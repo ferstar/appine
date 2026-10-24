@@ -1,28 +1,19 @@
-//! guest 进程（线程组）与一次运行会话（设计文档 §6）。
-//!
-//! [`run`] 建立内核、加载第一个 guest 进程并为它启动线程，然后等待它结束。
-//! 第一个进程是内置 init（pid 1）的子进程；它结束时会话结束，其余进程被强制终止。
+//! guest 进程（线程组）（设计文档 §6）。宿主启动的进程都是内置 init（pid 1）的子进程
+//! （[`crate::Machine`]）。
 
 use std::cell::RefCell;
-use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 
-use appine_engine::{Cpu, Dbt, DbtStats};
-use appine_hal::Event;
+use appine_engine::DbtStats;
 
 use crate::errno::Errno;
-use crate::fd::FdTable;
-use crate::kernel::{INIT, Kernel, Shared, Tid, block, request_wake};
-use crate::loader::{self, Args, LoadError};
-use crate::mm::Mm;
+use crate::kernel::{INIT, Kernel, Tid, request_wake};
+use crate::loader::{self, LoadError};
 use crate::signal::{self, SigAction, SigHandlers, SigInfo, sa};
-use crate::task::{self, FsContext, Task, TaskState};
-use crate::terminal::{self, Terminal};
+use crate::terminal::Terminal;
 use crate::tty::Tty;
 use crate::vfs::store::mode;
 use crate::vfs::{Node, Pseudo, Vfs};
@@ -190,6 +181,8 @@ pub enum RunError {
     Exec(Errno),
     /// 加载失败。
     Load(LoadError),
+    /// 控制台不存在，或者已经属于一个会话。
+    Console(Errno),
     /// 当前宿主不支持所选的执行引擎。
     TierUnavailable,
 }
@@ -205,6 +198,7 @@ impl fmt::Display for RunError {
             RunError::Exec(errno) if *errno == Errno::EACCES => f.write_str("permission denied"),
             RunError::Exec(errno) => write!(f, "cannot execute: {errno}"),
             RunError::Load(err) => err.fmt(f),
+            RunError::Console(errno) => write!(f, "cannot use the console: {errno}"),
             RunError::TierUnavailable => {
                 f.write_str("the selected tier is not supported on this host")
             }
@@ -213,9 +207,6 @@ impl fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
-
-/// 第一个 guest 进程的 pid：pid 1 是内置的 init。
-pub(crate) const FIRST_PID: Tid = INIT + 1;
 
 /// `RLIMIT_STACK`。
 pub(crate) const RLIMIT_STACK: u32 = 3;
@@ -401,8 +392,8 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     for (c, sig) in orphaned {
         signal::send_to_group(k, c, sig, SigInfo::kernel());
     }
-    if tgid == FIRST_PID {
-        k.session = Some(status);
+    if let Some(slot) = k.watched.get_mut(&tgid) {
+        *slot = Some(status);
     }
     release_ctty(k, group);
 
@@ -500,143 +491,4 @@ pub(crate) fn comm_of(path: &[u8]) -> [u8; 16] {
     let mut comm = [0u8; 16];
     comm[..n].copy_from_slice(&name[..n]);
     comm
-}
-
-/// 加载 guest 程序并运行到第一个进程结束。
-///
-/// 设置了 [`RunOptions::rootfs`] 时，`program` 是 guest 文件系统里的路径；
-/// 否则是宿主路径。
-pub fn run(
-    program: &OsStr,
-    argv: &[Vec<u8>],
-    envp: &[Vec<u8>],
-    options: &RunOptions,
-) -> Result<RunReport, RunError> {
-    if options.tier == Tier::Dbt && Dbt::new().is_none() {
-        return Err(RunError::TierUnavailable);
-    }
-    let vfs = match &options.rootfs {
-        Some(dir) => Some(Rc::new(Vfs::open(dir).map_err(RunError::Rootfs)?)),
-        None => None,
-    };
-    let path = program.as_bytes();
-    let offline = crate::pseudo::Offline;
-    let file = match &vfs {
-        Some(vfs) => read_executable(vfs, &offline, &Node::ROOT, path).map_err(RunError::Exec)?,
-        None => std::fs::read(Path::new(program)).map_err(RunError::Io)?,
-    };
-    let args = Args {
-        argv,
-        envp,
-        execfn: path,
-    };
-    let mut mm = Mm::new();
-    let mut read_interp = |p: &[u8]| match &vfs {
-        Some(vfs) => read_executable(vfs, &offline, &Node::ROOT, p),
-        None => Err(Errno::ENOENT),
-    };
-    let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
-    let exe: Rc<[u8]> = Rc::from(crate::vfs::normalize(&[b"/", path].concat()));
-    crate::syscall::label_image(&mut mm, &image, &exe);
-
-    let io_err = |e: Errno| RunError::Io(io::Error::from_raw_os_error(e.0));
-    let event = Arc::new(Event::new().map_err(|e| io_err(Errno(e)))?);
-    let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
-    {
-        let mut k = shared.lock();
-        let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
-        k.groups.insert(INIT, Rc::new(RefCell::new(init)));
-        let tid = k.alloc_tid().expect("the first tid is free");
-        debug_assert_eq!(tid, FIRST_PID);
-        let mm = Rc::new(RefCell::new(mm));
-        // SAFETY: Mm 由任务的 TaskState 持有，线程退出或 execve 之前不会释放
-        let mut cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
-        cpu.state_mut().pc = image.entry;
-        cpu.state_mut().sp = image.sp;
-        let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));
-        group.exe = exe.to_vec();
-        // 有终端时，第一个进程是会话组长，PTY 是它的控制终端
-        let fds = match &options.terminal {
-            Some(term) => {
-                let (slave, tty) = terminal::create(&mut k, term);
-                {
-                    let mut t = tty.borrow_mut();
-                    t.session = Some(tid);
-                    t.fg = Some(tid);
-                }
-                group.ctty = Some(tty);
-                let mut table = FdTable::new();
-                for fd in 0..3 {
-                    table.install_at(fd, slave.clone(), false).unwrap();
-                }
-                table
-            }
-            None => FdTable::with_host_stdio(),
-        };
-        let group = Rc::new(RefCell::new(group));
-        let state = TaskState {
-            mm,
-            fds: Rc::new(RefCell::new(fds)),
-            fs: Rc::new(RefCell::new(FsContext {
-                cwd: Node::ROOT,
-                umask: 0o022,
-            })),
-            group: group.clone(),
-            vfs,
-            altstack: Default::default(),
-            clear_child_tid: 0,
-            saved_sigmask: None,
-            vfork_done: None,
-        };
-        let task = Task::new(tid, tid, &cpu, state, 0, comm_of(path)).map_err(io_err)?;
-        k.groups.insert(tid, group);
-        k.groups[&INIT].borrow_mut().children.push(tid);
-        k.forks += 1;
-        task::start(&shared, &mut k, task, cpu).map_err(io_err)?;
-    }
-    let bridge = options.terminal.map(|term| {
-        let shared = shared.clone();
-        std::thread::Builder::new()
-            .name("terminal".into())
-            .spawn(move || terminal::bridge(shared, term))
-            .expect("cannot start the terminal thread")
-    });
-
-    // 等第一个进程结束，然后结束其余的进程，等所有线程退出
-    let status = wait_until(&shared, &event, |k| k.session);
-    {
-        let k = shared.lock();
-        let groups: Vec<_> = k.groups.values().cloned().collect();
-        for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
-            signal::group_exit(
-                &k,
-                g,
-                ExitStatus::Signaled {
-                    signal: Signal::KILL,
-                    pc: None,
-                    fault_addr: None,
-                },
-            );
-        }
-    }
-    wait_until(&shared, &event, |k| k.tasks.is_empty().then_some(()));
-    // 桥接线程把剩下的输出写完才退出
-    if let Some(b) = bridge {
-        let _ = b.join();
-    }
-    let dbt_stats = shared.lock().dbt_stats;
-    Ok(RunReport { status, dbt_stats })
-}
-
-/// 宿主主线程等待内核状态满足条件，同时负责间隔定时器。
-fn wait_until<T>(shared: &Shared, event: &Arc<Event>, cond: impl Fn(&Kernel) -> Option<T>) -> T {
-    let mut k = shared.lock();
-    loop {
-        if let Some(v) = cond(&k) {
-            return v;
-        }
-        let next = crate::itimer::expire(&k);
-        let (k2, _) = block(shared, k, event, next, &mut []);
-        k = k2;
-    }
 }

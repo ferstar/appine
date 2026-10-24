@@ -62,6 +62,17 @@ scripts/dev sh -c 'target/linux-arm64/debug/appine-run --rootfs target/store \
 
 The tests that need the internet run only with `APPINE_NETWORK_TESTS=1`.
 
+## Android app
+
+The app in [android/](android) runs the same kernel inside an Android app: each tab is a
+login shell on an in-process terminal. It needs the Android SDK with NDK 29.0.14206865,
+`rustup target add aarch64-linux-android` and `cargo install cargo-ndk`:
+
+```sh
+scripts/fetch-rootfs
+cd android && ./gradlew installDebug   # on a connected arm64 device or emulator (Android 10+)
+```
+
 ## License
 
 appine is free software: you can redistribute it and/or modify it under the terms of the

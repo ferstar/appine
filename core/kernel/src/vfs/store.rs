@@ -10,6 +10,7 @@
 //! inode 行以 nlink = 0 留下来，让打开着它的 fd 还能 fstat；下次打开仓库时清理。
 
 use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -193,10 +194,11 @@ impl Store {
             return Err(Errno::ENOENT);
         }
         let store = Self::connect(dir)?;
-        if store.lock.try_lock().is_ok() {
+        let fd = store.lock.as_raw_fd();
+        if appine_hal::flock(fd, true, false).is_ok() {
             store.remove_orphans()?;
         }
-        store.lock.lock_shared().map_err(io_err)?;
+        appine_hal::flock(fd, false, true).map_err(Errno)?;
         Ok(store)
     }
 
@@ -245,7 +247,7 @@ impl Store {
             .truncate(false)
             .open(dir.join("lock"))
             .map_err(io_err)?;
-        lock.lock_shared().map_err(io_err)?;
+        appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
         Ok(Store {
             db,
             objects: dir.join("objects"),

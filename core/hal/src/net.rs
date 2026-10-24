@@ -290,6 +290,7 @@ pub fn interfaces() -> Vec<Interface> {
 }
 
 /// 宿主 `/etc/resolv.conf` 里的名字服务器（sockaddr 的字节）。
+#[cfg(not(target_os = "android"))]
 fn nameservers() -> Vec<Vec<u8>> {
     let Ok(conf) = std::fs::read_to_string("/etc/resolv.conf") else {
         return Vec::new();
@@ -324,6 +325,7 @@ pub fn sockaddr(addr: std::net::SocketAddr) -> Vec<u8> {
 }
 
 /// 等一个 fd 就绪，超时返回 `ETIMEDOUT`。
+#[cfg(not(target_os = "android"))]
 fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
     let mut fds = [(fd, events, 0)];
     match super::poll(&mut fds, Some(timeout))? {
@@ -333,6 +335,7 @@ fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
 }
 
 /// 经由 UDP 向一个名字服务器查询，回答被截断（TC 位）时改用 TCP。
+#[cfg(not(target_os = "android"))]
 fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
     const TIMEOUT: Duration = Duration::from_secs(3);
     let family = u16::from_ne_bytes([server[0], server[1]]) as i32;
@@ -359,6 +362,7 @@ fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
     query_tcp(server, query, TIMEOUT)
 }
 
+#[cfg(not(target_os = "android"))]
 fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, i32> {
     let family = u16::from_ne_bytes([server[0], server[1]]) as i32;
     let fd = socket(family, libc::SOCK_STREAM, 0)?;
@@ -397,9 +401,48 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
 
 /// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（设计文档 §10 的 DNS 存根）。
 ///
-/// Linux 宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器；Android 上（M5）改用
-/// `android_res_nsend`，让私人 DNS、VPN 和按网络分流的设置生效。会阻塞，调用方不能
+/// Android 上交给 `android_res_nsend`，私人 DNS、VPN 和按网络分流的设置都会生效；
+/// 其他宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器。会阻塞，调用方不能
 /// 持有锁。
+#[cfg(target_os = "android")]
+pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
+    #[link(name = "android")]
+    unsafe extern "C" {
+        fn android_res_nsend(network: u64, msg: *const u8, len: usize, flags: u32) -> i32;
+        fn android_res_nresult(fd: i32, rcode: *mut i32, answer: *mut u8, len: usize) -> i32;
+        fn android_res_cancel(fd: i32);
+    }
+    /// `NETWORK_UNSPECIFIED`：系统的默认网络。
+    const DEFAULT_NETWORK: u64 = 0;
+    if query.len() < 12 {
+        return Err(libc::EINVAL);
+    }
+    let fd = unsafe { android_res_nsend(DEFAULT_NETWORK, query.as_ptr(), query.len(), 0) };
+    if fd < 0 {
+        return Err(-fd);
+    }
+    // 系统解析器自己会重试和超时，这里只防止它永远不回答
+    let mut pfd = [(fd, libc::POLLIN, 0)];
+    if !matches!(super::poll(&mut pfd, Some(Duration::from_secs(30))), Ok(1)) {
+        unsafe { android_res_cancel(fd) };
+        return Err(libc::ETIMEDOUT);
+    }
+    let mut answer = vec![0u8; 65535];
+    let mut rcode = 0;
+    let n = unsafe { android_res_nresult(fd, &mut rcode, answer.as_mut_ptr(), answer.len()) };
+    if n < 0 {
+        return Err(-n);
+    }
+    answer.truncate(n as usize);
+    Ok(answer)
+}
+
+/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（设计文档 §10 的 DNS 存根）。
+///
+/// Android 上交给 `android_res_nsend`，私人 DNS、VPN 和按网络分流的设置都会生效；
+/// 其他宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器。会阻塞，调用方不能
+/// 持有锁。
+#[cfg(not(target_os = "android"))]
 pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     if query.len() < 12 {
         return Err(libc::EINVAL);

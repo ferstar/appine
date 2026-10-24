@@ -771,6 +771,11 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
 /// 接口信息的 ioctl，透传给宿主 socket `host_fd`。
 fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> SysResult {
     const SIOCGIFCONF: u32 = 0x8912;
+    const SIOCGIFFLAGS: u32 = 0x8913;
+    const SIOCGIFHWADDR: u32 = 0x8927;
+    const IFF_LOOPBACK: u16 = 0x8;
+    const ARPHRD_ETHER: u16 = 1;
+    const ARPHRD_LOOPBACK: u16 = 772;
     // struct ifreq（40 字节）进、ifreq 出：SIOCGIFNAME、FLAGS、ADDR、DSTADDR、BRDADDR、
     // NETMASK、MTU、HWADDR、INDEX、TXQLEN
     const IFREQ_GETTERS: [u32; 10] = [
@@ -780,6 +785,18 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
         r if IFREQ_GETTERS.contains(&r) => {
             let mut b: [u8; 40] = get(cx, arg)?;
             appine_hal::ioctl(host_fd, r as u64, &mut b).map_err(Errno)?;
+            if r == SIOCGIFHWADDR && b[16..18] == [0, 0] {
+                // Android 不让 App 读硬件地址，地址族也是 0：按接口是不是回环补上
+                let mut flags = b;
+                appine_hal::ioctl(host_fd, SIOCGIFFLAGS as u64, &mut flags).map_err(Errno)?;
+                let loopback = u16::from_le_bytes([flags[16], flags[17]]) & IFF_LOOPBACK != 0;
+                let ty = if loopback {
+                    ARPHRD_LOOPBACK
+                } else {
+                    ARPHRD_ETHER
+                };
+                b[16..18].copy_from_slice(&ty.to_le_bytes());
+            }
             put(cx, arg, b).map(|()| 0)
         }
         SIOCGIFCONF => {

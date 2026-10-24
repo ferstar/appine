@@ -15,7 +15,8 @@
  *
  * 原型限制：
  *   - 翻译结果不会因为 guest 修改代码或映射而失效，调用方必须自行 flush；
- *   - 宿主 X18 在 Android 上可能是平台保留寄存器，正式版需要重新评估；
+ *   - 宿主 X18 是平台寄存器（Android 上是 bionic 给每个线程设的影子调用栈指针），
+ *     翻译后的代码把它当临时寄存器用，进入时保存、退出时恢复；
  *   - 代码缓存直接映射为 RWX，正式版改为 §12 的 W^X 双映射。
  */
 #include <stddef.h>
@@ -782,7 +783,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
     uint32_t *code = x->buf;
     size_t words = x->n;
     free(x);
-    __builtin___clear_cache((char *)code, (char *)(code + words));
+    sync_icache((void *)code, (void *)(code + words));
     d->used_words += words;
     table_insert(d, pc, code);
     d->stats.blocks++;
@@ -796,9 +797,11 @@ static void emit_routines(struct appine_dbt *d)
     struct xlate x = {.d = d, .buf = d->cache};
     size_t x0 = offsetof(struct appine_cpu, x);
 
-    /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code) */
+    /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code)：保存被调用者保存的寄存器
+     * 和平台寄存器 X18 */
     d->enter = here(&x);
-    emit(&x, enc_stp_x_pre(29, 30, 31, -96));
+    emit(&x, enc_stp_x_pre(29, 30, 31, -112));
+    emit(&x, enc_str_x(18, 31, 96));
     emit(&x, enc_stp_x(27, 28, 31, 16));
     emit(&x, enc_stp_x(25, 26, 31, 32));
     emit(&x, enc_stp_x(23, 24, 31, 48));
@@ -833,11 +836,12 @@ static void emit_routines(struct appine_dbt *d)
     emit(&x, enc_ldp_x(23, 24, 31, 48));
     emit(&x, enc_ldp_x(25, 26, 31, 32));
     emit(&x, enc_ldp_x(27, 28, 31, 16));
-    emit(&x, enc_ldp_x_post(29, 30, 31, 96));
+    emit(&x, enc_ldr_x(18, 31, 96));
+    emit(&x, enc_ldp_x_post(29, 30, 31, 112));
     emit(&x, enc_ret());
 
     d->routine_words = d->used_words = x.n;
-    __builtin___clear_cache((char *)d->cache, (char *)(d->cache + x.n));
+    sync_icache((void *)d->cache, (void *)(d->cache + x.n));
 }
 
 struct appine_dbt *appine_dbt_new(void)
@@ -904,7 +908,7 @@ enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
         }
         if (patch_site && patch_generation == d->generation) {
             *patch_site = enc_b((intptr_t)code - (intptr_t)patch_site);
-            __builtin___clear_cache((char *)patch_site, (char *)(patch_site + 1));
+            sync_icache((void *)patch_site, (void *)(patch_site + 1));
         }
         patch_site = NULL;
         if (fill_jump_cache) {

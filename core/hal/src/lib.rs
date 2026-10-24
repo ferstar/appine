@@ -127,6 +127,29 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
         .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
+/// flock(2)：`exclusive` 时取排他锁，否则取共享锁；`wait` 为 false 时拿不到就立即返回
+/// `EWOULDBLOCK`。同一个 fd 上已有的锁会被转换。（标准库的 `File::lock` 在 Android 上
+/// 没有实现。）
+pub fn flock(fd: i32, exclusive: bool, wait: bool) -> Result<(), i32> {
+    let mut op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if !wait {
+        op |= libc::LOCK_NB;
+    }
+    loop {
+        if unsafe { libc::flock(fd, op) } == 0 {
+            return Ok(());
+        }
+        match last_errno() {
+            libc::EINTR => continue,
+            e => return Err(e),
+        }
+    }
+}
+
 /// 读取宿主 fd 的元数据。
 pub fn fstat(fd: i32) -> Result<libc::stat, i32> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };

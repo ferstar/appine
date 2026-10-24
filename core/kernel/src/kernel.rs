@@ -60,8 +60,12 @@ pub(crate) struct Kernel {
     pub futexes: Futexes,
     /// 执行引擎。
     pub tier: Tier,
-    /// 第一个 guest 进程的结束方式；设置之后整个会话结束。
-    pub session: Option<ExitStatus>,
+    /// 宿主在等它结束的进程（[`crate::Machine::spawn`] 启动的进程）：结束后记下结束方式。
+    pub watched: BTreeMap<Tid, Option<ExitStatus>>,
+    /// 根文件系统；没有时 guest 看不到任何文件系统。
+    pub vfs: Option<Rc<crate::vfs::Vfs>>,
+    /// Machine 正在关闭：定时器线程退出。
+    pub shutting_down: bool,
     /// 已退出线程的 Tier 1 统计之和。
     pub dbt_stats: Option<DbtStats>,
     /// 已退出线程用掉的 CPU 时间之和（`/proc/stat`）。
@@ -72,8 +76,8 @@ pub(crate) struct Kernel {
     pub boot_id: [u8; 16],
     /// 所有 PTY，按编号；主设备和从设备都关闭之后条目失效。
     pub ptys: BTreeMap<u32, Weak<RefCell<Tty>>>,
-    /// 接到宿主终端的那个 PTY 的主设备（[`crate::terminal`]）。
-    pub terminal: Option<crate::tty::PtyEnd>,
+    /// 宿主持有主设备的 PTY（[`crate::terminal`]），按 PTY 编号。
+    pub consoles: BTreeMap<u32, crate::terminal::Console>,
     /// flock(2) 的锁：每个 inode 上持有锁的打开文件，以及是不是排他锁。打开文件关闭后
     /// 弱引用失效，锁随之释放。
     pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
@@ -97,7 +101,9 @@ impl Kernel {
             groups: BTreeMap::new(),
             futexes: Futexes::default(),
             tier,
-            session: None,
+            watched: BTreeMap::new(),
+            vfs: None,
+            shutting_down: false,
             dbt_stats: None,
             cpu_ns: 0,
             forks: 0,
@@ -109,7 +115,7 @@ impl Kernel {
                 id
             },
             ptys: BTreeMap::new(),
-            terminal: None,
+            consoles: BTreeMap::new(),
             flocks: BTreeMap::new(),
             unix: Default::default(),
             seals: BTreeMap::new(),

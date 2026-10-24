@@ -198,7 +198,7 @@ static void insert(uint32_t insn, const struct native_desc *desc)
     generate(&b, insn, desc);
     if (b.n > MAX_STUB_WORDS)
         abort(); /* 上界估计错误：属于引擎 bug */
-    __builtin___clear_cache((char *)b.p, (char *)(b.p + b.n));
+    sync_icache((void *)b.p, (void *)(b.p + b.n));
     used_words += b.n;
     table[i] = (struct slot){insn, (native_fn)(uintptr_t)b.p};
     table_count++;

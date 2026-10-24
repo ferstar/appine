@@ -17,6 +17,37 @@
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
+/*
+ * 写入代码之后让取指看到新代码，与 compiler-rt 的 __clear_cache 在 aarch64 上的做法相同。
+ * 不用 __builtin___clear_cache：Rust 链接 Android 的动态库时不带 compiler-rt，那个符号
+ * 在加载时找不到。
+ */
+static inline void sync_icache(void *start, void *end)
+{
+#if defined(__aarch64__) && defined(__linux__)
+    uint64_t ctr, addr;
+    uint64_t b = (uint64_t)(uintptr_t)start, e = (uint64_t)(uintptr_t)end;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    /* CTR_EL0.IDC：数据缓存不需要清到统一点 */
+    if (!((ctr >> 28) & 1)) {
+        uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
+        for (addr = b & ~(line - 1); addr < e; addr += line)
+            __asm__ volatile("dc cvau, %0" ::"r"(addr) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    /* CTR_EL0.DIC：指令缓存不需要作废 */
+    if (!((ctr >> 29) & 1)) {
+        uint64_t line = UINT64_C(4) << (ctr & 15);
+        for (addr = b & ~(line - 1); addr < e; addr += line)
+            __asm__ volatile("ic ivau, %0" ::"r"(addr) : "memory");
+        __asm__ volatile("dsb ish" ::: "memory");
+    }
+    __asm__ volatile("isb" ::: "memory");
+#else
+    __builtin___clear_cache((char *)start, (char *)end);
+#endif
+}
+
 /* 返回 gva 所在页的叶子表项，未映射时返回 0 */
 uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva);
 

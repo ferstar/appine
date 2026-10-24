@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="preparing">正在准备 Alpine Linux…</string>
+    <string name="start_failed">无法启动：%1$s</string>
+    <string name="channel_sessions">终端会话</string>
+    <string name="exit_all">全部退出</string>
+    <plurals name="sessions_running">
+        <item quantity="other">%d 个会话运行中</item>
+    </plurals>
+</resources>

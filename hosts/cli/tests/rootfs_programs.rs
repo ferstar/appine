@@ -758,3 +758,67 @@ fn importing_into_an_existing_store_fails() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
 }
+
+/// 读控制台直到会话结束（Android 的终端标签页就是这样用 Machine 的）。
+fn read_console(machine: &appine_kernel::Machine, id: u32) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match machine.read_console(id, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8(out).unwrap().replace("\r\n", "\n")
+}
+
+#[test]
+fn one_machine_runs_several_terminal_sessions() {
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in [Tier::Interpreter, Tier::Dbt] {
+        let machine = Machine::start(&MachineOptions {
+            tier,
+            rootfs: Some(store.to_path_buf()),
+        })
+        .unwrap();
+        let env = [PATH.as_bytes().to_vec()];
+        let sh = |script: &str| {
+            let id = machine.open_console(24, 80);
+            let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+            let pid = machine
+                .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+                .unwrap();
+            (id, pid)
+        };
+        // 两个会话同时运行，各自有自己的控制终端
+        let (a, pa) = sh("tty; stty size; echo one");
+        let (b, pb) = sh("read line; echo got $line; exit 3");
+        machine.write_console(b, b"input\n").unwrap();
+        machine.resize_console(a, 40, 100).unwrap();
+        let (out_a, out_b) = (read_console(&machine, a), read_console(&machine, b));
+        assert!(out_a.starts_with("/dev/pts/"), "{tier:?}: {out_a}");
+        assert!(out_a.ends_with("one\n"), "{tier:?}: {out_a}");
+        assert_eq!(out_b, "input\ngot input\n", "{tier:?}");
+        assert_eq!(machine.wait(pa), ExitStatus::Exited(0));
+        assert_eq!(machine.wait(pb), ExitStatus::Exited(3));
+        // 关闭控制台就是挂断终端：交互式 shell 收到 SIGHUP 退出
+        let id = machine.open_console(24, 80);
+        let argv = [b"sh".to_vec(), b"-i".to_vec()];
+        let pid = machine
+            .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+            .unwrap();
+        machine.write_console(id, b"echo ready\n").unwrap();
+        machine.close_console(id).unwrap();
+        assert!(
+            matches!(machine.wait(pid), ExitStatus::Signaled { signal, .. } if signal.number() == 1),
+            "{tier:?}"
+        );
+        assert_eq!(
+            machine.read_console(id, &mut [0; 8]),
+            Err(appine_kernel::errno::Errno::ENOENT)
+        );
+    }
+}

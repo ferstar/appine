@@ -293,15 +293,52 @@ impl Vfs {
 
 /// 没有 `/etc/resolv.conf` 时写一个指向 DNS 存根的（设计文档 §10）；已有的保持不动。
 fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
-    use std::io::Write;
     let Some(etc) = store.lookup(ROOT, b"etc")? else {
         return Ok(());
     };
     if store.lookup(etc, b"resolv.conf")?.is_some() {
         return Ok(());
     }
-    let (_, mut file) = store.create_file(etc, b"resolv.conf", 0o644, 0, 0)?;
-    file.write_all(b"nameserver 127.0.0.53\n")
+    write_file(
+        store,
+        b"/etc/resolv.conf",
+        b"nameserver 127.0.0.53\n",
+        0o644,
+        false,
+    )
+}
+
+/// 在仓库里写一个普通文件（宿主准备配置文件用）：父目录不存在时一并建好（0755），
+/// 路径里的符号链接不跟随。文件已经存在时，`overwrite` 为 false 就保持不动，否则
+/// 替换内容（权限位不变）。
+pub fn write_file(
+    store: &Store,
+    path: &[u8],
+    data: &[u8],
+    mode: u32,
+    overwrite: bool,
+) -> Result<(), Errno> {
+    use std::io::Write;
+    let comps: Vec<Vec<u8>> = split(path).collect();
+    let (name, dirs) = comps.split_last().ok_or(Errno::EINVAL)?;
+    let mut dir = ROOT;
+    for c in dirs {
+        dir = match store.lookup(dir, c)? {
+            Some(ino) if store.kind(ino)? == mode::S_IFDIR => ino,
+            Some(_) => return Err(Errno::ENOTDIR),
+            None => store.mkdir(dir, c, 0o755, 0, 0)?,
+        };
+    }
+    let mut file = match store.lookup(dir, name)? {
+        Some(_) if !overwrite => return Ok(()),
+        Some(ino) if store.kind(ino)? == mode::S_IFREG => {
+            store.truncate(ino, 0)?;
+            store.open_object(ino, true)?
+        }
+        Some(_) => return Err(Errno::EEXIST),
+        None => store.create_file(dir, name, mode & 0o7777, 0, 0)?.1,
+    };
+    file.write_all(data)
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
 }
 

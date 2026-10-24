@@ -4,6 +4,7 @@ members = [
     "core/engine",
     "core/hal",
     "core/kernel",
+    "hosts/android",
     "hosts/cli",
     "tests/bench",
     "tests/lockstep",

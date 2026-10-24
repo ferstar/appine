@@ -1,0 +1,352 @@
+//! 宿主眼中的 guest 内核（设计文档 §6、§11.2）。
+//!
+//! [`Machine`] 持有一个内核实例：可以先后启动多个进程（[`Machine::spawn`]），每个进程
+//! 可以有自己的控制台（宿主持有主设备的进程内 PTY，[`Machine::open_console`]）。Android
+//! 的前台服务为每个终端标签页开一个控制台和一个登录 shell；`appine-run` 只启动一个
+//! 进程（[`run`]）。方法可以在任意宿主线程上调用，阻塞的方法和 guest 线程一样走统一的
+//! 等待机制。间隔定时器由一个宿主线程负责（[`crate::itimer`]）。
+
+use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use appine_engine::{Cpu, Dbt, DbtStats};
+use appine_hal::Event;
+
+use crate::errno::Errno;
+use crate::fd::FdTable;
+use crate::kernel::{INIT, Kernel, Shared, block, request_wake};
+use crate::loader::{self, Args};
+use crate::mm::Mm;
+use crate::process::{
+    ExitStatus, RunError, RunOptions, RunReport, Signal, ThreadGroup, Tier, comm_of,
+    read_executable,
+};
+use crate::signal::{self, SigHandlers};
+use crate::task::{self, FsContext, Task, TaskState};
+use crate::terminal;
+use crate::tty::Winsize;
+use crate::vfs::{Node, Vfs};
+
+/// 内核实例的选项。
+#[derive(Debug, Clone, Default)]
+pub struct MachineOptions {
+    /// 执行引擎。
+    pub tier: Tier,
+    /// inode 仓库所在的宿主目录。设置后程序路径按 guest 路径在仓库里解析，否则按
+    /// 宿主路径读取，guest 也看不到任何文件系统。
+    pub rootfs: Option<PathBuf>,
+}
+
+/// 新进程的 stdin/stdout/stderr。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stdio {
+    /// 宿主进程自己的 0、1、2。
+    Host,
+    /// 控制台（PTY 编号）的从设备：进程成为新会话的组长，控制台是它的控制终端。
+    Console(u32),
+}
+
+/// 一个 guest 内核实例。析构时结束所有 guest 进程。
+pub struct Machine {
+    shared: Arc<Shared>,
+    timers: Option<JoinHandle<()>>,
+}
+
+thread_local! {
+    /// 宿主线程在 Machine 的阻塞方法里等待用的事件。
+    static EVENT: Arc<Event> = Arc::new(Event::new().expect("cannot create an eventfd"));
+}
+
+impl Machine {
+    /// 建立内核实例：打开 inode 仓库，建好内置的 init（pid 1）。
+    pub fn start(options: &MachineOptions) -> Result<Machine, RunError> {
+        if options.tier == Tier::Dbt && Dbt::new().is_none() {
+            return Err(RunError::TierUnavailable);
+        }
+        let vfs = match &options.rootfs {
+            Some(dir) => Some(Rc::new(Vfs::open(dir).map_err(RunError::Rootfs)?)),
+            None => None,
+        };
+        let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
+        {
+            let mut k = shared.lock();
+            k.vfs = vfs;
+            let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
+            k.groups.insert(INIT, Rc::new(RefCell::new(init)));
+        }
+        let timer_shared = shared.clone();
+        let timers = std::thread::Builder::new()
+            .name("timers".into())
+            .spawn(move || timers(timer_shared))
+            .map_err(RunError::Io)?;
+        Ok(Machine {
+            shared,
+            timers: Some(timers),
+        })
+    }
+
+    /// 启动一个新进程（init 的子进程），返回它的 pid。设置了仓库时 `program` 是 guest
+    /// 文件系统里的路径，否则是宿主路径。
+    pub fn spawn(
+        &self,
+        program: &[u8],
+        argv: &[Vec<u8>],
+        envp: &[Vec<u8>],
+        stdio: Stdio,
+    ) -> Result<u32, RunError> {
+        let io_err = |e: Errno| RunError::Io(io::Error::from_raw_os_error(e.0));
+        let mut k = self.shared.lock();
+        let vfs = k.vfs.clone();
+        let offline = crate::pseudo::Offline;
+        let file = match &vfs {
+            Some(vfs) => {
+                read_executable(vfs, &offline, &Node::ROOT, program).map_err(RunError::Exec)?
+            }
+            None => std::fs::read(OsStr::from_bytes(program)).map_err(RunError::Io)?,
+        };
+        let args = Args {
+            argv,
+            envp,
+            execfn: program,
+        };
+        let mut mm = Mm::new();
+        let mut read_interp = |p: &[u8]| match &vfs {
+            Some(vfs) => read_executable(vfs, &offline, &Node::ROOT, p),
+            None => Err(Errno::ENOENT),
+        };
+        let image =
+            loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
+        let exe: Rc<[u8]> = Rc::from(crate::vfs::normalize(&[b"/", program].concat()));
+        crate::syscall::label_image(&mut mm, &image, &exe);
+
+        let tid = k.alloc_tid().map_err(io_err)?;
+        let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));
+        group.exe = exe.to_vec();
+        let fds = match stdio {
+            Stdio::Host => FdTable::with_host_stdio(),
+            Stdio::Console(id) => {
+                let (slave, tty) = terminal::attach(&mut k, id, tid).map_err(RunError::Console)?;
+                group.ctty = Some(tty);
+                let mut table = FdTable::new();
+                for fd in 0..3 {
+                    table.install_at(fd, slave.clone(), false).unwrap();
+                }
+                table
+            }
+        };
+        let mm = Rc::new(RefCell::new(mm));
+        // SAFETY: Mm 由任务的 TaskState 持有，线程退出或 execve 之前不会释放
+        let mut cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
+        cpu.state_mut().pc = image.entry;
+        cpu.state_mut().sp = image.sp;
+        let group = Rc::new(RefCell::new(group));
+        let state = TaskState {
+            mm,
+            fds: Rc::new(RefCell::new(fds)),
+            fs: Rc::new(RefCell::new(FsContext {
+                cwd: Node::ROOT,
+                umask: 0o022,
+            })),
+            group: group.clone(),
+            vfs,
+            altstack: Default::default(),
+            clear_child_tid: 0,
+            saved_sigmask: None,
+            vfork_done: None,
+        };
+        let task = Task::new(tid, tid, &cpu, state, 0, comm_of(program)).map_err(io_err)?;
+        k.groups.insert(tid, group);
+        k.groups[&INIT].borrow_mut().children.push(tid);
+        k.forks += 1;
+        k.watched.insert(tid, None);
+        task::start(&self.shared, &mut k, task, cpu).map_err(io_err)?;
+        Ok(tid as u32)
+    }
+
+    /// 在持有 BKL 时反复检查 `cond`，直到它给出结果。
+    fn wait_for<T>(&self, mut cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+        EVENT.with(|event| {
+            let mut k = self.shared.lock();
+            loop {
+                if let Some(v) = cond(&mut k) {
+                    return v;
+                }
+                let (k2, _) = block(&self.shared, k, event, None, &mut []);
+                k = k2;
+            }
+        })
+    }
+
+    /// 等 [`Machine::spawn`] 启动的进程结束。
+    pub fn wait(&self, pid: u32) -> ExitStatus {
+        self.wait_for(|k| k.watched.get(&(pid as i32)).copied().flatten())
+    }
+
+    /// [`Machine::spawn`] 启动的进程已经结束时返回它的结束方式。
+    pub fn try_wait(&self, pid: u32) -> Option<ExitStatus> {
+        self.shared
+            .lock()
+            .watched
+            .get(&(pid as i32))
+            .copied()
+            .flatten()
+    }
+
+    /// 新建一个控制台，返回它的 PTY 编号（`/dev/pts/<编号>`）。
+    pub fn open_console(&self, rows: u16, cols: u16) -> u32 {
+        self.open_console_with(Winsize {
+            rows,
+            cols,
+            ..Winsize::default()
+        })
+    }
+
+    fn open_console_with(&self, size: Winsize) -> u32 {
+        terminal::open(&mut self.shared.lock(), size)
+    }
+
+    /// 读控制台的输出，没有输出时等待。返回 0 表示会话结束：所有从设备都关闭了，
+    /// 输出也已经读完。
+    pub fn read_console(&self, id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
+        let out = self.wait_for(|k| terminal::take_output(k, id, buf.len()).transpose())?;
+        buf[..out.len()].copy_from_slice(&out);
+        Ok(out.len())
+    }
+
+    /// 向控制台输入（经过行规程），输入队列满时等待。返回写入的字节数；会话已经结束时
+    /// 返回 EIO。
+    pub fn write_console(&self, id: u32, data: &[u8]) -> Result<usize, Errno> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        self.wait_for(|k| {
+            let room = match terminal::input_room(k, id) {
+                Ok(room) => room,
+                Err(e) => return Some(Err(e)),
+            };
+            if room > 0 {
+                let n = room.min(data.len());
+                return Some(terminal::feed(k, id, &data[..n]).map(|()| n));
+            }
+            // 输入队列满了，但已经没有进程会读它
+            match terminal::take_output(k, id, 0) {
+                Ok(Some(_)) => Some(Err(Errno::EIO)),
+                _ => None,
+            }
+        })
+    }
+
+    /// 控制台的窗口大小变了：前台进程组收到 SIGWINCH。
+    pub fn resize_console(&self, id: u32, rows: u16, cols: u16) -> Result<(), Errno> {
+        let w = Winsize {
+            rows,
+            cols,
+            ..Winsize::default()
+        };
+        terminal::resize(&self.shared.lock(), id, w)
+    }
+
+    /// 关闭控制台（终端标签页关闭）：会话组长收到 SIGHUP。
+    pub fn close_console(&self, id: u32) -> Result<(), Errno> {
+        terminal::close(&mut self.shared.lock(), id)
+    }
+
+    /// 结束所有 guest 进程，等所有 guest 线程退出。
+    pub fn kill_all(&self) {
+        {
+            let k = self.shared.lock();
+            let groups: Vec<_> = k.groups.values().cloned().collect();
+            for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
+                signal::group_exit(
+                    &k,
+                    g,
+                    ExitStatus::Signaled {
+                        signal: Signal::KILL,
+                        pc: None,
+                        fault_addr: None,
+                    },
+                );
+            }
+        }
+        self.wait_for(|k| k.tasks.is_empty().then_some(()));
+    }
+
+    /// 使用 Tier 1 时已退出线程的统计之和。
+    pub fn dbt_stats(&self) -> Option<DbtStats> {
+        self.shared.lock().dbt_stats
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        self.kill_all();
+        {
+            let mut k = self.shared.lock();
+            k.shutting_down = true;
+            request_wake();
+        }
+        if let Some(t) = self.timers.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// 定时器线程：等到最早的到期时刻，发出到期的 SIGALRM（[`crate::itimer::expire`]），
+/// 直到 Machine 关闭。
+fn timers(shared: Arc<Shared>) {
+    let event = Arc::new(Event::new().expect("cannot create an eventfd for the timers"));
+    let mut k = shared.lock();
+    while !k.shutting_down {
+        let next = crate::itimer::expire(&k);
+        let (k2, _) = block(&shared, k, &event, next, &mut []);
+        k = k2;
+    }
+}
+
+/// 加载 guest 程序并运行到它结束，然后结束其余的进程（`appine-run`）。
+///
+/// 设置了 [`RunOptions::rootfs`] 时，`program` 是 guest 文件系统里的路径；
+/// 否则是宿主路径。
+pub fn run(
+    program: &OsStr,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    options: &RunOptions,
+) -> Result<RunReport, RunError> {
+    let machine = Machine::start(&MachineOptions {
+        tier: options.tier,
+        rootfs: options.rootfs.clone(),
+    })?;
+    // 有终端时，进程是会话组长，接到宿主终端的控制台是它的控制终端
+    let console = options.terminal.map(|term| {
+        (
+            term,
+            machine.open_console_with(terminal::initial_size(&term)),
+        )
+    });
+    let stdio = console.map_or(Stdio::Host, |(_, id)| Stdio::Console(id));
+    let pid = machine.spawn(program.as_bytes(), argv, envp, stdio)?;
+    let bridge = console.map(|(term, id)| {
+        let shared = machine.shared.clone();
+        std::thread::Builder::new()
+            .name("terminal".into())
+            .spawn(move || terminal::bridge(shared, term, id, pid as i32))
+            .expect("cannot start the terminal thread")
+    });
+    let status = machine.wait(pid);
+    machine.kill_all();
+    // 桥接线程把剩下的输出写完才退出
+    if let Some(b) = bridge {
+        let _ = b.join();
+    }
+    Ok(RunReport {
+        status,
+        dbt_stats: machine.dbt_stats(),
+    })
+}

@@ -1,8 +1,7 @@
 //! appine 内核层：在进程内实现 Linux 用户态 ABI（设计文档 §3、§6–§8）。
 //!
-//! M3a：多进程、多线程。每个 guest 线程对应一个宿主线程，内核层由一把大内核锁
-//! 保护；支持 fork/vfork/线程、execve、wait、管道、完整的信号投递和 vDSO。根文件
-//! 系统是 inode 仓库。
+//! 每个 guest 线程对应一个宿主线程，内核层由一把大内核锁保护；宿主经由 [`Machine`]
+//! 启动进程、开控制台（Android 的终端标签页、`appine-run`）。根文件系统是 inode 仓库。
 
 mod debug;
 pub mod errno;
@@ -11,6 +10,7 @@ mod futex;
 mod itimer;
 mod kernel;
 mod loader;
+mod machine;
 mod mm;
 mod net;
 mod pipe;
@@ -28,7 +28,8 @@ pub mod vfs;
 
 pub use appine_engine::DbtStats;
 pub use loader::LoadError;
-pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier, run};
+pub use machine::{Machine, MachineOptions, Stdio, run};
+pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier};
 pub use terminal::Terminal;
 
 use std::path::Path;
@@ -36,6 +37,18 @@ use std::path::Path;
 use errno::Errno;
 use vfs::import::ImportReport;
 use vfs::store::Store;
+
+/// 在 inode 仓库里写一个文件（宿主准备配置文件用，比如首次启动时的
+/// `/etc/profile.d/appine.sh`）；`path` 是 guest 路径。见 [`vfs::write_file`]。
+pub fn write_file(
+    store: &Path,
+    path: &str,
+    data: &[u8],
+    mode: u32,
+    overwrite: bool,
+) -> Result<(), Errno> {
+    vfs::write_file(&Store::open(store)?, path.as_bytes(), data, mode, overwrite)
+}
 
 /// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。
 ///
