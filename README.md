@@ -27,6 +27,16 @@ scripts/dev sh -c 'cc -nostdlib -static -no-pie -o /tmp/hello tests/guest/hello.
                    cargo run -q -p appine-run -- --tier 1 /tmp/hello'
 ```
 
+To run busybox from the Alpine minirootfs (the rootfs tests in `cargo test` need the
+tarball too, and are skipped without it):
+
+```sh
+scripts/fetch-rootfs                   # downloads and verifies target/rootfs/alpine-minirootfs-*.tar.gz
+scripts/dev sh -c 'cargo build -q -p appine-run && run=target/linux-arm64/debug/appine-run &&
+                   $run --rootfs target/store --import target/rootfs/alpine-minirootfs-*.tar.gz &&
+                   $run --rootfs target/store /bin/busybox ls -l /'
+```
+
 ## License
 
 appine is free software: you can redistribute it and/or modify it under the terms of the

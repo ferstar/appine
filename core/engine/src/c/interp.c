@@ -26,6 +26,10 @@
 #define SYSREG_FPSR SYSREG(3, 3, 4, 4, 1)
 #define SYSREG_TPIDR_EL0 SYSREG(3, 3, 13, 0, 2)
 #define SYSREG_TPIDRRO_EL0 SYSREG(3, 3, 13, 0, 3)
+#define SYSREG_DCZID_EL0 SYSREG(3, 3, 0, 0, 7)
+
+/* DC ZVA 清零的块大小：DCZID_EL0.BS = 4，即 2^4 个字，与常见的 arm64 核心一致 */
+#define DCZ_BLOCK 64
 
 /* FPCR 中 AArch64 用户态可写的位：AHP、DN、FZ、RMode */
 #define FPCR_MASK UINT64_C(0x07c00000)
@@ -598,6 +602,11 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
             return undef(c, insn);
         wx(c, rt, 0);
         return next(c);
+    case SYSREG_DCZID_EL0: /* DZP = 0：允许 DC ZVA */
+        if (!read)
+            return undef(c, insn);
+        wx(c, rt, 4);
+        return next(c);
     default: {
         uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（§4.4） */
         if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(FIELD(insn, 20, 5), &id)) {
@@ -664,6 +673,16 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
     }
     if ((insn & 0xffd00000) == 0xd5100000) /* MRS / MSR（寄存器） */
         return sysreg_move(c, insn);
+    if ((insn & 0xffffffe0) == 0xd50b7420) { /* DC ZVA：把地址所在的整块清零，块总在一页之内 */
+        uint64_t va = untag(rx(c, insn & 31)) & ~(uint64_t)(DCZ_BLOCK - 1);
+        void *p = tlb_lookup(c, va, APPINE_ACCESS_WRITE);
+        if (!p) {
+            raise_fault(c, va, APPINE_ACCESS_WRITE, APPINE_FAULT_PAGE);
+            return APPINE_EXIT_FAULT;
+        }
+        memset(p, 0, DCZ_BLOCK);
+        return next(c);
+    }
 
     uint32_t reg_branch = insn & 0xfffffc1f;
     if (reg_branch == 0xd61f0000 || reg_branch == 0xd63f0000 || reg_branch == 0xd65f0000) {

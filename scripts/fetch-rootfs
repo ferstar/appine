@@ -1,0 +1,40 @@
+#!/bin/sh
+# 下载并校验 Alpine minirootfs（设计文档 §11.4）。版本和 sha256 固定写在这里，
+# 升级时一起修改。用法：scripts/fetch-rootfs [输出目录]，默认 target/rootfs。
+set -eu
+
+version=3.24.3
+sha256=4d3f80afaebd447c5591a63a73bde380a149fe8b2d85488cafabb2ff97551f50
+name=alpine-minirootfs-$version-aarch64.tar.gz
+url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/aarch64/$name
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-$root/target/rootfs}
+mkdir -p "$out"
+file=$out/$name
+
+# 只取摘要比较：GNU 和 BSD 的 sha256sum 参数不同，输出的第一列都是摘要
+digest() {
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$1"
+    else
+        shasum -a 256 "$1"
+    fi | cut -d' ' -f1
+}
+
+check() {
+    [ "$(digest "$1")" = "$sha256" ]
+}
+
+if [ -f "$file" ] && check "$file"; then
+    echo "$file"
+    exit 0
+fi
+curl -fsSL --retry 3 -o "$file.part" "$url"
+if ! check "$file.part"; then
+    echo "fetch-rootfs: sha256 mismatch for $url" >&2
+    rm -f "$file.part"
+    exit 1
+fi
+mv "$file.part" "$file"
+echo "$file"

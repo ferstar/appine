@@ -9,20 +9,66 @@ pub struct Errno(pub i32);
 impl Errno {
     /// 不允许的操作。
     pub const EPERM: Errno = Errno(1);
+    /// 文件不存在。
+    pub const ENOENT: Errno = Errno(2);
+    /// 进程不存在。
+    pub const ESRCH: Errno = Errno(3);
+    /// 被信号打断。
+    pub const EINTR: Errno = Errno(4);
     /// I/O 错误。
     pub const EIO: Errno = Errno(5);
+    /// 设备或地址不存在。
+    pub const ENXIO: Errno = Errno(6);
+    /// 参数列表太长。
+    pub const E2BIG: Errno = Errno(7);
     /// 可执行文件格式错误。
     pub const ENOEXEC: Errno = Errno(8);
     /// fd 无效。
     pub const EBADF: Errno = Errno(9);
+    /// 没有子进程。
+    pub const ECHILD: Errno = Errno(10);
+    /// 暂时不可用。
+    pub const EAGAIN: Errno = Errno(11);
     /// 内存不足。
     pub const ENOMEM: Errno = Errno(12);
+    /// 权限不足。
+    pub const EACCES: Errno = Errno(13);
     /// guest 地址无效。
     pub const EFAULT: Errno = Errno(14);
+    /// 文件已存在。
+    pub const EEXIST: Errno = Errno(17);
+    /// 跨文件系统。
+    pub const EXDEV: Errno = Errno(18);
+    /// 设备不支持该操作。
+    pub const ENODEV: Errno = Errno(19);
+    /// 不是目录。
+    pub const ENOTDIR: Errno = Errno(20);
+    /// 是目录。
+    pub const EISDIR: Errno = Errno(21);
     /// 参数无效。
     pub const EINVAL: Errno = Errno(22);
+    /// fd 用尽。
+    pub const EMFILE: Errno = Errno(24);
+    /// 不是终端。
+    pub const ENOTTY: Errno = Errno(25);
+    /// 不能 seek。
+    pub const ESPIPE: Errno = Errno(29);
+    /// 只读文件系统。
+    pub const EROFS: Errno = Errno(30);
+    /// 结果超出范围。
+    pub const ERANGE: Errno = Errno(34);
+    /// 名字太长。
+    pub const ENAMETOOLONG: Errno = Errno(36);
     /// 未实现的 syscall。
     pub const ENOSYS: Errno = Errno(38);
+    /// 目录非空。
+    pub const ENOTEMPTY: Errno = Errno(39);
+    /// 符号链接层数太多。
+    pub const ELOOP: Errno = Errno(40);
+    /// 值溢出。
+    pub const EOVERFLOW: Errno = Errno(75);
+    /// 不支持的操作。
+    pub const EOPNOTSUPP: Errno = Errno(95);
 
     /// syscall 返回给 guest 的值：`-errno`。
     pub fn to_syscall_return(self) -> u64 {

@@ -1,7 +1,9 @@
-//! ELF 加载器。
+//! ELF 加载器（设计文档 §6.1）。
 //!
-//! M0 只支持静态链接、非 PIE（`ET_EXEC`）的 aarch64 程序，初始栈只带最小的
-//! auxv（含 §4.4 的 `AT_HWCAP`）；PIE、动态链接和完整 auxv 在 M1b 加入（设计文档 §14）。
+//! 支持静态链接（`ET_EXEC`）和位置无关（`ET_DYN`）的 aarch64 程序。带
+//! `PT_INTERP` 的程序同时加载解释器（Alpine 上是 `ld-musl`），从解释器的入口
+//! 开始执行，由它完成动态链接。段的内容拷贝进匿名内存；初始栈按 Linux 的约定
+//! 构造，auxv 与 arm64 Linux 给出的条目一致（不含 vDSO）。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,16 +18,32 @@ const ET_DYN: u16 = 3;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 const PHDR_SIZE: u64 = 56;
 
 const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_FLAGS: u64 = 8;
 const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_PLATFORM: u64 = 15;
 const AT_HWCAP: u64 = 16;
+const AT_CLKTCK: u64 = 17;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
 const AT_HWCAP2: u64 = 26;
+const AT_EXECFN: u64 = 31;
+const AT_MINSIGSTKSZ: u64 = 51;
 
 /// 初始栈顶（不含），即 47 位地址空间的上界。
 pub const STACK_TOP: u64 = 1 << 47;
@@ -33,13 +51,21 @@ pub const STACK_TOP: u64 = 1 << 47;
 pub const STACK_SIZE: u64 = 8 << 20;
 /// argv、envp 及其字符串最多占用的栈空间，超过时报 `E2BIG`。
 const MAX_ARG_BYTES: usize = (STACK_SIZE / 4) as usize;
+/// 位置无关的主程序的加载基址：地址空间的 2/3，与 arm64 Linux 的 `ELF_ET_DYN_BASE` 取法相同。
+const ET_DYN_BASE: u64 = 0x5555_5555_0000;
+/// 解释器路径的最大长度。
+const MAX_INTERP_PATH: u64 = 4096;
+/// arm64 的 `AT_MINSIGSTKSZ`：信号帧最多需要的字节数（含 SVE 之外的全部扩展）。
+const MIN_SIGSTACK_SIZE: u64 = 5120;
+/// `sysconf(_SC_CLK_TCK)`。
+pub const CLOCK_TICKS: u64 = 100;
 
 /// 加载失败的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
     /// 不是 ELF 文件。
     NotElf,
-    /// ELF 合法，但 M0 还不支持。
+    /// ELF 合法，但还不支持。
     Unsupported(&'static str),
     /// ELF 结构损坏。
     Malformed(&'static str),
@@ -47,6 +73,8 @@ pub enum LoadError {
     ArgumentsTooLong,
     /// 建立映射失败。
     Memory(Errno),
+    /// 读取解释器失败。
+    Interpreter(Vec<u8>, Errno),
 }
 
 impl fmt::Display for LoadError {
@@ -57,16 +85,34 @@ impl fmt::Display for LoadError {
             LoadError::Malformed(what) => write!(f, "malformed ELF: {what}"),
             LoadError::ArgumentsTooLong => f.write_str("argument list too long"),
             LoadError::Memory(errno) => write!(f, "cannot map memory: {errno}"),
+            LoadError::Interpreter(path, errno) => {
+                write!(
+                    f,
+                    "cannot load interpreter {}: {errno}",
+                    String::from_utf8_lossy(path)
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for LoadError {}
 
+/// guest 程序的启动参数。
+#[derive(Debug, Clone, Copy)]
+pub struct Args<'a> {
+    /// argv。
+    pub argv: &'a [Vec<u8>],
+    /// envp。
+    pub envp: &'a [Vec<u8>],
+    /// 程序路径，放进 `AT_EXECFN`。
+    pub execfn: &'a [u8],
+}
+
 /// 加载结果：guest 开始执行时的 pc 和 sp。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Image {
-    /// 入口地址。
+    /// 入口地址（有解释器时是解释器的入口）。
     pub entry: u64,
     /// 初始栈指针，指向 argc。
     pub sp: u64,
@@ -74,120 +120,274 @@ pub struct Image {
 
 struct Segment {
     vaddr: u64,
+    memsz: u64,
     offset: usize,
     filesz: usize,
+    prot: u32,
 }
 
+/// 解析后的 ELF 文件。
+struct Elf<'a> {
+    file: &'a [u8],
+    e_type: u16,
+    entry: u64,
+    phoff: u64,
+    phnum: u64,
+    phdr_vaddr: Option<u64>,
+    interp: Option<Vec<u8>>,
+    segments: Vec<Segment>,
+}
+
+/// 映射到内存后的 ELF。
+struct Loaded {
+    bias: u64,
+    entry: u64,
+    phdr: u64,
+    phnum: u64,
+    end: u64,
+}
+
+impl<'a> Elf<'a> {
+    fn parse(file: &'a [u8]) -> Result<Self, LoadError> {
+        if file.len() < 64 || &file[..4] != b"\x7fELF" {
+            return Err(LoadError::NotElf);
+        }
+        if file[4] != 2 || file[5] != 1 {
+            return Err(LoadError::Unsupported("not a 64-bit little-endian ELF"));
+        }
+        if u16_at(file, 18)? != EM_AARCH64 {
+            return Err(LoadError::Unsupported("not an aarch64 executable"));
+        }
+        let e_type = u16_at(file, 16)?;
+        if e_type != ET_EXEC && e_type != ET_DYN {
+            return Err(LoadError::Unsupported("not an executable"));
+        }
+        let entry = u64_at(file, 24)?;
+        let phoff = u64_at(file, 32)?;
+        if u16_at(file, 54)? as u64 != PHDR_SIZE {
+            return Err(LoadError::Malformed("unexpected program header size"));
+        }
+        let phnum = u16_at(file, 56)? as u64;
+
+        let mut elf = Elf {
+            file,
+            e_type,
+            entry,
+            phoff,
+            phnum,
+            phdr_vaddr: None,
+            interp: None,
+            segments: Vec::new(),
+        };
+        for i in 0..phnum {
+            let ph = phoff
+                .checked_add(i * PHDR_SIZE)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or(LoadError::Malformed("program header out of range"))?;
+            let p_type = u32_at(file, ph)?;
+            let flags = u32_at(file, ph + 4)?;
+            let offset = u64_at(file, ph + 8)?;
+            let vaddr = u64_at(file, ph + 16)?;
+            let filesz = u64_at(file, ph + 32)?;
+            let memsz = u64_at(file, ph + 40)?;
+            match p_type {
+                PT_PHDR => elf.phdr_vaddr = Some(vaddr),
+                PT_INTERP => {
+                    let range = usize::try_from(offset)
+                        .ok()
+                        .zip(usize::try_from(filesz).ok())
+                        .filter(|_| filesz > 1 && filesz <= MAX_INTERP_PATH)
+                        .and_then(|(o, n)| file.get(o..o.checked_add(n)?))
+                        .ok_or(LoadError::Malformed("bad interpreter path"))?;
+                    let path = range
+                        .strip_suffix(&[0])
+                        .ok_or(LoadError::Malformed("bad interpreter path"))?;
+                    if path.contains(&0) {
+                        return Err(LoadError::Malformed("bad interpreter path"));
+                    }
+                    elf.interp = Some(path.to_vec());
+                }
+                PT_LOAD => {
+                    if filesz > memsz {
+                        return Err(LoadError::Malformed(
+                            "segment file size exceeds memory size",
+                        ));
+                    }
+                    // 只含 .bss 的段 filesz 为 0，p_offset 可以指到文件末尾之后，Linux 不会去读它
+                    let file_end = offset.checked_add(filesz);
+                    if filesz > 0 && file_end.is_none_or(|end| end > file.len() as u64) {
+                        return Err(LoadError::Malformed("segment exceeds the file"));
+                    }
+                    if vaddr
+                        .checked_add(memsz)
+                        .is_none_or(|end| end > 1 << VA_BITS)
+                    {
+                        return Err(LoadError::Malformed("segment outside the address space"));
+                    }
+                    if memsz == 0 {
+                        continue;
+                    }
+                    elf.segments.push(Segment {
+                        vaddr,
+                        memsz,
+                        offset: offset as usize,
+                        filesz: filesz as usize,
+                        prot: to_prot(flags),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if elf.segments.is_empty() {
+            return Err(LoadError::Malformed("no loadable segments"));
+        }
+        Ok(elf)
+    }
+
+    /// 段覆盖的页范围 `[起点, 终点)`（未加偏移）。
+    fn span(&self) -> (u64, u64) {
+        let lo = self.segments.iter().map(|s| s.vaddr).min().unwrap() & !(PAGE_SIZE - 1);
+        let hi = self
+            .segments
+            .iter()
+            .map(|s| s.vaddr + s.memsz)
+            .max()
+            .unwrap();
+        (lo, hi.next_multiple_of(PAGE_SIZE))
+    }
+
+    /// 程序头在内存中的地址（未加偏移）：优先用 `PT_PHDR`，否则找包含程序头的段。
+    fn phdr_vaddr(&self) -> Result<u64, LoadError> {
+        if let Some(v) = self.phdr_vaddr {
+            return Ok(v);
+        }
+        let size = self.phnum * PHDR_SIZE;
+        self.segments
+            .iter()
+            .find(|s| {
+                s.offset as u64 <= self.phoff && self.phoff + size <= (s.offset + s.filesz) as u64
+            })
+            .map(|s| s.vaddr + (self.phoff - s.offset as u64))
+            .ok_or(LoadError::Malformed("program headers are not loaded"))
+    }
+
+    /// 以偏移 `bias` 把段映射进 `mm`。
+    fn map(&self, mm: &mut Mm, bias: u64) -> Result<Loaded, LoadError> {
+        let (_, hi) = self.span();
+        if bias
+            .checked_add(hi)
+            .is_none_or(|end| end > STACK_TOP - STACK_SIZE)
+        {
+            return Err(LoadError::Unsupported("segment overlaps the stack"));
+        }
+        // 每个 guest 页的权限是覆盖它的所有段的并集
+        let mut pages: BTreeMap<u64, u32> = BTreeMap::new();
+        for seg in &self.segments {
+            let mut page = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
+            while page < bias + seg.vaddr + seg.memsz {
+                *pages.entry(page).or_insert(0) |= seg.prot;
+                page += PAGE_SIZE;
+            }
+        }
+        // 相邻且权限相同的页合并成一次映射
+        let mut runs: Vec<(u64, u64, u32)> = Vec::new();
+        for (&page, &page_prot) in &pages {
+            match runs.last_mut() {
+                Some((start, len, p)) if *start + *len == page && *p == page_prot => {
+                    *len += PAGE_SIZE
+                }
+                _ => runs.push((page, PAGE_SIZE, page_prot)),
+            }
+        }
+        for (start, len, run_prot) in runs {
+            mm.map_anonymous(start, len, run_prot)
+                .map_err(LoadError::Memory)?;
+        }
+        for seg in self.segments.iter().filter(|seg| seg.filesz > 0) {
+            mm.write_kernel(
+                bias + seg.vaddr,
+                &self.file[seg.offset..seg.offset + seg.filesz],
+            )
+            .map_err(LoadError::Memory)?;
+        }
+        Ok(Loaded {
+            bias,
+            entry: bias + self.entry,
+            phdr: bias + self.phdr_vaddr()?,
+            phnum: self.phnum,
+            end: bias + hi,
+        })
+    }
+}
+
+/// 按 guest 路径读取解释器文件的回调。
+pub type ReadInterp<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>, Errno> + 'a;
+
 /// 把 ELF 文件 `file` 加载进 `mm`，并按 Linux 的约定构造初始栈。
+///
+/// 程序带 `PT_INTERP` 时，用 `read_interp` 按 guest 路径读取解释器文件。
 pub fn load(
     mm: &mut Mm,
     file: &[u8],
-    argv: &[Vec<u8>],
-    envp: &[Vec<u8>],
+    args: &Args<'_>,
+    read_interp: &mut ReadInterp<'_>,
 ) -> Result<Image, LoadError> {
-    if file.len() < 64 || &file[..4] != b"\x7fELF" {
-        return Err(LoadError::NotElf);
-    }
-    if file[4] != 2 || file[5] != 1 {
-        return Err(LoadError::Unsupported("not a 64-bit little-endian ELF"));
-    }
-    if u16_at(file, 18)? != EM_AARCH64 {
-        return Err(LoadError::Unsupported("not an aarch64 executable"));
-    }
-    match u16_at(file, 16)? {
-        ET_EXEC => {}
-        ET_DYN => {
-            return Err(LoadError::Unsupported(
-                "position-independent executables (M1)",
-            ));
-        }
-        _ => return Err(LoadError::Unsupported("not an executable")),
-    }
-    let entry = u64_at(file, 24)?;
-    let phoff = u64_at(file, 32)?;
-    if u16_at(file, 54)? as u64 != PHDR_SIZE {
-        return Err(LoadError::Malformed("unexpected program header size"));
-    }
-    let phnum = u16_at(file, 56)? as u64;
+    let exe = Elf::parse(file)?;
+    let bias = match exe.e_type {
+        ET_DYN => ET_DYN_BASE - exe.span().0,
+        _ => 0,
+    };
+    let main = exe.map(mm, bias)?;
 
-    // 每个 guest 页的权限是覆盖它的所有段的并集
-    let mut pages: BTreeMap<u64, u32> = BTreeMap::new();
-    let mut segments = Vec::new();
-    for i in 0..phnum {
-        let ph = phoff
-            .checked_add(i * PHDR_SIZE)
-            .and_then(|v| usize::try_from(v).ok())
-            .ok_or(LoadError::Malformed("program header out of range"))?;
-        match u32_at(file, ph)? {
-            PT_LOAD => {}
-            PT_INTERP => {
-                return Err(LoadError::Unsupported(
-                    "dynamically linked executables (M1)",
-                ));
-            }
-            _ => continue,
+    let mut interp_base = 0;
+    let mut entry = main.entry;
+    if let Some(path) = &exe.interp {
+        let data = read_interp(path).map_err(|e| LoadError::Interpreter(path.clone(), e))?;
+        let interp = Elf::parse(&data)?;
+        if interp.e_type != ET_DYN || interp.interp.is_some() {
+            return Err(LoadError::Unsupported("interpreter is not a shared object"));
         }
-        let flags = u32_at(file, ph + 4)?;
-        let offset = u64_at(file, ph + 8)?;
-        let vaddr = u64_at(file, ph + 16)?;
-        let filesz = u64_at(file, ph + 32)?;
-        let memsz = u64_at(file, ph + 40)?;
-        if filesz > memsz {
-            return Err(LoadError::Malformed(
-                "segment file size exceeds memory size",
-            ));
-        }
-        // 只含 .bss 的段 filesz 为 0，p_offset 可以指到文件末尾之后，Linux 不会去读它
-        let file_end = offset.checked_add(filesz);
-        if filesz > 0 && file_end.is_none_or(|end| end > file.len() as u64) {
-            return Err(LoadError::Malformed("segment exceeds the file"));
-        }
-        let end = vaddr
-            .checked_add(memsz)
-            .filter(|&end| end <= 1 << VA_BITS)
-            .ok_or(LoadError::Malformed("segment outside the address space"))?;
-        if end > STACK_TOP - STACK_SIZE {
-            return Err(LoadError::Unsupported("segment overlaps the stack"));
-        }
-        if memsz == 0 {
-            continue;
-        }
-        let seg_prot = to_prot(flags);
-        let mut page = vaddr & !(PAGE_SIZE - 1);
-        while page < end {
-            *pages.entry(page).or_insert(0) |= seg_prot;
-            page += PAGE_SIZE;
-        }
-        segments.push(Segment {
-            vaddr,
-            offset: offset as usize,
-            filesz: filesz as usize,
-        });
-    }
-    if segments.is_empty() {
-        return Err(LoadError::Malformed("no loadable segments"));
+        let (lo, hi) = interp.span();
+        let base = mm
+            .find_free(hi - lo)
+            .ok_or(LoadError::Memory(Errno::ENOMEM))?;
+        let loaded = interp.map(mm, base - lo)?;
+        crate::debug::log(format_args!(
+            "loaded {} at {:#x}, interpreter at {base:#x}",
+            String::from_utf8_lossy(args.execfn),
+            main.bias + exe.span().0
+        ));
+        interp_base = loaded.bias + lo;
+        entry = loaded.entry;
     }
 
-    // 相邻且权限相同的页合并成一次映射
-    let mut runs: Vec<(u64, u64, u32)> = Vec::new();
-    for (&page, &page_prot) in &pages {
-        match runs.last_mut() {
-            Some((start, len, p)) if *start + *len == page && *p == page_prot => *len += PAGE_SIZE,
-            _ => runs.push((page, PAGE_SIZE, page_prot)),
-        }
-    }
-    for (start, len, run_prot) in runs {
-        mm.map_anonymous(start, len, run_prot)
-            .map_err(LoadError::Memory)?;
-    }
-    for seg in segments.iter().filter(|seg| seg.filesz > 0) {
-        mm.write_kernel(seg.vaddr, &file[seg.offset..seg.offset + seg.filesz])
-            .map_err(LoadError::Memory)?;
-    }
-
+    mm.set_brk(main.end);
     mm.map_anonymous(STACK_TOP - STACK_SIZE, STACK_SIZE, prot::READ | prot::WRITE)
         .map_err(LoadError::Memory)?;
-    let sp = build_stack(mm, argv, envp, entry)?;
+    let mut random = [0u8; 16];
+    appine_hal::fill_random(&mut random).map_err(|e| LoadError::Memory(Errno(e)))?;
+    let auxv = [
+        (AT_HWCAP, appine_engine::guest_hwcap()),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_CLKTCK, CLOCK_TICKS),
+        (AT_PHDR, main.phdr),
+        (AT_PHENT, PHDR_SIZE),
+        (AT_PHNUM, main.phnum),
+        (AT_BASE, interp_base),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, main.entry),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_SECURE, 0),
+        (AT_RANDOM, 0),
+        (AT_HWCAP2, 0),
+        (AT_EXECFN, 0),
+        (AT_PLATFORM, 0),
+        (AT_MINSIGSTKSZ, MIN_SIGSTACK_SIZE),
+    ];
+    let sp = build_stack(mm, args, &auxv, &random)?;
     Ok(Image { entry, sp })
 }
 
@@ -196,42 +396,63 @@ pub fn load(
 /// ```text
 /// sp → argc | argv[0..n] | NULL | envp[0..m] | NULL | auxv 键值对 | AT_NULL
 ///      ……
-///      argv 与 envp 的字符串（升序排列）
+///      AT_RANDOM 的 16 字节 | argv、envp、AT_EXECFN、AT_PLATFORM 的字符串
 /// STACK_TOP
 /// ```
-fn build_stack(mm: &Mm, argv: &[Vec<u8>], envp: &[Vec<u8>], entry: u64) -> Result<u64, LoadError> {
-    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
-    let auxv = [
-        (AT_PAGESZ, PAGE_SIZE),
-        (AT_ENTRY, entry),
-        (AT_HWCAP, appine_engine::guest_hwcap()),
-        (AT_HWCAP2, 0),
-        (AT_NULL, 0),
-    ];
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * auxv.len();
+///
+/// `auxv` 里 `AT_RANDOM`、`AT_EXECFN`、`AT_PLATFORM` 的值在这里填入。
+fn build_stack(
+    mm: &Mm,
+    args: &Args<'_>,
+    auxv: &[(u64, u64)],
+    random: &[u8; 16],
+) -> Result<u64, LoadError> {
+    const PLATFORM: &[u8] = b"aarch64";
+    let (argv, envp) = (args.argv, args.envp);
+    let extra = [args.execfn, PLATFORM];
+    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum::<usize>()
+        + extra.iter().map(|s| s.len() + 1).sum::<usize>()
+        + random.len();
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * (auxv.len() + 1);
     if strings + words * 8 > MAX_ARG_BYTES {
         return Err(LoadError::ArgumentsTooLong);
     }
 
-    let mut cursor = (STACK_TOP - 16 - strings as u64) & !15;
-    let mut table = vec![argv.len() as u64];
-    for (i, s) in argv.iter().chain(envp).enumerate() {
-        if i == argv.len() {
-            table.push(0);
+    let strings_start = (STACK_TOP - 16 - strings as u64) & !15;
+    let mut cursor = strings_start;
+    let mut put = |data: &[u8], nul: bool| -> Result<u64, LoadError> {
+        let at = cursor;
+        mm.write_kernel(at, data).map_err(LoadError::Memory)?;
+        cursor += data.len() as u64;
+        if nul {
+            mm.write_kernel(cursor, &[0]).map_err(LoadError::Memory)?;
+            cursor += 1;
         }
-        mm.write_kernel(cursor, s).map_err(LoadError::Memory)?;
-        mm.write_kernel(cursor + s.len() as u64, &[0])
-            .map_err(LoadError::Memory)?;
-        table.push(cursor);
-        cursor += s.len() as u64 + 1;
-    }
-    if envp.is_empty() {
-        table.push(0);
+        Ok(at)
+    };
+    let random_at = put(random, false)?;
+    let mut table = vec![argv.len() as u64];
+    for s in argv {
+        table.push(put(s, true)?);
     }
     table.push(0);
-    table.extend(auxv.iter().flat_map(|&(k, v)| [k, v]));
+    for s in envp {
+        table.push(put(s, true)?);
+    }
+    table.push(0);
+    let execfn_at = put(args.execfn, true)?;
+    let platform_at = put(PLATFORM, true)?;
+    for &(key, value) in auxv {
+        let value = match key {
+            AT_RANDOM => random_at,
+            AT_EXECFN => execfn_at,
+            AT_PLATFORM => platform_at,
+            _ => value,
+        };
+        table.extend([key, value]);
+    }
+    table.extend([AT_NULL, 0]);
 
-    let strings_start = (STACK_TOP - 16 - strings as u64) & !15;
     let sp = (strings_start - table.len() as u64 * 8) & !15;
     let bytes: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
     mm.write_kernel(sp, &bytes).map_err(LoadError::Memory)?;
@@ -304,22 +525,55 @@ mod tests {
         f
     }
 
+    /// 在 `tiny_elf` 后面追加一个 PT_INTERP 程序头和路径。
+    fn with_interp(mut f: Vec<u8>, path: &[u8]) -> Vec<u8> {
+        let code = f.split_off(0x78);
+        f.truncate(64 + 56);
+        f[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let path_at = 64 + 2 * 56;
+        let mut ph = vec![0u8; 56];
+        ph[..4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        ph[8..16].copy_from_slice(&(path_at as u64).to_le_bytes());
+        ph[32..40].copy_from_slice(&(path.len() as u64 + 1).to_le_bytes());
+        f.extend_from_slice(&ph);
+        f.extend_from_slice(path);
+        f.push(0);
+        f.resize(f.len().next_multiple_of(4), 0);
+        let code_at = f.len() as u64;
+        f[24..32].copy_from_slice(&(0x400000 + code_at).to_le_bytes());
+        f.extend_from_slice(&code);
+        let size = f.len() as u64;
+        f[64 + 32..64 + 40].copy_from_slice(&size.to_le_bytes());
+        f[64 + 40..64 + 48].copy_from_slice(&size.to_le_bytes());
+        f
+    }
+
     fn read_u64(mm: &Mm, addr: u64) -> u64 {
         let mut b = [0u8; 8];
         mm.read(UserSlice::new(addr, 8), &mut b).unwrap();
         u64::from_le_bytes(b)
     }
 
-    fn read_cstr(mm: &Mm, addr: u64) -> Vec<u8> {
-        let mut out = Vec::new();
+    fn no_interp(_: &[u8]) -> Result<Vec<u8>, Errno> {
+        Err(Errno::ENOENT)
+    }
+
+    /// 读出初始栈上的 auxv。
+    fn auxv(mm: &Mm, sp: u64) -> BTreeMap<u64, u64> {
+        let argc = read_u64(mm, sp);
+        let mut p = sp + 8 * (argc + 2);
+        while read_u64(mm, p) != 0 {
+            p += 8;
+        }
+        p += 8;
+        let mut out = BTreeMap::new();
         loop {
-            let mut b = [0u8; 1];
-            mm.read(UserSlice::new(addr + out.len() as u64, 1), &mut b)
-                .unwrap();
-            if b[0] == 0 {
+            let (k, v) = (read_u64(mm, p), read_u64(mm, p + 8));
+            if k == AT_NULL {
                 return out;
             }
-            out.push(b[0]);
+            out.insert(k, v);
+            p += 16;
         }
     }
 
@@ -329,7 +583,12 @@ mod tests {
         let code = 0xd503201fu32.to_le_bytes(); // nop
         let argv = vec![b"prog".to_vec(), b"arg1".to_vec()];
         let envp = vec![b"K=V".to_vec()];
-        let image = load(&mut mm, &tiny_elf(ET_EXEC, &code), &argv, &envp).unwrap();
+        let args = Args {
+            argv: &argv,
+            envp: &envp,
+            execfn: b"/bin/prog",
+        };
+        let image = load(&mut mm, &tiny_elf(ET_EXEC, &code), &args, &mut no_interp).unwrap();
         assert_eq!(image.entry, 0x400078);
         assert_eq!(image.sp % 16, 0);
         assert_eq!(read_u64(&mm, 0x400078) as u32, 0xd503201f);
@@ -338,19 +597,57 @@ mod tests {
 
         let sp = image.sp;
         assert_eq!(read_u64(&mm, sp), 2);
-        assert_eq!(read_cstr(&mm, read_u64(&mm, sp + 8)), b"prog");
-        assert_eq!(read_cstr(&mm, read_u64(&mm, sp + 16)), b"arg1");
+        assert_eq!(mm.read_cstr(read_u64(&mm, sp + 8), 64).unwrap(), b"prog");
+        assert_eq!(mm.read_cstr(read_u64(&mm, sp + 16), 64).unwrap(), b"arg1");
         assert_eq!(read_u64(&mm, sp + 24), 0);
-        assert_eq!(read_cstr(&mm, read_u64(&mm, sp + 32)), b"K=V");
+        assert_eq!(mm.read_cstr(read_u64(&mm, sp + 32), 64).unwrap(), b"K=V");
         assert_eq!(read_u64(&mm, sp + 40), 0);
-        assert_eq!(read_u64(&mm, sp + 48), AT_PAGESZ);
-        assert_eq!(read_u64(&mm, sp + 56), PAGE_SIZE);
-        assert_eq!(read_u64(&mm, sp + 64), AT_ENTRY);
-        assert_eq!(read_u64(&mm, sp + 72), 0x400078);
-        assert_eq!(read_u64(&mm, sp + 80), AT_HWCAP);
-        assert_eq!(read_u64(&mm, sp + 88), appine_engine::guest_hwcap());
-        assert_eq!(read_u64(&mm, sp + 96), AT_HWCAP2);
-        assert_eq!(read_u64(&mm, sp + 112), AT_NULL);
+
+        let aux = auxv(&mm, sp);
+        assert_eq!(aux[&AT_PAGESZ], PAGE_SIZE);
+        assert_eq!(aux[&AT_ENTRY], 0x400078);
+        assert_eq!(aux[&AT_HWCAP], appine_engine::guest_hwcap());
+        assert_eq!(aux[&AT_PHDR], 0x400040);
+        assert_eq!((aux[&AT_PHENT], aux[&AT_PHNUM]), (56, 1));
+        assert_eq!(aux[&AT_BASE], 0);
+        assert_eq!(mm.read_cstr(aux[&AT_EXECFN], 64).unwrap(), b"/bin/prog");
+        assert_eq!(mm.read_cstr(aux[&AT_PLATFORM], 64).unwrap(), b"aarch64");
+        let mut random = [0u8; 16];
+        mm.read(UserSlice::new(aux[&AT_RANDOM], 16), &mut random)
+            .unwrap();
+        assert_ne!(random, [0; 16]);
+    }
+
+    #[test]
+    fn loads_pie_with_interpreter() {
+        let code = 0xd503201fu32.to_le_bytes();
+        let exe = with_interp(tiny_elf(ET_DYN, &code), b"/lib/ld.so");
+        let mut ld = tiny_elf(ET_DYN, &code);
+        ld[24..32].copy_from_slice(&0x400078u64.to_le_bytes());
+        let mut requested = Vec::new();
+        let mut read_interp = |path: &[u8]| {
+            requested = path.to_vec();
+            Ok(ld.clone())
+        };
+        let mut mm = Mm::new();
+        let args = Args {
+            argv: &[b"prog".to_vec()],
+            envp: &[],
+            execfn: b"prog",
+        };
+        let image = load(&mut mm, &exe, &args, &mut read_interp).unwrap();
+        assert_eq!(requested, b"/lib/ld.so");
+
+        let aux = auxv(&mm, image.sp);
+        let exe_base = ET_DYN_BASE - 0x400000;
+        assert_eq!(aux[&AT_PHDR], exe_base + 0x400040);
+        assert_eq!(aux[&AT_PHNUM], 2);
+        assert_eq!(aux[&AT_ENTRY], exe_base + u64_at(&exe, 24).unwrap());
+        let interp_base = aux[&AT_BASE];
+        assert!(interp_base > ET_DYN_BASE && interp_base.is_multiple_of(PAGE_SIZE));
+        assert_eq!(image.entry, interp_base + 0x78);
+        assert!(mm.mmu().translate(image.entry, prot::EXEC).is_some());
+        assert!(mm.mmu().translate(aux[&AT_ENTRY], prot::EXEC).is_some());
     }
 
     #[test]
@@ -374,22 +671,38 @@ mod tests {
         f.extend_from_slice(&0xd503201fu32.to_le_bytes());
 
         let mut mm = Mm::new();
-        load(&mut mm, &f, &[], &[]).unwrap();
+        let args = Args {
+            argv: &[],
+            envp: &[],
+            execfn: b"",
+        };
+        load(&mut mm, &f, &args, &mut no_interp).unwrap();
         assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
         assert!(mm.mmu().translate(0x423fe0, prot::WRITE).is_some());
         assert_eq!(read_u64(&mm, 0x420000), 0);
+        // program break 紧跟在最后一个段之后
+        assert_eq!(mm.brk(0), 0x424000);
     }
 
     #[test]
     fn rejects_unsupported_files() {
         let mut mm = Mm::new();
+        let args = Args {
+            argv: &[],
+            envp: &[],
+            execfn: b"",
+        };
         assert_eq!(
-            load(&mut mm, b"#!/bin/sh\n", &[], &[]),
+            load(&mut mm, b"#!/bin/sh\n", &args, &mut no_interp),
             Err(LoadError::NotElf)
         );
-        assert!(matches!(
-            load(&mut mm, &tiny_elf(ET_DYN, &[0; 4]), &[], &[]),
-            Err(LoadError::Unsupported(_))
-        ));
+        let exe = with_interp(tiny_elf(ET_EXEC, &[0; 4]), b"/lib/missing.so");
+        assert_eq!(
+            load(&mut Mm::new(), &exe, &args, &mut no_interp),
+            Err(LoadError::Interpreter(
+                b"/lib/missing.so".to_vec(),
+                Errno::ENOENT
+            ))
+        );
     }
 }

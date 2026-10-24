@@ -1,34 +1,53 @@
 //! appine-run：在宿主终端里直接运行一个 guest 程序（开发用前端，设计文档 §13.3）。
 //!
-//! guest 以 `argv[0] = <program>` 启动，环境变量为空。退出码沿用 shell 的约定：
-//! 正常退出时是 guest 的退出码，被信号终止时是 128 + 信号编号，程序无法启动时
-//! 是 127（找不到）或 126（不能执行）。
+//! 不带 `--rootfs` 时，`<program>` 是宿主路径，guest 看不到任何文件系统；带上
+//! `--rootfs` 时，`<program>` 是 inode 仓库里的 guest 路径，动态链接的程序经由
+//! 仓库里的 `ld-musl` 加载。guest 以 `argv[0] = <program>` 启动，环境变量只有
+//! `--env` 给出的那些。退出码沿用 shell 的约定：正常退出时是 guest 的退出码，
+//! 被信号终止时是 128 + 信号编号，程序无法启动时是 127（找不到）或 126（不能执行）。
 
 use std::env;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
+use appine_kernel::errno::Errno;
 use appine_kernel::{DbtStats, ExitStatus, RunError, RunOptions, Tier};
 
-const USAGE: &str = "usage: appine-run [--tier 0|1] [--stats] [--] <program> [args...]
+const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
+       appine-run --rootfs <dir> --import <rootfs.tar.gz>
 
-  --tier 0   run in the interpreter (default)
-  --tier 1   run in the dynamic binary translator (aarch64 Linux hosts only)
-  --stats    print Tier 1 statistics to stderr on exit";
+  --tier 0             run in the interpreter (default)
+  --tier 1             run in the dynamic binary translator (aarch64 Linux hosts only)
+  --rootfs <dir>       resolve <program> in the inode store at <dir>
+  --import <tar.gz>    create the inode store at <dir> from a rootfs tarball, then exit
+  --env NAME=VALUE     add a guest environment variable (repeatable)
+  --stats              print Tier 1 statistics to stderr on exit";
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = env::args_os().skip(1).collect();
     let mut options = RunOptions::default();
     let mut stats = false;
+    let mut import = None;
+    let mut envp: Vec<Vec<u8>> = Vec::new();
     while let Some(arg) = args.first().and_then(|a| a.to_str()).map(str::to_owned) {
         if !arg.starts_with('-') {
             break;
         }
         args.remove(0);
-        match arg.as_str() {
+        // 带值的选项既可以写成 `--opt value`，也可以写成 `--opt=value`
+        let (name, inline) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(OsString::from(v))),
+            _ => (arg.clone(), None),
+        };
+        let mut value = || {
+            inline
+                .clone()
+                .or_else(|| (!args.is_empty()).then(|| args.remove(0)))
+        };
+        match name.as_str() {
             "--" => break,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -39,33 +58,65 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--stats" => stats = true,
-            "--tier" | "--tier=0" | "--tier=1" => {
-                let value = match arg.strip_prefix("--tier=") {
-                    Some(v) => Some(v.to_owned()),
-                    None if args.is_empty() => None,
-                    None => args.remove(0).into_string().ok(),
-                };
-                options.tier = match value.as_deref() {
+            "--tier" => {
+                options.tier = match value().as_ref().and_then(|v| v.to_str()) {
                     Some("0") => Tier::Interpreter,
                     Some("1") => Tier::Dbt,
                     _ => return usage_error(),
                 };
             }
+            "--rootfs" => match value() {
+                Some(v) => options.rootfs = Some(PathBuf::from(v)),
+                None => return usage_error(),
+            },
+            "--import" => match value() {
+                Some(v) => import = Some(PathBuf::from(v)),
+                None => return usage_error(),
+            },
+            "--env" => match value() {
+                Some(v) if v.as_bytes().contains(&b'=') => envp.push(v.as_bytes().to_vec()),
+                _ => return usage_error(),
+            },
             _ => return usage_error(),
         }
+    }
+
+    if let Some(tarball) = import {
+        let Some(store) = &options.rootfs else {
+            return usage_error();
+        };
+        return match appine_kernel::import_rootfs(store, &tarball) {
+            Ok(r) => {
+                eprintln!(
+                    "appine-run: imported {} files, {} directories, {} symlinks, {} hard links, {} device nodes",
+                    r.files, r.dirs, r.symlinks, r.hardlinks, r.nodes
+                );
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                let reason = if err == Errno::EEXIST {
+                    "the inode store already exists".to_owned()
+                } else {
+                    err.to_string()
+                };
+                eprintln!("appine-run: cannot import {}: {reason}", tarball.display());
+                ExitCode::from(1)
+            }
+        };
     }
     let Some(program) = args.first().cloned() else {
         return usage_error();
     };
 
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let path = Path::new(&program);
-    let report = match appine_kernel::run(path, &argv, &[], &options) {
+    let report = match appine_kernel::run(&program, &argv, &envp, &options) {
         Ok(report) => report,
         Err(err) => {
-            eprintln!("appine-run: {}: {err}", path.display());
+            eprintln!("appine-run: {}: {err}", program.to_string_lossy());
             return match err {
                 RunError::Io(io) if io.kind() == ErrorKind::NotFound => ExitCode::from(127),
+                RunError::Exec(errno) if errno == Errno::ENOENT => ExitCode::from(127),
+                RunError::Rootfs(_) => ExitCode::from(1),
                 _ => ExitCode::from(126),
             };
         }
@@ -81,11 +132,10 @@ fn main() -> ExitCode {
             fault_addr,
         } => {
             match fault_addr {
-                Some(addr) => eprintln!(
-                    "appine-run: guest killed by {} (pc={pc:#x}, addr={addr:#x})",
-                    signal.name()
-                ),
-                None => eprintln!("appine-run: guest killed by {} (pc={pc:#x})", signal.name()),
+                Some(addr) => {
+                    eprintln!("appine-run: guest killed by {signal} (pc={pc:#x}, addr={addr:#x})")
+                }
+                None => eprintln!("appine-run: guest killed by {signal} (pc={pc:#x})"),
             }
             ExitCode::from((128 + signal.number()) as u8)
         }

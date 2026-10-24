@@ -388,6 +388,24 @@ fn exceptions_hints_and_system_registers() {
     assert_eq!(g.cpu.state().tpidr_el0, 0xfeed);
     g.step(0xd53bd060); // mrs x0, tpidrro_el0
     assert_eq!(g.x(0), 0);
+
+    g.step(0xd53b00e5); // mrs x5, dczid_el0：64 字节块，允许 DC ZVA
+    assert_eq!(g.x(5), 4);
+    g.bytes(DATA + 0x80)[..0x100].fill(0xaa);
+    g.set_x(3, DATA + 0xc5);
+    g.step(0xd50b7423); // dc zva, x3
+    assert!(g.bytes(DATA + 0xc0)[..64].iter().all(|&b| b == 0));
+    assert_eq!(g.bytes(DATA + 0xbf)[0], 0xaa);
+    assert_eq!(g.bytes(DATA + 0x100)[0], 0xaa);
+    g.set_x(3, RODATA + 8);
+    assert_eq!(
+        g.cpu.exec_insn(0xd50b7423),
+        Some(Exit::Fault {
+            addr: RODATA,
+            access: Access::Write,
+            kind: FaultKind::Page
+        })
+    );
 }
 
 #[test]

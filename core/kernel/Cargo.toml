@@ -10,3 +10,7 @@ publish.workspace = true
 [dependencies]
 appine-engine.workspace = true
 appine-hal.workspace = true
+flate2.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+tar.workspace = true

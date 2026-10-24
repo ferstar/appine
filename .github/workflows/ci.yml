@@ -41,7 +41,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test (includes lockstep and guest programs)
+      # M1b 的端到端测试在 Alpine minirootfs 里运行 busybox；版本和 sha256 固定在脚本里
+      - uses: actions/cache@v4
+        with:
+          path: target/rootfs
+          key: rootfs-${{ hashFiles('scripts/fetch-rootfs') }}
+
+      - name: Fetch rootfs
+        run: scripts/fetch-rootfs
+
+      - name: Test (includes lockstep, guest programs and busybox in the rootfs)
+        env:
+          APPINE_REQUIRE_ROOTFS: "1"
         run: cargo test --workspace
 
       - name: Lockstep (extended)

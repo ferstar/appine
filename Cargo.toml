@@ -22,4 +22,7 @@ appine-engine = { path = "core/engine" }
 appine-hal = { path = "core/hal" }
 appine-kernel = { path = "core/kernel" }
 cc = "1"
+flate2 = "1"
 libc = "0.2"
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+tar = "0.4"
