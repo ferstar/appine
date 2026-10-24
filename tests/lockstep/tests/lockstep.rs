@@ -34,7 +34,7 @@ fn interpreter_matches_hardware() {
     eprintln!("lockstep seed = {seed}");
     match run(&config) {
         Ok(reports) => {
-            for r in &reports {
+            for r in reports.iter().filter(|r| !r.skipped) {
                 assert!(
                     r.executed > 0,
                     "class {} never executed an instruction",

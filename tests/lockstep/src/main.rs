@@ -75,6 +75,10 @@ fn main() -> ExitCode {
     match run(&config) {
         Ok(reports) => {
             for r in reports {
+                if r.skipped {
+                    println!("{:<18} skipped: the guest feature set lacks it", r.name);
+                    continue;
+                }
                 println!(
                     "{:<18} executed {:>8}  both-undefined {:>8}  rejected-by-whitelist {:>8}",
                     r.name, r.executed, r.both_undefined, r.stricter

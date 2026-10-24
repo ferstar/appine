@@ -92,11 +92,31 @@ struct appine_cpu {
     uint32_t reserved;
     uint64_t pending; /* 只能用原子操作访问；64 位是为了让 Tier 1 能用一条 ldr 读到它 */
     struct appine_mmu *mmu;
+    /* 独占监视器（LDXR/STXR）：记录的地址、长度和读到的值 */
+    uint64_t excl_addr;
+    uint64_t excl_value[2];
+    uint32_t excl_size; /* 0 表示没有独占标记 */
+    uint32_t reserved2;
     /* 以下字段由 Tier 1 内部使用 */
     uint64_t dbt_reason;
     uint64_t dbt_site;
     void *dbt_jump_cache;
 };
+
+/* ---- guest 可见的 CPU 特性（设计文档 §4.4），取值与 Linux 的 HWCAP_* 一致 ---- */
+
+#define APPINE_HWCAP_FP (UINT64_C(1) << 0)
+#define APPINE_HWCAP_ASIMD (UINT64_C(1) << 1)
+#define APPINE_HWCAP_AES (UINT64_C(1) << 3)
+#define APPINE_HWCAP_PMULL (UINT64_C(1) << 4)
+#define APPINE_HWCAP_SHA1 (UINT64_C(1) << 5)
+#define APPINE_HWCAP_SHA2 (UINT64_C(1) << 6)
+#define APPINE_HWCAP_CRC32 (UINT64_C(1) << 7)
+#define APPINE_HWCAP_ATOMICS (UINT64_C(1) << 8)
+#define APPINE_HWCAP_CPUID (UINT64_C(1) << 11)
+
+/* 宣告给 guest 的 AT_HWCAP：宿主支持 ∩ Tier 0 已实现 ∩ 白名单 */
+uint64_t appine_guest_hwcap(void);
 
 /* ---- soft-MMU 页表（设计文档 §5.1）---- */
 

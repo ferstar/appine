@@ -1,7 +1,7 @@
 //! ELF 加载器。
 //!
 //! M0 只支持静态链接、非 PIE（`ET_EXEC`）的 aarch64 程序，初始栈只带最小的
-//! auxv；PIE、动态链接和完整 auxv 在 M1 加入（设计文档 §14）。
+//! auxv（含 §4.4 的 `AT_HWCAP`）；PIE、动态链接和完整 auxv 在 M1b 加入（设计文档 §14）。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,6 +24,8 @@ const PHDR_SIZE: u64 = 56;
 const AT_NULL: u64 = 0;
 const AT_PAGESZ: u64 = 6;
 const AT_ENTRY: u64 = 9;
+const AT_HWCAP: u64 = 16;
+const AT_HWCAP2: u64 = 26;
 
 /// 初始栈顶（不含），即 47 位地址空间的上界。
 pub const STACK_TOP: u64 = 1 << 47;
@@ -199,7 +201,14 @@ pub fn load(
 /// ```
 fn build_stack(mm: &Mm, argv: &[Vec<u8>], envp: &[Vec<u8>], entry: u64) -> Result<u64, LoadError> {
     let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * 3;
+    let auxv = [
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_ENTRY, entry),
+        (AT_HWCAP, appine_engine::guest_hwcap()),
+        (AT_HWCAP2, 0),
+        (AT_NULL, 0),
+    ];
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * auxv.len();
     if strings + words * 8 > MAX_ARG_BYTES {
         return Err(LoadError::ArgumentsTooLong);
     }
@@ -220,7 +229,7 @@ fn build_stack(mm: &Mm, argv: &[Vec<u8>], envp: &[Vec<u8>], entry: u64) -> Resul
         table.push(0);
     }
     table.push(0);
-    table.extend([AT_PAGESZ, PAGE_SIZE, AT_ENTRY, entry, AT_NULL, 0]);
+    table.extend(auxv.iter().flat_map(|&(k, v)| [k, v]));
 
     let strings_start = (STACK_TOP - 16 - strings as u64) & !15;
     let sp = (strings_start - table.len() as u64 * 8) & !15;
@@ -338,7 +347,10 @@ mod tests {
         assert_eq!(read_u64(&mm, sp + 56), PAGE_SIZE);
         assert_eq!(read_u64(&mm, sp + 64), AT_ENTRY);
         assert_eq!(read_u64(&mm, sp + 72), 0x400078);
-        assert_eq!(read_u64(&mm, sp + 80), AT_NULL);
+        assert_eq!(read_u64(&mm, sp + 80), AT_HWCAP);
+        assert_eq!(read_u64(&mm, sp + 88), appine_engine::guest_hwcap());
+        assert_eq!(read_u64(&mm, sp + 96), AT_HWCAP2);
+        assert_eq!(read_u64(&mm, sp + 112), AT_NULL);
     }
 
     #[test]

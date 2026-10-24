@@ -2,15 +2,20 @@
 
 fn main() {
     let sources = [
+        "src/c/atomic.c",
         "src/c/cpu.c",
         "src/c/dbt.c",
+        "src/c/features.c",
         "src/c/interp.c",
         "src/c/mmu.c",
+        "src/c/native.c",
+        "src/c/simd.c",
     ];
-    for path in sources
-        .iter()
-        .chain(&["src/c/internal.h", "include/appine/engine.h"])
-    {
+    for path in sources.iter().chain(&[
+        "src/c/emit.h",
+        "src/c/internal.h",
+        "include/appine/engine.h",
+    ]) {
         println!("cargo::rerun-if-changed={path}");
     }
 

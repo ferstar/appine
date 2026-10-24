@@ -1,0 +1,217 @@
+/*
+ * Tier 0 的原生指令桩（设计文档 §4.2）：SIMD&FP 数据处理、CRC32 和 LSE 原子
+ * 操作直接交给宿主 CPU 执行同一条指令，结果与硬件逐位一致。Tier 0 只负责
+ * 白名单判定（§4.4）、地址翻译和寄存器搬运。
+ *
+ * 每条指令编码对应一个桩，缓存在一块可执行内存里：
+ *
+ *   void stub(struct appine_cpu *cpu, void *host_addr);
+ *
+ * 通用寄存器字段被换成宿主 x2–x7（成对的寄存器占两个），地址字段换成 x1；
+ * x9、x10 是桩自己的临时寄存器。FP 类的桩还会保存宿主 d8–d15 和 FPCR，
+ * 载入 guest 的 FPCR/FPSR/NZCV 和 V0–V31，执行后写回。
+ *
+ * 原型限制：可执行内存直接映射为 RWX；缓存写满时整体清空，因此还不能在
+ * 多个线程间共享。
+ */
+#include <pthread.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+#include "emit.h"
+#include "internal.h"
+
+#if defined(__aarch64__) && defined(__linux__)
+#define NATIVE_SUPPORTED 1
+#endif
+
+#ifdef NATIVE_SUPPORTED
+
+#include <sys/mman.h>
+
+#define CACHE_BYTES (UINT64_C(2) << 20)
+#define MAX_STUB_WORDS 96
+#define TABLE_BITS 12
+#define TABLE_SIZE (1u << TABLE_BITS)
+
+struct slot {
+    uint32_t insn;
+    native_fn fn;
+};
+
+static pthread_once_t once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t *cache;
+static size_t used_words;
+static size_t table_count;
+static struct slot table[TABLE_SIZE];
+
+static void init(void)
+{
+    void *p = mmap(NULL, CACHE_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1, 0);
+    if (p != MAP_FAILED)
+        cache = p;
+}
+
+bool appine_native_available(void)
+{
+    pthread_once(&once, init);
+    return cache != NULL;
+}
+
+struct buf {
+    uint32_t *p;
+    size_t n;
+};
+
+static void put(struct buf *b, uint32_t insn)
+{
+    if (b->n < MAX_STUB_WORDS)
+        b->p[b->n] = insn;
+    b->n++;
+}
+
+/* x9 = cpu + off；off 小于 2^24 */
+static void put_add(struct buf *b, unsigned rd, unsigned rn, size_t off)
+{
+    uint32_t hi = (uint32_t)(off >> 12), lo = (uint32_t)(off & 0xfff);
+    unsigned src = rn;
+    if (hi) {
+        put(b, enc_add_imm(rd, src, hi, 1));
+        src = rd;
+    }
+    if (lo || !hi)
+        put(b, enc_add_imm(rd, src, lo, 0));
+}
+
+static size_t x_off(unsigned r)
+{
+    return offsetof(struct appine_cpu, x) + 8 * r;
+}
+
+static void generate(struct buf *b, uint32_t insn, const struct native_desc *d)
+{
+    enum { CPU = 0, ADDR = 1, VBASE = 9, TMP = 10 };
+    size_t v_off = offsetof(struct appine_cpu, v);
+    uint32_t out = insn;
+    unsigned host[3];
+
+    if (d->fp) {
+        put(b, enc_stp_d_pre(8, 9, 31, -80));
+        put(b, enc_stp_d(10, 11, 31, 16));
+        put(b, enc_stp_d(12, 13, 31, 32));
+        put(b, enc_stp_d(14, 15, 31, 48));
+        put(b, enc_mrs_fpcr(TMP));
+        put(b, enc_str_x(TMP, 31, 64));
+        put(b, enc_ldr_x(TMP, CPU, offsetof(struct appine_cpu, fpcr)));
+        put(b, enc_msr_fpcr(TMP));
+        put(b, enc_ldr_x(TMP, CPU, offsetof(struct appine_cpu, fpsr)));
+        put(b, enc_msr_fpsr(TMP));
+        put(b, enc_ldr_x(TMP, CPU, offsetof(struct appine_cpu, nzcv)));
+        put(b, enc_msr_nzcv(TMP));
+        put_add(b, VBASE, CPU, v_off);
+        for (unsigned q = 0; q < 32; q += 2)
+            put(b, enc_ldp_q(q, q + 1, VBASE, (int)(16 * q)));
+    }
+
+    /* 通用寄存器操作数：31 表示 ZR，保持原样 */
+    for (unsigned i = 0; i < d->n; i++) {
+        const struct native_operand *op = &d->gpr[i];
+        unsigned r = (insn >> op->pos) & 31;
+        host[i] = 2 + 2 * i;
+        if (r == 31)
+            continue;
+        out = (out & ~(31u << op->pos)) | host[i] << op->pos;
+        if (!op->load)
+            continue;
+        put(b, enc_ldr_x(host[i], CPU, x_off(r)));
+        if (op->pair) {
+            if (r + 1 < 31)
+                put(b, enc_ldr_x(host[i] + 1, CPU, x_off(r + 1)));
+            else
+                put(b, enc_movz(host[i] + 1, 0, 0));
+        }
+    }
+    if (d->addr_pos != NATIVE_NO_ADDR)
+        out = (out & ~(31u << d->addr_pos)) | (uint32_t)ADDR << d->addr_pos;
+
+    put(b, out);
+
+    for (unsigned i = 0; i < d->n; i++) {
+        const struct native_operand *op = &d->gpr[i];
+        unsigned r = (insn >> op->pos) & 31;
+        if (r == 31 || !op->store)
+            continue;
+        put(b, enc_str_x(host[i], CPU, x_off(r)));
+        if (op->pair && r + 1 < 31)
+            put(b, enc_str_x(host[i] + 1, CPU, x_off(r + 1)));
+    }
+
+    if (d->fp) {
+        for (unsigned q = 0; q < 32; q += 2)
+            put(b, enc_stp_q(q, q + 1, VBASE, (int)(16 * q)));
+        put(b, enc_mrs_fpsr(TMP));
+        put(b, enc_str_x(TMP, CPU, offsetof(struct appine_cpu, fpsr)));
+        put(b, enc_mrs_nzcv(TMP));
+        put(b, enc_str_x(TMP, CPU, offsetof(struct appine_cpu, nzcv)));
+        put(b, enc_ldr_x(TMP, 31, 64));
+        put(b, enc_msr_fpcr(TMP));
+        put(b, enc_ldp_d(14, 15, 31, 48));
+        put(b, enc_ldp_d(12, 13, 31, 32));
+        put(b, enc_ldp_d(10, 11, 31, 16));
+        put(b, enc_ldp_d_post(8, 9, 31, 80));
+    }
+    put(b, enc_ret());
+}
+
+static size_t slot_index(uint32_t insn)
+{
+    return (size_t)((insn * UINT32_C(0x9e3779b1)) >> (32 - TABLE_BITS));
+}
+
+native_fn appine_native_stub(uint32_t insn, const struct native_desc *desc)
+{
+    if (!appine_native_available())
+        return NULL;
+    pthread_mutex_lock(&lock);
+    size_t i = slot_index(insn);
+    while (table[i].fn && table[i].insn != insn)
+        i = (i + 1) & (TABLE_SIZE - 1);
+    native_fn fn = table[i].fn;
+    if (!fn) {
+        if (table_count >= TABLE_SIZE / 2 || used_words + MAX_STUB_WORDS > CACHE_BYTES / 4) {
+            memset(table, 0, sizeof(table));
+            table_count = 0;
+            used_words = 0;
+            i = slot_index(insn);
+        }
+        struct buf b = {cache + used_words, 0};
+        generate(&b, insn, desc);
+        if (b.n > MAX_STUB_WORDS)
+            abort(); /* 上界估计错误：属于引擎 bug */
+        __builtin___clear_cache((char *)b.p, (char *)(b.p + b.n));
+        used_words += b.n;
+        fn = (native_fn)(uintptr_t)b.p;
+        table[i] = (struct slot){insn, fn};
+        table_count++;
+    }
+    pthread_mutex_unlock(&lock);
+    return fn;
+}
+
+#else /* !NATIVE_SUPPORTED */
+
+bool appine_native_available(void)
+{
+    return false;
+}
+
+native_fn appine_native_stub(uint32_t insn, const struct native_desc *desc)
+{
+    (void)insn;
+    (void)desc;
+    return NULL;
+}
+
+#endif

@@ -1,10 +1,11 @@
 /*
  * Tier 0 解释器（设计文档 §4.2）。
  *
- * M0 覆盖范围：整数数据处理（立即数、寄存器）、分支、svc/brk、hint 与屏障、
- * NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR 系统寄存器，以及整数 load/store
- * （立即数、寄存器偏移、literal、pair）。其余编码一律按未定义指令上报，
- * 与 §4.4 的白名单原则一致：没实现的就不执行。
+ * 覆盖范围：整数数据处理（立即数、寄存器）、CRC32、分支、svc/brk、hint 与
+ * 屏障、NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR 与 ID 寄存器、整数 load/store
+ * （立即数、寄存器偏移、literal、pair）。SIMD&FP 在 simd.c，独占访问与原子
+ * 操作在 atomic.c。其余编码一律按未定义指令上报，与 §4.4 的白名单原则一致：
+ * 没实现的就不执行。
  *
  * 约定：执行函数返回 APPINE_EXIT_NONE 表示继续；出错时 pc 保持不变，并且
  * 不写回任何寄存器。
@@ -318,6 +319,20 @@ static enum appine_exit dp_imm(cpu_t *c, uint32_t insn)
 
 /* ---- 数据处理：寄存器 ---- */
 
+/* CRC32 系列交给原生桩执行 */
+static enum appine_exit crc32(cpu_t *c, uint32_t insn)
+{
+    struct native_desc d = {.addr_pos = NATIVE_NO_ADDR, .n = 3};
+    d.gpr[0] = (struct native_operand){.pos = 0, .store = 1};
+    d.gpr[1] = (struct native_operand){.pos = 5, .load = 1};
+    d.gpr[2] = (struct native_operand){.pos = 16, .load = 1};
+    native_fn fn = appine_native_stub(insn, &d);
+    if (!fn)
+        return undef(c, insn);
+    fn(c, NULL);
+    return next(c);
+}
+
 static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
 {
     bool sf = BIT(insn, 31);
@@ -449,7 +464,18 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
             case 11: /* LSLV/LSRV/ASRV/RORV */
                 r = shift_reg(n, opcode - 8, (unsigned)(m & (size - 1)), sf);
                 break;
-            default: /* CRC32、PACGA、MTE、CSSC：不在白名单内 */
+            case 0x10:
+            case 0x11:
+            case 0x12:
+            case 0x13:
+            case 0x14:
+            case 0x15:
+            case 0x16:
+            case 0x17: /* CRC32B/H/W/X、CRC32CB/H/W/X：X 形式要求 sf = 1 */
+                if (!appine_has(APPINE_HWCAP_CRC32) || sf != ((opcode & 3) == 3))
+                    return undef(c, insn);
+                return crc32(c, insn);
+            default: /* PACGA、MTE、CSSC：不在白名单内 */
                 return undef(c, insn);
             }
         } else { /* 1 源操作数 */
@@ -572,8 +598,14 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
             return undef(c, insn);
         wx(c, rt, 0);
         return next(c);
-    default:
+    default: {
+        uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（§4.4） */
+        if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(FIELD(insn, 20, 5), &id)) {
+            wx(c, rt, id);
+            return next(c);
+        }
         return undef(c, insn);
+    }
     }
 }
 
@@ -603,8 +635,9 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         c->pc += take ? (uint64_t)(sext(FIELD(insn, 23, 5), 19) * 4) : 4;
         return APPINE_EXIT_NONE;
     }
-    if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC */
+    if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC：异常返回会清掉独占标记 */
         c->exit_info = FIELD(insn, 20, 5);
+        c->excl_size = 0;
         c->pc += 4;
         return APPINE_EXIT_SVC;
     }
@@ -616,7 +649,9 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         return next(c);
     if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障 */
         switch (FIELD(insn, 7, 5)) {
-        case 2: /* CLREX：M0 还没有独占监视器 */
+        case 2: /* CLREX */
+            c->excl_size = 0;
+            return next(c);
         case 6: /* ISB */
             return next(c);
         case 4: /* DSB */
@@ -680,7 +715,7 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
     unsigned rt = insn & 31, rn = FIELD(insn, 9, 5);
 
     if (BIT(insn, 26))
-        return undef(c, insn); /* SIMD&FP 访存：M0 未实现 */
+        return appine_simd_ldst(c, insn);
 
     if ((insn & 0x3b000000) == 0x39000000) { /* 无符号偏移 */
         enum ldst_kind kind = ldst_kind(size, opc);
@@ -743,8 +778,9 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
     if ((insn & 0x3a000000) == 0x28000000) { /* LDP/STP/LDPSW，含 LDNP/STNP */
         unsigned pair_opc = size, idx = FIELD(insn, 24, 23), load = BIT(insn, 22);
         unsigned rt2 = FIELD(insn, 14, 10);
-        if (pair_opc == 3 || (pair_opc == 1 && !load))
-            return undef(c, insn); /* STGP（MTE）不在白名单内 */
+        /* opc = 01 只有 LDPSW：STGP（MTE）不在白名单内，也不存在 no-allocate 形式 */
+        if (pair_opc == 3 || (pair_opc == 1 && (!load || idx == 0)))
+            return undef(c, insn);
         unsigned scale = pair_opc == 2 ? 3 : 2, n = 1u << scale;
         if (!sp_aligned(c, rn, load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE))
             return APPINE_EXIT_FAULT;
@@ -775,7 +811,21 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
             wx_sp(c, rn, base + off);
         return next(c);
     }
-    return undef(c, insn); /* 独占、acquire/release、LSE 原子等：M0 未实现 */
+    return appine_atomic_exec(c, insn); /* 独占、acquire/release、LSE 原子操作 */
+}
+
+/* ---- SIMD&FP 数据处理：白名单判定后交给原生桩 ---- */
+
+static enum appine_exit simd_dp(cpu_t *c, uint32_t insn)
+{
+    struct native_desc d;
+    if (!appine_has(APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD) || !appine_simd_dp_decode(insn, &d))
+        return undef(c, insn);
+    native_fn fn = appine_native_stub(insn, &d);
+    if (!fn)
+        return undef(c, insn);
+    fn(c, NULL);
+    return next(c);
 }
 
 /* ---- 顶层译码 ---- */
@@ -793,7 +843,9 @@ enum appine_exit appine_interp_exec(cpu_t *c, uint32_t insn)
     case 0x6:
     case 0xc:
     case 0xe: return ldst(c, insn);
-    default: /* 保留空间（含 UDF）、SVE、SIMD&FP 数据处理、未分配 */
+    case 0x7:
+    case 0xf: return simd_dp(c, insn);
+    default: /* 保留空间（含 UDF）、SVE、未分配 */
         return undef(c, insn);
     }
 }

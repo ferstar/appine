@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 
+#include "emit.h"
 #include "internal.h"
 
 #if defined(__aarch64__) && defined(__linux__)
@@ -87,120 +88,6 @@ struct appine_dbt {
     struct appine_dbt_stats stats;
     struct appine_cpu probe; /* 用来询问 Tier 0 是否认识某条指令 */
 };
-
-/* ---- 宿主指令编码 ---- */
-
-static uint32_t enc_ldr_x(unsigned rt, unsigned rn, size_t off)
-{
-    return 0xf9400000u | (uint32_t)(off / 8) << 10 | rn << 5 | rt;
-}
-
-static uint32_t enc_str_x(unsigned rt, unsigned rn, size_t off)
-{
-    return 0xf9000000u | (uint32_t)(off / 8) << 10 | rn << 5 | rt;
-}
-
-static uint32_t enc_ldp_x(unsigned rt, unsigned rt2, unsigned rn, int off)
-{
-    return 0xa9400000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
-}
-
-static uint32_t enc_stp_x(unsigned rt, unsigned rt2, unsigned rn, int off)
-{
-    return 0xa9000000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
-}
-
-static uint32_t enc_stp_x_pre(unsigned rt, unsigned rt2, unsigned rn, int off)
-{
-    return 0xa9800000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
-}
-
-static uint32_t enc_ldp_x_post(unsigned rt, unsigned rt2, unsigned rn, int off)
-{
-    return 0xa8c00000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
-}
-
-static uint32_t enc_mov(unsigned rd, unsigned rm) /* ORR Xd, XZR, Xm */
-{
-    return 0xaa0003e0u | rm << 16 | rd;
-}
-
-static uint32_t enc_add_imm(unsigned rd, unsigned rn, uint32_t imm12, unsigned shift12)
-{
-    return 0x91000000u | shift12 << 22 | imm12 << 10 | rn << 5 | rd;
-}
-
-static uint32_t enc_sub_imm(unsigned rd, unsigned rn, uint32_t imm12, unsigned shift12)
-{
-    return 0xd1000000u | shift12 << 22 | imm12 << 10 | rn << 5 | rd;
-}
-
-static uint32_t enc_movz(unsigned rd, uint32_t imm16, unsigned hw)
-{
-    return 0xd2800000u | hw << 21 | imm16 << 5 | rd;
-}
-
-static uint32_t enc_movk(unsigned rd, uint32_t imm16, unsigned hw)
-{
-    return 0xf2800000u | hw << 21 | imm16 << 5 | rd;
-}
-
-/* AND Xd, Xn, #((1 << bits) - 1) */
-static uint32_t enc_and_low(unsigned rd, unsigned rn, unsigned bits)
-{
-    return 0x92400000u | (bits - 1) << 10 | rn << 5 | rd;
-}
-
-static uint32_t enc_ubfx(unsigned rd, unsigned rn, unsigned lsb, unsigned width)
-{
-    return 0xd3400000u | lsb << 16 | (lsb + width - 1) << 10 | rn << 5 | rd;
-}
-
-static uint32_t enc_add_lsl(unsigned rd, unsigned rn, unsigned rm, unsigned amount)
-{
-    return 0x8b000000u | rm << 16 | amount << 10 | rn << 5 | rd;
-}
-
-/* EOR Xd, Xn, Xm, LSR #amount */
-static uint32_t enc_eor_lsr(unsigned rd, unsigned rn, unsigned rm, unsigned amount)
-{
-    return 0xca000000u | (amount ? 1u << 22 : 0) | rm << 16 | amount << 10 | rn << 5 | rd;
-}
-
-static uint32_t enc_add_ext(unsigned rd, unsigned rn, unsigned rm, unsigned option, unsigned shift)
-{
-    return 0x8b200000u | rm << 16 | option << 13 | shift << 10 | rn << 5 | rd;
-}
-
-static uint32_t enc_ldst_regoff(unsigned size, unsigned opc, unsigned rt, unsigned rn, unsigned rm)
-{
-    return size << 30 | 0x38206800u | opc << 22 | rm << 16 | rn << 5 | rt;
-}
-
-static uint32_t enc_b(intptr_t off)
-{
-    return 0x14000000u | ((uint32_t)(off >> 2) & 0x3ffffff);
-}
-
-static uint32_t enc_br(unsigned rn)
-{
-    return 0xd61f0000u | rn << 5;
-}
-
-static uint32_t enc_cbnz_x(unsigned rt)
-{
-    return 0xb5000000u | rt;
-}
-
-static uint32_t enc_tbnz(unsigned rt, unsigned bit)
-{
-    return 0x37000000u | (bit >> 5) << 31 | (bit & 31) << 19 | rt;
-}
-
-static uint32_t enc_adr_self(unsigned rd)
-{
-    return 0x10000000u | rd;
-}
 
 /* ---- 发射器 ---- */
 
@@ -920,7 +807,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(&x, enc_mov(CTX, 0));
     emit(&x, enc_mov(T0, 1));
     emit(&x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, nzcv)));
-    emit(&x, 0xd51b4200u | T1); /* msr nzcv, x17 */
+    emit(&x, enc_msr_nzcv(T1));
     emit_add_const(&x, T1, CTX, (int64_t)x0);
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++)
         emit(&x, enc_ldp_x(pairs[i], pairs[i] + 1, T1, (int)(8 * pairs[i])));
@@ -933,7 +820,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(&x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, pc)));
     emit(&x, enc_str_x(T1, CTX, offsetof(struct appine_cpu, dbt_site)));
     emit(&x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_reason)));
-    emit(&x, 0xd53b4200u | T0); /* mrs x16, nzcv */
+    emit(&x, enc_mrs_nzcv(T0));
     emit(&x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, nzcv)));
     emit_add_const(&x, T1, CTX, (int64_t)x0);
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++)
@@ -947,7 +834,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(&x, enc_ldp_x(25, 26, 31, 32));
     emit(&x, enc_ldp_x(27, 28, 31, 16));
     emit(&x, enc_ldp_x_post(29, 30, 31, 96));
-    emit(&x, 0xd65f03c0u); /* ret */
+    emit(&x, enc_ret());
 
     d->routine_words = d->used_words = x.n;
     __builtin___clear_cache((char *)d->cache, (char *)(d->cache + x.n));

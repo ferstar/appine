@@ -29,6 +29,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
 
+      # llvm-mc 用来独立核对解释器的指令白名单（tests/lockstep/tests/whitelist.rs）
+      - name: Install llvm
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Format

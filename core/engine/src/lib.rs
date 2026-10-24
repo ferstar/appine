@@ -76,6 +76,10 @@ pub struct CpuState {
     reserved: u32,
     pending: u64,
     mmu: *mut RawMmu,
+    excl_addr: u64,
+    excl_value: [u64; 2],
+    excl_size: u32,
+    reserved2: u32,
     dbt_reason: u64,
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
@@ -102,6 +106,8 @@ unsafe extern "C" {
         off_mmu: usize,
         off_jump_cache: usize,
     ) -> c_int;
+
+    fn appine_guest_hwcap() -> u64;
 
     fn appine_dbt_new() -> *mut RawDbt;
     fn appine_dbt_free(dbt: *mut RawDbt);
@@ -406,6 +412,33 @@ impl Drop for Dbt {
     fn drop(&mut self) {
         unsafe { appine_dbt_free(self.raw.as_ptr()) }
     }
+}
+
+/// 宣告给 guest 的 `AT_HWCAP`：宿主支持 ∩ Tier 0 已实现 ∩ 白名单（设计文档 §4.4）。
+pub fn guest_hwcap() -> u64 {
+    unsafe { appine_guest_hwcap() }
+}
+
+/// HWCAP 位，取值与 Linux 的 `HWCAP_*` 一致。
+pub mod hwcap {
+    /// 浮点。
+    pub const FP: u64 = 1 << 0;
+    /// Advanced SIMD。
+    pub const ASIMD: u64 = 1 << 1;
+    /// AES 指令。
+    pub const AES: u64 = 1 << 3;
+    /// PMULL 的 1Q 形式。
+    pub const PMULL: u64 = 1 << 4;
+    /// SHA1 指令。
+    pub const SHA1: u64 = 1 << 5;
+    /// SHA256 指令。
+    pub const SHA2: u64 = 1 << 6;
+    /// CRC32 指令。
+    pub const CRC32: u64 = 1 << 7;
+    /// LSE 原子指令。
+    pub const ATOMICS: u64 = 1 << 8;
+    /// EL0 可以读取 ID 寄存器。
+    pub const CPUID: u64 = 1 << 11;
 }
 
 /// 校验 [`CpuState`] 与 C 结构体的布局是否一致。

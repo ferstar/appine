@@ -102,6 +102,55 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
 }
 
 /* 执行一条已经取到的指令 */
+/* ---- CPU 特性（features.c）---- */
+
+/* guest 特性集合是否包含 hwcap 里的全部位 */
+bool appine_has(uint64_t hwcap);
+
+/* EL0 读取 ID 寄存器空间时的值；key 是 MRS 编码的 bits 20:5，不在该空间时返回 false */
+bool appine_id_register(unsigned key, uint64_t *value);
+
+/* ---- 原生指令桩（native.c）---- */
+
+/*
+ * 原生桩在宿主 CPU 上执行一条 guest 指令（设计文档 §4.2）：通用寄存器字段被
+ * 换成宿主临时寄存器，执行前从 cpu 结构体读入、执行后写回。fp 为真时还会
+ * 载入并写回 V0–V31、FPCR、FPSR 和 NZCV。
+ */
+struct native_operand {
+    uint8_t pos;   /* 寄存器字段的起始位 */
+    uint8_t pair;  /* 字段表示一对相邻寄存器（CASP） */
+    uint8_t load;  /* 执行前读入 guest 值 */
+    uint8_t store; /* 执行后写回 */
+};
+
+struct native_desc {
+    uint8_t fp;
+    uint8_t addr_pos; /* 地址寄存器字段的起始位，NATIVE_NO_ADDR 表示没有 */
+    uint8_t n;
+    struct native_operand gpr[3];
+};
+
+#define NATIVE_NO_ADDR 0xff
+
+typedef void (*native_fn)(struct appine_cpu *cpu, void *host_addr);
+
+bool appine_native_available(void);
+
+/* 取得（必要时生成）insn 的原生桩；同一条 insn 的 desc 必须总是相同 */
+native_fn appine_native_stub(uint32_t insn, const struct native_desc *desc);
+
+/* ---- SIMD&FP（simd.c）与原子访存（atomic.c）---- */
+
+/* SIMD&FP 数据处理指令是否在白名单内；是则填好原生桩的描述 */
+bool appine_simd_dp_decode(uint32_t insn, struct native_desc *desc);
+
+/* SIMD&FP 访存（bit 26 为 1 的 load/store 编码） */
+enum appine_exit appine_simd_ldst(struct appine_cpu *cpu, uint32_t insn);
+
+/* 独占访问、acquire/release、LSE 原子操作；编码不属于这些类别时返回 UNDEF */
+enum appine_exit appine_atomic_exec(struct appine_cpu *cpu, uint32_t insn);
+
 enum appine_exit appine_interp_exec(struct appine_cpu *cpu, uint32_t insn);
 
 /* 从 cpu->pc 取指并执行一条指令（Tier 0 的单步） */

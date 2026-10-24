@@ -5,7 +5,7 @@
 
 use std::ptr::NonNull;
 
-use appine_engine::{Access, Cpu, Exit, FaultKind, Mmu, PAGE_SIZE, prot};
+use appine_engine::{Access, Cpu, Exit, FaultKind, Mmu, PAGE_SIZE, hwcap, prot};
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -247,14 +247,83 @@ fn data_accesses_ignore_the_top_byte() {
 fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
-        0xc85f7c20, // ldxr x0, [x1]：M0 还没有独占访问
-        0x9e670020, // fmov d0, x1：M0 还没有 SIMD&FP
+        0x4e421420, // fadd v0.8h, v1.8h, v2.8h：FP16 不在白名单内
+        0x4e829420, // sdot v0.4s, v1.16b, v2.16b：DotProd 不在白名单内
+        0xb8bfc020, // ldapr w0, [x1]：LRCPC 不在白名单内
         0x00000000, // udf #0
         0xd51bd060, // msr tpidrro_el0, x0：EL0 不可写
     ] {
         assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
         assert_eq!(g.pc(), CODE);
     }
+}
+
+/// SIMD&FP 和原生桩只在 aarch64 Linux 宿主上可用（§4.4 的 HWCAP 会如实反映）。
+fn has_simd() -> bool {
+    let need = hwcap::FP | hwcap::ASIMD;
+    appine_engine::guest_hwcap() & need == need
+}
+
+#[test]
+fn exclusive_store_succeeds_only_after_a_matching_load() {
+    let mut g = Guest::new();
+    g.put_u64(DATA, 5);
+    g.set_x(1, DATA);
+    g.set_x(3, 9);
+    g.set_x(2, 7);
+    g.step(0xc8027c23); // stxr w2, x3, [x1]：没有独占标记，失败
+    assert_eq!((g.x(2), g.get_u64(DATA)), (1, 5));
+
+    g.step(0xc85f7c20); // ldxr x0, [x1]
+    assert_eq!(g.x(0), 5);
+    g.step(0xc8027c23); // stxr w2, x3, [x1]
+    assert_eq!((g.x(2), g.get_u64(DATA)), (0, 9));
+
+    g.step(0xc85f7c20); // ldxr x0, [x1]
+    g.step(0xd5033f5f); // clrex
+    g.step(0xc8027c23); // stxr w2, x3, [x1]：标记已被清除
+    assert_eq!(g.x(2), 1);
+
+    g.set_x(1, DATA + 4); // 未对齐：对齐错误
+    assert!(matches!(
+        g.cpu.exec_insn(0xc85f7c20),
+        Some(Exit::Fault {
+            kind: FaultKind::Alignment,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn simd_and_fp_round_trip() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    g.set_x(1, 0x4045_0000_0000_0000); // 42.0
+    g.step(0x9e670020); // fmov d0, x1
+    g.step(0x9e660002); // fmov x2, d0
+    assert_eq!(g.x(2), 0x4045_0000_0000_0000);
+    assert_eq!(g.cpu.state().v[0], [0x4045_0000_0000_0000, 0]);
+
+    let bytes: Vec<u8> = (0..32).collect();
+    g.bytes(DATA)[..32].copy_from_slice(&bytes);
+    g.set_x(1, DATA);
+    g.step(0x4c40a020); // ld1 {v0.16b, v1.16b}, [x1]
+    let v = g.cpu.state().v;
+    assert_eq!(v[0][0].to_le_bytes(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(v[1][1].to_le_bytes(), [24, 25, 26, 27, 28, 29, 30, 31]);
+}
+
+#[test]
+fn id_registers_match_hwcap() {
+    let mut g = Guest::new();
+    g.step(0xd5380600); // mrs x0, id_aa64isar0_el1
+    let isar0 = g.x(0);
+    let caps = appine_engine::guest_hwcap();
+    assert_eq!(caps & hwcap::CRC32 != 0, (isar0 >> 16) & 0xf == 1);
+    assert_eq!(caps & hwcap::ATOMICS != 0, (isar0 >> 20) & 0xf == 2);
+    assert_eq!(caps & hwcap::SHA2 != 0, (isar0 >> 12) & 0xf == 1);
 }
 
 #[test]

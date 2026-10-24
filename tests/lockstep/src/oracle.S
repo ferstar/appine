@@ -1,10 +1,12 @@
 // lockstep 的原生执行跳板。
 //
-// 整段代码会被拷贝进一个 JIT 页，被测指令写在 lockstep_tramp_slot 处，
-// 所以这里只能用位置无关、不引用外部符号的指令。被测指令不能读写 SP，
+// 整段代码会被拷贝进一个 JIT 页，被测指令（最多 4 条）写在 lockstep_tramp_slot
+// 处，所以这里只能用位置无关、不引用外部符号的指令。被测指令不能读写 SP，
 // 寄存器的保存与恢复全部经由栈完成。
 //
-//   void tramp(struct lockstep_state *st);   // st: x[31] @0, nzcv @248
+//   void tramp(struct lockstep_state *st);
+//
+//   st: x[31] @0, nzcv @248, v[32] @256, fpcr @768, fpsr @776
 
     .text
     .p2align 2
@@ -19,8 +21,34 @@ lockstep_tramp_start:
     stp     x23, x24, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
     stp     x19, x20, [sp, #-16]!
-    stp     x0, xzr, [sp, #-16]!        // 保存 st，同时保持 16 字节对齐
+    stp     d8, d9, [sp, #-16]!
+    stp     d10, d11, [sp, #-16]!
+    stp     d12, d13, [sp, #-16]!
+    stp     d14, d15, [sp, #-16]!
+    mrs     x1, fpcr
+    stp     x0, x1, [sp, #-16]!         // st 和宿主 FPCR
 
+    ldr     x1, [x0, #768]
+    msr     fpcr, x1
+    ldr     x1, [x0, #776]
+    msr     fpsr, x1
+    add     x1, x0, #256
+    ldp     q0, q1, [x1, #0]
+    ldp     q2, q3, [x1, #32]
+    ldp     q4, q5, [x1, #64]
+    ldp     q6, q7, [x1, #96]
+    ldp     q8, q9, [x1, #128]
+    ldp     q10, q11, [x1, #160]
+    ldp     q12, q13, [x1, #192]
+    ldp     q14, q15, [x1, #224]
+    ldp     q16, q17, [x1, #256]
+    ldp     q18, q19, [x1, #288]
+    ldp     q20, q21, [x1, #320]
+    ldp     q22, q23, [x1, #352]
+    ldp     q24, q25, [x1, #384]
+    ldp     q26, q27, [x1, #416]
+    ldp     q28, q29, [x1, #448]
+    ldp     q30, q31, [x1, #480]
     ldr     x1, [x0, #248]
     msr     nzcv, x1
     ldp     x2, x3, [x0, #16]
@@ -41,7 +69,10 @@ lockstep_tramp_start:
     ldp     x0, x1, [x0]
 
 lockstep_tramp_slot:
-    nop                                 // 被测指令
+    nop                                 // 被测指令，最多 4 条
+    nop
+    nop
+    nop
 
     sub     sp, sp, #256
     stp     x0, x1, [sp, #0]
@@ -69,8 +100,35 @@ lockstep_tramp_slot:
     add     x1, x1, #8
     cmp     x1, #256
     b.ne    1b
+    add     x1, x0, #256                // V 寄存器此时还没被动过
+    stp     q0, q1, [x1, #0]
+    stp     q2, q3, [x1, #32]
+    stp     q4, q5, [x1, #64]
+    stp     q6, q7, [x1, #96]
+    stp     q8, q9, [x1, #128]
+    stp     q10, q11, [x1, #160]
+    stp     q12, q13, [x1, #192]
+    stp     q14, q15, [x1, #224]
+    stp     q16, q17, [x1, #256]
+    stp     q18, q19, [x1, #288]
+    stp     q20, q21, [x1, #320]
+    stp     q22, q23, [x1, #352]
+    stp     q24, q25, [x1, #384]
+    stp     q26, q27, [x1, #416]
+    stp     q28, q29, [x1, #448]
+    stp     q30, q31, [x1, #480]
+    mrs     x2, fpsr
+    str     x2, [x0, #776]
+    mrs     x2, fpcr
+    str     x2, [x0, #768]
 
-    add     sp, sp, #(256 + 16)
+    add     sp, sp, #256
+    ldp     x0, x1, [sp], #16
+    msr     fpcr, x1                    // 恢复宿主 FPCR
+    ldp     d14, d15, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d8, d9, [sp], #16
     ldp     x19, x20, [sp], #16
     ldp     x21, x22, [sp], #16
     ldp     x23, x24, [sp], #16
