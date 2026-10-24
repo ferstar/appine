@@ -122,6 +122,8 @@ pub(crate) mod code {
     pub const SEGV_ACCERR: i32 = 2;
     /// 地址未对齐。
     pub const BUS_ADRALN: i32 = 1;
+    /// 地址不对应任何内容（文件映射超出文件末尾的部分）。
+    pub const BUS_ADRERR: i32 = 2;
     /// 非法指令。
     pub const ILL_ILLOPC: i32 = 1;
     /// 断点。
@@ -151,7 +153,8 @@ pub(crate) enum InfoFields {
 pub(crate) struct SigInfo {
     pub code: i32,
     pub fields: InfoFields,
-    /// 同步异常的 ESR，放进信号帧的 esr_context；0 表示不是同步异常。
+    /// 同步异常的 ESR，放进信号帧的 esr_context；0 表示没有（与 Linux 一样，断点和
+    /// 不是同步异常的信号都没有）。
     pub esr: u64,
 }
 
@@ -657,7 +660,7 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             SigAction::DEFAULT => {
                 let status = ExitStatus::Signaled {
                     signal: sig,
-                    pc: (info.esr != 0).then_some(cpu.state().pc),
+                    pc: matches!(info.fields, InfoFields::Fault { .. }).then_some(cpu.state().pc),
                     fault_addr: info
                         .fault_addr()
                         .filter(|_| sig == Signal::SEGV || sig == Signal::BUS),

@@ -45,7 +45,7 @@ static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, ui
 {
     uint64_t va = rn == 31 ? c->sp : c->x[rn];
     if (rn == 31 && (c->sp & 15)) {
-        raise_fault(c, c->sp, access, APPINE_FAULT_ALIGN);
+        raise_fault(c, c->sp, access, APPINE_FAULT_SP_ALIGN);
         return NULL;
     }
     va = untag(va);

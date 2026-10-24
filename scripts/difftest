@@ -1,0 +1,96 @@
+#!/bin/sh
+# 差分测试（设计文档 §13.3 第 4 层）：同一个脚本分别在 appine 和真正的 arm64 Linux 上
+# 运行，比对输出和退出码。在有 docker 的宿主上运行：
+#
+#   scripts/difftest [-t 执行层] [-r] [-s 仓库目录] [用例名……]
+#
+# 用例是 tests/diff/<名字>.sh，由 guest 的 /bin/sh 执行，stderr 并入 stdout。真正的
+# Linux 一侧是 docker 容器：先在 appine 里把仓库的根文件系统打包、导入成镜像，所以两边
+# 运行的是完全相同的文件。镜像只在第一次或者带 -r 时生成，换了仓库要带 -r。
+#
+# 仓库默认是 target/difftest/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
+# 再在 appine 里用 apk 安装用例需要的软件包，这一步要联网（沿用宿主或 docker 的代理）。
+# 仓库必须在工作区里。Linux arm64 宿主上直接运行 appine-run（环境变量 APPINE_RUN 可以
+# 指定），其他宿主上经由 scripts/dev。
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+tier=1
+rebuild=0
+store=target/difftest/store
+image=appine-difftest
+packages="python3 gcc musl-dev lua5.4 sqlite"
+env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+while getopts t:rs: opt; do
+    case $opt in
+    t) tier=$OPTARG ;;
+    r) rebuild=1 ;;
+    s) store=$OPTARG ;;
+    *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# linux <shell 命令>：在 Linux arm64 环境里执行，$http_proxy 这类变量在那边展开
+if [ "$(uname -sm)" = "Linux aarch64" ]; then
+    run=${APPINE_RUN:-target/linux-arm64/release/appine-run}
+    [ -x "$run" ] || run=target/release/appine-run
+    linux() { sh -c "$1"; }
+    appine() { "$run" "$@"; }
+else
+    run=target/linux-arm64/release/appine-run
+    linux() { scripts/dev sh -c "$1"; }
+    appine() { scripts/dev "$run" "$@"; }
+fi
+
+if [ ! -d "$store" ]; then
+    tarball=$(ls target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | tail -n 1)
+    [ -n "$tarball" ] || {
+        echo "difftest: no minirootfs; run scripts/fetch-rootfs" >&2
+        exit 1
+    }
+    echo "creating $store"
+    appine --rootfs "$store" --import "$tarball" >/dev/null
+    linux "$run --tier 1 --rootfs $store --env $env_path"' \
+        ${http_proxy:+--env http_proxy=$http_proxy} ${https_proxy:+--env https_proxy=$https_proxy} \
+        -- /bin/sh -c "apk add -q '"$packages"'"'
+    rebuild=1
+fi
+
+if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo "exporting the root filesystem of $store"
+    appine --tier 1 --rootfs "$store" -- /bin/tar -c -f - -C / bin etc lib sbin usr tmp 2>/dev/null |
+        docker import --platform linux/arm64 - "$image" >/dev/null
+fi
+
+out=target/difftest
+mkdir -p "$out"
+if [ $# -eq 0 ]; then
+    set -- $(cd tests/diff && ls *.sh | sed 's/\.sh$//')
+fi
+
+failed=0
+for name in "$@"; do
+    script="exec 2>&1; $(cat "tests/diff/$name.sh")"
+    set +e
+    docker run --rm --platform linux/arm64 -e "$env_path" -e HOME=/root -w / "$image" \
+        /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
+    echo "exit $?" >>"$out/$name.native"
+    appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root -- \
+        /bin/sh -c "cd / && $script" >"$out/$name.appine" 2>/dev/null
+    echo "exit $?" >>"$out/$name.appine"
+    set -e
+    if cmp -s "$out/$name.native" "$out/$name.appine"; then
+        echo "ok   $name"
+    else
+        echo "FAIL $name"
+        diff -u "$out/$name.native" "$out/$name.appine" | sed 's/^/    /' || true
+        failed=$((failed + 1))
+    fi
+done
+[ "$failed" = 0 ] || {
+    echo "$failed failed"
+    exit 1
+}

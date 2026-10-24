@@ -215,7 +215,7 @@ fn sp_based_access_must_be_aligned() {
         g.cpu.exec_insn(0xf94003e0), // ldr x0, [sp]
         Some(Exit::Fault {
             access: Access::Read,
-            kind: FaultKind::Alignment,
+            kind: FaultKind::StackAlignment,
             ..
         })
     ));
@@ -223,7 +223,7 @@ fn sp_based_access_must_be_aligned() {
         g.cpu.exec_insn(0xf90003e0), // str x0, [sp]
         Some(Exit::Fault {
             access: Access::Write,
-            kind: FaultKind::Alignment,
+            kind: FaultKind::StackAlignment,
             ..
         })
     ));

@@ -621,7 +621,7 @@ static bool probe(struct appine_cpu *c, uint64_t va, uint64_t len, uint32_t acce
 static bool check_sp(struct appine_cpu *c, unsigned rn, uint32_t access)
 {
     if (rn == 31 && (c->sp & 15))
-        return raise_fault(c, c->sp, access, APPINE_FAULT_ALIGN);
+        return raise_fault(c, c->sp, access, APPINE_FAULT_SP_ALIGN);
     return true;
 }
 

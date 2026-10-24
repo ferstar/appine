@@ -74,6 +74,11 @@ jobs:
           cargo build --release -p appine-run -p appine-bench
           target/release/appine-bench --runs 3 --skip-tier0
 
+      # M7 的退出标准：同样的脚本在 appine（Tier 1）和 docker 里的原生 Alpine 上输出一致。
+      # 第一次运行时用 apk 安装用例需要的软件包，依赖外网
+      - name: Differential tests
+        run: scripts/difftest
+
       # Android NDK 用 clang 编译 C 引擎，这里提前暴露 clang 特有的警告
       - name: Engine and oracle with clang
         env:

@@ -4,20 +4,24 @@
 //! （munmap/mprotect 切开之后，或者 fork 之后的共享映射）。宿主内存在最后一个
 //! 引用它的 VMA 消失时才释放。文件映射直接用宿主 `mmap(objects/<ino>)`。
 //!
-//! 一个地址空间可以被多个线程同时使用（线程、vfork）。拆除映射或修改权限之后，
+//! 一个地址空间可以被多个线程同时使用（线程、vfork）。拆除映射或降低权限之后，
 //! 其他线程的 TLB 里可能还留着旧的翻译，所以要先做一次 TLB shootdown（[`Mm::sync`]）：
 //! 递增代数，打断正在执行 guest 代码的线程并等它们退出，它们重新进入 guest
-//! 代码之前看到新的代数，会刷新自己的 TLB 和 Tier 1 翻译缓存。被解除映射的宿主
-//! 内存要等 shootdown 完成之后才释放，所以 guest 的数据竞争不会访问到已释放的内存。
+//! 代码之前看到新的代数，会刷新自己的 TLB。被解除映射的宿主内存要等 shootdown
+//! 完成之后才释放，所以 guest 的数据竞争不会访问到已释放的内存。
+//!
+//! Tier 1 的翻译按同样的方式作废：可执行的映射被拆除、改了权限，或者 guest 用
+//! `ic ivau` 声明修改了代码，这些范围记进 [`CodeLog`] 并递增代码代数；每个线程
+//! 按自己错过的范围逐页作废翻译。
 //!
 //! fork 按设计文档 §5.3 v1 整份复制：私有映射拷贝一份，共享映射与子进程共用。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
 
@@ -100,8 +104,9 @@ struct Vma {
     name: Option<Rc<[u8]>>,
     /// 这个 VMA 的起点对应的宿主地址。
     host: NonNull<u8>,
-    /// 从起点算起有文件内容的字节数（按 4K 向上取整）。私有文件映射超出文件末尾的
-    /// 部分一碰宿主就会发 SIGBUS，fork 复制时不能读它们。匿名和共享映射等于 `len`。
+    /// 从起点算起有文件内容的字节数（按 4K 向上取整），匿名映射等于 `len`。文件映射
+    /// 超出文件末尾的部分一碰宿主就会发 SIGBUS：它们不进页表，guest 访问时得到
+    /// SIGBUS（[`Mm::fault_past_eof`]），fork 复制时也不读它们。
     file_len: u64,
     /// 只读的私有文件映射在 fork 之后和别的地址空间共用宿主映射；要改成可写之前，
     /// 先复制一份自己的（[`Mm::mprotect`]）。
@@ -117,6 +122,54 @@ struct Vma {
     locked: bool,
 }
 
+/// 最近几个代码代数作废的范围。
+#[derive(Default)]
+pub struct CodeLog {
+    /// (代码代数, 起点, 长度)，代数递增。
+    entries: VecDeque<(u64, u64, u64)>,
+}
+
+impl CodeLog {
+    /// 保留的代数个数；落后更多的线程整体清空翻译缓存。
+    const GENERATIONS: u64 = 64;
+
+    fn push(&mut self, generation: u64, ranges: &[(u64, u64)]) {
+        self.entries
+            .extend(ranges.iter().map(|&(start, len)| (generation, start, len)));
+        while self
+            .entries
+            .front()
+            .is_some_and(|e| e.0 + Self::GENERATIONS <= generation)
+        {
+            self.entries.pop_front();
+        }
+    }
+
+    /// 代数 `seen` 之后、直到 `now` 作废的范围；记录已经不全时返回 None。
+    pub fn since(&self, seen: u64, now: u64) -> Option<Vec<(u64, u64)>> {
+        if self.entries.front().is_none_or(|e| e.0 > seen + 1) {
+            return None;
+        }
+        Some(
+            self.entries
+                .iter()
+                .filter(|e| e.0 > seen && e.0 <= now)
+                .map(|e| (e.1, e.2))
+                .collect(),
+        )
+    }
+}
+
+/// 使用者在重新进入 guest 代码之前检查的代数（[`Mm::sync`]）。
+pub struct Generations {
+    /// TLB shootdown 的代数。
+    pub tlb: Arc<AtomicU64>,
+    /// 代码的代数：变化之后按 `log` 作废 Tier 1 的翻译。
+    pub code: Arc<AtomicU64>,
+    /// 每个代码代数作废的范围。
+    pub log: Arc<Mutex<CodeLog>>,
+}
+
 /// 一个 guest 进程的地址空间。
 pub struct Mm {
     // 字段按声明顺序析构：先销毁页表，再释放它指向的宿主内存。
@@ -127,13 +180,14 @@ pub struct Mm {
     brk_start: u64,
     brk: u64,
     dirty: bool,
-    /// 可执行的映射被拆除、改了权限或者内容：翻译缓存也要作废。
-    code_dirty: bool,
+    /// 可执行的映射被拆除、改了权限或者内容的范围：这些地方的翻译要作废。
+    code_ranges: Vec<(u64, u64)>,
     /// shootdown 的代数：变化之后，使用者重新进入 guest 代码之前刷新 TLB。
     generation: Arc<AtomicU64>,
-    /// 代码的代数：变化之后，使用者还要清空 Tier 1 的翻译缓存。数据页的变化（gcc 的
-    /// 垃圾回收器、malloc 频繁地 mmap/munmap）不影响已经翻译的代码，不改这个代数。
+    /// 代码的代数：变化之后，使用者按 `code_log` 作废 Tier 1 的翻译。数据页的变化（gcc
+    /// 的垃圾回收器、malloc 频繁地 mmap/munmap）不影响已经翻译的代码，不改这个代数。
     code_generation: Arc<AtomicU64>,
+    code_log: Arc<Mutex<CodeLog>>,
     /// 正在使用这个地址空间的线程。
     users: Vec<Arc<TaskSync>>,
     /// `mlockall(MCL_FUTURE)`：以后的映射也锁住。
@@ -170,6 +224,14 @@ fn mmu_prot(p: u32) -> u32 {
     r
 }
 
+/// 文件从 `offset` 起还有内容的字节数，按页向上取整，不超过 `len`。
+fn file_extent(fd: i32, offset: u64, len: u64) -> u64 {
+    let size = appine_hal::fstat(fd).map_or(0, |s| s.st_size.max(0) as u64);
+    size.saturating_sub(offset)
+        .next_multiple_of(PAGE_SIZE)
+        .min(len)
+}
+
 fn map_err(e: MapError) -> Errno {
     match e {
         MapError::InvalidArgument => Errno::EINVAL,
@@ -187,9 +249,10 @@ impl Mm {
             brk_start: 0,
             brk: 0,
             dirty: false,
-            code_dirty: false,
+            code_ranges: Vec::new(),
             generation: Arc::new(AtomicU64::new(0)),
             code_generation: Arc::new(AtomicU64::new(0)),
+            code_log: Arc::default(),
             users: Vec::new(),
             lock_future: false,
             exe: None,
@@ -219,9 +282,19 @@ impl Mm {
         })
     }
 
-    /// shootdown 的代数和代码的代数（[`Mm::sync`]）。
-    pub fn generations(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-        (self.generation.clone(), self.code_generation.clone())
+    /// shootdown 的代数、代码的代数和代码失效的记录（[`Mm::sync`]）。
+    pub fn generations(&self) -> Generations {
+        Generations {
+            tlb: self.generation.clone(),
+            code: self.code_generation.clone(),
+            log: self.code_log.clone(),
+        }
+    }
+
+    /// guest 修改了 `[start, start + len)` 里的代码（`ic ivau`），在下一次 [`Mm::sync`]
+    /// 时作废这里的翻译。
+    pub fn invalidate_code(&mut self, start: u64, len: u64) {
+        self.code_ranges.push((start, len));
     }
 
     /// 登记一个开始使用这个地址空间的线程。
@@ -239,20 +312,27 @@ impl Mm {
         self.users.len() > 1
     }
 
-    /// 如果有映射被拆除或改了权限，做一次 TLB shootdown，然后释放被解除映射的宿主内存。
+    /// 如果有映射被拆除或降低了权限，做一次 TLB shootdown，然后释放被解除映射的宿主内存；
+    /// 有代码要作废时同样等所有使用者退出 guest 代码。
     ///
     /// 调用方持有 BKL；`current` 是调用线程，它自己在重新进入 guest 代码之前刷新。
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
-        let code = std::mem::take(&mut self.code_dirty);
-        if !std::mem::take(&mut self.dirty) && !code {
+        let code = std::mem::take(&mut self.code_ranges);
+        let dirty = std::mem::take(&mut self.dirty);
+        if !dirty && code.is_empty() {
             return;
         }
-        // SeqCst 与使用者那边"先标记在执行 guest 代码、再读代数"配对：要么它读到新的代数，
-        // 要么这里看到它正在执行，等它被打断后退出
-        if code {
-            self.code_generation.fetch_add(1, Ordering::SeqCst);
+        // 先记下范围、再改代数：读到新代数的使用者一定能找到对应的范围。SeqCst 与使用者
+        // 那边"先标记在执行 guest 代码、再读代数"配对：要么它读到新的代数，要么这里看到
+        // 它正在执行，等它被打断后退出
+        if !code.is_empty() {
+            let generation = self.code_generation.load(Ordering::Relaxed) + 1;
+            self.code_log.lock().unwrap().push(generation, &code);
+            self.code_generation.store(generation, Ordering::SeqCst);
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        if dirty {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
         self.quiesce(current);
         self.graveyard.clear();
     }
@@ -341,7 +421,41 @@ impl Mm {
             return Err(map_err(e));
         }
         self.vmas.insert(start, v);
+        self.trim_to_file(start)
+    }
+
+    /// 文件映射超出文件末尾的页从页表里拿掉（[`Vma::file_len`]）。
+    fn trim_to_file(&mut self, start: u64) -> Result<(), Errno> {
+        let v = &self.vmas[&start];
+        if v.file_len < v.len {
+            self.mmu
+                .unmap(start + v.file_len, v.len - v.file_len)
+                .map_err(map_err)?;
+        }
         Ok(())
+    }
+
+    /// guest 访问 `addr` 出错时调用。地址落在文件映射超出文件末尾的部分时返回
+    /// `Some(true)`，应当发 SIGBUS；共享映射的文件后来变长了，就把新的内容映射进来，
+    /// 返回 `Some(false)`，重新执行那条指令即可。其余情况返回 None。
+    pub fn fault_past_eof(&mut self, addr: u64) -> Option<bool> {
+        let (&s, v) = self.vmas.range(..=addr).next_back()?;
+        if addr >= s + v.len || addr < s + v.file_len {
+            return None;
+        }
+        if let (Backing::Shared, Some((fd, offset))) = (v.backing, &v.file) {
+            let extent = file_extent(std::os::fd::AsRawFd::as_raw_fd(&**fd), *offset, v.len);
+            if addr < s + extent {
+                let (from, prot) = (v.file_len, v.prot);
+                // SAFETY: 宿主映射覆盖整个 VMA，[from, extent) 现在有文件内容
+                let host = unsafe { v.host.add(from as usize) };
+                // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
+                unsafe { self.mmu.map(s + from, host, extent - from, mmu_prot(prot)) }.ok()?;
+                self.vmas.get_mut(&s).unwrap().file_len = extent;
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     fn new_anonymous(len: u64) -> Result<(Rc<HostRegion>, NonNull<u8>), Errno> {
@@ -441,13 +555,8 @@ impl Mm {
             return Err(Errno::EACCES);
         }
         let file_len = match file {
-            Some((fd, offset, _)) if !shared => {
-                let size = appine_hal::fstat(fd).map_or(0, |s| s.st_size.max(0) as u64);
-                size.saturating_sub(offset)
-                    .next_multiple_of(PAGE_SIZE)
-                    .min(len)
-            }
-            _ => len,
+            Some((fd, offset, _)) => file_extent(fd, offset, len),
+            None => len,
         };
         // st_dev 在 macOS 上是 i32
         #[allow(clippy::unnecessary_cast)]
@@ -474,6 +583,7 @@ impl Mm {
         v.file_len = file_len;
         v.shared_file = shared_file;
         v.file = dup;
+        self.trim_to_file(start)?;
         Ok(start)
     }
 
@@ -574,6 +684,9 @@ impl Mm {
                 (region, host, None)
             }
         };
+        let file_len = file.as_ref().map_or(len, |(fd, offset)| {
+            file_extent(std::os::fd::AsRawFd::as_raw_fd(&**fd), *offset, len)
+        });
         Ok(Vma {
             len,
             prot: template.prot,
@@ -582,7 +695,7 @@ impl Mm {
             region,
             name: template.name.clone(),
             host,
-            file_len: len,
+            file_len,
             cow: false,
             shared_file: template.shared_file.map(|(d, i, o)| (d, i, o + offset)),
             file,
@@ -600,7 +713,9 @@ impl Mm {
         for s in starts {
             let v = self.vmas.remove(&s).unwrap();
             self.mmu.unmap(s, v.len).map_err(map_err)?;
-            self.code_dirty |= v.prot & prot::EXEC != 0;
+            if v.prot & prot::EXEC != 0 {
+                self.code_ranges.push((s, v.len));
+            }
             moved.push((dst + (s - old), v));
         }
         for (s, v) in moved {
@@ -826,7 +941,9 @@ impl Mm {
         for (s, len) in doomed {
             let vma = self.vmas.remove(&s).unwrap();
             self.mmu.unmap(s, len).map_err(map_err)?;
-            self.code_dirty |= vma.prot & prot::EXEC != 0;
+            if vma.prot & prot::EXEC != 0 {
+                self.code_ranges.push((s, len));
+            }
             self.graveyard.push(vma.region);
             self.dirty = true;
         }
@@ -877,15 +994,18 @@ impl Mm {
                 self.unshare(s)?;
             }
         }
-        for (_, v) in self.vmas.range_mut(addr..end) {
+        for (&s, v) in self.vmas.range_mut(addr..end) {
             // 原来可执行的页：不再可执行时翻译要作废；W^X 的 JIT 改写代码之前也先去掉执行权限
-            self.code_dirty |= v.prot & prot::EXEC != 0 && v.prot != prot;
+            if v.prot & prot::EXEC != 0 && v.prot != prot {
+                self.code_ranges.push((s, v.len));
+            }
+            // 只增加权限时 TLB 里的旧表项只是少了权限，未命中时会重新填写，不必刷新
+            self.dirty |= mmu_prot(v.prot) & !mmu_prot(prot) != 0;
             v.prot = prot;
         }
         self.mmu
             .protect(addr, len, mmu_prot(prot))
             .map_err(map_err)?;
-        self.dirty = true;
         Ok(())
     }
 
@@ -905,7 +1025,9 @@ impl Mm {
             }
             let stop = end.min(s + v.len);
             if v.backing == Backing::Anonymous {
-                self.code_dirty |= v.prot & prot::EXEC != 0;
+                if v.prot & prot::EXEC != 0 {
+                    self.code_ranges.push((cursor, stop - cursor));
+                }
                 // SAFETY: [cursor, stop) 落在这个 VMA 内，对应的宿主内存由它持有
                 unsafe {
                     std::ptr::write_bytes(
@@ -952,11 +1074,12 @@ impl Mm {
             child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
             let c = child.vmas.get_mut(&start).unwrap();
             c.name = v.name.clone();
-            c.file_len = if share { v.file_len } else { v.len };
+            c.file_len = v.file_len;
             c.cow = v.cow && share;
             c.shared_file = v.shared_file;
             c.file = v.file.clone();
             c.shm = v.shm;
+            child.trim_to_file(start)?;
         }
         Ok(child)
     }
@@ -967,13 +1090,15 @@ impl Mm {
         let (region, host) = Self::new_anonymous(v.len)?;
         // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
         unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
-        let (len, p) = (v.len, v.prot);
-        // SAFETY: region 由 VMA 持有，生命周期不短于页表里的映射
-        unsafe { self.mmu.map(start, host, len, mmu_prot(p)) }.map_err(map_err)?;
+        // 超出文件末尾的页仍然不进页表
+        let (file_len, p) = (v.file_len, v.prot);
+        if file_len > 0 {
+            // SAFETY: region 由 VMA 持有，生命周期不短于页表里的映射
+            unsafe { self.mmu.map(start, host, file_len, mmu_prot(p)) }.map_err(map_err)?;
+        }
         let v = self.vmas.get_mut(&start).unwrap();
         let old = std::mem::replace(&mut v.region, region);
         v.host = host;
-        v.file_len = v.len;
         v.cow = false;
         // 其他线程的 TLB 里可能还有旧的翻译：shootdown 之后才释放
         self.graveyard.push(old);
@@ -1261,12 +1386,35 @@ mod tests {
         mm.mprotect(data + PAGE_SIZE, PAGE_SIZE, prot::READ)
             .unwrap();
         mm.mprotect(code, PAGE_SIZE, rx).unwrap();
-        assert!(mm.dirty && !mm.code_dirty);
-        // 代码页去掉执行权限（W^X 的 JIT 改写代码之前）、被拆除：翻译要作废
+        assert!(std::mem::take(&mut mm.dirty) && mm.code_ranges.is_empty());
+        // 只增加权限：TLB 不必刷新
+        mm.mprotect(data + PAGE_SIZE, PAGE_SIZE, RW).unwrap();
+        assert!(!mm.dirty);
+        // 代码页去掉执行权限（W^X 的 JIT 改写代码之前）、被拆除：这些页的翻译要作废
         mm.mprotect(code, PAGE_SIZE, RW).unwrap();
-        assert!(std::mem::take(&mut mm.code_dirty));
+        assert_eq!(std::mem::take(&mut mm.code_ranges), [(code, PAGE_SIZE)]);
         mm.munmap(code + PAGE_SIZE, PAGE_SIZE).unwrap();
-        assert!(mm.code_dirty);
+        assert_eq!(mm.code_ranges, [(code + PAGE_SIZE, PAGE_SIZE)]);
+    }
+
+    #[test]
+    fn code_log_reports_missed_ranges() {
+        let mut log = CodeLog::default();
+        log.push(1, &[(0x1000, 0x1000)]);
+        log.push(2, &[(0x5000, 0x2000), (0x9000, 0x1000)]);
+        assert_eq!(log.since(0, 2).unwrap().len(), 3);
+        assert_eq!(
+            log.since(1, 2),
+            Some(vec![(0x5000, 0x2000), (0x9000, 0x1000)])
+        );
+        // 读到的代数之后才记下的范围不算
+        assert_eq!(log.since(0, 1), Some(vec![(0x1000, 0x1000)]));
+        for g in 3..=100 {
+            log.push(g, &[(g << 12, 0x1000)]);
+        }
+        // 太旧的记录已经挤掉：只能整体清空
+        assert_eq!(log.since(0, 100), None);
+        assert_eq!(log.since(99, 100), Some(vec![(100 << 12, 0x1000)]));
     }
 
     #[test]
@@ -1336,7 +1484,7 @@ mod tests {
             )
             .unwrap();
         mm.write_kernel(rw, b"parent").unwrap();
-        let child = mm.fork().unwrap();
+        let mut child = mm.fork().unwrap();
         let mut b = [0u8; 6];
         child
             .read(UserSlice::new(ro + 4000, 1), &mut b[..1])
@@ -1349,6 +1497,50 @@ mod tests {
         mm.write(UserSlice::new(ro, 1), &[1]).unwrap();
         child.read(UserSlice::new(ro, 1), &mut b[..1]).unwrap();
         assert_eq!(b[0], 7);
+        // 超出文件末尾的页不在页表里，复制一份之后也一样
+        for m in [&mut mm, &mut child] {
+            for base in [ro, rw] {
+                assert!(m.mmu().translate(base + PAGE_SIZE, prot::READ).is_some());
+                assert!(m.mmu().translate(base + 2 * PAGE_SIZE, 0).is_none());
+                assert_eq!(m.fault_past_eof(base + 2 * PAGE_SIZE), Some(true));
+                assert_eq!(m.fault_past_eof(base + PAGE_SIZE), None);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shared_file_mappings_follow_the_end_of_the_file() {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("appine-eof-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(100).unwrap();
+        let mut mm = Mm::new();
+        let a = mm
+            .mmap(
+                0,
+                4 * PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED,
+                Some((f.as_raw_fd(), 0, true)),
+            )
+            .unwrap();
+        assert!(mm.mmu().translate(a, prot::WRITE).is_some());
+        assert!(mm.mmu().translate(a + PAGE_SIZE, 0).is_none());
+        assert_eq!(mm.fault_past_eof(a + PAGE_SIZE), Some(true));
+        // 文件变长之后，访问新的部分只需要重新执行
+        f.set_len(2 * PAGE_SIZE + 1).unwrap();
+        assert_eq!(mm.fault_past_eof(a + 2 * PAGE_SIZE), Some(false));
+        assert!(mm.mmu().translate(a + 2 * PAGE_SIZE, prot::WRITE).is_some());
+        assert_eq!(mm.fault_past_eof(a + 3 * PAGE_SIZE), Some(true));
+        // 不在任何映射里的地址交给普通的 SIGSEGV 处理
+        assert_eq!(mm.fault_past_eof(a + 4 * PAGE_SIZE), None);
         let _ = std::fs::remove_file(&path);
     }
 

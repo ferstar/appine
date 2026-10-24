@@ -77,6 +77,22 @@ scripts/dev scripts/ltp 'fcntl.*|mmap.*'   # only the tests whose name matches
 `APPINE_STRACE=1` makes `appine-run` print every syscall with its arguments and result,
 which helps when a test fails.
 
+### Differential tests
+
+`scripts/difftest` runs each script in `tests/diff` both in appine and in a native arm64
+Docker container, and compares their output and exit status. Both sides run the same
+files: the first run creates a store in `target/difftest/store` (minirootfs plus python3,
+gcc, Lua and SQLite from `apk`, so it needs the internet), exports its root filesystem
+from appine and imports it as a Docker image:
+
+```sh
+scripts/fetch-rootfs
+scripts/difftest                       # all cases on tier 1
+scripts/difftest -t 0 signals          # one case on the interpreter
+```
+
+Run it on the host, not in `scripts/dev`; on macOS it calls `scripts/dev` itself.
+
 ## Android app
 
 The app in [android/](android) runs the same kernel inside an Android app: each tab is a

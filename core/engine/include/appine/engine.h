@@ -20,7 +20,8 @@
 #define APPINE_PAGE_SHIFT 12
 #define APPINE_PAGE_SIZE (UINT64_C(1) << APPINE_PAGE_SHIFT)
 #define APPINE_VA_BITS 48
-#define APPINE_TLB_ENTRIES 512
+#define APPINE_TLB_ENTRIES 4096 /* 数据 TLB，直接映射 */
+#define APPINE_ITLB_ENTRIES 512 /* 取指 TLB，只有 Tier 0 用 */
 
 /* 页权限，与 Linux 的 PROT_* 取值一致 */
 enum {
@@ -37,8 +38,9 @@ enum appine_access {
 };
 
 enum appine_fault_kind {
-    APPINE_FAULT_PAGE = 1,  /* 未映射或权限不符，对应 SIGSEGV */
-    APPINE_FAULT_ALIGN = 2, /* PC 或 SP 未对齐，对应 SIGBUS */
+    APPINE_FAULT_PAGE = 1,     /* 未映射或权限不符，对应 SIGSEGV */
+    APPINE_FAULT_ALIGN = 2,    /* PC 或者要求对齐的数据访问未对齐，对应 SIGBUS */
+    APPINE_FAULT_SP_ALIGN = 3, /* 以 SP 为基址时 SP 未对齐（fault_addr = SP），对应 SIGBUS */
 };
 
 /* appine_cpu_run() 的退出原因 */
@@ -49,14 +51,16 @@ enum appine_exit {
     APPINE_EXIT_BRK = 3,   /* pc 指向该指令，exit_info = imm16 */
     APPINE_EXIT_FAULT = 4, /* pc 指向出错指令，fault_* 字段有效，指令没有产生副作用 */
     APPINE_EXIT_KICK = 5,  /* 被 appine_cpu_kick() 打断，pending 已清零 */
+    APPINE_EXIT_CODE = 6,  /* ic ivau：pc 已指向下一条指令，fault_addr = 其地址（已去掉 tag） */
 };
 
 /*
  * 数据 TLB 表项：host 地址 = guest 地址 + addend。tag 和 addend 相邻存放，
- * Tier 1 生成的代码用一条 ldp 同时取出两者。
+ * Tier 1 生成的代码用一条 ldp 同时取出两者。tag 存的是 guest 页号取反，0 表示
+ * 无效：清零的内存就是空的 TLB，不必逐项写入（没碰过的页也就不占内存）。
  */
 struct appine_tlb_entry {
-    uint64_t tag_read; /* guest 页号；UINT64_MAX 表示无效 */
+    uint64_t tag_read; /* ~guest 页号；0 表示无效 */
     uint64_t addend_read;
     uint64_t tag_write;
     uint64_t addend_write;
@@ -75,16 +79,13 @@ struct appine_mmu;
  * 修改时必须同步，并由 appine_cpu_layout_check() 校验。
  */
 struct appine_cpu {
-    /* 数据 TLB 必须位于偏移 0：Tier 1 生成的代码以 "cpu + 下标 * 32" 直接寻址表项 */
-    struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];
-    struct appine_itlb_entry itlb[APPINE_TLB_ENTRIES];
+    /* Tier 1 生成的代码用 ldr/str 的立即数偏移直接读写 tlb 之前的字段 */
     uint64_t x[31];
     uint64_t sp;
     uint64_t pc;
     uint64_t nzcv; /* 只使用 bit 31..28 */
     uint64_t fpcr;
     uint64_t fpsr;
-    uint64_t v[32][2]; /* V0–V31，低 64 位在前 */
     uint64_t tpidr_el0;
     uint64_t orig_x0; /* syscall 重启时恢复 x0（设计文档 §7.3），由内核层维护 */
     uint64_t fault_addr;
@@ -103,6 +104,12 @@ struct appine_cpu {
     uint64_t dbt_reason;
     uint64_t dbt_site;
     void *dbt_jump_cache;
+    /* Tier 1 以 "ldp [cpu + 下标 * 32 + 偏移]" 寻址表项，所以 tlb 的偏移不能超出 ldp
+     * 立即数的范围 */
+    struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];
+    struct appine_itlb_entry itlb[APPINE_ITLB_ENTRIES];
+    uint64_t v[32][2]; /* V0–V31，低 64 位在前 */
+    uint64_t tlb_used[APPINE_TLB_ENTRIES / 64]; /* 填充过的 tlb 项，清空时只处理这些 */
 };
 
 /* ---- guest 可见的 CPU 特性（设计文档 §4.4），取值与 Linux 的 HWCAP_* 一致 ---- */
@@ -152,6 +159,13 @@ void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t 
 
 /* ---- CPU ---- */
 
+/*
+ * 分配并初始化一个 cpu（失败时返回 NULL），用 appine_cpu_free() 释放。结构体里的 TLB
+ * 有一百多 KB，用 mmap 分配，没用到的页不占内存。
+ */
+struct appine_cpu *appine_cpu_new(struct appine_mmu *mmu);
+void appine_cpu_free(struct appine_cpu *cpu);
+
 /* 清零全部状态并绑定 mmu（可为 NULL，此时所有访存都会失败） */
 void appine_cpu_init(struct appine_cpu *cpu, struct appine_mmu *mmu);
 void appine_cpu_tlb_flush(struct appine_cpu *cpu);
@@ -167,7 +181,8 @@ void appine_cpu_kick(struct appine_cpu *cpu);
 
 /* 校验 Rust 侧镜像的结构体布局，一致时返回 1 */
 int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off_tpidr,
-                            size_t off_pending, size_t off_mmu, size_t off_jump_cache);
+                            size_t off_pending, size_t off_mmu, size_t off_jump_cache,
+                            size_t off_tlb, size_t off_v);
 
 /* ---- Tier 1：同 ISA 直通式 DBT（设计文档 §4.2）---- */
 
@@ -187,18 +202,24 @@ struct appine_dbt_stats {
     uint64_t exits_svc;
     uint64_t exits_kick;
     uint64_t flushes;
+    uint64_t invalidated;   /* 被 appine_dbt_invalidate() 作废的块 */
+    uint64_t blocks_shared; /* blocks 中直接拷贝翻译模板得到的块 */
 };
 
 /*
  * 创建一个 Tier 1 实例（代码缓存、翻译表、跳转缓存）。一个实例只能由一个
  * 线程使用。宿主不是 aarch64 Linux 时返回 NULL。
  *
- * 原型限制：翻译结果不会因为 guest 修改代码或映射而失效，调用方必须在
- * 这种情况下调用 appine_dbt_flush()。
+ * 翻译结果不会自己失效：guest 用 ic ivau 声明修改了代码（APPINE_EXIT_CODE），
+ * 或者可执行的映射被拆除、改了权限之后，调用方要对共用这个地址空间的每个
+ * 实例调用 appine_dbt_invalidate() 或 appine_dbt_flush()。
  */
 struct appine_dbt *appine_dbt_new(void);
 void appine_dbt_free(struct appine_dbt *dbt);
 void appine_dbt_flush(struct appine_dbt *dbt);
+
+/* 作废 [start, start + len) 覆盖的各页里开始的块；范围很大时等同于 appine_dbt_flush() */
+void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
 
 /* 与 appine_cpu_run() 语义相同，但在翻译后的代码里执行 */
 enum appine_exit appine_dbt_run(struct appine_dbt *dbt, struct appine_cpu *cpu);

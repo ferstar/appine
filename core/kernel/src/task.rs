@@ -7,15 +7,15 @@ use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker};
+use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE};
 use appine_hal::Event;
 
 use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
-use crate::mm::Mm;
+use crate::mm::{Generations, Mm};
 use crate::process::{Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::syscall::{self, Flow};
@@ -209,9 +209,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         Tier::Interpreter => None,
         Tier::Dbt => Dbt::new(),
     };
-    let load = |(g, c): &(Arc<AtomicU64>, Arc<AtomicU64>)| {
-        (g.load(Ordering::SeqCst), c.load(Ordering::SeqCst))
-    };
+    let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
     let mut seen = load(&generations);
     loop {
         // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
@@ -220,11 +218,16 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         if now.0 != seen.0 {
             cpu.tlb_flush();
         }
-        // 只有可执行的映射变了才需要重新翻译
+        // 只有代码变了才需要作废翻译：按错过的范围逐页作废，记录不全时整体清空
         if now.1 != seen.1
             && let Some(d) = &mut dbt
         {
-            d.flush();
+            match generations.log.lock().unwrap().since(seen.1, now.1) {
+                Some(ranges) => ranges
+                    .iter()
+                    .for_each(|&(start, len)| d.invalidate(start, len)),
+                None => d.flush(),
+            }
         }
         seen = now;
         let exit = match &mut dbt {
@@ -258,11 +261,12 @@ const EC_IABT_LOW: u64 = 0x20;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_DABT_LOW: u64 = 0x24;
 const EC_SP_ALIGN: u64 = 0x26;
-const EC_BRK64: u64 = 0x3c;
 /// 第 3 级转换错误（页没有映射）。
 const FSC_TRANSLATION: u64 = 0x07;
 /// 第 3 级权限错误。
 const FSC_PERMISSION: u64 = 0x0f;
+/// 对齐错误。
+const FSC_ALIGNMENT: u64 = 0x21;
 
 /// 处理一次 guest 退出。
 fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
@@ -273,27 +277,46 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     let (sig, info) = match exit {
         Exit::Svc { .. } => return syscall::dispatch(cx, cpu),
         Exit::Kick => return signal::deliver(cx, cpu, false),
+        Exit::InvalidateCode { addr } => {
+            // 作废所在一页的翻译，并等共用地址空间的其他线程都看到
+            let sync = cx.task.sync.clone();
+            {
+                let mut mm = cx.mm_mut();
+                mm.invalidate_code(addr & !(PAGE_SIZE - 1), PAGE_SIZE);
+                mm.sync(&sync);
+            }
+            return signal::deliver(cx, cpu, false);
+        }
         Exit::Undefined { insn } => {
             crate::debug::log(format_args!(
                 "undefined instruction {insn:#010x} at {pc:#x}"
             ));
             (Signal::ILL, SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL))
         }
-        Exit::Breakpoint { imm } => (
-            Signal::TRAP,
-            SigInfo::fault(code::TRAP_BRKPT, pc, EC_BRK64 << 26 | ESR_IL | imm as u64),
-        ),
+        // Linux 发断点的 SIGTRAP 时信号帧里没有 esr_context
+        Exit::Breakpoint { .. } => (Signal::TRAP, SigInfo::fault(code::TRAP_BRKPT, pc, 0)),
         Exit::Fault {
             addr,
             access,
             kind: FaultKind::Page,
         } => {
-            let mapped = cx.mm().is_mapped(addr);
             let (ec, wnr) = match access {
                 Access::Exec => (EC_IABT_LOW, 0),
                 Access::Read => (EC_DABT_LOW, 0),
                 Access::Write => (EC_DABT_LOW, ESR_WNR),
             };
+            let past_eof = cx.mm_mut().fault_past_eof(addr);
+            if past_eof == Some(false) {
+                // 共享映射的文件变长了，新内容已经映射进来：重新执行
+                return signal::deliver(cx, cpu, false);
+            }
+            if past_eof == Some(true) {
+                let esr = ec << 26 | ESR_IL | wnr | FSC_TRANSLATION;
+                let info = SigInfo::fault(code::BUS_ADRERR, addr, esr);
+                signal::force(cx, Signal::BUS, info);
+                return signal::deliver(cx, cpu, false);
+            }
+            let mapped = cx.mm().is_mapped(addr);
             let (code, fsc) = if mapped {
                 (code::SEGV_ACCERR, FSC_PERMISSION)
             } else {
@@ -307,12 +330,19 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             access,
             kind: FaultKind::Alignment,
         } => {
-            let ec = if access == Access::Exec {
-                EC_PC_ALIGN
-            } else {
-                EC_SP_ALIGN
+            let esr = match access {
+                Access::Exec => EC_PC_ALIGN << 26 | ESR_IL,
+                Access::Read => EC_DABT_LOW << 26 | ESR_IL | FSC_ALIGNMENT,
+                Access::Write => EC_DABT_LOW << 26 | ESR_IL | ESR_WNR | FSC_ALIGNMENT,
             };
-            let info = SigInfo::fault(code::BUS_ADRALN, addr, ec << 26 | ESR_IL);
+            (Signal::BUS, SigInfo::fault(code::BUS_ADRALN, addr, esr))
+        }
+        Exit::Fault {
+            addr,
+            kind: FaultKind::StackAlignment,
+            ..
+        } => {
+            let info = SigInfo::fault(code::BUS_ADRALN, addr, EC_SP_ALIGN << 26 | ESR_IL);
             (Signal::BUS, info)
         }
     };
@@ -386,4 +416,6 @@ fn add_stats(total: &mut DbtStats, s: &DbtStats) {
     total.exits_svc += s.exits_svc;
     total.exits_kick += s.exits_kick;
     total.flushes += s.flushes;
+    total.invalidated += s.invalidated;
+    total.blocks_shared += s.blocks_shared;
 }

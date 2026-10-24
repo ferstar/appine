@@ -19,6 +19,45 @@ static inline uint32_t enc_str_x(unsigned rt, unsigned rn, size_t off)
     return 0xf9000000u | (uint32_t)(off / 8) << 10 | rn << 5 | rt;
 }
 
+static inline uint32_t enc_ldr_w(unsigned rt, unsigned rn, size_t off)
+{
+    return 0xb9400000u | (uint32_t)(off / 4) << 10 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_str_w(unsigned rt, unsigned rn, size_t off)
+{
+    return 0xb9000000u | (uint32_t)(off / 4) << 10 | rn << 5 | rt;
+}
+
+/* LDRB/LDRH/LDR Wt/LDR Xt, [Xn]（size = log2 字节数） */
+static inline uint32_t enc_ldr_size(unsigned size, unsigned rt, unsigned rn)
+{
+    return 0x39400000u | size << 30 | rn << 5 | rt;
+}
+
+/* LDARB/LDARH/LDAR */
+static inline uint32_t enc_ldar(unsigned size, unsigned rt, unsigned rn)
+{
+    return 0x08dffc00u | size << 30 | rn << 5 | rt;
+}
+
+/* LDAXRB/LDAXRH/LDAXR */
+static inline uint32_t enc_ldaxr(unsigned size, unsigned rt, unsigned rn)
+{
+    return 0x085ffc00u | size << 30 | rn << 5 | rt;
+}
+
+/* STLXRB/STLXRH/STLXR Ws, Rt, [Xn] */
+static inline uint32_t enc_stlxr(unsigned size, unsigned rs, unsigned rt, unsigned rn)
+{
+    return 0x0800fc00u | size << 30 | rs << 16 | rn << 5 | rt;
+}
+
+static inline uint32_t enc_clrex(void)
+{
+    return 0xd503305fu;
+}
+
 static inline uint32_t enc_ldp_x(unsigned rt, unsigned rt2, unsigned rn, int off)
 {
     return 0xa9400000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
@@ -86,6 +125,18 @@ static inline uint32_t enc_eor_lsr(unsigned rd, unsigned rn, unsigned rm, unsign
     return 0xca000000u | (amount ? 1u << 22 : 0) | rm << 16 | amount << 10 | rn << 5 | rd;
 }
 
+/* EON Xd, Xn, Xm, LSR #amount（Xn ^ ~(Xm >> amount)） */
+static inline uint32_t enc_eon_lsr(unsigned rd, unsigned rn, unsigned rm, unsigned amount)
+{
+    return 0xca200000u | (amount ? 1u << 22 : 0) | rm << 16 | amount << 10 | rn << 5 | rd;
+}
+
+/* BIC Xd, Xn, Xm（Xn & ~Xm） */
+static inline uint32_t enc_bic_reg(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x8a200000u | rm << 16 | rn << 5 | rd;
+}
+
 static inline uint32_t enc_add_ext(unsigned rd, unsigned rn, unsigned rm, unsigned option, unsigned shift)
 {
     return 0x8b200000u | rm << 16 | option << 13 | shift << 10 | rn << 5 | rd;
@@ -106,9 +157,19 @@ static inline uint32_t enc_br(unsigned rn)
     return 0xd61f0000u | rn << 5;
 }
 
+static inline uint32_t enc_cbz_x(unsigned rt)
+{
+    return 0xb4000000u | rt;
+}
+
 static inline uint32_t enc_cbnz_x(unsigned rt)
 {
     return 0xb5000000u | rt;
+}
+
+static inline uint32_t enc_tbz(unsigned rt, unsigned bit)
+{
+    return 0x36000000u | (bit >> 5) << 31 | (bit & 31) << 19 | rt;
 }
 
 static inline uint32_t enc_tbnz(unsigned rt, unsigned bit)
@@ -116,9 +177,42 @@ static inline uint32_t enc_tbnz(unsigned rt, unsigned bit)
     return 0x37000000u | (bit >> 5) << 31 | (bit & 31) << 19 | rt;
 }
 
+static inline uint32_t enc_adr(unsigned rd, intptr_t off)
+{
+    return 0x10000000u | ((uint32_t)off & 3) << 29 | ((uint32_t)(off >> 2) & 0x7ffff) << 5 | rd;
+}
+
 static inline uint32_t enc_adr_self(unsigned rd)
 {
-    return 0x10000000u | rd;
+    return enc_adr(rd, 0);
+}
+
+/* LDR Xt, [Xn, Xm, LSL #3] */
+static inline uint32_t enc_ldr_x_index(unsigned rt, unsigned rn, unsigned rm)
+{
+    return 0xf8607800u | rm << 16 | rn << 5 | rt;
+}
+
+/* AND Xd, Xn, #~((1 << bits) - 1)：清掉低 bits 位，1 ≤ bits ≤ 63 */
+static inline uint32_t enc_and_clear_low(unsigned rd, unsigned rn, unsigned bits)
+{
+    return 0x92400000u | (64 - bits) << 16 | (63 - bits) << 10 | rn << 5 | rd;
+}
+
+static inline uint32_t enc_sub_reg(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0xcb000000u | rm << 16 | rn << 5 | rd;
+}
+
+static inline uint32_t enc_orr_reg(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0xaa000000u | rm << 16 | rn << 5 | rd;
+}
+
+/* LSL Xd, Xn, Xm（LSLV） */
+static inline uint32_t enc_lslv(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x9ac02000u | rm << 16 | rn << 5 | rd;
 }
 
 /* ---- SIMD&FP 与系统寄存器 ---- */

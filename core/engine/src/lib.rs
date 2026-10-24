@@ -12,8 +12,10 @@ use std::ptr::NonNull;
 pub const PAGE_SIZE: u64 = 4096;
 /// guest 虚拟地址位数。
 pub const VA_BITS: u32 = 48;
-/// 每个 CPU 的软件 TLB 项数。
-pub const TLB_ENTRIES: usize = 512;
+/// 每个 CPU 的软件数据 TLB 项数。
+pub const TLB_ENTRIES: usize = 4096;
+/// 每个 CPU 的软件取指 TLB 项数。
+pub const ITLB_ENTRIES: usize = 512;
 
 /// 页权限，取值与 Linux 的 `PROT_*` 一致。
 pub mod prot {
@@ -49,8 +51,6 @@ struct ItlbEntry {
 /// guest CPU 状态，逐字段镜像 C 的 `struct appine_cpu`。
 #[repr(C)]
 pub struct CpuState {
-    tlb: [TlbEntry; TLB_ENTRIES],
-    itlb: [ItlbEntry; TLB_ENTRIES],
     /// 通用寄存器 X0–X30。
     pub x: [u64; 31],
     /// 栈指针。
@@ -63,8 +63,6 @@ pub struct CpuState {
     pub fpcr: u64,
     /// 浮点状态寄存器。
     pub fpsr: u64,
-    /// V0–V31，每个寄存器低 64 位在前。
-    pub v: [[u64; 2]; 32],
     /// 用户态线程指针。
     pub tpidr_el0: u64,
     /// syscall 重启时用来恢复的原始 X0，由内核层维护。
@@ -83,6 +81,11 @@ pub struct CpuState {
     dbt_reason: u64,
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
+    tlb: [TlbEntry; TLB_ENTRIES],
+    itlb: [ItlbEntry; ITLB_ENTRIES],
+    /// V0–V31，每个寄存器低 64 位在前。
+    pub v: [[u64; 2]; 32],
+    tlb_used: [u64; TLB_ENTRIES / 64],
 }
 
 unsafe extern "C" {
@@ -93,6 +96,8 @@ unsafe extern "C" {
     fn appine_mmu_protect(mmu: *mut RawMmu, gva: u64, len: u64, prot: u32) -> c_int;
     fn appine_mmu_translate(mmu: *const RawMmu, gva: u64, required_prot: u32) -> *mut c_void;
 
+    fn appine_cpu_new(mmu: *mut RawMmu) -> *mut CpuState;
+    fn appine_cpu_free(cpu: *mut CpuState);
     fn appine_cpu_init(cpu: *mut CpuState, mmu: *mut RawMmu);
     fn appine_cpu_tlb_flush(cpu: *mut CpuState);
     fn appine_cpu_run(cpu: *mut CpuState) -> c_int;
@@ -106,6 +111,8 @@ unsafe extern "C" {
         off_pending: usize,
         off_mmu: usize,
         off_jump_cache: usize,
+        off_tlb: usize,
+        off_v: usize,
     ) -> c_int;
 
     fn appine_guest_hwcap() -> u64;
@@ -114,6 +121,7 @@ unsafe extern "C" {
     fn appine_dbt_new() -> *mut RawDbt;
     fn appine_dbt_free(dbt: *mut RawDbt);
     fn appine_dbt_flush(dbt: *mut RawDbt);
+    fn appine_dbt_invalidate(dbt: *mut RawDbt, start: u64, len: u64);
     fn appine_dbt_run(dbt: *mut RawDbt, cpu: *mut CpuState) -> c_int;
     fn appine_dbt_get_stats(dbt: *const RawDbt, out: *mut DbtStats);
 }
@@ -227,8 +235,10 @@ pub enum Access {
 pub enum FaultKind {
     /// 未映射或权限不符，对应 SIGSEGV。
     Page,
-    /// PC 或 SP 未对齐，对应 SIGBUS。
+    /// PC 或者要求对齐的数据访问（独占访问、原子操作）未对齐，对应 SIGBUS。
     Alignment,
+    /// 以 SP 为基址访存时 SP 未对齐（`addr` 是 SP），对应 SIGBUS。
+    StackAlignment,
 }
 
 /// [`Cpu::run`] 返回的退出原因：需要内核层介入的事件。
@@ -260,6 +270,12 @@ pub enum Exit {
     },
     /// 被其他线程 kick 打断。
     Kick,
+    /// `ic ivau`：guest 修改了 `addr` 处的代码；pc 已指向下一条指令。共用这个地址空间的
+    /// 每个 [`Dbt`] 都要作废这里的翻译。
+    InvalidateCode {
+        /// 指令的地址操作数（已去掉 TBI tag）。
+        addr: u64,
+    },
 }
 
 /// 一个 guest 硬件线程。
@@ -267,7 +283,8 @@ pub enum Exit {
 /// `Cpu` 持有它所绑定的 [`Mmu`] 的裸指针，调用方必须保证 `Mmu` 比 `Cpu`
 /// 活得久；修改 `Mmu` 的映射之后，必须调用 [`Cpu::tlb_flush`]。
 pub struct Cpu {
-    state: Box<CpuState>,
+    /// 由 `appine_cpu_new` 分配（mmap），`Drop` 时释放。
+    state: NonNull<CpuState>,
 }
 
 // SAFETY: 同一时刻只有一个线程运行一个 Cpu（`&mut self`），但它可以在线程之间移交；
@@ -301,14 +318,10 @@ impl Cpu {
     ///
     /// `mmu` 必须比返回的 `Cpu` 活得久。
     pub unsafe fn new(mmu: &Mmu) -> Self {
-        // CpuState 只含整数和裸指针，全零是合法值；直接在堆上清零分配，避免 16KB 的栈拷贝
-        let layout = std::alloc::Layout::new::<CpuState>();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<CpuState>();
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let mut state = unsafe { Box::from_raw(ptr) };
-        unsafe { appine_cpu_init(&mut *state, mmu.raw.as_ptr()) };
+        let state =
+            NonNull::new(unsafe { appine_cpu_new(mmu.raw.as_ptr()) }).unwrap_or_else(|| {
+                std::alloc::handle_alloc_error(std::alloc::Layout::new::<CpuState>())
+            });
         Cpu { state }
     }
 
@@ -318,44 +331,46 @@ impl Cpu {
     ///
     /// `mmu` 必须比这个 `Cpu` 活得久。
     pub unsafe fn reset(&mut self, mmu: &Mmu) {
-        unsafe { appine_cpu_init(&mut *self.state, mmu.raw.as_ptr()) }
+        unsafe { appine_cpu_init(self.state.as_ptr(), mmu.raw.as_ptr()) }
     }
 
     /// 打断这个 Cpu 的句柄。
     pub fn kicker(&self) -> Kicker {
-        Kicker(NonNull::from(&*self.state))
+        Kicker(self.state)
     }
 
     /// guest 寄存器。
     pub fn state(&self) -> &CpuState {
-        &self.state
+        // SAFETY: state 在 Cpu 存活期间有效，借用规则由 &self 保证
+        unsafe { self.state.as_ref() }
     }
 
     /// 可修改的 guest 寄存器。
     pub fn state_mut(&mut self) -> &mut CpuState {
-        &mut self.state
+        // SAFETY: 同上，&mut self 保证独占
+        unsafe { self.state.as_mut() }
     }
 
     /// 让软件 TLB 全部失效。
     pub fn tlb_flush(&mut self) {
-        unsafe { appine_cpu_tlb_flush(&mut *self.state) }
+        unsafe { appine_cpu_tlb_flush(self.state.as_ptr()) }
     }
 
     /// 从当前 pc 开始执行，直到需要内核层介入。
     pub fn run(&mut self) -> Exit {
-        let rc = unsafe { appine_cpu_run(&mut *self.state) };
+        let rc = unsafe { appine_cpu_run(self.state.as_ptr()) };
         self.decode_exit(rc)
             .expect("appine_cpu_run returned EXIT_NONE")
     }
 
     /// 在当前 pc 处执行给定的一条指令（不经取指）。正常完成时返回 `None`。
     pub fn exec_insn(&mut self, insn: u32) -> Option<Exit> {
-        let rc = unsafe { appine_cpu_exec_insn(&mut *self.state, insn) };
+        let rc = unsafe { appine_cpu_exec_insn(self.state.as_ptr(), insn) };
         self.decode_exit(rc)
     }
 
     pub(crate) fn decode_exit(&self, rc: c_int) -> Option<Exit> {
-        let s = &self.state;
+        let s = self.state();
         Some(match rc {
             0 => return None,
             1 => Exit::Svc {
@@ -372,15 +387,22 @@ impl Cpu {
                     2 => Access::Write,
                     _ => Access::Exec,
                 },
-                kind: if s.fault_kind == 2 {
-                    FaultKind::Alignment
-                } else {
-                    FaultKind::Page
+                kind: match s.fault_kind {
+                    2 => FaultKind::Alignment,
+                    3 => FaultKind::StackAlignment,
+                    _ => FaultKind::Page,
                 },
             },
             5 => Exit::Kick,
+            6 => Exit::InvalidateCode { addr: s.fault_addr },
             _ => panic!("unknown appine_exit {rc}"),
         })
+    }
+}
+
+impl Drop for Cpu {
+    fn drop(&mut self) {
+        unsafe { appine_cpu_free(self.state.as_ptr()) }
     }
 }
 
@@ -412,11 +434,16 @@ pub struct DbtStats {
     pub exits_kick: u64,
     /// 代码缓存被清空的次数。
     pub flushes: u64,
+    /// 被 [`Dbt::invalidate`] 作废的块数。
+    pub invalidated: u64,
+    /// `blocks` 中直接拷贝翻译模板（其他实例翻译过的同一段代码）得到的块数。
+    pub blocks_shared: u64,
 }
 
 /// Tier 1：同 ISA 直通式 DBT 的一个实例（代码缓存、翻译表、跳转缓存）。
 ///
-/// 原型限制：翻译结果不会因为 guest 修改代码或映射而失效，修改之后必须调用
+/// 翻译结果不会自己失效：guest 用 `ic ivau` 声明修改了代码（[`Exit::InvalidateCode`]），
+/// 或者可执行的映射被拆除、改了权限之后，必须调用 [`Dbt::invalidate`] 或
 /// [`Dbt::flush`]。只支持 aarch64 Linux 宿主。
 pub struct Dbt {
     raw: NonNull<RawDbt>,
@@ -430,7 +457,7 @@ impl Dbt {
 
     /// 与 [`Cpu::run`] 语义相同，但在翻译后的代码里执行。
     pub fn run(&mut self, cpu: &mut Cpu) -> Exit {
-        let rc = unsafe { appine_dbt_run(self.raw.as_ptr(), &mut *cpu.state) };
+        let rc = unsafe { appine_dbt_run(self.raw.as_ptr(), cpu.state.as_ptr()) };
         cpu.decode_exit(rc)
             .expect("appine_dbt_run returned EXIT_NONE")
     }
@@ -438,6 +465,11 @@ impl Dbt {
     /// 丢弃全部翻译结果。
     pub fn flush(&mut self) {
         unsafe { appine_dbt_flush(self.raw.as_ptr()) }
+    }
+
+    /// 作废 `[start, start + len)` 覆盖的各页里开始的块；范围很大时等同于 [`Dbt::flush`]。
+    pub fn invalidate(&mut self, start: u64, len: u64) {
+        unsafe { appine_dbt_invalidate(self.raw.as_ptr(), start, len) }
     }
 
     /// 统计数据。
@@ -497,6 +529,8 @@ pub fn layout_matches() -> bool {
             offset_of!(CpuState, pending),
             offset_of!(CpuState, mmu),
             offset_of!(CpuState, dbt_jump_cache),
+            offset_of!(CpuState, tlb),
+            offset_of!(CpuState, v),
         ) == 1
     }
 }

@@ -185,6 +185,7 @@ fn print_stats(s: &DbtStats) {
     let pct = |n: u64| 100.0 * n as f64 / s.insns.max(1) as f64;
     eprintln!("appine-run: tier 1 statistics");
     eprintln!("  blocks translated   {:>12}", s.blocks);
+    eprintln!("    from templates    {:>12}", s.blocks_shared);
     eprintln!("  guest instructions  {:>12}", s.insns);
     eprintln!(
         "    copied            {:>12}  ({:.1}%)",
@@ -211,4 +212,5 @@ fn print_stats(s: &DbtStats) {
         s.exits_chain, s.exits_lookup, s.exits_interp, s.exits_svc, s.exits_kick
     );
     eprintln!("  code cache flushes  {:>12}", s.flushes);
+    eprintln!("  blocks invalidated  {:>12}", s.invalidated);
 }

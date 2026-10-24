@@ -153,7 +153,7 @@ pub enum Tier {
     /// Tier 0：解释器。
     #[default]
     Interpreter,
-    /// Tier 1：同 ISA 直通式 DBT（M2 原型，只支持 aarch64 Linux 宿主）。
+    /// Tier 1：同 ISA 直通式 DBT（只支持 aarch64 Linux 宿主）。
     Dbt,
 }
 

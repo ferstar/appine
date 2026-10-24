@@ -8,7 +8,7 @@
 
 #include "appine/engine.h"
 
-#define TLB_INVALID UINT64_MAX
+#define TLB_INVALID 0 /* TLB 的 tag 是 ~页号，页号不可能全为 1 */
 #define PAGE_MASK (APPINE_PAGE_SIZE - 1)
 
 /* 页表叶子表项 = host 页地址 | 权限位；host 页 4K 对齐，低 12 位空闲 */
@@ -20,19 +20,25 @@
 /*
  * 写入代码之后让取指看到新代码，与 compiler-rt 的 __clear_cache 在 aarch64 上的做法相同。
  * 不用 __builtin___clear_cache：Rust 链接 Android 的动态库时不带 compiler-rt，那个符号
- * 在加载时找不到。
+ * 在加载时找不到。代码经由另一个地址写入时（W^X 双映射），数据缓存按写入的地址
+ * start + write_delta 清理，指令缓存按执行的地址 start 作废。
  */
-static inline void sync_icache(void *start, void *end)
+static inline void sync_code(void *start, void *end, intptr_t write_delta)
 {
 #if defined(__aarch64__) && defined(__linux__)
-    uint64_t ctr, addr;
+    /* 只读一次：有些内核为了绕过勘误会让 EL0 读 CTR_EL0 陷入内核 */
+    static uint64_t cached;
+    uint64_t ctr = __atomic_load_n(&cached, __ATOMIC_RELAXED), addr;
     uint64_t b = (uint64_t)(uintptr_t)start, e = (uint64_t)(uintptr_t)end;
-    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    if (!ctr) { /* bit 31 恒为 1，0 表示还没读过 */
+        __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        __atomic_store_n(&cached, ctr, __ATOMIC_RELAXED);
+    }
     /* CTR_EL0.IDC：数据缓存不需要清到统一点 */
     if (!((ctr >> 28) & 1)) {
         uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
         for (addr = b & ~(line - 1); addr < e; addr += line)
-            __asm__ volatile("dc cvau, %0" ::"r"(addr) : "memory");
+            __asm__ volatile("dc cvau, %0" ::"r"(addr + (uint64_t)write_delta) : "memory");
     }
     __asm__ volatile("dsb ish" ::: "memory");
     /* CTR_EL0.DIC：指令缓存不需要作废 */
@@ -44,9 +50,31 @@ static inline void sync_icache(void *start, void *end)
     }
     __asm__ volatile("isb" ::: "memory");
 #else
+    (void)write_delta;
     __builtin___clear_cache((char *)start, (char *)end);
 #endif
 }
+
+static inline void sync_icache(void *start, void *end)
+{
+    sync_code(start, end, 0);
+}
+
+/*
+ * 分配一块存放生成代码的内存（Tier 1 的代码缓存、原生指令桩），按 W^X 映射（§12）：
+ * 同一段共享内存映射两次，执行用返回的地址，写入用它加上 *rw_delta。宿主不允许
+ * 双映射时退回 RWX，*rw_delta 为 0。失败时返回 NULL。只在 aarch64 Linux 上可用。
+ */
+uint32_t *appine_map_code(size_t bytes, intptr_t *rw_delta);
+void appine_unmap_code(uint32_t *code, size_t bytes, intptr_t rw_delta);
+
+/* soft-MMU 页表（mmu.c）：Tier 1 的 TLB 回填例程也按这个结构遍历 */
+#define MMU_LEVELS 4
+#define MMU_LEVEL_BITS 9
+
+struct appine_mmu {
+    uintptr_t *root;
+};
 
 /* 返回 gva 所在页的叶子表项，未映射时返回 0 */
 uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva);
@@ -66,8 +94,8 @@ static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t acc
     unsigned idx = (unsigned)(vpn & (APPINE_TLB_ENTRIES - 1));
     uint64_t tag, addend;
     if (access == APPINE_ACCESS_EXEC) {
-        tag = cpu->itlb[idx].tag;
-        addend = cpu->itlb[idx].addend;
+        tag = cpu->itlb[vpn & (APPINE_ITLB_ENTRIES - 1)].tag;
+        addend = cpu->itlb[vpn & (APPINE_ITLB_ENTRIES - 1)].addend;
     } else if (access == APPINE_ACCESS_READ) {
         tag = cpu->tlb[idx].tag_read;
         addend = cpu->tlb[idx].addend_read;
@@ -75,7 +103,7 @@ static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t acc
         tag = cpu->tlb[idx].tag_write;
         addend = cpu->tlb[idx].addend_write;
     }
-    if (LIKELY(tag == vpn))
+    if (LIKELY(tag == ~vpn))
         return (void *)(uintptr_t)(va + addend);
     return appine_tlb_fill(cpu, va, access);
 }

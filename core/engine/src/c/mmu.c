@@ -12,13 +12,9 @@
 
 #include "internal.h"
 
-#define LEVELS 4
-#define LEVEL_BITS 9
+#define LEVELS MMU_LEVELS
+#define LEVEL_BITS MMU_LEVEL_BITS
 #define LEVEL_ENTRIES (1u << LEVEL_BITS)
-
-struct appine_mmu {
-    uintptr_t *root;
-};
 
 static unsigned level_index(uint64_t gva, int level)
 {

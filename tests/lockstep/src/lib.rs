@@ -55,6 +55,8 @@ pub struct ClassReport {
     pub both_undefined: u64,
     /// 硬件能执行、解释器按白名单拒绝的次数（只出现在模糊类别）。
     pub stricter: u64,
+    /// Tier 1 退回 Tier 0 执行单条指令的次数（TLB 未命中、跨页或者没有翻译的指令）。
+    pub tier1_fallback: u64,
     /// guest 特性集合缺少该类别需要的特性，没有运行。
     pub skipped: bool,
 }
@@ -422,11 +424,20 @@ mod runner {
             executed: 0,
             both_undefined: 0,
             stricter: 0,
+            tier1_fallback: 0,
             skipped: guest_hwcap() & class.requires != class.requires,
         };
         if report.skipped {
             return Ok(report);
         }
+        let interp_exits = |h: &Harness| {
+            h.tiers[1]
+                .1
+                .dbt
+                .as_ref()
+                .map_or(0, |d| d.stats().exits_interp)
+        };
+        let start_exits = interp_exits(h);
         let mut g = Rng::new(class_seed(config.seed, class.name));
         let slot = h.oracle.slot_addr();
         let data_va = h.oracle.data_addr();
@@ -541,6 +552,7 @@ mod runner {
                 _ => report.stricter += 1,
             }
         }
+        report.tier1_fallback = interp_exits(h) - start_exits;
         Ok(report)
     }
 

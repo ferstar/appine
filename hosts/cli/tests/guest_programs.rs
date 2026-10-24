@@ -238,6 +238,34 @@ fn ipc_timers_credentials_and_scheduling() {
 }
 
 #[test]
+fn self_modifying_code() {
+    // 像 JIT 一样改写代码：同一页反复改写、W^X 的 mprotect、memfd 双映射、另一个线程
+    // 正在执行时改写，以及对未映射地址做缓存维护
+    let Some(program) = build_c_guest("jit") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn missing_program_exits_127() {
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
         .arg("/nonexistent/program")

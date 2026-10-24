@@ -12,11 +12,10 @@
  * 载入 guest 的 FPCR/FPSR/NZCV 和 V0–V31，执行后写回。
  *
  * 缓存由所有线程共享，写满时整体清空。为了不覆盖别的线程正在执行的桩，
- * 查找和执行都在读锁内进行，生成和清空需要写锁。
- *
- * 原型限制：可执行内存直接映射为 RWX。
+ * 查找和执行都在读锁内进行，生成和清空需要写锁。缓存按 W^X 双映射
+ * （appine_map_code），在可写的别名里生成桩。
  */
-#define _POSIX_C_SOURCE 200809L /* -std=c17 下 pthread_rwlock_t 需要它 */
+#define _GNU_SOURCE /* -std=c17 下 pthread_rwlock_t、mremap 需要它 */
 
 #include <pthread.h>
 #include <stddef.h>
@@ -45,17 +44,41 @@ struct slot {
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static pthread_rwlock_t lock = PTHREAD_RWLOCK_INITIALIZER;
-static uint32_t *cache;
+static uint32_t *cache;   /* 执行用的地址 */
+static intptr_t rw_delta; /* 写入用的别名减去执行用的地址 */
 static size_t used_words;
 static size_t table_count;
 static struct slot table[TABLE_SIZE];
 
+uint32_t *appine_map_code(size_t bytes, intptr_t *delta)
+{
+    /* 用 mremap 复制共享映射，不依赖 memfd */
+    void *w = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (w != MAP_FAILED) {
+        void *x = mremap(w, 0, bytes, MREMAP_MAYMOVE);
+        if (x != MAP_FAILED && mprotect(x, bytes, PROT_READ | PROT_EXEC) == 0) {
+            *delta = (intptr_t)w - (intptr_t)x;
+            return x;
+        }
+        if (x != MAP_FAILED)
+            munmap(x, bytes);
+        munmap(w, bytes);
+    }
+    void *c = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    *delta = 0;
+    return c == MAP_FAILED ? NULL : c;
+}
+
+void appine_unmap_code(uint32_t *code, size_t bytes, intptr_t delta)
+{
+    munmap(code, bytes);
+    if (delta)
+        munmap((char *)code + delta, bytes);
+}
+
 static void init(void)
 {
-    void *p = mmap(NULL, CACHE_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
-                   -1, 0);
-    if (p != MAP_FAILED)
-        cache = p;
+    cache = appine_map_code(CACHE_BYTES, &rw_delta);
 }
 
 bool appine_native_available(void)
@@ -194,13 +217,14 @@ static void insert(uint32_t insn, const struct native_desc *desc)
     size_t i = slot_index(insn);
     while (table[i].fn)
         i = (i + 1) & (TABLE_SIZE - 1);
-    struct buf b = {cache + used_words, 0};
+    uint32_t *code = cache + used_words;
+    struct buf b = {(uint32_t *)((char *)code + rw_delta), 0}; /* 桩里没有相对跳转 */
     generate(&b, insn, desc);
     if (b.n > MAX_STUB_WORDS)
         abort(); /* 上界估计错误：属于引擎 bug */
-    sync_icache((void *)b.p, (void *)(b.p + b.n));
+    sync_code((void *)code, (void *)(code + b.n), rw_delta);
     used_words += b.n;
-    table[i] = (struct slot){insn, (native_fn)(uintptr_t)b.p};
+    table[i] = (struct slot){insn, (native_fn)(uintptr_t)code};
     table_count++;
 }
 

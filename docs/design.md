@@ -104,34 +104,31 @@ guest 是 **aarch64**，直接使用 Alpine 官方 aarch64 仓库。这样选有
   - 代价：对 SIMD&FP 而言，Tier 0 不再是独立于硬件的参考实现（硬件本来就是 lockstep 的标准答案）；Tier 0 需要宿主能分配可执行内存（Android 允许 JIT）；只能运行在 aarch64 Linux 宿主上，非这类宿主不宣告 FP/ASIMD。
   - SIMD&FP 的访存（LDR/STR/LDP/STP 的 B/H/S/D/Q 形式、LD1–LD4/ST1–ST4 的多结构、单结构和 replicate 形式）仍用 C 经 soft-MMU 实现：先确认要访问的每一页都可访问，再读写，失败时没有副作用。
 
-**Tier 1：同 ISA 直通式 DBT。** M2 的原型在 `core/engine/src/c/dbt.c`，用 `appine-run --tier 1` 启用。
-- **寄存器约定**：guest 的 X0–X15、X19–X27、X29、X30 放在同号的宿主寄存器里；宿主 X28 指向 CPU 上下文，X16–X18 是临时寄存器。guest 自己的 X16、X17、X18、X28 和 SP 存放在上下文里（"被占用的寄存器"）：引用它们的指令先把值读进临时寄存器，改写寄存器字段后执行，再写回。guest 的 NZCV 就是宿主的 NZCV，所以插入的代码一律不改动条件标志（用 `cbnz`/`tbnz`/`eor` 代替 `cmp`）。
-- 只读写寄存器的 ALU 指令（以后还有 FP、NEON 指令）**原样拷贝**。
-- 只有以下几类指令需要改写：
-  - 访存指令：插入 soft-MMU 的 TLB 快速路径。
+**Tier 1：同 ISA 直通式 DBT。** 在 `core/engine/src/c/dbt.c`，`appine-run --tier 1` 和 Android App 使用它。M2 是原型，M7 补全成正式版（见 §14 的 M7 结果）。
+- **寄存器约定**：guest 的 X0–X15、X19–X26、X29、X30 放在同号的宿主寄存器里；宿主 X28 指向 CPU 上下文，X16、X17、X27 是临时寄存器。guest 自己的 X16、X17、X18、X27、X28 和 SP 存放在上下文里（"被占用的寄存器"）：引用它们的指令先把值读进临时寄存器，改写寄存器字段后执行，再写回。宿主 X18 是平台寄存器（Android 上 ShadowCallStack 用它），翻译后的代码不碰它，宿主的信号处理函数随时可以用（R6）。guest 的 NZCV、FPCR、FPSR 和 V0–V31 就是宿主的（§4.3），所以插入的代码一律不改动条件标志（用 `cbnz`/`tbnz`/`eor` 代替 `cmp`）。
+- 只读写寄存器的 ALU、FP、NEON 指令**原样拷贝**。SIMD&FP 数据处理的白名单判定与 Tier 0 共用同一个函数。
+- 需要改写的指令：
+  - 访存指令，包括 SIMD&FP 的 LDR/STR/LDP/STP 和 LD1–LD4/ST1–ST4：插入 soft-MMU 的 TLB 快速路径，访问换成宿主地址。
   - 分支和 PC 相对寻址（`adr`/`adrp`/`ldr literal`）：改成以 guest PC 为基准的常量。
   - `svc`：转去调用内核层。
-  - `mrs/msr tpidr_el0`：改为读写 guest 状态结构里的字段。
-  - `mrs ID_*_EL1`：返回我们宣告的特性值。
-  - `ldxr…stxr` 序列：见 4.5。
-  - `dc zva`、`dc cvau`、`ic ivau`：它们的操作数是 guest 地址，需要先翻译。
+  - `mrs/msr tpidr_el0`、`mrs dczid_el0`：读写 guest 状态结构里的字段，或者换成常数。
+  - `ldxr…stxr`：改写成比较并交换，见 4.5；LDAR/STLR 和 LSE 原子指令在翻译好的宿主地址上原样执行。
+  - `dc zva`：翻译地址后用 `stp xzr` 清零。`dc cvau`、`ic ivau` 交给 Tier 0：前者只检查地址，后者让内核作废翻译（见下面的"失效"）。
   - PAC 系列 HINT 指令（`PACIASP`/`AUTIASP` 等）：改写为 NOP，见 4.4。
-- **访存快速路径**（约 10 条宿主指令）：算出 guest 地址 → 跨页检查 → 用一条 `ldp` 取出 TLB 表项的 tag 和 addend → 比较 → 访问 `addend + 地址`。TLB 未命中、跨页或 SP 未对齐时退出到分发器，由 Tier 0 执行这一条指令；这时指令还没有产生任何副作用，所以异常是精确的。
-- **控制流**：直接分支通过块链接回填成一条 `b`；间接分支（`br`/`blr`/`ret`）先查一张 4096 项的跳转缓存，未命中再回到分发器。每个块入口检查 kick 标志，链接成环的循环也能被打断。
+  - `mrs ID_*_EL1`、写 FPCR/FPSR 这类少见的系统寄存器访问交给 Tier 0 执行。
+- **访存快速路径**（算地址之外 6 条宿主指令）：算出 guest 地址 → 用最后一个字节所在页的下标取出 TLB 表项，一条 `ldp` 取出 tag 和 addend → 与第一个字节所在的页比较 → 访问 `addend + 地址`。TLB 直接映射，跨页时第一页的页号不可能出现在下一页的表项里，所以这一次比较同时排除了跨页访问。未命中时跳进代码缓存里的回填例程：它按 §5.1 的结构遍历页表、填好表项，再回来重新检查。只有页没有映射、权限不符、跨页、SP 未对齐或者地址带 TBI 标签时，才退出到分发器，由 Tier 0 执行这一条指令；这时指令还没有产生任何副作用，所以异常是精确的。
+- **控制流**：块不在条件分支处结束，不跳转的一侧接着翻译，跳转的一侧是侧出口。直接分支通过块链接回填成一条 `b`；条件分支的目标在它的偏移范围内时，直接改写条件分支本身。间接分支（`br`/`blr`/`ret`）先查一张 4096 项的跳转缓存，未命中再回到分发器。经由后向边或间接分支进入块时检查 kick 标志：块的起始地址沿前向边严格递增，任何循环里至少有一条边会经过检查，所以链接成环的循环也能被打断。
 - Tier 0 不认识的指令同样交给 Tier 0 执行，保证两层的白名单完全一致（§4.4）。
 - 精确状态几乎是免费的：宿主 `ucontext` 里的寄存器就是 guest 寄存器，被占用的寄存器另外保存在上下文里。
-- 文件映射的代码，其翻译结果按 `(inode, offset)` **跨进程共享**，这样 `./configure` 产生的大量短命进程不必每次重新翻译。
-- 原型还没处理的问题：
-  - **自修改代码和映射变化**：翻译结果不会自动失效，`ic ivau`、munmap、mprotect 都要触发失效。Tier 1 成为默认执行层之前必须解决。
-  - **宿主 X18**：Android 上它是平台保留寄存器（ShadowCallStack 会用到），原型拿它当临时寄存器。正式版要么换掉它，要么在宿主信号入口先恢复它。
-  - LL/SC 序列，见 4.5。
-- JIT 代码页使用 **W^X 双映射**：同一个 memfd 映射两次，一份 RW 用来写入，一份 RX 用来执行。原型目前直接映射成 RWX。
+- **翻译共享**：一个块的翻译只取决于它的 guest pc 和翻译过的指令字，与进程、映射无关。每翻译一个块就存成模板，放进所有实例共用的模板区；别的实例（另一个线程、fork 出来的子进程、又一次 exec 的同一个程序）要翻译同一个 pc 时，先比对指令字，相同就把模板拷进自己的代码缓存，只重新计算跳往例程的几条 `b`。块之间的链接在各自的拷贝里回填，所以不需要像原计划那样按 `(inode, offset)` 识别文件页，不同进程在同一地址映射了不同的代码也不会互相影响。`./configure` 这类负载里 85% 的块直接来自模板。
+- **失效**：guest 修改代码之后执行的 `ic ivau`，以及可执行映射的拆除和权限变化，都记进 `mm` 的代码失效日志，并递增代码代数；每个线程重新进入 guest 代码之前，按自己错过的范围逐页作废翻译（日志不全时整体清空）。作废的块入口改成跳往一个转发桩，重新翻译之后旧入口直接跳往新的块，别的块链接到旧入口的跳转不用找出来改写。CTR_EL0 报告 DIC = IDC = 0，guest 修改代码之后一定会执行 `ic ivau`。
+- JIT 代码页使用 **W^X 双映射**：同一段共享匿名内存用 `mremap` 映射两次，一份 RW 用来写入，一份 RX 用来执行，不依赖 memfd；宿主不允许时退回 RWX。Tier 0 的原生指令桩也这样分配。
 
 **否决了以 dynarmic 为核心的方案**，见 §15。dynarmic 是 0BSD 许可，可以直接借用它的 A64 解码表（`frontend/A64/decoder`）和测试用例。
 
 ### 4.3 FP 状态
 
-FP 和 NEON 指令都在宿主上原生执行。所以每次从宿主代码进入 guest 代码，都要把 guest 的 FPCR 装进宿主 FPCR；回到宿主 C 代码之前再恢复，避免 guest 设置的 flush-to-zero 之类的模式影响我们自己的代码。
+FP 和 NEON 指令都在宿主上原生执行。所以每次从宿主代码进入 guest 代码，都要把 guest 的 FPCR 装进宿主 FPCR；回到宿主 C 代码之前再恢复，避免 guest 设置的 flush-to-zero 之类的模式影响我们自己的代码。Tier 1 的进入例程保存宿主的 d8–d15 和 FPCR，载入 guest 的 FPCR、FPSR 和 V0–V31，翻译后的代码里它们一直在宿主寄存器里；退出例程保存 guest 的 V0–V31 和 FPSR，再恢复宿主的状态。
 
 ### 4.4 CPU 特性基线
 
@@ -156,7 +153,9 @@ FP 和 NEON 指令都在宿主上原生执行。所以每次从宿主代码进�
 
 在 `ldxr` 和 `stxr` 之间插入额外的访存（比如 TLB 查找），可能会让独占监视器失效，导致活锁。处理办法是：识别出整个 LL/SC 序列，在序列开始前一次性完成地址翻译；做不到的就把整段改写成 CAS 语义，或者整段放到慢路径执行。DynamoRIO 在 AArch64 上遇到过同样的问题，可以参考它的做法。soft-MMU 翻译得到的是真实宿主指针，所以原子指令直接作用在宿主内存上，多个线程或进程共享同一页时语义天然正确。
 
-**Tier 0 的做法**（M1a，`core/engine/src/c/atomic.c`）：LDXR/LDXP 记下地址、长度和读到的值；STXR/STXP 在宿主地址上做比较并交换，只有内存值仍等于记下的值才成功，与 QEMU 的做法相同（允许 ABA，对正确的 LL/SC 用法没有影响）。CLREX 和 svc 都会清掉独占标记。要求自然对齐，否则是对齐错误。LDAR/STLR 用 C 的 acquire/release 原子操作实现；LSE 原子指令和 CAS/CASP 交给原生桩，在翻译后的宿主地址上原样执行。Tier 1 原型目前把这些指令全部退回 Tier 0 执行，序列级的改写留到 M7。
+**Tier 0 的做法**（M1a，`core/engine/src/c/atomic.c`）：LDXR/LDXP 记下地址、长度和读到的值；STXR/STXP 在宿主地址上做比较并交换，只有内存值仍等于记下的值才成功，与 QEMU 的做法相同（允许 ABA，对正确的 LL/SC 用法没有影响）。CLREX 和 svc 都会清掉独占标记。要求自然对齐，否则是对齐错误。LDAR/STLR 用 C 的 acquire/release 原子操作实现；LSE 原子指令和 CAS/CASP 交给原生桩，在翻译后的宿主地址上原样执行。
+
+**Tier 1 的做法**（M7）：语义与 Tier 0 相同，不需要识别整个序列。LDXR 查过 TLB 之后在宿主地址上读（LDAXR 用 `ldar`），记下地址、长度和读到的值。STXR 先确认独占标记是同一地址、同一长度，再在宿主地址上用 `ldaxr`/`stlxr` 循环做比较并交换：两条指令之间只有寄存器运算，没有访存，宿主的独占监视器不会被我们自己的代码清掉。CLREX 清掉标记，svc 退出时也清掉。LDAR/STLR、CAS 和 LSE 原子指令换上宿主地址原样执行。成对的 LDXP/STXP，以及操作数是被占用寄存器的 CASP 很少见，仍交给 Tier 0。
 
 ---
 
@@ -169,21 +168,22 @@ FP 和 NEON 指令都在宿主上原生执行。所以每次从宿主代码进�
 - **每个进程一个 `mm`**，包含两部分：
   - VMA 区间树：实现 mmap/mprotect/munmap 语义，并用来生成 `/proc/<pid>/maps`。
   - 页表：以 guest 虚拟页号为键的基数树，表项内容为 `{宿主页指针, R/W/X/COW 标志位}`。只有 TLB 未命中时，我们自己的 C 代码才会遍历它。
-- **每个线程一个软件 TLB**：直接映射，初始 512 项，每项 `{读 tag, 写 tag, addend}`。tag 比较时把对齐位也算进去，这样跨页和未对齐的访问都会自动落到慢路径。
+- **每个线程一个软件 TLB**：直接映射，4096 项（M7 从 512 项加大），每项 `{读 tag, 读 addend, 写 tag, 写 addend}`。tag 存的是页号取反，0 表示无效，所以清零的内存就是空的 TLB，新线程不必逐项写入，没碰过的页不占内存。表项填写时记进一张位图，清空时只处理填过的项，所以 munmap 频繁的程序清空 TLB 也不贵。
 
-TLB 命中路径（示意）：
+Tier 1 的 TLB 命中路径（8 字节的读；x16 = guest 地址）：
 
 ```asm
-ubfx x16, xA, #12, #9        // 页号低 9 位 → TLB 下标
-add  x16, xTLB, x16, lsl #4
-ldp  x17, x16, [x16]         // tag, addend
-cmp  x17, xA, lsr #12
-b.ne slow_path
-ldr  x0, [x16, xA]           // 宿主地址 = addend + guest 地址
+add  x17, x16, #7            // 最后一个字节
+ubfx x17, x17, #12, #12      // 它所在页的页号低 12 位 → TLB 下标
+add  x17, x28, x17, lsl #5   // x28 指向 CPU 上下文
+ldp  x17, x27, [x17, #TLB]   // tag（页号取反）, addend
+eon  x17, x17, x16, lsr #12  // 与第一个字节所在的页比较，跨页时一定不等
+cbnz x17, refill
+ldr  x0, [x27, x16]          // 宿主地址 = addend + guest 地址
 ```
 
-- **TLB 未命中**：查基数树。查不到，或者权限不符，就调用内核层的 `mem_fault`，由它负责懒分配、CoW 复制，或者给 guest 投递 SIGSEGV。
-- **TLB shootdown**：多个线程共享一个 `mm` 时，页表可以在被别的线程遍历的同时修改（表项用原子操作读写，中间表在 `mm` 销毁前不释放）。解除映射或降低权限之后，修改方递增 `mm` 的代数，打断正在执行 guest 代码的其他线程，等它们退出 guest 代码；每个线程重新进入 guest 代码之前比较代数，变了就刷新自己的 TLB 和 Tier 1 翻译缓存。被解除映射的宿主内存要等 shootdown 完成后才释放，所以 guest 自己的数据竞争碰不到已经还给宿主的内存。
+- **TLB 未命中**：查基数树（Tier 1 在代码缓存里的回填例程中查，Tier 0 在 C 里查）。查不到，或者权限不符，就交给内核层，由它给 guest 投递 SIGSEGV 或 SIGBUS。
+- **TLB shootdown**：多个线程共享一个 `mm` 时，页表可以在被别的线程遍历的同时修改（表项用原子操作读写，中间表在 `mm` 销毁前不释放）。解除映射或降低权限之后，修改方递增 `mm` 的代数，打断正在执行 guest 代码的其他线程，等它们退出 guest 代码；每个线程重新进入 guest 代码之前比较代数，变了就刷新自己的 TLB。只增加权限时不刷新：TLB 里的旧表项只是少了权限，未命中时会重新填写。代码的变化另有一个代数和失效日志，见 §4.2。被解除映射的宿主内存要等 shootdown 完成后才释放，所以 guest 自己的数据竞争碰不到已经还给宿主的内存。
 
 ### 5.2 页与后备内存
 
@@ -193,7 +193,7 @@ ldr  x0, [x16, xA]           // 宿主地址 = addend + guest 地址
   - busybox/musl 的代码页通过宿主 page cache **在所有 guest 进程之间共享**。
   - `MAP_SHARED` 映射和 `read`/`write` 之间天然一致。
 - 进程间的 `MAP_SHARED` 匿名内存，就是让两张页表指向同一个宿主页。System V 共享内存段同理：段持有一段宿主内存，`shmat` 把它映射进地址空间。
-- 访问文件映射时如果超出 EOF，宿主会产生 SIGBUS，我们把它转换成 guest 的 SIGBUS。
+- 文件映射超出 EOF 的整页不放进页表，访问它们时宿主 mmap 会产生 SIGBUS。guest 访问这些页，得到的是 guest 自己的 SIGBUS（`BUS_ADRERR`）；共享映射的文件后来变长了，就把新的内容映射进来，重新执行那条指令。映射之后文件又被截短的情况见 §7.4。
 
 ### 5.3 fork
 
@@ -248,7 +248,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 类型 | 规则 |
 |---|---|
 | 访存出错（SIGSEGV/SIGBUS） | pc 指向出错的那条指令；`si_addr` 是精确的 guest 地址；`si_code` 区分 `SEGV_MAPERR`/`SEGV_ACCERR`；基址寄存器的回写（post-index、`ldp`）不能提前生效 |
-| `brk #imm` | 投递 SIGTRAP，`si_code` 为 `TRAP_BRKPT`，ESR 中带上立即数 |
+| `brk #imm` | 投递 SIGTRAP，`si_code` 为 `TRAP_BRKPT`；与 Linux 一样，信号帧里没有 `esr_context` |
+| 对齐错误 | 投递 SIGBUS，`si_code` 为 `BUS_ADRALN`。ESR 的 EC：数据访问（独占访问、原子操作）是 0x24，DFSC 为对齐错误；SP 未对齐是 0x26，`si_addr` 是 SP；PC 未对齐是 0x22 |
 | `udf` 和白名单外的编码 | 投递 SIGILL，`si_code` 为 `ILL_ILLOPC` |
 | 异步信号 | 解释器在指令边界投递；DBT 在块出口和循环回边检查每线程的 pending 标志后投递 |
 
@@ -258,6 +259,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 ### 7.4 宿主侧信号
 
 宿主侧只需要处理两种信号：文件映射越过 EOF 时的 SIGBUS，以及引擎自身 bug 导致的 SIGSEGV（转成崩溃报告）。用普通 `sigaction` 安装即可，libsigchain 会把我们的处理函数链在 ART 自己的处理函数之后。
+
+M7 先用不放进页表的办法避开了常见的情况（§5.2）：映射时就超出 EOF 的页，guest 根本碰不到宿主映射。还没有处理的是映射之后文件被截短（另一个进程 `ftruncate`），这时宿主进程仍会收到 SIGBUS 并退出；宿主侧的处理函数留到以后。
 
 ### 7.5 auxv 与内核版本
 
@@ -381,7 +384,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 6. 只导出启动 Activity 和 DocumentsProvider，不提供供其他 App 执行命令的 intent。
 7. guest 第一次在非回环地址上 `listen` 某个端口时，发出一条通知。
-8. JIT 代码页使用 W^X 双映射。
+8. JIT 代码页使用 W^X 双映射（M7）。
 
 **信任链**：`apk` 用 rootfs 中自带的 Alpine 公钥验证每个软件包的签名，所以更换镜像不会削弱信任。调试日志只保存在本地；如果以后加入遥测，必须由用户主动开启，并同步更新 Play 的数据安全表单。
 
@@ -436,13 +439,13 @@ docs/            设计文档
 ### 13.3 开发环境与测试
 
 - 主要的开发和测试宿主是 Mac 上的 **Linux arm64 虚拟机**（colima、OrbStack 或 Lima），90% 的工作不需要碰手机。`scripts/dev <命令>` 会在一个 arm64 Linux 容器里运行命令，比如 `scripts/dev cargo test --workspace`；Docker daemon 配了代理时，容器会自动沿用。
-- CI 跑在 GitHub 的 `ubuntu-24.04-arm` runner 上，依次执行格式检查、clippy、全部测试（含三方 lockstep、白名单与 `llvm-mc` 的对照、guest 程序和基准程序在两个执行层下的输出比对）、加长的 lockstep、性能探针，以及用 clang 编译的引擎测试。
+- CI 跑在 GitHub 的 `ubuntu-24.04-arm` runner 上，依次执行格式检查、clippy、全部测试（含三方 lockstep、白名单与 `llvm-mc` 的对照、guest 程序和基准程序在两个执行层下的输出比对）、加长的 lockstep、性能探针、差分测试（M7），以及用 clang 编译的引擎测试。
 - 性能探针：`cargo build --release -p appine-run -p appine-bench` 之后运行 `appine-bench`，它分别以原生、Tier 0、Tier 1 运行 `tests/bench/programs/` 下的程序，要求输出逐字相同，并打印耗时比。
 - 测试分为五层：
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。
   2. musl libc-test，加上 LTP 中挑选出的 syscall 和信号子集。
   3. 端到端场景：busybox 测试集、`apk add`、`git clone`、从源码编译真实项目。
-  4. **差分测试**：同一条命令分别在 appine 和真正的 arm64 Linux 虚拟机中运行，比对输出；信号测试比对 `ucontext` 的内容。
+  4. **差分测试**：同一条命令分别在 appine 和真正的 arm64 Linux 虚拟机中运行，比对输出；信号测试比对 `ucontext` 的内容。`scripts/difftest`（M7）先在 appine 里把测试仓库的根文件系统打包、导入成 docker 镜像，再把 `tests/diff/` 下的每个脚本分别交给 docker 容器和 `appine-run` 执行，比对输出和退出码。
   5. Android 专项：用 arm64 Android 模拟器跑 instrumentation 测试，覆盖 4K 和 16K 页。GitHub 的 runner 没有 KVM，这一层在本地运行，CI 只构建 APK 并运行 lint。核心库另外提供一个"模拟 Android 限制"的开关，在 Linux 上提前暴露问题。
 
 ---
@@ -462,7 +465,7 @@ docs/            设计文档
 | **M4 网络 + apk** ✅ | socket 透传、DNS 存根、netlink 模拟、硬链接、AES/SHA 指令 | `apk update && apk add git python3` 成功，`git clone https://…` 成功 |
 | **M5 Android 外壳** ✅（未提交 Play） | Kotlin App、vendored 终端库、`specialUse` 前台服务、首次启动流程 | 真机上装好即用；4K/16K 页设备都通过；**提交 Play 内部测试或封闭测试轨道** |
 | **M6 B 档负载** ✅ | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
-| **M7 Tier 1 正式版** | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
+| **M7 Tier 1 正式版** ✅ | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
 | **M8 C 档正确性** | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler） | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
@@ -753,6 +756,65 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 - epoll 没有 `EPOLLEXCLUSIVE`。
 - Tier 1 翻译 SIMD&FP 原本在 R1 的退路里。按上面的数据，建议把它放进 M7 作为第一项。
 
+### M7 结果（2026-10-25）
+
+**结论：Tier 1 补全成正式版。编译 `lvm.c` 这一个文件从 M6 结束时的 7.4 秒降到 3.3 秒，是原生的 4.8 倍；SQLite `make` 从 485 秒降到 237 秒（4.7×），Lua `make linux` 从 51 秒降到 30.1 秒（6.1×），整数基准的几何平均是 1.77×。达到性能目标：CPU 密集的负载在 3–5 倍以内，短命进程多的构建脚本略高。100 万轮的三方 lockstep，以及新加的差分测试（6 组脚本，与 docker 里的原生 Alpine 逐字节比对输出），在 Tier 1 下全部通过。达到退出标准。**
+
+测量条件与 M6 相同：Apple Silicon 上的 colima 虚拟机（4 核），release 构建，Tier 1，单个 make 作业，原生是同一台虚拟机上的 `alpine:3.24` 容器。M6 记的"`lvm.c` 原生约 0.4 秒"偏低，同样条件下重测是 0.69 秒。
+
+| 负载 | 原生 | M6 | M7 | 倍数 |
+|---|---|---|---|---|
+| 编译 `lvm.c`（`gcc -O2 -c`） | 0.69s | 7.4s | 3.3s | 4.8× |
+| Lua 5.4.7 `make linux` | 4.9s | 51s | 30.1s | 6.1× |
+| SQLite 3.50.4 `./configure` | 1.2s | 15s | 9.2s | 7.7× |
+| SQLite 3.50.4 `make` | 50s | 485s | 237s | 4.7× |
+| `sh` 循环 200 次 fork + exec `/bin/true` | 0.25s | 0.73s（M3a） | 0.46s | 1.8× |
+| `appine-bench` 几何平均 | — | 1.85×（M2） | 1.77× | |
+
+- **编译负载**按影响从大到小（括号里是编译 `lvm.c` 的时间）：
+  1. **Tier 1 翻译 SIMD&FP**（7.4 → 5.0 秒）：guest 的 V0–V31、FPCR、FPSR 在翻译后的代码里一直放在宿主寄存器里，数据处理指令原样拷贝；SIMD 访存走和整数一样的 TLB 快速路径。退回 Tier 0 执行单条指令的次数从 1.34 亿降到 3179 万。
+  2. **TLB 从 512 项加到 4096 项**（→ 4.0 秒）。模拟显示剩下的未命中里 86% 是直接映射的冲突，4096 项就能命中；清空 TLB 改为只处理填过的项，munmap 频繁的 gcc 清空 1.95 万次也不贵。cpu 结构体为此重新排了布局：生成的代码直接寻址的字段放在 TLB 前面。
+  3. **跨页检查并进 TLB 比较，前向的链接跳过块入口的 kick 检查**（→ 3.7 秒）。
+  4. **代码缓存里的 TLB 回填例程**（退回 Tier 0 从 696 万次降到 311 万次）：未命中时不退出到分发器，直接遍历页表。
+  5. **`dc zva`、`mrs dczid_el0`、LL/SC 和 LSE 在 Tier 1 里翻译**：前两项来自 musl 的 memset，退回 Tier 0 降到 48 万次，剩下的基本是真正跨页的访存。
+  6. **块不在条件分支处结束，条件分支直接链接到目标块**（→ 3.25 秒），翻译的块从 50 万降到 14 万。跳转缓存试过从 4096 项加到 16384 项，间接分支未命中从 374 万次降到 131 万次，但只快了 1%，每个线程却要多占 192 KB，所以保持 4096 项。
+
+  剖析（perf 采样，按生成的每条宿主指令的用途归类）显示，翻译后的代码占八成以上的时间，其中 TLB 检查和访问本身约占三分之一，块之间的跳转（取指延迟）约占两成，进出例程降到 2% 左右。剩下的开销主要是 soft-MMU 访存链路上多出来的延迟和代码膨胀，见下面的推迟项。
+- **短命进程**：SQLite 的 `./configure` 里，翻译占了 46% 的时间（236 万个块，平均每个 1.5µs）。
+  - **翻译模板共享**（§4.2）：按 guest pc 和指令字比对，`./configure` 里 85% 的块直接拷贝模板。模板区 32 MB，写满时整体丢弃；同一个 pc 最多留 4 个版本，否则 JIT 反复改写同一处代码时查找会退化（lockstep 就是这样的负载，一度从 10 秒变成 766 秒）。
+  - 翻译本身也提速：CTR_EL0 只读一次（这台虚拟机上 EL0 读它会陷入内核），工作区不再每次 malloc，每个块只查一次页表。
+  - 退出的线程留下的 Tier 1 实例清空后放进一个两个位置的池子，新线程直接复用，不必重新映射代码缓存、在第一次写入每页时缺页。
+  - 这台虚拟机上 EL0 的 `dc cvau`/`ic ivau` 也会陷入内核，每生成一个块都要付出这笔开销；真机上通常不陷入，所以这一项在真机上会小一些。
+- **LL/SC**（§4.5，R4 关闭）：STXR 改写成两条指令之间没有访存的 `ldaxr`/`stlxr` 比较并交换循环。顺带修了两个原型的问题：Tier 1 把 CLREX 当屏障原样拷贝，没有清掉 guest 的独占标记；Tier 1 的 svc 退出也没有清。
+- **自修改代码**（§4.2"失效"）：Tier 0 实现了 `mrs ctr_el0`（DIC = IDC = 0）和 `dc cvac`/`dc cvau`/`dc civac`/`ic ivau`（原来都是未定义指令，Node.js、Java、LuaJIT 这类带 JIT 的程序和 libffi 闭包都会收到 SIGILL）。`ic ivau` 以新的退出原因交给内核，内核把这一页记进 `mm` 的代码失效日志，打断共用地址空间的其他线程；可执行映射的拆除、改权限同样只作废涉及的页，不再整体清空翻译缓存。`tests/guest/jit.c` 在两个执行层下检查：同一页反复改写、只改一条指令、W^X 的 mprotect 切换、memfd 双映射（需要文件系统，不带 rootfs 时跳过）、另一个线程执行过的代码被改写，以及对未映射地址做缓存维护得到 SIGSEGV。去掉内核里的作废之后，这个测试在 Tier 1 下确实失败。
+- **精确异常**：
+  - 翻译后的代码里，访存出错都交给 Tier 0 从头执行那条指令，状态是精确的；差分测试的 `signals` 用例把 x19–x28 设成已知的值后触发各种同步异常，比对 `si_code`、出错地址、ESR 的 EC 和 WnR 以及这些寄存器，其中 x27、x28 在 Tier 1 里存放在上下文中。
+  - 差分测试找出了两处与 Linux 不同的地方：数据访问的对齐错误原来报成 EC 0x26（SP 对齐），现在是 EC 0x24 加对齐错误的 DFSC，SP 对齐另用一个错误类别；`brk` 的 SIGTRAP 原来带 `esr_context`，Linux 不带（§7.3）。
+  - 文件映射超出 EOF 的页不再放进页表（§5.2）：guest 访问时得到 SIGBUS（`BUS_ADRERR`），原来是宿主进程直接被 SIGBUS 杀掉。LTP 的 `mmap13` 因此通过。
+- **W^X**：代码缓存和原生指令桩都改为双映射（§12 第 8 条），Linux 和 4K、16K 页的 Android 模拟器上的 App 进程里都没有 RWX 映射了。
+- **宿主 X18**（R6 关闭）：临时寄存器改用宿主 X27，guest X27 存放在上下文里，翻译后的代码不再碰 X18。编译 `lvm.c` 和基准程序的耗时差别都在误差范围内。
+- **每个线程的内存**：完整跑 LTP 时，`futex_cmp_requeue01`（fork 出 1000 个等待的子进程）被虚拟机的 OOM killer 杀掉，峰值常驻内存 3.3 GB，平均每个线程 3 MB 多。原因有三个，第一个从 M6 起就有：
+  1. Tier 1 实例的几张表按最大规模用 calloc 分配。glibc 释放过同样大的块之后会调高 mmap 的阈值，之后的 calloc 改从堆里分配并逐字节清零，几 MB 的表整块占用内存。现在实例、各张表和 cpu 结构体都直接用 mmap 分配，没碰过的页不占内存。
+  2. 翻译表按哈希散开，短命进程的几百个块在 2^18 项的表里会各自碰到一页新的内存。现在从 2^12 项开始，装到四分之三时加倍。
+  3. 4096 项的 TLB 初始化时要逐项写成"无效"。现在 tag 存页号取反，0 表示无效，清零的内存就是空的 TLB。
+
+  改完之后同一个测试的峰值是 410 MB，平均每个线程约 400 KB，编译 `lvm.c` 的耗时不变。
+- **其他**：mprotect 只增加权限时不再刷新 TLB；`--stats` 增加模板命中和作废的块数。
+- **测试**：
+  - lockstep 的报告增加一列 `tier1-fallback`：Tier 1 退回 Tier 0 执行单条指令的次数，用来确认 SIMD、原子操作这些类别确实在翻译后的代码里执行，而不是因为 TLB 未命中退回 Tier 0。100 万轮全部一致。
+  - 差分测试 `scripts/difftest`（§13.3 第 4 层）：busybox 的文本处理和压缩、fork 与信号、CPython（哈希、浮点格式化、decimal、unicode、sqlite3、线程）、gcc 编译运行 C 程序（浮点、自动向量化、原子操作、setjmp）并比对编译器输出的散列、Lua 和 SQLite 命令行、同步信号的 ucontext。两个执行层下都和原生一致。
+  - 单元测试新增代码失效日志、文件映射超出 EOF 的页表和 SIGBUS 判定。
+  - LTP 的 syscall 测试 849 个通过，与 M6 持平：新通过 `mmap13`（超出 EOF 的 SIGBUS）、`mprotect04`（改权限之后执行拷贝来的代码，要用 `ic ivau`）和 `splice07`；`clock_nanosleep02`、`epoll_pwait03` 变成失败，它们检查睡眠的超时精度（睡 1ms 实际睡了 1.6ms），用 M6 的二进制在同一环境下重测也失败，是虚拟机当时的计时器延迟。
+  - App 的 instrumentation 测试在 4K、16K 页的模拟器上通过。
+
+和设计相比的改动和推迟项：
+
+- 跨进程共享翻译按指令内容比对，而不是原计划的按 `(inode, offset)`：不需要内核层告诉引擎页的来源，也天然处理了同一地址映射不同代码的情况。
+- 还没做的优化：`ret` 走宿主的返回地址预测、guest SP 常驻宿主寄存器（栈访问前的那条 `ldr` 约占 8% 的采样）、退出桩压缩（每条访存的回填桩加退出桩约 10 个字；M7 中途测得生成的代码是 guest 代码的 6 倍多）、多线程 JIT 下每条 `ic ivau` 都要打断其他线程。
+- 成对的 LDXP/STXP、操作数是被占用寄存器的 CASP、`mrs ctr_el0`、`mrs ID_*_EL1`、写 FPCR/FPSR、`dc cvau`/`ic ivau` 仍交给 Tier 0 执行。
+- 映射之后文件被截短，宿主仍会收到 SIGBUS 并退出（§7.4）。
+- 真机测量仍未做（R1）。
+
 ---
 
 ## 15. 已否决的方案
@@ -782,12 +844,12 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 
 | # | 风险或假设 | 何时验证 | 退路 |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0，见 §14；真机待测 | 先让 Tier 1 翻译 SIMD&FP，再优化间接分支（`ret` 走宿主返回地址预测）、块内 TLB 检查外提等 |
+| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，见 §14；真机待测 | `ret` 走宿主返回地址预测、guest SP 常驻宿主寄存器、块内 TLB 检查外提、压缩退出桩 |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时（M5 按决定暂不提交） | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前 | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
-| R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | M1a 已在 Tier 0 用 CAS 模拟解决；Tier 1 的序列级改写在 M7 | 整段改写成 CAS，或者整段走慢路径 |
+| R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | 已解决：M1a 在 Tier 0 用 CAS 模拟，M7 在 Tier 1 把 STXR 改写成两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 §4.5 | — |
 | R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | M4 已验证：`apk add` 比原生慢约 7 倍，但只读的 `apk info` 也慢 6.3 倍，瓶颈在引擎而不在事务，见 §14 | 不需要；元数据操作本身再慢时按 syscall 批量合并提交 |
-| R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | M5 已解决：进入翻译代码时保存 X18（bionic 的影子调用栈指针），退出时恢复，见 §14 | 换用别的临时寄存器，代价是多占用一个 guest 寄存器；或者在宿主信号入口恢复 X18 |
+| R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | 已解决：M5 在进入、退出翻译代码时保存、恢复 X18，但翻译代码执行期间宿主信号处理函数仍可能用到它；M7 改用宿主 X27 作临时寄存器，guest X27 存放在上下文里，翻译后的代码不再碰 X18，性能差别在误差范围内 | — |
 | A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | M8（跳板已在 M3a 提供） | 无论结论如何，vDSO 跳板都要提供 |
 | A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | 仅影响 §15 的论证 | — |
 | A3 | dynarmic 内存回调拿不到精确 guest 状态（根据接口签名推断） | 仅影响 §15 的论证 | — |

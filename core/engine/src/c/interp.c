@@ -27,6 +27,13 @@
 #define SYSREG_TPIDR_EL0 SYSREG(3, 3, 13, 0, 2)
 #define SYSREG_TPIDRRO_EL0 SYSREG(3, 3, 13, 0, 3)
 #define SYSREG_DCZID_EL0 SYSREG(3, 3, 0, 0, 7)
+#define SYSREG_CTR_EL0 SYSREG(3, 3, 0, 0, 1)
+
+/*
+ * guest 读到的 CTR_EL0：64 字节的缓存行，PIPT 指令缓存。DIC = IDC = 0，即修改代码
+ * 之后必须执行 dc cvau 和 ic ivau：Tier 1 靠 ic ivau 知道哪些翻译要作废。
+ */
+#define CTR_VALUE UINT64_C(0x8444c004)
 
 /* DC ZVA 清零的块大小：DCZID_EL0.BS = 4，即 2^4 个字，与常见的 arm64 核心一致 */
 #define DCZ_BLOCK 64
@@ -97,7 +104,7 @@ static inline enum appine_exit undef(cpu_t *c, uint32_t insn)
 static inline bool sp_aligned(cpu_t *c, unsigned rn, uint32_t access)
 {
     if (rn == 31 && (c->sp & 15))
-        return raise_fault(c, c->sp, access, APPINE_FAULT_ALIGN);
+        return raise_fault(c, c->sp, access, APPINE_FAULT_SP_ALIGN);
     return true;
 }
 
@@ -605,6 +612,11 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
             return undef(c, insn);
         wx(c, rt, 4);
         return next(c);
+    case SYSREG_CTR_EL0:
+        if (!read)
+            return undef(c, insn);
+        wx(c, rt, CTR_VALUE);
+        return next(c);
     default: {
         uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（§4.4） */
         if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(FIELD(insn, 20, 5), &id)) {
@@ -680,6 +692,23 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         }
         memset(p, 0, DCZ_BLOCK);
         return next(c);
+    }
+    /*
+     * DC CVAC、DC CVAU、DC CIVAC、IC IVAU：guest 内存就是宿主内存，不需要维护缓存，
+     * 只按读访问检查地址。ic ivau 表示 guest 修改了这里的代码，交给调用方作废翻译。
+     */
+    uint32_t cmo = insn & 0xffffffe0;
+    if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520) {
+        uint64_t va = untag(rx(c, insn & 31));
+        if (!tlb_lookup(c, va, APPINE_ACCESS_READ)) {
+            raise_fault(c, va, APPINE_ACCESS_READ, APPINE_FAULT_PAGE);
+            return APPINE_EXIT_FAULT;
+        }
+        if (cmo != 0xd50b7520)
+            return next(c);
+        c->fault_addr = va;
+        c->pc += 4;
+        return APPINE_EXIT_CODE;
     }
 
     uint32_t reg_branch = insn & 0xfffffc1f;
