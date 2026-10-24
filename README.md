@@ -50,6 +50,18 @@ scripts/dev target/linux-arm64/debug/appine-run --rootfs target/store \
     --env TERM=xterm-256color --env HOME=/root /bin/sh -l
 ```
 
+The guest uses the host's network, so `apk` and `git` work. The guest only sees the
+environment given with `--env`; if the host needs a proxy, pass it through:
+
+```sh
+scripts/dev sh -c 'target/linux-arm64/debug/appine-run --rootfs target/store \
+    --env PATH=/usr/sbin:/usr/bin:/sbin:/bin --env HOME=/root \
+    --env http_proxy=$http_proxy --env https_proxy=$https_proxy \
+    /bin/sh -c "apk update && apk add git python3"'
+```
+
+The tests that need the internet run only with `APPINE_NETWORK_TESTS=1`.
+
 ## License
 
 appine is free software: you can redistribute it and/or modify it under the terms of the

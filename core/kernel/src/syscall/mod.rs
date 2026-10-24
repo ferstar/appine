@@ -7,9 +7,17 @@
 mod fs;
 mod mem;
 mod misc;
+mod net;
+mod poll;
 mod proc;
+mod sched;
 mod sig;
 mod tty;
+mod unix;
+mod xattr;
+
+pub(crate) use net::SocketRef;
+pub(crate) use poll::Epoll;
 
 use appine_engine::Cpu;
 
@@ -44,6 +52,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     state.orig_x0 = state.x[0];
     let nr = state.x[8];
     let a: [u64; 6] = state.x[..6].try_into().unwrap();
+    use xattr::Target::{Fd, Path};
 
     let result = match nr {
         // 不返回，或者自己设置全部寄存器
@@ -55,11 +64,42 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             Err(e) => Err(e),
         },
 
+        5 | 6 => xattr::setxattr(
+            cx,
+            Path(a[0], nr == 5),
+            a[1],
+            a[2],
+            a[3] as usize,
+            a[4] as u32,
+        ),
+        7 => xattr::setxattr(cx, Fd(a[0] as i32), a[1], a[2], a[3] as usize, a[4] as u32),
+        8 | 9 => xattr::getxattr(cx, Path(a[0], nr == 8), a[1], a[2], a[3] as usize),
+        10 => xattr::getxattr(cx, Fd(a[0] as i32), a[1], a[2], a[3] as usize),
+        11 | 12 => xattr::listxattr(cx, Path(a[0], nr == 11), a[1], a[2] as usize),
+        13 => xattr::listxattr(cx, Fd(a[0] as i32), a[1], a[2] as usize),
+        14 | 15 => xattr::removexattr(cx, Path(a[0], nr == 14), a[1]),
+        16 => xattr::removexattr(cx, Fd(a[0] as i32), a[1]),
         17 => fs::getcwd(cx, a[0], a[1]),
+        19 => poll::eventfd2(cx, a[0] as u32, a[1] as u32),
+        20 => poll::epoll_create1(cx, a[0] as u32),
+        21 => poll::epoll_ctl(cx, a[0] as i32, a[1] as u32, a[2] as i32, a[3]),
+        22 => {
+            let deadline = poll::deadline_ms(a[3] as i32);
+            poll::epoll_pwait(
+                cx,
+                a[0] as i32,
+                a[1],
+                a[2] as i32,
+                deadline,
+                a[4],
+                a[5] as usize,
+            )
+        }
         23 => fs::dup(cx, a[0] as i32),
         24 => fs::dup3(cx, a[0] as i32, a[1] as i32, a[2] as u32),
         25 => fs::fcntl(cx, a[0] as i32, a[1] as u32, a[2]),
         29 => fs::ioctl(cx, a[0] as i32, a[1] as u32, a[2]),
+        32 => fs::flock(cx, a[0] as i32, a[1] as u32),
         33 => fs::mknodat(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
         34 => fs::mkdirat(cx, a[0] as i32, a[1], a[2] as u32),
         35 => fs::unlinkat(cx, a[0] as i32, a[1], a[2] as u32),
@@ -70,6 +110,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         44 => fs::fstatfs(cx, a[0] as i32, a[1]),
         45 => fs::truncate(cx, a[0], a[1] as i64),
         46 => fs::ftruncate(cx, a[0] as i32, a[1] as i64),
+        47 => fs::fallocate(cx, a[0] as i32, a[1] as u32, a[2] as i64, a[3] as i64),
         48 => fs::faccessat(cx, a[0] as i32, a[1], a[2] as u32, 0),
         49 => fs::chdir(cx, a[0]),
         50 => fs::fchdir(cx, a[0] as i32),
@@ -88,8 +129,19 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         66 => fs::writev(cx, a[0] as i32, a[1], a[2] as usize),
         67 => fs::pread(cx, a[0] as i32, a[1], a[2] as usize, a[3] as i64),
         68 => fs::pwrite(cx, a[0] as i32, a[1], a[2] as usize, a[3] as i64),
+        // 64 位上 pos_h 不参与偏移（Linux 的 pos_from_hilo）
+        69 | 70 => fs::pvectored(
+            cx,
+            a[0] as i32,
+            a[1],
+            a[2] as usize,
+            a[3] as i64,
+            None,
+            nr == 70,
+        ),
         71 => fs::sendfile(cx, a[0] as i32, a[1] as i32, a[2], a[3] as usize),
-        73 => fs::ppoll(cx, a[0], a[1] as usize, a[2], a[3], a[4] as usize),
+        72 => poll::pselect6(cx, a[0] as i32, [a[1], a[2], a[3]], a[4], a[5]),
+        73 => poll::ppoll(cx, a[0], a[1] as usize, a[2], a[3], a[4] as usize),
         78 => fs::readlinkat(cx, a[0] as i32, a[1], a[2], a[3] as usize),
         79 => fs::newfstatat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         80 => fs::fstat(cx, a[0] as i32, a[1]),
@@ -101,11 +153,20 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         98 => misc::futex(cx, a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32),
         99 => Ok(0), // set_robust_list：robust mutex 的持有者退出时不做处理
         101 => misc::nanosleep(cx, a[0], a[1]),
+        102 => misc::getitimer(cx, a[0] as i32, a[1]),
+        103 => misc::setitimer(cx, a[0] as i32, a[1], a[2]),
         113 => misc::clock_gettime(cx, a[0] as i32, a[1]),
         114 => misc::clock_getres(cx, a[0] as i32, a[1]),
         115 => misc::clock_nanosleep(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        118 => sched::sched_setparam(cx, a[0] as i32, a[1]),
+        119 => sched::sched_setscheduler(cx, a[0] as i32, a[1] as i32, a[2]),
+        120 => sched::sched_getscheduler(cx, a[0] as i32),
+        121 => sched::sched_getparam(cx, a[0] as i32, a[1]),
+        122 => sched::sched_setaffinity(cx, a[0] as i32),
         123 => misc::sched_getaffinity(cx, a[0] as i32, a[1] as usize, a[2]),
         124 => Ok(0), // sched_yield
+        125 | 126 => sched::sched_priority_range(a[0] as i32, nr == 125),
+        127 => sched::sched_rr_get_interval(cx, a[0] as i32, a[1]),
         129 => sig::kill(cx, a[0] as i32, a[1] as i32),
         130 => sig::tkill(cx, a[0] as i32, a[1] as i32),
         131 => sig::tgkill(cx, a[0] as i32, a[1] as i32, a[2] as i32),
@@ -114,6 +175,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         134 => sig::rt_sigaction(cx, a[0] as i32, a[1], a[2], a[3] as usize),
         135 => sig::rt_sigprocmask(cx, a[0] as u32, a[1], a[2], a[3] as usize),
         136 => sig::rt_sigpending(cx, a[0], a[1] as usize),
+        140 => sched::setpriority(cx, a[0] as i32, a[1] as i32, a[2] as i32),
+        141 => sched::getpriority(cx, a[0] as i32, a[1] as i32),
         153 => misc::times(cx, a[0]),
         154 => proc::setpgid(cx, a[0] as i32, a[1] as i32),
         155 => proc::getpgid(cx, a[0] as i32),
@@ -132,6 +195,37 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         174..=177 => Ok(0),                         // getuid、geteuid、getgid、getegid：root
         178 => Ok(cx.tid() as u64),                 // gettid
         179 => misc::sysinfo(cx, a[0]),
+        198 => net::socket(cx, a[0] as i32, a[1] as u32, a[2] as i32),
+        199 => net::socketpair(cx, a[0] as i32, a[1] as u32, a[2] as i32, a[3]),
+        200 => net::bind(cx, a[0] as i32, a[1], a[2] as u32),
+        201 => net::listen(cx, a[0] as i32, a[1] as i32),
+        202 => net::accept4(cx, a[0] as i32, a[1], a[2], 0),
+        203 => net::connect(cx, a[0] as i32, a[1], a[2] as u32),
+        204 => net::getsockname(cx, a[0] as i32, a[1], a[2]),
+        205 => net::getpeername(cx, a[0] as i32, a[1], a[2]),
+        206 => net::sendto(
+            cx,
+            a[0] as i32,
+            a[1],
+            a[2] as usize,
+            a[3] as u32,
+            a[4],
+            a[5] as u32,
+        ),
+        207 => net::recvfrom(
+            cx,
+            a[0] as i32,
+            a[1],
+            a[2] as usize,
+            a[3] as u32,
+            a[4],
+            a[5],
+        ),
+        208 => net::setsockopt(cx, a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4] as u32),
+        209 => net::getsockopt(cx, a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4]),
+        210 => net::shutdown(cx, a[0] as i32, a[1] as i32),
+        211 => net::sendmsg(cx, a[0] as i32, a[1], a[2] as u32),
+        212 => net::recvmsg(cx, a[0] as i32, a[1], a[2] as u32),
         214 => Ok(cx.mm_mut().brk(a[0])),
         215 => mem::munmap(cx, a[0], a[1]),
         216 => Err(Errno::ENOMEM), // mremap：调用方（musl 的 realloc）会退回到复制
@@ -139,13 +233,43 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         222 => mem::mmap(cx, a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5]),
         226 => mem::mprotect(cx, a[0], a[1], a[2] as u32),
         227 => Ok(0), // msync：共享映射直接就是宿主的文件映射
+        228 => mem::mlock(cx, a[0], a[1], 0),
+        229 => mem::mlock(cx, a[0], a[1], 0), // munlock
+        230 => mem::mlockall(a[0] as u32),
+        231 => Ok(0), // munlockall
+        232 => mem::mincore(cx, a[0], a[1], a[2]),
         233 => mem::madvise(cx, a[0], a[1], a[2] as i32),
+        242 => net::accept4(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         260 => proc::wait4(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
         261 => misc::prlimit(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
         276 => fs::renameat2(cx, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
         278 => misc::getrandom(cx, a[0], a[1] as usize, a[2] as u32),
+        279 => fs::memfd_create(cx, a[0], a[1] as u32),
+        284 => mem::mlock(cx, a[0], a[1], a[2] as u32),
+        286 | 287 => fs::pvectored(
+            cx,
+            a[0] as i32,
+            a[1],
+            a[2] as usize,
+            a[3] as i64,
+            Some(a[5] as u32),
+            nr == 287,
+        ),
+        291 => fs::statx(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
         436 => fs::close_range(cx, a[0] as u32, a[1] as u32, a[2] as u32),
         439 => fs::faccessat(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
+        441 => match poll::deadline_ts(cx, a[3]) {
+            Ok(deadline) => poll::epoll_pwait(
+                cx,
+                a[0] as i32,
+                a[1],
+                a[2] as i32,
+                deadline,
+                a[4],
+                a[5] as usize,
+            ),
+            Err(e) => Err(e),
+        },
         _ => {
             debug::unimplemented_syscall(nr);
             Err(Errno::ENOSYS)

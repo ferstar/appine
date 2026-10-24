@@ -98,7 +98,7 @@ pub(super) fn clone(
     } else {
         // 先让同一地址空间里的其他线程停下来，复制出来的才是 fork 那一刻的快照
         cx.mm().quiesce(&cx.task.sync);
-        Rc::new(RefCell::new(cx.mm().fork()?))
+        Rc::new(RefCell::new(cx.mm_mut().fork()?))
     };
     let fds = if flags & CLONE_FILES != 0 {
         cx.t.fds.clone()
@@ -132,6 +132,9 @@ pub(super) fn clone(
         g.pgid = parent.pgid;
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
+        g.nice = parent.nice;
+        g.dumpable = parent.dumpable;
+        g.no_new_privs = parent.no_new_privs;
         g.ctty = parent.ctty.clone();
         g.exe = parent.exe.clone();
         g.exit_signal = (flags & 0xff) as i32;
@@ -454,9 +457,12 @@ struct Wanted {
     consume: bool,
 }
 
+/// 找到的子进程状态变化：(pid, 事件, 子进程和它回收过的子进程用掉的 CPU 时间)。
+type Found = (Tid, ChildEvent, u64);
+
 /// 找到一个符合条件的子进程状态变化，`consume` 时取走它（已结束的子进程同时被回收）。
 /// 没有子进程符合条件时返回 ECHILD。
-fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<(Tid, ChildEvent)>, Errno> {
+fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, Errno> {
     let children = cx.t.group.borrow().children.clone();
     let mut any = false;
     for c in children {
@@ -472,29 +478,29 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<(Tid, Ch
             continue;
         }
         any = true;
+        let cpu = child.borrow().cpu_ns(cx.kr()) + child.borrow().child_cpu_ns;
         let mut g = child.borrow_mut();
         if let (true, Some(status)) = (want.exited, g.zombie) {
             if want.consume {
-                let cpu = g.cpu_ns + g.child_cpu_ns;
                 drop(g);
                 cx.k().groups.remove(&c);
                 let mut me = cx.t.group.borrow_mut();
                 me.children.retain(|&x| x != c);
                 me.child_cpu_ns += cpu;
             }
-            return Ok(Some((c, ChildEvent::Exited(status))));
+            return Ok(Some((c, ChildEvent::Exited(status), cpu)));
         }
         if let (true, Some(sig)) = (want.stopped, g.stop_report) {
             if want.consume {
                 g.stop_report = None;
             }
-            return Ok(Some((c, ChildEvent::Stopped(sig))));
+            return Ok(Some((c, ChildEvent::Stopped(sig), cpu)));
         }
         if want.continued && g.cont_report {
             if want.consume {
                 g.cont_report = false;
             }
-            return Ok(Some((c, ChildEvent::Continued)));
+            return Ok(Some((c, ChildEvent::Continued, cpu)));
         }
     }
     if any { Ok(None) } else { Err(Errno::ECHILD) }
@@ -506,7 +512,7 @@ fn wait_child(
     who: Who,
     nohang: bool,
     want: Wanted,
-) -> Result<Option<(Tid, ChildEvent)>, Errno> {
+) -> Result<Option<Found>, Errno> {
     loop {
         if let Some(found) = find_event(cx, who, want)? {
             return Ok(Some(found));
@@ -543,14 +549,14 @@ pub(super) fn wait4(
         continued: options & WCONTINUED != 0,
         consume: true,
     };
-    let Some((child, event)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
+    let Some((child, event, cpu)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
         return Ok(0);
     };
     if wstatus != 0 {
         put(cx, wstatus, event.wait_status().to_le_bytes())?;
     }
     if rusage != 0 {
-        cx.mm().write(UserSlice::new(rusage, 144), &[0; 144])?;
+        put(cx, rusage, process::encode_rusage(cpu))?;
     }
     Ok(child as u64)
 }
@@ -585,13 +591,14 @@ pub(super) fn waitid(
     let found = wait_child(cx, who, options & WNOHANG != 0, want)?;
     if infop != 0 {
         let info = match found {
-            Some((child, event)) => event.siginfo(child).encode(Signal::CHLD),
+            Some((child, event, _)) => event.siginfo(child).encode(Signal::CHLD),
             None => [0; 128],
         };
         cx.mm().write(UserSlice::new(infop, 128), &info)?;
     }
     if rusage != 0 {
-        cx.mm().write(UserSlice::new(rusage, 144), &[0; 144])?;
+        let cpu = found.map_or(0, |f| f.2);
+        put(cx, rusage, process::encode_rusage(cpu))?;
     }
     Ok(0)
 }

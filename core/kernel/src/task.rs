@@ -301,9 +301,9 @@ pub(crate) fn release_mm(k: &mut Kernel, task: &Task, st: &mut TaskState) {
         if addr != 0
             && mm.shared_with_others()
             && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
-            && let Some(host) = mm.mmu().translate(addr, 0)
+            && let Some(key) = mm.futex_key(addr)
         {
-            k.futexes.wake(host.as_ptr() as usize, 1, u32::MAX);
+            k.futexes.wake(key, 1, u32::MAX);
         }
     }
     if let Some(done) = st.vfork_done.take() {

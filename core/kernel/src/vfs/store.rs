@@ -98,6 +98,9 @@ pub struct DirEntry {
 pub struct Store {
     db: Connection,
     objects: PathBuf,
+    /// 仓库目录里的 `lock` 文件。每个使用仓库的进程持有它的共享锁，只有独占使用时
+    /// 才清理已删除的 inode：别的进程可能还打开着它们。
+    lock: File,
 }
 
 const SCHEMA: &str = "
@@ -118,6 +121,12 @@ const SCHEMA: &str = "
         name   BLOB NOT NULL,
         ino    INTEGER NOT NULL,
         PRIMARY KEY (parent, name)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS xattrs (
+        ino   INTEGER NOT NULL,
+        name  BLOB NOT NULL,
+        value BLOB NOT NULL,
+        PRIMARY KEY (ino, name)
     ) WITHOUT ROWID;
 ";
 
@@ -178,13 +187,16 @@ impl Store {
         Ok(store)
     }
 
-    /// 打开已有的仓库，并清理上次运行留下的已删除 inode。
+    /// 打开已有的仓库。没有别的进程在使用它时，清理上次运行留下的已删除 inode。
     pub fn open(dir: &Path) -> Result<Store, Errno> {
         if !dir.join("meta.db").exists() {
             return Err(Errno::ENOENT);
         }
         let store = Self::connect(dir)?;
-        store.remove_orphans()?;
+        if store.lock.try_lock().is_ok() {
+            store.remove_orphans()?;
+        }
+        store.lock.lock_shared().map_err(io_err)?;
         Ok(store)
     }
 
@@ -204,7 +216,12 @@ impl Store {
                 remove_object(&self.object_path(ino))?;
             }
             self.db
-                .execute("DELETE FROM inodes WHERE ino = ?1", params![ino])
+                .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino]))
+                .map_err(db_err)?;
+            self.db
+                .prepare_cached("DELETE FROM xattrs WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino]))
                 .map_err(db_err)?;
         }
         Ok(())
@@ -216,16 +233,34 @@ impl Store {
             .map_err(db_err)?;
         db.pragma_update(None, "synchronous", "NORMAL")
             .map_err(db_err)?;
+        // 多个 appine 进程可以同时使用同一个仓库：等别人的写事务结束，而不是立即失败
+        db.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
+        // 元数据操作很频繁：所有语句都只编译一次
+        db.set_prepared_statement_cache_capacity(64);
         db.execute_batch(SCHEMA).map_err(db_err)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("lock"))
+            .map_err(io_err)?;
+        lock.lock_shared().map_err(io_err)?;
         Ok(Store {
             db,
             objects: dir.join("objects"),
+            lock,
         })
     }
 
-    /// 在一个事务里执行 `f`；`f` 出错时回滚。
+    /// 在一个事务里执行 `f`；`f` 出错时回滚。一开始就取得写锁（`IMMEDIATE`）：先读后写
+    /// 的事务在别的进程提交之后无法升级成写事务，那时 busy_timeout 也帮不上忙。
+    /// 已经在事务里时（导入 rootfs 时整个导入是一个事务）直接并入外层事务。
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
-        self.db.execute_batch("BEGIN").map_err(db_err)?;
+        if !self.db.is_autocommit() {
+            return f(self);
+        }
+        self.db.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
         match f(self) {
             Ok(v) => {
                 self.db.execute_batch("COMMIT").map_err(db_err)?;
@@ -245,11 +280,8 @@ impl Store {
     /// 在目录 `parent` 里查找 `name`。
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
         self.db
-            .query_row(
-                "SELECT ino FROM dentries WHERE parent = ?1 AND name = ?2",
-                params![parent, name],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT ino FROM dentries WHERE parent = ?1 AND name = ?2")
+            .and_then(|mut st| st.query_row(params![parent, name], |row| row.get(0)))
             .optional()
             .map_err(db_err)
     }
@@ -257,11 +289,10 @@ impl Store {
     /// 目录 `parent` 里指向 `ino` 的一个名字（getcwd 用）。
     pub fn name_of(&self, parent: Ino, ino: Ino) -> Result<Option<Vec<u8>>, Errno> {
         self.db
-            .query_row(
+            .prepare_cached(
                 "SELECT name FROM dentries WHERE parent = ?1 AND ino = ?2 ORDER BY name LIMIT 1",
-                params![parent, ino],
-                |row| row.get(0),
             )
+            .and_then(|mut st| st.query_row(params![parent, ino], |row| row.get(0)))
             .optional()
             .map_err(db_err)
     }
@@ -283,15 +314,21 @@ impl Store {
         Ok(st)
     }
 
+    /// 文件类型位（不需要读 object，删除之后仍然打开着的文件也能用）。
+    pub fn kind(&self, ino: Ino) -> Result<u32, Errno> {
+        Ok(self.stat_row(ino)?.kind())
+    }
+
     /// 数据库里的元数据（普通文件的 size、mtime 还没有填）。
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
         let row = self
             .db
-            .query_row(
+            .prepare_cached(
                 "SELECT mode, nlink, uid, gid, rdev, mtime_ns, ctime_ns, length(target)
                  FROM inodes WHERE ino = ?1",
-                params![ino],
-                |r| {
+            )
+            .and_then(|mut st| {
+                st.query_row(params![ino], |r| {
                     Ok((
                         r.get::<_, u32>(0)?,
                         r.get::<_, u32>(1)?,
@@ -302,8 +339,8 @@ impl Store {
                         r.get::<_, i64>(6)?,
                         r.get::<_, Option<u64>>(7)?,
                     ))
-                },
-            )
+                })
+            })
             .optional()
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?;
@@ -325,11 +362,8 @@ impl Store {
     /// 读取符号链接的目标。
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
         self.db
-            .query_row(
-                "SELECT target FROM inodes WHERE ino = ?1",
-                params![ino],
-                |r| r.get::<_, Option<Vec<u8>>>(0),
-            )
+            .prepare_cached("SELECT target FROM inodes WHERE ino = ?1")
+            .and_then(|mut st| st.query_row(params![ino], |r| r.get::<_, Option<Vec<u8>>>(0)))
             .optional()
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?
@@ -339,11 +373,8 @@ impl Store {
     /// 目录的上级目录；根目录的上级是它自己。
     pub fn parent(&self, dir: Ino) -> Result<Ino, Errno> {
         self.db
-            .query_row(
-                "SELECT parent FROM inodes WHERE ino = ?1",
-                params![dir],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT parent FROM inodes WHERE ino = ?1")
+            .and_then(|mut st| st.query_row(params![dir], |r| r.get(0)))
             .optional()
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)
@@ -389,11 +420,11 @@ impl Store {
     ) -> Result<Ino, Errno> {
         let now = now_ns();
         self.db
-            .execute(
+            .prepare_cached(
                 "INSERT INTO inodes (mode, uid, gid, nlink, parent, mtime_ns, ctime_ns)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![mode, uid, gid, nlink, parent, now],
             )
+            .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now]))
             .map_err(db_err)?;
         Ok(self.db.last_insert_rowid() as Ino)
     }
@@ -406,10 +437,8 @@ impl Store {
             return Err(Errno::ENOTDIR);
         }
         self.db
-            .execute(
-                "INSERT INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)",
-                params![parent, name, ino],
-            )
+            .prepare_cached("INSERT INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)")
+            .and_then(|mut st| st.execute(params![parent, name, ino]))
             .map_err(db_err)?;
         Ok(())
     }
@@ -423,18 +452,17 @@ impl Store {
         uid: u32,
         gid: u32,
     ) -> Result<Ino, Errno> {
-        if self.lookup(parent, name)?.is_some() {
-            return Err(Errno::EEXIST);
-        }
-        let ino = self.new_inode(mode::S_IFDIR | (perm & 0o7777), uid, gid, 2, parent)?;
-        self.add_dentry(parent, name, ino)?;
-        self.db
-            .execute(
-                "UPDATE inodes SET nlink = nlink + 1 WHERE ino = ?1",
-                params![parent],
-            )
-            .map_err(db_err)?;
-        Ok(ino)
+        self.transaction(|s| {
+            if s.lookup(parent, name)?.is_some() {
+                return Err(Errno::EEXIST);
+            }
+            let ino = s.new_inode(mode::S_IFDIR | (perm & 0o7777), uid, gid, 2, parent)?;
+            s.add_dentry(parent, name, ino)?;
+            s.db.prepare_cached("UPDATE inodes SET nlink = nlink + 1 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![parent]))
+                .map_err(db_err)?;
+            Ok(ino)
+        })
     }
 
     /// 新建空的普通文件，返回可读写的 object。
@@ -446,17 +474,35 @@ impl Store {
         uid: u32,
         gid: u32,
     ) -> Result<(Ino, File), Errno> {
-        if self.lookup(parent, name)?.is_some() {
-            return Err(Errno::EEXIST);
-        }
-        let ino = self.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 1, 0)?;
+        self.transaction(|s| {
+            if s.lookup(parent, name)?.is_some() {
+                return Err(Errno::EEXIST);
+            }
+            let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 1, 0)?;
+            s.add_dentry(parent, name, ino)?;
+            // 最后建 object：失败时整个事务回滚，不留下没有 object 的 inode
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(s.object_path(ino))
+                .map_err(io_err)?;
+            Ok((ino, file))
+        })
+    }
+
+    /// 新建一个没有名字的普通文件（memfd_create）：链接数为 0，object 一开始就删除，
+    /// 关闭之后数据随之消失，inode 在下次打开仓库时清理。
+    pub fn create_anonymous(&self, perm: u32) -> Result<(Ino, File), Errno> {
+        let ino = self.new_inode(mode::S_IFREG | (perm & 0o7777), 0, 0, 0, 0)?;
+        let path = self.object_path(ino);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(self.object_path(ino))
+            .open(&path)
             .map_err(io_err)?;
-        self.add_dentry(parent, name, ino)?;
+        remove_object(&path)?;
         Ok((ino, file))
     }
 
@@ -469,18 +515,17 @@ impl Store {
         uid: u32,
         gid: u32,
     ) -> Result<Ino, Errno> {
-        if self.lookup(parent, name)?.is_some() {
-            return Err(Errno::EEXIST);
-        }
-        let ino = self.new_inode(mode::S_IFLNK | 0o777, uid, gid, 1, 0)?;
-        self.db
-            .execute(
-                "UPDATE inodes SET target = ?1 WHERE ino = ?2",
-                params![target, ino],
-            )
-            .map_err(db_err)?;
-        self.add_dentry(parent, name, ino)?;
-        Ok(ino)
+        self.transaction(|s| {
+            if s.lookup(parent, name)?.is_some() {
+                return Err(Errno::EEXIST);
+            }
+            let ino = s.new_inode(mode::S_IFLNK | 0o777, uid, gid, 1, 0)?;
+            s.db.prepare_cached("UPDATE inodes SET target = ?1 WHERE ino = ?2")
+                .and_then(|mut st| st.execute(params![target, ino]))
+                .map_err(db_err)?;
+            s.add_dentry(parent, name, ino)?;
+            Ok(ino)
+        })
     }
 
     /// 新建设备节点、FIFO 或 socket 文件；它们只存在于数据库里。
@@ -493,43 +538,43 @@ impl Store {
         uid: u32,
         gid: u32,
     ) -> Result<Ino, Errno> {
-        if self.lookup(parent, name)?.is_some() {
-            return Err(Errno::EEXIST);
-        }
-        let ino = self.new_inode(mode, uid, gid, 1, 0)?;
-        self.db
-            .execute(
-                "UPDATE inodes SET rdev = ?1 WHERE ino = ?2",
-                params![rdev, ino],
-            )
-            .map_err(db_err)?;
-        self.add_dentry(parent, name, ino)?;
-        Ok(ino)
+        self.transaction(|s| {
+            if s.lookup(parent, name)?.is_some() {
+                return Err(Errno::EEXIST);
+            }
+            let ino = s.new_inode(mode, uid, gid, 1, 0)?;
+            s.db.prepare_cached("UPDATE inodes SET rdev = ?1 WHERE ino = ?2")
+                .and_then(|mut st| st.execute(params![rdev, ino]))
+                .map_err(db_err)?;
+            s.add_dentry(parent, name, ino)?;
+            Ok(ino)
+        })
     }
 
     /// 给已有的非目录 inode 增加一个硬链接。
     pub fn link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
-        if self.stat(ino)?.is_dir() {
-            return Err(Errno::EPERM);
-        }
-        self.add_dentry(parent, name, ino)?;
-        self.db
-            .execute(
+        self.transaction(|s| {
+            if s.stat_row(ino)?.is_dir() {
+                return Err(Errno::EPERM);
+            }
+            s.add_dentry(parent, name, ino)?;
+            s.db.prepare_cached(
                 "UPDATE inodes SET nlink = nlink + 1, ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, now_ns()],
             )
+            .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// 修改权限位（保留类型位）。
     pub fn set_mode(&self, ino: Ino, perm: u32) -> Result<(), Errno> {
         let n = self
             .db
-            .execute(
+            .prepare_cached(
                 "UPDATE inodes SET mode = (mode & ?2) | ?3, ctime_ns = ?4 WHERE ino = ?1",
-                params![ino, mode::S_IFMT, perm & 0o7777, now_ns()],
             )
+            .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now_ns()]))
             .map_err(db_err)?;
         if n == 0 { Err(Errno::ENOENT) } else { Ok(()) }
     }
@@ -552,11 +597,8 @@ impl Store {
     fn is_empty_dir(&self, dir: Ino) -> Result<bool, Errno> {
         let n: i64 = self
             .db
-            .query_row(
-                "SELECT count(*) FROM dentries WHERE parent = ?1",
-                params![dir],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT count(*) FROM dentries WHERE parent = ?1")
+            .and_then(|mut st| st.query_row(params![dir], |r| r.get(0)))
             .map_err(db_err)?;
         Ok(n == 0)
     }
@@ -564,16 +606,12 @@ impl Store {
     /// 删除一个指向非目录的目录项；最后一个链接消失时普通文件的 object 一起删除。
     fn remove_link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         self.db
-            .execute(
-                "DELETE FROM dentries WHERE parent = ?1 AND name = ?2",
-                params![parent, name],
-            )
+            .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
+            .and_then(|mut st| st.execute(params![parent, name]))
             .map_err(db_err)?;
         self.db
-            .execute(
-                "UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, now_ns()],
-            )
+            .prepare_cached("UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
         let st = self.stat_row(ino)?;
         if st.nlink == 0 && st.kind() == mode::S_IFREG {
@@ -588,19 +626,16 @@ impl Store {
             return Err(Errno::ENOTEMPTY);
         }
         self.db
-            .execute(
-                "DELETE FROM dentries WHERE parent = ?1 AND name = ?2",
-                params![parent, name],
-            )
+            .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
+            .and_then(|mut st| st.execute(params![parent, name]))
             .map_err(db_err)?;
         self.db
-            .execute("UPDATE inodes SET nlink = 0 WHERE ino = ?1", params![ino])
+            .prepare_cached("UPDATE inodes SET nlink = 0 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino]))
             .map_err(db_err)?;
         self.db
-            .execute(
-                "UPDATE inodes SET nlink = nlink - 1 WHERE ino = ?1",
-                params![parent],
-            )
+            .prepare_cached("UPDATE inodes SET nlink = nlink - 1 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![parent]))
             .map_err(db_err)?;
         Ok(())
     }
@@ -646,27 +681,23 @@ impl Store {
         }
         for (ino, delta) in [(from, -1i64), (to, 1)] {
             self.db
-                .execute(
-                    "UPDATE inodes SET nlink = nlink + ?2 WHERE ino = ?1",
-                    params![ino, delta],
-                )
+                .prepare_cached("UPDATE inodes SET nlink = nlink + ?2 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino, delta]))
                 .map_err(db_err)?;
         }
         self.db
-            .execute(
-                "UPDATE inodes SET parent = ?2 WHERE ino = ?1",
-                params![dir, to],
-            )
+            .prepare_cached("UPDATE inodes SET parent = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![dir, to]))
             .map_err(db_err)?;
         Ok(())
     }
 
     fn set_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         self.db
-            .execute(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)",
-                params![parent, name, ino],
             )
+            .and_then(|mut st| st.execute(params![parent, name, ino]))
             .map_err(db_err)?;
         Ok(())
     }
@@ -732,20 +763,16 @@ impl Store {
                     s.remove_link(new_dir, new_name, d)?;
                 }
             }
-            s.db.execute(
-                "DELETE FROM dentries WHERE parent = ?1 AND name = ?2",
-                params![old_dir, old_name],
-            )
-            .map_err(db_err)?;
+            s.db.prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
+                .and_then(|mut st| st.execute(params![old_dir, old_name]))
+                .map_err(db_err)?;
             s.set_dentry(new_dir, new_name, src)?;
             if src_dir {
                 s.reparent_dir(src, old_dir, new_dir)?;
             }
-            s.db.execute(
-                "UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1",
-                params![src, now_ns()],
-            )
-            .map_err(db_err)?;
+            s.db.prepare_cached("UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![src, now_ns()]))
+                .map_err(db_err)?;
             Ok(())
         })
     }
@@ -763,10 +790,77 @@ impl Store {
     /// 修改权限位、属主和属组（保留类型位）。
     pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
         self.db
-            .execute(
-                "UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1",
-                params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()],
+            .prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 设置扩展属性。`create`（`XATTR_CREATE`）时已经存在则失败，`replace`
+    /// （`XATTR_REPLACE`）时不存在则失败。
+    pub fn set_xattr(
+        &self,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+        create: bool,
+        replace: bool,
+    ) -> Result<(), Errno> {
+        self.transaction(|s| {
+            let exists = s.get_xattr(ino, name).is_ok();
+            if create && exists {
+                return Err(Errno::EEXIST);
+            }
+            if replace && !exists {
+                return Err(Errno::ENODATA);
+            }
+            s.db.prepare_cached(
+                "INSERT OR REPLACE INTO xattrs (ino, name, value) VALUES (?1, ?2, ?3)",
             )
+            .and_then(|mut st| st.execute(params![ino, name, value]))
+            .map_err(db_err)?;
+            s.touch_ctime(ino)
+        })
+    }
+
+    /// 读取扩展属性；没有时返回 ENODATA。
+    pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> Result<Vec<u8>, Errno> {
+        self.db
+            .prepare_cached("SELECT value FROM xattrs WHERE ino = ?1 AND name = ?2")
+            .and_then(|mut st| st.query_row(params![ino, name], |r| r.get(0)))
+            .optional()
+            .map_err(db_err)?
+            .ok_or(Errno::ENODATA)
+    }
+
+    /// 所有扩展属性的名字。
+    pub fn list_xattr(&self, ino: Ino) -> Result<Vec<Vec<u8>>, Errno> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT name FROM xattrs WHERE ino = ?1 ORDER BY name")
+            .map_err(db_err)?;
+        let rows = stmt.query_map(params![ino], |r| r.get(0)).map_err(db_err)?;
+        rows.collect::<Result<_, _>>().map_err(db_err)
+    }
+
+    /// 删除扩展属性；没有时返回 ENODATA。
+    pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> Result<(), Errno> {
+        self.transaction(|s| {
+            let n =
+                s.db.prepare_cached("DELETE FROM xattrs WHERE ino = ?1 AND name = ?2")
+                    .and_then(|mut st| st.execute(params![ino, name]))
+                    .map_err(db_err)?;
+            if n == 0 {
+                return Err(Errno::ENODATA);
+            }
+            s.touch_ctime(ino)
+        })
+    }
+
+    fn touch_ctime(&self, ino: Ino) -> Result<(), Errno> {
+        self.db
+            .prepare_cached("UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
         Ok(())
     }
@@ -782,10 +876,8 @@ impl Store {
             return self.open_object(ino, true)?.set_modified(t).map_err(io_err);
         }
         self.db
-            .execute(
-                "UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1",
-                params![ino, mtime_ns],
-            )
+            .prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, mtime_ns]))
             .map_err(db_err)?;
         Ok(())
     }
@@ -887,6 +979,80 @@ mod tests {
         drop(s);
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.stat(f), Err(Errno::ENOENT));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xattrs_and_anonymous_files() {
+        let (s, dir) = temp_store("xattr");
+        let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        assert_eq!(s.get_xattr(f, b"user.a"), Err(Errno::ENODATA));
+        s.set_xattr(f, b"user.b", b"2", false, false).unwrap();
+        s.set_xattr(f, b"user.a", b"1", true, false).unwrap();
+        assert_eq!(
+            s.set_xattr(f, b"user.a", b"x", true, false),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            s.set_xattr(f, b"user.c", b"x", false, true),
+            Err(Errno::ENODATA)
+        );
+        s.set_xattr(f, b"user.a", b"one", false, true).unwrap();
+        assert_eq!(s.get_xattr(f, b"user.a").unwrap(), b"one");
+        assert_eq!(
+            s.list_xattr(f).unwrap(),
+            vec![b"user.a".to_vec(), b"user.b".to_vec()]
+        );
+        s.remove_xattr(f, b"user.b").unwrap();
+        assert_eq!(s.remove_xattr(f, b"user.b"), Err(Errno::ENODATA));
+
+        let (anon, mut file) = s.create_anonymous(0o777).unwrap();
+        file.write_all(b"data").unwrap();
+        let st = s.stat_open(anon, &file).unwrap();
+        assert_eq!((st.nlink, st.size), (0, 4));
+        s.set_xattr(anon, b"user.x", b"1", false, false).unwrap();
+        // 别的进程还在使用仓库时不清理：它可能还打开着这个 inode
+        let other = Store::open(&dir).unwrap();
+        assert!(other.stat_row(anon).is_ok());
+        drop(other);
+        // 独占打开仓库时清理掉没有名字的 inode 和它的扩展属性
+        drop((file, s));
+        let s = Store::open(&dir).unwrap();
+        assert!(s.stat_row(anon).is_err());
+        assert_eq!(s.list_xattr(anon).unwrap(), Vec::<Vec<u8>>::new());
+        assert_eq!(s.get_xattr(f, b"user.a").unwrap(), b"one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_connections_wait_for_each_other() {
+        // 多个 appine 进程同时使用一个仓库：写操作等别人的事务结束，不会失败
+        let (s, dir) = temp_store("concurrent");
+        let dirs: Vec<Ino> = (0..4)
+            .map(|i| {
+                s.mkdir(ROOT, format!("d{i}").as_bytes(), 0o755, 0, 0)
+                    .unwrap()
+            })
+            .collect();
+        drop(s);
+        let workers: Vec<_> = dirs
+            .into_iter()
+            .map(|d| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let s = Store::open(&dir).unwrap();
+                    for i in 0..100 {
+                        let name = format!("f{i}");
+                        s.create_file(d, name.as_bytes(), 0o644, 0, 0).unwrap();
+                        s.rename(d, name.as_bytes(), d, b"g", false, false).unwrap();
+                        s.unlink(d, b"g").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -27,6 +27,7 @@ use crate::mm::Mm;
 use crate::process::{ExitStatus, ThreadGroup, Tier};
 use crate::task::{Task, TaskState};
 use crate::tty::Tty;
+use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
 /// 线程 ID；线程组 ID（pid）就是组里第一个线程的 tid。
@@ -45,6 +46,9 @@ static WAKE: AtomicBool = AtomicBool::new(false);
 pub(crate) fn request_wake() {
     WAKE.store(true, Ordering::Relaxed);
 }
+
+/// 持有 flock(2) 锁的打开文件（弱引用，关闭后锁随之释放），以及是不是排他锁。
+pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool);
 
 /// 内核层的全局状态。
 pub(crate) struct Kernel {
@@ -70,6 +74,13 @@ pub(crate) struct Kernel {
     pub ptys: BTreeMap<u32, Weak<RefCell<Tty>>>,
     /// 接到宿主终端的那个 PTY 的主设备（[`crate::terminal`]）。
     pub terminal: Option<crate::tty::PtyEnd>,
+    /// flock(2) 的锁：每个 inode 上持有锁的打开文件，以及是不是排他锁。打开文件关闭后
+    /// 弱引用失效，锁随之释放。
+    pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
+    /// AF_UNIX socket 绑定的地址。
+    pub unix: crate::unix::Names,
+    /// memfd 的封印（F_ADD_SEALS），以 inode 为键；不在这里的文件不能加封印。
+    pub seals: BTreeMap<Ino, u32>,
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
@@ -99,6 +110,9 @@ impl Kernel {
             },
             ptys: BTreeMap::new(),
             terminal: None,
+            flocks: BTreeMap::new(),
+            unix: Default::default(),
+            seals: BTreeMap::new(),
             next_tid: INIT + 1,
             waiters: Vec::new(),
         }

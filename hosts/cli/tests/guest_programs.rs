@@ -181,6 +181,34 @@ fn threads_signals_and_fork() {
 }
 
 #[test]
+fn sockets_polling_and_timers() {
+    // AF_UNIX（socketpair、SCM_RIGHTS、SO_PEERCRED、抽象地址）、TCP/UDP 回环、netlink、
+    // epoll/eventfd/select、setitimer；都不需要外网
+    let Some(program) = build_c_guest("net") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn missing_program_exits_127() {
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
         .arg("/nonexistent/program")

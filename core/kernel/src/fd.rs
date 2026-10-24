@@ -86,6 +86,12 @@ pub enum FileKind {
     },
     /// PTY 的主设备或从设备。
     Pty(PtyEnd),
+    /// socket。
+    Socket(crate::syscall::SocketRef),
+    /// epoll 实例。
+    Epoll(Rc<RefCell<crate::syscall::Epoll>>),
+    /// eventfd：一个 64 位计数器。
+    EventFd(Rc<RefCell<EventFd>>),
     /// procfs 的文件：打开时生成的内容。
     Proc {
         /// 节点。
@@ -136,7 +142,12 @@ impl OpenFile {
     /// 对应的文件系统节点（宿主 fd、管道和 PTY 没有）。
     pub fn node(&self) -> Option<Node> {
         match &self.kind {
-            FileKind::Host(_) | FileKind::Pipe(_) | FileKind::Pty(_) => None,
+            FileKind::Host(_)
+            | FileKind::Pipe(_)
+            | FileKind::Pty(_)
+            | FileKind::Socket(_)
+            | FileKind::Epoll(_)
+            | FileKind::EventFd(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),
@@ -155,6 +166,21 @@ impl OpenFile {
     pub fn nonblocking(&self) -> bool {
         self.flags & oflags::O_NONBLOCK != 0
     }
+}
+
+impl Drop for OpenFile {
+    /// 最后一个引用消失：等在它上面的线程（flock、epoll）要重新检查。
+    fn drop(&mut self) {
+        crate::kernel::request_wake();
+    }
+}
+
+/// eventfd 的状态。
+pub struct EventFd {
+    /// 计数器。
+    pub count: u64,
+    /// `EFD_SEMAPHORE`：每次读只减 1。
+    pub semaphore: bool,
 }
 
 /// 打开文件的共享引用。

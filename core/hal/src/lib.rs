@@ -5,6 +5,8 @@
 //! 宿主上与 guest 的编号一致，可以原样交给 guest。其他宿主（比如 macOS）
 //! 只保证能编译，不在支持范围内（设计文档 §13.3）。
 
+pub mod net;
+
 use std::io;
 use std::ptr::NonNull;
 use std::time::Duration;

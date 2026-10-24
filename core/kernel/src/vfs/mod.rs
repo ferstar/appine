@@ -86,6 +86,9 @@ impl Vfs {
         if let Err(e) = dev::ensure_dev_nodes(&store) {
             crate::debug::log(format_args!("cannot create the device nodes: {e}"));
         }
+        if let Err(e) = ensure_resolv_conf(&store) {
+            crate::debug::log(format_args!("cannot create /etc/resolv.conf: {e}"));
+        }
         let mut mounts = Vec::new();
         for m in [Mount::Proc, Mount::Pts] {
             let mut ino = Some(ROOT);
@@ -120,7 +123,7 @@ impl Vfs {
     /// 节点的文件类型位。
     pub(crate) fn kind(&self, ps: &dyn Pseudo, node: &Node) -> Result<u32, Errno> {
         match node {
-            Node::Store(ino) => Ok(self.store.stat(*ino)?.kind()),
+            Node::Store(ino) => self.store.kind(*ino),
             Node::Pseudo(p) => ps.kind(p),
         }
     }
@@ -286,6 +289,20 @@ impl Vfs {
         }
         Ok(out)
     }
+}
+
+/// 没有 `/etc/resolv.conf` 时写一个指向 DNS 存根的（设计文档 §10）；已有的保持不动。
+fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
+    use std::io::Write;
+    let Some(etc) = store.lookup(ROOT, b"etc")? else {
+        return Ok(());
+    };
+    if store.lookup(etc, b"resolv.conf")?.is_some() {
+        return Ok(());
+    }
+    let (_, mut file) = store.create_file(etc, b"resolv.conf", 0o644, 0, 0)?;
+    file.write_all(b"nameserver 127.0.0.53\n")
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
 }
 
 /// 拆分路径组件，去掉空组件和 `.`。

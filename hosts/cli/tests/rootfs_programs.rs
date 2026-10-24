@@ -7,6 +7,9 @@
 //! rootfs 由 `scripts/fetch-rootfs` 下载到 `target/rootfs/`，也可以用环境变量
 //! `APPINE_ROOTFS_TARBALL` 指定。找不到时跳过这些测试；设置
 //! `APPINE_REQUIRE_ROOTFS=1`（CI 这样做）时改为失败。
+//!
+//! 需要外网的用例（M4 的退出标准：apk 安装软件包、git 经由 HTTPS 克隆）只在设置了
+//! `APPINE_NETWORK_TESTS=1` 时运行，宿主的 `http_proxy`、`https_proxy` 会传给 guest。
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
 use std::io::{Read, Write};
@@ -442,6 +445,65 @@ fn procfs_describes_processes() {
 }
 
 #[test]
+fn network_configuration_is_visible() {
+    // netlink（ip）、接口 ioctl（ifconfig）、/proc/net/dev、指向 DNS 存根的 resolv.conf
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "ip addr show lo | grep -o 'inet 127.0.0.1/8'; ifconfig lo | grep -o 'addr:127.0.0.1'; \
+         grep -c ' lo:' /proc/net/dev; cat /etc/resolv.conf",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "inet 127.0.0.1/8",
+                "addr:127.0.0.1",
+                "1",
+                "nameserver 127.0.0.53"
+            ],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn syslog_messages_travel_over_a_unix_socket() {
+    // syslogd 把数据报 socket 绑定在 /dev/log 上，logger 按路径发过去
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "rm -f /tmp/syslog.txt; syslogd -n -O /tmp/syslog.txt & sleep 0.5; \
+         test -S /dev/log && echo socket; logger -t appine hello; sleep 0.5; kill $!; wait; \
+         grep -o 'appine: hello' /tmp/syslog.txt",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["socket", "appine: hello"],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn flock_excludes_other_holders() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "flock /tmp/flock-test -c 'sleep 1' & sleep 0.3; flock -n /tmp/flock-test -c true; \
+         echo busy=$?; wait; flock -n /tmp/flock-test -c true; echo free=$?",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["busy=1", "free=0"],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
 fn stop_and_continue_signals() {
     for (tier, out) in run(&[
         "/bin/sh",
@@ -630,6 +692,55 @@ fn vi_edits_a_file() {
         s.expect(PROMPT);
         assert_eq!(s.exit(), Some(0), "tier {tier}");
     }
+}
+
+#[test]
+fn apk_installs_packages_and_git_clones_over_https() {
+    if std::env::var_os("APPINE_NETWORK_TESTS").is_none_or(|v| v != "1") {
+        eprintln!("skipping network test: set APPINE_NETWORK_TESTS=1 to enable it");
+        return;
+    }
+    let Some(tarball) = find_tarball() else {
+        panic!("rootfs tarball not found; run scripts/fetch-rootfs");
+    };
+    // 安装软件包会改动很多文件：用自己的仓库，不影响其他用例
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("network-store");
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .arg("--rootfs")
+        .arg(&dir)
+        .arg("--import")
+        .arg(&tarball)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "import failed: {}", stderr(&out));
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_appine-run"));
+    // Tier 0 太慢，只在 Tier 1 下运行
+    cmd.args(["--tier", "1", "--env", PATH, "--env", "HOME=/root"]);
+    for var in ["http_proxy", "https_proxy", "no_proxy"] {
+        if let Ok(v) = std::env::var(var) {
+            cmd.arg("--env").arg(format!("{var}={v}"));
+        }
+    }
+    let out = cmd
+        .arg("--rootfs")
+        .arg(&dir)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "apk update && apk add git python3 && \
+             git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello && \
+             cat /tmp/hello/README && \
+             python3 -c 'import asyncio, hashlib, sqlite3, ssl; print(\"python ok\")'",
+        ])
+        .output()
+        .unwrap();
+    let text = shell("1", &out);
+    assert!(text.contains("Hello World!"), "{text}");
+    assert!(text.ends_with("python ok\n"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -57,6 +57,13 @@ jobs:
           APPINE_REQUIRE_MUSL: "1"
         run: cargo test --workspace
 
+      # M4 的退出标准：apk 从 Alpine 镜像安装 git、python3，git 经由 HTTPS 克隆仓库。
+      # 依赖外网，单独一步，失败时容易分清是网络还是内核的问题
+      - name: Network (apk add, git clone)
+        env:
+          APPINE_NETWORK_TESTS: "1"
+        run: cargo test -p appine-run --test rootfs_programs -- --exact apk_installs_packages_and_git_clones_over_https
+
       - name: Lockstep (extended)
         run: cargo run --release -p appine-lockstep -- --iterations 200000
 

@@ -83,8 +83,10 @@ const ENTRIES: [(&[u8], Entry); 14] = [
     (b"oom_score_adj", Entry::OomScoreAdj),
 ];
 
-/// `/proc/sys` 下的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const SYS: [&[u8]; 16] = [
+/// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
+const STATIC: [&[u8]; 18] = [
+    b"net/",
+    b"net/dev",
     b"sys/",
     b"sys/fs/",
     b"sys/fs/file-max",
@@ -120,8 +122,8 @@ pub(crate) enum PseudoNode {
     SelfLink,
     /// `/proc/thread-self`。
     ThreadSelf,
-    /// `/proc/sys` 下的目录或文件，取值来自 [`SYS`]。
-    Sys(&'static [u8]),
+    /// `/proc/net`、`/proc/sys` 下的目录或文件，取值来自 [`STATIC`]。
+    Static(&'static [u8]),
     /// `/proc/<pid>`；第二项是 `Some(tid)` 时是 `/proc/<pid>/task/<tid>`。
     Pid(Tid, Option<Tid>),
     /// `/proc/<pid>/<项>`（含 task 子目录里的）。
@@ -260,11 +262,11 @@ impl Pseudo for View<'_> {
             PtsRoot | ProcRoot => return None,
             Pts(_) | PtsPtmx => PtsRoot,
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
-            Sys(path) => {
+            Static(path) => {
                 let trimmed = path.strip_suffix(b"/").unwrap_or(path);
                 match trimmed.iter().rposition(|&b| b == b'/') {
                     None => ProcRoot,
-                    Some(i) => Sys(SYS.iter().find(|p| **p == &trimmed[..=i]).unwrap()),
+                    Some(i) => Static(STATIC.iter().find(|p| **p == &trimmed[..=i]).unwrap()),
                 }
             }
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
@@ -283,7 +285,7 @@ impl Pseudo for View<'_> {
             Global(g) => GLOBALS.iter().find(|(_, x)| x == g).unwrap().0.to_vec(),
             SelfLink => b"self".to_vec(),
             ThreadSelf => b"thread-self".to_vec(),
-            Sys(path) => {
+            Static(path) => {
                 let trimmed = path.strip_suffix(b"/").unwrap_or(path);
                 let start = trimmed
                     .iter()
@@ -314,7 +316,8 @@ impl Pseudo for View<'_> {
             ProcRoot => match name {
                 b"self" => Some(SelfLink),
                 b"thread-self" => Some(ThreadSelf),
-                b"sys" => Some(Sys(SYS[0])),
+                b"net" => Some(Static(STATIC[0])),
+                b"sys" => Some(Static(STATIC[2])),
                 _ => GLOBALS
                     .iter()
                     .find(|(n, _)| *n == name)
@@ -324,12 +327,13 @@ impl Pseudo for View<'_> {
                         self.pid_exists(pid, None).then_some(Pid(pid, None))
                     }),
             },
-            Sys(path) => {
+            Static(path) => {
                 let mut full = path.to_vec();
                 full.extend_from_slice(name);
-                SYS.iter()
+                STATIC
+                    .iter()
                     .find(|p| p.strip_suffix(b"/").unwrap_or(p) == &full[..])
-                    .map(|p| Sys(p))
+                    .map(|p| Static(p))
             }
             Pid(pid, tid) => {
                 let allowed = |e: &self::Entry| tid.is_none() || TASK_ENTRIES.contains(e);
@@ -356,7 +360,7 @@ impl Pseudo for View<'_> {
         use PseudoNode::*;
         Ok(match node {
             PtsRoot | ProcRoot | Pid(..) => mode::S_IFDIR,
-            Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
+            Static(p) if p.ends_with(b"/") => mode::S_IFDIR,
             Entry(_, _, self::Entry::Fd | self::Entry::Task) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
             SelfLink | ThreadSelf | Global(self::Global::Mounts) | Fd(..) => mode::S_IFLNK,
@@ -366,6 +370,7 @@ impl Pseudo for View<'_> {
                 let f = file.borrow();
                 match &f.kind {
                     FileKind::Pipe(_) => mode::S_IFIFO,
+                    FileKind::Socket(_) => mode::S_IFSOCK,
                     FileKind::Host(fd) => {
                         appine_hal::fstat(*fd).map_err(Errno)?.st_mode as u32 & mode::S_IFMT
                     }
@@ -439,6 +444,9 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
         FileKind::Pipe(end) => format!("pipe:[{}]", end.pipe.borrow().ino).into_bytes(),
         FileKind::Pty(end) if end.master => b"/dev/ptmx".to_vec(),
         FileKind::Pty(end) => format!("/dev/pts/{}", end.tty.borrow().index).into_bytes(),
+        FileKind::Socket(s) => format!("socket:[{}]", Rc::as_ptr(s) as u64 >> 4).into_bytes(),
+        FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
+        FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
         FileKind::Host(fd) => std::fs::read_link(format!("/proc/self/fd/{fd}"))
             .map(|p| {
                 use std::os::unix::ffi::OsStringExt;
@@ -485,7 +493,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
 pub(crate) fn writable(node: &PseudoNode) -> bool {
     matches!(
         node,
-        PseudoNode::Entry(_, None, Entry::OomScoreAdj) | PseudoNode::Sys(b"sys/kernel/hostname")
+        PseudoNode::Entry(_, None, Entry::OomScoreAdj) | PseudoNode::Static(b"sys/kernel/hostname")
     )
 }
 
@@ -504,19 +512,20 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
             );
         }
         ProcRoot => {
-            nodes.extend([SelfLink, ThreadSelf, Sys(SYS[0])]);
+            nodes.extend([SelfLink, ThreadSelf, Static(STATIC[0]), Static(STATIC[2])]);
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
             nodes.extend(ps.k.groups.keys().map(|&pid| Pid(pid, None)));
         }
-        Sys(path) => nodes.extend(
-            SYS.iter()
+        Static(path) => nodes.extend(
+            STATIC
+                .iter()
                 .filter(|p| {
                     let trimmed = p.strip_suffix(b"/").unwrap_or(p);
                     trimmed.len() > path.len()
                         && trimmed.starts_with(path)
                         && !trimmed[path.len()..].contains(&b'/')
                 })
-                .map(|p| Sys(p)),
+                .map(|p| Static(p)),
         ),
         Pid(pid, tid) => nodes.extend(
             ENTRIES
@@ -573,15 +582,6 @@ fn cpus() -> usize {
 }
 
 /// 线程组的 CPU 时间（纳秒）：活着的线程加上已经退出的线程。
-fn group_cpu_ns(ps: &View<'_>, g: &ThreadGroup) -> u64 {
-    g.cpu_ns
-        + g.threads
-            .iter()
-            .filter_map(|t| ps.k.tasks.get(t))
-            .map(|t| t.cpu_ns())
-            .sum::<u64>()
-}
-
 /// 进程状态的字母：R 正在执行 guest 代码，S 在内核里或等待，T 停止，Z 僵尸。
 fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static str) {
     if g.zombie.is_some() {
@@ -674,7 +674,7 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     let (tty_nr, tpgid) = ctty_info(ps, &g);
     let cpu = match (tid, &task) {
         (Some(_), Some(t)) => t.cpu_ns(),
-        _ => group_cpu_ns(ps, &g),
+        _ => g.cpu_ns(ps.k),
     };
     let (vsize, rss) = mem_of(task.as_deref());
     let (sigign, sigcgt) = sig_dispositions(&g);
@@ -689,7 +689,7 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     let mut s = String::new();
     write!(
         s,
-        "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {} 18446744073709551615",
+        "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} 0 {} 0 {} {} {} 0 {} {} {} 18446744073709551615",
         tid.unwrap_or(pid),
         comm_str(task.as_deref(), pid),
         state,
@@ -700,6 +700,8 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
         tpgid,
         ticks(cpu),
         ticks(g.child_cpu_ns),
+        20 + g.nice,
+        g.nice,
         g.threads.len().max(1),
         g.start_ticks,
         vsize,
@@ -872,6 +874,19 @@ fn global_stat(ps: &View<'_>) -> String {
     s
 }
 
+/// `/proc/net/dev`：宿主接口的列表，流量计数都是 0。
+fn net_dev() -> String {
+    let mut s = String::from(
+        "Inter-|   Receive                                                |  Transmit\n \
+         face |bytes    packets errs drop fifo frame compressed multicast|\
+         bytes    packets errs drop fifo colls carrier compressed\n",
+    );
+    for i in appine_hal::net::interfaces() {
+        writeln!(s, "{:>6}: {}", i.name, ["0"; 16].join(" ")).unwrap();
+    }
+    s
+}
+
 fn random_uuid() -> String {
     let mut b = [0u8; 16];
     let _ = appine_hal::fill_random(&mut b);
@@ -916,7 +931,8 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             self::Global::Cmdline => "appine\n".to_owned(),
             self::Global::Mounts => return Err(Errno::EINVAL),
         },
-        Sys(path) => match &path[..] {
+        Static(path) => match &path[..] {
+            b"net/dev" => net_dev(),
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
             b"sys/kernel/hostname" => "localhost\n".to_owned(),

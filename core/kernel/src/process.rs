@@ -54,6 +54,8 @@ impl Signal {
     pub const SEGV: Signal = Signal(11);
     /// 管道断开。
     pub const PIPE: Signal = Signal(13);
+    /// 定时器到期。
+    pub const ALRM: Signal = Signal(14);
     /// 终止。
     pub const TERM: Signal = Signal(15);
     /// 子进程状态改变。
@@ -278,6 +280,16 @@ pub(crate) struct ThreadGroup {
     pub cpu_ns: u64,
     /// 已回收的子进程用掉的 CPU 时间。
     pub child_cpu_ns: u64,
+    /// `ITIMER_REAL`：fork 不继承，execve 保留。
+    pub itimer: Option<crate::itimer::ITimer>,
+    /// nice 值（-20–19），fork 继承。
+    pub nice: i32,
+    /// `PR_SET_PDEATHSIG`：父进程退出时收到的信号，0 表示不发；fork 不继承。
+    pub pdeathsig: i32,
+    /// `PR_SET_DUMPABLE`，fork 继承。
+    pub dumpable: bool,
+    /// `PR_SET_NO_NEW_PRIVS`，fork 和 execve 都保留。
+    pub no_new_privs: bool,
 }
 
 impl ThreadGroup {
@@ -305,8 +317,35 @@ impl ThreadGroup {
             start_ticks: crate::pseudo::uptime_ns() / (1_000_000_000 / loader::CLOCK_TICKS),
             cpu_ns: 0,
             child_cpu_ns: 0,
+            itimer: None,
+            nice: 0,
+            pdeathsig: 0,
+            dumpable: true,
+            no_new_privs: false,
         }
     }
+}
+
+impl ThreadGroup {
+    /// 用掉的 CPU 时间：已退出的线程加上活着的线程。
+    pub fn cpu_ns(&self, k: &Kernel) -> u64 {
+        self.cpu_ns
+            + self
+                .threads
+                .iter()
+                .filter_map(|t| k.tasks.get(t))
+                .map(|t| t.cpu_ns())
+                .sum::<u64>()
+    }
+}
+
+/// `struct rusage`：宿主的 CPU 时钟分不出用户态和内核态，全部算作 `ru_utime`，
+/// 其余字段为 0。
+pub(crate) fn encode_rusage(cpu_ns: u64) -> [u8; 144] {
+    let mut b = [0u8; 144];
+    b[..8].copy_from_slice(&(cpu_ns / 1_000_000_000).to_le_bytes());
+    b[8..16].copy_from_slice(&(cpu_ns % 1_000_000_000 / 1000).to_le_bytes());
+    b
 }
 
 /// 线程组的最后一个线程退出之后：把子进程交给 init，通知父进程或者直接回收。
@@ -336,6 +375,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             pgrps.push(pgid);
         }
     }
+    let mut orphaned = Vec::new();
     for c in children {
         let Some(child) = k.groups.get(&c).cloned() else {
             continue;
@@ -346,6 +386,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             if cg.pgid != pgid && cg.sid == sid {
                 pgrps.push(cg.pgid);
             }
+            if let Some(sig) = Signal::new(cg.pdeathsig) {
+                orphaned.push((c, sig));
+            }
             cg.zombie.is_some()
         };
         if zombie {
@@ -353,6 +396,10 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         } else {
             init.borrow_mut().children.push(c);
         }
+    }
+    // PR_SET_PDEATHSIG：通知失去父进程的子进程
+    for (c, sig) in orphaned {
+        signal::send_to_group(k, c, sig, SigInfo::kernel());
     }
     if tgid == FIRST_PID {
         k.session = Some(status);
@@ -581,14 +628,15 @@ pub fn run(
     Ok(RunReport { status, dbt_stats })
 }
 
-/// 宿主主线程等待内核状态满足条件。
+/// 宿主主线程等待内核状态满足条件，同时负责间隔定时器。
 fn wait_until<T>(shared: &Shared, event: &Arc<Event>, cond: impl Fn(&Kernel) -> Option<T>) -> T {
     let mut k = shared.lock();
     loop {
         if let Some(v) = cond(&k) {
             return v;
         }
-        let (k2, _) = block(shared, k, event, None, &mut []);
+        let next = crate::itimer::expire(&k);
+        let (k2, _) = block(shared, k, event, next, &mut []);
         k = k2;
     }
 }

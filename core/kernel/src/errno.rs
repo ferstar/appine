@@ -65,6 +65,8 @@ impl Errno {
     pub const ERANGE: Errno = Errno(34);
     /// 名字太长。
     pub const ENAMETOOLONG: Errno = Errno(36);
+    /// 没有这个属性（xattr）。
+    pub const ENODATA: Errno = Errno(61);
     /// 未实现的 syscall。
     pub const ENOSYS: Errno = Errno(38);
     /// 目录非空。
@@ -73,10 +75,34 @@ impl Errno {
     pub const ELOOP: Errno = Errno(40);
     /// 值溢出。
     pub const EOVERFLOW: Errno = Errno(75);
+    /// 不是 socket。
+    pub const ENOTSOCK: Errno = Errno(88);
+    /// 消息太长。
+    pub const EMSGSIZE: Errno = Errno(90);
+    /// socket 类型与协议不符。
+    pub const EPROTOTYPE: Errno = Errno(91);
+    /// 不支持的 socket 选项。
+    pub const ENOPROTOOPT: Errno = Errno(92);
+    /// 不支持的协议。
+    pub const EPROTONOSUPPORT: Errno = Errno(93);
+    /// 不支持的 socket 类型。
+    pub const ESOCKTNOSUPPORT: Errno = Errno(94);
     /// 不支持的操作。
     pub const EOPNOTSUPP: Errno = Errno(95);
+    /// 不支持的地址族。
+    pub const EAFNOSUPPORT: Errno = Errno(97);
+    /// 地址已被占用。
+    pub const EADDRINUSE: Errno = Errno(98);
+    /// 已经连接。
+    pub const EISCONN: Errno = Errno(106);
+    /// 没有连接。
+    pub const ENOTCONN: Errno = Errno(107);
     /// 超时。
     pub const ETIMEDOUT: Errno = Errno(110);
+    /// 连接被拒绝。
+    pub const ECONNREFUSED: Errno = Errno(111);
+    /// 连接正在进行。
+    pub const EINPROGRESS: Errno = Errno(115);
 
     // 以下是内核内部使用的 syscall 重启码（设计文档 §7.3），返回用户态之前一定会被
     // 换成重新执行 syscall 或者 EINTR，guest 永远看不到它们。

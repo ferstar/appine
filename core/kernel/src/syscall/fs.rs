@@ -7,14 +7,15 @@
 use std::cell::RefCell;
 use std::os::unix::fs::FileExt;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use super::{IO_CHUNK, SysResult, get, put, read_path, read_timespec, tty};
+use super::SocketRef;
+use super::{IO_CHUNK, SysResult, get, put, read_path, tty};
 use crate::errno::Errno;
-use crate::fd::{FileKind, FileRef, OpenFile, oflags};
+use crate::fd::{EventFd, FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
-use crate::process::{RLIMIT_NOFILE, Signal};
+use crate::process::Signal;
 use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
 use crate::tty::{PTS_MAJOR, Tty};
@@ -23,7 +24,7 @@ use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Node, Vfs, normalize};
 
-const AT_FDCWD: i32 = -100;
+pub(super) const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EACCESS: u32 = 0x200;
@@ -41,7 +42,18 @@ const F_SETLKW: u32 = 7;
 const F_DUPFD_CLOEXEC: u32 = 1030;
 const F_SETPIPE_SZ: u32 = 1031;
 const F_GETPIPE_SZ: u32 = 1032;
+const F_ADD_SEALS: u32 = 1033;
+const F_GET_SEALS: u32 = 1034;
 const FD_CLOEXEC: u64 = 1;
+
+/// memfd 的封印。
+const F_SEAL_SEAL: u32 = 0x1;
+const F_SEAL_SHRINK: u32 = 0x2;
+const F_SEAL_GROW: u32 = 0x4;
+const F_SEAL_WRITE: u32 = 0x8;
+const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+const F_SEAL_EXEC: u32 = 0x20;
+const F_SEAL_ALL: u32 = 0x3f;
 const F_UNLCK: i16 = 2;
 
 const SEEK_SET: u32 = 0;
@@ -66,6 +78,9 @@ const UIO_MAXIOV: usize = 1024;
 const ROOT_DEV: u64 = 0x801;
 /// 管道报告的设备号（Linux 上 pipefs 是一个匿名设备）。
 const PIPE_DEV: u64 = 0xd;
+/// socket、anon_inode（epoll、eventfd）报告的设备号。
+const SOCK_DEV: u64 = 0x8;
+const ANON_DEV: u64 = 0xe;
 /// procfs、devpts 报告的设备号。
 const PROC_DEV: u64 = 0x4;
 const DEVPTS_DEV: u64 = 0x18;
@@ -92,12 +107,6 @@ const FIONCLEX: u32 = 0x5450;
 const FIOCLEX: u32 = 0x5451;
 
 const POLLIN: i16 = 0x001;
-const POLLOUT: i16 = 0x004;
-const POLLERR: i16 = 0x008;
-const POLLHUP: i16 = 0x010;
-const POLLNVAL: i16 = 0x020;
-const POLLRDNORM: i16 = 0x040;
-const POLLWRNORM: i16 = 0x100;
 
 fn host_errno(e: std::io::Error) -> Errno {
     Errno(e.raw_os_error().unwrap_or(Errno::EIO.0))
@@ -123,7 +132,7 @@ fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
 }
 
 /// 解析 `*at` 系列的路径参数。
-fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
+pub(super) fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     vfs.resolve(&cx.view(&vfs), &start, path, follow)
@@ -147,7 +156,11 @@ fn lookup_at_or_fd(
 }
 
 /// 解析要新建或删除的路径：返回父目录和最后一个组件。只有仓库里的目录可以修改。
-fn parent_at<'p>(cx: &Cx<'_>, dirfd: i32, path: &'p [u8]) -> Result<(Ino, &'p [u8]), Errno> {
+pub(super) fn parent_at<'p>(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Result<(Ino, &'p [u8]), Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &start, path)?;
@@ -281,6 +294,14 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
             PIPE_DEV,
         )),
         FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
+        FileKind::Socket(s) => Ok(anon(
+            Rc::as_ptr(s) as u64 >> 4,
+            mode::S_IFSOCK | 0o777,
+            0,
+            SOCK_DEV,
+        )),
+        // anon_inode：没有文件类型位
+        FileKind::Epoll(_) | FileKind::EventFd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         FileKind::Pty(end) => {
             let n = end.tty.borrow().index;
             Ok(anon(
@@ -556,8 +577,93 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             FileKind::Pipe(_) => Ok(PIPE_CAPACITY as u64),
             _ => Err(Errno::EBADF),
         },
+        // 只有 memfd 能加封印
+        F_ADD_SEALS | F_GET_SEALS => {
+            let f = file.borrow();
+            let FileKind::Regular { ino, .. } = f.kind else {
+                return Err(Errno::EINVAL);
+            };
+            let seals = cx.k().seals.get_mut(&ino).ok_or(Errno::EINVAL)?;
+            if cmd == F_GET_SEALS {
+                return Ok(*seals as u64);
+            }
+            let add = arg as u32;
+            if add & !F_SEAL_ALL != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if !f.writable() || *seals & F_SEAL_SEAL != 0 {
+                return Err(Errno::EPERM);
+            }
+            *seals |= add;
+            Ok(0)
+        }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// 封印禁止的写入（write、pwrite）和长度变化（ftruncate）返回 EPERM。`grow_to` 是
+/// 写入或截断之后的长度。
+fn check_seals(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    write: bool,
+    grow_to: impl FnOnce(u64) -> u64,
+) -> Result<(), Errno> {
+    let FileKind::Regular { ino, file } = &f.kind else {
+        return Ok(());
+    };
+    let Some(&seals) = cx.kr().seals.get(ino) else {
+        return Ok(());
+    };
+    if write && seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+        return Err(Errno::EPERM);
+    }
+    let size = file.metadata().map_err(host_errno)?.len();
+    let new = grow_to(size);
+    if (new > size && seals & F_SEAL_GROW != 0) || (new < size && seals & F_SEAL_SHRINK != 0) {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult {
+    const MFD_CLOEXEC: u32 = 0x1;
+    const MFD_ALLOW_SEALING: u32 = 0x2;
+    const MFD_NOEXEC_SEAL: u32 = 0x8;
+    const MFD_EXEC: u32 = 0x10;
+    // 不支持 MFD_HUGETLB
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = cx.mm().read_cstr(name, 249).map_err(|e| {
+        if e == Errno::ENAMETOOLONG {
+            Errno::EINVAL
+        } else {
+            e
+        }
+    })?;
+    let noexec = flags & MFD_NOEXEC_SEAL != 0;
+    let (ino, file) = cx
+        .vfs()?
+        .store()
+        .create_anonymous(if noexec { 0o666 } else { 0o777 })?;
+    let seals = match (flags & MFD_ALLOW_SEALING != 0, noexec) {
+        (_, true) => F_SEAL_EXEC,
+        (true, false) => 0,
+        (false, false) => F_SEAL_SEAL,
+    };
+    cx.k().seals.insert(ino, seals);
+    let mut path = b"/memfd:".to_vec();
+    path.extend_from_slice(&name);
+    path.extend_from_slice(b" (deleted)");
+    let file = OpenFile::with_path(
+        FileKind::Regular { ino, file },
+        oflags::O_RDWR | oflags::O_LARGEFILE,
+        Some(Rc::from(path)),
+    );
+    cx.fds_mut()
+        .install(file, flags & MFD_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
 }
 
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {
@@ -580,6 +686,13 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
     };
     if let Some((t, master)) = pty {
         return tty::ioctl(cx, &t, master, request, arg);
+    }
+    let sock = match &file.borrow().kind {
+        FileKind::Socket(s) => Some(s.clone()),
+        _ => None,
+    };
+    if let Some(s) = sock {
+        return super::net::ioctl(cx, &s, request, arg);
     }
     let host_fd = match &file.borrow().kind {
         FileKind::Host(fd) => *fd,
@@ -689,13 +802,78 @@ pub(super) fn newfstatat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let st = if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
-        file_stat(cx, &cx.fds().get(dirfd)?)?
-    } else {
-        let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        node_stat(cx, &node)?
-    };
+    let st = stat_at(cx, dirfd, &path, flags)?;
     put(cx, buf, st).map(|()| 0)
+}
+
+/// newfstatat、statx 共用：`*at` 风格地找到对象，返回 `struct stat`。
+fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        file_stat(cx, &cx.fds().get(dirfd)?)
+    } else {
+        let node = lookup_at_or_fd(cx, dirfd, path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        node_stat(cx, &node)
+    }
+}
+
+pub(super) fn statx(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: u64,
+    flags: u32,
+    mask: u32,
+    buf: u64,
+) -> SysResult {
+    const AT_NO_AUTOMOUNT: u32 = 0x800;
+    const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+    const STATX_RESERVED: u32 = 0x8000_0000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0
+        || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+        || mask & STATX_RESERVED != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let path = read_path(cx, path)?;
+    let st = stat_at(
+        cx,
+        dirfd,
+        &path,
+        flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH),
+    )?;
+    put(cx, buf, encode_statx(&st)).map(|()| 0)
+}
+
+/// 由 `struct stat` 得到 `struct statx`：总是给出全部基本字段（`STATX_BASIC_STATS`），
+/// 没有创建时间。
+fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap());
+    // glibc、musl 的 major()/minor()
+    let major = |d: u64| (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32;
+    let minor = |d: u64| ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
+    let mut b = [0u8; 256];
+    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, &STATX_BASIC_STATS.to_le_bytes());
+    put(4, &u32_at(56).to_le_bytes()); // blksize
+    put(16, &u32_at(20).to_le_bytes()); // nlink
+    put(20, &u32_at(24).to_le_bytes()); // uid
+    put(24, &u32_at(28).to_le_bytes()); // gid
+    put(28, &(u32_at(16) as u16).to_le_bytes()); // mode
+    put(32, &u64_at(8).to_le_bytes()); // ino
+    put(40, &u64_at(48).to_le_bytes()); // size
+    put(48, &u64_at(64).to_le_bytes()); // blocks
+    // atime、ctime、mtime：秒和纳秒（statx_timestamp 是 i64 + u32 + 保留）
+    for (dst, src) in [(64, 72), (96, 104), (112, 88)] {
+        put(dst, &u64_at(src).to_le_bytes());
+        put(dst + 8, &(u64_at(src + 8) as u32).to_le_bytes());
+    }
+    let (rdev, dev) = (u64_at(32), u64_at(0));
+    put(128, &major(rdev).to_le_bytes());
+    put(132, &minor(rdev).to_le_bytes());
+    put(136, &major(dev).to_le_bytes());
+    put(140, &minor(dev).to_le_bytes());
+    b
 }
 
 pub(super) fn fstat(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
@@ -1020,10 +1198,104 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     let f = file.borrow();
     match &f.kind {
         FileKind::Regular { file, .. } if f.writable() => {
+            check_seals(cx, &f, false, |_| len)?;
             file.set_len(len).map_err(host_errno).map(|()| 0)
         }
         FileKind::Path(_) => Err(Errno::EBADF),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i64) -> SysResult {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x1;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x2;
+    const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+    let (Ok(offset), Ok(len)) = (u64::try_from(offset), u64::try_from(len)) else {
+        return Err(Errno::EINVAL);
+    };
+    let end = offset
+        .checked_add(len)
+        .filter(|_| len > 0)
+        .ok_or(Errno::EINVAL)?;
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    if !f.writable() {
+        return Err(Errno::EBADF);
+    }
+    let host = match &f.kind {
+        FileKind::Regular { file, .. } => file,
+        FileKind::Directory { .. } => return Err(Errno::EISDIR),
+        FileKind::Pipe(_) | FileKind::Socket(_) => return Err(Errno::ESPIPE),
+        _ => return Err(Errno::ENODEV),
+    };
+    let size = host.metadata().map_err(host_errno)?.len();
+    let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
+    // 仓库的 object 是宿主上的普通文件：预留空间就是把文件加长；打洞和清零写入 0
+    let zero = match mode & !FALLOC_FL_KEEP_SIZE {
+        0 => false,
+        FALLOC_FL_PUNCH_HOLE if keep => true,
+        FALLOC_FL_ZERO_RANGE => true,
+        _ => return Err(Errno::EOPNOTSUPP),
+    };
+    check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
+    if zero {
+        let zeros = vec![0u8; IO_CHUNK];
+        let mut pos = offset;
+        while pos < end.min(size) {
+            let n = (end.min(size) - pos).min(IO_CHUNK as u64) as usize;
+            host.write_all_at(&zeros[..n], pos).map_err(host_errno)?;
+            pos += n as u64;
+        }
+    }
+    if !keep && end > size {
+        host.set_len(end).map_err(host_errno)?;
+    }
+    Ok(0)
+}
+
+pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
+    const LOCK_SH: u32 = 1;
+    const LOCK_EX: u32 = 2;
+    const LOCK_NB: u32 = 4;
+    const LOCK_UN: u32 = 8;
+    let file = cx.fds().get(fd)?;
+    // 不在仓库里的文件（管道、socket）没有可以共享的锁：总是成功
+    let Some(ino) = file.borrow().ino() else {
+        return Ok(0);
+    };
+    let me = Rc::downgrade(&file);
+    let exclusive = match op & !LOCK_NB {
+        LOCK_SH => false,
+        LOCK_EX => true,
+        LOCK_UN => {
+            if let Some(locks) = cx.k().flocks.get_mut(&ino) {
+                locks.retain(|(f, _)| !f.ptr_eq(&me));
+            }
+            request_wake();
+            return Ok(0);
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    loop {
+        let locks = cx.k().flocks.entry(ino).or_default();
+        locks.retain(|(f, _)| f.strong_count() > 0);
+        // 同一个打开文件再次加锁是转换锁的类型
+        let conflict = locks
+            .iter()
+            .any(|(f, ex)| !f.ptr_eq(&me) && (exclusive || *ex));
+        if !conflict {
+            locks.retain(|(f, _)| !f.ptr_eq(&me));
+            locks.push((me, exclusive));
+            return Ok(0);
+        }
+        if op & LOCK_NB != 0 {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        // 持有锁的文件解锁或关闭（OpenFile 析构）时会请求唤醒
+        cx.wait(None, &mut [])?;
     }
 }
 
@@ -1100,7 +1372,11 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
     let base = match kind {
         FileKind::Host(fd) => return appine_hal::lseek(*fd, offset, whence as i32).map_err(Errno),
         FileKind::Path(_) => return Err(Errno::EBADF),
-        FileKind::Pipe(_) | FileKind::Pty(_) => return Err(Errno::ESPIPE),
+        FileKind::Pipe(_)
+        | FileKind::Pty(_)
+        | FileKind::Socket(_)
+        | FileKind::Epoll(_)
+        | FileKind::EventFd(_) => return Err(Errno::ESPIPE),
         FileKind::Proc { data, .. } => match whence {
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
@@ -1156,6 +1432,8 @@ enum IoPath {
     Host(i32),
     Pipe(Rc<RefCell<Pipe>>),
     Pty(Rc<RefCell<Tty>>, bool),
+    Socket(SocketRef),
+    EventFd(Rc<RefCell<EventFd>>),
     Local,
 }
 
@@ -1164,6 +1442,8 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::Host(fd) => IoPath::Host(*fd),
         FileKind::Pipe(end) => IoPath::Pipe(end.pipe.clone()),
         FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), end.master),
+        FileKind::Socket(s) => IoPath::Socket(s.clone()),
+        FileKind::EventFd(e) => IoPath::EventFd(e.clone()),
         _ => IoPath::Local,
     }
 }
@@ -1345,7 +1625,13 @@ fn read_bytes(
         (io_path(&f), f.nonblocking())
     };
     match path {
-        IoPath::Host(_) | IoPath::Pipe(_) | IoPath::Pty(..) if offset.is_some() => {
+        IoPath::Host(_)
+        | IoPath::Pipe(_)
+        | IoPath::Pty(..)
+        | IoPath::Socket(_)
+        | IoPath::EventFd(_)
+            if offset.is_some() =>
+        {
             Err(Errno::ESPIPE)
         }
         IoPath::Host(fd) => {
@@ -1354,6 +1640,12 @@ fn read_bytes(
         }
         IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
         IoPath::Pty(t, master) => tty::read(cx, &t, master, nonblock, buf),
+        IoPath::Socket(s) => {
+            let m = super::net::recv(cx, &s, nonblock, buf.len(), 0, 0)?;
+            buf[..m.data.len()].copy_from_slice(&m.data);
+            Ok(m.data.len())
+        }
+        IoPath::EventFd(e) => super::poll::eventfd_read(cx, &e, nonblock, buf),
         IoPath::Local => local_read(&mut file.borrow_mut(), buf, offset),
     }
 }
@@ -1373,7 +1665,13 @@ fn write_bytes(
         (io_path(&f), f.nonblocking())
     };
     match path {
-        IoPath::Host(_) | IoPath::Pipe(_) | IoPath::Pty(..) if offset.is_some() => {
+        IoPath::Host(_)
+        | IoPath::Pipe(_)
+        | IoPath::Pty(..)
+        | IoPath::Socket(_)
+        | IoPath::EventFd(_)
+            if offset.is_some() =>
+        {
             Err(Errno::ESPIPE)
         }
         IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
@@ -1383,7 +1681,20 @@ fn write_bytes(
         },
         IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data),
         IoPath::Pty(t, master) => tty::write(cx, &t, master, nonblock, data),
-        IoPath::Local => local_write(&mut file.borrow_mut(), data, offset),
+        IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
+        IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
+        IoPath::Local => {
+            check_seals(cx, &file.borrow(), true, |size| {
+                let f = file.borrow();
+                let pos = match offset {
+                    Some(off) => off,
+                    None if f.flags & oflags::O_APPEND != 0 => size,
+                    None => f.pos,
+                };
+                size.max(pos + data.len() as u64)
+            })?;
+            local_write(&mut file.borrow_mut(), data, offset)
+        }
     }
 }
 
@@ -1562,11 +1873,26 @@ fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errn
     Ok(out)
 }
 
-pub(super) fn readv(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
+/// readv、writev 和带偏移的变体：按顺序处理每个 iovec，遇到不完整的一段就停下。
+/// `offset` 为 None 时使用并推进文件位置。
+fn vectored(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    iov: u64,
+    count: usize,
+    offset: Option<u64>,
+    write: bool,
+) -> SysResult {
     let file = cx.fds().get(fd)?;
     let mut total = 0;
     for (base, len) in iovecs(cx, iov, count)? {
-        match read_file(cx, &file, base, len, None) {
+        let at = offset.map(|o| o + total);
+        let r = if write {
+            write_file(cx, &file, base, len, at)
+        } else {
+            read_file(cx, &file, base, len, at)
+        };
+        match r {
             Ok(n) => {
                 total += n;
                 if (n as usize) < len {
@@ -1578,151 +1904,34 @@ pub(super) fn readv(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResu
         }
     }
     Ok(total)
+}
+
+pub(super) fn readv(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
+    vectored(cx, fd, iov, count, None, false)
 }
 
 pub(super) fn writev(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let mut total = 0;
-    for (base, len) in iovecs(cx, iov, count)? {
-        match write_file(cx, &file, base, len, None) {
-            Ok(n) => {
-                total += n;
-                if (n as usize) < len {
-                    break;
-                }
-            }
-            Err(_) if total > 0 => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(total)
+    vectored(cx, fd, iov, count, None, true)
 }
 
-// ---- ppoll ----
-
-/// 一个 fd 现在的就绪状态；宿主 fd 交给宿主 poll。
-enum Readiness {
-    Events(i16),
-    Host(i32),
-}
-
-fn readiness(f: &OpenFile) -> Readiness {
-    match &f.kind {
-        FileKind::Host(fd) => Readiness::Host(*fd),
-        FileKind::Pipe(end) => {
-            let p = end.pipe.borrow();
-            let mut ev = 0;
-            if end.write {
-                if p.readers == 0 {
-                    ev |= POLLERR;
-                } else if p.space() >= PIPE_BUF {
-                    ev |= POLLOUT | POLLWRNORM;
-                }
-            } else {
-                if !p.buf.is_empty() {
-                    ev |= POLLIN | POLLRDNORM;
-                }
-                if p.writers == 0 {
-                    ev |= POLLHUP;
-                }
-            }
-            Readiness::Events(ev)
-        }
-        FileKind::Pty(end) => Readiness::Events(tty::readiness(&end.tty.borrow(), end.master)),
-        FileKind::Path(_) => Readiness::Events(POLLNVAL),
-        _ => Readiness::Events(POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM),
-    }
-}
-
-/// 等到至少一个 fd 就绪、超时或者被信号打断。
-fn poll_fds(
+/// preadv、pwritev；`flags` 不为 None 时是 preadv2、pwritev2，偏移为 -1 表示使用文件位置。
+pub(super) fn pvectored(
     cx: &mut Cx<'_>,
-    entries: &mut [(i32, i16, i16)],
-    deadline: Option<Instant>,
-) -> Result<usize, Errno> {
-    loop {
-        let mut host = Vec::new();
-        for (i, e) in entries.iter_mut().enumerate() {
-            e.2 = 0;
-            if e.0 < 0 {
-                continue;
-            }
-            let Ok(file) = cx.fds().get(e.0) else {
-                e.2 = POLLNVAL;
-                continue;
-            };
-            match readiness(&file.borrow()) {
-                // POLLERR、POLLHUP、POLLNVAL 不需要请求也会报告
-                Readiness::Events(ev) => e.2 = ev & (e.1 | POLLERR | POLLHUP | POLLNVAL),
-                Readiness::Host(fd) => host.push((i, fd)),
-            }
-        }
-        let mut hfds: Vec<(i32, i16, i16)> =
-            host.iter().map(|&(i, fd)| (fd, entries[i].1, 0)).collect();
-        if !hfds.is_empty() {
-            appine_hal::poll(&mut hfds, Some(Duration::ZERO)).map_err(Errno)?;
-        }
-        for (&(i, _), h) in host.iter().zip(&hfds) {
-            entries[i].2 = h.2;
-        }
-        let ready = entries.iter().filter(|e| e.2 != 0).count();
-        if ready > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
-            return Ok(ready);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTNOHAND);
-        }
-        cx.wait(deadline, &mut hfds)?;
-    }
-}
-
-pub(super) fn ppoll(
-    cx: &mut Cx<'_>,
-    fds: u64,
-    nfds: usize,
-    timeout: u64,
-    sigmask: u64,
-    sigsetsize: usize,
+    fd: i32,
+    iov: u64,
+    count: usize,
+    offset: i64,
+    flags: Option<u32>,
+    write: bool,
 ) -> SysResult {
-    if nfds as u64 > cx.t.group.borrow().rlimits[RLIMIT_NOFILE as usize].0 {
-        return Err(Errno::EINVAL);
-    }
-    let deadline = match timeout {
-        0 => None,
-        addr => Some(Instant::now() + read_timespec(cx, addr)?),
+    // RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果；RWF_NOWAIT、RWF_APPEND 不支持
+    const RWF_SUPPORTED: u32 = 0x7;
+    const RWF_ALL: u32 = 0x3f;
+    let offset = match flags {
+        Some(f) if f & !RWF_ALL != 0 => return Err(Errno::EINVAL),
+        Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
+        Some(_) if offset == -1 => None,
+        _ => checked_offset(offset)?,
     };
-    let mut raw = vec![0u8; nfds * 8];
-    cx.mm().read(UserSlice::new(fds, raw.len()), &mut raw)?;
-    // struct pollfd：fd、events、revents
-    let mut entries: Vec<(i32, i16, i16)> = raw
-        .chunks_exact(8)
-        .map(|e| {
-            (
-                i32::from_le_bytes(e[..4].try_into().unwrap()),
-                i16::from_le_bytes([e[4], e[5]]),
-                0,
-            )
-        })
-        .collect();
-    // 等待期间临时换上 guest 给的屏蔽字；被信号打断时由信号投递恢复原来的
-    if sigmask != 0 {
-        if sigsetsize != 8 {
-            return Err(Errno::EINVAL);
-        }
-        let mask = u64::from_le_bytes(get(cx, sigmask)?);
-        cx.t.saved_sigmask = Some(cx.task.sigmask.get());
-        cx.task.sigmask.set(mask & !signal::UNBLOCKABLE);
-    }
-    let r = poll_fds(cx, &mut entries, deadline);
-    if r != Err(Errno::ERESTARTNOHAND)
-        && let Some(saved) = cx.t.saved_sigmask.take()
-    {
-        cx.task.sigmask.set(saved);
-    }
-    let n = r?;
-    for (e, out) in entries.iter().zip(raw.chunks_exact_mut(8)) {
-        out[6..8].copy_from_slice(&e.2.to_le_bytes());
-    }
-    cx.mm().write(UserSlice::new(fds, raw.len()), &raw)?;
-    Ok(n as u64)
+    vectored(cx, fd, iov, count, offset, write)
 }

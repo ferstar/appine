@@ -79,6 +79,14 @@ struct Vma {
     name: Option<Rc<[u8]>>,
     /// 这个 VMA 的起点对应的宿主地址。
     host: NonNull<u8>,
+    /// 从起点算起有文件内容的字节数（按 4K 向上取整）。私有文件映射超出文件末尾的
+    /// 部分一碰宿主就会发 SIGBUS，fork 复制时不能读它们。匿名和共享映射等于 `len`。
+    file_len: u64,
+    /// 只读的私有文件映射在 fork 之后和别的地址空间共用宿主映射；要改成可写之前，
+    /// 先复制一份自己的（[`Mm::mprotect`]）。
+    cow: bool,
+    /// 文件的共享映射：宿主文件的 (设备号, inode) 和起点对应的文件偏移，作为 futex 的键。
+    shared_file: Option<(u64, u64, u64)>,
 }
 
 /// 一个 guest 进程的地址空间。
@@ -153,6 +161,20 @@ impl Mm {
     /// 该地址空间的软件页表。
     pub fn mmu(&self) -> &Mmu {
         &self.mmu
+    }
+
+    /// `addr` 处 futex 的键；没有映射时返回 None。
+    pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
+        let host = self.mmu.translate(addr, 0)?;
+        let (&start, v) = self.vmas.range(..=addr).next_back()?;
+        Some(match v.shared_file {
+            Some((dev, ino, offset)) => crate::futex::Key::File {
+                dev,
+                ino,
+                offset: offset + (addr - start),
+            },
+            None => crate::futex::Key::Host(host.as_ptr() as usize),
+        })
     }
 
     /// shootdown 的代数（[`Mm::sync`]）。
@@ -254,6 +276,9 @@ impl Mm {
                 region,
                 name: None,
                 host,
+                file_len: len,
+                cow: false,
+                shared_file: None,
             },
         );
         Ok(())
@@ -355,7 +380,27 @@ impl Mm {
         if prot & prot::WRITE != 0 && !may_write {
             return Err(Errno::EACCES);
         }
+        let file_len = match file {
+            Some((fd, offset, _)) if !shared => {
+                let size = appine_hal::fstat(fd).map_or(0, |s| s.st_size.max(0) as u64);
+                size.saturating_sub(offset)
+                    .next_multiple_of(PAGE_SIZE)
+                    .min(len)
+            }
+            _ => len,
+        };
+        // st_dev 在 macOS 上是 i32
+        #[allow(clippy::unnecessary_cast)]
+        let shared_file = match file {
+            Some((fd, offset, _)) if shared => appine_hal::fstat(fd)
+                .ok()
+                .map(|s| (s.st_dev as u64, s.st_ino as u64, offset)),
+            _ => None,
+        };
         self.insert(start, len, prot, backing, may_write, region, host)?;
+        let v = self.vmas.get_mut(&start).unwrap();
+        v.file_len = file_len;
+        v.shared_file = shared_file;
         Ok(start)
     }
 
@@ -370,9 +415,15 @@ impl Mm {
         let mut tail = v.clone();
         let head_len = addr - s;
         tail.len -= head_len;
+        tail.file_len = v.file_len.saturating_sub(head_len);
+        if let Some(f) = &mut tail.shared_file {
+            f.2 += head_len;
+        }
         // SAFETY: addr 落在 VMA 内部，偏移不越过宿主映射
         tail.host = unsafe { tail.host.add(head_len as usize) };
-        self.vmas.get_mut(&s).unwrap().len = head_len;
+        let head = self.vmas.get_mut(&s).unwrap();
+        head.len = head_len;
+        head.file_len = head.file_len.min(head_len);
         self.vmas.insert(addr, tail);
     }
 
@@ -436,6 +487,17 @@ impl Mm {
         }
         self.split_at(addr);
         self.split_at(end);
+        if prot & prot::WRITE != 0 {
+            let shared: Vec<u64> = self
+                .vmas
+                .range(addr..end)
+                .filter(|(_, v)| v.cow)
+                .map(|(&s, _)| s)
+                .collect();
+            for s in shared {
+                self.unshare(s)?;
+            }
+        }
         for (_, v) in self.vmas.range_mut(addr..end) {
             v.prot = prot;
         }
@@ -477,27 +539,60 @@ impl Mm {
     }
 
     /// fork：复制出一个新的地址空间。私有映射逐页拷贝（全零的页跳过，新的匿名
-    /// 内存本来就是零，这样没碰过的栈页不会在子进程里占用内存）；共享映射与子进程共用。
-    pub fn fork(&self) -> Result<Mm, Errno> {
+    /// 内存本来就是零，这样没碰过的栈页不会在子进程里占用内存；私有文件映射只拷贝
+    /// 文件末尾之前的部分）。共享映射和只读的私有文件映射与子进程共用宿主内存。
+    pub fn fork(&mut self) -> Result<Mm, Errno> {
         let mut child = Mm::new();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.vdso = self.vdso;
         child.args = self.args;
         child.env = self.env;
-        for (&start, v) in &self.vmas {
-            let (region, host) = if v.backing == Backing::Shared {
+        for (&start, v) in self.vmas.iter_mut() {
+            let share = match v.backing {
+                Backing::Shared => true,
+                // 两边都不能写，内容就不会分叉；谁要改成可写，再复制自己的一份
+                Backing::PrivateFile if v.prot & prot::WRITE == 0 => {
+                    v.cow = true;
+                    true
+                }
+                _ => false,
+            };
+            let (region, host) = if share {
                 (v.region.clone(), v.host)
             } else {
                 let (region, host) = Self::new_anonymous(v.len)?;
                 // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
-                unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.len as usize) };
+                unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
                 (region, host)
             };
             child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
-            child.vmas.get_mut(&start).unwrap().name = v.name.clone();
+            let c = child.vmas.get_mut(&start).unwrap();
+            c.name = v.name.clone();
+            c.file_len = if share { v.file_len } else { v.len };
+            c.cow = v.cow && share;
         }
         Ok(child)
+    }
+
+    /// 给一个和别的地址空间共用宿主内存的私有文件映射复制一份自己的。
+    fn unshare(&mut self, start: u64) -> Result<(), Errno> {
+        let v = &self.vmas[&start];
+        let (region, host) = Self::new_anonymous(v.len)?;
+        // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
+        unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
+        let (len, p) = (v.len, v.prot);
+        // SAFETY: region 由 VMA 持有，生命周期不短于页表里的映射
+        unsafe { self.mmu.map(start, host, len, mmu_prot(p)) }.map_err(map_err)?;
+        let v = self.vmas.get_mut(&start).unwrap();
+        let old = std::mem::replace(&mut v.region, region);
+        v.host = host;
+        v.file_len = v.len;
+        v.cow = false;
+        // 其他线程的 TLB 里可能还有旧的翻译：shootdown 之后才释放
+        self.graveyard.push(old);
+        self.dirty = true;
+        Ok(())
     }
 
     /// 给起点落在 `[start, start + len)` 里的映射起名字（`/proc/<pid>/maps` 用）。
@@ -804,6 +899,51 @@ mod tests {
         assert_eq!(&buf[..4], b"both");
         // 映射自顶向下分配：private 上方就是 mmap 区的上界，没有映射
         assert!(child.is_mapped(private) && !child.is_mapped(private + 2 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn fork_never_reads_private_file_mappings_past_the_end() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("appine-mm-{}", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&[7u8; 5000]).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let mut mm = Mm::new();
+        // 映射 3 页，文件只有 5000 字节：最后一页完全在文件末尾之后，碰了就是 SIGBUS
+        let ro = mm
+            .mmap(
+                0,
+                3 * PAGE_SIZE,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                Some((f.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        let rw = mm
+            .mmap(
+                0,
+                3 * PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE,
+                Some((f.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        mm.write_kernel(rw, b"parent").unwrap();
+        let child = mm.fork().unwrap();
+        let mut b = [0u8; 6];
+        child
+            .read(UserSlice::new(ro + 4000, 1), &mut b[..1])
+            .unwrap();
+        assert_eq!(b[0], 7);
+        child.read(UserSlice::new(rw, 6), &mut b).unwrap();
+        assert_eq!(&b, b"parent");
+        // 共用的只读映射改成可写之前先复制一份：父进程写入，子进程看不到
+        mm.mprotect(ro, PAGE_SIZE, RW).unwrap();
+        mm.write(UserSlice::new(ro, 1), &[1]).unwrap();
+        child.read(UserSlice::new(ro, 1), &mut b[..1]).unwrap();
+        assert_eq!(b[0], 7);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
