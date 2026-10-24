@@ -771,6 +771,19 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 | `sh` 循环 200 次 fork + exec `/bin/true` | 0.25s | 0.73s（M3a） | 0.46s | 1.8× |
 | `appine-bench` 几何平均 | — | 1.85×（M2） | 1.77× | |
 
+CI 的 `ubuntu-24.04-arm` runner（Neoverse N2，2 vCPU）上，性能探针的几何平均从 M2 的 2.37× 降到 2.25×。这种核心比 Apple Silicon 窄，更接近手机的大核和中核：
+
+| 程序 | M2（Neoverse N2） | M7（Neoverse N2） |
+|---|---|---|
+| sha256 | 2.06× | 1.88× |
+| lz | 2.33× | 2.24× |
+| sort | 1.98× | 1.80× |
+| crc32 | 2.32× | 2.42× |
+| vm | 3.37× | 3.15× |
+| **几何平均** | **2.37×** | **2.25×** |
+
+间接分支仍然最弱（`vm`），下一步的优化方向（`ret` 走宿主的返回地址预测）不变。crc32 从 2.32× 略升到 2.42×，原因还没有细查。
+
 - **编译负载**按影响从大到小（括号里是编译 `lvm.c` 的时间）：
   1. **Tier 1 翻译 SIMD&FP**（7.4 → 5.0 秒）：guest 的 V0–V31、FPCR、FPSR 在翻译后的代码里一直放在宿主寄存器里，数据处理指令原样拷贝；SIMD 访存走和整数一样的 TLB 快速路径。退回 Tier 0 执行单条指令的次数从 1.34 亿降到 3179 万。
   2. **TLB 从 512 项加到 4096 项**（→ 4.0 秒）。模拟显示剩下的未命中里 86% 是直接映射的冲突，4096 项就能命中；清空 TLB 改为只处理填过的项，munmap 频繁的 gcc 清空 1.95 万次也不贵。cpu 结构体为此重新排了布局：生成的代码直接寻址的字段放在 TLB 前面。
@@ -844,7 +857,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 
 | # | 风险或假设 | 何时验证 | 退路 |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，见 §14；真机待测 | `ret` 走宿主返回地址预测、guest SP 常驻宿主寄存器、块内 TLB 检查外提、压缩退出桩 |
+| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，性能探针在 Neoverse N2 上是 2.25×，见 §14；真机待测 | `ret` 走宿主返回地址预测、guest SP 常驻宿主寄存器、块内 TLB 检查外提、压缩退出桩 |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时（M5 按决定暂不提交） | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前 | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
 | R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | 已解决：M1a 在 Tier 0 用 CAS 模拟，M7 在 Tier 1 把 STXR 改写成两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 §4.5 | — |
