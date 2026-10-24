@@ -330,10 +330,8 @@ static enum appine_exit crc32(cpu_t *c, uint32_t insn)
     d.gpr[0] = (struct native_operand){.pos = 0, .store = 1};
     d.gpr[1] = (struct native_operand){.pos = 5, .load = 1};
     d.gpr[2] = (struct native_operand){.pos = 16, .load = 1};
-    native_fn fn = appine_native_stub(insn, &d);
-    if (!fn)
+    if (!appine_native_exec(insn, &d, c, NULL))
         return undef(c, insn);
-    fn(c, NULL);
     return next(c);
 }
 
@@ -840,10 +838,8 @@ static enum appine_exit simd_dp(cpu_t *c, uint32_t insn)
     struct native_desc d;
     if (!appine_has(APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD) || !appine_simd_dp_decode(insn, &d))
         return undef(c, insn);
-    native_fn fn = appine_native_stub(insn, &d);
-    if (!fn)
+    if (!appine_native_exec(insn, &d, c, NULL))
         return undef(c, insn);
-    fn(c, NULL);
     return next(c);
 }
 

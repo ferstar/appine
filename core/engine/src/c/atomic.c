@@ -213,10 +213,8 @@ static enum appine_exit native_atomic(struct appine_cpu *c, uint32_t insn, unsig
     void *p = atomic_target(c, FIELD(insn, 9, 5), bytes, APPINE_ACCESS_WRITE);
     if (!p)
         return APPINE_EXIT_FAULT;
-    native_fn fn = appine_native_stub(insn, d);
-    if (!fn)
+    if (!appine_native_exec(insn, d, c, p))
         return undef(c, insn);
-    fn(c, p);
     return next(c);
 }
 

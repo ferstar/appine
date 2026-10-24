@@ -6,8 +6,10 @@
  * 再次调用 appine_cpu_run() 继续执行。
  *
  * 线程模型：一个 struct appine_cpu 只能由一个线程运行；除 appine_cpu_kick()
- * 外，其余函数都不是线程安全的。修改 mmu 映射后，调用方必须对所有使用该 mmu
- * 的 cpu 调用 appine_cpu_tlb_flush()。
+ * 外，其余函数都不是线程安全的。多个 cpu 可以共享一个 mmu 并同时运行：页表
+ * 允许在被遍历的同时修改，但修改本身必须由调用方串行化。解除映射或降低权限
+ * 之后，调用方必须让所有使用该 mmu 的 cpu 调用 appine_cpu_tlb_flush()，并且
+ * 在它们都这样做之前不能释放被解除映射的 host 内存。
  */
 #ifndef APPINE_ENGINE_H
 #define APPINE_ENGINE_H

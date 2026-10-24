@@ -131,11 +131,12 @@ fn main() -> ExitCode {
             pc,
             fault_addr,
         } => {
-            match fault_addr {
-                Some(addr) => {
+            match (pc, fault_addr) {
+                (Some(pc), Some(addr)) => {
                     eprintln!("appine-run: guest killed by {signal} (pc={pc:#x}, addr={addr:#x})")
                 }
-                None => eprintln!("appine-run: guest killed by {signal} (pc={pc:#x})"),
+                (Some(pc), None) => eprintln!("appine-run: guest killed by {signal} (pc={pc:#x})"),
+                _ => eprintln!("appine-run: guest killed by {signal}"),
             }
             ExitCode::from((128 + signal.number()) as u8)
         }

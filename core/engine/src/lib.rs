@@ -97,6 +97,7 @@ unsafe extern "C" {
     fn appine_cpu_tlb_flush(cpu: *mut CpuState);
     fn appine_cpu_run(cpu: *mut CpuState) -> c_int;
     fn appine_cpu_exec_insn(cpu: *mut CpuState, insn: u32) -> c_int;
+    fn appine_cpu_kick(cpu: *mut CpuState);
     fn appine_cpu_layout_check(
         size: usize,
         off_x: usize,
@@ -268,6 +269,30 @@ pub struct Cpu {
     state: Box<CpuState>,
 }
 
+// SAFETY: 同一时刻只有一个线程运行一个 Cpu（`&mut self`），但它可以在线程之间移交；
+// 它指向的 Mmu 由调用方保证存活，并且页表本身允许并发遍历
+unsafe impl Send for Cpu {}
+
+/// 从其他线程打断一个 [`Cpu`] 的句柄（[`Cpu::kicker`]）。
+#[derive(Clone, Copy)]
+pub struct Kicker(NonNull<CpuState>);
+
+// SAFETY: kick 只对 CpuState 的 pending 字段做原子写
+unsafe impl Send for Kicker {}
+unsafe impl Sync for Kicker {}
+
+impl Kicker {
+    /// 让对应的 Cpu 在下一个指令边界（Tier 1 是下一个块入口）返回 [`Exit::Kick`]；
+    /// 它当前不在运行时，下一次运行会立即返回。
+    ///
+    /// # Safety
+    ///
+    /// 创建这个句柄的 Cpu 必须仍然存活。
+    pub unsafe fn kick(&self) {
+        unsafe { appine_cpu_kick(self.0.as_ptr()) }
+    }
+}
+
 impl Cpu {
     /// 创建一个所有寄存器为 0、绑定到 `mmu` 的 CPU。
     ///
@@ -284,6 +309,20 @@ impl Cpu {
         let mut state = unsafe { Box::from_raw(ptr) };
         unsafe { appine_cpu_init(&mut *state, mmu.raw.as_ptr()) };
         Cpu { state }
+    }
+
+    /// 清零全部状态并改为绑定 `mmu`（execve 使用），[`Kicker`] 仍然有效。
+    ///
+    /// # Safety
+    ///
+    /// `mmu` 必须比这个 `Cpu` 活得久。
+    pub unsafe fn reset(&mut self, mmu: &Mmu) {
+        unsafe { appine_cpu_init(&mut *self.state, mmu.raw.as_ptr()) }
+    }
+
+    /// 打断这个 Cpu 的句柄。
+    pub fn kicker(&self) -> Kicker {
+        Kicker(NonNull::from(&*self.state))
     }
 
     /// guest 寄存器。

@@ -1,20 +1,27 @@
 //! guest 地址空间（设计文档 §5）：VMA 表加 soft-MMU 页表。
 //!
 //! 每个 VMA 指向一段宿主内存（匿名映射或文件映射），多个 VMA 可以共享同一段
-//! （munmap/mprotect 切开之后）。宿主内存在最后一个引用它的 VMA 消失时才释放。
-//! 文件映射直接用宿主 `mmap(objects/<ino>)`，代码页因此经由 page cache 在
-//! guest 进程之间共享（§5.2）。
+//! （munmap/mprotect 切开之后，或者 fork 之后的共享映射）。宿主内存在最后一个
+//! 引用它的 VMA 消失时才释放。文件映射直接用宿主 `mmap(objects/<ino>)`。
 //!
-//! 任何拆除映射或修改权限的操作都会把 [`Mm::take_dirty`] 置位，调用方据此
-//! 刷新 CPU 的 TLB 和 Tier 1 的翻译缓存。
+//! 一个地址空间可以被多个线程同时使用（线程、vfork）。拆除映射或修改权限之后，
+//! 其他线程的 TLB 里可能还留着旧的翻译，所以要先做一次 TLB shootdown（[`Mm::sync`]）：
+//! 递增代数，打断正在执行 guest 代码的线程并等它们退出，它们重新进入 guest
+//! 代码之前看到新的代数，会刷新自己的 TLB 和 Tier 1 翻译缓存。被解除映射的宿主
+//! 内存要等 shootdown 完成之后才释放，所以 guest 的数据竞争不会访问到已释放的内存。
+//!
+//! fork 按设计文档 §5.3 v1 整份复制：私有映射拷贝一份，共享映射与子进程共用。
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
 
 use crate::errno::Errno;
+use crate::task::TaskSync;
 use crate::uaccess::UserSlice;
 
 /// mmap 的 flags（guest ABI）。
@@ -51,12 +58,12 @@ impl Drop for HostRegion {
 /// 映射的来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backing {
-    /// 匿名内存。
+    /// 私有的匿名内存。
     Anonymous,
     /// 文件的私有映射（写时复制）。
     PrivateFile,
-    /// 文件的共享映射。
-    SharedFile,
+    /// 共享映射（文件或匿名）：fork 之后父子进程共用同一段宿主内存。
+    Shared,
 }
 
 #[derive(Clone)]
@@ -66,8 +73,8 @@ struct Vma {
     backing: Backing,
     /// 能否获得写权限：只读打开的文件的共享映射不能（宿主映射本身就是只读的）。
     may_write: bool,
-    /// 只为持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
-    _region: Rc<HostRegion>,
+    /// 持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
+    region: Rc<HostRegion>,
     /// 这个 VMA 的起点对应的宿主地址。
     host: NonNull<u8>,
 }
@@ -77,9 +84,17 @@ pub struct Mm {
     // 字段按声明顺序析构：先销毁页表，再释放它指向的宿主内存。
     mmu: Mmu,
     vmas: BTreeMap<u64, Vma>,
+    /// 已经解除映射、等 shootdown 完成后才能释放的宿主内存。
+    graveyard: Vec<Rc<HostRegion>>,
     brk_start: u64,
     brk: u64,
     dirty: bool,
+    /// shootdown 的代数：变化之后，使用者重新进入 guest 代码之前刷新 TLB。
+    generation: Arc<AtomicU64>,
+    /// 正在使用这个地址空间的线程。
+    users: Vec<Arc<TaskSync>>,
+    /// vDSO 的加载地址（信号处理函数默认返回到其中的 sigreturn 跳板）。
+    pub vdso: u64,
 }
 
 fn page_up(v: u64) -> Option<u64> {
@@ -108,9 +123,13 @@ impl Mm {
         Mm {
             mmu: Mmu::new(),
             vmas: BTreeMap::new(),
+            graveyard: Vec::new(),
             brk_start: 0,
             brk: 0,
             dirty: false,
+            generation: Arc::new(AtomicU64::new(0)),
+            users: Vec::new(),
+            vdso: 0,
         }
     }
 
@@ -119,9 +138,54 @@ impl Mm {
         &self.mmu
     }
 
-    /// 自上次调用以来是否有映射被拆除或改了权限。
-    pub fn take_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.dirty)
+    /// shootdown 的代数（[`Mm::sync`]）。
+    pub fn generation(&self) -> Arc<AtomicU64> {
+        self.generation.clone()
+    }
+
+    /// 登记一个开始使用这个地址空间的线程。
+    pub fn add_user(&mut self, user: Arc<TaskSync>) {
+        self.users.push(user);
+    }
+
+    /// 注销一个不再使用这个地址空间的线程（退出或 execve）。
+    pub fn remove_user(&mut self, user: &Arc<TaskSync>) {
+        self.users.retain(|u| !Arc::ptr_eq(u, user));
+    }
+
+    /// 是否还有别的线程在使用这个地址空间。
+    pub fn shared_with_others(&self) -> bool {
+        self.users.len() > 1
+    }
+
+    /// 如果有映射被拆除或改了权限，做一次 TLB shootdown，然后释放被解除映射的宿主内存。
+    ///
+    /// 调用方持有 BKL；`current` 是调用线程，它自己在重新进入 guest 代码之前刷新。
+    pub fn sync(&mut self, current: &Arc<TaskSync>) {
+        if !std::mem::take(&mut self.dirty) {
+            return;
+        }
+        // SeqCst 与使用者那边"先标记在执行 guest 代码、再读代数"配对：要么它读到新的代数，
+        // 要么这里看到它正在执行，等它被打断后退出
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.quiesce(current);
+        self.graveyard.clear();
+    }
+
+    /// 打断其他正在执行 guest 代码的使用者，等它们全部退出。它们接下来要获取 BKL，
+    /// 而调用方正持有 BKL，所以在调用方释放 BKL 之前，这个地址空间里不会再执行
+    /// guest 代码（fork 据此复制出一致的内存快照）。
+    pub fn quiesce(&self, current: &Arc<TaskSync>) {
+        let others = self.users.iter().filter(|u| !Arc::ptr_eq(u, current));
+        for user in others.clone() {
+            // SAFETY: 线程在销毁自己的 Cpu 之前（持有 BKL）从 users 里注销
+            unsafe { user.kicker.kick() };
+        }
+        for user in others {
+            while user.in_guest.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// `[start, start + len)` 是否完全空闲。
@@ -170,7 +234,7 @@ impl Mm {
                 prot,
                 backing,
                 may_write,
-                _region: region,
+                region,
                 host,
             },
         );
@@ -244,7 +308,12 @@ impl Mm {
         let (backing, may_write, region, host) = match file {
             None => {
                 let (region, host) = Self::new_anonymous(len)?;
-                (Backing::Anonymous, true, region, host)
+                let backing = if shared {
+                    Backing::Shared
+                } else {
+                    Backing::Anonymous
+                };
+                (backing, true, region, host)
             }
             Some((fd, offset, writable)) => {
                 if !offset.is_multiple_of(PAGE_SIZE) {
@@ -254,7 +323,7 @@ impl Mm {
                 let m =
                     appine_hal::map_file(fd, offset, host_len, shared, writable).map_err(Errno)?;
                 let backing = if shared {
-                    Backing::SharedFile
+                    Backing::Shared
                 } else {
                     Backing::PrivateFile
                 };
@@ -308,8 +377,9 @@ impl Mm {
             .map(|(&s, v)| (s, v.len))
             .collect();
         for (s, len) in doomed {
-            self.vmas.remove(&s);
+            let vma = self.vmas.remove(&s).unwrap();
             self.mmu.unmap(s, len).map_err(map_err)?;
+            self.graveyard.push(vma.region);
             self.dirty = true;
         }
         Ok(())
@@ -386,6 +456,35 @@ impl Mm {
             cursor = stop;
         }
         Ok(())
+    }
+
+    /// fork：复制出一个新的地址空间。私有映射逐页拷贝（全零的页跳过，新的匿名
+    /// 内存本来就是零，这样没碰过的栈页不会在子进程里占用内存）；共享映射与子进程共用。
+    pub fn fork(&self) -> Result<Mm, Errno> {
+        let mut child = Mm::new();
+        child.brk_start = self.brk_start;
+        child.brk = self.brk;
+        child.vdso = self.vdso;
+        for (&start, v) in &self.vmas {
+            let (region, host) = if v.backing == Backing::Shared {
+                (v.region.clone(), v.host)
+            } else {
+                let (region, host) = Self::new_anonymous(v.len)?;
+                // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
+                unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.len as usize) };
+                (region, host)
+            };
+            child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
+        }
+        Ok(child)
+    }
+
+    /// guest 地址是否落在某个映射里（区分 SEGV_MAPERR 和 SEGV_ACCERR）。
+    pub fn is_mapped(&self, addr: u64) -> bool {
+        self.vmas
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(&s, v)| addr < s + v.len)
     }
 
     /// 设置初始的 program break（加载器使用）。
@@ -496,6 +595,25 @@ impl Default for Mm {
     }
 }
 
+/// 逐页拷贝，跳过全零的页（目标内存已经清零）。
+///
+/// # Safety
+///
+/// `src` 和 `dst` 都必须指向至少 `len` 字节、互不重叠的可访问内存，`len` 是页大小的整数倍。
+unsafe fn copy_nonzero_pages(src: *const u8, dst: *mut u8, len: usize) {
+    const PAGE: usize = PAGE_SIZE as usize;
+    for off in (0..len).step_by(PAGE) {
+        let page = unsafe { std::slice::from_raw_parts(src.add(off), PAGE) };
+        let (head, words, tail) = unsafe { page.align_to::<u64>() };
+        let zero = head.iter().all(|&b| b == 0)
+            && words.iter().all(|&w| w == 0)
+            && tail.iter().all(|&b| b == 0);
+        if !zero {
+            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), PAGE) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,12 +666,13 @@ mod tests {
         assert!(a + 4 * PAGE_SIZE <= MMAP_TOP);
         mm.write_kernel(a + 3 * PAGE_SIZE, b"tail").unwrap();
 
-        // 中间挖掉一页：两侧仍然可用，数据不变
+        // 中间挖掉一页：两侧仍然可用，数据不变；宿主内存要等 shootdown 之后才释放
         mm.munmap(a + PAGE_SIZE, PAGE_SIZE).unwrap();
-        assert!(mm.take_dirty());
+        assert!(std::mem::take(&mut mm.dirty));
+        assert_eq!(mm.graveyard.len(), 1);
         // 几乎整个地址空间都没有映射：立即成功，什么都不做
         mm.munmap(MMAP_MIN, a - MMAP_MIN).unwrap();
-        assert!(!mm.take_dirty());
+        assert!(!mm.dirty);
         assert_eq!(mm.vmas.len(), 2);
         assert!(mm.mmu().translate(a + PAGE_SIZE, 0).is_none());
         let mut buf = [0u8; 4];
@@ -580,6 +699,44 @@ mod tests {
             mm.mmap(a, PAGE_SIZE, RW, noreplace, None),
             Err(Errno::EEXIST)
         );
+    }
+
+    #[test]
+    fn fork_copies_private_and_shares_shared_mappings() {
+        let mut mm = Mm::new();
+        let private = mm
+            .mmap(
+                0,
+                2 * PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let shared = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        mm.write_kernel(private + PAGE_SIZE, b"parent").unwrap();
+        let child = mm.fork().unwrap();
+        mm.write_kernel(private + PAGE_SIZE, b"PARENT").unwrap();
+        mm.write_kernel(shared, b"both").unwrap();
+        let mut buf = [0u8; 6];
+        child
+            .read(UserSlice::new(private + PAGE_SIZE, 6), &mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"parent");
+        child
+            .read(UserSlice::new(shared, 4), &mut buf[..4])
+            .unwrap();
+        assert_eq!(&buf[..4], b"both");
+        // 映射自顶向下分配：private 上方就是 mmap 区的上界，没有映射
+        assert!(child.is_mapped(private) && !child.is_mapped(private + 2 * PAGE_SIZE));
     }
 
     #[test]

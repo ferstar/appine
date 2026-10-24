@@ -137,8 +137,12 @@ typedef void (*native_fn)(struct appine_cpu *cpu, void *host_addr);
 
 bool appine_native_available(void);
 
-/* 取得（必要时生成）insn 的原生桩；同一条 insn 的 desc 必须总是相同 */
-native_fn appine_native_stub(uint32_t insn, const struct native_desc *desc);
+/*
+ * 取得（必要时生成）insn 的原生桩并执行；原生桩不可用时返回 false。同一条
+ * insn 的 desc 必须总是相同。可以从多个线程同时调用。
+ */
+bool appine_native_exec(uint32_t insn, const struct native_desc *desc, struct appine_cpu *cpu,
+                        void *host_addr);
 
 /* ---- SIMD&FP（simd.c）与原子访存（atomic.c）---- */
 

@@ -1,5 +1,5 @@
 //! 端到端测试：把 Alpine minirootfs 导入 inode 仓库，经由 `ld-musl` 运行 busybox
-//! （M1b 的退出标准）。每个用例都分别在 Tier 0 和 Tier 1 下运行。
+//! （M1b、M3a 的退出标准）。每个用例都分别在 Tier 0 和 Tier 1 下运行。
 //!
 //! rootfs 由 `scripts/fetch-rootfs` 下载到 `target/rootfs/`，也可以用环境变量
 //! `APPINE_ROOTFS_TARBALL` 指定。找不到时跳过这些测试；设置
@@ -250,6 +250,163 @@ fn missing_or_non_executable_programs_fail_to_start() {
     }
     for (tier, out) in run(&["/etc/passwd"]) {
         assert_eq!(out.status.code(), Some(126), "tier {tier}");
+    }
+}
+
+/// 在 `sh -c` 里运行脚本，要求退出码为 0，返回 stdout。
+fn shell(tier: &str, out: &Output) -> String {
+    assert_ok(tier, out);
+    stdout(out).to_owned()
+}
+
+#[test]
+fn pipelines_connect_processes() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "ls / | wc -l; echo hello | tr a-z A-Z | cat; cat /etc/os-release | grep ^ID= | sort | uniq",
+    ]) {
+        let out = shell(tier, &out);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines[0].trim().parse::<u32>().unwrap() >= 10,
+            "tier {tier}: {out}"
+        );
+        assert_eq!(&lines[1..], ["HELLO", "ID=alpine"], "tier {tier}");
+    }
+}
+
+#[test]
+fn subshells_and_command_substitution_fork() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "echo $(echo nested $(echo twice)); (exit 3); echo status $?; false; echo $?",
+    ]) {
+        assert_eq!(
+            shell(tier, &out),
+            "nested twice\nstatus 3\n1\n",
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn trap_handlers_run_on_signals() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "trap 'echo caught USR1' USR1; kill -USR1 $$; echo after; \
+         trap 'echo term; exit 5' TERM; trap 'echo bye' EXIT; kill -TERM $$; echo not reached",
+    ]) {
+        // 与原生的 Alpine busybox 相同
+        assert_eq!(
+            stdout(&out),
+            "caught USR1\nafter\nterm\nbye\n",
+            "tier {tier}"
+        );
+        assert_eq!(out.status.code(), Some(5), "tier {tier}");
+    }
+    // 没有 trap 的 SIGTERM 按默认动作终止 shell，EXIT trap 不会运行
+    for (tier, out) in run(&["/bin/sh", "-c", "trap 'echo bye' EXIT; kill $$; echo no"]) {
+        assert_eq!(stdout(&out), "", "tier {tier}");
+        assert_eq!(out.status.code(), Some(128 + 15), "tier {tier}");
+    }
+}
+
+#[test]
+fn find_exec_and_xargs_spawn_programs() {
+    // busybox 用 vfork 启动 -exec 和 xargs 的命令
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "find /etc -name hostname -exec cat {} \\; ; echo /etc/hostname | xargs cat",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(out.lines().count(), 2, "tier {tier}: {out}");
+        let first = out.lines().next().unwrap();
+        assert!(out.lines().all(|l| l == first), "tier {tier}: {out}");
+    }
+}
+
+#[test]
+fn background_jobs_can_be_waited_for_and_killed() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "sleep 0.1 & echo started; wait; echo done; \
+         sleep 10 & kill $!; wait $!; echo killed $?",
+    ]) {
+        assert_eq!(
+            shell(tier, &out),
+            "started\ndone\nkilled 143\n",
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn closed_pipes_stop_writers_with_sigpipe() {
+    // yes 永远在写：head 退出之后它只能被 SIGPIPE 终止
+    for (tier, out) in run(&["/bin/sh", "-c", "yes | head -n 2; echo end"]) {
+        assert_eq!(shell(tier, &out), "y\ny\nend\n", "tier {tier}");
+    }
+}
+
+#[test]
+fn scripts_run_through_their_interpreter() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "cd /tmp && printf '#!/bin/sh -e\\necho script $0 $1\\n' > s && chmod +x s && \
+         ./s arg && exec ./s exec",
+    ]) {
+        assert_eq!(
+            shell(tier, &out),
+            "script ./s arg\nscript ./s exec\n",
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn files_can_be_renamed_linked_and_removed() {
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in TIERS {
+        let script = format!(
+            "cd /tmp && mkdir ns{tier} && cd ns{tier} && echo data > a && mv a b && \
+             ln -s b sym && ln b hard && cat sym && stat -c '%h %a' b && chmod 600 b && \
+             stat -c '%a' hard && rm b sym && cat hard && rm hard && cd .. && rmdir ns{tier} && \
+             ls -d ns{tier} 2>&1"
+        );
+        let out = command(store, tier, &["/bin/sh", "-c", &script])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "tier {tier}: {}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("data\n2 644\n600\ndata\nls: ns{tier}: No such file or directory\n"),
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn device_nodes_work() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "echo hidden > /dev/null; cat /dev/null; head -c 5 /dev/zero | od -An -tx1; \
+         head -c 16 /dev/urandom | wc -c; echo x > /dev/full || echo full",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            ["00", "00", "00", "00", "00", "16", "full"],
+            "tier {tier}: {out}"
+        );
     }
 }
 

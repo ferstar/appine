@@ -3,7 +3,7 @@
 //! 支持静态链接（`ET_EXEC`）和位置无关（`ET_DYN`）的 aarch64 程序。带
 //! `PT_INTERP` 的程序同时加载解释器（Alpine 上是 `ld-musl`），从解释器的入口
 //! 开始执行，由它完成动态链接。段的内容拷贝进匿名内存；初始栈按 Linux 的约定
-//! 构造，auxv 与 arm64 Linux 给出的条目一致（不含 vDSO）。
+//! 构造，auxv 与 arm64 Linux 给出的条目和顺序一致；vDSO 映射在解释器下方。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,6 +43,7 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_HWCAP2: u64 = 26;
 const AT_EXECFN: u64 = 31;
+const AT_SYSINFO_EHDR: u64 = 33;
 const AT_MINSIGSTKSZ: u64 = 51;
 
 /// 初始栈顶（不含），即 47 位地址空间的上界。
@@ -55,8 +56,6 @@ const MAX_ARG_BYTES: usize = (STACK_SIZE / 4) as usize;
 const ET_DYN_BASE: u64 = 0x5555_5555_0000;
 /// 解释器路径的最大长度。
 const MAX_INTERP_PATH: u64 = 4096;
-/// arm64 的 `AT_MINSIGSTKSZ`：信号帧最多需要的字节数（含 SVE 之外的全部扩展）。
-const MIN_SIGSTACK_SIZE: u64 = 5120;
 /// `sysconf(_SC_CLK_TCK)`。
 pub const CLOCK_TICKS: u64 = 100;
 
@@ -361,12 +360,25 @@ pub fn load(
         entry = loaded.entry;
     }
 
+    let vdso = crate::vdso::image();
+    let vdso_len = (vdso.len() as u64).next_multiple_of(PAGE_SIZE);
+    let vdso_base = mm
+        .find_free(vdso_len)
+        .ok_or(LoadError::Memory(Errno::ENOMEM))?;
+    mm.map_anonymous(vdso_base, vdso_len, prot::READ | prot::EXEC)
+        .and_then(|()| mm.write_kernel(vdso_base, vdso))
+        .map_err(LoadError::Memory)?;
+    mm.vdso = vdso_base;
+
     mm.set_brk(main.end);
     mm.map_anonymous(STACK_TOP - STACK_SIZE, STACK_SIZE, prot::READ | prot::WRITE)
         .map_err(LoadError::Memory)?;
     let mut random = [0u8; 16];
     appine_hal::fill_random(&mut random).map_err(|e| LoadError::Memory(Errno(e)))?;
+    // arm64 的 ARCH_DLINFO（AT_SYSINFO_EHDR、AT_MINSIGSTKSZ）排在最前面
     let auxv = [
+        (AT_SYSINFO_EHDR, vdso_base),
+        (AT_MINSIGSTKSZ, crate::signal::MIN_SIGSTKSZ),
         (AT_HWCAP, appine_engine::guest_hwcap()),
         (AT_PAGESZ, PAGE_SIZE),
         (AT_CLKTCK, CLOCK_TICKS),
@@ -385,7 +397,6 @@ pub fn load(
         (AT_HWCAP2, 0),
         (AT_EXECFN, 0),
         (AT_PLATFORM, 0),
-        (AT_MINSIGSTKSZ, MIN_SIGSTACK_SIZE),
     ];
     let sp = build_stack(mm, args, &auxv, &random)?;
     Ok(Image { entry, sp })
@@ -616,6 +627,15 @@ mod tests {
         mm.read(UserSlice::new(aux[&AT_RANDOM], 16), &mut random)
             .unwrap();
         assert_ne!(random, [0; 16]);
+        assert_eq!(aux[&AT_MINSIGSTKSZ], crate::signal::MIN_SIGSTKSZ);
+        // vDSO 只读可执行，开头是 ELF 头
+        let vdso = aux[&AT_SYSINFO_EHDR];
+        assert_eq!(vdso, mm.vdso);
+        assert!(mm.mmu().translate(vdso, prot::EXEC).is_some());
+        assert!(mm.mmu().translate(vdso, prot::WRITE).is_none());
+        let mut magic = [0u8; 4];
+        mm.read(UserSlice::new(vdso, 4), &mut magic).unwrap();
+        assert_eq!(&magic, b"\x7fELF");
     }
 
     #[test]

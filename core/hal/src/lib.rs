@@ -7,6 +7,7 @@
 
 use std::io;
 use std::ptr::NonNull;
+use std::time::Duration;
 
 /// 申请 `len` 字节、清零、可读写的匿名宿主内存。
 pub fn map_anonymous(len: usize) -> Result<NonNull<u8>, i32> {
@@ -209,9 +210,9 @@ pub fn memory_info() -> (u64, u64) {
     ((pages.max(0) as u64) * page_size() as u64, 0)
 }
 
-/// 在宿主 fd 上等待事件：`fds` 的每一项是 (fd, events, revents)，`timeout_ms` 为负时一直等。
-/// 返回就绪的 fd 数；被信号打断时返回 `EINTR`。
-pub fn poll(fds: &mut [(i32, i16, i16)], timeout_ms: i32) -> Result<usize, i32> {
+/// 在宿主 fd 上等待事件：`fds` 的每一项是 (fd, events, revents)，`timeout` 为 None 时一直等。
+/// 返回就绪的 fd 数；被宿主信号打断时返回 `EINTR`。
+pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<usize, i32> {
     let mut raw: Vec<libc::pollfd> = fds
         .iter()
         .map(|&(fd, events, _)| libc::pollfd {
@@ -220,7 +221,7 @@ pub fn poll(fds: &mut [(i32, i16, i16)], timeout_ms: i32) -> Result<usize, i32> 
             revents: 0,
         })
         .collect();
-    let rc = unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, timeout_ms) };
+    let rc = poll_raw(&mut raw, timeout);
     if rc < 0 {
         return Err(last_errno());
     }
@@ -228,4 +229,144 @@ pub fn poll(fds: &mut [(i32, i16, i16)], timeout_ms: i32) -> Result<usize, i32> 
         slot.2 = r.revents;
     }
     Ok(rc as usize)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
+    let ts = timeout.map(|t| libc::timespec {
+        tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
+        tv_nsec: t.subsec_nanos() as _,
+    });
+    let ts_ptr = ts
+        .as_ref()
+        .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+    unsafe {
+        libc::ppoll(
+            raw.as_mut_ptr(),
+            raw.len() as libc::nfds_t,
+            ts_ptr,
+            std::ptr::null(),
+        )
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
+    // 向上取整到毫秒，避免把很短的等待变成忙等
+    let ms = timeout.map_or(-1, |t| {
+        t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+    });
+    unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, ms) }
+}
+
+/// 一个宿主文件系统的容量（statvfs）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FsStats {
+    /// 块大小。
+    pub block_size: u64,
+    /// 总块数。
+    pub blocks: u64,
+    /// 空闲块数。
+    pub free: u64,
+    /// 非特权用户可用的块数。
+    pub available: u64,
+    /// inode 总数。
+    pub files: u64,
+    /// 空闲 inode 数。
+    pub files_free: u64,
+}
+
+/// 读取 `path` 所在宿主文件系统的容量。
+#[allow(clippy::unnecessary_cast)] // fsblkcnt_t 等类型在不同宿主上宽度不同
+pub fn statvfs(path: &std::path::Path) -> Result<FsStats, i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } < 0 {
+        return Err(last_errno());
+    }
+    let frsize = if st.f_frsize != 0 {
+        st.f_frsize as u64
+    } else {
+        st.f_bsize as u64
+    };
+    Ok(FsStats {
+        block_size: frsize,
+        blocks: st.f_blocks as u64,
+        free: st.f_bfree as u64,
+        available: st.f_bavail as u64,
+        files: st.f_files as u64,
+        files_free: st.f_ffree as u64,
+    })
+}
+
+/// 跨线程唤醒用的事件：Linux 上是 eventfd，其他宿主上用管道代替。
+///
+/// [`Event::signal`] 之后，它的 fd 变为可读，直到 [`Event::clear`]。
+pub struct Event {
+    read: i32,
+    write: i32,
+}
+
+impl Event {
+    /// 新建一个未触发的事件。
+    pub fn new() -> Result<Event, i32> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if fd < 0 {
+                return Err(last_errno());
+            }
+            Ok(Event {
+                read: fd,
+                write: fd,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let mut fds = [0; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                return Err(last_errno());
+            }
+            for fd in fds {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                }
+            }
+            Ok(Event {
+                read: fds[0],
+                write: fds[1],
+            })
+        }
+    }
+
+    /// 用来 poll 的 fd（等待 `POLLIN`）。
+    pub fn fd(&self) -> i32 {
+        self.read
+    }
+
+    /// 触发事件，可以从任意线程调用。
+    pub fn signal(&self) {
+        let one = 1u64.to_ne_bytes();
+        // 计数器已满（eventfd）或管道已满时写入失败，但事件本来就处于触发状态
+        unsafe { libc::write(self.write, one.as_ptr().cast(), one.len()) };
+    }
+
+    /// 清除触发状态。
+    pub fn clear(&self) {
+        let mut buf = [0u8; 64];
+        while unsafe { libc::read(self.read, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.read);
+            if self.write != self.read {
+                libc::close(self.write);
+            }
+        }
+    }
 }

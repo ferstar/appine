@@ -29,9 +29,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
 
-      # llvm-mc 用来独立核对解释器的指令白名单（tests/lockstep/tests/whitelist.rs）
-      - name: Install llvm
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
+      # llvm-mc 用来独立核对解释器的指令白名单（tests/lockstep/tests/whitelist.rs）；
+      # musl-gcc 用来编译链接 musl 的 guest 测试程序（tests/guest/*.c）
+      - name: Install llvm and musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm musl-tools
 
       - uses: Swatinem/rust-cache@v2
 
@@ -53,6 +54,7 @@ jobs:
       - name: Test (includes lockstep, guest programs and busybox in the rootfs)
         env:
           APPINE_REQUIRE_ROOTFS: "1"
+          APPINE_REQUIRE_MUSL: "1"
         run: cargo test --workspace
 
       - name: Lockstep (extended)

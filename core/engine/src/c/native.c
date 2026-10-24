@@ -11,9 +11,13 @@
  * x9、x10 是桩自己的临时寄存器。FP 类的桩还会保存宿主 d8–d15 和 FPCR，
  * 载入 guest 的 FPCR/FPSR/NZCV 和 V0–V31，执行后写回。
  *
- * 原型限制：可执行内存直接映射为 RWX；缓存写满时整体清空，因此还不能在
- * 多个线程间共享。
+ * 缓存由所有线程共享，写满时整体清空。为了不覆盖别的线程正在执行的桩，
+ * 查找和执行都在读锁内进行，生成和清空需要写锁。
+ *
+ * 原型限制：可执行内存直接映射为 RWX。
  */
+#define _POSIX_C_SOURCE 200809L /* -std=c17 下 pthread_rwlock_t 需要它 */
+
 #include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -40,7 +44,7 @@ struct slot {
 };
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t lock = PTHREAD_RWLOCK_INITIALIZER;
 static uint32_t *cache;
 static size_t used_words;
 static size_t table_count;
@@ -170,34 +174,56 @@ static size_t slot_index(uint32_t insn)
     return (size_t)((insn * UINT32_C(0x9e3779b1)) >> (32 - TABLE_BITS));
 }
 
-native_fn appine_native_stub(uint32_t insn, const struct native_desc *desc)
+/* 持有锁时调用：查找已生成的桩 */
+static native_fn lookup(uint32_t insn)
 {
-    if (!appine_native_available())
-        return NULL;
-    pthread_mutex_lock(&lock);
     size_t i = slot_index(insn);
     while (table[i].fn && table[i].insn != insn)
         i = (i + 1) & (TABLE_SIZE - 1);
-    native_fn fn = table[i].fn;
-    if (!fn) {
-        if (table_count >= TABLE_SIZE / 2 || used_words + MAX_STUB_WORDS > CACHE_BYTES / 4) {
-            memset(table, 0, sizeof(table));
-            table_count = 0;
-            used_words = 0;
-            i = slot_index(insn);
-        }
-        struct buf b = {cache + used_words, 0};
-        generate(&b, insn, desc);
-        if (b.n > MAX_STUB_WORDS)
-            abort(); /* 上界估计错误：属于引擎 bug */
-        __builtin___clear_cache((char *)b.p, (char *)(b.p + b.n));
-        used_words += b.n;
-        fn = (native_fn)(uintptr_t)b.p;
-        table[i] = (struct slot){insn, fn};
-        table_count++;
+    return table[i].fn;
+}
+
+/* 持有写锁时调用：生成桩，缓存写满时先整体清空 */
+static void insert(uint32_t insn, const struct native_desc *desc)
+{
+    if (table_count >= TABLE_SIZE / 2 || used_words + MAX_STUB_WORDS > CACHE_BYTES / 4) {
+        memset(table, 0, sizeof(table));
+        table_count = 0;
+        used_words = 0;
     }
-    pthread_mutex_unlock(&lock);
-    return fn;
+    size_t i = slot_index(insn);
+    while (table[i].fn)
+        i = (i + 1) & (TABLE_SIZE - 1);
+    struct buf b = {cache + used_words, 0};
+    generate(&b, insn, desc);
+    if (b.n > MAX_STUB_WORDS)
+        abort(); /* 上界估计错误：属于引擎 bug */
+    __builtin___clear_cache((char *)b.p, (char *)(b.p + b.n));
+    used_words += b.n;
+    table[i] = (struct slot){insn, (native_fn)(uintptr_t)b.p};
+    table_count++;
+}
+
+bool appine_native_exec(uint32_t insn, const struct native_desc *desc, struct appine_cpu *cpu,
+                        void *host_addr)
+{
+    if (!appine_native_available())
+        return false;
+    for (;;) {
+        pthread_rwlock_rdlock(&lock);
+        native_fn fn = lookup(insn);
+        if (fn) {
+            fn(cpu, host_addr);
+            pthread_rwlock_unlock(&lock);
+            return true;
+        }
+        pthread_rwlock_unlock(&lock);
+        /* 换成写锁后重新查找：其他线程可能已经生成了同一个桩 */
+        pthread_rwlock_wrlock(&lock);
+        if (!lookup(insn))
+            insert(insn, desc);
+        pthread_rwlock_unlock(&lock);
+    }
 }
 
 #else /* !NATIVE_SUPPORTED */
@@ -207,11 +233,14 @@ bool appine_native_available(void)
     return false;
 }
 
-native_fn appine_native_stub(uint32_t insn, const struct native_desc *desc)
+bool appine_native_exec(uint32_t insn, const struct native_desc *desc, struct appine_cpu *cpu,
+                        void *host_addr)
 {
     (void)insn;
     (void)desc;
-    return NULL;
+    (void)cpu;
+    (void)host_addr;
+    return false;
 }
 
 #endif

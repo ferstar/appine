@@ -2,6 +2,10 @@
  * soft-MMU 页表（设计文档 §5.1）：4 级基数树，每级 512 项，覆盖 48 位 guest
  * 地址空间。中间表项是下一级表的指针，叶子表项是 host 页地址 | 权限位。
  * 只有 TLB 未命中时才会遍历这棵树。
+ *
+ * 并发：修改只由内核层在持有 BKL 时进行，而共享同一地址空间的其他线程可能
+ * 同时在遍历（TLB 未命中）。所以表项一律用原子操作读写：新建的中间表以
+ * release 语义挂上，遍历时以 acquire 语义读取。中间表在 mmu 销毁前不会释放。
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -27,6 +31,16 @@ static uintptr_t *new_table(void)
     return calloc(LEVEL_ENTRIES, sizeof(uintptr_t));
 }
 
+static uintptr_t load_entry(const uintptr_t *slot)
+{
+    return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+}
+
+static void store_entry(uintptr_t *slot, uintptr_t v)
+{
+    __atomic_store_n(slot, v, __ATOMIC_RELEASE);
+}
+
 static void free_table(uintptr_t *table, int level)
 {
     if (level < LEVELS - 1) {
@@ -44,15 +58,17 @@ static uintptr_t *leaf_slot(struct appine_mmu *mmu, uint64_t gva, bool alloc)
     uintptr_t *table = mmu->root;
     for (int level = 0; level < LEVELS - 1; level++) {
         uintptr_t *slot = &table[level_index(gva, level)];
-        if (!*slot) {
+        uintptr_t next = load_entry(slot);
+        if (!next) {
             if (!alloc)
                 return NULL;
-            uintptr_t *next = new_table();
-            if (!next)
+            uintptr_t *fresh = new_table();
+            if (!fresh)
                 return NULL;
-            *slot = (uintptr_t)next;
+            next = (uintptr_t)fresh;
+            store_entry(slot, next);
         }
-        table = (uintptr_t *)*slot;
+        table = (uintptr_t *)next;
     }
     return &table[level_index(gva, LEVELS - 1)];
 }
@@ -93,7 +109,7 @@ int appine_mmu_map(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t le
         uintptr_t *slot = leaf_slot(mmu, gva + off, true);
         if (!slot)
             return APPINE_ENOMEM;
-        *slot = (h + off) | prot;
+        store_entry(slot, (h + off) | prot);
     }
     return APPINE_OK;
 }
@@ -105,7 +121,7 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
     for (uint64_t off = 0; off < len; off += APPINE_PAGE_SIZE) {
         uintptr_t *slot = leaf_slot(mmu, gva + off, false);
         if (slot)
-            *slot = 0;
+            store_entry(slot, 0);
     }
     return APPINE_OK;
 }
@@ -116,8 +132,9 @@ int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint3
         return APPINE_EINVAL;
     for (uint64_t off = 0; off < len; off += APPINE_PAGE_SIZE) {
         uintptr_t *slot = leaf_slot(mmu, gva + off, false);
-        if (slot && *slot)
-            *slot = (*slot & ~(uintptr_t)PTE_PROT_MASK) | prot;
+        uintptr_t old = slot ? load_entry(slot) : 0;
+        if (old)
+            store_entry(slot, (old & ~(uintptr_t)PTE_PROT_MASK) | prot);
     }
     return APPINE_OK;
 }
@@ -128,12 +145,12 @@ uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva)
         return 0;
     const uintptr_t *table = mmu->root;
     for (int level = 0; level < LEVELS - 1; level++) {
-        uintptr_t next = table[level_index(gva, level)];
+        uintptr_t next = load_entry(&table[level_index(gva, level)]);
         if (!next)
             return 0;
         table = (const uintptr_t *)next;
     }
-    return table[level_index(gva, LEVELS - 1)];
+    return load_entry(&table[level_index(gva, LEVELS - 1)]);
 }
 
 void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot)

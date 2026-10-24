@@ -1,0 +1,329 @@
+//! guest 线程（Linux 的 task）与它的运行循环（设计文档 §6）。
+//!
+//! 每个 guest 线程对应一个宿主线程（1:1）。运行循环在不持有 BKL 的情况下执行
+//! guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL 进入内核。
+
+use std::cell::{Cell, RefCell};
+use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker};
+use appine_hal::Event;
+
+use crate::errno::Errno;
+use crate::fd::FdTable;
+use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
+use crate::mm::Mm;
+use crate::process::{Signal, ThreadGroup, Tier};
+use crate::signal::{self, AltStack, SigInfo, code};
+use crate::syscall::{self, Flow};
+use crate::uaccess::UserSlice;
+use crate::vfs::Vfs;
+use crate::vfs::store::Ino;
+
+/// 运行循环与内核其他部分之间无锁共享的状态。
+pub(crate) struct TaskSync {
+    /// 线程是否正在执行 guest 代码（TLB shootdown 要等它退出）。
+    pub in_guest: AtomicBool,
+    /// 打断线程的 Cpu。
+    pub kicker: Kicker,
+}
+
+/// 当前目录和文件创建掩码（`CLONE_FS` 共享的部分）。
+pub(crate) struct FsContext {
+    pub cwd: Ino,
+    pub umask: u32,
+}
+
+/// 一个 guest 线程。除 [`Task::state`] 外，其余字段也会被其他线程访问（发信号、
+/// 结束线程组），都只在持有 BKL 时进行。
+pub(crate) struct Task {
+    /// tid。非主线程 execve 时接过主线程的 tid，所以会变。
+    pub tid: Cell<Tid>,
+    /// 所属线程组。
+    pub tgid: Tid,
+    /// 发给这个线程、尚未处理的信号。
+    pub pending: Cell<u64>,
+    /// 挂起信号附带的 siginfo。
+    pub info: RefCell<[SigInfo; Signal::MAX as usize]>,
+    /// 信号屏蔽字。
+    pub sigmask: Cell<u64>,
+    /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
+    pub killed: Cell<bool>,
+    /// 线程名（`prctl(PR_SET_NAME)`）。
+    pub comm: Cell<[u8; 16]>,
+    pub sync: Arc<TaskSync>,
+    /// 唤醒等待中的这个线程。
+    pub event: Arc<Event>,
+    /// 只有线程自己访问的状态。
+    pub state: RefCell<TaskState>,
+}
+
+/// 线程私有的状态，以及它和其他线程共享的资源。
+pub(crate) struct TaskState {
+    /// 地址空间（`CLONE_VM` 共享）。
+    pub mm: Rc<RefCell<Mm>>,
+    /// fd 表（`CLONE_FILES` 共享）。
+    pub fds: Rc<RefCell<FdTable>>,
+    /// 当前目录、umask（`CLONE_FS` 共享）。
+    pub fs: Rc<RefCell<FsContext>>,
+    /// 所属线程组。
+    pub group: Rc<RefCell<ThreadGroup>>,
+    /// 根文件系统。
+    pub vfs: Option<Rc<Vfs>>,
+    /// 备用信号栈。
+    pub altstack: AltStack,
+    /// 线程退出时清零并 futex 唤醒的地址（`set_tid_address`、`CLONE_CHILD_CLEARTID`）。
+    pub clear_child_tid: u64,
+    /// sigsuspend、ppoll 临时替换屏蔽字时原来的屏蔽字。
+    pub saved_sigmask: Option<u64>,
+    /// vfork 的子进程：execve 或退出时置位，让父进程继续。
+    pub vfork_done: Option<Rc<Cell<bool>>>,
+}
+
+impl Task {
+    /// 为 `cpu` 新建线程。
+    pub fn new(
+        tid: Tid,
+        tgid: Tid,
+        cpu: &Cpu,
+        state: TaskState,
+        sigmask: u64,
+        comm: [u8; 16],
+    ) -> Result<Rc<Task>, Errno> {
+        let event = Event::new().map_err(|_| Errno::EAGAIN)?;
+        Ok(Rc::new(Task {
+            tid: Cell::new(tid),
+            tgid,
+            pending: Cell::new(0),
+            info: RefCell::new([SigInfo::default(); Signal::MAX as usize]),
+            sigmask: Cell::new(sigmask),
+            killed: Cell::new(false),
+            comm: Cell::new(comm),
+            sync: Arc::new(TaskSync {
+                in_guest: AtomicBool::new(false),
+                kicker: cpu.kicker(),
+            }),
+            event: Arc::new(event),
+            state: RefCell::new(state),
+        }))
+    }
+}
+
+/// 为 `task` 启动宿主线程，并把它登记到 kernel、线程组和地址空间里。调用方持有 BKL，
+/// 线程要等调用方释放 BKL 之后才开始运行。
+pub(crate) fn start(
+    shared: &Arc<Shared>,
+    k: &mut Kernel,
+    task: Rc<Task>,
+    cpu: Cpu,
+) -> Result<(), Errno> {
+    let tid = task.tid.get();
+    let thread_shared = shared.clone();
+    // 不保留 JoinHandle：线程退出时它的宿主资源就释放了。会话结束时等的是
+    // kernel.tasks 变空，线程在那之后只剩释放自己的 Cpu 和翻译缓存
+    std::thread::Builder::new()
+        .name(format!("guest-{tid}"))
+        .spawn(move || thread_main(thread_shared, tid, cpu))
+        .map_err(|_| Errno::EAGAIN)?;
+    {
+        let st = task.state.borrow();
+        st.group.borrow_mut().threads.push(tid);
+        st.mm.borrow_mut().add_user(task.sync.clone());
+    }
+    k.tasks.insert(tid, task);
+    Ok(())
+}
+
+fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu) {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu)));
+    if r.is_err() {
+        // 内核层的 bug：BKL 保护的状态可能已经不一致，不能让其他线程继续
+        eprintln!("appine: internal error in guest thread {tid}, aborting");
+        std::process::abort();
+    }
+}
+
+fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
+    let (task, sync, mut generation, tier) = {
+        let k = shared.lock();
+        let task = k.tasks[&tid].clone();
+        let generation = task.state.borrow().mm.borrow().generation();
+        let sync = task.sync.clone();
+        (task, sync, generation, k.tier)
+    };
+    let mut dbt = match tier {
+        Tier::Interpreter => None,
+        Tier::Dbt => Dbt::new(),
+    };
+    let mut seen = generation.load(Ordering::SeqCst);
+    loop {
+        // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
+        sync.in_guest.store(true, Ordering::SeqCst);
+        let g = generation.load(Ordering::SeqCst);
+        if g != seen {
+            cpu.tlb_flush();
+            if let Some(d) = &mut dbt {
+                d.flush();
+            }
+            seen = g;
+        }
+        let exit = match &mut dbt {
+            Some(d) => d.run(cpu),
+            None => cpu.run(),
+        };
+        sync.in_guest.store(false, Ordering::SeqCst);
+
+        let k = shared.lock();
+        let mut state = task.state.borrow_mut();
+        let mut cx = Cx::new(shared, k, &task, &mut state);
+        match handle(&mut cx, cpu, exit) {
+            Flow::Continue => {}
+            Flow::Exec => {
+                generation = cx.mm().generation();
+                seen = generation.load(Ordering::SeqCst);
+                if let Some(d) = &mut dbt {
+                    d.flush();
+                }
+            }
+            Flow::Exit => break,
+        }
+    }
+    exit(shared, task, dbt.map(|d| d.stats()));
+}
+
+// 合成 esr_context 用的 ESR 字段（ARM ARM D17.2.37）
+const ESR_IL: u64 = 1 << 25;
+const ESR_WNR: u64 = 1 << 6;
+const EC_IABT_LOW: u64 = 0x20;
+const EC_PC_ALIGN: u64 = 0x22;
+const EC_DABT_LOW: u64 = 0x24;
+const EC_SP_ALIGN: u64 = 0x26;
+const EC_BRK64: u64 = 0x3c;
+/// 第 3 级转换错误（页没有映射）。
+const FSC_TRANSLATION: u64 = 0x07;
+/// 第 3 级权限错误。
+const FSC_PERMISSION: u64 = 0x0f;
+
+/// 处理一次 guest 退出。
+fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
+    if cx.task.killed.get() {
+        return Flow::Exit;
+    }
+    let pc = cpu.state().pc;
+    let (sig, info) = match exit {
+        Exit::Svc { .. } => return syscall::dispatch(cx, cpu),
+        Exit::Kick => return signal::deliver(cx, cpu, false),
+        Exit::Undefined { insn } => {
+            crate::debug::log(format_args!(
+                "undefined instruction {insn:#010x} at {pc:#x}"
+            ));
+            (Signal::ILL, SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL))
+        }
+        Exit::Breakpoint { imm } => (
+            Signal::TRAP,
+            SigInfo::fault(code::TRAP_BRKPT, pc, EC_BRK64 << 26 | ESR_IL | imm as u64),
+        ),
+        Exit::Fault {
+            addr,
+            access,
+            kind: FaultKind::Page,
+        } => {
+            let mapped = cx.mm().is_mapped(addr);
+            let (ec, wnr) = match access {
+                Access::Exec => (EC_IABT_LOW, 0),
+                Access::Read => (EC_DABT_LOW, 0),
+                Access::Write => (EC_DABT_LOW, ESR_WNR),
+            };
+            let (code, fsc) = if mapped {
+                (code::SEGV_ACCERR, FSC_PERMISSION)
+            } else {
+                (code::SEGV_MAPERR, FSC_TRANSLATION)
+            };
+            let esr = ec << 26 | ESR_IL | wnr | fsc;
+            (Signal::SEGV, SigInfo::fault(code, addr, esr))
+        }
+        Exit::Fault {
+            addr,
+            access,
+            kind: FaultKind::Alignment,
+        } => {
+            let ec = if access == Access::Exec {
+                EC_PC_ALIGN
+            } else {
+                EC_SP_ALIGN
+            };
+            let info = SigInfo::fault(code::BUS_ADRALN, addr, ec << 26 | ESR_IL);
+            (Signal::BUS, info)
+        }
+    };
+    signal::force(cx, sig, info);
+    signal::deliver(cx, cpu, false)
+}
+
+/// 线程离开它的地址空间（退出、execve）：清零 `clear_child_tid` 并唤醒等它的线程
+/// （pthread_join），让 vfork 的父进程继续，从使用者里注销。
+pub(crate) fn release_mm(k: &mut Kernel, task: &Task, st: &mut TaskState) {
+    let addr = std::mem::take(&mut st.clear_child_tid);
+    {
+        let mm = st.mm.borrow();
+        // 与 Linux 的 mm_release 一样，地址空间没有别人在用时不必通知
+        if addr != 0
+            && mm.shared_with_others()
+            && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
+            && let Some(host) = mm.mmu().translate(addr, 0)
+        {
+            k.futexes.wake(host.as_ptr() as usize, 1, u32::MAX);
+        }
+    }
+    if let Some(done) = st.vfork_done.take() {
+        done.set(true);
+        request_wake();
+    }
+    st.mm.borrow_mut().remove_user(&task.sync);
+}
+
+/// 线程退出：释放它的资源；它是线程组的最后一个线程时结束整个进程。
+fn exit(shared: &Arc<Shared>, task: Rc<Task>, stats: Option<DbtStats>) {
+    let mut k = shared.lock();
+    if let Some(s) = stats {
+        let total = k.dbt_stats.get_or_insert_with(DbtStats::default);
+        add_stats(total, &s);
+    }
+    let tid = task.tid.get();
+    let group = {
+        let mut st = task.state.borrow_mut();
+        release_mm(&mut k, &task, &mut st);
+        st.group.clone()
+    };
+    k.tasks.remove(&tid);
+    let last = {
+        let mut g = group.borrow_mut();
+        g.threads.retain(|&t| t != tid);
+        g.threads.is_empty()
+    };
+    if last {
+        crate::process::finish_group(&mut k, &group);
+    }
+    // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……
+    drop(group);
+    drop(task);
+    request_wake();
+}
+
+fn add_stats(total: &mut DbtStats, s: &DbtStats) {
+    total.blocks += s.blocks;
+    total.insns += s.insns;
+    total.insns_copied += s.insns_copied;
+    total.insns_remapped += s.insns_remapped;
+    total.insns_memory += s.insns_memory;
+    total.insns_fallback += s.insns_fallback;
+    total.exits_chain += s.exits_chain;
+    total.exits_lookup += s.exits_lookup;
+    total.exits_interp += s.exits_interp;
+    total.exits_svc += s.exits_svc;
+    total.exits_kick += s.exits_kick;
+    total.flushes += s.flushes;
+}

@@ -35,6 +35,8 @@ impl Errno {
     pub const EACCES: Errno = Errno(13);
     /// guest 地址无效。
     pub const EFAULT: Errno = Errno(14);
+    /// 设备或资源忙。
+    pub const EBUSY: Errno = Errno(16);
     /// 文件已存在。
     pub const EEXIST: Errno = Errno(17);
     /// 跨文件系统。
@@ -51,10 +53,14 @@ impl Errno {
     pub const EMFILE: Errno = Errno(24);
     /// 不是终端。
     pub const ENOTTY: Errno = Errno(25);
+    /// 设备没有空间。
+    pub const ENOSPC: Errno = Errno(28);
     /// 不能 seek。
     pub const ESPIPE: Errno = Errno(29);
     /// 只读文件系统。
     pub const EROFS: Errno = Errno(30);
+    /// 管道的读端已全部关闭。
+    pub const EPIPE: Errno = Errno(32);
     /// 结果超出范围。
     pub const ERANGE: Errno = Errno(34);
     /// 名字太长。
@@ -69,6 +75,18 @@ impl Errno {
     pub const EOVERFLOW: Errno = Errno(75);
     /// 不支持的操作。
     pub const EOPNOTSUPP: Errno = Errno(95);
+    /// 超时。
+    pub const ETIMEDOUT: Errno = Errno(110);
+
+    // 以下是内核内部使用的 syscall 重启码（设计文档 §7.3），返回用户态之前一定会被
+    // 换成重新执行 syscall 或者 EINTR，guest 永远看不到它们。
+
+    /// 被信号打断：处理函数带 `SA_RESTART` 时重新执行，否则返回 EINTR。
+    pub const ERESTARTSYS: Errno = Errno(512);
+    /// 被信号打断：总是重新执行。
+    pub const ERESTARTNOINTR: Errno = Errno(513);
+    /// 被信号打断：有处理函数时返回 EINTR，否则重新执行。
+    pub const ERESTARTNOHAND: Errno = Errno(514);
 
     /// syscall 返回给 guest 的值：`-errno`。
     pub fn to_syscall_return(self) -> u64 {

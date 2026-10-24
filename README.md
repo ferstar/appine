@@ -27,6 +27,9 @@ scripts/dev sh -c 'cc -nostdlib -static -no-pie -o /tmp/hello tests/guest/hello.
                    cargo run -q -p appine-run -- --tier 1 /tmp/hello'
 ```
 
+The C guest programs in `tests/guest` are built with `musl-gcc` from musl-tools, which the
+`scripts/dev` container provides; the tests that need it are skipped when it is missing.
+
 To run busybox from the Alpine minirootfs (the rootfs tests in `cargo test` need the
 tarball too, and are skipped without it):
 
@@ -34,7 +37,8 @@ tarball too, and are skipped without it):
 scripts/fetch-rootfs                   # downloads and verifies target/rootfs/alpine-minirootfs-*.tar.gz
 scripts/dev sh -c 'cargo build -q -p appine-run && run=target/linux-arm64/debug/appine-run &&
                    $run --rootfs target/store --import target/rootfs/alpine-minirootfs-*.tar.gz &&
-                   $run --rootfs target/store /bin/busybox ls -l /'
+                   $run --rootfs target/store /bin/busybox ls -l / &&
+                   $run --rootfs target/store --env PATH=/bin:/usr/bin /bin/sh -c "ls / | wc -l"'
 ```
 
 ## License

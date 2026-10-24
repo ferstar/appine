@@ -1,16 +1,23 @@
 //! appine 内核层：在进程内实现 Linux 用户态 ABI（设计文档 §3、§6–§8）。
 //!
-//! M1b：单进程、单线程；加载静态或经由 `ld-musl` 动态链接的程序，根文件系统是
-//! inode 仓库，提供文件、内存、时间等基础 syscall。
+//! M3a：多进程、多线程。每个 guest 线程对应一个宿主线程，内核层由一把大内核锁
+//! 保护；支持 fork/vfork/线程、execve、wait、管道、完整的信号投递和 vDSO。根文件
+//! 系统是 inode 仓库。
 
 mod debug;
 pub mod errno;
 mod fd;
+mod futex;
+mod kernel;
 mod loader;
 mod mm;
+mod pipe;
 mod process;
+mod signal;
 mod syscall;
+mod task;
 mod uaccess;
+mod vdso;
 pub mod vfs;
 
 pub use appine_engine::DbtStats;
@@ -30,5 +37,7 @@ pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno
     let file = std::fs::File::open(tarball)
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
     let store = Store::create(store)?;
-    vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))
+    let report = vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))?;
+    vfs::dev::ensure_dev_nodes(&store)?;
+    Ok(report)
 }

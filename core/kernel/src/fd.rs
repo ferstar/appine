@@ -1,13 +1,16 @@
 //! 打开文件与 fd 表。
 //!
 //! 一个打开文件（Linux 的 `struct file`）记录文件位置和状态标志，可以被多个
-//! fd 共享（dup、将来的 fork）；close-on-exec 标志属于 fd 本身。
+//! fd 共享（dup、fork）；close-on-exec 标志属于 fd 本身。打开文件和 fd 表都
+//! 只在持有 BKL 时访问（[`crate::kernel`]）。
 
 use std::cell::RefCell;
 use std::fs::File;
 use std::rc::Rc;
 
 use crate::errno::Errno;
+use crate::pipe::PipeEnd;
+use crate::vfs::dev::Device;
 use crate::vfs::store::{DirEntry, Ino};
 
 /// 每个进程最多打开的 fd 数，与 Linux 默认的 `RLIMIT_NOFILE` 软限制相同。
@@ -65,6 +68,15 @@ pub enum FileKind {
     },
     /// `O_PATH` 打开的文件：只能作为 `*at` 的起点或 fstat 的对象。
     Path(Ino),
+    /// 管道的一端。
+    Pipe(PipeEnd),
+    /// 字符设备（`/dev/null` 等），`ino` 是仓库里的设备节点。
+    Device {
+        /// inode。
+        ino: Ino,
+        /// 设备。
+        dev: Device,
+    },
 }
 
 /// 一个打开文件。
@@ -97,14 +109,20 @@ impl OpenFile {
         self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_RDONLY
     }
 
-    /// 对应的 inode（宿主 fd 没有）。
+    /// 对应的 inode（宿主 fd 和管道没有）。
     pub fn ino(&self) -> Option<Ino> {
         match &self.kind {
-            FileKind::Host(_) => None,
+            FileKind::Host(_) | FileKind::Pipe(_) => None,
             FileKind::Regular { ino, .. }
             | FileKind::Directory { ino, .. }
-            | FileKind::Path(ino) => Some(*ino),
+            | FileKind::Path(ino)
+            | FileKind::Device { ino, .. } => Some(*ino),
         }
+    }
+
+    /// 是否以非阻塞方式打开。
+    pub fn nonblocking(&self) -> bool {
+        self.flags & oflags::O_NONBLOCK != 0
     }
 }
 
@@ -185,6 +203,26 @@ impl FdTable {
             .and_then(|i| self.slots.get_mut(i))
             .ok_or(Errno::EBADF)?;
         slot.take().map(|_| ()).ok_or(Errno::EBADF)
+    }
+
+    /// execve：关闭所有带 close-on-exec 标志的 fd。
+    pub fn close_on_exec(&mut self) {
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|s| s.cloexec) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// close_range(2)：关闭（或只标记 close-on-exec）`[first, last]` 里的 fd。
+    pub fn close_range(&mut self, first: usize, last: usize, cloexec_only: bool) {
+        let end = last.saturating_add(1).min(self.slots.len());
+        for slot in self.slots.iter_mut().take(end).skip(first) {
+            match slot {
+                Some(s) if cloexec_only => s.cloexec = true,
+                _ => *slot = None,
+            }
+        }
     }
 
     /// 读取 close-on-exec 标志。
