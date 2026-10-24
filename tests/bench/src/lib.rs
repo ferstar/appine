@@ -101,3 +101,89 @@ pub fn build(program: &Program, out_dir: &Path) -> Result<PathBuf, String> {
     }
     Ok(out)
 }
+
+/// 宿主 CPU 的简要描述，读自 `/proc/cpuinfo`，按核心型号分组计数，例如
+/// `ARM 0xd49 Neoverse-N2 x4`。大小核混合时依次列出每种核心。
+pub fn host_cpu() -> String {
+    let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return "unknown".into();
+    };
+    let hex = |v: &str| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+    let mut cores: Vec<(String, usize)> = Vec::new();
+    for block in info.split("\n\n") {
+        let field = |name: &str| {
+            block.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                (k.trim() == name).then_some(v)
+            })
+        };
+        let (Some(implementer), Some(part)) = (
+            field("CPU implementer").and_then(hex),
+            field("CPU part").and_then(hex),
+        ) else {
+            continue;
+        };
+        let mut label = format!("{} {part:#05x}", vendor_name(implementer));
+        if let Some(name) = (implementer == 0x41).then(|| arm_part_name(part)).flatten() {
+            label = format!("{label} {name}");
+        }
+        match cores.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, n)) => *n += 1,
+            None => cores.push((label, 1)),
+        }
+    }
+    if cores.is_empty() {
+        return "unknown".into();
+    }
+    cores
+        .iter()
+        .map(|(label, n)| format!("{label} x{n}"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn vendor_name(implementer: u32) -> String {
+    match implementer {
+        0x41 => "ARM".into(),
+        0x46 => "Fujitsu".into(),
+        0x48 => "HiSilicon".into(),
+        0x4e => "NVIDIA".into(),
+        0x51 => "Qualcomm".into(),
+        0x61 => "Apple".into(),
+        0xc0 => "Ampere".into(),
+        other => format!("implementer {other:#04x}"),
+    }
+}
+
+/// Arm 公版核心的 MIDR part 编号。表里没有的只显示编号。
+fn arm_part_name(part: u32) -> Option<&'static str> {
+    Some(match part {
+        0xd03 => "Cortex-A53",
+        0xd04 => "Cortex-A35",
+        0xd05 => "Cortex-A55",
+        0xd07 => "Cortex-A57",
+        0xd08 => "Cortex-A72",
+        0xd09 => "Cortex-A73",
+        0xd0a => "Cortex-A75",
+        0xd0b => "Cortex-A76",
+        0xd0c => "Neoverse-N1",
+        0xd0d => "Cortex-A77",
+        0xd40 => "Neoverse-V1",
+        0xd41 => "Cortex-A78",
+        0xd44 => "Cortex-X1",
+        0xd46 => "Cortex-A510",
+        0xd47 => "Cortex-A710",
+        0xd48 => "Cortex-X2",
+        0xd49 => "Neoverse-N2",
+        0xd4d => "Cortex-A715",
+        0xd4e => "Cortex-X3",
+        0xd4f => "Neoverse-V2",
+        0xd80 => "Cortex-A520",
+        0xd81 => "Cortex-A720",
+        0xd82 => "Cortex-X4",
+        0xd84 => "Neoverse-V3",
+        0xd85 => "Cortex-X925",
+        0xd87 => "Cortex-A725",
+        _ => return None,
+    })
+}

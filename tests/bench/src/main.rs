@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-use appine_bench::{PROGRAMS, Program, build};
+use appine_bench::{PROGRAMS, Program, build, host_cpu};
 
 const USAGE: &str =
     "usage: appine-bench [--runs N] [--quick] [--skip-tier0] [--only NAME] [--stats]";
@@ -170,6 +170,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    println!("host: {}", host_cpu());
     println!(
         "{:<8} {:<38} {:>9} {:>18} {:>16}",
         "program", "workload", "native", "tier 0", "tier 1"
