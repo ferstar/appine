@@ -1,0 +1,726 @@
+//! System V IPC 的 syscall：msgget 系列、semget 系列、shmget 系列（对象见 [`crate::ipc`]）。
+//!
+//! 结构体按 asm-generic 的 64 位布局（`msqid64_ds` 等）。musl 在 cmd 里带上 `IPC_64`，
+//! 与 Linux 一样直接去掉。等待（msgsnd 时队列满、msgrcv 没有消息、semop 不能立即完成）
+//! 走统一的等待机制：每次修改都请求唤醒，等待者重新检查；等待期间对象被删除时返回
+//! EIDRM。
+
+use appine_engine::{PAGE_SIZE, prot};
+
+use super::{SysResult, get, put, read_timespec};
+use crate::cred::{Cred, cap};
+use crate::errno::Errno;
+use crate::ipc::{
+    IPC_NOWAIT, Ipc, Msg, MsgQueue, Perm, SHM_DEST, SHM_LOCKED, SemOp, SemSet, ShmSeg, limits,
+    nattch, now, reap_shm,
+};
+use crate::kernel::{Cx, Kernel};
+use crate::mm::SharedMemory;
+use crate::uaccess::UserSlice;
+
+const IPC_RMID: i32 = 0;
+const IPC_SET: i32 = 1;
+const IPC_STAT: i32 = 2;
+const IPC_INFO: i32 = 3;
+const IPC_64: i32 = 0x100;
+
+const MSG_STAT: i32 = 11;
+const MSG_INFO: i32 = 12;
+const MSG_STAT_ANY: i32 = 13;
+const MSG_NOERROR: i32 = 0o10000;
+const MSG_EXCEPT: i32 = 0o20000;
+const MSG_COPY: i32 = 0o40000;
+
+const GETPID: i32 = 11;
+const GETVAL: i32 = 12;
+const GETALL: i32 = 13;
+const GETNCNT: i32 = 14;
+const GETZCNT: i32 = 15;
+const SETVAL: i32 = 16;
+const SETALL: i32 = 17;
+const SEM_STAT: i32 = 18;
+const SEM_INFO: i32 = 19;
+const SEM_STAT_ANY: i32 = 20;
+
+const SHM_LOCK: i32 = 11;
+const SHM_UNLOCK: i32 = 12;
+const SHM_STAT: i32 = 13;
+const SHM_INFO: i32 = 14;
+const SHM_STAT_ANY: i32 = 15;
+const SHM_RDONLY: i32 = 0o10000;
+const SHM_RND: i32 = 0o20000;
+const SHM_REMAP: i32 = 0o40000;
+const SHM_EXEC: i32 = 0o100000;
+
+/// 读、写权限（`S_IRUGO`、`S_IWUGO`）。
+const READ: u32 = 0o444;
+const WRITE: u32 = 0o222;
+
+/// 一串整数按小端拼起来（编码 `*_ds`、`*info`）。
+fn words(out: &mut [u8], at: usize, values: &[u64], width: usize) {
+    for (i, v) in values.iter().enumerate() {
+        let off = at + i * width;
+        out[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
+    }
+}
+
+/// `*_STAT` 和 `IPC_STAT`：按下标或者 id 找对象，`any` 时不检查读权限。返回 id。
+fn stat_target<'t, T>(
+    table: &'t crate::ipc::Table<T>,
+    cred: &Cred,
+    id: i32,
+    by_index: bool,
+    any: bool,
+) -> Result<(i32, &'t (Perm, T)), Errno> {
+    let (id, entry) = if by_index {
+        table.by_index(id)?
+    } else {
+        (id, table.get(id)?)
+    };
+    if !any {
+        entry.0.check(cred, READ)?;
+    }
+    Ok((id, entry))
+}
+
+// ---- 消息队列 ----
+
+pub(super) fn msgget(cx: &mut Cx<'_>, key: i32, flags: i32) -> SysResult {
+    let cred = cx.cred();
+    let ipc = &mut cx.k().ipc;
+    let t = ipc.tunables;
+    ipc.msg
+        .get_or_create(
+            key,
+            flags,
+            &cred,
+            t.msgmni,
+            |_| Ok(()),
+            || Ok(MsgQueue::new(t.msgmnb)),
+        )
+        .map(|id| id as u64)
+}
+
+pub(super) fn msgsnd(cx: &mut Cx<'_>, id: i32, msgp: u64, size: u64, flags: i32) -> SysResult {
+    let msgmax = cx.kr().ipc.tunables.msgmax;
+    let len = usize::try_from(size as i64)
+        .ok()
+        .filter(|&n| n as u64 <= msgmax && id >= 0)
+        .ok_or(Errno::EINVAL)?;
+    let mtype = i64::from_le_bytes(get(cx, msgp)?);
+    if mtype < 1 {
+        return Err(Errno::EINVAL);
+    }
+    let mut text = vec![0u8; len];
+    cx.mm().read(UserSlice::new(msgp + 8, len), &mut text)?;
+    let cred = cx.cred();
+    let tgid = cx.tgid();
+    let mut waited = false;
+    loop {
+        let (perm, q) = match cx.k().ipc.msg.get_mut(id) {
+            Ok(e) => e,
+            Err(_) if waited => return Err(Errno::EIDRM),
+            Err(e) => return Err(e),
+        };
+        perm.check(&cred, WRITE)?;
+        if q.fits(len) {
+            q.cbytes += len as u64;
+            q.msgs.push_back(Msg { mtype, text });
+            q.lspid = tgid;
+            q.stime = now();
+            crate::kernel::request_wake();
+            return Ok(0);
+        }
+        if flags & IPC_NOWAIT != 0 {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTNOHAND);
+        }
+        waited = true;
+        cx.wait(None, &mut [])?;
+    }
+}
+
+pub(super) fn msgrcv(
+    cx: &mut Cx<'_>,
+    id: i32,
+    msgp: u64,
+    size: u64,
+    mtype: i64,
+    flags: i32,
+) -> SysResult {
+    let max = usize::try_from(size as i64)
+        .ok()
+        .filter(|_| id >= 0)
+        .ok_or(Errno::EINVAL)?;
+    // MSG_COPY 要求 CONFIG_CHECKPOINT_RESTORE
+    if flags & MSG_COPY != 0 {
+        return Err(Errno::ENOSYS);
+    }
+    let cred = cx.cred();
+    let tgid = cx.tgid();
+    let mut waited = false;
+    let msg = loop {
+        let (perm, q) = match cx.k().ipc.msg.get_mut(id) {
+            Ok(e) => e,
+            Err(_) if waited => return Err(Errno::EIDRM),
+            Err(e) => return Err(e),
+        };
+        perm.check(&cred, READ)?;
+        if let Some(i) = q.select(mtype, flags & MSG_EXCEPT != 0) {
+            if q.msgs[i].text.len() > max && flags & MSG_NOERROR == 0 {
+                return Err(Errno::E2BIG);
+            }
+            let m = q.msgs.remove(i).unwrap();
+            q.cbytes -= m.text.len() as u64;
+            q.lrpid = tgid;
+            q.rtime = now();
+            crate::kernel::request_wake();
+            break m;
+        }
+        if flags & IPC_NOWAIT != 0 {
+            return Err(Errno::ENOMSG);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTNOHAND);
+        }
+        waited = true;
+        cx.wait(None, &mut [])?;
+    };
+    let n = msg.text.len().min(max);
+    put(cx, msgp, msg.mtype.to_le_bytes())?;
+    cx.mm().write(UserSlice::new(msgp + 8, n), &msg.text[..n])?;
+    Ok(n as u64)
+}
+
+/// `struct msqid64_ds`（120 字节）。
+fn encode_msqid(perm: &Perm, q: &MsgQueue) -> [u8; 120] {
+    let mut b = [0u8; 120];
+    b[..48].copy_from_slice(&perm.encode());
+    words(
+        &mut b,
+        48,
+        &[
+            q.stime as u64,
+            q.rtime as u64,
+            q.ctime as u64,
+            q.cbytes,
+            q.msgs.len() as u64,
+            q.qbytes,
+        ],
+        8,
+    );
+    words(&mut b, 96, &[q.lspid as u64, q.lrpid as u64], 4);
+    b
+}
+
+pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult {
+    let cmd = cmd & !IPC_64;
+    let cred = cx.cred();
+    match cmd {
+        IPC_INFO | MSG_INFO => {
+            let tun = cx.kr().ipc.tunables;
+            let t = &cx.kr().ipc.msg;
+            let (pool, map, tql) = if cmd == IPC_INFO {
+                (tun.msgmni * tun.msgmnb / 1024, tun.msgmnb, tun.msgmnb)
+            } else {
+                let msgs = t.iter().map(|(_, _, q)| q.msgs.len() as u64).sum();
+                let bytes = t.iter().map(|(_, _, q)| q.cbytes).sum();
+                (t.len() as u64, msgs, bytes)
+            };
+            // struct msginfo：7 个 int 和一个 unsigned short
+            let mut b = [0u8; 32];
+            words(
+                &mut b,
+                0,
+                &[pool, map, tun.msgmax, tun.msgmnb, tun.msgmni, 16, tql],
+                4,
+            );
+            b[28..30].copy_from_slice(&0xffffu16.to_le_bytes());
+            let max = t.max_index();
+            put(cx, buf, b)?;
+            Ok(max as u64)
+        }
+        IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
+            let t = &cx.kr().ipc.msg;
+            let (full, (perm, q)) =
+                stat_target(t, &cred, id, cmd != IPC_STAT, cmd == MSG_STAT_ANY)?;
+            let b = encode_msqid(perm, q);
+            put(cx, buf, b)?;
+            Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
+        }
+        IPC_SET => {
+            let b: [u8; 120] = get(cx, buf)?;
+            let qbytes = u64::from_le_bytes(b[88..96].try_into().unwrap());
+            let msgmnb = cx.kr().ipc.tunables.msgmnb;
+            let (perm, q) = cx.k().ipc.msg.get_mut(id)?;
+            perm.may_change(&cred)?;
+            if qbytes > msgmnb && !cred.capable(cap::SYS_RESOURCE) {
+                return Err(Errno::EPERM);
+            }
+            perm.set(&b[..48]);
+            q.qbytes = qbytes;
+            q.ctime = now();
+            crate::kernel::request_wake();
+            Ok(0)
+        }
+        IPC_RMID => {
+            let t = &mut cx.k().ipc.msg;
+            t.get(id)?.0.may_change(&cred)?;
+            t.remove(id);
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+// ---- 信号量 ----
+
+pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysResult {
+    let [semmsl, _, _, semmni] = cx.kr().ipc.tunables.sem;
+    let n = usize::try_from(nsems)
+        .ok()
+        .filter(|&n| n as u64 <= semmsl)
+        .ok_or(Errno::EINVAL)?;
+    let cred = cx.cred();
+    cx.k()
+        .ipc
+        .sem
+        .get_or_create(
+            key,
+            flags,
+            &cred,
+            semmni,
+            |s| {
+                if n > s.vals.len() {
+                    Err(Errno::EINVAL)
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                if n == 0 {
+                    Err(Errno::EINVAL)
+                } else {
+                    Ok(SemSet::new(n))
+                }
+            },
+        )
+        .map(|id| id as u64)
+}
+
+/// `struct semid64_ds`（88 字节）。
+fn encode_semid(perm: &Perm, s: &SemSet) -> [u8; 88] {
+    let mut b = [0u8; 88];
+    b[..48].copy_from_slice(&perm.encode());
+    words(
+        &mut b,
+        48,
+        &[s.otime as u64, s.ctime as u64, s.vals.len() as u64],
+        8,
+    );
+    b
+}
+
+pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> SysResult {
+    let cmd = cmd & !IPC_64;
+    let cred = cx.cred();
+    let tgid = cx.tgid();
+    match cmd {
+        IPC_INFO | SEM_INFO => {
+            let [semmsl, semmns, semopm, semmni] = cx.kr().ipc.tunables.sem;
+            let t = &cx.kr().ipc.sem;
+            let (usz, aem) = if cmd == IPC_INFO {
+                (20, limits::SEMAEM as u64)
+            } else {
+                let sems = t.iter().map(|(_, _, s)| s.vals.len() as u64).sum();
+                (t.len() as u64, sems)
+            };
+            // struct seminfo：10 个 int
+            let mut b = [0u8; 40];
+            words(
+                &mut b,
+                0,
+                &[
+                    semmns,
+                    semmni,
+                    semmns,
+                    semmns,
+                    semmsl,
+                    semopm,
+                    semopm,
+                    usz,
+                    limits::SEMVMX as u64,
+                    aem,
+                ],
+                4,
+            );
+            let max = t.max_index();
+            put(cx, arg, b)?;
+            Ok(max as u64)
+        }
+        IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
+            let t = &cx.kr().ipc.sem;
+            let (full, (perm, s)) =
+                stat_target(t, &cred, id, cmd != IPC_STAT, cmd == SEM_STAT_ANY)?;
+            let b = encode_semid(perm, s);
+            put(cx, arg, b)?;
+            Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
+        }
+        IPC_SET => {
+            let b: [u8; 88] = get(cx, arg)?;
+            let (perm, s) = cx.k().ipc.sem.get_mut(id)?;
+            perm.may_change(&cred)?;
+            perm.set(&b[..48]);
+            s.ctime = now();
+            Ok(0)
+        }
+        IPC_RMID => {
+            let ipc = &mut cx.k().ipc;
+            ipc.sem.get(id)?.0.may_change(&cred)?;
+            ipc.remove_sem(id);
+            Ok(0)
+        }
+        GETVAL | GETPID | GETNCNT | GETZCNT => {
+            let (perm, s) = cx.kr().ipc.sem.get(id)?;
+            perm.check(&cred, READ)?;
+            let i = usize::try_from(num)
+                .ok()
+                .filter(|&i| i < s.vals.len())
+                .ok_or(Errno::EINVAL)?;
+            Ok(match cmd {
+                GETVAL => s.vals[i] as u64,
+                GETPID => s.pids[i] as u64,
+                GETNCNT => s.ncnt[i] as u64,
+                _ => s.zcnt[i] as u64,
+            })
+        }
+        GETALL => {
+            let (perm, s) = cx.kr().ipc.sem.get(id)?;
+            perm.check(&cred, READ)?;
+            let b: Vec<u8> = s
+                .vals
+                .iter()
+                .flat_map(|&v| (v as u16).to_le_bytes())
+                .collect();
+            cx.mm().write(UserSlice::new(arg, b.len()), &b)?;
+            Ok(0)
+        }
+        SETVAL => {
+            let val = arg as i32;
+            if !(0..=limits::SEMVMX).contains(&val) {
+                return Err(Errno::ERANGE);
+            }
+            let ipc = &mut cx.k().ipc;
+            let (perm, s) = ipc.sem.get_mut(id)?;
+            let i = usize::try_from(num)
+                .ok()
+                .filter(|&i| i < s.vals.len())
+                .ok_or(Errno::EINVAL)?;
+            perm.check(&cred, WRITE)?;
+            s.vals[i] = val;
+            s.pids[i] = tgid;
+            s.ctime = now();
+            ipc.clear_undo(id, Some(i));
+            crate::kernel::request_wake();
+            Ok(0)
+        }
+        SETALL => {
+            let n = {
+                let (perm, s) = cx.kr().ipc.sem.get(id)?;
+                perm.check(&cred, WRITE)?;
+                s.vals.len()
+            };
+            let mut b = vec![0u8; n * 2];
+            cx.mm().read(UserSlice::new(arg, b.len()), &mut b)?;
+            let vals: Vec<i32> = b
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]) as i32)
+                .collect();
+            if vals.iter().any(|&v| v > limits::SEMVMX) {
+                return Err(Errno::ERANGE);
+            }
+            let ipc = &mut cx.k().ipc;
+            let s = &mut ipc.sem.get_mut(id)?.1;
+            s.vals = vals;
+            s.pids.fill(tgid);
+            s.ctime = now();
+            ipc.clear_undo(id, None);
+            crate::kernel::request_wake();
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+pub(super) fn semtimedop(
+    cx: &mut Cx<'_>,
+    id: i32,
+    sops: u64,
+    nsops: u64,
+    timeout: u64,
+) -> SysResult {
+    if nsops < 1 || id < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let n = nsops as usize;
+    if n as u64 > cx.kr().ipc.tunables.sem[2] {
+        return Err(Errno::E2BIG);
+    }
+    let mut raw = vec![0u8; n * 6];
+    cx.mm().read(UserSlice::new(sops, raw.len()), &mut raw)?;
+    let ops: Vec<SemOp> = raw
+        .chunks(6)
+        .map(|c| SemOp {
+            num: u16::from_le_bytes([c[0], c[1]]),
+            op: i16::from_le_bytes([c[2], c[3]]),
+            flg: i16::from_le_bytes([c[4], c[5]]),
+        })
+        .collect();
+    let deadline = if timeout != 0 {
+        Some(std::time::Instant::now() + read_timespec(cx, timeout)?)
+    } else {
+        None
+    };
+    let cred = cx.cred();
+    let tgid = cx.tgid();
+    let alter = ops.iter().any(|o| o.op != 0);
+    let mut waited = false;
+    loop {
+        let Ipc { sem, undo, .. } = &mut cx.k().ipc;
+        let (perm, set) = match sem.get_mut(id) {
+            Ok(e) => e,
+            Err(_) if waited => return Err(Errno::EIDRM),
+            Err(e) => return Err(e),
+        };
+        if ops.iter().any(|o| o.num as usize >= set.vals.len()) {
+            return Err(Errno::EFBIG);
+        }
+        perm.check(&cred, if alter { WRITE } else { READ })?;
+        let adj = undo.entry((tgid, id)).or_default();
+        let blocked = set.apply(&ops, adj, tgid)?;
+        if adj.iter().all(|&a| a == 0) {
+            undo.remove(&(tgid, id));
+        }
+        let Some(i) = blocked else {
+            return Ok(0);
+        };
+        if ops[i].flg & IPC_NOWAIT as i16 != 0
+            || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            // semop 不会被 SA_RESTART 重启
+            return Err(Errno::EINTR);
+        }
+        // 等待期间计入 semncnt 或者 semzcnt
+        let (num, zero) = (ops[i].num as usize, ops[i].op == 0);
+        let count = |k: &mut Kernel, d: i32| {
+            if let Ok((_, s)) = k.ipc.sem.get_mut(id) {
+                let c = if zero {
+                    &mut s.zcnt[num]
+                } else {
+                    &mut s.ncnt[num]
+                };
+                *c = c.saturating_add_signed(d);
+            }
+        };
+        count(cx.k(), 1);
+        waited = true;
+        let r = cx.wait(deadline, &mut []);
+        count(cx.k(), -1);
+        r?;
+    }
+}
+
+// ---- 共享内存 ----
+
+pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysResult {
+    let cred = cx.cred();
+    let tgid = cx.tgid();
+    let k = cx.k();
+    reap_shm(k);
+    let t = k.ipc.tunables;
+    k.ipc
+        .shm
+        .get_or_create(
+            key,
+            flags,
+            &cred,
+            t.shmmni,
+            |s| {
+                if size > s.size {
+                    Err(Errno::EINVAL)
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                if !(limits::SHMMIN..=t.shmmax).contains(&size) {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(ShmSeg {
+                    mem: SharedMemory::new(size)?,
+                    size,
+                    atime: 0,
+                    dtime: 0,
+                    ctime: now(),
+                    cpid: tgid,
+                    lpid: 0,
+                })
+            },
+        )
+        .map(|id| id as u64)
+}
+
+pub(super) fn shmat(cx: &mut Cx<'_>, id: i32, addr: u64, flags: i32) -> SysResult {
+    let mut addr = addr;
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        if flags & SHM_RND == 0 {
+            return Err(Errno::EINVAL);
+        }
+        addr &= !(PAGE_SIZE - 1);
+        if addr == 0 && flags & SHM_REMAP != 0 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if addr == 0 && flags & SHM_REMAP != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (mut want, mut prot) = if flags & SHM_RDONLY != 0 {
+        (READ, prot::READ)
+    } else {
+        (READ | WRITE, prot::READ | prot::WRITE)
+    };
+    if flags & SHM_EXEC != 0 {
+        want |= 0o111;
+        prot |= prot::EXEC;
+    }
+    let cred = cx.cred();
+    let mem = {
+        let (perm, seg) = cx.kr().ipc.shm.get(id)?;
+        perm.check(&cred, want)?;
+        seg.mem.clone()
+    };
+    let at = cx.mm_mut().attach_shm(
+        (addr != 0).then_some(addr),
+        &mem,
+        prot,
+        flags & SHM_REMAP != 0,
+        id,
+    )?;
+    let tgid = cx.tgid();
+    if let Ok((_, seg)) = cx.k().ipc.shm.get_mut(id) {
+        seg.atime = now();
+        seg.lpid = tgid;
+    }
+    Ok(at)
+}
+
+pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(Errno::EINVAL);
+    }
+    let id = cx.mm_mut().detach_shm(addr)?;
+    let tgid = cx.tgid();
+    let k = cx.k();
+    if let Ok((_, seg)) = k.ipc.shm.get_mut(id) {
+        seg.dtime = now();
+        seg.lpid = tgid;
+    }
+    reap_shm(k);
+    Ok(0)
+}
+
+/// `struct shmid64_ds`（112 字节）。
+fn encode_shmid(perm: &Perm, s: &ShmSeg, nattch: u64) -> [u8; 112] {
+    let mut b = [0u8; 112];
+    b[..48].copy_from_slice(&perm.encode());
+    words(
+        &mut b,
+        48,
+        &[s.size, s.atime as u64, s.dtime as u64, s.ctime as u64],
+        8,
+    );
+    words(&mut b, 80, &[s.cpid as u64, s.lpid as u64], 4);
+    words(&mut b, 88, &[nattch], 8);
+    b
+}
+
+pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult {
+    let cmd = cmd & !IPC_64;
+    let cred = cx.cred();
+    reap_shm(cx.k());
+    match cmd {
+        IPC_INFO => {
+            // struct shminfo64：9 个 unsigned long
+            let t = cx.kr().ipc.tunables;
+            let mut b = [0u8; 72];
+            words(
+                &mut b,
+                0,
+                &[t.shmmax, limits::SHMMIN, t.shmmni, t.shmmni, t.shmall],
+                8,
+            );
+            let max = cx.kr().ipc.shm.max_index();
+            put(cx, buf, b)?;
+            Ok(max as u64)
+        }
+        SHM_INFO => {
+            let t = &cx.kr().ipc.shm;
+            let pages: u64 = t.iter().map(|(_, _, s)| s.mem.len() / PAGE_SIZE).sum();
+            // struct shm_info：used_ids，然后 shm_tot、shm_rss、shm_swp 等（unsigned long）
+            let mut b = [0u8; 48];
+            words(&mut b, 0, &[t.len() as u64], 4);
+            words(&mut b, 8, &[pages, pages], 8);
+            let max = t.max_index();
+            put(cx, buf, b)?;
+            Ok(max as u64)
+        }
+        IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
+            let k = cx.kr();
+            let (full, (perm, s)) =
+                stat_target(&k.ipc.shm, &cred, id, cmd != IPC_STAT, cmd == SHM_STAT_ANY)?;
+            let b = encode_shmid(perm, s, nattch(k, full));
+            put(cx, buf, b)?;
+            Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
+        }
+        IPC_SET => {
+            let b: [u8; 112] = get(cx, buf)?;
+            let (perm, s) = cx.k().ipc.shm.get_mut(id)?;
+            perm.may_change(&cred)?;
+            perm.set(&b[..48]);
+            s.ctime = now();
+            Ok(0)
+        }
+        IPC_RMID => {
+            let k = cx.k();
+            k.ipc.shm.get(id)?.0.may_change(&cred)?;
+            // 还有映射时先标记，key 变成私有，最后一个映射消失之后再释放
+            let attached = nattch(k, id);
+            let (perm, _) = k.ipc.shm.get_mut(id)?;
+            perm.mode |= SHM_DEST;
+            perm.key = crate::ipc::IPC_PRIVATE;
+            if attached == 0 {
+                k.ipc.shm.remove(id);
+            }
+            Ok(0)
+        }
+        SHM_LOCK | SHM_UNLOCK => {
+            let (perm, _) = cx.k().ipc.shm.get_mut(id)?;
+            let owner = cred.euid == perm.uid || cred.euid == perm.cuid;
+            if !owner && !cred.capable(cap::IPC_LOCK) {
+                return Err(Errno::EPERM);
+            }
+            if cmd == SHM_LOCK {
+                perm.mode |= SHM_LOCKED;
+            } else {
+                perm.mode &= !SHM_LOCKED;
+            }
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}

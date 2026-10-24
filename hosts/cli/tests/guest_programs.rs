@@ -209,6 +209,35 @@ fn sockets_polling_and_timers() {
 }
 
 #[test]
+fn ipc_timers_credentials_and_scheduling() {
+    // System V 消息队列、信号量（SEM_UNDO）、共享内存跨 fork，POSIX 定时器（超限次数、
+    // SIGEV_THREAD、CPU 时钟），mremap，降低权限之后的凭据规则，亲和性和实时策略，
+    // RLIMIT_NOFILE
+    let Some(program) = build_c_guest("posix") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn missing_program_exits_127() {
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
         .arg("/nonexistent/program")

@@ -3,9 +3,10 @@
 use std::time::{Duration, Instant};
 
 use super::{IO_CHUNK, SysResult, get, put, read_timespec, write_pair};
+use crate::cred::{SECBIT_KEEP_CAPS, cap};
 use crate::errno::Errno;
 use crate::futex::Key;
-use crate::itimer::ITimer;
+use crate::itimer::{CpuTimer, ITimer};
 use crate::kernel::{Cx, request_wake};
 use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Signal};
 use crate::uaccess::UserSlice;
@@ -29,10 +30,30 @@ const PR_SET_PDEATHSIG: i32 = 1;
 const PR_GET_PDEATHSIG: i32 = 2;
 const PR_GET_DUMPABLE: i32 = 3;
 const PR_SET_DUMPABLE: i32 = 4;
+const PR_GET_KEEPCAPS: i32 = 7;
+const PR_SET_KEEPCAPS: i32 = 8;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
 const PR_GET_SECCOMP: i32 = 21;
 const PR_CAPBSET_READ: i32 = 23;
+const PR_CAPBSET_DROP: i32 = 24;
+const PR_GET_SECUREBITS: i32 = 27;
+const PR_SET_SECUREBITS: i32 = 28;
+const PR_GET_TIMING: i32 = 13;
+const PR_SET_TIMING: i32 = 14;
+const PR_TIMING_STATISTICAL: u64 = 0;
+const PR_SET_SECCOMP: i32 = 22;
+const SECCOMP_MODE_FILTER: u64 = 2;
+const PR_SET_THP_DISABLE: i32 = 41;
+const PR_GET_THP_DISABLE: i32 = 42;
+const PR_CAP_AMBIENT: i32 = 47;
+const PR_CAP_AMBIENT_IS_SET: u64 = 1;
+const PR_CAP_AMBIENT_RAISE: u64 = 2;
+const PR_CAP_AMBIENT_LOWER: u64 = 3;
+const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+const PR_GET_SPECULATION_CTRL: i32 = 52;
+const PR_SPEC_NOT_AFFECTED: u64 = 0;
+const PR_SET_TIMERSLACK: i32 = 29;
 const PR_GET_TIMERSLACK: i32 = 30;
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 const PR_GET_NO_NEW_PRIVS: i32 = 39;
@@ -47,7 +68,7 @@ const GRND_INSECURE: u32 = 4;
 const RELEASE: &[u8] = b"6.1.0-appine";
 
 /// 把 `clock` 上的绝对时间换算成等待的截止时刻。
-fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
+pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
     let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
     let now = Duration::new(sec.max(0) as u64, nsec as u32);
     Ok(Instant::now() + abs.saturating_sub(now))
@@ -180,15 +201,10 @@ fn read_itimerval(cx: &Cx<'_>, addr: u64) -> Result<(Duration, Duration), Errno>
 }
 
 /// 写 `struct itimerval`：间隔和离下一次到期还有多久。
-fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<ITimer>) -> Result<(), Errno> {
+fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<(Duration, Duration)>) -> Result<(), Errno> {
     let (interval, left) = match t {
         // 与 Linux 相同，还没到期的定时器至少报告 1 微秒
-        Some(t) => (
-            t.interval,
-            t.deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_micros(1)),
-        ),
+        Some((interval, left)) => (interval, left.max(Duration::from_micros(1))),
         None => (Duration::ZERO, Duration::ZERO),
     };
     let mut b = [0u8; 32];
@@ -199,18 +215,34 @@ fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<ITimer>) -> Result<(), Errn
     put(cx, addr, b)
 }
 
-/// 只有 `ITIMER_REAL`；按 CPU 时间计时的两种返回 EINVAL。
-fn check_itimer(which: i32) -> Result<(), Errno> {
-    if which != ITIMER_REAL {
-        crate::debug::log(format_args!("setitimer: timer {which} is not supported"));
-        return Err(Errno::EINVAL);
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
+
+/// 定时器的当前值：(间隔, 离下一次到期还有多久)，没有启动时是 None。
+fn itimer_value(cx: &Cx<'_>, which: i32) -> Option<(Duration, Duration)> {
+    let g = cx.t.group.borrow();
+    if which == ITIMER_REAL {
+        let t = g.itimer?;
+        return Some((
+            t.interval,
+            t.deadline.saturating_duration_since(Instant::now()),
+        ));
     }
-    Ok(())
+    let t = g.cpu_itimers[(which - 1) as usize]?;
+    let left = t.deadline.saturating_sub(g.cpu_ns(cx.kr()));
+    Some((Duration::from_nanos(t.interval), Duration::from_nanos(left)))
+}
+
+fn check_itimer(which: i32) -> Result<(), Errno> {
+    match which {
+        ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub(super) fn getitimer(cx: &mut Cx<'_>, which: i32, curr: u64) -> SysResult {
     check_itimer(which)?;
-    let t = cx.t.group.borrow().itimer;
+    let t = itimer_value(cx, which);
     write_itimerval(cx, curr, t).map(|()| 0)
 }
 
@@ -222,15 +254,24 @@ pub(super) fn setitimer(cx: &mut Cx<'_>, which: i32, new: u64, old: u64) -> SysR
     } else {
         read_itimerval(cx, new)?
     };
-    let prev = cx.t.group.borrow().itimer;
     if old != 0 {
+        let prev = itimer_value(cx, which);
         write_itimerval(cx, old, prev)?;
     }
-    cx.t.group.borrow_mut().itimer = (!value.is_zero()).then(|| ITimer {
-        deadline: Instant::now() + value,
-        interval,
-    });
-    // 让负责定时器的宿主主线程重新计算等待时间
+    if which == ITIMER_REAL {
+        cx.t.group.borrow_mut().itimer = (!value.is_zero()).then(|| ITimer {
+            deadline: Instant::now() + value,
+            interval,
+        });
+    } else {
+        let now = cx.t.group.borrow().cpu_ns(cx.kr());
+        cx.t.group.borrow_mut().cpu_itimers[(which - 1) as usize] =
+            (!value.is_zero()).then(|| CpuTimer {
+                deadline: now + value.as_nanos() as u64,
+                interval: interval.as_nanos() as u64,
+            });
+    }
+    // 让定时器线程重新计算等待时间
     request_wake();
     Ok(0)
 }
@@ -242,7 +283,28 @@ pub(super) fn clock_nanosleep(
     req: u64,
     rem: u64,
 ) -> SysResult {
+    match clock {
+        // 线程 CPU 时钟、原始单调时钟和粗粒度时钟不能用来睡眠
+        CLOCK_THREAD_CPUTIME_ID | 4..=6 => return Err(Errno::EOPNOTSUPP),
+        c if c < 0 && c & 4 != 0 => return Err(Errno::EINVAL),
+        _ => {}
+    }
     let t = read_timespec(cx, req)?;
+    // 进程 CPU 时钟：按 CPU 时间换算成大约的墙上时间（每 10 毫秒检查一次）
+    if let Some(cpu) = cpu_clock(cx, clock) {
+        let now = cpu?;
+        let target = if flags & TIMER_ABSTIME != 0 {
+            t.as_nanos() as u64
+        } else {
+            now + t.as_nanos() as u64
+        };
+        while cpu_clock(cx, clock).unwrap()? < target {
+            if sleep_until(cx, Instant::now() + Duration::from_millis(10)).is_err() {
+                return Err(Errno::ERESTARTNOHAND);
+            }
+        }
+        return Ok(0);
+    }
     let deadline = if flags & TIMER_ABSTIME != 0 {
         deadline_from_clock(clock, t)?
     } else {
@@ -260,17 +322,69 @@ pub(super) fn clock_nanosleep(
     }
 }
 
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+
+/// guest 进程或线程的 CPU 时钟用掉的纳秒数；`clock` 不是 CPU 时钟时返回 None。负数的
+/// 时钟 id 是 `clock_getcpuclockid`/`pthread_getcpuclockid` 编码出来的（Linux 的
+/// `MAKE_PROCESS_CPUCLOCK`）：`(~pid << 3) | 类型`，第 2 位表示线程，pid 0 表示自己。
+fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
+    let (pid, thread) = match clock {
+        CLOCK_PROCESS_CPUTIME_ID => (0, false),
+        CLOCK_THREAD_CPUTIME_ID => (0, true),
+        // 类型 3 不是 CPU 时钟（低 3 位为 3 是 fd 编码的动态时钟）
+        c if c < 0 && c & 3 == 3 => return Some(Err(Errno::EINVAL)),
+        c if c < 0 => (!(c >> 3), c & 4 != 0),
+        _ => return None,
+    };
+    let k = cx.kr();
+    Some(if thread {
+        let task = if pid == 0 {
+            Some(cx.task.clone())
+        } else {
+            k.tasks.get(&pid).cloned()
+        };
+        task.map(|t| t.cpu_ns()).ok_or(Errno::EINVAL)
+    } else {
+        let group = if pid == 0 {
+            Some(cx.t.group.clone())
+        } else {
+            k.groups.get(&pid).cloned()
+        };
+        group.map(|g| g.borrow().cpu_ns(k)).ok_or(Errno::EINVAL)
+    })
+}
+
 pub(super) fn clock_gettime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
-    let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
+    let (sec, nsec) = match cpu_clock(cx, clock) {
+        Some(ns) => {
+            let ns = ns?;
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        }
+        None => appine_hal::clock_gettime(clock).map_err(Errno)?,
+    };
     write_pair(cx, tp, sec, nsec).map(|()| 0)
 }
 
 pub(super) fn clock_getres(cx: &mut Cx<'_>, clock: i32, res: u64) -> SysResult {
-    let (sec, nsec) = appine_hal::clock_getres(clock).map_err(Errno)?;
+    let (sec, nsec) = match cpu_clock(cx, clock) {
+        Some(ns) => ns.map(|_| (0, 1))?,
+        None => appine_hal::clock_getres(clock).map_err(Errno)?,
+    };
     if res != 0 {
         write_pair(cx, res, sec, nsec)?;
     }
     Ok(0)
+}
+
+/// clock_settime：guest 不能改宿主的时间。可以设置的时钟（`CLOCK_REALTIME`）返回
+/// EPERM，与没有 `CAP_SYS_TIME` 时相同；其余的时钟本来就不能设置。
+pub(super) fn clock_settime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
+    read_timespec(cx, tp)?;
+    match clock {
+        CLOCK_REALTIME => Err(Errno::EPERM),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
@@ -282,26 +396,6 @@ pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
         put(cx, tz, [0u8; 8])?;
     }
     Ok(0)
-}
-
-pub(super) fn sched_getaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64) -> SysResult {
-    if pid != 0 && !cx.kr().tasks.contains_key(&pid) {
-        return Err(Errno::ESRCH);
-    }
-    // 内核的 cpumask 按 unsigned long 对齐；guest 给的缓冲区至少要能放下它
-    if len < 8 || !len.is_multiple_of(8) {
-        return Err(Errno::EINVAL);
-    }
-    let cpus = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(64);
-    let bits = if cpus == 64 {
-        u64::MAX
-    } else {
-        (1u64 << cpus) - 1
-    };
-    put(cx, mask, bits.to_le_bytes())?;
-    Ok(8)
 }
 
 pub(super) fn times(cx: &mut Cx<'_>, buf: u64) -> SysResult {
@@ -335,13 +429,14 @@ pub(super) fn getrusage(cx: &mut Cx<'_>, who: i32, usage: u64) -> SysResult {
 }
 
 pub(super) fn uname(cx: &mut Cx<'_>, buf: u64) -> SysResult {
+    let k = cx.kr();
     let fields: [&[u8]; 6] = [
         b"Linux",
-        b"localhost",
+        &k.hostname,
         RELEASE,
         b"#1 SMP PREEMPT appine",
         b"aarch64",
-        b"(none)",
+        &k.domainname,
     ];
     let mut out = [0u8; 6 * 65];
     for (i, f) in fields.iter().enumerate() {
@@ -352,11 +447,68 @@ pub(super) fn uname(cx: &mut Cx<'_>, buf: u64) -> SysResult {
         .map(|()| 0)
 }
 
+/// reboot：不能重启宿主，只接受 Ctrl-Alt-Del 的开关；其余合法的命令 EPERM。
+pub(super) fn reboot(cx: &mut Cx<'_>, magic1: u32, magic2: u32, cmd: u32) -> SysResult {
+    const CAP_SYS_BOOT: u32 = 22;
+    const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
+    const MAGIC2: [u32; 4] = [672_274_793, 85_072_278, 369_367_448, 537_993_216];
+    const CMD_CAD_ON: u32 = 0x89ab_cdef;
+    const CMD_CAD_OFF: u32 = 0;
+    const OTHER_CMDS: [u32; 6] = [
+        0x0123_4567, // RESTART
+        0xcdef_0123, // HALT
+        0x4321_fedc, // POWER_OFF
+        0xa1b2_c3d4, // RESTART2
+        0xd000_fce2, // SW_SUSPEND
+        0x4558_4543, // KEXEC
+    ];
+    if !cx.cred().capable(CAP_SYS_BOOT) {
+        return Err(Errno::EPERM);
+    }
+    if magic1 != LINUX_REBOOT_MAGIC1 || !MAGIC2.contains(&magic2) {
+        return Err(Errno::EINVAL);
+    }
+    match cmd {
+        CMD_CAD_ON | CMD_CAD_OFF => Ok(0),
+        c if OTHER_CMDS.contains(&c) => Err(Errno::EPERM),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// sethostname、setdomainname。
+pub(super) fn set_uts_name(cx: &mut Cx<'_>, name: u64, len: i64, domain: bool) -> SysResult {
+    if !cx.cred().capable(cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&n| n <= crate::kernel::UTS_LEN)
+        .ok_or(Errno::EINVAL)?;
+    let mut value = vec![0u8; len];
+    cx.mm().read(UserSlice::new(name, len), &mut value)?;
+    let k = cx.k();
+    *if domain {
+        &mut k.domainname
+    } else {
+        &mut k.hostname
+    } = value;
+    Ok(0)
+}
+
 pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u64) -> SysResult {
+    let cred = cx.cred();
     let group = if pid == 0 || pid == cx.tgid() {
         cx.t.group.clone()
     } else {
-        cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?
+        let g = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
+        // 别人的进程：它的用户 ID、组 ID 都要等于调用者的真实 ID
+        let t = g.borrow().cred.clone();
+        let same = [t.ruid, t.euid, t.suid].iter().all(|&u| u == cred.ruid)
+            && [t.rgid, t.egid, t.sgid].iter().all(|&g| g == cred.rgid);
+        if !same && !cred.capable(cap::SYS_RESOURCE) {
+            return Err(Errno::EPERM);
+        }
+        g
     };
     if resource as usize >= RLIM_NLIMITS {
         return Err(Errno::EINVAL);
@@ -369,8 +521,10 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
         if cur > max {
             return Err(Errno::EINVAL);
         }
-        // root 可以提高硬限制，但 fd 表的容量是固定的
-        if resource == RLIMIT_NOFILE && max > crate::fd::MAX_FDS as u64 {
+        // fd 表的容量是固定的；提高硬限制要求 CAP_SYS_RESOURCE
+        if resource == RLIMIT_NOFILE && max > crate::fd::MAX_FDS as u64
+            || max > slot.1 && !cred.capable(cap::SYS_RESOURCE)
+        {
             return Err(Errno::EPERM);
         }
         Some((cur, max))
@@ -382,6 +536,15 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
     }
     if let Some(v) = new {
         group.borrow_mut().rlimits[resource as usize] = v;
+        // fd 表按 RLIMIT_NOFILE 的软限制分配新的 fd
+        if resource == RLIMIT_NOFILE {
+            let k = cx.kr();
+            for tid in &group.borrow().threads {
+                if let Some(t) = k.tasks.get(tid) {
+                    t.res.borrow().fds.borrow_mut().limit = v.0 as usize;
+                }
+            }
+        }
     }
     Ok(0)
 }
@@ -393,7 +556,16 @@ pub(super) fn umask(cx: &mut Cx<'_>, mask: u32) -> SysResult {
     Ok(old as u64)
 }
 
-pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, arg: u64) -> SysResult {
+pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
+    let arg = args[0];
+    // 与 Linux 一样，用不到的参数必须是 0
+    let unused = |from: usize| {
+        if args[from..].iter().all(|&a| a == 0) {
+            Ok(())
+        } else {
+            Err(Errno::EINVAL)
+        }
+    };
     match option {
         PR_SET_NAME => {
             // 名字可以不以 NUL 结尾，最多取 15 字节
@@ -425,18 +597,156 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, arg: u64) -> SysResult {
             Ok(0)
         }
         PR_SET_NO_NEW_PRIVS if arg == 1 => {
+            unused(1)?;
             cx.t.group.borrow_mut().no_new_privs = true;
             Ok(0)
         }
-        PR_GET_NO_NEW_PRIVS => Ok(cx.t.group.borrow().no_new_privs as u64),
-        // 没有 seccomp 过滤
+        PR_GET_NO_NEW_PRIVS => {
+            unused(0)?;
+            Ok(cx.t.group.borrow().no_new_privs as u64)
+        }
+        PR_GET_KEEPCAPS => Ok(cx.cred().keep_caps() as u64),
+        PR_SET_KEEPCAPS if arg <= 1 => {
+            let c = &mut cx.t.group.borrow_mut().cred;
+            c.securebits = (c.securebits & !SECBIT_KEEP_CAPS) | (arg as u32 * SECBIT_KEEP_CAPS);
+            Ok(0)
+        }
+        PR_GET_SECUREBITS => Ok(cx.cred().securebits as u64),
+        PR_SET_SECUREBITS => {
+            if !cx.cred().capable(cap::SETPCAP) {
+                return Err(Errno::EPERM);
+            }
+            cx.t.group.borrow_mut().cred.securebits = arg as u32;
+            Ok(0)
+        }
         PR_GET_SECCOMP => Ok(0),
-        // root 拥有全部 capability
-        PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok(1),
-        // Linux 的默认值 50 微秒
-        PR_GET_TIMERSLACK => Ok(50_000),
+        // 不支持 seccomp 过滤（设计文档 §11.1）；参数检查与 Linux 相同
+        PR_SET_SECCOMP => match arg {
+            SECCOMP_MODE_FILTER => {
+                let _: [u8; 16] = get(cx, args[1])?;
+                let g = cx.t.group.borrow();
+                if !g.no_new_privs && !g.cred.capable(cap::SYS_ADMIN) {
+                    return Err(Errno::EACCES);
+                }
+                Err(Errno::EINVAL)
+            }
+            _ => Err(Errno::EINVAL),
+        },
+        PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok((cx.cred().cap_bounding >> arg) & 1),
+        PR_CAPBSET_DROP if arg <= CAP_LAST_CAP => {
+            if !cx.cred().capable(cap::SETPCAP) {
+                return Err(Errno::EPERM);
+            }
+            cx.t.group.borrow_mut().cred.cap_bounding &= !(1 << arg);
+            Ok(0)
+        }
+        // 没有环境能力：查询总是 0，清空总是成功，提升总是 EPERM
+        PR_CAP_AMBIENT => match arg {
+            PR_CAP_AMBIENT_CLEAR_ALL => unused(1).map(|()| 0),
+            PR_CAP_AMBIENT_IS_SET | PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER => {
+                unused(2)?;
+                if args[1] > CAP_LAST_CAP {
+                    return Err(Errno::EINVAL);
+                }
+                if arg == PR_CAP_AMBIENT_RAISE {
+                    Err(Errno::EPERM)
+                } else {
+                    Ok(0)
+                }
+            }
+            _ => Err(Errno::EINVAL),
+        },
+        // 只记录；0 表示恢复默认值
+        PR_SET_TIMERSLACK => {
+            let (_, default) = cx.task.timerslack.get();
+            cx.task
+                .timerslack
+                .set((if arg == 0 { default } else { arg }, default));
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(cx.task.timerslack.get().0),
+        // 只有统计计时
+        PR_SET_TIMING if arg == PR_TIMING_STATISTICAL => Ok(0),
+        PR_GET_TIMING => Ok(PR_TIMING_STATISTICAL),
+        PR_SET_THP_DISABLE => {
+            unused(1)?;
+            cx.t.group.borrow_mut().thp_disable = arg != 0;
+            Ok(0)
+        }
+        PR_GET_THP_DISABLE => {
+            unused(0)?;
+            Ok(cx.t.group.borrow().thp_disable as u64)
+        }
+        // guest 看不到推测执行的缓解措施
+        PR_GET_SPECULATION_CTRL => {
+            unused(1)?;
+            match arg {
+                0..=2 => Ok(PR_SPEC_NOT_AFFECTED),
+                _ => Err(Errno::ENODEV),
+            }
+        }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// personality(2)：0xffffffff 只查询。
+pub(super) fn personality(cx: &mut Cx<'_>, persona: u32) -> SysResult {
+    let mut g = cx.t.group.borrow_mut();
+    let old = g.personality;
+    if persona != u32::MAX {
+        g.personality = persona;
+    }
+    Ok(old as u64)
+}
+
+/// getcpu(2)：报告亲和性里的第一个 CPU（线程由宿主调度，不知道它实际在哪个 CPU 上）。
+pub(super) fn getcpu(cx: &mut Cx<'_>, cpu: u64, node: u64) -> SysResult {
+    let first = cx.task.affinity.get().trailing_zeros().min(63);
+    if cpu != 0 {
+        put(cx, cpu, first.to_le_bytes())?;
+    }
+    if node != 0 {
+        put(cx, node, 0u32.to_le_bytes())?;
+    }
+    Ok(0)
+}
+
+pub(super) fn set_robust_list(cx: &mut Cx<'_>, head: u64, len: u64) -> SysResult {
+    // struct robust_list_head 的大小
+    if len != 24 {
+        return Err(Errno::EINVAL);
+    }
+    cx.task.robust_list.set((head, len));
+    Ok(0)
+}
+
+pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) -> SysResult {
+    let (h, l) = if pid == 0 {
+        cx.task.robust_list.get()
+    } else if pid == crate::kernel::INIT {
+        // 内置的 init 属于 root，没有 robust 链表
+        if cx.cred().ruid != 0 && !cx.cred().capable(cap::SYS_PTRACE) {
+            return Err(Errno::EPERM);
+        }
+        (0, 0)
+    } else {
+        let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
+        // 和 ptrace 一样：只能看同一个用户的线程
+        let target = cx
+            .kr()
+            .groups
+            .get(&task.tgid)
+            .map(|g| g.borrow().cred.clone())
+            .ok_or(Errno::ESRCH)?;
+        let cred = cx.cred();
+        if cred.ruid != target.ruid && !cred.capable(cap::SYS_PTRACE) {
+            return Err(Errno::EPERM);
+        }
+        task.robust_list.get()
+    };
+    put(cx, head, h.to_le_bytes())?;
+    put(cx, len, l.to_le_bytes())?;
+    Ok(0)
 }
 
 pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {

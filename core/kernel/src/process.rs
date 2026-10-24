@@ -3,19 +3,20 @@
 
 use std::cell::RefCell;
 use std::fmt;
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use appine_engine::DbtStats;
 
+use crate::cred::{Cred, MAY_EXEC};
 use crate::errno::Errno;
 use crate::kernel::{INIT, Kernel, Tid, request_wake};
-use crate::loader::{self, LoadError};
+use crate::loader::{self, Executable, LoadError};
 use crate::signal::{self, SigAction, SigHandlers, SigInfo, sa};
 use crate::terminal::Terminal;
 use crate::tty::Tty;
-use crate::vfs::store::mode;
+use crate::vfs::store::{Stat, mode};
 use crate::vfs::{Node, Pseudo, Vfs};
 
 /// 一个信号编号（1–64）。
@@ -61,6 +62,14 @@ impl Signal {
     pub const TTIN: Signal = Signal(21);
     /// 后台进程写终端或修改终端设置。
     pub const TTOU: Signal = Signal(22);
+    /// CPU 时间超过 `RLIMIT_CPU`。
+    pub const XCPU: Signal = Signal(24);
+    /// 文件大小超过 `RLIMIT_FSIZE`。
+    pub const XFSZ: Signal = Signal(25);
+    /// `ITIMER_VIRTUAL` 到期。
+    pub const VTALRM: Signal = Signal(26);
+    /// `ITIMER_PROF` 到期。
+    pub const PROF: Signal = Signal(27);
     /// 终端窗口大小改变。
     pub const WINCH: Signal = Signal(28);
 
@@ -208,12 +217,18 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// `RLIMIT_CPU`（秒）。
+pub(crate) const RLIMIT_CPU: u32 = 0;
+/// `RLIMIT_FSIZE`。
+pub(crate) const RLIMIT_FSIZE: u32 = 1;
 /// `RLIMIT_STACK`。
 pub(crate) const RLIMIT_STACK: u32 = 3;
 /// `RLIMIT_CORE`。
 pub(crate) const RLIMIT_CORE: u32 = 4;
 /// `RLIMIT_NOFILE`。
 pub(crate) const RLIMIT_NOFILE: u32 = 7;
+/// `RLIMIT_MEMLOCK`。
+pub(crate) const RLIMIT_MEMLOCK: u32 = 8;
 /// 资源种类数（`RLIM_NLIMITS`）。
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
@@ -222,6 +237,8 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     r[RLIMIT_STACK as usize] = (loader::STACK_SIZE, u64::MAX);
     r[RLIMIT_CORE as usize] = (0, u64::MAX);
     r[RLIMIT_NOFILE as usize] = (crate::fd::MAX_FDS as u64, crate::fd::MAX_FDS as u64);
+    // 与 Linux 5.16 起的默认值相同
+    r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
     r
 }
 
@@ -273,6 +290,8 @@ pub(crate) struct ThreadGroup {
     pub child_cpu_ns: u64,
     /// `ITIMER_REAL`：fork 不继承，execve 保留。
     pub itimer: Option<crate::itimer::ITimer>,
+    /// `ITIMER_VIRTUAL`、`ITIMER_PROF`，按进程用掉的 CPU 时间计时。
+    pub cpu_itimers: [Option<crate::itimer::CpuTimer>; 2],
     /// nice 值（-20–19），fork 继承。
     pub nice: i32,
     /// `PR_SET_PDEATHSIG`：父进程退出时收到的信号，0 表示不发；fork 不继承。
@@ -281,6 +300,19 @@ pub(crate) struct ThreadGroup {
     pub dumpable: bool,
     /// `PR_SET_NO_NEW_PRIVS`，fork 和 execve 都保留。
     pub no_new_privs: bool,
+    /// `/proc/<pid>/oom_score_adj`（-1000–1000），fork 继承。guest 自己的 OOM killer
+    /// （设计文档 §12）还没有，这里只记录。
+    pub oom_score_adj: i32,
+    /// 凭据，fork 继承。
+    pub cred: Cred,
+    /// personality(2) 的执行域和标志：只记录，fork 和 execve 都保留。
+    pub personality: u32,
+    /// 执行过 execve（父进程不能再 setpgid 它）；fork 出来的进程从 false 开始。
+    pub execed: bool,
+    /// `PR_SET_THP_DISABLE`（没有透明大页，只记录），fork 继承。
+    pub thp_disable: bool,
+    /// POSIX 定时器（timer_create），按 id；fork 不继承，execve 时删除。
+    pub posix_timers: std::collections::BTreeMap<i32, crate::itimer::PosixTimer>,
 }
 
 impl ThreadGroup {
@@ -309,10 +341,17 @@ impl ThreadGroup {
             cpu_ns: 0,
             child_cpu_ns: 0,
             itimer: None,
+            cpu_itimers: [None; 2],
             nice: 0,
             pdeathsig: 0,
             dumpable: true,
             no_new_privs: false,
+            oom_score_adj: 0,
+            cred: Cred::root(),
+            personality: 0,
+            thp_disable: false,
+            execed: false,
+            posix_timers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -395,6 +434,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     if let Some(slot) = k.watched.get_mut(&tgid) {
         *slot = Some(status);
     }
+    k.ipc.exit(tgid);
     release_ctty(k, group);
 
     // 父进程是 init、已经不在了，或者忽略 SIGCHLD（SIG_IGN、SA_NOCLDWAIT）时直接回收
@@ -462,26 +502,37 @@ fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     }
 }
 
-/// 按 execve 的规则读取 guest 文件：必须是仓库里带执行权限的普通文件。
-pub(crate) fn read_executable(
+/// 按 execve 的规则打开 guest 文件：必须是仓库里的普通文件，凭据为 `cred` 的进程
+/// 有执行权限。同时返回文件的元数据（setuid、setgid 位）。
+pub(crate) fn open_executable(
     vfs: &Vfs,
     ps: &dyn Pseudo,
+    cred: &Cred,
+    root: &Node,
     cwd: &Node,
     path: &[u8],
-) -> Result<Vec<u8>, Errno> {
-    let Node::Store(ino) = vfs.resolve(ps, cwd, path, true)? else {
+) -> Result<(Executable, Stat), Errno> {
+    let Node::Store(ino) = vfs.resolve(ps, cred, root, cwd, path, true)? else {
         return Err(Errno::EACCES);
     };
     let st = vfs.store().stat(ino)?;
-    if st.kind() != mode::S_IFREG || st.mode & 0o111 == 0 {
+    if st.kind() != mode::S_IFREG {
         return Err(Errno::EACCES);
     }
-    let mut data = Vec::with_capacity(st.size as usize);
-    vfs.store()
-        .open_object(ino, false)?
-        .read_to_end(&mut data)
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    Ok(data)
+    cred.permission(&st, MAY_EXEC)?;
+    Ok((Executable::open(vfs.store().open_object(ino, false)?)?, st))
+}
+
+/// [`open_executable`]，只要文件本身。
+pub(crate) fn read_executable(
+    vfs: &Vfs,
+    ps: &dyn Pseudo,
+    cred: &Cred,
+    root: &Node,
+    cwd: &Node,
+    path: &[u8],
+) -> Result<Executable, Errno> {
+    open_executable(vfs, ps, cred, root, cwd, path).map(|(file, _)| file)
 }
 
 /// 程序路径的最后一个组件，截到 15 字节（`comm`）。

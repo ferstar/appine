@@ -5,7 +5,7 @@
 //! - 地址：路径地址在 inode 仓库里建一个 socket 节点，按 inode 查找；抽象地址
 //!   （`sun_path` 以 NUL 开头）只存在于 [`Names`]。
 //! - `SCM_RIGHTS` 传递的是打开文件本身，接收时装进接收进程的 fd 表。`SO_PEERCRED`、
-//!   `SCM_CREDENTIALS` 给出 guest 的 pid，uid、gid 总是 0。
+//!   `SCM_CREDENTIALS` 给出对方的 pid 和有效用户 ID、组 ID。
 //! - socket 经由自己传递自己形成的环不会被回收（Linux 用专门的垃圾回收处理这种情况）。
 
 use std::cell::RefCell;
@@ -42,13 +42,9 @@ pub struct Ucred {
 }
 
 impl Ucred {
-    /// guest 进程的凭据：所有进程都是 root。
-    pub fn of(pid: i32) -> Ucred {
-        Ucred {
-            pid,
-            uid: 0,
-            gid: 0,
-        }
+    /// pid 为 `pid`、有效用户 ID 和组 ID 为 `uid`、`gid` 的进程。
+    pub fn of(pid: i32, uid: u32, gid: u32) -> Ucred {
+        Ucred { pid, uid, gid }
     }
 
     pub fn encode(&self) -> [u8; 12] {
@@ -494,7 +490,7 @@ mod tests {
             data: data.to_vec(),
             off: 0,
             fds: Vec::new(),
-            cred: Ucred::of(pid),
+            cred: Ucred::of(pid, 0, 0),
             from: Vec::new(),
         }
     }
@@ -543,8 +539,8 @@ mod tests {
 
     #[test]
     fn closing_one_end_shows_eof_and_hangup_on_the_other() {
-        let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(7));
-        assert_eq!(b.peer_cred, Some(Ucred::of(7)));
+        let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(7, 0, 0));
+        assert_eq!(b.peer_cred, Some(Ucred::of(7, 0, 0)));
         if let Link::Stream { tx, .. } = &a.link {
             tx.borrow_mut().push(packet(b"bye", 7));
         }

@@ -216,6 +216,28 @@ pub fn clock_getres(clock: i32) -> Result<(i64, i64), i32> {
     Ok(timespec_pair(&ts))
 }
 
+/// 把宿主进程的 fd 软限制提高到硬限制，返回新的软限制。所有 guest 进程共用宿主的
+/// fd：每个打开的仓库文件、socket 都占一个，默认的 1024 很快就会用完。
+#[allow(clippy::unnecessary_cast)] // rlim_t 在 32 位宿主上是 32 位
+pub fn raise_fd_limit() -> u64 {
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } < 0 {
+        return 0;
+    }
+    // macOS 上硬限制可能是无穷大，但 setrlimit 不接受超过 OPEN_MAX（10240）
+    #[cfg(target_os = "macos")]
+    let hard = rl.rlim_max.min(10240);
+    #[cfg(not(target_os = "macos"))]
+    let hard = rl.rlim_max;
+    if rl.rlim_cur < hard {
+        rl.rlim_cur = hard;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } < 0 {
+            let _ = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+        }
+    }
+    rl.rlim_cur as u64
+}
+
 /// 宿主的物理内存总量和空闲量（字节）。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::unnecessary_cast)] // unsigned long 在 32 位宿主上是 32 位
@@ -309,6 +331,19 @@ pub fn resident_pages(ptr: *const u8, len: usize) -> usize {
     }
     let host_pages = vec.iter().filter(|&&b| b & 1 != 0).count();
     (host_pages * page / 4096).min(len.div_ceil(4096))
+}
+
+/// `[ptr, ptr + len)` 里每个 4K 页是否在宿主内存里（mincore）；宿主页更大时，同一个
+/// 宿主页里的 4K 页结果相同。出错时全部报告为不在。
+pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
+    let page = page_size();
+    let start = ptr as usize & !(page - 1);
+    let span = (ptr as usize + len).next_multiple_of(page) - start;
+    let mut vec = vec![0u8; span / page];
+    let rc = unsafe { libc::mincore(start as *mut libc::c_void, span, vec.as_mut_ptr().cast()) };
+    (0..len.div_ceil(4096))
+        .map(|i| rc == 0 && vec[(ptr as usize + i * 4096 - start) / page] & 1 != 0)
+        .collect()
 }
 
 /// 一个宿主文件系统的容量（statvfs）。

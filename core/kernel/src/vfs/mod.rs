@@ -3,7 +3,8 @@
 //! 根文件系统是 inode 仓库，`/dev` 里的设备节点也存在仓库里（[`dev`]）。`/proc`
 //! （procfs）和 `/dev/pts`（devpts）是挂在仓库目录上的合成文件系统：它们的内容来自
 //! 内核状态，由内核层经由 [`Pseudo`] 提供。路径解析在整棵树里进行，符号链接最多
-//! 跟随 40 层。
+//! 跟随 40 层；经过的每个仓库目录都要有搜索权限。进程的根目录可以被 chroot 换掉：
+//! 绝对路径从它开始，`..` 不会越过它。
 
 pub mod dev;
 pub mod import;
@@ -12,12 +13,15 @@ pub mod store;
 use std::collections::VecDeque;
 use std::path::Path;
 
+use crate::cred::{Cred, MAY_EXEC};
 use crate::errno::Errno;
 pub(crate) use crate::pseudo::PseudoNode;
 use store::{Ino, ROOT, Store, mode};
 
 /// 跟随符号链接的最大次数，与 Linux 的 MAXSYMLINKS 一致。
 const MAX_SYMLINKS: u32 = 40;
+/// 路径组件的最大长度（`NAME_MAX`）。
+const NAME_MAX: usize = 255;
 
 /// 文件系统树里的一个节点。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -166,10 +170,23 @@ impl Vfs {
         }
     }
 
-    /// 解析路径。`follow` 为 false 时不跟随最后一个组件的符号链接（lstat、readlink 等）。
+    /// 凭据为 `cred` 的进程能不能在目录 `dir` 里查找。合成文件系统的目录总是可以。
+    fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
+        match dir {
+            Node::Store(ino) if !cred.searches_all() => {
+                cred.permission(&self.store.stat(*ino)?, MAY_EXEC)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// 以凭据 `cred`、根目录 `root` 解析路径。`follow` 为 false 时不跟随最后一个组件的
+    /// 符号链接（lstat、readlink 等）。
     pub(crate) fn resolve(
         &self,
         ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
         cwd: &Node,
         path: &[u8],
         follow: bool,
@@ -178,7 +195,7 @@ impl Vfs {
             return Err(Errno::ENOENT);
         }
         let mut dir = if path[0] == b'/' {
-            Node::ROOT
+            root.clone()
         } else {
             cwd.clone()
         };
@@ -188,12 +205,18 @@ impl Vfs {
         let trailing_slash = path.ends_with(b"/");
         while let Some(comp) = pending.pop_front() {
             let last = pending.is_empty();
-            if comp == b".." {
-                dir = self.parent(ps, &dir)?;
-                continue;
+            if comp.len() > NAME_MAX {
+                return Err(Errno::ENAMETOOLONG);
             }
             if !self.is_dir(ps, &dir)? {
                 return Err(Errno::ENOTDIR);
+            }
+            self.may_search(cred, &dir)?;
+            if comp == b".." {
+                if dir != *root {
+                    dir = self.parent(ps, &dir)?;
+                }
+                continue;
             }
             let node = self.lookup(ps, &dir, &comp)?;
             if self.kind(ps, &node)? == mode::S_IFLNK && (!last || follow || trailing_slash) {
@@ -209,7 +232,7 @@ impl Vfs {
                 }
                 let target = self.readlink(ps, &node)?;
                 if target.first() == Some(&b'/') {
-                    dir = Node::ROOT;
+                    dir = root.clone();
                 }
                 for c in split(&target).rev() {
                     pending.push_front(c);
@@ -230,6 +253,8 @@ impl Vfs {
     pub(crate) fn resolve_parent<'p>(
         &self,
         ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
         cwd: &Node,
         path: &'p [u8],
     ) -> Result<(Node, &'p [u8]), Errno> {
@@ -239,28 +264,44 @@ impl Vfs {
         let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
         let trimmed = &path[..end];
         if trimmed.is_empty() {
-            return Ok((Node::ROOT, b"."));
+            return Ok((root.clone(), b"."));
         }
         let (dir, name) = match trimmed.iter().rposition(|&b| b == b'/') {
             Some(i) => (
-                self.resolve(ps, cwd, &trimmed[..=i], true)?,
+                self.resolve(ps, cred, root, cwd, &trimmed[..=i], true)?,
                 &trimmed[i + 1..],
             ),
             None => (cwd.clone(), trimmed),
         };
+        if name.len() > NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
         if !self.is_dir(ps, &dir)? {
             return Err(Errno::ENOTDIR);
         }
         Ok((dir, name))
     }
 
-    /// 目录的绝对路径（getcwd、`/proc/<pid>/cwd`）。
-    pub(crate) fn path_of(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Vec<u8>, Errno> {
+    /// 目录相对根目录 `root` 的绝对路径（getcwd、`/proc/<pid>/cwd`）。不在 `root` 下面
+    /// 的目录与 Linux 一样以 `(unreachable)` 开头。
+    pub(crate) fn path_of(
+        &self,
+        ps: &dyn Pseudo,
+        root: &Node,
+        dir: &Node,
+    ) -> Result<Vec<u8>, Errno> {
         let mut names = Vec::new();
         let mut cur = dir.clone();
+        let mut reached = true;
         loop {
+            if cur == *root {
+                break;
+            }
             match cur {
-                Node::Store(ROOT) => break,
+                Node::Store(ROOT) => {
+                    reached = false;
+                    break;
+                }
                 Node::Store(ino) => {
                     let parent = self.store.parent(ino)?;
                     // 已被删除的目录找不到名字，与 Linux 一样报 ENOENT
@@ -279,10 +320,15 @@ impl Vfs {
                 },
             }
         }
+        let mut out = if reached {
+            Vec::new()
+        } else {
+            b"(unreachable)".to_vec()
+        };
         if names.is_empty() {
-            return Ok(b"/".to_vec());
+            out.push(b'/');
+            return Ok(out);
         }
-        let mut out = Vec::new();
         for name in names.iter().rev() {
             out.push(b'/');
             out.extend_from_slice(name);
@@ -433,7 +479,9 @@ mod tests {
     fn resolves_paths_and_symlinks() {
         let (vfs, dir) = sample();
         let ps = &Empty;
-        let r = |cwd: &Node, p: &[u8], follow| vfs.resolve(ps, cwd, p, follow);
+        let root_cred = Cred::root();
+        let cred = &root_cred;
+        let r = |cwd: &Node, p: &[u8], follow| vfs.resolve(ps, cred, &Node::ROOT, cwd, p, follow);
         let root = Node::ROOT;
         let busybox = r(&root, b"/bin/busybox", true).unwrap();
         assert_eq!(r(&root, b"/usr/bin/env", true).unwrap(), busybox);
@@ -457,33 +505,36 @@ mod tests {
 
         let ubin = r(&root, b"/usr/bin", true).unwrap();
         assert_eq!(
-            vfs.resolve_parent(ps, &root, b"/usr/bin/new").unwrap(),
+            vfs.resolve_parent(ps, cred, &Node::ROOT, &root, b"/usr/bin/new")
+                .unwrap(),
             (ubin.clone(), &b"new"[..])
         );
         assert_eq!(
-            vfs.resolve_parent(ps, &usr, b"bin//").unwrap(),
+            vfs.resolve_parent(ps, cred, &Node::ROOT, &usr, b"bin//")
+                .unwrap(),
             (usr.clone(), &b"bin"[..])
         );
         assert_eq!(
-            vfs.resolve_parent(ps, &usr, b"///").unwrap(),
+            vfs.resolve_parent(ps, cred, &Node::ROOT, &usr, b"///")
+                .unwrap(),
             (root.clone(), &b"."[..])
         );
         assert_eq!(
-            vfs.resolve_parent(ps, &root, b"/bin/busybox/x"),
+            vfs.resolve_parent(ps, cred, &Node::ROOT, &root, b"/bin/busybox/x"),
             Err(Errno::ENOTDIR)
         );
-        assert_eq!(vfs.path_of(ps, &ubin).unwrap(), b"/usr/bin");
-        assert_eq!(vfs.path_of(ps, &root).unwrap(), b"/");
+        assert_eq!(vfs.path_of(ps, &Node::ROOT, &ubin).unwrap(), b"/usr/bin");
+        assert_eq!(vfs.path_of(ps, &Node::ROOT, &root).unwrap(), b"/");
 
         // /proc 是挂载点：进去是合成文件系统的根，`..` 回到仓库的根目录
         let proc = r(&root, b"/proc", true).unwrap();
         assert_eq!(proc, Node::Pseudo(PseudoNode::ProcRoot));
         assert_eq!(r(&proc, b"..", true).unwrap(), root);
-        assert_eq!(vfs.path_of(ps, &proc).unwrap(), b"/proc");
+        assert_eq!(vfs.path_of(ps, &Node::ROOT, &proc).unwrap(), b"/proc");
         // 设备节点和 /dev/pts 由 Vfs::open 补齐
         let pts = r(&root, b"/dev/pts", true).unwrap();
         assert_eq!(pts, Node::Pseudo(PseudoNode::PtsRoot));
-        assert_eq!(vfs.path_of(ps, &pts).unwrap(), b"/dev/pts");
+        assert_eq!(vfs.path_of(ps, &Node::ROOT, &pts).unwrap(), b"/dev/pts");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

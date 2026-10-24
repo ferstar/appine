@@ -267,6 +267,27 @@ fn shell(tier: &str, out: &Output) -> String {
 }
 
 #[test]
+fn file_permissions_apply_to_other_users() {
+    // su 到 nobody 之后：读不了 root 的 600 文件，进不了 /root，删不了粘滞位 /tmp 里
+    // 别人的文件；新文件属于 nobody
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "f=/tmp/dac-$$; umask 077; echo secret > $f; \
+         su -s /bin/sh nobody -c \"id -u; cat $f || echo denied; ls /root || echo denied; \
+         rm -f $f || echo denied; touch $f.n; stat -c %u:%a $f.n; rm $f.n\"; \
+         chmod 644 $f; su -s /bin/sh nobody -c \"cat $f\"; rm $f",
+    ]) {
+        assert_eq!(
+            shell(tier, &out),
+            "65534\ndenied\ndenied\ndenied\n65534:600\nsecret\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn pipelines_connect_processes() {
     for (tier, out) in run(&[
         "/bin/sh",

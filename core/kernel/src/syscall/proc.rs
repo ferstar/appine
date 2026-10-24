@@ -15,6 +15,7 @@ use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
 use crate::vfs::normalize;
+use crate::vfs::store::mode;
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
@@ -110,6 +111,7 @@ pub(super) fn clone(
     } else {
         let f = cx.t.fs.borrow();
         Rc::new(RefCell::new(FsContext {
+            root: f.root.clone(),
             cwd: f.cwd.clone(),
             umask: f.umask,
         }))
@@ -135,6 +137,10 @@ pub(super) fn clone(
         g.nice = parent.nice;
         g.dumpable = parent.dumpable;
         g.no_new_privs = parent.no_new_privs;
+        g.oom_score_adj = parent.oom_score_adj;
+        g.cred = parent.cred.clone();
+        g.personality = parent.personality;
+        g.thp_disable = parent.thp_disable;
         g.ctty = parent.ctty.clone();
         g.exe = parent.exe.clone();
         g.exit_signal = (flags & 0xff) as i32;
@@ -190,6 +196,11 @@ pub(super) fn clone(
         cx.task.sigmask.get(),
         cx.task.comm.get(),
     )?;
+    task.affinity.set(cx.task.affinity.get());
+    task.sched.set(super::sched::inherit(cx.task.sched.get()));
+    task.deadline.set(cx.task.deadline.get());
+    let slack = cx.task.timerslack.get().0;
+    task.timerslack.set((slack, slack));
 
     // 写 tid 之前先确认能启动线程，失败时不留下任何痕迹
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -290,15 +301,21 @@ pub(super) fn execve(
     let mut total = 0;
     let mut argv = read_strings(cx, argv, &mut total)?;
     let envp = read_strings(cx, envp, &mut total)?;
+    // 与 Linux 5.18 起相同：argv 为空时补一个空字符串，新程序的 argc 至少是 1
+    if argv.is_empty() {
+        argv.push(Vec::new());
+    }
     let vfs = cx.vfs()?;
     let cwd = cx.cwd();
     let view = cx.view(&vfs);
+    let cred = cx.cred();
 
     // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
     let mut file_path = path.clone();
-    let mut file = process::read_executable(&vfs, &view, &cwd, &file_path)?;
+    let root = cx.root();
+    let (mut file, mut st) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &file_path)?;
     for depth in 0.. {
-        let Some((interp, arg)) = parse_shebang(&file) else {
+        let Some((interp, arg)) = parse_shebang(file.bytes()) else {
             break;
         };
         if depth == MAX_INTERP_DEPTH {
@@ -309,28 +326,42 @@ pub(super) fn execve(
         new_argv.push(file_path);
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
-        file = process::read_executable(&vfs, &view, &cwd, &interp)?;
+        (file, st) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
         file_path = interp;
+    }
+    // 以写方式打开着的程序不能执行
+    if super::fs::open_for_write(cx, st.ino) {
+        return Err(Errno::ETXTBSY);
     }
     // /proc/<pid>/exe 和 maps 里显示的绝对路径
     let exe: Rc<[u8]> = Rc::from(if file_path.starts_with(b"/") {
         normalize(&file_path)
     } else {
-        let mut p = vfs.path_of(&view, &cwd)?;
+        let mut p = vfs.path_of(&view, &root, &cwd)?;
         p.push(b'/');
         p.extend_from_slice(&file_path);
         normalize(&p)
     });
 
+    // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后不再生效）；脚本看的是解释器
+    let no_new_privs = cx.t.group.borrow().no_new_privs;
+    let setid = |bit: u32| st.mode & bit == bit && !no_new_privs;
+    let mut new_cred = cred.clone();
+    new_cred.exec(
+        setid(mode::S_ISUID).then_some(st.uid),
+        setid(mode::S_ISGID | 0o010).then_some(st.gid),
+    );
     let mut mm = Mm::new();
     let args = Args {
         argv: &argv,
         envp: &envp,
         execfn: &path,
+        ids: [new_cred.ruid, new_cred.euid, new_cred.rgid, new_cred.egid],
     };
-    let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cwd, p);
+    let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cred, &root, &cwd, p);
     let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(load_error)?;
     label_image(&mut mm, &image, &exe);
+    mm.exe = Some(st.ino);
 
     // 从这里开始不能失败：结束同一线程组里的其他线程，然后换掉地址空间
     kill_other_threads(cx)?;
@@ -338,11 +369,20 @@ pub(super) fn execve(
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
-    cx.fds_mut().close_on_exec();
+    let closed = cx.fds_mut().close_on_exec();
+    let fds = cx.t.fds.clone();
+    crate::locks::closed(cx.k(), &fds, &closed);
+    drop(closed);
     {
         let group = cx.t.group.clone();
         let mut g = group.borrow_mut();
         g.exe = exe.to_vec();
+        if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid) {
+            g.dumpable = false;
+        }
+        g.cred = new_cred;
+        g.posix_timers.clear();
+        g.execed = true;
         if Rc::strong_count(&g.sighand) > 1 {
             let copy = g.sighand.borrow().clone();
             g.sighand = Rc::new(RefCell::new(copy));
@@ -537,6 +577,10 @@ pub(super) fn wait4(
     if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
         return Err(Errno::EINVAL);
     }
+    // -INT_MIN 不能表示成进程组号
+    if pid == i32::MIN {
+        return Err(Errno::ESRCH);
+    }
     let who = match pid {
         -1 => Who::Any,
         0 => Who::Pgid(cx.t.group.borrow().pgid),
@@ -638,9 +682,9 @@ pub(super) fn setpgid(cx: &mut Cx<'_>, pid: i32, pgid: i32) -> SysResult {
     }
     let me = cx.tgid();
     let target = group_of(cx, pid)?;
-    let (tgid, ppid, sid) = {
+    let (tgid, ppid, sid, execed) = {
         let g = target.borrow();
-        (g.tgid, g.ppid, g.sid)
+        (g.tgid, g.ppid, g.sid, g.execed)
     };
     let my_sid = cx.t.group.borrow().sid;
     if tgid != me && ppid != me {
@@ -648,6 +692,10 @@ pub(super) fn setpgid(cx: &mut Cx<'_>, pid: i32, pgid: i32) -> SysResult {
     }
     if sid != my_sid {
         return Err(Errno::EPERM);
+    }
+    // 子进程 execve 之后，父进程不能再改它的进程组
+    if tgid != me && execed {
+        return Err(Errno::EACCES);
     }
     // 会话组长不能换进程组
     if sid == tgid {

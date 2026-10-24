@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker};
 use appine_hal::Event;
@@ -30,8 +30,10 @@ pub(crate) struct TaskSync {
     pub kicker: Kicker,
 }
 
-/// 当前目录和文件创建掩码（`CLONE_FS` 共享的部分）。
+/// 根目录、当前目录和文件创建掩码（`CLONE_FS` 共享的部分）。
 pub(crate) struct FsContext {
+    /// 根目录（chroot）。
+    pub root: Node,
     pub cwd: Node,
     pub umask: u32,
 }
@@ -60,8 +62,23 @@ pub(crate) struct Task {
     pub sigmask: Cell<u64>,
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
     pub killed: Cell<bool>,
+    /// 线程正在内核里等待（`/proc/<pid>/stat` 的状态 S）。在释放 BKL 之前设置，重新拿到
+    /// BKL 之后清除。
+    pub sleeping: Cell<bool>,
     /// 线程名（`prctl(PR_SET_NAME)`）。
     pub comm: Cell<[u8; 16]>,
+    /// 调度策略（含 `SCHED_RESET_ON_FORK`）和实时优先级：只记录，由宿主调度。
+    pub sched: Cell<(i32, i32)>,
+    /// `SCHED_DEADLINE` 的 (runtime, deadline, period)，纳秒。
+    pub deadline: Cell<(u64, u64, u64)>,
+    /// `PR_SET_TIMERSLACK` 的定时器松弛量和默认值（纳秒）：只记录。新线程的两者都是
+    /// 父线程当前的松弛量，设成 0 时恢复默认值。
+    pub timerslack: Cell<(u64, u64)>,
+    /// CPU 亲和性（最多 64 个 CPU）：只记录。
+    pub affinity: Cell<u64>,
+    /// set_robust_list 设置的 robust futex 链表头和长度，新线程从空开始。只记录：线程
+    /// 退出时不处理链表里的 futex。
+    pub robust_list: Cell<(u64, u64)>,
     pub sync: Arc<TaskSync>,
     /// 唤醒等待中的这个线程。
     pub event: Arc<Event>,
@@ -118,7 +135,13 @@ impl Task {
             info: RefCell::new([SigInfo::default(); Signal::MAX as usize]),
             sigmask: Cell::new(sigmask),
             killed: Cell::new(false),
+            sleeping: Cell::new(false),
             comm: Cell::new(comm),
+            sched: Cell::new((0, 0)),
+            deadline: Cell::new((0, 0, 0)),
+            timerslack: Cell::new((50_000, 50_000)),
+            affinity: Cell::new(u64::MAX),
+            robust_list: Cell::new((0, 0)),
             sync: Arc::new(TaskSync {
                 in_guest: AtomicBool::new(false),
                 kicker: cpu.kicker(),
@@ -174,30 +197,36 @@ fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu) {
 }
 
 fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
-    let (task, sync, mut generation, tier) = {
+    let (task, sync, mut generations, tier) = {
         let k = shared.lock();
         let task = k.tasks[&tid].clone();
         task.clock.set(appine_hal::thread_cpu_clock());
-        let generation = task.state.borrow().mm.borrow().generation();
+        let generations = task.state.borrow().mm.borrow().generations();
         let sync = task.sync.clone();
-        (task, sync, generation, k.tier)
+        (task, sync, generations, k.tier)
     };
     let mut dbt = match tier {
         Tier::Interpreter => None,
         Tier::Dbt => Dbt::new(),
     };
-    let mut seen = generation.load(Ordering::SeqCst);
+    let load = |(g, c): &(Arc<AtomicU64>, Arc<AtomicU64>)| {
+        (g.load(Ordering::SeqCst), c.load(Ordering::SeqCst))
+    };
+    let mut seen = load(&generations);
     loop {
         // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
         sync.in_guest.store(true, Ordering::SeqCst);
-        let g = generation.load(Ordering::SeqCst);
-        if g != seen {
+        let now = load(&generations);
+        if now.0 != seen.0 {
             cpu.tlb_flush();
-            if let Some(d) = &mut dbt {
-                d.flush();
-            }
-            seen = g;
         }
+        // 只有可执行的映射变了才需要重新翻译
+        if now.1 != seen.1
+            && let Some(d) = &mut dbt
+        {
+            d.flush();
+        }
+        seen = now;
         let exit = match &mut dbt {
             Some(d) => d.run(cpu),
             None => cpu.run(),
@@ -210,8 +239,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         match handle(&mut cx, cpu, exit) {
             Flow::Continue => {}
             Flow::Exec => {
-                generation = cx.mm().generation();
-                seen = generation.load(Ordering::SeqCst);
+                generations = cx.mm().generations();
+                seen = load(&generations);
                 if let Some(d) = &mut dbt {
                     d.flush();
                 }

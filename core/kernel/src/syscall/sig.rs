@@ -1,6 +1,9 @@
 //! 信号类 syscall：kill 系列、sigaction、屏蔽字、sigsuspend、sigaltstack。
 
-use super::{SysResult, get, put};
+use std::time::Instant;
+
+use super::{SysResult, get, put, read_timespec};
+use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::kernel::{Cx, INIT, Tid};
 use crate::process::Signal;
@@ -23,7 +26,19 @@ fn signal_arg(sig: i32) -> Result<Option<Signal>, Errno> {
 pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     let sig = signal_arg(sig)?;
     let me = cx.tgid();
-    let my_pgid = cx.t.group.borrow().pgid;
+    let (my_pgid, my_sid) = {
+        let g = cx.t.group.borrow();
+        (g.pgid, g.sid)
+    };
+    let cred = cx.cred();
+    // 内置的 init 忽略所有信号；没有权限给它发信号时与 Linux 一样报 EPERM
+    if pid == INIT {
+        return if cred.may_signal(&crate::cred::Cred::root()) {
+            Ok(0)
+        } else {
+            Err(Errno::EPERM)
+        };
+    }
     // 活着的目标线程组：pid > 0 是一个进程，0 是本进程组，-1 是除 init 和自己以外的
     // 所有进程，< -1 是进程组 -pid
     let targets: Vec<Tid> = cx
@@ -44,33 +59,240 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     if targets.is_empty() {
         return Err(Errno::ESRCH);
     }
+    // 没有权限的目标跳过；一个也发不出去时报 EPERM（pid 为 -1 时不报）
+    let allowed: Vec<Tid> = targets
+        .into_iter()
+        .filter(|&t| may_kill(cx, &cred, my_sid, t, sig))
+        .collect();
+    if allowed.is_empty() && pid != -1 {
+        return Err(Errno::EPERM);
+    }
     if let Some(sig) = sig {
-        for tgid in targets {
-            signal::send_to_group(cx.kr(), tgid, sig, SigInfo::kill(code::SI_USER, me));
+        for tgid in allowed {
+            let info = SigInfo::kill(code::SI_USER, me, cred.ruid);
+            signal::send_to_group(cx.kr(), tgid, sig, info);
         }
     }
     Ok(0)
 }
 
-pub(super) fn tkill(cx: &mut Cx<'_>, tid: i32, sig: i32) -> SysResult {
-    tgkill(cx, -1, tid, sig)
+/// 能不能给进程 `tgid` 发信号 `sig`（`check_kill_permission`）：凭据允许，或者是同一个
+/// 进程，或者是发给同一个会话的 SIGCONT。
+fn may_kill(cx: &Cx<'_>, cred: &Cred, sid: Tid, tgid: Tid, sig: Option<Signal>) -> bool {
+    let Some(target) = cx.kr().groups.get(&tgid) else {
+        return false;
+    };
+    let t = target.borrow();
+    t.tgid == cx.tgid() || cred.may_signal(&t.cred) || (sig == Some(Signal::CONT) && t.sid == sid)
 }
 
-/// `tgid` 为 -1 时不检查线程组（tkill）。
+pub(super) fn tkill(cx: &mut Cx<'_>, tid: i32, sig: i32) -> SysResult {
+    kill_thread(cx, None, tid, sig)
+}
+
 pub(super) fn tgkill(cx: &mut Cx<'_>, tgid: i32, tid: i32, sig: i32) -> SysResult {
-    if tid <= 0 || tgid == 0 || tgid < -1 {
+    if tgid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    kill_thread(cx, Some(tgid), tid, sig)
+}
+
+/// 给一个线程发信号；`tgid` 为 None 时不检查它属于哪个线程组（tkill）。
+fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysResult {
+    if tid <= 0 {
         return Err(Errno::EINVAL);
     }
     let sig = signal_arg(sig)?;
     let task = cx.kr().tasks.get(&tid).cloned().ok_or(Errno::ESRCH)?;
-    if tgid != -1 && task.tgid != tgid {
+    if tgid.is_some_and(|g| task.tgid != g) {
         return Err(Errno::ESRCH);
     }
+    let cred = cx.cred();
+    let sid = cx.t.group.borrow().sid;
+    if !may_kill(cx, &cred, sid, task.tgid, sig) {
+        return Err(Errno::EPERM);
+    }
     if let Some(sig) = sig {
-        let info = SigInfo::kill(code::SI_TKILL, cx.tgid());
+        let info = SigInfo::kill(code::SI_TKILL, cx.tgid(), cred.ruid);
         signal::send_to_task(cx.kr(), &task, sig, info);
     }
     Ok(0)
+}
+
+/// rt_sigqueueinfo、rt_tgsigqueueinfo（`tid` 为 None 时发给整个进程）：siginfo 由调用者
+/// 给出。不能冒充内核或 kill 发出的信号（si_code 不小于 0 或者是 SI_TKILL），除非发给
+/// 自己。
+pub(super) fn sigqueueinfo(
+    cx: &mut Cx<'_>,
+    tgid: i32,
+    tid: Option<i32>,
+    sig: i32,
+    uinfo: u64,
+) -> SysResult {
+    let b: [u8; 128] = get(cx, uinfo)?;
+    let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    let code = word(8);
+    let target = tid.unwrap_or(tgid);
+    if (code >= 0 || code == code::SI_TKILL) && target != cx.tid() && tgid != cx.tgid() {
+        return Err(Errno::EPERM);
+    }
+    let info = SigInfo {
+        code,
+        fields: signal::InfoFields::Queue {
+            pid: word(16),
+            uid: word(20) as u32,
+            value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        },
+        esr: 0,
+    };
+    let sig = signal_arg(sig)?;
+    let cred = cx.cred();
+    let sid = cx.t.group.borrow().sid;
+    // rt_sigqueueinfo 的 pid 也可以是进程里任何一个线程的 tid
+    let tgid = match tid {
+        None => cx.kr().tasks.get(&tgid).map_or(tgid, |t| t.tgid),
+        Some(_) => tgid,
+    };
+    match tid {
+        Some(tid) => {
+            if tgid <= 0 || tid <= 0 {
+                return Err(Errno::EINVAL);
+            }
+            let task = cx.kr().tasks.get(&tid).cloned().ok_or(Errno::ESRCH)?;
+            if task.tgid != tgid {
+                return Err(Errno::ESRCH);
+            }
+            if !may_kill(cx, &cred, sid, tgid, sig) {
+                return Err(Errno::EPERM);
+            }
+            if let Some(sig) = sig {
+                signal::send_to_task(cx.kr(), &task, sig, info);
+            }
+        }
+        None => {
+            let alive = cx
+                .kr()
+                .groups
+                .get(&tgid)
+                .is_some_and(|g| g.borrow().zombie.is_none() && tgid != INIT);
+            if !alive {
+                return Err(Errno::ESRCH);
+            }
+            if !may_kill(cx, &cred, sid, tgid, sig) {
+                return Err(Errno::EPERM);
+            }
+            if let Some(sig) = sig {
+                signal::send_to_group(cx.kr(), tgid, sig, info);
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// signalfd4：`fd` 为 -1 时新建，否则修改已有 signalfd 的掩码。
+pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags: u32) -> SysResult {
+    use crate::fd::{FileKind, OpenFile, SignalFd, oflags};
+    if size != SIGSET_SIZE || flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let set = u64::from_le_bytes(get(cx, mask)?) & !UNBLOCKABLE;
+    if fd != -1 {
+        let file = cx.fds().get(fd)?;
+        let FileKind::SignalFd(s) = &file.borrow().kind else {
+            return Err(Errno::EINVAL);
+        };
+        s.borrow_mut().mask = set;
+        crate::kernel::request_wake();
+        return Ok(fd as u64);
+    }
+    let s = SignalFd {
+        mask: set,
+        group: std::rc::Rc::downgrade(&cx.t.group),
+        task: std::rc::Rc::downgrade(cx.task),
+    };
+    let file = OpenFile::new(
+        FileKind::SignalFd(std::rc::Rc::new(std::cell::RefCell::new(s))),
+        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
+    );
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
+/// 读 signalfd：取走调用者挂起的、在掩码里的信号，每个编码成 128 字节的
+/// `struct signalfd_siginfo`。一个都没有时阻塞（非阻塞时 EAGAIN）。
+pub(super) fn signalfd_read(
+    cx: &mut Cx<'_>,
+    s: &std::rc::Rc<std::cell::RefCell<crate::fd::SignalFd>>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    if buf.len() < 128 {
+        return Err(Errno::EINVAL);
+    }
+    let mut n = 0;
+    loop {
+        let mask = s.borrow().mask;
+        while n + 128 <= buf.len() {
+            let Some((sig, info)) = signal::take(cx, mask) else {
+                break;
+            };
+            buf[n..n + 128].copy_from_slice(&encode_signalfd_siginfo(sig, &info));
+            n += 128;
+        }
+        if n > 0 {
+            return Ok(n);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait(None, &mut [])?;
+    }
+}
+
+/// `struct signalfd_siginfo`（128 字节）。
+fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
+    use signal::InfoFields;
+    let mut b = [0u8; 128];
+    let mut put32 = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put32(0, sig.number() as u32);
+    put32(8, info.code as u32);
+    let mut value = None;
+    match info.fields {
+        InfoFields::None => {}
+        InfoFields::Kill { pid, uid } => {
+            put32(12, pid as u32);
+            put32(16, uid);
+        }
+        InfoFields::Child { pid, uid, status } => {
+            put32(12, pid as u32);
+            put32(16, uid);
+            put32(40, status as u32);
+        }
+        InfoFields::Queue { pid, uid, value: v } => {
+            put32(12, pid as u32);
+            put32(16, uid);
+            value = Some(v);
+        }
+        InfoFields::Timer {
+            id,
+            overrun,
+            value: v,
+        } => {
+            put32(24, id as u32);
+            put32(32, overrun);
+            value = Some(v);
+        }
+        InfoFields::Fault { addr } => b[72..80].copy_from_slice(&addr.to_le_bytes()),
+    }
+    if let Some(v) = value {
+        b[44..48].copy_from_slice(&(v as u32).to_le_bytes());
+        b[48..56].copy_from_slice(&v.to_le_bytes());
+    }
+    b
 }
 
 pub(super) fn rt_sigaction(
@@ -188,6 +410,41 @@ pub(super) fn rt_sigsuspend(cx: &mut Cx<'_>, set: u64, size: usize) -> SysResult
         }
     }
     Err(Errno::ERESTARTNOHAND)
+}
+
+/// rt_sigtimedwait（sigwait、sigwaitinfo、sigtimedwait）：等 `set` 里的信号挂起，不经过
+/// 处理函数直接取走它。`set` 里的信号通常被调用方屏蔽着；别的信号打断等待时返回 EINTR，
+/// 与 Linux 相同，这个 syscall 不会被重新执行。
+pub(super) fn rt_sigtimedwait(
+    cx: &mut Cx<'_>,
+    set: u64,
+    info: u64,
+    timeout: u64,
+    size: usize,
+) -> SysResult {
+    if size != SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let want = u64::from_le_bytes(get(cx, set)?) & !UNBLOCKABLE;
+    let deadline = match timeout {
+        0 => None,
+        t => Some(Instant::now() + read_timespec(cx, t)?),
+    };
+    loop {
+        if let Some((sig, si)) = signal::take(cx, want) {
+            if info != 0 {
+                put(cx, info, si.encode(sig))?;
+            }
+            return Ok(sig.number() as u64);
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::EINTR);
+        }
+        cx.wait(deadline, &mut [])?;
+    }
 }
 
 pub(super) fn sigaltstack(cx: &mut Cx<'_>, sp: u64, uss: u64, uoss: u64) -> SysResult {

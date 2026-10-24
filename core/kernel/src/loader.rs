@@ -2,16 +2,21 @@
 //!
 //! 支持静态链接（`ET_EXEC`）和位置无关（`ET_DYN`）的 aarch64 程序。带
 //! `PT_INTERP` 的程序同时加载解释器（Alpine 上是 `ld-musl`），从解释器的入口
-//! 开始执行，由它完成动态链接。段的内容拷贝进匿名内存；初始栈按 Linux 的约定
-//! 构造，auxv 与 arm64 Linux 给出的条目和顺序一致；vDSO 映射在解释器下方。
+//! 开始执行，由它完成动态链接。仓库里的程序以私有文件映射的方式映射各段，代码页
+//! 经由宿主 page cache 在进程之间共享（设计文档 §5.2）；没有宿主文件的程序和段之间
+//! 共用页的程序把内容拷贝进匿名内存。初始栈按 Linux 的约定构造，auxv 与 arm64 Linux
+//! 给出的条目和顺序一致；vDSO 映射在解释器下方。
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::ptr::NonNull;
 
 use appine_engine::{PAGE_SIZE, VA_BITS, prot};
 
 use crate::errno::Errno;
-use crate::mm::Mm;
+use crate::mm::{Mm, flags};
 
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -106,6 +111,9 @@ pub struct Args<'a> {
     pub envp: &'a [Vec<u8>],
     /// 程序路径，放进 `AT_EXECFN`。
     pub execfn: &'a [u8],
+    /// 新程序的真实和有效用户 ID、组 ID（`AT_UID` 等）。两组不同时（setuid、setgid
+    /// 程序）设置 `AT_SECURE`。
+    pub ids: [u32; 4],
 }
 
 /// 加载结果：guest 开始执行时的 pc 和 sp，以及程序和解释器所在的地址范围。
@@ -129,9 +137,77 @@ struct Segment {
     prot: u32,
 }
 
+/// 要加载的可执行文件：全部内容，以及能直接映射进 guest 地址空间的宿主文件。
+pub struct Executable {
+    bytes: Bytes,
+    file: Option<File>,
+}
+
+enum Bytes {
+    /// 宿主文件的只读映射：解析时按需从 page cache 读取，不必整个读进内存。
+    Mapped {
+        base: NonNull<u8>,
+        len: usize,
+        map_len: usize,
+    },
+    Owned(Vec<u8>),
+}
+
+impl Executable {
+    /// 宿主文件（仓库里的 object）。
+    pub fn open(file: File) -> Result<Executable, Errno> {
+        let len = file
+            .metadata()
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?
+            .len() as usize;
+        if len == 0 {
+            return Ok(Executable::from_bytes(Vec::new()));
+        }
+        let m = appine_hal::map_file(file.as_raw_fd(), 0, len, true, false).map_err(Errno)?;
+        Ok(Executable {
+            bytes: Bytes::Mapped {
+                base: m.base,
+                len,
+                map_len: m.len,
+            },
+            file: Some(file),
+        })
+    }
+
+    /// 内存里的内容，没有宿主文件：各段拷贝进匿名内存。
+    pub fn from_bytes(data: Vec<u8>) -> Executable {
+        Executable {
+            bytes: Bytes::Owned(data),
+            file: None,
+        }
+    }
+
+    /// 文件的全部内容。
+    pub fn bytes(&self) -> &[u8] {
+        match &self.bytes {
+            // SAFETY: 映射在 Executable 析构之前一直有效
+            Bytes::Mapped { base, len, .. } => unsafe {
+                std::slice::from_raw_parts(base.as_ptr(), *len)
+            },
+            Bytes::Owned(v) => v,
+        }
+    }
+}
+
+impl Drop for Executable {
+    fn drop(&mut self) {
+        if let Bytes::Mapped { base, map_len, .. } = self.bytes {
+            // SAFETY: 映射来自 open，bytes() 借出的切片不会活得比 self 长
+            unsafe { appine_hal::unmap(base, map_len) };
+        }
+    }
+}
+
 /// 解析后的 ELF 文件。
 struct Elf<'a> {
     file: &'a [u8],
+    /// 可以直接映射的宿主文件。
+    fd: Option<i32>,
     e_type: u16,
     entry: u64,
     phoff: u64,
@@ -151,7 +227,8 @@ struct Loaded {
 }
 
 impl<'a> Elf<'a> {
-    fn parse(file: &'a [u8]) -> Result<Self, LoadError> {
+    fn parse(exe: &'a Executable) -> Result<Self, LoadError> {
+        let file = exe.bytes();
         if file.len() < 64 || &file[..4] != b"\x7fELF" {
             return Err(LoadError::NotElf);
         }
@@ -174,6 +251,7 @@ impl<'a> Elf<'a> {
 
         let mut elf = Elf {
             file,
+            fd: exe.file.as_ref().map(AsRawFd::as_raw_fd),
             e_type,
             entry,
             phoff,
@@ -285,12 +363,40 @@ impl<'a> Elf<'a> {
         }
         // 每个 guest 页的权限是覆盖它的所有段的并集
         let mut pages: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut shared_page = false;
         for seg in &self.segments {
             let mut page = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
             while page < bias + seg.vaddr + seg.memsz {
-                *pages.entry(page).or_insert(0) |= seg.prot;
+                match pages.get_mut(&page) {
+                    Some(p) => {
+                        *p |= seg.prot;
+                        shared_page = true;
+                    }
+                    None => {
+                        pages.insert(page, seg.prot);
+                    }
+                }
                 page += PAGE_SIZE;
             }
+        }
+        let loaded = Loaded {
+            bias,
+            entry: bias + self.entry,
+            phdr: bias + self.phdr_vaddr()?,
+            phnum: self.phnum,
+            end: bias + hi,
+        };
+        // 文件偏移和地址在页内的位置一致（Linux 也这样要求）并且段之间不共用页时，
+        // 直接映射宿主文件
+        let aligned = self
+            .segments
+            .iter()
+            .all(|s| (s.offset as u64 ^ s.vaddr) & (PAGE_SIZE - 1) == 0);
+        if let (Some(fd), false, true) = (self.fd, shared_page, aligned) {
+            for seg in &self.segments {
+                self.map_from_file(mm, bias, seg, fd)?;
+            }
+            return Ok(loaded);
         }
         // 相邻且权限相同的页合并成一次映射
         let mut runs: Vec<(u64, u64, u32)> = Vec::new();
@@ -313,25 +419,58 @@ impl<'a> Elf<'a> {
             )
             .map_err(LoadError::Memory)?;
         }
-        Ok(Loaded {
-            bias,
-            entry: bias + self.entry,
-            phdr: bias + self.phdr_vaddr()?,
-            phnum: self.phnum,
-            end: bias + hi,
-        })
+        Ok(loaded)
+    }
+
+    /// 以私有文件映射映射一个段：文件内容所在的页映射宿主文件，最后一页里文件内容之后
+    /// 的部分清零（.bss 的开头），其余的 .bss 是匿名内存。
+    fn map_from_file(
+        &self,
+        mm: &mut Mm,
+        bias: u64,
+        seg: &Segment,
+        fd: i32,
+    ) -> Result<(), LoadError> {
+        let start = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
+        let data_end = bias + seg.vaddr + seg.filesz as u64;
+        let end = (bias + seg.vaddr + seg.memsz).next_multiple_of(PAGE_SIZE);
+        let mut anon_start = start;
+        if seg.filesz > 0 {
+            let file_end = data_end.next_multiple_of(PAGE_SIZE);
+            let offset = seg.offset as u64 - (bias + seg.vaddr - start);
+            let fixed = flags::MAP_PRIVATE | flags::MAP_FIXED;
+            mm.mmap(
+                start,
+                file_end - start,
+                seg.prot,
+                fixed,
+                Some((fd, offset, false)),
+            )
+            .map_err(LoadError::Memory)?;
+            if seg.memsz > seg.filesz as u64 && file_end > data_end {
+                let zeros = vec![0u8; (file_end - data_end) as usize];
+                mm.write_kernel(data_end, &zeros)
+                    .map_err(LoadError::Memory)?;
+            }
+            anon_start = file_end;
+        }
+        if end > anon_start {
+            mm.map_anonymous(anon_start, end - anon_start, seg.prot)
+                .map_err(LoadError::Memory)?;
+        }
+        Ok(())
     }
 }
 
-/// 按 guest 路径读取解释器文件的回调。
-pub type ReadInterp<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>, Errno> + 'a;
+/// 按 guest 路径打开解释器文件的回调。
+pub type ReadInterp<'a> = dyn FnMut(&[u8]) -> Result<Executable, Errno> + 'a;
 
 /// 把 ELF 文件 `file` 加载进 `mm`，并按 Linux 的约定构造初始栈。
 ///
 /// 程序带 `PT_INTERP` 时，用 `read_interp` 按 guest 路径读取解释器文件。
 pub fn load(
     mm: &mut Mm,
-    file: &[u8],
+    file: &Executable,
     args: &Args<'_>,
     read_interp: &mut ReadInterp<'_>,
 ) -> Result<Image, LoadError> {
@@ -394,11 +533,14 @@ pub fn load(
         (AT_BASE, interp_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, main.entry),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
-        (AT_SECURE, 0),
+        (AT_UID, args.ids[0] as u64),
+        (AT_EUID, args.ids[1] as u64),
+        (AT_GID, args.ids[2] as u64),
+        (AT_EGID, args.ids[3] as u64),
+        (
+            AT_SECURE,
+            (args.ids[0] != args.ids[1] || args.ids[2] != args.ids[3]) as u64,
+        ),
         (AT_RANDOM, 0),
         (AT_HWCAP2, 0),
         (AT_EXECFN, 0),
@@ -596,8 +738,12 @@ mod tests {
         u64::from_le_bytes(b)
     }
 
-    fn no_interp(_: &[u8]) -> Result<Vec<u8>, Errno> {
+    fn no_interp(_: &[u8]) -> Result<Executable, Errno> {
         Err(Errno::ENOENT)
+    }
+
+    fn exe(bytes: &[u8]) -> Executable {
+        Executable::from_bytes(bytes.to_vec())
     }
 
     /// 读出初始栈上的 auxv。
@@ -629,8 +775,15 @@ mod tests {
             argv: &argv,
             envp: &envp,
             execfn: b"/bin/prog",
+            ids: [0; 4],
         };
-        let image = load(&mut mm, &tiny_elf(ET_EXEC, &code), &args, &mut no_interp).unwrap();
+        let image = load(
+            &mut mm,
+            &exe(&tiny_elf(ET_EXEC, &code)),
+            &args,
+            &mut no_interp,
+        )
+        .unwrap();
         assert_eq!(image.entry, 0x400078);
         assert_eq!(image.sp % 16, 0);
         assert_eq!(read_u64(&mm, 0x400078) as u32, 0xd503201f);
@@ -676,28 +829,29 @@ mod tests {
     #[test]
     fn loads_pie_with_interpreter() {
         let code = 0xd503201fu32.to_le_bytes();
-        let exe = with_interp(tiny_elf(ET_DYN, &code), b"/lib/ld.so");
+        let main = with_interp(tiny_elf(ET_DYN, &code), b"/lib/ld.so");
         let mut ld = tiny_elf(ET_DYN, &code);
         ld[24..32].copy_from_slice(&0x400078u64.to_le_bytes());
         let mut requested = Vec::new();
         let mut read_interp = |path: &[u8]| {
             requested = path.to_vec();
-            Ok(ld.clone())
+            Ok(exe(&ld))
         };
         let mut mm = Mm::new();
         let args = Args {
             argv: &[b"prog".to_vec()],
             envp: &[],
             execfn: b"prog",
+            ids: [0; 4],
         };
-        let image = load(&mut mm, &exe, &args, &mut read_interp).unwrap();
+        let image = load(&mut mm, &exe(&main), &args, &mut read_interp).unwrap();
         assert_eq!(requested, b"/lib/ld.so");
 
         let aux = auxv(&mm, image.sp);
         let exe_base = ET_DYN_BASE - 0x400000;
         assert_eq!(aux[&AT_PHDR], exe_base + 0x400040);
         assert_eq!(aux[&AT_PHNUM], 2);
-        assert_eq!(aux[&AT_ENTRY], exe_base + u64_at(&exe, 24).unwrap());
+        assert_eq!(aux[&AT_ENTRY], exe_base + u64_at(&main, 24).unwrap());
         let interp_base = aux[&AT_BASE];
         assert!(interp_base > ET_DYN_BASE && interp_base.is_multiple_of(PAGE_SIZE));
         assert_eq!(image.entry, interp_base + 0x78);
@@ -725,18 +879,29 @@ mod tests {
         f.extend_from_slice(&bss);
         f.extend_from_slice(&0xd503201fu32.to_le_bytes());
 
-        let mut mm = Mm::new();
-        let args = Args {
-            argv: &[],
-            envp: &[],
-            execfn: b"",
-        };
-        load(&mut mm, &f, &args, &mut no_interp).unwrap();
-        assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
-        assert!(mm.mmu().translate(0x423fe0, prot::WRITE).is_some());
-        assert_eq!(read_u64(&mm, 0x420000), 0);
-        // program break 紧跟在最后一个段之后
-        assert_eq!(mm.brk(0), 0x424000);
+        // 内存里的内容拷贝进匿名内存；宿主文件直接映射
+        let path = std::env::temp_dir().join(format!("appine-loader-{}", std::process::id()));
+        std::fs::write(&path, &f).unwrap();
+        let from_file = Executable::open(File::open(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        for file in [exe(&f), from_file] {
+            let mut mm = Mm::new();
+            let args = Args {
+                argv: &[],
+                envp: &[],
+                execfn: b"",
+                ids: [0; 4],
+            };
+            let image = load(&mut mm, &file, &args, &mut no_interp).unwrap();
+            assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
+            assert!(mm.mmu().translate(0x423fe0, prot::WRITE).is_some());
+            assert_eq!(read_u64(&mm, 0x420000), 0);
+            let mut insn = [0u8; 4];
+            mm.read(UserSlice::new(image.entry, 4), &mut insn).unwrap();
+            assert_eq!(insn, 0xd503201fu32.to_le_bytes());
+            // program break 紧跟在最后一个段之后
+            assert_eq!(mm.brk(0), 0x424000);
+        }
     }
 
     #[test]
@@ -746,14 +911,15 @@ mod tests {
             argv: &[],
             envp: &[],
             execfn: b"",
+            ids: [0; 4],
         };
         assert_eq!(
-            load(&mut mm, b"#!/bin/sh\n", &args, &mut no_interp),
+            load(&mut mm, &exe(b"#!/bin/sh\n"), &args, &mut no_interp),
             Err(LoadError::NotElf)
         );
-        let exe = with_interp(tiny_elf(ET_EXEC, &[0; 4]), b"/lib/missing.so");
+        let missing = with_interp(tiny_elf(ET_EXEC, &[0; 4]), b"/lib/missing.so");
         assert_eq!(
-            load(&mut Mm::new(), &exe, &args, &mut no_interp),
+            load(&mut Mm::new(), &exe(&missing), &args, &mut no_interp),
             Err(LoadError::Interpreter(
                 b"/lib/missing.so".to_vec(),
                 Errno::ENOENT

@@ -62,6 +62,21 @@ scripts/dev sh -c 'target/linux-arm64/debug/appine-run --rootfs target/store \
 
 The tests that need the internet run only with `APPINE_NETWORK_TESTS=1`.
 
+### LTP
+
+The syscall tests of the [Linux Test Project](https://github.com/linux-test-project/ltp)
+are built natively in an `alpine` arm64 container and run inside appine, one fresh
+`appine-run` per test:
+
+```sh
+scripts/build-ltp                      # builds target/ltp/ltp-<version>.tar (needs Docker)
+scripts/dev scripts/ltp -j 8           # all syscall tests; results in target/ltp/results.txt
+scripts/dev scripts/ltp 'fcntl.*|mmap.*'   # only the tests whose name matches
+```
+
+`APPINE_STRACE=1` makes `appine-run` print every syscall with its arguments and result,
+which helps when a test fails.
+
 ## Android app
 
 The app in [android/](android) runs the same kernel inside an Android app: each tab is a

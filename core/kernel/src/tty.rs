@@ -245,6 +245,8 @@ pub struct Tty {
     pub slaves: usize,
     /// 从设备是否还没有解锁（unlockpt）。
     pub locked: bool,
+    /// `/dev/pts/<index>` 的属主和属组：打开主设备的进程的 fsuid、fsgid。
+    pub owner: (u32, u32),
 }
 
 impl Tty {
@@ -265,6 +267,7 @@ impl Tty {
             masters: 0,
             slaves: 0,
             locked: true,
+            owner: (0, 0),
         }
     }
 

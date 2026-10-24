@@ -18,7 +18,6 @@ use crate::net::{
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
 use crate::uaccess::UserSlice;
-use crate::unix::Ucred;
 
 /// socket 和它所在的打开文件。
 pub(crate) type SocketRef = Rc<RefCell<Socket>>;
@@ -27,7 +26,11 @@ const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_NONBLOCK: u32 = oflags::O_NONBLOCK;
 const SOCK_CLOEXEC: u32 = oflags::O_CLOEXEC;
 const IPPROTO_ICMP: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+const IPPROTO_UDP: i32 = 17;
 const IPPROTO_ICMPV6: i32 = 58;
+const IPPROTO_UDPLITE: i32 = 136;
+const IPPROTO_MPTCP: i32 = 262;
 
 const SOL_SOCKET: i32 = 1;
 const SO_RCVTIMEO: i32 = 20;
@@ -37,6 +40,7 @@ const SO_ERROR: i32 = 4;
 const MSG_PEEK: u32 = 0x2;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
+const MSG_ERRQUEUE: u32 = 0x2000;
 const MSG_WAITALL: u32 = 0x100;
 const MSG_NOSIGNAL: u32 = 0x4000;
 
@@ -53,6 +57,7 @@ fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(SocketRef, bool), Errno> {
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
     match &f.kind {
+        _ if f.flags & oflags::O_PATH != 0 => Err(Errno::EBADF),
         FileKind::Socket(s) => Ok((s.clone(), f.nonblocking())),
         _ => Err(Errno::ENOTSOCK),
     }
@@ -75,11 +80,17 @@ fn read_addr(cx: &Cx<'_>, addr: u64, len: u32) -> Result<Vec<u8>, Errno> {
 }
 
 /// 把地址写回 guest：`addrlen` 指向缓冲区长度，写回实际长度（缓冲区不够时截断）。
+/// accept、recvfrom 的 `addr` 可以为 NULL，表示不要地址。
 fn write_addr(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
     if addr == 0 || addrlen == 0 {
         return Ok(());
     }
-    let room = u32::from_le_bytes(get(cx, addrlen)?) as usize;
+    write_addr_to(cx, addr, addrlen, value)
+}
+
+/// getsockname、getpeername：`addrlen` 必须有效，长度为负时 EINVAL。
+fn write_addr_to(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
+    let room = usize::try_from(i32::from_le_bytes(get(cx, addrlen)?)).map_err(|_| Errno::EINVAL)?;
     let n = room.min(value.len());
     cx.mm().write(UserSlice::new(addr, n), &value[..n])?;
     put(cx, addrlen, (value.len() as u32).to_le_bytes())
@@ -158,7 +169,22 @@ pub(super) fn socketpair(
     }
     match domain {
         AF_UNIX => {}
-        AF_INET | AF_INET6 | AF_NETLINK => return Err(Errno::EOPNOTSUPP),
+        // 和 Linux 一样先按普通的 socket 检查类型和协议，再报告不支持 socketpair
+        AF_INET | AF_INET6 => {
+            let ok = match (ty & SOCK_TYPE_MASK) as i32 {
+                SOCK_STREAM => matches!(protocol, 0 | IPPROTO_TCP | IPPROTO_MPTCP),
+                SOCK_DGRAM => matches!(protocol, 0 | IPPROTO_UDP | IPPROTO_ICMP | IPPROTO_UDPLITE),
+                // raw socket 不能用协议 0
+                SOCK_RAW => protocol != 0,
+                _ => false,
+            };
+            return Err(if ok {
+                Errno::EOPNOTSUPP
+            } else {
+                Errno::EPROTONOSUPPORT
+            });
+        }
+        AF_NETLINK => return Err(Errno::EOPNOTSUPP),
         _ => return Err(Errno::EAFNOSUPPORT),
     }
     let (a, b) = unix::pair(cx, (ty & SOCK_TYPE_MASK) as i32, protocol)?;
@@ -184,6 +210,16 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
     }
+    // 1024 以下的端口要求 CAP_NET_BIND_SERVICE
+    let family = addr
+        .get(..2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as i32);
+    if matches!(family, Some(AF_INET | AF_INET6)) && addr.len() >= 4 {
+        let port = u16::from_be_bytes([addr[2], addr[3]]);
+        if port != 0 && port < 1024 && !cx.cred().capable(crate::cred::cap::NET_BIND_SERVICE) {
+            return Err(Errno::EACCES);
+        }
+    }
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => appine_hal::net::bind(s.fd, &addr).map_err(Errno)?,
         Socket::Netlink(s) => {
@@ -202,7 +238,7 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => appine_hal::net::listen(s.fd, backlog).map_err(Errno)?,
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
-        Socket::Unix(u) => unix::listen(u, backlog, Ucred::of(cx.tgid()))?,
+        Socket::Unix(u) => unix::listen(u, backlog, cx.ucred())?,
     }
     Ok(0)
 }
@@ -305,7 +341,7 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
         Socket::Netlink(s) => s.sockaddr(),
         Socket::Unix(u) => unix::sockname(u, peer)?,
     };
-    write_addr(cx, addr, addrlen, &value).map(|()| 0)
+    write_addr_to(cx, addr, addrlen, &value).map(|()| 0)
 }
 
 pub(super) fn getsockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64) -> SysResult {
@@ -357,7 +393,7 @@ pub(super) fn getsockopt(
     len: u64,
 ) -> SysResult {
     let (sock, _) = socket_of(cx, fd)?;
-    let room = u32::from_le_bytes(get(cx, len)?) as usize;
+    let room = usize::try_from(i32::from_le_bytes(get(cx, len)?)).map_err(|_| Errno::EINVAL)?;
     let encode_tv = |t: Option<Duration>| {
         let t = t.unwrap_or_default();
         let mut b = (t.as_secs() as i64).to_le_bytes().to_vec();
@@ -491,7 +527,8 @@ pub(crate) fn recv(
     if is_unix(sock) {
         return unix::recv(cx, sock, nonblock, max, control_len, flags);
     }
-    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    // 读错误队列（MSG_ERRQUEUE）从不等待：没有排队的错误时 EAGAIN
+    let nonblock = nonblock || flags & (MSG_DONTWAIT | MSG_ERRQUEUE) != 0;
     // 进程内产生的数据报：DNS 存根的回答、netlink 的回答
     let local = |q: &mut std::collections::VecDeque<Vec<u8>>, addr: Vec<u8>| {
         let d = if flags & MSG_PEEK != 0 {
@@ -696,6 +733,58 @@ pub(super) fn sendmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
             .read(UserSlice::new(control, cmsg.len()), &mut cmsg)?;
     }
     send(cx, &sock, nonblock, &data, &addr, &cmsg, flags).map(|n| n as u64)
+}
+
+/// `struct mmsghdr` 的大小：msghdr 后面跟着 msg_len。
+const MMSGHDR_SIZE: u64 = 64;
+/// sendmmsg、recvmmsg 一次最多处理的消息个数（`UIO_MAXIOV`）。
+const MMSG_MAX: u32 = 1024;
+const MSG_WAITFORONE: u32 = 0x1_0000;
+
+/// sendmmsg：逐个 sendmsg。第一个就失败时返回错误，否则返回发出的个数。
+pub(super) fn sendmmsg(cx: &mut Cx<'_>, fd: i32, vec: u64, vlen: u32, flags: u32) -> SysResult {
+    let mut done = 0;
+    for i in 0..vlen.min(MMSG_MAX) as u64 {
+        let hdr = vec + i * MMSGHDR_SIZE;
+        match sendmsg(cx, fd, hdr, flags) {
+            Ok(n) => put(cx, hdr + 56, (n as u32).to_le_bytes())?,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+        done += 1;
+    }
+    Ok(done)
+}
+
+/// recvmmsg：逐个 recvmsg。`MSG_WAITFORONE` 时收到第一个之后不再等待；超时只在
+/// 每收到一个之后检查，与 Linux 相同。
+pub(super) fn recvmmsg(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    vec: u64,
+    vlen: u32,
+    flags: u32,
+    timeout: u64,
+) -> SysResult {
+    let deadline = super::poll::deadline_ts(cx, timeout)?;
+    let mut flags = flags;
+    let mut done = 0;
+    for i in 0..vlen.min(MMSG_MAX) as u64 {
+        let hdr = vec + i * MMSGHDR_SIZE;
+        match recvmsg(cx, fd, hdr, flags & !MSG_WAITFORONE) {
+            Ok(n) => put(cx, hdr + 56, (n as u32).to_le_bytes())?,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+        done += 1;
+        if flags & MSG_WAITFORONE != 0 {
+            flags |= MSG_DONTWAIT;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+    }
+    Ok(done)
 }
 
 pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResult {

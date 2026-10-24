@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile};
+use crate::ipc;
 use crate::kernel::{INIT, Kernel, Tid};
 use crate::process::{Signal, ThreadGroup};
 use crate::signal::SigAction;
@@ -64,9 +65,10 @@ pub(crate) enum Entry {
     Fd,
     Task,
     OomScoreAdj,
+    CoredumpFilter,
 }
 
-const ENTRIES: [(&[u8], Entry); 14] = [
+const ENTRIES: [(&[u8], Entry); 15] = [
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
@@ -81,18 +83,29 @@ const ENTRIES: [(&[u8], Entry); 14] = [
     (b"fd", Entry::Fd),
     (b"task", Entry::Task),
     (b"oom_score_adj", Entry::OomScoreAdj),
+    (b"coredump_filter", Entry::CoredumpFilter),
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 18] = [
+const STATIC: [&[u8]; 41] = [
     b"net/",
     b"net/dev",
     b"sys/",
     b"sys/fs/",
     b"sys/fs/file-max",
+    b"sys/fs/lease-break-time",
+    b"sys/fs/nr_open",
+    b"sys/fs/pipe-max-size",
+    b"sys/fs/pipe-user-pages-hard",
+    b"sys/fs/pipe-user-pages-soft",
     b"sys/kernel/",
     b"sys/kernel/cap_last_cap",
+    b"sys/kernel/core_pattern",
+    b"sys/kernel/domainname",
     b"sys/kernel/hostname",
+    b"sys/kernel/msgmax",
+    b"sys/kernel/msgmnb",
+    b"sys/kernel/msgmni",
     b"sys/kernel/ngroups_max",
     b"sys/kernel/osrelease",
     b"sys/kernel/ostype",
@@ -100,10 +113,36 @@ const STATIC: [&[u8]; 18] = [
     b"sys/kernel/random/",
     b"sys/kernel/random/boot_id",
     b"sys/kernel/random/uuid",
+    b"sys/kernel/sched_rr_timeslice_ms",
+    b"sys/kernel/sem",
+    b"sys/kernel/shmall",
+    b"sys/kernel/shmmax",
+    b"sys/kernel/shmmni",
+    b"sys/kernel/tainted",
+    b"sys/kernel/threads-max",
     b"sys/kernel/version",
     b"sys/vm/",
+    b"sys/vm/max_map_count",
     b"sys/vm/overcommit_memory",
+    b"sys/vm/overcommit_ratio",
+    b"sysvipc/",
+    b"sysvipc/msg",
+    b"sysvipc/sem",
+    b"sysvipc/shm",
 ];
+
+/// `/proc` 下直接的静态目录（`net/`、`sys/`、`sysvipc/`）。
+fn is_top_dir(path: &[u8]) -> bool {
+    path.iter().position(|&b| b == b'/') == Some(path.len() - 1)
+}
+
+/// `/proc/<name>` 是不是静态目录。
+fn top_static(name: &[u8]) -> Option<&'static [u8]> {
+    STATIC
+        .iter()
+        .find(|p| is_top_dir(p) && &p[..p.len() - 1] == name)
+        .copied()
+}
 
 /// 合成文件系统里的一个节点。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -204,6 +243,14 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
 }
 
 impl<'a> View<'a> {
+    /// 读者（`self` 指向的线程）的根目录：procfs 里的路径相对它显示。
+    fn root(&self) -> Node {
+        self.k
+            .tasks
+            .get(&self.tid)
+            .map_or(Node::ROOT, |t| t.res.borrow().fs.borrow().root.clone())
+    }
+
     fn group(&self, pid: Tid) -> Option<Rc<RefCell<ThreadGroup>>> {
         self.k.groups.get(&pid).cloned()
     }
@@ -316,8 +363,7 @@ impl Pseudo for View<'_> {
             ProcRoot => match name {
                 b"self" => Some(SelfLink),
                 b"thread-self" => Some(ThreadSelf),
-                b"net" => Some(Static(STATIC[0])),
-                b"sys" => Some(Static(STATIC[2])),
+                _ if top_static(name).is_some() => top_static(name).map(Static),
                 _ => GLOBALS
                     .iter()
                     .find(|(n, _)| *n == name)
@@ -387,7 +433,11 @@ impl Pseudo for View<'_> {
             SelfLink => Ok(self.tgid.to_string().into_bytes()),
             ThreadSelf => Ok(format!("{}/task/{}", self.tgid, self.tid).into_bytes()),
             Global(self::Global::Mounts) => Ok(b"self/mounts".to_vec()),
-            Entry(_, _, self::Entry::Root) => Ok(b"/".to_vec()),
+            Entry(pid, tid, self::Entry::Root) => {
+                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
+                let root = task.res.borrow().fs.borrow().root.clone();
+                self.vfs.path_of(self, &self.root(), &root)
+            }
             Entry(pid, _, self::Entry::Exe) => {
                 let g = self.group(*pid).ok_or(Errno::ENOENT)?;
                 let exe = g.borrow().exe.clone();
@@ -400,7 +450,7 @@ impl Pseudo for View<'_> {
             Entry(pid, tid, self::Entry::Cwd) => {
                 let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
                 let cwd = task.res.borrow().fs.borrow().cwd.clone();
-                self.vfs.path_of(self, &cwd)
+                self.vfs.path_of(self, &self.root(), &cwd)
             }
             Fd(pid, fd) => {
                 let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
@@ -447,6 +497,8 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
         FileKind::Socket(s) => format!("socket:[{}]", Rc::as_ptr(s) as u64 >> 4).into_bytes(),
         FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
         FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
+        FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
+        FileKind::SignalFd(_) => b"anon_inode:[signalfd]".to_vec(),
         FileKind::Host(fd) => std::fs::read_link(format!("/proc/self/fd/{fd}"))
             .map(|p| {
                 use std::os::unix::ffi::OsStringExt;
@@ -476,12 +528,13 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let now = appine_hal::clock_gettime(0)
         .map(|(s, ns)| s * 1_000_000_000 + ns)
         .unwrap_or(0);
+    let (uid, gid) = owner_of(ps.k, node);
     Ok(Stat {
         ino: ino_of(node),
         mode: kind | perm,
         nlink: if kind == mode::S_IFDIR { 2 } else { 1 },
-        uid: 0,
-        gid: 0,
+        uid,
+        gid,
         rdev: rdev_value,
         size: 0,
         mtime_ns: now,
@@ -489,12 +542,81 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     })
 }
 
-/// 可以写入的 procfs 文件：写入的内容被接受但不起作用。
+/// 节点的属主和属组：`/proc/<pid>` 下是进程的有效用户 ID 和组 ID，`/dev/pts/<n>`
+/// 是打开主设备的进程，其余是 root。
+fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
+    match node {
+        PseudoNode::Pid(pid, _) | PseudoNode::Entry(pid, ..) | PseudoNode::Fd(pid, _) => {
+            k.groups.get(pid).map_or((0, 0), |g| {
+                let c = &g.borrow().cred;
+                (c.euid, c.egid)
+            })
+        }
+        PseudoNode::Pts(n) => k
+            .ptys
+            .get(n)
+            .and_then(std::rc::Weak::upgrade)
+            .map_or((0, 0), |t| t.borrow().owner),
+        _ => (0, 0),
+    }
+}
+
+/// 可以写入的 procfs 文件。
 pub(crate) fn writable(node: &PseudoNode) -> bool {
     matches!(
         node,
-        PseudoNode::Entry(_, None, Entry::OomScoreAdj) | PseudoNode::Static(b"sys/kernel/hostname")
+        PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
+            | PseudoNode::Static(
+                b"sys/kernel/hostname"
+                    | b"sys/kernel/domainname"
+                    | b"sys/kernel/pid_max"
+                    | b"sys/kernel/core_pattern"
+                    | b"sys/kernel/msgmax"
+                    | b"sys/kernel/msgmnb"
+                    | b"sys/kernel/msgmni"
+                    | b"sys/kernel/sem"
+                    | b"sys/kernel/shmall"
+                    | b"sys/kernel/shmmax"
+                    | b"sys/kernel/shmmni"
+                    | b"sys/fs/lease-break-time"
+                    | b"sys/fs/nr_open"
+                    | b"sys/fs/pipe-max-size"
+                    | b"sys/vm/max_map_count"
+            )
     )
+}
+
+/// 写 procfs 文件：`oom_score_adj`、主机名、域名和 System V IPC 的限制记下新值，其余
+/// 可写的文件接受写入但不起作用。
+pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<(), Errno> {
+    if let PseudoNode::Static(path) = node
+        && let Some(name) = path.strip_prefix(b"sys/kernel/")
+        && k.ipc.tunables.read(name).is_some()
+    {
+        return k.ipc.tunables.write(name, data);
+    }
+    if let PseudoNode::Static(path @ (b"sys/kernel/hostname" | b"sys/kernel/domainname")) = node {
+        let name = data.strip_suffix(b"\n").unwrap_or(data);
+        if name.len() > crate::kernel::UTS_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let slot = if *path == b"sys/kernel/hostname" {
+            &mut k.hostname
+        } else {
+            &mut k.domainname
+        };
+        *slot = name.to_vec();
+    }
+    if let PseudoNode::Entry(pid, _, Entry::OomScoreAdj) = node {
+        let value: i32 = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v| (-1000..=1000).contains(v))
+            .ok_or(Errno::EINVAL)?;
+        let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
+        group.borrow_mut().oom_score_adj = value;
+    }
+    Ok(())
 }
 
 /// 目录的内容（不含 `.` 和 `..`）。
@@ -512,7 +634,8 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
             );
         }
         ProcRoot => {
-            nodes.extend([SelfLink, ThreadSelf, Static(STATIC[0]), Static(STATIC[2])]);
+            nodes.extend([SelfLink, ThreadSelf]);
+            nodes.extend(STATIC.iter().filter(|p| is_top_dir(p)).map(|p| Static(p)));
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
             nodes.extend(ps.k.groups.keys().map(|&pid| Pid(pid, None)));
         }
@@ -590,16 +713,13 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static
     if g.stopped {
         return ('T', "stopped");
     }
-    let running = g
-        .threads
-        .iter()
-        .filter(|t| tid.is_none_or(|x| x == **t))
-        .filter_map(|t| ps.k.tasks.get(t))
-        .any(|t| t.sync.in_guest.load(std::sync::atomic::Ordering::Relaxed));
-    if running {
-        ('R', "running")
-    } else {
+    // 与 Linux 相同，进程的状态是主线程（主线程已退出时是代表线程）的状态：在内核里
+    // 等待是 S，其余（执行 guest 代码、处理 syscall、刚创建还没运行）都是 R
+    let sleeping = ps.task(g.tgid, tid).is_some_and(|t| t.sleeping.get());
+    if sleeping {
         ('S', "sleeping")
+    } else {
+        ('R', "running")
     }
 }
 
@@ -739,15 +859,23 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
     writeln!(s, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{}", tid.unwrap_or(pid)).unwrap();
     writeln!(s, "PPid:\t{}\nTracerPid:\t0", g.ppid).unwrap();
-    writeln!(
-        s,
-        "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t{fdsize}\nGroups:\t"
-    )
-    .unwrap();
+    let c = &g.cred;
+    writeln!(s, "Uid:\t{}\t{}\t{}\t{}", c.ruid, c.euid, c.suid, c.fsuid).unwrap();
+    writeln!(s, "Gid:\t{}\t{}\t{}\t{}", c.rgid, c.egid, c.sgid, c.fsgid).unwrap();
+    let groups: Vec<String> = c.groups.iter().map(u32::to_string).collect();
+    writeln!(s, "FDSize:\t{fdsize}\nGroups:\t{}", groups.join(" ")).unwrap();
     if task.is_some() {
         let kb = vsize / 1024;
         writeln!(s, "VmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB").unwrap();
-        writeln!(s, "VmRSS:\t{:>8} kB", rss * 4).unwrap();
+        let locked = task
+            .as_ref()
+            .map_or(0, |t| t.res.borrow().mm.borrow().locked_bytes());
+        writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
+        writeln!(s, "VmHWM:\t{:>8} kB\nVmRSS:\t{:>8} kB", rss * 4, rss * 4).unwrap();
+        // 不区分数据段、栈和代码；没有交换
+        writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", 0).unwrap();
+        writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
+        writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
     }
     writeln!(s, "Threads:\t{}", g.threads.len().max(1)).unwrap();
     writeln!(s, "SigQ:\t0/63432").unwrap();
@@ -757,9 +885,12 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
         "SigBlk:\t{blocked:016x}\nSigIgn:\t{sigign:016x}\nSigCgt:\t{sigcgt:016x}"
     )
     .unwrap();
-    writeln!(s, "CapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff").unwrap();
-    writeln!(s, "CapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff").unwrap();
-    writeln!(s, "CapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0").unwrap();
+    writeln!(s, "CapInh:\t{:016x}", c.cap_inheritable).unwrap();
+    writeln!(s, "CapPrm:\t{:016x}", c.cap_permitted).unwrap();
+    writeln!(s, "CapEff:\t{:016x}", c.cap_effective).unwrap();
+    writeln!(s, "CapBnd:\t{:016x}", c.cap_bounding).unwrap();
+    writeln!(s, "CapAmb:\t0000000000000000").unwrap();
+    writeln!(s, "NoNewPrivs:\t{}\nSeccomp:\t0", g.no_new_privs as u8).unwrap();
     writeln!(s, "Cpus_allowed_list:\t0-{}", cpus() - 1).unwrap();
     writeln!(
         s,
@@ -934,8 +1065,28 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         Static(path) => match &path[..] {
             b"net/dev" => net_dev(),
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
+            b"sys/fs/lease-break-time" => "45\n".to_owned(),
+            b"sys/fs/nr_open" => format!("{}\n", crate::fd::MAX_FDS),
+            b"sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE),
+            b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
+            b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
-            b"sys/kernel/hostname" => "localhost\n".to_owned(),
+            b"sys/kernel/core_pattern" => "core\n".to_owned(),
+            b"sys/kernel/domainname" => {
+                format!("{}\n", String::from_utf8_lossy(&ps.k.domainname))
+            }
+            b"sys/kernel/hostname" => format!("{}\n", String::from_utf8_lossy(&ps.k.hostname)),
+            b"sys/kernel/sched_rr_timeslice_ms" => "100\n".to_owned(),
+            b"sys/kernel/msgmax" | b"sys/kernel/msgmnb" | b"sys/kernel/msgmni"
+            | b"sys/kernel/sem" | b"sys/kernel/shmall" | b"sys/kernel/shmmax"
+            | b"sys/kernel/shmmni" => ps.k.ipc.tunables.read(&path[11..]).unwrap(),
+            b"sysvipc/msg" => ipc::proc_listing(ps.k, b"msg"),
+            b"sysvipc/sem" => ipc::proc_listing(ps.k, b"sem"),
+            b"sysvipc/shm" => ipc::proc_listing(ps.k, b"shm"),
+            b"sys/kernel/tainted" => "0\n".to_owned(),
+            b"sys/kernel/threads-max" => format!("{}\n", crate::kernel::PID_MAX),
+            b"sys/vm/max_map_count" => "65530\n".to_owned(),
+            b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
@@ -964,7 +1115,12 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 }
                 self::Entry::Maps => task.map_or(String::new(), |t| maps(&t)),
                 self::Entry::Mounts => MOUNTS.to_owned(),
-                self::Entry::OomScoreAdj => "0\n".to_owned(),
+                self::Entry::OomScoreAdj => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    format!("{}\n", g.borrow().oom_score_adj)
+                }
+                // 不产生 core dump，只给出 Linux 的默认值（写入接受但不起作用）
+                self::Entry::CoredumpFilter => "00000033\n".to_owned(),
                 _ => return Err(Errno::EINVAL),
             }
         }

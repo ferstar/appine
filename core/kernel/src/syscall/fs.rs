@@ -6,16 +6,18 @@
 
 use std::cell::RefCell;
 use std::os::unix::fs::FileExt;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use super::SocketRef;
 use super::{IO_CHUNK, SysResult, get, put, read_path, tty};
+use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
-use crate::fd::{EventFd, FileKind, FileRef, OpenFile, oflags};
+use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
 use crate::kernel::{Cx, request_wake};
-use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
-use crate::process::Signal;
+use crate::locks::{self, Lock, Owner, Waiter};
+use crate::pipe::{PIPE_BUF, PIPE_MAX_SIZE, Pipe, PipeEnd};
+use crate::process::{RLIMIT_FSIZE, Signal};
 use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
 use crate::tty::{PTS_MAJOR, Tty};
@@ -39,6 +41,18 @@ const F_SETFL: u32 = 4;
 const F_GETLK: u32 = 5;
 const F_SETLK: u32 = 6;
 const F_SETLKW: u32 = 7;
+const F_OFD_GETLK: u32 = 36;
+const F_OFD_SETLK: u32 = 37;
+const F_OFD_SETLKW: u32 = 38;
+const F_SETOWN: u32 = 8;
+const F_GETOWN: u32 = 9;
+const F_SETSIG: u32 = 10;
+const F_GETSIG: u32 = 11;
+const F_SETOWN_EX: u32 = 15;
+const F_GETOWN_EX: u32 = 16;
+const F_OWNER_TID: i32 = 0;
+const F_OWNER_PID: i32 = 1;
+const F_OWNER_PGRP: i32 = 2;
 const F_DUPFD_CLOEXEC: u32 = 1030;
 const F_SETPIPE_SZ: u32 = 1031;
 const F_GETPIPE_SZ: u32 = 1032;
@@ -54,6 +68,8 @@ const F_SEAL_WRITE: u32 = 0x8;
 const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 const F_SEAL_EXEC: u32 = 0x20;
 const F_SEAL_ALL: u32 = 0x3f;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
 const F_UNLCK: i16 = 2;
 
 const SEEK_SET: u32 = 0;
@@ -114,10 +130,13 @@ fn host_errno(e: std::io::Error) -> Errno {
 
 // ---- 路径 ----
 
-/// `*at` 系列的起点目录。
+/// `*at` 系列的起点目录。路径为空时直接 ENOENT（不看 dirfd），与 Linux 相同。
 fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
     if path.first() == Some(&b'/') {
-        return Ok(Node::ROOT);
+        return Ok(cx.root());
     }
     if dirfd == AT_FDCWD {
         return Ok(cx.cwd());
@@ -133,14 +152,26 @@ fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
 
 /// 解析 `*at` 系列的路径参数。
 pub(super) fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
+    resolve_at(cx, &cx.cred(), dirfd, path, follow)
+}
+
+/// 以凭据 `cred` 解析 `*at` 系列的路径参数。
+fn resolve_at(
+    cx: &Cx<'_>,
+    cred: &Cred,
+    dirfd: i32,
+    path: &[u8],
+    follow: bool,
+) -> Result<Node, Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
-    vfs.resolve(&cx.view(&vfs), &start, path, follow)
+    vfs.resolve(&cx.view(&vfs), cred, &cx.root(), &start, path, follow)
 }
 
 /// `*at` 系列里"路径为空时作用于 dirfd 本身"（`AT_EMPTY_PATH`）的公共部分。
 fn lookup_at_or_fd(
     cx: &Cx<'_>,
+    cred: &Cred,
     dirfd: i32,
     path: &[u8],
     flags: u32,
@@ -152,7 +183,7 @@ fn lookup_at_or_fd(
         }
         return cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF);
     }
-    lookup_at(cx, dirfd, path, follow)
+    resolve_at(cx, cred, dirfd, path, follow)
 }
 
 /// 解析要新建或删除的路径：返回父目录和最后一个组件。只有仓库里的目录可以修改。
@@ -163,8 +194,39 @@ pub(super) fn parent_at<'p>(
 ) -> Result<(Ino, &'p [u8]), Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
-    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &start, path)?;
+    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
     Ok((store_ino(&dir)?, name))
+}
+
+/// 在目录 `dir` 里新建 `name` 之前的检查（`may_create`）：要能在目录里查找，名字
+/// 不存在，目录可写。返回目录的元数据。
+pub(super) fn may_create(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
+    let st = store.stat(dir)?;
+    cred.permission(&st, MAY_EXEC)?;
+    if store.lookup(dir, name)?.is_some() {
+        return Err(Errno::EEXIST);
+    }
+    cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+    Ok(st)
+}
+
+/// 删除或者移走目录 `dir` 里的 `name` 之前的检查（`may_delete`），返回它的元数据。
+fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
+    let dir_st = store.stat(dir)?;
+    cred.permission(&dir_st, MAY_EXEC)?;
+    let victim = store.stat(store.lookup(dir, name)?.ok_or(Errno::ENOENT)?)?;
+    cred.may_delete(&dir_st, &victim)?;
+    Ok(victim)
+}
+
+/// fchmod、fchown 等作用的打开文件在仓库里的 inode：`O_PATH` 打开的文件不行。
+fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    if f.flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    f.ino().ok_or(Errno::EBADF)
 }
 
 /// 仓库里的 inode；合成文件系统里的节点不能修改。
@@ -180,7 +242,7 @@ fn display_path(cx: &Cx<'_>, vfs: &Vfs, start: &Node, path: &[u8]) -> Option<Rc<
     let full = if path.first() == Some(&b'/') {
         path.to_vec()
     } else {
-        let mut p = vfs.path_of(&cx.view(vfs), start).ok()?;
+        let mut p = vfs.path_of(&cx.view(vfs), &cx.root(), start).ok()?;
         p.push(b'/');
         p.extend_from_slice(path);
         p
@@ -287,12 +349,15 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
     };
     match &f.kind {
         FileKind::Host(fd) => host_stat(*fd),
-        FileKind::Pipe(end) => Ok(anon(
-            end.pipe.borrow().ino,
-            mode::S_IFIFO | 0o600,
-            0,
-            PIPE_DEV,
-        )),
+        FileKind::Pipe(end) => match end.pipe.borrow().fifo {
+            Some(ino) => Ok(encode_stat(&cx.vfs()?.store().stat(ino)?, ROOT_DEV)),
+            None => Ok(anon(
+                end.pipe.borrow().ino,
+                mode::S_IFIFO | 0o600,
+                0,
+                PIPE_DEV,
+            )),
+        },
         FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
         FileKind::Socket(s) => Ok(anon(
             Rc::as_ptr(s) as u64 >> 4,
@@ -301,7 +366,10 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
             SOCK_DEV,
         )),
         // anon_inode：没有文件类型位
-        FileKind::Epoll(_) | FileKind::EventFd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        FileKind::Epoll(_)
+        | FileKind::EventFd(_)
+        | FileKind::TimerFd(_)
+        | FileKind::SignalFd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         FileKind::Pty(end) => {
             let n = end.tty.borrow().index;
             Ok(anon(
@@ -332,19 +400,22 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
     let create = flags & oflags::O_CREAT != 0;
     let excl = create && flags & oflags::O_EXCL != 0;
     let follow = flags & oflags::O_NOFOLLOW == 0 && !excl;
+    let cred = cx.cred();
 
-    let resolved = vfs.resolve(&cx.view(&vfs), &start, &path, follow);
+    let root = cx.root();
+    let resolved = vfs.resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow);
     let (node, created) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
         Ok(node) => (node, None),
         Err(e) if e == Errno::ENOENT && create => {
-            let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &start, &path)?;
+            let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &root, &start, &path)?;
             if path.ends_with(b"/") || name == b"." || name == b".." {
                 return Err(Errno::EISDIR);
             }
             let dir = store_ino(&dir)?;
-            let perm = perm & !cx.umask() & 0o7777;
-            let (ino, file) = vfs.store().create_file(dir, name, perm, 0, 0)?;
+            let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+            let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
+            let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
             (Node::Store(ino), Some(file))
         }
         Err(e) => return Err(e),
@@ -358,8 +429,8 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         FileKind::Path(node)
     } else {
         match node {
-            Node::Store(ino) => open_store(cx, vfs.store(), ino, flags, created)?,
-            Node::Pseudo(p) => open_pseudo(cx, &vfs, p, flags)?,
+            Node::Store(ino) => open_store(cx, &cred, vfs.store(), ino, flags, created)?,
+            Node::Pseudo(p) => open_pseudo(cx, &cred, &vfs, p, flags)?,
         }
     };
     if let FileKind::Pty(end) = &kind {
@@ -374,6 +445,96 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         .map(|fd| fd as u64)
 }
 
+/// 文件句柄（`struct file_handle`）里的类型和长度：句柄就是仓库里的 inode 编号。
+const FILE_HANDLE_TYPE: i32 = 1;
+const FILE_HANDLE_BYTES: u32 = 8;
+const MAX_HANDLE_SZ: u32 = 128;
+const AT_HANDLE_FID: u32 = 0x200;
+
+/// name_to_handle_at：仓库里的文件的句柄是它的 inode 编号；合成文件系统不支持句柄。
+pub(super) fn name_to_handle_at(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: u64,
+    handle: u64,
+    mount_id: u64,
+    flags: u32,
+) -> SysResult {
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let path = read_path(cx, path)?;
+    let node = lookup_at_or_fd(
+        cx,
+        &cx.cred(),
+        dirfd,
+        &path,
+        flags,
+        flags & AT_SYMLINK_FOLLOW != 0,
+    )?;
+    let Node::Store(ino) = node else {
+        return Err(Errno::EOPNOTSUPP);
+    };
+    let room = u32::from_le_bytes(get(cx, handle)?);
+    if room > MAX_HANDLE_SZ {
+        return Err(Errno::EINVAL);
+    }
+    // 放不下时写回需要的长度
+    if room < FILE_HANDLE_BYTES {
+        put(cx, handle, FILE_HANDLE_BYTES.to_le_bytes())?;
+        return Err(Errno::EOVERFLOW);
+    }
+    let mut b = [0u8; 16];
+    b[..4].copy_from_slice(&FILE_HANDLE_BYTES.to_le_bytes());
+    b[4..8].copy_from_slice(&FILE_HANDLE_TYPE.to_le_bytes());
+    b[8..].copy_from_slice(&ino.to_le_bytes());
+    put(cx, handle, b)?;
+    // 根文件系统的挂载 id
+    put(cx, mount_id, 1i32.to_le_bytes())?;
+    Ok(0)
+}
+
+/// open_by_handle_at：按 inode 编号打开，要求 `CAP_DAC_READ_SEARCH`。
+pub(super) fn open_by_handle_at(
+    cx: &mut Cx<'_>,
+    mount_fd: i32,
+    handle: u64,
+    flags: u32,
+) -> SysResult {
+    if !cx.cred().capable(cap::DAC_READ_SEARCH) {
+        return Err(Errno::EPERM);
+    }
+    if mount_fd != AT_FDCWD {
+        cx.fds().get(mount_fd)?;
+    }
+    let b: [u8; 16] = get(cx, handle)?;
+    let bytes = u32::from_le_bytes(b[..4].try_into().unwrap());
+    if bytes == 0 || bytes > MAX_HANDLE_SZ {
+        return Err(Errno::EINVAL);
+    }
+    let ty = i32::from_le_bytes(b[4..8].try_into().unwrap());
+    let ino = u64::from_le_bytes(b[8..].try_into().unwrap());
+    let vfs = cx.vfs()?;
+    // 文件已经删除（或者句柄不是这里发的）：ESTALE
+    let st = match vfs.store().stat(ino) {
+        Ok(st) if bytes == FILE_HANDLE_BYTES && ty == FILE_HANDLE_TYPE && st.nlink > 0 => st,
+        _ => return Err(Errno::ESTALE),
+    };
+    let kind = if flags & oflags::O_PATH != 0 {
+        if flags & oflags::O_DIRECTORY != 0 && !st.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        FileKind::Path(Node::Store(ino))
+    } else {
+        open_store(cx, &cx.cred(), vfs.store(), ino, flags, None)?
+    };
+    let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
+    let file = OpenFile::new(kind, flags & keep);
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
 /// 设备号对应的 PTY 从设备编号（主设备号 136–143）。
 fn pts_index(r: u64) -> Option<u32> {
     let major = ((r >> 8) & 0xfff) as u32;
@@ -383,9 +544,46 @@ fn pts_index(r: u64) -> Option<u32> {
         .then(|| ((major - PTS_MAJOR) << 8) + minor)
 }
 
-/// 打开仓库里的 inode。
+/// 有没有进程正在执行仓库里的程序 `ino`（以写方式打开它时 ETXTBSY）。
+pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
+    cx.kr()
+        .tasks
+        .values()
+        .any(|t| t.res.borrow().mm.borrow().exe == Some(ino))
+}
+
+/// 有没有以写方式打开着的 `ino`（执行它时 ETXTBSY）。
+pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
+    let mut seen = Vec::new();
+    cx.kr().tasks.values().any(|t| {
+        let fds = t.res.borrow().fds.clone();
+        if seen.contains(&Rc::as_ptr(&fds)) {
+            return false;
+        }
+        seen.push(Rc::as_ptr(&fds));
+        let table = fds.borrow();
+        table.open_fds().into_iter().any(|fd| {
+            table.get(fd).is_ok_and(|f| {
+                let f = f.borrow();
+                f.writable() && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
+            })
+        })
+    })
+}
+
+/// open 要求的访问权限（`MAY_*`）。
+fn open_mask(flags: u32) -> u32 {
+    match flags & oflags::O_ACCMODE {
+        oflags::O_RDONLY => MAY_READ,
+        oflags::O_WRONLY => MAY_WRITE,
+        _ => MAY_READ | MAY_WRITE,
+    }
+}
+
+/// 打开仓库里的 inode。刚刚由这次 open 新建的文件（`created`）不检查权限。
 fn open_store(
     cx: &mut Cx<'_>,
+    cred: &Cred,
     store: &Store,
     ino: Ino,
     flags: u32,
@@ -393,6 +591,21 @@ fn open_store(
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
     let st = store.stat(ino)?;
+    if created.is_none() {
+        let mut mask = open_mask(flags);
+        match st.kind() {
+            mode::S_IFLNK => return Err(Errno::ELOOP),
+            mode::S_IFDIR if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 => {
+                return Err(Errno::EISDIR);
+            }
+            mode::S_IFREG if flags & oflags::O_TRUNC != 0 => mask |= MAY_WRITE,
+            _ => {}
+        }
+        cred.permission(&st, mask)?;
+        if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
+            return Err(Errno::EPERM);
+        }
+    }
     Ok(match st.kind() {
         mode::S_IFLNK => return Err(Errno::ELOOP),
         mode::S_IFDIR => {
@@ -406,6 +619,10 @@ fn open_store(
         }
         _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
         mode::S_IFREG => {
+            let write = accmode != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
+            if write && created.is_none() && executing(cx, ino) {
+                return Err(Errno::ETXTBSY);
+            }
             let file = match created {
                 Some(f) => f,
                 None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
@@ -418,7 +635,7 @@ fn open_store(
         mode::S_IFCHR => match st.rdev {
             // /dev/tty、/dev/console：调用者的控制终端
             r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
-            PTMX_RDEV => tty::open_ptmx(cx.k())?,
+            PTMX_RDEV => tty::open_ptmx(cx.k(), (cred.fsuid, cred.fsgid))?,
             r => match pts_index(r) {
                 Some(index) => tty::open_slave(cx, index, flags)?,
                 None => FileKind::Device {
@@ -427,22 +644,74 @@ fn open_store(
                 },
             },
         },
-        // 块设备、FIFO、socket 文件还不支持
+        mode::S_IFIFO => open_fifo(cx, ino, flags)?,
+        // 块设备、socket 文件不能打开（socket 文件用 connect）
         _ => return Err(Errno::ENXIO),
     })
+}
+
+/// 打开命名管道（FIFO）：同一个 inode 的所有打开共用一个管道。与 Linux 相同，只读打开
+/// 等到有写者，只写打开等到有读者（`O_NONBLOCK` 时没有读者就返回 ENXIO），读写打开不等。
+fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
+    let accmode = flags & oflags::O_ACCMODE;
+    let nonblock = flags & oflags::O_NONBLOCK != 0;
+    let (read, write) = match accmode {
+        oflags::O_RDONLY => (true, false),
+        oflags::O_WRONLY => (false, true),
+        _ => (true, true),
+    };
+    let pipe = {
+        let k = cx.k();
+        k.fifos.retain(|_, w| w.strong_count() > 0);
+        match k.fifos.get(&ino).and_then(Weak::upgrade) {
+            Some(p) => p,
+            None => {
+                let p = Pipe::fifo(ino);
+                k.fifos.insert(ino, Rc::downgrade(&p));
+                p
+            }
+        }
+    };
+    if write && !read && nonblock && pipe.borrow().readers == 0 {
+        return Err(Errno::ENXIO);
+    }
+    let peer_opens = |p: &Pipe| if read { p.writer_opens } else { p.reader_opens };
+    let before = peer_opens(&pipe.borrow());
+    let end = PipeEnd::open(&pipe, read, write);
+    if read != write && !nonblock {
+        // 等对端打开：对端来过就行，哪怕已经关掉
+        loop {
+            {
+                let p = pipe.borrow();
+                let peers = if read { p.writers } else { p.readers };
+                if peers > 0 || peer_opens(&p) != before {
+                    break;
+                }
+            }
+            if cx.interrupted() {
+                return Err(Errno::ERESTARTSYS);
+            }
+            cx.wait(None, &mut [])?;
+        }
+    }
+    Ok(FileKind::Pipe(end))
 }
 
 /// 打开合成文件系统里的节点。
 fn open_pseudo(
     cx: &mut Cx<'_>,
+    cred: &Cred,
     vfs: &Vfs,
     node: PseudoNode,
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
+    if !matches!(node, PseudoNode::OpenFd(..)) {
+        cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
+    }
     match node {
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
-        PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k()),
+        PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), (cred.fsuid, cred.fsgid)),
         PseudoNode::OpenFd(pid, fd) => return reopen(cx, vfs, pid, fd, accmode),
         _ => {}
     }
@@ -472,13 +741,11 @@ fn reopen(cx: &Cx<'_>, vfs: &Vfs, pid: i32, fd: i32, accmode: u32) -> Result<Fil
     let file = cx.view(vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
     let f = file.borrow();
     match &f.kind {
-        FileKind::Pipe(end) => {
-            if accmode == oflags::O_RDWR {
-                return Err(Errno::EINVAL);
-            }
-            let write = accmode == oflags::O_WRONLY;
-            Ok(FileKind::Pipe(PipeEnd::reopen(&end.pipe, write)))
-        }
+        FileKind::Pipe(end) => Ok(FileKind::Pipe(PipeEnd::open(
+            &end.pipe,
+            accmode != oflags::O_WRONLY,
+            accmode != oflags::O_RDONLY,
+        ))),
         FileKind::Host(fd) => Ok(FileKind::Host(*fd)),
         _ => Err(Errno::ENXIO),
     }
@@ -487,7 +754,10 @@ fn reopen(cx: &Cx<'_>, vfs: &Vfs, pid: i32, fd: i32, accmode: u32) -> Result<Fil
 pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     // 先从表里拿出来再释放：关闭管道的最后一端会唤醒另一端
     let r = cx.fds_mut().close(fd);
-    r.map(|()| 0)
+    let file = r?;
+    let fds = cx.t.fds.clone();
+    locks::closed(cx.k(), &fds, &[file]);
+    Ok(0)
 }
 
 pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) -> SysResult {
@@ -498,11 +768,13 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
-    cx.fds_mut().close_range(
+    let closed = cx.fds_mut().close_range(
         first as usize,
         last as usize,
         flags & CLOSE_RANGE_CLOEXEC != 0,
     );
+    let fds = cx.t.fds.clone();
+    locks::closed(cx.k(), &fds, &closed);
     Ok(0)
 }
 
@@ -516,9 +788,10 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
         return Err(Errno::EINVAL);
     }
     let file = cx.fds().get(old)?;
-    cx.fds_mut()
-        .install_at(new, file, flags != 0)
-        .map(|()| new as u64)
+    let replaced = cx.fds_mut().install_at(new, file, flags != 0);
+    let fds = cx.t.fds.clone();
+    locks::closed(cx.k(), &fds, &replaced?.into_iter().collect::<Vec<_>>());
+    Ok(new as u64)
 }
 
 pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
@@ -532,7 +805,9 @@ pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     let r = OpenFile::new(FileKind::Pipe(r), oflags::O_RDONLY | status);
     let w = OpenFile::new(FileKind::Pipe(w), oflags::O_WRONLY | status);
     let rfd = cx.fds_mut().install(r, cloexec, 0)?;
-    let wfd = match cx.fds_mut().install(w, cloexec, 0) {
+    // 先结束对 fd 表的借用：失败时还要再借一次，关掉读端
+    let installed = cx.fds_mut().install(w, cloexec, 0);
+    let wfd = match installed {
         Ok(fd) => fd,
         Err(e) => {
             let _ = cx.fds_mut().close(rfd);
@@ -570,13 +845,74 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             f.flags = (f.flags & !oflags::SETFL_MASK) | (arg as u32 & oflags::SETFL_MASK);
             Ok(0)
         }
-        // 记录锁还没有实现：F_GETLK 总是报告没有锁，加锁总是成功
-        F_GETLK => put(cx, arg, F_UNLCK.to_le_bytes()).map(|()| 0),
-        F_SETLK | F_SETLKW => Ok(0),
-        F_GETPIPE_SZ | F_SETPIPE_SZ => match file.borrow().kind {
-            FileKind::Pipe(_) => Ok(PIPE_CAPACITY as u64),
-            _ => Err(Errno::EBADF),
-        },
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
+            record_lock(cx, &file, cmd, arg)
+        }
+        // 异步 I/O 通知（O_ASYNC、SIGIO）没有实现：属主和信号只记录下来
+        F_SETOWN => {
+            let pid = arg as i32;
+            file.borrow_mut().owner = if pid < 0 {
+                (F_OWNER_PGRP, -pid)
+            } else {
+                (F_OWNER_PID, pid)
+            };
+            Ok(0)
+        }
+        F_GETOWN => {
+            let (ty, pid) = file.borrow().owner;
+            Ok(if ty == F_OWNER_PGRP { -pid } else { pid } as i64 as u64)
+        }
+        F_SETOWN_EX => {
+            let b: [u8; 8] = get(cx, arg)?;
+            let ty = i32::from_le_bytes(b[..4].try_into().unwrap());
+            let pid = i32::from_le_bytes(b[4..].try_into().unwrap());
+            if !matches!(ty, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
+                return Err(Errno::EINVAL);
+            }
+            file.borrow_mut().owner = (ty, pid);
+            Ok(0)
+        }
+        F_GETOWN_EX => {
+            let (ty, pid) = file.borrow().owner;
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&ty.to_le_bytes());
+            b[4..].copy_from_slice(&pid.to_le_bytes());
+            put(cx, arg, b).map(|()| 0)
+        }
+        F_SETSIG => {
+            if arg != 0 && Signal::new(arg as i32).is_none() {
+                return Err(Errno::EINVAL);
+            }
+            file.borrow_mut().sig = arg as i32;
+            Ok(0)
+        }
+        F_GETSIG => Ok(file.borrow().sig as u64),
+        F_GETPIPE_SZ | F_SETPIPE_SZ => {
+            let f = file.borrow();
+            let FileKind::Pipe(end) = &f.kind else {
+                return Err(Errno::EBADF);
+            };
+            let mut p = end.pipe.borrow_mut();
+            if cmd == F_GETPIPE_SZ {
+                return Ok(p.capacity as u64);
+            }
+            // 按页向上取整到 2 的幂；超过 pipe-max-size 要求 CAP_SYS_RESOURCE，
+            // 不能小于已经缓冲的数据
+            let size = (arg as u32 as usize)
+                .max(PIPE_BUF)
+                .checked_next_power_of_two()
+                .filter(|&n| n <= 1 << 31)
+                .ok_or(Errno::EINVAL)?;
+            if size > PIPE_MAX_SIZE && !cx.cred().capable(cap::SYS_RESOURCE) {
+                return Err(Errno::EPERM);
+            }
+            if size < p.buf.len() {
+                return Err(Errno::EBUSY);
+            }
+            p.capacity = size;
+            request_wake();
+            Ok(size as u64)
+        }
         // 只有 memfd 能加封印
         F_ADD_SEALS | F_GET_SEALS => {
             let f = file.borrow();
@@ -598,6 +934,132 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// fcntl 的记录锁命令（[`crate::locks`]）：`arg` 指向 `struct flock`。
+fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult {
+    let mut b: [u8; 32] = get(cx, arg)?;
+    let half = |off: usize| i16::from_le_bytes(b[off..off + 2].try_into().unwrap());
+    let long = |off: usize| i64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+    let (l_type, whence, l_start, l_len) = (half(0), half(2), long(8), long(16));
+    let l_pid = i32::from_le_bytes(b[24..28].try_into().unwrap());
+    let ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    let getlk = matches!(cmd, F_GETLK | F_OFD_GETLK);
+    if ofd && l_pid != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let write = match l_type {
+        F_RDLCK => false,
+        F_WRLCK => true,
+        F_UNLCK if !getlk => false,
+        _ => return Err(Errno::EINVAL),
+    };
+    let unlock = l_type == F_UNLCK;
+    if !matches!(whence as u32, SEEK_SET | SEEK_CUR | SEEK_END) {
+        return Err(Errno::EINVAL);
+    }
+    let (ino, start, end) = {
+        let f = file.borrow();
+        if !getlk && !unlock && !(if write { f.writable() } else { f.readable() }) {
+            return Err(Errno::EBADF);
+        }
+        let Some(ino) = f.ino() else {
+            // 不在仓库里的文件（管道、socket）：别的进程看不到它们的锁
+            if getlk {
+                b[..2].copy_from_slice(&F_UNLCK.to_le_bytes());
+                put(cx, arg, b)?;
+            }
+            return Ok(0);
+        };
+        let base = match whence as u32 {
+            SEEK_SET => 0,
+            SEEK_CUR => f.pos,
+            SEEK_END => match &f.kind {
+                FileKind::Regular { file, .. } => file.metadata().map_err(host_errno)?.len(),
+                _ => 0,
+            },
+            _ => return Err(Errno::EINVAL),
+        };
+        let start = i64::try_from(base)
+            .ok()
+            .and_then(|b| b.checked_add(l_start))
+            .ok_or(Errno::EOVERFLOW)?;
+        // l_len 为 0 表示到文件末尾以及之后，负数表示 [start + l_len, start)
+        let (start, end) = match l_len {
+            0 => (start, i64::MAX),
+            n if n > 0 => (start, start.checked_add(n).ok_or(Errno::EOVERFLOW)?),
+            n => (start + n, start),
+        };
+        if start < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = if end == i64::MAX {
+            u64::MAX
+        } else {
+            end as u64
+        };
+        (ino, start as u64, end)
+    };
+    let owner = if ofd {
+        Owner::Ofd(Rc::downgrade(file))
+    } else {
+        Owner::Posix(Rc::downgrade(&cx.t.fds))
+    };
+    let req = Lock {
+        owner,
+        pid: if ofd { -1 } else { cx.tgid() },
+        start,
+        end,
+        write,
+    };
+    if getlk {
+        // 没有冲突时只把 l_type 改成 F_UNLCK，其余字段不变
+        match cx.k().locks.conflict(ino, &req) {
+            None => b[..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+            Some(l) => {
+                let ty = if l.write { F_WRLCK } else { F_RDLCK };
+                let len = if l.end == u64::MAX {
+                    0
+                } else {
+                    l.end - l.start
+                };
+                b[..2].copy_from_slice(&ty.to_le_bytes());
+                b[2..4].copy_from_slice(&(SEEK_SET as i16).to_le_bytes());
+                b[8..16].copy_from_slice(&l.start.to_le_bytes());
+                b[16..24].copy_from_slice(&len.to_le_bytes());
+                b[24..28].copy_from_slice(&l.pid.to_le_bytes());
+            }
+        }
+        return put(cx, arg, b).map(|()| 0);
+    }
+    loop {
+        let locks = &mut cx.k().locks;
+        if unlock || locks.conflict(ino, &req).is_none() {
+            locks.set_waiting(&req.owner, None);
+            locks.set(ino, req, unlock);
+            return Ok(0);
+        }
+        if matches!(cmd, F_SETLK | F_OFD_SETLK) {
+            return Err(Errno::EAGAIN);
+        }
+        if locks.deadlock(ino, &req) {
+            locks.set_waiting(&req.owner, None);
+            return Err(Errno::EDEADLK);
+        }
+        locks.set_waiting(
+            &req.owner,
+            Some(Waiter {
+                ino,
+                req: req.clone(),
+            }),
+        );
+        if cx.interrupted() {
+            cx.k().locks.set_waiting(&req.owner, None);
+            return Err(Errno::ERESTARTSYS);
+        }
+        // 持有锁的一方解锁、关闭文件或者退出时会请求唤醒
+        cx.wait(None, &mut [])?;
     }
 }
 
@@ -729,33 +1191,74 @@ pub(super) fn faccessat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-    let st = node_stat(cx, &node)?;
-    let st_mode = u32::from_le_bytes(st[16..20].try_into().unwrap());
-    // guest 以 root 运行：读写总是允许，执行要求至少一个 x 位（目录除外）
-    if amode & 1 != 0 && st_mode & mode::S_IFMT != mode::S_IFDIR && st_mode & 0o111 == 0 {
-        return Err(Errno::EACCES);
+    // 默认用真实用户 ID 检查（包括路径上的搜索权限），AT_EACCESS 时用有效用户 ID
+    let cred = if flags & AT_EACCESS != 0 {
+        cx.cred()
+    } else {
+        cx.cred().for_access()
+    };
+    let node = lookup_at_or_fd(
+        cx,
+        &cred,
+        dirfd,
+        &path,
+        flags,
+        flags & AT_SYMLINK_NOFOLLOW == 0,
+    )?;
+    if amode == 0 {
+        return Ok(0);
     }
-    Ok(0)
+    let b = node_stat(cx, &node)?;
+    let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    let st = Stat {
+        mode: word(16),
+        uid: word(24),
+        gid: word(28),
+        ..Stat::default()
+    };
+    // R_OK、W_OK、X_OK 与 MAY_READ、MAY_WRITE、MAY_EXEC 的取值相同
+    cred.permission(&st, amode).map(|()| 0)
 }
 
 pub(super) fn chdir(cx: &mut Cx<'_>, path: u64) -> SysResult {
     let path = read_path(cx, path)?;
-    let vfs = cx.vfs()?;
-    let view = cx.view(&vfs);
-    let node = vfs.resolve(&view, &cx.cwd(), &path, true)?;
-    if !vfs.is_dir(&view, &node)? {
-        return Err(Errno::ENOTDIR);
-    }
-    cx.t.fs.borrow_mut().cwd = node;
-    Ok(0)
+    let node = lookup_at(cx, AT_FDCWD, &path, true)?;
+    set_cwd(cx, node)
 }
 
 pub(super) fn fchdir(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     let node = cx.fds().get(fd)?.borrow().node().ok_or(Errno::ENOTDIR)?;
+    set_cwd(cx, node)
+}
+
+/// chroot：目标必须是可以搜索的目录，要求 `CAP_SYS_CHROOT`。当前目录不变（可能在
+/// 新的根目录外面，与 Linux 相同）。
+pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
+    let path = read_path(cx, path)?;
+    let node = lookup_at(cx, AT_FDCWD, &path, true)?;
     let vfs = cx.vfs()?;
     if !vfs.is_dir(&cx.view(&vfs), &node)? {
         return Err(Errno::ENOTDIR);
+    }
+    let cred = cx.cred();
+    if let Node::Store(ino) = node {
+        cred.permission(&vfs.store().stat(ino)?, MAY_EXEC)?;
+    }
+    if !cred.capable(cap::SYS_CHROOT) {
+        return Err(Errno::EPERM);
+    }
+    cx.t.fs.borrow_mut().root = node;
+    Ok(0)
+}
+
+/// chdir、fchdir：目标必须是可以搜索的目录。
+fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
+    let vfs = cx.vfs()?;
+    if !vfs.is_dir(&cx.view(&vfs), &node)? {
+        return Err(Errno::ENOTDIR);
+    }
+    if let Node::Store(ino) = node {
+        cx.cred().permission(&vfs.store().stat(ino)?, MAY_EXEC)?;
     }
     cx.t.fs.borrow_mut().cwd = node;
     Ok(0)
@@ -763,7 +1266,7 @@ pub(super) fn fchdir(cx: &mut Cx<'_>, fd: i32) -> SysResult {
 
 pub(super) fn getcwd(cx: &mut Cx<'_>, buf: u64, size: u64) -> SysResult {
     let vfs = cx.vfs()?;
-    let mut path = vfs.path_of(&cx.view(&vfs), &cx.cwd())?;
+    let mut path = vfs.path_of(&cx.view(&vfs), &cx.root(), &cx.cwd())?;
     path.push(0);
     if (size as usize) < path.len() {
         return Err(Errno::ERANGE);
@@ -783,7 +1286,12 @@ pub(super) fn readlinkat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let node = lookup_at(cx, dirfd, &path, false)?;
+    // 路径为空时读 dirfd 本身（以 O_PATH | O_NOFOLLOW 打开的符号链接）
+    let node = if path.is_empty() {
+        cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::ENOENT)?
+    } else {
+        lookup_at(cx, dirfd, &path, false)?
+    };
     let vfs = cx.vfs()?;
     let target = vfs.readlink(&cx.view(&vfs), &node)?;
     let n = target.len().min(size);
@@ -811,7 +1319,15 @@ fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128]
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         file_stat(cx, &cx.fds().get(dirfd)?)
     } else {
-        let node = lookup_at_or_fd(cx, dirfd, path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        let cred = cx.cred();
+        let node = lookup_at_or_fd(
+            cx,
+            &cred,
+            dirfd,
+            path,
+            flags,
+            flags & AT_SYMLINK_NOFOLLOW == 0,
+        )?;
         node_stat(cx, &node)
     }
 }
@@ -920,8 +1436,7 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
 
 pub(super) fn statfs(cx: &mut Cx<'_>, path: u64, buf: u64) -> SysResult {
     let path = read_path(cx, path)?;
-    let vfs = cx.vfs()?;
-    let node = vfs.resolve(&cx.view(&vfs), &cx.cwd(), &path, true)?;
+    let node = lookup_at(cx, AT_FDCWD, &path, true)?;
     let b = statfs_of(cx, &node)?;
     put(cx, buf, b).map(|()| 0)
 }
@@ -954,9 +1469,11 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    cx.vfs()?
-        .store()
-        .mkdir(dir, name, perm & !cx.umask() & 0o7777, 0, 0)?;
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+    let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, true);
+    vfs.store().mkdir(dir, name, perm, uid, gid)?;
     Ok(0)
 }
 
@@ -972,18 +1489,24 @@ pub(super) fn mknodat(
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    let perm = mode_arg & !cx.umask() & 0o7777;
-    let vfs = cx.vfs()?;
-    match mode_arg & mode::S_IFMT {
-        0 | mode::S_IFREG => {
-            vfs.store().create_file(dir, name, perm, 0, 0)?;
-        }
-        kind @ (mode::S_IFCHR | mode::S_IFBLK | mode::S_IFIFO | mode::S_IFSOCK) => {
-            vfs.store()
-                .mknod(dir, name, kind | perm, dev & 0xffff_ffff, 0, 0)?;
-        }
+    let kind = mode_arg & mode::S_IFMT;
+    match kind {
+        0 | mode::S_IFREG | mode::S_IFCHR | mode::S_IFBLK | mode::S_IFIFO | mode::S_IFSOCK => {}
         mode::S_IFDIR => return Err(Errno::EPERM),
         _ => return Err(Errno::EINVAL),
+    }
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+    if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !cred.capable(cap::MKNOD) {
+        return Err(Errno::EPERM);
+    }
+    let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg & !cx.umask() & 0o7777, false);
+    if kind == 0 || kind == mode::S_IFREG {
+        vfs.store().create_file(dir, name, perm, uid, gid)?;
+    } else {
+        vfs.store()
+            .mknod(dir, name, kind | perm, dev & 0xffff_ffff, uid, gid)?;
     }
     Ok(0)
 }
@@ -996,16 +1519,21 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
     let (dir, name) = parent_at(cx, dirfd, &path)?;
     let store_vfs = cx.vfs()?;
     let store = store_vfs.store();
+    let cred = cx.cred();
     if flags & AT_REMOVEDIR != 0 {
         match name {
             b"." => return Err(Errno::EINVAL),
             b".." => return Err(Errno::ENOTEMPTY),
-            _ => store.rmdir(dir, name)?,
+            _ => {
+                may_delete(store, &cred, dir, name)?;
+                store.rmdir(dir, name)?;
+            }
         }
     } else {
         if name == b"." || name == b".." || path.ends_with(b"/") {
             return Err(Errno::EISDIR);
         }
+        may_delete(store, &cred, dir, name)?;
         store.unlink(dir, name)?;
     }
     Ok(0)
@@ -1021,7 +1549,11 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    cx.vfs()?.store().symlink(dir, name, &target, 0, 0)?;
+    let vfs = cx.vfs()?;
+    let cred = cx.cred();
+    let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+    let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
+    vfs.store().symlink(dir, name, &target, uid, gid)?;
     Ok(0)
 }
 
@@ -1037,19 +1569,28 @@ pub(super) fn linkat(
         return Err(Errno::EINVAL);
     }
     let oldpath = read_path(cx, oldpath)?;
-    let src = store_ino(&lookup_at_or_fd(
+    let cred = cx.cred();
+    let src = lookup_at_or_fd(
         cx,
+        &cred,
         olddirfd,
         &oldpath,
         flags,
         flags & AT_SYMLINK_FOLLOW != 0,
-    )?)?;
+    )?;
     let newpath = read_path(cx, newpath)?;
-    let (dir, name) = parent_at(cx, newdirfd, &newpath)?;
+    let start = start_dir(cx, newdirfd, &newpath)?;
+    let vfs = cx.vfs()?;
+    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &newpath)?;
+    // 合成文件系统是另一个"设备"：跨设备不能建硬链接
+    let (Node::Store(src), Node::Store(dir)) = (src, dir) else {
+        return Err(Errno::EXDEV);
+    };
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    cx.vfs()?.store().link(dir, name, src)?;
+    may_create(vfs.store(), &cred, dir, name)?;
+    vfs.store().link(dir, name, src)?;
     Ok(0)
 }
 
@@ -1076,7 +1617,15 @@ pub(super) fn renameat2(
     {
         return Err(Errno::EBUSY);
     }
-    cx.vfs()?.store().rename(
+    let vfs = cx.vfs()?;
+    may_rename(
+        vfs.store(),
+        &cx.cred(),
+        (old_dir, old_name),
+        (new_dir, new_name),
+        flags & RENAME_EXCHANGE != 0,
+    )?;
+    vfs.store().rename(
         old_dir,
         old_name,
         new_dir,
@@ -1087,16 +1636,57 @@ pub(super) fn renameat2(
     Ok(0)
 }
 
+/// rename 之前的检查：两边的目录都要可写并遵守粘滞位；目录换了上级时，它自己也要
+/// 可写（要修改它的 `..`）。
+fn may_rename(
+    store: &Store,
+    cred: &Cred,
+    (old_dir, old_name): (Ino, &[u8]),
+    (new_dir, new_name): (Ino, &[u8]),
+    exchange: bool,
+) -> Result<(), Errno> {
+    let src = may_delete(store, cred, old_dir, old_name)?;
+    let dst = match store.lookup(new_dir, new_name)? {
+        Some(_) => Some(may_delete(store, cred, new_dir, new_name)?),
+        None => {
+            cred.permission(&store.stat(new_dir)?, MAY_WRITE | MAY_EXEC)?;
+            None
+        }
+    };
+    if old_dir != new_dir {
+        let moved = [Some(src), dst.filter(|_| exchange)];
+        for st in moved.iter().flatten().filter(|st| st.is_dir()) {
+            cred.permission(st, MAY_WRITE)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
     let ino = store_ino(&lookup_at(cx, dirfd, &path, true)?)?;
-    cx.vfs()?.store().set_mode(ino, perm)?;
-    Ok(0)
+    chmod(cx, ino, perm)
 }
 
 pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
-    let ino = cx.fds().get(fd)?.borrow().ino().ok_or(Errno::EBADF)?;
-    cx.vfs()?.store().set_mode(ino, perm)?;
+    let ino = file_ino(cx, fd)?;
+    chmod(cx, ino, perm)
+}
+
+/// 只有属主（或者有 `CAP_FOWNER`）能修改权限位；不在文件属组里的调用者不能设置
+/// setgid 位（没有 `CAP_FSETID` 时静默去掉）。
+fn chmod(cx: &Cx<'_>, ino: Ino, perm: u32) -> SysResult {
+    let vfs = cx.vfs()?;
+    let st = vfs.store().stat(ino)?;
+    let cred = cx.cred();
+    if !cred.owns(&st) {
+        return Err(Errno::EPERM);
+    }
+    let mut perm = perm & 0o7777;
+    if !cred.in_group(st.gid) && !cred.capable(cap::FSETID) {
+        perm &= !mode::S_ISGID;
+    }
+    vfs.store().set_mode(ino, perm)?;
     Ok(0)
 }
 
@@ -1116,18 +1706,35 @@ pub(super) fn fchownat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-    cx.vfs()?
-        .store()
-        .set_owner(store_ino(&node)?, owner_arg(uid), owner_arg(gid))?;
-    Ok(0)
+    let node = lookup_at_or_fd(
+        cx,
+        &cx.cred(),
+        dirfd,
+        &path,
+        flags,
+        flags & AT_SYMLINK_NOFOLLOW == 0,
+    )?;
+    chown(cx, store_ino(&node)?, uid, gid)
 }
 
 pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult {
-    let ino = cx.fds().get(fd)?.borrow().ino().ok_or(Errno::EBADF)?;
-    cx.vfs()?
-        .store()
-        .set_owner(ino, owner_arg(uid), owner_arg(gid))?;
+    let ino = file_ino(cx, fd)?;
+    chown(cx, ino, uid, gid)
+}
+
+/// 没有 `CAP_CHOWN` 时，属主只能把属组改成自己所在的组，不能修改属主。
+fn chown(cx: &Cx<'_>, ino: Ino, uid: u32, gid: u32) -> SysResult {
+    let (uid, gid) = (owner_arg(uid), owner_arg(gid));
+    let vfs = cx.vfs()?;
+    let st = vfs.store().stat(ino)?;
+    let cred = cx.cred();
+    let owner = cred.fsuid == st.uid;
+    let uid_ok = uid.is_none_or(|u| owner && u == st.uid);
+    let gid_ok = gid.is_none_or(|g| owner && (g == st.gid || cred.in_group(g)));
+    if !(cred.capable(cap::CHOWN) || uid_ok && gid_ok) {
+        return Err(Errno::EPERM);
+    }
+    vfs.store().set_owner(ino, uid, gid)?;
     Ok(0)
 }
 
@@ -1146,10 +1753,17 @@ pub(super) fn utimensat(
         if dirfd == AT_FDCWD {
             return Err(Errno::EFAULT);
         }
-        cx.fds().get(dirfd)?.borrow().ino().ok_or(Errno::EBADF)?
+        file_ino(cx, dirfd)?
     } else {
         let path = read_path(cx, path)?;
-        let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        let node = lookup_at_or_fd(
+            cx,
+            &cx.cred(),
+            dirfd,
+            &path,
+            flags,
+            flags & AT_SYMLINK_NOFOLLOW == 0,
+        )?;
         store_ino(&node)?
     };
     let now = || {
@@ -1158,8 +1772,8 @@ pub(super) fn utimensat(
             .map_err(Errno)
     };
     // 只记录 mtime（atime 用 mtime 代替）：times[1] 是 mtime
-    let mtime = if times == 0 {
-        Some(now()?)
+    let (mtime, explicit) = if times == 0 {
+        (Some(now()?), false)
     } else {
         let b: [u8; 32] = get(cx, times)?;
         let word = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
@@ -1168,12 +1782,28 @@ pub(super) fn utimensat(
                 return Err(Errno::EINVAL);
             }
         }
-        match word(3) {
+        if word(1) == UTIME_OMIT && word(3) == UTIME_OMIT {
+            return Ok(0);
+        }
+        let explicit = [word(1), word(3)]
+            .iter()
+            .any(|&n| n != UTIME_NOW && n != UTIME_OMIT);
+        let mtime = match word(3) {
             UTIME_OMIT => None,
             UTIME_NOW => Some(now()?),
             nsec => Some(word(2) * 1_000_000_000 + nsec),
-        }
+        };
+        (mtime, explicit)
     };
+    // 设成指定的时间只有属主可以，设成现在的时间有写权限也可以
+    let st = cx.vfs()?.store().stat(ino)?;
+    let cred = cx.cred();
+    if !cred.owns(&st) {
+        if explicit {
+            return Err(Errno::EPERM);
+        }
+        cred.permission(&st, MAY_WRITE)?;
+    }
     if let Some(t) = mtime {
         cx.vfs()?.store().set_mtime(ino, t)?;
     }
@@ -1184,10 +1814,18 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let len = u64::try_from(len).map_err(|_| Errno::EINVAL)?;
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
-    let ino = store_ino(&vfs.resolve(&cx.view(&vfs), &cx.cwd(), &path, true)?)?;
-    match vfs.store().stat(ino)?.kind() {
+    let ino = store_ino(&lookup_at(cx, AT_FDCWD, &path, true)?)?;
+    let st = vfs.store().stat(ino)?;
+    match st.kind() {
         mode::S_IFDIR => Err(Errno::EISDIR),
-        mode::S_IFREG => vfs.store().truncate(ino, len).map(|()| 0),
+        mode::S_IFREG => {
+            cx.cred().permission(&st, MAY_WRITE)?;
+            if executing(cx, ino) {
+                return Err(Errno::ETXTBSY);
+            }
+            check_fsize(cx, len)?;
+            vfs.store().truncate(ino, len).map(|()| 0)
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -1198,6 +1836,7 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     let f = file.borrow();
     match &f.kind {
         FileKind::Regular { file, .. } if f.writable() => {
+            check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
             file.set_len(len).map_err(host_errno).map(|()| 0)
         }
@@ -1213,10 +1852,14 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     let (Ok(offset), Ok(len)) = (u64::try_from(offset), u64::try_from(len)) else {
         return Err(Errno::EINVAL);
     };
+    if len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    // 超过最大的文件长度（i64::MAX）
     let end = offset
         .checked_add(len)
-        .filter(|_| len > 0)
-        .ok_or(Errno::EINVAL)?;
+        .filter(|&e| e <= i64::MAX as u64)
+        .ok_or(Errno::EFBIG)?;
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
     if !f.writable() {
@@ -1237,6 +1880,9 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         FALLOC_FL_ZERO_RANGE => true,
         _ => return Err(Errno::EOPNOTSUPP),
     };
+    if !keep {
+        check_fsize(cx, end)?;
+    }
     check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
     if zero {
         let zeros = vec![0u8; IO_CHUNK];
@@ -1299,9 +1945,48 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     }
 }
 
+/// sync_file_range、readahead、syncfs：只检查参数（数据直接写在宿主文件里，读取
+/// 也由宿主缓存）。`kind` 区分三者：0 是 sync_file_range，1 是 readahead，2 是 syncfs。
+pub(super) fn cache_hint(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    offset: i64,
+    len: i64,
+    flags: u32,
+    kind: u32,
+) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    match kind {
+        0 => {
+            if flags & !7 != 0 || offset < 0 || len < 0 || offset.checked_add(len).is_none() {
+                return Err(Errno::EINVAL);
+            }
+            match &f.kind {
+                FileKind::Regular { .. } | FileKind::Directory { .. } => Ok(0),
+                FileKind::Path(_) => Err(Errno::EBADF),
+                _ => Err(Errno::ESPIPE),
+            }
+        }
+        1 => match &f.kind {
+            _ if !f.readable() => Err(Errno::EBADF),
+            FileKind::Regular { .. } if offset >= 0 => Ok(0),
+            _ => Err(Errno::EINVAL),
+        },
+        _ => Ok(0),
+    }
+}
+
 pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     // 仓库的数据直接写在宿主文件里；为了 apk 这类频繁 fsync 的负载，不逐个刷盘
-    cx.fds().get(fd).map(|_| 0)
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    match &f.kind {
+        _ if f.flags & oflags::O_PATH != 0 => Err(Errno::EBADF),
+        // 只有普通文件和目录能同步（宿主 fd 交给宿主）
+        FileKind::Regular { .. } | FileKind::Directory { .. } | FileKind::Host(_) => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 // ---- 目录 ----
@@ -1376,7 +2061,9 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         | FileKind::Pty(_)
         | FileKind::Socket(_)
         | FileKind::Epoll(_)
-        | FileKind::EventFd(_) => return Err(Errno::ESPIPE),
+        | FileKind::EventFd(_)
+        | FileKind::TimerFd(_)
+        | FileKind::SignalFd(_) => return Err(Errno::ESPIPE),
         FileKind::Proc { data, .. } => match whence {
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
@@ -1434,6 +2121,8 @@ enum IoPath {
     Pty(Rc<RefCell<Tty>>, bool),
     Socket(SocketRef),
     EventFd(Rc<RefCell<EventFd>>),
+    TimerFd(Rc<RefCell<TimerFd>>),
+    SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
     Local,
 }
 
@@ -1444,6 +2133,8 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), end.master),
         FileKind::Socket(s) => IoPath::Socket(s.clone()),
         FileKind::EventFd(e) => IoPath::EventFd(e.clone()),
+        FileKind::TimerFd(t) => IoPath::TimerFd(t.clone()),
+        FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
         _ => IoPath::Local,
     }
 }
@@ -1498,6 +2189,195 @@ fn pipe_read(
         }
         cx.wait(None, &mut [])?;
     }
+}
+
+/// 等管道里有数据：返回 false 表示写端已经全部关闭（EOF）。
+fn pipe_wait_data(
+    cx: &mut Cx<'_>,
+    pipe: &Rc<RefCell<Pipe>>,
+    nonblock: bool,
+) -> Result<bool, Errno> {
+    loop {
+        {
+            let p = pipe.borrow();
+            if !p.buf.is_empty() {
+                return Ok(true);
+            }
+            if p.writers == 0 {
+                return Ok(false);
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait(None, &mut [])?;
+    }
+}
+
+/// 打开文件是管道时返回管道，以及它是不是读端。
+fn pipe_of(file: &FileRef) -> Option<(Rc<RefCell<Pipe>>, bool)> {
+    match &file.borrow().kind {
+        FileKind::Pipe(end) => Some((end.pipe.clone(), end.read)),
+        _ => None,
+    }
+}
+
+const SPLICE_F_NONBLOCK: u32 = 2;
+
+/// splice：在管道和另一个文件（或两个管道）之间搬数据。经由宿主缓冲区复制，不是零拷贝；
+/// 从管道取数据时先复制、写成功之后才从管道里去掉，写失败时数据不会丢。
+pub(super) fn splice(
+    cx: &mut Cx<'_>,
+    fd_in: i32,
+    off_in: u64,
+    fd_out: i32,
+    off_out: u64,
+    len: usize,
+    flags: u32,
+) -> SysResult {
+    let input = cx.fds().get(fd_in)?;
+    let output = cx.fds().get(fd_out)?;
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    let (in_pipe, out_pipe) = (pipe_of(&input), pipe_of(&output));
+    // 目录、eventfd、epoll 这类对象不支持 splice（Linux 的 splice_read、splice_write）
+    let splices = |f: &FileRef| {
+        matches!(
+            f.borrow().kind,
+            FileKind::Regular { .. }
+                | FileKind::Pipe(_)
+                | FileKind::Socket(_)
+                | FileKind::Device { .. }
+                | FileKind::Pty(_)
+                | FileKind::Proc { .. }
+                | FileKind::Host(_)
+        )
+    };
+    if in_pipe.is_none() && out_pipe.is_none()
+        || output.borrow().flags & oflags::O_APPEND != 0
+        || !splices(&input)
+        || !splices(&output)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if in_pipe.is_some() && off_in != 0 || out_pipe.is_some() && off_out != 0 {
+        return Err(Errno::ESPIPE);
+    }
+    let read_off = |cx: &Cx<'_>, addr: u64| -> Result<Option<u64>, Errno> {
+        match addr {
+            0 => Ok(None),
+            a => Ok(Some(
+                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
+            )),
+        }
+    };
+    let (src, dst) = (read_off(cx, off_in)?, read_off(cx, off_out)?);
+    if len == 0 {
+        return Ok(0);
+    }
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    let wrote = if let Some((pipe, _)) = in_pipe {
+        if !pipe_wait_data(cx, &pipe, nonblock || input.borrow().nonblocking())? {
+            return Ok(0);
+        }
+        let data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
+        let n = write_bytes(cx, &output, &data, dst)?;
+        pipe.borrow_mut().buf.drain(..n);
+        request_wake();
+        n
+    } else {
+        let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
+        // 与 Linux 相同，没有连接的 socket 不能 splice 出数据：EINVAL
+        let got = match read_bytes(cx, &input, &mut buf, src) {
+            Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
+            r => r?,
+        };
+        let n = write_bytes(cx, &output, &buf[..got], None)?;
+        // 没写完的部分退回输入文件
+        if src.is_none() && n < got {
+            input.borrow_mut().pos -= (got - n) as u64;
+        }
+        n
+    };
+    if let Some(s) = src {
+        put(cx, off_in, (s + wrote as u64).to_le_bytes())?;
+    }
+    if let Some(d) = dst {
+        put(cx, off_out, (d + wrote as u64).to_le_bytes())?;
+    }
+    Ok(wrote as u64)
+}
+
+/// tee：把一个管道里的数据复制到另一个管道，不从源管道里取走。
+pub(super) fn tee(cx: &mut Cx<'_>, fd_in: i32, fd_out: i32, len: usize, flags: u32) -> SysResult {
+    let input = cx.fds().get(fd_in)?;
+    let output = cx.fds().get(fd_out)?;
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    let (Some((src, _)), Some((dst, _))) = (pipe_of(&input), pipe_of(&output)) else {
+        return Err(Errno::EINVAL);
+    };
+    if Rc::ptr_eq(&src, &dst) {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if !pipe_wait_data(cx, &src, flags & SPLICE_F_NONBLOCK != 0)? {
+        return Ok(0);
+    }
+    let data: Vec<u8> = src.borrow().buf.iter().take(len).copied().collect();
+    write_bytes(cx, &output, &data, None).map(|n| n as u64)
+}
+
+/// vmsplice：管道的读端相当于 readv；写端等到有空间，然后写进放得下的部分就返回
+/// （与 Linux 相同，不等全部写完）。
+pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: u32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let Some((pipe, read)) = pipe_of(&file) else {
+        return Err(Errno::EBADF);
+    };
+    if read {
+        return vectored(cx, fd, iov, count, None, false);
+    }
+    let iovecs = iovecs(cx, iov, count)?;
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0 || file.borrow().nonblocking();
+    let space = loop {
+        {
+            let p = pipe.borrow();
+            if p.readers == 0 {
+                return Err(broken_pipe(cx));
+            }
+            if p.space() > 0 {
+                break p.space();
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait(None, &mut [])?;
+    };
+    let mut data = Vec::new();
+    for (base, len) in iovecs {
+        let n = len.min(space - data.len());
+        let start = data.len();
+        data.resize(start + n, 0);
+        cx.mm().read(UserSlice::new(base, n), &mut data[start..])?;
+        if data.len() == space {
+            break;
+        }
+    }
+    pipe.borrow_mut().buf.extend(&data);
+    request_wake();
+    Ok(data.len() as u64)
 }
 
 /// 写端没有读者了：EPIPE，并给当前线程发 SIGPIPE。
@@ -1604,7 +2484,7 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
             Device::Full => Err(Errno::ENOSPC),
             _ => Ok(data.len()),
         },
-        // 可写的 procfs 文件：接受写入，但不起作用
+        // 可写的 procfs 文件：内容由 pseudo::write 处理过了
         FileKind::Proc { .. } => Ok(data.len()),
         _ => Err(Errno::EBADF),
     }
@@ -1630,6 +2510,8 @@ fn read_bytes(
         | IoPath::Pty(..)
         | IoPath::Socket(_)
         | IoPath::EventFd(_)
+        | IoPath::TimerFd(_)
+        | IoPath::SignalFd(_)
             if offset.is_some() =>
         {
             Err(Errno::ESPIPE)
@@ -1646,6 +2528,8 @@ fn read_bytes(
             Ok(m.data.len())
         }
         IoPath::EventFd(e) => super::poll::eventfd_read(cx, &e, nonblock, buf),
+        IoPath::TimerFd(t) => super::timerfd::read(cx, &t, nonblock, buf),
+        IoPath::SignalFd(s) => super::sig::signalfd_read(cx, &s, nonblock, buf),
         IoPath::Local => local_read(&mut file.borrow_mut(), buf, offset),
     }
 }
@@ -1670,6 +2554,8 @@ fn write_bytes(
         | IoPath::Pty(..)
         | IoPath::Socket(_)
         | IoPath::EventFd(_)
+        | IoPath::TimerFd(_)
+        | IoPath::SignalFd(_)
             if offset.is_some() =>
         {
             Err(Errno::ESPIPE)
@@ -1683,7 +2569,9 @@ fn write_bytes(
         IoPath::Pty(t, master) => tty::write(cx, &t, master, nonblock, data),
         IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
         IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
+        IoPath::TimerFd(_) | IoPath::SignalFd(_) => Err(Errno::EINVAL),
         IoPath::Local => {
+            let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
             check_seals(cx, &file.borrow(), true, |size| {
                 let f = file.borrow();
                 let pos = match offset {
@@ -1693,9 +2581,56 @@ fn write_bytes(
                 };
                 size.max(pos + data.len() as u64)
             })?;
+            let proc_node = match &file.borrow().kind {
+                FileKind::Proc { node, .. } => Some(node.clone()),
+                _ => None,
+            };
+            if let Some(node) = proc_node {
+                pseudo::write(cx.k(), &node, data)?;
+            }
             local_write(&mut file.borrow_mut(), data, offset)
         }
     }
+}
+
+/// `RLIMIT_FSIZE`：普通文件写到超过限制的位置时只写到限制为止；一个字节都写不了时
+/// 给当前线程发 SIGXFSZ 并返回 EFBIG。返回允许写的字节数。
+fn fsize_allowed(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    offset: Option<u64>,
+    len: usize,
+) -> Result<usize, Errno> {
+    let FileKind::Regular { file, .. } = &f.kind else {
+        return Ok(len);
+    };
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
+    if limit == u64::MAX || len == 0 {
+        return Ok(len);
+    }
+    let pos = match offset {
+        Some(off) => off,
+        None if f.flags & oflags::O_APPEND != 0 => file.metadata().map_err(host_errno)?.len(),
+        None => f.pos,
+    };
+    if pos >= limit {
+        return Err(file_too_big(cx));
+    }
+    Ok(len.min((limit - pos) as usize))
+}
+
+/// 超过 `RLIMIT_FSIZE`：发 SIGXFSZ，返回 EFBIG。
+fn file_too_big(cx: &Cx<'_>) -> Errno {
+    signal::send_to_task(cx.kr(), cx.task, Signal::XFSZ, SigInfo::kernel());
+    Errno::EFBIG
+}
+
+/// 截断、预留空间之后的长度不能超过 `RLIMIT_FSIZE`。
+fn check_fsize(cx: &Cx<'_>, len: u64) -> Result<(), Errno> {
+    if len > cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0 {
+        return Err(file_too_big(cx));
+    }
+    Ok(())
 }
 
 /// 从打开文件读到 guest 缓冲区（read、pread、readv）。
@@ -1783,6 +2718,9 @@ pub(super) fn sendfile(
 ) -> SysResult {
     let input = cx.fds().get(in_fd)?;
     let output = cx.fds().get(out_fd)?;
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
     if !matches!(
         input.borrow().kind,
         FileKind::Regular { .. } | FileKind::Device { .. }
@@ -1827,6 +2765,96 @@ pub(super) fn sendfile(
         put(cx, offset, o.to_le_bytes())?;
     }
     Ok(done as u64)
+}
+
+/// copy_file_range：在两个普通文件之间拷贝，不经过 guest 内存。偏移指针为空时使用并
+/// 推进文件位置，否则使用并更新指针指向的偏移。
+pub(super) fn copy_file_range(
+    cx: &mut Cx<'_>,
+    fd_in: i32,
+    off_in: u64,
+    fd_out: i32,
+    off_out: u64,
+    len: usize,
+    flags: u32,
+) -> SysResult {
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let input = cx.fds().get(fd_in)?;
+    let output = cx.fds().get(fd_out)?;
+    {
+        let (i, o) = (input.borrow(), output.borrow());
+        if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
+            return Err(Errno::EBADF);
+        }
+        for f in [&i, &o] {
+            match f.kind {
+                FileKind::Regular { .. } => {}
+                FileKind::Directory { .. } => return Err(Errno::EISDIR),
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+    }
+    let read_off = |addr: u64| -> Result<Option<u64>, Errno> {
+        match addr {
+            0 => Ok(None),
+            a => Ok(Some(
+                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
+            )),
+        }
+    };
+    let (mut src, mut dst) = (read_off(off_in)?, read_off(off_out)?);
+    let same = input.borrow().ino() == output.borrow().ino();
+    if same {
+        // 同一个文件里的两段不能重叠
+        let s = src.unwrap_or(input.borrow().pos);
+        let d = dst.unwrap_or(output.borrow().pos);
+        if s < d + len as u64 && d < s + len as u64 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(IO_CHUNK);
+        let got = read_bytes(cx, &input, &mut chunk[..n], src)?;
+        if got == 0 {
+            break;
+        }
+        let wrote = write_bytes(cx, &output, &chunk[..got], dst)?;
+        if let Some(s) = &mut src {
+            *s += wrote as u64;
+        } else {
+            input.borrow_mut().pos -= (got - wrote) as u64;
+        }
+        if let Some(d) = &mut dst {
+            *d += wrote as u64;
+        }
+        done += wrote;
+        if wrote < got {
+            break;
+        }
+    }
+    if let Some(s) = src {
+        put(cx, off_in, s.to_le_bytes())?;
+    }
+    if let Some(d) = dst {
+        put(cx, off_out, d.to_le_bytes())?;
+    }
+    Ok(done as u64)
+}
+
+/// posix_fadvise：只影响性能，检查参数之后忽略。
+pub(super) fn fadvise64(cx: &mut Cx<'_>, fd: i32, len: i64, advice: i32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    if matches!(file.borrow().kind, FileKind::Pipe(_) | FileKind::Socket(_)) {
+        return Err(Errno::ESPIPE);
+    }
+    if len < 0 || !(0..=5).contains(&advice) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
 }
 
 pub(super) fn read(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult {
@@ -1924,11 +2952,11 @@ pub(super) fn pvectored(
     flags: Option<u32>,
     write: bool,
 ) -> SysResult {
-    // RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果；RWF_NOWAIT、RWF_APPEND 不支持
-    const RWF_SUPPORTED: u32 = 0x7;
-    const RWF_ALL: u32 = 0x3f;
+    // RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果；带偏移的写本来就不管 O_APPEND，所以
+    // RWF_NOAPPEND 也不影响结果（musl 的 pwrite 用它）；RWF_NOWAIT、RWF_APPEND 不支持，
+    // 与 Linux 一样，不认识的标志都是 EOPNOTSUPP
+    const RWF_SUPPORTED: u32 = 0x7 | 0x20;
     let offset = match flags {
-        Some(f) if f & !RWF_ALL != 0 => return Err(Errno::EINVAL),
         Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
         Some(_) if offset == -1 => None,
         _ => checked_offset(offset)?,

@@ -106,6 +106,8 @@ pub(crate) mod code {
     pub const SI_KERNEL: i32 = 0x80;
     /// tkill(2)、tgkill(2)。
     pub const SI_TKILL: i32 = -6;
+    /// POSIX 定时器到期。
+    pub const SI_TIMER: i32 = -2;
     /// 子进程正常退出。
     pub const CLD_EXITED: i32 = 1;
     /// 子进程被信号终止。
@@ -136,6 +138,10 @@ pub(crate) enum InfoFields {
     Kill { pid: Tid, uid: u32 },
     /// SIGCHLD：子进程和它的状态。
     Child { pid: Tid, uid: u32, status: i32 },
+    /// sigqueue（rt_sigqueueinfo）：发送者和附带的值。
+    Queue { pid: Tid, uid: u32, value: u64 },
+    /// POSIX 定时器到期：定时器 id、超限次数和 `sigev_value`。
+    Timer { id: i32, overrun: u32, value: u64 },
     /// 同步异常：出错地址。
     Fault { addr: u64 },
 }
@@ -150,11 +156,11 @@ pub(crate) struct SigInfo {
 }
 
 impl SigInfo {
-    /// kill(2) 或 tkill(2) 发出的信号。
-    pub fn kill(code: i32, pid: Tid) -> SigInfo {
+    /// 真实用户 ID 为 `uid` 的进程 `pid` 用 kill(2) 或 tkill(2) 发出的信号。
+    pub fn kill(code: i32, pid: Tid, uid: u32) -> SigInfo {
         SigInfo {
             code,
-            fields: InfoFields::Kill { pid, uid: 0 },
+            fields: InfoFields::Kill { pid, uid },
             esr: 0,
         }
     }
@@ -213,6 +219,16 @@ impl SigInfo {
                 b[16..20].copy_from_slice(&pid.to_le_bytes());
                 b[20..24].copy_from_slice(&uid.to_le_bytes());
                 b[24..28].copy_from_slice(&status.to_le_bytes());
+            }
+            InfoFields::Timer { id, overrun, value } => {
+                b[16..20].copy_from_slice(&id.to_le_bytes());
+                b[20..24].copy_from_slice(&overrun.to_le_bytes());
+                b[24..32].copy_from_slice(&value.to_le_bytes());
+            }
+            InfoFields::Queue { pid, uid, value } => {
+                b[16..20].copy_from_slice(&pid.to_le_bytes());
+                b[20..24].copy_from_slice(&uid.to_le_bytes());
+                b[24..32].copy_from_slice(&value.to_le_bytes());
             }
             InfoFields::Fault { addr } => b[16..24].copy_from_slice(&addr.to_le_bytes()),
         }
@@ -409,6 +425,9 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
     task.info.borrow_mut()[sig.index()] = info;
     if !blocked {
         wake(task);
+    } else {
+        // sigtimedwait 等的正是被屏蔽的信号
+        request_wake();
     }
 }
 
@@ -440,8 +459,10 @@ pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
         g.pending |= sig.bit();
         g.info[sig.index()] = info;
     }
-    if let Some(t) = threads.iter().find(|t| t.sigmask.get() & sig.bit() == 0) {
-        wake(t);
+    match threads.iter().find(|t| t.sigmask.get() & sig.bit() == 0) {
+        Some(t) => wake(t),
+        // 所有线程都屏蔽了它：sigtimedwait 里等着的线程要重新检查
+        None => request_wake(),
     }
 }
 
@@ -519,6 +540,24 @@ fn dequeue(cx: &mut Cx<'_>) -> Option<(Signal, SigInfo)> {
     }
     let mut g = cx.t.group.borrow_mut();
     let shared = g.pending & !mask;
+    if shared != 0 {
+        let sig = pick(shared);
+        g.pending &= !sig.bit();
+        return Some((sig, g.info[sig.index()]));
+    }
+    None
+}
+
+/// sigtimedwait：不管屏蔽字，取出 `set` 里的一个挂起信号，先看线程自己的。
+pub(crate) fn take(cx: &mut Cx<'_>, set: u64) -> Option<(Signal, SigInfo)> {
+    let own = cx.task.pending.get() & set;
+    if own != 0 {
+        let sig = pick(own);
+        cx.task.pending.set(cx.task.pending.get() & !sig.bit());
+        return Some((sig, cx.task.info.borrow()[sig.index()]));
+    }
+    let mut g = cx.t.group.borrow_mut();
+    let shared = g.pending & set;
     if shared != 0 {
         let sig = pick(shared);
         g.pending &= !sig.bit();
@@ -652,8 +691,13 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         }
         cx.task.sigmask.set(mask & !UNBLOCKABLE);
         if act.flags & sa::RESETHAND != 0 {
+            // 与 Linux 相同，只把处理函数换回 SIG_DFL，flags 和 mask 保持不变
             let group = cx.t.group.borrow();
-            group.sighand.borrow_mut().set(sig, SigAction::default());
+            let reset = SigAction {
+                handler: SigAction::DEFAULT,
+                ..act
+            };
+            group.sighand.borrow_mut().set(sig, reset);
         }
         handled = true;
     }

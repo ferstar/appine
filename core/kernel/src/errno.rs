@@ -63,8 +63,20 @@ impl Errno {
     pub const EPIPE: Errno = Errno(32);
     /// 结果超出范围。
     pub const ERANGE: Errno = Errno(34);
+    /// 会死锁。
+    pub const EDEADLK: Errno = Errno(35);
     /// 名字太长。
     pub const ENAMETOOLONG: Errno = Errno(36);
+    /// 正在执行的程序文件不能写，以写方式打开着的文件不能执行。
+    pub const ETXTBSY: Errno = Errno(26);
+    /// 文件太大（semop 的信号量编号超出范围）。
+    pub const EFBIG: Errno = Errno(27);
+    /// 没有符合条件的消息（msgrcv）。
+    pub const ENOMSG: Errno = Errno(42);
+    /// IPC 对象已被删除。
+    pub const EIDRM: Errno = Errno(43);
+    /// 文件句柄已经失效。
+    pub const ESTALE: Errno = Errno(116);
     /// 没有这个属性（xattr）。
     pub const ENODATA: Errno = Errno(61);
     /// 未实现的 syscall。

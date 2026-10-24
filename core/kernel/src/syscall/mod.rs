@@ -4,14 +4,18 @@
 //! `-ENOSYS`，绝不崩溃，并记录一条本地调试日志。处理函数在持有 BKL 时运行，
 //! 需要等待的会经由 [`Cx::wait`] 暂时释放它。
 
+mod cred;
 mod fs;
+mod ipc;
 mod mem;
 mod misc;
 mod net;
 mod poll;
+mod posix_timer;
 mod proc;
 mod sched;
 mod sig;
+mod timerfd;
 mod tty;
 mod unix;
 mod xattr;
@@ -114,6 +118,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         48 => fs::faccessat(cx, a[0] as i32, a[1], a[2] as u32, 0),
         49 => fs::chdir(cx, a[0]),
         50 => fs::fchdir(cx, a[0] as i32),
+        51 => fs::chroot(cx, a[0]),
         52 => fs::fchmod(cx, a[0] as i32, a[1] as u32),
         53 => fs::fchmodat(cx, a[0] as i32, a[1], a[2] as u32),
         54 => fs::fchownat(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4] as u32),
@@ -142,19 +147,45 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         71 => fs::sendfile(cx, a[0] as i32, a[1] as i32, a[2], a[3] as usize),
         72 => poll::pselect6(cx, a[0] as i32, [a[1], a[2], a[3]], a[4], a[5]),
         73 => poll::ppoll(cx, a[0], a[1] as usize, a[2], a[3], a[4] as usize),
+        74 => sig::signalfd4(cx, a[0] as i32, a[1], a[2] as usize, a[3] as u32),
+        75 => fs::vmsplice(cx, a[0] as i32, a[1], a[2] as usize, a[3] as u32),
+        76 => fs::splice(
+            cx,
+            a[0] as i32,
+            a[1],
+            a[2] as i32,
+            a[3],
+            a[4] as usize,
+            a[5] as u32,
+        ),
+        77 => fs::tee(cx, a[0] as i32, a[1] as i32, a[2] as usize, a[3] as u32),
         78 => fs::readlinkat(cx, a[0] as i32, a[1], a[2], a[3] as usize),
         79 => fs::newfstatat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         80 => fs::fstat(cx, a[0] as i32, a[1]),
         81 => Ok(0), // sync：仓库的修改已经写进宿主文件
         82 | 83 => fs::fsync(cx, a[0] as i32),
+        84 => fs::cache_hint(cx, a[0] as i32, a[1] as i64, a[2] as i64, a[3] as u32, 0),
+        85 => timerfd::timerfd_create(cx, a[0] as i32, a[1] as u32),
+        86 => timerfd::timerfd_settime(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        87 => timerfd::timerfd_gettime(cx, a[0] as i32, a[1]),
         88 => fs::utimensat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
+        90 => cred::capget(cx, a[0], a[1]),
+        91 => cred::capset(cx, a[0], a[1]),
         95 => proc::waitid(cx, a[0] as u32, a[1] as i32, a[2], a[3] as u32, a[4]),
         96 => proc::set_tid_address(cx, a[0]),
         98 => misc::futex(cx, a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32),
-        99 => Ok(0), // set_robust_list：robust mutex 的持有者退出时不做处理
+        92 => misc::personality(cx, a[0] as u32),
+        99 => misc::set_robust_list(cx, a[0], a[1]),
+        100 => misc::get_robust_list(cx, a[0] as i32, a[1], a[2]),
         101 => misc::nanosleep(cx, a[0], a[1]),
         102 => misc::getitimer(cx, a[0] as i32, a[1]),
         103 => misc::setitimer(cx, a[0] as i32, a[1], a[2]),
+        107 => posix_timer::timer_create(cx, a[0] as i32, a[1], a[2]),
+        108 => posix_timer::timer_gettime(cx, a[0] as i32, a[1]),
+        109 => posix_timer::timer_getoverrun(cx, a[0] as i32),
+        110 => posix_timer::timer_settime(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        111 => posix_timer::timer_delete(cx, a[0] as i32),
+        112 => misc::clock_settime(cx, a[0] as i32, a[1]),
         113 => misc::clock_gettime(cx, a[0] as i32, a[1]),
         114 => misc::clock_getres(cx, a[0] as i32, a[1]),
         115 => misc::clock_nanosleep(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
@@ -162,8 +193,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         119 => sched::sched_setscheduler(cx, a[0] as i32, a[1] as i32, a[2]),
         120 => sched::sched_getscheduler(cx, a[0] as i32),
         121 => sched::sched_getparam(cx, a[0] as i32, a[1]),
-        122 => sched::sched_setaffinity(cx, a[0] as i32),
-        123 => misc::sched_getaffinity(cx, a[0] as i32, a[1] as usize, a[2]),
+        122 => sched::sched_setaffinity(cx, a[0] as i32, a[1] as usize, a[2]),
+        123 => sched::sched_getaffinity(cx, a[0] as i32, a[1] as usize, a[2]),
         124 => Ok(0), // sched_yield
         125 | 126 => sched::sched_priority_range(a[0] as i32, nr == 125),
         127 => sched::sched_rr_get_interval(cx, a[0] as i32, a[1]),
@@ -175,26 +206,57 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         134 => sig::rt_sigaction(cx, a[0] as i32, a[1], a[2], a[3] as usize),
         135 => sig::rt_sigprocmask(cx, a[0] as u32, a[1], a[2], a[3] as usize),
         136 => sig::rt_sigpending(cx, a[0], a[1] as usize),
+        137 => sig::rt_sigtimedwait(cx, a[0], a[1], a[2], a[3] as usize),
+        138 => sig::sigqueueinfo(cx, a[0] as i32, None, a[1] as i32, a[2]),
         140 => sched::setpriority(cx, a[0] as i32, a[1] as i32, a[2] as i32),
         141 => sched::getpriority(cx, a[0] as i32, a[1] as i32),
+        142 => misc::reboot(cx, a[0] as u32, a[1] as u32, a[2] as u32),
+        143 => cred::setregid(cx, a[0], a[1]),
+        144 => cred::setgid(cx, a[0]),
+        145 => cred::setreuid(cx, a[0], a[1]),
+        146 => cred::setuid(cx, a[0]),
+        147 => cred::setresuid(cx, a[0], a[1], a[2]),
+        148 => cred::getres(cx, false, [a[0], a[1], a[2]]),
+        149 => cred::setresgid(cx, a[0], a[1], a[2]),
+        150 => cred::getres(cx, true, [a[0], a[1], a[2]]),
+        151 => cred::setfsuid(cx, a[0]),
+        152 => cred::setfsgid(cx, a[0]),
         153 => misc::times(cx, a[0]),
         154 => proc::setpgid(cx, a[0] as i32, a[1] as i32),
         155 => proc::getpgid(cx, a[0] as i32),
         156 => proc::getsid(cx, a[0] as i32),
         157 => proc::setsid(cx),
-        158 => Ok(0), // getgroups：root 没有附加组
+        158 => cred::getgroups(cx, a[0] as i32, a[1]),
+        159 => cred::setgroups(cx, a[0] as i32, a[1]),
         160 => misc::uname(cx, a[0]),
+        161 => misc::set_uts_name(cx, a[0], a[1] as i64, false),
+        162 => misc::set_uts_name(cx, a[0], a[1] as i64, true),
         163 => misc::prlimit(cx, 0, a[0] as u32, 0, a[1]),
         164 => misc::prlimit(cx, 0, a[0] as u32, a[1], 0),
         165 => misc::getrusage(cx, a[0] as i32, a[1]),
         166 => misc::umask(cx, a[0] as u32),
-        167 => misc::prctl(cx, a[0] as i32, a[1]),
+        167 => misc::prctl(cx, a[0] as i32, [a[1], a[2], a[3], a[4]]),
         169 => misc::gettimeofday(cx, a[0], a[1]),
-        172 => Ok(cx.tgid() as u64),                // getpid
+        170 => Err(Errno::EPERM),    // settimeofday：guest 不能改宿主的时间
+        172 => Ok(cx.tgid() as u64), // getpid
         173 => Ok(cx.t.group.borrow().ppid as u64), // getppid
-        174..=177 => Ok(0),                         // getuid、geteuid、getgid、getegid：root
-        178 => Ok(cx.tid() as u64),                 // gettid
+        174 | 175 => cred::getuid(cx, nr == 175),
+        176 | 177 => cred::getgid(cx, nr == 177),
+        168 => misc::getcpu(cx, a[0], a[1]),
+        178 => Ok(cx.tid() as u64), // gettid
         179 => misc::sysinfo(cx, a[0]),
+        186 => ipc::msgget(cx, a[0] as i32, a[1] as i32),
+        187 => ipc::msgctl(cx, a[0] as i32, a[1] as i32, a[2]),
+        188 => ipc::msgrcv(cx, a[0] as i32, a[1], a[2], a[3] as i64, a[4] as i32),
+        189 => ipc::msgsnd(cx, a[0] as i32, a[1], a[2], a[3] as i32),
+        190 => ipc::semget(cx, a[0] as i32, a[1] as i32, a[2] as i32),
+        191 => ipc::semctl(cx, a[0] as i32, a[1] as i32, a[2] as i32, a[3]),
+        192 => ipc::semtimedop(cx, a[0] as i32, a[1], a[2], a[3]),
+        193 => ipc::semtimedop(cx, a[0] as i32, a[1], a[2], 0),
+        194 => ipc::shmget(cx, a[0] as i32, a[1], a[2] as i32),
+        195 => ipc::shmctl(cx, a[0] as i32, a[1] as i32, a[2]),
+        196 => ipc::shmat(cx, a[0] as i32, a[1], a[2] as i32),
+        197 => ipc::shmdt(cx, a[0]),
         198 => net::socket(cx, a[0] as i32, a[1] as u32, a[2] as i32),
         199 => net::socketpair(cx, a[0] as i32, a[1] as u32, a[2] as i32, a[3]),
         200 => net::bind(cx, a[0] as i32, a[1], a[2] as u32),
@@ -227,25 +289,44 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         211 => net::sendmsg(cx, a[0] as i32, a[1], a[2] as u32),
         212 => net::recvmsg(cx, a[0] as i32, a[1], a[2] as u32),
         214 => Ok(cx.mm_mut().brk(a[0])),
+        223 => fs::fadvise64(cx, a[0] as i32, a[2] as i64, a[3] as i32),
+        213 => fs::cache_hint(cx, a[0] as i32, a[1] as i64, a[2] as i64, 0, 1),
         215 => mem::munmap(cx, a[0], a[1]),
-        216 => Err(Errno::ENOMEM), // mremap：调用方（musl 的 realloc）会退回到复制
+        216 => mem::mremap(cx, a[0], a[1], a[2], a[3] as u32, a[4]),
         220 => proc::clone(cx, cpu, a[0], a[1], a[2], a[3], a[4]),
         222 => mem::mmap(cx, a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5]),
         226 => mem::mprotect(cx, a[0], a[1], a[2] as u32),
-        227 => Ok(0), // msync：共享映射直接就是宿主的文件映射
-        228 => mem::mlock(cx, a[0], a[1], 0),
-        229 => mem::mlock(cx, a[0], a[1], 0), // munlock
-        230 => mem::mlockall(a[0] as u32),
-        231 => Ok(0), // munlockall
+        227 => mem::msync(cx, a[0], a[1], a[2] as u32),
+        228 => mem::mlock(cx, a[0], a[1], 0, true),
+        229 => mem::mlock(cx, a[0], a[1], 0, false),
+        230 => mem::mlockall(cx, a[0] as u32),
+        231 => mem::munlockall(cx),
         232 => mem::mincore(cx, a[0], a[1], a[2]),
         233 => mem::madvise(cx, a[0], a[1], a[2] as i32),
+        240 => sig::sigqueueinfo(cx, a[0] as i32, Some(a[1] as i32), a[2] as i32, a[3]),
         242 => net::accept4(cx, a[0] as i32, a[1], a[2], a[3] as u32),
+        243 => net::recvmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
         260 => proc::wait4(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
         261 => misc::prlimit(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        267 => fs::cache_hint(cx, a[0] as i32, 0, 0, 0, 2),
+        264 => fs::name_to_handle_at(cx, a[0] as i32, a[1], a[2], a[3], a[4] as u32),
+        265 => fs::open_by_handle_at(cx, a[0] as i32, a[1], a[2] as u32),
+        269 => net::sendmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
+        274 => sched::sched_setattr(cx, a[0] as i32, a[1], a[2] as u32),
+        275 => sched::sched_getattr(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
         276 => fs::renameat2(cx, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
         278 => misc::getrandom(cx, a[0], a[1] as usize, a[2] as u32),
         279 => fs::memfd_create(cx, a[0], a[1] as u32),
-        284 => mem::mlock(cx, a[0], a[1], a[2] as u32),
+        284 => mem::mlock(cx, a[0], a[1], a[2] as u32, true),
+        285 => fs::copy_file_range(
+            cx,
+            a[0] as i32,
+            a[1],
+            a[2] as i32,
+            a[3],
+            a[4] as usize,
+            a[5] as u32,
+        ),
         286 | 287 => fs::pvectored(
             cx,
             a[0] as i32,
@@ -275,6 +356,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             Err(Errno::ENOSYS)
         }
     };
+    debug::trace_syscall(cx.tid(), nr, &a, &result);
     cpu.state_mut().x[0] = match result {
         Ok(v) => v,
         Err(errno) => errno.to_syscall_return(),

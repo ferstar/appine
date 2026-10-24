@@ -42,10 +42,16 @@ pub mod mode {
     pub const S_IFIFO: u32 = 0o010000;
     /// socket。
     pub const S_IFSOCK: u32 = 0o140000;
+    /// setuid 位。
+    pub const S_ISUID: u32 = 0o4000;
+    /// setgid 位。
+    pub const S_ISGID: u32 = 0o2000;
+    /// 粘滞位。
+    pub const S_ISVTX: u32 = 0o1000;
 }
 
 /// 一个 inode 的元数据。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stat {
     /// inode 编号。
     pub ino: Ino,

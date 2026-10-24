@@ -3,13 +3,16 @@
 //! 每个 guest 线程对应一个宿主线程，内核层由一把大内核锁保护；宿主经由 [`Machine`]
 //! 启动进程、开控制台（Android 的终端标签页、`appine-run`）。根文件系统是 inode 仓库。
 
+mod cred;
 mod debug;
 pub mod errno;
 mod fd;
 mod futex;
+mod ipc;
 mod itimer;
 mod kernel;
 mod loader;
+mod locks;
 mod machine;
 mod mm;
 mod net;

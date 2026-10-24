@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crate::errno::Errno;
 use crate::pipe::PipeEnd;
@@ -47,6 +48,8 @@ pub mod oflags {
     pub const O_NOFOLLOW: u32 = 0o100000;
     /// 大文件（64 位上恒为真）。
     pub const O_LARGEFILE: u32 = 0o400000;
+    /// 不更新访问时间（只有属主或者有 `CAP_FOWNER` 的进程能用）。
+    pub const O_NOATIME: u32 = 0o1000000;
     /// exec 时关闭。
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// 只取路径。
@@ -92,6 +95,10 @@ pub enum FileKind {
     Epoll(Rc<RefCell<crate::syscall::Epoll>>),
     /// eventfd：一个 64 位计数器。
     EventFd(Rc<RefCell<EventFd>>),
+    /// timerfd：一个定时器，到期的次数由 read 取走。
+    TimerFd(Rc<RefCell<TimerFd>>),
+    /// signalfd：read 取走调用者挂起的、在掩码里的信号。
+    SignalFd(Rc<RefCell<SignalFd>>),
     /// procfs 的文件：打开时生成的内容。
     Proc {
         /// 节点。
@@ -111,6 +118,9 @@ pub struct OpenFile {
     pub pos: u64,
     /// `/proc/<pid>/fd/<n>` 显示的路径（打开时的绝对路径）。
     pub path: Option<Rc<[u8]>>,
+    /// `F_SETOWN_EX` 的 (类型, pid) 和 `F_SETSIG` 的信号：只记录，不发 SIGIO。
+    pub owner: (i32, i32),
+    pub sig: i32,
 }
 
 impl OpenFile {
@@ -126,6 +136,8 @@ impl OpenFile {
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
             path,
+            owner: (0, 0),
+            sig: 0,
         }))
     }
 
@@ -139,15 +151,17 @@ impl OpenFile {
         self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_RDONLY
     }
 
-    /// 对应的文件系统节点（宿主 fd、管道和 PTY 没有）。
+    /// 对应的文件系统节点（宿主 fd、匿名管道和 PTY 没有）。
     pub fn node(&self) -> Option<Node> {
         match &self.kind {
+            FileKind::Pipe(end) => end.pipe.borrow().fifo.map(Node::Store),
             FileKind::Host(_)
-            | FileKind::Pipe(_)
             | FileKind::Pty(_)
             | FileKind::Socket(_)
             | FileKind::Epoll(_)
-            | FileKind::EventFd(_) => None,
+            | FileKind::EventFd(_)
+            | FileKind::TimerFd(_)
+            | FileKind::SignalFd(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),
@@ -175,6 +189,53 @@ impl Drop for OpenFile {
     }
 }
 
+/// signalfd 的状态。
+pub struct SignalFd {
+    /// 关注的信号（不含 SIGKILL、SIGSTOP）。
+    pub mask: u64,
+    /// 创建它的线程组和线程：poll 按它们挂起的信号判断是否可读（read 取的是调用者的）。
+    pub group: std::rc::Weak<RefCell<crate::process::ThreadGroup>>,
+    pub task: std::rc::Weak<crate::task::Task>,
+}
+
+impl SignalFd {
+    /// 有没有可以读走的信号（poll）。
+    pub fn ready(&self) -> bool {
+        let group = self.group.upgrade().map_or(0, |g| g.borrow().pending);
+        let task = self.task.upgrade().map_or(0, |t| t.pending.get());
+        (group | task) & self.mask != 0
+    }
+}
+
+/// timerfd 的状态。
+pub struct TimerFd {
+    /// 时钟（`CLOCK_REALTIME` 等）：设置绝对时间时按它换算。
+    pub clock: i32,
+    /// 下一次到期的时刻（宿主的单调时钟）；None 表示没有启动。
+    pub deadline: Option<Instant>,
+    /// 到期之后重新计时的间隔，0 表示只触发一次。
+    pub interval: Duration,
+    /// 已经到期、还没有被读走的次数。
+    pub expirations: u64,
+}
+
+impl TimerFd {
+    /// 把 `now` 之前到期的次数记进 `expirations`。
+    pub fn update(&mut self, now: Instant) {
+        let Some(d) = self.deadline.filter(|&d| d <= now) else {
+            return;
+        };
+        if self.interval.is_zero() {
+            self.expirations += 1;
+            self.deadline = None;
+        } else {
+            let n = ((now - d).as_nanos() / self.interval.as_nanos()) as u64 + 1;
+            self.expirations += n;
+            self.deadline = Some(d + self.interval * n as u32);
+        }
+    }
+}
+
 /// eventfd 的状态。
 pub struct EventFd {
     /// 计数器。
@@ -193,9 +254,20 @@ struct Slot {
 }
 
 /// 一个进程的 fd 表。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FdTable {
     slots: Vec<Option<Slot>>,
+    /// 新的 fd 必须小于它（`RLIMIT_NOFILE` 的软限制，由 prlimit 同步过来）。
+    pub limit: usize,
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        FdTable {
+            slots: Vec::new(),
+            limit: MAX_FDS,
+        }
+    }
 }
 
 impl FdTable {
@@ -230,36 +302,41 @@ impl FdTable {
 
     /// 放到不小于 `min` 的最小空闲 fd 上。
     pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
-        if min >= MAX_FDS {
+        if min >= self.limit {
             return Err(Errno::EINVAL);
         }
-        let fd = (min..MAX_FDS)
+        let fd = (min..self.limit)
             .find(|&i| self.slots.get(i).is_none_or(Option::is_none))
             .ok_or(Errno::EMFILE)?;
         self.install_at(fd as i32, file, cloexec)?;
         Ok(fd as i32)
     }
 
-    /// 放到指定的 fd 上，原来的文件被关闭（dup2/dup3）。
-    pub fn install_at(&mut self, fd: i32, file: FileRef, cloexec: bool) -> Result<(), Errno> {
+    /// 放到指定的 fd 上，返回被替换掉的原来的文件（dup2/dup3）。
+    pub fn install_at(
+        &mut self,
+        fd: i32,
+        file: FileRef,
+        cloexec: bool,
+    ) -> Result<Option<FileRef>, Errno> {
         let i = usize::try_from(fd)
             .ok()
-            .filter(|&i| i < MAX_FDS)
+            .filter(|&i| i < self.limit)
             .ok_or(Errno::EBADF)?;
         if self.slots.len() <= i {
             self.slots.resize(i + 1, None);
         }
-        self.slots[i] = Some(Slot { file, cloexec });
-        Ok(())
+        let old = self.slots[i].replace(Slot { file, cloexec });
+        Ok(old.map(|s| s.file))
     }
 
-    /// 关闭 fd。
-    pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
+    /// 关闭 fd，返回关闭的文件。
+    pub fn close(&mut self, fd: i32) -> Result<FileRef, Errno> {
         let slot = usize::try_from(fd)
             .ok()
             .and_then(|i| self.slots.get_mut(i))
             .ok_or(Errno::EBADF)?;
-        slot.take().map(|_| ()).ok_or(Errno::EBADF)
+        slot.take().map(|s| s.file).ok_or(Errno::EBADF)
     }
 
     /// 所有打开着的 fd，从小到大。
@@ -272,24 +349,29 @@ impl FdTable {
             .collect()
     }
 
-    /// execve：关闭所有带 close-on-exec 标志的 fd。
-    pub fn close_on_exec(&mut self) {
+    /// execve：关闭所有带 close-on-exec 标志的 fd，返回关闭的文件。
+    pub fn close_on_exec(&mut self) -> Vec<FileRef> {
+        let mut closed = Vec::new();
         for slot in &mut self.slots {
             if slot.as_ref().is_some_and(|s| s.cloexec) {
-                *slot = None;
+                closed.extend(slot.take().map(|s| s.file));
             }
         }
+        closed
     }
 
-    /// close_range(2)：关闭（或只标记 close-on-exec）`[first, last]` 里的 fd。
-    pub fn close_range(&mut self, first: usize, last: usize, cloexec_only: bool) {
+    /// close_range(2)：关闭（或只标记 close-on-exec）`[first, last]` 里的 fd，返回
+    /// 关闭的文件。
+    pub fn close_range(&mut self, first: usize, last: usize, cloexec_only: bool) -> Vec<FileRef> {
+        let mut closed = Vec::new();
         let end = last.saturating_add(1).min(self.slots.len());
         for slot in self.slots.iter_mut().take(end).skip(first) {
             match slot {
                 Some(s) if cloexec_only => s.cloexec = true,
-                _ => *slot = None,
+                _ => closed.extend(slot.take().map(|s| s.file)),
             }
         }
+        closed
     }
 
     /// 读取 close-on-exec 标志。
@@ -318,6 +400,13 @@ impl FdTable {
     }
 }
 
+impl Drop for FdTable {
+    /// fd 表消失（进程退出）：它持有的记录锁随之失效，等锁的线程要重新检查。
+    fn drop(&mut self) {
+        crate::kernel::request_wake();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,8 +420,15 @@ mod tests {
         assert_eq!(t.install(f.clone(), true, 0), Ok(1));
         assert_eq!(t.cloexec(1), Ok(true));
         assert_eq!(t.install(f.clone(), false, 10), Ok(10));
-        assert_eq!(t.close(7), Err(Errno::EBADF));
+        assert_eq!(t.close(7).err(), Some(Errno::EBADF));
         assert_eq!(t.get(-1).err(), Some(Errno::EBADF));
+        // 新的 fd 不能超过 RLIMIT_NOFILE
+        t.limit = 11;
+        for fd in [4, 5, 6, 7, 8, 9] {
+            assert_eq!(t.install(f.clone(), false, 0), Ok(fd));
+        }
+        assert_eq!(t.install(f.clone(), false, 0), Err(Errno::EMFILE));
+        assert_eq!(t.install(f.clone(), false, 11), Err(Errno::EINVAL));
         // dup 出来的 fd 共享同一个打开文件
         f.borrow_mut().pos = 5;
         assert_eq!(t.get(10).unwrap().borrow().pos, 5);

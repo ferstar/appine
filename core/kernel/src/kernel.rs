@@ -37,7 +37,10 @@ pub(crate) type Tid = i32;
 pub(crate) const INIT: Tid = 1;
 
 /// 最大的 tid，与 Linux 64 位上 `pid_max` 的上限相同。
-const PID_MAX: Tid = 4 << 20;
+pub(crate) const PID_MAX: Tid = 4 << 20;
+
+/// 主机名、域名的最大长度（`__NEW_UTS_LEN`）。
+pub(crate) const UTS_LEN: usize = 64;
 
 /// 有修改可能让等待中的线程继续，释放 BKL 时唤醒它们。
 static WAKE: AtomicBool = AtomicBool::new(false);
@@ -81,10 +84,20 @@ pub(crate) struct Kernel {
     /// flock(2) 的锁：每个 inode 上持有锁的打开文件，以及是不是排他锁。打开文件关闭后
     /// 弱引用失效，锁随之释放。
     pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
+    /// fcntl(2) 的记录锁。
+    pub locks: crate::locks::Locks,
+    /// System V IPC 对象。
+    pub ipc: crate::ipc::Ipc,
     /// AF_UNIX socket 绑定的地址。
     pub unix: crate::unix::Names,
+    /// 正在被打开的命名管道（FIFO）：同一个 inode 的所有打开共用一个管道对象。
+    pub fifos: BTreeMap<Ino, Weak<RefCell<crate::pipe::Pipe>>>,
     /// memfd 的封印（F_ADD_SEALS），以 inode 为键；不在这里的文件不能加封印。
     pub seals: BTreeMap<Ino, u32>,
+    /// 主机名和 NIS 域名（uname、sethostname、`/proc/sys/kernel/hostname`），最长
+    /// [`UTS_LEN`] 字节。
+    pub hostname: Vec<u8>,
+    pub domainname: Vec<u8>,
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
@@ -117,8 +130,13 @@ impl Kernel {
             ptys: BTreeMap::new(),
             consoles: BTreeMap::new(),
             flocks: BTreeMap::new(),
+            locks: crate::locks::Locks::default(),
+            ipc: crate::ipc::Ipc::default(),
             unix: Default::default(),
+            fifos: BTreeMap::new(),
             seals: BTreeMap::new(),
+            hostname: b"localhost".to_vec(),
+            domainname: b"(none)".to_vec(),
             next_tid: INIT + 1,
             waiters: Vec::new(),
         }
@@ -296,6 +314,11 @@ impl<'a> Cx<'a> {
         self.t.fs.borrow().cwd.clone()
     }
 
+    /// 根目录（chroot）。
+    pub fn root(&self) -> Node {
+        self.t.fs.borrow().root.clone()
+    }
+
     /// 换掉地址空间（execve），同时更新 procfs 能看到的那份。
     pub fn set_mm(&mut self, mm: Rc<RefCell<Mm>>) {
         self.task.res.borrow_mut().mm = mm.clone();
@@ -318,6 +341,17 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// 当前进程的凭据。
+    pub fn cred(&self) -> crate::cred::Cred {
+        self.t.group.borrow().cred.clone()
+    }
+
+    /// AF_UNIX 的 `SO_PEERCRED`、`SCM_CREDENTIALS`：pid 和有效用户 ID、组 ID。
+    pub fn ucred(&self) -> crate::unix::Ucred {
+        let g = self.t.group.borrow();
+        crate::unix::Ucred::of(self.tgid(), g.cred.euid, g.cred.egid)
+    }
+
     /// 文件创建掩码。
     pub fn umask(&self) -> u32 {
         self.t.fs.borrow().umask
@@ -335,16 +369,20 @@ impl<'a> Cx<'a> {
         host: &mut [(i32, i16, i16)],
     ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
+        self.task.sleeping.set(true);
         let (k, r) = block(self.shared, k, &self.task.event, deadline, host);
+        self.task.sleeping.set(false);
         self.k = Some(k);
         r
     }
 
     /// 释放 BKL 执行 `f`（可能阻塞的宿主 I/O）。`f` 不能访问任何内核对象。
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.task.sleeping.set(true);
         drop(self.k.take());
         let r = f();
         self.k = Some(self.shared.lock());
+        self.task.sleeping.set(false);
         r
     }
 }

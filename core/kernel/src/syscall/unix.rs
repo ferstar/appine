@@ -71,7 +71,7 @@ pub(super) fn socket(ty: i32, protocol: i32) -> Result<Socket, Errno> {
 
 /// socketpair(2)：两个互相连接的 socket。
 pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socket), Errno> {
-    let (a, b) = UnixSocket::pair(socket_type(ty, protocol)?, Ucred::of(cx.tgid()));
+    let (a, b) = UnixSocket::pair(socket_type(ty, protocol)?, cx.ucred());
     Ok((Socket::Unix(a), Socket::Unix(b)))
 }
 
@@ -118,6 +118,9 @@ fn find(cx: &Cx<'_>, addr: &[u8]) -> Result<SocketRef, Errno> {
             let vfs = cx.vfs()?;
             match node {
                 Node::Store(ino) if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK => {
+                    // 连接路径地址要求对 socket 文件有写权限
+                    cx.cred()
+                        .permission(&vfs.store().stat(ino)?, crate::cred::MAY_WRITE)?;
                     Name::Path(ino)
                 }
                 _ => return Err(Errno::ECONNREFUSED),
@@ -146,18 +149,21 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
         Addr::Path(p) => {
             // 与 Linux 相同，在文件系统里建一个 socket 节点；已经存在时失败
             let (dir, name) = parent_at(cx, AT_FDCWD, p)?;
-            let perm = 0o777 & !cx.umask();
-            let ino = cx
-                .vfs()?
+            let vfs = cx.vfs()?;
+            let cred = cx.cred();
+            let in_use = |e: Errno| {
+                if e == Errno::EEXIST {
+                    Errno::EADDRINUSE
+                } else {
+                    e
+                }
+            };
+            let dir_st = super::fs::may_create(vfs.store(), &cred, dir, name).map_err(in_use)?;
+            let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777 & !cx.umask(), false);
+            let ino = vfs
                 .store()
-                .mknod(dir, name, mode::S_IFSOCK | perm, 0, 0, 0)
-                .map_err(|e| {
-                    if e == Errno::EEXIST {
-                        Errno::EADDRINUSE
-                    } else {
-                        e
-                    }
-                })?;
+                .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
+                .map_err(in_use)?;
             cx.k().unix.insert(Name::Path(ino), sock);
             bound.extend_from_slice(p);
             bound.push(0);
@@ -239,7 +245,7 @@ pub(super) fn connect(
     if ty == SOCK_DGRAM {
         return connect_dgram(cx, sock, addr);
     }
-    let cred = Ucred::of(cx.tgid());
+    let cred = cx.ucred();
     let deadline = deadline(timeout);
     loop {
         with(sock, |u| match u.link {
@@ -340,7 +346,7 @@ pub(super) fn send(
 ) -> Result<usize, Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let mut files = rights(cx, control)?;
-    let cred = Ucred::of(cx.tgid());
+    let cred = cx.ucred();
     let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
     let deadline = deadline(timeout);
     if ty == SOCK_DGRAM {

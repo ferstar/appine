@@ -18,10 +18,11 @@ use std::thread::JoinHandle;
 use appine_engine::{Cpu, Dbt, DbtStats};
 use appine_hal::Event;
 
+use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{INIT, Kernel, Shared, block, request_wake};
-use crate::loader::{self, Args};
+use crate::loader::{self, Args, Executable};
 use crate::mm::Mm;
 use crate::process::{
     ExitStatus, RunError, RunOptions, RunReport, Signal, ThreadGroup, Tier, comm_of,
@@ -73,6 +74,7 @@ impl Machine {
             Some(dir) => Some(Rc::new(Vfs::open(dir).map_err(RunError::Rootfs)?)),
             None => None,
         };
+        appine_hal::raise_fd_limit();
         let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
         {
             let mut k = shared.lock();
@@ -105,19 +107,29 @@ impl Machine {
         let vfs = k.vfs.clone();
         let offline = crate::pseudo::Offline;
         let file = match &vfs {
-            Some(vfs) => {
-                read_executable(vfs, &offline, &Node::ROOT, program).map_err(RunError::Exec)?
+            Some(vfs) => read_executable(
+                vfs,
+                &offline,
+                &Cred::root(),
+                &Node::ROOT,
+                &Node::ROOT,
+                program,
+            )
+            .map_err(RunError::Exec)?,
+            None => {
+                let f = std::fs::File::open(OsStr::from_bytes(program)).map_err(RunError::Io)?;
+                Executable::open(f).map_err(|e| RunError::Io(io::Error::from_raw_os_error(e.0)))?
             }
-            None => std::fs::read(OsStr::from_bytes(program)).map_err(RunError::Io)?,
         };
         let args = Args {
             argv,
             envp,
             execfn: program,
+            ids: [0; 4],
         };
         let mut mm = Mm::new();
         let mut read_interp = |p: &[u8]| match &vfs {
-            Some(vfs) => read_executable(vfs, &offline, &Node::ROOT, p),
+            Some(vfs) => read_executable(vfs, &offline, &Cred::root(), &Node::ROOT, &Node::ROOT, p),
             None => Err(Errno::ENOENT),
         };
         let image =
@@ -150,6 +162,7 @@ impl Machine {
             mm,
             fds: Rc::new(RefCell::new(fds)),
             fs: Rc::new(RefCell::new(FsContext {
+                root: Node::ROOT,
                 cwd: Node::ROOT,
                 umask: 0o022,
             })),

@@ -192,7 +192,7 @@ ldr  x0, [x16, xA]           // 宿主地址 = addend + guest 地址
 - 文件映射直接用宿主 `mmap(objects/<ino>)` 的页作为后备内存。如果宿主是 16K 页，就映射包含目标位置的 16K 对齐区间，再把页表项指向区间里正确的 4K 偏移。这样带来两个好处：
   - busybox/musl 的代码页通过宿主 page cache **在所有 guest 进程之间共享**。
   - `MAP_SHARED` 映射和 `read`/`write` 之间天然一致。
-- 进程间的 `MAP_SHARED` 匿名内存，就是让两张页表指向同一个宿主页。
+- 进程间的 `MAP_SHARED` 匿名内存，就是让两张页表指向同一个宿主页。System V 共享内存段同理：段持有一段宿主内存，`shmat` 把它映射进地址空间。
 - 访问文件映射时如果超出 EOF，宿主会产生 SIGBUS，我们把它转换成 guest 的 SIGBUS。
 
 ### 5.3 fork
@@ -328,11 +328,11 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ### 11.1 凭据与权限
 
-- 按 Linux 的 `struct cred` 完整实现：ruid/euid/suid/fsuid、附加组、umask。VFS 做 DAC 权限检查，root 可以绕过。
+- 按 Linux 的 `struct cred` 实现：ruid/euid/suid/fsuid、对应的四个 gid、附加组、umask。凭据放在线程组里（libc 的 setuid 系列本来就会让每个线程都调用一遍）。VFS 做 DAC 权限检查（`generic_permission`、粘滞位、setgid 目录），root 经由能力绕过。
 - **默认以 root 登录**。设置里提供"以指定用户登录"。
 - setuid/setgid 位在 execve 时生效，并设置 `AT_SECURE`。
-- 支持 `chroot`（每个进程记录自己的根目录 dentry）。
-- capabilities 简化处理：uid 0 拥有全部能力，其他 uid 没有。v1 不支持文件 capabilities。
+- 支持 `chroot`（每个进程记录自己的根目录）。
+- capabilities 按 capabilities(7) 的规则随用户 ID 变化：有效用户 ID 为 0 时拥有边界集内的全部能力，变成非 0 时清空有效集，三个用户 ID 都非 0 时清空允许集，文件系统能力跟着 fsuid；`capset`、`PR_CAPBSET_DROP` 可以缩小。v1 不支持文件 capabilities 和环境（ambient）能力。
 - guest 自己安装 seccomp 过滤器：v1 返回 `EINVAL`，v1.x 在内核层实现 cBPF 解释器。
 
 ### 11.2 生命周期
@@ -461,7 +461,7 @@ docs/            设计文档
 | **M3b 交互式 shell** ✅ | 进程内 PTY + 行规程、会话和进程组的作业控制（停止和继续）、`appine-run` 接管宿主终端、devpts 和 procfs | `ash` 下管道、Ctrl-C、Ctrl-Z/`fg`、`vi` 都正常 |
 | **M4 网络 + apk** ✅ | socket 透传、DNS 存根、netlink 模拟、硬链接、AES/SHA 指令 | `apk update && apk add git python3` 成功，`git clone https://…` 成功 |
 | **M5 Android 外壳** ✅（未提交 Play） | Kotlin App、vendored 终端库、`specialUse` 前台服务、首次启动流程 | 真机上装好即用；4K/16K 页设备都通过；**提交 Play 内部测试或封闭测试轨道** |
-| **M6 B 档负载** | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
+| **M6 B 档负载** ✅ | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
 | **M7 Tier 1 正式版** | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
 | **M8 C 档正确性** | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler） | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
@@ -631,7 +631,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 
 - epoll 没有用宿主 epoll（修改 §10），见上。
 - AF_UNIX 没有垃圾回收：socket 经由自己传递自己形成的环不会被释放（Linux 用专门的 GC 处理）；没有 `/proc/net/unix`。
-- 没有实现 `execveat`（musl 的 `fexecve` 会退回到 `/proc/self/fd/<n>`）、`membarrier`（musl 有基于信号的退路）、`pidfd_open`（python 会退回）、POSIX 定时器、`timerfd`、`signalfd`、`inotify`、文件记录锁（`F_SETLK` 仍然总是成功）。
+- 没有实现 `execveat`（musl 的 `fexecve` 会退回到 `/proc/self/fd/<n>`）、`membarrier`（musl 有基于信号的退路）、`pidfd_open`（python 会退回）、POSIX 定时器、`timerfd`、`signalfd`、`inotify`、文件记录锁（`F_SETLK` 仍然总是成功）。其中 POSIX 定时器、timerfd、signalfd 和记录锁在 M6 补上了。
 - 1024 以下的端口、回环地址对其他 App 可见等 §10 的问题在 M5 的真机上确认。
 
 ### M5 结果（2026-10-24）
@@ -677,6 +677,82 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 - 还没有：wake lock 开关、`onTrimMemory`、被杀之后恢复标签页（M9）、DocumentsProvider（§11.3）、设置界面（选执行层、换镜像、重置 rootfs）。
 - 没有真机，R1 的真机性能测量、1024 以下端口和回环地址对其他 App 可见等问题仍待确认。
 
+### M6 结果（2026-10-25）
+
+**结论：在 appine 里从源码编译成功。Lua 5.4.7 `make linux` 用 51 秒，编出来的 `lua` 正常；SQLite 3.50.4 `./configure && make` 用 15 + 485 秒，编出来的 `sqlite3` 正常。两者都比原生慢约 10 倍。python3 测试集子集的 29 个测试文件（2929 个用例，跳过 307 个）全部通过。LTP 的 syscall 测试从 490 个通过增加到 849 个，剩下的失败大多是 appine 不打算支持的功能（见下）。达到退出标准。**
+
+测量条件与 M4 相同：Apple Silicon 上的 colima 虚拟机（4 核），release 构建，Tier 1，单个 make 作业。原生是同一台虚拟机上的 `alpine:3.24` 容器。
+
+| 负载 | 原生 | appine Tier 1 | 倍数 |
+|---|---|---|---|
+| Lua 5.4.7 `make linux` | 4.9s | 51s | 10× |
+| SQLite 3.50.4 `./configure` | 1.2s | 15s | 12× |
+| SQLite 3.50.4 `make` | 50s | 485s | 9.6× |
+
+- **性能**：M6 开始时 Lua 要编 5 分 33 秒，找到的问题有三个：
+  1. **代码缓存清空太频繁**。编译 `lvm.c` 这一个文件就清空了 19613 次：gcc 的垃圾回收器、malloc 频繁地 munmap、mprotect，原来每次都作废整个代码缓存。`Mm` 现在分开记两个代数：TLB 代数在任何映射变化时递增，代码代数只在可执行的映射被拆除、改了权限或者被 `MADV_DONTNEED` 时递增；只有后者变化时才清空翻译缓存。
+  2. **翻译表太小**。表满了也要整体清空，表从 2^16 项加到 2^18 项。
+  3. **加载器拷贝整个程序**。cc1 有 37 MB，每次 execve 都把各段拷贝进匿名内存。现在仓库里的程序以私有文件映射的方式映射各段（§5.2），代码页经由宿主 page cache 在进程之间共享；只有段之间共用一页、或者偏移没有对齐时才退回到拷贝。
+
+  三项修好之后，编译 `lvm.c` 从 32.3 秒降到 7.4 秒（原生约 0.4 秒），整个 Lua 从 333 秒降到 51 秒。剩下的瓶颈很集中：编译 `lvm.c` 时有 1.34 亿次退回 Tier 0 执行单条指令，按类别是 SIMD 访存约 60%、SIMD 数据处理约 21%、整数访存的 TLB 未命中约 19%。前两类来自 musl 用 NEON 写的 `memcpy`、`strlen` 这类函数。退回 Tier 0 的指令只占翻译指令的 0.9%，执行次数却很高。所以 R1 的退路"先让 Tier 1 翻译 SIMD&FP"现在有了实测依据。
+- **凭据与权限**（§11.1）：`Cred` 放在线程组里，包括 ruid/euid/suid/fsuid、四个 gid、附加组、能力集（有效、允许、可继承、边界）和 securebits。
+  - 实现了 setuid 系列的 14 个 syscall 和 `capget`/`capset`，用户 ID 变化时按 capabilities(7) 的规则调整能力。
+  - VFS 做 DAC 检查：路径上每个目录的搜索权限、open 的读写权限、新建和删除要求父目录可写、粘滞位、chmod/chown/utimes 的属主规则、access 用真实 ID。
+  - 新文件的属主是 fsuid/fsgid，setgid 目录里继承目录的属组。
+  - execve 时 setuid/setgid 位生效，并设置 `AT_SECURE`。
+  - kill、setpriority、调度参数、prlimit 按凭据检查权限；`/proc/<pid>` 的属主是进程的有效 ID；PTY 从设备属于打开主设备的进程。
+- **文件**：
+  - fcntl 的记录锁：传统的 POSIX 锁属于 fd 表，关闭任何一个指向该文件的 fd 都会释放它在该文件上的全部锁；OFD 锁属于打开文件。锁会拆分和合并，F_SETLKW 能检测死锁（`core/kernel/src/locks.rs`）。
+  - FIFO：同一个 inode 的所有打开共用一个管道，open 按 Linux 的规则等对端。
+  - chroot（每个进程记录自己的根目录）、ETXTBSY、`RLIMIT_FSIZE`（SIGXFSZ）、`RLIMIT_NOFILE`。
+  - 新增 `copy_file_range`、`splice`/`tee`/`vmsplice`（经由宿主缓冲区复制，不是零拷贝）、`name_to_handle_at`/`open_by_handle_at`（句柄就是 inode 编号），以及 `fadvise64`、`sync_file_range`、`readahead`、`syncfs`。
+  - 管道容量可以用 `F_SETPIPE_SZ` 修改。
+  - `pwritev2` 支持 `RWF_NOAPPEND`：Alpine 3.24 的 musl 用它实现 pwrite，原来返回 EOPNOTSUPP 时，musl 的退路会让 O_APPEND 文件上的 pwrite 全部失败。
+  - 所有 guest 进程共用宿主进程的 fd，每个打开的仓库文件、socket 都占一个，所以 `Machine` 启动时把宿主的 fd 软限制提到硬限制。
+- **内存**：
+  - `mremap`：搬家时不复制数据，只把同一段宿主内存映射到新地址；扩展出来的部分是匿名内存，共享文件映射则接着映射文件。
+  - `msync` 做参数检查。
+  - `mlock` 一族记录哪些映射被锁住，实行 `RLIMIT_MEMLOCK`，`/proc/<pid>/status` 有 VmLck。
+  - `madvise` 检查参数和区间，`mincore` 改用宿主的 mincore。
+  - mmap 支持 `MAP_SHARED_VALIDATE`、`MAP_LOCKED` 和 `/dev/zero`；封印了写入的 memfd 不能有可写的共享映射。
+- **进程间通信和定时器**：
+  - System V 消息队列、信号量集（含 `SEM_UNDO`）和共享内存段，有 `/proc/sysvipc/*`，`/proc/sys/kernel` 下的限制可以修改（`core/kernel/src/ipc.rs`）。共享内存段是一段宿主内存；段被 shmat 的次数不单独记录，而是数各个地址空间里的映射。
+  - POSIX 定时器：墙上时钟和进程、线程的 CPU 时钟，`SIGEV_SIGNAL`/`SIGEV_THREAD_ID`/`SIGEV_NONE`，超限次数记在挂起的信号里。
+  - 另外还有：timerfd、signalfd、`rt_sigtimedwait`、`rt_sigqueueinfo`、按 CPU 时间计时的 `ITIMER_VIRTUAL`/`ITIMER_PROF`、`RLIMIT_CPU`（SIGXCPU）、进程和线程的 CPU 时钟。
+  - epoll 的 `EPOLLET` 改为按状态变化触发，并检查嵌套和成环。
+- **其他 syscall**：
+  - 调度：调度策略、实时优先级和 `SCHED_DEADLINE` 的参数按线程记录（只记录，由宿主调度），`sched_setattr`/`sched_getattr`，CPU 亲和性。
+  - prctl：补了 keepcaps、securebits、边界集、环境能力、timerslack 等选项，用不到的参数要求为 0。
+  - 还有 `personality`、`getcpu`、`get_robust_list`、`sendmmsg`/`recvmmsg`、`sethostname`/`setdomainname`、`reboot`（只接受 Ctrl-Alt-Del 的开关）。
+  - `/proc/<pid>/stat` 只有真正在内核里等待的线程才报告 S：刚 fork 还没运行的子进程原来也报告 S，LTP 里按状态同步的测试因此出现竞争。
+- **LTP**：`scripts/build-ltp` 在 `alpine:3.24` 容器里原生编译 LTP 20260930（1562 个程序），`scripts/ltp` 每个测试启动一个新的 `appine-run`，同时把一份描述 appine 特性的内核配置交给 LTP（`KCONFIG_PATH`）。syscall 测试共 1552 个：
+
+  | | M6 开始时 | M6 结束时 |
+  |---|---|---|
+  | 通过 | 490 | 849 |
+  | 不适用（TCONF） | 310 | 393 |
+  | 失败 | 752 | 310 |
+
+  剩下的失败按原因：
+  - 176 个需要块设备、挂载或者特定的文件系统：LTP 用 loop 设备建文件系统来测（`.needs_device`、`.all_filesystems`），appine 没有块设备。
+  - 18 个是命名空间、ptrace、cgroup；18 个是 inotify/fanotify、AIO、io_uring、POSIX 消息队列、userfaultfd；18 个是文件租约和 core dump；14 个要修改宿主时间；2 个是内核模块、keyctl。这些都没有实现，见下面的推迟项。
+  - 16 个是 musl 自己的行为，在真正的 Linux 上配 musl 也会失败：musl 的 `clone()` 拒绝 `CLONE_THREAD`，`sched_setscheduler` 不调用内核，`sigtimedwait` 遇到 EINTR 自动重试，`sendmsg`/`recvmmsg` 先在用户态读写参数，`fchmod` 对 O_PATH fd 退回到 `/proc/self/fd`。
+  - 10 个程序在 LTP 的其他目录里，`scripts/build-ltp` 没有编。
+  - 剩下 38 个是零散的语义差别，比如 `EPOLLEXCLUSIVE`、`/proc/<pid>/smaps` 和 `pagemap`、`MAP_GROWSDOWN` 的栈、一些 ioctl 的错误码。
+- **测试**：
+  - 单元测试新增凭据和能力的转换、DAC、粘滞位和 setgid 目录、记录锁的拆分合并和死锁检测、System V IPC、mremap、执行文件映射的 .bss。
+  - `tests/guest/posix.c` 在两个执行层下检查消息队列、信号量（`SEM_UNDO`）、跨 fork 的共享内存、POSIX 定时器（超限次数、`SIGEV_THREAD`、CPU 时钟）、signalfd、管道之间的 splice/tee/vmsplice、mremap、降低权限之后的凭据规则、亲和性和实时策略、`RLIMIT_NOFILE`。
+  - rootfs 用例新增一个：su 到 nobody 之后检查 DAC。
+  - 另外，`APPINE_STRACE=1` 会打印每个 syscall 的参数和结果，查 LTP 失败时用到。
+
+和设计相比的改动和推迟项：
+
+- 没有：inotify/fanotify、文件租约（`F_SETLEASE`）和 `O_ASYNC`/SIGIO（`F_SETOWN` 等只记录）、core dump、AIO/io_uring、POSIX 消息队列、挂载、命名空间、ptrace、seccomp 过滤、文件能力和环境能力。
+- 线程退出时不处理 robust futex 链表（只记录 `set_robust_list`）。
+- `MREMAP_DONTUNMAP` 不支持；私有文件映射不能用 mremap 扩展。
+- epoll 没有 `EPOLLEXCLUSIVE`。
+- Tier 1 翻译 SIMD&FP 原本在 R1 的退路里。按上面的数据，建议把它放进 M7 作为第一项。
+
 ---
 
 ## 15. 已否决的方案
@@ -706,7 +782,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 
 | # | 风险或假设 | 何时验证 | 退路 |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon），见 §14；M5 上真机 | 先让 Tier 1 翻译 SIMD&FP，再优化间接分支（`ret` 走宿主返回地址预测）、块内 TLB 检查外提等 |
+| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0，见 §14；真机待测 | 先让 Tier 1 翻译 SIMD&FP，再优化间接分支（`ret` 走宿主返回地址预测）、块内 TLB 检查外提等 |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时（M5 按决定暂不提交） | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前 | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
 | R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | M1a 已在 Tier 0 用 CAS 模拟解决；Tier 1 的序列级改写在 M7 | 整段改写成 CAS，或者整段走慢路径 |

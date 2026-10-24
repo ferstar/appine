@@ -13,6 +13,7 @@
 //! fork 按设计文档 §5.3 v1 整份复制：私有映射拷贝一份，共享映射与子进程共用。
 
 use std::collections::BTreeMap;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -55,6 +56,26 @@ impl Drop for HostRegion {
     }
 }
 
+/// 一段可以映射进多个地址空间的宿主内存（System V 共享内存段）。
+#[derive(Clone)]
+pub(crate) struct SharedMemory {
+    region: Rc<HostRegion>,
+}
+
+impl SharedMemory {
+    /// 新建一段清零的内存，长度按页向上取整。
+    pub fn new(len: u64) -> Result<SharedMemory, Errno> {
+        let len = page_up(len).ok_or(Errno::ENOMEM)?;
+        let (region, _) = Mm::new_anonymous(len)?;
+        Ok(SharedMemory { region })
+    }
+
+    /// 长度（页的整数倍）。
+    pub fn len(&self) -> u64 {
+        self.region.len as u64
+    }
+}
+
 /// 映射的来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backing {
@@ -87,6 +108,13 @@ struct Vma {
     cow: bool,
     /// 文件的共享映射：宿主文件的 (设备号, inode) 和起点对应的文件偏移，作为 futex 的键。
     shared_file: Option<(u64, u64, u64)>,
+    /// 文件的共享映射：复制出来的宿主 fd 和起点对应的文件偏移（mremap 扩展映射时
+    /// 接着映射文件后面的内容）。
+    file: Option<(Rc<OwnedFd>, u64)>,
+    /// shmat 映射的共享内存段：段的 id 和这次 shmat 的起点（切开之后不变）。
+    shm: Option<(i32, u64)>,
+    /// mlock 锁住了（只记录，宿主内存不会被换出到 guest 能察觉的地方）。
+    locked: bool,
 }
 
 /// 一个 guest 进程的地址空间。
@@ -99,10 +127,19 @@ pub struct Mm {
     brk_start: u64,
     brk: u64,
     dirty: bool,
+    /// 可执行的映射被拆除、改了权限或者内容：翻译缓存也要作废。
+    code_dirty: bool,
     /// shootdown 的代数：变化之后，使用者重新进入 guest 代码之前刷新 TLB。
     generation: Arc<AtomicU64>,
+    /// 代码的代数：变化之后，使用者还要清空 Tier 1 的翻译缓存。数据页的变化（gcc 的
+    /// 垃圾回收器、malloc 频繁地 mmap/munmap）不影响已经翻译的代码，不改这个代数。
+    code_generation: Arc<AtomicU64>,
     /// 正在使用这个地址空间的线程。
     users: Vec<Arc<TaskSync>>,
+    /// `mlockall(MCL_FUTURE)`：以后的映射也锁住。
+    pub lock_future: bool,
+    /// 正在执行的程序文件在仓库里的 inode（ETXTBSY）。
+    pub exe: Option<u64>,
     /// vDSO 的加载地址（信号处理函数默认返回到其中的 sigreturn 跳板）。
     pub vdso: u64,
     /// 初始栈上 argv 字符串的范围（`/proc/<pid>/cmdline`）。
@@ -150,8 +187,12 @@ impl Mm {
             brk_start: 0,
             brk: 0,
             dirty: false,
+            code_dirty: false,
             generation: Arc::new(AtomicU64::new(0)),
+            code_generation: Arc::new(AtomicU64::new(0)),
             users: Vec::new(),
+            lock_future: false,
+            exe: None,
             vdso: 0,
             args: (0, 0),
             env: (0, 0),
@@ -165,7 +206,8 @@ impl Mm {
 
     /// `addr` 处 futex 的键；没有映射时返回 None。
     pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
-        let host = self.mmu.translate(addr, 0)?;
+        // 与 Linux 相同，futex 的地址必须可读
+        let host = self.mmu.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
         Some(match v.shared_file {
             Some((dev, ino, offset)) => crate::futex::Key::File {
@@ -177,9 +219,9 @@ impl Mm {
         })
     }
 
-    /// shootdown 的代数（[`Mm::sync`]）。
-    pub fn generation(&self) -> Arc<AtomicU64> {
-        self.generation.clone()
+    /// shootdown 的代数和代码的代数（[`Mm::sync`]）。
+    pub fn generations(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.generation.clone(), self.code_generation.clone())
     }
 
     /// 登记一个开始使用这个地址空间的线程。
@@ -201,11 +243,15 @@ impl Mm {
     ///
     /// 调用方持有 BKL；`current` 是调用线程，它自己在重新进入 guest 代码之前刷新。
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
-        if !std::mem::take(&mut self.dirty) {
+        let code = std::mem::take(&mut self.code_dirty);
+        if !std::mem::take(&mut self.dirty) && !code {
             return;
         }
         // SeqCst 与使用者那边"先标记在执行 guest 代码、再读代数"配对：要么它读到新的代数，
         // 要么这里看到它正在执行，等它被打断后退出
+        if code {
+            self.code_generation.fetch_add(1, Ordering::SeqCst);
+        }
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.quiesce(current);
         self.graveyard.clear();
@@ -279,8 +325,22 @@ impl Mm {
                 file_len: len,
                 cow: false,
                 shared_file: None,
+                file: None,
+                shm: None,
+                locked: self.lock_future,
             },
         );
+        Ok(())
+    }
+
+    /// 把一个完整的 VMA 放到 `start`；调用方保证区间空闲。
+    fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
+        // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
+        if let Err(e) = unsafe { self.mmu.map(start, v.host, v.len, mmu_prot(v.prot)) } {
+            let _ = self.mmu.unmap(start, v.len);
+            return Err(map_err(e));
+        }
+        self.vmas.insert(start, v);
         Ok(())
     }
 
@@ -397,11 +457,326 @@ impl Mm {
                 .map(|s| (s.st_dev as u64, s.st_ino as u64, offset)),
             _ => None,
         };
+        let dup = match file {
+            // SAFETY: fd 在这次调用期间一直打开着
+            Some((fd, offset, _)) if shared => Some((
+                Rc::new(
+                    unsafe { BorrowedFd::borrow_raw(fd) }
+                        .try_clone_to_owned()
+                        .map_err(|_| Errno::EMFILE)?,
+                ),
+                offset,
+            )),
+            _ => None,
+        };
         self.insert(start, len, prot, backing, may_write, region, host)?;
         let v = self.vmas.get_mut(&start).unwrap();
         v.file_len = file_len;
         v.shared_file = shared_file;
+        v.file = dup;
         Ok(start)
+    }
+
+    /// 实现 mremap(2)：`fixed` 是 `MREMAP_FIXED` 的目标地址。变长时先尝试原地扩展，不行再搬到新的地址（`may_move`）：搬家不复制
+    /// 数据，只是把同一段宿主内存映射到新地址。新增的部分是匿名内存，共享文件映射
+    /// 则接着映射文件后面的内容；私有文件映射不能扩展。
+    pub fn mremap(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        may_move: bool,
+        fixed: Option<u64>,
+    ) -> Result<u64, Errno> {
+        let old_len = page_up(old_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        let new_len = page_up(new_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        let old_end = old.checked_add(old_len).ok_or(Errno::EINVAL)?;
+        if !old.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        // Linux 要求原来的区间在一个 VMA 里；这里不合并相邻的 VMA（比如原地扩展过的），
+        // 所以只要求区间被首尾相接的 VMA 完全覆盖
+        self.check_mapped(old, old_len).map_err(|_| Errno::EFAULT)?;
+        let (&s, v) = self.vmas.range(..old_end).next_back().unwrap();
+        let vma_end = s + v.len;
+        let template = v.clone();
+        let grow = new_len.saturating_sub(old_len);
+        // 扩展出来的部分接在原来区间的后面，对应 VMA 里的偏移 old_end - s
+        let extension = |mm: &Mm| -> Result<Option<Vma>, Errno> {
+            (grow > 0)
+                .then(|| mm.extension(&template, old_end - s, grow))
+                .transpose()
+        };
+        if let Some(dst) = fixed {
+            if !dst.is_multiple_of(PAGE_SIZE)
+                || dst.checked_add(new_len).is_none_or(|e| e > 1 << VA_BITS)
+                || dst < old_end && old < dst + new_len
+            {
+                return Err(Errno::EINVAL);
+            }
+            let ext = extension(self)?;
+            self.munmap(dst, new_len)?;
+            if new_len < old_len {
+                self.munmap(old + new_len, old_len - new_len)?;
+            }
+            self.move_range(old, old_len.min(new_len), dst)?;
+            if let Some(e) = ext {
+                self.insert_vma(dst + old_len, e)?;
+            }
+            return Ok(dst);
+        }
+        if grow == 0 {
+            if new_len < old_len {
+                self.munmap(old + new_len, old_len - new_len)?;
+            }
+            return Ok(old);
+        }
+        if old_end == vma_end && old_end + grow <= MMAP_TOP && self.is_free(old_end, grow) {
+            let e = extension(self)?.unwrap();
+            self.insert_vma(old_end, e)?;
+            return Ok(old);
+        }
+        if !may_move {
+            return Err(Errno::ENOMEM);
+        }
+        let dst = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
+        let e = extension(self)?.unwrap();
+        self.move_range(old, old_len, dst)?;
+        self.insert_vma(dst + old_len, e)?;
+        Ok(dst)
+    }
+
+    /// mremap 扩展出来的 `len` 字节：接在 `template` 里偏移 `offset` 处之后，类型和
+    /// 权限与它相同。
+    fn extension(&self, template: &Vma, offset: u64, len: u64) -> Result<Vma, Errno> {
+        let (region, host, file) = match (&template.backing, &template.file) {
+            (Backing::Shared, Some((fd, start))) => {
+                let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+                let file_offset = start + offset;
+                let writable = template.may_write;
+                let m = appine_hal::map_file(
+                    std::os::fd::AsRawFd::as_raw_fd(&**fd),
+                    file_offset,
+                    host_len,
+                    true,
+                    writable,
+                )
+                .map_err(Errno)?;
+                let region = Rc::new(HostRegion {
+                    base: m.base,
+                    len: m.len,
+                });
+                (region, m.ptr, Some((fd.clone(), file_offset)))
+            }
+            (Backing::PrivateFile, _) => return Err(Errno::ENOMEM),
+            _ => {
+                let (region, host) = Self::new_anonymous(len)?;
+                (region, host, None)
+            }
+        };
+        Ok(Vma {
+            len,
+            prot: template.prot,
+            backing: template.backing,
+            may_write: template.may_write,
+            region,
+            name: template.name.clone(),
+            host,
+            file_len: len,
+            cow: false,
+            shared_file: template.shared_file.map(|(d, i, o)| (d, i, o + offset)),
+            file,
+            shm: None,
+            locked: template.locked,
+        })
+    }
+
+    /// 把 `[old, old + len)` 里的映射原样搬到 `dst`（宿主内存不动）。
+    fn move_range(&mut self, old: u64, len: u64, dst: u64) -> Result<(), Errno> {
+        self.split_at(old);
+        self.split_at(old + len);
+        let starts: Vec<u64> = self.vmas.range(old..old + len).map(|(&s, _)| s).collect();
+        let mut moved = Vec::with_capacity(starts.len());
+        for s in starts {
+            let v = self.vmas.remove(&s).unwrap();
+            self.mmu.unmap(s, v.len).map_err(map_err)?;
+            self.code_dirty |= v.prot & prot::EXEC != 0;
+            moved.push((dst + (s - old), v));
+        }
+        for (s, v) in moved {
+            self.insert_vma(s, v)?;
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// shmat：把共享内存段 `id` 映射到 `addr`（None 时自己找地方）。`remap` 时可以
+    /// 覆盖已有的映射，否则区间必须空闲。
+    pub fn attach_shm(
+        &mut self,
+        addr: Option<u64>,
+        mem: &SharedMemory,
+        prot: u32,
+        remap: bool,
+        id: i32,
+    ) -> Result<u64, Errno> {
+        let len = mem.len();
+        let start = match addr {
+            Some(a) => {
+                if a.checked_add(len).is_none_or(|e| e > 1 << VA_BITS) {
+                    return Err(Errno::EINVAL);
+                }
+                if !self.is_free(a, len) {
+                    if !remap {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.munmap(a, len)?;
+                }
+                a
+            }
+            None => self.find_free(len).ok_or(Errno::ENOMEM)?,
+        };
+        let host = mem.region.base;
+        self.insert(
+            start,
+            len,
+            prot,
+            Backing::Shared,
+            true,
+            mem.region.clone(),
+            host,
+        )?;
+        self.vmas.get_mut(&start).unwrap().shm = Some((id, start));
+        Ok(start)
+    }
+
+    /// shmdt：解除从 `addr` 开始的那次 shmat 的映射，返回段的 id。
+    pub fn detach_shm(&mut self, addr: u64) -> Result<i32, Errno> {
+        let id = self
+            .vmas
+            .get(&addr)
+            .and_then(|v| v.shm)
+            .filter(|&(_, base)| base == addr)
+            .map(|(id, _)| id)
+            .ok_or(Errno::EINVAL)?;
+        let parts: Vec<(u64, u64)> = self
+            .vmas
+            .range(addr..)
+            .take_while(|(_, v)| v.shm == Some((id, addr)))
+            .map(|(&s, v)| (s, v.len))
+            .collect();
+        for (s, len) in parts {
+            self.munmap(s, len)?;
+        }
+        Ok(id)
+    }
+
+    /// 共享内存段 `id` 在这个地址空间里被 shmat 了几次。
+    pub fn shm_attachments(&self, id: i32) -> usize {
+        let mut bases: Vec<u64> = self
+            .vmas
+            .values()
+            .filter_map(|v| v.shm.filter(|&(i, _)| i == id).map(|(_, b)| b))
+            .collect();
+        bases.sort_unstable();
+        bases.dedup();
+        bases.len()
+    }
+
+    /// 起点在 `[start, start + len)` 里的映射以后不能改成可写（只读打开的 /dev/zero 的
+    /// 共享映射）。
+    pub fn deny_write(&mut self, start: u64, len: u64) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            v.may_write = false;
+        }
+    }
+
+    /// mlock、munlock：锁住或解锁 `[addr, addr + len)`（按页扩大），区间必须完全已映射。
+    pub fn set_locked(&mut self, addr: u64, len: u64, locked: bool) -> Result<(), Errno> {
+        let start = addr & !(PAGE_SIZE - 1);
+        let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
+        self.check_mapped(start, end - start)?;
+        self.split_at(start);
+        self.split_at(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.locked = locked;
+        }
+        Ok(())
+    }
+
+    /// mlockall、munlockall：锁住或解锁所有映射。
+    pub fn set_all_locked(&mut self, locked: bool) {
+        for v in self.vmas.values_mut() {
+            v.locked = locked;
+        }
+    }
+
+    /// 锁住的字节数（`/proc/<pid>/status` 的 VmLck、`RLIMIT_MEMLOCK`）。
+    pub fn locked_bytes(&self) -> u64 {
+        self.vmas.values().filter(|v| v.locked).map(|v| v.len).sum()
+    }
+
+    /// `[addr, addr + len)` 里已经锁住的字节数（mlock 只为新锁住的部分计数）。
+    pub fn locked_in(&self, addr: u64, len: u64) -> u64 {
+        let end = addr.saturating_add(len);
+        self.vmas
+            .iter()
+            .filter(|&(&s, v)| v.locked && s < end && s + v.len > addr)
+            .map(|(&s, v)| (s + v.len).min(end) - s.max(addr))
+            .sum()
+    }
+
+    /// madvise 关心的区间性质：(区间里有没有锁住的页, 是不是全部是私有的匿名内存)。
+    /// 区间必须完全已映射。
+    pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {
+        self.check_mapped(addr, len)?;
+        let end = addr + len;
+        let mut locked = false;
+        let mut anon = true;
+        if let Some((_, v)) = self.vmas.range(..addr).next_back() {
+            locked |= v.locked;
+            anon &= v.backing == Backing::Anonymous;
+        }
+        for (_, v) in self.vmas.range(addr..end) {
+            locked |= v.locked;
+            anon &= v.backing == Backing::Anonymous;
+        }
+        Ok((locked, anon))
+    }
+
+    /// mincore：`[addr, addr + len)` 里每页是否在宿主内存里。区间必须完全已映射。
+    pub fn residency(&self, addr: u64, len: u64) -> Result<Vec<bool>, Errno> {
+        let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
+        self.check_mapped(addr, end - addr)?;
+        let mut out = Vec::with_capacity(((end - addr) / PAGE_SIZE) as usize);
+        let mut cursor = addr;
+        while cursor < end {
+            let (&s, v) = self.vmas.range(..=cursor).next_back().unwrap();
+            let stop = end.min(s + v.len);
+            // SAFETY: [cursor, stop) 落在这个 VMA 里，宿主内存由它持有
+            let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
+            out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
+            cursor = stop;
+        }
+        Ok(out)
+    }
+
+    /// msync(2) 的范围检查：区间必须完全已映射。
+    pub fn check_mapped(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        let end = page_up(len)
+            .and_then(|l| addr.checked_add(l))
+            .ok_or(Errno::ENOMEM)?;
+        let mut cursor = addr;
+        while cursor < end {
+            let (&s, v) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+                .ok_or(Errno::ENOMEM)?;
+            cursor = s + v.len;
+        }
+        Ok(())
     }
 
     /// 在 `addr` 处把跨过它的 VMA 切成两段。
@@ -418,6 +793,9 @@ impl Mm {
         tail.file_len = v.file_len.saturating_sub(head_len);
         if let Some(f) = &mut tail.shared_file {
             f.2 += head_len;
+        }
+        if let Some(f) = &mut tail.file {
+            f.1 += head_len;
         }
         // SAFETY: addr 落在 VMA 内部，偏移不越过宿主映射
         tail.host = unsafe { tail.host.add(head_len as usize) };
@@ -448,6 +826,7 @@ impl Mm {
         for (s, len) in doomed {
             let vma = self.vmas.remove(&s).unwrap();
             self.mmu.unmap(s, len).map_err(map_err)?;
+            self.code_dirty |= vma.prot & prot::EXEC != 0;
             self.graveyard.push(vma.region);
             self.dirty = true;
         }
@@ -499,6 +878,8 @@ impl Mm {
             }
         }
         for (_, v) in self.vmas.range_mut(addr..end) {
+            // 原来可执行的页：不再可执行时翻译要作废；W^X 的 JIT 改写代码之前也先去掉执行权限
+            self.code_dirty |= v.prot & prot::EXEC != 0 && v.prot != prot;
             v.prot = prot;
         }
         self.mmu
@@ -524,6 +905,7 @@ impl Mm {
             }
             let stop = end.min(s + v.len);
             if v.backing == Backing::Anonymous {
+                self.code_dirty |= v.prot & prot::EXEC != 0;
                 // SAFETY: [cursor, stop) 落在这个 VMA 内，对应的宿主内存由它持有
                 unsafe {
                     std::ptr::write_bytes(
@@ -548,6 +930,7 @@ impl Mm {
         child.vdso = self.vdso;
         child.args = self.args;
         child.env = self.env;
+        child.exe = self.exe;
         for (&start, v) in self.vmas.iter_mut() {
             let share = match v.backing {
                 Backing::Shared => true,
@@ -571,6 +954,9 @@ impl Mm {
             c.name = v.name.clone();
             c.file_len = if share { v.file_len } else { v.len };
             c.cow = v.cow && share;
+            c.shared_file = v.shared_file;
+            c.file = v.file.clone();
+            c.shm = v.shm;
         }
         Ok(child)
     }
@@ -864,6 +1250,26 @@ mod tests {
     }
 
     #[test]
+    fn only_executable_changes_invalidate_translations() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let rx = prot::READ | prot::EXEC;
+        let data = mm.mmap(0, 2 * PAGE_SIZE, RW, anon, None).unwrap();
+        let code = mm.mmap(0, 2 * PAGE_SIZE, rx, anon, None).unwrap();
+        // 数据页的变化只要刷新 TLB
+        mm.munmap(data, PAGE_SIZE).unwrap();
+        mm.mprotect(data + PAGE_SIZE, PAGE_SIZE, prot::READ)
+            .unwrap();
+        mm.mprotect(code, PAGE_SIZE, rx).unwrap();
+        assert!(mm.dirty && !mm.code_dirty);
+        // 代码页去掉执行权限（W^X 的 JIT 改写代码之前）、被拆除：翻译要作废
+        mm.mprotect(code, PAGE_SIZE, RW).unwrap();
+        assert!(std::mem::take(&mut mm.code_dirty));
+        mm.munmap(code + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(mm.code_dirty);
+    }
+
+    #[test]
     fn fork_copies_private_and_shares_shared_mappings() {
         let mut mm = Mm::new();
         let private = mm
@@ -943,6 +1349,80 @@ mod tests {
         mm.write(UserSlice::new(ro, 1), &[1]).unwrap();
         child.read(UserSlice::new(ro, 1), &mut b[..1]).unwrap();
         assert_eq!(b[0], 7);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mremap_grows_moves_and_shrinks() {
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let a = mm.mmap(0x100000, 2 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.write_kernel(a, b"keep").unwrap();
+        // 后面是空的：原地扩展
+        let b = mm
+            .mremap(a, 2 * PAGE_SIZE, 3 * PAGE_SIZE, false, None)
+            .unwrap();
+        assert_eq!(b, a);
+        mm.write_kernel(a + 2 * PAGE_SIZE, b"x").unwrap();
+        // 后面被占住：不许搬家就失败，许可就搬到别处，内容不变
+        mm.mmap(a + 3 * PAGE_SIZE, PAGE_SIZE, RW, fixed, None)
+            .unwrap();
+        assert_eq!(
+            mm.mremap(a, 3 * PAGE_SIZE, 5 * PAGE_SIZE, false, None),
+            Err(Errno::ENOMEM)
+        );
+        let c = mm
+            .mremap(a, 3 * PAGE_SIZE, 5 * PAGE_SIZE, true, None)
+            .unwrap();
+        assert_ne!(c, a);
+        assert!(!mm.is_mapped(a));
+        let mut buf = [0u8; 4];
+        mm.read(UserSlice::new(c, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"keep");
+        mm.read(UserSlice::new(c + 4 * PAGE_SIZE, 4), &mut buf)
+            .unwrap();
+        assert_eq!(buf, [0; 4]);
+        // 缩小：去掉尾部
+        assert_eq!(mm.mremap(c, 5 * PAGE_SIZE, PAGE_SIZE, false, None), Ok(c));
+        assert!(!mm.is_mapped(c + PAGE_SIZE));
+        // 没有完全映射的区间
+        assert_eq!(
+            mm.mremap(c, 2 * PAGE_SIZE, PAGE_SIZE, true, None),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(mm.check_mapped(c, 2 * PAGE_SIZE), Err(Errno::ENOMEM));
+        assert_eq!(mm.check_mapped(c, PAGE_SIZE), Ok(()));
+    }
+
+    #[test]
+    fn mremap_extends_shared_file_mappings_with_the_file() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("appine-mremap-{}", std::process::id()));
+        let mut f = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&vec![1u8; PAGE_SIZE as usize]).unwrap();
+        f.write_all(&vec![2u8; PAGE_SIZE as usize]).unwrap();
+        let mut mm = Mm::new();
+        let a = mm
+            .mmap(
+                0,
+                PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED,
+                Some((f.as_raw_fd(), 0, true)),
+            )
+            .unwrap();
+        drop(f);
+        let b = mm.mremap(a, PAGE_SIZE, 2 * PAGE_SIZE, true, None).unwrap();
+        let mut buf = [0u8; 1];
+        mm.read(UserSlice::new(b + PAGE_SIZE, 1), &mut buf).unwrap();
+        assert_eq!(buf, [2]);
         let _ = std::fs::remove_file(&path);
     }
 

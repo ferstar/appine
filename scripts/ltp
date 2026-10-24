@@ -1,0 +1,95 @@
+#!/bin/sh
+# 在 appine 里运行 LTP 的 syscall 测试（设计文档 §13.3 第 2 层）。先用 scripts/build-ltp
+# 编译 LTP。在 Linux arm64 上运行，macOS 上经由 scripts/dev：
+#
+#   scripts/dev scripts/ltp [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
+#
+# 每个测试在一个新的 appine-run 进程里运行，结果写到 target/ltp/results.txt，每行
+# "<名字> <PASS|CONF|FAIL|TIMEOUT> <退出码>"，输出在 target/ltp/logs/<名字>.log。
+# LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=$root/target/ltp
+store=$out/store
+run=${APPINE_RUN:-$root/target/linux-arm64/release/appine-run}
+
+# xargs 为每个测试调用一次：scripts/ltp --one <执行层> <名字> <命令行……>
+if [ "${1:-}" = --one ]; then
+    tier=$2
+    name=$3
+    shift 3
+    set +e
+    # LTP 按自己的计时器判超时；appine 比原生慢得多，放宽 20 倍
+    timeout 900 "$run" --tier "$tier" --rootfs "$store" \
+        --env PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        --env LTPROOT=/opt/ltp --env TMPDIR=/tmp --env LTP_TIMEOUT_MUL=20 \
+        --env LTP_COLORIZE_OUTPUT=0 --env KCONFIG_PATH=/opt/ltp/appine.config \
+        -- /bin/sh -c "cd /tmp && exec $*" </dev/null >"$out/logs/$name.log" 2>&1
+    code=$?
+    case $code in
+    0) result=PASS ;;
+    32) result=CONF ;;
+    124) result=TIMEOUT ;;
+    *) result=FAIL ;;
+    esac
+    echo "$name $result $code"
+    exit 0
+fi
+
+jobs=8
+tier=1
+while getopts j:t: opt; do
+    case $opt in
+    j) jobs=$OPTARG ;;
+    t) tier=$OPTARG ;;
+    *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+pattern=${1:-[^[:space:]]+}
+
+ltp=$(ls "$out"/ltp-*.tar 2>/dev/null | tail -n 1)
+rootfs=$(ls "$root"/target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | tail -n 1)
+if [ -z "$ltp" ] || [ -z "$rootfs" ]; then
+    echo "ltp: run scripts/build-ltp and scripts/fetch-rootfs first" >&2
+    exit 1
+fi
+[ -x "$run" ] || (cd "$root" && cargo build --release -q -p appine-run)
+
+# 第一次运行时建一个装好 LTP 的仓库
+if [ ! -f "$store/.ltp" ]; then
+    rm -rf "$store"
+    "$run" --rootfs "$store" --import "$rootfs" >/dev/null
+    "$run" --tier 1 --rootfs "$store" -- /bin/tar xf - -C / <"$ltp"
+    touch "$store/.ltp"
+fi
+
+# 测试按内核配置决定跑不跑（.needs_kconfigs）：列出 appine 实现了的特性，没列出的
+# 当作没有
+"$run" --rootfs "$store" -- /bin/sh -c 'cat >/opt/ltp/appine.config' <<'EOF'
+CONFIG_64BIT=y
+CONFIG_ARM64=y
+CONFIG_MMU=y
+CONFIG_MULTIUSER=y
+CONFIG_FILE_LOCKING=y
+CONFIG_PROC_FS=y
+CONFIG_EXT4_FS=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_EVENTFD=y
+CONFIG_TIMERFD=y
+CONFIG_SHMEM=y
+CONFIG_MEMFD_CREATE=y
+CONFIG_HIGH_RES_TIMERS=y
+EOF
+
+mkdir -p "$out/logs"
+"$run" --rootfs "$store" -- /bin/cat /opt/ltp/runtest/syscalls |
+    grep -v '^#' | grep -E "^($pattern)[[:space:]]" >"$out/tests.txt" || true
+xargs -r -P "$jobs" -L 1 "$0" --one "$tier" <"$out/tests.txt" | sort >"$out/results.txt"
+awk '{n[$2]++} END {for (r in n) printf "%s %d\n", r, n[r]}' "$out/results.txt" | sort
+echo "results: $out/results.txt"

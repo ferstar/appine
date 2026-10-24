@@ -42,7 +42,7 @@
 #define MAX_BLOCK_WORDS (MAX_BLOCK_INSNS * 64)
 #define MAX_STUBS (MAX_BLOCK_INSNS * 2 + 4)
 #define MAX_FIXUPS (MAX_BLOCK_INSNS * 4 + 4)
-#define TABLE_BITS 16
+#define TABLE_BITS 18
 #define TABLE_SIZE (1u << TABLE_BITS)
 #define TABLE_LIMIT (TABLE_SIZE / 4 * 3)
 #define JC_BITS 12

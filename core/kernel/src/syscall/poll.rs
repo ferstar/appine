@@ -3,9 +3,11 @@
 //! 三者共用 [`wait_ready`]：先检查进程内对象（管道、PTY、eventfd……）的就绪状态，
 //! 宿主 fd（宿主 socket、宿主 stdio）用一次不等待的宿主 poll 检查；都没有就绪时，
 //! 把宿主 fd 和自己的唤醒事件放在一起等（§6 的统一等待机制）。epoll 在进程内实现，
-//! 按水平触发报告（`EPOLLET` 按水平触发处理，读到 EAGAIN 为止的程序不受影响）。
+//! 默认水平触发。`EPOLLET` 近似为边沿触发：某一位从未就绪变成就绪时触发，触发时与
+//! Linux 一样报告当前全部就绪的位；已经可读时又来了数据不会再触发一次（按 ET 的约定
+//! 读到 EAGAIN 为止的程序不受影响）。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,7 @@ use crate::pipe::PIPE_BUF;
 use crate::process::RLIMIT_NOFILE;
 use crate::signal;
 use crate::uaccess::UserSlice;
+use crate::vfs::dev::Device;
 
 const POLLIN: i16 = 0x001;
 const POLLPRI: i16 = 0x002;
@@ -44,7 +47,8 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
                 } else if p.space() >= PIPE_BUF {
                     ev |= POLLOUT | POLLWRNORM;
                 }
-            } else {
+            }
+            if end.read {
                 if !p.buf.is_empty() {
                     ev |= POLLIN | POLLRDNORM;
                 }
@@ -66,6 +70,26 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             }
             (ev, None)
         }
+        FileKind::TimerFd(t) => {
+            let mut t = t.borrow_mut();
+            t.update(Instant::now());
+            (
+                if t.expirations > 0 {
+                    POLLIN | POLLRDNORM
+                } else {
+                    0
+                },
+                None,
+            )
+        }
+        FileKind::SignalFd(s) => (
+            if s.borrow().ready() {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            },
+            None,
+        ),
         FileKind::Epoll(ep) if depth < MAX_NESTS => {
             let ready = ep.borrow().ready(depth + 1, 1);
             (if ready.is_empty() { 0 } else { POLLIN }, None)
@@ -89,16 +113,38 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
     ev & (wanted | POLLERR | POLLHUP | POLLNVAL)
 }
 
-/// 需要等的宿主 fd（含嵌套 epoll 里的）。
-fn collect_host(f: &OpenFile, wanted: i16, depth: u32, out: &mut Vec<(i32, i16, i16)>) {
-    match (&f.kind, readiness(f, depth).1) {
-        (_, Some(fd)) => out.push((fd, wanted, 0)),
-        (FileKind::Epoll(ep), None) if depth < MAX_NESTS => {
-            for (file, events) in ep.borrow().live() {
-                collect_host(&file.borrow(), events, depth + 1, out);
+/// 等待时要一起等的东西：宿主 fd，以及最早的 timerfd 到期时刻（含嵌套 epoll 里的）。
+#[derive(Default)]
+struct Waits {
+    host: Vec<(i32, i16, i16)>,
+    timer: Option<Instant>,
+}
+
+impl Waits {
+    fn add(&mut self, f: &OpenFile, wanted: i16, depth: u32) {
+        match (&f.kind, readiness(f, depth).1) {
+            (_, Some(fd)) => self.host.push((fd, wanted, 0)),
+            (FileKind::TimerFd(t), None) => {
+                if let Some(d) = t.borrow().deadline {
+                    self.timer = Some(self.timer.map_or(d, |e| e.min(d)));
+                }
             }
+            (FileKind::Epoll(ep), None) if depth < MAX_NESTS => {
+                for (file, events) in ep.borrow().live() {
+                    self.add(&file.borrow(), events, depth + 1);
+                }
+            }
+            _ => {}
         }
-        _ => {}
+    }
+
+    /// 等到 `deadline`、某个宿主 fd 就绪、timerfd 到期或者被唤醒。
+    fn wait(mut self, cx: &mut Cx<'_>, deadline: Option<Instant>) -> Result<(), Errno> {
+        let until = match (deadline, self.timer) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        cx.wait(until, &mut self.host)
     }
 }
 
@@ -123,13 +169,13 @@ fn wait_ready(
         if cx.interrupted() {
             return Err(Errno::ERESTARTNOHAND);
         }
-        let mut host = Vec::new();
+        let mut waits = Waits::default();
         for (f, wanted) in items {
             if let Some(f) = f {
-                collect_host(&f.borrow(), *wanted, 0, &mut host);
+                waits.add(&f.borrow(), *wanted, 0);
             }
         }
-        cx.wait(deadline, &mut host)?;
+        waits.wait(cx, deadline)?;
     }
 }
 
@@ -308,6 +354,21 @@ struct Interest {
     data: u64,
     /// `EPOLLONESHOT` 报告过一次之后停用，直到 `EPOLL_CTL_MOD`。
     armed: bool,
+    /// `EPOLLET`：上次报告时就绪的位里现在仍然就绪的那些。出现不在其中的就绪位才触发。
+    seen: Cell<u32>,
+}
+
+impl Interest {
+    fn new(fd: i32, file: &FileRef, events: u32, data: u64) -> Interest {
+        Interest {
+            fd,
+            file: Rc::downgrade(file),
+            events,
+            data,
+            armed: true,
+            seen: Cell::new(0),
+        }
+    }
 }
 
 /// 一个 epoll 实例。
@@ -326,7 +387,8 @@ impl Epoll {
             .collect()
     }
 
-    /// 立即检查哪些关注就绪，最多 `max` 个：(下标, 事件)。
+    /// 立即检查哪些关注就绪，最多 `max` 个：(下标, 事件)。只检查，不消耗边沿触发的
+    /// 事件（报告之后由 [`Epoll::reported`] 记下）。
     fn ready(&self, depth: u32, max: usize) -> Vec<(usize, u32)> {
         let mut out = Vec::new();
         for (i, int) in self.interests.iter().enumerate() {
@@ -337,11 +399,27 @@ impl Epoll {
                 continue;
             };
             let ev = poll_now(&file.borrow(), int.events as i16, depth) as u16 as u32;
+            if int.events & EPOLLET != 0 {
+                // 不再就绪的位忘掉，下次重新就绪时才能再触发
+                int.seen.set(int.seen.get() & ev);
+                if ev & !int.seen.get() == 0 {
+                    continue;
+                }
+            }
             if ev != 0 {
                 out.push((i, ev));
             }
         }
         out
+    }
+
+    /// 关注 `i` 的事件 `ev` 已经报告给 guest。
+    fn reported(&mut self, i: usize, ev: u32) {
+        let int = &mut self.interests[i];
+        int.seen.set(ev);
+        if int.events & EPOLLONESHOT != 0 {
+            int.armed = false;
+        }
     }
 }
 
@@ -358,6 +436,28 @@ pub(super) fn epoll_create1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         .map(|fd| fd as u64)
 }
 
+/// `file` 里面嵌套了几层 epoll（不是 epoll 时是 0，只关注普通对象的 epoll 是 1）；
+/// 其中能到达 `target`（会成环）或者嵌套太深时返回 None。
+fn nesting(file: &FileRef, target: &Rc<RefCell<Epoll>>, level: u32) -> Option<u32> {
+    let FileKind::Epoll(ep) = &file.borrow().kind else {
+        return Some(0);
+    };
+    if Rc::ptr_eq(ep, target) || level > MAX_NESTS {
+        return None;
+    }
+    let children: Vec<FileRef> = ep
+        .borrow()
+        .interests
+        .iter()
+        .filter_map(|i| i.file.upgrade())
+        .collect();
+    let mut depth = 0;
+    for child in children {
+        depth = depth.max(nesting(&child, target, level + 1)?);
+    }
+    Some(depth + 1)
+}
+
 pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64) -> SysResult {
     let epf = cx.fds().get(epfd)?;
     let FileKind::Epoll(ep) = &epf.borrow().kind else {
@@ -365,15 +465,28 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     };
     let ep = ep.clone();
     let file = cx.fds().get(fd)?;
+    if file.borrow().flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
     if Rc::ptr_eq(&epf, &file) {
         return Err(Errno::EINVAL);
     }
-    // 普通文件和目录总是就绪，Linux 不允许把它们加进 epoll
+    // 普通文件、目录和 /dev/null 这类设备不支持 poll，Linux 不允许把它们加进 epoll
     if matches!(
         file.borrow().kind,
-        FileKind::Regular { .. } | FileKind::Directory { .. }
+        FileKind::Regular { .. }
+            | FileKind::Directory { .. }
+            | FileKind::Proc { .. }
+            | FileKind::Device {
+                dev: Device::Null | Device::Zero | Device::Full,
+                ..
+            }
     ) {
         return Err(Errno::EPERM);
+    }
+    // 加入另一个 epoll：不能成环，嵌套不能超过 EP_MAX_NESTS 层
+    if op == EPOLL_CTL_ADD && nesting(&file, &ep, 0).is_none_or(|d| d > MAX_NESTS) {
+        return Err(Errno::ELOOP);
     }
     let (events, data) = if op == EPOLL_CTL_DEL {
         (0, 0)
@@ -393,20 +506,12 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     match (op, pos) {
         (EPOLL_CTL_ADD, Some(_)) => Err(Errno::EEXIST),
         (EPOLL_CTL_ADD, None) => {
-            ep.interests.push(Interest {
-                fd,
-                file: Rc::downgrade(&file),
-                events: events & !EPOLLET,
-                data,
-                armed: true,
-            });
+            ep.interests.push(Interest::new(fd, &file, events, data));
             Ok(0)
         }
+        // 与 Linux 相同，修改之后重新判断：已经就绪的会再报告一次
         (EPOLL_CTL_MOD, Some(i)) => {
-            let int = &mut ep.interests[i];
-            int.events = events & !EPOLLET;
-            int.data = data;
-            int.armed = true;
+            ep.interests[i] = Interest::new(fd, &file, events, data);
             Ok(0)
         }
         (EPOLL_CTL_DEL, Some(i)) => {
@@ -444,11 +549,11 @@ pub(super) fn epoll_pwait(
         if cx.interrupted() {
             return Err(Errno::ERESTARTNOHAND);
         }
-        let mut host = Vec::new();
+        let mut waits = Waits::default();
         for (file, wanted) in ep.borrow().live() {
-            collect_host(&file.borrow(), wanted, 0, &mut host);
+            waits.add(&file.borrow(), wanted, 0);
         }
-        cx.wait(deadline, &mut host)?;
+        waits.wait(cx, deadline)?;
     })();
     restore_mask(cx, &r);
     let ready = r?;
@@ -456,13 +561,10 @@ pub(super) fn epoll_pwait(
     {
         let mut ep = ep.borrow_mut();
         for &(i, ev) in &ready {
-            let int = &mut ep.interests[i];
             out.extend_from_slice(&ev.to_le_bytes());
             out.extend_from_slice(&[0; 4]);
-            out.extend_from_slice(&int.data.to_le_bytes());
-            if int.events & EPOLLONESHOT != 0 {
-                int.armed = false;
-            }
+            out.extend_from_slice(&ep.interests[i].data.to_le_bytes());
+            ep.reported(i, ev);
         }
     }
     cx.mm().write(UserSlice::new(events, out.len()), &out)?;
@@ -572,6 +674,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edge_triggered_interests_fire_on_new_readiness() {
+        let efd = Rc::new(RefCell::new(EventFd {
+            count: 0,
+            semaphore: false,
+        }));
+        let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
+        let both = (POLLIN | POLLOUT) as u32;
+        let mut ep = Epoll::default();
+        ep.interests
+            .push(Interest::new(3, &file, both | EPOLLET, 0));
+        // 一开始可写：报告一次之后，没有变化就不再报告
+        assert_eq!(ep.ready(0, 8), vec![(0, POLLOUT as u32)]);
+        ep.reported(0, POLLOUT as u32);
+        assert!(ep.ready(0, 8).is_empty());
+        // 变得可读：报告当前全部就绪的位
+        efd.borrow_mut().count = 1;
+        assert_eq!(ep.ready(0, 8), vec![(0, both)]);
+        // 只检查（嵌套 epoll）不消耗事件
+        assert_eq!(ep.ready(0, 8), vec![(0, both)]);
+        ep.reported(0, both);
+        assert!(ep.ready(0, 8).is_empty());
+        // 读空之后再写入：重新触发
+        efd.borrow_mut().count = 0;
+        assert!(ep.ready(0, 8).is_empty());
+        efd.borrow_mut().count = 5;
+        assert_eq!(ep.ready(0, 8), vec![(0, both)]);
+    }
+
+    #[test]
     fn eventfd_readiness_and_epoll_oneshot() {
         let efd = Rc::new(RefCell::new(EventFd {
             count: 0,
@@ -580,17 +711,12 @@ mod tests {
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         assert_eq!(poll_now(&file.borrow(), POLLIN | POLLOUT, 0), POLLOUT);
         let mut ep = Epoll::default();
-        ep.interests.push(Interest {
-            fd: 3,
-            file: Rc::downgrade(&file),
-            events: (POLLIN as u32) | EPOLLONESHOT,
-            data: 7,
-            armed: true,
-        });
+        ep.interests
+            .push(Interest::new(3, &file, (POLLIN as u32) | EPOLLONESHOT, 7));
         assert!(ep.ready(0, 8).is_empty());
         efd.borrow_mut().count = 2;
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
-        ep.interests[0].armed = false;
+        ep.reported(0, POLLIN as u32);
         assert!(ep.ready(0, 8).is_empty());
         // 文件关闭之后关注自动失效
         ep.interests[0].armed = true;

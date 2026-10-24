@@ -5,10 +5,13 @@ use std::os::fd::AsRawFd;
 use appine_engine::{PAGE_SIZE, prot};
 
 use super::SysResult;
+use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::FileKind;
 use crate::kernel::Cx;
 use crate::mm::flags;
+use crate::process::RLIMIT_MEMLOCK;
+use crate::vfs::dev::Device;
 
 const PROT_MASK: u32 = prot::READ | prot::WRITE | prot::EXEC;
 /// `PROT_GROWSDOWN`、`PROT_GROWSUP`：只对栈有意义，按 Linux 的做法忽略。
@@ -16,7 +19,29 @@ const PROT_GROWS: u32 = 0x0100_0000 | 0x0200_0000;
 /// 映射类型位：`MAP_SHARED`、`MAP_PRIVATE`、`MAP_SHARED_VALIDATE`。
 const MAP_TYPE: u32 = 0x0f;
 const MAP_SHARED_VALIDATE: u32 = 0x03;
+/// MAP_SHARED_VALIDATE 认识的标志（Linux 的 `LEGACY_MAP_MASK` 加上 `MAP_FIXED_NOREPLACE`、
+/// `MAP_UNINITIALIZED`，以及 MAP_HUGETLB 的页大小位）。
+const MAP_VALIDATE_KNOWN: u32 = MAP_TYPE
+    | flags::MAP_FIXED
+    | flags::MAP_ANONYMOUS
+    | 0x0100 // MAP_GROWSDOWN
+    | 0x0800 // MAP_DENYWRITE
+    | 0x1000 // MAP_EXECUTABLE
+    | 0x2000 // MAP_LOCKED
+    | 0x4000 // MAP_NORESERVE
+    | 0x8000 // MAP_POPULATE
+    | 0x1_0000 // MAP_NONBLOCK
+    | 0x2_0000 // MAP_STACK
+    | 0x4_0000 // MAP_HUGETLB
+    | flags::MAP_FIXED_NOREPLACE
+    | 0x400_0000 // MAP_UNINITIALIZED
+    | 0xfc00_0000; // MAP_HUGE_SHIFT 之上的页大小
+const F_SEAL_WRITE: u32 = 0x8;
+const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 const MADV_DONTNEED: i32 = 4;
+const MADV_FREE: i32 = 8;
+const MADV_WIPEONFORK: i32 = 18;
+const MADV_KEEPONFORK: i32 = 19;
 const MCL_CURRENT: u32 = 1;
 const MCL_FUTURE: u32 = 2;
 const MCL_ONFAULT: u32 = 4;
@@ -39,33 +64,124 @@ pub(super) fn mmap(
         return Err(Errno::EINVAL);
     }
     let kind = match flags & MAP_TYPE {
+        // MAP_SHARED_VALIDATE 要求认识所有的标志（MAP_SYNC 只对 DAX 文件有效）
+        MAP_SHARED_VALIDATE if flags & !MAP_VALIDATE_KNOWN != 0 => {
+            return Err(Errno::EOPNOTSUPP);
+        }
         MAP_SHARED_VALIDATE => flags::MAP_SHARED,
         k @ (flags::MAP_SHARED | flags::MAP_PRIVATE) => k,
         _ => return Err(Errno::EINVAL),
     };
+    let mut flags = (flags & !MAP_TYPE) | kind;
+    // 只读打开的 /dev/zero 的共享映射：不能有写权限，以后也不能改成可写
+    let mut deny_write = false;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         None
     } else {
         let file = cx.fds().get(fd)?;
+        // Linux 先查 fd（EBADF），再查长度（EINVAL），最后才查文件的权限（EACCES）
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
         let f = file.borrow();
-        let FileKind::Regular { file: host, .. } = &f.kind else {
-            return Err(if matches!(f.kind, FileKind::Path(_)) {
-                Errno::EBADF
-            } else {
-                Errno::ENODEV
-            });
-        };
-        if !f.readable() {
-            return Err(Errno::EACCES);
-        }
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
-        if shared_write && !f.writable() {
-            return Err(Errno::EACCES);
+        match &f.kind {
+            FileKind::Regular { file: host, ino } => {
+                if !f.readable() {
+                    return Err(Errno::EACCES);
+                }
+                if shared_write && !f.writable() {
+                    return Err(Errno::EACCES);
+                }
+                // 封印了写入的 memfd 不能有可写的共享映射，以后也不能改成可写
+                let sealed = cx
+                    .kr()
+                    .seals
+                    .get(ino)
+                    .is_some_and(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0);
+                if sealed && kind == flags::MAP_SHARED {
+                    if prot & prot::WRITE != 0 {
+                        return Err(Errno::EPERM);
+                    }
+                    Some((host.as_raw_fd(), offset, false))
+                } else {
+                    Some((host.as_raw_fd(), offset, f.writable()))
+                }
+            }
+            // /dev/zero：私有映射是匿名内存，共享映射是共享的匿名内存
+            FileKind::Device {
+                dev: Device::Zero, ..
+            } => {
+                if !f.readable() {
+                    return Err(Errno::EACCES);
+                }
+                if kind == flags::MAP_SHARED && !f.writable() {
+                    if prot & prot::WRITE != 0 {
+                        return Err(Errno::EACCES);
+                    }
+                    deny_write = true;
+                }
+                flags |= flags::MAP_ANONYMOUS;
+                None
+            }
+            FileKind::Path(_) => return Err(Errno::EBADF),
+            _ => return Err(Errno::ENODEV),
         }
-        Some((host.as_raw_fd(), offset, f.writable()))
     };
-    let flags = (flags & !MAP_TYPE) | kind;
-    cx.mm_mut().mmap(addr, len, prot, flags, file)
+    const MAP_LOCKED: u32 = 0x2000;
+    if flags & MAP_LOCKED != 0 {
+        check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
+    }
+    let start = cx.mm_mut().mmap(addr, len, prot, flags, file)?;
+    if deny_write {
+        cx.mm_mut().deny_write(start, len);
+    }
+    if flags & MAP_LOCKED != 0 {
+        cx.mm_mut().set_locked(start, len, true)?;
+    }
+    Ok(start)
+}
+
+pub(super) fn mremap(
+    cx: &mut Cx<'_>,
+    old: u64,
+    old_len: u64,
+    new_len: u64,
+    flags: u32,
+    new_addr: u64,
+) -> SysResult {
+    const MREMAP_MAYMOVE: u32 = 1;
+    const MREMAP_FIXED: u32 = 2;
+    const MREMAP_DONTUNMAP: u32 = 4;
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+        || flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0
+        // 不支持保留原来映射的 MREMAP_DONTUNMAP
+        || flags & MREMAP_DONTUNMAP != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
+    cx.mm_mut()
+        .mremap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
+}
+
+/// msync：共享映射直接就是宿主的文件映射，不需要写回，只检查参数。
+pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
+    const MS_ASYNC: u32 = 1;
+    const MS_INVALIDATE: u32 = 2;
+    const MS_SYNC: u32 = 4;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+        || !addr.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(Errno::EINVAL);
+    }
+    cx.mm().check_mapped(addr, len)?;
+    // 锁住的页不能作废
+    if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
+        return Err(Errno::EBUSY);
+    }
+    Ok(0)
 }
 
 pub(super) fn munmap(cx: &mut Cx<'_>, addr: u64, len: u64) -> SysResult {
@@ -85,56 +201,98 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
-    // 其余建议只影响性能，可以忽略；DONTNEED 之后匿名内存必须读回 0
-    if advice == MADV_DONTNEED {
-        cx.mm_mut().discard(addr, len)?;
+    let len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .filter(|&l| addr.checked_add(l).is_some())
+        .ok_or(Errno::EINVAL)?;
+    // 没有 KSM、透明大页和内存故障注入（MERGEABLE、HUGEPAGE、COLLAPSE、HWPOISON 等）
+    if !matches!(advice, 0..=4 | 8..=11 | 16..=24) {
+        return Err(Errno::EINVAL);
     }
-    Ok(0)
+    if len == 0 {
+        return Ok(0);
+    }
+    let (locked, private_anon) = cx.mm().advice_range(addr, len)?;
+    match advice {
+        MADV_DONTNEED if locked => Err(Errno::EINVAL),
+        // 其余建议只影响性能，可以忽略；DONTNEED 之后匿名内存必须读回 0
+        MADV_DONTNEED => cx.mm_mut().discard(addr, len).map(|()| 0),
+        MADV_FREE | MADV_WIPEONFORK | MADV_KEEPONFORK if !private_anon => Err(Errno::EINVAL),
+        _ => Ok(0),
+    }
 }
 
-/// 每一页都已映射时返回页数，否则 ENOMEM（mlock、mincore）。
-fn mapped_pages(cx: &Cx<'_>, addr: u64, len: u64) -> Result<u64, Errno> {
-    let end = addr
-        .checked_add(len)
-        .and_then(|e| e.checked_next_multiple_of(PAGE_SIZE))
-        .ok_or(Errno::ENOMEM)?;
-    let start = addr & !(PAGE_SIZE - 1);
-    let mm = cx.mm();
-    for page in (start..end).step_by(PAGE_SIZE as usize) {
-        if mm.mmu().translate(page, 0).is_none() {
-            return Err(Errno::ENOMEM);
-        }
+/// 没有 `CAP_IPC_LOCK` 时，锁住的内存不能超过 `RLIMIT_MEMLOCK`（为 0 时根本不能锁）。
+/// `more` 是这次要新锁住的字节数。
+fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
+    if cx.cred().capable(cap::IPC_LOCK) {
+        return Ok(());
     }
-    Ok((end - start) / PAGE_SIZE)
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_MEMLOCK as usize].0;
+    if limit == 0 {
+        return Err(Errno::EPERM);
+    }
+    if cx.mm().locked_bytes() + more > limit {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(())
 }
 
-/// mlock、munlock、mlock2：宿主内存不会被换出到 guest 能察觉的地方，只检查范围。
-pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
+/// mlock、munlock、mlock2：只记录哪些映射被锁住（宿主内存不会被换出到 guest 能察觉的
+/// 地方），检查范围和 `RLIMIT_MEMLOCK`。
+pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool) -> SysResult {
     const MLOCK_ONFAULT: u32 = 1;
     if flags & !MLOCK_ONFAULT != 0 {
         return Err(Errno::EINVAL);
     }
-    mapped_pages(cx, addr, len).map(|_| 0)
+    if lock {
+        let start = addr & !(PAGE_SIZE - 1);
+        let span = (addr.saturating_add(len)).next_multiple_of(PAGE_SIZE) - start;
+        let already = cx.mm().locked_in(start, span);
+        check_memlock(cx, span - already)?;
+    }
+    cx.mm_mut().set_locked(addr, len, lock).map(|()| 0)
 }
 
-pub(super) fn mlockall(flags: u32) -> SysResult {
+pub(super) fn mlockall(cx: &mut Cx<'_>, flags: u32) -> SysResult {
     if flags == 0
         || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0
         || flags & (MCL_CURRENT | MCL_FUTURE) == 0
     {
         return Err(Errno::EINVAL);
     }
+    if flags & MCL_CURRENT != 0 {
+        let mm = cx.mm();
+        let more = mm.size() - mm.locked_bytes();
+        drop(mm);
+        check_memlock(cx, more)?;
+        cx.mm_mut().set_all_locked(true);
+    } else {
+        check_memlock(cx, 0)?;
+    }
+    cx.mm_mut().lock_future = flags & MCL_FUTURE != 0;
     Ok(0)
 }
 
-/// mincore：已映射的页都报告为在内存里。
+pub(super) fn munlockall(cx: &mut Cx<'_>) -> SysResult {
+    let mut mm = cx.mm_mut();
+    mm.set_all_locked(false);
+    mm.lock_future = false;
+    Ok(0)
+}
+
+/// mincore：按宿主内存报告每页是否驻留。
 pub(super) fn mincore(cx: &mut Cx<'_>, addr: u64, len: u64, vec: u64) -> SysResult {
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
-    let pages = mapped_pages(cx, addr, len)? as usize;
-    let out = vec![1u8; pages];
+    let out: Vec<u8> = cx
+        .mm()
+        .residency(addr, len)?
+        .into_iter()
+        .map(u8::from)
+        .collect();
     cx.mm()
-        .write(crate::uaccess::UserSlice::new(vec, pages), &out)?;
+        .write(crate::uaccess::UserSlice::new(vec, out.len()), &out)?;
     Ok(0)
 }
