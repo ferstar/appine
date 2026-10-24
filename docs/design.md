@@ -69,8 +69,8 @@ flowchart TB
         HAL["宿主 HAL：Android（bionic）/ Linux（glibc，开发用）"]
     end
     UI -- JNI --> KERNEL
-    ENGINE -- "syscall / mem_fault / undef / brk" --> KERNEL
-    KERNEL -- "cpu_run / tlb_flush / tc_invalidate / kick" --> ENGINE
+    ENGINE -- "退出原因：svc / fault / undef / brk / kick" --> KERNEL
+    KERNEL -- "cpu_run / mmu_map / tlb_flush / kick" --> ENGINE
     KERNEL --> HAL
 ```
 
@@ -380,42 +380,46 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - **内核层**：Rust，可以参考 Fuchsia Starnix 和 Asterinas 的设计。
 - **Android 外壳**：Kotlin。
 
-引擎与内核层之间的接口很窄（草案）：
+引擎与内核层之间的接口很窄，采用**退出原因**模型：引擎从不回调内核层，`appine_cpu_run()` 一直执行到需要内核层介入的事件，返回一个退出原因；内核层处理完之后再调用它继续执行。这样 C 与 Rust 之间没有重入，FFI 边界最简单。完整定义见 `core/engine/include/appine/engine.h`，Rust 绑定见 `core/engine/src/lib.rs`。
 
 ```c
-/* 引擎 → 内核层 */
-void kernel_syscall(struct cpu *cpu);
-void kernel_mem_fault(struct cpu *cpu, uint64_t guest_addr, enum access acc);
-void kernel_undefined(struct cpu *cpu, uint32_t insn);
-void kernel_brk(struct cpu *cpu, uint16_t imm);
-void kernel_icache_inval(struct mm *mm, uint64_t addr, uint64_t len);
+/* 运行：返回 SVC / UNDEF / BRK / FAULT / KICK 之一 */
+enum appine_exit appine_cpu_run(struct appine_cpu *cpu);
+void appine_cpu_kick(struct appine_cpu *cpu);   /* 可从任意线程调用，让目标线程在下一个指令边界退出 */
+void appine_cpu_tlb_flush(struct appine_cpu *cpu);
 
-/* 内核层 → 引擎 */
-enum exit_reason cpu_run(struct cpu *cpu);     /* 运行到需要内核层介入为止 */
-void tlb_flush(struct mm *mm, uint64_t start, uint64_t len);
-void tc_invalidate(uint64_t start, uint64_t len);
-void cpu_kick(struct cpu *cpu);                /* 设置 pending 标志，让目标线程尽快退出到内核层 */
+/* soft-MMU 页表：由内核层维护，修改后要刷新所有共用它的 CPU 的 TLB */
+int appine_mmu_map(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot);
+int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
+int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint32_t prot);
+void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot);
 ```
 
-guest 状态（`struct cpu`）包含：`x[31]`、`sp`、`pc`、`nzcv`、`fpcr`、`fpsr`、`v[32]`（128 位）、`tpidr_el0`、独占监视器状态、`orig_x0`、pending 标志、TLB 指针。
+- FAULT 退出时，pc 指向出错指令，`fault_addr`/`fault_access`/`fault_kind` 给出地址、访存类型以及页错误还是对齐错误；该指令不产生任何副作用。
+- 翻译缓存失效（`tc_invalidate`，由 `ic ivau` 和 munmap 触发）随 Tier 1 加入。
 
-### 13.2 仓库结构（拟）
+guest 状态（`struct appine_cpu`）包含：`x[31]`、`sp`、`pc`、`nzcv`、`fpcr`、`fpsr`、`v[32]`（128 位）、`tpidr_el0`、`orig_x0`、fault 信息、pending 标志、mmu 指针和软件 TLB。独占监视器状态随 LL/SC 一起加入。Rust 侧逐字段镜像这个结构体，由 `appine_cpu_layout_check()` 在测试里校验布局。
+
+### 13.2 仓库结构
 
 ```
-core/engine/     C 引擎（解释器、DBT、soft-MMU 快速路径）
+core/engine/     C 引擎（include/appine/engine.h、src/c/）及其 Rust 绑定
 core/kernel/     Rust 内核层
-core/hal/        宿主抽象层（linux / android）
-hosts/cli/       appine-run（开发用 CLI 前端）
-android/         Gradle 工程（Kotlin 外壳、vendored 终端库）
-tests/           lockstep、libc-test/LTP 子集、端到端场景、差分测试
+core/hal/        宿主抽象层（Android 与 Linux 共用一套实现）
+hosts/cli/       appine-run（开发用 CLI 前端）及 guest 端到端测试
+tests/guest/     手写的 guest 汇编测试程序
+tests/lockstep/  指令级 lockstep：原生跳板、随机指令生成、比对
+scripts/dev      在 Linux arm64 容器里运行命令
+android/         Gradle 工程（Kotlin 外壳、vendored 终端库），M5 加入
 docs/            设计文档
 ```
 
-构建：Gradle 构建 App 外壳，cargo-ndk 构建原生库（Rust 部分通过 `cc` crate 编译 C 引擎）。
+构建：Cargo 工作区；引擎通过 `cc` crate 编译，C 代码在 gcc 和 clang 下都以 `-Wall -Wextra -Werror` 编译。Rust 工具链由 `rust-toolchain.toml` 锁定。M5 起由 Gradle 构建 App 外壳，cargo-ndk 构建原生库。
 
 ### 13.3 开发环境与测试
 
-- 主要的开发和测试宿主是 Mac 上的 **Linux arm64 虚拟机**（OrbStack 或 Lima），90% 的工作不需要碰手机。
+- 主要的开发和测试宿主是 Mac 上的 **Linux arm64 虚拟机**（colima、OrbStack 或 Lima），90% 的工作不需要碰手机。`scripts/dev <命令>` 会在一个 arm64 Linux 容器里运行命令，比如 `scripts/dev cargo test --workspace`；Docker daemon 配了代理时，容器会自动沿用。
+- CI 跑在 GitHub 的 `ubuntu-24.04-arm` runner 上，依次执行格式检查、clippy、全部测试（含 lockstep 和 guest 程序）、加长的 lockstep，以及用 clang 编译的引擎测试。
 - 测试分为五层：
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。
   2. musl libc-test，加上 LTP 中挑选出的 syscall 和信号子集。
@@ -429,7 +433,7 @@ docs/            设计文档
 
 | 里程碑 | 内容 | 退出标准 |
 |---|---|---|
-| **M0 骨架** | 仓库结构、引擎与内核层的工程、`appine-run`、CI、lockstep 测试框架 | 手写的静态 aarch64 程序（`write` + `exit`）能在解释器里跑通；lockstep 测试进入 CI |
+| **M0 骨架** ✅ | 仓库结构、引擎与内核层的工程、`appine-run`、CI、lockstep 测试框架 | 手写的静态 aarch64 程序（`write` + `exit`）能在解释器里跑通；lockstep 测试进入 CI |
 | **M1 加载程序** | ELF 加载器（静态 + PIE）、auxv、初始栈、soft-MMU v1、基础 syscall、inode 仓库 v1 + minirootfs 导入 | `appine-run /bin/busybox ls /` 跑通（经过 `ld-musl`） |
 | **M2 性能探针** ⚠️ | 原型 Tier 1：整数指令 + 访存 + 分支 + 内联 TLB | 在 CoreMark 类计算循环、`gzip`、`sha256sum` 上测出实际开销，**根据数据复核 3–5 倍的目标** |
 | **M3 交互式 shell** | fork/execve/wait4、信号帧、管道、PTY + 行规程、作业控制 | `ash` 下管道、Ctrl-C、Ctrl-Z/`fg`、`vi` 都正常 |

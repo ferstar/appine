@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "core/engine",
+    "core/hal",
+    "core/kernel",
+    "hosts/cli",
+    "tests/lockstep",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+appine-engine = { path = "core/engine" }
+appine-hal = { path = "core/hal" }
+appine-kernel = { path = "core/kernel" }
+cc = "1"
+libc = "0.2"

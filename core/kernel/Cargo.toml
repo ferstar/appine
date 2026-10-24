@@ -1,0 +1,12 @@
+[package]
+name = "appine-kernel"
+description = "appine kernel layer: the Linux user-space ABI implemented in-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+appine-engine.workspace = true
+appine-hal.workspace = true

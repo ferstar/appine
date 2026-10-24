@@ -1,0 +1,40 @@
+#!/bin/sh
+# 在 Linux arm64 容器里运行命令，例如：
+#
+#   scripts/dev cargo test --workspace
+#
+# 设计文档 §13.3：主开发和测试宿主是 Linux arm64。macOS 上由 colima、OrbStack
+# 或 Docker Desktop 提供 arm64 Linux 虚拟机。不带参数时进入容器里的 shell。
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+image=appine-dev
+
+# Docker daemon 配了代理时，镜像构建和容器内的 cargo/rustup 也走同一个代理
+proxy_build=""
+proxy_run=""
+IFS='|' read -r http https no <<EOF
+$(docker info --format '{{.HTTPProxy}}|{{.HTTPSProxy}}|{{.NoProxy}}' 2>/dev/null || true)
+EOF
+for kv in "http_proxy=$http" "https_proxy=$https" "no_proxy=$no"; do
+    if [ -n "${kv#*=}" ]; then
+        proxy_build="$proxy_build --build-arg $kv"
+        proxy_run="$proxy_run -e $kv"
+    fi
+done
+
+# shellcheck disable=SC2086 # 这几个变量为空时必须消失，不能变成空参数
+docker build --quiet --platform linux/arm64 -t "$image" $proxy_build \
+    -f "$root/scripts/dev.Dockerfile" "$root/scripts" >/dev/null
+
+tty_flags=""
+if [ -t 0 ] && [ -t 1 ]; then
+    tty_flags="-it"
+fi
+
+# shellcheck disable=SC2086
+exec docker run --rm $tty_flags $proxy_run --platform linux/arm64 \
+    -v "$root:/work" -w /work \
+    -v appine-cargo-registry:/usr/local/cargo/registry \
+    -e CARGO_TARGET_DIR=/work/target/linux-arm64 \
+    "$image" "$@"

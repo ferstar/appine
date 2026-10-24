@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-arm64:
+    name: Linux arm64
+    # 设计文档 §13.3：lockstep 以真实的 arm64 硬件作为标准答案
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustup
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (includes lockstep and guest programs)
+        run: cargo test --workspace
+
+      - name: Lockstep (extended)
+        run: cargo run --release -p appine-lockstep -- --iterations 200000
+
+      # Android NDK 用 clang 编译 C 引擎，这里提前暴露 clang 特有的警告
+      - name: Engine and oracle with clang
+        env:
+          CC: clang
+          CARGO_TARGET_DIR: target/clang
+        run: cargo test -p appine-engine -p appine-lockstep
