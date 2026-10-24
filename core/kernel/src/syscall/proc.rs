@@ -11,9 +11,10 @@ use crate::kernel::{Cx, Tid};
 use crate::loader::{self, Args, LoadError};
 use crate::mm::Mm;
 use crate::process::{self, ExitStatus, Signal, ThreadGroup};
-use crate::signal::{self, AltStack, SigInfo};
+use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
+use crate::vfs::normalize;
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
@@ -109,7 +110,7 @@ pub(super) fn clone(
     } else {
         let f = cx.t.fs.borrow();
         Rc::new(RefCell::new(FsContext {
-            cwd: f.cwd,
+            cwd: f.cwd.clone(),
             umask: f.umask,
         }))
     };
@@ -131,6 +132,8 @@ pub(super) fn clone(
         g.pgid = parent.pgid;
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
+        g.ctty = parent.ctty.clone();
+        g.exe = parent.exe.clone();
         g.exit_signal = (flags & 0xff) as i32;
         Rc::new(RefCell::new(g))
     };
@@ -198,6 +201,7 @@ pub(super) fn clone(
     if !thread {
         let ppid = group.borrow().ppid;
         let k = cx.k();
+        k.forks += 1;
         k.groups.insert(tid, group);
         if let Some(parent) = k.groups.get(&ppid) {
             parent.borrow_mut().children.push(tid);
@@ -256,6 +260,14 @@ fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
 }
 
+/// 给程序和解释器的映射起名字（`/proc/<pid>/maps`）。
+pub(crate) fn label_image(mm: &mut Mm, image: &loader::Image, exe: &Rc<[u8]>) {
+    mm.label(image.main.0, image.main.1 - image.main.0, exe.clone());
+    if let Some((path, start, end)) = &image.interp {
+        mm.label(*start, end - start, Rc::from(path.as_slice()));
+    }
+}
+
 fn load_error(e: LoadError) -> Errno {
     match e {
         LoadError::NotElf | LoadError::Unsupported(_) | LoadError::Malformed(_) => Errno::ENOEXEC,
@@ -277,10 +289,11 @@ pub(super) fn execve(
     let envp = read_strings(cx, envp, &mut total)?;
     let vfs = cx.vfs()?;
     let cwd = cx.cwd();
+    let view = cx.view(&vfs);
 
     // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
     let mut file_path = path.clone();
-    let mut file = process::read_executable(&vfs, cwd, &file_path)?;
+    let mut file = process::read_executable(&vfs, &view, &cwd, &file_path)?;
     for depth in 0.. {
         let Some((interp, arg)) = parse_shebang(&file) else {
             break;
@@ -293,9 +306,18 @@ pub(super) fn execve(
         new_argv.push(file_path);
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
-        file = process::read_executable(&vfs, cwd, &interp)?;
+        file = process::read_executable(&vfs, &view, &cwd, &interp)?;
         file_path = interp;
     }
+    // /proc/<pid>/exe 和 maps 里显示的绝对路径
+    let exe: Rc<[u8]> = Rc::from(if file_path.starts_with(b"/") {
+        normalize(&file_path)
+    } else {
+        let mut p = vfs.path_of(&view, &cwd)?;
+        p.push(b'/');
+        p.extend_from_slice(&file_path);
+        normalize(&p)
+    });
 
     let mut mm = Mm::new();
     let args = Args {
@@ -303,19 +325,21 @@ pub(super) fn execve(
         envp: &envp,
         execfn: &path,
     };
-    let mut read_interp = |p: &[u8]| process::read_executable(&vfs, cwd, p);
+    let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cwd, p);
     let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(load_error)?;
+    label_image(&mut mm, &image, &exe);
 
     // 从这里开始不能失败：结束同一线程组里的其他线程，然后换掉地址空间
     kill_other_threads(cx)?;
     if Rc::strong_count(&cx.t.fds) > 1 {
         let copy = cx.fds().clone();
-        cx.t.fds = Rc::new(RefCell::new(copy));
+        cx.set_fds(Rc::new(RefCell::new(copy)));
     }
     cx.fds_mut().close_on_exec();
     {
         let group = cx.t.group.clone();
         let mut g = group.borrow_mut();
+        g.exe = exe.to_vec();
         if Rc::strong_count(&g.sighand) > 1 {
             let copy = g.sighand.borrow().clone();
             g.sighand = Rc::new(RefCell::new(copy));
@@ -329,7 +353,7 @@ pub(super) fn execve(
     mm.borrow_mut().add_user(task.sync.clone());
     // SAFETY: 新的地址空间由 TaskState 持有；旧的可能随这次赋值释放，cpu 已经不再使用它
     unsafe { cpu.reset(mm.borrow().mmu()) };
-    cx.t.mm = mm;
+    cx.set_mm(mm);
     cx.t.altstack = AltStack::default();
     cx.t.saved_sigmask = None;
     cx.task.comm.set(process::comm_of(&path));
@@ -391,47 +415,100 @@ enum Who {
     Pgid(Tid),
 }
 
-/// 找到一个符合条件的已结束子进程并（`reap` 时）回收它。没有子进程符合条件时返回 ECHILD。
-fn find_zombie(cx: &mut Cx<'_>, who: Who, reap: bool) -> Result<Option<(Tid, ExitStatus)>, Errno> {
+/// 子进程的状态变化。
+#[derive(Clone, Copy)]
+enum ChildEvent {
+    Exited(ExitStatus),
+    Stopped(Signal),
+    Continued,
+}
+
+impl ChildEvent {
+    /// wait4 的状态字。
+    fn wait_status(self) -> i32 {
+        match self {
+            ChildEvent::Exited(s) => s.wait_status(),
+            ChildEvent::Stopped(sig) => sig.number() << 8 | 0x7f,
+            ChildEvent::Continued => 0xffff,
+        }
+    }
+
+    /// waitid 的 siginfo。
+    fn siginfo(self, pid: Tid) -> SigInfo {
+        match self {
+            ChildEvent::Exited(s) => SigInfo::child(pid, s),
+            ChildEvent::Stopped(sig) => SigInfo::child_event(pid, code::CLD_STOPPED, sig.number()),
+            ChildEvent::Continued => {
+                SigInfo::child_event(pid, code::CLD_CONTINUED, Signal::CONT.number())
+            }
+        }
+    }
+}
+
+/// 要等哪些状态变化（`WEXITED`、`WUNTRACED`/`WSTOPPED`、`WCONTINUED`），以及是否取走事件。
+#[derive(Clone, Copy)]
+struct Wanted {
+    exited: bool,
+    stopped: bool,
+    continued: bool,
+    consume: bool,
+}
+
+/// 找到一个符合条件的子进程状态变化，`consume` 时取走它（已结束的子进程同时被回收）。
+/// 没有子进程符合条件时返回 ECHILD。
+fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<(Tid, ChildEvent)>, Errno> {
     let children = cx.t.group.borrow().children.clone();
     let mut any = false;
     for c in children {
         let Some(child) = cx.kr().groups.get(&c).cloned() else {
             continue;
         };
-        let (pgid, zombie) = {
-            let g = child.borrow();
-            (g.pgid, g.zombie)
-        };
         let matches = match who {
             Who::Pid(p) => p == c,
             Who::Any => true,
-            Who::Pgid(g) => g == pgid,
+            Who::Pgid(g) => g == child.borrow().pgid,
         };
         if !matches {
             continue;
         }
         any = true;
-        if let Some(status) = zombie {
-            if reap {
+        let mut g = child.borrow_mut();
+        if let (true, Some(status)) = (want.exited, g.zombie) {
+            if want.consume {
+                let cpu = g.cpu_ns + g.child_cpu_ns;
+                drop(g);
                 cx.k().groups.remove(&c);
-                cx.t.group.borrow_mut().children.retain(|&x| x != c);
+                let mut me = cx.t.group.borrow_mut();
+                me.children.retain(|&x| x != c);
+                me.child_cpu_ns += cpu;
             }
-            return Ok(Some((c, status)));
+            return Ok(Some((c, ChildEvent::Exited(status))));
+        }
+        if let (true, Some(sig)) = (want.stopped, g.stop_report) {
+            if want.consume {
+                g.stop_report = None;
+            }
+            return Ok(Some((c, ChildEvent::Stopped(sig))));
+        }
+        if want.continued && g.cont_report {
+            if want.consume {
+                g.cont_report = false;
+            }
+            return Ok(Some((c, ChildEvent::Continued)));
         }
     }
     if any { Ok(None) } else { Err(Errno::ECHILD) }
 }
 
-/// wait4 和 waitid 的公共部分：等到有子进程结束。
+/// wait4 和 waitid 的公共部分：等到有子进程的状态变化。
 fn wait_child(
     cx: &mut Cx<'_>,
     who: Who,
     nohang: bool,
-    reap: bool,
-) -> Result<Option<(Tid, ExitStatus)>, Errno> {
+    want: Wanted,
+) -> Result<Option<(Tid, ChildEvent)>, Errno> {
     loop {
-        if let Some(found) = find_zombie(cx, who, reap)? {
+        if let Some(found) = find_event(cx, who, want)? {
             return Ok(Some(found));
         }
         if nohang {
@@ -460,11 +537,17 @@ pub(super) fn wait4(
         p if p < 0 => Who::Pgid(-p),
         p => Who::Pid(p),
     };
-    let Some((child, status)) = wait_child(cx, who, options & WNOHANG != 0, true)? else {
+    let want = Wanted {
+        exited: true,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+        consume: true,
+    };
+    let Some((child, event)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
         return Ok(0);
     };
     if wstatus != 0 {
-        put(cx, wstatus, status.wait_status().to_le_bytes())?;
+        put(cx, wstatus, event.wait_status().to_le_bytes())?;
     }
     if rusage != 0 {
         cx.mm().write(UserSlice::new(rusage, 144), &[0; 144])?;
@@ -493,14 +576,16 @@ pub(super) fn waitid(
         P_PGID if id == 0 => Who::Pgid(cx.t.group.borrow().pgid),
         _ => return Err(Errno::EINVAL),
     };
-    // 停止和继续随作业控制一起实现，这里只等待结束
-    if options & WEXITED == 0 {
-        return Err(Errno::ECHILD);
-    }
-    let found = wait_child(cx, who, options & WNOHANG != 0, options & WNOWAIT == 0)?;
+    let want = Wanted {
+        exited: options & WEXITED != 0,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+        consume: options & WNOWAIT == 0,
+    };
+    let found = wait_child(cx, who, options & WNOHANG != 0, want)?;
     if infop != 0 {
         let info = match found {
-            Some((child, status)) => SigInfo::child(child, status).encode(Signal::CHLD),
+            Some((child, event)) => event.siginfo(child).encode(Signal::CHLD),
             None => [0; 128],
         };
         cx.mm().write(UserSlice::new(infop, 128), &info)?;
@@ -534,6 +619,7 @@ pub(super) fn setsid(cx: &mut Cx<'_>) -> SysResult {
         return Err(Errno::EPERM);
     }
     let mut g = cx.t.group.borrow_mut();
+    g.ctty = None;
     g.sid = tgid;
     g.pgid = tgid;
     Ok(tgid as u64)

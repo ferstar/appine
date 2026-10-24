@@ -5,6 +5,11 @@
 //! 仓库里的 `ld-musl` 加载。guest 以 `argv[0] = <program>` 启动，环境变量只有
 //! `--env` 给出的那些。退出码沿用 shell 的约定：正常退出时是 guest 的退出码，
 //! 被信号终止时是 128 + 信号编号，程序无法启动时是 127（找不到）或 126（不能执行）。
+//!
+//! stdin 和 stdout 都是终端时，guest 运行在一个进程内的 PTY 上（设计文档 §9）：宿主
+//! 终端切到 raw 模式，按键原样交给 guest 的行规程，^C、^Z 由它变成发给前台进程组的
+//! 信号，窗口大小跟随宿主终端。`--pty` 在没有终端时也这样做（stdin 和 stdout 可以是
+//! 管道，测试用），`--no-pty` 让 guest 直接使用宿主的 stdin/stdout/stderr。
 
 use std::env;
 use std::ffi::OsString;
@@ -14,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use appine_kernel::errno::Errno;
-use appine_kernel::{DbtStats, ExitStatus, RunError, RunOptions, Tier};
+use appine_kernel::{DbtStats, ExitStatus, RunError, RunOptions, Terminal, Tier};
 
 const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
        appine-run --rootfs <dir> --import <rootfs.tar.gz>
@@ -24,6 +29,8 @@ const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
   --rootfs <dir>       resolve <program> in the inode store at <dir>
   --import <tar.gz>    create the inode store at <dir> from a rootfs tarball, then exit
   --env NAME=VALUE     add a guest environment variable (repeatable)
+  --pty                run on an in-process terminal even if stdin is not a tty
+  --no-pty             give the guest the host stdin/stdout/stderr directly
   --stats              print Tier 1 statistics to stderr on exit";
 
 fn main() -> ExitCode {
@@ -31,6 +38,7 @@ fn main() -> ExitCode {
     let mut options = RunOptions::default();
     let mut stats = false;
     let mut import = None;
+    let mut pty = None;
     let mut envp: Vec<Vec<u8>> = Vec::new();
     while let Some(arg) = args.first().and_then(|a| a.to_str()).map(str::to_owned) {
         if !arg.starts_with('-') {
@@ -58,6 +66,8 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--stats" => stats = true,
+            "--pty" => pty = Some(true),
+            "--no-pty" => pty = Some(false),
             "--tier" => {
                 options.tier = match value().as_ref().and_then(|v| v.to_str()) {
                     Some("0") => Tier::Interpreter,
@@ -109,7 +119,30 @@ fn main() -> ExitCode {
     };
 
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let report = match appine_kernel::run(&program, &argv, &envp, &options) {
+    let on_tty = appine_hal::isatty(0) && appine_hal::isatty(1);
+    let mut raw = None;
+    if pty.unwrap_or(on_tty) {
+        if on_tty {
+            match appine_hal::RawMode::enter(0) {
+                Ok(r) => raw = Some(r),
+                Err(e) => {
+                    eprintln!("appine-run: cannot switch the terminal to raw mode: errno {e}")
+                }
+            }
+        }
+        options.terminal = Some(Terminal {
+            input: 0,
+            output: 1,
+            size: on_tty.then_some(1),
+            resize: on_tty
+                .then(appine_hal::sigwinch_notifier)
+                .and_then(Result::ok),
+        });
+    }
+    let result = appine_kernel::run(&program, &argv, &envp, &options);
+    // 先恢复宿主终端，再打印消息
+    drop(raw);
+    let report = match result {
         Ok(report) => report,
         Err(err) => {
             eprintln!("appine-run: {}: {err}", program.to_string_lossy());

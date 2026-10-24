@@ -63,6 +63,24 @@ impl PipeEnd {
     }
 }
 
+impl PipeEnd {
+    /// 经由 `/proc/<pid>/fd/<n>` 再打开同一个管道的一端。
+    pub fn reopen(pipe: &Rc<RefCell<Pipe>>, write: bool) -> PipeEnd {
+        {
+            let mut p = pipe.borrow_mut();
+            if write {
+                p.writers += 1;
+            } else {
+                p.readers += 1;
+            }
+        }
+        PipeEnd {
+            pipe: pipe.clone(),
+            write,
+        }
+    }
+}
+
 impl Drop for PipeEnd {
     fn drop(&mut self) {
         let mut p = self.pipe.borrow_mut();

@@ -12,7 +12,7 @@
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -26,8 +26,8 @@ use crate::futex::Futexes;
 use crate::mm::Mm;
 use crate::process::{ExitStatus, ThreadGroup, Tier};
 use crate::task::{Task, TaskState};
-use crate::vfs::Vfs;
-use crate::vfs::store::Ino;
+use crate::tty::Tty;
+use crate::vfs::{Node, Vfs};
 
 /// 线程 ID；线程组 ID（pid）就是组里第一个线程的 tid。
 pub(crate) type Tid = i32;
@@ -60,6 +60,16 @@ pub(crate) struct Kernel {
     pub session: Option<ExitStatus>,
     /// 已退出线程的 Tier 1 统计之和。
     pub dbt_stats: Option<DbtStats>,
+    /// 已退出线程用掉的 CPU 时间之和（`/proc/stat`）。
+    pub cpu_ns: u64,
+    /// 创建过的进程数（`/proc/stat` 的 processes）。
+    pub forks: u64,
+    /// 本次运行的 `/proc/sys/kernel/random/boot_id`。
+    pub boot_id: [u8; 16],
+    /// 所有 PTY，按编号；主设备和从设备都关闭之后条目失效。
+    pub ptys: BTreeMap<u32, Weak<RefCell<Tty>>>,
+    /// 接到宿主终端的那个 PTY 的主设备（[`crate::terminal`]）。
+    pub terminal: Option<crate::tty::PtyEnd>,
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
@@ -78,6 +88,17 @@ impl Kernel {
             tier,
             session: None,
             dbt_stats: None,
+            cpu_ns: 0,
+            forks: 0,
+            boot_id: {
+                let mut id = [0u8; 16];
+                let _ = appine_hal::fill_random(&mut id);
+                id[6] = (id[6] & 0x0f) | 0x40;
+                id[8] = (id[8] & 0x3f) | 0x80;
+                id
+            },
+            ptys: BTreeMap::new(),
+            terminal: None,
             next_tid: INIT + 1,
             waiters: Vec::new(),
         }
@@ -251,8 +272,30 @@ impl<'a> Cx<'a> {
     }
 
     /// 当前目录。
-    pub fn cwd(&self) -> Ino {
-        self.t.fs.borrow().cwd
+    pub fn cwd(&self) -> Node {
+        self.t.fs.borrow().cwd.clone()
+    }
+
+    /// 换掉地址空间（execve），同时更新 procfs 能看到的那份。
+    pub fn set_mm(&mut self, mm: Rc<RefCell<Mm>>) {
+        self.task.res.borrow_mut().mm = mm.clone();
+        self.t.mm = mm;
+    }
+
+    /// 换掉 fd 表（execve、close_range 不再共享时），同时更新 procfs 能看到的那份。
+    pub fn set_fds(&mut self, fds: Rc<RefCell<FdTable>>) {
+        self.task.res.borrow_mut().fds = fds.clone();
+        self.t.fds = fds;
+    }
+
+    /// procfs、devpts 的视图（路径解析用）。
+    pub fn view<'v>(&'v self, vfs: &'v Vfs) -> crate::pseudo::View<'v> {
+        crate::pseudo::View {
+            k: self.kr(),
+            vfs,
+            tid: self.tid(),
+            tgid: self.tgid(),
+        }
     }
 
     /// 文件创建掩码。

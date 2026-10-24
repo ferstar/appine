@@ -41,6 +41,15 @@ scripts/dev sh -c 'cargo build -q -p appine-run && run=target/linux-arm64/debug/
                    $run --rootfs target/store --env PATH=/bin:/usr/bin /bin/sh -c "ls / | wc -l"'
 ```
 
+When stdin and stdout are a terminal, `appine-run` runs the guest on an in-process
+terminal, so an interactive login shell has job control (Ctrl-C, Ctrl-Z, `fg`) and
+full-screen programs such as `vi` and `top` work:
+
+```sh
+scripts/dev target/linux-arm64/debug/appine-run --rootfs target/store \
+    --env TERM=xterm-256color --env HOME=/root /bin/sh -l
+```
+
 ## License
 
 appine is free software: you can redistribute it and/or modify it under the terms of the

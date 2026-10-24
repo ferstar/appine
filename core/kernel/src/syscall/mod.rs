@@ -9,6 +9,7 @@ mod mem;
 mod misc;
 mod proc;
 mod sig;
+mod tty;
 
 use appine_engine::Cpu;
 
@@ -160,6 +161,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // 返回用户态之前处理挂起的信号和 syscall 重启，与 Linux 一样
     signal::deliver(cx, cpu, true)
 }
+
+pub(crate) use proc::label_image;
 
 /// 读取 guest 的路径参数。
 fn read_path(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {

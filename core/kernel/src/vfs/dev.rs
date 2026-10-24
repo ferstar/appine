@@ -1,8 +1,8 @@
 //! 字符设备（设计文档 §8）。
 //!
-//! M3a 的 `/dev` 是 inode 仓库里的普通目录，设备节点按 Linux 的设备号建在里面
-//! （[`ensure_dev_nodes`]），打开设备节点时按设备号找到这里的实现。guest 自己
-//! 用 mknod 建的同号节点行为相同。终端设备随 PTY 一起在 M3b 实现。
+//! `/dev` 是 inode 仓库里的普通目录，设备节点按 Linux 的设备号建在里面
+//! （[`ensure_dev_nodes`]），打开设备节点时按设备号找到这里的实现；guest 自己
+//! 用 mknod 建的同号节点行为相同。`/dev/pts` 是挂在仓库目录上的 devpts。
 
 use crate::errno::Errno;
 use crate::vfs::store::{Ino, ROOT, Store, mode};
@@ -38,17 +38,20 @@ impl Device {
     }
 }
 
-/// `/dev` 里的标准节点：名字、设备号、权限。
-const NODES: [(&[u8], u64, u32); 6] = [
+/// `/dev` 里的标准节点：名字、设备号、权限。终端设备（tty、console、ptmx）由
+/// syscall 层按设备号接到 PTY 上。
+const NODES: [(&[u8], u64, u32); 8] = [
     (b"null", rdev(1, 3), 0o666),
     (b"zero", rdev(1, 5), 0o666),
     (b"full", rdev(1, 7), 0o666),
     (b"random", rdev(1, 8), 0o666),
     (b"urandom", rdev(1, 9), 0o666),
     (b"tty", rdev(5, 0), 0o666),
+    (b"console", rdev(5, 1), 0o600),
+    (b"ptmx", rdev(5, 2), 0o666),
 ];
 
-/// `/dev` 里的标准符号链接，procfs 在 M3b 实现之前它们是悬空的，与真实系统的布局一致。
+/// `/dev` 里的标准符号链接，都指向 procfs。
 const LINKS: [(&[u8], &[u8]); 4] = [
     (b"fd", b"/proc/self/fd"),
     (b"stdin", b"/proc/self/fd/0"),
@@ -56,10 +59,15 @@ const LINKS: [(&[u8], &[u8]); 4] = [
     (b"stderr", b"/proc/self/fd/2"),
 ];
 
-/// 确保 `/dev` 和其中的标准设备节点存在（导入 rootfs 之后、每次启动时调用）。
-/// 已经存在的同名项保持不动。
+/// 确保 `/dev` 和其中的标准设备节点，以及 `/proc`、`/sys` 这些挂载点存在（导入
+/// rootfs 之后、每次启动时调用）。已经存在的同名项保持不动。
 pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
     store.transaction(|s| {
+        for (name, perm) in [(&b"proc"[..], 0o555), (b"sys", 0o555)] {
+            if s.lookup(ROOT, name)?.is_none() {
+                s.mkdir(ROOT, name, perm, 0, 0)?;
+            }
+        }
         let dev = match s.lookup(ROOT, b"dev")? {
             Some(ino) => ino,
             None => s.mkdir(ROOT, b"dev", 0o755, 0, 0)?,

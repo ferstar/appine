@@ -9,16 +9,19 @@ use std::os::unix::fs::FileExt;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::{IO_CHUNK, SysResult, get, put, read_path, read_timespec};
+use super::{IO_CHUNK, SysResult, get, put, read_path, read_timespec, tty};
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_NOFILE, Signal};
+use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
+use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
-use crate::vfs::dev::{self, Device};
-use crate::vfs::store::{DirEntry, Ino, ROOT, Stat, mode};
+use crate::vfs::dev::{self, Device, rdev};
+use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
+use crate::vfs::{Node, Vfs, normalize};
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -63,9 +66,16 @@ const UIO_MAXIOV: usize = 1024;
 const ROOT_DEV: u64 = 0x801;
 /// 管道报告的设备号（Linux 上 pipefs 是一个匿名设备）。
 const PIPE_DEV: u64 = 0xd;
+/// procfs、devpts 报告的设备号。
+const PROC_DEV: u64 = 0x4;
+const DEVPTS_DEV: u64 = 0x18;
 /// statfs 报告的文件系统类型。
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
+const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
+/// PTY 主设备的设备号（`/dev/ptmx`）。
+const PTMX_RDEV: u64 = rdev(5, 2);
 
 /// 可以透传给宿主终端的 ioctl：编号、参数大小、是否是输出参数。
 const TTY_IOCTLS: [(u32, usize, bool); 6] = [
@@ -96,25 +106,27 @@ fn host_errno(e: std::io::Error) -> Errno {
 // ---- 路径 ----
 
 /// `*at` 系列的起点目录。
-fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Ino, Errno> {
+fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
     if path.first() == Some(&b'/') {
-        return Ok(ROOT);
+        return Ok(Node::ROOT);
     }
     if dirfd == AT_FDCWD {
         return Ok(cx.cwd());
     }
     let file = cx.fds().get(dirfd)?;
-    let ino = file.borrow().ino().ok_or(Errno::ENOTDIR)?;
-    if !cx.vfs()?.store().stat(ino)?.is_dir() {
+    let node = file.borrow().node().ok_or(Errno::ENOTDIR)?;
+    let vfs = cx.vfs()?;
+    if !vfs.is_dir(&cx.view(&vfs), &node)? {
         return Err(Errno::ENOTDIR);
     }
-    Ok(ino)
+    Ok(node)
 }
 
 /// 解析 `*at` 系列的路径参数。
-fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Ino, Errno> {
+fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
     let start = start_dir(cx, dirfd, path)?;
-    cx.vfs()?.resolve(start, path, follow)
+    let vfs = cx.vfs()?;
+    vfs.resolve(&cx.view(&vfs), &start, path, follow)
 }
 
 /// `*at` 系列里"路径为空时作用于 dirfd 本身"（`AT_EMPTY_PATH`）的公共部分。
@@ -124,20 +136,43 @@ fn lookup_at_or_fd(
     path: &[u8],
     flags: u32,
     follow: bool,
-) -> Result<Ino, Errno> {
+) -> Result<Node, Errno> {
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd == AT_FDCWD {
             return Ok(cx.cwd());
         }
-        return cx.fds().get(dirfd)?.borrow().ino().ok_or(Errno::EBADF);
+        return cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF);
     }
     lookup_at(cx, dirfd, path, follow)
 }
 
-/// 解析要新建或删除的路径：返回父目录和最后一个组件。
+/// 解析要新建或删除的路径：返回父目录和最后一个组件。只有仓库里的目录可以修改。
 fn parent_at<'p>(cx: &Cx<'_>, dirfd: i32, path: &'p [u8]) -> Result<(Ino, &'p [u8]), Errno> {
     let start = start_dir(cx, dirfd, path)?;
-    cx.vfs()?.resolve_parent(start, path)
+    let vfs = cx.vfs()?;
+    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &start, path)?;
+    Ok((store_ino(&dir)?, name))
+}
+
+/// 仓库里的 inode；合成文件系统里的节点不能修改。
+fn store_ino(node: &Node) -> Result<Ino, Errno> {
+    match node {
+        Node::Store(ino) => Ok(*ino),
+        Node::Pseudo(_) => Err(Errno::EACCES),
+    }
+}
+
+/// 打开时记下的绝对路径（`/proc/<pid>/fd/<n>`）：词法上规范化，不跟随符号链接。
+fn display_path(cx: &Cx<'_>, vfs: &Vfs, start: &Node, path: &[u8]) -> Option<Rc<[u8]>> {
+    let full = if path.first() == Some(&b'/') {
+        path.to_vec()
+    } else {
+        let mut p = vfs.path_of(&cx.view(vfs), start).ok()?;
+        p.push(b'/');
+        p.extend_from_slice(path);
+        p
+    };
+    Some(Rc::from(normalize(&full)))
 }
 
 // ---- stat ----
@@ -150,20 +185,24 @@ fn split_ns(ns: i64) -> (u64, u64) {
 }
 
 /// 按 asm-generic 的 `struct stat`（128 字节）编码。
-fn encode_stat(st: &Stat) -> [u8; 128] {
+fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     let mut b = [0u8; 128];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
     let (msec, mnsec) = split_ns(st.mtime_ns);
     let (csec, cnsec) = split_ns(st.ctime_ns);
-    put(0, &ROOT_DEV.to_le_bytes());
+    put(0, &dev.to_le_bytes());
     put(8, &st.ino.to_le_bytes());
     put(16, &st.mode.to_le_bytes());
     put(20, &st.nlink.to_le_bytes());
     put(24, &st.uid.to_le_bytes());
     put(28, &st.gid.to_le_bytes());
     put(32, &st.rdev.to_le_bytes());
-    // 目录在仓库里没有数据，按 ext4 的习惯报告一个块
-    let size = if st.is_dir() { 4096 } else { st.size };
+    // 仓库里的目录没有数据，按 ext4 的习惯报告一个块
+    let size = if st.is_dir() && dev == ROOT_DEV {
+        4096
+    } else {
+        st.size
+    };
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
     put(64, &(size.div_ceil(4096) * 8).to_le_bytes());
@@ -177,12 +216,33 @@ fn encode_stat(st: &Stat) -> [u8; 128] {
     b
 }
 
+/// 文件系统节点的元数据。
+fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    match node {
+        Node::Store(ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, ROOT_DEV)),
+        // 魔法链接指向的打开文件：报告那个文件本身
+        Node::Pseudo(PseudoNode::OpenFd(pid, fd)) => {
+            let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
+            file_stat(cx, &file)
+        }
+        Node::Pseudo(p) => {
+            let dev = match p {
+                PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => DEVPTS_DEV,
+                _ => PROC_DEV,
+            };
+            Ok(encode_stat(&pseudo::stat(&view, p)?, dev))
+        }
+    }
+}
+
 /// 宿主 fd 的元数据。
 // st_* 字段的类型在不同宿主上宽度不同
 #[allow(clippy::unnecessary_cast)]
 fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
     let s = appine_hal::fstat(fd).map_err(Errno)?;
-    let mut b = encode_stat(&Stat {
+    let st = Stat {
         ino: s.st_ino as u64,
         mode: s.st_mode as u32,
         nlink: s.st_nlink as u32,
@@ -192,35 +252,52 @@ fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
         size: s.st_size as u64,
         mtime_ns: s.st_mtime as i64 * 1_000_000_000 + s.st_mtime_nsec as i64,
         ctime_ns: s.st_ctime as i64 * 1_000_000_000 + s.st_ctime_nsec as i64,
-    });
-    b[..8].copy_from_slice(&(s.st_dev as u64).to_le_bytes());
-    Ok(b)
+    };
+    Ok(encode_stat(&st, s.st_dev as u64))
 }
 
 fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
     let f = file.borrow();
+    let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
+        let st = Stat {
+            ino,
+            mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev,
+            size: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        };
+        encode_stat(&st, dev)
+    };
     match &f.kind {
         FileKind::Host(fd) => host_stat(*fd),
-        FileKind::Pipe(end) => {
-            let mut b = encode_stat(&Stat {
-                ino: end.pipe.borrow().ino,
-                mode: mode::S_IFIFO | 0o600,
-                nlink: 1,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                size: 0,
-                mtime_ns: 0,
-                ctime_ns: 0,
-            });
-            b[..8].copy_from_slice(&PIPE_DEV.to_le_bytes());
-            Ok(b)
+        FileKind::Pipe(end) => Ok(anon(
+            end.pipe.borrow().ino,
+            mode::S_IFIFO | 0o600,
+            0,
+            PIPE_DEV,
+        )),
+        FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
+        FileKind::Pty(end) => {
+            let n = end.tty.borrow().index;
+            Ok(anon(
+                pseudo::ino_of(&PseudoNode::Pts(n)),
+                mode::S_IFCHR | 0o620,
+                rdev(PTS_MAJOR, n),
+                DEVPTS_DEV,
+            ))
         }
-        FileKind::Regular { ino, file } => {
-            Ok(encode_stat(&cx.vfs()?.store().stat_open(*ino, file)?))
-        }
-        FileKind::Directory { ino, .. } | FileKind::Path(ino) | FileKind::Device { ino, .. } => {
-            Ok(encode_stat(&cx.vfs()?.store().stat(*ino)?))
+        FileKind::Regular { ino, file } => Ok(encode_stat(
+            &cx.vfs()?.store().stat_open(*ino, file)?,
+            ROOT_DEV,
+        )),
+        _ => {
+            let node = f.node().ok_or(Errno::EBADF)?;
+            drop(f);
+            node_stat(cx, &node)
         }
     }
 }
@@ -230,66 +307,160 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
 pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
-    let store = vfs.store();
     let start = start_dir(cx, dirfd, &path)?;
     let create = flags & oflags::O_CREAT != 0;
     let excl = create && flags & oflags::O_EXCL != 0;
     let follow = flags & oflags::O_NOFOLLOW == 0 && !excl;
 
-    let (ino, created) = match vfs.resolve(start, &path, follow) {
+    let resolved = vfs.resolve(&cx.view(&vfs), &start, &path, follow);
+    let (node, created) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
-        Ok(ino) => (ino, None),
+        Ok(node) => (node, None),
         Err(e) if e == Errno::ENOENT && create => {
-            let (dir, name) = vfs.resolve_parent(start, &path)?;
+            let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &start, &path)?;
             if path.ends_with(b"/") || name == b"." || name == b".." {
                 return Err(Errno::EISDIR);
             }
-            let (ino, file) = store.create_file(dir, name, perm & !cx.umask() & 0o7777, 0, 0)?;
-            (ino, Some(file))
+            let dir = store_ino(&dir)?;
+            let perm = perm & !cx.umask() & 0o7777;
+            let (ino, file) = vfs.store().create_file(dir, name, perm, 0, 0)?;
+            (Node::Store(ino), Some(file))
         }
         Err(e) => return Err(e),
     };
 
-    let accmode = flags & oflags::O_ACCMODE;
-    let st = store.stat(ino)?;
+    let mut display = display_path(cx, &vfs, &start, &path);
     let kind = if flags & oflags::O_PATH != 0 {
-        if flags & oflags::O_DIRECTORY != 0 && !st.is_dir() {
+        if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
         }
-        FileKind::Path(ino)
+        FileKind::Path(node)
     } else {
-        match st.kind() {
-            mode::S_IFLNK => return Err(Errno::ELOOP),
-            mode::S_IFDIR => {
-                if accmode != oflags::O_RDONLY || create {
-                    return Err(Errno::EISDIR);
-                }
-                FileKind::Directory { ino, entries: None }
-            }
-            _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
-            mode::S_IFREG => {
-                let file = match created {
-                    Some(f) => f,
-                    None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
-                };
-                if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
-                    file.set_len(0).map_err(host_errno)?;
-                }
-                FileKind::Regular { ino, file }
-            }
-            mode::S_IFCHR => FileKind::Device {
-                ino,
-                dev: dev::open(store, ino)?,
-            },
-            // 块设备、FIFO、socket 文件还不支持
-            _ => return Err(Errno::ENXIO),
+        match node {
+            Node::Store(ino) => open_store(cx, vfs.store(), ino, flags, created)?,
+            Node::Pseudo(p) => open_pseudo(cx, &vfs, p, flags)?,
         }
     };
+    if let FileKind::Pty(end) = &kind {
+        // /dev/tty、/dev/ptmx 打开的是具体的某个 PTY
+        display = (!end.master)
+            .then(|| Rc::from(format!("/dev/pts/{}", end.tty.borrow().index).into_bytes()));
+    }
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
-    let file = OpenFile::new(kind, flags & keep);
+    let file = OpenFile::with_path(kind, flags & keep, display);
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)
         .map(|fd| fd as u64)
+}
+
+/// 设备号对应的 PTY 从设备编号（主设备号 136–143）。
+fn pts_index(r: u64) -> Option<u32> {
+    let major = ((r >> 8) & 0xfff) as u32;
+    let minor = ((r & 0xff) | ((r >> 12) & !0xff)) as u32;
+    (PTS_MAJOR..PTS_MAJOR + 8)
+        .contains(&major)
+        .then(|| ((major - PTS_MAJOR) << 8) + minor)
+}
+
+/// 打开仓库里的 inode。
+fn open_store(
+    cx: &mut Cx<'_>,
+    store: &Store,
+    ino: Ino,
+    flags: u32,
+    created: Option<std::fs::File>,
+) -> Result<FileKind, Errno> {
+    let accmode = flags & oflags::O_ACCMODE;
+    let st = store.stat(ino)?;
+    Ok(match st.kind() {
+        mode::S_IFLNK => return Err(Errno::ELOOP),
+        mode::S_IFDIR => {
+            if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 {
+                return Err(Errno::EISDIR);
+            }
+            FileKind::Directory {
+                node: Node::Store(ino),
+                entries: None,
+            }
+        }
+        _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
+        mode::S_IFREG => {
+            let file = match created {
+                Some(f) => f,
+                None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
+            };
+            if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
+                file.set_len(0).map_err(host_errno)?;
+            }
+            FileKind::Regular { ino, file }
+        }
+        mode::S_IFCHR => match st.rdev {
+            // /dev/tty、/dev/console：调用者的控制终端
+            r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
+            PTMX_RDEV => tty::open_ptmx(cx.k())?,
+            r => match pts_index(r) {
+                Some(index) => tty::open_slave(cx, index, flags)?,
+                None => FileKind::Device {
+                    ino,
+                    dev: dev::open(store, ino)?,
+                },
+            },
+        },
+        // 块设备、FIFO、socket 文件还不支持
+        _ => return Err(Errno::ENXIO),
+    })
+}
+
+/// 打开合成文件系统里的节点。
+fn open_pseudo(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    node: PseudoNode,
+    flags: u32,
+) -> Result<FileKind, Errno> {
+    let accmode = flags & oflags::O_ACCMODE;
+    match node {
+        PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
+        PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k()),
+        PseudoNode::OpenFd(pid, fd) => return reopen(cx, vfs, pid, fd, accmode),
+        _ => {}
+    }
+    let view = cx.view(vfs);
+    if vfs.is_dir(&view, &Node::Pseudo(node.clone()))? {
+        if accmode != oflags::O_RDONLY {
+            return Err(Errno::EISDIR);
+        }
+        return Ok(FileKind::Directory {
+            node: Node::Pseudo(node),
+            entries: None,
+        });
+    }
+    if flags & oflags::O_DIRECTORY != 0 {
+        return Err(Errno::ENOTDIR);
+    }
+    if accmode != oflags::O_RDONLY && !pseudo::writable(&node) {
+        return Err(Errno::EACCES);
+    }
+    let data = pseudo::content(&view, &node)?;
+    Ok(FileKind::Proc { node, data })
+}
+
+/// 经由 `/proc/<pid>/fd/<n>` 重新打开一个不在仓库里的文件：管道得到同一个管道的
+/// 一端，宿主 fd 得到同一个宿主 fd。
+fn reopen(cx: &Cx<'_>, vfs: &Vfs, pid: i32, fd: i32, accmode: u32) -> Result<FileKind, Errno> {
+    let file = cx.view(vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
+    let f = file.borrow();
+    match &f.kind {
+        FileKind::Pipe(end) => {
+            if accmode == oflags::O_RDWR {
+                return Err(Errno::EINVAL);
+            }
+            let write = accmode == oflags::O_WRONLY;
+            Ok(FileKind::Pipe(PipeEnd::reopen(&end.pipe, write)))
+        }
+        FileKind::Host(fd) => Ok(FileKind::Host(*fd)),
+        _ => Err(Errno::ENXIO),
+    }
 }
 
 pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
@@ -304,7 +475,7 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     }
     if flags & CLOSE_RANGE_UNSHARE != 0 && Rc::strong_count(&cx.t.fds) > 1 {
         let copy = cx.fds().clone();
-        cx.t.fds = Rc::new(RefCell::new(copy));
+        cx.set_fds(Rc::new(RefCell::new(copy)));
     }
     cx.fds_mut().close_range(
         first as usize,
@@ -403,6 +574,13 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         }
         _ => {}
     }
+    let pty = match &file.borrow().kind {
+        FileKind::Pty(end) => Some((end.tty.clone(), end.master)),
+        _ => None,
+    };
+    if let Some((t, master)) = pty {
+        return tty::ioctl(cx, &t, master, request, arg);
+    }
     let host_fd = match &file.borrow().kind {
         FileKind::Host(fd) => *fd,
         FileKind::Pipe(end) if request == FIONREAD => {
@@ -438,10 +616,11 @@ pub(super) fn faccessat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let ino = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-    let st = cx.vfs()?.store().stat(ino)?;
+    let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    let st = node_stat(cx, &node)?;
+    let st_mode = u32::from_le_bytes(st[16..20].try_into().unwrap());
     // guest 以 root 运行：读写总是允许，执行要求至少一个 x 位（目录除外）
-    if amode & 1 != 0 && !st.is_dir() && st.mode & 0o111 == 0 {
+    if amode & 1 != 0 && st_mode & mode::S_IFMT != mode::S_IFDIR && st_mode & 0o111 == 0 {
         return Err(Errno::EACCES);
     }
     Ok(0)
@@ -449,25 +628,29 @@ pub(super) fn faccessat(
 
 pub(super) fn chdir(cx: &mut Cx<'_>, path: u64) -> SysResult {
     let path = read_path(cx, path)?;
-    let ino = cx.vfs()?.resolve(cx.cwd(), &path, true)?;
-    if !cx.vfs()?.store().stat(ino)?.is_dir() {
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    let node = vfs.resolve(&view, &cx.cwd(), &path, true)?;
+    if !vfs.is_dir(&view, &node)? {
         return Err(Errno::ENOTDIR);
     }
-    cx.t.fs.borrow_mut().cwd = ino;
+    cx.t.fs.borrow_mut().cwd = node;
     Ok(0)
 }
 
 pub(super) fn fchdir(cx: &mut Cx<'_>, fd: i32) -> SysResult {
-    let ino = cx.fds().get(fd)?.borrow().ino().ok_or(Errno::ENOTDIR)?;
-    if !cx.vfs()?.store().stat(ino)?.is_dir() {
+    let node = cx.fds().get(fd)?.borrow().node().ok_or(Errno::ENOTDIR)?;
+    let vfs = cx.vfs()?;
+    if !vfs.is_dir(&cx.view(&vfs), &node)? {
         return Err(Errno::ENOTDIR);
     }
-    cx.t.fs.borrow_mut().cwd = ino;
+    cx.t.fs.borrow_mut().cwd = node;
     Ok(0)
 }
 
 pub(super) fn getcwd(cx: &mut Cx<'_>, buf: u64, size: u64) -> SysResult {
-    let mut path = cx.vfs()?.path_of(cx.cwd())?;
+    let vfs = cx.vfs()?;
+    let mut path = vfs.path_of(&cx.view(&vfs), &cx.cwd())?;
     path.push(0);
     if (size as usize) < path.len() {
         return Err(Errno::ERANGE);
@@ -487,8 +670,9 @@ pub(super) fn readlinkat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let ino = lookup_at(cx, dirfd, &path, false)?;
-    let target = cx.vfs()?.store().readlink(ino)?;
+    let node = lookup_at(cx, dirfd, &path, false)?;
+    let vfs = cx.vfs()?;
+    let target = vfs.readlink(&cx.view(&vfs), &node)?;
     let n = target.len().min(size);
     cx.mm().write(UserSlice::new(buf, n), &target[..n])?;
     Ok(n as u64)
@@ -508,8 +692,8 @@ pub(super) fn newfstatat(
     let st = if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         file_stat(cx, &cx.fds().get(dirfd)?)?
     } else {
-        let ino = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        encode_stat(&cx.vfs()?.store().stat(ino)?)
+        let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        node_stat(cx, &node)?
     };
     put(cx, buf, st).map(|()| 0)
 }
@@ -541,24 +725,45 @@ fn encode_statfs(magic: u64, s: &appine_hal::FsStats) -> [u8; 120] {
     b
 }
 
+/// 节点所在文件系统的 statfs。
+fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
+    let empty = appine_hal::FsStats {
+        block_size: 4096,
+        ..Default::default()
+    };
+    Ok(match node {
+        Node::Store(_) => encode_statfs(EXT4_SUPER_MAGIC, &cx.vfs()?.store().fs_stats()?),
+        Node::Pseudo(PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx) => {
+            encode_statfs(DEVPTS_SUPER_MAGIC, &empty)
+        }
+        Node::Pseudo(_) => encode_statfs(PROC_SUPER_MAGIC, &empty),
+    })
+}
+
 pub(super) fn statfs(cx: &mut Cx<'_>, path: u64, buf: u64) -> SysResult {
     let path = read_path(cx, path)?;
-    cx.vfs()?.resolve(cx.cwd(), &path, true)?;
-    let stats = cx.vfs()?.store().fs_stats()?;
-    put(cx, buf, encode_statfs(EXT4_SUPER_MAGIC, &stats)).map(|()| 0)
+    let vfs = cx.vfs()?;
+    let node = vfs.resolve(&cx.view(&vfs), &cx.cwd(), &path, true)?;
+    let b = statfs_of(cx, &node)?;
+    put(cx, buf, b).map(|()| 0)
 }
 
 pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
     let file = cx.fds().get(fd)?;
-    let b = match file.borrow().kind {
-        FileKind::Pipe(_) => encode_statfs(
+    let (pipe, node) = {
+        let f = file.borrow();
+        (matches!(f.kind, FileKind::Pipe(_)), f.node())
+    };
+    let b = match (pipe, node) {
+        (true, _) => encode_statfs(
             PIPEFS_MAGIC,
             &appine_hal::FsStats {
                 block_size: 4096,
                 ..Default::default()
             },
         ),
-        _ => encode_statfs(EXT4_SUPER_MAGIC, &cx.vfs()?.store().fs_stats()?),
+        (false, Some(node)) => statfs_of(cx, &node)?,
+        (false, None) => statfs_of(cx, &Node::ROOT)?,
     };
     put(cx, buf, b).map(|()| 0)
 }
@@ -654,13 +859,13 @@ pub(super) fn linkat(
         return Err(Errno::EINVAL);
     }
     let oldpath = read_path(cx, oldpath)?;
-    let src = lookup_at_or_fd(
+    let src = store_ino(&lookup_at_or_fd(
         cx,
         olddirfd,
         &oldpath,
         flags,
         flags & AT_SYMLINK_FOLLOW != 0,
-    )?;
+    )?)?;
     let newpath = read_path(cx, newpath)?;
     let (dir, name) = parent_at(cx, newdirfd, &newpath)?;
     if name == b"." || name == b".." {
@@ -706,7 +911,7 @@ pub(super) fn renameat2(
 
 pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
-    let ino = lookup_at(cx, dirfd, &path, true)?;
+    let ino = store_ino(&lookup_at(cx, dirfd, &path, true)?)?;
     cx.vfs()?.store().set_mode(ino, perm)?;
     Ok(0)
 }
@@ -733,10 +938,10 @@ pub(super) fn fchownat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let ino = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
     cx.vfs()?
         .store()
-        .set_owner(ino, owner_arg(uid), owner_arg(gid))?;
+        .set_owner(store_ino(&node)?, owner_arg(uid), owner_arg(gid))?;
     Ok(0)
 }
 
@@ -766,7 +971,8 @@ pub(super) fn utimensat(
         cx.fds().get(dirfd)?.borrow().ino().ok_or(Errno::EBADF)?
     } else {
         let path = read_path(cx, path)?;
-        lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?
+        let node = lookup_at_or_fd(cx, dirfd, &path, flags, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        store_ino(&node)?
     };
     let now = || {
         appine_hal::clock_gettime(0)
@@ -800,7 +1006,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let len = u64::try_from(len).map_err(|_| Errno::EINVAL)?;
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
-    let ino = vfs.resolve(cx.cwd(), &path, true)?;
+    let ino = store_ino(&vfs.resolve(&cx.view(&vfs), &cx.cwd(), &path, true)?)?;
     match vfs.store().stat(ino)?.kind() {
         mode::S_IFDIR => Err(Errno::EISDIR),
         mode::S_IFREG => vfs.store().truncate(ino, len).map(|()| 0),
@@ -832,25 +1038,33 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
     let file = cx.fds().get(fd)?;
     let mut f = file.borrow_mut();
     let OpenFile { kind, pos, .. } = &mut *f;
-    let FileKind::Directory { ino, entries } = kind else {
+    let FileKind::Directory { node, entries } = kind else {
         return Err(Errno::ENOTDIR);
     };
     if entries.is_none() {
         let vfs = cx.vfs()?;
-        let store = vfs.store();
+        let view = cx.view(&vfs);
+        let ino_of = |n: &Node| match n {
+            Node::Store(i) => *i,
+            Node::Pseudo(p) => pseudo::ino_of(p),
+        };
+        let parent = vfs.parent(&view, node)?;
         let mut list = vec![
             DirEntry {
                 name: b".".to_vec(),
-                ino: *ino,
+                ino: ino_of(node),
                 mode: mode::S_IFDIR,
             },
             DirEntry {
                 name: b"..".to_vec(),
-                ino: store.parent(*ino)?,
+                ino: ino_of(&parent),
                 mode: mode::S_IFDIR,
             },
         ];
-        list.extend(store.readdir(*ino)?);
+        match node {
+            Node::Store(ino) => list.extend(vfs.store().readdir(*ino)?),
+            Node::Pseudo(p) => list.extend(pseudo::readdir(&view, p)?),
+        }
         *entries = Some(list);
     }
     let list = entries.as_ref().unwrap();
@@ -886,7 +1100,13 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
     let base = match kind {
         FileKind::Host(fd) => return appine_hal::lseek(*fd, offset, whence as i32).map_err(Errno),
         FileKind::Path(_) => return Err(Errno::EBADF),
-        FileKind::Pipe(_) => return Err(Errno::ESPIPE),
+        FileKind::Pipe(_) | FileKind::Pty(_) => return Err(Errno::ESPIPE),
+        FileKind::Proc { data, .. } => match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => *pos as i64,
+            SEEK_END => data.len() as i64,
+            _ => return Err(Errno::EINVAL),
+        },
         // 与 Linux 的 /dev/null 等一样，seek 总是成功并停在 0
         FileKind::Device { .. } => return Ok(0),
         FileKind::Directory { entries, .. } => {
@@ -935,6 +1155,7 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
 enum IoPath {
     Host(i32),
     Pipe(Rc<RefCell<Pipe>>),
+    Pty(Rc<RefCell<Tty>>, bool),
     Local,
 }
 
@@ -942,6 +1163,7 @@ fn io_path(f: &OpenFile) -> IoPath {
     match &f.kind {
         FileKind::Host(fd) => IoPath::Host(*fd),
         FileKind::Pipe(end) => IoPath::Pipe(end.pipe.clone()),
+        FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), end.master),
         _ => IoPath::Local,
     }
 }
@@ -1067,10 +1289,16 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
                 buf.len()
             }
         },
+        FileKind::Proc { data, .. } => {
+            let start = (pos as usize).min(data.len());
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        }
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
         _ => return Err(Errno::EBADF),
     };
-    if offset.is_none() && matches!(f.kind, FileKind::Regular { .. }) {
+    if offset.is_none() && matches!(f.kind, FileKind::Regular { .. } | FileKind::Proc { .. }) {
         f.pos = pos + n as u64;
     }
     Ok(n)
@@ -1096,6 +1324,8 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
             Device::Full => Err(Errno::ENOSPC),
             _ => Ok(data.len()),
         },
+        // 可写的 procfs 文件：接受写入，但不起作用
+        FileKind::Proc { .. } => Ok(data.len()),
         _ => Err(Errno::EBADF),
     }
 }
@@ -1115,12 +1345,15 @@ fn read_bytes(
         (io_path(&f), f.nonblocking())
     };
     match path {
-        IoPath::Host(_) | IoPath::Pipe(_) if offset.is_some() => Err(Errno::ESPIPE),
+        IoPath::Host(_) | IoPath::Pipe(_) | IoPath::Pty(..) if offset.is_some() => {
+            Err(Errno::ESPIPE)
+        }
         IoPath::Host(fd) => {
             wait_host(cx, fd, POLLIN, nonblock)?;
             cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
         }
         IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
+        IoPath::Pty(t, master) => tty::read(cx, &t, master, nonblock, buf),
         IoPath::Local => local_read(&mut file.borrow_mut(), buf, offset),
     }
 }
@@ -1140,13 +1373,16 @@ fn write_bytes(
         (io_path(&f), f.nonblocking())
     };
     match path {
-        IoPath::Host(_) | IoPath::Pipe(_) if offset.is_some() => Err(Errno::ESPIPE),
+        IoPath::Host(_) | IoPath::Pipe(_) | IoPath::Pty(..) if offset.is_some() => {
+            Err(Errno::ESPIPE)
+        }
         IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
             Ok(n) => Ok(n),
             Err(e) if e == Errno::EPIPE.0 => Err(broken_pipe(cx)),
             Err(e) => Err(Errno(e)),
         },
         IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data),
+        IoPath::Pty(t, master) => tty::write(cx, &t, master, nonblock, data),
         IoPath::Local => local_write(&mut file.borrow_mut(), data, offset),
     }
 }
@@ -1160,7 +1396,10 @@ fn read_file(
     offset: Option<u64>,
 ) -> SysResult {
     // 终端、管道每次 read 只返回已经就绪的数据，不能为了凑满缓冲区再次阻塞
-    let fill = matches!(file.borrow().kind, FileKind::Regular { .. });
+    let fill = matches!(
+        file.borrow().kind,
+        FileKind::Regular { .. } | FileKind::Proc { .. }
+    );
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;
     while done < len {
@@ -1389,6 +1628,7 @@ fn readiness(f: &OpenFile) -> Readiness {
             }
             Readiness::Events(ev)
         }
+        FileKind::Pty(end) => Readiness::Events(tty::readiness(&end.tty.borrow(), end.master)),
         FileKind::Path(_) => Readiness::Events(POLLNVAL),
         _ => Readiness::Events(POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM),
     }

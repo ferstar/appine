@@ -20,8 +20,7 @@ use crate::process::{Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::syscall::{self, Flow};
 use crate::uaccess::UserSlice;
-use crate::vfs::Vfs;
-use crate::vfs::store::Ino;
+use crate::vfs::{Node, Vfs};
 
 /// 运行循环与内核其他部分之间无锁共享的状态。
 pub(crate) struct TaskSync {
@@ -33,8 +32,17 @@ pub(crate) struct TaskSync {
 
 /// 当前目录和文件创建掩码（`CLONE_FS` 共享的部分）。
 pub(crate) struct FsContext {
-    pub cwd: Ino,
+    pub cwd: Node,
     pub umask: u32,
+}
+
+/// 线程用着的地址空间、fd 表和当前目录。它们本来在 [`TaskState`] 里，这里是一份
+/// 别的线程也能读的拷贝（procfs 用），由 [`Cx::set_mm`](crate::kernel::Cx::set_mm)
+/// 等在替换时同步更新。
+pub(crate) struct TaskRes {
+    pub mm: Rc<RefCell<Mm>>,
+    pub fds: Rc<RefCell<FdTable>>,
+    pub fs: Rc<RefCell<FsContext>>,
 }
 
 /// 一个 guest 线程。除 [`Task::state`] 外，其余字段也会被其他线程访问（发信号、
@@ -57,6 +65,10 @@ pub(crate) struct Task {
     pub sync: Arc<TaskSync>,
     /// 唤醒等待中的这个线程。
     pub event: Arc<Event>,
+    /// 地址空间等资源的共享拷贝（procfs 用）。
+    pub res: RefCell<TaskRes>,
+    /// 宿主线程的 CPU 时间时钟。
+    pub clock: Cell<Option<i32>>,
     /// 只有线程自己访问的状态。
     pub state: RefCell<TaskState>,
 }
@@ -94,6 +106,11 @@ impl Task {
         comm: [u8; 16],
     ) -> Result<Rc<Task>, Errno> {
         let event = Event::new().map_err(|_| Errno::EAGAIN)?;
+        let res = TaskRes {
+            mm: state.mm.clone(),
+            fds: state.fds.clone(),
+            fs: state.fs.clone(),
+        };
         Ok(Rc::new(Task {
             tid: Cell::new(tid),
             tgid,
@@ -107,8 +124,18 @@ impl Task {
                 kicker: cpu.kicker(),
             }),
             event: Arc::new(event),
+            res: RefCell::new(res),
+            clock: Cell::new(None),
             state: RefCell::new(state),
         }))
+    }
+
+    /// 线程用掉的 CPU 时间（纳秒），以宿主线程的 CPU 时间计。
+    pub fn cpu_ns(&self) -> u64 {
+        self.clock
+            .get()
+            .and_then(|c| appine_hal::clock_gettime(c).ok())
+            .map_or(0, |(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
     }
 }
 
@@ -150,6 +177,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
     let (task, sync, mut generation, tier) = {
         let k = shared.lock();
         let task = k.tasks[&tid].clone();
+        task.clock.set(appine_hal::thread_cpu_clock());
         let generation = task.state.borrow().mm.borrow().generation();
         let sync = task.sync.clone();
         (task, sync, generation, k.tier)
@@ -293,11 +321,14 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, stats: Option<DbtStats>) {
         add_stats(total, &s);
     }
     let tid = task.tid.get();
+    let cpu = task.cpu_ns();
+    k.cpu_ns += cpu;
     let group = {
         let mut st = task.state.borrow_mut();
         release_mm(&mut k, &task, &mut st);
         st.group.clone()
     };
+    group.borrow_mut().cpu_ns += cpu;
     k.tasks.remove(&tid);
     let last = {
         let mut g = group.borrow_mut();

@@ -259,6 +259,33 @@ fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
     unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, ms) }
 }
 
+/// 当前线程的 CPU 时间时钟，其他线程也可以用 [`clock_gettime`] 读它（线程退出后失效）。
+pub fn thread_cpu_clock() -> Option<i32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut id: libc::clockid_t = 0;
+        (unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut id) } == 0).then_some(id)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
+/// `[ptr, ptr + len)` 里驻留在内存中的 4K 页数（mincore）。
+pub fn resident_pages(ptr: *const u8, len: usize) -> usize {
+    let page = page_size();
+    let start = ptr as usize & !(page - 1);
+    let span = (ptr as usize + len).next_multiple_of(page) - start;
+    let mut vec = vec![0u8; span / page];
+    let rc = unsafe { libc::mincore(start as *mut libc::c_void, span, vec.as_mut_ptr().cast()) };
+    if rc < 0 {
+        return 0;
+    }
+    let host_pages = vec.iter().filter(|&&b| b & 1 != 0).count();
+    (host_pages * page / 4096).min(len.div_ceil(4096))
+}
+
 /// 一个宿主文件系统的容量（statvfs）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStats {
@@ -298,6 +325,77 @@ pub fn statvfs(path: &std::path::Path) -> Result<FsStats, i32> {
         files: st.f_files as u64,
         files_free: st.f_ffree as u64,
     })
+}
+
+/// 读空一个非阻塞 fd 里现有的数据（通知用的管道）。
+pub fn drain(fd: i32) {
+    let mut buf = [0u8; 64];
+    while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+/// fd 是不是终端。
+pub fn isatty(fd: i32) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// 把宿主终端切到 raw 模式，析构时恢复原来的设置。
+pub struct RawMode {
+    fd: i32,
+    saved: libc::termios,
+}
+
+impl RawMode {
+    /// 切换 `fd` 所在的终端：关掉回显、行编辑和信号，让每个按键原样到达。
+    pub fn enter(fd: i32) -> Result<RawMode, i32> {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut t) } < 0 {
+            return Err(last_errno());
+        }
+        let saved = t;
+        unsafe { libc::cfmakeraw(&mut t) };
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(RawMode { fd, saved })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.saved) };
+    }
+}
+
+static WINCH_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_sigwinch(_: libc::c_int) {
+    let fd = WINCH_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // 只调用 async-signal-safe 的 write；管道满了说明已经有通知在等着
+        unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+    }
+}
+
+/// 宿主收到 SIGWINCH（终端窗口大小改变）时变为可读的 fd（非阻塞），只能调用一次。
+pub fn sigwinch_notifier() -> Result<i32, i32> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(last_errno());
+    }
+    for fd in fds {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    WINCH_FD.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as usize;
+    sa.sa_flags = libc::SA_RESTART;
+    if unsafe { libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut()) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(fds[0])
 }
 
 /// 跨线程唤醒用的事件：Linux 上是 eventfd，其他宿主上用管道代替。

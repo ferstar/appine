@@ -13,9 +13,12 @@ mod loader;
 mod mm;
 mod pipe;
 mod process;
+mod pseudo;
 mod signal;
 mod syscall;
 mod task;
+mod terminal;
+mod tty;
 mod uaccess;
 mod vdso;
 pub mod vfs;
@@ -23,6 +26,7 @@ pub mod vfs;
 pub use appine_engine::DbtStats;
 pub use loader::LoadError;
 pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier, run};
+pub use terminal::Terminal;
 
 use std::path::Path;
 

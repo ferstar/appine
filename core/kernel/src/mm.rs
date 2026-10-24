@@ -75,6 +75,8 @@ struct Vma {
     may_write: bool,
     /// 持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
     region: Rc<HostRegion>,
+    /// `/proc/<pid>/maps` 里显示的名字（映射的文件、程序）。
+    name: Option<Rc<[u8]>>,
     /// 这个 VMA 的起点对应的宿主地址。
     host: NonNull<u8>,
 }
@@ -95,6 +97,19 @@ pub struct Mm {
     users: Vec<Arc<TaskSync>>,
     /// vDSO 的加载地址（信号处理函数默认返回到其中的 sigreturn 跳板）。
     pub vdso: u64,
+    /// 初始栈上 argv 字符串的范围（`/proc/<pid>/cmdline`）。
+    pub args: (u64, u64),
+    /// 初始栈上 envp 字符串的范围（`/proc/<pid>/environ`）。
+    pub env: (u64, u64),
+}
+
+/// `/proc/<pid>/maps` 的一行。
+pub struct Region {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u32,
+    pub shared: bool,
+    pub name: Option<Rc<[u8]>>,
 }
 
 fn page_up(v: u64) -> Option<u64> {
@@ -130,6 +145,8 @@ impl Mm {
             generation: Arc::new(AtomicU64::new(0)),
             users: Vec::new(),
             vdso: 0,
+            args: (0, 0),
+            env: (0, 0),
         }
     }
 
@@ -235,6 +252,7 @@ impl Mm {
                 backing,
                 may_write,
                 region,
+                name: None,
                 host,
             },
         );
@@ -465,6 +483,8 @@ impl Mm {
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.vdso = self.vdso;
+        child.args = self.args;
+        child.env = self.env;
         for (&start, v) in &self.vmas {
             let (region, host) = if v.backing == Backing::Shared {
                 (v.region.clone(), v.host)
@@ -475,8 +495,55 @@ impl Mm {
                 (region, host)
             };
             child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
+            child.vmas.get_mut(&start).unwrap().name = v.name.clone();
         }
         Ok(child)
+    }
+
+    /// 给起点落在 `[start, start + len)` 里的映射起名字（`/proc/<pid>/maps` 用）。
+    pub fn label(&mut self, start: u64, len: u64, name: Rc<[u8]>) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            v.name = Some(name.clone());
+        }
+    }
+
+    /// 所有映射，按地址排列；栈、堆和 vDSO 按 Linux 的习惯命名。
+    pub fn regions(&self) -> Vec<Region> {
+        let stack = crate::loader::STACK_TOP - crate::loader::STACK_SIZE;
+        self.vmas
+            .iter()
+            .map(|(&s, v)| {
+                let special: Option<&[u8]> = if s == stack {
+                    Some(b"[stack]")
+                } else if s == self.vdso {
+                    Some(b"[vdso]")
+                } else if s >= self.brk_start && s < self.brk && self.brk_start != 0 {
+                    Some(b"[heap]")
+                } else {
+                    None
+                };
+                Region {
+                    start: s,
+                    end: s + v.len,
+                    prot: v.prot,
+                    shared: v.backing == Backing::Shared,
+                    name: v.name.clone().or_else(|| special.map(Rc::from)),
+                }
+            })
+            .collect()
+    }
+
+    /// 映射的总大小（字节）。
+    pub fn size(&self) -> u64 {
+        self.vmas.values().map(|v| v.len).sum()
+    }
+
+    /// 驻留在宿主内存里的 4K 页数。
+    pub fn resident_pages(&self) -> u64 {
+        self.vmas
+            .values()
+            .map(|v| appine_hal::resident_pages(v.host.as_ptr(), v.len as usize) as u64)
+            .sum()
     }
 
     /// guest 地址是否落在某个映射里（区分 SEGV_MAPERR 和 SEGV_ACCERR）。

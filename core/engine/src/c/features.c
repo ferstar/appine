@@ -1,6 +1,6 @@
 /*
  * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
- * HWCAP、ID 寄存器（以及以后的 /proc/cpuinfo）都从这同一份集合生成，解码器
+ * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
  * 也按它决定 AES/SHA/CRC32/LSE 等可选指令是否合法。
  */
 #include <pthread.h>
@@ -39,6 +39,12 @@ uint64_t appine_guest_hwcap(void)
 {
     pthread_once(&once, detect);
     return guest_hwcap;
+}
+
+uint64_t appine_guest_midr(void)
+{
+    pthread_once(&once, detect);
+    return host_midr;
 }
 
 bool appine_has(uint64_t hwcap)

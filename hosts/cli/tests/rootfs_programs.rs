@@ -1,15 +1,19 @@
 //! 端到端测试：把 Alpine minirootfs 导入 inode 仓库，经由 `ld-musl` 运行 busybox
-//! （M1b、M3a 的退出标准）。每个用例都分别在 Tier 0 和 Tier 1 下运行。
+//! （M1b、M3a、M3b 的退出标准）。每个用例都分别在 Tier 0 和 Tier 1 下运行。
+//!
+//! 交互式的用例用 `appine-run --pty` 在进程内 PTY 上运行 `sh -i`，经由管道发送按键
+//! （^C、^Z 就是字节 0x03、0x1a），等到输出里出现预期的文字再发下一步。
 //!
 //! rootfs 由 `scripts/fetch-rootfs` 下载到 `target/rootfs/`，也可以用环境变量
 //! `APPINE_ROOTFS_TARBALL` 指定。找不到时跳过这些测试；设置
 //! `APPINE_REQUIRE_ROOTFS=1`（CI 这样做）时改为失败。
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const TIERS: [&str; 2] = ["0", "1"];
 const PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
@@ -407,6 +411,224 @@ fn device_nodes_work() {
             ["00", "00", "00", "00", "00", "16", "full"],
             "tier {tier}: {out}"
         );
+    }
+}
+
+#[test]
+fn procfs_describes_processes() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "sleep 5 & ps -o pid,comm | grep -c sleep; grep ^Name /proc/self/status; \
+         readlink /proc/self/exe; cat /proc/self/cmdline | tr '\\0' ' '; echo; \
+         df / | tail -n 1 | grep -c ' /$'; grep -c ^processor /proc/cpuinfo | grep -vc ^0; \
+         echo piped | cat /dev/stdin; kill $!",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "1",
+                "Name:\tgrep",
+                "/usr/bin/readlink",
+                "cat /proc/self/cmdline ",
+                "1",
+                "1",
+                "piped"
+            ],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
+fn stop_and_continue_signals() {
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "sleep 5 & p=$!; kill -STOP $p; sleep 0.2; grep State /proc/$p/status; \
+         kill -CONT $p; sleep 0.2; grep State /proc/$p/status; kill $p; wait $p; echo $?",
+    ]) {
+        assert_eq!(
+            stdout(&out),
+            "State:\tT (stopped)\nState:\tS (sleeping)\n143\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// 在进程内 PTY 上运行的交互式 shell。
+struct Interactive {
+    child: Child,
+    stdin: ChildStdin,
+    output: Arc<Mutex<Vec<u8>>>,
+    /// 已经匹配过的输出长度：`expect` 只在它之后查找。
+    seen: usize,
+    tier: &'static str,
+}
+
+const PROMPT: &str = "appine$ ";
+
+impl Interactive {
+    fn start(store: &Path, tier: &'static str) -> Interactive {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args([
+                "--tier",
+                tier,
+                "--pty",
+                "--env",
+                PATH,
+                "--env",
+                "TERM=xterm",
+            ])
+            .arg(format!("--env=PS1={PROMPT}"))
+            .arg("--rootfs")
+            .arg(store)
+            .args(["--", "/bin/sh", "-i"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let mut s = Interactive {
+            child,
+            stdin,
+            output,
+            seen: 0,
+            tier,
+        };
+        s.expect(PROMPT);
+        s
+    }
+
+    fn send(&mut self, keys: &[u8]) {
+        self.stdin.write_all(keys).unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// 等到新的输出里出现 `text`。
+    fn expect(&mut self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            {
+                let out = self.output.lock().unwrap();
+                let rest = &out[self.seen..];
+                if let Some(i) = rest.windows(text.len()).position(|w| w == text.as_bytes()) {
+                    self.seen += i + text.len();
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "tier {}: timed out waiting for {text:?}; output so far:\n{}",
+                    self.tier,
+                    String::from_utf8_lossy(&out)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 退出 shell，返回它的退出码。
+    fn exit(mut self) -> Option<i32> {
+        self.send(b"exit\n");
+        self.child.wait().unwrap().code()
+    }
+}
+
+impl Drop for Interactive {
+    /// 用例失败时不留下还在等输入的 appine-run。
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn interactive_shell_runs_on_a_terminal() {
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in TIERS {
+        let mut s = Interactive::start(store, tier);
+        s.send(b"echo $((6*7)) | cat; tty; stty size\n");
+        s.expect("42\r\n");
+        s.expect("/dev/pts/0\r\n");
+        s.expect("24 80\r\n");
+        s.expect(PROMPT);
+        assert_eq!(s.exit(), Some(0), "tier {tier}");
+    }
+}
+
+#[test]
+fn ctrl_c_and_ctrl_z_control_the_foreground_job() {
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in TIERS {
+        let mut s = Interactive::start(store, tier);
+        // 子进程打印 job-42 时已经是前台进程组；输出的文字不能出现在命令行里，
+        // 否则会先匹配到回显
+        s.send(b"sh -c 'echo job-$((6*7)); exec sleep 30'\n");
+        s.expect("job-42");
+        s.send(b"\x1a");
+        s.expect("Stopped");
+        s.expect(PROMPT);
+        s.send(b"jobs\n");
+        s.expect("Stopped");
+        s.expect(PROMPT);
+        // fg 打印作业的命令之前已经把终端交给了它
+        s.send(b"fg\n");
+        s.expect("exec sleep 30");
+        s.send(b"\x03");
+        s.expect(PROMPT);
+        s.send(b"echo status $?\n");
+        s.expect("status 130");
+        s.expect(PROMPT);
+        assert_eq!(s.exit(), Some(0), "tier {tier}");
+    }
+}
+
+#[test]
+fn vi_edits_a_file() {
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in TIERS {
+        let mut s = Interactive::start(store, tier);
+        let file = format!("/tmp/vi-{tier}");
+        s.send(format!("rm -f {file}; vi {file}\n").as_bytes());
+        // 切到备用屏幕，画出状态行
+        s.expect("\x1b[?1049h");
+        s.expect("100%");
+        // vi 靠 ESC 之后有没有紧跟着的字节区分 ESC 键和转义序列，所以分开发送
+        s.send(b"ihello from vi");
+        std::thread::sleep(Duration::from_millis(300));
+        s.send(b"\x1b");
+        std::thread::sleep(Duration::from_millis(300));
+        s.send(b"oline two");
+        std::thread::sleep(Duration::from_millis(300));
+        s.send(b"\x1b");
+        std::thread::sleep(Duration::from_millis(300));
+        s.send(b":wq\r");
+        s.expect("\x1b[?1049l");
+        s.expect(PROMPT);
+        s.send(format!("cat {file}\n").as_bytes());
+        s.expect("hello from vi\r\nline two\r\n");
+        s.expect(PROMPT);
+        assert_eq!(s.exit(), Some(0), "tier {tier}");
     }
 }
 

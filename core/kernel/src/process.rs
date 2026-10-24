@@ -22,8 +22,10 @@ use crate::loader::{self, Args, LoadError};
 use crate::mm::Mm;
 use crate::signal::{self, SigAction, SigHandlers, SigInfo, sa};
 use crate::task::{self, FsContext, Task, TaskState};
-use crate::vfs::Vfs;
-use crate::vfs::store::{Ino, ROOT, mode};
+use crate::terminal::{self, Terminal};
+use crate::tty::Tty;
+use crate::vfs::store::mode;
+use crate::vfs::{Node, Pseudo, Vfs};
 
 /// 一个信号编号（1–64）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,8 @@ impl Signal {
     pub const HUP: Signal = Signal(1);
     /// 终端中断。
     pub const INT: Signal = Signal(2);
+    /// 终端退出（^\）。
+    pub const QUIT: Signal = Signal(3);
     /// 未定义指令。
     pub const ILL: Signal = Signal(4);
     /// 断点。
@@ -54,8 +58,18 @@ impl Signal {
     pub const TERM: Signal = Signal(15);
     /// 子进程状态改变。
     pub const CHLD: Signal = Signal(17);
+    /// 让停止的进程继续。
+    pub const CONT: Signal = Signal(18);
     /// 停止（不能捕获）。
     pub const STOP: Signal = Signal(19);
+    /// 终端停止（^Z）。
+    pub const TSTP: Signal = Signal(20);
+    /// 后台进程读终端。
+    pub const TTIN: Signal = Signal(21);
+    /// 后台进程写终端或修改终端设置。
+    pub const TTOU: Signal = Signal(22);
+    /// 终端窗口大小改变。
+    pub const WINCH: Signal = Signal(28);
 
     /// 最大的信号编号。
     pub const MAX: i32 = 64;
@@ -85,10 +99,9 @@ impl Signal {
         matches!(self.0, 19..=22)
     }
 
-    /// 默认动作是否是忽略。作业控制在 M3b 实现之前，停止信号也按忽略处理。
+    /// 默认动作是否是忽略：SIGCHLD、SIGCONT（它的"继续"在产生时就生效了）、SIGURG、SIGWINCH。
     pub(crate) fn ignored_by_default(self) -> bool {
-        // SIGCHLD、SIGCONT、SIGSTOP、SIGTSTP、SIGTTIN、SIGTTOU、SIGURG、SIGWINCH
-        matches!(self.0, 17..=23 | 28)
+        matches!(self.0, 17 | 18 | 23 | 28)
     }
 }
 
@@ -150,6 +163,9 @@ pub struct RunOptions {
     /// inode 仓库所在的宿主目录。设置后程序路径按 guest 路径在仓库里解析，
     /// 否则按宿主路径读取，guest 也看不到任何文件系统。
     pub rootfs: Option<PathBuf>,
+    /// 设置时，第一个进程以一个进程内 PTY 为 stdin/stdout/stderr 和控制终端，PTY 接到
+    /// 这些宿主 fd 上；否则 guest 直接使用宿主的 stdin/stdout/stderr。
+    pub terminal: Option<Terminal>,
 }
 
 /// 一次运行的结果。
@@ -246,6 +262,22 @@ pub(crate) struct ThreadGroup {
     pub zombie: Option<ExitStatus>,
     /// 退出时发给父进程的信号（clone 的低 8 位，通常是 SIGCHLD），0 表示不发。
     pub exit_signal: i32,
+    /// 控制终端。
+    pub ctty: Option<Rc<RefCell<Tty>>>,
+    /// 整个线程组被停止信号停住了。
+    pub stopped: bool,
+    /// 还没有被父进程的 wait 取走的"停止"事件。
+    pub stop_report: Option<Signal>,
+    /// 还没有被父进程的 wait 取走的"继续"事件。
+    pub cont_report: bool,
+    /// 当前程序的路径（`/proc/<pid>/exe`）。
+    pub exe: Vec<u8>,
+    /// 创建时刻，开机以来的时钟滴答数（`/proc/<pid>/stat`）。
+    pub start_ticks: u64,
+    /// 已退出线程用掉的 CPU 时间。
+    pub cpu_ns: u64,
+    /// 已回收的子进程用掉的 CPU 时间。
+    pub child_cpu_ns: u64,
 }
 
 impl ThreadGroup {
@@ -265,6 +297,14 @@ impl ThreadGroup {
             leader_code: 0,
             zombie: None,
             exit_signal: Signal::CHLD.number(),
+            ctty: None,
+            stopped: false,
+            stop_report: None,
+            cont_report: false,
+            exe: Vec::new(),
+            start_ticks: crate::pseudo::uptime_ns() / (1_000_000_000 / loader::CLOCK_TICKS),
+            cpu_ns: 0,
+            child_cpu_ns: 0,
         }
     }
 }
@@ -283,6 +323,19 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         )
     };
     let init = k.groups[&INIT].clone();
+    // 这个进程退出之后可能变成孤儿的进程组（Linux 的 kill_orphaned_pgrp）：它把同一会话里
+    // 另一个进程组和这个进程组连在一起时，是它自己的进程组；以及同一会话里、另一个进程组的子进程的
+    let (pgid, sid) = {
+        let g = group.borrow();
+        (g.pgid, g.sid)
+    };
+    let mut pgrps = Vec::new();
+    if let Some(p) = k.groups.get(&ppid) {
+        let p = p.borrow();
+        if p.pgid != pgid && p.sid == sid {
+            pgrps.push(pgid);
+        }
+    }
     for c in children {
         let Some(child) = k.groups.get(&c).cloned() else {
             continue;
@@ -290,6 +343,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         let zombie = {
             let mut cg = child.borrow_mut();
             cg.ppid = INIT;
+            if cg.pgid != pgid && cg.sid == sid {
+                pgrps.push(cg.pgid);
+            }
             cg.zombie.is_some()
         };
         if zombie {
@@ -301,6 +357,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     if tgid == FIRST_PID {
         k.session = Some(status);
     }
+    release_ctty(k, group);
 
     // 父进程是 init、已经不在了，或者忽略 SIGCHLD（SIG_IGN、SA_NOCLDWAIT）时直接回收
     let parent = k.groups.get(&ppid).cloned();
@@ -320,12 +377,63 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             signal::send_to_group(k, ppid, sig, SigInfo::child(tgid, status));
         }
     }
+    // POSIX：进程组因为这次退出变成孤儿时，如果组里有停住的进程，先发 SIGHUP 再发
+    // SIGCONT，否则它们再也没有机会继续
+    pgrps.sort_unstable();
+    pgrps.dedup();
+    for pgid in pgrps {
+        let stopped = k
+            .groups
+            .values()
+            .any(|g| g.borrow().pgid == pgid && g.borrow().stopped);
+        if stopped && signal::pgrp_orphaned(k, pgid) {
+            signal::send_to_pgrp(k, pgid, Signal::HUP, SigInfo::kernel());
+            signal::send_to_pgrp(k, pgid, Signal::CONT, SigInfo::kernel());
+        }
+    }
     request_wake();
 }
 
-/// 按 execve 的规则读取 guest 文件：必须是带执行权限的普通文件。
-pub(crate) fn read_executable(vfs: &Vfs, cwd: Ino, path: &[u8]) -> Result<Vec<u8>, Errno> {
-    let ino = vfs.resolve(cwd, path, true)?;
+/// 会话组长退出：控制终端不再属于这个会话，前台进程组收到 SIGHUP 和 SIGCONT
+/// （Linux 的 `disassociate_ctty`）。
+fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let (tgid, sid, ctty) = {
+        let g = group.borrow();
+        (g.tgid, g.sid, g.ctty.clone())
+    };
+    let Some(tty) = ctty.filter(|_| sid == tgid) else {
+        return;
+    };
+    let fg = {
+        let mut t = tty.borrow_mut();
+        if t.session != Some(sid) {
+            return;
+        }
+        t.session = None;
+        t.fg.take()
+    };
+    for g in k.groups.values() {
+        let mut g = g.borrow_mut();
+        if g.sid == sid {
+            g.ctty = None;
+        }
+    }
+    if let Some(fg) = fg {
+        signal::send_to_pgrp(k, fg, Signal::HUP, SigInfo::kernel());
+        signal::send_to_pgrp(k, fg, Signal::CONT, SigInfo::kernel());
+    }
+}
+
+/// 按 execve 的规则读取 guest 文件：必须是仓库里带执行权限的普通文件。
+pub(crate) fn read_executable(
+    vfs: &Vfs,
+    ps: &dyn Pseudo,
+    cwd: &Node,
+    path: &[u8],
+) -> Result<Vec<u8>, Errno> {
+    let Node::Store(ino) = vfs.resolve(ps, cwd, path, true)? else {
+        return Err(Errno::EACCES);
+    };
     let st = vfs.store().stat(ino)?;
     if st.kind() != mode::S_IFREG || st.mode & 0o111 == 0 {
         return Err(Errno::EACCES);
@@ -361,18 +469,13 @@ pub fn run(
         return Err(RunError::TierUnavailable);
     }
     let vfs = match &options.rootfs {
-        Some(dir) => {
-            let vfs = Vfs::open(dir).map_err(RunError::Rootfs)?;
-            if let Err(e) = crate::vfs::dev::ensure_dev_nodes(vfs.store()) {
-                crate::debug::log(format_args!("cannot create the device nodes: {e}"));
-            }
-            Some(Rc::new(vfs))
-        }
+        Some(dir) => Some(Rc::new(Vfs::open(dir).map_err(RunError::Rootfs)?)),
         None => None,
     };
     let path = program.as_bytes();
+    let offline = crate::pseudo::Offline;
     let file = match &vfs {
-        Some(vfs) => read_executable(vfs, ROOT, path).map_err(RunError::Exec)?,
+        Some(vfs) => read_executable(vfs, &offline, &Node::ROOT, path).map_err(RunError::Exec)?,
         None => std::fs::read(Path::new(program)).map_err(RunError::Io)?,
     };
     let args = Args {
@@ -382,12 +485,15 @@ pub fn run(
     };
     let mut mm = Mm::new();
     let mut read_interp = |p: &[u8]| match &vfs {
-        Some(vfs) => read_executable(vfs, ROOT, p),
+        Some(vfs) => read_executable(vfs, &offline, &Node::ROOT, p),
         None => Err(Errno::ENOENT),
     };
     let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
+    let exe: Rc<[u8]> = Rc::from(crate::vfs::normalize(&[b"/", path].concat()));
+    crate::syscall::label_image(&mut mm, &image, &exe);
 
-    let event = Arc::new(Event::new().map_err(|e| RunError::Io(io::Error::from_raw_os_error(e)))?);
+    let io_err = |e: Errno| RunError::Io(io::Error::from_raw_os_error(e.0));
+    let event = Arc::new(Event::new().map_err(|e| io_err(Errno(e)))?);
     let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
     {
         let mut k = shared.lock();
@@ -400,16 +506,32 @@ pub fn run(
         let mut cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
         cpu.state_mut().pc = image.entry;
         cpu.state_mut().sp = image.sp;
-        let group = Rc::new(RefCell::new(ThreadGroup::new(
-            tid,
-            INIT,
-            Rc::new(RefCell::new(SigHandlers::default())),
-        )));
+        let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));
+        group.exe = exe.to_vec();
+        // 有终端时，第一个进程是会话组长，PTY 是它的控制终端
+        let fds = match &options.terminal {
+            Some(term) => {
+                let (slave, tty) = terminal::create(&mut k, term);
+                {
+                    let mut t = tty.borrow_mut();
+                    t.session = Some(tid);
+                    t.fg = Some(tid);
+                }
+                group.ctty = Some(tty);
+                let mut table = FdTable::new();
+                for fd in 0..3 {
+                    table.install_at(fd, slave.clone(), false).unwrap();
+                }
+                table
+            }
+            None => FdTable::with_host_stdio(),
+        };
+        let group = Rc::new(RefCell::new(group));
         let state = TaskState {
             mm,
-            fds: Rc::new(RefCell::new(FdTable::with_host_stdio())),
+            fds: Rc::new(RefCell::new(fds)),
             fs: Rc::new(RefCell::new(FsContext {
-                cwd: ROOT,
+                cwd: Node::ROOT,
                 umask: 0o022,
             })),
             group: group.clone(),
@@ -419,13 +541,19 @@ pub fn run(
             saved_sigmask: None,
             vfork_done: None,
         };
-        let task = Task::new(tid, tid, &cpu, state, 0, comm_of(path))
-            .map_err(|e| RunError::Io(io::Error::from_raw_os_error(e.0)))?;
+        let task = Task::new(tid, tid, &cpu, state, 0, comm_of(path)).map_err(io_err)?;
         k.groups.insert(tid, group);
         k.groups[&INIT].borrow_mut().children.push(tid);
-        task::start(&shared, &mut k, task, cpu)
-            .map_err(|e| RunError::Io(io::Error::from_raw_os_error(e.0)))?;
+        k.forks += 1;
+        task::start(&shared, &mut k, task, cpu).map_err(io_err)?;
     }
+    let bridge = options.terminal.map(|term| {
+        let shared = shared.clone();
+        std::thread::Builder::new()
+            .name("terminal".into())
+            .spawn(move || terminal::bridge(shared, term))
+            .expect("cannot start the terminal thread")
+    });
 
     // 等第一个进程结束，然后结束其余的进程，等所有线程退出
     let status = wait_until(&shared, &event, |k| k.session);
@@ -445,6 +573,10 @@ pub fn run(
         }
     }
     wait_until(&shared, &event, |k| k.tasks.is_empty().then_some(()));
+    // 桥接线程把剩下的输出写完才退出
+    if let Some(b) = bridge {
+        let _ = b.join();
+    }
     let dbt_stats = shared.lock().dbt_stats;
     Ok(RunReport { status, dbt_stats })
 }

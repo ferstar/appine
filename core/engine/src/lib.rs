@@ -109,6 +109,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn appine_guest_hwcap() -> u64;
+    fn appine_guest_midr() -> u64;
 
     fn appine_dbt_new() -> *mut RawDbt;
     fn appine_dbt_free(dbt: *mut RawDbt);
@@ -456,6 +457,11 @@ impl Drop for Dbt {
 /// 宣告给 guest 的 `AT_HWCAP`：宿主支持 ∩ Tier 0 已实现 ∩ 白名单（设计文档 §4.4）。
 pub fn guest_hwcap() -> u64 {
     unsafe { appine_guest_hwcap() }
+}
+
+/// guest 读到的 `MIDR_EL1`（`/proc/cpuinfo` 用）；宿主不允许读 ID 寄存器时为 0。
+pub fn guest_midr() -> u64 {
+    unsafe { appine_guest_midr() }
 }
 
 /// HWCAP 位，取值与 Linux 的 `HWCAP_*` 一致。

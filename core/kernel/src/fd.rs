@@ -10,6 +10,9 @@ use std::rc::Rc;
 
 use crate::errno::Errno;
 use crate::pipe::PipeEnd;
+use crate::pseudo::PseudoNode;
+use crate::tty::PtyEnd;
+use crate::vfs::Node;
 use crate::vfs::dev::Device;
 use crate::vfs::store::{DirEntry, Ino};
 
@@ -24,10 +27,14 @@ pub mod oflags {
     pub const O_RDONLY: u32 = 0o0;
     /// 只写。
     pub const O_WRONLY: u32 = 0o1;
+    /// 读写。
+    pub const O_RDWR: u32 = 0o2;
     /// 不存在时创建。
     pub const O_CREAT: u32 = 0o100;
     /// 与 `O_CREAT` 合用：已存在时失败。
     pub const O_EXCL: u32 = 0o200;
+    /// 不让终端成为控制终端。
+    pub const O_NOCTTY: u32 = 0o400;
     /// 截断。
     pub const O_TRUNC: u32 = 0o1000;
     /// 追加写。
@@ -61,13 +68,13 @@ pub enum FileKind {
     },
     /// 目录。目录项在第一次 getdents 时取一份快照，lseek 到 0 时丢弃。
     Directory {
-        /// inode。
-        ino: Ino,
+        /// 目录节点（仓库里的，或者合成文件系统里的）。
+        node: Node,
         /// 目录项快照（含 `.` 和 `..`）。
         entries: Option<Vec<DirEntry>>,
     },
     /// `O_PATH` 打开的文件：只能作为 `*at` 的起点或 fstat 的对象。
-    Path(Ino),
+    Path(Node),
     /// 管道的一端。
     Pipe(PipeEnd),
     /// 字符设备（`/dev/null` 等），`ino` 是仓库里的设备节点。
@@ -76,6 +83,15 @@ pub enum FileKind {
         ino: Ino,
         /// 设备。
         dev: Device,
+    },
+    /// PTY 的主设备或从设备。
+    Pty(PtyEnd),
+    /// procfs 的文件：打开时生成的内容。
+    Proc {
+        /// 节点。
+        node: PseudoNode,
+        /// 内容。
+        data: Vec<u8>,
     },
 }
 
@@ -87,15 +103,23 @@ pub struct OpenFile {
     pub flags: u32,
     /// 文件位置；目录是下一个目录项的下标。
     pub pos: u64,
+    /// `/proc/<pid>/fd/<n>` 显示的路径（打开时的绝对路径）。
+    pub path: Option<Rc<[u8]>>,
 }
 
 impl OpenFile {
     /// 新建打开文件。
     pub fn new(kind: FileKind, flags: u32) -> FileRef {
+        Self::with_path(kind, flags, None)
+    }
+
+    /// 新建打开文件，并记下打开时的绝对路径。
+    pub fn with_path(kind: FileKind, flags: u32, path: Option<Rc<[u8]>>) -> FileRef {
         Rc::new(RefCell::new(OpenFile {
             kind,
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
+            path,
         }))
     }
 
@@ -109,14 +133,21 @@ impl OpenFile {
         self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_RDONLY
     }
 
-    /// 对应的 inode（宿主 fd 和管道没有）。
-    pub fn ino(&self) -> Option<Ino> {
+    /// 对应的文件系统节点（宿主 fd、管道和 PTY 没有）。
+    pub fn node(&self) -> Option<Node> {
         match &self.kind {
-            FileKind::Host(_) | FileKind::Pipe(_) => None,
-            FileKind::Regular { ino, .. }
-            | FileKind::Directory { ino, .. }
-            | FileKind::Path(ino)
-            | FileKind::Device { ino, .. } => Some(*ino),
+            FileKind::Host(_) | FileKind::Pipe(_) | FileKind::Pty(_) => None,
+            FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
+            FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
+            FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),
+        }
+    }
+
+    /// 仓库里的 inode（chmod、chown 等只对它们有意义）。
+    pub fn ino(&self) -> Option<Ino> {
+        match self.node() {
+            Some(Node::Store(ino)) => Some(ino),
+            _ => None,
         }
     }
 
@@ -203,6 +234,16 @@ impl FdTable {
             .and_then(|i| self.slots.get_mut(i))
             .ok_or(Errno::EBADF)?;
         slot.take().map(|_| ()).ok_or(Errno::EBADF)
+    }
+
+    /// 所有打开着的 fd，从小到大。
+    pub fn open_fds(&self) -> Vec<i32> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_some())
+            .map(|(i, _)| i as i32)
+            .collect()
     }
 
     /// execve：关闭所有带 close-on-exec 标志的 fd。

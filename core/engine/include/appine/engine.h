@@ -120,6 +120,9 @@ struct appine_cpu {
 /* 宣告给 guest 的 AT_HWCAP：宿主支持 ∩ Tier 0 已实现 ∩ 白名单 */
 uint64_t appine_guest_hwcap(void);
 
+/* guest 读到的 MIDR_EL1（宿主不允许读 ID 寄存器时为 0） */
+uint64_t appine_guest_midr(void);
+
 /* ---- soft-MMU 页表（设计文档 §5.1）---- */
 
 enum {

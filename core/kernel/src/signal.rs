@@ -14,7 +14,7 @@ use std::rc::Rc;
 use appine_engine::Cpu;
 
 use crate::errno::Errno;
-use crate::kernel::{Cx, Kernel, Tid};
+use crate::kernel::{Cx, Kernel, Tid, request_wake};
 use crate::process::{ExitStatus, Signal, ThreadGroup};
 use crate::syscall::Flow;
 use crate::task::Task;
@@ -22,6 +22,8 @@ use crate::uaccess::UserSlice;
 
 /// sigaction 的 flags。
 pub(crate) mod sa {
+    /// 子进程停止和继续时不发 SIGCHLD。
+    pub const NOCLDSTOP: u64 = 0x1;
     /// 子进程退出时不变成僵尸。
     pub const NOCLDWAIT: u64 = 0x2;
     /// 处理函数接收 siginfo 和 ucontext。
@@ -108,6 +110,10 @@ pub(crate) mod code {
     pub const CLD_EXITED: i32 = 1;
     /// 子进程被信号终止。
     pub const CLD_KILLED: i32 = 2;
+    /// 子进程停止。
+    pub const CLD_STOPPED: i32 = 5;
+    /// 停止的子进程继续。
+    pub const CLD_CONTINUED: i32 = 6;
     /// 地址没有映射。
     pub const SEGV_MAPERR: i32 = 1;
     /// 地址没有相应的权限。
@@ -170,12 +176,17 @@ impl SigInfo {
         }
     }
 
-    /// 子进程状态改变时发给父进程的 SIGCHLD。
+    /// 子进程退出时发给父进程的 SIGCHLD。
     pub fn child(pid: Tid, status: ExitStatus) -> SigInfo {
         let (code, status) = match status {
             ExitStatus::Exited(c) => (code::CLD_EXITED, c),
             ExitStatus::Signaled { signal, .. } => (code::CLD_KILLED, signal.number()),
         };
+        Self::child_event(pid, code, status)
+    }
+
+    /// 子进程状态改变（`CLD_*`）时发给父进程的 SIGCHLD。
+    pub fn child_event(pid: Tid, code: i32, status: i32) -> SigInfo {
         SigInfo {
             code,
             fields: InfoFields::Child {
@@ -325,6 +336,60 @@ fn killed_by(sig: Signal) -> ExitStatus {
     }
 }
 
+/// 停止信号：SIGSTOP、SIGTSTP、SIGTTIN、SIGTTOU。
+const STOP_SIGNALS: u64 = (1 << (19 - 1)) | (1 << (20 - 1)) | (1 << (21 - 1)) | (1 << (22 - 1));
+
+/// 产生信号时立即生效的部分（Linux 的 `prepare_signal`）：停止信号丢掉挂起的 SIGCONT；
+/// SIGCONT 丢掉挂起的停止信号，并让停住的线程组继续，不管它是否被屏蔽或忽略。
+fn prepare(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, sig: Signal) {
+    let clear = |mask: u64| {
+        let mut g = group.borrow_mut();
+        g.pending &= !mask;
+        for t in g.threads.iter().filter_map(|t| k.tasks.get(t)) {
+            t.pending.set(t.pending.get() & !mask);
+        }
+    };
+    if sig.is_stop() {
+        clear(Signal::CONT.bit());
+    } else if sig == Signal::CONT {
+        clear(STOP_SIGNALS);
+        let resumed = {
+            let mut g = group.borrow_mut();
+            let was = std::mem::take(&mut g.stopped);
+            if was {
+                g.stop_report = None;
+                g.cont_report = true;
+            }
+            was
+        };
+        if resumed {
+            notify_parent(k, group, code::CLD_CONTINUED, Signal::CONT.number());
+            request_wake();
+        }
+    }
+}
+
+/// 子进程停止或继续时通知父进程：唤醒在 wait 的父进程，没有设置 `SA_NOCLDSTOP` 时发 SIGCHLD。
+fn notify_parent(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, code: i32, status: i32) {
+    let (tgid, ppid) = {
+        let g = group.borrow();
+        (g.tgid, g.ppid)
+    };
+    request_wake();
+    let Some(parent) = k.groups.get(&ppid) else {
+        return;
+    };
+    let act = parent.borrow().sighand.borrow().get(Signal::CHLD);
+    if act.flags & sa::NOCLDSTOP == 0 {
+        send_to_group(
+            k,
+            ppid,
+            Signal::CHLD,
+            SigInfo::child_event(tgid, code, status),
+        );
+    }
+}
+
 /// 给一个线程发信号（tkill、SIGPIPE 等）。
 pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) {
     let Some(group) = k.groups.get(&task.tgid).cloned() else {
@@ -334,6 +399,7 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
         group_exit(k, &group, killed_by(sig));
         return;
     }
+    prepare(k, &group, sig);
     let blocked = task.sigmask.get() & sig.bit() != 0;
     // 被屏蔽的信号即使当前被忽略也要挂起：解除屏蔽之前处理方式可能会变
     if !blocked && group.borrow().sighand.borrow().ignores(sig) {
@@ -364,6 +430,7 @@ pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
         group_exit(k, &group, killed_by(sig));
         return;
     }
+    prepare(k, &group, sig);
     let ignored = group.borrow().sighand.borrow().ignores(sig);
     if ignored && leader.sigmask.get() & sig.bit() == 0 {
         return;
@@ -376,6 +443,33 @@ pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
     if let Some(t) = threads.iter().find(|t| t.sigmask.get() & sig.bit() == 0) {
         wake(t);
     }
+}
+
+/// 给进程组里的每个进程发信号（终端产生的信号、kill 负数 pid）。
+pub(crate) fn send_to_pgrp(k: &Kernel, pgid: Tid, sig: Signal, info: SigInfo) {
+    let members: Vec<Tid> = k
+        .groups
+        .values()
+        .filter(|g| g.borrow().pgid == pgid)
+        .map(|g| g.borrow().tgid)
+        .collect();
+    for tgid in members {
+        send_to_group(k, tgid, sig, info);
+    }
+}
+
+/// 孤儿进程组：组里没有一个进程的父进程在同一会话的另一个进程组里。这样的进程组
+/// 被停住之后没有人能让它继续，所以终端产生的停止信号对它无效。
+pub(crate) fn pgrp_orphaned(k: &Kernel, pgid: Tid) -> bool {
+    !k.groups.values().any(|g| {
+        let g = g.borrow();
+        g.pgid == pgid
+            && g.zombie.is_none()
+            && k.groups.get(&g.ppid).is_some_and(|p| {
+                let p = p.borrow();
+                p.pgid != pgid && p.sid == g.sid
+            })
+    })
 }
 
 /// 同步异常：信号被屏蔽或被忽略时恢复默认处理并解除屏蔽（Linux 的 `force_sig_info`），
@@ -433,10 +527,44 @@ fn dequeue(cx: &mut Cx<'_>) -> Option<(Signal, SigInfo)> {
     None
 }
 
-/// 有没有可以投递的信号，或者线程已经被要求退出（等待中的 syscall 据此提前返回）。
+/// 有没有可以投递的信号，线程组是否被停住，或者线程已经被要求退出（等待中的 syscall
+/// 据此提前返回）。
 pub(crate) fn interrupted(cx: &Cx<'_>) -> bool {
     let mask = cx.task.sigmask.get();
-    cx.task.killed.get() || (cx.task.pending.get() | cx.t.group.borrow().pending) & !mask != 0
+    let g = cx.t.group.borrow();
+    cx.task.killed.get() || g.stopped || (cx.task.pending.get() | g.pending) & !mask != 0
+}
+
+/// 停住整个线程组（停止信号的默认动作）：通知父进程，打断其他线程，让它们也停下来。
+fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
+    let group = cx.t.group.clone();
+    let threads = {
+        let mut g = group.borrow_mut();
+        g.stopped = true;
+        g.stop_report = Some(sig);
+        g.cont_report = false;
+        g.threads.clone()
+    };
+    for t in threads.iter().filter_map(|t| cx.kr().tasks.get(t)) {
+        if !Rc::ptr_eq(t, cx.task) {
+            wake(t);
+        }
+    }
+    notify_parent(cx.kr(), &group, code::CLD_STOPPED, sig.number());
+}
+
+/// 线程组停住期间，在这里等到 SIGCONT 或者被结束。
+fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
+    loop {
+        if cx.task.killed.get() {
+            return Flow::Exit;
+        }
+        if !cx.t.group.borrow().stopped {
+            return Flow::Continue;
+        }
+        // 只有 SIGCONT、SIGKILL 能让它离开这里，所以不检查其他信号
+        let _ = cx.wait(None, &mut []);
+    }
 }
 
 /// 返回 guest 之前：处理 syscall 重启，投递所有可以投递的信号。
@@ -464,17 +592,26 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             st.pc -= 4;
         }
     }
+    // 线程组被别的线程停住了：在返回 guest 之前一起停下
+    if let Flow::Exit = wait_while_stopped(cx) {
+        return Flow::Exit;
+    }
 
     let mut handled = false;
     while let Some((sig, info)) = dequeue(cx) {
         let act = cx.t.group.borrow().sighand.borrow().get(sig);
         match act.handler {
             SigAction::IGNORE => continue,
-            SigAction::DEFAULT if sig.ignored_by_default() => {
-                if sig.is_stop() {
-                    crate::debug::log(format_args!(
-                        "job control is not supported yet; {sig} ignored"
-                    ));
+            SigAction::DEFAULT if sig.ignored_by_default() => continue,
+            SigAction::DEFAULT if sig.is_stop() => {
+                // 孤儿进程组不响应终端产生的停止信号（SIGSTOP 除外）
+                let pgid = cx.t.group.borrow().pgid;
+                if sig != Signal::STOP && pgrp_orphaned(cx.kr(), pgid) {
+                    continue;
+                }
+                group_stop(cx, sig);
+                if let Flow::Exit = wait_while_stopped(cx) {
+                    return Flow::Exit;
                 }
                 continue;
             }

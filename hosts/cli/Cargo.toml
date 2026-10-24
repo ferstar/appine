@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+appine-hal.workspace = true
 appine-kernel.workspace = true
 
 [dev-dependencies]

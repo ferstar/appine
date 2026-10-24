@@ -108,13 +108,17 @@ pub struct Args<'a> {
     pub execfn: &'a [u8],
 }
 
-/// 加载结果：guest 开始执行时的 pc 和 sp。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 加载结果：guest 开始执行时的 pc 和 sp，以及程序和解释器所在的地址范围。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     /// 入口地址（有解释器时是解释器的入口）。
     pub entry: u64,
     /// 初始栈指针，指向 argc。
     pub sp: u64,
+    /// 主程序映射的 `[起点, 终点)`。
+    pub main: (u64, u64),
+    /// 解释器的路径和映射的 `[起点, 终点)`。
+    pub interp: Option<(Vec<u8>, u64, u64)>,
 }
 
 struct Segment {
@@ -339,6 +343,7 @@ pub fn load(
     let main = exe.map(mm, bias)?;
 
     let mut interp_base = 0;
+    let mut interp_range = None;
     let mut entry = main.entry;
     if let Some(path) = &exe.interp {
         let data = read_interp(path).map_err(|e| LoadError::Interpreter(path.clone(), e))?;
@@ -357,6 +362,7 @@ pub fn load(
             main.bias + exe.span().0
         ));
         interp_base = loaded.bias + lo;
+        interp_range = Some((path.clone(), interp_base, loaded.end));
         entry = loaded.entry;
     }
 
@@ -398,8 +404,25 @@ pub fn load(
         (AT_EXECFN, 0),
         (AT_PLATFORM, 0),
     ];
-    let sp = build_stack(mm, args, &auxv, &random)?;
-    Ok(Image { entry, sp })
+    let StackLayout { sp, args, env } = build_stack(mm, args, &auxv, &random)?;
+    mm.args = args;
+    mm.env = env;
+    Ok(Image {
+        entry,
+        sp,
+        main: (main.bias + exe.span().0, main.end),
+        interp: interp_range,
+    })
+}
+
+/// 初始栈的布局。
+struct StackLayout {
+    /// 指向 argc 的栈指针。
+    sp: u64,
+    /// argv 字符串所在的范围。
+    args: (u64, u64),
+    /// envp 字符串所在的范围。
+    env: (u64, u64),
 }
 
 /// 按 Linux 的布局构造初始栈：
@@ -411,13 +434,14 @@ pub fn load(
 /// STACK_TOP
 /// ```
 ///
-/// `auxv` 里 `AT_RANDOM`、`AT_EXECFN`、`AT_PLATFORM` 的值在这里填入。
+/// `auxv` 里 `AT_RANDOM`、`AT_EXECFN`、`AT_PLATFORM` 的值在这里填入。返回 sp，以及
+/// argv、envp 字符串所在的范围。
 fn build_stack(
     mm: &Mm,
     args: &Args<'_>,
     auxv: &[(u64, u64)],
     random: &[u8; 16],
-) -> Result<u64, LoadError> {
+) -> Result<StackLayout, LoadError> {
     const PLATFORM: &[u8] = b"aarch64";
     let (argv, envp) = (args.argv, args.envp);
     let extra = [args.execfn, PLATFORM];
@@ -443,14 +467,17 @@ fn build_stack(
     };
     let random_at = put(random, false)?;
     let mut table = vec![argv.len() as u64];
+    let args_start = random_at + random.len() as u64;
     for s in argv {
         table.push(put(s, true)?);
     }
     table.push(0);
+    let env_start = args_start + argv.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
     for s in envp {
         table.push(put(s, true)?);
     }
     table.push(0);
+    let env_end = env_start + envp.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
     let execfn_at = put(args.execfn, true)?;
     let platform_at = put(PLATFORM, true)?;
     for &(key, value) in auxv {
@@ -467,7 +494,11 @@ fn build_stack(
     let sp = (strings_start - table.len() as u64 * 8) & !15;
     let bytes: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
     mm.write_kernel(sp, &bytes).map_err(LoadError::Memory)?;
-    Ok(sp)
+    Ok(StackLayout {
+        sp,
+        args: (args_start, env_start),
+        env: (env_start, env_end),
+    })
 }
 
 fn to_prot(flags: u32) -> u32 {
@@ -628,6 +659,10 @@ mod tests {
             .unwrap();
         assert_ne!(random, [0; 16]);
         assert_eq!(aux[&AT_MINSIGSTKSZ], crate::signal::MIN_SIGSTKSZ);
+        // /proc/<pid>/cmdline 和 environ 读的范围
+        assert_eq!(mm.args.1 - mm.args.0, b"prog\0arg1\0".len() as u64);
+        assert_eq!(mm.read_cstr(mm.args.0, 64).unwrap(), b"prog");
+        assert_eq!((mm.env.0, mm.env.1 - mm.env.0), (mm.args.1, 4));
         // vDSO 只读可执行，开头是 ELF 头
         let vdso = aux[&AT_SYSINFO_EHDR];
         assert_eq!(vdso, mm.vdso);
