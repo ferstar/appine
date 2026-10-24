@@ -1,7 +1,12 @@
 //! 编译 C 引擎（设计文档 §13.1：引擎用 C17 + aarch64 汇编）。
 
 fn main() {
-    let sources = ["src/c/cpu.c", "src/c/interp.c", "src/c/mmu.c"];
+    let sources = [
+        "src/c/cpu.c",
+        "src/c/dbt.c",
+        "src/c/interp.c",
+        "src/c/mmu.c",
+    ];
     for path in sources
         .iter()
         .chain(&["src/c/internal.h", "include/appine/engine.h"])

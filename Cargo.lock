@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "appine-bench"
+version = "0.0.0"
+
+[[package]]
 name = "appine-engine"
 version = "0.0.0"
 dependencies = [
@@ -36,6 +40,7 @@ dependencies = [
 name = "appine-run"
 version = "0.0.0"
 dependencies = [
+ "appine-bench",
  "appine-kernel",
 ]
 

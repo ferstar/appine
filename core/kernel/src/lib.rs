@@ -10,5 +10,6 @@ mod process;
 mod syscall;
 mod uaccess;
 
+pub use appine_engine::DbtStats;
 pub use loader::LoadError;
-pub use process::{ExitStatus, RunError, Signal, run};
+pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier, run};

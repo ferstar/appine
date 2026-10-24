@@ -100,8 +100,9 @@ guest 是 **aarch64**，直接使用 Alpine 官方 aarch64 仓库。这样选有
 - 分发采用 `[[clang::musttail]]` 尾调用的 threaded 风格。
 - 和 Tier 1 共享 guest 状态布局、soft-MMU 接口和异常上报接口。
 
-**Tier 1：同 ISA 直通式 DBT。**
-- guest 的 x0–x30 一一对应宿主的 x0–x30。只读写寄存器的 ALU、FP、NEON 指令**原样拷贝**。
+**Tier 1：同 ISA 直通式 DBT。** M2 的原型在 `core/engine/src/c/dbt.c`，用 `appine-run --tier 1` 启用。
+- **寄存器约定**：guest 的 X0–X15、X19–X27、X29、X30 放在同号的宿主寄存器里；宿主 X28 指向 CPU 上下文，X16–X18 是临时寄存器。guest 自己的 X16、X17、X18、X28 和 SP 存放在上下文里（"被占用的寄存器"）：引用它们的指令先把值读进临时寄存器，改写寄存器字段后执行，再写回。guest 的 NZCV 就是宿主的 NZCV，所以插入的代码一律不改动条件标志（用 `cbnz`/`tbnz`/`eor` 代替 `cmp`）。
+- 只读写寄存器的 ALU 指令（以后还有 FP、NEON 指令）**原样拷贝**。
 - 只有以下几类指令需要改写：
   - 访存指令：插入 soft-MMU 的 TLB 快速路径。
   - 分支和 PC 相对寻址（`adr`/`adrp`/`ldr literal`）：改成以 guest PC 为基准的常量。
@@ -111,13 +112,16 @@ guest 是 **aarch64**，直接使用 Alpine 官方 aarch64 仓库。这样选有
   - `ldxr…stxr` 序列：见 4.5。
   - `dc zva`、`dc cvau`、`ic ivau`：它们的操作数是 guest 地址，需要先翻译。
   - PAC 系列 HINT 指令（`PACIASP`/`AUTIASP` 等）：改写为 NOP，见 4.4。
+- **访存快速路径**（约 10 条宿主指令）：算出 guest 地址 → 跨页检查 → 用一条 `ldp` 取出 TLB 表项的 tag 和 addend → 比较 → 访问 `addend + 地址`。TLB 未命中、跨页或 SP 未对齐时退出到分发器，由 Tier 0 执行这一条指令；这时指令还没有产生任何副作用，所以异常是精确的。
+- **控制流**：直接分支通过块链接回填成一条 `b`；间接分支（`br`/`blr`/`ret`）先查一张 4096 项的跳转缓存，未命中再回到分发器。每个块入口检查 kick 标志，链接成环的循环也能被打断。
+- Tier 0 不认识的指令同样交给 Tier 0 执行，保证两层的白名单完全一致（§4.4）。
 - 精确状态几乎是免费的：宿主 `ucontext` 里的寄存器就是 guest 寄存器，被占用的寄存器另外保存在上下文里。
 - 文件映射的代码，其翻译结果按 `(inode, offset)` **跨进程共享**，这样 `./configure` 产生的大量短命进程不必每次重新翻译。
-- 已知难点：
-  - 要占用 1–2 个宿主寄存器存上下文指针和 TLB 基址。guest 指令用到这些寄存器时，要改写成访问上下文中保存的值。
-  - TLB 查找需要临时寄存器，要在基本块内做活跃性分析，找不到空闲寄存器时就溢出到内存。
-  - guest 的 `sp` 是 guest 地址，栈访问同样要经过翻译。
-- JIT 代码页使用 **W^X 双映射**：同一个 memfd 映射两次，一份 RW 用来写入，一份 RX 用来执行。
+- 原型还没处理的问题：
+  - **自修改代码和映射变化**：翻译结果不会自动失效，`ic ivau`、munmap、mprotect 都要触发失效。Tier 1 成为默认执行层之前必须解决。
+  - **宿主 X18**：Android 上它是平台保留寄存器（ShadowCallStack 会用到），原型拿它当临时寄存器。正式版要么换掉它，要么在宿主信号入口先恢复它。
+  - LL/SC 序列，见 4.5。
+- JIT 代码页使用 **W^X 双映射**：同一个 memfd 映射两次，一份 RW 用来写入，一份 RX 用来执行。原型目前直接映射成 RWX。
 
 **否决了以 dynarmic 为核心的方案**，见 §15。dynarmic 是 0BSD 许可，可以直接借用它的 A64 解码表（`frontend/A64/decoder`）和测试用例。
 
@@ -408,7 +412,8 @@ core/kernel/     Rust 内核层
 core/hal/        宿主抽象层（Android 与 Linux 共用一套实现）
 hosts/cli/       appine-run（开发用 CLI 前端）及 guest 端到端测试
 tests/guest/     手写的 guest 汇编测试程序
-tests/lockstep/  指令级 lockstep：原生跳板、随机指令生成、比对
+tests/lockstep/  指令级 lockstep：原生跳板、随机指令生成，同时比对 Tier 0 和 Tier 1
+tests/bench/     M2 性能探针：独立编译的基准程序和测量工具 appine-bench
 scripts/dev      在 Linux arm64 容器里运行命令
 android/         Gradle 工程（Kotlin 外壳、vendored 终端库），M5 加入
 docs/            设计文档
@@ -419,7 +424,8 @@ docs/            设计文档
 ### 13.3 开发环境与测试
 
 - 主要的开发和测试宿主是 Mac 上的 **Linux arm64 虚拟机**（colima、OrbStack 或 Lima），90% 的工作不需要碰手机。`scripts/dev <命令>` 会在一个 arm64 Linux 容器里运行命令，比如 `scripts/dev cargo test --workspace`；Docker daemon 配了代理时，容器会自动沿用。
-- CI 跑在 GitHub 的 `ubuntu-24.04-arm` runner 上，依次执行格式检查、clippy、全部测试（含 lockstep 和 guest 程序）、加长的 lockstep，以及用 clang 编译的引擎测试。
+- CI 跑在 GitHub 的 `ubuntu-24.04-arm` runner 上，依次执行格式检查、clippy、全部测试（含 lockstep、guest 程序和基准程序在两个执行层下的输出比对）、加长的 lockstep、性能探针，以及用 clang 编译的引擎测试。
+- 性能探针：`cargo build --release -p appine-run -p appine-bench` 之后运行 `appine-bench`，它分别以原生、Tier 0、Tier 1 运行 `tests/bench/programs/` 下的程序，要求输出逐字相同，并打印耗时比。
 - 测试分为五层：
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。
   2. musl libc-test，加上 LTP 中挑选出的 syscall 和信号子集。
@@ -431,11 +437,14 @@ docs/            设计文档
 
 ## 14. 里程碑
 
+按执行顺序排列。编号保持不变，所以 M2 排在 M1a 之前。
+
 | 里程碑 | 内容 | 退出标准 |
 |---|---|---|
 | **M0 骨架** ✅ | 仓库结构、引擎与内核层的工程、`appine-run`、CI、lockstep 测试框架 | 手写的静态 aarch64 程序（`write` + `exit`）能在解释器里跑通；lockstep 测试进入 CI |
-| **M1 加载程序** | ELF 加载器（静态 + PIE）、auxv、初始栈、soft-MMU v1、基础 syscall、inode 仓库 v1 + minirootfs 导入 | `appine-run /bin/busybox ls /` 跑通（经过 `ld-musl`） |
-| **M2 性能探针** ⚠️ | 原型 Tier 1：整数指令 + 访存 + 分支 + 内联 TLB | 在 CoreMark 类计算循环、`gzip`、`sha256sum` 上测出实际开销，**根据数据复核 3–5 倍的目标** |
+| **M2 性能探针** ✅ | 原型 Tier 1：整数指令 + 访存 + 分支 + 内联 TLB + 块链接；独立编译的整数基准程序（不依赖 libc、不用 SIMD） | 测出原生、Tier 0、Tier 1 的耗时比，**按判定规则复核 3–5 倍的目标**；M1 完成后用 busybox `gzip`/`sha256sum` 补测 |
+| **M1a 指令集补全** | SIMD&FP、LL/SC 独占访问、按 §4.4 宣告 HWCAP；lockstep 扩展到这些指令 | lockstep 覆盖 SIMD&FP 和独占访问，并在 CI 中通过 |
+| **M1b 加载程序** | ELF 加载器（PIE、`ld-musl`）、完整 auxv、soft-MMU v1（mmap/brk/mprotect）、基础 syscall、inode 仓库 v1 + minirootfs 导入 | `appine-run /bin/busybox ls /` 跑通（经过 `ld-musl`） |
 | **M3 交互式 shell** | fork/execve/wait4、信号帧、管道、PTY + 行规程、作业控制 | `ash` 下管道、Ctrl-C、Ctrl-Z/`fg`、`vi` 都正常 |
 | **M4 网络 + apk** | socket 透传、DNS 存根、netlink 模拟、硬链接、AES/SHA 指令 | `apk update && apk add git python3` 成功，`git clone https://…` 成功 |
 | **M5 Android 外壳** | Kotlin App、vendored 终端库、`specialUse` 前台服务、首次启动流程 | 真机上装好即用；4K/16K 页设备都通过；**提交 Play 内部测试或封闭测试轨道** |
@@ -446,9 +455,39 @@ docs/            设计文档
 
 排序依据：
 
-- **最没把握的前提最先验证**：M2 用实测数据检验 soft-MMU + DBT 的性能。
+- **最没把握的前提最先验证**：M2 用实测数据检验 soft-MMU + DBT 的性能。M0 已经提供了静态 ELF 加载器和 soft-MMU，M2 不需要等 M1，所以提前到 M1 之前，免得 M1 在内存模型上大量投入之后才发现要返工。
+- **M2 的判定规则**（事先定好）：Tier 1 相对原生 ≤ 3 倍，按原计划继续；3–5 倍，继续，同时记下优化方向；做完块链接、内联 TLB 这些明显的优化之后仍然 > 5 倍，就在开始 M1 之前重新审视决策 4（soft-MMU）。
+- **M1 拆成两步**：M1a 补全解释器的指令集（工作量最大，而且可以完全靠 lockstep 验证），M1b 打通加载和系统调用路径。
 - **只能在真机或 Play 上暴露的风险尽早撞上**：放在 M5，而不是最后。
 - **先有负载，再做 DBT**：Tier 1 正式版排在 B 档负载之后，这样有真实负载可测。C 档放到最后，因为它同时依赖精确信号和成熟的 DBT。
+
+### M2 结果（2026-10-24）
+
+**结论：Tier 1 相对原生的几何平均是 1.85 倍，落在"≤ 3 倍，按原计划继续"一档。决策 4（soft-MMU）和决策 5（分层引擎）不需要改动，下一步做 M1a。**
+
+测量条件：Apple Silicon 上 colima 起的 arm64 Linux 虚拟机（4 核）；基准程序用 gcc `-O2 -mgeneral-regs-only` 静态编译，不依赖 libc，见 `tests/bench/programs/`；原生和 Tier 1 各运行 5 次取最短耗时，Tier 0 运行 1 次；三种方式的输出逐字相同。
+
+| 程序 | 负载 | 原生 | Tier 0 | Tier 1 |
+|---|---|---|---|---|
+| sha256 | 32 位 ALU | 0.287s | 65.7× | 1.36× |
+| lz | 访存、分支 | 0.239s | 49.7× | 1.97× |
+| sort | 访存、难预测的分支 | 0.318s | 23.3× | 1.64× |
+| crc32 | 查表 | 0.311s | 18.5× | 2.17× |
+| vm | 间接分支 | 0.290s | 73.6× | 2.29× |
+| **几何平均** | | | **40.1×** | **1.85×** |
+
+翻译统计（`appine-run --stats`）：约 55% 的 guest 指令原样拷贝，5–13% 因为用到被占用的寄存器或 SP 而改写，13–22% 是改写成快速路径的访存指令，没有指令退回 Tier 0。开销基本按访存比例增长：ALU 为主的 sha256 最低，以访存和间接分支为主的 crc32、vm 最高。
+
+这个数字偏乐观，原因有四：
+
+1. **宿主核心很宽**。Apple Silicon 能把插入的整数指令大量并行吸收，手机上的中核、小核未必如此。CI 已加入同样的探针（GitHub 的 arm64 runner），可以拿到第二种微架构的数据；M5 再到真机上测。
+2. **只有整数负载**。没有 SIMD、没有 libc，热循环里也没有 syscall。M1 完成后要用 busybox `gzip`/`sha256sum` 补测。
+3. **原型缺少一些功能**。自修改代码的失效检查、LL/SC、SIMD 访存都还没做；加上之后，访存路径的成本应该大致相同，但还要实测确认。
+4. **单线程**，也没有信号投递。
+
+如果补测结果变差，手上的优化方向有：同一基本块内对同一页的 TLB 检查外提；把 guest SP 常驻在一个宿主寄存器里，省掉每次栈访问前的一条 `ldr`；基址对齐已知时省掉跨页检查；`ret` 改用宿主的返回地址预测，不走跳转缓存。
+
+Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考，而且还没用上设计里的尾调用分发。
 
 ---
 
@@ -478,11 +517,12 @@ docs/            设计文档
 
 | # | 风险或假设 | 何时验证 | 退路 |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 | 调整性能目标；做块内 TLB 检查外提等更激进的优化 |
+| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（见 §14）；M1 后用 busybox 补测，M5 上真机 | 调整性能目标；做块内 TLB 检查外提等更激进的优化 |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | M5 | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前 | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
-| R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | M2 / M7 | 整段改写成 CAS，或者整段走慢路径 |
+| R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | M1a / M7 | 整段改写成 CAS，或者整段走慢路径 |
 | R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | M4 | 按 syscall 批量合并提交 |
+| R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | M5 | 换用别的临时寄存器，代价是多占用一个 guest 寄存器；或者在宿主信号入口恢复 X18 |
 | A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | M3 | 无论结论如何，vDSO 跳板都要提供 |
 | A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | 仅影响 §15 的论证 | — |
 | A3 | dynarmic 内存回调拿不到精确 guest 状态（根据接口签名推断） | 仅影响 §15 的论证 | — |

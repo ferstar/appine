@@ -7,7 +7,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use appine_engine::{Cpu, Exit, FaultKind};
+use appine_engine::{Cpu, Dbt, DbtStats, Exit, FaultKind};
 
 use crate::loader::{self, LoadError};
 use crate::mm::Mm;
@@ -64,6 +64,32 @@ pub enum ExitStatus {
     },
 }
 
+/// 执行引擎（设计文档 §4.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tier {
+    /// Tier 0：解释器。
+    #[default]
+    Interpreter,
+    /// Tier 1：同 ISA 直通式 DBT（M2 原型，只支持 aarch64 Linux 宿主）。
+    Dbt,
+}
+
+/// 运行选项。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    /// 执行引擎。
+    pub tier: Tier,
+}
+
+/// 一次运行的结果。
+#[derive(Debug, Clone, Copy)]
+pub struct RunReport {
+    /// guest 的结束方式。
+    pub status: ExitStatus,
+    /// 使用 Tier 1 时的统计。
+    pub dbt_stats: Option<DbtStats>,
+}
+
 /// guest 没能开始运行的原因。
 #[derive(Debug)]
 pub enum RunError {
@@ -71,6 +97,8 @@ pub enum RunError {
     Io(io::Error),
     /// 加载失败。
     Load(LoadError),
+    /// 当前宿主不支持所选的执行引擎。
+    TierUnavailable,
 }
 
 impl fmt::Display for RunError {
@@ -78,6 +106,9 @@ impl fmt::Display for RunError {
         match self {
             RunError::Io(err) => err.fmt(f),
             RunError::Load(err) => err.fmt(f),
+            RunError::TierUnavailable => {
+                f.write_str("the selected tier is not supported on this host")
+            }
         }
     }
 }
@@ -85,7 +116,16 @@ impl fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 /// 从宿主路径 `path` 加载 guest 程序并运行到结束。
-pub fn run(path: &Path, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<ExitStatus, RunError> {
+pub fn run(
+    path: &Path,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    options: &RunOptions,
+) -> Result<RunReport, RunError> {
+    let mut dbt = match options.tier {
+        Tier::Interpreter => None,
+        Tier::Dbt => Some(Dbt::new().ok_or(RunError::TierUnavailable)?),
+    };
     let file = std::fs::read(path).map_err(RunError::Io)?;
     let mut mm = Mm::new();
     let image = loader::load(&mut mm, &file, argv, envp).map_err(RunError::Load)?;
@@ -95,11 +135,15 @@ pub fn run(path: &Path, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<ExitStatus
     cpu.state_mut().pc = image.entry;
     cpu.state_mut().sp = image.sp;
 
-    loop {
-        let signal = match cpu.run() {
+    let status = loop {
+        let exit = match &mut dbt {
+            Some(dbt) => dbt.run(&mut cpu),
+            None => cpu.run(),
+        };
+        let signal = match exit {
             Exit::Svc { .. } => match syscall::dispatch(&mut cpu, &mm) {
                 Flow::Continue => continue,
-                Flow::Exit(code) => return Ok(ExitStatus::Exited(code)),
+                Flow::Exit(code) => break ExitStatus::Exited(code),
             },
             Exit::Kick => continue,
             Exit::Undefined { .. } => (Signal::Ill, None),
@@ -115,10 +159,14 @@ pub fn run(path: &Path, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<ExitStatus
                 ..
             } => (Signal::Bus, Some(addr)),
         };
-        return Ok(ExitStatus::Signaled {
+        break ExitStatus::Signaled {
             signal: signal.0,
             pc: cpu.state().pc,
             fault_addr: signal.1,
-        });
-    }
+        };
+    };
+    Ok(RunReport {
+        status,
+        dbt_stats: dbt.map(|d| d.stats()),
+    })
 }

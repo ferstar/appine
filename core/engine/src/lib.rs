@@ -34,14 +34,23 @@ struct RawMmu {
 #[derive(Clone, Copy)]
 struct TlbEntry {
     tag_read: u64,
+    addend_read: u64,
     tag_write: u64,
-    tag_exec: u64,
+    addend_write: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ItlbEntry {
+    tag: u64,
     addend: u64,
 }
 
 /// guest CPU 状态，逐字段镜像 C 的 `struct appine_cpu`。
 #[repr(C)]
 pub struct CpuState {
+    tlb: [TlbEntry; TLB_ENTRIES],
+    itlb: [ItlbEntry; TLB_ENTRIES],
     /// 通用寄存器 X0–X30。
     pub x: [u64; 31],
     /// 栈指针。
@@ -64,9 +73,12 @@ pub struct CpuState {
     fault_access: u32,
     fault_kind: u32,
     exit_info: u32,
-    pending: u32,
+    reserved: u32,
+    pending: u64,
     mmu: *mut RawMmu,
-    tlb: [TlbEntry; TLB_ENTRIES],
+    dbt_reason: u64,
+    dbt_site: u64,
+    dbt_jump_cache: *mut c_void,
 }
 
 unsafe extern "C" {
@@ -83,12 +95,24 @@ unsafe extern "C" {
     fn appine_cpu_exec_insn(cpu: *mut CpuState, insn: u32) -> c_int;
     fn appine_cpu_layout_check(
         size: usize,
+        off_x: usize,
         off_pc: usize,
         off_tpidr: usize,
         off_pending: usize,
         off_mmu: usize,
-        off_tlb: usize,
+        off_jump_cache: usize,
     ) -> c_int;
+
+    fn appine_dbt_new() -> *mut RawDbt;
+    fn appine_dbt_free(dbt: *mut RawDbt);
+    fn appine_dbt_flush(dbt: *mut RawDbt);
+    fn appine_dbt_run(dbt: *mut RawDbt, cpu: *mut CpuState) -> c_int;
+    fn appine_dbt_get_stats(dbt: *const RawDbt, out: *mut DbtStats);
+}
+
+#[repr(C)]
+struct RawDbt {
+    _private: [u8; 0],
 }
 
 /// 修改页表时的参数错误或内存不足。
@@ -284,7 +308,7 @@ impl Cpu {
         self.decode_exit(rc)
     }
 
-    fn decode_exit(&self, rc: c_int) -> Option<Exit> {
+    pub(crate) fn decode_exit(&self, rc: c_int) -> Option<Exit> {
         let s = &self.state;
         Some(match rc {
             0 => return None,
@@ -314,16 +338,87 @@ impl Cpu {
     }
 }
 
+/// Tier 1 的翻译与运行统计（设计文档 §4.2）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbtStats {
+    /// 翻译的块数。
+    pub blocks: u64,
+    /// 翻译的 guest 指令数。
+    pub insns: u64,
+    /// 原样拷贝的指令数。
+    pub insns_copied: u64,
+    /// 涉及被占用寄存器或 SP、改写后执行的指令数。
+    pub insns_remapped: u64,
+    /// 改写成内联 TLB 快速路径的访存指令数。
+    pub insns_memory: u64,
+    /// 交给 Tier 0 执行的指令数（静态计数）。
+    pub insns_fallback: u64,
+    /// 因块链接退出到分发器的次数（每个链接点只发生一次）。
+    pub exits_chain: u64,
+    /// 间接分支未命中跳转缓存的次数。
+    pub exits_lookup: u64,
+    /// 交给 Tier 0 执行一条指令的次数（TLB 未命中、跨页、不支持的指令）。
+    pub exits_interp: u64,
+    /// 因 syscall 退出的次数。
+    pub exits_svc: u64,
+    /// 因 kick 退出的次数。
+    pub exits_kick: u64,
+    /// 代码缓存被清空的次数。
+    pub flushes: u64,
+}
+
+/// Tier 1：同 ISA 直通式 DBT 的一个实例（代码缓存、翻译表、跳转缓存）。
+///
+/// 原型限制：翻译结果不会因为 guest 修改代码或映射而失效，修改之后必须调用
+/// [`Dbt::flush`]。只支持 aarch64 Linux 宿主。
+pub struct Dbt {
+    raw: NonNull<RawDbt>,
+}
+
+impl Dbt {
+    /// 创建实例；宿主不是 aarch64 Linux 时返回 `None`。
+    pub fn new() -> Option<Self> {
+        NonNull::new(unsafe { appine_dbt_new() }).map(|raw| Dbt { raw })
+    }
+
+    /// 与 [`Cpu::run`] 语义相同，但在翻译后的代码里执行。
+    pub fn run(&mut self, cpu: &mut Cpu) -> Exit {
+        let rc = unsafe { appine_dbt_run(self.raw.as_ptr(), &mut *cpu.state) };
+        cpu.decode_exit(rc)
+            .expect("appine_dbt_run returned EXIT_NONE")
+    }
+
+    /// 丢弃全部翻译结果。
+    pub fn flush(&mut self) {
+        unsafe { appine_dbt_flush(self.raw.as_ptr()) }
+    }
+
+    /// 统计数据。
+    pub fn stats(&self) -> DbtStats {
+        let mut stats = DbtStats::default();
+        unsafe { appine_dbt_get_stats(self.raw.as_ptr(), &mut stats) };
+        stats
+    }
+}
+
+impl Drop for Dbt {
+    fn drop(&mut self) {
+        unsafe { appine_dbt_free(self.raw.as_ptr()) }
+    }
+}
+
 /// 校验 [`CpuState`] 与 C 结构体的布局是否一致。
 pub fn layout_matches() -> bool {
     unsafe {
         appine_cpu_layout_check(
             size_of::<CpuState>(),
+            offset_of!(CpuState, x),
             offset_of!(CpuState, pc),
             offset_of!(CpuState, tpidr_el0),
             offset_of!(CpuState, pending),
             offset_of!(CpuState, mmu),
-            offset_of!(CpuState, tlb),
+            offset_of!(CpuState, dbt_jump_cache),
         ) == 1
     }
 }

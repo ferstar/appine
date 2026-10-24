@@ -135,8 +135,9 @@ pub fn load(
                 "segment file size exceeds memory size",
             ));
         }
+        // 只含 .bss 的段 filesz 为 0，p_offset 可以指到文件末尾之后，Linux 不会去读它
         let file_end = offset.checked_add(filesz);
-        if file_end.is_none_or(|end| end > file.len() as u64) {
+        if filesz > 0 && file_end.is_none_or(|end| end > file.len() as u64) {
             return Err(LoadError::Malformed("segment exceeds the file"));
         }
         let end = vaddr
@@ -177,7 +178,7 @@ pub fn load(
         mm.map_anonymous(start, len, run_prot)
             .map_err(LoadError::Memory)?;
     }
-    for seg in &segments {
+    for seg in segments.iter().filter(|seg| seg.filesz > 0) {
         mm.write_kernel(seg.vaddr, &file[seg.offset..seg.offset + seg.filesz])
             .map_err(LoadError::Memory)?;
     }
@@ -338,6 +339,33 @@ mod tests {
         assert_eq!(read_u64(&mm, sp + 64), AT_ENTRY);
         assert_eq!(read_u64(&mm, sp + 72), 0x400078);
         assert_eq!(read_u64(&mm, sp + 80), AT_NULL);
+    }
+
+    #[test]
+    fn bss_only_segment_may_point_past_the_end_of_file() {
+        // 两个程序头：代码段，以及 filesz = 0、p_offset 越过文件末尾的 .bss 段
+        let mut f = tiny_elf(ET_EXEC, &[]);
+        f.truncate(64 + 56);
+        f[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let code_at = 64 + 2 * 56;
+        f[24..32].copy_from_slice(&(0x400000 + code_at as u64).to_le_bytes());
+        let size = (code_at + 4) as u64;
+        f[64 + 32..64 + 40].copy_from_slice(&size.to_le_bytes());
+        f[64 + 40..64 + 48].copy_from_slice(&size.to_le_bytes());
+        let mut bss = vec![0u8; 56];
+        bss[..4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        bss[4..8].copy_from_slice(&(PF_R | PF_W).to_le_bytes());
+        bss[8..16].copy_from_slice(&0xffe8u64.to_le_bytes());
+        bss[16..24].copy_from_slice(&0x41ffe8u64.to_le_bytes());
+        bss[40..48].copy_from_slice(&0x4000u64.to_le_bytes());
+        f.extend_from_slice(&bss);
+        f.extend_from_slice(&0xd503201fu32.to_le_bytes());
+
+        let mut mm = Mm::new();
+        load(&mut mm, &f, &[], &[]).unwrap();
+        assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
+        assert!(mm.mmu().translate(0x423fe0, prot::WRITE).is_some());
+        assert_eq!(read_u64(&mm, 0x420000), 0);
     }
 
     #[test]

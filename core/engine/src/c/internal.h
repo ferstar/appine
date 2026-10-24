@@ -32,12 +32,20 @@ static inline uint64_t untag(uint64_t va)
 static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t access)
 {
     uint64_t vpn = va >> APPINE_PAGE_SHIFT;
-    struct appine_tlb_entry *e = &cpu->tlb[vpn & (APPINE_TLB_ENTRIES - 1)];
-    uint64_t tag = access == APPINE_ACCESS_READ    ? e->tag_read
-                   : access == APPINE_ACCESS_WRITE ? e->tag_write
-                                                   : e->tag_exec;
+    unsigned idx = (unsigned)(vpn & (APPINE_TLB_ENTRIES - 1));
+    uint64_t tag, addend;
+    if (access == APPINE_ACCESS_EXEC) {
+        tag = cpu->itlb[idx].tag;
+        addend = cpu->itlb[idx].addend;
+    } else if (access == APPINE_ACCESS_READ) {
+        tag = cpu->tlb[idx].tag_read;
+        addend = cpu->tlb[idx].addend_read;
+    } else {
+        tag = cpu->tlb[idx].tag_write;
+        addend = cpu->tlb[idx].addend_write;
+    }
     if (LIKELY(tag == vpn))
-        return (void *)(uintptr_t)(va + e->addend);
+        return (void *)(uintptr_t)(va + addend);
     return appine_tlb_fill(cpu, va, access);
 }
 
@@ -93,6 +101,10 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
     return true;
 }
 
+/* 执行一条已经取到的指令 */
 enum appine_exit appine_interp_exec(struct appine_cpu *cpu, uint32_t insn);
+
+/* 从 cpu->pc 取指并执行一条指令（Tier 0 的单步） */
+enum appine_exit appine_interp_step(struct appine_cpu *cpu);
 
 #endif /* APPINE_ENGINE_INTERNAL_H */

@@ -43,6 +43,13 @@ jobs:
       - name: Lockstep (extended)
         run: cargo run --release -p appine-lockstep -- --iterations 200000
 
+      # M2 性能探针：在另一种 arm64 微架构上记录 Tier 1 的开销。
+      # 只检查三种运行方式的输出一致，不设耗时门槛
+      - name: Performance probe
+        run: |
+          cargo build --release -p appine-run -p appine-bench
+          target/release/appine-bench --runs 3 --skip-tier0
+
       # Android NDK 用 clang 编译 C 引擎，这里提前暴露 clang 特有的警告
       - name: Engine and oracle with clang
         env:

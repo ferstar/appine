@@ -9,3 +9,6 @@ publish.workspace = true
 
 [dependencies]
 appine-kernel.workspace = true
+
+[dev-dependencies]
+appine-bench.workspace = true

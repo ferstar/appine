@@ -120,7 +120,9 @@ pub fn run(_config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
 
 #[cfg(lockstep_native)]
 mod runner {
-    use appine_engine::{Cpu, Exit, Mmu};
+    use std::ptr::NonNull;
+
+    use appine_engine::{Cpu, Dbt, Exit, Mmu, prot};
 
     use super::*;
     use crate::classes::{CLASSES, Class};
@@ -177,17 +179,73 @@ mod runner {
     /// 解释器执行前把 SP 设成这个值；数据处理指令不应该改动它。
     const SP_SENTINEL: u64 = 0x0000_7fff_dead_bef0;
 
+    #[repr(C, align(4096))]
+    struct Page([u8; 4096]);
+
+    /// Tier 1 的执行环境：在与原生跳板相同的 guest 地址上放 "被测指令; svc #0"，
+    /// 每次都重新翻译执行。
+    struct Tier1 {
+        // 析构顺序：dbt → cpu → mmu → page
+        dbt: Dbt,
+        cpu: Cpu,
+        _mmu: Mmu,
+        page: Box<Page>,
+        slot_offset: usize,
+    }
+
+    impl Tier1 {
+        fn new(slot: u64) -> Self {
+            let dbt = Dbt::new().expect("tier 1 is unavailable on this host");
+            let mut page = Box::new(Page([0; 4096]));
+            let mut mmu = Mmu::new();
+            let host = NonNull::from(&mut page.0).cast::<u8>();
+            // SAFETY: page 由 Tier1 持有，比 mmu 活得久
+            unsafe { mmu.map(slot & !0xfff, host, 4096, prot::READ | prot::EXEC) }.unwrap();
+            // SAFETY: mmu 由 Tier1 持有，比 cpu 活得久
+            let cpu = unsafe { Cpu::new(&mmu) };
+            Tier1 {
+                dbt,
+                cpu,
+                _mmu: mmu,
+                page,
+                slot_offset: (slot & 0xfff) as usize,
+            }
+        }
+
+        fn run(&mut self, insn: u32, before: &State, pc: u64) -> (Exit, State) {
+            let code = &mut self.page.0[self.slot_offset..self.slot_offset + 8];
+            code[..4].copy_from_slice(&insn.to_le_bytes());
+            code[4..].copy_from_slice(&0xd400_0001u32.to_le_bytes()); // svc #0
+            self.dbt.flush();
+            let s = self.cpu.state_mut();
+            s.x = before.x;
+            s.nzcv = before.nzcv;
+            s.sp = SP_SENTINEL;
+            s.pc = pc;
+            let exit = self.dbt.run(&mut self.cpu);
+            let s = self.cpu.state();
+            (
+                exit,
+                State {
+                    x: s.x,
+                    nzcv: s.nzcv,
+                },
+            )
+        }
+    }
+
     pub(super) fn run(config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
         let mut oracle = Oracle::new().expect("cannot create lockstep oracle");
         let mmu = Mmu::new();
         // SAFETY: mmu 比 cpu 先声明、后析构
         let mut cpu = unsafe { Cpu::new(&mmu) };
+        let mut tier1 = Tier1::new(oracle.slot_addr());
         let mut reports = Vec::new();
         for class in CLASSES {
             if config.class.as_deref().is_some_and(|c| c != class.name) {
                 continue;
             }
-            reports.push(run_class(class, config, &mut oracle, &mut cpu)?);
+            reports.push(run_class(class, config, &mut oracle, &mut cpu, &mut tier1)?);
         }
         Ok(reports)
     }
@@ -197,6 +255,7 @@ mod runner {
         config: &Config,
         oracle: &mut Oracle,
         cpu: &mut Cpu,
+        tier1: &mut Tier1,
     ) -> Result<ClassReport, Box<Mismatch>> {
         let mut g = Rng::new(class_seed(config.seed, class.name));
         let mut report = ClassReport {
@@ -277,6 +336,25 @@ mod runner {
                     }
                     report.executed += 1;
                 }
+            }
+
+            // Tier 1 必须与 Tier 0 完全一致：同样认识或拒绝这条指令，结果也相同
+            let (exit1, state1) = tier1.run(insn, &before, pc);
+            let pc1 = tier1.cpu.state().pc;
+            let sp1 = tier1.cpu.state().sp;
+            let ok = match (hw_result, exit, exit1) {
+                (_, Some(Exit::Undefined { .. }), Exit::Undefined { .. }) => pc1 == pc,
+                (Ok(()), None, Exit::Svc { .. }) => {
+                    state1 == hw && pc1 == pc + 8 && sp1 == SP_SENTINEL
+                }
+                _ => false,
+            };
+            if !ok {
+                return Err(mismatch(
+                    format!("tier 1 returned {exit1:?} with pc={pc1:#x} sp={sp1:#x}"),
+                    Some(hw),
+                    Some(state1),
+                ));
             }
         }
         Ok(report)

@@ -49,11 +49,20 @@ enum appine_exit {
     APPINE_EXIT_KICK = 5,  /* 被 appine_cpu_kick() 打断，pending 已清零 */
 };
 
-/* 软件 TLB 表项：host 地址 = guest 地址 + addend */
+/*
+ * 数据 TLB 表项：host 地址 = guest 地址 + addend。tag 和 addend 相邻存放，
+ * Tier 1 生成的代码用一条 ldp 同时取出两者。
+ */
 struct appine_tlb_entry {
     uint64_t tag_read; /* guest 页号；UINT64_MAX 表示无效 */
+    uint64_t addend_read;
     uint64_t tag_write;
-    uint64_t tag_exec;
+    uint64_t addend_write;
+};
+
+/* 取指 TLB 表项，只有 Tier 0 的取指和 Tier 1 的翻译会用到 */
+struct appine_itlb_entry {
+    uint64_t tag;
     uint64_t addend;
 };
 
@@ -64,6 +73,9 @@ struct appine_mmu;
  * 修改时必须同步，并由 appine_cpu_layout_check() 校验。
  */
 struct appine_cpu {
+    /* 数据 TLB 必须位于偏移 0：Tier 1 生成的代码以 "cpu + 下标 * 32" 直接寻址表项 */
+    struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];
+    struct appine_itlb_entry itlb[APPINE_TLB_ENTRIES];
     uint64_t x[31];
     uint64_t sp;
     uint64_t pc;
@@ -77,9 +89,13 @@ struct appine_cpu {
     uint32_t fault_access; /* enum appine_access */
     uint32_t fault_kind;   /* enum appine_fault_kind */
     uint32_t exit_info;
-    uint32_t pending; /* 只能用原子操作访问 */
+    uint32_t reserved;
+    uint64_t pending; /* 只能用原子操作访问；64 位是为了让 Tier 1 能用一条 ldr 读到它 */
     struct appine_mmu *mmu;
-    struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];
+    /* 以下字段由 Tier 1 内部使用 */
+    uint64_t dbt_reason;
+    uint64_t dbt_site;
+    void *dbt_jump_cache;
 };
 
 /* ---- soft-MMU 页表（设计文档 §5.1）---- */
@@ -125,7 +141,42 @@ enum appine_exit appine_cpu_exec_insn(struct appine_cpu *cpu, uint32_t insn);
 void appine_cpu_kick(struct appine_cpu *cpu);
 
 /* 校验 Rust 侧镜像的结构体布局，一致时返回 1 */
-int appine_cpu_layout_check(size_t size, size_t off_pc, size_t off_tpidr, size_t off_pending,
-                            size_t off_mmu, size_t off_tlb);
+int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off_tpidr,
+                            size_t off_pending, size_t off_mmu, size_t off_jump_cache);
+
+/* ---- Tier 1：同 ISA 直通式 DBT（设计文档 §4.2）---- */
+
+struct appine_dbt;
+
+/* 翻译与运行统计 */
+struct appine_dbt_stats {
+    uint64_t blocks;         /* 翻译的块数 */
+    uint64_t insns;          /* 翻译的 guest 指令数 */
+    uint64_t insns_copied;   /* 原样拷贝 */
+    uint64_t insns_remapped; /* 涉及被占用寄存器或 SP，改写后执行 */
+    uint64_t insns_memory;   /* 改写成 TLB 快速路径的访存指令 */
+    uint64_t insns_fallback; /* 交给 Tier 0 执行的指令（静态计数） */
+    uint64_t exits_chain;    /* 运行时退出到分发器的次数，按原因分类 */
+    uint64_t exits_lookup;
+    uint64_t exits_interp;
+    uint64_t exits_svc;
+    uint64_t exits_kick;
+    uint64_t flushes;
+};
+
+/*
+ * 创建一个 Tier 1 实例（代码缓存、翻译表、跳转缓存）。一个实例只能由一个
+ * 线程使用。宿主不是 aarch64 Linux 时返回 NULL。
+ *
+ * 原型限制：翻译结果不会因为 guest 修改代码或映射而失效，调用方必须在
+ * 这种情况下调用 appine_dbt_flush()。
+ */
+struct appine_dbt *appine_dbt_new(void);
+void appine_dbt_free(struct appine_dbt *dbt);
+void appine_dbt_flush(struct appine_dbt *dbt);
+
+/* 与 appine_cpu_run() 语义相同，但在翻译后的代码里执行 */
+enum appine_exit appine_dbt_run(struct appine_dbt *dbt, struct appine_cpu *cpu);
+void appine_dbt_get_stats(const struct appine_dbt *dbt, struct appine_dbt_stats *out);
 
 #endif /* APPINE_ENGINE_H */
