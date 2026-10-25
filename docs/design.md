@@ -1077,7 +1077,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 
 ### M9 之前：推迟项（2026-10-25）
 
-把前几轮推迟的、在单进程模型里做得了的补上；io_uring 单独做一轮。
+把前几轮推迟的、在单进程模型里做得了的补上；io_uring 不做（见下面的推迟项和 §15）。
 
 - **信号驱动的 I/O**：`O_ASYNC`（`F_SETFL`、`FIOASYNC`），属主（`F_SETOWN`、`F_SETOWN_EX`，socket 上还有 `FIOSETOWN`/`SIOCSPGRP`）和 `F_SETSIG` 原来只记录，现在生效：文件变得可读、可写、出错或挂断时给属主（线程、进程或进程组）发 SIGIO，或者 `F_SETSIG` 设置的信号，带 `si_band`、`si_fd`（signalfd 也给出这两项），band 与 Linux 相同。读过之后仍然可读的（又来了数据）再通知一次。检查放在定时器线程上：内核状态的任何修改都会叫醒它，它顺便检查登记了 `O_ASYNC` 的文件，宿主 socket 的就绪也由它一起 poll。
 - **文件租约**：`F_SETLEASE`、`F_GETLEASE`、`/proc/sys/fs/lease-break-time`。规则与 Linux 相同：只有属主（或有 `CAP_LEASE`）能设置；读租约要求自己不可写、没有人以写方式打开，写租约要求没有别的打开。以写方式打开或者截短打破所有租约，以读方式打开打破写租约：持有者收到 `F_SETSIG` 的信号（`POLL_MSG`）或 SIGIO；`O_NONBLOCK` 的 open 返回 EWOULDBLOCK，否则等持有者降级或放弃，超过 lease-break-time 强制降级。被写方式的打开打破时不能降成读租约。
@@ -1104,7 +1104,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 
 推迟：
 
-- io_uring：程序探测到 io_uring 可用就不再走自己的退路，只做一部分比 ENOSYS 更容易出问题，下一轮单独做。
+- io_uring 不做，保持 ENOSYS。之后试做过一轮又放弃了：环放在共享内存里，请求在提交者的上下文里先不等待地执行一次（Cx 加"不等待"模式，让现有的阻塞循环直接返回 EAGAIN），会阻塞的挂起，由定时器线程把提交者叫进内核推进（相当于 task_work），SQPOLL 靠一直置位 `IORING_SQ_NEED_WAKEUP` 实现。接口和 49 个操作码写完是 3800 行，liburing 的测试先抽了 10 个，过了一半，剩下的细节（DEFER_TASKRUN 的完成时机、多次接收的 recvmsg、提供的缓冲区等）还有很长一串。考虑到用的人很少（见 §15），代码没有留下。
 - `PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做。
 - 内核访问 guest 内存（比如 read 写进还没长出来的栈）不会让 `MAP_GROWSDOWN` 的映射增长，返回 EFAULT。
 - `EPOLLEXCLUSIVE` 只保证报告给一个，唤醒还是全部唤醒。
@@ -1131,6 +1131,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 | `dataSync` 前台服务 | Android 15 起每 24 小时最多运行 6 小时 |
 | 处处假装 root（proot `-0` 式） | postgres、测试集、sshd 权限分离等场景会出问题 |
 | 全部用 C 实现 | 内核层是代码量的大头，内存安全的收益最大 |
+| 实现 io_uring | 用的人很少：Android 用 seccomp 不让 App 使用 io_uring，手机上的程序本来就要有退路；Go、Java、Python、Rust 标准库、tokio 都不用，Node.js 的 libuv 从 1.48 起默认不用。只做一部分比 ENOSYS 更危险：程序探测到能用就不走退路了。它还要求内核的等待机制多一种"不等待"模式、等待醒来之后顺带推进请求，以后每个 syscall 都要考虑它。试做过一轮，见"M9 之前：推迟项" |
 
 ---
 
