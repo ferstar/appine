@@ -41,6 +41,18 @@ pub unsafe fn unmap(ptr: NonNull<u8>, len: usize) {
     unsafe { libc::munmap(ptr.as_ptr().cast(), len) };
 }
 
+/// 丢弃一段私有匿名内存的内容（`MADV_DONTNEED`）：宿主回收这些页，之后读到的是零。
+///
+/// # Safety
+///
+/// `ptr` 和 `len` 按宿主页对齐，落在 [`map_anonymous`] 申请、还没有释放的内存里。
+pub unsafe fn discard(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
+    if unsafe { libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_DONTNEED) } != 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 /// 向宿主 fd 写入，遇到 `EINTR` 自动重试。
 pub fn write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
     loop {

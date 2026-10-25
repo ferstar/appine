@@ -651,6 +651,7 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             Errno::ERESTARTSYS,
             Errno::ERESTARTNOINTR,
             Errno::ERESTARTNOHAND,
+            Errno::ERESTART_RESTARTBLOCK,
         ]
         .iter()
         .any(|e| ret == -(e.0 as i64))
@@ -699,6 +700,7 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         }
         if let (false, Some((code, cont))) = (handled, restart) {
             let to_eintr = code == Errno::ERESTARTNOHAND
+                || code == Errno::ERESTART_RESTARTBLOCK
                 || (code == Errno::ERESTARTSYS && act.flags & sa::RESTART == 0);
             if to_eintr {
                 let st = cpu.state_mut();
@@ -732,6 +734,10 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
     }
     if !handled && let Some(saved) = cx.t.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
+    }
+    // 没有处理函数打断：重新执行的那条 svc 改成 restart_syscall，接着做剩下的部分
+    if !handled && let Some((Errno::ERESTART_RESTARTBLOCK, _)) = restart {
+        cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
     }
     Flow::Continue
 }

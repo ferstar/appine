@@ -401,6 +401,12 @@ const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
 const EPOLLONESHOT: u32 = 1 << 30;
 const EPOLLET: u32 = 1 << 31;
+/// 多个 epoll 等同一个 fd 时只唤醒其中一个。这里总是全部唤醒，所以只检查参数。
+const EPOLLEXCLUSIVE: u32 = 1 << 28;
+const EPOLLWAKEUP: u32 = 1 << 29;
+/// 能和 `EPOLLEXCLUSIVE` 一起用的位（Linux 的 `EPOLLEXCLUSIVE_OK_BITS`）。
+const EXCLUSIVE_OK: u32 =
+    (POLLIN | POLLOUT | POLLERR | POLLHUP) as u32 | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
 
 /// epoll 关注的一个文件。
 struct Interest {
@@ -559,6 +565,15 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
             u64::from_le_bytes(b[8..].try_into().unwrap()),
         )
     };
+    // 与 Linux 相同：EPOLLEXCLUSIVE 只能在加入时用，不能用于 epoll，也不能配别的标志
+    if events & EPOLLEXCLUSIVE != 0
+        && (op == EPOLL_CTL_MOD
+            || op == EPOLL_CTL_ADD
+                && (matches!(file.borrow().kind, FileKind::Epoll(_))
+                    || events & !EXCLUSIVE_OK != 0))
+    {
+        return Err(Errno::EINVAL);
+    }
     let mut ep = ep.borrow_mut();
     ep.interests.retain(|i| i.file.strong_count() > 0);
     let pos = ep
@@ -572,6 +587,10 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
             ep.interests.push(Interest::new(fd, &file, events, data));
             request_wake();
             Ok(0)
+        }
+        // 带 EPOLLEXCLUSIVE 加入的不能修改
+        (EPOLL_CTL_MOD, Some(i)) if ep.interests[i].events & EPOLLEXCLUSIVE != 0 => {
+            Err(Errno::EINVAL)
         }
         // 与 Linux 相同，修改之后重新判断：已经就绪的会再报告一次
         (EPOLL_CTL_MOD, Some(i)) => {

@@ -710,6 +710,7 @@ fn open_store(
             };
             if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
                 file.set_len(0).map_err(host_errno)?;
+                truncated(cx, &file);
             }
             FileKind::Regular { ino, file }
         }
@@ -2029,7 +2030,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                 return Err(Errno::ETXTBSY);
             }
             check_fsize(cx, len)?;
-            vfs.store().truncate(ino, len)?;
+            let host = vfs.store().open_object(ino, true)?;
+            host.set_len(len).map_err(host_errno)?;
+            truncated(cx, &host);
             if inotify::active(cx.kr()) {
                 let parent = inotify::watched_parent(cx, AT_FDCWD, &path, true);
                 let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
@@ -2050,11 +2053,38 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
             file.set_len(len).map_err(host_errno)?;
+            truncated(cx, file);
             inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
             Ok(0)
         }
         FileKind::Path(_) => Err(Errno::EBADF),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 文件变短之后调用：所有地址空间里映射它的页，超出新末尾的从页表里拿掉
+/// （[`crate::mm::Mm::file_truncated`]）。当前进程的地址空间在 syscall 结束时同步，
+/// 别的进程的在这里同步。
+fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = host.metadata() else {
+        return;
+    };
+    let sync = cx.task.sync.clone();
+    let mut seen = Vec::new();
+    for t in cx.kr().tasks.values() {
+        let mm = t.res.borrow().mm.clone();
+        if seen.contains(&Rc::as_ptr(&mm)) {
+            continue;
+        }
+        seen.push(Rc::as_ptr(&mm));
+        let Ok(mut m) = mm.try_borrow_mut() else {
+            crate::debug::log(format_args!("truncate: an address space is busy"));
+            continue;
+        };
+        if m.file_truncated(meta.dev(), meta.ino(), meta.len()) && !Rc::ptr_eq(&mm, &cx.t.mm) {
+            m.sync(&sync);
+        }
     }
 }
 

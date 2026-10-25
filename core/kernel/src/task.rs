@@ -110,6 +110,8 @@ pub(crate) struct TaskState {
     pub saved_sigmask: Option<u64>,
     /// vfork 的子进程：execve 或退出时置位，让父进程继续。
     pub vfork_done: Option<Rc<Cell<bool>>>,
+    /// 被信号打断的 nanosleep 剩下的部分（`restart_syscall`）：到期时刻和 `rem` 的地址。
+    pub restart: Option<(std::time::Instant, u64)>,
 }
 
 impl Task {
@@ -350,9 +352,11 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     signal::deliver(cx, cpu, false)
 }
 
-/// 线程离开它的地址空间（退出、execve）：清零 `clear_child_tid` 并唤醒等它的线程
-/// （pthread_join），让 vfork 的父进程继续，从使用者里注销。
+/// 线程离开它的地址空间（退出、execve）：处理 robust futex 链表，清零 `clear_child_tid`
+/// 并唤醒等它的线程（pthread_join），让 vfork 的父进程继续，从使用者里注销。
 pub(crate) fn release_mm(k: &mut Kernel, task: &Task, st: &mut TaskState) {
+    let (head, _) = task.robust_list.replace((0, 0));
+    crate::futex::exit_robust_list(&mut k.futexes, &st.mm.borrow(), head, task.tid.get() as u32);
     let addr = std::mem::take(&mut st.clear_child_tid);
     {
         let mm = st.mm.borrow();

@@ -125,6 +125,9 @@ impl Errno {
     pub const ERESTARTNOINTR: Errno = Errno(513);
     /// 被信号打断：有处理函数时返回 EINTR，否则重新执行。
     pub const ERESTARTNOHAND: Errno = Errno(514);
+    /// 被信号打断：有处理函数时返回 EINTR，否则改成执行 `restart_syscall`，接着做剩下的
+    /// 部分（线程的 [`crate::task::TaskState::restart`]）。
+    pub const ERESTART_RESTARTBLOCK: Errno = Errno(516);
 
     /// syscall 返回给 guest 的值：`-errno`。
     pub fn to_syscall_return(self) -> u64 {

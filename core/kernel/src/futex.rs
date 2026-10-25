@@ -5,7 +5,13 @@
 //! 等待者登记在队列里，然后走统一的等待机制；被唤醒的等待者从队列里移除，
 //! 它重新检查时发现自己不在队列里了，就知道是被 FUTEX_WAKE 唤醒的。
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use appine_engine::prot;
+
 use crate::kernel::request_wake;
+use crate::mm::Mm;
+use crate::uaccess::UserSlice;
 
 /// futex 的键（[`crate::mm::Mm::futex_key`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +87,95 @@ impl Futexes {
             moved += 1;
         }
         woken + moved
+    }
+}
+
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+/// 最多处理的链表项（`ROBUST_LIST_LIMIT`），防止 guest 构造出环。
+const ROBUST_LIST_LIMIT: usize = 2048;
+
+/// 线程退出或 execve 时处理它的 robust futex 链表（set_robust_list），与 Linux 的
+/// `exit_robust_list` 相同：它还持有的锁标上 `FUTEX_OWNER_DIED`，有等待者时唤醒一个，
+/// 等待者因此拿到 EOWNERDEAD。`head` 是 `struct robust_list_head` 的地址。
+pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u32) {
+    if head == 0 {
+        return;
+    }
+    let word = |addr: u64| {
+        let mut b = [0u8; 8];
+        mm.read(UserSlice::new(addr, 8), &mut b)
+            .ok()
+            .map(|()| u64::from_le_bytes(b))
+    };
+    // 链表项的最低位表示 PI futex
+    let (Some(mut entry), Some(offset), Some(pending)) =
+        (word(head), word(head + 8), word(head + 16))
+    else {
+        return;
+    };
+    for _ in 0..ROBUST_LIST_LIMIT {
+        if entry & !1 == head {
+            break;
+        }
+        let Some(next) = word(entry & !1) else {
+            return;
+        };
+        // 正在加锁或解锁的那一项最后单独处理
+        if entry & !1 != pending & !1 {
+            owner_died(
+                futexes,
+                mm,
+                (entry & !1).wrapping_add(offset),
+                tid,
+                entry & 1 != 0,
+                false,
+            );
+        }
+        entry = next;
+    }
+    if pending & !1 != 0 {
+        let addr = (pending & !1).wrapping_add(offset);
+        owner_died(futexes, mm, addr, tid, pending & 1 != 0, true);
+    }
+}
+
+/// Linux 的 `handle_futex_death`：`addr` 处的锁由 `tid` 持有时标上 `FUTEX_OWNER_DIED`
+/// （保留 `FUTEX_WAITERS`），有等待者就唤醒一个。别的线程可能正在 guest 代码里用原子
+/// 操作改它，所以用比较交换。
+fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pending: bool) {
+    if !addr.is_multiple_of(4) {
+        return;
+    }
+    let Some(host) = mm.mmu().translate(addr, prot::READ | prot::WRITE) else {
+        return;
+    };
+    // SAFETY: 4 字节对齐、可写的 guest 内存，宿主内存由地址空间持有
+    let lock = unsafe { AtomicU32::from_ptr(host.as_ptr().cast()) };
+    let mut cur = lock.load(Ordering::SeqCst);
+    let wake = |futexes: &mut Futexes| {
+        if let Some(key) = mm.futex_key(addr) {
+            futexes.wake(key, 1, u32::MAX);
+        }
+    };
+    // 解锁之后、唤醒等待者之前退出的：锁已经是 0，直接唤醒一个，免得它们永远等下去
+    if pending && !pi && cur == 0 {
+        wake(futexes);
+        return;
+    }
+    loop {
+        if cur & FUTEX_TID_MASK != tid {
+            return;
+        }
+        let new = (cur & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        match lock.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(v) => cur = v,
+        }
+    }
+    if !pi && cur & FUTEX_WAITERS != 0 {
+        wake(futexes);
     }
 }
 

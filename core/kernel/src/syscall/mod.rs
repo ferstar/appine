@@ -52,6 +52,10 @@ const IO_CHUNK: usize = 64 * 1024;
 /// 路径参数的最大长度（含 NUL），与 Linux 的 `PATH_MAX` 相同。
 const PATH_MAX: usize = 4096;
 
+/// restart_syscall 的编号：没有处理函数的信号打断 `ERESTART_RESTARTBLOCK` 的 syscall 之后，
+/// 重新执行的 svc 改成它（[`crate::signal::deliver`]）。
+pub(crate) const NR_RESTART_SYSCALL: u64 = 128;
+
 /// 按 aarch64 Linux 的约定处理一次 `svc #0`：x8 是编号，x0–x5 是参数，返回值写回 x0。
 pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let state = cpu.state_mut();
@@ -206,6 +210,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         124 => Ok(0), // sched_yield
         125 | 126 => sched::sched_priority_range(a[0] as i32, nr == 125),
         127 => sched::sched_rr_get_interval(cx, a[0] as i32, a[1]),
+        NR_RESTART_SYSCALL => misc::restart_syscall(cx),
         129 => sig::kill(cx, a[0] as i32, a[1] as i32),
         130 => sig::tkill(cx, a[0] as i32, a[1] as i32),
         131 => sig::tgkill(cx, a[0] as i32, a[1] as i32, a[2] as i32),

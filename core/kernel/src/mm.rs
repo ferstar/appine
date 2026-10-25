@@ -114,8 +114,9 @@ struct Vma {
     /// 只读的私有文件映射在 fork 之后和别的地址空间共用宿主映射；要改成可写之前，
     /// 先复制一份自己的（[`Mm::mprotect`]）。
     cow: bool,
-    /// 文件的共享映射：宿主文件的 (设备号, inode) 和起点对应的文件偏移，作为 futex 的键。
-    shared_file: Option<(u64, u64, u64)>,
+    /// 文件映射：宿主文件的 (设备号, inode) 和起点对应的文件偏移。共享映射拿它作 futex
+    /// 的键；文件被截短时据此找到映射它的页（[`Mm::file_truncated`]）。
+    file_id: Option<(u64, u64, u64)>,
     /// 文件的共享映射：复制出来的宿主 fd 和起点对应的文件偏移（mremap 扩展映射时
     /// 接着映射文件后面的内容）。
     file: Option<(Rc<OwnedFd>, u64)>,
@@ -242,6 +243,28 @@ fn file_extent(fd: i32, offset: u64, len: u64) -> u64 {
         .min(len)
 }
 
+/// 丢弃一段私有匿名宿主内存的内容：整页交给宿主回收，宿主页比 4K 大时两头不满一页
+/// 的部分清零。原来全部清零，Go、JVM、V8 的 GC 归还内存时反而把这些页都碰了一遍。
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` 是 [`Mm`] 持有的、私有的匿名宿主内存。
+unsafe fn discard_host(ptr: NonNull<u8>, len: usize) {
+    let page = appine_hal::page_size();
+    let addr = ptr.as_ptr() as usize;
+    let head = (addr.next_multiple_of(page) - addr).min(len);
+    let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
+    // SAFETY: 偏移都在 [0, len] 里；[head, tail) 按宿主页对齐
+    unsafe {
+        if head < tail && appine_hal::discard(ptr.add(head), tail - head).is_ok() {
+            std::ptr::write_bytes(ptr.as_ptr(), 0, head);
+            std::ptr::write_bytes(ptr.as_ptr().add(tail), 0, len - tail);
+        } else {
+            std::ptr::write_bytes(ptr.as_ptr(), 0, len);
+        }
+    }
+}
+
 fn map_err(e: MapError) -> Errno {
     match e {
         MapError::InvalidArgument => Errno::EINVAL,
@@ -283,13 +306,13 @@ impl Mm {
         // 与 Linux 相同，futex 的地址必须可读
         let host = self.mmu.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
-        Some(match v.shared_file {
-            Some((dev, ino, offset)) => crate::futex::Key::File {
+        Some(match v.file_id {
+            Some((dev, ino, offset)) if v.backing == Backing::Shared => crate::futex::Key::File {
                 dev,
                 ino,
                 offset: offset + (addr - start),
             },
-            None => crate::futex::Key::Host(host.as_ptr() as usize),
+            _ => crate::futex::Key::Host(host.as_ptr() as usize),
         })
     }
 
@@ -386,6 +409,26 @@ impl Mm {
         (top >= MMAP_MIN + len).then(|| top - len)
     }
 
+    /// 把 VMA 的一段放进页表。`PROT_NONE` 的不放：V8、JVM 预留的大片地址空间逐页写
+    /// 页表很占内存（8 GB 要 16 MB），mprotect 加上权限时再放（[`Mm::mprotect`]）。
+    fn map_pages(
+        mmu: &mut Mmu,
+        start: u64,
+        host: NonNull<u8>,
+        len: u64,
+        prot: u32,
+    ) -> Result<(), Errno> {
+        if mmu_prot(prot) == 0 || len == 0 {
+            return Ok(());
+        }
+        // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
+        if let Err(e) = unsafe { mmu.map(start, host, len, mmu_prot(prot)) } {
+            let _ = mmu.unmap(start, len);
+            return Err(map_err(e));
+        }
+        Ok(())
+    }
+
     /// 把一段宿主内存映射到 `[start, start + len)`；调用方保证区间空闲。
     #[allow(clippy::too_many_arguments)]
     fn insert(
@@ -398,11 +441,7 @@ impl Mm {
         region: Rc<HostRegion>,
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
-        // SAFETY: region 由 VMA 持有，生命周期不短于页表里的映射
-        if let Err(e) = unsafe { self.mmu.map(start, host, len, mmu_prot(prot)) } {
-            let _ = self.mmu.unmap(start, len);
-            return Err(map_err(e));
-        }
+        Self::map_pages(&mut self.mmu, start, host, len, prot)?;
         self.vmas.insert(
             start,
             Vma {
@@ -415,7 +454,7 @@ impl Mm {
                 host,
                 file_len: len,
                 cow: false,
-                shared_file: None,
+                file_id: None,
                 file: None,
                 shm: None,
                 locked: self.lock_future,
@@ -427,13 +466,9 @@ impl Mm {
 
     /// 把一个完整的 VMA 放到 `start`；调用方保证区间空闲。
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
-        // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
-        if let Err(e) = unsafe { self.mmu.map(start, v.host, v.len, mmu_prot(v.prot)) } {
-            let _ = self.mmu.unmap(start, v.len);
-            return Err(map_err(e));
-        }
+        Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot)?;
         self.vmas.insert(start, v);
-        self.trim_to_file(start)
+        Ok(())
     }
 
     /// 文件映射超出文件末尾的页从页表里拿掉（[`Vma::file_len`]）。
@@ -461,8 +496,7 @@ impl Mm {
                 let (from, prot) = (v.file_len, v.prot);
                 // SAFETY: 宿主映射覆盖整个 VMA，[from, extent) 现在有文件内容
                 let host = unsafe { v.host.add(from as usize) };
-                // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
-                unsafe { self.mmu.map(s + from, host, extent - from, mmu_prot(prot)) }.ok()?;
+                Self::map_pages(&mut self.mmu, s + from, host, extent - from, prot).ok()?;
                 self.vmas.get_mut(&s).unwrap().file_len = extent;
                 return Some(false);
             }
@@ -578,12 +612,11 @@ impl Mm {
         };
         // st_dev 在 macOS 上是 i32
         #[allow(clippy::unnecessary_cast)]
-        let shared_file = match file {
-            Some((fd, offset, _)) if shared => appine_hal::fstat(fd)
+        let file_id = file.and_then(|(fd, offset, _)| {
+            appine_hal::fstat(fd)
                 .ok()
-                .map(|s| (s.st_dev as u64, s.st_ino as u64, offset)),
-            _ => None,
-        };
+                .map(|s| (s.st_dev as u64, s.st_ino as u64, offset))
+        });
         let dup = match file {
             // SAFETY: fd 在这次调用期间一直打开着
             Some((fd, offset, _)) if shared => Some((
@@ -599,7 +632,7 @@ impl Mm {
         self.insert(start, len, prot, backing, may_write, region, host)?;
         let v = self.vmas.get_mut(&start).unwrap();
         v.file_len = file_len;
-        v.shared_file = shared_file;
+        v.file_id = file_id;
         v.file = dup;
         self.trim_to_file(start)?;
         Ok(start)
@@ -715,7 +748,7 @@ impl Mm {
             host,
             file_len,
             cow: false,
-            shared_file: template.shared_file.map(|(d, i, o)| (d, i, o + offset)),
+            file_id: template.file_id.map(|(d, i, o)| (d, i, o + offset)),
             file,
             shm: None,
             locked: template.locked,
@@ -925,7 +958,7 @@ impl Mm {
         let head_len = addr - s;
         tail.len -= head_len;
         tail.file_len = v.file_len.saturating_sub(head_len);
-        if let Some(f) = &mut tail.shared_file {
+        if let Some(f) = &mut tail.file_id {
             f.2 += head_len;
         }
         if let Some(f) = &mut tail.file {
@@ -1019,19 +1052,27 @@ impl Mm {
                 self.code_ranges.push((s, v.len));
             }
             // 只增加权限时 TLB 里的旧表项只是少了权限，未命中时会重新填写，不必刷新
-            self.dirty |= mmu_prot(v.prot) & !mmu_prot(prot) != 0;
+            let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
+            self.dirty |= old & !new != 0;
+            // PROT_NONE 的页不在页表里（[`Mm::map_pages`]）：去掉全部权限时拿掉，从没有
+            // 权限变成有权限时放进去（文件映射只放文件末尾之前的部分）
+            if new == 0 {
+                self.mmu.unmap(s, v.len).map_err(map_err)?;
+            } else if old == 0 {
+                Self::map_pages(&mut self.mmu, s, v.host, v.file_len, prot)?;
+            } else {
+                self.mmu.protect(s, v.len, new).map_err(map_err)?;
+            }
             v.prot = prot;
             if prot & prot::WRITE != 0 {
                 v.written.set(true);
             }
         }
-        self.mmu
-            .protect(addr, len, mmu_prot(prot))
-            .map_err(map_err)?;
         Ok(())
     }
 
-    /// madvise(MADV_DONTNEED)：匿名内存清零，其余映射保持不变。区间必须完全已映射。
+    /// madvise(MADV_DONTNEED)：匿名内存交给宿主回收（之后读到零），其余映射保持不变。
+    /// 区间必须完全已映射。
     pub fn discard(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         let len = page_up(len).ok_or(Errno::EINVAL)?;
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
@@ -1050,13 +1091,9 @@ impl Mm {
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((cursor, stop - cursor));
                 }
-                // SAFETY: [cursor, stop) 落在这个 VMA 内，对应的宿主内存由它持有
+                // SAFETY: [cursor, stop) 落在这个 VMA 内，对应的宿主内存是它私有的匿名内存
                 unsafe {
-                    std::ptr::write_bytes(
-                        v.host.as_ptr().add((cursor - s) as usize),
-                        0,
-                        (stop - cursor) as usize,
-                    )
+                    discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
                 };
             }
             cursor = stop;
@@ -1103,7 +1140,7 @@ impl Mm {
             c.name = v.name.clone();
             c.file_len = v.file_len;
             c.cow = v.cow && share;
-            c.shared_file = v.shared_file;
+            c.file_id = v.file_id;
             c.file = v.file.clone();
             c.shm = v.shm;
             child.trim_to_file(start)?;
@@ -1119,10 +1156,7 @@ impl Mm {
         unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
         // 超出文件末尾的页仍然不进页表
         let (file_len, p) = (v.file_len, v.prot);
-        if file_len > 0 {
-            // SAFETY: region 由 VMA 持有，生命周期不短于页表里的映射
-            unsafe { self.mmu.map(start, host, file_len, mmu_prot(p)) }.map_err(map_err)?;
-        }
+        Self::map_pages(&mut self.mmu, start, host, file_len, p)?;
         let v = self.vmas.get_mut(&start).unwrap();
         let old = std::mem::replace(&mut v.region, region);
         v.host = host;
@@ -1131,6 +1165,35 @@ impl Mm {
         self.graveyard.push(old);
         self.dirty = true;
         Ok(())
+    }
+
+    /// 宿主文件 (`dev`, `ino`) 被截短成 `size` 字节：映射它的 VMA 里超出新末尾的页从
+    /// 页表里拿掉，之后 guest 访问得到 SIGBUS，与 Linux 的 truncate 相同。不拿掉的话，
+    /// 宿主访问超出文件末尾的映射会收到 SIGBUS，整个 App 退出。返回有没有改动，有改动时
+    /// 要做 shootdown（[`Mm::sync`]）。
+    pub fn file_truncated(&mut self, dev: u64, ino: u64, size: u64) -> bool {
+        let mut changed = false;
+        for (&s, v) in self.vmas.iter_mut() {
+            let Some((d, i, offset)) = v.file_id else {
+                continue;
+            };
+            let extent = size
+                .saturating_sub(offset)
+                .next_multiple_of(PAGE_SIZE)
+                .min(v.len);
+            if (d, i) != (dev, ino) || extent >= v.file_len {
+                continue;
+            }
+            // unmap 只会因为参数不合法失败，这里的区间来自 VMA
+            let _ = self.mmu.unmap(s + extent, v.file_len - extent);
+            if v.prot & prot::EXEC != 0 {
+                self.code_ranges.push((s + extent, v.file_len - extent));
+            }
+            v.file_len = extent;
+            changed = true;
+        }
+        self.dirty |= changed;
+        changed
     }
 
     /// 给起点落在 `[start, start + len)` 里的映射起名字（`/proc/<pid>/maps` 用）。
@@ -1258,20 +1321,32 @@ impl Mm {
         }
     }
 
-    /// 内核自己往 guest 内存写入，比如加载程序、构造初始栈。只要求已映射，不检查权限。
+    /// 内核自己往 guest 内存写入，比如加载程序、构造初始栈。只要求已映射，不检查权限，
+    /// 所以按 VMA 找宿主内存：`PROT_NONE` 的页不在页表里。文件映射超出文件末尾的部分
+    /// 不能写。
     pub(crate) fn write_kernel(&self, addr: u64, data: &[u8]) -> Result<(), Errno> {
-        let end = addr.saturating_add(data.len() as u64);
-        for (_, v) in self
-            .vmas
-            .range(..end)
-            .rev()
-            .take_while(|(s, v)| *s + v.len > addr)
-        {
+        let mut done = 0;
+        while done < data.len() {
+            let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
+            let (&s, v) = self
+                .vmas
+                .range(..=cur)
+                .next_back()
+                .filter(|&(&s, v)| cur < s + v.file_len)
+                .ok_or(Errno::EFAULT)?;
+            let chunk = ((s + v.file_len - cur) as usize).min(data.len() - done);
             v.written.set(true);
+            // SAFETY: [cur, cur + chunk) 落在这个 VMA 有内容的部分，宿主内存由它持有
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data[done..].as_ptr(),
+                    v.host.as_ptr().add((cur - s) as usize),
+                    chunk,
+                )
+            };
+            done += chunk;
         }
-        self.for_each_page(addr, data.len(), 0, |host, done, chunk| unsafe {
-            std::ptr::copy_nonoverlapping(data[done..].as_ptr(), host, chunk);
-        })
+        Ok(())
     }
 
     /// 按页遍历 `[addr, addr + len)`，对每一段调用 `f(宿主指针, 已处理字节数, 本段长度)`。
@@ -1515,12 +1590,13 @@ mod tests {
         assert_eq!(&buf, b"heap");
         child.read(UserSlice::new(text, 4), &mut buf).unwrap();
         assert_eq!(&buf, b"code");
-        let host = child.mmu().translate(hidden, 0).unwrap();
-        // SAFETY: translate 返回的页在 child 存续期间有效
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(host.as_ptr(), 4) },
-            b"kept"
-        );
+        // PROT_NONE 的页不在页表里，权限加回来之后内容还在
+        let mut child = child;
+        assert!(child.mmu().translate(hidden, 0).is_none());
+        assert!(child.mmu().translate(reserved + PAGE_SIZE, 0).is_none());
+        child.mprotect(hidden, PAGE_SIZE, prot::READ).unwrap();
+        child.read(UserSlice::new(hidden, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"kept");
         assert!(!child.vmas[&(reserved + PAGE_SIZE)].written.get());
     }
 
@@ -1611,6 +1687,100 @@ mod tests {
         // 不在任何映射里的地址交给普通的 SIGSEGV 处理
         assert_eq!(mm.fault_past_eof(a + 4 * PAGE_SIZE), None);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncation_removes_pages_past_the_new_end() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("appine-trunc-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(3 * PAGE_SIZE).unwrap();
+        let mut mm = Mm::new();
+        let file = |shared| Some((f.as_raw_fd(), 0, shared));
+        let shared = mm
+            .mmap(0, 3 * PAGE_SIZE, RW, flags::MAP_SHARED, file(true))
+            .unwrap();
+        let private = mm
+            .mmap(
+                0,
+                3 * PAGE_SIZE,
+                prot::READ,
+                flags::MAP_PRIVATE,
+                file(false),
+            )
+            .unwrap();
+        let hidden = mm
+            .mmap(0, 3 * PAGE_SIZE, 0, flags::MAP_PRIVATE, file(false))
+            .unwrap();
+        let meta = f.metadata().unwrap();
+        // 别的文件变短不影响这些映射
+        assert!(!mm.file_truncated(meta.dev(), meta.ino() + 1, 0));
+        f.set_len(PAGE_SIZE + 10).unwrap();
+        assert!(mm.file_truncated(meta.dev(), meta.ino(), PAGE_SIZE + 10));
+        for a in [shared, private] {
+            // 文件末尾所在的那一页还在，后面的页访问时得到 SIGBUS
+            assert!(mm.mmu().translate(a + PAGE_SIZE, prot::READ).is_some());
+            assert!(mm.mmu().translate(a + 2 * PAGE_SIZE, 0).is_none());
+            assert_eq!(mm.fault_past_eof(a + 2 * PAGE_SIZE), Some(true));
+        }
+        // 没有权限的映射改成可读时也只放文件末尾之前的页
+        mm.mprotect(hidden, 3 * PAGE_SIZE, prot::READ).unwrap();
+        assert!(mm.mmu().translate(hidden + PAGE_SIZE, prot::READ).is_some());
+        assert!(mm.mmu().translate(hidden + 2 * PAGE_SIZE, 0).is_none());
+        // 再次截短到同样的长度没有改动；共享映射的文件变长之后可以接着访问
+        assert!(!mm.file_truncated(meta.dev(), meta.ino(), PAGE_SIZE + 10));
+        f.set_len(3 * PAGE_SIZE).unwrap();
+        assert_eq!(mm.fault_past_eof(shared + 2 * PAGE_SIZE), Some(false));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prot_none_stays_out_of_the_page_table() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_NORESERVE;
+        // V8 为一块 wasm 内存预留的大小：一页都不进页表
+        let a = mm.mmap(0, 1 << 33, 0, anon, None).unwrap();
+        let page = a + (1 << 32);
+        assert!(mm.mmu().translate(page, 0).is_none());
+        mm.mprotect(page, PAGE_SIZE, RW).unwrap();
+        mm.write(UserSlice::new(page, 2), b"hi").unwrap();
+        assert!(mm.mmu().translate(page + PAGE_SIZE, 0).is_none());
+        // 去掉权限再加回来，内容还在
+        mm.mprotect(page, PAGE_SIZE, 0).unwrap();
+        assert!(mm.mmu().translate(page, 0).is_none());
+        mm.mprotect(page, PAGE_SIZE, prot::READ).unwrap();
+        let mut buf = [0u8; 2];
+        mm.read(UserSlice::new(page, 2), &mut buf).unwrap();
+        assert_eq!(&buf, b"hi");
+        // 内核写入不看页表：没有权限的页也能写
+        mm.write_kernel(a, b"k").unwrap();
+        mm.munmap(a, 1 << 33).unwrap();
+        assert!(mm.mmu().translate(page, 0).is_none());
+    }
+
+    #[test]
+    fn discard_zeroes_private_anonymous_memory() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let len = 8 * PAGE_SIZE;
+        let a = mm.mmap(0, len, RW, anon, None).unwrap();
+        mm.write(UserSlice::new(a, len as usize), &vec![7u8; len as usize])
+            .unwrap();
+        // 不按宿主页对齐的一段：中间交给宿主，两头清零
+        mm.discard(a + PAGE_SIZE, 5 * PAGE_SIZE).unwrap();
+        let mut buf = vec![0u8; len as usize];
+        mm.read(UserSlice::new(a, len as usize), &mut buf).unwrap();
+        let p = PAGE_SIZE as usize;
+        assert!(buf[..p].iter().all(|&b| b == 7));
+        assert!(buf[p..6 * p].iter().all(|&b| b == 0));
+        assert!(buf[6 * p..].iter().all(|&b| b == 7));
     }
 
     #[test]

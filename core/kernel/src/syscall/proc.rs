@@ -188,6 +188,7 @@ pub(super) fn clone(
         },
         saved_sigmask: None,
         vfork_done: vfork_done.clone(),
+        restart: None,
     };
     let tgid = if thread { cx.tgid() } else { tid };
     let task = Task::new(

@@ -243,15 +243,30 @@ fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
 
 pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
     let t = read_timespec(cx, req)?;
-    match sleep_until(cx, Instant::now() + t) {
+    sleep_rest(cx, Instant::now() + t, rem)
+}
+
+/// 睡到 `deadline`。被信号打断时把剩下的时长写进 `rem`（不为 0 时），并记下到期时刻：
+/// 没有处理函数打断时（比如停止之后又继续）由 restart_syscall 接着睡，而不是按原来的
+/// 时长重新睡一遍。
+fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
+    match sleep_until(cx, deadline) {
         Ok(()) => Ok(0),
         Err(left) => {
             if rem != 0 {
                 write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
             }
-            // 没有处理函数的信号打断时按原来的时长重新执行（还没有 restart_syscall）
-            Err(Errno::ERESTARTNOHAND)
+            cx.t.restart = Some((deadline, rem));
+            Err(Errno::ERESTART_RESTARTBLOCK)
         }
+    }
+}
+
+/// restart_syscall：接着做被打断的 nanosleep。与 Linux 相同，没有可以接着做的时返回 EINTR。
+pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
+    match cx.t.restart.take() {
+        Some((deadline, rem)) => sleep_rest(cx, deadline, rem),
+        None => Err(Errno::EINTR),
     }
 }
 
@@ -374,20 +389,14 @@ pub(super) fn clock_nanosleep(
         }
         return Ok(0);
     }
-    let deadline = if flags & TIMER_ABSTIME != 0 {
-        deadline_from_clock(clock, t)?
-    } else {
+    if flags & TIMER_ABSTIME == 0 {
         appine_hal::clock_gettime(clock).map_err(Errno)?;
-        Instant::now() + t
-    };
-    match sleep_until(cx, deadline) {
+        return sleep_rest(cx, Instant::now() + t, rem);
+    }
+    // 绝对时刻：重新执行同样的参数就是接着睡
+    match sleep_until(cx, deadline_from_clock(clock, t)?) {
         Ok(()) => Ok(0),
-        Err(left) => {
-            if rem != 0 && flags & TIMER_ABSTIME == 0 {
-                write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
-            }
-            Err(Errno::ERESTARTNOHAND)
-        }
+        Err(_) => Err(Errno::ERESTARTNOHAND),
     }
 }
 

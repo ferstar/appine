@@ -69,6 +69,14 @@ static uintptr_t *leaf_slot(struct appine_mmu *mmu, uint64_t gva, bool alloc)
     return &table[level_index(gva, LEVELS - 1)];
 }
 
+/* 从 gva + off 到下一张叶子表（512 页）起点的偏移：没有中间表的地方整张跳过，
+ * 解除或修改 V8、JVM 预留的大片地址空间时不必逐页查找 */
+static uint64_t next_table(uint64_t gva, uint64_t off)
+{
+    uint64_t span = (uint64_t)APPINE_PAGE_SIZE << LEVEL_BITS;
+    return (((gva + off) | (span - 1)) + 1) - gva;
+}
+
 static bool range_ok(uint64_t gva, uint64_t len)
 {
     uint64_t limit = UINT64_C(1) << APPINE_VA_BITS;
@@ -114,10 +122,14 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
 {
     if (!range_ok(gva, len))
         return APPINE_EINVAL;
-    for (uint64_t off = 0; off < len; off += APPINE_PAGE_SIZE) {
+    for (uint64_t off = 0; off < len;) {
         uintptr_t *slot = leaf_slot(mmu, gva + off, false);
-        if (slot)
-            store_entry(slot, 0);
+        if (!slot) {
+            off = next_table(gva, off);
+            continue;
+        }
+        store_entry(slot, 0);
+        off += APPINE_PAGE_SIZE;
     }
     return APPINE_OK;
 }
@@ -126,11 +138,16 @@ int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint3
 {
     if (!range_ok(gva, len) || (prot & ~PTE_PROT_MASK))
         return APPINE_EINVAL;
-    for (uint64_t off = 0; off < len; off += APPINE_PAGE_SIZE) {
+    for (uint64_t off = 0; off < len;) {
         uintptr_t *slot = leaf_slot(mmu, gva + off, false);
-        uintptr_t old = slot ? load_entry(slot) : 0;
+        if (!slot) {
+            off = next_table(gva, off);
+            continue;
+        }
+        uintptr_t old = load_entry(slot);
         if (old)
             store_entry(slot, (old & ~(uintptr_t)PTE_PROT_MASK) | prot);
+        off += APPINE_PAGE_SIZE;
     }
     return APPINE_OK;
 }
