@@ -5,6 +5,11 @@
 //! 的前台服务为每个终端标签页开一个控制台和一个登录 shell；`appine-run` 只启动一个
 //! 进程（[`run`]）。方法可以在任意宿主线程上调用，阻塞的方法和 guest 线程一样走统一的
 //! 等待机制。间隔定时器由一个宿主线程负责（[`crate::itimer`]）。
+//!
+//! 方法里的内核代码撞上内核层的 bug（panic）时，只让这次调用失败
+//! （[`crate::bug::host_call`]）：返回 EIO 或者 [`RunError::Internal`]，出错的是一个控制台上
+//! 的调用时还挂断那个控制台，免得终端标签页卡在坏掉的控制台上。只读一张表的方法
+//! （[`Machine::wait`] 等）不需要。
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -70,6 +75,11 @@ thread_local! {
 impl Machine {
     /// 建立内核实例：打开 inode 仓库，建好内置的 init（pid 1）。
     pub fn start(options: &MachineOptions) -> Result<Machine, RunError> {
+        crate::bug::host_call("Machine::start", || Self::start_kernel(options))
+            .unwrap_or(Err(RunError::Internal))
+    }
+
+    fn start_kernel(options: &MachineOptions) -> Result<Machine, RunError> {
         if options.tier == Tier::Dbt && Dbt::new().is_none() {
             return Err(RunError::TierUnavailable);
         }
@@ -106,6 +116,19 @@ impl Machine {
     /// 启动一个新进程（init 的子进程），返回它的 pid。设置了仓库时 `program` 是 guest
     /// 文件系统里的路径，否则是宿主路径。
     pub fn spawn(
+        &self,
+        program: &[u8],
+        argv: &[Vec<u8>],
+        envp: &[Vec<u8>],
+        stdio: Stdio,
+    ) -> Result<u32, RunError> {
+        crate::bug::host_call("Machine::spawn", || {
+            self.spawn_process(program, argv, envp, stdio)
+        })
+        .unwrap_or(Err(RunError::Internal))
+    }
+
+    fn spawn_process(
         &self,
         program: &[u8],
         argv: &[Vec<u8>],
@@ -241,7 +264,7 @@ impl Machine {
     }
 
     /// 新建一个控制台，返回它的 PTY 编号（`/dev/pts/<编号>`）。
-    pub fn open_console(&self, rows: u16, cols: u16) -> u32 {
+    pub fn open_console(&self, rows: u16, cols: u16) -> Result<u32, Errno> {
         self.open_console_with(Winsize {
             rows,
             cols,
@@ -249,14 +272,22 @@ impl Machine {
         })
     }
 
-    fn open_console_with(&self, size: Winsize) -> u32 {
-        terminal::open(&mut self.shared.lock(), size)
+    fn open_console_with(&self, size: Winsize) -> Result<u32, Errno> {
+        crate::bug::host_call("Machine::open_console", || {
+            terminal::open(&mut self.shared.lock(), size)
+        })
+        .ok_or(Errno::EIO)
     }
 
     /// 读控制台的输出，没有输出时等待。返回 0 表示会话结束：所有从设备都关闭了，
     /// 输出也已经读完。
     pub fn read_console(&self, id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
-        let out = self.wait_for(|k| terminal::take_output(k, id, buf.len()).transpose())?;
+        let out = self.wait_for(|k| {
+            on_console(k, id, "Machine::read_console", |k| {
+                terminal::take_output(k, id, buf.len())
+            })
+            .transpose()
+        })?;
         buf[..out.len()].copy_from_slice(&out);
         Ok(out.len())
     }
@@ -268,19 +299,19 @@ impl Machine {
             return Ok(0);
         }
         self.wait_for(|k| {
-            let room = match terminal::input_room(k, id) {
-                Ok(room) => room,
-                Err(e) => return Some(Err(e)),
-            };
-            if room > 0 {
-                let n = room.min(data.len());
-                return Some(terminal::feed(k, id, &data[..n]).map(|()| n));
-            }
-            // 输入队列满了，但已经没有进程会读它
-            match terminal::take_output(k, id, 0) {
-                Ok(Some(_)) => Some(Err(Errno::EIO)),
-                _ => None,
-            }
+            on_console(k, id, "Machine::write_console", |k| {
+                let room = terminal::input_room(k, id)?;
+                if room > 0 {
+                    let n = room.min(data.len());
+                    return terminal::feed(k, id, &data[..n]).map(|()| Some(n));
+                }
+                // 输入队列满了，但已经没有进程会读它
+                match terminal::take_output(k, id, 0) {
+                    Ok(Some(_)) => Err(Errno::EIO),
+                    _ => Ok(None),
+                }
+            })
+            .transpose()
         })
     }
 
@@ -291,17 +322,25 @@ impl Machine {
             cols,
             ..Winsize::default()
         };
-        terminal::resize(&self.shared.lock(), id, w)
+        on_console(
+            &mut self.shared.lock(),
+            id,
+            "Machine::resize_console",
+            |k| terminal::resize(k, id, w),
+        )
     }
 
     /// 关闭控制台（终端标签页关闭）：会话组长收到 SIGHUP。
     pub fn close_console(&self, id: u32) -> Result<(), Errno> {
-        terminal::close(&mut self.shared.lock(), id)
+        crate::bug::host_call("Machine::close_console", || {
+            terminal::close(&mut self.shared.lock(), id)
+        })
+        .unwrap_or(Err(Errno::EIO))
     }
 
     /// 结束所有 guest 进程，等所有 guest 线程退出。
     pub fn kill_all(&self) {
-        {
+        crate::bug::host_call("Machine::kill_all", || {
             let k = self.shared.lock();
             let groups: Vec<_> = k.groups.values().cloned().collect();
             for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
@@ -315,7 +354,7 @@ impl Machine {
                     },
                 );
             }
-        }
+        });
         self.wait_for(|k| k.tasks.is_empty().then_some(()));
     }
 
@@ -323,6 +362,20 @@ impl Machine {
     pub fn dbt_stats(&self) -> Option<DbtStats> {
         self.shared.lock().dbt_stats
     }
+}
+
+/// 执行控制台 `id` 上的宿主调用。内核层 panic 时像终端被挂断一样关闭这个控制台（会话组长
+/// 收到 SIGHUP），返回 EIO。
+fn on_console<T>(
+    k: &mut Kernel,
+    id: u32,
+    what: &str,
+    f: impl FnOnce(&mut Kernel) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    crate::bug::host_call(what, || f(k)).unwrap_or_else(|| {
+        let _ = crate::bug::host_call("Machine::close_console", || terminal::close(k, id));
+        Err(Errno::EIO)
+    })
 }
 
 impl Drop for Machine {
@@ -341,16 +394,33 @@ impl Drop for Machine {
 
 /// 定时器线程：等到最早的到期时刻，发出到期的 SIGALRM（[`crate::itimer::expire`]），
 /// 有 guest 线程在运行时定时检查内存的上限（[`crate::oom`]），直到 Machine 关闭。
+///
+/// 撞上内核层的 bug 时（[`crate::bug`]）照常运行：处理一个进程的定时器时出错，结束那个
+/// 进程；内存上限的检查和信号驱动的 I/O 分不出是哪个进程的，出错时关掉这项功能。
 fn timers(shared: Arc<Shared>) {
     let event = shared.timers.clone();
     let mut k = shared.lock();
     while !k.shutting_down {
         let mut next = crate::itimer::expire(&k);
-        if let Some(check) = crate::oom::check(&mut k, &shared) {
-            next = Some(next.map_or(check, |n| n.min(check)));
+        match crate::bug::catch(|| crate::oom::check(&mut k, &shared)) {
+            Some(Some(check)) => next = Some(next.map_or(check, |n| n.min(check))),
+            Some(None) => {}
+            None => {
+                crate::bug::report(format_args!(
+                    "kernel panic in the OOM killer; the memory limit is off"
+                ));
+                k.oom.limit = u64::MAX;
+            }
         }
         // 信号驱动的 I/O：任何修改都会叫醒这个线程，顺便检查；宿主 socket 一起等
-        let mut host = crate::syscall::check_fasync(&mut k);
+        let fasync = crate::bug::catch(|| crate::syscall::check_fasync(&mut k));
+        let mut host = fasync.unwrap_or_else(|| {
+            crate::bug::report(format_args!(
+                "kernel panic in signal-driven I/O; no more SIGIO for the files that used it"
+            ));
+            k.fasync.clear();
+            Vec::new()
+        });
         let (k2, _) = block(&shared, k, &event, next, &mut host, true);
         k = k2;
     }
@@ -372,12 +442,13 @@ pub fn run(
         memory_limit: options.memory_limit,
     })?;
     // 有终端时，进程是会话组长，接到宿主终端的控制台是它的控制终端
-    let console = options.terminal.map(|term| {
-        (
-            term,
-            machine.open_console_with(terminal::initial_size(&term)),
-        )
-    });
+    let console = options
+        .terminal
+        .map(|term| {
+            let id = machine.open_console_with(terminal::initial_size(&term));
+            id.map(|id| (term, id)).map_err(RunError::Console)
+        })
+        .transpose()?;
     let stdio = console.map_or(Stdio::Host, |(_, id)| Stdio::Console(id));
     let pid = machine.spawn(program.as_bytes(), argv, envp, stdio)?;
     let bridge = console.map(|(term, id)| {

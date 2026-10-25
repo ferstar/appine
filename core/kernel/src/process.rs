@@ -201,6 +201,8 @@ pub enum RunError {
     Console(Errno),
     /// 当前宿主不支持所选的执行引擎。
     TierUnavailable,
+    /// 内核层的 bug（panic），报告在宿主的 stderr 上（设计文档 §12 第 5 条）。
+    Internal,
 }
 
 impl fmt::Display for RunError {
@@ -218,6 +220,7 @@ impl fmt::Display for RunError {
             RunError::TierUnavailable => {
                 f.write_str("the selected tier is not supported on this host")
             }
+            RunError::Internal => f.write_str("internal error"),
         }
     }
 }
@@ -534,8 +537,50 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     }
     k.ipc.exit(tgid);
     release_ctty(k, group);
+    hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
+    // POSIX：进程组因为这次退出变成孤儿时，如果组里有停住的进程，先发 SIGHUP 再发
+    // SIGCONT，否则它们再也没有机会继续
+    pgrps.sort_unstable();
+    pgrps.dedup();
+    for pgid in pgrps {
+        let stopped = k
+            .groups
+            .values()
+            .any(|g| g.borrow().pgid == pgid && g.borrow().stopped);
+        if stopped && signal::pgrp_orphaned(k, pgid) {
+            signal::send_to_pgrp(k, pgid, Signal::HUP, SigInfo::kernel());
+            signal::send_to_pgrp(k, pgid, Signal::CONT, SigInfo::kernel());
+        }
+    }
+    request_wake();
+}
 
-    // 父进程是 init、已经不在了，或者忽略 SIGCHLD（SIG_IGN、SA_NOCLDWAIT）时直接回收
+/// [`finish_group`] 中途撞上内核层的 bug 之后（[`crate::bug`]）：至少让宿主等得到它结束、
+/// 父进程能回收它。做到一半的其余部分（子进程交给 init、孤儿进程组的信号等）只能放弃。
+pub(crate) fn finish_group_after_bug(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let (ids, status, handed) = {
+        let g = group.borrow();
+        let status = g.exiting.unwrap_or(ExitStatus::Exited(g.leader_code));
+        let handed = g.zombie.is_some() || !k.groups.contains_key(&g.tgid);
+        ((g.tgid, g.ppid, g.exit_signal), status, handed)
+    };
+    if let Some(slot) = k.watched.get_mut(&ids.0) {
+        *slot = Some(status);
+    }
+    if !handed {
+        hand_to_parent(k, group, ids, status);
+    }
+    request_wake();
+}
+
+/// 退出的进程（`tgid`、`ppid`、`exit_signal`）交给父进程：父进程是 init、已经不在了，
+/// 或者忽略 SIGCHLD（SIG_IGN、SA_NOCLDWAIT）时直接回收，否则变成僵尸进程并通知父进程。
+fn hand_to_parent(
+    k: &mut Kernel,
+    group: &Rc<RefCell<ThreadGroup>>,
+    (tgid, ppid, exit_signal): (Tid, Tid, i32),
+    status: ExitStatus,
+) {
     let parent = k.groups.get(&ppid).cloned();
     let reap = ppid == INIT
         || parent.as_ref().is_none_or(|p| {
@@ -553,21 +598,6 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             signal::send_to_group(k, ppid, sig, SigInfo::child(tgid, status));
         }
     }
-    // POSIX：进程组因为这次退出变成孤儿时，如果组里有停住的进程，先发 SIGHUP 再发
-    // SIGCONT，否则它们再也没有机会继续
-    pgrps.sort_unstable();
-    pgrps.dedup();
-    for pgid in pgrps {
-        let stopped = k
-            .groups
-            .values()
-            .any(|g| g.borrow().pgid == pgid && g.borrow().stopped);
-        if stopped && signal::pgrp_orphaned(k, pgid) {
-            signal::send_to_pgrp(k, pgid, Signal::HUP, SigInfo::kernel());
-            signal::send_to_pgrp(k, pgid, Signal::CONT, SigInfo::kernel());
-        }
-    }
-    request_wake();
 }
 
 /// 会话组长退出：控制终端不再属于这个会话，前台进程组收到 SIGHUP 和 SIGCONT

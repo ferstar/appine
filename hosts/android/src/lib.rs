@@ -4,7 +4,8 @@
 //! [`Machine`] 以 `Arc` 的裸指针交给 Kotlin（`long` 句柄），每次调用临时增加一个引用，
 //! 所以 `stop` 和别的线程上正在阻塞的读并发时也是安全的：最后一个引用消失时才析构。
 //! 出错时抛出 `java.io.IOException`。阻塞的调用（读控制台、等进程结束）由 Kotlin 在
-//! 后台线程上进行。
+//! 后台线程上进行。内核层的 bug（panic）在 [`Machine`] 的方法里就兜住了，变成这些调用
+//! 的错误，不会穿过 JNI 边界让 App 进程 abort。
 //!
 //! 只为 Android 编译，其他宿主上是一个空库。
 #![cfg(target_os = "android")]
@@ -179,13 +180,20 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_openConsole<'l>(
-    _: JNIEnv<'l>,
+    mut env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
     rows: jint,
     cols: jint,
 ) -> jint {
-    machine(handle).open_console(rows.clamp(1, 0xffff) as u16, cols.clamp(1, 0xffff) as u16) as jint
+    let (rows, cols) = (rows.clamp(1, 0xffff) as u16, cols.clamp(1, 0xffff) as u16);
+    match machine(handle).open_console(rows, cols) {
+        Ok(id) => id as jint,
+        Err(e) => {
+            throw(&mut env, format!("cannot open a console: {e}"));
+            -1
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

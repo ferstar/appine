@@ -84,11 +84,12 @@ addresses (`g_<pc>`). `--stats` prints how many blocks were translated and why t
 exited.
 
 A bug in the kernel layer or the engine (a panic, or the engine faulting on host memory) kills
-only the guest process that hit it in release builds, with a report on stderr. Debug builds
-abort the whole `appine-run` instead, so the bug can be debugged where it happened;
-`APPINE_ON_BUG=kill` or `APPINE_ON_BUG=abort` overrides the default. When appine's anonymous
-memory exceeds `--memory-limit` (default: half the RAM), the guest process using the most
-memory is killed with SIGKILL, like the Linux OOM killer.
+only the guest process that hit it in release builds, with a report on stderr; a panic in a
+`Machine` method called by the host only fails that call. Debug builds abort the whole
+`appine-run` instead, so the bug can be debugged where it happened; `APPINE_ON_BUG=kill` or
+`APPINE_ON_BUG=abort` overrides the default. When appine's anonymous memory exceeds
+`--memory-limit` (default: half the RAM), the guest process using the most memory is killed
+with SIGKILL, like the Linux OOM killer.
 
 ### Differential tests
 
@@ -117,8 +118,14 @@ login shell on an in-process terminal. It needs the Android SDK with NDK 29.0.14
 
 ```sh
 scripts/fetch-rootfs
-cd android && ./gradlew installDebug   # on a connected arm64 device or emulator (Android 10+)
+cd android
+./gradlew installDebug                 # on a connected arm64 device or emulator (Android 10+)
+./gradlew connectedDebugAndroidTest    # instrumentation tests, on the same kind of device
 ```
+
+The native library is always a release build. In the debug app it also has the test hooks
+(the `test-hooks` feature), which the instrumentation tests use to simulate kernel and engine
+bugs inside the app process; they do nothing unless `APPINE_TEST_HOOKS=1` is set.
 
 ## License
 

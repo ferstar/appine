@@ -15,10 +15,12 @@
 //!   `SI_TIMER` 信号（`SIGEV_THREAD_ID` 时发给指定线程）。上一个信号还没被取走时
 //!   不再发，只把超限次数（overrun）记在那个挂起的信号里。
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
+use crate::bug::Trap;
 use crate::kernel::{Kernel, Tid};
-use crate::process::{RLIMIT_CPU, Signal};
+use crate::process::{RLIMIT_CPU, Signal, ThreadGroup};
 use crate::signal::{self, InfoFields, Pending, SigInfo, code};
 
 /// 一个进程的 `ITIMER_REAL`。
@@ -161,97 +163,124 @@ impl PosixTimer {
 }
 
 /// 给定时器到期的进程发信号，返回下一次要检查的时刻。
+///
+/// 处理一个进程时撞上内核层的 bug（[`crate::bug`]）：结束这个进程、清掉它的定时器，
+/// 其余的进程照常处理。
 pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
     let now = Instant::now();
     let mut next: Option<Instant> = None;
+    for (&tgid, group) in &k.groups {
+        match crate::bug::catch(|| expire_group(k, tgid, group, now)) {
+            Some(Some(n)) => next = Some(next.map_or(n, |m| m.min(n))),
+            Some(None) => {}
+            None => {
+                disarm(&mut group.borrow_mut());
+                crate::bug::kill_process(k, tgid, format_args!("kernel panic in its timers"));
+            }
+        }
+    }
+    next
+}
+
+/// 停掉进程的所有定时器。
+fn disarm(g: &mut ThreadGroup) {
+    g.itimer = None;
+    g.cpu_itimers = [None; 2];
+    g.posix_timers.clear();
+}
+
+/// 处理进程 `tgid` 的定时器，返回它下一次要检查的时刻。
+fn expire_group(
+    k: &Kernel,
+    tgid: Tid,
+    group: &RefCell<ThreadGroup>,
+    now: Instant,
+) -> Option<Instant> {
+    crate::bug::trap(Trap::Timers, tgid);
+    let mut next: Option<Instant> = None;
     let mut fired = Vec::new();
     let mut timer_fired = Vec::new();
-    for (&tgid, group) in &k.groups {
-        if group.borrow().threads.is_empty() {
-            let mut g = group.borrow_mut();
-            g.itimer = None;
-            g.cpu_itimers = [None; 2];
-            g.posix_timers.clear();
-            continue;
-        }
-        let cpu_limit = group.borrow().rlimits[RLIMIT_CPU as usize];
-        let cpu_armed =
-            group.borrow().cpu_itimers.iter().any(Option::is_some) || cpu_limit.0 != u64::MAX;
-        let cpu = if cpu_armed {
-            group.borrow().cpu_ns(k)
-        } else {
-            0
-        };
-        let mut g = group.borrow_mut();
-        if let Some(t) = g.itimer {
-            if t.deadline <= now {
-                fired.push((tgid, Signal::ALRM));
-                g.itimer = t.next(now);
-            }
-            if let Some(t) = g.itimer {
-                next = Some(next.map_or(t.deadline, |n| n.min(t.deadline)));
-            }
-        }
-        for (slot, sig) in [(0, Signal::VTALRM), (1, Signal::PROF)] {
-            if let Some(t) = g.cpu_itimers[slot]
-                && t.deadline <= cpu
-            {
-                fired.push((tgid, sig));
-                g.cpu_itimers[slot] = t.next(cpu);
-            }
-        }
-        if cpu_limit.0 != u64::MAX {
-            let secs = cpu / 1_000_000_000;
-            if secs >= cpu_limit.1 {
-                fired.push((tgid, Signal::KILL));
-            } else if secs >= cpu_limit.0 {
-                fired.push((tgid, Signal::XCPU));
-                g.rlimits[RLIMIT_CPU as usize].0 = cpu_limit.0 + 1;
-            }
-        }
-        if cpu_armed {
-            let tick = now + CPU_TICK;
-            next = Some(next.map_or(tick, |n| n.min(tick)));
-        }
-        let mut timers = std::mem::take(&mut g.posix_timers);
-        drop(g);
-        for (&id, t) in timers.iter_mut() {
-            if let Some(missed) = t.fire(k, now)
-                && let Some((sig, tid)) = t.signal
-            {
-                let info = SigInfo {
-                    code: code::SI_TIMER,
-                    fields: InfoFields::Timer {
-                        id,
-                        overrun: missed,
-                        value: t.value,
-                    },
-                    esr: 0,
-                };
-                if !add_overrun(k, tgid, tid, sig, id, missed) {
-                    let cpu = matches!(t.clock, Clock::Process(_));
-                    timer_fired.push((tgid, tid, sig, info, cpu));
-                }
-            }
-            match t.deadline {
-                Some(Deadline::At(d)) => next = Some(next.map_or(d, |n| n.min(d))),
-                Some(Deadline::Cpu(_)) => {
-                    let tick = now + CPU_TICK;
-                    next = Some(next.map_or(tick, |n| n.min(tick)));
-                }
-                None => {}
-            }
-        }
-        group.borrow_mut().posix_timers = timers;
+    if group.borrow().threads.is_empty() {
+        disarm(&mut group.borrow_mut());
+        return None;
     }
-    for (tgid, sig) in fired {
+    let cpu_limit = group.borrow().rlimits[RLIMIT_CPU as usize];
+    let cpu_armed =
+        group.borrow().cpu_itimers.iter().any(Option::is_some) || cpu_limit.0 != u64::MAX;
+    let cpu = if cpu_armed {
+        group.borrow().cpu_ns(k)
+    } else {
+        0
+    };
+    let mut g = group.borrow_mut();
+    if let Some(t) = g.itimer {
+        if t.deadline <= now {
+            fired.push(Signal::ALRM);
+            g.itimer = t.next(now);
+        }
+        if let Some(t) = g.itimer {
+            next = Some(next.map_or(t.deadline, |n| n.min(t.deadline)));
+        }
+    }
+    for (slot, sig) in [(0, Signal::VTALRM), (1, Signal::PROF)] {
+        if let Some(t) = g.cpu_itimers[slot]
+            && t.deadline <= cpu
+        {
+            fired.push(sig);
+            g.cpu_itimers[slot] = t.next(cpu);
+        }
+    }
+    if cpu_limit.0 != u64::MAX {
+        let secs = cpu / 1_000_000_000;
+        if secs >= cpu_limit.1 {
+            fired.push(Signal::KILL);
+        } else if secs >= cpu_limit.0 {
+            fired.push(Signal::XCPU);
+            g.rlimits[RLIMIT_CPU as usize].0 = cpu_limit.0 + 1;
+        }
+    }
+    if cpu_armed {
+        let tick = now + CPU_TICK;
+        next = Some(next.map_or(tick, |n| n.min(tick)));
+    }
+    let mut timers = std::mem::take(&mut g.posix_timers);
+    drop(g);
+    for (&id, t) in timers.iter_mut() {
+        if let Some(missed) = t.fire(k, now)
+            && let Some((sig, tid)) = t.signal
+        {
+            let info = SigInfo {
+                code: code::SI_TIMER,
+                fields: InfoFields::Timer {
+                    id,
+                    overrun: missed,
+                    value: t.value,
+                },
+                esr: 0,
+            };
+            if !add_overrun(k, tgid, tid, sig, id, missed) {
+                let cpu = matches!(t.clock, Clock::Process(_));
+                timer_fired.push((tid, sig, info, cpu));
+            }
+        }
+        match t.deadline {
+            Some(Deadline::At(d)) => next = Some(next.map_or(d, |n| n.min(d))),
+            Some(Deadline::Cpu(_)) => {
+                let tick = now + CPU_TICK;
+                next = Some(next.map_or(tick, |n| n.min(tick)));
+            }
+            None => {}
+        }
+    }
+    group.borrow_mut().posix_timers = timers;
+    for sig in fired {
         if sig == Signal::VTALRM || sig == Signal::PROF {
             signal::send_cpu_timer(k, tgid, sig, SigInfo::kernel());
         } else {
             signal::send_to_group(k, tgid, sig, SigInfo::kernel());
         }
     }
-    for (tgid, tid, sig, info, cpu) in timer_fired {
+    for (tid, sig, info, cpu) in timer_fired {
         match tid.and_then(|t| k.tasks.get(&t)) {
             Some(task) => signal::send_to_task(k, task, sig, info),
             None if cpu => signal::send_cpu_timer(k, tgid, sig, info),

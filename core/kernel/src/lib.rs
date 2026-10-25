@@ -52,23 +52,24 @@ pub fn write_file(
     mode: u32,
     overwrite: bool,
 ) -> Result<(), Errno> {
-    vfs::write_file(
-        &Store::open(store, &[])?,
-        path.as_bytes(),
-        data,
-        mode,
-        overwrite,
-    )
+    bug::host_call("write_file", || {
+        let store = Store::open(store, &[])?;
+        vfs::write_file(&store, path.as_bytes(), data, mode, overwrite)
+    })
+    .unwrap_or(Err(Errno::EIO))
 }
 
 /// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。
 ///
 /// 目录里已经有仓库时返回 `EEXIST`。导入失败时仓库保持为空。
 pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno> {
-    let file = std::fs::File::open(tarball)
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    let store = Store::create(store)?;
-    let report = vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))?;
-    vfs::dev::ensure_dev_nodes(&store)?;
-    Ok(report)
+    bug::host_call("import_rootfs", || {
+        let file = std::fs::File::open(tarball)
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        let store = Store::create(store)?;
+        let report = vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))?;
+        vfs::dev::ensure_dev_nodes(&store)?;
+        Ok(report)
+    })
+    .unwrap_or(Err(Errno::EIO))
 }

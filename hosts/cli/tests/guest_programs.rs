@@ -13,11 +13,21 @@ use std::process::{Command, Output};
 
 const TIERS: [&str; 2] = ["0", "1"];
 
+/// 编译好的 guest 程序的路径，和编译时写的临时文件：几个用例可能同时编译同一个程序，
+/// 各自写完再改名过去，免得运行到别人写了一半的文件。
+fn output(name: &str) -> (PathBuf, PathBuf) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let tmp = dir.join(format!("guest-{name}.{}.{n}", std::process::id()));
+    (dir.join(format!("guest-{name}")), tmp)
+}
+
 fn build_guest(name: &str) -> PathBuf {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/guest")
         .join(format!("{name}.S"));
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("guest-{name}"));
+    let (out, tmp) = output(name);
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
     let status = Command::new(&cc)
         .args([
@@ -27,11 +37,12 @@ fn build_guest(name: &str) -> PathBuf {
             "-Wl,--build-id=none",
             "-o",
         ])
-        .arg(&out)
+        .arg(&tmp)
         .arg(&src)
         .status()
         .unwrap_or_else(|e| panic!("failed to run {cc}: {e}"));
     assert!(status.success(), "assembling {} failed", src.display());
+    std::fs::rename(&tmp, &out).unwrap();
     out
 }
 
@@ -40,12 +51,12 @@ fn build_c_guest(name: &str) -> Option<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/guest")
         .join(format!("{name}.c"));
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("guest-{name}"));
+    let (out, tmp) = output(name);
     let status = Command::new("musl-gcc")
         .args([
             "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-o",
         ])
-        .arg(&out)
+        .arg(&tmp)
         .arg(&src)
         .status();
     let Ok(status) = status else {
@@ -57,6 +68,7 @@ fn build_c_guest(name: &str) -> Option<PathBuf> {
         return None;
     };
     assert!(status.success(), "compiling {} failed", src.display());
+    std::fs::rename(&tmp, &out).unwrap();
     Some(out)
 }
 
@@ -210,8 +222,8 @@ fn sockets_polling_and_timers() {
 
 #[test]
 fn bugs_kill_only_the_guest_process() {
-    // 内核层 panic、引擎让宿主出错（用 debug 构建的测试钩子模拟）都只结束撞上它的
-    // guest 进程，App 里别的照常运行
+    // 内核层 panic（进入内核时、线程开始和退出时、定时器线程上）、引擎让宿主出错（用
+    // debug 构建的测试钩子模拟）都只结束撞上它的 guest 进程，App 里别的照常运行
     if !cfg!(debug_assertions) {
         return;
     }
@@ -239,13 +251,114 @@ fn bugs_kill_only_the_guest_process() {
             stdout(&out)
         );
         // 0xa991 是测试钩子的 syscall 编号
-        for report in ["kernel panic in syscall 43409", "host signal 11"] {
+        for report in [
+            "kernel panic in syscall 43409",
+            "host signal 11",
+            "kernel panic while the thread was exiting",
+            "kernel panic while starting the thread",
+            "kernel panic in its timers",
+        ] {
             assert!(
                 stderr(&out).contains(report),
                 "tier {tier}: {}",
                 stderr(&out)
             );
         }
+    }
+}
+
+#[test]
+fn host_calls_survive_kernel_bugs() {
+    // 宿主调用 Machine 的方法时内核层 panic（测试钩子模拟）：只有这次调用失败，控制台上的
+    // 调用还挂断那个控制台，Machine 之后照常可用
+    use appine_kernel::errno::Errno;
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, RunError, Stdio, Tier};
+    use std::os::unix::ffi::OsStrExt;
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(program) = build_c_guest("bugs") else {
+        return;
+    };
+    // 内核层只在第一次撞上 bug 时读 APPINE_ON_BUG：在设置了它和 APPINE_TEST_HOOKS 的
+    // 子进程里重新运行这个用例
+    if std::env::var_os("APPINE_TEST_HOOKS").is_none() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host_calls_survive_kernel_bugs", "--nocapture"])
+            .env("APPINE_TEST_HOOKS", "1")
+            .env("APPINE_ON_BUG", "kill")
+            .output()
+            .expect("failed to rerun the test");
+        assert!(
+            out.status.success() && stdout(&out).contains("1 passed"),
+            "{}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        return;
+    }
+    let hello = build_guest("hello");
+    let path = |p: &Path| p.as_os_str().as_bytes().to_vec();
+    let argv = |mode: &str| [b"bugs".to_vec(), mode.as_bytes().to_vec()];
+    let read_all = |machine: &Machine, id: u32| {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        let end = loop {
+            match machine.read_console(id, &mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => break Err(e),
+            }
+        };
+        (String::from_utf8(out).unwrap(), end)
+    };
+    for tier in [Tier::Interpreter, Tier::Dbt] {
+        let machine = Machine::start(&MachineOptions {
+            tier,
+            rootfs: None,
+            memory_limit: None,
+        })
+        .unwrap();
+        // spawn 里出错：spawn 失败
+        let pid = machine
+            .spawn(
+                &path(&program),
+                &argv("host-call-then-exit"),
+                &[],
+                Stdio::Host,
+            )
+            .unwrap();
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+        let r = machine.spawn(&path(&hello), &[b"hello".to_vec()], &[], Stdio::Host);
+        assert!(matches!(r, Err(RunError::Internal)), "{tier:?}: {r:?}");
+        // 读控制台时出错：控制台被挂断，会话组长收到 SIGHUP
+        let id = machine.open_console(24, 80).unwrap();
+        let pid = machine
+            .spawn(
+                &path(&program),
+                &argv("host-call-then-read"),
+                &[],
+                Stdio::Console(id),
+            )
+            .unwrap();
+        assert_eq!(read_all(&machine, id).1, Err(Errno::EIO), "{tier:?}");
+        assert!(
+            matches!(machine.wait(pid), ExitStatus::Signaled { signal, .. } if signal.number() == 1),
+            "{tier:?}"
+        );
+        assert_eq!(read_all(&machine, id).1, Err(Errno::ENOENT), "{tier:?}");
+        // 之后照常可用
+        let id = machine.open_console(24, 80).unwrap();
+        let pid = machine
+            .spawn(&path(&hello), &[b"hello".to_vec()], &[], Stdio::Console(id))
+            .unwrap();
+        let (out, end) = read_all(&machine, id);
+        assert_eq!(
+            (out.as_str(), end),
+            ("Hello from appine!\r\n", Ok(())),
+            "{tier:?}"
+        );
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
     }
 }
 

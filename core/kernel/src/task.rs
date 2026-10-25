@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE};
 use appine_hal::Event;
 
+use crate::bug::Trap;
 use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
@@ -207,24 +208,32 @@ pub(crate) fn start(
 fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu) {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu)));
     if r.is_err() {
-        // 内核层的 bug，而且不在 run 兜住的地方（线程开始、退出时）：BKL 保护的状态可能
-        // 已经不一致，不能让其他线程继续
+        // 内核层的 bug，而且不在兜住的地方（crate::bug）：线程找不到自己，或者出错之后的
+        // 收拾本身又出了错。BKL 保护的状态可能已经不一致，不能让其他线程继续
         eprintln!("appine: internal error in guest thread {tid}, aborting");
         std::process::abort();
     }
 }
 
 fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
-    let (task, sync, mut generations, tier) = {
-        let k = shared.lock();
-        let task = k.tasks[&tid].clone();
+    let k = shared.lock();
+    let task = k.tasks[&tid].clone();
+    // 线程开始时的 bug 和进入内核时的一样只结束这个进程（crate::bug）
+    let started = crate::bug::catch(|| {
+        crate::bug::trap(Trap::Start, task.tgid);
         task.clock.set(appine_hal::thread_cpu_clock());
         task.host_tid.set(appine_hal::gettid());
         crate::syscall::host_started(&task);
-        let generations = task.state.borrow().mm.borrow().generations();
-        let sync = task.sync.clone();
-        (task, sync, generations, k.tier)
+        task.state.borrow().mm.borrow().generations()
+    });
+    let Some(mut generations) = started else {
+        let what = format_args!("kernel panic while starting the thread");
+        crate::bug::kill(&k, &task, cpu.state().pc, what);
+        drop(k);
+        return exit(shared, task, cpu.state().pc, None);
     };
+    let (sync, tier) = (task.sync.clone(), k.tier);
+    drop(k);
     let mut dbt = match tier {
         Tier::Interpreter => None,
         Tier::Dbt => Dbt::new(),
@@ -260,7 +269,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
 
         // 内核层的 bug 只结束这个进程（crate::bug）
         let pc = cpu.state().pc;
-        let entered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let entered = crate::bug::catch(|| {
             let k = shared.lock();
             let mut state = task.state.borrow_mut();
             let mut cx = Cx::new(shared, k, &task, &mut state);
@@ -269,13 +278,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
                 generations = cx.mm().generations();
             }
             flow
-        }));
-        let flow = entered.unwrap_or_else(|_| {
-            if !crate::bug::contain() {
-                let tid = task.tid.get();
-                eprintln!("appine: internal error in guest thread {tid}, aborting");
-                std::process::abort();
-            }
+        });
+        let flow = entered.unwrap_or_else(|| {
             task.sleeping.set(false);
             let what = match exit {
                 Exit::Svc { .. } => format!("kernel panic in syscall {}", cpu.state().x[8]),
@@ -296,7 +300,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
             Flow::Exit => break,
         }
     }
-    exit(shared, task, dbt.map(|d| d.stats()));
+    exit(shared, task, cpu.state().pc, dbt.map(|d| d.stats()));
 }
 
 // 合成 esr_context 用的 ESR 字段（ARM ARM D17.2.37）
@@ -441,42 +445,66 @@ pub(crate) fn release_mm(k: &mut Kernel, task: &Task, st: &mut TaskState) {
     st.mm.borrow_mut().remove_user(&task.sync);
 }
 
-/// 线程退出：释放它的资源；它是线程组的最后一个线程时结束整个进程。
-fn exit(shared: &Arc<Shared>, task: Rc<Task>, stats: Option<DbtStats>) {
+/// 线程退出：释放它的资源；它是线程组的最后一个线程时结束整个进程。`pc` 是线程最后的
+/// guest pc。
+///
+/// 每一步分别兜住内核层的 bug（crate::bug）：出错时结束这个进程，后面的步骤照样做，所以
+/// 线程总会从内核里注销，进程也总会结束，等它的父进程和宿主不会卡住。
+fn exit(shared: &Arc<Shared>, task: Rc<Task>, pc: u64, stats: Option<DbtStats>) {
     let mut k = shared.lock();
-    if let Some(s) = stats {
-        let total = k.dbt_stats.get_or_insert_with(DbtStats::default);
-        add_stats(total, &s);
-    }
-    let tid = task.tid.get();
-    let cpu = task.cpu();
-    k.cpu += cpu;
-    let group = {
+    let (tid, tgid) = (task.tid.get(), task.tgid);
+    let group = task.state.borrow().group.clone();
+    let released = crate::bug::catch(|| {
+        crate::bug::trap(Trap::Exit, tid);
+        if let Some(s) = stats {
+            let total = k.dbt_stats.get_or_insert_with(DbtStats::default);
+            add_stats(total, &s);
+        }
+        let cpu = task.cpu();
+        k.cpu += cpu;
+        group.borrow_mut().cpu += cpu;
         let mut st = task.state.borrow_mut();
         // 进程的最后一个线程：退出之前给驻留内存的峰值取一次样
-        let group = st.group.clone();
         if group.borrow().threads.len() == 1 {
             group.borrow_mut().sample_rss(&st.mm.borrow());
         }
         release_mm(&mut k, &task, &mut st);
-        group
-    };
-    group.borrow_mut().cpu += cpu;
+    });
+    if released.is_none() {
+        let what = format_args!("kernel panic while the thread was exiting");
+        crate::bug::kill(&k, &task, pc, what);
+    }
     k.tasks.remove(&tid);
     let last = {
         let mut g = group.borrow_mut();
         g.threads.retain(|&t| t != tid);
         g.threads.is_empty()
     };
-    if last {
-        crate::process::finish_group(&mut k, &group);
+    // 后面的步骤出错时：还有别的线程就结束这个进程，否则它已经结束了，只报告
+    let failed = |k: &Kernel, step: &str| {
+        if last {
+            crate::bug::report(format_args!(
+                "kernel panic while pid {tgid} was exiting ({step})"
+            ));
+        } else {
+            let what = format_args!("kernel panic while thread {tid} was exiting ({step})");
+            crate::bug::kill_process(k, tgid, what);
+        }
+    };
+    if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
+        failed(&k, "finishing the process");
+        crate::bug::catch(|| crate::process::finish_group_after_bug(&mut k, &group));
     }
     // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……
-    drop(group);
-    drop(task);
+    if crate::bug::catch(|| drop((group, task))).is_none() {
+        failed(&k, "releasing its resources");
+    }
     // fd 表里的 unix socket 关掉之后可能只剩在途的环
-    if last && !k.unix_inflight.is_empty() {
-        crate::unix::collect(&mut k);
+    if last
+        && !k.unix_inflight.is_empty()
+        && crate::bug::catch(|| crate::unix::collect(&mut k)).is_none()
+    {
+        failed(&k, "collecting unix sockets");
     }
     request_wake();
 }

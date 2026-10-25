@@ -862,7 +862,7 @@ fn one_machine_runs_several_terminal_sessions() {
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
         let sh = |script: &str| {
-            let id = machine.open_console(24, 80);
+            let id = machine.open_console(24, 80).unwrap();
             let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
             let pid = machine
                 .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
@@ -881,7 +881,7 @@ fn one_machine_runs_several_terminal_sessions() {
         assert_eq!(machine.wait(pa), ExitStatus::Exited(0));
         assert_eq!(machine.wait(pb), ExitStatus::Exited(3));
         // 关闭控制台就是挂断终端：交互式 shell 收到 SIGHUP 退出
-        let id = machine.open_console(24, 80);
+        let id = machine.open_console(24, 80).unwrap();
         let argv = [b"sh".to_vec(), b"-i".to_vec()];
         let pid = machine
             .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))

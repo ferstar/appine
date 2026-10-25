@@ -39,6 +39,7 @@ internal object Native {
 
     /** 新建一个控制台（进程内 PTY），返回它的编号。 */
     @JvmStatic
+    @Throws(IOException::class)
     external fun openConsole(machine: Long, rows: Int, cols: Int): Int
 
     /** 以控制台为控制终端启动一个会话组长，返回 pid。 */

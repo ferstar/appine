@@ -14,3 +14,8 @@ flate2.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
 tar.workspace = true
+
+[features]
+# 测试钩子（src/bug.rs）在 release 构建里也编进去：Android 的 debug 版 App 用它在 App 进程里
+# 模拟内核层和引擎的 bug。debug 构建总是有测试钩子
+test-hooks = []
