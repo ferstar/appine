@@ -220,7 +220,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
   - 宿主 `poll()`，监听集合里包含该线程专属的 **eventfd**，作为唤醒通道。
 
   这样 guest 信号、futex 和 I/O 就绪都走同一条唤醒路径，也不需要用宿主信号去打断阻塞调用，避免了和 ART/bionic 抢信号编号。
-- **futex**：以翻译后的宿主地址为键，用自管 wait queue 实现。不同 guest 进程共享同一页时也能正确等待和唤醒，而且信号可以唤醒指定线程。
+- **futex**：以翻译后的宿主地址为键，用自管 wait queue 实现。不同 guest 进程共享同一页时也能正确等待和唤醒，而且信号可以唤醒指定线程。别的等待在任何相关修改之后都被全部叫醒、各自重新检查；futex 的等待者不在这个名单里，只被 FUTEX_WAKE（它只通知被唤醒的那几个线程）、信号和结束线程组直接通知：JVM、Go 运行时里停在锁和条件变量上的线程很多，原来别处的每次修改都把它们全部叫醒一遍。
 - **TLS**：guest 的 `tpidr_el0` 只是 guest 状态结构里的一个字段。**宿主的 `TPIDR_EL0` 永远是 bionic 的值**，所以 ART 的信号处理链可以安全运行。
 - **PID 1**：内核层内置一个虚拟的 init。它不对应任何 guest 程序，只负责收养孤儿进程、回收僵尸进程。每个终端标签页的登录 shell 都是它的子进程。v1 不运行 OpenRC。
 - **namespace**：不支持。`unshare`、`setns`、`clone(CLONE_NEW*)` 一律返回 `EPERM`。
@@ -1009,6 +1009,15 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 - 测试：`tests/dbt.rs` 新增普通的调用返回、被调函数改了 x30 时按 x30 返回、x30 恰好等于空项标记时照样得到 pc 对齐错误、递归 200 层（超过影子栈的 64 项）。lockstep、全部 11 组差分测试在两个执行层下通过，LTP 869 个通过。差分测试 `java` 里等子进程输出的 `grep` 改用 `-s`：CI 上子进程还没创建输出文件时，grep 会多打印一行错误。
 - 没做：SP 对齐检查（每次以 SP 为基址的访存两条指令）仍然保留；跳转缓存保持 4096 项（加到 64K 项能让 gcc 的 lookup 退出再少一个数量级，但返回预测之后剩下的已经不多）。
 
+### M9 之前：futex 定向唤醒（2026-10-25）
+
+原来任何修改都会在释放 BKL 时叫醒所有正在等待的线程，futex 唤醒也一样。现在 futex 的等待项记下等待线程的事件，FUTEX_WAKE 只通知被唤醒的线程，futex 等待者也不再被别处的修改叫醒（§6）。其余的等待（管道、socket、epoll、wait4 等）仍是全部叫醒。
+
+- 两个线程用互斥锁和条件变量来回传递 10 万次：3.74 → 2.97 秒（原生 1.8–2.1 秒），20 万次等待里"全部叫醒"只剩 12 次。
+- JVM 受益最大：Maven 热构建 17.5 → 15.7 秒，Gradle 热构建 6.1 → 4.8 秒；`go build` 冷编译 16.7 → 16.3 秒（M8 时是 19.2 秒）；`git status` 不变，它的线程争用在 BKL 本身。
+- Gradle 那次运行里剩下的"全部叫醒"约 3.2 万次（等待 7.5 万次），每次白醒十几微秒，给每种对象建自己的等待队列的收益已经不大。拆分 BKL 仍放到发布之后（R1）。
+- 测试：futex 的单元测试检查唤醒只通知被唤醒的线程。全部 11 组差分测试在两个执行层下通过（Go、Java、Node.js 都用大量 futex），LTP 868 个通过（与上一轮相比只有随机的 nice05 不同）。
+
 ---
 
 ## 15. 已否决的方案
@@ -1038,7 +1047,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 
 | # | 风险或假设 | 何时验证 | 退路 |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，性能探针在 Neoverse N2 上是 2.25×，见 §14；M8 的 C 档负载里，node 中 JIT 生成的代码 1.9×，`go build` 冷编译 8.7×（单线程 5.6×，多线程扩展性差）；JVM 补测时测试程序 4–5×，Maven 热构建 11×、Gradle 热构建 14×（跳转缓存未命中、JIT 代码打补丁）；M9 前的剖析之后，`git status` 6×、shell 起进程 6.3×（翻译跨 exec 保留）；SP 常驻寄存器和返回预测之后 gcc 3.9×、python 6.2×；真机待测 | 跳转缓存改成组相联或加大、块内 TLB 检查外提、压缩退出桩；多线程负载拆分 BKL、futex 只唤醒对应的等待者 |
+| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，性能探针在 Neoverse N2 上是 2.25×，见 §14；M8 的 C 档负载里，node 中 JIT 生成的代码 1.9×，`go build` 冷编译 8.7×（单线程 5.6×，多线程扩展性差）；JVM 补测时测试程序 4–5×，Maven 热构建 11×、Gradle 热构建 14×（跳转缓存未命中、JIT 代码打补丁）；M9 前的剖析之后，`git status` 6×、shell 起进程 6.3×（翻译跨 exec 保留）；SP 常驻寄存器和返回预测之后 gcc 3.9×、python 6.2×；futex 定向唤醒之后 Gradle 热构建 9×；真机待测 | 跳转缓存改成组相联或加大、块内 TLB 检查外提、压缩退出桩；多线程负载拆分 BKL、其余等待也按对象定向唤醒 |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时（M5 按决定暂不提交） | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前 | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
 | R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | 已解决：M1a 在 Tier 0 用 CAS 模拟，M7 在 Tier 1 把 STXR 改写成两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 §4.5 | — |

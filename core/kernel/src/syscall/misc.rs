@@ -119,7 +119,8 @@ pub(super) fn futex(
             if u32::from_le_bytes(get(cx, uaddr)?) != val {
                 return Err(Errno::EAGAIN);
             }
-            let id = cx.k().futexes.enqueue(key, bitset);
+            let event = cx.task.event.clone();
+            let id = cx.k().futexes.enqueue(key, bitset, event);
             loop {
                 if !cx.kr().futexes.is_queued(id) {
                     return Ok(0);
@@ -129,7 +130,7 @@ pub(super) fn futex(
                 } else if cx.interrupted() {
                     Some(Errno::ERESTARTSYS)
                 } else {
-                    cx.wait(deadline, &mut []).err()
+                    cx.wait_alone(deadline).err()
                 };
                 if let Some(e) = err {
                     cx.k().futexes.remove(id);
@@ -203,9 +204,10 @@ pub(super) fn futex_waitv(
             return Err(Errno::EAGAIN);
         }
     }
+    let event = cx.task.event.clone();
     let ids: Vec<u64> = keys
         .iter()
-        .map(|&(key, ..)| cx.k().futexes.enqueue(key, u32::MAX))
+        .map(|&(key, ..)| cx.k().futexes.enqueue(key, u32::MAX, event.clone()))
         .collect();
     let r = loop {
         if let Some(i) = ids.iter().position(|&id| !cx.kr().futexes.is_queued(id)) {
@@ -216,7 +218,7 @@ pub(super) fn futex_waitv(
         } else if cx.interrupted() {
             Some(Errno::ERESTARTSYS)
         } else {
-            cx.wait(deadline, &mut []).err()
+            cx.wait_alone(deadline).err()
         };
         if let Some(e) = err {
             break Err(e);

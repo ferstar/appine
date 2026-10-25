@@ -2,14 +2,17 @@
 //! 宿主内存的进程能互相唤醒；文件的共享映射以宿主文件和偏移为键，因为各个进程分别
 //! 映射同一个文件（`sem_open` 的 `/dev/shm` 文件）时宿主地址各不相同。
 //!
-//! 等待者登记在队列里，然后走统一的等待机制；被唤醒的等待者从队列里移除，
-//! 它重新检查时发现自己不在队列里了，就知道是被 FUTEX_WAKE 唤醒的。
+//! 等待者登记在队列里，然后等待；被唤醒的等待者从队列里移除，它重新检查时发现自己
+//! 不在队列里了，就知道是被 FUTEX_WAKE 唤醒的。唤醒只通知被唤醒的那几个线程（登记时
+//! 记下了它们的事件），不像别的等待那样叫醒所有在等的线程：JVM、Go 运行时里停在锁和
+//! 条件变量上的线程很多，别处的每次修改都把它们全部叫醒一遍，代价很大。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use appine_engine::prot;
+use appine_hal::Event;
 
-use crate::kernel::request_wake;
 use crate::mm::Mm;
 use crate::uaccess::UserSlice;
 
@@ -26,6 +29,8 @@ struct Entry {
     id: u64,
     key: Key,
     bitset: u32,
+    /// 等待线程的事件（[`crate::task::Task::event`]）。
+    event: Arc<Event>,
 }
 
 /// 所有 futex 等待者，按登记顺序排列（唤醒时先到先得）。
@@ -36,13 +41,15 @@ pub(crate) struct Futexes {
 }
 
 impl Futexes {
-    /// 登记一个等待者，返回它的编号。
-    pub fn enqueue(&mut self, key: Key, bitset: u32) -> u64 {
+    /// 登记一个等待者，返回它的编号。`event` 是唤醒它时要通知的事件；等待者要用
+    /// [`crate::kernel::Cx::wait_alone`] 等待。
+    pub fn enqueue(&mut self, key: Key, bitset: u32, event: Arc<Event>) -> u64 {
         self.next_id += 1;
         self.waiting.push(Entry {
             id: self.next_id,
             key,
             bitset,
+            event,
         });
         self.next_id
     }
@@ -63,14 +70,12 @@ impl Futexes {
         self.waiting.retain(|e| {
             if woken < n && e.key == key && e.bitset & bitset != 0 {
                 woken += 1;
+                e.event.signal();
                 false
             } else {
                 true
             }
         });
-        if woken > 0 {
-            request_wake();
-        }
         woken
     }
 
@@ -183,6 +188,16 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
 mod tests {
     use super::*;
 
+    fn event() -> Arc<Event> {
+        Arc::new(Event::new().unwrap())
+    }
+
+    fn signaled(e: &Event) -> bool {
+        let mut p = [(e.fd(), 1, 0)];
+        appine_hal::poll(&mut p, Some(std::time::Duration::ZERO)).unwrap();
+        p[0].2 & 1 != 0
+    }
+
     #[test]
     fn wake_and_requeue_in_order() {
         let (k1, k2) = (
@@ -194,12 +209,15 @@ mod tests {
             },
         );
         let mut f = Futexes::default();
-        let a = f.enqueue(k1, u32::MAX);
-        let b = f.enqueue(k1, 0b10);
-        let c = f.enqueue(k1, u32::MAX);
-        let d = f.enqueue(k2, u32::MAX);
+        let (ea, eb) = (event(), event());
+        let a = f.enqueue(k1, u32::MAX, ea.clone());
+        let b = f.enqueue(k1, 0b10, eb.clone());
+        let c = f.enqueue(k1, u32::MAX, event());
+        let d = f.enqueue(k2, u32::MAX, event());
         assert_eq!(f.wake(k1, 1, 0b01), 1);
         assert!(!f.is_queued(a) && f.is_queued(b));
+        // 只通知被唤醒的那个线程
+        assert!(signaled(&ea) && !signaled(&eb));
         assert_eq!(f.requeue(k1, 1, k2, 5), 2);
         assert!(!f.is_queued(b) && f.is_queued(c));
         assert_eq!(f.wake(k2, 10, u32::MAX), 2);

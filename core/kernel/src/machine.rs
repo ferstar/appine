@@ -196,7 +196,7 @@ impl Machine {
                 if let Some(v) = cond(&mut k) {
                     return v;
                 }
-                let (k2, _) = block(&self.shared, k, event, None, &mut []);
+                let (k2, _) = block(&self.shared, k, event, None, &mut [], true);
                 k = k2;
             }
         })
@@ -323,7 +323,7 @@ fn timers(shared: Arc<Shared>) {
     let mut k = shared.lock();
     while !k.shutting_down {
         let next = crate::itimer::expire(&k);
-        let (k2, _) = block(&shared, k, &event, next, &mut []);
+        let (k2, _) = block(&shared, k, &event, next, &mut [], true);
         k = k2;
     }
 }

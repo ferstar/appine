@@ -7,7 +7,9 @@
 //!
 //! 等待统一走宿主 `poll()`：每个线程有一个 eventfd，等待时把它和要等的宿主 fd
 //! 放在一起 poll。任何可能让别人的等待条件成立的修改都调用 [`request_wake`]，
-//! 释放 BKL 时唤醒所有正在等待的线程，由它们各自重新检查条件。
+//! 释放 BKL 时唤醒所有正在等待的线程，由它们各自重新检查条件。futex 是例外：停在锁
+//! 和条件变量上的线程很多，它们用 [`Cx::wait_alone`] 等待，只被 FUTEX_WAKE、信号和
+//! 结束线程组直接通知。
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
@@ -210,16 +212,20 @@ impl Drop for Bkl<'_> {
 }
 
 /// 释放 BKL 等待：事件被触发（[`request_wake`]、信号）、`host` 里的宿主 fd 就绪或者
-/// 到达 `deadline` 时重新获取 BKL 返回。调用方重新检查自己的条件。
+/// 到达 `deadline` 时重新获取 BKL 返回。调用方重新检查自己的条件。`listed` 为 false
+/// 时不登记在 [`request_wake`] 要叫醒的名单里，只有直接通知 `event` 才会醒（futex）。
 pub(crate) fn block<'a>(
     shared: &'a Shared,
     mut k: Bkl<'a>,
     event: &Arc<Event>,
     deadline: Option<Instant>,
     host: &mut [(i32, i16, i16)],
+    listed: bool,
 ) -> (Bkl<'a>, Result<(), Errno>) {
     const POLLIN: i16 = 1;
-    k.waiters.push(event.clone());
+    if listed {
+        k.waiters.push(event.clone());
+    }
     drop(k);
     let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
     let mut fds: Vec<(i32, i16, i16)> = host.iter().map(|&(fd, ev, _)| (fd, ev, 0)).collect();
@@ -227,7 +233,9 @@ pub(crate) fn block<'a>(
     let r = appine_hal::poll(&mut fds, timeout);
     let mut k = shared.lock();
     event.clear();
-    k.waiters.retain(|e| !Arc::ptr_eq(e, event));
+    if listed {
+        k.waiters.retain(|e| !Arc::ptr_eq(e, event));
+    }
     for (h, f) in host.iter_mut().zip(&fds) {
         h.2 = f.2;
     }
@@ -374,9 +382,24 @@ impl<'a> Cx<'a> {
         deadline: Option<Instant>,
         host: &mut [(i32, i16, i16)],
     ) -> Result<(), Errno> {
+        self.wait_on(deadline, host, true)
+    }
+
+    /// 只等直接的通知（futex 唤醒、信号、被结束）或者超时，[`request_wake`] 不会叫醒它。
+    /// 调用方必须保证让它的条件成立的每个地方都直接通知了 `self.task.event`。
+    pub fn wait_alone(&mut self, deadline: Option<Instant>) -> Result<(), Errno> {
+        self.wait_on(deadline, &mut [], false)
+    }
+
+    fn wait_on(
+        &mut self,
+        deadline: Option<Instant>,
+        host: &mut [(i32, i16, i16)],
+        listed: bool,
+    ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
         self.task.sleeping.set(true);
-        let (k, r) = block(self.shared, k, &self.task.event, deadline, host);
+        let (k, r) = block(self.shared, k, &self.task.event, deadline, host, listed);
         self.task.sleeping.set(false);
         self.k = Some(k);
         r
