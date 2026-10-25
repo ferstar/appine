@@ -14,8 +14,9 @@
  *   - guest V0–V31、FPCR、FPSR 就是宿主的 V0–V31、FPCR、FPSR，SIMD&FP 数据处理
  *     指令原样执行。
  *
- * 访存指令改写成内联的 TLB 快速路径；TLB 未命中、跨页、SP 未对齐时退出到
- * 分发器，由 Tier 0 执行这一条指令（此时指令还没有产生任何副作用）。直接
+ * 访存指令改写成内联的 TLB 快速路径；TLB 未命中、跨页时进入回填例程，回填失败
+ * （未映射、没有权限等）和 SP 未对齐时退出到分发器，由 Tier 0 执行这一条指令
+ * （此时指令还没有产生任何副作用）。直接
  * 分支通过块链接直接跳转，间接分支先查跳转缓存。函数调用压影子返回栈，RET 先看
  * 栈顶（emit_call）。Tier 0 不认识的指令同样
  * 交给 Tier 0，保证两层的白名单完全一致（§4.4）。
@@ -71,10 +72,11 @@
 
 /* 退出原因（从翻译后的代码返回分发器）。R_CHAIN_FWD 是前向的直接跳转，链接时
  * 跳过目标块入口的 kick 检查：块的起始地址沿前向边严格递增，所以任何循环里至少
- * 有一条边会经过检查 */
-enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK };
+ * 有一条边会经过检查。R_UNGROUP 是共用检查的一组访存没通过检查（见 plan_group），
+ * 和 R_INTERP 一样由 Tier 0 执行这一条指令 */
+enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
 
-/* 退出桩之外的另一种桩：TLB 未命中时进入回填例程，回填失败再退出（R_INTERP） */
+/* 退出桩之外的另一种桩：TLB 未命中时进入回填例程，回填失败再退出（R_INTERP 或 R_UNGROUP） */
 #define STUB_REFILL 0
 
 /* 一个桩最多占的字数：回填桩 4 个字，后面接一个最长 7 个字的退出桩 */
@@ -86,7 +88,7 @@ enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK };
 /* 退出原因的低 3 位是 R_*；链接桩在高位带上跳到它的条件分支相对桩的字数（0 表示没有） */
 #define REASON_BITS 3
 #define REASON_MASK ((1u << REASON_BITS) - 1)
-_Static_assert(R_KICK <= REASON_MASK, "退出原因放在低 3 位");
+_Static_assert(R_UNGROUP <= REASON_MASK, "退出原因放在低 3 位");
 _Static_assert(MAX_BLOCK_WORDS < 1u << (16 - REASON_BITS), "条件分支到桩的距离要放进 movz 的立即数");
 
 #define SYSREG_NZCV 0xda10
@@ -132,6 +134,12 @@ struct block {
     uint32_t nguest; /* guest 指令条数 */
 };
 
+/* 一组访存第二次没通过共用的检查之后，组长的 pc 记在这里，重新翻译时它和后面同一个
+ * 块里的访存都不再当组长；记满了从最早的开始覆盖。第一次失败只记进 strikes（按 pc
+ * 直接映射） */
+#define NOGROUP_MAX 64
+#define STRIKES 64
+
 /* 每个块的 guest 指令字最多占多少字（按块数上限和每块的指令数上限） */
 #define WORDS_LIMIT ((size_t)TABLE_LIMIT * MAX_BLOCK_INSNS)
 /* 放回池里时最多保留多少个块：再多的实例多半属于 JIT 或大程序，核对的代价不划算 */
@@ -152,6 +160,8 @@ struct appine_dbt {
     unsigned table_bits;
     uint32_t *table_used; /* 按插入顺序记下用过的位置，最多 TABLE_LIMIT 个 */
     size_t table_count;
+    size_t table_occupied; /* 表里不空的位置：有效的块和墓碑 */
+    size_t table_dead;     /* 其中的墓碑 */
     struct slot *jc; /* 间接分支的跳转缓存，直接映射 */
     bool jc_dirty;
     struct block *blocks; /* 与 table_used 一一对应，按翻译顺序记录 */
@@ -162,6 +172,9 @@ struct appine_dbt {
     /* 运行时宿主出了故障（APPINE_EXIT_HOST_FAULT）：各张表可能只改了一半，不再使用 */
     bool poisoned;
     uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
+    uint64_t nogroup[NOGROUP_MAX];
+    unsigned nogroup_count;
+    uint64_t strikes[STRIKES];
     uint64_t generation; /* 每次 flush 加一，用来作废尚未回填的链接 */
     struct appine_dbt_stats stats;
     size_t high_words;       /* 代码缓存用到过的最大字数 */
@@ -177,10 +190,12 @@ struct stub {
     unsigned reason; /* R_* 或 STUB_REFILL；R_LOOKUP 的目标 pc 已经在 T0 里 */
     uint64_t pc;
     uint32_t *addr;
-    /* 回填桩：回填成功后重新做 TLB 检查的位置、访问的字节数和方向 */
-    uint32_t *retry;
+    /* 回填桩：回填成功后接着执行的位置（TLB 检查之后的访问）、访问的字节数和方向，
+     * 失败时的退出原因 */
+    uint32_t *resume;
     unsigned bytes;
     bool write;
+    unsigned fail;
     /* 跳到这个桩的分支个数和其中一个的位置（发射桩时填写） */
     unsigned sites;
     const uint32_t *branch;
@@ -194,6 +209,10 @@ struct fixup {
 
 /* 跳往例程的 b：拷贝翻译模板时要按新位置重新计算偏移 */
 enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE };
+
+/* 一组共用检查的访存最多覆盖多少字节、最多几条（plan_group） */
+#define GROUP_SPAN 512
+#define GROUP_MAX 16
 #define MAX_RELOCS (MAX_STUBS * 2 + 4)
 
 struct xlate {
@@ -206,6 +225,21 @@ struct xlate {
     unsigned nfixups;
     uint32_t relocs[MAX_RELOCS]; /* 下标 << 2 | TO_* */
     unsigned nrelocs;
+    /* 正在翻译的块：起始 pc、guest 指令字、当前指令的下标、块最多能有几条指令 */
+    uint64_t pc;
+    const uint32_t *guest;
+    unsigned idx, limit;
+    /* 本块里 SP 已经检查过对齐，之后只按 16 的倍数改过 */
+    bool sp_aligned;
+    /* 共用检查的一组访存（plan_group）：还没翻译的组员，T2 在此期间是基址的宿主地址 */
+    struct group {
+        unsigned n, next;
+        unsigned idx[GROUP_MAX];
+        int32_t off[GROUP_MAX]; /* 相对组长执行之前的基址 */
+        int32_t lo;             /* 整组覆盖的范围，也相对这个基址 */
+        unsigned bytes;
+        bool write;
+    } group;
 };
 
 /* 代码的写入地址（W^X 双映射的可写别名） */
@@ -350,12 +384,17 @@ static unsigned chain_reason(uint64_t pc, uint64_t target)
     return target > pc ? R_CHAIN_FWD : R_CHAIN;
 }
 
-/* TLB 未命中时跳往回填桩：每条访存指令一个，不和别的桩合并 */
-static void emit_to_refill(struct xlate *x, uint64_t pc, uint32_t *retry, unsigned bytes, bool write)
+/* TLB 未命中时跳往回填桩：每条访存指令一个，不和别的桩合并。回填成功后从紧接着的
+ * 指令（访问本身）继续 */
+static void emit_to_refill(struct xlate *x, uint64_t pc, unsigned bytes, bool write, unsigned fail)
 {
     if (x->nstubs < MAX_STUBS)
-        x->stubs[x->nstubs] =
-            (struct stub){.reason = STUB_REFILL, .pc = pc, .retry = retry, .bytes = bytes, .write = write};
+        x->stubs[x->nstubs] = (struct stub){.reason = STUB_REFILL,
+                                            .pc = pc,
+                                            .resume = here(x) + 1,
+                                            .bytes = bytes,
+                                            .write = write,
+                                            .fail = fail};
     if (x->nfixups < MAX_FIXUPS)
         x->fixups[x->nfixups] = (struct fixup){here(x), FIX_IMM19, x->nstubs};
     x->nstubs++;
@@ -364,16 +403,17 @@ static void emit_to_refill(struct xlate *x, uint64_t pc, uint32_t *retry, unsign
 }
 
 /*
- * 回填桩：T1 指向桩里的 "b 重试"，T2 = 字节数 - 1，然后进入回填例程。例程成功时
- * 跳回 T1，失败时跳到 T1 + 4，也就是紧接着的退出桩，由 Tier 0 执行这条指令。
+ * 回填桩：T1 指向桩里的 "b 访问"，T2 = 字节数 - 1，然后进入回填例程。例程成功时
+ * T2 = addend 并跳回 T1，失败时跳到 T1 + 4，也就是紧接着的退出桩，由 Tier 0 执行
+ * 这条指令。
  */
 static void emit_refill_stub(struct xlate *x, const struct stub *s)
 {
     emit(x, enc_adr(T1, 12));
     emit(x, enc_movz(T2, s->bytes - 1, 0));
     emit_to_routine(x, s->write ? TO_REFILL_WRITE : TO_REFILL_READ);
-    emit(x, enc_b((intptr_t)s->retry - (intptr_t)here(x)));
-    emit_exit_stub(x, R_INTERP, s->pc);
+    emit(x, enc_b((intptr_t)s->resume - (intptr_t)here(x)));
+    emit_exit_stub(x, s->fail, s->pc);
 }
 
 static bool fallback(struct xlate *x, uint64_t pc)
@@ -525,6 +565,8 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
         x->d->stats.insns_copied++;
         return true;
     }
+    if (nmap == 3 && x->group.next < x->group.n)
+        abort(); /* plan_group 保证组员之间的指令不用 T2 */
     for (unsigned k = 0; k < nmap; k++)
         emit_load_guest(x, pool[k], guest[k]);
     emit(x, out);
@@ -709,13 +751,17 @@ static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
 /*
  * T0 = guest 地址时查 TLB，命中后 T2 = addend。取最后一个字节所在页的表项，和
  * 第一个字节所在页比较：TLB 直接映射，跨页时第一页的页号不可能出现在下一页的
- * 表项里，所以这一次比较同时排除了跨页访问。未命中时进入回填例程。
+ * 表项里，所以这一次比较同时排除了跨页访问。未命中和跨页时进入回填例程，回填失败
+ * 时以 `fail` 退出。`in_granule` 表示访问落在一个对齐的 16 字节里，不可能跨页，
+ * 可以直接用第一个字节的页。
  */
-static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool write)
+static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool write, bool in_granule,
+                           unsigned fail)
 {
+    if (x->group.next < x->group.n)
+        abort(); /* plan_group 保证组员之间没有别的访存 */
     unsigned last = T0;
-    uint32_t *retry = here(x);
-    if (bytes > 1) {
+    if (bytes > 1 && !in_granule) {
         emit(x, enc_add_imm(T1, T0, bytes - 1, 0));
         last = T1;
     }
@@ -723,21 +769,53 @@ static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF + (write ? 16 : 0)));
     emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag 是页号取反 */
-    emit_to_refill(x, pc, retry, bytes, write);
+    emit_to_refill(x, pc, bytes, write, fail);
 }
+
+/* 访存的字节数 */
+static unsigned memop_bytes(const struct memop *m)
+{
+    return m->structure ? m->bytes : (m->pair ? 2u : 1u) << m->size;
+}
+
+/* 以 SP 为基址访存之前检查 SP 的对齐；本块里已经检查过、之后只按 16 的倍数改过时不用 */
+static void emit_sp_check(struct xlate *x, uint64_t pc)
+{
+    if (x->sp_aligned)
+        return;
+    emit(x, enc_and_low(T1, SP_HOST, 4));
+    emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
+    x->sp_aligned = true;
+}
+
+/* SP 改了 `delta` 之后是否仍然对齐 */
+static void sp_moved(struct xlate *x, int64_t delta)
+{
+    if (delta & 15)
+        x->sp_aligned = false;
+}
+
+static bool plan_group(struct xlate *x, const struct memop *lead);
+static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc);
 
 static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
 {
     unsigned rn = m->rn == 31 ? REG_SP : m->rn;
+    if (plan_group(x, m)) {
+        emit_group(x, m, pc);
+        return;
+    }
 
     /* 1. guest 地址 → T0 */
+    bool in_granule = false;
     if (m->mode == M_LITERAL) {
         emit_mov_const(x, T0, (uint64_t)m->imm);
     } else {
         unsigned base = rn == REG_SP ? SP_HOST : rn;
         if (rn == REG_SP) { /* SP 必须 16 字节对齐 */
-            emit(x, enc_and_low(T1, SP_HOST, 4));
-            emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
+            emit_sp_check(x, pc);
+            int64_t off = m->mode == M_POST ? 0 : m->imm;
+            in_granule = m->mode != M_REG && (off & 15) + memop_bytes(m) <= 16;
         } else if (is_stolen(rn)) {
             emit_load_guest(x, T0, rn);
             base = T0;
@@ -763,8 +841,7 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
     }
 
     /* 2. TLB */
-    unsigned bytes = m->structure ? m->bytes : (m->pair ? 2u : 1u) << m->size;
-    emit_tlb_check(x, pc, bytes, !m->load);
+    emit_tlb_check(x, pc, memop_bytes(m), !m->load, in_granule, R_INTERP);
 
     /* 3. 访问宿主内存 */
     if (m->structure) {
@@ -814,8 +891,269 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
             emit_add_const(x, dst, dst, m->imm);
         if (dst == T0)
             emit_store_guest(x, T0, rn);
+        if (rn == REG_SP)
+            sp_moved(x, m->wb_reg ? 1 : m->imm);
     }
     x->d->stats.insns_memory++;
+}
+
+/* ---- 共用一次 TLB 检查的一组访存 ---- */
+
+/*
+ * 同一个块里以同一个寄存器为基址的几条访存（函数的序言和尾声、结构体的几个字段）
+ * 共用一次检查：组长检查整组覆盖的范围，之后 T2 = 基址在组长执行之前的值对应的宿主
+ * 地址，组员直接用 [T2, #偏移] 访问。组员之间只能有不写基址（按常数加减的除外，记下
+ * 累计的偏移）、不用 T2 的指令和条件分支，SP 只能按 16 的倍数改变（组长的对齐检查
+ * 对组员也成立）。
+ *
+ * 跨页时回填例程按两页处理，宿主地址不连续时检查失败。条件分支后面的组员不一定会
+ * 执行，覆盖的范围里也可能有它们访问不到的页，所以检查失败时以 R_UNGROUP 退出，由
+ * Tier 0 执行组长；同一个组长第二次失败时作废这个块，重新翻译时不再分组（ungroup）。
+ */
+
+static bool is_atomic(uint32_t insn);
+
+/* 组员的访问指令：宿主地址 = Rn + off，Rn、Rt 字段为 0。立即数放不下时返回 false */
+static bool member_insn(const struct memop *m, int64_t off, uint32_t *out)
+{
+    unsigned sz = m->size;
+    if (m->structure) { /* LD1–LD4/ST1–ST4 没有偏移 */
+        *out = m->final;
+        return off == 0;
+    }
+    if (m->pair) {
+        if (off & ((1 << sz) - 1) || off < -64 * (1 << sz) || off > 63 * (1 << sz))
+            return false;
+        *out = m->final | ((uint32_t)(off >> sz) & 0x7f) << 15;
+        return true;
+    }
+    uint32_t common = m->final & 0xc4c00000; /* size、V、opc */
+    if (off >= 0 && !(off & ((1 << sz) - 1)) && off >> sz < 4096) { /* 无符号偏移 */
+        *out = common | 0x39000000 | (uint32_t)(off >> sz) << 10;
+        return true;
+    }
+    if (off >= -256 && off < 256) { /* LDUR/STUR */
+        *out = common | 0x38000000 | ((uint32_t)off & 0x1ff) << 12;
+        return true;
+    }
+    return false;
+}
+
+/* 立即数放不下时借来放宿主地址的寄存器：被占用的 Rt 用 T1（成对时用 T0、T1） */
+static unsigned member_scratch(const struct memop *m)
+{
+    return m->pair && !m->simd && is_stolen(m->rt) ? T1 : T0;
+}
+
+static bool member_fits(const struct memop *m, int64_t off)
+{
+    uint32_t insn;
+    if (member_insn(m, off, &insn))
+        return true;
+    return !(m->pair && !m->simd && is_stolen(m->rt) && is_stolen(m->rt2));
+}
+
+/* pc 处的访存能不能当组长：记下的组长和它后面一个块的长度以内都不能，它原来的组员
+ * 多半也会因为同样的原因通不过检查 */
+static bool nogroup(const struct appine_dbt *d, uint64_t pc)
+{
+    unsigned n = d->nogroup_count < NOGROUP_MAX ? d->nogroup_count : NOGROUP_MAX;
+    for (unsigned i = 0; i < n; i++) {
+        if (pc - d->nogroup[i] < 4 * MAX_BLOCK_INSNS)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * 不写基址、不用 T2、不结束块的指令可以夹在组员之间。按常数加减基址的 ADD/SUB
+ * （立即数）把改变量记进 `delta`。
+ */
+static bool keeps_group(uint32_t insn, unsigned rn, int64_t *delta)
+{
+    unsigned top = FIELD(insn, 28, 25), stolen[3], nstolen = 0;
+    struct operands o = {.n = 0};
+    if ((top & 7) == 7) { /* SIMD&FP 数据处理：只有通用寄存器操作数要看 */
+        struct native_desc nd;
+        if (!appine_simd_dp_decode(insn, &nd))
+            return false;
+        for (unsigned i = 0; i < nd.n; i++) {
+            add_operand(&o, nd.gpr[i].pos, false);
+            if (nd.gpr[i].store && ((insn >> nd.gpr[i].pos) & 31) == rn && rn != 31)
+                return false;
+        }
+    } else if (top == 0x8 || top == 0x9 || top == 0x5 || top == 0xd) {
+        if (FIELD(insn, 28, 24) == 0x10) /* ADR/ADRP：被占用的 Rd 只用 T0 */
+            return (insn & 31) != rn || rn == 31;
+        if (!dp_operands(insn, &o))
+            return false;
+        uint32_t op = insn & 0xff800000;
+        if ((op == 0x91000000 || op == 0xd1000000) && (insn & 31) == rn && FIELD(insn, 9, 5) == rn) {
+            int64_t imm = (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0);
+            *delta += op == 0xd1000000 ? -imm : imm;
+            return true;
+        }
+        unsigned rd = insn & 31;
+        if (o.writes_rd && (rn == 31 ? rd == 31 && o.sp[0] : rd == rn))
+            return false;
+    } else {
+        return (insn & 0xff000010) == 0x54000000 || /* B.cond */
+               (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
+               (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
+               (insn & 0xfffff01f) == 0xd503201f || /* HINT */
+               (insn & 0xfffff01f) == 0xd503301f;   /* 屏障、CLREX */
+    }
+    /* 被占用的寄存器依次换成 T0、T1、T2（emit_operands）：三个就用到了 T2 */
+    for (unsigned i = 0; i < o.n; i++) {
+        unsigned r = (insn >> o.pos[i]) & 31, k;
+        if ((r == 31 && o.sp[i]) || !is_stolen(r))
+            continue;
+        for (k = 0; k < nstolen && stolen[k] != r; k++)
+            ;
+        if (k == nstolen && nstolen++ == 2)
+            return false;
+        stolen[k] = r;
+    }
+    return true;
+}
+
+/* 访存 `m` 执行时基址比组长执行之前多 `delta`：访问范围的起点（相对组长之前的基址） */
+static int64_t member_start(const struct memop *m, int64_t delta)
+{
+    return delta + (m->mode == M_POST ? 0 : m->imm);
+}
+
+/* 从访存 `lead`（块里的第 x->idx 条）开始往后找同一基址的组员；至少有一个组员时
+ * 填好 x->group 并返回 true */
+static bool plan_group(struct xlate *x, const struct memop *lead)
+{
+    struct group *g = &x->group;
+    unsigned rn = lead->rn;
+    uint64_t pc0 = x->pc + 4ull * x->idx;
+    g->n = g->next = 0;
+    if (lead->mode == M_LITERAL || lead->mode == M_REG || lead->wb_reg || (rn != 31 && is_stolen(rn)) ||
+        nogroup(x->d, pc0))
+        return false;
+    int64_t delta = 0, lo = member_start(lead, 0), hi = lo + memop_bytes(lead);
+    bool write = !lead->load;
+    if (!member_fits(lead, lo))
+        return false;
+    g->idx[0] = x->idx;
+    g->off[0] = (int32_t)lo;
+    g->n = 1;
+    if (lead->mode != M_OFFSET)
+        delta = lead->imm;
+    bool overwritten = lead->load && !lead->simd && (lead->rt == rn || (lead->pair && lead->rt2 == rn));
+    for (unsigned j = x->idx + 1; !overwritten && j < x->limit && g->n < GROUP_MAX; j++) {
+        uint32_t insn = x->guest[j];
+        unsigned top = FIELD(insn, 28, 25);
+        if (top != 0x4 && top != 0x6 && top != 0xc && top != 0xe) {
+            if (!keeps_group(insn, rn, &delta))
+                break;
+            continue;
+        }
+        struct memop m;
+        uint64_t pc = x->pc + 4ull * j;
+        if (is_atomic(insn) || !(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
+            break;
+        if (m.prefetch) /* 不生成代码 */
+            continue;
+        if (m.rn != rn || m.mode == M_LITERAL || m.mode == M_REG || (rn == 31 && (delta & 15)))
+            break;
+        int64_t start = member_start(&m, delta), end = start + memop_bytes(&m);
+        int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
+        if (nhi - nlo > GROUP_SPAN || !member_fits(&m, start))
+            break;
+        lo = nlo;
+        hi = nhi;
+        write |= !m.load;
+        g->idx[g->n] = j;
+        g->off[g->n] = (int32_t)start;
+        g->n++;
+        if (m.mode != M_OFFSET) {
+            if (m.wb_reg)
+                break;
+            delta += m.imm;
+        }
+        overwritten = m.load && !m.simd && (m.rt == rn || (m.pair && m.rt2 == rn));
+    }
+    if (g->n < 2) {
+        g->n = 0;
+        return false;
+    }
+    g->next = g->n; /* 组长的检查发射之后才开始 */
+    g->lo = (int32_t)lo;
+    g->bytes = (unsigned)(hi - lo);
+    g->write = write;
+    return true;
+}
+
+/* 组员（包括组长）的访问：宿主地址 = T2 + off，然后回写基址 */
+static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
+{
+    unsigned rn = m->rn == 31 ? REG_SP : m->rn, base = rn == REG_SP ? SP_HOST : rn, addr = T2;
+    bool s1 = !m->simd && is_stolen(m->rt), s2 = m->pair && !m->simd && is_stolen(m->rt2);
+    uint32_t insn;
+    if (!member_insn(m, off, &insn)) {
+        addr = member_scratch(m);
+        emit_add_const(x, addr, T2, off);
+        member_insn(m, 0, &insn);
+    }
+    if (m->structure) {
+        emit(x, insn | addr << 5);
+    } else if (!m->pair) {
+        unsigned rt = s1 ? T1 : m->rt;
+        if (s1 && !m->load)
+            emit_load_guest(x, T1, m->rt);
+        emit(x, insn | addr << 5 | rt);
+        if (s1 && m->load)
+            emit_store_guest(x, T1, m->rt);
+    } else {
+        unsigned h1 = s1 ? T0 : m->rt, h2 = s2 ? T1 : m->rt2;
+        if (!m->load) {
+            if (s1)
+                emit_load_guest(x, T0, m->rt);
+            if (s2)
+                emit_load_guest(x, T1, m->rt2);
+        }
+        emit(x, insn | h2 << 10 | addr << 5 | h1);
+        if (m->load) {
+            if (s1)
+                emit_store_guest(x, T0, m->rt);
+            if (s2)
+                emit_store_guest(x, T1, m->rt2);
+        }
+    }
+    if (m->mode == M_PRE || m->mode == M_POST) {
+        if (m->wb_reg) {
+            unsigned inc = m->rm;
+            if (is_stolen(inc)) {
+                emit_load_guest(x, T1, inc);
+                inc = T1;
+            }
+            emit(x, enc_add_lsl(base, base, inc, 0));
+        } else {
+            emit_add_const(x, base, base, m->imm);
+        }
+        if (rn == REG_SP)
+            sp_moved(x, m->wb_reg ? 1 : m->imm);
+    }
+    x->d->stats.insns_memory++;
+}
+
+/* 组长：检查整组覆盖的范围，T2 = 基址的宿主地址，再做组长自己的访问 */
+static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc)
+{
+    struct group *g = &x->group;
+    unsigned rn = lead->rn == 31 ? REG_SP : lead->rn, base = rn == REG_SP ? SP_HOST : rn;
+    if (rn == REG_SP)
+        emit_sp_check(x, pc);
+    emit_add_const(x, T0, base, g->lo);
+    bool in_granule = rn == REG_SP && (g->lo & 15) + g->bytes <= 16;
+    emit_tlb_check(x, pc, g->bytes, g->write, in_granule, R_UNGROUP);
+    emit(x, enc_add_lsl(T2, T2, base, 0));
+    g->next = 1;
+    emit_member(x, lead, g->off[0]);
 }
 
 /* ---- 独占访问、acquire/release、LSE 原子操作（§4.5） ---- */
@@ -829,8 +1167,7 @@ static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bo
 {
     if (rn == 31) {
         emit(x, enc_mov(T0, SP_HOST));
-        emit(x, enc_and_low(T1, T0, 4));
-        emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
+        emit_sp_check(x, pc);
     } else if (is_stolen(rn)) {
         emit_load_guest(x, T0, rn);
     } else {
@@ -840,7 +1177,7 @@ static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bo
         emit(x, enc_and_low(T1, T0, (unsigned)__builtin_ctz(bytes)));
         emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
     }
-    emit_tlb_check(x, pc, bytes, write);
+    emit_tlb_check(x, pc, bytes, write, true, R_INTERP);
     emit(x, enc_add_lsl(T2, T2, T0, 0));
     x->d->stats.insns_memory++;
 }
@@ -1131,7 +1468,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             emit(x, enc_mov(T0, rt));
         emit(x, enc_and_clear_low(T0, T0, 6));
         _Static_assert(DCZ_BLOCK == 64, "DC ZVA 的块大小");
-        emit_tlb_check(x, pc, DCZ_BLOCK, true);
+        emit_tlb_check(x, pc, DCZ_BLOCK, true, false, R_INTERP);
         emit(x, enc_add_lsl(T2, T2, T0, 0));
         for (int off = 0; off < DCZ_BLOCK; off += 16)
             emit(x, enc_stp_x(31, 31, T2, off));
@@ -1211,6 +1548,13 @@ static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
         struct operands o;
         if (!dp_operands(insn, &o) || !emit_operands(x, insn, &o))
             return fallback(x, pc);
+        if (o.writes_rd && o.sp[0] && (insn & 31) == 31) { /* 写了 SP */
+            uint32_t op = insn & 0xff800000;
+            if ((op == 0x91000000 || op == 0xd1000000) && FIELD(insn, 9, 5) == 31)
+                sp_moved(x, (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0));
+            else
+                x->sp_aligned = false;
+        }
         return true;
     }
     case 0x4:
@@ -1222,8 +1566,15 @@ static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
         struct memop m;
         if (!(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
             return fallback(x, pc);
-        if (!m.prefetch)
+        struct group *g = &x->group;
+        if (m.prefetch)
+            return true;
+        if (g->next < g->n && x->idx == g->idx[g->next]) {
+            emit_member(x, &m, g->off[g->next++]);
+            x->d->stats.insns_grouped++;
+        } else {
             emit_memop(x, &m, pc);
+        }
         return true;
     }
     case 0xa:
@@ -1280,35 +1631,51 @@ static unsigned page_bucket(uint64_t page)
     return (unsigned)((page * UINT64_C(0x9e3779b97f4a7c15)) >> (64 - PAGE_BUCKET_BITS));
 }
 
-/* 放进一个 2^bits 项的新表，表项按原来的插入顺序重新放（墓碑也照样放，table_used
- * 和 blocks 的下标保持对应）；分配失败时返回 false，原来的表不变 */
+/* table_used 里的特殊值：这个块已经作废，重建表时没有放进去 */
+#define SLOT_NONE UINT32_MAX
+
+/* 把有效的块按原来的插入顺序放进一个 2^bits 项的新表，作废的块（墓碑）不再放进去，
+ * table_used 和 blocks 的下标保持对应；分配失败时返回 false，原来的表不变 */
 static bool table_resize(struct appine_dbt *d, unsigned bits)
 {
     struct slot *table = zalloc(TABLE_BYTES(bits));
     if (!table)
         return false;
-    struct slot *old = d->table;
-    unsigned old_bits = d->table_bits;
+    zfree(d->table, TABLE_BYTES(d->table_bits));
     d->table = table;
     d->table_bits = bits;
+    d->table_occupied = d->table_dead = 0;
     for (size_t k = 0; k < d->table_count; k++) {
-        struct slot s = old[d->table_used[k]];
-        size_t i = table_index(d, s.pc);
+        const struct block *b = &d->blocks[k];
+        if (!b->code) {
+            d->table_used[k] = SLOT_NONE;
+            continue;
+        }
+        size_t i = table_index(d, b->pc);
         while (table[i].code)
             i = (i + 1) & table_mask(d);
-        table[i] = s;
+        table[i] = (struct slot){b->pc, b->code};
         d->table_used[k] = (uint32_t)i;
+        d->table_occupied++;
     }
-    zfree(old, TABLE_BYTES(old_bits));
     return true;
 }
 
+/*
+ * pc 不在表里时才插入。沿途遇到的第一个墓碑可以直接用：JIT 反复改写、重新翻译同一处
+ * 代码时，墓碑不会越堆越长。被复用的墓碑在 table_used 里还有原来那个（已作废的）块的
+ * 记录，重建表时按 blocks 跳过它。
+ */
 static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code, const uint32_t *guest,
                          uint32_t nguest)
 {
     size_t i = table_index(d, pc);
-    while (d->table[i].code)
+    while (d->table[i].code && d->table[i].pc != JC_EMPTY)
         i = (i + 1) & table_mask(d);
+    if (d->table[i].code)
+        d->table_dead--;
+    else
+        d->table_occupied++;
     d->table[i] = (struct slot){pc, code};
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
     memcpy(d->words + d->words_used, guest, nguest * 4);
@@ -1325,6 +1692,7 @@ static void table_remove(struct appine_dbt *d, uint64_t pc)
     for (size_t i = table_index(d, pc); d->table[i].code; i = (i + 1) & table_mask(d)) {
         if (d->table[i].pc == pc) {
             d->table[i].pc = JC_EMPTY;
+            d->table_dead++;
             break;
         }
     }
@@ -1354,10 +1722,11 @@ void appine_dbt_flush(struct appine_dbt *d)
     if (d->used_words > d->high_words)
         d->high_words = d->used_words;
     for (size_t i = 0; i < d->table_count; i++) {
-        d->table[d->table_used[i]] = (struct slot){0, NULL};
+        if (d->table_used[i] != SLOT_NONE)
+            d->table[d->table_used[i]] = (struct slot){0, NULL};
         d->page_head[page_bucket(d->blocks[i].pc >> APPINE_PAGE_SHIFT)] = 0;
     }
-    d->table_count = 0;
+    d->table_count = d->table_occupied = d->table_dead = 0;
     d->words_used = 0;
     d->stale = false;
     rs_reset(d);
@@ -1413,6 +1782,31 @@ void appine_dbt_invalidate(struct appine_dbt *d, uint64_t start, uint64_t len)
     }
 }
 
+/*
+ * 组长 `pc` 没通过共用的检查。第一次只记下来：栈还没长到那里这类情况，Tier 0 执行
+ * 组员时就会解决。第二次记进 nogroup，作废包含它的块（块不跨页，都在它那一页的桶里），
+ * 重新翻译时不再分组。
+ */
+static void ungroup(struct appine_dbt *d, uint64_t pc)
+{
+    uint64_t *strike = &d->strikes[(pc >> 2) % STRIKES];
+    if (*strike != pc) {
+        *strike = pc;
+        return;
+    }
+    *strike = 0;
+    d->nogroup[d->nogroup_count++ % NOGROUP_MAX] = pc;
+    d->stats.ungrouped++;
+    uint64_t page = pc >> APPINE_PAGE_SHIFT;
+    for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
+        struct block *b = &d->blocks[i - 1];
+        if (b->code && b->pc <= pc && pc < b->pc + 4ull * b->nguest && !retire_block(d, b)) {
+            appine_dbt_flush(d);
+            return;
+        }
+    }
+}
+
 /* ---- 翻译模板：所有实例共享（§4.2） ---- */
 
 /*
@@ -1431,8 +1825,9 @@ void appine_dbt_invalidate(struct appine_dbt *d, uint64_t start, uint64_t len)
 struct template {
     struct template *next;
     uint64_t pc;
+    uint64_t key; /* 翻译时用到的分组记录（nogroup_key） */
     uint32_t nguest, nhost, nrelocs;
-    uint32_t copied, remapped, memory, fallback; /* 统计，拷贝时累加 */
+    uint32_t copied, remapped, memory, fallback, grouped; /* 统计，拷贝时累加 */
     uint32_t words[];                            /* guest 指令字、宿主指令字、重定位 */
 };
 
@@ -1448,11 +1843,27 @@ static struct template **template_bucket(uint64_t pc)
     return &templates.buckets[((pc >> 2) * UINT64_C(0x9e3779b97f4a7c15)) >> (64 - TEMPLATE_BUCKET_BITS)];
 }
 
+/*
+ * 从 pc 开始的块翻译时会用到的分组记录（ungroup 记下的、影响到这一页里 pc 之后的
+ * 组长）：实例记下的不同，翻译出来的块也可能不同，翻译模板按它区分版本。没有时为 0。
+ */
+static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
+{
+    uint64_t key = 0, end = (pc | PAGE_MASK) + 1;
+    unsigned n = d->nogroup_count < NOGROUP_MAX ? d->nogroup_count : NOGROUP_MAX;
+    for (unsigned i = 0; i < n; i++) {
+        uint64_t q = d->nogroup[i];
+        if (q + 4 * MAX_BLOCK_INSNS > pc && q < end)
+            key += (q * UINT64_C(0x9e3779b97f4a7c15)) | 1;
+    }
+    return key;
+}
+
 /* 调用方持有锁 */
-static struct template *template_find(uint64_t pc, const uint32_t *guest)
+static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key)
 {
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
-        if (t->pc == pc && memcmp(t->words, guest, t->nguest * 4) == 0)
+        if (t->pc == pc && t->key == key && memcmp(t->words, guest, t->nguest * 4) == 0)
             return t;
     }
     return NULL;
@@ -1460,13 +1871,13 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest)
 
 /* 按模板在代码缓存的当前位置生成一个块，`nguest` 是它的 guest 指令条数；没有合适的
  * 模板时返回 NULL */
-static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t *guest,
+static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t *guest, uint64_t key,
                                uint32_t *nguest)
 {
     uint32_t *code = d->cache + d->used_words;
     pthread_mutex_lock(&templates.lock);
     appine_guard_hold(&templates.lock, false);
-    struct template *t = template_find(pc, guest);
+    struct template *t = template_find(pc, guest, key);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
         memcpy(rw(d, code), host, t->nhost * 4);
@@ -1480,6 +1891,7 @@ static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t
         d->stats.insns_remapped += t->remapped;
         d->stats.insns_memory += t->memory;
         d->stats.insns_fallback += t->fallback;
+        d->stats.insns_grouped += t->grouped;
         d->stats.blocks_shared++;
         *nguest = t->nguest;
     }
@@ -1489,8 +1901,8 @@ static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t
 }
 
 /* 把刚翻译好、还没有回填过链接的块存成模板 */
-static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, const struct xlate *x,
-                           const struct appine_dbt_stats *before)
+static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, uint64_t key,
+                           const struct xlate *x, const struct appine_dbt_stats *before)
 {
     const struct appine_dbt_stats *after = &x->d->stats;
     size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs);
@@ -1501,7 +1913,7 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
         void *p = mmap(NULL, TEMPLATE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         templates.arena = p == MAP_FAILED ? NULL : p;
     }
-    if (templates.arena && !template_find(pc, guest)) {
+    if (templates.arena && !template_find(pc, guest, key)) {
         if (templates.used + bytes > TEMPLATE_BYTES) {
             memset(templates.buckets, 0, sizeof(templates.buckets));
             templates.used = 0;
@@ -1510,6 +1922,7 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
         templates.used += bytes;
         *t = (struct template){
             .pc = pc,
+            .key = key,
             .nguest = nguest,
             .nhost = (uint32_t)x->n,
             .nrelocs = x->nrelocs,
@@ -1517,6 +1930,7 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
             .remapped = (uint32_t)(after->insns_remapped - before->insns_remapped),
             .memory = (uint32_t)(after->insns_memory - before->insns_memory),
             .fallback = (uint32_t)(after->insns_fallback - before->insns_fallback),
+            .grouped = (uint32_t)(after->insns_grouped - before->insns_grouped),
         };
         memcpy(t->words, guest, 4 * nguest);
         memcpy(t->words + nguest, x->buf, 4 * x->n);
@@ -1584,15 +1998,22 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
         page = appine_mmu_translate(c->mmu, pc & ~PAGE_MASK, APPINE_PROT_EXEC);
     if (!page)
         return NULL;
-    if (d->table_count >= ((size_t)3 << d->table_bits) / 4 &&
-        (d->table_bits == TABLE_BITS || !table_resize(d, d->table_bits + 1)))
+    /* 表里有四分之三不空时，墓碑占一半以上就原样重建，否则加倍；blocks 记满时整体清空 */
+    if (d->table_count == TABLE_LIMIT) {
         appine_dbt_flush(d);
+    } else if (d->table_occupied >= ((size_t)3 << d->table_bits) / 4) {
+        bool purge = d->table_dead * 2 >= d->table_occupied || d->table_bits == TABLE_BITS;
+        if (!table_resize(d, purge ? d->table_bits : d->table_bits + 1) ||
+            d->table_occupied >= ((size_t)3 << d->table_bits) / 4)
+            appine_dbt_flush(d);
+    }
     if (d->used_words + MAX_BLOCK_WORDS > d->cache_words)
         appine_dbt_flush(d);
 
     const uint32_t *guest = page + (pc & PAGE_MASK) / 4;
     uint32_t shared_nguest = 0;
-    uint32_t *code = template_copy(d, pc, guest, &shared_nguest);
+    uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
+    uint32_t *code = template_copy(d, pc, guest, key, &shared_nguest);
     if (code) {
         perf_map(code, (size_t)(d->cache + d->used_words - code) * 4, pc);
         sync_range(d, code, d->cache + d->used_words);
@@ -1609,6 +2030,13 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
     x->nstubs = 0;
     x->nfixups = 0;
     x->nrelocs = 0;
+    x->pc = pc;
+    x->guest = guest;
+    x->limit = (unsigned)((APPINE_PAGE_SIZE - (pc & PAGE_MASK)) / 4);
+    if (x->limit > MAX_BLOCK_INSNS)
+        x->limit = MAX_BLOCK_INSNS;
+    x->sp_aligned = false;
+    x->group.n = x->group.next = 0;
 
     /* 块入口检查 kick，保证链接起来的循环也能被打断 */
     emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, pending)));
@@ -1623,6 +2051,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
             break;
         }
         d->stats.insns++;
+        x->idx = nguest;
         if (!translate_insn(x, guest[nguest], va)) {
             nguest++;
             break;
@@ -1661,7 +2090,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
 
     if (x->nrelocs > MAX_RELOCS)
         abort();
-    template_store(pc, guest, nguest, x, &before);
+    template_store(pc, guest, nguest, key, x, &before);
     code = x->buf;
     size_t words = x->n;
     perf_map(code, words * 4, pc);
@@ -1672,78 +2101,140 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
     return code;
 }
 
-/*
- * TLB 回填例程：在翻译后的代码里按 mmu.c 的结构遍历页表，填好表项后回到访存
- * 指令重新检查，不必退出到分发器。入口：T0 = guest 地址，T1 和 T2 见
- * emit_refill_stub。跨页、地址带标签、未映射或没有权限时失败。
- *
- * 借用 cpu 结构体里 x0–x3 的位置暂存宿主 x0–x3：翻译后的代码运行期间这些位置
- * 不保存 guest 的值，退出例程会重新写入。和 Tier 0 的 appine_tlb_fill 一样，
- * 同时记下 tlb_used，读写两半的 tag 按叶子表项的权限分别填写。
- */
-static uint32_t *emit_refill(struct xlate *x, bool write)
-{
-    size_t x0 = offsetof(struct appine_cpu, x), used = offsetof(struct appine_cpu, tlb_used);
-    uint32_t *fail[8], *entry = here(x);
-    unsigned nfail = 0;
+/* 回填例程失败时跳往的位置，最后统一回填 */
+struct refill_fails {
+    uint32_t *site[16];
+    unsigned n;
+};
 
-    emit(x, enc_stp_x(0, 1, CTX, (int)x0));
-    emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
-    /* 跨页：页内偏移 + 字节数 - 1 超出这一页 */
-    emit(x, enc_and_low(0, T0, APPINE_PAGE_SHIFT));
-    emit(x, enc_add_lsl(0, 0, T2, 0));
-    fail[nfail++] = here(x);
-    emit(x, enc_tbnz(0, APPINE_PAGE_SHIFT));
-    emit(x, enc_ubfx(0, T0, APPINE_VA_BITS, 64 - APPINE_VA_BITS));
-    fail[nfail++] = here(x);
-    emit(x, enc_cbnz_x(0));
+static void emit_to_fail(struct xlate *x, struct refill_fails *f, uint32_t insn)
+{
+    f->site[f->n++] = here(x);
+    emit(x, insn);
+}
+
+/*
+ * 按 mmu.c 的结构遍历页表，把地址 `a`（T0 或 x3）所在的页填进 TLB：读写两半的 tag
+ * 按叶子表项的权限分别填写，和 Tier 0 的 appine_tlb_fill 一样同时记下 tlb_used。
+ * 未映射或没有这次访问要的权限时跳往失败。结束时 x2 = addend；用掉 x0、x1、x4、T2，
+ * 保留 x3、T0、T1。
+ */
+static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fails *f)
+{
+    size_t used = offsetof(struct appine_cpu, tlb_used);
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, mmu)));
     emit(x, enc_ldr_x(0, 0, offsetof(struct appine_mmu, root)));
     /* 中间表项是下一级表的地址；按地址依赖读取，和 mmu.c 的 acquire 读取一样有序 */
     for (unsigned level = 0; level < MMU_LEVELS; level++) {
-        emit(x, enc_ubfx(1, T0, APPINE_PAGE_SHIFT + MMU_LEVEL_BITS * (MMU_LEVELS - 1 - level),
+        emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + MMU_LEVEL_BITS * (MMU_LEVELS - 1 - level),
                          MMU_LEVEL_BITS));
         emit(x, enc_ldr_x_index(0, 0, 1));
-        if (level < MMU_LEVELS - 1) {
-            fail[nfail++] = here(x);
-            emit(x, enc_cbz_x(0));
-        }
+        if (level < MMU_LEVELS - 1)
+            emit_to_fail(x, f, enc_cbz_x(0));
     }
     /* 叶子表项 = 宿主页地址 | 权限位；未映射的是 0，权限检查一并排除 */
-    fail[nfail++] = here(x);
-    emit(x, enc_tbz(0, write ? 1 : 0));
+    emit_to_fail(x, f, enc_tbz(0, write ? 1 : 0));
     _Static_assert(APPINE_PROT_READ == 1 && APPINE_PROT_WRITE == 2, "权限位的位置");
-    emit(x, enc_and_clear_low(1, T0, APPINE_PAGE_SHIFT));
-    emit(x, enc_and_clear_low(T2, 0, APPINE_PAGE_SHIFT));
-    emit(x, enc_sub_reg(T2, T2, 1)); /* addend */
-    emit(x, enc_ubfx(2, T0, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT)); /* 页号 */
-    emit(x, enc_ubfx(1, T0, APPINE_PAGE_SHIFT, TLB_BITS));
+    emit(x, enc_and_clear_low(1, a, APPINE_PAGE_SHIFT));
+    emit(x, enc_and_clear_low(2, 0, APPINE_PAGE_SHIFT));
+    emit(x, enc_sub_reg(2, 2, 1)); /* addend */
+    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT)); /* 页号 */
+    emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(1, CTX, 1, 5));
     for (unsigned half = 0; half < 2; half++) {
         /* 有权限时 tag = (0 - 1) & ~页号，否则 0 & ~页号 = TLB_INVALID */
-        emit(x, enc_ubfx(3, 0, half, 1));
-        emit(x, enc_sub_reg(3, 31, 3));
-        emit(x, enc_bic_reg(3, 3, 2));
-        emit(x, enc_stp_x(3, T2, 1, (int)(TLB_OFF + 16 * half)));
+        emit(x, enc_ubfx(T2, 0, half, 1));
+        emit(x, enc_sub_reg(T2, 31, T2));
+        emit(x, enc_bic_reg(T2, T2, 4));
+        emit(x, enc_stp_x(T2, 2, 1, (int)(TLB_OFF + 16 * half)));
     }
     /* tlb_used[下标 / 64] |= 1 << (下标 % 64) */
-    emit(x, enc_ubfx(1, T0, APPINE_PAGE_SHIFT + 6, TLB_BITS - 6));
+    emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + 6, TLB_BITS - 6));
     emit(x, enc_add_lsl(1, CTX, 1, 3));
     emit_add_const(x, 1, 1, (int64_t)(used & ~(size_t)0xfff));
-    emit(x, enc_ldr_x(3, 1, used & 0xfff));
-    emit(x, enc_ubfx(2, T0, APPINE_PAGE_SHIFT, 6));
+    emit(x, enc_ldr_x(T2, 1, used & 0xfff));
+    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 6));
     emit(x, enc_movz(0, 1, 0));
-    emit(x, enc_lslv(0, 0, 2));
-    emit(x, enc_orr_reg(3, 3, 0));
-    emit(x, enc_str_x(3, 1, used & 0xfff));
+    emit(x, enc_lslv(0, 0, 4));
+    emit(x, enc_orr_reg(T2, T2, 0));
+    emit(x, enc_str_x(T2, 1, used & 0xfff));
+}
+
+/* 在 TLB 里查地址 `a` 所在的页：命中时 `addend` 寄存器 = addend，否则跳往 `miss`
+ * （偏移待回填）；用掉 x0 */
+static uint32_t *emit_probe(struct xlate *x, unsigned a, unsigned addend, bool write)
+{
+    emit(x, enc_ubfx(0, a, APPINE_PAGE_SHIFT, TLB_BITS));
+    emit(x, enc_add_lsl(0, CTX, 0, 5));
+    emit(x, enc_ldp_x(0, addend, 0, (int)TLB_OFF + (write ? 16 : 0)));
+    emit(x, enc_eon_lsr(0, 0, a, APPINE_PAGE_SHIFT));
+    uint32_t *miss = here(x);
+    emit(x, enc_cbnz_x(0));
+    return miss;
+}
+
+/*
+ * TLB 回填例程：TLB 未命中或者访问跨页时，在翻译后的代码里处理，不必退出到分发器。
+ * 入口：T0 = guest 地址，T1 和 T2 见 emit_refill_stub。成功时 T2 = addend，回到
+ * 访问本身。
+ *
+ * 不跨页时按页表填好表项。跨页时两页都要有这次访问的权限，宿主地址也要连续（两页
+ * 的 addend 相同；同一次宿主映射里的页都是这样），这时整个访问照样在宿主上一次完成：
+ * 两页都在 TLB 里时只比对两个表项，不在的先填进去。栈帧跨页的函数每次调用都会这样
+ * 访问，所以不能退给 Tier 0。地址带标签、超出地址空间、未映射、没有权限或者宿主地址
+ * 不连续时失败。
+ *
+ * 借用 cpu 结构体里 x0–x4 的位置暂存宿主 x0–x4：翻译后的代码运行期间这些位置
+ * 不保存 guest 的值，退出例程会重新写入。
+ */
+static uint32_t *emit_refill(struct xlate *x, bool write)
+{
+    size_t x0 = offsetof(struct appine_cpu, x);
+    uint32_t *entry = here(x);
+    struct refill_fails f = {.n = 0};
+
+    emit(x, enc_stp_x(0, 1, CTX, (int)x0));
+    emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
+    emit(x, enc_str_x(4, CTX, x0 + 32));
+    emit(x, enc_add_lsl(3, T0, T2, 0)); /* 最后一个字节 */
+    /* 两头的高位都要是 0：只看 x3 会漏掉加上字节数之后绕回来的地址 */
+    emit(x, enc_orr_reg(0, T0, 3));
+    emit(x, enc_ubfx(0, 0, APPINE_VA_BITS, 64 - APPINE_VA_BITS));
+    emit_to_fail(x, &f, enc_cbnz_x(0));
+    emit(x, enc_eor_lsr(0, T0, 3, 0));
+    emit(x, enc_ubfx(0, 0, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT));
+    uint32_t *cross = here(x);
+    emit(x, enc_cbnz_x(0));
+
+    emit_fill(x, T0, write, &f);
+    emit(x, enc_mov(T2, 2));
+    uint32_t *done = here(x);
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
+    emit(x, enc_ldr_x(4, CTX, x0 + 32));
     emit(x, enc_br(T1));
 
-    for (unsigned i = 0; i < nfail; i++)
-        patch_branch(x->d, fail[i], here(x));
+    /* 跨页：x1、x2 = 两页的 addend */
+    uint32_t *probe = here(x);
+    patch_branch(x->d, cross, probe);
+    uint32_t *miss[2];
+    miss[0] = emit_probe(x, T0, 1, write);
+    miss[1] = emit_probe(x, 3, 2, write);
+    emit(x, enc_sub_reg(0, 2, 1));
+    emit_to_fail(x, &f, enc_cbnz_x(0));
+    emit(x, enc_mov(T2, 1));
+    emit(x, enc_b((intptr_t)done - (intptr_t)here(x)));
+    for (unsigned i = 0; i < 2; i++) {
+        patch_branch(x->d, miss[i], here(x));
+        emit_fill(x, i ? 3 : T0, write, &f);
+        emit(x, enc_b((intptr_t)probe - (intptr_t)here(x)));
+    }
+
+    for (unsigned i = 0; i < f.n; i++)
+        patch_branch(x->d, f.site[i], here(x));
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
+    emit(x, enc_ldr_x(4, CTX, x0 + 32));
     emit(x, enc_add_imm(T1, T1, 4, 0));
     emit(x, enc_br(T1));
     return entry;
@@ -2077,6 +2568,9 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             d->stats.exits_lookup++;
             fill_jump_cache = true;
             break;
+        case R_UNGROUP:
+            ungroup(d, c->pc);
+            /* fallthrough */
         case R_INTERP: {
             d->stats.exits_interp++;
             enum appine_exit r = appine_interp_step(c);

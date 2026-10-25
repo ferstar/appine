@@ -34,11 +34,16 @@ fn interpreter_matches_hardware() {
     eprintln!("lockstep seed = {seed}");
     match run(&config) {
         Ok(reports) => {
+            let tier1 = appine_engine::Dbt::new().is_some();
             for r in reports.iter().filter(|r| !r.skipped) {
                 assert!(
                     r.executed > 0,
                     "class {} never executed an instruction",
                     r.name
+                );
+                assert!(
+                    !tier1 || r.name != "same_base" || r.tier1_grouped > 0,
+                    "tier 1 never shared a TLB check in class same_base"
                 );
             }
         }

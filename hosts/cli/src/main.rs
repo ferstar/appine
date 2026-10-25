@@ -223,6 +223,11 @@ fn print_stats(s: &DbtStats) {
         pct(s.insns_memory)
     );
     eprintln!(
+        "      sharing a check {:>12}  ({:.1}%)",
+        s.insns_grouped,
+        pct(s.insns_grouped)
+    );
+    eprintln!(
         "    tier 0 fallback   {:>12}  ({:.1}%)",
         s.insns_fallback,
         pct(s.insns_fallback)
@@ -233,4 +238,5 @@ fn print_stats(s: &DbtStats) {
     );
     eprintln!("  code cache flushes  {:>12}", s.flushes);
     eprintln!("  blocks invalidated  {:>12}", s.invalidated);
+    eprintln!("  groups undone       {:>12}", s.ungrouped);
 }

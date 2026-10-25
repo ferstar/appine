@@ -463,7 +463,7 @@ pub struct DbtStats {
     pub exits_chain: u64,
     /// 间接分支未命中跳转缓存的次数。
     pub exits_lookup: u64,
-    /// 交给 Tier 0 执行一条指令的次数（TLB 未命中、跨页、不支持的指令）。
+    /// 交给 Tier 0 执行一条指令的次数（回填 TLB 失败、SP 未对齐、不支持的指令等）。
     pub exits_interp: u64,
     /// 因 syscall 退出的次数。
     pub exits_svc: u64,
@@ -475,6 +475,10 @@ pub struct DbtStats {
     pub invalidated: u64,
     /// `blocks` 中直接拷贝翻译模板（其他实例翻译过的同一段代码）得到的块数。
     pub blocks_shared: u64,
+    /// `insns_memory` 中和同一块里前面以同一寄存器为基址的访存共用一次 TLB 检查的条数。
+    pub insns_grouped: u64,
+    /// 共用的检查没通过、作废之后按不分组重新翻译的次数。
+    pub ungrouped: u64,
 }
 
 /// Tier 1：同 ISA 直通式 DBT 的一个实例（代码缓存、翻译表、跳转缓存）。

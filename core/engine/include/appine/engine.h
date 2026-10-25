@@ -230,6 +230,8 @@ struct appine_dbt_stats {
     uint64_t flushes;
     uint64_t invalidated;   /* 被 appine_dbt_invalidate() 作废的块 */
     uint64_t blocks_shared; /* blocks 中直接拷贝翻译模板得到的块 */
+    uint64_t insns_grouped; /* insns_memory 中和前面的访存共用一次 TLB 检查的 */
+    uint64_t ungrouped;     /* 共用的检查没通过、按不分组重新翻译的次数 */
 };
 
 /*

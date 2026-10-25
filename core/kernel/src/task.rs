@@ -524,4 +524,6 @@ fn add_stats(total: &mut DbtStats, s: &DbtStats) {
     total.flushes += s.flushes;
     total.invalidated += s.invalidated;
     total.blocks_shared += s.blocks_shared;
+    total.insns_grouped += s.insns_grouped;
+    total.ungrouped += s.ungrouped;
 }

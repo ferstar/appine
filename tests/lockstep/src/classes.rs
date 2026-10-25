@@ -94,6 +94,7 @@ pub const CLASSES: &[Class] = &[
     },
     case("int_ldst", int_ldst, 0),
     case("int_pair", int_pair, 0),
+    case("same_base", same_base, hwcap::FP | hwcap::ASIMD),
     case("literal", literal, hwcap::FP | hwcap::ASIMD),
     case("simd_ldst", simd_ldst, hwcap::FP | hwcap::ASIMD),
     case("simd_pair", simd_pair, hwcap::FP | hwcap::ASIMD),
@@ -464,6 +465,92 @@ fn single_reg(
     };
     c.insns.push(insn);
     c.pointers.push((rn, start));
+    c
+}
+
+/// 以同一个寄存器为基址的 2–4 条访存（Tier 1 让它们共用一次 TLB 检查）：整数和
+/// SIMD&FP 的单寄存器、成对访问，带回写，中间可以有按常数加减基址的 ADD/SUB，最后
+/// 一条可以是把基址覆盖掉的加载。覆盖的范围可以跨页。
+fn same_base(g: &mut Rng, _: &Env) -> Case {
+    let rn = reg_except(g, &[]);
+    /* 基址离数据区两头都足够远：每条指令最多移动基址 512 字节、偏移最多 512 字节 */
+    let start = 2560 + g.below(DATA_BYTES as u32 - 2 * 2560 - 16) as i64;
+    let mut c = Case {
+        pointers: vec![(rn, start)],
+        ..Case::default()
+    };
+    for _ in 0..2 + g.below(3) {
+        let rt = reg_or_zr(g, &[rn]);
+        let insn = match g.below(6) {
+            0 => {
+                /* LDR/STR Wt|Xt 无符号偏移；加载时偶尔覆盖基址，之后不再用它 */
+                let size = 2 + g.bit();
+                let load = g.bit();
+                let rt = if load == 1 && g.below(4) == 0 { rn } else { rt };
+                let insn = size << 30 | 0x3900_0000 | load << 22 | g.below(32) << 10 | rn << 5 | rt;
+                if rt == rn {
+                    c.insns.push(insn);
+                    break;
+                }
+                insn
+            }
+            1 => {
+                /* LDUR/STUR、后变址、前变址，各种大小 */
+                let op = g.pick(&[0, 1, 3]);
+                g.bits(2) << 30
+                    | 0x3800_0000
+                    | g.bit() << 22
+                    | (signed(g, 9) as u32 & 0x1ff) << 12
+                    | op << 10
+                    | rn << 5
+                    | rt
+            }
+            2 => {
+                /* LDP/STP Xt：后变址、有符号偏移、前变址 */
+                let load = g.bit();
+                let rt2 = if load == 1 {
+                    reg_or_zr(g, &[rn, rt])
+                } else {
+                    reg_or_zr(g, &[rn])
+                };
+                2 << 30
+                    | 0x2800_0000
+                    | (1 + g.below(3)) << 23
+                    | load << 22
+                    | (signed(g, 7) as u32 & 0x7f) << 15
+                    | rt2 << 10
+                    | rn << 5
+                    | rt
+            }
+            3 => {
+                /* LDR/STR Qt 无符号偏移 */
+                0x3d80_0000 | g.bit() << 22 | g.below(32) << 10 | rn << 5 | g.bits(5)
+            }
+            4 => {
+                /* LDP/STP Dt 有符号偏移 */
+                let load = g.bit();
+                let rt = g.bits(5);
+                let rt2 = loop {
+                    let r = g.bits(5);
+                    if load == 0 || r != rt {
+                        break r;
+                    }
+                };
+                1 << 30
+                    | 0x2d00_0000
+                    | load << 22
+                    | (signed(g, 7) as u32 & 0x7f) << 15
+                    | rt2 << 10
+                    | rn << 5
+                    | rt
+            }
+            _ => {
+                /* ADD/SUB Xn, Xn, #imm */
+                0x9100_0000 | g.bit() << 30 | g.below(64) << 10 | rn << 5 | rn
+            }
+        };
+        c.insns.push(insn);
+    }
     c
 }
 

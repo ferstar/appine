@@ -80,8 +80,13 @@ fn main() -> ExitCode {
                     continue;
                 }
                 println!(
-                    "{:<18} executed {:>8}  both-undefined {:>8}  rejected-by-whitelist {:>8}  tier1-fallback {:>8}",
-                    r.name, r.executed, r.both_undefined, r.stricter, r.tier1_fallback
+                    "{:<18} executed {:>8}  both-undefined {:>8}  rejected-by-whitelist {:>8}  tier1-fallback {:>8}  tier1-grouped {:>8}",
+                    r.name,
+                    r.executed,
+                    r.both_undefined,
+                    r.stricter,
+                    r.tier1_fallback,
+                    r.tier1_grouped
                 );
             }
             ExitCode::SUCCESS
