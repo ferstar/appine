@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, read_timespec, tty};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, oflags};
-use crate::kernel::{Cx, request_wake};
+use crate::kernel::{Cx, request_wake_files};
 use crate::pipe::PIPE_BUF;
 use crate::process::RLIMIT_NOFILE;
 use crate::signal;
@@ -225,7 +225,7 @@ pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
     }
     // 信号驱动的 I/O 也按用完数据重新开始计算，见 check_fasync
     if file.borrow().flags & oflags::O_ASYNC != 0 {
-        request_wake();
+        request_wake_files();
     }
 }
 
@@ -789,7 +789,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         (EPOLL_CTL_ADD, Some(_)) => Err(Errno::EEXIST),
         (EPOLL_CTL_ADD, None) => {
             ep.interests.push(Interest::new(fd, &file, events, data));
-            request_wake();
+            request_wake_files();
             Ok(0)
         }
         // 带 EPOLLEXCLUSIVE 加入的不能修改
@@ -799,7 +799,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         // 与 Linux 相同，修改之后重新判断：已经就绪的会再报告一次
         (EPOLL_CTL_MOD, Some(i)) => {
             ep.interests[i] = Interest::new(fd, &file, events, data);
-            request_wake();
+            request_wake_files();
             Ok(0)
         }
         (EPOLL_CTL_DEL, Some(i)) => {
@@ -908,7 +908,7 @@ pub(super) fn eventfd_read(
                 let v = if e.semaphore { 1 } else { e.count };
                 e.count -= v;
                 buf[..8].copy_from_slice(&v.to_le_bytes());
-                request_wake();
+                request_wake_files();
                 return Ok(8);
             }
         }
@@ -941,7 +941,7 @@ pub(super) fn eventfd_write(
             let mut e = efd.borrow_mut();
             if e.count.checked_add(v).is_some_and(|c| c < u64::MAX) {
                 e.count += v;
-                request_wake();
+                request_wake_files();
                 return Ok(8);
             }
         }

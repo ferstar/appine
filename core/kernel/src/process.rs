@@ -335,6 +335,8 @@ pub(crate) struct ThreadGroup {
     pub maxrss_kb: u64,
     /// 已回收的子进程（包括它们回收的）里最大的 `maxrss_kb`。
     pub child_maxrss_kb: u64,
+    /// getrusage 上次取样的时刻（[`ThreadGroup::sample_rss_throttled`]）。
+    pub rss_sampled: Option<std::time::Instant>,
     /// `ITIMER_REAL`：fork 不继承，execve 保留。
     pub itimer: Option<crate::itimer::ITimer>,
     /// `ITIMER_VIRTUAL`、`ITIMER_PROF`，按进程用掉的 CPU 时间计时。
@@ -396,6 +398,7 @@ impl ThreadGroup {
             child_cpu: CpuTime::default(),
             maxrss_kb: 0,
             child_maxrss_kb: 0,
+            rss_sampled: None,
             itimer: None,
             cpu_itimers: [None; 2],
             pdeathsig: 0,
@@ -428,6 +431,19 @@ impl ThreadGroup {
     /// 取一次驻留内存的样，更新峰值。
     pub fn sample_rss(&mut self, mm: &crate::mm::Mm) {
         self.maxrss_kb = self.maxrss_kb.max(mm.resident_pages() * 4);
+    }
+
+    /// getrusage 的取样：距上次不到 10 毫秒时沿用上次的峰值。取样要用 mincore 扫一遍写过
+    /// 的映射，JVM 频繁调用 getrusage、堆又很大，每次都取样时它占了 Maven 一成多的时间。
+    /// execve、退出时的取样不受限制。
+    pub fn sample_rss_throttled(&mut self, mm: &crate::mm::Mm) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        let now = std::time::Instant::now();
+        if self.rss_sampled.is_some_and(|t| now - t < INTERVAL) {
+            return;
+        }
+        self.rss_sampled = Some(now);
+        self.sample_rss(mm);
     }
 }
 

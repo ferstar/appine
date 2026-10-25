@@ -47,6 +47,12 @@ static inline uint32_t enc_ldaxr(unsigned size, unsigned rt, unsigned rn)
     return 0x085ffc00u | size << 30 | rn << 5 | rt;
 }
 
+/* STLRB/STLRH/STLR Rt, [Xn] */
+static inline uint32_t enc_stlr(unsigned size, unsigned rt, unsigned rn)
+{
+    return 0x089ffc00u | size << 30 | rn << 5 | rt;
+}
+
 /* STLXRB/STLXRH/STLXR Ws, Rt, [Xn] */
 static inline uint32_t enc_stlxr(unsigned size, unsigned rs, unsigned rt, unsigned rn)
 {
@@ -224,6 +230,24 @@ static inline uint32_t enc_sub_reg(unsigned rd, unsigned rn, unsigned rm)
 static inline uint32_t enc_orr_reg(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0xaa000000u | rm << 16 | rn << 5 | rd;
+}
+
+/* LSR Xd, Xn, Xm（LSRV） */
+static inline uint32_t enc_lsrv(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x9ac02400u | rm << 16 | rn << 5 | rd;
+}
+
+/* MUL Xd, Xn, Xm（MADD Xd, Xn, Xm, XZR） */
+static inline uint32_t enc_mul(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x9b007c00u | rm << 16 | rn << 5 | rd;
+}
+
+/* AND Xd, Xn, Xm */
+static inline uint32_t enc_and_reg(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x8a000000u | rm << 16 | rn << 5 | rd;
 }
 
 /* LSL Xd, Xn, Xm（LSLV） */

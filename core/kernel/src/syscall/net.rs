@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, put, unix};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
-use crate::kernel::{Cx, request_wake};
+use crate::kernel::{Cx, request_wake_files};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
     SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
@@ -480,7 +480,7 @@ pub(crate) fn send(
         }
         Socket::Netlink(s) => {
             s.handle(data, appine_hal::net::interfaces);
-            request_wake();
+            request_wake_files();
             return Ok(data.len());
         }
         Socket::Unix(_) => unreachable!("handled above"),
@@ -497,7 +497,7 @@ pub(crate) fn send(
         if let Socket::Inet(s) = &mut *sock.borrow_mut() {
             s.answers.push_back(answer);
         }
-        request_wake();
+        request_wake_files();
         return Ok(data.len());
     }
     let deadline = timeout.map(|t| Instant::now() + t);

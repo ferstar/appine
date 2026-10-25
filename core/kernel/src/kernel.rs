@@ -7,15 +7,16 @@
 //!
 //! 等待统一走宿主 `poll()`：每个线程有一个 eventfd，等待时把它和要等的宿主 fd
 //! 放在一起 poll。任何可能让别人的等待条件成立的修改都调用 [`request_wake`]，
-//! 释放 BKL 时唤醒所有正在等待的线程，由它们各自重新检查条件。futex 是例外：停在锁
-//! 和条件变量上的线程很多，它们用 [`Cx::wait_alone`] 等待，只被 FUTEX_WAKE、信号和
-//! 结束线程组直接通知。
+//! 释放 BKL 时唤醒正在等待的线程，由它们各自重新检查条件。修改按通道（[`wake`]）区分，
+//! 只叫醒关心这个通道的等待者：关闭文件、读写管道这类修改很频繁，不必每次都叫醒在 wait4
+//! 里等子进程的 shell 和定时器线程。futex 是例外：停在锁和条件变量上的线程很多，它们用
+//! [`Cx::wait_alone`] 等待，只被 FUTEX_WAKE、信号和结束线程组直接通知。
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -44,12 +45,27 @@ pub(crate) const PID_MAX: Tid = 4 << 20;
 /// 主机名、域名的最大长度（`__NEW_UTS_LEN`）。
 pub(crate) const UTS_LEN: usize = 64;
 
-/// 有修改可能让等待中的线程继续，释放 BKL 时唤醒它们。
-static WAKE: AtomicBool = AtomicBool::new(false);
+/// 唤醒的通道：等待者登记自己关心哪些（[`Cx::wait_on`]），修改只叫醒关心它的等待者。
+pub(crate) mod wake {
+    /// 文件、管道、socket、文件锁这类打开文件上的修改。
+    pub const FILE: u32 = 1;
+    /// 其余一切：子进程的状态、定时器的设置、信号等。
+    pub const OTHER: u32 = 2;
+    pub const ALL: u32 = FILE | OTHER;
+}
+
+/// 释放 BKL 时要叫醒的通道。
+static WAKE: AtomicU32 = AtomicU32::new(0);
 
 /// 请求在释放 BKL 时唤醒所有等待中的线程。调用方持有 BKL。
 pub(crate) fn request_wake() {
-    WAKE.store(true, Ordering::Relaxed);
+    WAKE.fetch_or(wake::ALL, Ordering::Relaxed);
+}
+
+/// 只影响打开文件的修改（关闭文件、读写管道、释放文件锁等）：只叫醒关心
+/// [`wake::FILE`] 的等待者。调用方持有 BKL。
+pub(crate) fn request_wake_files() {
+    WAKE.fetch_or(wake::FILE, Ordering::Relaxed);
 }
 
 /// 持有 flock(2) 锁的打开文件（弱引用，关闭后锁随之释放），以及是不是排他锁。
@@ -111,8 +127,8 @@ pub(crate) struct Kernel {
     /// App 内存的上限和 OOM killer（[`crate::oom`]）。
     pub oom: crate::oom::Oom,
     next_tid: Tid,
-    /// 正在等待的线程的事件。
-    waiters: Vec<Arc<Event>>,
+    /// 正在等待的线程的事件和它关心的通道（[`wake`]）。
+    waiters: Vec<(Arc<Event>, u32)>,
     /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
     pub edge_waiters: Vec<Arc<Event>>,
     /// 设置了 `O_ASYNC` 的打开文件（`syscall::poll` 的 fasync）。
@@ -237,9 +253,12 @@ impl Kernel {
     }
 
     fn flush_wakeups(&self) {
-        if WAKE.swap(false, Ordering::AcqRel) {
-            for event in &self.waiters {
-                event.signal();
+        let channels = WAKE.swap(0, Ordering::AcqRel);
+        if channels != 0 {
+            for (event, interest) in &self.waiters {
+                if interest & channels != 0 {
+                    event.signal();
+                }
             }
         }
     }
@@ -272,7 +291,17 @@ impl Shared {
 
     /// 获取 BKL。内核层 panic 时锁会中毒：出问题的进程已经被结束（[`crate::bug`]），
     /// 其余的照常使用它。
+    ///
+    /// 持锁的时间通常只有几微秒（一次 lstat），先自旋一会儿：睡下再被叫醒要几十微秒，
+    /// 释放的一方还要多一次 futex 唤醒。`git status` 的并行 lstat 原来比单线程还慢。
     pub fn lock(&self) -> Bkl<'_> {
+        for _ in 0..100 {
+            match self.kernel.try_lock() {
+                Ok(k) => return Bkl(k),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Bkl(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
+            }
+        }
         Bkl(self.kernel.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
@@ -300,19 +329,21 @@ impl Drop for Bkl<'_> {
 }
 
 /// 释放 BKL 等待：事件被触发（[`request_wake`]、信号）、`host` 里的宿主 fd 就绪或者
-/// 到达 `deadline` 时重新获取 BKL 返回。调用方重新检查自己的条件。`listed` 为 false
-/// 时不登记在 [`request_wake`] 要叫醒的名单里，只有直接通知 `event` 才会醒（futex）。
+/// 到达 `deadline` 时重新获取 BKL 返回。调用方重新检查自己的条件。`interest` 是关心的
+/// 通道（[`wake`]）；为 0 时不登记在 [`request_wake`] 要叫醒的名单里，只有直接通知
+/// `event` 才会醒（futex）。
 pub(crate) fn block<'a>(
     shared: &'a Shared,
     mut k: Bkl<'a>,
     event: &Arc<Event>,
     deadline: Option<Instant>,
     host: &mut [(i32, i16, i16)],
-    listed: bool,
+    interest: u32,
 ) -> (Bkl<'a>, Result<(), Errno>) {
     const POLLIN: i16 = 1;
+    let listed = interest != 0;
     if listed {
-        k.waiters.push(event.clone());
+        k.waiters.push((event.clone(), interest));
     }
     drop(k);
     let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
@@ -322,7 +353,7 @@ pub(crate) fn block<'a>(
     let mut k = shared.lock();
     event.clear();
     if listed {
-        k.waiters.retain(|e| !Arc::ptr_eq(e, event));
+        k.waiters.retain(|(e, _)| !Arc::ptr_eq(e, event));
     }
     for (h, f) in host.iter_mut().zip(&fds) {
         h.2 = f.2;
@@ -497,24 +528,26 @@ impl<'a> Cx<'a> {
         deadline: Option<Instant>,
         host: &mut [(i32, i16, i16)],
     ) -> Result<(), Errno> {
-        self.wait_on(deadline, host, true)
+        self.wait_on(deadline, host, wake::ALL)
     }
 
     /// 只等直接的通知（futex 唤醒、信号、被结束）或者超时，[`request_wake`] 不会叫醒它。
     /// 调用方必须保证让它的条件成立的每个地方都直接通知了 `self.task.event`。
     pub fn wait_alone(&mut self, deadline: Option<Instant>) -> Result<(), Errno> {
-        self.wait_on(deadline, &mut [], false)
+        self.wait_on(deadline, &mut [], 0)
     }
 
-    fn wait_on(
+    /// 与 [`Cx::wait`] 相同，但只被 `interest` 里的通道（[`wake`]）叫醒。调用方必须保证
+    /// 让它的条件成立的修改都请求了这些通道。
+    pub fn wait_on(
         &mut self,
         deadline: Option<Instant>,
         host: &mut [(i32, i16, i16)],
-        listed: bool,
+        interest: u32,
     ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
         self.task.sleeping.set(true);
-        let (k, r) = block(self.shared, k, &self.task.event, deadline, host, listed);
+        let (k, r) = block(self.shared, k, &self.task.event, deadline, host, interest);
         self.task.sleeping.set(false);
         self.k = Some(k);
         r

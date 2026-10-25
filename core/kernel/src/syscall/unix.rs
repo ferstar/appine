@@ -12,7 +12,7 @@ use super::fs::{AT_FDCWD, lookup_at, parent_at};
 use super::net::{Message, SocketRef, epipe};
 use crate::errno::Errno;
 use crate::fd::FileRef;
-use crate::kernel::{Cx, request_wake};
+use crate::kernel::{Cx, request_wake_files};
 use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket};
 use crate::unix::{
     CAPACITY, ChannelRef, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN, Ucred,
@@ -232,7 +232,7 @@ pub(super) fn accept(
         })?;
         if let Some(new) = new {
             // 等 backlog 有空位的 connect 可以继续了
-            request_wake();
+            request_wake_files();
             let peer = with(&new, |u| u.peer_name()).unwrap_or_else(unnamed);
             return Ok((new, peer));
         }
@@ -282,7 +282,7 @@ pub(super) fn connect(
             if pending.len() <= *backlog {
                 let end = with(sock, |u| u.connect_stream(&server.addr, *server_cred, cred));
                 pending.push_back(Rc::new(RefCell::new(Socket::Unix(end))));
-                request_wake();
+                request_wake_files();
                 return Ok(());
             }
         }

@@ -29,7 +29,7 @@ use super::{SysResult, read_path};
 use crate::cred::MAY_READ;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
-use crate::kernel::{Cx, Kernel, request_wake};
+use crate::kernel::{Cx, Kernel, request_wake_files};
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
@@ -337,7 +337,7 @@ impl Registry {
         }
         queued |= self.deliver(ino, mask, 0, b"", None);
         if queued {
-            request_wake();
+            request_wake_files();
         }
     }
 }
@@ -409,7 +409,7 @@ pub(crate) fn dir_event(k: &Kernel, dir: Ino, name: &[u8], mask: u32, cookie: u3
             .borrow_mut()
             .deliver(dir, mask, cookie, name, None)
     {
-        request_wake();
+        request_wake_files();
     }
 }
 
@@ -626,7 +626,7 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     let mut i = inotify.borrow_mut();
     let w = i.watches.remove(&wd).ok_or(Errno::EINVAL)?;
     i.push(wd, IN_IGNORED, 0, b"");
-    request_wake();
+    request_wake_files();
     let mut r = cx.kr().inotify.borrow_mut();
     r.uncharge(i.uid);
     if let Node::Store(ino) = w.node

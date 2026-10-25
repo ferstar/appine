@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use crate::fd::{FdTable, FileRef, OpenFile};
-use crate::kernel::{Kernel, Tid, request_wake};
+use crate::kernel::{Kernel, Tid, request_wake_files};
 use crate::vfs::store::Ino;
 
 /// 锁的持有者。
@@ -129,7 +129,7 @@ impl Locks {
         } else {
             *locks = kept;
         }
-        request_wake();
+        request_wake_files();
     }
 
     /// 等待 `req` 会不会死锁：沿着"等待的请求被谁的锁挡住"一路找下去，回到自己就是
@@ -178,7 +178,7 @@ impl Locks {
                 let before = locks.len();
                 locks.retain(|l| !l.owner.same(&owner) && l.owner.alive());
                 if locks.len() != before {
-                    request_wake();
+                    request_wake_files();
                 }
                 if locks.is_empty() {
                     self.by_ino.remove(&ino);

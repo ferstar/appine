@@ -96,7 +96,7 @@ struct appine_cpu {
     uint32_t fault_access; /* enum appine_access */
     uint32_t fault_kind;   /* enum appine_fault_kind */
     uint32_t exit_info;
-    uint32_t reserved;
+    uint32_t dbt_lookup_seq; /* Tier 1：奇数表示正在不持锁地查翻译表（dbt.c 的 table_lookup） */
     uint64_t pending; /* 只能用原子操作访问；64 位是为了让 Tier 1 能用一条 ldr 读到它 */
     struct appine_mmu *mmu;
     /* 独占监视器（LDXR/STXR）：记录的地址、长度和读到的值 */
@@ -109,7 +109,9 @@ struct appine_cpu {
     uint64_t dbt_site;
     void *dbt_jump_cache;
     void *dbt_rs; /* 影子返回栈的栈顶（Tier 1 实例里 1 KB 对齐的环形缓冲） */
-    uint64_t reserved3; /* 让 tlb 按 16 字节对齐 */
+    /* ic ivau 记下、还没交给调用方作废翻译的页（0 表示没有），dsb、isb 和退出时交出；
+     * 也让 tlb 按 16 字节对齐 */
+    uint64_t ivau_page;
     /* Tier 1 以 "ldp [cpu + 下标 * 32 + 偏移]" 寻址表项，所以 tlb 的偏移不能超出 ldp
      * 立即数的范围 */
     struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];
@@ -235,26 +237,39 @@ struct appine_dbt_stats {
 };
 
 /*
- * 创建一个 Tier 1 实例（代码缓存、翻译表、跳转缓存）。一个实例只能由一个
- * 线程使用。宿主不是 aarch64 Linux 时返回 NULL。
+ * 一个地址空间的 Tier 1 翻译（代码缓存、翻译表）：这个地址空间里的所有线程共用，每个
+ * 线程用 appine_dbt_attach() 挂上去得到自己的部分（跳转缓存、影子返回栈、统计），再用
+ * 它运行。宿主不是 aarch64 Linux 时返回 NULL。appine_dbt_free() 在所有线程都解挂之后
+ * 调用；实例放回池里，翻译不多时保留下来，下一个使用者运行之前逐块核对。`key` 区分程序
+ * （0 表示不区分）：appine_dbt_new() 优先拿回同一个键留下的翻译。
  *
  * 翻译结果不会自己失效：guest 用 ic ivau 声明修改了代码（APPINE_EXIT_CODE），
- * 或者可执行的映射被拆除、改了权限之后，调用方要对共用这个地址空间的每个
- * 实例调用 appine_dbt_invalidate() 或 appine_dbt_flush()。
+ * 或者可执行的映射被拆除、改了权限之后，调用方要调用 appine_dbt_invalidate() 或
+ * appine_dbt_flush()（对地址空间调用一次即可，经由任意一个挂着的线程）。
  */
-struct appine_dbt *appine_dbt_new(void);
-void appine_dbt_free(struct appine_dbt *dbt);
-void appine_dbt_flush(struct appine_dbt *dbt);
+struct appine_dbt *appine_dbt_new(uint64_t key);
+void appine_dbt_free(struct appine_dbt *dbt, uint64_t key);
+/* 释放池里保留的翻译（宿主内存紧张时） */
+void appine_dbt_trim(void);
 
-/* 实例要换一个地址空间运行（exec 之后）：保留翻译，下次运行之前逐块核对 guest 指令字，
+struct appine_dbt_thread;
+struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *dbt);
+void appine_dbt_detach(struct appine_dbt_thread *t);
+
+/* 丢弃全部翻译：要等所有线程离开翻译后的代码，所以只是请求，由下一次进入 appine_dbt_run()
+ * 的线程完成 */
+void appine_dbt_flush(struct appine_dbt_thread *t);
+
+/* 要换一个地址空间运行（exec 之后）：保留翻译，下次运行之前逐块核对 guest 指令字，
  * 对不上的作废。从池里拿到的实例也是这样处理的。 */
-void appine_dbt_recheck(struct appine_dbt *dbt);
+void appine_dbt_recheck(struct appine_dbt_thread *t);
 
 /* 作废 [start, start + len) 覆盖的各页里开始的块；范围很大时等同于 appine_dbt_flush() */
-void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
+void appine_dbt_invalidate(struct appine_dbt_thread *t, uint64_t start, uint64_t len);
 
 /* 与 appine_cpu_run() 语义相同，但在翻译后的代码里执行 */
-enum appine_exit appine_dbt_run(struct appine_dbt *dbt, struct appine_cpu *cpu);
-void appine_dbt_get_stats(const struct appine_dbt *dbt, struct appine_dbt_stats *out);
+enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *cpu);
+/* 这个线程的统计：它退出的次数，以及它做的翻译、作废 */
+void appine_dbt_get_stats(const struct appine_dbt_thread *t, struct appine_dbt_stats *out);
 
 #endif /* APPINE_ENGINE_H */

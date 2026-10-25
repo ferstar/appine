@@ -7,6 +7,7 @@ use std::ffi::{c_int, c_void};
 use std::fmt;
 use std::mem::offset_of;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 /// guest 页大小，固定 4K（设计文档 §5.2）。
 pub const PAGE_SIZE: u64 = 4096;
@@ -71,7 +72,7 @@ pub struct CpuState {
     fault_access: u32,
     fault_kind: u32,
     exit_info: u32,
-    reserved: u32,
+    dbt_lookup_seq: u32,
     pending: u64,
     mmu: *mut RawMmu,
     excl_addr: u64,
@@ -82,7 +83,9 @@ pub struct CpuState {
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
     dbt_rs: *mut c_void,
-    reserved3: u64,
+    /// Tier 1 里 `ic ivau` 记下、还没交出来作废的页（0 表示没有）。引擎在 dsb、isb 时以
+    /// [`Exit::InvalidateCode`] 交出，因为别的原因退出时由调用方取走并作废。
+    pub ivau_page: u64,
     tlb: [TlbEntry; TLB_ENTRIES],
     itlb: [ItlbEntry; ITLB_ENTRIES],
     /// V0–V31，每个寄存器低 64 位在前。
@@ -123,17 +126,25 @@ unsafe extern "C" {
     fn appine_guest_hwcap() -> u64;
     fn appine_guest_midr() -> u64;
 
-    fn appine_dbt_new() -> *mut RawDbt;
-    fn appine_dbt_free(dbt: *mut RawDbt);
-    fn appine_dbt_flush(dbt: *mut RawDbt);
-    fn appine_dbt_recheck(dbt: *mut RawDbt);
-    fn appine_dbt_invalidate(dbt: *mut RawDbt, start: u64, len: u64);
-    fn appine_dbt_run(dbt: *mut RawDbt, cpu: *mut CpuState) -> c_int;
-    fn appine_dbt_get_stats(dbt: *const RawDbt, out: *mut DbtStats);
+    fn appine_dbt_new(key: u64) -> *mut RawDbt;
+    fn appine_dbt_trim();
+    fn appine_dbt_free(dbt: *mut RawDbt, key: u64);
+    fn appine_dbt_attach(dbt: *mut RawDbt) -> *mut RawDbtThread;
+    fn appine_dbt_detach(t: *mut RawDbtThread);
+    fn appine_dbt_flush(t: *mut RawDbtThread);
+    fn appine_dbt_recheck(t: *mut RawDbtThread);
+    fn appine_dbt_invalidate(t: *mut RawDbtThread, start: u64, len: u64);
+    fn appine_dbt_run(t: *mut RawDbtThread, cpu: *mut CpuState) -> c_int;
+    fn appine_dbt_get_stats(t: *const RawDbtThread, out: *mut DbtStats);
 }
 
 #[repr(C)]
 struct RawDbt {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct RawDbtThread {
     _private: [u8; 0],
 }
 
@@ -481,19 +492,72 @@ pub struct DbtStats {
     pub ungrouped: u64,
 }
 
-/// Tier 1：同 ISA 直通式 DBT 的一个实例（代码缓存、翻译表、跳转缓存）。
+/// 一个地址空间的 Tier 1 翻译（代码缓存、翻译表），这个地址空间里的所有线程共用：每个
+/// 线程经由 [`Dbt::attach`] 得到自己的 [`Dbt`]。最后一个 [`Dbt`] 和这里的引用都没了之后
+/// 放回池里，翻译不多时保留下来，下一个使用者运行之前逐块核对。
+pub struct DbtSpace {
+    raw: NonNull<RawDbt>,
+    key: u64,
+}
+
+// SAFETY: C 侧用自己的锁保护共享的部分（dbt.c 的 struct appine_dbt）
+unsafe impl Send for DbtSpace {}
+unsafe impl Sync for DbtSpace {}
+
+impl DbtSpace {
+    /// 创建（或者从池里取出）一个实例；宿主不是 aarch64 Linux 时返回 `None`。`key` 区分
+    /// 程序（0 表示不区分）：池里有同一个键留下的翻译时优先拿回它，用完放回池里时也按它
+    /// 记下。
+    pub fn new(key: u64) -> Option<Arc<Self>> {
+        NonNull::new(unsafe { appine_dbt_new(key) }).map(|raw| Arc::new(DbtSpace { raw, key }))
+    }
+}
+
+/// 释放池里保留的 Tier 1 翻译：没有人在用，宿主内存紧张时（Android 的 `onTrimMemory`）
+/// 可以丢掉，下次运行同一个程序时重新拷贝模板。
+pub fn trim_dbt_pool() {
+    unsafe { appine_dbt_trim() }
+}
+
+impl Drop for DbtSpace {
+    fn drop(&mut self) {
+        // 挂着的 Dbt 都持有 Arc，走到这里时它们都已经解挂
+        unsafe { appine_dbt_free(self.raw.as_ptr(), self.key) }
+    }
+}
+
+/// Tier 1：同 ISA 直通式 DBT 里一个线程的部分（跳转缓存、影子返回栈、统计），挂在一个
+/// [`DbtSpace`] 上。
 ///
 /// 翻译结果不会自己失效：guest 用 `ic ivau` 声明修改了代码（[`Exit::InvalidateCode`]），
 /// 或者可执行的映射被拆除、改了权限之后，必须调用 [`Dbt::invalidate`] 或
-/// [`Dbt::flush`]。只支持 aarch64 Linux 宿主。
+/// [`Dbt::flush`]（经由挂在同一个 [`DbtSpace`] 上的任意一个线程调用一次）。只支持
+/// aarch64 Linux 宿主。
 pub struct Dbt {
-    raw: NonNull<RawDbt>,
+    raw: NonNull<RawDbtThread>,
+    space: Arc<DbtSpace>,
 }
 
+// SAFETY: 线程的部分只由持有这个 Dbt 的线程使用，共享的部分由 C 侧加锁
+unsafe impl Send for Dbt {}
+
 impl Dbt {
-    /// 创建实例；宿主不是 aarch64 Linux 时返回 `None`。
+    /// 创建一个只有这个线程用的实例；宿主不是 aarch64 Linux 时返回 `None`。
     pub fn new() -> Option<Self> {
-        NonNull::new(unsafe { appine_dbt_new() }).map(|raw| Dbt { raw })
+        Self::attach(&DbtSpace::new(0)?)
+    }
+
+    /// 挂到 `space` 上。
+    pub fn attach(space: &Arc<DbtSpace>) -> Option<Self> {
+        NonNull::new(unsafe { appine_dbt_attach(space.raw.as_ptr()) }).map(|raw| Dbt {
+            raw,
+            space: space.clone(),
+        })
+    }
+
+    /// 挂着的实例。
+    pub fn space(&self) -> &Arc<DbtSpace> {
+        &self.space
     }
 
     /// 与 [`Cpu::run`] 语义相同，但在翻译后的代码里执行。
@@ -503,7 +567,7 @@ impl Dbt {
             .expect("appine_dbt_run returned EXIT_NONE")
     }
 
-    /// 丢弃全部翻译结果。
+    /// 丢弃全部翻译：要等所有线程离开翻译后的代码，由下一次 [`Dbt::run`] 完成。
     pub fn flush(&mut self) {
         unsafe { appine_dbt_flush(self.raw.as_ptr()) }
     }
@@ -519,7 +583,7 @@ impl Dbt {
         unsafe { appine_dbt_invalidate(self.raw.as_ptr(), start, len) }
     }
 
-    /// 统计数据。
+    /// 这个线程的统计：它退出的次数，以及它做的翻译、作废。
     pub fn stats(&self) -> DbtStats {
         let mut stats = DbtStats::default();
         unsafe { appine_dbt_get_stats(self.raw.as_ptr(), &mut stats) };
@@ -529,7 +593,7 @@ impl Dbt {
 
 impl Drop for Dbt {
     fn drop(&mut self) {
-        unsafe { appine_dbt_free(self.raw.as_ptr()) }
+        unsafe { appine_dbt_detach(self.raw.as_ptr()) }
     }
 }
 

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::kernel::request_wake;
+use crate::kernel::request_wake_files;
 use crate::vfs::store::Ino;
 
 /// 管道的默认容量。
@@ -100,7 +100,7 @@ impl PipeEnd {
             }
         }
         // 打开 FIFO 时等着对端的线程可以继续了
-        request_wake();
+        request_wake_files();
         PipeEnd {
             pipe: pipe.clone(),
             read,
@@ -119,6 +119,6 @@ impl Drop for PipeEnd {
             p.writers -= 1;
         }
         // 等在另一端的线程要看到 EOF 或 EPIPE
-        request_wake();
+        request_wake_files();
     }
 }

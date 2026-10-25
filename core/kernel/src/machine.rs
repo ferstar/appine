@@ -26,7 +26,7 @@ use appine_hal::Event;
 use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::fd::FdTable;
-use crate::kernel::{INIT, Kernel, Shared, block, request_wake};
+use crate::kernel::{INIT, Kernel, Shared, block, request_wake, wake};
 use crate::loader::{self, Args, Executable};
 use crate::mm::Mm;
 use crate::process::{
@@ -236,14 +236,19 @@ impl Machine {
     }
 
     /// 在持有 BKL 时反复检查 `cond`，直到它给出结果。
-    fn wait_for<T>(&self, mut cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+    fn wait_for<T>(&self, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+        self.wait_on(wake::ALL, cond)
+    }
+
+    /// 与 [`Machine::wait_for`] 相同，但只被 `interest` 里的通道（[`wake`]）叫醒。
+    fn wait_on<T>(&self, interest: u32, mut cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
         EVENT.with(|event| {
             let mut k = self.shared.lock();
             loop {
                 if let Some(v) = cond(&mut k) {
                     return v;
                 }
-                let (k2, _) = block(&self.shared, k, event, None, &mut [], true);
+                let (k2, _) = block(&self.shared, k, event, None, &mut [], interest);
                 k = k2;
             }
         })
@@ -251,7 +256,10 @@ impl Machine {
 
     /// 等 [`Machine::spawn`] 启动的进程结束。
     pub fn wait(&self, pid: u32) -> ExitStatus {
-        self.wait_for(|k| k.watched.get(&(pid as i32)).copied().flatten())
+        // 进程结束不是打开文件上的修改：关闭文件、读写管道不必叫醒这里
+        self.wait_on(wake::OTHER, |k| {
+            k.watched.get(&(pid as i32)).copied().flatten()
+        })
     }
 
     /// [`Machine::spawn`] 启动的进程已经结束时返回它的结束方式。
@@ -359,6 +367,12 @@ impl Machine {
         self.wait_for(|k| k.tasks.is_empty().then_some(()));
     }
 
+    /// 宿主内存紧张（Android 的 `onTrimMemory`）：丢掉可以重建的缓存。现在是池里保留的
+    /// Tier 1 翻译（运行中的进程的翻译不动）。
+    pub fn trim_memory(&self) {
+        appine_engine::trim_dbt_pool();
+    }
+
     /// 使用 Tier 1 时已退出线程的统计之和。
     pub fn dbt_stats(&self) -> Option<DbtStats> {
         self.shared.lock().dbt_stats
@@ -422,7 +436,13 @@ fn timers(shared: Arc<Shared>) {
             k.fasync.clear();
             Vec::new()
         });
-        let (k2, _) = block(&shared, k, &event, next, &mut host, true);
+        // 定时器的设置不是打开文件上的修改；有信号驱动的 I/O 时才要看每一次修改
+        let interest = if k.fasync.is_empty() {
+            wake::OTHER
+        } else {
+            wake::ALL
+        };
+        let (k2, _) = block(&shared, k, &event, next, &mut host, interest);
         k = k2;
     }
 }

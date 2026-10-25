@@ -213,7 +213,7 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
         if let Some(r) = term.resize {
             fds.push((r, POLLIN, 0));
         }
-        let (k2, _) = block(&shared, k, &event, None, &mut fds, true);
+        let (k2, _) = block(&shared, k, &event, None, &mut fds, crate::kernel::wake::ALL);
         k = k2;
         for (fd, _, revents) in fds {
             if revents == 0 {

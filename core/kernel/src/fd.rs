@@ -150,6 +150,9 @@ pub struct OpenFile {
     /// 打开的仓库文件：inotify 按 fd 的事件报给打开时经过的目录，最后一个引用释放时
     /// 报告 `IN_CLOSE_*`。
     pub watch: Option<crate::syscall::Opened>,
+    /// 用文件位置的一次读写正在不持 BKL 地进行（相当于 Linux 的 f_pos_lock，见
+    /// `syscall::fs` 的 `unlocked_io`）：0 没有，1 有，2 有并且还有线程在等它。
+    pub pos_busy: u8,
 }
 
 impl OpenFile {
@@ -170,6 +173,7 @@ impl OpenFile {
             drained: [0; 2],
             reads: 0,
             exclusive_claim: std::cell::Cell::new(None),
+            pos_busy: 0,
             watch: None,
         }))
     }
@@ -221,7 +225,7 @@ impl OpenFile {
 impl Drop for OpenFile {
     /// 最后一个引用消失：等在它上面的线程（flock、epoll）要重新检查。
     fn drop(&mut self) {
-        crate::kernel::request_wake();
+        crate::kernel::request_wake_files();
     }
 }
 
@@ -487,7 +491,7 @@ impl FdTable {
 impl Drop for FdTable {
     /// fd 表消失（进程退出）：它持有的记录锁随之失效，等锁的线程要重新检查。
     fn drop(&mut self) {
-        crate::kernel::request_wake();
+        crate::kernel::request_wake_files();
     }
 }
 

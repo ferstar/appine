@@ -233,11 +233,17 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         return exit(shared, task, cpu.state().pc, None);
     };
     let (sync, tier) = (task.sync.clone(), k.tier);
-    drop(k);
-    let mut dbt = match tier {
-        Tier::Interpreter => None,
-        Tier::Dbt => Dbt::new(),
+    // Tier 1 的翻译由这个地址空间里的线程共用。参数只是持有 BKL 的凭证：Mm 只在持有 BKL
+    // 时访问
+    let attach = |_: &Kernel| {
+        let space = match tier {
+            Tier::Interpreter => None,
+            Tier::Dbt => task.state.borrow().mm.borrow_mut().code_space(),
+        };
+        space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)))
     };
+    let mut dbt = attach(&k);
+    drop(k);
     let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
     let mut seen = load(&generations);
     loop {
@@ -249,20 +255,25 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         if now.0 != seen.0 {
             cpu.tlb_flush();
         }
-        // 只有代码变了才需要作废翻译：按错过的范围逐页作废，记录不全时整体清空
+        // 只有代码变了才需要作废翻译：按错过的范围逐页作废，记录不全时整体清空。翻译是
+        // 共用的，第一个看到新代数的线程做一次就够了
         if now.1 != seen.1
-            && let Some(d) = &mut dbt
+            && let Some((d, space)) = &mut dbt
         {
-            match generations.log.lock().unwrap().since(seen.1, now.1) {
-                Some(ranges) => ranges
-                    .iter()
-                    .for_each(|&(start, len)| d.invalidate(start, len)),
-                None => d.flush(),
+            let mut done = space.seen.lock().unwrap();
+            if *done < now.1 {
+                match generations.log.lock().unwrap().since(*done, now.1) {
+                    Some(ranges) => ranges
+                        .iter()
+                        .for_each(|&(start, len)| d.invalidate(start, len)),
+                    None => d.flush(),
+                }
+                *done = now.1;
             }
         }
         seen = now;
         let exit = match &mut dbt {
-            Some(d) => d.run(cpu),
+            Some((d, _)) => d.run(cpu),
             None => cpu.run(),
         };
         sync.in_guest.store(false, Ordering::SeqCst);
@@ -292,15 +303,17 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
             Flow::Continue => {}
             Flow::Exec => {
                 seen = load(&generations);
-                // 又一次 exec 的多半是同一个程序（shell 脚本里的 busybox）：保留翻译，核对后继续用
-                if let Some(d) = &mut dbt {
-                    d.recheck();
+                // 换了地址空间，换用它的翻译。先放开旧的：旧地址空间没人用了，它的翻译放回
+                // 池里，新的地址空间多半就拿到它。又一次 exec 的多半是同一个程序（shell
+                // 脚本里的 busybox），保留下来的翻译核对后继续用
+                if dbt.take().is_some() {
+                    dbt = attach(&shared.lock());
                 }
             }
             Flow::Exit => break,
         }
     }
-    exit(shared, task, cpu.state().pc, dbt.map(|d| d.stats()));
+    exit(shared, task, cpu.state().pc, dbt.map(|(d, _)| d.stats()));
 }
 
 // 合成 esr_context 用的 ESR 字段（ARM ARM D17.2.37）
@@ -322,20 +335,21 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     if cx.task.killed.get() {
         return Flow::Exit;
     }
+    // Tier 1 的 ic ivau 按页记下、到 dsb、isb 才交出来（Exit::InvalidateCode）：因为别的
+    // 原因退出时在这里作废
+    let ivau = std::mem::take(&mut cpu.state_mut().ivau_page);
     let pc = cpu.state().pc;
     let (sig, info) = match exit {
-        Exit::Svc { .. } => return syscall::dispatch(cx, cpu),
-        Exit::Kick => return signal::deliver(cx, cpu, false),
         Exit::InvalidateCode { addr } => {
-            // 作废所在一页的翻译，并等共用地址空间的其他线程都看到
-            let sync = cx.task.sync.clone();
-            {
-                let mut mm = cx.mm_mut();
-                mm.invalidate_code(addr & !(PAGE_SIZE - 1), PAGE_SIZE);
-                mm.sync(&sync);
-            }
+            invalidate_code(cx, &[addr & !(PAGE_SIZE - 1), ivau]);
             return signal::deliver(cx, cpu, false);
         }
+        _ if ivau != 0 => {
+            invalidate_code(cx, &[ivau]);
+            return handle(cx, cpu, exit);
+        }
+        Exit::Svc { .. } => return syscall::dispatch(cx, cpu),
+        Exit::Kick => return signal::deliver(cx, cpu, false),
         Exit::Undefined { insn } => {
             crate::debug::log(format_args!(
                 "undefined instruction {insn:#010x} at {pc:#x}"
@@ -419,6 +433,16 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     };
     signal::force(cx, sig, info);
     signal::deliver(cx, cpu, false)
+}
+
+/// 作废 `pages` 里各页（0 跳过）的翻译，并让共用地址空间的其他线程知道。
+fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
+    let sync = cx.task.sync.clone();
+    let mut mm = cx.mm_mut();
+    for &page in pages.iter().filter(|&&p| p != 0) {
+        mm.invalidate_code(page, PAGE_SIZE);
+    }
+    mm.sync(&sync);
 }
 
 /// 线程离开它的地址空间（退出、execve）：处理 robust futex 链表，清零 `clear_child_tid`

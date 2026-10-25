@@ -85,6 +85,41 @@ pub fn write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
     }
 }
 
+/// 在宿主 fd 的 `offset` 处写入（pwrite），遇到 `EINTR` 自动重试。
+pub fn pwrite(fd: i32, buf: &[u8], offset: u64) -> Result<usize, i32> {
+    loop {
+        let n = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset as libc::off_t) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let errno = last_errno();
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+}
+
+/// 从宿主 fd 的 `offset` 处读取（pread），遇到 `EINTR` 自动重试。
+pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, i32> {
+    loop {
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                offset as libc::off_t,
+            )
+        };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let errno = last_errno();
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+}
+
 fn last_errno() -> i32 {
     io::Error::last_os_error()
         .raw_os_error()

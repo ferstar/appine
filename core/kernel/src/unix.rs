@@ -16,7 +16,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crate::fd::{FileKind, FileRef, OpenFile};
-use crate::kernel::{Kernel, request_wake};
+use crate::kernel::{Kernel, request_wake_files};
 use crate::net::{AF_UNIX, SOCK_DGRAM, Socket};
 use crate::vfs::store::Ino;
 
@@ -120,7 +120,7 @@ impl Channel {
     pub fn push(&mut self, p: Packet) {
         self.bytes += p.remaining();
         self.packets.push_back(p);
-        request_wake();
+        request_wake_files();
     }
 
     /// 接收方关闭：丢弃缓冲的消息。消息交给调用方在释放借用之后析构，因为里面的
@@ -164,7 +164,7 @@ impl Channel {
             }
         }
         if !peek && !data.is_empty() {
-            request_wake();
+            request_wake_files();
         }
         Received {
             len: data.len(),
@@ -192,7 +192,7 @@ impl Channel {
             self.bytes -= p.data.len();
             let len = p.data.len();
             p.data.truncate(max);
-            request_wake();
+            request_wake_files();
             (p.data, len, std::mem::take(&mut p.fds), p.cred, p.from)
         };
         Some(Received {
@@ -359,7 +359,7 @@ impl UnixSocket {
                 self.shut_wr |= wr;
             }
         }
-        request_wake();
+        request_wake_files();
     }
 
     /// FIONREAD：流式是缓冲的字节数，数据报是下一个数据报的长度。
@@ -432,7 +432,7 @@ impl Drop for UnixSocket {
             _ => self.rx.borrow_mut().discard(),
         };
         drop(stale);
-        request_wake();
+        request_wake_files();
     }
 }
 

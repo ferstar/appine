@@ -23,13 +23,13 @@
  * 在加载时找不到。代码经由另一个地址写入时（W^X 双映射），数据缓存按写入的地址
  * start + write_delta 清理，指令缓存按执行的地址 start 作废。
  */
-static inline void sync_code(void *start, void *end, intptr_t write_delta)
+static inline void sync_code_ranges(void *const *start, void *const *end, unsigned n,
+                                    intptr_t write_delta)
 {
 #if defined(__aarch64__) && defined(__linux__)
     /* 只读一次：有些内核为了绕过勘误会让 EL0 读 CTR_EL0 陷入内核 */
     static uint64_t cached;
     uint64_t ctr = __atomic_load_n(&cached, __ATOMIC_RELAXED), addr;
-    uint64_t b = (uint64_t)(uintptr_t)start, e = (uint64_t)(uintptr_t)end;
     if (!ctr) { /* bit 31 恒为 1，0 表示还没读过 */
         __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
         __atomic_store_n(&cached, ctr, __ATOMIC_RELAXED);
@@ -37,22 +37,33 @@ static inline void sync_code(void *start, void *end, intptr_t write_delta)
     /* CTR_EL0.IDC：数据缓存不需要清到统一点 */
     if (!((ctr >> 28) & 1)) {
         uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
-        for (addr = b & ~(line - 1); addr < e; addr += line)
-            __asm__ volatile("dc cvau, %0" ::"r"(addr + (uint64_t)write_delta) : "memory");
+        for (unsigned i = 0; i < n; i++)
+            for (addr = (uint64_t)(uintptr_t)start[i] & ~(line - 1); addr < (uint64_t)(uintptr_t)end[i];
+                 addr += line)
+                __asm__ volatile("dc cvau, %0" ::"r"(addr + (uint64_t)write_delta) : "memory");
     }
     __asm__ volatile("dsb ish" ::: "memory");
     /* CTR_EL0.DIC：指令缓存不需要作废 */
     if (!((ctr >> 29) & 1)) {
         uint64_t line = UINT64_C(4) << (ctr & 15);
-        for (addr = b & ~(line - 1); addr < e; addr += line)
-            __asm__ volatile("ic ivau, %0" ::"r"(addr) : "memory");
+        for (unsigned i = 0; i < n; i++)
+            for (addr = (uint64_t)(uintptr_t)start[i] & ~(line - 1); addr < (uint64_t)(uintptr_t)end[i];
+                 addr += line)
+                __asm__ volatile("ic ivau, %0" ::"r"(addr) : "memory");
+        /* 这次 dsb 要等作废广播完成，比作废本身贵得多：几段代码合在一起同步，只等一次 */
         __asm__ volatile("dsb ish" ::: "memory");
     }
     __asm__ volatile("isb" ::: "memory");
 #else
     (void)write_delta;
-    __builtin___clear_cache((char *)start, (char *)end);
+    for (unsigned i = 0; i < n; i++)
+        __builtin___clear_cache((char *)start[i], (char *)end[i]);
 #endif
+}
+
+static inline void sync_code(void *start, void *end, intptr_t write_delta)
+{
+    sync_code_ranges(&start, &end, 1, write_delta);
 }
 
 static inline void sync_icache(void *start, void *end)
@@ -87,6 +98,7 @@ static inline uint64_t untag(uint64_t va)
 {
     return va & UINT64_C(0x00ffffffffffffff);
 }
+
 
 static inline void *tlb_lookup(struct appine_cpu *cpu, uint64_t va, uint32_t access)
 {

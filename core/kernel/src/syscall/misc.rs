@@ -518,7 +518,7 @@ pub(super) fn getrusage(cx: &mut Cx<'_>, who: i32, usage: u64) -> SysResult {
     let mut g = group.borrow_mut();
     // 与 Linux 一样，RUSAGE_THREAD 的 ru_maxrss 也是整个进程的
     if who != RUSAGE_CHILDREN {
-        g.sample_rss(&cx.mm());
+        g.sample_rss_throttled(&cx.mm());
     }
     let r = match who {
         RUSAGE_SELF => Rusage {

@@ -4,7 +4,7 @@
 
 use std::ptr::NonNull;
 
-use appine_engine::{Cpu, Dbt, Exit, FaultKind, Mmu, PAGE_SIZE, prot};
+use appine_engine::{Cpu, Dbt, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, prot};
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -170,6 +170,39 @@ fn pooled_instances_are_checked_before_use() {
     g.code(CODE, &[movz_x0(4), SVC]);
     let mut dbt = Dbt::new().unwrap();
     assert_eq!(g.run(&mut dbt), 4);
+}
+
+#[test]
+fn pooled_instances_keep_translations_of_the_same_program() {
+    // 别的测试不用这个键；池里同一个键的实例只会还给它
+    const KEY: u64 = 0x5eed_0001;
+    let Some(space) = DbtSpace::new(KEY) else {
+        return;
+    };
+    let mut g = Guest::new();
+    g.code(CODE, &[movz_x0(7), SVC]);
+    let mut dbt = Dbt::attach(&space).unwrap();
+    assert_eq!(g.run(&mut dbt), 7);
+    drop((dbt, space));
+    // 同一个程序再运行：拿回留下的翻译，核对之后直接用，不再翻译
+    let space = DbtSpace::new(KEY).unwrap();
+    let mut dbt = Dbt::attach(&space).unwrap();
+    assert_eq!(g.run(&mut dbt), 7);
+    assert_eq!(dbt.stats().blocks, 0);
+    drop((dbt, space));
+    // 这期间代码变了：核对时作废，重新翻译
+    g.code(CODE, &[movz_x0(8), SVC]);
+    let space = DbtSpace::new(KEY).unwrap();
+    let mut dbt = Dbt::attach(&space).unwrap();
+    assert_eq!(g.run(&mut dbt), 8);
+    assert_eq!(dbt.stats().blocks, 1);
+    drop((dbt, space));
+    // 宿主内存紧张时丢掉池里保留的翻译：再运行要重新翻译（或者拷贝模板）
+    appine_engine::trim_dbt_pool();
+    let space = DbtSpace::new(KEY).unwrap();
+    let mut dbt = Dbt::attach(&space).unwrap();
+    assert_eq!(g.run(&mut dbt), 8);
+    assert_eq!(dbt.stats().blocks, 1);
 }
 
 #[test]

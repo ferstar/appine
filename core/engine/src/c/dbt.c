@@ -44,16 +44,20 @@
 #define BIT(x, n) ((unsigned)(((x) >> (n)) & 1u))
 #define FIELD(x, hi, lo) ((unsigned)(((x) >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1)))
 
-#define CODE_CACHE_BYTES (UINT64_C(64) << 20)
+/* 一个地址空间的所有线程共用，JIT 负载要放得下十几万个活着的块。块跳往缓存开头的例程、
+ * 块之间的链接都是一条 b，偏移范围是 ±128 MB，所以不能更大 */
+#define CODE_CACHE_BYTES (UINT64_C(128) << 20)
 #define MAX_BLOCK_INSNS 64
+_Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "b 的偏移范围");
 /* 单条 guest 指令最多展开成约 40 条宿主指令，再加上退出桩 */
 #define MAX_BLOCK_WORDS (MAX_BLOCK_INSNS * 64)
 #define MAX_STUBS (MAX_BLOCK_INSNS * 2 + 4)
 #define MAX_FIXUPS (MAX_BLOCK_INSNS * 4 + 4)
-/* 翻译表从 2^12 项开始，装到四分之三时加倍，最多 2^18 项：表按哈希散开，短命进程的
- * 几百个块要是放进最大的表，每个块都会碰到一页新的内存 */
+/* 翻译表从 2^12 项开始，装到四分之三时加倍，最多 2^19 项：表按哈希散开，短命进程的
+ * 几百个块要是放进最大的表，每个块都会碰到一页新的内存。一个地址空间的所有线程共用
+ * 一张表，JIT 负载（JVM）活着的块有十几万个 */
 #define TABLE_MIN_BITS 12
-#define TABLE_BITS 18
+#define TABLE_BITS 19
 #define TABLE_SIZE (1u << TABLE_BITS)
 #define TABLE_LIMIT (TABLE_SIZE / 4 * 3)
 #define JC_BITS 12
@@ -79,7 +83,7 @@ enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
 /* 退出桩之外的另一种桩：TLB 未命中时进入回填例程，回填失败再退出（R_INTERP 或 R_UNGROUP） */
 #define STUB_REFILL 0
 
-/* 一个桩最多占的字数：回填桩 4 个字，后面接一个最长 7 个字的退出桩 */
+/* 一个桩最多占的字数：回填桩 4 个字，后面接一个最长 7 个字的退出桩；链接桩最长 8 个字 */
 #define MAX_STUB_WORDS 11
 
 /* 块入口的 kick 检查占的字数 */
@@ -116,6 +120,20 @@ struct slot {
 };
 
 /*
+ * 翻译表：guest pc → 翻译结果，开放寻址。分发器不持锁查表（table_lookup），所以：插入只用
+ * 空位（先写 pc、再写 code），作废只把 pc 改成墓碑——读到旧 code 的线程进入的是作废块的
+ * 入口，它跳往转发桩，按原来的 pc 退出；墓碑不复用，扩容或原样重建时去掉。换表之后等
+ * 正在查旧表的线程查完才释放它（table_publish）。
+ */
+struct table {
+    unsigned bits;
+    unsigned shift; /* 64 - bits：下标是 pc 的哈希右移这么多位 */
+    uint64_t mask;  /* 2^bits - 1 */
+    struct slot slots[];
+};
+#define GOLDEN UINT64_C(0x9e3779b97f4a7c15)
+
+/*
  * 影子返回栈：每项是 (guest 返回地址, 宿主落点)，64 项的环形缓冲按自身大小对齐，压栈、
  * 弹栈只改栈顶指针的低 RS_SHIFT 位（bfxil，不碰条件标志）。
  */
@@ -124,7 +142,7 @@ struct slot {
 
 /* 作废翻译时按 guest 页找到其中开始的块（appine_dbt_invalidate） */
 #define PAGE_BUCKET_BITS 14
-#define INVALIDATE_MAX_PAGES 256 /* 超过这么多页就整体清空 */
+#define INVALIDATE_MAX_PAGES 256 /* 超过这么多页就逐个看所有的块 */
 
 struct block {
     uint64_t pc;
@@ -142,9 +160,18 @@ struct block {
 
 /* 每个块的 guest 指令字最多占多少字（按块数上限和每块的指令数上限） */
 #define WORDS_LIMIT ((size_t)TABLE_LIMIT * MAX_BLOCK_INSNS)
-/* 放回池里时最多保留多少个块：再多的实例多半属于 JIT 或大程序，核对的代价不划算 */
-#define KEEP_MAX_BLOCKS 32768
+/* 放回池里时最多保留多少个块：核对比重新拷贝模板、链接便宜得多（node 一次启动约 5 万个
+ * 块），再多的多半是 JIT 生成的代码，下次多半对不上 */
+#define KEEP_MAX_BLOCKS 131072
 
+/*
+ * 一个地址空间的翻译（代码缓存、翻译表、各种记录），这个地址空间里的所有线程共用
+ * （appine_dbt_attach）：多线程的程序（Go 的编译器、JVM）原来每个线程各翻译一遍同样的
+ * 代码，翻译、拷贝模板、链接和同步指令缓存都要做好几遍，代码缓存也各占一份。
+ *
+ * 除了分发器查翻译表，读写都持有 lock。整体清空要等所有线程离开翻译后的代码：发起的
+ * 线程打断其他线程，等它们都停在分发器里（parked）或者离开 dbt_run，见 flush_world。
+ */
 struct appine_dbt {
     uint32_t *cache;    /* 执行用的地址；所有代码指针都指向这里 */
     intptr_t rw_delta;  /* 写入用的别名减去执行用的地址；直接映射成 RWX 时为 0 */
@@ -154,20 +181,18 @@ struct appine_dbt {
     uint32_t *enter;
     uint32_t *exit;
     uint32_t *refill[2]; /* TLB 回填例程：读、写 */
+    uint32_t *lookup;    /* 跳转缓存没命中时查翻译表的例程（emit_lookup） */
     uint32_t *rs_miss;   /* 影子返回栈空项的落点：按 guest x30 查找 */
-    uint64_t (*rs)[2];   /* 影子返回栈 */
-    struct slot *table; /* guest pc → 翻译结果，开放寻址 */
-    unsigned table_bits;
+    struct table *table; /* 不持锁读取时用 __atomic_load_n */
     uint32_t *table_used; /* 按插入顺序记下用过的位置，最多 TABLE_LIMIT 个 */
     size_t table_count;
     size_t table_occupied; /* 表里不空的位置：有效的块和墓碑 */
     size_t table_dead;     /* 其中的墓碑 */
-    struct slot *jc; /* 间接分支的跳转缓存，直接映射 */
-    bool jc_dirty;
     struct block *blocks; /* 与 table_used 一一对应，按翻译顺序记录 */
+    size_t blocks_dead;   /* 其中已经作废的 */
     uint32_t *words;      /* 各块翻译时的 guest 指令字，按需映射 */
     size_t words_used;
-    /* 换了地址空间（exec 之后，或者从池里交给另一个线程），下次运行之前要核对 */
+    /* 换了地址空间（exec、fork 之后从池里取出），下次运行之前要核对 */
     bool stale;
     /* 运行时宿主出了故障（APPINE_EXIT_HOST_FAULT）：各张表可能只改了一半，不再使用 */
     bool poisoned;
@@ -175,11 +200,36 @@ struct appine_dbt {
     uint64_t nogroup[NOGROUP_MAX];
     unsigned nogroup_count;
     uint64_t strikes[STRIKES];
-    uint64_t generation; /* 每次 flush 加一，用来作废尚未回填的链接 */
+    /* 每次 flush 加一：作废尚未回填的链接，线程据此清空自己的跳转缓存和影子返回栈 */
+    uint64_t generation;
+    size_t high_words; /* 代码缓存用到过的最大字数 */
+
+    pthread_mutex_t lock;
+    pthread_cond_t flushed; /* 整体清空结束（或者实例作废） */
+    struct appine_dbt_thread *threads; /* 挂着的线程 */
+    unsigned nthreads;                 /* 它们的个数（原子读） */
+    unsigned running;  /* 正在 dbt_run 里的线程数（原子） */
+    unsigned parked;   /* 其中停下来等整体清空的（原子） */
+    bool flushing;     /* 有线程在等别人停下来整体清空（原子读） */
+    bool flush_wanted; /* 要整体清空：调用方要求，或者作废时放不下转发桩（原子读） */
+    struct appine_dbt_stats *st; /* 持锁的线程的统计：翻译、作废记在它头上 */
+};
+
+/* 一个线程在某个地址空间里运行用的部分：跳转缓存、影子返回栈和统计 */
+struct appine_dbt_thread {
+    struct appine_dbt *d;
+    struct appine_dbt_thread *next; /* d->threads 链表，持有 d->lock 时读写 */
+    struct appine_cpu *cpu; /* 正在 dbt_run 里运行的 cpu，否则为 NULL（原子）：整体清空时打断它 */
+    uint64_t generation;    /* jc、rs 对应的 d->generation */
+    struct slot *jc;        /* 间接分支的跳转缓存，直接映射 */
+    bool jc_dirty;
+    uint64_t (*rs)[2]; /* 影子返回栈 */
     struct appine_dbt_stats stats;
-    size_t high_words;       /* 代码缓存用到过的最大字数 */
-    struct xlate *xlate;     /* 翻译时的工作区 */
-    struct appine_cpu probe; /* 用来询问 Tier 0 是否认识某条指令 */
+    /* 不持锁翻译用的工作区（prepare）：翻译过程、生成的代码和结果 */
+    struct xlate *xlate;
+    uint32_t *scratch;
+    struct appine_cpu *probe;
+    struct prep *prep;
 };
 
 /* ---- 发射器 ---- */
@@ -207,8 +257,22 @@ struct fixup {
     unsigned stub;
 };
 
+/*
+ * 块的一个直接跳转出口（链接桩）：桩相对块开头的字数、唯一跳到它的条件分支相对块开头的
+ * 字数（没有时为 NO_BRANCH）和目标 pc。建块时目标已经翻译过就直接链接（link_block），
+ * 省掉第一次走到这里时退出到分发器、再单独同步一次指令缓存（ic ivau 之后的 dsb 要等
+ * 作废广播完成，一次约 0.1 微秒）
+ */
+struct link {
+    uint32_t stub; /* LINK_FWD：前向，跳过目标块入口的 kick 检查 */
+    uint32_t branch;
+    uint64_t pc;
+};
+#define LINK_FWD (UINT32_C(1) << 31)
+#define NO_BRANCH UINT32_MAX
+
 /* 跳往例程的 b：拷贝翻译模板时要按新位置重新计算偏移 */
-enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE };
+enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE, TO_LOOKUP };
 
 /* 一组共用检查的访存最多覆盖多少字节、最多几条（plan_group） */
 #define GROUP_SPAN 512
@@ -218,6 +282,9 @@ enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE };
 struct xlate {
     struct appine_dbt *d;
     uint32_t *buf;
+    intptr_t wdelta; /* 写入地址减去 buf：翻译进线程的暂存区时为 0，直接写代码缓存时是 rw_delta */
+    struct appine_dbt_stats *st; /* 翻译的统计记在谁头上 */
+    struct appine_cpu *probe;    /* 用来询问 Tier 0 是否认识某条指令 */
     size_t n;
     struct stub stubs[MAX_STUBS];
     unsigned nstubs;
@@ -254,10 +321,30 @@ static void sync_range(const struct appine_dbt *d, const uint32_t *start, const 
     sync_code((void *)start, (void *)end, d->rw_delta);
 }
 
+/* 攒着一起同步的几段代码（sync_code_ranges） */
+struct syncs {
+    void *start[3], *end[3];
+    unsigned n;
+};
+
+static void sync_add(struct syncs *s, const uint32_t *start, const uint32_t *end)
+{
+    s->start[s->n] = (void *)start;
+    s->end[s->n] = (void *)end;
+    s->n++;
+}
+
+static void sync_all(const struct appine_dbt *d, struct syncs *s)
+{
+    if (s->n)
+        sync_code_ranges(s->start, s->end, s->n, d->rw_delta);
+    s->n = 0;
+}
+
 static void emit(struct xlate *x, uint32_t insn)
 {
     if (x->n < MAX_BLOCK_WORDS)
-        *rw(x->d, &x->buf[x->n]) = insn;
+        *(uint32_t *)((uintptr_t)&x->buf[x->n] + (uintptr_t)x->wdelta) = insn;
     x->n++;
 }
 
@@ -268,7 +355,14 @@ static uint32_t *here(struct xlate *x)
 
 static uint32_t *routine(const struct appine_dbt *d, unsigned to)
 {
-    return to == TO_EXIT ? d->exit : d->refill[to - TO_REFILL_READ];
+    switch (to) {
+    case TO_EXIT:
+        return d->exit;
+    case TO_LOOKUP:
+        return d->lookup;
+    default:
+        return d->refill[to - TO_REFILL_READ];
+    }
 }
 
 /* 跳往进入/退出例程或回填例程的 b */
@@ -276,7 +370,7 @@ static void emit_to_routine(struct xlate *x, unsigned to)
 {
     if (x->nrelocs < MAX_RELOCS)
         x->relocs[x->nrelocs] = (uint32_t)x->n << 2 | to;
-    x->nrelocs++; /* 溢出由 translate() 检查 */
+    x->nrelocs++; /* 溢出由 prepare() 检查 */
     emit(x, enc_b((intptr_t)routine(x->d, to) - (intptr_t)here(x)));
 }
 
@@ -340,15 +434,25 @@ static void emit_store_guest(struct xlate *x, unsigned host, unsigned guest)
 
 /*
  * 退出桩把 T0 = guest pc、T1 = 回填位置（或 0）、T2 = 退出原因交给退出例程。
- * 链接桩的第一条指令是 "adr x17, ."，链接时它会被改写成直接跳往目标块的 b；
- * branch 是唯一跳到这个桩的条件分支，链接时目标在它的偏移范围内就让它直接跳过去。
+ * 链接桩的第一条指令是跳到下一条的 b，链接时它被改写成直接跳往目标块的 b：别的线程
+ * 可能正在执行它，b 改成 b 是架构允许并发修改的（ARM ARM 的 CMODX 规则），下一条
+ * "adr x17, -4" 把它的地址交给分发器。branch 是唯一跳到这个桩的条件分支，链接时目标
+ * 在它的偏移范围内就让它直接跳过去（只在没有别的线程时，见 dbt_run）。
  */
 static void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc, const uint32_t *branch)
 {
     unsigned delta = branch ? (unsigned)(here(x) - branch) : 0;
-    emit(x, reason == R_CHAIN || reason == R_CHAIN_FWD ? enc_adr_self(T1) : enc_movz(T1, 0, 0));
-    if (reason != R_LOOKUP)
-        emit_mov_const(x, T0, pc);
+    if (reason == R_LOOKUP) { /* 目标 pc 已经在 T0 里：先在翻译后的代码里查表 */
+        emit_to_routine(x, TO_LOOKUP);
+        return;
+    }
+    if (reason == R_CHAIN || reason == R_CHAIN_FWD) {
+        emit(x, enc_b(4));
+        emit(x, enc_adr(T1, -4));
+    } else {
+        emit(x, enc_movz(T1, 0, 0));
+    }
+    emit_mov_const(x, T0, pc);
     emit(x, enc_movz(T2, reason | delta << REASON_BITS, 0));
     emit_to_routine(x, TO_EXIT);
 }
@@ -369,12 +473,12 @@ static void emit_to_stub(struct xlate *x, uint32_t insn, enum fixup_kind kind, u
     if (i == x->nstubs) {
         if (x->nstubs < MAX_STUBS)
             x->stubs[i] = (struct stub){.reason = reason, .pc = pc};
-        x->nstubs++; /* 溢出由 translate() 检查 */
+        x->nstubs++; /* 溢出由 prepare() 检查 */
     }
     if (x->nfixups < MAX_FIXUPS)
         x->fixups[x->nfixups++] = (struct fixup){here(x), kind, i};
     else
-        x->nfixups++; /* 记录溢出，translate() 会检查 */
+        x->nfixups++; /* 记录溢出，prepare() 会检查 */
     emit(x, insn);
 }
 
@@ -398,7 +502,7 @@ static void emit_to_refill(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
     if (x->nfixups < MAX_FIXUPS)
         x->fixups[x->nfixups] = (struct fixup){here(x), FIX_IMM19, x->nstubs};
     x->nstubs++;
-    x->nfixups++; /* 溢出由 translate() 检查 */
+    x->nfixups++; /* 溢出由 prepare() 检查 */
     emit(x, enc_cbnz_x(T1));
 }
 
@@ -418,15 +522,15 @@ static void emit_refill_stub(struct xlate *x, const struct stub *s)
 
 static bool fallback(struct xlate *x, uint64_t pc)
 {
-    x->d->stats.insns_fallback++;
+    x->st->insns_fallback++;
     emit_exit_stub(x, R_INTERP, pc);
     return false;
 }
 
 /* 回填 b/cbz/cbnz/tbz/tbnz 的偏移 */
-static void patch_branch(const struct appine_dbt *d, uint32_t *site, const uint32_t *target)
+static void patch_branch(intptr_t wdelta, uint32_t *site, const uint32_t *target)
 {
-    uint32_t off = (uint32_t)(target - site), *w = rw(d, site);
+    uint32_t off = (uint32_t)(target - site), *w = (uint32_t *)((uintptr_t)site + (uintptr_t)wdelta);
     if ((*w & 0x7c000000) == 0x14000000)
         *w |= off & 0x3ffffff;
     else if ((*w & 0x7e000000) == 0x36000000)
@@ -435,11 +539,11 @@ static void patch_branch(const struct appine_dbt *d, uint32_t *site, const uint3
         *w |= (off & 0x7ffff) << 5;
 }
 
-/* 块内的局部跳转；溢出的块不会被使用（translate() 会检查），只是不能写出界 */
+/* 块内的局部跳转；溢出的块不会被使用（prepare() 会检查），只是不能写出界 */
 static void patch_local(struct xlate *x, uint32_t *site, const uint32_t *target)
 {
     if (site < x->buf + MAX_BLOCK_WORDS)
-        patch_branch(x->d, site, target);
+        patch_branch(x->wdelta, site, target);
 }
 
 /* ---- 数据处理：原样拷贝或改写被占用的寄存器 ---- */
@@ -562,7 +666,7 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
     }
     if (nmap == 0 && !renamed) {
         emit(x, insn);
-        x->d->stats.insns_copied++;
+        x->st->insns_copied++;
         return true;
     }
     if (nmap == 3 && x->group.next < x->group.n)
@@ -572,7 +676,7 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
     emit(x, out);
     if (rd_stolen)
         emit_store_guest(x, rd_host, rd_guest);
-    x->d->stats.insns_remapped++;
+    x->st->insns_remapped++;
     return true;
 }
 
@@ -583,7 +687,7 @@ static void emit_pcrel(struct xlate *x, uint32_t insn, uint64_t pc)
     uint64_t imm = ((uint64_t)FIELD(insn, 23, 5) << 2) | FIELD(insn, 30, 29);
     int64_t off = (int64_t)(imm << 43) >> 43;
     uint64_t v = BIT(insn, 31) ? (pc & ~UINT64_C(0xfff)) + ((uint64_t)off << 12) : pc + (uint64_t)off;
-    x->d->stats.insns_remapped++;
+    x->st->insns_remapped++;
     if (rd == 31)
         return;
     if (is_stolen(rd)) {
@@ -894,7 +998,7 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
         if (rn == REG_SP)
             sp_moved(x, m->wb_reg ? 1 : m->imm);
     }
-    x->d->stats.insns_memory++;
+    x->st->insns_memory++;
 }
 
 /* ---- 共用一次 TLB 检查的一组访存 ---- */
@@ -1138,7 +1242,7 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
         if (rn == REG_SP)
             sp_moved(x, m->wb_reg ? 1 : m->imm);
     }
-    x->d->stats.insns_memory++;
+    x->st->insns_memory++;
 }
 
 /* 组长：检查整组覆盖的范围，T2 = 基址的宿主地址，再做组长自己的访问 */
@@ -1179,7 +1283,7 @@ static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bo
     }
     emit_tlb_check(x, pc, bytes, write, true, R_INTERP);
     emit(x, enc_add_lsl(T2, T2, T0, 0));
-    x->d->stats.insns_memory++;
+    x->st->insns_memory++;
 }
 
 struct atomic_operand {
@@ -1411,11 +1515,16 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障：白名单已由 Tier 0 确认 */
         if (FIELD(insn, 7, 5) == 2) { /* CLREX：清掉 guest 的独占标记 */
             emit(x, enc_str_w(31, CTX, offsetof(struct appine_cpu, excl_size)));
-            x->d->stats.insns_remapped++;
+            x->st->insns_remapped++;
             return true;
         }
+        unsigned op2 = FIELD(insn, 7, 5);
+        if (op2 == 4 || op2 == 6) { /* DSB、ISB：先把 ic ivau 记下的页交出去（见 dbt_run） */
+            emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
+            emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
+        }
         emit(x, insn);
-        x->d->stats.insns_copied++;
+        x->st->insns_copied++;
         return true;
     }
     if ((insn & 0xffd00000) == 0xd5100000) { /* MRS/MSR */
@@ -1442,7 +1551,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
                     emit_load_guest(x, T0, rt);
                 emit(x, enc_str_x(h, CTX, off));
             }
-            x->d->stats.insns_remapped++;
+            x->st->insns_remapped++;
             return true;
         }
         case SYSREG_DCZID_EL0: /* 只读，写入已被 tier0_defined 拒绝 */
@@ -1452,7 +1561,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
                 if (h == T0)
                     emit_store_guest(x, T0, rt);
             }
-            x->d->stats.insns_remapped++;
+            x->st->insns_remapped++;
             return true;
         default:
             return fallback(x, pc);
@@ -1472,7 +1581,33 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         emit(x, enc_add_lsl(T2, T2, T0, 0));
         for (int off = 0; off < DCZ_BLOCK; off += 16)
             emit(x, enc_stp_x(31, 31, T2, off));
-        x->d->stats.insns_memory++;
+        x->st->insns_memory++;
+        return true;
+    }
+    /*
+     * DC CVAC、DC CVAU、DC CIVAC、IC IVAU：与 Tier 0 一样只按读访问检查地址。ic ivau 不再
+     * 每条都退出：记下所在的页（JIT 刷新缓存时一页要执行几十条），等 dsb、isb 时一次交给
+     * 调用方作废翻译；已经记着另一页时由 Tier 0 执行这一条，退出时两页一起作废。
+     */
+    uint32_t cmo = insn & 0xffffffe0;
+    if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520) {
+        unsigned rt = insn & 31;
+        if (rt == 31)
+            emit(x, enc_movz(T0, 0, 0));
+        else if (is_stolen(rt))
+            emit_load_guest(x, T0, rt);
+        else
+            emit(x, enc_mov(T0, rt));
+        emit_tlb_check(x, pc, 1, false, true, R_INTERP);
+        if (cmo == 0xd50b7520) {
+            emit(x, enc_and_clear_low(T0, T0, APPINE_PAGE_SHIFT));
+            emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, ivau_page)));
+            emit(x, enc_eor_lsr(T2, T1, T0, 0));
+            emit(x, enc_cbz_x(T2) | 3u << 5); /* 同一页：跳过下面两条 */
+            emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
+            emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
+        }
+        x->st->insns_memory++;
         return true;
     }
     uint32_t reg_branch = insn & 0xfffffc1f;
@@ -1501,11 +1636,11 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
 }
 
 /* 询问 Tier 0 是否认识这条指令（§4.4：两层的白名单必须一致） */
-static bool tier0_defined(struct appine_dbt *d, uint32_t insn, uint64_t pc)
+static bool tier0_defined(struct appine_cpu *probe, uint32_t insn, uint64_t pc)
 {
-    d->probe.pc = pc;
-    d->probe.sp = 0;
-    return appine_interp_exec(&d->probe, insn) != APPINE_EXIT_UNDEF;
+    probe->pc = pc;
+    probe->sp = 0;
+    return appine_interp_exec(probe, insn) != APPINE_EXIT_UNDEF;
 }
 
 /*
@@ -1533,7 +1668,7 @@ static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     if ((FIELD(insn, 28, 25) & 7) == 7)
         return translate_simd_dp(x, insn) || fallback(x, pc);
-    if (!tier0_defined(x->d, insn, pc))
+    if (!tier0_defined(x->probe, insn, pc))
         return fallback(x, pc);
     switch (FIELD(insn, 28, 25)) {
     case 0x8:
@@ -1571,7 +1706,7 @@ static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
             return true;
         if (g->next < g->n && x->idx == g->idx[g->next]) {
             emit_member(x, &m, g->off[g->next++]);
-            x->d->stats.insns_grouped++;
+            x->st->insns_grouped++;
         } else {
             emit_memop(x, &m, pc);
         }
@@ -1587,9 +1722,23 @@ static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
 
 /* ---- 翻译表与代码缓存 ---- */
 
+/* 把条件分支直接指向目标块；超出它的偏移范围时不改（仍然经由桩跳转），返回 false。
+ * 不同步指令缓存 */
+static bool relink_word(const struct appine_dbt *d, uint32_t *site, const uint32_t *target)
+{
+    uint32_t *w = rw(d, site);
+    bool test = (*w & 0x7e000000) == 0x36000000; /* TBZ/TBNZ：14 位偏移，其余 19 位 */
+    intptr_t off = target - site, limit = (intptr_t)1 << (test ? 13 : 18);
+    if (off < -limit || off >= limit)
+        return false;
+    uint32_t mask = (test ? 0x3fffu : 0x7ffffu) << 5;
+    *w = (*w & ~mask) | (((uint32_t)off << 5) & mask);
+    return true;
+}
+
 /*
- * 实例和它的几张表都用 mmap 分配，保证是按需提交的清零页：每个 guest 线程一个实例，
- * 表按最大的规模分配，大部分页从来不碰。calloc 不一定这样（glibc 释放过同样大的块
+ * 实例和它的几张表都用 mmap 分配，保证是按需提交的清零页：每个地址空间一个实例、每个
+ * 线程一份跳转缓存，表按最大的规模分配，大部分页从来不碰。calloc 不一定这样（glibc 释放过同样大的块
  * 之后会调高 mmap 的阈值，改从堆里分配并逐字节清零）。
  */
 static void *zalloc(size_t bytes)
@@ -1604,25 +1753,90 @@ static void zfree(void *p, size_t bytes)
         munmap(p, bytes);
 }
 
-#define TABLE_BYTES(bits) (sizeof(struct slot) << (bits))
+#define TABLE_BYTES(bits) (sizeof(struct table) + (sizeof(struct slot) << (bits)))
 
-static size_t table_index(const struct appine_dbt *d, uint64_t pc)
+static size_t table_index(const struct table *t, uint64_t pc)
 {
-    return (size_t)(((pc >> 2) * UINT64_C(0x9e3779b97f4a7c15)) >> (64 - d->table_bits));
+    return (size_t)(((pc >> 2) * GOLDEN) >> t->shift);
 }
 
-static size_t table_mask(const struct appine_dbt *d)
+static size_t table_mask(const struct table *t)
 {
-    return ((size_t)1 << d->table_bits) - 1;
+    return (size_t)t->mask;
 }
 
-static uint32_t *table_lookup(const struct appine_dbt *d, uint64_t pc)
+/* 分配一张 2^bits 项的空表 */
+static struct table *table_new(unsigned bits)
 {
-    for (size_t i = table_index(d, pc);; i = (i + 1) & table_mask(d)) {
-        if (!d->table[i].code)
+    struct table *t = zalloc(TABLE_BYTES(bits));
+    if (t) {
+        t->bits = bits;
+        t->shift = 64 - bits;
+        t->mask = (UINT64_C(1) << bits) - 1;
+    }
+    return t;
+}
+
+/* 在 t 里找 pc。持有锁时直接调用；不持锁时经由 table_lookup */
+static uint32_t *table_find(const struct table *t, uint64_t pc)
+{
+    for (size_t i = table_index(t, pc);; i = (i + 1) & table_mask(t)) {
+        /* 插入时先写 pc 再写 code：读到 code 不为空，pc 就是对应的那个 */
+        uint32_t *code = __atomic_load_n(&t->slots[i].code, __ATOMIC_ACQUIRE);
+        if (!code)
             return NULL;
-        if (d->table[i].pc == pc)
-            return d->table[i].code;
+        if (__atomic_load_n(&t->slots[i].pc, __ATOMIC_RELAXED) == pc)
+            return code;
+    }
+}
+
+/*
+ * 分发器和查表例程（emit_lookup）不持锁查表：cpu 的 dbt_lookup_seq 为奇数期间，换下来的
+ * 旧表不会被释放（table_publish）
+ */
+static uint32_t *table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc)
+{
+    __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_SEQ_CST);
+    uint32_t *code = table_find(__atomic_load_n(&d->table, __ATOMIC_SEQ_CST), pc);
+    __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_RELEASE);
+    return code;
+}
+
+/* 换上新表，等正在查旧表的线程查完再释放旧表。持有锁 */
+static void table_publish(struct appine_dbt *d, struct table *table)
+{
+    struct table *old = d->table;
+    __atomic_store_n(&d->table, table, __ATOMIC_SEQ_CST);
+    /* 不在 dbt_run 里的线程不会查表；之后进来的先登记 cpu、再读 table，读到的是新表 */
+    for (struct appine_dbt_thread *t = d->threads; t; t = t->next) {
+        struct appine_cpu *c = __atomic_load_n(&t->cpu, __ATOMIC_SEQ_CST);
+        if (!c)
+            continue;
+        unsigned seq = __atomic_load_n(&c->dbt_lookup_seq, __ATOMIC_SEQ_CST);
+        while ((seq & 1) && __atomic_load_n(&c->dbt_lookup_seq, __ATOMIC_ACQUIRE) == seq)
+            __asm__ volatile("yield");
+    }
+    zfree(old, TABLE_BYTES(old->bits));
+}
+
+/*
+ * 刚建好、还没同步指令缓存的块（起始 pc 为 `pc`）：目标已经翻译过的出口直接链接，和分发器
+ * 里第一次走到时的链接（dbt_run 的 R_CHAIN）一样。改动随整个块一起同步。持有锁
+ */
+static void link_block(const struct appine_dbt *d, uint32_t *code, uint64_t pc, const struct link *links,
+                       unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        const struct link *l = &links[i];
+        uint32_t *target = l->pc == pc ? code : table_find(d->table, l->pc);
+        if (!target)
+            continue;
+        if (l->stub & LINK_FWD)
+            target += ENTRY_CHECK_WORDS;
+        uint32_t *site = code + (l->stub & ~LINK_FWD);
+        *rw(d, site) = enc_b((intptr_t)target - (intptr_t)site);
+        if (l->branch != NO_BRANCH)
+            relink_word(d, code + l->branch, target);
     }
 }
 
@@ -1635,48 +1849,51 @@ static unsigned page_bucket(uint64_t page)
 #define SLOT_NONE UINT32_MAX
 
 /* 把有效的块按原来的插入顺序放进一个 2^bits 项的新表，作废的块（墓碑）不再放进去，
- * table_used 和 blocks 的下标保持对应；分配失败时返回 false，原来的表不变 */
+ * table_used 和 blocks 的下标保持对应；分配失败时返回 false，原来的表不变。持有锁 */
+static void table_rebuild(struct appine_dbt *d, struct table *table);
+
 static bool table_resize(struct appine_dbt *d, unsigned bits)
 {
-    struct slot *table = zalloc(TABLE_BYTES(bits));
+    struct table *table = table_new(bits);
     if (!table)
         return false;
-    zfree(d->table, TABLE_BYTES(d->table_bits));
-    d->table = table;
-    d->table_bits = bits;
-    d->table_occupied = d->table_dead = 0;
+    table_rebuild(d, table);
+    return true;
+}
+
+/* 按 blocks 填好新分配的 table 并换上（table_resize） */
+static void table_rebuild(struct appine_dbt *d, struct table *table)
+{
+    size_t occupied = 0;
     for (size_t k = 0; k < d->table_count; k++) {
         const struct block *b = &d->blocks[k];
         if (!b->code) {
             d->table_used[k] = SLOT_NONE;
             continue;
         }
-        size_t i = table_index(d, b->pc);
-        while (table[i].code)
-            i = (i + 1) & table_mask(d);
-        table[i] = (struct slot){b->pc, b->code};
+        size_t i = table_index(table, b->pc);
+        while (table->slots[i].code)
+            i = (i + 1) & table_mask(table);
+        table->slots[i] = (struct slot){b->pc, b->code};
         d->table_used[k] = (uint32_t)i;
-        d->table_occupied++;
+        occupied++;
     }
-    return true;
+    d->table_occupied = occupied;
+    d->table_dead = 0;
+    table_publish(d, table);
 }
 
-/*
- * pc 不在表里时才插入。沿途遇到的第一个墓碑可以直接用：JIT 反复改写、重新翻译同一处
- * 代码时，墓碑不会越堆越长。被复用的墓碑在 table_used 里还有原来那个（已作废的）块的
- * 记录，重建表时按 blocks 跳过它。
- */
+/* pc 不在表里时才插入，只用空位（见 struct table）。持有锁 */
 static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code, const uint32_t *guest,
                          uint32_t nguest)
 {
-    size_t i = table_index(d, pc);
-    while (d->table[i].code && d->table[i].pc != JC_EMPTY)
-        i = (i + 1) & table_mask(d);
-    if (d->table[i].code)
-        d->table_dead--;
-    else
-        d->table_occupied++;
-    d->table[i] = (struct slot){pc, code};
+    struct table *t = d->table;
+    size_t i = table_index(t, pc);
+    while (t->slots[i].code)
+        i = (i + 1) & table_mask(t);
+    d->table_occupied++;
+    __atomic_store_n(&t->slots[i].pc, pc, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->slots[i].code, code, __ATOMIC_RELEASE);
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
     memcpy(d->words + d->words_used, guest, nguest * 4);
     d->blocks[d->table_count] =
@@ -1686,106 +1903,212 @@ static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code, cons
     d->page_head[h] = (uint32_t)d->table_count;
 }
 
-/* 从翻译表和跳转缓存里删掉 pc。翻译表开放寻址，删掉的位置留一个永远不会命中的墓碑 */
+/*
+ * 从翻译表里删掉 pc，留一个永远不会命中的墓碑。各线程跳转缓存里的旧项不用删：它们指向
+ * 作废块的入口，那里跳往转发桩。持有锁
+ */
 static void table_remove(struct appine_dbt *d, uint64_t pc)
 {
-    for (size_t i = table_index(d, pc); d->table[i].code; i = (i + 1) & table_mask(d)) {
-        if (d->table[i].pc == pc) {
-            d->table[i].pc = JC_EMPTY;
+    struct table *t = d->table;
+    for (size_t i = table_index(t, pc); t->slots[i].code; i = (i + 1) & table_mask(t)) {
+        if (t->slots[i].pc == pc) {
+            __atomic_store_n(&t->slots[i].pc, JC_EMPTY, __ATOMIC_RELEASE);
             d->table_dead++;
             break;
         }
     }
-    struct slot *j = &d->jc[(pc >> 2) & (JC_SIZE - 1)];
-    if (j->pc == pc)
-        *j = (struct slot){JC_EMPTY, NULL};
 }
 
-static void clear_jump_cache(struct appine_dbt *d)
+static void clear_jump_cache(struct appine_dbt_thread *t)
 {
     for (unsigned i = 0; i < JC_SIZE; i++)
-        d->jc[i] = (struct slot){JC_EMPTY, NULL};
-    d->jc_dirty = false;
+        t->jc[i] = (struct slot){JC_EMPTY, NULL};
+    t->jc_dirty = false;
 }
 
 /* 影子返回栈全部换成空项：落点所在的代码就要被覆盖了 */
-static void rs_reset(struct appine_dbt *d)
+static void rs_reset(struct appine_dbt_thread *t)
 {
     for (unsigned i = 0; i < RS_ENTRIES; i++) {
-        d->rs[i][0] = 1; /* 未对齐，不会是 RET 的目标；万一匹配，rs_miss 也照样查找 */
-        d->rs[i][1] = (uint64_t)(uintptr_t)d->rs_miss;
+        t->rs[i][0] = 1; /* 未对齐，不会是 RET 的目标；万一匹配，rs_miss 也照样查找 */
+        t->rs[i][1] = (uint64_t)(uintptr_t)t->d->rs_miss;
     }
 }
 
-void appine_dbt_flush(struct appine_dbt *d)
+/* 代码缓存整体清空过（generation 变了）：线程自己的跳转缓存和影子返回栈指向旧代码 */
+static void thread_catch_up(struct appine_dbt_thread *t)
+{
+    uint64_t g = __atomic_load_n(&t->d->generation, __ATOMIC_ACQUIRE);
+    if (t->generation != g) {
+        t->generation = g;
+        rs_reset(t);
+        if (t->jc_dirty)
+            clear_jump_cache(t);
+    }
+}
+
+/*
+ * blocks 记满了，但大半是作废的块（JIT 反复改写、重新翻译同一处代码）：去掉它们的记录，
+ * 再原样重建翻译表去掉墓碑，不必整体清空。作废块的代码还留在代码缓存里，它们的入口仍然
+ * 跳往转发桩。持有锁；分配新表失败时返回 false
+ */
+static bool compact_blocks(struct appine_dbt *d)
+{
+    struct table *table = table_new(d->table->bits);
+    if (!table)
+        return false;
+    size_t n = 0, words = 0;
+    memset(d->page_head, 0, sizeof(*d->page_head) << PAGE_BUCKET_BITS);
+    for (size_t k = 0; k < d->table_count; k++) {
+        struct block b = d->blocks[k];
+        if (!b.code)
+            continue;
+        memmove(d->words + words, d->words + b.words, b.nguest * 4);
+        b.words = (uint32_t)words;
+        words += b.nguest;
+        unsigned h = page_bucket(b.pc >> APPINE_PAGE_SHIFT);
+        b.next = d->page_head[h];
+        d->blocks[n++] = b;
+        d->page_head[h] = (uint32_t)n;
+    }
+    d->table_count = n;
+    d->words_used = words;
+    d->blocks_dead = 0;
+    table_rebuild(d, table);
+    return true;
+}
+
+/*
+ * 丢弃全部翻译。持有锁，并且没有别的线程在翻译后的代码里或者不持锁地查表：它们都停在
+ * 分发器里，或者不在 dbt_run 里（flush_world）。
+ */
+static void flush_locked(struct appine_dbt *d)
 {
     if (d->used_words > d->high_words)
         d->high_words = d->used_words;
+    struct table *t = d->table;
     for (size_t i = 0; i < d->table_count; i++) {
         if (d->table_used[i] != SLOT_NONE)
-            d->table[d->table_used[i]] = (struct slot){0, NULL};
+            t->slots[d->table_used[i]] = (struct slot){0, NULL};
         d->page_head[page_bucket(d->blocks[i].pc >> APPINE_PAGE_SHIFT)] = 0;
     }
-    d->table_count = d->table_occupied = d->table_dead = 0;
+    d->table_count = d->table_occupied = d->table_dead = d->blocks_dead = 0;
     d->words_used = 0;
     d->stale = false;
-    rs_reset(d);
-    if (d->jc_dirty)
-        clear_jump_cache(d);
+    d->flush_wanted = false;
     d->used_words = d->routine_words;
-    d->generation++;
-    d->stats.flushes++;
+    __atomic_store_n(&d->generation, d->generation + 1, __ATOMIC_RELEASE);
+    d->st->flushes++;
 }
 
 /*
  * 让作废的块不再被执行：入口（kick 检查之前和之后两处）改成跳往一个转发桩。转发桩
  * 以 R_CHAIN 退出，回填位置就是旧入口，所以重新翻译之后旧入口直接跳往新的块，
- * 别的块链接到旧入口的跳转不用找出来改写。代码缓存放不下转发桩时返回 false。
+ * 别的块链接到旧入口的跳转不用找出来改写。别的线程可能正在执行这个块：它照样执行到
+ * 块尾，和硬件上别的核在上下文同步之前还可能执行旧指令一样。
+ *
+ * 转发桩要先同步好，入口才能跳过去；每次同步都要等指令缓存的作废广播完成，所以一批块
+ * 一起做：retire_add 写好转发桩，retire_flush 同步所有转发桩、改所有入口、再同步一次。
+ * 持有锁
  */
-static bool retire_block(struct appine_dbt *d, struct block *b)
+#define RETIRE_BATCH 32
+
+struct retire_batch {
+    unsigned n;
+    struct block *blocks[RETIRE_BATCH];
+    uint32_t *fwd_start;
+};
+
+static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
 {
+    if (!r->n)
+        return;
+    void *start[RETIRE_BATCH], *end[RETIRE_BATCH];
+    start[0] = r->fwd_start;
+    end[0] = d->cache + d->used_words;
+    sync_code_ranges(start, end, 1, d->rw_delta);
+    uint32_t *fwd = r->fwd_start;
+    for (unsigned i = 0; i < r->n; i++) {
+        uint32_t *code = r->blocks[i]->code;
+        *rw(d, code) = enc_b((intptr_t)fwd - (intptr_t)code);
+        *rw(d, code + ENTRY_CHECK_WORDS) = enc_b(-ENTRY_CHECK_WORDS * 4);
+        start[i] = code;
+        end[i] = code + ENTRY_CHECK_WORDS + 1;
+        fwd += 16;
+    }
+    sync_code_ranges(start, end, r->n, d->rw_delta);
+    for (unsigned i = 0; i < r->n; i++) {
+        struct block *b = r->blocks[i];
+        table_remove(d, b->pc);
+        b->code = NULL;
+        d->blocks_dead++;
+        d->st->invalidated++;
+    }
+    r->n = 0;
+}
+
+/* 作废 b：先写好它的转发桩（每个占 16 个字），入口等 retire_flush 一起改。代码缓存放不下
+ * 转发桩时返回 false */
+static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct block *b)
+{
+    if (r->n == RETIRE_BATCH)
+        retire_flush(d, r);
     if (d->used_words + 16 > d->cache_words)
         return false;
-    struct xlate x = {.d = d, .buf = d->cache + d->used_words};
+    struct xlate x = {.d = d, .buf = d->cache + d->used_words, .wdelta = d->rw_delta, .st = d->st};
     emit_mov_const(&x, T1, (uint64_t)(uintptr_t)b->code);
     emit_mov_const(&x, T0, b->pc);
     emit(&x, enc_movz(T2, R_CHAIN, 0));
     emit(&x, enc_b((intptr_t)d->exit - (intptr_t)here(&x)));
-    sync_range(d, x.buf, x.buf + x.n);
+    while (x.n < 16)
+        emit(&x, enc_b(4)); /* 补齐，转发桩按 16 个字排列 */
     d->used_words += x.n;
-    *rw(d, b->code) = enc_b((intptr_t)x.buf - (intptr_t)b->code);
-    *rw(d, b->code + ENTRY_CHECK_WORDS) = enc_b(-ENTRY_CHECK_WORDS * 4);
-    sync_range(d, b->code, b->code + ENTRY_CHECK_WORDS + 1);
-    table_remove(d, b->pc);
-    b->code = NULL;
-    d->stats.invalidated++;
+    if (!r->n)
+        r->fwd_start = x.buf;
+    r->blocks[r->n++] = b;
     return true;
 }
 
-void appine_dbt_invalidate(struct appine_dbt *d, uint64_t start, uint64_t len)
+/* 作废 [start, start + len) 覆盖的各页里开始的块；放不下转发桩或者范围太大时改为请求
+ * 整体清空，由下一次进入分发器的线程完成。持有锁 */
+static void invalidate_locked(struct appine_dbt *d, uint64_t start, uint64_t len)
 {
     if (!len)
         return;
     uint64_t end = start + len - 1, first = start >> APPINE_PAGE_SHIFT, last = end >> APPINE_PAGE_SHIFT;
+    if (end < start)
+        last = UINT64_MAX >> APPINE_PAGE_SHIFT;
+    /* 范围很大（拆掉一个库）：逐个看所有的块，比整体清空便宜，别的线程也不必重新翻译。
+     * 块不跨页，按页比较 */
+    struct retire_batch r = {.n = 0};
     if (end < start || last - first >= INVALIDATE_MAX_PAGES) {
-        appine_dbt_flush(d);
+        for (size_t i = 0; i < d->table_count; i++) {
+            struct block *b = &d->blocks[i];
+            uint64_t page = b->pc >> APPINE_PAGE_SHIFT;
+            if (b->code && page >= first && page <= last && !retire_add(d, &r, b))
+                goto full;
+        }
+        retire_flush(d, &r);
         return;
     }
     for (uint64_t page = first; page <= last; page++) {
         for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
             struct block *b = &d->blocks[i - 1];
-            if (b->code && b->pc >> APPINE_PAGE_SHIFT == page && !retire_block(d, b)) {
-                appine_dbt_flush(d);
-                return;
-            }
+            if (b->code && b->pc >> APPINE_PAGE_SHIFT == page && !retire_add(d, &r, b))
+                goto full;
         }
     }
+    retire_flush(d, &r);
+    return;
+full:
+    retire_flush(d, &r);
+    __atomic_store_n(&d->flush_wanted, true, __ATOMIC_SEQ_CST);
 }
 
 /*
  * 组长 `pc` 没通过共用的检查。第一次只记下来：栈还没长到那里这类情况，Tier 0 执行
  * 组员时就会解决。第二次记进 nogroup，作废包含它的块（块不跨页，都在它那一页的桶里），
- * 重新翻译时不再分组。
+ * 重新翻译时不再分组。持有锁
  */
 static void ungroup(struct appine_dbt *d, uint64_t pc)
 {
@@ -1796,15 +2119,17 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
     }
     *strike = 0;
     d->nogroup[d->nogroup_count++ % NOGROUP_MAX] = pc;
-    d->stats.ungrouped++;
+    d->st->ungrouped++;
     uint64_t page = pc >> APPINE_PAGE_SHIFT;
+    struct retire_batch r = {.n = 0};
     for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
         struct block *b = &d->blocks[i - 1];
-        if (b->code && b->pc <= pc && pc < b->pc + 4ull * b->nguest && !retire_block(d, b)) {
-            appine_dbt_flush(d);
-            return;
+        if (b->code && b->pc <= pc && pc < b->pc + 4ull * b->nguest && !retire_add(d, &r, b)) {
+            __atomic_store_n(&d->flush_wanted, true, __ATOMIC_SEQ_CST);
+            break;
         }
     }
+    retire_flush(d, &r);
 }
 
 /* ---- 翻译模板：所有实例共享（§4.2） ---- */
@@ -1816,9 +2141,14 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
  * 自己内存里的是否相同，相同就把模板拷进自己的代码缓存，只重新计算跳往例程的几条
  * b。块之间的链接在各自的拷贝里回填，所以不同进程在同一地址映射了不同的代码也
  * 互不影响。模板区写满时整体丢弃，因为实例只拷贝模板、从不引用它。
+ *
+ * 所有进程的所有线程都在用模板，一把锁时 go build 这样并发起编译进程的负载有一成时间
+ * 花在锁上，所以按桶分片加锁；分配模板区另用一把只持有片刻的锁，整体丢弃时持有全部的
+ * 锁（先分片、后分配，与存模板时的顺序相同）。
  */
 #define TEMPLATE_BYTES (UINT64_C(32) << 20)
 #define TEMPLATE_BUCKET_BITS 16
+#define TEMPLATE_SHARDS 64
 /* 同一个 pc 最多保留几个版本：JIT 反复改写同一处代码时只留最新的几个 */
 #define TEMPLATES_PER_PC 4
 
@@ -1826,21 +2156,49 @@ struct template {
     struct template *next;
     uint64_t pc;
     uint64_t key; /* 翻译时用到的分组记录（nogroup_key） */
-    uint32_t nguest, nhost, nrelocs;
+    uint32_t nguest, nhost, nrelocs, nlinks;
     uint32_t copied, remapped, memory, fallback, grouped; /* 统计，拷贝时累加 */
-    uint32_t words[];                            /* guest 指令字、宿主指令字、重定位 */
+    uint32_t words[]; /* guest 指令字、宿主指令字、重定位、链接（每个 4 个字，见 struct link） */
 };
 
 static struct {
-    pthread_mutex_t lock;
+    struct {
+        pthread_mutex_t lock;
+        char pad[64 - sizeof(pthread_mutex_t) % 64]; /* 各占一个缓存行 */
+    } shards[TEMPLATE_SHARDS]; /* 第 i 片管下标模 TEMPLATE_SHARDS 等于 i 的桶 */
+    pthread_mutex_t arena_lock;
     uint8_t *arena; /* 第一次使用时映射，写满时清空 */
     size_t used;
+    bool full; /* 写满了，等存模板的线程放开分片锁之后清空 */
     struct template *buckets[1u << TEMPLATE_BUCKET_BITS];
-} templates = {.lock = PTHREAD_MUTEX_INITIALIZER};
+} templates = {
+    .shards = {[0 ... TEMPLATE_SHARDS - 1] = {.lock = PTHREAD_MUTEX_INITIALIZER}},
+    .arena_lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static unsigned template_index(uint64_t pc)
+{
+    return (unsigned)(((pc >> 2) * UINT64_C(0x9e3779b97f4a7c15)) >> (64 - TEMPLATE_BUCKET_BITS));
+}
 
 static struct template **template_bucket(uint64_t pc)
 {
-    return &templates.buckets[((pc >> 2) * UINT64_C(0x9e3779b97f4a7c15)) >> (64 - TEMPLATE_BUCKET_BITS)];
+    return &templates.buckets[template_index(pc)];
+}
+
+/* pc 所在的桶的锁，同时向 guard 登记 */
+static pthread_mutex_t *template_lock(uint64_t pc)
+{
+    pthread_mutex_t *lock = &templates.shards[template_index(pc) % TEMPLATE_SHARDS].lock;
+    pthread_mutex_lock(lock);
+    appine_guard_hold(lock, false);
+    return lock;
+}
+
+static void template_unlock(pthread_mutex_t *lock)
+{
+    appine_guard_drop();
+    pthread_mutex_unlock(lock);
 }
 
 /*
@@ -1859,7 +2217,7 @@ static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
     return key;
 }
 
-/* 调用方持有锁 */
+/* 调用方持有 pc 所在的分片的锁 */
 static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key)
 {
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
@@ -1869,63 +2227,107 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
     return NULL;
 }
 
-/* 按模板在代码缓存的当前位置生成一个块，`nguest` 是它的 guest 指令条数；没有合适的
- * 模板时返回 NULL */
-static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t *guest, uint64_t key,
-                               uint32_t *nguest)
+/*
+ * 准备好、还没装进代码缓存的块（prepare 不持锁翻译，install 持锁装进去）：生成的宿主指令
+ * 在线程的暂存区里，跳往例程的 b 的位置记在 relocs，出口记在 links。
+ */
+struct prep {
+    uint64_t pc;
+    const uint32_t *guest; /* guest 指令字在宿主内存里的位置：装进去之前再比对一次 */
+    uint32_t nguest;
+    uint32_t words[MAX_BLOCK_INSNS]; /* 翻译时读到的 guest 指令字 */
+    const uint32_t *host;
+    uint32_t nhost;
+    uint32_t relocs[MAX_RELOCS];
+    unsigned nrelocs;
+    struct link links[MAX_STUBS];
+    unsigned nlinks;
+};
+
+/* 有和 `guest`（翻译时读到的指令字）相同的模板时，拷进线程的暂存区记在 p 里 */
+static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, struct prep *p,
+                           uint32_t *scratch, struct appine_dbt_stats *st)
 {
-    uint32_t *code = d->cache + d->used_words;
-    pthread_mutex_lock(&templates.lock);
-    appine_guard_hold(&templates.lock, false);
+    pthread_mutex_t *lock = template_lock(pc);
     struct template *t = template_find(pc, guest, key);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
-        memcpy(rw(d, code), host, t->nhost * 4);
-        for (uint32_t i = 0; i < t->nrelocs; i++) {
-            uint32_t *site = code + (relocs[i] >> 2);
-            *rw(d, site) = enc_b((intptr_t)routine(d, relocs[i] & 3) - (intptr_t)site);
-        }
-        d->used_words += t->nhost;
-        d->stats.insns += t->nguest;
-        d->stats.insns_copied += t->copied;
-        d->stats.insns_remapped += t->remapped;
-        d->stats.insns_memory += t->memory;
-        d->stats.insns_fallback += t->fallback;
-        d->stats.insns_grouped += t->grouped;
-        d->stats.blocks_shared++;
-        *nguest = t->nguest;
+        memcpy(scratch, host, t->nhost * 4);
+        memcpy(p->relocs, relocs, t->nrelocs * 4);
+        p->host = scratch;
+        p->nhost = t->nhost;
+        p->nrelocs = t->nrelocs;
+        p->nguest = t->nguest;
+        const uint32_t *l = relocs + t->nrelocs;
+        for (uint32_t i = 0; i < t->nlinks; i++, l += 4)
+            p->links[i] = (struct link){l[0], l[1], (uint64_t)l[3] << 32 | l[2]};
+        p->nlinks = t->nlinks;
+        st->insns += t->nguest;
+        st->insns_copied += t->copied;
+        st->insns_remapped += t->remapped;
+        st->insns_memory += t->memory;
+        st->insns_fallback += t->fallback;
+        st->insns_grouped += t->grouped;
+        st->blocks_shared++;
     }
-    appine_guard_drop();
-    pthread_mutex_unlock(&templates.lock);
-    return t ? code : NULL;
+    template_unlock(lock);
+    return t != NULL;
+}
+
+/* 从模板区分配 `bytes` 字节；写满时返回 NULL，并标记等着清空。调用方持有某个分片的锁 */
+static void *template_alloc(size_t bytes)
+{
+    void *p = NULL;
+    pthread_mutex_lock(&templates.arena_lock);
+    if (!templates.arena) {
+        void *m = mmap(NULL, TEMPLATE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        templates.arena = m == MAP_FAILED ? NULL : m;
+    }
+    if (templates.arena && templates.used + bytes <= TEMPLATE_BYTES) {
+        p = templates.arena + templates.used;
+        templates.used += bytes;
+    } else if (templates.arena) {
+        templates.full = true;
+    }
+    pthread_mutex_unlock(&templates.arena_lock);
+    return p;
+}
+
+/* 丢弃所有翻译模板：模板区写满了（`if_full`，别的线程已经清空过时不再清空），或者宿主
+ * 出了故障（坏掉的可能是模板本身） */
+static void template_clear(bool if_full)
+{
+    for (unsigned i = 0; i < TEMPLATE_SHARDS; i++)
+        pthread_mutex_lock(&templates.shards[i].lock);
+    pthread_mutex_lock(&templates.arena_lock);
+    if (templates.full || !if_full) {
+        memset(templates.buckets, 0, sizeof(templates.buckets));
+        templates.used = 0;
+        templates.full = false;
+    }
+    pthread_mutex_unlock(&templates.arena_lock);
+    for (unsigned i = TEMPLATE_SHARDS; i-- > 0;)
+        pthread_mutex_unlock(&templates.shards[i].lock);
 }
 
 /* 把刚翻译好、还没有回填过链接的块存成模板 */
 static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, uint64_t key,
-                           const struct xlate *x, const struct appine_dbt_stats *before)
+                           const struct xlate *x, const struct appine_dbt_stats *before,
+                           const struct link *links, unsigned nlinks)
 {
-    const struct appine_dbt_stats *after = &x->d->stats;
-    size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs);
+    const struct appine_dbt_stats *after = x->st;
+    size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs + 4 * nlinks);
     bytes = (bytes + 7) & ~(size_t)7;
-    pthread_mutex_lock(&templates.lock);
-    appine_guard_hold(&templates.lock, false);
-    if (!templates.arena) {
-        void *p = mmap(NULL, TEMPLATE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        templates.arena = p == MAP_FAILED ? NULL : p;
-    }
-    if (templates.arena && !template_find(pc, guest, key)) {
-        if (templates.used + bytes > TEMPLATE_BYTES) {
-            memset(templates.buckets, 0, sizeof(templates.buckets));
-            templates.used = 0;
-        }
-        struct template *t = (struct template *)(templates.arena + templates.used);
-        templates.used += bytes;
+    pthread_mutex_t *lock = template_lock(pc);
+    struct template *t = template_find(pc, guest, key) ? NULL : template_alloc(bytes);
+    if (t) {
         *t = (struct template){
             .pc = pc,
             .key = key,
             .nguest = nguest,
             .nhost = (uint32_t)x->n,
             .nrelocs = x->nrelocs,
+            .nlinks = nlinks,
             .copied = (uint32_t)(after->insns_copied - before->insns_copied),
             .remapped = (uint32_t)(after->insns_remapped - before->insns_remapped),
             .memory = (uint32_t)(after->insns_memory - before->insns_memory),
@@ -1935,6 +2337,13 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
         memcpy(t->words, guest, 4 * nguest);
         memcpy(t->words + nguest, x->buf, 4 * x->n);
         memcpy(t->words + nguest + x->n, x->relocs, 4 * x->nrelocs);
+        uint32_t *l = t->words + nguest + x->n + x->nrelocs;
+        for (unsigned i = 0; i < nlinks; i++, l += 4) {
+            l[0] = links[i].stub;
+            l[1] = links[i].branch;
+            l[2] = (uint32_t)links[i].pc;
+            l[3] = (uint32_t)(links[i].pc >> 32);
+        }
         struct template **b = template_bucket(pc);
         t->next = *b;
         *b = t;
@@ -1947,17 +2356,9 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
                 p = &(*p)->next;
         }
     }
-    appine_guard_drop();
-    pthread_mutex_unlock(&templates.lock);
-}
-
-/* 丢弃所有翻译模板（宿主出了故障之后：坏掉的可能是模板本身） */
-static void template_clear(void)
-{
-    pthread_mutex_lock(&templates.lock);
-    memset(templates.buckets, 0, sizeof(templates.buckets));
-    templates.used = 0;
-    pthread_mutex_unlock(&templates.lock);
+    template_unlock(lock);
+    if (__atomic_load_n(&templates.full, __ATOMIC_RELAXED))
+        template_clear(true);
 }
 
 /*
@@ -1990,51 +2391,62 @@ static void perf_map(const void *code, size_t bytes, uint64_t pc)
     pthread_mutex_unlock(&lock);
 }
 
-static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc)
+/* install 的返回值：代码缓存或者翻译表满了，要先整体清空（flush_world）；翻译之后 guest
+ * 代码被改写过，要重新翻译 */
+#define NEED_FLUSH ((uint32_t *)(uintptr_t)1)
+#define STALE ((uint32_t *)(uintptr_t)2)
+
+/* install 建好、还没放进翻译表的块：同步了指令缓存之后才能放进去，别的线程不持锁查表 */
+struct fresh {
+    uint64_t pc;
+    uint32_t *code;
+    const uint32_t *guest;
+    uint32_t nguest;
+};
+
+/*
+ * 不持锁：把 pc 开始的块翻译进线程的暂存区（或者拷贝模板），结果记在 t->prep。翻译耗时
+ * 最长，持锁翻译时 JVM 的主线程常常要等编译线程。guest 指令字先拷一份再翻译，装进去之前
+ * 拿它和内存里的比对（install）。取不到指令时返回 false。
+ */
+static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t pc)
 {
+    struct appine_dbt *d = t->d;
+    struct prep *p = t->prep;
     /* 块不跨页（遇到页边界就结束），整页的权限相同 */
     const uint32_t *page = NULL;
     if (!(pc & 3))
         page = appine_mmu_translate(c->mmu, pc & ~PAGE_MASK, APPINE_PROT_EXEC);
     if (!page)
-        return NULL;
-    /* 表里有四分之三不空时，墓碑占一半以上就原样重建，否则加倍；blocks 记满时整体清空 */
-    if (d->table_count == TABLE_LIMIT) {
-        appine_dbt_flush(d);
-    } else if (d->table_occupied >= ((size_t)3 << d->table_bits) / 4) {
-        bool purge = d->table_dead * 2 >= d->table_occupied || d->table_bits == TABLE_BITS;
-        if (!table_resize(d, purge ? d->table_bits : d->table_bits + 1) ||
-            d->table_occupied >= ((size_t)3 << d->table_bits) / 4)
-            appine_dbt_flush(d);
-    }
-    if (d->used_words + MAX_BLOCK_WORDS > d->cache_words)
-        appine_dbt_flush(d);
-
-    const uint32_t *guest = page + (pc & PAGE_MASK) / 4;
-    uint32_t shared_nguest = 0;
+        return false;
+    unsigned limit = (unsigned)((APPINE_PAGE_SIZE - (pc & PAGE_MASK)) / 4);
+    if (limit > MAX_BLOCK_INSNS)
+        limit = MAX_BLOCK_INSNS;
+    p->pc = pc;
+    p->guest = page + (pc & PAGE_MASK) / 4;
+    memcpy(p->words, p->guest, limit * 4);
+    p->nlinks = 0;
+    const uint32_t *guest = p->words;
+    /* 不持锁读分组记录：读到旧的只影响分组，检查没通过时会再撤销（ungroup） */
     uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
-    uint32_t *code = template_copy(d, pc, guest, key, &shared_nguest);
-    if (code) {
-        perf_map(code, (size_t)(d->cache + d->used_words - code) * 4, pc);
-        sync_range(d, code, d->cache + d->used_words);
-        table_insert(d, pc, code, guest, shared_nguest);
-        d->stats.blocks++;
-        return code;
-    }
+    t->stats.blocks++;
+    if (template_fetch(pc, guest, key, p, t->scratch, &t->stats))
+        return true;
 
-    struct appine_dbt_stats before = d->stats;
-    struct xlate *x = d->xlate;
+    struct appine_dbt_stats before = t->stats;
+    struct xlate *x = t->xlate;
     x->d = d;
-    x->buf = d->cache + d->used_words;
+    x->buf = t->scratch;
+    x->wdelta = 0;
+    x->st = &t->stats;
+    x->probe = t->probe;
     x->n = 0;
     x->nstubs = 0;
     x->nfixups = 0;
     x->nrelocs = 0;
     x->pc = pc;
     x->guest = guest;
-    x->limit = (unsigned)((APPINE_PAGE_SIZE - (pc & PAGE_MASK)) / 4);
-    if (x->limit > MAX_BLOCK_INSNS)
-        x->limit = MAX_BLOCK_INSNS;
+    x->limit = limit;
     x->sp_aligned = false;
     x->group.n = x->group.next = 0;
 
@@ -2050,7 +2462,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
             emit_exit_stub(x, R_CHAIN_FWD, va);
             break;
         }
-        d->stats.insns++;
+        x->st->insns++;
         x->idx = nguest;
         if (!translate_insn(x, guest[nguest], va)) {
             nguest++;
@@ -2078,26 +2490,65 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
         }
         bool link = s->reason == R_CHAIN || s->reason == R_CHAIN_FWD;
         emit_link_stub(x, s->reason, s->pc, link && s->sites == 1 ? s->branch : NULL);
+        if (link)
+            p->links[p->nlinks++] = (struct link){
+                (uint32_t)(s->addr - x->buf) | (s->reason == R_CHAIN_FWD ? LINK_FWD : 0),
+                s->sites == 1 ? (uint32_t)(s->branch - x->buf) : NO_BRANCH, s->pc};
     }
     for (unsigned i = 0; i < x->nfixups; i++) {
         struct fixup *f = &x->fixups[i];
         intptr_t off = (intptr_t)x->stubs[f->stub].addr - (intptr_t)f->site;
         if (f->kind == FIX_IMM19)
-            *rw(d, f->site) |= ((uint32_t)(off >> 2) & 0x7ffff) << 5;
+            *f->site |= ((uint32_t)(off >> 2) & 0x7ffff) << 5;
         else
-            *rw(d, f->site) |= ((uint32_t)(off >> 2) & 0x3fff) << 5;
+            *f->site |= ((uint32_t)(off >> 2) & 0x3fff) << 5;
     }
 
     if (x->nrelocs > MAX_RELOCS)
         abort();
-    template_store(pc, guest, nguest, key, x, &before);
-    code = x->buf;
-    size_t words = x->n;
-    perf_map(code, words * 4, pc);
-    sync_range(d, code, code + words);
-    d->used_words += words;
-    table_insert(d, pc, code, guest, nguest);
-    d->stats.blocks++;
+    template_store(pc, guest, nguest, key, x, &before, p->links, p->nlinks);
+    p->nguest = nguest;
+    p->host = x->buf;
+    p->nhost = (uint32_t)x->n;
+    memcpy(p->relocs, x->relocs, x->nrelocs * 4);
+    p->nrelocs = x->nrelocs;
+    return true;
+}
+
+/*
+ * 持锁：把准备好的块（prepare）装进代码缓存，链接已经翻译过的出口。新代码的范围记进
+ * `sync`，块记进 `f`，由调用方同步指令缓存之后放进翻译表（table_insert）。
+ */
+static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct syncs *sync, struct fresh *f)
+{
+    /* 翻译期间别的线程改写了这段代码（它作废时这个块还不在表里）：重新翻译 */
+    if (memcmp(p->guest, p->words, p->nguest * 4) != 0)
+        return STALE;
+    /* 表里有四分之三不空时，墓碑占一半以上就原样重建，否则加倍；blocks 记满时去掉作废块
+     * 的记录，作废的不多就整体清空 */
+    if (d->table_count == TABLE_LIMIT &&
+        (d->blocks_dead * 8 < d->table_count || !compact_blocks(d)))
+        return NEED_FLUSH;
+    unsigned bits = d->table->bits;
+    if (d->table_occupied >= ((size_t)3 << bits) / 4) {
+        bool purge = d->table_dead * 2 >= d->table_occupied || bits == TABLE_BITS;
+        if (!table_resize(d, purge ? bits : bits + 1) ||
+            d->table_occupied >= ((size_t)3 << d->table->bits) / 4)
+            return NEED_FLUSH;
+    }
+    if (d->used_words + p->nhost > d->cache_words)
+        return NEED_FLUSH;
+    uint32_t *code = d->cache + d->used_words;
+    memcpy(rw(d, code), p->host, p->nhost * 4);
+    for (unsigned i = 0; i < p->nrelocs; i++) {
+        uint32_t *site = code + (p->relocs[i] >> 2);
+        *rw(d, site) = enc_b((intptr_t)routine(d, p->relocs[i] & 3) - (intptr_t)site);
+    }
+    d->used_words += p->nhost;
+    link_block(d, code, p->pc, p->links, p->nlinks);
+    perf_map(code, p->nhost * 4, p->pc);
+    sync_add(sync, code, code + p->nhost);
+    *f = (struct fresh){p->pc, code, p->guest, p->nguest};
     return code;
 }
 
@@ -2216,7 +2667,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
 
     /* 跨页：x1、x2 = 两页的 addend */
     uint32_t *probe = here(x);
-    patch_branch(x->d, cross, probe);
+    patch_branch(x->wdelta, cross, probe);
     uint32_t *miss[2];
     miss[0] = emit_probe(x, T0, 1, write);
     miss[1] = emit_probe(x, 3, 2, write);
@@ -2225,13 +2676,13 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_mov(T2, 1));
     emit(x, enc_b((intptr_t)done - (intptr_t)here(x)));
     for (unsigned i = 0; i < 2; i++) {
-        patch_branch(x->d, miss[i], here(x));
+        patch_branch(x->wdelta, miss[i], here(x));
         emit_fill(x, i ? 3 : T0, write, &f);
         emit(x, enc_b((intptr_t)probe - (intptr_t)here(x)));
     }
 
     for (unsigned i = 0; i < f.n; i++)
-        patch_branch(x->d, f.site[i], here(x));
+        patch_branch(x->wdelta, f.site[i], here(x));
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
     emit(x, enc_ldr_x(4, CTX, x0 + 32));
@@ -2240,11 +2691,78 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     return entry;
 }
 
+/* 把 cpu 的 dbt_lookup_seq 加一（用掉 x1、x2），见 table_lookup */
+static void emit_seq_step(struct xlate *x)
+{
+    size_t seq = offsetof(struct appine_cpu, dbt_lookup_seq);
+    emit(x, enc_ldr_w(2, CTX, seq));
+    emit(x, enc_add_imm(2, 2, 1, 0));
+    emit_add_const(x, 1, CTX, (int64_t)seq);
+    emit(x, enc_stlr(2, 2, 1));
+}
+
+/*
+ * 跳转缓存没命中时的查表例程：T0 = guest pc。像 table_lookup 一样不持锁查这个地址空间
+ * 共用的翻译表，查到了填进线程的跳转缓存再跳过去，查不到才退出到分发器翻译（R_LOOKUP）。
+ * 原来每次没命中都要退出、保存和恢复全部寄存器，JIT 负载一次 Maven 构建有六百多万次。
+ * 借用 cpu 结构体里 x0–x3 的位置暂存宿主 x0–x3，见 emit_refill。
+ */
+static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
+{
+    size_t x0 = offsetof(struct appine_cpu, x);
+    uint32_t *entry = here(x);
+    emit(x, enc_stp_x(0, 1, CTX, (int)x0));
+    emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
+    /* 序号改成奇数之后再读表：stlr 与随后的 ldar 之间有序 */
+    emit_seq_step(x);
+    emit_mov_const(x, 0, (uint64_t)(uintptr_t)&d->table);
+    emit(x, enc_ldar(3, 0, 0));
+    emit(x, enc_ldr_w(2, 0, offsetof(struct table, shift)));
+    emit(x, enc_ldr_x(3, 0, offsetof(struct table, mask)));
+    emit(x, enc_add_imm(0, 0, offsetof(struct table, slots), 0));
+    emit(x, enc_ubfx(T1, T0, 2, 62));
+    emit_mov_const(x, T2, GOLDEN);
+    emit(x, enc_mul(T1, T1, T2));
+    emit(x, enc_lsrv(T1, T1, 2));
+    /* 线性探测：x2 = 表项的 pc，T2 = code */
+    uint32_t *loop = here(x);
+    emit(x, enc_add_lsl(T2, 0, T1, 4));
+    emit(x, enc_ldp_x(2, T2, T2, 0));
+    uint32_t *miss = here(x);
+    emit(x, enc_cbz_x(T2));
+    emit(x, enc_eor_lsr(2, 2, T0, 0));
+    uint32_t *found = here(x);
+    emit(x, enc_cbz_x(2));
+    emit(x, enc_add_imm(T1, T1, 1, 0));
+    emit(x, enc_and_reg(T1, T1, 3));
+    emit(x, enc_b((intptr_t)loop - (intptr_t)here(x)));
+
+    patch_branch(x->wdelta, found, here(x));
+    emit_seq_step(x);
+    emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
+    emit(x, enc_ubfx(1, T0, 2, JC_BITS));
+    emit(x, enc_add_lsl(0, 0, 1, 4));
+    emit(x, enc_stp_x(T0, T2, 0, 0));
+    emit(x, enc_mov(T1, T2));
+    emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
+    emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
+    emit(x, enc_br(T1));
+
+    patch_branch(x->wdelta, miss, here(x));
+    emit_seq_step(x);
+    emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
+    emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
+    emit(x, enc_movz(T1, 0, 0));
+    emit(x, enc_movz(T2, R_LOOKUP, 0));
+    emit(x, enc_b((intptr_t)d->exit - (intptr_t)here(x)));
+    return entry;
+}
+
 /* 进入与退出例程：放在代码缓存开头，所有退出桩都能用一条 b 到达 */
 static void emit_routines(struct appine_dbt *d)
 {
     static const unsigned pairs[] = {0, 2, 4, 6, 8, 10, 12, 14, 19, 21, 23};
-    struct xlate x = {.d = d, .buf = d->cache};
+    struct xlate x = {.d = d, .buf = d->cache, .wdelta = d->rw_delta, .st = d->st};
     size_t x0 = offsetof(struct appine_cpu, x), v0 = offsetof(struct appine_cpu, v);
 
     /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code)：保存被调用者保存的寄存器
@@ -2314,83 +2832,112 @@ static void emit_routines(struct appine_dbt *d)
 
     d->refill[0] = emit_refill(&x, false);
     d->refill[1] = emit_refill(&x, true);
+    d->lookup = emit_lookup(&x, d);
 
-    /* 影子返回栈空项的落点：像间接跳转没命中跳转缓存那样，按 guest x30 退出查找 */
+    /* 影子返回栈空项的落点：像间接跳转没命中跳转缓存那样，按 guest x30 查找 */
     d->rs_miss = here(&x);
     emit(&x, enc_mov(T0, 30));
-    emit(&x, enc_movz(T1, 0, 0));
-    emit(&x, enc_movz(T2, R_LOOKUP, 0));
-    emit(&x, enc_b((intptr_t)d->exit - (intptr_t)here(&x)));
+    emit(&x, enc_b((intptr_t)d->lookup - (intptr_t)here(&x)));
 
     d->routine_words = d->used_words = x.n;
     sync_range(d, d->cache, d->cache + x.n);
 }
 
 /*
- * 退出的线程留下的实例清空后放进一个小池子，给新线程复用：短命进程不必每次都重新
- * 映射代码缓存和各张表，再在第一次写入每一页时缺页。池里的实例把代码缓存用过的
- * 部分标成 MADV_FREE，宿主内存紧张时可以直接回收（之后再写入只是重新缺页）。
+ * 不再使用的实例（它的地址空间没了）放进一个小池子，给新的地址空间复用：短命进程不必每次
+ * 都重新映射代码缓存和各张表，再在第一次写入每一页时缺页。翻译不多时保留下来，按程序
+ * （调用方给的键，内核层用可执行文件的 inode）区分：同一个程序再运行时（shell 脚本里反复
+ * exec 的 busybox、go build 的一个个 compile、一次次 `node -e`）拿回它留下的翻译，核对之后
+ * 接着用；没有同键的就拿一个空的或者新建，不去清空别的程序留下的。池里保留的代码总量有
+ * 上限，超出时先去掉最久没用的。清空了的实例把代码缓存用过的部分标成 MADV_FREE，宿主内存
+ * 紧张时可以直接回收（之后再写入只是重新缺页）。线程的部分（跳转缓存、影子返回栈）另有
+ * 一个池子。
  */
-#define POOL_SIZE 2
+#define POOL_SIZE 6
+#define POOL_KEEP_WORDS ((size_t)(64u << 20) / 4) /* 池里保留的代码最多 64 MB */
+#define THREAD_POOL_SIZE 8
 
 static struct {
     pthread_mutex_t lock;
-    struct appine_dbt *free[POOL_SIZE];
+    struct pooled {
+        struct appine_dbt *d;
+        uint64_t key;  /* 保留着哪个程序的翻译；0 表示已经清空 */
+        uint64_t when; /* 放进来的先后，去掉最久没用的 */
+    } free[POOL_SIZE];
     unsigned n;
+    uint64_t clock;
+    size_t kept_words; /* 池里保留着的代码 */
+    struct appine_dbt_thread *threads[THREAD_POOL_SIZE];
+    unsigned nthreads;
 } pool = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+/* 从池里取出第 i 个。持有池的锁 */
+static struct appine_dbt *pool_take(unsigned i)
+{
+    struct appine_dbt *d = pool.free[i].d;
+    if (pool.free[i].key)
+        pool.kept_words -= d->used_words - d->routine_words;
+    pool.free[i] = pool.free[--pool.n];
+    return d;
+}
 
 static void release(struct appine_dbt *d)
 {
     if (d->cache)
         appine_unmap_code(d->cache, CODE_CACHE_BYTES, d->rw_delta);
-    zfree(d->table, TABLE_BYTES(d->table_bits));
+    if (d->table)
+        zfree(d->table, TABLE_BYTES(d->table->bits));
     zfree(d->table_used, TABLE_LIMIT * sizeof(*d->table_used));
-    zfree(d->jc, JC_SIZE * sizeof(*d->jc));
     zfree(d->blocks, TABLE_LIMIT * sizeof(*d->blocks));
     zfree(d->words, WORDS_LIMIT * sizeof(*d->words));
-    zfree(d->rs, APPINE_PAGE_SIZE);
     zfree(d->page_head, sizeof(*d->page_head) << PAGE_BUCKET_BITS);
-    free(d->xlate);
+    pthread_mutex_destroy(&d->lock);
+    pthread_cond_destroy(&d->flushed);
     zfree(d, sizeof(*d));
 }
 
-struct appine_dbt *appine_dbt_new(void)
+/* 没有线程挂着的实例自己的统计（从池里取出、放回池里时的清空和核对） */
+static struct appine_dbt_stats spare_stats;
+
+struct appine_dbt *appine_dbt_new(uint64_t key)
 {
     pthread_mutex_lock(&pool.lock);
-    struct appine_dbt *d = pool.n ? pool.free[--pool.n] : NULL;
-    pthread_mutex_unlock(&pool.lock);
-    if (d) {
-        d->stats = (struct appine_dbt_stats){0};
-        return d;
+    int best = -1;
+    for (unsigned i = 0; i < pool.n; i++) {
+        bool same = key && pool.free[i].key == key;
+        bool empty = !pool.free[i].key;
+        if ((same && (best < 0 || pool.free[best].key != key || pool.free[i].when > pool.free[best].when)) ||
+            (empty && best < 0))
+            best = (int)i;
     }
+    struct appine_dbt *d = best >= 0 ? pool_take((unsigned)best) : NULL;
+    pthread_mutex_unlock(&pool.lock);
+    if (d)
+        return d;
 
     d = zalloc(sizeof(*d));
     if (!d)
         return NULL;
+    pthread_mutex_init(&d->lock, NULL);
+    pthread_cond_init(&d->flushed, NULL);
+    d->st = &spare_stats;
     d->cache = appine_map_code(CODE_CACHE_BYTES, &d->rw_delta);
-    d->table_bits = TABLE_MIN_BITS;
-    d->table = zalloc(TABLE_BYTES(TABLE_MIN_BITS));
+    d->table = table_new(TABLE_MIN_BITS);
     d->table_used = zalloc(TABLE_LIMIT * sizeof(*d->table_used));
-    d->jc = zalloc(JC_SIZE * sizeof(*d->jc));
     d->blocks = zalloc(TABLE_LIMIT * sizeof(*d->blocks));
     d->words = zalloc(WORDS_LIMIT * sizeof(*d->words));
-    d->rs = zalloc(APPINE_PAGE_SIZE); /* 按页对齐，也就按 1 KB 对齐 */
     d->page_head = zalloc(sizeof(*d->page_head) << PAGE_BUCKET_BITS);
-    d->xlate = malloc(sizeof(*d->xlate));
-    if (!d->cache || !d->table || !d->table_used || !d->jc || !d->blocks || !d->words || !d->rs ||
-        !d->page_head || !d->xlate) {
+    if (!d->cache || !d->table || !d->table_used || !d->blocks || !d->words || !d->page_head) {
         release(d);
         return NULL;
     }
     d->cache_words = CODE_CACHE_BYTES / 4;
-    clear_jump_cache(d);
-    appine_cpu_init(&d->probe, NULL);
     emit_routines(d);
-    rs_reset(d);
     return d;
 }
 
-void appine_dbt_free(struct appine_dbt *d)
+/* 放回池里：没有线程挂着，所以可以直接清空 */
+void appine_dbt_free(struct appine_dbt *d, uint64_t key)
 {
     if (!d)
         return;
@@ -2398,63 +2945,184 @@ void appine_dbt_free(struct appine_dbt *d)
         release(d);
         return;
     }
-    pthread_mutex_lock(&pool.lock);
-    bool keep = pool.n < POOL_SIZE;
-    pthread_mutex_unlock(&pool.lock);
-    if (!keep) {
-        release(d);
-        return;
+    d->st = &spare_stats;
+    size_t words = d->used_words - d->routine_words;
+    /* 块不多时保留翻译：下一个同一程序的使用者运行之前核对一遍（recheck），比逐块拷贝模板、
+     * 重新链接、同步指令缓存便宜得多 */
+    if (key && d->table_count <= KEEP_MAX_BLOCKS && words <= POOL_KEEP_WORDS && !d->flush_wanted) {
+        d->stale = d->table_count > 0;
+    } else {
+        key = 0;
+        words = 0;
+        flush_locked(d);
+        if (d->table->bits > TABLE_MIN_BITS) /* 下一个使用者多半是个短命进程 */
+            table_resize(d, TABLE_MIN_BITS);
+        /*
+         * 进入/退出例程所在的页保留，其余用过的部分交给宿主回收：私有映射用 MADV_FREE，
+         * 内存紧张时才回收；双映射的共享内存不支持它，只能用 MADV_REMOVE 立即释放
+         */
+        uintptr_t page = APPINE_PAGE_SIZE;
+        uintptr_t start = ((uintptr_t)rw(d, d->cache + d->routine_words) + page - 1) & ~(page - 1);
+        uintptr_t end = ((uintptr_t)rw(d, d->cache + d->high_words) + page - 1) & ~(page - 1);
+        if (end > start)
+            madvise((void *)start, end - start, d->rw_delta ? MADV_REMOVE : MADV_FREE);
+        d->high_words = 0;
     }
-    /*
-     * 块不多时保留翻译：下一个使用者（fork 出来的子进程、又一次 exec 的同一个程序）
-     * 多半运行同样的代码，运行之前核对一遍（recheck）比逐块拷贝模板便宜得多
-     */
-    if (d->table_count <= KEEP_MAX_BLOCKS) {
-        d->stale = true;
-        pthread_mutex_lock(&pool.lock);
-        if (pool.n < POOL_SIZE)
-            pool.free[pool.n++] = d;
-        else
-            keep = false;
-        pthread_mutex_unlock(&pool.lock);
-        if (!keep)
-            release(d);
-        return;
-    }
-    appine_dbt_flush(d);
-    if (d->table_bits > TABLE_MIN_BITS) /* 下一个使用者多半是个短命进程 */
-        table_resize(d, TABLE_MIN_BITS);
-    /*
-     * 进入/退出例程所在的页保留，其余用过的部分交给宿主回收：私有映射用 MADV_FREE，
-     * 内存紧张时才回收；双映射的共享内存不支持它，只能用 MADV_REMOVE 立即释放
-     */
-    uintptr_t page = APPINE_PAGE_SIZE;
-    uintptr_t start = ((uintptr_t)rw(d, d->cache + d->routine_words) + page - 1) & ~(page - 1);
-    uintptr_t end = ((uintptr_t)rw(d, d->cache + d->high_words) + page - 1) & ~(page - 1);
-    if (end > start)
-        madvise((void *)start, end - start, d->rw_delta ? MADV_REMOVE : MADV_FREE);
-    d->high_words = 0;
+    /* 腾出地方：池满了，或者保留的代码超出上限。先去掉空的（重建它们很便宜），再去掉
+     * 最久没用的 */
+    struct appine_dbt *evicted[POOL_SIZE];
+    unsigned nevicted = 0;
     pthread_mutex_lock(&pool.lock);
-    if (pool.n < POOL_SIZE)
-        pool.free[pool.n++] = d;
-    else
-        keep = false;
+    while (pool.n && (pool.n == POOL_SIZE || pool.kept_words + words > POOL_KEEP_WORDS)) {
+        /* 腾代码的地方时去掉空的没有用 */
+        bool need_code = pool.kept_words + words > POOL_KEEP_WORDS;
+        int victim = -1;
+        for (unsigned i = 0; i < pool.n; i++) {
+            bool empty = !pool.free[i].key;
+            if (need_code && empty)
+                continue;
+            if (victim < 0) {
+                victim = (int)i;
+                continue;
+            }
+            bool victim_empty = !pool.free[victim].key;
+            if (empty != victim_empty ? empty : pool.free[i].when < pool.free[victim].when)
+                victim = (int)i;
+        }
+        if (victim < 0)
+            break;
+        evicted[nevicted++] = pool_take((unsigned)victim);
+    }
+    pool.free[pool.n++] = (struct pooled){d, key, ++pool.clock};
+    pool.kept_words += words;
     pthread_mutex_unlock(&pool.lock);
-    if (!keep)
-        release(d);
+    for (unsigned i = 0; i < nevicted; i++)
+        release(evicted[i]);
 }
 
-/* 把条件分支直接指向目标块；超出它的偏移范围时仍然经由桩跳转 */
-static void relink_branch(const struct appine_dbt *d, uint32_t *site, const uint32_t *target)
+/* 释放池里所有的实例（App 内存紧张时，保留的翻译可以重建） */
+void appine_dbt_trim(void)
 {
-    uint32_t *w = rw(d, site);
-    bool test = (*w & 0x7e000000) == 0x36000000; /* TBZ/TBNZ：14 位偏移，其余 19 位 */
-    intptr_t off = target - site, limit = (intptr_t)1 << (test ? 13 : 18);
-    if (off < -limit || off >= limit)
+    struct appine_dbt *evicted[POOL_SIZE];
+    pthread_mutex_lock(&pool.lock);
+    unsigned n = 0;
+    while (pool.n)
+        evicted[n++] = pool_take(pool.n - 1);
+    pthread_mutex_unlock(&pool.lock);
+    for (unsigned i = 0; i < n; i++)
+        release(evicted[i]);
+}
+
+static void release_thread(struct appine_dbt_thread *t)
+{
+    zfree(t->jc, JC_SIZE * sizeof(*t->jc));
+    zfree(t->rs, APPINE_PAGE_SIZE);
+    free(t->xlate);
+    zfree(t->scratch, MAX_BLOCK_WORDS * sizeof(*t->scratch));
+    zfree(t->probe, sizeof(*t->probe));
+    free(t->prep);
+    zfree(t, sizeof(*t));
+}
+
+/* 取得 d 的锁，记下这次的翻译、作废算在谁头上。持锁的时间都很短（装一个块、作废一批块），
+ * 先自旋一会儿，免得睡下再被叫醒（虚拟机里一次要几十微秒） */
+static void lock_dbt(struct appine_dbt *d, struct appine_dbt_stats *st)
+{
+    unsigned spin = 0;
+    while (pthread_mutex_trylock(&d->lock) != 0) {
+        if (++spin == 200) {
+            pthread_mutex_lock(&d->lock);
+            break;
+        }
+        __asm__ volatile("yield");
+    }
+    appine_guard_hold(&d->lock, false);
+    d->st = st;
+}
+
+static void unlock_dbt(struct appine_dbt *d)
+{
+    appine_guard_drop();
+    pthread_mutex_unlock(&d->lock);
+}
+
+struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
+{
+    pthread_mutex_lock(&pool.lock);
+    struct appine_dbt_thread *t = pool.nthreads ? pool.threads[--pool.nthreads] : NULL;
+    pthread_mutex_unlock(&pool.lock);
+    if (!t) {
+        t = zalloc(sizeof(*t));
+        if (!t)
+            return NULL;
+        t->jc = zalloc(JC_SIZE * sizeof(*t->jc));
+        t->rs = zalloc(APPINE_PAGE_SIZE); /* 按页对齐，也就按 1 KB 对齐 */
+        t->xlate = malloc(sizeof(*t->xlate));
+        t->scratch = zalloc(MAX_BLOCK_WORDS * sizeof(*t->scratch));
+        t->probe = zalloc(sizeof(*t->probe)); /* TLB 占一百多 KB，用不到的页不占内存 */
+        t->prep = malloc(sizeof(*t->prep));
+        if (!t->jc || !t->rs || !t->xlate || !t->scratch || !t->probe || !t->prep) {
+            release_thread(t);
+            return NULL;
+        }
+        appine_cpu_init(t->probe, NULL);
+        t->jc_dirty = true;
+    }
+    t->d = d;
+    t->cpu = NULL;
+    t->stats = (struct appine_dbt_stats){0};
+    if (t->jc_dirty)
+        clear_jump_cache(t);
+    lock_dbt(d, &t->stats);
+    t->generation = d->generation;
+    rs_reset(t);
+    t->next = d->threads;
+    d->threads = t;
+    __atomic_store_n(&d->nthreads, d->nthreads + 1, __ATOMIC_RELAXED);
+    unlock_dbt(d);
+    return t;
+}
+
+void appine_dbt_detach(struct appine_dbt_thread *t)
+{
+    if (!t)
         return;
-    uint32_t mask = (test ? 0x3fffu : 0x7ffffu) << 5;
-    *w = (*w & ~mask) | (((uint32_t)off << 5) & mask);
-    sync_range(d, site, site + 1);
+    struct appine_dbt *d = t->d;
+    lock_dbt(d, &spare_stats);
+    for (struct appine_dbt_thread **p = &d->threads; *p; p = &(*p)->next) {
+        if (*p == t) {
+            *p = t->next;
+            __atomic_store_n(&d->nthreads, d->nthreads - 1, __ATOMIC_RELAXED);
+            break;
+        }
+    }
+    unlock_dbt(d);
+    pthread_mutex_lock(&pool.lock);
+    bool keep = pool.nthreads < THREAD_POOL_SIZE;
+    if (keep)
+        pool.threads[pool.nthreads++] = t;
+    pthread_mutex_unlock(&pool.lock);
+    if (!keep)
+        release_thread(t);
+}
+
+void appine_dbt_flush(struct appine_dbt_thread *t)
+{
+    __atomic_store_n(&t->d->flush_wanted, true, __ATOMIC_SEQ_CST);
+}
+
+void appine_dbt_recheck(struct appine_dbt_thread *t)
+{
+    lock_dbt(t->d, &t->stats);
+    t->d->stale = t->d->table_count > 0;
+    unlock_dbt(t->d);
+}
+
+void appine_dbt_invalidate(struct appine_dbt_thread *t, uint64_t start, uint64_t len)
+{
+    lock_dbt(t->d, &t->stats);
+    invalidate_locked(t->d, start, len);
+    unlock_dbt(t->d);
 }
 
 /* 块翻译时的 guest 指令字和现在 `mmu` 里同一地址的是否相同；`page`/`host` 记着上一次
@@ -2473,7 +3141,7 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
 /*
  * 实例换了地址空间之后、第一次运行之前：逐块核对 guest 指令字，对不上的作废。和拷贝
  * 翻译模板时的核对是同一件事，只是一次做完，省掉逐块拷贝、重新链接和同步指令缓存。
- * 大部分都对不上时（exec 了别的程序）整体清空。
+ * 大部分都对不上时（exec 了别的程序）请求整体清空。持有锁
  */
 static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
 {
@@ -2489,30 +3157,72 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
         }
     }
     if (bad * 2 > live) {
-        appine_dbt_flush(d);
+        d->flush_wanted = true;
         return;
     }
     page = 1;
+    struct retire_batch r = {.n = 0};
     for (size_t i = 0; bad && i < d->table_count; i++) {
         struct block *b = &d->blocks[i];
         if (b->code && !block_matches(d, c->mmu, b, &page, &host)) {
-            if (!retire_block(d, b)) {
-                appine_dbt_flush(d);
-                return;
+            if (!retire_add(d, &r, b)) {
+                d->flush_wanted = true;
+                break;
             }
             bad--;
         }
     }
+    retire_flush(d, &r);
 }
 
-void appine_dbt_recheck(struct appine_dbt *d)
+/* 停下来等别人整体清空完。持有锁，等待期间放开 */
+static void park(struct appine_dbt *d)
 {
-    d->stale = d->table_count > 0;
+    __atomic_fetch_add(&d->parked, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&d->flushing, __ATOMIC_ACQUIRE) && !d->poisoned)
+        pthread_cond_wait(&d->flushed, &d->lock);
+    __atomic_fetch_sub(&d->parked, 1, __ATOMIC_SEQ_CST);
+}
+
+/*
+ * 整体清空：打断其他在 dbt_run 里的线程，等它们都停下来（park）或者离开 dbt_run，再
+ * 清空。持有锁进入和返回，等待期间放开锁，别的线程才走得到 park。已经有线程在做时一起
+ * 停下等它。
+ *
+ * 先置 flushing 再看各线程的 cpu，线程那边先登记 cpu、再计入 running、再看 flushing：
+ * 要么这里打断得到它，要么它看到 flushing 自己停下。等待时先读 parked 再读 running：
+ * 停下的线程在清空结束之前不会离开，这样算出来的"还在跑的"只会多不会少。
+ */
+static void flush_world(struct appine_dbt *d, struct appine_dbt_thread *self)
+{
+    if (__atomic_load_n(&d->flushing, __ATOMIC_RELAXED)) {
+        park(d);
+        return;
+    }
+    __atomic_store_n(&d->flushing, true, __ATOMIC_SEQ_CST);
+    for (struct appine_dbt_thread *t = d->threads; t; t = t->next) {
+        struct appine_cpu *c = __atomic_load_n(&t->cpu, __ATOMIC_SEQ_CST);
+        if (t != self && c)
+            appine_cpu_kick(c);
+    }
+    unlock_dbt(d);
+    for (;;) {
+        unsigned parked = __atomic_load_n(&d->parked, __ATOMIC_SEQ_CST);
+        unsigned running = __atomic_load_n(&d->running, __ATOMIC_SEQ_CST);
+        if (running - parked <= 1)
+            break;
+        sched_yield();
+    }
+    lock_dbt(d, &self->stats);
+    flush_locked(d);
+    __atomic_store_n(&d->flushing, false, __ATOMIC_SEQ_CST);
+    pthread_cond_broadcast(&d->flushed);
 }
 
 static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
 {
-    struct appine_dbt *d = ctx;
+    struct appine_dbt_thread *t = ctx;
+    struct appine_dbt *d = t->d;
     uint64_t (*enter)(struct appine_cpu *, uint32_t *) =
         (uint64_t(*)(struct appine_cpu *, uint32_t *))(uintptr_t)d->enter;
     uint32_t *patch_site = NULL, *patch_branch_site = NULL;
@@ -2520,37 +3230,109 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
     bool patch_forward = false;
     bool fill_jump_cache = false;
 
-    if (UNLIKELY(d->stale))
-        recheck(d, c);
-    c->dbt_jump_cache = d->jc;
-    if (((uintptr_t)c->dbt_rs & ~(uintptr_t)((1u << RS_SHIFT) - 1)) != (uintptr_t)d->rs)
-        c->dbt_rs = d->rs;
+    if (UNLIKELY(d->stale)) {
+        lock_dbt(d, &t->stats);
+        if (d->stale)
+            recheck(d, c);
+        unlock_dbt(d);
+    }
+    c->dbt_jump_cache = t->jc;
+    t->jc_dirty = true; /* 查表例程会往里填 */
+    if (((uintptr_t)c->dbt_rs & ~(uintptr_t)((1u << RS_SHIFT) - 1)) != (uintptr_t)t->rs)
+        c->dbt_rs = t->rs;
     for (;;) {
+        /* 有人要整体清空：一起停下，或者自己来做 */
+        if (UNLIKELY(__atomic_load_n(&d->flushing, __ATOMIC_SEQ_CST) ||
+                     __atomic_load_n(&d->flush_wanted, __ATOMIC_SEQ_CST))) {
+            lock_dbt(d, &t->stats);
+            if (d->flushing)
+                park(d);
+            else if (d->flush_wanted)
+                flush_world(d, t);
+            unlock_dbt(d);
+            patch_site = NULL;
+        }
+        thread_catch_up(t);
         if (UNLIKELY(__atomic_load_n(&c->pending, __ATOMIC_RELAXED)) &&
             __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE))
             return APPINE_EXIT_KICK;
 
-        uint32_t *code = table_lookup(d, c->pc);
-        if (!code)
-            code = translate(d, c, c->pc);
+        uint32_t *code = table_lookup(d, c, c->pc);
+        if (!code) {
+            /* 不持锁翻译，持锁装进去 */
+            bool fetched = prepare(t, c, c->pc);
+            lock_dbt(d, &t->stats);
+            if (__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) || d->flush_wanted) {
+                unlock_dbt(d);
+                continue;
+            }
+            struct syncs sync = {.n = 0};
+            struct fresh f = {.code = NULL};
+            /* 只有这一个线程时，新块和链接点一起同步一次；否则新块先同步、放进表里，
+             * 别的线程才可能跳过去 */
+            bool alone = d->threads == t && !t->next;
+            /* 别的线程可能刚装进去同一个块 */
+            code = table_find(d->table, c->pc);
+            if (!code && fetched) {
+                code = install(d, t->prep, &sync, &f);
+                if (code == NEED_FLUSH) {
+                    flush_world(d, t);
+                    unlock_dbt(d);
+                    patch_site = NULL;
+                    continue;
+                }
+                if (code == STALE) {
+                    unlock_dbt(d);
+                    continue;
+                }
+                if (!alone) {
+                    sync_all(d, &sync);
+                    table_insert(d, f.pc, f.code, f.guest, f.nguest);
+                }
+            }
+            /* 持锁时表里只有有效的块：回填的目标不会是作废块（它的入口跳往自己） */
+            uint32_t *target = code && patch_forward ? code + ENTRY_CHECK_WORDS : code;
+            if (code && patch_site && patch_generation == d->generation && target != patch_site) {
+                *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
+                sync_add(&sync, patch_site, patch_site + 1);
+                /* 条件分支不在 CMODX 允许并发修改的指令里：有别的线程时不改它 */
+                if (patch_branch_site && alone && relink_word(d, patch_branch_site, target))
+                    sync_add(&sync, patch_branch_site, patch_branch_site + 1);
+            }
+            sync_all(d, &sync);
+            if (f.code && alone)
+                table_insert(d, f.pc, f.code, f.guest, f.nguest);
+            unlock_dbt(d);
+            patch_site = NULL;
+        } else if (patch_site) {
+            /*
+             * 目标已经翻译过：不持锁回填链接。b 改成 b 可以并发修改；整体清空要等这个线程
+             * 停下，不会同时发生。不持锁查到的可能是刚被作废的块，它不会是回填位置本身以外
+             * 的东西：作废块的入口跳往转发桩，转发桩照样退出到这里
+             */
+            uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
+            if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
+                target != patch_site) {
+                struct syncs sync = {.n = 0};
+                __atomic_store_n(rw(d, patch_site), enc_b((intptr_t)target - (intptr_t)patch_site),
+                                 __ATOMIC_RELAXED);
+                sync_add(&sync, patch_site, patch_site + 1);
+                if (patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1 &&
+                    relink_word(d, patch_branch_site, target))
+                    sync_add(&sync, patch_branch_site, patch_branch_site + 1);
+                sync_all(d, &sync);
+            }
+            patch_site = NULL;
+        }
         if (!code) { /* 无法取指：让 Tier 0 报告精确的 fault */
             enum appine_exit r = appine_interp_step(c);
             if (r != APPINE_EXIT_NONE)
                 return r;
-            patch_site = NULL;
             continue;
         }
-        if (patch_site && patch_generation == d->generation) {
-            uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
-            *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
-            sync_range(d, patch_site, patch_site + 1);
-            if (patch_branch_site)
-                relink_branch(d, patch_branch_site, target);
-        }
-        patch_site = NULL;
         if (fill_jump_cache) {
-            d->jc[(c->pc >> 2) & (JC_SIZE - 1)] = (struct slot){c->pc, code};
-            d->jc_dirty = true;
+            t->jc[(c->pc >> 2) & (JC_SIZE - 1)] = (struct slot){c->pc, code};
+            t->jc_dirty = true;
             fill_jump_cache = false;
         }
 
@@ -2558,91 +3340,129 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         switch (reason & REASON_MASK) {
         case R_CHAIN:
         case R_CHAIN_FWD:
-            d->stats.exits_chain++;
+            t->stats.exits_chain++;
             patch_site = (uint32_t *)(uintptr_t)c->dbt_site;
             patch_branch_site = reason >> REASON_BITS ? patch_site - (reason >> REASON_BITS) : NULL;
-            patch_generation = d->generation;
+            patch_generation = __atomic_load_n(&d->generation, __ATOMIC_RELAXED);
             patch_forward = (reason & REASON_MASK) == R_CHAIN_FWD;
             break;
         case R_LOOKUP:
-            d->stats.exits_lookup++;
+            t->stats.exits_lookup++;
             fill_jump_cache = true;
             break;
         case R_UNGROUP:
+            lock_dbt(d, &t->stats);
             ungroup(d, c->pc);
+            unlock_dbt(d);
             /* fallthrough */
         case R_INTERP: {
-            d->stats.exits_interp++;
+            t->stats.exits_interp++;
             enum appine_exit r = appine_interp_step(c);
             if (r != APPINE_EXIT_NONE)
                 return r;
+            if (UNLIKELY(c->ivau_page)) { /* dsb、isb：交出 ic ivau 记下的页 */
+                c->fault_addr = c->ivau_page;
+                c->ivau_page = 0;
+                return APPINE_EXIT_CODE;
+            }
             break;
         }
         case R_SVC:
-            d->stats.exits_svc++;
+            t->stats.exits_svc++;
             c->exit_info = 0;
             c->excl_size = 0; /* 与 Tier 0 一样：异常返回清掉独占标记 */
             return APPINE_EXIT_SVC;
         default:
-            d->stats.exits_kick++;
+            t->stats.exits_kick++;
             break;
         }
     }
 }
 
-enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
+enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *c)
 {
-    enum appine_exit r = appine_guard_run(dbt_run, d, c);
+    struct appine_dbt *d = t->d;
+    /* 宿主故障作废了这个实例：其余线程用 Tier 0 跑到进程被结束 */
+    if (UNLIKELY(d->poisoned))
+        return appine_cpu_run(c);
+    /* 先登记 cpu、再计入 running（见 flush_world） */
+    __atomic_store_n(&t->cpu, c, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&d->running, 1, __ATOMIC_SEQ_CST);
+    enum appine_exit r = appine_guard_run(dbt_run, t, c);
     if (UNLIKELY(r == APPINE_EXIT_HOST_FAULT)) {
+        /* guard 已经放开了持有的锁。停着等清空的线程不能一直等下去 */
+        pthread_mutex_lock(&d->lock);
         d->poisoned = true;
-        template_clear();
+        __atomic_store_n(&d->flushing, false, __ATOMIC_SEQ_CST);
+        pthread_cond_broadcast(&d->flushed);
+        pthread_mutex_unlock(&d->lock);
+        template_clear(false);
     }
+    __atomic_fetch_sub(&d->running, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&t->cpu, NULL, __ATOMIC_RELEASE);
     return r;
 }
 
-void appine_dbt_get_stats(const struct appine_dbt *d, struct appine_dbt_stats *out)
+void appine_dbt_get_stats(const struct appine_dbt_thread *t, struct appine_dbt_stats *out)
 {
-    *out = d->stats;
+    *out = t->stats;
 }
 
 #else /* !DBT_SUPPORTED */
 
-struct appine_dbt *appine_dbt_new(void)
+struct appine_dbt *appine_dbt_new(uint64_t key)
 {
+    (void)key;
     return NULL;
 }
 
-void appine_dbt_free(struct appine_dbt *d)
+void appine_dbt_free(struct appine_dbt *d, uint64_t key)
 {
     (void)d;
+    (void)key;
 }
 
-void appine_dbt_flush(struct appine_dbt *d)
+void appine_dbt_trim(void)
 {
-    (void)d;
 }
 
-void appine_dbt_recheck(struct appine_dbt *d)
+struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
 {
     (void)d;
+    return NULL;
 }
 
-void appine_dbt_invalidate(struct appine_dbt *d, uint64_t start, uint64_t len)
+void appine_dbt_detach(struct appine_dbt_thread *t)
 {
-    (void)d;
+    (void)t;
+}
+
+void appine_dbt_flush(struct appine_dbt_thread *t)
+{
+    (void)t;
+}
+
+void appine_dbt_recheck(struct appine_dbt_thread *t)
+{
+    (void)t;
+}
+
+void appine_dbt_invalidate(struct appine_dbt_thread *t, uint64_t start, uint64_t len)
+{
+    (void)t;
     (void)start;
     (void)len;
 }
 
-enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
+enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *c)
 {
-    (void)d;
+    (void)t;
     return appine_cpu_run(c);
 }
 
-void appine_dbt_get_stats(const struct appine_dbt *d, struct appine_dbt_stats *out)
+void appine_dbt_get_stats(const struct appine_dbt_thread *t, struct appine_dbt_stats *out)
 {
-    (void)d;
+    (void)t;
     memset(out, 0, sizeof(*out));
 }
 

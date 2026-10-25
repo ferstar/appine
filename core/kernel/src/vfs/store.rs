@@ -139,18 +139,63 @@ struct Touched {
     inos: Vec<Ino>,
 }
 
+/// 缓存的哈希：键是 inode 号和文件名，不必抵御哈希碰撞攻击，用 FxHash（rustc 的做法）。
+/// 默认的 SipHash 在 `ls`、`git status` 的 stat 路径上占 4–5%。
+#[derive(Default, Clone, Copy)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        const SEED: u64 = 0x517c_c1b7_2722_0a95;
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type Map<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
 /// 元数据缓存。条目对应提交计数为 `generation` 时数据库的内容。
 #[derive(Default)]
 struct Cache {
     generation: u64,
     entries: usize,
     /// 目录 → 名字 → inode（None 表示不存在）。
-    dentries: HashMap<Ino, HashMap<Vec<u8>, Option<Ino>>>,
-    rows: HashMap<Ino, Stat>,
-    targets: HashMap<Ino, Vec<u8>>,
-    parents: HashMap<Ino, Ino>,
+    dentries: Map<Ino, Map<Vec<u8>, Option<Ino>>>,
+    rows: Map<Ino, Stat>,
+    targets: Map<Ino, Vec<u8>>,
+    parents: Map<Ino, Ino>,
+    /// 目录 → inode → 目录里指向它的一个名字（[`Store::name_of`]，None 表示没有）。
+    names: Map<Ino, Map<Ino, Option<Vec<u8>>>>,
     /// 目录的完整列表（readdir）。
-    listings: HashMap<Ino, Vec<DirEntry>>,
+    listings: Map<Ino, Vec<DirEntry>>,
 }
 
 impl Cache {
@@ -440,6 +485,7 @@ impl Store {
                 d.remove(name);
             }
             c.listings.remove(dir);
+            c.names.remove(dir);
         }
         for ino in &touched.inos {
             c.rows.remove(ino);
@@ -543,15 +589,38 @@ impl Store {
         Ok(found)
     }
 
-    /// 目录 `parent` 里指向 `ino` 的一个名字（getcwd 用）。
+    /// 目录 `parent` 里指向 `ino` 的一个名字（getcwd 用；打开相对路径时也要算出绝对路径，
+    /// 见 `syscall::fs` 的 `display_path`，所以要缓存）。
     pub fn name_of(&self, parent: Ino, ino: Ino) -> Result<Option<Vec<u8>>, Errno> {
-        self.db
+        let generation = self.cache_generation();
+        if generation.is_some()
+            && let Some(hit) = self
+                .cache
+                .borrow()
+                .names
+                .get(&parent)
+                .and_then(|d| d.get(&ino))
+        {
+            return Ok(hit.clone());
+        }
+        self.begin_read()?;
+        let found: Option<Vec<u8>> = self
+            .db
             .prepare_cached(
                 "SELECT name FROM dentries WHERE parent = ?1 AND ino = ?2 ORDER BY name LIMIT 1",
             )
             .and_then(|mut st| st.query_row(params![parent, ino], |row| row.get(0)))
             .optional()
-            .map_err(db_err)
+            .map_err(db_err)?;
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            let mut c = self.cache.borrow_mut();
+            c.entries += 1;
+            c.names
+                .entry(parent)
+                .or_default()
+                .insert(ino, found.clone());
+        }
+        Ok(found)
     }
 
     /// 读取元数据。普通文件的 size 和 mtime 取自宿主 object 文件。

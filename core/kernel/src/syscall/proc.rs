@@ -840,7 +840,8 @@ fn wait_child(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        // 子进程的状态变化不是打开文件上的修改（crate::kernel::wake）
+        cx.wait_on(None, &mut [], crate::kernel::wake::OTHER)?;
     }
 }
 

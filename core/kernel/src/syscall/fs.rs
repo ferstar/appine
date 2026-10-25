@@ -14,7 +14,7 @@ use super::{IO_CHUNK, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, Kernel, Tid, request_wake};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_files};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -1104,7 +1104,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
                 return Err(Errno::EBUSY);
             }
             p.capacity = size;
-            request_wake();
+            request_wake_files();
             Ok(size as u64)
         }
         // 只有 memfd 能加封印
@@ -2359,7 +2359,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
             if let Some(locks) = cx.k().flocks.get_mut(&ino) {
                 locks.retain(|(f, _)| !f.ptr_eq(&me));
             }
-            request_wake();
+            request_wake_files();
             return Ok(0);
         }
         _ => return Err(Errno::EINVAL),
@@ -2675,7 +2675,7 @@ fn pipe_read(
                 for (d, s) in buf.iter_mut().zip(p.buf.drain(..n)) {
                     *d = s;
                 }
-                request_wake();
+                request_wake_files();
                 return Ok(n);
             }
             if p.writers == 0 {
@@ -2788,7 +2788,7 @@ pub(super) fn splice(
         let data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
         let n = write_bytes(cx, &output, &data, dst)?;
         pipe.borrow_mut().buf.drain(..n);
-        request_wake();
+        request_wake_files();
         n
     } else {
         let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
@@ -2877,7 +2877,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
         }
     }
     pipe.borrow_mut().buf.extend(&data);
-    request_wake();
+    request_wake_files();
     Ok(data.len() as u64)
 }
 
@@ -2910,7 +2910,7 @@ fn pipe_write(
                 let n = want.min(space);
                 p.buf.extend(&data[done..done + n]);
                 done += n;
-                request_wake();
+                request_wake_files();
                 true
             } else {
                 false
@@ -2935,6 +2935,54 @@ fn pipe_write(
 }
 
 /// 仓库里的文件和设备：不会阻塞，直接在持有借用时完成。
+/// 普通文件的宿主 fd：读写它时可以放开 BKL（[`unlocked_io`]）。
+fn regular_fd(f: &OpenFile) -> Option<i32> {
+    match &f.kind {
+        FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
+        _ => None,
+    }
+}
+
+/// 不持 BKL 读写普通文件：冷数据的宿主 pread/pwrite 要等闪存（百微秒到毫秒），持锁时
+/// 所有进程的系统调用都得跟着等。`offset` 为 None 时用文件位置，同一个打开文件同时只有
+/// 一次这样的读写（Linux 的 f_pos_lock），别的等它做完。`io` 在放开 BKL 时以宿主 fd 和
+/// 位置调用，不能访问任何内核对象；打开文件由调用方手里的 `file` 保活，放锁期间不碰它的
+/// 引用计数和借用。
+fn unlocked_io(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    fd: i32,
+    offset: Option<u64>,
+    io: impl FnOnce(i32, u64) -> Result<usize, i32>,
+) -> Result<usize, Errno> {
+    let pos = match offset {
+        Some(off) => off,
+        None => {
+            while file.borrow().pos_busy != 0 {
+                if cx.task.killed.get() {
+                    return Err(Errno::EINTR);
+                }
+                file.borrow_mut().pos_busy = 2;
+                cx.wait_on(None, &mut [], crate::kernel::wake::FILE)?;
+            }
+            let mut f = file.borrow_mut();
+            f.pos_busy = 1;
+            f.pos
+        }
+    };
+    let r = cx.unlocked(|| io(fd, pos));
+    if offset.is_none() {
+        let mut f = file.borrow_mut();
+        if let Ok(n) = r {
+            f.pos = pos + n as u64;
+        }
+        if std::mem::take(&mut f.pos_busy) == 2 {
+            request_wake_files();
+        }
+    }
+    r.map_err(Errno)
+}
+
 fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<usize, Errno> {
     let pos = offset.unwrap_or(f.pos);
     let n = match &f.kind {
@@ -3046,7 +3094,13 @@ fn read_bytes(
             Ok(n)
         }
         IoPath::Local => {
-            let n = local_read(&mut file.borrow_mut(), buf, offset)?;
+            let regular = regular_fd(&file.borrow());
+            let n = match regular {
+                Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
+                    appine_hal::pread(fd, buf, pos)
+                })?,
+                None => local_read(&mut file.borrow_mut(), buf, offset)?,
+            };
             if n > 0 {
                 inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
             }
@@ -3102,7 +3156,15 @@ fn write_bytes(
                 let cred = cx.cred();
                 pseudo::write(cx.k(), &cred, &node, data)?;
             }
-            let n = local_write(&mut file.borrow_mut(), data, offset)?;
+            // 普通文件不持 BKL 写；O_APPEND 仍持锁做，几个进程同时追加时不会互相覆盖
+            let regular = regular_fd(&file.borrow())
+                .filter(|_| offset.is_some() || file.borrow().flags & oflags::O_APPEND == 0);
+            let n = match regular {
+                Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
+                    appine_hal::pwrite(fd, data, pos)
+                })?,
+                None => local_write(&mut file.borrow_mut(), data, offset)?,
+            };
             if n > 0 {
                 inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
             }
@@ -3176,7 +3238,7 @@ pub(super) fn read_file(
         if k > 0 {
             file.borrow_mut().reads += 1;
             if file.borrow().flags & oflags::O_ASYNC != 0 {
-                request_wake();
+                request_wake_files();
             }
         }
         if let Err(e) = cx.mm().write(

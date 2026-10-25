@@ -187,10 +187,12 @@ impl CodeLog {
         if self.entries.front().is_none_or(|e| e.0 > seen + 1) {
             return None;
         }
+        // 代数递增：二分找到起点，只看错过的那几条（JVM 下整个记录有上万条）
+        let first = self.entries.partition_point(|e| e.0 <= seen);
         Some(
             self.entries
-                .iter()
-                .filter(|e| e.0 > seen && e.0 <= now)
+                .range(first..)
+                .take_while(|e| e.0 <= now)
                 .map(|e| (e.1, e.2))
                 .collect(),
         )
@@ -205,6 +207,13 @@ pub struct Generations {
     pub code: Arc<AtomicU64>,
     /// 每个代码代数作废的范围。
     pub log: Arc<Mutex<CodeLog>>,
+}
+
+/// 一个地址空间的 Tier 1 翻译，这个地址空间里的线程共用（[`Mm::code_space`]）。
+pub struct CodeSpace {
+    pub space: Arc<appine_engine::DbtSpace>,
+    /// 已经按代码失效的记录作废到的代码代数：第一个看到新代数的线程作废一次就够了。
+    pub seen: Mutex<u64>,
 }
 
 /// 一个 guest 进程的地址空间。
@@ -227,6 +236,8 @@ pub struct Mm {
     code_log: Arc<Mutex<CodeLog>>,
     /// 正在使用这个地址空间的线程。
     users: Vec<Arc<TaskSync>>,
+    /// Tier 1 的翻译，第一个线程开始运行时创建（[`Mm::code_space`]）。
+    code_space: Option<Arc<CodeSpace>>,
     /// membarrier(2) 登记过的命令（`MEMBARRIER_CMD_REGISTER_*`）。
     pub membarrier: i32,
     /// `mlockall(MCL_FUTURE)`：以后的映射也锁住。
@@ -330,6 +341,7 @@ impl Mm {
             code_generation: Arc::new(AtomicU64::new(0)),
             code_log: Arc::default(),
             users: Vec::new(),
+            code_space: None,
             membarrier: 0,
             lock_future: false,
             lock_onfault: false,
@@ -374,6 +386,18 @@ impl Mm {
         })
     }
 
+    /// 这个地址空间的 Tier 1 翻译，没有时创建；宿主不支持 Tier 1 时返回 None。创建时优先
+    /// 拿回池里同一个程序（按可执行文件的 inode）留下的翻译，它在第一次运行之前逐块核对。
+    pub fn code_space(&mut self) -> Option<Arc<CodeSpace>> {
+        if self.code_space.is_none() {
+            self.code_space = Some(Arc::new(CodeSpace {
+                space: appine_engine::DbtSpace::new(self.exe.unwrap_or(0))?,
+                seen: Mutex::new(self.code_generation.load(Ordering::SeqCst)),
+            }));
+        }
+        self.code_space.clone()
+    }
+
     /// shootdown 的代数、代码的代数和代码失效的记录（[`Mm::sync`]）。
     pub fn generations(&self) -> Generations {
         Generations {
@@ -405,7 +429,7 @@ impl Mm {
     }
 
     /// 如果有映射被拆除或降低了权限，做一次 TLB shootdown，然后释放被解除映射的宿主内存；
-    /// 有代码要作废时同样等所有使用者退出 guest 代码。
+    /// 只有代码要作废时只记下范围、改代数。
     ///
     /// 调用方持有 BKL；`current` 是调用线程，它自己在重新进入 guest 代码之前刷新。
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
@@ -421,6 +445,13 @@ impl Mm {
             let generation = self.code_generation.load(Ordering::Relaxed) + 1;
             self.code_log.lock().unwrap().push(generation, &code);
             self.code_generation.store(generation, Ordering::SeqCst);
+        }
+        if !dirty && self.graveyard.is_empty() {
+            // 只有代码变了（JIT 的 ic ivau）：翻译由这个地址空间的线程共用，改代码的线程
+            // 重新进入 guest 代码之前作废一次，作废块的入口就跳往转发桩了，其他使用者不必
+            // 打断。在那之前它们可能还执行旧的翻译，与硬件上别的核在上下文同步之前可能还执行
+            // 旧指令一样。要等的是 membarrier 的 SYNC_CORE（它调用 quiesce）
+            return;
         }
         if dirty {
             self.generation.fetch_add(1, Ordering::SeqCst);
