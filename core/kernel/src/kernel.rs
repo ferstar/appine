@@ -103,6 +103,8 @@ pub(crate) struct Kernel {
     waiters: Vec<Arc<Event>>,
     /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
     pub edge_waiters: Vec<Arc<Event>>,
+    /// inotify 的所有监视。打开文件析构时要报告 `IN_CLOSE_*`，所以用 Rc 共享。
+    pub inotify: Rc<RefCell<crate::syscall::Registry>>,
 }
 
 // SAFETY: Kernel 及其中的 Rc/RefCell 只在持有 BKL（Shared::kernel 这把锁）时访问，
@@ -142,6 +144,7 @@ impl Kernel {
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
+            inotify: Rc::default(),
         }
     }
 

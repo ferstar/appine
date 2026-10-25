@@ -335,15 +335,18 @@ pub(super) fn execve(
     if super::fs::open_for_write(cx, st.ino) {
         return Err(Errno::ETXTBSY);
     }
-    // /proc/<pid>/exe 和 maps 里显示的绝对路径
-    let exe: Rc<[u8]> = Rc::from(if file_path.starts_with(b"/") {
-        normalize(&file_path)
-    } else {
-        let mut p = vfs.path_of(&view, &root, &cwd)?;
-        p.push(b'/');
-        p.extend_from_slice(&file_path);
-        normalize(&p)
-    });
+    // /proc/<pid>/exe 和 maps 里显示的绝对路径，符号链接全部解析：musl 按它展开主程序
+    // 的 `$ORIGIN`，经由 /usr/bin/java 这种链接启动的程序靠它找到自己的库
+    let exe: Rc<[u8]> = match vfs.real_path(&view, &cred, &root, &cwd, &file_path) {
+        Ok(p) => Rc::from(p),
+        Err(_) if file_path.starts_with(b"/") => Rc::from(normalize(&file_path)),
+        Err(_) => {
+            let mut p = vfs.path_of(&view, &root, &cwd)?;
+            p.push(b'/');
+            p.extend_from_slice(&file_path);
+            Rc::from(normalize(&p))
+        }
+    };
 
     // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后不再生效）；脚本看的是解释器
     let no_new_privs = cx.t.group.borrow().no_new_privs;

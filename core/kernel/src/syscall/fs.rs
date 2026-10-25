@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use super::SocketRef;
-use super::{IO_CHUNK, SysResult, get, put, read_path, tty};
+use super::{IO_CHUNK, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
@@ -131,7 +131,7 @@ fn host_errno(e: std::io::Error) -> Errno {
 // ---- 路径 ----
 
 /// `*at` 系列的起点目录。路径为空时直接 ENOENT（不看 dirfd），与 Linux 相同。
-fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
+pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
@@ -383,7 +383,8 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         FileKind::Epoll(_)
         | FileKind::EventFd(_)
         | FileKind::TimerFd(_)
-        | FileKind::SignalFd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        | FileKind::SignalFd(_)
+        | FileKind::Inotify(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         FileKind::Pty(end) => {
             let n = end.tty.borrow().index;
             Ok(anon(
@@ -417,10 +418,11 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
     let cred = cx.cred();
 
     let root = cx.root();
-    let resolved = vfs.resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow);
-    let (node, created) = match resolved {
+    let resolved = vfs.walk(&cx.view(&vfs), &cred, &root, &start, &path, follow);
+    // parent 是最后经过的目录和名字，报告 inotify 事件用
+    let (node, created, parent) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
-        Ok(node) => (node, None),
+        Ok((node, found)) => (node, None, found),
         Err(e) if e == Errno::ENOENT && create => {
             // 最后一个组件是悬空的符号链接时，与 Linux 一样沿着它新建目标文件
             let (mut start, mut path) = (start.clone(), path.clone());
@@ -447,13 +449,22 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
                 let dir_st = may_create(vfs.store(), &cred, dir, name)?;
                 let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
                 let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
-                break (Node::Store(ino), Some(file));
+                break (
+                    Node::Store(ino),
+                    Some(file),
+                    Some((Node::Store(dir), name.to_vec())),
+                );
             }
         }
         Err(e) => return Err(e),
     };
 
     let mut display = display_path(cx, &vfs, &start, &path);
+    let was_created = created.is_some();
+    let opened_ino = match &node {
+        Node::Store(ino) if flags & oflags::O_PATH == 0 => Some(*ino),
+        _ => None,
+    };
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
@@ -472,9 +483,47 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
     }
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
     let file = OpenFile::with_path(kind, flags & keep, display);
+    if let Some(ino) = opened_ino {
+        open_events(cx, &file, ino, parent, was_created, flags);
+    }
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)
         .map(|fd| fd as u64)
+}
+
+/// open 的 inotify 事件，顺序与 Linux 相同：新建（报给目录）、`O_TRUNC` 截断、打开。
+/// 有监视时给打开文件挂上 [`inotify::Opened`]。
+fn open_events(
+    cx: &Cx<'_>,
+    file: &FileRef,
+    ino: Ino,
+    parent: Option<(Node, Vec<u8>)>,
+    created: bool,
+    flags: u32,
+) {
+    let k = cx.kr();
+    if !inotify::active(k) {
+        return;
+    }
+    let parent = match &parent {
+        Some((Node::Store(dir), name)) => Some((*dir, name.as_slice())),
+        _ => None,
+    };
+    let (dir, truncated) = {
+        let f = file.borrow();
+        let regular = matches!(f.kind, FileKind::Regular { .. });
+        let dir = matches!(f.kind, FileKind::Directory { .. });
+        let truncated = regular && f.writable() && flags & oflags::O_TRUNC != 0;
+        (if dir { inotify::IN_ISDIR } else { 0 }, truncated)
+    };
+    match parent {
+        Some((d, name)) if created => inotify::dir_event(k, d, name, inotify::IN_CREATE, 0),
+        _ if truncated => inotify::path_event(k, ino, parent, inotify::IN_MODIFY),
+        _ => {}
+    }
+    inotify::path_event(k, ino, parent, inotify::IN_OPEN | dir);
+    let watch = inotify::opened(k, &file.borrow(), parent);
+    file.borrow_mut().watch = watch;
 }
 
 /// 文件句柄（`struct file_handle`）里的类型和长度：句柄就是仓库里的 inode 编号。
@@ -1194,6 +1243,10 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             let n = end.pipe.borrow().buf.len() as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
         }
+        FileKind::Inotify(i) if request == FIONREAD => {
+            let n = i.borrow().pending() as i32;
+            return put(cx, arg, n.to_le_bytes()).map(|()| 0);
+        }
         _ => return Err(Errno::ENOTTY),
     };
     let Some(&(_, size, out)) = TTY_IOCTLS.iter().find(|(r, ..)| *r == request) else {
@@ -1506,6 +1559,13 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     let dir_st = may_create(vfs.store(), &cred, dir, name)?;
     let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, true);
     vfs.store().mkdir(dir, name, perm, uid, gid)?;
+    inotify::dir_event(
+        cx.kr(),
+        dir,
+        name,
+        inotify::IN_CREATE | inotify::IN_ISDIR,
+        0,
+    );
     Ok(0)
 }
 
@@ -1541,6 +1601,7 @@ pub(super) fn mknodat(
         vfs.store()
             .mknod(dir, name, kind | perm, dev & 0xffff_ffff, uid, gid)?;
     }
+    inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
 }
 
@@ -1553,6 +1614,12 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
     let store_vfs = cx.vfs()?;
     let store = store_vfs.store();
     let cred = cx.cred();
+    // 有 inotify 监视时先记下要删除的 inode
+    let victim = match name {
+        b"." | b".." => None,
+        _ if inotify::active(cx.kr()) => store.lookup(dir, name)?,
+        _ => None,
+    };
     if flags & AT_REMOVEDIR != 0 {
         match name {
             b"." => return Err(Errno::EINVAL),
@@ -1561,6 +1628,11 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
                 may_delete(store, &cred, dir, name)?;
                 store.rmdir(dir, name)?;
             }
+        }
+        if let Some(ino) = victim {
+            let k = cx.kr();
+            inotify::path_event(k, ino, None, inotify::IN_DELETE_SELF);
+            inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
         }
     } else {
         if name == b"." || name == b".." {
@@ -1577,8 +1649,22 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
         }
         may_delete(store, &cred, dir, name)?;
         store.unlink(dir, name)?;
+        if let Some(ino) = victim {
+            unlinked_events(cx, store, ino);
+            inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
+        }
     }
     Ok(0)
+}
+
+/// 去掉了文件 `ino` 的一个链接（unlink、被 rename 覆盖）：链接数变了（IN_ATTRIB），
+/// 最后一个链接也没了时 IN_DELETE_SELF。这两个事件只报给文件自己。
+fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino) {
+    let k = cx.kr();
+    inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
+    if store.stat(ino).map_or(0, |st| st.nlink) == 0 {
+        inotify::path_event(k, ino, None, inotify::IN_DELETE_SELF);
+    }
 }
 
 pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> SysResult {
@@ -1597,6 +1683,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     let dir_st = may_create(vfs.store(), &cred, dir, name)?;
     let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
     vfs.store().symlink(dir, name, &target, uid, gid)?;
+    inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
 }
 
@@ -1635,6 +1722,8 @@ pub(super) fn linkat(
     reject_trailing_slash(vfs.store(), dir, name, &newpath)?;
     may_create(vfs.store(), &cred, dir, name)?;
     vfs.store().link(dir, name, src)?;
+    inotify::path_event(cx.kr(), src, None, inotify::IN_ATTRIB);
+    inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
 }
 
@@ -1669,21 +1758,61 @@ pub(super) fn renameat2(
     {
         return Err(Errno::ENOTDIR);
     }
+    let exchange = flags & RENAME_EXCHANGE != 0;
     may_rename(
         vfs.store(),
         &cx.cred(),
         (old_dir, old_name),
         (new_dir, new_name),
-        flags & RENAME_EXCHANGE != 0,
+        exchange,
     )?;
+    // 有 inotify 监视时先记下两边的 inode 和它们是不是目录
+    let entry = |dir, name| -> Result<Option<(Ino, u32)>, Errno> {
+        match vfs.store().lookup(dir, name)? {
+            Some(ino) if vfs.store().stat(ino)?.is_dir() => Ok(Some((ino, inotify::IN_ISDIR))),
+            Some(ino) => Ok(Some((ino, 0))),
+            None => Ok(None),
+        }
+    };
+    let (src, dst) = if inotify::active(cx.kr()) {
+        (entry(old_dir, old_name)?, entry(new_dir, new_name)?)
+    } else {
+        (None, None)
+    };
     vfs.store().rename(
         old_dir,
         old_name,
         new_dir,
         new_name,
         flags & RENAME_NOREPLACE != 0,
-        flags & RENAME_EXCHANGE != 0,
+        exchange,
     )?;
+    // 顺序与 Linux 的 fsnotify_move 相同；交换时另一边再移动一次
+    let k = cx.kr();
+    let moved = |isdir: u32, from: (Ino, &[u8]), to: (Ino, &[u8])| {
+        let cookie = inotify::cookie(k);
+        inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
+        inotify::dir_event(k, to.0, to.1, inotify::IN_MOVED_TO | isdir, cookie);
+    };
+    if let Some(src) = src {
+        moved(src.1, (old_dir, old_name), (new_dir, new_name));
+        match dst {
+            Some(dst) if exchange => {
+                inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF);
+                moved(dst.1, (new_dir, new_name), (old_dir, old_name));
+                inotify::path_event(k, dst.0, None, inotify::IN_MOVE_SELF);
+            }
+            Some((replaced, isdir)) => {
+                inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF);
+                if isdir != 0 {
+                    inotify::path_event(k, replaced, None, inotify::IN_DELETE_SELF);
+                } else {
+                    unlinked_events(cx, vfs.store(), replaced);
+                }
+            }
+            None => inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF),
+        }
+    }
     Ok(0)
 }
 
@@ -1716,12 +1845,36 @@ fn may_rename(
 pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
     let ino = store_ino(&lookup_at(cx, dirfd, &path, true)?)?;
-    chmod(cx, ino, perm)
+    chmod(cx, ino, perm)?;
+    attrib_at(cx, ino, dirfd, &path, true);
+    Ok(0)
 }
 
 pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
     let ino = file_ino(cx, fd)?;
-    chmod(cx, ino, perm)
+    chmod(cx, ino, perm)?;
+    attrib_fd(cx, fd);
+    Ok(0)
+}
+
+/// 按路径改了元数据：报告 IN_ATTRIB（也报给所在的目录）。
+pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool) {
+    if inotify::active(cx.kr()) {
+        let parent = inotify::watched_parent(cx, dirfd, path, follow);
+        let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
+        let dir = match cx.vfs().map(|v| v.store().kind(ino)) {
+            Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
+            _ => 0,
+        };
+        inotify::path_event(cx.kr(), ino, parent, inotify::IN_ATTRIB | dir);
+    }
+}
+
+/// 按 fd 改了元数据：报告 IN_ATTRIB。
+pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
+    if let Ok(file) = cx.fds().get(fd) {
+        inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ATTRIB);
+    }
 }
 
 /// 只有属主（或者有 `CAP_FOWNER`）能修改权限位；不在文件属组里的调用者不能设置
@@ -1757,20 +1910,23 @@ pub(super) fn fchownat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    let node = lookup_at_or_fd(
-        cx,
-        &cx.cred(),
-        dirfd,
-        &path,
-        flags,
-        flags & AT_SYMLINK_NOFOLLOW == 0,
-    )?;
-    chown(cx, store_ino(&node)?, uid, gid)
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
+    let ino = store_ino(&node)?;
+    chown(cx, ino, uid, gid)?;
+    if path.is_empty() {
+        attrib_fd(cx, dirfd);
+    } else {
+        attrib_at(cx, ino, dirfd, &path, follow);
+    }
+    Ok(0)
 }
 
 pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult {
     let ino = file_ino(cx, fd)?;
-    chown(cx, ino, uid, gid)
+    chown(cx, ino, uid, gid)?;
+    attrib_fd(cx, fd);
+    Ok(0)
 }
 
 /// 没有 `CAP_CHOWN` 时，属主只能把属组改成自己所在的组，不能修改属主。
@@ -1800,22 +1956,16 @@ pub(super) fn utimensat(
         return Err(Errno::EINVAL);
     }
     // path 为 NULL 时作用于 dirfd 本身（futimens）
-    let ino = if path == 0 {
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (ino, path) = if path == 0 {
         if dirfd == AT_FDCWD {
             return Err(Errno::EFAULT);
         }
-        file_ino(cx, dirfd)?
+        (file_ino(cx, dirfd)?, Vec::new())
     } else {
         let path = read_path(cx, path)?;
-        let node = lookup_at_or_fd(
-            cx,
-            &cx.cred(),
-            dirfd,
-            &path,
-            flags,
-            flags & AT_SYMLINK_NOFOLLOW == 0,
-        )?;
-        store_ino(&node)?
+        let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
+        (store_ino(&node)?, path)
     };
     let now = || {
         appine_hal::clock_gettime(0)
@@ -1857,6 +2007,11 @@ pub(super) fn utimensat(
         cred.permission(&st, MAY_WRITE)?;
     }
     cx.vfs()?.store().set_times(ino, atime, mtime)?;
+    if path.is_empty() {
+        attrib_fd(cx, dirfd);
+    } else {
+        attrib_at(cx, ino, dirfd, &path, follow);
+    }
     Ok(0)
 }
 
@@ -1874,7 +2029,13 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                 return Err(Errno::ETXTBSY);
             }
             check_fsize(cx, len)?;
-            vfs.store().truncate(ino, len).map(|()| 0)
+            vfs.store().truncate(ino, len)?;
+            if inotify::active(cx.kr()) {
+                let parent = inotify::watched_parent(cx, AT_FDCWD, &path, true);
+                let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
+                inotify::path_event(cx.kr(), ino, parent, inotify::IN_MODIFY);
+            }
+            Ok(0)
         }
         _ => Err(Errno::EINVAL),
     }
@@ -1888,7 +2049,9 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
         FileKind::Regular { file, .. } if f.writable() => {
             check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
-            file.set_len(len).map_err(host_errno).map(|()| 0)
+            file.set_len(len).map_err(host_errno)?;
+            inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
+            Ok(0)
         }
         FileKind::Path(_) => Err(Errno::EBADF),
         _ => Err(Errno::EINVAL),
@@ -1946,6 +2109,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     if !keep && end > size {
         host.set_len(end).map_err(host_errno)?;
     }
+    inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
     Ok(0)
 }
 
@@ -2097,6 +2261,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
     }
     cx.mm().write(UserSlice::new(buf, out.len()), &out)?;
     *pos = next as u64;
+    inotify::file_event(cx.kr(), &f, inotify::IN_ACCESS);
     Ok(out.len() as u64)
 }
 
@@ -2113,7 +2278,8 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         | FileKind::Epoll(_)
         | FileKind::EventFd(_)
         | FileKind::TimerFd(_)
-        | FileKind::SignalFd(_) => return Err(Errno::ESPIPE),
+        | FileKind::SignalFd(_)
+        | FileKind::Inotify(_) => return Err(Errno::ESPIPE),
         FileKind::Proc { data, .. } => match whence {
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
@@ -2173,6 +2339,7 @@ enum IoPath {
     EventFd(Rc<RefCell<EventFd>>),
     TimerFd(Rc<RefCell<TimerFd>>),
     SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
+    Inotify(Rc<RefCell<super::Inotify>>),
     Local,
 }
 
@@ -2185,6 +2352,7 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::EventFd(e) => IoPath::EventFd(e.clone()),
         FileKind::TimerFd(t) => IoPath::TimerFd(t.clone()),
         FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
+        FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
         _ => IoPath::Local,
     }
 }
@@ -2562,6 +2730,7 @@ fn read_bytes(
         | IoPath::EventFd(_)
         | IoPath::TimerFd(_)
         | IoPath::SignalFd(_)
+        | IoPath::Inotify(_)
             if offset.is_some() =>
         {
             Err(Errno::ESPIPE)
@@ -2580,7 +2749,14 @@ fn read_bytes(
         IoPath::EventFd(e) => super::poll::eventfd_read(cx, &e, nonblock, buf),
         IoPath::TimerFd(t) => super::timerfd::read(cx, &t, nonblock, buf),
         IoPath::SignalFd(s) => super::sig::signalfd_read(cx, &s, nonblock, buf),
-        IoPath::Local => local_read(&mut file.borrow_mut(), buf, offset),
+        IoPath::Inotify(i) => super::inotify::read(cx, &i, nonblock, buf),
+        IoPath::Local => {
+            let n = local_read(&mut file.borrow_mut(), buf, offset)?;
+            if n > 0 {
+                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -2606,6 +2782,7 @@ fn write_bytes(
         | IoPath::EventFd(_)
         | IoPath::TimerFd(_)
         | IoPath::SignalFd(_)
+        | IoPath::Inotify(_)
             if offset.is_some() =>
         {
             Err(Errno::ESPIPE)
@@ -2619,7 +2796,7 @@ fn write_bytes(
         IoPath::Pty(t, master) => tty::write(cx, &t, master, nonblock, data),
         IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
         IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
-        IoPath::TimerFd(_) | IoPath::SignalFd(_) => Err(Errno::EINVAL),
+        IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) => Err(Errno::EINVAL),
         IoPath::Local => {
             let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
             check_seals(cx, &file.borrow(), true, |size| {
@@ -2638,7 +2815,11 @@ fn write_bytes(
             if let Some(node) = proc_node {
                 pseudo::write(cx.k(), &node, data)?;
             }
-            local_write(&mut file.borrow_mut(), data, offset)
+            let n = local_write(&mut file.borrow_mut(), data, offset)?;
+            if n > 0 {
+                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+            }
+            Ok(n)
         }
     }
 }

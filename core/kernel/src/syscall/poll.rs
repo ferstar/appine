@@ -93,6 +93,14 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
                 None,
             )
         }
+        FileKind::Inotify(i) => (
+            if i.borrow().ready() {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            },
+            None,
+        ),
         FileKind::SignalFd(s) => (
             if s.borrow().ready() {
                 POLLIN | POLLRDNORM

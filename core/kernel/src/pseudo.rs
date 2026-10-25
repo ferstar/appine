@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::errno::Errno;
-use crate::fd::{FileKind, OpenFile};
+use crate::fd::{FileKind, OpenFile, oflags};
 use crate::ipc;
 use crate::kernel::{INIT, Kernel, Tid};
 use crate::process::{Signal, ThreadGroup};
@@ -63,12 +63,13 @@ pub(crate) enum Entry {
     Exe,
     Root,
     Fd,
+    FdInfo,
     Task,
     OomScoreAdj,
     CoredumpFilter,
 }
 
-const ENTRIES: [(&[u8], Entry); 15] = [
+const ENTRIES: [(&[u8], Entry); 16] = [
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
@@ -81,18 +82,23 @@ const ENTRIES: [(&[u8], Entry); 15] = [
     (b"exe", Entry::Exe),
     (b"root", Entry::Root),
     (b"fd", Entry::Fd),
+    (b"fdinfo", Entry::FdInfo),
     (b"task", Entry::Task),
     (b"oom_score_adj", Entry::OomScoreAdj),
     (b"coredump_filter", Entry::CoredumpFilter),
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 41] = [
+const STATIC: [&[u8]; 45] = [
     b"net/",
     b"net/dev",
     b"sys/",
     b"sys/fs/",
     b"sys/fs/file-max",
+    b"sys/fs/inotify/",
+    b"sys/fs/inotify/max_queued_events",
+    b"sys/fs/inotify/max_user_instances",
+    b"sys/fs/inotify/max_user_watches",
     b"sys/fs/lease-break-time",
     b"sys/fs/nr_open",
     b"sys/fs/pipe-max-size",
@@ -171,6 +177,8 @@ pub(crate) enum PseudoNode {
     Fd(Tid, i32),
     /// `/proc/<pid>/fd/<n>` 跟随之后得到的那个打开文件（不在仓库里的那些：管道、宿主 fd）。
     OpenFd(Tid, i32),
+    /// `/proc/<pid>/fdinfo/<n>`。
+    FdInfo(Tid, i32),
 }
 
 /// `/proc/<pid>/task/<tid>` 里的项。
@@ -319,6 +327,7 @@ impl Pseudo for View<'_> {
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
             Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
+            FdInfo(pid, _) => Entry(*pid, None, self::Entry::FdInfo),
         })
     }
 
@@ -343,7 +352,7 @@ impl Pseudo for View<'_> {
             Pid(pid, None) => pid.to_string().into_bytes(),
             Pid(_, Some(tid)) => tid.to_string().into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
-            Fd(_, fd) | OpenFd(_, fd) => fd.to_string().into_bytes(),
+            Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
         }
     }
 
@@ -389,10 +398,13 @@ impl Pseudo for View<'_> {
                     .map(|(_, e)| Entry(*pid, *tid, *e))
                     .filter(|_| self.pid_exists(*pid, *tid))
             }
-            Entry(pid, None, self::Entry::Fd) => parse_num(name)
+            Entry(pid, None, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
                 .map(|fd| fd as i32)
                 .filter(|&fd| self.open_file(*pid, fd).is_some())
-                .map(|fd| Fd(*pid, fd)),
+                .map(|fd| match e {
+                    self::Entry::Fd => Fd(*pid, fd),
+                    _ => FdInfo(*pid, fd),
+                }),
             Entry(pid, None, self::Entry::Task) => parse_num(name)
                 .map(|t| t as Tid)
                 .filter(|&t| self.pid_exists(*pid, Some(t)))
@@ -407,7 +419,7 @@ impl Pseudo for View<'_> {
         Ok(match node {
             PtsRoot | ProcRoot | Pid(..) => mode::S_IFDIR,
             Static(p) if p.ends_with(b"/") => mode::S_IFDIR,
-            Entry(_, _, self::Entry::Fd | self::Entry::Task) => mode::S_IFDIR,
+            Entry(_, _, self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
             SelfLink | ThreadSelf | Global(self::Global::Mounts) | Fd(..) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
@@ -497,6 +509,7 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
         FileKind::Socket(s) => format!("socket:[{}]", Rc::as_ptr(s) as u64 >> 4).into_bytes(),
         FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
         FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
+        FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
         FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
         FileKind::SignalFd(_) => b"anon_inode:[signalfd]".to_vec(),
         FileKind::Host(fd) => std::fs::read_link(format!("/proc/self/fd/{fd}"))
@@ -582,6 +595,9 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/lease-break-time"
                     | b"sys/fs/nr_open"
                     | b"sys/fs/pipe-max-size"
+                    | b"sys/fs/inotify/max_queued_events"
+                    | b"sys/fs/inotify/max_user_instances"
+                    | b"sys/fs/inotify/max_user_watches"
                     | b"sys/vm/max_map_count"
             )
     )
@@ -657,10 +673,13 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
                 .filter(|(_, e)| tid.is_none() || TASK_ENTRIES.contains(e))
                 .map(|(_, e)| Entry(*pid, *tid, *e)),
         ),
-        Entry(pid, None, self::Entry::Fd) => {
+        Entry(pid, None, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
             if let Some(task) = ps.leader(*pid) {
                 let fds = task.res.borrow().fds.borrow().open_fds();
-                nodes.extend(fds.into_iter().map(|fd| Fd(*pid, fd)));
+                nodes.extend(fds.into_iter().map(|fd| match e {
+                    self::Entry::Fd => Fd(*pid, fd),
+                    _ => FdInfo(*pid, fd),
+                }));
             }
         }
         Entry(pid, None, self::Entry::Task) => {
@@ -1067,6 +1086,9 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"net/dev" => net_dev(),
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => "45\n".to_owned(),
+            b"sys/fs/inotify/max_queued_events" => format!("{}\n", crate::syscall::MAX_QUEUED),
+            b"sys/fs/inotify/max_user_instances" => "128\n".to_owned(),
+            b"sys/fs/inotify/max_user_watches" => format!("{}\n", crate::syscall::MAX_WATCHES),
             b"sys/fs/nr_open" => format!("{}\n", crate::fd::MAX_FDS),
             b"sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE),
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
@@ -1125,7 +1147,42 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 _ => return Err(Errno::EINVAL),
             }
         }
+        FdInfo(pid, fd) => fdinfo(ps, *pid, *fd)?,
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())
+}
+
+/// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec 和 64 位上总有的
+/// `O_LARGEFILE`）、挂载编号、inode，以及 eventfd、inotify 的附加行。
+fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
+    const O_LARGEFILE: u32 = 0o400000;
+    let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
+    let res = task.res.borrow();
+    let fds = res.fds.borrow();
+    let file = fds.get(fd).map_err(|_| Errno::ENOENT)?;
+    let cloexec = if fds.cloexec(fd)? {
+        oflags::O_CLOEXEC
+    } else {
+        0
+    };
+    let f = file.borrow();
+    let mnt_id = match f.node() {
+        Some(Node::Store(_)) => 1,
+        Some(Node::Pseudo(p)) if mount_of(&p) == Mount::Proc => 2,
+        Some(Node::Pseudo(_)) => 3,
+        None => 4,
+    };
+    let mut s = format!(
+        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",
+        f.pos,
+        f.flags | O_LARGEFILE | cloexec,
+        f.ino().unwrap_or(0)
+    );
+    match &f.kind {
+        FileKind::EventFd(e) => s += &format!("eventfd-count: {:16x}\n", e.borrow().count),
+        FileKind::Inotify(i) => s += &i.borrow().fdinfo(),
+        _ => {}
+    }
+    Ok(s)
 }

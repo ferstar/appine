@@ -191,6 +191,45 @@ impl Vfs {
         path: &[u8],
         follow: bool,
     ) -> Result<Node, Errno> {
+        self.walk(ps, cred, root, cwd, path, follow)
+            .map(|(node, _)| node)
+    }
+
+    /// 路径指向的文件的绝对路径，符号链接全部解析（`/proc/<pid>/exe`，与 Linux 的
+    /// `d_path` 相同）。经由 `/proc/<pid>/fd/<n>` 到达、不知道名字的文件报 ENOENT。
+    pub(crate) fn real_path(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+    ) -> Result<Vec<u8>, Errno> {
+        match self.walk(ps, cred, root, cwd, path, true)? {
+            (_, Some((dir, name))) => {
+                let mut p = self.path_of(ps, root, &dir)?;
+                if p != b"/" {
+                    p.push(b'/');
+                }
+                p.extend_from_slice(&name);
+                Ok(p)
+            }
+            (node, None) if self.is_dir(ps, &node)? => self.path_of(ps, root, &node),
+            _ => Err(Errno::ENOENT),
+        }
+    }
+
+    /// [`resolve`](Self::resolve)，另外返回最后找到结果的目录和名字；结果是经由 `.`、
+    /// `..`、根目录或者合成文件系统的链接得到的时候没有。
+    pub(crate) fn walk(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<(Node, Option<Dentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
@@ -199,6 +238,7 @@ impl Vfs {
         } else {
             cwd.clone()
         };
+        let mut found = None;
         let mut pending = components(path);
         let mut links = 0;
         while let Some(comp) = pending.pop_front() {
@@ -218,6 +258,7 @@ impl Vfs {
                 if dir != *root {
                     dir = self.parent(ps, &dir)?;
                 }
+                found = None;
                 continue;
             }
             let node = self.lookup(ps, &dir, &comp)?;
@@ -230,20 +271,22 @@ impl Vfs {
                     && let Some(target) = ps.follow(p)
                 {
                     dir = target;
+                    found = None;
                     continue;
                 }
                 let target = self.readlink(ps, &node)?;
                 if target.first() == Some(&b'/') {
                     dir = root.clone();
+                    found = None;
                 }
                 for c in components(&target).into_iter().rev() {
                     pending.push_front(c);
                 }
                 continue;
             }
-            dir = node;
+            found = Some((std::mem::replace(&mut dir, node), comp));
         }
-        Ok(dir)
+        Ok((dir, found))
     }
 
     /// 解析路径的父目录，返回父目录和最后一个组件（去掉结尾的 `/`）。
@@ -408,6 +451,9 @@ fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
         .map(<[u8]>::to_vec)
 }
 
+/// 目录和其中的一个名字。
+pub(crate) type Dentry = (Node, Vec<u8>);
+
 /// 词法上规范化一个绝对路径：去掉 `.`、空组件，按 `..` 回退（不跟随符号链接）。
 pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
     let mut comps: Vec<&[u8]> = Vec::new();
@@ -552,6 +598,23 @@ mod tests {
         );
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &ubin).unwrap(), b"/usr/bin");
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &root).unwrap(), b"/");
+
+        // 解析完符号链接之后的路径（/proc/<pid>/exe）
+        let real = |cwd: &Node, p: &[u8]| vfs.real_path(ps, cred, &Node::ROOT, cwd, p);
+        for p in [
+            &b"/usr/bin/env"[..],
+            b"/usr/bin/rel",
+            b"/bindir/busybox",
+            b"/bin/busybox",
+        ] {
+            assert_eq!(real(&root, p).unwrap(), b"/bin/busybox");
+        }
+        assert_eq!(real(&usr, b"bin/rel").unwrap(), b"/bin/busybox");
+        assert_eq!(real(&usr, b"../bindir/").unwrap(), b"/bin");
+        assert_eq!(real(&ubin, b".").unwrap(), b"/usr/bin");
+        assert_eq!(real(&ubin, b"..").unwrap(), b"/usr");
+        assert_eq!(real(&root, b"/").unwrap(), b"/");
+        assert_eq!(real(&root, b"/missing"), Err(Errno::ENOENT));
 
         // /proc 是挂载点：进去是合成文件系统的根，`..` 回到仓库的根目录
         let proc = r(&root, b"/proc", true).unwrap();

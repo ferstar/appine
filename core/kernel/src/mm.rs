@@ -136,8 +136,10 @@ pub struct CodeLog {
 }
 
 impl CodeLog {
-    /// 保留的代数个数；落后更多的线程整体清空翻译缓存。
-    const GENERATIONS: u64 = 64;
+    /// 保留的代数个数；落后更多的线程整体清空翻译缓存。JVM 每装一个编译好的方法就
+    /// `ic ivau` 一串缓存行，只留 64 个时，睡一会儿的 GC、编译线程醒来几乎都要整体
+    /// 清空：Maven 构建清空 2400 次，用户态 CPU 时间多 30%。
+    const GENERATIONS: u64 = 4096;
 
     fn push(&mut self, generation: u64, ranges: &[(u64, u64)]) {
         self.entries
@@ -1443,12 +1445,13 @@ mod tests {
         );
         // 读到的代数之后才记下的范围不算
         assert_eq!(log.since(0, 1), Some(vec![(0x1000, 0x1000)]));
-        for g in 3..=100 {
+        let last = CodeLog::GENERATIONS + 36;
+        for g in 3..=last {
             log.push(g, &[(g << 12, 0x1000)]);
         }
         // 太旧的记录已经挤掉：只能整体清空
-        assert_eq!(log.since(0, 100), None);
-        assert_eq!(log.since(99, 100), Some(vec![(100 << 12, 0x1000)]));
+        assert_eq!(log.since(0, last), None);
+        assert_eq!(log.since(last - 1, last), Some(vec![(last << 12, 0x1000)]));
     }
 
     #[test]

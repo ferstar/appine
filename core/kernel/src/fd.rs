@@ -104,6 +104,8 @@ pub enum FileKind {
     TimerFd(Rc<RefCell<TimerFd>>),
     /// signalfd：read 取走调用者挂起的、在掩码里的信号。
     SignalFd(Rc<RefCell<SignalFd>>),
+    /// inotify 实例：read 取走排队的文件系统事件。
+    Inotify(Rc<RefCell<crate::syscall::Inotify>>),
     /// procfs 的文件：打开时生成的内容。
     Proc {
         /// 节点。
@@ -129,6 +131,9 @@ pub struct OpenFile {
     /// 程序在这个打开文件上读、写两个方向各用完数据的次数：epoll 的 `EPOLLET` 据此
     /// 知道程序已经用完了上一次报告的事件（`syscall::poll::drained`）。
     pub drained: [u64; 2],
+    /// 打开时已经有 inotify 监视：按 fd 的事件报给打开时经过的目录，最后一个引用释放
+    /// 时报告 `IN_CLOSE_*`。
+    pub watch: Option<crate::syscall::Opened>,
 }
 
 impl OpenFile {
@@ -147,6 +152,7 @@ impl OpenFile {
             owner: (0, 0),
             sig: 0,
             drained: [0; 2],
+            watch: None,
         }))
     }
 
@@ -170,7 +176,8 @@ impl OpenFile {
             | FileKind::Epoll(_)
             | FileKind::EventFd(_)
             | FileKind::TimerFd(_)
-            | FileKind::SignalFd(_) => None,
+            | FileKind::SignalFd(_)
+            | FileKind::Inotify(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),

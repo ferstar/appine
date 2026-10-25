@@ -134,7 +134,12 @@ impl Machine {
         };
         let image =
             loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
-        let exe: Rc<[u8]> = Rc::from(crate::vfs::normalize(&[b"/", program].concat()));
+        let real = vfs.as_ref().and_then(|vfs| {
+            vfs.real_path(&offline, &Cred::root(), &Node::ROOT, &Node::ROOT, program)
+                .ok()
+        });
+        let exe: Rc<[u8]> =
+            Rc::from(real.unwrap_or_else(|| crate::vfs::normalize(&[b"/", program].concat())));
         crate::syscall::label_image(&mut mm, &image, &exe);
 
         let tid = k.alloc_tid().map_err(io_err)?;

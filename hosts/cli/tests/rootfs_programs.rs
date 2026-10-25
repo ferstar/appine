@@ -454,7 +454,8 @@ fn procfs_describes_processes() {
             [
                 "1",
                 "Name:\tgrep",
-                "/usr/bin/readlink",
+                // 与 Linux 相同，exe 是解析完符号链接的路径
+                "/bin/busybox",
                 "cat /proc/self/cmdline ",
                 "1",
                 "1",

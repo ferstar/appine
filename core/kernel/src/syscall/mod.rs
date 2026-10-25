@@ -6,6 +6,7 @@
 
 mod cred;
 mod fs;
+mod inotify;
 mod ipc;
 mod mem;
 mod misc;
@@ -20,6 +21,7 @@ mod tty;
 mod unix;
 mod xattr;
 
+pub(crate) use inotify::{Inotify, MAX_QUEUED, MAX_WATCHES, Opened, Registry};
 pub(crate) use net::SocketRef;
 pub(crate) use poll::Epoll;
 
@@ -103,6 +105,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         23 => fs::dup(cx, a[0] as i32),
         24 => fs::dup3(cx, a[0] as i32, a[1] as i32, a[2] as u32),
         25 => fs::fcntl(cx, a[0] as i32, a[1] as u32, a[2]),
+        26 => inotify::inotify_init1(cx, a[0] as u32),
+        27 => inotify::inotify_add_watch(cx, a[0] as i32, a[1], a[2] as u32),
+        28 => inotify::inotify_rm_watch(cx, a[0] as i32, a[1] as i32),
         29 => fs::ioctl(cx, a[0] as i32, a[1] as u32, a[2]),
         32 => fs::flock(cx, a[0] as i32, a[1] as u32),
         33 => fs::mknodat(cx, a[0] as i32, a[1], a[2] as u32, a[3]),

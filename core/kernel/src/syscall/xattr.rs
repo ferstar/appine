@@ -4,8 +4,8 @@
 //! 扩展属性存在 inode 仓库的数据库里（设计文档 §11）。合成文件系统（/proc、/dev/pts）
 //! 的节点没有扩展属性，管道、socket 等不在文件系统里的文件不支持。
 
-use super::fs::{AT_FDCWD, lookup_at};
-use super::{SysResult, read_path};
+use super::fs::{AT_FDCWD, attrib_at, attrib_fd, lookup_at};
+use super::{SysResult, inotify, read_path};
 use crate::errno::Errno;
 use crate::fd::oflags;
 use crate::kernel::Cx;
@@ -116,7 +116,21 @@ pub(super) fn setxattr(
         flags & XATTR_CREATE != 0,
         flags & XATTR_REPLACE != 0,
     )?;
+    attrib(cx, target, ino);
     Ok(0)
+}
+
+/// 改了扩展属性：报告 inotify 的 IN_ATTRIB。
+fn attrib(cx: &Cx<'_>, target: Target, ino: Ino) {
+    match target {
+        Target::Path(path, follow) if inotify::active(cx.kr()) => {
+            if let Ok(path) = read_path(cx, path) {
+                attrib_at(cx, ino, AT_FDCWD, &path, follow);
+            }
+        }
+        Target::Path(..) => {}
+        Target::Fd(fd) => attrib_fd(cx, fd),
+    }
 }
 
 pub(super) fn getxattr(
@@ -148,5 +162,7 @@ pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize)
 pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResult {
     let name = read_name(cx, name)?;
     let ino = store_ino(node_of(cx, target)?, Errno::EOPNOTSUPP)?;
-    cx.vfs()?.store().remove_xattr(ino, &name).map(|()| 0)
+    cx.vfs()?.store().remove_xattr(ino, &name)?;
+    attrib(cx, target, ino);
+    Ok(0)
 }

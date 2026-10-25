@@ -168,6 +168,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
                 .store()
                 .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
                 .map_err(in_use)?;
+            super::inotify::dir_event(cx.kr(), dir, name, super::inotify::IN_CREATE, 0);
             cx.k().unix.insert(Name::Path(ino), sock);
             bound.extend_from_slice(p);
             bound.push(0);

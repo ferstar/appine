@@ -82,8 +82,10 @@ which helps when a test fails.
 `scripts/difftest` runs each script in `tests/diff` both in appine and in a native arm64
 Docker container, and compares their output and exit status. Both sides run the same
 files: the first run creates a store in `target/difftest/store` (minirootfs plus python3,
-gcc, Lua, SQLite, Go and Node.js from `apk`, so it needs the internet), exports its root filesystem
-from appine and imports it as a Docker image:
+gcc, Lua, SQLite, Go, Node.js and OpenJDK 21 from `apk`, so it needs the internet), exports its
+root filesystem from appine and imports it as a Docker image. A store made before a package was
+added lacks it: install the package into the store with `apk add`, or delete the store, and pass
+`-r` to export it again:
 
 ```sh
 scripts/fetch-rootfs
