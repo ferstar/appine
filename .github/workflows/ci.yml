@@ -77,11 +77,14 @@ jobs:
       # M7 的退出标准：同样的脚本在 appine（Tier 1）和 docker 里的原生 Alpine 上输出一致。
       # 第一次运行时用 apk 安装用例需要的软件包，依赖外网。appine 把 guest 的 raw ICMP
       # socket 换成宿主的 ping socket：Ubuntu 默认不让普通用户建（ping_group_range 是
-      # "1 0"），Android 和原生一侧的 Docker 容器都允许所有组
+      # "1 0"），Android 和原生一侧的 Docker 容器都允许所有组。rust-cache 缓存整个 target/，
+      # 会恢复出上次运行留下的一部分仓库，所以每次重新创建，跑完再删掉，免得它又被存进缓存
       - name: Differential tests
         run: |
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          rm -rf target/difftest
           scripts/difftest
+          rm -rf target/difftest
 
       # Android NDK 用 clang 编译 C 引擎，这里提前暴露 clang 特有的警告
       - name: Engine and oracle with clang

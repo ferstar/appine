@@ -947,7 +947,7 @@ static unsigned member_scratch(const struct memop *m)
 
 static bool member_fits(const struct memop *m, int64_t off)
 {
-    uint32_t insn;
+    uint32_t insn = 0;
     if (member_insn(m, off, &insn))
         return true;
     return !(m->pair && !m->simd && is_stolen(m->rt) && is_stolen(m->rt2));
@@ -1093,7 +1093,7 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
 {
     unsigned rn = m->rn == 31 ? REG_SP : m->rn, base = rn == REG_SP ? SP_HOST : rn, addr = T2;
     bool s1 = !m->simd && is_stolen(m->rt), s2 = m->pair && !m->simd && is_stolen(m->rt2);
-    uint32_t insn;
+    uint32_t insn = 0;
     if (!member_insn(m, off, &insn)) {
         addr = member_scratch(m);
         emit_add_const(x, addr, T2, off);

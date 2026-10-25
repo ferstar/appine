@@ -58,6 +58,13 @@ if [ ! -d "$store" ]; then
         -- /bin/sh -c "apk add -q '"$packages"'"'
     rebuild=1
 fi
+# 只看目录在不在不够：安装中途失败、缓存只恢复了一部分的仓库会让每个用例都失败
+if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
+    /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java" >/dev/null 2>&1; then
+    echo "difftest: $store lacks some of: $packages" >&2
+    echo "difftest: install them with apk add, or delete $store to create it again" >&2
+    exit 1
+fi
 
 if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "exporting the root filesystem of $store"
