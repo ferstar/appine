@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::kernel::{Kernel, Tid};
 use crate::process::{RLIMIT_CPU, Signal};
-use crate::signal::{self, InfoFields, SigInfo, code};
+use crate::signal::{self, InfoFields, Pending, SigInfo, code};
 
 /// 一个进程的 `ITIMER_REAL`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,22 +263,25 @@ pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
 
 /// 定时器 `id` 上一次发的信号还挂着：超限次数加到那个信号的 siginfo 里，返回 true。
 fn add_overrun(k: &Kernel, tgid: Tid, tid: Option<Tid>, sig: Signal, id: i32, missed: u32) -> bool {
-    let bump = |pending: u64, info: &mut SigInfo| match &mut info.fields {
-        InfoFields::Timer { id: i, overrun, .. }
-            if *i == id && pending & sig.bit() != 0 && info.code == code::SI_TIMER =>
-        {
-            *overrun = overrun.saturating_add(missed + 1);
-            true
+    let bump = |pending: &mut Pending| {
+        let info = pending.infos_mut(sig).find(|info| {
+            info.code == code::SI_TIMER
+                && matches!(info.fields, InfoFields::Timer { id: i, .. } if i == id)
+        });
+        match info.map(|info| &mut info.fields) {
+            Some(InfoFields::Timer { overrun, .. }) => {
+                *overrun = overrun.saturating_add(missed + 1);
+                true
+            }
+            _ => false,
         }
-        _ => false,
     };
     match tid.and_then(|t| k.tasks.get(&t)) {
-        Some(task) => bump(task.pending.get(), &mut task.info.borrow_mut()[sig.index()]),
-        None => k.groups.get(&tgid).is_some_and(|g| {
-            let mut g = g.borrow_mut();
-            let pending = g.pending;
-            bump(pending, &mut g.info[sig.index()])
-        }),
+        Some(task) => bump(&mut task.pending.borrow_mut()),
+        None => k
+            .groups
+            .get(&tgid)
+            .is_some_and(|g| bump(&mut g.borrow_mut().pending)),
     }
 }
 

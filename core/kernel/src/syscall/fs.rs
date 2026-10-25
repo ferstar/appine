@@ -16,7 +16,7 @@ use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
 use crate::kernel::{Cx, request_wake};
 use crate::locks::{self, Lock, Owner, Waiter};
-use crate::pipe::{PIPE_BUF, PIPE_MAX_SIZE, Pipe, PipeEnd};
+use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
 use crate::pseudo::{self, PseudoNode};
 use crate::signal::{self, SigInfo};
@@ -109,15 +109,22 @@ const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const PTMX_RDEV: u64 = rdev(5, 2);
 
 /// 可以透传给宿主终端的 ioctl：编号、参数大小、是否是输出参数。
-const TTY_IOCTLS: [(u32, usize, bool); 6] = [
+const TTY_IOCTLS: [(u32, usize, bool); 10] = [
     (0x5401, 36, true),  // TCGETS
     (0x5402, 36, false), // TCSETS
     (0x5403, 36, false), // TCSETSW
     (0x5404, 36, false), // TCSETSF
+    (0x5405, 18, true),  // TCGETA
+    (0x5406, 18, false), // TCSETA
+    (0x5407, 18, false), // TCSETAW
+    (0x5408, 18, false), // TCSETAF
     (0x5413, 8, true),   // TIOCGWINSZ
     (0x5414, 8, false),  // TIOCSWINSZ
 ];
 const FIONREAD: u32 = 0x541b;
+const RNDGETENTCNT: u32 = 0x8004_5200;
+/// 熵池里的比特数（`/proc/sys/kernel/random/entropy_avail`）。
+pub(crate) const ENTROPY: i32 = 256;
 const FIONBIO: u32 = 0x5421;
 const FIONCLEX: u32 = 0x5450;
 const FIOCLEX: u32 = 0x5451;
@@ -303,6 +310,17 @@ fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     b
 }
 
+/// fstat 会报告的 (st_dev, st_ino)，不必查仓库就能知道的部分（epoll 的 fdinfo）。
+pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
+    match (&f.kind, f.node()) {
+        (_, Some(Node::Store(ino))) => (ROOT_DEV, ino),
+        (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
+        (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
+        (_, Some(Node::Pseudo(p))) => (PROC_DEV, pseudo::ino_of(&p)),
+        _ => (ANON_DEV, 1),
+    }
+}
+
 /// 文件系统节点的元数据。
 fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     let vfs = cx.vfs()?;
@@ -374,7 +392,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         },
         FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
         FileKind::Socket(s) => Ok(anon(
-            Rc::as_ptr(s) as u64 >> 4,
+            pseudo::socket_ino(s),
             mode::S_IFSOCK | 0o777,
             0,
             SOCK_DEV,
@@ -384,7 +402,8 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::EventFd(_)
         | FileKind::TimerFd(_)
         | FileKind::SignalFd(_)
-        | FileKind::Inotify(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        | FileKind::Inotify(_)
+        | FileKind::Pidfd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         FileKind::Pty(end) => {
             let n = end.tty.borrow().index;
             Ok(anon(
@@ -742,13 +761,14 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
         oflags::O_WRONLY => (false, true),
         _ => (true, true),
     };
+    let capacity = pipe_capacity(cx);
     let pipe = {
         let k = cx.k();
         k.fifos.retain(|_, w| w.strong_count() > 0);
         match k.fifos.get(&ino).and_then(Weak::upgrade) {
             Some(p) => p,
             None => {
-                let p = Pipe::fifo(ino);
+                let p = Pipe::fifo(ino, capacity);
                 k.fifos.insert(ino, Rc::downgrade(&p));
                 p
             }
@@ -876,6 +896,15 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
     Ok(new as u64)
 }
 
+/// 新管道的容量：与 Linux 一样不超过 pipe-max-size，有 `CAP_SYS_RESOURCE` 时除外。
+fn pipe_capacity(cx: &Cx<'_>) -> usize {
+    if cx.cred().capable(cap::SYS_RESOURCE) {
+        PIPE_CAPACITY
+    } else {
+        PIPE_CAPACITY.min(cx.kr().pipe_max_size)
+    }
+}
+
 pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     const O_DIRECT: u32 = 0o200000;
     if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK | O_DIRECT) != 0 {
@@ -883,7 +912,7 @@ pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     }
     let cloexec = flags & oflags::O_CLOEXEC != 0;
     let status = flags & oflags::O_NONBLOCK;
-    let (r, w) = PipeEnd::pair();
+    let (r, w) = PipeEnd::pair(pipe_capacity(cx));
     let r = OpenFile::new(FileKind::Pipe(r), oflags::O_RDONLY | status);
     let w = OpenFile::new(FileKind::Pipe(w), oflags::O_WRONLY | status);
     let rfd = cx.fds_mut().install(r, cloexec, 0)?;
@@ -985,7 +1014,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
                 .checked_next_power_of_two()
                 .filter(|&n| n <= 1 << 31)
                 .ok_or(Errno::EINVAL)?;
-            if size > PIPE_MAX_SIZE && !cx.cred().capable(cap::SYS_RESOURCE) {
+            if size > cx.kr().pipe_max_size && !cx.cred().capable(cap::SYS_RESOURCE) {
                 return Err(Errno::EPERM);
             }
             if size < p.buf.len() {
@@ -1247,6 +1276,13 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         FileKind::Inotify(i) if request == FIONREAD => {
             let n = i.borrow().pending() as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
+        }
+        // 与 Linux 5.18 起相同，熵池总是满的
+        FileKind::Device {
+            dev: Device::Random,
+            ..
+        } if request == RNDGETENTCNT => {
+            return put(cx, arg, ENTROPY.to_le_bytes()).map(|()| 0);
         }
         _ => return Err(Errno::ENOTTY),
     };
@@ -2313,7 +2349,8 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         | FileKind::EventFd(_)
         | FileKind::TimerFd(_)
         | FileKind::SignalFd(_)
-        | FileKind::Inotify(_) => return Err(Errno::ESPIPE),
+        | FileKind::Inotify(_)
+        | FileKind::Pidfd(_) => return Err(Errno::ESPIPE),
         FileKind::Proc { data, .. } => match whence {
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
@@ -2389,6 +2426,16 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
         _ => IoPath::Local,
     }
+}
+
+/// 读写走哪条路径。带偏移的读写（pread、pwritev）遇到不能定位的文件是 ESPIPE：与
+/// Linux 一样先于打开方式检查（只读打开的管道 pwrite 也是 ESPIPE），`O_PATH` 除外。
+fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
+    let path = io_path(f);
+    if offset.is_some() && !matches!(path, IoPath::Local) && f.flags & oflags::O_PATH == 0 {
+        return Err(Errno::ESPIPE);
+    }
+    Ok(path)
 }
 
 /// 等宿主 fd 可读或可写；非阻塞时不等。
@@ -2708,6 +2755,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             n
         }
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
+        FileKind::Epoll(_) | FileKind::Pidfd(_) => return Err(Errno::EINVAL),
         _ => return Err(Errno::EBADF),
     };
     if offset.is_none() && matches!(f.kind, FileKind::Regular { .. } | FileKind::Proc { .. }) {
@@ -2738,6 +2786,8 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
         },
         // 可写的 procfs 文件：内容由 pseudo::write 处理过了
         FileKind::Proc { .. } => Ok(data.len()),
+        // 没有 write 操作的匿名 inode
+        FileKind::Epoll(_) | FileKind::Pidfd(_) => Err(Errno::EINVAL),
         _ => Err(Errno::EBADF),
     }
 }
@@ -2751,24 +2801,13 @@ fn read_bytes(
 ) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
+        let path = positional(&f, offset)?;
         if !f.readable() {
             return Err(Errno::EBADF);
         }
-        (io_path(&f), f.nonblocking())
+        (path, f.nonblocking())
     };
     match path {
-        IoPath::Host(_)
-        | IoPath::Pipe(_)
-        | IoPath::Pty(..)
-        | IoPath::Socket(_)
-        | IoPath::EventFd(_)
-        | IoPath::TimerFd(_)
-        | IoPath::SignalFd(_)
-        | IoPath::Inotify(_)
-            if offset.is_some() =>
-        {
-            Err(Errno::ESPIPE)
-        }
         IoPath::Host(fd) => {
             wait_host(cx, fd, POLLIN, nonblock)?;
             cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
@@ -2803,24 +2842,13 @@ fn write_bytes(
 ) -> Result<usize, Errno> {
     let (path, nonblock) = {
         let f = file.borrow();
+        let path = positional(&f, offset)?;
         if !f.writable() {
             return Err(Errno::EBADF);
         }
-        (io_path(&f), f.nonblocking())
+        (path, f.nonblocking())
     };
     match path {
-        IoPath::Host(_)
-        | IoPath::Pipe(_)
-        | IoPath::Pty(..)
-        | IoPath::Socket(_)
-        | IoPath::EventFd(_)
-        | IoPath::TimerFd(_)
-        | IoPath::SignalFd(_)
-        | IoPath::Inotify(_)
-            if offset.is_some() =>
-        {
-            Err(Errno::ESPIPE)
-        }
         IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
             Ok(n) => Ok(n),
             Err(e) if e == Errno::EPIPE.0 => Err(broken_pipe(cx)),
@@ -2946,6 +2974,8 @@ fn write_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
+    // 缓冲区读不了之前先报 ESPIPE、EBADF
+    positional(&file.borrow(), offset)?;
     if !file.borrow().writable() {
         return Err(Errno::EBADF);
     }

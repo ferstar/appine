@@ -17,7 +17,7 @@ use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
 use crate::mm::{Generations, Mm};
 use crate::process::{Signal, ThreadGroup, Tier};
-use crate::signal::{self, AltStack, SigInfo, code};
+use crate::signal::{self, AltStack, Pending, SigInfo, code};
 use crate::syscall::{self, Flow};
 use crate::uaccess::UserSlice;
 use crate::vfs::{Node, Vfs};
@@ -55,9 +55,7 @@ pub(crate) struct Task {
     /// 所属线程组。
     pub tgid: Tid,
     /// 发给这个线程、尚未处理的信号。
-    pub pending: Cell<u64>,
-    /// 挂起信号附带的 siginfo。
-    pub info: RefCell<[SigInfo; Signal::MAX as usize]>,
+    pub pending: RefCell<Pending>,
     /// 信号屏蔽字。
     pub sigmask: Cell<u64>,
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
@@ -133,8 +131,7 @@ impl Task {
         Ok(Rc::new(Task {
             tid: Cell::new(tid),
             tgid,
-            pending: Cell::new(0),
-            info: RefCell::new([SigInfo::default(); Signal::MAX as usize]),
+            pending: RefCell::default(),
             sigmask: Cell::new(sigmask),
             killed: Cell::new(false),
             sleeping: Cell::new(false),

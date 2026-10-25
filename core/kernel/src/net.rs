@@ -9,6 +9,7 @@
 //! - AF_UNIX：完全在进程内模拟（[`crate::unix`]）。
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use appine_hal::net::Interface;
@@ -64,6 +65,111 @@ impl Drop for InetSocket {
     fn drop(&mut self) {
         appine_hal::net::close(self.fd);
     }
+}
+
+// ---- /proc/net ----
+
+const SOL_SOCKET: i32 = 1;
+const SO_PROTOCOL: i32 = 38;
+const IPPROTO_TCP: i32 = 6;
+const IPPROTO_UDP: i32 = 17;
+const TCP_INFO: i32 = 11;
+/// `/proc/net` 的 st 列（Linux 的 TCP 状态，UDP 也借用其中两个）。
+const TCP_ESTABLISHED: u8 = 1;
+const TCP_CLOSE: u8 = 7;
+const TCP_LISTEN: u8 = 10;
+
+/// `/proc/net` 格式的地址：IPv4 是一个 32 位字，IPv6 是四个，按内存里的字节当成小端
+/// 打印（与 arm64 上的 Linux 相同）；端口按数值。
+fn proc_addr(addr: Option<&[u8]>, v6: bool) -> String {
+    let addr = addr.unwrap_or_default();
+    let port = addr
+        .get(2..4)
+        .map_or(0, |p| u16::from_be_bytes([p[0], p[1]]));
+    let (start, words) = if v6 { (8, 4) } else { (4, 1) };
+    let mut s = String::new();
+    for w in 0..words {
+        let at = start + w * 4;
+        let v = addr
+            .get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        write!(s, "{v:08X}").unwrap();
+    }
+    write!(s, ":{port:04X}").unwrap();
+    s
+}
+
+/// `/proc/net/{tcp,tcp6,udp,udp6}`：`family` 的 TCP（`ty` 是 `SOCK_STREAM`）或 UDP
+/// socket。地址和 TCP 状态从宿主 socket 查，队列长度和计时器都是 0。与 Linux 一样，
+/// IPv4 的两个文件每行补空格到固定宽度，IPv6 的不补。
+pub(crate) fn proc_listing(
+    sockets: &[(crate::syscall::SocketRef, u32)],
+    family: i32,
+    ty: i32,
+) -> String {
+    let (v6, tcp) = (family == AF_INET6, ty == SOCK_STREAM);
+    let width = if v6 {
+        0
+    } else if tcp {
+        149
+    } else {
+        127
+    };
+    let address = if v6 {
+        "local_address                         remote_address                        "
+    } else {
+        "local_address rem_address   "
+    };
+    let mut lines = vec![format!(
+        "{}  sl  {address}st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode{}",
+        if tcp || v6 { "" } else { " " },
+        if tcp { "" } else { " ref pointer drops" },
+    )];
+    let int = |b: Result<Vec<u8>, i32>| {
+        b.ok()
+            .and_then(|b| Some(i32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+    };
+    for (sock, uid) in sockets {
+        let b = sock.borrow();
+        let Socket::Inet(inet) = &*b else {
+            continue;
+        };
+        let fd = inet.fd;
+        let want = if tcp { IPPROTO_TCP } else { IPPROTO_UDP };
+        let proto = int(appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, 4));
+        if inet.family != family || inet.ty != ty || proto != Some(want) {
+            continue;
+        }
+        let local = appine_hal::net::sockname(fd, false).ok();
+        let peer = appine_hal::net::sockname(fd, true).ok();
+        let state = if tcp {
+            appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)
+                .ok()
+                .and_then(|b| b.first().copied())
+                .unwrap_or(TCP_CLOSE)
+        } else if peer.is_some() {
+            TCP_ESTABLISHED
+        } else {
+            TCP_CLOSE
+        };
+        let ino = crate::pseudo::socket_ino(sock);
+        let tail = if !tcp {
+            "2 0000000000000000 0".to_owned()
+        } else if state == TCP_LISTEN {
+            "1 0000000000000000 100 0 0 10 0".to_owned()
+        } else {
+            "2 0000000000000000 20 4 30 10 -1".to_owned()
+        };
+        let sl = lines.len() - 1;
+        lines.push(format!(
+            "{sl:>w$}: {} {} {state:02X} 00000000:00000000 00:00000000 00000000 {uid:5} {:8} {ino} {tail}",
+            proc_addr(local.as_deref(), v6),
+            proc_addr(peer.as_deref(), v6),
+            0,
+            w = if tcp { 4 } else { 5 },
+        ));
+    }
+    lines.iter().map(|l| format!("{l:<width$}\n")).collect()
 }
 
 /// 进程内模拟的 netlink socket。只有 `NETLINK_ROUTE` 回答查询，其他协议的 socket

@@ -106,6 +106,8 @@ pub enum FileKind {
     SignalFd(Rc<RefCell<SignalFd>>),
     /// inotify 实例：read 取走排队的文件系统事件。
     Inotify(Rc<RefCell<crate::syscall::Inotify>>),
+    /// pidfd：指向一个进程，进程结束时变为可读。
+    Pidfd(Pidfd),
     /// procfs 的文件：打开时生成的内容。
     Proc {
         /// 节点。
@@ -177,7 +179,8 @@ impl OpenFile {
             | FileKind::EventFd(_)
             | FileKind::TimerFd(_)
             | FileKind::SignalFd(_)
-            | FileKind::Inotify(_) => None,
+            | FileKind::Inotify(_)
+            | FileKind::Pidfd(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),
@@ -217,9 +220,36 @@ pub struct SignalFd {
 impl SignalFd {
     /// 有没有可以读走的信号（poll）。
     pub fn ready(&self) -> bool {
-        let group = self.group.upgrade().map_or(0, |g| g.borrow().pending);
-        let task = self.task.upgrade().map_or(0, |t| t.pending.get());
+        let group = self.group.upgrade().map_or(0, |g| g.borrow().pending.set());
+        let task = self.task.upgrade().map_or(0, |t| t.pending.borrow().set());
         (group | task) & self.mask != 0
+    }
+}
+
+/// pidfd 指向的进程。拿的是弱引用：pid 分给了别的进程之后，它仍然指向原来那个。
+pub struct Pidfd {
+    pub tgid: crate::kernel::Tid,
+    pub group: std::rc::Weak<RefCell<crate::process::ThreadGroup>>,
+}
+
+impl Pidfd {
+    /// 进程还没有被回收时返回它的线程组（可能是僵尸进程）。
+    pub fn group(
+        &self,
+        k: &crate::kernel::Kernel,
+    ) -> Option<Rc<RefCell<crate::process::ThreadGroup>>> {
+        let g = self.group.upgrade()?;
+        k.groups
+            .get(&self.tgid)
+            .is_some_and(|o| Rc::ptr_eq(o, &g))
+            .then_some(g)
+    }
+
+    /// 所有线程都已退出（poll 可读）。
+    pub fn exited(&self) -> bool {
+        self.group
+            .upgrade()
+            .is_none_or(|g| g.borrow().threads.is_empty())
     }
 }
 
@@ -233,9 +263,33 @@ pub struct TimerFd {
     pub interval: Duration,
     /// 已经到期、还没有被读走的次数。
     pub expirations: u64,
+    /// 上一次 timerfd_settime 的 flags（`/proc/<pid>/fdinfo`）。
+    pub settime_flags: u32,
 }
 
 impl TimerFd {
+    /// 离下一次到期还有多久，没有启动时是 0（timerfd_gettime 的 `it_value`）。
+    pub fn remaining(&mut self, now: Instant) -> Duration {
+        self.update(now);
+        self.deadline
+            .map_or(Duration::ZERO, |d| d.saturating_duration_since(now))
+    }
+
+    /// `/proc/<pid>/fdinfo` 里 timerfd 特有的几行。
+    pub fn fdinfo(&mut self) -> String {
+        let left = self.remaining(Instant::now());
+        format!(
+            "clockid: {}\nticks: {}\nsettime flags: 0{:o}\nit_value: ({}, {})\nit_interval: ({}, {})\n",
+            self.clock,
+            self.expirations,
+            self.settime_flags,
+            left.as_secs(),
+            left.subsec_nanos(),
+            self.interval.as_secs(),
+            self.interval.subsec_nanos()
+        )
+    }
+
     /// 把 `now` 之前到期的次数记进 `expirations`。
     pub fn update(&mut self, now: Instant) {
         let Some(d) = self.deadline.filter(|&d| d <= now) else {

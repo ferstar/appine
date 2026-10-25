@@ -578,7 +578,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 - **内核层结构**（§6）：全局状态是一个 `Kernel`，由一把 `Mutex`（BKL）保护。内核对象之间仍然用 `Rc`/`RefCell` 共享，规则是只在持有 BKL 时访问它们；唯一的例外是线程自己的私有状态（`TaskState`），只有它所属的线程会访问，等待期间也一直借用着。每个 guest 线程一个宿主线程，运行循环不持有 BKL 执行 guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL。内核层 panic 时直接终止宿主进程，因为 BKL 保护的状态可能已经不一致。
 - **等待**（§6）：只用了"宿主 `poll()` + 每线程 eventfd"这一种途径。任何可能让别人的等待条件成立的修改都请求一次唤醒，释放 BKL 时唤醒所有正在等待的线程，由它们各自重新检查条件（相当于只有一个 wait queue，以后按 profiling 拆分）。宿主 fd 的读先 poll（可以被 guest 信号打断）再读，写在释放 BKL 之后进行，阻塞的宿主 I/O 不会卡住其他 guest 线程。
 - **进程与线程**：
-  - `clone` 支持 fork、vfork（父进程等到子进程 execve 或退出）、线程，以及 `CLONE_PARENT`、`CLONE_SETTLS`、`CLONE_{PARENT,CHILD}_SETTID`、`CLONE_CHILD_CLEARTID`；`CLONE_NEW*` 返回 `EPERM`，`clone3` 返回 `ENOSYS`（glibc 和 musl 会退回到 `clone`）。
+  - `clone` 支持 fork、vfork（父进程等到子进程 execve 或退出）、线程，以及 `CLONE_PARENT`、`CLONE_SETTLS`、`CLONE_{PARENT,CHILD}_SETTID`、`CLONE_CHILD_CLEARTID`；`CLONE_NEW*` 返回 `EPERM`，`clone3` 返回 `ENOSYS`（glibc 和 musl 会退回到 `clone`；M9 之前的兼容性补漏实现了 `clone3`）。
   - `execve` 支持 `#!`（最多 4 层），先结束同一线程组的其他线程（非主线程调用时接过主线程的 tid），然后关闭 close-on-exec 的 fd，把信号处理函数恢复默认。
   - `wait4`/`waitid`、`exit`/`exit_group`、进程组和会话（`setpgid`/`setsid` 等）。init 收养孤儿进程并立即回收；父进程忽略 SIGCHLD 或设置了 `SA_NOCLDWAIT` 时子进程不留僵尸。第一个进程结束时会话结束，其余进程收到 SIGKILL。
 - **内存**：fork 按 §5.3 v1 整份复制，`MAP_SHARED|MAP_ANONYMOUS` 在 fork 之后真正共享。TLB shootdown 按 §5.1。C 引擎里两处原本不能多线程运行的地方也改了：页表表项改用原子操作读写；原生指令桩的缓存写满会整体清空，现在查找和执行都在读锁内，避免覆盖别的线程正在执行的桩。
@@ -648,8 +648,8 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 和设计相比的改动和推迟项：
 
 - epoll 没有用宿主 epoll（修改 §10），见上。
-- AF_UNIX 没有垃圾回收：socket 经由自己传递自己形成的环不会被释放（Linux 用专门的 GC 处理）；没有 `/proc/net/unix`。
-- 没有实现 `execveat`（musl 的 `fexecve` 会退回到 `/proc/self/fd/<n>`）、`membarrier`（musl 有基于信号的退路）、`pidfd_open`（python 会退回）、POSIX 定时器、`timerfd`、`signalfd`、`inotify`、文件记录锁（`F_SETLK` 仍然总是成功）。其中 POSIX 定时器、timerfd、signalfd 和记录锁在 M6 补上了。
+- AF_UNIX 没有垃圾回收：socket 经由自己传递自己形成的环不会被释放（Linux 用专门的 GC 处理）；没有 `/proc/net/unix`（M9 之前补上了）。
+- 没有实现 `execveat`（musl 的 `fexecve` 会退回到 `/proc/self/fd/<n>`）、`membarrier`（musl 有基于信号的退路）、`pidfd_open`（python 会退回）、POSIX 定时器、`timerfd`、`signalfd`、`inotify`、文件记录锁（`F_SETLK` 仍然总是成功）。其中 POSIX 定时器、timerfd、signalfd 和记录锁在 M6 补上了，`execveat` 和 pidfd 在 M9 之前的兼容性补漏里补上了。
 - 1024 以下的端口、回环地址对其他 App 可见等 §10 的问题在 M5 的真机上确认。
 
 ### M5 结果（2026-10-24）
@@ -883,7 +883,7 @@ V8 生成的代码在 Tier 1 下和普通程序一样快。`go build` 慢有两�
   - `RLIMIT_NOFILE` 的默认值改为与 Linux 相同的 1024/4096，`nr_open` 是 2^20（Go 的 `TestOpenFileLimit` 要把软限制提到硬限制）。
   - recvmsg 的 `msg_flags` 带上 `MSG_CMSG_CLOEXEC`（`TestSCMCredentials`）。
   - AF_UNIX 的 bind 拒绝最后一段是 `.` 或 `..` 的路径。原来 bind `"//"` 会在根目录里建出一个名为 `.` 的 socket。
-  - clone 忽略 `CLONE_PIDFD`，与 5.2 之前的内核一样，Go 据此退回到不用 pidfd 的路径（`TestPidFD`）。
+  - clone 忽略 `CLONE_PIDFD`，与 5.2 之前的内核一样，Go 据此退回到不用 pidfd 的路径（`TestPidFD`）。M9 之前实现了 pidfd，Go 改走 pidfd 的路径。
   - ptrace 一律返回 EPERM，与 Yama 的 `ptrace_scope=3` 相同，程序会当作没有权限（`TestExecPtrace`）；原来是 ENOSYS。
 - **调试**：`APPINE_STRACE=1` 的每一行带上从启动算起的时间和 syscall 的耗时，查 epoll 卡住时用到。
 - **测试**：
@@ -942,7 +942,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 
 - JIT 负载的性能：跳转缓存是 4096 项直接映射，JIT 代码里间接跳转和 `ret` 的目标多，冲突严重；给编译好的代码打补丁按页作废翻译。见 R1 的退路。
 - inotify 的近似：监视建立之前就打开的文件关闭时不报告；打开之后改名的文件，按 fd 的事件仍然报给原来的目录；`IN_DELETE_SELF` 在最后一个链接删除时报告，不等文件关闭；`max_user_instances`、`max_user_watches` 可写但不起作用。
-- fdinfo 只有通用的几行和 eventfd、inotify 的内容，没有 epoll、timerfd、signalfd 的；挂载编号是合成的，没有 `/proc/<pid>/mountinfo`。
+- fdinfo 只有通用的几行和 eventfd、inotify 的内容，没有 epoll、timerfd、signalfd 的；挂载编号是合成的，没有 `/proc/<pid>/mountinfo`。这两项在 M9 之前补上了。
 - 没有 fanotify。
 
 ### M9 之前：稳定性和内存（2026-10-25）
@@ -989,7 +989,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 - 起进程的剩余开销：每个新进程都要把常用代码从翻译模板里重新复制、重新链接一遍（shell 每个进程约 1150 个块，`appine_dbt_run` 自身占 31%），要根本解决得让翻译结果在进程之间直接共用；其次是宿主缺页（15%）。
 - 多线程争用 BKL：git 的并行 lstat 线程上，唤醒和锁争用约占 30%（R1 的退路：拆分 BKL、定向唤醒）。
 - 翻译后代码的质量：python 6.8×、gcc 4.6×；gcc 有 370 万次间接跳转没命中跳转缓存（返回地址预测）。
-- `/proc/<pid>/maps` 里库的文件映射没有名字；brk 每扩一页就是一个新的 VMA，相邻的 VMA 不合并（apk 运行中有 800 个 VMA）。
+- `/proc/<pid>/maps` 里库的文件映射没有名字；brk 每扩一页就是一个新的 VMA，相邻的 VMA 不合并（apk 运行中有 800 个 VMA）。这两项在兼容性补漏里做了。
 
 ### M9 之前：起进程的翻译开销（2026-10-25）
 
@@ -1017,6 +1017,35 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 - JVM 受益最大：Maven 热构建 17.5 → 15.7 秒，Gradle 热构建 6.1 → 4.8 秒；`go build` 冷编译 16.7 → 16.3 秒（M8 时是 19.2 秒）；`git status` 不变，它的线程争用在 BKL 本身。
 - Gradle 那次运行里剩下的"全部叫醒"约 3.2 万次（等待 7.5 万次），每次白醒十几微秒，给每种对象建自己的等待队列的收益已经不大。拆分 BKL 仍放到发布之后（R1）。
 - 测试：futex 的单元测试检查唤醒只通知被唤醒的线程。全部 11 组差分测试在两个执行层下通过（Go、Java、Node.js 都用大量 futex），LTP 868 个通过（与上一轮相比只有随机的 nice05 不同）。
+
+### M9 之前：兼容性补漏（2026-10-25）
+
+把推迟项里程序会直接碰到的接口缺口补上一轮：
+
+- **`/proc/<pid>/maps`**：所有文件映射（程序、解释器、mmap 的库和文件）都显示路径、文件偏移、设备号和 inode，与 stat 一致。原来只有程序和解释器有名字，vDSO 那一行还被错标成解释器。
+- **brk 和 VMA**：堆第一次扩展时预留 256 MB 的宿主地址空间（`MAP_NORESERVE`，不碰不占内存），之后的扩展只是加长同一个 VMA；收缩后再扩展的页清零，fork 出来的子进程照样预留。maps 里相邻、权限相同的匿名映射（以及同一个文件里接着的部分）与 Linux 一样合成一段：每次匿名 mmap 都是单独的宿主内存，VMA 本身合不起来。python 跑一会儿，maps 从 276 行变成 40 行左右。
+- **实时信号排队**：挂起的信号从位图换成 Linux 的 `sigpending` 结构，标准信号同一种只挂一个，实时信号每次产生都排队，按先后投递，各带各的 siginfo。一个线程组最多排 `RLIMIT_SIGPENDING` 个（默认 16384，与 4 GB 内存的 Linux 相同）；排满时 sigqueue 返回 EAGAIN，kill 照样挂起但丢掉 siginfo。`/proc/<pid>/status` 的 SigQ 是真实的数字。
+- **pidfd**：`pidfd_open`、`pidfd_send_signal`（也接受打开的 `/proc/<pid>` 目录）、`pidfd_getfd`（按 ptrace 的规则检查权限）、clone 的 `CLONE_PIDFD`、`waitid(P_PIDFD)`（非阻塞的 pidfd 没有事件时是 EAGAIN）。pidfd 拿着线程组的弱引用，pid 分给别的进程之后仍然指向原来那个；所有线程退出时 poll 可读，fdinfo 有 `Pid:`。另外实现了 `clone3`，包括 `CLONE_CLEAR_SIGHAND`；指定 pid 的 `set_tid` 和 `CLONE_INTO_CGROUP` 返回 EINVAL。Go 探测到这些之后，os/exec 改用 pidfd 等子进程、发信号（strace 里能看到 `waitid(P_PIDFD)` 和带 `CLONE_PIDFD` 的 vfork），Go 的差分测试照样通过。
+- **`execveat`**：路径相对 dirfd，`AT_EMPTY_PATH` 执行 fd 本身（fexecve），`AT_SYMLINK_NOFOLLOW` 遇到符号链接是 ELOOP。新程序看到的 `AT_EXECFN` 是 `/dev/fd/<n>[/<路径>]`，comm 取文件名；用 close-on-exec 的 fd 执行脚本是 ENOENT（解释器打开它时 fd 已经关了），与 Linux 相同。
+- **`/proc/net/{tcp,tcp6,udp,udp6,unix}`**：遍历所有进程的 fd 表收集 socket。TCP、UDP 的地址、协议和 TCP 状态向宿主 socket 查，不读宿主的 `/proc/net`（Android 10 起 App 读不了）；格式照抄 Linux，包括 IPv4 的两个文件每行补空格到固定宽度。只在 SCM_RIGHTS 消息里、或者还在 accept 队列里的 socket 不列出。
+- **`/proc/<pid>/mountinfo`** 和 epoll、timerfd、signalfd 的 fdinfo：挂载编号与 fdinfo 的 `mnt_id` 一致，设备号与 stat 的 `st_dev` 一致。
+- **零碎的**：
+  - `/proc/sys/fs/pipe-max-size` 可写并且生效，没有 `CAP_SYS_RESOURCE` 时新管道的容量不超过它（LTP fcntl35）。
+  - 老式的 `TCGETA`/`TCSETA*`（ioctl01）。
+  - `/dev/urandom` 的 `RNDGETENTCNT` 和 `entropy_avail`（ioctl07）。
+  - 带偏移的读写遇到不能定位的文件先报 ESPIPE，再看打开方式（pwritev202）。
+  - `MADV_REMOVE`：有锁住的页或私有匿名映射是 EINVAL，不能获得写权限的是 EACCES，共享映射清零（madvise02）。
+  - `MREMAP_DONTUNMAP`：与 5.7–5.12 一样只支持私有匿名映射，原地址留下空的映射。
+  - 读写 epoll 和 pidfd 是 EINVAL。
+  - kcmp（LTP 的 pidfd_getfd01 用它核对复制来的 fd）：文件、地址空间、fd 表、fs、信号处理表比较对象本身，`KCMP_EPOLL_TFD` 到 epoll 里找目标文件；appine 没有 IO 上下文，SysV 信号量的 undo 表也不在进程之间共享，这两种总是相同。
+- LTP 的 sigtimedwait01、sigwaitinfo01 超时不是 appine 的问题：第一项测试等的是"空集合被信号打断返回 EINTR"，而 musl 的 `sigtimedwait` 遇到 EINTR 会自己重试，在原生 Alpine 上一样卡住；直接发 syscall 的 rt_sigtimedwait01 是通过的。
+- 测试：差分测试新增 `compat`（以上各项，只比较与环境无关的列），共 12 组，在两个执行层下都和原生一致。原生一侧的容器改为不加 seccomp 过滤：Docker 默认的规则让 clone3 返回 ENOSYS、pidfd_getfd 返回 EPERM，比对的应当是内核本身的行为。内核版本相关的部分只测各版本相同的：6.9 起进程回收之后 pidfd 有 POLLHUP，`CLONE_PIDFD` 可以和 `CLONE_THREAD` 一起用，这里与 6.1 相同。单元测试新增堆的扩展、maps 的合并和信号的排队。LTP 的 syscall 测试 889 个通过（上次 868），新通过的是 execveat01/02、pidfd 的 8 个、kcmp01–03、fcntl35（两个）、ioctl01、ioctl07、madvise02、pwritev202（两个）和 splice06，没有新失败。getrusage03 由跳过变成失败：上次虚拟机可用内存不足 512 MB 没有运行，这次运行了，暴露出 `ru_maxrss` 总是 0。
+
+推迟：
+
+- pidfd：`PIDFD_THREAD`、`/proc/sys/kernel/ns_last_pid`（pidfd_send_signal03 要用它让新进程拿到同一个 pid）。
+- 不产生 core dump，`WCOREDUMP` 总是 0（waitid10）；getrusage 的 `ru_maxrss` 总是 0（getrusage03）。
+- `MREMAP_DONTUNMAP` 不支持文件映射；没有 `/proc/net/{icmp,raw}`。
 
 ---
 

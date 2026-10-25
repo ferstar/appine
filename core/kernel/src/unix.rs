@@ -443,6 +443,48 @@ pub(crate) enum Name {
     Abstract(Vec<u8>),
 }
 
+/// `/proc/net/unix`：所有 AF_UNIX socket。地址是抽象地址时以 `@` 开头，其中的 NUL
+/// 也显示成 `@`。
+pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
+    for (sock, _) in sockets {
+        let b = sock.borrow();
+        let Socket::Unix(u) = &*b else {
+            continue;
+        };
+        // __SO_ACCEPTCON；SS_UNCONNECTED、SS_CONNECTED
+        let (flags, state) = match &u.link {
+            Link::Listening { .. } => (0x10000, 1),
+            Link::Stream { .. } | Link::Dgram { .. } => (0, 3),
+            Link::None => (0, 1),
+        };
+        let ino = crate::pseudo::socket_ino(sock);
+        write!(
+            s,
+            "0000000000000000: 00000002 00000000 {flags:08X} {:04X} {state:02X} {ino:5}",
+            u.ty
+        )
+        .unwrap();
+        match u.addr.get(2..) {
+            Some([0, name @ ..]) => {
+                let name: Vec<u8> = name
+                    .iter()
+                    .map(|&c| if c == 0 { b'@' } else { c })
+                    .collect();
+                write!(s, " @{}", String::from_utf8_lossy(&name)).unwrap();
+            }
+            Some(path) if !path.is_empty() => {
+                let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+                write!(s, " {}", String::from_utf8_lossy(&path[..end])).unwrap();
+            }
+            _ => {}
+        }
+        s.push('\n');
+    }
+    s
+}
+
 /// 已绑定的地址（内核全局）。socket 关闭后弱引用失效，地址随之释放。
 #[derive(Default)]
 pub(crate) struct Names {

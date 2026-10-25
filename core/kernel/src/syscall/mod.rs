@@ -21,6 +21,7 @@ mod tty;
 mod unix;
 mod xattr;
 
+pub(crate) use fs::ENTROPY;
 pub(crate) use inotify::{Inotify, MAX_QUEUED, MAX_WATCHES, Opened, Registry};
 pub(crate) use net::SocketRef;
 pub(crate) use poll::Epoll;
@@ -71,6 +72,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         94 => return proc::exit_group(cx, a[0] as i32),
         139 => return signal::sigreturn(cx, cpu),
         221 => match proc::execve(cx, cpu, a[0], a[1], a[2]) {
+            Ok(()) => return Flow::Exec,
+            Err(e) => Err(e),
+        },
+        281 => match proc::execveat(cx, cpu, a[0] as i32, a[1], (a[2], a[3]), a[4] as u32) {
             Ok(()) => return Flow::Exec,
             Err(e) => Err(e),
         },
@@ -325,6 +330,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         264 => fs::name_to_handle_at(cx, a[0] as i32, a[1], a[2], a[3], a[4] as u32),
         265 => fs::open_by_handle_at(cx, a[0] as i32, a[1], a[2] as u32),
         269 => net::sendmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
+        272 => proc::kcmp(cx, a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4]),
         274 => sched::sched_setattr(cx, a[0] as i32, a[1], a[2] as u32),
         275 => sched::sched_getattr(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
         276 => fs::renameat2(cx, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
@@ -351,7 +357,11 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             nr == 287,
         ),
         291 => fs::statx(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
+        424 => sig::pidfd_send_signal(cx, a[0] as i32, a[1] as i32, a[2], a[3] as u32),
+        434 => proc::pidfd_open(cx, a[0] as i32, a[1] as u32),
+        435 => proc::clone3(cx, cpu, a[0], a[1] as usize),
         436 => fs::close_range(cx, a[0] as u32, a[1] as u32, a[2] as u32),
+        438 => proc::pidfd_getfd(cx, a[0] as i32, a[1] as i32, a[2] as u32),
         439 => fs::faccessat(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
         441 => match poll::deadline_ts(cx, a[3]) {
             Ok(deadline) => poll::epoll_pwait(

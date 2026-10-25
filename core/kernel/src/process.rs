@@ -13,7 +13,7 @@ use crate::cred::{Cred, MAY_EXEC};
 use crate::errno::Errno;
 use crate::kernel::{INIT, Kernel, Tid, request_wake};
 use crate::loader::{self, Executable, LoadError};
-use crate::signal::{self, SigAction, SigHandlers, SigInfo, sa};
+use crate::signal::{self, Pending, SigAction, SigHandlers, SigInfo, sa};
 use crate::terminal::Terminal;
 use crate::tty::Tty;
 use crate::vfs::store::{Stat, mode};
@@ -94,6 +94,11 @@ impl Signal {
     /// 在按信号编号排列的表里的下标。
     pub(crate) fn index(self) -> usize {
         self.0 as usize - 1
+    }
+
+    /// 是不是实时信号（32 号起；libc 自己用掉前几个，它的 SIGRTMIN 更大）。
+    pub(crate) fn is_realtime(self) -> bool {
+        self.0 >= 32
     }
 
     /// 是不是停止信号（SIGSTOP、SIGTSTP、SIGTTIN、SIGTTOU）。
@@ -229,6 +234,8 @@ pub(crate) const RLIMIT_CORE: u32 = 4;
 pub(crate) const RLIMIT_NOFILE: u32 = 7;
 /// `RLIMIT_MEMLOCK`。
 pub(crate) const RLIMIT_MEMLOCK: u32 = 8;
+/// `RLIMIT_SIGPENDING`。
+pub(crate) const RLIMIT_SIGPENDING: u32 = 11;
 /// 资源种类数（`RLIM_NLIMITS`）。
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
@@ -240,6 +247,8 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     r[RLIMIT_NOFILE as usize] = (soft as u64, hard as u64);
     // 与 Linux 5.16 起的默认值相同
     r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
+    // Linux 按内存大小算（max_threads / 2），4 GB 内存时是这个数
+    r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
     r
 }
 
@@ -258,9 +267,7 @@ pub(crate) struct ThreadGroup {
     /// 子进程（含僵尸进程）。
     pub children: Vec<Tid>,
     /// 发给整个进程、尚未处理的信号。
-    pub pending: u64,
-    /// 挂起信号附带的 siginfo。
-    pub info: [SigInfo; Signal::MAX as usize],
+    pub pending: Pending,
     /// 信号处理方式。
     pub sighand: Rc<RefCell<SigHandlers>>,
     /// 资源限制：(软限制, 硬限制)。
@@ -325,8 +332,7 @@ impl ThreadGroup {
             sid: tgid,
             threads: Vec::new(),
             children: Vec::new(),
-            pending: 0,
-            info: [SigInfo::default(); Signal::MAX as usize],
+            pending: Pending::default(),
             sighand,
             rlimits: default_rlimits(),
             exiting: None,
@@ -513,12 +519,20 @@ pub(crate) fn open_executable(
     cwd: &Node,
     path: &[u8],
 ) -> Result<(Executable, Stat), Errno> {
-    let Node::Store(ino) = vfs.resolve(ps, cred, root, cwd, path, true)? else {
+    open_node(vfs, cred, &vfs.resolve(ps, cred, root, cwd, path, true)?)
+}
+
+/// 打开要执行的文件 `node`（execveat 已经解析好的路径或者 fd）。没有跟随的符号链接
+/// 是 ELOOP（`AT_SYMLINK_NOFOLLOW`）。
+pub(crate) fn open_node(vfs: &Vfs, cred: &Cred, node: &Node) -> Result<(Executable, Stat), Errno> {
+    let Node::Store(ino) = *node else {
         return Err(Errno::EACCES);
     };
     let st = vfs.store().stat(ino)?;
-    if st.kind() != mode::S_IFREG {
-        return Err(Errno::EACCES);
+    match st.kind() {
+        mode::S_IFREG => {}
+        mode::S_IFLNK => return Err(Errno::ELOOP),
+        _ => return Err(Errno::EACCES),
     }
     cred.permission(&st, MAY_EXEC)?;
     Ok((Executable::open(vfs.store().open_object(ino, false)?)?, st))

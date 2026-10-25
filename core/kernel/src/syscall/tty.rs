@@ -19,6 +19,11 @@ const TCGETS: u32 = 0x5401;
 const TCSETS: u32 = 0x5402;
 const TCSETSW: u32 = 0x5403;
 const TCSETSF: u32 = 0x5404;
+/// 老式的 `struct termio`：标志只有低 16 位，控制字符只有 8 个。
+const TCGETA: u32 = 0x5405;
+const TCSETA: u32 = 0x5406;
+const TCSETAW: u32 = 0x5407;
+const TCSETAF: u32 = 0x5408;
 const TCSBRK: u32 = 0x5409;
 const TCXONC: u32 = 0x540a;
 const TCFLSH: u32 = 0x540b;
@@ -355,13 +360,33 @@ pub(crate) fn ioctl(
 ) -> SysResult {
     match request {
         TCGETS => put(cx, arg, tty.borrow().termios.encode()).map(|()| 0),
-        TCSETS | TCSETSW | TCSETSF => {
+        TCGETA => {
+            let t = tty.borrow().termios.encode();
+            let mut b = [0u8; 18];
+            for i in 0..4 {
+                b[i * 2..i * 2 + 2].copy_from_slice(&t[i * 4..i * 4 + 2]);
+            }
+            b[8..17].copy_from_slice(&t[16..25]);
+            put(cx, arg, b).map(|()| 0)
+        }
+        TCSETS | TCSETSW | TCSETSF | TCSETA | TCSETAW | TCSETAF => {
             if !master {
                 check_background(cx, tty, Signal::TTOU)?;
             }
-            let t = Termios::decode(&get(cx, arg)?);
+            let t = if request >= TCSETA {
+                // 只换掉标志的低 16 位和前 8 个控制字符
+                let b: [u8; 18] = get(cx, arg)?;
+                let mut t = tty.borrow().termios.encode();
+                for i in 0..4 {
+                    t[i * 4..i * 4 + 2].copy_from_slice(&b[i * 2..i * 2 + 2]);
+                }
+                t[16..25].copy_from_slice(&b[8..17]);
+                Termios::decode(&t)
+            } else {
+                Termios::decode(&get(cx, arg)?)
+            };
             let mut tt = tty.borrow_mut();
-            if request == TCSETSF {
+            if request == TCSETSF || request == TCSETAF {
                 tt.flush_input();
             }
             tt.set_termios(t);

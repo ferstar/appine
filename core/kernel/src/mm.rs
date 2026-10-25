@@ -50,6 +50,9 @@ pub mod flags {
 const MMAP_TOP: u64 = crate::loader::STACK_TOP - crate::loader::STACK_SIZE - (1 << 30);
 /// 最低可分配地址，与 Linux 的 mmap_min_addr 默认值相同。
 const MMAP_MIN: u64 = 0x10000;
+/// 堆（brk）第一次扩展时预留的宿主地址空间：之后的扩展只是加长同一个 VMA。不碰的部分
+/// 不占内存（`MAP_NORESERVE`）；超出的部分照旧单独映射。
+const HEAP_RESERVE: u64 = 256 << 20;
 
 /// 一段由 [`Mm`] 持有的宿主内存。
 struct HostRegion {
@@ -103,8 +106,9 @@ struct Vma {
     may_write: bool,
     /// 持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
     region: Rc<HostRegion>,
-    /// `/proc/<pid>/maps` 里显示的名字（映射的文件、程序）。
+    /// `/proc/<pid>/maps` 里显示的名字（映射的文件、程序）和文件的 inode。
     name: Option<Rc<[u8]>>,
+    ino: u64,
     /// 这个 VMA 的起点对应的宿主地址。
     host: NonNull<u8>,
     /// 从起点算起有文件内容的字节数（按 4K 向上取整），匿名映射等于 `len`。文件映射
@@ -220,6 +224,8 @@ pub struct Region {
     pub prot: u32,
     pub shared: bool,
     pub name: Option<Rc<[u8]>>,
+    /// 文件映射：起点对应的文件偏移和文件的 inode。
+    pub file: Option<(u64, u64)>,
 }
 
 fn page_up(v: u64) -> Option<u64> {
@@ -451,6 +457,7 @@ impl Mm {
                 may_write,
                 region,
                 name: None,
+                ino: 0,
                 host,
                 file_len: len,
                 cow: false,
@@ -638,6 +645,46 @@ impl Mm {
         Ok(start)
     }
 
+    /// mremap(`MREMAP_DONTUNMAP`)：内容搬到新地址（`fixed` 或者新找一段），原来的地址上
+    /// 留下权限相同、内容为空的映射，不再锁住。与 Linux 5.7 到 5.12 一样只支持私有的
+    /// 匿名映射。
+    pub fn mremap_dontunmap(
+        &mut self,
+        old: u64,
+        len: u64,
+        fixed: Option<u64>,
+    ) -> Result<u64, Errno> {
+        let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        if !old.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        self.check_mapped(old, len).map_err(|_| Errno::EFAULT)?;
+        let end = old + len;
+        let first = self.vmas.range(..=old).next_back().map_or(old, |(&s, _)| s);
+        let mut parts = Vec::new();
+        for (&s, v) in self
+            .vmas
+            .range(first..end)
+            .filter(|(s, v)| *s + v.len > old)
+        {
+            if v.backing != Backing::Anonymous {
+                return Err(Errno::EINVAL);
+            }
+            let from = s.max(old);
+            parts.push((from, (s + v.len).min(end) - from, v.prot));
+        }
+        let dst = match fixed {
+            Some(d) => d,
+            None => self.find_free(len).ok_or(Errno::ENOMEM)?,
+        };
+        let new = self.mremap(old, len, len, true, Some(dst))?;
+        for (start, len, prot) in parts {
+            self.map_anonymous(start, len, prot)?;
+            self.vmas.get_mut(&start).unwrap().locked = false;
+        }
+        Ok(new)
+    }
+
     /// 实现 mremap(2)：`fixed` 是 `MREMAP_FIXED` 的目标地址。变长时先尝试原地扩展，不行再搬到新的地址（`may_move`）：搬家不复制
     /// 数据，只是把同一段宿主内存映射到新地址。新增的部分是匿名内存，共享文件映射
     /// 则接着映射文件后面的内容；私有文件映射不能扩展。
@@ -745,6 +792,7 @@ impl Mm {
             may_write: template.may_write,
             region,
             name: template.name.clone(),
+            ino: template.ino,
             host,
             file_len,
             cow: false,
@@ -909,6 +957,49 @@ impl Mm {
             anon &= v.backing == Backing::Anonymous;
         }
         Ok((locked, anon))
+    }
+
+    /// madvise(`MADV_REMOVE`)：共享映射里这一段清零，文件映射就是在文件里打洞。与 Linux
+    /// 相同，有锁住的页或者私有的匿名映射是 EINVAL，其余私有的或者不能获得写权限的映射
+    /// 是 EACCES（6.7 起看的是能不能获得写权限，不是现在有没有）。区间必须完全已映射。
+    pub fn remove(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+        self.check_mapped(addr, len)?;
+        let end = addr + len;
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let overlapping = || {
+            self.vmas
+                .range(first..end)
+                .filter(move |(s, v)| *s + v.len > addr)
+        };
+        for (_, v) in overlapping() {
+            if v.locked || v.backing == Backing::Anonymous {
+                return Err(Errno::EINVAL);
+            }
+            if v.backing != Backing::Shared || !v.may_write {
+                return Err(Errno::EACCES);
+            }
+        }
+        for (&s, v) in overlapping() {
+            // 超出文件末尾的部分碰不得（宿主会发 SIGBUS）
+            let from = addr.max(s);
+            let to = end.min(s + v.file_len);
+            if from < to {
+                // SAFETY: [from, to) 在这个 VMA 里，宿主内存由它持有；能获得写权限的共享
+                // 映射，宿主映射总是可写的
+                unsafe {
+                    std::ptr::write_bytes(
+                        v.host.as_ptr().add((from - s) as usize),
+                        0,
+                        (to - from) as usize,
+                    )
+                };
+            }
+        }
+        Ok(())
     }
 
     /// mincore：`[addr, addr + len)` 里每页是否在宿主内存里。区间必须完全已映射。
@@ -1125,7 +1216,15 @@ impl Mm {
             let (region, host) = if share {
                 (v.region.clone(), v.host)
             } else {
-                let (region, host) = Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?;
+                // 堆照样预留宿主地址空间，子进程里接着扩展也是同一个 VMA
+                let heap = start == page_up(self.brk_start).unwrap_or(0)
+                    && v.backing == Backing::Anonymous
+                    && v.len <= HEAP_RESERVE;
+                let (region, host) = if heap {
+                    Self::new_anonymous(HEAP_RESERVE, false)?
+                } else {
+                    Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?
+                };
                 let len = v.file_len as usize;
                 if v.backing == Backing::Anonymous && v.written.get() {
                     // 匿名内存里宿主从没碰过的页一定是零：只看碰过的（栈的 VMA 有 8 MB，
@@ -1145,6 +1244,7 @@ impl Mm {
             let c = child.vmas.get_mut(&start).unwrap();
             c.written.set(v.written.get());
             c.name = v.name.clone();
+            c.ino = v.ino;
             c.file_len = v.file_len;
             c.cow = v.cow && share;
             c.file_id = v.file_id;
@@ -1203,37 +1303,63 @@ impl Mm {
         changed
     }
 
-    /// 给起点落在 `[start, start + len)` 里的映射起名字（`/proc/<pid>/maps` 用）。
-    pub fn label(&mut self, start: u64, len: u64, name: Rc<[u8]>) {
+    /// 给起点落在 `[start, start + len)` 里的文件映射记下文件的名字和 inode（`/proc/<pid>/maps`
+    /// 用）。与 Linux 一样，中间的匿名映射（.bss）没有名字。
+    pub fn label(&mut self, start: u64, len: u64, name: Option<Rc<[u8]>>, ino: u64) {
         for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
-            v.name = Some(name.clone());
+            if v.file_id.is_some() {
+                v.name = name.clone();
+                v.ino = ino;
+            }
         }
     }
 
-    /// 所有映射，按地址排列；栈、堆和 vDSO 按 Linux 的习惯命名。
+    /// 所有映射，按地址排列；栈、堆和 vDSO 按 Linux 的习惯命名。相邻、权限相同的匿名映射（或者同一个文件里接着的部分）与 Linux 一样合成一段：
+    /// 每次匿名 mmap 都是单独的宿主内存，VMA 合不起来，python 跑一会儿就有几百个。
     pub fn regions(&self) -> Vec<Region> {
         let stack = crate::loader::STACK_TOP - crate::loader::STACK_SIZE;
-        self.vmas
-            .iter()
-            .map(|(&s, v)| {
-                let special: Option<&[u8]> = if s == stack {
-                    Some(b"[stack]")
-                } else if s == self.vdso {
-                    Some(b"[vdso]")
-                } else if s >= self.brk_start && s < self.brk && self.brk_start != 0 {
-                    Some(b"[heap]")
-                } else {
-                    None
+        let mut out: Vec<Region> = Vec::new();
+        let regions = self.vmas.iter().map(|(&s, v)| {
+            let special: Option<&[u8]> = if s == stack {
+                Some(b"[stack]")
+            } else if s == self.vdso {
+                Some(b"[vdso]")
+            } else if s >= self.brk_start && s < self.brk && self.brk_start != 0 {
+                Some(b"[heap]")
+            } else {
+                None
+            };
+            Region {
+                start: s,
+                end: s + v.len,
+                prot: v.prot,
+                shared: v.backing == Backing::Shared,
+                name: v.name.clone().or_else(|| special.map(Rc::from)),
+                file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
+            }
+        });
+        for r in regions {
+            if let Some(last) = out.last_mut() {
+                let joins = match (last.file, r.file) {
+                    (None, None) => !last.shared && !r.shared,
+                    (Some((off, ino)), Some((next, next_ino))) => {
+                        ino == next_ino && off + (last.end - last.start) == next
+                    }
+                    _ => false,
                 };
-                Region {
-                    start: s,
-                    end: s + v.len,
-                    prot: v.prot,
-                    shared: v.backing == Backing::Shared,
-                    name: v.name.clone().or_else(|| special.map(Rc::from)),
+                if joins
+                    && last.end == r.start
+                    && last.prot == r.prot
+                    && last.shared == r.shared
+                    && last.name == r.name
+                {
+                    last.end = r.end;
+                    continue;
                 }
-            })
-            .collect()
+            }
+            out.push(r);
+        }
+        out
     }
 
     /// 映射的总大小（字节）。
@@ -1273,11 +1399,15 @@ impl Mm {
         };
         if new_end > old_end {
             let grow = new_end - old_end;
-            if !self.is_free(old_end, grow)
+            if !self.is_free(old_end, grow) {
+                return self.brk;
+            }
+            let grown = self.grow_heap(old_end, grow)
+                || self.start_heap(old_end, grow)
                 || self
                     .map_anonymous(old_end, grow, prot::READ | prot::WRITE)
-                    .is_err()
-            {
+                    .is_ok();
+            if !grown {
                 return self.brk;
             }
         } else if new_end < old_end && self.munmap(new_end, old_end - new_end).is_err() {
@@ -1285,6 +1415,60 @@ impl Mm {
         }
         self.brk = new;
         new
+    }
+
+    /// 堆还没有映射时，在 `start` 映射 `len` 字节并预留 [`HEAP_RESERVE`] 的宿主地址空间。
+    fn start_heap(&mut self, start: u64, len: u64) -> bool {
+        if start != page_up(self.brk_start).unwrap_or(0) || len > HEAP_RESERVE {
+            return false;
+        }
+        let Ok((region, host)) = Self::new_anonymous(HEAP_RESERVE, false) else {
+            return false;
+        };
+        let rw = prot::READ | prot::WRITE;
+        self.insert(start, len, rw, Backing::Anonymous, true, region, host)
+            .is_ok()
+    }
+
+    /// 结束在 `end` 的堆 VMA 的宿主内存后面还有空余时，把它加长 `grow` 字节。
+    fn grow_heap(&mut self, end: u64, grow: u64) -> bool {
+        let Some((&s, v)) = self.vmas.range(..end).next_back() else {
+            return false;
+        };
+        let rw = prot::READ | prot::WRITE;
+        let compatible = v.backing == Backing::Anonymous
+            && v.prot == rw
+            && v.locked == self.lock_future
+            && v.name.is_none();
+        if s + v.len != end || !compatible {
+            return false;
+        }
+        let used = v.host.as_ptr() as usize - v.region.base.as_ptr() as usize + v.len as usize;
+        if used + grow as usize > v.region.len {
+            return false;
+        }
+        // 宿主上紧接着的这段不能有别的映射在用（堆的一部分被 mremap 搬走之后仍然属于
+        // 同一段宿主内存）
+        let (lo, hi) = (v.host.as_ptr() as usize + v.len as usize, grow as usize);
+        let taken = self.vmas.values().any(|o| {
+            let at = o.host.as_ptr() as usize;
+            Rc::ptr_eq(&o.region, &v.region) && at < lo + hi && lo < at + o.len as usize
+        });
+        if taken {
+            return false;
+        }
+        // SAFETY: [lo, lo + hi) 在这段私有匿名内存里，没有别的映射在用
+        let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
+        // 缩小之后又扩展：以前写过的内容要变回零
+        unsafe { discard_host(host, hi) };
+        if Self::map_pages(&mut self.mmu, end, host, grow, rw).is_err() {
+            return false;
+        }
+        let v = self.vmas.get_mut(&s).unwrap();
+        v.len += grow;
+        v.file_len += grow;
+        v.written.set(true);
+        true
     }
 
     /// 从 guest 内存读取（相当于 Linux 的 `copy_from_user`），要求每页可读。
@@ -1877,5 +2061,55 @@ mod tests {
         mm.write_kernel(0x50_2ff0, &[1; 16]).unwrap();
         assert_eq!(mm.brk(0x50_1000), 0x50_1000);
         assert!(mm.mmu().translate(0x50_2000, 0).is_none());
+    }
+
+    #[test]
+    fn brk_extends_one_vma_and_zeroes_regrown_pages() {
+        let mut mm = Mm::new();
+        mm.set_brk(0x50_0000);
+        for i in 1..=64 {
+            assert_eq!(mm.brk(0x50_0000 + i * PAGE_SIZE), 0x50_0000 + i * PAGE_SIZE);
+        }
+        assert_eq!(mm.vmas.len(), 1);
+        mm.write_kernel(0x53_f000, b"old").unwrap();
+        mm.brk(0x52_0000);
+        mm.brk(0x54_0000);
+        assert_eq!(mm.vmas.len(), 1);
+        let mut buf = [1u8; 3];
+        mm.read(UserSlice::new(0x53_f000, 3), &mut buf).unwrap();
+        assert_eq!(buf, [0; 3]);
+        // 子进程里接着扩展也还是一个 VMA，内容是复制过来的
+        mm.write_kernel(0x50_0000, b"heap").unwrap();
+        let mut child = mm.fork().unwrap();
+        assert_eq!(child.brk(0x58_0000), 0x58_0000);
+        assert_eq!(child.vmas.len(), 1);
+        let mut buf = [0u8; 4];
+        child.read(UserSlice::new(0x50_0000, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"heap");
+        // 堆中间的一页被换掉之后，后面那段照样能扩展
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        mm.mmap(0x50_0000, PAGE_SIZE, 0, anon, None).unwrap();
+        assert_eq!(mm.brk(0x60_0000), 0x60_0000);
+        assert_eq!(mm.vmas.len(), 2);
+        let regions = mm.regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1].name.as_deref(), Some(&b"[heap]"[..]));
+    }
+
+    #[test]
+    fn regions_join_adjacent_anonymous_mappings() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = mm.mmap(0, PAGE_SIZE, RW, anon, None).unwrap();
+        let b = mm.mmap(0, PAGE_SIZE, RW, anon, None).unwrap();
+        let c = mm.mmap(0, PAGE_SIZE, prot::READ, anon, None).unwrap();
+        assert_eq!((a - b, b - c), (PAGE_SIZE, PAGE_SIZE));
+        let r = mm.regions();
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[1].start, r[1].end), (b, a + PAGE_SIZE));
+        let shared = flags::MAP_SHARED | flags::MAP_ANONYMOUS;
+        mm.mmap(0, PAGE_SIZE, RW, shared, None).unwrap();
+        mm.mmap(0, PAGE_SIZE, RW, shared, None).unwrap();
+        assert_eq!(mm.regions().len(), 4);
     }
 }

@@ -5,9 +5,12 @@ use std::time::Instant;
 use super::{SysResult, get, put, read_timespec};
 use crate::cred::Cred;
 use crate::errno::Errno;
+use crate::fd::FileKind;
 use crate::kernel::{Cx, INIT, Tid};
 use crate::process::Signal;
+use crate::pseudo::PseudoNode;
 use crate::signal::{self, SigAction, SigInfo, UNBLOCKABLE, code};
+use crate::vfs::Node;
 
 const SIG_BLOCK: u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
@@ -119,6 +122,77 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
     Ok(0)
 }
 
+/// 调用者给出的 siginfo（rt_sigqueueinfo、pidfd_send_signal）。
+fn queue_info(b: &[u8; 128]) -> SigInfo {
+    let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    SigInfo {
+        code: word(8),
+        fields: signal::InfoFields::Queue {
+            pid: word(16),
+            uid: word(20) as u32,
+            value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        },
+        esr: 0,
+    }
+}
+
+/// pidfd_send_signal：pidfd 也可以是打开的 `/proc/<pid>` 目录。`uinfo` 为空时与 kill
+/// 相同，否则与 rt_sigqueueinfo 相同（si_signo 必须等于 `sig`）。
+pub(super) fn pidfd_send_signal(
+    cx: &mut Cx<'_>,
+    pidfd: i32,
+    sig: i32,
+    uinfo: u64,
+    flags: u32,
+) -> SysResult {
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.fds().get(pidfd)?;
+    let tgid = match &file.borrow().kind {
+        FileKind::Pidfd(p) => p.group(cx.kr()).map(|_| p.tgid).ok_or(Errno::ESRCH)?,
+        FileKind::Directory {
+            node: Node::Pseudo(PseudoNode::Pid(pid, None)),
+            ..
+        } => *pid,
+        _ => return Err(Errno::EBADF),
+    };
+    let sig = signal_arg(sig)?;
+    let me = cx.tgid();
+    let cred = cx.cred();
+    let info = if uinfo != 0 {
+        let b: [u8; 128] = get(cx, uinfo)?;
+        if i32::from_le_bytes(b[..4].try_into().unwrap()) != sig.map_or(0, Signal::number) {
+            return Err(Errno::EINVAL);
+        }
+        let info = queue_info(&b);
+        if (info.code >= 0 || info.code == code::SI_TKILL) && tgid != me {
+            return Err(Errno::EPERM);
+        }
+        info
+    } else {
+        SigInfo::kill(code::SI_USER, me, cred.ruid)
+    };
+    if !cx.kr().groups.contains_key(&tgid) {
+        return Err(Errno::ESRCH);
+    }
+    let sid = cx.t.group.borrow().sid;
+    if !may_kill(cx, &cred, sid, tgid, sig) {
+        return Err(Errno::EPERM);
+    }
+    let Some(sig) = sig else {
+        return Ok(0);
+    };
+    if uinfo != 0 && info.code != code::SI_USER && !signal::can_queue(cx.kr(), tgid, sig) {
+        return Err(Errno::EAGAIN);
+    }
+    // 内置的 init 忽略所有信号
+    if tgid != INIT {
+        signal::send_to_group(cx.kr(), tgid, sig, info);
+    }
+    Ok(0)
+}
+
 /// rt_sigqueueinfo、rt_tgsigqueueinfo（`tid` 为 None 时发给整个进程）：siginfo 由调用者
 /// 给出。不能冒充内核或 kill 发出的信号（si_code 不小于 0 或者是 SI_TKILL），除非发给
 /// 自己。
@@ -130,21 +204,12 @@ pub(super) fn sigqueueinfo(
     uinfo: u64,
 ) -> SysResult {
     let b: [u8; 128] = get(cx, uinfo)?;
-    let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
-    let code = word(8);
+    let info = queue_info(&b);
+    let code = info.code;
     let target = tid.unwrap_or(tgid);
     if (code >= 0 || code == code::SI_TKILL) && target != cx.tid() && tgid != cx.tgid() {
         return Err(Errno::EPERM);
     }
-    let info = SigInfo {
-        code,
-        fields: signal::InfoFields::Queue {
-            pid: word(16),
-            uid: word(20) as u32,
-            value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
-        },
-        esr: 0,
-    };
     let sig = signal_arg(sig)?;
     let cred = cx.cred();
     let sid = cx.t.group.borrow().sid;
@@ -152,6 +217,10 @@ pub(super) fn sigqueueinfo(
     let tgid = match tid {
         None => cx.kr().tasks.get(&tgid).map_or(tgid, |t| t.tgid),
         Some(_) => tgid,
+    };
+    // 实时信号排不上队：返回 EAGAIN，而不是像 kill 那样丢掉 siginfo
+    let full = |cx: &Cx<'_>| {
+        sig.is_some_and(|s| code != code::SI_USER && !signal::can_queue(cx.kr(), tgid, s))
     };
     match tid {
         Some(tid) => {
@@ -164,6 +233,9 @@ pub(super) fn sigqueueinfo(
             }
             if !may_kill(cx, &cred, sid, tgid, sig) {
                 return Err(Errno::EPERM);
+            }
+            if full(cx) {
+                return Err(Errno::EAGAIN);
             }
             if let Some(sig) = sig {
                 signal::send_to_task(cx.kr(), &task, sig, info);
@@ -180,6 +252,9 @@ pub(super) fn sigqueueinfo(
             }
             if !may_kill(cx, &cred, sid, tgid, sig) {
                 return Err(Errno::EPERM);
+            }
+            if full(cx) {
+                return Err(Errno::EAGAIN);
             }
             if let Some(sig) = sig {
                 signal::send_to_group(cx.kr(), tgid, sig, info);
@@ -339,12 +414,12 @@ pub(super) fn rt_sigaction(
         if sighand.borrow().ignores(sig) {
             let threads = {
                 let mut g = cx.t.group.borrow_mut();
-                g.pending &= !sig.bit();
+                g.pending.discard(sig.bit());
                 g.threads.clone()
             };
             for tid in threads {
                 if let Some(t) = cx.kr().tasks.get(&tid) {
-                    t.pending.set(t.pending.get() & !sig.bit());
+                    t.pending.borrow_mut().discard(sig.bit());
                 }
             }
         }
@@ -387,7 +462,8 @@ pub(super) fn rt_sigpending(cx: &mut Cx<'_>, set: u64, size: usize) -> SysResult
     if size > SIGSET_SIZE {
         return Err(Errno::EINVAL);
     }
-    let pending = (cx.task.pending.get() | cx.t.group.borrow().pending) & cx.task.sigmask.get();
+    let pending = cx.task.pending.borrow().set() | cx.t.group.borrow().pending.set();
+    let pending = pending & cx.task.sigmask.get();
     cx.mm().write(
         crate::uaccess::UserSlice::new(set, size),
         &pending.to_le_bytes()[..size],

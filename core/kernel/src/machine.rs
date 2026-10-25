@@ -140,7 +140,20 @@ impl Machine {
         });
         let exe: Rc<[u8]> =
             Rc::from(real.unwrap_or_else(|| crate::vfs::normalize(&[b"/", program].concat())));
-        crate::syscall::label_image(&mut mm, &image, &exe);
+        let ino_of = |p: &[u8]| {
+            vfs.as_ref()
+                .and_then(|vfs| {
+                    vfs.resolve(&offline, &Cred::root(), &Node::ROOT, &Node::ROOT, p, true)
+                        .ok()
+                })
+                .and_then(|n| match n {
+                    Node::Store(ino) => Some(ino),
+                    Node::Pseudo(_) => None,
+                })
+                .unwrap_or(0)
+        };
+        let interp_ino = image.interp.as_ref().map_or(0, |(p, ..)| ino_of(p));
+        crate::syscall::label_image(&mut mm, &image, &exe, (ino_of(program), interp_ino));
 
         let tid = k.alloc_tid().map_err(io_err)?;
         let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));

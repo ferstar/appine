@@ -39,6 +39,7 @@ const MAP_VALIDATE_KNOWN: u32 = MAP_TYPE
 const F_SEAL_WRITE: u32 = 0x8;
 const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 const MADV_DONTNEED: i32 = 4;
+const MADV_REMOVE: i32 = 9;
 const MADV_FREE: i32 = 8;
 const MADV_WIPEONFORK: i32 = 18;
 const MADV_KEEPONFORK: i32 = 19;
@@ -75,6 +76,8 @@ pub(super) fn mmap(
     let mut flags = (flags & !MAP_TYPE) | kind;
     // 只读打开的 /dev/zero 的共享映射：不能有写权限，以后也不能改成可写
     let mut deny_write = false;
+    // 文件映射在 /proc/<pid>/maps 里显示的路径和 inode
+    let mut label = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         None
     } else {
@@ -90,6 +93,7 @@ pub(super) fn mmap(
                 if !f.readable() {
                     return Err(Errno::EACCES);
                 }
+                label = Some((f.path.clone(), *ino));
                 if shared_write && !f.writable() {
                     return Err(Errno::EACCES);
                 }
@@ -133,6 +137,9 @@ pub(super) fn mmap(
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
     let start = cx.mm_mut().mmap(addr, len, prot, flags, file)?;
+    if let Some((name, ino)) = label {
+        cx.mm_mut().label(start, len, name, ino);
+    }
     if deny_write {
         cx.mm_mut().deny_write(start, len);
     }
@@ -155,12 +162,14 @@ pub(super) fn mremap(
     const MREMAP_DONTUNMAP: u32 = 4;
     if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
         || flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0
-        // 不支持保留原来映射的 MREMAP_DONTUNMAP
-        || flags & MREMAP_DONTUNMAP != 0
+        || flags & MREMAP_DONTUNMAP != 0 && (flags & MREMAP_MAYMOVE == 0 || old_len != new_len)
     {
         return Err(Errno::EINVAL);
     }
     let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
+    if flags & MREMAP_DONTUNMAP != 0 {
+        return cx.mm_mut().mremap_dontunmap(old, old_len, fixed);
+    }
     cx.mm_mut()
         .mremap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
 }
@@ -211,6 +220,9 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     }
     if len == 0 {
         return Ok(0);
+    }
+    if advice == MADV_REMOVE {
+        return cx.mm_mut().remove(addr, len).map(|()| 0);
     }
     let (locked, private_anon) = cx.mm().advice_range(addr, len)?;
     match advice {

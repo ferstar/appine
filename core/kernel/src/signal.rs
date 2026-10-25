@@ -9,6 +9,7 @@
 //! 帧上方是 `{fp, lr}` 帧记录。syscall 重启的规则照搬 arm64 的 `do_signal`。
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -16,7 +17,7 @@ use appine_engine::Cpu;
 
 use crate::errno::Errno;
 use crate::kernel::{Cx, Kernel, Tid, request_wake};
-use crate::process::{ExitStatus, Signal, ThreadGroup};
+use crate::process::{ExitStatus, RLIMIT_SIGPENDING, Signal, ThreadGroup};
 use crate::syscall::Flow;
 use crate::task::Task;
 use crate::uaccess::UserSlice;
@@ -247,6 +248,99 @@ impl SigInfo {
     }
 }
 
+/// 挂起的信号（Linux 的 `struct sigpending`）。标准信号同一种只挂起一个，再产生时
+/// 合并；实时信号每产生一次排一次队，按产生的先后投递，各带各的 siginfo。
+#[derive(Default)]
+pub(crate) struct Pending {
+    set: u64,
+    /// 标准信号（1–31）的 siginfo。
+    info: [SigInfo; 31],
+    /// 排着队的实时信号。
+    queue: VecDeque<(Signal, SigInfo)>,
+}
+
+impl Pending {
+    /// 挂起的信号集。
+    pub fn set(&self) -> u64 {
+        self.set
+    }
+
+    /// 排着队的实时信号个数。
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// 挂起一个信号。`room` 为 false 时实时信号不再排队（超过了 `RLIMIT_SIGPENDING`）：
+    /// 与 Linux 一样，信号照样挂起，siginfo 丢掉。
+    pub fn add(&mut self, sig: Signal, info: SigInfo, room: bool) {
+        if !sig.is_realtime() {
+            self.info[sig.index()] = info;
+        } else if room {
+            self.queue.push_back((sig, info));
+        }
+        self.set |= sig.bit();
+    }
+
+    /// 取出一个 `sig`。实时信号取最早排队的那个，同一种还有排着的就仍然挂起；没有排上
+    /// 队的，siginfo 是空的（si_code 为 SI_USER），与 Linux 相同。
+    pub fn take(&mut self, sig: Signal) -> SigInfo {
+        if !sig.is_realtime() {
+            self.set &= !sig.bit();
+            return self.info[sig.index()];
+        }
+        let mut same = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, _))| *s == sig);
+        let (first, more) = (same.next().map(|(i, _)| i), same.next().is_some());
+        if !more {
+            self.set &= !sig.bit();
+        }
+        first
+            .and_then(|i| self.queue.remove(i))
+            .map_or_else(SigInfo::default, |(_, info)| info)
+    }
+
+    /// 丢掉 `mask` 里的信号，包括排着队的。
+    pub fn discard(&mut self, mask: u64) {
+        self.set &= !mask;
+        self.queue.retain(|(s, _)| mask & s.bit() == 0);
+    }
+
+    /// 挂着的 `sig` 的 siginfo（定时器把超限次数加到自己上一次发的信号里）。
+    pub fn infos_mut(&mut self, sig: Signal) -> impl Iterator<Item = &mut SigInfo> {
+        let Pending { set, info, queue } = self;
+        let standard =
+            (!sig.is_realtime() && *set & sig.bit() != 0).then(|| &mut info[sig.index()]);
+        standard.into_iter().chain(
+            queue
+                .iter_mut()
+                .filter(move |(s, _)| *s == sig)
+                .map(|(_, info)| info),
+        )
+    }
+}
+
+/// 线程组里排着队的实时信号个数（`/proc/<pid>/status` 的 SigQ）。
+pub(crate) fn queued(k: &Kernel, group: &ThreadGroup) -> usize {
+    let threads = group.threads.iter().filter_map(|t| k.tasks.get(t));
+    group.pending.queued() + threads.map(|t| t.pending.borrow().queued()).sum::<usize>()
+}
+
+/// 实时信号还能不能排队：一个线程组最多排 `RLIMIT_SIGPENDING` 个（Linux 按用户算）。
+fn queue_room(k: &Kernel, group: &ThreadGroup) -> bool {
+    (queued(k, group) as u64) < group.rlimits[RLIMIT_SIGPENDING as usize].0
+}
+
+/// sigqueue 发实时信号时，线程组的队列满了要返回 EAGAIN，而不是丢掉 siginfo。
+pub(crate) fn can_queue(k: &Kernel, tgid: Tid, sig: Signal) -> bool {
+    !sig.is_realtime()
+        || k.groups
+            .get(&tgid)
+            .is_none_or(|g| queue_room(k, &g.borrow()))
+}
+
 /// sigaltstack 的 ss_flags。
 pub(crate) mod ss {
     /// 正在备用栈上运行。
@@ -364,9 +458,9 @@ const STOP_SIGNALS: u64 = (1 << (19 - 1)) | (1 << (20 - 1)) | (1 << (21 - 1)) | 
 fn prepare(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, sig: Signal) {
     let clear = |mask: u64| {
         let mut g = group.borrow_mut();
-        g.pending &= !mask;
+        g.pending.discard(mask);
         for t in g.threads.iter().filter_map(|t| k.tasks.get(t)) {
-            t.pending.set(t.pending.get() & !mask);
+            t.pending.borrow_mut().discard(mask);
         }
     };
     if sig.is_stop() {
@@ -425,8 +519,8 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
     if !blocked && group.borrow().sighand.borrow().ignores(sig) {
         return;
     }
-    task.pending.set(task.pending.get() | sig.bit());
-    task.info.borrow_mut()[sig.index()] = info;
+    let room = sig.is_realtime() && queue_room(k, &group.borrow());
+    task.pending.borrow_mut().add(sig, info, room);
     if !blocked {
         wake(task);
     } else {
@@ -470,9 +564,8 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         return;
     }
     {
-        let mut g = group.borrow_mut();
-        g.pending |= sig.bit();
-        g.info[sig.index()] = info;
+        let room = sig.is_realtime() && queue_room(k, &group.borrow());
+        group.borrow_mut().pending.add(sig, info, room);
     }
     let unmasked = |t: &&Rc<Task>| t.sigmask.get() & sig.bit() == 0;
     let target = if running {
@@ -538,8 +631,7 @@ pub(crate) fn force(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
     if blocked {
         cx.task.sigmask.set(cx.task.sigmask.get() & !sig.bit());
     }
-    cx.task.pending.set(cx.task.pending.get() | sig.bit());
-    cx.task.info.borrow_mut()[sig.index()] = info;
+    cx.task.pending.borrow_mut().add(sig, info, false);
 }
 
 // ---- 信号的投递 ----
@@ -560,37 +652,20 @@ fn pick(set: u64) -> Signal {
 
 /// 取出下一个没有被屏蔽的挂起信号：先看线程自己的，再看线程组的。
 fn dequeue(cx: &mut Cx<'_>) -> Option<(Signal, SigInfo)> {
-    let mask = cx.task.sigmask.get();
-    let own = cx.task.pending.get() & !mask;
-    if own != 0 {
-        let sig = pick(own);
-        cx.task.pending.set(cx.task.pending.get() & !sig.bit());
-        return Some((sig, cx.task.info.borrow()[sig.index()]));
-    }
-    let mut g = cx.t.group.borrow_mut();
-    let shared = g.pending & !mask;
-    if shared != 0 {
-        let sig = pick(shared);
-        g.pending &= !sig.bit();
-        return Some((sig, g.info[sig.index()]));
-    }
-    None
+    take(cx, !cx.task.sigmask.get())
 }
 
-/// sigtimedwait：不管屏蔽字，取出 `set` 里的一个挂起信号，先看线程自己的。
+/// 取出 `set` 里的一个挂起信号，先看线程自己的（sigtimedwait 不管屏蔽字）。
 pub(crate) fn take(cx: &mut Cx<'_>, set: u64) -> Option<(Signal, SigInfo)> {
-    let own = cx.task.pending.get() & set;
-    if own != 0 {
-        let sig = pick(own);
-        cx.task.pending.set(cx.task.pending.get() & !sig.bit());
-        return Some((sig, cx.task.info.borrow()[sig.index()]));
+    let mut own = cx.task.pending.borrow_mut();
+    if own.set() & set != 0 {
+        let sig = pick(own.set() & set);
+        return Some((sig, own.take(sig)));
     }
     let mut g = cx.t.group.borrow_mut();
-    let shared = g.pending & set;
-    if shared != 0 {
-        let sig = pick(shared);
-        g.pending &= !sig.bit();
-        return Some((sig, g.info[sig.index()]));
+    if g.pending.set() & set != 0 {
+        let sig = pick(g.pending.set() & set);
+        return Some((sig, g.pending.take(sig)));
     }
     None
 }
@@ -600,7 +675,8 @@ pub(crate) fn take(cx: &mut Cx<'_>, set: u64) -> Option<(Signal, SigInfo)> {
 pub(crate) fn interrupted(cx: &Cx<'_>) -> bool {
     let mask = cx.task.sigmask.get();
     let g = cx.t.group.borrow();
-    cx.task.killed.get() || g.stopped || (cx.task.pending.get() | g.pending) & !mask != 0
+    let pending = cx.task.pending.borrow().set() | g.pending.set();
+    cx.task.killed.get() || g.stopped || pending & !mask != 0
 }
 
 /// 停住整个线程组（停止信号的默认动作）：通知父进程，打断其他线程，让它们也停下来。
@@ -983,5 +1059,39 @@ mod tests {
         let set = Signal::INT.bit() | Signal::SEGV.bit() | Signal::HUP.bit();
         assert_eq!(pick(set), Signal::SEGV);
         assert_eq!(pick(Signal::INT.bit() | Signal::TERM.bit()), Signal::INT);
+    }
+
+    #[test]
+    fn realtime_signals_queue_and_standard_ones_merge() {
+        let value = |v: u64| SigInfo {
+            code: -1,
+            fields: InfoFields::Queue {
+                pid: 1,
+                uid: 0,
+                value: v,
+            },
+            esr: 0,
+        };
+        let rt = Signal::new(40).unwrap();
+        let mut p = Pending::default();
+        p.add(rt, value(1), true);
+        p.add(Signal::USR1, value(2), true);
+        p.add(rt, value(3), true);
+        p.add(Signal::USR1, value(4), true);
+        // 排不上队：信号照样挂起，siginfo 丢掉
+        p.add(rt, value(5), false);
+        assert_eq!(p.queued(), 2);
+        assert_eq!(p.take(Signal::USR1), value(4));
+        assert_eq!(p.set(), rt.bit());
+        assert_eq!(p.take(rt), value(1));
+        assert_eq!(p.set(), rt.bit());
+        assert_eq!(p.take(rt), value(3));
+        assert_eq!(p.set(), 0);
+        p.add(rt, value(6), true);
+        p.add(Signal::USR1, value(7), true);
+        p.discard(rt.bit());
+        assert_eq!((p.set(), p.queued()), (Signal::USR1.bit(), 0));
+        p.add(rt, value(8), false);
+        assert_eq!(p.take(rt), SigInfo::default());
     }
 }

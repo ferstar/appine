@@ -100,6 +100,8 @@ pub(crate) struct Kernel {
     /// [`UTS_LEN`] 字节。
     pub hostname: Vec<u8>,
     pub domainname: Vec<u8>,
+    /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
+    pub pipe_max_size: usize,
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
@@ -143,6 +145,7 @@ impl Kernel {
             seals: BTreeMap::new(),
             hostname: b"localhost".to_vec(),
             domainname: b"(none)".to_vec(),
+            pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),

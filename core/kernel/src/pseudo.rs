@@ -5,6 +5,7 @@
 //! 之后的读都在这份快照上进行，与 Linux 的 seq_file 一次读完时的效果相同。
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -13,8 +14,10 @@ use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::ipc;
 use crate::kernel::{INIT, Kernel, Tid};
+use crate::net::{AF_INET, AF_INET6, SOCK_DGRAM, SOCK_STREAM};
 use crate::process::{Signal, ThreadGroup};
 use crate::signal::SigAction;
+use crate::syscall::SocketRef;
 use crate::task::Task;
 use crate::tty::{PTS_MAJOR, Tty};
 use crate::vfs::dev::rdev;
@@ -59,6 +62,7 @@ pub(crate) enum Entry {
     Environ,
     Maps,
     Mounts,
+    MountInfo,
     Cwd,
     Exe,
     Root,
@@ -69,7 +73,7 @@ pub(crate) enum Entry {
     CoredumpFilter,
 }
 
-const ENTRIES: [(&[u8], Entry); 16] = [
+const ENTRIES: [(&[u8], Entry); 17] = [
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
@@ -78,6 +82,7 @@ const ENTRIES: [(&[u8], Entry); 16] = [
     (b"environ", Entry::Environ),
     (b"maps", Entry::Maps),
     (b"mounts", Entry::Mounts),
+    (b"mountinfo", Entry::MountInfo),
     (b"cwd", Entry::Cwd),
     (b"exe", Entry::Exe),
     (b"root", Entry::Root),
@@ -89,9 +94,14 @@ const ENTRIES: [(&[u8], Entry); 16] = [
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 45] = [
+const STATIC: [&[u8]; 52] = [
     b"net/",
     b"net/dev",
+    b"net/tcp",
+    b"net/tcp6",
+    b"net/udp",
+    b"net/udp6",
+    b"net/unix",
     b"sys/",
     b"sys/fs/",
     b"sys/fs/file-max",
@@ -118,6 +128,8 @@ const STATIC: [&[u8]; 45] = [
     b"sys/kernel/pid_max",
     b"sys/kernel/random/",
     b"sys/kernel/random/boot_id",
+    b"sys/kernel/random/entropy_avail",
+    b"sys/kernel/random/poolsize",
     b"sys/kernel/random/uuid",
     b"sys/kernel/sched_rr_timeslice_ms",
     b"sys/kernel/sem",
@@ -506,10 +518,11 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
         FileKind::Pipe(end) => format!("pipe:[{}]", end.pipe.borrow().ino).into_bytes(),
         FileKind::Pty(end) if end.master => b"/dev/ptmx".to_vec(),
         FileKind::Pty(end) => format!("/dev/pts/{}", end.tty.borrow().index).into_bytes(),
-        FileKind::Socket(s) => format!("socket:[{}]", Rc::as_ptr(s) as u64 >> 4).into_bytes(),
+        FileKind::Socket(s) => format!("socket:[{}]", socket_ino(s)).into_bytes(),
         FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
         FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
+        FileKind::Pidfd(_) => b"anon_inode:[pidfd]".to_vec(),
         FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
         FileKind::SignalFd(_) => b"anon_inode:[signalfd]".to_vec(),
         FileKind::Host(fd) => std::fs::read_link(format!("/proc/self/fd/{fd}"))
@@ -623,6 +636,17 @@ pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<()
             &mut k.domainname
         };
         *slot = name.to_vec();
+    }
+    // 与 Linux 一样按页向上取整到 2 的幂，超过 2^31 是 EINVAL
+    if let PseudoNode::Static(b"sys/fs/pipe-max-size") = node {
+        let size: u64 = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| n <= 1 << 31)
+            .ok_or(Errno::EINVAL)?;
+        k.pipe_max_size = (size as usize)
+            .max(crate::pipe::PIPE_BUF)
+            .next_power_of_two();
     }
     if let PseudoNode::Entry(pid, _, Entry::OomScoreAdj) = node {
         let value: i32 = std::str::from_utf8(data)
@@ -818,9 +842,9 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     };
     let (vsize, rss) = mem_of(task.as_deref());
     let (sigign, sigcgt) = sig_dispositions(&g);
-    let (pending, blocked) = task
-        .as_ref()
-        .map_or((0, 0), |t| (t.pending.get() | g.pending, t.sigmask.get()));
+    let (pending, blocked) = task.as_ref().map_or((0, 0), |t| {
+        (t.pending.borrow().set() | g.pending.set(), t.sigmask.get())
+    });
     let (args, env) = task.as_ref().map_or(((0, 0), (0, 0)), |t| {
         let res = t.res.borrow();
         let mm = res.mm.borrow();
@@ -871,7 +895,7 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     });
     let (pending, blocked) = task
         .as_ref()
-        .map_or((0, 0), |t| (t.pending.get(), t.sigmask.get()));
+        .map_or((0, 0), |t| (t.pending.borrow().set(), t.sigmask.get()));
     let mut s = String::new();
     let comm = comm_str(task.as_deref(), pid);
     writeln!(s, "Name:\t{comm}").unwrap();
@@ -898,8 +922,14 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
         writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
     }
     writeln!(s, "Threads:\t{}", g.threads.len().max(1)).unwrap();
-    writeln!(s, "SigQ:\t0/63432").unwrap();
-    writeln!(s, "SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}", g.pending).unwrap();
+    let limit = g.rlimits[crate::process::RLIMIT_SIGPENDING as usize].0;
+    writeln!(s, "SigQ:\t{}/{limit}", crate::signal::queued(ps.k, &g)).unwrap();
+    writeln!(
+        s,
+        "SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}",
+        g.pending.set()
+    )
+    .unwrap();
     writeln!(
         s,
         "SigBlk:\t{blocked:016x}\nSigIgn:\t{sigign:016x}\nSigCgt:\t{sigcgt:016x}"
@@ -932,7 +962,15 @@ fn maps(task: &Task) -> String {
             if r.prot & 4 != 0 { 'x' } else { '-' },
             if r.shared { 's' } else { 'p' },
         );
-        let line = format!("{:08x}-{:08x} {perms} 00000000 00:00 0", r.start, r.end);
+        // 文件映射的设备号是根文件系统的 8:1（与 stat 的 st_dev 相同）
+        let (offset, dev, ino) = match r.file {
+            Some((offset, ino)) => (offset, "08:01", ino),
+            None => (0, "00:00", 0),
+        };
+        let line = format!(
+            "{:08x}-{:08x} {perms} {offset:08x} {dev} {ino}",
+            r.start, r.end
+        );
         match &r.name {
             Some(name) => writeln!(s, "{line:<73}{}", String::from_utf8_lossy(name)).unwrap(),
             None => writeln!(s, "{line}").unwrap(),
@@ -944,6 +982,13 @@ fn maps(task: &Task) -> String {
 const MOUNTS: &str = "appine / ext4 rw,relatime 0 0\n\
     proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
     devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0\n";
+
+/// `/proc/<pid>/mountinfo`：挂载点的编号与 fdinfo 的 mnt_id 一致，设备号与 stat 的
+/// st_dev 一致。
+const MOUNTINFO: &str = "1 1 8:1 / / rw,relatime - ext4 appine rw\n\
+    2 1 0:4 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n\
+    3 1 0:24 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts \
+    rw,gid=5,mode=620,ptmxmode=000\n";
 
 const HWCAP_NAMES: [&str; 12] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
@@ -1025,6 +1070,39 @@ fn global_stat(ps: &View<'_>) -> String {
     s
 }
 
+/// 所有打开着的 socket（同一个只算一次）和打开它的进程的 fsuid，按 inode 排列。
+/// 只在 SCM_RIGHTS 消息里、或者等着 accept 的 socket 不算。
+fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
+    let mut tables = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for task in k.tasks.values() {
+        let fds = task.res.borrow().fds.clone();
+        if !tables.insert(Rc::as_ptr(&fds)) {
+            continue;
+        }
+        let uid = k
+            .groups
+            .get(&task.tgid)
+            .map_or(0, |g| g.borrow().cred.fsuid);
+        let fds = fds.borrow();
+        for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
+            if let FileKind::Socket(s) = &file.borrow().kind
+                && seen.insert(Rc::as_ptr(s))
+            {
+                out.push((s.clone(), uid));
+            }
+        }
+    }
+    out.sort_by_key(|(s, _)| socket_ino(s));
+    out
+}
+
+/// socket 的 inode 号（fstat、`/proc/<pid>/fd` 的 `socket:[n]`）。
+pub(crate) fn socket_ino(s: &SocketRef) -> u64 {
+    Rc::as_ptr(s) as u64 >> 4
+}
+
 /// `/proc/net/dev`：宿主接口的列表，流量计数都是 0。
 fn net_dev() -> String {
     let mut s = String::from(
@@ -1084,13 +1162,18 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         },
         Static(path) => match &path[..] {
             b"net/dev" => net_dev(),
+            b"net/tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, SOCK_STREAM),
+            b"net/tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, SOCK_STREAM),
+            b"net/udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, SOCK_DGRAM),
+            b"net/udp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, SOCK_DGRAM),
+            b"net/unix" => crate::unix::proc_listing(&sockets(ps.k)),
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => "45\n".to_owned(),
             b"sys/fs/inotify/max_queued_events" => format!("{}\n", crate::syscall::MAX_QUEUED),
             b"sys/fs/inotify/max_user_instances" => "128\n".to_owned(),
             b"sys/fs/inotify/max_user_watches" => format!("{}\n", crate::syscall::MAX_WATCHES),
             b"sys/fs/nr_open" => format!("{}\n", crate::fd::MAX_FDS),
-            b"sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE),
+            b"sys/fs/pipe-max-size" => format!("{}\n", ps.k.pipe_max_size),
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
@@ -1115,6 +1198,9 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
             b"sys/kernel/random/boot_id" => format!("{}\n", format_uuid(&ps.k.boot_id)),
+            b"sys/kernel/random/entropy_avail" | b"sys/kernel/random/poolsize" => {
+                format!("{}\n", crate::syscall::ENTROPY)
+            }
             b"sys/kernel/random/uuid" => format!("{}\n", random_uuid()),
             b"sys/kernel/version" => "#1 SMP PREEMPT appine\n".to_owned(),
             b"sys/vm/overcommit_memory" => "0\n".to_owned(),
@@ -1138,6 +1224,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 }
                 self::Entry::Maps => task.map_or(String::new(), |t| maps(&t)),
                 self::Entry::Mounts => MOUNTS.to_owned(),
+                self::Entry::MountInfo => MOUNTINFO.to_owned(),
                 self::Entry::OomScoreAdj => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
@@ -1182,6 +1269,13 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
     match &f.kind {
         FileKind::EventFd(e) => s += &format!("eventfd-count: {:16x}\n", e.borrow().count),
         FileKind::Inotify(i) => s += &i.borrow().fdinfo(),
+        FileKind::Pidfd(p) => {
+            let pid = if p.exited() { -1 } else { p.tgid };
+            s += &format!("Pid:\t{pid}\nNSpid:\t{pid}\n");
+        }
+        FileKind::Epoll(e) => s += &e.borrow().fdinfo(),
+        FileKind::TimerFd(t) => s += &t.borrow_mut().fdinfo(),
+        FileKind::SignalFd(sfd) => s += &format!("sigmask:\t{:016x}\n", sfd.borrow().mask),
         _ => {}
     }
     Ok(s)

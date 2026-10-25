@@ -75,7 +75,10 @@ failed=0
 for name in "$@"; do
     script="exec 2>&1; $(cat "tests/diff/$name.sh")"
     set +e
-    docker run --rm --platform linux/arm64 -e "$env_path" -e HOME=/root -w / "$image" \
+    # Docker 默认的 seccomp 规则会改掉一些 syscall 的结果（clone3 返回 ENOSYS，
+    # pidfd_getfd 返回 EPERM），比对的应当是内核本身的行为
+    docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
+        -e "$env_path" -e HOME=/root -w / "$image" \
         /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
     echo "exit $?" >>"$out/$name.native"
     appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root -- \

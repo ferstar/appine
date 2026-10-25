@@ -114,6 +114,8 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             (if ready.is_empty() { 0 } else { POLLIN }, None)
         }
         FileKind::Epoll(_) => (0, None),
+        // 6.9 起进程被回收之后还有 POLLHUP；这里与 6.1 相同
+        FileKind::Pidfd(p) => (if p.exited() { POLLIN | POLLRDNORM } else { 0 }, None),
         FileKind::Path(_) => (POLLNVAL, None),
         _ => (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, None),
     }
@@ -444,6 +446,34 @@ pub(crate) struct Epoll {
 }
 
 impl Epoll {
+    /// 关注里 fd 为 `fd` 的第 `nth` 个（从 0 数）的打开文件（kcmp 的 `KCMP_EPOLL_TFD`）。
+    pub(crate) fn target(&self, fd: i32, nth: usize) -> Option<FileRef> {
+        self.interests
+            .iter()
+            .filter(|i| i.fd == fd)
+            .filter_map(|i| i.file.upgrade())
+            .nth(nth)
+    }
+
+    /// `/proc/<pid>/fdinfo` 里每个关注一行。与 Linux 一样，关注的事件总是带着
+    /// EPOLLERR 和 EPOLLHUP。
+    pub(crate) fn fdinfo(&self) -> String {
+        let mut s = String::new();
+        for int in &self.interests {
+            let Some(file) = int.file.upgrade() else {
+                continue;
+            };
+            let f = file.borrow();
+            let (dev, ino) = super::fs::dev_ino(&f);
+            let events = int.events | (POLLERR | POLLHUP) as u32;
+            s += &format!(
+                "tfd: {:8} events: {events:8x} data: {:16x}  pos:{} ino:{ino:x} sdev:{dev:x}\n",
+                int.fd, int.data, f.pos
+            );
+        }
+        s
+    }
+
     /// 立即检查哪些关注就绪，最多 `max` 个：(下标, 事件)。只检查，不消耗边沿触发的
     /// 事件（报告之后由 [`Epoll::reported`] 记下）。
     fn ready(&self, depth: u32, max: usize) -> Vec<(usize, u32)> {

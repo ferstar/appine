@@ -42,6 +42,7 @@ pub(super) fn timerfd_create(cx: &mut Cx<'_>, clock: i32, flags: u32) -> SysResu
         deadline: None,
         interval: Duration::ZERO,
         expirations: 0,
+        settime_flags: 0,
     };
     let file = OpenFile::new(
         FileKind::TimerFd(Rc::new(RefCell::new(t))),
@@ -71,11 +72,7 @@ fn timespec(b: &[u8]) -> Result<Duration, Errno> {
 
 /// `struct itimerspec`：间隔和离下一次到期还有多久（没有启动时都是 0）。
 fn current(t: &mut TimerFd) -> [u8; 32] {
-    let now = Instant::now();
-    t.update(now);
-    let left = t
-        .deadline
-        .map_or(Duration::ZERO, |d| d.saturating_duration_since(now));
+    let left = t.remaining(Instant::now());
     let mut b = [0u8; 32];
     for (o, d) in [(0, t.interval), (16, left)] {
         b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
@@ -104,6 +101,7 @@ pub(super) fn timerfd_settime(
     }
     t.interval = interval;
     t.expirations = 0;
+    t.settime_flags = flags;
     t.deadline = if value.is_zero() {
         None
     } else if flags & TFD_TIMER_ABSTIME != 0 {

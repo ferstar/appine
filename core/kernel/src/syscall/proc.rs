@@ -6,7 +6,9 @@ use std::rc::Rc;
 use appine_engine::Cpu;
 
 use super::{Flow, SysResult, put, read_path};
+use crate::cred::cap;
 use crate::errno::Errno;
+use crate::fd::{FileKind, FileRef, OpenFile, Pidfd, oflags};
 use crate::kernel::{Cx, Tid};
 use crate::loader::{self, Args, LoadError};
 use crate::mm::Mm;
@@ -14,8 +16,8 @@ use crate::process::{self, ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
-use crate::vfs::normalize;
 use crate::vfs::store::mode;
+use crate::vfs::{Node, normalize};
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
@@ -28,9 +30,18 @@ const CLONE_THREAD: u64 = 0x10000;
 const CLONE_SETTLS: u64 = 0x80000;
 const CLONE_PARENT_SETTID: u64 = 0x100000;
 const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+const CLONE_DETACHED: u64 = 0x400000;
 const CLONE_CHILD_SETTID: u64 = 0x1000000;
-/// 各种 `CLONE_NEW*`：不支持 namespace（设计文档 §6）。
-const CLONE_NEW_MASK: u64 = 0x0002_0000 | 0x7e00_0000;
+const CLONE_NEWNS: u64 = 0x0002_0000;
+const CLONE_NEWUSER: u64 = 0x1000_0000;
+/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：不支持 namespace（设计文档 §6）。
+const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
+/// clone3：子进程的信号处理函数恢复默认。
+const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+/// clone3：子进程放进 `cgroup` 指定的 cgroup。
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+/// 低 8 位：clone 的退出信号。
+const CSIGNAL: u64 = 0xff;
 
 const WNOHANG: u32 = 1;
 const WUNTRACED: u32 = 2;
@@ -44,6 +55,11 @@ const WCLONE: u32 = 0x8000_0000;
 const P_ALL: u32 = 0;
 const P_PID: u32 = 1;
 const P_PGID: u32 = 2;
+const P_PIDFD: u32 = 3;
+
+const AT_FDCWD: i32 = -100;
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const AT_EMPTY_PATH: u32 = 0x1000;
 
 /// execve 的参数和环境变量最多占用的字节数（与初始栈的上限一致）。
 const MAX_ARG_BYTES: usize = (loader::STACK_SIZE / 4) as usize;
@@ -72,7 +88,20 @@ pub(super) fn set_tid_address(cx: &mut Cx<'_>, addr: u64) -> SysResult {
     Ok(cx.tid() as u64)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// clone 和 clone3 的参数（Linux 的 `struct kernel_clone_args`）。
+struct CloneArgs {
+    flags: u64,
+    /// 子进程退出时发给父进程的信号，0 表示不发。
+    exit_signal: i32,
+    /// 子线程的栈顶，0 表示沿用父线程的 sp。
+    stack: u64,
+    ptid: u64,
+    tls: u64,
+    ctid: u64,
+    /// `CLONE_PIDFD`：新进程的 pidfd 写到哪里。
+    pidfd: u64,
+}
+
 pub(super) fn clone(
     cx: &mut Cx<'_>,
     cpu: &Cpu,
@@ -82,17 +111,102 @@ pub(super) fn clone(
     tls: u64,
     ctid: u64,
 ) -> SysResult {
-    if flags & CLONE_NEW_MASK != 0 {
-        return Err(Errno::EPERM);
+    // 只看低 32 位；pidfd 写在 parent_tid 那里，所以不能再同时要 CLONE_PARENT_SETTID
+    let flags = flags & 0xffff_ffff;
+    if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 {
+        return Err(Errno::EINVAL);
     }
-    if (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
+    let args = CloneArgs {
+        flags: flags & !CSIGNAL,
+        exit_signal: (flags & CSIGNAL) as i32,
+        stack,
+        ptid,
+        tls,
+        ctid,
+        pidfd: ptid,
+    };
+    do_clone(cx, cpu, args)
+}
+
+/// clone3：参数在 `struct clone_args` 里，比 clone 多了 pidfd、栈的大小和 set_tid。
+pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &Cpu, uargs: u64, size: usize) -> SysResult {
+    // CLONE_ARGS_SIZE_VER0 和已知的最大长度（VER2）
+    const MIN: usize = 64;
+    const KNOWN: usize = 88;
+    if size < MIN {
+        return Err(Errno::EINVAL);
+    }
+    if size > appine_engine::PAGE_SIZE as usize {
+        return Err(Errno::E2BIG);
+    }
+    let mut b = vec![0u8; size];
+    cx.mm().read(UserSlice::new(uargs, size), &mut b)?;
+    // 新内核的程序传来更长的结构体：多出来的部分必须是零
+    if b.get(KNOWN..)
+        .is_some_and(|rest| rest.iter().any(|&x| x != 0))
+    {
+        return Err(Errno::E2BIG);
+    }
+    b.resize(KNOWN, 0);
+    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    let (flags, pidfd, ctid, ptid, exit_signal) = (w(0), w(1), w(2), w(3), w(4));
+    let (stack, stack_size, tls, set_tid, set_tid_size) = (w(5), w(6), w(7), w(8), w(9));
+    let known = 0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP;
+    let invalid = flags & !known != 0
+        || flags & (CLONE_DETACHED | (CSIGNAL & !0x80)) != 0
+        || flags & CLONE_SIGHAND != 0 && flags & CLONE_CLEAR_SIGHAND != 0
+        || flags & (CLONE_THREAD | CLONE_PARENT) != 0 && exit_signal != 0
+        || exit_signal > Signal::MAX as u64
+        || (stack == 0) != (stack_size == 0)
+        || set_tid_size > 32
+        || (set_tid == 0) != (set_tid_size == 0);
+    if invalid {
+        return Err(Errno::EINVAL);
+    }
+    // 不能指定 pid（要 CAP_CHECKPOINT_RESTORE，CRIU 用），也没有 cgroup
+    if set_tid_size != 0 || flags & CLONE_INTO_CGROUP != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 && pidfd == ptid {
+        return Err(Errno::EINVAL);
+    }
+    let args = CloneArgs {
+        flags,
+        exit_signal: exit_signal as i32,
+        stack: if stack != 0 {
+            stack.wrapping_add(stack_size)
+        } else {
+            0
+        },
+        ptid,
+        tls,
+        ctid,
+        pidfd,
+    };
+    do_clone(cx, cpu, args)
+}
+
+fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
+    let CloneArgs {
+        flags,
+        stack,
+        ptid,
+        tls,
+        ctid,
+        ..
+    } = args;
+    let both = |a: u64, b: u64| flags & (a | b) == a | b;
+    if both(CLONE_NEWNS, CLONE_FS)
+        || both(CLONE_NEWUSER, CLONE_FS)
+        || (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
         || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
+        || (flags & CLONE_PIDFD != 0 && flags & (CLONE_DETACHED | CLONE_THREAD) != 0)
     {
         return Err(Errno::EINVAL);
     }
-    // pidfd 还没有实现（pidfd_open 返回 ENOSYS）。CLONE_PIDFD 与 5.2 之前的内核一样被
-    // 忽略，不写回 pidfd：Go 预先把它设成 -1，据此知道不支持
-    let flags = flags & !CLONE_PIDFD;
+    if flags & CLONE_NEW_MASK != 0 {
+        return Err(Errno::EPERM);
+    }
     let thread = flags & CLONE_THREAD != 0;
     let tid = cx.k().alloc_tid()?;
 
@@ -125,7 +239,12 @@ pub(super) fn clone(
         let sighand = if flags & CLONE_SIGHAND != 0 {
             parent.sighand.clone()
         } else {
-            Rc::new(RefCell::new(parent.sighand.borrow().clone()))
+            let mut h = parent.sighand.borrow().clone();
+            // 与 execve 一样：装了处理函数的恢复默认，忽略的仍然忽略
+            if flags & CLONE_CLEAR_SIGHAND != 0 {
+                h.reset_on_exec();
+            }
+            Rc::new(RefCell::new(h))
         };
         let ppid = if flags & CLONE_PARENT != 0 {
             parent.ppid
@@ -145,7 +264,7 @@ pub(super) fn clone(
         g.thp_disable = parent.thp_disable;
         g.ctty = parent.ctty.clone();
         g.exe = parent.exe.clone();
-        g.exit_signal = (flags & 0xff) as i32;
+        g.exit_signal = args.exit_signal;
         Rc::new(RefCell::new(g))
     };
 
@@ -213,8 +332,24 @@ pub(super) fn clone(
         mm.borrow()
             .write(UserSlice::new(ctid, 4), &tid.to_le_bytes())?;
     }
+    // CLONE_PIDFD：在父进程里打开新进程的 pidfd（没有 CLONE_FILES 时子进程看不到它）
+    let pidfd = if flags & CLONE_PIDFD != 0 {
+        let fd = cx.fds_mut().install(new_pidfd(tid, &group, 0), true, 0)?;
+        if let Err(e) = put(cx, args.pidfd, fd.to_le_bytes()) {
+            let _ = cx.fds_mut().close(fd);
+            return Err(e);
+        }
+        Some(fd)
+    } else {
+        None
+    };
     let shared = cx.shared;
-    task::start(shared, cx.k(), task, child_cpu)?;
+    if let Err(e) = task::start(shared, cx.k(), task, child_cpu) {
+        if let Some(fd) = pidfd {
+            let _ = cx.fds_mut().close(fd);
+        }
+        return Err(e);
+    }
     if !thread {
         let ppid = group.borrow().ppid;
         let k = cx.k();
@@ -277,11 +412,17 @@ fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
 }
 
-/// 给程序和解释器的映射起名字（`/proc/<pid>/maps`）。
-pub(crate) fn label_image(mm: &mut Mm, image: &loader::Image, exe: &Rc<[u8]>) {
-    mm.label(image.main.0, image.main.1 - image.main.0, exe.clone());
+/// 给程序和解释器的映射起名字（`/proc/<pid>/maps`）。`inos` 是它们在仓库里的 inode
+/// （不知道时是 0）。
+pub(crate) fn label_image(mm: &mut Mm, image: &loader::Image, exe: &Rc<[u8]>, inos: (u64, u64)) {
+    mm.label(
+        image.main.0,
+        image.main.1 - image.main.0,
+        Some(exe.clone()),
+        inos.0,
+    );
     if let Some((path, start, end)) = &image.interp {
-        mm.label(*start, end - start, Rc::from(path.as_slice()));
+        mm.label(*start, end - start, Some(Rc::from(path.as_slice())), inos.1);
     }
 }
 
@@ -301,6 +442,34 @@ pub(super) fn execve(
     envp: u64,
 ) -> Result<(), Errno> {
     let path = read_path(cx, path)?;
+    exec(cx, cpu, AT_FDCWD, path, argv, envp, 0)
+}
+
+/// execveat：路径相对 `dirfd`；`AT_EMPTY_PATH` 且路径为空时执行 `dirfd` 本身（fexecve）。
+pub(super) fn execveat(
+    cx: &mut Cx<'_>,
+    cpu: &mut Cpu,
+    dirfd: i32,
+    path: u64,
+    (argv, envp): (u64, u64),
+    flags: u32,
+) -> Result<(), Errno> {
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let path = read_path(cx, path)?;
+    exec(cx, cpu, dirfd, path, argv, envp, flags)
+}
+
+fn exec(
+    cx: &mut Cx<'_>,
+    cpu: &mut Cpu,
+    dirfd: i32,
+    path: Vec<u8>,
+    argv: u64,
+    envp: u64,
+    flags: u32,
+) -> Result<(), Errno> {
     let mut total = 0;
     let mut argv = read_strings(cx, argv, &mut total)?;
     let envp = read_strings(cx, envp, &mut total)?;
@@ -313,10 +482,41 @@ pub(super) fn execve(
     let view = cx.view(&vfs);
     let cred = cx.cred();
 
-    // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
-    let mut file_path = path.clone();
+    // 新程序看到的路径（AT_EXECFN、comm、脚本解释器的参数）：路径不是从当前目录或者根
+    // 目录出发时，与 Linux 一样是 /dev/fd/<dirfd>[/<路径>]
+    let by_fd = dirfd != AT_FDCWD && !path.starts_with(b"/");
+    let filename = match (by_fd, path.is_empty()) {
+        (false, _) => path.clone(),
+        (true, true) => format!("/dev/fd/{dirfd}").into_bytes(),
+        (true, false) => [format!("/dev/fd/{dirfd}/").as_bytes(), &path].concat(),
+    };
+    // /proc/<pid>/exe 的路径从哪里算：(起点目录, 相对它的路径)
+    let mut exe_at = (cwd.clone(), path.clone());
+    // comm 取路径的最后一段；执行的是 fd 本身时取文件名，不是 fd 的编号
+    let mut comm = filename.clone();
     let root = cx.root();
-    let (mut file, mut st) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &file_path)?;
+    let node = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dirfd == AT_FDCWD {
+            cwd.clone()
+        } else {
+            let file = cx.fds().get(dirfd)?;
+            let f = file.borrow();
+            exe_at.1 = f.path.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
+            if !exe_at.1.is_empty() {
+                comm.clone_from(&exe_at.1);
+            }
+            f.node().ok_or(Errno::EACCES)?
+        }
+    } else {
+        let start = super::fs::start_dir(cx, dirfd, &path)?;
+        exe_at.0 = start.clone();
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        vfs.resolve(&view, &cred, &root, &start, &path, follow)?
+    };
+    let (mut file, mut st) = process::open_node(&vfs, &cred, &node)?;
+
+    // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
+    let mut file_path = filename.clone();
     for depth in 0.. {
         let Some((interp, arg)) = parse_shebang(file.bytes()) else {
             break;
@@ -324,12 +524,17 @@ pub(super) fn execve(
         if depth == MAX_INTERP_DEPTH {
             return Err(Errno::ELOOP);
         }
+        // 解释器要按路径打开脚本，close-on-exec 的 dirfd 到时已经关了
+        if depth == 0 && by_fd && cx.fds().cloexec(dirfd)? {
+            return Err(Errno::ENOENT);
+        }
         let mut new_argv = vec![interp.clone()];
         new_argv.extend(arg);
         new_argv.push(file_path);
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
         (file, st) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
+        exe_at = (cwd.clone(), interp.clone());
         file_path = interp;
     }
     // 以写方式打开着的程序不能执行
@@ -338,13 +543,14 @@ pub(super) fn execve(
     }
     // /proc/<pid>/exe 和 maps 里显示的绝对路径，符号链接全部解析：musl 按它展开主程序
     // 的 `$ORIGIN`，经由 /usr/bin/java 这种链接启动的程序靠它找到自己的库
-    let exe: Rc<[u8]> = match vfs.real_path(&view, &cred, &root, &cwd, &file_path) {
+    let (exe_dir, exe_path) = &exe_at;
+    let exe: Rc<[u8]> = match vfs.real_path(&view, &cred, &root, exe_dir, exe_path) {
         Ok(p) => Rc::from(p),
-        Err(_) if file_path.starts_with(b"/") => Rc::from(normalize(&file_path)),
+        Err(_) if exe_path.starts_with(b"/") => Rc::from(normalize(exe_path)),
         Err(_) => {
-            let mut p = vfs.path_of(&view, &root, &cwd)?;
+            let mut p = vfs.path_of(&view, &root, exe_dir)?;
             p.push(b'/');
-            p.extend_from_slice(&file_path);
+            p.extend_from_slice(exe_path);
             Rc::from(normalize(&p))
         }
     };
@@ -361,12 +567,18 @@ pub(super) fn execve(
     let args = Args {
         argv: &argv,
         envp: &envp,
-        execfn: &path,
+        execfn: &filename,
         ids: [new_cred.ruid, new_cred.euid, new_cred.rgid, new_cred.egid],
     };
     let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cred, &root, &cwd, p);
     let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(load_error)?;
-    label_image(&mut mm, &image, &exe);
+    let interp_ino = image.interp.as_ref().and_then(|(p, ..)| {
+        match vfs.resolve(&view, &cred, &root, &cwd, p, true) {
+            Ok(Node::Store(ino)) => Some(ino),
+            _ => None,
+        }
+    });
+    label_image(&mut mm, &image, &exe, (st.ino, interp_ino.unwrap_or(0)));
     mm.exe = Some(st.ino);
 
     // 从这里开始不能失败：结束同一线程组里的其他线程，然后换掉地址空间
@@ -405,7 +617,7 @@ pub(super) fn execve(
     cx.set_mm(mm);
     cx.t.altstack = AltStack::default();
     cx.t.saved_sigmask = None;
-    cx.task.comm.set(process::comm_of(&path));
+    cx.task.comm.set(process::comm_of(&comm));
     let st = cpu.state_mut();
     st.pc = image.entry;
     st.sp = image.sp;
@@ -625,11 +837,25 @@ pub(super) fn waitid(
     {
         return Err(Errno::EINVAL);
     }
+    let mut nonblock = false;
     let who = match idtype {
         P_ALL => Who::Any,
         P_PID if id > 0 => Who::Pid(id),
         P_PGID if id > 0 => Who::Pgid(id),
         P_PGID if id == 0 => Who::Pgid(cx.t.group.borrow().pgid),
+        // pidfd 指向的进程已经被回收、pid 分给了别人时，与 Linux 一样等不到它
+        P_PIDFD if id >= 0 => {
+            let file = cx.fds().get(id)?;
+            let f = file.borrow();
+            let FileKind::Pidfd(p) = &f.kind else {
+                return Err(Errno::EBADF);
+            };
+            nonblock = f.nonblocking();
+            match p.group(cx.kr()) {
+                Some(_) => Who::Pid(p.tgid),
+                None => return Err(Errno::ECHILD),
+            }
+        }
         _ => return Err(Errno::EINVAL),
     };
     let want = Wanted {
@@ -638,7 +864,12 @@ pub(super) fn waitid(
         continued: options & WCONTINUED != 0,
         consume: options & WNOWAIT == 0,
     };
-    let found = wait_child(cx, who, options & WNOHANG != 0, want)?;
+    let nohang = options & WNOHANG != 0;
+    let found = wait_child(cx, who, nohang || nonblock, want)?;
+    // 非阻塞的 pidfd：没有事件时返回 EAGAIN，调用者自己要求 WNOHANG 时除外
+    if found.is_none() && nonblock && !nohang {
+        return Err(Errno::EAGAIN);
+    }
     if infop != 0 {
         let info = match found {
             Some((child, event, _)) => event.siginfo(child).encode(Signal::CHLD),
@@ -651,6 +882,143 @@ pub(super) fn waitid(
         put(cx, rusage, process::encode_rusage(cpu))?;
     }
     Ok(0)
+}
+
+/// 指向线程组 `group`（pid 为 `tgid`）的新的 pidfd。
+fn new_pidfd(tgid: Tid, group: &Rc<RefCell<ThreadGroup>>, flags: u32) -> FileRef {
+    let p = Pidfd {
+        tgid,
+        group: Rc::downgrade(group),
+    };
+    OpenFile::new(FileKind::Pidfd(p), oflags::O_RDWR | flags)
+}
+
+/// pidfd_open：`flags` 只能是 `PIDFD_NONBLOCK`（6.9 起的 `PIDFD_THREAD` 不支持），
+/// pid 必须是进程而不是线程。pidfd 总是 close-on-exec。
+pub(super) fn pidfd_open(cx: &mut Cx<'_>, pid: i32, flags: u32) -> SysResult {
+    if pid <= 0 || flags & !oflags::O_NONBLOCK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let Some(group) = cx.kr().groups.get(&pid).cloned() else {
+        let thread = cx.kr().tasks.contains_key(&pid);
+        return Err(if thread { Errno::EINVAL } else { Errno::ESRCH });
+    };
+    let file = new_pidfd(pid, &group, flags);
+    cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
+}
+
+/// 能不能像 ptrace 那样访问 `target`（`PTRACE_MODE_ATTACH_REALCREDS`）：是自己；或者
+/// 真实用户和组等于目标的所有用户和组，并且目标可以 dump；或者有 `CAP_SYS_PTRACE`。
+fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
+    let me = cx.cred();
+    let t = &target.cred;
+    let same = [t.ruid, t.euid, t.suid].iter().all(|&u| u == me.ruid)
+        && [t.rgid, t.egid, t.sgid].iter().all(|&g| g == me.rgid);
+    target.tgid == cx.tgid() || (same && target.dumpable) || me.capable(cap::SYS_PTRACE)
+}
+
+/// pidfd_getfd：把 pidfd 指向的进程的 `target` 复制一份到调用者，带 close-on-exec。
+pub(super) fn pidfd_getfd(cx: &mut Cx<'_>, pidfd: i32, target: i32, flags: u32) -> SysResult {
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.fds().get(pidfd)?;
+    let group = match &file.borrow().kind {
+        FileKind::Pidfd(p) => p.group(cx.kr()).ok_or(Errno::ESRCH)?,
+        _ => return Err(Errno::EBADF),
+    };
+    let leader = group
+        .borrow()
+        .threads
+        .first()
+        .copied()
+        .ok_or(Errno::ESRCH)?;
+    if !may_ptrace(cx, &group.borrow()) {
+        return Err(Errno::EPERM);
+    }
+    let task = cx.kr().tasks.get(&leader).cloned().ok_or(Errno::ESRCH)?;
+    let fds = task.res.borrow().fds.clone();
+    let remote = fds.borrow().get(target)?;
+    cx.fds_mut().install(remote, true, 0).map(|fd| fd as u64)
+}
+
+/// kcmp：两个线程的某种资源是不是同一个。相同返回 0，不同时按对象的地址返回 1 或 2
+/// （Linux 的地址是打乱过的，只保证顺序一致）。
+pub(super) fn kcmp(
+    cx: &mut Cx<'_>,
+    pid1: i32,
+    pid2: i32,
+    ty: i32,
+    idx1: u64,
+    idx2: u64,
+) -> SysResult {
+    const KCMP_FILE: i32 = 0;
+    const KCMP_VM: i32 = 1;
+    const KCMP_FILES: i32 = 2;
+    const KCMP_FS: i32 = 3;
+    const KCMP_SIGHAND: i32 = 4;
+    const KCMP_IO: i32 = 5;
+    const KCMP_SYSVSEM: i32 = 6;
+    const KCMP_EPOLL_TFD: i32 = 7;
+    let task = |pid: i32| cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH);
+    let (t1, t2) = (task(pid1)?, task(pid2)?);
+    for t in [&t1, &t2] {
+        let group = cx.kr().groups.get(&t.tgid).cloned().ok_or(Errno::ESRCH)?;
+        if !may_ptrace(cx, &group.borrow()) {
+            return Err(Errno::EPERM);
+        }
+    }
+    let file = |t: &Task, fd: u64| -> Result<usize, Errno> {
+        let fds = t.res.borrow().fds.clone();
+        let f = fds
+            .borrow()
+            .get(i32::try_from(fd).map_err(|_| Errno::EBADF)?)?;
+        Ok(Rc::as_ptr(&f) as usize)
+    };
+    let sighand = |t: &Task| -> usize {
+        cx.kr()
+            .groups
+            .get(&t.tgid)
+            .map_or(0, |g| Rc::as_ptr(&g.borrow().sighand) as usize)
+    };
+    let (a, b) = match ty {
+        KCMP_FILE => (file(&t1, idx1)?, file(&t2, idx2)?),
+        KCMP_VM => {
+            let vm = |t: &Task| Rc::as_ptr(&t.res.borrow().mm) as usize;
+            (vm(&t1), vm(&t2))
+        }
+        KCMP_FILES => {
+            let files = |t: &Task| Rc::as_ptr(&t.res.borrow().fds) as usize;
+            (files(&t1), files(&t2))
+        }
+        KCMP_FS => {
+            let fs = |t: &Task| Rc::as_ptr(&t.res.borrow().fs) as usize;
+            (fs(&t1), fs(&t2))
+        }
+        KCMP_SIGHAND => (sighand(&t1), sighand(&t2)),
+        // 没有 IO 上下文；SysV 信号量的 undo 表不在进程之间共享，按两边都为空算
+        KCMP_IO | KCMP_SYSVSEM => (0, 0),
+        // idx2 指向 `struct kcmp_epoll_slot { efd, tfd, toff }`：t2 的 epoll 里第 toff 个
+        // fd 为 tfd 的关注
+        KCMP_EPOLL_TFD => {
+            let slot: [u8; 12] = super::get(cx, idx2)?;
+            let word = |i: usize| u32::from_le_bytes(slot[i * 4..i * 4 + 4].try_into().unwrap());
+            let fds = t2.res.borrow().fds.clone();
+            let ep = fds.borrow().get(word(0) as i32)?;
+            let target = match &ep.borrow().kind {
+                FileKind::Epoll(e) => e.borrow().target(word(1) as i32, word(2) as usize),
+                _ => return Err(Errno::EINVAL),
+            };
+            let target = target.ok_or(Errno::ENOENT)?;
+            (file(&t1, idx1)?, Rc::as_ptr(&target) as usize)
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    Ok(match a.cmp(&b) {
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Greater => 2,
+    })
 }
 
 /// pid 参数为 0 时表示调用者自己。

@@ -16,7 +16,7 @@ use crate::vfs::store::Ino;
 
 /// 管道的默认容量。
 pub const PIPE_CAPACITY: usize = 64 * 1024;
-/// 没有 `CAP_SYS_RESOURCE` 时 `F_SETPIPE_SZ` 能设置的最大容量（`/proc/sys/fs/pipe-max-size`）。
+/// `/proc/sys/fs/pipe-max-size` 的默认值：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
 pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
 /// 不超过这个长度的写入不会和其他写入交错。
 pub const PIPE_BUF: usize = 4096;
@@ -46,10 +46,10 @@ impl Pipe {
         self.capacity.saturating_sub(self.buf.len())
     }
 
-    fn new(ino: u64, fifo: Option<Ino>) -> Rc<RefCell<Pipe>> {
+    fn new(ino: u64, fifo: Option<Ino>, capacity: usize) -> Rc<RefCell<Pipe>> {
         Rc::new(RefCell::new(Pipe {
             buf: VecDeque::new(),
-            capacity: PIPE_CAPACITY,
+            capacity,
             readers: 0,
             writers: 0,
             ino,
@@ -60,8 +60,8 @@ impl Pipe {
     }
 
     /// 命名管道 `ino` 的管道对象，还没有任何一端。
-    pub fn fifo(ino: Ino) -> Rc<RefCell<Pipe>> {
-        Pipe::new(ino, Some(ino))
+    pub fn fifo(ino: Ino, capacity: usize) -> Rc<RefCell<Pipe>> {
+        Pipe::new(ino, Some(ino), capacity)
     }
 }
 
@@ -76,10 +76,10 @@ pub struct PipeEnd {
 }
 
 impl PipeEnd {
-    /// 新建匿名管道，返回 (读端, 写端)。
-    pub fn pair() -> (PipeEnd, PipeEnd) {
+    /// 新建容量为 `capacity` 的匿名管道，返回 (读端, 写端)。
+    pub fn pair(capacity: usize) -> (PipeEnd, PipeEnd) {
         static NEXT_INO: AtomicU64 = AtomicU64::new(1);
-        let pipe = Pipe::new(NEXT_INO.fetch_add(1, Ordering::Relaxed), None);
+        let pipe = Pipe::new(NEXT_INO.fetch_add(1, Ordering::Relaxed), None, capacity);
         (
             PipeEnd::open(&pipe, true, false),
             PipeEnd::open(&pipe, false, true),
