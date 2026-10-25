@@ -37,7 +37,14 @@ pub(crate) struct InetSocket {
     /// 宿主 fd（非阻塞），随这个对象一起关闭。
     pub fd: i32,
     pub family: i32,
+    /// 宿主 socket 的类型。
     pub ty: i32,
+    /// guest 建的是 `SOCK_RAW`：raw ICMP 在宿主上是 ping socket，`SO_TYPE` 和
+    /// `/proc/net/raw` 按 guest 建的报告。
+    pub raw: bool,
+    /// 数据报 socket 用 connect 连上的对端。ping 和 raw socket 没有对端端口，宿主的
+    /// getpeername 不给出对端（Linux 的 inet_getname），`/proc/net` 要用这个。
+    pub peer: Option<Vec<u8>>,
     /// 用 connect 连到了 DNS 存根（宿主 socket 本身没有连接）。
     pub stub_peer: bool,
     /// DNS 存根的回答，等 guest 读走。
@@ -52,7 +59,9 @@ impl InetSocket {
         InetSocket {
             fd,
             family,
+            raw: ty == SOCK_RAW,
             ty,
+            peer: None,
             stub_peer: false,
             answers: VecDeque::new(),
             rcvtimeo: None,
@@ -71,8 +80,10 @@ impl Drop for InetSocket {
 
 const SOL_SOCKET: i32 = 1;
 const SO_PROTOCOL: i32 = 38;
+const IPPROTO_ICMP: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
+const IPPROTO_ICMPV6: i32 = 58;
 const TCP_INFO: i32 = 11;
 /// `/proc/net` 的 st 列（Linux 的 TCP 状态，UDP 也借用其中两个）。
 const TCP_ESTABLISHED: u8 = 1;
@@ -81,11 +92,12 @@ const TCP_LISTEN: u8 = 10;
 
 /// `/proc/net` 格式的地址：IPv4 是一个 32 位字，IPv6 是四个，按内存里的字节当成小端
 /// 打印（与 arm64 上的 Linux 相同）；端口按数值。
-fn proc_addr(addr: Option<&[u8]>, v6: bool) -> String {
+fn proc_addr(addr: Option<&[u8]>, v6: bool, port: Option<u16>) -> String {
     let addr = addr.unwrap_or_default();
-    let port = addr
-        .get(2..4)
-        .map_or(0, |p| u16::from_be_bytes([p[0], p[1]]));
+    let port = port.unwrap_or_else(|| {
+        addr.get(2..4)
+            .map_or(0, |p| u16::from_be_bytes([p[0], p[1]]))
+    });
     let (start, words) = if v6 { (8, 4) } else { (4, 1) };
     let mut s = String::new();
     for w in 0..words {
@@ -99,21 +111,32 @@ fn proc_addr(addr: Option<&[u8]>, v6: bool) -> String {
     s
 }
 
-/// `/proc/net/{tcp,tcp6,udp,udp6}`：`family` 的 TCP（`ty` 是 `SOCK_STREAM`）或 UDP
-/// socket。地址和 TCP 状态从宿主 socket 查，队列长度和计时器都是 0。与 Linux 一样，
-/// IPv4 的两个文件每行补空格到固定宽度，IPv6 的不补。
+/// `/proc/net` 下列出 socket 的表。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Table {
+    Tcp,
+    Udp,
+    /// ping socket（`icmp`、`icmp6`）。
+    Icmp,
+    /// raw socket（`raw`、`raw6`）。
+    Raw,
+}
+
+/// `/proc/net/{tcp,udp,icmp,raw}` 和对应的 IPv6 文件：`family` 的这一种 socket。地址和
+/// TCP 状态从宿主 socket 查，队列长度和计时器都是 0。与 Linux 一样，ping 和 raw socket
+/// 的对端端口总是 0，raw socket 的本端端口是协议号；IPv4 的 tcp、udp、icmp 每行补空格
+/// 到固定宽度，raw 和 IPv6 的不补。
 pub(crate) fn proc_listing(
     sockets: &[(crate::syscall::SocketRef, u32)],
     family: i32,
-    ty: i32,
+    table: Table,
 ) -> String {
-    let (v6, tcp) = (family == AF_INET6, ty == SOCK_STREAM);
-    let width = if v6 {
-        0
-    } else if tcp {
-        149
-    } else {
-        127
+    let (v6, tcp) = (family == AF_INET6, table == Table::Tcp);
+    let width = match table {
+        _ if v6 => 0,
+        Table::Tcp => 149,
+        Table::Udp | Table::Icmp => 127,
+        Table::Raw => 0,
     };
     let address = if v6 {
         "local_address                         remote_address                        "
@@ -122,26 +145,35 @@ pub(crate) fn proc_listing(
     };
     let mut lines = vec![format!(
         "{}  sl  {address}st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode{}",
-        if tcp || v6 { "" } else { " " },
+        if table == Table::Udp && !v6 { " " } else { "" },
         if tcp { "" } else { " ref pointer drops" },
     )];
     let int = |b: Result<Vec<u8>, i32>| {
         b.ok()
             .and_then(|b| Some(i32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
     };
+    let icmp = if v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP };
     for (sock, uid) in sockets {
         let b = sock.borrow();
         let Socket::Inet(inet) = &*b else {
             continue;
         };
         let fd = inet.fd;
-        let want = if tcp { IPPROTO_TCP } else { IPPROTO_UDP };
         let proto = int(appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, 4));
-        if inet.family != family || inet.ty != ty || proto != Some(want) {
+        let listed = inet.family == family
+            && match table {
+                Table::Tcp => inet.ty == SOCK_STREAM && proto == Some(IPPROTO_TCP),
+                Table::Udp => inet.ty == SOCK_DGRAM && proto == Some(IPPROTO_UDP),
+                Table::Icmp => !inet.raw && inet.ty == SOCK_DGRAM && proto == Some(icmp),
+                Table::Raw => inet.raw,
+            };
+        if !listed {
             continue;
         }
         let local = appine_hal::net::sockname(fd, false).ok();
-        let peer = appine_hal::net::sockname(fd, true).ok();
+        let peer = appine_hal::net::sockname(fd, true)
+            .ok()
+            .or_else(|| inet.peer.clone());
         let state = if tcp {
             appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)
                 .ok()
@@ -160,13 +192,18 @@ pub(crate) fn proc_listing(
         } else {
             "2 0000000000000000 20 4 30 10 -1".to_owned()
         };
+        let (local_port, peer_port) = match table {
+            Table::Raw => (Some(proto.unwrap_or(0) as u16), Some(0)),
+            Table::Icmp => (None, Some(0)),
+            _ => (None, None),
+        };
         let sl = lines.len() - 1;
         lines.push(format!(
             "{sl:>w$}: {} {} {state:02X} 00000000:00000000 00:00000000 00000000 {uid:5} {:8} {ino} {tail}",
-            proc_addr(local.as_deref(), v6),
-            proc_addr(peer.as_deref(), v6),
+            proc_addr(local.as_deref(), v6, local_port),
+            proc_addr(peer.as_deref(), v6, peer_port),
             0,
-            w = if tcp { 4 } else { 5 },
+            w = if tcp || table == Table::Raw && !v6 { 4 } else { 5 },
         ));
     }
     lines.iter().map(|l| format!("{l:<width$}\n")).collect()

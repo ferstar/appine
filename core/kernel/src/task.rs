@@ -65,6 +65,9 @@ pub(crate) struct Task {
     pub sleeping: Cell<bool>,
     /// 线程名（`prctl(PR_SET_NAME)`）。
     pub comm: Cell<[u8; 16]>,
+    /// nice 值（-20–19）：与 Linux 一样属于线程，新线程继承创建者的。宿主线程跟着
+    /// 设置（`syscall::sched`）。
+    pub nice: Cell<i32>,
     /// 调度策略（含 `SCHED_RESET_ON_FORK`）和实时优先级：只记录，由宿主调度。
     pub sched: Cell<(i32, i32)>,
     /// `SCHED_DEADLINE` 的 (runtime, deadline, period)，纳秒。
@@ -138,6 +141,7 @@ impl Task {
             killed: Cell::new(false),
             sleeping: Cell::new(false),
             comm: Cell::new(comm),
+            nice: Cell::new(0),
             sched: Cell::new((0, 0)),
             deadline: Cell::new((0, 0, 0)),
             timerslack: Cell::new((50_000, 50_000)),
@@ -215,6 +219,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         let task = k.tasks[&tid].clone();
         task.clock.set(appine_hal::thread_cpu_clock());
         task.host_tid.set(appine_hal::gettid());
+        crate::syscall::host_started(&task);
         let generations = task.state.borrow().mm.borrow().generations();
         let sync = task.sync.clone();
         (task, sync, generations, k.tier)
@@ -331,6 +336,10 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 signal::force(cx, Signal::BUS, info);
                 return signal::deliver(cx, cpu, false);
             }
+            // 向下增长的映射（MAP_GROWSDOWN）长到这里：重新执行
+            if cx.mm_mut().grow_down(addr) {
+                return signal::deliver(cx, cpu, false);
+            }
             let mapped = cx.mm().is_mapped(addr);
             let (code, fsc) = if mapped {
                 (code::SEGV_ACCERR, FSC_PERMISSION)
@@ -422,6 +431,10 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, stats: Option<DbtStats>) {
     // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……
     drop(group);
     drop(task);
+    // fd 表里的 unix socket 关掉之后可能只剩在途的环
+    if last && !k.unix_inflight.is_empty() {
+        crate::unix::collect(&mut k);
+    }
     request_wake();
 }
 

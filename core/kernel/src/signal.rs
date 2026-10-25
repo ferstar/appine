@@ -148,6 +148,8 @@ pub(crate) enum InfoFields {
     Timer { id: i32, overrun: u32, value: u64 },
     /// 同步异常：出错地址。
     Fault { addr: u64 },
+    /// 信号驱动的 I/O（`F_SETSIG`）：就绪的事件和 fd。
+    Poll { band: i64, fd: i32 },
 }
 
 /// 一个挂起信号附带的 siginfo。
@@ -236,6 +238,10 @@ impl SigInfo {
                 b[24..32].copy_from_slice(&value.to_le_bytes());
             }
             InfoFields::Fault { addr } => b[16..24].copy_from_slice(&addr.to_le_bytes()),
+            InfoFields::Poll { band, fd } => {
+                b[16..24].copy_from_slice(&band.to_le_bytes());
+                b[24..28].copy_from_slice(&fd.to_le_bytes());
+            }
         }
         b
     }

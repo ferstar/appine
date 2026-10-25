@@ -1,5 +1,7 @@
 //! 信号类 syscall：kill 系列、sigaction、屏蔽字、sigsuspend、sigaltstack。
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use super::{SysResult, get, put, read_timespec};
@@ -155,10 +157,23 @@ pub(super) fn pidfd_send_signal(
     let file = cx.fds().get(pidfd)?;
     let tgid = match &file.borrow().kind {
         FileKind::Pidfd(p) => p.group(cx.kr()).map(|_| p.tgid).ok_or(Errno::ESRCH)?,
+        // 打开的那个进程已经回收了：pid 可能已经给了新进程
         FileKind::Directory {
             node: Node::Pseudo(PseudoNode::Pid(pid, None)),
+            process,
             ..
-        } => *pid,
+        } => {
+            let same = |g: &Rc<RefCell<crate::process::ThreadGroup>>| {
+                process
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|p| Rc::ptr_eq(&p, g))
+            };
+            match cx.kr().groups.get(pid) {
+                Some(g) if same(g) => *pid,
+                _ => return Err(Errno::ESRCH),
+            }
+        }
         _ => return Err(Errno::EBADF),
     };
     let sig = signal_arg(sig)?;
@@ -366,6 +381,10 @@ fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
             value = Some(v);
         }
         InfoFields::Fault { addr } => b[72..80].copy_from_slice(&addr.to_le_bytes()),
+        InfoFields::Poll { band, fd } => {
+            put32(20, fd as u32);
+            put32(28, band as u32);
+        }
     }
     if let Some(v) = value {
         b[44..48].copy_from_slice(&(v as u32).to_le_bytes());

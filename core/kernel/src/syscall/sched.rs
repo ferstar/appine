@@ -1,9 +1,13 @@
 //! 调度类 syscall：nice 值（getpriority、setpriority）和 `sched_*`。
 //!
-//! guest 线程就是普通的宿主线程，由宿主调度。nice 值、调度策略、实时优先级和 CPU
-//! 亲和性都只记录下来（procfs 和对应的 get 调用能看到），不影响宿主调度。权限按
-//! Linux 的规则检查：改别人的设置要求有效用户 ID 相同，提高优先级、实时策略要求
-//! `CAP_SYS_NICE`。`SCHED_DEADLINE` 的参数按 Linux 的规则检查后记录，不做带宽准入控制。
+//! guest 线程就是普通的宿主线程，由宿主调度。nice 值与 Linux 一样属于线程，和 CPU
+//! 亲和性一起设置到宿主线程上（[`apply_host`]），宿主据此分配 CPU；`SCHED_IDLE` 设成
+//! 宿主的最低优先级。guest 的 CPU `i` 是宿主允许本进程用的第 `i` 个 CPU
+//! （[`appine_hal::host_cpus`]）。实时策略和实时优先级只记录下来（procfs 和对应的 get
+//! 调用能看到）。权限
+//! 按 Linux 的规则检查：改别人的设置要求有效用户 ID 相同，提高优先级要求
+//! `RLIMIT_NICE` 允许或者 `CAP_SYS_NICE`，实时策略要求 `CAP_SYS_NICE`。`SCHED_DEADLINE`
+//! 的参数按 Linux 的规则检查后记录，不做带宽准入控制。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,7 +16,7 @@ use super::{SysResult, get, put, write_pair};
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::kernel::{Cx, INIT};
-use crate::process::ThreadGroup;
+use crate::process::{RLIMIT_NICE, ThreadGroup};
 use crate::task::Task;
 
 const PRIO_PROCESS: i32 = 0;
@@ -40,27 +44,39 @@ fn same_owner(cred: &Cred, target: &Cred) -> bool {
     cred.euid == target.euid || cred.euid == target.ruid || cred.capable(cap::SYS_NICE)
 }
 
-/// getpriority、setpriority 作用的进程（不含僵尸进程）。
-fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Rc<RefCell<ThreadGroup>>>, Errno> {
+/// getpriority、setpriority 作用的一个线程和它所在的进程。
+type Target = (Option<Rc<Task>>, Rc<RefCell<ThreadGroup>>);
+
+/// getpriority、setpriority 作用的线程（不含僵尸进程）。与 Linux 一样，`PRIO_PROCESS`
+/// 是一个线程，`PRIO_PGRP`、`PRIO_USER` 是这些进程的所有线程。内置的 init 没有线程，但
+/// 它是 root 的进程：线程是 None，nice 值总是 0，改它没有效果。
+fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Target>, Errno> {
     let k = cx.kr();
-    // 内置的 init 没有线程，但它是 root 的进程（改它的优先级没有效果）
-    let live = |g: &&Rc<RefCell<ThreadGroup>>| {
-        let g = g.borrow();
-        !g.threads.is_empty() || g.tgid == INIT
+    let threads = |g: &Rc<RefCell<ThreadGroup>>| -> Vec<Target> {
+        let gb = g.borrow();
+        if gb.tgid == INIT && gb.threads.is_empty() {
+            return vec![(None, g.clone())];
+        }
+        gb.threads
+            .iter()
+            .filter_map(|tid| k.tasks.get(tid))
+            .map(|t| (Some(t.clone()), g.clone()))
+            .collect()
     };
     let found: Vec<_> = match which {
-        PRIO_PROCESS => {
-            let tgid = match who {
-                0 => cx.tgid(),
-                tid => k.tasks.get(&tid).map_or(tid, |t| t.tgid),
-            };
-            k.groups
-                .get(&tgid)
-                .filter(live)
-                .cloned()
-                .into_iter()
-                .collect()
-        }
+        PRIO_PROCESS => match who {
+            0 => vec![(Some(cx.task.clone()), cx.t.group.clone())],
+            tid => match k.tasks.get(&tid) {
+                Some(t) => k
+                    .groups
+                    .get(&t.tgid)
+                    .map(|g| (Some(t.clone()), g.clone()))
+                    .into_iter()
+                    .collect(),
+                None if tid == INIT => k.groups.get(&INIT).map(threads).unwrap_or_default(),
+                None => Vec::new(),
+            },
+        },
         PRIO_PGRP => {
             let pgid = if who == 0 {
                 cx.t.group.borrow().pgid
@@ -69,18 +85,16 @@ fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Rc<RefCell<ThreadGro
             };
             k.groups
                 .values()
-                .filter(live)
                 .filter(|g| g.borrow().pgid == pgid)
-                .cloned()
+                .flat_map(threads)
                 .collect()
         }
         PRIO_USER => {
             let uid = if who == 0 { cx.cred().ruid } else { who as u32 };
             k.groups
                 .values()
-                .filter(live)
                 .filter(|g| g.borrow().cred.ruid == uid)
-                .cloned()
+                .flat_map(threads)
                 .collect()
         }
         _ => return Err(Errno::EINVAL),
@@ -95,7 +109,7 @@ pub(super) fn getpriority(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
     // 与 Linux 的 syscall 一样返回 20 - nice（1–40），libc 再换算回来
     let nice = targets(cx, which, who)?
         .iter()
-        .map(|g| g.borrow().nice)
+        .map(|(t, _)| t.as_ref().map_or(0, |t| t.nice.get()))
         .min()
         .unwrap();
     Ok((20 - nice) as u64)
@@ -105,27 +119,67 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
     let nice = nice.clamp(-20, 19);
     let cred = cx.cred();
     let mut result = Ok(0);
-    for g in targets(cx, which, who)? {
-        let mut g = g.borrow_mut();
-        // 别人的进程要求有效用户 ID 相同，提高优先级（降低 nice）要求 CAP_SYS_NICE
+    for (t, g) in targets(cx, which, who)? {
+        let g = g.borrow();
+        let current = t.as_ref().map_or(0, |t| t.nice.get());
+        // 别人的进程要求有效用户 ID 相同；提高优先级（降低 nice）要在目标的
+        // RLIMIT_NICE 之内，或者有 CAP_SYS_NICE（Linux 的 can_nice）
         if !same_owner(&cred, &g.cred) {
             result = Err(Errno::EPERM);
-        } else if nice < g.nice && !cred.capable(cap::SYS_NICE) {
+        } else if nice < current
+            && (20 - nice) as u64 > g.rlimits[RLIMIT_NICE as usize].0
+            && !cred.capable(cap::SYS_NICE)
+        {
             result = Err(Errno::EACCES);
-        } else {
-            g.nice = nice;
+        } else if let Some(t) = t {
+            t.nice.set(nice);
+            apply_host(&t);
         }
     }
     result
 }
 
-/// `sched_*` 的目标线程：pid 0 是自己。内置的 init 没有线程，返回 None。
+/// guest 提高优先级时，宿主线程的 nice 值最低到这里：不超过 Android 上与显示有关的
+/// 线程（-4 到 -10），guest 的忙循环不会拖慢界面。
+const HOST_NICE_FLOOR: i32 = -4;
+
+/// 宿主线程开始运行 guest 线程 `t`：它继承的是创建它的宿主线程的优先级和亲和性，换成
+/// `t` 自己的。
+pub(crate) fn host_started(t: &Task) {
+    apply_host(t);
+    let mask = t.affinity.get() & online_cpus();
+    if mask != online_cpus() {
+        appine_hal::set_thread_affinity(t.host_tid.get(), mask);
+    }
+}
+
+/// 按 guest 线程的 nice 值和调度策略设置它的宿主线程的 nice 值。`SCHED_IDLE` 用宿主
+/// 最低的优先级。宿主线程还没有开始运行时，由它开始时设置。
+fn apply_host(t: &Task) {
+    let tid = t.host_tid.get();
+    if tid == 0 {
+        return;
+    }
+    let nice = if t.sched.get().0 & !SCHED_RESET_ON_FORK == SCHED_IDLE {
+        19
+    } else {
+        t.nice.get().max(HOST_NICE_FLOOR)
+    };
+    appine_hal::set_thread_nice(tid, nice);
+}
+
+/// `sched_*` 的目标线程：pid 0 是自己。内置的 init 没有线程，返回 None。僵尸进程（和
+/// 组长已经退出的进程）也是 None：Linux 上回收之前还能找到组长，按默认的调度参数处理。
 fn target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
     match pid {
         p if p < 0 => Err(Errno::EINVAL),
         0 => Ok(Some(cx.task.clone())),
         INIT => Ok(None),
-        p => cx.kr().tasks.get(&p).cloned().map(Some).ok_or(Errno::ESRCH),
+        p => match cx.kr().tasks.get(&p) {
+            Some(t) => Ok(Some(t.clone())),
+            None if cx.kr().groups.contains_key(&p) => Ok(None),
+            None => Err(Errno::ESRCH),
+        },
     }
 }
 
@@ -135,16 +189,17 @@ fn cred_of(cx: &Cx<'_>, task: Option<&Rc<Task>>) -> Cred {
         .map_or_else(Cred::root, |g| g.borrow().cred.clone())
 }
 
-/// fork 出来的线程继承的调度策略：`SCHED_RESET_ON_FORK` 时回到普通策略。
-pub(super) fn inherit((policy, priority): (i32, i32)) -> (i32, i32) {
+/// 新线程继承的调度策略和 nice 值：`SCHED_RESET_ON_FORK` 时实时策略回到普通策略，
+/// 负的 nice 值回到 0。
+pub(super) fn inherit((policy, priority): (i32, i32), nice: i32) -> ((i32, i32), i32) {
     if policy & SCHED_RESET_ON_FORK != 0 {
         let base = policy & !SCHED_RESET_ON_FORK;
         if matches!(base, SCHED_FIFO | SCHED_RR) {
-            return (SCHED_OTHER, 0);
+            return ((SCHED_OTHER, 0), 0);
         }
-        return (base, priority);
+        return ((base, priority), nice.max(0));
     }
-    (policy, priority)
+    ((policy, priority), nice)
 }
 
 /// 设置调度策略：检查策略、优先级和权限。
@@ -169,6 +224,7 @@ fn set_policy(
     }
     if let Some(t) = task {
         t.sched.set((policy, priority));
+        apply_host(t);
     }
     Ok(())
 }
@@ -289,8 +345,8 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
     if !matches!(policy, SCHED_FIFO | SCHED_RR)
         && let Some(t) = &task
     {
-        let tgid = t.tgid;
-        setpriority(cx, PRIO_PROCESS, tgid, nice)?;
+        let tid = t.tid.get();
+        setpriority(cx, PRIO_PROCESS, tid, nice)?;
     }
     Ok(0)
 }
@@ -308,10 +364,7 @@ pub(super) fn sched_getattr(
     }
     let task = target(cx, pid)?;
     let (policy, priority) = task.as_ref().map_or((SCHED_OTHER, 0), |t| t.sched.get());
-    let nice = task
-        .as_ref()
-        .and_then(|t| cx.kr().groups.get(&t.tgid))
-        .map_or(0, |g| g.borrow().nice);
+    let nice = task.as_ref().map_or(0, |t| t.nice.get());
     let n = size.min(SCHED_ATTR_SIZE);
     let mut b = [0u8; SCHED_ATTR_SIZE];
     b[..4].copy_from_slice(&(n as u32).to_le_bytes());
@@ -338,9 +391,7 @@ pub(super) fn sched_getattr(
 
 /// 宿主的 CPU 个数对应的掩码（最多 64 个）。
 fn online_cpus() -> u64 {
-    let cpus = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(64);
+    let cpus = appine_hal::host_cpus().len();
     if cpus == 64 {
         u64::MAX
     } else {
@@ -372,6 +423,9 @@ pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
     }
     if let Some(t) = task {
         t.affinity.set(new);
+        if t.host_tid.get() != 0 {
+            appine_hal::set_thread_affinity(t.host_tid.get(), new);
+        }
     }
     Ok(0)
 }

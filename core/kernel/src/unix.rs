@@ -6,15 +6,17 @@
 //!   （`sun_path` 以 NUL 开头）只存在于 [`Names`]。
 //! - `SCM_RIGHTS` 传递的是打开文件本身，接收时装进接收进程的 fd 表。`SO_PEERCRED`、
 //!   `SCM_CREDENTIALS` 给出对方的 pid 和有效用户 ID、组 ID。
-//! - socket 经由自己传递自己形成的环不会被回收（Linux 用专门的垃圾回收处理这种情况）。
+//! - 只经由在途的 `SCM_RIGHTS` 消息互相引用的 socket 形成 Rc 的环（打开文件 → socket →
+//!   接收队列 → 消息 → 打开文件），程序已经够不着它们。与 Linux 的 unix_gc 一样，关闭
+//!   unix socket 和进程退出之后找出这样的 socket，清空它们的接收队列（[`collect`]）。
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use crate::fd::FileRef;
-use crate::kernel::request_wake;
+use crate::fd::{FileKind, FileRef, OpenFile};
+use crate::kernel::{Kernel, request_wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, Socket};
 use crate::vfs::store::Ino;
 
@@ -446,7 +448,6 @@ pub(crate) enum Name {
 /// `/proc/net/unix`：所有 AF_UNIX socket。地址是抽象地址时以 `@` 开头，其中的 NUL
 /// 也显示成 `@`。
 pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> String {
-    use std::fmt::Write as _;
     let mut s = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
     for (sock, _) in sockets {
         let b = sock.borrow();
@@ -460,29 +461,179 @@ pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> Stri
             Link::None => (0, 1),
         };
         let ino = crate::pseudo::socket_ino(sock);
-        write!(
-            s,
-            "0000000000000000: 00000002 00000000 {flags:08X} {:04X} {state:02X} {ino:5}",
-            u.ty
-        )
-        .unwrap();
-        match u.addr.get(2..) {
-            Some([0, name @ ..]) => {
-                let name: Vec<u8> = name
-                    .iter()
-                    .map(|&c| if c == 0 { b'@' } else { c })
-                    .collect();
-                write!(s, " @{}", String::from_utf8_lossy(&name)).unwrap();
+        line(&mut s, flags, u.ty, state, ino, &u.addr);
+        // 还没有 accept 的连接：与 Linux 一样没有 inode，地址是监听的地址，状态是
+        // SS_CONNECTING（还没有 socket 对象）
+        if let Link::Listening { pending, .. } = &u.link {
+            for _ in pending {
+                line(&mut s, 0, u.ty, 2, 0, &u.addr);
             }
-            Some(path) if !path.is_empty() => {
-                let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
-                write!(s, " {}", String::from_utf8_lossy(&path[..end])).unwrap();
-            }
-            _ => {}
         }
-        s.push('\n');
     }
     s
+}
+
+/// `/proc/net/unix` 的一行。
+fn line(s: &mut String, flags: u32, ty: i32, state: u32, ino: u64, addr: &[u8]) {
+    use std::fmt::Write as _;
+    write!(
+        s,
+        "0000000000000000: 00000002 00000000 {flags:08X} {ty:04X} {state:02X} {ino:5}"
+    )
+    .unwrap();
+    match addr.get(2..) {
+        Some([0, name @ ..]) => {
+            let name: Vec<u8> = name
+                .iter()
+                .map(|&c| if c == 0 { b'@' } else { c })
+                .collect();
+            write!(s, " @{}", String::from_utf8_lossy(&name)).unwrap();
+        }
+        Some(path) if !path.is_empty() => {
+            let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+            write!(s, " {}", String::from_utf8_lossy(&path[..end])).unwrap();
+        }
+        _ => {}
+    }
+    s.push('\n');
+}
+
+/// `f` 是 AF_UNIX socket 时返回它的 socket。
+fn unix_socket(f: &FileRef) -> Option<Rc<RefCell<Socket>>> {
+    match &f.borrow().kind {
+        FileKind::Socket(s) if matches!(&*s.borrow(), Socket::Unix(_)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// 发给 `u` 的消息所在的 channel：数据报的接收队列、流式连接的接收方向，监听 socket
+/// 还有等着 accept 的连接的（Linux 的 GC 也把它们算作监听 socket 收到的）。
+fn inboxes(u: &UnixSocket) -> Vec<ChannelRef> {
+    let mut out = vec![u.rx.clone()];
+    match &u.link {
+        Link::Stream { rx, .. } => out.push(rx.clone()),
+        Link::Listening { pending, .. } => {
+            for s in pending {
+                if let Socket::Unix(e) = &*s.borrow()
+                    && let Link::Stream { rx, .. } = &e.link
+                {
+                    out.push(rx.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// 消息里带了打开文件的 channel 记下来，[`collect`] 从这里找在途的 socket。
+pub(crate) fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
+    let weak = Rc::downgrade(c);
+    if !k.unix_inflight.iter().any(|w| w.ptr_eq(&weak)) {
+        k.unix_inflight.push(weak);
+    }
+}
+
+/// 在途的 socket（只在 `SCM_RIGHTS` 消息里的）：`/proc/net/unix` 也列出它们。
+pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
+    let mut out = Vec::new();
+    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
+        for p in &c.borrow().packets {
+            out.extend(p.fds.iter().filter_map(unix_socket));
+        }
+    }
+    out
+}
+
+/// 关闭了一些打开文件（close、dup2 覆盖、execve 等）：释放它们，其中有 unix socket
+/// 时回收在途的环。
+pub(crate) fn released(k: &mut Kernel, files: Vec<FileRef>) {
+    let unix = files.iter().any(|f| unix_socket(f).is_some());
+    drop(files);
+    if unix {
+        collect(k);
+    }
+}
+
+/// 回收程序够不着的在途 socket（Linux 的 unix_gc）。候选是所有引用都来自在途消息的
+/// unix socket；从候选的接收队列里出发的引用不算，还剩引用的候选是从外面够得着的，它们
+/// 接收队列里的候选也够得着。其余的候选清空接收队列，环就断开了。别处临时多持有一个
+/// 引用的（比如阻塞在它上面的线程）不是候选，只会少回收、不会错收。
+pub(crate) fn collect(k: &mut Kernel) {
+    type Key = *const RefCell<OpenFile>;
+    k.unix_inflight.retain(|w| {
+        w.upgrade()
+            .is_some_and(|c| c.borrow().packets.iter().any(|p| !p.fds.is_empty()))
+    });
+    // 在途的打开文件和各自被在途消息引用的次数
+    let mut inflight: HashMap<Key, (FileRef, usize)> = HashMap::new();
+    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
+        for p in &c.borrow().packets {
+            for f in &p.fds {
+                inflight
+                    .entry(Rc::as_ptr(f))
+                    .or_insert_with(|| (f.clone(), 0))
+                    .1 += 1;
+            }
+        }
+    }
+    // 引用数里还有上面自己持有的一个
+    let mut candidates: HashMap<Key, usize> = inflight
+        .iter()
+        .filter(|(_, (f, n))| Rc::strong_count(f) == n + 1 && unix_socket(f).is_some())
+        .map(|(&key, &(_, n))| (key, n))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let children = |key: Key| -> Vec<Key> {
+        let Some(s) = unix_socket(&inflight[&key].0) else {
+            return Vec::new();
+        };
+        let Socket::Unix(u) = &*s.borrow() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for c in inboxes(u) {
+            for p in &c.borrow().packets {
+                out.extend(p.fds.iter().map(Rc::as_ptr));
+            }
+        }
+        out
+    };
+    let keys: Vec<Key> = candidates.keys().copied().collect();
+    for &key in &keys {
+        for child in children(key) {
+            if let Some(n) = candidates.get_mut(&child) {
+                *n -= 1;
+            }
+        }
+    }
+    let mut work: Vec<Key> = keys.iter().copied().filter(|k| candidates[k] > 0).collect();
+    let mut reachable: HashSet<Key> = work.iter().copied().collect();
+    while let Some(key) = work.pop() {
+        for child in children(key) {
+            if candidates.contains_key(&child) && reachable.insert(child) {
+                work.push(child);
+            }
+        }
+    }
+    // 消息在释放所有借用之后再析构：里面的打开文件析构时要用到别的 channel
+    let mut garbage = Vec::new();
+    for key in keys.into_iter().filter(|k| !reachable.contains(k)) {
+        let Some(s) = unix_socket(&inflight[&key].0) else {
+            continue;
+        };
+        if let Socket::Unix(u) = &*s.borrow() {
+            for c in inboxes(u) {
+                let mut c = c.borrow_mut();
+                c.bytes = 0;
+                garbage.extend(std::mem::take(&mut c.packets));
+            }
+        }
+    }
+    drop(inflight);
+    drop(garbage);
 }
 
 /// 已绑定的地址（内核全局）。socket 关闭后弱引用失效，地址随之释放。
@@ -535,6 +686,54 @@ mod tests {
             cred: Ucred::of(pid, 0, 0),
             from: Vec::new(),
         }
+    }
+
+    /// 一对互相连接的流式 socket 的打开文件，和 `a` 发往 `b` 的 channel。
+    fn pair() -> (FileRef, FileRef, ChannelRef) {
+        let (a, b) = UnixSocket::pair(SOCK_STREAM, Ucred::of(1, 0, 0));
+        let Link::Stream { tx, .. } = &a.link else {
+            unreachable!()
+        };
+        let tx = tx.clone();
+        let file = |u| {
+            let s = Rc::new(RefCell::new(Socket::Unix(u)));
+            OpenFile::new(FileKind::Socket(s), oflags::O_RDWR)
+        };
+        (file(a), file(b), tx)
+    }
+
+    fn send(k: &mut Kernel, c: &ChannelRef, f: &FileRef) {
+        let mut p = packet(b"x", 1);
+        p.fds.push(f.clone());
+        c.borrow_mut().push(p);
+        note_inflight(k, c);
+    }
+
+    #[test]
+    fn collects_sockets_only_reachable_from_their_own_queue() {
+        let mut k = Kernel::new(crate::process::Tier::Interpreter);
+        // b 在自己的接收队列里
+        let (a, b, to_b) = pair();
+        send(&mut k, &to_b, &b);
+        let gone = Rc::downgrade(&b);
+        drop((a, b, to_b));
+        // 在途的 c 的接收队列里有 d，c 本身在一个还开着的 socket 的队列里：都够得着
+        let (keep, keep_peer, to_keep_peer) = pair();
+        let (c, c_peer, to_c_peer) = pair();
+        let (d, d_peer, _) = pair();
+        send(&mut k, &to_c_peer, &d_peer);
+        send(&mut k, &to_keep_peer, &c_peer);
+        let (kept_c, kept_d) = (Rc::downgrade(&c_peer), Rc::downgrade(&d_peer));
+        drop((c, c_peer, to_c_peer, d, d_peer, to_keep_peer));
+        collect(&mut k);
+        assert!(gone.upgrade().is_none());
+        assert!(kept_c.upgrade().is_some() && kept_d.upgrade().is_some());
+        assert_eq!(inflight_sockets(&k).len(), 2);
+        // 最外面的也关掉之后，整串都回收
+        drop((keep, keep_peer));
+        collect(&mut k);
+        assert!(kept_c.upgrade().is_none() && kept_d.upgrade().is_none());
+        assert!(inflight_sockets(&k).is_empty());
     }
 
     #[test]

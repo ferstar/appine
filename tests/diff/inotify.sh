@@ -1,6 +1,6 @@
 # inotify：目录和文件上的事件及其顺序、rename 的 cookie、覆盖和交换、一次性监视、
-# IN_IGNORED、错误码、FIONREAD、poll 和阻塞读；Java 的 WatchService 和 Node.js 的
-# fs.watch 建立在它上面
+# IN_IGNORED、错误码、FIONREAD、poll 和阻塞读、按 fd 的事件报给哪个目录；Java 的
+# WatchService 和 Node.js 的 fs.watch 建立在它上面
 set -e
 mkdir -p /tmp/diff-inotify
 cd /tmp/diff-inotify
@@ -155,6 +155,99 @@ int main(void)
 C
 gcc -O2 -o ino ino.c
 ./ino
+
+# 按 fd 的事件跟着打开时经过的目录项：监视建立之前打开的文件、打开之后改名、删除时
+# 还打开着（IN_DELETE_SELF 等到关闭）、硬链接、打开着的目录被 rmdir
+cat > fdev.c <<'C'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/inotify.h>
+#include <sys/stat.h>
+
+static int in;
+static int wa, wb, wf;
+static void drain(const char *tag) {
+    char buf[4096];
+    printf("[%s]", tag);
+    for (;;) {
+        ssize_t n = read(in, buf, sizeof buf);
+        if (n <= 0) break;
+        for (char *p = buf; p < buf + n;) {
+            struct inotify_event *e = (void *)p;
+            const char *w = e->wd == wa ? "a" : e->wd == wb ? "b" : e->wd == wf ? "f" : "?";
+            printf(" %s:%x%s%s", w, e->mask, e->len ? ":" : "", e->len ? e->name : "");
+            p += sizeof *e + e->len;
+        }
+    }
+    printf("\n");
+}
+
+int main(void) {
+    mkdir("/tmp/diff-inotify/fd", 0755); mkdir("/tmp/diff-inotify/fd/a", 0755); mkdir("/tmp/diff-inotify/fd/b", 0755);
+    in = inotify_init1(IN_NONBLOCK);
+    /* 1. 建监视之前打开的文件 */
+    int fd = open("/tmp/diff-inotify/fd/a/x", O_CREAT | O_WRONLY, 0644);
+    wa = inotify_add_watch(in, "/tmp/diff-inotify/fd/a", IN_ALL_EVENTS);
+    wb = inotify_add_watch(in, "/tmp/diff-inotify/fd/b", IN_ALL_EVENTS);
+    write(fd, "1", 1);
+    close(fd);
+    drain("pre-open close");
+    /* 2. 打开之后改名到另一个目录 */
+    fd = open("/tmp/diff-inotify/fd/a/x", O_WRONLY);
+    rename("/tmp/diff-inotify/fd/a/x", "/tmp/diff-inotify/fd/b/y");
+    write(fd, "2", 1);
+    close(fd);
+    drain("rename then write");
+    /* 3. 打开着删除最后一个链接 */
+    wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/b/y", IN_ALL_EVENTS);
+    fd = open("/tmp/diff-inotify/fd/b/y", O_RDONLY);
+    unlink("/tmp/diff-inotify/fd/b/y");
+    drain("unlink while open");
+    close(fd);
+    drain("close after unlink");
+    /* 4. 两个打开 */
+    int f1 = open("/tmp/diff-inotify/fd/b/z", O_CREAT | O_RDWR, 0644);
+    int f2 = open("/tmp/diff-inotify/fd/b/z", O_RDONLY);
+    wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/b/z", IN_ALL_EVENTS);
+    drain("two opens");
+    unlink("/tmp/diff-inotify/fd/b/z");
+    close(f1);
+    drain("close one");
+    close(f2);
+    drain("close two");
+    /* 5. 硬链接 */
+    fd = open("/tmp/diff-inotify/fd/a/h", O_CREAT | O_RDWR, 0644);
+    link("/tmp/diff-inotify/fd/a/h", "/tmp/diff-inotify/fd/b/h");
+    wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/a/h", IN_ALL_EVENTS);
+    unlink("/tmp/diff-inotify/fd/a/h");
+    drain("unlink one link");
+    unlink("/tmp/diff-inotify/fd/b/h");
+    drain("unlink other link");
+    close(fd);
+    drain("close hardlinked");
+    /* 6. 没有打开时删除 */
+    close(open("/tmp/diff-inotify/fd/a/q", O_CREAT | O_RDWR, 0644));
+    wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/a/q", IN_ALL_EVENTS);
+    unlink("/tmp/diff-inotify/fd/a/q");
+    drain("unlink closed");
+    /* 7. 打开着的目录 rmdir */
+    mkdir("/tmp/diff-inotify/fd/a/d", 0755);
+    wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/a/d", IN_ALL_EVENTS);
+    fd = open("/tmp/diff-inotify/fd/a/d", O_RDONLY | O_DIRECTORY);
+    rmdir("/tmp/diff-inotify/fd/a/d");
+    drain("rmdir open dir");
+    close(fd);
+    drain("close dir");
+    return 0;
+}
+C
+gcc -O2 -o fdev fdev.c
+./fdev
 
 cat > Watch.java <<'JAVA'
 import java.nio.file.*;

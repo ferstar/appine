@@ -256,7 +256,6 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         g.pgid = parent.pgid;
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
-        g.nice = parent.nice;
         g.dumpable = parent.dumpable;
         g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
@@ -320,7 +319,9 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         cx.task.comm.get(),
     )?;
     task.affinity.set(cx.task.affinity.get());
-    task.sched.set(super::sched::inherit(cx.task.sched.get()));
+    let (sched, nice) = super::sched::inherit(cx.task.sched.get(), cx.task.nice.get());
+    task.sched.set(sched);
+    task.nice.set(nice);
     task.deadline.set(cx.task.deadline.get());
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));
@@ -591,7 +592,7 @@ fn exec(
     let closed = cx.fds_mut().close_on_exec();
     let fds = cx.t.fds.clone();
     crate::locks::closed(cx.k(), &fds, &closed);
-    drop(closed);
+    crate::unix::released(cx.k(), closed);
     {
         let group = cx.t.group.clone();
         let mut g = group.borrow_mut();
@@ -601,6 +602,11 @@ fn exec(
         }
         g.cred = new_cred;
         g.posix_timers.clear();
+        // AIO 上下文的环在旧的地址空间里，随之消失
+        let contexts = std::mem::take(&mut g.aio);
+        drop(g);
+        super::aio::released(cx.k(), contexts);
+        let mut g = group.borrow_mut();
         g.execed = true;
         if Rc::strong_count(&g.sighand) > 1 {
             let copy = g.sighand.borrow().clone();

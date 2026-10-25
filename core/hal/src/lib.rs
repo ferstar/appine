@@ -360,6 +360,63 @@ pub fn thread_cpu_clock() -> Option<i32> {
     }
 }
 
+/// 本进程可以用的宿主 CPU 的编号（最多 64 个），第一次调用时的快照：guest 看到的 CPU
+/// `i` 是其中第 `i` 个。之后宿主线程的亲和性被改了（guest 的 sched_setaffinity）也不
+/// 影响它。
+pub fn host_cpus() -> &'static [usize] {
+    static CPUS: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    CPUS.get_or_init(|| {
+        // 也考虑了 cgroup 的 CPU 配额
+        let n = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(64);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+                // CPU_SETSIZE 在 Linux 上是 i32，在 Android 上是 usize
+                #[allow(clippy::unnecessary_cast)]
+                let cpus: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+                    .filter(|&i| libc::CPU_ISSET(i, &set))
+                    .take(n)
+                    .collect();
+                if !cpus.is_empty() {
+                    return cpus;
+                }
+            }
+        }
+        (0..n).collect()
+    })
+}
+
+/// 把本进程的宿主线程 `tid` 限制在 [`host_cpus`] 里由 `mask` 选出的 CPU 上（第 `i` 位是
+/// 第 `i` 个）。失败时保持原样。
+pub fn set_thread_affinity(tid: i32, mask: u64) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for (i, &cpu) in host_cpus().iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                libc::CPU_SET(cpu, &mut set);
+            }
+        }
+        libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (tid, mask);
+}
+
+/// 设置本进程的宿主线程 `tid` 的 nice 值。失败时（没有权限提高优先级）保持原样。
+pub fn set_thread_nice(tid: i32, nice: i32) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        // Linux 上 PRIO_PROCESS 作用于单个线程
+        libc::setpriority(libc::PRIO_PROCESS as _, tid as libc::id_t, nice);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (tid, nice);
+}
+
 /// 当前宿主线程的 tid。
 pub fn gettid() -> i32 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -398,6 +455,46 @@ pub unsafe fn populate(ptr: *const u8, len: usize) {
         unsafe { std::ptr::read_volatile(at.max(ptr as usize) as *const u8) };
         at += page;
     }
+}
+
+/// 宿主文件 `fd` 在 `[off, off + len)`（`len` 为 0 时到文件末尾）里的页缓存状况，按 4K
+/// 页计（`struct cachestat` 的五项）。在缓存里的页数用 mincore 查：文件映射的 mincore
+/// 查的就是页缓存，不依赖宿主内核的版本和文件系统（宿主的 cachestat 要 6.5，在
+/// overlayfs 上也数不到底层文件的页）。脏页、写回、逐出几项宿主不给，是 0。
+pub fn cachestat(fd: i32, off: u64, len: u64) -> Result<[u64; 5], i32> {
+    let size = fstat(fd)?.st_size as u64;
+    // 范围里、文件末尾之内的 4K 页
+    let first = off / 4096;
+    let last = match len {
+        0 => u64::MAX,
+        n => off.saturating_add(n - 1) / 4096,
+    }
+    .min(size.saturating_sub(1) / 4096);
+    let pages = if size == 0 || last < first {
+        0
+    } else {
+        last - first + 1
+    };
+    Ok([resident_in_file(fd, first, pages), 0, 0, 0, 0])
+}
+
+/// 文件 `fd` 从第 `first` 个 4K 页起的 `pages` 页里有几页在宿主的页缓存里。分段映射，
+/// 大文件也不占太多地址空间；映射不了（比如只写打开的）的部分当作不在。
+fn resident_in_file(fd: i32, first: u64, pages: u64) -> u64 {
+    const WINDOW: u64 = 1 << 16;
+    let mut total = 0;
+    let mut at = first;
+    while at < first + pages {
+        let n = (first + pages - at).min(WINDOW);
+        let span = (n * 4096) as usize;
+        let Ok(m) = map_file(fd, at * 4096, span, true, false) else {
+            break;
+        };
+        total += resident_pages(m.ptr.as_ptr(), span) as u64;
+        unsafe { unmap(m.base, m.len) };
+        at += n;
+    }
+    total
 }
 
 /// `[ptr, ptr + len)` 里驻留在内存中的 4K 页数（mincore）。
@@ -633,5 +730,31 @@ impl Drop for Event {
                 libc::close(self.write);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn counts_written_pages_as_cached() {
+        let path = std::env::temp_dir().join(format!("appine-cachestat-{}", std::process::id()));
+        let mut f = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&[7u8; 3 * 4096 + 100]).unwrap();
+        let fd = f.as_raw_fd();
+        // 刚写的页都在页缓存里；范围超出文件末尾的部分不算
+        assert_eq!(cachestat(fd, 0, 0).unwrap()[0], 4);
+        assert_eq!(cachestat(fd, 4096, 4096).unwrap()[0], 1);
+        assert_eq!(cachestat(fd, 1 << 20, 0).unwrap(), [0; 5]);
+        std::fs::remove_file(path).unwrap();
     }
 }

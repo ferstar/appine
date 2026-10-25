@@ -375,7 +375,11 @@ pub(super) fn send(
                     return Err(Errno::EMSGSIZE);
                 }
                 if c.space() >= data.len() {
+                    let inflight = !files.is_empty();
                     c.push(packet(data, files, cred, Vec::new()));
+                    if inflight {
+                        crate::unix::note_inflight(cx.k(), &tx);
+                    }
                     return Ok(data.len());
                 }
             } else {
@@ -385,6 +389,9 @@ pub(super) fn send(
                 // 流式 socket 可以只放下一部分；打开文件随第一部分传递
                 let n = c.space().min(data.len() - done);
                 if n > 0 || data.is_empty() {
+                    if !files.is_empty() {
+                        crate::unix::note_inflight(cx.k(), &tx);
+                    }
                     c.push(packet(
                         &data[done..done + n],
                         std::mem::take(&mut files),
@@ -469,7 +476,11 @@ fn send_dgram(
                 return Err(Errno::ECONNREFUSED);
             }
             if c.space() >= data.len() {
-                c.push(packet(data, files.take().unwrap_or_default(), cred, from));
+                let files = files.take().unwrap_or_default();
+                if !files.is_empty() {
+                    crate::unix::note_inflight(cx.k(), &rx);
+                }
+                c.push(packet(data, files, cred, from));
                 return Ok(data.len());
             }
         }

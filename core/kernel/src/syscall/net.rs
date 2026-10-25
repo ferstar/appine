@@ -33,6 +33,7 @@ const IPPROTO_UDPLITE: i32 = 136;
 const IPPROTO_MPTCP: i32 = 262;
 
 const SOL_SOCKET: i32 = 1;
+const SO_TYPE: i32 = 3;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ERROR: i32 = 4;
@@ -136,7 +137,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
                 base
             };
             let fd = appine_hal::net::socket(domain, host_ty, protocol).map_err(Errno)?;
-            Socket::Inet(InetSocket::new(fd, domain, host_ty))
+            let mut s = InetSocket::new(fd, domain, host_ty);
+            s.raw = base == SOCK_RAW;
+            Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
             Socket::Netlink(NetlinkSocket::new(protocol))
@@ -305,7 +308,15 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         Socket::Unix(_) => unreachable!("handled above"),
     };
     match appine_hal::net::connect(host_fd, &addr) {
-        Ok(()) => return Ok(0),
+        Ok(()) => {
+            // 数据报 socket 记下对端，AF_UNSPEC 是断开
+            if let Socket::Inet(s) = &mut *sock.borrow_mut()
+                && s.ty != SOCK_STREAM
+            {
+                s.peer = (addr.get(..2) != Some(&[0, 0])).then(|| addr.clone());
+            }
+            return Ok(0);
+        }
         Err(e) if e == Errno::EINPROGRESS.0 && !nonblock => {}
         Err(e) => return Err(Errno(e)),
     }
@@ -426,6 +437,8 @@ pub(super) fn getsockopt(
         Socket::Inet(s) => match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
             (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
+            // raw ICMP 在宿主上是 ping socket
+            (SOL_SOCKET, SO_TYPE) if s.raw => SOCK_RAW.to_le_bytes().to_vec(),
             _ => appine_hal::net::getsockopt(s.fd, level, name, room.min(256)).map_err(Errno)?,
         },
         Socket::Netlink(_) => 0i32.to_le_bytes().to_vec(),

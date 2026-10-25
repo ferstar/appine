@@ -23,7 +23,7 @@ use appine_engine::DbtStats;
 use appine_hal::Event;
 
 use crate::errno::Errno;
-use crate::fd::FdTable;
+use crate::fd::{FdTable, FileRef};
 use crate::futex::Futexes;
 use crate::mm::Mm;
 use crate::process::{CpuTime, ExitStatus, ThreadGroup, Tier};
@@ -92,6 +92,8 @@ pub(crate) struct Kernel {
     pub ipc: crate::ipc::Ipc,
     /// AF_UNIX socket 绑定的地址。
     pub unix: crate::unix::Names,
+    /// 消息里带着打开文件的 AF_UNIX channel（`unix::collect` 用）。
+    pub unix_inflight: Vec<Weak<RefCell<crate::unix::Channel>>>,
     /// 正在被打开的命名管道（FIFO）：同一个 inode 的所有打开共用一个管道对象。
     pub fifos: BTreeMap<Ino, Weak<RefCell<crate::pipe::Pipe>>>,
     /// memfd 的封印（F_ADD_SEALS），以 inode 为键；不在这里的文件不能加封印。
@@ -109,6 +111,19 @@ pub(crate) struct Kernel {
     waiters: Vec<Arc<Event>>,
     /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
     pub edge_waiters: Vec<Arc<Event>>,
+    /// 设置了 `O_ASYNC` 的打开文件（`syscall::poll` 的 fasync）。
+    pub fasync: Vec<crate::syscall::Fasync>,
+    /// 文件租约，按 inode（`syscall::lease`）。
+    pub leases: BTreeMap<Ino, Vec<crate::syscall::Lease>>,
+    /// `/proc/sys/fs/lease-break-time`：打破租约时最多等多少秒。
+    pub lease_break_time: u64,
+    /// POSIX 消息队列，按名字（`syscall::mqueue`）。
+    pub mqueues: BTreeMap<Vec<u8>, Rc<RefCell<crate::syscall::MessageQueue>>>,
+    /// `/proc/sys/fs/mqueue/*`。
+    pub mq_limits: crate::syscall::MqLimits,
+    /// AIO 上下文占用的事件数（`/proc/sys/fs/aio-nr`）和上限（`aio-max-nr`）。
+    pub aio_nr: u64,
+    pub aio_max_nr: u64,
     /// inotify 的所有监视。打开文件析构时要报告 `IN_CLOSE_*`，所以用 Rc 共享。
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
 }
@@ -119,6 +134,8 @@ unsafe impl Send for Kernel {}
 
 impl Kernel {
     pub fn new(tier: Tier) -> Kernel {
+        // 在任何 guest 线程改变宿主亲和性之前记下宿主的 CPU
+        appine_hal::host_cpus();
         Kernel {
             tasks: BTreeMap::new(),
             groups: BTreeMap::new(),
@@ -143,6 +160,7 @@ impl Kernel {
             locks: crate::locks::Locks::default(),
             ipc: crate::ipc::Ipc::default(),
             unix: Default::default(),
+            unix_inflight: Vec::new(),
             fifos: BTreeMap::new(),
             seals: BTreeMap::new(),
             hostname: b"localhost".to_vec(),
@@ -152,6 +170,13 @@ impl Kernel {
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
+            fasync: Vec::new(),
+            leases: BTreeMap::new(),
+            lease_break_time: 45,
+            mqueues: BTreeMap::new(),
+            mq_limits: Default::default(),
+            aio_nr: 0,
+            aio_max_nr: 65536,
             inotify: Rc::default(),
         }
     }
@@ -166,6 +191,43 @@ impl Kernel {
             }
         }
         Err(Errno::EAGAIN)
+    }
+
+    /// 最后分配的 tid（`/proc/sys/kernel/ns_last_pid`）。
+    pub fn last_pid(&self) -> Tid {
+        self.next_tid - 1
+    }
+
+    /// 写 `ns_last_pid`：之后从 `pid + 1` 开始分配（被占用的跳过）。
+    pub fn set_last_pid(&mut self, pid: Tid) {
+        self.next_tid = if pid >= PID_MAX {
+            INIT + 1
+        } else {
+            (pid + 1).max(INIT + 1)
+        };
+    }
+
+    /// 所有 fd 表里的打开文件。同一个打开文件在几个 fd 表里时出现几次。
+    pub(crate) fn open_files(&self) -> Vec<FileRef> {
+        let mut tables: Vec<Rc<RefCell<FdTable>>> = Vec::new();
+        let mut files = Vec::new();
+        for t in self.tasks.values() {
+            let fds = t.res.borrow().fds.clone();
+            if tables.iter().any(|p| Rc::ptr_eq(p, &fds)) {
+                continue;
+            }
+            {
+                let table = fds.borrow();
+                files.extend(
+                    table
+                        .open_fds()
+                        .into_iter()
+                        .filter_map(|fd| table.get(fd).ok()),
+                );
+            }
+            tables.push(fds);
+        }
+        files
     }
 
     fn flush_wakeups(&self) {

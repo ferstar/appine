@@ -5,17 +5,21 @@
 //! 时，每个事件只多一次判空。
 //!
 //! - 文件上的事件同时报给它所在目录的监视（带名字）。按路径操作时，有监视才再解析一次
-//!   路径找出目录（[`watched_parent`]）。按 fd 操作（读写、截断、关闭）时用打开时记下的
-//!   目录：打开时已经有监视的文件带一个 [`Opened`]，没有它的文件只报给自己的监视。
-//!   仓库没有按 inode 反查目录的索引，所以打开之后又改名的文件仍然报给原来的目录。
+//!   路径找出目录（[`watched_parent`]）。按 fd 操作（读写、截断、关闭）时用打开时经过的
+//!   目录和名字：每个打开的仓库文件带一个 [`Opened`] 记着它们，相当于 Linux 打开文件
+//!   引用的目录项。rename 移动目录项时一起改（[`renamed`]）；删除之后不变，与 Linux
+//!   一样仍然报给原来的目录。
 //! - `IN_CLOSE_*` 在打开文件的最后一个引用释放时报告（[`Opened`] 析构），与 Linux 的
-//!   fput 相同；监视建立之前就打开的文件关闭时不报告。
-//! - `IN_DELETE_SELF` 在最后一个链接删除时报告，不等文件关闭。
+//!   fput 相同。
+//! - `IN_DELETE_SELF` 在最后一个链接删除时报告；还有经由被删除的那个名字打开着的文件
+//!   时，等它们都关闭再报告（[`deleted`]），与 Linux 在目录项最后一个引用释放时报告
+//!   相同。
 //! - 目录上的事件带 `IN_ISDIR`；`IN_DELETE_SELF`、`IN_MOVE_SELF` 不带，inotify 一直
 //!   如此（Linux 为兼容老程序特意去掉）。
 //! - 合成文件系统（procfs、devpts）上可以建监视，但不会有事件。
-//! - 与 Linux 相同：与队尾未读事件完全相同的事件合并；排队 16384 个事件之后丢弃新的，
-//!   并排一个 `IN_Q_OVERFLOW`。
+//! - 与 Linux 相同：与队尾未读事件完全相同的事件合并；排队 `max_queued_events` 个事件
+//!   之后丢弃新的，并排一个 `IN_Q_OVERFLOW`。每个用户（有效 uid）的实例数和监视数受
+//!   `max_user_instances`、`max_user_watches` 限制，超过时分别是 EMFILE、ENOSPC。
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -55,9 +59,11 @@ const IN_ONESHOT: u32 = 0x8000_0000;
 const SELF_EVENTS: u32 = IN_DELETE_SELF | IN_MOVE_SELF;
 
 /// 一个实例里最多排队的事件数（`max_queued_events` 的默认值）。
-pub(crate) const MAX_QUEUED: usize = 16384;
-/// 一个实例最多的监视数。
-pub(crate) const MAX_WATCHES: usize = 1 << 20;
+const MAX_QUEUED: usize = 16384;
+/// 一个用户最多的实例数（`max_user_instances` 的默认值）。
+const MAX_INSTANCES: usize = 128;
+/// 一个用户最多的监视数（`max_user_watches` 的默认值）。
+const MAX_WATCHES: usize = 1 << 20;
 
 struct Watch {
     node: Node,
@@ -84,7 +90,6 @@ impl Event {
 }
 
 /// 一个 inotify 实例。
-#[derive(Default)]
 pub struct Inotify {
     watches: BTreeMap<i32, Watch>,
     last_wd: i32,
@@ -93,8 +98,27 @@ pub struct Inotify {
     bytes: usize,
     /// 队列里有 `IN_Q_OVERFLOW`。
     overflowed: bool,
+    /// 最多排队的事件数：与 Linux 一样取创建时的 `max_queued_events`。
+    max_queued: usize,
+    /// 创建者的有效 uid：实例和监视算在这个用户名下。
+    uid: u32,
     /// 登记了监视的 [`Registry`]：实例关闭时从里面去掉自己的监视。
     registry: Weak<RefCell<Registry>>,
+}
+
+impl Default for Inotify {
+    fn default() -> Inotify {
+        Inotify {
+            watches: BTreeMap::new(),
+            last_wd: 0,
+            queue: VecDeque::new(),
+            bytes: 0,
+            overflowed: false,
+            max_queued: MAX_QUEUED,
+            uid: 0,
+            registry: Weak::new(),
+        }
+    }
 }
 
 impl Drop for Inotify {
@@ -105,6 +129,9 @@ impl Drop for Inotify {
         let Ok(mut r) = registry.try_borrow_mut() else {
             return;
         };
+        let user = r.users.entry(self.uid).or_default();
+        user.0 = user.0.saturating_sub(1);
+        user.1 = user.1.saturating_sub(self.watches.len());
         for w in self.watches.values() {
             if let Node::Store(ino) = w.node
                 && let Some(list) = r.by_ino.get_mut(&ino)
@@ -167,7 +194,7 @@ impl Inotify {
         if self.queue.back() == Some(&event) {
             return;
         }
-        let event = if self.queue.len() < MAX_QUEUED {
+        let event = if self.queue.len() < self.max_queued {
             event
         } else if self.overflowed {
             return;
@@ -189,13 +216,36 @@ impl Inotify {
 type Watcher = (Weak<RefCell<Inotify>>, i32);
 
 /// 所有监视，按被监视的 inode。
-#[derive(Default)]
 pub struct Registry {
     /// 每个 inode 上的 (实例, wd)。实例关闭之后弱引用失效，下次碰到时清掉。
     by_ino: HashMap<Ino, Vec<Watcher>>,
     last_cookie: u32,
     /// 监视所在的仓库：`IN_EXCL_UNLINK` 要查子项还有没有链接。
     vfs: Weak<Vfs>,
+    /// 每个用户（有效 uid）的实例数和监视数。
+    users: HashMap<u32, (usize, usize)>,
+    /// `/proc/sys/fs/inotify/` 下的三个限制。
+    pub max_queued: usize,
+    pub max_instances: usize,
+    pub max_watches: usize,
+    /// 最后一个链接已经删除，但还有经由那个名字打开着的文件的 inode：这些文件都关闭
+    /// 之后报告 `IN_DELETE_SELF`。
+    doomed: HashMap<Ino, Vec<Weak<RefCell<OpenFile>>>>,
+}
+
+impl Default for Registry {
+    fn default() -> Registry {
+        Registry {
+            by_ino: HashMap::new(),
+            last_cookie: 0,
+            vfs: Weak::new(),
+            users: HashMap::new(),
+            max_queued: MAX_QUEUED,
+            max_instances: MAX_INSTANCES,
+            max_watches: MAX_WATCHES,
+            doomed: HashMap::new(),
+        }
+    }
 }
 
 impl Registry {
@@ -221,6 +271,7 @@ impl Registry {
             })
         };
         let mut queued = false;
+        let mut gone = Vec::new();
         list.retain(|(weak, wd)| {
             let Some(inotify) = weak.upgrade() else {
                 return false;
@@ -241,6 +292,7 @@ impl Registry {
             if mask & IN_DELETE_SELF != 0 || wanted && wmask & IN_ONESHOT != 0 {
                 inotify.watches.remove(wd);
                 inotify.push(*wd, IN_IGNORED, 0, b"");
+                gone.push(inotify.uid);
                 queued = true;
                 return false;
             }
@@ -249,7 +301,30 @@ impl Registry {
         if list.is_empty() {
             self.by_ino.remove(&ino);
         }
+        for uid in gone {
+            self.uncharge(uid);
+        }
         queued
+    }
+
+    /// 用户 `uid` 少了一个监视。
+    fn uncharge(&mut self, uid: u32) {
+        let user = self.users.entry(uid).or_default();
+        user.1 = user.1.saturating_sub(1);
+    }
+
+    /// 打开文件关闭了：它是经由已经删除的名字打开的最后一个文件时报告
+    /// `IN_DELETE_SELF`。
+    fn closed(&mut self, ino: Ino) {
+        let Some(list) = self.doomed.get_mut(&ino) else {
+            return;
+        };
+        // 正在析构的打开文件已经没有强引用
+        list.retain(|f| f.strong_count() > 0);
+        if list.is_empty() {
+            self.doomed.remove(&ino);
+            self.notify(ino, None, IN_DELETE_SELF);
+        }
     }
 
     /// `ino` 自己的事件：先报给所在目录 `parent` 的监视（带名字），再报给它自己的。
@@ -267,8 +342,8 @@ impl Registry {
     }
 }
 
-/// 打开时已经有监视的文件带着它：按 fd 的事件据此报给所在的目录，最后一个引用释放
-/// 时报告 `IN_CLOSE_WRITE` 或 `IN_CLOSE_NOWRITE`。
+/// 打开的仓库文件带着它：按 fd 的事件据此报给所在的目录，最后一个引用释放时报告
+/// `IN_CLOSE_WRITE` 或 `IN_CLOSE_NOWRITE`。
 pub struct Opened {
     registry: Weak<RefCell<Registry>>,
     ino: Ino,
@@ -280,9 +355,11 @@ impl Drop for Opened {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade()
             && let Ok(mut r) = registry.try_borrow_mut()
+            && !r.by_ino.is_empty()
         {
             let parent = self.parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
             r.notify(self.ino, parent, self.close);
+            r.closed(self.ino);
         }
     }
 }
@@ -343,12 +420,8 @@ pub(crate) fn cookie(k: &Kernel) -> u32 {
     r.last_cookie
 }
 
-/// 新打开的文件要带的 [`Opened`]；没有任何监视时不需要。`parent` 是打开时经过的目录
-/// 和名字。
-pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, &[u8])>) -> Option<Opened> {
-    if idle(k) {
-        return None;
-    }
+/// 新打开的仓库文件要带的 [`Opened`]。`parent` 是打开时经过的目录和名字。
+pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -> Option<Opened> {
     let ino = match &f.kind {
         FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => *ino,
         FileKind::Directory {
@@ -365,7 +438,7 @@ pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, &[u8])>) -> 
     Some(Opened {
         registry: Rc::downgrade(&k.inotify),
         ino,
-        parent: parent.map(|(d, n)| (d, n.to_vec())),
+        parent,
         close: dir
             | if f.writable() {
                 IN_CLOSE_WRITE
@@ -373,6 +446,70 @@ pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, &[u8])>) -> 
                 IN_CLOSE_NOWRITE
             },
     })
+}
+
+/// rename 把目录项 `from` 移到了 `to`：经由它打开的文件，之后按 fd 的事件报给新的目录
+/// 和名字（Linux 的 d_move）。`moved` 查出被移动的对象：同名的已经删除的文件不跟着改。
+pub(crate) fn renamed(
+    k: &Kernel,
+    from: (Ino, &[u8]),
+    to: (Ino, &[u8]),
+    moved: impl FnOnce() -> Option<Ino>,
+) {
+    let at = |f: &OpenFile| {
+        f.watch
+            .as_ref()
+            .and_then(|w| w.parent.as_ref())
+            .is_some_and(|(d, n)| *d == from.0 && n == from.1)
+    };
+    let files: Vec<_> = k
+        .open_files()
+        .into_iter()
+        .filter(|f| at(&f.borrow()))
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    let Some(ino) = moved() else {
+        return;
+    };
+    for f in files {
+        let mut f = f.borrow_mut();
+        if let Some(w) = f.watch.as_mut().filter(|w| w.ino == ino) {
+            w.parent = Some((to.0, to.1.to_vec()));
+        }
+    }
+}
+
+/// `ino` 在目录 `dir` 里的最后一个链接 `name` 删除了：报告 `IN_DELETE_SELF`。还有经由
+/// 这个名字打开着的文件时，等它们都关闭再报告。
+pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
+    if !k.inotify.borrow().by_ino.contains_key(&ino) {
+        return;
+    }
+    let open: Vec<_> = k
+        .open_files()
+        .iter()
+        .filter(|f| {
+            f.borrow().watch.as_ref().is_some_and(|w| {
+                w.ino == ino
+                    && w.parent
+                        .as_ref()
+                        .is_some_and(|(d, n)| *d == dir && n == name)
+            })
+        })
+        .map(Rc::downgrade)
+        .collect();
+    if open.is_empty() {
+        path_event(k, ino, None, IN_DELETE_SELF);
+    } else {
+        k.inotify
+            .borrow_mut()
+            .doomed
+            .entry(ino)
+            .or_default()
+            .extend(open);
+    }
 }
 
 /// 按路径操作时对象所在的目录和名字（报给目录的监视用）。没有任何监视时不解析。
@@ -400,8 +537,21 @@ pub(super) fn inotify_init1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
     if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
         return Err(Errno::EINVAL);
     }
+    let uid = cx.cred().euid;
+    let registry = cx.kr().inotify.clone();
+    let mut r = registry.borrow_mut();
+    if r.users.get(&uid).map_or(0, |u| u.0) >= r.max_instances {
+        return Err(Errno::EMFILE);
+    }
+    r.users.entry(uid).or_default().0 += 1;
+    let mut inotify = Inotify::default();
+    inotify.max_queued = r.max_queued;
+    inotify.uid = uid;
+    inotify.registry = Rc::downgrade(&registry);
+    drop(r);
+    // 装不进 fd 表时实例在这里析构，计数随之退回
     let file = OpenFile::new(
-        FileKind::Inotify(Rc::new(RefCell::new(Inotify::default()))),
+        FileKind::Inotify(Rc::new(RefCell::new(inotify))),
         oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
     );
     cx.fds_mut()
@@ -445,10 +595,14 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         };
         return Ok(wd as u64);
     }
-    if i.watches.len() >= MAX_WATCHES {
+    let registry = cx.kr().inotify.clone();
+    let mut r = registry.borrow_mut();
+    let user = r.users.get(&i.uid).map_or(0, |u| u.1);
+    if user >= r.max_watches {
         return Err(Errno::ENOSPC);
     }
     i.last_wd = i.last_wd.checked_add(1).ok_or(Errno::ENOSPC)?;
+    r.users.entry(i.uid).or_default().1 += 1;
     let wd = i.last_wd;
     i.watches.insert(
         wd,
@@ -458,9 +612,6 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         },
     );
     if let Node::Store(ino) = node {
-        let registry = &cx.kr().inotify;
-        i.registry = Rc::downgrade(registry);
-        let mut r = registry.borrow_mut();
         r.vfs = Rc::downgrade(&vfs);
         r.by_ino
             .entry(ino)
@@ -476,13 +627,14 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     let w = i.watches.remove(&wd).ok_or(Errno::EINVAL)?;
     i.push(wd, IN_IGNORED, 0, b"");
     request_wake();
-    if let Node::Store(ino) = w.node {
-        let mut r = cx.kr().inotify.borrow_mut();
-        if let Some(list) = r.by_ino.get_mut(&ino) {
-            list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
-            if list.is_empty() {
-                r.by_ino.remove(&ino);
-            }
+    let mut r = cx.kr().inotify.borrow_mut();
+    r.uncharge(i.uid);
+    if let Node::Store(ino) = w.node
+        && let Some(list) = r.by_ino.get_mut(&ino)
+    {
+        list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
+        if list.is_empty() {
+            r.by_ino.remove(&ino);
         }
     }
     Ok(0)
@@ -605,6 +757,40 @@ mod tests {
         drop(i);
         assert!(!r.deliver(6, IN_OPEN, 0, b"", None));
         assert!(r.by_ino.is_empty());
+    }
+
+    #[test]
+    fn delete_self_waits_for_the_last_close() {
+        let registry = Rc::new(RefCell::new(Registry::default()));
+        let i = Rc::new(RefCell::new(Inotify::default()));
+        let wd = watch(&mut registry.borrow_mut(), &i, 7, IN_ALL_EVENTS);
+        let open = || {
+            let file = OpenFile::new(FileKind::Path(Node::Store(7)), oflags::O_RDONLY);
+            file.borrow_mut().watch = Some(Opened {
+                registry: Rc::downgrade(&registry),
+                ino: 7,
+                parent: Some((1, b"f".to_vec())),
+                close: IN_CLOSE_NOWRITE,
+            });
+            file
+        };
+        let (a, b) = (open(), open());
+        registry
+            .borrow_mut()
+            .doomed
+            .insert(7, vec![Rc::downgrade(&a), Rc::downgrade(&b)]);
+        drop(a);
+        assert_eq!(events(&i), vec![(wd, IN_CLOSE_NOWRITE, vec![])]);
+        drop(b);
+        assert_eq!(
+            events(&i),
+            vec![
+                (wd, IN_CLOSE_NOWRITE, vec![]),
+                (wd, IN_DELETE_SELF, vec![]),
+                (wd, IN_IGNORED, vec![]),
+            ]
+        );
+        assert!(registry.borrow().doomed.is_empty());
     }
 
     #[test]

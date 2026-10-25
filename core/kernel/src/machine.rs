@@ -336,7 +336,9 @@ fn timers(shared: Arc<Shared>) {
     let mut k = shared.lock();
     while !k.shutting_down {
         let next = crate::itimer::expire(&k);
-        let (k2, _) = block(&shared, k, &event, next, &mut [], true);
+        // 信号驱动的 I/O：任何修改都会叫醒这个线程，顺便检查；宿主 socket 一起等
+        let mut host = crate::syscall::check_fasync(&mut k);
+        let (k2, _) = block(&shared, k, &event, next, &mut host, true);
         k = k2;
     }
 }

@@ -236,6 +236,10 @@ pub(crate) const RLIMIT_NOFILE: u32 = 7;
 pub(crate) const RLIMIT_MEMLOCK: u32 = 8;
 /// `RLIMIT_SIGPENDING`。
 pub(crate) const RLIMIT_SIGPENDING: u32 = 11;
+/// `RLIMIT_NICE`：不用 `CAP_SYS_NICE` 就能调到的最低 nice 值，记作 20 - nice。
+pub(crate) const RLIMIT_NICE: u32 = 13;
+/// `RLIMIT_RTPRIO`。
+const RLIMIT_RTPRIO: u32 = 14;
 /// 资源种类数（`RLIM_NLIMITS`）。
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
@@ -249,6 +253,8 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
     // Linux 按内存大小算（max_threads / 2），4 GB 内存时是这个数
     r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
+    r[RLIMIT_NICE as usize] = (0, 0);
+    r[RLIMIT_RTPRIO as usize] = (0, 0);
     r
 }
 
@@ -304,8 +310,6 @@ pub(crate) struct ThreadGroup {
     pub itimer: Option<crate::itimer::ITimer>,
     /// `ITIMER_VIRTUAL`、`ITIMER_PROF`，按进程用掉的 CPU 时间计时。
     pub cpu_itimers: [Option<crate::itimer::CpuTimer>; 2],
-    /// nice 值（-20–19），fork 继承。
-    pub nice: i32,
     /// `PR_SET_PDEATHSIG`：父进程退出时收到的信号，0 表示不发；fork 不继承。
     pub pdeathsig: i32,
     /// `PR_SET_DUMPABLE`，fork 继承。
@@ -325,11 +329,18 @@ pub(crate) struct ThreadGroup {
     pub thp_disable: bool,
     /// POSIX 定时器（timer_create），按 id；fork 不继承，execve 时删除。
     pub posix_timers: std::collections::BTreeMap<i32, crate::itimer::PosixTimer>,
+    /// AIO 上下文，按 id（`syscall::aio`）。
+    pub aio: std::collections::BTreeMap<u64, Rc<RefCell<crate::syscall::AioContext>>>,
+    /// 进程的编号，不重复：pid 被新进程重新使用之后用它区分新旧进程（`/proc/<pid>` 的
+    /// inode）。
+    pub serial: u64,
 }
 
 impl ThreadGroup {
     pub fn new(tgid: Tid, ppid: Tid, sighand: Rc<RefCell<SigHandlers>>) -> ThreadGroup {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         ThreadGroup {
+            serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             tgid,
             ppid,
             pgid: tgid,
@@ -355,7 +366,6 @@ impl ThreadGroup {
             child_maxrss_kb: 0,
             itimer: None,
             cpu_itimers: [None; 2],
-            nice: 0,
             pdeathsig: 0,
             dumpable: true,
             no_new_privs: false,
@@ -365,6 +375,7 @@ impl ThreadGroup {
             thp_disable: false,
             execed: false,
             posix_timers: std::collections::BTreeMap::new(),
+            aio: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -439,6 +450,8 @@ impl Rusage {
 
 /// 线程组的最后一个线程退出之后：把子进程交给 init，通知父进程或者直接回收。
 pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let contexts = std::mem::take(&mut group.borrow_mut().aio);
+    crate::syscall::aio_released(k, contexts);
     let (tgid, ppid, status, children, exit_signal) = {
         let mut g = group.borrow_mut();
         let status = g.exiting.unwrap_or(ExitStatus::Exited(g.leader_code));

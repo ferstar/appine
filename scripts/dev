@@ -32,8 +32,11 @@ if [ -t 0 ] && [ -t 1 ]; then
     tty_flags="-it"
 fi
 
+# --ulimit nice：与 Android 的 init.rc（setrlimit nice 40 40）一样，线程不需要特权就能
+# 把 nice 值调到 -20；appine 把 guest 线程的 nice 值设置到宿主线程上
 # shellcheck disable=SC2086
 exec docker run --rm $tty_flags $proxy_run --platform linux/arm64 \
+    --ulimit nice=40:40 \
     -v "$root:/work" -w /work \
     -v appine-cargo-registry:/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/work/target/linux-arm64 \

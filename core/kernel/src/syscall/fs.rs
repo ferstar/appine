@@ -14,7 +14,7 @@ use super::{IO_CHUNK, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, Tid, request_wake};
+use crate::kernel::{Cx, Kernel, Tid, request_wake};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -53,6 +53,8 @@ const F_GETOWN_EX: u32 = 16;
 const F_OWNER_TID: i32 = 0;
 const F_OWNER_PID: i32 = 1;
 const F_OWNER_PGRP: i32 = 2;
+const F_SETLEASE: u32 = 1024;
+const F_GETLEASE: u32 = 1025;
 const F_DUPFD_CLOEXEC: u32 = 1030;
 const F_SETPIPE_SZ: u32 = 1031;
 const F_GETPIPE_SZ: u32 = 1032;
@@ -100,6 +102,8 @@ const ANON_DEV: u64 = 0xe;
 /// procfs、devpts 报告的设备号。
 const PROC_DEV: u64 = 0x4;
 const DEVPTS_DEV: u64 = 0x18;
+/// mqueue 文件系统的设备号。
+const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
@@ -126,6 +130,11 @@ const RNDGETENTCNT: u32 = 0x8004_5200;
 /// 熵池里的比特数（`/proc/sys/kernel/random/entropy_avail`）。
 pub(crate) const ENTROPY: i32 = 256;
 const FIONBIO: u32 = 0x5421;
+const FIOASYNC: u32 = 0x5452;
+const FIOSETOWN: u32 = 0x8901;
+const SIOCSPGRP: u32 = 0x8902;
+const FIOGETOWN: u32 = 0x8903;
+const SIOCGPGRP: u32 = 0x8904;
 const FIONCLEX: u32 = 0x5450;
 const FIOCLEX: u32 = 0x5451;
 
@@ -404,6 +413,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::SignalFd(_)
         | FileKind::Inotify(_)
         | FileKind::Pidfd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        FileKind::MessageQueue(q) => Ok(encode_stat(&q.borrow().stat(), MQUEUE_DEV)),
         FileKind::Pty(end) => {
             let n = end.tty.borrow().index;
             Ok(anon(
@@ -511,7 +521,7 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
 }
 
 /// open 的 inotify 事件，顺序与 Linux 相同：新建（报给目录）、`O_TRUNC` 截断、打开。
-/// 有监视时给打开文件挂上 [`inotify::Opened`]。
+/// 给打开文件挂上 [`inotify::Opened`]。
 fn open_events(
     cx: &Cx<'_>,
     file: &FileRef,
@@ -521,13 +531,26 @@ fn open_events(
     flags: u32,
 ) {
     let k = cx.kr();
-    if !inotify::active(k) {
-        return;
-    }
-    let parent = match &parent {
-        Some((Node::Store(dir), name)) => Some((*dir, name.as_slice())),
+    let parent = match parent {
+        Some((Node::Store(dir), name)) => Some((dir, name)),
         _ => None,
     };
+    if inotify::active(k) {
+        open_notify(k, file, ino, parent.as_ref(), created, flags);
+    }
+    let watch = inotify::opened(k, &file.borrow(), parent);
+    file.borrow_mut().watch = watch;
+}
+
+fn open_notify(
+    k: &Kernel,
+    file: &FileRef,
+    ino: Ino,
+    parent: Option<&(Ino, Vec<u8>)>,
+    created: bool,
+    flags: u32,
+) {
+    let parent = parent.map(|(d, n)| (*d, n.as_slice()));
     let (dir, truncated) = {
         let f = file.borrow();
         let regular = matches!(f.kind, FileKind::Regular { .. });
@@ -541,8 +564,6 @@ fn open_events(
         _ => {}
     }
     inotify::path_event(k, ino, parent, inotify::IN_OPEN | dir);
-    let watch = inotify::opened(k, &file.borrow(), parent);
-    file.borrow_mut().watch = watch;
 }
 
 /// 文件句柄（`struct file_handle`）里的类型和长度：句柄就是仓库里的 inode 编号。
@@ -654,20 +675,9 @@ pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
 
 /// 有没有以写方式打开着的 `ino`（执行它时 ETXTBSY）。
 pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
-    let mut seen = Vec::new();
-    cx.kr().tasks.values().any(|t| {
-        let fds = t.res.borrow().fds.clone();
-        if seen.contains(&Rc::as_ptr(&fds)) {
-            return false;
-        }
-        seen.push(Rc::as_ptr(&fds));
-        let table = fds.borrow();
-        table.open_fds().into_iter().any(|fd| {
-            table.get(fd).is_ok_and(|f| {
-                let f = f.borrow();
-                f.writable() && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
-            })
-        })
+    cx.kr().open_files().iter().any(|f| {
+        let f = f.borrow();
+        f.writable() && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
     })
 }
 
@@ -719,6 +729,7 @@ fn open_store(
             FileKind::Directory {
                 node: Node::Store(ino),
                 entries: None,
+                process: None,
             }
         }
         _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
@@ -726,6 +737,11 @@ fn open_store(
             let write = accmode != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
             if write && created.is_none() && executing(cx, ino) {
                 return Err(Errno::ETXTBSY);
+            }
+            // 别人的租约：写方式打开与所有租约冲突，读方式只与写租约冲突
+            if created.is_none() {
+                let nonblock = flags & oflags::O_NONBLOCK != 0;
+                super::lease::break_leases(cx, ino, write, nonblock, None)?;
             }
             let file = match created {
                 Some(f) => f,
@@ -830,9 +846,16 @@ fn open_pseudo(
         if accmode != oflags::O_RDONLY {
             return Err(Errno::EISDIR);
         }
+        // /proc/<pid> 记住是哪个进程：Linux 的打开文件引用着 struct pid，进程回收之后
+        // 当作 pidfd 用是 ESRCH，即使 pid 已经给了新进程
+        let process = match node {
+            PseudoNode::Pid(pid, None) => cx.kr().groups.get(&pid).map(Rc::downgrade),
+            _ => None,
+        };
         return Ok(FileKind::Directory {
             node: Node::Pseudo(node),
             entries: None,
+            process,
         });
     }
     if flags & oflags::O_DIRECTORY != 0 {
@@ -902,7 +925,8 @@ pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     let r = cx.fds_mut().close(fd);
     let file = r?;
     let fds = cx.t.fds.clone();
-    locks::closed(cx.k(), &fds, &[file]);
+    locks::closed(cx.k(), &fds, std::slice::from_ref(&file));
+    crate::unix::released(cx.k(), vec![file]);
     Ok(0)
 }
 
@@ -921,6 +945,7 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     );
     let fds = cx.t.fds.clone();
     locks::closed(cx.k(), &fds, &closed);
+    crate::unix::released(cx.k(), closed);
     Ok(0)
 }
 
@@ -936,7 +961,9 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
     let file = cx.fds().get(old)?;
     let replaced = cx.fds_mut().install_at(new, file, flags != 0);
     let fds = cx.t.fds.clone();
-    locks::closed(cx.k(), &fds, &replaced?.into_iter().collect::<Vec<_>>());
+    let replaced: Vec<_> = replaced?.into_iter().collect();
+    locks::closed(cx.k(), &fds, &replaced);
+    crate::unix::released(cx.k(), replaced);
     Ok(new as u64)
 }
 
@@ -984,7 +1011,11 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     let file = cx.fds().get(fd)?;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let min = usize::try_from(arg as i32).map_err(|_| Errno::EINVAL)?;
+            // 起点不小于 RLIMIT_NOFILE 是 EINVAL，没有空位才是 EMFILE
+            let min = usize::try_from(arg as i32)
+                .ok()
+                .filter(|&m| m < cx.fds().limit)
+                .ok_or(Errno::EINVAL)?;
             cx.fds_mut()
                 .install(file, cmd == F_DUPFD_CLOEXEC, min)
                 .map(|fd| fd as u64)
@@ -996,14 +1027,20 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             .map(|()| 0),
         F_GETFL => Ok((file.borrow().flags | oflags::O_LARGEFILE) as u64),
         F_SETFL => {
-            let mut f = file.borrow_mut();
-            f.flags = (f.flags & !oflags::SETFL_MASK) | (arg as u32 & oflags::SETFL_MASK);
+            let async_on = {
+                let mut f = file.borrow_mut();
+                let was = f.flags & oflags::O_ASYNC != 0;
+                f.flags = (f.flags & !oflags::SETFL_MASK) | (arg as u32 & oflags::SETFL_MASK);
+                !was && f.flags & oflags::O_ASYNC != 0
+            };
+            if async_on {
+                super::poll::register_fasync(cx, &file, fd);
+            }
             Ok(0)
         }
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             record_lock(cx, &file, cmd, arg)
         }
-        // 异步 I/O 通知（O_ASYNC、SIGIO）没有实现：属主和信号只记录下来
         F_SETOWN => {
             let pid = arg as i32;
             file.borrow_mut().owner = if pid < 0 {
@@ -1042,6 +1079,8 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             Ok(0)
         }
         F_GETSIG => Ok(file.borrow().sig as u64),
+        F_SETLEASE => super::lease::set(cx, &file, fd, arg as i16).map(|()| 0),
+        F_GETLEASE => Ok(super::lease::get(cx, &file) as u64),
         F_GETPIPE_SZ | F_SETPIPE_SZ => {
             let f = file.borrow();
             let FileKind::Pipe(end) = &f.kind else {
@@ -1298,6 +1337,36 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             let mut f = file.borrow_mut();
             f.flags = (f.flags & !oflags::O_NONBLOCK) | if on { oflags::O_NONBLOCK } else { 0 };
             return Ok(0);
+        }
+        FIOASYNC => {
+            let on = u32::from_le_bytes(get(cx, arg)?) != 0;
+            let was = {
+                let mut f = file.borrow_mut();
+                let was = f.flags & oflags::O_ASYNC != 0;
+                f.flags = (f.flags & !oflags::O_ASYNC) | if on { oflags::O_ASYNC } else { 0 };
+                was
+            };
+            if on && !was {
+                super::poll::register_fasync(cx, &file, fd);
+            }
+            return Ok(0);
+        }
+        // socket 的属主（与 F_SETOWN、F_GETOWN 相同，负数是进程组）
+        FIOSETOWN | SIOCSPGRP | FIOGETOWN | SIOCGPGRP
+            if matches!(file.borrow().kind, FileKind::Socket(_)) =>
+        {
+            if matches!(request, FIOSETOWN | SIOCSPGRP) {
+                let pid = i32::from_le_bytes(get(cx, arg)?);
+                file.borrow_mut().owner = if pid < 0 {
+                    (F_OWNER_PGRP, -pid)
+                } else {
+                    (F_OWNER_PID, pid)
+                };
+                return Ok(0);
+            }
+            let (ty, pid) = file.borrow().owner;
+            let pid = if ty == F_OWNER_PGRP { -pid } else { pid };
+            return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
         _ => {}
     }
@@ -1720,7 +1789,7 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
         }
         if let Some(ino) = victim {
             let k = cx.kr();
-            inotify::path_event(k, ino, None, inotify::IN_DELETE_SELF);
+            inotify::deleted(k, ino, dir, name);
             inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
         }
     } else {
@@ -1739,20 +1808,20 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
         may_delete(store, &cred, dir, name)?;
         store.unlink(dir, name)?;
         if let Some(ino) = victim {
-            unlinked_events(cx, store, ino);
+            unlinked_events(cx, store, ino, (dir, name));
             inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
         }
     }
     Ok(0)
 }
 
-/// 去掉了文件 `ino` 的一个链接（unlink、被 rename 覆盖）：链接数变了（IN_ATTRIB），
+/// 去掉了文件 `ino` 的链接 `name`（unlink、被 rename 覆盖）：链接数变了（IN_ATTRIB），
 /// 最后一个链接也没了时 IN_DELETE_SELF。这两个事件只报给文件自己。
-fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino) {
+fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8])) {
     let k = cx.kr();
     inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
     if store.stat(ino).map_or(0, |st| st.nlink) == 0 {
-        inotify::path_event(k, ino, None, inotify::IN_DELETE_SELF);
+        inotify::deleted(k, ino, dir, name);
     }
 }
 
@@ -1876,8 +1945,25 @@ pub(super) fn renameat2(
         flags & RENAME_NOREPLACE != 0,
         exchange,
     )?;
-    // 顺序与 Linux 的 fsnotify_move 相同；交换时另一边再移动一次
+    // 经由移动的名字打开着的文件跟着改名
     let k = cx.kr();
+    let store = vfs.store();
+    let lookup = |dir, name| move || store.lookup(dir, name).ok().flatten();
+    inotify::renamed(
+        k,
+        (old_dir, old_name),
+        (new_dir, new_name),
+        lookup(new_dir, new_name),
+    );
+    if exchange {
+        inotify::renamed(
+            k,
+            (new_dir, new_name),
+            (old_dir, old_name),
+            lookup(old_dir, old_name),
+        );
+    }
+    // 顺序与 Linux 的 fsnotify_move 相同；交换时另一边再移动一次
     let moved = |isdir: u32, from: (Ino, &[u8]), to: (Ino, &[u8])| {
         let cookie = inotify::cookie(k);
         inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
@@ -1894,9 +1980,9 @@ pub(super) fn renameat2(
             Some((replaced, isdir)) => {
                 inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF);
                 if isdir != 0 {
-                    inotify::path_event(k, replaced, None, inotify::IN_DELETE_SELF);
+                    inotify::deleted(k, replaced, new_dir, new_name);
                 } else {
-                    unlinked_events(cx, vfs.store(), replaced);
+                    unlinked_events(cx, vfs.store(), replaced, (new_dir, new_name));
                 }
             }
             None => inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF),
@@ -2118,6 +2204,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
                 return Err(Errno::ETXTBSY);
             }
             check_fsize(cx, len)?;
+            super::lease::break_leases(cx, ino, true, false, None)?;
             let host = vfs.store().open_object(ino, true)?;
             host.set_len(len).map_err(host_errno)?;
             truncated(cx, &host);
@@ -2135,6 +2222,11 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
 pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     let len = u64::try_from(len).map_err(|_| Errno::EINVAL)?;
     let file = cx.fds().get(fd)?;
+    if let FileKind::Regular { ino, .. } = file.borrow().kind
+        && file.borrow().writable()
+    {
+        super::lease::break_leases(cx, ino, true, false, Some(&file))?;
+    }
     let f = file.borrow();
     match &f.kind {
         FileKind::Regular { file, .. } if f.writable() => {
@@ -2327,6 +2419,32 @@ pub(super) fn cache_hint(
     }
 }
 
+/// cachestat（Linux 6.5）：文件在页缓存里的状况。仓库里的文件看宿主文件的页缓存
+/// （[`appine_hal::cachestat`]，只有在缓存里的页数），其余的文件没有页缓存，全是 0。
+pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    if matches!(file.borrow().kind, FileKind::Path(_)) {
+        return Err(Errno::EBADF);
+    }
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let r: [u8; 16] = get(cx, range)?;
+    let off = u64::from_le_bytes(r[..8].try_into().unwrap());
+    let len = u64::from_le_bytes(r[8..].try_into().unwrap());
+    let stats = match &file.borrow().kind {
+        FileKind::Regular { file, .. } => {
+            appine_hal::cachestat(std::os::fd::AsRawFd::as_raw_fd(file), off, len).map_err(Errno)?
+        }
+        _ => [0; 5],
+    };
+    let mut b = [0u8; 40];
+    for (i, n) in stats.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&n.to_le_bytes());
+    }
+    put(cx, out, b).map(|()| 0)
+}
+
 pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     // 仓库的数据直接写在宿主文件里；为了 apk 这类频繁 fsync 的负载，不逐个刷盘
     let file = cx.fds().get(fd)?;
@@ -2345,7 +2463,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
     let file = cx.fds().get(fd)?;
     let mut f = file.borrow_mut();
     let OpenFile { kind, pos, .. } = &mut *f;
-    let FileKind::Directory { node, entries } = kind else {
+    let FileKind::Directory { node, entries, .. } = kind else {
         return Err(Errno::ENOTDIR);
     };
     if entries.is_none() {
@@ -2353,7 +2471,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         let view = cx.view(&vfs);
         let ino_of = |n: &Node| match n {
             Node::Store(i) => *i,
-            Node::Pseudo(p) => pseudo::ino_of(p),
+            Node::Pseudo(p) => pseudo::node_ino(view.k, p),
         };
         let parent = vfs.parent(&view, node)?;
         let mut list = vec![
@@ -2421,6 +2539,12 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
             SEEK_END => data.len() as i64,
+            _ => return Err(Errno::EINVAL),
+        },
+        FileKind::MessageQueue(q) => match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => *pos as i64,
+            SEEK_END => q.borrow().status().len() as i64,
             _ => return Err(Errno::EINVAL),
         },
         // 与 Linux 的 /dev/null 等一样，seek 总是成功并停在 0
@@ -2498,6 +2622,11 @@ fn io_path(f: &OpenFile) -> IoPath {
         } => IoPath::Pagemap(*pid),
         _ => IoPath::Local,
     }
+}
+
+/// 能不能按位置读写（AIO 对不能定位的文件不管偏移）。
+pub(super) fn seekable(f: &OpenFile) -> bool {
+    matches!(io_path(f), IoPath::Local | IoPath::Pagemap(_))
 }
 
 /// 读写走哪条路径。带偏移的读写（pread、pwritev）遇到不能定位的文件是 ESPIPE：与
@@ -2827,11 +2956,23 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             buf[..n].copy_from_slice(&data[start..start + n]);
             n
         }
+        // 消息队列读到的是状态行
+        FileKind::MessageQueue(q) => {
+            let data = q.borrow().status();
+            let start = (pos as usize).min(data.len());
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        }
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
         FileKind::Epoll(_) | FileKind::Pidfd(_) => return Err(Errno::EINVAL),
         _ => return Err(Errno::EBADF),
     };
-    if offset.is_none() && matches!(f.kind, FileKind::Regular { .. } | FileKind::Proc { .. }) {
+    let positioned = matches!(
+        f.kind,
+        FileKind::Regular { .. } | FileKind::Proc { .. } | FileKind::MessageQueue(_)
+    );
+    if offset.is_none() && positioned {
         f.pos = pos + n as u64;
     }
     Ok(n)
@@ -2860,7 +3001,7 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
         // 可写的 procfs 文件：内容由 pseudo::write 处理过了
         FileKind::Proc { .. } => Ok(data.len()),
         // 没有 write 操作的匿名 inode
-        FileKind::Epoll(_) | FileKind::Pidfd(_) => Err(Errno::EINVAL),
+        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::MessageQueue(_) => Err(Errno::EINVAL),
         _ => Err(Errno::EBADF),
     }
 }
@@ -3010,7 +3151,7 @@ fn check_fsize(cx: &Cx<'_>, len: u64) -> Result<(), Errno> {
 }
 
 /// 从打开文件读到 guest 缓冲区（read、pread、readv）。
-fn read_file(
+pub(super) fn read_file(
     cx: &mut Cx<'_>,
     file: &FileRef,
     buf: u64,
@@ -3031,6 +3172,12 @@ fn read_file(
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
+        if k > 0 {
+            file.borrow_mut().reads += 1;
+            if file.borrow().flags & oflags::O_ASYNC != 0 {
+                request_wake();
+            }
+        }
         if let Err(e) = cx.mm().write(
             UserSlice::new(buf.wrapping_add(done as u64), k),
             &chunk[..k],
@@ -3050,7 +3197,7 @@ fn read_file(
 }
 
 /// 把 guest 缓冲区写进打开文件（write、pwrite、writev）。
-fn write_file(
+pub(super) fn write_file(
     cx: &mut Cx<'_>,
     file: &FileRef,
     buf: u64,
@@ -3281,7 +3428,7 @@ fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errn
 
 /// readv、writev 和带偏移的变体：按顺序处理每个 iovec，遇到不完整的一段就停下。
 /// `offset` 为 None 时使用并推进文件位置。
-fn vectored(
+pub(super) fn vectored(
     cx: &mut Cx<'_>,
     fd: i32,
     iov: u64,

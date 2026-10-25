@@ -15,7 +15,7 @@ use crate::fd::{FileKind, OpenFile, oflags};
 use crate::ipc;
 use crate::kernel::{INIT, Kernel, Tid};
 use crate::mm::Region;
-use crate::net::{AF_INET, AF_INET6, SOCK_DGRAM, SOCK_STREAM};
+use crate::net::{AF_INET, AF_INET6, Table};
 use crate::process::{Signal, ThreadGroup};
 use crate::signal::SigAction;
 use crate::syscall::SocketRef;
@@ -101,9 +101,13 @@ const ENTRIES: [(&[u8], Entry); 20] = [
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 52] = [
+const STATIC: [&[u8]; 65] = [
     b"net/",
     b"net/dev",
+    b"net/icmp",
+    b"net/icmp6",
+    b"net/raw",
+    b"net/raw6",
     b"net/tcp",
     b"net/tcp6",
     b"net/udp",
@@ -111,12 +115,20 @@ const STATIC: [&[u8]; 52] = [
     b"net/unix",
     b"sys/",
     b"sys/fs/",
+    b"sys/fs/aio-max-nr",
+    b"sys/fs/aio-nr",
     b"sys/fs/file-max",
     b"sys/fs/inotify/",
     b"sys/fs/inotify/max_queued_events",
     b"sys/fs/inotify/max_user_instances",
     b"sys/fs/inotify/max_user_watches",
     b"sys/fs/lease-break-time",
+    b"sys/fs/mqueue/",
+    b"sys/fs/mqueue/msg_default",
+    b"sys/fs/mqueue/msg_max",
+    b"sys/fs/mqueue/msgsize_default",
+    b"sys/fs/mqueue/msgsize_max",
+    b"sys/fs/mqueue/queues_max",
     b"sys/fs/nr_open",
     b"sys/fs/pipe-max-size",
     b"sys/fs/pipe-user-pages-hard",
@@ -130,6 +142,7 @@ const STATIC: [&[u8]; 52] = [
     b"sys/kernel/msgmnb",
     b"sys/kernel/msgmni",
     b"sys/kernel/ngroups_max",
+    b"sys/kernel/ns_last_pid",
     b"sys/kernel/osrelease",
     b"sys/kernel/ostype",
     b"sys/kernel/pid_max",
@@ -266,6 +279,26 @@ fn parse_num(name: &[u8]) -> Option<i64> {
 pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     node.hash(&mut h);
+    h.finish() | 1
+}
+
+/// stat 和 readdir 给出的 inode：`/proc/<pid>` 和它下面的项还取决于是哪个进程，与 Linux
+/// 一样，pid 被新进程重新使用之后 inode 不同。
+pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
+    let pid = match node {
+        PseudoNode::Pid(pid, _)
+        | PseudoNode::Entry(pid, ..)
+        | PseudoNode::Fd(pid, _)
+        | PseudoNode::OpenFd(pid, _)
+        | PseudoNode::FdInfo(pid, _) => *pid,
+        _ => return ino_of(node),
+    };
+    let Some(g) = k.groups.get(&pid) else {
+        return ino_of(node);
+    };
+    let mut h = std::hash::DefaultHasher::new();
+    node.hash(&mut h);
+    g.borrow().serial.hash(&mut h);
     h.finish() | 1
 }
 
@@ -575,7 +608,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         .unwrap_or(0);
     let (uid, gid) = owner_of(ps.k, node);
     Ok(Stat {
-        ino: ino_of(node),
+        ino: node_ino(ps.k, node),
         mode: kind | perm,
         nlink: if kind == mode::S_IFDIR { 2 } else { 1 },
         uid,
@@ -616,6 +649,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                 b"sys/kernel/hostname"
                     | b"sys/kernel/domainname"
                     | b"sys/kernel/pid_max"
+                    | b"sys/kernel/ns_last_pid"
                     | b"sys/kernel/core_pattern"
                     | b"sys/kernel/msgmax"
                     | b"sys/kernel/msgmnb"
@@ -625,6 +659,12 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/kernel/shmmax"
                     | b"sys/kernel/shmmni"
                     | b"sys/fs/lease-break-time"
+                    | b"sys/fs/aio-max-nr"
+                    | b"sys/fs/mqueue/msg_default"
+                    | b"sys/fs/mqueue/msg_max"
+                    | b"sys/fs/mqueue/msgsize_default"
+                    | b"sys/fs/mqueue/msgsize_max"
+                    | b"sys/fs/mqueue/queues_max"
                     | b"sys/fs/nr_open"
                     | b"sys/fs/pipe-max-size"
                     | b"sys/fs/inotify/max_queued_events"
@@ -663,6 +703,53 @@ pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<()
             .filter(|&n| n <= i32::MAX as usize)
             .ok_or(Errno::EINVAL)?;
         crate::mm::MAX_MAP_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let PseudoNode::Static(path) = node
+        && let Some(name) = path.strip_prefix(b"sys/fs/mqueue/")
+        && let Some(slot) = k.mq_limits.slot(name)
+    {
+        *slot = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&v: &u64| v > 0)
+            .ok_or(Errno::EINVAL)?;
+    }
+    if let PseudoNode::Static(b"sys/fs/aio-max-nr") = node {
+        k.aio_max_nr = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or(Errno::EINVAL)?;
+    }
+    if let PseudoNode::Static(path) = node
+        && let Some(name) = path.strip_prefix(b"sys/fs/inotify/")
+    {
+        // 与 Linux 一样不接受负数
+        let n: usize = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| n <= i32::MAX as usize)
+            .ok_or(Errno::EINVAL)?;
+        let mut r = k.inotify.borrow_mut();
+        match name {
+            b"max_queued_events" => r.max_queued = n,
+            b"max_user_instances" => r.max_instances = n,
+            _ => r.max_watches = n,
+        }
+    }
+    // 与 Linux 一样在 0 到 pid_max 之间（checkpoint/restore 用它让新进程拿到指定的 pid）
+    if let PseudoNode::Static(b"sys/kernel/ns_last_pid") = node {
+        let pid: i32 = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| (0..=crate::kernel::PID_MAX).contains(&n))
+            .ok_or(Errno::EINVAL)?;
+        k.set_last_pid(pid);
+    }
+    if let PseudoNode::Static(b"sys/fs/lease-break-time") = node {
+        k.lease_break_time = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or(Errno::EINVAL)?;
     }
     // fd 表的容量固定：nr_open 可以调小，不能超过它
     if let PseudoNode::Static(b"sys/fs/nr_open") = node {
@@ -754,7 +841,7 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
         .map(|n| {
             Ok(DirEntry {
                 name: ps.name(&n),
-                ino: ino_of(&n),
+                ino: node_ino(ps.k, &n),
                 mode: ps.kind(&n).unwrap_or(mode::S_IFREG),
             })
         })
@@ -778,9 +865,7 @@ pub(crate) fn uptime_ns() -> u64 {
 }
 
 fn cpus() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(64)
+    appine_hal::host_cpus().len()
 }
 
 /// 线程组的 CPU 时间（纳秒）：活着的线程加上已经退出的线程。
@@ -869,6 +954,7 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     let g = ps.group(pid).ok_or(Errno::ENOENT)?;
     let g = g.borrow();
     let task = ps.task(pid, tid);
+    let nice = task.as_ref().map_or(0, |t| t.nice.get());
     let (state, _) = state_of(ps, &g, tid);
     let (tty_nr, tpgid) = ctty_info(ps, &g);
     let cpu = match (tid, &task) {
@@ -901,8 +987,8 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
         ticks(cpu.sys_ns),
         ticks(g.child_cpu.user_ns()),
         ticks(g.child_cpu.sys_ns),
-        20 + g.nice,
-        g.nice,
+        20 + nice,
+        nice,
         g.threads.len().max(1),
         g.start_ticks,
         vsize,
@@ -1293,6 +1379,12 @@ fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
             }
         }
     }
+    // 只在 SCM_RIGHTS 消息里的
+    for s in crate::unix::inflight_sockets(k) {
+        if seen.insert(Rc::as_ptr(&s)) {
+            out.push((s, 0));
+        }
+    }
     out.sort_by_key(|(s, _)| socket_ino(s));
     out
 }
@@ -1361,16 +1453,31 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         },
         Static(path) => match &path[..] {
             b"net/dev" => net_dev(),
-            b"net/tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, SOCK_STREAM),
-            b"net/tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, SOCK_STREAM),
-            b"net/udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, SOCK_DGRAM),
-            b"net/udp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, SOCK_DGRAM),
+            b"net/tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Tcp),
+            b"net/tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Tcp),
+            b"net/udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Udp),
+            b"net/udp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Udp),
+            b"net/icmp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Icmp),
+            b"net/icmp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Icmp),
+            b"net/raw" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Raw),
+            b"net/raw6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Raw),
             b"net/unix" => crate::unix::proc_listing(&sockets(ps.k)),
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
-            b"sys/fs/lease-break-time" => "45\n".to_owned(),
-            b"sys/fs/inotify/max_queued_events" => format!("{}\n", crate::syscall::MAX_QUEUED),
-            b"sys/fs/inotify/max_user_instances" => "128\n".to_owned(),
-            b"sys/fs/inotify/max_user_watches" => format!("{}\n", crate::syscall::MAX_WATCHES),
+            b"sys/fs/lease-break-time" => format!("{}\n", ps.k.lease_break_time),
+            b"sys/fs/aio-max-nr" => format!("{}\n", ps.k.aio_max_nr),
+            b"sys/fs/aio-nr" => format!("{}\n", ps.k.aio_nr),
+            p if p.starts_with(b"sys/fs/mqueue/") => {
+                format!("{}\n", ps.k.mq_limits.get(&p[14..]).unwrap_or(0))
+            }
+            b"sys/fs/inotify/max_queued_events" => {
+                format!("{}\n", ps.k.inotify.borrow().max_queued)
+            }
+            b"sys/fs/inotify/max_user_instances" => {
+                format!("{}\n", ps.k.inotify.borrow().max_instances)
+            }
+            b"sys/fs/inotify/max_user_watches" => {
+                format!("{}\n", ps.k.inotify.borrow().max_watches)
+            }
             b"sys/fs/nr_open" => format!("{}\n", ps.k.nr_open),
             b"sys/fs/pipe-max-size" => format!("{}\n", ps.k.pipe_max_size),
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
@@ -1398,6 +1505,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             }
             b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
+            b"sys/kernel/ns_last_pid" => format!("{}\n", ps.k.last_pid()),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),

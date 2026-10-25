@@ -305,8 +305,9 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 所有文件系统修改都经过内核层，所以 inotify 不需要宿主参与：各个 syscall 改完仓库之后报告事件，报告的位置和顺序与 Linux 的 fsnotify 钩子相同。监视按仓库的 inode 登记；没有任何监视时，每个事件只多一次判空。
 
-- 文件上的事件同时报给它所在目录的监视，带上文件名。按路径的操作只在有监视时再解析一次路径，找出文件所在的目录。按 fd 的操作（读写、截断、关闭）用打开时经过的目录：仓库没有按 inode 反查目录项的索引，所以打开之后又被改名的文件，事件仍然报给原来的目录。监视建立之前就打开的文件只报给它自己的监视。
-- `IN_CLOSE_*` 在打开文件的最后一个引用释放时报告，与 Linux 的 fput 相同。`IN_DELETE_SELF` 在最后一个链接删除时就报告，不等文件关闭。
+- 文件上的事件同时报给它所在目录的监视，带上文件名。按路径的操作只在有监视时再解析一次路径，找出文件所在的目录。按 fd 的操作（读写、截断、关闭）用打开时经过的目录和名字：每个打开的仓库文件都记着它们，相当于 Linux 打开文件引用的目录项，所以监视建立之前就打开的文件也报告。rename 移动目录项时，经由它打开的文件跟着改；删除之后不变，与 Linux 一样仍然报给原来的目录。
+- `IN_CLOSE_*` 在打开文件的最后一个引用释放时报告，与 Linux 的 fput 相同。`IN_DELETE_SELF` 在最后一个链接删除时报告；还有经由被删除的那个名字打开着的文件时，等它们都关闭再报告，与 Linux 在目录项的最后一个引用释放时报告相同。
+- 每个用户（有效 uid）的实例数和监视数受 `max_user_instances`、`max_user_watches` 限制（EMFILE、ENOSPC），队列长度取创建实例时的 `max_queued_events`。
 - procfs、devpts 上可以建监视，但不会有事件。`/proc/sys/fs/inotify/*` 和 `/proc/<pid>/fdinfo/<fd>` 的格式与 Linux 相同。
 
 ---
@@ -333,7 +334,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | DNS | `resolv.conf` 写 `nameserver 127.0.0.53`。socket 层截下发往这个地址 53 端口的 UDP/TCP 请求，交给 `android_res_nsend`，这样系统的私人 DNS、VPN 和按网络分流设置都能生效 |
 | 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射 |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档 |
-| AF_UNIX | 进程内模拟。`SCM_RIGHTS` 传递的是 guest fd，`SO_PEERCRED` 返回 guest 的 pid 和 uid |
+| AF_UNIX | 进程内模拟。`SCM_RIGHTS` 传递的是 guest fd，`SO_PEERCRED` 返回 guest 的 pid 和 uid；只经由在途消息互相引用的 socket 由垃圾回收释放 |
 | tun/VpnService | v1 不做 |
 
 **I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作。宿主 fd 和进程内对象统一在 §6 的等待机制里处理。guest 的 `epoll` 在进程内实现，等待时把关注的宿主 fd 和线程自己的唤醒事件放进同一次宿主 `poll`（M4 没有用宿主 epoll，fd 很多时再换）。
@@ -648,7 +649,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 和设计相比的改动和推迟项：
 
 - epoll 没有用宿主 epoll（修改 §10），见上。
-- AF_UNIX 没有垃圾回收：socket 经由自己传递自己形成的环不会被释放（Linux 用专门的 GC 处理）；没有 `/proc/net/unix`（M9 之前补上了）。
+- AF_UNIX 没有垃圾回收：socket 经由自己传递自己形成的环不会被释放（Linux 用专门的 GC 处理）；没有 `/proc/net/unix`。这两项都在 M9 之前补上了。
 - 没有实现 `execveat`（musl 的 `fexecve` 会退回到 `/proc/self/fd/<n>`）、`membarrier`（musl 有基于信号的退路）、`pidfd_open`（python 会退回）、POSIX 定时器、`timerfd`、`signalfd`、`inotify`、文件记录锁（`F_SETLK` 仍然总是成功）。其中 POSIX 定时器、timerfd、signalfd 和记录锁在 M6 补上了，`execveat` 和 pidfd 在 M9 之前的兼容性补漏里补上了。
 - 1024 以下的端口、回环地址对其他 App 可见等 §10 的问题在 M5 的真机上确认。
 
@@ -765,10 +766,10 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 
 和设计相比的改动和推迟项：
 
-- 没有：inotify/fanotify、文件租约（`F_SETLEASE`）和 `O_ASYNC`/SIGIO（`F_SETOWN` 等只记录）、core dump、AIO/io_uring、POSIX 消息队列、挂载、命名空间、ptrace、seccomp 过滤、文件能力和环境能力。
+- 没有：inotify/fanotify、文件租约（`F_SETLEASE`）和 `O_ASYNC`/SIGIO（`F_SETOWN` 等只记录）、core dump、AIO/io_uring、POSIX 消息队列、挂载、命名空间、ptrace、seccomp 过滤、文件能力和环境能力。（inotify 在 M8 补测时补上；文件租约、`O_ASYNC`、AIO、POSIX 消息队列在 M9 之前补上。）
 - 线程退出时不处理 robust futex 链表（只记录 `set_robust_list`）。
-- `MREMAP_DONTUNMAP` 不支持；私有文件映射不能用 mremap 扩展。
-- epoll 没有 `EPOLLEXCLUSIVE`。
+- `MREMAP_DONTUNMAP` 不支持；私有文件映射不能用 mremap 扩展。（`MREMAP_DONTUNMAP` 在 M9 之前补上。）
+- epoll 没有 `EPOLLEXCLUSIVE`。（M9 之前补上。）
 - Tier 1 翻译 SIMD&FP 原本在 R1 的退路里。按上面的数据，建议把它放进 M7 作为第一项。
 
 ### M7 结果（2026-10-25）
@@ -903,7 +904,7 @@ V8 生成的代码在 Tier 1 下和普通程序一样快。`go build` 慢有两�
 - `PROT_NONE` 的预留区仍然逐页写页表：V8 的每块 wasm 内存占 16 MB 页表。可以改成到 mprotect 成可访问时再填。
 - `MADV_DONTNEED` 用清零实现，对大块从没碰过的内存反而会占用内存，应当改用宿主的 madvise（宿主 16K 页时边缘部分仍要清零）。
 - `EPOLLET` 的近似：程序没有用完数据（没读到 EAGAIN、读满了缓冲区）时，新到的数据不会再触发。
-- 不按 nice 值分配 CPU（nice05）。
+- 不按 nice 值分配 CPU（nice05）。（M9 之前补上。）
 
 ### M8 补测：JVM（2026-10-25）
 
@@ -1043,9 +1044,9 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 
 推迟：
 
-- pidfd：`PIDFD_THREAD`、`/proc/sys/kernel/ns_last_pid`（pidfd_send_signal03 要用它让新进程拿到同一个 pid）。
+- pidfd：`PIDFD_THREAD`、`/proc/sys/kernel/ns_last_pid`（pidfd_send_signal03 要用它让新进程拿到同一个 pid）。（ns_last_pid 在"M9 之前：推迟项"补上；`PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做。）
 - 不产生 core dump，`WCOREDUMP` 总是 0（waitid10）；getrusage 的 `ru_maxrss` 总是 0（getrusage03，下一轮补上了）。
-- `MREMAP_DONTUNMAP` 不支持文件映射；没有 `/proc/net/{icmp,raw}`。
+- `MREMAP_DONTUNMAP` 不支持文件映射；没有 `/proc/net/{icmp,raw}`。（都在"M9 之前：推迟项"补上。）
 
 ### M9 之前：剩下的小缺口（2026-10-25）
 
@@ -1071,8 +1072,42 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 
 推迟：
 
-- `MAP_GROWSDOWN` 的映射不会向下增长（mmap18）：要在映射下方预留宿主地址空间，并在缺页时延伸 VMA。
-- cachestat；unshare 的命名空间。
+- `MAP_GROWSDOWN` 的映射不会向下增长（mmap18）：要在映射下方预留宿主地址空间，并在缺页时延伸 VMA。（下一轮补上了，不需要预留：长出来的部分是一个新的 VMA。）
+- cachestat；unshare 的命名空间。（cachestat 下一轮补上了。）
+
+### M9 之前：推迟项（2026-10-25）
+
+把前几轮推迟的、在单进程模型里做得了的补上；io_uring 单独做一轮。
+
+- **信号驱动的 I/O**：`O_ASYNC`（`F_SETFL`、`FIOASYNC`），属主（`F_SETOWN`、`F_SETOWN_EX`，socket 上还有 `FIOSETOWN`/`SIOCSPGRP`）和 `F_SETSIG` 原来只记录，现在生效：文件变得可读、可写、出错或挂断时给属主（线程、进程或进程组）发 SIGIO，或者 `F_SETSIG` 设置的信号，带 `si_band`、`si_fd`（signalfd 也给出这两项），band 与 Linux 相同。读过之后仍然可读的（又来了数据）再通知一次。检查放在定时器线程上：内核状态的任何修改都会叫醒它，它顺便检查登记了 `O_ASYNC` 的文件，宿主 socket 的就绪也由它一起 poll。
+- **文件租约**：`F_SETLEASE`、`F_GETLEASE`、`/proc/sys/fs/lease-break-time`。规则与 Linux 相同：只有属主（或有 `CAP_LEASE`）能设置；读租约要求自己不可写、没有人以写方式打开，写租约要求没有别的打开。以写方式打开或者截短打破所有租约，以读方式打开打破写租约：持有者收到 `F_SETSIG` 的信号（`POLL_MSG`）或 SIGIO；`O_NONBLOCK` 的 open 返回 EWOULDBLOCK，否则等持有者降级或放弃，超过 lease-break-time 强制降级。被写方式的打开打破时不能降成读租约。
+- **POSIX 消息队列**：`mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr`；按优先级排序，同一优先级先进先出；`/proc/sys/fs/mqueue/*` 可写，属性按它们和 `CAP_SYS_RESOURCE` 检查。队列的 fd 能 poll、epoll，read 给出与 Linux 相同的状态行。`mq_notify` 支持 `SIGEV_SIGNAL`、`SIGEV_NONE` 和 musl 的 `SIGEV_THREAD`（经由 netlink socket 送 cookie，与 Linux 相同）。队列在内存里，App 进程重启就没了，相当于 Linux 重启后的 mqueue 文件系统。
+- **原生 AIO**：`io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`，`/proc/sys/fs/aio-nr`、`aio-max-nr`。读写（含向量）、`fsync`、`fdatasync` 提交时就同步做完，`IOCB_CMD_POLL` 在文件就绪时完成，可以取消；`IOCB_FLAG_RESFD` 通知 eventfd，`RWF_NOWAIT`、`RWF_APPEND` 生效。上下文的 id 是一页只读的空映射：libaio 看到环的魔数不对，就不在用户态读完成队列，改用 syscall。
+- **epoll**：水平触发的关注在就绪的比 maxevents 多时轮流报告：从上次报告的后面接着查，效果与 Linux 把报告过的放到就绪链表末尾相同（epoll_wait14）。边沿触发的 `EPOLLEXCLUSIVE` 关注，同一次数据变化只报告给一个 epoll（epoll_wait16）：打开文件记着已经报告过的"数据代数"（读完、写满和读到数据的次数）。唤醒仍然叫醒所有等待者，没轮到的重新检查之后接着睡。
+- **inotify 的三处近似都去掉了**（§8.3）：每个打开的仓库文件记着打开时经过的目录和名字（原来只有打开时已经有监视的才记），监视建立之前打开的文件关闭时也报告；rename 移动目录项时，经由它打开的文件跟着改（扫一遍所有 fd 表）；`IN_DELETE_SELF` 在还有经由被删除的那个名字打开着的文件时等它们都关闭，顺序（`IN_CLOSE_*`、`IN_DELETE_SELF`、`IN_IGNORED`）与 Linux 相同。`max_user_instances`、`max_user_watches` 生效。
+- **nice 和亲和性交给宿主**：nice 改为按线程记录（Linux 的 `PRIO_PROCESS` 作用于线程，原来记在线程组上，第二个线程调 nice 拿到的是叠加的值），并设置到宿主线程上；guest 提高优先级时宿主线程最低到 -4，不超过 Android 上与显示有关的线程，guest 的忙循环不会拖慢界面。`SCHED_IDLE` 设成宿主的 19。`sched_setaffinity` 设置宿主线程的亲和性：guest 的 CPU i 是宿主允许本进程用的第 i 个 CPU，按启动时的快照（`available_parallelism` 读的是调用线程的亲和性，guest 线程被绑核之后再读会少报 CPU）。新线程开始运行时换成自己的设置，不继承创建它的宿主线程的。`RLIMIT_NICE`、`RLIMIT_RTPRIO` 的默认值改为 Linux 的 0，提高优先级按 `RLIMIT_NICE` 检查（Linux 的 can_nice）。宿主上没有权限时（普通 Linux 宿主不给降低 nice）保持原样；Android 的 init 给所有进程 `setrlimit nice 40 40`，开发容器也加上 `--ulimit nice=40:40`。另外 `SCHED_RESET_ON_FORK` 的子线程负的 nice 回到 0，`sched_*` 对还没回收的僵尸进程不再是 ESRCH。
+- **内存**：
+  - `remap_file_pages`：与 Linux 4.0 起一样用 mmap 模拟，在原地用同一个文件、新的偏移重新做共享映射。
+  - `MREMAP_DONTUNMAP` 支持所有映射（Linux 5.13 起）：原来的地址上私有匿名映射变空；共享映射（文件或匿名）与新地址共用同一段宿主内存，相当于之后从文件或共享内存重新读进来；私有文件映射按 inode 重新打开仓库里的文件再映射，打不开（已经删除并回收）时给空的匿名内存。
+  - `MAP_GROWSDOWN`：缺页地址在一个向下增长的私有匿名映射下面、中间没有别的映射时，把它延伸到那一页（mmap18），与下面那个可访问的映射之间要留出 256 页（`stack_guard_gap`）。宿主内存不必连续，长出来的部分是一个新的 VMA，所以不需要预留地址空间。共享匿名映射加它是 EINVAL，文件映射加它不增长。
+  - cachestat（6.5）：在缓存里的页数用 mincore 查宿主文件映射，不依赖宿主内核的版本（宿主的 cachestat 在开发容器的 overlayfs 上也数不到底层文件的页）；脏页、写回、逐出几项是 0。
+- **procfs、pidfd**：
+  - `/proc/sys/kernel/ns_last_pid` 可读写（pidfd_send_signal03）。
+  - `/proc/<pid>` 目录的 fd 记着打开时的那个进程：当作 pidfd 用时，进程回收之后是 ESRCH，即使 pid 已经给了新进程。`/proc/<pid>` 下的 inode 也随进程实例不同（加进了进程的编号），与 Linux 一样。
+  - `/proc/net/{icmp,icmp6,raw,raw6}`，格式与 Linux 相同（raw 的本端"端口"是协议号，ping 和 raw 的对端端口是 0）。ping 和 raw socket 没有对端端口，宿主的 getpeername 不给对端，数据报 socket connect 的对端由内核层记下。guest 的 raw ICMP socket 在宿主上是 ping socket，`SO_TYPE` 照样报告 `SOCK_RAW`。
+  - `/proc/net/unix` 列出只在 `SCM_RIGHTS` 消息里的 socket，和还没 accept 的连接（与 Linux 一样没有 inode，状态是 `SS_CONNECTING`）。
+- **AF_UNIX 的垃圾回收**：只经由在途消息互相引用的 socket 形成 Rc 的环（打开文件 → socket → 接收队列 → 消息 → 打开文件），程序已经够不着，原来永远不会释放。现在与 Linux 的 unix_gc 一样：消息里带着打开文件的 channel 登记下来；关闭 unix socket（close、close_range、dup2 覆盖、execve）和进程退出之后，候选是所有引用都来自在途消息的 unix socket，去掉从候选的接收队列出发的引用之后还有引用的够得着，它们收到的也够得着；剩下的清空接收队列，环就断开了。别处临时多持有一个引用的不是候选，只会少回收、不会错收。Linux 6.8 起 GC 在工作队列里异步执行，所以这一项没法和原生比对，由单元测试检查。
+- **零碎的**：fd 表没有空位时总是 EMFILE（`F_DUPFD` 的起点超过上限由它自己返回 EINVAL），`mq_open` 先装 fd 再登记名字，装不下时不留下队列。
+- musl 的问题：mq_open01 的空名字一项要 EINVAL，那是 glibc 自己的检查，musl 直接交给内核，Linux 返回 ENOENT；sched_setscheduler04 用 libc 的 `sched_getscheduler`，musl 的这个函数直接返回 ENOSYS。这两项在原生 Alpine 上同样失败。用 libaio 的 AIO 测试跳过，因为 LTP 构建时没有 libaio。
+- 测试：差分测试 `compat` 新增信号驱动的 I/O 和 `F_SETSIG`、文件租约（在 /dev/shm 里，原生一侧的 overlayfs 不让设写租约）、消息队列、AIO、`MREMAP_DONTUNMAP` 和 remap_file_pages，`/proc/net` 那组加上 icmp、icmp6、raw；`inotify` 新增按 fd 的事件报给哪个目录。单元测试新增 inotify 推迟的 `IN_DELETE_SELF`、AF_UNIX 的垃圾回收、`MAP_GROWSDOWN` 的增长和守护间隔，以及 hal 的第一个单元测试（cachestat）。全部 12 组差分测试在两个执行层下通过。LTP 的 syscall 测试 944 个通过（上次 905），新通过 38 个：fcntl23–27、31–33（各两个）、mq_notify01–03、mq_timedreceive01、mq_timedsend01、mq_unlink01、io_cancel01、io_destroy02、io_getevents01、io_setup02、io_submit02–04、epoll_wait14、epoll_wait16、nice05、mmap18、remap_file_pages01/02、shmctl05（用 remap_file_pages）、cachestat02、pidfd_send_signal03；shmctl01 这次也通过了（全量并发时偶发失败）。没有新失败。cachestat01/04 要块设备，03 要 hugetlbfs。
+- 性能：每次 open 多挂一个记着目录项的对象，rename 要扫一遍所有 fd 表，新线程开始时多两个宿主 syscall。与上一轮的二进制对比（同一会话里跑两遍取第二遍，各跑三次）：open+close 5 万次、rename 2 万次、起 300 个进程、300 个线程、`git status`（3000 个文件）都在噪声之内。
+
+推迟：
+
+- io_uring：程序探测到 io_uring 可用就不再走自己的退路，只做一部分比 ENOSYS 更容易出问题，下一轮单独做。
+- `PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做。
+- 内核访问 guest 内存（比如 read 写进还没长出来的栈）不会让 `MAP_GROWSDOWN` 的映射增长，返回 EFAULT。
+- `EPOLLEXCLUSIVE` 只保证报告给一个，唤醒还是全部唤醒。
 
 ---
 

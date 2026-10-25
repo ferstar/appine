@@ -35,6 +35,7 @@ pub(crate) mod cap {
     pub const SYS_NICE: u32 = 23;
     pub const SYS_RESOURCE: u32 = 24;
     pub const MKNOD: u32 = 27;
+    pub const LEASE: u32 = 28;
     pub const MAC_OVERRIDE: u32 = 32;
     /// 最大的能力编号（`CAP_CHECKPOINT_RESTORE`）。
     pub const LAST: u32 = 40;

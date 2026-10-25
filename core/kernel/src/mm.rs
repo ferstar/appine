@@ -50,6 +50,8 @@ pub mod flags {
 const MMAP_TOP: u64 = crate::loader::STACK_TOP - crate::loader::STACK_SIZE - (1 << 30);
 /// 最低可分配地址，与 Linux 的 mmap_min_addr 默认值相同。
 const MMAP_MIN: u64 = 0x10000;
+/// 向下增长的映射与下面的映射之间至少要留的间隔（Linux 的 `stack_guard_gap`，256 页）。
+const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
 /// `/proc/sys/vm/max_map_count`：一个地址空间最多有多少个 VMA。每个 VMA 是一个宿主
 /// 映射，而宿主的映射数（Android 上也是 65530）是整个 App 进程共用的。
 pub(crate) static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
@@ -101,6 +103,18 @@ pub enum Backing {
     Shared,
 }
 
+/// mremap(`MREMAP_DONTUNMAP`) 之后，原来的地址上要重新映射文件的一段：它原来是私有
+/// 文件映射，Linux 上那里的页之后从文件重新读进来。
+pub struct Refill {
+    pub start: u64,
+    pub len: u64,
+    pub prot: u32,
+    /// 映射的文件在仓库里的 inode（0 表示不知道）和这一段对应的文件偏移。
+    pub ino: u64,
+    pub offset: u64,
+    pub name: Option<Rc<[u8]>>,
+}
+
 #[derive(Clone)]
 struct Vma {
     len: u64,
@@ -135,6 +149,8 @@ struct Vma {
     /// 匿名映射可写过，或者内核写过（加载器）。没写过的内容全是零，fork 时不用复制：
     /// V8 为 wasm 预留的 8 GB `PROT_NONE` 逐页检查一遍要一秒。
     written: Cell<bool>,
+    /// `MAP_GROWSDOWN`：访问它下面的地址时向下增长（[`Mm::grow_down`]）。
+    growsdown: bool,
 }
 
 /// 最近几个代码代数作废的范围。
@@ -478,6 +494,7 @@ impl Mm {
                 shm: None,
                 locked: self.lock_future,
                 written: Cell::new(prot & prot::WRITE != 0),
+                growsdown: false,
             },
         );
         Ok(())
@@ -571,6 +588,45 @@ impl Mm {
         }
         let (region, host) = Self::new_anonymous(len, prot & prot::WRITE != 0)?;
         self.insert(start, len, prot, Backing::Anonymous, true, region, host)
+    }
+
+    /// 把从 `start` 开始的映射标记为向下增长（`MAP_GROWSDOWN` 的私有匿名映射）。
+    pub fn set_growsdown(&mut self, start: u64) {
+        if let Some(v) = self.vmas.get_mut(&start) {
+            v.growsdown = true;
+        }
+    }
+
+    /// guest 访问没有映射的 `addr` 出错时调用：它上面紧挨着的是向下增长的映射时，把映射
+    /// 延伸到 `addr` 所在的页，返回 true，重新执行那条指令即可。与 Linux 一样，延伸之后
+    /// 与下面那个可访问的映射之间要留出 [`STACK_GUARD_GAP`]，否则不增长（SIGSEGV）。
+    /// 长出来的部分是一个新的 VMA，也向下增长；宿主内存不必连续。
+    pub fn grow_down(&mut self, addr: u64) -> bool {
+        let page = addr & !(PAGE_SIZE - 1);
+        if page < MMAP_MIN || self.is_mapped(addr) {
+            return false;
+        }
+        let Some((&above, v)) = self.vmas.range(addr..).next() else {
+            return false;
+        };
+        if !v.growsdown {
+            return false;
+        }
+        let (prot, locked) = (v.prot, v.locked);
+        if let Some((&s, below)) = self.vmas.range(..page).next_back()
+            && !below.growsdown
+            && below.prot != 0
+            && page - (s + below.len) < STACK_GUARD_GAP
+        {
+            return false;
+        }
+        if self.map_anonymous(page, above - page, prot).is_err() {
+            return false;
+        }
+        let v = self.vmas.get_mut(&page).unwrap();
+        v.growsdown = true;
+        v.locked = locked;
+        true
     }
 
     /// 实现 mmap(2)。`file` 是宿主 fd、文件偏移，以及文件是否以可写方式打开。
@@ -680,43 +736,97 @@ impl Mm {
     }
 
     /// mremap(`MREMAP_DONTUNMAP`)：内容搬到新地址（`fixed` 或者新找一段），原来的地址上
-    /// 留下权限相同、内容为空的映射，不再锁住。与 Linux 5.7 到 5.12 一样只支持私有的
-    /// 匿名映射。
+    /// 留下权限相同、不再锁住的映射。与 Linux 5.13 起一样支持所有映射，原来的地址上
+    /// 相当于丢掉了页表：私有匿名映射变成空的；共享映射（文件或匿名）与新地址共用同
+    /// 一段宿主内存，相当于之后从文件或共享内存重新读进来；私有文件映射空出来，由调用
+    /// 方按返回的 [`Refill`] 重新映射文件。
     pub fn mremap_dontunmap(
         &mut self,
         old: u64,
         len: u64,
         fixed: Option<u64>,
-    ) -> Result<u64, Errno> {
+    ) -> Result<(u64, Vec<Refill>), Errno> {
         let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         if !old.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
         self.check_mapped(old, len).map_err(|_| Errno::EFAULT)?;
         let end = old + len;
-        let first = self.vmas.range(..=old).next_back().map_or(old, |(&s, _)| s);
-        let mut parts = Vec::new();
-        for (&s, v) in self
-            .vmas
-            .range(first..end)
-            .filter(|(s, v)| *s + v.len > old)
-        {
-            if v.backing != Backing::Anonymous {
-                return Err(Errno::EINVAL);
-            }
-            let from = s.max(old);
-            parts.push((from, (s + v.len).min(end) - from, v.prot));
-        }
         let dst = match fixed {
             Some(d) => d,
             None => self.find_free(len).ok_or(Errno::ENOMEM)?,
         };
+        self.split_at(old);
+        self.split_at(end);
+        let (mut empty, mut alias, mut refill) = (Vec::new(), Vec::new(), Vec::new());
+        for (&s, v) in self.vmas.range(old..end) {
+            match v.backing {
+                Backing::Anonymous => empty.push((s, v.len, v.prot)),
+                Backing::Shared => {
+                    let mut v = v.clone();
+                    v.locked = false;
+                    alias.push((s, v));
+                }
+                Backing::PrivateFile => refill.push(Refill {
+                    start: s,
+                    len: v.len,
+                    prot: v.prot,
+                    ino: v.ino,
+                    offset: v.file_id.map_or(0, |f| f.2),
+                    name: v.name.clone(),
+                }),
+            }
+        }
         let new = self.mremap(old, len, len, true, Some(dst))?;
-        for (start, len, prot) in parts {
+        for (start, len, prot) in empty {
             self.map_anonymous(start, len, prot)?;
             self.vmas.get_mut(&start).unwrap().locked = false;
         }
-        Ok(new)
+        for (start, v) in alias {
+            self.insert_vma(start, v)?;
+        }
+        Ok((new, refill))
+    }
+
+    /// remap_file_pages(2)：与 Linux 4.0 起一样用 mmap 模拟，把 `[start, start + len)`
+    /// 换成同一个文件从 `offset` 开始的内容。区间要落在首尾相接、映射同一个文件、权限
+    /// 相同的共享映射里。
+    pub fn remap_file_pages(&mut self, start: u64, len: u64, offset: u64) -> Result<(), Errno> {
+        let end = start
+            .checked_add(len)
+            .filter(|&e| e > start)
+            .ok_or(Errno::EINVAL)?;
+        let (&s, v) = self
+            .vmas
+            .range(..=start)
+            .next_back()
+            .filter(|(s, v)| **s + v.len > start)
+            .ok_or(Errno::EINVAL)?;
+        let Some((fd, _)) = v.file.clone() else {
+            return Err(Errno::EINVAL);
+        };
+        let (prot, may_write, name, ino, locked) =
+            (v.prot, v.may_write, v.name.clone(), v.ino, v.locked);
+        // 同一个文件：按宿主的 (设备号, inode) 比较
+        let id = v.file_id.map(|(d, i, _)| (d, i));
+        let mut at = s + v.len;
+        while at < end {
+            let next = self
+                .vmas
+                .get(&at)
+                .filter(|n| n.file.is_some() && n.file_id.map(|(d, i, _)| (d, i)) == id)
+                .filter(|n| n.prot == prot)
+                .ok_or(Errno::EINVAL)?;
+            at += next.len;
+        }
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&*fd);
+        let flags = flags::MAP_SHARED | flags::MAP_FIXED;
+        self.mmap(start, len, prot, flags, Some((raw, offset, may_write)))?;
+        self.label(start, len, name, ino);
+        if locked {
+            self.set_locked(start, len, true)?;
+        }
+        Ok(())
     }
 
     /// 实现 mremap(2)：`fixed` 是 `MREMAP_FIXED` 的目标地址。变长时先尝试原地扩展，不行再搬到新的地址（`may_move`）：搬家不复制
@@ -835,6 +945,7 @@ impl Mm {
             shm: None,
             locked: template.locked,
             written: Cell::new(template.prot & prot::WRITE != 0),
+            growsdown: false,
         })
     }
 
@@ -2083,6 +2194,31 @@ mod tests {
         mm.write_kernel(a, b"k").unwrap();
         mm.munmap(a, 1 << 33).unwrap();
         assert!(mm.mmu().translate(page, 0).is_none());
+    }
+
+    #[test]
+    fn growsdown_mappings_grow_until_the_guard_gap() {
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let base = 0x4000_0000;
+        let top = base + 1024 * PAGE_SIZE;
+        mm.mmap(top - PAGE_SIZE, PAGE_SIZE, RW, fixed, None)
+            .unwrap();
+        mm.set_growsdown(top - PAGE_SIZE);
+        // 访问下面隔了几页的地址：一直长到那里，长出来的部分还能接着长
+        assert!(mm.grow_down(top - 5 * PAGE_SIZE + 8));
+        mm.write(UserSlice::new(top - 5 * PAGE_SIZE, 2), b"ok")
+            .unwrap();
+        assert!(mm.grow_down(top - 6 * PAGE_SIZE));
+        // 已经映射的地址、不向下增长的映射下面都不增长
+        assert!(!mm.grow_down(top - 6 * PAGE_SIZE));
+        mm.mmap(base, PAGE_SIZE, RW, fixed, None).unwrap();
+        assert!(!mm.grow_down(base - PAGE_SIZE));
+        // 离下面那个映射不到 256 页：不增长；它是 PROT_NONE 时不算
+        let guard_end = base + PAGE_SIZE + STACK_GUARD_GAP;
+        assert!(!mm.grow_down(guard_end - PAGE_SIZE));
+        mm.mprotect(base, PAGE_SIZE, 0).unwrap();
+        assert!(mm.grow_down(guard_end - PAGE_SIZE));
     }
 
     #[test]

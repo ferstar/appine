@@ -47,6 +47,10 @@ pub mod oflags {
     pub const O_APPEND: u32 = 0o2000;
     /// 非阻塞。
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// 信号驱动的 I/O：就绪时给属主发信号（`syscall::poll` 的 fasync）。
+    pub const O_ASYNC: u32 = 0o20000;
+    /// 直接 I/O（只记录）。
+    pub const O_DIRECT: u32 = 0o200000;
     /// 必须是目录。
     pub const O_DIRECTORY: u32 = 0o40000;
     /// 不跟随最后一个组件的符号链接。
@@ -60,7 +64,7 @@ pub mod oflags {
     /// 只取路径。
     pub const O_PATH: u32 = 0o10000000;
     /// fcntl(F_SETFL) 能修改的标志。
-    pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK;
+    pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_ASYNC | O_DIRECT | O_NOATIME;
 }
 
 /// 打开文件的种类。
@@ -80,6 +84,8 @@ pub enum FileKind {
         node: Node,
         /// 目录项快照（含 `.` 和 `..`）。
         entries: Option<Vec<DirEntry>>,
+        /// `/proc/<pid>`：打开时的那个进程（当作 pidfd 用）。
+        process: Option<std::rc::Weak<RefCell<crate::process::ThreadGroup>>>,
     },
     /// `O_PATH` 打开的文件：只能作为 `*at` 的起点或 fstat 的对象。
     Path(Node),
@@ -108,6 +114,8 @@ pub enum FileKind {
     Inotify(Rc<RefCell<crate::syscall::Inotify>>),
     /// pidfd：指向一个进程，进程结束时变为可读。
     Pidfd(Pidfd),
+    /// POSIX 消息队列。
+    MessageQueue(Rc<RefCell<crate::syscall::MessageQueue>>),
     /// procfs 的文件：打开时生成的内容。
     Proc {
         /// 节点。
@@ -127,14 +135,20 @@ pub struct OpenFile {
     pub pos: u64,
     /// `/proc/<pid>/fd/<n>` 显示的路径（打开时的绝对路径）。
     pub path: Option<Rc<[u8]>>,
-    /// `F_SETOWN_EX` 的 (类型, pid) 和 `F_SETSIG` 的信号：只记录，不发 SIGIO。
+    /// `F_SETOWN_EX` 的 (类型, pid) 和 `F_SETSIG` 的信号：`O_ASYNC` 时就绪发给谁、发
+    /// 什么信号（0 是 SIGIO），文件租约被打破时也发给它们。
     pub owner: (i32, i32),
     pub sig: i32,
     /// 程序在这个打开文件上读、写两个方向各用完数据的次数：epoll 的 `EPOLLET` 据此
     /// 知道程序已经用完了上一次报告的事件（`syscall::poll::drained`）。
     pub drained: [u64; 2],
-    /// 打开时已经有 inotify 监视：按 fd 的事件报给打开时经过的目录，最后一个引用释放
-    /// 时报告 `IN_CLOSE_*`。
+    /// 读到数据的次数：设置了 `O_ASYNC` 时读过之后仍然可读，就当作来了新数据，再通知
+    /// 一次（`syscall::poll` 的 fasync）；也是 `EPOLLEXCLUSIVE` 区分边沿的数据代数。
+    pub reads: u64,
+    /// 边沿触发的 `EPOLLEXCLUSIVE` 关注已经报告过的数据代数（`syscall::poll`）。
+    pub exclusive_claim: std::cell::Cell<Option<[u64; 3]>>,
+    /// 打开的仓库文件：inotify 按 fd 的事件报给打开时经过的目录，最后一个引用释放时
+    /// 报告 `IN_CLOSE_*`。
     pub watch: Option<crate::syscall::Opened>,
 }
 
@@ -154,6 +168,8 @@ impl OpenFile {
             owner: (0, 0),
             sig: 0,
             drained: [0; 2],
+            reads: 0,
+            exclusive_claim: std::cell::Cell::new(None),
             watch: None,
         }))
     }
@@ -180,7 +196,8 @@ impl OpenFile {
             | FileKind::TimerFd(_)
             | FileKind::SignalFd(_)
             | FileKind::Inotify(_)
-            | FileKind::Pidfd(_) => None,
+            | FileKind::Pidfd(_)
+            | FileKind::MessageQueue(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),
@@ -372,9 +389,6 @@ impl FdTable {
 
     /// 放到不小于 `min` 的最小空闲 fd 上。
     pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
-        if min >= self.limit {
-            return Err(Errno::EINVAL);
-        }
         let fd = (min..self.limit)
             .find(|&i| self.slots.get(i).is_none_or(Option::is_none))
             .ok_or(Errno::EMFILE)?;
@@ -498,7 +512,8 @@ mod tests {
             assert_eq!(t.install(f.clone(), false, 0), Ok(fd));
         }
         assert_eq!(t.install(f.clone(), false, 0), Err(Errno::EMFILE));
-        assert_eq!(t.install(f.clone(), false, 11), Err(Errno::EINVAL));
+        // 起点超出上限也是没有空位（F_DUPFD 的 EINVAL 由调用方检查）
+        assert_eq!(t.install(f.clone(), false, 11), Err(Errno::EMFILE));
         // dup 出来的 fd 共享同一个打开文件
         f.borrow_mut().pos = 5;
         assert_eq!(t.get(10).unwrap().borrow().pos, 5);

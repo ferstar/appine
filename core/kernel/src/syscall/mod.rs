@@ -4,12 +4,15 @@
 //! `-ENOSYS`，绝不崩溃，并记录一条本地调试日志。处理函数在持有 BKL 时运行，
 //! 需要等待的会经由 [`Cx::wait`] 暂时释放它。
 
+mod aio;
 mod cred;
 mod fs;
 mod inotify;
 mod ipc;
+mod lease;
 mod mem;
 mod misc;
+mod mqueue;
 mod net;
 mod poll;
 mod posix_timer;
@@ -21,10 +24,14 @@ mod tty;
 mod unix;
 mod xattr;
 
+pub(crate) use aio::{AioContext, released as aio_released};
 pub(crate) use fs::ENTROPY;
-pub(crate) use inotify::{Inotify, MAX_QUEUED, MAX_WATCHES, Opened, Registry};
+pub(crate) use inotify::{Inotify, Opened, Registry};
+pub(crate) use lease::Lease;
+pub(crate) use mqueue::{Limits as MqLimits, MessageQueue};
 pub(crate) use net::SocketRef;
-pub(crate) use poll::Epoll;
+pub(crate) use poll::{Epoll, Fasync, check_fasync};
+pub(crate) use sched::host_started;
 
 use appine_engine::Cpu;
 
@@ -90,6 +97,15 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         ),
         7 => xattr::setxattr(cx, Fd(a[0] as i32), a[1], a[2], a[3] as usize, a[4] as u32),
         8 | 9 => xattr::getxattr(cx, Path(a[0], nr == 8), a[1], a[2], a[3] as usize),
+        0 => aio::io_setup(cx, a[0] as u32, a[1]),
+        1 => aio::io_destroy(cx, a[0]),
+        2 => aio::io_submit(cx, a[0], a[1] as i64, a[2]),
+        3 => aio::io_cancel(cx, a[0], a[1], a[2]),
+        4 => aio::io_getevents(cx, a[0], a[1] as i64, a[2] as i64, a[3], a[4], None),
+        292 => match aio::sigmask_arg(cx, a[5]) {
+            Ok(mask) => aio::io_getevents(cx, a[0], a[1] as i64, a[2] as i64, a[3], a[4], mask),
+            Err(e) => Err(e),
+        },
         10 => xattr::getxattr(cx, Fd(a[0] as i32), a[1], a[2], a[3] as usize),
         11 | 12 => xattr::listxattr(cx, Path(a[0], nr == 11), a[1], a[2] as usize),
         13 => xattr::listxattr(cx, Fd(a[0] as i32), a[1], a[2] as usize),
@@ -275,6 +291,12 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         195 => ipc::shmctl(cx, a[0] as i32, a[1] as i32, a[2]),
         196 => ipc::shmat(cx, a[0] as i32, a[1], a[2] as i32),
         97 => proc::unshare(cx, a[0]),
+        180 => mqueue::mq_open(cx, a[0], a[1] as u32, a[2] as u32, a[3]),
+        181 => mqueue::mq_unlink(cx, a[0]),
+        182 => mqueue::mq_timedsend(cx, a[0] as i32, a[1], a[2] as usize, a[3] as u32, a[4]),
+        183 => mqueue::mq_timedreceive(cx, a[0] as i32, a[1], a[2] as usize, a[3], a[4]),
+        184 => mqueue::mq_notify(cx, a[0] as i32, a[1]),
+        185 => mqueue::mq_getsetattr(cx, a[0] as i32, a[1], a[2]),
         197 => ipc::shmdt(cx, a[0]),
         198 => net::socket(cx, a[0] as i32, a[1] as u32, a[2] as i32),
         199 => net::socketpair(cx, a[0] as i32, a[1] as u32, a[2] as i32, a[3]),
@@ -322,6 +344,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         231 => mem::munlockall(cx),
         232 => mem::mincore(cx, a[0], a[1], a[2]),
         233 => mem::madvise(cx, a[0], a[1], a[2] as i32),
+        234 => mem::remap_file_pages(cx, a[0], a[1], a[2], a[3], a[4] as u32),
         240 => sig::sigqueueinfo(cx, a[0] as i32, Some(a[1] as i32), a[2] as i32, a[3]),
         242 => net::accept4(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         243 => net::recvmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
@@ -377,6 +400,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             Err(e) => Err(e),
         },
         449 => misc::futex_waitv(cx, a[0], a[1] as u32, a[2] as u32, a[3], a[4] as i32),
+        451 => fs::cachestat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         _ => {
             debug::unimplemented_syscall(nr);
             Err(Errno::ENOSYS)

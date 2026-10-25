@@ -322,8 +322,8 @@ gcc -O1 -o /tmp/xat/show /tmp/xat/show.c
 gcc -O1 -o xatest xat.c
 ./xatest
 
-# /proc/net/{tcp,tcp6,udp,udp6,unix}：按 fstat 的 inode 找到自己的 socket，只看与环境
-# 无关的列（端口是临时分配的，只比较是否与 getsockname 一致）
+# /proc/net/{tcp,tcp6,udp,udp6,icmp,icmp6,raw,unix}：按 fstat 的 inode 找到自己的
+# socket，只看与环境无关的列（端口是临时分配的，只比较是否与 getsockname 一致）
 cat > procnet.c <<'C'
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -370,6 +370,30 @@ static void inet(const char *file, const char *what, int fd)
                lport == port(fd, 0) ? "ok" : "bad", remote,
                rport == 0 ? "0" : rport == port(fd, 1) ? "ok" : "bad", st,
                (int)strlen(line) == width ? "same" : "differs");
+        fclose(f);
+        return;
+    }
+    printf("%s %s: missing\n", file, what);
+    fclose(f);
+}
+
+/* raw socket 的一行：本端的"端口"是协议号，对端端口总是 0，行尾不补空格 */
+static void raw_line(const char *file, const char *what, int fd)
+{
+    char path[64], line[512];
+    snprintf(path, sizeof path, "/proc/net/%s", file);
+    FILE *f = fopen(path, "r");
+    fgets(line, sizeof line, f);
+    printf("%s header %s", file, line);
+    while (fgets(line, sizeof line, f)) {
+        char local[64], remote[64];
+        unsigned st, lport, rport;
+        unsigned long inode;
+        if (sscanf(line, "%*d: %63[0-9A-F]:%X %63[0-9A-F]:%X %X %*s %*s %*s %*s %*s %lu", local, &lport,
+                   remote, &rport, &st, &inode) != 6 || inode != ino(fd))
+            continue;
+        printf("%s %s: local %s port %u remote %s port %u st %02X tail '%c'\n", file, what, local, lport,
+               remote, rport, st, line[strlen(line) - 2]);
         fclose(f);
         return;
     }
@@ -428,6 +452,23 @@ int main(void)
     bind(udp6, (struct sockaddr *)&a6, sizeof a6);
     inet("udp6", "bound", udp6);
     inet("tcp", "tcp6 socket", lis6);
+    /* ping socket 列在 icmp 里，raw ICMP socket 列在 raw 里 */
+    struct sockaddr_in p = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int ping = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    bind(ping, (struct sockaddr *)&p, sizeof p);
+    inet("icmp", "ping", ping);
+    connect(ping, (struct sockaddr *)&p, sizeof p);
+    inet("icmp", "ping connected", ping);
+    int raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    int type;
+    socklen_t tl = sizeof type;
+    getsockopt(raw, SOL_SOCKET, SO_TYPE, &type, &tl);
+    printf("raw SO_TYPE %d\n", type);
+    raw_line("raw", "icmp", raw);
+    inet("icmp", "raw socket", raw);
+    int ping6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    bind(ping6, (struct sockaddr *)&a6, sizeof a6);
+    inet("icmp6", "ping", ping6);
 
     struct sockaddr_un un = {.sun_family = AF_UNIX};
     strcpy(un.sun_path, "/tmp/procnet.sock");
@@ -899,3 +940,446 @@ int main(void)
 C
 gcc -O1 -o misc2 misc2.c
 ./misc2
+
+# 信号驱动的 I/O（O_ASYNC、F_SETSIG、FIOSETOWN）和文件租约。租约用 /dev/shm 里的文件：
+# 原生一侧的根是 overlayfs，Linux 在它上面不让设写租约
+cat > async.c <<'C'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static void wait_sig(const char *what, sigset_t *set)
+{
+    siginfo_t si;
+    struct timespec t = {5, 0};
+    int sig = sigtimedwait(set, &si, &t);
+    if (sig < 0) {
+        printf("%s: %s\n", what, strerror(errno));
+        return;
+    }
+    printf("%s: sig %s code %d", what, sig == SIGIO ? "SIGIO" : sig == SIGUSR1 ? "SIGUSR1" : "?", si.si_code);
+    if (sig == SIGUSR1)
+        printf(" fd %d band %lx", si.si_fd, (long)si.si_band);
+    printf("\n");
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGIO);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int p[2];
+    pipe(p);
+    fcntl(p[0], F_SETOWN, getpid());
+    fcntl(p[0], F_SETSIG, SIGUSR1);
+    printf("setfl %d async %d\n", fcntl(p[0], F_SETFL, O_ASYNC | O_NONBLOCK),
+           (fcntl(p[0], F_GETFL) & O_ASYNC) != 0);
+    if (fork() == 0) {
+        usleep(100000);
+        write(p[1], "x", 1);
+        _exit(0);
+    }
+    wait_sig("pipe", &set);
+    char c;
+    read(p[0], &c, 1);
+    wait(NULL);
+    /* 默认的 SIGIO */
+    fcntl(p[0], F_SETSIG, 0);
+    write(p[1], "y", 1);
+    wait_sig("pipe default", &set);
+    read(p[0], &c, 1);
+    /* 没有属主：不发 */
+    fcntl(p[0], F_SETOWN, 0);
+    write(p[1], "z", 1);
+    struct timespec zero = {0, 200000000};
+    printf("no owner: %d\n", sigtimedwait(&set, NULL, &zero));
+    read(p[0], &c, 1);
+    /* TCP：数据从别的进程来 */
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    bind(l, (void *)&a, sizeof a);
+    listen(l, 1);
+    socklen_t len = sizeof a;
+    getsockname(l, (void *)&a, &len);
+    if (fork() == 0) {
+        int c2 = socket(AF_INET, SOCK_STREAM, 0);
+        connect(c2, (void *)&a, sizeof a);
+        usleep(200000);
+        write(c2, "hello", 5);
+        usleep(200000);
+        _exit(0);
+    }
+    int s = accept(l, NULL, NULL);
+    int pid = getpid(), on = 1, owner = 0;
+    ioctl(s, FIOSETOWN, &pid);
+    ioctl(s, FIOGETOWN, &owner);
+    printf("socket owner ok %d\n", owner == pid);
+    fcntl(s, F_SETSIG, SIGUSR1);
+    ioctl(s, FIOASYNC, &on);
+    while (sigtimedwait(&set, NULL, &(struct timespec){0, 0}) > 0)
+        ;
+    wait_sig("tcp data", &set);
+    char buf[16];
+    printf("read %zd\n", read(s, buf, sizeof buf));
+    wait(NULL);
+    return 0;
+}
+C
+gcc -O1 -o /tmp/async async.c && /tmp/async
+cat > lease.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FILE "/dev/shm/appine-lease"
+
+static const char *name(int t) { return t == F_RDLCK ? "RDLCK" : t == F_WRLCK ? "WRLCK" : "UNLCK"; }
+
+/* 子进程以 flags 打开文件（打破租约），退出码是 errno */
+static pid_t opener(int flags)
+{
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(open(FILE, flags) >= 0 ? 0 : errno);
+    return pid;
+}
+
+/* 等子进程，打印它打开的结果 */
+static void reap(const char *what, pid_t pid)
+{
+    int status;
+    waitpid(pid, &status, 0);
+    printf("%s: %s\n", what, WEXITSTATUS(status) ? strerror(WEXITSTATUS(status)) : "opened");
+}
+
+static void wait_break(sigset_t *set, int fd)
+{
+    siginfo_t si;
+    struct timespec t = {5, 0};
+    int sig = sigtimedwait(set, &si, &t);
+    printf("  signal %s code %d fd ok %d, lease now %s\n", sig == SIGUSR1 ? "SIGUSR1" : strerror(errno),
+           si.si_code, si.si_fd == fd, name(fcntl(fd, F_GETLEASE)));
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    close(open(FILE, O_CREAT | O_RDWR | O_TRUNC, 0644));
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGIO);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    int w = open(FILE, O_RDWR);
+    printf("read lease on a writable fd %d %s\n", fcntl(w, F_SETLEASE, F_RDLCK), strerror(errno));
+    int r = open(FILE, O_RDONLY);
+    printf("write lease with another open %d %s\n", fcntl(r, F_SETLEASE, F_WRLCK), strerror(errno));
+    close(w);
+    printf("unlock without a lease %d %s\n", fcntl(r, F_SETLEASE, F_UNLCK), strerror(errno));
+    fcntl(r, F_SETSIG, SIGUSR1);
+    printf("write lease %d, lease %s\n", fcntl(r, F_SETLEASE, F_WRLCK), name(fcntl(r, F_GETLEASE)));
+    /* 非阻塞的打开：通知持有者，立即返回 EWOULDBLOCK */
+    reap("nonblocking read open", opener(O_RDONLY | O_NONBLOCK));
+    wait_break(&set, r);
+    /* 读方式打开：降成读租约之后打开完成 */
+    pid_t pid = opener(O_RDONLY);
+    usleep(200000);
+    printf("  downgrade %d, lease %s\n", fcntl(r, F_SETLEASE, F_RDLCK), name(fcntl(r, F_GETLEASE)));
+    reap("read open", pid);
+    /* 写方式打开：要放弃租约，降成读租约不行 */
+    pid = opener(O_WRONLY);
+    wait_break(&set, r);
+    printf("  downgrade %d, unlock %d\n", fcntl(r, F_SETLEASE, F_RDLCK), fcntl(r, F_SETLEASE, F_UNLCK));
+    reap("write open", pid);
+    unlink(FILE);
+    return 0;
+}
+C
+gcc -O1 -o lease lease.c
+./lease
+
+# POSIX 消息队列：优先级、非阻塞和超时、状态行、poll、mq_notify（信号和 musl 的线程）
+cat > mq.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile int notified;
+static void on_notify(union sigval v) { notified = v.sival_int; }
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    mq_unlink("/appine-mq");
+    struct mq_attr attr = {.mq_maxmsg = 4, .mq_msgsize = 64};
+    mqd_t q = mq_open("/appine-mq", O_CREAT | O_RDWR | O_EXCL, 0600, &attr);
+    printf("open %d excl again %d %s\n", q >= 0, mq_open("/appine-mq", O_CREAT | O_EXCL | O_RDWR, 0600, &attr),
+           strerror(errno));
+    printf("bad attr %d %s\n", mq_open("/appine-mq2", O_CREAT | O_RDWR, 0600, &(struct mq_attr){.mq_maxmsg = 0}),
+           strerror(errno));
+    mq_send(q, "low", 3, 1);
+    mq_send(q, "high", 4, 9);
+    mq_send(q, "low2", 4, 1);
+    struct mq_attr got;
+    mq_getattr(q, &got);
+    printf("attr maxmsg %ld msgsize %ld curmsgs %ld\n", got.mq_maxmsg, got.mq_msgsize, got.mq_curmsgs);
+    char status[128] = {0};
+    pread(q, status, 16, 0);
+    printf("status %.16s\n", status);
+    struct pollfd p = {q, POLLIN | POLLOUT, 0};
+    poll(&p, 1, 0);
+    printf("poll %x\n", p.revents);
+    printf("too long %d %s\n", mq_send(q, status, 65, 0), strerror(errno));
+    printf("bad prio %d %s\n", mq_send(q, "x", 1, 40000), strerror(errno));
+    char buf[64];
+    unsigned prio;
+    printf("small buffer %zd %s\n", mq_receive(q, buf, 10, &prio), strerror(errno));
+    for (int i = 0; i < 3; i++) {
+        ssize_t n = mq_receive(q, buf, sizeof buf, &prio);
+        printf("got %.*s prio %u\n", (int)n, buf, prio);
+    }
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_nsec += 50000000;
+    if (t.tv_nsec >= 1000000000) t.tv_sec++, t.tv_nsec -= 1000000000;
+    printf("timed out %zd %s\n", mq_timedreceive(q, buf, sizeof buf, &prio, &t), strerror(errno));
+    struct mq_attr nb = {.mq_flags = O_NONBLOCK};
+    mq_setattr(q, &nb, NULL);
+    printf("nonblocking %zd %s\n", mq_receive(q, buf, sizeof buf, &prio), strerror(errno));
+
+    /* 信号通知：空队列来了消息 */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    struct sigevent sev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1, .sigev_value.sival_int = 42};
+    printf("notify %d\n", mq_notify(q, &sev));
+    pid_t pid = fork();
+    if (pid == 0) {
+        printf("child notify %d %s\n", mq_notify(q, &sev), strerror(errno));
+        mq_send(q, "wake", 4, 0);
+        _exit(0);
+    }
+    siginfo_t si;
+    sigwaitinfo(&set, &si);
+    printf("signal code %d value %d from child %d\n", si.si_code, si.si_value.sival_int, si.si_pid == pid);
+    waitpid(pid, NULL, 0);
+    mq_receive(q, buf, sizeof buf, &prio);
+    /* musl 的 SIGEV_THREAD：经由 netlink socket 通知一个线程 */
+    struct sigevent th = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = on_notify,
+                          .sigev_value.sival_int = 7};
+    printf("thread notify %d\n", mq_notify(q, &th));
+    mq_send(q, "go", 2, 0);
+    for (int i = 0; i < 200 && !notified; i++)
+        usleep(10000);
+    printf("thread notified %d\n", notified);
+    mq_close(q);
+    printf("unlink %d reopen %d %s\n", mq_unlink("/appine-mq"), mq_open("/appine-mq", O_RDWR), strerror(errno));
+    return 0;
+}
+C
+gcc -O1 -o mq mq.c
+./mq
+
+# 原生 AIO（直接发 syscall，不用 libaio）：读写、fsync、poll、eventfd 通知、取消
+cat > aio.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+/* 镜像里没有 linux-headers：linux/aio_abi.h 的定义 */
+typedef unsigned long aio_context_t;
+enum { IOCB_CMD_PREAD = 0, IOCB_CMD_PWRITE = 1, IOCB_CMD_FSYNC = 2, IOCB_CMD_POLL = 5 };
+#define IOCB_FLAG_RESFD 1
+struct iocb {
+    uint64_t aio_data;
+    uint32_t aio_key, aio_rw_flags;
+    uint16_t aio_lio_opcode;
+    int16_t aio_reqprio;
+    uint32_t aio_fildes;
+    uint64_t aio_buf, aio_nbytes;
+    int64_t aio_offset;
+    uint64_t aio_reserved2;
+    uint32_t aio_flags, aio_resfd;
+};
+struct io_event {
+    uint64_t data, obj;
+    int64_t res, res2;
+};
+
+static struct iocb cb(int fd, int op, void *buf, size_t n, long long off, uint64_t data)
+{
+    struct iocb c;
+    memset(&c, 0, sizeof c);
+    c.aio_fildes = fd;
+    c.aio_lio_opcode = op;
+    c.aio_buf = (uintptr_t)buf;
+    c.aio_nbytes = n;
+    c.aio_offset = off;
+    c.aio_data = data;
+    return c;
+}
+
+static void events(aio_context_t ctx, long min, const char *what)
+{
+    struct io_event ev[8];
+    struct timespec t = {0, 200000000};
+    long n = syscall(SYS_io_getevents, ctx, min, 8, ev, &t);
+    printf("%s: %ld", what, n);
+    for (long i = 0; i < n; i++)
+        printf(" [data %llu res %lld]", (unsigned long long)ev[i].data, (long long)ev[i].res);
+    printf("\n");
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    aio_context_t ctx = 0;
+    printf("setup %ld\n", syscall(SYS_io_setup, 8, &ctx));
+    int fd = open("/tmp/aio-file", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char out[] = "hello aio", in[16] = {0};
+    struct iocb w = cb(fd, IOCB_CMD_PWRITE, out, 9, 100, 1);
+    struct iocb s = cb(fd, IOCB_CMD_FSYNC, NULL, 0, 0, 2);
+    struct iocb *list[] = {&w, &s};
+    printf("submit %ld\n", syscall(SYS_io_submit, ctx, 2, list));
+    events(ctx, 2, "write+fsync");
+    struct iocb r = cb(fd, IOCB_CMD_PREAD, in, 9, 100, 3);
+    int efd = eventfd(0, 0);
+    r.aio_flags = IOCB_FLAG_RESFD;
+    r.aio_resfd = efd;
+    struct iocb *one[] = {&r};
+    syscall(SYS_io_submit, ctx, 1, one);
+    uint64_t count;
+    read(efd, &count, 8);
+    events(ctx, 1, "read");
+    printf("read back %s eventfd %llu\n", in, (unsigned long long)count);
+    int p[2];
+    pipe(p);
+    struct iocb pl = cb(p[0], IOCB_CMD_POLL, (void *)(uintptr_t)POLLIN, 0, 0, 4);
+    one[0] = &pl;
+    syscall(SYS_io_submit, ctx, 1, one);
+    events(ctx, 0, "poll before data");
+    write(p[1], "x", 1);
+    events(ctx, 1, "poll after data");
+    struct iocb pl2 = cb(p[1], IOCB_CMD_POLL, (void *)(uintptr_t)POLLIN, 0, 0, 5);
+    one[0] = &pl2;
+    syscall(SYS_io_submit, ctx, 1, one);
+    struct io_event res;
+    printf("cancel %ld %s\n", syscall(SYS_io_cancel, ctx, &pl2, &res), strerror(errno));
+    events(ctx, 1, "after cancel");
+    struct iocb bad = cb(fd, 99, in, 1, 0, 6);
+    one[0] = &bad;
+    printf("bad opcode %ld %s\n", syscall(SYS_io_submit, ctx, 1, one), strerror(errno));
+    printf("min > nr %ld %s\n", syscall(SYS_io_getevents, ctx, 2, 1, &res, NULL), strerror(errno));
+    printf("destroy %ld again %ld %s\n", syscall(SYS_io_destroy, ctx), syscall(SYS_io_destroy, ctx),
+           strerror(errno));
+    return 0;
+}
+C
+gcc -O1 -o aio aio.c
+./aio
+
+# MREMAP_DONTUNMAP 用在各种映射上之后原来的地址上看到什么；remap_file_pages
+cat > dun.c <<'C'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/mman.h>
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+static void show(const char *tag, char *old, char *new) {
+    printf("%s: old=%.4s new=%.4s\n", tag, old[0] ? old : "(0)", new);
+}
+int main(void) {
+    long pg = 4096;
+    int fd = open("dun.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char buf[8192];
+    memset(buf, 'f', sizeof buf);
+    write(fd, buf, sizeof buf);
+    /* 共享文件映射 */
+    char *a = mmap(0, 2 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    memcpy(a, "AAAA", 4);
+    char *b = mremap(a, 2 * pg, 2 * pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    if (b == MAP_FAILED) { printf("shared file: %s\n", strerror(errno)); return 1; }
+    show("shared file", a, b);
+    memcpy(b, "BBBB", 4);
+    show("shared file after write new", a, b);
+    memcpy(a + pg, "CCCC", 4);
+    show("shared file second page", a + pg, b + pg);
+    pread(fd, buf, 4, 0);
+    printf("file now %.4s\n", buf);
+    /* 私有文件映射 */
+    char *p = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    memcpy(p, "PPPP", 4);
+    char *q = mremap(p, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    if (q == MAP_FAILED) { printf("private file: %s\n", strerror(errno)); return 1; }
+    show("private file", p, q);
+    memcpy(p, "OOOO", 4);
+    pread(fd, buf, 4, 0);
+    printf("private write old -> file %.4s\n", buf);
+    /* 共享匿名映射 */
+    char *s = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    memcpy(s, "SSSS", 4);
+    char *t = mremap(s, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    show("shared anon", s, t);
+    memcpy(t, "TTTT", 4);
+    show("shared anon after write new", s, t);
+    /* 私有匿名映射 */
+    char *x = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(x, "XXXX", 4);
+    char *y = mremap(x, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    show("private anon", x, y);
+    /* 只读的共享文件映射 */
+    char *r = mmap(0, pg, PROT_READ, MAP_SHARED, fd, pg);
+    char *r2 = mremap(r, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    show("readonly shared", r, r2);
+    /* remap_file_pages */
+    char *w = mmap(0, 2 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    printf("remap %d", remap_file_pages(w, pg, 0, 1, 0));
+    printf(" -> %.4s %.4s\n", w, w + pg);
+    printf("remap prot %d %s\n", remap_file_pages(w, pg, PROT_READ, 1, 0), strerror(errno));
+    printf("remap private %d %s\n", remap_file_pages(p, pg, 0, 1, 0), strerror(errno));
+    return 0;
+}
+C
+gcc -O1 -o dun dun.c
+./dun

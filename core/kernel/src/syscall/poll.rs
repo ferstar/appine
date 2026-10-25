@@ -116,9 +116,27 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
         FileKind::Epoll(_) => (0, None),
         // 6.9 起进程被回收之后还有 POLLHUP；这里与 6.1 相同
         FileKind::Pidfd(p) => (if p.exited() { POLLIN | POLLRDNORM } else { 0 }, None),
+        FileKind::MessageQueue(q) => (q.borrow().readiness(), None),
         FileKind::Path(_) => (POLLNVAL, None),
         _ => (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, None),
     }
+}
+
+/// AIO 的 `IOCB_CMD_POLL`：现在就绪的、关心的事件（加上总会报告的 POLLERR、POLLHUP）。
+/// `all` 时有关心的事件就绪就报告全部就绪的位：Linux 挂起之后被唤醒完成的请求就是这样。
+pub(super) fn poll_once(f: &OpenFile, events: i16, all: bool) -> i16 {
+    let wanted = poll_now(f, events, 0);
+    if all && wanted != 0 {
+        poll_now(f, !0, 0)
+    } else {
+        wanted
+    }
+}
+
+/// 打开文件现在的"数据代数"：读、写方向用完数据的次数和读到数据的次数。代数不变就
+/// 还是同一个边沿（`EPOLLEXCLUSIVE`）。
+fn edge(f: &OpenFile) -> [u64; 3] {
+    [f.drained[0], f.drained[1], f.reads]
 }
 
 /// 立即检查一个文件就绪的事件（宿主 fd 用一次不等待的 poll），只保留 `wanted` 和
@@ -205,6 +223,142 @@ pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
     for event in &cx.k().edge_waiters {
         event.signal();
     }
+    // 信号驱动的 I/O 也按用完数据重新开始计算，见 check_fasync
+    if file.borrow().flags & oflags::O_ASYNC != 0 {
+        request_wake();
+    }
+}
+
+// ---- 信号驱动的 I/O ----
+
+/// 一个设置了 `O_ASYNC` 的打开文件（Linux 的 fasync）。
+pub(crate) struct Fasync {
+    file: Weak<RefCell<OpenFile>>,
+    /// 设置 `O_ASYNC` 时用的 fd：`F_SETSIG` 的信号把它放在 si_fd 里。
+    fd: i32,
+    /// 上次检查时就绪的事件。
+    last: i16,
+    /// 上次检查时打开文件的 [`OpenFile::drained`] 和 [`OpenFile::reads`]。
+    drained: [u64; 2],
+    reads: u64,
+}
+
+/// 打开文件刚刚设置了 `O_ASYNC`：登记它。已经就绪的事件不发信号，与 Linux 一样。
+pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
+    let k = cx.k();
+    k.fasync.retain(|e| e.file.strong_count() > 0);
+    if k.fasync.iter().any(|e| e.file.as_ptr() == Rc::as_ptr(file)) {
+        return;
+    }
+    let f = file.borrow();
+    k.fasync.push(Fasync {
+        file: Rc::downgrade(file),
+        fd,
+        last: poll_now(&f, POLLIN | POLLOUT, 0),
+        drained: f.drained,
+        reads: f.reads,
+    });
+}
+
+/// 检查设置了 `O_ASYNC` 的文件，新出现的就绪事件给属主发信号。返回等待时要一起 poll
+/// 的宿主 fd 和事件：宿主 socket 上的数据不经过内核，没有人会请求唤醒。定时器线程每次
+/// 醒来调用；任何可能让文件就绪的修改都会叫醒它。
+pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)> {
+    const POLL_IN: i32 = 1;
+    const POLL_OUT: i32 = 2;
+    const POLL_ERR: i32 = 4;
+    const POLL_HUP: i32 = 6;
+    if k.fasync.is_empty() {
+        return Vec::new();
+    }
+    let mut host = Vec::new();
+    let mut signals = Vec::new();
+    k.fasync.retain_mut(|e| {
+        let Some(file) = e.file.upgrade() else {
+            return false;
+        };
+        let f = file.borrow();
+        if f.flags & oflags::O_ASYNC == 0 {
+            return false;
+        }
+        // 程序在一个方向上用完了数据：这个方向重新算作没有就绪，之后再来数据还会通知。
+        // 读过数据之后仍然可读也再通知一次：两次检查之间可能读空了又来了新数据，
+        // Linux 每来一次数据都通知
+        if f.drained[0] != e.drained[0] || f.reads != e.reads {
+            e.last &= !(POLLIN | POLLRDNORM);
+        }
+        if f.drained[1] != e.drained[1] {
+            e.last &= !(POLLOUT | POLLWRNORM);
+        }
+        e.drained = f.drained;
+        e.reads = f.reads;
+        let (_, host_fd) = readiness(&f, 0);
+        let ev = poll_now(&f, POLLIN | POLLOUT, 0);
+        let new = ev & !e.last;
+        e.last = ev;
+        if let Some(fd) = host_fd {
+            let wanted = (POLLIN | POLLOUT) & !ev;
+            if wanted != 0 {
+                host.push((fd, wanted, 0));
+            }
+        }
+        for (bit, code, band) in [
+            // Linux 的 band_table
+            (POLLIN, POLL_IN, POLLIN | POLLRDNORM),
+            (POLLOUT, POLL_OUT, POLLOUT | POLLWRNORM | 0x200),
+            (POLLERR, POLL_ERR, POLLERR),
+            (POLLHUP, POLL_HUP, POLLHUP | POLLERR),
+        ] {
+            if new & bit != 0 {
+                signals.push((f.owner, f.sig, code, band, e.fd));
+            }
+        }
+        true
+    });
+    for ((ty, pid), sig, code, band, fd) in signals {
+        let Some(signo) = crate::process::Signal::new(if sig == 0 { 29 } else { sig }) else {
+            continue;
+        };
+        // F_SETSIG 设置了信号时带上事件和 fd，默认的 SIGIO 不带
+        let info = if sig == 0 {
+            signal::SigInfo::kernel()
+        } else {
+            signal::SigInfo {
+                code,
+                fields: signal::InfoFields::Poll {
+                    band: band as i64,
+                    fd,
+                },
+                esr: 0,
+            }
+        };
+        send_to_owner(k, ty, pid, signo, info);
+    }
+    host
+}
+
+/// 给 `F_SETOWN_EX` 记下的属主发信号；没有属主（pid 为 0）时不发。
+pub(crate) fn send_to_owner(
+    k: &crate::kernel::Kernel,
+    ty: i32,
+    pid: i32,
+    sig: crate::process::Signal,
+    info: signal::SigInfo,
+) {
+    const F_OWNER_TID: i32 = 0;
+    const F_OWNER_PGRP: i32 = 2;
+    if pid <= 0 {
+        return;
+    }
+    match ty {
+        F_OWNER_TID => {
+            if let Some(t) = k.tasks.get(&pid) {
+                signal::send_to_task(k, t, sig, info);
+            }
+        }
+        F_OWNER_PGRP => signal::send_to_pgrp(k, pid, sig, info),
+        _ => signal::send_to_group(k, pid, sig, info),
+    }
 }
 
 /// 等到 `items` 里至少一个文件就绪、超时或者被信号打断，返回每一项就绪的事件。
@@ -239,7 +393,7 @@ fn wait_ready(
 }
 
 /// 换上 guest 给的临时屏蔽字；被信号打断时由信号投递恢复，否则由 [`restore_mask`] 恢复。
-fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Result<(), Errno> {
+pub(super) fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Result<(), Errno> {
     if sigmask == 0 {
         return Ok(());
     }
@@ -252,7 +406,7 @@ fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Result<(), Errno
     Ok(())
 }
 
-fn restore_mask<T>(cx: &mut Cx<'_>, r: &Result<T, Errno>) {
+pub(super) fn restore_mask<T>(cx: &mut Cx<'_>, r: &Result<T, Errno>) {
     let interrupted = matches!(r, Err(e) if *e == Errno::ERESTARTNOHAND);
     if !interrupted && let Some(saved) = cx.t.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
@@ -443,6 +597,9 @@ impl Interest {
 #[derive(Default)]
 pub(crate) struct Epoll {
     interests: Vec<Interest>,
+    /// 下一次从哪个关注开始检查：与 Linux 把报告过的放到就绪链表末尾一样，就绪的比
+    /// maxevents 多时轮流报告。
+    cursor: usize,
 }
 
 impl Epoll {
@@ -478,13 +635,23 @@ impl Epoll {
     /// 事件（报告之后由 [`Epoll::reported`] 记下）。
     fn ready(&self, depth: u32, max: usize) -> Vec<(usize, u32)> {
         let mut out = Vec::new();
-        for (i, int) in self.interests.iter().enumerate() {
+        let n = self.interests.len();
+        let start = if n == 0 { 0 } else { self.cursor % n };
+        for i in (start..n).chain(0..start) {
+            let int = &self.interests[i];
             if out.len() == max {
                 break;
             }
             let Some(file) = int.file.upgrade().filter(|_| int.armed) else {
                 continue;
             };
+            // 边沿触发的独占关注：同一个边沿已经被别的 epoll 报告过了，当作没有就绪
+            // （Linux 只叫醒一个等待者）
+            if int.events & (EPOLLET | EPOLLEXCLUSIVE) == EPOLLET | EPOLLEXCLUSIVE
+                && file.borrow().exclusive_claim.get() == Some(edge(&file.borrow()))
+            {
+                continue;
+            }
             let ev = poll_now(&file.borrow(), int.events as i16, depth) as u16 as u32;
             if int.events & EPOLLET != 0 {
                 // 程序在某个方向上用完了数据：这个方向上次报告的事件作废
@@ -518,6 +685,13 @@ impl Epoll {
         if int.events & EPOLLONESHOT != 0 {
             int.armed = false;
         }
+        if int.events & (EPOLLET | EPOLLEXCLUSIVE) == EPOLLET | EPOLLEXCLUSIVE
+            && let Some(file) = int.file.upgrade()
+        {
+            let f = file.borrow();
+            f.exclusive_claim.set(Some(edge(&f)));
+        }
+        self.cursor = i + 1;
     }
 }
 

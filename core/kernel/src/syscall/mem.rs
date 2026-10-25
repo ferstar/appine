@@ -74,6 +74,12 @@ pub(super) fn mmap(
         _ => return Err(Errno::EINVAL),
     };
     let mut flags = (flags & !MAP_TYPE) | kind;
+    // 共享的匿名内存不能向下增长
+    const MAP_GROWSDOWN: u32 = 0x0100;
+    let growsdown = flags & MAP_GROWSDOWN != 0;
+    if growsdown && flags & flags::MAP_ANONYMOUS != 0 && kind == flags::MAP_SHARED {
+        return Err(Errno::EINVAL);
+    }
     // 只读打开的 /dev/zero 的共享映射：不能有写权限，以后也不能改成可写
     let mut deny_write = false;
     // 文件映射在 /proc/<pid>/maps 里显示的路径和 inode
@@ -137,6 +143,10 @@ pub(super) fn mmap(
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
     let start = cx.mm_mut().mmap(addr, len, prot, flags, file)?;
+    // 文件映射的 MAP_GROWSDOWN 不增长（Linux 上长出来的部分也映射文件，没有程序这样用）
+    if growsdown && file.is_none() && kind == flags::MAP_PRIVATE {
+        cx.mm_mut().set_growsdown(start);
+    }
     if let Some((name, ino)) = label {
         cx.mm_mut().label(start, len, name, ino);
     }
@@ -178,10 +188,59 @@ pub(super) fn mremap(
     }
     let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
     if flags & MREMAP_DONTUNMAP != 0 {
-        return cx.mm_mut().mremap_dontunmap(old, old_len, fixed);
+        let (new, refill) = cx.mm_mut().mremap_dontunmap(old, old_len, fixed)?;
+        // 私有文件映射原来的地址上重新映射仓库里的文件；打不开（比如已经删除并回收）
+        // 时只好给空的匿名内存
+        let vfs = cx.vfs()?;
+        for r in refill {
+            let file = (r.ino != 0)
+                .then(|| vfs.store().open_object(r.ino, false).ok())
+                .flatten();
+            let mut mm = cx.mm_mut();
+            match &file {
+                Some(f) => {
+                    let flags = flags::MAP_PRIVATE | flags::MAP_FIXED;
+                    let src = Some((f.as_raw_fd(), r.offset, false));
+                    mm.mmap(r.start, r.len, r.prot, flags, src)?;
+                    mm.label(r.start, r.len, r.name, r.ino);
+                }
+                None => mm.map_anonymous(r.start, r.len, r.prot)?,
+            }
+            mm.set_locked(r.start, r.len, false)?;
+        }
+        return Ok(new);
     }
     cx.mm_mut()
         .mremap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
+}
+
+/// remap_file_pages：已经废弃，与 Linux 4.0 起一样用 mmap 模拟（[`Mm::remap_file_pages`]）。
+/// `prot` 必须是 0，`flags` 只看 `MAP_NONBLOCK`。
+///
+/// [`Mm::remap_file_pages`]: crate::mm::Mm::remap_file_pages
+pub(super) fn remap_file_pages(
+    cx: &mut Cx<'_>,
+    start: u64,
+    size: u64,
+    prot: u64,
+    pgoff: u64,
+    flags: u32,
+) -> SysResult {
+    const MAP_NONBLOCK: u32 = 0x10000;
+    if prot != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let start = start & !(PAGE_SIZE - 1);
+    let size = size & !(PAGE_SIZE - 1);
+    let offset = pgoff
+        .checked_add(size / PAGE_SIZE)
+        .and(pgoff.checked_mul(PAGE_SIZE))
+        .ok_or(Errno::EINVAL)?;
+    cx.mm_mut().remap_file_pages(start, size, offset)?;
+    if flags & MAP_NONBLOCK == 0 {
+        cx.mm().populate(start, size);
+    }
+    Ok(0)
 }
 
 /// msync：共享映射直接就是宿主的文件映射，不需要写回，只检查参数。
