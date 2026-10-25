@@ -81,6 +81,8 @@ pub struct CpuState {
     dbt_reason: u64,
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
+    dbt_rs: *mut c_void,
+    reserved3: u64,
     tlb: [TlbEntry; TLB_ENTRIES],
     itlb: [ItlbEntry; ITLB_ENTRIES],
     /// V0–V31，每个寄存器低 64 位在前。

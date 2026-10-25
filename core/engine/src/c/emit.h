@@ -157,6 +157,23 @@ static inline uint32_t enc_br(unsigned rn)
     return 0xd61f0000u | rn << 5;
 }
 
+static inline uint32_t enc_bl(intptr_t off)
+{
+    return 0x94000000u | ((uint32_t)(off >> 2) & 0x3ffffff);
+}
+
+/* RET Xn：宿主按返回地址栈预测目标 */
+static inline uint32_t enc_ret_reg(unsigned rn)
+{
+    return 0xd65f0000u | rn << 5;
+}
+
+/* BFXIL Xd, Xn, #0, #width：把 Xn 的低 width 位放进 Xd，其余位不变 */
+static inline uint32_t enc_bfxil_low(unsigned rd, unsigned rn, unsigned width)
+{
+    return 0xb3400000u | (width - 1) << 10 | rn << 5 | rd;
+}
+
 static inline uint32_t enc_cbz_x(unsigned rt)
 {
     return 0xb4000000u | rt;

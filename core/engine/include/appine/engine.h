@@ -104,6 +104,8 @@ struct appine_cpu {
     uint64_t dbt_reason;
     uint64_t dbt_site;
     void *dbt_jump_cache;
+    void *dbt_rs; /* 影子返回栈的栈顶（Tier 1 实例里 1 KB 对齐的环形缓冲） */
+    uint64_t reserved3; /* 让 tlb 按 16 字节对齐 */
     /* Tier 1 以 "ldp [cpu + 下标 * 32 + 偏移]" 寻址表项，所以 tlb 的偏移不能超出 ldp
      * 立即数的范围 */
     struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];

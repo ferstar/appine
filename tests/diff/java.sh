@@ -199,7 +199,8 @@ JAVA
 javac -d . Sleeper.java
 java -cp . Sleeper > sleeper.out &
 pid=$!
-while ! grep -q 'sleeper up' sleeper.out; do sleep 0.1; done
+# 子进程可能还没创建 sleeper.out：grep -s 不报文件不存在
+while ! grep -qs 'sleeper up' sleeper.out; do sleep 0.1; done
 jcmd $pid VM.version | tail -n +2
 kill $pid
 wait $pid
