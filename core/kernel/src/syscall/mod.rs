@@ -56,6 +56,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     state.orig_x0 = state.x[0];
     let nr = state.x[8];
     let a: [u64; 6] = state.x[..6].try_into().unwrap();
+    let started = debug::trace_start();
     use xattr::Target::{Fd, Path};
 
     let result = match nr {
@@ -189,6 +190,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         113 => misc::clock_gettime(cx, a[0] as i32, a[1]),
         114 => misc::clock_getres(cx, a[0] as i32, a[1]),
         115 => misc::clock_nanosleep(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        // ptrace 没有实现：与 Yama 的 ptrace_scope=3 一样一律拒绝，程序会当作没有权限
+        117 => Err(Errno::EPERM),
         118 => sched::sched_setparam(cx, a[0] as i32, a[1]),
         119 => sched::sched_setscheduler(cx, a[0] as i32, a[1] as i32, a[2]),
         120 => sched::sched_getscheduler(cx, a[0] as i32),
@@ -316,6 +319,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         275 => sched::sched_getattr(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
         276 => fs::renameat2(cx, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
         278 => misc::getrandom(cx, a[0], a[1] as usize, a[2] as u32),
+        283 => misc::membarrier(cx, a[0] as i32, a[1] as u32),
         279 => fs::memfd_create(cx, a[0], a[1] as u32),
         284 => mem::mlock(cx, a[0], a[1], a[2] as u32, true),
         285 => fs::copy_file_range(
@@ -351,12 +355,32 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             ),
             Err(e) => Err(e),
         },
+        449 => misc::futex_waitv(cx, a[0], a[1] as u32, a[2] as u32, a[3], a[4] as i32),
         _ => {
             debug::unimplemented_syscall(nr);
             Err(Errno::ENOSYS)
         }
     };
-    debug::trace_syscall(cx.tid(), nr, &a, &result);
+    // fd 上的读写返回 EAGAIN，或者 read、write、recvfrom、sendto 没有读写满要求的长度：
+    // 程序在这个方向上用完了 EPOLLET 上次报告的事件（poll::drained）。表里是 (参数下标,
+    // 方向)：sendfile 写 a[0]、读 a[1]，splice 和 tee 读 a[0]、写 a[2]
+    let dirs: &[(usize, usize)] = match nr {
+        63 | 65 | 202 | 207 | 212 | 242 | 243 => &[(0, 0)],
+        64 | 66 | 206 | 211 | 269 => &[(0, 1)],
+        71 => &[(0, 1), (1, 0)],
+        76 | 77 => &[(0, 0), (2, 1)],
+        _ => &[],
+    };
+    let short = matches!((nr, &result), (63 | 64 | 206 | 207, Ok(n)) if *n < a[2]);
+    if !dirs.is_empty() && (short || result == Err(Errno::EAGAIN)) {
+        for &(i, dir) in dirs {
+            let file = cx.fds().get(a[i] as i32);
+            if let Ok(file) = file {
+                poll::drained(cx, &file, dir);
+            }
+        }
+    }
+    debug::trace_syscall(started, cx.tid(), nr, &a, &result);
     cpu.state_mut().x[0] = match result {
         Ok(v) => v,
         Err(errno) => errno.to_syscall_return(),

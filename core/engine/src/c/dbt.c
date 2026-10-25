@@ -86,6 +86,8 @@ _Static_assert(MAX_BLOCK_WORDS < 1u << (16 - REASON_BITS), "条件分支到桩�
 #define SYSREG_NZCV 0xda10
 #define SYSREG_TPIDR_EL0 0xde82
 #define SYSREG_DCZID_EL0 0xd807
+#define SYSREG_CNTFRQ_EL0 0xdf00
+#define SYSREG_CNTVCT_EL0 0xdf02
 
 /* DC ZVA 的块大小，与 Tier 0 报告的 DCZID_EL0 一致 */
 #define DCZ_BLOCK 64
@@ -1007,7 +1009,9 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         bool read = BIT(insn, 21);
         unsigned rt = insn & 31;
         switch (FIELD(insn, 20, 5)) {
-        case SYSREG_NZCV: {
+        case SYSREG_NZCV:
+        case SYSREG_CNTFRQ_EL0: /* 计时器只读，写入已被 tier0_defined 拒绝；原样在宿主上读 */
+        case SYSREG_CNTVCT_EL0: {
             struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read};
             return emit_operands(x, insn, &o) || fallback(x, pc);
         }

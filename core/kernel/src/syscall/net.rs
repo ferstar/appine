@@ -820,7 +820,13 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         cx.mm().write(UserSlice::new(control, n), &m.control[..n])?;
     }
     put(cx, msg + 40, (n as u64).to_le_bytes())?;
-    put(cx, msg + 48, m.flags.to_le_bytes())?;
+    // 与 Linux 一样，msg_flags 里回显调用方给的 MSG_CMSG_CLOEXEC
+    const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
+    put(
+        cx,
+        msg + 48,
+        (m.flags | flags & MSG_CMSG_CLOEXEC).to_le_bytes(),
+    )?;
     Ok(if flags & MSG_TRUNC != 0 {
         m.len
     } else {

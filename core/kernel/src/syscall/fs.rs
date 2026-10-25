@@ -210,6 +210,18 @@ pub(super) fn may_create(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> R
     Ok(st)
 }
 
+/// 要新建的不是目录、名字却以 `/` 结尾：已经存在时是 EEXIST，否则 ENOENT（与 Linux
+/// 的 `filename_create` 一样）。
+fn reject_trailing_slash(store: &Store, dir: Ino, name: &[u8], path: &[u8]) -> Result<(), Errno> {
+    if !path.ends_with(b"/") {
+        return Ok(());
+    }
+    Err(match store.lookup(dir, name)? {
+        Some(_) => Errno::EEXIST,
+        None => Errno::ENOENT,
+    })
+}
+
 /// 删除或者移走目录 `dir` 里的 `name` 之前的检查（`may_delete`），返回它的元数据。
 fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
     let dir_st = store.stat(dir)?;
@@ -263,6 +275,7 @@ fn split_ns(ns: i64) -> (u64, u64) {
 fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     let mut b = [0u8; 128];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    let (asec, ansec) = split_ns(st.atime_ns);
     let (msec, mnsec) = split_ns(st.mtime_ns);
     let (csec, cnsec) = split_ns(st.ctime_ns);
     put(0, &dev.to_le_bytes());
@@ -281,9 +294,8 @@ fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
     put(64, &(size.div_ceil(4096) * 8).to_le_bytes());
-    // 不记录 atime，用 mtime 代替
-    put(72, &msec.to_le_bytes());
-    put(80, &mnsec.to_le_bytes());
+    put(72, &asec.to_le_bytes());
+    put(80, &ansec.to_le_bytes());
     put(88, &msec.to_le_bytes());
     put(96, &mnsec.to_le_bytes());
     put(104, &csec.to_le_bytes());
@@ -325,6 +337,7 @@ fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
         gid: s.st_gid,
         rdev: s.st_rdev as u64,
         size: s.st_size as u64,
+        atime_ns: s.st_atime as i64 * 1_000_000_000 + s.st_atime_nsec as i64,
         mtime_ns: s.st_mtime as i64 * 1_000_000_000 + s.st_mtime_nsec as i64,
         ctime_ns: s.st_ctime as i64 * 1_000_000_000 + s.st_ctime_nsec as i64,
     };
@@ -342,6 +355,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
             gid: 0,
             rdev,
             size: 0,
+            atime_ns: 0,
             mtime_ns: 0,
             ctime_ns: 0,
         };
@@ -408,15 +422,33 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         Ok(_) if excl => return Err(Errno::EEXIST),
         Ok(node) => (node, None),
         Err(e) if e == Errno::ENOENT && create => {
-            let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &root, &start, &path)?;
-            if path.ends_with(b"/") || name == b"." || name == b".." {
-                return Err(Errno::EISDIR);
+            // 最后一个组件是悬空的符号链接时，与 Linux 一样沿着它新建目标文件
+            let (mut start, mut path) = (start.clone(), path.clone());
+            let mut links = 0;
+            loop {
+                let (dir, name) =
+                    vfs.resolve_parent(&cx.view(&vfs), &cred, &root, &start, &path)?;
+                if path.ends_with(b"/") || name == b"." || name == b".." {
+                    return Err(Errno::EISDIR);
+                }
+                let dir = store_ino(&dir)?;
+                if let Some(ino) = vfs.store().lookup(dir, name)?
+                    && follow
+                    && vfs.store().stat(ino)?.kind() == mode::S_IFLNK
+                {
+                    links += 1;
+                    if links > crate::vfs::MAX_SYMLINKS {
+                        return Err(Errno::ELOOP);
+                    }
+                    path = vfs.store().readlink(ino)?;
+                    start = Node::Store(dir);
+                    continue;
+                }
+                let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+                let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
+                let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
+                break (Node::Store(ino), Some(file));
             }
-            let dir = store_ino(&dir)?;
-            let dir_st = may_create(vfs.store(), &cred, dir, name)?;
-            let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
-            let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
-            (Node::Store(ino), Some(file))
         }
         Err(e) => return Err(e),
     };
@@ -1497,6 +1529,7 @@ pub(super) fn mknodat(
     }
     let vfs = cx.vfs()?;
     let cred = cx.cred();
+    reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(vfs.store(), &cred, dir, name)?;
     if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !cred.capable(cap::MKNOD) {
         return Err(Errno::EPERM);
@@ -1530,8 +1563,17 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
             }
         }
     } else {
-        if name == b"." || name == b".." || path.ends_with(b"/") {
+        if name == b"." || name == b".." {
             return Err(Errno::EISDIR);
+        }
+        // 以 / 结尾的名字只能是目录：是目录时 EISDIR，否则 ENOTDIR
+        if path.ends_with(b"/") {
+            let ino = store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
+            return Err(if store.stat(ino)?.is_dir() {
+                Errno::EISDIR
+            } else {
+                Errno::ENOTDIR
+            });
         }
         may_delete(store, &cred, dir, name)?;
         store.unlink(dir, name)?;
@@ -1551,6 +1593,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     }
     let vfs = cx.vfs()?;
     let cred = cx.cred();
+    reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(vfs.store(), &cred, dir, name)?;
     let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
     vfs.store().symlink(dir, name, &target, uid, gid)?;
@@ -1589,6 +1632,7 @@ pub(super) fn linkat(
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
+    reject_trailing_slash(vfs.store(), dir, name, &newpath)?;
     may_create(vfs.store(), &cred, dir, name)?;
     vfs.store().link(dir, name, src)?;
     Ok(0)
@@ -1618,6 +1662,13 @@ pub(super) fn renameat2(
         return Err(Errno::EBUSY);
     }
     let vfs = cx.vfs()?;
+    // 任何一边以 / 结尾，被移动的就必须是目录
+    if (oldpath.ends_with(b"/") || newpath.ends_with(b"/"))
+        && let Some(src) = vfs.store().lookup(old_dir, old_name)?
+        && !vfs.store().stat(src)?.is_dir()
+    {
+        return Err(Errno::ENOTDIR);
+    }
     may_rename(
         vfs.store(),
         &cx.cred(),
@@ -1771,9 +1822,10 @@ pub(super) fn utimensat(
             .map(|(s, ns)| s * 1_000_000_000 + ns)
             .map_err(Errno)
     };
-    // 只记录 mtime（atime 用 mtime 代替）：times[1] 是 mtime
-    let (mtime, explicit) = if times == 0 {
-        (Some(now()?), false)
+    // times[0] 是 atime，times[1] 是 mtime
+    let (atime, mtime, explicit) = if times == 0 {
+        let t = now()?;
+        (Some(t), Some(t), false)
     } else {
         let b: [u8; 32] = get(cx, times)?;
         let word = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
@@ -1788,12 +1840,12 @@ pub(super) fn utimensat(
         let explicit = [word(1), word(3)]
             .iter()
             .any(|&n| n != UTIME_NOW && n != UTIME_OMIT);
-        let mtime = match word(3) {
-            UTIME_OMIT => None,
-            UTIME_NOW => Some(now()?),
-            nsec => Some(word(2) * 1_000_000_000 + nsec),
+        let time = |sec: i64, nsec: i64| match nsec {
+            UTIME_OMIT => Ok(None),
+            UTIME_NOW => now().map(Some),
+            nsec => Ok(Some(sec * 1_000_000_000 + nsec)),
         };
-        (mtime, explicit)
+        (time(word(0), word(1))?, time(word(2), word(3))?, explicit)
     };
     // 设成指定的时间只有属主可以，设成现在的时间有写权限也可以
     let st = cx.vfs()?.store().stat(ino)?;
@@ -1804,9 +1856,7 @@ pub(super) fn utimensat(
         }
         cred.permission(&st, MAY_WRITE)?;
     }
-    if let Some(t) = mtime {
-        cx.vfs()?.store().set_mtime(ino, t)?;
-    }
+    cx.vfs()?.store().set_times(ino, atime, mtime)?;
     Ok(0)
 }
 

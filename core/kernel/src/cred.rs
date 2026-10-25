@@ -476,6 +476,7 @@ mod tests {
             gid,
             rdev: 0,
             size: 0,
+            atime_ns: 0,
             mtime_ns: 0,
             ctime_ns: 0,
         }

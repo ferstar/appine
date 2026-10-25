@@ -11,14 +11,16 @@ use std::io;
 use std::ptr::NonNull;
 use std::time::Duration;
 
-/// 申请 `len` 字节、清零、可读写的匿名宿主内存。
-pub fn map_anonymous(len: usize) -> Result<NonNull<u8>, i32> {
+/// 申请 `len` 字节、清零、可读写的匿名宿主内存。`reserve` 为 false 时不计入宿主的
+/// 内存提交量（`MAP_NORESERVE`），超量使用时在访问时失败，而不是现在失败。
+pub fn map_anonymous(len: usize, reserve: bool) -> Result<NonNull<u8>, i32> {
+    let noreserve = if reserve { 0 } else { libc::MAP_NORESERVE };
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             len,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | noreserve,
             -1,
             0,
         )

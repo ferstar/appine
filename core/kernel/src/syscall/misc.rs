@@ -159,6 +159,75 @@ pub(super) fn futex(
     }
 }
 
+/// `struct futex_waitv` 的 flags：32 位的 futex，以及只在本进程内有效（我们不区分）。
+const FUTEX_32: u32 = 2;
+const FUTEX_PRIVATE_FLAG: u32 = 128;
+/// futex_waitv 一次最多等的 futex 个数。
+const FUTEX_WAITV_MAX: u32 = 128;
+
+/// futex_waitv(2)：同时等多个 futex，任何一个被唤醒就返回它的下标。超时是 `clock`
+/// 上的绝对时间。
+pub(super) fn futex_waitv(
+    cx: &mut Cx<'_>,
+    waiters: u64,
+    nr: u32,
+    flags: u32,
+    timeout: u64,
+    clock: i32,
+) -> SysResult {
+    if flags != 0 || waiters == 0 || nr == 0 || nr > FUTEX_WAITV_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let deadline = match timeout {
+        0 => None,
+        _ if clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME => return Err(Errno::EINVAL),
+        addr => Some(deadline_from_clock(clock, read_timespec(cx, addr)?)?),
+    };
+    // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 __reserved; }
+    let mut keys = Vec::with_capacity(nr as usize);
+    for i in 0..nr as u64 {
+        let w: [u8; 24] = get(cx, waiters + i * 24)?;
+        let val = u64::from_le_bytes(w[..8].try_into().unwrap());
+        let uaddr = u64::from_le_bytes(w[8..16].try_into().unwrap());
+        let wflags = u32::from_le_bytes(w[16..20].try_into().unwrap());
+        let reserved = u32::from_le_bytes(w[20..].try_into().unwrap());
+        if wflags & !(FUTEX_32 | FUTEX_PRIVATE_FLAG) != 0 || wflags & FUTEX_32 == 0 || reserved != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        keys.push((futex_key(cx, uaddr)?, uaddr, val));
+    }
+    // 持有 BKL：检查值和登记之间不会有人唤醒
+    for &(_, uaddr, val) in &keys {
+        if u64::from(u32::from_le_bytes(get(cx, uaddr)?)) != val {
+            return Err(Errno::EAGAIN);
+        }
+    }
+    let ids: Vec<u64> = keys
+        .iter()
+        .map(|&(key, ..)| cx.k().futexes.enqueue(key, u32::MAX))
+        .collect();
+    let r = loop {
+        if let Some(i) = ids.iter().position(|&id| !cx.kr().futexes.is_queued(id)) {
+            break Ok(i as u64);
+        }
+        let err = if deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(Errno::ETIMEDOUT)
+        } else if cx.interrupted() {
+            Some(Errno::ERESTARTSYS)
+        } else {
+            cx.wait(deadline, &mut []).err()
+        };
+        if let Some(e) = err {
+            break Err(e);
+        }
+    };
+    for id in ids {
+        cx.k().futexes.remove(id);
+    }
+    r
+}
+
 /// 睡到 `deadline`，被信号打断时返回剩余时间。
 fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
     loop {
@@ -761,6 +830,55 @@ pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     b[80..82].copy_from_slice(&procs.to_le_bytes());
     b[104..108].copy_from_slice(&1u32.to_le_bytes());
     put(cx, buf, b).map(|()| 0)
+}
+
+/// membarrier(2)。共用地址空间的其他线程被打断、离开 guest 代码，就相当于在它们身上
+/// 执行了一次完整的内存屏障和上下文同步（V8 改写代码之后用 `SYNC_CORE` 的形式）。
+/// 全局的命令也只作用于本进程：其他进程和它共享的只有共享映射，appine 的所有 guest
+/// 线程都在一个宿主进程里，这里再加一个宿主的内存屏障。
+pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
+    const QUERY: i32 = 0;
+    const GLOBAL: i32 = 1;
+    const GLOBAL_EXPEDITED: i32 = 2;
+    const REGISTER_GLOBAL_EXPEDITED: i32 = 4;
+    const PRIVATE_EXPEDITED: i32 = 8;
+    const REGISTER_PRIVATE_EXPEDITED: i32 = 16;
+    const PRIVATE_EXPEDITED_SYNC_CORE: i32 = 32;
+    const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 64;
+    const SUPPORTED: i32 = GLOBAL
+        | GLOBAL_EXPEDITED
+        | REGISTER_GLOBAL_EXPEDITED
+        | PRIVATE_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED
+        | PRIVATE_EXPEDITED_SYNC_CORE
+        | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let registered = cx.mm().membarrier;
+    match cmd {
+        QUERY => Ok(SUPPORTED as u64),
+        REGISTER_GLOBAL_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            cx.mm_mut().membarrier |= cmd;
+            Ok(0)
+        }
+        GLOBAL | GLOBAL_EXPEDITED | PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {
+            // 私有的命令要求先登记，与 Linux 一样
+            if (cmd == PRIVATE_EXPEDITED && registered & REGISTER_PRIVATE_EXPEDITED == 0)
+                || (cmd == PRIVATE_EXPEDITED_SYNC_CORE
+                    && registered & REGISTER_PRIVATE_EXPEDITED_SYNC_CORE == 0)
+            {
+                return Err(Errno::EPERM);
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let sync = cx.task.sync.clone();
+            cx.mm().quiesce(&sync);
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> SysResult {

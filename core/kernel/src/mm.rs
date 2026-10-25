@@ -16,6 +16,7 @@
 //!
 //! fork 按设计文档 §5.3 v1 整份复制：私有映射拷贝一份，共享映射与子进程共用。
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
@@ -39,6 +40,8 @@ pub mod flags {
     pub const MAP_FIXED: u32 = 0x10;
     /// 匿名映射。
     pub const MAP_ANONYMOUS: u32 = 0x20;
+    /// 不计入内存提交量。
+    pub const MAP_NORESERVE: u32 = 0x4000;
     /// 固定地址，但不覆盖已有映射。
     pub const MAP_FIXED_NOREPLACE: u32 = 0x10_0000;
 }
@@ -70,7 +73,7 @@ impl SharedMemory {
     /// 新建一段清零的内存，长度按页向上取整。
     pub fn new(len: u64) -> Result<SharedMemory, Errno> {
         let len = page_up(len).ok_or(Errno::ENOMEM)?;
-        let (region, _) = Mm::new_anonymous(len)?;
+        let (region, _) = Mm::new_anonymous(len, true)?;
         Ok(SharedMemory { region })
     }
 
@@ -120,6 +123,9 @@ struct Vma {
     shm: Option<(i32, u64)>,
     /// mlock 锁住了（只记录，宿主内存不会被换出到 guest 能察觉的地方）。
     locked: bool,
+    /// 匿名映射可写过，或者内核写过（加载器）。没写过的内容全是零，fork 时不用复制：
+    /// V8 为 wasm 预留的 8 GB `PROT_NONE` 逐页检查一遍要一秒。
+    written: Cell<bool>,
 }
 
 /// 最近几个代码代数作废的范围。
@@ -190,6 +196,8 @@ pub struct Mm {
     code_log: Arc<Mutex<CodeLog>>,
     /// 正在使用这个地址空间的线程。
     users: Vec<Arc<TaskSync>>,
+    /// membarrier(2) 登记过的命令（`MEMBARRIER_CMD_REGISTER_*`）。
+    pub membarrier: i32,
     /// `mlockall(MCL_FUTURE)`：以后的映射也锁住。
     pub lock_future: bool,
     /// 正在执行的程序文件在仓库里的 inode（ETXTBSY）。
@@ -254,6 +262,7 @@ impl Mm {
             code_generation: Arc::new(AtomicU64::new(0)),
             code_log: Arc::default(),
             users: Vec::new(),
+            membarrier: 0,
             lock_future: false,
             exe: None,
             vdso: 0,
@@ -408,6 +417,7 @@ impl Mm {
                 file: None,
                 shm: None,
                 locked: self.lock_future,
+                written: Cell::new(prot & prot::WRITE != 0),
             },
         );
         Ok(())
@@ -458,9 +468,13 @@ impl Mm {
         Some(true)
     }
 
-    fn new_anonymous(len: u64) -> Result<(Rc<HostRegion>, NonNull<u8>), Errno> {
+    /// 新的匿名宿主内存。宿主内存总是可读写（guest 的权限由页表管），所以 `reserve`
+    /// 按 Linux 的提交量规则由调用方决定：只有可写的私有映射计入，`MAP_NORESERVE`、
+    /// 只读和 `PROT_NONE` 的不计入。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，
+    /// 计入的话在内存小的宿主上直接失败。
+    fn new_anonymous(len: u64, reserve: bool) -> Result<(Rc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
-        let base = appine_hal::map_anonymous(host_len).map_err(|_| Errno::ENOMEM)?;
+        let base = appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?;
         Ok((
             Rc::new(HostRegion {
                 base,
@@ -478,7 +492,7 @@ impl Mm {
         if !self.is_free(start, len) {
             return Err(Errno::EEXIST);
         }
-        let (region, host) = Self::new_anonymous(len)?;
+        let (region, host) = Self::new_anonymous(len, prot & prot::WRITE != 0)?;
         self.insert(start, len, prot, Backing::Anonymous, true, region, host)
     }
 
@@ -524,7 +538,9 @@ impl Mm {
 
         let (backing, may_write, region, host) = match file {
             None => {
-                let (region, host) = Self::new_anonymous(len)?;
+                let reserve =
+                    prot & prot::WRITE != 0 && (shared || flags & flags::MAP_NORESERVE == 0);
+                let (region, host) = Self::new_anonymous(len, reserve)?;
                 let backing = if shared {
                     Backing::Shared
                 } else {
@@ -680,7 +696,7 @@ impl Mm {
             }
             (Backing::PrivateFile, _) => return Err(Errno::ENOMEM),
             _ => {
-                let (region, host) = Self::new_anonymous(len)?;
+                let (region, host) = Self::new_anonymous(len, template.prot & prot::WRITE != 0)?;
                 (region, host, None)
             }
         };
@@ -701,6 +717,7 @@ impl Mm {
             file,
             shm: None,
             locked: template.locked,
+            written: Cell::new(template.prot & prot::WRITE != 0),
         })
     }
 
@@ -1002,6 +1019,9 @@ impl Mm {
             // 只增加权限时 TLB 里的旧表项只是少了权限，未命中时会重新填写，不必刷新
             self.dirty |= mmu_prot(v.prot) & !mmu_prot(prot) != 0;
             v.prot = prot;
+            if prot & prot::WRITE != 0 {
+                v.written.set(true);
+            }
         }
         self.mmu
             .protect(addr, len, mmu_prot(prot))
@@ -1066,13 +1086,18 @@ impl Mm {
             let (region, host) = if share {
                 (v.region.clone(), v.host)
             } else {
-                let (region, host) = Self::new_anonymous(v.len)?;
-                // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
-                unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
+                let (region, host) = Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?;
+                if v.backing != Backing::Anonymous || v.written.get() {
+                    // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
+                    unsafe {
+                        copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize)
+                    };
+                }
                 (region, host)
             };
             child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
             let c = child.vmas.get_mut(&start).unwrap();
+            c.written.set(v.written.get());
             c.name = v.name.clone();
             c.file_len = v.file_len;
             c.cow = v.cow && share;
@@ -1087,7 +1112,7 @@ impl Mm {
     /// 给一个和别的地址空间共用宿主内存的私有文件映射复制一份自己的。
     fn unshare(&mut self, start: u64) -> Result<(), Errno> {
         let v = &self.vmas[&start];
-        let (region, host) = Self::new_anonymous(v.len)?;
+        let (region, host) = Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?;
         // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
         unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
         // 超出文件末尾的页仍然不进页表
@@ -1233,6 +1258,15 @@ impl Mm {
 
     /// 内核自己往 guest 内存写入，比如加载程序、构造初始栈。只要求已映射，不检查权限。
     pub(crate) fn write_kernel(&self, addr: u64, data: &[u8]) -> Result<(), Errno> {
+        let end = addr.saturating_add(data.len() as u64);
+        for (_, v) in self
+            .vmas
+            .range(..end)
+            .rev()
+            .take_while(|(s, v)| *s + v.len > addr)
+        {
+            v.written.set(true);
+        }
         self.for_each_page(addr, data.len(), 0, |host, done, chunk| unsafe {
             std::ptr::copy_nonoverlapping(data[done..].as_ptr(), host, chunk);
         })
@@ -1453,6 +1487,38 @@ mod tests {
         assert_eq!(&buf[..4], b"both");
         // 映射自顶向下分配：private 上方就是 mmap 区的上界，没有映射
         assert!(child.is_mapped(private) && !child.is_mapped(private + 2 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn fork_skips_only_never_written_anonymous_mappings() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        // V8 式的预留：PROT_NONE 加 MAP_NORESERVE，再把一部分改成可写
+        let reserved = mm
+            .mmap(0, 1 << 33, 0, anon | flags::MAP_NORESERVE, None)
+            .unwrap();
+        mm.mprotect(reserved, PAGE_SIZE, RW).unwrap();
+        mm.write_kernel(reserved, b"heap").unwrap();
+        // 写过之后去掉权限：内容还在，fork 要复制
+        let hidden = mm.mmap(0, PAGE_SIZE, RW, anon, None).unwrap();
+        mm.write_kernel(hidden, b"kept").unwrap();
+        mm.mprotect(hidden, PAGE_SIZE, 0).unwrap();
+        // 加载器那样映射成只读再由内核写入
+        let text = mm.mmap(0, PAGE_SIZE, prot::READ, anon, None).unwrap();
+        mm.write_kernel(text, b"code").unwrap();
+        let child = mm.fork().unwrap();
+        let mut buf = [0u8; 4];
+        child.read(UserSlice::new(reserved, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"heap");
+        child.read(UserSlice::new(text, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"code");
+        let host = child.mmu().translate(hidden, 0).unwrap();
+        // SAFETY: translate 返回的页在 child 存续期间有效
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(host.as_ptr(), 4) },
+            b"kept"
+        );
+        assert!(!child.vmas[&(reserved + PAGE_SIZE)].written.get());
     }
 
     #[test]

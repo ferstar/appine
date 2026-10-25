@@ -101,6 +101,8 @@ pub(crate) struct Kernel {
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
+    /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
+    pub edge_waiters: Vec<Arc<Event>>,
 }
 
 // SAFETY: Kernel 及其中的 Rc/RefCell 只在持有 BKL（Shared::kernel 这把锁）时访问，
@@ -139,6 +141,7 @@ impl Kernel {
             domainname: b"(none)".to_vec(),
             next_tid: INIT + 1,
             waiters: Vec::new(),
+            edge_waiters: Vec::new(),
         }
     }
 

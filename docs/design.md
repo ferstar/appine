@@ -137,6 +137,7 @@ FP 和 NEON 指令都在宿主上原生执行。所以每次从宿主代码进�
 - `AT_HWCAP`/`AT_HWCAP2`、`/proc/cpuinfo` 的 Features 行、guest 读 `mrs ID_AA64*_EL1` 得到的值，三者从**同一份集合**生成。
 - 白名单以外的编码，在两个 Tier 里都投递 SIGILL（`ILL_ILLOPC`），**绝不把它们原样拷贝执行**。
 - 两个 Tier 对同一条指令的语义必须一致。PAC 在 Tier 1 原样执行会用宿主密钥签名，而 Tier 0 只能把它当 NOP。为了一致，Tier 1 也把它们改写成 NOP，并且不宣告 PACA/PACG。
+- 通用定时器的 `CNTVCT_EL0`、`CNTFRQ_EL0` 与 Linux 一样允许 EL0 读，两个 Tier 都读宿主的值（M8）。Go 的运行时和 V8 直接读它们计时，原来是 SIGILL。
 - **实现**（M1a，`core/engine/src/c/features.c`）：启动时读宿主的 `AT_HWCAP`，与 Tier 0 已实现的集合求交，作为 guest 的 `AT_HWCAP`（`AT_HWCAP2` 为 0）；guest 读 ID 寄存器空间（`MIDR_EL1`、`ID_AA64ISAR0_EL1`、`ID_AA64PFR0_EL1` 等）时，返回与这份集合一致的值。`/proc/cpuinfo` 随 procfs 一起生成（M3b）。
 - **白名单的独立核对**：硬件只能告诉我们一条编码能否执行，分不清它属于基础集还是 FP16 之类没宣告的扩展。所以另用 LLVM 的反汇编器（`llvm-mc`，按 guest 特性集合设置 `-mattr`）做对照：在 SIMD&FP 数据处理、SIMD 访存、独占访问、LSE、整数 2 源数据处理这几个编码空间里随机抽样，Tier 0 认为能执行的编码必须恰好是 LLVM 能解码的编码（`tests/lockstep/tests/whitelist.rs`）。对"应当全为 1"（SBO）的字段，沿用 LLVM 的口径：独占访问和 LDAR/STLR 忽略它们，CAS/CASP 的 Rt2 必须全为 1。
 
@@ -193,11 +194,12 @@ ldr  x0, [x27, x16]          // 宿主地址 = addend + guest 地址
   - busybox/musl 的代码页通过宿主 page cache **在所有 guest 进程之间共享**。
   - `MAP_SHARED` 映射和 `read`/`write` 之间天然一致。
 - 进程间的 `MAP_SHARED` 匿名内存，就是让两张页表指向同一个宿主页。System V 共享内存段同理：段持有一段宿主内存，`shmat` 把它映射进地址空间。
+- 宿主内存总是可读写，guest 的权限只记在页表里，所以宿主的内存提交量（overcommit 记账）按 Linux 的规则由 guest 的参数决定：只有可写的私有映射计入，`MAP_NORESERVE`、只读和 `PROT_NONE` 的映射用 `MAP_NORESERVE` 向宿主申请（M8）。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，计入的话在内存小的设备上直接失败。
 - 文件映射超出 EOF 的整页不放进页表，访问它们时宿主 mmap 会产生 SIGBUS。guest 访问这些页，得到的是 guest 自己的 SIGBUS（`BUS_ADRERR`）；共享映射的文件后来变长了，就把新的内容映射进来，重新执行那条指令。映射之后文件又被截短的情况见 §7.4。
 
 ### 5.3 fork
 
-- **v1：全量复制。** shell 的 fork 通常紧接着 exec，复制几 MB 内存的代价可以接受。复制之前先让同一 `mm` 的其他线程停在 guest 代码之外（与 shootdown 用同一套机制），得到 fork 那一刻的快照；全零的页不复制，没碰过的栈页因此不会在子进程里占用内存。
+- **v1：全量复制。** shell 的 fork 通常紧接着 exec，复制几 MB 内存的代价可以接受。复制之前先让同一 `mm` 的其他线程停在 guest 代码之外（与 shootdown 用同一套机制），得到 fork 那一刻的快照；全零的页不复制，没碰过的栈页因此不会在子进程里占用内存。从来没有可写过（内核也没有写过）的匿名映射内容全是零，整段跳过，不逐页检查（M8：V8 的 wasm 预留区原来让 node 的每次 fork 多花一秒）。
 - **v2：页引用计数 + CoW。** 用页表项里的 COW 位实现，不依赖宿主的 `mprotect`。
 
 ### 5.4 guest 地址空间布局
@@ -324,6 +326,8 @@ M7 先用不放进页表的办法避开了常见的情况（§5.2）：映射时
 | tun/VpnService | v1 不做 |
 
 **I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作。宿主 fd 和进程内对象统一在 §6 的等待机制里处理。guest 的 `epoll` 在进程内实现，等待时把关注的宿主 fd 和线程自己的唤醒事件放进同一次宿主 `poll`（M4 没有用宿主 epoll，fd 很多时再换）。
+
+`EPOLLET` 是近似的边沿触发（M8，Go 的 netpoller 全部用它）：某一位从未就绪变成就绪时触发。宿主 socket 上看不到"又来了一批数据"这种事件，所以改为看程序：程序在一个方向上用完数据（读写得到 EAGAIN，或者没有读写满要求的长度）之后，这个方向上次报告过的位作废，之后的数据一定会再触发一次。等待时不等报告过、仍然就绪的位，否则宿主 poll 立刻返回，epoll_wait 变成反复释放、获取 BKL 的忙等，把别的线程饿死；作为代价，程序用完数据时要叫醒这些 epoll_wait 重新计算要等什么。`epoll_ctl` 也叫醒正在等的线程，让它们按新的关注重新等。
 
 ---
 
@@ -466,7 +470,7 @@ docs/            设计文档
 | **M5 Android 外壳** ✅（未提交 Play） | Kotlin App、vendored 终端库、`specialUse` 前台服务、首次启动流程 | 真机上装好即用；4K/16K 页设备都通过；**提交 Play 内部测试或封闭测试轨道** |
 | **M6 B 档负载** ✅ | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
 | **M7 Tier 1 正式版** ✅ | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
-| **M8 C 档正确性** | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler） | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
+| **M8 C 档正确性** ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler） | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
 排序依据：
@@ -828,6 +832,68 @@ CI 的 `ubuntu-24.04-arm` runner（Neoverse N2，2 vCPU）上，性能探针的�
 - 映射之后文件被截短，宿主仍会收到 SIGBUS 并退出（§7.4）。
 - 真机测量仍未做（R1）。
 
+
+### M8 结果（2026-10-25）
+
+**结论：Go 和 Node.js 在 appine 里行为正确。Go 1.26 标准库 100 多个包的测试（`-short`）全部通过，包括 os、os/exec、syscall、net、runtime（含 cgo 和 CPU profiling）、crypto（含 tls、x509）和 go/types；Go 写的命令行工具 fzf、yq、age 正常。Node.js 24 的 JIT、WebAssembly 越界访问的 trap、worker_threads、子进程和回环上的 HTTP 都和原生一致，`node -e` 正常，`npm install express`（65 个包）连同起服务、发请求共 13 秒。新加的 Go 和 Node.js 差分测试在两个执行层下都和原生一致，LTP 的 syscall 测试 856 个通过。达到退出标准。**
+
+测量条件与 M7 相同（Apple Silicon 上的 colima 虚拟机，4 核，release 构建，Tier 1）。原生是差分测试的 docker 镜像，和 appine 里的文件完全相同（Alpine 3.24 的 go 1.26.9、nodejs 24.22.1）。C 档只要求行为正确，这些数字用来指出下一步的方向：
+
+| 负载 | 原生 | appine Tier 1 | 倍数 |
+|---|---|---|---|
+| `node -e 0` | 0.02s | 0.23s | 12× |
+| node 里 3 亿次循环（JIT 生成的代码） | 0.70s | 1.32s | 1.9× |
+| `go build` hello，冷缓存 | 2.2s | 19.2s | 8.7× |
+| 同上，`-p 1`、`GOMAXPROCS=1` | 5.7s | 32.2s | 5.6× |
+| `go build` hello，热缓存 | 0.07s | 0.57s | 8× |
+
+V8 生成的代码在 Tier 1 下和普通程序一样快。`go build` 慢有两个原因：一是多线程扩展性差，原生用 4 个线程比单线程快 2.7 倍，appine 只快 1.65 倍（BKL，以及 futex 唤醒时叫醒所有等待者）；二是每个包起一个新的 compile 进程，一次冷编译翻译了 980 万个块（54% 直接拷贝模板），代码缓存清空了 221 次。
+
+- **指令**：Go 的运行时读 `CNTFRQ_EL0`、npm 读 `CNTVCT_EL0`，两个 Tier 原来都当未定义指令。现在都读宿主的值（§4.4）。
+- **信号**：
+  - Go 的异步抢占（SIGURG 打断不调用函数的死循环，GC 才能 stop the world）和 nil 解引用转 panic（SIGSEGV 处理函数改 pc 跳进 `sigpanic`）没有改动就能工作，靠的是 M3a 的信号帧和 M7 的精确异常。
+  - A1 证实：Go 在 arm64 上不设置 `SA_RESTORER`，信号处理函数经由 vDSO 的跳板返回。
+  - CPU 时间定时器（`ITIMER_PROF`、`ITIMER_VIRTUAL`、按进程 CPU 时钟的 POSIX 定时器）到期时，信号原来交给第一个没屏蔽它的线程，通常是在睡眠的主线程。Linux 是在消耗 CPU 的线程的时钟中断里发现定时器到期的，所以由它处理。现在优先叫醒正在运行的线程，Go 的 profiler 才能采到 cgo 线程里的样本（`TestCgoPprofThread`）。
+- **epoll**（§10）：Go 的 netpoller 全部用 `EPOLLET`，找到三个问题：
+  1. 读到 EAGAIN 和新数据到达之间没有调用 epoll_wait 时，按状态变化判断的边沿会丢，os/exec 的管道测试会卡住。改为程序在一个方向上用完数据之后，这个方向上次报告的位作废。
+  2. 边沿触发的关注上次报告过、仍然就绪的位（最常见的是一直可写的 socket），等待时宿主 poll 会立刻返回。epoll_wait 于是不停地释放、重新获取 BKL；`std::sync::Mutex` 不保证公平，别的线程几乎拿不到锁。net 的 `TestSplice` 6 次里卡住 2 次、慢到 270 秒 1 次，修好之后每次 2 秒。
+  3. `epoll_ctl` 没有叫醒正在 epoll_wait 的线程，新加的 fd 要等别的事情把它叫醒之后才会被关注。
+- **内存**：
+  - V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`。宿主映射原来按可写的私有内存计入提交量，在 3.6 GB 内存的虚拟机上直接失败（`Out of memory: Cannot allocate Wasm memory`），现在按 Linux 的规则决定是否计入（§5.2）。
+  - fork 原来要逐页检查这 8 GB，node 每起一个子进程就多花一秒。从来没有可写过的匿名映射现在整段跳过（§5.3），node 里 fork + exec 从 1076 毫秒降到 50 毫秒。
+  - wasm 越界访问的 trap 不需要额外的工作：V8 的 SIGSEGV 处理函数看到出错的 pc 在 wasm 代码里，就改 pc 跳到抛异常的桩，和 Go 的 nil 解引用是同一条路径。
+- **文件系统**（Go 的 os 测试，`TestRoot*`、`TestChtimesOmit`）：
+  - 路径解析按 Linux 的规则处理 `.` 和末尾的 `/`：`file/.`、`file/..`、`file/` 和指向 `file/` 的符号链接都是 ENOTDIR；新建的名字带末尾的 `/` 时（mknodat、symlinkat、linkat），名字已存在返回 EEXIST，否则 ENOENT；unlinkat 按目标返回 ENOENT、EISDIR 或 ENOTDIR；renameat2 的任何一边带末尾的 `/` 而源不是目录时返回 ENOTDIR。
+  - `open(O_CREAT)` 遇到悬空的符号链接时在链接指向的位置创建文件。
+  - utimensat 分别设置 atime 和 mtime，stat 报告真正的 atime（普通文件取宿主对象的 atime）。
+- **其他 syscall**：
+  - `membarrier`：V8 改写代码之后用 `PRIVATE_EXPEDITED_SYNC_CORE` 让其他线程同步指令流；实现是打断共用地址空间的其他线程，让它们离开 guest 代码。
+  - `futex_waitv`（Linux 5.16，按 §7.5 的 ABI 契约应当有）：同时登记在多个键上，任何一个被唤醒就返回它的下标。
+  - `RLIMIT_NOFILE` 的默认值改为与 Linux 相同的 1024/4096，`nr_open` 是 2^20（Go 的 `TestOpenFileLimit` 要把软限制提到硬限制）。
+  - recvmsg 的 `msg_flags` 带上 `MSG_CMSG_CLOEXEC`（`TestSCMCredentials`）。
+  - AF_UNIX 的 bind 拒绝最后一段是 `.` 或 `..` 的路径。原来 bind `"//"` 会在根目录里建出一个名为 `.` 的 socket。
+  - clone 忽略 `CLONE_PIDFD`，与 5.2 之前的内核一样，Go 据此退回到不用 pidfd 的路径（`TestPidFD`）。
+  - ptrace 一律返回 EPERM，与 Yama 的 `ptrace_scope=3` 相同，程序会当作没有权限（`TestExecPtrace`）；原来是 ENOSYS。
+- **调试**：`APPINE_STRACE=1` 的每一行带上从启动算起的时间和 syscall 的耗时，查 epoll 卡住时用到。
+- **测试**：
+  - Go 标准库的测试在 appine 里用 `go test -short` 运行。Alpine 的 go 包删掉了 `_test.go` 和 testdata，从同版本的源码包补回去。通过的包有 os、os/exec、os/signal、syscall、net、internal/poll、runtime、runtime/pprof、runtime/debug、reflect、sync、time、context、io/fs、path/filepath、math/big、compress/*、archive/*、crypto/*、encoding/*、hash/*、text/template、html/template、go/parser、go/types、strings、strconv、regexp 等。
+  - 差分测试新增 `go` 和 `node` 两组（`tests/diff`），差分测试的仓库因此要重新生成：
+    - Go：goroutine 和 select，不调用函数的死循环里的 GC（只能靠 SIGURG 抢占），`os/signal`，os/exec，nil 解引用转 panic。
+    - Node.js：多态调用让 V8 反复优化、反优化，wasm 越界访问抛 RuntimeError，crypto、zlib、worker_threads、子进程，回环上的 HTTP。
+  - 单元测试新增 `EPOLLET` 按方向作废、fork 跳过没写过的匿名映射、路径解析的 ENOTDIR。
+  - LTP 的 syscall 测试 856 个通过（M7 是 849）。新通过 futex_waitv01–03、membarrier01、pipe15、ptrace02，以及 M7 时因为虚拟机计时延迟失败的 clock_nanosleep02、epoll_pwait03；新失败 nice05，它比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU，两者几乎相等，差值的正负是随机的。计时精度类的测试（这两个和 futex_wait05）在这台虚拟机上时好时坏，同一时刻用 M7 的二进制也一样失败。
+  - lockstep 100 万轮全部一致；单元测试、rootfs 用例，以及 Android 目标的 clippy 都通过。
+
+和设计相比的改动和推迟项：
+
+- JVM 在 §1.2 的 C 档里，M8 没有测。
+- 多线程负载的扩展性（见上面的 `go build`）：BKL 之外，futex 唤醒、信号这些修改都叫醒所有等待中的线程，线程多时代价明显。
+- 短命进程多的构建（`go build` 每个包一个 compile 进程）翻译开销大，可以考虑把翻译结果在进程之间、或者跨运行保存下来。
+- `PROT_NONE` 的预留区仍然逐页写页表：V8 的每块 wasm 内存占 16 MB 页表。可以改成到 mprotect 成可访问时再填。
+- `MADV_DONTNEED` 用清零实现，对大块从没碰过的内存反而会占用内存，应当改用宿主的 madvise（宿主 16K 页时边缘部分仍要清零）。
+- `EPOLLET` 的近似：程序没有用完数据（没读到 EAGAIN、读满了缓冲区）时，新到的数据不会再触发。
+- 不按 nice 值分配 CPU（nice05）。
+
 ---
 
 ## 15. 已否决的方案
@@ -857,13 +923,13 @@ CI 的 `ubuntu-24.04-arm` runner（Neoverse N2，2 vCPU）上，性能探针的�
 
 | # | 风险或假设 | 何时验证 | 退路 |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，性能探针在 Neoverse N2 上是 2.25×，见 §14；真机待测 | `ret` 走宿主返回地址预测、guest SP 常驻宿主寄存器、块内 TLB 检查外提、压缩退出桩 |
+| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | M2 初测 1.85×（Apple Silicon）和 2.37×（Neoverse N2）；M1b 用 busybox 补测，`sha256sum` 1.51×、`gzip` 4.75×（Apple Silicon）；M6 的编译负载（Lua、SQLite）约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0；M7 之后编译 `lvm.c` 4.8×、SQLite `make` 4.7×、Lua `make linux` 6.1×，性能探针在 Neoverse N2 上是 2.25×，见 §14；M8 的 C 档负载里，node 中 JIT 生成的代码 1.9×，`go build` 冷编译 8.7×（单线程 5.6×，多线程扩展性差）；真机待测 | `ret` 走宿主返回地址预测、guest SP 常驻宿主寄存器、块内 TLB 检查外提、压缩退出桩；多线程负载拆分 BKL、futex 只唤醒对应的等待者 |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时（M5 按决定暂不提交） | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前 | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
 | R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | 已解决：M1a 在 Tier 0 用 CAS 模拟，M7 在 Tier 1 把 STXR 改写成两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 §4.5 | — |
 | R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | M4 已验证：`apk add` 比原生慢约 7 倍，但只读的 `apk info` 也慢 6.3 倍，瓶颈在引擎而不在事务，见 §14 | 不需要；元数据操作本身再慢时按 syscall 批量合并提交 |
 | R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | 已解决：M5 在进入、退出翻译代码时保存、恢复 X18，但翻译代码执行期间宿主信号处理函数仍可能用到它；M7 改用宿主 X27 作临时寄存器，guest X27 存放在上下文里，翻译后的代码不再碰 X18，性能差别在误差范围内 | — |
-| A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | M8（跳板已在 M3a 提供） | 无论结论如何，vDSO 跳板都要提供 |
+| A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | 已证实：M8 确认 Go 1.26 在 arm64 上 `_SA_RESTORER = 0`（只在 x86 上用），信号处理函数经由 vDSO 的 `__kernel_rt_sigreturn` 返回，异步抢占、`os/signal` 和 CPU profiling 都正常 | — |
 | A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | 仅影响 §15 的论证 | — |
 | A3 | dynarmic 内存回调拿不到精确 guest 状态（根据接口签名推断） | 仅影响 §15 的论证 | — |
 

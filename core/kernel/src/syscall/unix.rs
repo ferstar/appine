@@ -147,8 +147,12 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
             bound.extend_from_slice(p);
         }
         Addr::Path(p) => {
-            // 与 Linux 相同，在文件系统里建一个 socket 节点；已经存在时失败
+            // 与 Linux 相同，在文件系统里建一个 socket 节点；已经存在时失败。路径是 / 或者
+            // 以 . 结尾时，它指的是一个已有的目录
             let (dir, name) = parent_at(cx, AT_FDCWD, p)?;
+            if name == b"." || name == b".." {
+                return Err(Errno::EADDRINUSE);
+            }
             let vfs = cx.vfs()?;
             let cred = cx.cred();
             let in_use = |e: Errno| {

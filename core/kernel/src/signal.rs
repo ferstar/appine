@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use appine_engine::Cpu;
 
@@ -436,6 +437,17 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
 
 /// 给整个线程组发信号（kill）。目标是僵尸进程时什么都不做。
 pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
+    send_group(k, tgid, sig, info, false);
+}
+
+/// 按进程 CPU 时间计时的定时器到期：信号与 Linux 一样发给进程，但叫醒一个正在运行
+/// 的线程来处理。Linux 在消耗 CPU 的线程的时钟中断里发现定时器到期，所以是它处理；
+/// CPU profiler 靠这一点采到 cgo 里一直在算的线程，而不是第一个线程。
+pub(crate) fn send_cpu_timer(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
+    send_group(k, tgid, sig, info, true);
+}
+
+fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) {
     let Some(group) = k.groups.get(&tgid).cloned() else {
         return;
     };
@@ -462,7 +474,21 @@ pub(crate) fn send_to_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo) {
         g.pending |= sig.bit();
         g.info[sig.index()] = info;
     }
-    match threads.iter().find(|t| t.sigmask.get() & sig.bit() == 0) {
+    let unmasked = |t: &&Rc<Task>| t.sigmask.get() & sig.bit() == 0;
+    let target = if running {
+        // 几个线程都在运行时轮流挑，大致按 CPU 时间分摊
+        static TURN: AtomicUsize = AtomicUsize::new(0);
+        let busy: Vec<_> = threads
+            .iter()
+            .filter(unmasked)
+            .filter(|t| !t.sleeping.get())
+            .collect();
+        let turn = TURN.fetch_add(1, Ordering::Relaxed);
+        busy.get(turn % busy.len().max(1)).copied()
+    } else {
+        None
+    };
+    match target.or_else(|| threads.iter().find(unmasked)) {
         Some(t) => wake(t),
         // 所有线程都屏蔽了它：sigtimedwait 里等着的线程要重新检查
         None => request_wake(),

@@ -82,7 +82,7 @@ which helps when a test fails.
 `scripts/difftest` runs each script in `tests/diff` both in appine and in a native arm64
 Docker container, and compares their output and exit status. Both sides run the same
 files: the first run creates a store in `target/difftest/store` (minirootfs plus python3,
-gcc, Lua and SQLite from `apk`, so it needs the internet), exports its root filesystem
+gcc, Lua, SQLite, Go and Node.js from `apk`, so it needs the internet), exports its root filesystem
 from appine and imports it as a Docker image:
 
 ```sh

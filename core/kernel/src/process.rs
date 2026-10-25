@@ -236,7 +236,8 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     let mut r = [(u64::MAX, u64::MAX); RLIM_NLIMITS];
     r[RLIMIT_STACK as usize] = (loader::STACK_SIZE, u64::MAX);
     r[RLIMIT_CORE as usize] = (0, u64::MAX);
-    r[RLIMIT_NOFILE as usize] = (crate::fd::MAX_FDS as u64, crate::fd::MAX_FDS as u64);
+    let (soft, hard) = crate::fd::DEFAULT_NOFILE;
+    r[RLIMIT_NOFILE as usize] = (soft as u64, hard as u64);
     // 与 Linux 5.16 起的默认值相同
     r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
     r

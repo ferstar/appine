@@ -17,8 +17,13 @@ use crate::vfs::Node;
 use crate::vfs::dev::Device;
 use crate::vfs::store::{DirEntry, Ino};
 
-/// 每个进程最多打开的 fd 数，与 Linux 默认的 `RLIMIT_NOFILE` 软限制相同。
-pub const MAX_FDS: usize = 1024;
+/// 每个进程最多能打开的 fd 数（`/proc/sys/fs/nr_open`，`RLIMIT_NOFILE` 的上限），与 Linux
+/// 的默认值相同。
+pub const MAX_FDS: usize = 1 << 20;
+
+/// 新进程的 `RLIMIT_NOFILE`：软限制 1024、硬限制 4096，与 Linux 内核的默认值相同。Go 在
+/// 启动时把软限制提到硬限制。
+pub const DEFAULT_NOFILE: (usize, usize) = (1024, 4096);
 
 /// open(2) 的标志位（arm64 的取值）。
 pub mod oflags {
@@ -121,6 +126,9 @@ pub struct OpenFile {
     /// `F_SETOWN_EX` 的 (类型, pid) 和 `F_SETSIG` 的信号：只记录，不发 SIGIO。
     pub owner: (i32, i32),
     pub sig: i32,
+    /// 程序在这个打开文件上读、写两个方向各用完数据的次数：epoll 的 `EPOLLET` 据此
+    /// 知道程序已经用完了上一次报告的事件（`syscall::poll::drained`）。
+    pub drained: [u64; 2],
 }
 
 impl OpenFile {
@@ -138,6 +146,7 @@ impl OpenFile {
             path,
             owner: (0, 0),
             sig: 0,
+            drained: [0; 2],
         }))
     }
 
@@ -265,7 +274,7 @@ impl Default for FdTable {
     fn default() -> Self {
         FdTable {
             slots: Vec::new(),
-            limit: MAX_FDS,
+            limit: DEFAULT_NOFILE.0,
         }
     }
 }

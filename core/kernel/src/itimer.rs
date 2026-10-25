@@ -229,7 +229,8 @@ pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
                 };
                 t.overrun = missed;
                 if !add_overrun(k, tgid, tid, sig, id, missed) {
-                    timer_fired.push((tgid, tid, sig, info));
+                    let cpu = matches!(t.clock, Clock::Process(_));
+                    timer_fired.push((tgid, tid, sig, info, cpu));
                 }
             }
             match t.deadline {
@@ -244,11 +245,16 @@ pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
         group.borrow_mut().posix_timers = timers;
     }
     for (tgid, sig) in fired {
-        signal::send_to_group(k, tgid, sig, SigInfo::kernel());
+        if sig == Signal::VTALRM || sig == Signal::PROF {
+            signal::send_cpu_timer(k, tgid, sig, SigInfo::kernel());
+        } else {
+            signal::send_to_group(k, tgid, sig, SigInfo::kernel());
+        }
     }
-    for (tgid, tid, sig, info) in timer_fired {
+    for (tgid, tid, sig, info, cpu) in timer_fired {
         match tid.and_then(|t| k.tasks.get(&t)) {
             Some(task) => signal::send_to_task(k, task, sig, info),
+            None if cpu => signal::send_cpu_timer(k, tgid, sig, info),
             None => signal::send_to_group(k, tgid, sig, info),
         }
     }

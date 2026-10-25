@@ -87,10 +87,12 @@ pub(super) fn clone(
     }
     if (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
         || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
-        || flags & CLONE_PIDFD != 0
     {
         return Err(Errno::EINVAL);
     }
+    // pidfd 还没有实现（pidfd_open 返回 ENOSYS）。CLONE_PIDFD 与 5.2 之前的内核一样被
+    // 忽略，不写回 pidfd：Go 预先把它设成 -1，据此知道不支持
+    let flags = flags & !CLONE_PIDFD;
     let thread = flags & CLONE_THREAD != 0;
     let tid = cx.k().alloc_tid()?;
 

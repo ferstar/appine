@@ -537,6 +537,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         gid,
         rdev: rdev_value,
         size: 0,
+        atime_ns: now,
         mtime_ns: now,
         ctime_ns: now,
     })

@@ -67,6 +67,8 @@ pub struct Stat {
     pub rdev: u64,
     /// 字节数。
     pub size: u64,
+    /// 访问时间（纳秒）。只有普通文件单独记录（宿主 object 的 atime），其余等于 mtime。
+    pub atime_ns: i64,
     /// 修改时间（纳秒）。
     pub mtime_ns: i64,
     /// 状态改变时间（纳秒）。
@@ -164,6 +166,7 @@ fn to_ns(t: SystemTime) -> i64 {
 fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
     st.size = meta.len();
     st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
+    st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
 }
 
 /// 删除 object 文件；它已经不在时不算错误。
@@ -362,6 +365,7 @@ impl Store {
             gid,
             rdev,
             size,
+            atime_ns: mtime_ns,
             mtime_ns,
             ctime_ns,
         })
@@ -875,18 +879,43 @@ impl Store {
 
     /// 设置修改时间：普通文件改宿主 object 的 mtime，其余改数据库。
     pub fn set_mtime(&self, ino: Ino, mtime_ns: i64) -> Result<(), Errno> {
-        if self.stat(ino)?.kind() == mode::S_IFREG {
-            let t = if mtime_ns >= 0 {
-                UNIX_EPOCH + Duration::from_nanos(mtime_ns as u64)
+        self.set_times(ino, None, Some(mtime_ns))
+    }
+
+    /// 设置访问时间和修改时间（None 表示不改）。普通文件改宿主 object 的时间；其余的
+    /// 只记录修改时间，访问时间跟着它。
+    pub fn set_times(
+        &self,
+        ino: Ino,
+        atime_ns: Option<i64>,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), Errno> {
+        let at = |ns: i64| {
+            if ns >= 0 {
+                UNIX_EPOCH + Duration::from_nanos(ns as u64)
             } else {
                 UNIX_EPOCH
-            };
-            return self.open_object(ino, true)?.set_modified(t).map_err(io_err);
+            }
+        };
+        if self.stat(ino)?.kind() == mode::S_IFREG {
+            let mut times = fs::FileTimes::new();
+            if let Some(ns) = atime_ns {
+                times = times.set_accessed(at(ns));
+            }
+            if let Some(ns) = mtime_ns {
+                times = times.set_modified(at(ns));
+            }
+            return self
+                .open_object(ino, true)?
+                .set_times(times)
+                .map_err(io_err);
         }
-        self.db
-            .prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, mtime_ns]))
-            .map_err(db_err)?;
+        if let Some(ns) = mtime_ns {
+            self.db
+                .prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino, ns]))
+                .map_err(db_err)?;
+        }
         Ok(())
     }
 }

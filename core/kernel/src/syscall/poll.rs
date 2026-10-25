@@ -4,11 +4,19 @@
 //! 宿主 fd（宿主 socket、宿主 stdio）用一次不等待的宿主 poll 检查；都没有就绪时，
 //! 把宿主 fd 和自己的唤醒事件放在一起等（§6 的统一等待机制）。epoll 在进程内实现，
 //! 默认水平触发。`EPOLLET` 近似为边沿触发：某一位从未就绪变成就绪时触发，触发时与
-//! Linux 一样报告当前全部就绪的位；已经可读时又来了数据不会再触发一次（按 ET 的约定
-//! 读到 EAGAIN 为止的程序不受影响）。
+//! Linux 一样报告当前全部就绪的位。程序在一个方向上用完数据（读写得到 EAGAIN，或者
+//! 没有读写满要求的长度，见 [`drained`]）之后，这个方向上次报告过的位全部忘掉，所以
+//! 之后来的数据一定会再触发一次：只靠 epoll_wait 看到的状态判断会丢事件，比如读到
+//! EAGAIN 和新数据到达之间没有调用 epoll_wait（Go 的 netpoller 就会这样）。已经可读时
+//! 又来了数据、而程序没有用完数据，不会再触发。
+//!
+//! 等待时，边沿触发的关注不等报告过、仍然就绪的位：宿主 poll 会立刻返回，epoll_wait
+//! 就变成反复释放、获取 BKL 的忙等，把其他线程饿死。所以程序用完数据时要叫醒这些
+//! epoll_wait 重新计算（[`Kernel::edge_waiters`](crate::kernel::Kernel)）。
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{SysResult, get, read_timespec, tty};
@@ -29,6 +37,9 @@ const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
 const POLLRDNORM: i16 = 0x040;
 const POLLWRNORM: i16 = 0x100;
+
+/// 写方向的就绪位，其余的都算读方向。
+const WRITE_BITS: u32 = (POLLOUT | POLLWRNORM) as u32 | 0x200; // POLLWRBAND
 
 /// 嵌套 epoll 的最大深度，与 Linux 的 `EP_MAX_NESTS` 相同。
 const MAX_NESTS: u32 = 4;
@@ -118,6 +129,8 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
 struct Waits {
     host: Vec<(i32, i16, i16)>,
     timer: Option<Instant>,
+    /// 有边沿触发的关注少等了报告过的位。
+    edge: bool,
 }
 
 impl Waits {
@@ -130,11 +143,30 @@ impl Waits {
                 }
             }
             (FileKind::Epoll(ep), None) if depth < MAX_NESTS => {
-                for (file, events) in ep.borrow().live() {
-                    self.add(&file.borrow(), events, depth + 1);
-                }
+                self.add_epoll(&ep.borrow(), depth + 1);
             }
             _ => {}
+        }
+    }
+
+    /// 一个 epoll 活着、没有停用的关注。边沿触发的关注不等报告过、仍然就绪的位（见
+    /// 模块文档）；报告过 POLLHUP、POLLERR 的整个不等，因为宿主 poll 总会报告这两位，
+    /// 而挂断、出错之后也不会再有新的事件。
+    fn add_epoll(&mut self, ep: &Epoll, depth: u32) {
+        for int in ep.interests.iter().filter(|i| i.armed) {
+            let Some(file) = int.file.upgrade() else {
+                continue;
+            };
+            let mut wanted = int.events as i16;
+            let seen = int.seen.get() as i16;
+            if int.events & EPOLLET != 0 && seen != 0 {
+                self.edge = true;
+                if seen & (POLLHUP | POLLERR) != 0 {
+                    continue;
+                }
+                wanted &= !seen;
+            }
+            self.add(&file.borrow(), wanted, depth);
         }
     }
 
@@ -144,7 +176,24 @@ impl Waits {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        cx.wait(until, &mut self.host)
+        if !self.edge {
+            return cx.wait(until, &mut self.host);
+        }
+        let event = cx.task.event.clone();
+        cx.k().edge_waiters.push(event.clone());
+        let r = cx.wait(until, &mut self.host);
+        cx.k().edge_waiters.retain(|e| !Arc::ptr_eq(e, &event));
+        r
+    }
+}
+
+/// 程序在 `file` 的一个方向（0 读，1 写）上用完了数据：读写返回 EAGAIN，或者没有读写
+/// 满要求的长度（tokio 这类运行时据此认为数据已经读完、不再读到 EAGAIN）。边沿触发的
+/// 关注之后重新报告这个方向上的事件，等待中少等了这些事件的 epoll_wait 被叫醒重新计算。
+pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
+    file.borrow_mut().drained[dir] += 1;
+    for event in &cx.k().edge_waiters {
+        event.signal();
     }
 }
 
@@ -356,6 +405,8 @@ struct Interest {
     armed: bool,
     /// `EPOLLET`：上次报告时就绪的位里现在仍然就绪的那些。出现不在其中的就绪位才触发。
     seen: Cell<u32>,
+    /// `EPOLLET`：上次检查时打开文件的 [`OpenFile::drained`]。
+    drained: Cell<[u64; 2]>,
 }
 
 impl Interest {
@@ -367,6 +418,7 @@ impl Interest {
             data,
             armed: true,
             seen: Cell::new(0),
+            drained: Cell::new(file.borrow().drained),
         }
     }
 }
@@ -378,15 +430,6 @@ pub(crate) struct Epoll {
 }
 
 impl Epoll {
-    /// 活着、没有停用的关注：(文件, 关注的 poll 事件)。
-    fn live(&self) -> Vec<(FileRef, i16)> {
-        self.interests
-            .iter()
-            .filter(|i| i.armed)
-            .filter_map(|i| Some((i.file.upgrade()?, i.events as i16)))
-            .collect()
-    }
-
     /// 立即检查哪些关注就绪，最多 `max` 个：(下标, 事件)。只检查，不消耗边沿触发的
     /// 事件（报告之后由 [`Epoll::reported`] 记下）。
     fn ready(&self, depth: u32, max: usize) -> Vec<(usize, u32)> {
@@ -400,9 +443,20 @@ impl Epoll {
             };
             let ev = poll_now(&file.borrow(), int.events as i16, depth) as u16 as u32;
             if int.events & EPOLLET != 0 {
+                // 程序在某个方向上用完了数据：这个方向上次报告的事件作废
+                let drained = file.borrow().drained;
+                let last = int.drained.replace(drained);
+                let mut seen = int.seen.get();
+                if drained[0] != last[0] {
+                    seen &= WRITE_BITS;
+                }
+                if drained[1] != last[1] {
+                    seen &= !WRITE_BITS;
+                }
                 // 不再就绪的位忘掉，下次重新就绪时才能再触发
-                int.seen.set(int.seen.get() & ev);
-                if ev & !int.seen.get() == 0 {
+                seen &= ev;
+                int.seen.set(seen);
+                if ev & !seen == 0 {
                     continue;
                 }
             }
@@ -503,15 +557,18 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         .interests
         .iter()
         .position(|i| i.fd == fd && i.file.as_ptr() == Rc::as_ptr(&file));
+    // 别的线程可能正在 epoll_wait：叫醒它们按新的关注重新等
     match (op, pos) {
         (EPOLL_CTL_ADD, Some(_)) => Err(Errno::EEXIST),
         (EPOLL_CTL_ADD, None) => {
             ep.interests.push(Interest::new(fd, &file, events, data));
+            request_wake();
             Ok(0)
         }
         // 与 Linux 相同，修改之后重新判断：已经就绪的会再报告一次
         (EPOLL_CTL_MOD, Some(i)) => {
             ep.interests[i] = Interest::new(fd, &file, events, data);
+            request_wake();
             Ok(0)
         }
         (EPOLL_CTL_DEL, Some(i)) => {
@@ -550,9 +607,7 @@ pub(super) fn epoll_pwait(
             return Err(Errno::ERESTARTNOHAND);
         }
         let mut waits = Waits::default();
-        for (file, wanted) in ep.borrow().live() {
-            waits.add(&file.borrow(), wanted, 0);
-        }
+        waits.add_epoll(&ep.borrow(), 0);
         waits.wait(cx, deadline)?;
     })();
     restore_mask(cx, &r);
@@ -700,6 +755,22 @@ mod tests {
         assert!(ep.ready(0, 8).is_empty());
         efd.borrow_mut().count = 5;
         assert_eq!(ep.ready(0, 8), vec![(0, both)]);
+        ep.reported(0, both);
+        // 读空、得到 EAGAIN、又来了数据，其间没有调用 epoll_wait：也要重新触发
+        efd.borrow_mut().count = 0;
+        file.borrow_mut().drained[0] += 1;
+        efd.borrow_mut().count = 2;
+        assert_eq!(ep.ready(0, 8), vec![(0, both)]);
+        ep.reported(0, both);
+        assert!(ep.ready(0, 8).is_empty());
+        // 写方向用完只重新报告写方向的位，等待时不等报告过、仍然就绪的位
+        file.borrow_mut().drained[1] += 1;
+        assert_eq!(ep.ready(0, 8), vec![(0, both)]);
+        ep.reported(0, both);
+        assert!(ep.ready(0, 8).is_empty());
+        let mut waits = Waits::default();
+        waits.add_epoll(&ep, 0);
+        assert!(waits.edge);
     }
 
     #[test]
@@ -721,6 +792,6 @@ mod tests {
         // 文件关闭之后关注自动失效
         ep.interests[0].armed = true;
         drop(file);
-        assert!(ep.ready(0, 8).is_empty() && ep.live().is_empty());
+        assert!(ep.ready(0, 8).is_empty() && ep.interests[0].file.upgrade().is_none());
     }
 }

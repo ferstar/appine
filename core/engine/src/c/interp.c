@@ -28,6 +28,8 @@
 #define SYSREG_TPIDRRO_EL0 SYSREG(3, 3, 13, 0, 3)
 #define SYSREG_DCZID_EL0 SYSREG(3, 3, 0, 0, 7)
 #define SYSREG_CTR_EL0 SYSREG(3, 3, 0, 0, 1)
+#define SYSREG_CNTFRQ_EL0 SYSREG(3, 3, 14, 0, 0)
+#define SYSREG_CNTVCT_EL0 SYSREG(3, 3, 14, 0, 2)
 
 /*
  * guest 读到的 CTR_EL0：64 字节的缓存行，PIPT 指令缓存。DIC = IDC = 0，即修改代码
@@ -617,6 +619,22 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
             return undef(c, insn);
         wx(c, rt, CTR_VALUE);
         return next(c);
+#ifdef __aarch64__
+    /* 通用计时器：Linux 允许 EL0 读虚拟计数器和频率（Go 和 V8 会用），直接读宿主的，
+     * 与 guest 的 clock_gettime 用的是同一个计数器 */
+    case SYSREG_CNTFRQ_EL0:
+        if (!read)
+            return undef(c, insn);
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+        wx(c, rt, v);
+        return next(c);
+    case SYSREG_CNTVCT_EL0:
+        if (!read)
+            return undef(c, insn);
+        __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v)::"memory");
+        wx(c, rt, v);
+        return next(c);
+#endif
     default: {
         uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（§4.4） */
         if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(FIELD(insn, 20, 5), &id)) {

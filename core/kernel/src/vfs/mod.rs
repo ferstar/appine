@@ -19,7 +19,7 @@ pub(crate) use crate::pseudo::PseudoNode;
 use store::{Ino, ROOT, Store, mode};
 
 /// 跟随符号链接的最大次数，与 Linux 的 MAXSYMLINKS 一致。
-const MAX_SYMLINKS: u32 = 40;
+pub(crate) const MAX_SYMLINKS: u32 = 40;
 /// 路径组件的最大长度（`NAME_MAX`）。
 const NAME_MAX: usize = 255;
 
@@ -199,19 +199,21 @@ impl Vfs {
         } else {
             cwd.clone()
         };
-        let mut pending: VecDeque<Vec<u8>> = split(path).collect();
+        let mut pending = components(path);
         let mut links = 0;
-        // 路径以 / 结尾时，最后一个组件必须是目录，并且要跟随符号链接
-        let trailing_slash = path.ends_with(b"/");
         while let Some(comp) = pending.pop_front() {
             let last = pending.is_empty();
             if comp.len() > NAME_MAX {
                 return Err(Errno::ENAMETOOLONG);
             }
+            // 每个组件（包括 . 和 ..）之前的节点都必须是目录：file/. 和 file/ 是 ENOTDIR
             if !self.is_dir(ps, &dir)? {
                 return Err(Errno::ENOTDIR);
             }
             self.may_search(cred, &dir)?;
+            if comp == b"." {
+                continue;
+            }
             if comp == b".." {
                 if dir != *root {
                     dir = self.parent(ps, &dir)?;
@@ -219,7 +221,7 @@ impl Vfs {
                 continue;
             }
             let node = self.lookup(ps, &dir, &comp)?;
-            if self.kind(ps, &node)? == mode::S_IFLNK && (!last || follow || trailing_slash) {
+            if self.kind(ps, &node)? == mode::S_IFLNK && (!last || follow) {
                 links += 1;
                 if links > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
@@ -234,15 +236,12 @@ impl Vfs {
                 if target.first() == Some(&b'/') {
                     dir = root.clone();
                 }
-                for c in split(&target).rev() {
+                for c in components(&target).into_iter().rev() {
                     pending.push_front(c);
                 }
                 continue;
             }
             dir = node;
-        }
-        if trailing_slash && !self.is_dir(ps, &dir)? {
-            return Err(Errno::ENOTDIR);
         }
         Ok(dir)
     }
@@ -389,6 +388,20 @@ pub fn write_file(
 }
 
 /// 拆分路径组件，去掉空组件和 `.`。
+/// 路径解析的组件：保留 `.`，以 `/` 结尾时再补一个 `.`，这样前面的节点必须是目录，
+/// 最后一个组件是符号链接时也会被跟随（与 Linux 一样）。
+fn components(path: &[u8]) -> VecDeque<Vec<u8>> {
+    let mut comps: VecDeque<Vec<u8>> = path
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    if path.ends_with(b"/") {
+        comps.push_back(b".".to_vec());
+    }
+    comps
+}
+
 fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
     path.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
@@ -471,6 +484,7 @@ mod tests {
         s.symlink(ubin, b"rel", b"../../bin/busybox", 0, 0).unwrap();
         s.symlink(ROOT, b"loop", b"loop", 0, 0).unwrap();
         s.symlink(ROOT, b"bindir", b"bin", 0, 0).unwrap();
+        s.symlink(ROOT, b"slash", b"bin/busybox/", 0, 0).unwrap();
         drop(s);
         (Vfs::open(&dir).unwrap(), dir)
     }
@@ -501,6 +515,19 @@ mod tests {
         assert_eq!(r(&root, b"/missing", true), Err(Errno::ENOENT));
         assert_eq!(r(&root, b"/bin/busybox/x", true), Err(Errno::ENOTDIR));
         assert_eq!(r(&root, b"/bin/busybox/", true), Err(Errno::ENOTDIR));
+        // . 和 .. 之前也必须是目录；符号链接的目标以 / 结尾时同样要求是目录
+        assert_eq!(r(&root, b"/bin/busybox/.", true), Err(Errno::ENOTDIR));
+        assert_eq!(r(&root, b"/bin/busybox/..", true), Err(Errno::ENOTDIR));
+        assert_eq!(r(&root, b"/slash", true), Err(Errno::ENOTDIR));
+        assert_eq!(
+            vfs.kind(ps, &r(&root, b"/slash", false).unwrap()).unwrap(),
+            mode::S_IFLNK
+        );
+        assert_eq!(
+            r(&root, b"/bindir/", false).unwrap(),
+            r(&root, b"/bin", true).unwrap()
+        );
+        assert_eq!(r(&root, b"/", true).unwrap(), root);
         assert_eq!(r(&root, b"", true), Err(Errno::ENOENT));
 
         let ubin = r(&root, b"/usr/bin", true).unwrap();
