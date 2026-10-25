@@ -396,6 +396,34 @@ fn memory_limit_and_thread_limits() {
 }
 
 #[test]
+fn main_stack_grows_up_to_rlimit_stack() {
+    // 缺页、syscall 的缓冲区和信号帧都让主线程栈长出来，大小受 RLIMIT_STACK 的当前值
+    // 限制；超出时缺页得到 SIGSEGV，内核访问得到 EFAULT
+    let Some(program) = build_c_guest("stack") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn ipc_timers_credentials_and_scheduling() {
     // System V 消息队列、信号量（SEM_UNDO）、共享内存跨 fork，POSIX 定时器（超限次数、
     // SIGEV_THREAD、CPU 时钟），mremap，降低权限之后的凭据规则，亲和性和实时策略，

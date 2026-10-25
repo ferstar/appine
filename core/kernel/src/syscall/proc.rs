@@ -62,8 +62,6 @@ const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_EMPTY_PATH: u32 = 0x1000;
 
-/// execve 的参数和环境变量最多占用的字节数（与初始栈的上限一致）。
-const MAX_ARG_BYTES: usize = (loader::STACK_SIZE / 4) as usize;
 /// 单个参数的最大长度（Linux 的 `MAX_ARG_STRLEN`）。
 const MAX_ARG_STRLEN: usize = 32 * 4096;
 /// `#!` 解释器最多嵌套的层数，与 Linux 一样超过时返回 ELOOP。
@@ -399,8 +397,14 @@ fn user_threads(k: &crate::kernel::Kernel, uid: u32) -> u64 {
         .sum()
 }
 
-/// 读取 execve 的 argv 或 envp：以 NULL 结尾的字符串指针数组。
-fn read_strings(cx: &Cx<'_>, addr: u64, total: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
+/// 读取 execve 的 argv 或 envp：以 NULL 结尾的字符串指针数组。字符串和指针一共超过
+/// `limit` 字节（[`loader::arg_limit`]）时返回 E2BIG。
+fn read_strings(
+    cx: &Cx<'_>,
+    addr: u64,
+    total: &mut usize,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, Errno> {
     let mut out = Vec::new();
     if addr == 0 {
         return Ok(out);
@@ -418,7 +422,7 @@ fn read_strings(cx: &Cx<'_>, addr: u64, total: &mut usize) -> Result<Vec<Vec<u8>
             }
         })?;
         *total += s.len() + 1 + 8;
-        if *total > MAX_ARG_BYTES {
+        if *total > limit {
             return Err(Errno::E2BIG);
         }
         out.push(s);
@@ -500,9 +504,11 @@ fn exec(
     envp: u64,
     flags: u32,
 ) -> Result<(), Errno> {
+    let mut stack_limit = cx.t.group.borrow().rlimits[process::RLIMIT_STACK as usize].0;
+    let limit = loader::arg_limit(stack_limit);
     let mut total = 0;
-    let mut argv = read_strings(cx, argv, &mut total)?;
-    let envp = read_strings(cx, envp, &mut total)?;
+    let mut argv = read_strings(cx, argv, &mut total, limit)?;
+    let envp = read_strings(cx, envp, &mut total, limit)?;
     // 与 Linux 5.18 起相同：argv 为空时补一个空字符串，新程序的 argc 至少是 1
     if argv.is_empty() {
         argv.push(Vec::new());
@@ -593,12 +599,19 @@ fn exec(
         setid(mode::S_ISUID).then_some(st.uid),
         setid(mode::S_ISGID | 0o010).then_some(st.gid),
     );
+    // 与 Linux 一样，setuid、setgid 程序的栈大小上限不超过默认值，免得调用者用它影响
+    // 新程序的地址空间布局；新的值在 execve 成功之后写回
+    let secure = new_cred.ruid != new_cred.euid || new_cred.rgid != new_cred.egid;
+    if secure {
+        stack_limit = stack_limit.min(loader::STACK_SIZE);
+    }
     let mut mm = Mm::new();
     let args = Args {
         argv: &argv,
         envp: &envp,
         execfn: &filename,
         ids: [new_cred.ruid, new_cred.euid, new_cred.rgid, new_cred.egid],
+        stack_limit,
     };
     let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cred, &root, &cwd, p);
     let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(load_error)?;
@@ -629,6 +642,7 @@ fn exec(
             g.dumpable = false;
         }
         g.cred = new_cred;
+        g.rlimits[process::RLIMIT_STACK as usize].0 = stack_limit;
         g.posix_timers.clear();
         // AIO 上下文的环在旧的地址空间里，随之消失
         let contexts = std::mem::take(&mut g.aio);

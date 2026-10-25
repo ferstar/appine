@@ -53,10 +53,13 @@ const AT_MINSIGSTKSZ: u64 = 51;
 
 /// 初始栈顶（不含），即 47 位地址空间的上界。
 pub const STACK_TOP: u64 = 1 << 47;
-/// 初始栈大小。
+/// 栈大小上限的默认值（`RLIMIT_STACK` 的默认软限制，Linux 的 `_STK_LIM`），也是加载时
+/// 在栈下面最多预留的宿主内存。
 pub const STACK_SIZE: u64 = 8 << 20;
-/// argv、envp 及其字符串最多占用的栈空间，超过时报 `E2BIG`。
-const MAX_ARG_BYTES: usize = (STACK_SIZE / 4) as usize;
+/// 初始栈在参数下面多映射的大小（Linux `setup_arg_pages` 的 `stack_expand`）。
+const STACK_EXPAND: u64 = 128 << 10;
+/// 栈大小上限再小，参数也至少能占这么多（Linux 的 `ARG_MAX`，32 页）。
+const ARG_MAX: u64 = 32 * PAGE_SIZE;
 /// 位置无关的主程序的加载基址：地址空间的 2/3，与 arm64 Linux 的 `ELF_ET_DYN_BASE` 取法相同。
 const ET_DYN_BASE: u64 = 0x5555_5555_0000;
 /// 解释器路径的最大长度。
@@ -114,6 +117,16 @@ pub struct Args<'a> {
     /// 新程序的真实和有效用户 ID、组 ID（`AT_UID` 等）。两组不同时（setuid、setgid
     /// 程序）设置 `AT_SECURE`。
     pub ids: [u32; 4],
+    /// 栈大小的上限（`RLIMIT_STACK` 的软限制）：决定地址空间的布局、参数最多占多少、
+    /// 初始栈映射多大。
+    pub stack_limit: u64,
+}
+
+/// argv、envp 的字符串和指针最多占用的栈空间，超过时报 `E2BIG`。与 Linux 的
+/// `bprm_stack_limits` 相同：栈大小上限的 1/4，不超过 6 MB（`_STK_LIM` 的 3/4），
+/// 不少于 [`ARG_MAX`]。
+pub fn arg_limit(stack_limit: u64) -> usize {
+    (STACK_SIZE / 4 * 3).min(stack_limit / 4).max(ARG_MAX) as usize
 }
 
 /// 加载结果：guest 开始执行时的 pc 和 sp，以及程序和解释器所在的地址范围。
@@ -475,6 +488,7 @@ pub fn load(
     read_interp: &mut ReadInterp<'_>,
 ) -> Result<Image, LoadError> {
     let exe = Elf::parse(file)?;
+    mm.set_layout(args.stack_limit);
     let bias = match exe.e_type {
         ET_DYN => ET_DYN_BASE - exe.span().0,
         _ => 0,
@@ -516,8 +530,6 @@ pub fn load(
     mm.vdso = vdso_base;
 
     mm.set_brk(main.end);
-    mm.map_anonymous(STACK_TOP - STACK_SIZE, STACK_SIZE, prot::READ | prot::WRITE)
-        .map_err(LoadError::Memory)?;
     let mut random = [0u8; 16];
     appine_hal::fill_random(&mut random).map_err(|e| LoadError::Memory(Errno(e)))?;
     // arm64 的 ARCH_DLINFO（AT_SYSINFO_EHDR、AT_MINSIGSTKSZ）排在最前面
@@ -576,10 +588,13 @@ struct StackLayout {
 /// STACK_TOP
 /// ```
 ///
+/// 栈先映射到参数下面再多 [`STACK_EXPAND`]（不超过栈大小的上限），之后按需向下增长
+/// （[`Mm::grow_down`]），与 Linux 的 `setup_arg_pages` 相同。
+///
 /// `auxv` 里 `AT_RANDOM`、`AT_EXECFN`、`AT_PLATFORM` 的值在这里填入。返回 sp，以及
 /// argv、envp 字符串所在的范围。
 fn build_stack(
-    mm: &Mm,
+    mm: &mut Mm,
     args: &Args<'_>,
     auxv: &[(u64, u64)],
     random: &[u8; 16],
@@ -591,11 +606,18 @@ fn build_stack(
         + extra.iter().map(|s| s.len() + 1).sum::<usize>()
         + random.len();
     let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * (auxv.len() + 1);
-    if strings + words * 8 > MAX_ARG_BYTES {
+    if strings + words * 8 > arg_limit(args.stack_limit) {
         return Err(LoadError::ArgumentsTooLong);
     }
 
     let strings_start = (STACK_TOP - 16 - strings as u64) & !15;
+    let sp = (strings_start - words as u64 * 8) & !15;
+    let used = STACK_TOP - (sp & !(PAGE_SIZE - 1));
+    let limit = args.stack_limit & !(PAGE_SIZE - 1);
+    let len = (used + STACK_EXPAND).min(limit).max(used);
+    mm.map_stack(len, limit.min(STACK_SIZE))
+        .map_err(LoadError::Memory)?;
+    mm.set_start_stack(sp);
     let mut cursor = strings_start;
     let mut put = |data: &[u8], nul: bool| -> Result<u64, LoadError> {
         let at = cursor;
@@ -633,7 +655,7 @@ fn build_stack(
     }
     table.extend([AT_NULL, 0]);
 
-    let sp = (strings_start - table.len() as u64 * 8) & !15;
+    debug_assert_eq!(table.len(), words);
     let bytes: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
     mm.write_kernel(sp, &bytes).map_err(LoadError::Memory)?;
     Ok(StackLayout {
@@ -776,6 +798,7 @@ mod tests {
             envp: &envp,
             execfn: b"/bin/prog",
             ids: [0; 4],
+            stack_limit: STACK_SIZE,
         };
         let image = load(
             &mut mm,
@@ -843,6 +866,7 @@ mod tests {
             envp: &[],
             execfn: b"prog",
             ids: [0; 4],
+            stack_limit: STACK_SIZE,
         };
         let image = load(&mut mm, &exe(&main), &args, &mut read_interp).unwrap();
         assert_eq!(requested, b"/lib/ld.so");
@@ -891,6 +915,7 @@ mod tests {
                 envp: &[],
                 execfn: b"",
                 ids: [0; 4],
+                stack_limit: STACK_SIZE,
             };
             let image = load(&mut mm, &file, &args, &mut no_interp).unwrap();
             assert!(mm.mmu().translate(0x41ffe8, prot::WRITE).is_some());
@@ -912,6 +937,7 @@ mod tests {
             envp: &[],
             execfn: b"",
             ids: [0; 4],
+            stack_limit: STACK_SIZE,
         };
         assert_eq!(
             load(&mut mm, &exe(b"#!/bin/sh\n"), &args, &mut no_interp),

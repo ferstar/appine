@@ -817,6 +817,38 @@ fn threads_max_limits_root_too() {
 }
 
 #[test]
+fn rlimit_stack_at_execve_sets_the_stack_and_layout() {
+    // 初始栈只映射参数下面再多 128 KB；参数最多占栈大小上限的 1/4（至少 128 KB）；不限
+    // 栈大小时 mmap 区让出 MAX_GAP（ld-musl 映射在 0x1555_5555_5000 以下）
+    let script = "grep stack /proc/self/maps; \
+                  (ulimit -s 1024; /bin/busybox true $(seq 20000) 2>/dev/null || echo E2BIG; \
+                   /bin/busybox true $(seq 10000) && echo small ok); \
+                  /bin/busybox true $(seq 20000) && echo default ok; \
+                  (ulimit -s unlimited; grep -m1 ld-musl /proc/self/maps); \
+                  grep -m1 ld-musl /proc/self/maps";
+    let start_of = |line: &str| u64::from_str_radix(line.split('-').next().unwrap(), 16).unwrap();
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        let text = shell(tier, &out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 6, "tier {tier}: {text}");
+        let (lo, hi) = lines[0].split_once(' ').unwrap().0.split_once('-').unwrap();
+        let (lo, hi) = (
+            u64::from_str_radix(lo, 16).unwrap(),
+            u64::from_str_radix(hi, 16).unwrap(),
+        );
+        assert!(lines[0].ends_with("[stack]"), "tier {tier}: {text}");
+        assert!(hi == 1 << 47 && hi - lo <= 256 << 10, "tier {tier}: {text}");
+        assert_eq!(
+            &lines[1..4],
+            ["E2BIG", "small ok", "default ok"],
+            "tier {tier}"
+        );
+        assert!(start_of(lines[4]) < 0x1555_5555_5000, "tier {tier}: {text}");
+        assert!(start_of(lines[5]) > 0x7f00_0000_0000, "tier {tier}: {text}");
+    }
+}
+
+#[test]
 fn lowering_oom_score_adj_needs_cap_sys_resource() {
     // 普通用户能调高 oom_score_adj、再调回下限，不能调到下限以下；root 写的值成为新的
     // 下限，su 之后继承

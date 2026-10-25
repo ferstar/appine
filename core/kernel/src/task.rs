@@ -383,8 +383,8 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 signal::force(cx, Signal::BUS, info);
                 return signal::deliver(cx, cpu, false);
             }
-            // 向下增长的映射（MAP_GROWSDOWN）长到这里：重新执行
-            if cx.mm_mut().grow_down(addr) {
+            // 向下增长的映射（主线程栈、MAP_GROWSDOWN）长到这里：重新执行
+            if cx.grow_stack(addr) {
                 return signal::deliver(cx, cpu, false);
             }
             let mapped = cx.mm().is_mapped(addr);

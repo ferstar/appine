@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
 
 use crate::errno::Errno;
+use crate::loader::{STACK_SIZE, STACK_TOP};
 use crate::task::TaskSync;
 use crate::uaccess::UserSlice;
 
@@ -46,8 +47,11 @@ pub mod flags {
     pub const MAP_FIXED_NOREPLACE: u32 = 0x10_0000;
 }
 
-/// mmap 分配区的上界：栈下方留出 1 GiB 的间隔。
-const MMAP_TOP: u64 = crate::loader::STACK_TOP - crate::loader::STACK_SIZE - (1 << 30);
+/// 栈顶和 mmap 分配区上界之间至少留的间隔：默认的栈大小上限再加 1 GiB。Linux 是
+/// 128 MB 加上栈的随机偏移（arm64 上最多约 1 GB）。
+const MIN_GAP: u64 = STACK_SIZE + (1 << 30);
+/// 这个间隔的上限，与 Linux 的 `MAX_GAP` 相同。
+const MAX_GAP: u64 = STACK_TOP / 6 * 5;
 /// 最低可分配地址，与 Linux 的 mmap_min_addr 默认值相同。
 const MMAP_MIN: u64 = 0x10000;
 /// 向下增长的映射与下面的映射之间至少要留的间隔（Linux 的 `stack_guard_gap`，256 页）。
@@ -237,6 +241,13 @@ pub struct Mm {
     pub args: (u64, u64),
     /// 初始栈上 envp 字符串的范围（`/proc/<pid>/environ`）。
     pub env: (u64, u64),
+    /// mmap 分配区的上界（不含），按 execve 时的 `RLIMIT_STACK` 定下（[`Mm::set_layout`]）。
+    mmap_top: u64,
+    /// 初始的栈指针（Linux 的 `start_stack`）：`/proc/<pid>/maps` 把包含它的栈标成
+    /// `[stack]`。
+    start_stack: u64,
+    /// 主线程栈目前的底部；还没有栈时是 0。
+    stack_low: u64,
 }
 
 /// `/proc/<pid>/maps` 的一行。
@@ -326,7 +337,21 @@ impl Mm {
             vdso: 0,
             args: (0, 0),
             env: (0, 0),
+            mmap_top: STACK_TOP - MIN_GAP,
+            start_stack: 0,
+            stack_low: 0,
         }
+    }
+
+    /// 按栈大小的上限 `stack_limit`（execve 时的 `RLIMIT_STACK`）定下 mmap 分配区的
+    /// 上界，与 Linux 的 `mmap_base` 一样给栈留出这么大的间隔，再加上
+    /// [`STACK_GUARD_GAP`]，并限制在 [`MIN_GAP`] 和 [`MAX_GAP`] 之间。不限时，Linux
+    /// 改为自底向上分配（legacy 布局），这里仍然自顶向下，间隔取 [`MAX_GAP`]。
+    pub fn set_layout(&mut self, stack_limit: u64) {
+        let gap = stack_limit
+            .saturating_add(STACK_GUARD_GAP)
+            .clamp(MIN_GAP, MAX_GAP);
+        self.mmap_top = (STACK_TOP - gap) & !(PAGE_SIZE - 1);
     }
 
     /// 该地址空间的软件页表。
@@ -431,8 +456,8 @@ impl Mm {
 
     /// 自顶向下找一段长度为 `len` 的空闲区间。
     pub fn find_free(&self, len: u64) -> Option<u64> {
-        let mut top = MMAP_TOP;
-        for (&s, v) in self.vmas.range(..MMAP_TOP).rev() {
+        let mut top = self.mmap_top;
+        for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
             let end = s + v.len;
             if end <= top && top - end >= len {
                 return Some(top - len);
@@ -597,11 +622,39 @@ impl Mm {
         }
     }
 
-    /// guest 访问没有映射的 `addr` 出错时调用：它上面紧挨着的是向下增长的映射时，把映射
-    /// 延伸到 `addr` 所在的页，返回 true，重新执行那条指令即可。与 Linux 一样，延伸之后
-    /// 与下面那个可访问的映射之间要留出 [`STACK_GUARD_GAP`]，否则不增长（SIGSEGV）。
-    /// 长出来的部分是一个新的 VMA，也向下增长；宿主内存不必连续。
-    pub fn grow_down(&mut self, addr: u64) -> bool {
+    /// 映射主线程的初始栈 `[STACK_TOP - len, STACK_TOP)`（加载器使用）：可读写，向下增长。
+    /// 宿主内存在它下面预留到一共 `reserve` 字节（不碰不占内存），栈在这个范围里增长时
+    /// 只是就地加长同一个 VMA。
+    pub fn map_stack(&mut self, len: u64, reserve: u64) -> Result<(), Errno> {
+        let start = STACK_TOP - len;
+        if !self.is_free(start, len) {
+            return Err(Errno::EEXIST);
+        }
+        let (region, base) = Self::new_anonymous(reserve.max(len), false)?;
+        // SAFETY: 这段宿主内存至少有 len 字节
+        let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
+        let rw = prot::READ | prot::WRITE;
+        self.insert(start, len, rw, Backing::Anonymous, true, region, host)?;
+        self.vmas.get_mut(&start).unwrap().growsdown = true;
+        self.stack_low = start;
+        Ok(())
+    }
+
+    /// 主线程栈目前的底部；还没有栈时是 0。
+    pub fn stack_low(&self) -> u64 {
+        self.stack_low
+    }
+
+    /// 访问没有映射的 `addr`（guest 的访存出错，或者内核访问 guest 内存之前）时调用：
+    /// 它上面紧挨着的是向下增长的映射（主线程栈、`MAP_GROWSDOWN`）时，把映射延伸到
+    /// `addr` 所在的页，返回 true。与 Linux 的 `expand_downwards` 一样，延伸之后与下面
+    /// 那个可访问的映射之间要留出 [`STACK_GUARD_GAP`]，大小不能超过 `limit`
+    /// （`RLIMIT_STACK` 的当前值），否则不增长（guest 收到 SIGSEGV，内核访问得到 EFAULT）。
+    ///
+    /// 宿主内存下面还有预留的空间时就地加长这个 VMA。没有时另外申请一段，长出来的部分
+    /// 是一个新的 VMA，宿主内存在它下面预留到与栈现在的大小相同：栈越长，VMA 的个数只按
+    /// 对数增加。
+    pub fn grow_down(&mut self, addr: u64, limit: u64) -> bool {
         let page = addr & !(PAGE_SIZE - 1);
         if page < MMAP_MIN || self.is_mapped(addr) {
             return false;
@@ -620,7 +673,87 @@ impl Mm {
         {
             return false;
         }
-        if self.map_anonymous(page, above - page, prot).is_err() {
+        // 只是因为宿主内存不连续才分开的几个 VMA，在 Linux 上是同一个
+        let mut end = above;
+        for (&s, o) in self.vmas.range(above..) {
+            if s != end || !o.growsdown || o.prot != prot {
+                break;
+            }
+            end = s + o.len;
+        }
+        let (grow, size) = (above - page, end - above);
+        if size + grow > limit {
+            return false;
+        }
+        let grown = if self.spare_below(above) >= grow {
+            self.extend_down(above, grow)
+        } else {
+            let reserve = size.clamp(grow, limit - size);
+            self.new_stack_chunk(page, grow, reserve, prot, locked)
+        };
+        if grown && above == self.stack_low {
+            self.stack_low = page;
+        }
+        grown
+    }
+
+    /// VMA `start` 的宿主内存下面还空着、可以就地向下加长的字节数：同一段宿主内存里
+    /// 别的 VMA（拆开的、被 mremap 搬走的部分）占着的不算。
+    fn spare_below(&self, start: u64) -> u64 {
+        let v = &self.vmas[&start];
+        let host = v.host.as_ptr() as usize;
+        let low = self
+            .vmas
+            .values()
+            .filter(|o| Rc::ptr_eq(&o.region, &v.region))
+            .map(|o| o.host.as_ptr() as usize + o.len as usize)
+            .filter(|&end| end <= host)
+            .fold(v.region.base.as_ptr() as usize, usize::max);
+        (host - low) as u64
+    }
+
+    /// 向下增长的 VMA `start` 就地往下加长 `grow` 字节，用它的宿主内存下面空着的部分
+    /// （[`Mm::spare_below`]）。
+    fn extend_down(&mut self, start: u64, grow: u64) -> bool {
+        let v = &self.vmas[&start];
+        let (page, prot) = (start - grow, v.prot);
+        // SAFETY: v.host 下面至少还有 grow 字节属于同一段宿主内存，没有别的映射在用
+        let host = unsafe { NonNull::new_unchecked(v.host.as_ptr().sub(grow as usize)) };
+        // 栈的下面一段解除映射之后又长回来：以前写过的内容要变回零
+        unsafe { discard_host(host, grow as usize) };
+        if Self::map_pages(&mut self.mmu, page, host, grow, prot).is_err() {
+            return false;
+        }
+        let mut v = self.vmas.remove(&start).unwrap();
+        v.host = host;
+        v.len += grow;
+        v.file_len += grow;
+        self.vmas.insert(page, v);
+        true
+    }
+
+    /// 在 `page` 映射 `grow` 字节的新 VMA，接在上面那个向下增长的 VMA 下面。宿主内存申请
+    /// `reserve` 字节，VMA 放在最上面，下面留着以后就地增长；申请不到时只申请 `grow` 字节。
+    fn new_stack_chunk(
+        &mut self,
+        page: u64,
+        grow: u64,
+        reserve: u64,
+        prot: u32,
+        locked: bool,
+    ) -> bool {
+        let Ok((region, base)) =
+            Self::new_anonymous(reserve, false).or_else(|_| Self::new_anonymous(grow, false))
+        else {
+            return false;
+        };
+        // SAFETY: 这段宿主内存至少有 grow 字节
+        let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - grow as usize)) };
+        let anon = Backing::Anonymous;
+        if self
+            .insert(page, grow, prot, anon, true, region, host)
+            .is_err()
+        {
             return false;
         }
         let v = self.vmas.get_mut(&page).unwrap();
@@ -660,7 +793,7 @@ impl Mm {
         } else {
             let hint = addr & !(PAGE_SIZE - 1);
             if hint >= MMAP_MIN
-                && hint.checked_add(len).is_some_and(|e| e <= MMAP_TOP)
+                && hint.checked_add(len).is_some_and(|e| e <= self.mmap_top)
                 && self.is_free(hint, len)
             {
                 hint
@@ -883,7 +1016,7 @@ impl Mm {
             }
             return Ok(old);
         }
-        if old_end == vma_end && old_end + grow <= MMAP_TOP && self.is_free(old_end, grow) {
+        if old_end == vma_end && old_end + grow <= self.mmap_top && self.is_free(old_end, grow) {
             let e = extension(self)?.unwrap();
             self.insert_vma(old_end, e)?;
             return Ok(old);
@@ -1362,6 +1495,15 @@ impl Mm {
         child.args = self.args;
         child.env = self.env;
         child.exe = self.exe;
+        child.mmap_top = self.mmap_top;
+        child.start_stack = self.start_stack;
+        child.stack_low = self.stack_low;
+        let spare: BTreeMap<u64, u64> = self
+            .vmas
+            .iter()
+            .filter(|(_, v)| v.growsdown && v.backing == Backing::Anonymous)
+            .map(|(&s, _)| (s, self.spare_below(s)))
+            .collect();
         for (&start, v) in self.vmas.iter_mut() {
             let share = match v.backing {
                 Backing::Shared => true,
@@ -1379,15 +1521,22 @@ impl Mm {
                 let heap = start == page_up(self.brk_start).unwrap_or(0)
                     && v.backing == Backing::Anonymous
                     && v.len <= HEAP_RESERVE;
+                let below = spare.get(&start).copied().unwrap_or(0);
                 let (region, host) = if heap {
                     Self::new_anonymous(HEAP_RESERVE, false)?
+                } else if below > 0 {
+                    // 栈下面预留的宿主内存也照样留着
+                    let (region, base) = Self::new_anonymous(below + v.len, false)?;
+                    // SAFETY: 这段宿主内存有 below + v.len 字节
+                    let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(below as usize)) };
+                    (region, host)
                 } else {
                     Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?
                 };
                 let len = v.file_len as usize;
                 if v.backing == Backing::Anonymous && v.written.get() {
-                    // 匿名内存里宿主从没碰过的页一定是零：只看碰过的（栈的 VMA 有 8 MB，
-                    // 用到的只是顶上一点）
+                    // 匿名内存里宿主从没碰过的页一定是零：只看碰过的（malloc 的大块、
+                    // MAP_NORESERVE 的预留常常只碰过一小部分）
                     let touched = appine_hal::touched_pages(v.host.as_ptr(), len);
                     // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
                     unsafe {
@@ -1409,6 +1558,7 @@ impl Mm {
             c.file_id = v.file_id;
             c.file = v.file.clone();
             c.shm = v.shm;
+            c.growsdown = v.growsdown;
             child.trim_to_file(start)?;
         }
         Ok(child)
@@ -1483,13 +1633,37 @@ impl Mm {
         }
     }
 
+    /// 记下初始的栈指针（加载器使用）。
+    pub fn set_start_stack(&mut self, sp: u64) {
+        self.start_stack = sp;
+    }
+
+    /// `/proc/<pid>/maps` 里标成 `[stack]` 的范围：与 Linux 一样是包含初始栈指针的映射，
+    /// 加上它下面接着的、向下增长而且权限相同的 VMA（宿主内存不连续时栈长出来的部分）。
+    fn stack_range(&self) -> Option<(u64, u64)> {
+        let sp = self.start_stack;
+        let (&s, v) = self
+            .vmas
+            .range(..=sp)
+            .next_back()
+            .filter(|&(&s, v)| sp != 0 && sp < s + v.len)?;
+        let mut low = s;
+        for (&b, o) in self.vmas.range(..s).rev() {
+            if b + o.len != low || !o.growsdown || o.prot != v.prot {
+                break;
+            }
+            low = b;
+        }
+        Some((low, s + v.len))
+    }
+
     /// 所有映射，按地址排列；栈、堆和 vDSO 按 Linux 的习惯命名。相邻、权限相同的匿名映射（或者同一个文件里接着的部分）与 Linux 一样合成一段：
     /// 每次匿名 mmap 都是单独的宿主内存，VMA 合不起来，python 跑一会儿就有几百个。
     pub fn regions(&self) -> Vec<Region> {
-        let stack = crate::loader::STACK_TOP - crate::loader::STACK_SIZE;
+        let stack = self.stack_range();
         let mut out: Vec<Region> = Vec::new();
         let regions = self.vmas.iter().map(|(&s, v)| {
-            let special: Option<&[u8]> = if s == stack {
+            let special: Option<&[u8]> = if stack.is_some_and(|(lo, hi)| (lo..hi).contains(&s)) {
                 Some(b"[stack]")
             } else if s == self.vdso {
                 Some(b"[vdso]")
@@ -1892,7 +2066,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(a + 4 * PAGE_SIZE <= MMAP_TOP);
+        assert!(a + 4 * PAGE_SIZE <= mm.mmap_top);
         mm.write_kernel(a + 3 * PAGE_SIZE, b"tail").unwrap();
 
         // 中间挖掉一页：两侧仍然可用，数据不变；宿主内存要等 shootdown 之后才释放
@@ -2220,19 +2394,97 @@ mod tests {
             .unwrap();
         mm.set_growsdown(top - PAGE_SIZE);
         // 访问下面隔了几页的地址：一直长到那里，长出来的部分还能接着长
-        assert!(mm.grow_down(top - 5 * PAGE_SIZE + 8));
+        assert!(mm.grow_down(top - 5 * PAGE_SIZE + 8, u64::MAX));
         mm.write(UserSlice::new(top - 5 * PAGE_SIZE, 2), b"ok")
             .unwrap();
-        assert!(mm.grow_down(top - 6 * PAGE_SIZE));
+        assert!(mm.grow_down(top - 6 * PAGE_SIZE, u64::MAX));
         // 已经映射的地址、不向下增长的映射下面都不增长
-        assert!(!mm.grow_down(top - 6 * PAGE_SIZE));
+        assert!(!mm.grow_down(top - 6 * PAGE_SIZE, u64::MAX));
         mm.mmap(base, PAGE_SIZE, RW, fixed, None).unwrap();
-        assert!(!mm.grow_down(base - PAGE_SIZE));
+        assert!(!mm.grow_down(base - PAGE_SIZE, u64::MAX));
         // 离下面那个映射不到 256 页：不增长；它是 PROT_NONE 时不算
         let guard_end = base + PAGE_SIZE + STACK_GUARD_GAP;
-        assert!(!mm.grow_down(guard_end - PAGE_SIZE));
+        assert!(!mm.grow_down(guard_end - PAGE_SIZE, u64::MAX));
         mm.mprotect(base, PAGE_SIZE, 0).unwrap();
-        assert!(mm.grow_down(guard_end - PAGE_SIZE));
+        assert!(mm.grow_down(guard_end - PAGE_SIZE, u64::MAX));
+        // fork 之后子进程里的也照样增长
+        let mut child = mm.fork().unwrap();
+        assert!(child.grow_down(guard_end - 2 * PAGE_SIZE, u64::MAX));
+    }
+
+    #[test]
+    fn stack_grows_in_place_until_its_reservation_runs_out() {
+        let mut mm = Mm::new();
+        mm.map_stack(2 * PAGE_SIZE, 16 * PAGE_SIZE).unwrap();
+        mm.set_start_stack(STACK_TOP - 16);
+        mm.write(UserSlice::new(STACK_TOP - 4, 4), b"top!").unwrap();
+        // 预留的范围里：还是同一个 VMA，原来的内容不变
+        assert!(mm.grow_down(STACK_TOP - 10 * PAGE_SIZE + 100, u64::MAX));
+        assert_eq!(mm.vmas.len(), 1);
+        assert_eq!(mm.stack_low(), STACK_TOP - 10 * PAGE_SIZE);
+        mm.write(UserSlice::new(STACK_TOP - 10 * PAGE_SIZE, 2), b"lo")
+            .unwrap();
+        let mut buf = [0u8; 4];
+        mm.read(UserSlice::new(STACK_TOP - 4, 4), &mut buf).unwrap();
+        assert_eq!(&buf, b"top!");
+        assert!(mm.grow_down(STACK_TOP - 16 * PAGE_SIZE, u64::MAX));
+        assert_eq!(mm.vmas.len(), 1);
+        // 超出预留：新的一段，下面再预留到和栈一样大，接着就地增长
+        assert!(mm.grow_down(STACK_TOP - 17 * PAGE_SIZE, u64::MAX));
+        assert!(mm.grow_down(STACK_TOP - 32 * PAGE_SIZE, u64::MAX));
+        assert_eq!(mm.vmas.len(), 2);
+        assert!(mm.grow_down(STACK_TOP - 33 * PAGE_SIZE, u64::MAX));
+        assert_eq!(mm.vmas.len(), 3);
+        // maps 里仍然是一行 [stack]
+        let regions = mm.regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            (regions[0].start, regions[0].end),
+            (STACK_TOP - 33 * PAGE_SIZE, STACK_TOP)
+        );
+        assert_eq!(regions[0].name.as_deref(), Some(&b"[stack]"[..]));
+    }
+
+    #[test]
+    fn stack_growth_stops_at_the_limit() {
+        let mut mm = Mm::new();
+        mm.map_stack(2 * PAGE_SIZE, 4 * PAGE_SIZE).unwrap();
+        // 长完之后的大小按分开的几段合起来算
+        assert!(!mm.grow_down(STACK_TOP - 9 * PAGE_SIZE, 8 * PAGE_SIZE));
+        assert!(mm.grow_down(STACK_TOP - 6 * PAGE_SIZE, 8 * PAGE_SIZE));
+        assert!(!mm.grow_down(STACK_TOP - 9 * PAGE_SIZE, 8 * PAGE_SIZE));
+        assert!(mm.grow_down(STACK_TOP - 8 * PAGE_SIZE, 8 * PAGE_SIZE));
+        assert_eq!(mm.vmas.len(), 3);
+        // 上限调高之后接着长
+        assert!(mm.grow_down(STACK_TOP - 9 * PAGE_SIZE, 9 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn fork_keeps_the_reservation_below_the_stack() {
+        let mut mm = Mm::new();
+        mm.map_stack(2 * PAGE_SIZE, 16 * PAGE_SIZE).unwrap();
+        mm.write(UserSlice::new(STACK_TOP - 2, 2), b"hi").unwrap();
+        let mut child = mm.fork().unwrap();
+        assert_eq!(child.stack_low(), STACK_TOP - 2 * PAGE_SIZE);
+        assert!(child.grow_down(STACK_TOP - 16 * PAGE_SIZE, u64::MAX));
+        assert_eq!(child.vmas.len(), 1);
+        let mut buf = [0u8; 2];
+        child
+            .read(UserSlice::new(STACK_TOP - 2, 2), &mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"hi");
+    }
+
+    #[test]
+    fn mmap_area_leaves_room_for_the_stack_limit() {
+        let mut mm = Mm::new();
+        let default = mm.mmap_top;
+        mm.set_layout(STACK_SIZE);
+        assert_eq!(mm.mmap_top, default);
+        mm.set_layout(4 << 30);
+        assert_eq!(mm.mmap_top, STACK_TOP - (4 << 30) - STACK_GUARD_GAP);
+        mm.set_layout(u64::MAX);
+        assert_eq!(mm.mmap_top, (STACK_TOP - MAX_GAP) & !(PAGE_SIZE - 1));
     }
 
     #[test]

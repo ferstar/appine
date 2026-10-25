@@ -159,6 +159,7 @@ impl Machine {
             envp,
             execfn: program,
             ids: [0; 4],
+            stack_limit: loader::STACK_SIZE,
         };
         let mut mm = Mm::new();
         let mut read_interp = |p: &[u8]| match &vfs {

@@ -935,6 +935,8 @@ fn setup_frame(
     // 帧记录：让栈回溯能越过信号帧
     w64(&mut b, FRAME_SIZE, st.x[29]);
     w64(&mut b, FRAME_SIZE + 8, st.x[30]);
+    // 帧落到栈的底部下面时，与 Linux 的缺页处理一样先让栈长下来
+    cx.grow_stack(frame);
     cx.mm().write(UserSlice::new(frame, b.len()), &b)?;
 
     if alt.flags & ss::AUTODISARM != 0 {

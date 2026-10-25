@@ -396,6 +396,27 @@ impl<'a> Cx<'a> {
         self.t.mm.borrow_mut()
     }
 
+    /// 让 `addr` 上面紧挨着的向下增长的映射（主线程栈、`MAP_GROWSDOWN`）长到它所在的页，
+    /// 大小不超过 `RLIMIT_STACK` 的当前值（[`Mm::grow_down`]）。
+    pub fn grow_stack(&self, addr: u64) -> bool {
+        let limit = self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0;
+        self.mm_mut().grow_down(addr, limit)
+    }
+
+    /// syscall 入口：SP 已经低于主线程栈的底部（程序分配了大的栈帧但还没碰）时，先让栈
+    /// 长到 SP。syscall 用到的栈上缓冲区都在 SP 以上（arm64 没有 red zone），这样内核
+    /// 访问它们时与 Linux 一样不会 EFAULT。SP 在栈里（常见情况）只比较一次。
+    pub fn grow_stack_to(&self, sp: u64) {
+        if sp >= self.mm().stack_low() {
+            return;
+        }
+        let limit = self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0;
+        // 别的线程的栈在 mmap 区里，离主线程栈远得多：不用查
+        if crate::loader::STACK_TOP - sp <= limit {
+            self.mm_mut().grow_down(sp, limit);
+        }
+    }
+
     /// fd 表。
     pub fn fds(&self) -> Ref<'_, FdTable> {
         self.t.fds.borrow()

@@ -70,6 +70,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     state.orig_x0 = state.x[0];
     let nr = state.x[8];
     let a: [u64; 6] = state.x[..6].try_into().unwrap();
+    cx.grow_stack_to(state.sp);
     let started = debug::trace_start();
     use xattr::Target::{Fd, Path};
 
