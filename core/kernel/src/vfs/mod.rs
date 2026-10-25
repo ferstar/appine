@@ -230,6 +230,19 @@ impl Vfs {
         path: &[u8],
         follow: bool,
     ) -> Result<(Node, Option<Dentry>), Errno> {
+        self.store
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow))
+    }
+
+    fn walk_in(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<(Node, Option<Dentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }

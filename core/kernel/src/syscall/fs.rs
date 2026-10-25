@@ -1405,16 +1405,20 @@ fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128]
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         file_stat(cx, &cx.fds().get(dirfd)?)
     } else {
-        let cred = cx.cred();
-        let node = lookup_at_or_fd(
-            cx,
-            &cred,
-            dirfd,
-            path,
-            flags,
-            flags & AT_SYMLINK_NOFOLLOW == 0,
-        )?;
-        node_stat(cx, &node)
+        // 解析和取属性共用一个读事务（只在缓存没命中时才真正开始）
+        let vfs = cx.vfs()?;
+        vfs.store().snapshot(|_| {
+            let cred = cx.cred();
+            let node = lookup_at_or_fd(
+                cx,
+                &cred,
+                dirfd,
+                path,
+                flags,
+                flags & AT_SYMLINK_NOFOLLOW == 0,
+            )?;
+            node_stat(cx, &node)
+        })
     }
 }
 

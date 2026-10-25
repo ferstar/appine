@@ -33,7 +33,9 @@
 #ifdef DBT_SUPPORTED
 
 #include <pthread.h>
+#include <stdio.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #define BIT(x, n) ((unsigned)(((x) >> (n)) & 1u))
 #define FIELD(x, hi, lo) ((unsigned)(((x) >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1)))
@@ -1436,6 +1438,36 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
     pthread_mutex_unlock(&templates.lock);
 }
 
+/*
+ * 剖析用：环境变量 APPINE_PERF_MAP 存在时，把每个块在代码缓存里的位置写进
+ * /tmp/perf-<pid>.map，perf report 据此把样本记到 guest pc 上（g_<pc>）。没有这个
+ * 变量时只多一次判断。
+ */
+static void perf_map(const void *code, size_t bytes, uint64_t pc)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static FILE *file;
+    static int enabled = -1;
+    if (__atomic_load_n(&enabled, __ATOMIC_RELAXED) == 0)
+        return;
+    pthread_mutex_lock(&lock);
+    if (__atomic_load_n(&enabled, __ATOMIC_RELAXED) < 0) {
+        int on = getenv("APPINE_PERF_MAP") != NULL;
+        if (on) {
+            char path[64];
+            snprintf(path, sizeof path, "/tmp/perf-%d.map", (int)getpid());
+            file = fopen(path, "w");
+        }
+        __atomic_store_n(&enabled, on, __ATOMIC_RELAXED);
+    }
+    if (file) {
+        fprintf(file, "%lx %zx g_%lx\n", (unsigned long)(uintptr_t)code, bytes,
+                (unsigned long)pc);
+        fflush(file);
+    }
+    pthread_mutex_unlock(&lock);
+}
+
 static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc)
 {
     /* 块不跨页（遇到页边界就结束），整页的权限相同 */
@@ -1453,6 +1485,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
     const uint32_t *guest = page + (pc & PAGE_MASK) / 4;
     uint32_t *code = template_copy(d, pc, guest);
     if (code) {
+        perf_map(code, (size_t)(d->cache + d->used_words - code) * 4, pc);
         sync_range(d, code, d->cache + d->used_words);
         table_insert(d, pc, code);
         d->stats.blocks++;
@@ -1522,6 +1555,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
     template_store(pc, guest, nguest, x, &before);
     code = x->buf;
     size_t words = x->n;
+    perf_map(code, words * 4, pc);
     sync_range(d, code, code + words);
     d->used_words += words;
     table_insert(d, pc, code);

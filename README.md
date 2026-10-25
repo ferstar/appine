@@ -77,6 +77,11 @@ scripts/dev scripts/ltp 'fcntl.*|mmap.*'   # only the tests whose name matches
 `APPINE_STRACE=1` makes `appine-run` print every syscall with its arguments and result,
 which helps when a test fails.
 
+To profile, run `appine-run` under `perf record` with `APPINE_PERF_MAP=1`: tier 1 then writes
+`/tmp/perf-<pid>.map`, and `perf report` attributes samples in translated code to guest
+addresses (`g_<pc>`). `--stats` prints how many blocks were translated and why translated code
+exited.
+
 ### Differential tests
 
 `scripts/difftest` runs each script in `tests/diff` both in appine and in a native arm64

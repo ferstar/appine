@@ -1126,11 +1126,18 @@ impl Mm {
                 (v.region.clone(), v.host)
             } else {
                 let (region, host) = Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?;
-                if v.backing != Backing::Anonymous || v.written.get() {
+                let len = v.file_len as usize;
+                if v.backing == Backing::Anonymous && v.written.get() {
+                    // 匿名内存里宿主从没碰过的页一定是零：只看碰过的（栈的 VMA 有 8 MB，
+                    // 用到的只是顶上一点）
+                    let touched = appine_hal::touched_pages(v.host.as_ptr(), len);
                     // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
                     unsafe {
-                        copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize)
+                        copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), len, touched.as_deref())
                     };
+                } else if v.backing != Backing::Anonymous {
+                    // SAFETY: 同上
+                    unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), len, None) };
                 }
                 (region, host)
             };
@@ -1153,7 +1160,7 @@ impl Mm {
         let v = &self.vmas[&start];
         let (region, host) = Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?;
         // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
-        unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize) };
+        unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
         // 超出文件末尾的页仍然不进页表
         let (file_len, p) = (v.file_len, v.prot);
         Self::map_pages(&mut self.mmu, start, host, file_len, p)?;
@@ -1384,9 +1391,13 @@ impl Default for Mm {
 /// # Safety
 ///
 /// `src` 和 `dst` 都必须指向至少 `len` 字节、互不重叠的可访问内存，`len` 是页大小的整数倍。
-unsafe fn copy_nonzero_pages(src: *const u8, dst: *mut u8, len: usize) {
+/// `touched` 是每页有没有被碰过（[`appine_hal::touched_pages`]），没碰过的页不看。
+unsafe fn copy_nonzero_pages(src: *const u8, dst: *mut u8, len: usize, touched: Option<&[bool]>) {
     const PAGE: usize = PAGE_SIZE as usize;
-    for off in (0..len).step_by(PAGE) {
+    for (i, off) in (0..len).step_by(PAGE).enumerate() {
+        if touched.is_some_and(|t| !t[i]) {
+            continue;
+        }
         let page = unsafe { std::slice::from_raw_parts(src.add(off), PAGE) };
         let (head, words, tail) = unsafe { page.align_to::<u64>() };
         let zero = head.iter().all(|&b| b == 0)

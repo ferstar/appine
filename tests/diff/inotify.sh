@@ -129,12 +129,12 @@ int main(void)
     printf("fionread %d short read %zd %d\n", avail, read(in, buf, 8), errno);
     drain("after errors");
 
-    /* 阻塞读：子进程过一会儿新建文件 */
+    /* 阻塞读：子进程过一会儿新建目录（只产生一个事件，结果不依赖父进程醒来的时机） */
     fcntl(in, F_SETFL, 0);
     pid_t pid = fork();
     if (pid == 0) {
         usleep(100000);
-        close(open("d/late", O_CREAT | O_WRONLY, 0644));
+        mkdir("d/late", 0755);
         _exit(0);
     }
     struct pollfd p = {in, POLLIN, 0};
@@ -147,7 +147,7 @@ int main(void)
     printf("\n");
     waitpid(pid, NULL, 0);
     fcntl(in, F_SETFL, O_NONBLOCK);
-    unlink("d/late");
+    rmdir("d/late");
     inotify_rm_watch(in, wd_dir);
     drain("rm_watch");
     return 0;

@@ -8,10 +8,18 @@
 //!
 //! 删除最后一个链接时，普通文件的 object 立即删除（已经打开的宿主文件仍然可用），
 //! inode 行以 nlink = 0 留下来，让打开着它的 fd 还能 fstat；下次打开仓库时清理。
+//!
+//! 路径解析和 stat 走内存里的元数据缓存（目录项，包括不存在的名字；inode 行；符号
+//! 链接目标），不逐级查询数据库。自己的写入只去掉受影响的条目。多个 appine 进程可以
+//! 共用一个仓库，所以 `lock` 文件的前 8 字节是所有进程共享映射的计数器：每次提交之后
+//! 加一；缓存发现它不是因为自己的提交而变了，就整体作废。
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -110,6 +118,87 @@ pub struct Store {
     /// 仓库目录里的 `lock` 文件。每个使用仓库的进程持有它的共享锁，只有独占使用时
     /// 才清理已删除的 inode：别的进程可能还打开着它们。
     lock: File,
+    /// `lock` 文件开头的提交计数器（模块文档）。
+    commits: Commits,
+    cache: RefCell<Cache>,
+    /// 正在写事务里：读到的可能是还没提交的内容，不用缓存。
+    writing: Cell<bool>,
+    /// [`Store::snapshot`] 里：还没开始读事务时是 Some(None)，开始时的提交计数是
+    /// Some(Some(n))。
+    snapshot_at: Cell<Option<Option<u64>>>,
+    /// 这次写入改了的目录项和 inode 行，提交之后从缓存里去掉。
+    touched: RefCell<Touched>,
+    /// `objects` 目录（宿主 `O_PATH`），按 inode 编号 stat object 不必解析整个路径。
+    objects_dir: std::os::fd::OwnedFd,
+}
+
+/// 写入改了的东西（[`Store::written`]）。
+#[derive(Default)]
+struct Touched {
+    names: Vec<(Ino, Vec<u8>)>,
+    inos: Vec<Ino>,
+}
+
+/// 元数据缓存。条目对应提交计数为 `generation` 时数据库的内容。
+#[derive(Default)]
+struct Cache {
+    generation: u64,
+    entries: usize,
+    /// 目录 → 名字 → inode（None 表示不存在）。
+    dentries: HashMap<Ino, HashMap<Vec<u8>, Option<Ino>>>,
+    rows: HashMap<Ino, Stat>,
+    targets: HashMap<Ino, Vec<u8>>,
+    parents: HashMap<Ino, Ino>,
+    /// 目录的完整列表（readdir）。
+    listings: HashMap<Ino, Vec<DirEntry>>,
+}
+
+impl Cache {
+    /// 条目数的上限：超过就整体清空。
+    const MAX_ENTRIES: usize = 1 << 17;
+
+    fn clear(&mut self, generation: u64) {
+        *self = Cache {
+            generation,
+            ..Cache::default()
+        };
+    }
+}
+
+/// 共享映射的提交计数器。
+struct Commits {
+    map: appine_hal::FileMapping,
+}
+
+impl Commits {
+    fn open(lock: &File) -> Result<Commits, Errno> {
+        if lock.metadata().map_err(io_err)?.len() < 8 {
+            lock.set_len(8).map_err(io_err)?;
+        }
+        let map = appine_hal::map_file(lock.as_raw_fd(), 0, 8, true, true).map_err(Errno)?;
+        Ok(Commits { map })
+    }
+
+    fn counter(&self) -> &AtomicU64 {
+        // SAFETY: 映射按页对齐、至少 8 字节，存续期间一直有效
+        unsafe { AtomicU64::from_ptr(self.map.ptr.as_ptr().cast()) }
+    }
+
+    fn get(&self) -> u64 {
+        self.counter().load(Ordering::SeqCst)
+    }
+
+    /// 加一，返回原来的值。
+    fn bump(&self) -> u64 {
+        self.counter().fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+impl Drop for Commits {
+    fn drop(&mut self) {
+        // SAFETY: 映射来自 map_file，之后不再访问
+        unsafe { appine_hal::unmap(self.map.base, self.map.len) }
+    }
 }
 
 const SCHEMA: &str = "
@@ -257,10 +346,21 @@ impl Store {
             .open(dir.join("lock"))
             .map_err(io_err)?;
         appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
+        let commits = Commits::open(&lock)?;
+        let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
         Ok(Store {
             db,
             objects: dir.join("objects"),
             lock,
+            cache: RefCell::new(Cache {
+                generation: commits.get(),
+                ..Cache::default()
+            }),
+            commits,
+            writing: Cell::new(false),
+            snapshot_at: Cell::new(None),
+            touched: RefCell::default(),
+            objects_dir,
         })
     }
 
@@ -272,16 +372,107 @@ impl Store {
             return f(self);
         }
         self.db.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
-        match f(self) {
-            Ok(v) => {
-                self.db.execute_batch("COMMIT").map_err(db_err)?;
-                Ok(v)
-            }
+        self.writing.set(true);
+        let r = match f(self) {
+            Ok(v) => self.db.execute_batch("COMMIT").map_err(db_err).map(|()| v),
             Err(e) => {
                 let _ = self.db.execute_batch("ROLLBACK");
                 Err(e)
             }
+        };
+        self.writing.set(false);
+        self.written();
+        r
+    }
+
+    /// 写入改了目录 `dir` 里的名字 `name`。
+    fn touch_name(&self, dir: Ino, name: &[u8]) {
+        self.touched.borrow_mut().names.push((dir, name.to_vec()));
+    }
+
+    /// 写入改了 inode `ino` 的行。
+    fn touch_ino(&self, ino: Ino) {
+        self.touched.borrow_mut().inos.push(ino);
+    }
+
+    /// 改了数据库之后调用：从自己的缓存里去掉改了的条目；已经提交了（不在外层事务里）
+    /// 就让计数器加一，别的进程的缓存随之作废。必须在提交之后加：之前加的话，别的进程
+    /// 可能赶在提交完成之前重新读到旧的内容，再记成新的计数。计数器在这之前被别人改过，
+    /// 自己的缓存也整体作废。
+    fn written(&self) {
+        let touched = std::mem::take(&mut *self.touched.borrow_mut());
+        let mut c = self.cache.borrow_mut();
+        for (dir, name) in &touched.names {
+            if let Some(d) = c.dentries.get_mut(dir) {
+                d.remove(name);
+            }
+            c.listings.remove(dir);
         }
+        for ino in &touched.inos {
+            c.rows.remove(ino);
+            c.targets.remove(ino);
+            c.parents.remove(ino);
+        }
+        if self.db.is_autocommit() {
+            let before = self.commits.bump();
+            if before == c.generation {
+                c.generation = before + 1;
+            } else {
+                c.clear(before + 1);
+            }
+        }
+    }
+
+    /// 缓存没命中、要查数据库之前调用：在 [`Store::snapshot`] 里时，第一次查询开始读事务。
+    fn begin_read(&self) -> Result<(), Errno> {
+        if self.snapshot_at.get() == Some(None) {
+            self.snapshot_at.set(Some(Some(self.commits.get())));
+            self.db.execute_batch("BEGIN").map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// 缓存能不能用：写事务里不能。能用时返回现在的提交计数，缓存是旧的就先清空。
+    fn cache_generation(&self) -> Option<u64> {
+        if self.writing.get() {
+            return None;
+        }
+        let now = self.commits.get();
+        let mut c = self.cache.borrow_mut();
+        if c.generation != now || c.entries > Cache::MAX_ENTRIES {
+            c.clear(now);
+        }
+        Some(now)
+    }
+
+    /// 刚查到的结果能不能放进缓存：读事务开始以来、以及这次查询期间都没有人提交过
+    /// （否则查到的可能比 `generation` 旧）。
+    fn may_fill(&self, generation: u64) -> bool {
+        self.snapshot_at
+            .get()
+            .flatten()
+            .is_none_or(|s| s == generation)
+            && self.commits.get() == generation
+    }
+
+    /// 在一个读事务里执行 `f`，里面的查询看到同一个快照，并且共用一次加锁：WAL 模式下
+    /// 每条语句单独开、关读事务都要 fcntl 加解锁并检查文件长度，逐级解析一个路径时
+    /// 这比查询本身还贵。读事务在缓存第一次没命中时才开始，全部命中时不碰数据库。
+    /// 已经在事务里时直接执行。
+    pub fn snapshot<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
+        if !self.db.is_autocommit() || self.snapshot_at.get().is_some() {
+            return f(self);
+        }
+        self.snapshot_at.set(Some(None));
+        let r = f(self);
+        if self.snapshot_at.get().flatten().is_some() {
+            // 只读的事务提交只是释放读锁
+            let _ = self
+                .db
+                .execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        }
+        self.snapshot_at.set(None);
+        r
     }
 
     fn object_path(&self, ino: Ino) -> PathBuf {
@@ -290,11 +481,33 @@ impl Store {
 
     /// 在目录 `parent` 里查找 `name`。
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
-        self.db
+        let generation = self.cache_generation();
+        if generation.is_some()
+            && let Some(&hit) = self
+                .cache
+                .borrow()
+                .dentries
+                .get(&parent)
+                .and_then(|d| d.get(name))
+        {
+            return Ok(hit);
+        }
+        self.begin_read()?;
+        let found = self
+            .db
             .prepare_cached("SELECT ino FROM dentries WHERE parent = ?1 AND name = ?2")
             .and_then(|mut st| st.query_row(params![parent, name], |row| row.get(0)))
             .optional()
-            .map_err(db_err)
+            .map_err(db_err)?;
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            let mut c = self.cache.borrow_mut();
+            c.entries += 1;
+            c.dentries
+                .entry(parent)
+                .or_default()
+                .insert(name.to_vec(), found);
+        }
+        Ok(found)
     }
 
     /// 目录 `parent` 里指向 `ino` 的一个名字（getcwd 用）。
@@ -312,8 +525,12 @@ impl Store {
     pub fn stat(&self, ino: Ino) -> Result<Stat, Errno> {
         let mut st = self.stat_row(ino)?;
         if st.kind() == mode::S_IFREG {
-            let meta = fs::metadata(self.object_path(ino)).map_err(io_err)?;
-            fill_from_object(&mut st, &meta);
+            let name = ino.to_string();
+            let o = appine_hal::stat_at(self.objects_dir.as_raw_fd(), name.as_bytes())
+                .map_err(Errno)?;
+            st.size = o.st_size as u64;
+            st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
+            st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
         }
         Ok(st)
     }
@@ -332,6 +549,23 @@ impl Store {
 
     /// 数据库里的元数据（普通文件的 size、mtime 还没有填）。
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
+        let generation = self.cache_generation();
+        if generation.is_some()
+            && let Some(&hit) = self.cache.borrow().rows.get(&ino)
+        {
+            return Ok(hit);
+        }
+        self.begin_read()?;
+        let st = self.query_stat_row(ino)?;
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            let mut c = self.cache.borrow_mut();
+            c.entries += 1;
+            c.rows.insert(ino, st);
+        }
+        Ok(st)
+    }
+
+    fn query_stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
         let row = self
             .db
             .prepare_cached(
@@ -373,27 +607,61 @@ impl Store {
 
     /// 读取符号链接的目标。
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
-        self.db
+        let generation = self.cache_generation();
+        if generation.is_some()
+            && let Some(hit) = self.cache.borrow().targets.get(&ino)
+        {
+            return Ok(hit.clone());
+        }
+        self.begin_read()?;
+        let target = self
+            .db
             .prepare_cached("SELECT target FROM inodes WHERE ino = ?1")
             .and_then(|mut st| st.query_row(params![ino], |r| r.get::<_, Option<Vec<u8>>>(0)))
             .optional()
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?
-            .ok_or(Errno::EINVAL)
+            .ok_or(Errno::EINVAL)?;
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            let mut c = self.cache.borrow_mut();
+            c.entries += 1;
+            c.targets.insert(ino, target.clone());
+        }
+        Ok(target)
     }
 
     /// 目录的上级目录；根目录的上级是它自己。
     pub fn parent(&self, dir: Ino) -> Result<Ino, Errno> {
-        self.db
+        let generation = self.cache_generation();
+        if generation.is_some()
+            && let Some(&hit) = self.cache.borrow().parents.get(&dir)
+        {
+            return Ok(hit);
+        }
+        self.begin_read()?;
+        let parent = self
+            .db
             .prepare_cached("SELECT parent FROM inodes WHERE ino = ?1")
             .and_then(|mut st| st.query_row(params![dir], |r| r.get(0)))
             .optional()
             .map_err(db_err)?
-            .ok_or(Errno::ENOENT)
+            .ok_or(Errno::ENOENT)?;
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            let mut c = self.cache.borrow_mut();
+            c.entries += 1;
+            c.parents.insert(dir, parent);
+        }
+        Ok(parent)
     }
 
     /// 列出目录内容，按名字排序，不含 `.` 和 `..`。
     pub fn readdir(&self, dir: Ino) -> Result<Vec<DirEntry>, Errno> {
+        let generation = self.cache_generation();
+        if generation.is_some()
+            && let Some(hit) = self.cache.borrow().listings.get(&dir)
+        {
+            return Ok(hit.clone());
+        }
         let mut stmt = self
             .db
             .prepare_cached(
@@ -410,7 +678,13 @@ impl Store {
                 })
             })
             .map_err(db_err)?;
-        rows.collect::<Result<_, _>>().map_err(db_err)
+        let list: Vec<DirEntry> = rows.collect::<Result<_, _>>().map_err(db_err)?;
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            let mut c = self.cache.borrow_mut();
+            c.entries += list.len() + 1;
+            c.listings.insert(dir, list.clone());
+        }
+        Ok(list)
     }
 
     /// 打开普通文件的 object。
@@ -438,7 +712,9 @@ impl Store {
             )
             .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now]))
             .map_err(db_err)?;
-        Ok(self.db.last_insert_rowid() as Ino)
+        let ino = self.db.last_insert_rowid() as Ino;
+        self.touch_ino(ino);
+        Ok(ino)
     }
 
     fn add_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
@@ -452,6 +728,7 @@ impl Store {
             .prepare_cached("INSERT INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)")
             .and_then(|mut st| st.execute(params![parent, name, ino]))
             .map_err(db_err)?;
+        self.touch_name(parent, name);
         Ok(())
     }
 
@@ -473,6 +750,7 @@ impl Store {
             s.db.prepare_cached("UPDATE inodes SET nlink = nlink + 1 WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![parent]))
                 .map_err(db_err)?;
+            s.touch_ino(parent);
             Ok(ino)
         })
     }
@@ -575,6 +853,7 @@ impl Store {
             )
             .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
+            s.touch_ino(ino);
             Ok(())
         })
     }
@@ -588,6 +867,8 @@ impl Store {
             )
             .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now_ns()]))
             .map_err(db_err)?;
+        self.touch_ino(ino);
+        self.written();
         if n == 0 { Err(Errno::ENOENT) } else { Ok(()) }
     }
 
@@ -625,6 +906,8 @@ impl Store {
             .prepare_cached("UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1")
             .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
+        self.touch_name(parent, name);
+        self.touch_ino(ino);
         let st = self.stat_row(ino)?;
         if st.nlink == 0 && st.kind() == mode::S_IFREG {
             remove_object(&self.object_path(ino))?;
@@ -649,6 +932,9 @@ impl Store {
             .prepare_cached("UPDATE inodes SET nlink = nlink - 1 WHERE ino = ?1")
             .and_then(|mut st| st.execute(params![parent]))
             .map_err(db_err)?;
+        self.touch_name(parent, name);
+        self.touch_ino(ino);
+        self.touch_ino(parent);
         Ok(())
     }
 
@@ -701,6 +987,9 @@ impl Store {
             .prepare_cached("UPDATE inodes SET parent = ?2 WHERE ino = ?1")
             .and_then(|mut st| st.execute(params![dir, to]))
             .map_err(db_err)?;
+        for ino in [dir, from, to] {
+            self.touch_ino(ino);
+        }
         Ok(())
     }
 
@@ -711,6 +1000,7 @@ impl Store {
             )
             .and_then(|mut st| st.execute(params![parent, name, ino]))
             .map_err(db_err)?;
+        self.touch_name(parent, name);
         Ok(())
     }
 
@@ -778,6 +1068,7 @@ impl Store {
             s.db.prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
                 .and_then(|mut st| st.execute(params![old_dir, old_name]))
                 .map_err(db_err)?;
+            s.touch_name(old_dir, old_name);
             s.set_dentry(new_dir, new_name, src)?;
             if src_dir {
                 s.reparent_dir(src, old_dir, new_dir)?;
@@ -785,6 +1076,7 @@ impl Store {
             s.db.prepare_cached("UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![src, now_ns()]))
                 .map_err(db_err)?;
+            s.touch_ino(src);
             Ok(())
         })
     }
@@ -805,6 +1097,8 @@ impl Store {
             .prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
             .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
             .map_err(db_err)?;
+        self.touch_ino(ino);
+        self.written();
         Ok(())
     }
 
@@ -874,6 +1168,8 @@ impl Store {
             .prepare_cached("UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1")
             .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
+        self.touch_ino(ino);
+        self.written();
         Ok(())
     }
 
@@ -915,6 +1211,8 @@ impl Store {
                 .prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino, ns]))
                 .map_err(db_err)?;
+            self.touch_ino(ino);
+            self.written();
         }
         Ok(())
     }
@@ -929,6 +1227,58 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("appine-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         (Store::create(&dir).unwrap(), dir)
+    }
+
+    #[test]
+    fn cache_follows_own_and_other_processes_writes() {
+        let (a, dir) = temp_store("cache");
+        // 第二个连接相当于另一个 appine 进程
+        let b = Store::open(&dir).unwrap();
+        let names = |s: &Store| -> Vec<Vec<u8>> {
+            s.readdir(ROOT)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        // 自己的写入：缓存里的"不存在"、属性和目录列表随之更新
+        assert_eq!(a.lookup(ROOT, b"f").unwrap(), None);
+        assert!(names(&a).is_empty());
+        let (f, _) = a.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        assert_eq!(a.lookup(ROOT, b"f").unwrap(), Some(f));
+        assert_eq!(names(&a), [b"f".to_vec()]);
+        assert_eq!(a.stat(f).unwrap().mode & 0o777, 0o644);
+        a.set_mode(f, 0o600).unwrap();
+        assert_eq!(a.stat(f).unwrap().mode & 0o777, 0o600);
+        a.rename(ROOT, b"f", ROOT, b"g", false, false).unwrap();
+        assert_eq!(a.lookup(ROOT, b"f").unwrap(), None);
+        assert_eq!(a.lookup(ROOT, b"g").unwrap(), Some(f));
+        // 别的进程的写入：计数器变了，整个缓存作废
+        assert_eq!(b.lookup(ROOT, b"g").unwrap(), Some(f));
+        assert_eq!(b.stat(f).unwrap().nlink, 1);
+        a.link(ROOT, b"h", f).unwrap();
+        a.unlink(ROOT, b"g").unwrap();
+        assert_eq!(b.lookup(ROOT, b"g").unwrap(), None);
+        assert_eq!(b.lookup(ROOT, b"h").unwrap(), Some(f));
+        assert_eq!(names(&b), [b"h".to_vec()]);
+        let d = b.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap();
+        assert_eq!(a.lookup(ROOT, b"d").unwrap(), Some(d));
+        assert_eq!(a.stat(ROOT).unwrap().nlink, 3);
+        // 读事务里的查询同样走缓存，读事务之外的写入随后可见
+        a.snapshot(|s| {
+            assert_eq!(s.lookup(ROOT, b"h")?, Some(f));
+            assert_eq!(s.parent(d)?, ROOT);
+            Ok(())
+        })
+        .unwrap();
+        b.rmdir(ROOT, b"d").unwrap();
+        a.snapshot(|s| {
+            assert_eq!(s.lookup(ROOT, b"d")?, None);
+            Ok(())
+        })
+        .unwrap();
+        drop((a, b));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

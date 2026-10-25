@@ -173,6 +173,33 @@ pub fn fstat(fd: i32) -> Result<libc::stat, i32> {
     Ok(st)
 }
 
+/// 打开一个宿主目录，只用来作 [`stat_at`] 的起点（`O_PATH`）。
+pub fn open_dir(path: &std::path::Path) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// 读取目录 `dir` 里名为 `name` 的文件的元数据（跟随符号链接）。
+pub fn stat_at(dir: i32, name: &[u8]) -> Result<libc::stat, i32> {
+    let name = std::ffi::CString::new(name).map_err(|_| libc::EINVAL)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, 0) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(st)
+}
+
 /// 对宿主 fd 发 ioctl，`arg` 作为参数缓冲区（由调用方保证足够大）。
 pub fn ioctl(fd: i32, request: u64, arg: &mut [u8]) -> Result<i32, i32> {
     let rc = unsafe { libc::ioctl(fd, request as _, arg.as_mut_ptr()) };
@@ -358,6 +385,32 @@ pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
     (0..len.div_ceil(4096))
         .map(|i| rc == 0 && vec[(ptr as usize + i * 4096 - start) / page] & 1 != 0)
         .collect()
+}
+
+/// `[ptr, ptr + len)` 里每个 4K 页有没有被碰过（`/proc/self/pagemap` 的"在内存里"或
+/// "已换出"位）；宿主页更大时，同一个宿主页里的 4K 页结果相同。读不了 pagemap 时
+/// 返回 None。不能用 mincore：换出到 swap（Android 的 zram）的页它也报告"不在"。
+pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
+    use std::os::unix::fs::FileExt;
+    static PAGEMAP: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    let pagemap = PAGEMAP
+        .get_or_init(|| std::fs::File::open("/proc/self/pagemap").ok())
+        .as_ref()?;
+    let page = page_size();
+    let first = ptr as usize / page;
+    let last = (ptr as usize + len).div_ceil(page);
+    let mut raw = vec![0u8; (last - first) * 8];
+    pagemap.read_exact_at(&mut raw, first as u64 * 8).ok()?;
+    let touched = |host: usize| {
+        let i = (host - first) * 8;
+        let entry = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
+        entry & (3 << 62) != 0
+    };
+    Some(
+        (0..len.div_ceil(4096))
+            .map(|i| touched((ptr as usize + i * 4096) / page))
+            .collect(),
+    )
 }
 
 /// 一个宿主文件系统的容量（statvfs）。
