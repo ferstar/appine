@@ -276,6 +276,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         g.dumpable = parent.dumpable;
         g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
+        g.oom_score_adj_min = parent.oom_score_adj_min;
         g.cred = parent.cred.clone();
         g.personality = parent.personality;
         g.thp_disable = parent.thp_disable;

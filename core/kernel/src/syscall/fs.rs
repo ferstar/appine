@@ -3099,7 +3099,8 @@ fn write_bytes(
                 _ => None,
             };
             if let Some(node) = proc_node {
-                pseudo::write(cx.k(), &node, data)?;
+                let cred = cx.cred();
+                pseudo::write(cx.k(), &cred, &node, data)?;
             }
             let n = local_write(&mut file.borrow_mut(), data, offset)?;
             if n > 0 {

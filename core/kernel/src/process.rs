@@ -348,6 +348,9 @@ pub(crate) struct ThreadGroup {
     /// `/proc/<pid>/oom_score_adj`（-1000–1000），fork 继承。OOM killer 挑进程时用
     /// （[`crate::oom`]），-1000 表示不挑它。
     pub oom_score_adj: i32,
+    /// 没有 `CAP_SYS_RESOURCE` 时 `oom_score_adj` 能调到的最低值：有这个能力的写入者
+    /// 写的值，fork 继承。
+    pub oom_score_adj_min: i32,
     /// 凭据，fork 继承。
     pub cred: Cred,
     /// personality(2) 的执行域和标志：只记录，fork 和 execve 都保留。
@@ -399,6 +402,7 @@ impl ThreadGroup {
             dumpable: true,
             no_new_privs: false,
             oom_score_adj: 0,
+            oom_score_adj_min: 0,
             cred: Cred::root(),
             personality: 0,
             thp_disable: false,

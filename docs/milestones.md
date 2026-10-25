@@ -313,7 +313,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 
 - 没有：inotify/fanotify、文件租约（`F_SETLEASE`）和 `O_ASYNC`/SIGIO（`F_SETOWN` 等只记录）、core dump、AIO/io_uring、POSIX 消息队列、挂载、命名空间、ptrace、seccomp 过滤、文件能力和环境能力。→ inotify 已补上（M8 补测：JVM）；文件租约、`O_ASYNC`、AIO、POSIX 消息队列已补上（M9 之前：推迟项）；io_uring 决定不做（§15）
 - 线程退出时不处理 robust futex 链表（只记录 `set_robust_list`）。→ 已补上（M9 之前：稳定性和内存）
-- `MREMAP_DONTUNMAP` 不支持；私有文件映射不能用 mremap 扩展。→ `MREMAP_DONTUNMAP` 已补上（M9 之前：兼容性补漏、推迟项）
+- `MREMAP_DONTUNMAP` 不支持；私有文件映射不能用 mremap 扩展。→ `MREMAP_DONTUNMAP` 已补上（M9 之前：兼容性补漏、推迟项）；私有文件映射仍然不能扩展，返回 ENOMEM
 - epoll 没有 `EPOLLEXCLUSIVE`。→ 已补上（M9 之前：稳定性和内存、推迟项）
 - Tier 1 翻译 SIMD&FP 原本在 R1 的退路里。按上面的数据，建议把它放进 M7 作为第一项。→ 已补上（M7）
 
@@ -685,7 +685,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 - 引擎故障在 App 进程里的恢复（要经过 ART 的 libsigchain）没有直接测过：Android 上验证了 bionic 下的恢复（模拟器上直接运行引擎测试），以及 App 装上处理函数之后 ART 照常工作；libsigchain 把 ART 不认领的故障转给我们的处理函数，`siglongjmp` 离开它时它没有要恢复的状态（按它的源码）。→ 已补上：App 进程里的 instrumentation 测试（M9 之前：稳健性的收尾）
 - 被结束的进程只在宿主 stderr（Android 上是 logcat）里留下报告，终端里只看到 shell 打印的 "Segmentation fault" 或 "Killed"。App 可以在标签页里提示，留给 M9 的外壳。
 - 内存上限只看 App 自己：系统整体内存紧张时（`onTrimMemory`）还没有接到 OOM killer 上。
-- `oom_score_adj` 的写入不检查权限：Linux 不让没有 `CAP_SYS_RESOURCE` 的进程把它调到 `oom_score_adj_min` 以下。
+- `oom_score_adj` 的写入不检查权限：Linux 不让没有 `CAP_SYS_RESOURCE` 的进程把它调到 `oom_score_adj_min` 以下。→ 已补上（2026-10-26，单独修补）：没有这个能力时调到下限以下返回 EACCES，有它时写的值成为新的下限，fork 继承
 - 线程开始、退出时的 panic 仍然终止宿主进程；定时器线程、`Machine` 方法（JNI 调用）里的 panic 还没有处理。→ 已补上（M9 之前：稳健性的收尾）
 
 ## M9 之前：稳健性的收尾（2026-10-25）

@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::ipc;
@@ -677,8 +678,13 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
 }
 
 /// 写 procfs 文件：`oom_score_adj`、主机名、域名和 System V IPC 的限制记下新值，其余
-/// 可写的文件接受写入但不起作用。
-pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<(), Errno> {
+/// 可写的文件接受写入但不起作用。`cred` 是写入者的凭据。
+pub(crate) fn write(
+    k: &mut Kernel,
+    cred: &Cred,
+    node: &PseudoNode,
+    data: &[u8],
+) -> Result<(), Errno> {
     if let PseudoNode::Static(path) = node
         && let Some(name) = path.strip_prefix(b"sys/kernel/")
         && k.ipc.tunables.read(name).is_some()
@@ -786,7 +792,16 @@ pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<()
             .filter(|v| (-1000..=1000).contains(v))
             .ok_or(Errno::EINVAL)?;
         let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
-        group.borrow_mut().oom_score_adj = value;
+        let mut g = group.borrow_mut();
+        // 与 Linux 一样：调到下限以下要求 CAP_SYS_RESOURCE，有它时写的值同时成为新的下限
+        let privileged = cred.capable(cap::SYS_RESOURCE);
+        if value < g.oom_score_adj_min && !privileged {
+            return Err(Errno::EACCES);
+        }
+        g.oom_score_adj = value;
+        if privileged {
+            g.oom_score_adj_min = value;
+        }
     }
     Ok(())
 }

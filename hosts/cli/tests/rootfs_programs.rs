@@ -817,6 +817,32 @@ fn threads_max_limits_root_too() {
 }
 
 #[test]
+fn lowering_oom_score_adj_needs_cap_sys_resource() {
+    // 普通用户能调高 oom_score_adj、再调回下限，不能调到下限以下；root 写的值成为新的
+    // 下限，su 之后继承
+    let f = "/proc/self/oom_score_adj";
+    let script = format!(
+        "su -s /bin/sh nobody -c 'echo 500 > {f}; cat {f}; echo 0 > {f}; \
+         echo -1 > {f} || echo denied; cat {f}'; \
+         echo -500 > {f}; su -s /bin/sh nobody -c 'cat {f}; echo -400 > {f}; \
+         echo -500 > {f} && echo ok; echo -501 > {f} || echo denied'"
+    );
+    for (tier, out) in run(&["/bin/sh", "-c", &script]) {
+        assert_eq!(
+            shell(tier, &out),
+            "500\ndenied\n0\n-500\nok\ndenied\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("Permission denied"),
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn oom_killer_honours_oom_score_adj() {
     // 超出内存上限时先结束 oom_score_adj 为 1000 的进程（即使它几乎不占内存），等它退出
     // 之后还超出，再结束真正吃内存的 awk。挑进程的规则与执行层无关，只在 Tier 1 下跑：
