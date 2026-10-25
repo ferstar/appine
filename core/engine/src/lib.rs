@@ -121,6 +121,7 @@ unsafe extern "C" {
     fn appine_dbt_new() -> *mut RawDbt;
     fn appine_dbt_free(dbt: *mut RawDbt);
     fn appine_dbt_flush(dbt: *mut RawDbt);
+    fn appine_dbt_recheck(dbt: *mut RawDbt);
     fn appine_dbt_invalidate(dbt: *mut RawDbt, start: u64, len: u64);
     fn appine_dbt_run(dbt: *mut RawDbt, cpu: *mut CpuState) -> c_int;
     fn appine_dbt_get_stats(dbt: *const RawDbt, out: *mut DbtStats);
@@ -465,6 +466,12 @@ impl Dbt {
     /// 丢弃全部翻译结果。
     pub fn flush(&mut self) {
         unsafe { appine_dbt_flush(self.raw.as_ptr()) }
+    }
+
+    /// 要换一个地址空间运行（exec 之后）：保留翻译，下次运行之前逐块核对 guest 指令字，
+    /// 对不上的作废，大部分对不上时整体清空。比 [`Dbt::flush`] 之后重新拷贝翻译模板便宜。
+    pub fn recheck(&mut self) {
+        unsafe { appine_dbt_recheck(self.raw.as_ptr()) }
     }
 
     /// 作废 `[start, start + len)` 覆盖的各页里开始的块；范围很大时等同于 [`Dbt::flush`]。

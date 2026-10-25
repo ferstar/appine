@@ -218,6 +218,10 @@ struct appine_dbt *appine_dbt_new(void);
 void appine_dbt_free(struct appine_dbt *dbt);
 void appine_dbt_flush(struct appine_dbt *dbt);
 
+/* 实例要换一个地址空间运行（exec 之后）：保留翻译，下次运行之前逐块核对 guest 指令字，
+ * 对不上的作废。从池里拿到的实例也是这样处理的。 */
+void appine_dbt_recheck(struct appine_dbt *dbt);
+
 /* 作废 [start, start + len) 覆盖的各页里开始的块；范围很大时等同于 appine_dbt_flush() */
 void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
 

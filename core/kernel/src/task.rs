@@ -246,8 +246,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
             Flow::Exec => {
                 generations = cx.mm().generations();
                 seen = load(&generations);
+                // 又一次 exec 的多半是同一个程序（shell 脚本里的 busybox）：保留翻译，核对后继续用
                 if let Some(d) = &mut dbt {
-                    d.flush();
+                    d.recheck();
                 }
             }
             Flow::Exit => break,

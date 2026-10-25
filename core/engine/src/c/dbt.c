@@ -114,9 +114,16 @@ struct slot {
 
 struct block {
     uint64_t pc;
-    uint32_t *code; /* 已作废时为 NULL */
-    uint32_t next;  /* 同一个桶里的上一个块（下标加 1），0 表示没有 */
+    uint32_t *code;  /* 已作废时为 NULL */
+    uint32_t next;   /* 同一个桶里的上一个块（下标加 1），0 表示没有 */
+    uint32_t words;  /* 翻译时的 guest 指令字在 words 里的位置（recheck 用） */
+    uint32_t nguest; /* guest 指令条数 */
 };
+
+/* 每个块的 guest 指令字最多占多少字（按块数上限和每块的指令数上限） */
+#define WORDS_LIMIT ((size_t)TABLE_LIMIT * MAX_BLOCK_INSNS)
+/* 放回池里时最多保留多少个块：再多的实例多半属于 JIT 或大程序，核对的代价不划算 */
+#define KEEP_MAX_BLOCKS 32768
 
 struct appine_dbt {
     uint32_t *cache;    /* 执行用的地址；所有代码指针都指向这里 */
@@ -134,6 +141,10 @@ struct appine_dbt {
     struct slot *jc; /* 间接分支的跳转缓存，直接映射 */
     bool jc_dirty;
     struct block *blocks; /* 与 table_used 一一对应，按翻译顺序记录 */
+    uint32_t *words;      /* 各块翻译时的 guest 指令字，按需映射 */
+    size_t words_used;
+    /* 换了地址空间（exec 之后，或者从池里交给另一个线程），下次运行之前要核对 */
+    bool stale;
     uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
     uint64_t generation; /* 每次 flush 加一，用来作废尚未回填的链接 */
     struct appine_dbt_stats stats;
@@ -1227,14 +1238,18 @@ static bool table_resize(struct appine_dbt *d, unsigned bits)
     return true;
 }
 
-static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code)
+static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code, const uint32_t *guest,
+                         uint32_t nguest)
 {
     size_t i = table_index(d, pc);
     while (d->table[i].code)
         i = (i + 1) & table_mask(d);
     d->table[i] = (struct slot){pc, code};
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
-    d->blocks[d->table_count] = (struct block){pc, code, d->page_head[h]};
+    memcpy(d->words + d->words_used, guest, nguest * 4);
+    d->blocks[d->table_count] =
+        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, nguest};
+    d->words_used += nguest;
     d->table_used[d->table_count++] = (uint32_t)i;
     d->page_head[h] = (uint32_t)d->table_count;
 }
@@ -1269,6 +1284,8 @@ void appine_dbt_flush(struct appine_dbt *d)
         d->page_head[page_bucket(d->blocks[i].pc >> APPINE_PAGE_SHIFT)] = 0;
     }
     d->table_count = 0;
+    d->words_used = 0;
+    d->stale = false;
     if (d->jc_dirty)
         clear_jump_cache(d);
     d->used_words = d->routine_words;
@@ -1366,8 +1383,10 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest)
     return NULL;
 }
 
-/* 按模板在代码缓存的当前位置生成一个块；没有合适的模板时返回 NULL */
-static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t *guest)
+/* 按模板在代码缓存的当前位置生成一个块，`nguest` 是它的 guest 指令条数；没有合适的
+ * 模板时返回 NULL */
+static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t *guest,
+                               uint32_t *nguest)
 {
     uint32_t *code = d->cache + d->used_words;
     pthread_mutex_lock(&templates.lock);
@@ -1386,6 +1405,7 @@ static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t
         d->stats.insns_memory += t->memory;
         d->stats.insns_fallback += t->fallback;
         d->stats.blocks_shared++;
+        *nguest = t->nguest;
     }
     pthread_mutex_unlock(&templates.lock);
     return t ? code : NULL;
@@ -1483,11 +1503,12 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
         appine_dbt_flush(d);
 
     const uint32_t *guest = page + (pc & PAGE_MASK) / 4;
-    uint32_t *code = template_copy(d, pc, guest);
+    uint32_t shared_nguest = 0;
+    uint32_t *code = template_copy(d, pc, guest, &shared_nguest);
     if (code) {
         perf_map(code, (size_t)(d->cache + d->used_words - code) * 4, pc);
         sync_range(d, code, d->cache + d->used_words);
-        table_insert(d, pc, code);
+        table_insert(d, pc, code, guest, shared_nguest);
         d->stats.blocks++;
         return code;
     }
@@ -1558,7 +1579,7 @@ static uint32_t *translate(struct appine_dbt *d, struct appine_cpu *c, uint64_t 
     perf_map(code, words * 4, pc);
     sync_range(d, code, code + words);
     d->used_words += words;
-    table_insert(d, pc, code);
+    table_insert(d, pc, code, guest, nguest);
     d->stats.blocks++;
     return code;
 }
@@ -1736,6 +1757,7 @@ static void release(struct appine_dbt *d)
     zfree(d->table_used, TABLE_LIMIT * sizeof(*d->table_used));
     zfree(d->jc, JC_SIZE * sizeof(*d->jc));
     zfree(d->blocks, TABLE_LIMIT * sizeof(*d->blocks));
+    zfree(d->words, WORDS_LIMIT * sizeof(*d->words));
     zfree(d->page_head, sizeof(*d->page_head) << PAGE_BUCKET_BITS);
     free(d->xlate);
     zfree(d, sizeof(*d));
@@ -1760,9 +1782,11 @@ struct appine_dbt *appine_dbt_new(void)
     d->table_used = zalloc(TABLE_LIMIT * sizeof(*d->table_used));
     d->jc = zalloc(JC_SIZE * sizeof(*d->jc));
     d->blocks = zalloc(TABLE_LIMIT * sizeof(*d->blocks));
+    d->words = zalloc(WORDS_LIMIT * sizeof(*d->words));
     d->page_head = zalloc(sizeof(*d->page_head) << PAGE_BUCKET_BITS);
     d->xlate = malloc(sizeof(*d->xlate));
-    if (!d->cache || !d->table || !d->table_used || !d->jc || !d->blocks || !d->page_head || !d->xlate) {
+    if (!d->cache || !d->table || !d->table_used || !d->jc || !d->blocks || !d->words ||
+        !d->page_head || !d->xlate) {
         release(d);
         return NULL;
     }
@@ -1782,6 +1806,22 @@ void appine_dbt_free(struct appine_dbt *d)
     pthread_mutex_unlock(&pool.lock);
     if (!keep) {
         release(d);
+        return;
+    }
+    /*
+     * 块不多时保留翻译：下一个使用者（fork 出来的子进程、又一次 exec 的同一个程序）
+     * 多半运行同样的代码，运行之前核对一遍（recheck）比逐块拷贝模板便宜得多
+     */
+    if (d->table_count <= KEEP_MAX_BLOCKS) {
+        d->stale = true;
+        pthread_mutex_lock(&pool.lock);
+        if (pool.n < POOL_SIZE)
+            pool.free[pool.n++] = d;
+        else
+            keep = false;
+        pthread_mutex_unlock(&pool.lock);
+        if (!keep)
+            release(d);
         return;
     }
     appine_dbt_flush(d);
@@ -1820,6 +1860,59 @@ static void relink_branch(const struct appine_dbt *d, uint32_t *site, const uint
     sync_range(d, site, site + 1);
 }
 
+/* 块翻译时的 guest 指令字和现在 `mmu` 里同一地址的是否相同；`page`/`host` 记着上一次
+ * 查到的页 */
+static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *mmu,
+                          const struct block *b, uint64_t *page, const uint32_t **host)
+{
+    uint64_t p = b->pc & ~PAGE_MASK;
+    if (p != *page) {
+        *page = p;
+        *host = appine_mmu_translate(mmu, p, APPINE_PROT_EXEC);
+    }
+    return *host && memcmp(*host + (b->pc & PAGE_MASK) / 4, d->words + b->words, b->nguest * 4) == 0;
+}
+
+/*
+ * 实例换了地址空间之后、第一次运行之前：逐块核对 guest 指令字，对不上的作废。和拷贝
+ * 翻译模板时的核对是同一件事，只是一次做完，省掉逐块拷贝、重新链接和同步指令缓存。
+ * 大部分都对不上时（exec 了别的程序）整体清空。
+ */
+static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
+{
+    d->stale = false;
+    size_t live = 0, bad = 0;
+    uint64_t page = 1; /* 未对齐，不会与任何页相同 */
+    const uint32_t *host = NULL;
+    for (size_t i = 0; i < d->table_count; i++) {
+        const struct block *b = &d->blocks[i];
+        if (b->code) {
+            live++;
+            bad += !block_matches(d, c->mmu, b, &page, &host);
+        }
+    }
+    if (bad * 2 > live) {
+        appine_dbt_flush(d);
+        return;
+    }
+    page = 1;
+    for (size_t i = 0; bad && i < d->table_count; i++) {
+        struct block *b = &d->blocks[i];
+        if (b->code && !block_matches(d, c->mmu, b, &page, &host)) {
+            if (!retire_block(d, b)) {
+                appine_dbt_flush(d);
+                return;
+            }
+            bad--;
+        }
+    }
+}
+
+void appine_dbt_recheck(struct appine_dbt *d)
+{
+    d->stale = d->table_count > 0;
+}
+
 enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
 {
     uint64_t (*enter)(struct appine_cpu *, uint32_t *) =
@@ -1829,6 +1922,8 @@ enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
     bool patch_forward = false;
     bool fill_jump_cache = false;
 
+    if (UNLIKELY(d->stale))
+        recheck(d, c);
     c->dbt_jump_cache = d->jc;
     for (;;) {
         if (UNLIKELY(__atomic_load_n(&c->pending, __ATOMIC_RELAXED)) &&
@@ -1910,6 +2005,11 @@ void appine_dbt_free(struct appine_dbt *d)
 }
 
 void appine_dbt_flush(struct appine_dbt *d)
+{
+    (void)d;
+}
+
+void appine_dbt_recheck(struct appine_dbt *d)
 {
     (void)d;
 }
