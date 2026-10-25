@@ -6,6 +6,7 @@ fn main() {
         "src/c/cpu.c",
         "src/c/dbt.c",
         "src/c/features.c",
+        "src/c/guard.c",
         "src/c/interp.c",
         "src/c/mmu.c",
         "src/c/native.c",

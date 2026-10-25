@@ -78,6 +78,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         93 => return proc::exit(cx, a[0] as i32),
         94 => return proc::exit_group(cx, a[0] as i32),
         139 => return signal::sigreturn(cx, cpu),
+        #[cfg(debug_assertions)]
+        crate::bug::TEST_SYSCALL => crate::bug::test_hook(cx, cpu, a[0], a[1]),
         221 => match proc::execve(cx, cpu, a[0], a[1], a[2]) {
             Ok(()) => return Flow::Exec,
             Err(e) => Err(e),

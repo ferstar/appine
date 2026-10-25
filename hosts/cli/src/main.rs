@@ -31,6 +31,8 @@ const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
   --env NAME=VALUE     add a guest environment variable (repeatable)
   --pty                run on an in-process terminal even if stdin is not a tty
   --no-pty             give the guest the host stdin/stdout/stderr directly
+  --memory-limit <n>   kill a guest process when appine's anonymous memory exceeds n
+                       bytes (K, M, G suffixes; \"none\" for no limit; default: half the RAM)
   --stats              print Tier 1 statistics to stderr on exit";
 
 fn main() -> ExitCode {
@@ -85,6 +87,10 @@ fn main() -> ExitCode {
             },
             "--env" => match value() {
                 Some(v) if v.as_bytes().contains(&b'=') => envp.push(v.as_bytes().to_vec()),
+                _ => return usage_error(),
+            },
+            "--memory-limit" => match value().as_ref().and_then(|v| v.to_str()).map(parse_size) {
+                Some(Some(n)) => options.memory_limit = Some(n),
                 _ => return usage_error(),
             },
             _ => return usage_error(),
@@ -174,6 +180,20 @@ fn main() -> ExitCode {
             ExitCode::from((128 + signal.number()) as u8)
         }
     }
+}
+
+/// `--memory-limit` 的值：字节数，可以带 K、M、G 后缀；`none` 表示不限制。
+fn parse_size(s: &str) -> Option<u64> {
+    if s == "none" {
+        return Some(u64::MAX);
+    }
+    let (digits, shift) = match s.as_bytes().last()? {
+        b'K' | b'k' => (&s[..s.len() - 1], 10),
+        b'M' | b'm' => (&s[..s.len() - 1], 20),
+        b'G' | b'g' => (&s[..s.len() - 1], 30),
+        _ => (s, 0),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
 }
 
 fn usage_error() -> ExitCode {

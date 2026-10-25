@@ -106,6 +106,10 @@ pub(crate) struct Kernel {
     pub pipe_max_size: usize,
     /// `/proc/sys/fs/nr_open`：fd 的上限（`RLIMIT_NOFILE` 不能超过它）。
     pub nr_open: usize,
+    /// `/proc/sys/kernel/threads-max`：同时存在的线程数的上限，root 也受它限制。
+    pub threads_max: usize,
+    /// App 内存的上限和 OOM killer（[`crate::oom`]）。
+    pub oom: crate::oom::Oom,
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
@@ -167,6 +171,8 @@ impl Kernel {
             domainname: b"(none)".to_vec(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
+            threads_max: crate::process::default_threads_max(),
+            oom: Default::default(),
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
@@ -242,16 +248,30 @@ impl Kernel {
 /// 所有 guest 线程共享的内核对象。
 pub(crate) struct Shared {
     kernel: Mutex<Kernel>,
+    /// 叫醒定时器线程。
+    pub timers: Arc<Event>,
+    /// 内存上限的检查停下来了（所有线程都在等待，[`crate::oom`]）。
+    pub oom_idle: AtomicBool,
 }
 
 impl Shared {
     pub fn new(kernel: Kernel) -> Shared {
         Shared {
             kernel: Mutex::new(kernel),
+            timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
+            oom_idle: AtomicBool::new(false),
         }
     }
 
-    /// 获取 BKL。内核层的 bug 导致的 panic 会直接终止宿主进程，所以不需要处理中毒。
+    /// 线程要接着执行 guest 代码了：内存上限的检查停着时叫醒定时器线程。不需要持有 BKL。
+    pub fn resume_oom_checks(&self) {
+        if self.oom_idle.load(Ordering::Relaxed) && self.oom_idle.swap(false, Ordering::Relaxed) {
+            self.timers.signal();
+        }
+    }
+
+    /// 获取 BKL。内核层 panic 时锁会中毒：出问题的进程已经被结束（[`crate::bug`]），
+    /// 其余的照常使用它。
     pub fn lock(&self) -> Bkl<'_> {
         Bkl(self.kernel.lock().unwrap_or_else(PoisonError::into_inner))
     }

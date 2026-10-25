@@ -1611,6 +1611,20 @@ impl Mm {
             .sum()
     }
 
+    /// 测试钩子（[`crate::bug`]）：让 `addr` 所在的页在页表里指向一个不能访问的宿主页，
+    /// guest 访问它时引擎在宿主上出错。那一页宿主内存不归任何 VMA，故意泄漏。
+    #[cfg(debug_assertions)]
+    pub fn break_page(&mut self, addr: u64) -> Result<(), Errno> {
+        let host = appine_hal::map_inaccessible(PAGE_SIZE as usize).map_err(Errno)?;
+        let page = addr & !(PAGE_SIZE - 1);
+        // SAFETY: 访问这页宿主内存正是要模拟的 bug；它从不释放
+        unsafe {
+            self.mmu
+                .map(page, host, PAGE_SIZE, prot::READ | prot::WRITE)
+        }
+        .map_err(map_err)
+    }
+
     /// guest 地址是否落在某个映射里（区分 SEGV_MAPERR 和 SEGV_ACCERR）。
     pub fn is_mapped(&self, addr: u64) -> bool {
         self.vmas

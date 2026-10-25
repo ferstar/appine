@@ -83,6 +83,13 @@ To profile, run `appine-run` under `perf record` with `APPINE_PERF_MAP=1`: tier 
 addresses (`g_<pc>`). `--stats` prints how many blocks were translated and why translated code
 exited.
 
+A bug in the kernel layer or the engine (a panic, or the engine faulting on host memory) kills
+only the guest process that hit it in release builds, with a report on stderr. Debug builds
+abort the whole `appine-run` instead, so the bug can be debugged where it happened;
+`APPINE_ON_BUG=kill` or `APPINE_ON_BUG=abort` overrides the default. When appine's anonymous
+memory exceeds `--memory-limit` (default: half the RAM), the guest process using the most
+memory is killed with SIGKILL, like the Linux OOM killer.
+
 ### Differential tests
 
 `scripts/difftest` runs each script in `tests/diff` both in appine and in a native arm64

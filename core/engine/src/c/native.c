@@ -233,19 +233,25 @@ bool appine_native_exec(uint32_t insn, const struct native_desc *desc, struct ap
 {
     if (!appine_native_available())
         return false;
+    /* 桩在宿主地址上访存：地址错了（引擎的 bug）时宿主的故障兜底要释放这把锁 */
     for (;;) {
         pthread_rwlock_rdlock(&lock);
+        appine_guard_hold(&lock, true);
         native_fn fn = lookup(insn);
         if (fn) {
             fn(cpu, host_addr);
+            appine_guard_drop();
             pthread_rwlock_unlock(&lock);
             return true;
         }
+        appine_guard_drop();
         pthread_rwlock_unlock(&lock);
         /* 换成写锁后重新查找：其他线程可能已经生成了同一个桩 */
         pthread_rwlock_wrlock(&lock);
+        appine_guard_hold(&lock, true);
         if (!lookup(insn))
             insert(insn, desc);
+        appine_guard_drop();
         pthread_rwlock_unlock(&lock);
     }
 }

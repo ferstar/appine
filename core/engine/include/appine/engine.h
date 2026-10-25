@@ -52,6 +52,10 @@ enum appine_exit {
     APPINE_EXIT_FAULT = 4, /* pc 指向出错指令，fault_* 字段有效，指令没有产生副作用 */
     APPINE_EXIT_KICK = 5,  /* 被 appine_cpu_kick() 打断，pending 已清零 */
     APPINE_EXIT_CODE = 6,  /* ic ivau：pc 已指向下一条指令，fault_addr = 其地址（已去掉 tag） */
+    /* 引擎自己的 bug 让宿主收到了 SIGSEGV、SIGBUS 或 SIGILL（只在 appine_fault_guard_install()
+     * 之后出现）：guest 状态不可信，调用方应当结束这个 guest 进程。详情见
+     * appine_host_fault_last()；Tier 1 实例已经作废，appine_dbt_free() 直接释放它 */
+    APPINE_EXIT_HOST_FAULT = 7,
 };
 
 /*
@@ -180,6 +184,26 @@ enum appine_exit appine_cpu_exec_insn(struct appine_cpu *cpu, uint32_t insn);
 
 /* 可从任意线程调用：让 appine_cpu_run() 在下一个指令边界返回 APPINE_EXIT_KICK */
 void appine_cpu_kick(struct appine_cpu *cpu);
+
+/* ---- 宿主侧的故障兜底（设计文档 §7.4、§12）---- */
+
+/* 宿主收到的故障信号（APPINE_EXIT_HOST_FAULT） */
+struct appine_host_fault {
+    int32_t signo;
+    int32_t code;  /* si_code */
+    uint64_t addr; /* si_addr：宿主地址 */
+    uint64_t pc;   /* 出错的宿主指令 */
+};
+
+/*
+ * 装上宿主的 SIGSEGV、SIGBUS、SIGILL 处理函数，可以重复调用。之后 appine_cpu_run()、
+ * appine_dbt_run() 运行期间的这些故障变成 APPINE_EXIT_HOST_FAULT；其余的故障先往 stderr
+ * 写一行报告，再交给原来的处理方式（Android 上 debuggerd 据此生成 tombstone）。
+ */
+void appine_fault_guard_install(void);
+
+/* 当前线程最近一次 APPINE_EXIT_HOST_FAULT 的详情 */
+void appine_host_fault_last(struct appine_host_fault *out);
 
 /* 校验 Rust 侧镜像的结构体布局，一致时返回 1 */
 int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off_tpidr,

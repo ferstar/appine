@@ -209,6 +209,80 @@ fn sockets_polling_and_timers() {
 }
 
 #[test]
+fn bugs_kill_only_the_guest_process() {
+    // 内核层 panic、引擎让宿主出错（用 debug 构建的测试钩子模拟）都只结束撞上它的
+    // guest 进程，App 里别的照常运行
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(program) = build_c_guest("bugs") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .env("APPINE_TEST_HOOKS", "1")
+            .env("APPINE_ON_BUG", "kill")
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+        // 0xa991 是测试钩子的 syscall 编号
+        for report in ["kernel panic in syscall 43409", "host signal 11"] {
+            assert!(
+                stderr(&out).contains(report),
+                "tier {tier}: {}",
+                stderr(&out)
+            );
+        }
+    }
+}
+
+#[test]
+fn memory_limit_and_thread_limits() {
+    // RLIMIT_NPROC 的默认值和检查（root 不受它限制），超出 App 内存的上限时结束用得最多
+    // 的 guest 进程
+    let Some(program) = build_c_guest("limits") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--memory-limit", "256M"])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+        assert!(
+            stderr(&out).contains("out of memory: killed process"),
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn ipc_timers_credentials_and_scheduling() {
     // System V 消息队列、信号量（SEM_UNDO）、共享内存跨 fork，POSIX 定时器（超限次数、
     // SIGEV_THREAD、CPU 时钟），mremap，降低权限之后的凭据规则，亲和性和实时策略，

@@ -88,7 +88,7 @@ flowchart TB
         HAL["宿主 HAL：Android（bionic）/ Linux（glibc，开发用）"]
     end
     UI -- JNI --> KERNEL
-    ENGINE -- "退出原因：svc / fault / undef / brk / kick / code" --> KERNEL
+    ENGINE -- "退出原因：svc / fault / undef / brk / kick / code / host_fault" --> KERNEL
     KERNEL -- "cpu_run / dbt_run / mmu_map / tlb_flush / dbt_invalidate / kick" --> ENGINE
     KERNEL --> HAL
 ```
@@ -330,10 +330,11 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
   - 这样 guest 信号、futex 和 I/O 就绪都走同一条唤醒路径，也不需要用宿主信号去打断阻塞调用，避免了和 ART/bionic 抢信号编号。
   - 最初还计划了自管的 wait queue（mutex + condvar），实际只用了 poll 这一种。
 - **futex**：用自管的等待者表实现。键是翻译后的宿主地址；文件的共享映射以宿主文件的 (设备号, inode, 偏移) 为键，不同进程分别 mmap 同一个文件时宿主地址不同，也能互相唤醒（M4）。信号可以唤醒指定线程。futex 的等待者不在"全部叫醒"的名单里，只被 FUTEX_WAKE（它只通知被唤醒的那几个线程）、信号和结束线程组直接通知：JVM、Go 运行时里停在锁和条件变量上的线程很多，原来别处的每次修改都把它们全部叫醒一遍。
-- **定时器线程**：`Machine` 有一个专门的宿主线程，等到最早的到期时刻，发出间隔定时器、POSIX 定时器和 CPU 时间限制的信号。内核状态的任何修改也会叫醒它，它顺便检查登记了 `O_ASYNC` 的文件，宿主 socket 的就绪也由它一起 poll（§10）。
+- **定时器线程**：`Machine` 有一个专门的宿主线程，等到最早的到期时刻，发出间隔定时器、POSIX 定时器和 CPU 时间限制的信号。内核状态的任何修改也会叫醒它，它顺便检查登记了 `O_ASYNC` 的文件，宿主 socket 的就绪也由它一起 poll（§10）。有 guest 线程在运行时，它还定时检查 App 的内存是否超出上限（§12 第 4 条）。
 - **TLS**：guest 的 `tpidr_el0` 只是 guest 状态结构里的一个字段。**宿主的 `TPIDR_EL0` 永远是 bionic 的值**，所以 ART 的信号处理链可以安全运行。
 - **PID 1**：内核层内置一个虚拟的 init。它不对应任何 guest 程序，只负责收养孤儿进程、回收僵尸进程。每个终端标签页的登录 shell 都是它的子进程。v1 不运行 OpenRC。
 - **调度参数**：nice 值按线程设置到宿主线程上（guest 提高优先级时宿主线程最低到 -4，不超过 Android 上与显示有关的线程）；`sched_setaffinity` 设置宿主线程的亲和性；实时调度策略只记录，由宿主按普通线程调度。
+- **线程数的上限**：`/proc/sys/kernel/threads-max` 对 root 也有效，默认按物理内存每 MB 一个，并且不超过宿主 fd 上限的一半：每个 guest 线程是一个宿主线程，还占一个 eventfd。`RLIMIT_NPROC` 默认是它的一半，与 Linux 一样按真实用户 ID 数线程，root 和有 `CAP_SYS_RESOURCE`、`CAP_SYS_ADMIN` 的不受它限制。两者超出时 fork 和建线程返回 `EAGAIN`，fork 炸弹因此停在上限，不会把宿主的线程和 fd 用完。
 - **namespace**：不支持。`clone(CLONE_NEW*)` 和 `unshare` 的命名空间标志返回 `EPERM`（`unshare` 的 `CLONE_FILES`、`CLONE_FS`、`CLONE_SYSVSEM` 是支持的），`setns` 返回 `ENOSYS`。
 
 ---
@@ -376,8 +377,9 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 设计时预计宿主侧只需要处理两种信号：文件映射越过 EOF 时的 SIGBUS，以及引擎自身 bug 导致的 SIGSEGV（转成崩溃报告）。用普通 `sigaction` 安装即可，libsigchain 会把我们的处理函数链在 ART 自己的处理函数之后。现状：
 
-- **SIGBUS**：都事先避开了（§5.2）。映射时就超出 EOF 的页不放进页表，映射之后文件被截短时把超出新末尾的页从页表里拿掉；仓库的 object 文件只有 appine 自己会改。所以没有宿主侧的 SIGBUS 处理函数。
-- **引擎 bug 的 SIGSEGV**：还没有处理函数（未实现），现在由宿主默认处理，整个 App 进程崩溃。
+- **越过 EOF 的 SIGBUS**：都事先避开了（§5.2）。映射时就超出 EOF 的页不放进页表，映射之后文件被截短时把超出新末尾的页从页表里拿掉；仓库的 object 文件只有 appine 自己会改。
+- **引擎的 bug**（`core/engine/src/c/guard.c`）：引擎装了 SIGSEGV、SIGBUS、SIGILL 的处理函数。`appine_cpu_run()`、`appine_dbt_run()` 运行期间（翻译后的代码、解释器、翻译器）出了故障，处理函数 `siglongjmp` 回运行函数，由它返回 `APPINE_EXIT_HOST_FAULT`，内核层只结束这个 guest 进程（§12 第 5 条）。为此运行期间引擎不调用 malloc、不回调内核层，拿到的锁（原生桩缓存的读写锁、翻译模板的锁）都登记下来，跳回之后释放；用过的 Tier 1 实例直接释放，翻译模板整体丢弃。每次进入引擎多一次 `sigsetjmp`，最便宜的 syscall 多约 6 纳秒。
+- 其余的故障（内核层自己的、ART 没认领的别的线程的）先往 stderr 写一行报告（信号、`si_code`、宿主 pc、地址、线程名），再交给原来的处理函数：Android 上是 debuggerd，生成 tombstone；Linux 开发宿主上是 Rust 标准库的栈溢出检查，之后按默认动作产生 core dump。
 - 打断 guest 线程不用宿主信号：kick 只是置位 pending 标志（§7.3），等待中的线程经由 eventfd 唤醒（§6）。
 - 开发用的 `appine-run` 另外装了 SIGWINCH 处理函数，把宿主终端的窗口变化转给 PTY（§9）。
 
@@ -526,8 +528,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 2 | 内核层不把 guest 指针当作宿主指针 | ✅ syscall 参数里的地址一律是 `u64` 或 `UserSlice`（`core/kernel/src/uaccess.rs`），只能经由 `Mm` 读写。计划中带类型的 `UserPtr<T>` 没有引入 |
 | 3 | 宿主路径永远不由 guest 输入拼出来，宿主侧只出现 `objects/<数字>` 形式的路径，symlink 只存在于数据库里。因此"恶意 tar 包借 symlink 逃逸"这类问题在结构上不可能发生 | ✅ |
 | | **稳健性** | |
-| 4 | **guest 自己的 OOM killer**：给所有 guest 内存设一个总上限，默认按设备内存的比例计算，可以配置。超出上限时由我们挑选一个 guest 进程杀掉，不让系统 LMK 杀掉整个 App。同时为 `RLIMIT_NPROC` 设置默认值，防止 fork 炸弹 | 未实现：没有总上限，`RLIMIT_NPROC` 默认不限 |
-| 5 | 内核层以 `panic=unwind` 编译，在 syscall 入口用 `catch_unwind` 兜住 panic，只杀掉当前 guest 进程并生成报告。debug 构建下直接 abort | 未实现：现在每个 guest 线程的入口兜住 panic 之后直接 abort 宿主进程，因为 BKL 保护的状态可能已经不一致 |
+| 4 | **guest 自己的 OOM killer**：给所有 guest 内存设一个总上限，默认按设备内存的比例计算，可以配置。超出上限时由我们挑选一个 guest 进程杀掉，不让系统 LMK 杀掉整个 App。同时为 `RLIMIT_NPROC` 设置默认值，防止 fork 炸弹 | ✅ `core/kernel/src/oom.rs`。上限量的是整个 App 进程的匿名内存（`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，LMK 看的就是它），默认是物理内存的一半，`MachineOptions::memory_limit`、`appine-run --memory-limit` 可以改。guest 碰新的页由宿主内核处理，所以是定时检查：有 guest 线程在运行时每 20 毫秒量一次，超过上限的 3/4 之后每 5 毫秒，全都在等待时停下。超出时按 Linux 的 oom_badness（驻留页数加上按物理内存折算的 `oom_score_adj`）挑一个进程，用 SIGKILL 结束，等它退完（最多 1 秒）再看下一个。不停分配内存的程序在被发现之前还能多用几十 MB。fork 炸弹由 `threads-max` 和 `RLIMIT_NPROC` 挡住（§6） |
+| 5 | 内核层以 `panic=unwind` 编译，在 syscall 入口用 `catch_unwind` 兜住 panic，只杀掉当前 guest 进程并生成报告。debug 构建下直接 abort | ✅ `core/kernel/src/bug.rs`。运行循环在每次进入内核的地方兜住 panic，获取 BKL 时忽略中毒标记；引擎的 bug 走 §7.4 的 `APPINE_EXIT_HOST_FAULT`。两种情况都像 Linux 的 oops 结束当前任务那样，用 SIGSEGV 结束整个进程，并往 stderr（Android 上转到 logcat）写报告。BKL 保护的状态可能只改了一半，结束出问题的进程之后大部分不一致也随之消失。debug 构建默认直接终止宿主进程，`APPINE_ON_BUG=kill`/`abort` 可以覆盖 |
 | | **对 Android 暴露的接口** | |
 | 6 | 只导出启动 Activity 和 DocumentsProvider，不提供供其他 App 执行命令的 intent | ✅ 目前只导出启动 Activity（还没有 DocumentsProvider） |
 | 7 | guest 第一次在非回环地址上 `listen` 某个端口时，发出一条通知 | 未实现 |
@@ -548,7 +550,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 引擎与内核层之间的接口很窄，采用**退出原因**模型：引擎从不回调内核层，`appine_cpu_run()`（Tier 0）或 `appine_dbt_run()`（Tier 1）一直执行到需要内核层介入的事件，返回一个退出原因；内核层处理完之后再调用它继续执行。这样 C 与 Rust 之间没有重入，FFI 边界最简单。完整定义见 `core/engine/include/appine/engine.h`，Rust 绑定见 `core/engine/src/lib.rs`。
 
 ```c
-/* 运行：返回 SVC / UNDEF / BRK / FAULT / KICK / CODE 之一 */
+/* 运行：返回 SVC / UNDEF / BRK / FAULT / KICK / CODE / HOST_FAULT 之一 */
 enum appine_exit appine_cpu_run(struct appine_cpu *cpu);                          /* Tier 0 */
 enum appine_exit appine_dbt_run(struct appine_dbt *dbt, struct appine_cpu *cpu);  /* Tier 1 */
 void appine_cpu_kick(struct appine_cpu *cpu);   /* 可从任意线程调用，让目标线程在下一个指令边界退出 */
@@ -564,10 +566,14 @@ void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t 
 void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
 void appine_dbt_flush(struct appine_dbt *dbt);
 void appine_dbt_recheck(struct appine_dbt *dbt);  /* exec 之后：保留翻译，下次运行前逐块核对 */
+
+/* 宿主侧的故障兜底（§7.4）：之后运行期间的 SIGSEGV/SIGBUS/SIGILL 变成 HOST_FAULT 退出 */
+void appine_fault_guard_install(void);
 ```
 
 - FAULT 退出时，pc 指向出错指令，`fault_addr`/`fault_access`/`fault_kind` 给出地址、访存类型以及页错误、对齐错误还是 SP 对齐错误；该指令不产生任何副作用。
 - CODE 退出表示 guest 执行了 `ic ivau`：pc 已指向下一条指令，`fault_addr` 是它的地址，内核层把这一页记进代码失效日志。
+- HOST_FAULT 退出表示引擎自己的 bug 让宿主收到了故障信号（§7.4）：guest 状态不可信，内核层结束这个进程，详情由 `appine_host_fault_last()` 给出。
 
 guest 状态（`struct appine_cpu`）包含：`x[31]`、`sp`、`pc`、`nzcv`、`fpcr`、`fpsr`、`tpidr_el0`、`orig_x0`、fault 信息、`exit_info`、pending 标志、mmu 指针、独占监视器（地址、长度、读到的值）、Tier 1 内部用的几个字段（退出原因、跳转缓存、影子返回栈）、软件 TLB 和取指 TLB、`v[32]`（128 位）。Tier 1 生成的代码用立即数偏移直接寻址的字段放在 TLB 前面。Rust 侧逐字段镜像这个结构体，由 `appine_cpu_layout_check()` 在测试里校验布局。
 
@@ -597,7 +603,7 @@ docs/            设计文档
   - **Linux arm64**（GitHub 的 `ubuntu-24.04-arm` runner）：依次执行格式检查、clippy、`cargo test --workspace`（含三方 lockstep、白名单与 `llvm-mc` 的对照、guest 程序和 rootfs 用例、基准程序在两个执行层下的输出比对）、需要外网的 apk + git 用例、20 万轮的加长 lockstep、性能探针、差分测试，以及用 clang 编译的引擎测试。
   - **Android APK**（x86_64 runner）：Android 目标的 clippy、`assembleDebug`、lint，APK 作为构件上传。
 - **性能探针**：`cargo build --release -p appine-run -p appine-bench` 之后运行 `appine-bench`，它分别以原生、Tier 0、Tier 1 运行 `tests/bench/programs/` 下的程序，要求输出逐字相同，并打印耗时比。
-- **调试**：`APPINE_LOG=1` 输出本地调试日志；`APPINE_STRACE=1` 打印每个 syscall 的参数、结果、时间和耗时；`APPINE_PERF_MAP=1` 让 Tier 1 写 `/tmp/perf-<pid>.map` 供 perf 使用；`appine-run --stats` 打印翻译统计。
+- **调试**：`APPINE_LOG=1` 输出本地调试日志；`APPINE_STRACE=1` 打印每个 syscall 的参数、结果、时间和耗时；`APPINE_PERF_MAP=1` 让 Tier 1 写 `/tmp/perf-<pid>.map` 供 perf 使用；`appine-run --stats` 打印翻译统计。内核层和引擎的 bug 在 debug 构建下默认直接终止宿主进程，`APPINE_ON_BUG=kill` 改成只结束撞上它的 guest 进程（release 构建的默认做法，§12 第 5 条）；debug 构建设置 `APPINE_TEST_HOOKS=1` 时，一个 Linux 编号之外的 syscall（`0xa991`）可以模拟这两种 bug，供端到端测试使用。
 - 测试分为五层：
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。
   2. **LTP 的 syscall 测试**：`scripts/build-ltp` 在 `alpine` 容器里原生编译，`scripts/ltp` 每个测试起一个新的 `appine-run`，在本地运行，不在 CI 里。目前 1552 个里通过 944 个，剩下的失败见 [milestones.md](milestones.md) 的 M6 结果和之后几轮。原计划中的 musl libc-test 没有接入。
@@ -628,7 +634,7 @@ docs/            设计文档
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 未开始 | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
-M8 之后、M9 之前插进了几轮补强：稳定性和内存、性能剖析和优化、兼容性补漏、把前面推迟的内核功能补上，结果见 [milestones.md](milestones.md)。
+M8 之后、M9 之前插进了几轮补强：稳定性和内存、性能剖析和优化、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹），结果见 [milestones.md](milestones.md)。
 
 ### 14.2 排序依据
 

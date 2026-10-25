@@ -159,6 +159,8 @@ struct appine_dbt {
     size_t words_used;
     /* 换了地址空间（exec 之后，或者从池里交给另一个线程），下次运行之前要核对 */
     bool stale;
+    /* 运行时宿主出了故障（APPINE_EXIT_HOST_FAULT）：各张表可能只改了一半，不再使用 */
+    bool poisoned;
     uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
     uint64_t generation; /* 每次 flush 加一，用来作废尚未回填的链接 */
     struct appine_dbt_stats stats;
@@ -1463,6 +1465,7 @@ static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t
 {
     uint32_t *code = d->cache + d->used_words;
     pthread_mutex_lock(&templates.lock);
+    appine_guard_hold(&templates.lock, false);
     struct template *t = template_find(pc, guest);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
@@ -1480,6 +1483,7 @@ static uint32_t *template_copy(struct appine_dbt *d, uint64_t pc, const uint32_t
         d->stats.blocks_shared++;
         *nguest = t->nguest;
     }
+    appine_guard_drop();
     pthread_mutex_unlock(&templates.lock);
     return t ? code : NULL;
 }
@@ -1492,6 +1496,7 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
     size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs);
     bytes = (bytes + 7) & ~(size_t)7;
     pthread_mutex_lock(&templates.lock);
+    appine_guard_hold(&templates.lock, false);
     if (!templates.arena) {
         void *p = mmap(NULL, TEMPLATE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         templates.arena = p == MAP_FAILED ? NULL : p;
@@ -1528,6 +1533,16 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
                 p = &(*p)->next;
         }
     }
+    appine_guard_drop();
+    pthread_mutex_unlock(&templates.lock);
+}
+
+/* 丢弃所有翻译模板（宿主出了故障之后：坏掉的可能是模板本身） */
+static void template_clear(void)
+{
+    pthread_mutex_lock(&templates.lock);
+    memset(templates.buckets, 0, sizeof(templates.buckets));
+    templates.used = 0;
     pthread_mutex_unlock(&templates.lock);
 }
 
@@ -1888,6 +1903,10 @@ void appine_dbt_free(struct appine_dbt *d)
 {
     if (!d)
         return;
+    if (d->poisoned) {
+        release(d);
+        return;
+    }
     pthread_mutex_lock(&pool.lock);
     bool keep = pool.n < POOL_SIZE;
     pthread_mutex_unlock(&pool.lock);
@@ -2000,8 +2019,9 @@ void appine_dbt_recheck(struct appine_dbt *d)
     d->stale = d->table_count > 0;
 }
 
-enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
+static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
 {
+    struct appine_dbt *d = ctx;
     uint64_t (*enter)(struct appine_cpu *, uint32_t *) =
         (uint64_t(*)(struct appine_cpu *, uint32_t *))(uintptr_t)d->enter;
     uint32_t *patch_site = NULL, *patch_branch_site = NULL;
@@ -2074,6 +2094,16 @@ enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
             break;
         }
     }
+}
+
+enum appine_exit appine_dbt_run(struct appine_dbt *d, struct appine_cpu *c)
+{
+    enum appine_exit r = appine_guard_run(dbt_run, d, c);
+    if (UNLIKELY(r == APPINE_EXIT_HOST_FAULT)) {
+        d->poisoned = true;
+        template_clear();
+    }
+    return r;
 }
 
 void appine_dbt_get_stats(const struct appine_dbt *d, struct appine_dbt_stats *out)

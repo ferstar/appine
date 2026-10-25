@@ -42,6 +42,9 @@ pub struct MachineOptions {
     /// inode 仓库所在的宿主目录。设置后程序路径按 guest 路径在仓库里解析，否则按
     /// 宿主路径读取，guest 也看不到任何文件系统。
     pub rootfs: Option<PathBuf>,
+    /// App 进程匿名内存的上限（字节）：超出时结束一个 guest 进程，免得 Android 的 LMK
+    /// 杀掉整个 App（设计文档 §12）。None 时取宿主物理内存的一半，`u64::MAX` 表示不限制。
+    pub memory_limit: Option<u64>,
 }
 
 /// 新进程的 stdin/stdout/stderr。
@@ -75,10 +78,17 @@ impl Machine {
             None => None,
         };
         appine_hal::raise_fd_limit();
+        // 引擎的 bug 只结束撞上它的 guest 进程（crate::bug）
+        if crate::bug::contain() {
+            appine_engine::install_fault_guard();
+        }
         let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
         {
             let mut k = shared.lock();
             k.vfs = vfs;
+            k.oom.limit = options
+                .memory_limit
+                .unwrap_or_else(crate::oom::default_limit);
             let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
             k.groups.insert(INIT, Rc::new(RefCell::new(init)));
         }
@@ -330,12 +340,15 @@ impl Drop for Machine {
 }
 
 /// 定时器线程：等到最早的到期时刻，发出到期的 SIGALRM（[`crate::itimer::expire`]），
-/// 直到 Machine 关闭。
+/// 有 guest 线程在运行时定时检查内存的上限（[`crate::oom`]），直到 Machine 关闭。
 fn timers(shared: Arc<Shared>) {
-    let event = Arc::new(Event::new().expect("cannot create an eventfd for the timers"));
+    let event = shared.timers.clone();
     let mut k = shared.lock();
     while !k.shutting_down {
-        let next = crate::itimer::expire(&k);
+        let mut next = crate::itimer::expire(&k);
+        if let Some(check) = crate::oom::check(&mut k, &shared) {
+            next = Some(next.map_or(check, |n| n.min(check)));
+        }
         // 信号驱动的 I/O：任何修改都会叫醒这个线程，顺便检查；宿主 socket 一起等
         let mut host = crate::syscall::check_fasync(&mut k);
         let (k2, _) = block(&shared, k, &event, next, &mut host, true);
@@ -356,6 +369,7 @@ pub fn run(
     let machine = Machine::start(&MachineOptions {
         tier: options.tier,
         rootfs: options.rootfs.clone(),
+        memory_limit: options.memory_limit,
     })?;
     // 有终端时，进程是会话组长，接到宿主终端的控制台是它的控制终端
     let console = options.terminal.map(|term| {

@@ -649,6 +649,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                 b"sys/kernel/hostname"
                     | b"sys/kernel/domainname"
                     | b"sys/kernel/pid_max"
+                    | b"sys/kernel/threads-max"
                     | b"sys/kernel/ns_last_pid"
                     | b"sys/kernel/core_pattern"
                     | b"sys/kernel/msgmax"
@@ -744,6 +745,14 @@ pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<()
             .filter(|&n| (0..=crate::kernel::PID_MAX).contains(&n))
             .ok_or(Errno::EINVAL)?;
         k.set_last_pid(pid);
+    }
+    // 与 Linux 一样在 MIN_THREADS 到 FUTEX_TID_MASK 之间；已经设置的 RLIMIT_NPROC 不变
+    if let PseudoNode::Static(b"sys/kernel/threads-max") = node {
+        k.threads_max = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|n| (crate::process::MIN_THREADS..=0x3fff_ffff).contains(n))
+            .ok_or(Errno::EINVAL)?;
     }
     if let PseudoNode::Static(b"sys/fs/lease-break-time") = node {
         k.lease_break_time = std::str::from_utf8(data)
@@ -902,7 +911,7 @@ fn guest_bytes(task: &Task, range: fn(&crate::mm::Mm) -> (u64, u64)) -> Vec<u8> 
     }
 }
 
-fn comm_str(task: Option<&Task>, pid: Tid) -> String {
+pub(crate) fn comm_str(task: Option<&Task>, pid: Tid) -> String {
     match task {
         Some(t) => {
             let c = t.comm.get();
@@ -1496,7 +1505,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sysvipc/sem" => ipc::proc_listing(ps.k, b"sem"),
             b"sysvipc/shm" => ipc::proc_listing(ps.k, b"shm"),
             b"sys/kernel/tainted" => "0\n".to_owned(),
-            b"sys/kernel/threads-max" => format!("{}\n", crate::kernel::PID_MAX),
+            b"sys/kernel/threads-max" => format!("{}\n", ps.k.threads_max),
             b"sys/vm/max_map_count" => {
                 format!(
                     "{}\n",

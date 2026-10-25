@@ -10,3 +10,6 @@ links = "appine_engine"
 
 [build-dependencies]
 cc.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

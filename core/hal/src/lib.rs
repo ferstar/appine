@@ -31,6 +31,24 @@ pub fn map_anonymous(len: usize, reserve: bool) -> Result<NonNull<u8>, i32> {
     Ok(NonNull::new(ptr.cast()).expect("mmap returned NULL"))
 }
 
+/// 申请 `len` 字节不能访问（`PROT_NONE`）的宿主地址空间：访问它时宿主收到 SIGSEGV。
+pub fn map_inaccessible(len: usize) -> Result<NonNull<u8>, i32> {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(last_errno());
+    }
+    Ok(NonNull::new(ptr.cast()).expect("mmap returned NULL"))
+}
+
 /// 释放 [`map_anonymous`] 申请的内存。
 ///
 /// # Safety
@@ -277,6 +295,46 @@ pub fn raise_fd_limit() -> u64 {
         }
     }
     rl.rlim_cur as u64
+}
+
+/// 宿主进程的 fd 软限制。
+#[allow(clippy::unnecessary_cast)] // rlim_t 在 32 位宿主上是 32 位
+pub fn fd_limit() -> u64 {
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } < 0 {
+        return 1024;
+    }
+    if rl.rlim_cur == libc::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        rl.rlim_cur as u64
+    }
+}
+
+/// 宿主进程用掉的匿名内存（字节）：`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，
+/// 换出到 swap（Android 的 zram）的也算；文件页可以回收，不算。没有 RssAnon 的老内核
+/// （4.5 之前）改用 VmRSS。读不了时返回 None。
+pub fn memory_footprint() -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    static STATUS: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    let status = STATUS
+        .get_or_init(|| std::fs::File::open("/proc/self/status").ok())
+        .as_ref()?;
+    // 从头读时内核重新生成整个文件
+    let mut buf = [0u8; 4096];
+    let n = status.read_at(&mut buf, 0).ok()?;
+    let field = |name: &[u8]| -> Option<u64> {
+        let line = buf[..n]
+            .split(|&b| b == b'\n')
+            .find(|l| l.starts_with(name))?;
+        let digits = line[name.len()..].trim_ascii().strip_suffix(b"kB")?;
+        std::str::from_utf8(digits).ok()?.trim().parse().ok()
+    };
+    let anon = match field(b"RssAnon:") {
+        Some(anon) => anon + field(b"RssShmem:").unwrap_or(0),
+        None => field(b"VmRSS:")?,
+    };
+    Some((anon + field(b"VmSwap:").unwrap_or(0)) * 1024)
 }
 
 /// 宿主的物理内存总量和空闲量（字节）。

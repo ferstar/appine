@@ -209,6 +209,23 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         return Err(Errno::EPERM);
     }
     let thread = flags & CLONE_THREAD != 0;
+    // 线程数的限制（Linux 的 copy_process）：RLIMIT_NPROC 按真实用户 ID 数线程，root 和
+    // 有 CAP_SYS_RESOURCE 或 CAP_SYS_ADMIN 的不受它限制；threads-max 对谁都有效
+    {
+        let cred = cx.cred();
+        let nproc = cx.t.group.borrow().rlimits[process::RLIMIT_NPROC as usize].0;
+        let k = cx.kr();
+        if cred.ruid != 0
+            && !cred.capable(cap::SYS_RESOURCE)
+            && !cred.capable(cap::SYS_ADMIN)
+            && user_threads(k, cred.ruid) >= nproc
+        {
+            return Err(Errno::EAGAIN);
+        }
+        if k.tasks.len() >= k.threads_max {
+            return Err(Errno::EAGAIN);
+        }
+    }
     let tid = cx.k().alloc_tid()?;
 
     let mm = if flags & CLONE_VM != 0 {
@@ -369,6 +386,16 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         }
     }
     Ok(tid as u64)
+}
+
+/// 真实用户 ID 是 `uid` 的线程数（`RLIMIT_NPROC`）。
+fn user_threads(k: &crate::kernel::Kernel, uid: u32) -> u64 {
+    k.groups
+        .values()
+        .map(|g| g.borrow())
+        .filter(|g| g.cred.ruid == uid)
+        .map(|g| g.threads.len() as u64)
+        .sum()
 }
 
 /// 读取 execve 的 argv 或 envp：以 NULL 结尾的字符串指针数组。

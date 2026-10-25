@@ -161,6 +161,23 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
 }
 
 /* 执行一条已经取到的指令 */
+/* ---- 宿主故障兜底（guard.c）---- */
+
+/*
+ * 上着保险运行 fn(ctx, cpu)：期间宿主的 SIGSEGV、SIGBUS、SIGILL 让它返回
+ * APPINE_EXIT_HOST_FAULT（appine_fault_guard_install() 之后才生效）。fn 不能调用 malloc，
+ * 拿到的锁都要登记。
+ */
+enum appine_exit appine_guard_run(enum appine_exit (*fn)(void *, struct appine_cpu *), void *ctx,
+                                  struct appine_cpu *cpu);
+
+/* 刚拿到一把锁（rw 为真时是 pthread_rwlock_t，否则是 pthread_mutex_t）：保险期间出了故障
+ * 时由 appine_guard_run() 释放 */
+void appine_guard_hold(void *lock, bool rw);
+
+/* 马上要释放最近登记的那把锁 */
+void appine_guard_drop(void);
+
 /* ---- CPU 特性（features.c）---- */
 
 /* guest 特性集合是否包含 hwcap 里的全部位 */

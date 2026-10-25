@@ -26,6 +26,7 @@ name = "appine-engine"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "libc",
 ]
 
 [[package]]

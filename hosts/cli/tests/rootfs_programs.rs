@@ -795,6 +795,59 @@ fn read_console(machine: &appine_kernel::Machine, id: u32) -> String {
 }
 
 #[test]
+fn threads_max_limits_root_too() {
+    // threads-max 对 root 也有效：线程数到了上限时 fork 返回 EAGAIN，busybox sh 报告
+    // "can't fork" 后退出；写入的值不能小于 20
+    let script = "echo 19 > /proc/sys/kernel/threads-max || echo rejected; \
+                  echo 25 > /proc/sys/kernel/threads-max; cat /proc/sys/kernel/threads-max; \
+                  i=0; while [ $i -lt 40 ]; do sleep 5 & i=$((i + 1)); done; echo not reached";
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        assert_eq!(
+            stdout(&out),
+            "rejected\n25\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("can't fork"),
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn oom_killer_honours_oom_score_adj() {
+    // 超出内存上限时先结束 oom_score_adj 为 1000 的进程（即使它几乎不占内存），等它退出
+    // 之后还超出，再结束真正吃内存的 awk。挑进程的规则与执行层无关，只在 Tier 1 下跑：
+    // Tier 0 的 debug 构建拼 128 MB 的字符串要十几秒
+    let Some(store) = store() else {
+        return;
+    };
+    let script = "(echo 1000 > /proc/self/oom_score_adj && exec sleep 30) & sleep 0.2; \
+                  awk 'BEGIN { s = \"x\"; for (i = 0; i < 27; i++) s = s s; print length(s) }'; \
+                  echo awk $?; wait $!; echo sleep $?";
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .args([
+            "--tier",
+            "1",
+            "--memory-limit",
+            "128M",
+            "--env",
+            PATH,
+            "--rootfs",
+        ])
+        .arg(store)
+        .args(["--", "/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out), "awk 137\nsleep 137\n", "{}", stderr(&out));
+    let err = stderr(&out);
+    let (sleep, awk) = (err.find("(sleep) rss"), err.find("(awk) rss"));
+    assert!(sleep.is_some() && sleep < awk, "{err}");
+}
+
+#[test]
 fn one_machine_runs_several_terminal_sessions() {
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
     let Some(store) = store() else {
@@ -804,6 +857,7 @@ fn one_machine_runs_several_terminal_sessions() {
         let machine = Machine::start(&MachineOptions {
             tier,
             rootfs: Some(store.to_path_buf()),
+            memory_limit: None,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];

@@ -154,6 +154,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
             Tier::Interpreter
         },
         rootfs: Some(PathBuf::from(store)),
+        memory_limit: None,
     };
     match Machine::start(&options) {
         Ok(m) => Arc::into_raw(Arc::new(m)) as jlong,

@@ -207,7 +207,8 @@ pub(crate) fn start(
 fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu) {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu)));
     if r.is_err() {
-        // 内核层的 bug：BKL 保护的状态可能已经不一致，不能让其他线程继续
+        // 内核层的 bug，而且不在 run 兜住的地方（线程开始、退出时）：BKL 保护的状态可能
+        // 已经不一致，不能让其他线程继续
         eprintln!("appine: internal error in guest thread {tid}, aborting");
         std::process::abort();
     }
@@ -231,6 +232,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
     let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
     let mut seen = load(&generations);
     loop {
+        // 所有线程都在等待时内存上限的检查会停下来（crate::oom）
+        shared.resume_oom_checks();
         // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
         sync.in_guest.store(true, Ordering::SeqCst);
         let now = load(&generations);
@@ -255,13 +258,35 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         };
         sync.in_guest.store(false, Ordering::SeqCst);
 
-        let k = shared.lock();
-        let mut state = task.state.borrow_mut();
-        let mut cx = Cx::new(shared, k, &task, &mut state);
-        match handle(&mut cx, cpu, exit) {
+        // 内核层的 bug 只结束这个进程（crate::bug）
+        let pc = cpu.state().pc;
+        let entered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let k = shared.lock();
+            let mut state = task.state.borrow_mut();
+            let mut cx = Cx::new(shared, k, &task, &mut state);
+            let flow = handle(&mut cx, cpu, exit);
+            if let Flow::Exec = flow {
+                generations = cx.mm().generations();
+            }
+            flow
+        }));
+        let flow = entered.unwrap_or_else(|_| {
+            if !crate::bug::contain() {
+                let tid = task.tid.get();
+                eprintln!("appine: internal error in guest thread {tid}, aborting");
+                std::process::abort();
+            }
+            task.sleeping.set(false);
+            let what = match exit {
+                Exit::Svc { .. } => format!("kernel panic in syscall {}", cpu.state().x[8]),
+                _ => format!("kernel panic while handling {exit:?}"),
+            };
+            crate::bug::kill(&shared.lock(), &task, pc, format_args!("{what}"));
+            Flow::Exit
+        });
+        match flow {
             Flow::Continue => {}
             Flow::Exec => {
-                generations = cx.mm().generations();
                 seen = load(&generations);
                 // 又一次 exec 的多半是同一个程序（shell 脚本里的 busybox）：保留翻译，核对后继续用
                 if let Some(d) = &mut dbt {
@@ -315,6 +340,24 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
         }
         // Linux 发断点的 SIGTRAP 时信号帧里没有 esr_context
         Exit::Breakpoint { .. } => (Signal::TRAP, SigInfo::fault(code::TRAP_BRKPT, pc, 0)),
+        // 引擎的 bug（crate::bug）
+        Exit::HostFault {
+            signal,
+            code,
+            addr,
+            pc: host_pc,
+        } => {
+            crate::bug::kill(
+                cx.kr(),
+                cx.task,
+                pc,
+                format_args!(
+                    "host signal {signal} (code {code}) in the engine at {host_pc:#x}, \
+                     address {addr:#x}"
+                ),
+            );
+            return Flow::Exit;
+        }
         Exit::Fault {
             addr,
             access,

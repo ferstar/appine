@@ -78,8 +78,9 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
     return (void *)(host_page + (va & PAGE_MASK));
 }
 
-enum appine_exit appine_cpu_run(struct appine_cpu *cpu)
+static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
 {
+    (void)ctx;
     for (;;) {
         /* 先用普通读做快速判断，确实有请求时再原子交换清零，不会吞掉并发到达的 kick */
         if (UNLIKELY(__atomic_load_n(&cpu->pending, __ATOMIC_RELAXED)) &&
@@ -89,6 +90,11 @@ enum appine_exit appine_cpu_run(struct appine_cpu *cpu)
         if (r != APPINE_EXIT_NONE)
             return r;
     }
+}
+
+enum appine_exit appine_cpu_run(struct appine_cpu *cpu)
+{
+    return appine_guard_run(cpu_run, NULL, cpu);
 }
 
 enum appine_exit appine_interp_step(struct appine_cpu *cpu)

@@ -117,6 +117,9 @@ unsafe extern "C" {
         off_v: usize,
     ) -> c_int;
 
+    fn appine_fault_guard_install();
+    fn appine_host_fault_last(out: *mut RawHostFault);
+
     fn appine_guest_hwcap() -> u64;
     fn appine_guest_midr() -> u64;
 
@@ -132,6 +135,15 @@ unsafe extern "C" {
 #[repr(C)]
 struct RawDbt {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RawHostFault {
+    signo: i32,
+    code: i32,
+    addr: u64,
+    pc: u64,
 }
 
 /// 修改页表时的参数错误或内存不足。
@@ -279,6 +291,18 @@ pub enum Exit {
         /// 指令的地址操作数（已去掉 TBI tag）。
         addr: u64,
     },
+    /// 引擎自己的 bug 让宿主收到了故障信号（只在 [`install_fault_guard`] 之后出现）：guest
+    /// 状态不可信，应当结束这个 guest 进程。用过的 [`Dbt`] 已经作废，析构时直接释放。
+    HostFault {
+        /// 宿主收到的信号：SIGSEGV、SIGBUS 或 SIGILL。
+        signal: i32,
+        /// 宿主的 `si_code`。
+        code: i32,
+        /// 宿主的 `si_addr`。
+        addr: u64,
+        /// 出错的宿主指令。
+        pc: u64,
+    },
 }
 
 /// 一个 guest 硬件线程。
@@ -398,6 +422,16 @@ impl Cpu {
             },
             5 => Exit::Kick,
             6 => Exit::InvalidateCode { addr: s.fault_addr },
+            7 => {
+                let mut f = RawHostFault::default();
+                unsafe { appine_host_fault_last(&mut f) };
+                Exit::HostFault {
+                    signal: f.signo,
+                    code: f.code,
+                    addr: f.addr,
+                    pc: f.pc,
+                }
+            }
             _ => panic!("unknown appine_exit {rc}"),
         })
     }
@@ -493,6 +527,14 @@ impl Drop for Dbt {
     fn drop(&mut self) {
         unsafe { appine_dbt_free(self.raw.as_ptr()) }
     }
+}
+
+/// 装上宿主侧的故障兜底（设计文档 §7.4、§12），可以重复调用：之后 [`Cpu::run`]、
+/// [`Dbt::run`] 运行期间宿主收到的 SIGSEGV、SIGBUS、SIGILL 变成 [`Exit::HostFault`]，
+/// 只影响当时运行的那个 guest；其余的故障先往 stderr 写一行报告，再交给原来的处理方式
+/// （Android 上 debuggerd 据此生成 tombstone）。
+pub fn install_fault_guard() {
+    unsafe { appine_fault_guard_install() }
 }
 
 /// 宣告给 guest 的 `AT_HWCAP`：宿主支持 ∩ Tier 0 已实现 ∩ 白名单（设计文档 §4.4）。

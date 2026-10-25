@@ -173,6 +173,8 @@ pub struct RunOptions {
     /// 设置时，第一个进程以一个进程内 PTY 为 stdin/stdout/stderr 和控制终端，PTY 接到
     /// 这些宿主 fd 上；否则 guest 直接使用宿主的 stdin/stdout/stderr。
     pub terminal: Option<Terminal>,
+    /// 宿主进程匿名内存的上限，见 [`crate::MachineOptions::memory_limit`]。
+    pub memory_limit: Option<u64>,
 }
 
 /// 一次运行的结果。
@@ -230,6 +232,8 @@ pub(crate) const RLIMIT_FSIZE: u32 = 1;
 pub(crate) const RLIMIT_STACK: u32 = 3;
 /// `RLIMIT_CORE`。
 pub(crate) const RLIMIT_CORE: u32 = 4;
+/// `RLIMIT_NPROC`：一个真实用户 ID 最多有多少个线程。
+pub(crate) const RLIMIT_NPROC: u32 = 6;
 /// `RLIMIT_NOFILE`。
 pub(crate) const RLIMIT_NOFILE: u32 = 7;
 /// `RLIMIT_MEMLOCK`。
@@ -243,6 +247,25 @@ const RLIMIT_RTPRIO: u32 = 14;
 /// 资源种类数（`RLIM_NLIMITS`）。
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
+/// `threads-max` 能写入的最小值（Linux 的 `MIN_THREADS`）。
+pub(crate) const MIN_THREADS: usize = 20;
+
+/// `/proc/sys/kernel/threads-max` 的默认值：同时存在的线程数的上限，挡住 fork 炸弹，root
+/// 也受它限制（`RLIMIT_NPROC` 管不了 root）。每个 guest 线程是一个宿主线程，还占一个
+/// 宿主 fd（等待用的 eventfd），所以按物理内存每 MB 一个（Linux 是每 128 KB 一个），
+/// 并且不超过宿主 fd 上限的一半，给打开的文件留出余地。
+pub(crate) fn default_threads_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let by_memory = match appine_hal::memory_info().0 {
+            0 => 4096,
+            total => (total >> 20) as usize,
+        };
+        let by_fds = usize::try_from(appine_hal::fd_limit() / 2).unwrap_or(usize::MAX);
+        by_memory.min(by_fds).max(MIN_THREADS)
+    })
+}
+
 fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     let mut r = [(u64::MAX, u64::MAX); RLIM_NLIMITS];
     r[RLIMIT_STACK as usize] = (loader::STACK_SIZE, u64::MAX);
@@ -251,6 +274,9 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     r[RLIMIT_NOFILE as usize] = (soft as u64, hard as u64);
     // 与 Linux 5.16 起的默认值相同
     r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
+    // 与 Linux 一样是 threads-max 的一半；root 不受它限制
+    let nproc = default_threads_max() as u64 / 2;
+    r[RLIMIT_NPROC as usize] = (nproc, nproc);
     // Linux 按内存大小算（max_threads / 2），4 GB 内存时是这个数
     r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
     r[RLIMIT_NICE as usize] = (0, 0);
@@ -316,8 +342,8 @@ pub(crate) struct ThreadGroup {
     pub dumpable: bool,
     /// `PR_SET_NO_NEW_PRIVS`，fork 和 execve 都保留。
     pub no_new_privs: bool,
-    /// `/proc/<pid>/oom_score_adj`（-1000–1000），fork 继承。guest 自己的 OOM killer
-    /// （设计文档 §12）还没有，这里只记录。
+    /// `/proc/<pid>/oom_score_adj`（-1000–1000），fork 继承。OOM killer 挑进程时用
+    /// （[`crate::oom`]），-1000 表示不挑它。
     pub oom_score_adj: i32,
     /// 凭据，fork 继承。
     pub cred: Cred,
