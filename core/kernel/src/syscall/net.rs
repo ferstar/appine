@@ -323,7 +323,13 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     }
     let err = appine_hal::net::getsockopt(host_fd, SOL_SOCKET, SO_ERROR, 4).map_err(Errno)?;
     match i32::from_le_bytes(err[..4].try_into().unwrap()) {
-        0 => Ok(0),
+        // 宿主 socket 在套接字层还是"正在连接"，再 connect 一次才变成"已连接"：不然
+        // guest 之后再 connect 会成功，而 Linux 上阻塞的 connect 返回之后再 connect 是
+        // EISCONN
+        0 => {
+            let _ = appine_hal::net::connect(host_fd, &addr);
+            Ok(0)
+        }
         e => Err(Errno(e)),
     }
 }
@@ -367,10 +373,26 @@ pub(super) fn setsockopt(
     value: u64,
     len: u32,
 ) -> SysResult {
+    const SO_SNDBUF: i32 = 7;
+    const SO_RCVBUF: i32 = 8;
+    const SO_SNDBUFFORCE: i32 = 32;
+    const SO_RCVBUFFORCE: i32 = 33;
     let (sock, _) = socket_of(cx, fd)?;
     let len = (len as usize).min(256);
     let mut v = vec![0u8; len];
     cx.mm().read(UserSlice::new(value, len), &mut v)?;
+    // 不受上限约束的 SO_*BUFFORCE 要求 CAP_NET_ADMIN，App 在宿主上没有：有这个能力的
+    // guest 进程退回到普通的 SO_*BUF（受宿主的上限约束）
+    let name = match (level, name) {
+        (SOL_SOCKET, SO_SNDBUFFORCE | SO_RCVBUFFORCE)
+            if !cx.cred().capable(crate::cred::cap::NET_ADMIN) =>
+        {
+            return Err(Errno::EPERM);
+        }
+        (SOL_SOCKET, SO_SNDBUFFORCE) => SO_SNDBUF,
+        (SOL_SOCKET, SO_RCVBUFFORCE) => SO_RCVBUF,
+        _ => name,
+    };
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v),
@@ -844,7 +866,14 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         }
         Socket::Netlink(_) | Socket::Unix(_) => None,
     };
+    const SIOCATMARK: u32 = 0x8905;
     match (request, host_fd) {
+        // 先问宿主（UDP 是 EINVAL），再写回 guest（地址不对是 EFAULT）
+        (SIOCATMARK, Some(fd)) => {
+            let mut b = [0u8; 4];
+            appine_hal::ioctl(fd, request as u64, &mut b).map_err(Errno)?;
+            put(cx, arg, b).map(|()| 0)
+        }
         (FIONREAD, Some(fd)) => {
             let mut b = [0u8; 4];
             appine_hal::ioctl(fd, request as u64, &mut b).map_err(Errno)?;
@@ -893,6 +922,12 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
                 b[16..18].copy_from_slice(&ty.to_le_bytes());
             }
             put(cx, arg, b).map(|()| 0)
+        }
+        // 修改接口（SIOCSIFFLAGS、ADDR、MTU 等）：App 改不了宿主的接口，与没有
+        // CAP_NET_ADMIN 时一样是 EPERM，先读参数（地址不对是 EFAULT）
+        0x8914 | 0x8916 | 0x8918 | 0x891a | 0x891c | 0x8922 | 0x8923 | 0x8924 | 0x8943 => {
+            let _: [u8; 40] = get(cx, arg)?;
+            Err(Errno::EPERM)
         }
         SIOCGIFCONF => {
             // struct ifconf：长度和指向 guest 缓冲区的指针，换成宿主缓冲区

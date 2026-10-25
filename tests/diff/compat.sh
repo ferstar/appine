@@ -642,3 +642,260 @@ int main(void)
 C
 gcc -O1 -o misc misc.c
 ./misc
+
+# smaps、smaps_rollup、pagemap；mlock 和 MAP_POPULATE 把页调进内存
+cat > smaps.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/* smaps 里起点为 addr 的映射：打印几项计数和 VmFlags */
+static void smaps(const char *what, void *addr)
+{
+    char line[256];
+    int in = 0;
+    FILE *f = fopen("/proc/self/smaps", "r");
+    printf("%s:", what);
+    while (fgets(line, sizeof line, f)) {
+        unsigned long start, end, kb;
+        char name[32];
+        if (sscanf(line, "%lx-%lx", &start, &end) == 2 && strchr(line, ' ') - line == (long)strcspn(line, " ")) {
+            if (in)
+                break;
+            in = start == (unsigned long)addr;
+            continue;
+        }
+        if (!in)
+            continue;
+        if (sscanf(line, "%31[^:]: %lu kB", name, &kb) == 2 &&
+            (!strcmp(name, "Size") || !strcmp(name, "Rss") || !strcmp(name, "Locked") || !strcmp(name, "Anonymous")))
+            printf(" %s %lu", name, kb);
+        if (!strncmp(line, "VmFlags:", 8))
+            printf(" |%s", line + 8);
+    }
+    fclose(f);
+}
+
+static int present(void *addr, int pages)
+{
+    int fd = open("/proc/self/pagemap", O_RDONLY), n = 0;
+    for (int i = 0; i < pages; i++) {
+        uint64_t e;
+        pread(fd, &e, 8, ((uintptr_t)addr / 4096 + i) * 8);
+        n += e >> 63;
+    }
+    close(fd);
+    return n;
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    long pg = 4096;
+    char *a = mmap(NULL, 16 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char vec[16];
+    mincore(a, 16 * pg, vec);
+    int n = 0;
+    for (int i = 0; i < 16; i++)
+        n += vec[i] & 1;
+    printf("before mlock: resident %d present %d\n", n, present(a, 16));
+    mlock(a, 4 * pg);
+    mincore(a, 16 * pg, vec);
+    n = 0;
+    for (int i = 0; i < 16; i++)
+        n += vec[i] & 1;
+    printf("after mlock: resident %d present %d\n", n, present(a, 16));
+    smaps("locked part", a);
+    smaps("rest", a + 4 * pg);
+    char *b = mmap(NULL, 4 * pg, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    smaps("read-only", b);
+    int fd = open("/tmp/smaps-file", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, 8 * pg);
+    char *c = mmap(NULL, 8 * pg, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    printf("populated file: present %d\n", present(c, 8));
+    int pm = open("/proc/self/pagemap", O_RDONLY);
+    uint64_t e;
+    printf("unaligned read %zd\n", pread(pm, &e, 4, 0));
+    FILE *r = fopen("/proc/self/smaps_rollup", "r");
+    char line[256];
+    fgets(line, sizeof line, r);
+    printf("rollup header ends with [rollup]: %d at column %ld\n", strstr(line, "[rollup]") != NULL,
+           strstr(line, "[rollup]") - line);
+    /* 6.6 起多一行 KSM：只看几个字段在不在 */
+    int fields = 0;
+    while (fgets(line, sizeof line, r))
+        fields += !strncmp(line, "Rss:", 4) || !strncmp(line, "Pss_Anon:", 9) || !strncmp(line, "Locked:", 7);
+    printf("rollup fields %d\n", fields);
+    /* maps 里没有名字的行末尾有一个空格 */
+    FILE *m = fopen("/proc/self/maps", "r");
+    int unnamed = 0, trailing = 0;
+    while (fgets(line, sizeof line, m)) {
+        char *nl = strchr(line, '\n');
+        if (nl && nl[-1] == ' ' && nl[-2] == '0')
+            trailing++;
+        int cols = 0;
+        for (char *t = strtok(line, " \n"); t; t = strtok(NULL, " \n"))
+            cols++;
+        unnamed += cols == 5;
+    }
+    printf("unnamed lines all end with a space: %d\n", unnamed == trailing && unnamed > 0);
+    return 0;
+}
+C
+gcc -O1 -o smaps smaps.c
+./smaps
+
+# 经由 /proc/self/fd 重新打开 memfd 和删除之后还开着的文件；O_NOFOLLOW 停在链接上是 ELOOP
+cat > mfd.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+static void try(const char *what, const char *path, int flags)
+{
+    int fd = open(path, flags, 0600);
+    char buf[16] = {0};
+    if (fd < 0) { printf("%s: %s\n", what, strerror(errno)); return; }
+    pread(fd, buf, 4, 0);
+    printf("%s: ok [%s] flags %o\n", what, buf, fcntl(fd, F_GETFL) & O_ACCMODE);
+    close(fd);
+}
+int main(void)
+{
+    int m = memfd_create("t", 0);
+    write(m, "data", 4);
+    char p[64];
+    snprintf(p, sizeof p, "/proc/self/fd/%d", m);
+    try("rdonly", p, O_RDONLY);
+    try("rdwr", p, O_RDWR);
+    try("creat", p, O_RDWR | O_CREAT);
+    try("creat excl", p, O_RDWR | O_CREAT | O_EXCL);
+    try("creat trunc", p, O_RDWR | O_CREAT | O_TRUNC);
+    try("nofollow", p, O_RDONLY | O_NOFOLLOW);
+    int t = open("/tmp/unlinked", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    write(t, "gone", 4);
+    unlink("/tmp/unlinked");
+    snprintf(p, sizeof p, "/proc/self/fd/%d", t);
+    try("unlinked", p, O_RDONLY);
+    int pp[2];
+    pipe(pp);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", pp[1]);
+    try("pipe creat", p, O_WRONLY | O_CREAT);
+    return 0;
+}
+C
+gcc -O1 -o mfd mfd.c
+./mfd
+
+# unshare、ru_maxrss、tkill 排不上队、futex 的负数、已经连接的 socket、接口 ioctl、
+# 有可写映射时封印写入。定时器超限次数封顶由 LTP 的 timer_settime03 测：间隔 1 纳秒的
+# 定时器在原生一侧会造成信号风暴，结果取决于时机
+cat > misc2.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FUTEX_CMP_REQUEUE 4
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    /* unshare(CLONE_FILES)：之后关的 fd 不影响原来共用 fd 表的进程 */
+    int fd = open("/dev/null", O_RDONLY);
+    pid_t pid = syscall(SYS_clone, CLONE_FILES | SIGCHLD, 0, 0, 0, 0);
+    if (pid == 0) {
+        printf("unshare files %d\n", unshare(CLONE_FILES));
+        close(fd);
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    printf("fd still open in parent %d\n", fcntl(fd, F_GETFD) != -1);
+    pid = syscall(SYS_clone, CLONE_FS | SIGCHLD, 0, 0, 0, 0);
+    if (pid == 0) {
+        unshare(CLONE_FS);
+        chdir("/tmp");
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    char cwd[64];
+    printf("cwd after child chdir %s\n", getcwd(cwd, sizeof cwd));
+    printf("unshare bad %d %s\n", unshare(-1), strerror(errno));
+    printf("unshare vm single-threaded %d\n", unshare(CLONE_VM));
+
+    /* 子进程用了 64 MB：ru_maxrss 至少有一半（内存紧张时有的页可能已经换出） */
+    pid = fork();
+    if (pid == 0) {
+        char *p = malloc(64 << 20);
+        memset(p, 1, 64 << 20);
+        _exit(p[100] - 1);
+    }
+    waitpid(pid, NULL, 0);
+    struct rusage ru;
+    getrusage(RUSAGE_CHILDREN, &ru);
+    printf("children maxrss >= 32MB %d\n", ru.ru_maxrss >= 32 * 1024);
+
+    /* tkill 的实时信号排不上队是 EAGAIN */
+    struct rlimit zero = {0, 0}, old;
+    getrlimit(RLIMIT_SIGPENDING, &old);
+    setrlimit(RLIMIT_SIGPENDING, &zero);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGRTMIN);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    printf("tkill %ld %s\n", syscall(SYS_tkill, gettid(), SIGRTMIN), strerror(errno));
+    setrlimit(RLIMIT_SIGPENDING, &old);
+
+    int f1 = 0, f2 = 0;
+    printf("requeue negative %ld %s\n",
+           syscall(SYS_futex, &f1, FUTEX_CMP_REQUEUE, 1, (long)-1, &f2, 0), strerror(errno));
+
+    /* 阻塞的 connect 返回之后再 connect 是 EISCONN */
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    bind(l, (void *)&a, sizeof a);
+    listen(l, 1);
+    socklen_t len = sizeof a;
+    getsockname(l, (void *)&a, &len);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&a, sizeof a);
+    printf("connect again %d %s\n", connect(c, (void *)&a, sizeof a), strerror(errno));
+    printf("SIOCATMARK null %d %s\n", ioctl(c, SIOCATMARK, NULL), strerror(errno));
+    int u = socket(AF_INET, SOCK_DGRAM, 0), mark;
+    printf("SIOCATMARK udp %d %s\n", ioctl(u, SIOCATMARK, &mark), strerror(errno));
+    printf("SIOCSIFFLAGS bad %d %s\n", ioctl(u, SIOCSIFFLAGS, (void *)8), strerror(errno));
+
+    /* memfd 有可写的共享映射时不能封印写入 */
+    int m = memfd_create("seal", MFD_ALLOW_SEALING);
+    ftruncate(m, 4096);
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, m, 0);
+    printf("seal write mapped %d %s\n", fcntl(m, F_ADD_SEALS, F_SEAL_WRITE), strerror(errno));
+    munmap(p, 4096);
+    printf("seal write unmapped %d\n", fcntl(m, F_ADD_SEALS, F_SEAL_WRITE));
+    return 0;
+}
+C
+gcc -O1 -o misc2 misc2.c
+./misc2

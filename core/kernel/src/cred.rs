@@ -26,6 +26,7 @@ pub(crate) mod cap {
     pub const SETPCAP: u32 = 8;
     pub const LINUX_IMMUTABLE: u32 = 9;
     pub const NET_BIND_SERVICE: u32 = 10;
+    pub const NET_ADMIN: u32 = 12;
     pub const IPC_LOCK: u32 = 14;
     pub const IPC_OWNER: u32 = 15;
     pub const SYS_CHROOT: u32 = 18;

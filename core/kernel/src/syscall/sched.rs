@@ -43,7 +43,11 @@ fn same_owner(cred: &Cred, target: &Cred) -> bool {
 /// getpriority、setpriority 作用的进程（不含僵尸进程）。
 fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Rc<RefCell<ThreadGroup>>>, Errno> {
     let k = cx.kr();
-    let live = |g: &&Rc<RefCell<ThreadGroup>>| !g.borrow().threads.is_empty();
+    // 内置的 init 没有线程，但它是 root 的进程（改它的优先级没有效果）
+    let live = |g: &&Rc<RefCell<ThreadGroup>>| {
+        let g = g.borrow();
+        !g.threads.is_empty() || g.tgid == INIT
+    };
     let found: Vec<_> = match which {
         PRIO_PROCESS => {
             let tgid = match who {

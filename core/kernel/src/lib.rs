@@ -50,7 +50,13 @@ pub fn write_file(
     mode: u32,
     overwrite: bool,
 ) -> Result<(), Errno> {
-    vfs::write_file(&Store::open(store)?, path.as_bytes(), data, mode, overwrite)
+    vfs::write_file(
+        &Store::open(store, &[])?,
+        path.as_bytes(),
+        data,
+        mode,
+        overwrite,
+    )
 }
 
 /// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。

@@ -26,7 +26,7 @@ use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::futex::Futexes;
 use crate::mm::Mm;
-use crate::process::{ExitStatus, ThreadGroup, Tier};
+use crate::process::{CpuTime, ExitStatus, ThreadGroup, Tier};
 use crate::task::{Task, TaskState};
 use crate::tty::Tty;
 use crate::vfs::store::Ino;
@@ -74,7 +74,7 @@ pub(crate) struct Kernel {
     /// 已退出线程的 Tier 1 统计之和。
     pub dbt_stats: Option<DbtStats>,
     /// 已退出线程用掉的 CPU 时间之和（`/proc/stat`）。
-    pub cpu_ns: u64,
+    pub cpu: CpuTime,
     /// 创建过的进程数（`/proc/stat` 的 processes）。
     pub forks: u64,
     /// 本次运行的 `/proc/sys/kernel/random/boot_id`。
@@ -102,6 +102,8 @@ pub(crate) struct Kernel {
     pub domainname: Vec<u8>,
     /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
     pub pipe_max_size: usize,
+    /// `/proc/sys/fs/nr_open`：fd 的上限（`RLIMIT_NOFILE` 不能超过它）。
+    pub nr_open: usize,
     next_tid: Tid,
     /// 正在等待的线程的事件。
     waiters: Vec<Arc<Event>>,
@@ -126,7 +128,7 @@ impl Kernel {
             vfs: None,
             shutting_down: false,
             dbt_stats: None,
-            cpu_ns: 0,
+            cpu: CpuTime::default(),
             forks: 0,
             boot_id: {
                 let mut id = [0u8; 16];
@@ -146,6 +148,7 @@ impl Kernel {
             hostname: b"localhost".to_vec(),
             domainname: b"(none)".to_vec(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
+            nr_open: crate::fd::MAX_FDS,
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
@@ -346,6 +349,12 @@ impl<'a> Cx<'a> {
     pub fn set_fds(&mut self, fds: Rc<RefCell<FdTable>>) {
         self.task.res.borrow_mut().fds = fds.clone();
         self.t.fds = fds;
+    }
+
+    /// 换掉根目录、当前目录和 umask（unshare），同时更新 procfs 能看到的那份。
+    pub fn set_fs(&mut self, fs: Rc<RefCell<crate::task::FsContext>>) {
+        self.task.res.borrow_mut().fs = fs.clone();
+        self.t.fs = fs;
     }
 
     /// procfs、devpts 的视图（路径解析用）。

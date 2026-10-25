@@ -657,17 +657,28 @@ fn dequeue(cx: &mut Cx<'_>) -> Option<(Signal, SigInfo)> {
 
 /// 取出 `set` 里的一个挂起信号，先看线程自己的（sigtimedwait 不管屏蔽字）。
 pub(crate) fn take(cx: &mut Cx<'_>, set: u64) -> Option<(Signal, SigInfo)> {
-    let mut own = cx.task.pending.borrow_mut();
-    if own.set() & set != 0 {
-        let sig = pick(own.set() & set);
-        return Some((sig, own.take(sig)));
+    let taken = {
+        let mut own = cx.task.pending.borrow_mut();
+        let mut g = cx.t.group.borrow_mut();
+        if own.set() & set != 0 {
+            let sig = pick(own.set() & set);
+            Some((sig, own.take(sig)))
+        } else if g.pending.set() & set != 0 {
+            let sig = pick(g.pending.set() & set);
+            Some((sig, g.pending.take(sig)))
+        } else {
+            None
+        }
+    };
+    // POSIX 定时器的信号送达：timer_getoverrun 从此报告它累计的超限次数
+    if let Some((_, info)) = &taken
+        && let InfoFields::Timer { id, overrun, .. } = info.fields
+        && info.code == code::SI_TIMER
+        && let Some(t) = cx.t.group.borrow_mut().posix_timers.get_mut(&id)
+    {
+        t.overrun = overrun;
     }
-    let mut g = cx.t.group.borrow_mut();
-    if g.pending.set() & set != 0 {
-        let sig = pick(g.pending.set() & set);
-        return Some((sig, g.pending.take(sig)));
-    }
-    None
+    taken
 }
 
 /// 有没有可以投递的信号，线程组是否被停住，或者线程已经被要求退出（等待中的 syscall

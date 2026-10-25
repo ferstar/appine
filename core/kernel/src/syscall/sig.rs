@@ -116,6 +116,10 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
         return Err(Errno::EPERM);
     }
     if let Some(sig) = sig {
+        // tkill 的 si_code 不是 SI_USER：实时信号排不上队时与 sigqueue 一样是 EAGAIN
+        if !signal::can_queue(cx.kr(), task.tgid, sig) {
+            return Err(Errno::EAGAIN);
+        }
         let info = SigInfo::kill(code::SI_TKILL, cx.tgid(), cred.ruid);
         signal::send_to_task(cx.kr(), &task, sig, info);
     }

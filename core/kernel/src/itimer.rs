@@ -100,7 +100,7 @@ pub(crate) struct PosixTimer {
     pub value: u64,
     pub deadline: Option<Deadline>,
     pub interval: Duration,
-    /// 最近一个信号的超限次数（timer_getoverrun）。
+    /// 最近送达的一个信号累计的超限次数（timer_getoverrun，取出信号时更新）。
     pub overrun: u32,
 }
 
@@ -136,7 +136,7 @@ impl PosixTimer {
         };
     }
 
-    /// 到期了就返回错过的周期数（不含这一次），并重新计时。
+    /// 到期了就返回错过的周期数（不含这一次，与 Linux 一样封顶在 INT_MAX），并重新计时。
     fn fire(&mut self, k: &Kernel, now: Instant) -> Option<u32> {
         let (late, deadline) = match (self.deadline?, self.cpu_now(k)) {
             (Deadline::At(d), _) if d <= now => (now.duration_since(d), Deadline::At(d)),
@@ -149,13 +149,14 @@ impl PosixTimer {
             self.deadline = None;
             return Some(0);
         }
-        let missed = (late.as_nanos() / self.interval.as_nanos()) as u32;
-        let step = self.interval * (missed + 1);
+        // 间隔很短、起点在很久以前时周期数超出 32 位：按真实的周期数推进
+        let periods = late.as_nanos() / self.interval.as_nanos();
+        let step_ns = (self.interval.as_nanos() * (periods + 1)).min(u64::MAX as u128) as u64;
         self.deadline = Some(match deadline {
-            Deadline::At(d) => Deadline::At(d + step),
-            Deadline::Cpu(d) => Deadline::Cpu(d + step.as_nanos() as u64),
+            Deadline::At(d) => Deadline::At(d + Duration::from_nanos(step_ns)),
+            Deadline::Cpu(d) => Deadline::Cpu(d.saturating_add(step_ns)),
         });
-        Some(missed)
+        Some(periods.min(i32::MAX as u128) as u32)
     }
 }
 
@@ -227,7 +228,6 @@ pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
                     },
                     esr: 0,
                 };
-                t.overrun = missed;
                 if !add_overrun(k, tgid, tid, sig, id, missed) {
                     let cpu = matches!(t.clock, Clock::Process(_));
                     timer_fired.push((tgid, tid, sig, info, cpu));
@@ -270,7 +270,7 @@ fn add_overrun(k: &Kernel, tgid: Tid, tid: Option<Tid>, sig: Signal, id: i32, mi
         });
         match info.map(|info| &mut info.fields) {
             Some(InfoFields::Timer { overrun, .. }) => {
-                *overrun = overrun.saturating_add(missed + 1);
+                *overrun = overrun.saturating_add(missed + 1).min(i32::MAX as u32);
                 true
             }
             _ => false,

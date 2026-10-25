@@ -146,6 +146,16 @@ pub(super) fn mmap(
     if flags & MAP_LOCKED != 0 {
         cx.mm_mut().set_locked(start, len, true)?;
     }
+    // MAP_POPULATE（带 MAP_NONBLOCK 时不调）、MAP_LOCKED、mlockall(MCL_FUTURE) 都把页
+    // 调进内存
+    const MAP_POPULATE: u32 = 0x8000;
+    const MAP_NONBLOCK: u32 = 0x10000;
+    let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE
+        || flags & MAP_LOCKED != 0
+        || cx.mm().lock_future && !cx.mm().lock_onfault;
+    if populate {
+        cx.mm().populate(start, len);
+    }
     Ok(start)
 }
 
@@ -250,20 +260,25 @@ fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// mlock、munlock、mlock2：只记录哪些映射被锁住（宿主内存不会被换出到 guest 能察觉的
-/// 地方），检查范围和 `RLIMIT_MEMLOCK`。
+/// mlock、munlock、mlock2：记录哪些映射被锁住（宿主内存不会被换出到 guest 能察觉的
+/// 地方），检查范围和 `RLIMIT_MEMLOCK`。与 Linux 一样，锁住时把页调进内存，
+/// `MLOCK_ONFAULT` 时不调。
 pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool) -> SysResult {
     const MLOCK_ONFAULT: u32 = 1;
     if flags & !MLOCK_ONFAULT != 0 {
         return Err(Errno::EINVAL);
     }
+    let start = addr & !(PAGE_SIZE - 1);
+    let span = (addr.saturating_add(len)).next_multiple_of(PAGE_SIZE) - start;
     if lock {
-        let start = addr & !(PAGE_SIZE - 1);
-        let span = (addr.saturating_add(len)).next_multiple_of(PAGE_SIZE) - start;
         let already = cx.mm().locked_in(start, span);
         check_memlock(cx, span - already)?;
     }
-    cx.mm_mut().set_locked(addr, len, lock).map(|()| 0)
+    cx.mm_mut().set_locked(addr, len, lock)?;
+    if lock && flags & MLOCK_ONFAULT == 0 {
+        cx.mm().populate(start, span);
+    }
+    Ok(0)
 }
 
 pub(super) fn mlockall(cx: &mut Cx<'_>, flags: u32) -> SysResult {
@@ -279,10 +294,15 @@ pub(super) fn mlockall(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         drop(mm);
         check_memlock(cx, more)?;
         cx.mm_mut().set_all_locked(true);
+        if flags & MCL_ONFAULT == 0 {
+            cx.mm().populate(0, u64::MAX);
+        }
     } else {
         check_memlock(cx, 0)?;
     }
-    cx.mm_mut().lock_future = flags & MCL_FUTURE != 0;
+    let mut mm = cx.mm_mut();
+    mm.lock_future = flags & MCL_FUTURE != 0;
+    mm.lock_onfault = flags & MCL_ONFAULT != 0;
     Ok(0)
 }
 
@@ -290,6 +310,7 @@ pub(super) fn munlockall(cx: &mut Cx<'_>) -> SysResult {
     let mut mm = cx.mm_mut();
     mm.set_all_locked(false);
     mm.lock_future = false;
+    mm.lock_onfault = false;
     Ok(0)
 }
 

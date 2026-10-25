@@ -360,6 +360,46 @@ pub fn thread_cpu_clock() -> Option<i32> {
     }
 }
 
+/// 当前宿主线程的 tid。
+pub fn gettid() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0
+    }
+}
+
+/// 本进程的宿主线程 `tid` 在宿主内核里花的时间（`/proc/self/task/<tid>/stat` 的
+/// stime，精度是一个时钟滴答）。线程已经退出或者读不了时返回 None。
+pub fn thread_system_ns(tid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+    // 第 2 列是括号里的线程名，可能含空格；之后从第 3 列（状态）数起，stime 是第 15 列
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let ticks: u64 = rest.split_ascii_whitespace().nth(12)?.parse().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    Some(ticks * (1_000_000_000 / hz))
+}
+
+/// 把 `[ptr, ptr + len)` 的页调进内存：每个宿主页读一个字节。匿名内存没写过的页映射到
+/// 零页，不额外占内存。
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` 是可读的内存，读它不会产生 SIGBUS（文件映射不能超出文件末尾）。
+pub unsafe fn populate(ptr: *const u8, len: usize) {
+    let page = page_size();
+    let mut at = ptr as usize & !(page - 1);
+    let end = ptr as usize + len;
+    while at < end {
+        // SAFETY: 由调用方保证；读的是 at 和 ptr 中较大的那个，在区间里
+        unsafe { std::ptr::read_volatile(at.max(ptr as usize) as *const u8) };
+        at += page;
+    }
+}
+
 /// `[ptr, ptr + len)` 里驻留在内存中的 4K 页数（mincore）。
 pub fn resident_pages(ptr: *const u8, len: usize) -> usize {
     let page = page_size();

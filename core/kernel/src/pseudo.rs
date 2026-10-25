@@ -14,6 +14,7 @@ use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::ipc;
 use crate::kernel::{INIT, Kernel, Tid};
+use crate::mm::Region;
 use crate::net::{AF_INET, AF_INET6, SOCK_DGRAM, SOCK_STREAM};
 use crate::process::{Signal, ThreadGroup};
 use crate::signal::SigAction;
@@ -61,6 +62,9 @@ pub(crate) enum Entry {
     Comm,
     Environ,
     Maps,
+    Smaps,
+    SmapsRollup,
+    Pagemap,
     Mounts,
     MountInfo,
     Cwd,
@@ -73,7 +77,7 @@ pub(crate) enum Entry {
     CoredumpFilter,
 }
 
-const ENTRIES: [(&[u8], Entry); 17] = [
+const ENTRIES: [(&[u8], Entry); 20] = [
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
@@ -81,6 +85,9 @@ const ENTRIES: [(&[u8], Entry); 17] = [
     (b"comm", Entry::Comm),
     (b"environ", Entry::Environ),
     (b"maps", Entry::Maps),
+    (b"smaps", Entry::Smaps),
+    (b"smaps_rollup", Entry::SmapsRollup),
+    (b"pagemap", Entry::Pagemap),
     (b"mounts", Entry::Mounts),
     (b"mountinfo", Entry::MountInfo),
     (b"cwd", Entry::Cwd),
@@ -492,6 +499,17 @@ impl Pseudo for View<'_> {
         let file = self.open_file(*pid, *fd)?;
         let f = file.borrow();
         Some(match &f.kind {
+            // 已经删除的文件没法按 inode 重新打开（仓库里的 object 已经删了）：指向打开文件
+            // 本身，重新打开时复制宿主文件
+            FileKind::Regular { ino, file }
+                if self
+                    .vfs
+                    .store()
+                    .stat_open(*ino, file)
+                    .is_ok_and(|st| st.nlink == 0) =>
+            {
+                Node::Pseudo(PseudoNode::OpenFd(*pid, *fd))
+            }
             FileKind::Regular { ino, .. }
             | FileKind::Device { ino, .. }
             | FileKind::Directory {
@@ -544,6 +562,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (_, PseudoNode::Pts(_)) => 0o620,
         (_, PseudoNode::PtsPtmx) => 0o666,
         (_, n) if writable(n) => 0o644,
+        (_, PseudoNode::Entry(_, _, Entry::Pagemap)) => 0o400,
         _ => 0o444,
     };
     let rdev_value = match node {
@@ -636,6 +655,22 @@ pub(crate) fn write(k: &mut Kernel, node: &PseudoNode, data: &[u8]) -> Result<()
             &mut k.domainname
         };
         *slot = name.to_vec();
+    }
+    if let PseudoNode::Static(b"sys/vm/max_map_count") = node {
+        let n: usize = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| n <= i32::MAX as usize)
+            .ok_or(Errno::EINVAL)?;
+        crate::mm::MAX_MAP_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    // fd 表的容量固定：nr_open 可以调小，不能超过它
+    if let PseudoNode::Static(b"sys/fs/nr_open") = node {
+        k.nr_open = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|n| (64..=crate::fd::MAX_FDS).contains(n))
+            .ok_or(Errno::EINVAL)?;
     }
     // 与 Linux 一样按页向上取整到 2 的幂，超过 2^31 是 EINVAL
     if let PseudoNode::Static(b"sys/fs/pipe-max-size") = node {
@@ -837,8 +872,8 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     let (state, _) = state_of(ps, &g, tid);
     let (tty_nr, tpgid) = ctty_info(ps, &g);
     let cpu = match (tid, &task) {
-        (Some(_), Some(t)) => t.cpu_ns(),
-        _ => g.cpu_ns(ps.k),
+        (Some(_), Some(t)) => t.cpu(),
+        _ => g.cpu(ps.k),
     };
     let (vsize, rss) = mem_of(task.as_deref());
     let (sigign, sigcgt) = sig_dispositions(&g);
@@ -853,7 +888,7 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     let mut s = String::new();
     write!(
         s,
-        "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} 0 {} 0 {} {} {} 0 {} {} {} 18446744073709551615",
+        "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} {} {} {} {} {} {} 0 {} {} {} 18446744073709551615",
         tid.unwrap_or(pid),
         comm_str(task.as_deref(), pid),
         state,
@@ -862,8 +897,10 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
         g.sid,
         tty_nr,
         tpgid,
-        ticks(cpu),
-        ticks(g.child_cpu_ns),
+        ticks(cpu.user_ns()),
+        ticks(cpu.sys_ns),
+        ticks(g.child_cpu.user_ns()),
+        ticks(g.child_cpu.sys_ns),
         20 + g.nice,
         g.nice,
         g.threads.len().max(1),
@@ -915,7 +952,8 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
             .as_ref()
             .map_or(0, |t| t.res.borrow().mm.borrow().locked_bytes());
         writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
-        writeln!(s, "VmHWM:\t{:>8} kB\nVmRSS:\t{:>8} kB", rss * 4, rss * 4).unwrap();
+        let hwm = g.maxrss_kb.max(rss * 4);
+        writeln!(s, "VmHWM:\t{hwm:>8} kB\nVmRSS:\t{:>8} kB", rss * 4).unwrap();
         // 不区分数据段、栈和代码；没有交换
         writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", 0).unwrap();
         writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
@@ -953,30 +991,183 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
 fn maps(task: &Task) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
-    let mut s = String::new();
-    for r in mm.regions() {
-        let perms = format!(
-            "{}{}{}{}",
-            if r.prot & 1 != 0 { 'r' } else { '-' },
-            if r.prot & 2 != 0 { 'w' } else { '-' },
-            if r.prot & 4 != 0 { 'x' } else { '-' },
-            if r.shared { 's' } else { 'p' },
-        );
-        // 文件映射的设备号是根文件系统的 8:1（与 stat 的 st_dev 相同）
-        let (offset, dev, ino) = match r.file {
-            Some((offset, ino)) => (offset, "08:01", ino),
-            None => (0, "00:00", 0),
+    mm.regions().iter().map(map_line).collect()
+}
+
+/// maps 的一行。与 Linux 一样，没有名字的行末尾也有一个空格，名字从第 74 列开始。
+fn map_line(r: &Region) -> String {
+    let perms = format!(
+        "{}{}{}{}",
+        if r.prot & 1 != 0 { 'r' } else { '-' },
+        if r.prot & 2 != 0 { 'w' } else { '-' },
+        if r.prot & 4 != 0 { 'x' } else { '-' },
+        if r.shared { 's' } else { 'p' },
+    );
+    // 文件映射的设备号是根文件系统的 8:1（与 stat 的 st_dev 相同）
+    let (offset, dev, ino) = match r.file {
+        Some((offset, ino)) => (offset, "08:01", ino),
+        None => (0, "00:00", 0),
+    };
+    let line = format!(
+        "{:08x}-{:08x} {perms} {offset:08x} {dev} {ino} ",
+        r.start, r.end
+    );
+    match &r.name {
+        Some(name) => format!("{line:<73}{}\n", String::from_utf8_lossy(name)),
+        None => format!("{line}\n"),
+    }
+}
+
+/// smaps 的计数，单位 kB。宿主看不出哪些页被别的进程共用、哪些被写过：匿名内存的
+/// 驻留页都算私有的脏页，文件映射的都算私有的干净页。
+#[derive(Default)]
+struct Usage {
+    rss: u64,
+    anon: u64,
+    file: u64,
+    shmem: u64,
+    locked: u64,
+}
+
+impl Usage {
+    fn add(&mut self, o: &Usage) {
+        self.rss += o.rss;
+        self.anon += o.anon;
+        self.file += o.file;
+        self.shmem += o.shmem;
+        self.locked += o.locked;
+    }
+
+    /// Linux 的 `__show_smap`：标签占 16 列，数字占 8 列。
+    fn write(&self, s: &mut String, rollup: bool) {
+        let dirty = self.anon + self.shmem;
+        // Private_Hugetlb 的标签多一列，数字少一列，总宽度不变
+        let mut put = |label: &str, kb: u64| {
+            let w = 24 - label.len().max(16);
+            writeln!(s, "{label:<16}{kb:>w$} kB").unwrap()
         };
-        let line = format!(
-            "{:08x}-{:08x} {perms} {offset:08x} {dev} {ino}",
-            r.start, r.end
-        );
-        match &r.name {
-            Some(name) => writeln!(s, "{line:<73}{}", String::from_utf8_lossy(name)).unwrap(),
-            None => writeln!(s, "{line}").unwrap(),
+        put("Rss:", self.rss);
+        put("Pss:", self.rss);
+        put("Pss_Dirty:", dirty);
+        if rollup {
+            put("Pss_Anon:", self.anon);
+            put("Pss_File:", self.file);
+            put("Pss_Shmem:", self.shmem);
         }
+        put("Shared_Clean:", 0);
+        put("Shared_Dirty:", 0);
+        put("Private_Clean:", self.file);
+        put("Private_Dirty:", dirty);
+        put("Referenced:", self.rss);
+        put("Anonymous:", self.anon);
+        for label in [
+            "LazyFree:",
+            "AnonHugePages:",
+            "ShmemPmdMapped:",
+            "FilePmdMapped:",
+        ] {
+            put(label, 0);
+        }
+        put("Shared_Hugetlb:", 0);
+        put("Private_Hugetlb:", 0);
+        put("Swap:", 0);
+        put("SwapPss:", 0);
+        put("Locked:", self.locked);
+    }
+}
+
+/// `/proc/<pid>/smaps`，或者 `rollup` 时的 `smaps_rollup`（所有映射的合计）。驻留的页
+/// 按宿主内存算（mincore）。
+fn smaps(task: &Task, rollup: bool) -> String {
+    let res = task.res.borrow();
+    let mm = res.mm.borrow();
+    let regions = mm.regions();
+    let mut s = String::new();
+    let mut total = Usage::default();
+    for r in &regions {
+        let resident = mm.residency(r.start, r.end - r.start).unwrap_or_default();
+        let rss = resident.iter().filter(|&&p| p).count() as u64 * 4;
+        let mut u = Usage {
+            rss,
+            locked: if r.locked { rss } else { 0 },
+            ..Usage::default()
+        };
+        match (r.file, r.shared) {
+            (Some(_), _) => u.file = rss,
+            (None, true) => u.shmem = rss,
+            (None, false) => u.anon = rss,
+        }
+        total.add(&u);
+        if rollup {
+            continue;
+        }
+        s += &map_line(r);
+        let kb = (r.end - r.start) / 1024;
+        writeln!(s, "{:<16}{kb:>8} kB", "Size:").unwrap();
+        writeln!(s, "{:<16}{:>8} kB", "KernelPageSize:", 4).unwrap();
+        writeln!(s, "{:<16}{:>8} kB", "MMUPageSize:", 4).unwrap();
+        u.write(&mut s, false);
+        writeln!(s, "THPeligible:    0").unwrap();
+        s += &vm_flags(r);
+    }
+    if rollup && let (Some(first), Some(last)) = (regions.first(), regions.last()) {
+        let line = format!(
+            "{:08x}-{:08x} ---p 00000000 00:00 0 ",
+            first.start, last.end
+        );
+        writeln!(s, "{line:<73}[rollup]").unwrap();
+        total.write(&mut s, true);
     }
     s
+}
+
+/// smaps 的 VmFlags 行，按 Linux 的标志位顺序。
+fn vm_flags(r: &Region) -> String {
+    let flags = [
+        (r.prot & 1 != 0, "rd"),
+        (r.prot & 2 != 0, "wr"),
+        (r.prot & 4 != 0, "ex"),
+        (r.shared, "sh"),
+        (true, "mr"),
+        (r.may_write, "mw"),
+        (true, "me"),
+        (r.shared, "ms"),
+        (r.name.as_deref() == Some(b"[stack]"), "gd"),
+        (r.locked, "lo"),
+        // 计入提交量：可写的私有匿名映射
+        (r.file.is_none() && !r.shared && r.prot & 2 != 0, "ac"),
+    ];
+    let mut s = String::from("VmFlags: ");
+    for (on, name) in flags {
+        if on {
+            s += name;
+            s.push(' ');
+        }
+    }
+    s.push('\n');
+    s
+}
+
+/// 读 `/proc/<pid>/pagemap`：每页 8 字节，位置和长度都要是 8 的整数倍。
+pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
+    if !pos.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
+        return Err(Errno::EINVAL);
+    }
+    let task = k
+        .groups
+        .get(&pid)
+        .and_then(|g| g.borrow().threads.first().copied())
+        .and_then(|t| k.tasks.get(&t).cloned())
+        .ok_or(Errno::ESRCH)?;
+    // 用户地址空间是 48 位
+    let pages_total = 1u64 << (48 - 12);
+    let first = pos / 8;
+    let n = (buf.len() as u64 / 8).min(pages_total.saturating_sub(first)) as usize;
+    let entries = task.res.borrow().mm.borrow().pagemap(first * 4096, n);
+    for (i, e) in entries.iter().enumerate() {
+        buf[i * 8..i * 8 + 8].copy_from_slice(&e.to_le_bytes());
+    }
+    Ok(n * 8)
 }
 
 const MOUNTS: &str = "appine / ext4 rw,relatime 0 0\n\
@@ -1046,8 +1237,9 @@ fn meminfo() -> String {
 fn global_stat(ps: &View<'_>) -> String {
     let n = cpus() as u64;
     let up = ticks(uptime_ns());
-    let busy = ticks(ps.k.cpu_ns + ps.k.tasks.values().map(|t| t.cpu_ns()).sum::<u64>());
-    let idle = (up * n).saturating_sub(busy);
+    let cpu = ps.k.tasks.values().fold(ps.k.cpu, |sum, t| sum + t.cpu());
+    let (user, system) = (ticks(cpu.user_ns()), ticks(cpu.sys_ns));
+    let idle = (up * n).saturating_sub(user + system);
     let running =
         ps.k.tasks
             .values()
@@ -1056,9 +1248,16 @@ fn global_stat(ps: &View<'_>) -> String {
     let (now, _) = appine_hal::clock_gettime(0).unwrap_or((0, 0));
     let btime = now as u64 - uptime_ns() / 1_000_000_000;
     let mut s = String::new();
-    writeln!(s, "cpu  {busy} 0 0 {idle} 0 0 0 0 0 0").unwrap();
+    writeln!(s, "cpu  {user} 0 {system} {idle} 0 0 0 0 0 0").unwrap();
     for i in 0..n {
-        writeln!(s, "cpu{i} {} 0 0 {} 0 0 0 0 0 0", busy / n, idle / n).unwrap();
+        writeln!(
+            s,
+            "cpu{i} {} 0 {} {} 0 0 0 0 0 0",
+            user / n,
+            system / n,
+            idle / n
+        )
+        .unwrap();
     }
     writeln!(s, "intr 0\nctxt 0\nbtime {btime}\nprocesses {}", ps.k.forks).unwrap();
     writeln!(
@@ -1172,7 +1371,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sys/fs/inotify/max_queued_events" => format!("{}\n", crate::syscall::MAX_QUEUED),
             b"sys/fs/inotify/max_user_instances" => "128\n".to_owned(),
             b"sys/fs/inotify/max_user_watches" => format!("{}\n", crate::syscall::MAX_WATCHES),
-            b"sys/fs/nr_open" => format!("{}\n", crate::fd::MAX_FDS),
+            b"sys/fs/nr_open" => format!("{}\n", ps.k.nr_open),
             b"sys/fs/pipe-max-size" => format!("{}\n", ps.k.pipe_max_size),
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
@@ -1191,7 +1390,12 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sysvipc/shm" => ipc::proc_listing(ps.k, b"shm"),
             b"sys/kernel/tainted" => "0\n".to_owned(),
             b"sys/kernel/threads-max" => format!("{}\n", crate::kernel::PID_MAX),
-            b"sys/vm/max_map_count" => "65530\n".to_owned(),
+            b"sys/vm/max_map_count" => {
+                format!(
+                    "{}\n",
+                    crate::mm::MAX_MAP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+                )
+            }
             b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
@@ -1223,6 +1427,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.env)));
                 }
                 self::Entry::Maps => task.map_or(String::new(), |t| maps(&t)),
+                self::Entry::Smaps => task.map_or(String::new(), |t| smaps(&t, false)),
+                self::Entry::SmapsRollup => task.map_or(String::new(), |t| smaps(&t, true)),
+                // 二进制，按读的位置现算（`read_pagemap`）
+                self::Entry::Pagemap => String::new(),
                 self::Entry::Mounts => MOUNTS.to_owned(),
                 self::Entry::MountInfo => MOUNTINFO.to_owned(),
                 self::Entry::OomScoreAdj => {

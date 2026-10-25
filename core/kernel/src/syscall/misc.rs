@@ -8,7 +8,7 @@ use crate::errno::Errno;
 use crate::futex::Key;
 use crate::itimer::{CpuTimer, ITimer};
 use crate::kernel::{Cx, request_wake};
-use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Signal};
+use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Rusage, Signal};
 use crate::uaccess::UserSlice;
 
 const FUTEX_WAIT: u32 = 0;
@@ -67,11 +67,16 @@ const GRND_INSECURE: u32 = 4;
 /// `uname -r` 报告的内核版本，即 ABI 契约（设计文档 §7.5）。
 const RELEASE: &[u8] = b"6.1.0-appine";
 
-/// 把 `clock` 上的绝对时间换算成等待的截止时刻。
+/// 把 `clock` 上的绝对时间换算成等待的截止时刻。已经过去的时间换算成过去的时刻：
+/// 周期性的定时器要按它算错过了几个周期。早到单调时钟表示不了时就是现在。
 pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
     let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
     let now = Duration::new(sec.max(0) as u64, nsec as u32);
-    Ok(Instant::now() + abs.saturating_sub(now))
+    let base = Instant::now();
+    Ok(match abs.checked_sub(now) {
+        Some(ahead) => base + ahead,
+        None => base.checked_sub(now - abs).unwrap_or(base),
+    })
 }
 
 /// futex 的键：翻译后的宿主地址。
@@ -147,6 +152,10 @@ pub(super) fn futex(
             Ok(cx.k().futexes.wake(key, val, bitset) as u64)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // 唤醒和移动的个数是 int，负数是 EINVAL
+            if (val as i32) < 0 || (timeout as u32 as i32) < 0 {
+                return Err(Errno::EINVAL);
+            }
             let key = futex_key(cx, uaddr)?;
             let key2 = futex_key(cx, uaddr2)?;
             if cmd == FUTEX_CMP_REQUEUE && u32::from_le_bytes(get(cx, uaddr)?) != val3 {
@@ -480,14 +489,17 @@ pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
 
 pub(super) fn times(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     let ticks = crate::loader::CLOCK_TICKS;
-    // struct tms：CPU 时间分不出用户态和内核态，全部算作用户态
+    // struct tms：自己和已回收的子进程的用户态、内核态 CPU 时间
     if buf != 0 {
         let to_ticks = |ns: u64| ns / (1_000_000_000 / ticks);
         let g = cx.t.group.borrow();
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&to_ticks(g.cpu_ns(cx.kr())).to_le_bytes());
-        b[16..24].copy_from_slice(&to_ticks(g.child_cpu_ns).to_le_bytes());
+        let (me, children) = (g.cpu(cx.kr()), g.child_cpu);
         drop(g);
+        let mut b = [0u8; 32];
+        let fields = [me.user_ns(), me.sys_ns, children.user_ns(), children.sys_ns];
+        for (i, ns) in fields.into_iter().enumerate() {
+            b[i * 8..i * 8 + 8].copy_from_slice(&to_ticks(ns).to_le_bytes());
+        }
         put(cx, buf, b)?;
     }
     // 返回值是开机以来的时钟滴答数
@@ -499,13 +511,31 @@ pub(super) fn getrusage(cx: &mut Cx<'_>, who: i32, usage: u64) -> SysResult {
     const RUSAGE_SELF: i32 = 0;
     const RUSAGE_CHILDREN: i32 = -1;
     const RUSAGE_THREAD: i32 = 1;
-    let cpu = match who {
-        RUSAGE_SELF => cx.t.group.borrow().cpu_ns(cx.kr()),
-        RUSAGE_CHILDREN => cx.t.group.borrow().child_cpu_ns,
-        RUSAGE_THREAD => cx.task.cpu_ns(),
-        _ => return Err(Errno::EINVAL),
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return Err(Errno::EINVAL);
+    }
+    let group = cx.t.group.clone();
+    let mut g = group.borrow_mut();
+    // 与 Linux 一样，RUSAGE_THREAD 的 ru_maxrss 也是整个进程的
+    if who != RUSAGE_CHILDREN {
+        g.sample_rss(&cx.mm());
+    }
+    let r = match who {
+        RUSAGE_SELF => Rusage {
+            cpu: g.cpu(cx.kr()),
+            maxrss_kb: g.maxrss_kb,
+        },
+        RUSAGE_CHILDREN => Rusage {
+            cpu: g.child_cpu,
+            maxrss_kb: g.child_maxrss_kb,
+        },
+        _ => Rusage {
+            cpu: cx.task.cpu(),
+            maxrss_kb: g.maxrss_kb,
+        },
     };
-    put(cx, usage, crate::process::encode_rusage(cpu)).map(|()| 0)
+    drop(g);
+    put(cx, usage, r.encode()).map(|()| 0)
 }
 
 pub(super) fn uname(cx: &mut Cx<'_>, buf: u64) -> SysResult {
@@ -602,7 +632,7 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
             return Err(Errno::EINVAL);
         }
         // fd 表的容量是固定的；提高硬限制要求 CAP_SYS_RESOURCE
-        if resource == RLIMIT_NOFILE && max > crate::fd::MAX_FDS as u64
+        if resource == RLIMIT_NOFILE && max > cx.kr().nr_open as u64
             || max > slot.1 && !cred.capable(cap::SYS_RESOURCE)
         {
             return Err(Errno::EPERM);

@@ -16,7 +16,7 @@ use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
 use crate::mm::{Generations, Mm};
-use crate::process::{Signal, ThreadGroup, Tier};
+use crate::process::{CpuTime, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
 use crate::syscall::{self, Flow};
 use crate::uaccess::UserSlice;
@@ -84,6 +84,8 @@ pub(crate) struct Task {
     pub res: RefCell<TaskRes>,
     /// 宿主线程的 CPU 时间时钟。
     pub clock: Cell<Option<i32>>,
+    /// 宿主线程的 tid（读宿主记的内核态时间）。
+    pub host_tid: Cell<i32>,
     /// 只有线程自己访问的状态。
     pub state: RefCell<TaskState>,
 }
@@ -148,6 +150,7 @@ impl Task {
             event: Arc::new(event),
             res: RefCell::new(res),
             clock: Cell::new(None),
+            host_tid: Cell::new(0),
             state: RefCell::new(state),
         }))
     }
@@ -158,6 +161,17 @@ impl Task {
             .get()
             .and_then(|c| appine_hal::clock_gettime(c).ok())
             .map_or(0, |(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
+    }
+
+    /// 线程用掉的 CPU 时间，分出内核态：宿主内核替这个宿主线程干活的时间（转发的
+    /// I/O、缺页等）。内核层自己在宿主用户态做的事情算不进去，所以偏少。
+    pub fn cpu(&self) -> CpuTime {
+        let total_ns = self.cpu_ns();
+        let sys_ns = appine_hal::thread_system_ns(self.host_tid.get()).unwrap_or(0);
+        CpuTime {
+            total_ns,
+            sys_ns: sys_ns.min(total_ns),
+        }
     }
 }
 
@@ -200,6 +214,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         let k = shared.lock();
         let task = k.tasks[&tid].clone();
         task.clock.set(appine_hal::thread_cpu_clock());
+        task.host_tid.set(appine_hal::gettid());
         let generations = task.state.borrow().mm.borrow().generations();
         let sync = task.sync.clone();
         (task, sync, generations, k.tier)
@@ -382,14 +397,19 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, stats: Option<DbtStats>) {
         add_stats(total, &s);
     }
     let tid = task.tid.get();
-    let cpu = task.cpu_ns();
-    k.cpu_ns += cpu;
+    let cpu = task.cpu();
+    k.cpu += cpu;
     let group = {
         let mut st = task.state.borrow_mut();
+        // 进程的最后一个线程：退出之前给驻留内存的峰值取一次样
+        let group = st.group.clone();
+        if group.borrow().threads.len() == 1 {
+            group.borrow_mut().sample_rss(&st.mm.borrow());
+        }
         release_mm(&mut k, &task, &mut st);
-        st.group.clone()
+        group
     };
-    group.borrow_mut().cpu_ns += cpu;
+    group.borrow_mut().cpu += cpu;
     k.tasks.remove(&tid);
     let last = {
         let mut g = group.borrow_mut();

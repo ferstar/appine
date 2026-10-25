@@ -32,6 +32,7 @@ const CLONE_PARENT_SETTID: u64 = 0x100000;
 const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 const CLONE_DETACHED: u64 = 0x400000;
 const CLONE_CHILD_SETTID: u64 = 0x1000000;
+const CLONE_SYSVSEM: u64 = 0x40000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
 /// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：不支持 namespace（设计文档 §6）。
@@ -607,6 +608,9 @@ fn exec(
         }
         g.sighand.borrow_mut().reset_on_exec();
     }
+    // 驻留内存的峰值跨 execve 保留：换掉地址空间之前取一次样
+    let group = cx.t.group.clone();
+    group.borrow_mut().sample_rss(&cx.mm());
     let task = cx.task.clone();
     let (k, t) = cx.parts();
     task::release_mm(k, &task, t);
@@ -716,7 +720,7 @@ struct Wanted {
 }
 
 /// 找到的子进程状态变化：(pid, 事件, 子进程和它回收过的子进程用掉的 CPU 时间)。
-type Found = (Tid, ChildEvent, u64);
+type Found = (Tid, ChildEvent, process::Rusage);
 
 /// 找到一个符合条件的子进程状态变化，`consume` 时取走它（已结束的子进程同时被回收）。
 /// 没有子进程符合条件时返回 ECHILD。
@@ -736,29 +740,36 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
             continue;
         }
         any = true;
-        let cpu = child.borrow().cpu_ns(cx.kr()) + child.borrow().child_cpu_ns;
+        // 与 Linux 一样，子进程的用量包括它回收的子进程。找到事件才算：活着的线程的内核态
+        // 时间要读宿主的 /proc，wait 每次被叫醒都会重新扫一遍子进程
+        let usage = |g: &ThreadGroup, k: &crate::kernel::Kernel| process::Rusage {
+            cpu: g.cpu(k) + g.child_cpu,
+            maxrss_kb: g.maxrss_kb.max(g.child_maxrss_kb),
+        };
         let mut g = child.borrow_mut();
         if let (true, Some(status)) = (want.exited, g.zombie) {
+            let usage = usage(&g, cx.kr());
             if want.consume {
                 drop(g);
                 cx.k().groups.remove(&c);
                 let mut me = cx.t.group.borrow_mut();
                 me.children.retain(|&x| x != c);
-                me.child_cpu_ns += cpu;
+                me.child_cpu += usage.cpu;
+                me.child_maxrss_kb = me.child_maxrss_kb.max(usage.maxrss_kb);
             }
-            return Ok(Some((c, ChildEvent::Exited(status), cpu)));
+            return Ok(Some((c, ChildEvent::Exited(status), usage)));
         }
         if let (true, Some(sig)) = (want.stopped, g.stop_report) {
             if want.consume {
                 g.stop_report = None;
             }
-            return Ok(Some((c, ChildEvent::Stopped(sig), cpu)));
+            return Ok(Some((c, ChildEvent::Stopped(sig), usage(&g, cx.kr()))));
         }
         if want.continued && g.cont_report {
             if want.consume {
                 g.cont_report = false;
             }
-            return Ok(Some((c, ChildEvent::Continued, cpu)));
+            return Ok(Some((c, ChildEvent::Continued, usage(&g, cx.kr()))));
         }
     }
     if any { Ok(None) } else { Err(Errno::ECHILD) }
@@ -811,14 +822,14 @@ pub(super) fn wait4(
         continued: options & WCONTINUED != 0,
         consume: true,
     };
-    let Some((child, event, cpu)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
+    let Some((child, event, usage)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
         return Ok(0);
     };
     if wstatus != 0 {
         put(cx, wstatus, event.wait_status().to_le_bytes())?;
     }
     if rusage != 0 {
-        put(cx, rusage, process::encode_rusage(cpu))?;
+        put(cx, rusage, usage.encode())?;
     }
     Ok(child as u64)
 }
@@ -878,8 +889,8 @@ pub(super) fn waitid(
         cx.mm().write(UserSlice::new(infop, 128), &info)?;
     }
     if rusage != 0 {
-        let cpu = found.map_or(0, |f| f.2);
-        put(cx, rusage, process::encode_rusage(cpu))?;
+        let usage = found.map_or(process::Rusage::default(), |f| f.2);
+        put(cx, rusage, usage.encode())?;
     }
     Ok(0)
 }
@@ -1019,6 +1030,75 @@ pub(super) fn kcmp(
         std::cmp::Ordering::Less => 1,
         std::cmp::Ordering::Greater => 2,
     })
+}
+
+/// unshare：不再和别的线程、进程共用某些资源。命名空间不支持，与 clone 一样返回
+/// EPERM。与 Linux 一样，`CLONE_THREAD`、`CLONE_SIGHAND`、`CLONE_VM` 只在本来就没有
+/// 共用时成功（什么也不用做）。
+pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
+    let known = CLONE_THREAD
+        | CLONE_FS
+        | CLONE_SIGHAND
+        | CLONE_VM
+        | CLONE_FILES
+        | CLONE_SYSVSEM
+        | CLONE_NEW_MASK;
+    let mut flags = flags;
+    if flags & CLONE_NEWUSER != 0 {
+        flags |= CLONE_THREAD | CLONE_FS;
+    }
+    if flags & CLONE_VM != 0 {
+        flags |= CLONE_SIGHAND;
+    }
+    if flags & CLONE_SIGHAND != 0 {
+        flags |= CLONE_THREAD;
+    }
+    if flags & CLONE_NEWNS != 0 {
+        flags |= CLONE_FS;
+    }
+    if flags & !known != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let group = cx.t.group.clone();
+    let shared = (flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0
+        && group.borrow().threads.len() > 1)
+        || (flags & (CLONE_SIGHAND | CLONE_VM) != 0
+            && Rc::strong_count(&group.borrow().sighand) > 1)
+        || (flags & CLONE_VM != 0 && cx.mm().shared_with_others());
+    if shared {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_NEW_MASK != 0 {
+        return Err(Errno::EPERM);
+    }
+    // 每个线程的 TaskState 和 TaskRes 各持有一份引用
+    let others = |count: usize| count > 2;
+    if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
+        // 与 Linux 的 dup_fd 一样：已经打开的最大的 fd（按 64 取整）超过 nr_open 时复制不了
+        let highest = cx.fds().open_fds().last().map_or(0, |&fd| fd as usize + 1);
+        if highest.next_multiple_of(64) > cx.kr().nr_open {
+            return Err(Errno::EMFILE);
+        }
+        let copy = cx.fds().clone();
+        cx.set_fds(Rc::new(RefCell::new(copy)));
+    }
+    if flags & CLONE_FS != 0 && others(Rc::strong_count(&cx.t.fs)) {
+        let copy = {
+            let f = cx.t.fs.borrow();
+            FsContext {
+                root: f.root.clone(),
+                cwd: f.cwd.clone(),
+                umask: f.umask,
+            }
+        };
+        cx.set_fs(Rc::new(RefCell::new(copy)));
+    }
+    // 与 Linux 的 exit_sem 一样，执行并丢掉 SysV 信号量的 undo
+    if flags & CLONE_SYSVSEM != 0 {
+        let tgid = cx.tgid();
+        cx.k().ipc.exit(tgid);
+    }
+    Ok(0)
 }
 
 /// pid 参数为 0 时表示调用者自己。

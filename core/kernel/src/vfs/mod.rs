@@ -85,8 +85,10 @@ pub struct Vfs {
 
 impl Vfs {
     /// 打开 `dir` 里的 inode 仓库作为根文件系统，补齐标准的设备节点，挂上 procfs 和 devpts。
+    /// 开机（没有别的进程在用这个仓库）时清空 Linux 上是 tmpfs 的 /dev/shm 和 /run：
+    /// 共享内存、命名信号量和 pid 文件不能留到下次。
     pub fn open(dir: &Path) -> Result<Vfs, Errno> {
-        let store = Store::open(dir)?;
+        let store = Store::open(dir, &[b"dev/shm", b"run"])?;
         if let Err(e) = dev::ensure_dev_nodes(&store) {
             crate::debug::log(format_args!("cannot create the device nodes: {e}"));
         }

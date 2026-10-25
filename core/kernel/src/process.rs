@@ -293,9 +293,13 @@ pub(crate) struct ThreadGroup {
     /// 创建时刻，开机以来的时钟滴答数（`/proc/<pid>/stat`）。
     pub start_ticks: u64,
     /// 已退出线程用掉的 CPU 时间。
-    pub cpu_ns: u64,
+    pub cpu: CpuTime,
     /// 已回收的子进程用掉的 CPU 时间。
-    pub child_cpu_ns: u64,
+    pub child_cpu: CpuTime,
+    /// 驻留内存的峰值（kB，`ru_maxrss`）：getrusage、execve、退出时取样，跨 execve 保留。
+    pub maxrss_kb: u64,
+    /// 已回收的子进程（包括它们回收的）里最大的 `maxrss_kb`。
+    pub child_maxrss_kb: u64,
     /// `ITIMER_REAL`：fork 不继承，execve 保留。
     pub itimer: Option<crate::itimer::ITimer>,
     /// `ITIMER_VIRTUAL`、`ITIMER_PROF`，按进程用掉的 CPU 时间计时。
@@ -345,8 +349,10 @@ impl ThreadGroup {
             cont_report: false,
             exe: Vec::new(),
             start_ticks: crate::pseudo::uptime_ns() / (1_000_000_000 / loader::CLOCK_TICKS),
-            cpu_ns: 0,
-            child_cpu_ns: 0,
+            cpu: CpuTime::default(),
+            child_cpu: CpuTime::default(),
+            maxrss_kb: 0,
+            child_maxrss_kb: 0,
             itimer: None,
             cpu_itimers: [None; 2],
             nice: 0,
@@ -365,24 +371,70 @@ impl ThreadGroup {
 
 impl ThreadGroup {
     /// 用掉的 CPU 时间：已退出的线程加上活着的线程。
+    pub fn cpu(&self, k: &Kernel) -> CpuTime {
+        let threads = self.threads.iter().filter_map(|t| k.tasks.get(t));
+        threads.fold(self.cpu, |sum, t| sum + t.cpu())
+    }
+
+    /// [`ThreadGroup::cpu`] 的总数。
     pub fn cpu_ns(&self, k: &Kernel) -> u64 {
-        self.cpu_ns
-            + self
-                .threads
-                .iter()
-                .filter_map(|t| k.tasks.get(t))
-                .map(|t| t.cpu_ns())
-                .sum::<u64>()
+        self.cpu(k).total_ns
+    }
+
+    /// 取一次驻留内存的样，更新峰值。
+    pub fn sample_rss(&mut self, mm: &crate::mm::Mm) {
+        self.maxrss_kb = self.maxrss_kb.max(mm.resident_pages() * 4);
     }
 }
 
-/// `struct rusage`：宿主的 CPU 时钟分不出用户态和内核态，全部算作 `ru_utime`，
-/// 其余字段为 0。
-pub(crate) fn encode_rusage(cpu_ns: u64) -> [u8; 144] {
-    let mut b = [0u8; 144];
-    b[..8].copy_from_slice(&(cpu_ns / 1_000_000_000).to_le_bytes());
-    b[8..16].copy_from_slice(&(cpu_ns % 1_000_000_000 / 1000).to_le_bytes());
-    b
+/// 用掉的 CPU 时间，其中 `sys_ns` 是内核态的部分（不超过 `total_ns`，见 [`Task::cpu`](crate::task::Task::cpu)）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CpuTime {
+    pub total_ns: u64,
+    pub sys_ns: u64,
+}
+
+impl CpuTime {
+    pub fn user_ns(self) -> u64 {
+        self.total_ns - self.sys_ns
+    }
+}
+
+impl std::ops::Add for CpuTime {
+    type Output = CpuTime;
+    fn add(self, o: CpuTime) -> CpuTime {
+        CpuTime {
+            total_ns: self.total_ns + o.total_ns,
+            sys_ns: self.sys_ns + o.sys_ns,
+        }
+    }
+}
+
+impl std::ops::AddAssign for CpuTime {
+    fn add_assign(&mut self, o: CpuTime) {
+        *self = *self + o;
+    }
+}
+
+/// getrusage、wait4 报告的资源用量。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Rusage {
+    pub cpu: CpuTime,
+    /// 驻留内存的峰值（kB）。
+    pub maxrss_kb: u64,
+}
+
+impl Rusage {
+    /// `struct rusage`：用户态、内核态的 CPU 时间和 `ru_maxrss`，其余字段为 0。
+    pub fn encode(&self) -> [u8; 144] {
+        let mut b = [0u8; 144];
+        for (at, ns) in [(0, self.cpu.user_ns()), (16, self.cpu.sys_ns)] {
+            b[at..at + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+            b[at + 8..at + 16].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
+        }
+        b[32..40].copy_from_slice(&self.maxrss_kb.to_le_bytes());
+        b
+    }
 }
 
 /// 线程组的最后一个线程退出之后：把子进程交给 init，通知父进程或者直接回收。

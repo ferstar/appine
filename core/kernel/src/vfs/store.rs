@@ -286,18 +286,51 @@ impl Store {
         Ok(store)
     }
 
-    /// 打开已有的仓库。没有别的进程在使用它时，清理上次运行留下的已删除 inode。
-    pub fn open(dir: &Path) -> Result<Store, Errno> {
+    /// 打开已有的仓库。没有别的进程在使用它时（相当于开机），清空 `volatile` 里的目录
+    /// （相对根目录的路径，比如 `dev/shm`：Linux 上它们是 tmpfs），清理上次运行留下的
+    /// 已删除 inode。
+    pub fn open(dir: &Path, volatile: &[&[u8]]) -> Result<Store, Errno> {
         if !dir.join("meta.db").exists() {
             return Err(Errno::ENOENT);
         }
         let store = Self::connect(dir)?;
         let fd = store.lock.as_raw_fd();
         if appine_hal::flock(fd, true, false).is_ok() {
+            for path in volatile {
+                store.empty_dir(path)?;
+            }
             store.remove_orphans()?;
         }
         appine_hal::flock(fd, false, true).map_err(Errno)?;
         Ok(store)
+    }
+
+    /// 清空目录 `path` 的内容，目录本身保留。不存在或者不是目录（比如符号链接）时
+    /// 什么也不做。
+    fn empty_dir(&self, path: &[u8]) -> Result<(), Errno> {
+        let mut dir = ROOT;
+        for name in path.split(|&b| b == b'/') {
+            match self.lookup(dir, name)? {
+                Some(ino) => dir = ino,
+                None => return Ok(()),
+            }
+        }
+        if !self.stat_row(dir)?.is_dir() {
+            return Ok(());
+        }
+        self.remove_contents(dir)
+    }
+
+    fn remove_contents(&self, dir: Ino) -> Result<(), Errno> {
+        for e in self.readdir(dir)? {
+            if e.mode & mode::S_IFMT == mode::S_IFDIR {
+                self.remove_contents(e.ino)?;
+                self.rmdir(dir, &e.name)?;
+            } else {
+                self.unlink(dir, &e.name)?;
+            }
+        }
+        Ok(())
     }
 
     fn remove_orphans(&self) -> Result<(), Errno> {
@@ -1233,7 +1266,7 @@ mod tests {
     fn cache_follows_own_and_other_processes_writes() {
         let (a, dir) = temp_store("cache");
         // 第二个连接相当于另一个 appine 进程
-        let b = Store::open(&dir).unwrap();
+        let b = Store::open(&dir, &[]).unwrap();
         let names = |s: &Store| -> Vec<Vec<u8>> {
             s.readdir(ROOT)
                 .unwrap()
@@ -1311,7 +1344,7 @@ mod tests {
         assert_eq!(s.mkdir(ROOT, b"bin", 0o755, 0, 0), Err(Errno::EEXIST));
 
         drop(s);
-        let s = Store::open(&dir).unwrap();
+        let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.lookup(bin, b"busybox").unwrap(), Some(busybox));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1364,7 +1397,7 @@ mod tests {
         assert_eq!(s.stat(ROOT).unwrap().nlink, 2);
         assert_eq!(s.unlink(ROOT, b"a"), Err(Errno::ENOENT));
         drop(s);
-        let s = Store::open(&dir).unwrap();
+        let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.stat(f), Err(Errno::ENOENT));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1399,15 +1432,38 @@ mod tests {
         assert_eq!((st.nlink, st.size), (0, 4));
         s.set_xattr(anon, b"user.x", b"1", false, false).unwrap();
         // 别的进程还在使用仓库时不清理：它可能还打开着这个 inode
-        let other = Store::open(&dir).unwrap();
+        let other = Store::open(&dir, &[]).unwrap();
         assert!(other.stat_row(anon).is_ok());
         drop(other);
         // 独占打开仓库时清理掉没有名字的 inode 和它的扩展属性
         drop((file, s));
-        let s = Store::open(&dir).unwrap();
+        let s = Store::open(&dir, &[]).unwrap();
         assert!(s.stat_row(anon).is_err());
         assert_eq!(s.list_xattr(anon).unwrap(), Vec::<Vec<u8>>::new());
         assert_eq!(s.get_xattr(f, b"user.a").unwrap(), b"one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn volatile_directories_are_emptied_on_first_open() {
+        let (s, dir) = temp_store("volatile");
+        let dev = s.mkdir(ROOT, b"dev", 0o755, 0, 0).unwrap();
+        let shm = s.mkdir(dev, b"shm", 0o1777, 0, 0).unwrap();
+        s.create_file(shm, b"seg", 0o600, 0, 0).unwrap();
+        let run = s.mkdir(ROOT, b"run", 0o755, 0, 0).unwrap();
+        let sub = s.mkdir(run, b"sub", 0o755, 0, 0).unwrap();
+        s.create_file(sub, b"pid", 0o644, 0, 0).unwrap();
+        s.symlink(ROOT, b"tmp", b"run", 0, 0).unwrap();
+        let volatile: &[&[u8]] = &[b"dev/shm", b"run", b"tmp", b"missing/dir"];
+        // 别的进程还在使用仓库：不是开机，什么都不删
+        let other = Store::open(&dir, volatile).unwrap();
+        assert!(other.lookup(shm, b"seg").unwrap().is_some());
+        drop((other, s));
+        let s = Store::open(&dir, volatile).unwrap();
+        assert!(s.readdir(shm).unwrap().is_empty());
+        assert!(s.readdir(run).unwrap().is_empty());
+        assert_eq!(s.stat(shm).unwrap().mode & 0o7777, 0o1777);
+        assert!(s.lookup(ROOT, b"tmp").unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1427,7 +1483,7 @@ mod tests {
             .map(|d| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    let s = Store::open(&dir).unwrap();
+                    let s = Store::open(&dir, &[]).unwrap();
                     for i in 0..100 {
                         let name = format!("f{i}");
                         s.create_file(d, name.as_bytes(), 0o644, 0, 0).unwrap();

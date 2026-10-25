@@ -274,6 +274,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         194 => ipc::shmget(cx, a[0] as i32, a[1], a[2] as i32),
         195 => ipc::shmctl(cx, a[0] as i32, a[1] as i32, a[2]),
         196 => ipc::shmat(cx, a[0] as i32, a[1], a[2] as i32),
+        97 => proc::unshare(cx, a[0]),
         197 => ipc::shmdt(cx, a[0]),
         198 => net::socket(cx, a[0] as i32, a[1] as u32, a[2] as i32),
         199 => net::socketpair(cx, a[0] as i32, a[1] as u32, a[2] as i32, a[3]),

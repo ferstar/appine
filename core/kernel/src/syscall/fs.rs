@@ -14,7 +14,7 @@ use super::{IO_CHUNK, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, request_wake};
+use crate::kernel::{Cx, Tid, request_wake};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
-use crate::vfs::{Node, Vfs, normalize};
+use crate::vfs::{Node, Pseudo, Vfs, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -690,7 +690,11 @@ fn open_store(
     created: Option<std::fs::File>,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
-    let st = store.stat(ino)?;
+    // 已经打开的（刚建好的，或者重新打开的已删除文件）从打开的 object 取属性
+    let st = match &created {
+        Some(f) => store.stat_open(ino, f)?,
+        None => store.stat(ino)?,
+    };
     if created.is_none() {
         let mut mask = open_mask(flags);
         match st.kind() {
@@ -814,10 +818,14 @@ fn open_pseudo(
     match node {
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
         PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), (cred.fsuid, cred.fsgid)),
-        PseudoNode::OpenFd(pid, fd) => return reopen(cx, vfs, pid, fd, accmode),
+        PseudoNode::OpenFd(pid, fd) => return reopen(cx, cred, vfs, pid, fd, flags),
         _ => {}
     }
     let view = cx.view(vfs);
+    // O_NOFOLLOW 时停在了符号链接（比如 /proc/self/fd/<n>）上
+    if Pseudo::kind(&view, &node)? == mode::S_IFLNK {
+        return Err(Errno::ELOOP);
+    }
     if vfs.is_dir(&view, &Node::Pseudo(node.clone()))? {
         if accmode != oflags::O_RDONLY {
             return Err(Errno::EISDIR);
@@ -837,11 +845,47 @@ fn open_pseudo(
     Ok(FileKind::Proc { node, data })
 }
 
-/// 经由 `/proc/<pid>/fd/<n>` 重新打开一个不在仓库里的文件：管道得到同一个管道的
-/// 一端，宿主 fd 得到同一个宿主 fd。
-fn reopen(cx: &Cx<'_>, vfs: &Vfs, pid: i32, fd: i32, accmode: u32) -> Result<FileKind, Errno> {
+/// 经由 `/proc/<pid>/fd/<n>` 重新打开一个没有路径的文件：管道得到同一个管道的
+/// 一端，宿主 fd 得到同一个宿主 fd，已经删除的普通文件（memfd、删除之后还开着的）
+/// 经由宿主的 `/proc/self/fd` 打开同一个宿主文件（仓库里的 object 已经删了）。
+fn reopen(
+    cx: &mut Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    pid: i32,
+    fd: i32,
+    flags: u32,
+) -> Result<FileKind, Errno> {
+    let accmode = flags & oflags::O_ACCMODE;
     let file = cx.view(vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
     let f = file.borrow();
+    if let FileKind::Regular { ino, file: host } = &f.kind {
+        let ino = *ino;
+        let st = vfs.store().stat_open(ino, host)?;
+        let truncate = flags & oflags::O_TRUNC != 0;
+        let mask = open_mask(flags) | if truncate { MAY_WRITE } else { 0 };
+        cred.permission(&st, mask)?;
+        if truncate && accmode != oflags::O_RDONLY {
+            check_seals(cx, &f, false, |_| 0)?;
+        }
+        // 宿主 fd 总是可读的，原来以写方式打开时也可写：够用就复制一份（读写都按位置
+        // 进行，偏移由各自的打开文件记着）。不够用时经由宿主的 /proc/self/fd 重新打开，
+        // 被删除的文件在 virtiofs 这类文件系统上打不开
+        let new = if accmode == oflags::O_RDONLY || f.writable() {
+            host.try_clone()
+        } else {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!(
+                    "/proc/self/fd/{}",
+                    std::os::fd::AsRawFd::as_raw_fd(host)
+                ))
+        }
+        .map_err(host_errno)?;
+        drop(f);
+        return open_store(cx, cred, vfs.store(), ino, flags, Some(new));
+    }
     match &f.kind {
         FileKind::Pipe(end) => Ok(FileKind::Pipe(PipeEnd::open(
             &end.pipe,
@@ -1041,7 +1085,11 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if !f.writable() || *seals & F_SEAL_SEAL != 0 {
                 return Err(Errno::EPERM);
             }
-            *seals |= add;
+            // 还有可写的共享映射时不能封印写入
+            if add & F_SEAL_WRITE != 0 && writably_mapped(cx, &f) {
+                return Err(Errno::EBUSY);
+            }
+            *cx.k().seals.get_mut(&ino).unwrap() |= add;
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
@@ -2105,6 +2153,24 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
 /// 文件变短之后调用：所有地址空间里映射它的页，超出新末尾的从页表里拿掉
 /// （[`crate::mm::Mm::file_truncated`]）。当前进程的地址空间在 syscall 结束时同步，
 /// 别的进程的在这里同步。
+/// 有没有哪个地址空间以可写的共享映射映射着这个打开的文件。
+fn writably_mapped(cx: &Cx<'_>, f: &OpenFile) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let FileKind::Regular { file, .. } = &f.kind else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    cx.kr().tasks.values().any(|t| {
+        t.res
+            .borrow()
+            .mm
+            .borrow()
+            .writably_maps(meta.dev(), meta.ino())
+    })
+}
+
 fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = host.metadata() else {
@@ -2411,6 +2477,8 @@ enum IoPath {
     TimerFd(Rc<RefCell<TimerFd>>),
     SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
     Inotify(Rc<RefCell<super::Inotify>>),
+    /// `/proc/<pid>/pagemap`：按读的位置现算。
+    Pagemap(Tid),
     Local,
 }
 
@@ -2424,6 +2492,10 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::TimerFd(t) => IoPath::TimerFd(t.clone()),
         FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
         FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
+        FileKind::Proc {
+            node: PseudoNode::Entry(pid, _, pseudo::Entry::Pagemap),
+            ..
+        } => IoPath::Pagemap(*pid),
         _ => IoPath::Local,
     }
 }
@@ -2432,7 +2504,8 @@ fn io_path(f: &OpenFile) -> IoPath {
 /// Linux 一样先于打开方式检查（只读打开的管道 pwrite 也是 ESPIPE），`O_PATH` 除外。
 fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     let path = io_path(f);
-    if offset.is_some() && !matches!(path, IoPath::Local) && f.flags & oflags::O_PATH == 0 {
+    let seekable = matches!(path, IoPath::Local | IoPath::Pagemap(_));
+    if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
         return Err(Errno::ESPIPE);
     }
     Ok(path)
@@ -2823,6 +2896,14 @@ fn read_bytes(
         IoPath::TimerFd(t) => super::timerfd::read(cx, &t, nonblock, buf),
         IoPath::SignalFd(s) => super::sig::signalfd_read(cx, &s, nonblock, buf),
         IoPath::Inotify(i) => super::inotify::read(cx, &i, nonblock, buf),
+        IoPath::Pagemap(pid) => {
+            let pos = offset.unwrap_or(file.borrow().pos);
+            let n = pseudo::read_pagemap(cx.kr(), pid, buf, pos)?;
+            if offset.is_none() {
+                file.borrow_mut().pos = pos + n as u64;
+            }
+            Ok(n)
+        }
         IoPath::Local => {
             let n = local_read(&mut file.borrow_mut(), buf, offset)?;
             if n > 0 {
@@ -2858,7 +2939,9 @@ fn write_bytes(
         IoPath::Pty(t, master) => tty::write(cx, &t, master, nonblock, data),
         IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
         IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
-        IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) => Err(Errno::EINVAL),
+        IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {
+            Err(Errno::EINVAL)
+        }
         IoPath::Local => {
             let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
             check_seals(cx, &file.borrow(), true, |size| {

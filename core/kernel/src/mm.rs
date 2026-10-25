@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
@@ -50,6 +50,10 @@ pub mod flags {
 const MMAP_TOP: u64 = crate::loader::STACK_TOP - crate::loader::STACK_SIZE - (1 << 30);
 /// 最低可分配地址，与 Linux 的 mmap_min_addr 默认值相同。
 const MMAP_MIN: u64 = 0x10000;
+/// `/proc/sys/vm/max_map_count`：一个地址空间最多有多少个 VMA。每个 VMA 是一个宿主
+/// 映射，而宿主的映射数（Android 上也是 65530）是整个 App 进程共用的。
+pub(crate) static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
+
 /// 堆（brk）第一次扩展时预留的宿主地址空间：之后的扩展只是加长同一个 VMA。不碰的部分
 /// 不占内存（`MAP_NORESERVE`）；超出的部分照旧单独映射。
 const HEAP_RESERVE: u64 = 256 << 20;
@@ -207,6 +211,8 @@ pub struct Mm {
     pub membarrier: i32,
     /// `mlockall(MCL_FUTURE)`：以后的映射也锁住。
     pub lock_future: bool,
+    /// 同时带了 `MCL_ONFAULT`：以后的映射锁住但不预先调进内存。
+    pub lock_onfault: bool,
     /// 正在执行的程序文件在仓库里的 inode（ETXTBSY）。
     pub exe: Option<u64>,
     /// vDSO 的加载地址（信号处理函数默认返回到其中的 sigreturn 跳板）。
@@ -226,6 +232,10 @@ pub struct Region {
     pub name: Option<Rc<[u8]>>,
     /// 文件映射：起点对应的文件偏移和文件的 inode。
     pub file: Option<(u64, u64)>,
+    /// mlock 锁住了。
+    pub locked: bool,
+    /// 能获得写权限（smaps 的 `mw`）。
+    pub may_write: bool,
 }
 
 fn page_up(v: u64) -> Option<u64> {
@@ -295,6 +305,7 @@ impl Mm {
             users: Vec::new(),
             membarrier: 0,
             lock_future: false,
+            lock_onfault: false,
             exe: None,
             vdso: 0,
             args: (0, 0),
@@ -447,6 +458,7 @@ impl Mm {
         region: Rc<HostRegion>,
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
+        self.room_for(1)?;
         Self::map_pages(&mut self.mmu, start, host, len, prot)?;
         self.vmas.insert(
             start,
@@ -471,8 +483,30 @@ impl Mm {
         Ok(())
     }
 
+    /// 还能不能再多 `more` 个 VMA（`vm.max_map_count`）。
+    fn room_for(&self, more: usize) -> Result<(), Errno> {
+        if self.vmas.len() + more > MAX_MAP_COUNT.load(Ordering::Relaxed) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// 在这些地址上拆开 VMA 要多出几个。
+    fn splits(&self, addrs: &[u64]) -> usize {
+        addrs
+            .iter()
+            .filter(|&&a| {
+                self.vmas
+                    .range(..a)
+                    .next_back()
+                    .is_some_and(|(&s, v)| s + v.len > a)
+            })
+            .count()
+    }
+
     /// 把一个完整的 VMA 放到 `start`；调用方保证区间空闲。
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
+        self.room_for(1)?;
         Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot)?;
         self.vmas.insert(start, v);
         Ok(())
@@ -911,6 +945,7 @@ impl Mm {
         let start = addr & !(PAGE_SIZE - 1);
         let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
         self.check_mapped(start, end - start)?;
+        self.room_for(self.splits(&[start, end]))?;
         self.split_at(start);
         self.split_at(end);
         for (_, v) in self.vmas.range_mut(start..end) {
@@ -1073,6 +1108,18 @@ impl Mm {
             return Err(Errno::EINVAL);
         }
         let end = addr + len;
+        // 与 Linux 一样，只有把一个 VMA 拆成三段时才受 max_map_count 限制
+        let inside = |a: u64| {
+            self.vmas
+                .range(..a)
+                .next_back()
+                .filter(|(s, v)| **s + v.len > a)
+        };
+        if let (Some((s1, _)), Some((s2, _))) = (inside(addr), inside(end))
+            && s1 == s2
+        {
+            self.room_for(1)?;
+        }
         self.split_at(addr);
         self.split_at(end);
         // 页表按页解除映射，所以只处理确实存在的 VMA：guest 传一个覆盖整个地址空间的长度也很快
@@ -1124,6 +1171,7 @@ impl Mm {
         if prot & prot::WRITE != 0 && !writable {
             return Err(Errno::EACCES);
         }
+        self.room_for(self.splits(&[addr, end]))?;
         self.split_at(addr);
         self.split_at(end);
         if prot & prot::WRITE != 0 {
@@ -1274,6 +1322,16 @@ impl Mm {
         Ok(())
     }
 
+    /// 有没有能获得写权限的共享映射指向宿主文件 (`dev`, `ino`)（memfd 加 `F_SEAL_WRITE`
+    /// 之前检查）。
+    pub fn writably_maps(&self, dev: u64, ino: u64) -> bool {
+        self.vmas.values().any(|v| {
+            v.backing == Backing::Shared
+                && v.may_write
+                && v.file_id.is_some_and(|(d, i, _)| (d, i) == (dev, ino))
+        })
+    }
+
     /// 宿主文件 (`dev`, `ino`) 被截短成 `size` 字节：映射它的 VMA 里超出新末尾的页从
     /// 页表里拿掉，之后 guest 访问得到 SIGBUS，与 Linux 的 truncate 相同。不拿掉的话，
     /// 宿主访问超出文件末尾的映射会收到 SIGBUS，整个 App 退出。返回有没有改动，有改动时
@@ -1336,6 +1394,8 @@ impl Mm {
                 shared: v.backing == Backing::Shared,
                 name: v.name.clone().or_else(|| special.map(Rc::from)),
                 file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
+                locked: v.locked,
+                may_write: v.may_write,
             }
         });
         for r in regions {
@@ -1349,8 +1409,8 @@ impl Mm {
                 };
                 if joins
                     && last.end == r.start
-                    && last.prot == r.prot
-                    && last.shared == r.shared
+                    && (last.prot, last.shared, last.locked) == (r.prot, r.shared, r.locked)
+                    && last.may_write == r.may_write
                     && last.name == r.name
                 {
                     last.end = r.end;
@@ -1362,15 +1422,80 @@ impl Mm {
         out
     }
 
+    /// 把 `[addr, addr + len)` 的页调进宿主内存（mlock、`MAP_POPULATE`）。文件映射超出
+    /// 文件末尾的部分不碰。
+    pub fn populate(&self, addr: u64, len: u64) {
+        let end = addr.saturating_add(len);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        // 与 Linux 一样，没有任何权限的映射不调入
+        for (&s, v) in self.vmas.range(first..end).filter(|(_, v)| v.prot != 0) {
+            let from = addr.max(s);
+            let to = end.min(s + v.file_len);
+            if from < to {
+                // SAFETY: [from, to) 在这个 VMA 里，宿主内存由它持有，并且在文件末尾之前
+                unsafe {
+                    appine_hal::populate(
+                        v.host.as_ptr().add((from - s) as usize),
+                        (to - from) as usize,
+                    )
+                };
+            }
+        }
+    }
+
+    /// `/proc/<pid>/pagemap` 从 `addr` 起 `pages` 页的表项：驻留（第 63 位），文件页或者
+    /// 共享内存（第 61 位），私有匿名页只映射了一次（第 56 位）。与没有特权的进程在
+    /// Linux 上看到的一样，不给页框号。
+    pub fn pagemap(&self, addr: u64, pages: usize) -> Vec<u64> {
+        const PRESENT: u64 = 1 << 63;
+        const FILE: u64 = 1 << 61;
+        const EXCLUSIVE: u64 = 1 << 56;
+        let mut out = vec![0u64; pages];
+        let end = addr.saturating_add(pages as u64 * PAGE_SIZE);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        for (&s, v) in self.vmas.range(first..end) {
+            let from = addr.max(s);
+            let to = end.min(s + v.len);
+            if from >= to {
+                continue;
+            }
+            let bits = if v.backing == Backing::Anonymous {
+                PRESENT | EXCLUSIVE
+            } else {
+                PRESENT | FILE
+            };
+            // SAFETY: [from, to) 落在这个 VMA 内
+            let host = unsafe { v.host.as_ptr().add((from - s) as usize) };
+            let resident = appine_hal::page_residency(host, (to - from) as usize);
+            let at = ((from - addr) / PAGE_SIZE) as usize;
+            for (i, r) in resident.into_iter().enumerate() {
+                if r {
+                    out[at + i] = bits;
+                }
+            }
+        }
+        out
+    }
+
     /// 映射的总大小（字节）。
     pub fn size(&self) -> u64 {
         self.vmas.values().map(|v| v.len).sum()
     }
 
-    /// 驻留在宿主内存里的 4K 页数。
+    /// 驻留在宿主内存里的 4K 页数。没写过的匿名映射跳过：读它只会映射到零页，Linux 的
+    /// RSS 也不算零页。
     pub fn resident_pages(&self) -> u64 {
         self.vmas
             .values()
+            .filter(|v| v.backing != Backing::Anonymous || v.written.get())
             .map(|v| appine_hal::resident_pages(v.host.as_ptr(), v.len as usize) as u64)
             .sum()
     }
