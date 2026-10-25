@@ -6,7 +6,8 @@ Run Alpine Linux as Android App 🤖
 
 ## Development
 
-The architecture and milestones are described in [docs/design.md](docs/design.md).
+The architecture and the milestone plan are described in [docs/design.md](docs/design.md);
+the results of each milestone are recorded in [docs/milestones.md](docs/milestones.md).
 
 The primary development host is Linux arm64. On macOS, `scripts/dev` runs a command in an
 arm64 Linux container (colima, OrbStack or Docker Desktop):
