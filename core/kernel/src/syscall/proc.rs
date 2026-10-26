@@ -70,6 +70,7 @@ const MAX_INTERP_DEPTH: usize = 4;
 const SHEBANG_MAX: usize = 256;
 
 pub(super) fn exit(cx: &mut Cx<'_>, code: i32) -> Flow {
+    cx.task.exit_code.set(code & 0xff);
     if cx.tid() == cx.tgid() {
         cx.t.group.borrow_mut().leader_code = code & 0xff;
     }
@@ -103,7 +104,7 @@ struct CloneArgs {
 
 pub(super) fn clone(
     cx: &mut Cx<'_>,
-    cpu: &Cpu,
+    cpu: &mut Cpu,
     flags: u64,
     stack: u64,
     ptid: u64,
@@ -128,7 +129,7 @@ pub(super) fn clone(
 }
 
 /// clone3：参数在 `struct clone_args` 里，比 clone 多了 pidfd、栈的大小和 set_tid。
-pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &Cpu, uargs: u64, size: usize) -> SysResult {
+pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) -> SysResult {
     // CLONE_ARGS_SIZE_VER0 和已知的最大长度（VER2）
     const MIN: usize = 64;
     const KNOWN: usize = 88;
@@ -185,7 +186,7 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &Cpu, uargs: u64, size: usize) -> Sys
     do_clone(cx, cpu, args)
 }
 
-fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
+fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let CloneArgs {
         flags,
         stack,
@@ -342,6 +343,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
     task.deadline.set(cx.task.deadline.get());
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));
+    // 被跟踪的线程 clone 出来的可能也被跟踪（crate::ptrace）
+    let traced = crate::ptrace::clone(cx.task, &task, flags, args.exit_signal);
 
     // 写 tid 之前先确认能启动线程，失败时不留下任何痕迹
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -379,11 +382,18 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         }
     }
 
+    // 跟踪者打开了这个事件：报告新线程（PTRACE_EVENT_FORK、VFORK、CLONE）
+    if let Some(e) = traced
+        && !crate::ptrace::event(cx, cpu, e, tid as u64)
+    {
+        return Ok(tid as u64);
+    }
     // vfork：等子进程 execve 或退出；只有致命信号能打断（Linux 的 TASK_KILLABLE）
     if let Some(done) = vfork_done {
         while !done.get() && !cx.task.killed.get() {
             cx.wait(None, &mut [])?;
         }
+        crate::ptrace::event(cx, cpu, crate::ptrace::event::VFORK_DONE, tid as u64);
     }
     Ok(tid as u64)
 }
@@ -742,12 +752,14 @@ enum Who {
     Pgid(Tid),
 }
 
-/// 子进程的状态变化。
+/// 子进程（或者被跟踪的线程）的状态变化。
 #[derive(Clone, Copy)]
 enum ChildEvent {
     Exited(ExitStatus),
     Stopped(Signal),
     Continued,
+    /// 被跟踪的线程停在 ptrace-stop 里，带着报告给跟踪者的状态（`crate::ptrace`）。
+    Trapped(i32),
 }
 
 impl ChildEvent {
@@ -757,6 +769,7 @@ impl ChildEvent {
             ChildEvent::Exited(s) => s.wait_status(),
             ChildEvent::Stopped(sig) => sig.number() << 8 | 0x7f,
             ChildEvent::Continued => 0xffff,
+            ChildEvent::Trapped(code) => code << 8 | 0x7f,
         }
     }
 
@@ -768,6 +781,7 @@ impl ChildEvent {
             ChildEvent::Continued => {
                 SigInfo::child_event(pid, code::CLD_CONTINUED, Signal::CONT.number())
             }
+            ChildEvent::Trapped(status) => SigInfo::child_event(pid, code::CLD_TRAPPED, status),
         }
     }
 }
@@ -785,29 +799,37 @@ struct Wanted {
 type Found = (Tid, ChildEvent, process::Rusage);
 
 /// 找到一个符合条件的子进程状态变化，`consume` 时取走它（已结束的子进程同时被回收）。
-/// 没有子进程符合条件时返回 ECHILD。
+/// 跟踪着的线程（不一定是子进程）的 ptrace-stop 和退出也算。没有子进程、跟踪着的线程
+/// 符合条件时返回 ECHILD。
 fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, Errno> {
     let children = cx.t.group.borrow().children.clone();
+    let me = cx.tgid();
+    let matches = |pid: Tid, pgid: Tid| match who {
+        Who::Pid(p) => p == pid,
+        Who::Any => true,
+        Who::Pgid(g) => g == pgid,
+    };
+    // 与 Linux 一样，子进程的用量包括它回收的子进程。找到事件才算：活着的线程的内核态
+    // 时间要读宿主的 /proc，wait 每次被叫醒都会重新扫一遍子进程
+    let usage = |g: &ThreadGroup, k: &crate::kernel::Kernel| process::Rusage {
+        cpu: g.cpu(k) + g.child_cpu,
+        maxrss_kb: g.maxrss_kb.max(g.child_maxrss_kb),
+    };
     let mut any = false;
     for c in children {
         let Some(child) = cx.kr().groups.get(&c).cloned() else {
             continue;
         };
-        let matches = match who {
-            Who::Pid(p) => p == c,
-            Who::Any => true,
-            Who::Pgid(g) => g == child.borrow().pgid,
-        };
-        if !matches {
+        if !matches(c, child.borrow().pgid) {
             continue;
         }
         any = true;
-        // 与 Linux 一样，子进程的用量包括它回收的子进程。找到事件才算：活着的线程的内核态
-        // 时间要读宿主的 /proc，wait 每次被叫醒都会重新扫一遍子进程
-        let usage = |g: &ThreadGroup, k: &crate::kernel::Kernel| process::Rusage {
-            cpu: g.cpu(k) + g.child_cpu,
-            maxrss_kb: g.maxrss_kb.max(g.child_maxrss_kb),
-        };
+        // 主线程被自己跟踪着：停止和继续按 ptrace-stop 报告（下面），与 Linux 一样不重复报告
+        let traced = cx
+            .kr()
+            .tasks
+            .get(&c)
+            .is_some_and(|t| t.trace.borrow().tracer == Some(me));
         let mut g = child.borrow_mut();
         if let (true, Some(status)) = (want.exited, g.zombie) {
             let usage = usage(&g, cx.kr());
@@ -821,6 +843,9 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
             }
             return Ok(Some((c, ChildEvent::Exited(status), usage)));
         }
+        if traced {
+            continue;
+        }
         if let (true, Some(sig)) = (want.stopped, g.stop_report) {
             if want.consume {
                 g.stop_report = None;
@@ -832,6 +857,50 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
                 g.cont_report = false;
             }
             return Ok(Some((c, ChildEvent::Continued, usage(&g, cx.kr()))));
+        }
+    }
+    // 跟踪着的线程：ptrace-stop 不要求 WUNTRACED（与 Linux 一样，也不要求 __WALL）
+    let tracees: Vec<_> = cx
+        .kr()
+        .tasks
+        .values()
+        .filter(|t| t.trace.borrow().tracer == Some(me))
+        .cloned()
+        .collect();
+    for t in tracees {
+        let pgid = cx.kr().groups.get(&t.tgid).map_or(0, |g| g.borrow().pgid);
+        if !matches(t.tid.get(), pgid) {
+            continue;
+        }
+        any = true;
+        let mut trace = t.trace.borrow_mut();
+        if let (true, false, Some(code)) = (trace.stopped(), trace.reported, trace.exit_code()) {
+            if want.consume {
+                trace.reported = true;
+            }
+            // 与 Linux 一样报告它所在进程的用量（strace -c 用它算系统调用的时间）
+            let usage = cx
+                .kr()
+                .groups
+                .get(&t.tgid)
+                .map_or_else(process::Rusage::default, |g| usage(&g.borrow(), cx.kr()));
+            return Ok(Some((t.tid.get(), ChildEvent::Trapped(code), usage)));
+        }
+    }
+    // 跟踪着的线程退出了
+    let exits = &cx.kr().trace_exits;
+    if let Some(i) = exits
+        .iter()
+        .position(|e| e.tracer == me && matches(e.pid, e.pgid))
+    {
+        any = true;
+        if want.exited {
+            let (pid, status) = (exits[i].pid, exits[i].status);
+            if want.consume {
+                cx.k().trace_exits.remove(i);
+            }
+            let usage = process::Rusage::default();
+            return Ok(Some((pid, ChildEvent::Exited(status), usage)));
         }
     }
     if any { Ok(None) } else { Err(Errno::ECHILD) }
@@ -983,7 +1052,7 @@ pub(super) fn pidfd_open(cx: &mut Cx<'_>, pid: i32, flags: u32) -> SysResult {
 
 /// 能不能像 ptrace 那样访问 `target`（`PTRACE_MODE_ATTACH_REALCREDS`）：是自己；或者
 /// 真实用户和组等于目标的所有用户和组，并且目标可以 dump；或者有 `CAP_SYS_PTRACE`。
-fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
+pub(super) fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
     let me = cx.cred();
     let t = &target.cred;
     let same = [t.ruid, t.euid, t.suid].iter().all(|&u| u == me.ruid)

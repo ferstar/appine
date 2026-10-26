@@ -25,6 +25,6 @@
 
 **推迟项**：
 
-- 内核别的地方访问栈底下面时不会让栈增长，返回 EFAULT（Linux 上会增长）：指向 SP 下面的缓冲区（arm64 的 ABI 不让程序用 SP 下面的内存，只有故意这样做的程序会碰到），以及 `/proc/<pid>/mem`、`process_vm_writev` 访问别的进程的栈。→ 后两个接口本身还没有实现（2026-10-27 核对代码）
+- 内核别的地方访问栈底下面时不会让栈增长，返回 EFAULT（Linux 上会增长）：指向 SP 下面的缓冲区（arm64 的 ABI 不让程序用 SP 下面的内存，只有故意这样做的程序会碰到），以及 `/proc/<pid>/mem`、`process_vm_writev` 访问别的进程的栈。→ 后两个接口本身还没有实现（2026-10-27 核对代码）；`process_vm_writev` 后来补上了（M9 之前：ptrace 的第一步），访问别的进程的栈底下面仍是 EFAULT
 - 不限栈大小时没有用 Linux 的 legacy 布局（见上）；mmap 的地址提示仍然只在 mmap 区的上界以下才采用。
 - 没有 `/proc/<pid>/limits`。→ 已补上（M9 之前：平均负载、sysfs 和 limits）

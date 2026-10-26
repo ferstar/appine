@@ -385,6 +385,11 @@ fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
             put32(20, fd as u32);
             put32(28, band as u32);
         }
+        // 跟踪者给的：多数 si_code 的开头是发送者的 pid 和 uid
+        InfoFields::Raw(rest) => {
+            put32(12, u32::from_le_bytes(rest[..4].try_into().unwrap()));
+            put32(16, u32::from_le_bytes(rest[4..8].try_into().unwrap()));
+        }
     }
     if let Some(v) = value {
         b[44..48].copy_from_slice(&(v as u32).to_le_bytes());

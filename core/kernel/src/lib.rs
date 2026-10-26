@@ -22,6 +22,7 @@ mod oom;
 mod pipe;
 mod process;
 mod pseudo;
+mod ptrace;
 mod signal;
 mod syscall;
 mod task;

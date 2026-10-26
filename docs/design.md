@@ -42,7 +42,7 @@
 | C 难缠的运行时 | Go 静态二进制、node/V8、JVM | **行为正确，不要求快** | ✅ M8：Go、Node.js、OpenJDK 21/25 |
 | D 不做 | docker/podman（namespace、cgroup）、systemd、内核模块、X11/GUI | — | — |
 
-ptrace（gdb/strace）推迟到 v1 之后，目前一律返回 `EPERM`（§7.5）。
+ptrace（§7.6）：strace 可以用；gdb 要的单步、改写被跟踪进程的内存还没有。
 
 ### 1.3 性能目标
 
@@ -434,7 +434,18 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - auxv 依次提供：`AT_SYSINFO_EHDR`、`AT_MINSIGSTKSZ`、`AT_HWCAP`（§4.4）、`AT_PAGESZ=4096`、`AT_CLKTCK=100`、`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`、`AT_SECURE`、`AT_RANDOM`、`AT_HWCAP2=0`、`AT_EXECFN`、`AT_PLATFORM="aarch64"`。
 - `uname -r` 固定报告一个 LTS 版本 `6.1.0-appine`。我们把它当作一份 **ABI 契约**：除文档明确列出的例外，按这个内核版本的语义实现。比 6.1 新的功能一般不做（比如 6.9 的 `PIDFD_THREAD`），例外是 6.5 的 `cachestat`。
 - 未实现的 syscall **一律返回 `ENOSYS`，绝不崩溃**，同时记录一条本地调试日志（`APPINE_LOG=1` 时输出）。
-- 有意不实现的：ptrace 一律返回 `EPERM`（与 Yama 的 `ptrace_scope=3` 相同，程序会当作没有权限）；io_uring 保持 `ENOSYS`（§15）。
+- 有意不实现的：io_uring 保持 `ENOSYS`（§15）。
+
+### 7.6 ptrace
+
+- 被跟踪的是线程，跟踪者记的是进程：Linux 只接受跟踪者线程自己发的请求，appine 放宽到跟踪者进程里的任何线程（appine 不记 fork 的是哪个线程，PTRACE_TRACEME 的跟踪者是父进程）。权限与 Linux 的 `PTRACE_MODE_ATTACH_REALCREDS` 相同：同一个用户并且可以 dump，或者有 `CAP_SYS_PTRACE`；没有 Yama 的限制。跟踪 pid 1 是 ESRCH，内置的 init 不是 guest 进程（§6）。
+- 被跟踪的线程在这些地方停下（ptrace-stop）：投递信号之前、group-stop、PTRACE_SYSCALL 让它继续之后系统调用的入口和出口，以及 `PTRACE_EVENT_*`（fork、vfork、clone、exec、vfork 结束、退出，PTRACE_INTERRUPT 和 PTRACE_SEIZE 跟进来的新线程的 `PTRACE_EVENT_STOP`）。停住时把寄存器存一份，跟踪者读写的是这一份，继续时写回 CPU 状态；停住期间只有 SIGKILL 能让它离开。与 arm64 Linux 一样，系统调用停住时 x7 是 0（入口）或 1（出口），跟踪者看不到、也改不了它原来的值；入口处跟踪者可以经由 `NT_ARM_SYSTEM_CALL` 改编号，改成 -1 时跳过这个系统调用，x0 是跟踪者设的返回值。
+- 与 Linux 一样，被跟踪的线程不丢弃被忽略的信号（跟踪者要看到它们）；参加完 group-stop 就照常执行，即使线程组仍然停着；SEIZE 跟踪的线程的 group-stop 报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 等它结束。
+- wait 报告 ptrace-stop 不要求 `WUNTRACED`，被跟踪的线程退出时也报告给跟踪者（不是主线程的单独报告），报告 ptrace-stop 时带着被跟踪进程的 rusage（strace -c 用它算时间）。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪，停在信号投递停止里的信号照常投递。
+- regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`，以及报告 0 个槽的 `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`（调试器改用软件断点和观察点）。guest 没有 SVE、PAC、MTE、SME，也就没有它们的 regset。
+- PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径，好在入口和出口停下（§6 的不持 BKL 的系统调用不走）。vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
+- `process_vm_readv`、`process_vm_writev`：权限同上，远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少。
+- 还没有：PTRACE_SINGLESTEP、改写被跟踪进程的内存（PTRACE_POKETEXT/POKEDATA）、`/proc/<pid>/mem`。
 
 ---
 
@@ -690,7 +701,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 未开始 | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
-M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
+M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 
 ### 14.2 排序依据
 

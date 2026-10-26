@@ -18,6 +18,7 @@ mod net;
 mod poll;
 mod posix_timer;
 mod proc;
+mod ptrace;
 mod sched;
 mod sig;
 mod timerfd;
@@ -39,6 +40,7 @@ use appine_engine::Cpu;
 use crate::debug;
 use crate::errno::Errno;
 use crate::kernel::Cx;
+use crate::process::ExitStatus;
 use crate::signal;
 use crate::uaccess::UserSlice;
 
@@ -68,31 +70,72 @@ const PATH_MAX: usize = 4096;
 /// 重新执行的 svc 改成它（[`crate::signal::deliver`]）。
 pub(crate) const NR_RESTART_SYSCALL: u64 = 128;
 
+/// 编号 -1：跟踪者在入口把编号改成它时跳过这个系统调用（Linux 的 `NO_SYSCALL`）。
+const NO_SYSCALL: u64 = u64::MAX;
+
 /// 按 aarch64 Linux 的约定处理一次 `svc #0`：x8 是编号，x0–x5 是参数，返回值写回 x0。
 pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let state = cpu.state_mut();
     state.orig_x0 = state.x[0];
-    let nr = state.x[8];
-    let a: [u64; 6] = state.x[..6].try_into().unwrap();
+    let mut nr = state.x[8];
     cx.grow_stack_to(state.sp);
+    // PTRACE_SYSCALL：入口停下，跟踪者可能改了编号（NT_ARM_SYSTEM_CALL）和参数。编号改成
+    // -1 时跳过这个系统调用，x0 是跟踪者设好的返回值；程序自己用 -1 时与 Linux 一样是
+    // ENOSYS（crate::ptrace）
+    let traced = crate::ptrace::syscall_traced(cx, cpu, nr);
+    if traced {
+        if nr == NO_SYSCALL {
+            cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
+        }
+        match crate::ptrace::syscall_entry(cx, cpu, nr) {
+            Some(n) => nr = n,
+            None => return Flow::Exit,
+        }
+        if nr == NO_SYSCALL {
+            if !crate::ptrace::syscall_exit(cx, cpu) {
+                return Flow::Exit;
+            }
+            return signal::deliver(cx, cpu, true);
+        }
+    }
+    let a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
     let started = debug::trace_start();
     use xattr::Target::{Fd, Path};
 
     let result = match nr {
-        // 不返回，或者自己设置全部寄存器
-        93 => return proc::exit(cx, a[0] as i32),
-        94 => return proc::exit_group(cx, a[0] as i32),
+        // 不返回，或者自己设置全部寄存器。被跟踪时退出之前可能停下来报告
+        // （PTRACE_EVENT_EXIT），execve 之后要报告 exec 和系统调用的出口
+        93 => {
+            let flow = proc::exit(cx, a[0] as i32);
+            crate::ptrace::exit(cx, cpu, ExitStatus::Exited(a[0] as i32 & 0xff));
+            return flow;
+        }
+        94 => {
+            let flow = proc::exit_group(cx, a[0] as i32);
+            crate::ptrace::exit(cx, cpu, ExitStatus::Exited(a[0] as i32 & 0xff));
+            return flow;
+        }
         139 => return signal::sigreturn(cx, cpu),
         #[cfg(any(debug_assertions, feature = "test-hooks"))]
         crate::bug::TEST_SYSCALL => crate::bug::test_hook(cx, cpu, a[0], a[1]),
-        221 => match proc::execve(cx, cpu, a[0], a[1], a[2]) {
-            Ok(()) => return Flow::Exec,
-            Err(e) => Err(e),
-        },
-        281 => match proc::execveat(cx, cpu, a[0] as i32, a[1], (a[2], a[3]), a[4] as u32) {
-            Ok(()) => return Flow::Exec,
-            Err(e) => Err(e),
-        },
+        221 => {
+            let tid = cx.tid();
+            match proc::execve(cx, cpu, a[0], a[1], a[2]) {
+                Ok(()) => return exec_done(cx, cpu, tid),
+                Err(e) => Err(e),
+            }
+        }
+        281 => {
+            let tid = cx.tid();
+            match proc::execveat(cx, cpu, a[0] as i32, a[1], (a[2], a[3]), a[4] as u32) {
+                Ok(()) => return exec_done(cx, cpu, tid),
+                Err(e) => Err(e),
+            }
+        }
+        117 => ptrace::ptrace(cx, a[0] as i64, a[1] as i32, a[2], a[3]),
+        270 | 271 => {
+            ptrace::process_vm(cx, a[0] as i32, (a[1], a[2]), (a[3], a[4]), a[5], nr == 271)
+        }
 
         5 | 6 => xattr::setxattr(
             cx,
@@ -227,8 +270,6 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         113 => misc::clock_gettime(cx, a[0] as i32, a[1]),
         114 => misc::clock_getres(cx, a[0] as i32, a[1]),
         115 => misc::clock_nanosleep(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
-        // ptrace 没有实现：与 Yama 的 ptrace_scope=3 一样一律拒绝，程序会当作没有权限
-        117 => Err(Errno::EPERM),
         118 => sched::sched_setparam(cx, a[0] as i32, a[1]),
         119 => sched::sched_setscheduler(cx, a[0] as i32, a[1] as i32, a[2]),
         120 => sched::sched_getscheduler(cx, a[0] as i32),
@@ -440,8 +481,27 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // 解除了映射或改了权限：其他共享地址空间的线程要先刷新 TLB，才能释放宿主内存
     let sync = cx.task.sync.clone();
     cx.mm_mut().sync(&sync);
+    // PTRACE_SYSCALL：出口停下，跟踪者看到返回值
+    if traced && !crate::ptrace::syscall_exit(cx, cpu) {
+        return Flow::Exit;
+    }
     // 返回用户态之前处理挂起的信号和 syscall 重启，与 Linux 一样
     signal::deliver(cx, cpu, true)
+}
+
+/// execve 成功了（`old_tid` 是之前的 tid）：被跟踪时报告 exec（`PTRACE_EVENT_EXEC` 或者
+/// SIGTRAP）和系统调用的出口，执行新程序的第一条指令之前投递信号。
+fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flow {
+    if !crate::ptrace::traced(cx.task) {
+        return Flow::Exec;
+    }
+    if !crate::ptrace::exec(cx, cpu, old_tid) || !crate::ptrace::syscall_exit(cx, cpu) {
+        return Flow::Exit;
+    }
+    match signal::deliver(cx, cpu, false) {
+        Flow::Exit => Flow::Exit,
+        _ => Flow::Exec,
+    }
 }
 
 pub(crate) use proc::label_image;

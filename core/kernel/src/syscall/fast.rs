@@ -106,8 +106,10 @@ impl Fast {
     /// 不持 BKL 执行 `cpu` 停在的系统调用。做完了（结果写进了 x0）返回 true；返回 false
     /// 时由调用方持有 BKL 正常处理，这里除了 [`TaskState::fast_sleep`] 什么也没改。
     pub(crate) fn syscall(&self, shared: &Shared, task: &Task, cpu: &mut Cpu) -> bool {
-        // 还有没作废的 ic ivau 时要先进内核作废（task::handle）
-        if self.traced || cpu.state().ivau_page != 0 {
+        // 还有没作废的 ic ivau 时要先进内核作废（task::handle）；PTRACE_SYSCALL 时要在
+        // 入口和出口停下（crate::ptrace）
+        if self.traced || cpu.state().ivau_page != 0 || task.syscall_traced.load(Ordering::Relaxed)
+        {
             return false;
         }
         let Some(r) = self.dispatch(shared, task, cpu) else {

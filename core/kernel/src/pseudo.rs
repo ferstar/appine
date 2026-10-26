@@ -973,6 +973,12 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static
     if g.zombie.is_some() {
         return ('Z', "zombie");
     }
+    // 停在 ptrace-stop 里（PTRACE_LISTEN 时也是，与 Linux 一样）
+    if let Some(t) = ps.task(g.tgid, tid)
+        && t.trace.borrow().stop.is_some()
+    {
+        return ('t', "tracing stop");
+    }
     if g.stopped {
         return ('T', "stopped");
     }
@@ -1126,7 +1132,8 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "Umask:\t{umask:04o}").unwrap();
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
     writeln!(s, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{}", tid.unwrap_or(pid)).unwrap();
-    writeln!(s, "PPid:\t{}\nTracerPid:\t0", g.ppid).unwrap();
+    let tracer = task.as_ref().and_then(|t| t.trace.borrow().tracer);
+    writeln!(s, "PPid:\t{}\nTracerPid:\t{}", g.ppid, tracer.unwrap_or(0)).unwrap();
     let c = &g.cred;
     writeln!(s, "Uid:\t{}\t{}\t{}\t{}", c.ruid, c.euid, c.suid, c.fsuid).unwrap();
     writeln!(s, "Gid:\t{}\t{}\t{}\t{}", c.rgid, c.egid, c.sgid, c.fsgid).unwrap();

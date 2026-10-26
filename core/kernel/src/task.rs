@@ -95,6 +95,13 @@ pub(crate) struct Task {
     pub cpu_base: Cell<(u64, u64)>,
     /// 宿主线程的 tid（读宿主记的内核态时间）。
     pub host_tid: Cell<i32>,
+    /// ptrace 的状态（[`crate::ptrace`]）。
+    pub trace: RefCell<crate::ptrace::Trace>,
+    /// 跟踪者用 PTRACE_SYSCALL 让它继续了：系统调用都交给持有 BKL 的路径，好在入口和
+    /// 出口停下（`syscall::fast` 不持 BKL 时读它）。
+    pub syscall_traced: AtomicBool,
+    /// 线程自己 exit(2) 的退出码（被跟踪的线程退出时报告给跟踪者）。
+    pub exit_code: Cell<i32>,
     /// 只有线程自己访问的状态。
     pub state: RefCell<TaskState>,
 }
@@ -165,6 +172,9 @@ impl Task {
             clock: Cell::new(None),
             cpu_base: Cell::new((0, 0)),
             host_tid: Cell::new(0),
+            trace: RefCell::default(),
+            syscall_traced: AtomicBool::new(false),
+            exit_code: Cell::new(0),
             state: RefCell::new(state),
         }))
     }
@@ -637,6 +647,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, pc: u64, stats: Option<DbtStats>) 
             group.borrow_mut().sample_rss(&st.mm.borrow());
         }
         release_mm(shared, &task, &mut st);
+        // 被跟踪的线程退出了：报告给跟踪者（crate::ptrace）
+        let code = task.exit_code.get();
+        crate::ptrace::tracee_exited(&mut k, &task, &mut group.borrow_mut(), code);
     });
     if released.is_none() {
         let what = format_args!("kernel panic while the thread was exiting");

@@ -1,5 +1,5 @@
 /*
- * System V IPC、POSIX 定时器、时钟、mremap、凭据和调度设置的 guest 测试程序（M6）：用 musl-gcc -static
+ * System V IPC、POSIX 定时器、时钟、mremap、凭据、调度设置和 ptrace 的 guest 测试程序（M6）：用 musl-gcc -static
  * 编译，在 appine-run 里直接运行（不需要 rootfs）。每项检查通过时打印一行
  * "ok <名字>"，失败时打印原因并以 1 退出，全部通过时最后打印 "all ok"。
  */
@@ -16,6 +16,7 @@
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
+#include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/sem.h>
 #include <poll.h>
@@ -454,6 +455,60 @@ static void test_sched(void)
     ok("sched");
 }
 
+/* ---- ptrace：信号投递停止、系统调用的停止、改返回值，process_vm_readv ---- */
+
+/* struct ptrace_syscall_info 里用到的部分 */
+struct syscall_info {
+    unsigned char op;
+    unsigned char pad[3];
+    unsigned arch;
+    unsigned long long pc, sp, nr;
+};
+
+static char secret[16] = "ptrace secret";
+
+static void test_ptrace(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* 跟踪不了时不能停下来，父进程会一直等 */
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0)
+            _exit(2);
+        raise(SIGSTOP);
+        _exit(syscall(SYS_getppid) == 4242 ? 0 : 1);
+    }
+    int st;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP, "first stop %#x", st);
+    char buf[16];
+    struct iovec local = {buf, sizeof buf}, remote = {secret, sizeof secret};
+    CHECK(process_vm_readv(pid, &local, 1, &remote, 1, 0) == sizeof buf && !strcmp(buf, "ptrace secret"),
+          "process_vm_readv");
+    CHECK(ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD) == 0, "SETOPTIONS");
+    CHECK(ptrace(PTRACE_SYSCALL, pid, 0, 0) == 0, "SYSCALL");
+    unsigned long long nr = 0;
+    for (;;) {
+        CHECK(waitpid(pid, &st, 0) == pid, "waitpid");
+        if (WIFEXITED(st))
+            break;
+        CHECK(WIFSTOPPED(st) && WSTOPSIG(st) == (SIGTRAP | 0x80), "syscall stop %#x", st);
+        struct syscall_info info;
+        long size = ptrace(0x420e /* PTRACE_GET_SYSCALL_INFO */, pid, sizeof info, &info);
+        CHECK(size == 80 || size == 33, "GET_SYSCALL_INFO %ld", size);
+        if (info.op == 1) {
+            nr = info.nr;
+        } else if (nr == SYS_getppid) {
+            unsigned long long regs[34];
+            struct iovec iov = {regs, sizeof regs};
+            CHECK(ptrace(PTRACE_GETREGSET, pid, 1 /* NT_PRSTATUS */, &iov) == 0, "GETREGSET");
+            regs[0] = 4242;
+            CHECK(ptrace(PTRACE_SETREGSET, pid, 1, &iov) == 0, "SETREGSET");
+        }
+        CHECK(ptrace(PTRACE_SYSCALL, pid, 0, 0) == 0, "SYSCALL");
+    }
+    CHECK(WEXITSTATUS(st) == 0, "the changed return value");
+    ok("ptrace");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -467,6 +522,7 @@ int main(void)
     test_mremap();
     test_creds();
     test_sched();
+    test_ptrace();
     printf("all ok\n");
     return 0;
 }

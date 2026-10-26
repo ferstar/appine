@@ -368,6 +368,8 @@ pub(crate) struct ThreadGroup {
     /// 进程的编号，不重复：pid 被新进程重新使用之后用它区分新旧进程（`/proc/<pid>` 的
     /// inode）。
     pub serial: u64,
+    /// 主线程退出时跟踪着它的进程：整个进程结束时也报告给它（[`crate::ptrace`]）。
+    pub leader_tracer: Option<Tid>,
 }
 
 impl ThreadGroup {
@@ -412,6 +414,7 @@ impl ThreadGroup {
             execed: false,
             posix_timers: std::collections::BTreeMap::new(),
             aio: std::collections::BTreeMap::new(),
+            leader_tracer: None,
         }
     }
 }
@@ -568,6 +571,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     k.ipc.exit(tgid);
     release_ctty(k, group);
     hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
+    // 被父进程以外的进程跟踪着的也报告给跟踪者；它跟踪着的不再被跟踪
+    crate::ptrace::group_finished(k, &group.borrow(), status);
+    crate::ptrace::tracer_exited(k, tgid);
     // POSIX：进程组因为这次退出变成孤儿时，如果组里有停住的进程，先发 SIGHUP 再发
     // SIGCONT，否则它们再也没有机会继续
     pgrps.sort_unstable();

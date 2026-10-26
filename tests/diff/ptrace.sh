@@ -1,0 +1,548 @@
+# ptrace 和 process_vm_readv/writev：一个小跟踪器逐项检查停住、继续、事件和寄存器，再用
+# strace 跟踪几个程序
+set -e
+cd /tmp
+cat > tracer.c <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <errno.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef NT_ARM_SYSTEM_CALL
+#define NT_ARM_SYSTEM_CALL 0x404
+#endif
+#ifndef NT_ARM_HW_BREAK
+#define NT_ARM_HW_BREAK 0x402
+#endif
+
+/* aarch64 的 user_pt_regs */
+struct regs {
+    unsigned long long x[31], sp, pc, pstate;
+};
+
+static const char *describe(int st)
+{
+    static char b[64];
+    if (WIFEXITED(st))
+        snprintf(b, sizeof b, "exited %d", WEXITSTATUS(st));
+    else if (WIFSIGNALED(st))
+        snprintf(b, sizeof b, "killed by %d", WTERMSIG(st));
+    else if (WIFSTOPPED(st))
+        snprintf(b, sizeof b, "stopped %#x event %d", WSTOPSIG(st), st >> 16);
+    else
+        snprintf(b, sizeof b, "status %#x", st);
+    return b;
+}
+
+static int wait_for(pid_t pid)
+{
+    int st;
+    if (waitpid(pid, &st, __WALL) != pid) {
+        perror("waitpid");
+        exit(1);
+    }
+    return st;
+}
+
+static void regs(pid_t pid, struct regs *r, int set)
+{
+    struct iovec iov = {r, sizeof *r};
+    if (ptrace(set ? PTRACE_SETREGSET : PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) || iov.iov_len != sizeof *r)
+        perror("regset");
+}
+
+/* /proc/<pid>/status 的 State 和 TracerPid 是不是自己；在运行的进程的状态取决于调度，
+   不打印 */
+static void status(pid_t pid, int show_state)
+{
+    char path[64], line[128], state[64] = "";
+    int tracer = -1;
+    snprintf(path, sizeof path, "/proc/%d/status", pid);
+    FILE *f = fopen(path, "r");
+    while (fgets(line, sizeof line, f)) {
+        sscanf(line, "State: %63[^\n]", state);
+        sscanf(line, "TracerPid: %d", &tracer);
+    }
+    fclose(f);
+    printf("  state %s, traced by %s\n", show_state ? state : "-",
+           tracer == getpid() ? "me" : tracer == 0 ? "nobody" : "other");
+}
+
+/* 系统调用的入口和出口：GET_SYSCALL_INFO、x7、改返回值、跳过系统调用，改了返回值就
+   PTRACE_DETACH */
+static void syscalls(void)
+{
+    printf("== syscall stops\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        long a = syscall(SYS_getppid);
+        long b = syscall(SYS_kill, 0, 0);
+        long c = syscall(SYS_getppid);
+        long d = syscall(SYS_getppid);
+        printf("  child sees getppid %ld, kill %ld, then getppid %s, after detach %ld\n", a, b,
+               c == getppid() ? "real" : "changed", d);
+        _exit(5);
+    }
+    int st = wait_for(pid);
+    printf("first stop: %s\n", describe(st));
+    siginfo_t si;
+    long r = ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("  siginfo %ld signo %d code %d from child %d\n", r, si.si_signo, si.si_code, si.si_pid == pid);
+    status(pid, 1);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD);
+    struct __ptrace_syscall_info info;
+    r = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof info, &info);
+    printf("  info in a signal stop: size %ld op %d arch %#x\n", r, info.op, info.arch);
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    long last = -2;
+    int getppids = 0;
+    for (;;) {
+        st = wait_for(pid);
+        if (!WIFSTOPPED(st)) {
+            printf("end: %s\n", describe(st));
+            break;
+        }
+        if (WSTOPSIG(st) != (SIGTRAP | 0x80)) {
+            printf("unexpected: %s\n", describe(st));
+            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            continue;
+        }
+        r = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof info, &info);
+        unsigned long msg;
+        ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+        struct regs g;
+        regs(pid, &g, 0);
+        if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
+            last = info.entry.nr;
+            if (last == SYS_kill) {
+                printf("enter kill(%lld, %lld): size %ld message %lu x7 %llu sp %s\n",
+                       (long long)info.entry.args[0], (long long)info.entry.args[1], r, msg, g.x[7],
+                       info.stack_pointer == g.sp ? "ok" : "differs");
+                /* 跳过它：编号改成 -1，返回值 77 */
+                int no = -1;
+                struct iovec iov = {&no, sizeof no};
+                ptrace(PTRACE_SETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov);
+                g.x[0] = 77;
+                regs(pid, &g, 1);
+            }
+        } else if (info.op == PTRACE_SYSCALL_INFO_EXIT) {
+            if (last == SYS_getppid && getppids++ == 0) {
+                printf("exit getppid: size %ld message %lu x7 %llu rval is parent %d error %d\n", r, msg, g.x[7],
+                       info.exit.rval == getpid(), info.exit.is_error);
+                g.x[0] = 4242;
+                g.x[7] = 99; /* 跟踪者改不了 x7 */
+                regs(pid, &g, 1);
+            } else if (last == SYS_getppid && getppids == 3) {
+                g.x[0] = 1234;
+                regs(pid, &g, 1);
+                printf("detach %ld\n", ptrace(PTRACE_DETACH, pid, 0, 0));
+                printf("end: %s\n", describe(wait_for(pid)));
+                break;
+            } else if (last == SYS_kill) {
+                printf("exit of the skipped kill: rval %lld error %d\n", (long long)info.exit.rval, info.exit.is_error);
+            }
+        }
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    }
+}
+
+/* PTRACE_O_TRACEEXEC，以及不用它时 execve 之后的 SIGTRAP */
+static void exec_events(void)
+{
+    printf("== exec\n");
+    for (int opt = 0; opt < 2; opt++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            ptrace(PTRACE_TRACEME, 0, 0, 0);
+            raise(SIGSTOP);
+            execl("/bin/true", "true", (char *)0);
+            _exit(1);
+        }
+        wait_for(pid);
+        ptrace(PTRACE_SETOPTIONS, pid, 0, opt ? PTRACE_O_TRACEEXEC : 0);
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        int st = wait_for(pid);
+        unsigned long msg = 1;
+        ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+        siginfo_t si;
+        long r = ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+        printf("%s: %s, message %s, siginfo %ld code %#x\n", opt ? "TRACEEXEC" : "plain", describe(st),
+               msg == (unsigned long)pid ? "pid" : msg ? "other" : "0", r, si.si_code);
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        printf("  then %s\n", describe(wait_for(pid)));
+    }
+}
+
+/* PTRACE_SEIZE、PTRACE_INTERRUPT、fork 之后跟进新进程、PTRACE_EVENT_EXIT */
+static void seize_fork(void)
+{
+    printf("== seize and fork\n");
+    int go[2];
+    pipe(go);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        pid_t g = fork();
+        if (g == 0)
+            _exit(7);
+        int st;
+        waitpid(g, &st, 0);
+        printf("  child: grandchild %s\n", describe(st));
+        exit(9);
+    }
+    printf("seize %ld\n", ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_TRACEFORK | PTRACE_O_TRACEEXIT));
+    ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+    int st = wait_for(pid);
+    printf("interrupt: %s\n", describe(st));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    write(go[1], "x", 1);
+    st = wait_for(pid);
+    unsigned long g = 0;
+    ptrace(PTRACE_GETEVENTMSG, pid, 0, &g);
+    printf("fork: %s\n", describe(st));
+    st = wait_for(g);
+    printf("grandchild starts: %s\n", describe(st));
+    status(g, 1);
+    ptrace(PTRACE_CONT, g, 0, 0);
+    st = wait_for(g);
+    unsigned long msg = 0;
+    ptrace(PTRACE_GETEVENTMSG, g, 0, &msg);
+    printf("grandchild exiting: %s", describe(st));
+    printf(", status %s\n", describe(msg));
+    ptrace(PTRACE_CONT, g, 0, 0);
+    printf("grandchild: %s\n", describe(wait_for(g)));
+    /* 孙进程退出了，子进程收到 SIGCHLD：被跟踪的线程先停下来让跟踪者看 */
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    while (st = wait_for(pid), WIFSTOPPED(st) && st >> 16 == 0) {
+        printf("child gets a signal: %s\n", describe(st));
+        ptrace(PTRACE_CONT, pid, 0, WSTOPSIG(st));
+    }
+    ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+    printf("child exiting: %s", describe(st));
+    printf(", status %s\n", describe(msg));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    printf("child: %s\n", describe(wait_for(pid)));
+}
+
+/* group-stop：SEIZE 时报告成 PTRACE_EVENT_STOP，PTRACE_LISTEN 等 SIGCONT；ATTACH 时
+   group-stop 没有 siginfo */
+static void group_stop(void)
+{
+    printf("== group stop\n");
+    int go[2];
+    pipe(go);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        _exit(3);
+    }
+    ptrace(PTRACE_SEIZE, pid, 0, 0);
+    kill(pid, SIGSTOP);
+    int st = wait_for(pid);
+    printf("signal: %s\n", describe(st));
+    ptrace(PTRACE_CONT, pid, 0, SIGSTOP);
+    st = wait_for(pid);
+    siginfo_t si;
+    long r = ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("group stop: %s, siginfo %ld\n", describe(st), r);
+    printf("listen %ld\n", ptrace(PTRACE_LISTEN, pid, 0, 0));
+    status(pid, 1);
+    errno = 0;
+    r = ptrace(PTRACE_CONT, pid, 0, 0);
+    printf("cont while listening %ld %s\n", r, strerror(errno));
+    kill(pid, SIGCONT);
+    st = wait_for(pid);
+    printf("after SIGCONT: %s\n", describe(st));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    st = wait_for(pid);
+    printf("then: %s\n", describe(st));
+    ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+    write(go[1], "x", 1);
+    printf("end: %s\n", describe(wait_for(pid)));
+
+    pid = fork();
+    if (pid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        _exit(4);
+    }
+    printf("attach %ld\n", ptrace(PTRACE_ATTACH, pid, 0, 0));
+    st = wait_for(pid);
+    r = ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("attach stop: %s, siginfo %ld signo %d\n", describe(st), r, si.si_signo);
+    ptrace(PTRACE_CONT, pid, 0, SIGSTOP);
+    st = wait_for(pid);
+    errno = 0;
+    r = ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("group stop: %s, siginfo %ld %s\n", describe(st), r, strerror(errno));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    write(go[1], "x", 1);
+    printf("end: %s\n", describe(wait_for(pid)));
+}
+
+/* 被跟踪的进程忽略的信号也挂起，跟踪者看得到它 */
+static void ignored(void)
+{
+    printf("== ignored signal\n");
+    int go[2], ready[2];
+    pipe(go);
+    pipe(ready);
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGUSR1, SIG_IGN);
+        write(ready[1], "r", 1);
+        char c;
+        read(go[0], &c, 1);
+        _exit(6);
+    }
+    char c;
+    read(ready[0], &c, 1);
+    ptrace(PTRACE_SEIZE, pid, 0, 0);
+    kill(pid, SIGUSR1);
+    printf("ignored SIGUSR1: %s\n", describe(wait_for(pid)));
+    ptrace(PTRACE_CONT, pid, 0, SIGUSR1);
+    write(go[1], "x", 1);
+    printf("end: %s\n", describe(wait_for(pid)));
+}
+
+static void *thread_main(void *arg)
+{
+    (void)arg;
+    return 0;
+}
+
+/* PTRACE_O_TRACECLONE：新线程挂着 SIGSTOP 开始，退出时单独报告 */
+static void threads(void)
+{
+    printf("== threads\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        pthread_t t;
+        pthread_create(&t, 0, thread_main, 0);
+        pthread_join(t, 0);
+        _exit(0);
+    }
+    wait_for(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACECLONE);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st = wait_for(pid);
+    unsigned long tid = 0;
+    ptrace(PTRACE_GETEVENTMSG, pid, 0, &tid);
+    printf("clone: %s, new thread is %s\n", describe(st), tid > (unsigned long)pid ? "after the process" : "?");
+    st = wait_for(tid);
+    printf("thread starts: %s\n", describe(st));
+    ptrace(PTRACE_CONT, tid, 0, 0);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    printf("thread: %s\n", describe(wait_for(tid)));
+    printf("process: %s\n", describe(wait_for(pid)));
+}
+
+/* PTRACE_O_EXITKILL：跟踪者退出时被跟踪的进程被结束 */
+static void exitkill(void)
+{
+    printf("== exitkill\n");
+    int alive[2];
+    pipe(alive);
+    pid_t tracer = fork();
+    if (tracer == 0) {
+        close(alive[0]);
+        pid_t victim = fork();
+        if (victim == 0) {
+            pause();
+            _exit(0);
+        }
+        close(alive[1]);
+        ptrace(PTRACE_SEIZE, victim, 0, PTRACE_O_EXITKILL);
+        _exit(0);
+    }
+    close(alive[1]);
+    waitpid(tracer, 0, 0);
+    struct pollfd p = {alive[0], POLLIN, 0};
+    char c;
+    int n = poll(&p, 1, 5000);
+    printf("victim %s\n", n == 1 && read(alive[0], &c, 1) == 0 ? "killed" : "still running");
+}
+
+static char message[32] = "hello from the child";
+
+/* process_vm_readv/writev 和 PTRACE_PEEKDATA：fork 之后子进程里同一个地址 */
+static void memory(void)
+{
+    printf("== memory\n");
+    int go[2], back[2];
+    pipe(go);
+    pipe(back);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        write(back[1], message, sizeof message);
+        _exit(0);
+    }
+    char buf[32] = {0};
+    struct iovec local = {buf, 5}, remote = {message + 6, 5};
+    printf("readv %zd '%.5s'\n", process_vm_readv(pid, &local, 1, &remote, 1, 0), buf);
+    struct iovec from = {"HELLO", 5}, to = {message, 5};
+    printf("writev %zd\n", process_vm_writev(pid, &from, 1, &to, 1, 0));
+    struct iovec two[2] = {{message, 4}, {(void *)16, 4}}, eight = {buf, 8};
+    printf("second piece unmapped %zd\n", process_vm_readv(pid, &eight, 1, two, 2, 0));
+    errno = 0;
+    printf("unmapped %zd %s\n", process_vm_readv(pid, &eight, 1, &two[1], 1, 0), strerror(errno));
+    errno = 0;
+    printf("flags %zd %s\n", process_vm_readv(pid, &eight, 1, two, 1, 1), strerror(errno));
+    ptrace(PTRACE_SEIZE, pid, 0, 0);
+    ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+    wait_for(pid);
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, pid, message, 0);
+    printf("peek '%.8s' %s\n", (char *)&word, strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_PEEKDATA, pid, (void *)16, 0);
+    printf("peek unmapped %s\n", strerror(errno));
+    status(pid, 1);
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    status(pid, 0);
+    write(go[1], "x", 1);
+    read(back[0], buf, sizeof buf);
+    printf("child now says '%s'\n", buf);
+    waitpid(pid, 0, 0);
+}
+
+static void errors(void)
+{
+    printf("== errors\n");
+    errno = 0;
+    ptrace(PTRACE_CONT, getpid(), 0, 0);
+    printf("cont self: %s\n", strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_ATTACH, getpid(), 0, 0);
+    printf("attach self: %s\n", strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_ATTACH, 999999, 0, 0);
+    printf("attach missing: %s\n", strerror(errno));
+    int go[2];
+    pipe(go);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        _exit(0);
+    }
+    errno = 0;
+    ptrace(PTRACE_SEIZE, pid, 0, 1 << 30);
+    printf("seize with a bad option: %s\n", strerror(errno));
+    ptrace(PTRACE_SEIZE, pid, 0, 0);
+    errno = 0;
+    ptrace(PTRACE_SEIZE, pid, 0, 0);
+    printf("seize twice: %s\n", strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    printf("cont while running: %s\n", strerror(errno));
+    ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+    wait_for(pid);
+    errno = 0;
+    ptrace(PTRACE_SETOPTIONS, pid, 0, 1 << 30);
+    printf("bad option: %s\n", strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_CONT, pid, 0, 99);
+    printf("bad signal: %s\n", strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_PEEKUSER, pid, 0, 0);
+    printf("peekuser: %s\n", strerror(errno));
+    unsigned long long b[40];
+    struct iovec iov = {b, 7};
+    errno = 0;
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    printf("regset of 7 bytes: %s\n", strerror(errno));
+    iov.iov_len = 16;
+    printf("regset of 16 bytes: %ld, got %zu\n", ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov), iov.iov_len);
+    iov.iov_len = sizeof b;
+    printf("whole regset: got %zu\n", (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov), iov.iov_len));
+    iov.iov_len = sizeof b;
+    printf("fp regset: got %zu\n", (ptrace(PTRACE_GETREGSET, pid, NT_PRFPREG, &iov), iov.iov_len));
+    iov.iov_len = sizeof b;
+    printf("hw breakpoints: got %zu\n", (ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_BREAK, &iov), iov.iov_len));
+    errno = 0;
+    ptrace(PTRACE_GETREGSET, pid, 0x7777, &iov);
+    printf("unknown regset: %s\n", strerror(errno));
+    errno = 0;
+    ptrace(PTRACE_GETSIGMASK, pid, 4, b);
+    printf("sigmask of 4 bytes: %s\n", strerror(errno));
+    ptrace(PTRACE_KILL, pid, 0, 0);
+    printf("kill: %s\n", describe(wait_for(pid)));
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    /* 等不到该来的停止时不要一直卡着 */
+    alarm(60);
+    syscalls();
+    exec_events();
+    seize_fork();
+    group_stop();
+    ignored();
+    threads();
+    exitkill();
+    memory();
+    errors();
+    return 0;
+}
+C
+gcc -O1 -o tracer tracer.c -lpthread
+./tracer
+
+# strace：地址、pid、环境变量个数在两边不同，归一化之后比
+norm() {
+    sed -E 's/0x[0-9a-f]+/ADDR/g; s/\/\* [0-9]+ vars \*\//VARS/; s/(si_pid|si_uid)=[0-9]+/\1=N/g' |
+        sed -E 's/^(getpid|getppid|gettid|set_tid_address|clone|wait4)\((.*)\) += [0-9]+$/\1(\2) = PID/' |
+        sed -E 's/^tkill\([0-9]+/tkill(TID/'
+}
+cat > sig.c <<'C'
+#include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void handler(int sig)
+{
+    (void)sig;
+    write(1, "handled\n", 8);
+}
+
+int main(void)
+{
+    signal(SIGUSR1, handler);
+    raise(SIGUSR1);
+    raise(SIGUSR2);
+    return 0;
+}
+C
+gcc -O1 -o sig sig.c
+echo "some text" > text
+env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -o st1 cat text
+norm < st1
+echo "strace sig: $(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -o st2 ./sig; echo $?)"
+norm < st2
+# -f：每个进程一个文件，按 pid 的顺序
+rm -rf st3 && mkdir st3
+env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -ff -e trace=process -e signal=none -o st3/t sh -c 'true; ls /dev/null >/dev/null; exit 2' || echo "strace -f: $?"
+for f in $(ls st3 | sort -t. -k2 -n); do
+    echo "-- process"
+    norm < st3/$f
+done

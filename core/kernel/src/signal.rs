@@ -114,6 +114,8 @@ pub(crate) mod code {
     pub const CLD_EXITED: i32 = 1;
     /// 子进程被信号终止。
     pub const CLD_KILLED: i32 = 2;
+    /// 被跟踪的线程停在 ptrace-stop 里。
+    pub const CLD_TRAPPED: i32 = 4;
     /// 子进程停止。
     pub const CLD_STOPPED: i32 = 5;
     /// 停止的子进程继续。
@@ -150,6 +152,8 @@ pub(crate) enum InfoFields {
     Fault { addr: u64 },
     /// 信号驱动的 I/O（`F_SETSIG`）：就绪的事件和 fd。
     Poll { band: i64, fd: i32 },
+    /// 跟踪者用 PTRACE_SETSIGINFO 给的：`siginfo_t` 在 si_code 之后的部分，原样投递。
+    Raw([u8; 112]),
 }
 
 /// 一个挂起信号附带的 siginfo。
@@ -211,6 +215,15 @@ impl SigInfo {
         }
     }
 
+    /// 按 `siginfo_t` 编码的 siginfo（跟踪者给的），信号编号另外给出。
+    pub fn from_raw(b: &[u8; 128]) -> SigInfo {
+        SigInfo {
+            code: i32::from_le_bytes(b[8..12].try_into().unwrap()),
+            fields: InfoFields::Raw(b[16..].try_into().unwrap()),
+            esr: 0,
+        }
+    }
+
     /// 按 Linux 的 `siginfo_t`（128 字节）编码。
     pub fn encode(&self, sig: Signal) -> [u8; 128] {
         let mut b = [0u8; 128];
@@ -242,6 +255,7 @@ impl SigInfo {
                 b[16..24].copy_from_slice(&band.to_le_bytes());
                 b[24..28].copy_from_slice(&fd.to_le_bytes());
             }
+            InfoFields::Raw(rest) => b[16..].copy_from_slice(&rest),
         }
         b
     }
@@ -486,6 +500,15 @@ fn prepare(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, sig: Signal) {
             notify_parent(k, group, code::CLD_CONTINUED, Signal::CONT.number());
             request_wake();
         }
+        // 被跟踪的线程不再参加 group-stop；PTRACE_LISTEN 的要重新报告（crate::ptrace）
+        for t in group.borrow().threads.iter().filter_map(|t| k.tasks.get(t)) {
+            let mut trace = t.trace.borrow_mut();
+            trace.group_stop = None;
+            if trace.listening {
+                drop(trace);
+                wake(t);
+            }
+        }
     }
 }
 
@@ -521,8 +544,9 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
     }
     prepare(k, &group, sig);
     let blocked = task.sigmask.get() & sig.bit() != 0;
-    // 被屏蔽的信号即使当前被忽略也要挂起：解除屏蔽之前处理方式可能会变
-    if !blocked && group.borrow().sighand.borrow().ignores(sig) {
+    // 被屏蔽的信号即使当前被忽略也要挂起：解除屏蔽之前处理方式可能会变。被跟踪的线程
+    // 也挂起，跟踪者要看到它
+    if !blocked && group.borrow().sighand.borrow().ignores(sig) && !crate::ptrace::traced(task) {
         return;
     }
     let room = sig.is_realtime() && queue_room(k, &group.borrow());
@@ -566,7 +590,7 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
     }
     prepare(k, &group, sig);
     let ignored = group.borrow().sighand.borrow().ignores(sig);
-    if ignored && leader.sigmask.get() & sig.bit() == 0 {
+    if ignored && leader.sigmask.get() & sig.bit() == 0 && !crate::ptrace::traced(leader) {
         return;
     }
     {
@@ -688,15 +712,22 @@ pub(crate) fn take(cx: &mut Cx<'_>, set: u64) -> Option<(Signal, SigInfo)> {
 }
 
 /// 有没有可以投递的信号，线程组是否被停住，或者线程已经被要求退出（等待中的 syscall
-/// 据此提前返回）。
+/// 据此提前返回）。被跟踪的线程参加完 group-stop 就照常执行，即使线程组仍然停着；跟踪者
+/// 用 PTRACE_INTERRUPT 要它停下时也要返回（crate::ptrace）。
 pub(crate) fn interrupted(cx: &Cx<'_>) -> bool {
     let mask = cx.task.sigmask.get();
     let g = cx.t.group.borrow();
     let pending = cx.task.pending.borrow().set() | g.pending.set();
-    cx.task.killed.get() || g.stopped || pending & !mask != 0
+    let t = cx.task.trace.borrow();
+    let stopping = match t.tracer {
+        Some(_) => t.group_stop.is_some() || t.trap,
+        None => g.stopped,
+    };
+    cx.task.killed.get() || stopping || pending & !mask != 0
 }
 
 /// 停住整个线程组（停止信号的默认动作）：通知父进程，打断其他线程，让它们也停下来。
+/// 被跟踪的线程（包括自己）记下要参加这次 group-stop（crate::ptrace）。
 fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
     let group = cx.t.group.clone();
     let threads = {
@@ -707,6 +738,12 @@ fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
         g.threads.clone()
     };
     for t in threads.iter().filter_map(|t| cx.kr().tasks.get(t)) {
+        {
+            let mut trace = t.trace.borrow_mut();
+            if trace.tracer.is_some() {
+                trace.group_stop = Some(sig);
+            }
+        }
         if !Rc::ptr_eq(t, cx.task) {
             wake(t);
         }
@@ -714,13 +751,14 @@ fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
     notify_parent(cx.kr(), &group, code::CLD_STOPPED, sig.number());
 }
 
-/// 线程组停住期间，在这里等到 SIGCONT 或者被结束。
+/// 线程组停住期间，在这里等到 SIGCONT 或者被结束。停着的时候被 ptrace 跟踪了也离开，
+/// 改为停在 ptrace-stop 里（[`deliver`]）。
 fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
     loop {
         if cx.task.killed.get() {
             return Flow::Exit;
         }
-        if !cx.t.group.borrow().stopped {
+        if !cx.t.group.borrow().stopped || crate::ptrace::traced(cx.task) {
             return Flow::Continue;
         }
         // 只有 SIGCONT、SIGKILL 能让它离开这里，所以不检查其他信号
@@ -754,13 +792,30 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             st.pc -= 4;
         }
     }
-    // 线程组被别的线程停住了：在返回 guest 之前一起停下
+    // 线程组被别的线程停住了：在返回 guest 之前一起停下。被跟踪的停在 ptrace-stop 里报告
+    // 给跟踪者，跟踪者用 PTRACE_INTERRUPT 要它停的也在这里停（crate::ptrace）
+    if crate::ptrace::traced(cx.task)
+        && (!crate::ptrace::group_stop(cx, cpu) || !crate::ptrace::trap(cx, cpu))
+    {
+        return Flow::Exit;
+    }
     if let Flow::Exit = wait_while_stopped(cx) {
         return Flow::Exit;
     }
 
     let mut handled = false;
     while let Some((sig, info)) = dequeue(cx) {
+        // 被跟踪的线程先停下来让跟踪者看（信号投递停止），跟踪者可以换掉或者不投递它；
+        // SIGKILL 不经过这里
+        let (sig, info) = if crate::ptrace::traced(cx.task) {
+            match crate::ptrace::signal_stop(cx, cpu, sig, info) {
+                Ok(Some(delivered)) => delivered,
+                Ok(None) => continue,
+                Err(()) => return Flow::Exit,
+            }
+        } else {
+            (sig, info)
+        };
         let act = cx.t.group.borrow().sighand.borrow().get(sig);
         match act.handler {
             SigAction::IGNORE => continue,
@@ -772,6 +827,9 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
                     continue;
                 }
                 group_stop(cx, sig);
+                if crate::ptrace::traced(cx.task) && !crate::ptrace::group_stop(cx, cpu) {
+                    return Flow::Exit;
+                }
                 if let Flow::Exit = wait_while_stopped(cx) {
                     return Flow::Exit;
                 }
@@ -787,11 +845,15 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
                 };
                 let group = cx.t.group.clone();
                 group_exit(cx.k(), &group, status);
+                crate::ptrace::exit(cx, cpu, status);
                 return Flow::Exit;
             }
             _ => {}
         }
-        if let (false, Some((code, cont))) = (handled, restart) {
+        // 跟踪者改了 pc 时不再管重启（与 Linux 的 do_signal 一样）
+        if let (false, Some((code, cont))) = (handled, restart)
+            && cpu.state().pc == cont - 4
+        {
             let to_eintr = code == Errno::ERESTARTNOHAND
                 || code == Errno::ERESTART_RESTARTBLOCK
                 || (code == Errno::ERESTARTSYS && act.flags & sa::RESTART == 0);
@@ -829,7 +891,10 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         cx.task.sigmask.set(saved);
     }
     // 没有处理函数打断：重新执行的那条 svc 改成 restart_syscall，接着做剩下的部分
-    if !handled && let Some((Errno::ERESTART_RESTARTBLOCK, _)) = restart {
+    if !handled
+        && let Some((Errno::ERESTART_RESTARTBLOCK, cont)) = restart
+        && cpu.state().pc == cont - 4
+    {
         cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
     }
     Flow::Continue
@@ -965,6 +1030,10 @@ pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         crate::debug::log(format_args!("rt_sigreturn: bad signal frame"));
         let group = cx.t.group.clone();
         group_exit(cx.k(), &group, killed_by(Signal::SEGV));
+        return Flow::Exit;
+    }
+    // PTRACE_SYSCALL：出口停下，跟踪者看到恢复出来的寄存器（crate::ptrace）
+    if crate::ptrace::traced(cx.task) && !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
     // 恢复的屏蔽字可能解除了对挂起信号的屏蔽；x0 是恢复出来的值，不按 syscall 返回值处理

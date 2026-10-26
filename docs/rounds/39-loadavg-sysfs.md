@@ -1,6 +1,6 @@
 # M9 之前：平均负载、sysfs 和 limits（2026-10-27）
 
-← [M9 之前：拆 BKL（2026-10-26）](38-split-bkl.md) · [索引](../milestones.md)
+← [M9 之前：拆 BKL（2026-10-26）](38-split-bkl.md) · [索引](../milestones.md) · [M9 之前：ptrace 的第一步，strace（2026-10-27）](40-ptrace-strace.md) →
 
 把推迟项里顺手能补的几个内核兼容性缺口补上（ptrace 另做）：
 

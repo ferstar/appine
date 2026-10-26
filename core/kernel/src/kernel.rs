@@ -184,6 +184,8 @@ pub(crate) struct Kernel {
     pub oom: crate::oom::Oom,
     /// 平均负载（[`crate::loadavg`]）。
     pub load: crate::loadavg::LoadAvg,
+    /// 被跟踪的线程退出了、还没被跟踪者的 wait 取走的（[`crate::ptrace`]）。
+    pub trace_exits: Vec<crate::ptrace::TraceExit>,
     next_tid: Tid,
     /// 正在等待的线程的事件、它关心的通道（[`wake`]）和它等的对象。
     waiters: Vec<(Arc<Event>, u32, Option<wake::Object>)>,
@@ -249,6 +251,7 @@ impl Kernel {
             threads_max: crate::process::default_threads_max(),
             oom: Default::default(),
             load: crate::loadavg::LoadAvg::new(Instant::now()),
+            trace_exits: Vec::new(),
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
