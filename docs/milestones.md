@@ -45,6 +45,7 @@
 | [M9 之前：JIT 负载](#m9-之前jit-负载2026-10-26) | 2026-10-26 | 代码作废按内容、dsb 时由分发器就地作废；大实例不挤掉池里别的翻译；Maven 6.7 → 6.2 秒，Gradle 热构建 −6% |
 | [M9 之前：多进程并行](#m9-之前多进程并行2026-10-26) | 2026-10-26 | 翻译池放 16 个实例；起进程时少做 mincore；4 个同时 exec −18%、4 个同时跑管道 −23%，池里多留约 56 MB 翻译 |
 | [M9 之前：onTrimMemory](#m9-之前ontrimmemory2026-10-26) | 2026-10-26 | 界面离开 1 分钟之后、内存紧张时释放池里的翻译等可以重建的缓存；有前台服务时 Android 14 起收不到 `onTrimMemory`，自己看界面在不在 |
+| [M9 之前：拆 BKL](#m9-之前拆-bkl2026-10-26) | 2026-10-26 | 按负载量 BKL 的持锁和等锁；读时钟不取 BKL（4 个进程同时读每次 800 → 88 纳秒） |
 
 ---
 
@@ -1297,3 +1298,30 @@ node（V8）这边没有这个问题：一次计算负载只作废一两百个�
 - `Machine::trim_memory` 里内核层的部分包进 `host_call`：内核层在这里 panic 时那次调用失败，不穿过 JNI 让 App 进程 abort。
 
 - **测试**：MachineTest 新增"释放缓存时正在运行的进程不受影响，之后照常起新进程"（一边跑循环一边释放 5 次）；4K（API 34）和 16K（API 37）的模拟器上 5 个测试都通过。4K 模拟器上装好 debug 版 App（内核层的日志打开）：`am send-trim-memory` 发 `RUNNING_LOW` 立即释放；按 HOME、20 秒后切回来，不释放；按 HOME 等 70 秒，释放；App 一直照常运行，日志里没有错误（看内核层日志里的 "trimming memory"）。cargo test（174 个）、clippy 和 Android clippy 通过。
+
+## M9 之前：拆 BKL（2026-10-26）
+
+上一轮的结论是剩下的差距主要在 BKL。这一轮分几步把常用的路径从 BKL 下拿出来，每一步单独提交。先给工作区加上按 syscall 统计持锁、等锁时间的临时插桩（`target/mem/bklinstr.py`），在各类并行负载上各跑一次（`target/mem/bklsurvey.sh`）：
+
+| 负载 | 持锁或等锁最多的 |
+|---|---|
+| `go build` 冷编译 | clock_gettime 218 万次：持锁 0.41 秒、**等锁 2.5 秒**；nanosleep 2.5 万次，等锁 0.47 秒；futex 等锁 0.14 秒 |
+| Maven 热构建 | mmap 2 万次，持锁 0.2 秒（每次平均 10 微秒）；clock_gettime 76 万次，持锁 0.14 秒、等锁 0.21 秒；futex 8.5 万次，持锁 0.08 秒 |
+| `xargs -P4` 编译 Lua | mmap 17 万次、munmap 16 万次（cc1 的内存分配），合计持锁 0.51 秒、等锁 0.32 秒 |
+| 并行 lstat 的 `git status` | 没能不持锁的 newfstatat 6646 次，等锁 0.31 秒 |
+| 4 个同时 exec、4 个同时跑管道 | clone、execve、exit_group（上一轮） |
+
+等锁的时间是各线程等锁的 CPU 时间之和，大多在空转的后台线程上（Go 的 sysmon、空闲的 P 不停地读时钟），不全在关键路径上。
+
+### 读时钟不取 BKL
+
+vDSO 的时间函数只是 svc 存根（§7.2），Go 的 nanotime、JVM 的 `System.nanoTime` 每次都进内核。`clock_gettime`、`gettimeofday`、`clock_getres` 读宿主的时钟和线程自己的 CPU 时钟（`CLOCK_THREAD_CPUTIME_ID`，或者 `pthread_getcpuclockid` 编码出来的自己的 tid）时，在不持 BKL 的路径（`syscall::fast`，§6）里做完；进程的、别的线程的 CPU 时钟要用内核里的状态，照常取 BKL。在跟踪系统调用（`APPINE_STRACE`）时都走持锁的路径，好打印出来。
+
+| 负载（交替运行） | HEAD | 之后 |
+|---|---|---|
+| `clock_gettime(CLOCK_MONOTONIC)`，单个进程（每次） | 127 纳秒 | 89 纳秒 |
+| 同上，4 个进程同时 | 790–813 纳秒 | 87–89 纳秒 |
+| `go build` 冷编译（宿主上同时有别的负载） | 6.76–6.90 秒 | 6.50–6.85 秒 |
+| Maven 热构建、node | | 不变 |
+
+- **测试**：guest 测试程序 `posix.c` 新增时钟一项：单调时钟不倒退、`gettimeofday` 和 `CLOCK_REALTIME` 一致、出错的时钟 id 和指针（交给持锁的路径报错）；自己的 CPU 时钟两种写法读的是同一个，进程的不比它少；在新线程里看另一个空转的线程的时钟，它的涨到 50 毫秒时自己的几乎不动（变异检验：把别的线程的时钟当成自己的，这一项超时失败）。cargo test（174 个）、clippy、两层的 14 组差分测试通过。LTP 的 syscall 测试 942 个通过（上一轮 943），唯一的不同是 futex_wait05 报"睡得太久"：HEAD 的二进制在同一时刻交替各重跑两次，结果一样（睡 1 毫秒量出 1.34 毫秒）；shmctl01 这次通过。

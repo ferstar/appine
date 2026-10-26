@@ -6,6 +6,11 @@
 //! （[`Cached`]）。做不了时什么也不改，交给持有 BKL 的 [`dispatch`](super::dispatch)，
 //! 它顺带把要用的东西填进缓存。
 //!
+//! 读时钟（`clock_gettime`、`gettimeofday`）也在这里：vDSO 的时间函数只是 svc 存根
+//! （§7.2），Go 的 nanotime、JVM 的 `System.nanoTime` 每次都进内核。go build 一次 218
+//! 万次，几个线程排队等 BKL 一共等了 2.5 秒。宿主的时钟和线程自己的 CPU 时钟不用内核里
+//! 的状态；进程的、别的线程的 CPU 时钟交给持有 BKL 的路径。
+//!
 //! 线程在持有 BKL 时记下自己的根目录、当前目录和凭据（[`Fast`]）。它们可能被别的线程
 //! 改掉（`CLONE_FS` 共享的 chdir、线程组共享的凭据），改的一方让
 //! [`Shared::paths_changed`] 的计数加一，记下的就作废了。
@@ -22,8 +27,8 @@ use super::fs::{
 };
 use super::{PATH_MAX, SysResult};
 use crate::errno::Errno;
-use crate::kernel::Shared;
-use crate::task::TaskState;
+use crate::kernel::{Shared, Tid};
+use crate::task::{Task, TaskState};
 use crate::vfs::store::{Ino, Stat};
 use crate::vfs::{Cached, Node};
 
@@ -31,9 +36,14 @@ use crate::vfs::{Cached, Node};
 pub(crate) struct Fast {
     /// 记下时的 [`Shared::paths_epoch`]。
     epoch: u64,
-    /// 不能不持 BKL 解析路径（凭据要检查搜索权限、根目录不在仓库里、在跟踪系统调用）
-    /// 时是 None。
+    /// 在跟踪系统调用（`APPINE_STRACE`）：都交给持有 BKL 的路径，好打印出来。
+    traced: bool,
+    /// 不能不持 BKL 解析路径（凭据要检查搜索权限、根目录不在仓库里）时是 None。
     paths: Option<Paths>,
+    /// 线程自己的 tid（execve 时可能接过主线程的，那时 [`Shared::paths_epoch`] 也变了）。
+    tid: Tid,
+    /// 宿主线程的 CPU 时钟和线程开始时它的读数（[`Task::cpu_ns`]）。
+    cpu_clock: Option<(i32, u64)>,
 }
 
 struct Paths {
@@ -45,13 +55,11 @@ struct Paths {
 
 impl Fast {
     /// 记下线程现在的状态。持有 BKL 时调用。
-    pub(crate) fn new(shared: &Shared, t: &TaskState) -> Fast {
+    pub(crate) fn new(shared: &Shared, task: &Task, t: &TaskState) -> Fast {
         let epoch = shared.paths_epoch();
         let fs = t.fs.borrow();
         let paths = match (&t.vfs, &fs.root) {
-            (Some(vfs), &Node::Store(root))
-                if t.group.borrow().cred.searches_all() && !crate::debug::tracing() =>
-            {
+            (Some(vfs), &Node::Store(root)) if t.group.borrow().cred.searches_all() => {
                 Some(Paths {
                     vfs: vfs.cached().clone(),
                     root,
@@ -63,34 +71,30 @@ impl Fast {
             }
             _ => None,
         };
-        Fast { epoch, paths }
+        Fast {
+            epoch,
+            traced: crate::debug::tracing(),
+            paths,
+            tid: task.tid.get(),
+            cpu_clock: task.clock.get().map(|c| (c, task.cpu_base.get().0)),
+        }
     }
 
     /// 记下的过时了就重新记下。持有 BKL 时调用。
-    pub(crate) fn refresh(&mut self, shared: &Shared, t: &TaskState) {
+    pub(crate) fn refresh(&mut self, shared: &Shared, task: &Task, t: &TaskState) {
         if shared.paths_epoch() != self.epoch {
-            *self = Fast::new(shared, t);
+            *self = Fast::new(shared, task, t);
         }
     }
 
     /// 不持 BKL 执行 `cpu` 停在的系统调用。做完了（结果写进了 x0）返回 true；返回 false
     /// 时什么也没改，由调用方持有 BKL 正常处理。
     pub(crate) fn syscall(&self, shared: &Shared, cpu: &mut Cpu) -> bool {
-        let Some(p) = &self.paths else {
-            return false;
-        };
-        let s = cpu.state();
         // 还有没作废的 ic ivau 时要先进内核作废（task::handle）
-        if s.ivau_page != 0 || shared.paths_epoch() != self.epoch {
+        if self.traced || cpu.state().ivau_page != 0 {
             return false;
         }
-        let a = [s.x[0], s.x[1], s.x[2], s.x[3], s.x[4]];
-        let r = match s.x[8] {
-            79 => p.newfstatat(cpu, a[0] as i32, a[1], a[2], a[3] as u32),
-            291 => p.statx(cpu, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
-            _ => None,
-        };
-        let Some(r) = r else {
+        let Some(r) = self.dispatch(shared, cpu) else {
             return false;
         };
         cpu.state_mut().x[0] = match r {
@@ -99,6 +103,93 @@ impl Fast {
         };
         true
     }
+
+    fn dispatch(&self, shared: &Shared, cpu: &Cpu) -> Option<SysResult> {
+        let s = cpu.state();
+        let a = [s.x[0], s.x[1], s.x[2], s.x[3], s.x[4]];
+        match s.x[8] {
+            113 => self.clock_gettime(cpu, a[0] as i32, a[1]),
+            114 => clock_getres(cpu, a[0] as i32, a[1]),
+            169 => gettimeofday(cpu, a[0], a[1]),
+            79 | 291 => {
+                let p = self.paths.as_ref()?;
+                if shared.paths_epoch() != self.epoch {
+                    return None;
+                }
+                match s.x[8] {
+                    79 => p.newfstatat(cpu, a[0] as i32, a[1], a[2], a[3] as u32),
+                    _ => p.statx(cpu, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `misc::clock_gettime` 里宿主的时钟和线程自己的 CPU 时钟。
+    fn clock_gettime(&self, cpu: &Cpu, clock: i32, tp: u64) -> Option<SysResult> {
+        let (sec, nsec) = if self.own_cpu_clock(clock) {
+            let (host, base) = self.cpu_clock?;
+            let (sec, nsec) = appine_hal::clock_gettime(host).ok()?;
+            let ns = (sec as u64 * 1_000_000_000 + nsec as u64).saturating_sub(base);
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        } else if host_clock(clock) {
+            appine_hal::clock_gettime(clock).ok()?
+        } else {
+            return None;
+        };
+        write(cpu, tp, &pair(sec, nsec))?;
+        Some(Ok(0))
+    }
+
+    /// `clock` 是线程自己的 CPU 时钟：`CLOCK_THREAD_CPUTIME_ID`，或者
+    /// `pthread_getcpuclockid` 编码出来的自己的（`misc::cpu_clock`）。
+    fn own_cpu_clock(&self, clock: i32) -> bool {
+        clock == CLOCK_THREAD_CPUTIME_ID
+            || clock < 0 && clock & 3 != 3 && clock & 4 != 0 && {
+                let tid = !(clock >> 3);
+                tid == 0 || tid == self.tid
+            }
+    }
+}
+
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+
+/// 直接用宿主的时钟（`misc::clock_gettime` 里不是 CPU 时钟的）。宿主不认识的交给持有
+/// BKL 的路径报错。
+fn host_clock(clock: i32) -> bool {
+    clock >= 0 && clock != CLOCK_PROCESS_CPUTIME_ID && clock != CLOCK_THREAD_CPUTIME_ID
+}
+
+fn clock_getres(cpu: &Cpu, clock: i32, res: u64) -> Option<SysResult> {
+    if !host_clock(clock) {
+        return None;
+    }
+    let (sec, nsec) = appine_hal::clock_getres(clock).ok()?;
+    if res != 0 {
+        write(cpu, res, &pair(sec, nsec))?;
+    }
+    Some(Ok(0))
+}
+
+fn gettimeofday(cpu: &Cpu, tv: u64, tz: u64) -> Option<SysResult> {
+    if tv != 0 {
+        let (sec, nsec) = appine_hal::clock_gettime(CLOCK_REALTIME).ok()?;
+        write(cpu, tv, &pair(sec, nsec / 1000))?;
+    }
+    if tz != 0 {
+        write(cpu, tz, &[0; 8])?;
+    }
+    Some(Ok(0))
+}
+
+/// `struct timespec`、`struct timeval`。
+fn pair(a: i64, b: i64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&a.to_le_bytes());
+    buf[8..].copy_from_slice(&b.to_le_bytes());
+    buf
 }
 
 impl Paths {

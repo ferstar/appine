@@ -1,5 +1,5 @@
 /*
- * System V IPC、POSIX 定时器、mremap、凭据和调度设置的 guest 测试程序（M6）：用 musl-gcc -static
+ * System V IPC、POSIX 定时器、时钟、mremap、凭据和调度设置的 guest 测试程序（M6）：用 musl-gcc -static
  * 编译，在 appine-run 里直接运行（不需要 rootfs）。每项检查通过时打印一行
  * "ok <名字>"，失败时打印原因并以 1 退出，全部通过时最后打印 "all ok"。
  */
@@ -19,11 +19,13 @@
 #include <sys/resource.h>
 #include <sys/sem.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/shm.h>
 #include <fcntl.h>
 #include <sys/signalfd.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -254,6 +256,79 @@ static void test_timers(void)
 
 /* ---- signalfd：取走被阻塞的信号，poll 能看到 ---- */
 
+/* ---- 时钟：宿主的时钟和自己的 CPU 时钟不持 BKL，别的持锁，结果一致；出错的参数 ---- */
+
+static long long ns_of(const struct timespec *t)
+{
+    return t->tv_sec * 1000000000LL + t->tv_nsec;
+}
+
+static void *spin(void *arg)
+{
+    while (!atomic_load((atomic_int *)arg))
+        ;
+    return NULL;
+}
+
+/* 在新线程里看另一个空转的线程的 CPU 时钟：它的涨得多，自己的从 0 开始、睡着几乎不动 */
+static void *watch(void *arg)
+{
+    atomic_int stop = 0;
+    pthread_t t;
+    clockid_t other;
+    struct timespec start, now, a, own;
+    (void)arg;
+    CHECK(pthread_create(&t, NULL, spin, &stop) == 0, "pthread_create");
+    CHECK(pthread_getcpuclockid(t, &other) == 0, "getcpuclockid other");
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0, "monotonic");
+    do {
+        struct timespec nap = {0, 10000000};
+        nanosleep(&nap, NULL);
+        CHECK(clock_gettime(other, &a) == 0, "other thread's clock");
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
+                  ns_of(&now) - ns_of(&start) < 10000000000LL,
+              "other thread's clock stays at %lld", ns_of(&a));
+    } while (ns_of(&a) < 50000000);
+    CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &own) == 0 && ns_of(&own) < ns_of(&a) / 2,
+          "own clock %lld while the other thread used %lld", ns_of(&own), ns_of(&a));
+    atomic_store(&stop, 1);
+    CHECK(pthread_join(t, NULL) == 0, "pthread_join");
+    return NULL;
+}
+
+static void test_clocks(void)
+{
+    struct timespec a, b, p;
+    struct timeval tv;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &a) == 0, "monotonic");
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &b) == 0 && ns_of(&b) >= ns_of(&a), "monotonic goes back");
+    CHECK(clock_gettime(CLOCK_REALTIME, &a) == 0 && gettimeofday(&tv, NULL) == 0, "realtime");
+    CHECK(tv.tv_sec >= a.tv_sec && tv.tv_sec - a.tv_sec <= 1, "gettimeofday %ld vs %ld",
+          (long)tv.tv_sec, (long)a.tv_sec);
+    CHECK(clock_getres(CLOCK_MONOTONIC, &p) == 0 && p.tv_sec == 0 && p.tv_nsec > 0, "getres");
+    CHECK(syscall(SYS_clock_gettime, 12345, &a) == -1 && errno == EINVAL, "bad clock");
+    CHECK(syscall(SYS_clock_gettime, CLOCK_MONOTONIC, (void *)8) == -1 && errno == EFAULT,
+          "bad timespec");
+    CHECK(syscall(SYS_gettimeofday, (void *)8, NULL) == -1 && errno == EFAULT, "bad timeval");
+
+    /* 自己的 CPU 时钟：两种写法读的是同一个，忙一阵之后增加；进程的不比它少 */
+    clockid_t self;
+    CHECK(pthread_getcpuclockid(pthread_self(), &self) == 0, "getcpuclockid");
+    CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &a) == 0, "thread clock");
+    for (volatile long i = 0; i < 20000000; i++)
+        ;
+    CHECK(clock_gettime(self, &b) == 0 && ns_of(&b) > ns_of(&a), "own clock %lld -> %lld",
+          ns_of(&a), ns_of(&b));
+    CHECK(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &p) == 0 && ns_of(&p) >= ns_of(&b),
+          "process clock %lld < thread clock %lld", ns_of(&p), ns_of(&b));
+
+    /* 别的线程的 CPU 时钟 */
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, watch, NULL) == 0, "pthread_create");
+    CHECK(pthread_join(t, NULL) == 0, "pthread_join");
+    ok("clocks");
+}
+
 static void test_signalfd(void)
 {
     sigset_t set;
@@ -386,6 +461,7 @@ int main(void)
     test_sem();
     test_shm();
     test_timers();
+    test_clocks();
     test_signalfd();
     test_splice();
     test_mremap();

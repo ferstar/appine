@@ -360,7 +360,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)))
     };
     let mut dbt = attach(&k);
-    let mut fast = Fast::new(shared, &task.state.borrow());
+    let mut fast = Fast::new(shared, &task, &task.state.borrow());
     drop(k);
     let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
     let mut seen = load(&generations);
@@ -412,7 +412,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             if let Flow::Exec = flow {
                 generations = cx.mm().generations();
             }
-            fast.refresh(shared, cx.t);
+            fast.refresh(shared, cx.task, cx.t);
             flow
         });
         let flow = entered.unwrap_or_else(|| {

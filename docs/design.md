@@ -366,6 +366,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
   - execve 打开程序和解释器时用记着的宿主文件和读进来的开头（`loader::ExeCache`，最多 32 个，同一个版本才用，版本见 §4.2 的"翻译保留"），不必每次打开、读、关闭。
   - execve 放开 BKL 建新的地址空间：路径解析、打开程序和解释器、检查格式在锁里做，映射各段、构造初始栈只碰新的地址空间和共用的只读文件映射（它自己有锁），在锁外做，占 execve 持锁时间的大半。回来之后线程已经被要求退出（别的线程 exit_group、execve）就放弃。
   - **不持 BKL 的 stat**（`syscall::fast`）：newfstatat、statx 在运行循环里先试一次不取 BKL 的做法，条件是凭据不必检查搜索权限（root）、路径从根目录或当前目录开始（`AT_FDCWD` 或绝对路径）、整条路径都在仓库的元数据缓存里、不经过合成文件系统（§8.1）。做不了时什么也不改，照常取 BKL。线程在持有 BKL 时记下自己的根目录、当前目录和凭据；chdir、chroot、unshare、改凭据的一方让一个全局计数加一，别的线程记下的随之作废（`CLONE_FS` 共享的当前目录、线程组共享的凭据可能被别的线程改掉）。访问 guest 内存时线程仍然标记着在执行 guest 代码，解除映射的线程要等它，与 guest 代码自己访存一样。原来并行 lstat 被 BKL 串行化，`git status` 开着并行 lstat 比单线程还慢。
+  - **不持 BKL 读时钟**（同在 `syscall::fast`）：`clock_gettime`、`gettimeofday`、`clock_getres` 读宿主的时钟（实时、单调、启动以来等）和线程自己的 CPU 时钟（`CLOCK_THREAD_CPUTIME_ID`，或者 `pthread_getcpuclockid` 编码出来的自己的 tid）时不取 BKL；进程的、别的线程的 CPU 时钟要用内核里的状态，照常取 BKL。vDSO 的时间函数还是 svc 存根（§7.2），Go 的 nanotime、JVM 的 `System.nanoTime` 每次都进内核：原来 `go build` 一次 218 万次，几个线程排队等 BKL 一共等了 2.5 秒，4 个进程同时读时钟每次 800 纳秒。
   - 其余的拆分按 profiling 决定（R1）：多数负载的系统调用只占几个百分点。
 - **统一的等待机制**：guest 线程永远不直接阻塞在宿主 syscall 上。每个线程有一个专属的 **eventfd** 作为唤醒通道，所有等待都是一次宿主 `poll()`，监听集合里是这个 eventfd 加上要等的宿主 fd。
   - 任何可能让别人的等待条件成立的修改都请求一次唤醒，释放 BKL 时叫醒正在等待的线程，由它们各自重新检查条件。futex 是例外，见下一条。
@@ -401,7 +402,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 - v1 提供一个最小但真实的 ELF 镜像（`core/kernel/src/vdso.rs`，运行时按字节拼出），通过 `AT_SYSINFO_EHDR` 交给 guest。镜像只有一页，导出 `LINUX_2.6.39` 版本的符号，每个进程映射一份只读、可执行的私有拷贝（与 Linux 一样，调试器可以在里面下断点）。
 - `__kernel_rt_sigreturn` **必须恰好是 `mov x8, #139; svc #0` 这两条指令**，因为 libgcc 的 unwinder 靠逐字节匹配它们来识别信号帧。前面另有一条 nop，与 Linux 相同。
-- 时间函数（`__kernel_clock_gettime`、`gettimeofday`、`clock_getres`）在 v1 里只写成 `svc` 存根。
+- 时间函数（`__kernel_clock_gettime`、`gettimeofday`、`clock_getres`）在 v1 里只写成 `svc` 存根，进内核之后不取 BKL（§6），每次约 90 纳秒。
 - v1.x 实现快速路径（未实现）：guest 代码直接读 `CNTVCT_EL0`，再配合一个由我们更新的 vvar 页提供换算系数。
 
 ### 7.3 投递精度
