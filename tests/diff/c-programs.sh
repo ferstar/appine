@@ -1,5 +1,6 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
-# 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加
+# 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
+# 改名、setuid 之后 stat 立刻看到
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -185,3 +186,150 @@ int main(void)
 C
 gcc -O2 -o diff2 diff2.c -pthread
 ./diff2
+cat > diff3.c <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define ROUNDS 2000
+
+/* 主线程每轮改完加一（奇数），检查线程检查完加一（偶数） */
+static atomic_int turn;
+static atomic_int done;
+static atomic_int bad, stress_bad;
+static ino_t ino;
+
+static void wait_for(int v)
+{
+    while (atomic_load(&turn) < v)
+        sched_yield();
+}
+
+/* 一开始当前目录是 start。第 i 轮：当前目录是 d<i%2>，里面有 in<i%2>；三个目录里都有
+   which，长度各不相同；文件叫 n<i%2> */
+static void *checker(void *arg)
+{
+    (void)arg;
+    struct stat st;
+    char p[64];
+    bad += !(lstat("which", &st) == 0 && st.st_size == 9);
+    for (int i = 0; i < ROUNDS; i++) {
+        wait_for(2 * i + 1);
+        int k = i % 2;
+        bad += !(lstat("which", &st) == 0 && st.st_size == k);
+        snprintf(p, sizeof p, "in%d", k);
+        bad += lstat(p, &st) != 0;
+        snprintf(p, sizeof p, "in%d", !k);
+        bad += !(lstat(p, &st) != 0 && errno == ENOENT);
+        snprintf(p, sizeof p, "/tmp/fs3/n%d", k);
+        bad += !(stat(p, &st) == 0 && st.st_size == 3 && st.st_ino == ino);
+        snprintf(p, sizeof p, "../n%d", !k);
+        bad += !(stat(p, &st) != 0 && errno == ENOENT);
+        atomic_fetch_add(&turn, 1);
+    }
+    return NULL;
+}
+
+/* 不同步地一直 stat：拿到的总是同一个文件 */
+static void *stress(void *arg)
+{
+    (void)arg;
+    struct stat st;
+    while (!atomic_load(&done)) {
+        for (int k = 0; k < 2; k++) {
+            char p[32];
+            snprintf(p, sizeof p, "/tmp/fs3/n%d", k);
+            if (stat(p, &st) == 0)
+                stress_bad += st.st_size != 3 || st.st_ino != ino;
+            else
+                stress_bad += errno != ENOENT;
+        }
+    }
+    return NULL;
+}
+
+static atomic_int phase;
+static int helper_before, helper_after, helper_errno;
+
+/* 先 stat 一次（填进缓存），等主线程 setuid 之后再 stat */
+static void *helper(void *arg)
+{
+    (void)arg;
+    struct stat st;
+    helper_before = stat("/tmp/fs3/priv/x", &st);
+    atomic_store(&phase, 1);
+    while (atomic_load(&phase) < 2)
+        sched_yield();
+    helper_after = stat("/tmp/fs3/priv/x", &st);
+    helper_errno = errno;
+    return NULL;
+}
+
+static void put(const char *path, const char *data)
+{
+    FILE *f = fopen(path, "w");
+    fputs(data, f);
+    fclose(f);
+}
+
+int main(void)
+{
+    struct stat st;
+    mkdir("/tmp/fs3", 0755);
+    mkdir("/tmp/fs3/start", 0755);
+    mkdir("/tmp/fs3/d0", 0755);
+    mkdir("/tmp/fs3/d1", 0755);
+    put("/tmp/fs3/start/which", "123456789");
+    put("/tmp/fs3/d0/which", "");
+    put("/tmp/fs3/d1/which", "1");
+    close(creat("/tmp/fs3/d0/in0", 0644));
+    close(creat("/tmp/fs3/d1/in1", 0644));
+    unlink("/tmp/fs3/n0");
+    put("/tmp/fs3/n1", "abc");
+    chdir("/tmp/fs3/start");
+    stat("/tmp/fs3/n1", &st);
+    ino = st.st_ino;
+    pthread_t c, s[2];
+    pthread_create(&c, NULL, checker, NULL);
+    for (int i = 0; i < 2; i++)
+        pthread_create(&s[i], NULL, stress, NULL);
+    for (int i = 0; i < ROUNDS; i++) {
+        int k = i % 2;
+        char from[32], to[32];
+        snprintf(from, sizeof from, "/tmp/fs3/n%d", !k);
+        snprintf(to, sizeof to, "/tmp/fs3/n%d", k);
+        bad += chdir(k ? "/tmp/fs3/d1" : "/tmp/fs3/d0") != 0;
+        bad += rename(from, to) != 0;
+        atomic_fetch_add(&turn, 1);
+        wait_for(2 * i + 2);
+    }
+    atomic_store(&done, 1);
+    pthread_join(c, NULL);
+    for (int i = 0; i < 2; i++)
+        pthread_join(s[i], NULL);
+    printf("stat after changes: %d bad, stress %d bad\n", bad, stress_bad);
+
+    /* 换成普通用户之后要检查搜索权限（musl 让每个线程都换） */
+    mkdir("/tmp/fs3/priv", 0700);
+    close(creat("/tmp/fs3/priv/x", 0644));
+    pthread_create(&c, NULL, helper, NULL);
+    while (atomic_load(&phase) < 1)
+        sched_yield();
+    if (setuid(65534) != 0)
+        return 1;
+    atomic_store(&phase, 2);
+    pthread_join(c, NULL);
+    printf("as root %d, after setuid %d %s\n", helper_before, helper_after,
+           helper_after ? strerror(helper_errno) : "");
+    return 0;
+}
+C
+gcc -O2 -o diff3 diff3.c -pthread
+./diff3
+rm -rf /tmp/fs3

@@ -389,6 +389,17 @@ impl Cpu {
         unsafe { self.state.as_mut() }
     }
 
+    /// 按绑定的页表查询 guest 地址对应的 host 指针（[`Mmu::translate`]）；没有绑定页表时
+    /// 返回 None。页表允许在别的线程修改它时遍历；指针指向的内存的有效期由调用方保证。
+    pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
+        let mmu = self.state().mmu;
+        if mmu.is_null() {
+            return None;
+        }
+        // SAFETY: 绑定的 mmu 比 Cpu 活得久（Cpu::new、Cpu::reset）
+        NonNull::new(unsafe { appine_mmu_translate(mmu, gva, required_prot) }.cast())
+    }
+
     /// 让软件 TLB 全部失效。
     pub fn tlb_flush(&mut self) {
         unsafe { appine_cpu_tlb_flush(self.state.as_ptr()) }

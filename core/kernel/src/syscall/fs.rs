@@ -27,7 +27,7 @@ use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Node, Pseudo, Vfs, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
-const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_EACCESS: u32 = 0x200;
 const AT_SYMLINK_FOLLOW: u32 = 0x400;
@@ -93,7 +93,7 @@ const CLOSE_RANGE_CLOEXEC: u32 = 4;
 const UIO_MAXIOV: usize = 1024;
 
 /// inode 仓库对外报告的设备号。
-const ROOT_DEV: u64 = 0x801;
+pub(super) const ROOT_DEV: u64 = 0x801;
 /// 管道报告的设备号（Linux 上 pipefs 是一个匿名设备）。
 const PIPE_DEV: u64 = 0xd;
 /// socket、anon_inode（epoll、eventfd）报告的设备号。
@@ -288,7 +288,7 @@ fn split_ns(ns: i64) -> (u64, u64) {
 }
 
 /// 按 asm-generic 的 `struct stat`（128 字节）编码。
-fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
+pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     let mut b = [0u8; 128];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
     let (asec, ansec) = split_ns(st.atime_ns);
@@ -1487,6 +1487,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::EPERM);
     }
     cx.t.fs.borrow_mut().root = node;
+    cx.shared.paths_changed();
     Ok(0)
 }
 
@@ -1500,6 +1501,7 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
         cx.cred().permission(&vfs.store().stat(ino)?, MAY_EXEC)?;
     }
     cx.t.fs.borrow_mut().cwd = node;
+    cx.shared.paths_changed();
     Ok(0)
 }
 
@@ -1545,12 +1547,18 @@ pub(super) fn newfstatat(
     buf: u64,
     flags: u32,
 ) -> SysResult {
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        return Err(Errno::EINVAL);
-    }
+    newfstatat_flags(flags)?;
     let path = read_path(cx, path)?;
     let st = stat_at(cx, dirfd, &path, flags)?;
     put(cx, buf, st).map(|()| 0)
+}
+
+/// newfstatat 的 `flags` 检查。
+pub(super) fn newfstatat_flags(flags: u32) -> Result<(), Errno> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 /// newfstatat、statx 共用：`*at` 风格地找到对象，返回 `struct stat`。
@@ -1583,6 +1591,14 @@ pub(super) fn statx(
     mask: u32,
     buf: u64,
 ) -> SysResult {
+    let flags = statx_flags(flags, mask)?;
+    let path = read_path(cx, path)?;
+    let st = stat_at(cx, dirfd, &path, flags)?;
+    put(cx, buf, encode_statx(&st)).map(|()| 0)
+}
+
+/// statx 的 `flags` 和 `mask` 检查，返回 [`stat_at`] 用的 flags。
+pub(super) fn statx_flags(flags: u32, mask: u32) -> Result<u32, Errno> {
     const AT_NO_AUTOMOUNT: u32 = 0x800;
     const AT_STATX_SYNC_TYPE: u32 = 0x6000;
     const STATX_RESERVED: u32 = 0x8000_0000;
@@ -1592,19 +1608,12 @@ pub(super) fn statx(
     {
         return Err(Errno::EINVAL);
     }
-    let path = read_path(cx, path)?;
-    let st = stat_at(
-        cx,
-        dirfd,
-        &path,
-        flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH),
-    )?;
-    put(cx, buf, encode_statx(&st)).map(|()| 0)
+    Ok(flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
 }
 
 /// 由 `struct stat` 得到 `struct statx`：总是给出全部基本字段（`STATX_BASIC_STATS`），
 /// 没有创建时间。
-fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
+pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
     const STATX_BASIC_STATS: u32 = 0x7ff;
     let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap());

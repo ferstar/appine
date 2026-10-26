@@ -1,7 +1,8 @@
 //! guest 线程（Linux 的 task）与它的运行循环（设计文档 §6）。
 //!
 //! 每个 guest 线程对应一个宿主线程（1:1）。运行循环在不持有 BKL 的情况下执行
-//! guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL 进入内核。
+//! guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL 进入内核；少数系统调用不必
+//! 取 BKL（[`crate::syscall::fast`]）。
 
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
@@ -19,6 +20,7 @@ use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
 use crate::mm::{Generations, Mm};
 use crate::process::{CpuTime, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
+use crate::syscall::fast::Fast;
 use crate::syscall::{self, Flow};
 use crate::uaccess::UserSlice;
 use crate::vfs::{Node, Vfs};
@@ -243,6 +245,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
         space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)))
     };
     let mut dbt = attach(&k);
+    let mut fast = Fast::new(shared, &task.state.borrow());
     drop(k);
     let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
     let mut seen = load(&generations);
@@ -276,7 +279,13 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
             Some((d, _)) => d.run(cpu),
             None => cpu.run(),
         };
+        // 不持 BKL 就能做完的系统调用（syscall::fast）。它访问 guest 内存时仍然标记着在
+        // 执行 guest 代码
+        let done = matches!(exit, Exit::Svc { .. }) && fast.syscall(shared, cpu);
         sync.in_guest.store(false, Ordering::SeqCst);
+        if done {
+            continue;
+        }
 
         // 内核层的 bug 只结束这个进程（crate::bug）
         let pc = cpu.state().pc;
@@ -288,6 +297,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
             if let Flow::Exec = flow {
                 generations = cx.mm().generations();
             }
+            fast.refresh(shared, cx.t);
             flow
         });
         let flow = entered.unwrap_or_else(|| {

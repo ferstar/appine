@@ -6,6 +6,7 @@
 
 mod aio;
 mod cred;
+pub(crate) mod fast;
 mod fs;
 mod inotify;
 mod ipc;

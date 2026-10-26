@@ -642,6 +642,7 @@ fn exec(
             g.dumpable = false;
         }
         g.cred = new_cred;
+        cx.shared.paths_changed();
         g.rlimits[process::RLIMIT_STACK as usize].0 = stack_limit;
         g.posix_timers.clear();
         // AIO 上下文的环在旧的地址空间里，随之消失

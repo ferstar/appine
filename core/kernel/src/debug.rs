@@ -26,7 +26,7 @@ pub(crate) fn trace_start() -> Option<Instant> {
     })
 }
 
-fn tracing() -> bool {
+pub(crate) fn tracing() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("APPINE_STRACE").is_some_and(|v| !v.is_empty() && v != "0")

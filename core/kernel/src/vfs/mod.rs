@@ -12,11 +12,12 @@ pub mod store;
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::cred::{Cred, MAY_EXEC};
 use crate::errno::Errno;
 pub(crate) use crate::pseudo::PseudoNode;
-use store::{Ino, ROOT, Store, mode};
+use store::{Ino, ROOT, Stat, Store, mode};
 
 /// 跟随符号链接的最大次数，与 Linux 的 MAXSYMLINKS 一致。
 pub(crate) const MAX_SYMLINKS: u32 = 40;
@@ -81,6 +82,134 @@ pub struct Vfs {
     store: Store,
     /// 挂载点：仓库里的目录和挂在上面的文件系统。
     mounts: Vec<(Ino, Mount)>,
+    cached: Cached,
+}
+
+/// 不持 BKL 解析路径要用的部分（`syscall::fast`）：仓库的元数据缓存和挂载点。
+#[derive(Clone)]
+pub(crate) struct Cached {
+    meta: Arc<store::Meta>,
+    mounts: Arc<[Ino]>,
+}
+
+impl Cached {
+    /// 只用元数据缓存解析路径并取得元数据：相当于凭据有 `CAP_DAC_READ_SEARCH`（不检查
+    /// 搜索权限）时的 [`Vfs::resolve`] 加上 [`Store::stat`]。`root`、`cwd` 是仓库里的
+    /// 目录。路径进入合成文件系统，或者要用的东西不在缓存里时返回 None，调用方改为持有
+    /// BKL 正常解析（顺带填进缓存）。
+    pub(crate) fn stat(
+        &self,
+        root: Ino,
+        cwd: Ino,
+        path: &[u8],
+        follow: bool,
+    ) -> Option<Result<Stat, Errno>> {
+        let r = self.meta.reader()?;
+        match self.walk(&r, root, cwd, path, follow)? {
+            Ok(ino) => r.stat(ino).map(Ok),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// 与 [`Vfs::walk_in`] 一一对应。
+    fn walk(
+        &self,
+        r: &store::Reader<'_>,
+        root: Ino,
+        cwd: Ino,
+        path: &[u8],
+        follow: bool,
+    ) -> Option<Result<Ino, Errno>> {
+        if path.is_empty() {
+            return Some(Err(Errno::ENOENT));
+        }
+        let mut dir = if path[0] == b'/' { root } else { cwd };
+        // 还没处理的组件，栈顶是下一个；不分配内存，放不下时交给正常的解析
+        let mut pending = Pending::default();
+        pending.push(path)?;
+        let mut links = 0;
+        while let Some(comp) = pending.pop() {
+            let last = pending.is_empty();
+            if comp.len() > NAME_MAX {
+                return Some(Err(Errno::ENAMETOOLONG));
+            }
+            if r.kind(dir)? != mode::S_IFDIR {
+                return Some(Err(Errno::ENOTDIR));
+            }
+            if comp == b"." {
+                continue;
+            }
+            if comp == b".." {
+                if dir != root {
+                    dir = r.parent(dir)?;
+                }
+                continue;
+            }
+            let Some(node) = r.lookup(dir, comp)? else {
+                return Some(Err(Errno::ENOENT));
+            };
+            if self.mounts.contains(&node) {
+                return None;
+            }
+            if r.kind(node)? == mode::S_IFLNK && (!last || follow) {
+                links += 1;
+                if links > MAX_SYMLINKS {
+                    return Some(Err(Errno::ELOOP));
+                }
+                let target = r.readlink(node)?;
+                if target.first() == Some(&b'/') {
+                    dir = root;
+                }
+                pending.push(target)?;
+                continue;
+            }
+            dir = node;
+        }
+        Some(Ok(dir))
+    }
+}
+
+/// [`Cached::walk`] 还没处理的路径组件（[`components`] 的结果倒过来放）。
+struct Pending<'p> {
+    comps: [&'p [u8]; 64],
+    len: usize,
+}
+
+impl Default for Pending<'_> {
+    fn default() -> Self {
+        Pending {
+            comps: [&[]; 64],
+            len: 0,
+        }
+    }
+}
+
+impl<'p> Pending<'p> {
+    /// 把 `path` 的组件放到最前面；放不下时返回 None。
+    fn push(&mut self, path: &'p [u8]) -> Option<()> {
+        if path.ends_with(b"/") {
+            self.push_one(b".")?;
+        }
+        for c in path.rsplit(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            self.push_one(c)?;
+        }
+        Some(())
+    }
+
+    fn push_one(&mut self, comp: &'p [u8]) -> Option<()> {
+        *self.comps.get_mut(self.len)? = comp;
+        self.len += 1;
+        Some(())
+    }
+
+    fn pop(&mut self) -> Option<&'p [u8]> {
+        self.len = self.len.checked_sub(1)?;
+        Some(self.comps[self.len])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl Vfs {
@@ -106,12 +235,25 @@ impl Vfs {
                 _ => crate::debug::log(format_args!("no mount point for {m:?}")),
             }
         }
-        Ok(Vfs { store, mounts })
+        let cached = Cached {
+            meta: store.meta().clone(),
+            mounts: mounts.iter().map(|&(ino, _)| ino).collect(),
+        };
+        Ok(Vfs {
+            store,
+            mounts,
+            cached,
+        })
     }
 
     /// 底层的 inode 仓库。
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// 不持 BKL 解析路径要用的部分。
+    pub(crate) fn cached(&self) -> &Cached {
+        &self.cached
     }
 
     fn mount_point(&self, m: Mount) -> Option<Ino> {
@@ -532,8 +674,8 @@ mod tests {
         }
     }
 
-    fn sample() -> (Vfs, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("appine-vfs-{}", std::process::id()));
+    fn sample(name: &str) -> (Vfs, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("appine-vfs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::create(&dir).unwrap();
         let bin = s.mkdir(ROOT, b"bin", 0o755, 0, 0).unwrap();
@@ -552,7 +694,7 @@ mod tests {
 
     #[test]
     fn resolves_paths_and_symlinks() {
-        let (vfs, dir) = sample();
+        let (vfs, dir) = sample("resolve");
         let ps = &Empty;
         let root_cred = Cred::root();
         let cred = &root_cred;
@@ -640,6 +782,73 @@ mod tests {
         let pts = r(&root, b"/dev/pts", true).unwrap();
         assert_eq!(pts, Node::Pseudo(PseudoNode::PtsRoot));
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &pts).unwrap(), b"/dev/pts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_from_the_cache_like_the_full_walk() {
+        let (vfs, dir) = sample("cached");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let cached = vfs.cached();
+        let usr = match vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true) {
+            Ok(Node::Store(ino)) => ino,
+            other => panic!("{other:?}"),
+        };
+        let paths: [&[u8]; 20] = [
+            b"/bin/busybox",
+            b"/usr/bin/env",
+            b"/usr/bin/rel",
+            b"/bindir/busybox",
+            b"//usr/./bin/../../bin/busybox",
+            b"../bin/busybox",
+            b"/..",
+            b"/loop",
+            b"/missing",
+            b"/bin/missing/x",
+            b"/bin/busybox/x",
+            b"/bin/busybox/",
+            b"/bin/busybox/.",
+            b"/bin/busybox/..",
+            b"/slash",
+            b"/bindir/",
+            b"/",
+            b"bin",
+            b"bin/rel",
+            b"./bin/../../bindir/",
+        ];
+        for follow in [true, false] {
+            for cwd in [ROOT, usr] {
+                for p in paths {
+                    let full = vfs
+                        .resolve(ps, cred, &Node::ROOT, &Node::Store(cwd), p, follow)
+                        .and_then(|n| match n {
+                            Node::Store(ino) => vfs.store().stat(ino),
+                            Node::Pseudo(_) => unreachable!(),
+                        });
+                    // 正常解析把要用的都填进了缓存，之后只用缓存也得到同样的结果
+                    assert_eq!(
+                        cached.stat(ROOT, cwd, p, follow),
+                        Some(full),
+                        "{} from {cwd}, follow {follow}",
+                        String::from_utf8_lossy(p)
+                    );
+                }
+            }
+        }
+        // 合成文件系统交给正常解析
+        assert_eq!(cached.stat(ROOT, ROOT, b"/proc", true), None);
+        assert_eq!(cached.stat(ROOT, ROOT, b"/dev/pts/0", true), None);
+        // 没解析过的名字也交给正常解析
+        assert_eq!(cached.stat(ROOT, ROOT, b"/bin/sh", true), None);
+        // 改了之后不会用到旧的条目
+        let bin = match vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/bin", true) {
+            Ok(Node::Store(ino)) => ino,
+            other => panic!("{other:?}"),
+        };
+        vfs.store().unlink(bin, b"busybox").unwrap();
+        assert_eq!(cached.stat(ROOT, ROOT, b"/bin/busybox", true), None);
+        assert_eq!(cached.stat(ROOT, usr, b"bin/env", true), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

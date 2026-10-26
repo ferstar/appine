@@ -13,13 +13,16 @@
 //! 链接目标），不逐级查询数据库。自己的写入只去掉受影响的条目。多个 appine 进程可以
 //! 共用一个仓库，所以 `lock` 文件的前 8 字节是所有进程共享映射的计数器：每次提交之后
 //! 加一；缓存发现它不是因为自己的提交而变了，就整体作废。
+//!
+//! 缓存也可以不持 BKL 读（[`Meta`]）：并行的 lstat（`git status`、构建工具）不必排队。
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -118,9 +121,8 @@ pub struct Store {
     /// 仓库目录里的 `lock` 文件。每个使用仓库的进程持有它的共享锁，只有独占使用时
     /// 才清理已删除的 inode：别的进程可能还打开着它们。
     lock: File,
-    /// `lock` 文件开头的提交计数器（模块文档）。
-    commits: Commits,
-    cache: RefCell<Cache>,
+    /// 元数据缓存、提交计数器和 `objects` 目录。
+    meta: Arc<Meta>,
     /// 正在写事务里：读到的可能是还没提交的内容，不用缓存。
     writing: Cell<bool>,
     /// [`Store::snapshot`] 里：还没开始读事务时是 Some(None)，开始时的提交计数是
@@ -128,8 +130,104 @@ pub struct Store {
     snapshot_at: Cell<Option<Option<u64>>>,
     /// 这次写入改了的目录项和 inode 行，提交之后从缓存里去掉。
     touched: RefCell<Touched>,
+}
+
+/// 元数据缓存，以及不持 BKL 读它（`syscall::fast`）要用的东西。
+///
+/// 只有 [`Store`] 的方法修改缓存，修改时持有写锁；它们读时不加锁，因为别的线程只会读：
+/// Store 不是 Sync，同一时刻只有一个线程（持有 BKL 的那个）调用它的方法。不持 BKL 的
+/// 线程只经由 [`Meta::reader`] 持读锁读。
+pub(crate) struct Meta {
+    lock: RwLock<()>,
+    cache: UnsafeCell<Cache>,
+    /// `lock` 文件开头的提交计数器（模块文档）。
+    commits: Commits,
     /// `objects` 目录（宿主 `O_PATH`），按 inode 编号 stat object 不必解析整个路径。
-    objects_dir: std::os::fd::OwnedFd,
+    objects_dir: OwnedFd,
+}
+
+// SAFETY: 缓存按上面的约定同步；提交计数器是共享映射里的原子变量，映射在 Meta 存续
+// 期间一直有效
+unsafe impl Send for Meta {}
+unsafe impl Sync for Meta {}
+
+impl Meta {
+    /// 不持 BKL 读缓存。缓存是最新的（提交计数器没变）时返回读者，持有读锁直到它被丢掉。
+    pub(crate) fn reader(&self) -> Option<Reader<'_>> {
+        let guard = self.lock.read().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: 持有读锁，修改缓存的线程要等它释放
+        let cache = unsafe { &*self.cache.get() };
+        (cache.generation == self.commits.get()).then_some(Reader {
+            _guard: guard,
+            cache,
+            objects_dir: &self.objects_dir,
+        })
+    }
+}
+
+/// 不持 BKL 读缓存的读者（[`Meta::reader`]）。查询没有命中时返回 None，调用方改为持有
+/// BKL 正常查询（会填进缓存）。
+pub(crate) struct Reader<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
+    cache: &'a Cache,
+    objects_dir: &'a OwnedFd,
+}
+
+impl Reader<'_> {
+    /// [`Store::lookup`]。
+    pub fn lookup(&self, parent: Ino, name: &[u8]) -> Option<Option<Ino>> {
+        self.cache.dentries.get(&parent)?.get(name).copied()
+    }
+
+    /// [`Store::kind`]。
+    pub fn kind(&self, ino: Ino) -> Option<u32> {
+        Some(self.cache.rows.get(&ino)?.kind())
+    }
+
+    /// [`Store::readlink`]：不是符号链接时返回 None。
+    pub fn readlink(&self, ino: Ino) -> Option<&[u8]> {
+        self.cache.targets.get(&ino).map(Vec::as_slice)
+    }
+
+    /// [`Store::parent`]。
+    pub fn parent(&self, dir: Ino) -> Option<Ino> {
+        self.cache.parents.get(&dir).copied()
+    }
+
+    /// [`Store::stat`]。持有读锁时 stat object：inode 编号被删除后重新使用的话，结果
+    /// 不会一半来自旧文件、一半来自新文件。宿主上出错时返回 None。
+    pub fn stat(&self, ino: Ino) -> Option<Stat> {
+        let mut st = *self.cache.rows.get(&ino)?;
+        if st.kind() == mode::S_IFREG {
+            fill_from_host(&mut st, self.objects_dir, ino).ok()?;
+        }
+        Some(st)
+    }
+}
+
+/// 普通文件的 size 和时间取自宿主 object 文件。
+fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+    let mut name = [0u8; 21];
+    let o =
+        appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)).map_err(Errno)?;
+    st.size = o.st_size as u64;
+    st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
+    st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
+    Ok(())
+}
+
+/// object 的文件名（inode 编号的十进制表示），不分配内存。
+fn object_name(mut ino: Ino, buf: &mut [u8; 21]) -> &std::ffi::CStr {
+    let mut i = buf.len() - 1;
+    buf[i] = 0;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (ino % 10) as u8;
+        ino /= 10;
+        if ino == 0 {
+            return std::ffi::CStr::from_bytes_with_nul(&buf[i..]).unwrap();
+        }
+    }
 }
 
 /// 写入改了的东西（[`Store::written`]）。
@@ -430,15 +528,18 @@ impl Store {
             db,
             objects: dir.join("objects"),
             lock,
-            cache: RefCell::new(Cache {
-                generation: commits.get(),
-                ..Cache::default()
+            meta: Arc::new(Meta {
+                lock: RwLock::new(()),
+                cache: UnsafeCell::new(Cache {
+                    generation: commits.get(),
+                    ..Cache::default()
+                }),
+                commits,
+                objects_dir,
             }),
-            commits,
             writing: Cell::new(false),
             snapshot_at: Cell::new(None),
             touched: RefCell::default(),
-            objects_dir,
         })
     }
 
@@ -479,33 +580,58 @@ impl Store {
     /// 自己的缓存也整体作废。
     fn written(&self) {
         let touched = std::mem::take(&mut *self.touched.borrow_mut());
-        let mut c = self.cache.borrow_mut();
-        for (dir, name) in &touched.names {
-            if let Some(d) = c.dentries.get_mut(dir) {
-                d.remove(name);
+        let committed = self.db.is_autocommit();
+        self.update(|c| {
+            for (dir, name) in &touched.names {
+                if let Some(d) = c.dentries.get_mut(dir) {
+                    d.remove(name);
+                }
+                c.listings.remove(dir);
+                c.names.remove(dir);
             }
-            c.listings.remove(dir);
-            c.names.remove(dir);
-        }
-        for ino in &touched.inos {
-            c.rows.remove(ino);
-            c.targets.remove(ino);
-            c.parents.remove(ino);
-        }
-        if self.db.is_autocommit() {
-            let before = self.commits.bump();
-            if before == c.generation {
-                c.generation = before + 1;
-            } else {
-                c.clear(before + 1);
+            for ino in &touched.inos {
+                c.rows.remove(ino);
+                c.targets.remove(ino);
+                c.parents.remove(ino);
             }
-        }
+            if committed {
+                let before = self.meta.commits.bump();
+                if before == c.generation {
+                    c.generation = before + 1;
+                } else {
+                    c.clear(before + 1);
+                }
+            }
+        });
+    }
+
+    /// 读缓存。只有 Store 的方法改缓存，它们自己读不必加锁（[`Meta`]）。
+    fn cached<R>(&self, f: impl FnOnce(&Cache) -> R) -> R {
+        // SAFETY: Store 不是 Sync，别的线程不会同时修改；f 不回调 Store 的方法，借用不会
+        // 与 update 的重叠
+        f(unsafe { &*self.meta.cache.get() })
+    }
+
+    /// 改缓存：持有写锁，等不持 BKL 读缓存的线程读完。
+    fn update<R>(&self, f: impl FnOnce(&mut Cache) -> R) -> R {
+        let _guard = self
+            .meta
+            .lock
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: 持有写锁，没有别的线程在读；f 不回调 Store 的方法
+        f(unsafe { &mut *self.meta.cache.get() })
+    }
+
+    /// 不持 BKL 读缓存要用的部分（[`Meta`]）。
+    pub(crate) fn meta(&self) -> &Arc<Meta> {
+        &self.meta
     }
 
     /// 缓存没命中、要查数据库之前调用：在 [`Store::snapshot`] 里时，第一次查询开始读事务。
     fn begin_read(&self) -> Result<(), Errno> {
         if self.snapshot_at.get() == Some(None) {
-            self.snapshot_at.set(Some(Some(self.commits.get())));
+            self.snapshot_at.set(Some(Some(self.meta.commits.get())));
             self.db.execute_batch("BEGIN").map_err(db_err)?;
         }
         Ok(())
@@ -516,10 +642,9 @@ impl Store {
         if self.writing.get() {
             return None;
         }
-        let now = self.commits.get();
-        let mut c = self.cache.borrow_mut();
-        if c.generation != now || c.entries > Cache::MAX_ENTRIES {
-            c.clear(now);
+        let now = self.meta.commits.get();
+        if self.cached(|c| c.generation != now || c.entries > Cache::MAX_ENTRIES) {
+            self.update(|c| c.clear(now));
         }
         Some(now)
     }
@@ -531,7 +656,7 @@ impl Store {
             .get()
             .flatten()
             .is_none_or(|s| s == generation)
-            && self.commits.get() == generation
+            && self.meta.commits.get() == generation
     }
 
     /// 在一个读事务里执行 `f`，里面的查询看到同一个快照，并且共用一次加锁：WAL 模式下
@@ -562,12 +687,7 @@ impl Store {
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
         let generation = self.cache_generation();
         if generation.is_some()
-            && let Some(&hit) = self
-                .cache
-                .borrow()
-                .dentries
-                .get(&parent)
-                .and_then(|d| d.get(name))
+            && let Some(hit) = self.cached(|c| c.dentries.get(&parent)?.get(name).copied())
         {
             return Ok(hit);
         }
@@ -579,12 +699,13 @@ impl Store {
             .optional()
             .map_err(db_err)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            let mut c = self.cache.borrow_mut();
-            c.entries += 1;
-            c.dentries
-                .entry(parent)
-                .or_default()
-                .insert(name.to_vec(), found);
+            self.update(|c| {
+                c.entries += 1;
+                c.dentries
+                    .entry(parent)
+                    .or_default()
+                    .insert(name.to_vec(), found);
+            });
         }
         Ok(found)
     }
@@ -594,14 +715,9 @@ impl Store {
     pub fn name_of(&self, parent: Ino, ino: Ino) -> Result<Option<Vec<u8>>, Errno> {
         let generation = self.cache_generation();
         if generation.is_some()
-            && let Some(hit) = self
-                .cache
-                .borrow()
-                .names
-                .get(&parent)
-                .and_then(|d| d.get(&ino))
+            && let Some(hit) = self.cached(|c| c.names.get(&parent)?.get(&ino).cloned())
         {
-            return Ok(hit.clone());
+            return Ok(hit);
         }
         self.begin_read()?;
         let found: Option<Vec<u8>> = self
@@ -613,12 +729,13 @@ impl Store {
             .optional()
             .map_err(db_err)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            let mut c = self.cache.borrow_mut();
-            c.entries += 1;
-            c.names
-                .entry(parent)
-                .or_default()
-                .insert(ino, found.clone());
+            self.update(|c| {
+                c.entries += 1;
+                c.names
+                    .entry(parent)
+                    .or_default()
+                    .insert(ino, found.clone());
+            });
         }
         Ok(found)
     }
@@ -627,12 +744,7 @@ impl Store {
     pub fn stat(&self, ino: Ino) -> Result<Stat, Errno> {
         let mut st = self.stat_row(ino)?;
         if st.kind() == mode::S_IFREG {
-            let name = ino.to_string();
-            let o = appine_hal::stat_at(self.objects_dir.as_raw_fd(), name.as_bytes())
-                .map_err(Errno)?;
-            st.size = o.st_size as u64;
-            st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
-            st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
+            fill_from_host(&mut st, &self.meta.objects_dir, ino)?;
         }
         Ok(st)
     }
@@ -653,16 +765,17 @@ impl Store {
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
         let generation = self.cache_generation();
         if generation.is_some()
-            && let Some(&hit) = self.cache.borrow().rows.get(&ino)
+            && let Some(hit) = self.cached(|c| c.rows.get(&ino).copied())
         {
             return Ok(hit);
         }
         self.begin_read()?;
         let st = self.query_stat_row(ino)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            let mut c = self.cache.borrow_mut();
-            c.entries += 1;
-            c.rows.insert(ino, st);
+            self.update(|c| {
+                c.entries += 1;
+                c.rows.insert(ino, st);
+            });
         }
         Ok(st)
     }
@@ -711,9 +824,9 @@ impl Store {
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
         let generation = self.cache_generation();
         if generation.is_some()
-            && let Some(hit) = self.cache.borrow().targets.get(&ino)
+            && let Some(hit) = self.cached(|c| c.targets.get(&ino).cloned())
         {
-            return Ok(hit.clone());
+            return Ok(hit);
         }
         self.begin_read()?;
         let target = self
@@ -725,9 +838,10 @@ impl Store {
             .ok_or(Errno::ENOENT)?
             .ok_or(Errno::EINVAL)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            let mut c = self.cache.borrow_mut();
-            c.entries += 1;
-            c.targets.insert(ino, target.clone());
+            self.update(|c| {
+                c.entries += 1;
+                c.targets.insert(ino, target.clone());
+            });
         }
         Ok(target)
     }
@@ -736,7 +850,7 @@ impl Store {
     pub fn parent(&self, dir: Ino) -> Result<Ino, Errno> {
         let generation = self.cache_generation();
         if generation.is_some()
-            && let Some(&hit) = self.cache.borrow().parents.get(&dir)
+            && let Some(hit) = self.cached(|c| c.parents.get(&dir).copied())
         {
             return Ok(hit);
         }
@@ -749,9 +863,10 @@ impl Store {
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            let mut c = self.cache.borrow_mut();
-            c.entries += 1;
-            c.parents.insert(dir, parent);
+            self.update(|c| {
+                c.entries += 1;
+                c.parents.insert(dir, parent);
+            });
         }
         Ok(parent)
     }
@@ -760,9 +875,9 @@ impl Store {
     pub fn readdir(&self, dir: Ino) -> Result<Vec<DirEntry>, Errno> {
         let generation = self.cache_generation();
         if generation.is_some()
-            && let Some(hit) = self.cache.borrow().listings.get(&dir)
+            && let Some(hit) = self.cached(|c| c.listings.get(&dir).cloned())
         {
-            return Ok(hit.clone());
+            return Ok(hit);
         }
         let mut stmt = self
             .db
@@ -782,9 +897,10 @@ impl Store {
             .map_err(db_err)?;
         let list: Vec<DirEntry> = rows.collect::<Result<_, _>>().map_err(db_err)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
-            let mut c = self.cache.borrow_mut();
-            c.entries += list.len() + 1;
-            c.listings.insert(dir, list.clone());
+            self.update(|c| {
+                c.entries += list.len() + 1;
+                c.listings.insert(dir, list.clone());
+            });
         }
         Ok(list)
     }

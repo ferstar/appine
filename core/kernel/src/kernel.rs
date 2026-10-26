@@ -16,7 +16,7 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -271,6 +271,9 @@ pub(crate) struct Shared {
     pub timers: Arc<Event>,
     /// 内存上限的检查停下来了（所有线程都在等待，[`crate::oom`]）。
     pub oom_idle: AtomicBool,
+    /// 有线程的根目录、当前目录或者凭据变了就加一：线程为不持 BKL 的系统调用记下的
+    /// 这些随之过时（`syscall::fast`）。
+    paths: AtomicU64,
 }
 
 impl Shared {
@@ -279,7 +282,18 @@ impl Shared {
             kernel: Mutex::new(kernel),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
             oom_idle: AtomicBool::new(false),
+            paths: AtomicU64::new(0),
         }
+    }
+
+    /// 某个线程的根目录、当前目录或者凭据变了（持有 BKL 时调用）。
+    pub fn paths_changed(&self) {
+        self.paths.fetch_add(1, Ordering::Release);
+    }
+
+    /// [`Shared::paths_changed`] 的次数。
+    pub fn paths_epoch(&self) -> u64 {
+        self.paths.load(Ordering::Acquire)
     }
 
     /// 线程要接着执行 guest 代码了：内存上限的检查停着时叫醒定时器线程。不需要持有 BKL。
@@ -489,6 +503,7 @@ impl<'a> Cx<'a> {
     pub fn set_fs(&mut self, fs: Rc<RefCell<crate::task::FsContext>>) {
         self.task.res.borrow_mut().fs = fs.clone();
         self.t.fs = fs;
+        self.shared.paths_changed();
     }
 
     /// procfs、devpts 的视图（路径解析用）。

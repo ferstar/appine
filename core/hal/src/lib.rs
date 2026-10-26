@@ -244,8 +244,7 @@ pub fn open_dir(path: &std::path::Path) -> Result<std::os::fd::OwnedFd, i32> {
 }
 
 /// 读取目录 `dir` 里名为 `name` 的文件的元数据（跟随符号链接）。
-pub fn stat_at(dir: i32, name: &[u8]) -> Result<libc::stat, i32> {
-    let name = std::ffi::CString::new(name).map_err(|_| libc::EINVAL)?;
+pub fn stat_at(dir: i32, name: &std::ffi::CStr) -> Result<libc::stat, i32> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, 0) } < 0 {
         return Err(last_errno());
