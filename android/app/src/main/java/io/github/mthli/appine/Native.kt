@@ -37,6 +37,10 @@ internal object Native {
     @JvmStatic
     external fun stop(machine: Long)
 
+    /** 丢掉可以重建的缓存（池里保留的翻译等），提交推迟的写事务。要取 BKL，不在主线程上调用。 */
+    @JvmStatic
+    external fun trimMemory(machine: Long)
+
     /** 新建一个控制台（进程内 PTY），返回它的编号。 */
     @JvmStatic
     @Throws(IOException::class)

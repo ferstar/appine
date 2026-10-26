@@ -373,17 +373,19 @@ impl Machine {
         self.wait_for(|k| k.tasks.is_empty().then_some(()));
     }
 
-    /// 宿主内存紧张（Android 的 `onTrimMemory`）：丢掉可以重建的缓存。现在是池里保留的
-    /// Tier 1 翻译（运行中的进程的翻译不动）。App 这时多半在后台，随时可能被杀掉，顺便
-    /// 提交推迟的写事务。
+    /// 宿主内存紧张、App 的界面离开了一阵子（设计文档 §11.2）：丢掉可以重建的缓存，即池里
+    /// 保留的 Tier 1 翻译、共用的只读文件映射和 dentry/inode 缓存（运行中的进程用着的不动）。
+    /// App 这时多半在后台，随时可能被杀掉，顺便提交推迟的写事务。
     pub fn trim_memory(&self) {
+        crate::debug::log(format_args!("trimming memory"));
         appine_engine::trim_dbt_pool();
-        let k = self.shared.lock();
-        k.file_maps.clear();
-        if let Some(vfs) = &k.vfs {
-            vfs.trim();
-        }
-        drop(k);
+        crate::bug::host_call("Machine::trim_memory", || {
+            let k = self.shared.lock();
+            k.file_maps.clear();
+            if let Some(vfs) = &k.vfs {
+                vfs.trim();
+            }
+        });
         self.sync();
     }
 

@@ -44,6 +44,7 @@
 | [M9 之前：node 启动](#m9-之前node-启动2026-10-26) | 2026-10-26 | outline atomics 的 STXR 借一个寄存器在 Tier 1 里做（原子操作的循环 43 → 8.3 纳秒）；核对时页还没映射的块停放、执行到时整页恢复；`node -e 0` 热启动 −12%，python 启动 −6% |
 | [M9 之前：JIT 负载](#m9-之前jit-负载2026-10-26) | 2026-10-26 | 代码作废按内容、dsb 时由分发器就地作废；大实例不挤掉池里别的翻译；Maven 6.7 → 6.2 秒，Gradle 热构建 −6% |
 | [M9 之前：多进程并行](#m9-之前多进程并行2026-10-26) | 2026-10-26 | 翻译池放 16 个实例；起进程时少做 mincore；4 个同时 exec −18%、4 个同时跑管道 −23%，池里多留约 56 MB 翻译 |
+| [M9 之前：onTrimMemory](#m9-之前ontrimmemory2026-10-26) | 2026-10-26 | 界面离开 1 分钟之后、内存紧张时释放池里的翻译等可以重建的缓存；有前台服务时 Android 14 起收不到 `onTrimMemory`，自己看界面在不在 |
 
 ---
 
@@ -253,7 +254,7 @@ Tier 0 慢了 40 倍，这在意料之中：它只负责冷代码和语义参考
 - 不提交 Play 测试轨道（这次的决定），R2 留到提交时验证。
 - netlink 没有接 `ConnectivityManager`，见上。
 - 首次启动的 tarball 只按 sha256 校验，没有校验 GPG 签名。
-- 还没有：wake lock 开关、`onTrimMemory`、被杀之后恢复标签页（M9）、DocumentsProvider（§11.3）、设置界面（选执行层、换镜像、重置 rootfs）。
+- 还没有：wake lock 开关、`onTrimMemory`、被杀之后恢复标签页（M9）、DocumentsProvider（§11.3）、设置界面（选执行层、换镜像、重置 rootfs）。→ `onTrimMemory` 已补上（M9 之前：onTrimMemory）
 - 没有真机，R1 的真机性能测量、1024 以下端口和回环地址对其他 App 可见等问题仍待确认。
 
 ## M6 结果（2026-10-25）
@@ -856,7 +857,7 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
 - SQLite 的自动检查点（WAL 满 1000 页时，要 fsync）持着 BKL 做。
 - python 的解释循环仍是 5 倍，六成时间在 TLB 检查上；按访存点缓存上次的页只做了可行性统计（同一访存点连续落在同一页：python 93%、gcc 85%），没实现：共用代码缓存之后槽位的并发更新、换地址空间时的作废、跨页检查都麻烦，而且没命中时分支多半猜错。
 - Go 程序的 x26（闭包上下文）、x27（汇编器临时寄存器）、x28（g）用得很多，正好是被占用的寄存器；可以按程序换一组。
-- 池里保留的翻译最多 64 MB，App 还没有在 `onTrimMemory` 时调用 `Machine::trim_memory`（M9 的外壳）。
+- 池里保留的翻译最多 64 MB，App 还没有在 `onTrimMemory` 时调用 `Machine::trim_memory`（M9 的外壳）。→ 已补上（M9 之前：onTrimMemory）
 
 ## M9 之前：不持 BKL 的 stat（2026-10-26）
 
@@ -1284,4 +1285,15 @@ node（V8）这边没有这个问题：一次计算负载只作废一两百个�
 **推迟项**：
 
 - BKL 拆分：起进程、退出、缺页这些路径的持锁时间占了 4 路并发的大半。
-- 池里保留的翻译（代码最多 64 MB，连同表等约 85 MB）在 App 收到 `onTrimMemory` 时还不会清空。
+- 池里保留的翻译（代码最多 64 MB，连同表等约 85 MB）在 App 收到 `onTrimMemory` 时还不会清空。→ 已补上（M9 之前：onTrimMemory）
+
+## M9 之前：onTrimMemory（2026-10-26）
+
+上一轮翻译池放到 16 个实例之后，池里最多留七八十 MB 翻译。内核层的 `Machine::trim_memory`（丢掉池里保留的翻译、共用的只读文件映射、dentry/inode 缓存，提交推迟的写事务）早就有了，这一轮把它接到 App 上（§11.2）。
+
+- **能收到什么**：Android 14 起不再发 `RUNNING_MODERATE`、`RUNNING_LOW`、`RUNNING_CRITICAL`、`MODERATE`、`COMPLETE`，只发 `UI_HIDDEN` 和 `BACKGROUND`。第一版在 `UI_HIDDEN` 时释放，模拟器上按 HOME 之后一直没有收到：按 AOSP 的代码，系统只在进程状态降到 `IMPORTANT_BACKGROUND` 以下时才发它，有前台服务的进程停在前台服务；也不在后台的 LRU 列表里，收不到 `BACKGROUND`。所以有前台服务时，Android 14 起根本收不到 `onTrimMemory`。
+- **什么时候释放**：自己看界面在不在。Activity 停下（切到别的 App、熄屏）时会把 `TerminalService.listener` 设成 null，这时开始计时，1 分钟之后还没回来就释放；回来时取消。只是切出去看一眼再回来时，不必把 node、python 这些重新翻译一遍。`onTrimMemory` 的 `RUNNING_LOW`、`RUNNING_CRITICAL`（Android 14 之前）以及 `BACKGROUND` 以上立即释放。正在运行的进程用着的翻译和映射不动，释放之后池子随着进程退出又会攒起来。
+- **在哪个线程上做**：释放要取 BKL、提交仓库，不放在主线程上。它和停止内核放在同一个单线程的 executor 上按顺序做（原来停止在临时线程上），停止之后不会再有释放的调用用到已经释放的句柄。JNI 新增 `Native.trimMemory`。
+- `Machine::trim_memory` 里内核层的部分包进 `host_call`：内核层在这里 panic 时那次调用失败，不穿过 JNI 让 App 进程 abort。
+
+- **测试**：MachineTest 新增"释放缓存时正在运行的进程不受影响，之后照常起新进程"（一边跑循环一边释放 5 次）；4K（API 34）和 16K（API 37）的模拟器上 5 个测试都通过。4K 模拟器上装好 debug 版 App（内核层的日志打开）：`am send-trim-memory` 发 `RUNNING_LOW` 立即释放；按 HOME、20 秒后切回来，不释放；按 HOME 等 70 秒，释放；App 一直照常运行，日志里没有错误（看内核层日志里的 "trimming memory"）。cargo test（174 个）、clippy 和 Android clippy 通过。

@@ -17,6 +17,7 @@ import android.os.Looper
 import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /**
@@ -48,6 +49,15 @@ class TerminalService : Service() {
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
 
+    /**
+     * 释放缓存和停止内核按顺序在这个线程上做：两者都要取 BKL，不占主线程；停止之后也不会
+     * 再有释放缓存的调用用到已经释放的句柄。
+     */
+    private val worker = Executors.newSingleThreadExecutor { Thread(it, "appine-worker") }
+
+    /** 界面隐藏一段时间之后还没回来才释放缓存（[listener]）。 */
+    private val trimWhenHidden = Runnable { trimMemory() }
+
     /** 内核句柄，启动之前是 0。 */
     var machine = 0L
         private set
@@ -58,7 +68,17 @@ class TerminalService : Service() {
 
     val sessions = mutableListOf<TerminalSession>()
 
+    /**
+     * 当前的 Activity；它停下（切到别的 App、熄屏）时是 null。停下 [TRIM_DELAY_MS] 之后还没
+     * 回来就释放内核里可以重建的缓存：Android 14 起有前台服务的进程收不到 `onTrimMemory`
+     * 的 `UI_HIDDEN`，只能自己看界面在不在；很快切回来时也不必重新翻译。
+     */
     var listener: Listener? = null
+        set(value) {
+            field = value
+            main.removeCallbacks(trimWhenHidden)
+            if (value == null) main.postDelayed(trimWhenHidden, TRIM_DELAY_MS)
+        }
 
     /** 所有会话共用的回调：会话比 Activity 活得久，事件转给当前的 Activity（如果有）。 */
     private val client = object : TerminalSessionClient {
@@ -163,13 +183,30 @@ class TerminalService : Service() {
     }
 
     override fun onDestroy() {
+        main.removeCallbacks(trimWhenHidden)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
         val m = machine
         machine = 0
         // 结束所有 guest 进程要等它们的线程退出，不在主线程上做
-        if (m != 0L) thread(name = "appine-stop") { Native.stop(m) }
+        if (m != 0L) worker.execute { Native.stop(m) }
+        worker.shutdown()
         super.onDestroy()
+    }
+
+    /**
+     * 宿主内存紧张时立即丢掉内核里可以重建的缓存（池里保留的 Tier 1 翻译最多七八十 MB）。
+     * Android 14 起不再发 `RUNNING_*` 这些级别；界面隐藏（`UI_HIDDEN`）由 [listener] 处理。
+     */
+    @Suppress("DEPRECATION") // RUNNING_LOW、RUNNING_CRITICAL 只在 Android 14 之前发
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) trimMemory()
+    }
+
+    private fun trimMemory() {
+        val m = machine
+        if (m != 0L) worker.execute { Native.trimMemory(m) }
     }
 
     /** 新开一个终端会话（登录 shell）。shell 在第一次知道窗口大小时启动。 */
@@ -224,5 +261,6 @@ class TerminalService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val TRANSCRIPT_ROWS = 2000
+        private const val TRIM_DELAY_MS = 60_000L
     }
 }

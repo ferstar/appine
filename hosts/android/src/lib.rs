@@ -178,6 +178,16 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
     drop(unsafe { Arc::from_raw(handle as *const Machine) });
 }
 
+/// 宿主内存紧张：丢掉可以重建的缓存（池里保留的翻译等），提交推迟的写事务。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    machine(handle).trim_memory();
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_openConsole<'l>(
     mut env: JNIEnv<'l>,

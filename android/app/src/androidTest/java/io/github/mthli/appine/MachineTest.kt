@@ -113,6 +113,25 @@ class MachineTest {
         for (i in 0 until 3) assertEquals(results[i], "$i-1\n$i-2\n$i-3\n", results[i])
     }
 
+    /** 释放缓存（onTrimMemory）时正在运行的进程不受影响，之后照常起新进程。 */
+    @Test
+    fun trimMemoryKeepsTheMachineWorking() {
+        val machine = start(1)
+        assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+        var result = "" to -1
+        val running = thread {
+            result = sh(machine, "for n in 1 2 3 4 5; do sha256sum /bin/busybox >/dev/null; sleep 0.05; done; echo done")
+        }
+        repeat(5) {
+            Native.trimMemory(machine)
+            Thread.sleep(50)
+        }
+        running.join(30_000)
+        assertEquals("done\n" to 0, result)
+        Native.trimMemory(machine)
+        assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+    }
+
     /**
      * 内核层和引擎的 bug 只结束撞上它的 guest 进程（设计文档 §7.4、§12 第 5 条），用 debug 版 App 的
      * 测试钩子模拟。在 App 进程里，引擎在宿主上出错时 SIGSEGV 先经过 ART 的 libsigchain：ART 不认领，

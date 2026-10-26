@@ -446,7 +446,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
   - 普通文件的 **size 和 mtime 以宿主 object 文件为准**。`utimensat` 直接对宿主 object 调用 `futimens`。
   - mode、uid/gid、ctime、xattr、nlink 存在 SQLite 里。
 - 硬链接就是多个目录项指向同一个 ino。每个元数据操作（新建、删除、`rename`、改属性）要么全部生效，要么全部不生效。
-- **推迟提交**：一次提交要把改了的页写进 WAL（每页两次 pwrite，加上 WAL 索引的加解锁），约 15 微秒，比操作本身（约 2 微秒）贵得多。所以写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是事务里的一个保存点，出错（或者内核层 panic）时只回滚到它自己的保存点。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，宿主调用 `Machine::sync`、`trim_memory`（准备接到 Android 的 `onTrimMemory`），以及内核实例关闭时立即提交。
+- **推迟提交**：一次提交要把改了的页写进 WAL（每页两次 pwrite，加上 WAL 索引的加解锁），约 15 微秒，比操作本身（约 2 微秒）贵得多。所以写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是事务里的一个保存点，出错（或者内核层 panic）时只回滚到它自己的保存点。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，宿主调用 `Machine::sync`、`trim_memory`（Android 的 `onTrimMemory`，§11.2），以及内核实例关闭时立即提交。
   - App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态。Linux 断电时丢失的更多（ext4 默认每 5 秒提交一次日志）；guest 用 fsync 要求持久的修改不会丢。
   - 删除最后一个链接时，宿主 object 等提交之后再删：提交之前被杀掉的话，目录项还在，object 也得在。
   - 新建普通文件的 object 立即建好（guest 马上就要读写）。提交之前被杀掉的话，这些 inode 随事务丢失，object 却留了下来；编号以后会再分配出去，分给目录这类没有 object 的 inode 时它就永远留下了。所以 `lock` 文件里记着还没提交的写事务新分配的 inode 编号范围，下次开机删掉范围里没有 inode 行的 object；新建 object 时已经有同名的就清空接着用。
@@ -544,7 +544,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 前台服务 | 只要还有终端会话或 guest 进程在运行，就保持一个**前台服务**，类型为 `specialUse`。通知栏显示"N 个会话运行中"，附带"全部退出"按钮 | ✅ M5（`TerminalService`） |
 | 生命周期归属 | 所有会话和 guest 内核的生命周期都**挂在 Service 上，不挂在 Activity 上** | ✅ M5 |
 | 熄屏 | 熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启，默认关闭 | M9 |
-| 内存紧张 | 在 `onTrimMemory` 中缩减可以重建的缓存：翻译缓存、dentry/inode 缓存 | 未实现 |
+| 内存紧张 | 丢掉可以重建的缓存：池里保留的翻译、共用的只读文件映射、dentry/inode 缓存（`Machine::trim_memory`，运行中的进程用着的不动），并提交推迟的写事务。界面停下（切到别的 App、熄屏）1 分钟之后还没回来就释放，很快切回来时不必重新翻译：Android 14 起不再发 `RUNNING_*` 这些级别，有前台服务的进程连界面隐藏（`UI_HIDDEN`）也收不到（进程状态停在前台服务），只能自己看 Activity 在不在。`onTrimMemory` 的 `RUNNING_LOW`、`RUNNING_CRITICAL`（Android 14 之前）和 `BACKGROUND` 以上立即释放。释放和停止内核在同一个后台线程上按顺序做 | ✅ M9 之前 |
 | 进程被杀 | v1 只恢复标签页布局、每个标签的 cwd 和滚动回看记录，并启动新的 shell，同时明确提示"上次会话因 App 被系统终止而结束"。v1 **不恢复进程** | M9 |
 | 开机自启 | v1 不做 | — |
 
