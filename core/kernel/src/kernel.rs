@@ -135,8 +135,6 @@ pub(crate) struct Kernel {
     pub tasks: BTreeMap<Tid, Rc<Task>>,
     /// 所有线程组，包括僵尸进程和 init。
     pub groups: BTreeMap<Tid, Rc<RefCell<ThreadGroup>>>,
-    /// futex 等待队列。
-    pub futexes: Futexes,
     /// 执行引擎。
     pub tier: Tier,
     /// 宿主在等它结束的进程（[`crate::Machine::spawn`] 启动的进程）：结束后记下结束方式。
@@ -219,7 +217,6 @@ impl Kernel {
         Kernel {
             tasks: BTreeMap::new(),
             groups: BTreeMap::new(),
-            futexes: Futexes::default(),
             tier,
             watched: BTreeMap::new(),
             vfs: None,
@@ -349,9 +346,12 @@ pub(crate) struct Shared {
     pub timers: Arc<Event>,
     /// 内存上限的检查停下来了（所有线程都在等待，[`crate::oom`]）。
     pub oom_idle: AtomicBool,
-    /// 有线程的根目录、当前目录或者凭据变了就加一：线程为不持 BKL 的系统调用记下的
-    /// 这些随之过时（`syscall::fast`）。
-    paths: AtomicU64,
+    /// 线程为不持 BKL 的系统调用记下的状态可能过时了就加一（[`Shared::fast_changed`]）。
+    fast: AtomicU64,
+    /// futex 的等待队列。不持 BKL 的 futex（`syscall::fast`）只取这把锁；持有 BKL 时也可以
+    /// 再取它，反过来不行。检查 futex 的值和登记成为等待者在同一次持锁里做，唤醒也要
+    /// 取它，所以两者之间不会漏掉唤醒。
+    futexes: Mutex<Futexes>,
 }
 
 impl Shared {
@@ -362,18 +362,25 @@ impl Shared {
             spinning: AtomicBool::new(false),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
             oom_idle: AtomicBool::new(false),
-            paths: AtomicU64::new(0),
+            fast: AtomicU64::new(0),
+            futexes: Mutex::new(Futexes::default()),
         }
     }
 
-    /// 某个线程的根目录、当前目录或者凭据变了（持有 BKL 时调用）。
-    pub fn paths_changed(&self) {
-        self.paths.fetch_add(1, Ordering::Release);
+    /// 线程为不持 BKL 的系统调用记下的状态（`syscall::fast`）可能过时了：某个线程的根目录、
+    /// 当前目录或者凭据变了。持有 BKL 时调用。
+    pub fn fast_changed(&self) {
+        self.fast.fetch_add(1, Ordering::Release);
     }
 
-    /// [`Shared::paths_changed`] 的次数。
-    pub fn paths_epoch(&self) -> u64 {
-        self.paths.load(Ordering::Acquire)
+    /// [`Shared::fast_changed`] 的次数。
+    pub fn fast_epoch(&self) -> u64 {
+        self.fast.load(Ordering::Acquire)
+    }
+
+    /// futex 的等待队列（[`Shared::futexes`]）。
+    pub fn futexes(&self) -> MutexGuard<'_, Futexes> {
+        self.futexes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// 线程要接着执行 guest 代码了：内存上限的检查停着时叫醒定时器线程。不需要持有 BKL。
@@ -562,11 +569,6 @@ impl<'a> Cx<'a> {
         self.k.as_mut().expect("BKL is held")
     }
 
-    /// 同时借用全局状态和当前线程的私有状态。
-    pub fn parts(&mut self) -> (&mut Kernel, &mut TaskState) {
-        (self.k.as_mut().expect("BKL is held"), self.t)
-    }
-
     /// 只读的全局状态。
     pub fn kr(&self) -> &Kernel {
         self.k.as_ref().expect("BKL is held")
@@ -654,7 +656,7 @@ impl<'a> Cx<'a> {
     pub fn set_fs(&mut self, fs: Rc<RefCell<crate::task::FsContext>>) {
         self.task.res.borrow_mut().fs = fs.clone();
         self.t.fs = fs;
-        self.shared.paths_changed();
+        self.shared.fast_changed();
     }
 
     /// procfs、devpts 的视图（路径解析用）。
@@ -728,21 +730,21 @@ impl<'a> Cx<'a> {
         object: Option<wake::Object>,
     ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
-        self.task.sleeping.set(true);
+        self.task.sleeping.store(true, Ordering::Relaxed);
         let event = &self.task.event;
         let (k, r) = block_for(self.shared, k, event, deadline, host, interest, object);
-        self.task.sleeping.set(false);
+        self.task.sleeping.store(false, Ordering::Relaxed);
         self.k = Some(k);
         r
     }
 
     /// 释放 BKL 执行 `f`（可能阻塞的宿主 I/O）。`f` 不能访问任何内核对象。
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        self.task.sleeping.set(true);
+        self.task.sleeping.store(true, Ordering::Relaxed);
         drop(self.k.take());
         let r = f();
         self.k = Some(self.shared.lock());
-        self.task.sleeping.set(false);
+        self.task.sleeping.store(false, Ordering::Relaxed);
         r
     }
 }

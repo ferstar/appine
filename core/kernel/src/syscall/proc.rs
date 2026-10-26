@@ -324,6 +324,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
         saved_sigmask: None,
         vfork_done: vfork_done.clone(),
         restart: None,
+        fast_sleep: None,
     };
     let tgid = if thread { cx.tgid() } else { tid };
     let task = Task::new(
@@ -658,7 +659,7 @@ fn exec(
             g.dumpable = false;
         }
         g.cred = new_cred;
-        cx.shared.paths_changed();
+        cx.shared.fast_changed();
         g.rlimits[process::RLIMIT_STACK as usize].0 = stack_limit;
         g.posix_timers.clear();
         // AIO 上下文的环在旧的地址空间里，随之消失
@@ -674,8 +675,7 @@ fn exec(
         g.sighand.borrow_mut().reset_on_exec();
     }
     let task = cx.task.clone();
-    let (k, t) = cx.parts();
-    task::release_mm(k, &task, t);
+    task::release_mm(cx.shared, &task, cx.t);
     let mm = mm.into_shared();
     mm.borrow_mut().add_user(task.sync.clone());
     // SAFETY: 新的地址空间由 TaskState 持有；旧的可能随这次赋值释放，cpu 已经不再使用它

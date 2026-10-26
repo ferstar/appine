@@ -1,5 +1,5 @@
 /*
- * 多线程与信号的 guest 测试程序（M3a）：用 musl-gcc -static 编译，在 appine-run 里
+ * 多线程、futex 与信号的 guest 测试程序（M3a）：用 musl-gcc -static 编译，在 appine-run 里
  * 直接运行（不需要 rootfs）。每项检查通过时打印一行 "ok <名字>"，失败时打印原因并
  * 以 1 退出，全部通过时最后打印 "all ok"。
  */
@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -316,6 +317,88 @@ static void test_restart(void)
     ok("restart");
 }
 
+/* ---- futex 和 nanosleep（不持 BKL 的路径）：信号打断、超时、被唤醒、剩下的时间。共享
+ * 文件映射里跨进程的 futex 要有文件系统，在差分测试 c-programs 里 ---- */
+
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | 128)
+#define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | 128)
+
+static atomic_int fword;
+
+static long futex(atomic_int *addr, int op, int val, const struct timespec *ts)
+{
+    return syscall(SYS_futex, addr, op, val, ts, NULL, 0);
+}
+
+static long long ms_since(const struct timespec *start)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - start->tv_sec) * 1000LL + (now.tv_nsec - start->tv_nsec) / 1000000;
+}
+
+static void *interrupt_main(void *arg)
+{
+    (void)arg;
+    sleep_ms(50);
+    pthread_kill(main_thread, SIGUSR1);
+    return NULL;
+}
+
+static void *wake_main(void *arg)
+{
+    (void)arg;
+    sleep_ms(30);
+    atomic_store(&fword, 1);
+    futex(&fword, FUTEX_WAKE_PRIVATE, 1, NULL);
+    return NULL;
+}
+
+static void test_futex_sleep(void)
+{
+    main_thread = pthread_self();
+    handle(SIGUSR1, on_usr1, 0);
+    pthread_t t;
+    struct timespec start;
+
+    /* 等待被信号打断（处理函数没有 SA_RESTART）：EINTR */
+    atomic_store(&fword, 0);
+    pthread_create(&t, NULL, interrupt_main, NULL);
+    long r = futex(&fword, FUTEX_WAIT_PRIVATE, 0, NULL);
+    CHECK(r == -1 && errno == EINTR, "interrupted futex wait returned %ld errno %d", r, errno);
+    pthread_join(t, NULL);
+
+    /* 超时、值不对 */
+    struct timespec ts = {0, 50000000};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    r = futex(&fword, FUTEX_WAIT_PRIVATE, 0, &ts);
+    CHECK(r == -1 && errno == ETIMEDOUT, "futex timeout returned %ld errno %d", r, errno);
+    CHECK(ms_since(&start) >= 50, "futex timed out after %lld ms", ms_since(&start));
+    r = futex(&fword, FUTEX_WAIT_PRIVATE, 1, NULL);
+    CHECK(r == -1 && errno == EAGAIN, "futex with a stale value returned %ld errno %d", r, errno);
+
+    /* 被另一个线程唤醒 */
+    pthread_create(&t, NULL, wake_main, NULL);
+    while (atomic_load(&fword) == 0) {
+        r = futex(&fword, FUTEX_WAIT_PRIVATE, 0, NULL);
+        CHECK(r == 0 || errno == EAGAIN, "futex wait returned %ld errno %d", r, errno);
+    }
+    pthread_join(t, NULL);
+
+    /* nanosleep 被信号打断：剩下的是真正剩下的，不是从被打断时重新算的 */
+    pthread_create(&t, NULL, interrupt_main, NULL);
+    struct timespec req = {1, 0}, rem = {0, 0};
+    r = nanosleep(&req, &rem);
+    long long left = rem.tv_sec * 1000LL + rem.tv_nsec / 1000000;
+    CHECK(r == -1 && errno == EINTR, "interrupted nanosleep returned %ld errno %d", r, errno);
+    CHECK(left > 500 && left < 990, "%lld ms left of 1000 after about 50", left);
+    pthread_join(t, NULL);
+
+    ok("futex_sleep");
+}
+
 /* ---- 多线程进程里 fork：子进程只有调用 fork 的线程，内存是一份拷贝 ---- */
 
 static atomic_int stop_spinning;
@@ -384,6 +467,7 @@ int main(void)
     test_altstack();
     test_faults();
     test_restart();
+    test_futex_sleep();
     test_fork();
     test_detached();
     printf("all ok\n");

@@ -1,6 +1,6 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
-# 改名、setuid 之后 stat 立刻看到
+# 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -333,3 +333,59 @@ C
 gcc -O2 -o diff3 diff3.c -pthread
 ./diff3
 rm -rf /tmp/fs3
+# 共享文件映射里的 futex：父子进程各自映射同一个文件，宿主地址不同，要按文件和偏移认出
+# 是同一个 futex（不持 BKL 的 futex 只按宿主地址算键，要避开这种映射）
+cat > diff4.c <<'C'
+#define _GNU_SOURCE
+#include <stdatomic.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+
+static long futex(atomic_int *addr, int op, int val, const struct timespec *ts)
+{
+    return syscall(SYS_futex, addr, op, val, ts, NULL, 0);
+}
+
+int main(void)
+{
+    int fd = memfd_create("futex", 0);
+    if (fd < 0 || ftruncate(fd, 8192) != 0)
+        return 1;
+    atomic_int *a = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (a == MAP_FAILED)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        atomic_int *b = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (b == MAP_FAILED)
+            _exit(1);
+        struct timespec nap = {0, 50000000};
+        nanosleep(&nap, NULL);
+        atomic_store(&b[1024], 1);
+        futex(&b[1024], FUTEX_WAKE, 1, NULL);
+        _exit(0);
+    }
+    struct timespec limit = {3, 0}, start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int timeouts = 0;
+    while (atomic_load(&a[1024]) == 0)
+        if (futex(&a[1024], FUTEX_WAIT, 0, &limit) != 0 && atomic_load(&a[1024]) == 0)
+            timeouts++;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    int status;
+    waitpid(pid, &status, 0);
+    long ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+    printf("woken by the other process: %s, timeouts %d, child %d\n", ms < 2000 ? "yes" : "no",
+           timeouts, WEXITSTATUS(status));
+    return 0;
+}
+C
+gcc -O2 -o diff4 diff4.c
+./diff4

@@ -73,7 +73,10 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     {
         return Some(next);
     }
-    let idle = k.tasks.values().all(|t| t.sleeping.get());
+    let idle = k
+        .tasks
+        .values()
+        .all(|t| t.sleeping.load(std::sync::atomic::Ordering::Relaxed));
     shared.oom_idle.store(idle, Ordering::Relaxed);
     if idle {
         k.oom.next = None;

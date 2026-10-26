@@ -20,7 +20,7 @@ fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Resu
     let mut cred = cx.cred();
     let r = f(&mut cred)?;
     cx.t.group.borrow_mut().cred = cred;
-    cx.shared.paths_changed();
+    cx.shared.fast_changed();
     Ok(r)
 }
 

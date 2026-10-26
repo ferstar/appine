@@ -580,7 +580,7 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         let busy: Vec<_> = threads
             .iter()
             .filter(unmasked)
-            .filter(|t| !t.sleeping.get())
+            .filter(|t| !t.sleeping.load(std::sync::atomic::Ordering::Relaxed))
             .collect();
         let turn = TURN.fetch_add(1, Ordering::Relaxed);
         busy.get(turn % busy.len().max(1)).copied()

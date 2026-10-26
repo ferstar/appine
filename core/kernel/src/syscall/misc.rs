@@ -121,13 +121,17 @@ pub(super) fn futex(
                 }
             };
             let key = futex_key(cx, uaddr)?;
-            if u32::from_le_bytes(get(cx, uaddr)?) != val {
-                return Err(Errno::EAGAIN);
-            }
-            let event = cx.task.event.clone();
-            let id = cx.k().futexes.enqueue(key, bitset, event);
+            let shared = cx.shared;
+            // 不持 BKL 的唤醒（syscall::fast）也取 futex 的锁：检查值和登记之间不会漏掉
+            let id = {
+                let mut futexes = shared.futexes();
+                if u32::from_le_bytes(get(cx, uaddr)?) != val {
+                    return Err(Errno::EAGAIN);
+                }
+                futexes.enqueue(key, bitset, cx.task.event.clone())
+            };
             loop {
-                if !cx.kr().futexes.is_queued(id) {
+                if !shared.futexes().is_queued(id) {
                     return Ok(0);
                 }
                 let err = if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -138,7 +142,7 @@ pub(super) fn futex(
                     cx.wait_alone(deadline).err()
                 };
                 if let Some(e) = err {
-                    cx.k().futexes.remove(id);
+                    shared.futexes().remove(id);
                     return Err(e);
                 }
             }
@@ -149,7 +153,7 @@ pub(super) fn futex(
                 return Err(Errno::EINVAL);
             }
             let key = futex_key(cx, uaddr)?;
-            Ok(cx.k().futexes.wake(key, val, bitset) as u64)
+            Ok(cx.shared.futexes().wake(key, val, bitset) as u64)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             // 唤醒和移动的个数是 int，负数是 EINVAL
@@ -158,11 +162,12 @@ pub(super) fn futex(
             }
             let key = futex_key(cx, uaddr)?;
             let key2 = futex_key(cx, uaddr2)?;
+            let mut futexes = cx.shared.futexes();
             if cmd == FUTEX_CMP_REQUEUE && u32::from_le_bytes(get(cx, uaddr)?) != val3 {
                 return Err(Errno::EAGAIN);
             }
             // 第四个参数在 REQUEUE 里是要移动的个数，不是超时
-            let n = cx.k().futexes.requeue(key, val, key2, timeout as u32);
+            let n = futexes.requeue(key, val, key2, timeout as u32);
             Ok(n as u64)
         }
         _ => Err(Errno::ENOSYS),
@@ -207,19 +212,23 @@ pub(super) fn futex_waitv(
         }
         keys.push((futex_key(cx, uaddr)?, uaddr, val));
     }
-    // 持有 BKL：检查值和登记之间不会有人唤醒
-    for &(_, uaddr, val) in &keys {
-        if u64::from(u32::from_le_bytes(get(cx, uaddr)?)) != val {
-            return Err(Errno::EAGAIN);
+    // 持有 futex 的锁：检查值和登记之间不会有人唤醒
+    let shared = cx.shared;
+    let ids: Vec<u64> = {
+        let mut futexes = shared.futexes();
+        for &(_, uaddr, val) in &keys {
+            if u64::from(u32::from_le_bytes(get(cx, uaddr)?)) != val {
+                return Err(Errno::EAGAIN);
+            }
         }
-    }
-    let event = cx.task.event.clone();
-    let ids: Vec<u64> = keys
-        .iter()
-        .map(|&(key, ..)| cx.k().futexes.enqueue(key, u32::MAX, event.clone()))
-        .collect();
+        let event = &cx.task.event;
+        keys.iter()
+            .map(|&(key, ..)| futexes.enqueue(key, u32::MAX, event.clone()))
+            .collect()
+    };
     let r = loop {
-        if let Some(i) = ids.iter().position(|&id| !cx.kr().futexes.is_queued(id)) {
+        let woken = ids.iter().position(|&id| !shared.futexes().is_queued(id));
+        if let Some(i) = woken {
             break Ok(i as u64);
         }
         let err = if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -233,8 +242,9 @@ pub(super) fn futex_waitv(
             break Err(e);
         }
     };
+    let mut futexes = shared.futexes();
     for id in ids {
-        cx.k().futexes.remove(id);
+        futexes.remove(id);
     }
     r
 }
@@ -253,8 +263,9 @@ fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
 }
 
 pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
+    let early = cx.t.fast_sleep.take();
     let t = read_timespec(cx, req)?;
-    sleep_rest(cx, Instant::now() + t, rem)
+    sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem)
 }
 
 /// 睡到 `deadline`。被信号打断时把剩下的时长写进 `rem`（不为 0 时），并记下到期时刻：
@@ -378,6 +389,7 @@ pub(super) fn clock_nanosleep(
     req: u64,
     rem: u64,
 ) -> SysResult {
+    let early = cx.t.fast_sleep.take();
     match clock {
         // 线程 CPU 时钟、原始单调时钟和粗粒度时钟不能用来睡眠
         CLOCK_THREAD_CPUTIME_ID | 4..=6 => return Err(Errno::EOPNOTSUPP),
@@ -402,7 +414,7 @@ pub(super) fn clock_nanosleep(
     }
     if flags & TIMER_ABSTIME == 0 {
         appine_hal::clock_gettime(clock).map_err(Errno)?;
-        return sleep_rest(cx, Instant::now() + t, rem);
+        return sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem);
     }
     // 绝对时刻：重新执行同样的参数就是接着睡
     match sleep_until(cx, deadline_from_clock(clock, t)?) {

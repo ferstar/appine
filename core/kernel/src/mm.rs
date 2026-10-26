@@ -34,7 +34,7 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
 
@@ -603,6 +603,8 @@ pub struct Mm {
     dirty: bool,
     /// 可执行的映射被拆除、改了权限或者内容的范围：这些地方的翻译要作废。
     code_ranges: Vec<(u64, u64)>,
+    /// 可以写的共享文件映射所在的范围（[`Mm::shared_files`]）。
+    shared_files: Arc<RwLock<Vec<(u64, u64)>>>,
     /// shootdown 的代数：变化之后，使用者重新进入 guest 代码之前刷新 TLB。
     generation: Arc<AtomicU64>,
     /// 代码的代数：变化之后，使用者按 `code_log` 作废 Tier 1 的翻译。数据页的变化（gcc
@@ -835,6 +837,7 @@ impl Mm {
             brk: 0,
             dirty: false,
             code_ranges: Vec::new(),
+            shared_files: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
             code_generation: Arc::new(AtomicU64::new(0)),
             code_log: Arc::default(),
@@ -886,6 +889,34 @@ impl Mm {
     /// 该地址空间的软件页表。
     pub fn mmu(&self) -> &Mmu {
         &self.mmu
+    }
+
+    /// 可以写（现在可写，或者以后可以 mprotect 成可写）的共享文件映射所在的范围：那里的
+    /// futex 以文件和偏移为键（[`Mm::futex_key`]），按宿主地址算键的不持 BKL 的 futex
+    /// （`syscall::fast`，它只处理可写的页）要避开。只读打开的文件的共享映射不算：Go 的
+    /// 工具链用它读文件，又在每个进程里可写地共享映射一个遥测计数文件，所以按范围记。
+    /// 新建、搬动这种映射之后重新统计（[`Mm::note_shared_files`]）；拆掉的不必马上去掉，
+    /// 只是那里的 futex 走持锁的路径。
+    pub fn shared_files(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
+        self.shared_files.clone()
+    }
+
+    /// 按现在的映射重新统计 [`Mm::shared_files`]。`moved` 时只在有这种映射时才统计
+    /// （mremap 之后：搬动、扩展的可能是它们）。
+    pub fn note_shared_files(&self, moved: bool) {
+        let mut ranges = self
+            .shared_files
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if moved && ranges.is_empty() {
+            return;
+        }
+        *ranges = self
+            .vmas
+            .iter()
+            .filter(|(_, v)| v.backing == Backing::Shared && v.file_id.is_some() && v.may_write)
+            .map(|(&s, v)| (s, s + v.len))
+            .collect();
     }
 
     /// `addr` 处 futex 的键；没有映射时返回 None。
@@ -1479,6 +1510,9 @@ impl Mm {
         v.cow = cached;
         v.file = dup;
         self.trim_to_file(start)?;
+        if backing == Backing::Shared && file_id.is_some() && may_write {
+            self.note_shared_files(false);
+        }
         Ok(start)
     }
 
@@ -2235,6 +2269,13 @@ impl Mm {
             .get_mut()
             .lent
             .append(&mut lent.into_iter().collect());
+        let ranges = self
+            .shared_files
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !ranges.is_empty() {
+            child.note_shared_files(false);
+        }
         drop(child);
         Ok(shared)
     }

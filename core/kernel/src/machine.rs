@@ -231,6 +231,7 @@ impl Machine {
             saved_sigmask: None,
             vfork_done: None,
             restart: None,
+            fast_sleep: None,
         };
         let task = Task::new(tid, tid, &cpu, state, 0, comm_of(program)).map_err(io_err)?;
         k.groups.insert(tid, group);

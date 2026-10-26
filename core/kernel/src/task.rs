@@ -64,8 +64,8 @@ pub(crate) struct Task {
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
     pub killed: Cell<bool>,
     /// 线程正在内核里等待（`/proc/<pid>/stat` 的状态 S）。在释放 BKL 之前设置，重新拿到
-    /// BKL 之后清除。
-    pub sleeping: Cell<bool>,
+    /// BKL 之后清除；不持 BKL 的等待（`syscall::fast`）也设置。
+    pub sleeping: AtomicBool,
     /// 线程名（`prctl(PR_SET_NAME)`）。
     pub comm: Cell<[u8; 16]>,
     /// nice 值（-20–19）：与 Linux 一样属于线程，新线程继承创建者的。宿主线程跟着
@@ -121,6 +121,9 @@ pub(crate) struct TaskState {
     pub vfork_done: Option<Rc<Cell<bool>>>,
     /// 被信号打断的 nanosleep 剩下的部分（`restart_syscall`）：到期时刻和 `rem` 的地址。
     pub restart: Option<(std::time::Instant, u64)>,
+    /// 不持 BKL 的 nanosleep（`syscall::fast`）还没睡够就被叫醒，交给持锁的路径：原来的
+    /// 到期时刻。持锁的路径接着睡到它，被信号打断时也按它算剩下多少。
+    pub fast_sleep: Option<std::time::Instant>,
 }
 
 impl Task {
@@ -145,7 +148,7 @@ impl Task {
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),
             killed: Cell::new(false),
-            sleeping: Cell::new(false),
+            sleeping: AtomicBool::new(false),
             comm: Cell::new(comm),
             nice: Cell::new(0),
             sched: Cell::new((0, 0)),
@@ -396,7 +399,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         };
         // 不持 BKL 就能做完的系统调用（syscall::fast）。它访问 guest 内存时仍然标记着在
         // 执行 guest 代码
-        let done = matches!(exit, Exit::Svc { .. }) && fast.syscall(shared, cpu);
+        let done = matches!(exit, Exit::Svc { .. }) && fast.syscall(shared, &task, cpu);
         sync.in_guest.store(false, Ordering::SeqCst);
         if done {
             continue;
@@ -416,7 +419,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             flow
         });
         let flow = entered.unwrap_or_else(|| {
-            task.sleeping.set(false);
+            task.sleeping.store(false, Ordering::Relaxed);
             let what = match exit {
                 Exit::Svc { .. } => format!("kernel panic in syscall {}", cpu.state().x[8]),
                 _ => format!("kernel panic while handling {exit:?}"),
@@ -586,9 +589,10 @@ fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
 
 /// 线程离开它的地址空间（退出、execve）：处理 robust futex 链表，清零 `clear_child_tid`
 /// 并唤醒等它的线程（pthread_join），让 vfork 的父进程继续，从使用者里注销。
-pub(crate) fn release_mm(k: &mut Kernel, task: &Task, st: &mut TaskState) {
+pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
     let (head, _) = task.robust_list.replace((0, 0));
-    crate::futex::exit_robust_list(&mut k.futexes, &st.mm.borrow(), head, task.tid.get() as u32);
+    let mut futexes = shared.futexes();
+    crate::futex::exit_robust_list(&mut futexes, &st.mm.borrow(), head, task.tid.get() as u32);
     let addr = std::mem::take(&mut st.clear_child_tid);
     {
         let mm = st.mm.borrow();
@@ -598,9 +602,10 @@ pub(crate) fn release_mm(k: &mut Kernel, task: &Task, st: &mut TaskState) {
             && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
             && let Some(key) = mm.futex_key(addr)
         {
-            k.futexes.wake(key, 1, u32::MAX);
+            futexes.wake(key, 1, u32::MAX);
         }
     }
+    drop(futexes);
     if let Some(done) = st.vfork_done.take() {
         done.set(true);
         request_wake();
@@ -631,7 +636,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, pc: u64, stats: Option<DbtStats>) 
         if group.borrow().threads.len() == 1 {
             group.borrow_mut().sample_rss(&st.mm.borrow());
         }
-        release_mm(&mut k, &task, &mut st);
+        release_mm(shared, &task, &mut st);
     });
     if released.is_none() {
         let what = format_args!("kernel panic while the thread was exiting");

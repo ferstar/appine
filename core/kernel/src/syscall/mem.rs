@@ -177,6 +177,20 @@ pub(super) fn mremap(
     flags: u32,
     new_addr: u64,
 ) -> SysResult {
+    let r = remap(cx, old, old_len, new_len, flags, new_addr);
+    // 搬动、扩展的可能是可以写的共享文件映射：不持 BKL 的 futex 要知道它们现在在哪里
+    cx.mm().note_shared_files(true);
+    r
+}
+
+fn remap(
+    cx: &mut Cx<'_>,
+    old: u64,
+    old_len: u64,
+    new_len: u64,
+    flags: u32,
+    new_addr: u64,
+) -> SysResult {
     const MREMAP_MAYMOVE: u32 = 1;
     const MREMAP_FIXED: u32 = 2;
     const MREMAP_DONTUNMAP: u32 = 4;

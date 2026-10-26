@@ -1494,7 +1494,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::EPERM);
     }
     cx.t.fs.borrow_mut().root = node;
-    cx.shared.paths_changed();
+    cx.shared.fast_changed();
     Ok(0)
 }
 
@@ -1508,7 +1508,7 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
         cx.cred().permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
     }
     cx.t.fs.borrow_mut().cwd = node;
-    cx.shared.paths_changed();
+    cx.shared.fast_changed();
     Ok(0)
 }
 
