@@ -399,6 +399,37 @@ static void test_futex_sleep(void)
     ok("futex_sleep");
 }
 
+/* ---- 一个线程一直在执行 guest 代码时另一个线程反复 munmap：被打断的线程不进内核、马上
+ * 回到 guest 代码，解除映射的一方仍然要能等到它离开过（等不到时持着 BKL 卡住） ---- */
+
+static atomic_int spinning, stop_spin;
+
+static void *spin_only(void *arg)
+{
+    (void)arg;
+    atomic_store(&spinning, 1);
+    while (!atomic_load(&stop_spin)) {
+    }
+    return NULL;
+}
+
+static void test_unmap_while_spinning(void)
+{
+    pthread_t t;
+    pthread_create(&t, NULL, spin_only, NULL);
+    while (!atomic_load(&spinning))
+        sleep_ms(1);
+    for (int i = 0; i < 2000; i++) {
+        char *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(p != MAP_FAILED, "mmap");
+        p[0] = 1;
+        CHECK(munmap(p, 65536) == 0, "munmap");
+    }
+    atomic_store(&stop_spin, 1);
+    pthread_join(t, NULL);
+    ok("unmap_while_spinning");
+}
+
 /* ---- 多线程进程里 fork：子进程只有调用 fork 的线程，内存是一份拷贝 ---- */
 
 static atomic_int stop_spinning;
@@ -468,6 +499,7 @@ int main(void)
     test_faults();
     test_restart();
     test_futex_sleep();
+    test_unmap_while_spinning();
     test_fork();
     test_detached();
     printf("all ok\n");

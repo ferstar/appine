@@ -199,8 +199,8 @@ cat > diff3.c <<'C'
 
 #define ROUNDS 2000
 
-/* 主线程每轮改完加一（奇数），检查线程检查完加一（偶数） */
-static atomic_int turn;
+/* 检查线程做完开头的检查之后置 1；主线程每轮改完加一（奇数），检查线程检查完加一（偶数） */
+static atomic_int ready, turn;
 static atomic_int done;
 static atomic_int bad, stress_bad;
 static ino_t ino;
@@ -219,6 +219,7 @@ static void *checker(void *arg)
     struct stat st;
     char p[64];
     bad += !(lstat("which", &st) == 0 && st.st_size == 9);
+    atomic_store(&ready, 1);
     for (int i = 0; i < ROUNDS; i++) {
         wait_for(2 * i + 1);
         int k = i % 2;
@@ -299,6 +300,8 @@ int main(void)
     pthread_create(&c, NULL, checker, NULL);
     for (int i = 0; i < 2; i++)
         pthread_create(&s[i], NULL, stress, NULL);
+    while (!atomic_load(&ready))
+        sched_yield();
     for (int i = 0; i < ROUNDS; i++) {
         int k = i % 2;
         char from[32], to[32];
