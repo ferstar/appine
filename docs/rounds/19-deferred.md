@@ -32,4 +32,4 @@
 - io_uring 不做，保持 ENOSYS。之后试做过一轮又放弃了：环放在共享内存里，请求在提交者的上下文里先不等待地执行一次（Cx 加"不等待"模式，让现有的阻塞循环直接返回 EAGAIN），会阻塞的挂起，由定时器线程把提交者叫进内核推进（相当于 task_work），SQPOLL 靠一直置位 `IORING_SQ_NEED_WAKEUP` 实现。接口和 49 个操作码写完是 3800 行，liburing 的测试先抽了 10 个，过了一半，剩下的细节（DEFER_TASKRUN 的完成时机、多次接收的 recvmsg、提供的缓冲区等）还有很长一串。考虑到用的人很少（见 §15），代码没有留下。
 - `PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做。
 - 内核访问 guest 内存（比如 read 写进还没长出来的栈）不会让 `MAP_GROWSDOWN` 的映射增长，返回 EFAULT。→ syscall 入口和构造信号帧之前会让它增长了（M9 之前：栈的大小上限）；内核别的访问仍然是 EFAULT
-- `EPOLLEXCLUSIVE` 只保证报告给一个，唤醒还是全部唤醒。
+- `EPOLLEXCLUSIVE` 只保证报告给一个，唤醒还是全部唤醒。→ 水平触发的关注原来报告给所有 epoll，现在也只报告给一个（M9 之前：epoll 的边沿），一个新连接只让一个进程从 epoll_wait 返回；等待的线程仍然都被叫醒（poll、epoll 的等待者被所有文件类的修改叫醒），没轮到的在内核里接着睡

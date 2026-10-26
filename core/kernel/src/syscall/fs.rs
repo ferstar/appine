@@ -2951,7 +2951,11 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
             break;
         }
     }
-    pipe.borrow_mut().buf.extend(&data);
+    {
+        let mut p = pipe.borrow_mut();
+        p.buf.extend(&data);
+        p.writes += 1;
+    }
     request_wake_object(crate::pipe::object(&pipe));
     Ok(data.len() as u64)
 }
@@ -2983,11 +2987,15 @@ fn pipe_write(
             let space = p.space();
             if (data.len() <= PIPE_BUF && space >= want) || (data.len() > PIPE_BUF && space > 0) {
                 let n = want.min(space);
-                // 读端只在管道空着时等，poll 也只在空着时报告不可读
+                // 读端只在管道空着时等，poll 也只在空着时报告不可读；不空时只有边沿触发
+                // 的 epoll 要知道又来了数据
                 if p.buf.is_empty() {
                     request_wake_object(crate::pipe::object(pipe));
+                } else {
+                    super::poll::arrived(cx);
                 }
                 p.buf.extend(&data[done..done + n]);
+                p.writes += 1;
                 done += n;
                 true
             } else {

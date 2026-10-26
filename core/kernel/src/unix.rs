@@ -102,6 +102,11 @@ pub(crate) struct Channel {
     pub eof: bool,
     /// 接收方不再读（关闭或 `SHUT_RD`）：写入失败。
     pub closed: bool,
+    /// 放进来的消息数：与 Linux 一样，每来一条都让接收方的 `EPOLLET` 再触发一次。
+    pub arrivals: u64,
+    /// 接收方读走之后仍然可写的次数：Linux 每次读走都叫醒发送方（`unix_write_space`），
+    /// 发送方的 `EPOLLET` 再触发一次。
+    pub taken: u64,
 }
 
 pub(crate) type ChannelRef = Rc<RefCell<Channel>>;
@@ -120,6 +125,7 @@ impl Channel {
     pub fn push(&mut self, p: Packet) {
         self.bytes += p.remaining();
         self.packets.push_back(p);
+        self.arrivals += 1;
         request_wake_files();
     }
 
@@ -164,6 +170,9 @@ impl Channel {
             }
         }
         if !peek && !data.is_empty() {
+            if self.writable() {
+                self.taken += 1;
+            }
             request_wake_files();
         }
         Received {
@@ -192,6 +201,9 @@ impl Channel {
             self.bytes -= p.data.len();
             let len = p.data.len();
             p.data.truncate(max);
+            if self.writable() {
+                self.taken += 1;
+            }
             request_wake_files();
             (p.data, len, std::mem::take(&mut p.fds), p.cred, p.from)
         };
@@ -245,6 +257,8 @@ pub(crate) struct UnixSocket {
     pub sndtimeo: Option<Duration>,
     /// 数据报 socket 做过 `SHUT_WR`。
     pub shut_wr: bool,
+    /// 监听 socket 来过的连接数（`EPOLLET` 每来一个都触发）。
+    pub connections: u64,
 }
 
 impl UnixSocket {
@@ -259,6 +273,7 @@ impl UnixSocket {
             rcvtimeo: None,
             sndtimeo: None,
             shut_wr: false,
+            connections: 0,
         }
     }
 
@@ -368,6 +383,19 @@ impl UnixSocket {
             Link::Stream { rx, .. } if self.ty == crate::net::SOCK_STREAM => rx.borrow().bytes,
             Link::Stream { rx, .. } => rx.borrow().packets.front().map_or(0, |p| p.data.len()),
             _ => self.rx.borrow().packets.front().map_or(0, |p| p.data.len()),
+        }
+    }
+
+    /// 读、写两个方向各到过几次事件（`syscall::poll` 的数据代数）。
+    pub fn arrivals(&self) -> [u64; 2] {
+        match &self.link {
+            Link::Listening { .. } => [self.connections, 0],
+            Link::Stream { rx, tx, .. } => [rx.borrow().arrivals, tx.borrow().taken],
+            Link::Dgram { tx, .. } => [
+                self.rx.borrow().arrivals,
+                tx.upgrade().map_or(0, |c| c.borrow().taken),
+            ],
+            Link::None => [self.rx.borrow().arrivals, 0],
         }
     }
 

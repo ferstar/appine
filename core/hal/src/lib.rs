@@ -556,6 +556,61 @@ fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
     unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, ms) }
 }
 
+/// 宿主 fd 上新发生的事件：一个边沿触发的宿主 epoll，只关注这一个 fd。宿主 poll 只能
+/// 看到 fd 现在就不就绪，看不到已经可读时又来了数据；宿主 epoll 的边沿触发每来一次
+/// 数据（每次唤醒）都报告一次，正好是 guest 的 `EPOLLET` 要的。
+pub struct Edges {
+    epfd: std::os::fd::OwnedFd,
+}
+
+impl Edges {
+    /// 开始记录 `fd` 上的事件。刚建立时 fd 已经就绪的话，第一次 [`Edges::take`] 就会报告。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn new(fd: i32) -> Result<Edges, i32> {
+        use std::os::fd::FromRawFd;
+        let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if raw < 0 {
+            return Err(last_errno());
+        }
+        let epfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+            u64: 0,
+        };
+        if unsafe { libc::epoll_ctl(raw, libc::EPOLL_CTL_ADD, fd, &mut ev) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(Edges { epfd })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn new(_fd: i32) -> Result<Edges, i32> {
+        Err(libc::ENOSYS)
+    }
+
+    /// 宿主 epoll 本身的 fd：有新事件时可读，可以放进 [`poll`] 里等。
+    pub fn fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.epfd.as_raw_fd()
+    }
+
+    /// 取走上次以来发生的事件：(读方向, 写方向) 有没有新的。出错、挂断算读方向。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn take(&self) -> (bool, bool) {
+        let mut ev = libc::epoll_event { events: 0, u64: 0 };
+        if unsafe { libc::epoll_wait(self.fd(), &mut ev, 1, 0) } != 1 {
+            return (false, false);
+        }
+        let out = (libc::EPOLLOUT | libc::EPOLLWRNORM | libc::EPOLLWRBAND) as u32;
+        (ev.events & !out != 0, ev.events & out != 0)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn take(&self) -> (bool, bool) {
+        (false, false)
+    }
+}
+
 /// 当前线程的 CPU 时间时钟，其他线程也可以用 [`clock_gettime`] 读它（线程退出后失效）。
 pub fn thread_cpu_clock() -> Option<i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]

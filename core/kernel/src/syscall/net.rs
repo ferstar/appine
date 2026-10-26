@@ -496,6 +496,7 @@ pub(crate) fn send(
             });
         if let Socket::Inet(s) = &mut *sock.borrow_mut() {
             s.answers.push_back(answer);
+            s.answered += 1;
         }
         request_wake_files();
         return Ok(data.len());
@@ -967,6 +968,16 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
             put(cx, arg, (got as i32).to_le_bytes()).map(|()| 0)
         }
         _ => Err(Errno::ENOTTY),
+    }
+}
+
+/// 进程内的数据来过几次：[读方向, 写方向]（`syscall::poll` 的数据代数）。宿主 socket
+/// 上的数据不经过内核层，由 [`crate::fd::HostEdges`] 记录。
+pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
+    match sock {
+        Socket::Inet(s) => [s.answered, 0],
+        Socket::Netlink(s) => [s.arrivals, 0],
+        Socket::Unix(u) => u.arrivals(),
     }
 }
 

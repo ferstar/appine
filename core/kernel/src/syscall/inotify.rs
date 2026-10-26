@@ -98,6 +98,8 @@ pub struct Inotify {
     bytes: usize,
     /// 队列里有 `IN_Q_OVERFLOW`。
     overflowed: bool,
+    /// 排进队列的事件数（`EPOLLET` 每排进一个都触发）。
+    queued: u64,
     /// 最多排队的事件数：与 Linux 一样取创建时的 `max_queued_events`。
     max_queued: usize,
     /// 创建者的有效 uid：实例和监视算在这个用户名下。
@@ -114,6 +116,7 @@ impl Default for Inotify {
             queue: VecDeque::new(),
             bytes: 0,
             overflowed: false,
+            queued: 0,
             max_queued: MAX_QUEUED,
             uid: 0,
             registry: Weak::new(),
@@ -150,6 +153,11 @@ impl Inotify {
     /// 有没有事件可读。
     pub fn ready(&self) -> bool {
         !self.queue.is_empty()
+    }
+
+    /// 一共排进过几个事件。
+    pub fn queued(&self) -> u64 {
+        self.queued
     }
 
     /// 可读的字节数。
@@ -209,6 +217,7 @@ impl Inotify {
         };
         self.bytes += event.len();
         self.queue.push_back(event);
+        self.queued += 1;
     }
 }
 

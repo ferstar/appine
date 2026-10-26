@@ -282,6 +282,7 @@ pub(super) fn connect(
             if pending.len() <= *backlog {
                 let end = with(sock, |u| u.connect_stream(&server.addr, *server_cred, cred));
                 pending.push_back(Rc::new(RefCell::new(Socket::Unix(end))));
+                server.connections += 1;
                 request_wake_files();
                 return Ok(());
             }

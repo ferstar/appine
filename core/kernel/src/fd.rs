@@ -142,11 +142,15 @@ pub struct OpenFile {
     /// 程序在这个打开文件上读、写两个方向各用完数据的次数：epoll 的 `EPOLLET` 据此
     /// 知道程序已经用完了上一次报告的事件（`syscall::poll::drained`）。
     pub drained: [u64; 2],
-    /// 读到数据的次数：设置了 `O_ASYNC` 时读过之后仍然可读，就当作来了新数据，再通知
-    /// 一次（`syscall::poll` 的 fasync）；也是 `EPOLLEXCLUSIVE` 区分边沿的数据代数。
+    /// 读到数据的次数：设置了 `O_ASYNC` 时读过之后仍然可读，就当作可能来了新数据，再
+    /// 通知一次（`syscall::poll` 的 fasync）。
     pub reads: u64,
-    /// 边沿触发的 `EPOLLEXCLUSIVE` 关注已经报告过的数据代数（`syscall::poll`）。
-    pub exclusive_claim: std::cell::Cell<Option<[u64; 3]>>,
+    /// `EPOLLEXCLUSIVE` 的关注报告过的边沿（`syscall::poll` 的数据代数）和报告它的 epoll：
+    /// 同一个边沿别的 epoll 不再报告（Linux 只叫醒一个等待者）。
+    pub exclusive_claim: std::cell::Cell<Option<([u64; 4], usize)>>,
+    /// 宿主 fd 上新到的事件：有边沿触发或者 `EPOLLEXCLUSIVE` 的关注时才建立
+    /// （`syscall::poll`）。
+    pub host_edges: Option<HostEdges>,
     /// 打开的仓库文件：inotify 按 fd 的事件报给打开时经过的目录，最后一个引用释放时
     /// 报告 `IN_CLOSE_*`。
     pub watch: Option<crate::syscall::Opened>,
@@ -176,6 +180,7 @@ impl OpenFile {
             drained: [0; 2],
             reads: 0,
             exclusive_claim: std::cell::Cell::new(None),
+            host_edges: None,
             pos_busy: 0,
             holds_locks: false,
             watch: None,
@@ -260,6 +265,19 @@ pub struct SignalFd {
 }
 
 impl SignalFd {
+    /// 创建它的线程组和线程一共挂起过几次信号（`syscall::poll` 的数据代数）。
+    pub fn arrivals(&self) -> u64 {
+        let group = self
+            .group
+            .upgrade()
+            .map_or(0, |g| g.borrow().pending.arrivals());
+        let task = self
+            .task
+            .upgrade()
+            .map_or(0, |t| t.pending.borrow().arrivals());
+        group + task
+    }
+
     /// 有没有可以读走的信号（poll）。
     pub fn ready(&self) -> bool {
         let group = self.group.upgrade().map_or(0, |g| g.borrow().pending.set());
@@ -305,6 +323,8 @@ pub struct TimerFd {
     pub interval: Duration,
     /// 已经到期、还没有被读走的次数。
     pub expirations: u64,
+    /// 一共到期过几次（不因为读走而减少）：epoll 的 `EPOLLET` 每次到期都触发。
+    pub fired: u64,
     /// 上一次 timerfd_settime 的 flags（`/proc/<pid>/fdinfo`）。
     pub settime_flags: u32,
 }
@@ -337,6 +357,7 @@ impl TimerFd {
         let Some(d) = self.deadline.filter(|&d| d <= now) else {
             return;
         };
+        self.fired += 1;
         if self.interval.is_zero() {
             self.expirations += 1;
             self.deadline = None;
@@ -354,6 +375,60 @@ pub struct EventFd {
     pub count: u64,
     /// `EFD_SEMAPHORE`：每次读只减 1。
     pub semaphore: bool,
+    /// 写入、读出的次数：与 Linux 一样，每次写都让读的一方的 `EPOLLET` 再触发一次（mio
+    /// 的唤醒器就靠它，从来不读走计数），每次读都让写的一方再触发一次。
+    pub writes: u64,
+    pub reads: u64,
+}
+
+/// 宿主 fd 上新到的事件（[`appine_hal::Edges`]）累计的次数。
+pub struct HostEdges {
+    edges: appine_hal::Edges,
+    counts: std::cell::Cell<[u64; 2]>,
+    /// 宿主 epoll 上可能有还没取走的事件：最近一次和宿主 fd 一起 poll 时它可读
+    /// （[`HostEdges::polled`]）。
+    unread: std::cell::Cell<bool>,
+}
+
+impl HostEdges {
+    /// 开始记录宿主 fd `fd` 上新到的事件。
+    pub fn new(fd: i32) -> Result<HostEdges, i32> {
+        Ok(HostEdges {
+            edges: appine_hal::Edges::new(fd)?,
+            counts: std::cell::Cell::new([0; 2]),
+            unread: std::cell::Cell::new(true),
+        })
+    }
+
+    /// 到现在为止读、写两个方向各到过几次事件。
+    pub fn counts(&self) -> [u64; 2] {
+        self.unread.set(false);
+        let (r, w) = self.edges.take();
+        let [a, b] = self.counts.get();
+        let now = [a + r as u64, b + w as u64];
+        self.counts.set(now);
+        now
+    }
+
+    /// 与 [`HostEdges::counts`] 相同，但刚刚和宿主 fd 一起 poll 过（[`HostEdges::polled`]）：
+    /// 那时宿主 epoll 不可读就不必再问宿主，每次检查少一次系统调用。
+    pub fn counts_polled(&self) -> [u64; 2] {
+        if self.unread.get() {
+            self.counts()
+        } else {
+            self.counts.get()
+        }
+    }
+
+    /// 和宿主 fd 一起 poll 了宿主 epoll 的 fd，得到 `revents`。
+    pub fn polled(&self, revents: i16) {
+        self.unread.set(self.unread.get() || revents != 0);
+    }
+
+    /// 有新事件时可读的宿主 fd，等待时放进宿主 poll。
+    pub fn fd(&self) -> i32 {
+        self.edges.fd()
+    }
 }
 
 /// 打开文件的共享引用。

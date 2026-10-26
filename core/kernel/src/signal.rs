@@ -279,12 +279,20 @@ pub(crate) struct Pending {
     info: [SigInfo; 31],
     /// 排着队的实时信号。
     queue: VecDeque<(Signal, SigInfo)>,
+    /// 挂起过几次信号（已经挂起的标准信号再产生时不算）：与 Linux 的 signalfd_notify
+    /// 一样，每次都让 signalfd 的 `EPOLLET` 再触发一次。
+    arrivals: u64,
 }
 
 impl Pending {
     /// 挂起的信号集。
     pub fn set(&self) -> u64 {
         self.set
+    }
+
+    /// 挂起过几次信号。
+    pub fn arrivals(&self) -> u64 {
+        self.arrivals
     }
 
     /// 排着队的实时信号个数。
@@ -295,6 +303,9 @@ impl Pending {
     /// 挂起一个信号。`room` 为 false 时实时信号不再排队（超过了 `RLIMIT_SIGPENDING`）：
     /// 与 Linux 一样，信号照样挂起，siginfo 丢掉。
     pub fn add(&mut self, sig: Signal, info: SigInfo, room: bool) {
+        if sig.is_realtime() || self.set & sig.bit() == 0 {
+            self.arrivals += 1;
+        }
         if !sig.is_realtime() {
             self.info[sig.index()] = info;
         } else if room {
@@ -332,7 +343,9 @@ impl Pending {
 
     /// 挂着的 `sig` 的 siginfo（定时器把超限次数加到自己上一次发的信号里）。
     pub fn infos_mut(&mut self, sig: Signal) -> impl Iterator<Item = &mut SigInfo> {
-        let Pending { set, info, queue } = self;
+        let Pending {
+            set, info, queue, ..
+        } = self;
         let standard =
             (!sig.is_realtime() && *set & sig.bit() != 0).then(|| &mut info[sig.index()]);
         standard.into_iter().chain(

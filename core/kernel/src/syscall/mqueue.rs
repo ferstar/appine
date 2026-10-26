@@ -126,9 +126,17 @@ pub struct MessageQueue {
     notify: Option<Notify>,
     /// 正在等着接收的线程数：有人在等时不发通知。
     receivers: usize,
+    /// 发送、接收的消息数：与 Linux 一样，每次都让对方的 `EPOLLET` 再触发一次。
+    sent: u64,
+    received: u64,
 }
 
 impl MessageQueue {
+    /// 发送、接收过的消息数（`syscall::poll` 的数据代数）。
+    pub fn arrivals(&self) -> [u64; 2] {
+        [self.sent, self.received]
+    }
+
     /// poll 的就绪事件。
     pub fn readiness(&self) -> i16 {
         const POLLIN: i16 = 0x001;
@@ -246,6 +254,8 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
                 messages: VecDeque::new(),
                 notify: None,
                 receivers: 0,
+                sent: 0,
+                received: 0,
             }))
         }
     };
@@ -337,6 +347,7 @@ pub(super) fn mq_timedsend(
             .position(|(p, _)| *p < prio)
             .unwrap_or(q.messages.len());
         q.messages.insert(at, (prio, data));
+        q.sent += 1;
         // 空队列来了消息、又没有人在等着接收：通知一次，登记随之取消
         if was_empty && q.receivers == 0 {
             q.notify.take()
@@ -365,6 +376,7 @@ pub(super) fn mq_timedsend(
             {
                 cookie[31] = NOTIFY_WOKENUP;
                 n.queue.push_back(cookie.to_vec());
+                n.arrivals += 1;
             }
         }
         _ => {}
@@ -390,9 +402,12 @@ pub(super) fn mq_timedreceive(
     }
     let deadline = deadline(cx, timeout)?;
     let (p, data) = loop {
-        if let Some(m) = q.borrow_mut().messages.pop_front() {
+        let mut queue = q.borrow_mut();
+        if let Some(m) = queue.messages.pop_front() {
+            queue.received += 1;
             break m;
         }
+        drop(queue);
         if flags & oflags::O_NONBLOCK != 0 {
             return Err(Errno::EAGAIN);
         }

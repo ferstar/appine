@@ -42,6 +42,7 @@ pub(super) fn timerfd_create(cx: &mut Cx<'_>, clock: i32, flags: u32) -> SysResu
         deadline: None,
         interval: Duration::ZERO,
         expirations: 0,
+        fired: 0,
         settime_flags: 0,
     };
     let file = OpenFile::new(

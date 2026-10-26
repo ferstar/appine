@@ -50,6 +50,7 @@
 | [M9 之前：平均负载、sysfs 和 limits](rounds/39-loadavg-sysfs.md) | 2026-10-27 | 平均负载按 Linux 的算法每 5 秒取样，所有线程都在等待时停下；只有 CPU 拓扑的 sysfs（`nproc --all`）；`/proc/<pid>/limits`；删除之后仍然打开着的文件可以 futimens |
 | [M9 之前：ptrace 的第一步，strace](rounds/40-ptrace-strace.md) | 2026-10-27 | 系统调用、信号、group-stop 和 `PTRACE_EVENT_*` 的停止，寄存器经由 regset 读写，wait 报告被跟踪的线程；process_vm_readv/writev；strace 能用 |
 | [M9 之前：ptrace 的第二步，gdb](rounds/41-ptrace-gdb.md) | 2026-10-27 | 解释器单步、强制写入被跟踪进程的内存并作废翻译、`/proc/<pid>/mem`、`/proc/<pid>/auxv`；gdb 的断点、单步、软件观察点、`catch syscall` 与原生一致 |
+| [M9 之前：epoll 的边沿](rounds/42-epoll-edges.md) | 2026-10-27 | `EPOLLET` 按 Linux 的唤醒时机：已经就绪时又来了数据也再触发（进程内的对象记数据代数，宿主 socket 用一个边沿触发的宿主 epoll 记新到的数据），tokio 程序（uv）不再卡住；水平触发的 `EPOLLEXCLUSIVE` 一个边沿只让一个 epoll 返回 |
 
 ## 测量条件
 

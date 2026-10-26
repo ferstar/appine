@@ -49,6 +49,8 @@ pub(crate) struct InetSocket {
     pub stub_peer: bool,
     /// DNS 存根的回答，等 guest 读走。
     pub answers: VecDeque<Vec<u8>>,
+    /// 放进 `answers` 的回答数（`EPOLLET` 每来一个都触发）。
+    pub answered: u64,
     /// `SO_RCVTIMEO`、`SO_SNDTIMEO`：阻塞由我们模拟，所以超时也由我们处理。
     pub rcvtimeo: Option<Duration>,
     pub sndtimeo: Option<Duration>,
@@ -64,6 +66,7 @@ impl InetSocket {
             peer: None,
             stub_peer: false,
             answers: VecDeque::new(),
+            answered: 0,
             rcvtimeo: None,
             sndtimeo: None,
         }
@@ -217,6 +220,8 @@ pub(crate) struct NetlinkSocket {
     pub pid: u32,
     /// 等 guest 读走的回答，每一项是一个数据报。
     pub queue: VecDeque<Vec<u8>>,
+    /// 放进 `queue` 的数据报数（`EPOLLET` 每来一个都触发）。
+    pub arrivals: u64,
 }
 
 // ---- DNS 存根 ----
@@ -373,6 +378,7 @@ impl NetlinkSocket {
             protocol,
             pid: 0,
             queue: VecDeque::new(),
+            arrivals: 0,
         }
     }
 
@@ -424,6 +430,7 @@ impl NetlinkSocket {
             }
             if !out.is_empty() {
                 self.queue.push_back(out);
+                self.arrivals += 1;
             }
             off += len.next_multiple_of(4);
         }

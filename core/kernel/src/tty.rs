@@ -247,6 +247,9 @@ pub struct Tty {
     pub locked: bool,
     /// `/dev/pts/<index>` 的属主和属组：打开主设备的进程的 fsuid、fsgid。
     pub owner: (u32, u32),
+    /// 输入（从设备读的）、输出（主设备读的）各来过几次数据：与 Linux 一样，每来一次
+    /// 都让读的一方的 `EPOLLET` 再触发一次。
+    pub arrivals: [u64; 2],
 }
 
 impl Tty {
@@ -268,6 +271,7 @@ impl Tty {
             slaves: 0,
             locked: true,
             owner: (0, 0),
+            arrivals: [0; 2],
         }
     }
 
@@ -393,6 +397,7 @@ impl Tty {
         for &c in data {
             self.put_output(c);
         }
+        self.arrivals[1] += 1;
     }
 
     fn put_output(&mut self, c: u8) {
@@ -461,10 +466,15 @@ impl Tty {
     /// 调用方保证 `data` 不超过 [`Tty::input_room`]。
     pub fn write_input(&mut self, data: &[u8]) -> Vec<Signal> {
         let mut signals = Vec::new();
+        let echoed = self.output.len();
         for &c in data {
             if let Some(sig) = self.input_char(c) {
                 signals.push(sig);
             }
+        }
+        self.arrivals[0] += 1;
+        if self.output.len() != echoed {
+            self.arrivals[1] += 1;
         }
         signals
     }

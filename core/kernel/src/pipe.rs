@@ -41,6 +41,8 @@ pub struct Pipe {
     /// 等着空间的写端最少要多少字节（0 表示没有）：读端腾出这么多时才叫醒它们
     /// （[`Pipe::drained`]）。
     pub writer_need: usize,
+    /// 写入数据的次数：与 Linux 一样，每次写都让读端的 `EPOLLET` 再触发一次。
+    pub writes: u64,
 }
 
 impl Pipe {
@@ -81,6 +83,7 @@ impl Pipe {
             reader_opens: 0,
             writer_opens: 0,
             writer_need: 0,
+            writes: 0,
         }))
     }
 

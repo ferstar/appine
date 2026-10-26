@@ -3,16 +3,31 @@
 //! 三者共用 [`wait_ready`]：先检查进程内对象（管道、PTY、eventfd……）的就绪状态，
 //! 宿主 fd（宿主 socket、宿主 stdio）用一次不等待的宿主 poll 检查；都没有就绪时，
 //! 把宿主 fd 和自己的唤醒事件放在一起等（§6 的统一等待机制）。epoll 在进程内实现，
-//! 默认水平触发。`EPOLLET` 近似为边沿触发：某一位从未就绪变成就绪时触发，触发时与
-//! Linux 一样报告当前全部就绪的位。程序在一个方向上用完数据（读写得到 EAGAIN，或者
-//! 没有读写满要求的长度，见 [`drained`]）之后，这个方向上次报告过的位全部忘掉，所以
-//! 之后来的数据一定会再触发一次：只靠 epoll_wait 看到的状态判断会丢事件，比如读到
-//! EAGAIN 和新数据到达之间没有调用 epoll_wait（Go 的 netpoller 就会这样）。已经可读时
-//! 又来了数据、而程序没有用完数据，不会再触发。
+//! 默认水平触发。
+//!
+//! `EPOLLET`：Linux 每次唤醒文件的等待队列（来了数据、新的连接、eventfd 被写、timerfd
+//! 到期……）都让边沿触发的关注再报告一次，即使文件本来就已经就绪；mio（tokio）的唤醒器
+//! 就靠这一点，它从来不读走 eventfd 的计数。这里按"数据代数"判断（[`arrivals`]）：
+//! 进程内的对象每来一次事件记一次；宿主 socket 上的数据不经过内核层，由一个只关注它的
+//! 边沿触发的宿主 epoll 记录（[`HostEdges`]，有边沿触发的关注时才建立）。某一位从未
+//! 就绪变成就绪，或者那个方向又来了事件时触发，触发时与 Linux 一样报告当前全部就绪的
+//! 位。程序在一个方向上用完数据（读写得到 EAGAIN，或者没有读写满要求的长度，见
+//! [`drained`]）之后，这个方向上次报告过的位也全部忘掉：建不了 [`HostEdges`] 时（宿主
+//! 上的普通文件）只能靠它，而且读到 EAGAIN 和新数据到达之间没有调用 epoll_wait 时
+//! （Go 的 netpoller 就会这样）也不会丢事件。
 //!
 //! 等待时，边沿触发的关注不等报告过、仍然就绪的位：宿主 poll 会立刻返回，epoll_wait
-//! 就变成反复释放、获取 BKL 的忙等，把其他线程饿死。所以程序用完数据时要叫醒这些
-//! epoll_wait 重新计算（[`Kernel::edge_waiters`](crate::kernel::Kernel)）。
+//! 就变成反复释放、获取 BKL 的忙等，把其他线程饿死。所以改为等宿主 fd 上的新事件
+//! （[`HostEdges`] 的 fd），进程内的对象来了数据（管道不空时只叫醒这些等待者，见
+//! [`arrived`]）、程序用完数据时叫醒这些 epoll_wait 重新计算
+//! （[`Kernel::edge_waiters`](crate::kernel::Kernel)）。
+//!
+//! `EPOLLEXCLUSIVE`：Linux 每次唤醒只叫醒一个独占的等待者。这里一个边沿（数据代数）
+//! 只报告给一个 epoll（[`OpenFile::exclusive_claim`]）：水平触发的关注由报告过它的
+//! epoll 接着报告，别的 epoll 等下一个边沿，所以几个进程各用一个 epoll 等同一个监听
+//! socket 时，一个新连接只让一个进程从 epoll_wait 返回。等待的线程仍然都会被叫醒
+//! （poll、epoll 的等待者被所有文件类的修改叫醒，§6），没轮到的在内核里重新检查之后
+//! 接着睡。
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -21,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use super::{SysResult, get, read_timespec, tty};
 use crate::errno::Errno;
-use crate::fd::{EventFd, FileKind, FileRef, OpenFile, oflags};
+use crate::fd::{EventFd, FileKind, FileRef, HostEdges, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_files};
 use crate::pipe::PIPE_BUF;
 use crate::process::RLIMIT_NOFILE;
@@ -133,10 +148,70 @@ pub(super) fn poll_once(f: &OpenFile, events: i16, all: bool) -> i16 {
     }
 }
 
-/// 打开文件现在的"数据代数"：读、写方向用完数据的次数和读到数据的次数。代数不变就
+/// 打开文件上读、写两个方向各来过几次事件：进程内的对象每次来数据（管道、socket 的
+/// 写入，eventfd 的写，timerfd 到期，新的连接……）都记一次，与 Linux 每次唤醒等待队列
+/// 对应；宿主 fd 上的由 [`HostEdges`] 记录，没有建立它时是 0。`EPOLLET` 据此在已经就绪
+/// 时又来了数据的情况下再触发一次。
+fn arrivals(f: &OpenFile) -> [u64; 2] {
+    arrivals_with(f, HostEdges::counts)
+}
+
+/// 与 [`arrivals`] 相同，但宿主 fd 刚刚经过 [`poll_now`]，宿主 epoll 那时不可读就不必
+/// 再问宿主。
+fn arrivals_polled(f: &OpenFile) -> [u64; 2] {
+    arrivals_with(f, HostEdges::counts_polled)
+}
+
+fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2]) -> [u64; 2] {
+    let local = match &f.kind {
+        FileKind::Pipe(end) if end.read => [end.pipe.borrow().writes, 0],
+        FileKind::Pty(end) => [end.tty.borrow().arrivals[end.master as usize], 0],
+        FileKind::Socket(s) => super::net::arrivals(&s.borrow()),
+        FileKind::EventFd(e) => {
+            let e = e.borrow();
+            [e.writes, e.reads]
+        }
+        FileKind::TimerFd(t) => {
+            let mut t = t.borrow_mut();
+            t.update(Instant::now());
+            [t.fired, 0]
+        }
+        FileKind::Inotify(i) => [i.borrow().queued(), 0],
+        FileKind::SignalFd(s) => [s.borrow().arrivals(), 0],
+        FileKind::MessageQueue(q) => q.borrow().arrivals(),
+        _ => [0, 0],
+    };
+    let host = f.host_edges.as_ref().map_or([0, 0], host);
+    [local[0] + host[0], local[1] + host[1]]
+}
+
+/// 打开文件现在的"数据代数"：读、写方向用完数据的次数和来过事件的次数。代数不变就
 /// 还是同一个边沿（`EPOLLEXCLUSIVE`）。
-fn edge(f: &OpenFile) -> [u64; 3] {
-    [f.drained[0], f.drained[1], f.reads]
+fn edge(f: &OpenFile) -> [u64; 4] {
+    let a = arrivals(f);
+    [f.drained[0], f.drained[1], a[0], a[1]]
+}
+
+/// 打开文件背后的宿主 fd（宿主 stdio、TCP/UDP socket）。
+fn host_fd(f: &OpenFile) -> Option<i32> {
+    match &f.kind {
+        FileKind::Host(fd) => Some(*fd),
+        FileKind::Socket(s) => match &*s.borrow() {
+            crate::net::Socket::Inet(i) => Some(i.fd),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `EPOLLEXCLUSIVE` 的关注 `int`（属于地址为 `owner` 的 epoll）现在的边沿已经被别的
+/// epoll 报告过了：Linux 每次唤醒只叫醒一个独占的等待者，没轮到的不报告。边沿触发的
+/// 关注自己报告过的也不再报告（与没有 `EPOLLEXCLUSIVE` 时一样）。
+fn claimed(int: &Interest, f: &OpenFile, owner: usize) -> bool {
+    int.events & EPOLLEXCLUSIVE != 0
+        && f.exclusive_claim.get().is_some_and(|(edge_then, by)| {
+            edge_then == edge(f) && (by != owner || int.events & EPOLLET != 0)
+        })
 }
 
 /// 立即检查一个文件就绪的事件（宿主 fd 用一次不等待的 poll），只保留 `wanted` 和
@@ -144,9 +219,18 @@ fn edge(f: &OpenFile) -> [u64; 3] {
 fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
     let (mut ev, host) = readiness(f, depth);
     if let Some(fd) = host {
-        let mut p = [(fd, wanted, 0)];
-        if appine_hal::poll(&mut p, Some(Duration::ZERO)).is_ok() {
+        // 记录新事件的宿主 epoll 一起问：不可读时 arrivals_polled 不必再问
+        let edges = f.host_edges.as_ref();
+        let mut p = [
+            (fd, wanted, 0),
+            (edges.map_or(-1, HostEdges::fd), POLLIN, 0),
+        ];
+        let n = if edges.is_some() { 2 } else { 1 };
+        if appine_hal::poll(&mut p[..n], Some(Duration::ZERO)).is_ok() {
             ev |= p[0].2;
+            if let Some(e) = edges {
+                e.polled(p[1].2);
+            }
         }
     }
     ev & (wanted | POLLERR | POLLHUP | POLLNVAL)
@@ -177,9 +261,9 @@ impl Waits {
         }
     }
 
-    /// 一个 epoll 活着、没有停用的关注。边沿触发的关注不等报告过、仍然就绪的位（见
-    /// 模块文档）；报告过 POLLHUP、POLLERR 的整个不等，因为宿主 poll 总会报告这两位，
-    /// 而挂断、出错之后也不会再有新的事件。
+    /// 一个 epoll 活着、没有停用的关注。边沿触发的关注不等报告过、仍然就绪的位，独占
+    /// 的关注不等轮到了别的 epoll 的边沿，改为等宿主 fd 上的新事件（见模块文档）；
+    /// 报告过 POLLHUP、POLLERR 的不等宿主 fd 本身，因为宿主 poll 总会报告这两位。
     fn add_epoll(&mut self, ep: &Epoll, depth: u32) {
         for int in ep.interests.iter().filter(|i| i.armed) {
             let Some(file) = int.file.upgrade() else {
@@ -187,14 +271,28 @@ impl Waits {
             };
             let mut wanted = int.events as i16;
             let seen = int.seen.get() as i16;
+            let f = file.borrow();
+            // 宿主 fd 上新到的数据只能从 HostEdges 的宿主 epoll 看到：等它
+            let mut edges = false;
+            let mut hung_up = false;
             if int.events & EPOLLET != 0 && seen != 0 {
                 self.edge = true;
-                if seen & (POLLHUP | POLLERR) != 0 {
-                    continue;
-                }
+                edges = true;
+                hung_up = seen & (POLLHUP | POLLERR) != 0;
                 wanted &= !seen;
             }
-            self.add(&file.borrow(), wanted, depth);
+            // 现在的边沿轮到了别的 epoll：现在就绪的位不等，等新的边沿
+            if claimed(int, &f, ep as *const Epoll as usize) {
+                self.edge = true;
+                edges = true;
+                wanted &= !poll_now(&f, wanted, depth);
+            }
+            if edges && let Some(e) = &f.host_edges {
+                self.host.push((e.fd(), POLLIN, 0));
+            }
+            if !hung_up {
+                self.add(&f, wanted, depth);
+            }
         }
     }
 
@@ -229,6 +327,14 @@ pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
     }
 }
 
+/// 一个已经就绪的进程内对象又来了数据，而写入的一方没有请求唤醒（管道不空时）：叫醒
+/// 边沿触发、少等了这些事件的 epoll_wait 重新计算。
+pub(super) fn arrived(cx: &mut Cx<'_>) {
+    for event in &cx.k().edge_waiters {
+        crate::kernel::signal_later(event);
+    }
+}
+
 // ---- 信号驱动的 I/O ----
 
 /// 一个设置了 `O_ASYNC` 的打开文件（Linux 的 fasync）。
@@ -238,9 +344,10 @@ pub(crate) struct Fasync {
     fd: i32,
     /// 上次检查时就绪的事件。
     last: i16,
-    /// 上次检查时打开文件的 [`OpenFile::drained`] 和 [`OpenFile::reads`]。
+    /// 上次检查时打开文件的 [`OpenFile::drained`]、[`OpenFile::reads`] 和 [`arrivals`]。
     drained: [u64; 2],
     reads: u64,
+    arrivals: [u64; 2],
 }
 
 /// 打开文件刚刚设置了 `O_ASYNC`：登记它。已经就绪的事件不发信号，与 Linux 一样。
@@ -257,6 +364,7 @@ pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
         last: poll_now(&f, POLLIN | POLLOUT, 0),
         drained: f.drained,
         reads: f.reads,
+        arrivals: arrivals(&f),
     });
 }
 
@@ -281,17 +389,20 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
         if f.flags & oflags::O_ASYNC == 0 {
             return false;
         }
-        // 程序在一个方向上用完了数据：这个方向重新算作没有就绪，之后再来数据还会通知。
-        // 读过数据之后仍然可读也再通知一次：两次检查之间可能读空了又来了新数据，
-        // Linux 每来一次数据都通知
-        if f.drained[0] != e.drained[0] || f.reads != e.reads {
+        // 程序在一个方向上用完了数据，或者这个方向又来了事件：这个方向重新算作没有
+        // 就绪，仍然就绪的话再通知，Linux 每来一次数据都通知。读过数据之后仍然可读也再
+        // 通知一次：宿主 socket 上看不到新到的数据（没有 HostEdges 时），两次检查之间
+        // 可能读空了又来了新数据
+        let came = arrivals(&f);
+        if f.drained[0] != e.drained[0] || f.reads != e.reads || came[0] != e.arrivals[0] {
             e.last &= !(POLLIN | POLLRDNORM);
         }
-        if f.drained[1] != e.drained[1] {
+        if f.drained[1] != e.drained[1] || came[1] != e.arrivals[1] {
             e.last &= !(POLLOUT | POLLWRNORM);
         }
         e.drained = f.drained;
         e.reads = f.reads;
+        e.arrivals = came;
         let (_, host_fd) = readiness(&f, 0);
         let ev = poll_now(&f, POLLIN | POLLOUT, 0);
         let new = ev & !e.last;
@@ -557,7 +668,7 @@ const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
 const EPOLLONESHOT: u32 = 1 << 30;
 const EPOLLET: u32 = 1 << 31;
-/// 多个 epoll 等同一个 fd 时只唤醒其中一个。这里总是全部唤醒，所以只检查参数。
+/// 多个 epoll 等同一个 fd 时只唤醒其中一个（见模块文档）。
 const EPOLLEXCLUSIVE: u32 = 1 << 28;
 const EPOLLWAKEUP: u32 = 1 << 29;
 /// 能和 `EPOLLEXCLUSIVE` 一起用的位（Linux 的 `EPOLLEXCLUSIVE_OK_BITS`）。
@@ -575,8 +686,9 @@ struct Interest {
     armed: bool,
     /// `EPOLLET`：上次报告时就绪的位里现在仍然就绪的那些。出现不在其中的就绪位才触发。
     seen: Cell<u32>,
-    /// `EPOLLET`：上次检查时打开文件的 [`OpenFile::drained`]。
+    /// `EPOLLET`：上次检查时打开文件的 [`OpenFile::drained`] 和 [`arrivals`]。
     drained: Cell<[u64; 2]>,
+    arrivals: Cell<[u64; 2]>,
 }
 
 impl Interest {
@@ -589,6 +701,7 @@ impl Interest {
             armed: true,
             seen: Cell::new(0),
             drained: Cell::new(file.borrow().drained),
+            arrivals: Cell::new(arrivals(&file.borrow())),
         }
     }
 }
@@ -645,23 +758,24 @@ impl Epoll {
             let Some(file) = int.file.upgrade().filter(|_| int.armed) else {
                 continue;
             };
-            // 边沿触发的独占关注：同一个边沿已经被别的 epoll 报告过了，当作没有就绪
-            // （Linux 只叫醒一个等待者）
-            if int.events & (EPOLLET | EPOLLEXCLUSIVE) == EPOLLET | EPOLLEXCLUSIVE
-                && file.borrow().exclusive_claim.get() == Some(edge(&file.borrow()))
-            {
+            let f = file.borrow();
+            // 独占的关注：这个边沿已经轮到了别的 epoll，当作没有就绪
+            if claimed(int, &f, self as *const Epoll as usize) {
                 continue;
             }
-            let ev = poll_now(&file.borrow(), int.events as i16, depth) as u16 as u32;
+            let ev = poll_now(&f, int.events as i16, depth) as u16 as u32;
             if int.events & EPOLLET != 0 {
-                // 程序在某个方向上用完了数据：这个方向上次报告的事件作废
-                let drained = file.borrow().drained;
+                // 程序在某个方向上用完了数据，或者这个方向又来了事件：这个方向上次报告的
+                // 事件作废，仍然就绪的话再报告一次
+                let drained = f.drained;
                 let last = int.drained.replace(drained);
+                let came = arrivals_polled(&f);
+                let before = int.arrivals.replace(came);
                 let mut seen = int.seen.get();
-                if drained[0] != last[0] {
+                if drained[0] != last[0] || came[0] != before[0] {
                     seen &= WRITE_BITS;
                 }
-                if drained[1] != last[1] {
+                if drained[1] != last[1] || came[1] != before[1] {
                     seen &= !WRITE_BITS;
                 }
                 // 不再就绪的位忘掉，下次重新就绪时才能再触发
@@ -680,16 +794,18 @@ impl Epoll {
 
     /// 关注 `i` 的事件 `ev` 已经报告给 guest。
     fn reported(&mut self, i: usize, ev: u32) {
+        let owner = self as *const Epoll as usize;
         let int = &mut self.interests[i];
         int.seen.set(ev);
         if int.events & EPOLLONESHOT != 0 {
             int.armed = false;
         }
-        if int.events & (EPOLLET | EPOLLEXCLUSIVE) == EPOLLET | EPOLLEXCLUSIVE
+        // 独占的关注：这个边沿归这个 epoll，别的 epoll 等下一个边沿
+        if int.events & EPOLLEXCLUSIVE != 0
             && let Some(file) = int.file.upgrade()
         {
             let f = file.borrow();
-            f.exclusive_claim.set(Some(edge(&f)));
+            f.exclusive_claim.set(Some((edge(&f), owner)));
         }
         self.cursor = i + 1;
     }
@@ -778,6 +894,9 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     {
         return Err(Errno::EINVAL);
     }
+    if op != EPOLL_CTL_DEL && events & (EPOLLET | EPOLLEXCLUSIVE) != 0 {
+        watch_host_edges(&file);
+    }
     let mut ep = ep.borrow_mut();
     ep.interests.retain(|i| i.file.strong_count() > 0);
     let pos = ep
@@ -808,6 +927,22 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         }
         (EPOLL_CTL_MOD | EPOLL_CTL_DEL, None) => Err(Errno::ENOENT),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 边沿触发、独占的关注要知道宿主 fd 上新到的数据：第一次时建立 [`HostEdges`]。宿主
+/// 不让 epoll 的 fd（宿主上的普通文件）建不了，仍然只看程序有没有用完数据。
+fn watch_host_edges(file: &FileRef) {
+    let mut f = file.borrow_mut();
+    if f.host_edges.is_some() {
+        return;
+    }
+    let Some(fd) = host_fd(&f) else {
+        return;
+    };
+    match HostEdges::new(fd) {
+        Ok(e) => f.host_edges = Some(e),
+        Err(e) => crate::debug::log(format_args!("epoll: host fd {fd}: edges: errno {e}")),
     }
 }
 
@@ -881,6 +1016,8 @@ pub(super) fn eventfd2(cx: &mut Cx<'_>, initval: u32, flags: u32) -> SysResult {
     let efd = EventFd {
         count: initval as u64,
         semaphore: flags & EFD_SEMAPHORE != 0,
+        writes: 0,
+        reads: 0,
     };
     let file = OpenFile::new(
         FileKind::EventFd(Rc::new(RefCell::new(efd))),
@@ -907,6 +1044,7 @@ pub(super) fn eventfd_read(
             if e.count > 0 {
                 let v = if e.semaphore { 1 } else { e.count };
                 e.count -= v;
+                e.reads += 1;
                 buf[..8].copy_from_slice(&v.to_le_bytes());
                 request_wake_files();
                 return Ok(8);
@@ -941,6 +1079,7 @@ pub(super) fn eventfd_write(
             let mut e = efd.borrow_mut();
             if e.count.checked_add(v).is_some_and(|c| c < u64::MAX) {
                 e.count += v;
+                e.writes += 1;
                 request_wake_files();
                 return Ok(8);
             }
@@ -964,6 +1103,8 @@ mod tests {
         let efd = Rc::new(RefCell::new(EventFd {
             count: 0,
             semaphore: false,
+            writes: 0,
+            reads: 0,
         }));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         let both = (POLLIN | POLLOUT) as u32;
@@ -1005,10 +1146,92 @@ mod tests {
     }
 
     #[test]
+    fn edge_triggered_interests_fire_on_every_arrival() {
+        let efd = Rc::new(RefCell::new(EventFd {
+            count: 0,
+            semaphore: false,
+            writes: 0,
+            reads: 0,
+        }));
+        let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
+        let mut ep = Epoll::default();
+        ep.interests
+            .push(Interest::new(3, &file, POLLIN as u32 | EPOLLET, 0));
+        let write = |n| {
+            let mut e = efd.borrow_mut();
+            e.count += n;
+            e.writes += 1;
+        };
+        write(1);
+        assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
+        ep.reported(0, POLLIN as u32);
+        assert!(ep.ready(0, 8).is_empty());
+        // 计数没有读走又写了一次（mio 的唤醒器）：再报告一次
+        write(1);
+        assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
+        ep.reported(0, POLLIN as u32);
+        assert!(ep.ready(0, 8).is_empty());
+        // 等待时不等仍然就绪的位，但要被叫醒（边沿触发的等待者）
+        let mut waits = Waits::default();
+        waits.add_epoll(&ep, 0);
+        assert!(waits.edge);
+        // 写零也算一次（Linux 照样唤醒）
+        write(0);
+        assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
+    }
+
+    #[test]
+    fn exclusive_interests_report_each_edge_to_one_epoll() {
+        let efd = Rc::new(RefCell::new(EventFd {
+            count: 0,
+            semaphore: false,
+            writes: 0,
+            reads: 0,
+        }));
+        let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
+        let new = || {
+            let mut ep = Epoll::default();
+            ep.interests
+                .push(Interest::new(3, &file, POLLIN as u32 | EPOLLEXCLUSIVE, 0));
+            ep
+        };
+        let (mut a, mut b) = (new(), new());
+        let write = || {
+            let mut e = efd.borrow_mut();
+            e.count += 1;
+            e.writes += 1;
+        };
+        write();
+        assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
+        a.reported(0, POLLIN as u32);
+        // 水平触发：报告过的 epoll 只要仍然就绪就接着报告，别的 epoll 等下一个边沿
+        assert!(b.ready(0, 8).is_empty());
+        assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
+        let mut waits = Waits::default();
+        waits.add_epoll(&b, 0);
+        assert!(waits.edge);
+        // 又来了数据：轮到先检查的那个
+        write();
+        assert_eq!(b.ready(0, 8), vec![(0, POLLIN as u32)]);
+        b.reported(0, POLLIN as u32);
+        assert!(a.ready(0, 8).is_empty());
+        // 读空之后再来：仍然只报告给一个
+        efd.borrow_mut().count = 0;
+        file.borrow_mut().drained[0] += 1;
+        assert!(a.ready(0, 8).is_empty() && b.ready(0, 8).is_empty());
+        write();
+        assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
+        a.reported(0, POLLIN as u32);
+        assert!(b.ready(0, 8).is_empty());
+    }
+
+    #[test]
     fn eventfd_readiness_and_epoll_oneshot() {
         let efd = Rc::new(RefCell::new(EventFd {
             count: 0,
             semaphore: false,
+            writes: 0,
+            reads: 0,
         }));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
         assert_eq!(poll_now(&file.borrow(), POLLIN | POLLOUT, 0), POLLOUT);
