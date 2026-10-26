@@ -153,6 +153,9 @@ pub struct OpenFile {
     /// 用文件位置的一次读写正在不持 BKL 地进行（相当于 Linux 的 f_pos_lock，见
     /// `syscall::fs` 的 `unlocked_io`）：0 没有，1 有，2 有并且还有线程在等它。
     pub pos_busy: u8,
+    /// 加过 flock、OFD 锁或者租约：它们以打开文件为持有者，关闭时随之释放，等锁的线程
+    /// 要重新检查。
+    pub holds_locks: bool,
 }
 
 impl OpenFile {
@@ -174,6 +177,7 @@ impl OpenFile {
             reads: 0,
             exclusive_claim: std::cell::Cell::new(None),
             pos_busy: 0,
+            holds_locks: false,
             watch: None,
         }))
     }
@@ -223,9 +227,26 @@ impl OpenFile {
 }
 
 impl Drop for OpenFile {
-    /// 最后一个引用消失：等在它上面的线程（flock、epoll）要重新检查。
+    /// 最后一个引用消失：等在它上面的线程（flock、socket 和 PTY 的另一方、epoll）要重新
+    /// 检查。管道的另一端由 `PipeEnd` 叫醒（只叫醒等这个管道的），普通文件、目录这类
+    /// 没有锁的文件没有线程在等它关闭：shell 每次 exec、退出都要关好几个文件，原来每关一个
+    /// 都把读着管道的进程叫醒一遍。
     fn drop(&mut self) {
-        crate::kernel::request_wake_files();
+        let quiet = matches!(
+            self.kind,
+            FileKind::Host(_)
+                | FileKind::Regular { .. }
+                | FileKind::Directory { .. }
+                | FileKind::Path(_)
+                | FileKind::Pipe(_)
+                | FileKind::Device { .. }
+                | FileKind::EventFd(_)
+                | FileKind::TimerFd(_)
+                | FileKind::Proc { .. }
+        );
+        if self.holds_locks || !quiet {
+            crate::kernel::request_wake_files();
+        }
     }
 }
 

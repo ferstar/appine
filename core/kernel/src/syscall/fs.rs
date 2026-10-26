@@ -14,7 +14,7 @@ use super::{IO_CHUNK, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, Kernel, Tid, request_wake_files};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_files, request_wake_object};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -813,7 +813,7 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
             if cx.interrupted() {
                 return Err(Errno::ERESTARTSYS);
             }
-            cx.wait(None, &mut [])?;
+            cx.wait_object(crate::pipe::object(&pipe))?;
         }
     }
     Ok(FileKind::Pipe(end))
@@ -1200,6 +1200,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
         (ino, start as u64, end)
     };
     let owner = if ofd {
+        file.borrow_mut().holds_locks = true;
         Owner::Ofd(Rc::downgrade(file))
     } else {
         Owner::Posix(Rc::downgrade(&cx.t.fds))
@@ -2383,6 +2384,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         if !conflict {
             locks.retain(|(f, _)| !f.ptr_eq(&me));
             locks.push((me, exclusive));
+            file.borrow_mut().holds_locks = true;
             return Ok(0);
         }
         if op & LOCK_NB != 0 {
@@ -2684,7 +2686,7 @@ fn pipe_read(
                 for (d, s) in buf.iter_mut().zip(p.buf.drain(..n)) {
                     *d = s;
                 }
-                request_wake_files();
+                request_wake_object(crate::pipe::object(pipe));
                 return Ok(n);
             }
             if p.writers == 0 {
@@ -2697,7 +2699,7 @@ fn pipe_read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_object(crate::pipe::object(pipe))?;
     }
 }
 
@@ -2723,7 +2725,7 @@ fn pipe_wait_data(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_object(crate::pipe::object(pipe))?;
     }
 }
 
@@ -2797,7 +2799,7 @@ pub(super) fn splice(
         let data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
         let n = write_bytes(cx, &output, &data, dst)?;
         pipe.borrow_mut().buf.drain(..n);
-        request_wake_files();
+        request_wake_object(crate::pipe::object(&pipe));
         n
     } else {
         let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
@@ -2873,7 +2875,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_object(crate::pipe::object(&pipe))?;
     };
     let mut data = Vec::new();
     for (base, len) in iovecs {
@@ -2886,7 +2888,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
         }
     }
     pipe.borrow_mut().buf.extend(&data);
-    request_wake_files();
+    request_wake_object(crate::pipe::object(&pipe));
     Ok(data.len() as u64)
 }
 
@@ -2919,7 +2921,7 @@ fn pipe_write(
                 let n = want.min(space);
                 p.buf.extend(&data[done..done + n]);
                 done += n;
-                request_wake_files();
+                request_wake_object(crate::pipe::object(pipe));
                 true
             } else {
                 false
@@ -2939,7 +2941,7 @@ fn pipe_write(
             };
             return if done > 0 { Ok(done) } else { Err(e) };
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_object(crate::pipe::object(pipe))?;
     }
 }
 

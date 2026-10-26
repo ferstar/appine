@@ -231,7 +231,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &Cpu, args: CloneArgs) -> SysResult {
     } else {
         // 先让同一地址空间里的其他线程停下来，复制出来的才是 fork 那一刻的快照
         cx.mm().quiesce(&cx.task.sync);
-        Rc::new(RefCell::new(cx.mm_mut().fork()?))
+        cx.mm_mut().fork()?
     };
     let fds = if flags & CLONE_FILES != 0 {
         cx.t.fds.clone()
@@ -663,7 +663,7 @@ fn exec(
     let task = cx.task.clone();
     let (k, t) = cx.parts();
     task::release_mm(k, &task, t);
-    let mm = Rc::new(RefCell::new(mm));
+    let mm = mm.into_shared();
     mm.borrow_mut().add_user(task.sync.clone());
     // SAFETY: 新的地址空间由 TaskState 持有；旧的可能随这次赋值释放，cpu 已经不再使用它
     unsafe { cpu.reset(mm.borrow().mmu()) };
@@ -841,8 +841,8 @@ fn wait_child(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        // 子进程的状态变化不是打开文件上的修改（crate::kernel::wake）
-        cx.wait_on(None, &mut [], crate::kernel::wake::OTHER)?;
+        // 只有子进程的状态变化（和直接通知的信号）会让这里的条件成立（crate::kernel::wake）
+        cx.wait_on(None, &mut [], crate::kernel::wake::CHILD)?;
     }
 }
 

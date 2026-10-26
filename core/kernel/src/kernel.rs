@@ -49,13 +49,27 @@ pub(crate) const UTS_LEN: usize = 64;
 pub(crate) mod wake {
     /// 文件、管道、socket、文件锁这类打开文件上的修改。
     pub const FILE: u32 = 1;
-    /// 其余一切：子进程的状态、定时器的设置、信号等。
+    /// 其余一切：定时器的设置、信号等。
     pub const OTHER: u32 = 2;
-    pub const ALL: u32 = FILE | OTHER;
+    /// 子进程的状态变化（结束、停止、继续）：wait4、waitid 只听它。
+    pub const CHILD: u32 = 4;
+    /// 宿主在等的进程（[`crate::Machine::spawn`] 启动的）结束了：`Machine::wait` 只听它。
+    pub const WATCHED: u32 = 8;
+    /// 有线程结束了（execve 在等别的线程结束，关闭时在等所有线程结束）。
+    pub const EXITED: u32 = 16;
+    pub const ALL: u32 = FILE | OTHER | CHILD | WATCHED | EXITED;
+    /// 有只影响某些对象的修改（[`super::request_wake_object`]），不是等待者关心的通道。
+    pub(super) const OBJECTS: u32 = 1 << 31;
+
+    /// 等待者等的对象（管道）：对象的地址。
+    pub type Object = usize;
 }
 
 /// 释放 BKL 时要叫醒的通道。
 static WAKE: AtomicU32 = AtomicU32::new(0);
+
+/// 释放 BKL 时要叫醒的对象（[`request_wake_object`]）。
+static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
 
 /// 请求在释放 BKL 时唤醒所有等待中的线程。调用方持有 BKL。
 pub(crate) fn request_wake() {
@@ -65,7 +79,25 @@ pub(crate) fn request_wake() {
 /// 只影响打开文件的修改（关闭文件、读写管道、释放文件锁等）：只叫醒关心
 /// [`wake::FILE`] 的等待者。调用方持有 BKL。
 pub(crate) fn request_wake_files() {
-    WAKE.fetch_or(wake::FILE, Ordering::Relaxed);
+    request_wake_on(wake::FILE);
+}
+
+/// 请求在释放 BKL 时叫醒关心 `channels`（[`wake`]）里任何一个通道的等待者。调用方持有
+/// BKL。
+pub(crate) fn request_wake_on(channels: u32) {
+    WAKE.fetch_or(channels, Ordering::Relaxed);
+}
+
+/// 只影响对象 `object` 的修改（管道里的数据、管道两端的打开和关闭）：只叫醒等这个对象的
+/// 等待者（[`Cx::wait_object`]），以及没有指明对象的 [`wake::FILE`] 等待者（poll、epoll）。
+/// 原来 shell 的每次管道读写都把读着别的管道的进程（`$(...)` 外面的 shell、`tail`）
+/// 叫醒一遍。调用方持有 BKL。
+pub(crate) fn request_wake_object(object: wake::Object) {
+    let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if !objects.contains(&object) {
+        objects.push(object);
+    }
+    WAKE.fetch_or(wake::OBJECTS, Ordering::Relaxed);
 }
 
 /// 持有 flock(2) 锁的打开文件（弱引用，关闭后锁随之释放），以及是不是排他锁。
@@ -127,8 +159,8 @@ pub(crate) struct Kernel {
     /// App 内存的上限和 OOM killer（[`crate::oom`]）。
     pub oom: crate::oom::Oom,
     next_tid: Tid,
-    /// 正在等待的线程的事件和它关心的通道（[`wake`]）。
-    waiters: Vec<(Arc<Event>, u32)>,
+    /// 正在等待的线程的事件、它关心的通道（[`wake`]）和它等的对象。
+    waiters: Vec<(Arc<Event>, u32, Option<wake::Object>)>,
     /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
     pub edge_waiters: Vec<Arc<Event>>,
     /// 设置了 `O_ASYNC` 的打开文件（`syscall::poll` 的 fasync）。
@@ -254,13 +286,20 @@ impl Kernel {
 
     fn flush_wakeups(&self) {
         let channels = WAKE.swap(0, Ordering::AcqRel);
-        if channels != 0 {
-            for (event, interest) in &self.waiters {
-                if interest & channels != 0 {
-                    event.signal();
-                }
+        if channels == 0 {
+            return;
+        }
+        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
+        for (event, interest, object) in &self.waiters {
+            let hit = interest & channels & wake::ALL != 0
+                || interest & wake::FILE != 0
+                    && !objects.is_empty()
+                    && object.is_none_or(|o| objects.contains(&o));
+            if hit {
+                event.signal();
             }
         }
+        objects.clear();
     }
 }
 
@@ -348,16 +387,30 @@ impl Drop for Bkl<'_> {
 /// `event` 才会醒（futex）。
 pub(crate) fn block<'a>(
     shared: &'a Shared,
-    mut k: Bkl<'a>,
+    k: Bkl<'a>,
     event: &Arc<Event>,
     deadline: Option<Instant>,
     host: &mut [(i32, i16, i16)],
     interest: u32,
 ) -> (Bkl<'a>, Result<(), Errno>) {
+    block_for(shared, k, event, deadline, host, interest, None)
+}
+
+/// [`block`]；`object` 不为 None 时，只影响别的对象的修改（[`request_wake_object`]）
+/// 不叫醒它。
+fn block_for<'a>(
+    shared: &'a Shared,
+    mut k: Bkl<'a>,
+    event: &Arc<Event>,
+    deadline: Option<Instant>,
+    host: &mut [(i32, i16, i16)],
+    interest: u32,
+    object: Option<wake::Object>,
+) -> (Bkl<'a>, Result<(), Errno>) {
     const POLLIN: i16 = 1;
     let listed = interest != 0;
     if listed {
-        k.waiters.push((event.clone(), interest));
+        k.waiters.push((event.clone(), interest, object));
     }
     drop(k);
     let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
@@ -367,7 +420,7 @@ pub(crate) fn block<'a>(
     let mut k = shared.lock();
     event.clear();
     if listed {
-        k.waiters.retain(|(e, _)| !Arc::ptr_eq(e, event));
+        k.waiters.retain(|(e, ..)| !Arc::ptr_eq(e, event));
     }
     for (h, f) in host.iter_mut().zip(&fds) {
         h.2 = f.2;
@@ -560,9 +613,26 @@ impl<'a> Cx<'a> {
         host: &mut [(i32, i16, i16)],
         interest: u32,
     ) -> Result<(), Errno> {
+        self.wait_for(deadline, host, interest, None)
+    }
+
+    /// 等对象 `object`（管道）上的修改（[`request_wake_object`]、[`request_wake_files`]）、
+    /// 直接的通知或者超时。
+    pub fn wait_object(&mut self, object: wake::Object) -> Result<(), Errno> {
+        self.wait_for(None, &mut [], wake::FILE, Some(object))
+    }
+
+    fn wait_for(
+        &mut self,
+        deadline: Option<Instant>,
+        host: &mut [(i32, i16, i16)],
+        interest: u32,
+        object: Option<wake::Object>,
+    ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
         self.task.sleeping.set(true);
-        let (k, r) = block(self.shared, k, &self.task.event, deadline, host, interest);
+        let event = &self.task.event;
+        let (k, r) = block_for(self.shared, k, event, deadline, host, interest, object);
         self.task.sleeping.set(false);
         self.k = Some(k);
         r

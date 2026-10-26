@@ -143,12 +143,13 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
 /// 线程（-4 到 -10），guest 的忙循环不会拖慢界面。
 const HOST_NICE_FLOOR: i32 = -4;
 
-/// 宿主线程开始运行 guest 线程 `t`：它继承的是创建它的宿主线程的优先级和亲和性，换成
-/// `t` 自己的。
-pub(crate) fn host_started(t: &Task) {
+/// 宿主线程开始运行 guest 线程 `t`：它继承的是创建它的宿主线程的优先级和亲和性（`reused`
+/// 时是上一个 guest 线程的），换成 `t` 自己的。
+pub(crate) fn host_started(t: &Task, reused: bool) {
     apply_host(t);
     let mask = t.affinity.get() & online_cpus();
-    if mask != online_cpus() {
+    // 线程池里复用的宿主线程还留着上一个 guest 线程的亲和性
+    if mask != online_cpus() || reused {
         appine_hal::set_thread_affinity(t.host_tid.get(), mask);
     }
 }

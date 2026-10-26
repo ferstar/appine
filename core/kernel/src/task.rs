@@ -10,13 +10,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE};
+use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE, prot};
 use appine_hal::Event;
 
 use crate::bug::Trap;
 use crate::errno::Errno;
 use crate::fd::FdTable;
-use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake};
+use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake, request_wake_on, wake};
 use crate::mm::{Generations, Mm};
 use crate::process::{CpuTime, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
@@ -90,6 +90,9 @@ pub(crate) struct Task {
     pub res: RefCell<TaskRes>,
     /// 宿主线程的 CPU 时间时钟。
     pub clock: Cell<Option<i32>>,
+    /// 线程开始时宿主线程已经用掉的 CPU 时间和其中的内核态时间（纳秒）：宿主线程可能
+    /// 是线程池留下来的，跑过别的 guest 线程（[`pool`]）。
+    pub cpu_base: Cell<(u64, u64)>,
     /// 宿主线程的 tid（读宿主记的内核态时间）。
     pub host_tid: Cell<i32>,
     /// 只有线程自己访问的状态。
@@ -157,6 +160,7 @@ impl Task {
             event: Arc::new(event),
             res: RefCell::new(res),
             clock: Cell::new(None),
+            cpu_base: Cell::new((0, 0)),
             host_tid: Cell::new(0),
             state: RefCell::new(state),
         }))
@@ -164,17 +168,35 @@ impl Task {
 
     /// 线程用掉的 CPU 时间（纳秒），以宿主线程的 CPU 时间计。
     pub fn cpu_ns(&self) -> u64 {
+        self.host_cpu_ns().saturating_sub(self.cpu_base.get().0)
+    }
+
+    /// 宿主线程总共用掉的 CPU 时间（纳秒）。
+    fn host_cpu_ns(&self) -> u64 {
         self.clock
             .get()
             .and_then(|c| appine_hal::clock_gettime(c).ok())
             .map_or(0, |(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
     }
 
+    /// 由线程自己调用的 [`Task::cpu`]：内核态时间用 getrusage 取，不必读 /proc（线程
+    /// 结束时原来占了五分之一）。
+    pub fn cpu_self(&self) -> CpuTime {
+        let total_ns = self.cpu_ns();
+        let sys_ns = appine_hal::thread_system_ns_self().saturating_sub(self.cpu_base.get().1);
+        CpuTime {
+            total_ns,
+            sys_ns: sys_ns.min(total_ns),
+        }
+    }
+
     /// 线程用掉的 CPU 时间，分出内核态：宿主内核替这个宿主线程干活的时间（转发的
     /// I/O、缺页等）。内核层自己在宿主用户态做的事情算不进去，所以偏少。
     pub fn cpu(&self) -> CpuTime {
         let total_ns = self.cpu_ns();
-        let sys_ns = appine_hal::thread_system_ns(self.host_tid.get()).unwrap_or(0);
+        let sys_ns = appine_hal::thread_system_ns(self.host_tid.get())
+            .unwrap_or(0)
+            .saturating_sub(self.cpu_base.get().1);
         CpuTime {
             total_ns,
             sys_ns: sys_ns.min(total_ns),
@@ -192,12 +214,13 @@ pub(crate) fn start(
 ) -> Result<(), Errno> {
     let tid = task.tid.get();
     let thread_shared = shared.clone();
-    // 不保留 JoinHandle：线程退出时它的宿主资源就释放了。会话结束时等的是
-    // kernel.tasks 变空，线程在那之后只剩释放自己的 Cpu 和翻译缓存
-    std::thread::Builder::new()
-        .name(format!("guest-{tid}"))
-        .spawn(move || thread_main(thread_shared, tid, cpu))
-        .map_err(|_| Errno::EAGAIN)?;
+    // 不保留 JoinHandle：会话结束时等的是 kernel.tasks 变空，线程在那之后只剩释放自己的
+    // Cpu 和翻译缓存
+    pool::spawn(Box::new(move |reused| {
+        appine_hal::set_thread_name(&format!("guest-{tid}"));
+        thread_main(thread_shared, tid, cpu, reused)
+    }))
+    .map_err(|_| Errno::EAGAIN)?;
     {
         let st = task.state.borrow();
         st.group.borrow_mut().threads.push(tid);
@@ -207,8 +230,79 @@ pub(crate) fn start(
     Ok(())
 }
 
-fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu) {
-    let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu)));
+/// 宿主线程池：guest 线程结束之后，它的宿主线程留一会儿给下一个 guest 线程用。fork 的
+/// 时间原来有四分之一花在新建宿主线程上（内核栈、线程栈、TLS），线程结束时还要拆掉。
+pub(crate) mod pool {
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// 参数是这个宿主线程有没有跑过别的 guest 线程（亲和性这类宿主线程的设置要重新设置）。
+    type Job = Box<dyn FnOnce(bool) + Send>;
+
+    struct Pool {
+        jobs: VecDeque<Job>,
+        idle: usize,
+    }
+
+    static POOL: Mutex<Pool> = Mutex::new(Pool {
+        jobs: VecDeque::new(),
+        idle: 0,
+    });
+    static READY: Condvar = Condvar::new();
+
+    /// 最多留着几个空闲的宿主线程。
+    const MAX_IDLE: usize = 8;
+    /// 空闲的宿主线程留多久。
+    const LINGER: Duration = Duration::from_secs(5);
+
+    /// 在一个宿主线程上运行 `job`：有空闲的就交给它，没有就新建一个。`job` 不能 panic。
+    pub fn spawn(job: Job) -> std::io::Result<()> {
+        let mut p = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        if p.idle > p.jobs.len() {
+            p.jobs.push_back(job);
+            READY.notify_one();
+            return Ok(());
+        }
+        drop(p);
+        std::thread::Builder::new()
+            .name("guest".into())
+            .spawn(move || worker(job))
+            .map(drop)
+    }
+
+    fn worker(mut job: Job) {
+        let mut reused = false;
+        loop {
+            job(reused);
+            let mut p = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+            if p.idle >= MAX_IDLE {
+                return;
+            }
+            p.idle += 1;
+            let deadline = Instant::now() + LINGER;
+            job = loop {
+                if let Some(j) = p.jobs.pop_front() {
+                    p.idle -= 1;
+                    break j;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    p.idle -= 1;
+                    return;
+                }
+                p = READY
+                    .wait_timeout(p, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            };
+            reused = true;
+        }
+    }
+}
+
+fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu, reused)));
     if r.is_err() {
         // 内核层的 bug，而且不在兜住的地方（crate::bug）：线程找不到自己，或者出错之后的
         // 收拾本身又出了错。BKL 保护的状态可能已经不一致，不能让其他线程继续
@@ -217,15 +311,18 @@ fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu) {
     }
 }
 
-fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu) {
+/// `reused`：宿主线程跑过别的 guest 线程（[`pool`]）。
+fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     let k = shared.lock();
     let task = k.tasks[&tid].clone();
     // 线程开始时的 bug 和进入内核时的一样只结束这个进程（crate::bug）
     let started = crate::bug::catch(|| {
         crate::bug::trap(Trap::Start, task.tgid);
         task.clock.set(appine_hal::thread_cpu_clock());
+        task.cpu_base
+            .set((task.host_cpu_ns(), appine_hal::thread_system_ns_self()));
         task.host_tid.set(appine_hal::gettid());
-        crate::syscall::host_started(&task);
+        crate::syscall::host_started(&task, reused);
         task.state.borrow().mm.borrow().generations()
     });
     let Some(mut generations) = started else {
@@ -391,6 +488,20 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             access,
             kind: FaultKind::Page,
         } => {
+            // fork 之后写时复制的页：换成可写的，重新执行
+            if access == Access::Write && cx.mm().cow_break(addr) {
+                return signal::deliver(cx, cpu, false);
+            }
+            // 等 BKL 的时候页表可能已经改好了（借用方还回了写时复制的页、别的线程
+            // mprotect），与 Linux 一样重新执行。引擎报告的是出错的那一页（跨页时是后一页）
+            let need = match access {
+                Access::Exec => prot::EXEC,
+                Access::Read => prot::READ,
+                Access::Write => prot::WRITE,
+            };
+            if cx.mm().mmu().translate(addr, need).is_some() {
+                return signal::deliver(cx, cpu, false);
+            }
             let (ec, wnr) = match access {
                 Access::Exec => (EC_IABT_LOW, 0),
                 Access::Read => (EC_DABT_LOW, 0),
@@ -494,7 +605,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, pc: u64, stats: Option<DbtStats>) 
             let total = k.dbt_stats.get_or_insert_with(DbtStats::default);
             add_stats(total, &s);
         }
-        let cpu = task.cpu();
+        let cpu = task.cpu_self();
         k.cpu += cpu;
         group.borrow_mut().cpu += cpu;
         let mut st = task.state.borrow_mut();
@@ -540,7 +651,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, pc: u64, stats: Option<DbtStats>) 
     {
         failed(&k, "collecting unix sockets");
     }
-    request_wake();
+    // 子进程的状态变化由 finish_group 另外请求（wake::CHILD），vfork 的父进程由
+    // release_mm 叫醒，关闭文件的各自请求；这里只叫醒等线程结束的（execve、关闭）
+    request_wake_on(wake::EXITED);
 }
 
 fn add_stats(total: &mut DbtStats, s: &DbtStats) {

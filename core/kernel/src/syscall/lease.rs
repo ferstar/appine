@@ -144,12 +144,15 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
             }
             request_wake();
         }
-        None => list.push(Lease {
-            file: Rc::downgrade(file),
-            fd,
-            ty: arg,
-            breaking: None,
-        }),
+        None => {
+            file.borrow_mut().holds_locks = true;
+            list.push(Lease {
+                file: Rc::downgrade(file),
+                fd,
+                ty: arg,
+                breaking: None,
+            });
+        }
     }
     // 与 Linux 一样，打破时的信号发给设置租约的进程
     file.borrow_mut().owner = (1, tgid);

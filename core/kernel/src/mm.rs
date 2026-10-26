@@ -14,13 +14,24 @@
 //! `ic ivau` 声明修改了代码，这些范围记进 [`CodeLog`] 并递增代码代数；每个线程
 //! 按自己错过的范围逐页作废翻译。
 //!
-//! fork 按设计文档 §5.3 v1 整份复制：私有映射拷贝一份，共享映射与子进程共用。
+//! fork 时私有匿名内存写时复制（设计文档 §5.3），其余的私有映射拷贝一份，共享映射与
+//! 子进程共用。写时复制按页进行：fork 时写过的页不复制，父子进程的页表都指向父进程的
+//! 宿主页、去掉写权限。宿主页在它的 VMA 里的一方是拥有者，它把页借出；别的地址空间借用。
+//! - 借用方要写时复制一份到自己 VMA 里对应的位置（[`Mm::materialize`]）。
+//! - 拥有者要写、解除映射、搬走或者丢弃借出的页之前，先让每个借用方复制自己的一份
+//!   （[`Mm::recall`]）。
+//! - 拥有者的地址空间销毁时页留给借用方（孤儿页，谁也不能再写），它持有那段宿主内存。
+//! - 最后一个借用方还回来时，拥有者的页表项马上恢复写权限：shell fork 之后子进程马上
+//!   exec，父进程不必为此缺页。
+//!
+//! 页表项改指别处之前，使用这个地址空间的线程要先刷新 TLB（[`Mm::shootdown`]）；只是
+//! 恢复写权限不必。
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -216,6 +227,112 @@ pub struct CodeSpace {
     pub seen: Mutex<u64>,
 }
 
+/// 地址空间的句柄（[`Mm::into_shared`]）：写时复制时同一个 fork 家族的地址空间经由它
+/// 找到对方。
+type MmRef = Weak<RefCell<Mm>>;
+
+/// 一个借出的宿主页。
+struct Loan {
+    /// 拥有者和页在它那里的 guest 地址；拥有者的地址空间销毁之后是 None（孤儿页）。
+    owner: Option<(MmRef, u64)>,
+    /// 借用方和页在它那里的 guest 地址。通常只有一个（fork 出来的子进程），它不另外分配：
+    /// 大进程 fork 时每页都有一条记录。
+    first: Option<(MmRef, u64)>,
+    others: Vec<(MmRef, u64)>,
+}
+
+impl Loan {
+    fn new(owner: Option<(MmRef, u64)>, borrower: (MmRef, u64)) -> Loan {
+        Loan {
+            owner,
+            first: Some(borrower),
+            others: Vec::new(),
+        }
+    }
+
+    fn lend(&mut self, borrower: (MmRef, u64)) {
+        match self.first {
+            None => self.first = Some(borrower),
+            Some(_) => self.others.push(borrower),
+        }
+    }
+
+    /// 去掉借用方 `mm`（页在它那里的地址是 `page`），返回还有没有别的借用方。
+    fn give_back(&mut self, mm: &MmRef, page: u64) -> bool {
+        let it = |(m, a): &(MmRef, u64)| *a == page && m.ptr_eq(mm);
+        if self.first.as_ref().is_some_and(it) {
+            self.first = self.others.pop();
+        } else {
+            self.others.retain(|b| !it(b));
+        }
+        self.first.is_some()
+    }
+
+    fn borrowers(self) -> impl Iterator<Item = (MmRef, u64)> {
+        self.first.into_iter().chain(self.others)
+    }
+}
+
+/// 宿主页地址的哈希：按页对齐的地址去掉低位再乘一个奇数常数就足够分散。默认的 SipHash
+/// 在大进程 fork 时占一成多。
+#[derive(Default, Clone, Copy)]
+struct PageHasher(u64);
+
+impl std::hash::Hasher for PageHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (n as u64 >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// 同一个 fork 家族共用的借出记录，键是宿主页的地址。
+type Loans = Rc<RefCell<HashMap<usize, Loan, std::hash::BuildHasherDefault<PageHasher>>>>;
+
+/// 页表里连续的一段：guest 地址、宿主地址、长度。逐页改页表项之前先接成段。
+#[derive(Default)]
+struct Runs {
+    runs: Vec<(u64, usize, u64)>,
+}
+
+impl Runs {
+    fn push(&mut self, page: u64, host: NonNull<u8>) {
+        let host = host.as_ptr() as usize;
+        if let Some((g, h, len)) = self.runs.last_mut()
+            && *g + *len == page
+            && *h + *len as usize == host
+        {
+            *len += PAGE_SIZE;
+            return;
+        }
+        self.runs.push((page, host, PAGE_SIZE));
+    }
+}
+
+/// 借来的页。
+struct Borrowed {
+    host: NonNull<u8>,
+    /// 持有那段宿主内存：拥有者解除映射、销毁之后它也不会释放。
+    region: Rc<HostRegion>,
+}
+
+/// 一个地址空间里写时复制的页（guest 地址）。只在私有匿名映射里。
+#[derive(Default)]
+struct Cow {
+    /// 借出的页：页表项没有写权限。
+    lent: BTreeSet<u64>,
+    /// 借来的页：页表项指向拥有者的宿主页，没有写权限。
+    borrowed: BTreeMap<u64, Borrowed>,
+}
+
 /// 一个 guest 进程的地址空间。
 pub struct Mm {
     // 字段按声明顺序析构：先销毁页表，再释放它指向的宿主内存。
@@ -259,6 +376,12 @@ pub struct Mm {
     start_stack: u64,
     /// 主线程栈目前的底部；还没有栈时是 0。
     stack_low: u64,
+    /// 写时复制的页和同一个 fork 家族共用的借出记录（模块文档）。只在持有 BKL 时访问，
+    /// 也会经由别的地址空间的共享借用修改，所以放在 RefCell 里。
+    cow: RefCell<Cow>,
+    loans: Loans,
+    /// 自己的句柄，借出页时记下（[`Mm::into_shared`]）。
+    me: MmRef,
 }
 
 /// `/proc/<pid>/maps` 的一行。
@@ -352,7 +475,20 @@ impl Mm {
             mmap_top: STACK_TOP - MIN_GAP,
             start_stack: 0,
             stack_low: 0,
+            cow: RefCell::default(),
+            loans: Rc::default(),
+            me: Weak::new(),
         }
+    }
+
+    /// 放进 `Rc<RefCell<..>>`（`TaskState` 持有的形式），记下自己的句柄：借用方还回最后
+    /// 一个借用时经由它让拥有者恢复写权限。
+    pub fn into_shared(self) -> Rc<RefCell<Mm>> {
+        Rc::new_cyclic(|me| {
+            let mut mm = self;
+            mm.me = me.clone();
+            RefCell::new(mm)
+        })
     }
 
     /// 按栈大小的上限 `stack_limit`（execve 时的 `RLIMIT_STACK`）定下 mmap 分配区的
@@ -373,6 +509,12 @@ impl Mm {
 
     /// `addr` 处 futex 的键；没有映射时返回 None。
     pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
+        // 私有内存的键是宿主地址：借来的页先换成自己的，否则写时复制之后键就变了，等在
+        // 旧键上的线程再也叫不醒；也不会和拥有者那边的键相同
+        let page = addr & !(PAGE_SIZE - 1);
+        if self.cow.borrow().borrowed.contains_key(&page) {
+            self.materialize(page, true);
+        }
         // 与 Linux 相同，futex 的地址必须可读
         let host = self.mmu.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
@@ -1115,6 +1257,8 @@ impl Mm {
 
     /// 把 `[old, old + len)` 里的映射原样搬到 `dst`（宿主内存不动）。
     fn move_range(&mut self, old: u64, len: u64, dst: u64) -> Result<(), Errno> {
+        // 写时复制的页按 guest 地址记录：搬走之前先各自复制
+        self.cow_settle(old, old + len);
         self.split_at(old);
         self.split_at(old + len);
         let starts: Vec<u64> = self.vmas.range(old..old + len).map(|(&s, _)| s).collect();
@@ -1326,6 +1470,15 @@ impl Mm {
             out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
             cursor = stop;
         }
+        // 借来的页在拥有者的宿主内存里
+        for (&page, _) in self
+            .cow
+            .borrow()
+            .borrowed
+            .range(addr & !(PAGE_SIZE - 1)..end)
+        {
+            out[((page - (addr & !(PAGE_SIZE - 1))) / PAGE_SIZE) as usize] = true;
+        }
         Ok(out)
     }
 
@@ -1397,6 +1550,7 @@ impl Mm {
         }
         self.split_at(addr);
         self.split_at(end);
+        let borrowed = self.cow_unmap(addr, end);
         // 页表按页解除映射，所以只处理确实存在的 VMA：guest 传一个覆盖整个地址空间的长度也很快
         let doomed: Vec<(u64, u64)> = self
             .vmas
@@ -1412,6 +1566,7 @@ impl Mm {
             self.graveyard.push(vma.region);
             self.dirty = true;
         }
+        self.give_back(borrowed);
         Ok(())
     }
 
@@ -1449,6 +1604,12 @@ impl Mm {
         self.room_for(self.splits(&[addr, end]))?;
         self.split_at(addr);
         self.split_at(end);
+        // 写时复制的页在下面先拿到新的权限、再去掉写权限：在那之间别的线程不能执行 guest
+        // 代码，否则可能写进借出的页
+        let cow = self.has_cow(addr, end);
+        if cow {
+            self.shootdown();
+        }
         if prot & prot::WRITE != 0 {
             let shared: Vec<u64> = self
                 .vmas
@@ -1482,6 +1643,9 @@ impl Mm {
                 v.written.set(true);
             }
         }
+        if cow {
+            self.cow_protect(addr, end);
+        }
         Ok(())
     }
 
@@ -1505,6 +1669,8 @@ impl Mm {
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((cursor, stop - cursor));
                 }
+                // 借出的页借用方还要用，借来的页要换成自己的（之后读到零）
+                self.cow_settle(cursor, stop);
                 // SAFETY: [cursor, stop) 落在这个 VMA 内，对应的宿主内存是它私有的匿名内存
                 unsafe {
                     discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
@@ -1515,11 +1681,14 @@ impl Mm {
         Ok(())
     }
 
-    /// fork：复制出一个新的地址空间。私有映射逐页拷贝（全零的页跳过，新的匿名
-    /// 内存本来就是零，这样没碰过的栈页不会在子进程里占用内存；私有文件映射只拷贝
-    /// 文件末尾之前的部分）。共享映射和只读的私有文件映射与子进程共用宿主内存。
-    pub fn fork(&mut self) -> Result<Mm, Errno> {
-        let mut child = Mm::new();
+    /// fork：复制出一个新的地址空间。写过的私有匿名映射写时复制（[`Mm::lend`]），没写过
+    /// 的内容全是零，子进程用自己的；可写的私有文件映射逐页拷贝（全零的页跳过，只拷贝
+    /// 文件末尾之前的部分）。共享映射和只读的私有文件映射与子进程共用宿主内存。调用方
+    /// 先让同一地址空间的其他线程停在 guest 代码之外（[`Mm::quiesce`]）。
+    pub fn fork(&mut self) -> Result<Rc<RefCell<Mm>>, Errno> {
+        let shared = Mm::new().into_shared();
+        let mut child = shared.borrow_mut();
+        child.loans = self.loans.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.vdso = self.vdso;
@@ -1535,6 +1704,8 @@ impl Mm {
             .filter(|(_, v)| v.growsdown && v.backing == Backing::Anonymous)
             .map(|(&s, _)| (s, self.spare_below(s)))
             .collect();
+        // 写过的私有匿名映射写时复制：先映射好子进程自己的（全零的）宿主内存，再借给它
+        let mut cow = Vec::new();
         for (&start, v) in self.vmas.iter_mut() {
             let share = match v.backing {
                 Backing::Shared => true,
@@ -1566,15 +1737,9 @@ impl Mm {
                 };
                 let len = v.file_len as usize;
                 if v.backing == Backing::Anonymous && v.written.get() {
-                    // 匿名内存里宿主从没碰过的页一定是零：只看碰过的（malloc 的大块、
-                    // MAP_NORESERVE 的预留常常只碰过一小部分）
-                    let touched = appine_hal::touched_pages(v.host.as_ptr(), len);
-                    // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
-                    unsafe {
-                        copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), len, touched.as_deref())
-                    };
+                    cow.push(start);
                 } else if v.backing != Backing::Anonymous {
-                    // SAFETY: 同上
+                    // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
                     unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), len, None) };
                 }
                 (region, host)
@@ -1592,7 +1757,19 @@ impl Mm {
             c.growsdown = v.growsdown;
             child.trim_to_file(start)?;
         }
-        Ok(child)
+        let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
+        for start in cow {
+            // 自己的页表项去掉了写权限：其他线程（已经停在 guest 代码之外）的 TLB 要刷新
+            self.dirty |= self.lend(start, &child, &mut borrowed, &mut lent);
+        }
+        // 都是按地址顺序放进去的，一次建好
+        child.cow.get_mut().borrowed = borrowed.into_iter().collect();
+        self.cow
+            .get_mut()
+            .lent
+            .append(&mut lent.into_iter().collect());
+        drop(child);
+        Ok(shared)
     }
 
     /// 给一个和别的地址空间共用宿主内存的私有文件映射复制一份自己的。
@@ -1798,6 +1975,10 @@ impl Mm {
                 }
             }
         }
+        // 借来的页驻留，但不是只映射了一次
+        for (&page, _) in self.cow.borrow().borrowed.range(addr..end) {
+            out[((page - addr) / PAGE_SIZE) as usize] = PRESENT;
+        }
         out
     }
 
@@ -1809,11 +1990,14 @@ impl Mm {
     /// 驻留在宿主内存里的 4K 页数。没写过的匿名映射跳过：读它只会映射到零页，Linux 的
     /// RSS 也不算零页。
     pub fn resident_pages(&self) -> u64 {
+        // 借来的页与 Linux 上写时复制的页一样算在里面
+        let borrowed = self.cow.borrow().borrowed.len() as u64;
         self.vmas
             .values()
             .filter(|v| v.backing != Backing::Anonymous || v.written.get())
             .map(|v| appine_hal::resident_pages(v.host.as_ptr(), v.len as usize) as u64)
-            .sum()
+            .sum::<u64>()
+            + borrowed
     }
 
     /// 测试钩子（[`crate::bug`]）：让 `addr` 所在的页在页表里指向一个不能访问的宿主页，
@@ -1971,6 +2155,9 @@ impl Mm {
     /// 所以按 VMA 找宿主内存：`PROT_NONE` 的页不在页表里。文件映射超出文件末尾的部分
     /// 不能写。
     pub(crate) fn write_kernel(&self, addr: u64, data: &[u8]) -> Result<(), Errno> {
+        // 直接写 VMA 自己的宿主内存：写时复制的页先换成自己的
+        let end = page_up(addr.saturating_add(data.len() as u64)).unwrap_or(u64::MAX);
+        self.cow_settle(addr & !(PAGE_SIZE - 1), end);
         let mut done = 0;
         while done < data.len() {
             let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
@@ -2008,14 +2195,373 @@ impl Mm {
             let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
             let page_left = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
             let chunk = page_left.min(len - done);
-            let host = self
-                .mmu
-                .translate(cur, required_prot)
-                .ok_or(Errno::EFAULT)?;
+            let host = match self.mmu.translate(cur, required_prot) {
+                Some(host) => host,
+                // 写时复制的页：先换成可写的（Mm::cow_break）
+                None if required_prot & prot::WRITE != 0 && self.cow_break(cur) => self
+                    .mmu
+                    .translate(cur, required_prot)
+                    .ok_or(Errno::EFAULT)?,
+                None => return Err(Errno::EFAULT),
+            };
             f(host.as_ptr(), done, chunk);
             done += chunk;
         }
         Ok(())
+    }
+}
+
+/// 写时复制（模块文档、设计文档 §5.3）。经由共享借用进行：内核往 guest 内存写的时候
+/// 只有 `&Mm`，拥有者收回页时也要改借用方的页表。
+impl Mm {
+    /// 页 `page` 所在的私有匿名 VMA 和它的起点。
+    fn anon_vma(&self, page: u64) -> Option<(u64, &Vma)> {
+        let (&s, v) = self.vmas.range(..=page).next_back()?;
+        (page < s + v.len && v.backing == Backing::Anonymous).then_some((s, v))
+    }
+
+    /// 页 `page` 在自己的 VMA 里的宿主页。
+    fn own_page(s: u64, v: &Vma, page: u64) -> NonNull<u8> {
+        // SAFETY: page 落在这个 VMA 里，偏移不越过宿主映射
+        unsafe { v.host.add((page - s) as usize) }
+    }
+
+    /// 页 `page` 写时复制的页表权限：没有写权限。
+    fn read_only(v: &Vma) -> u32 {
+        mmu_prot(v.prot) & !prot::WRITE
+    }
+
+    /// 往 `page` 写之前调用（写缺页、内核写 guest 内存）：借来的页复制一份自己的，借出
+    /// 的页先让借用方各自复制。返回 true 表示页表项已经可写；VMA 不可写、不是写时复制
+    /// 的页时返回 false。
+    pub fn cow_break(&self, page: u64) -> bool {
+        let page = page & !(PAGE_SIZE - 1);
+        if self
+            .anon_vma(page)
+            .is_none_or(|(_, v)| v.prot & prot::WRITE == 0)
+        {
+            return false;
+        }
+        let (borrowed, lent) = {
+            let c = self.cow.borrow();
+            (c.borrowed.contains_key(&page), c.lent.contains(&page))
+        };
+        if borrowed {
+            self.materialize(page, true);
+        } else if lent {
+            self.recall(page);
+        }
+        borrowed || lent
+    }
+
+    /// 借来的页 `page` 换成自己的一份：复制到自己的 VMA 里对应的位置，页表项指向那里。
+    /// `notify` 时，还回的是最后一个借用的话让拥有者恢复写权限；拥有者自己收回时不必。
+    fn materialize(&self, page: u64, notify: bool) {
+        let Some(b) = self.cow.borrow_mut().borrowed.remove(&page) else {
+            return;
+        };
+        if let Some((s, v)) = self.anon_vma(page) {
+            let own = Self::own_page(s, v, page);
+            // SAFETY: 两边都是一整页，借来的那页由 b.region 持有
+            unsafe {
+                std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize)
+            };
+            if mmu_prot(v.prot) != 0 {
+                // SAFETY: 宿主页属于这个 VMA
+                let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
+            }
+        }
+        // 线程的 TLB 里可能还指向借来的页：刷新之后才能还回去，拥有者接着就可能写它
+        self.shootdown();
+        self.return_loan(b.host, page, notify);
+    }
+
+    /// 还回借来的宿主页 `host`（在这里的 guest 地址是 `page`）。
+    fn return_loan(&self, host: NonNull<u8>, page: u64, notify: bool) {
+        self.return_loans([(page, host)], notify);
+    }
+
+    /// 还回一批借来的页（这里的 guest 地址，拥有者的宿主页）。`notify` 时，还回的是最后
+    /// 一个借用的页让拥有者恢复写权限，同一个拥有者的一起处理。
+    fn return_loans(&self, pages: impl IntoIterator<Item = (u64, NonNull<u8>)>, notify: bool) {
+        let mut owners: Vec<(MmRef, Vec<u64>)> = Vec::new();
+        {
+            let mut loans = self.loans.borrow_mut();
+            for (page, host) in pages {
+                let key = host.as_ptr() as usize;
+                let Some(loan) = loans.get_mut(&key) else {
+                    continue;
+                };
+                if loan.give_back(&self.me, page) {
+                    continue;
+                }
+                if let Some((owner, addr)) = loans.remove(&key).and_then(|l| l.owner)
+                    && notify
+                {
+                    match owners.iter_mut().find(|(o, _)| o.ptr_eq(&owner)) {
+                        Some((_, addrs)) => addrs.push(addr),
+                        None => owners.push((owner, vec![addr])),
+                    }
+                }
+            }
+        }
+        // 拥有者正被借用（它自己的操作引起的，比如收回）时不必管：它的页表项下次写缺页
+        // 时恢复（Mm::cow_break）
+        for (owner, addrs) in owners {
+            if let Some(owner) = owner.upgrade()
+                && let Ok(owner) = owner.try_borrow()
+            {
+                owner.repossess(&addrs);
+            }
+        }
+    }
+
+    /// 借出的这些页没有借用方了：恢复写权限（只增加权限，不必刷新 TLB）。
+    fn repossess(&self, pages: &[u64]) {
+        let mut runs = Runs::default();
+        {
+            let mut c = self.cow.borrow_mut();
+            for &page in pages {
+                if c.lent.remove(&page)
+                    && let Some((s, v)) = self.anon_vma(page)
+                {
+                    runs.push(page, Self::own_page(s, v, page));
+                }
+            }
+        }
+        for (page, _, len) in runs.runs {
+            if let Some((_, v)) = self.anon_vma(page) {
+                let _ = self.mmu.protect_shared(page, len, mmu_prot(v.prot));
+            }
+        }
+    }
+
+    /// 拥有者要改借出的页 `page` 之前：每个借用方复制自己的一份，然后恢复写权限。
+    fn recall(&self, page: u64) {
+        let Some((s, v)) = self.anon_vma(page) else {
+            self.cow.borrow_mut().lent.remove(&page);
+            return;
+        };
+        let key = Self::own_page(s, v, page).as_ptr() as usize;
+        let loan = self.loans.borrow_mut().remove(&key);
+        for (b, addr) in loan.into_iter().flat_map(Loan::borrowers) {
+            if let Some(b) = b.upgrade() {
+                b.borrow().materialize(addr, false);
+            }
+        }
+        self.repossess(&[page]);
+    }
+
+    /// 页表项改指别处之后马上做的 shootdown：先改代数，使用者重新进入 guest 代码之前
+    /// 刷新 TLB；正在执行 guest 代码的打断、等它们退出（[`Mm::sync`] 的做法，但调用方
+    /// 接着就要用那一页）。
+    fn shootdown(&self) {
+        if self.users.is_empty() {
+            return;
+        }
+        // 与使用者那边"先标记、再读代数"配对：要么它读到新的代数，要么这里看到它在执行
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for u in &self.users {
+            if u.in_guest.load(Ordering::SeqCst) {
+                // SAFETY: 线程在销毁自己的 Cpu 之前（持有 BKL）从 users 里注销
+                unsafe { u.kicker.kick() };
+            }
+        }
+        for u in &self.users {
+            while u.in_guest.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// `[start, end)` 里的页不再写时复制，内容保留在自己的宿主内存里：借出的先收回，
+    /// 借来的复制一份（mremap 搬走、丢弃、内核直接写宿主内存之前）。
+    fn cow_settle(&self, start: u64, end: u64) {
+        let (lent, borrowed): (Vec<u64>, Vec<u64>) = {
+            let c = self.cow.borrow();
+            (
+                c.lent.range(start..end).copied().collect(),
+                c.borrowed.range(start..end).map(|(&p, _)| p).collect(),
+            )
+        };
+        for page in lent {
+            self.recall(page);
+        }
+        for page in borrowed {
+            self.materialize(page, true);
+        }
+    }
+
+    /// `[start, end)` 要解除映射：借出的先收回；借来的从记录里拿走，等调用方改掉页表项、
+    /// 刷新 TLB 之后用 [`Mm::give_back`] 还回去（内容不要了，不必复制）。
+    fn cow_unmap(&self, start: u64, end: u64) -> Vec<(u64, Borrowed)> {
+        let lent: Vec<u64> = self.cow.borrow().lent.range(start..end).copied().collect();
+        for page in lent {
+            self.recall(page);
+        }
+        let mut c = self.cow.borrow_mut();
+        let pages: Vec<u64> = c.borrowed.range(start..end).map(|(&p, _)| p).collect();
+        pages
+            .into_iter()
+            .map(|p| (p, c.borrowed.remove(&p).unwrap()))
+            .collect()
+    }
+
+    /// 还回 [`Mm::cow_unmap`] 拿走的页。
+    fn give_back(&self, pages: Vec<(u64, Borrowed)>) {
+        if pages.is_empty() {
+            return;
+        }
+        self.shootdown();
+        self.return_loans(pages.into_iter().map(|(page, b)| (page, b.host)), true);
+    }
+
+    /// mprotect 改了 `[start, end)` 的页表项之后：写时复制的页仍然不能写，借来的页仍然
+    /// 指向拥有者的宿主页。
+    fn cow_protect(&self, start: u64, end: u64) {
+        let c = self.cow.borrow();
+        for &page in c.lent.range(start..end) {
+            if let Some((_, v)) = self.anon_vma(page)
+                && Self::read_only(v) != 0
+            {
+                let _ = self.mmu.protect_shared(page, PAGE_SIZE, Self::read_only(v));
+            }
+        }
+        for (&page, b) in c.borrowed.range(start..end) {
+            if let Some((_, v)) = self.anon_vma(page)
+                && Self::read_only(v) != 0
+            {
+                // SAFETY: 借来的宿主页由 b.region 持有
+                let _ = unsafe {
+                    self.mmu
+                        .map_shared(page, b.host, PAGE_SIZE, Self::read_only(v))
+                };
+            }
+        }
+    }
+
+    /// `[start, end)` 里有没有写时复制的页。
+    fn has_cow(&self, start: u64, end: u64) -> bool {
+        let c = self.cow.borrow();
+        c.lent.range(start..end).next().is_some() || c.borrowed.range(start..end).next().is_some()
+    }
+
+    /// fork：VMA `start`（私有匿名、写过）里有内容的页借给子进程 `child`，子进程在同一个
+    /// 地址的 VMA 已经映射好了自己的（全零的）宿主内存。自己借来的页让子进程向原来的
+    /// 拥有者借。子进程借的页按地址顺序放进 `borrowed`，新借出的放进 `lent`，由调用方
+    /// 一起建表。返回有没有新借出的页（自己的页表项去掉了写权限，要做 shootdown）。
+    fn lend(
+        &self,
+        start: u64,
+        child: &Mm,
+        borrowed: &mut Vec<(u64, Borrowed)>,
+        lent: &mut Vec<u64>,
+    ) -> bool {
+        let v = &self.vmas[&start];
+        let end = start + v.len;
+        // 宿主从没碰过的页一定是零，子进程用自己的就行
+        let touched = appine_hal::touched_pages(v.host.as_ptr(), v.len as usize);
+        let ro = Self::read_only(v);
+        let cow = self.cow.borrow();
+        let mut loans = self.loans.borrow_mut();
+        loans.reserve(
+            touched
+                .as_ref()
+                .map_or(0, |t| t.iter().filter(|&&t| t).count()),
+        );
+        // 自己借来的、已经借出的页按地址顺序和逐页的遍历合并，不必每页查一次
+        let mut mine = cow.borrowed.range(start..end).peekable();
+        let mut out = cow.lent.range(start..end).peekable();
+        let (mut parent_runs, mut child_runs) = (Runs::default(), Runs::default());
+        let before = lent.len();
+        for (i, page) in (start..end).step_by(PAGE_SIZE as usize).enumerate() {
+            let (host, region) = if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
+                if let Some(loan) = loans.get_mut(&(b.host.as_ptr() as usize)) {
+                    loan.lend((child.me.clone(), page));
+                }
+                (b.host, b.region.clone())
+            } else if touched.as_ref().is_none_or(|t| t[i]) {
+                let host = Self::own_page(start, v, page);
+                let key = host.as_ptr() as usize;
+                if out.next_if(|&&p| p == page).is_some() {
+                    if let Some(loan) = loans.get_mut(&key) {
+                        loan.lend((child.me.clone(), page));
+                    }
+                } else {
+                    let owner = Some((self.me.clone(), page));
+                    loans.insert(key, Loan::new(owner, (child.me.clone(), page)));
+                    lent.push(page);
+                    parent_runs.push(page, host);
+                }
+                (host, v.region.clone())
+            } else {
+                continue;
+            };
+            child_runs.push(page, host);
+            borrowed.push((page, Borrowed { host, region }));
+        }
+        if ro != 0 {
+            for (page, _, len) in parent_runs.runs {
+                let _ = self.mmu.protect_shared(page, len, ro);
+            }
+            for (page, host, len) in child_runs.runs {
+                // SAFETY: 借来的宿主页由 Borrowed::region 持有，记在子进程的 borrowed 里
+                let _ = unsafe {
+                    child
+                        .mmu
+                        .map_shared(page, NonNull::new_unchecked(host as *mut u8), len, ro)
+                };
+            }
+        }
+        lent.len() > before
+    }
+
+    /// 地址空间销毁时：私有匿名内存里没有借出的页交还宿主。借出的页留给借用方，它们持有
+    /// 那段宿主内存，要等最后一个借用方还回来才释放；同一段宿主内存可能切成了几个 VMA，
+    /// 所以每个都要看（没写过的内容全是零、宿主没碰过，不必看）。
+    fn discard_unlent(&self, lent: &BTreeSet<u64>) {
+        for (&s, v) in self
+            .vmas
+            .iter()
+            .filter(|(_, v)| v.backing == Backing::Anonymous && v.written.get())
+        {
+            let end = s + v.len;
+            let mut cursor = s;
+            for page in lent.range(s..end).copied().chain([end]) {
+                if page > cursor {
+                    // SAFETY: [cursor, page) 落在这个私有匿名 VMA 里，不再有人用
+                    unsafe { discard_host(Self::own_page(s, v, cursor), (page - cursor) as usize) };
+                }
+                cursor = page + PAGE_SIZE;
+            }
+        }
+    }
+}
+
+impl Drop for Mm {
+    fn drop(&mut self) {
+        let cow = std::mem::take(self.cow.get_mut());
+        // 已经没有线程在用这个地址空间（退出、execve），还回借来的页之前不必刷新 TLB
+        self.return_loans(
+            cow.borrowed.into_iter().map(|(page, b)| (page, b.host)),
+            true,
+        );
+        if cow.lent.is_empty() {
+            return;
+        }
+        // 借出的页成了孤儿页
+        {
+            let mut loans = self.loans.borrow_mut();
+            for &page in &cow.lent {
+                if let Some((s, v)) = self.anon_vma(page)
+                    && let Some(loan) =
+                        loans.get_mut(&(Self::own_page(s, v, page).as_ptr() as usize))
+                {
+                    loan.owner = None;
+                }
+            }
+        }
+        self.discard_unlent(&cow.lent);
     }
 }
 
@@ -2202,6 +2748,7 @@ mod tests {
             .unwrap();
         mm.write_kernel(private + PAGE_SIZE, b"parent").unwrap();
         let child = mm.fork().unwrap();
+        let child = child.borrow();
         mm.write_kernel(private + PAGE_SIZE, b"PARENT").unwrap();
         mm.write_kernel(shared, b"both").unwrap();
         let mut buf = [0u8; 6];
@@ -2235,13 +2782,13 @@ mod tests {
         let text = mm.mmap(0, PAGE_SIZE, prot::READ, anon, None).unwrap();
         mm.write_kernel(text, b"code").unwrap();
         let child = mm.fork().unwrap();
+        let mut child = child.borrow_mut();
         let mut buf = [0u8; 4];
         child.read(UserSlice::new(reserved, 4), &mut buf).unwrap();
         assert_eq!(&buf, b"heap");
         child.read(UserSlice::new(text, 4), &mut buf).unwrap();
         assert_eq!(&buf, b"code");
         // PROT_NONE 的页不在页表里，权限加回来之后内容还在
-        let mut child = child;
         assert!(child.mmu().translate(hidden, 0).is_none());
         assert!(child.mmu().translate(reserved + PAGE_SIZE, 0).is_none());
         child.mprotect(hidden, PAGE_SIZE, prot::READ).unwrap();
@@ -2279,7 +2826,8 @@ mod tests {
             )
             .unwrap();
         mm.write_kernel(rw, b"parent").unwrap();
-        let mut child = mm.fork().unwrap();
+        let child = mm.fork().unwrap();
+        let mut child = child.borrow_mut();
         let mut b = [0u8; 6];
         child
             .read(UserSlice::new(ro + 4000, 1), &mut b[..1])
@@ -2439,7 +2987,8 @@ mod tests {
         mm.mprotect(base, PAGE_SIZE, 0).unwrap();
         assert!(mm.grow_down(guard_end - PAGE_SIZE, u64::MAX));
         // fork 之后子进程里的也照样增长
-        let mut child = mm.fork().unwrap();
+        let child = mm.fork().unwrap();
+        let mut child = child.borrow_mut();
         assert!(child.grow_down(guard_end - 2 * PAGE_SIZE, u64::MAX));
     }
 
@@ -2495,7 +3044,8 @@ mod tests {
         let mut mm = Mm::new();
         mm.map_stack(2 * PAGE_SIZE, 16 * PAGE_SIZE).unwrap();
         mm.write(UserSlice::new(STACK_TOP - 2, 2), b"hi").unwrap();
-        let mut child = mm.fork().unwrap();
+        let child = mm.fork().unwrap();
+        let mut child = child.borrow_mut();
         assert_eq!(child.stack_low(), STACK_TOP - 2 * PAGE_SIZE);
         assert!(child.grow_down(STACK_TOP - 16 * PAGE_SIZE, u64::MAX));
         assert_eq!(child.vmas.len(), 1);
@@ -2638,20 +3188,159 @@ mod tests {
         assert_eq!(buf, [0; 3]);
         // 子进程里接着扩展也还是一个 VMA，内容是复制过来的
         mm.write_kernel(0x50_0000, b"heap").unwrap();
-        let mut child = mm.fork().unwrap();
-        assert_eq!(child.brk(0x58_0000), 0x58_0000);
-        assert_eq!(child.vmas.len(), 1);
+        let child = mm.fork().unwrap();
         let mut buf = [0u8; 4];
-        child.read(UserSlice::new(0x50_0000, 4), &mut buf).unwrap();
-        assert_eq!(&buf, b"heap");
-        // 堆中间的一页被换掉之后，后面那段照样能扩展
+        {
+            let mut child = child.borrow_mut();
+            assert_eq!(child.brk(0x58_0000), 0x58_0000);
+            assert_eq!(child.vmas.len(), 1);
+            child.read(UserSlice::new(0x50_0000, 4), &mut buf).unwrap();
+            assert_eq!(&buf, b"heap");
+        }
+        // 堆中间的一页被换掉之后，后面那段照样能扩展；子进程借的那页先复制给它
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
         mm.mmap(0x50_0000, PAGE_SIZE, 0, anon, None).unwrap();
+        child
+            .borrow()
+            .read(UserSlice::new(0x50_0000, 4), &mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"heap");
         assert_eq!(mm.brk(0x60_0000), 0x60_0000);
         assert_eq!(mm.vmas.len(), 2);
         let regions = mm.regions();
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[1].name.as_deref(), Some(&b"[heap]"[..]));
+    }
+
+    /// 读 `addr` 处的一个字节。
+    fn byte(mm: &Rc<RefCell<Mm>>, addr: u64) -> u8 {
+        let mut b = [0u8];
+        mm.borrow().read(UserSlice::new(addr, 1), &mut b).unwrap();
+        b[0]
+    }
+
+    fn poke(mm: &Rc<RefCell<Mm>>, addr: u64, b: u8) {
+        mm.borrow().write(UserSlice::new(addr, 1), &[b]).unwrap();
+    }
+
+    fn writable(mm: &Rc<RefCell<Mm>>, addr: u64) -> bool {
+        mm.borrow().mmu().translate(addr, prot::WRITE).is_some()
+    }
+
+    #[test]
+    fn fork_shares_written_pages_until_either_side_writes() {
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, 4 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        for i in 0..4 {
+            poke(&parent, a + i * PAGE_SIZE, b'p');
+        }
+        let child = parent.borrow_mut().fork().unwrap();
+        // 两边的页表都指向父进程的宿主页，都不能写
+        let host = |mm: &Rc<RefCell<Mm>>, addr| mm.borrow().mmu().translate(addr, prot::READ);
+        assert_eq!(host(&parent, a), host(&child, a));
+        assert!(!writable(&parent, a) && !writable(&child, a));
+        // 子进程写：复制一份自己的；父进程是唯一的使用者了，马上恢复写权限
+        poke(&child, a, b'c');
+        assert_eq!((byte(&parent, a), byte(&child, a)), (b'p', b'c'));
+        assert!(writable(&parent, a) && writable(&child, a));
+        // 父进程写：子进程先复制一份
+        poke(&parent, a + PAGE_SIZE, b'q');
+        assert_eq!(byte(&child, a + PAGE_SIZE), b'p');
+        // 孙进程向子进程借第 0 页，向原来的拥有者借第 2 页
+        let grandchild = child.borrow_mut().fork().unwrap();
+        assert_eq!(
+            host(&grandchild, a + 2 * PAGE_SIZE),
+            host(&parent, a + 2 * PAGE_SIZE)
+        );
+        poke(&parent, a + 2 * PAGE_SIZE, b'r');
+        assert_eq!(byte(&child, a + 2 * PAGE_SIZE), b'p');
+        assert_eq!(byte(&grandchild, a + 2 * PAGE_SIZE), b'p');
+        poke(&child, a, b'd');
+        assert_eq!(byte(&grandchild, a), b'c');
+        // 拥有者的地址空间销毁：借出的页留给子孙，内容不变，它们照样能写
+        drop(parent);
+        poke(&grandchild, a + 3 * PAGE_SIZE, b'g');
+        assert_eq!(byte(&child, a + 3 * PAGE_SIZE), b'p');
+        assert_eq!(byte(&grandchild, a + 3 * PAGE_SIZE), b'g');
+        // 子进程解除映射：孙进程借它的页先复制
+        child.borrow_mut().munmap(a, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(byte(&grandchild, a), b'c');
+        assert_eq!(byte(&grandchild, a + PAGE_SIZE), b'p');
+        drop(child);
+        let g = grandchild.borrow();
+        assert!(g.cow.borrow().borrowed.is_empty() && g.cow.borrow().lent.is_empty());
+        assert!(g.loans.borrow().is_empty());
+    }
+
+    #[test]
+    fn copy_on_write_survives_mprotect_discard_and_mremap() {
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, 3 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        for i in 0..3 {
+            poke(&parent, a + i * PAGE_SIZE, b'p');
+        }
+        let child = parent.borrow_mut().fork().unwrap();
+        // 去掉权限再加回来（包括 PROT_NONE，那时页不在页表里）：仍然借着、仍然不能写
+        for mm in [&parent, &child] {
+            for p in [prot::READ, 0, RW] {
+                mm.borrow_mut().mprotect(a, 3 * PAGE_SIZE, p).unwrap();
+            }
+            assert_eq!(byte(mm, a), b'p');
+            assert!(!writable(mm, a));
+        }
+        // 丢弃：另一边的内容不变
+        parent.borrow_mut().discard(a, PAGE_SIZE).unwrap();
+        child
+            .borrow_mut()
+            .discard(a + PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        assert_eq!((byte(&parent, a), byte(&child, a)), (0, b'p'));
+        assert_eq!(
+            (byte(&parent, a + PAGE_SIZE), byte(&child, a + PAGE_SIZE)),
+            (b'p', 0)
+        );
+        // mremap 搬走之后各写各的
+        let moved = parent
+            .borrow_mut()
+            .mremap(
+                a + 2 * PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                true,
+                Some(0x1000_0000),
+            )
+            .unwrap();
+        poke(&parent, moved, b'q');
+        assert_eq!(byte(&child, a + 2 * PAGE_SIZE), b'p');
+        poke(&child, a + 2 * PAGE_SIZE, b'c');
+        assert_eq!(byte(&parent, moved), b'q');
+    }
+
+    #[test]
+    fn futex_keys_of_borrowed_pages_are_their_own() {
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        poke(&parent, a, 1);
+        let child = parent.borrow_mut().fork().unwrap();
+        // 写时复制之后键就会变：借来的页先换成自己的
+        let key = child.borrow().futex_key(a).unwrap();
+        assert!(child.borrow().cow.borrow().borrowed.is_empty());
+        assert!(key != parent.borrow().futex_key(a).unwrap());
+        poke(&child, a, 2);
+        assert!(child.borrow().futex_key(a).unwrap() == key);
+        assert_eq!(byte(&parent, a), 1);
     }
 
     #[test]

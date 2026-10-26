@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use appine_engine::Cpu;
 
 use crate::errno::Errno;
-use crate::kernel::{Cx, Kernel, Tid, request_wake};
+use crate::kernel::{Cx, Kernel, Tid, request_wake, request_wake_on, wake};
 use crate::process::{ExitStatus, RLIMIT_SIGPENDING, Signal, ThreadGroup};
 use crate::syscall::Flow;
 use crate::task::Task;
@@ -495,7 +495,7 @@ fn notify_parent(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, code: i32, status
         let g = group.borrow();
         (g.tgid, g.ppid)
     };
-    request_wake();
+    request_wake_on(wake::CHILD);
     let Some(parent) = k.groups.get(&ppid) else {
         return;
     };

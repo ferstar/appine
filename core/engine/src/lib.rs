@@ -227,6 +227,29 @@ impl Mmu {
         map_result(unsafe { appine_mmu_protect(self.raw.as_ptr(), gva, len, prot) })
     }
 
+    /// 与 [`Mmu::map`] 相同，但只要 `&self`：内核层在写时复制时经由共享借用修改别的地址
+    /// 空间的页表。`Mmu` 不能跨线程共享，修改仍然是串行的；别的线程照样可以同时遍历。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`Mmu::map`]。
+    pub unsafe fn map_shared(
+        &self,
+        gva: u64,
+        host: NonNull<u8>,
+        len: u64,
+        prot: u32,
+    ) -> Result<(), MapError> {
+        map_result(unsafe {
+            appine_mmu_map(self.raw.as_ptr(), gva, host.as_ptr().cast(), len, prot)
+        })
+    }
+
+    /// 与 [`Mmu::protect`] 相同，但只要 `&self`（见 [`Mmu::map_shared`]）。
+    pub fn protect_shared(&self, gva: u64, len: u64, prot: u32) -> Result<(), MapError> {
+        map_result(unsafe { appine_mmu_protect(self.raw.as_ptr(), gva, len, prot) })
+    }
+
     /// 查询 guest 地址对应的 host 指针；`required_prot` 中的权限必须全部具备，传 0 只要求已映射。
     pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
         NonNull::new(unsafe { appine_mmu_translate(self.raw.as_ptr(), gva, required_prot) }.cast())

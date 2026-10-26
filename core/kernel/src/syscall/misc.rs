@@ -530,7 +530,7 @@ pub(super) fn getrusage(cx: &mut Cx<'_>, who: i32, usage: u64) -> SysResult {
             maxrss_kb: g.child_maxrss_kb,
         },
         _ => Rusage {
-            cpu: cx.task.cpu(),
+            cpu: cx.task.cpu_self(),
             maxrss_kb: g.maxrss_kb,
         },
     };

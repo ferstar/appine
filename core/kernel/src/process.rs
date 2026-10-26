@@ -11,7 +11,7 @@ use appine_engine::DbtStats;
 
 use crate::cred::{Cred, MAY_EXEC};
 use crate::errno::Errno;
-use crate::kernel::{INIT, Kernel, Tid, request_wake};
+use crate::kernel::{INIT, Kernel, Tid, request_wake_on, wake};
 use crate::loader::{self, Executable, LoadError};
 use crate::signal::{self, Pending, SigAction, SigHandlers, SigInfo, sa};
 use crate::terminal::Terminal;
@@ -572,7 +572,14 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             signal::send_to_pgrp(k, pgid, Signal::CONT, SigInfo::kernel());
         }
     }
-    request_wake();
+    finished(k, tgid);
+}
+
+/// 进程 `tgid` 结束了：叫醒等子进程的线程，宿主在等它时也叫醒宿主。其余的等待者不必
+/// 醒：它们关心的修改（关闭文件、信号量的 undo、发信号）各自请求唤醒。
+fn finished(k: &Kernel, tgid: Tid) {
+    let watched = k.watched.contains_key(&tgid);
+    request_wake_on(wake::CHILD | if watched { wake::WATCHED } else { 0 });
 }
 
 /// [`finish_group`] 中途撞上内核层的 bug 之后（[`crate::bug`]）：至少让宿主等得到它结束、
@@ -590,7 +597,7 @@ pub(crate) fn finish_group_after_bug(k: &mut Kernel, group: &Rc<RefCell<ThreadGr
     if !handed {
         hand_to_parent(k, group, ids, status);
     }
-    request_wake();
+    finished(k, ids.0);
 }
 
 /// 退出的进程（`tgid`、`ppid`、`exit_signal`）交给父进程：父进程是 init、已经不在了，

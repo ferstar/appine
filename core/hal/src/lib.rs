@@ -521,6 +521,39 @@ pub fn gettid() -> i32 {
     }
 }
 
+/// 调用线程到现在在宿主内核里花的时间（`getrusage(RUSAGE_THREAD)` 的 stime）。
+pub fn thread_system_ns_self() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Linux 的 UAPI 常量；libc crate 在 Android 上没有定义它
+        const RUSAGE_THREAD: libc::c_int = 1;
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
+            let t = ru.ru_stime;
+            return t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1000;
+        }
+        0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0
+    }
+}
+
+/// 设置调用线程的名字（`/proc/self/task/<tid>/comm`，调试器里看到的），超过 15 字节的
+/// 部分截掉。
+pub fn set_thread_name(name: &str) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut buf = [0u8; 16];
+        let n = name.len().min(15);
+        buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+        unsafe { libc::prctl(libc::PR_SET_NAME, buf.as_ptr()) };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = name;
+}
+
 /// 本进程的宿主线程 `tid` 在宿主内核里花的时间（`/proc/self/task/<tid>/stat` 的
 /// stime，精度是一个时钟滴答）。线程已经退出或者读不了时返回 None。
 pub fn thread_system_ns(tid: i32) -> Option<u64> {

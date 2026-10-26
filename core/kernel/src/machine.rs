@@ -204,7 +204,7 @@ impl Machine {
                 table
             }
         };
-        let mm = Rc::new(RefCell::new(mm));
+        let mm = mm.into_shared();
         // SAFETY: Mm 由任务的 TaskState 持有，线程退出或 execve 之前不会释放
         let mut cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
         cpu.state_mut().pc = image.entry;
@@ -256,8 +256,8 @@ impl Machine {
 
     /// 等 [`Machine::spawn`] 启动的进程结束。
     pub fn wait(&self, pid: u32) -> ExitStatus {
-        // 进程结束不是打开文件上的修改：关闭文件、读写管道不必叫醒这里
-        self.wait_on(wake::OTHER, |k| {
+        // 只有宿主在等的进程结束时才要叫醒这里，别的进程结束、关闭文件都不必
+        self.wait_on(wake::WATCHED, |k| {
             k.watched.get(&(pid as i32)).copied().flatten()
         })
     }
