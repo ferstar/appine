@@ -34,5 +34,5 @@
 **推迟项**：
 
 - 写过 100 MB 的进程 fork 仍是原生的 3.8 倍，时间在逐页记账上；可以按 VMA 的区间记，只在拆开、拷贝时再细分。
-- fork 时子进程的私有匿名映射各自 mmap 一段宿主内存，exec 时再 munmap，占空进程 fork 的一成多：可以合成一次 mmap，或者推迟到第一次写。每个新线程仍然新建 Cpu（TLB 要 mmap）。→ 起进程的宿主开销：小映射合成一段，Cpu 留着复用。
-- `/proc/<pid>/smaps` 的 Rss 没算借来的页（`/proc/<pid>/status`、getrusage 的驻留内存算了）。
+- fork 时子进程的私有匿名映射各自 mmap 一段宿主内存，exec 时再 munmap，占空进程 fork 的一成多：可以合成一次 mmap，或者推迟到第一次写。每个新线程仍然新建 Cpu（TLB 要 mmap）。→ 已补上（M9 之前：起进程的宿主开销）：小映射合成一段，Cpu 留着复用
+- `/proc/<pid>/smaps` 的 Rss 没算借来的页（`/proc/<pid>/status`、getrusage 的驻留内存算了）。→ 这一条记错了：smaps 和 mincore 用的 `Mm::residency` 在这一轮的提交里就把借来的页算作驻留（2026-10-27 核对代码）

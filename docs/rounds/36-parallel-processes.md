@@ -30,5 +30,5 @@
 
 **推迟项**：
 
-- BKL 拆分：起进程、退出、缺页这些路径的持锁时间占了 4 路并发的大半。→ 先拆了读时钟、futex 和 nanosleep（M9 之前：拆 BKL）；起进程、退出、缺页仍持 BKL
+- BKL 拆分：起进程、退出、缺页这些路径的持锁时间占了 4 路并发的大半。→ 先拆了读时钟、futex 和 nanosleep（M9 之前：拆 BKL）；起进程、退出、缺页、mmap/munmap 仍持 BKL
 - 池里保留的翻译（代码最多 64 MB，连同表等约 85 MB）在 App 收到 `onTrimMemory` 时还不会清空。→ 已补上（M9 之前：onTrimMemory）

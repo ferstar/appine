@@ -32,7 +32,7 @@
 
 贵的是提交本身：每次提交把改了的 4 个左右的页写进 WAL（每页两次 pwrite），再加 WAL 索引的 4 次 fcntl 加解锁。
 
-- **推迟提交**：写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是一个保存点，出错或者内核层 panic 时只回滚它自己（`Op` 守卫）。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，`Machine::sync`、`trim_memory`（还没接到 Android 的 `onTrimMemory`）和关闭时立即提交。App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态。
+- **推迟提交**：写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是一个保存点，出错或者内核层 panic 时只回滚它自己（`Op` 守卫）。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，`Machine::sync`、`trim_memory`（还没接到 Android 的 `onTrimMemory`；→ 已接上，M9 之前：onTrimMemory）和关闭时立即提交。App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态。
   - 删除最后一个链接时，object 等提交之后再删。
   - 提交之前被杀掉时，新建的 inode 随事务丢失，object 却留下了；编号以后再分配给目录时它就永远留下了。`lock` 文件里记着还没提交的写事务新分配的 inode 编号范围，开机时删掉其中没有 inode 行的 object；新建 object 时已经有同名的就清空接着用。
   - 别的 appine 进程也在用仓库时不推迟：`lock` 文件里记着使用者数，打开仓库时发现已经有别人，先等它提交推迟的写事务（空的 `BEGIN IMMEDIATE`），它看到计数之后也每个操作立即提交。
