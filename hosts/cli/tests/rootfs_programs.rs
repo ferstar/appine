@@ -443,7 +443,9 @@ fn procfs_describes_processes() {
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
-        "sleep 5 & ps -o pid,comm | grep -c sleep; grep ^Name /proc/self/status; \
+        // 后台的子进程可能还没 exec 成 sleep（comm 还是 sh），与 Linux 相同：先等它
+        "sleep 5 & i=0; until ps -o comm | grep -qx sleep || [ $i -ge 200 ]; do i=$((i+1)); done; \
+         ps -o pid,comm | grep -c sleep; grep ^Name /proc/self/status; \
          readlink /proc/self/exe; cat /proc/self/cmdline | tr '\\0' ' '; echo; \
          df / | tail -n 1 | grep -c ' /$'; grep -c ^processor /proc/cpuinfo | grep -vc ^0; \
          echo piped | cat /dev/stdin; kill $!",
