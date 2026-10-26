@@ -97,6 +97,7 @@ pub const CLASSES: &[Class] = &[
     case("same_base", same_base, hwcap::FP | hwcap::ASIMD),
     case("interleaved", interleaved, hwcap::FP | hwcap::ASIMD),
     case("literal", literal, hwcap::FP | hwcap::ASIMD),
+    case("pc_page", pc_page, hwcap::FP | hwcap::ASIMD),
     case("simd_ldst", simd_ldst, hwcap::FP | hwcap::ASIMD),
     case("simd_pair", simd_pair, hwcap::FP | hwcap::ASIMD),
     case("simd_struct", simd_struct, hwcap::FP | hwcap::ASIMD),
@@ -699,6 +700,79 @@ fn literal(g: &mut Rng, env: &Env) -> Case {
     let imm19 = (target - env.slot_offset as i64) / 4;
     let base = if simd { 0x1c00_0000 } else { 0x1800_0000 };
     Case::one((opc << 30) | base | ((imm19 as u32 & 0x7ffff) << 5) | g.bits(5))
+}
+
+/// 以 ADRP 算出的基址（可能再加一个立即数）读被测指令所在的页：Tier 1 翻译时就知道
+/// 地址，表项的位置是常数（dbt.c 的 konst）。中间可能夹一条改掉基址的指令（MOV、或者读
+/// 进基址本身），之后的访问不能再当作已知地址。
+fn pc_page(g: &mut Rng, env: &Env) -> Case {
+    let rn = reg_except(g, &[]);
+    let mut c = Case::default();
+    c.insns.push(0x9000_0000 | rn); // ADRP Xn, 本页
+    let mut base = 0i64;
+    if g.bit() == 1 {
+        let k = g.below(500) as i64 * 8; // 后面至少还有几个 16 字节的位置
+        c.insns.push(0x9100_0000 | (k as u32) << 10 | rn << 5 | rn); // ADD Xn, Xn, #k
+        base = k;
+    }
+    let svc = env.slot_offset as i64 + 16;
+    // 访问 n 字节：LDR X/W/H/B、LDP X、LDR Q，偏移按 n 对齐、不超过 `max`（LDP 的立即数
+    // 只有 7 位），落在本页、不碰 SVC
+    let pick = |g: &mut Rng, base: i64, n: i64, max: i64| loop {
+        let off = g.below(((4096 - base - n) / n).min(max / n) as u32 + 1) as i64 * n;
+        let t = base + off;
+        if t + n <= 4096 && (t + n <= svc || t >= svc + 4) {
+            break off;
+        }
+    };
+    let access = |g: &mut Rng, rn: u32, base: i64| -> u32 {
+        match g.below(4) {
+            0 => {
+                let size = g.below(4);
+                let n = 1i64 << size;
+                let off = pick(g, base, n, 4095 * n);
+                (size << 30)
+                    | 0x3940_0000
+                    | ((off / n) as u32) << 10
+                    | rn << 5
+                    | reg_or_zr(g, &[rn])
+            }
+            1 => {
+                let off = pick(g, base, 16, 504);
+                let t1 = reg_or_zr(g, &[rn]);
+                let t2 = reg_or_zr(g, &[rn, t1]);
+                0xa940_0000 | ((off / 8) as u32) << 15 | t2 << 10 | rn << 5 | t1
+            }
+            _ => {
+                let off = pick(g, base, 16, 4095 * 16);
+                0x3dc0_0000 | ((off / 16) as u32) << 10 | rn << 5 | g.bits(5)
+            }
+        }
+    };
+    match g.below(4) {
+        0 => {
+            // MOV Xn, Xm：基址改指向数据区，不再是已知值
+            let rm = reg_except(g, &[rn]);
+            c.pointers.push((rm, 0));
+            c.insns.push(0xaa00_03e0 | rm << 16 | rn);
+            let off = (g.below(512) * 8) as i64;
+            c.insns
+                .push(0xf940_0000 | ((off / 8) as u32) << 10 | rn << 5 | g.bits(5));
+        }
+        1 => {
+            // 读进基址本身（LDR Xn, [Xn, #off]）
+            let off = pick(g, base, 8, 4095 * 8);
+            c.insns
+                .push(0xf940_0000 | ((off / 8) as u32) << 10 | rn << 5 | rn);
+        }
+        _ => {
+            c.insns.push(access(g, rn, base));
+            if c.insns.len() < 4 && g.bit() == 1 {
+                c.insns.push(access(g, rn, base));
+            }
+        }
+    }
+    c
 }
 
 /// SIMD&FP 单寄存器 LDR/STR（B/H/S/D/Q）。

@@ -306,6 +306,10 @@ struct xlate {
     unsigned idx, limit;
     /* 本块里 SP 已经检查过对齐，之后只按 16 的倍数改过 */
     bool sp_aligned;
+    /* 本块里值在翻译时已知的通用寄存器（ADR/ADRP 设下的，和在它上面加的立即数），第
+     * r 位对应 Xr，值在 kval 里（konst_update） */
+    uint32_t konst;
+    uint64_t kval[31];
     /* 共用检查的几组访存（plan_group）：还没翻译的组员。组的宿主基址在 T2 里，或者暂存
      * 在 cpu 的 dbt_groups[组的下标] 里 */
     struct group {
@@ -869,14 +873,17 @@ static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
  * 第一个字节所在页比较：TLB 直接映射，跨页时第一页的页号不可能出现在下一页的
  * 表项里，所以这一次比较同时排除了跨页访问。未命中和跨页时进入回填例程，回填失败
  * 时以 `fail` 退出。`in_granule` 表示访问落在一个对齐的 16 字节里，不可能跨页，
- * 可以直接用第一个字节的页。
+ * 可以直接用第一个字节的页。`last_ready` 表示调用方已经把最后一个字节的地址算进了
+ * T1（[`emit_address_imm`]）。
  */
 static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool write, bool in_granule,
-                           unsigned fail)
+                           bool last_ready, unsigned fail)
 {
     x->t2_group = -1;
     unsigned last = T0;
-    if (bytes > 1 && !in_granule) {
+    if (last_ready) {
+        last = T1;
+    } else if (bytes > 1 && !in_granule) {
         emit(x, enc_add_imm(T1, T0, bytes - 1, 0));
         last = T1;
     }
@@ -885,6 +892,61 @@ static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
     emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF + (write ? 16 : 0)));
     emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag 是页号取反 */
     emit_to_refill(x, pc, bytes, write, fail);
+}
+
+/*
+ * 访问的 guest 地址在翻译时已知（`addr`，T0 里也是它，访问不跨页）：表项的位置是常数，
+ * 取表项不必等 T0 算出来（全局变量：ADRP 之后的访存，T0 要等 ADRP 换成的几条 movk）。
+ */
+static void emit_tlb_check_known(struct xlate *x, uint64_t pc, uint64_t addr, unsigned bytes, bool write,
+                                 unsigned fail)
+{
+    x->t2_group = -1;
+    uint64_t off = TLB_OFF + ((addr >> APPINE_PAGE_SHIFT) & (APPINE_TLB_ENTRIES - 1)) * 32 + (write ? 16 : 0);
+    int64_t lo = (int64_t)(off & 0xfff);
+    uint64_t hi = off - (uint64_t)lo;
+    if (lo > 504 && lo >= 4096 - 512) { /* ldp 的偏移是 -512..504 */
+        hi += 4096;
+        lo -= 4096;
+    }
+    unsigned b = CTX;
+    if (hi) {
+        emit(x, enc_add_imm(T1, CTX, (uint32_t)(hi >> 12), 1));
+        b = T1;
+    }
+    if (lo > 504) {
+        emit(x, enc_add_imm(T1, b, (uint32_t)lo, 0));
+        b = T1;
+        lo = 0;
+    }
+    emit(x, enc_ldp_x(T1, T2, b, (int)lo));
+    emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag 是页号取反 */
+    emit_to_refill(x, pc, bytes, write, fail);
+}
+
+/* 以已知值的寄存器 `rn` 为基址、偏移 `imm` 访问 `bytes` 字节时的 guest 地址；寄存器的值
+ * 不知道或者访问跨页时返回 false */
+static bool known_address(const struct xlate *x, unsigned rn, int64_t imm, unsigned bytes, uint64_t *addr)
+{
+    if (rn > 30 || !(x->konst >> rn & 1))
+        return false;
+    *addr = x->kval[rn] + (uint64_t)imm;
+    return ((*addr ^ (*addr + bytes - 1)) >> APPINE_PAGE_SHIFT) == 0;
+}
+
+/*
+ * T0 = base + imm。要取最后一个字节的页时，T1 = base + imm + bytes - 1 不经过 T0、直接
+ * 从基址算：TLB 的下标不必等 T0 算出来，访存的依赖链上少一步（追指针的读每次都走完
+ * 整条链），指令数不变。返回 T1 是否已经算好。
+ */
+static bool emit_address_imm(struct xlate *x, unsigned base, int64_t imm, unsigned bytes, bool in_granule)
+{
+    int64_t last = imm + (int64_t)bytes - 1;
+    bool fold = bytes > 1 && !in_granule && last > -4096 && last < 4096;
+    if (fold)
+        emit(x, last >= 0 ? enc_add_imm(T1, base, (uint32_t)last, 0) : enc_sub_imm(T1, base, (uint32_t)-last, 0));
+    emit_add_const(x, T0, base, imm);
+    return fold;
 }
 
 /* 访存的字节数 */
@@ -923,9 +985,12 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
     }
 
     /* 1. guest 地址 → T0 */
-    bool in_granule = false;
+    bool in_granule = false, last_ready = false, known = false;
+    uint64_t addr = 0;
     if (m->mode == M_LITERAL) {
         emit_mov_const(x, T0, (uint64_t)m->imm);
+        addr = (uint64_t)m->imm;
+        known = ((addr ^ (addr + memop_bytes(m) - 1)) >> APPINE_PAGE_SHIFT) == 0;
     } else {
         unsigned base = rn == REG_SP ? SP_HOST : rn;
         if (rn == REG_SP) { /* SP 必须 16 字节对齐 */
@@ -947,17 +1012,23 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
             break;
         }
         case M_POST:
-            if (base != T0)
-                emit(x, enc_mov(T0, base));
+            last_ready = emit_address_imm(x, base, 0, memop_bytes(m), in_granule);
             break;
         default:
-            emit_add_const(x, T0, base, m->imm);
+            known = m->mode == M_OFFSET && known_address(x, m->rn, m->imm, memop_bytes(m), &addr);
+            if (known)
+                emit_add_const(x, T0, base, m->imm);
+            else
+                last_ready = emit_address_imm(x, base, m->imm, memop_bytes(m), in_granule);
             break;
         }
     }
 
     /* 2. TLB */
-    emit_tlb_check(x, pc, memop_bytes(m), !m->load, in_granule, R_INTERP);
+    if (known)
+        emit_tlb_check_known(x, pc, addr, memop_bytes(m), !m->load, R_INTERP);
+    else
+        emit_tlb_check(x, pc, memop_bytes(m), !m->load, in_granule, last_ready, R_INTERP);
 
     /* 3. 访问宿主内存 */
     if (m->structure) {
@@ -1292,9 +1363,15 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, i
     unsigned rn = lead->rn == 31 ? REG_SP : lead->rn, base = rn == REG_SP ? SP_HOST : rn;
     if (rn == REG_SP)
         emit_sp_check(x, pc);
-    emit_add_const(x, T0, base, g->lo);
     bool in_granule = rn == REG_SP && (g->lo & 15) + g->bytes <= 16;
-    emit_tlb_check(x, pc, g->bytes, g->write, in_granule, R_UNGROUP);
+    uint64_t addr;
+    if (known_address(x, rn, g->lo, g->bytes, &addr)) {
+        emit_add_const(x, T0, base, g->lo);
+        emit_tlb_check_known(x, pc, addr, g->bytes, g->write, R_UNGROUP);
+    } else {
+        bool last_ready = emit_address_imm(x, base, g->lo, g->bytes, in_granule);
+        emit_tlb_check(x, pc, g->bytes, g->write, in_granule, last_ready, R_UNGROUP);
+    }
     emit(x, enc_add_lsl(T2, T2, base, 0));
     if (g->spill)
         emit(x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_groups) + 8 * (size_t)slot));
@@ -1324,7 +1401,7 @@ static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bo
         emit(x, enc_and_low(T1, T0, (unsigned)__builtin_ctz(bytes)));
         emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
     }
-    emit_tlb_check(x, pc, bytes, write, true, R_INTERP);
+    emit_tlb_check(x, pc, bytes, write, true, false, R_INTERP);
     emit(x, enc_add_lsl(T2, T2, T0, 0));
     x->st->insns_memory++;
 }
@@ -1620,7 +1697,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             emit(x, enc_mov(T0, rt));
         emit(x, enc_and_clear_low(T0, T0, 6));
         _Static_assert(DCZ_BLOCK == 64, "DC ZVA 的块大小");
-        emit_tlb_check(x, pc, DCZ_BLOCK, true, false, R_INTERP);
+        emit_tlb_check(x, pc, DCZ_BLOCK, true, false, false, R_INTERP);
         emit(x, enc_add_lsl(T2, T2, T0, 0));
         for (int off = 0; off < DCZ_BLOCK; off += 16)
             emit(x, enc_stp_x(31, 31, T2, off));
@@ -1641,7 +1718,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             emit_load_guest(x, T0, rt);
         else
             emit(x, enc_mov(T0, rt));
-        emit_tlb_check(x, pc, 1, false, true, R_INTERP);
+        emit_tlb_check(x, pc, 1, false, true, false, R_INTERP);
         if (cmo == 0xd50b7520) {
             emit(x, enc_and_clear_low(T0, T0, APPINE_PAGE_SHIFT));
             emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, ivau_page)));
@@ -1707,7 +1784,84 @@ static bool translate_simd_dp(struct xlate *x, uint32_t insn)
 }
 
 /* 翻译一条指令；返回 false 表示块到此结束 */
+static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc);
+
+/*
+ * 这条指令之后哪些寄存器的值已知（xlate.konst）：ADR/ADRP 设下常数，在已知值上加立即数
+ * 仍然已知，其余可能写通用寄存器的指令让它们失效。拿不准的一律当作全都写了。
+ */
+static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
+{
+    unsigned rd = insn & 31, rn = FIELD(insn, 9, 5);
+    uint32_t kill = 1u << rd;
+    if (FIELD(insn, 28, 24) == 0x10) { /* ADR/ADRP */
+        uint64_t imm = ((uint64_t)FIELD(insn, 23, 5) << 2) | FIELD(insn, 30, 29);
+        int64_t off = (int64_t)(imm << 43) >> 43;
+        if (rd != 31) {
+            x->konst |= 1u << rd;
+            x->kval[rd] = BIT(insn, 31) ? (pc & ~UINT64_C(0xfff)) + ((uint64_t)off << 12) : pc + (uint64_t)off;
+        }
+        return;
+    }
+    if ((insn & 0xff800000) == 0x91000000 && rd != 31 && rn != 31 && (x->konst >> rn & 1)) {
+        /* ADD Xd, Xn, #imm{, lsl #12}（不设标志） */
+        x->kval[rd] = x->kval[rn] + ((uint64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0));
+        x->konst |= 1u << rd;
+        return;
+    }
+    switch (FIELD(insn, 28, 25)) {
+    case 0x8:
+    case 0x9:
+    case 0x5:
+    case 0xd:
+    case 0x7:
+    case 0xf: /* 数据处理（SIMD 的也可能写通用寄存器，如 UMOV） */
+        break;
+    case 0x4:
+    case 0x6:
+    case 0xc:
+    case 0xe: {
+        struct memop m;
+        if (is_atomic(insn)) { /* Rt、Rs，成对的再加一个 */
+            unsigned rs = FIELD(insn, 20, 16);
+            kill |= 3u << rd | 3u << rs;
+            break;
+        }
+        if (!(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m))) {
+            kill = ~0u;
+            break;
+        }
+        kill = 0;
+        if (m.load && !m.simd && !m.prefetch) {
+            kill |= 1u << m.rt;
+            if (m.pair)
+                kill |= 1u << m.rt2;
+        }
+        if (m.mode == M_PRE || m.mode == M_POST)
+            kill |= 1u << m.rn;
+        break;
+    }
+    default:
+        /* 条件分支、CBZ、TBZ、HINT、屏障不写寄存器；其余（MRS、BL 等）拿不准 */
+        if ((insn & 0xff000010) == 0x54000000 || (insn & 0x7e000000) == 0x34000000 ||
+            (insn & 0x7e000000) == 0x36000000 || (insn & 0xfffff01f) == 0xd503201f ||
+            (insn & 0xfffff01f) == 0xd503301f)
+            kill = 0;
+        else
+            kill = ~0u;
+        break;
+    }
+    x->konst &= ~kill;
+}
+
 static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
+{
+    bool r = translate_insn_body(x, insn, pc);
+    konst_update(x, insn, pc);
+    return r;
+}
+
+static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     if ((FIELD(insn, 28, 25) & 7) == 7)
         return translate_simd_dp(x, insn) || fallback(x, pc);
@@ -2501,6 +2655,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     x->guest = guest;
     x->limit = limit;
     x->sp_aligned = false;
+    x->konst = 0;
     for (unsigned i = 0; i < GROUP_SLOTS; i++)
         x->groups[i].n = x->groups[i].next = 0;
     x->t2_group = -1;
