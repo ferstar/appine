@@ -38,12 +38,36 @@ pub struct Pipe {
     /// 读端、写端被打开过的次数：打开 FIFO 时等对端，据此知道对端来过（即使已经关掉）。
     pub reader_opens: u64,
     pub writer_opens: u64,
+    /// 等着空间的写端最少要多少字节（0 表示没有）：读端腾出这么多时才叫醒它们
+    /// （[`Pipe::drained`]）。
+    pub writer_need: usize,
 }
 
 impl Pipe {
     /// 剩余空间。
     pub fn space(&self) -> usize {
         self.capacity.saturating_sub(self.buf.len())
+    }
+
+    /// 写端要等至少 `need` 字节的空间。
+    pub fn want_space(&mut self, need: usize) {
+        self.writer_need = match self.writer_need {
+            0 => need,
+            n => n.min(need),
+        };
+    }
+
+    /// 读走了数据，读之前的空间是 `before`：返回要不要叫醒等着的写端。与 Linux 一样不是
+    /// 每读一点就叫醒：等着的写端要的空间够了，或者空间越过 `PIPE_BUF`（poll 报告可写的
+    /// 门槛）时才叫醒。读端用 stdio 每次读 1 KB 时，原来每读一次就把写端叫醒一次。
+    pub fn drained(&mut self, before: usize) -> bool {
+        let now = self.space();
+        let wake = (before < PIPE_BUF && now >= PIPE_BUF)
+            || (self.writer_need != 0 && now >= self.writer_need);
+        if wake {
+            self.writer_need = 0;
+        }
+        wake
     }
 
     fn new(ino: u64, fifo: Option<Ino>, capacity: usize) -> Rc<RefCell<Pipe>> {
@@ -56,6 +80,7 @@ impl Pipe {
             fifo,
             reader_opens: 0,
             writer_opens: 0,
+            writer_need: 0,
         }))
     }
 

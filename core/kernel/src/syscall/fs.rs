@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use super::SocketRef;
-use super::{IO_CHUNK, SysResult, get, inotify, put, read_path, tty};
+use super::{IO_CHUNK, MAX_COPY, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
@@ -465,7 +465,7 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
                 let dir = store_ino(&dir)?;
                 if let Some(ino) = vfs.store().lookup(dir, name)?
                     && follow
-                    && vfs.store().stat(ino)?.kind() == mode::S_IFLNK
+                    && vfs.store().attrs(ino)?.kind() == mode::S_IFLNK
                 {
                     links += 1;
                     if links > crate::vfs::MAX_SYMLINKS {
@@ -709,11 +709,8 @@ fn open_store(
     created: Option<std::fs::File>,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
-    // 已经打开的（刚建好的，或者重新打开的已删除文件）从打开的 object 取属性
-    let st = match &created {
-        Some(f) => store.stat_open(ino, f)?,
-        None => store.stat(ino)?,
-    };
+    // 只用到类型、权限、属主和设备号，不必向宿主 stat object
+    let st = store.attrs(ino)?;
     if created.is_none() {
         let mut mask = open_mask(flags);
         match st.kind() {
@@ -1491,7 +1488,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
     }
     let cred = cx.cred();
     if let Node::Store(ino) = node {
-        cred.permission(&vfs.store().stat(ino)?, MAY_EXEC)?;
+        cred.permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
     }
     if !cred.capable(cap::SYS_CHROOT) {
         return Err(Errno::EPERM);
@@ -1508,7 +1505,7 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
         return Err(Errno::ENOTDIR);
     }
     if let Node::Store(ino) = node {
-        cx.cred().permission(&vfs.store().stat(ino)?, MAY_EXEC)?;
+        cx.cred().permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
     }
     cx.t.fs.borrow_mut().cwd = node;
     cx.shared.paths_changed();
@@ -1931,7 +1928,7 @@ pub(super) fn renameat2(
     // 任何一边以 / 结尾，被移动的就必须是目录
     if (oldpath.ends_with(b"/") || newpath.ends_with(b"/"))
         && let Some(src) = vfs.store().lookup(old_dir, old_name)?
-        && !vfs.store().stat(src)?.is_dir()
+        && !vfs.store().attrs(src)?.is_dir()
     {
         return Err(Errno::ENOTDIR);
     }
@@ -1946,7 +1943,7 @@ pub(super) fn renameat2(
     // 有 inotify 监视时先记下两边的 inode 和它们是不是目录
     let entry = |dir, name| -> Result<Option<(Ino, u32)>, Errno> {
         match vfs.store().lookup(dir, name)? {
-            Some(ino) if vfs.store().stat(ino)?.is_dir() => Ok(Some((ino, inotify::IN_ISDIR))),
+            Some(ino) if vfs.store().attrs(ino)?.is_dir() => Ok(Some((ino, inotify::IN_ISDIR))),
             Some(ino) => Ok(Some((ino, 0))),
             None => Ok(None),
         }
@@ -2075,7 +2072,7 @@ pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
 /// setgid 位（没有 `CAP_FSETID` 时静默去掉）。
 fn chmod(cx: &Cx<'_>, ino: Ino, perm: u32) -> SysResult {
     let vfs = cx.vfs()?;
-    let st = vfs.store().stat(ino)?;
+    let st = vfs.store().attrs(ino)?;
     let cred = cx.cred();
     if !cred.owns(&st) {
         return Err(Errno::EPERM);
@@ -2127,7 +2124,7 @@ pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult 
 fn chown(cx: &Cx<'_>, ino: Ino, uid: u32, gid: u32) -> SysResult {
     let (uid, gid) = (owner_arg(uid), owner_arg(gid));
     let vfs = cx.vfs()?;
-    let st = vfs.store().stat(ino)?;
+    let st = vfs.store().attrs(ino)?;
     let cred = cx.cred();
     let owner = cred.fsuid == st.uid;
     let uid_ok = uid.is_none_or(|u| owner && u == st.uid);
@@ -2192,7 +2189,7 @@ pub(super) fn utimensat(
         (time(word(0), word(1))?, time(word(2), word(3))?, explicit)
     };
     // 设成指定的时间只有属主可以，设成现在的时间有写权限也可以
-    let st = cx.vfs()?.store().stat(ino)?;
+    let st = cx.vfs()?.store().attrs(ino)?;
     let cred = cx.cred();
     if !cred.owns(&st) {
         if explicit {
@@ -2214,7 +2211,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
     let ino = store_ino(&lookup_at(cx, AT_FDCWD, &path, true)?)?;
-    let st = vfs.store().stat(ino)?;
+    let st = vfs.store().attrs(ino)?;
     match st.kind() {
         mode::S_IFDIR => Err(Errno::EISDIR),
         mode::S_IFREG => {
@@ -2702,10 +2699,13 @@ fn pipe_read(
             let mut p = pipe.borrow_mut();
             if !p.buf.is_empty() || buf.is_empty() {
                 let n = buf.len().min(p.buf.len());
+                let before = p.space();
                 for (d, s) in buf.iter_mut().zip(p.buf.drain(..n)) {
                     *d = s;
                 }
-                request_wake_object(crate::pipe::object(pipe));
+                if p.drained(before) {
+                    request_wake_object(crate::pipe::object(pipe));
+                }
                 return Ok(n);
             }
             if p.writers == 0 {
@@ -2817,8 +2817,12 @@ pub(super) fn splice(
         }
         let data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
         let n = write_bytes(cx, &output, &data, dst)?;
-        pipe.borrow_mut().buf.drain(..n);
-        request_wake_object(crate::pipe::object(&pipe));
+        let mut p = pipe.borrow_mut();
+        let before = p.space();
+        p.buf.drain(..n);
+        if p.drained(before) {
+            request_wake_object(crate::pipe::object(&pipe));
+        }
         n
     } else {
         let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
@@ -2894,6 +2898,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
+        pipe.borrow_mut().want_space(1);
         cx.wait_object(crate::pipe::object(&pipe))?;
     };
     let mut data = Vec::new();
@@ -2938,11 +2943,21 @@ fn pipe_write(
             let space = p.space();
             if (data.len() <= PIPE_BUF && space >= want) || (data.len() > PIPE_BUF && space > 0) {
                 let n = want.min(space);
+                // 读端只在管道空着时等，poll 也只在空着时报告不可读
+                if p.buf.is_empty() {
+                    request_wake_object(crate::pipe::object(pipe));
+                }
                 p.buf.extend(&data[done..done + n]);
                 done += n;
-                request_wake_object(crate::pipe::object(pipe));
                 true
             } else {
+                // 要等读端腾出空间：小写入要一次写完的空间；大写入等到至少能写一页，
+                // 免得读端每读一点就叫醒一次
+                p.want_space(if data.len() <= PIPE_BUF {
+                    want
+                } else {
+                    want.min(PIPE_BUF)
+                });
                 false
             }
         };
@@ -3349,6 +3364,13 @@ pub(super) fn sendfile(
         0 => None,
         addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
     };
+    if let Some(r) = copy_regular(cx, &input, off, &output, None, count) {
+        let n = r?;
+        if let Some(o) = off {
+            put(cx, offset, (o + n as u64).to_le_bytes())?;
+        }
+        return Ok(n as u64);
+    }
     let mut chunk = vec![0u8; count.min(IO_CHUNK)];
     let mut done = 0;
     while done < count {
@@ -3383,6 +3405,81 @@ pub(super) fn sendfile(
         put(cx, offset, o.to_le_bytes())?;
     }
     Ok(done as u64)
+}
+
+/// sendfile、copy_file_range 在两个普通文件之间拷贝时交给宿主内核（[`appine_hal::copy_file`]）：
+/// 数据不经过内核层，也只要一次宿主调用，不持 BKL。`src`、`dst` 为 None 时用并推进文件
+/// 位置；输出 fd 的宿主位置也要用，所以总是像 [`unlocked_io`] 那样占住输出的位置，等的
+/// 时候两个都不占，免得两个方向的拷贝互相等。不适用时（不是两个不同的普通文件、追加写、
+/// 有封印、宿主不支持）返回 None，由调用方逐块读写。
+fn copy_regular(
+    cx: &mut Cx<'_>,
+    input: &FileRef,
+    src: Option<u64>,
+    output: &FileRef,
+    dst: Option<u64>,
+    len: usize,
+) -> Option<Result<usize, Errno>> {
+    let (fd_in, fd_out, ino) = {
+        let (i, o) = (input.borrow(), output.borrow());
+        if o.flags & oflags::O_APPEND != 0 || i.ino() == o.ino() {
+            return None;
+        }
+        (regular_fd(&i)?, regular_fd(&o)?, o.ino()?)
+    };
+    if cx.kr().seals.contains_key(&ino) {
+        return None;
+    }
+    let len = match fsize_allowed(cx, &output.borrow(), dst, len.min(MAX_COPY)) {
+        Ok(n) => n,
+        Err(e) => return Some(Err(e)),
+    };
+    let busy = |f: &FileRef, used: bool| used && f.borrow().pos_busy != 0;
+    while busy(input, src.is_none()) || busy(output, true) {
+        if cx.task.killed.get() {
+            return Some(Err(Errno::EINTR));
+        }
+        for (f, used) in [(input, src.is_none()), (output, true)] {
+            if busy(f, used) {
+                f.borrow_mut().pos_busy = 2;
+            }
+        }
+        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::FILE) {
+            return Some(Err(e));
+        }
+    }
+    let from = src.unwrap_or_else(|| input.borrow().pos);
+    let to = dst.unwrap_or_else(|| output.borrow().pos);
+    if src.is_none() {
+        input.borrow_mut().pos_busy = 1;
+    }
+    output.borrow_mut().pos_busy = 1;
+    let r = cx.unlocked(|| appine_hal::copy_file(fd_in, from, fd_out, to, len));
+    let mut wake = false;
+    for (f, used, dst, at) in [(input, src.is_none(), src, from), (output, true, dst, to)] {
+        if used {
+            let mut f = f.borrow_mut();
+            if let (Ok(n), None) = (r, dst) {
+                f.pos = at + n as u64;
+            }
+            wake |= std::mem::take(&mut f.pos_busy) == 2;
+        }
+    }
+    if wake {
+        request_wake_files();
+    }
+    match r.map_err(Errno) {
+        // 宿主不支持这一对文件：调用方逐块读写
+        Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP | Errno::EXDEV) => None,
+        Err(e) => Some(Err(e)),
+        Ok(n) => {
+            if n > 0 {
+                inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+                inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+            }
+            Some(Ok(n))
+        }
+    }
 }
 
 /// copy_file_range：在两个普通文件之间拷贝，不经过 guest 内存。偏移指针为空时使用并
@@ -3431,6 +3528,16 @@ pub(super) fn copy_file_range(
         if s < d + len as u64 && d < s + len as u64 {
             return Err(Errno::EINVAL);
         }
+    }
+    if let Some(r) = copy_regular(cx, &input, src, &output, dst, len) {
+        let n = r? as u64;
+        if let Some(s) = src {
+            put(cx, off_in, (s + n).to_le_bytes())?;
+        }
+        if let Some(d) = dst {
+            put(cx, off_out, (d + n).to_le_bytes())?;
+        }
+        return Ok(n);
     }
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;

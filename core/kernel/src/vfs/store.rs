@@ -28,7 +28,8 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -132,20 +133,36 @@ pub struct Store {
     lock: File,
     /// 元数据缓存、提交计数器和 `objects` 目录。
     meta: Arc<Meta>,
-    /// 正在一个操作里（[`Store::transaction`]）：读到的可能是它回滚时会撤销的内容，
-    /// 不用缓存。
+    /// 正在一个操作里（[`Store::transaction`]）：查到的可能是它回滚时会撤销的内容，不填
+    /// 进缓存。缓存照样读：这次操作改过的条目改的时候就去掉了（[`Store::touch_name`]），
+    /// 留下的都与数据库一致。
     writing: Cell<bool>,
     /// [`Store::snapshot`] 里：还没开始读事务时是 Some(None)，开始时的提交计数是
     /// Some(Some(n))。
     snapshot_at: Cell<Option<Option<u64>>>,
-    /// 这次写入改了的目录项和 inode 行，提交之后从缓存里去掉。
-    touched: RefCell<Touched>,
     /// 推迟提交的写事务开始的时刻；None 时没有打开的写事务。
     pending: Cell<Option<Instant>>,
     /// 最后一个链接已经删除、等写事务提交之后再删除的 object。
     doomed: RefCell<Vec<Ino>>,
     /// 开始推迟提交时调用：叫醒到点提交的线程（[`Store::commit_due`]）。
     waker: RefCell<Option<Box<dyn Fn()>>>,
+    /// 删除 object 的后台线程（[`reap`]）。
+    reaper: Option<JoinHandle<()>>,
+    /// 这个操作成功之后放进缓存的内容（[`Fill`]）。
+    fills: RefCell<Vec<Fill>>,
+}
+
+/// 操作里新建的目录项和 inode 行：内容在操作里就知道了，操作成功之后直接放进缓存，新建
+/// 之后马上按路径 chmod、chown、stat 时不必再查数据库。之后同一个操作又改了它们的，
+/// 改的时候作废（[`Store::touch_name`]）。
+enum Fill {
+    Name(Ino, Vec<u8>, Ino),
+    Row(Stat),
+}
+
+impl Fill {
+    /// 每个操作最多记这么多：导入 rootfs 整个是一个操作，作废时逐个比较会变成平方级。
+    const MAX: usize = 64;
 }
 
 /// 元数据缓存，以及不持 BKL 读它（`syscall::fast`）要用的东西。
@@ -160,6 +177,63 @@ pub(crate) struct Meta {
     commits: Commits,
     /// `objects` 目录（宿主 `O_PATH`），按 inode 编号 stat object 不必解析整个路径。
     objects_dir: OwnedFd,
+    /// 等着后台线程删除的 object（[`reap`]）。
+    reaper: Reaper,
+}
+
+/// 提交之后要删除的 object 交给后台线程（[`reap`]）：宿主的 unlink 每个几微秒，还要拿
+/// `objects` 目录的锁，`rm -rf` 时占了 guest 线程一成多的时间，而且是持着 BKL 做的。
+/// 删除之前 App 被杀掉也没关系：inode 行以 nlink = 0 留着，开机时清理。
+#[derive(Default)]
+struct Reaper {
+    state: Mutex<Reaping>,
+    /// 有活干了，或者该退出了。
+    work: Condvar,
+    /// 队列空了、手上也没有在删的（测试等它）。
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct Reaping {
+    queue: Vec<Ino>,
+    busy: bool,
+    quit: bool,
+    /// 一共交给它多少个（测试用）。
+    #[cfg(test)]
+    handed: usize,
+}
+
+/// 删除 object 的后台线程，直到 Store 关闭；关闭之前删完队列里的。
+fn reap(meta: Arc<Meta>) {
+    let r = &meta.reaper;
+    let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        if !st.queue.is_empty() {
+            let inos = std::mem::take(&mut st.queue);
+            st.busy = true;
+            drop(st);
+            for ino in inos {
+                let _ = remove_object(&meta.objects_dir, ino);
+            }
+            st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.busy = false;
+            continue;
+        }
+        r.idle.notify_all();
+        if st.quit {
+            return;
+        }
+        st = r.work.wait(st).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// 删除 `objects` 目录里的 object；它已经不在时不算错误。
+fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+    let mut name = [0u8; 21];
+    match appine_hal::unlink_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)) {
+        Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
+        _ => Ok(()),
+    }
 }
 
 // SAFETY: 缓存按上面的约定同步；提交计数器是共享映射里的原子变量，映射在 Meta 存续
@@ -244,13 +318,6 @@ fn object_name(mut ino: Ino, buf: &mut [u8; 21]) -> &std::ffi::CStr {
             return std::ffi::CStr::from_bytes_with_nul(&buf[i..]).unwrap();
         }
     }
-}
-
-/// 写入改了的东西（[`Store::written`]）。
-#[derive(Default)]
-struct Touched {
-    names: Vec<(Ino, Vec<u8>)>,
-    inos: Vec<Ino>,
 }
 
 /// 缓存的哈希：键是 inode 号和文件名，不必抵御哈希碰撞攻击，用 FxHash（rustc 的做法）。
@@ -431,12 +498,10 @@ fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
     st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
 }
 
-/// 删除 object 文件；它已经不在时不算错误。
-fn remove_object(path: &Path) -> Result<(), Errno> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_err(e)),
-        _ => Ok(()),
-    }
+/// 宿主上操作 object 出错（宿主的错误码）。
+fn object_err(ino: Ino, e: i32) -> Errno {
+    crate::debug::log(format_args!("inode store: object {ino}: errno {e}"));
+    Errno(e)
 }
 
 impl Store {
@@ -495,7 +560,7 @@ impl Store {
         if *range.start() != 0 {
             for ino in range {
                 if self.query_stat_row(ino) == Err(Errno::ENOENT) {
-                    remove_object(&self.object_path(ino))?;
+                    self.remove_object(ino)?;
                 }
             }
             lo.store(0, Ordering::SeqCst);
@@ -544,13 +609,16 @@ impl Store {
             rows.collect::<Result<_, _>>().map_err(db_err)?
         };
         for (ino, m) in orphans {
+            // 不交给后台线程：行一删掉，编号就可能分给新建的文件，后台线程晚一点删的会是
+            // 新文件的 object。提交之前删也没关系，这些行早就没有目录项指着了
             if m & mode::S_IFMT == mode::S_IFREG {
-                self.doomed.borrow_mut().push(ino);
+                self.remove_object(ino)?;
             }
             self.db
                 .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino]))
                 .map_err(db_err)?;
+            self.touch_ino(ino);
             self.db
                 .prepare_cached("DELETE FROM xattrs WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino]))
@@ -580,25 +648,35 @@ impl Store {
         appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
         let commits = Commits::open(&lock)?;
         let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
+        let meta = Arc::new(Meta {
+            lock: RwLock::new(()),
+            cache: UnsafeCell::new(Cache {
+                generation: commits.get(),
+                ..Cache::default()
+            }),
+            commits,
+            objects_dir,
+            reaper: Reaper::default(),
+        });
+        let reaper = {
+            let meta = meta.clone();
+            std::thread::Builder::new()
+                .name("objects-reaper".into())
+                .spawn(move || reap(meta))
+                .ok()
+        };
         Ok(Store {
             db,
             objects: dir.join("objects"),
             lock,
-            meta: Arc::new(Meta {
-                lock: RwLock::new(()),
-                cache: UnsafeCell::new(Cache {
-                    generation: commits.get(),
-                    ..Cache::default()
-                }),
-                commits,
-                objects_dir,
-            }),
+            meta,
+            reaper,
             writing: Cell::new(false),
             snapshot_at: Cell::new(None),
-            touched: RefCell::default(),
             pending: Cell::new(None),
             doomed: RefCell::default(),
             waker: RefCell::new(None),
+            fills: RefCell::default(),
         })
     }
 
@@ -617,6 +695,20 @@ impl Store {
     /// busy_timeout 也帮不上忙。已经在操作里时（导入 rootfs 时整个导入是一个操作）直接
     /// 并入外层。
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
+        self.operation(true, f)
+    }
+
+    /// 只有一条写语句的操作（改权限、属主、时间）：语句本身是原子的，失败时 SQLite 只撤销
+    /// 这一条，不需要保存点。
+    fn statement<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
+        self.operation(false, f)
+    }
+
+    fn operation<T>(
+        &self,
+        savepoint: bool,
+        f: impl FnOnce(&Store) -> Result<T, Errno>,
+    ) -> Result<T, Errno> {
         // 读事务里（[`Store::snapshot`]）也直接执行：和原来一样在读事务里写
         if self.writing.get() || (self.pending.get().is_none() && !self.db.is_autocommit()) {
             return f(self);
@@ -630,18 +722,27 @@ impl Store {
                 wake();
             }
         }
-        let r = self.exec("SAVEPOINT op").and_then(|()| {
+        let r = if savepoint {
+            self.exec("SAVEPOINT op")
+        } else {
+            Ok(())
+        };
+        let r = r.and_then(|()| {
             let op = Op {
                 store: self,
+                savepoint,
                 doomed: self.doomed.borrow().len(),
                 done: false,
             };
             self.writing.set(true);
-            let r = f(self).and_then(|v| self.exec("RELEASE op").map(|()| v));
+            let r = f(self);
+            let r = match r {
+                Ok(v) if savepoint => self.exec("RELEASE op").map(|()| v),
+                r => r,
+            };
             op.finish(r.is_ok());
             r
         });
-        self.written();
         // 别的进程也在用仓库时立即提交，免得它看不到；推迟够久了也提交
         let overdue = self
             .pending
@@ -692,9 +793,7 @@ impl Store {
         let (lo, hi) = self.meta.commits.fresh();
         lo.store(0, Ordering::SeqCst);
         hi.store(0, Ordering::SeqCst);
-        for ino in doomed {
-            let _ = remove_object(&self.object_path(ino));
-        }
+        self.reap_later(doomed);
         // 计数器必须在提交之后加：之前加的话，别的进程可能赶在提交完成之前重新读到旧的
         // 内容，再记成新的计数。计数器在这之前被别人改过，自己的缓存也整体作废
         self.update(|c| {
@@ -708,36 +807,38 @@ impl Store {
         Ok(())
     }
 
-    /// 写入改了目录 `dir` 里的名字 `name`。
+    /// 改了目录 `dir` 里的名字 `name`：从自己的缓存里去掉受影响的条目。别的进程的缓存
+    /// 在提交时作废（[`Store::commit`]）。
     fn touch_name(&self, dir: Ino, name: &[u8]) {
-        self.touched.borrow_mut().names.push((dir, name.to_vec()));
-    }
-
-    /// 写入改了 inode `ino` 的行。
-    fn touch_ino(&self, ino: Ino) {
-        self.touched.borrow_mut().inos.push(ino);
-    }
-
-    /// 一个操作结束之后调用：从自己的缓存里去掉改了的条目。别的进程的缓存在提交时作废
-    /// （[`Store::commit`]）。
-    fn written(&self) {
-        let touched = std::mem::take(&mut *self.touched.borrow_mut());
-        if touched.names.is_empty() && touched.inos.is_empty() {
-            return;
-        }
+        self.fills
+            .borrow_mut()
+            .retain(|f| !matches!(f, Fill::Name(d, n, _) if *d == dir && n == name));
         self.update(|c| {
-            for (dir, name) in &touched.names {
-                if let Some(d) = c.dentries.get_mut(dir) {
-                    d.remove(name);
-                }
-                c.listings.remove(dir);
-                c.names.remove(dir);
+            if let Some(d) = c.dentries.get_mut(&dir) {
+                d.remove(name);
             }
-            for ino in &touched.inos {
-                c.rows.remove(ino);
-                c.targets.remove(ino);
-                c.parents.remove(ino);
-            }
+            c.listings.remove(&dir);
+            c.names.remove(&dir);
+        });
+    }
+
+    /// 操作成功之后把 `fill` 放进缓存。
+    fn fill(&self, fill: Fill) {
+        let mut fills = self.fills.borrow_mut();
+        if fills.len() < Fill::MAX {
+            fills.push(fill);
+        }
+    }
+
+    /// 改了 inode `ino` 的行（同上）。
+    fn touch_ino(&self, ino: Ino) {
+        self.fills
+            .borrow_mut()
+            .retain(|f| !matches!(f, Fill::Row(st) if st.ino == ino));
+        self.update(|c| {
+            c.rows.remove(&ino);
+            c.targets.remove(&ino);
+            c.parents.remove(&ino);
         });
     }
 
@@ -773,16 +874,19 @@ impl Store {
         Ok(())
     }
 
-    /// 缓存能不能用：操作里不能。能用时返回现在的提交计数，缓存是旧的就先清空。
+    /// 缓存是现在的（读缓存之前已经清空过旧的）：操作成功之后往里填它新建的东西用。
+    fn cache_generation_any(&self) -> bool {
+        self.cached(|c| c.generation) == self.meta.commits.get()
+    }
+
+    /// 读缓存之前调用：缓存是旧的就先清空。查到的能填进缓存时（不在操作里）返回现在的
+    /// 提交计数。
     fn cache_generation(&self) -> Option<u64> {
-        if self.writing.get() {
-            return None;
-        }
         let now = self.meta.commits.get();
         if self.cached(|c| c.generation != now || c.entries > Cache::MAX_ENTRIES) {
             self.update(|c| c.clear(now));
         }
-        Some(now)
+        (!self.writing.get()).then_some(now)
     }
 
     /// 刚查到的结果能不能放进缓存：读事务开始以来、以及这次查询期间都没有人提交过
@@ -813,16 +917,45 @@ impl Store {
         r
     }
 
-    fn object_path(&self, ino: Ino) -> PathBuf {
-        self.objects.join(ino.to_string())
+    /// 打开 object（相对 `objects` 目录，不解析整个路径），`flags` 是宿主 open 的标志。
+    fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
+        let mut name = [0u8; 21];
+        let dir = self.meta.objects_dir.as_raw_fd();
+        appine_hal::open_at(dir, object_name(ino, &mut name), flags, 0o666)
+            .map_err(|e| object_err(ino, e))
+    }
+
+    /// 删除 object；它已经不在时不算错误。
+    fn remove_object(&self, ino: Ino) -> Result<(), Errno> {
+        remove_object(&self.meta.objects_dir, ino)
+    }
+
+    /// 把 object 交给后台线程删除；线程没有建起来时自己删。
+    fn reap_later(&self, inos: Vec<Ino>) {
+        if inos.is_empty() {
+            return;
+        }
+        if self.reaper.is_none() {
+            for ino in inos {
+                let _ = self.remove_object(ino);
+            }
+            return;
+        }
+        let r = &self.meta.reaper;
+        let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            st.handed += inos.len();
+        }
+        st.queue.extend(inos);
+        drop(st);
+        r.work.notify_one();
     }
 
     /// 在目录 `parent` 里查找 `name`。
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
         let generation = self.cache_generation();
-        if generation.is_some()
-            && let Some(hit) = self.cached(|c| c.dentries.get(&parent)?.get(name).copied())
-        {
+        if let Some(hit) = self.cached(|c| c.dentries.get(&parent)?.get(name).copied()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -848,9 +981,7 @@ impl Store {
     /// 见 `syscall::fs` 的 `display_path`，所以要缓存）。
     pub fn name_of(&self, parent: Ino, ino: Ino) -> Result<Option<Vec<u8>>, Errno> {
         let generation = self.cache_generation();
-        if generation.is_some()
-            && let Some(hit) = self.cached(|c| c.names.get(&parent)?.get(&ino).cloned())
-        {
+        if let Some(hit) = self.cached(|c| c.names.get(&parent)?.get(&ino).cloned()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -890,6 +1021,11 @@ impl Store {
         Ok(st)
     }
 
+    /// 数据库里的元数据（不碰宿主，普通文件的 size、时间没有填）：打开文件时检查权限用。
+    pub fn attrs(&self, ino: Ino) -> Result<Stat, Errno> {
+        self.stat_row(ino)
+    }
+
     /// 文件类型位（不需要读 object，删除之后仍然打开着的文件也能用）。
     pub fn kind(&self, ino: Ino) -> Result<u32, Errno> {
         Ok(self.stat_row(ino)?.kind())
@@ -898,9 +1034,7 @@ impl Store {
     /// 数据库里的元数据（普通文件的 size、mtime 还没有填）。
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
         let generation = self.cache_generation();
-        if generation.is_some()
-            && let Some(hit) = self.cached(|c| c.rows.get(&ino).copied())
-        {
+        if let Some(hit) = self.cached(|c| c.rows.get(&ino).copied()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -957,9 +1091,7 @@ impl Store {
     /// 读取符号链接的目标。
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
         let generation = self.cache_generation();
-        if generation.is_some()
-            && let Some(hit) = self.cached(|c| c.targets.get(&ino).cloned())
-        {
+        if let Some(hit) = self.cached(|c| c.targets.get(&ino).cloned()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -983,9 +1115,7 @@ impl Store {
     /// 目录的上级目录；根目录的上级是它自己。
     pub fn parent(&self, dir: Ino) -> Result<Ino, Errno> {
         let generation = self.cache_generation();
-        if generation.is_some()
-            && let Some(hit) = self.cached(|c| c.parents.get(&dir).copied())
-        {
+        if let Some(hit) = self.cached(|c| c.parents.get(&dir).copied()) {
             return Ok(hit);
         }
         self.begin_read()?;
@@ -1008,9 +1138,7 @@ impl Store {
     /// 列出目录内容，按名字排序，不含 `.` 和 `..`。
     pub fn readdir(&self, dir: Ino) -> Result<Vec<DirEntry>, Errno> {
         let generation = self.cache_generation();
-        if generation.is_some()
-            && let Some(hit) = self.cached(|c| c.listings.get(&dir).cloned())
-        {
+        if let Some(hit) = self.cached(|c| c.listings.get(&dir).cloned()) {
             return Ok(hit);
         }
         let mut stmt = self
@@ -1041,11 +1169,7 @@ impl Store {
 
     /// 打开普通文件的 object。
     pub fn open_object(&self, ino: Ino, write: bool) -> Result<File, Errno> {
-        OpenOptions::new()
-            .read(true)
-            .write(write)
-            .open(self.object_path(ino))
-            .map_err(io_err)
+        self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
     fn new_inode(
@@ -1066,6 +1190,18 @@ impl Store {
             .map_err(db_err)?;
         let ino = self.db.last_insert_rowid() as Ino;
         self.touch_ino(ino);
+        self.fill(Fill::Row(Stat {
+            ino,
+            mode,
+            nlink,
+            uid,
+            gid,
+            rdev: 0,
+            size: 0,
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
+        }));
         let (lo, hi) = self.meta.commits.fresh();
         if lo.load(Ordering::Relaxed) == 0 {
             lo.store(ino, Ordering::Relaxed);
@@ -1078,7 +1214,7 @@ impl Store {
         if self.lookup(parent, name)?.is_some() {
             return Err(Errno::EEXIST);
         }
-        if !self.stat(parent)?.is_dir() {
+        if !self.stat_row(parent)?.is_dir() {
             return Err(Errno::ENOTDIR);
         }
         self.db
@@ -1086,6 +1222,7 @@ impl Store {
             .and_then(|mut st| st.execute(params![parent, name, ino]))
             .map_err(db_err)?;
         self.touch_name(parent, name);
+        self.fill(Fill::Name(parent, name.to_vec(), ino));
         Ok(())
     }
 
@@ -1136,13 +1273,7 @@ impl Store {
     /// 为新的 inode 建空的 object。已经有的话是没来得及提交就丢失的 inode 留下的
     /// （inode 编号又分配了出来），清空后接着用。
     fn new_object(&self, ino: Ino) -> Result<File, Errno> {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(self.object_path(ino))
-            .map_err(io_err)
+        self.object(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
     }
 
     /// 新建一个没有名字的普通文件（memfd_create）：链接数为 0，object 一开始就删除，
@@ -1151,7 +1282,7 @@ impl Store {
         self.transaction(|s| {
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), 0, 0, 0, 0)?;
             let file = s.new_object(ino)?;
-            remove_object(&s.object_path(ino))?;
+            s.remove_object(ino)?;
             Ok((ino, file))
         })
     }
@@ -1173,6 +1304,7 @@ impl Store {
             s.db.prepare_cached("UPDATE inodes SET target = ?1 WHERE ino = ?2")
                 .and_then(|mut st| st.execute(params![target, ino]))
                 .map_err(db_err)?;
+            s.touch_ino(ino);
             s.add_dentry(parent, name, ino)?;
             Ok(ino)
         })
@@ -1196,6 +1328,7 @@ impl Store {
             s.db.prepare_cached("UPDATE inodes SET rdev = ?1 WHERE ino = ?2")
                 .and_then(|mut st| st.execute(params![rdev, ino]))
                 .map_err(db_err)?;
+            s.touch_ino(ino);
             s.add_dentry(parent, name, ino)?;
             Ok(ino)
         })
@@ -1220,7 +1353,7 @@ impl Store {
 
     /// 修改权限位（保留类型位）。
     pub fn set_mode(&self, ino: Ino, perm: u32) -> Result<(), Errno> {
-        self.transaction(|s| {
+        self.statement(|s| {
             let n =
                 s.db.prepare_cached(
                     "UPDATE inodes SET mode = (mode & ?2) | ?3, ctime_ns = ?4 WHERE ino = ?1",
@@ -1362,6 +1495,7 @@ impl Store {
             .and_then(|mut st| st.execute(params![parent, name, ino]))
             .map_err(db_err)?;
         self.touch_name(parent, name);
+        self.fill(Fill::Name(parent, name.to_vec(), ino));
         Ok(())
     }
 
@@ -1454,7 +1588,7 @@ impl Store {
 
     /// 修改权限位、属主和属组（保留类型位）。
     pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
-        self.transaction(|s| {
+        self.statement(|s| {
             s.db.prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
                 .map_err(db_err)?;
@@ -1546,28 +1680,19 @@ impl Store {
         atime_ns: Option<i64>,
         mtime_ns: Option<i64>,
     ) -> Result<(), Errno> {
-        let at = |ns: i64| {
-            if ns >= 0 {
-                UNIX_EPOCH + Duration::from_nanos(ns as u64)
-            } else {
-                UNIX_EPOCH
-            }
-        };
-        if self.stat(ino)?.kind() == mode::S_IFREG {
-            let mut times = fs::FileTimes::new();
-            if let Some(ns) = atime_ns {
-                times = times.set_accessed(at(ns));
-            }
-            if let Some(ns) = mtime_ns {
-                times = times.set_modified(at(ns));
-            }
-            return self
-                .open_object(ino, true)?
-                .set_times(times)
-                .map_err(io_err);
+        if self.kind(ino)? == mode::S_IFREG {
+            let mut name = [0u8; 21];
+            let split = |ns: i64| (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
+            return appine_hal::set_times_at(
+                self.meta.objects_dir.as_raw_fd(),
+                object_name(ino, &mut name),
+                atime_ns.map(split),
+                mtime_ns.map(split),
+            )
+            .map_err(|e| object_err(ino, e));
         }
         if let Some(ns) = mtime_ns {
-            self.transaction(|s| {
+            self.statement(|s| {
                 s.db.prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
                     .and_then(|mut st| st.execute(params![ino, ns]))
                     .map_err(db_err)?;
@@ -1580,9 +1705,10 @@ impl Store {
 }
 
 /// [`Store::transaction`] 里的一个操作：没有正常结束（出错或者 panic）时回滚到它的
-/// 保存点，撤销它要删除的 object。
+/// 保存点，撤销它要删除的 object。没有保存点的（[`Store::statement`]）只清掉"在操作里"。
 struct Op<'a> {
     store: &'a Store,
+    savepoint: bool,
     doomed: usize,
     done: bool,
 }
@@ -1597,10 +1723,29 @@ impl Drop for Op<'_> {
     fn drop(&mut self) {
         let s = self.store;
         s.writing.set(false);
+        let fills = std::mem::take(&mut *s.fills.borrow_mut());
         if !self.done {
-            let _ = s.exec("ROLLBACK TO op");
-            let _ = s.exec("RELEASE op");
-            s.doomed.borrow_mut().truncate(self.doomed);
+            if self.savepoint {
+                let _ = s.exec("ROLLBACK TO op");
+                let _ = s.exec("RELEASE op");
+                s.doomed.borrow_mut().truncate(self.doomed);
+            }
+            return;
+        }
+        if !fills.is_empty() && s.cache_generation_any() {
+            s.update(|c| {
+                for f in fills {
+                    c.entries += 1;
+                    match f {
+                        Fill::Name(dir, name, ino) => {
+                            c.dentries.entry(dir).or_default().insert(name, Some(ino));
+                        }
+                        Fill::Row(st) => {
+                            c.rows.insert(st.ino, st);
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -1609,6 +1754,12 @@ impl Drop for Store {
     fn drop(&mut self) {
         if let Err(e) = self.commit() {
             crate::debug::log(format_args!("inode store: final commit failed: {e:?}"));
+        }
+        if let Some(t) = self.reaper.take() {
+            let r = &self.meta.reaper;
+            r.state.lock().unwrap_or_else(PoisonError::into_inner).quit = true;
+            r.work.notify_one();
+            let _ = t.join();
         }
         self.meta.commits.users().fetch_sub(1, Ordering::SeqCst);
     }
@@ -1620,6 +1771,15 @@ mod tests {
     use std::io::Write;
 
     impl Store {
+        /// 等后台线程删完交给它的 object。
+        fn reaped(&self) {
+            let r = &self.meta.reaper;
+            let mut st = r.state.lock().unwrap();
+            while !st.queue.is_empty() || st.busy {
+                st = r.idle.wait(st).unwrap();
+            }
+        }
+
         /// 模拟进程在提交之前被杀掉：推迟的修改丢失，等着删除的 object 留着，`lock` 里
         /// 新分配的 inode 编号范围也留着。
         fn crash(self) {
@@ -1905,9 +2065,41 @@ mod tests {
         s.unlink(ROOT, b"f").unwrap();
         assert!(object.exists());
         s.commit().unwrap();
+        s.reaped();
         assert!(!object.exists());
         assert_eq!(count(b"f"), 0);
         drop((raw, s));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inode_numbers_reused_after_boot_keep_their_objects() {
+        let (s, dir) = temp_store("reuse");
+        let inos: Vec<Ino> = (0..50)
+            .map(|i| {
+                let name = format!("f{i}");
+                let (ino, _) = s.create_file(ROOT, name.as_bytes(), 0o644, 0, 0).unwrap();
+                s.unlink(ROOT, name.as_bytes()).unwrap();
+                ino
+            })
+            .collect();
+        drop(s);
+        // 开机清理删掉这些 inode 行，编号又分配给新建的文件。清理时自己删 object，不交给
+        // 后台线程：它晚一点删的话，删掉的是新文件的
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.meta.reaper.state.lock().unwrap().handed, 0);
+        for i in 0..50 {
+            s.create_file(ROOT, format!("g{i}").as_bytes(), 0o644, 0, 0)
+                .unwrap();
+        }
+        s.commit().unwrap();
+        s.reaped();
+        for i in 0..50 {
+            let ino = s.lookup(ROOT, format!("g{i}").as_bytes()).unwrap().unwrap();
+            assert!(inos.contains(&ino));
+            assert!(dir.join("objects").join(ino.to_string()).exists());
+        }
+        drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 

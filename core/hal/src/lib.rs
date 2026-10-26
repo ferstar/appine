@@ -99,6 +99,34 @@ pub fn pwrite(fd: i32, buf: &[u8], offset: u64) -> Result<usize, i32> {
     }
 }
 
+/// 把宿主文件 `fd_in` 从 `off_in` 开始的最多 `len` 字节拷到 `fd_out` 的 `off_out` 处，
+/// 数据不经过用户态，返回拷贝的字节数。用 sendfile：Android 14 之前 App 的 seccomp 不允许
+/// copy_file_range（会收到 SIGSYS）。sendfile 写在输出 fd 的位置上，所以先把它移到
+/// `off_out`，调用方要保证这期间没有别人用这个 fd 的位置。遇到 `EINTR` 自动重试。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn copy_file(
+    fd_in: i32,
+    off_in: u64,
+    fd_out: i32,
+    off_out: u64,
+    len: usize,
+) -> Result<usize, i32> {
+    if unsafe { libc::lseek(fd_out, off_out as libc::off_t, libc::SEEK_SET) } < 0 {
+        return Err(last_errno());
+    }
+    loop {
+        let mut off = off_in as libc::off_t;
+        let n = unsafe { libc::sendfile(fd_out, fd_in, &mut off, len) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let errno = last_errno();
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+}
+
 /// 从宿主 fd 的 `offset` 处读取（pread），遇到 `EINTR` 自动重试。
 pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, i32> {
     loop {
@@ -256,6 +284,62 @@ pub fn open_dir(path: &std::path::Path) -> Result<std::os::fd::OwnedFd, i32> {
         return Err(last_errno());
     }
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// 打开目录 `dir` 里名为 `name` 的文件（openat，总是带 `O_CLOEXEC`），新建时权限是
+/// `mode`（再去掉 umask）。
+pub fn open_at(
+    dir: i32,
+    name: &std::ffi::CStr,
+    flags: i32,
+    mode: u32,
+) -> Result<std::fs::File, i32> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// 设置目录 `dir` 里名为 `name` 的文件的访问时间和修改时间（utimensat，跟随符号链接），
+/// 时间是 (秒, 纳秒)，None 表示不改。
+pub fn set_times_at(
+    dir: i32,
+    name: &std::ffi::CStr,
+    atime: Option<(i64, i64)>,
+    mtime: Option<(i64, i64)>,
+) -> Result<(), i32> {
+    let ts = |t: Option<(i64, i64)>| match t {
+        Some((sec, nsec)) => libc::timespec {
+            tv_sec: sec as libc::time_t,
+            tv_nsec: nsec as _,
+        },
+        None => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    };
+    let times = [ts(atime), ts(mtime)];
+    if unsafe { libc::utimensat(dir, name.as_ptr(), times.as_ptr(), 0) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// 删除目录 `dir` 里名为 `name` 的文件（unlinkat）。
+pub fn unlink_at(dir: i32, name: &std::ffi::CStr) -> Result<(), i32> {
+    if unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
 }
 
 /// 读取目录 `dir` 里名为 `name` 的文件的元数据（跟随符号链接）。

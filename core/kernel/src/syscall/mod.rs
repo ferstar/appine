@@ -58,6 +58,9 @@ type SysResult = Result<u64, Errno>;
 /// 单次在 guest 与宿主之间拷贝的最大字节数，避免按 guest 给的长度一次性分配内存。
 const IO_CHUNK: usize = 64 * 1024;
 
+/// sendfile、copy_file_range 一次最多拷这么多，与 Linux 的 `MAX_RW_COUNT` 相同。
+const MAX_COPY: usize = 0x7fff_f000;
+
 /// 路径参数的最大长度（含 NUL），与 Linux 的 `PATH_MAX` 相同。
 const PATH_MAX: usize = 4096;
 
