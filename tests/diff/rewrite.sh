@@ -48,3 +48,20 @@ sleep 3
 ./prog
 sleep 3
 ./prog; ./prog
+
+# 共享库就地改写：池里的翻译在新进程第一次运行时库还没有映射，先停放起来，执行到时再
+# 核对，内容变了就不能用
+for n in 42 43; do
+    printf 'int v(void) { return %s * 3 + 1; }\n' $n > lib$n.c
+    gcc -O2 -shared -fPIC -o lib$n.so lib$n.c
+done
+[ "$(stat -c %s lib42.so)" = "$(stat -c %s lib43.so)" ] && echo same size
+printf '#include <stdio.h>\nint v(void);\nint main(void) { printf("%%d\\n", v()); return 0; }\n' > uselib.c
+cp lib42.so libv.so
+gcc -O2 -o uselib uselib.c -L. -lv -Wl,-rpath,/tmp
+sleep 3
+./uselib; ./uselib
+cat lib43.so > libv.so
+./uselib; ./uselib
+dd if=lib42.so of=libv.so conv=notrunc 2>/dev/null
+./uselib; ./uselib

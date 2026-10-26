@@ -553,7 +553,7 @@ pub struct DbtSource {
 
 impl DbtSpace {
     /// [`DbtSpace::set_sources`] 最多记下几段。
-    pub const SOURCES: usize = 16;
+    pub const SOURCES: usize = 64;
 
     /// 创建（或者从池里取出）一个实例；宿主不是 aarch64 Linux 时返回 `None`。`key` 区分
     /// 程序（0 表示不区分）：池里有同一个键留下的翻译时优先拿回它，用完放回池里时也按它

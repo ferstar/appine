@@ -149,7 +149,9 @@ struct block {
     uint32_t *code;  /* 已作废时为 NULL */
     uint32_t next;   /* 同一个桶里的上一个块（下标加 1），0 表示没有 */
     uint32_t words;  /* 翻译时的 guest 指令字在 words 里的位置（recheck 用） */
-    uint32_t nguest; /* guest 指令条数 */
+    uint16_t nguest; /* guest 指令条数 */
+    uint16_t parked; /* 停放着（revive）：入口像作废块一样跳往转发桩，代码还在 */
+    uint32_t first;  /* 停放时被改写的那条入口检查之后的指令 */
 };
 
 /* 一组访存第二次没通过共用的检查之后，组长的 pc 记在这里，重新翻译时它和后面同一个
@@ -190,6 +192,7 @@ struct appine_dbt {
     size_t table_dead;     /* 其中的墓碑 */
     struct block *blocks; /* 与 table_used 一一对应，按翻译顺序记录 */
     size_t blocks_dead;   /* 其中已经作废的 */
+    size_t nparked;       /* 其中停放着的（revive） */
     uint32_t *words;      /* 各块翻译时的 guest 指令字，按需映射 */
     size_t words_used;
     /* 换了地址空间（exec、fork 之后从池里取出），下次运行之前要核对 */
@@ -200,9 +203,13 @@ struct appine_dbt {
     /* 下一次核对时不必看的范围 [start, end)（appine_dbt_trust） */
     uint64_t trusted[APPINE_DBT_SOURCES][2];
     unsigned ntrusted;
+    /* 上一个使用者的文件映射 [start, end)：核对时其中还没映射的块停放起来（recheck） */
+    uint64_t parkable[APPINE_DBT_SOURCES][2];
+    unsigned nparkable;
     /* 运行时宿主出了故障（APPINE_EXIT_HOST_FAULT）：各张表可能只改了一半，不再使用 */
     bool poisoned;
     uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
+    uint32_t *page_parked; /* 同一个哈希：停放着的块数，查表失败时不持锁看一眼（revive） */
     uint64_t nogroup[NOGROUP_MAX];
     unsigned nogroup_count;
     uint64_t strikes[STRIKES];
@@ -1484,9 +1491,23 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
         return true;
     }
 
-    if (is_stolen(rt)) /* CAS 循环里没有空闲的寄存器放要写的值 */
-        return false;
     emit_atomic_address(x, rn, bytes, true, pc);
+    /*
+     * 要写的值在被占用的寄存器里（libgcc 的 outline atomics 都这样写：Alpine 上它们不
+     * 认 LSE，总是走 LL/SC 的循环）：CAS 循环里 T0、T1、T2 都有用处，借一个这条指令
+     * 没用到的 guest 寄存器放它。借来的寄存器先存进 cpu 结构体里它自己的位置（翻译后的
+     * 代码运行期间那里没有用），用完恢复；中间不会退出，宿主故障也不从 ucontext 恢复
+     * guest 状态（guard.c），所以没有人看得到它被借走。原来整条交给 Tier 0，node 启动时
+     * 每次要退出一万多次。
+     */
+    unsigned v = rt, borrow = 0;
+    if (is_stolen(rt)) {
+        while (borrow == rn || borrow == rs)
+            borrow++;
+        emit_store_guest(x, borrow, borrow);
+        emit_load_guest(x, borrow, rt);
+        v = borrow;
+    }
     uint32_t *mismatch[2], *differ, *done;
     emit(x, enc_ldr_x(T1, CTX, addr));
     emit(x, enc_eor_lsr(T1, T1, T0, 0));
@@ -1502,7 +1523,7 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
     emit(x, enc_eor_lsr(T0, T0, T1, 0));
     differ = here(x);
     emit(x, enc_cbnz_x(T0));
-    emit(x, enc_stlxr(size, T1, rt, T2));
+    emit(x, enc_stlxr(size, T1, v, T2));
     uint32_t *again = here(x);
     emit(x, enc_cbnz_x(T1));
     patch_local(x, again, loop);
@@ -1515,6 +1536,8 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
     patch_local(x, mismatch[1], here(x));
     emit_status(x, rs, 1);
     patch_local(x, done, here(x));
+    if (v != rt)
+        emit_load_guest(x, borrow, borrow);
     emit(x, enc_str_w(31, CTX, len));
     return true;
 }
@@ -2098,7 +2121,7 @@ static void table_rebuild(struct appine_dbt *d, struct table *table)
     size_t occupied = 0;
     for (size_t k = 0; k < d->table_count; k++) {
         const struct block *b = &d->blocks[k];
-        if (!b->code) {
+        if (!b->code || b->parked) {
             d->table_used[k] = SLOT_NONE;
             continue;
         }
@@ -2128,7 +2151,7 @@ static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code, cons
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
     memcpy(d->words + d->words_used, guest, nguest * 4);
     d->blocks[d->table_count] =
-        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, nguest};
+        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, (uint16_t)nguest, 0, 0};
     d->words_used += nguest;
     d->table_used[d->table_count++] = (uint32_t)i;
     d->page_head[h] = (uint32_t)d->table_count;
@@ -2222,11 +2245,12 @@ static void flush_locked(struct appine_dbt *d)
         if (d->table_used[i] != SLOT_NONE)
             t->slots[d->table_used[i]] = (struct slot){0, NULL};
         d->page_head[page_bucket(d->blocks[i].pc >> APPINE_PAGE_SHIFT)] = 0;
+        d->page_parked[page_bucket(d->blocks[i].pc >> APPINE_PAGE_SHIFT)] = 0;
     }
-    d->table_count = d->table_occupied = d->table_dead = d->blocks_dead = 0;
+    d->table_count = d->table_occupied = d->table_dead = d->blocks_dead = d->nparked = 0;
     d->words_used = 0;
     d->stale = false;
-    d->nsources = d->ntrusted = 0;
+    d->nsources = d->ntrusted = d->nparkable = 0;
     d->flush_wanted = false;
     d->used_words = d->routine_words;
     __atomic_store_n(&d->generation, d->generation + 1, __ATOMIC_RELEASE);
@@ -2248,6 +2272,7 @@ static void flush_locked(struct appine_dbt *d)
 struct retire_batch {
     unsigned n;
     struct block *blocks[RETIRE_BATCH];
+    bool park[RETIRE_BATCH];
     uint32_t *fwd_start;
 };
 
@@ -2262,6 +2287,8 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
     uint32_t *fwd = r->fwd_start;
     for (unsigned i = 0; i < r->n; i++) {
         uint32_t *code = r->blocks[i]->code;
+        if (r->park[i])
+            r->blocks[i]->first = code[ENTRY_CHECK_WORDS];
         *rw(d, code) = enc_b((intptr_t)fwd - (intptr_t)code);
         *rw(d, code + ENTRY_CHECK_WORDS) = enc_b(-ENTRY_CHECK_WORDS * 4);
         start[i] = code;
@@ -2272,6 +2299,12 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
     for (unsigned i = 0; i < r->n; i++) {
         struct block *b = r->blocks[i];
         table_remove(d, b->pc);
+        if (r->park[i]) {
+            b->parked = 1;
+            d->nparked++;
+            d->page_parked[page_bucket(b->pc >> APPINE_PAGE_SHIFT)]++;
+            continue;
+        }
         b->code = NULL;
         d->blocks_dead++;
         d->st->invalidated++;
@@ -2279,9 +2312,20 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
     r->n = 0;
 }
 
-/* 作废 b：先写好它的转发桩（每个占 16 个字），入口等 retire_flush 一起改。代码缓存放不下
- * 转发桩时返回 false */
-static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct block *b)
+/* 作废停放着的块：它的入口本来就跳往转发桩 */
+static void kill_parked(struct appine_dbt *d, struct block *b)
+{
+    b->parked = 0;
+    b->code = NULL;
+    d->nparked--;
+    d->page_parked[page_bucket(b->pc >> APPINE_PAGE_SHIFT)]--;
+    d->blocks_dead++;
+    d->st->invalidated++;
+}
+
+/* 作废 b：先写好它的转发桩（每个占 16 个字），入口等 retire_flush 一起改。`park` 时只是
+ * 停放（revive）。代码缓存放不下转发桩时返回 false */
+static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct block *b, bool park)
 {
     if (r->n == RETIRE_BATCH)
         retire_flush(d, r);
@@ -2297,6 +2341,7 @@ static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct bloc
     d->used_words += x.n;
     if (!r->n)
         r->fwd_start = x.buf;
+    r->park[r->n] = park;
     r->blocks[r->n++] = b;
     return true;
 }
@@ -2317,7 +2362,11 @@ static void invalidate_locked(struct appine_dbt *d, uint64_t start, uint64_t len
         for (size_t i = 0; i < d->table_count; i++) {
             struct block *b = &d->blocks[i];
             uint64_t page = b->pc >> APPINE_PAGE_SHIFT;
-            if (b->code && page >= first && page <= last && !retire_add(d, &r, b))
+            if (!b->code || page < first || page > last)
+                continue;
+            if (b->parked)
+                kill_parked(d, b);
+            else if (!retire_add(d, &r, b, false))
                 goto full;
         }
         retire_flush(d, &r);
@@ -2326,7 +2375,11 @@ static void invalidate_locked(struct appine_dbt *d, uint64_t start, uint64_t len
     for (uint64_t page = first; page <= last; page++) {
         for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
             struct block *b = &d->blocks[i - 1];
-            if (b->code && b->pc >> APPINE_PAGE_SHIFT == page && !retire_add(d, &r, b))
+            if (!b->code || b->pc >> APPINE_PAGE_SHIFT != page)
+                continue;
+            if (b->parked)
+                kill_parked(d, b);
+            else if (!retire_add(d, &r, b, false))
                 goto full;
         }
     }
@@ -2356,7 +2409,11 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
     struct retire_batch r = {.n = 0};
     for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
         struct block *b = &d->blocks[i - 1];
-        if (b->code && b->pc <= pc && pc < b->pc + 4ull * b->nguest && !retire_add(d, &r, b)) {
+        if (!b->code || b->pc > pc || pc >= b->pc + 4ull * b->nguest)
+            continue;
+        if (b->parked) {
+            kill_parked(d, b);
+        } else if (!retire_add(d, &r, b, false)) {
             __atomic_store_n(&d->flush_wanted, true, __ATOMIC_SEQ_CST);
             break;
         }
@@ -3127,6 +3184,7 @@ static void release(struct appine_dbt *d)
     zfree(d->blocks, TABLE_LIMIT * sizeof(*d->blocks));
     zfree(d->words, WORDS_LIMIT * sizeof(*d->words));
     zfree(d->page_head, sizeof(*d->page_head) << PAGE_BUCKET_BITS);
+    zfree(d->page_parked, sizeof(*d->page_parked) << PAGE_BUCKET_BITS);
     pthread_mutex_destroy(&d->lock);
     pthread_cond_destroy(&d->flushed);
     zfree(d, sizeof(*d));
@@ -3163,7 +3221,9 @@ struct appine_dbt *appine_dbt_new(uint64_t key)
     d->blocks = zalloc(TABLE_LIMIT * sizeof(*d->blocks));
     d->words = zalloc(WORDS_LIMIT * sizeof(*d->words));
     d->page_head = zalloc(sizeof(*d->page_head) << PAGE_BUCKET_BITS);
-    if (!d->cache || !d->table || !d->table_used || !d->blocks || !d->words || !d->page_head) {
+    d->page_parked = zalloc(sizeof(*d->page_parked) << PAGE_BUCKET_BITS);
+    if (!d->cache || !d->table || !d->table_used || !d->blocks || !d->words || !d->page_head ||
+        !d->page_parked) {
         release(d);
         return NULL;
     }
@@ -3381,6 +3441,17 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
  * 翻译模板时的核对是同一件事，只是一次做完，省掉逐块拷贝、重新链接和同步指令缓存。
  * 大部分都对不上时（exec 了别的程序）请求整体清空。持有锁
  */
+/* 块整个落在上一个使用者的某段文件映射里（appine_dbt_trust 记下）：它的页还没映射时值得
+ * 停放，以后多半映射回同样的内容；匿名内存里的（JIT 生成的代码）下一次多半对不上 */
+static bool block_parkable(const struct appine_dbt *d, const struct block *b)
+{
+    for (unsigned i = 0; i < d->nparkable; i++) {
+        if (b->pc >= d->parkable[i][0] && b->pc + (uint64_t)b->nguest * 4 <= d->parkable[i][1])
+            return true;
+    }
+    return false;
+}
+
 /* 块整个落在 appine_dbt_trust 给出的范围里 */
 static bool block_trusted(const struct appine_dbt *d, const struct block *b)
 {
@@ -3394,35 +3465,116 @@ static bool block_trusted(const struct appine_dbt *d, const struct block *b)
 static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
 {
     d->stale = false;
-    size_t live = 0, bad = 0;
+    size_t live = 0, bad = 0, unmapped = 0;
     uint64_t page = 1; /* 未对齐，不会与任何页相同 */
     const uint32_t *host = NULL;
     for (size_t i = 0; i < d->table_count; i++) {
         const struct block *b = &d->blocks[i];
-        if (b->code) {
+        if (b->code && !b->parked) {
             live++;
-            bad += !block_trusted(d, b) && !block_matches(d, c->mmu, b, &page, &host);
+            if (!block_trusted(d, b) && !block_matches(d, c->mmu, b, &page, &host)) {
+                bool park = !host && block_parkable(d, b);
+                bad += !park;
+                unmapped += park;
+            }
         }
     }
     if (bad * 2 > live) {
-        d->ntrusted = 0;
+        d->ntrusted = d->nparkable = 0;
         d->flush_wanted = true;
         return;
     }
+    /* 所在的页还没有映射的块（共享库要等动态链接器加载，这时只有程序和动态链接器）停放
+     * 起来，第一次执行到时再核对（revive）：原来都作废了，node 每次启动要从模板重新拷贝
+     * 六七千个块 */
     page = 1;
     struct retire_batch r = {.n = 0};
-    for (size_t i = 0; bad && i < d->table_count; i++) {
+    for (size_t i = 0; (bad || unmapped) && i < d->table_count; i++) {
         struct block *b = &d->blocks[i];
-        if (b->code && !block_trusted(d, b) && !block_matches(d, c->mmu, b, &page, &host)) {
-            if (!retire_add(d, &r, b)) {
+        if (b->code && !b->parked && !block_trusted(d, b) &&
+            !block_matches(d, c->mmu, b, &page, &host)) {
+            bool park = !host && block_parkable(d, b);
+            if (!retire_add(d, &r, b, park)) {
                 d->flush_wanted = true;
                 break;
             }
-            bad--;
+            if (park)
+                unmapped--;
+            else
+                bad--;
         }
     }
     retire_flush(d, &r);
-    d->ntrusted = 0;
+    d->ntrusted = d->nparkable = 0;
+}
+
+/* 停放的块重新放进翻译表（revive）。持有锁 */
+static void table_relink(struct appine_dbt *d, size_t k)
+{
+    struct table *t = d->table;
+    const struct block *b = &d->blocks[k];
+    size_t i = table_index(t, b->pc);
+    while (t->slots[i].code)
+        i = (i + 1) & table_mask(t);
+    d->table_occupied++;
+    __atomic_store_n(&t->slots[i].pc, b->pc, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->slots[i].code, b->code, __ATOMIC_RELEASE);
+    d->table_used[k] = (uint32_t)i;
+}
+
+/*
+ * 分发器没查到 pc，而它有停放着的块（recheck）：把同一页里停放着的块一起核对，guest 指令字
+ * 和现在的相同的恢复入口、放回表里，不必重新翻译或者拷贝模板；对不上的作废。一页一起做：
+ * 每个停放的块第一次执行到时都要经由转发桩退出到这里，一个一个恢复时光是这些退出就把
+ * 省下的时间用掉了。指向停放块的链接一直跳往它的入口，停放期间经由转发桩退出到这里，
+ * 所以没有核对过的代码不会被执行。表太满时不恢复，由正常的翻译路径扩表。持有锁
+ */
+/* 恢复的这一批先同步、再放进表里，别的线程才可能跳过去 */
+static void revive_flush(struct appine_dbt *d, const uint32_t *idx, unsigned n)
+{
+    void *start[RETIRE_BATCH], *end[RETIRE_BATCH];
+    for (unsigned k = 0; k < n; k++) {
+        start[k] = d->blocks[idx[k]].code;
+        end[k] = d->blocks[idx[k]].code + ENTRY_CHECK_WORDS + 1;
+    }
+    sync_code_ranges(start, end, n, d->rw_delta);
+    for (unsigned k = 0; k < n; k++)
+        table_relink(d, idx[k]);
+}
+
+static uint32_t *revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc)
+{
+    uint64_t page = pc >> APPINE_PAGE_SHIFT, p = 1;
+    const uint32_t *host = NULL;
+    uint32_t *found = NULL, idx[RETIRE_BATCH];
+    unsigned n = 0;
+    /* 入口检查的第一条对所有块都一样（prepare），不必另外记 */
+    uint32_t check = enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, pending));
+    for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
+        struct block *b = &d->blocks[i - 1];
+        if (!b->parked || b->pc >> APPINE_PAGE_SHIFT != page)
+            continue;
+        if (!block_matches(d, c->mmu, b, &p, &host)) {
+            kill_parked(d, b);
+            continue;
+        }
+        if (d->table_occupied + n >= ((size_t)3 << d->table->bits) / 4)
+            break;
+        if (n == RETIRE_BATCH) {
+            revive_flush(d, idx, n);
+            n = 0;
+        }
+        *rw(d, b->code) = check;
+        *rw(d, b->code + ENTRY_CHECK_WORDS) = b->first;
+        b->parked = 0;
+        d->nparked--;
+        d->page_parked[page_bucket(page)]--;
+        idx[n++] = i - 1;
+        if (b->pc == pc)
+            found = b->code;
+    }
+    revive_flush(d, idx, n);
+    return found;
 }
 
 void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
@@ -3448,7 +3600,12 @@ void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, s
             }
         }
     }
-    /* 记下的只用一次：这个地址空间不再使用时重新记 */
+    /* 记下的只用一次：这个地址空间不再使用时重新记。全部记作可以停放的范围（recheck） */
+    for (unsigned j = 0; j < d->nsources; j++) {
+        d->parkable[j][0] = d->sources[j].start;
+        d->parkable[j][1] = d->sources[j].start + d->sources[j].len;
+    }
+    d->nparkable = d->stale ? d->nsources : 0;
     d->nsources = 0;
     pthread_mutex_unlock(&d->lock);
 }
@@ -3536,6 +3693,16 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             return APPINE_EXIT_KICK;
 
         uint32_t *code = table_lookup(d, c, c->pc);
+        if (!code && __atomic_load_n(&d->page_parked[page_bucket(c->pc >> APPINE_PAGE_SHIFT)],
+                                     __ATOMIC_RELAXED)) {
+            lock_dbt(d, &t->stats);
+            if (!__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) && !d->flush_wanted) {
+                code = table_find(d->table, c->pc);
+                if (!code)
+                    code = revive(d, c, c->pc);
+            }
+            unlock_dbt(d);
+        }
         if (!code) {
             /* 不持锁翻译，持锁装进去 */
             bool fetched = prepare(t, c, c->pc);

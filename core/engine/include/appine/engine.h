@@ -264,7 +264,7 @@ struct appine_dbt_source {
 };
 
 /* 地址空间不再使用之前（翻译要放回池里）：记下翻译所在的映射，最多 APPINE_DBT_SOURCES 段 */
-#define APPINE_DBT_SOURCES 16
+#define APPINE_DBT_SOURCES 64
 void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
 /*
  * 从池里拿到的实例在新的地址空间第一次运行之前：新地址空间里与记下的完全相同的映射里的块
