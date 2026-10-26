@@ -83,6 +83,8 @@ pub struct Vfs {
     /// 挂载点：仓库里的目录和挂在上面的文件系统。
     mounts: Vec<(Ino, Mount)>,
     cached: Cached,
+    /// 最近执行过的程序文件（[`Vfs::executable`]）。
+    executables: crate::loader::ExeCache,
 }
 
 /// 不持 BKL 解析路径要用的部分（`syscall::fast`）：仓库的元数据缓存和挂载点。
@@ -243,7 +245,19 @@ impl Vfs {
             store,
             mounts,
             cached,
+            executables: Default::default(),
         })
+    }
+
+    /// 打开仓库里的普通文件 `ino` 作为要执行的文件（[`crate::loader::ExeCache`]）。
+    pub(crate) fn executable(&self, ino: Ino) -> Result<crate::loader::Executable, Errno> {
+        self.executables
+            .open(ino, || self.store.open_object(ino, false))
+    }
+
+    /// 丢掉记着的程序文件（宿主内存紧张时）。
+    pub(crate) fn trim(&self) {
+        self.executables.clear();
     }
 
     /// 底层的 inode 仓库。

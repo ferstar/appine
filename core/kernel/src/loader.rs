@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use appine_engine::{PAGE_SIZE, VA_BITS, prot};
 
@@ -158,10 +159,85 @@ pub struct Executable {
     /// 文件开头的 [`Executable::HEAD`] 字节：ELF 头、程序头、解释器的路径、`#!` 行一般
     /// 都在里面。没有宿主文件时是全部内容。原来把整个文件映射进来再解析，每次 execve
     /// 程序和解释器各多一次映射、缺页和解除映射。
-    head: Vec<u8>,
+    head: Arc<[u8]>,
     /// 文件的大小。
     len: usize,
-    file: Option<File>,
+    file: Option<Arc<File>>,
+}
+
+/// 最近执行过的程序文件：打开着的宿主文件和读进来的开头。同一个版本
+/// （[`crate::mm::content_version`]）再执行时直接用，不必再打开、读、关闭（shell 每起
+/// 一个进程，程序和解释器各一次，都持着 BKL）。
+#[derive(Default)]
+pub struct ExeCache(Mutex<Vec<CachedExe>>);
+
+struct CachedExe {
+    /// 仓库里的 inode。
+    ino: u64,
+    exe: Executable,
+    /// 读进来时宿主文件的 (设备号, inode) 和内容的版本。
+    version: (u64, u64, u64, u64),
+    /// 最近一次用到的序号，满了时去掉最久没用的。
+    used: u64,
+}
+
+impl ExeCache {
+    /// 最多记几个程序。
+    const MAX: usize = 32;
+
+    /// 打开仓库里的 inode `ino`（`open` 打开它的宿主文件）作为要执行的文件。
+    pub fn open(
+        &self,
+        ino: u64,
+        open: impl FnOnce() -> Result<File, Errno>,
+    ) -> Result<Executable, Errno> {
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let next = cache.iter().map(|c| c.used).max().unwrap_or(0) + 1;
+        if let Some(i) = cache.iter().position(|c| c.ino == ino) {
+            let c = &mut cache[i];
+            let fd = c.exe.file.as_ref().map(|f| f.as_raw_fd());
+            if fd.and_then(Self::version) == Some(c.version) {
+                c.used = next;
+                return Ok(c.exe.share());
+            }
+            cache.swap_remove(i);
+        }
+        drop(cache);
+        let exe = Executable::open(open()?)?;
+        let version = exe.file.as_ref().and_then(|f| Self::version(f.as_raw_fd()));
+        if let Some(version) = version {
+            let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if cache.len() >= Self::MAX
+                && let Some(old) = (0..cache.len()).min_by_key(|&i| cache[i].used)
+            {
+                cache.swap_remove(old);
+            }
+            let used = cache.iter().map(|c| c.used).max().unwrap_or(0) + 1;
+            cache.push(CachedExe {
+                ino,
+                exe: exe.share(),
+                version,
+                used,
+            });
+        }
+        Ok(exe)
+    }
+
+    /// 宿主文件 `fd` 的身份和内容的版本；没有可信的版本时是 None。
+    #[allow(clippy::unnecessary_cast)] // st_dev 在 macOS 上是 i32
+    fn version(fd: i32) -> Option<(u64, u64, u64, u64)> {
+        let st = appine_hal::fstat(fd).ok()?;
+        let (dev, ino) = (st.st_dev as u64, st.st_ino as u64);
+        crate::mm::content_version(&st, dev, ino).map(|(ctime, size)| (dev, ino, ctime, size))
+    }
+
+    /// 全部丢掉（宿主内存紧张时）。
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
 }
 
 impl Executable {
@@ -176,10 +252,19 @@ impl Executable {
         let mut head = vec![0u8; len.min(Self::HEAD)];
         file.read_exact_at(&mut head, 0).map_err(io)?;
         Ok(Executable {
-            head,
+            head: head.into(),
             len,
-            file: Some(file),
+            file: Some(Arc::new(file)),
         })
+    }
+
+    /// 同一个文件的又一个句柄（[`ExeCache`]）。
+    fn share(&self) -> Executable {
+        Executable {
+            head: self.head.clone(),
+            len: self.len,
+            file: self.file.clone(),
+        }
     }
 
     /// 内存里的内容，没有宿主文件：各段拷贝进匿名内存。
@@ -187,7 +272,7 @@ impl Executable {
     pub fn from_bytes(data: Vec<u8>) -> Executable {
         Executable {
             len: data.len(),
-            head: data,
+            head: data.into(),
             file: None,
         }
     }

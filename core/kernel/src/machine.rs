@@ -372,7 +372,11 @@ impl Machine {
     /// Tier 1 翻译（运行中的进程的翻译不动）。
     pub fn trim_memory(&self) {
         appine_engine::trim_dbt_pool();
-        self.shared.lock().file_maps.clear();
+        let k = self.shared.lock();
+        k.file_maps.clear();
+        if let Some(vfs) = &k.vfs {
+            vfs.trim();
+        }
     }
 
     /// 使用 Tier 1 时已退出线程的统计之和。

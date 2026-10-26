@@ -332,9 +332,19 @@ impl Kernel {
     }
 }
 
+/// 取 BKL 时最多自旋多久（[`Shared::lock`]）。原来自旋 100 次（不到 1 微秒），四个
+/// 进程同时起进程时总吞吐还不如一个：持锁的线程一放开，等锁的线程都已经睡下，叫醒它们
+/// 的这段时间锁空着。10 到 60 微秒都差不多，更长时自旋的线程反而占了持锁线程的核。
+const BKL_SPIN: std::time::Duration = std::time::Duration::from_micros(30);
+
 /// 所有 guest 线程共享的内核对象。
 pub(crate) struct Shared {
     kernel: Mutex<Kernel>,
+    /// 有线程持有 BKL（只是提示）：等锁的线程自旋时只读它，看起来空了才去抢，不让锁所在
+    /// 的缓存行在几个核之间来回。
+    held: AtomicBool,
+    /// 有线程在自旋等 BKL：只让一个线程自旋，别的直接睡下，不白占几个核。
+    spinning: AtomicBool,
     /// 叫醒定时器线程。
     pub timers: Arc<Event>,
     /// 内存上限的检查停下来了（所有线程都在等待，[`crate::oom`]）。
@@ -348,6 +358,8 @@ impl Shared {
     pub fn new(kernel: Kernel) -> Shared {
         Shared {
             kernel: Mutex::new(kernel),
+            held: AtomicBool::new(false),
+            spinning: AtomicBool::new(false),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
             oom_idle: AtomicBool::new(false),
             paths: AtomicU64::new(0),
@@ -374,29 +386,64 @@ impl Shared {
     /// 获取 BKL。内核层 panic 时锁会中毒：出问题的进程已经被结束（[`crate::bug`]），
     /// 其余的照常使用它。
     ///
-    /// 持锁的时间通常只有几微秒（一次 lstat），先自旋一会儿：睡下再被叫醒要几十微秒，
-    /// 释放的一方还要多一次 futex 唤醒。`git status` 的并行 lstat 原来比单线程还慢。
+    /// 持锁的时间通常只有几微秒（一次 lstat），长的（execve、fork、进程退出）十几到几十
+    /// 微秒，先自旋最多 [`BKL_SPIN`]：睡下再被叫醒要几十微秒，释放的一方还要多一次 futex
+    /// 唤醒，锁在这期间空着。`git status` 的并行 lstat 原来比单线程还慢。自旋只读
+    /// [`Shared::held`]，看起来空了才去抢。
     pub fn lock(&self) -> Bkl<'_> {
-        for _ in 0..100 {
-            match self.kernel.try_lock() {
-                Ok(k) => return Bkl::new(k),
-                Err(std::sync::TryLockError::Poisoned(e)) => return Bkl::new(e.into_inner()),
-                Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
+        if let Ok(k) = self.kernel.try_lock() {
+            return Bkl::new(k, &self.held);
+        }
+        if !self.spinning.swap(true, Ordering::Acquire)
+            && let Some(k) = self.spin()
+        {
+            return k;
+        }
+        Bkl::new(
+            self.kernel.lock().unwrap_or_else(PoisonError::into_inner),
+            &self.held,
+        )
+    }
+
+    /// 自旋等 BKL，最多 [`BKL_SPIN`]；调用方已经置上 [`Shared::spinning`]，这里清掉。
+    fn spin(&self) -> Option<Bkl<'_>> {
+        let mut deadline = None;
+        for i in 0u32.. {
+            if !self.held.load(Ordering::Relaxed) {
+                let k = match self.kernel.try_lock() {
+                    Ok(k) => Some(k),
+                    Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                };
+                if let Some(k) = k {
+                    self.spinning.store(false, Ordering::Release);
+                    return Some(Bkl::new(k, &self.held));
+                }
+            }
+            std::hint::spin_loop();
+            // 读时钟比自旋一圈贵得多，隔一阵看一次
+            if i % 64 == 63 {
+                let now = Instant::now();
+                if now >= *deadline.get_or_insert(now + BKL_SPIN) {
+                    break;
+                }
             }
         }
-        Bkl::new(self.kernel.lock().unwrap_or_else(PoisonError::into_inner))
+        self.spinning.store(false, Ordering::Release);
+        None
     }
 }
 
 /// 持有 BKL 的凭证；释放时唤醒等待中的线程，再把持有期间释放的宿主内存交还宿主
 /// （[`crate::mm::release_unmapped`]）。
-pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>);
+pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>, &'a AtomicBool);
 
 impl<'a> Bkl<'a> {
-    fn new(guard: MutexGuard<'a, Kernel>) -> Bkl<'a> {
+    fn new(guard: MutexGuard<'a, Kernel>, held: &'a AtomicBool) -> Bkl<'a> {
+        held.store(true, Ordering::Relaxed);
         HELD.set(true);
         crate::mm::defer_unmaps();
-        Bkl(ManuallyDrop::new(guard))
+        Bkl(ManuallyDrop::new(guard), held)
     }
 }
 
@@ -416,12 +463,14 @@ impl DerefMut for Bkl<'_> {
 impl Drop for Bkl<'_> {
     fn drop(&mut self) {
         self.0.flush_wakeups();
+        self.1.store(false, Ordering::Relaxed);
         // SAFETY: 之后不再使用 self.0
         unsafe { ManuallyDrop::drop(&mut self.0) };
         HELD.set(false);
         crate::task::pool::notify_pending();
         flush_signals();
         crate::mm::release_unmapped();
+        crate::mm::spare::refill();
     }
 }
 

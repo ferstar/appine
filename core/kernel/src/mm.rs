@@ -29,6 +29,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::mem::ManuallyDrop;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
@@ -79,6 +80,9 @@ const HEAP_RESERVE: u64 = 256 << 20;
 /// 映射之后，宿主内存要等那一段全都不用了才交还，所以只给小的。
 const FORK_PIECE_MAX: u64 = 1 << 20;
 
+/// fork 时这么大以内的写过的匿名映射不看哪些页碰过，全部借出（[`Mm::lend`]）。
+const LEND_ALL_MAX: u64 = 16 * PAGE_SIZE;
+
 /// [`Mm::carve`] 切出来的：每个 VMA 的起点 → 那一段宿主内存和它的宿主地址。
 type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
 
@@ -96,7 +100,8 @@ unsafe impl Sync for HostRegion {}
 impl Drop for HostRegion {
     fn drop(&mut self) {
         let (base, len) = (self.base, self.len);
-        let deferred = UNMAPPED.with_borrow_mut(|u| u.as_mut().map(|u| u.push((base, len))));
+        let deferred =
+            UNMAPPED.with_borrow_mut(|u| u.as_mut().map(|u| u.regions.push((base, len))));
         if deferred.is_some() {
             UNMAPPING.fetch_add(len, Ordering::Relaxed);
         } else {
@@ -106,14 +111,49 @@ impl Drop for HostRegion {
     }
 }
 
-/// 等着交还宿主的内存：(起点, 长度)。
-type Unmapped = Vec<(NonNull<u8>, usize)>;
+/// 持有 BKL 时释放、等放开之后再交还的东西。
+#[derive(Default)]
+struct Unmapped {
+    /// 宿主内存：(起点, 长度)。
+    regions: Vec<(NonNull<u8>, usize)>,
+    /// 销毁的地址空间的页表：逐个释放中间表要好几微秒。
+    mmus: Vec<Mmu>,
+}
 
 thread_local! {
     /// 持有 BKL 时释放的宿主内存，放开 BKL 之后才交还宿主（[`release_unmapped`]）；
     /// 不持有 BKL 时是 None，当场交还。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
     static UNMAPPED: RefCell<Option<Unmapped>> = const { RefCell::new(None) };
+}
+
+/// 驻留内存的一次取样（[`Mm::rss_plan`]）。
+struct RssPlan {
+    /// 不用 mincore 就知道的 4K 页数：借来的页、缓存着的文件映射。
+    fixed: u64,
+    /// 要 mincore 的宿主范围，按起点排好。
+    spans: Vec<(usize, usize)>,
+}
+
+impl RssPlan {
+    /// 驻留的 4K 页数。宿主上首尾相接的合起来一次 mincore。
+    fn measure(&self) -> u64 {
+        let mut total = self.fixed;
+        let mut rest = &self.spans[..];
+        while let Some(&(start, mut len)) = rest.first() {
+            let n = rest[1..]
+                .iter()
+                .take_while(|&&(s, l)| {
+                    let next = s == start + len;
+                    len += if next { l } else { 0 };
+                    next
+                })
+                .count();
+            total += appine_hal::resident_pages(start as *const u8, len) as u64;
+            rest = &rest[1 + n..];
+        }
+        total
+    }
 }
 
 /// 文件映射驻留的页数的缓存（[`Mm::resident_pages`]），键是 (设备号, inode, 文件偏移,
@@ -151,13 +191,106 @@ impl FileResidency {
     }
 }
 
+/// fork 时要用的匿名宿主内存（堆和栈预留的地址空间、小映射切出来的那一段）预先映射
+/// 好几段，fork 持有 BKL 时直接拿来用。同一个程序反复 fork 时要的长度总是那几个，用掉
+/// 一段就在放开 BKL 之后补上（[`refill`](spare::refill)）：宿主的 mmap 原来占 fork
+/// 持锁时间的四成，四个进程同时起进程时总吞吐还不如一个。
+pub(crate) mod spare {
+    use std::ptr::NonNull;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use super::HostRegion;
+    use crate::errno::Errno;
+
+    /// 每个长度最多留几段。
+    const PER_LEN: usize = 2;
+    /// 最多记几种长度。
+    const LENS: usize = 8;
+
+    struct Spares {
+        /// (长度, 起点)：`MAP_NORESERVE`、没碰过的匿名宿主内存。
+        maps: Vec<(usize, usize)>,
+        /// 要补上的长度，最近用到的在后面。
+        wanted: Vec<usize>,
+    }
+
+    static SPARES: Mutex<Spares> = Mutex::new(Spares {
+        maps: Vec::new(),
+        wanted: Vec::new(),
+    });
+
+    /// `len` 字节不计入提交量（`MAP_NORESERVE`）、清零的匿名宿主内存：有预先映射好的就
+    /// 拿来用，没有就当场映射。
+    pub(super) fn anonymous(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+        let found = {
+            let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+            s.wanted.retain(|&l| l != host_len);
+            s.wanted.push(host_len);
+            if s.wanted.len() > LENS {
+                let old = s.wanted.remove(0);
+                // 不再要的长度留着的也交还
+                s.maps.retain(|&(l, base)| {
+                    if l == old {
+                        // SAFETY: 预先映射的、没人用过的宿主内存
+                        unsafe { appine_hal::unmap(NonNull::new(base as *mut u8).unwrap(), l) };
+                    }
+                    l != old
+                });
+            }
+            s.maps
+                .iter()
+                .position(|&(l, _)| l == host_len)
+                .map(|i| s.maps.swap_remove(i).1)
+        };
+        let base = match found.and_then(|b| NonNull::new(b as *mut u8)) {
+            Some(base) => base,
+            None => appine_hal::map_anonymous(host_len, false).map_err(|_| Errno::ENOMEM)?,
+        };
+        Ok((
+            Arc::new(HostRegion {
+                base,
+                len: host_len,
+            }),
+            base,
+        ))
+    }
+
+    /// 补上用掉的。放开 BKL 之后调用。
+    pub(crate) fn refill() {
+        loop {
+            let need = {
+                let s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+                s.wanted
+                    .iter()
+                    .copied()
+                    .find(|&l| s.maps.iter().filter(|m| m.0 == l).count() < PER_LEN)
+            };
+            let Some(len) = need else {
+                return;
+            };
+            let Ok(base) = appine_hal::map_anonymous(len, false) else {
+                return;
+            };
+            let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+            if s.wanted.contains(&len) && s.maps.iter().filter(|m| m.0 == len).count() < PER_LEN {
+                s.maps.push((len, base.as_ptr() as usize));
+            } else {
+                drop(s);
+                // SAFETY: 刚刚映射、没人用过
+                unsafe { appine_hal::unmap(base, len) };
+            }
+        }
+    }
+}
+
 /// 释放了、还没交还宿主的字节数：OOM killer 等它们交还了再量。
 pub(crate) static UNMAPPING: AtomicUsize = AtomicUsize::new(0);
 
 /// 开始持有 BKL：之后释放的宿主内存等放开 BKL 再交还（[`release_unmapped`]）。
 pub(crate) fn defer_unmaps() {
     UNMAPPED.with_borrow_mut(|u| {
-        u.get_or_insert_with(Vec::new);
+        u.get_or_insert_with(Unmapped::default);
     });
 }
 
@@ -165,9 +298,15 @@ pub(crate) fn defer_unmaps() {
 /// 映射，宿主拆页表、刷 TLB 要几十微秒，不必让等 BKL 的线程（等着回收它的 shell、管道
 /// 另一头的进程）跟着等。首尾相接的一起交还，少刷几次 TLB。
 pub(crate) fn release_unmapped() {
-    let Some(mut list) = UNMAPPED.with_borrow_mut(Option::take) else {
+    let Some(Unmapped {
+        regions: mut list,
+        mmus,
+    }) = UNMAPPED.with_borrow_mut(Option::take)
+    else {
         return;
     };
+    // 先释放页表，再交还它指向的宿主内存
+    drop(mmus);
     if list.is_empty() {
         return;
     }
@@ -439,8 +578,8 @@ struct Cow {
 
 /// 一个 guest 进程的地址空间。
 pub struct Mm {
-    // 字段按声明顺序析构：先销毁页表，再释放它指向的宿主内存。
-    mmu: Mmu,
+    // 先销毁页表，再释放它指向的宿主内存（Drop 里先放开页表，字段再按声明顺序析构）。
+    mmu: ManuallyDrop<Mmu>,
     vmas: BTreeMap<u64, Vma>,
     /// 已经解除映射、等 shootdown 完成后才能释放的宿主内存。
     graveyard: Vec<Arc<HostRegion>>,
@@ -594,6 +733,11 @@ fn extent(size: i64, offset: u64, len: u64) -> u64 {
         .min(len)
 }
 
+/// 宿主文件内容的版本（[`content::version`]），没有可信的版本时是 None。
+pub(crate) fn content_version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
+    content::version(st, dev, ino)
+}
+
 /// 判断两段文件映射的内容是否相同（[`Mm::code_sources`]）。
 mod content {
     use std::collections::HashSet;
@@ -669,7 +813,7 @@ impl Mm {
     /// 创建空地址空间。
     pub fn new() -> Self {
         Mm {
-            mmu: Mmu::new(),
+            mmu: ManuallyDrop::new(Mmu::new()),
             vmas: BTreeMap::new(),
             graveyard: Vec::new(),
             brk_start: 0,
@@ -1992,10 +2136,10 @@ impl Mm {
         let is_heap = |s: u64, v: &Vma| {
             s == heap_start && v.backing == Backing::Anonymous && v.len <= HEAP_RESERVE
         };
-        // 子进程自己的小映射（数据段、.bss、malloc 的小块）切自同一段宿主内存，可写的和
-        // 只读的各一段：shell fork 之后马上 execve，原来每个映射各一次宿主的 mmap 和
-        // munmap。大的、堆和向下增长的仍然各自一段，解除映射时才能交还宿主
-        let pieces: Vec<(u64, bool)> = self
+        // 子进程自己的小映射（数据段、.bss、malloc 的小块）切自同一段宿主内存：shell fork
+        // 之后马上 execve，原来每个映射各一次宿主的 mmap 和 munmap。大的、堆和向下增长的
+        // 仍然各自一段，解除映射时才能交还宿主
+        let pieces: Vec<u64> = self
             .vmas
             .iter()
             .filter(|&(&s, v)| {
@@ -2008,7 +2152,7 @@ impl Mm {
                         Backing::Anonymous => true,
                     }
             })
-            .map(|(&s, v)| (s, v.prot & prot::WRITE != 0))
+            .map(|(&s, _)| s)
             .collect();
         let mut carved = Self::carve(&self.vmas, &pieces)?;
         // 写过的私有匿名映射写时复制：先映射好子进程自己的（全零的）宿主内存，再借给它
@@ -2032,10 +2176,10 @@ impl Mm {
                 let (region, host) = if let Some(piece) = carved.remove(&start) {
                     piece
                 } else if heap {
-                    Self::new_anonymous(HEAP_RESERVE, false)?
+                    spare::anonymous(HEAP_RESERVE)?
                 } else if below > 0 {
                     // 栈下面预留的宿主内存也照样留着
-                    let (region, base) = Self::new_anonymous(below + v.len, false)?;
+                    let (region, base) = spare::anonymous(below + v.len)?;
                     // SAFETY: 这段宿主内存有 below + v.len 字节
                     let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(below as usize)) };
                     (region, host)
@@ -2080,28 +2224,27 @@ impl Mm {
         Ok(shared)
     }
 
-    /// fork 时给子进程的小映射 `pieces`（起点、要不要计入提交量）切出宿主内存：同一类的
-    /// 切自同一段，各自按宿主页对齐。返回每个起点的那一段和它的宿主地址。
-    fn carve(vmas: &BTreeMap<u64, Vma>, pieces: &[(u64, bool)]) -> Result<Carved, Errno> {
+    /// fork 时给子进程的小映射（起点是 `pieces`）切出宿主内存：切自同一段，各自按宿主页
+    /// 对齐。这一段不计入宿主的提交量（`MAP_NORESERVE`）：每个映射都不超过
+    /// [`FORK_PIECE_MAX`]，计不计入只关系到一次申请超过内存总量时失败。返回每个起点的
+    /// 那一段和它的宿主地址。
+    fn carve(vmas: &BTreeMap<u64, Vma>, pieces: &[u64]) -> Result<Carved, Errno> {
         let page = appine_hal::page_size() as u64;
         let mut out = BTreeMap::new();
-        for reserve in [true, false] {
-            let mine = pieces.iter().filter(|p| p.1 == reserve).map(|p| p.0);
-            let total: u64 = mine
-                .clone()
-                .map(|s| vmas[&s].len.next_multiple_of(page))
-                .sum();
-            if total == 0 {
-                continue;
-            }
-            let (region, base) = Self::new_anonymous(total, reserve)?;
-            let mut at = 0;
-            for s in mine {
-                // SAFETY: 各段按顺序排在这段宿主内存里，at + len 不超过 total
-                let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(at as usize)) };
-                out.insert(s, (region.clone(), host));
-                at += vmas[&s].len.next_multiple_of(page);
-            }
+        let total: u64 = pieces
+            .iter()
+            .map(|s| vmas[s].len.next_multiple_of(page))
+            .sum();
+        if total == 0 {
+            return Ok(out);
+        }
+        let (region, base) = spare::anonymous(total)?;
+        let mut at = 0;
+        for &s in pieces {
+            // SAFETY: 各段按顺序排在这段宿主内存里，at + len 不超过 total
+            let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(at as usize)) };
+            out.insert(s, (region.clone(), host));
+            at += vmas[&s].len.next_multiple_of(page);
         }
         Ok(out)
     }
@@ -2330,6 +2473,11 @@ impl Mm {
     ///   文件本身的事，与哪个进程映射无关，而 mincore 要在 page cache 里逐页查找：结果按
     ///   文件的一段缓存一会儿（[`FileResidency`]），程序和库的代码段不必每次都查。
     pub fn resident_pages(&self) -> u64 {
+        self.rss_plan().measure()
+    }
+
+    /// [`Mm::resident_pages`] 要量的：不用 mincore 就知道的页数，和要 mincore 的宿主范围。
+    fn rss_plan(&self) -> RssPlan {
         // 借来的页与 Linux 上写时复制的页一样算在里面
         let mut total = self.cow.borrow().borrowed.len() as u64;
         let mut spans = Vec::with_capacity(self.vmas.len());
@@ -2352,20 +2500,10 @@ impl Mm {
             }
         }
         spans.sort_unstable();
-        let mut rest = &spans[..];
-        while let Some(&(start, mut len)) = rest.first() {
-            let n = rest[1..]
-                .iter()
-                .take_while(|&&(s, l)| {
-                    let next = s == start + len;
-                    len += if next { l } else { 0 };
-                    next
-                })
-                .count();
-            total += appine_hal::resident_pages(start as *const u8, len) as u64;
-            rest = &rest[1 + n..];
+        RssPlan {
+            fixed: total,
+            spans,
         }
-        total
     }
 
     /// 测试钩子（[`crate::bug`]）：让 `addr` 所在的页在页表里指向一个不能访问的宿主页，
@@ -2842,8 +2980,11 @@ impl Mm {
     ) -> bool {
         let v = &self.vmas[&start];
         let end = start + v.len;
-        // 宿主从没碰过的页一定是零，子进程用自己的就行
-        let touched = appine_hal::touched_pages(v.host.as_ptr(), v.len as usize);
+        // 宿主从没碰过的页一定是零，子进程用自己的就行。小的映射多半都碰过，不为它们读
+        // pagemap（一次 pread，fork 持锁时间的三成多），全部借出
+        let touched = (v.len > LEND_ALL_MAX)
+            .then(|| appine_hal::touched_pages(v.host.as_ptr(), v.len as usize))
+            .flatten();
         let ro = Self::read_only(v);
         let cow = self.cow.borrow();
         let mut loans = self.loans.borrow_mut();
@@ -2923,6 +3064,25 @@ impl Mm {
 
 impl Drop for Mm {
     fn drop(&mut self) {
+        self.release_cow();
+        // SAFETY: 之后不再使用 self.mmu
+        let mmu = unsafe { ManuallyDrop::take(&mut self.mmu) };
+        // 持有 BKL 时放开之后再释放（release_unmapped）
+        if let Some(mmu) = UNMAPPED.with_borrow_mut(|u| match u {
+            Some(u) => {
+                u.mmus.push(mmu);
+                None
+            }
+            None => Some(mmu),
+        }) {
+            drop(mmu);
+        }
+    }
+}
+
+impl Mm {
+    /// 地址空间销毁时：记下翻译所在的映射，还回借来的页，借出的页留给借用方。
+    fn release_cow(&mut self) {
         if let Some(cs) = &self.code_space {
             cs.space.set_sources(&self.code_sources());
         }

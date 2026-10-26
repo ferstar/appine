@@ -683,7 +683,7 @@ pub(crate) fn open_node(vfs: &Vfs, cred: &Cred, node: &Node) -> Result<(Executab
         _ => return Err(Errno::EACCES),
     }
     cred.permission(&st, MAY_EXEC)?;
-    Ok((Executable::open(vfs.store().open_object(ino, false)?)?, st))
+    Ok((vfs.executable(ino)?, st))
 }
 
 /// [`open_executable`]，只要文件本身。
