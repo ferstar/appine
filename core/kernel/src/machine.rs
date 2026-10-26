@@ -93,6 +93,11 @@ impl Machine {
             appine_engine::install_fault_guard();
         }
         let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
+        if let Some(vfs) = &vfs {
+            // 推迟提交的写事务由定时器线程到点提交
+            let timers = shared.timers.clone();
+            vfs.store().set_waker(Box::new(move || timers.signal()));
+        }
         {
             let mut k = shared.lock();
             k.vfs = vfs;
@@ -369,7 +374,8 @@ impl Machine {
     }
 
     /// 宿主内存紧张（Android 的 `onTrimMemory`）：丢掉可以重建的缓存。现在是池里保留的
-    /// Tier 1 翻译（运行中的进程的翻译不动）。
+    /// Tier 1 翻译（运行中的进程的翻译不动）。App 这时多半在后台，随时可能被杀掉，顺便
+    /// 提交推迟的写事务。
     pub fn trim_memory(&self) {
         appine_engine::trim_dbt_pool();
         let k = self.shared.lock();
@@ -377,6 +383,17 @@ impl Machine {
         if let Some(vfs) = &k.vfs {
             vfs.trim();
         }
+        drop(k);
+        self.sync();
+    }
+
+    /// 提交 inode 仓库推迟提交的写事务（App 退到后台时，[`crate::vfs::store`]）。
+    pub fn sync(&self) {
+        crate::bug::host_call("Machine::sync", || {
+            if let Some(vfs) = &self.shared.lock().vfs {
+                let _ = vfs.store().commit();
+            }
+        });
     }
 
     /// 使用 Tier 1 时已退出线程的统计之和。
@@ -402,6 +419,7 @@ fn on_console<T>(
 impl Drop for Machine {
     fn drop(&mut self) {
         self.kill_all();
+        self.sync();
         {
             let mut k = self.shared.lock();
             k.shutting_down = true;
@@ -414,7 +432,8 @@ impl Drop for Machine {
 }
 
 /// 定时器线程：等到最早的到期时刻，发出到期的 SIGALRM（[`crate::itimer::expire`]），
-/// 有 guest 线程在运行时定时检查内存的上限（[`crate::oom`]），直到 Machine 关闭。
+/// 有 guest 线程在运行时定时检查内存的上限（[`crate::oom`]），到点提交 inode 仓库推迟
+/// 提交的写事务，直到 Machine 关闭。
 ///
 /// 撞上内核层的 bug 时（[`crate::bug`]）照常运行：处理一个进程的定时器时出错，结束那个
 /// 进程；内存上限的检查和信号驱动的 I/O 分不出是哪个进程的，出错时关掉这项功能。
@@ -431,6 +450,16 @@ fn timers(shared: Arc<Shared>) {
                     "kernel panic in the OOM killer; the memory limit is off"
                 ));
                 k.oom.limit = u64::MAX;
+            }
+        }
+        // inode 仓库推迟提交的写事务：开始推迟时叫醒这个线程
+        if let Some(vfs) = k.vfs.clone() {
+            match crate::bug::catch(|| vfs.store().commit_due()) {
+                Some(Some(due)) => next = Some(next.map_or(due, |n| n.min(due))),
+                Some(None) => {}
+                None => crate::bug::report(format_args!(
+                    "kernel panic while committing the inode store"
+                )),
             }
         }
         // 信号驱动的 I/O：任何修改都会叫醒这个线程，顺便检查；宿主 socket 一起等

@@ -197,7 +197,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         78 => fs::readlinkat(cx, a[0] as i32, a[1], a[2], a[3] as usize),
         79 => fs::newfstatat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         80 => fs::fstat(cx, a[0] as i32, a[1]),
-        81 => Ok(0), // sync：仓库的修改已经写进宿主文件
+        81 => fs::sync(cx),
         82 | 83 => fs::fsync(cx, a[0] as i32),
         84 => fs::cache_hint(cx, a[0] as i32, a[1] as i64, a[2] as i64, a[3] as u32, 0),
         85 => timerfd::timerfd_create(cx, a[0] as i32, a[1] as u32),
@@ -354,7 +354,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         243 => net::recvmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
         260 => proc::wait4(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
         261 => misc::prlimit(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
-        267 => fs::cache_hint(cx, a[0] as i32, 0, 0, 0, 2),
+        267 => fs::cache_hint(cx, a[0] as i32, 0, 0, 0, 2).and_then(|_| fs::sync(cx)),
         264 => fs::name_to_handle_at(cx, a[0] as i32, a[1], a[2], a[3], a[4] as u32),
         265 => fs::open_by_handle_at(cx, a[0] as i32, a[1], a[2] as u32),
         269 => net::sendmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),

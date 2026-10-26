@@ -6,8 +6,14 @@
 //! 硬链接就是多个目录项指向同一个 ino。宿主侧只会出现 `objects/<数字>` 这种
 //! 路径，永远不由 guest 输入拼出（§12 不变量 3）。
 //!
-//! 删除最后一个链接时，普通文件的 object 立即删除（已经打开的宿主文件仍然可用），
-//! inode 行以 nlink = 0 留下来，让打开着它的 fd 还能 fstat；下次打开仓库时清理。
+//! 删除最后一个链接时，普通文件的 object 在这次修改提交之后删除（已经打开的宿主文件
+//! 仍然可用），inode 行以 nlink = 0 留下来，让打开着它的 fd 还能 fstat；下次打开仓库时
+//! 清理。
+//!
+//! 写事务推迟提交（[`COMMIT_DELAY`]）：每次提交都要把改了的页写进 WAL，比修改本身贵十
+//! 倍，所以几毫秒里的元数据操作一起提交，每个操作是事务里的一个保存点，出错时只回滚
+//! 它自己。App 被杀掉时最多丢失最后几毫秒的修改，仓库仍然是某个时刻的完整状态（Linux
+//! 断电时丢失的更多）。别的 appine 进程也在用仓库时每个操作立即提交。
 //!
 //! 路径解析和 stat 走内存里的元数据缓存（目录项，包括不存在的名字；inode 行；符号
 //! 链接目标），不逐级查询数据库。自己的写入只去掉受影响的条目。多个 appine 进程可以
@@ -23,7 +29,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -34,6 +40,9 @@ pub type Ino = u64;
 
 /// 根目录的 inode。
 pub const ROOT: Ino = 1;
+
+/// 写事务最多推迟这么久提交（模块文档）。
+pub const COMMIT_DELAY: Duration = Duration::from_millis(5);
 
 /// 文件类型位（`st_mode` 的高位）。
 pub mod mode {
@@ -123,13 +132,20 @@ pub struct Store {
     lock: File,
     /// 元数据缓存、提交计数器和 `objects` 目录。
     meta: Arc<Meta>,
-    /// 正在写事务里：读到的可能是还没提交的内容，不用缓存。
+    /// 正在一个操作里（[`Store::transaction`]）：读到的可能是它回滚时会撤销的内容，
+    /// 不用缓存。
     writing: Cell<bool>,
     /// [`Store::snapshot`] 里：还没开始读事务时是 Some(None)，开始时的提交计数是
     /// Some(Some(n))。
     snapshot_at: Cell<Option<Option<u64>>>,
     /// 这次写入改了的目录项和 inode 行，提交之后从缓存里去掉。
     touched: RefCell<Touched>,
+    /// 推迟提交的写事务开始的时刻；None 时没有打开的写事务。
+    pending: Cell<Option<Instant>>,
+    /// 最后一个链接已经删除、等写事务提交之后再删除的 object。
+    doomed: RefCell<Vec<Ino>>,
+    /// 开始推迟提交时调用：叫醒到点提交的线程（[`Store::commit_due`]）。
+    waker: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 /// 元数据缓存，以及不持 BKL 读它（`syscall::fast`）要用的东西。
@@ -308,32 +324,46 @@ impl Cache {
     }
 }
 
-/// 共享映射的提交计数器。
+/// `lock` 文件开头所有进程共享映射的几个字：提交次数、正在使用仓库的进程数、还没提交的
+/// 写事务新分配的 inode 编号范围。
 struct Commits {
     map: appine_hal::FileMapping,
 }
 
 impl Commits {
     fn open(lock: &File) -> Result<Commits, Errno> {
-        if lock.metadata().map_err(io_err)?.len() < 8 {
-            lock.set_len(8).map_err(io_err)?;
+        if lock.metadata().map_err(io_err)?.len() < 32 {
+            lock.set_len(32).map_err(io_err)?;
         }
-        let map = appine_hal::map_file(lock.as_raw_fd(), 0, 8, true, true).map_err(Errno)?;
+        let map = appine_hal::map_file(lock.as_raw_fd(), 0, 32, true, true).map_err(Errno)?;
         Ok(Commits { map })
     }
 
-    fn counter(&self) -> &AtomicU64 {
-        // SAFETY: 映射按页对齐、至少 8 字节，存续期间一直有效
-        unsafe { AtomicU64::from_ptr(self.map.ptr.as_ptr().cast()) }
+    fn word(&self, i: usize) -> &AtomicU64 {
+        // SAFETY: 映射按页对齐、至少 32 字节，存续期间一直有效
+        unsafe { AtomicU64::from_ptr(self.map.ptr.as_ptr().cast::<u64>().add(i)) }
     }
 
     fn get(&self) -> u64 {
-        self.counter().load(Ordering::SeqCst)
+        self.word(0).load(Ordering::SeqCst)
     }
 
     /// 加一，返回原来的值。
     fn bump(&self) -> u64 {
-        self.counter().fetch_add(1, Ordering::SeqCst)
+        self.word(0).fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// 正在使用仓库的进程数。异常退出的进程没有减掉自己，所以可能偏大（只会让别的进程
+    /// 不推迟提交），独占打开仓库（相当于开机）时清零。
+    fn users(&self) -> &AtomicU64 {
+        self.word(1)
+    }
+
+    /// 还没提交的写事务新分配的 inode 编号的最小值和最大值（0 表示没有）。进程在提交
+    /// 之前被杀掉时，这些 inode 随事务一起丢失，它们的 object 却已经建好，下次开机按这个
+    /// 范围删掉；不删的话编号再分配给目录之类没有 object 的 inode 时就永远留下了。
+    fn fresh(&self) -> (&AtomicU64, &AtomicU64) {
+        (self.word(2), self.word(3))
     }
 }
 
@@ -426,6 +456,7 @@ impl Store {
                 params![ROOT, mode::S_IFDIR | 0o755, now],
             )
             .map_err(db_err)?;
+        store.meta.commits.users().fetch_add(1, Ordering::SeqCst);
         Ok(store)
     }
 
@@ -439,13 +470,38 @@ impl Store {
         let store = Self::connect(dir)?;
         let fd = store.lock.as_raw_fd();
         if appine_hal::flock(fd, true, false).is_ok() {
+            store.meta.commits.users().store(0, Ordering::SeqCst);
+            store.remove_lost_objects()?;
             for path in volatile {
                 store.empty_dir(path)?;
             }
-            store.remove_orphans()?;
+            store.transaction(|s| s.remove_orphans())?;
+            store.commit()?;
         }
         appine_hal::flock(fd, false, true).map_err(Errno)?;
+        // 别的进程也在用仓库：等它提交推迟的写事务（它看到这个计数之后不再推迟），之后
+        // 才能看到它的修改
+        if store.meta.commits.users().fetch_add(1, Ordering::SeqCst) > 0 {
+            store.exec("BEGIN IMMEDIATE")?;
+            store.exec("COMMIT")?;
+        }
         Ok(store)
+    }
+
+    /// 删掉上次没来得及提交就丢失的 inode 留下的 object（[`Commits::fresh`]）。
+    fn remove_lost_objects(&self) -> Result<(), Errno> {
+        let (lo, hi) = self.meta.commits.fresh();
+        let range = lo.load(Ordering::SeqCst)..=hi.load(Ordering::SeqCst);
+        if *range.start() != 0 {
+            for ino in range {
+                if self.query_stat_row(ino) == Err(Errno::ENOENT) {
+                    remove_object(&self.object_path(ino))?;
+                }
+            }
+            lo.store(0, Ordering::SeqCst);
+            hi.store(0, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// 清空目录 `path` 的内容，目录本身保留。不存在或者不是目录（比如符号链接）时
@@ -489,7 +545,7 @@ impl Store {
         };
         for (ino, m) in orphans {
             if m & mode::S_IFMT == mode::S_IFREG {
-                remove_object(&self.object_path(ino))?;
+                self.doomed.borrow_mut().push(ino);
             }
             self.db
                 .prepare_cached("DELETE FROM inodes WHERE ino = ?1")
@@ -540,28 +596,116 @@ impl Store {
             writing: Cell::new(false),
             snapshot_at: Cell::new(None),
             touched: RefCell::default(),
+            pending: Cell::new(None),
+            doomed: RefCell::default(),
+            waker: RefCell::new(None),
         })
     }
 
-    /// 在一个事务里执行 `f`；`f` 出错时回滚。一开始就取得写锁（`IMMEDIATE`）：先读后写
-    /// 的事务在别的进程提交之后无法升级成写事务，那时 busy_timeout 也帮不上忙。
-    /// 已经在事务里时（导入 rootfs 时整个导入是一个事务）直接并入外层事务。
+    /// 执行一条不带参数的语句（BEGIN、COMMIT、保存点），只编译一次。
+    fn exec(&self, sql: &str) -> Result<(), Errno> {
+        self.db
+            .prepare_cached(sql)
+            .and_then(|mut st| st.execute([]))
+            .map(drop)
+            .map_err(db_err)
+    }
+
+    /// 把 `f` 作为一个元数据操作执行：要么全部生效，要么（`f` 出错或者 panic 时）全部
+    /// 回滚。操作是推迟提交的写事务（模块文档）里的一个保存点；写事务一开始就取得写锁
+    /// （`IMMEDIATE`）：先读后写的事务在别的进程提交之后无法升级成写事务，那时
+    /// busy_timeout 也帮不上忙。已经在操作里时（导入 rootfs 时整个导入是一个操作）直接
+    /// 并入外层。
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
-        if !self.db.is_autocommit() {
+        // 读事务里（[`Store::snapshot`]）也直接执行：和原来一样在读事务里写
+        if self.writing.get() || (self.pending.get().is_none() && !self.db.is_autocommit()) {
             return f(self);
         }
-        self.db.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
-        self.writing.set(true);
-        let r = match f(self) {
-            Ok(v) => self.db.execute_batch("COMMIT").map_err(db_err).map(|()| v),
-            Err(e) => {
-                let _ = self.db.execute_batch("ROLLBACK");
-                Err(e)
+        if self.pending.get().is_none() {
+            self.exec("BEGIN IMMEDIATE")?;
+            self.pending.set(Some(Instant::now()));
+            if self.defers()
+                && let Some(wake) = &*self.waker.borrow()
+            {
+                wake();
             }
-        };
-        self.writing.set(false);
+        }
+        let r = self.exec("SAVEPOINT op").and_then(|()| {
+            let op = Op {
+                store: self,
+                doomed: self.doomed.borrow().len(),
+                done: false,
+            };
+            self.writing.set(true);
+            let r = f(self).and_then(|v| self.exec("RELEASE op").map(|()| v));
+            op.finish(r.is_ok());
+            r
+        });
         self.written();
+        // 别的进程也在用仓库时立即提交，免得它看不到；推迟够久了也提交
+        let overdue = self
+            .pending
+            .get()
+            .is_some_and(|t| t.elapsed() >= COMMIT_DELAY);
+        if overdue || !self.defers() {
+            self.commit()?;
+        }
         r
+    }
+
+    /// 写事务可以推迟提交：没有别的进程在用仓库。
+    fn defers(&self) -> bool {
+        self.meta.commits.users().load(Ordering::Relaxed) <= 1
+    }
+
+    /// 推迟提交时叫醒 `wake`（[`Store::commit_due`]）。
+    pub fn set_waker(&self, wake: Box<dyn Fn()>) {
+        *self.waker.borrow_mut() = Some(wake);
+    }
+
+    /// 到点了就提交推迟的写事务；还没到点时返回该提交的时刻。
+    pub fn commit_due(&self) -> Option<Instant> {
+        let due = self.pending.get()? + COMMIT_DELAY;
+        if Instant::now() < due {
+            return Some(due);
+        }
+        let _ = self.commit();
+        None
+    }
+
+    /// 提交推迟的写事务（fsync、sync、关闭时），然后删除等着它的 object。提交失败时
+    /// 推迟的修改全部丢失：数据库回到上次提交时的状态，缓存整个清空。
+    pub fn commit(&self) -> Result<(), Errno> {
+        if self.pending.take().is_none() {
+            return Ok(());
+        }
+        let r = self.exec("COMMIT");
+        let doomed = std::mem::take(&mut *self.doomed.borrow_mut());
+        if r.is_err() {
+            if !self.db.is_autocommit() {
+                let _ = self.exec("ROLLBACK");
+            }
+            self.update(|c| c.clear(c.generation));
+            let _ = self.remove_lost_objects();
+            return r;
+        }
+        let (lo, hi) = self.meta.commits.fresh();
+        lo.store(0, Ordering::SeqCst);
+        hi.store(0, Ordering::SeqCst);
+        for ino in doomed {
+            let _ = remove_object(&self.object_path(ino));
+        }
+        // 计数器必须在提交之后加：之前加的话，别的进程可能赶在提交完成之前重新读到旧的
+        // 内容，再记成新的计数。计数器在这之前被别人改过，自己的缓存也整体作废
+        self.update(|c| {
+            let before = self.meta.commits.bump();
+            if before == c.generation {
+                c.generation = before + 1;
+            } else {
+                c.clear(before + 1);
+            }
+        });
+        Ok(())
     }
 
     /// 写入改了目录 `dir` 里的名字 `name`。
@@ -574,13 +718,13 @@ impl Store {
         self.touched.borrow_mut().inos.push(ino);
     }
 
-    /// 改了数据库之后调用：从自己的缓存里去掉改了的条目；已经提交了（不在外层事务里）
-    /// 就让计数器加一，别的进程的缓存随之作废。必须在提交之后加：之前加的话，别的进程
-    /// 可能赶在提交完成之前重新读到旧的内容，再记成新的计数。计数器在这之前被别人改过，
-    /// 自己的缓存也整体作废。
+    /// 一个操作结束之后调用：从自己的缓存里去掉改了的条目。别的进程的缓存在提交时作废
+    /// （[`Store::commit`]）。
     fn written(&self) {
         let touched = std::mem::take(&mut *self.touched.borrow_mut());
-        let committed = self.db.is_autocommit();
+        if touched.names.is_empty() && touched.inos.is_empty() {
+            return;
+        }
         self.update(|c| {
             for (dir, name) in &touched.names {
                 if let Some(d) = c.dentries.get_mut(dir) {
@@ -593,14 +737,6 @@ impl Store {
                 c.rows.remove(ino);
                 c.targets.remove(ino);
                 c.parents.remove(ino);
-            }
-            if committed {
-                let before = self.meta.commits.bump();
-                if before == c.generation {
-                    c.generation = before + 1;
-                } else {
-                    c.clear(before + 1);
-                }
             }
         });
     }
@@ -632,12 +768,12 @@ impl Store {
     fn begin_read(&self) -> Result<(), Errno> {
         if self.snapshot_at.get() == Some(None) {
             self.snapshot_at.set(Some(Some(self.meta.commits.get())));
-            self.db.execute_batch("BEGIN").map_err(db_err)?;
+            self.exec("BEGIN")?;
         }
         Ok(())
     }
 
-    /// 缓存能不能用：写事务里不能。能用时返回现在的提交计数，缓存是旧的就先清空。
+    /// 缓存能不能用：操作里不能。能用时返回现在的提交计数，缓存是旧的就先清空。
     fn cache_generation(&self) -> Option<u64> {
         if self.writing.get() {
             return None;
@@ -671,9 +807,7 @@ impl Store {
         let r = f(self);
         if self.snapshot_at.get().flatten().is_some() {
             // 只读的事务提交只是释放读锁
-            let _ = self
-                .db
-                .execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
+            let _ = self.exec(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
         self.snapshot_at.set(None);
         r
@@ -932,6 +1066,11 @@ impl Store {
             .map_err(db_err)?;
         let ino = self.db.last_insert_rowid() as Ino;
         self.touch_ino(ino);
+        let (lo, hi) = self.meta.commits.fresh();
+        if lo.load(Ordering::Relaxed) == 0 {
+            lo.store(ino, Ordering::Relaxed);
+        }
+        hi.fetch_max(ino, Ordering::Relaxed);
         Ok(ino)
     }
 
@@ -988,30 +1127,33 @@ impl Store {
             }
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 1, 0)?;
             s.add_dentry(parent, name, ino)?;
-            // 最后建 object：失败时整个事务回滚，不留下没有 object 的 inode
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(s.object_path(ino))
-                .map_err(io_err)?;
+            // 最后建 object：失败时整个操作回滚，不留下没有 object 的 inode
+            let file = s.new_object(ino)?;
             Ok((ino, file))
         })
+    }
+
+    /// 为新的 inode 建空的 object。已经有的话是没来得及提交就丢失的 inode 留下的
+    /// （inode 编号又分配了出来），清空后接着用。
+    fn new_object(&self, ino: Ino) -> Result<File, Errno> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(self.object_path(ino))
+            .map_err(io_err)
     }
 
     /// 新建一个没有名字的普通文件（memfd_create）：链接数为 0，object 一开始就删除，
     /// 关闭之后数据随之消失，inode 在下次打开仓库时清理。
     pub fn create_anonymous(&self, perm: u32) -> Result<(Ino, File), Errno> {
-        let ino = self.new_inode(mode::S_IFREG | (perm & 0o7777), 0, 0, 0, 0)?;
-        let path = self.object_path(ino);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(io_err)?;
-        remove_object(&path)?;
-        Ok((ino, file))
+        self.transaction(|s| {
+            let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), 0, 0, 0, 0)?;
+            let file = s.new_object(ino)?;
+            remove_object(&s.object_path(ino))?;
+            Ok((ino, file))
+        })
     }
 
     /// 新建符号链接。
@@ -1078,16 +1220,16 @@ impl Store {
 
     /// 修改权限位（保留类型位）。
     pub fn set_mode(&self, ino: Ino, perm: u32) -> Result<(), Errno> {
-        let n = self
-            .db
-            .prepare_cached(
-                "UPDATE inodes SET mode = (mode & ?2) | ?3, ctime_ns = ?4 WHERE ino = ?1",
-            )
-            .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now_ns()]))
-            .map_err(db_err)?;
-        self.touch_ino(ino);
-        self.written();
-        if n == 0 { Err(Errno::ENOENT) } else { Ok(()) }
+        self.transaction(|s| {
+            let n =
+                s.db.prepare_cached(
+                    "UPDATE inodes SET mode = (mode & ?2) | ?3, ctime_ns = ?4 WHERE ino = ?1",
+                )
+                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now_ns()]))
+                .map_err(db_err)?;
+            s.touch_ino(ino);
+            if n == 0 { Err(Errno::ENOENT) } else { Ok(()) }
+        })
     }
 
     /// 修改属主和属组；`None` 表示不变。普通文件同时清除 setuid 位，组可执行时还清除
@@ -1128,7 +1270,8 @@ impl Store {
         self.touch_ino(ino);
         let st = self.stat_row(ino)?;
         if st.nlink == 0 && st.kind() == mode::S_IFREG {
-            remove_object(&self.object_path(ino))?;
+            // 提交之后再删：提交之前 App 被杀掉的话，目录项还在，object 也得在
+            self.doomed.borrow_mut().push(ino);
         }
         Ok(())
     }
@@ -1311,13 +1454,13 @@ impl Store {
 
     /// 修改权限位、属主和属组（保留类型位）。
     pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
-        self.db
-            .prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
-            .map_err(db_err)?;
-        self.touch_ino(ino);
-        self.written();
-        Ok(())
+        self.transaction(|s| {
+            s.db.prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
+                .map_err(db_err)?;
+            s.touch_ino(ino);
+            Ok(())
+        })
     }
 
     /// 设置扩展属性。`create`（`XATTR_CREATE`）时已经存在则失败，`replace`
@@ -1387,7 +1530,6 @@ impl Store {
             .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
         self.touch_ino(ino);
-        self.written();
         Ok(())
     }
 
@@ -1425,14 +1567,50 @@ impl Store {
                 .map_err(io_err);
         }
         if let Some(ns) = mtime_ns {
-            self.db
-                .prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
-                .and_then(|mut st| st.execute(params![ino, ns]))
-                .map_err(db_err)?;
-            self.touch_ino(ino);
-            self.written();
+            self.transaction(|s| {
+                s.db.prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
+                    .and_then(|mut st| st.execute(params![ino, ns]))
+                    .map_err(db_err)?;
+                s.touch_ino(ino);
+                Ok(())
+            })?;
         }
         Ok(())
+    }
+}
+
+/// [`Store::transaction`] 里的一个操作：没有正常结束（出错或者 panic）时回滚到它的
+/// 保存点，撤销它要删除的 object。
+struct Op<'a> {
+    store: &'a Store,
+    doomed: usize,
+    done: bool,
+}
+
+impl Op<'_> {
+    fn finish(mut self, ok: bool) {
+        self.done = ok;
+    }
+}
+
+impl Drop for Op<'_> {
+    fn drop(&mut self) {
+        let s = self.store;
+        s.writing.set(false);
+        if !self.done {
+            let _ = s.exec("ROLLBACK TO op");
+            let _ = s.exec("RELEASE op");
+            s.doomed.borrow_mut().truncate(self.doomed);
+        }
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Err(e) = self.commit() {
+            crate::debug::log(format_args!("inode store: final commit failed: {e:?}"));
+        }
+        self.meta.commits.users().fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1440,6 +1618,16 @@ impl Store {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    impl Store {
+        /// 模拟进程在提交之前被杀掉：推迟的修改丢失，等着删除的 object 留着，`lock` 里
+        /// 新分配的 inode 编号范围也留着。
+        fn crash(self) {
+            let _ = self.exec("ROLLBACK");
+            self.pending.set(None);
+            self.doomed.borrow_mut().clear();
+        }
+    }
 
     fn temp_store(name: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("appine-store-{name}-{}", std::process::id()));
@@ -1616,6 +1804,8 @@ mod tests {
         let st = s.stat_open(anon, &file).unwrap();
         assert_eq!((st.nlink, st.size), (0, 4));
         s.set_xattr(anon, b"user.x", b"1", false, false).unwrap();
+        // 定时器线程到点提交；不提交的话，下面打开仓库要等到超时
+        s.commit().unwrap();
         // 别的进程还在使用仓库时不清理：它可能还打开着这个 inode
         let other = Store::open(&dir, &[]).unwrap();
         assert!(other.stat_row(anon).is_ok());
@@ -1640,6 +1830,7 @@ mod tests {
         s.create_file(sub, b"pid", 0o644, 0, 0).unwrap();
         s.symlink(ROOT, b"tmp", b"run", 0, 0).unwrap();
         let volatile: &[&[u8]] = &[b"dev/shm", b"run", b"tmp", b"missing/dir"];
+        s.commit().unwrap();
         // 别的进程还在使用仓库：不是开机，什么都不删
         let other = Store::open(&dir, volatile).unwrap();
         assert!(other.lookup(shm, b"seg").unwrap().is_some());
@@ -1681,6 +1872,64 @@ mod tests {
         for w in workers {
             w.join().unwrap();
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_commits() {
+        let (s, dir) = temp_store("defer");
+        let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        // 别的连接（直接读数据库）在提交之前看不到
+        let raw = Connection::open(dir.join("meta.db")).unwrap();
+        let count = |name: &[u8]| -> i64 {
+            raw.query_row(
+                "SELECT count(*) FROM dentries WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(b"f"), 0);
+        // 失败的操作只回滚它自己：在普通文件下面建符号链接，插入 inode 之后才发现上级
+        // 不是目录
+        assert_eq!(s.symlink(f, b"x", b"t", 0, 0), Err(Errno::ENOTDIR));
+        let max: Ino =
+            s.db.query_row("SELECT max(ino) FROM inodes", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(max, f);
+        assert_eq!(s.lookup(ROOT, b"f").unwrap(), Some(f));
+        s.commit().unwrap();
+        assert_eq!(count(b"f"), 1);
+        // 最后一个链接删除之后，object 在提交时才删
+        let object = dir.join("objects").join(f.to_string());
+        s.unlink(ROOT, b"f").unwrap();
+        assert!(object.exists());
+        s.commit().unwrap();
+        assert!(!object.exists());
+        assert_eq!(count(b"f"), 0);
+        drop((raw, s));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn killed_before_commit() {
+        let (s, dir) = temp_store("killed");
+        let (g, _) = s.create_file(ROOT, b"g", 0o644, 0, 0).unwrap();
+        s.commit().unwrap();
+        // 没提交就被杀掉：删除没有生效，新建的文件随之丢失，它的 object 开机时删掉
+        s.unlink(ROOT, b"g").unwrap();
+        let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        let object = |ino: Ino| dir.join("objects").join(ino.to_string());
+        assert!(object(f).exists());
+        s.crash();
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.lookup(ROOT, b"g").unwrap(), Some(g));
+        assert!(object(g).exists());
+        assert_eq!(s.lookup(ROOT, b"f").unwrap(), None);
+        assert!(!object(f).exists());
+        // 编号又分配了出来
+        assert_eq!(s.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap(), f);
+        drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 }

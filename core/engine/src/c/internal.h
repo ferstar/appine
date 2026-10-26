@@ -23,17 +23,25 @@
  * 在加载时找不到。代码经由另一个地址写入时（W^X 双映射），数据缓存按写入的地址
  * start + write_delta 清理，指令缓存按执行的地址 start 作废。
  */
-static inline void sync_code_ranges(void *const *start, void *const *end, unsigned n,
-                                    intptr_t write_delta)
-{
 #if defined(__aarch64__) && defined(__linux__)
-    /* 只读一次：有些内核为了绕过勘误会让 EL0 读 CTR_EL0 陷入内核 */
+/* 宿主的 CTR_EL0。只读一次：有些内核为了绕过勘误会让 EL0 读 CTR_EL0 陷入内核 */
+static inline uint64_t host_ctr(void)
+{
     static uint64_t cached;
-    uint64_t ctr = __atomic_load_n(&cached, __ATOMIC_RELAXED), addr;
+    uint64_t ctr = __atomic_load_n(&cached, __ATOMIC_RELAXED);
     if (!ctr) { /* bit 31 恒为 1，0 表示还没读过 */
         __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
         __atomic_store_n(&cached, ctr, __ATOMIC_RELAXED);
     }
+    return ctr;
+}
+#endif
+
+static inline void sync_code_ranges(void *const *start, void *const *end, unsigned n,
+                                    intptr_t write_delta)
+{
+#if defined(__aarch64__) && defined(__linux__)
+    uint64_t ctr = host_ctr(), addr;
     /* CTR_EL0.IDC：数据缓存不需要清到统一点 */
     if (!((ctr >> 28) & 1)) {
         uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
@@ -58,6 +66,31 @@ static inline void sync_code_ranges(void *const *start, void *const *end, unsign
     (void)write_delta;
     for (unsigned i = 0; i < n; i++)
         __builtin___clear_cache((char *)start[i], (char *)end[i]);
+#endif
+}
+
+/*
+ * 只做缓存维护、不等它完成也不做上下文同步（sync_code_ranges 去掉 dsb、isb）：用于改写
+ * 链接点这种"旧指令照样正确、新指令迟一点被看到也没关系"的地方。维护操作总会完成，
+ * 之后取指迟早看到新指令；在那之前执行的还是旧指令。
+ */
+static inline void publish_code_lazily(void *start, void *end, intptr_t write_delta)
+{
+#if defined(__aarch64__) && defined(__linux__)
+    uint64_t ctr = host_ctr(), addr;
+    if (!((ctr >> 28) & 1)) {
+        uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
+        for (addr = (uint64_t)(uintptr_t)start & ~(line - 1); addr < (uint64_t)(uintptr_t)end; addr += line)
+            __asm__ volatile("dc cvau, %0" ::"r"(addr + (uint64_t)write_delta) : "memory");
+    }
+    if (!((ctr >> 29) & 1)) {
+        uint64_t line = UINT64_C(4) << (ctr & 15);
+        for (addr = (uint64_t)(uintptr_t)start & ~(line - 1); addr < (uint64_t)(uintptr_t)end; addr += line)
+            __asm__ volatile("ic ivau, %0" ::"r"(addr) : "memory");
+    }
+#else
+    __builtin___clear_cache((char *)start, (char *)end);
+    (void)write_delta;
 #endif
 }
 

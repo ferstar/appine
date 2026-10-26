@@ -501,7 +501,16 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         FileKind::Path(node)
     } else {
         match node {
-            Node::Store(ino) => open_store(cx, &cred, vfs.store(), ino, flags, created)?,
+            Node::Store(ino) => {
+                // 刚建好的文件本来就是空的，不截断：ext4 把截断到 0 之后又写过的文件当成
+                // 整个替换，关闭时立即开始回写，比写本身还慢
+                let flags = if was_created {
+                    flags & !oflags::O_TRUNC
+                } else {
+                    flags
+                };
+                open_store(cx, &cred, vfs.store(), ino, flags, created)?
+            }
             Node::Pseudo(p) => open_pseudo(cx, &cred, &vfs, p, flags)?,
         }
     };
@@ -2457,15 +2466,25 @@ pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u
 }
 
 pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32) -> SysResult {
-    // 仓库的数据直接写在宿主文件里；为了 apk 这类频繁 fsync 的负载，不逐个刷盘
+    // 仓库的数据直接写在宿主文件里；为了 apk 这类频繁 fsync 的负载，不逐个刷盘。推迟
+    // 提交的元数据修改现在提交，App 随后被杀掉也不会丢失
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
     match &f.kind {
         _ if f.flags & oflags::O_PATH != 0 => Err(Errno::EBADF),
         // 只有普通文件和目录能同步（宿主 fd 交给宿主）
-        FileKind::Regular { .. } | FileKind::Directory { .. } | FileKind::Host(_) => Ok(0),
+        FileKind::Regular { .. } | FileKind::Directory { .. } => sync(cx),
+        FileKind::Host(_) => Ok(0),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// sync(2)：提交 inode 仓库推迟提交的写事务。
+pub(super) fn sync(cx: &Cx<'_>) -> SysResult {
+    if let Ok(vfs) = cx.vfs() {
+        vfs.store().commit()?;
+    }
+    Ok(0)
 }
 
 // ---- 目录 ----

@@ -235,6 +235,7 @@ struct appine_dbt_thread {
     struct xlate *xlate;
     uint32_t *scratch;
     struct appine_cpu *probe;
+    uint64_t *defined; /* tier0_defined 的结果，按指令字缓存（DEFINED_CACHE 项） */
     struct prep *prep;
 };
 
@@ -293,6 +294,7 @@ struct xlate {
     intptr_t wdelta; /* 写入地址减去 buf：翻译进线程的暂存区时为 0，直接写代码缓存时是 rw_delta */
     struct appine_dbt_stats *st; /* 翻译的统计记在谁头上 */
     struct appine_cpu *probe;    /* 用来询问 Tier 0 是否认识某条指令 */
+    uint64_t *defined;           /* 它的回答，按指令字缓存 */
     size_t n;
     struct stub stubs[MAX_STUBS];
     unsigned nstubs;
@@ -335,6 +337,19 @@ static uint32_t *rw(const struct appine_dbt *d, const uint32_t *p)
 static void sync_range(const struct appine_dbt *d, const uint32_t *start, const uint32_t *end)
 {
     sync_code((void *)start, (void *)end, d->rw_delta);
+}
+
+/*
+ * 链接点改写之后不等它生效：改写的线程接着直接进入目标块，用不着新指令；别的线程（和
+ * 它自己以后）在看到新指令之前执行的是旧指令，跳往退出例程，由分发器照样找到目标块，
+ * 结果一样。缓存维护照做，新指令迟早被看到，只是不等 dsb、不做 isb：java 启动时每个块
+ * 要链接一两次，每次完整同步都要等作废广播完成，占了启动时间的两成。
+ */
+static void publish_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch)
+{
+    publish_code_lazily(site, site + 1, d->rw_delta);
+    if (branch)
+        publish_code_lazily(branch, branch + 1, d->rw_delta);
 }
 
 /* 攒着一起同步的几段代码（sync_code_ranges） */
@@ -1755,12 +1770,22 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     return fallback(x, pc);
 }
 
-/* 询问 Tier 0 是否认识这条指令（§4.4：两层的白名单必须一致） */
-static bool tier0_defined(struct appine_cpu *probe, uint32_t insn, uint64_t pc)
+/*
+ * 询问 Tier 0 是否认识这条指令（§4.4：两层的白名单必须一致）。回答只取决于指令字，按它
+ * 缓存在 `cache` 里（直接映射，每项是 1 << 40 | 指令字 << 1 | 回答）：Tier 0 要把指令
+ * 执行一遍才知道，java 启动时翻译的每条指令都问一次，占了两个百分点。
+ */
+#define DEFINED_CACHE 4096
+static bool tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t insn, uint64_t pc)
 {
+    uint64_t *e = &cache[(insn * UINT32_C(0x9e3779b1)) >> 20];
+    if ((*e >> 1) == ((uint64_t)1 << 39 | insn))
+        return *e & 1;
     probe->pc = pc;
     probe->sp = 0;
-    return appine_interp_exec(probe, insn) != APPINE_EXIT_UNDEF;
+    bool ok = appine_interp_exec(probe, insn) != APPINE_EXIT_UNDEF;
+    *e = (uint64_t)1 << 40 | (uint64_t)insn << 1 | ok;
+    return ok;
 }
 
 /*
@@ -1865,7 +1890,7 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     if ((FIELD(insn, 28, 25) & 7) == 7)
         return translate_simd_dp(x, insn) || fallback(x, pc);
-    if (!tier0_defined(x->probe, insn, pc))
+    if (!tier0_defined(x->probe, x->defined, insn, pc))
         return fallback(x, pc);
     switch (FIELD(insn, 28, 25)) {
     case 0x8:
@@ -2647,6 +2672,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     x->wdelta = 0;
     x->st = &t->stats;
     x->probe = t->probe;
+    x->defined = t->defined;
     x->n = 0;
     x->nstubs = 0;
     x->nfixups = 0;
@@ -3230,6 +3256,7 @@ static void release_thread(struct appine_dbt_thread *t)
     free(t->xlate);
     zfree(t->scratch, MAX_BLOCK_WORDS * sizeof(*t->scratch));
     zfree(t->probe, sizeof(*t->probe));
+    zfree(t->defined, DEFINED_CACHE * sizeof(*t->defined));
     free(t->prep);
     zfree(t, sizeof(*t));
 }
@@ -3270,8 +3297,9 @@ struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
         t->xlate = malloc(sizeof(*t->xlate));
         t->scratch = zalloc(MAX_BLOCK_WORDS * sizeof(*t->scratch));
         t->probe = zalloc(sizeof(*t->probe)); /* TLB 占一百多 KB，用不到的页不占内存 */
+        t->defined = zalloc(DEFINED_CACHE * sizeof(*t->defined));
         t->prep = malloc(sizeof(*t->prep));
-        if (!t->jc || !t->rs || !t->xlate || !t->scratch || !t->probe || !t->prep) {
+        if (!t->jc || !t->rs || !t->xlate || !t->scratch || !t->probe || !t->defined || !t->prep) {
             release_thread(t);
             return NULL;
         }
@@ -3544,10 +3572,15 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             uint32_t *target = code && patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (code && patch_site && patch_generation == d->generation && target != patch_site) {
                 *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
-                sync_add(&sync, patch_site, patch_site + 1);
                 /* 条件分支不在 CMODX 允许并发修改的指令里：有别的线程时不改它 */
-                if (patch_branch_site && alone && relink_word(d, patch_branch_site, target))
-                    sync_add(&sync, patch_branch_site, patch_branch_site + 1);
+                bool branch = patch_branch_site && alone && relink_word(d, patch_branch_site, target);
+                if (sync.n) { /* 新块反正要同步，链接点一起 */
+                    sync_add(&sync, patch_site, patch_site + 1);
+                    if (branch)
+                        sync_add(&sync, patch_branch_site, patch_branch_site + 1);
+                } else {
+                    publish_link(d, patch_site, branch ? patch_branch_site : NULL);
+                }
             }
             sync_all(d, &sync);
             if (f.code && alone)
@@ -3563,14 +3596,21 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
                 target != patch_site) {
-                struct syncs sync = {.n = 0};
-                __atomic_store_n(rw(d, patch_site), enc_b((intptr_t)target - (intptr_t)patch_site),
-                                 __ATOMIC_RELAXED);
-                sync_add(&sync, patch_site, patch_site + 1);
-                if (patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1 &&
-                    relink_word(d, patch_branch_site, target))
-                    sync_add(&sync, patch_branch_site, patch_branch_site + 1);
-                sync_all(d, &sync);
+                uint32_t b = enc_b((intptr_t)target - (intptr_t)patch_site);
+                bool again = __atomic_load_n(rw(d, patch_site), __ATOMIC_RELAXED) == b;
+                __atomic_store_n(rw(d, patch_site), b, __ATOMIC_RELAXED);
+                bool branch = patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1 &&
+                              relink_word(d, patch_branch_site, target);
+                if (again) {
+                    /* 已经改过、这个线程却还执行了旧指令：完整同步一次 */
+                    struct syncs sync = {.n = 0};
+                    sync_add(&sync, patch_site, patch_site + 1);
+                    if (branch)
+                        sync_add(&sync, patch_branch_site, patch_branch_site + 1);
+                    sync_all(d, &sync);
+                } else {
+                    publish_link(d, patch_site, branch ? patch_branch_site : NULL);
+                }
             }
             patch_site = NULL;
         }
