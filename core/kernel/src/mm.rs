@@ -136,6 +136,21 @@ struct RssPlan {
 }
 
 impl RssPlan {
+    /// 要量的几段合计不超过这么多页时不量，按全部驻留算（[`RssPlan::estimate`]）。
+    const SMALL: usize = 256;
+
+    /// 驻留页数的峰值用的估计：要 mincore 的几段合计不超过 1 MB 时按全部驻留算，最多
+    /// 多算 1 MB。`/bin/true` 这样的短命进程退出时要量 8 段、合计 45 页，量出来 12 页，
+    /// 却要持着 BKL 做 4 次 mincore（还要等宿主的 mmap_lock）。分配了大量内存的照常量。
+    fn estimate(&self) -> u64 {
+        let pages: usize = self.spans.iter().map(|&(_, len)| len.div_ceil(4096)).sum();
+        if pages <= Self::SMALL {
+            self.fixed + pages as u64
+        } else {
+            self.measure()
+        }
+    }
+
     /// 驻留的 4K 页数。宿主上首尾相接的合起来一次 mincore。
     fn measure(&self) -> u64 {
         let mut total = self.fixed;
@@ -2474,6 +2489,14 @@ impl Mm {
     ///   文件的一段缓存一会儿（[`FileResidency`]），程序和库的代码段不必每次都查。
     pub fn resident_pages(&self) -> u64 {
         self.rss_plan().measure()
+    }
+
+    /// 驻留页数峰值（`ru_maxrss`）的取样：自己的匿名内存不多时不量（[`RssPlan::estimate`]）。
+    /// `fresh` 时（fork 之后马上 execve，shell 起进程的常见做法）只算借来的页和缓存着的
+    /// 文件映射，不量它自己的匿名内存，那里只有 fork 之后写过的几页。
+    pub fn peak_resident_pages(&self, fresh: bool) -> u64 {
+        let plan = self.rss_plan();
+        if fresh { plan.fixed } else { plan.estimate() }
     }
 
     /// [`Mm::resident_pages`] 要量的：不用 mincore 就知道的页数，和要 mincore 的宿主范围。

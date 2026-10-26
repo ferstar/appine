@@ -430,7 +430,17 @@ impl ThreadGroup {
 
     /// 取一次驻留内存的样，更新峰值。
     pub fn sample_rss(&mut self, mm: &crate::mm::Mm) {
-        self.maxrss_kb = self.maxrss_kb.max(mm.resident_pages() * 4);
+        self.maxrss_kb = self.maxrss_kb.max(mm.peak_resident_pages(false) * 4);
+    }
+
+    /// execve 换掉地址空间之前的取样：fork 出来、还没执行过 execve、创建不超过一个时钟
+    /// 滴答的进程不量它自己的匿名内存（[`crate::mm::Mm::peak_resident_pages`]）。这次取样
+    /// 在 4 个进程同时起进程时占了不少时间：mincore 持着 BKL 等宿主的 mmap_lock，别的进程
+    /// 正在锁外 munmap。
+    pub fn sample_rss_at_exec(&mut self, mm: &crate::mm::Mm) {
+        let now = crate::pseudo::uptime_ns() / (1_000_000_000 / loader::CLOCK_TICKS);
+        let fresh = !self.execed && now <= self.start_ticks + 1;
+        self.maxrss_kb = self.maxrss_kb.max(mm.peak_resident_pages(fresh) * 4);
     }
 
     /// getrusage 的取样：距上次不到 10 毫秒时沿用上次的峰值。取样要用 mincore 扫一遍写过

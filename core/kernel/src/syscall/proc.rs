@@ -651,6 +651,8 @@ fn exec(
     {
         let group = cx.t.group.clone();
         let mut g = group.borrow_mut();
+        // 驻留内存的峰值跨 execve 保留：换掉地址空间之前取一次样（在标记 execed 之前）
+        g.sample_rss_at_exec(&cx.mm());
         g.exe = exe.to_vec();
         if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid) {
             g.dumpable = false;
@@ -671,9 +673,6 @@ fn exec(
         }
         g.sighand.borrow_mut().reset_on_exec();
     }
-    // 驻留内存的峰值跨 execve 保留：换掉地址空间之前取一次样
-    let group = cx.t.group.clone();
-    group.borrow_mut().sample_rss(&cx.mm());
     let task = cx.task.clone();
     let (k, t) = cx.parts();
     task::release_mm(k, &task, t);

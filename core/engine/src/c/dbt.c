@@ -2001,6 +2001,14 @@ static void *zalloc(size_t bytes)
     return p == MAP_FAILED ? NULL : p;
 }
 
+/* zalloc 得到的内存从头起 `bytes` 字节交还宿主，之后读到的是 0 */
+static void release_pages(void *p, size_t bytes)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (bytes)
+        madvise(p, (bytes + page - 1) & ~(page - 1), MADV_DONTNEED);
+}
+
 static void zfree(void *p, size_t bytes)
 {
     if (p)
@@ -3162,12 +3170,12 @@ static void emit_routines(struct appine_dbt *d)
  * 都重新映射代码缓存和各张表，再在第一次写入每一页时缺页。翻译不多时保留下来，按程序
  * （调用方给的键，内核层用可执行文件的 inode）区分：同一个程序再运行时（shell 脚本里反复
  * exec 的 busybox、go build 的一个个 compile、一次次 `node -e`）拿回它留下的翻译，核对之后
- * 接着用；没有同键的就拿一个空的或者新建，不去清空别的程序留下的。池里保留的代码总量有
- * 上限，超出时先去掉最久没用的。清空了的实例把代码缓存用过的部分标成 MADV_FREE，宿主内存
- * 紧张时可以直接回收（之后再写入只是重新缺页）。线程的部分（跳转缓存、影子返回栈）另有
- * 一个池子。
+ * 接着用；没有同键的就拿一个空的或者新建，不去清空别的程序留下的。几个进程同时跑同一个
+ * 程序时各占一个实例，池子要放得下它们。池里保留的代码总量有上限，超出时先去掉最久没用的。
+ * 清空了的实例把代码缓存用过的部分标成 MADV_FREE，宿主内存紧张时可以直接回收（之后再写入
+ * 只是重新缺页）。线程的部分（跳转缓存、影子返回栈）另有一个池子。
  */
-#define POOL_SIZE 6
+#define POOL_SIZE 16
 #define POOL_KEEP_WORDS ((size_t)(64u << 20) / 4) /* 池里保留的代码最多 64 MB */
 #define THREAD_POOL_SIZE 8
 
@@ -3279,9 +3287,14 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
     } else {
         key = 0;
         words = 0;
+        size_t nblocks = d->table_count, nguest = d->words_used;
         flush_locked(d);
         if (d->table->bits > TABLE_MIN_BITS) /* 下一个使用者多半是个短命进程 */
             table_resize(d, TABLE_MIN_BITS);
+        /* 块的记录和指令字按上限预先映射，用过的部分一直占着内存：也交还 */
+        release_pages(d->blocks, nblocks * sizeof(*d->blocks));
+        release_pages(d->table_used, nblocks * sizeof(*d->table_used));
+        release_pages(d->words, nguest * sizeof(*d->words));
         /*
          * 进入/退出例程所在的页保留，其余用过的部分交给宿主回收：私有映射用 MADV_FREE，
          * 内存紧张时才回收；双映射的共享内存不支持它，只能用 MADV_REMOVE 立即释放
