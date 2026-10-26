@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
-use crate::vfs::{Node, Pseudo, Vfs, normalize};
+use crate::vfs::{Mount, Node, Pseudo, Vfs, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -99,9 +99,10 @@ const PIPE_DEV: u64 = 0xd;
 /// socket、anon_inode（epoll、eventfd）报告的设备号。
 const SOCK_DEV: u64 = 0x8;
 const ANON_DEV: u64 = 0xe;
-/// procfs、devpts 报告的设备号。
+/// procfs、devpts、sysfs 报告的设备号。
 const PROC_DEV: u64 = 0x4;
 const DEVPTS_DEV: u64 = 0x18;
+const SYSFS_DEV: u64 = 0x16;
 /// mqueue 文件系统的设备号。
 const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
@@ -109,6 +110,7 @@ const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
+const SYSFS_MAGIC: u64 = 0x6265_6572;
 /// PTY 主设备的设备号（`/dev/ptmx`）。
 const PTMX_RDEV: u64 = rdev(5, 2);
 
@@ -309,7 +311,13 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     };
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
-    put(64, &(size.div_ceil(4096) * 8).to_le_bytes());
+    // sysfs 的文件报告一页的大小，但不占块
+    let blocks = if dev == SYSFS_DEV {
+        0
+    } else {
+        size.div_ceil(4096) * 8
+    };
+    put(64, &blocks.to_le_bytes());
     put(72, &asec.to_le_bytes());
     put(80, &ansec.to_le_bytes());
     put(88, &msec.to_le_bytes());
@@ -325,8 +333,17 @@ pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
         (_, Some(Node::Store(ino))) => (ROOT_DEV, ino),
         (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
         (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
-        (_, Some(Node::Pseudo(p))) => (PROC_DEV, pseudo::ino_of(&p)),
+        (_, Some(Node::Pseudo(p))) => (pseudo_dev(&p), pseudo::ino_of(&p)),
         _ => (ANON_DEV, 1),
+    }
+}
+
+/// 合成文件系统里的节点报告的设备号。
+fn pseudo_dev(p: &PseudoNode) -> u64 {
+    match pseudo::mount_of(p) {
+        Mount::Proc => PROC_DEV,
+        Mount::Pts => DEVPTS_DEV,
+        Mount::Sys => SYSFS_DEV,
     }
 }
 
@@ -341,13 +358,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
             let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
             file_stat(cx, &file)
         }
-        Node::Pseudo(p) => {
-            let dev = match p {
-                PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => DEVPTS_DEV,
-                _ => PROC_DEV,
-            };
-            Ok(encode_stat(&pseudo::stat(&view, p)?, dev))
-        }
+        Node::Pseudo(p) => Ok(encode_stat(&pseudo::stat(&view, p)?, pseudo_dev(p))),
     }
 }
 
@@ -1686,10 +1697,11 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     };
     Ok(match node {
         Node::Store(_) => encode_statfs(EXT4_SUPER_MAGIC, &cx.vfs()?.store().fs_stats()?),
-        Node::Pseudo(PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx) => {
-            encode_statfs(DEVPTS_SUPER_MAGIC, &empty)
-        }
-        Node::Pseudo(_) => encode_statfs(PROC_SUPER_MAGIC, &empty),
+        Node::Pseudo(p) => match pseudo::mount_of(p) {
+            Mount::Proc => encode_statfs(PROC_SUPER_MAGIC, &empty),
+            Mount::Pts => encode_statfs(DEVPTS_SUPER_MAGIC, &empty),
+            Mount::Sys => encode_statfs(SYSFS_MAGIC, &empty),
+        },
     })
 }
 
@@ -2197,7 +2209,19 @@ pub(super) fn utimensat(
         }
         cred.permission(&st, MAY_WRITE)?;
     }
-    cx.vfs()?.store().set_times(ino, atime, mtime)?;
+    // 按 fd 设置的普通文件经由打开的 object 设置：删除之后仍然打开着的文件也能用
+    let open = match (path.is_empty(), dirfd) {
+        (true, fd) if fd != AT_FDCWD => Some(cx.fds().get(fd)?),
+        _ => None,
+    };
+    let vfs = cx.vfs()?;
+    if let Some(f) = open.as_ref().map(|f| f.borrow())
+        && let FileKind::Regular { file, .. } = &f.kind
+    {
+        vfs.store().set_times_open(ino, file, atime, mtime)?;
+    } else {
+        vfs.store().set_times(ino, atime, mtime)?;
+    }
     if path.is_empty() {
         attrib_fd(cx, dirfd);
     } else {

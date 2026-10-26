@@ -878,6 +878,9 @@ pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     // struct sysinfo（64 位）：uptime、loads[3]、totalram…freeswap、procs、totalhigh、freehigh、mem_unit
     let mut b = [0u8; 112];
     b[..8].copy_from_slice(&uptime.to_le_bytes());
+    for (i, load) in crate::loadavg::sysinfo_loads(cx.kr()).iter().enumerate() {
+        b[8 + i * 8..16 + i * 8].copy_from_slice(&load.to_le_bytes());
+    }
     b[32..40].copy_from_slice(&total.to_le_bytes());
     b[40..48].copy_from_slice(&free.to_le_bytes());
     b[80..82].copy_from_slice(&procs.to_le_bytes());

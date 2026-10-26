@@ -469,6 +469,29 @@ fn procfs_describes_processes() {
 }
 
 #[test]
+fn sysfs_and_limits_describe_the_machine() {
+    // busybox 的 nproc --all 数 /sys/devices/system/cpu 下的 cpu<n>；/proc/self/limits 与
+    // ulimit 一致
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "n=$(grep -c ^processor /proc/cpuinfo); test $(nproc --all) = $n && echo nproc; \
+         online=$(cat /sys/devices/system/cpu/online); \
+         test $online = 0-$((n - 1)) -o $online = 0 -a $n = 1 && echo online; \
+         ls /sys/devices/system/cpu/cpu0/topology | grep -c _list; \
+         ulimit -n 777; grep 'open files' /proc/self/limits | tr -s ' '; \
+         grep -c ' - sysfs ' /proc/self/mountinfo",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["nproc", "online", "5", "Max open files 777 777 files ", "1"],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
 fn network_configuration_is_visible() {
     // netlink（ip）、接口 ioctl（ifconfig）、/proc/net/dev、指向 DNS 存根的 resolv.conf
     for (tier, out) in run(&[

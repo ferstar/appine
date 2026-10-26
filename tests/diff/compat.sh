@@ -599,8 +599,10 @@ int main(void)
     show(signalfd(-1, &set, 0));
     int root = open("/", O_RDONLY);
     int proc = open("/proc/self/stat", O_RDONLY);
+    int sys = open("/sys/devices/system/cpu/online", O_RDONLY);
     mount("/", root);
     mount("/proc", proc);
+    mount("/sys", sys);
     return 0;
 }
 C
@@ -1383,3 +1385,77 @@ int main(void) {
 C
 gcc -O1 -o dun dun.c
 ./dun
+
+# sysfs 里 CPU 的拓扑（busybox 的 nproc --all 数 cpu<n> 目录）；possible、present 在有的
+# 宿主上比 online 多，不比
+n=$(grep -c ^processor /proc/cpuinfo)
+[ "$(nproc --all)" = "$n" ] && echo "nproc --all matches cpuinfo"
+[ "$(ls -d /sys/devices/system/cpu/cpu[0-9]* | wc -l)" = "$n" ] && echo "cpu directories match cpuinfo"
+for f in online cpu0/online cpu0/topology/thread_siblings_list; do
+    echo "$f: $(cat /sys/devices/system/cpu/$f)"
+done
+test -r /sys/devices/system/cpu/possible && test -r /sys/devices/system/cpu/present && echo "possible present"
+stat -c 'size %s blocks %b' /sys/devices/system/cpu/online
+stat -f -c 'type %T' /sys
+# /proc/loadavg 的格式（数值取决于宿主）
+sed -E 's/[0-9]+\.[0-9][0-9]/L/g; s/[0-9]+\/[0-9]+ [0-9]+$/R\/T P/' /proc/loadavg
+
+# /proc/<pid>/limits 与 getrlimit 一致，列宽与 Linux 相同；删除之后仍然打开着的文件可以
+# futimens
+cat > limits.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static void show(char *out, rlim_t v)
+{
+    if (v == RLIM_INFINITY)
+        strcpy(out, "unlimited");
+    else
+        sprintf(out, "%llu", (unsigned long long)v);
+}
+
+int main(void)
+{
+    struct rlimit rl = {777, 777};
+    setrlimit(RLIMIT_NOFILE, &rl);
+    FILE *f = fopen("/proc/self/limits", "r");
+    char line[256];
+    int n = 0, same = 0;
+    fgets(line, sizeof line, f);
+    printf("[%.*s]\n", (int)strcspn(line, "\n"), line);
+    while (fgets(line, sizeof line, f)) {
+        char soft[32], hard[32], want_soft[32], want_hard[32];
+        struct rlimit r;
+        getrlimit(n++, &r);
+        show(want_soft, r.rlim_cur);
+        show(want_hard, r.rlim_max);
+        if (sscanf(line + 26, "%31s %31s", soft, hard) == 2 && !strcmp(soft, want_soft) &&
+            !strcmp(hard, want_hard))
+            same++;
+        if (!strncmp(line, "Max open files", 14) || !strncmp(line, "Max nice", 8))
+            printf("[%.*s]\n", (int)strcspn(line, "\n"), line);
+    }
+    printf("%d limits, %d same as getrlimit\n", n, same);
+
+    int fd = open("futimens.tmp", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    unlink("futimens.tmp");
+    usleep(100000);
+    struct timespec ts[2] = {{1000000000, 0}, {1234567890, 5}};
+    printf("futimens %d\n", futimens(fd, ts));
+    struct stat st;
+    fstat(fd, &st);
+    printf("atime %ld mtime %ld.%09ld\n", (long)st.st_atime, (long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
+    ts[1].tv_sec = 1500000000;
+    printf("empty path %d\n", utimensat(fd, "", ts, AT_EMPTY_PATH));
+    fstat(fd, &st);
+    printf("mtime %ld nlink %ld\n", (long)st.st_mtime, (long)st.st_nlink);
+    return 0;
+}
+C
+gcc -O1 -o limits limits.c
+./limits

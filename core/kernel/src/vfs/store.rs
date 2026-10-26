@@ -1682,12 +1682,11 @@ impl Store {
     ) -> Result<(), Errno> {
         if self.kind(ino)? == mode::S_IFREG {
             let mut name = [0u8; 21];
-            let split = |ns: i64| (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
             return appine_hal::set_times_at(
                 self.meta.objects_dir.as_raw_fd(),
                 object_name(ino, &mut name),
-                atime_ns.map(split),
-                mtime_ns.map(split),
+                atime_ns.map(split_ns),
+                mtime_ns.map(split_ns),
             )
             .map_err(|e| object_err(ino, e));
         }
@@ -1702,6 +1701,28 @@ impl Store {
         }
         Ok(())
     }
+
+    /// 经由打开的 object 设置普通文件 `ino` 的访问时间和修改时间：文件删除之后（object
+    /// 已经删了）也能用。
+    pub fn set_times_open(
+        &self,
+        ino: Ino,
+        file: &File,
+        atime_ns: Option<i64>,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), Errno> {
+        appine_hal::set_times_fd(
+            file.as_raw_fd(),
+            atime_ns.map(split_ns),
+            mtime_ns.map(split_ns),
+        )
+        .map_err(|e| object_err(ino, e))
+    }
+}
+
+/// 纳秒数拆成 (秒, 纳秒)。
+fn split_ns(ns: i64) -> (i64, i64) {
+    (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
 }
 
 /// [`Store::transaction`] 里的一个操作：没有正常结束（出错或者 panic）时回滚到它的

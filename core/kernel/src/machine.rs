@@ -435,8 +435,8 @@ impl Drop for Machine {
 }
 
 /// 定时器线程：等到最早的到期时刻，发出到期的 SIGALRM（[`crate::itimer::expire`]），
-/// 有 guest 线程在运行时定时检查内存的上限（[`crate::oom`]），到点提交 inode 仓库推迟
-/// 提交的写事务，直到 Machine 关闭。
+/// 有 guest 线程在运行时定时检查内存的上限（[`crate::oom`]）、为平均负载取样
+/// （[`crate::loadavg`]），到点提交 inode 仓库推迟提交的写事务，直到 Machine 关闭。
 ///
 /// 撞上内核层的 bug 时（[`crate::bug`]）照常运行：处理一个进程的定时器时出错，结束那个
 /// 进程；内存上限的检查和信号驱动的 I/O 分不出是哪个进程的，出错时关掉这项功能。
@@ -454,6 +454,11 @@ fn timers(shared: Arc<Shared>) {
                 ));
                 k.oom.limit = u64::MAX;
             }
+        }
+        match crate::bug::catch(|| crate::loadavg::sample(&mut k, &shared)) {
+            Some(Some(due)) => next = Some(next.map_or(due, |n| n.min(due))),
+            Some(None) => {}
+            None => crate::bug::report(format_args!("kernel panic in the load average")),
         }
         // inode 仓库推迟提交的写事务：开始推迟时叫醒这个线程
         if let Some(vfs) = k.vfs.clone() {

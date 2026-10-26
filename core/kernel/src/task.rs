@@ -368,8 +368,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
     let mut seen = load(&generations);
     loop {
-        // 所有线程都在等待时内存上限的检查会停下来（crate::oom）
-        shared.resume_oom_checks();
+        // 所有线程都在等待时定时器线程的定期检查会停下来（crate::oom、crate::loadavg）
+        shared.resume_checks();
         // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
         sync.in_guest.store(true, Ordering::SeqCst);
         let now = load(&generations);

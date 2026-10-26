@@ -309,14 +309,8 @@ pub fn open_at(
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// 设置目录 `dir` 里名为 `name` 的文件的访问时间和修改时间（utimensat，跟随符号链接），
-/// 时间是 (秒, 纳秒)，None 表示不改。
-pub fn set_times_at(
-    dir: i32,
-    name: &std::ffi::CStr,
-    atime: Option<(i64, i64)>,
-    mtime: Option<(i64, i64)>,
-) -> Result<(), i32> {
+/// utimensat 的时间参数：(秒, 纳秒)，None 表示不改。
+fn utime_spec(atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> [libc::timespec; 2] {
     let ts = |t: Option<(i64, i64)>| match t {
         Some((sec, nsec)) => libc::timespec {
             tv_sec: sec as libc::time_t,
@@ -327,8 +321,32 @@ pub fn set_times_at(
             tv_nsec: libc::UTIME_OMIT,
         },
     };
-    let times = [ts(atime), ts(mtime)];
+    [ts(atime), ts(mtime)]
+}
+
+/// 设置目录 `dir` 里名为 `name` 的文件的访问时间和修改时间（utimensat，跟随符号链接），
+/// 时间是 (秒, 纳秒)，None 表示不改。
+pub fn set_times_at(
+    dir: i32,
+    name: &std::ffi::CStr,
+    atime: Option<(i64, i64)>,
+    mtime: Option<(i64, i64)>,
+) -> Result<(), i32> {
+    let times = utime_spec(atime, mtime);
     if unsafe { libc::utimensat(dir, name.as_ptr(), times.as_ptr(), 0) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// 设置打开的文件 `fd` 的访问时间和修改时间（futimens），参数与 [`set_times_at`] 相同。
+pub fn set_times_fd(
+    fd: i32,
+    atime: Option<(i64, i64)>,
+    mtime: Option<(i64, i64)>,
+) -> Result<(), i32> {
+    let times = utime_spec(atime, mtime);
+    if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
         return Err(last_errno());
     }
     Ok(())

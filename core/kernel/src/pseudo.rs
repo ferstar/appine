@@ -1,4 +1,5 @@
-//! 合成文件系统（设计文档 §8.2）：`/proc`（procfs）和 `/dev/pts`（devpts）。
+//! 合成文件系统（设计文档 §8.2）：`/proc`（procfs）、`/dev/pts`（devpts）和 `/sys`（sysfs，
+//! 只有 CPU 的拓扑）。
 //!
 //! 节点是 [`PseudoNode`]，目录结构经由 [`View`]（持有 BKL 时对内核状态的只读视图）
 //! 实现 [`Pseudo`]。procfs 的文件在打开时生成一份完整的内容（[`content`]），
@@ -8,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::rc::Rc;
 
 use crate::cred::{Cred, cap};
@@ -62,6 +64,7 @@ pub(crate) enum Entry {
     Cmdline,
     Comm,
     Environ,
+    Limits,
     Maps,
     Smaps,
     SmapsRollup,
@@ -78,13 +81,14 @@ pub(crate) enum Entry {
     CoredumpFilter,
 }
 
-const ENTRIES: [(&[u8], Entry); 20] = [
+const ENTRIES: [(&[u8], Entry); 21] = [
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
     (b"cmdline", Entry::Cmdline),
     (b"comm", Entry::Comm),
     (b"environ", Entry::Environ),
+    (b"limits", Entry::Limits),
     (b"maps", Entry::Maps),
     (b"smaps", Entry::Smaps),
     (b"smaps_rollup", Entry::SmapsRollup),
@@ -170,17 +174,76 @@ const STATIC: [&[u8]; 65] = [
     b"sysvipc/shm",
 ];
 
-/// `/proc` 下直接的静态目录（`net/`、`sys/`、`sysvipc/`）。
-fn is_top_dir(path: &[u8]) -> bool {
-    path.iter().position(|&b| b == b'/') == Some(path.len() - 1)
+/// `/sys` 下固定的目录和文件（相对 `/sys` 的路径，目录以 `/` 结尾）。只有 CPU 的拓扑：
+/// busybox 的 `nproc --all`、lscpu、glibc 的 get_nprocs 读它们。各个 `cpu<n>` 是
+/// [`PseudoNode::SysCpu`]。
+const SYS_STATIC: [&[u8]; 7] = [
+    b"devices/",
+    b"devices/system/",
+    b"devices/system/cpu/",
+    b"devices/system/cpu/offline",
+    b"devices/system/cpu/online",
+    b"devices/system/cpu/possible",
+    b"devices/system/cpu/present",
+];
+
+/// `/sys/devices/system/cpu`：各个 `cpu<n>` 在它下面。
+const SYS_CPU_DIR: &[u8] = b"devices/system/cpu/";
+
+/// `/sys/devices/system/cpu/cpu<n>` 下的目录和文件（相对 `cpu<n>` 的路径）。
+const CPU_FILES: [&[u8]; 19] = [
+    b"online",
+    b"regs/",
+    b"regs/identification/",
+    b"regs/identification/midr_el1",
+    b"regs/identification/revidr_el1",
+    b"topology/",
+    b"topology/cluster_cpus",
+    b"topology/cluster_cpus_list",
+    b"topology/cluster_id",
+    b"topology/core_cpus",
+    b"topology/core_cpus_list",
+    b"topology/core_id",
+    b"topology/core_siblings",
+    b"topology/core_siblings_list",
+    b"topology/package_cpus",
+    b"topology/package_cpus_list",
+    b"topology/physical_package_id",
+    b"topology/thread_siblings",
+    b"topology/thread_siblings_list",
+];
+
+/// 固定的目录树（[`STATIC`] 这样相对树根的路径，目录以 `/` 结尾）里，目录 `dir`（树根是
+/// 空的）下名为 `name` 的项。
+fn tree_lookup(tree: &[&'static [u8]], dir: &[u8], name: &[u8]) -> Option<&'static [u8]> {
+    tree.iter().copied().find(|p| {
+        let p = p.strip_suffix(b"/").unwrap_or(p);
+        p.len() == dir.len() + name.len() && p.starts_with(dir) && p.ends_with(name)
+    })
 }
 
-/// `/proc/<name>` 是不是静态目录。
-fn top_static(name: &[u8]) -> Option<&'static [u8]> {
-    STATIC
-        .iter()
-        .find(|p| is_top_dir(p) && &p[..p.len() - 1] == name)
-        .copied()
+/// 固定的目录树里目录 `dir` 下直接的项。
+fn tree_children<'t>(
+    tree: &'t [&'static [u8]],
+    dir: &'t [u8],
+) -> impl Iterator<Item = &'static [u8]> + 't {
+    tree.iter().copied().filter(move |p| {
+        let p = p.strip_suffix(b"/").unwrap_or(p);
+        p.len() > dir.len() && p.starts_with(dir) && !p[dir.len()..].contains(&b'/')
+    })
+}
+
+/// 固定的目录树里的上级目录；直接在树根下的是 None。
+fn tree_parent(tree: &[&'static [u8]], path: &[u8]) -> Option<&'static [u8]> {
+    let p = path.strip_suffix(b"/").unwrap_or(path);
+    let i = p.iter().rposition(|&b| b == b'/')?;
+    tree.iter().copied().find(|q| *q == &p[..=i])
+}
+
+/// 路径的最后一个组件。
+fn tree_name(path: &[u8]) -> &[u8] {
+    let p = path.strip_suffix(b"/").unwrap_or(path);
+    &p[p.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..]
 }
 
 /// 合成文件系统里的一个节点。
@@ -212,10 +275,17 @@ pub(crate) enum PseudoNode {
     OpenFd(Tid, i32),
     /// `/proc/<pid>/fdinfo/<n>`。
     FdInfo(Tid, i32),
+    /// `/sys`。
+    SysRoot,
+    /// `/sys` 下的目录或文件，取值来自 [`SYS_STATIC`]。
+    Sys(&'static [u8]),
+    /// `/sys/devices/system/cpu/cpu<n>`（路径为空），或者它下面的目录和文件（路径取值来自
+    /// [`CPU_FILES`]）。
+    SysCpu(u32, &'static [u8]),
 }
 
 /// `/proc/<pid>/task/<tid>` 里的项。
-const TASK_ENTRIES: [Entry; 3] = [Entry::Stat, Entry::Status, Entry::Comm];
+const TASK_ENTRIES: [Entry; 4] = [Entry::Stat, Entry::Status, Entry::Comm, Entry::Limits];
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
 pub(crate) struct View<'a> {
@@ -259,12 +329,14 @@ fn root_of(fs: Mount) -> PseudoNode {
     match fs {
         Mount::Proc => PseudoNode::ProcRoot,
         Mount::Pts => PseudoNode::PtsRoot,
+        Mount::Sys => PseudoNode::SysRoot,
     }
 }
 
-fn mount_of(node: &PseudoNode) -> Mount {
+pub(crate) fn mount_of(node: &PseudoNode) -> Mount {
     match node {
         PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => Mount::Pts,
+        PseudoNode::SysRoot | PseudoNode::Sys(_) | PseudoNode::SysCpu(..) => Mount::Sys,
         _ => Mount::Proc,
     }
 }
@@ -367,15 +439,14 @@ impl Pseudo for View<'_> {
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode> {
         use PseudoNode::*;
         Some(match node {
-            PtsRoot | ProcRoot => return None,
+            PtsRoot | ProcRoot | SysRoot => return None,
             Pts(_) | PtsPtmx => PtsRoot,
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
-            Static(path) => {
-                let trimmed = path.strip_suffix(b"/").unwrap_or(path);
-                match trimmed.iter().rposition(|&b| b == b'/') {
-                    None => ProcRoot,
-                    Some(i) => Static(STATIC.iter().find(|p| **p == &trimmed[..=i]).unwrap()),
-                }
+            Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
+            Sys(path) => tree_parent(&SYS_STATIC, path).map_or(SysRoot, Sys),
+            SysCpu(_, b"") => Sys(SYS_CPU_DIR),
+            SysCpu(n, path) => {
+                tree_parent(&CPU_FILES, path).map_or(SysCpu(*n, b""), |p| SysCpu(*n, p))
             }
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
@@ -394,14 +465,10 @@ impl Pseudo for View<'_> {
             Global(g) => GLOBALS.iter().find(|(_, x)| x == g).unwrap().0.to_vec(),
             SelfLink => b"self".to_vec(),
             ThreadSelf => b"thread-self".to_vec(),
-            Static(path) => {
-                let trimmed = path.strip_suffix(b"/").unwrap_or(path);
-                let start = trimmed
-                    .iter()
-                    .rposition(|&b| b == b'/')
-                    .map_or(0, |i| i + 1);
-                trimmed[start..].to_vec()
-            }
+            Static(path) | Sys(path) => tree_name(path).to_vec(),
+            SysRoot => b"sys".to_vec(),
+            SysCpu(n, b"") => format!("cpu{n}").into_bytes(),
+            SysCpu(_, path) => tree_name(path).to_vec(),
             Pid(pid, None) => pid.to_string().into_bytes(),
             Pid(_, Some(tid)) => tid.to_string().into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
@@ -425,7 +492,9 @@ impl Pseudo for View<'_> {
             ProcRoot => match name {
                 b"self" => Some(SelfLink),
                 b"thread-self" => Some(ThreadSelf),
-                _ if top_static(name).is_some() => top_static(name).map(Static),
+                _ if tree_lookup(&STATIC, b"", name).is_some() => {
+                    tree_lookup(&STATIC, b"", name).map(Static)
+                }
                 _ => GLOBALS
                     .iter()
                     .find(|(n, _)| *n == name)
@@ -435,14 +504,14 @@ impl Pseudo for View<'_> {
                         self.pid_exists(pid, None).then_some(Pid(pid, None))
                     }),
             },
-            Static(path) => {
-                let mut full = path.to_vec();
-                full.extend_from_slice(name);
-                STATIC
-                    .iter()
-                    .find(|p| p.strip_suffix(b"/").unwrap_or(p) == &full[..])
-                    .map(|p| Static(p))
-            }
+            Static(path) => tree_lookup(&STATIC, path, name).map(Static),
+            SysRoot => tree_lookup(&SYS_STATIC, b"", name).map(Sys),
+            Sys(path) => tree_lookup(&SYS_STATIC, path, name).map(Sys).or_else(|| {
+                let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
+                let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
+                (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
+            }),
+            SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name).map(|p| SysCpu(*n, p)),
             Pid(pid, tid) => {
                 let allowed = |e: &self::Entry| tid.is_none() || TASK_ENTRIES.contains(e);
                 ENTRIES
@@ -470,8 +539,9 @@ impl Pseudo for View<'_> {
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno> {
         use PseudoNode::*;
         Ok(match node {
-            PtsRoot | ProcRoot | Pid(..) => mode::S_IFDIR,
-            Static(p) if p.ends_with(b"/") => mode::S_IFDIR,
+            PtsRoot | ProcRoot | Pid(..) | SysRoot => mode::S_IFDIR,
+            Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
+            SysCpu(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
             Entry(_, _, self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
             SelfLink | ThreadSelf | Global(self::Global::Mounts) | Fd(..) => mode::S_IFLNK,
@@ -590,7 +660,9 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 /// 合成节点的元数据。
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let kind = ps.kind(node)?;
+    let sysfs = mount_of(node) == Mount::Sys;
     let perm = match (kind, node) {
+        (mode::S_IFDIR, _) if sysfs => 0o755,
         (mode::S_IFDIR, _) => 0o555,
         (mode::S_IFLNK, _) => 0o777,
         (_, PseudoNode::Pts(_)) => 0o620,
@@ -615,7 +687,12 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         uid,
         gid,
         rdev: rdev_value,
-        size: 0,
+        // sysfs 的文件与 Linux 一样报告一页
+        size: if sysfs && kind == mode::S_IFREG {
+            4096
+        } else {
+            0
+        },
         atime_ns: now,
         mtime_ns: now,
         ctime_ns: now,
@@ -822,21 +899,19 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
         }
         ProcRoot => {
             nodes.extend([SelfLink, ThreadSelf]);
-            nodes.extend(STATIC.iter().filter(|p| is_top_dir(p)).map(|p| Static(p)));
+            nodes.extend(tree_children(&STATIC, b"").map(Static));
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
             nodes.extend(ps.k.groups.keys().map(|&pid| Pid(pid, None)));
         }
-        Static(path) => nodes.extend(
-            STATIC
-                .iter()
-                .filter(|p| {
-                    let trimmed = p.strip_suffix(b"/").unwrap_or(p);
-                    trimmed.len() > path.len()
-                        && trimmed.starts_with(path)
-                        && !trimmed[path.len()..].contains(&b'/')
-                })
-                .map(|p| Static(p)),
-        ),
+        Static(path) => nodes.extend(tree_children(&STATIC, path).map(Static)),
+        SysRoot => nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys)),
+        Sys(path) => {
+            nodes.extend(tree_children(&SYS_STATIC, path).map(Sys));
+            if *path == SYS_CPU_DIR {
+                nodes.extend((0..cpus() as u32).map(|n| SysCpu(n, b"")));
+            }
+        }
+        SysCpu(n, path) => nodes.extend(tree_children(&CPU_FILES, path).map(|p| SysCpu(*n, p))),
         Pid(pid, tid) => nodes.extend(
             ENTRIES
                 .iter()
@@ -1100,6 +1175,47 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     Ok(s)
 }
 
+/// `/proc/<pid>/limits` 各行的名字和单位，按资源编号排列（Linux 的 `lnames`）。
+const LIMIT_NAMES: [(&str, &str); crate::process::RLIM_NLIMITS] = [
+    ("Max cpu time", "seconds"),
+    ("Max file size", "bytes"),
+    ("Max data size", "bytes"),
+    ("Max stack size", "bytes"),
+    ("Max core file size", "bytes"),
+    ("Max resident set", "bytes"),
+    ("Max processes", "processes"),
+    ("Max open files", "files"),
+    ("Max locked memory", "bytes"),
+    ("Max address space", "bytes"),
+    ("Max file locks", "locks"),
+    ("Max pending signals", "signals"),
+    ("Max msgqueue size", "bytes"),
+    ("Max nice priority", ""),
+    ("Max realtime priority", ""),
+    ("Max realtime timeout", "us"),
+];
+
+/// `/proc/<pid>/limits`：与 Linux 的 `proc_pid_limits` 格式相同，没有单位的行末尾也留着
+/// 硬限制后面的空格。
+fn limits(rlimits: &[(u64, u64); crate::process::RLIM_NLIMITS]) -> String {
+    let value = |v: u64| match v {
+        u64::MAX => "unlimited".to_owned(),
+        v => v.to_string(),
+    };
+    let mut s = format!(
+        "{:<25} {:<20} {:<20} {:<10}\n",
+        "Limit", "Soft Limit", "Hard Limit", "Units"
+    );
+    for ((name, unit), &(soft, hard)) in LIMIT_NAMES.iter().zip(rlimits) {
+        write!(s, "{name:<25} {:<20} {:<20} ", value(soft), value(hard)).unwrap();
+        if !unit.is_empty() {
+            write!(s, "{unit:<10}").unwrap();
+        }
+        s.push('\n');
+    }
+    s
+}
+
 fn maps(task: &Task) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
@@ -1284,14 +1400,16 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
 
 const MOUNTS: &str = "appine / ext4 rw,relatime 0 0\n\
     proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
-    devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0\n";
+    devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0\n\
+    sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n";
 
 /// `/proc/<pid>/mountinfo`：挂载点的编号与 fdinfo 的 mnt_id 一致，设备号与 stat 的
 /// st_dev 一致。
 const MOUNTINFO: &str = "1 1 8:1 / / rw,relatime - ext4 appine rw\n\
     2 1 0:4 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n\
     3 1 0:24 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts \
-    rw,gid=5,mode=620,ptmxmode=000\n";
+    rw,gid=5,mode=620,ptmxmode=000\n\
+    4 1 0:22 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n";
 
 const HWCAP_NAMES: [&str; 12] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
@@ -1465,15 +1583,13 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 let up = uptime_ns() as f64 / 1e9;
                 format!("{up:.2} {:.2}\n", up * cpus() as f64)
             }
-            self::Global::Loadavg => format!(
-                "0.00 0.00 0.00 1/{} {}\n",
-                ps.k.tasks.len(),
-                ps.k.groups.keys().max().unwrap_or(&1)
-            ),
+            self::Global::Loadavg => crate::loadavg::proc_loadavg(ps.k),
             self::Global::Version => {
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
-            self::Global::Filesystems => "\text4\nnodev\tproc\nnodev\tdevpts\n".to_owned(),
+            self::Global::Filesystems => {
+                "nodev\tsysfs\n\text4\nnodev\tproc\nnodev\tdevpts\n".to_owned()
+            }
             self::Global::Cmdline => "appine\n".to_owned(),
             self::Global::Mounts => return Err(Errno::EINVAL),
         },
@@ -1560,6 +1676,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 self::Entry::Environ => {
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.env)));
                 }
+                self::Entry::Limits => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    limits(&g.borrow().rlimits)
+                }
                 self::Entry::Maps => task.map_or(String::new(), |t| maps(&t)),
                 self::Entry::Smaps => task.map_or(String::new(), |t| smaps(&t, false)),
                 self::Entry::SmapsRollup => task.map_or(String::new(), |t| smaps(&t, true)),
@@ -1577,9 +1697,74 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             }
         }
         FdInfo(pid, fd) => fdinfo(ps, *pid, *fd)?,
+        Sys(path) => match &path[..] {
+            b"devices/system/cpu/online"
+            | b"devices/system/cpu/possible"
+            | b"devices/system/cpu/present" => cpu_list(0..cpus()),
+            b"devices/system/cpu/offline" => "\n".to_owned(),
+            _ => return Err(Errno::EISDIR),
+        },
+        SysCpu(n, path) => cpu_file(*n as usize, path)?,
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())
+}
+
+/// `/sys/devices/system/cpu/cpu<n>` 下的文件。CPU 都一样（`/proc/cpuinfo` 也是），各自是
+/// 一个核，没有超线程，都在一个封装里。
+fn cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
+    let all = 0..cpus();
+    let me = n..n + 1;
+    Ok(match path {
+        b"online" => "1\n".to_owned(),
+        b"regs/identification/midr_el1" => format!("0x{:016x}\n", appine_engine::guest_midr()),
+        b"regs/identification/revidr_el1" => format!("0x{:016x}\n", 0),
+        b"topology/cluster_id" => "-1\n".to_owned(),
+        b"topology/core_id" => format!("{n}\n"),
+        b"topology/physical_package_id" => "0\n".to_owned(),
+        b"topology/cluster_cpus" | b"topology/core_cpus" | b"topology/thread_siblings" => {
+            cpu_mask(me)
+        }
+        b"topology/cluster_cpus_list"
+        | b"topology/core_cpus_list"
+        | b"topology/thread_siblings_list" => cpu_list(me),
+        b"topology/core_siblings" | b"topology/package_cpus" => cpu_mask(all),
+        b"topology/core_siblings_list" | b"topology/package_cpus_list" => cpu_list(all),
+        _ => return Err(Errno::EISDIR),
+    })
+}
+
+/// CPU 列表的写法（`%*pbl`）：`0-3`，只有一个时是 `2`。
+fn cpu_list(set: Range<usize>) -> String {
+    match set.len() {
+        0 => "\n".to_owned(),
+        1 => format!("{}\n", set.start),
+        _ => format!("{}-{}\n", set.start, set.end - 1),
+    }
+}
+
+/// CPU 掩码的写法（`%*pb`）：十六进制，每 32 位一组，用逗号隔开，最高的一组补零到写得下
+/// CPU 总数的位数（4 个 CPU 时是 `f`，8 个时 cpu0 是 `01`）。
+fn cpu_mask(set: Range<usize>) -> String {
+    let bits = cpus();
+    let groups = bits.div_ceil(32);
+    let mut s = String::new();
+    for g in (0..groups).rev() {
+        let width = if g == groups - 1 {
+            (bits - g * 32).div_ceil(4)
+        } else {
+            8
+        };
+        let word = (0..32)
+            .filter(|b| set.contains(&(g * 32 + b)))
+            .fold(0u32, |w, b| w | 1 << b);
+        if g != groups - 1 {
+            s.push(',');
+        }
+        write!(s, "{word:0width$x}").unwrap();
+    }
+    s.push('\n');
+    s
 }
 
 /// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec 和 64 位上总有的
@@ -1598,9 +1783,12 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
     let f = file.borrow();
     let mnt_id = match f.node() {
         Some(Node::Store(_)) => 1,
-        Some(Node::Pseudo(p)) if mount_of(&p) == Mount::Proc => 2,
-        Some(Node::Pseudo(_)) => 3,
-        None => 4,
+        Some(Node::Pseudo(p)) => match mount_of(&p) {
+            Mount::Proc => 2,
+            Mount::Pts => 3,
+            Mount::Sys => 4,
+        },
+        None => 5,
     };
     let mut s = format!(
         "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",

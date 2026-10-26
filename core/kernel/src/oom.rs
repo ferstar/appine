@@ -9,7 +9,7 @@
 //! guest 碰新的页由宿主内核直接处理，内核层看不到缺页，所以只能定时检查：有 guest 线程
 //! 不在内核里等待时，定时器线程每 20 毫秒量一次（读一次 `/proc/self/status` 约 2 微秒），
 //! 用量超过上限的 3/4 之后改成每 5 毫秒；全都在等待时内存不会再涨，停下来，等某个线程
-//! 要接着执行 guest 代码时再叫醒它（[`Shared::resume_oom_checks`]）。不停分配内存的程序
+//! 要接着执行 guest 代码时再叫醒它（[`Shared::resume_checks`]）。不停分配内存的程序
 //! 在被发现之前还能多用几十 MB（Tier 1 下每秒能碰好几 GB 的新页），所以上限要留出余量。
 //! 结束一个进程之后，等它的线程都退出、内存还给宿主，再决定要不要结束下一个。
 
@@ -77,7 +77,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
         .tasks
         .values()
         .all(|t| t.sleeping.load(std::sync::atomic::Ordering::Relaxed));
-    shared.oom_idle.store(idle, Ordering::Relaxed);
+    shared.checks_idle.store(idle, Ordering::Relaxed);
     if idle {
         k.oom.next = None;
         return None;

@@ -45,6 +45,8 @@ pub(crate) enum Mount {
     Proc,
     /// `/dev/pts`。
     Pts,
+    /// `/sys`。
+    Sys,
 }
 
 impl Mount {
@@ -53,6 +55,7 @@ impl Mount {
         match self {
             Mount::Proc => &[b"proc"],
             Mount::Pts => &[b"dev", b"pts"],
+            Mount::Sys => &[b"sys"],
         }
     }
 }
@@ -215,7 +218,8 @@ impl<'p> Pending<'p> {
 }
 
 impl Vfs {
-    /// 打开 `dir` 里的 inode 仓库作为根文件系统，补齐标准的设备节点，挂上 procfs 和 devpts。
+    /// 打开 `dir` 里的 inode 仓库作为根文件系统，补齐标准的设备节点，挂上 procfs、devpts
+    /// 和 sysfs。
     /// 开机（没有别的进程在用这个仓库）时清空 Linux 上是 tmpfs 的 /dev/shm 和 /run：
     /// 共享内存、命名信号量和 pid 文件不能留到下次。
     pub fn open(dir: &Path) -> Result<Vfs, Errno> {
@@ -227,7 +231,7 @@ impl Vfs {
             crate::debug::log(format_args!("cannot create /etc/resolv.conf: {e}"));
         }
         let mut mounts = Vec::new();
-        for m in [Mount::Proc, Mount::Pts] {
+        for m in [Mount::Proc, Mount::Pts, Mount::Sys] {
             let mut ino = Some(ROOT);
             for name in m.path() {
                 ino = ino.and_then(|i| store.lookup(i, name).ok().flatten());
@@ -660,11 +664,13 @@ mod tests {
             match fs {
                 Mount::Proc => PseudoNode::ProcRoot,
                 Mount::Pts => PseudoNode::PtsRoot,
+                Mount::Sys => PseudoNode::SysRoot,
             }
         }
         fn mount_of(&self, node: &PseudoNode) -> Mount {
             match node {
                 PseudoNode::PtsRoot => Mount::Pts,
+                PseudoNode::SysRoot => Mount::Sys,
                 _ => Mount::Proc,
             }
         }

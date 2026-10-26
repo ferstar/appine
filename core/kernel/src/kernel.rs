@@ -182,6 +182,8 @@ pub(crate) struct Kernel {
     pub threads_max: usize,
     /// App 内存的上限和 OOM killer（[`crate::oom`]）。
     pub oom: crate::oom::Oom,
+    /// 平均负载（[`crate::loadavg`]）。
+    pub load: crate::loadavg::LoadAvg,
     next_tid: Tid,
     /// 正在等待的线程的事件、它关心的通道（[`wake`]）和它等的对象。
     waiters: Vec<(Arc<Event>, u32, Option<wake::Object>)>,
@@ -246,6 +248,7 @@ impl Kernel {
             nr_open: crate::fd::MAX_FDS,
             threads_max: crate::process::default_threads_max(),
             oom: Default::default(),
+            load: crate::loadavg::LoadAvg::new(Instant::now()),
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
@@ -344,8 +347,9 @@ pub(crate) struct Shared {
     spinning: AtomicBool,
     /// 叫醒定时器线程。
     pub timers: Arc<Event>,
-    /// 内存上限的检查停下来了（所有线程都在等待，[`crate::oom`]）。
-    pub oom_idle: AtomicBool,
+    /// 定时器线程的定期检查（内存上限 [`crate::oom`]、平均负载 [`crate::loadavg`]）停下来了：
+    /// 所有线程都在等待。
+    pub checks_idle: AtomicBool,
     /// 线程为不持 BKL 的系统调用记下的状态可能过时了就加一（[`Shared::fast_changed`]）。
     fast: AtomicU64,
     /// futex 的等待队列。不持 BKL 的 futex（`syscall::fast`）只取这把锁；持有 BKL 时也可以
@@ -361,7 +365,7 @@ impl Shared {
             held: AtomicBool::new(false),
             spinning: AtomicBool::new(false),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
-            oom_idle: AtomicBool::new(false),
+            checks_idle: AtomicBool::new(false),
             fast: AtomicU64::new(0),
             futexes: Mutex::new(Futexes::default()),
         }
@@ -383,9 +387,11 @@ impl Shared {
         self.futexes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 线程要接着执行 guest 代码了：内存上限的检查停着时叫醒定时器线程。不需要持有 BKL。
-    pub fn resume_oom_checks(&self) {
-        if self.oom_idle.load(Ordering::Relaxed) && self.oom_idle.swap(false, Ordering::Relaxed) {
+    /// 线程要接着执行 guest 代码了：定期检查停着时叫醒定时器线程。不需要持有 BKL。
+    pub fn resume_checks(&self) {
+        if self.checks_idle.load(Ordering::Relaxed)
+            && self.checks_idle.swap(false, Ordering::Relaxed)
+        {
             self.timers.signal();
         }
     }
