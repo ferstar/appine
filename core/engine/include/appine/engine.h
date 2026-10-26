@@ -284,8 +284,10 @@ void appine_dbt_flush(struct appine_dbt_thread *t);
  * 对不上的作废。从池里拿到的实例也是这样处理的。 */
 void appine_dbt_recheck(struct appine_dbt_thread *t);
 
-/* 作废 [start, start + len) 覆盖的各页里开始的块；范围很大时等同于 appine_dbt_flush() */
-void appine_dbt_invalidate(struct appine_dbt_thread *t, uint64_t start, uint64_t len);
+/* 作废 [start, start + len) 覆盖的各页里开始的块；给了 `cpu` 时只作废 guest 指令字和它的
+ * 地址空间里现在的不同的块。放不下时等同于 appine_dbt_flush() */
+void appine_dbt_invalidate(struct appine_dbt_thread *t, const struct appine_cpu *cpu, uint64_t start,
+                           uint64_t len);
 
 /* 与 appine_cpu_run() 语义相同，但在翻译后的代码里执行 */
 enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *cpu);

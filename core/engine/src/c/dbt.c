@@ -2346,9 +2346,20 @@ static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct bloc
     return true;
 }
 
-/* 作废 [start, start + len) 覆盖的各页里开始的块；放不下转发桩或者范围太大时改为请求
- * 整体清空，由下一次进入分发器的线程完成。持有锁 */
-static void invalidate_locked(struct appine_dbt *d, uint64_t start, uint64_t len)
+static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *mmu,
+                          const struct block *b, uint64_t *page, const uint32_t **host);
+
+/*
+ * 作废 [start, start + len) 覆盖的各页里开始的块；放不下转发桩或者范围太大时改为请求
+ * 整体清空，由下一次进入分发器的线程完成。给了 `mmu` 时只作废 guest 指令字和现在不同的块
+ * （翻译只取决于 pc 和指令字，字面量也是运行时才读）：JIT 改写一处代码只 ic ivau 一两行，
+ * 而 ic ivau 是按页记下的，同一页里别的方法的块照样能用。HotSpot 不停地改写内联缓存和
+ * 方法入口，原来每次都把整页的块作废、重新翻译，Maven 每次构建要作废 31 万个块。拆掉映射、
+ * 去掉执行权限之后这一页找不到可执行的映射，照样全部作废。停放着的块不用管，恢复时本来
+ * 就要核对。持有锁
+ */
+static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu, uint64_t start,
+                              uint64_t len)
 {
     if (!len)
         return;
@@ -2358,16 +2369,22 @@ static void invalidate_locked(struct appine_dbt *d, uint64_t start, uint64_t len
     /* 范围很大（拆掉一个库）：逐个看所有的块，比整体清空便宜，别的线程也不必重新翻译。
      * 块不跨页，按页比较 */
     struct retire_batch r = {.n = 0};
+    uint64_t seen = 1; /* 未对齐，不会与任何页相同 */
+    const uint32_t *host = NULL;
     if (end < start || last - first >= INVALIDATE_MAX_PAGES) {
         for (size_t i = 0; i < d->table_count; i++) {
             struct block *b = &d->blocks[i];
             uint64_t page = b->pc >> APPINE_PAGE_SHIFT;
             if (!b->code || page < first || page > last)
                 continue;
-            if (b->parked)
-                kill_parked(d, b);
-            else if (!retire_add(d, &r, b, false))
+            if (b->parked) {
+                if (!mmu)
+                    kill_parked(d, b);
+            } else if (mmu && block_matches(d, mmu, b, &seen, &host)) {
+                continue;
+            } else if (!retire_add(d, &r, b, false)) {
                 goto full;
+            }
         }
         retire_flush(d, &r);
         return;
@@ -2377,10 +2394,14 @@ static void invalidate_locked(struct appine_dbt *d, uint64_t start, uint64_t len
             struct block *b = &d->blocks[i - 1];
             if (!b->code || b->pc >> APPINE_PAGE_SHIFT != page)
                 continue;
-            if (b->parked)
-                kill_parked(d, b);
-            else if (!retire_add(d, &r, b, false))
+            if (b->parked) {
+                if (!mmu)
+                    kill_parked(d, b);
+            } else if (mmu && block_matches(d, mmu, b, &seen, &host)) {
+                continue;
+            } else if (!retire_add(d, &r, b, false)) {
                 goto full;
+            }
         }
     }
     retire_flush(d, &r);
@@ -3245,7 +3266,15 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
     size_t words = d->used_words - d->routine_words;
     /* 块不多时保留翻译：下一个同一程序的使用者运行之前核对一遍（recheck），比逐块拷贝模板、
      * 重新链接、同步指令缓存便宜得多 */
-    if (key && d->table_count <= KEEP_MAX_BLOCKS && words <= POOL_KEEP_WORDS && !d->flush_wanted) {
+    bool keep = key && d->table_count <= KEEP_MAX_BLOCKS && words <= POOL_KEEP_WORDS && !d->flush_wanted;
+    /* 超过池里一半的大实例（JVM 一次就有四五十 MB）只在不挤掉别人时保留：否则跑一次 java
+     * 就把 node、python 这些常用程序留下的翻译全挤掉了 */
+    if (keep && words > POOL_KEEP_WORDS / 2) {
+        pthread_mutex_lock(&pool.lock);
+        keep = pool.kept_words + words <= POOL_KEEP_WORDS;
+        pthread_mutex_unlock(&pool.lock);
+    }
+    if (keep) {
         d->stale = d->table_count > 0;
     } else {
         key = 0;
@@ -3416,10 +3445,11 @@ void appine_dbt_recheck(struct appine_dbt_thread *t)
     unlock_dbt(t->d);
 }
 
-void appine_dbt_invalidate(struct appine_dbt_thread *t, uint64_t start, uint64_t len)
+void appine_dbt_invalidate(struct appine_dbt_thread *t, const struct appine_cpu *cpu, uint64_t start,
+                           uint64_t len)
 {
     lock_dbt(t->d, &t->stats);
-    invalidate_locked(t->d, start, len);
+    invalidate_locked(t->d, cpu ? cpu->mmu : NULL, start, len);
     unlock_dbt(t->d);
 }
 
@@ -3654,6 +3684,14 @@ static void flush_world(struct appine_dbt *d, struct appine_dbt_thread *self)
     pthread_cond_broadcast(&d->flushed);
 }
 
+/* guest 改了 `addr` 所在那一页的代码（ic ivau）：作废其中指令字变了的块 */
+static void code_changed(struct appine_dbt_thread *t, const struct appine_cpu *c, uint64_t addr)
+{
+    lock_dbt(t->d, &t->stats);
+    invalidate_locked(t->d, c->mmu, addr & ~(uint64_t)PAGE_MASK, APPINE_PAGE_SIZE);
+    unlock_dbt(t->d);
+}
+
 static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
 {
     struct appine_dbt_thread *t = ctx;
@@ -3815,12 +3853,22 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         case R_INTERP: {
             t->stats.exits_interp++;
             enum appine_exit r = appine_interp_step(c);
+            /*
+             * ic ivau 记下的页（dsb、isb 时；或者 Tier 0 执行了记到另一页的 ic ivau）：翻译由
+             * 这个地址空间的线程共用，就地按内容作废一次就行，不必退出到调用方。作废块的入口
+             * 跳往转发桩，别的线程下次进入它们时就会看到（硬件上它们在上下文同步之前同样可能
+             * 还执行旧指令）。HotSpot 每改一处代码就 ic ivau、dsb 一次，Maven 一次构建 8 万次，
+             * 原来每次都要退出、取 BKL、记日志，回来再作废
+             */
+            if (r == APPINE_EXIT_CODE) {
+                code_changed(t, c, c->fault_addr);
+                r = APPINE_EXIT_NONE;
+            }
             if (r != APPINE_EXIT_NONE)
                 return r;
-            if (UNLIKELY(c->ivau_page)) { /* dsb、isb：交出 ic ivau 记下的页 */
-                c->fault_addr = c->ivau_page;
+            if (UNLIKELY(c->ivau_page)) {
+                code_changed(t, c, c->ivau_page);
                 c->ivau_page = 0;
-                return APPINE_EXIT_CODE;
             }
             break;
         }

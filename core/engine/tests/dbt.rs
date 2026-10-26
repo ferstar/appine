@@ -206,6 +206,28 @@ fn pooled_instances_keep_translations_of_the_same_program() {
 }
 
 #[test]
+fn invalidation_keeps_blocks_whose_code_did_not_change() {
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    let mut g = Guest::new();
+    let other = CODE + 0x100;
+    g.code(CODE, &[movz_x0(7), SVC]);
+    g.code(other, &[movz_x0(8), SVC]);
+    assert_eq!(g.run(&mut dbt), 7);
+    assert_eq!(g.run_at(&mut dbt, other), 8);
+    // JIT 只改了同一页里的一处、按页 ic ivau：只有改了的块作废、重新翻译
+    g.code(other, &[movz_x0(9), SVC]);
+    let before = dbt.stats();
+    dbt.invalidate(&g.cpu, CODE, PAGE_SIZE);
+    assert_eq!(g.run(&mut dbt), 7);
+    assert_eq!(g.run_at(&mut dbt, other), 9);
+    let after = dbt.stats();
+    assert_eq!(after.invalidated - before.invalidated, 1);
+    assert_eq!(after.blocks - before.blocks, 1);
+}
+
+#[test]
 fn recheck_retires_only_blocks_that_changed() {
     let Some(mut dbt) = Dbt::new() else {
         return;
@@ -241,7 +263,7 @@ fn returns_follow_x30_even_when_the_prediction_is_wrong() {
     // 被调函数改了 x30（longjmp 那样）：影子栈顶对不上，按 x30 返回
     g.code(f, &[adr_x30(f, other), RET]);
     g.code(other, &[movz_x0(9), SVC]);
-    dbt.invalidate(f, 4);
+    dbt.invalidate(&g.cpu, f, 4);
     assert_eq!(g.run(&mut dbt), 9);
 }
 
@@ -361,7 +383,7 @@ fn cross_page_faults_are_precise() {
     ];
     for (insn, reg, addr, fault) in cases {
         g.code(CODE, &[insn, SVC]);
-        dbt.invalidate(CODE, 8);
+        dbt.invalidate(&g.cpu, CODE, 8);
         let before = g.data(4, 4096 - 8);
         g.cpu.state_mut().x[reg] = addr;
         g.cpu.state_mut().pc = CODE;

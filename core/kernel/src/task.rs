@@ -383,7 +383,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 match generations.log.lock().unwrap().since(*done, now.1) {
                     Some(ranges) => ranges
                         .iter()
-                        .for_each(|&(start, len)| d.invalidate(start, len)),
+                        .for_each(|&(start, len)| d.invalidate(cpu, start, len)),
                     None => d.flush(),
                 }
                 *done = now.1;

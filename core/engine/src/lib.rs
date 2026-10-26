@@ -136,7 +136,7 @@ unsafe extern "C" {
     fn appine_dbt_detach(t: *mut RawDbtThread);
     fn appine_dbt_flush(t: *mut RawDbtThread);
     fn appine_dbt_recheck(t: *mut RawDbtThread);
-    fn appine_dbt_invalidate(t: *mut RawDbtThread, start: u64, len: u64);
+    fn appine_dbt_invalidate(t: *mut RawDbtThread, cpu: *const CpuState, start: u64, len: u64);
     fn appine_dbt_run(t: *mut RawDbtThread, cpu: *mut CpuState) -> c_int;
     fn appine_dbt_get_stats(t: *const RawDbtThread, out: *mut DbtStats);
 }
@@ -640,9 +640,10 @@ impl Dbt {
         unsafe { appine_dbt_recheck(self.raw.as_ptr()) }
     }
 
-    /// 作废 `[start, start + len)` 覆盖的各页里开始的块；范围很大时等同于 [`Dbt::flush`]。
-    pub fn invalidate(&mut self, start: u64, len: u64) {
-        unsafe { appine_dbt_invalidate(self.raw.as_ptr(), start, len) }
+    /// 作废 `[start, start + len)` 覆盖的各页里开始的块中，guest 指令字和 `cpu` 的地址空间
+    /// 里现在的不同的（翻译只取决于 pc 和指令字）；放不下时等同于 [`Dbt::flush`]。
+    pub fn invalidate(&mut self, cpu: &Cpu, start: u64, len: u64) {
+        unsafe { appine_dbt_invalidate(self.raw.as_ptr(), cpu.state.as_ptr(), start, len) }
     }
 
     /// 这个线程的统计：它退出的次数，以及它做的翻译、作废。
