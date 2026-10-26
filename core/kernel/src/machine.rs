@@ -162,6 +162,7 @@ impl Machine {
             stack_limit: loader::STACK_SIZE,
         };
         let mut mm = Mm::new();
+        mm.share_files(&k.file_maps);
         let mut read_interp = |p: &[u8]| match &vfs {
             Some(vfs) => read_executable(vfs, &offline, &Cred::root(), &Node::ROOT, &Node::ROOT, p),
             None => Err(Errno::ENOENT),
@@ -371,6 +372,7 @@ impl Machine {
     /// Tier 1 翻译（运行中的进程的翻译不动）。
     pub fn trim_memory(&self) {
         appine_engine::trim_dbt_pool();
+        self.shared.lock().file_maps.clear();
     }
 
     /// 使用 Tier 1 时已退出线程的统计之和。

@@ -221,7 +221,7 @@ impl Waits {
 pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
     file.borrow_mut().drained[dir] += 1;
     for event in &cx.k().edge_waiters {
-        event.signal();
+        crate::kernel::signal_later(event);
     }
     // 信号驱动的 I/O 也按用完数据重新开始计算，见 check_fasync
     if file.borrow().flags & oflags::O_ASYNC != 0 {

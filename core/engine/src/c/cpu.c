@@ -1,5 +1,7 @@
 /* CPU 生命周期、软件 TLB 和 Tier 0 解释器的主循环。 */
 #define _DEFAULT_SOURCE /* -std=c17 下 MAP_ANONYMOUS 需要它 */
+#include <pthread.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <sys/mman.h>
 
@@ -9,19 +11,42 @@
  * 直接用 mmap：malloc 的实现可能从堆里分配并逐字节清零（glibc 释放过同样大的块之后
  * 会调高 mmap 的阈值），那样每个线程的 TLB 都会整块占用内存
  */
+/*
+ * 释放的 cpu 留几个给下一个线程：shell 每起一个进程就要一个，新映射一段、TLB 用到的页
+ * 逐页缺页、退出时拆掉，比 appine_cpu_init 只清填过的项贵得多
+ */
+#define SPARE_CPUS 8
+static struct {
+    pthread_mutex_t lock;
+    struct appine_cpu *cpus[SPARE_CPUS];
+    unsigned n;
+} spare = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
 struct appine_cpu *appine_cpu_new(struct appine_mmu *mmu)
 {
-    void *p = mmap(NULL, sizeof(struct appine_cpu), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
-                   -1, 0);
-    if (p == MAP_FAILED)
-        return NULL;
+    pthread_mutex_lock(&spare.lock);
+    void *p = spare.n ? spare.cpus[--spare.n] : NULL;
+    pthread_mutex_unlock(&spare.lock);
+    if (!p) {
+        p = mmap(NULL, sizeof(struct appine_cpu), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+                 0);
+        if (p == MAP_FAILED)
+            return NULL;
+    }
     appine_cpu_init(p, mmu);
     return p;
 }
 
 void appine_cpu_free(struct appine_cpu *cpu)
 {
-    if (cpu)
+    if (!cpu)
+        return;
+    pthread_mutex_lock(&spare.lock);
+    bool keep = spare.n < SPARE_CPUS;
+    if (keep)
+        spare.cpus[spare.n++] = cpu;
+    pthread_mutex_unlock(&spare.lock);
+    if (!keep)
         munmap(cpu, sizeof(*cpu));
 }
 

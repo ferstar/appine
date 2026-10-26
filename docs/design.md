@@ -203,6 +203,7 @@ guest 是 **aarch64**，直接使用 Alpine 官方 aarch64 仓库。这样选有
 
 - 池里的实例按程序（可执行文件的 inode）作键，优先还给同一个程序：shell 脚本里反复 exec 的 busybox、`go build` 的一个个 compile 进程、一次次 `node -e` 都能拿回前一个留下的翻译。没有同键的就拿空的或者新建，不清空别的程序留下的。
 - 运行之前逐块比对 guest 指令字（每个块记着自己翻译时的指令字），对不上的按"失效"的办法作废，大部分对不上时才整体清空。这和拷贝模板时的比对是同一件事，只是一次做完，省掉逐块拷贝模板、重新链接、同步指令缓存。
+- 内容由文件和它的版本就能确定的代码段不必比对：地址空间不再使用时，内核层把没写过、有可信版本的私有文件映射（程序和动态链接器的代码段）记给翻译（起止地址、宿主文件的设备号和 inode、文件偏移、版本）；新的地址空间里同一段地址映射的是同一个版本的同一段文件时，落在里面的块直接保留。版本是宿主 object 的 ctime 和大小：内容的每一次修改宿主都会把 ctime 改成当时的时间，utimensat 也改不回去。ctime 离现在不到 2 秒（宿主的时间戳取自粗粒度的时钟，紧接着的修改可能得到同一个 ctime）、有过可写共享映射（写进共享映射的页一直是脏的就不再改 ctime）的文件不给版本。原来 shell 每起一个 busybox 进程都要把池里所有块比对一遍，代码页还要逐页缺页，占管道负载一成的时间。
 - 池里最多 6 个实例，保留的代码总共最多 64 MB，超出时先去掉空的、再去掉最久没用的；块数超过 13 万的实例放回池里时清空。
 
 **失效**
@@ -304,11 +305,13 @@ ldr  x0, [x27, x16]          // 宿主地址 = addend + guest 地址
 ### 5.2 页与后备内存
 
 - guest 页**固定 4K**，不管宿主页是 4K 还是 16K。`AT_PAGESZ` 报告 4096。
-- **匿名内存**：每个匿名映射单独向宿主 mmap 一段内存，每个 guest VMA 对应一个宿主映射。
+- **匿名内存**：每个匿名映射单独向宿主 mmap 一段内存，每个 guest VMA 对应一个宿主映射。例外是 fork 时子进程自己的小映射（1 MB 以内，堆和栈除外），它们切自同一段宿主内存（要计入提交量的和不计入的各一段）：shell fork 之后马上 exec，原来每个映射各一次宿主的 mmap 和 munmap。代价是这样的映射解除映射之后，宿主内存要等那一段全都不用了才交还。
+- **交还宿主**：持有 BKL 时释放的宿主内存（munmap、进程退出和 execve 时销毁地址空间）放开 BKL 之后才交还，宿主上首尾相接的几段一起交还：拆页表、刷 TLB 要几十微秒，等着回收的 shell、管道另一头的进程不必跟着等 BKL。OOM killer 看到还有没交还完的内存时这一轮不挑进程（§12 第 4 条）。在后台线程里交还试过，微基准反而变慢：宿主的 `mmap_lock` 上与 fork 的 mmap 争抢，叫醒后台线程也要跨核中断。
   - 最初的设计是按大块 arena（如每块 2MB）申请、再切成 4K 页，以减少宿主 VMA 数量，没有做。宿主的 `vm.max_map_count` 是整个 App 进程共用的，所以内核层按地址空间实行 guest 的 `vm.max_map_count`（默认 65530，可写），一个 guest 进程不能把宿主的映射数用完。
   - 堆第一次扩展时预留 256 MB 宿主地址空间（`MAP_NORESERVE`，不碰不占内存），之后的 brk 只是加长同一个 VMA。相邻的匿名 VMA 不合并（各自是一段宿主内存），只是 `/proc/<pid>/maps` 里相邻、权限相同的匿名映射与 Linux 一样显示成一行。
 - **文件映射**直接用宿主 `mmap(objects/<ino>)` 的页作为后备内存。如果宿主是 16K 页，就映射包含目标位置的 16K 对齐区间，再把页表项指向区间里正确的 4K 偏移。这样带来两个好处：
   - busybox/musl 的代码页通过宿主 page cache **在所有 guest 进程之间共享**。ELF 加载器也这样映射程序的各段（M6），只有段之间共用一页、或者偏移没有对齐时才退回到拷贝。
+  - 只读的私有映射（程序和库的代码段）有可信版本（§4.2 的"翻译保留"）时，宿主映射由内核里所有地址空间共用（`mm::FileMaps`，最多 128 段）：同一个版本的同一段文件再映射时直接用它，宿主页表还在，不必重新映射、缺页，退出时也不必拆掉。用它的 VMA 与 fork 之后父子共用宿主映射时一样，要写（mprotect 加写权限、加载器清零 .bss 的开头）之前复制一份自己的。宿主上是只读映射，万一漏了复制会直接出错，不会悄悄改了别人的代码。宿主内存紧张时（`Machine::trim_memory`）清空。
   - `MAP_SHARED` 映射和 `read`/`write` 之间天然一致。
 - **共享内存**：进程间的 `MAP_SHARED` 匿名内存，就是让两张页表指向同一个宿主页。System V 共享内存段同理：段持有一段宿主内存，`shmat` 把它映射进地址空间。
 - **提交量**：宿主内存总是可读写，guest 的权限只记在页表里，所以宿主的内存提交量（overcommit 记账）按 Linux 的规则由 guest 的参数决定：只有可写的私有映射计入，`MAP_NORESERVE`、只读和 `PROT_NONE` 的映射用 `MAP_NORESERVE` 向宿主申请（M8）。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，计入的话在内存小的设备上直接失败。
@@ -346,10 +349,13 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ## 6. 进程、线程与调度
 
-- **1:1 线程模型**：每个 guest 线程（`struct task`）对应一个宿主 pthread，调度交给宿主内核。guest 线程结束之后它的宿主线程留 5 秒给下一个 guest 线程用（最多留 8 个）：fork 原来有四分之一的时间花在新建宿主线程上。复用时 CPU 时间从线程开始时的读数算起，nice、亲和性重新设置。
+- **1:1 线程模型**：每个 guest 线程（`struct task`）对应一个宿主 pthread，调度交给宿主内核。guest 线程结束之后它的宿主线程留 5 秒给下一个 guest 线程用（最多留 8 个）：fork 原来有四分之一的时间花在新建宿主线程上。复用时 CPU 时间从线程开始时的读数算起，nice、亲和性重新设置。引擎的 CPU 状态（含 4096 项的数据 TLB，约 130 KB）也留 8 个给下一个线程，只清掉填过的 TLB 项：原来每个线程新映射一段、逐页缺页、结束时拆掉。
+- **驻留内存**（`ru_maxrss`、`/proc/<pid>/status` 的 VmRSS、OOM killer 挑进程）按 VMA 用宿主的 mincore 数，execve 和退出时各量一次。宿主上首尾相接的 VMA 合起来量一次；只有 page cache 页的文件映射（没写过的私有映射、共享映射）驻留多少是文件本身的事，结果按文件的一段缓存 1 秒，程序和库的代码段不必每次在 page cache 里逐页查找。
 - **大内核锁（BKL）**：进入 syscall 时获取；执行 guest 代码时**不持有**；在内核层里等待之前**释放**。内核对象之间用 `Rc`/`RefCell` 共享，只在持有 BKL 时访问。
   - 可能要等宿主的操作放开 BKL 做：宿主 fd（socket 等）的读写，以及普通文件的 pread/pwrite（冷数据要等闪存）。用文件位置的读写，同一个打开文件同时只有一次（相当于 Linux 的 f_pos_lock）；O_APPEND 的写仍持锁。
   - 取锁时先自旋一会儿：临界区通常只有几微秒（一次 lstat），睡下再被叫醒要几十微秒。
+  - 持有 BKL 时要叫醒的线程（等待者的 eventfd、FUTEX_WAKE、信号、宿主线程池里接手新线程的空闲线程）放开 BKL 之后再叫醒：被叫醒的线程马上就要拿 BKL，放开之前叫醒它只会让它再睡下去等锁，等这边放开时又要叫醒一次。持有期间释放的宿主内存也在放开之后交还（§5.2）。
+  - execve 放开 BKL 建新的地址空间：路径解析、打开程序和解释器、检查格式在锁里做，映射各段、构造初始栈只碰新的地址空间和共用的只读文件映射（它自己有锁），在锁外做，占 execve 持锁时间的大半。回来之后线程已经被要求退出（别的线程 exit_group、execve）就放弃。
   - **不持 BKL 的 stat**（`syscall::fast`）：newfstatat、statx 在运行循环里先试一次不取 BKL 的做法，条件是凭据不必检查搜索权限（root）、路径从根目录或当前目录开始（`AT_FDCWD` 或绝对路径）、整条路径都在仓库的元数据缓存里、不经过合成文件系统（§8.1）。做不了时什么也不改，照常取 BKL。线程在持有 BKL 时记下自己的根目录、当前目录和凭据；chdir、chroot、unshare、改凭据的一方让一个全局计数加一，别的线程记下的随之作废（`CLONE_FS` 共享的当前目录、线程组共享的凭据可能被别的线程改掉）。访问 guest 内存时线程仍然标记着在执行 guest 代码，解除映射的线程要等它，与 guest 代码自己访存一样。原来并行 lstat 被 BKL 串行化，`git status` 开着并行 lstat 比单线程还慢。
   - 其余的拆分按 profiling 决定（R1）：多数负载的系统调用只占几个百分点。
 - **统一的等待机制**：guest 线程永远不直接阻塞在宿主 syscall 上。每个线程有一个专属的 **eventfd** 作为唤醒通道，所有等待都是一次宿主 `poll()`，监听集合里是这个 eventfd 加上要等的宿主 fd。
@@ -596,6 +602,9 @@ void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t 
 void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
 void appine_dbt_flush(struct appine_dbt *dbt);
 void appine_dbt_recheck(struct appine_dbt *dbt);  /* exec 之后：保留翻译，下次运行前逐块核对 */
+/* 放回池里之前记下翻译所在的映射；从池里拿到之后，与记下的完全相同的映射里的块不必核对 */
+void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+void appine_dbt_trust(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
 
 /* 宿主侧的故障兜底（§7.4）：之后运行期间的 SIGSEGV/SIGBUS/SIGILL 变成 HOST_FAULT 退出 */
 void appine_fault_guard_install(void);
@@ -736,6 +745,7 @@ M8 之后、M9 之前插进了几轮补强：稳定性和内存、性能剖析�
 | M9 之前：多线程共用翻译和定向唤醒（仓库改放虚拟机本地卷，以上各行都在 virtiofs 上测，文件系统、起进程类的倍数偏高） | gcc；python；Maven、Gradle 热构建；`go build` 冷编译；shell 起进程；`git status`；`node -e 0` | 3.4×；4.3×；4.4×、4.0×；3.2×；2.2×；1.1×（并行 lstat 2.3×）；2.9× |
 | M9 之前：不持 BKL 的 stat | 并行 lstat 的 `git status` | 1.3–1.4× |
 | M9 之前：fork 写时复制 | fork、子进程退出、等待（进程写过 0、10、100 MB） | 1.25×、2.2×、3.8×（原来 1.6×、18×、35×） |
+| M9 之前：起进程的宿主开销 | fork 后 exec、vfork 后 exec、`posix_spawn`；`sh -c 'cat \| wc'`；shell 起进程 | 1.05×、1.15×、1.2×；1.4×；1.4×（原来 1.45×、1.6×、1.6×；2.2×；1.8×） |
 
 ---
 

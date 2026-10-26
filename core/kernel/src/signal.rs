@@ -430,7 +430,7 @@ impl AltStack {
 pub(crate) fn wake(task: &Task) {
     // SAFETY: 线程在销毁 Cpu 之前（持有 BKL）从 kernel.tasks 里移除，这里也持有 BKL
     unsafe { task.sync.kicker.kick() };
-    task.event.signal();
+    crate::kernel::signal_later(&task.event);
 }
 
 /// 结束整个线程组（exit_group、致命信号、execve 之外的 SIGKILL）：记录退出状态，

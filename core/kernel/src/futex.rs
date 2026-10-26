@@ -70,7 +70,7 @@ impl Futexes {
         self.waiting.retain(|e| {
             if woken < n && e.key == key && e.bitset & bitset != 0 {
                 woken += 1;
-                e.event.signal();
+                crate::kernel::signal_later(&e.event);
                 false
             } else {
                 true
@@ -193,6 +193,7 @@ mod tests {
     }
 
     fn signaled(e: &Event) -> bool {
+        crate::kernel::flush_signals();
         let mut p = [(e.fd(), 1, 0)];
         appine_hal::poll(&mut p, Some(std::time::Duration::ZERO)).unwrap();
         p[0].2 & 1 != 0

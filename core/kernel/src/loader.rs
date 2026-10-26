@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::ptr::NonNull;
 
 use appine_engine::{PAGE_SIZE, VA_BITS, prot};
 
@@ -80,6 +79,8 @@ pub enum LoadError {
     ArgumentsTooLong,
     /// 建立映射失败。
     Memory(Errno),
+    /// 读取文件失败。
+    Read(Errno),
     /// 读取解释器失败。
     Interpreter(Vec<u8>, Errno),
 }
@@ -92,6 +93,7 @@ impl fmt::Display for LoadError {
             LoadError::Malformed(what) => write!(f, "malformed ELF: {what}"),
             LoadError::ArgumentsTooLong => f.write_str("argument list too long"),
             LoadError::Memory(errno) => write!(f, "cannot map memory: {errno}"),
+            LoadError::Read(errno) => write!(f, "cannot read the file: {errno}"),
             LoadError::Interpreter(path, errno) => {
                 write!(
                     f,
@@ -150,75 +152,72 @@ struct Segment {
     prot: u32,
 }
 
-/// 要加载的可执行文件：全部内容，以及能直接映射进 guest 地址空间的宿主文件。
+/// 要加载的可执行文件：开头的一部分（或者全部内容），以及能直接映射进 guest 地址空间的
+/// 宿主文件。
 pub struct Executable {
-    bytes: Bytes,
+    /// 文件开头的 [`Executable::HEAD`] 字节：ELF 头、程序头、解释器的路径、`#!` 行一般
+    /// 都在里面。没有宿主文件时是全部内容。原来把整个文件映射进来再解析，每次 execve
+    /// 程序和解释器各多一次映射、缺页和解除映射。
+    head: Vec<u8>,
+    /// 文件的大小。
+    len: usize,
     file: Option<File>,
 }
 
-enum Bytes {
-    /// 宿主文件的只读映射：解析时按需从 page cache 读取，不必整个读进内存。
-    Mapped {
-        base: NonNull<u8>,
-        len: usize,
-        map_len: usize,
-    },
-    Owned(Vec<u8>),
-}
-
 impl Executable {
+    /// 宿主文件开头读进来多少。
+    const HEAD: usize = 4096;
+
     /// 宿主文件（仓库里的 object）。
     pub fn open(file: File) -> Result<Executable, Errno> {
-        let len = file
-            .metadata()
-            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?
-            .len() as usize;
-        if len == 0 {
-            return Ok(Executable::from_bytes(Vec::new()));
-        }
-        let m = appine_hal::map_file(file.as_raw_fd(), 0, len, true, false).map_err(Errno)?;
+        use std::os::unix::fs::FileExt;
+        let io = |e: std::io::Error| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0));
+        let len = file.metadata().map_err(io)?.len() as usize;
+        let mut head = vec![0u8; len.min(Self::HEAD)];
+        file.read_exact_at(&mut head, 0).map_err(io)?;
         Ok(Executable {
-            bytes: Bytes::Mapped {
-                base: m.base,
-                len,
-                map_len: m.len,
-            },
+            head,
+            len,
             file: Some(file),
         })
     }
 
     /// 内存里的内容，没有宿主文件：各段拷贝进匿名内存。
+    #[cfg(test)]
     pub fn from_bytes(data: Vec<u8>) -> Executable {
         Executable {
-            bytes: Bytes::Owned(data),
+            len: data.len(),
+            head: data,
             file: None,
         }
     }
 
-    /// 文件的全部内容。
-    pub fn bytes(&self) -> &[u8] {
-        match &self.bytes {
-            // SAFETY: 映射在 Executable 析构之前一直有效
-            Bytes::Mapped { base, len, .. } => unsafe {
-                std::slice::from_raw_parts(base.as_ptr(), *len)
-            },
-            Bytes::Owned(v) => v,
-        }
+    /// 文件开头的一部分（至少 [`Executable::HEAD`] 字节，文件更短时是全部内容）。
+    pub fn head(&self) -> &[u8] {
+        &self.head
     }
-}
 
-impl Drop for Executable {
-    fn drop(&mut self) {
-        if let Bytes::Mapped { base, map_len, .. } = self.bytes {
-            // SAFETY: 映射来自 open，bytes() 借出的切片不会活得比 self 长
-            unsafe { appine_hal::unmap(base, map_len) };
+    /// 文件里 `[off, off + n)` 的内容；超出文件末尾时返回 None。
+    fn read(&self, off: u64, n: u64) -> Result<Option<std::borrow::Cow<'_, [u8]>>, Errno> {
+        use std::os::unix::fs::FileExt;
+        let Some(end) = off.checked_add(n).filter(|&e| e <= self.len as u64) else {
+            return Ok(None);
+        };
+        let (off, end) = (off as usize, end as usize);
+        if end <= self.head.len() {
+            return Ok(Some(self.head[off..end].into()));
         }
+        let file = self.file.as_ref().ok_or(Errno::EIO)?;
+        let mut buf = vec![0u8; end - off];
+        file.read_exact_at(&mut buf, off as u64)
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        Ok(Some(buf.into()))
     }
 }
 
 /// 解析后的 ELF 文件。
 struct Elf<'a> {
-    file: &'a [u8],
+    exe: &'a Executable,
     /// 可以直接映射的宿主文件。
     fd: Option<i32>,
     e_type: u16,
@@ -241,7 +240,7 @@ struct Loaded {
 
 impl<'a> Elf<'a> {
     fn parse(exe: &'a Executable) -> Result<Self, LoadError> {
-        let file = exe.bytes();
+        let file = exe.head();
         if file.len() < 64 || &file[..4] != b"\x7fELF" {
             return Err(LoadError::NotElf);
         }
@@ -263,7 +262,7 @@ impl<'a> Elf<'a> {
         let phnum = u16_at(file, 56)? as u64;
 
         let mut elf = Elf {
-            file,
+            exe,
             fd: exe.file.as_ref().map(AsRawFd::as_raw_fd),
             e_type,
             entry,
@@ -273,25 +272,29 @@ impl<'a> Elf<'a> {
             interp: None,
             segments: Vec::new(),
         };
-        for i in 0..phnum {
-            let ph = phoff
-                .checked_add(i * PHDR_SIZE)
-                .and_then(|v| usize::try_from(v).ok())
-                .ok_or(LoadError::Malformed("program header out of range"))?;
-            let p_type = u32_at(file, ph)?;
-            let flags = u32_at(file, ph + 4)?;
-            let offset = u64_at(file, ph + 8)?;
-            let vaddr = u64_at(file, ph + 16)?;
-            let filesz = u64_at(file, ph + 32)?;
-            let memsz = u64_at(file, ph + 40)?;
+        if phoff.checked_add(phnum * PHDR_SIZE).is_none() {
+            return Err(LoadError::Malformed("program header out of range"));
+        }
+        let table = exe
+            .read(phoff, phnum * PHDR_SIZE)
+            .map_err(LoadError::Read)?
+            .ok_or(LoadError::Malformed("truncated"))?;
+        for ph in (0..phnum as usize).map(|i| i * PHDR_SIZE as usize) {
+            let p_type = u32_at(&table, ph)?;
+            let flags = u32_at(&table, ph + 4)?;
+            let offset = u64_at(&table, ph + 8)?;
+            let vaddr = u64_at(&table, ph + 16)?;
+            let filesz = u64_at(&table, ph + 32)?;
+            let memsz = u64_at(&table, ph + 40)?;
             match p_type {
                 PT_PHDR => elf.phdr_vaddr = Some(vaddr),
                 PT_INTERP => {
-                    let range = usize::try_from(offset)
-                        .ok()
-                        .zip(usize::try_from(filesz).ok())
-                        .filter(|_| filesz > 1 && filesz <= MAX_INTERP_PATH)
-                        .and_then(|(o, n)| file.get(o..o.checked_add(n)?))
+                    if filesz <= 1 || filesz > MAX_INTERP_PATH {
+                        return Err(LoadError::Malformed("bad interpreter path"));
+                    }
+                    let range = exe
+                        .read(offset, filesz)
+                        .map_err(LoadError::Read)?
                         .ok_or(LoadError::Malformed("bad interpreter path"))?;
                     let path = range
                         .strip_suffix(&[0])
@@ -309,7 +312,7 @@ impl<'a> Elf<'a> {
                     }
                     // 只含 .bss 的段 filesz 为 0，p_offset 可以指到文件末尾之后，Linux 不会去读它
                     let file_end = offset.checked_add(filesz);
-                    if filesz > 0 && file_end.is_none_or(|end| end > file.len() as u64) {
+                    if filesz > 0 && file_end.is_none_or(|end| end > exe.len as u64) {
                         return Err(LoadError::Malformed("segment exceeds the file"));
                     }
                     if vaddr
@@ -432,11 +435,13 @@ impl<'a> Elf<'a> {
                 .map_err(LoadError::Memory)?;
         }
         for seg in self.segments.iter().filter(|seg| seg.filesz > 0) {
-            mm.write_kernel(
-                bias + seg.vaddr,
-                &self.file[seg.offset..seg.offset + seg.filesz],
-            )
-            .map_err(LoadError::Memory)?;
+            let data = self
+                .exe
+                .read(seg.offset as u64, seg.filesz as u64)
+                .map_err(LoadError::Read)?
+                .ok_or(LoadError::Malformed("segment exceeds the file"))?;
+            mm.write_kernel(bias + seg.vaddr, &data)
+                .map_err(LoadError::Memory)?;
         }
         Ok(loaded)
     }
@@ -493,7 +498,40 @@ pub fn load(
     args: &Args<'_>,
     read_interp: &mut ReadInterp<'_>,
 ) -> Result<Image, LoadError> {
+    load_prepared(mm, &prepare(file, read_interp)?, args)
+}
+
+/// 程序和它的解释器，已经打开、检查过格式（[`prepare`]），只差映射（[`load_prepared`]）。
+pub struct Prepared<'a> {
+    exe: Elf<'a>,
+    interp: Option<(Vec<u8>, Executable)>,
+}
+
+/// 加载的前一半：解析 `file`，带 `PT_INTERP` 时用 `read_interp` 打开解释器。打开解释器
+/// 要解析 guest 路径，调用方持有 BKL；后一半 [`load_prepared`] 只碰新的地址空间，execve
+/// 放开 BKL 做。
+pub fn prepare<'a>(
+    file: &'a Executable,
+    read_interp: &mut ReadInterp<'_>,
+) -> Result<Prepared<'a>, LoadError> {
     let exe = Elf::parse(file)?;
+    let interp = match &exe.interp {
+        Some(path) => {
+            let data = read_interp(path).map_err(|e| LoadError::Interpreter(path.clone(), e))?;
+            Some((path.clone(), data))
+        }
+        None => None,
+    };
+    Ok(Prepared { exe, interp })
+}
+
+/// 加载的后一半：把 [`prepare`] 准备好的程序映射进 `mm`，构造初始栈。
+pub fn load_prepared(
+    mm: &mut Mm,
+    prepared: &Prepared<'_>,
+    args: &Args<'_>,
+) -> Result<Image, LoadError> {
+    let exe = &prepared.exe;
     mm.set_layout(args.stack_limit);
     let bias = match exe.e_type {
         ET_DYN => ET_DYN_BASE - exe.span().0,
@@ -504,9 +542,8 @@ pub fn load(
     let mut interp_base = 0;
     let mut interp_range = None;
     let mut entry = main.entry;
-    if let Some(path) = &exe.interp {
-        let data = read_interp(path).map_err(|e| LoadError::Interpreter(path.clone(), e))?;
-        let interp = Elf::parse(&data)?;
+    if let Some((path, data)) = &prepared.interp {
+        let interp = Elf::parse(data)?;
         if interp.e_type != ET_DYN || interp.interp.is_some() {
             return Err(LoadError::Unsupported("interpreter is not a shared object"));
         }

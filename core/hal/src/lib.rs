@@ -151,10 +151,6 @@ pub fn map_file(
     shared: bool,
     writable: bool,
 ) -> Result<FileMapping, i32> {
-    let page = page_size() as u64;
-    let aligned = offset & !(page - 1);
-    let delta = (offset - aligned) as usize;
-    let map_len = (len + delta).div_ceil(page as usize) * page as usize;
     let prot = if !shared || writable {
         libc::PROT_READ | libc::PROT_WRITE
     } else {
@@ -165,6 +161,25 @@ pub fn map_file(
     } else {
         libc::MAP_PRIVATE
     };
+    map_file_with(fd, offset, len, prot, flags)
+}
+
+/// 只读的私有映射：好几个地址空间共用、谁也不能写的（[`map_file`]）。
+pub fn map_file_read_only(fd: i32, offset: u64, len: usize) -> Result<FileMapping, i32> {
+    map_file_with(fd, offset, len, libc::PROT_READ, libc::MAP_PRIVATE)
+}
+
+fn map_file_with(
+    fd: i32,
+    offset: u64,
+    len: usize,
+    prot: i32,
+    flags: i32,
+) -> Result<FileMapping, i32> {
+    let page = page_size() as u64;
+    let aligned = offset & !(page - 1);
+    let delta = (offset - aligned) as usize;
+    let map_len = (len + delta).div_ceil(page as usize) * page as usize;
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),

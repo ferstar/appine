@@ -130,6 +130,8 @@ unsafe extern "C" {
     fn appine_dbt_new(key: u64) -> *mut RawDbt;
     fn appine_dbt_trim();
     fn appine_dbt_free(dbt: *mut RawDbt, key: u64);
+    fn appine_dbt_set_sources(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
+    fn appine_dbt_trust(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_attach(dbt: *mut RawDbt) -> *mut RawDbtThread;
     fn appine_dbt_detach(t: *mut RawDbtThread);
     fn appine_dbt_flush(t: *mut RawDbtThread);
@@ -539,12 +541,37 @@ pub struct DbtSpace {
 unsafe impl Send for DbtSpace {}
 unsafe impl Sync for DbtSpace {}
 
+/// 翻译所在的一段映射（[`DbtSpace::set_sources`]）：guest 地址范围，和能断定内容相同的
+/// 身份（文件和它的版本）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbtSource {
+    pub start: u64,
+    pub len: u64,
+    pub id: [u64; 5],
+}
+
 impl DbtSpace {
+    /// [`DbtSpace::set_sources`] 最多记下几段。
+    pub const SOURCES: usize = 16;
+
     /// 创建（或者从池里取出）一个实例；宿主不是 aarch64 Linux 时返回 `None`。`key` 区分
     /// 程序（0 表示不区分）：池里有同一个键留下的翻译时优先拿回它，用完放回池里时也按它
     /// 记下。
     pub fn new(key: u64) -> Option<Arc<Self>> {
         NonNull::new(unsafe { appine_dbt_new(key) }).map(|raw| Arc::new(DbtSpace { raw, key }))
+    }
+
+    /// 地址空间不再使用了（翻译要放回池里）：记下翻译所在的映射，最多 [`Self::SOURCES`]
+    /// 段。调用方保证身份相同的映射内容相同。
+    pub fn set_sources(&self, sources: &[DbtSource]) {
+        unsafe { appine_dbt_set_sources(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
+    }
+
+    /// 从池里拿到的翻译在新的地址空间第一次运行之前：新地址空间里与记下的
+    /// （[`Self::set_sources`]）完全相同的映射里的块不必逐块核对。
+    pub fn trust(&self, sources: &[DbtSource]) {
+        unsafe { appine_dbt_trust(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 }
 

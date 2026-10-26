@@ -254,6 +254,24 @@ void appine_dbt_free(struct appine_dbt *dbt, uint64_t key);
 /* 释放池里保留的翻译（宿主内存紧张时） */
 void appine_dbt_trim(void);
 
+/*
+ * 翻译所在的一段映射：guest 地址范围，和调用方给出的、能断定内容相同的身份（文件和它的
+ * 版本）。身份相同的两段映射内容一定相同，由调用方保证。
+ */
+struct appine_dbt_source {
+    uint64_t start, len;
+    uint64_t id[5];
+};
+
+/* 地址空间不再使用之前（翻译要放回池里）：记下翻译所在的映射，最多 APPINE_DBT_SOURCES 段 */
+#define APPINE_DBT_SOURCES 16
+void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+/*
+ * 从池里拿到的实例在新的地址空间第一次运行之前：新地址空间里与记下的完全相同的映射里的块
+ * 不必逐块核对（execve 时程序和动态链接器的代码段，核对它们要把每一页都读一遍）
+ */
+void appine_dbt_trust(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+
 struct appine_dbt_thread;
 struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *dbt);
 void appine_dbt_detach(struct appine_dbt_thread *t);

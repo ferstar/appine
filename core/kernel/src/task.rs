@@ -251,6 +251,13 @@ pub(crate) mod pool {
     });
     static READY: Condvar = Condvar::new();
 
+    thread_local! {
+        /// 持有 BKL 时交给空闲线程的 job 数：放开 BKL 之后再叫醒它们（[`notify_pending`]），
+        /// 否则空闲线程醒来马上又要睡下去等 BKL。
+        #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+        static PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// 最多留着几个空闲的宿主线程。
     const MAX_IDLE: usize = 8;
     /// 空闲的宿主线程留多久。
@@ -261,7 +268,11 @@ pub(crate) mod pool {
         let mut p = POOL.lock().unwrap_or_else(PoisonError::into_inner);
         if p.idle > p.jobs.len() {
             p.jobs.push_back(job);
-            READY.notify_one();
+            if crate::kernel::bkl_held() {
+                PENDING.set(PENDING.get() + 1);
+            } else {
+                READY.notify_one();
+            }
             return Ok(());
         }
         drop(p);
@@ -269,6 +280,13 @@ pub(crate) mod pool {
             .name("guest".into())
             .spawn(move || worker(job))
             .map(drop)
+    }
+
+    /// 叫醒持有 BKL 时交了 job 的空闲线程。放开 BKL 之后调用。
+    pub(crate) fn notify_pending() {
+        for _ in 0..PENDING.replace(0) {
+            READY.notify_one();
+        }
     }
 
     fn worker(mut job: Job) {

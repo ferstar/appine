@@ -14,6 +14,7 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -67,6 +68,31 @@ pub(crate) mod wake {
 
 /// 释放 BKL 时要叫醒的通道。
 static WAKE: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// 持有 BKL 时要触发的事件（[`signal_later`]）。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static SIGNALS: RefCell<Vec<Arc<Event>>> = const { RefCell::new(Vec::new()) };
+    /// 这个线程持有 BKL。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 当前线程持有 BKL。
+pub(crate) fn bkl_held() -> bool {
+    HELD.get()
+}
+
+/// 放开 BKL 之后再触发 `event`。被叫醒的线程马上就要拿 BKL：放开之前叫醒它，它只会
+/// 再睡下去等锁，等这边放开时又要叫醒一次（shell 等子进程时每次都这样）。调用方持有
+/// BKL。
+pub(crate) fn signal_later(event: &Arc<Event>) {
+    SIGNALS.with_borrow_mut(|s| {
+        if !s.iter().any(|e| Arc::ptr_eq(e, event)) {
+            s.push(event.clone());
+        }
+    });
+}
 
 /// 释放 BKL 时要叫醒的对象（[`request_wake_object`]）。
 static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
@@ -178,6 +204,8 @@ pub(crate) struct Kernel {
     pub aio_max_nr: u64,
     /// inotify 的所有监视。打开文件析构时要报告 `IN_CLOSE_*`，所以用 Rc 共享。
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
+    /// 所有地址空间共用的只读文件映射（[`crate::mm::FileMaps`]）。
+    pub file_maps: crate::mm::FileMaps,
 }
 
 // SAFETY: Kernel 及其中的 Rc/RefCell 只在持有 BKL（Shared::kernel 这把锁）时访问，
@@ -232,6 +260,7 @@ impl Kernel {
             aio_nr: 0,
             aio_max_nr: 65536,
             inotify: Rc::default(),
+            file_maps: Default::default(),
         }
     }
 
@@ -296,7 +325,7 @@ impl Kernel {
                     && !objects.is_empty()
                     && object.is_none_or(|o| objects.contains(&o));
             if hit {
-                event.signal();
+                signal_later(event);
             }
         }
         objects.clear();
@@ -350,17 +379,26 @@ impl Shared {
     pub fn lock(&self) -> Bkl<'_> {
         for _ in 0..100 {
             match self.kernel.try_lock() {
-                Ok(k) => return Bkl(k),
-                Err(std::sync::TryLockError::Poisoned(e)) => return Bkl(e.into_inner()),
+                Ok(k) => return Bkl::new(k),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Bkl::new(e.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
             }
         }
-        Bkl(self.kernel.lock().unwrap_or_else(PoisonError::into_inner))
+        Bkl::new(self.kernel.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
-/// 持有 BKL 的凭证；释放时唤醒等待中的线程。
-pub(crate) struct Bkl<'a>(MutexGuard<'a, Kernel>);
+/// 持有 BKL 的凭证；释放时唤醒等待中的线程，再把持有期间释放的宿主内存交还宿主
+/// （[`crate::mm::release_unmapped`]）。
+pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>);
+
+impl<'a> Bkl<'a> {
+    fn new(guard: MutexGuard<'a, Kernel>) -> Bkl<'a> {
+        HELD.set(true);
+        crate::mm::defer_unmaps();
+        Bkl(ManuallyDrop::new(guard))
+    }
+}
 
 impl Deref for Bkl<'_> {
     type Target = Kernel;
@@ -378,7 +416,18 @@ impl DerefMut for Bkl<'_> {
 impl Drop for Bkl<'_> {
     fn drop(&mut self) {
         self.0.flush_wakeups();
+        // SAFETY: 之后不再使用 self.0
+        unsafe { ManuallyDrop::drop(&mut self.0) };
+        HELD.set(false);
+        crate::task::pool::notify_pending();
+        flush_signals();
+        crate::mm::release_unmapped();
     }
+}
+
+/// 触发 [`signal_later`] 攒下的事件。
+pub(crate) fn flush_signals() {
+    SIGNALS.with_borrow_mut(|s| s.drain(..).for_each(|e| e.signal()));
 }
 
 /// 释放 BKL 等待：事件被触发（[`request_wake`]、信号）、`host` 里的宿主 fd 就绪或者

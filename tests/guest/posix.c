@@ -173,14 +173,16 @@ static void test_shm(void)
 /* ---- POSIX 定时器：周期信号、超限次数、SIGEV_THREAD、CPU 时钟 ---- */
 
 static volatile sig_atomic_t ticks;
-static volatile int last_overrun;
+/* 每一次送达时的 si_overrun，按送达的顺序 */
+static volatile int overruns[64];
 
 static void on_tick(int sig, siginfo_t *si, void *uc)
 {
     (void)sig;
     (void)uc;
+    if (ticks < 64)
+        overruns[ticks] = si->si_overrun;
     ticks++;
-    last_overrun = si->si_overrun;
 }
 
 static atomic_int thread_ticks;
@@ -211,7 +213,8 @@ static void test_timers(void)
     struct itimerspec cur;
     CHECK(timer_gettime(t, &cur) == 0 && cur.it_interval.tv_nsec == 10000000, "timer_gettime");
 
-    /* 信号挂着期间的到期次数记进 si_overrun */
+    /* 信号挂着期间的到期次数记进 si_overrun。解除屏蔽之后送达的第一个是挂着的那个；
+     * 检查之前可能又到期了一次（周期只有 10 毫秒），所以只看第一个 */
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR1);
@@ -219,7 +222,7 @@ static void test_timers(void)
     int before = ticks;
     usleep(100000);
     sigprocmask(SIG_UNBLOCK, &block, NULL);
-    CHECK(ticks == before + 1 && last_overrun > 0, "overrun %d", last_overrun);
+    CHECK(ticks > before && overruns[before] > 0, "overrun %d", overruns[before]);
     CHECK(timer_delete(t) == 0, "timer_delete");
     /* musl 的 timer_delete 直接返回 -EINVAL，不设置 errno */
     CHECK(timer_delete(t) != 0, "deleted");

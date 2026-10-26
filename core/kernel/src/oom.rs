@@ -86,7 +86,8 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     };
     let near = used > k.oom.limit / 4 * 3;
     k.oom.next = Some(now + if near { NEAR_INTERVAL } else { INTERVAL });
-    if used <= k.oom.limit {
+    // 刚退出的进程的内存在它放开 BKL 之后才交还宿主（mm::release_unmapped）
+    if used <= k.oom.limit || crate::mm::UNMAPPING.load(Ordering::Acquire) != 0 {
         return k.oom.next;
     }
     // 上次挑中的进程还没退完：它的内存马上就会还回来。超时还没退完的（卡在宿主 I/O 里）

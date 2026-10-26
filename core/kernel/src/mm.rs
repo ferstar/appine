@@ -75,22 +75,123 @@ pub(crate) static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
 /// 不占内存（`MAP_NORESERVE`）；超出的部分照旧单独映射。
 const HEAP_RESERVE: u64 = 256 << 20;
 
-/// 一段由 [`Mm`] 持有的宿主内存。
+/// fork 时子进程这么大以内的映射切自同一段宿主内存（[`Mm::fork`]）。这样的映射解除
+/// 映射之后，宿主内存要等那一段全都不用了才交还，所以只给小的。
+const FORK_PIECE_MAX: u64 = 1 << 20;
+
+/// [`Mm::carve`] 切出来的：每个 VMA 的起点 → 那一段宿主内存和它的宿主地址。
+type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
+
+/// 一段由 [`Mm`] 持有的宿主内存。用 Arc 共享：只读文件映射的宿主映射所有地址空间共用
+/// （[`FileMaps`]），execve 不持 BKL 建新的地址空间时也会拿到它。
 struct HostRegion {
     base: NonNull<u8>,
     len: usize,
 }
 
+// SAFETY: 只是一段宿主地址范围，释放（Drop）时才用到它
+unsafe impl Send for HostRegion {}
+unsafe impl Sync for HostRegion {}
+
 impl Drop for HostRegion {
     fn drop(&mut self) {
-        unsafe { appine_hal::unmap(self.base, self.len) }
+        let (base, len) = (self.base, self.len);
+        let deferred = UNMAPPED.with_borrow_mut(|u| u.as_mut().map(|u| u.push((base, len))));
+        if deferred.is_some() {
+            UNMAPPING.fetch_add(len, Ordering::Relaxed);
+        } else {
+            // SAFETY: 这段宿主内存归这个 HostRegion，已经没有人用它
+            unsafe { appine_hal::unmap(base, len) }
+        }
     }
+}
+
+/// 等着交还宿主的内存：(起点, 长度)。
+type Unmapped = Vec<(NonNull<u8>, usize)>;
+
+thread_local! {
+    /// 持有 BKL 时释放的宿主内存，放开 BKL 之后才交还宿主（[`release_unmapped`]）；
+    /// 不持有 BKL 时是 None，当场交还。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static UNMAPPED: RefCell<Option<Unmapped>> = const { RefCell::new(None) };
+}
+
+/// 文件映射驻留的页数的缓存（[`Mm::resident_pages`]），键是 (设备号, inode, 文件偏移,
+/// 长度)。
+struct FileResidency;
+
+impl FileResidency {
+    /// 缓存的结果用多久：page cache 里一个文件的页变化得很慢。
+    const TTL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// 最多缓存几段，满了就清空。
+    const MAX: usize = 1024;
+
+    fn get(
+        key: (u64, u64, u64, u64),
+        now: std::time::Instant,
+        measure: impl FnOnce() -> u64,
+    ) -> u64 {
+        type Map = HashMap<(u64, u64, u64, u64), (u64, std::time::Instant)>;
+        static CACHE: Mutex<Option<Map>> = Mutex::new(None);
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = cache.get_or_insert_with(HashMap::new);
+        if let Some(&(n, at)) = map.get(&key)
+            && now.duration_since(at) < Self::TTL
+        {
+            return n;
+        }
+        if map.len() >= Self::MAX {
+            map.clear();
+        }
+        let n = measure();
+        map.insert(key, (n, now));
+        n
+    }
+}
+
+/// 释放了、还没交还宿主的字节数：OOM killer 等它们交还了再量。
+pub(crate) static UNMAPPING: AtomicUsize = AtomicUsize::new(0);
+
+/// 开始持有 BKL：之后释放的宿主内存等放开 BKL 再交还（[`release_unmapped`]）。
+pub(crate) fn defer_unmaps() {
+    UNMAPPED.with_borrow_mut(|u| {
+        u.get_or_insert_with(Vec::new);
+    });
+}
+
+/// 放开了 BKL：把持有期间释放的宿主内存交还宿主。进程退出、execve 时一次有十几二十个
+/// 映射，宿主拆页表、刷 TLB 要几十微秒，不必让等 BKL 的线程（等着回收它的 shell、管道
+/// 另一头的进程）跟着等。首尾相接的一起交还，少刷几次 TLB。
+pub(crate) fn release_unmapped() {
+    let Some(mut list) = UNMAPPED.with_borrow_mut(Option::take) else {
+        return;
+    };
+    if list.is_empty() {
+        return;
+    }
+    list.sort_unstable_by_key(|&(base, _)| base);
+    let total: usize = list.iter().map(|&(_, len)| len).sum();
+    let mut run = list[0];
+    for &(base, len) in &list[1..] {
+        // SAFETY: 两段都是交还的宿主内存；前一段在宿主上正好到 base 为止（宿主页比 4K
+        // 大时长度向上取整，接不上的不会凑巧相等）
+        if unsafe { run.0.add(run.1) } == base {
+            run.1 += len;
+        } else {
+            unsafe { appine_hal::unmap(run.0, run.1) };
+            run = (base, len);
+        }
+    }
+    unsafe { appine_hal::unmap(run.0, run.1) };
+    UNMAPPING.fetch_sub(total, Ordering::Release);
 }
 
 /// 一段可以映射进多个地址空间的宿主内存（System V 共享内存段）。
 #[derive(Clone)]
 pub(crate) struct SharedMemory {
-    region: Rc<HostRegion>,
+    region: Arc<HostRegion>,
 }
 
 impl SharedMemory {
@@ -138,7 +239,7 @@ struct Vma {
     /// 能否获得写权限：只读打开的文件的共享映射不能（宿主映射本身就是只读的）。
     may_write: bool,
     /// 持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
-    region: Rc<HostRegion>,
+    region: Arc<HostRegion>,
     /// `/proc/<pid>/maps` 里显示的名字（映射的文件、程序）和文件的 inode。
     name: Option<Rc<[u8]>>,
     ino: u64,
@@ -154,6 +255,9 @@ struct Vma {
     /// 文件映射：宿主文件的 (设备号, inode) 和起点对应的文件偏移。共享映射拿它作 futex
     /// 的键；文件被截短时据此找到映射它的页（[`Mm::file_truncated`]）。
     file_id: Option<(u64, u64, u64)>,
+    /// 私有文件映射：映射时文件内容的版本（[`content::version`]），没有可信的版本时是
+    /// None。没写过的映射里是这个版本的文件内容（[`Mm::code_sources`]）。
+    content: Option<(u64, u64)>,
     /// 文件的共享映射：复制出来的宿主 fd 和起点对应的文件偏移（mremap 扩展映射时
     /// 接着映射文件后面的内容）。
     file: Option<(Rc<OwnedFd>, u64)>,
@@ -321,7 +425,7 @@ impl Runs {
 struct Borrowed {
     host: NonNull<u8>,
     /// 持有那段宿主内存：拥有者解除映射、销毁之后它也不会释放。
-    region: Rc<HostRegion>,
+    region: Arc<HostRegion>,
 }
 
 /// 一个地址空间里写时复制的页（guest 地址）。只在私有匿名映射里。
@@ -339,7 +443,7 @@ pub struct Mm {
     mmu: Mmu,
     vmas: BTreeMap<u64, Vma>,
     /// 已经解除映射、等 shootdown 完成后才能释放的宿主内存。
-    graveyard: Vec<Rc<HostRegion>>,
+    graveyard: Vec<Arc<HostRegion>>,
     brk_start: u64,
     brk: u64,
     dirty: bool,
@@ -382,6 +486,71 @@ pub struct Mm {
     loans: Loans,
     /// 自己的句柄，借出页时记下（[`Mm::into_shared`]）。
     me: MmRef,
+    /// 只读文件映射的宿主映射，所有地址空间共用（[`FileMaps`]）。
+    files: FileMaps,
+}
+
+/// 只读私有文件映射（程序和库的代码段）的宿主映射，内核里的所有地址空间共用：同一个
+/// 版本（[`content::version`]）的同一段文件再映射时直接用它，宿主页表还在，不必重新映射、
+/// 缺页，退出时也不必拆掉（shell 每起一个进程，程序和动态链接器的代码段各一次）。用它的
+/// VMA 与 fork 之后父子共用宿主内存时一样标记为 `cow`，要写之前复制一份自己的。宿主上是
+/// 只读映射，万一有地方忘了复制就直接出错，不会悄悄改了别人的代码。
+#[derive(Clone, Default)]
+pub(crate) struct FileMaps(Arc<Mutex<Vec<FileMap>>>);
+
+struct FileMap {
+    /// (设备号, inode, 文件偏移, 长度, ctime, 大小)。
+    key: [u64; 6],
+    region: Arc<HostRegion>,
+    host: NonNull<u8>,
+    /// 最近一次用到的序号，满了时去掉最久没用的。
+    used: u64,
+}
+
+// SAFETY: host 指向 region 持有的宿主内存
+unsafe impl Send for FileMap {}
+
+impl FileMaps {
+    /// 最多保留几段。只占宿主地址空间，页是 page cache 里的，宿主内存紧张时可以回收。
+    const MAX: usize = 128;
+
+    fn get(&self, key: &[u64; 6]) -> Option<(Arc<HostRegion>, NonNull<u8>)> {
+        let mut maps = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = maps.iter().map(|m| m.used).max().unwrap_or(0) + 1;
+        let m = maps.iter_mut().find(|m| m.key == *key)?;
+        m.used = next;
+        Some((m.region.clone(), m.host))
+    }
+
+    fn insert(&self, key: [u64; 6], region: Arc<HostRegion>, host: NonNull<u8>) {
+        let mut maps = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let used = maps.iter().map(|m| m.used).max().unwrap_or(0) + 1;
+        if maps.len() >= Self::MAX
+            && let Some(old) = (0..maps.len()).min_by_key(|&i| maps[i].used)
+        {
+            maps.swap_remove(old);
+        }
+        maps.push(FileMap {
+            key,
+            region,
+            host,
+            used,
+        });
+    }
+
+    /// 全部丢掉（宿主内存紧张时）。还在用的映射由用它的 VMA 持有，不受影响。
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 /// `/proc/<pid>/maps` 的一行。
@@ -414,10 +583,57 @@ fn mmu_prot(p: u32) -> u32 {
 
 /// 文件从 `offset` 起还有内容的字节数，按页向上取整，不超过 `len`。
 fn file_extent(fd: i32, offset: u64, len: u64) -> u64 {
-    let size = appine_hal::fstat(fd).map_or(0, |s| s.st_size.max(0) as u64);
-    size.saturating_sub(offset)
+    extent(appine_hal::fstat(fd).map_or(0, |s| s.st_size), offset, len)
+}
+
+/// 大小为 `size` 的文件从 `offset` 起还有内容的字节数（[`file_extent`]）。
+fn extent(size: i64, offset: u64, len: u64) -> u64 {
+    (size.max(0) as u64)
+        .saturating_sub(offset)
         .next_multiple_of(PAGE_SIZE)
         .min(len)
+}
+
+/// 判断两段文件映射的内容是否相同（[`Mm::code_sources`]）。
+mod content {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// 有过可写共享映射的宿主文件 (设备号, inode)：经由共享映射写进去的内容不一定改
+    /// ctime（页一直是脏的就不再经过 page_mkwrite），这样的文件不再相信 ctime。
+    static WRITABLY_SHARED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
+
+    /// 文件 (`dev`, `ino`) 有了可写的共享映射。
+    pub(super) fn writably_shared(dev: u64, ino: u64) {
+        let mut set = WRITABLY_SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.get_or_insert_with(HashSet::new).insert((dev, ino));
+    }
+
+    /// 宿主文件内容的版本：ctime（纳秒）和大小。内容的每一次修改（write、truncate、
+    /// fallocate……）宿主都会把 ctime 改成当时的时间，utimensat 也改不回去，所以两次量到
+    /// 的版本相同，之间就没有改过。宿主的时间戳取自粗粒度的时钟，ctime 离现在太近时，
+    /// 之后紧接着的修改可能得到同一个 ctime，这时不给版本；有过可写共享映射的文件也不给。
+    #[allow(clippy::unnecessary_cast)]
+    pub(super) fn version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
+        const RACY_NS: i128 = 2_000_000_000;
+        let ctime = st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos() as i128;
+        if ctime + RACY_NS > now {
+            return None;
+        }
+        let set = WRITABLY_SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.as_ref().is_some_and(|s| s.contains(&(dev, ino))) {
+            return None;
+        }
+        Some((ctime as u64, st.st_size as u64))
+    }
 }
 
 /// 丢弃一段私有匿名宿主内存的内容：整页交给宿主回收，宿主页比 4K 大时两头不满一页
@@ -478,7 +694,13 @@ impl Mm {
             cow: RefCell::default(),
             loans: Rc::default(),
             me: Weak::new(),
+            files: FileMaps::default(),
         }
+    }
+
+    /// 与别的地址空间共用只读文件映射（[`FileMaps`]）。
+    pub fn share_files(&mut self, files: &FileMaps) {
+        self.files = files.clone();
     }
 
     /// 放进 `Rc<RefCell<..>>`（`TaskState` 持有的形式），记下自己的句柄：借用方还回最后
@@ -532,12 +754,37 @@ impl Mm {
     /// 拿回池里同一个程序（按可执行文件的 inode）留下的翻译，它在第一次运行之前逐块核对。
     pub fn code_space(&mut self) -> Option<Arc<CodeSpace>> {
         if self.code_space.is_none() {
+            let space = appine_engine::DbtSpace::new(self.exe.unwrap_or(0))?;
+            // 从池里拿到上一个使用者留下的翻译时，同一个版本的程序文件里的块不必再核对
+            space.trust(&self.code_sources());
             self.code_space = Some(Arc::new(CodeSpace {
-                space: appine_engine::DbtSpace::new(self.exe.unwrap_or(0))?,
+                space,
                 seen: Mutex::new(self.code_generation.load(Ordering::SeqCst)),
             }));
         }
         self.code_space.clone()
+    }
+
+    /// 内容由文件和版本就能确定的可执行映射（[`appine_engine::DbtSource`]）：没写过、
+    /// 有可信版本（[`content::version`]）的私有文件映射。翻译放回池里之前记下它们，下一个
+    /// 使用者的同一段映射是同一个版本的同一段文件时，里面的块不必逐块核对（核对要把程序
+    /// 和动态链接器的代码段每一页都读一遍，shell 每起一个进程都要做）。
+    fn code_sources(&self) -> Vec<appine_engine::DbtSource> {
+        self.vmas
+            .iter()
+            .filter(|(_, v)| {
+                v.prot & prot::EXEC != 0 && v.backing == Backing::PrivateFile && !v.written.get()
+            })
+            .filter_map(|(&start, v)| {
+                let ((dev, ino, offset), (ctime, size)) = (v.file_id?, v.content?);
+                Some(appine_engine::DbtSource {
+                    start,
+                    len: v.len,
+                    id: [dev, ino, offset, ctime, size],
+                })
+            })
+            .take(appine_engine::DbtSpace::SOURCES)
+            .collect()
     }
 
     /// shootdown 的代数、代码的代数和代码失效的记录（[`Mm::sync`]）。
@@ -669,7 +916,7 @@ impl Mm {
         prot: u32,
         backing: Backing,
         may_write: bool,
-        region: Rc<HostRegion>,
+        region: Arc<HostRegion>,
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
         self.room_for(1)?;
@@ -688,6 +935,7 @@ impl Mm {
                 file_len: len,
                 cow: false,
                 file_id: None,
+                content: None,
                 file: None,
                 shm: None,
                 locked: self.lock_future,
@@ -764,11 +1012,11 @@ impl Mm {
     /// 按 Linux 的提交量规则由调用方决定：只有可写的私有映射计入，`MAP_NORESERVE`、
     /// 只读和 `PROT_NONE` 的不计入。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，
     /// 计入的话在内存小的宿主上直接失败。
-    fn new_anonymous(len: u64, reserve: bool) -> Result<(Rc<HostRegion>, NonNull<u8>), Errno> {
+    fn new_anonymous(len: u64, reserve: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let base = appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?;
         Ok((
-            Rc::new(HostRegion {
+            Arc::new(HostRegion {
                 base,
                 len: host_len,
             }),
@@ -878,7 +1126,7 @@ impl Mm {
         let low = self
             .vmas
             .values()
-            .filter(|o| Rc::ptr_eq(&o.region, &v.region))
+            .filter(|o| Arc::ptr_eq(&o.region, &v.region))
             .map(|o| o.host.as_ptr() as usize + o.len as usize)
             .filter(|&end| end <= host)
             .fold(v.region.base.as_ptr() as usize, usize::max);
@@ -975,6 +1223,23 @@ impl Mm {
             }
         };
 
+        let st = file.and_then(|(fd, ..)| appine_hal::fstat(fd).ok());
+        // st_dev 在 macOS 上是 i32
+        #[allow(clippy::unnecessary_cast)]
+        let file_id = st
+            .as_ref()
+            .zip(file)
+            .map(|(s, (_, offset, _))| (s.st_dev as u64, s.st_ino as u64, offset));
+        let content = match (&st, file_id) {
+            (Some(_), Some((dev, ino, _))) if shared && file.is_some_and(|f| f.2) => {
+                content::writably_shared(dev, ino);
+                None
+            }
+            (Some(s), Some((dev, ino, _))) if !shared => content::version(s, dev, ino),
+            _ => None,
+        };
+        // 宿主映射与别的地址空间共用（FileMaps）
+        let mut cached = false;
         let (backing, may_write, region, host) = match file {
             None => {
                 let reserve =
@@ -992,34 +1257,49 @@ impl Mm {
                     return Err(Errno::EINVAL);
                 }
                 let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
-                let m =
-                    appine_hal::map_file(fd, offset, host_len, shared, writable).map_err(Errno)?;
                 let backing = if shared {
                     Backing::Shared
                 } else {
                     Backing::PrivateFile
                 };
-                let region = Rc::new(HostRegion {
-                    base: m.base,
-                    len: m.len,
-                });
-                (backing, !shared || writable, region, m.ptr)
+                // 有可信版本的只读私有映射：所有地址空间共用一份宿主映射（FileMaps）
+                let key = st
+                    .as_ref()
+                    .zip(content)
+                    .filter(|_| !shared && prot & prot::WRITE == 0)
+                    .map(|(s, (ctime, size))| {
+                        #[allow(clippy::unnecessary_cast)]
+                        let (dev, ino) = (s.st_dev as u64, s.st_ino as u64);
+                        [dev, ino, offset, len, ctime, size]
+                    });
+                if let Some((region, host)) = key.as_ref().and_then(|k| self.files.get(k)) {
+                    cached = true;
+                    (backing, true, region, host)
+                } else {
+                    let m = match key {
+                        Some(_) => appine_hal::map_file_read_only(fd, offset, host_len),
+                        None => appine_hal::map_file(fd, offset, host_len, shared, writable),
+                    }
+                    .map_err(Errno)?;
+                    let region = Arc::new(HostRegion {
+                        base: m.base,
+                        len: m.len,
+                    });
+                    if let Some(key) = key {
+                        self.files.insert(key, region.clone(), m.ptr);
+                        cached = true;
+                    }
+                    (backing, !shared || writable, region, m.ptr)
+                }
             }
         };
         if prot & prot::WRITE != 0 && !may_write {
             return Err(Errno::EACCES);
         }
         let file_len = match file {
-            Some((fd, offset, _)) => file_extent(fd, offset, len),
+            Some((_, offset, _)) => extent(st.as_ref().map_or(0, |s| s.st_size), offset, len),
             None => len,
         };
-        // st_dev 在 macOS 上是 i32
-        #[allow(clippy::unnecessary_cast)]
-        let file_id = file.and_then(|(fd, offset, _)| {
-            appine_hal::fstat(fd)
-                .ok()
-                .map(|s| (s.st_dev as u64, s.st_ino as u64, offset))
-        });
         let dup = match file {
             // SAFETY: fd 在这次调用期间一直打开着
             Some((fd, offset, _)) if shared => Some((
@@ -1036,6 +1316,8 @@ impl Mm {
         let v = self.vmas.get_mut(&start).unwrap();
         v.file_len = file_len;
         v.file_id = file_id;
+        v.content = content;
+        v.cow = cached;
         v.file = dup;
         self.trim_to_file(start)?;
         Ok(start)
@@ -1220,7 +1502,7 @@ impl Mm {
                     writable,
                 )
                 .map_err(Errno)?;
-                let region = Rc::new(HostRegion {
+                let region = Arc::new(HostRegion {
                     base: m.base,
                     len: m.len,
                 });
@@ -1247,6 +1529,7 @@ impl Mm {
             file_len,
             cow: false,
             file_id: template.file_id.map(|(d, i, o)| (d, i, o + offset)),
+            content: None,
             file,
             shm: None,
             locked: template.locked,
@@ -1689,6 +1972,7 @@ impl Mm {
         let shared = Mm::new().into_shared();
         let mut child = shared.borrow_mut();
         child.loans = self.loans.clone();
+        child.files = self.files.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.vdso = self.vdso;
@@ -1704,6 +1988,29 @@ impl Mm {
             .filter(|(_, v)| v.growsdown && v.backing == Backing::Anonymous)
             .map(|(&s, _)| (s, self.spare_below(s)))
             .collect();
+        let heap_start = page_up(self.brk_start).unwrap_or(0);
+        let is_heap = |s: u64, v: &Vma| {
+            s == heap_start && v.backing == Backing::Anonymous && v.len <= HEAP_RESERVE
+        };
+        // 子进程自己的小映射（数据段、.bss、malloc 的小块）切自同一段宿主内存，可写的和
+        // 只读的各一段：shell fork 之后马上 execve，原来每个映射各一次宿主的 mmap 和
+        // munmap。大的、堆和向下增长的仍然各自一段，解除映射时才能交还宿主
+        let pieces: Vec<(u64, bool)> = self
+            .vmas
+            .iter()
+            .filter(|&(&s, v)| {
+                !v.growsdown
+                    && !is_heap(s, v)
+                    && v.len <= FORK_PIECE_MAX
+                    && match v.backing {
+                        Backing::Shared => false,
+                        Backing::PrivateFile => v.prot & prot::WRITE != 0,
+                        Backing::Anonymous => true,
+                    }
+            })
+            .map(|(&s, v)| (s, v.prot & prot::WRITE != 0))
+            .collect();
+        let mut carved = Self::carve(&self.vmas, &pieces)?;
         // 写过的私有匿名映射写时复制：先映射好子进程自己的（全零的）宿主内存，再借给它
         let mut cow = Vec::new();
         for (&start, v) in self.vmas.iter_mut() {
@@ -1720,11 +2027,11 @@ impl Mm {
                 (v.region.clone(), v.host)
             } else {
                 // 堆照样预留宿主地址空间，子进程里接着扩展也是同一个 VMA
-                let heap = start == page_up(self.brk_start).unwrap_or(0)
-                    && v.backing == Backing::Anonymous
-                    && v.len <= HEAP_RESERVE;
+                let heap = is_heap(start, v);
                 let below = spare.get(&start).copied().unwrap_or(0);
-                let (region, host) = if heap {
+                let (region, host) = if let Some(piece) = carved.remove(&start) {
+                    piece
+                } else if heap {
                     Self::new_anonymous(HEAP_RESERVE, false)?
                 } else if below > 0 {
                     // 栈下面预留的宿主内存也照样留着
@@ -1752,6 +2059,7 @@ impl Mm {
             c.file_len = v.file_len;
             c.cow = v.cow && share;
             c.file_id = v.file_id;
+            c.content = v.content;
             c.file = v.file.clone();
             c.shm = v.shm;
             c.growsdown = v.growsdown;
@@ -1770,6 +2078,32 @@ impl Mm {
             .append(&mut lent.into_iter().collect());
         drop(child);
         Ok(shared)
+    }
+
+    /// fork 时给子进程的小映射 `pieces`（起点、要不要计入提交量）切出宿主内存：同一类的
+    /// 切自同一段，各自按宿主页对齐。返回每个起点的那一段和它的宿主地址。
+    fn carve(vmas: &BTreeMap<u64, Vma>, pieces: &[(u64, bool)]) -> Result<Carved, Errno> {
+        let page = appine_hal::page_size() as u64;
+        let mut out = BTreeMap::new();
+        for reserve in [true, false] {
+            let mine = pieces.iter().filter(|p| p.1 == reserve).map(|p| p.0);
+            let total: u64 = mine
+                .clone()
+                .map(|s| vmas[&s].len.next_multiple_of(page))
+                .sum();
+            if total == 0 {
+                continue;
+            }
+            let (region, base) = Self::new_anonymous(total, reserve)?;
+            let mut at = 0;
+            for s in mine {
+                // SAFETY: 各段按顺序排在这段宿主内存里，at + len 不超过 total
+                let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(at as usize)) };
+                out.insert(s, (region.clone(), host));
+                at += vmas[&s].len.next_multiple_of(page);
+            }
+        }
+        Ok(out)
     }
 
     /// 给一个和别的地址空间共用宿主内存的私有文件映射复制一份自己的。
@@ -1989,15 +2323,49 @@ impl Mm {
 
     /// 驻留在宿主内存里的 4K 页数。没写过的匿名映射跳过：读它只会映射到零页，Linux 的
     /// RSS 也不算零页。
+    ///
+    /// 进程退出、execve 时各量一次（`ru_maxrss`），shell 每起一个进程就量两次：
+    /// - 宿主上首尾相接的映射（execve 时先后建立的那些大多是）合起来一次 mincore；
+    /// - 文件映射里只有宿主 page cache 的页（没写过的私有映射、共享映射）时，驻留多少是
+    ///   文件本身的事，与哪个进程映射无关，而 mincore 要在 page cache 里逐页查找：结果按
+    ///   文件的一段缓存一会儿（[`FileResidency`]），程序和库的代码段不必每次都查。
     pub fn resident_pages(&self) -> u64 {
         // 借来的页与 Linux 上写时复制的页一样算在里面
-        let borrowed = self.cow.borrow().borrowed.len() as u64;
-        self.vmas
-            .values()
-            .filter(|v| v.backing != Backing::Anonymous || v.written.get())
-            .map(|v| appine_hal::resident_pages(v.host.as_ptr(), v.len as usize) as u64)
-            .sum::<u64>()
-            + borrowed
+        let mut total = self.cow.borrow().borrowed.len() as u64;
+        let mut spans = Vec::with_capacity(self.vmas.len());
+        let now = std::time::Instant::now();
+        for v in self.vmas.values() {
+            let page_cache = match v.backing {
+                Backing::Anonymous if !v.written.get() => continue,
+                Backing::Anonymous => false,
+                Backing::PrivateFile => !v.written.get(),
+                Backing::Shared => true,
+            };
+            let span = (v.host.as_ptr() as usize, v.len as usize);
+            match v.file_id {
+                Some((dev, ino, offset)) if page_cache => {
+                    total += FileResidency::get((dev, ino, offset, v.len), now, || {
+                        appine_hal::resident_pages(v.host.as_ptr(), span.1) as u64
+                    });
+                }
+                _ => spans.push(span),
+            }
+        }
+        spans.sort_unstable();
+        let mut rest = &spans[..];
+        while let Some(&(start, mut len)) = rest.first() {
+            let n = rest[1..]
+                .iter()
+                .take_while(|&&(s, l)| {
+                    let next = s == start + len;
+                    len += if next { l } else { 0 };
+                    next
+                })
+                .count();
+            total += appine_hal::resident_pages(start as *const u8, len) as u64;
+            rest = &rest[1 + n..];
+        }
+        total
     }
 
     /// 测试钩子（[`crate::bug`]）：让 `addr` 所在的页在页表里指向一个不能访问的宿主页，
@@ -2091,7 +2459,7 @@ impl Mm {
         let (lo, hi) = (v.host.as_ptr() as usize + v.len as usize, grow as usize);
         let taken = self.vmas.values().any(|o| {
             let at = o.host.as_ptr() as usize;
-            Rc::ptr_eq(&o.region, &v.region) && at < lo + hi && lo < at + o.len as usize
+            Arc::ptr_eq(&o.region, &v.region) && at < lo + hi && lo < at + o.len as usize
         });
         if taken {
             return false;
@@ -2154,10 +2522,25 @@ impl Mm {
     /// 内核自己往 guest 内存写入，比如加载程序、构造初始栈。只要求已映射，不检查权限，
     /// 所以按 VMA 找宿主内存：`PROT_NONE` 的页不在页表里。文件映射超出文件末尾的部分
     /// 不能写。
-    pub(crate) fn write_kernel(&self, addr: u64, data: &[u8]) -> Result<(), Errno> {
-        // 直接写 VMA 自己的宿主内存：写时复制的页先换成自己的
+    pub(crate) fn write_kernel(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
+        // 直接写 VMA 自己的宿主内存：写时复制的页先换成自己的，与别的地址空间共用宿主
+        // 内存的文件映射先复制一份自己的
         let end = page_up(addr.saturating_add(data.len() as u64)).unwrap_or(u64::MAX);
         self.cow_settle(addr & !(PAGE_SIZE - 1), end);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let shared: Vec<u64> = self
+            .vmas
+            .range(first..end)
+            .filter(|(_, v)| v.cow)
+            .map(|(&s, _)| s)
+            .collect();
+        for s in shared {
+            self.unshare(s)?;
+        }
         let mut done = 0;
         while done < data.len() {
             let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
@@ -2540,6 +2923,9 @@ impl Mm {
 
 impl Drop for Mm {
     fn drop(&mut self) {
+        if let Some(cs) = &self.code_space {
+            cs.space.set_sources(&self.code_sources());
+        }
         let cow = std::mem::take(self.cow.get_mut());
         // 已经没有线程在用这个地址空间（退出、execve），还回借来的页之前不必刷新 TLB
         self.return_loans(

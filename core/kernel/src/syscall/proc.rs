@@ -464,7 +464,7 @@ fn load_error(e: LoadError) -> Errno {
     match e {
         LoadError::NotElf | LoadError::Unsupported(_) | LoadError::Malformed(_) => Errno::ENOEXEC,
         LoadError::ArgumentsTooLong => Errno::E2BIG,
-        LoadError::Memory(e) | LoadError::Interpreter(_, e) => e,
+        LoadError::Memory(e) | LoadError::Read(e) | LoadError::Interpreter(_, e) => e,
     }
 }
 
@@ -514,6 +514,7 @@ fn exec(
         argv.push(Vec::new());
     }
     let vfs = cx.vfs()?;
+    let files = cx.k().file_maps.clone();
     let cwd = cx.cwd();
     let view = cx.view(&vfs);
     let cred = cx.cred();
@@ -554,7 +555,7 @@ fn exec(
     // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
     let mut file_path = filename.clone();
     for depth in 0.. {
-        let Some((interp, arg)) = parse_shebang(file.bytes()) else {
+        let Some((interp, arg)) = parse_shebang(file.head()) else {
             break;
         };
         if depth == MAX_INTERP_DEPTH {
@@ -605,7 +606,6 @@ fn exec(
     if secure {
         stack_limit = stack_limit.min(loader::STACK_SIZE);
     }
-    let mut mm = Mm::new();
     let args = Args {
         argv: &argv,
         envp: &envp,
@@ -614,7 +614,21 @@ fn exec(
         stack_limit,
     };
     let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cred, &root, &cwd, p);
-    let image = loader::load(&mut mm, &file, &args, &mut read_interp).map_err(load_error)?;
+    let prepared = loader::prepare(&file, &mut read_interp).map_err(load_error)?;
+    // 新的地址空间放开 BKL 建：映射程序的各段、构造初始栈占了 execve 持锁时间的大半，
+    // 管道两头的进程、并行构建里同时 exec 的进程原来要排队。这期间只碰新的地址空间和
+    // 所有地址空间共用的只读文件映射（FileMaps，自己有锁）
+    let built = cx.unlocked(|| {
+        let mut mm = Mm::new();
+        mm.share_files(&files);
+        loader::load_prepared(&mut mm, &prepared, &args).map(|image| (mm, image))
+    });
+    // 等 BKL 的时候被结束了（别的线程 exit_group、execve，或者致命信号）
+    if cx.task.killed.get() {
+        return Err(Errno::EINTR);
+    }
+    let (mut mm, image) = built.map_err(load_error)?;
+    let view = cx.view(&vfs);
     let interp_ino = image.interp.as_ref().and_then(|(p, ..)| {
         match vfs.resolve(&view, &cred, &root, &cwd, p, true) {
             Ok(Node::Store(ino)) => Some(ino),

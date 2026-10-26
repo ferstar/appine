@@ -194,6 +194,12 @@ struct appine_dbt {
     size_t words_used;
     /* 换了地址空间（exec、fork 之后从池里取出），下次运行之前要核对 */
     bool stale;
+    /* 放回池里之前记下的、翻译所在的映射（appine_dbt_set_sources） */
+    struct appine_dbt_source sources[APPINE_DBT_SOURCES];
+    unsigned nsources;
+    /* 下一次核对时不必看的范围 [start, end)（appine_dbt_trust） */
+    uint64_t trusted[APPINE_DBT_SOURCES][2];
+    unsigned ntrusted;
     /* 运行时宿主出了故障（APPINE_EXIT_HOST_FAULT）：各张表可能只改了一半，不再使用 */
     bool poisoned;
     uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
@@ -2041,6 +2047,7 @@ static void flush_locked(struct appine_dbt *d)
     d->table_count = d->table_occupied = d->table_dead = d->blocks_dead = 0;
     d->words_used = 0;
     d->stale = false;
+    d->nsources = d->ntrusted = 0;
     d->flush_wanted = false;
     d->used_words = d->routine_words;
     __atomic_store_n(&d->generation, d->generation + 1, __ATOMIC_RELEASE);
@@ -3191,6 +3198,16 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
  * 翻译模板时的核对是同一件事，只是一次做完，省掉逐块拷贝、重新链接和同步指令缓存。
  * 大部分都对不上时（exec 了别的程序）请求整体清空。持有锁
  */
+/* 块整个落在 appine_dbt_trust 给出的范围里 */
+static bool block_trusted(const struct appine_dbt *d, const struct block *b)
+{
+    for (unsigned i = 0; i < d->ntrusted; i++) {
+        if (b->pc >= d->trusted[i][0] && b->pc + (uint64_t)b->nguest * 4 <= d->trusted[i][1])
+            return true;
+    }
+    return false;
+}
+
 static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
 {
     d->stale = false;
@@ -3201,10 +3218,11 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
         const struct block *b = &d->blocks[i];
         if (b->code) {
             live++;
-            bad += !block_matches(d, c->mmu, b, &page, &host);
+            bad += !block_trusted(d, b) && !block_matches(d, c->mmu, b, &page, &host);
         }
     }
     if (bad * 2 > live) {
+        d->ntrusted = 0;
         d->flush_wanted = true;
         return;
     }
@@ -3212,7 +3230,7 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
     struct retire_batch r = {.n = 0};
     for (size_t i = 0; bad && i < d->table_count; i++) {
         struct block *b = &d->blocks[i];
-        if (b->code && !block_matches(d, c->mmu, b, &page, &host)) {
+        if (b->code && !block_trusted(d, b) && !block_matches(d, c->mmu, b, &page, &host)) {
             if (!retire_add(d, &r, b)) {
                 d->flush_wanted = true;
                 break;
@@ -3221,6 +3239,35 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
         }
     }
     retire_flush(d, &r);
+    d->ntrusted = 0;
+}
+
+void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    pthread_mutex_lock(&d->lock);
+    /* 记不下的不记：没记下的映射里的块照常核对 */
+    d->nsources = n < APPINE_DBT_SOURCES ? (unsigned)n : APPINE_DBT_SOURCES;
+    memcpy(d->sources, s, d->nsources * sizeof(*s));
+    pthread_mutex_unlock(&d->lock);
+}
+
+void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    pthread_mutex_lock(&d->lock);
+    d->ntrusted = 0;
+    for (size_t i = 0; d->stale && i < n; i++) {
+        for (unsigned j = 0; j < d->nsources; j++) {
+            if (!memcmp(&s[i], &d->sources[j], sizeof(*s)) && d->ntrusted < APPINE_DBT_SOURCES) {
+                d->trusted[d->ntrusted][0] = s[i].start;
+                d->trusted[d->ntrusted][1] = s[i].start + s[i].len;
+                d->ntrusted++;
+                break;
+            }
+        }
+    }
+    /* 记下的只用一次：这个地址空间不再使用时重新记 */
+    d->nsources = 0;
+    pthread_mutex_unlock(&d->lock);
 }
 
 /* 停下来等别人整体清空完。持有锁，等待期间放开 */
@@ -3472,6 +3519,20 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
 
 void appine_dbt_trim(void)
 {
+}
+
+void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    (void)d;
+    (void)s;
+    (void)n;
+}
+
+void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    (void)d;
+    (void)s;
+    (void)n;
 }
 
 struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
