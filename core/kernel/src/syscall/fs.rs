@@ -848,6 +848,13 @@ fn open_pseudo(
     if !matches!(node, PseudoNode::OpenFd(..)) {
         cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
     }
+    // /proc/<pid>/mem 与 ptrace 一样要求能跟踪那个进程（PTRACE_MODE_ATTACH）
+    if let PseudoNode::Entry(pid, _, pseudo::Entry::Mem) = node {
+        let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
+        if !super::proc::may_ptrace(cx, &group.borrow()) {
+            return Err(Errno::EACCES);
+        }
+    }
     match node {
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
         PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), (cred.fsuid, cred.fsgid)),
@@ -2654,6 +2661,8 @@ enum IoPath {
     Inotify(Rc<RefCell<super::Inotify>>),
     /// `/proc/<pid>/pagemap`：按读的位置现算。
     Pagemap(Tid),
+    /// `/proc/<pid>/mem`：位置就是地址。
+    Mem(Tid),
     Local,
 }
 
@@ -2671,20 +2680,27 @@ fn io_path(f: &OpenFile) -> IoPath {
             node: PseudoNode::Entry(pid, _, pseudo::Entry::Pagemap),
             ..
         } => IoPath::Pagemap(*pid),
+        FileKind::Proc {
+            node: PseudoNode::Entry(pid, _, pseudo::Entry::Mem),
+            ..
+        } => IoPath::Mem(*pid),
         _ => IoPath::Local,
     }
 }
 
 /// 能不能按位置读写（AIO 对不能定位的文件不管偏移）。
 pub(super) fn seekable(f: &OpenFile) -> bool {
-    matches!(io_path(f), IoPath::Local | IoPath::Pagemap(_))
+    matches!(
+        io_path(f),
+        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_)
+    )
 }
 
 /// 读写走哪条路径。带偏移的读写（pread、pwritev）遇到不能定位的文件是 ESPIPE：与
 /// Linux 一样先于打开方式检查（只读打开的管道 pwrite 也是 ESPIPE），`O_PATH` 除外。
 fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     let path = io_path(f);
-    let seekable = matches!(path, IoPath::Local | IoPath::Pagemap(_));
+    let seekable = matches!(path, IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_));
     if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
         return Err(Errno::ESPIPE);
     }
@@ -3162,6 +3178,14 @@ fn read_bytes(
             }
             Ok(n)
         }
+        IoPath::Mem(pid) => {
+            let pos = offset.unwrap_or(file.borrow().pos);
+            let n = pseudo::read_mem(cx.kr(), pid, buf, pos)?;
+            if offset.is_none() {
+                file.borrow_mut().pos = pos.wrapping_add(n as u64);
+            }
+            Ok(n)
+        }
         IoPath::Local => {
             let regular = regular_fd(&file.borrow());
             let n = match regular {
@@ -3205,6 +3229,15 @@ fn write_bytes(
         IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
         IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {
             Err(Errno::EINVAL)
+        }
+        IoPath::Mem(pid) => {
+            let pos = offset.unwrap_or(file.borrow().pos);
+            let sync = cx.task.sync.clone();
+            let n = pseudo::write_mem(cx.kr(), pid, data, pos, &sync)?;
+            if offset.is_none() {
+                file.borrow_mut().pos = pos.wrapping_add(n as u64);
+            }
+            Ok(n)
         }
         IoPath::Local => {
             let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];

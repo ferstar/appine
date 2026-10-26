@@ -455,7 +455,7 @@ static void test_sched(void)
     ok("sched");
 }
 
-/* ---- ptrace：信号投递停止、系统调用的停止、改返回值，process_vm_readv ---- */
+/* ---- ptrace：信号投递停止、单步、系统调用的停止、改返回值，process_vm_readv ---- */
 
 /* struct ptrace_syscall_info 里用到的部分 */
 struct syscall_info {
@@ -483,6 +483,14 @@ static void test_ptrace(void)
     struct iovec local = {buf, sizeof buf}, remote = {secret, sizeof secret};
     CHECK(process_vm_readv(pid, &local, 1, &remote, 1, 0) == sizeof buf && !strcmp(buf, "ptrace secret"),
           "process_vm_readv");
+    /* 单步：每次停下都是 SIGTRAP，普通指令是 TRAP_TRACE，svc 是 SI_USER */
+    for (int i = 0; i < 3; i++) {
+        CHECK(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == 0, "SINGLESTEP");
+        CHECK(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP, "step stop %#x", st);
+        siginfo_t si;
+        CHECK(ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && (si.si_code == 2 || si.si_code == SI_USER),
+              "step code %d", si.si_code);
+    }
     CHECK(ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD) == 0, "SETOPTIONS");
     CHECK(ptrace(PTRACE_SYSCALL, pid, 0, 0) == 0, "SYSCALL");
     unsigned long long nr = 0;

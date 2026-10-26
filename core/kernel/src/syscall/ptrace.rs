@@ -21,8 +21,11 @@ use crate::uaccess::UserSlice;
 const TRACEME: i64 = 0;
 const PEEKTEXT: i64 = 1;
 const PEEKDATA: i64 = 2;
+const POKETEXT: i64 = 4;
+const POKEDATA: i64 = 5;
 const CONT: i64 = 7;
 const KILL: i64 = 8;
+const SINGLESTEP: i64 = 9;
 const ATTACH: i64 = 16;
 const DETACH: i64 = 17;
 const SYSCALL: i64 = 24;
@@ -69,8 +72,17 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
     }
     match request {
         PEEKTEXT | PEEKDATA => peek(cx, &task, addr, data),
+        POKETEXT | POKEDATA => {
+            // 与 Linux 的 FOLL_FORCE 一样可以写没有写权限的私有映射：下断点
+            let mm = task.res.borrow().mm.clone();
+            mm.borrow_mut()
+                .write_force(addr, &data.to_le_bytes(), &cx.task.sync)
+                .map_err(|_| Errno::EIO)?;
+            Ok(0)
+        }
         CONT => resume(&task, Mode::Cont, data),
         SYSCALL => resume(&task, Mode::Syscall, data),
+        SINGLESTEP => resume(&task, Mode::Step, data),
         DETACH => {
             if data > Signal::MAX as u64 {
                 return Err(Errno::EIO);
@@ -144,8 +156,7 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             }
         }
         GET_SYSCALL_INFO => syscall_info(cx, &task, addr, data),
-        // 单步和改写被跟踪进程的内存还没有实现；PEEKUSR、POKEUSR、GETREGS 这些在 arm64
-        // 上本来就没有
+        // PEEKUSR、POKEUSR、GETREGS 这些在 arm64 上本来就没有
         _ => Err(Errno::EIO),
     }
 }
@@ -223,7 +234,8 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
     Ok(0)
 }
 
-/// PTRACE_CONT、PTRACE_SYSCALL：让停着的线程继续，`data` 是要注入的信号。
+/// PTRACE_CONT、PTRACE_SYSCALL、PTRACE_SINGLESTEP：让停着的线程继续，`data` 是要注入的
+/// 信号。
 fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
     if data > Signal::MAX as u64 {
         return Err(Errno::EIO);
@@ -235,6 +247,10 @@ fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
     }
     task.syscall_traced
         .store(mode == Mode::Syscall, Ordering::Relaxed);
+    task.stepping.store(mode == Mode::Step, Ordering::Relaxed);
+    if mode != Mode::Step {
+        task.step_again.store(false, Ordering::Relaxed);
+    }
     // 它停在内核里，只等自己的事件，不必打断
     crate::kernel::signal_later(&task.event);
     Ok(0)

@@ -45,7 +45,7 @@ enum appine_fault_kind {
 
 /* appine_cpu_run() 的退出原因 */
 enum appine_exit {
-    APPINE_EXIT_NONE = 0,  /* 仅 appine_cpu_exec_insn() 使用：指令正常完成 */
+    APPINE_EXIT_NONE = 0,  /* 仅 appine_cpu_exec_insn()、appine_cpu_step() 使用：指令正常完成 */
     APPINE_EXIT_SVC = 1,   /* pc 已指向下一条指令，exit_info = imm16 */
     APPINE_EXIT_UNDEF = 2, /* pc 指向该指令，exit_info = 指令编码 */
     APPINE_EXIT_BRK = 3,   /* pc 指向该指令，exit_info = imm16 */
@@ -185,6 +185,9 @@ enum appine_exit appine_cpu_run(struct appine_cpu *cpu);
 
 /* 在 cpu->pc 处执行给定的一条指令（不经取指），供 lockstep 测试使用 */
 enum appine_exit appine_cpu_exec_insn(struct appine_cpu *cpu, uint32_t insn);
+
+/* 用解释器执行 cpu->pc 处的一条指令（ptrace 的单步），不看 pending */
+enum appine_exit appine_cpu_step(struct appine_cpu *cpu);
 
 /* 可从任意线程调用：让 appine_cpu_run() 在下一个指令边界返回 APPINE_EXIT_KICK */
 void appine_cpu_kick(struct appine_cpu *cpu);

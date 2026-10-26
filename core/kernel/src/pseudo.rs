@@ -11,6 +11,9 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
+
+use appine_engine::PAGE_SIZE;
 
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
@@ -24,6 +27,7 @@ use crate::signal::SigAction;
 use crate::syscall::SocketRef;
 use crate::task::Task;
 use crate::tty::{PTS_MAJOR, Tty};
+use crate::uaccess::UserSlice;
 use crate::vfs::dev::rdev;
 use crate::vfs::store::{DirEntry, Stat, mode};
 use crate::vfs::{Mount, Node, Pseudo, Vfs};
@@ -58,6 +62,7 @@ const GLOBALS: [(&[u8], Global); 9] = [
 /// `/proc/<pid>` 下的项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Entry {
+    Auxv,
     Stat,
     Status,
     Statm,
@@ -66,6 +71,7 @@ pub(crate) enum Entry {
     Environ,
     Limits,
     Maps,
+    Mem,
     Smaps,
     SmapsRollup,
     Pagemap,
@@ -81,7 +87,8 @@ pub(crate) enum Entry {
     CoredumpFilter,
 }
 
-const ENTRIES: [(&[u8], Entry); 21] = [
+const ENTRIES: [(&[u8], Entry); 23] = [
+    (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
@@ -90,6 +97,7 @@ const ENTRIES: [(&[u8], Entry); 21] = [
     (b"environ", Entry::Environ),
     (b"limits", Entry::Limits),
     (b"maps", Entry::Maps),
+    (b"mem", Entry::Mem),
     (b"smaps", Entry::Smaps),
     (b"smaps_rollup", Entry::SmapsRollup),
     (b"pagemap", Entry::Pagemap),
@@ -284,8 +292,27 @@ pub(crate) enum PseudoNode {
     SysCpu(u32, &'static [u8]),
 }
 
-/// `/proc/<pid>/task/<tid>` 里的项。
-const TASK_ENTRIES: [Entry; 4] = [Entry::Stat, Entry::Status, Entry::Comm, Entry::Limits];
+/// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
+/// mem）。
+const TASK_ENTRIES: [Entry; 17] = [
+    Entry::Stat,
+    Entry::Status,
+    Entry::Statm,
+    Entry::Comm,
+    Entry::Cmdline,
+    Entry::Environ,
+    Entry::Limits,
+    Entry::Auxv,
+    Entry::Mem,
+    Entry::Maps,
+    Entry::Smaps,
+    Entry::SmapsRollup,
+    Entry::Mounts,
+    Entry::MountInfo,
+    Entry::Cwd,
+    Entry::Exe,
+    Entry::Root,
+];
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
 pub(crate) struct View<'a> {
@@ -667,8 +694,9 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (mode::S_IFLNK, _) => 0o777,
         (_, PseudoNode::Pts(_)) => 0o620,
         (_, PseudoNode::PtsPtmx) => 0o666,
+        (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
         (_, n) if writable(n) => 0o644,
-        (_, PseudoNode::Entry(_, _, Entry::Pagemap)) => 0o400,
+        (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv)) => 0o400,
         _ => 0o444,
     };
     let rdev_value = match node {
@@ -723,6 +751,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     matches!(
         node,
         PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
+            | PseudoNode::Entry(_, _, Entry::Mem)
             | PseudoNode::Static(
                 b"sys/kernel/hostname"
                     | b"sys/kernel/domainname"
@@ -1405,6 +1434,76 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
     Ok(n * 8)
 }
 
+/// 进程 `pid` 的地址空间。
+fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno> {
+    let task = k
+        .groups
+        .get(&pid)
+        .and_then(|g| g.borrow().threads.first().copied())
+        .and_then(|t| k.tasks.get(&t).cloned())
+        .ok_or(Errno::ESRCH)?;
+    let mm = task.res.borrow().mm.clone();
+    Ok(mm)
+}
+
+/// 读 `/proc/<pid>/mem`：位置就是地址。按页读，碰到不能读的页停下；一字节也没读到时是
+/// EIO（Linux 的 `mem_rw`）。
+pub(crate) fn read_mem(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
+    let mm = process_mm(k, pid)?;
+    let mm = mm.borrow();
+    let mut done = 0;
+    while done < buf.len() {
+        let Some(addr) = pos.checked_add(done as u64) else {
+            break;
+        };
+        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(buf.len() - done);
+        if mm
+            .read(UserSlice::new(addr, n), &mut buf[done..done + n])
+            .is_err()
+        {
+            break;
+        }
+        done += n;
+    }
+    if done == 0 && !buf.is_empty() {
+        return Err(Errno::EIO);
+    }
+    Ok(done)
+}
+
+/// 写 `/proc/<pid>/mem`：与 PTRACE_POKETEXT 一样强制写入（[`Mm::write_force`]），按页
+/// 写，碰到不能写的页停下。`current` 是写入的线程。
+///
+/// [`Mm::write_force`]: crate::mm::Mm::write_force
+pub(crate) fn write_mem(
+    k: &Kernel,
+    pid: Tid,
+    data: &[u8],
+    pos: u64,
+    current: &Arc<crate::task::TaskSync>,
+) -> Result<usize, Errno> {
+    let mm = process_mm(k, pid)?;
+    let mut mm = mm.borrow_mut();
+    let mut done = 0;
+    while done < data.len() {
+        let Some(addr) = pos.checked_add(done as u64) else {
+            break;
+        };
+        let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(data.len() - done);
+        if mm
+            .write_force(addr, &data[done..done + n], current)
+            .is_err()
+        {
+            break;
+        }
+        done += n;
+    }
+    if done == 0 && !data.is_empty() {
+        return Err(Errno::EIO);
+    }
+    Ok(done)
+}
+
 const MOUNTS: &str = "appine / ext4 rw,relatime 0 0\n\
     proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
     devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0\n\
@@ -1690,8 +1789,13 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 self::Entry::Maps => task.map_or(String::new(), |t| maps(&t)),
                 self::Entry::Smaps => task.map_or(String::new(), |t| smaps(&t, false)),
                 self::Entry::SmapsRollup => task.map_or(String::new(), |t| smaps(&t, true)),
-                // 二进制，按读的位置现算（`read_pagemap`）
-                self::Entry::Pagemap => String::new(),
+                // 二进制，按读写的位置现算（`read_pagemap`、`read_mem`、`write_mem`）
+                self::Entry::Pagemap | self::Entry::Mem => String::new(),
+                self::Entry::Auxv => {
+                    let auxv =
+                        task.map_or_else(Vec::new, |t| t.res.borrow().mm.borrow().auxv.to_vec());
+                    return Ok(auxv.iter().flat_map(|w| w.to_le_bytes()).collect());
+                }
                 self::Entry::Mounts => MOUNTS.to_owned(),
                 self::Entry::MountInfo => MOUNTINFO.to_owned(),
                 self::Entry::OomScoreAdj => {

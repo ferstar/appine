@@ -42,7 +42,7 @@
 | C 难缠的运行时 | Go 静态二进制、node/V8、JVM | **行为正确，不要求快** | ✅ M8：Go、Node.js、OpenJDK 21/25 |
 | D 不做 | docker/podman（namespace、cgroup）、systemd、内核模块、X11/GUI | — | — |
 
-ptrace（§7.6）：strace 可以用；gdb 要的单步、改写被跟踪进程的内存还没有。
+ptrace（§7.6）：strace、gdb 可以用。
 
 ### 1.3 性能目标
 
@@ -443,9 +443,11 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - 与 Linux 一样，被跟踪的线程不丢弃被忽略的信号（跟踪者要看到它们）；参加完 group-stop 就照常执行，即使线程组仍然停着；SEIZE 跟踪的线程的 group-stop 报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 等它结束。
 - wait 报告 ptrace-stop 不要求 `WUNTRACED`，被跟踪的线程退出时也报告给跟踪者（不是主线程的单独报告），报告 ptrace-stop 时带着被跟踪进程的 rusage（strace -c 用它算时间）。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪，停在信号投递停止里的信号照常投递。
 - regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`，以及报告 0 个槽的 `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`（调试器改用软件断点和观察点）。guest 没有 SVE、PAC、MTE、SME，也就没有它们的 regset。
+- 单步（PTRACE_SINGLESTEP）由解释器执行一条指令（`appine_cpu_step`），执行完了投递 `TRAP_TRACE` 的 SIGTRAP。与 arm64 Linux 一样，单步执行 svc 时系统调用做完再报告（`SI_USER`），下一次单步不执行指令、原地再报告一次。
+- 改写被跟踪进程的内存（PTRACE_POKETEXT/POKEDATA、`/proc/<pid>/mem`）照 Linux 的 `FOLL_FORCE`：没有写权限的私有映射也能写（下断点），先复制成自己的一份；没有写权限的共享映射不能写。写过的地方作废翻译（§4.2），写过的映射不再算作翻译池里可信的来源。`/proc/<pid>/auxv` 是加载器留下的一份 auxv，gdb 靠它算 PIE 程序的加载地址。
 - PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径，好在入口和出口停下（§6 的不持 BKL 的系统调用不走）。vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
 - `process_vm_readv`、`process_vm_writev`：权限同上，远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少。
-- 还没有：PTRACE_SINGLESTEP、改写被跟踪进程的内存（PTRACE_POKETEXT/POKEDATA）、`/proc/<pid>/mem`。
+- 没有硬件断点和观察点，gdb 的观察点靠逐条指令单步。
 
 ---
 

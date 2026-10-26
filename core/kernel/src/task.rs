@@ -102,6 +102,11 @@ pub(crate) struct Task {
     pub syscall_traced: AtomicBool,
     /// 线程自己 exit(2) 的退出码（被跟踪的线程退出时报告给跟踪者）。
     pub exit_code: Cell<i32>,
+    /// 跟踪者用 PTRACE_SINGLESTEP 让它继续了：运行循环每次只让解释器执行一条指令
+    /// （[`crate::ptrace::step_done`]），不持 BKL 时读它。
+    pub stepping: AtomicBool,
+    /// 单步执行了 svc：下一次单步不执行指令，原地再报告一次（[`crate::ptrace::syscall_stepped`]）。
+    pub step_again: AtomicBool,
     /// 只有线程自己访问的状态。
     pub state: RefCell<TaskState>,
 }
@@ -175,6 +180,8 @@ impl Task {
             trace: RefCell::default(),
             syscall_traced: AtomicBool::new(false),
             exit_code: Cell::new(0),
+            stepping: AtomicBool::new(false),
+            step_again: AtomicBool::new(false),
             state: RefCell::new(state),
         }))
     }
@@ -403,9 +410,26 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             }
         }
         seen = now;
-        let exit = match &mut dbt {
-            Some((d, _)) => d.run(cpu),
-            None => cpu.run(),
+        // PTRACE_SINGLESTEP：解释器只执行一条指令。执行完了（ic ivau 也算）进内核报告；
+        // svc 在系统调用做完之后报告，访存出错、brk 投递它们自己的信号（crate::ptrace）
+        let (exit, stepped) = if task.stepping.load(Ordering::Relaxed) {
+            // 单步执行了 svc 之后的这一次不执行指令（crate::ptrace::syscall_stepped）
+            let r = if task.step_again.swap(false, Ordering::Relaxed) {
+                None
+            } else {
+                cpu.step()
+            };
+            match r {
+                None => (Exit::Kick, true),
+                Some(e @ Exit::InvalidateCode { .. }) => (e, true),
+                Some(e) => (e, false),
+            }
+        } else {
+            let exit = match &mut dbt {
+                Some((d, _)) => d.run(cpu),
+                None => cpu.run(),
+            };
+            (exit, false)
         };
         // 不持 BKL 就能做完的系统调用（syscall::fast）。它访问 guest 内存时仍然标记着在
         // 执行 guest 代码
@@ -421,6 +445,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             let k = shared.lock();
             let mut state = task.state.borrow_mut();
             let mut cx = Cx::new(shared, k, &task, &mut state);
+            if stepped {
+                crate::ptrace::step_done(&mut cx, cpu);
+            }
             let flow = handle(&mut cx, cpu, exit);
             if let Flow::Exec = flow {
                 generations = cx.mm().generations();

@@ -481,10 +481,11 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // 解除了映射或改了权限：其他共享地址空间的线程要先刷新 TLB，才能释放宿主内存
     let sync = cx.task.sync.clone();
     cx.mm_mut().sync(&sync);
-    // PTRACE_SYSCALL：出口停下，跟踪者看到返回值
+    // PTRACE_SYSCALL：出口停下，跟踪者看到返回值；单步执行的 svc 在这里报告
     if traced && !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
+    crate::ptrace::syscall_stepped(cx);
     // 返回用户态之前处理挂起的信号和 syscall 重启，与 Linux 一样
     signal::deliver(cx, cpu, true)
 }

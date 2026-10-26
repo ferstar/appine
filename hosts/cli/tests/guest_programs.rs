@@ -427,7 +427,7 @@ fn main_stack_grows_up_to_rlimit_stack() {
 fn ipc_timers_credentials_and_scheduling() {
     // System V 消息队列、信号量（SEM_UNDO）、共享内存跨 fork，POSIX 定时器（超限次数、
     // SIGEV_THREAD、CPU 时钟），时钟（不持 BKL 的和持锁的一致），mremap，降低权限之后的
-    // 凭据规则，亲和性和实时策略，RLIMIT_NOFILE，ptrace 的系统调用停止和 process_vm_readv
+    // 凭据规则，亲和性和实时策略，RLIMIT_NOFILE，ptrace 的单步、系统调用停止和 process_vm_readv
     let Some(program) = build_c_guest("posix") else {
         return;
     };

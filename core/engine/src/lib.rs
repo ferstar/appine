@@ -108,6 +108,7 @@ unsafe extern "C" {
     fn appine_cpu_tlb_flush(cpu: *mut CpuState);
     fn appine_cpu_run(cpu: *mut CpuState) -> c_int;
     fn appine_cpu_exec_insn(cpu: *mut CpuState, insn: u32) -> c_int;
+    fn appine_cpu_step(cpu: *mut CpuState) -> c_int;
     fn appine_cpu_kick(cpu: *mut CpuState);
     fn appine_cpu_layout_check(
         size: usize,
@@ -441,6 +442,12 @@ impl Cpu {
     /// 在当前 pc 处执行给定的一条指令（不经取指）。正常完成时返回 `None`。
     pub fn exec_insn(&mut self, insn: u32) -> Option<Exit> {
         let rc = unsafe { appine_cpu_exec_insn(self.state.as_ptr(), insn) };
+        self.decode_exit(rc)
+    }
+
+    /// 用解释器执行 pc 处的一条指令（ptrace 的单步），不理会 kick。正常完成时返回 `None`。
+    pub fn step(&mut self) -> Option<Exit> {
+        let rc = unsafe { appine_cpu_step(self.state.as_ptr()) };
         self.decode_exit(rc)
     }
 

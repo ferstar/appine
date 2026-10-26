@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use appine_engine::{PAGE_SIZE, VA_BITS, prot};
@@ -686,9 +687,15 @@ pub fn load_prepared(
         (AT_EXECFN, 0),
         (AT_PLATFORM, 0),
     ];
-    let StackLayout { sp, args, env } = build_stack(mm, args, &auxv, &random)?;
+    let StackLayout {
+        sp,
+        args,
+        env,
+        auxv,
+    } = build_stack(mm, args, &auxv, &random)?;
     mm.args = args;
     mm.env = env;
+    mm.auxv = auxv;
     Ok(Image {
         entry,
         sp,
@@ -705,6 +712,8 @@ struct StackLayout {
     args: (u64, u64),
     /// envp 字符串所在的范围。
     env: (u64, u64),
+    /// 栈上的 auxv（`/proc/<pid>/auxv`）。
+    auxv: Rc<[u64]>,
 }
 
 /// 按 Linux 的布局构造初始栈：
@@ -790,6 +799,7 @@ fn build_stack(
         sp,
         args: (args_start, env_start),
         env: (env_start, env_end),
+        auxv: Rc::from(&table[table.len() - 2 * (auxv.len() + 1)..]),
     })
 }
 

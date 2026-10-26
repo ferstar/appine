@@ -629,6 +629,8 @@ pub struct Mm {
     pub args: (u64, u64),
     /// 初始栈上 envp 字符串的范围（`/proc/<pid>/environ`）。
     pub env: (u64, u64),
+    /// 初始栈上的 auxv（键值对，以 `AT_NULL` 结尾），`/proc/<pid>/auxv` 用这一份。
+    pub auxv: Rc<[u64]>,
     /// mmap 分配区的上界（不含），按 execve 时的 `RLIMIT_STACK` 定下（[`Mm::set_layout`]）。
     mmap_top: u64,
     /// 初始的栈指针（Linux 的 `start_stack`）：`/proc/<pid>/maps` 把包含它的栈标成
@@ -850,6 +852,7 @@ impl Mm {
             vdso: 0,
             args: (0, 0),
             env: (0, 0),
+            auxv: Rc::from([]),
             mmap_top: STACK_TOP - MIN_GAP,
             start_stack: 0,
             stack_low: 0,
@@ -2171,6 +2174,7 @@ impl Mm {
         child.vdso = self.vdso;
         child.args = self.args;
         child.env = self.env;
+        child.auxv = self.auxv.clone();
         child.exe = self.exe;
         child.mmap_top = self.mmap_top;
         child.start_stack = self.start_stack;
@@ -2764,6 +2768,37 @@ impl Mm {
             };
             done += chunk;
         }
+        Ok(())
+    }
+
+    /// 跟踪者强制写入（PTRACE_POKETEXT、`/proc/<pid>/mem`，Linux 的 `FOLL_FORCE`）：没有写
+    /// 权限的私有映射也能写（程序的代码段：下断点），复制成自己的一份；没有写权限的共享映射
+    /// 不能写。写过的地方作废翻译，用着这个地址空间的线程先刷新 TLB；`current` 是写入的
+    /// 线程（它不在这个地址空间里时没有影响）。
+    pub(crate) fn write_force(
+        &mut self,
+        addr: u64,
+        data: &[u8],
+        current: &Arc<TaskSync>,
+    ) -> Result<(), Errno> {
+        let end = addr.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
+        let mut cur = addr;
+        while cur < end {
+            let (&s, v) = self
+                .vmas
+                .range(..=cur)
+                .next_back()
+                .filter(|&(&s, v)| cur < s + v.len)
+                .ok_or(Errno::EFAULT)?;
+            if v.backing == Backing::Shared && v.prot & prot::WRITE == 0 {
+                return Err(Errno::EFAULT);
+            }
+            cur = s + v.len;
+        }
+        self.write_kernel(addr, data)?;
+        let page = addr & !(PAGE_SIZE - 1);
+        self.invalidate_code(page, page_up(end).unwrap_or(u64::MAX) - page);
+        self.sync(current);
         Ok(())
     }
 

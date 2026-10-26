@@ -144,6 +144,17 @@ enum appine_exit appine_cpu_exec_insn(struct appine_cpu *cpu, uint32_t insn)
     return appine_interp_exec(cpu, insn);
 }
 
+static enum appine_exit cpu_step(void *ctx, struct appine_cpu *cpu)
+{
+    (void)ctx;
+    return appine_interp_step(cpu);
+}
+
+enum appine_exit appine_cpu_step(struct appine_cpu *cpu)
+{
+    return appine_guard_run(cpu_step, NULL, cpu);
+}
+
 void appine_cpu_kick(struct appine_cpu *cpu)
 {
     __atomic_store_n(&cpu->pending, 1, __ATOMIC_RELEASE);

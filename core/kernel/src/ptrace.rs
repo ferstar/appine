@@ -74,6 +74,8 @@ pub(crate) enum Mode {
     Cont,
     /// PTRACE_SYSCALL：在系统调用的入口和出口停下。
     Syscall,
+    /// PTRACE_SINGLESTEP：执行一条指令就停下（[`step_done`]）。
+    Step,
 }
 
 /// 停住时的寄存器。跟踪者读写这一份，继续时写回 Cpu。
@@ -371,6 +373,23 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
 }
 
+/// PTRACE_SINGLESTEP 让线程执行完了一条指令（不是 svc）：与 arm64 Linux 的单步异常一样
+/// 投递 SIGTRAP（`TRAP_TRACE`，地址是下一条指令），停在信号投递停止里报告给跟踪者。
+pub(crate) fn step_done(cx: &mut Cx<'_>, cpu: &Cpu) {
+    let info = SigInfo::fault(code::TRAP_TRACE, cpu.state().pc, 0);
+    signal::force(cx, Signal::TRAP, info);
+}
+
+/// 单步执行的是 svc：系统调用做完之后报告。与 arm64 Linux 一样，这次的 SIGTRAP 是
+/// `SI_USER`，没有发送者；硬件的单步状态还挂着，下一次 PTRACE_SINGLESTEP 不执行指令，
+/// 在原地再报告一次 `TRAP_TRACE`（`Task::step_again`）。
+pub(crate) fn syscall_stepped(cx: &mut Cx<'_>) {
+    if cx.task.stepping.load(Ordering::Relaxed) {
+        signal::force(cx, Signal::TRAP, SigInfo::kill(code::SI_USER, 0, 0));
+        cx.task.step_again.store(true, Ordering::Relaxed);
+    }
+}
+
 /// 系统调用停住时跟踪者注入的信号：与 Linux 一样当作内核发给自己的新信号。
 fn inject(cx: &Cx<'_>, data: i32) {
     if let Some(sig) = Signal::new(data) {
@@ -531,6 +550,7 @@ pub(crate) fn detach(task: &Task, sig: Option<i32>) {
         }
     }
     task.syscall_traced.store(false, Ordering::Relaxed);
+    task.stepping.store(false, Ordering::Relaxed);
     signal::wake(task);
 }
 

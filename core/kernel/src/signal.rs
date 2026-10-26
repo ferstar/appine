@@ -132,6 +132,8 @@ pub(crate) mod code {
     pub const ILL_ILLOPC: i32 = 1;
     /// 断点。
     pub const TRAP_BRKPT: i32 = 1;
+    /// 单步执行完一条指令。
+    pub const TRAP_TRACE: i32 = 2;
 }
 
 /// siginfo 里随 si_code 变化的字段。

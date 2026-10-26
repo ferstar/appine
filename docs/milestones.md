@@ -49,6 +49,7 @@
 | [M9 之前：拆 BKL](rounds/38-split-bkl.md) | 2026-10-26 | 按负载量 BKL 的持锁和等锁；读时钟不取 BKL（4 个进程同时读每次 800 → 88 纳秒）；futex 的等待和唤醒、nanosleep 不取 BKL（4 对线程同时 futex 乒乓 10.8 → 4.9 微秒） |
 | [M9 之前：平均负载、sysfs 和 limits](rounds/39-loadavg-sysfs.md) | 2026-10-27 | 平均负载按 Linux 的算法每 5 秒取样，所有线程都在等待时停下；只有 CPU 拓扑的 sysfs（`nproc --all`）；`/proc/<pid>/limits`；删除之后仍然打开着的文件可以 futimens |
 | [M9 之前：ptrace 的第一步，strace](rounds/40-ptrace-strace.md) | 2026-10-27 | 系统调用、信号、group-stop 和 `PTRACE_EVENT_*` 的停止，寄存器经由 regset 读写，wait 报告被跟踪的线程；process_vm_readv/writev；strace 能用 |
+| [M9 之前：ptrace 的第二步，gdb](rounds/41-ptrace-gdb.md) | 2026-10-27 | 解释器单步、强制写入被跟踪进程的内存并作废翻译、`/proc/<pid>/mem`、`/proc/<pid>/auxv`；gdb 的断点、单步、软件观察点、`catch syscall` 与原生一致 |
 
 ## 测量条件
 
@@ -73,7 +74,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | futex_wake05 | [稳定性和内存](rounds/12-stability-memory.md)那一轮记为以前就时好时坏，原因没查 |
 | times03 | [翻译后代码里的访存](rounds/30-translated-access.md)那一轮看到一次进程的用户态 CPU 时间倒退了一个滴答（111 → 110），单独重跑 3 次都通过，之后没再出现，原因没查 |
-| mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上） |
+| mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题 |
 
 cargo test 里 `ctrl_c_and_ctrl_z_control_the_foreground_job`（Tier 1）卡住过一次：作业停着、shell 在等输入，测试在等它退出（[起进程的宿主开销](rounds/28-spawn-host-cost.md)）。之后重放几十次都没再出现，原因没查明。
 

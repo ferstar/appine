@@ -1,6 +1,6 @@
 # M9 之前：ptrace 的第一步，strace（2026-10-27）
 
-← [M9 之前：平均负载、sysfs 和 limits（2026-10-27）](39-loadavg-sysfs.md) · [索引](../milestones.md)
+← [M9 之前：平均负载、sysfs 和 limits（2026-10-27）](39-loadavg-sysfs.md) · [索引](../milestones.md) · [M9 之前：ptrace 的第二步，gdb（2026-10-27）](41-ptrace-gdb.md) →
 
 ptrace 原来一律返回 EPERM，gdb、strace 都不能用（[M6](08-m6.md)、[M8](10-m8.md) 起推迟到 v1 之后）。分两步做，这一轮先让 strace 能用；单步和改写被跟踪进程的内存（gdb 要的）留给下一步。设计见 §7.6。
 
@@ -24,7 +24,7 @@ ptrace 原来一律返回 EPERM，gdb、strace 都不能用（[M6](08-m6.md)、[
 
 **推迟项**：
 
-- PTRACE_SINGLESTEP、PTRACE_POKETEXT/POKEDATA（改写被跟踪进程的内存，下断点要用）、`/proc/<pid>/mem`：gdb 要的，下一步做。
+- PTRACE_SINGLESTEP、PTRACE_POKETEXT/POKEDATA（改写被跟踪进程的内存，下断点要用）、`/proc/<pid>/mem`：gdb 要的，下一步做。→ 已补上（M9 之前：ptrace 的第二步，gdb）
 - 跟踪 pid 1 是 ESRCH（LTP 的 ptrace11）：内置的 init 不是 guest 进程。
 - 跟踪者记的是进程：跟踪者线程退出时，它跟踪的线程不会像 Linux 那样被放开，要等整个跟踪者进程退出；请求可以来自跟踪者进程里的任何线程。
 - 跟踪者不是父进程时，被跟踪的进程结束后父进程马上就能回收它（Linux 等跟踪者先取走它的结束）。

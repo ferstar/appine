@@ -6,12 +6,15 @@ cat > tracer.c <<'C'
 #define _GNU_SOURCE
 #include <elf.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -424,6 +427,116 @@ static void memory(void)
     waitpid(pid, 0, 0);
 }
 
+static void __attribute__((noinline)) steps(void)
+{
+    asm volatile("nop\n nop\n mov x9, #5\n add x9, x9, #1\n" ::: "x9");
+}
+
+static long __attribute__((noinline)) do_svc(void)
+{
+    register long x0 asm("x0");
+    asm volatile("mov x8, #172\n svc #0\n nop\n" : "=r"(x0)::"x8", "memory");
+    return x0;
+}
+
+/* 单步到下一个 SIGTRAP，打印 pc 相对 `base` 的位置和 siginfo */
+static struct regs step(pid_t pid, void *base)
+{
+    struct regs r;
+    ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
+    int st = wait_for(pid);
+    regs(pid, &r, 0);
+    siginfo_t si;
+    ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("  step: %s, pc %+lld, code %d, addr is pc %d\n", describe(st), (long long)(r.pc - (unsigned long)base),
+           si.si_code, si.si_addr == (void *)r.pc);
+    return r;
+}
+
+/* 断点（PTRACE_POKETEXT 和 /proc/<pid>/mem 写进 brk）、PTRACE_SINGLESTEP（普通指令和 svc）、
+   /proc/<pid>/auxv，以及不能强制写入的只读共享映射 */
+static void breakpoints(void)
+{
+    printf("== breakpoints and single step\n");
+    int fd = open("shared.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    ftruncate(fd, 4096);
+    char *shared = mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        /* 先执行过：Tier 1 已经翻译了它，写进断点之后要作废 */
+        for (int i = 0; i < 100; i++)
+            steps();
+        raise(SIGSTOP);
+        steps();
+        long r = do_svc();
+        _exit(r == getpid() ? 0 : 1);
+    }
+    wait_for(pid);
+    const unsigned brk = 0xd4200000;
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKTEXT, pid, steps, 0);
+    long patched = (word & ~0xffffffffL) | brk;
+    printf("poke code %ld\n", ptrace(PTRACE_POKETEXT, pid, steps, patched));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st = wait_for(pid);
+    struct regs r;
+    regs(pid, &r, 0);
+    siginfo_t si;
+    ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("breakpoint: %s, at steps %d, code %d, addr %d\n", describe(st), r.pc == (unsigned long)steps,
+           si.si_code, si.si_addr == (void *)steps);
+    ptrace(PTRACE_POKETEXT, pid, steps, word);
+    for (int i = 0; i < 4; i++)
+        r = step(pid, steps);
+    printf("  x9 %llu\n", r.x[9]);
+
+    /* 经由 /proc/<pid>/mem 在 do_svc 下断点 */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/mem", pid);
+    int mem = open(path, O_RDWR);
+    unsigned insn = 0, back = 0;
+    printf("mem read %zd\n", pread(mem, &insn, 4, (off_t)(unsigned long)do_svc));
+    printf("mem write %zd\n", pwrite(mem, &brk, 4, (off_t)(unsigned long)do_svc));
+    pread(mem, &back, 4, (off_t)(unsigned long)do_svc);
+    printf("  reads back brk %d\n", back == brk);
+    errno = 0;
+    printf("mem unmapped %zd %s\n", pread(mem, &back, 4, 16), strerror(errno));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    st = wait_for(pid);
+    regs(pid, &r, 0);
+    printf("breakpoint: %s, at do_svc %d\n", describe(st), r.pc == (unsigned long)do_svc);
+    pwrite(mem, &insn, 4, (off_t)(unsigned long)do_svc);
+    for (int i = 0; i < 3; i++)
+        r = step(pid, do_svc);
+    printf("  x0 is the pid %d\n", r.x[0] == (unsigned long long)pid);
+
+    /* 只读的共享映射不能强制写入 */
+    errno = 0;
+    printf("poke read-only shared %ld %s\n", ptrace(PTRACE_POKEDATA, pid, shared, 0L), strerror(errno));
+    errno = 0;
+    printf("mem write read-only shared %zd %s\n", pwrite(mem, "x", 1, (off_t)(unsigned long)shared),
+           strerror(errno));
+    close(mem);
+
+    snprintf(path, sizeof path, "/proc/%d/auxv", pid);
+    int f = open(path, O_RDONLY);
+    unsigned long aux[128] = {0};
+    ssize_t n = read(f, aux, sizeof aux);
+    close(f);
+    int entry = 0, pagesz = 0, last = 0;
+    for (ssize_t i = 0; i + 1 < n / 8; i += 2) {
+        if (aux[i] == AT_ENTRY)
+            entry = aux[i + 1] == getauxval(AT_ENTRY);
+        if (aux[i] == AT_PAGESZ)
+            pagesz = aux[i + 1] == 4096;
+        last = aux[i] == AT_NULL;
+    }
+    printf("auxv: entry %d, page size %d, ends with AT_NULL %d\n", entry, pagesz, last);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    printf("end: %s\n", describe(wait_for(pid)));
+}
+
 static void errors(void)
 {
     printf("== errors\n");
@@ -501,6 +614,7 @@ int main(void)
     threads();
     exitkill();
     memory();
+    breakpoints();
     errors();
     return 0;
 }
