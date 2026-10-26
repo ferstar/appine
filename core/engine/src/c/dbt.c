@@ -274,9 +274,11 @@ struct link {
 /* 跳往例程的 b：拷贝翻译模板时要按新位置重新计算偏移 */
 enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE, TO_LOOKUP };
 
-/* 一组共用检查的访存最多覆盖多少字节、最多几条（plan_group） */
+/* 一组共用检查的访存最多覆盖多少字节、最多几条；同时最多几组（plan_group） */
 #define GROUP_SPAN 512
 #define GROUP_MAX 16
+#define GROUP_SLOTS 4
+_Static_assert(sizeof(((struct appine_cpu *)0)->dbt_groups) == GROUP_SLOTS * 8, "每组一个槽");
 #define MAX_RELOCS (MAX_STUBS * 2 + 4)
 
 struct xlate {
@@ -298,15 +300,19 @@ struct xlate {
     unsigned idx, limit;
     /* 本块里 SP 已经检查过对齐，之后只按 16 的倍数改过 */
     bool sp_aligned;
-    /* 共用检查的一组访存（plan_group）：还没翻译的组员，T2 在此期间是基址的宿主地址 */
+    /* 共用检查的几组访存（plan_group）：还没翻译的组员。组的宿主基址在 T2 里，或者暂存
+     * 在 cpu 的 dbt_groups[组的下标] 里 */
     struct group {
         unsigned n, next;
         unsigned idx[GROUP_MAX];
         int32_t off[GROUP_MAX]; /* 相对组长执行之前的基址 */
+        bool reload[GROUP_MAX]; /* 之前有指令用过 T2：先从槽里取回宿主基址 */
         int32_t lo;             /* 整组覆盖的范围，也相对这个基址 */
         unsigned bytes;
         bool write;
-    } group;
+        bool spill; /* 有组员要取回：组长把宿主基址存进槽里 */
+    } groups[GROUP_SLOTS];
+    int t2_group; /* T2 现在是哪一组的宿主基址，-1 表示都不是 */
 };
 
 /* 代码的写入地址（W^X 双映射的可写别名） */
@@ -669,8 +675,8 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
         x->st->insns_copied++;
         return true;
     }
-    if (nmap == 3 && x->group.next < x->group.n)
-        abort(); /* plan_group 保证组员之间的指令不用 T2 */
+    if (nmap == 3)
+        x->t2_group = -1; /* 之后的组员从槽里取回宿主基址（plan_group） */
     for (unsigned k = 0; k < nmap; k++)
         emit_load_guest(x, pool[k], guest[k]);
     emit(x, out);
@@ -862,8 +868,7 @@ static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
 static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool write, bool in_granule,
                            unsigned fail)
 {
-    if (x->group.next < x->group.n)
-        abort(); /* plan_group 保证组员之间没有别的访存 */
+    x->t2_group = -1;
     unsigned last = T0;
     if (bytes > 1 && !in_granule) {
         emit(x, enc_add_imm(T1, T0, bytes - 1, 0));
@@ -899,14 +904,15 @@ static void sp_moved(struct xlate *x, int64_t delta)
         x->sp_aligned = false;
 }
 
-static bool plan_group(struct xlate *x, const struct memop *lead);
-static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc);
+static int plan_group(struct xlate *x, const struct memop *lead);
+static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, int slot);
 
 static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
 {
     unsigned rn = m->rn == 31 ? REG_SP : m->rn;
-    if (plan_group(x, m)) {
-        emit_group(x, m, pc);
+    int slot = plan_group(x, m);
+    if (slot >= 0) {
+        emit_group(x, m, pc, slot);
         return;
     }
 
@@ -1007,8 +1013,13 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
  * 同一个块里以同一个寄存器为基址的几条访存（函数的序言和尾声、结构体的几个字段）
  * 共用一次检查：组长检查整组覆盖的范围，之后 T2 = 基址在组长执行之前的值对应的宿主
  * 地址，组员直接用 [T2, #偏移] 访问。组员之间只能有不写基址（按常数加减的除外，记下
- * 累计的偏移）、不用 T2 的指令和条件分支，SP 只能按 16 的倍数改变（组长的对齐检查
- * 对组员也成立）。
+ * 累计的偏移）的指令和条件分支，SP 只能按 16 的倍数改变（组长的对齐检查对组员也成立）。
+ *
+ * 组员之间可以夹着别的访存（别的组、不分组的）和用到 T2 的指令：组长把宿主基址存进
+ * cpu 的 dbt_groups[槽]，它们之后的组员先取回来。槽的地址是常数，可以早早取出，组员的
+ * 访问不必等 TLB 查表：python 的解释循环里栈帧、代码对象这几个基址的访存互相交错，原来
+ * 一个块里十几次检查一次也省不下。一个块执行期间映射不会变（只会回填 TLB），宿主基址
+ * 在基址改变之前一直有效。同时最多 GROUP_SLOTS 组。
  *
  * 跨页时回填例程按两页处理，宿主地址不连续时检查失败。条件分支后面的组员不一定会
  * 执行，覆盖的范围里也可能有它们访问不到的页，所以检查失败时以 R_UNGROUP 退出，由
@@ -1070,10 +1081,10 @@ static bool nogroup(const struct appine_dbt *d, uint64_t pc)
 }
 
 /*
- * 不写基址、不用 T2、不结束块的指令可以夹在组员之间。按常数加减基址的 ADD/SUB
- * （立即数）把改变量记进 `delta`。
+ * 不写基址、不结束块的指令可以夹在组员之间：返回 1，用到 T2 时返回 2，否则返回 0。按常数
+ * 加减基址的 ADD/SUB（立即数）把改变量记进 `delta`。
  */
-static bool keeps_group(uint32_t insn, unsigned rn, int64_t *delta)
+static int keeps_group(uint32_t insn, unsigned rn, int64_t *delta)
 {
     unsigned top = FIELD(insn, 28, 25), stolen[3], nstolen = 0;
     struct operands o = {.n = 0};
@@ -1115,10 +1126,10 @@ static bool keeps_group(uint32_t insn, unsigned rn, int64_t *delta)
         for (k = 0; k < nstolen && stolen[k] != r; k++)
             ;
         if (k == nstolen && nstolen++ == 2)
-            return false;
+            return 2;
         stolen[k] = r;
     }
-    return true;
+    return 1;
 }
 
 /* 访存 `m` 执行时基址比组长执行之前多 `delta`：访问范围的起点（相对组长之前的基址） */
@@ -1127,33 +1138,45 @@ static int64_t member_start(const struct memop *m, int64_t delta)
     return delta + (m->mode == M_POST ? 0 : m->imm);
 }
 
-/* 从访存 `lead`（块里的第 x->idx 条）开始往后找同一基址的组员；至少有一个组员时
- * 填好 x->group 并返回 true */
-static bool plan_group(struct xlate *x, const struct memop *lead)
+/* 从访存 `lead`（块里的第 x->idx 条）开始往后找同一基址的组员；至少有一个组员时在一个
+ * 空闲的槽里填好这一组，返回槽的下标，否则返回 -1 */
+static int plan_group(struct xlate *x, const struct memop *lead)
 {
-    struct group *g = &x->group;
+    int slot = -1;
+    for (int i = 0; i < GROUP_SLOTS && slot < 0; i++) {
+        if (x->groups[i].next >= x->groups[i].n)
+            slot = i;
+    }
+    if (slot < 0)
+        return -1;
+    struct group *g = &x->groups[slot];
     unsigned rn = lead->rn;
     uint64_t pc0 = x->pc + 4ull * x->idx;
     g->n = g->next = 0;
+    g->spill = false;
     if (lead->mode == M_LITERAL || lead->mode == M_REG || lead->wb_reg || (rn != 31 && is_stolen(rn)) ||
         nogroup(x->d, pc0))
-        return false;
+        return -1;
     int64_t delta = 0, lo = member_start(lead, 0), hi = lo + memop_bytes(lead);
     bool write = !lead->load;
     if (!member_fits(lead, lo))
-        return false;
+        return -1;
     g->idx[0] = x->idx;
     g->off[0] = (int32_t)lo;
+    g->reload[0] = false;
     g->n = 1;
     if (lead->mode != M_OFFSET)
         delta = lead->imm;
     bool overwritten = lead->load && !lead->simd && (lead->rt == rn || (lead->pair && lead->rt2 == rn));
+    bool clobbered = false; /* 上一个组员之后有指令用了 T2 */
     for (unsigned j = x->idx + 1; !overwritten && j < x->limit && g->n < GROUP_MAX; j++) {
         uint32_t insn = x->guest[j];
         unsigned top = FIELD(insn, 28, 25);
         if (top != 0x4 && top != 0x6 && top != 0xc && top != 0xe) {
-            if (!keeps_group(insn, rn, &delta))
+            int keep = keeps_group(insn, rn, &delta);
+            if (!keep)
                 break;
+            clobbered |= keep == 2;
             continue;
         }
         struct memop m;
@@ -1162,7 +1185,14 @@ static bool plan_group(struct xlate *x, const struct memop *lead)
             break;
         if (m.prefetch) /* 不生成代码 */
             continue;
-        if (m.rn != rn || m.mode == M_LITERAL || m.mode == M_REG || (rn == 31 && (delta & 15)))
+        if (m.rn != rn) {
+            /* 别的基址的访存要用 T2；读进来的值改写了基址就到此为止 */
+            if (m.load && !m.simd && (m.rt == rn || (m.pair && m.rt2 == rn)))
+                break;
+            clobbered = true;
+            continue;
+        }
+        if (m.mode == M_LITERAL || m.mode == M_REG || (rn == 31 && (delta & 15)))
             break;
         int64_t start = member_start(&m, delta), end = start + memop_bytes(&m);
         int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
@@ -1173,6 +1203,9 @@ static bool plan_group(struct xlate *x, const struct memop *lead)
         write |= !m.load;
         g->idx[g->n] = j;
         g->off[g->n] = (int32_t)start;
+        g->reload[g->n] = clobbered;
+        g->spill |= clobbered;
+        clobbered = false;
         g->n++;
         if (m.mode != M_OFFSET) {
             if (m.wb_reg)
@@ -1183,13 +1216,13 @@ static bool plan_group(struct xlate *x, const struct memop *lead)
     }
     if (g->n < 2) {
         g->n = 0;
-        return false;
+        return -1;
     }
     g->next = g->n; /* 组长的检查发射之后才开始 */
     g->lo = (int32_t)lo;
     g->bytes = (unsigned)(hi - lo);
     g->write = write;
-    return true;
+    return slot;
 }
 
 /* 组员（包括组长）的访问：宿主地址 = T2 + off，然后回写基址 */
@@ -1245,10 +1278,11 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
     x->st->insns_memory++;
 }
 
-/* 组长：检查整组覆盖的范围，T2 = 基址的宿主地址，再做组长自己的访问 */
-static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc)
+/* 组长：检查整组覆盖的范围，T2 = 基址的宿主地址（有组员要取回时存进槽里），再做组长
+ * 自己的访问 */
+static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, int slot)
 {
-    struct group *g = &x->group;
+    struct group *g = &x->groups[slot];
     unsigned rn = lead->rn == 31 ? REG_SP : lead->rn, base = rn == REG_SP ? SP_HOST : rn;
     if (rn == REG_SP)
         emit_sp_check(x, pc);
@@ -1256,6 +1290,9 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc)
     bool in_granule = rn == REG_SP && (g->lo & 15) + g->bytes <= 16;
     emit_tlb_check(x, pc, g->bytes, g->write, in_granule, R_UNGROUP);
     emit(x, enc_add_lsl(T2, T2, base, 0));
+    if (g->spill)
+        emit(x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_groups) + 8 * (size_t)slot));
+    x->t2_group = slot;
     g->next = 1;
     emit_member(x, lead, g->off[0]);
 }
@@ -1701,15 +1738,24 @@ static bool translate_insn(struct xlate *x, uint32_t insn, uint64_t pc)
         struct memop m;
         if (!(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
             return fallback(x, pc);
-        struct group *g = &x->group;
         if (m.prefetch)
             return true;
-        if (g->next < g->n && x->idx == g->idx[g->next]) {
+        for (int i = 0; i < GROUP_SLOTS; i++) {
+            struct group *g = &x->groups[i];
+            if (g->next >= g->n || x->idx != g->idx[g->next])
+                continue;
+            if (g->reload[g->next]) {
+                size_t off = offsetof(struct appine_cpu, dbt_groups) + 8 * (size_t)i;
+                emit(x, enc_ldr_x(T2, CTX, off));
+                x->t2_group = i;
+            } else if (x->t2_group != i) {
+                abort(); /* plan_group 保证没标 reload 的组员之前没有指令用过 T2 */
+            }
             emit_member(x, &m, g->off[g->next++]);
             x->st->insns_grouped++;
-        } else {
-            emit_memop(x, &m, pc);
+            return true;
         }
+        emit_memop(x, &m, pc);
         return true;
     }
     case 0xa:
@@ -2448,7 +2494,9 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     x->guest = guest;
     x->limit = limit;
     x->sp_aligned = false;
-    x->group.n = x->group.next = 0;
+    for (unsigned i = 0; i < GROUP_SLOTS; i++)
+        x->groups[i].n = x->groups[i].next = 0;
+    x->t2_group = -1;
 
     /* 块入口检查 kick，保证链接起来的循环也能被打断 */
     emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, pending)));

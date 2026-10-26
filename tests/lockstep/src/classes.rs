@@ -95,6 +95,7 @@ pub const CLASSES: &[Class] = &[
     case("int_ldst", int_ldst, 0),
     case("int_pair", int_pair, 0),
     case("same_base", same_base, hwcap::FP | hwcap::ASIMD),
+    case("interleaved", interleaved, hwcap::FP | hwcap::ASIMD),
     case("literal", literal, hwcap::FP | hwcap::ASIMD),
     case("simd_ldst", simd_ldst, hwcap::FP | hwcap::ASIMD),
     case("simd_pair", simd_pair, hwcap::FP | hwcap::ASIMD),
@@ -552,6 +553,83 @@ fn same_base(g: &mut Rng, _: &Env) -> Case {
         c.insns.push(insn);
     }
     c
+}
+
+/// 两个基址交错的访存（Tier 1 让同一基址的共用一次检查，中间夹着别的访存时组员从槽里
+/// 取回宿主基址），中间还可能夹一条用三个被占用寄存器的运算（翻译时要用 T2）。两个基址
+/// 指向的范围可以重叠。
+fn interleaved(g: &mut Rng, _: &Env) -> Case {
+    let a = reg_except(g, &[]);
+    let b = reg_except(g, &[a]);
+    let mut start = || 2560 + g.below(DATA_BYTES as u32 - 2 * 2560 - 16) as i64;
+    let mut c = Case {
+        pointers: vec![(a, start()), (b, start())],
+        ..Case::default()
+    };
+    let pattern = g.pick(&[b"abab", b"abaa", b"aaba", b"axab"]);
+    for &p in pattern {
+        let insn = match p {
+            b'a' => access_on(g, a, &[a, b]),
+            b'b' => access_on(g, b, &[a, b]),
+            _ => {
+                /* ADD Xd, Xn, Xm：三个被占用的寄存器，不写两个基址 */
+                let stolen = [16, 17, 18, 26, 27, 28];
+                let pick = |g: &mut Rng, used: &[u32]| loop {
+                    let r = g.pick(&stolen);
+                    if !used.contains(&r) {
+                        break r;
+                    }
+                };
+                let rd = pick(g, &[a, b]);
+                let rn = pick(g, &[rd]);
+                let rm = pick(g, &[rd, rn]);
+                0x8b00_0000 | rm << 16 | rn << 5 | rd
+            }
+        };
+        c.insns.push(insn);
+    }
+    c
+}
+
+/// 以 `rn` 为基址的一条访存（same_base 的几种形式），不写 `keep` 里的寄存器（回写基址
+/// 除外）。
+fn access_on(g: &mut Rng, rn: u32, keep: &[u32]) -> u32 {
+    let rt = reg_or_zr(g, keep);
+    match g.below(5) {
+        0 => {
+            let size = 2 + g.bit();
+            size << 30 | 0x3900_0000 | g.bit() << 22 | g.below(32) << 10 | rn << 5 | rt
+        }
+        1 => {
+            let op = g.pick(&[0, 1, 3]);
+            g.bits(2) << 30
+                | 0x3800_0000
+                | g.bit() << 22
+                | (signed(g, 9) as u32 & 0x1ff) << 12
+                | op << 10
+                | rn << 5
+                | rt
+        }
+        2 => {
+            let load = g.bit();
+            let rt2 = loop {
+                let r = reg_or_zr(g, keep);
+                if load == 0 || r != rt {
+                    break r;
+                }
+            };
+            2 << 30
+                | 0x2800_0000
+                | (1 + g.below(3)) << 23
+                | load << 22
+                | (signed(g, 7) as u32 & 0x7f) << 15
+                | rt2 << 10
+                | rn << 5
+                | rt
+        }
+        3 => 0x3d80_0000 | g.bit() << 22 | g.below(32) << 10 | rn << 5 | g.bits(5),
+        _ => 0x9100_0000 | g.bit() << 30 | g.below(64) << 10 | rn << 5 | rn,
+    }
 }
 
 /// 整数 LDP/STP/LDPSW/LDNP/STNP。

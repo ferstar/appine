@@ -86,6 +86,7 @@ pub struct CpuState {
     /// Tier 1 里 `ic ivau` 记下、还没交出来作废的页（0 表示没有）。引擎在 dsb、isb 时以
     /// [`Exit::InvalidateCode`] 交出，因为别的原因退出时由调用方取走并作废。
     pub ivau_page: u64,
+    dbt_groups: [u64; 4],
     tlb: [TlbEntry; TLB_ENTRIES],
     itlb: [ItlbEntry; ITLB_ENTRIES],
     /// V0–V31，每个寄存器低 64 位在前。

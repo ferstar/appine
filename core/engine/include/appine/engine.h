@@ -112,6 +112,8 @@ struct appine_cpu {
     /* ic ivau 记下、还没交给调用方作废翻译的页（0 表示没有），dsb、isb 和退出时交出；
      * 也让 tlb 按 16 字节对齐 */
     uint64_t ivau_page;
+    /* Tier 1 一个块执行期间暂存几组访存的宿主基址（dbt.c 的 plan_group） */
+    uint64_t dbt_groups[4];
     /* Tier 1 以 "ldp [cpu + 下标 * 32 + 偏移]" 寻址表项，所以 tlb 的偏移不能超出 ldp
      * 立即数的范围 */
     struct appine_tlb_entry tlb[APPINE_TLB_ENTRIES];

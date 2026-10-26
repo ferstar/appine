@@ -374,24 +374,21 @@ impl<'a> Elf<'a> {
         {
             return Err(LoadError::Unsupported("segment overlaps the stack"));
         }
-        // 每个 guest 页的权限是覆盖它的所有段的并集
-        let mut pages: BTreeMap<u64, u32> = BTreeMap::new();
-        let mut shared_page = false;
-        for seg in &self.segments {
-            let mut page = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
-            while page < bias + seg.vaddr + seg.memsz {
-                match pages.get_mut(&page) {
-                    Some(p) => {
-                        *p |= seg.prot;
-                        shared_page = true;
-                    }
-                    None => {
-                        pages.insert(page, seg.prot);
-                    }
-                }
-                page += PAGE_SIZE;
-            }
-        }
+        // 段之间有没有共用的页：按起点排好之后看相邻的两段就够了（busybox 加 ld-musl 有
+        // 四百来页，原来逐页放进 BTreeMap，每次 execve 都要做一遍）
+        let mut spans: Vec<(u64, u64)> = self
+            .segments
+            .iter()
+            .map(|seg| {
+                let start = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
+                (
+                    start,
+                    (bias + seg.vaddr + seg.memsz).next_multiple_of(PAGE_SIZE),
+                )
+            })
+            .collect();
+        spans.sort_unstable();
+        let shared_page = spans.windows(2).any(|w| w[1].0 < w[0].1);
         let loaded = Loaded {
             bias,
             entry: bias + self.entry,
@@ -410,6 +407,15 @@ impl<'a> Elf<'a> {
                 self.map_from_file(mm, bias, seg, fd)?;
             }
             return Ok(loaded);
+        }
+        // 每个 guest 页的权限是覆盖它的所有段的并集
+        let mut pages: BTreeMap<u64, u32> = BTreeMap::new();
+        for seg in &self.segments {
+            let mut page = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
+            while page < bias + seg.vaddr + seg.memsz {
+                *pages.entry(page).or_insert(0) |= seg.prot;
+                page += PAGE_SIZE;
+            }
         }
         // 相邻且权限相同的页合并成一次映射
         let mut runs: Vec<(u64, u64, u32)> = Vec::new();
