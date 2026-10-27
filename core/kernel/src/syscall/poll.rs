@@ -153,17 +153,19 @@ pub(super) fn poll_once(f: &OpenFile, events: i16, all: bool) -> i16 {
 /// 对应；宿主 fd 上的由 [`HostEdges`] 记录，没有建立它时是 0。`EPOLLET` 据此在已经就绪
 /// 时又来了数据的情况下再触发一次。
 fn arrivals(f: &OpenFile) -> [u64; 2] {
-    arrivals_with(f, HostEdges::counts)
+    arrivals_with(f, HostEdges::counts, 0)
 }
 
 /// 与 [`arrivals`] 相同，但宿主 fd 刚刚经过 [`poll_now`]，宿主 epoll 那时不可读就不必
 /// 再问宿主。
 fn arrivals_polled(f: &OpenFile) -> [u64; 2] {
-    arrivals_with(f, HostEdges::counts_polled)
+    arrivals_with(f, HostEdges::counts_polled, 0)
 }
 
-fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2]) -> [u64; 2] {
+/// `depth` 是嵌套的 epoll 的层数（[`epoll_arrivals`]）。
+fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> [u64; 2] {
     let local = match &f.kind {
+        FileKind::Epoll(ep) => [epoll_arrivals(&ep.borrow(), depth), 0],
         FileKind::Pipe(end) if end.read => [end.pipe.borrow().writes, 0],
         FileKind::Pty(end) => [end.tty.borrow().arrivals[end.master as usize], 0],
         FileKind::Socket(s) => super::net::arrivals(&s.borrow()),
@@ -183,6 +185,39 @@ fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2]) -> [u64; 2] {
     };
     let host = f.host_edges.as_ref().map_or([0, 0], host);
     [local[0] + host[0], local[1] + host[1]]
+}
+
+/// epoll 实例里来过的事件：Linux 的 `ep_poll_callback` 每次被唤醒（关注的文件在关注的
+/// 方向上来了事件）都唤醒等这个 epoll 的 `poll_wait`，外面套着它的 epoll 的边沿触发的
+/// 关注因此再触发一次。这里是各个关注从加入起在关注的方向上来过事件的次数之和，加上
+/// 去掉了的关注原来的份额和加入、修改时已经就绪的次数（[`Epoll::base`]），只增不减。
+fn epoll_arrivals(ep: &Epoll, depth: u32) -> u64 {
+    let mut total = ep.base.get();
+    for int in &ep.interests {
+        // 停用的（EPOLLONESHOT 报告过）不唤醒，份额停在原来的值
+        if int.armed
+            && depth < MAX_NESTS
+            && let Some(file) = int.file.upgrade()
+        {
+            let now = interest_arrivals(int.events, &file.borrow(), depth + 1);
+            int.share.set(now.saturating_sub(int.origin));
+        }
+        total += int.share.get();
+    }
+    total
+}
+
+/// 关注 `events` 的方向上，文件 `f` 来过事件的次数（读写两个方向分开算，与 Linux 按唤醒的
+/// 事件过滤一样）。
+fn interest_arrivals(events: u32, f: &OpenFile, depth: u32) -> u64 {
+    directional(events, arrivals_with(f, HostEdges::counts, depth))
+}
+
+/// 两个方向的事件次数里，`events` 关注的方向上的。
+fn directional(events: u32, a: [u64; 2]) -> u64 {
+    let read = events & !WRITE_BITS & 0xffff != 0;
+    let write = events & WRITE_BITS != 0;
+    (if read { a[0] } else { 0 }) + (if write { a[1] } else { 0 })
 }
 
 /// 打开文件现在的"数据代数"：读、写方向用完数据的次数和来过事件的次数。代数不变就
@@ -254,10 +289,41 @@ impl Waits {
                     self.timer = Some(self.timer.map_or(d, |e| e.min(d)));
                 }
             }
+            // 只等新事件（外层边沿触发的关注报告过它可读）：等它里面的宿主 socket 新到的
+            // 数据和定时器，进程内的对象来了事件时内核叫醒边沿触发的等待者
+            (FileKind::Epoll(ep), None) if depth < MAX_NESTS && wanted & POLLIN == 0 => {
+                self.edge = true;
+                self.add_epoll_edges(&ep.borrow(), depth + 1);
+            }
             (FileKind::Epoll(ep), None) if depth < MAX_NESTS => {
                 self.add_epoll(&ep.borrow(), depth + 1);
             }
             _ => {}
+        }
+    }
+
+    /// 嵌套的 epoll 里只等新事件：各个关注的宿主 fd 新到的数据（[`HostEdges`]，外层以边沿
+    /// 触发关注它时建立，[`mark_edge_watched`]）、timerfd 的到期，再往里嵌套的照此。
+    fn add_epoll_edges(&mut self, ep: &Epoll, depth: u32) {
+        for int in ep.interests.iter().filter(|i| i.armed) {
+            let Some(file) = int.file.upgrade() else {
+                continue;
+            };
+            let f = file.borrow();
+            if let Some(e) = &f.host_edges {
+                self.host.push((e.fd(), POLLIN, 0));
+            }
+            match &f.kind {
+                FileKind::TimerFd(t) => {
+                    if let Some(d) = t.borrow().deadline {
+                        self.timer = Some(self.timer.map_or(d, |e| e.min(d)));
+                    }
+                }
+                FileKind::Epoll(inner) if depth < MAX_NESTS => {
+                    self.add_epoll_edges(&inner.borrow(), depth + 1);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -689,10 +755,15 @@ struct Interest {
     /// `EPOLLET`：上次检查时打开文件的 [`OpenFile::drained`] 和 [`arrivals`]。
     drained: Cell<[u64; 2]>,
     arrivals: Cell<[u64; 2]>,
+    /// 加入时文件在关注的方向上来过事件的次数，和此后来过的次数（这个 epoll 被嵌套时的
+    /// 数据代数，[`epoll_arrivals`]）。
+    origin: u64,
+    share: Cell<u64>,
 }
 
 impl Interest {
     fn new(fd: i32, file: &FileRef, events: u32, data: u64) -> Interest {
+        let came = arrivals(&file.borrow());
         Interest {
             fd,
             file: Rc::downgrade(file),
@@ -701,7 +772,9 @@ impl Interest {
             armed: true,
             seen: Cell::new(0),
             drained: Cell::new(file.borrow().drained),
-            arrivals: Cell::new(arrivals(&file.borrow())),
+            arrivals: Cell::new(came),
+            origin: directional(events, came),
+            share: Cell::new(0),
         }
     }
 }
@@ -713,9 +786,33 @@ pub(crate) struct Epoll {
     /// 下一次从哪个关注开始检查：与 Linux 把报告过的放到就绪链表末尾一样，就绪的比
     /// maxevents 多时轮流报告。
     cursor: usize,
+    /// 去掉了的关注原来的份额，加上加入、修改关注时它已经就绪的次数（[`epoll_arrivals`]）。
+    base: Cell<u64>,
+    /// 有别的 epoll 以边沿触发关注这个 epoll：它关注的宿主 fd 也要记录新到的数据
+    /// （[`mark_edge_watched`]）。
+    edge_watched: Cell<bool>,
 }
 
 impl Epoll {
+    /// 去掉第 `i` 个关注，份额记进 `base`，嵌套时的数据代数不会变少。
+    fn remove(&mut self, i: usize) -> Interest {
+        let int = self.interests.remove(i);
+        self.base.set(self.base.get() + int.share.get());
+        int
+    }
+
+    /// 去掉文件已经关闭了的关注。
+    fn prune(&mut self) {
+        let mut i = 0;
+        while i < self.interests.len() {
+            if self.interests[i].file.strong_count() == 0 {
+                self.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// 关注里 fd 为 `fd` 的第 `nth` 个（从 0 数）的打开文件（kcmp 的 `KCMP_EPOLL_TFD`）。
     pub(crate) fn target(&self, fd: i32, nth: usize) -> Option<FileRef> {
         self.interests
@@ -894,11 +991,25 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     {
         return Err(Errno::EINVAL);
     }
-    if op != EPOLL_CTL_DEL && events & (EPOLLET | EPOLLEXCLUSIVE) != 0 {
-        watch_host_edges(&file);
+    if op != EPOLL_CTL_DEL {
+        if events & (EPOLLET | EPOLLEXCLUSIVE) != 0 || ep.borrow().edge_watched.get() {
+            watch_host_edges(&file);
+        }
+        // 以边沿触发关注另一个 epoll，或者往被这样关注着的 epoll 里加 epoll：里面的宿主
+        // fd 也要记录新到的数据
+        if let FileKind::Epoll(inner) = &file.borrow().kind
+            && (events & EPOLLET != 0 || ep.borrow().edge_watched.get())
+        {
+            mark_edge_watched(inner, 0);
+        }
     }
+    // 加入、修改时已经就绪：与 Linux 一样唤醒外面等它的 epoll（嵌套时的数据代数加一）。
+    // 只有外面以边沿触发等它时才用得上，不必每次都问宿主
+    let ready_now = op != EPOLL_CTL_DEL
+        && ep.borrow().edge_watched.get()
+        && poll_now(&file.borrow(), events as i16, 0) != 0;
     let mut ep = ep.borrow_mut();
-    ep.interests.retain(|i| i.file.strong_count() > 0);
+    ep.prune();
     let pos = ep
         .interests
         .iter()
@@ -908,6 +1019,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         (EPOLL_CTL_ADD, Some(_)) => Err(Errno::EEXIST),
         (EPOLL_CTL_ADD, None) => {
             ep.interests.push(Interest::new(fd, &file, events, data));
+            ep.base.set(ep.base.get() + ready_now as u64);
             request_wake_files();
             Ok(0)
         }
@@ -917,16 +1029,42 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         }
         // 与 Linux 相同，修改之后重新判断：已经就绪的会再报告一次
         (EPOLL_CTL_MOD, Some(i)) => {
-            ep.interests[i] = Interest::new(fd, &file, events, data);
+            let old =
+                std::mem::replace(&mut ep.interests[i], Interest::new(fd, &file, events, data));
+            ep.base
+                .set(ep.base.get() + old.share.get() + ready_now as u64);
             request_wake_files();
             Ok(0)
         }
         (EPOLL_CTL_DEL, Some(i)) => {
-            ep.interests.remove(i);
+            ep.remove(i);
             Ok(0)
         }
         (EPOLL_CTL_MOD | EPOLL_CTL_DEL, None) => Err(Errno::ENOENT),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 有 epoll 以边沿触发关注 `ep`（`depth` 是往里嵌套的层数）：它和它里面嵌套的 epoll 关注
+/// 的宿主 fd 都建立 [`HostEdges`]，之后加进来的也是（[`Epoll::edge_watched`]）。已有的关注
+/// 的数据代数重新取一次起点，刚建立的记录不算新事件。
+fn mark_edge_watched(ep: &Rc<RefCell<Epoll>>, depth: u32) {
+    if depth >= MAX_NESTS {
+        return;
+    }
+    let ep = ep.borrow();
+    ep.edge_watched.set(true);
+    for int in &ep.interests {
+        let Some(file) = int.file.upgrade() else {
+            continue;
+        };
+        if file.borrow().host_edges.is_none() {
+            watch_host_edges(&file);
+            int.arrivals.set(arrivals(&file.borrow()));
+        }
+        if let FileKind::Epoll(inner) = &file.borrow().kind {
+            mark_edge_watched(inner, depth + 1);
+        }
     }
 }
 
@@ -1178,6 +1316,49 @@ mod tests {
         // 写零也算一次（Linux 照样唤醒）
         write(0);
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
+    }
+
+    #[test]
+    fn nested_epolls_fire_on_every_inner_event() {
+        let efd = Rc::new(RefCell::new(EventFd {
+            count: 0,
+            semaphore: false,
+            writes: 0,
+            reads: 0,
+        }));
+        let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
+        // 内层水平触发关注 eventfd，外层边沿触发关注内层
+        let mut inner = Epoll::default();
+        inner
+            .interests
+            .push(Interest::new(3, &file, POLLIN as u32, 0));
+        let inner = OpenFile::new(
+            FileKind::Epoll(Rc::new(RefCell::new(inner))),
+            oflags::O_RDWR,
+        );
+        let mut outer = Epoll::default();
+        outer
+            .interests
+            .push(Interest::new(4, &inner, POLLIN as u32 | EPOLLET, 0));
+        let write = || {
+            let mut e = efd.borrow_mut();
+            e.count += 1;
+            e.writes += 1;
+        };
+        assert!(outer.ready(0, 8).is_empty());
+        write();
+        assert_eq!(outer.ready(0, 8), vec![(0, POLLIN as u32)]);
+        outer.reported(0, POLLIN as u32);
+        assert!(outer.ready(0, 8).is_empty());
+        // 内层仍然就绪，又来了一次：外层再报告
+        write();
+        assert_eq!(outer.ready(0, 8), vec![(0, POLLIN as u32)]);
+        outer.reported(0, POLLIN as u32);
+        // 内层去掉关注不算新事件
+        if let FileKind::Epoll(ep) = &inner.borrow().kind {
+            ep.borrow_mut().remove(0);
+        }
+        assert!(outer.ready(0, 8).is_empty());
     }
 
     #[test]

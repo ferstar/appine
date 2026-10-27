@@ -55,6 +55,7 @@
 | [M9 之前：硬件断点和观察点](rounds/44-hw-watchpoints.md) | 2026-10-27 | `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 报告 6 个断点、4 个观察点，由解释器检查，有它们的线程只用 Tier 0；gdb 的 `watch`、`rwatch`、`awatch`、`hbreak` 与原生一致 |
 | [M9 之前：ptrace 和 procfs 的细节](rounds/45-ptrace-procfs.md) | 2026-10-27 | 单步进信号处理函数先停在第一条指令上；sigsuspend 里 GETSIGMASK 读到原来的屏蔽字、SETSIGMASK 之后不再恢复；`/proc/<pid>/mem` 拿打开时的地址空间；auxv、environ、maps、smaps、pagemap 打开时要能跟踪 |
 | [M9 之前：mremap 和 sysfs](rounds/46-mremap-sysfs.md) | 2026-10-27 | mremap 可以扩展私有文件映射（接着映射文件后面的内容）；sysfs 的 `cache/`、`cpufreq/` 照搬宿主对应的 CPU 的 |
+| [M9 之前：嵌套 epoll 的边沿](rounds/47-nested-epoll.md) | 2026-10-27 | 外层 epoll 以边沿触发关注内层时，内层关注的文件每来一次事件外层都再触发，两层嵌套和外层阻塞等待时也一样 |
 
 ## 测量条件
 

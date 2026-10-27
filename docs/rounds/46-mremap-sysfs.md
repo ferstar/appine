@@ -1,6 +1,6 @@
 # M9 之前：mremap 和 sysfs（2026-10-27）
 
-← [M9 之前：ptrace 和 procfs 的细节（2026-10-27）](45-ptrace-procfs.md) · [索引](../milestones.md)
+← [M9 之前：ptrace 和 procfs 的细节（2026-10-27）](45-ptrace-procfs.md) · [索引](../milestones.md) · [M9 之前：嵌套 epoll 的边沿（2026-10-27）](47-nested-epoll.md) →
 
 内核兼容性里剩下的两个顺手的缺口：mremap 不能扩展私有文件映射（[M6](08-m6.md) 起），sysfs 只有 CPU 的拓扑、没有缓存和频率（[平均负载、sysfs 和 limits](39-loadavg-sysfs.md)）。
 

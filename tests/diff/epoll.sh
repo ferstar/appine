@@ -275,6 +275,117 @@ C
 gcc -O1 -o et et.c
 ./et
 
+# 嵌套的 epoll：外层边沿触发关注内层时，内层关注的文件每来一次事件（即使已经就绪）外层
+# 都再触发一次，两层嵌套也是；外层在 epoll_wait 里等着时也被叫醒
+cat > nested.c <<'C'
+#define _GNU_SOURCE
+#include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int wait1(int ep, int ms)
+{
+    struct epoll_event e;
+    return epoll_wait(ep, &e, 1, ms);
+}
+
+/* 内层 epoll 以 inner_events 关注 fd，外层以边沿触发关注内层；每次 poke 之后外层报告几次 */
+static void nested(const char *name, int fd, uint32_t inner_events, int wfd, size_t len)
+{
+    int inner = epoll_create1(0), outer = epoll_create1(0);
+    struct epoll_event e = {.events = inner_events};
+    epoll_ctl(inner, EPOLL_CTL_ADD, fd, &e);
+    struct epoll_event o = {.events = EPOLLIN | EPOLLET};
+    epoll_ctl(outer, EPOLL_CTL_ADD, inner, &o);
+    uint64_t one = 1;
+    write(wfd, &one, len);
+    int a = wait1(outer, 100);
+    write(wfd, &one, len);
+    int b = wait1(outer, 100);
+    int c = wait1(outer, 50);
+    /* 外层还没报告过时新加一个已经就绪的关注 */
+    int d = 0;
+    printf("%-22s first %d, again %d, quiet %d\n", name, a, b, c);
+    (void)d;
+    close(inner);
+    close(outer);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    int efd = eventfd(0, EFD_NONBLOCK);
+    nested("eventfd, inner LT", efd, EPOLLIN, efd, 8);
+    int efd2 = eventfd(0, EFD_NONBLOCK);
+    nested("eventfd, inner ET", efd2, EPOLLIN | EPOLLET, efd2, 8);
+    int p[2];
+    pipe(p);
+    nested("pipe, inner LT", p[0], EPOLLIN, p[1], 1);
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    bind(l, (void *)&a, sizeof a);
+    listen(l, 4);
+    getsockname(l, (void *)&a, &al);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&a, sizeof a);
+    int s = accept(l, 0, 0);
+    nested("tcp, inner LT", s, EPOLLIN, c, 1);
+    int s2[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s2);
+    nested("unix, inner ET", s2[0], EPOLLIN | EPOLLET, s2[1], 1);
+    /* 两层嵌套：最外层边沿触发关注中间层，中间层水平触发关注内层 */
+    int e3 = eventfd(0, EFD_NONBLOCK);
+    int in = epoll_create1(0), mid = epoll_create1(0), out = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN};
+    epoll_ctl(in, EPOLL_CTL_ADD, e3, &ev);
+    epoll_ctl(mid, EPOLL_CTL_ADD, in, &ev);
+    ev.events = EPOLLIN | EPOLLET;
+    epoll_ctl(out, EPOLL_CTL_ADD, mid, &ev);
+    uint64_t one = 1;
+    write(e3, &one, 8);
+    int x = wait1(out, 100);
+    write(e3, &one, 8);
+    int y = wait1(out, 100);
+    int z = wait1(out, 50);
+    printf("%-22s first %d, again %d, quiet %d\n", "two levels", x, y, z);
+
+    /* 外层报告过之后在 epoll_wait 里等着，另一个进程往已经可读的管道、TCP 连接里再写 */
+    int fds[2][2];
+    pipe(fds[0]);
+    int c2 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c2, (void *)&a, sizeof a);
+    int s3 = accept(l, 0, 0);
+    fds[1][0] = s3;
+    fds[1][1] = c2;
+    const char *names[] = {"pipe, blocking", "tcp, blocking"};
+    for (int i = 0; i < 2; i++) {
+        int inner = epoll_create1(0), outer = epoll_create1(0);
+        struct epoll_event e = {.events = EPOLLIN};
+        epoll_ctl(inner, EPOLL_CTL_ADD, fds[i][0], &e);
+        e.events = EPOLLIN | EPOLLET;
+        epoll_ctl(outer, EPOLL_CTL_ADD, inner, &e);
+        write(fds[i][1], "x", 1);
+        int first = wait1(outer, 100);
+        if (fork() == 0) {
+            usleep(100000);
+            write(fds[i][1], "y", 1);
+            _exit(0);
+        }
+        int woke = wait1(outer, 2000);
+        printf("%-22s first %d, woken %d\n", names[i], first, woke);
+        wait(NULL);
+    }
+    return 0;
+}
+C
+gcc -O1 -o nested nested.c && ./nested
+
 # 真实的 tokio 程序：uv 离线安装一个包（缓存里没有，失败）。原来 mio 的第二次唤醒丢了，
 # uv 一直卡住
 rm -rf /tmp/uvenv
