@@ -28,5 +28,5 @@ ptrace 原来一律返回 EPERM，gdb、strace 都不能用（[M6](08-m6.md)、[
 - 跟踪 pid 1 是 ESRCH（LTP 的 ptrace11）：内置的 init 不是 guest 进程。
 - 跟踪者记的是进程：跟踪者线程退出时，它跟踪的线程不会像 Linux 那样被放开，要等整个跟踪者进程退出；请求可以来自跟踪者进程里的任何线程。
 - 跟踪者不是父进程时，被跟踪的进程结束后父进程马上就能回收它（Linux 等跟踪者先取走它的结束）。→ 已补上（M9 之前：跟踪停住的进程、跟踪者先取走结束）；被跟踪的非主线程退出时 Linux 也让父进程等跟踪者取走它（`delay_group_leader`），仍没有
-- 没有 seccomp，`PTRACE_O_TRACESECCOMP` 不会触发，`PTRACE_O_SUSPEND_SECCOMP` 是 EINVAL；PTRACE_PEEKSIGINFO、PTRACE_GET_RSEQ_CONFIGURATION 是 EIO。PTRACE_GETSIGMASK 不报告 sigsuspend 临时换掉的屏蔽字。→ 查明是反过来：Linux 报告原来的屏蔽字（`TIF_RESTORE_SIGMASK` 时读 `saved_sigmask`），appine 报告的是临时的；已改成与 Linux 相同，SETSIGMASK 之后也不再恢复原来的（M9 之前：ptrace 和 procfs 的细节）；seccomp、PTRACE_PEEKSIGINFO、PTRACE_GET_RSEQ_CONFIGURATION 仍没有
+- 没有 seccomp，`PTRACE_O_TRACESECCOMP` 不会触发，`PTRACE_O_SUSPEND_SECCOMP` 是 EINVAL；PTRACE_PEEKSIGINFO、PTRACE_GET_RSEQ_CONFIGURATION 是 EIO。PTRACE_GETSIGMASK 不报告 sigsuspend 临时换掉的屏蔽字。→ 查明是反过来：Linux 报告原来的屏蔽字（`TIF_RESTORE_SIGMASK` 时读 `saved_sigmask`），appine 报告的是临时的；已改成与 Linux 相同，SETSIGMASK 之后也不再恢复原来的（M9 之前：ptrace 和 procfs 的细节）；seccomp 已补上，`PTRACE_O_TRACESECCOMP`、`PTRACE_O_SUSPEND_SECCOMP`、PTRACE_SECCOMP_GET_FILTER、PTRACE_SECCOMP_GET_METADATA 与 Linux 相同（M9 之前：seccomp）；PTRACE_PEEKSIGINFO、PTRACE_GET_RSEQ_CONFIGURATION 仍没有
 - 跟踪一个已经被停住的进程时，group-stop 的信号在父进程取走之后记不得，报告成 SIGSTOP。→ 已补上（M9 之前：跟踪停住的进程、跟踪者先取走结束），ATTACH 时先报告 group-stop、再报告 ATTACH 发的 SIGSTOP 的顺序也与 Linux 相同了

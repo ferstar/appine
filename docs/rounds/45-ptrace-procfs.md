@@ -12,4 +12,4 @@
 
 **推迟项**：
 
-- 跟踪 pid 1 仍是 ESRCH，跟踪者记的仍是进程，非父进程的跟踪者跟踪的进程结束时父进程仍可能先回收它，跟踪一个已经停住的进程时 group-stop 的信号仍报告成 SIGSTOP（[ptrace 的第一步](40-ptrace-strace.md)的推迟项）。→ 后两项已补上（M9 之前：跟踪停住的进程、跟踪者先取走结束）；跟踪 pid 1、跟踪者记的是进程仍没有，40 篇的 seccomp、PTRACE_PEEKSIGINFO、PTRACE_GET_RSEQ_CONFIGURATION 也没有列在这里
+- 跟踪 pid 1 仍是 ESRCH，跟踪者记的仍是进程，非父进程的跟踪者跟踪的进程结束时父进程仍可能先回收它，跟踪一个已经停住的进程时 group-stop 的信号仍报告成 SIGSTOP（[ptrace 的第一步](40-ptrace-strace.md)的推迟项）。→ 后两项已补上（M9 之前：跟踪停住的进程、跟踪者先取走结束）；跟踪 pid 1、跟踪者记的是进程仍没有，40 篇的 seccomp（已补上，M9 之前：seccomp）、PTRACE_PEEKSIGINFO、PTRACE_GET_RSEQ_CONFIGURATION 也没有列在这里

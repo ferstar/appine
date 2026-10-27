@@ -1,6 +1,6 @@
 # M9 之前：cgroup v2 的视图（2026-10-27）
 
-← [M9 之前：跟踪停住的进程、跟踪者先取走结束（2026-10-27）](57-ptrace-stopped-reaped.md) · [索引](../milestones.md)
+← [M9 之前：跟踪停住的进程、跟踪者先取走结束（2026-10-27）](57-ptrace-stopped-reaped.md) · [索引](../milestones.md) · [M9 之前：seccomp（2026-10-28）](59-seccomp.md) →
 
 运行时按物理内存定堆的大小：JVM 的默认最大堆是物理内存的 1/4，Node.js 按物理内存给 V8 定上限。但 guest 能用的只有 OOM killer 的上限，默认是物理内存的一半（§12 第 4 条），几个运行时一起用满时，就有进程被结束。它们在容器里改按 cgroup 的 `memory.max` 算：JVM 的容器支持（UseContainerSupport），Node.js 经由 libuv 的 `uv_get_constrained_memory`。原来 appine 没有 cgroup，JVM 报告"No metrics available"。
 

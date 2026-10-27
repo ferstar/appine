@@ -67,6 +67,7 @@
 | [M9 之前：被屏蔽的信号只叫醒等它的线程](rounds/56-blocked-signals.md) | 2026-10-27 | 被屏蔽的信号挂起只叫醒 sigtimedwait、signalfd 的等待者（原来叫醒所有等待者；musl 的 fork 在 clone 前后屏蔽所有信号，这时退出的子进程的 SIGCHLD 就会触发）：屏蔽着 SIGCHLD 起子进程时 8 个空等的进程不再每次都被叫醒，屏蔽着的信号发出再取走 9–16 → 0.4 微秒 |
 | [M9 之前：跟踪停住的进程、跟踪者先取走结束](rounds/57-ptrace-stopped-reaped.md) | 2026-10-27 | 跟踪父进程已经取走停止事件的进程时，group-stop 报告停住它的信号，ATTACH 时先报告 group-stop、再报告 SIGSTOP；被跟踪的进程结束时，跟踪者不是父进程的话，先只交给跟踪者，它取走或者退出之后父进程才能回收、收到 SIGCHLD |
 | [M9 之前：cgroup v2 的视图](rounds/58-cgroup.md) | 2026-10-27 | 只读的 cgroup v2 挂在 `/sys/fs/cgroup`，所有 guest 进程在同一个 cgroup 里，`memory.max` 是 OOM killer 的上限：JVM、Node.js 按它定堆，默认上限下 JVM 的默认最大堆 978 → 490 MiB，Node.js 的堆上限 2.09 → 1.05 GiB |
+| [M9 之前：seccomp](rounds/59-seccomp.md) | 2026-10-28 | 严格模式和 cBPF 过滤器按 Linux 6.1 检查、执行，继承和 TSYNC，`PTRACE_EVENT_SECCOMP`，通知 fd（USER_NOTIF、ADDFD）；`strace --seccomp-bpf` 能用；线程各自退出时进程的退出状态由最后一个退出的线程定下；LTP 958 |
 
 ## 测量条件
 
