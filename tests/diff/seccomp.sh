@@ -1,5 +1,5 @@
-# seccomp：严格模式、过滤器的检查和各种动作、优先级、继承和 TSYNC、PTRACE_EVENT_SECCOMP、
-# 通知 fd（USER_NOTIF）。docker 里的 root 没有 CAP_SYS_ADMIN，开头先去掉它，两边一样
+# seccomp：严格模式、过滤器的检查和各种动作、优先级、快速路径上的系统调用、继承和 TSYNC、
+# PTRACE_EVENT_SECCOMP、通知 fd（USER_NOTIF、ADDFD）。docker 里的 root 没有 CAP_SYS_ADMIN，开头先去掉它，两边一样
 rm -rf /tmp/seccomp-test
 mkdir -p /tmp/seccomp-test
 cd /tmp/seccomp-test
@@ -23,6 +23,7 @@ cat > sc.c <<'C'
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -52,6 +53,10 @@ struct seccomp_notif_resp {
     int64_t val;
     int32_t error;
     uint32_t flags;
+};
+struct seccomp_notif_addfd {
+    uint64_t id;
+    uint32_t flags, srcfd, newfd, newfd_flags;
 };
 #define BPF_LD 0x00
 #define BPF_LDX 0x01
@@ -91,6 +96,11 @@ struct seccomp_notif_resp {
 #define NOTIF_RECV 0xc0502100
 #define NOTIF_SEND 0xc0182101
 #define NOTIF_ID_VALID 0x40082102
+#define NOTIF_ADDFD 0x40182103
+/* ADDFD 的结构体可以加长：ioctl 编号里的长度是调用者给的 */
+#define NOTIF_ADDFD_SIZE(n) (0x40002103 | (n) << 16)
+#define ADDFD_FLAG_SETFD 1
+#define ADDFD_FLAG_SEND 2
 #ifndef PTRACE_O_TRACESECCOMP
 #define PTRACE_O_TRACESECCOMP 0x80
 #endif
@@ -528,6 +538,68 @@ static void sibling_do(char c)
         read(sibling_done[0], &c, 1);
 }
 
+/* 不持 BKL 的快速路径（appine 的 syscall::fast）上的系统调用也要经过过滤器；vDSO 里读时钟
+   不进内核，过滤器管不到 */
+static void fast_path(void)
+{
+    printf("== fast path\n");
+    static const struct {
+        int nr;
+        const char *name;
+    } calls[] = {
+        {SYS_futex, "futex"},
+        {SYS_nanosleep, "nanosleep"},
+        {SYS_clock_nanosleep, "clock_nanosleep"},
+        {SYS_clock_gettime, "clock_gettime"},
+        {SYS_clock_getres, "clock_getres"},
+        {SYS_gettimeofday, "gettimeofday"},
+        {SYS_newfstatat, "newfstatat"},
+        {SYS_statx, "statx"},
+    };
+    for (unsigned i = 0; i < sizeof calls / sizeof *calls; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            install(calls[i].nr, RET_ERRNO | 77, 0);
+            static int word;
+            struct timespec ts = {0, 1000};
+            char buf[256];
+            long r;
+            switch (calls[i].nr) {
+            case SYS_futex:
+                r = syscall(SYS_futex, &word, 1 /* FUTEX_WAKE */, 1, 0, 0, 0);
+                break;
+            case SYS_nanosleep:
+                r = syscall(SYS_nanosleep, &ts, NULL);
+                break;
+            case SYS_clock_nanosleep:
+                r = syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &ts, NULL);
+                break;
+            case SYS_clock_gettime:
+                r = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+                break;
+            case SYS_clock_getres:
+                r = syscall(SYS_clock_getres, CLOCK_MONOTONIC, &ts);
+                break;
+            case SYS_gettimeofday:
+                r = syscall(SYS_gettimeofday, buf, NULL);
+                break;
+            case SYS_newfstatat:
+                r = syscall(SYS_newfstatat, AT_FDCWD, "/", buf, 0);
+                break;
+            default:
+                r = syscall(SYS_statx, AT_FDCWD, "/", 0, 0x7ff, buf);
+                break;
+            }
+            result(calls[i].name, r);
+            if (calls[i].nr == SYS_clock_gettime)
+                result("  through the vDSO", clock_gettime(CLOCK_MONOTONIC, &ts));
+            _exit(0);
+        }
+        wait_for(pid);
+    }
+}
+
 static void inherit(void)
 {
     printf("== inheritance and tsync\n");
@@ -662,6 +734,48 @@ static void trace(void)
             ptrace(PTRACE_SYSCALL, pid, 0, 0);
     }
     ptrace(PTRACE_CONT, pid, 0, 0);
+    printf("end: %s\n", describe(wait_for(pid)));
+
+    /* 用 PTRACE_CONT 继续到 seccomp 的停止，再改用 PTRACE_SYSCALL：与 arm64 Linux 一样出口也停
+       （strace --seccomp-bpf 这样拿返回值）；跳过的系统调用在出口给返回值 */
+    pid = fork();
+    if (pid == 0) {
+        pid_t parent = getppid();
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        install(SYS_getppid, RET_TRACE | 2, 0);
+        raise(SIGSTOP);
+        long a = syscall(SYS_getppid);
+        long b = syscall(SYS_getppid);
+        printf("  child: getppid %s, then %ld\n", a == parent ? "real" : "changed", b);
+        _exit(0);
+    }
+    wait_for(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    for (int i = 0; i < 2; i++) {
+        printf("stop: %s\n", describe(wait_for(pid)));
+        if (i == 1) {
+            int nr = -1;
+            struct iovec iov = {&nr, sizeof nr};
+            ptrace(PTRACE_SETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov);
+        }
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        st = wait_for(pid);
+        struct __ptrace_syscall_info info = {0};
+        ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof info, &info);
+        if (i == 0) {
+            printf("stop: %s, op %d, rval is the tracer %d\n", describe(st), info.op,
+                   info.exit.rval == getpid());
+        } else {
+            printf("stop: %s, op %d\n", describe(st), info.op);
+            unsigned long long regs[34];
+            struct iovec riov = {regs, sizeof regs};
+            ptrace(PTRACE_GETREGSET, pid, 1, &riov);
+            regs[0] = 66;
+            ptrace(PTRACE_SETREGSET, pid, 1, &riov);
+        }
+        ptrace(PTRACE_CONT, pid, 0, 0);
+    }
     printf("end: %s\n", describe(wait_for(pid)));
 }
 
@@ -890,6 +1004,110 @@ static void killable(void)
     close(report[0]);
 }
 
+/* ADDFD：监管进程把自己的 fd 装进对方的 fd 表。子进程那一边 */
+static void addfd_child(int sock)
+{
+    int null = open("/dev/null", O_RDONLY);
+    dup2(null, 50);
+    close(null);
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    int listener = install(SYS_getppid, RET_USER_NOTIF, FLAG_NEW_LISTENER);
+    send_fd(sock, listener);
+    close(listener);
+    close(sock);
+    long fd = syscall(SYS_getppid);
+    reportf("got fd %ld", fd);
+    reportf(", wrote %ld\n", write(fd, "hello", 5));
+    close(fd);
+    fd = syscall(SYS_getppid);
+    char link[64] = {0};
+    readlink("/proc/self/fd/50", link, sizeof link - 1);
+    reportf("setfd and send: %ld", fd);
+    reportf(", close-on-exec %ld", fcntl(50, F_GETFD) & FD_CLOEXEC);
+    reportf(", a pipe %ld\n", !strncmp(link, "pipe:", 5));
+    struct rlimit rl = {60, 60};
+    setrlimit(RLIMIT_NOFILE, &rl);
+    reportf("after the limit: %ld\n", errno_or(syscall(SYS_getppid)));
+}
+
+static void addfd(void)
+{
+    printf("== addfd\n");
+    pipe(report);
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(report[0]);
+        close(sv[0]);
+        addfd_child(sv[1]);
+        _exit(0);
+    }
+    close(report[1]);
+    close(sv[1]);
+    int l = recv_fd(sv[0]);
+    close(sv[0]);
+    int p[2];
+    pipe(p);
+    struct seccomp_notif n = {0};
+    result("recv", ioctl(l, NOTIF_RECV, &n));
+    struct seccomp_notif_addfd a = {n.id + 1000, 0, p[1], 0, 0};
+    result("unknown id", ioctl(l, NOTIF_ADDFD, &a));
+    a.id = n.id;
+    a.flags = 4;
+    result("unknown flag", ioctl(l, NOTIF_ADDFD, &a));
+    a.flags = 0;
+    a.newfd = 7;
+    result("newfd without SETFD", ioctl(l, NOTIF_ADDFD, &a));
+    a.newfd = 0;
+    a.newfd_flags = O_NONBLOCK;
+    result("newfd_flags other than O_CLOEXEC", ioctl(l, NOTIF_ADDFD, &a));
+    a.newfd_flags = 0;
+    a.srcfd = 999;
+    result("bad srcfd", ioctl(l, NOTIF_ADDFD, &a));
+    a.srcfd = p[1];
+    result("shorter struct", ioctl(l, NOTIF_ADDFD_SIZE(16), &a));
+    struct {
+        struct seccomp_notif_addfd a;
+        uint64_t tail;
+    } longer = {a, 1};
+    result("longer struct, nonzero tail", ioctl(l, NOTIF_ADDFD_SIZE(32), &longer));
+    longer.tail = 0;
+    long fd = ioctl(l, NOTIF_ADDFD_SIZE(32), &longer);
+    result("longer struct, zero tail", fd);
+    struct seccomp_notif_resp resp = {n.id, fd, 0, 0};
+    ioctl(l, NOTIF_SEND, &resp);
+    report_line();
+    char buf[8] = {0};
+    read(p[0], buf, 5);
+    printf("  read from the pipe: %s\n", buf);
+    /* SETFD 换掉 50 上的 /dev/null，SEND 同时回答 */
+    memset(&n, 0, sizeof n);
+    ioctl(l, NOTIF_RECV, &n);
+    a = (struct seccomp_notif_addfd){n.id, ADDFD_FLAG_SETFD | ADDFD_FLAG_SEND, p[1], 50, O_CLOEXEC};
+    result("setfd and send", ioctl(l, NOTIF_ADDFD, &a));
+    report_line();
+    /* 受对方的 RLIMIT_NOFILE 限制：SETFD 超出是 EBADF，装满之后是 EMFILE */
+    memset(&n, 0, sizeof n);
+    ioctl(l, NOTIF_RECV, &n);
+    a = (struct seccomp_notif_addfd){n.id, ADDFD_FLAG_SETFD, p[1], 70, 0};
+    result("setfd past the limit", ioctl(l, NOTIF_ADDFD, &a));
+    a.flags = 0;
+    a.newfd = 0;
+    long last = -1, r;
+    while ((r = ioctl(l, NOTIF_ADDFD, &a)) >= 0)
+        last = r;
+    printf("addfd until full: last fd %ld, then %s\n", last, strerror(errno));
+    resp = (struct seccomp_notif_resp){n.id, 0, -EPERM, 0};
+    ioctl(l, NOTIF_SEND, &resp);
+    report_line();
+    printf("child: %s\n", describe(wait_for(pid)));
+    close(p[0]);
+    close(p[1]);
+    close(l);
+    close(report[0]);
+}
+
 /* 关闭最后一个 listener：已经挂起的调用和之后的调用都得到 ENOSYS。 */
 static void close_listener(void)
 {
@@ -932,12 +1150,22 @@ int main(void)
     strict();
     checks();
     actions();
+    fast_path();
     inherit();
     trace();
     notif();
+    addfd();
     close_listener();
     killable();
     return 0;
 }
 C
 gcc -O1 -o sc sc.c -lpthread && timeout 120 ./sc
+
+# strace --seccomp-bpf：只在要看的系统调用上停（PTRACE_EVENT_SECCOMP），停住时改用
+# PTRACE_SYSCALL 拿到出口的返回值。pid 在两边不同，去掉
+echo "some text" > text
+env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -f --seccomp-bpf -e trace=openat,close -e signal=none \
+    -o st sh -c 'cat text >/dev/null; head -c1 text >/dev/null'
+echo "strace: $?"
+sed -E 's/^[0-9]+ +//' st

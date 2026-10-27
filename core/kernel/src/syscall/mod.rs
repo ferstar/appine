@@ -106,8 +106,12 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             crate::seccomp::Verdict::Exit => return Flow::Exit,
         }
     }
-    if (traced || filtered) && nr == NO_SYSCALL {
-        if traced && !crate::ptrace::syscall_exit(cx, cpu) {
+    // 出口停不停与 arm64 Linux 一样看出口时的跟踪状态（syscall_trace_exit 重新读标志）：
+    // 跟踪者在 PTRACE_EVENT_SECCOMP 停住时改用 PTRACE_SYSCALL 继续的，出口也停
+    // （strace --seccomp-bpf 这样拿返回值）
+    let exit_stop = traced || filtered;
+    if exit_stop && nr == NO_SYSCALL {
+        if !crate::ptrace::syscall_exit(cx, cpu) {
             return Flow::Exit;
         }
         return signal::deliver(cx, cpu, true);
@@ -497,7 +501,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let sync = cx.task.sync.clone();
     cx.mm_mut().sync(&sync);
     // PTRACE_SYSCALL：出口停下，跟踪者看到返回值；单步执行的 svc 在这里报告
-    if traced && !crate::ptrace::syscall_exit(cx, cpu) {
+    if exit_stop && !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
     crate::ptrace::syscall_stepped(cx);
