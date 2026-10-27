@@ -1,6 +1,6 @@
 # M9 之前：cgroup 的 memory.stat（2026-10-28）
 
-← [M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）](66-aio-destroy.md) · [索引](../milestones.md)
+← [M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）](66-aio-destroy.md) · [索引](../milestones.md) · [M9 之前：/proc/meminfo 照搬宿主的（2026-10-28）](68-meminfo.md) →
 
 [负载普查](62-workload-survey.md)的问题 5：另一个 guest 进程占着 400 MB 时，.NET 的 GC 报告的内存负载仍是 39 MiB，`memory.current` 却已经 543 MB。几个进程一起把内存用到 OOM killer 的上限时，.NET 不会提前收紧堆，结果被结束的可能是它。
 

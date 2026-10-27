@@ -1767,3 +1767,35 @@ int main(void)
 }
 C
 gcc -O1 -o ptyown ptyown.c && ./ptyown
+
+# /proc/meminfo 和 sysinfo：照搬宿主的（两边是同一台宿主），可用量算上页缓存
+awk '/^MemTotal:/ { t = $2 } /^MemFree:/ { f = $2 } /^MemAvailable:/ { a = $2 } /^Cached:/ { c = $2 }
+    END { print "meminfo: total", t, "available >= free", (a >= f), "cached", (c > 0) }' /proc/meminfo
+cat > si.c <<'C'
+#include <stdio.h>
+#include <string.h>
+#include <sys/sysinfo.h>
+
+static unsigned long long field(const char *name)
+{
+    char line[128];
+    unsigned long long kb = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, name, strlen(name)) && line[strlen(name)] == ':')
+            sscanf(line + strlen(name) + 1, "%llu", &kb);
+    fclose(f);
+    return kb * 1024;
+}
+
+int main(void)
+{
+    struct sysinfo si;
+    sysinfo(&si);
+    unsigned long long u = si.mem_unit;
+    printf("sysinfo: totalram %d, totalswap %d, bufferram %d, sharedram %d\n", si.totalram * u == field("MemTotal"),
+           si.totalswap * u == field("SwapTotal"), si.bufferram > 0, si.sharedram > 0);
+    return 0;
+}
+C
+gcc -O1 -o si si.c && ./si

@@ -861,16 +861,28 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
 
 pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     let (uptime, _) = appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME).map_err(Errno)?;
-    let (total, free) = appine_hal::memory_info();
+    let m = appine_hal::host_meminfo();
     let procs = cx.kr().tasks.len().min(u16::MAX as usize) as u16;
-    // struct sysinfo（64 位）：uptime、loads[3]、totalram…freeswap、procs、totalhigh、freehigh、mem_unit
+    // struct sysinfo（64 位）：uptime、loads[3]、totalram、freeram、sharedram、bufferram、
+    // totalswap、freeswap、procs、totalhigh、freehigh、mem_unit；与 /proc/meminfo 一样照搬宿主的
     let mut b = [0u8; 112];
     b[..8].copy_from_slice(&uptime.to_le_bytes());
     for (i, load) in crate::loadavg::sysinfo_loads(cx.kr()).iter().enumerate() {
         b[8 + i * 8..16 + i * 8].copy_from_slice(&load.to_le_bytes());
     }
-    b[32..40].copy_from_slice(&total.to_le_bytes());
-    b[40..48].copy_from_slice(&free.to_le_bytes());
+    for (i, v) in [
+        m.total,
+        m.free,
+        m.shmem,
+        m.buffers,
+        m.swap_total,
+        m.swap_free,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        b[32 + i * 8..40 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
     b[80..82].copy_from_slice(&procs.to_le_bytes());
     b[104..108].copy_from_slice(&1u32.to_le_bytes());
     put(cx, buf, b).map(|()| 0)

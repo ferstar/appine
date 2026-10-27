@@ -1740,26 +1740,28 @@ fn cpuinfo() -> String {
     s
 }
 
+/// `/proc/meminfo`：照搬宿主的（与 docker 的容器一样），guest 能用的上限另见 cgroup 的
+/// `memory.max`。原来按 sysinfo 算，`MemAvailable` 就是 `MemFree`，页缓存都算作已用。
 fn meminfo() -> String {
-    let (total, free) = appine_hal::memory_info();
+    let m = appine_hal::host_meminfo();
     let mut s = String::new();
     for (name, bytes) in [
-        ("MemTotal", total),
-        ("MemFree", free),
-        ("MemAvailable", free),
-        ("Buffers", 0),
-        ("Cached", 0),
-        ("SwapCached", 0),
-        ("Active", 0),
-        ("Inactive", 0),
-        ("SwapTotal", 0),
-        ("SwapFree", 0),
-        ("Dirty", 0),
-        ("AnonPages", total - free),
-        ("Mapped", 0),
-        ("Shmem", 0),
-        ("Slab", 0),
-        ("SReclaimable", 0),
+        ("MemTotal", m.total),
+        ("MemFree", m.free),
+        ("MemAvailable", m.available),
+        ("Buffers", m.buffers),
+        ("Cached", m.cached),
+        ("SwapCached", m.swap_cached),
+        ("Active", m.active),
+        ("Inactive", m.inactive),
+        ("SwapTotal", m.swap_total),
+        ("SwapFree", m.swap_free),
+        ("Dirty", m.dirty),
+        ("AnonPages", m.anon_pages),
+        ("Mapped", m.mapped),
+        ("Shmem", m.shmem),
+        ("Slab", m.slab),
+        ("SReclaimable", m.sreclaimable),
     ] {
         writeln!(s, "{:<16}{:>8} kB", format!("{name}:"), bytes / 1024).unwrap();
     }

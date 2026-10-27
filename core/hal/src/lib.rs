@@ -526,6 +526,91 @@ pub fn memory_info() -> (u64, u64) {
     ((pages.max(0) as u64) * page_size() as u64, 0)
 }
 
+/// 宿主 `/proc/meminfo` 的几项（字节），guest 的 `/proc/meminfo` 和 sysinfo 照搬它们，与
+/// docker 的容器看到的一样。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemInfo {
+    pub total: u64,
+    pub free: u64,
+    pub available: u64,
+    pub buffers: u64,
+    pub cached: u64,
+    pub swap_cached: u64,
+    pub active: u64,
+    pub inactive: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+    pub dirty: u64,
+    pub anon_pages: u64,
+    pub mapped: u64,
+    pub shmem: u64,
+    pub slab: u64,
+    pub sreclaimable: u64,
+}
+
+/// 宿主的内存状况：读 `/proc/meminfo`。读不了时（宿主不让读）只有 sysinfo 给得出的几项，
+/// 可用量按空闲加缓冲区估计。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::unnecessary_cast)] // unsigned long 在 32 位宿主上是 32 位
+pub fn host_meminfo() -> MemInfo {
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+                .and_then(|v| v.trim().strip_suffix("kB"))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(0, |kb| kb * 1024)
+        };
+        let total = field("MemTotal");
+        if total != 0 {
+            return MemInfo {
+                total,
+                free: field("MemFree"),
+                available: field("MemAvailable"),
+                buffers: field("Buffers"),
+                cached: field("Cached"),
+                swap_cached: field("SwapCached"),
+                active: field("Active"),
+                inactive: field("Inactive"),
+                swap_total: field("SwapTotal"),
+                swap_free: field("SwapFree"),
+                dirty: field("Dirty"),
+                anon_pages: field("AnonPages"),
+                mapped: field("Mapped"),
+                shmem: field("Shmem"),
+                slab: field("Slab"),
+                sreclaimable: field("SReclaimable"),
+            };
+        }
+    }
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } < 0 {
+        return MemInfo::default();
+    }
+    let unit = info.mem_unit.max(1) as u64;
+    let free = info.freeram as u64 * unit;
+    let buffers = info.bufferram as u64 * unit;
+    MemInfo {
+        total: info.totalram as u64 * unit,
+        free,
+        available: free + buffers,
+        buffers,
+        swap_total: info.totalswap as u64 * unit,
+        swap_free: info.freeswap as u64 * unit,
+        shmem: info.sharedram as u64 * unit,
+        ..MemInfo::default()
+    }
+}
+
+/// 宿主的内存状况：只知道物理内存的总量。
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn host_meminfo() -> MemInfo {
+    MemInfo {
+        total: memory_info().0,
+        ..MemInfo::default()
+    }
+}
+
 /// 在宿主 fd 上等待事件：`fds` 的每一项是 (fd, events, revents)，`timeout` 为 None 时一直等。
 /// 返回就绪的 fd 数；被宿主信号打断时返回 `EINTR`。
 pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<usize, i32> {
