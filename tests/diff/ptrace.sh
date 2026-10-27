@@ -150,8 +150,11 @@ static void syscalls(void)
             } else if (last == SYS_getppid && getppids == 3) {
                 g.x[0] = 1234;
                 regs(pid, &g, 1);
-                printf("detach %ld\n", ptrace(PTRACE_DETACH, pid, 0, 0));
-                printf("end: %s\n", describe(wait_for(pid)));
+                /* 子进程放开之后马上打印自己那一行：等它退出再打印，两行的先后才固定 */
+                r = ptrace(PTRACE_DETACH, pid, 0, 0);
+                st = wait_for(pid);
+                printf("detach %ld\n", r);
+                printf("end: %s\n", describe(st));
                 break;
             } else if (last == SYS_kill) {
                 printf("exit of the skipped kill: rval %lld error %d\n", (long long)info.exit.rval, info.exit.is_error);
