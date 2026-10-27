@@ -29,7 +29,7 @@
   之前 Node.js 的堆上限比 guest 能用的还大。`java -XshowSettings:system` 报告 `Provider: cgroupv2`，Memory Limit 是上限，`process.constrainedMemory()` 也是。
 - **测试**：新的差分测试 `cgroup`（第 19 组），比对：
   - `/proc/<pid>/cgroup`、`/proc/cgroups` 的这五个控制器、挂载的那一行和 statfs；
-  - 与宿主无关的文件的权限和内容，取决于宿主的文件（memory.max、用量、pid）的权限和格式；
+  - 与宿主无关的文件的权限和内容，取决于宿主的文件（memory.max、pids.max、用量、pid）的权限和格式。CI 的宿主内核比 6.1 新：cgroup.stat、memory.events、cpu.stat 多了项（`nr_subsys_*`、`sock_throttled`、`nice_usec`），`memory.peak` 可写（6.12 起），容器的 `pids.max` 有限制。这些只比 6.1 就有的部分；
   - 写、建、删、改权限都是 EROFS；
   - JVM（`OperatingSystemMXBean.getTotalMemorySize`）、Node.js（`process.constrainedMemory`）看到的上限与 `memory.max` 一致：原生一侧 docker 没有设 `--memory`，`memory.max` 是 max，两者都是物理内存。
 

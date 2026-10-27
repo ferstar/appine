@@ -13,28 +13,38 @@ stat -c '%A %n' /sys/fs/cgroup
 for c in cpuset cpu memory pids; do
     grep -qw $c cgroup.controllers && echo "controller $c"
 done
-# 内容与宿主无关的文件
-for f in cgroup.events cgroup.freeze cgroup.max.depth cgroup.max.descendants cgroup.stat \
+# 内容与宿主无关的文件。appine 报告 6.1，新内核在 cgroup.stat、memory.events、cpu.stat 里
+# 多了项（nr_subsys_*、sock_throttled、nice_usec），这几个只比 6.1 就有的
+for f in cgroup.events cgroup.freeze cgroup.max.depth cgroup.max.descendants \
     cgroup.subtree_control cgroup.type cpu.idle cpu.max cpu.max.burst cpu.weight \
     cpu.weight.nice cpuset.cpus cpuset.cpus.effective cpuset.cpus.partition cpuset.mems \
-    cpuset.mems.effective memory.events memory.events.local memory.high memory.low memory.min \
-    memory.oom.group memory.swap.current memory.swap.events memory.swap.high pids.events \
-    pids.max; do
+    cpuset.mems.effective memory.high memory.low memory.min memory.oom.group \
+    memory.swap.current memory.swap.events memory.swap.high pids.events; do
     echo "$(stat -c %A $f) $f: $(tr '\n' '|' < $f)"
 done
-# 取决于宿主和当时的状态的：只比格式
-for f in cgroup.controllers cgroup.procs cgroup.threads memory.current memory.max memory.peak \
-    memory.swap.max pids.current cpu.stat; do
+echo "$(stat -c %A cgroup.stat) cgroup.stat: $(grep -E '^nr_(dying_)?descendants ' cgroup.stat | tr '\n' '|')"
+for f in memory.events memory.events.local; do
+    echo "$(stat -c %A $f) $f: $(grep -E '^(low|high|max|oom|oom_kill|oom_group_kill) ' $f | tr '\n' '|')"
+done
+for k in usage_usec user_usec system_usec nr_periods nr_throttled throttled_usec nr_bursts \
+    burst_usec; do
+    grep -q "^$k " cpu.stat && printf '%s ' $k
+done
+echo
+# 取决于宿主和当时的状态的：只比格式（6.12 起 memory.peak 可写，不比它的权限；容器的
+# pids.max 可能有限制）
+for f in cgroup.controllers cgroup.procs cgroup.threads memory.current memory.max \
+    memory.swap.max pids.current pids.max cpu.stat; do
     echo "$(stat -c %A $f) $f"
 done
 for f in memory.current memory.peak pids.current; do
     grep -qxE '[0-9]+' $f && echo "$f is a number"
 done
-grep -qxE '[0-9]+|max' memory.max && echo "memory.max is a number or max"
+for f in memory.max pids.max; do
+    grep -qxE '[0-9]+|max' $f && echo "$f is a number or max"
+done
 grep -qx $$ cgroup.procs && echo "the shell is in cgroup.procs"
 grep -qx $$ cgroup.threads && echo "the shell is in cgroup.threads"
-grep -v core_sched cpu.stat | cut -d ' ' -f 1 | tr '\n' ' '
-echo
 # 只读的挂载：写文件、建文件和子 cgroup、删除、改权限都是 EROFS
 echo 1 > cgroup.freeze
 echo 1 > memory.current
@@ -57,7 +67,7 @@ J
 jvm=$(java /tmp/Mem.java)
 if [ "$limit" = max ]; then want=$total; else want=$limit; fi
 [ "$jvm" = "$want" ] && echo "the JVM sees the limit" || echo "the JVM sees $jvm, not $want"
-java -XshowSettings:system -version 2>&1 | grep -E 'Provider|CPU Period|CPU Quota|CPU Shares|Maximum Processes'
+java -XshowSettings:system -version 2>&1 | grep -E 'Provider|CPU Period|CPU Quota|CPU Shares'
 node -e '
 const m = require("fs").readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
 const c = process.constrainedMemory();
