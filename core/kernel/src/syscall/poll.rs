@@ -274,9 +274,10 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
 }
 
 /// 等打开文件 `f` 的就绪状态变化时要登记的唤醒对象（[`wake::of`]）。改变进程内对象
-/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求整个通道（关闭文件、信号和
-/// signalfd、pidfd、POSIX 消息队列、netlink、DNS 存根的回答仍是这样）；宿主 fd 由宿主
-/// poll 等。epoll 只列出它自己（epoll_ctl），里面的关注由 [`Waits`] 逐个加上。
+/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求整个通道（关闭文件、挂起的
+/// 信号、pidfd、POSIX 消息队列、netlink、DNS 存根的回答仍是这样）；宿主 fd 由宿主 poll
+/// 等。signalfd 只列出它自己（改掩码），epoll 只列出它自己（epoll_ctl），里面的关注由
+/// [`Waits`] 逐个加上。
 fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
     match &f.kind {
         FileKind::Pipe(end) => out.push(crate::pipe::object(&end.pipe)),
@@ -284,6 +285,7 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
         FileKind::EventFd(e) => out.push(wake::of(e)),
         FileKind::TimerFd(t) => out.push(wake::of(t)),
         FileKind::Inotify(i) => out.push(wake::of(i)),
+        FileKind::SignalFd(s) => out.push(wake::of(s)),
         FileKind::Epoll(ep) => out.push(wake::of(ep)),
         FileKind::Socket(s) => super::net::wake_objects(&s.borrow(), out),
         _ => {}

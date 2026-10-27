@@ -7,7 +7,7 @@ use crate::cred::{SECBIT_KEEP_CAPS, cap};
 use crate::errno::Errno;
 use crate::futex::Key;
 use crate::itimer::{CpuTimer, ITimer};
-use crate::kernel::{Cx, request_wake};
+use crate::kernel::Cx;
 use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Rusage, Signal};
 use crate::uaccess::UserSlice;
 
@@ -377,8 +377,8 @@ pub(super) fn setitimer(cx: &mut Cx<'_>, which: i32, new: u64, old: u64) -> SysR
                 interval: interval.as_nanos() as u64,
             });
     }
-    // 让定时器线程重新计算等待时间
-    request_wake();
+    // 让定时器线程重新计算等待时间。只叫醒它：原来叫醒所有等待者
+    crate::kernel::signal_later(&cx.shared.timers);
     Ok(0)
 }
 

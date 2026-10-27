@@ -1,6 +1,7 @@
-# 等待和唤醒：别的进程在别的管道、socket、eventfd、PTY 上来回读写，起进程、结束进程，
-# 改别的 epoll、timerfd、inotify 时，空闲着等自己的对象的进程不被叫醒（自愿上下文切换
-# 的次数不变）；每一种对象上真正的事件都叫醒另一个进程里等着的线程
+# 等待和唤醒：别的进程在别的管道、socket、eventfd、PTY 上来回读写，起进程（含 vfork、
+# posix_spawn）、结束进程，改别的 epoll、timerfd、inotify、signalfd，设定时器时，空闲着
+# 等自己的对象的进程不被叫醒（自愿上下文切换的次数不变）；每一种对象上真正的事件都叫醒
+# 另一个进程里等着的线程，vfork 的父进程、改短了的定时器照常
 set -e
 rm -rf /tmp/wakeups.d /tmp/wakeups.idle
 mkdir -p /tmp/wakeups.d /tmp/wakeups.idle
@@ -10,15 +11,20 @@ cat > wakeups.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -208,6 +214,42 @@ static void traffic(void)
         unlink(name);
     }
     close(in);
+
+    /* posix_spawn（musl、glibc 都用 CLONE_VFORK）和 vfork 之后直接退出 */
+    char *args[] = {"/bin/true", NULL};
+    for (int i = 0; i < 30; i++) {
+        pid_t p;
+        posix_spawn(&p, "/bin/true", NULL, NULL, args, environ);
+        waitpid(p, NULL, 0);
+        if ((p = vfork()) == 0)
+            _exit(0);
+        waitpid(p, NULL, 0);
+    }
+
+    /* 设定时器（都远在之后，最后取消） */
+    struct itimerval far = {.it_value = {3600, 0}}, off = {{0, 0}, {0, 0}};
+    struct sigevent sev = {.sigev_notify = SIGEV_NONE};
+    timer_t timer;
+    timer_create(CLOCK_MONOTONIC, &sev, &timer);
+    struct itimerspec later = {.it_value = {3600, 0}};
+    for (int i = 0; i < 200; i++) {
+        setitimer(ITIMER_REAL, &far, NULL);
+        timer_settime(timer, 0, &later, NULL);
+    }
+    setitimer(ITIMER_REAL, &off, NULL);
+    timer_delete(timer);
+
+    /* 改自己的 signalfd 的掩码 */
+    sigset_t set;
+    sigemptyset(&set);
+    int sfd = signalfd(-1, &set, 0);
+    for (int i = 0; i < 50; i++) {
+        sigaddset(&set, SIGUSR2);
+        signalfd(sfd, &set, 0);
+        sigemptyset(&set);
+        signalfd(sfd, &set, 0);
+    }
+    close(sfd);
 }
 
 static void idle_waiters(void)
@@ -216,8 +258,10 @@ static void idle_waiters(void)
     pipe(ready);
     pid_t pids[NIDLE];
     for (int i = 0; i < NIDLE; i++)
-        if ((pids[i] = fork()) == 0)
+        if ((pids[i] = fork()) == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGKILL); /* 卡住被结束时不留下它们 */
             idle(i, ready[1]);
+        }
     char c;
     for (int i = 0; i < NIDLE; i++)
         read(ready[0], &c, 1);
@@ -356,6 +400,89 @@ static void kill_sleeper(void)
 }
 
 static void closefds(void) { close(fds[0]), close(fds[1]); }
+static void nothing(void) {}
+
+/* vfork：子进程 exec 或者过一会儿退出之后父进程继续。卡住时 SIGALRM 结束这个进程（vfork
+ * 的等待只有致命信号能打断） */
+static int vfork_exec(void)
+{
+    signal(SIGALRM, SIG_DFL);
+    pid_t p = vfork();
+    if (p == 0) {
+        execl("/bin/true", "true", (char *)NULL);
+        _exit(1);
+    }
+    int st;
+    return waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+static int vfork_exit_later(void)
+{
+    signal(SIGALRM, SIG_DFL);
+    pid_t p = vfork();
+    if (p == 0) {
+        usleep(100000);
+        _exit(7);
+    }
+    int st;
+    return waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 7;
+}
+
+/* 定时器先设 10 秒、再改成 100 毫秒：定时器线程要按新的时刻醒来 */
+static volatile int fired;
+static void on_fire(int sig) { (void)sig, fired = 1; }
+static int itimer_shortened(void)
+{
+    struct sigaction sa = {.sa_handler = on_fire};
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = {.it_value = {10, 0}};
+    setitimer(ITIMER_REAL, &it, NULL);
+    it.it_value = (struct timeval){0, 100000};
+    setitimer(ITIMER_REAL, &it, NULL);
+    while (!fired)
+        pause();
+    return 1;
+}
+static int posix_timer_shortened(void)
+{
+    struct sigaction sa = {.sa_handler = on_fire};
+    sigaction(SIGUSR1, &sa, NULL);
+    struct sigevent sev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+    timer_t t;
+    timer_create(CLOCK_MONOTONIC, &sev, &t);
+    struct itimerspec it = {.it_value = {10, 0}};
+    timer_settime(t, 0, &it, NULL);
+    it.it_value = (struct timespec){0, 100000000};
+    timer_settime(t, 0, &it, NULL);
+    while (!fired)
+        pause();
+    return 1;
+}
+
+/* 一个线程 poll 掩码是空的 signalfd（进程挂着 SIGUSR2），另一个线程改掩码 */
+static int sfd;
+static void *poll_sfd(void *arg)
+{
+    (void)arg;
+    return (void *)(long)pollin(sfd);
+}
+static int signalfd_mask(void)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    kill(getpid(), SIGUSR2); /* 发给进程：两个线程都看得到 */
+    sigset_t none;
+    sigemptyset(&none);
+    sfd = signalfd(-1, &none, 0);
+    pthread_t t;
+    pthread_create(&t, NULL, poll_sfd, NULL);
+    usleep(100000);
+    signalfd(sfd, &set, 0);
+    void *r;
+    pthread_join(t, &r);
+    return r != NULL;
+}
 
 static void wake_cases(void)
 {
@@ -433,16 +560,22 @@ static void wake_cases(void)
     pidfd = syscall(SYS_pidfd_open, sleeper, 0);
     check("poll pidfd", poll_pidfd, kill_sleeper);
     close(pidfd);
+
+    check("vfork (exec)", vfork_exec, nothing);
+    check("vfork (exit later)", vfork_exit_later, nothing);
+    check("setitimer (shortened)", itimer_shortened, nothing);
+    check("timer_settime (shortened)", posix_timer_shortened, nothing);
+    check("poll signalfd (mask)", signalfd_mask, nothing);
 }
 
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    alarm(300); /* 漏了唤醒、卡住时结束，不让差分测试一直等 */
+    alarm(120); /* 漏了唤醒、卡住时结束，不让差分测试一直等 */
     idle_waiters();
     wake_cases();
     return 0;
 }
 C
-gcc -O1 -o wakeups wakeups.c
+gcc -O1 -o wakeups wakeups.c -lpthread
 ./wakeups

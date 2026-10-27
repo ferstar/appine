@@ -296,7 +296,8 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
             return Err(Errno::EINVAL);
         };
         s.borrow_mut().mask = set;
-        crate::kernel::request_wake();
+        // 等这个 signalfd 的线程按新的掩码重新检查（poll 登记了它）
+        crate::kernel::request_wake_object(crate::kernel::wake::of(s));
         return Ok(fd as u64);
     }
     let s = SignalFd {

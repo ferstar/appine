@@ -18,7 +18,7 @@ use appine_hal::Event;
 use crate::bug::Trap;
 use crate::errno::Errno;
 use crate::fd::FdTable;
-use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake, request_wake_on, wake};
+use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake_on, wake};
 use crate::mm::{Generations, Mm};
 use crate::process::{CpuTime, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
@@ -136,8 +136,8 @@ pub(crate) struct TaskState {
     pub altstack: AltStack,
     /// 线程退出时清零并 futex 唤醒的地址（`set_tid_address`、`CLONE_CHILD_CLEARTID`）。
     pub clear_child_tid: u64,
-    /// vfork 的子进程：execve 或退出时置位，让父进程继续。
-    pub vfork_done: Option<Rc<Cell<bool>>>,
+    /// vfork 的子进程：execve 或退出时置位，并直接叫醒父进程（它的事件）让它继续。
+    pub vfork_done: Option<(Rc<Cell<bool>>, Arc<Event>)>,
     /// 被信号打断的 nanosleep 剩下的部分（`restart_syscall`）：到期时刻和 `rem` 的地址。
     pub restart: Option<(std::time::Instant, u64)>,
     /// 不持 BKL 的 nanosleep（`syscall::fast`）还没睡够就被叫醒，交给持锁的路径：原来的
@@ -663,9 +663,11 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
         }
     }
     drop(futexes);
-    if let Some(done) = st.vfork_done.take() {
+    // 父进程只等直接的通知：原来叫醒所有等待者，每次 posix_spawn（musl、glibc 都用
+    // CLONE_VFORK）都把读着管道、停在 poll 里的线程叫醒一遍
+    if let Some((done, parent)) = st.vfork_done.take() {
         done.set(true);
-        request_wake();
+        crate::kernel::signal_later(&parent);
     }
     st.mm.borrow_mut().remove_user(&task.sync);
 }

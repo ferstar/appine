@@ -1,6 +1,6 @@
 # M9 之前：Tier 1 里的观察点（2026-10-27）
 
-← [M9 之前：按对象唤醒（2026-10-27）](49-targeted-wakeups.md) · [索引](../milestones.md)
+← [M9 之前：按对象唤醒（2026-10-27）](49-targeted-wakeups.md) · [索引](../milestones.md) · [M9 之前：起进程和设定时器不再叫醒所有人（2026-10-27）](51-spawn-timer-wakeups.md) →
 
 [硬件断点和观察点](44-hw-watchpoints.md)那一轮让有断点或观察点的线程整个用解释器执行，比 Tier 1 慢一个数量级（sha256sum 加 gzip 2 MB：Tier 0 2.8 秒，Tier 1 0.11 秒）。gdb 的 `watch` 最常见的用法是在程序跑了一阵之后等某个变量被改，这段时间全在解释器里。这一轮让有观察点的线程照常用 Tier 1，只把被观察的页上的访问交给解释器（§4.2、§7.6）。
 

@@ -323,7 +323,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         } else {
             0
         },
-        vfork_done: vfork_done.clone(),
+        vfork_done: vfork_done.clone().map(|d| (d, cx.task.event.clone())),
         restart: None,
         fast_sleep: None,
     };
@@ -388,10 +388,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     {
         return Ok(tid as u64);
     }
-    // vfork：等子进程 execve 或退出；只有致命信号能打断（Linux 的 TASK_KILLABLE）
+    // vfork：等子进程 execve 或退出；只有致命信号能打断（Linux 的 TASK_KILLABLE）。两者都
+    // 直接叫醒这个线程（task::release_mm、signal::group_exit）
     if let Some(done) = vfork_done {
         while !done.get() && !cx.task.killed.get() {
-            cx.wait(None, &mut [])?;
+            cx.wait_alone(None)?;
         }
         crate::ptrace::event(cx, cpu, crate::ptrace::event::VFORK_DONE, tid as u64);
     }

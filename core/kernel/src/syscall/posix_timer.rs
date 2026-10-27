@@ -187,7 +187,8 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
     t.interval = interval;
     t.overrun = 0;
     cx.t.group.borrow_mut().posix_timers.insert(id, t);
-    crate::kernel::request_wake();
+    // 让定时器线程重新计算等待时间（只叫醒它）
+    crate::kernel::signal_later(&cx.shared.timers);
     Ok(0)
 }
 

@@ -59,6 +59,7 @@
 | [M9 之前：独占的唤醒](rounds/48-exclusive-wakeup.md) | 2026-10-27 | `EPOLLEXCLUSIVE` 的文件上来了新的边沿只叫醒一个等待者（定时器线程替它们看），没轮到的进程不醒；`/proc/<pid>/status` 的上下文切换次数取宿主线程的 |
 | [M9 之前：按对象唤醒](rounds/49-targeted-wakeups.md) | 2026-10-27 | poll、epoll 和阻塞的读写只被它们等的管道、PTY、eventfd、timerfd、inotify、epoll、AF_UNIX 连接上的修改叫醒（原来系统里每次读写都叫醒所有 poll、epoll 的等待者），关闭文件、进程退出不再广播；修了 `timerfd_settime` 不叫醒等它的线程 |
 | [M9 之前：Tier 1 里的观察点](rounds/50-watchpoints-tier1.md) | 2026-10-27 | 有硬件观察点的线程照常用 Tier 1，只有被观察的页上的访问交给解释器（被观察的页不进 TLB）；gdb 里用 `watch` 等变量被写从 10.8 秒降到 0.45 秒 |
+| [M9 之前：起进程和设定时器不再叫醒所有人](rounds/51-spawn-timer-wakeups.md) | 2026-10-27 | vfork（`posix_spawn`）的子进程 execve 或退出时只叫醒父进程，setitimer、timer_settime 只叫醒定时器线程，signalfd 改掩码只叫醒等它的线程；原来都叫醒所有等待者 |
 
 ## 测量条件
 
