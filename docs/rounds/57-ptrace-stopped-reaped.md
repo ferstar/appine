@@ -1,6 +1,6 @@
 # M9 之前：跟踪停住的进程、跟踪者先取走结束（2026-10-27）
 
-← [M9 之前：被屏蔽的信号只叫醒等它的线程（2026-10-27）](56-blocked-signals.md) · [索引](../milestones.md)
+← [M9 之前：被屏蔽的信号只叫醒等它的线程（2026-10-27）](56-blocked-signals.md) · [索引](../milestones.md) · [M9 之前：cgroup v2 的视图（2026-10-27）](58-cgroup.md) →
 
 [ptrace 的第一步](40-ptrace-strace.md)留下的两处与 Linux 不同的细节，都出在用 `strace -p`、gdb 的 attach 跟踪别人的进程时（§7.6）。
 

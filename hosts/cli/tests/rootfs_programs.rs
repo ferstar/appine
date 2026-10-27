@@ -1062,6 +1062,43 @@ fn oom_killer_honours_oom_score_adj() {
 }
 
 #[test]
+fn cgroup_memory_files_follow_the_oom_killer() {
+    // /sys/fs/cgroup/memory.max 是 --memory-limit 给的上限（none 时是 max）；OOM killer 结束了
+    // 进程之后 memory.events 记着，memory.peak 量到过超出上限的用量。只在 Tier 1 下跑，理由
+    // 同上
+    let Some(store) = store() else {
+        return;
+    };
+    let run = |limit: &str, script: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args([
+                "--tier",
+                "1",
+                "--memory-limit",
+                limit,
+                "--env",
+                PATH,
+                "--rootfs",
+            ])
+            .arg(store)
+            .args(["--", "/bin/sh", "-c", script])
+            .output()
+            .unwrap();
+        stdout(&out).to_owned()
+    };
+    let none = run("none", "cat /sys/fs/cgroup/memory.max");
+    assert_eq!(none, "max\n");
+    let script = "cd /sys/fs/cgroup; cat memory.max; grep oom_kill memory.events; \
+                  awk 'BEGIN { s = \"x\"; for (i = 0; i < 27; i++) s = s s; print length(s) }'; \
+                  echo awk $?; grep -E '^(max|oom|oom_kill) ' memory.events | sed 's/ [1-9][0-9]*$/ N/'; \
+                  [ $(cat memory.peak) -gt 134217728 ] && echo peak over the limit";
+    assert_eq!(
+        run("128M", script),
+        "134217728\noom_kill 0\nawk 137\nmax N\noom N\noom_kill N\npeak over the limit\n"
+    );
+}
+
+#[test]
 fn one_machine_runs_several_terminal_sessions() {
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
     let Some(store) = store() else {

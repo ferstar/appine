@@ -10,5 +10,5 @@
 
 **推迟项**：
 
-- `/sys/class`、`/sys/fs/cgroup` 仍没有，`cpu<n>/online` 仍是只读的。
+- `/sys/class`、`/sys/fs/cgroup` 仍没有，`cpu<n>/online` 仍是只读的。→ `/sys/fs/cgroup` 已补上，是只读的 cgroup v2（M9 之前：cgroup v2 的视图）；`/sys/class` 仍没有，`online` 仍是只读的
 - cpufreq 的文件不能写（Linux 上 root 可以改 `scaling_governor` 等），App 也改不了宿主的。

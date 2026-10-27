@@ -103,6 +103,7 @@ const ANON_DEV: u64 = 0xe;
 const PROC_DEV: u64 = 0x4;
 const DEVPTS_DEV: u64 = 0x18;
 const SYSFS_DEV: u64 = 0x16;
+const CGROUP_DEV: u64 = 0x1a;
 /// mqueue 文件系统的设备号。
 const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
@@ -111,6 +112,7 @@ const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const SYSFS_MAGIC: u64 = 0x6265_6572;
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 /// PTY 主设备的设备号（`/dev/ptmx`）。
 const PTMX_RDEV: u64 = rdev(5, 2);
 
@@ -259,10 +261,11 @@ fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
     f.ino().ok_or(Errno::EBADF)
 }
 
-/// 仓库里的 inode；合成文件系统里的节点不能修改。
+/// 仓库里的 inode；合成文件系统里的节点不能修改，只读挂载的 cgroup2 是 EROFS。
 fn store_ino(node: &Node) -> Result<Ino, Errno> {
     match node {
         Node::Store(ino) => Ok(*ino),
+        Node::Pseudo(p) if pseudo::mount_of(p) == Mount::Cgroup => Err(Errno::EROFS),
         Node::Pseudo(_) => Err(Errno::EACCES),
     }
 }
@@ -344,6 +347,7 @@ fn pseudo_dev(p: &PseudoNode) -> u64 {
         Mount::Proc => PROC_DEV,
         Mount::Pts => DEVPTS_DEV,
         Mount::Sys => SYSFS_DEV,
+        Mount::Cgroup => CGROUP_DEV,
     }
 }
 
@@ -935,6 +939,9 @@ fn open_pseudo(
     }
     if flags & oflags::O_DIRECTORY != 0 {
         return Err(Errno::ENOTDIR);
+    }
+    if accmode != oflags::O_RDONLY && pseudo::mount_of(&node) == Mount::Cgroup {
+        return Err(Errno::EROFS);
     }
     if accmode != oflags::O_RDONLY && !pseudo::writable(&node) {
         return Err(Errno::EACCES);
@@ -1760,6 +1767,7 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
             Mount::Proc => encode_statfs(PROC_SUPER_MAGIC, &empty),
             Mount::Pts => encode_statfs(DEVPTS_SUPER_MAGIC, &empty),
             Mount::Sys => encode_statfs(SYSFS_MAGIC, &empty),
+            Mount::Cgroup => encode_statfs(CGROUP2_SUPER_MAGIC, &empty),
         },
     })
 }

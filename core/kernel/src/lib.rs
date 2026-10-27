@@ -4,6 +4,7 @@
 //! 启动进程、开控制台（Android 的终端标签页、`appine-run`）。根文件系统是 inode 仓库。
 
 mod bug;
+mod cgroup;
 mod coredump;
 mod cred;
 mod debug;

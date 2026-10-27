@@ -13,7 +13,7 @@
 //! 在被发现之前还能多用几十 MB（Tier 1 下每秒能碰好几 GB 的新页），所以上限要留出余量。
 //! 结束一个进程之后，等它的线程都退出、内存还给宿主，再决定要不要结束下一个。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -37,19 +37,53 @@ const OOM_SCORE_ADJ_MIN: i32 = -1000;
 pub(crate) struct Oom {
     /// 上限（字节），`u64::MAX` 表示不限制。
     pub limit: u64,
+    /// 量到过的最大用量（`/sys/fs/cgroup/memory.peak`）。
+    pub peak: Cell<u64>,
+    /// 超出上限、要结束进程、结束了进程的次数（`/sys/fs/cgroup/memory.events`）。
+    pub events: Cell<Events>,
     /// 下一次检查的时刻；None 表示所有线程都在等待，停下来了。
     next: Option<Instant>,
     /// 最近结束的进程和结束它的时刻。
     victim: Option<(Weak<RefCell<ThreadGroup>>, Instant)>,
 }
 
+/// `memory.events` 里的计数：量到超出上限的次数，因此要挑进程结束的次数（上次挑中的
+/// 还没退完时不算），结束了的进程数。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Events {
+    pub max: u64,
+    pub oom: u64,
+    pub oom_kill: u64,
+}
+
 impl Default for Oom {
     fn default() -> Oom {
         Oom {
             limit: u64::MAX,
+            peak: Cell::new(0),
+            events: Cell::new(Events::default()),
             next: None,
             victim: None,
         }
+    }
+}
+
+impl Oom {
+    /// 现在 App 的内存用量（量不了时是 0），顺便记下峰值。
+    pub fn measure(&self) -> u64 {
+        let used = appine_hal::memory_footprint().unwrap_or(0);
+        self.note(used);
+        used
+    }
+
+    fn note(&self, used: u64) {
+        self.peak.set(self.peak.get().max(used));
+    }
+
+    fn count(&self, f: impl FnOnce(&mut Events)) {
+        let mut e = self.events.get();
+        f(&mut e);
+        self.events.set(e);
     }
 }
 
@@ -87,12 +121,14 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
         k.oom.limit = u64::MAX;
         return None;
     };
+    k.oom.note(used);
     let near = used > k.oom.limit / 4 * 3;
     k.oom.next = Some(now + if near { NEAR_INTERVAL } else { INTERVAL });
     // 刚退出的进程的内存在它放开 BKL 之后才交还宿主（mm::release_unmapped）
     if used <= k.oom.limit || crate::mm::UNMAPPING.load(Ordering::Acquire) != 0 {
         return k.oom.next;
     }
+    k.oom.count(|e| e.max += 1);
     // 上次挑中的进程还没退完：它的内存马上就会还回来。超时还没退完的（卡在宿主 I/O 里）
     // 不再等，也不再挑它
     let mut stuck = None;
@@ -108,6 +144,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     let Some((victim, rss)) = select(k, stuck.as_ref()) else {
         return k.oom.next;
     };
+    k.oom.count(|e| e.oom += 1);
     k.oom.victim = Some((Rc::downgrade(&victim), now));
     // 已经在退出（exit_group、致命信号）的不用再结束，与 Linux 一样等它退完
     if victim.borrow().exiting.is_none() {
@@ -131,6 +168,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
             core_dumped: false,
         };
         crate::signal::group_exit(k, &victim, status);
+        k.oom.count(|e| e.oom_kill += 1);
     }
     k.oom.next
 }

@@ -47,6 +47,8 @@ pub(crate) enum Mount {
     Pts,
     /// `/sys`。
     Sys,
+    /// `/sys/fs/cgroup`（只读的 cgroup2）：挂在 sysfs 里，不在仓库的目录上。
+    Cgroup,
 }
 
 impl Mount {
@@ -56,6 +58,7 @@ impl Mount {
             Mount::Proc => &[b"proc"],
             Mount::Pts => &[b"dev", b"pts"],
             Mount::Sys => &[b"sys"],
+            Mount::Cgroup => &[b"sys", b"fs", b"cgroup"],
         }
     }
 }
@@ -665,6 +668,7 @@ mod tests {
                 Mount::Proc => PseudoNode::ProcRoot,
                 Mount::Pts => PseudoNode::PtsRoot,
                 Mount::Sys => PseudoNode::SysRoot,
+                Mount::Cgroup => PseudoNode::Cgroup(b""),
             }
         }
         fn mount_of(&self, node: &PseudoNode) -> Mount {

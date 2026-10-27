@@ -45,9 +45,11 @@ pub(crate) enum Global {
     Cmdline,
     /// 指向 `self/mounts` 的符号链接。
     Mounts,
+    /// cgroup 的控制器（[`crate::cgroup`]）。
+    Cgroups,
 }
 
-const GLOBALS: [(&[u8], Global); 9] = [
+const GLOBALS: [(&[u8], Global); 10] = [
     (b"cpuinfo", Global::Cpuinfo),
     (b"meminfo", Global::Meminfo),
     (b"stat", Global::Stat),
@@ -57,6 +59,7 @@ const GLOBALS: [(&[u8], Global); 9] = [
     (b"filesystems", Global::Filesystems),
     (b"cmdline", Global::Cmdline),
     (b"mounts", Global::Mounts),
+    (b"cgroups", Global::Cgroups),
 ];
 
 /// `/proc/<pid>` 下的项。
@@ -85,9 +88,11 @@ pub(crate) enum Entry {
     Task,
     OomScoreAdj,
     CoredumpFilter,
+    /// 所在的 cgroup（[`crate::cgroup`]）。
+    Cgroup,
 }
 
-const ENTRIES: [(&[u8], Entry); 23] = [
+const ENTRIES: [(&[u8], Entry); 24] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -111,6 +116,7 @@ const ENTRIES: [(&[u8], Entry); 23] = [
     (b"task", Entry::Task),
     (b"oom_score_adj", Entry::OomScoreAdj),
     (b"coredump_filter", Entry::CoredumpFilter),
+    (b"cgroup", Entry::Cgroup),
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
@@ -186,7 +192,7 @@ const STATIC: [&[u8]; 66] = [
 /// `/sys` 下固定的目录和文件（相对 `/sys` 的路径，目录以 `/` 结尾）。只有 CPU 的拓扑：
 /// busybox 的 `nproc --all`、lscpu、glibc 的 get_nprocs 读它们。各个 `cpu<n>` 是
 /// [`PseudoNode::SysCpu`]。
-const SYS_STATIC: [&[u8]; 7] = [
+const SYS_STATIC: [&[u8]; 8] = [
     b"devices/",
     b"devices/system/",
     b"devices/system/cpu/",
@@ -194,6 +200,7 @@ const SYS_STATIC: [&[u8]; 7] = [
     b"devices/system/cpu/online",
     b"devices/system/cpu/possible",
     b"devices/system/cpu/present",
+    b"fs/",
 ];
 
 /// `/sys/devices/system/cpu`：各个 `cpu<n>` 在它下面。
@@ -366,11 +373,13 @@ pub(crate) enum PseudoNode {
     /// `/sys/devices/system/cpu/cpu<n>`（路径为空），或者它下面的目录和文件（路径取值来自
     /// [`CPU_FILES`]）。
     SysCpu(u32, &'static [u8]),
+    /// `/sys/fs/cgroup`（名字为空），或者它下面的文件（名字取值来自 [`crate::cgroup::FILES`]）。
+    Cgroup(&'static [u8]),
 }
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
-const TASK_ENTRIES: [Entry; 17] = [
+const TASK_ENTRIES: [Entry; 18] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -388,6 +397,7 @@ const TASK_ENTRIES: [Entry; 17] = [
     Entry::Cwd,
     Entry::Exe,
     Entry::Root,
+    Entry::Cgroup,
 ];
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
@@ -433,6 +443,7 @@ fn root_of(fs: Mount) -> PseudoNode {
         Mount::Proc => PseudoNode::ProcRoot,
         Mount::Pts => PseudoNode::PtsRoot,
         Mount::Sys => PseudoNode::SysRoot,
+        Mount::Cgroup => PseudoNode::Cgroup(b""),
     }
 }
 
@@ -440,6 +451,7 @@ pub(crate) fn mount_of(node: &PseudoNode) -> Mount {
     match node {
         PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => Mount::Pts,
         PseudoNode::SysRoot | PseudoNode::Sys(_) | PseudoNode::SysCpu(..) => Mount::Sys,
+        PseudoNode::Cgroup(_) => Mount::Cgroup,
         _ => Mount::Proc,
     }
 }
@@ -551,6 +563,8 @@ impl Pseudo for View<'_> {
             SysCpu(n, path) => tree_parent(&CPU_FILES, path)
                 .or_else(|| tree_parent(&HOST_CPU_FILES, path))
                 .map_or(SysCpu(*n, b""), |p| SysCpu(*n, p)),
+            Cgroup(b"") => Sys(b"fs/"),
+            Cgroup(_) => Cgroup(b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
             Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
@@ -572,6 +586,8 @@ impl Pseudo for View<'_> {
             SysRoot => b"sys".to_vec(),
             SysCpu(n, b"") => format!("cpu{n}").into_bytes(),
             SysCpu(_, path) => tree_name(path).to_vec(),
+            Cgroup(b"") => b"cgroup".to_vec(),
+            Cgroup(name) => name.to_vec(),
             Pid(pid, None) => pid.to_string().into_bytes(),
             Pid(_, Some(tid)) => tid.to_string().into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
@@ -610,10 +626,17 @@ impl Pseudo for View<'_> {
             Static(path) => tree_lookup(&STATIC, path, name).map(Static),
             SysRoot => tree_lookup(&SYS_STATIC, b"", name).map(Sys),
             Sys(path) => tree_lookup(&SYS_STATIC, path, name).map(Sys).or_else(|| {
+                if *path == b"fs/" && name == b"cgroup" {
+                    return Some(Cgroup(b""));
+                }
                 let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
                 let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                 (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
             }),
+            Cgroup(b"") => crate::cgroup::FILES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(n, _)| Cgroup(n)),
             SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name)
                 .or_else(|| {
                     tree_lookup(&HOST_CPU_FILES, path, name).filter(|p| host_cpu_has(*n, p))
@@ -649,6 +672,7 @@ impl Pseudo for View<'_> {
             PtsRoot | ProcRoot | Pid(..) | SysRoot => mode::S_IFDIR,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
+            Cgroup(b"") => mode::S_IFDIR,
             Entry(_, _, self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
             SelfLink | ThreadSelf | Global(self::Global::Mounts) | Fd(..) => mode::S_IFLNK,
@@ -767,9 +791,10 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 /// 合成节点的元数据。
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let kind = ps.kind(node)?;
-    let sysfs = mount_of(node) == Mount::Sys;
+    let sysfs = matches!(mount_of(node), Mount::Sys | Mount::Cgroup);
     let perm = match (kind, node) {
         (mode::S_IFDIR, _) if sysfs => 0o755,
+        (_, PseudoNode::Cgroup(name)) if crate::cgroup::FILES.contains(&(name, true)) => 0o644,
         (mode::S_IFDIR, _) => 0o555,
         (mode::S_IFLNK, _) => 0o777,
         (_, PseudoNode::Pts(_)) => 0o620,
@@ -1047,7 +1072,11 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
             if *path == SYS_CPU_DIR {
                 nodes.extend((0..cpus() as u32).map(|n| SysCpu(n, b"")));
             }
+            if *path == b"fs/" {
+                nodes.push(Cgroup(b""));
+            }
         }
+        Cgroup(b"") => nodes.extend(crate::cgroup::FILES.iter().map(|(n, _)| Cgroup(n))),
         SysCpu(n, path) => {
             nodes.extend(tree_children(&CPU_FILES, path).map(|p| SysCpu(*n, p)));
             nodes.extend(
@@ -1636,7 +1665,8 @@ pub(crate) fn write_mem(
 const MOUNTS: &str = "appine / ext4 rw,relatime 0 0\n\
     proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
     devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0\n\
-    sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n";
+    sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
+    cgroup /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0\n";
 
 /// `/proc/<pid>/mountinfo`：挂载点的编号与 fdinfo 的 mnt_id 一致，设备号与 stat 的
 /// st_dev 一致。
@@ -1644,7 +1674,9 @@ const MOUNTINFO: &str = "1 1 8:1 / / rw,relatime - ext4 appine rw\n\
     2 1 0:4 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n\
     3 1 0:24 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts \
     rw,gid=5,mode=620,ptmxmode=000\n\
-    4 1 0:22 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n";
+    4 1 0:22 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n\
+    6 4 0:26 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup \
+    rw,nsdelegate,memory_recursiveprot\n";
 
 const HWCAP_NAMES: [&str; 12] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
@@ -1823,9 +1855,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
             self::Global::Filesystems => {
-                "nodev\tsysfs\n\text4\nnodev\tproc\nnodev\tdevpts\n".to_owned()
+                "nodev\tsysfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\n".to_owned()
             }
             self::Global::Cmdline => "appine\n".to_owned(),
+            self::Global::Cgroups => crate::cgroup::proc_cgroups(),
             self::Global::Mounts => return Err(Errno::EINVAL),
         },
         Static(path) => match &path[..] {
@@ -1908,6 +1941,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
                 }
                 self::Entry::Comm => format!("{}\n", comm_str(task.as_deref(), *pid)),
+                self::Entry::Cgroup => crate::cgroup::PROC_CGROUP.to_owned(),
                 self::Entry::Cmdline => {
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.args)));
                 }
@@ -1950,6 +1984,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             _ => return Err(Errno::EISDIR),
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
+        Cgroup(name) => crate::cgroup::file(ps.k, name).ok_or(Errno::EISDIR)?,
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())
@@ -2119,6 +2154,7 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
             Mount::Proc => 2,
             Mount::Pts => 3,
             Mount::Sys => 4,
+            Mount::Cgroup => 6,
         },
         None => 5,
     };
