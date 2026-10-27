@@ -1,6 +1,6 @@
 # M9 之前：fork 之后还回的页按各自的权限恢复（2026-10-28）
 
-← [M9 之前：负载普查（2026-10-28）](62-workload-survey.md) · [索引](../milestones.md)
+← [M9 之前：负载普查（2026-10-28）](62-workload-survey.md) · [索引](../milestones.md) · [M9 之前：终端的属主和权限（2026-10-28）](64-pty-owner.md) →
 
 [负载普查](62-workload-survey.md)的问题 1：rustc 生成代码的编译每次都在退出时 SIGSEGV。这是[fork 写时复制](26-fork-cow.md)那一轮就有的 bug，任何 fork 过的进程都可能撞上。
 

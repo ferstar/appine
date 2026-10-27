@@ -801,7 +801,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (_, PseudoNode::Cgroup(name)) if crate::cgroup::FILES.contains(&(name, true)) => 0o644,
         (mode::S_IFDIR, _) => 0o555,
         (mode::S_IFLNK, _) => 0o777,
-        (_, PseudoNode::Pts(_)) => 0o620,
+        (_, PseudoNode::Pts(n)) => pty(ps.k, *n).map_or(0o620, |t| t.borrow().mode),
         (_, PseudoNode::PtsPtmx) => 0o666,
         (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
         (_, n) if writable(n) => 0o644,
@@ -836,8 +836,13 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     })
 }
 
+/// `/dev/pts/<n>` 的终端，已经关掉的是 None。
+pub(crate) fn pty(k: &Kernel, n: u32) -> Option<Rc<RefCell<Tty>>> {
+    k.ptys.get(&n).and_then(std::rc::Weak::upgrade)
+}
+
 /// 节点的属主和属组：`/proc/<pid>` 下是进程的有效用户 ID 和组 ID，`/dev/pts/<n>`
-/// 是打开主设备的进程，其余是 root。
+/// 记在终端上（[`Tty::owner`]），其余是 root。
 fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     match node {
         PseudoNode::Pid(pid, _) | PseudoNode::Entry(pid, ..) | PseudoNode::Fd(pid, _) => {
@@ -846,11 +851,7 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
                 (c.euid, c.egid)
             })
         }
-        PseudoNode::Pts(n) => k
-            .ptys
-            .get(n)
-            .and_then(std::rc::Weak::upgrade)
-            .map_or((0, 0), |t| t.borrow().owner),
+        PseudoNode::Pts(n) => pty(k, *n).map_or((0, 0), |t| t.borrow().owner),
         _ => (0, 0),
     }
 }

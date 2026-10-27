@@ -16,6 +16,9 @@ use crate::process::Signal;
 
 /// PTY 从设备的主设备号（`/dev/pts/<n>`）。
 pub const PTS_MAJOR: u32 = 136;
+
+/// tty 组：devpts 挂载时的 `gid=5`（mountinfo 里也这样写），新的终端都属于它。
+pub const TTY_GID: u32 = 5;
 /// 输入队列的容量（Linux 的 `N_TTY_BUF_SIZE`）。
 pub const INPUT_MAX: usize = 4096;
 /// 输出队列的容量：从设备写满之后阻塞，直到主设备读走。
@@ -245,8 +248,11 @@ pub struct Tty {
     pub slaves: usize,
     /// 从设备是否还没有解锁（unlockpt）。
     pub locked: bool,
-    /// `/dev/pts/<index>` 的属主和属组：打开主设备的进程的 fsuid、fsgid。
+    /// `/dev/pts/<index>` 的属主、属组和权限位：与 Linux 按挂载选项 `gid=5,mode=620` 的
+    /// devpts 一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod
+    /// 可以修改，记到终端关掉为止。
     pub owner: (u32, u32),
+    pub mode: u32,
     /// 输入（从设备读的）、输出（主设备读的）各来过几次数据：与 Linux 一样，每来一次
     /// 都让读的一方的 `EPOLLET` 再触发一次。
     pub arrivals: [u64; 2],
@@ -270,7 +276,8 @@ impl Tty {
             masters: 0,
             slaves: 0,
             locked: true,
-            owner: (0, 0),
+            owner: (0, TTY_GID),
+            mode: 0o620,
             arrivals: [0; 2],
         }
     }

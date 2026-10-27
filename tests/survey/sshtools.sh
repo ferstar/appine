@@ -13,7 +13,7 @@ Host local
   BatchMode yes
   LogLevel ERROR
 C
-/usr/sbin/sshd -p 2222 -E /tmp/sshd2.log; sleep 1
+rm -f /tmp/sshd2.log; /usr/sbin/sshd -p 2222 -E /tmp/sshd2.log; sleep 1
 echo "== rsync"; rm -rf /tmp/rs; rsync -a /usr/share/apk/ local:/tmp/rs/ && diff -r /usr/share/apk /tmp/rs && echo "rsync same"
 rsync -a --delete --stats /etc/ local:/tmp/rs-etc/ | grep -E 'Number of files:|Total transferred'
 echo "== git"; rm -rf /tmp/repo.git /tmp/clone /tmp/clone2; git init -q --bare /tmp/repo.git

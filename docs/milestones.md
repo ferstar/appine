@@ -72,6 +72,7 @@
 | [M9 之前：进程结束的每一步分别兜住](rounds/61-finish-steps.md) | 2026-10-28 | 最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC、控制终端、跟踪、孤儿进程组等）各自兜住内核层的 bug，一步出错只丢掉这一步做的事，不再留下永远停着、等着的进程 |
 | [M9 之前：负载普查](rounds/62-workload-survey.md) | 2026-10-28 | `scripts/survey` 在 appine 里跑 sshd、tmux、postgres、redis、mariadb、Rust、.NET 等 20 多种服务和工具：多数正常；找到 6 个问题：fork 之后父进程的页权限被改错（rustc 崩溃）、ssh 分配不了 PTY、redis/valkey 不肯启动、mariadb 卡住、.NET 看不到别的进程的内存、`/proc/meminfo` 的可用内存偏小 |
 | [M9 之前：fork 之后还回的页按各自的权限恢复](rounds/63-returned-loans.md) | 2026-10-28 | 子进程还回借来的页时，父进程把宿主内存连着的一段按第一页所在映射的权限恢复，保护页的 PROT_NONE 扩散到旁边的页（rustc 退出时崩溃），可写的权限扩散到只读的页；改为不跨映射接段（[fork 写时复制](rounds/26-fork-cow.md)那一轮起的 bug） |
+| [M9 之前：终端的属主和权限](rounds/64-pty-owner.md) | 2026-10-28 | `/dev/pts/N` 属于 tty 组，可以 chown、chmod：sshd 能把终端交给登录的用户，`ssh -t`、交互式登录和 mosh 能用了（原来 root 登录也被关掉） |
 
 ## 测量条件
 
@@ -96,6 +97,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | futex_wake05 | [稳定性和内存](rounds/12-stability-memory.md)那一轮记为以前就时好时坏，原因没查 |
 | times03 | [翻译后代码里的访存](rounds/30-translated-access.md)那一轮看到一次进程的用户态 CPU 时间倒退了一个滴答（111 → 110），单独重跑 3 次都通过，之后没再出现，原因没查 |
+| exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查 |
 | mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题 |
 
 cargo test 里 `ctrl_c_and_ctrl_z_control_the_foreground_job`（Tier 1）卡住过一次：作业停着、shell 在等输入，测试在等它退出（[起进程的宿主开销](rounds/28-spawn-host-cost.md)）。之后重放几十次都没再出现，原因没查明。

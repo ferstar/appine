@@ -1,4 +1,4 @@
-# 不常用但程序会依赖的接口：实时信号排队、pidfd、execveat 等
+# 不常用但程序会依赖的接口：实时信号排队、pidfd、execveat、终端的属主和权限等
 set -e
 cd /tmp
 cat > rtsig.c <<'C'
@@ -1663,3 +1663,68 @@ int main(void)
 }
 C
 gcc -O1 -o sfd sfd.c -lpthread && ./sfd
+
+# /dev/pts/<n> 的属主、属组和权限（devpts 挂载时 gid=5、mode=620）：sshd 把终端 chown 给
+# 登录的用户和 tty 组；普通用户只能改自己的终端
+cat > ptyown.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void show(const char *what, const char *path, int fd)
+{
+    struct stat a, b;
+    stat(path, &a);
+    fstat(fd, &b);
+    printf("%s: path %u:%u %o, fd %u:%u %o\n", what, a.st_uid, a.st_gid, a.st_mode & 07777, b.st_uid,
+           b.st_gid, b.st_mode & 07777);
+}
+
+static int open_pty(char *name, size_t size, int *slave)
+{
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    grantpt(m);
+    unlockpt(m);
+    ptsname_r(m, name, size);
+    *slave = open(name, O_RDWR | O_NOCTTY);
+    return m;
+}
+
+int main(void)
+{
+    char name[64];
+    int s;
+    open_pty(name, sizeof name, &s);
+    show("new", name, s);
+    printf("chown to 1000:5 %d, chmod 0600 %d\n", chown(name, 1000, 5), chmod(name, 0600));
+    show("changed", name, s);
+    printf("fchmod 0620 %d, fchown 0:5 %d\n", fchmod(s, 0620), fchown(s, 0, 5));
+    show("by fd", name, s);
+    chown(name, 1000, 5);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setgid(1000) || setuid(1000))
+            _exit(1);
+        int own = chmod(name, 0600);
+        int give = chown(name, 0, -1);
+        int e = errno;
+        printf("uid 1000: chmod its own %d, chown to root %d errno %d\n", own, give, e);
+        char n2[64];
+        int s2;
+        open_pty(n2, sizeof n2, &s2);
+        show("opened by uid 1000", n2, s2);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    show("after uid 1000", name, s);
+    return 0;
+}
+C
+gcc -O1 -o ptyown ptyown.c && ./ptyown

@@ -431,13 +431,17 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::SeccompNotify(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         FileKind::MessageQueue(q) => Ok(encode_stat(&q.borrow().stat(), MQUEUE_DEV)),
         FileKind::Pty(end) => {
-            let n = end.tty.borrow().index;
-            Ok(anon(
-                pseudo::ino_of(&PseudoNode::Pts(n)),
-                mode::S_IFCHR | 0o620,
-                rdev(PTS_MAJOR, n),
-                DEVPTS_DEV,
-            ))
+            let t = end.tty.borrow();
+            let st = Stat {
+                ino: pseudo::ino_of(&PseudoNode::Pts(t.index)),
+                mode: mode::S_IFCHR | t.mode,
+                nlink: 1,
+                uid: t.owner.0,
+                gid: t.owner.1,
+                rdev: rdev(PTS_MAJOR, t.index),
+                ..Stat::default()
+            };
+            Ok(encode_stat(&st, DEVPTS_DEV))
         }
         FileKind::Regular { ino, file } => Ok(encode_stat(
             &cx.vfs()?.store().stat_open(*ino, file)?,
@@ -812,7 +816,7 @@ fn open_store(
         mode::S_IFCHR => match st.rdev {
             // /dev/tty、/dev/console：调用者的控制终端
             r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
-            PTMX_RDEV => tty::open_ptmx(cx.k(), (cred.fsuid, cred.fsgid))?,
+            PTMX_RDEV => tty::open_ptmx(cx.k(), cred.fsuid)?,
             r => match pts_index(r) {
                 Some(index) => tty::open_slave(cx, index, flags)?,
                 None => FileKind::Device {
@@ -913,7 +917,7 @@ fn open_pseudo(
     }
     match node {
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
-        PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), (cred.fsuid, cred.fsgid)),
+        PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), cred.fsuid),
         PseudoNode::OpenFd(pid, fd) => return reopen(cx, cred, vfs, pid, fd, flags),
         _ => {}
     }
@@ -2122,17 +2126,67 @@ fn may_rename(
 
 pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
-    let ino = store_ino(&lookup_at(cx, dirfd, &path, true)?)?;
-    chmod(cx, ino, perm)?;
-    attrib_at(cx, ino, dirfd, &path, true);
+    let target = Attrs::of(cx, &lookup_at(cx, dirfd, &path, true)?)?;
+    chmod(cx, &target, perm)?;
+    if let Attrs::Store(ino) = target {
+        attrib_at(cx, ino, dirfd, &path, true);
+    }
     Ok(0)
 }
 
 pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
-    let ino = file_ino(cx, fd)?;
-    chmod(cx, ino, perm)?;
+    let target = Attrs::of_fd(cx, fd)?;
+    chmod(cx, &target, perm)?;
     attrib_fd(cx, fd);
     Ok(0)
+}
+
+/// chmod、chown 作用的对象：仓库里的 inode，或者 `/dev/pts/<n>`（属主和权限记在终端上，
+/// 与 Linux 的 devpts 一样）。合成文件系统里别的节点不能修改。
+enum Attrs {
+    Store(Ino),
+    Pts(Rc<RefCell<Tty>>),
+}
+
+impl Attrs {
+    fn of(cx: &Cx<'_>, node: &Node) -> Result<Attrs, Errno> {
+        match node {
+            Node::Pseudo(PseudoNode::Pts(n)) => pseudo::pty(cx.kr(), *n)
+                .map(Attrs::Pts)
+                .ok_or(Errno::ENOENT),
+            _ => store_ino(node).map(Attrs::Store),
+        }
+    }
+
+    /// 打开的文件：终端的从设备，或者仓库里的文件（`O_PATH` 打开的不行）。
+    fn of_fd(cx: &Cx<'_>, fd: i32) -> Result<Attrs, Errno> {
+        let file = cx.fds().get(fd)?;
+        let f = file.borrow();
+        match &f.kind {
+            FileKind::Pty(end) if !end.master && f.flags & oflags::O_PATH == 0 => {
+                Ok(Attrs::Pts(end.tty.clone()))
+            }
+            _ => {
+                drop(f);
+                file_ino(cx, fd).map(Attrs::Store)
+            }
+        }
+    }
+
+    fn stat(&self, cx: &Cx<'_>) -> Result<Stat, Errno> {
+        match self {
+            Attrs::Store(ino) => cx.vfs()?.store().attrs(*ino),
+            Attrs::Pts(t) => {
+                let t = t.borrow();
+                Ok(Stat {
+                    mode: mode::S_IFCHR | t.mode,
+                    uid: t.owner.0,
+                    gid: t.owner.1,
+                    ..Stat::default()
+                })
+            }
+        }
+    }
 }
 
 /// 按路径改了元数据：报告 IN_ATTRIB（也报给所在的目录）。
@@ -2157,9 +2211,8 @@ pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
 
 /// 只有属主（或者有 `CAP_FOWNER`）能修改权限位；不在文件属组里的调用者不能设置
 /// setgid 位（没有 `CAP_FSETID` 时静默去掉）。
-fn chmod(cx: &Cx<'_>, ino: Ino, perm: u32) -> SysResult {
-    let vfs = cx.vfs()?;
-    let st = vfs.store().attrs(ino)?;
+fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
+    let st = target.stat(cx)?;
     let cred = cx.cred();
     if !cred.owns(&st) {
         return Err(Errno::EPERM);
@@ -2168,7 +2221,10 @@ fn chmod(cx: &Cx<'_>, ino: Ino, perm: u32) -> SysResult {
     if !cred.in_group(st.gid) && !cred.capable(cap::FSETID) {
         perm &= !mode::S_ISGID;
     }
-    vfs.store().set_mode(ino, perm)?;
+    match target {
+        Attrs::Store(ino) => cx.vfs()?.store().set_mode(*ino, perm)?,
+        Attrs::Pts(t) => t.borrow_mut().mode = perm,
+    }
     Ok(0)
 }
 
@@ -2190,28 +2246,27 @@ pub(super) fn fchownat(
     let path = read_path(cx, path)?;
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
-    let ino = store_ino(&node)?;
-    chown(cx, ino, uid, gid)?;
+    let target = Attrs::of(cx, &node)?;
+    chown(cx, &target, uid, gid)?;
     if path.is_empty() {
         attrib_fd(cx, dirfd);
-    } else {
+    } else if let Attrs::Store(ino) = target {
         attrib_at(cx, ino, dirfd, &path, follow);
     }
     Ok(0)
 }
 
 pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult {
-    let ino = file_ino(cx, fd)?;
-    chown(cx, ino, uid, gid)?;
+    let target = Attrs::of_fd(cx, fd)?;
+    chown(cx, &target, uid, gid)?;
     attrib_fd(cx, fd);
     Ok(0)
 }
 
 /// 没有 `CAP_CHOWN` 时，属主只能把属组改成自己所在的组，不能修改属主。
-fn chown(cx: &Cx<'_>, ino: Ino, uid: u32, gid: u32) -> SysResult {
+fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
     let (uid, gid) = (owner_arg(uid), owner_arg(gid));
-    let vfs = cx.vfs()?;
-    let st = vfs.store().attrs(ino)?;
+    let st = target.stat(cx)?;
     let cred = cx.cred();
     let owner = cred.fsuid == st.uid;
     let uid_ok = uid.is_none_or(|u| owner && u == st.uid);
@@ -2219,7 +2274,13 @@ fn chown(cx: &Cx<'_>, ino: Ino, uid: u32, gid: u32) -> SysResult {
     if !(cred.capable(cap::CHOWN) || uid_ok && gid_ok) {
         return Err(Errno::EPERM);
     }
-    vfs.store().set_owner(ino, uid, gid)?;
+    match target {
+        Attrs::Store(ino) => cx.vfs()?.store().set_owner(*ino, uid, gid)?,
+        Attrs::Pts(t) => {
+            let mut t = t.borrow_mut();
+            t.owner = (uid.unwrap_or(t.owner.0), gid.unwrap_or(t.owner.1));
+        }
+    }
     Ok(0)
 }
 

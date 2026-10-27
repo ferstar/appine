@@ -45,12 +45,12 @@ const TIOCGSID: u32 = 0x5429;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 
-/// 打开 `/dev/ptmx`：分配一对新的 PTY，返回主设备。
-pub(crate) fn open_ptmx(k: &mut Kernel, owner: (u32, u32)) -> Result<FileKind, Errno> {
+/// 打开 `/dev/ptmx`：分配一对新的 PTY，返回主设备。从设备属于调用者的 fsuid 和 tty 组。
+pub(crate) fn open_ptmx(k: &mut Kernel, uid: u32) -> Result<FileKind, Errno> {
     k.ptys.retain(|_, w| w.strong_count() > 0);
     let index = (0..).find(|i| !k.ptys.contains_key(i)).unwrap();
     let tty = Rc::new(RefCell::new(Tty::new(index)));
-    tty.borrow_mut().owner = owner;
+    tty.borrow_mut().owner.0 = uid;
     k.ptys.insert(index, Rc::downgrade(&tty));
     Ok(FileKind::Pty(PtyEnd::new(tty, true)))
 }
