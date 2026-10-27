@@ -1,6 +1,6 @@
 # M9 之前：按对象唤醒（2026-10-27）
 
-← [M9 之前：独占的唤醒（2026-10-27）](48-exclusive-wakeup.md) · [索引](../milestones.md)
+← [M9 之前：独占的唤醒（2026-10-27）](48-exclusive-wakeup.md) · [索引](../milestones.md) · [M9 之前：Tier 1 里的观察点（2026-10-27）](50-watchpoints-tier1.md) →
 
 [futex 定向唤醒](16-futex-targeted-wake.md)起一直留着的推迟项：poll、epoll 的等待者被所有文件类的修改叫醒。系统里任何一次管道、socket、eventfd、PTY 的读写都把每个停在 poll、epoll 里的线程叫醒一遍，它们抢 BKL、重新检查、再睡下去；Go 的 netpoller、Node.js 的 libuv、Python 的 asyncio、JVM 的 NIO 线程平时都停在 epoll 里。量下来（`target/herd/herd.c`）：8 个进程各自空等在一个没人碰的 eventfd 上，另外两个进程用管道、socketpair 各来回 2 万次，空等的进程一共被叫醒 52 万次（每个来回 13 次），socketpair 的一个来回从 30 微秒变成 56 微秒，管道从 31–33 微秒变成 37 微秒（原生都是 24–25 微秒，空等的进程不醒）。这一轮让等待者只被它等的对象上的修改叫醒（§6）。
 

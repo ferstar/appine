@@ -2874,9 +2874,9 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     return code;
 }
 
-/* 回填例程失败时跳往的位置，最后统一回填 */
+/* 回填例程失败时跳往的位置，最后统一回填：三次填表各 MMU_LEVELS 处，另有三处 */
 struct refill_fails {
-    uint32_t *site[16];
+    uint32_t *site[3 * MMU_LEVELS + 3];
     unsigned n;
 };
 
@@ -2969,6 +2969,12 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_stp_x(0, 1, CTX, (int)x0));
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
     emit(x, enc_str_x(4, CTX, x0 + 32));
+    /* 有观察点（ptrace 设置的）时不按页表填：被观察的页不能进 TLB。交给 Tier 0 执行这一条，
+     * 它检查观察点，并按 appine_tlb_fill 的规则填表，没被观察的页之后照常命中 */
+    size_t nwatch = offsetof(struct appine_cpu, nwatch);
+    emit_add_const(x, 0, CTX, (int64_t)(nwatch & ~(size_t)0xfff));
+    emit(x, enc_ldr_w(0, 0, nwatch & 0xfff));
+    emit_to_fail(x, &f, enc_cbnz_x(0));
     emit(x, enc_add_lsl(3, T0, T2, 0)); /* 最后一个字节 */
     /* 两头的高位都要是 0：只看 x3 会漏掉加上字节数之后绕回来的地址 */
     emit(x, enc_orr_reg(0, T0, 3));
@@ -3859,9 +3865,12 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             fill_jump_cache = true;
             break;
         case R_UNGROUP:
-            lock_dbt(d, &t->stats);
-            ungroup(d, c->pc);
-            unlock_dbt(d);
+            /* 有观察点时回填总是失败（emit_refill），不是这一组访存不能共用检查 */
+            if (!c->nwatch) {
+                lock_dbt(d, &t->stats);
+                ungroup(d, c->pc);
+                unlock_dbt(d);
+            }
             /* fallthrough */
         case R_INTERP: {
             t->stats.exits_interp++;

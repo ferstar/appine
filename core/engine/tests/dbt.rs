@@ -1,10 +1,12 @@
 //! Tier 1 在地址空间换了之后保留翻译、逐块核对 guest 指令字（`Dbt::recheck`，以及从
-//! 池里拿到的实例），函数返回的预测（影子返回栈），以及跨页的访存。宿主不是 aarch64
-//! Linux 时没有 Tier 1，测试直接通过。
+//! 池里拿到的实例），函数返回的预测（影子返回栈），跨页的访存，以及硬件观察点。宿主不是
+//! aarch64 Linux 时没有 Tier 1，测试直接通过。
 
 use std::ptr::NonNull;
 
-use appine_engine::{Cpu, Dbt, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, prot};
+use appine_engine::{
+    Access, Cpu, Dbt, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, WATCH_LOAD, WATCH_STORE, prot,
+};
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -485,4 +487,140 @@ fn shared_checks_cover_accesses_behind_branches() {
         assert_eq!(g.cpu.state().x[1], 7);
         assert_eq!(dbt.stats().ungrouped, ungrouped);
     }
+}
+
+/// 从 `pc` 开始执行到 svc 或者出错。
+fn go(g: &mut Guest, dbt: &mut Dbt, pc: u64) -> Exit {
+    g.cpu.state_mut().pc = pc;
+    dbt.run(&mut g.cpu)
+}
+
+#[test]
+fn watchpoints_send_only_watched_pages_to_tier0() {
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    let mut g = Guest::with_data();
+    let f = CODE + 0x500;
+    g.code(f, &[LDR_X0_X2, STR_X3_X4, SVC]);
+    let page = DATA + 4 * PAGE_SIZE;
+    let watched = page + 0x100;
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(watched, watched + 8, WATCH_STORE)]);
+    let interp = |dbt: &Dbt| dbt.stats().exits_interp;
+    // 读被写观察的页、写别的页：第一次没命中 TLB 由 Tier 0 执行并填表，之后都在翻译后的
+    // 代码里
+    let s = g.cpu.state_mut();
+    (s.x[2], s.x[3], s.x[4]) = (page + 0x108, 5, DATA + 0x10);
+    for _ in 0..2 {
+        assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
+    }
+    let before = interp(&dbt);
+    assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
+    assert_eq!(interp(&dbt), before);
+    assert_eq!(g.cpu.state().x[0], g.data(4, 0x108));
+    // 写被观察的页上没被观察的字节：每次都由 Tier 0 执行
+    g.cpu.state_mut().x[4] = page + 0x108;
+    for i in 1..=2 {
+        assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
+        assert_eq!(interp(&dbt), before + i);
+    }
+    assert_eq!(g.data(4, 0x108), 5);
+    // 写被观察的字节：停在这条指令上，没有写，前一条读已经执行
+    let old = g.data(4, 0x100);
+    let s = g.cpu.state_mut();
+    (s.x[0], s.x[4]) = (0, watched + 4);
+    let hit = Exit::Fault {
+        addr: watched + 4,
+        access: Access::Write,
+        kind: FaultKind::Watchpoint,
+    };
+    assert_eq!(go(&mut g, &mut dbt, f), hit);
+    assert_eq!(g.cpu.state().pc, f + 4);
+    assert_eq!(g.cpu.state().x[0], g.data(4, 0x108));
+    assert_eq!(g.data(4, 0x100), old);
+    // 读观察点：读的一半也不进 TLB
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(watched, watched + 8, WATCH_LOAD)]);
+    let s = g.cpu.state_mut();
+    (s.x[2], s.x[4]) = (watched, DATA + 0x10);
+    let hit = Exit::Fault {
+        addr: watched,
+        access: Access::Read,
+        kind: FaultKind::Watchpoint,
+    };
+    assert_eq!(go(&mut g, &mut dbt, f), hit);
+    assert_eq!(g.cpu.state().pc, f);
+    // 去掉之后整页又在翻译后的代码里
+    g.cpu.state_mut().set_hw_debug(&[], &[]);
+    g.cpu.state_mut().x[4] = page + 0x100;
+    assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
+    let before = interp(&dbt);
+    assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
+    assert_eq!(interp(&dbt), before);
+    assert_eq!(g.data(4, 0x100), 5);
+}
+
+#[test]
+fn watchpoints_stop_inside_shared_checks_and_atomics() {
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    let mut g = Guest::with_data();
+    // 函数序言里共用一次检查的几条写栈：停在写被观察的那个槽的指令上，之前的已经执行
+    let f = CODE + 0x600;
+    g.code(
+        f,
+        &[
+            0xa9bd_7bfd, // stp x29, x30, [sp, #-48]!
+            0xa901_47f0, // stp x16, x17, [sp, #16]
+            0xf900_17fb, // str x27, [sp, #40]
+            0x9100_c3ff, // add sp, sp, #48
+            SVC,
+        ],
+    );
+    let slot = STACK - 8;
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(slot, slot + 8, WATCH_STORE)]);
+    g.cpu.state_mut().x[29] = 0x2929;
+    let hit = Exit::Fault {
+        addr: slot,
+        access: Access::Write,
+        kind: FaultKind::Watchpoint,
+    };
+    assert_eq!(go(&mut g, &mut dbt, f), hit);
+    assert_eq!(g.cpu.state().pc, f + 8);
+    assert_eq!(g.cpu.state().sp, STACK - 48);
+    let stack = &g.pages[2].0;
+    assert_eq!(
+        u64::from_le_bytes(stack[4096 - 48..4096 - 40].try_into().unwrap()),
+        0x2929
+    );
+    // 不是这一组不能共用检查：不记下"这里不再分组"
+    assert_eq!(dbt.stats().ungrouped, 0);
+    g.cpu.state_mut().set_hw_debug(&[], &[]);
+    assert_eq!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 });
+    assert_eq!(g.cpu.state().sp, STACK);
+
+    // 原子的读改写算读：读观察点也要停
+    let f = CODE + 0x700;
+    g.code(f, &[0xf825_00e6, SVC]); // ldadd x5, x6, [x7]
+    let at = DATA + 4 * PAGE_SIZE + 0x200;
+    g.cpu.state_mut().x[7] = at;
+    g.cpu.state_mut().x[5] = 1;
+    assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
+    let after = g.data(4, 0x200);
+    g.cpu
+        .state_mut()
+        .set_hw_debug(&[], &[(at, at + 8, WATCH_LOAD)]);
+    let exit = go(&mut g, &mut dbt, f);
+    assert!(
+        matches!(exit, Exit::Fault { kind: FaultKind::Watchpoint, addr, .. } if addr == at),
+        "{exit:?}"
+    );
+    assert_eq!(g.cpu.state().pc, f);
+    assert_eq!(g.data(4, 0x200), after);
 }

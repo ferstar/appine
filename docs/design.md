@@ -448,7 +448,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - 改写被跟踪进程的内存（PTRACE_POKETEXT/POKEDATA、`/proc/<pid>/mem`）照 Linux 的 `FOLL_FORCE`：没有写权限的私有映射也能写（下断点），先复制成自己的一份；没有写权限的共享映射不能写。写过的地方作废翻译（§4.2），写过的映射不再算作翻译池里可信的来源。`/proc/<pid>/mem` 读写的是打开时那个进程的地址空间，进程 execve 之后旧的 fd 读到 EOF。`/proc/<pid>/auxv` 是加载器留下的一份 auxv，gdb 靠它算 PIE 程序的加载地址。打开 mem 要能跟踪那个进程（`PTRACE_MODE_ATTACH`），auxv、environ、maps、smaps、pagemap 要能以只读方式跟踪（`PTRACE_MODE_READ`，规则相同：同一个用户而且可以 dump，或者有 `CAP_SYS_PTRACE`）。
 - PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径，好在入口和出口停下（§6 的不持 BKL 的系统调用不走）。vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
 - `process_vm_readv`、`process_vm_writev`：权限同上，远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少。
-- 硬件断点和观察点：与常见的 Cortex-A 核一样报告 6 个断点、4 个观察点的槽。控制字按 Linux 检查和规范化（字节选择必须连续，观察点的种类是读、写或两者，断点只能是 4 字节；地址按 8 字节对齐、偏移挪进字节选择）。它们属于线程，跟踪者让线程继续时交给 CPU，只有解释器检查：每条指令执行之前比较断点，每次访存（普通读写、原子操作、独占访问、SIMD、`dc zva`）在页表检查之后、产生副作用之前比较观察点，原子的读改写算读也算写。命中时指令不执行，投递 `TRAP_HWBKPT` 的 SIGTRAP，`si_addr` 是断点地址或者访问的起点，与 arm64 Linux 一样由调试器停用、单步越过再恢复。有断点或观察点的线程只用 Tier 0 执行，不影响别的线程；fork、clone 出来的线程没有，execve 时清掉，PTRACE_DETACH 不清。
+- 硬件断点和观察点：与常见的 Cortex-A 核一样报告 6 个断点、4 个观察点的槽。控制字按 Linux 检查和规范化（字节选择必须连续，观察点的种类是读、写或两者，断点只能是 4 字节；地址按 8 字节对齐、偏移挪进字节选择）。它们属于线程，跟踪者让线程继续时交给 CPU，只有解释器检查：每条指令执行之前比较断点，每次访存（普通读写、原子操作、独占访问、SIMD、`dc zva`）在页表检查之后、产生副作用之前比较观察点，原子的读改写算读也算写。命中时指令不执行，投递 `TRAP_HWBKPT` 的 SIGTRAP，`si_addr` 是断点地址或者访问的起点，与 arm64 Linux 一样由调试器停用、单步越过再恢复。有断点的线程只用 Tier 0 执行，不影响别的线程；有观察点的线程照常用 Tier 1，被观察的页不进它的数据 TLB（读观察点让读的一半失效，有任何观察点时写的一半都失效，因为原子的读改写也查写的一半），有观察点时翻译后的代码里的回填例程直接失败，这两种访问都交给 Tier 0 执行那一条指令，由它检查观察点、按同样的规则填表；观察的范围变了就清空 TLB。fork、clone 出来的线程没有，execve 时清掉，PTRACE_DETACH 不清。
 
 ### 7.7 core dump
 
@@ -715,7 +715,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 未开始 | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
-M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、core dump，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
+M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、按对象唤醒、core dump，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 
 ### 14.2 排序依据
 

@@ -74,6 +74,18 @@ void appine_cpu_tlb_flush(struct appine_cpu *cpu)
     _Static_assert(TLB_INVALID == 0, "清零的表项就是无效的");
 }
 
+/* 第 vpn 页上的观察点的种类（APPINE_WATCH_*） */
+static uint32_t watched_page(const struct appine_cpu *cpu, uint64_t vpn)
+{
+    uint32_t type = 0;
+    for (unsigned i = 0; i < cpu->nwatch; i++) {
+        const struct appine_watch *w = &cpu->watch[i];
+        if (w->lo >> APPINE_PAGE_SHIFT <= vpn && (w->hi - 1) >> APPINE_PAGE_SHIFT >= vpn)
+            type |= w->type;
+    }
+    return type;
+}
+
 void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
 {
     uintptr_t pte = appine_mmu_lookup_pte(cpu->mmu, va);
@@ -92,12 +104,18 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
     if (access == APPINE_ACCESS_EXEC) {
         cpu->itlb[vpn & (APPINE_ITLB_ENTRIES - 1)] = (struct appine_itlb_entry){~vpn, addend};
     } else {
+        /*
+         * 有观察点的页不填进去：Tier 1 的访问没命中，退给 Tier 0 检查观察点（Tier 0 不管
+         * 命中与否都检查）。读的一半只看读观察点；写的一半在页上有任何观察点时都不填，
+         * 因为 Tier 1 的原子读改写、独占访问也用写的一半
+         */
+        uint32_t watched = UNLIKELY(cpu->nwatch) ? watched_page(cpu, vpn) : 0;
         unsigned idx = (unsigned)(vpn & (APPINE_TLB_ENTRIES - 1));
         cpu->tlb_used[idx / 64] |= UINT64_C(1) << (idx % 64);
         cpu->tlb[idx] = (struct appine_tlb_entry){
-            (prot & APPINE_PROT_READ) ? ~vpn : TLB_INVALID,
+            (prot & APPINE_PROT_READ) && !(watched & APPINE_WATCH_LOAD) ? ~vpn : TLB_INVALID,
             addend,
-            (prot & APPINE_PROT_WRITE) ? ~vpn : TLB_INVALID,
+            (prot & APPINE_PROT_WRITE) && !watched ? ~vpn : TLB_INVALID,
             addend,
         };
     }

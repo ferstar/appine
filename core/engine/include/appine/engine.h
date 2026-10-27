@@ -136,7 +136,9 @@ struct appine_cpu {
     uint64_t v[32][2]; /* V0–V31，低 64 位在前 */
     uint64_t tlb_used[APPINE_TLB_ENTRIES / 64]; /* 填充过的 tlb 项，清空时只处理这些 */
     /* 硬件断点和观察点（ptrace 的 NT_ARM_HW_BREAK、NT_ARM_HW_WATCH）：brk、watch 的前
-     * nbrk、nwatch 项有效。只有 Tier 0 检查，有它们的线程只用 Tier 0 执行 */
+     * nbrk、nwatch 项有效。只有 Tier 0 检查：有断点的线程只用 Tier 0 执行；有观察点时
+     * 被观察的页不进 tlb（appine_tlb_fill），Tier 1 访问它们时退给 Tier 0。改了观察点
+     * 之后要清空 tlb */
     uint32_t nbrk, nwatch;
     uint64_t brk[APPINE_HW_SLOTS];
     struct appine_watch watch[APPINE_HW_SLOTS];

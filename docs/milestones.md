@@ -58,6 +58,7 @@
 | [M9 之前：嵌套 epoll 的边沿](rounds/47-nested-epoll.md) | 2026-10-27 | 外层 epoll 以边沿触发关注内层时，内层关注的文件每来一次事件外层都再触发，两层嵌套和外层阻塞等待时也一样 |
 | [M9 之前：独占的唤醒](rounds/48-exclusive-wakeup.md) | 2026-10-27 | `EPOLLEXCLUSIVE` 的文件上来了新的边沿只叫醒一个等待者（定时器线程替它们看），没轮到的进程不醒；`/proc/<pid>/status` 的上下文切换次数取宿主线程的 |
 | [M9 之前：按对象唤醒](rounds/49-targeted-wakeups.md) | 2026-10-27 | poll、epoll 和阻塞的读写只被它们等的管道、PTY、eventfd、timerfd、inotify、epoll、AF_UNIX 连接上的修改叫醒（原来系统里每次读写都叫醒所有 poll、epoll 的等待者），关闭文件、进程退出不再广播；修了 `timerfd_settime` 不叫醒等它的线程 |
+| [M9 之前：Tier 1 里的观察点](rounds/50-watchpoints-tier1.md) | 2026-10-27 | 有硬件观察点的线程照常用 Tier 1，只有被观察的页上的访问交给解释器（被观察的页不进 TLB）；gdb 里用 `watch` 等变量被写从 10.8 秒降到 0.45 秒 |
 
 ## 测量条件
 

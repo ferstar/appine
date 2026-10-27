@@ -106,7 +106,7 @@ pub const WATCH_STORE: u32 = 2;
 
 /// C 的 `struct appine_watch`。
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct WatchSlot {
     lo: u64,
     hi: u64,
@@ -117,9 +117,12 @@ struct WatchSlot {
 impl CpuState {
     /// 设置硬件断点（指令地址）和观察点（起点、终点、[`WATCH_LOAD`]/[`WATCH_STORE`]），各
     /// 最多 [`HW_SLOTS`] 个。只有解释器检查它们（[`Cpu::run`]、[`Cpu::step`]）：命中时以
-    /// [`FaultKind::HwBreakpoint`]、[`FaultKind::Watchpoint`] 退出，指令没有执行。
+    /// [`FaultKind::HwBreakpoint`]、[`FaultKind::Watchpoint`] 退出，指令没有执行。有断点的
+    /// 线程只能用解释器执行（[`CpuState::hw_breakpoints_active`]）；有观察点时被观察的页
+    /// 不进 TLB，Tier 1 访问它们时交给解释器执行那一条指令，所以观察的范围变了要清空 TLB。
     pub fn set_hw_debug(&mut self, breakpoints: &[u64], watchpoints: &[(u64, u64, u32)]) {
         assert!(breakpoints.len() <= HW_SLOTS && watchpoints.len() <= HW_SLOTS);
+        let before = (self.nwatch, self.watch);
         self.brk[..breakpoints.len()].copy_from_slice(breakpoints);
         for (slot, &(lo, hi, ty)) in self.watch.iter_mut().zip(watchpoints) {
             *slot = WatchSlot {
@@ -131,11 +134,16 @@ impl CpuState {
         }
         self.nbrk = breakpoints.len() as u32;
         self.nwatch = watchpoints.len() as u32;
+        let n = self.nwatch as usize;
+        // 跟踪者每次让线程继续都重新设置一遍，没变时不清
+        if before.0 != self.nwatch || before.1[..n] != self.watch[..n] {
+            unsafe { appine_cpu_tlb_flush(self) }
+        }
     }
 
-    /// 设置了硬件断点或观察点：这个线程只能用解释器执行。
-    pub fn hw_debug_active(&self) -> bool {
-        self.nbrk != 0 || self.nwatch != 0
+    /// 设置了硬件断点：这个线程只能用解释器执行（Tier 1 不在每条指令之前比较 pc）。
+    pub fn hw_breakpoints_active(&self) -> bool {
+        self.nbrk != 0
     }
 }
 

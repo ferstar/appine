@@ -436,9 +436,10 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 Some(e) => (e, false),
             }
         } else {
-            // 有硬件断点、观察点（ptrace 设置的）时只有解释器检查它们
+            // 有硬件断点（ptrace 设置的）时只有解释器检查它们。观察点由 Tier 1 把被观察的页
+            // 上的访问交给解释器（CpuState::set_hw_debug）
             let exit = match &mut dbt {
-                Some((d, _)) if !cpu.state().hw_debug_active() => d.run(cpu),
+                Some((d, _)) if !cpu.state().hw_breakpoints_active() => d.run(cpu),
                 _ => cpu.run(),
             };
             (exit, false)
