@@ -31,5 +31,5 @@
 **推迟项**：
 
 - `appine-run` 的终端桥接线程（`terminal::bridge`）直接调用控制台的内核代码，没有兜住。它只在开发用的 `appine-run` 里，App 不经过它。
-- `finish_group` 中途出错时，子进程交给 init、孤儿进程组的 SIGHUP/SIGCONT、IPC 的清理会丢掉。
+- `finish_group` 中途出错时，子进程交给 init、孤儿进程组的 SIGHUP/SIGCONT、IPC 的清理会丢掉。→ 已补上（M9 之前：进程结束的每一步分别兜住）：九步各自兜住，只丢掉出错的那一步做的事
 - 结束进程的报告仍然只在 stderr（logcat）里（上一轮的推迟项，留给 M9 的外壳）。

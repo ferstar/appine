@@ -5,6 +5,8 @@
 //! - 内核层 panic：用 [`catch`] 兜住，之后获取 BKL 时忽略它的中毒标记
 //!   （[`crate::kernel::Shared::lock`]）。兜住的地方和出错时结束的是：
 //!   - guest 线程每次进入内核、线程开始、线程退出的每一步：这个线程所在的进程；
+//!   - 进程结束（最后一个线程退出之后，[`crate::process::finish_group`]）的每一步：进程
+//!     已经结束了，只报告，接着做下一步；
 //!   - 定时器线程处理一个进程的定时器：那个进程；内存上限的检查、信号驱动的 I/O 分不出
 //!     是哪个进程的，出错时关掉这项功能；
 //!   - 宿主调用 [`crate::Machine`] 的方法和本库别的公开函数（[`host_call`]）：调用返回
@@ -22,7 +24,7 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 use appine_engine::Cpu;
@@ -126,11 +128,18 @@ pub(crate) enum Trap {
     Timers,
     /// 宿主下一次调用 [`crate::Machine`] 的方法（只读一张表的除外）或本库别的公开函数时。
     HostCall,
+    /// 进程结束（[`crate::process::finish_group`]）的一步：布给一个进程（pid），哪一步记在
+    /// `FINISH_STEP` 里。
+    Finish,
 }
 
 /// 测试钩子布下的 bug：每个 [`Trap`] 上布给的 tid 或 pid，0 表示没有。
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
-static ARMED: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
+static ARMED: [AtomicI32; 5] = [const { AtomicI32::new(0) }; 5];
+
+/// [`Trap::Finish`] 布在第几步（从 1 开始）。
+#[cfg(any(debug_assertions, feature = "test-hooks"))]
+static FINISH_STEP: AtomicU32 = AtomicU32::new(0);
 
 /// 宿主调用不属于任何 guest 进程，布给它时用这个编号。
 pub(crate) const HOST: Tid = -1;
@@ -154,6 +163,18 @@ pub(crate) fn trap(at: Trap, id: Tid) {
     let _ = (at, id);
 }
 
+/// 进程 `tgid` 结束的第 `step` 步：测试钩子在这一步为它布下了 bug 时 panic，只触发一次。
+#[inline]
+pub(crate) fn trap_finish(tgid: Tid, step: u32) {
+    #[cfg(any(debug_assertions, feature = "test-hooks"))]
+    if FINISH_STEP.load(Ordering::Relaxed) != step {
+        return;
+    }
+    #[cfg(not(any(debug_assertions, feature = "test-hooks")))]
+    let _ = step;
+    trap(Trap::Finish, tgid);
+}
+
 /// 测试钩子的 syscall 编号，远在 Linux 的编号之外。只在 debug 构建和打开了 `test-hooks`
 /// 特性的构建（Android 的 debug 版 App）里存在，并且要设置 `APPINE_TEST_HOOKS=1`。
 /// 端到端测试用它模拟内核层和引擎的 bug。
@@ -168,7 +189,8 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 /// 3. 调用的线程退出时 panic；
 /// 4. 这个进程下一个开始运行的线程 panic；
 /// 5. 定时器线程下次处理这个进程的定时器时 panic；
-/// 6. 宿主下一次调用 Machine 的方法时 panic。
+/// 6. 宿主下一次调用 Machine 的方法时 panic；
+/// 7. 这个进程结束时（[`crate::process::finish_group`]）第 `addr` 步 panic。
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -196,6 +218,10 @@ pub(crate) fn test_hook(
             arm(Trap::HostCall, HOST);
             // 让在 Machine 的方法里等着的宿主线程重新检查
             crate::kernel::request_wake();
+        }
+        7 if addr != 0 => {
+            FINISH_STEP.store(addr as u32, Ordering::SeqCst);
+            arm(Trap::Finish, cx.tgid());
         }
         _ => return Err(Errno::EINVAL),
     }

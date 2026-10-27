@@ -782,9 +782,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             crate::bug::kill_process(k, tgid, what);
         }
     };
+    // finish_group 自己分步兜住，这里只剩读进程状态的那几行
     if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
         failed(&k, "finishing the process");
-        crate::bug::catch(|| crate::process::finish_group_after_bug(&mut k, &group));
     }
     // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……
     if crate::bug::catch(|| drop((group, task))).is_none() {

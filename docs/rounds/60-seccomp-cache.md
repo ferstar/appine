@@ -1,6 +1,6 @@
 # M9 之前：seccomp 的缓存和快速路径（2026-10-28）
 
-← [M9 之前：seccomp（2026-10-28）](59-seccomp.md) · [索引](../milestones.md)
+← [M9 之前：seccomp（2026-10-28）](59-seccomp.md) · [索引](../milestones.md) · [M9 之前：进程结束的每一步分别兜住（2026-10-28）](61-finish-steps.md) →
 
 上一轮的 seccomp 每次系统调用都在解释器里运行整条过滤器链，每条指令约 4.5 纳秒；装了过滤器的线程也失去了不持 BKL 的快速路径（§6），连 vDSO 里读时钟这种不检查的调用也要排队等 BKL（[上一轮](59-seccomp.md)的开销）。用 seccomp 做沙箱的多是多线程的程序，每个 futex、每次读时钟都去等 BKL，线程越多越慢。
 

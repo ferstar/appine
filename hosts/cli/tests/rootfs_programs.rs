@@ -382,6 +382,51 @@ fn core_files_have_the_linux_layout() {
 }
 
 #[test]
+fn each_step_of_finishing_a_process_survives_kernel_bugs() {
+    // 进程结束的一步撞上内核层的 bug（debug 构建的测试钩子模拟）时，只丢掉这一步做的事，
+    // 后面的步骤照样做（tests/guest/finish.c）；要有控制终端，程序拷进仓库里运行
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let (Some(store), Some(program)) = (store(), build_static("finish")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/finish && chmod +x /tmp/finish && /tmp/finish";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .env("APPINE_TEST_HOOKS", "1")
+            .env("APPINE_ON_BUG", "kill")
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+        for step in [
+            "releasing AIO contexts",
+            "handing its children to init",
+            "sending parent-death signals",
+            "releasing SysV IPC",
+            "releasing the controlling terminal",
+            "reporting to its tracer",
+            "handing it to its parent",
+            "releasing its tracees",
+            "signalling orphaned process groups",
+        ] {
+            let report = format!("was exiting ({step})");
+            assert!(
+                stderr(&out).contains(&report),
+                "tier {tier}: {}",
+                stderr(&out)
+            );
+        }
+    }
+}
+
+#[test]
 fn missing_or_non_executable_programs_fail_to_start() {
     for (tier, out) in run(&["/bin/no-such-program"]) {
         assert_eq!(out.status.code(), Some(127), "tier {tier}");
