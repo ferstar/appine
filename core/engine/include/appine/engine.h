@@ -41,6 +41,8 @@ enum appine_fault_kind {
     APPINE_FAULT_PAGE = 1,     /* 未映射或权限不符，对应 SIGSEGV */
     APPINE_FAULT_ALIGN = 2,    /* PC 或者要求对齐的数据访问未对齐，对应 SIGBUS */
     APPINE_FAULT_SP_ALIGN = 3, /* 以 SP 为基址时 SP 未对齐（fault_addr = SP），对应 SIGBUS */
+    APPINE_FAULT_WATCH = 4,    /* 访存命中了硬件观察点（fault_addr = 访问的起点），对应 SIGTRAP */
+    APPINE_FAULT_BREAK = 5,    /* pc 命中了硬件断点（fault_addr = pc），对应 SIGTRAP */
 };
 
 /* appine_cpu_run() 的退出原因 */
@@ -68,6 +70,19 @@ struct appine_tlb_entry {
     uint64_t addend_read;
     uint64_t tag_write;
     uint64_t addend_write;
+};
+
+/*
+ * 硬件观察点（ptrace 的 NT_ARM_HW_WATCH）：访问 [lo, hi) 里任何一个字节、种类在 type 里
+ * （APPINE_WATCH_*）时命中，指令不执行。
+ */
+#define APPINE_WATCH_LOAD 1u
+#define APPINE_WATCH_STORE 2u
+#define APPINE_HW_SLOTS 16
+struct appine_watch {
+    uint64_t lo, hi;
+    uint32_t type;
+    uint32_t reserved;
 };
 
 /* 取指 TLB 表项，只有 Tier 0 的取指和 Tier 1 的翻译会用到 */
@@ -120,6 +135,11 @@ struct appine_cpu {
     struct appine_itlb_entry itlb[APPINE_ITLB_ENTRIES];
     uint64_t v[32][2]; /* V0–V31，低 64 位在前 */
     uint64_t tlb_used[APPINE_TLB_ENTRIES / 64]; /* 填充过的 tlb 项，清空时只处理这些 */
+    /* 硬件断点和观察点（ptrace 的 NT_ARM_HW_BREAK、NT_ARM_HW_WATCH）：brk、watch 的前
+     * nbrk、nwatch 项有效。只有 Tier 0 检查，有它们的线程只用 Tier 0 执行 */
+    uint32_t nbrk, nwatch;
+    uint64_t brk[APPINE_HW_SLOTS];
+    struct appine_watch watch[APPINE_HW_SLOTS];
 };
 
 /* ---- guest 可见的 CPU 特性（设计文档 §4.4），取值与 Linux 的 HWCAP_* 一致 ---- */

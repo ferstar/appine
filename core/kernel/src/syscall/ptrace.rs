@@ -12,7 +12,8 @@ use crate::errno::Errno;
 use crate::kernel::{Cx, INIT};
 use crate::process::Signal;
 use crate::ptrace::{
-    EVENTMSG_SYSCALL_ENTRY, EVENTMSG_SYSCALL_EXIT, Mode, PSTATE_NZCV, Regs, Stop, Trace, event, opt,
+    BRK_SLOTS, EVENTMSG_SYSCALL_ENTRY, EVENTMSG_SYSCALL_EXIT, HwDebug, Mode, PSTATE_NZCV, Regs,
+    Stop, Trace, WATCH_SLOTS, event, opt,
 };
 use crate::signal::{self, SigInfo};
 use crate::task::Task;
@@ -283,7 +284,7 @@ fn regset_shape(nt: u64) -> Result<(usize, usize), Errno> {
 }
 
 /// regset 的内容。
-pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32) -> Vec<u8> {
+pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32, hw: &HwDebug) -> Vec<u8> {
     let mut b = Vec::new();
     match nt {
         NT_PRSTATUS => {
@@ -302,9 +303,19 @@ pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32) -> Vec<u8> {
         }
         NT_ARM_TLS => b.extend_from_slice(&r.tpidr.to_le_bytes()),
         NT_ARM_HW_BREAK | NT_ARM_HW_WATCH => {
-            // 没有硬件断点和观察点：调试器改用软件的
-            b.extend_from_slice(&(DEBUG_ARCH_V8 << 8).to_le_bytes());
-            b.resize(66 * 4, 0);
+            // dbg_info：调试架构和槽数，然后是 16 组（地址、控制字、空字）
+            let (slots, n) = if nt == NT_ARM_HW_BREAK {
+                (&hw.brk, BRK_SLOTS)
+            } else {
+                (&hw.watch, WATCH_SLOTS)
+            };
+            b.extend_from_slice(&(DEBUG_ARCH_V8 << 8 | n as u32).to_le_bytes());
+            b.extend_from_slice(&[0; 4]);
+            for &(addr, ctrl) in slots {
+                b.extend_from_slice(&addr.to_le_bytes());
+                b.extend_from_slice(&ctrl.to_le_bytes());
+                b.extend_from_slice(&[0; 4]);
+            }
         }
         _ => b.extend_from_slice(&syscallno.to_le_bytes()),
     }
@@ -312,7 +323,13 @@ pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32) -> Vec<u8> {
 }
 
 /// 跟踪者写来的 regset 内容。
-fn decode_regset(nt: u64, b: &[u8], r: &mut Regs, syscallno: &mut i32) -> Result<(), Errno> {
+fn decode_regset(
+    nt: u64,
+    b: &[u8],
+    r: &mut Regs,
+    syscallno: &mut i32,
+    hw: &mut HwDebug,
+) -> Result<(), Errno> {
     let u64_at = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     let u32_at = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     match nt {
@@ -332,15 +349,69 @@ fn decode_regset(nt: u64, b: &[u8], r: &mut Regs, syscallno: &mut i32) -> Result
             r.fpcr = u64::from(u32_at(516));
         }
         NT_ARM_TLS => r.tpidr = u64_at(0),
-        // 没有可用的槽：只能全写成零
         NT_ARM_HW_BREAK | NT_ARM_HW_WATCH => {
-            if b[8..].iter().any(|&x| x != 0) {
-                return Err(Errno::ENOSPC);
+            let watch = nt == NT_ARM_HW_WATCH;
+            let (mut slots, n) = if watch {
+                (hw.watch, WATCH_SLOTS)
+            } else {
+                (hw.brk, BRK_SLOTS)
+            };
+            for (i, slot) in slots.iter_mut().enumerate() {
+                let addr = u64_at(1 + 2 * i);
+                let ctrl = u32_at(16 + 16 * i);
+                // 超出槽数的只能是零（Linux 建不出断点，ENOSPC）
+                *slot = if i >= n {
+                    if (addr, ctrl) != (0, 0) {
+                        return Err(Errno::ENOSPC);
+                    }
+                    (0, 0)
+                } else {
+                    hw_slot(watch, addr, ctrl)?
+                };
+            }
+            if watch {
+                hw.watch = slots;
+            } else {
+                hw.brk = slots;
             }
         }
         _ => *syscallno = u32_at(0) as i32,
     }
     Ok(())
+}
+
+/// 一组硬件断点或观察点（`watch`）的地址和控制字，按 Linux 检查并规范化
+/// （`ptrace_hbp_fill_attr_ctrl`、`hw_breakpoint_arch_parse`）：停用的原样记下；启用的
+/// 字节选择（BAS）必须是连续的一段，观察点的种类是读、写或者两者，断点只能是 4 字节；
+/// 起点是地址加上 BAS 的偏移，再按 8 字节（断点按 4 字节）对齐、把偏移挪回 BAS，
+/// 特权级记成 EL0。
+fn hw_slot(watch: bool, addr: u64, ctrl: u32) -> Result<(u64, u32), Errno> {
+    const EL0: u32 = 2 << 1;
+    if ctrl & 1 == 0 {
+        return Ok((addr, ctrl));
+    }
+    let ty = ctrl >> 3 & 3;
+    let bas = ctrl >> 5 & 0xff;
+    let shift = bas.trailing_zeros();
+    let run = bas.checked_shr(shift).unwrap_or(0);
+    if bas == 0 || run & (run + 1) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let len = run.count_ones() as u64;
+    let start = addr.wrapping_add(u64::from(shift));
+    if watch {
+        let offset = start & 7;
+        if ty == 0 || offset + len > 8 {
+            return Err(Errno::EINVAL);
+        }
+        let bas = ((1u32 << len) - 1) << offset;
+        Ok((start & !7, bas << 5 | ty << 3 | EL0 | 1))
+    } else {
+        if ty != 0 || len != 4 {
+            return Err(Errno::EINVAL);
+        }
+        Ok((start & !3, 0xf << 5 | EL0 | 1))
+    }
 }
 
 /// PTRACE_GETREGSET、PTRACE_SETREGSET：`data` 指向 iovec，长度可以比 regset 短（只读写
@@ -357,13 +428,18 @@ fn regset(cx: &mut Cx<'_>, task: &Task, set: bool, nt: u64, iov: u64) -> SysResu
     {
         let mut t = task.trace.borrow_mut();
         let Trace {
-            regs, syscallno, ..
+            regs,
+            syscallno,
+            hw,
+            hw_changed,
+            ..
         } = &mut *t;
         let regs = regs.as_mut().ok_or(Errno::ESRCH)?;
-        let mut bytes = encode_regset(nt, regs, *syscallno);
+        let mut bytes = encode_regset(nt, regs, *syscallno, hw);
         if set {
             cx.mm().read(UserSlice::new(base, len), &mut bytes[..len])?;
-            decode_regset(nt, &bytes, regs, syscallno)?;
+            decode_regset(nt, &bytes, regs, syscallno, hw)?;
+            *hw_changed |= nt == NT_ARM_HW_BREAK || nt == NT_ARM_HW_WATCH;
         } else {
             cx.mm().write(UserSlice::new(base, len), &bytes[..len])?;
         }
@@ -502,4 +578,46 @@ pub(super) fn process_vm(
         return Err(Errno::EFAULT);
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hw_slots_are_checked_and_normalized_like_linux() {
+        const EL0: u32 = 2 << 1;
+        let watch = |bas: u32, ty: u32| bas << 5 | ty << 3 | EL0 | 1;
+        // 停用的原样记下，不检查
+        assert_eq!(hw_slot(true, 0x1234, 0x40), Ok((0x1234, 0x40)));
+        // 地址里的偏移和 BAS 里的偏移是一回事：都规范化成按 8 对齐的地址
+        assert_eq!(
+            hw_slot(true, 0x1000, watch(0xf0, 2)),
+            Ok((0x1000, watch(0xf0, 2)))
+        );
+        assert_eq!(
+            hw_slot(true, 0x1004, watch(0x0f, 2)),
+            Ok((0x1000, watch(0xf0, 2)))
+        );
+        assert_eq!(
+            hw_slot(true, 0x1003, watch(0x01, 1)),
+            Ok((0x1000, watch(0x08, 1)))
+        );
+        // 越过 8 字节、BAS 不连续或为零、种类是执行：EINVAL
+        assert_eq!(hw_slot(true, 0x1006, watch(0x0f, 2)), Err(Errno::EINVAL));
+        assert_eq!(hw_slot(true, 0x1000, watch(0x05, 2)), Err(Errno::EINVAL));
+        assert_eq!(hw_slot(true, 0x1000, watch(0, 2)), Err(Errno::EINVAL));
+        assert_eq!(hw_slot(true, 0x1000, watch(0xff, 0)), Err(Errno::EINVAL));
+        // 断点只能是执行、4 字节，地址按 4 对齐
+        assert_eq!(
+            hw_slot(false, 0x2000, watch(0x0f, 0)),
+            Ok((0x2000, watch(0x0f, 0)))
+        );
+        assert_eq!(
+            hw_slot(false, 0x2002, watch(0x0f, 0)),
+            Ok((0x2000, watch(0x0f, 0)))
+        );
+        assert_eq!(hw_slot(false, 0x2000, watch(0x03, 0)), Err(Errno::EINVAL));
+        assert_eq!(hw_slot(false, 0x2000, watch(0x0f, 1)), Err(Errno::EINVAL));
+    }
 }

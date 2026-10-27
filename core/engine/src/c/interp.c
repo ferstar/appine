@@ -708,6 +708,10 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
             raise_fault(c, va, APPINE_ACCESS_WRITE, APPINE_FAULT_PAGE);
             return APPINE_EXIT_FAULT;
         }
+        if (UNLIKELY(watch_hit(c, va, DCZ_BLOCK, APPINE_WATCH_STORE))) {
+            raise_fault(c, va, APPINE_ACCESS_WRITE, APPINE_FAULT_WATCH);
+            return APPINE_EXIT_FAULT;
+        }
         memset(p, 0, DCZ_BLOCK);
         return next(c);
     }

@@ -1,6 +1,6 @@
 # M9 之前：core dump（2026-10-27）
 
-← [M9 之前：epoll 的边沿（2026-10-27）](42-epoll-edges.md) · [索引](../milestones.md)
+← [M9 之前：epoll 的边沿（2026-10-27）](42-epoll-edges.md) · [索引](../milestones.md) · [M9 之前：硬件断点和观察点（2026-10-27）](44-hw-watchpoints.md) →
 
 [ptrace 的第二步](41-ptrace-gdb.md)之后 gdb 能调试运行中的程序，但程序崩溃之后没有 core 文件，不能事后分析；`WCOREDUMP` 总是 0，LTP 的 abort01、kill11、waitid10、waitpid01 因此失败（[M6](08-m6.md) 起推迟）。这一轮按 Linux 的 `do_coredump`、`elf_core_dump` 写 core 文件（§7.7）。
 

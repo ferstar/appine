@@ -157,6 +157,51 @@ pub(crate) struct Trace {
     pub message: u64,
     /// 系统调用的编号：入口停住时跟踪者可以改（`NT_ARM_SYSTEM_CALL`），改成 -1 时跳过。
     pub syscallno: i32,
+    /// 跟踪者设置的硬件断点和观察点；`hw_changed` 时继续之后交给 CPU。
+    pub hw: HwDebug,
+    pub hw_changed: bool,
+}
+
+/// 硬件断点、观察点的槽数，与常见的 Cortex-A 核相同（`ID_AA64DFR0_EL1` 的 BRPs、WRPs）。
+pub(crate) const BRK_SLOTS: usize = 6;
+pub(crate) const WATCH_SLOTS: usize = 4;
+
+/// 硬件断点、观察点（`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 的 16 组地址和控制字，前
+/// [`BRK_SLOTS`]、[`WATCH_SLOTS`] 组有用）。启用的已经按 Linux 规范化：观察点的地址按 8
+/// 字节对齐，偏移挪进字节选择（BAS），特权级是 EL0（`syscall::ptrace`）。与 Linux 一样
+/// 属于线程：fork、clone 出来的线程没有，execve 时清掉，PTRACE_DETACH 不清。
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HwDebug {
+    pub brk: [(u64, u32); 16],
+    pub watch: [(u64, u32); 16],
+}
+
+impl HwDebug {
+    /// 交给引擎（`CpuState::set_hw_debug`）：启用的断点的地址，启用的观察点的
+    /// [起点, 终点) 和种类（控制字的 LSC 位就是引擎的 `WATCH_LOAD`、`WATCH_STORE`）。
+    pub fn apply(&self, s: &mut CpuState) {
+        s.set_hw_debug(&self.breakpoints(), &self.watchpoints());
+    }
+
+    fn breakpoints(&self) -> Vec<u64> {
+        self.brk[..BRK_SLOTS]
+            .iter()
+            .filter(|(_, ctrl)| ctrl & 1 != 0)
+            .map(|&(addr, _)| addr)
+            .collect()
+    }
+
+    fn watchpoints(&self) -> Vec<(u64, u64, u32)> {
+        self.watch[..WATCH_SLOTS]
+            .iter()
+            .filter(|(_, ctrl)| ctrl & 1 != 0)
+            .map(|&(addr, ctrl)| {
+                let bas = ctrl >> 5 & 0xff;
+                let lo = addr + u64::from(bas.trailing_zeros());
+                (lo, lo + u64::from(bas.count_ones()), ctrl >> 3 & 3)
+            })
+            .collect()
+    }
 }
 
 impl Trace {
@@ -268,7 +313,25 @@ pub(crate) fn stop(
     if let Some(regs) = regs {
         regs.restore(cpu.state_mut());
     }
+    // 跟踪者改了硬件断点、观察点（PTRACE_SETREGSET）
+    let hw = {
+        let mut t = cx.task.trace.borrow_mut();
+        std::mem::take(&mut t.hw_changed).then_some(t.hw)
+    };
+    if let Some(hw) = hw {
+        hw.apply(cpu.state_mut());
+    }
     resumed
+}
+
+/// execve：与 Linux 的 `flush_ptrace_hw_breakpoint` 一样清掉硬件断点和观察点。
+pub(crate) fn exec_hw_flush(cx: &Cx<'_>, cpu: &mut Cpu) {
+    let mut t = cx.task.trace.borrow_mut();
+    if t.hw != HwDebug::default() {
+        t.hw = HwDebug::default();
+        t.hw_changed = false;
+        cpu.state_mut().set_hw_debug(&[], &[]);
+    }
 }
 
 /// 通知跟踪者线程停住了：叫醒它的 wait；它没有忽略 SIGCHLD、也没有设 SA_NOCLDSTOP 时
@@ -624,4 +687,21 @@ fn report_exit(k: &mut Kernel, tracer: Tid, pid: Tid, pgid: Tid, status: ExitSta
     });
     request_wake_on(wake::CHILD);
     signal::send_to_group(k, tracer, Signal::CHLD, SigInfo::child(pid, status));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hw_debug_ranges_come_from_the_byte_selects() {
+        let mut hw = HwDebug::default();
+        // 8 字节对齐的地址，BAS 选第 4–7 个字节，读写都算；停用的和超出槽数的不算
+        hw.watch[0] = (0x1000, 0xf0 << 5 | 3 << 3 | 4 | 1);
+        hw.watch[1] = (0x2000, 0x01 << 5 | 2 << 3 | 4);
+        hw.watch[WATCH_SLOTS] = (0x3000, 0x01 << 5 | 2 << 3 | 4 | 1);
+        hw.brk[0] = (0x4000, 0xf << 5 | 4 | 1);
+        assert_eq!(hw.watchpoints(), vec![(0x1004, 0x1008, 3)]);
+        assert_eq!(hw.breakpoints(), vec![0x4000]);
+    }
 }

@@ -427,9 +427,10 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 Some(e) => (e, false),
             }
         } else {
+            // 有硬件断点、观察点（ptrace 设置的）时只有解释器检查它们
             let exit = match &mut dbt {
-                Some((d, _)) => d.run(cpu),
-                None => cpu.run(),
+                Some((d, _)) if !cpu.state().hw_debug_active() => d.run(cpu),
+                _ => cpu.run(),
             };
             (exit, false)
         };
@@ -611,6 +612,13 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             let info = SigInfo::fault(code::BUS_ADRALN, addr, EC_SP_ALIGN << 26 | ESR_IL);
             (Signal::BUS, info)
         }
+        // 硬件观察点（访问的起点）、断点（pc）：指令还没有执行，与 Linux 的
+        // ptrace_hbptriggered 一样没有 esr_context
+        Exit::Fault {
+            addr,
+            kind: FaultKind::Watchpoint | FaultKind::HwBreakpoint,
+            ..
+        } => (Signal::TRAP, SigInfo::fault(code::TRAP_HWBKPT, addr, 0)),
     };
     signal::force(cx, sig, info);
     signal::deliver(cx, cpu, false)

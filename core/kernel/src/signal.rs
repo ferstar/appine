@@ -136,6 +136,8 @@ pub(crate) mod code {
     pub const TRAP_BRKPT: i32 = 1;
     /// 单步执行完一条指令。
     pub const TRAP_TRACE: i32 = 2;
+    /// 硬件断点、观察点。
+    pub const TRAP_HWBKPT: i32 = 4;
 }
 
 /// siginfo 里随 si_code 变化的字段。

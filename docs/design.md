@@ -442,12 +442,12 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - 被跟踪的线程在这些地方停下（ptrace-stop）：投递信号之前、group-stop、PTRACE_SYSCALL 让它继续之后系统调用的入口和出口，以及 `PTRACE_EVENT_*`（fork、vfork、clone、exec、vfork 结束、退出，PTRACE_INTERRUPT 和 PTRACE_SEIZE 跟进来的新线程的 `PTRACE_EVENT_STOP`）。停住时把寄存器存一份，跟踪者读写的是这一份，继续时写回 CPU 状态；停住期间只有 SIGKILL 能让它离开。与 arm64 Linux 一样，系统调用停住时 x7 是 0（入口）或 1（出口），跟踪者看不到、也改不了它原来的值；入口处跟踪者可以经由 `NT_ARM_SYSTEM_CALL` 改编号，改成 -1 时跳过这个系统调用，x0 是跟踪者设的返回值。
 - 与 Linux 一样，被跟踪的线程不丢弃被忽略的信号（跟踪者要看到它们）；参加完 group-stop 就照常执行，即使线程组仍然停着；SEIZE 跟踪的线程的 group-stop 报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 等它结束。
 - wait 报告 ptrace-stop 不要求 `WUNTRACED`，被跟踪的线程退出时也报告给跟踪者（不是主线程的单独报告），报告 ptrace-stop 时带着被跟踪进程的 rusage（strace -c 用它算时间）。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪，停在信号投递停止里的信号照常投递。
-- regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`，以及报告 0 个槽的 `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`（调试器改用软件断点和观察点）。guest 没有 SVE、PAC、MTE、SME，也就没有它们的 regset。
+- regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`（见下）。guest 没有 SVE、PAC、MTE、SME，也就没有它们的 regset。
 - 单步（PTRACE_SINGLESTEP）由解释器执行一条指令（`appine_cpu_step`），执行完了投递 `TRAP_TRACE` 的 SIGTRAP。与 arm64 Linux 一样，单步执行 svc 时系统调用做完再报告（`SI_USER`），下一次单步不执行指令、原地再报告一次。
 - 改写被跟踪进程的内存（PTRACE_POKETEXT/POKEDATA、`/proc/<pid>/mem`）照 Linux 的 `FOLL_FORCE`：没有写权限的私有映射也能写（下断点），先复制成自己的一份；没有写权限的共享映射不能写。写过的地方作废翻译（§4.2），写过的映射不再算作翻译池里可信的来源。`/proc/<pid>/auxv` 是加载器留下的一份 auxv，gdb 靠它算 PIE 程序的加载地址。
 - PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径，好在入口和出口停下（§6 的不持 BKL 的系统调用不走）。vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
 - `process_vm_readv`、`process_vm_writev`：权限同上，远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少。
-- 没有硬件断点和观察点，gdb 的观察点靠逐条指令单步。
+- 硬件断点和观察点：与常见的 Cortex-A 核一样报告 6 个断点、4 个观察点的槽。控制字按 Linux 检查和规范化（字节选择必须连续，观察点的种类是读、写或两者，断点只能是 4 字节；地址按 8 字节对齐、偏移挪进字节选择）。它们属于线程，跟踪者让线程继续时交给 CPU，只有解释器检查：每条指令执行之前比较断点，每次访存（普通读写、原子操作、独占访问、SIMD、`dc zva`）在页表检查之后、产生副作用之前比较观察点，原子的读改写算读也算写。命中时指令不执行，投递 `TRAP_HWBKPT` 的 SIGTRAP，`si_addr` 是断点地址或者访问的起点，与 arm64 Linux 一样由调试器停用、单步越过再恢复。有断点或观察点的线程只用 Tier 0 执行，不影响别的线程；fork、clone 出来的线程没有，execve 时清掉，PTRACE_DETACH 不清。
 
 ### 7.7 core dump
 
@@ -713,7 +713,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 未开始 | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
-M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace、epoll 的边沿触发、core dump，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
+M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、core dump，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 
 ### 14.2 排序依据
 

@@ -39,9 +39,11 @@ static uint64_t get_x(const struct appine_cpu *c, unsigned r)
 
 /*
  * 取得一次对齐访问的宿主地址。这类指令要求自然对齐，否则是对齐错误；对齐的
- * 访问不会跨页。access 为写时同时要求可读。
+ * 访问不会跨页。access 为写时同时要求可读。watch 是这次访问算作哪种硬件观察点
+ * （APPINE_WATCH_*，读改写两种都算）。
  */
-static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, uint32_t access)
+static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, uint32_t access,
+                           uint32_t watch)
 {
     uint64_t va = rn == 31 ? c->sp : c->x[rn];
     if (rn == 31 && (c->sp & 15)) {
@@ -60,6 +62,8 @@ static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, ui
     void *p = tlb_lookup(c, va, access);
     if (!p)
         raise_fault(c, va, access, APPINE_FAULT_PAGE);
+    else if (UNLIKELY(watch_hit(c, va, bytes, watch)))
+        return raise_fault(c, va, access, APPINE_FAULT_WATCH), NULL;
     return p;
 }
 
@@ -145,7 +149,8 @@ static enum appine_exit exclusive(struct appine_cpu *c, uint32_t insn, bool pair
     unsigned rs = FIELD(insn, 20, 16), rt2 = FIELD(insn, 14, 10), rn = FIELD(insn, 9, 5);
     unsigned rt = insn & 31;
     unsigned esize = 1u << size, bytes = pair ? 2 * esize : esize;
-    void *p = atomic_target(c, rn, bytes, load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE);
+    void *p = atomic_target(c, rn, bytes, load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE,
+                            load ? APPINE_WATCH_LOAD : APPINE_WATCH_STORE);
     if (!p)
         return APPINE_EXIT_FAULT;
     uint64_t va = untag(rn == 31 ? c->sp : c->x[rn]);
@@ -187,7 +192,8 @@ static enum appine_exit acquire_release(struct appine_cpu *c, uint32_t insn)
 {
     unsigned size = FIELD(insn, 31, 30), load = BIT(insn, 22), rn = FIELD(insn, 9, 5);
     unsigned rt = insn & 31, bytes = 1u << size;
-    void *p = atomic_target(c, rn, bytes, load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE);
+    void *p = atomic_target(c, rn, bytes, load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE,
+                            load ? APPINE_WATCH_LOAD : APPINE_WATCH_STORE);
     if (!p)
         return APPINE_EXIT_FAULT;
     if (load) {
@@ -210,7 +216,8 @@ static enum appine_exit acquire_release(struct appine_cpu *c, uint32_t insn)
 static enum appine_exit native_atomic(struct appine_cpu *c, uint32_t insn, unsigned bytes,
                                       const struct native_desc *d)
 {
-    void *p = atomic_target(c, FIELD(insn, 9, 5), bytes, APPINE_ACCESS_WRITE);
+    void *p = atomic_target(c, FIELD(insn, 9, 5), bytes, APPINE_ACCESS_WRITE,
+                            APPINE_WATCH_LOAD | APPINE_WATCH_STORE);
     if (!p)
         return APPINE_EXIT_FAULT;
     if (!appine_native_exec(insn, d, c, p))

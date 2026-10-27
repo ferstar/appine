@@ -92,6 +92,51 @@ pub struct CpuState {
     /// V0–V31，每个寄存器低 64 位在前。
     pub v: [[u64; 2]; 32],
     tlb_used: [u64; TLB_ENTRIES / 64],
+    nbrk: u32,
+    nwatch: u32,
+    brk: [u64; HW_SLOTS],
+    watch: [WatchSlot; HW_SLOTS],
+}
+
+/// 硬件断点、观察点各最多几个（C 的 `APPINE_HW_SLOTS`）。
+pub const HW_SLOTS: usize = 16;
+/// 观察点的种类：读、写（可以合用）。
+pub const WATCH_LOAD: u32 = 1;
+pub const WATCH_STORE: u32 = 2;
+
+/// C 的 `struct appine_watch`。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WatchSlot {
+    lo: u64,
+    hi: u64,
+    ty: u32,
+    reserved: u32,
+}
+
+impl CpuState {
+    /// 设置硬件断点（指令地址）和观察点（起点、终点、[`WATCH_LOAD`]/[`WATCH_STORE`]），各
+    /// 最多 [`HW_SLOTS`] 个。只有解释器检查它们（[`Cpu::run`]、[`Cpu::step`]）：命中时以
+    /// [`FaultKind::HwBreakpoint`]、[`FaultKind::Watchpoint`] 退出，指令没有执行。
+    pub fn set_hw_debug(&mut self, breakpoints: &[u64], watchpoints: &[(u64, u64, u32)]) {
+        assert!(breakpoints.len() <= HW_SLOTS && watchpoints.len() <= HW_SLOTS);
+        self.brk[..breakpoints.len()].copy_from_slice(breakpoints);
+        for (slot, &(lo, hi, ty)) in self.watch.iter_mut().zip(watchpoints) {
+            *slot = WatchSlot {
+                lo,
+                hi,
+                ty,
+                reserved: 0,
+            };
+        }
+        self.nbrk = breakpoints.len() as u32;
+        self.nwatch = watchpoints.len() as u32;
+    }
+
+    /// 设置了硬件断点或观察点：这个线程只能用解释器执行。
+    pub fn hw_debug_active(&self) -> bool {
+        self.nbrk != 0 || self.nwatch != 0
+    }
 }
 
 unsafe extern "C" {
@@ -292,6 +337,10 @@ pub enum FaultKind {
     Alignment,
     /// 以 SP 为基址访存时 SP 未对齐（`addr` 是 SP），对应 SIGBUS。
     StackAlignment,
+    /// 访存命中了硬件观察点（`addr` 是访问的起点），对应 SIGTRAP；指令没有执行。
+    Watchpoint,
+    /// pc 命中了硬件断点（`addr` 是 pc），对应 SIGTRAP。
+    HwBreakpoint,
 }
 
 /// [`Cpu::run`] 返回的退出原因：需要内核层介入的事件。
@@ -472,6 +521,8 @@ impl Cpu {
                 kind: match s.fault_kind {
                     2 => FaultKind::Alignment,
                     3 => FaultKind::StackAlignment,
+                    4 => FaultKind::Watchpoint,
+                    5 => FaultKind::HwBreakpoint,
                     _ => FaultKind::Page,
                 },
             },

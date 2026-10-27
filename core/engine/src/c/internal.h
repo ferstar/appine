@@ -162,6 +162,22 @@ static inline bool raise_fault(struct appine_cpu *cpu, uint64_t va, uint32_t acc
 }
 
 /*
+ * 访问 [va, va + n) 命中了硬件观察点（type 是 APPINE_WATCH_* 的组合，读改写两种都算）。
+ * 页表检查之后、产生副作用之前调用：与硬件一样，转换错误优先，命中时指令不执行。
+ */
+static inline bool watch_hit(const struct appine_cpu *cpu, uint64_t va, uint64_t n, uint32_t type)
+{
+    if (LIKELY(!cpu->nwatch))
+        return false;
+    for (unsigned i = 0; i < cpu->nwatch; i++) {
+        const struct appine_watch *w = &cpu->watch[i];
+        if ((w->type & type) && va < w->hi && va + n > w->lo)
+            return true;
+    }
+    return false;
+}
+
+/*
  * 读写 guest 内存（n ≤ 16）。跨页访问会先确认两页都可访问，再拷贝。
  * 失败时记录 fault 并返回 false，不产生任何副作用。
  */
@@ -173,6 +189,8 @@ static inline bool mem_read(struct appine_cpu *cpu, uint64_t va, void *out, unsi
     if (UNLIKELY(!p0))
         return raise_fault(cpu, va, APPINE_ACCESS_READ, APPINE_FAULT_PAGE);
     if (LIKELY(off + n <= APPINE_PAGE_SIZE)) {
+        if (UNLIKELY(watch_hit(cpu, va, n, APPINE_WATCH_LOAD)))
+            return raise_fault(cpu, va, APPINE_ACCESS_READ, APPINE_FAULT_WATCH);
         memcpy(out, p0, n);
         return true;
     }
@@ -180,6 +198,8 @@ static inline bool mem_read(struct appine_cpu *cpu, uint64_t va, void *out, unsi
     void *p1 = tlb_lookup(cpu, va + first, APPINE_ACCESS_READ);
     if (UNLIKELY(!p1))
         return raise_fault(cpu, va + first, APPINE_ACCESS_READ, APPINE_FAULT_PAGE);
+    if (UNLIKELY(watch_hit(cpu, va, n, APPINE_WATCH_LOAD)))
+        return raise_fault(cpu, va, APPINE_ACCESS_READ, APPINE_FAULT_WATCH);
     memcpy(out, p0, first);
     memcpy((uint8_t *)out + first, p1, n - first);
     return true;
@@ -193,6 +213,8 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
     if (UNLIKELY(!p0))
         return raise_fault(cpu, va, APPINE_ACCESS_WRITE, APPINE_FAULT_PAGE);
     if (LIKELY(off + n <= APPINE_PAGE_SIZE)) {
+        if (UNLIKELY(watch_hit(cpu, va, n, APPINE_WATCH_STORE)))
+            return raise_fault(cpu, va, APPINE_ACCESS_WRITE, APPINE_FAULT_WATCH);
         memcpy(p0, in, n);
         return true;
     }
@@ -200,6 +222,8 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
     void *p1 = tlb_lookup(cpu, va + first, APPINE_ACCESS_WRITE);
     if (UNLIKELY(!p1))
         return raise_fault(cpu, va + first, APPINE_ACCESS_WRITE, APPINE_FAULT_PAGE);
+    if (UNLIKELY(watch_hit(cpu, va, n, APPINE_WATCH_STORE)))
+        return raise_fault(cpu, va, APPINE_ACCESS_WRITE, APPINE_FAULT_WATCH);
     memcpy(p0, in, first);
     memcpy(p1, (const uint8_t *)in + first, n - first);
     return true;

@@ -660,3 +660,190 @@ for f in $(ls st3 | sort -t. -k2 -n); do
     echo "-- process"
     norm < st3/$f
 done
+
+# 硬件观察点和断点（NT_ARM_HW_WATCH、NT_ARM_HW_BREAK）：槽数、非法的控制字、读回规范化的
+# 控制字；写、读、不对齐的一个字节的观察点停在访问之前（数据还没写），si_code 是
+# TRAP_HWBKPT、si_addr 是访问的地址；停用之后单步完成访问；断点停在指令上
+cat > hw.c <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct dbg { uint32_t info, pad; struct { uint64_t addr; uint32_t ctrl, pad; } regs[16]; };
+
+static volatile long data[4];
+static volatile char bytes[16];
+
+__attribute__((noinline)) static void store(volatile long *p, long v) { *p = v; }
+__attribute__((noinline)) static long load(volatile long *p) { return *p; }
+__attribute__((noinline)) static void store_byte(volatile char *p) { *p = 'x'; }
+__attribute__((noinline)) static int target(int x) { return x + 1; }
+
+static int setdbg(pid_t pid, int nt, int n, const uint64_t *addr, const uint32_t *ctrl)
+{
+    struct dbg d;
+    memset(&d, 0, sizeof d);
+    for (int i = 0; i < n; i++) { d.regs[i].addr = addr[i]; d.regs[i].ctrl = ctrl[i]; }
+    struct iovec iov = {&d, 8 + 16 * (n ? n : 1)};
+    return ptrace(PTRACE_SETREGSET, pid, nt, &iov) < 0 ? -errno : 0;
+}
+
+static uint32_t ctrl(uint32_t bas, uint32_t type) { return bas << 5 | type << 3 | 2 << 1 | 1; }
+
+static void report(pid_t pid, const char *what)
+{
+    int st;
+    waitpid(pid, &st, 0);
+    if (!WIFSTOPPED(st)) { printf("%s: not stopped %#x\n", what, st); return; }
+    siginfo_t si;
+    ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    struct { uint64_t x[31], sp, pc, pstate; } r;
+    struct iovec iov = {&r, sizeof r};
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    long cur = ptrace(PTRACE_PEEKDATA, pid, &data[1], 0);
+    printf("%s: sig %d code %d addr %s pc %s data[1] %ld\n", what, WSTOPSIG(st), si.si_code,
+           si.si_addr == (void *)&data[1] ? "data[1]" : si.si_addr == (void *)&bytes[3] ? "bytes[3]" :
+           si.si_addr == (void *)(uintptr_t)target ? "target" : "other",
+           r.pc == (uintptr_t)target ? "target" : "other", cur);
+}
+
+int main(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        store(&data[1], 5);
+        long v = load(&data[1]);
+        store_byte(&bytes[3]);
+        v += target(1);
+        _exit(v == 7 ? 0 : 1);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    struct dbg d;
+    struct iovec iov = {&d, sizeof d};
+    ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_WATCH, &iov);
+    printf("watch slots >= 2: %d, len %zu\n", (d.info & 0xff) >= 2, iov.iov_len);
+    iov.iov_len = sizeof d;
+    ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_BREAK, &iov);
+    printf("break slots >= 2: %d\n", (d.info & 0xff) >= 2);
+    uint64_t a = (uint64_t)&data[1];
+    uint32_t bad[] = {ctrl(0xff, 0), ctrl(0x5, 2), 0x1};
+    for (int i = 0; i < 3; i++)
+        printf("bad ctrl %#x: %d\n", bad[i], setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &bad[i]));
+    uint32_t c = ctrl(0xff, 2); /* 写 */
+    printf("set store watch: %d\n", setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c));
+    iov.iov_len = sizeof d;
+    ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_WATCH, &iov);
+    printf("read back: addr ok %d ctrl %#x\n", d.regs[0].addr == a, d.regs[0].ctrl);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    report(pid, "store watch");
+    c = 0;
+    setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c);
+    ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
+    report(pid, "stepped");
+    c = ctrl(0xff, 1); /* 读 */
+    setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    report(pid, "load watch");
+    /* 不对齐的一个字节：地址按 8 对齐，BAS 选第 3 个字节 */
+    uint64_t b8 = (uint64_t)&bytes[3] & ~7ul;
+    uint32_t cb = ctrl(1u << ((uint64_t)&bytes[3] & 7), 2);
+    printf("set byte watch: %d\n", setdbg(pid, NT_ARM_HW_WATCH, 1, &b8, &cb));
+    c = 0;
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    report(pid, "byte watch");
+    setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c);
+    uint64_t t = (uint64_t)target;
+    uint32_t cbk = ctrl(0xf, 0);
+    printf("set breakpoint: %d\n", setdbg(pid, NT_ARM_HW_BREAK, 1, &t, &cbk));
+    uint64_t tu = t + 2;
+    printf("unaligned breakpoint: %d\n", setdbg(pid, NT_ARM_HW_BREAK, 1, &tu, &cbk));
+    setdbg(pid, NT_ARM_HW_BREAK, 1, &t, &cbk);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    report(pid, "breakpoint");
+    cbk = 0;
+    setdbg(pid, NT_ARM_HW_BREAK, 1, &t, &cbk);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    waitpid(pid, &st, 0);
+    printf("exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+C
+gcc -O1 -o hw hw.c && ./hw
+# 原子的读改写（LSE）也算读；16 字节的 SIMD 存储碰到后一半时报告访问的起点
+cat > hw3.c <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct dbg { uint32_t info, pad; struct { uint64_t addr; uint32_t ctrl, pad; } regs[16]; };
+static volatile int atom;
+static volatile uint64_t vec[4] __attribute__((aligned(16)));
+
+static void watch(pid_t pid, uint64_t addr, uint32_t bas, uint32_t type)
+{
+    struct dbg d;
+    memset(&d, 0, sizeof d);
+    d.regs[0].addr = addr;
+    d.regs[0].ctrl = type ? bas << 5 | type << 3 | 2 << 1 | 1 : 0;
+    struct iovec iov = {&d, 8 + 16};
+    if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_HW_WATCH, &iov) < 0)
+        perror("SETREGSET");
+}
+
+static void report(pid_t pid, const char *what, volatile void *expect)
+{
+    int st;
+    waitpid(pid, &st, 0);
+    siginfo_t si;
+    ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    printf("%s: sig %d code %d addr %s\n", what, WSTOPSIG(st), si.si_code,
+           si.si_addr == (void *)expect ? "ok" : "other");
+}
+
+int main(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        __atomic_fetch_add(&atom, 1, __ATOMIC_SEQ_CST);
+        __asm__ volatile("movi v0.16b, #7\n\tstr q0, [%0]" : : "r"(&vec[1]) : "v0", "memory");
+        _exit(atom == 1 && vec[1] == 0x0707070707070707ull ? 0 : 1);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    /* 只读的观察点：原子的读改写也算读 */
+    watch(pid, (uint64_t)&atom & ~7ull, 0xf << ((uint64_t)&atom & 7), 1);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    report(pid, "atomic add, load watch", &atom);
+    watch(pid, 0, 0, 0);
+    /* 16 字节的 SIMD 存储碰到后一半 */
+    watch(pid, (uint64_t)&vec[2], 0xff, 2);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    report(pid, "simd store", &vec[1]);
+    watch(pid, 0, 0, 0);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    waitpid(pid, &st, 0);
+    printf("exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+C
+gcc -O1 -o hw3 hw3.c && ./hw3

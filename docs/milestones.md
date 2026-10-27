@@ -52,6 +52,7 @@
 | [M9 之前：ptrace 的第二步，gdb](rounds/41-ptrace-gdb.md) | 2026-10-27 | 解释器单步、强制写入被跟踪进程的内存并作废翻译、`/proc/<pid>/mem`、`/proc/<pid>/auxv`；gdb 的断点、单步、软件观察点、`catch syscall` 与原生一致 |
 | [M9 之前：epoll 的边沿](rounds/42-epoll-edges.md) | 2026-10-27 | `EPOLLET` 按 Linux 的唤醒时机：已经就绪时又来了数据也再触发（进程内的对象记数据代数，宿主 socket 用一个边沿触发的宿主 epoll 记新到的数据），tokio 程序（uv）不再卡住；水平触发的 `EPOLLEXCLUSIVE` 一个边沿只让一个 epoll 返回 |
 | [M9 之前：core dump](rounds/43-coredump.md) | 2026-10-27 | 默认动作生成 core 的信号结束进程时按 `core_pattern` 写 ELF core 文件，格式与 arm64 Linux 相同，gdb 可以事后分析；`WCOREDUMP`、`CLD_DUMPED`、`coredump_filter`、`MADV_DONTDUMP`；被结束的线程停在 svc 上；LTP 955 |
+| [M9 之前：硬件断点和观察点](rounds/44-hw-watchpoints.md) | 2026-10-27 | `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 报告 6 个断点、4 个观察点，由解释器检查，有它们的线程只用 Tier 0；gdb 的 `watch`、`rwatch`、`awatch`、`hbreak` 与原生一致 |
 
 ## 测量条件
 

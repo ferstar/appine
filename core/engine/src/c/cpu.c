@@ -55,6 +55,7 @@ void appine_cpu_init(struct appine_cpu *cpu, struct appine_mmu *mmu)
     /* 数据 TLB 只清掉填过的项：新分配的 cpu 是清零的内存，没碰过的页不必写 */
     memset(cpu, 0, offsetof(struct appine_cpu, tlb));
     memset(cpu->v, 0, sizeof(cpu->v));
+    cpu->nbrk = cpu->nwatch = 0;
     cpu->mmu = mmu;
     appine_cpu_tlb_flush(cpu);
 }
@@ -122,11 +123,25 @@ enum appine_exit appine_cpu_run(struct appine_cpu *cpu)
     return appine_guard_run(cpu_run, NULL, cpu);
 }
 
+/* pc 命中了硬件断点（只有 ptrace 设置了断点的线程才有） */
+static bool brk_hit(const struct appine_cpu *cpu, uint64_t pc)
+{
+    for (unsigned i = 0; i < cpu->nbrk; i++)
+        if (cpu->brk[i] == pc)
+            return true;
+    return false;
+}
+
 enum appine_exit appine_interp_step(struct appine_cpu *cpu)
 {
     uint64_t pc = cpu->pc;
     if (UNLIKELY(pc & 3)) {
         raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_ALIGN);
+        return APPINE_EXIT_FAULT;
+    }
+    /* 与硬件一样在执行这条指令之前 */
+    if (UNLIKELY(cpu->nbrk) && brk_hit(cpu, pc)) {
+        raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_BREAK);
         return APPINE_EXIT_FAULT;
     }
     void *p = tlb_lookup(cpu, pc, APPINE_ACCESS_EXEC);

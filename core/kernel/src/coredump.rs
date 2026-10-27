@@ -18,7 +18,7 @@ use crate::fd::FileRef;
 use crate::kernel::{Cx, Tid, wake};
 use crate::mm::{DumpRegion, Mm};
 use crate::process::{CpuTime, RLIMIT_CORE, Signal, ThreadGroup};
-use crate::ptrace::Regs;
+use crate::ptrace::{HwDebug, Regs};
 use crate::signal::SigInfo;
 use crate::task::Task;
 use appine_engine::{CpuState, PAGE_SIZE, prot};
@@ -36,6 +36,8 @@ pub(crate) fn dumps_core(sig: Signal) -> bool {
 pub(crate) struct ThreadCore {
     tid: Tid,
     regs: Regs,
+    /// 跟踪者设置的硬件断点和观察点（`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`）。
+    hw: HwDebug,
     /// 线程自己挂起的信号和屏蔽字。
     pending: u64,
     blocked: u64,
@@ -48,6 +50,7 @@ impl ThreadCore {
         ThreadCore {
             tid: task.tid.get(),
             regs: Regs::save(state),
+            hw: task.trace.borrow().hw,
             pending: task.pending.borrow().set(),
             blocked: task.sigmask.get(),
             cpu: task.cpu_self(),
@@ -394,7 +397,7 @@ fn notes(
             ("LINUX", NT_ARM_HW_WATCH),
             ("LINUX", NT_ARM_SYSTEM_CALL),
         ] {
-            let desc = crate::syscall::encode_regset(u64::from(nt), &t.regs, -1);
+            let desc = crate::syscall::encode_regset(u64::from(nt), &t.regs, -1, &t.hw);
             note(&mut out, name, nt, &desc);
         }
     }

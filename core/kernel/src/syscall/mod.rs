@@ -495,6 +495,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
 /// execve 成功了（`old_tid` 是之前的 tid）：被跟踪时报告 exec（`PTRACE_EVENT_EXEC` 或者
 /// SIGTRAP）和系统调用的出口，执行新程序的第一条指令之前投递信号。
 fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flow {
+    crate::ptrace::exec_hw_flush(cx, cpu);
     if !crate::ptrace::traced(cx.task) {
         return Flow::Exec;
     }

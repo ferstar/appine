@@ -605,7 +605,7 @@ static enum appine_exit undef(struct appine_cpu *c, uint32_t insn)
     return APPINE_EXIT_UNDEF;
 }
 
-/* 确认 [va, va + len) 的每一页都可以按 access 访问 */
+/* 确认 [va, va + len) 的每一页都可以按 access 访问，也没有碰到硬件观察点 */
 static bool probe(struct appine_cpu *c, uint64_t va, uint64_t len, uint32_t access)
 {
     va = untag(va);
@@ -614,6 +614,9 @@ static bool probe(struct appine_cpu *c, uint64_t va, uint64_t len, uint32_t acce
         if (!tlb_lookup(c, p, access))
             return raise_fault(c, p, access, APPINE_FAULT_PAGE);
     }
+    uint32_t watch = access == APPINE_ACCESS_READ ? APPINE_WATCH_LOAD : APPINE_WATCH_STORE;
+    if (UNLIKELY(watch_hit(c, va, len, watch)))
+        return raise_fault(c, va, access, APPINE_FAULT_WATCH);
     return true;
 }
 
