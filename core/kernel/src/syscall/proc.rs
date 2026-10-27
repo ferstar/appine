@@ -832,6 +832,10 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
             .get(&c)
             .is_some_and(|t| t.trace.borrow().tracer == Some(me));
         let mut g = child.borrow_mut();
+        // 结束了、跟踪者还没取走：只有跟踪者看得见（下面的 trace_exits），父进程接着等
+        if g.exit_tracer.is_some() {
+            continue;
+        }
         if let (true, Some(status)) = (want.exited, g.zombie) {
             let usage = usage(&g, cx.kr());
             if want.consume {
@@ -897,10 +901,15 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         any = true;
         if want.exited {
             let (pid, status) = (exits[i].pid, exits[i].status);
+            // 整个进程的结束：与 Linux 一样报告它的用量（它还在，等着交给父进程）
+            let usage = match cx.kr().groups.get(&pid) {
+                Some(g) if exits[i].process => usage(&g.borrow(), cx.kr()),
+                _ => process::Rusage::default(),
+            };
             if want.consume {
-                cx.k().trace_exits.remove(i);
+                let e = cx.k().trace_exits.remove(i);
+                crate::ptrace::released(cx.k(), &e);
             }
-            let usage = process::Rusage::default();
             return Ok(Some((pid, ChildEvent::Exited(status), usage)));
         }
     }

@@ -300,6 +300,141 @@ static void group_stop(void)
     printf("end: %s\n", describe(wait_for(pid)));
 }
 
+/* 跟踪一个已经停住的进程：报告停住它的信号（这里是 SIGTSTP），父进程已经用 wait 取走了
+   停止事件也一样 */
+static void stopped_attach(void)
+{
+    printf("== attach to a stopped process\n");
+    for (int seize = 0; seize < 2; seize++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* 自己一个进程组：父进程在同一会话的另一个进程组里，不是孤儿进程组，SIGTSTP 不会
+               被丢掉 */
+            setpgid(0, 0);
+            raise(SIGTSTP);
+            _exit(6);
+        }
+        int st;
+        waitpid(pid, &st, WUNTRACED);
+        printf("%s; the parent took %s\n", seize ? "seize" : "attach", describe(st));
+        long r = ptrace(seize ? PTRACE_SEIZE : PTRACE_ATTACH, pid, 0, 0);
+        st = wait_for(pid);
+        siginfo_t si;
+        errno = 0;
+        long got = ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+        printf("  %ld, first stop: %s, siginfo %ld", r, describe(st), got);
+        if (got == 0)
+            printf(" signo %d code %#x\n", si.si_signo, si.si_code);
+        else
+            printf(" %s\n", strerror(errno));
+        if (seize) {
+            ptrace(PTRACE_LISTEN, pid, 0, 0);
+            kill(pid, SIGCONT);
+            printf("  after SIGCONT: %s\n", describe(wait_for(pid)));
+            ptrace(PTRACE_CONT, pid, 0, 0);
+            printf("  then: %s\n", describe(wait_for(pid)));
+        } else {
+            /* 然后是 ATTACH 发的 SIGSTOP；不投递它，线程组虽然停着，被跟踪的线程照常执行 */
+            ptrace(PTRACE_CONT, pid, 0, 0);
+            printf("  then: %s\n", describe(wait_for(pid)));
+        }
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        printf("  end: %s\n", describe(wait_for(pid)));
+    }
+}
+
+/* 跟踪者不是父进程（是祖父进程，Yama 也允许）：被跟踪的进程结束之后先只报告给跟踪者，
+   它用 wait 取走之前父进程等不到、也没有收到 SIGCHLD，取走之后父进程才能回收；跟踪者
+   没取走就退出时交给父进程 */
+static void foreign_tracer(void)
+{
+    printf("== tracer that is not the parent\n");
+    int up[2], go[2], chk[2], say[2];
+    pipe(up);
+    pipe(go);
+    pipe(chk);
+    pipe(say);
+    char ch;
+    pid_t parent = fork();
+    if (parent == 0) {
+        sigset_t chld;
+        sigemptyset(&chld);
+        sigaddset(&chld, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &chld, NULL);
+        pid_t c = fork();
+        if (c == 0) {
+            read(go[0], &ch, 1);
+            _exit(7);
+        }
+        write(up[1], &c, sizeof c);
+        read(chk[0], &ch, 1);
+        int st = -1;
+        sigset_t pending;
+        sigpending(&pending);
+        pid_t r = waitpid(c, &st, WNOHANG);
+        printf("  parent before the tracer reaps: waitpid %s, SIGCHLD %s\n",
+               r == 0 ? "0" : r == c ? describe(st) : "error",
+               sigismember(&pending, SIGCHLD) ? "pending" : "not pending");
+        write(up[1], "x", 1);
+        r = waitpid(c, &st, 0);
+        sigpending(&pending);
+        read(say[0], &ch, 1);
+        printf("  parent then reaps: %s, SIGCHLD %s\n", r == c ? describe(st) : "error",
+               sigismember(&pending, SIGCHLD) ? "pending" : "not pending");
+        _exit(0);
+    }
+    pid_t c;
+    read(up[0], &c, sizeof c);
+    printf("seize %ld\n", ptrace(PTRACE_SEIZE, c, 0, 0));
+    write(go[1], "x", 1);
+    siginfo_t si = {0};
+    waitid(P_PID, c, &si, WEXITED | WNOWAIT);
+    printf("  tracer sees: code %d status %d\n", si.si_code, si.si_status);
+    write(chk[1], "x", 1);
+    read(up[0], &ch, 1);
+    int st;
+    printf("  tracer reaps: %s\n", waitpid(c, &st, 0) == c ? describe(st) : "error");
+    write(say[1], "x", 1);
+    waitpid(parent, &st, 0);
+    printf("parent: %s\n", describe(st));
+
+    /* 跟踪者（祖父进程）没取走就退出了 */
+    int done[2];
+    pipe(done);
+    pid_t tracer = fork();
+    if (tracer == 0) {
+        if (fork() == 0) {
+            pid_t c = fork();
+            if (c == 0) {
+                read(go[0], &ch, 1);
+                _exit(8);
+            }
+            write(up[1], &c, sizeof c);
+            read(chk[0], &ch, 1);
+            int st = -1;
+            printf("  parent before the tracer exits: waitpid %d\n", waitpid(c, &st, WNOHANG));
+            write(up[1], "x", 1);
+            pid_t r = waitpid(c, &st, 0);
+            printf("  parent after the tracer exits: %s\n", r == c ? describe(st) : "error");
+            write(done[1], "x", 1);
+            _exit(0);
+        }
+        pid_t c;
+        read(up[0], &c, sizeof c);
+        printf("seize %ld\n", ptrace(PTRACE_SEIZE, c, 0, 0));
+        write(go[1], "x", 1);
+        siginfo_t si = {0};
+        waitid(P_PID, c, &si, WEXITED | WNOWAIT);
+        printf("  tracer sees: code %d status %d\n", si.si_code, si.si_status);
+        write(chk[1], "x", 1);
+        read(up[0], &ch, 1);
+        _exit(0);
+    }
+    read(done[0], &ch, 1);
+    waitpid(tracer, &st, 0);
+    printf("tracer: %s\n", describe(st));
+}
+
 /* 被跟踪的进程忽略的信号也挂起，跟踪者看得到它 */
 static void ignored(void)
 {
@@ -613,6 +748,8 @@ int main(void)
     exec_events();
     seize_fork();
     group_stop();
+    stopped_attach();
+    foreign_tracer();
     ignored();
     threads();
     exitkill();

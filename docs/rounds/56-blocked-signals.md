@@ -1,6 +1,6 @@
 # M9 之前：被屏蔽的信号只叫醒等它的线程（2026-10-27）
 
-← [M9 之前：宿主 stdio 上的阻塞读只等宿主 fd（2026-10-27）](55-host-stdio.md) · [索引](../milestones.md)
+← [M9 之前：宿主 stdio 上的阻塞读只等宿主 fd（2026-10-27）](55-host-stdio.md) · [索引](../milestones.md) · [M9 之前：跟踪停住的进程、跟踪者先取走结束（2026-10-27）](57-ptrace-stopped-reaped.md) →
 
 [按对象唤醒](49-targeted-wakeups.md)起一直留着的推迟项：发给进程的信号被所有线程屏蔽（或者发给线程的信号被它屏蔽）时，叫醒所有等待者，为的是让 sigtimedwait 里的线程重新检查。[上一轮](55-host-stdio.md)查出它很常见：musl 的 fork 在 clone 前后屏蔽所有信号，fork 的那一刻正好有子进程退出，SIGCHLD 就是被所有线程屏蔽的。shell 起管道、构建工具并行起进程时都会碰到，每次都把系统里所有 poll、epoll、阻塞的读写、等锁的线程叫醒一遍。微基准（`target/herd/sockherd.c`）加了两项，8 个进程空等，epoll 和 recv 两种空等方式各量两次，每次操作的微秒数和空等的进程被叫醒的次数：
 

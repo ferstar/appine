@@ -19,6 +19,8 @@
 //! 停住时把寄存器存一份在 [`Trace::regs`]，跟踪者读写的是这一份，继续时写回 Cpu。停住期间
 //! 不处理信号，只有 SIGKILL 让它离开（Linux 的 TASK_TRACED）。
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use appine_engine::{Cpu, CpuState};
@@ -643,7 +645,14 @@ pub(crate) fn tracer_exited(k: &mut Kernel, tgid: Tid) {
         }
         detach(&task, None);
     }
-    k.trace_exits.retain(|e| e.tracer != tgid);
+    // 还没取走的结束：被跟踪的进程交给父进程（Linux 的 `__ptrace_detach`）
+    let (gone, kept) = std::mem::take(&mut k.trace_exits)
+        .into_iter()
+        .partition(|e| e.tracer == tgid);
+    k.trace_exits = kept;
+    for e in gone {
+        released(k, &e);
+    }
     for g in k.groups.values() {
         let mut g = g.borrow_mut();
         if g.leader_tracer == Some(tgid) {
@@ -659,6 +668,8 @@ pub(crate) struct TraceExit {
     /// 退出时所在的进程组（wait 按进程组等）。
     pub pgid: Tid,
     pub status: ExitStatus,
+    /// 是整个进程的结束：跟踪者取走之后进程才交给父进程（[`group_finished`]）。
+    pub process: bool,
 }
 
 /// 被跟踪的线程 `task` 退出了（已经从 `kernel.tasks` 里拿掉）：不是主线程的单独报告给
@@ -674,31 +685,66 @@ pub(crate) fn tracee_exited(k: &mut Kernel, task: &Task, group: &mut ThreadGroup
         return;
     }
     let status = group.exiting.unwrap_or(ExitStatus::Exited(code));
-    report_exit(k, tracer, tid, group.pgid, status);
+    let exit = TraceExit {
+        tracer,
+        pid: tid,
+        pgid: group.pgid,
+        status,
+        process: false,
+    };
+    report_exit(k, exit);
 }
 
-/// 进程结束了：主线程被父进程以外的进程跟踪着时，也报告给跟踪者。父进程本身就是跟踪者
-/// 时由普通的 wait 报告。
-pub(crate) fn group_finished(k: &mut Kernel, group: &ThreadGroup, status: ExitStatus) {
-    if let Some(tracer) = group.leader_tracer
-        && tracer != group.ppid
+/// 进程 `group` 结束了：主线程被父进程以外的进程跟踪着时，与 Linux 一样先只报告给跟踪者
+/// （发 SIGCHLD），它在 wait 里取走之后（[`released`]）或者自己退出时，才交给父进程。
+/// 这样推迟了时返回 true。父进程本身就是跟踪者时由普通的 wait 报告。
+pub(crate) fn group_finished(
+    k: &mut Kernel,
+    group: &Rc<RefCell<ThreadGroup>>,
+    status: ExitStatus,
+) -> bool {
+    let exit = {
+        let g = group.borrow();
+        match g.leader_tracer {
+            Some(tracer) if tracer != g.ppid && k.groups.contains_key(&tracer) => TraceExit {
+                tracer,
+                pid: g.tgid,
+                pgid: g.pgid,
+                status,
+                process: true,
+            },
+            _ => return false,
+        }
+    };
     {
-        report_exit(k, tracer, group.tgid, group.pgid, status);
+        let mut g = group.borrow_mut();
+        g.zombie = Some(status);
+        g.exit_tracer = Some(exit.tracer);
     }
+    report_exit(k, exit);
+    true
 }
 
-fn report_exit(k: &mut Kernel, tracer: Tid, pid: Tid, pgid: Tid, status: ExitStatus) {
-    if !k.groups.contains_key(&tracer) {
+/// 跟踪者取走了被跟踪的线程的结束 `e`（或者没取走就退出了）：整个进程的结束交给父进程。
+pub(crate) fn released(k: &mut Kernel, e: &TraceExit) {
+    if !e.process {
         return;
     }
-    k.trace_exits.push(TraceExit {
-        tracer,
-        pid,
-        pgid,
-        status,
-    });
+    if let Some(group) = k.groups.get(&e.pid).cloned()
+        && group.borrow().exit_tracer == Some(e.tracer)
+    {
+        crate::process::tracer_released(k, &group);
+    }
+}
+
+fn report_exit(k: &mut Kernel, exit: TraceExit) {
+    if !k.groups.contains_key(&exit.tracer) {
+        return;
+    }
+    let (tracer, info) = (exit.tracer, SigInfo::child(exit.pid, exit.status));
+    k.trace_exits.push(exit);
     request_wake_on(wake::CHILD);
-    signal::send_to_group(k, tracer, Signal::CHLD, SigInfo::child(pid, status));
+    signal::send_to_group(k, tracer, Signal::CHLD, info);
 }
 
 #[cfg(test)]

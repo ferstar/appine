@@ -440,8 +440,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 - 被跟踪的是线程，跟踪者记的是进程：Linux 只接受跟踪者线程自己发的请求，appine 放宽到跟踪者进程里的任何线程（appine 不记 fork 的是哪个线程，PTRACE_TRACEME 的跟踪者是父进程）。权限与 Linux 的 `PTRACE_MODE_ATTACH_REALCREDS` 相同：同一个用户并且可以 dump，或者有 `CAP_SYS_PTRACE`；没有 Yama 的限制。跟踪 pid 1 是 ESRCH，内置的 init 不是 guest 进程（§6）。
 - 被跟踪的线程在这些地方停下（ptrace-stop）：投递信号之前、group-stop、PTRACE_SYSCALL 让它继续之后系统调用的入口和出口，以及 `PTRACE_EVENT_*`（fork、vfork、clone、exec、vfork 结束、退出，PTRACE_INTERRUPT 和 PTRACE_SEIZE 跟进来的新线程的 `PTRACE_EVENT_STOP`）。停住时把寄存器存一份，跟踪者读写的是这一份，继续时写回 CPU 状态；停住期间只有 SIGKILL 能让它离开。与 arm64 Linux 一样，系统调用停住时 x7 是 0（入口）或 1（出口），跟踪者看不到、也改不了它原来的值；入口处跟踪者可以经由 `NT_ARM_SYSTEM_CALL` 改编号，改成 -1 时跳过这个系统调用，x0 是跟踪者设的返回值。
-- 与 Linux 一样，被跟踪的线程不丢弃被忽略的信号（跟踪者要看到它们）；参加完 group-stop 就照常执行，即使线程组仍然停着；SEIZE 跟踪的线程的 group-stop 报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 等它结束。
-- wait 报告 ptrace-stop 不要求 `WUNTRACED`，被跟踪的线程退出时也报告给跟踪者（不是主线程的单独报告），报告 ptrace-stop 时带着被跟踪进程的 rusage（strace -c 用它算时间）。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪，停在信号投递停止里的信号照常投递。
+- 与 Linux 一样，被跟踪的线程不丢弃被忽略的信号（跟踪者要看到它们）；参加完 group-stop 就照常执行，即使线程组仍然停着；SEIZE 跟踪的线程的 group-stop 报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 等它结束。跟踪一个已经停住的进程时，group-stop 报告停住它的信号（线程组记着，父进程取走了停止事件也一样），每取一个信号之前先报告 group-stop：ATTACH 时先是 group-stop，再是 ATTACH 发的 SIGSTOP。
+- wait 报告 ptrace-stop 不要求 `WUNTRACED`，被跟踪的线程退出时也报告给跟踪者（不是主线程的单独报告），报告 ptrace-stop 时带着被跟踪进程的 rusage（strace -c 用它算时间）。跟踪者不是父进程时，与 Linux 一样，结束了的进程先只有跟踪者看得见（只给它发 SIGCHLD，父进程的 wait 接着等），跟踪者用 wait 取走或者退出之后才交给父进程；被跟踪的非主线程退出时不让父进程等（Linux 的 `delay_group_leader` 会等）。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪，停在信号投递停止里的信号照常投递。
 - regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`（见下）。guest 没有 SVE、PAC、MTE、SME，也就没有它们的 regset。
 - 单步（PTRACE_SINGLESTEP）由解释器执行一条指令（`appine_cpu_step`），执行完了投递 `TRAP_TRACE` 的 SIGTRAP。与 arm64 Linux 一样，单步执行 svc 时系统调用做完再报告（`SI_USER`），下一次单步不执行指令、原地再报告一次；单步时进了信号处理函数，先停在处理函数的第一条指令上（`ptrace_notify` 的 SIGTRAP，`si_code` 也是 SIGTRAP），不执行它。
 - sigsuspend、ppoll 临时换掉屏蔽字时，PTRACE_GETSIGMASK 读到的是原来的（与 Linux 的 `TIF_RESTORE_SIGMASK` 一样）；PTRACE_SETSIGMASK 之后不再恢复原来的，处理函数返回后是跟踪者设的。

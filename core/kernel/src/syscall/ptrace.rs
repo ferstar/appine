@@ -225,10 +225,11 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
             options,
             ..Trace::default()
         };
-        // 线程组已经被停住了：马上作为 group-stop 停下来报告（Linux 的 JOBCTL_TRAP_STOP）
+        // 线程组已经被停住了：马上作为 group-stop 停下来报告（Linux 的 JOBCTL_TRAP_STOP），
+        // 报告的是停住它的信号，父进程取走了停止事件也一样
         let g = group.borrow();
         if g.stopped {
-            t.group_stop = Some(g.stop_report.unwrap_or(Signal::STOP));
+            t.group_stop = Some(g.stop_signal);
         }
     }
     if !seize {

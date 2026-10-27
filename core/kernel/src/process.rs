@@ -325,6 +325,9 @@ pub(crate) struct ThreadGroup {
     pub ctty: Option<Rc<RefCell<Tty>>>,
     /// 整个线程组被停止信号停住了。
     pub stopped: bool,
+    /// 停住线程组的停止信号（Linux 的 `JOBCTL_STOP_SIGMASK`），停着时有意义：父进程的
+    /// wait 取走停止事件之后仍然记着，停着的时候被跟踪的线程按它报告 group-stop。
+    pub stop_signal: Signal,
     /// 还没有被父进程的 wait 取走的"停止"事件。
     pub stop_report: Option<Signal>,
     /// 还没有被父进程的 wait 取走的"继续"事件。
@@ -380,6 +383,10 @@ pub(crate) struct ThreadGroup {
     pub serial: u64,
     /// 主线程退出时跟踪着它的进程：整个进程结束时也报告给它（[`crate::ptrace`]）。
     pub leader_tracer: Option<Tid>,
+    /// 结束时跟踪着主线程、又不是父进程的跟踪者：它用 wait 取走这次结束（或者它自己退出）
+    /// 之前，这个僵尸进程只有它看得见，父进程等不到、也不收到通知（Linux 的僵尸进程
+    /// 还被跟踪着时）。
+    pub exit_tracer: Option<Tid>,
 }
 
 impl ThreadGroup {
@@ -402,6 +409,7 @@ impl ThreadGroup {
             exit_signal: Signal::CHLD.number(),
             ctty: None,
             stopped: false,
+            stop_signal: Signal::STOP,
             stop_report: None,
             cont_report: false,
             exe: Vec::new(),
@@ -427,6 +435,7 @@ impl ThreadGroup {
             posix_timers: std::collections::BTreeMap::new(),
             aio: std::collections::BTreeMap::new(),
             leader_tracer: None,
+            exit_tracer: None,
         }
     }
 }
@@ -565,7 +574,8 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             if let Some(sig) = Signal::new(cg.pdeathsig) {
                 orphaned.push((c, sig));
             }
-            cg.zombie.is_some()
+            // 跟踪者还没取走的僵尸进程交给 init，跟踪者取走之后由 init 回收
+            cg.zombie.is_some() && cg.exit_tracer.is_none()
         };
         if zombie {
             k.groups.remove(&c);
@@ -582,9 +592,11 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     }
     k.ipc.exit(tgid);
     release_ctty(k, group);
-    hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
-    // 被父进程以外的进程跟踪着的也报告给跟踪者；它跟踪着的不再被跟踪
-    crate::ptrace::group_finished(k, &group.borrow(), status);
+    // 被父进程以外的进程跟踪着的先报告给跟踪者，它取走之后再交给父进程；它跟踪着的
+    // 不再被跟踪
+    if !crate::ptrace::group_finished(k, group, status) {
+        hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
+    }
     crate::ptrace::tracer_exited(k, tgid);
     // POSIX：进程组因为这次退出变成孤儿时，如果组里有停住的进程，先发 SIGHUP 再发
     // SIGCONT，否则它们再也没有机会继续
@@ -626,6 +638,21 @@ pub(crate) fn finish_group_after_bug(k: &mut Kernel, group: &Rc<RefCell<ThreadGr
         hand_to_parent(k, group, ids, status);
     }
     finished(k, ids.0);
+}
+
+/// 跟踪者取走了结束了的进程 `group`（或者没取走就退出了）：交给父进程，与 Linux 的
+/// `wait_task_zombie`、`__ptrace_detach` 对僵尸进程的处理一样（[`crate::ptrace`]）。
+pub(crate) fn tracer_released(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let (ids, status) = {
+        let mut g = group.borrow_mut();
+        g.exit_tracer = None;
+        let Some(status) = g.zombie else {
+            return;
+        };
+        ((g.tgid, g.ppid, g.exit_signal), status)
+    };
+    hand_to_parent(k, group, ids, status);
+    request_wake_on(wake::CHILD);
 }
 
 /// 退出的进程（`tgid`、`ppid`、`exit_signal`）交给父进程：父进程是 init、已经不在了，

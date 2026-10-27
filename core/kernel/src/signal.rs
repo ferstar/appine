@@ -764,6 +764,7 @@ fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
     let threads = {
         let mut g = group.borrow_mut();
         g.stopped = true;
+        g.stop_signal = sig;
         g.stop_report = Some(sig);
         g.cont_report = false;
         g.threads.clone()
@@ -825,19 +826,24 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
     if cx.task.killed.get() {
         return Flow::Exit;
     }
-    // 线程组被别的线程停住了：在返回 guest 之前一起停下。被跟踪的停在 ptrace-stop 里报告
-    // 给跟踪者，跟踪者用 PTRACE_INTERRUPT 要它停的也在这里停（crate::ptrace）
-    if crate::ptrace::traced(cx.task)
-        && (!crate::ptrace::group_stop(cx, cpu) || !crate::ptrace::trap(cx, cpu))
-    {
-        return Flow::Exit;
-    }
-    if let Flow::Exit = wait_while_stopped(cx) {
-        return Flow::Exit;
-    }
-
     let mut handled = false;
-    while let Some((sig, info)) = dequeue(cx) {
+    loop {
+        // 线程组被停住了（别的线程、或者下面刚取到的停止信号）：在返回 guest 之前一起停下。
+        // 被跟踪的停在 ptrace-stop 里报告给跟踪者，跟踪者用 PTRACE_INTERRUPT 要它停的、
+        // 停着时被跟踪了的也在这里停（crate::ptrace）。与 Linux 的 get_signal 一样，每取一个
+        // 信号之前先做这些：停着时被 PTRACE_ATTACH 的，先报告 group-stop，再报告 ATTACH 发的
+        // SIGSTOP
+        if let Flow::Exit = wait_while_stopped(cx) {
+            return Flow::Exit;
+        }
+        if crate::ptrace::traced(cx.task)
+            && (!crate::ptrace::group_stop(cx, cpu) || !crate::ptrace::trap(cx, cpu))
+        {
+            return Flow::Exit;
+        }
+        let Some((sig, info)) = dequeue(cx) else {
+            break;
+        };
         // 被跟踪的线程先停下来让跟踪者看（信号投递停止），跟踪者可以换掉或者不投递它；
         // SIGKILL 不经过这里
         let (sig, info) = if crate::ptrace::traced(cx.task) {
@@ -860,12 +866,6 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
                     continue;
                 }
                 group_stop(cx, sig);
-                if crate::ptrace::traced(cx.task) && !crate::ptrace::group_stop(cx, cpu) {
-                    return Flow::Exit;
-                }
-                if let Flow::Exit = wait_while_stopped(cx) {
-                    return Flow::Exit;
-                }
                 continue;
             }
             SigAction::DEFAULT => {
