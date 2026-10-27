@@ -116,6 +116,8 @@ pub enum FileKind {
     Pidfd(Pidfd),
     /// POSIX 消息队列。
     MessageQueue(Rc<RefCell<crate::syscall::MessageQueue>>),
+    /// seccomp 的通知 fd（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）。
+    SeccompNotify(crate::seccomp::Listener),
     /// procfs 的文件：打开时生成的内容。
     Proc {
         /// 节点。
@@ -213,6 +215,7 @@ impl OpenFile {
             | FileKind::SignalFd(_)
             | FileKind::Inotify(_)
             | FileKind::Pidfd(_)
+            | FileKind::SeccompNotify(_)
             | FileKind::MessageQueue(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
@@ -514,13 +517,19 @@ impl FdTable {
             .ok_or(Errno::EBADF)
     }
 
+    /// 不小于 `min` 的最小空闲 fd。
+    pub fn free_slot(&self, min: usize) -> Result<i32, Errno> {
+        (min..self.limit)
+            .find(|&i| self.slots.get(i).is_none_or(Option::is_none))
+            .map(|i| i as i32)
+            .ok_or(Errno::EMFILE)
+    }
+
     /// 放到不小于 `min` 的最小空闲 fd 上。
     pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
-        let fd = (min..self.limit)
-            .find(|&i| self.slots.get(i).is_none_or(Option::is_none))
-            .ok_or(Errno::EMFILE)?;
-        self.install_at(fd as i32, file, cloexec)?;
-        Ok(fd as i32)
+        let fd = self.free_slot(min)?;
+        self.install_at(fd, file, cloexec)?;
+        Ok(fd)
     }
 
     /// 放到指定的 fd 上，返回被替换掉的原来的文件（dup2/dup3）。

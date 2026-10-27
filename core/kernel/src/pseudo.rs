@@ -120,7 +120,7 @@ const ENTRIES: [(&[u8], Entry); 24] = [
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 66] = [
+const STATIC: [&[u8]; 69] = [
     b"net/",
     b"net/dev",
     b"net/icmp",
@@ -172,6 +172,9 @@ const STATIC: [&[u8]; 66] = [
     b"sys/kernel/random/poolsize",
     b"sys/kernel/random/uuid",
     b"sys/kernel/sched_rr_timeslice_ms",
+    b"sys/kernel/seccomp/",
+    b"sys/kernel/seccomp/actions_avail",
+    b"sys/kernel/seccomp/actions_logged",
     b"sys/kernel/sem",
     b"sys/kernel/shmall",
     b"sys/kernel/shmmax",
@@ -776,6 +779,7 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
         FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
         FileKind::Pidfd(_) => b"anon_inode:[pidfd]".to_vec(),
+        FileKind::SeccompNotify(_) => b"anon_inode:seccomp notify".to_vec(),
         FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
         FileKind::SignalFd(_) => b"anon_inode:[signalfd]".to_vec(),
         FileKind::Host(fd) => std::fs::read_link(format!("/proc/self/fd/{fd}"))
@@ -864,6 +868,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/kernel/threads-max"
                     | b"sys/kernel/ns_last_pid"
                     | b"sys/kernel/core_pattern"
+                    | b"sys/kernel/seccomp/actions_logged"
                     | b"sys/kernel/core_uses_pid"
                     | b"sys/kernel/msgmax"
                     | b"sys/kernel/msgmnb"
@@ -1014,6 +1019,9 @@ pub(crate) fn write(
         if privileged {
             g.oom_score_adj_min = value;
         }
+    }
+    if let PseudoNode::Static(b"sys/kernel/seccomp/actions_logged") = node {
+        crate::seccomp::set_actions_logged(k, cred, data)?;
     }
     // 与 Linux 的 proc_dostring 一样，长了截断（core_pattern 最长 127 个字节）
     if let PseudoNode::Static(b"sys/kernel/core_pattern") = node {
@@ -1345,7 +1353,16 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "CapEff:\t{:016x}", c.cap_effective).unwrap();
     writeln!(s, "CapBnd:\t{:016x}", c.cap_bounding).unwrap();
     writeln!(s, "CapAmb:\t0000000000000000").unwrap();
-    writeln!(s, "NoNewPrivs:\t{}\nSeccomp:\t0", g.no_new_privs as u8).unwrap();
+    let (seccomp, filters) = task.as_ref().map_or((0, 0), |t| {
+        let s = t.seccomp.borrow();
+        (s.mode, s.filters())
+    });
+    writeln!(
+        s,
+        "NoNewPrivs:\t{}\nSeccomp:\t{seccomp}\nSeccomp_filters:\t{filters}",
+        g.no_new_privs as u8
+    )
+    .unwrap();
     writeln!(s, "Cpus_allowed_list:\t0-{}", cpus() - 1).unwrap();
     // 宿主线程睡下（等待）一次是一次自愿切换：没被叫醒的线程不会变
     let (vol, nonvol) = task.as_ref().map_or((0, 0), |t| {
@@ -1919,6 +1936,8 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
             b"sys/kernel/ns_last_pid" => format!("{}\n", ps.k.last_pid()),
+            b"sys/kernel/seccomp/actions_avail" => crate::seccomp::actions_avail(),
+            b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),

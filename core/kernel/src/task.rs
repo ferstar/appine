@@ -20,7 +20,7 @@ use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake_on, wake};
 use crate::mm::{Generations, Mm};
-use crate::process::{CpuTime, Signal, ThreadGroup, Tier};
+use crate::process::{CpuTime, ExitStatus, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
 use crate::syscall::fast::Fast;
 use crate::syscall::{self, Flow};
@@ -109,8 +109,15 @@ pub(crate) struct Task {
     /// 跟踪者用 PTRACE_SYSCALL 让它继续了：系统调用都交给持有 BKL 的路径，好在入口和
     /// 出口停下（`syscall::fast` 不持 BKL 时读它）。
     pub syscall_traced: AtomicBool,
-    /// 线程自己 exit(2) 的退出码（被跟踪的线程退出时报告给跟踪者）。
-    pub exit_code: Cell<i32>,
+    /// 线程自己结束时的结束方式：exit(2) 的退出码，或者 seccomp 让它以信号结束（被跟踪的
+    /// 线程退出时报告给跟踪者）。
+    pub exit_status: Cell<ExitStatus>,
+    /// 已进入退出流程（可能还停在 PTRACE_EVENT_EXIT）。
+    exit_started: Cell<bool>,
+    /// seccomp 的状态（[`crate::seccomp`]），只在持有 BKL 时访问。
+    pub seccomp: RefCell<crate::seccomp::Seccomp>,
+    /// 线程有 seccomp：系统调用都交给持有 BKL 的路径检查（`syscall::fast` 不持 BKL 时读它）。
+    pub seccomp_on: AtomicBool,
     /// 跟踪者用 PTRACE_SINGLESTEP 让它继续了：运行循环每次只让解释器执行一条指令
     /// （[`crate::ptrace::step_done`]），不持 BKL 时读它。
     pub stepping: AtomicBool,
@@ -188,11 +195,31 @@ impl Task {
             host_tid: Cell::new(0),
             trace: RefCell::default(),
             syscall_traced: AtomicBool::new(false),
-            exit_code: Cell::new(0),
+            exit_status: Cell::new(ExitStatus::Exited(0)),
+            exit_started: Cell::new(false),
+            seccomp: RefCell::default(),
+            seccomp_on: AtomicBool::new(false),
             stepping: AtomicBool::new(false),
             step_again: AtomicBool::new(false),
             state: RefCell::new(state),
         }))
+    }
+
+    /// Linux 的 synchronize_group_exit：最后一个进入退出流程的线程确定进程的退出
+    /// 状态，已有 exit_group/致命信号的状态不覆盖。必须在 PTRACE_EVENT_EXIT 之前做，
+    /// 不能按跟踪者放行之后的资源释放顺序决定。
+    pub(crate) fn begin_exit(&self, k: &Kernel, group: &RefCell<ThreadGroup>, status: ExitStatus) {
+        if self.exit_started.replace(true) {
+            return;
+        }
+        self.exit_status.set(status);
+        let mut g = group.borrow_mut();
+        if g.threads
+            .iter()
+            .all(|tid| k.tasks.get(tid).is_none_or(|t| t.exit_started.get()))
+        {
+            g.exiting.get_or_insert(status);
+        }
     }
 
     /// 线程用掉的 CPU 时间（纳秒），以宿主线程的 CPU 时间计。
@@ -704,6 +731,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     let mut k = shared.lock();
     let (tid, tgid) = (task.tid.get(), task.tgid);
     let group = task.state.borrow().group.clone();
+    task.begin_exit(&k, &group, task.exit_status.get());
     let released = crate::bug::catch(|| {
         crate::bug::trap(Trap::Exit, tid);
         // 进程正在写 core 文件：留下寄存器（crate::coredump）
@@ -724,8 +752,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         }
         release_mm(shared, &task, &mut st);
         // 被跟踪的线程退出了：报告给跟踪者（crate::ptrace）
-        let code = task.exit_code.get();
-        crate::ptrace::tracee_exited(&mut k, &task, &mut group.borrow_mut(), code);
+        let status = task.exit_status.get();
+        crate::ptrace::tracee_exited(&mut k, &task, &mut group.borrow_mut(), status);
+        crate::seccomp::exited(&task, &mut group.borrow_mut());
     });
     if released.is_none() {
         let what = format_args!("kernel panic while the thread was exiting");

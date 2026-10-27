@@ -357,6 +357,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ## 6. 进程、线程与调度
 
+- **退出状态**：`exit_group`、致命信号先确定整个进程的退出状态；各线程单独退出时，由最后一个进入退出流程的线程确定。按 Linux 6.1 稳定分支的 [`synchronize_group_exit`](https://github.com/gregkh/linux/blob/linux-6.1.y/kernel/exit.c) 在 `PTRACE_EVENT_EXIT` 前同步，所以跟踪者改变放行顺序不改变进程退出码；状态确定后，退出清理中的内核故障也不再覆盖它。
 - **1:1 线程模型**：每个 guest 线程（`struct task`）对应一个宿主 pthread，调度交给宿主内核。guest 线程结束之后它的宿主线程留 5 秒给下一个 guest 线程用（最多留 8 个），fork 不必每次新建宿主线程（叫醒新线程要跨核中断，还要分配内核栈）。复用时 CPU 时间从线程开始时的读数算起，nice、亲和性重新设置。引擎的 CPU 状态（含 4096 项的数据 TLB，约 130 KB）也留 8 个给下一个线程，只清掉填过的 TLB 项，不必每个线程新映射一段、逐页缺页、结束时再拆掉。
 - **驻留内存**（`ru_maxrss`、`/proc/<pid>/status` 的 VmRSS、OOM killer 挑进程）按 VMA 用宿主的 mincore 数，execve 和退出时各量一次。宿主上首尾相接的 VMA 合起来量一次；只有 page cache 页的文件映射（没写过的私有映射、共享映射）驻留多少是文件本身的事，结果按文件的一段缓存 1 秒，程序和库的代码段不必每次在 page cache 里逐页查找。峰值（`ru_maxrss`）的取样更省：要量的几段合计不超过 1 MB 时按全部驻留算（最多多算 1 MB）；fork 出来、不到一个时钟滴答就 execve 的进程（shell 起进程）不量它自己的匿名内存，只算借来的页和缓存着的文件映射。mincore 持着 BKL 等宿主的 mmap_lock，4 个进程同时起进程时，这几次取样占了一成多的时间。
 - **大内核锁（BKL）**：进入 syscall 时获取；执行 guest 代码时**不持有**；在内核层里等待之前**释放**。内核对象之间用 `Rc`/`RefCell` 共享，只在持有 BKL 时访问。

@@ -38,6 +38,7 @@ pub(crate) mod event {
     pub const EXEC: u32 = 4;
     pub const VFORK_DONE: u32 = 5;
     pub const EXIT: u32 = 6;
+    pub const SECCOMP: u32 = 7;
     pub const STOP: u32 = 128;
 }
 
@@ -483,10 +484,7 @@ pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
             return false;
         }
     }
-    let svc = cpu.state().pc.wrapping_sub(4);
-    let vdso = cx.mm().vdso;
-    let in_vdso = vdso != 0 && (vdso..vdso + crate::vdso::image().len() as u64).contains(&svc);
-    !(in_vdso && matches!(nr, 113 | 114 | 169))
+    !crate::vdso::clock_stub(cx, cpu.state().pc, nr)
 }
 
 /// 系统调用的停住：与 arm64 Linux 一样，停住期间 x7 是 0（入口）或 1（出口），跟踪者
@@ -531,6 +529,15 @@ pub(crate) fn syscall_exit(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     !syscall_traced(cx, cpu, nr) || syscall_stop(cx, cpu, false)
 }
 
+/// seccomp 的过滤器返回 TRACE（数据是 `data`）：停一次 `PTRACE_EVENT_SECCOMP`，跟踪者
+/// 可以改编号（`NT_ARM_SYSTEM_CALL`，-1 是跳过）和寄存器。返回之后的编号；线程被结束时
+/// 返回 None。
+pub(crate) fn seccomp_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64, data: u32) -> Option<u64> {
+    cx.task.trace.borrow_mut().syscallno = nr as i32;
+    event(cx, cpu, event::SECCOMP, u64::from(data))
+        .then(|| cx.task.trace.borrow().syscallno as i64 as u64)
+}
+
 /// `PTRACE_EVENT_*` 停下（跟踪者打开了这个事件时）。线程被结束时返回 false。
 pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> bool {
     if !cx.task.trace.borrow().enabled(e) {
@@ -563,6 +570,7 @@ pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
 /// wait 的状态字。exit_group 已经要求所有线程退出，包括自己；调用者自己仍然停下来报告，
 /// 停住期间被 SIGKILL 结束时不再等。
 pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
+    cx.task.begin_exit(cx.kr(), &cx.t.group, status);
     if !cx.task.trace.borrow().enabled(event::EXIT) {
         return;
     }
@@ -673,9 +681,14 @@ pub(crate) struct TraceExit {
 }
 
 /// 被跟踪的线程 `task` 退出了（已经从 `kernel.tasks` 里拿掉）：不是主线程的单独报告给
-/// 跟踪者；主线程记下跟踪者，等整个进程结束时再报告（[`group_finished`]）。`code` 是
-/// 线程自己 exit 的退出码。
-pub(crate) fn tracee_exited(k: &mut Kernel, task: &Task, group: &mut ThreadGroup, code: i32) {
+/// 跟踪者；主线程记下跟踪者，等整个进程结束时再报告（[`group_finished`]）。`status` 是
+/// 线程自己结束的方式。
+pub(crate) fn tracee_exited(
+    k: &mut Kernel,
+    task: &Task,
+    group: &mut ThreadGroup,
+    status: ExitStatus,
+) {
     let Some(tracer) = task.trace.borrow().tracer else {
         return;
     };
@@ -684,7 +697,7 @@ pub(crate) fn tracee_exited(k: &mut Kernel, task: &Task, group: &mut ThreadGroup
         group.leader_tracer = Some(tracer);
         return;
     }
-    let status = group.exiting.unwrap_or(ExitStatus::Exited(code));
+    let status = group.exiting.unwrap_or(status);
     let exit = TraceExit {
         tracer,
         pid: tid,

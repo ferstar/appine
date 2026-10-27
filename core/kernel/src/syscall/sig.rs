@@ -386,6 +386,17 @@ fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
             put32(20, fd as u32);
             put32(28, band as u32);
         }
+        InfoFields::Sys {
+            errno,
+            call_addr,
+            syscall,
+            arch,
+        } => {
+            put32(4, errno as u32);
+            put32(84, syscall as u32);
+            put32(96, arch);
+            b[88..96].copy_from_slice(&call_addr.to_le_bytes());
+        }
         // 跟踪者给的：多数 si_code 的开头是发送者的 pid 和 uid
         InfoFields::Raw(rest) => {
             put32(12, u32::from_le_bytes(rest[..4].try_into().unwrap()));
@@ -421,11 +432,16 @@ pub(super) fn rt_sigaction(
             flags: word(1),
             restorer: word(2),
             mask: word(3) & !UNBLOCKABLE,
+            immutable: false,
         })
     } else {
         None
     };
     let sighand = cx.t.group.borrow().sighand.clone();
+    // seccomp 要结束进程时强制的默认处理不能再改（Linux 的 SA_IMMUTABLE）
+    if sighand.borrow().get(sig).immutable {
+        return Err(Errno::EINVAL);
+    }
     if oact != 0 {
         let old = sighand.borrow().get(sig);
         let mut b = [0u8; 32];

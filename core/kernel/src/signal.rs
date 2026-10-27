@@ -49,6 +49,9 @@ pub(crate) struct SigAction {
     pub flags: u64,
     pub restorer: u64,
     pub mask: u64,
+    /// seccomp 要结束进程时强制的默认处理（Linux 的 `SA_IMMUTABLE`）：不能再改，跟踪者也
+    /// 拦不下（[`force_fatal`]）。
+    pub immutable: bool,
 }
 
 impl SigAction {
@@ -158,6 +161,13 @@ pub(crate) enum InfoFields {
     Fault { addr: u64 },
     /// 信号驱动的 I/O（`F_SETSIG`）：就绪的事件和 fd。
     Poll { band: i64, fd: i32 },
+    /// seccomp 的 SIGSYS：过滤器给的数据（`si_errno`）、svc 之后的地址、系统调用的编号和架构。
+    Sys {
+        errno: i32,
+        call_addr: u64,
+        syscall: i32,
+        arch: u32,
+    },
     /// 跟踪者用 PTRACE_SETSIGINFO 给的：`siginfo_t` 在 si_code 之后的部分，原样投递。
     Raw([u8; 112]),
 }
@@ -271,6 +281,17 @@ impl SigInfo {
             InfoFields::Poll { band, fd } => {
                 b[16..24].copy_from_slice(&band.to_le_bytes());
                 b[24..28].copy_from_slice(&fd.to_le_bytes());
+            }
+            InfoFields::Sys {
+                errno,
+                call_addr,
+                syscall,
+                arch,
+            } => {
+                b[4..8].copy_from_slice(&errno.to_le_bytes());
+                b[16..24].copy_from_slice(&call_addr.to_le_bytes());
+                b[24..28].copy_from_slice(&syscall.to_le_bytes());
+                b[28..32].copy_from_slice(&arch.to_le_bytes());
             }
             InfoFields::Raw(rest) => b[16..].copy_from_slice(&rest),
         }
@@ -695,6 +716,24 @@ pub(crate) fn force(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
     cx.task.pending.borrow_mut().add(sig, info, false);
 }
 
+/// seccomp 要结束进程（Linux 的 `force_sig_info_to_task(..., HANDLER_EXIT)`）：不管原来怎样
+/// 处理，恢复默认处理、解除屏蔽，并且不能再改、跟踪者拦不下（`SA_IMMUTABLE`），然后挂到
+/// 当前线程上。默认动作结束进程（SIGSYS 写 core）。
+pub(crate) fn force_fatal(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
+    {
+        let group = cx.t.group.borrow();
+        let mut sh = group.sighand.borrow_mut();
+        let act = SigAction {
+            handler: SigAction::DEFAULT,
+            immutable: true,
+            ..sh.get(sig)
+        };
+        sh.set(sig, act);
+    }
+    cx.task.sigmask.set(cx.task.sigmask.get() & !sig.bit());
+    cx.task.pending.borrow_mut().add(sig, info, false);
+}
+
 // ---- 信号的投递 ----
 
 /// 同步异常产生的信号优先投递（Linux 的 `SYNCHRONOUS_MASK`）。
@@ -845,8 +884,9 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             break;
         };
         // 被跟踪的线程先停下来让跟踪者看（信号投递停止），跟踪者可以换掉或者不投递它；
-        // SIGKILL 不经过这里
-        let (sig, info) = if crate::ptrace::traced(cx.task) {
+        // SIGKILL 不经过这里，seccomp 强制的也不停（SA_IMMUTABLE）
+        let immutable = cx.t.group.borrow().sighand.borrow().get(sig).immutable;
+        let (sig, info) = if crate::ptrace::traced(cx.task) && !immutable {
             match crate::ptrace::signal_stop(cx, cpu, sig, info) {
                 Ok(Some(delivered)) => delivered,
                 Ok(None) => continue,

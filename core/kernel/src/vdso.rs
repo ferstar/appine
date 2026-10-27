@@ -235,6 +235,14 @@ pub fn sigreturn_offset() -> u64 {
     get().sigreturn
 }
 
+/// svc 之后的 pc 是 `pc`、编号是 `nr` 的系统调用来自 vDSO 里读时钟的存根（clock_gettime、
+/// clock_getres、gettimeofday）：Linux 上它们不进内核，跟踪者看不到，seccomp 也不检查。
+pub(crate) fn clock_stub(cx: &crate::kernel::Cx<'_>, pc: u64, nr: u64) -> bool {
+    let svc = pc.wrapping_sub(4);
+    let vdso = cx.mm().vdso;
+    vdso != 0 && (vdso..vdso + image().len() as u64).contains(&svc) && matches!(nr, 113 | 114 | 169)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -70,9 +70,10 @@ const MAX_INTERP_DEPTH: usize = 4;
 const SHEBANG_MAX: usize = 256;
 
 pub(super) fn exit(cx: &mut Cx<'_>, code: i32) -> Flow {
-    cx.task.exit_code.set(code & 0xff);
+    let status = ExitStatus::Exited(code & 0xff);
+    cx.task.exit_status.set(status);
     if cx.tid() == cx.tgid() {
-        cx.t.group.borrow_mut().leader_code = code & 0xff;
+        cx.t.group.borrow_mut().leader_status = status;
     }
     Flow::Exit
 }
@@ -343,6 +344,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     task.deadline.set(cx.task.deadline.get());
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));
+    // seccomp 的模式和过滤器链与 Linux 一样继承
+    let seccomp = cx.task.seccomp.borrow().clone();
+    task.seccomp_on
+        .store(seccomp.mode != 0, std::sync::atomic::Ordering::Relaxed);
+    *task.seccomp.borrow_mut() = seccomp;
     // 被跟踪的线程 clone 出来的可能也被跟踪（crate::ptrace）
     let traced = crate::ptrace::clone(cx.task, &task, flags, args.exit_signal);
 
@@ -740,7 +746,10 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
         let task = k.tasks.remove(&me).unwrap();
         task.tid.set(tgid);
         k.tasks.insert(tgid, task);
-        cx.t.group.borrow_mut().threads = vec![tgid];
+        let mut g = cx.t.group.borrow_mut();
+        g.threads = vec![tgid];
+        // 原来的主线程已经被回收了（Linux 的 de_thread 里 release_task）
+        g.leader_seccomp = None;
     }
     Ok(())
 }

@@ -41,6 +41,8 @@ const INTERRUPT: i64 = 0x4207;
 const LISTEN: i64 = 0x4208;
 const GETSIGMASK: i64 = 0x420a;
 const SETSIGMASK: i64 = 0x420b;
+const SECCOMP_GET_FILTER: i64 = 0x420c;
+const SECCOMP_GET_METADATA: i64 = 0x420d;
 const GET_SYSCALL_INFO: i64 = 0x420e;
 
 /// regset 的类型（`NT_*`）。
@@ -99,7 +101,7 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             if data & !(opt::MASK as u64) != 0 {
                 return Err(Errno::EINVAL);
             }
-            check_options(data as u32)?;
+            check_options(cx, data as u32)?;
             task.trace.borrow_mut().options = data as u32;
             Ok(0)
         }
@@ -161,6 +163,8 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             }
         }
         GET_SYSCALL_INFO => syscall_info(cx, &task, addr, data),
+        SECCOMP_GET_FILTER => crate::seccomp::get_filter(cx, &task, addr, data),
+        SECCOMP_GET_METADATA => crate::seccomp::get_metadata(cx, &task, addr, data),
         // PEEKUSR、POKEUSR、GETREGS 这些在 arm64 上本来就没有
         _ => Err(Errno::EIO),
     }
@@ -180,10 +184,20 @@ fn traceme(cx: &mut Cx<'_>) -> SysResult {
     Ok(0)
 }
 
-/// 选项里 appine 做不到的：没有 seccomp，所以没有 `PTRACE_O_SUSPEND_SECCOMP`。
-fn check_options(options: u32) -> Result<(), Errno> {
+/// `PTRACE_O_SUSPEND_SECCOMP`（checkpoint/restore 用）：要求 `CAP_SYS_ADMIN`，跟踪者自己
+/// 没有 seccomp、也没有被这样跟踪着（Linux 的 `check_ptrace_options`）。
+fn check_options(cx: &Cx<'_>, options: u32) -> Result<(), Errno> {
     if options & opt::SUSPEND_SECCOMP != 0 {
-        return Err(Errno::EINVAL);
+        let suspended = {
+            let t = cx.task.trace.borrow();
+            t.tracer.is_some() && t.options & opt::SUSPEND_SECCOMP != 0
+        };
+        if !cx.cred().capable(crate::cred::cap::SYS_ADMIN)
+            || cx.task.seccomp.borrow().mode != crate::seccomp::mode::DISABLED
+            || suspended
+        {
+            return Err(Errno::EPERM);
+        }
     }
     Ok(())
 }
@@ -196,7 +210,7 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
         if addr != 0 || data & !(opt::MASK as u64) != 0 {
             return Err(Errno::EIO);
         }
-        check_options(data as u32)?;
+        check_options(cx, data as u32)?;
         data as u32
     } else {
         0
@@ -458,7 +472,8 @@ fn regset(cx: &mut Cx<'_>, task: &Task, set: bool, nt: u64, iov: u64) -> SysResu
 fn syscall_info(cx: &mut Cx<'_>, task: &Task, size: u64, data: u64) -> SysResult {
     const OP_ENTRY: u8 = 1;
     const OP_EXIT: u8 = 2;
-    let mut b = [0u8; 80];
+    const OP_SECCOMP: u8 = 3;
+    let mut b = [0u8; 88];
     let actual = {
         let t = task.trace.borrow();
         let r = t.regs.as_ref().ok_or(Errno::ESRCH)?;
@@ -469,14 +484,25 @@ fn syscall_info(cx: &mut Cx<'_>, task: &Task, size: u64, data: u64) -> SysResult
             .siginfo
             .map_or(0, |s| i32::from_le_bytes(s[8..12].try_into().unwrap()));
         let syscall = si_code == Signal::TRAP.number() | 0x80;
+        let seccomp = si_code == Signal::TRAP.number() | (event::SECCOMP as i32) << 8;
+        let entry = |b: &mut [u8; 88]| {
+            b[24..32].copy_from_slice(&(t.syscallno as i64).to_le_bytes());
+            let args = [r.orig_x0, r.x[1], r.x[2], r.x[3], r.x[4], r.x[5]];
+            for (i, a) in args.iter().enumerate() {
+                b[32 + i * 8..40 + i * 8].copy_from_slice(&a.to_le_bytes());
+            }
+        };
         match t.message {
+            // seccomp 的 TRACE：编号和参数，加上过滤器给的数据
+            data if seccomp => {
+                b[0] = OP_SECCOMP;
+                entry(&mut b);
+                b[80..84].copy_from_slice(&(data as u32).to_le_bytes());
+                84
+            }
             EVENTMSG_SYSCALL_ENTRY if syscall => {
                 b[0] = OP_ENTRY;
-                b[24..32].copy_from_slice(&(t.syscallno as i64).to_le_bytes());
-                let args = [r.orig_x0, r.x[1], r.x[2], r.x[3], r.x[4], r.x[5]];
-                for (i, a) in args.iter().enumerate() {
-                    b[32 + i * 8..40 + i * 8].copy_from_slice(&a.to_le_bytes());
-                }
+                entry(&mut b);
                 80
             }
             EVENTMSG_SYSCALL_EXIT if syscall => {

@@ -2,6 +2,7 @@
  * 内核层和引擎的 bug 只结束撞上它的 guest 进程（设计文档 §7.4、§12 第 5 条）。bug 用
  * debug 构建的测试钩子模拟：appine-run 要设置 APPINE_TEST_HOOKS=1 和 APPINE_ON_BUG=kill。
  * 每种 bug 都在子进程里触发，父进程检查子进程被 SIGSEGV 结束，自己照常运行。
+ * 已经确定了整个进程的退出状态时，退出清理中的 bug 不再覆盖它。
  *
  * 带参数时只为宿主调用 Machine 的方法布下 bug（Machine 的测试用）：
  * host-call-then-exit 布下之后退出，host-call-then-read 布下之后读 stdin。
@@ -124,16 +125,20 @@ int main(int argc, char **argv)
     expect_segv(pid, "engine fault with another thread");
 
     /*
-     * 线程退出时：进程的最后一个线程（用 SYS_exit：exit_group 已经定下了进程的退出码，
-     * 与 Linux 一样之后的 oops 不再改它），以及另一个线程还在 pthread_join 里等它
+     * 最后一个线程进入 exit 时，synchronize_group_exit 已经定下进程的退出码，
+     * 和 exit_group 一样，之后退出清理中的 oops 不再改它。
      */
     pid = fork();
     if (pid == 0) {
         exit_with_bug(NULL);
         syscall(SYS_exit, 11);
     }
-    expect_segv(pid, "panic while exiting");
+    int exit_status;
+    if (waitpid(pid, &exit_status, 0) != pid || !WIFEXITED(exit_status) || WEXITSTATUS(exit_status) != 11)
+        fail("panic while exiting preserves the group exit code");
+    printf("panic while exiting: kept exit code 11\n");
 
+    /* 还有线程没退出：故障仍结束整个进程，父进程看到 SIGSEGV。 */
     pid = fork();
     if (pid == 0) {
         pthread_t t;

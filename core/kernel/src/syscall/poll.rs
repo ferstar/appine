@@ -134,6 +134,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
         // 6.9 起进程被回收之后还有 POLLHUP；这里与 6.1 相同
         FileKind::Pidfd(p) => (if p.exited() { POLLIN | POLLRDNORM } else { 0 }, None),
         FileKind::MessageQueue(q) => (q.borrow().readiness(), None),
+        FileKind::SeccompNotify(l) => (l.readiness(), None),
         FileKind::Path(_) => (POLLNVAL, None),
         _ => (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, None),
     }
@@ -183,6 +184,7 @@ fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> 
         FileKind::Inotify(i) => [i.borrow().queued(), 0],
         FileKind::SignalFd(s) => [s.borrow().arrivals(), 0],
         FileKind::MessageQueue(q) => q.borrow().arrivals(),
+        FileKind::SeccompNotify(l) => l.arrivals(),
         _ => [0, 0],
     };
     let host = f.host_edges.as_ref().map_or([0, 0], host);
@@ -289,6 +291,7 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
         FileKind::Epoll(ep) => out.push(wake::of(ep)),
         FileKind::Socket(s) => super::net::wake_objects(s, out),
         FileKind::MessageQueue(q) => out.push(wake::of(q)),
+        FileKind::SeccompNotify(l) => out.push(l.object()),
         _ => {}
     }
 }

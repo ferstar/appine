@@ -427,7 +427,8 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::TimerFd(_)
         | FileKind::SignalFd(_)
         | FileKind::Inotify(_)
-        | FileKind::Pidfd(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        | FileKind::Pidfd(_)
+        | FileKind::SeccompNotify(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         FileKind::MessageQueue(q) => Ok(encode_stat(&q.borrow().stat(), MQUEUE_DEV)),
         FileKind::Pty(end) => {
             let n = end.tty.borrow().index;
@@ -1453,6 +1454,9 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
         _ => {}
+    }
+    if let FileKind::SeccompNotify(l) = &file.borrow().kind {
+        return crate::seccomp::ioctl(cx, l, request, arg);
     }
     let pty = match &file.borrow().kind {
         FileKind::Pty(end) => Some((end.tty.clone(), end.master)),
@@ -2662,7 +2666,8 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         | FileKind::TimerFd(_)
         | FileKind::SignalFd(_)
         | FileKind::Inotify(_)
-        | FileKind::Pidfd(_) => return Err(Errno::ESPIPE),
+        | FileKind::Pidfd(_)
+        | FileKind::SeccompNotify(_) => return Err(Errno::ESPIPE),
         FileKind::Proc { data, .. } => match whence {
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
@@ -3180,7 +3185,9 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             n
         }
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
-        FileKind::Epoll(_) | FileKind::Pidfd(_) => return Err(Errno::EINVAL),
+        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::SeccompNotify(_) => {
+            return Err(Errno::EINVAL);
+        }
         _ => return Err(Errno::EBADF),
     };
     let positioned = matches!(
@@ -3216,7 +3223,10 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
         // 可写的 procfs 文件：内容由 pseudo::write 处理过了
         FileKind::Proc { .. } => Ok(data.len()),
         // 没有 write 操作的匿名 inode
-        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::MessageQueue(_) => Err(Errno::EINVAL),
+        FileKind::Epoll(_)
+        | FileKind::Pidfd(_)
+        | FileKind::MessageQueue(_)
+        | FileKind::SeccompNotify(_) => Err(Errno::EINVAL),
         _ => Err(Errno::EBADF),
     }
 }

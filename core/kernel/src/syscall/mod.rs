@@ -37,6 +37,8 @@ pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;
 
+use std::sync::atomic::Ordering;
+
 use appine_engine::Cpu;
 
 use crate::debug;
@@ -85,20 +87,30 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // -1 时跳过这个系统调用，x0 是跟踪者设好的返回值；程序自己用 -1 时与 Linux 一样是
     // ENOSYS（crate::ptrace）
     let traced = crate::ptrace::syscall_traced(cx, cpu, nr);
+    let filtered = cx.task.seccomp_on.load(Ordering::Relaxed);
+    if (traced || filtered) && nr == NO_SYSCALL {
+        cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
+    }
     if traced {
-        if nr == NO_SYSCALL {
-            cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
-        }
         match crate::ptrace::syscall_entry(cx, cpu, nr) {
             Some(n) => nr = n,
             None => return Flow::Exit,
         }
-        if nr == NO_SYSCALL {
-            if !crate::ptrace::syscall_exit(cx, cpu) {
-                return Flow::Exit;
-            }
-            return signal::deliver(cx, cpu, true);
+    }
+    // seccomp：与 arm64 Linux 一样在入口停住之后检查，跟踪者要跳过的（-1）也检查。不执行
+    // 的，x0 已经是返回值（crate::seccomp）
+    if filtered {
+        match crate::seccomp::check(cx, cpu, nr) {
+            crate::seccomp::Verdict::Run(n) => nr = n,
+            crate::seccomp::Verdict::Skip => nr = NO_SYSCALL,
+            crate::seccomp::Verdict::Exit => return Flow::Exit,
         }
+    }
+    if (traced || filtered) && nr == NO_SYSCALL {
+        if traced && !crate::ptrace::syscall_exit(cx, cpu) {
+            return Flow::Exit;
+        }
+        return signal::deliver(cx, cpu, true);
     }
     let a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
     let started = debug::trace_start();
@@ -135,6 +147,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             }
         }
         117 => ptrace::ptrace(cx, a[0] as i64, a[1] as i32, a[2], a[3]),
+        277 => crate::seccomp::seccomp(cx, a[0] as u32, a[1] as u32, a[2]),
         270 | 271 => {
             ptrace::process_vm(cx, a[0] as i32, (a[1], a[2]), (a[3], a[4]), a[5], nr == 271)
         }

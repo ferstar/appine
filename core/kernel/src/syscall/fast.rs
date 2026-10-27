@@ -107,11 +107,13 @@ impl Fast {
     /// 时由调用方持有 BKL 正常处理，这里除了 [`TaskState::fast_sleep`] 什么也没改。
     pub(crate) fn syscall(&self, shared: &Shared, task: &Task, cpu: &mut Cpu) -> bool {
         // 还有没作废的 ic ivau 时要先进内核作废（task::handle）；PTRACE_SYSCALL 时要在
-        // 入口和出口停下，单步时系统调用做完要报告（crate::ptrace）
+        // 入口和出口停下，单步时系统调用做完要报告（crate::ptrace）；有 seccomp 时要先检查
+        // （crate::seccomp）
         if self.traced
             || cpu.state().ivau_page != 0
             || task.syscall_traced.load(Ordering::Relaxed)
             || task.stepping.load(Ordering::Relaxed)
+            || task.seccomp_on.load(Ordering::Relaxed)
         {
             return false;
         }

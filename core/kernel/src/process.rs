@@ -72,6 +72,8 @@ impl Signal {
     pub const PROF: Signal = Signal(27);
     /// 终端窗口大小改变。
     pub const WINCH: Signal = Signal(28);
+    /// 错误的系统调用（seccomp）。
+    pub const SYS: Signal = Signal(31);
 
     /// 最大的信号编号。
     pub const MAX: i32 = 64;
@@ -315,8 +317,9 @@ pub(crate) struct ThreadGroup {
     pub rlimits: [(u64, u64); RLIM_NLIMITS],
     /// 正在整体退出（exit_group、致命信号）时的结束方式。
     pub exiting: Option<ExitStatus>,
-    /// 主线程用 exit(2) 退出时的退出码。
-    pub leader_code: i32,
+    /// 主线程自己的结束方式，异常清理的备用值；正常退出由最后一个进入退出流程的线程
+    /// 确定 `exiting`（task::Task::begin_exit）。
+    pub leader_status: ExitStatus,
     /// 所有线程都已退出、等待父进程回收时的结束方式。
     pub zombie: Option<ExitStatus>,
     /// 退出时发给父进程的信号（clone 的低 8 位，通常是 SIGCHLD），0 表示不发。
@@ -387,6 +390,8 @@ pub(crate) struct ThreadGroup {
     /// 之前，这个僵尸进程只有它看得见，父进程等不到、也不收到通知（Linux 的僵尸进程
     /// 还被跟踪着时）。
     pub exit_tracer: Option<Tid>,
+    /// 主线程结束时的 seccomp 过滤器链：与 Linux 一样，进程被回收时才放下（[`crate::seccomp`]）。
+    pub leader_seccomp: Option<crate::seccomp::Chain>,
 }
 
 impl ThreadGroup {
@@ -404,7 +409,7 @@ impl ThreadGroup {
             sighand,
             rlimits: default_rlimits(),
             exiting: None,
-            leader_code: 0,
+            leader_status: ExitStatus::Exited(0),
             zombie: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
@@ -436,6 +441,7 @@ impl ThreadGroup {
             aio: std::collections::BTreeMap::new(),
             leader_tracer: None,
             exit_tracer: None,
+            leader_seccomp: None,
         }
     }
 }
@@ -537,7 +543,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     crate::syscall::aio_released(k, contexts);
     let (tgid, ppid, status, children, exit_signal) = {
         let mut g = group.borrow_mut();
-        let status = g.exiting.unwrap_or(ExitStatus::Exited(g.leader_code));
+        let status = g.exiting.unwrap_or(g.leader_status);
         (
             g.tgid,
             g.ppid,
@@ -627,7 +633,7 @@ fn finished(k: &Kernel, tgid: Tid) {
 pub(crate) fn finish_group_after_bug(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     let (ids, status, handed) = {
         let g = group.borrow();
-        let status = g.exiting.unwrap_or(ExitStatus::Exited(g.leader_code));
+        let status = g.exiting.unwrap_or(g.leader_status);
         let handed = g.zombie.is_some() || !k.groups.contains_key(&g.tgid);
         ((g.tgid, g.ppid, g.exit_signal), status, handed)
     };

@@ -43,7 +43,6 @@ const PR_GET_TIMING: i32 = 13;
 const PR_SET_TIMING: i32 = 14;
 const PR_TIMING_STATISTICAL: u64 = 0;
 const PR_SET_SECCOMP: i32 = 22;
-const SECCOMP_MODE_FILTER: u64 = 2;
 const PR_SET_THP_DISABLE: i32 = 41;
 const PR_GET_THP_DISABLE: i32 = 42;
 const PR_CAP_AMBIENT: i32 = 47;
@@ -741,19 +740,8 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             cx.t.group.borrow_mut().cred.securebits = arg as u32;
             Ok(0)
         }
-        PR_GET_SECCOMP => Ok(0),
-        // 不支持 seccomp 过滤（设计文档 §11.1）；参数检查与 Linux 相同
-        PR_SET_SECCOMP => match arg {
-            SECCOMP_MODE_FILTER => {
-                let _: [u8; 16] = get(cx, args[1])?;
-                let g = cx.t.group.borrow();
-                if !g.no_new_privs && !g.cred.capable(cap::SYS_ADMIN) {
-                    return Err(Errno::EACCES);
-                }
-                Err(Errno::EINVAL)
-            }
-            _ => Err(Errno::EINVAL),
-        },
+        PR_GET_SECCOMP => Ok(u64::from(cx.task.seccomp.borrow().mode)),
+        PR_SET_SECCOMP => crate::seccomp::prctl_set(cx, arg, args[1]),
         PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok((cx.cred().cap_bounding >> arg) & 1),
         PR_CAPBSET_DROP if arg <= CAP_LAST_CAP => {
             if !cx.cred().capable(cap::SETPCAP) {

@@ -231,6 +231,8 @@ pub(crate) struct Kernel {
     pub leases: BTreeMap<Ino, Vec<crate::syscall::Lease>>,
     /// `/proc/sys/fs/lease-break-time`：打破租约时最多等多少秒。
     pub lease_break_time: u64,
+    /// `/proc/sys/kernel/seccomp/actions_logged`：记哪些 seccomp 动作（`seccomp::logged`）。
+    pub seccomp_logged: u32,
     /// POSIX 消息队列，按名字（`syscall::mqueue`）。
     pub mqueues: BTreeMap<Vec<u8>, Rc<RefCell<crate::syscall::MessageQueue>>>,
     /// `/proc/sys/fs/mqueue/*`。
@@ -295,6 +297,7 @@ impl Kernel {
             fasync: Vec::new(),
             leases: BTreeMap::new(),
             lease_break_time: 45,
+            seccomp_logged: crate::seccomp::logged::DEFAULT,
             mqueues: BTreeMap::new(),
             mq_limits: Default::default(),
             aio_nr: 0,
