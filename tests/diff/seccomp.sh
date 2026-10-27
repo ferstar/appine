@@ -379,7 +379,9 @@ static void *exit_thread(void *arg)
 static void actions(void)
 {
     printf("== actions\n");
-    struct rlimit no_core = {0, 0};
+    /* 不写 core：core_pattern 是管道（CI 的 Ubuntu 宿主上是 apport）时 Linux 不管限制是不是 0
+       都交给它，只有 1 不交；写文件时不到一页也不写 */
+    struct rlimit no_core = {1, 1};
     setrlimit(RLIMIT_CORE, &no_core);
     pid_t pid = fork();
     if (pid == 0) {

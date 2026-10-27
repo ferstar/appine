@@ -53,7 +53,7 @@
   - ADDFD：不存在的 id、不认得的标志、没有 SETFD 时给 newfd、O_CLOEXEC 以外的 newfd_flags、坏的 srcfd、更短和更长的结构体（多出的部分不是零时 E2BIG），装进去的 fd 能用，SETFD 换掉已有的 fd 并带 O_CLOEXEC、SEND 同时回答，对方的 `RLIMIT_NOFILE` 之外 SETFD 是 EBADF、装满之后 EMFILE；
   - `strace -f --seccomp-bpf` 跟踪 shell 起的两个进程的 openat、close。
 
-  docker 里的 root 没有 `CAP_SYS_ADMIN`，测试开头两边都先去掉它，所以要特权的成功路径（`GET_FILTER`、写 `actions_logged`、`SUSPEND_SECCOMP`）没有比对。快速路径、ADDFD、改用 PTRACE_SYSCALL 和 strace 这几节是审查时补的：原来过滤的都是本来就持 BKL 的系统调用，快速路径漏看 `seccomp_on` 时过滤器被绕过也查不出。审查时还用一个临时用例比对过几处，两层都与原生一致，没有放进差分测试（要写 core，原生一侧写不写取决于宿主的 `core_pattern`，见[core dump](43-coredump.md)那一篇）：主线程退出之后剩下的唯一线程触发 KILL_THREAD 时按结束进程处理、写 core，TRAP 时 SIGSYS 被忽略也写 core，线程各自退出时进程的退出码是最后一个线程的，`Seccomp_filters` 跟着 fork。
+  动作那一节把 `RLIMIT_CORE` 设成 1，两边都不写 core：`core_pattern` 是管道时（CI 的 Ubuntu 宿主上是 apport）Linux 不管限制是不是 0 都交给它，只有 1 不交，写文件时不到一页也不写。原来设成 0，CI 上原生一侧的 SIGSYS 都带着 core。docker 里的 root 没有 `CAP_SYS_ADMIN`，测试开头两边都先去掉它，所以要特权的成功路径（`GET_FILTER`、写 `actions_logged`、`SUSPEND_SECCOMP`）没有比对。快速路径、ADDFD、改用 PTRACE_SYSCALL 和 strace 这几节是审查时补的：原来过滤的都是本来就持 BKL 的系统调用，快速路径漏看 `seccomp_on` 时过滤器被绕过也查不出。审查时还用一个临时用例比对过几处，两层都与原生一致，没有放进差分测试（要写 core，原生一侧写不写取决于宿主的 `core_pattern`，见[core dump](43-coredump.md)那一篇）：主线程退出之后剩下的唯一线程触发 KILL_THREAD 时按结束进程处理、写 core，TRAP 时 SIGSYS 被忽略也写 core，线程各自退出时进程的退出码是最后一个线程的，`Seccomp_filters` 跟着 fork。
 
   单元测试新增程序的检查和执行。变异检验：快速路径不看 `seccomp_on` 时，那 8 个系统调用都绕过了过滤器，`seccomp` 只有快速路径一节不同（补测之前查不出）；ADDFD 不设 O_CLOEXEC 时 SETFD 那一行不同；修改出口的停止之前的二进制上，改用 PTRACE_SYSCALL 那一节和 strace 那一段不同。cargo test（196 个）、clippy、两层的 20 组差分测试通过（改出口的停止之后重跑了两层的 seccomp、ptrace 和 Tier 1 的 gdb）。
 
