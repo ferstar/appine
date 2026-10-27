@@ -37,6 +37,12 @@ for k in usage_usec user_usec system_usec nr_periods nr_throttled throttled_usec
     grep -q "^$k " cpu.stat && printf '%s ' $k
 done
 echo
+# memory.stat：新内核加了项，有没有 swapcached、*_thp、zswap 又取决于内核的配置，只比 6.1
+# 就有、不取决于配置的项的顺序，以及值都是数字
+echo "$(stat -c %A memory.stat) memory.stat: $(grep -oE '^[a-z_]+' memory.stat | grep -xE \
+    'anon|file|kernel|kernel_stack|pagetables|sec_pagetables|percpu|sock|vmalloc|shmem|file_mapped|file_dirty|file_writeback|inactive_anon|active_anon|inactive_file|active_file|unevictable|slab_reclaimable|slab_unreclaimable|slab|workingset_[a-z_]+|pgscan|pgsteal|pgscan_kswapd|pgscan_direct|pgsteal_kswapd|pgsteal_direct|pgfault|pgmajfault|pgrefill|pgactivate|pgdeactivate|pglazyfree|pglazyfreed' |
+    tr '\n' ' ')"
+grep -vqE '^[a-z_]+ [0-9]+$' memory.stat || echo "memory.stat has a line that is not a name and a number"
 # 取决于宿主和当时的状态的：只比格式（6.12 起 memory.peak 可写，不比它的权限；容器的
 # pids.max 可能有限制）
 for f in cgroup.controllers cgroup.procs cgroup.threads memory.current memory.max \

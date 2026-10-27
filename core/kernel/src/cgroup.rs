@@ -11,8 +11,8 @@
 //! memory、pids。
 //!
 //! - `memory.max` 是 OOM killer 的上限，`memory.current` 是它量的 App 的内存（宿主的匿名内存，
-//!   换出到 zram 的也算在里面，所以 `memory.swap.max` 是 0），`memory.events` 记着超出上限和
-//!   结束进程的次数；
+//!   换出到 zram 的也算在里面，所以 `memory.swap.max` 是 0），`memory.stat` 把它分成匿名内存和
+//!   共享内存，`memory.events` 记着超出上限和结束进程的次数；
 //! - 没有 CPU 配额和权重：`cpu.max` 是 `max 100000`，cpuset 是 guest 看到的所有 CPU；
 //! - `pids.current` 是 guest 的线程数，`pids.max` 不限（限制在 threads-max 和 `RLIMIT_NPROC`）。
 //!
@@ -23,7 +23,7 @@ use std::fmt::Write;
 use crate::kernel::{INIT, Kernel};
 
 /// `/sys/fs/cgroup` 下的文件，和它在 Linux 上是否可写（决定权限位）。
-pub(crate) const FILES: [(&[u8], bool); 37] = [
+pub(crate) const FILES: [(&[u8], bool); 38] = [
     (b"cgroup.controllers", false),
     (b"cgroup.events", false),
     (b"cgroup.freeze", true),
@@ -54,6 +54,7 @@ pub(crate) const FILES: [(&[u8], bool); 37] = [
     (b"memory.min", true),
     (b"memory.oom.group", true),
     (b"memory.peak", false),
+    (b"memory.stat", false),
     (b"memory.swap.current", false),
     (b"memory.swap.events", false),
     (b"memory.swap.high", true),
@@ -139,12 +140,87 @@ pub(crate) fn file(k: &Kernel, name: &[u8]) -> Option<String> {
                 e.max, e.oom, e.oom_kill
             )
         }
+        b"memory.stat" => memory_stat(),
         b"memory.swap.events" => "high 0\nmax 0\nfail 0".to_owned(),
         b"pids.current" => k.tasks.len().to_string(),
         b"pids.events" => "max 0".to_owned(),
         _ => return None,
     };
     Some(s + "\n")
+}
+
+/// `memory.stat`，按 Linux 6.1 的 `memory_stat_format`（有 swap 和透明大页、没有 zswap 的
+/// 配置），单位是字节。只量得到宿主进程的匿名内存（与 `memory.current` 相同）：私有的和换出的
+/// 算 anon，共享的算 shmem（Linux 的 file 包括 shmem），都在 active_anon 里；没有可以回收的
+/// 页缓存，inactive_file 是 0。.NET 的 GC 按 `memory.current` 减去 inactive_file 算用量，没有
+/// 这个文件就只看自己进程的 RSS。
+fn memory_stat() -> String {
+    let u = appine_hal::memory_usage().unwrap_or_default();
+    let anon = u.anon + u.swap;
+    let mut s = String::new();
+    let mut put = |name: &str, v: u64| writeln!(s, "{name} {v}").unwrap();
+    for (name, v) in [("anon", anon), ("file", u.shmem)] {
+        put(name, v);
+    }
+    for name in [
+        "kernel",
+        "kernel_stack",
+        "pagetables",
+        "sec_pagetables",
+        "percpu",
+        "sock",
+        "vmalloc",
+    ] {
+        put(name, 0);
+    }
+    put("shmem", u.shmem);
+    for name in [
+        "file_mapped",
+        "file_dirty",
+        "file_writeback",
+        "swapcached",
+        "anon_thp",
+        "file_thp",
+        "shmem_thp",
+        "inactive_anon",
+    ] {
+        put(name, 0);
+    }
+    put("active_anon", anon + u.shmem);
+    for name in [
+        "inactive_file",
+        "active_file",
+        "unevictable",
+        "slab_reclaimable",
+        "slab_unreclaimable",
+        "slab",
+        "workingset_refault_anon",
+        "workingset_refault_file",
+        "workingset_activate_anon",
+        "workingset_activate_file",
+        "workingset_restore_anon",
+        "workingset_restore_file",
+        "workingset_nodereclaim",
+        "pgscan",
+        "pgsteal",
+        "pgscan_kswapd",
+        "pgscan_direct",
+        "pgsteal_kswapd",
+        "pgsteal_direct",
+        "pgfault",
+        "pgmajfault",
+        "pgrefill",
+        "pgactivate",
+        "pgdeactivate",
+        "pglazyfree",
+        "pglazyfreed",
+        "thp_fault_alloc",
+        "thp_collapse_alloc",
+    ] {
+        put(name, 0);
+    }
+    s.pop();
+    s
 }
 
 /// 每行一个编号，从小到大。

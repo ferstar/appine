@@ -497,7 +497,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `/dev/shm`、`/run` | inode 仓库里的目录。Linux 上它们是 tmpfs，所以仓库被第一个使用者打开时清空其中的内容 |
 | `/proc` | procfs：根据内核层的 task、mm 等结构实时合成。smaps 的驻留页按宿主内存算（mincore）；匿名内存都算脏页，fork 之后和别的地址空间共用的（写时复制借出、借来的）算共享的，Pss 按共用的个数分摊，与 Linux 的 mapcount 一样（redis、valkey 启动时靠它检查内核），其余算私有的；文件映射都算私有的干净页 |
 | `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。各个 `cpu<n>` 的 `cache/`、`cpufreq/` 照搬宿主对应的那个 CPU 的（宿主有、App 读得了的才有），CPU 列表和掩码换成 guest 的编号。没有 `transparent_hugepage`，相当于没有编进 THP 的内核 |
-| `/sys/fs/cgroup` | 只读的 cgroup2（`core/kernel/src/cgroup.rs`）：所有 guest 进程在同一个 cgroup 里，像 docker 用 cgroup 命名空间的容器（`/proc/<pid>/cgroup` 是 `0::/`），控制器有 cpuset、cpu、memory、pids。`memory.max` 是 §12 第 4 条的上限，`memory.current` 是那里量的用量，`memory.events` 记着超出上限和结束进程的次数；没有 CPU 配额，cpuset 是所有 CPU。JVM 的容器支持和 Node.js（libuv 的 `uv_get_constrained_memory`）据此按上限定堆。写、建子 cgroup 都是 EROFS |
+| `/sys/fs/cgroup` | 只读的 cgroup2（`core/kernel/src/cgroup.rs`）：所有 guest 进程在同一个 cgroup 里，像 docker 用 cgroup 命名空间的容器（`/proc/<pid>/cgroup` 是 `0::/`），控制器有 cpuset、cpu、memory、pids。`memory.max` 是 §12 第 4 条的上限，`memory.current` 是那里量的用量，`memory.stat` 按 Linux 6.1 的格式把它分成匿名内存（含换出的）和共享内存（.NET 的 GC 按 `memory.current` 减去其中的 `inactive_file` 算用量），`memory.events` 记着超出上限和结束进程的次数；没有 CPU 配额，cpuset 是所有 CPU。JVM 的容器支持和 Node.js（libuv 的 `uv_get_constrained_memory`）据此按上限定堆。写、建子 cgroup 都是 EROFS |
 | `/tmp` | 放在 inode 仓库里，不用内存 tmpfs，避免占用 App 内存配额 |
 | `/mnt/<名字>` | SAF 目录挂载（v1.x，见 §11.3） |
 

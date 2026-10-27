@@ -75,6 +75,7 @@
 | [M9 之前：终端的属主和权限](rounds/64-pty-owner.md) | 2026-10-28 | `/dev/pts/N` 属于 tty 组，可以 chown、chmod：sshd 能把终端交给登录的用户，`ssh -t`、交互式登录和 mosh 能用了（原来 root 登录也被关掉） |
 | [M9 之前：smaps 里共用的页](rounds/65-smaps-shared.md) | 2026-10-28 | fork 之后写时复制共用的页在 smaps 里算共享的脏页，Pss 按共用的个数分摊：redis、valkey 启动时的 `ARM64-COW-BUG` 检查通过，能启动了，后台保存、AOF 正常 |
 | [M9 之前：io_destroy 叫醒等事件的线程](rounds/66-aio-destroy.md) | 2026-10-28 | 销毁 AIO 上下文时正在 `io_getevents` 里等它的线程返回（没有事件是 EINVAL），与 Linux 相同：mariadb 的 install-db 和关闭不再卡住 |
+| [M9 之前：cgroup 的 memory.stat](rounds/67-memory-stat.md) | 2026-10-28 | 按 Linux 6.1 的格式补上 `memory.stat`：.NET 的 GC 改按整个 App 的用量（`memory.current` 减去 `inactive_file`）算内存负载，别的 guest 进程用的内存也算进去（原来只看自己的 RSS） |
 
 ## 测量条件
 

@@ -1,6 +1,6 @@
 # M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）
 
-← [M9 之前：smaps 里共用的页（2026-10-28）](65-smaps-shared.md) · [索引](../milestones.md)
+← [M9 之前：smaps 里共用的页（2026-10-28）](65-smaps-shared.md) · [索引](../milestones.md) · [M9 之前：cgroup 的 memory.stat（2026-10-28）](67-memory-stat.md) →
 
 [负载普查](62-workload-survey.md)的问题 4：`mariadb-install-db` 永远不结束，之后启动的 mariadbd 也因为拿不到数据文件的锁（还被卡住的那个占着）起不来。
 

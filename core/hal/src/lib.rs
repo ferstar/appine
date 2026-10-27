@@ -463,9 +463,24 @@ pub fn fd_limit() -> u64 {
 }
 
 /// 宿主进程用掉的匿名内存（字节）：`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，
-/// 换出到 swap（Android 的 zram）的也算；文件页可以回收，不算。没有 RssAnon 的老内核
-/// （4.5 之前）改用 VmRSS。读不了时返回 None。
+/// 换出到 swap（Android 的 zram）的也算；文件页可以回收，不算。读不了时返回 None。
 pub fn memory_footprint() -> Option<u64> {
+    memory_usage().map(|u| u.anon + u.shmem + u.swap)
+}
+
+/// [`memory_footprint`] 的各项（字节）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryUsage {
+    /// RssAnon：驻留的私有匿名内存。没有 RssAnon 的老内核（4.5 之前）是 VmRSS。
+    pub anon: u64,
+    /// RssShmem：驻留的共享匿名内存（memfd、`MAP_SHARED|MAP_ANONYMOUS`）。
+    pub shmem: u64,
+    /// VmSwap：换出去的。
+    pub swap: u64,
+}
+
+/// 宿主进程的匿名内存，分项（[`memory_footprint`]）。
+pub fn memory_usage() -> Option<MemoryUsage> {
     use std::os::unix::fs::FileExt;
     static STATUS: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
     let status = STATUS
@@ -481,11 +496,15 @@ pub fn memory_footprint() -> Option<u64> {
         let digits = line[name.len()..].trim_ascii().strip_suffix(b"kB")?;
         std::str::from_utf8(digits).ok()?.trim().parse().ok()
     };
-    let anon = match field(b"RssAnon:") {
-        Some(anon) => anon + field(b"RssShmem:").unwrap_or(0),
-        None => field(b"VmRSS:")?,
+    let (anon, shmem) = match field(b"RssAnon:") {
+        Some(anon) => (anon, field(b"RssShmem:").unwrap_or(0)),
+        None => (field(b"VmRSS:")?, 0),
     };
-    Some((anon + field(b"VmSwap:").unwrap_or(0)) * 1024)
+    Some(MemoryUsage {
+        anon: anon * 1024,
+        shmem: shmem * 1024,
+        swap: field(b"VmSwap:").unwrap_or(0) * 1024,
+    })
 }
 
 /// 宿主的物理内存总量和空闲量（字节）。
