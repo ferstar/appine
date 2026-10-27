@@ -1,0 +1,77 @@
+#!/bin/sh
+# 负载普查（docs/rounds/62-workload-survey.md）：在 appine 里跑常见的服务和工具，收集
+# 失败和内核层的日志。在有 docker 的宿主上运行：
+#
+#   scripts/survey [-t 执行层] [-s 仓库目录] [负载名……]
+#
+# 负载是 tests/survey/<名字>.sh，拷进仓库里由 guest 的 /bin/sh 运行（stdin 是 /dev/null），
+# 带 APPINE_LOG=1。stdout 写到 target/survey/<名字>.out，stderr（含内核层的日志）写到
+# <名字>.err；最后每个负载一行：退出码、用时和未实现的 syscall。输出要人看：脚本只打印
+# 结果，不和原生比对。不带名字时跑全部。
+#
+# 仓库默认是 target/survey/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
+# 再用 apk 安装要的软件包，这一步要联网（沿用宿主或 docker 的代理），约 1 GB。
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+tier=1
+store=target/survey/store
+packages="openssh-server openssh-client tmux postgresql18 postgresql18-client postgresql18-contrib
+    redis valkey valkey-cli mariadb mariadb-client cargo rust gcc musl-dev dotnet10-sdk php85
+    ruby nginx curl neovim htop btop fish zsh rsync git git-daemon mosh zig python3 py3-pip socat"
+
+while getopts t:s: opt; do
+    case $opt in
+    t) tier=$OPTARG ;;
+    s) store=$OPTARG ;;
+    *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# 在 Linux arm64 上直接运行，别的宿主上整个脚本经由 scripts/dev 重新运行
+if [ "$(uname -sm)" != "Linux aarch64" ]; then
+    exec scripts/dev scripts/survey -t "$tier" -s "$store" "$@"
+fi
+run=${APPINE_RUN:-target/linux-arm64/release/appine-run}
+[ -x "$run" ] || run=target/release/appine-run
+proxy() {
+    for kv in "http_proxy=${http_proxy:-}" "https_proxy=${https_proxy:-}"; do
+        [ -n "${kv#*=}" ] && printf -- '--env %s ' "$kv"
+    done
+    printf -- '--env no_proxy=127.0.0.1,localhost'
+}
+
+if [ ! -d "$store" ]; then
+    tarball=$(ls target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | tail -n 1)
+    [ -n "$tarball" ] || {
+        echo "survey: no minirootfs; run scripts/fetch-rootfs" >&2
+        exit 1
+    }
+    echo "creating $store"
+    "$run" --rootfs "$store" --import "$tarball" >/dev/null
+    # shellcheck disable=SC2046
+    "$run" --tier 1 --rootfs "$store" --env PATH=/usr/sbin:/usr/bin:/sbin:/bin $(proxy) \
+        -- /bin/sh -c "apk add -q $(echo $packages)"
+fi
+
+out=target/survey
+mkdir -p "$out"
+if [ $# -eq 0 ]; then
+    set -- $(cd tests/survey && ls *.sh | sed 's/\.sh$//')
+fi
+for name in "$@"; do
+    start=$(date +%s)
+    set +e
+    # shellcheck disable=SC2046
+    APPINE_LOG=1 timeout 1500 "$run" --tier "$tier" --rootfs "$store" \
+        --env PATH=/usr/sbin:/usr/bin:/sbin:/bin --env HOME=/root --env TERM=xterm $(proxy) \
+        -- /bin/sh -c 'cat > /tmp/survey.sh && exec sh /tmp/survey.sh </dev/null' \
+        <"tests/survey/$name.sh" >"$out/$name.out" 2>"$out/$name.err"
+    code=$?
+    set -e
+    enosys=$(sed -n 's/^appine: unimplemented syscall //p' "$out/$name.err" | sort -nu | tr '\n' ' ')
+    printf '%-10s exit %-3s %4ss  %s\n' "$name" "$code" "$(($(date +%s) - start))" \
+        "${enosys:+ENOSYS: $enosys}"
+done

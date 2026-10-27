@@ -70,6 +70,7 @@
 | [M9 之前：seccomp](rounds/59-seccomp.md) | 2026-10-28 | 严格模式和 cBPF 过滤器按 Linux 6.1 检查、执行，继承和 TSYNC，`PTRACE_EVENT_SECCOMP`，通知 fd（USER_NOTIF、ADDFD）；`strace --seccomp-bpf` 能用；线程各自退出时进程的退出状态由最后一个退出的线程定下；LTP 958 |
 | [M9 之前：seccomp 的缓存和快速路径](rounds/60-seccomp-cache.md) | 2026-10-28 | 按 Linux 的 `seccomp_cache` 记下过滤器总是放行的编号，不再运行程序；这些编号和 vDSO 里读时钟照常不持 BKL：46 条的过滤器下 futex 唤醒 313 → 60 纳秒（没有过滤器时 60），读时钟 143 → 89 纳秒 |
 | [M9 之前：进程结束的每一步分别兜住](rounds/61-finish-steps.md) | 2026-10-28 | 最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC、控制终端、跟踪、孤儿进程组等）各自兜住内核层的 bug，一步出错只丢掉这一步做的事，不再留下永远停着、等着的进程 |
+| [M9 之前：负载普查](rounds/62-workload-survey.md) | 2026-10-28 | `scripts/survey` 在 appine 里跑 sshd、tmux、postgres、redis、mariadb、Rust、.NET 等 20 多种服务和工具：多数正常；找到 6 个问题：fork 之后父进程的页权限被改错（rustc 崩溃）、ssh 分配不了 PTY、redis/valkey 不肯启动、mariadb 卡住、.NET 看不到别的进程的内存、`/proc/meminfo` 的可用内存偏小 |
 
 ## 测量条件
 
