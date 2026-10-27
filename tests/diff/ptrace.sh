@@ -808,14 +808,17 @@ static void watch(pid_t pid, uint64_t addr, uint32_t bas, uint32_t type)
         perror("SETREGSET");
 }
 
-static void report(pid_t pid, const char *what, volatile void *expect)
+/* si_addr 要落在这条指令访问的 [start, start + len) 里。访问跨出观察的范围时报告哪个
+ * 地址由核决定：Apple 的核报告访问的起点，CI 上的 Neoverse N2 报告的不是起点 */
+static void report(pid_t pid, const char *what, volatile void *start, size_t len)
 {
     int st;
     waitpid(pid, &st, 0);
     siginfo_t si;
     ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    uintptr_t a = (uintptr_t)si.si_addr, s = (uintptr_t)start;
     printf("%s: sig %d code %d addr %s\n", what, WSTOPSIG(st), si.si_code,
-           si.si_addr == (void *)expect ? "ok" : "other");
+           a >= s && a < s + len ? "ok" : "other");
 }
 
 int main(void)
@@ -833,12 +836,12 @@ int main(void)
     /* 只读的观察点：原子的读改写也算读 */
     watch(pid, (uint64_t)&atom & ~7ull, 0xf << ((uint64_t)&atom & 7), 1);
     ptrace(PTRACE_CONT, pid, 0, 0);
-    report(pid, "atomic add, load watch", &atom);
+    report(pid, "atomic add, load watch", &atom, sizeof atom);
     watch(pid, 0, 0, 0);
     /* 16 字节的 SIMD 存储碰到后一半 */
     watch(pid, (uint64_t)&vec[2], 0xff, 2);
     ptrace(PTRACE_CONT, pid, 0, 0);
-    report(pid, "simd store", &vec[1]);
+    report(pid, "simd store", &vec[1], 16);
     watch(pid, 0, 0, 0);
     ptrace(PTRACE_CONT, pid, 0, 0);
     waitpid(pid, &st, 0);
