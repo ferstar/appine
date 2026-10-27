@@ -882,11 +882,28 @@ fn open_pseudo(
     if !matches!(node, PseudoNode::OpenFd(..)) {
         cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
     }
-    // /proc/<pid>/mem 与 ptrace 一样要求能跟踪那个进程（PTRACE_MODE_ATTACH）
-    if let PseudoNode::Entry(pid, _, pseudo::Entry::Mem) = node {
+    // /proc/<pid>/mem 与 ptrace 一样要求能跟踪那个进程（PTRACE_MODE_ATTACH），auxv、environ、
+    // maps、smaps、pagemap 要求能以只读方式跟踪（PTRACE_MODE_READ，规则相同）：同一个用户
+    // 的进程不可 dump 时也打不开
+    let mut mm = None;
+    if let PseudoNode::Entry(
+        pid,
+        _,
+        e @ (pseudo::Entry::Mem
+        | pseudo::Entry::Auxv
+        | pseudo::Entry::Environ
+        | pseudo::Entry::Maps
+        | pseudo::Entry::Smaps
+        | pseudo::Entry::SmapsRollup
+        | pseudo::Entry::Pagemap),
+    ) = node
+    {
         let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
         if !super::proc::may_ptrace(cx, &group.borrow()) {
             return Err(Errno::EACCES);
+        }
+        if e == pseudo::Entry::Mem {
+            mm = Some(Rc::downgrade(&pseudo::process_mm(cx.kr(), pid)?));
         }
     }
     match node {
@@ -923,7 +940,7 @@ fn open_pseudo(
         return Err(Errno::EACCES);
     }
     let data = pseudo::content(&view, &node)?;
-    Ok(FileKind::Proc { node, data })
+    Ok(FileKind::Proc { node, data, mm })
 }
 
 /// 经由 `/proc/<pid>/fd/<n>` 重新打开一个没有路径的文件：管道得到同一个管道的
@@ -2700,7 +2717,8 @@ enum IoPath {
     /// `/proc/<pid>/pagemap`：按读的位置现算。
     Pagemap(Tid),
     /// `/proc/<pid>/mem`：位置就是地址。
-    Mem(Tid),
+    /// `/proc/<pid>/mem` 打开时的地址空间，已经释放时是 None。
+    Mem(Option<Rc<RefCell<crate::mm::Mm>>>),
     Local,
 }
 
@@ -2719,9 +2737,10 @@ fn io_path(f: &OpenFile) -> IoPath {
             ..
         } => IoPath::Pagemap(*pid),
         FileKind::Proc {
-            node: PseudoNode::Entry(pid, _, pseudo::Entry::Mem),
+            node: PseudoNode::Entry(_, _, pseudo::Entry::Mem),
+            mm,
             ..
-        } => IoPath::Mem(*pid),
+        } => IoPath::Mem(mm.as_ref().and_then(std::rc::Weak::upgrade)),
         _ => IoPath::Local,
     }
 }
@@ -3224,9 +3243,9 @@ fn read_bytes(
             }
             Ok(n)
         }
-        IoPath::Mem(pid) => {
+        IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
-            let n = pseudo::read_mem(cx.kr(), pid, buf, pos)?;
+            let n = pseudo::read_mem(mm, buf, pos)?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos.wrapping_add(n as u64);
             }
@@ -3276,10 +3295,10 @@ fn write_bytes(
         IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {
             Err(Errno::EINVAL)
         }
-        IoPath::Mem(pid) => {
+        IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
             let sync = cx.task.sync.clone();
-            let n = pseudo::write_mem(cx.kr(), pid, data, pos, &sync)?;
+            let n = pseudo::write_mem(mm, data, pos, &sync)?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos.wrapping_add(n as u64);
             }

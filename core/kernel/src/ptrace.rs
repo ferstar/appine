@@ -436,6 +436,18 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
 }
 
+/// 单步时信号的处理函数刚设置好（还没执行第一条指令）：与 Linux 的 `ptrace_notify(SIGTRAP)`
+/// 一样停一次，跟踪者看到的 siginfo 是 SIGTRAP、`si_code` 也是 SIGTRAP、发送者是线程
+/// 自己。停住时的信号不投递。线程被结束时返回 false。
+pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+    if !traced(cx.task) {
+        return true;
+    }
+    let sig = Signal::TRAP;
+    let info = notify_info(sig, sig.number(), cx.tid(), cx.cred().ruid);
+    stop(cx, cpu, Stop::Event(0, sig), Some(info), 0).is_some()
+}
+
 /// PTRACE_SINGLESTEP 让线程执行完了一条指令（不是 svc）：与 arm64 Linux 的单步异常一样
 /// 投递 SIGTRAP（`TRAP_TRACE`，地址是下一条指令），停在信号投递停止里报告给跟踪者。
 pub(crate) fn step_done(cx: &mut Cx<'_>, cpu: &Cpu) {

@@ -505,11 +505,13 @@ pub(super) fn rt_sigsuspend(cx: &mut Cx<'_>, set: u64, size: usize) -> SysResult
     }
     let mask = u64::from_le_bytes(get(cx, set)?);
     // 投递信号时帧里保存原来的屏蔽字，处理函数返回后恢复（signal::deliver）
-    cx.t.saved_sigmask = Some(cx.task.sigmask.get());
+    cx.task.saved_sigmask.set(Some(cx.task.sigmask.get()));
     cx.task.sigmask.set(mask & !UNBLOCKABLE);
     while !cx.interrupted() {
         if let Err(e) = cx.wait(None, &mut []) {
-            cx.task.sigmask.set(cx.t.saved_sigmask.take().unwrap());
+            if let Some(saved) = cx.task.saved_sigmask.take() {
+                cx.task.sigmask.set(saved);
+            }
             return Err(e);
         }
     }

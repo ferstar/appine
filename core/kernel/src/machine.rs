@@ -228,7 +228,6 @@ impl Machine {
             vfs,
             altstack: Default::default(),
             clear_child_tid: 0,
-            saved_sigmask: None,
             vfork_done: None,
             restart: None,
             fast_sleep: None,

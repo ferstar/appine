@@ -63,6 +63,10 @@ pub(crate) struct Task {
     pub pending: RefCell<Pending>,
     /// 信号屏蔽字。
     pub sigmask: Cell<u64>,
+    /// sigsuspend、ppoll 临时替换屏蔽字时原来的屏蔽字（Linux 的 `saved_sigmask` 加上
+    /// `TIF_RESTORE_SIGMASK`）：处理函数的帧里保存它，没有处理函数时恢复它。放在这里而不是
+    /// TaskState 里，跟踪者要读写它（PTRACE_GETSIGMASK、SETSIGMASK）。
+    pub saved_sigmask: Cell<Option<u64>>,
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
     pub killed: Cell<bool>,
     /// 线程正在内核里等待（`/proc/<pid>/stat` 的状态 S）。在释放 BKL 之前设置，重新拿到
@@ -129,8 +133,6 @@ pub(crate) struct TaskState {
     pub altstack: AltStack,
     /// 线程退出时清零并 futex 唤醒的地址（`set_tid_address`、`CLONE_CHILD_CLEARTID`）。
     pub clear_child_tid: u64,
-    /// sigsuspend、ppoll 临时替换屏蔽字时原来的屏蔽字。
-    pub saved_sigmask: Option<u64>,
     /// vfork 的子进程：execve 或退出时置位，让父进程继续。
     pub vfork_done: Option<Rc<Cell<bool>>>,
     /// 被信号打断的 nanosleep 剩下的部分（`restart_syscall`）：到期时刻和 `rem` 的地址。
@@ -161,6 +163,7 @@ impl Task {
             tgid,
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),
+            saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
             sleeping: AtomicBool::new(false),
             comm: Cell::new(comm),

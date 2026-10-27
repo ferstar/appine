@@ -323,7 +323,6 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         } else {
             0
         },
-        saved_sigmask: None,
         vfork_done: vfork_done.clone(),
         restart: None,
         fast_sleep: None,
@@ -693,7 +692,7 @@ fn exec(
     unsafe { cpu.reset(mm.borrow().mmu()) };
     cx.set_mm(mm);
     cx.t.altstack = AltStack::default();
-    cx.t.saved_sigmask = None;
+    cx.task.saved_sigmask.set(None);
     cx.task.comm.set(process::comm_of(&comm));
     let st = cpu.state_mut();
     st.pc = image.entry;

@@ -1465,7 +1465,7 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
 }
 
 /// 进程 `pid` 的地址空间。
-fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno> {
+pub(crate) fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno> {
     let task = k
         .groups
         .get(&pid)
@@ -1476,10 +1476,16 @@ fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno>
     Ok(mm)
 }
 
-/// 读 `/proc/<pid>/mem`：位置就是地址。按页读，碰到不能读的页停下；一字节也没读到时是
-/// EIO（Linux 的 `mem_rw`）。
-pub(crate) fn read_mem(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
-    let mm = process_mm(k, pid)?;
+/// 读 `/proc/<pid>/mem`（`mm` 是打开时的地址空间，已经释放时读到 EOF）：位置就是地址。
+/// 按页读，碰到不能读的页停下；一字节也没读到时是 EIO（Linux 的 `mem_rw`）。
+pub(crate) fn read_mem(
+    mm: Option<Rc<RefCell<crate::mm::Mm>>>,
+    buf: &mut [u8],
+    pos: u64,
+) -> Result<usize, Errno> {
+    let Some(mm) = mm else {
+        return Ok(0);
+    };
     let mm = mm.borrow();
     let mut done = 0;
     while done < buf.len() {
@@ -1506,13 +1512,14 @@ pub(crate) fn read_mem(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Result
 ///
 /// [`Mm::write_force`]: crate::mm::Mm::write_force
 pub(crate) fn write_mem(
-    k: &Kernel,
-    pid: Tid,
+    mm: Option<Rc<RefCell<crate::mm::Mm>>>,
     data: &[u8],
     pos: u64,
     current: &Arc<crate::task::TaskSync>,
 ) -> Result<usize, Errno> {
-    let mm = process_mm(k, pid)?;
+    let Some(mm) = mm else {
+        return Ok(0);
+    };
     let mut mm = mm.borrow_mut();
     let mut done = 0;
     while done < data.len() {

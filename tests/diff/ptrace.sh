@@ -847,3 +847,182 @@ int main(void)
 }
 C
 gcc -O1 -o hw3 hw3.c && ./hw3
+
+# 带着信号单步：停在处理函数的第一条指令上（ptrace_notify 的 SIGTRAP，si_code 也是
+# SIGTRAP），再单步才执行它；sigsuspend 里停住时 GETSIGMASK 读到的是原来的屏蔽字，
+# SETSIGMASK 之后处理函数返回时不再恢复原来的
+cat > sigstep.c <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile int hits;
+static void handler(int sig) { (void)sig; hits++; }
+
+struct regs { uint64_t x[31], sp, pc, pstate; };
+
+static uint64_t pc_of(pid_t pid)
+{
+    struct regs r;
+    struct iovec iov = {&r, sizeof r};
+    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    return r.pc;
+}
+
+static int wait_stop(pid_t pid, siginfo_t *si)
+{
+    int st;
+    waitpid(pid, &st, 0);
+    if (!WIFSTOPPED(st))
+        return -1;
+    ptrace(PTRACE_GETSIGINFO, pid, 0, si);
+    return WSTOPSIG(st);
+}
+
+static const char *where(uint64_t pc)
+{
+    uint64_t h = (uint64_t)handler;
+    if (pc == h) return "handler";
+    if (pc == h + 4) return "handler+4";
+    return "elsewhere";
+}
+
+int main(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGUSR1, handler);
+        sigset_t m;
+        sigemptyset(&m);
+        sigaddset(&m, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &m, NULL);
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        raise(SIGUSR1);
+        /* sigsuspend：临时屏蔽 SIGUSR2 以外再加 SIGINT */
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, SIGINT);
+        sigsuspend(&s);
+        sigset_t after;
+        sigprocmask(SIG_BLOCK, NULL, &after);
+        _exit((sigismember(&after, SIGUSR2) ? 1 : 0) | (sigismember(&after, SIGQUIT) ? 2 : 0) |
+              (hits == 2 ? 4 : 0));
+    }
+    siginfo_t si;
+    wait_stop(pid, &si);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int sig = wait_stop(pid, &si); /* raise(SIGUSR1) 的信号投递停止 */
+    printf("stop %d\n", sig);
+    /* 带着信号单步：停在处理函数的第一条指令上（还没执行），还是执行了它之后 */
+    ptrace(PTRACE_SINGLESTEP, pid, 0, SIGUSR1);
+    sig = wait_stop(pid, &si);
+    printf("step into handler: sig %d code %d at %s\n", sig, si.si_code, where(pc_of(pid)));
+    ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
+    sig = wait_stop(pid, &si);
+    printf("next step: sig %d code %d at %s\n", sig, si.si_code, where(pc_of(pid)));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    /* 子进程停在 sigsuspend 里；发 SIGUSR1 打断它，在信号投递停止里看屏蔽字 */
+    usleep(100000);
+    kill(pid, SIGUSR1);
+    sig = wait_stop(pid, &si);
+    uint64_t mask;
+    ptrace(PTRACE_GETSIGMASK, pid, 8, &mask);
+    printf("in sigsuspend: stop %d, mask has INT %d USR2 %d\n", sig, !!(mask & (1ull << (SIGINT - 1))),
+           !!(mask & (1ull << (SIGUSR2 - 1))));
+    /* 跟踪者改了屏蔽字：处理函数返回之后是它，不再恢复 sigsuspend 之前的 */
+    mask = 1ull << (SIGQUIT - 1);
+    ptrace(PTRACE_SETSIGMASK, pid, 8, &mask);
+    ptrace(PTRACE_CONT, pid, 0, SIGUSR1);
+    int st;
+    waitpid(pid, &st, 0);
+    printf("exit %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+C
+gcc -O1 -o sigstep sigstep.c && ./sigstep
+
+# /proc/<pid>/mem 拿的是打开时的地址空间，execve 之后旧的 fd 读到 EOF；auxv、environ、
+# mem、maps 打开时要能跟踪那个进程（同一个用户、不可 dump 的打不开）
+cat > procmem.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile char secret[] = "before exec";
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    /* /proc/<pid>/mem 拿的是打开时的地址空间：子进程 execve 之后，旧的 fd 读到 EOF */
+    int go[2];
+    pipe(go);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        execl("/bin/sleep", "sleep", "1", (char *)0);
+        _exit(127);
+    }
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/mem", pid);
+    int fd = open(path, O_RDONLY);
+    char buf[16] = {0};
+    ssize_t n = pread(fd, buf, 11, (off_t)(unsigned long)secret);
+    printf("before exec: %zd %s\n", n, buf);
+    write(go[1], "x", 1);
+    usleep(300000);
+    memset(buf, 0, sizeof buf);
+    n = pread(fd, buf, 11, (off_t)(unsigned long)secret);
+    printf("after exec: %zd\n", n);
+    int fd2 = open(path, O_RDONLY);
+    printf("reopen after exec: %d\n", fd2 >= 0);
+    waitpid(pid, NULL, 0);
+
+    /* auxv、environ：同一个用户的进程不可 dump 时打不开（要能以只读方式跟踪它） */
+    int ready[2];
+    pipe(ready);
+    pid = fork();
+    if (pid == 0) {
+        setgid(1000);
+        setuid(1000);
+        prctl(PR_SET_DUMPABLE, 0);
+        write(ready[1], "x", 1);
+        pause();
+        _exit(0);
+    }
+    char c;
+    read(ready[0], &c, 1);
+    pid_t peer = fork();
+    if (peer == 0) {
+        setgid(1000);
+        setuid(1000);
+        const char *names[] = {"auxv", "environ", "mem", "maps"};
+        for (int i = 0; i < 4; i++) {
+            snprintf(path, sizeof path, "/proc/%d/%s", pid, names[i]);
+            int f = open(path, O_RDONLY);
+            printf("non-dumpable %s: %s\n", names[i], f >= 0 ? "opened" : strerror(errno));
+        }
+        _exit(0);
+    }
+    waitpid(peer, NULL, 0);
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    return 0;
+}
+C
+gcc -O1 -o procmem procmem.c && ./procmem

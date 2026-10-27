@@ -122,6 +122,9 @@ pub enum FileKind {
         node: PseudoNode,
         /// 内容。
         data: Vec<u8>,
+        /// `/proc/<pid>/mem`：打开时那个进程的地址空间。与 Linux 一样，进程 execve 之后
+        /// 读写的仍是它（已经释放时读到 EOF），不是新程序的。
+        mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
     },
 }
 

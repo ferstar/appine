@@ -20,6 +20,6 @@
 **推迟项**：
 
 - 没有硬件断点和观察点：gdb 的观察点靠逐条指令单步，每条指令都要停下来让 gdb 比较一次。→ 已补上（M9 之前：硬件断点和观察点）：解释器检查，有它们的线程只用 Tier 0
-- 单步进入信号处理函数时的行为没有和 Linux 对照过。
-- `/proc/<pid>/mem` 读写的是那个 pid 现在的地址空间；Linux 拿的是打开时的，进程 execve 之后旧的 fd 读不到新程序。`/proc/<pid>/auxv` 不检查权限（Linux 要求能以只读方式跟踪那个进程）。
+- 单步进入信号处理函数时的行为没有和 Linux 对照过。→ 对照了，原来不同：Linux 停在处理函数的第一条指令上、不执行它，appine 执行了才停；已改成相同（M9 之前：ptrace 和 procfs 的细节）
+- `/proc/<pid>/mem` 读写的是那个 pid 现在的地址空间；Linux 拿的是打开时的，进程 execve 之后旧的 fd 读不到新程序。`/proc/<pid>/auxv` 不检查权限（Linux 要求能以只读方式跟踪那个进程）。→ 都已补上（M9 之前：ptrace 和 procfs 的细节），maps、smaps、pagemap、environ 也一样要求能跟踪
 - 仍然没有 core dump，gdb 不能事后分析。→ 已补上（M9 之前：core dump）

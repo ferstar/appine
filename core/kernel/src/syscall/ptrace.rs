@@ -148,11 +148,15 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             if addr != 8 {
                 return Err(Errno::EINVAL);
             }
+            // 与 Linux 一样：sigsuspend、ppoll 换掉了屏蔽字时读到的是原来的那个；设置之后不再
+            // 恢复原来的（clear_tsk_restore_sigmask），处理函数返回后是跟踪者设的
             if request == GETSIGMASK {
-                put(cx, data, task.sigmask.get().to_le_bytes()).map(|()| 0)
+                let mask = task.saved_sigmask.get().unwrap_or(task.sigmask.get());
+                put(cx, data, mask.to_le_bytes()).map(|()| 0)
             } else {
                 let mask = u64::from_le_bytes(get(cx, data)?);
                 task.sigmask.set(mask & !signal::UNBLOCKABLE);
+                task.saved_sigmask.set(None);
                 Ok(0)
             }
         }

@@ -512,14 +512,14 @@ pub(super) fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Resul
         return Err(Errno::EINVAL);
     }
     let mask = u64::from_le_bytes(get(cx, sigmask)?);
-    cx.t.saved_sigmask = Some(cx.task.sigmask.get());
+    cx.task.saved_sigmask.set(Some(cx.task.sigmask.get()));
     cx.task.sigmask.set(mask & !signal::UNBLOCKABLE);
     Ok(())
 }
 
 pub(super) fn restore_mask<T>(cx: &mut Cx<'_>, r: &Result<T, Errno>) {
     let interrupted = matches!(r, Err(e) if *e == Errno::ERESTARTNOHAND);
-    if !interrupted && let Some(saved) = cx.t.saved_sigmask.take() {
+    if !interrupted && let Some(saved) = cx.task.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
     }
 }

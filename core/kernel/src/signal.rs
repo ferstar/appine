@@ -908,7 +908,11 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             }
         }
         // sigsuspend、ppoll 临时换掉的屏蔽字：帧里保存原来的，处理函数返回后恢复
-        let saved = cx.t.saved_sigmask.take().unwrap_or(cx.task.sigmask.get());
+        let saved = cx
+            .task
+            .saved_sigmask
+            .take()
+            .unwrap_or(cx.task.sigmask.get());
         if setup_frame(cx, cpu, sig, &info, &act, saved).is_err() {
             crate::debug::log(format_args!("cannot set up the frame for {sig}"));
             let group = cx.t.group.clone();
@@ -931,8 +935,16 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         }
         handled = true;
     }
-    if !handled && let Some(saved) = cx.t.saved_sigmask.take() {
+    if !handled && let Some(saved) = cx.task.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
+    }
+    // PTRACE_SINGLESTEP 进了处理函数：与 arm64 Linux 一样（user_fastforward_single_step
+    // 之后的 tracehook_signal_handler）停在处理函数的第一条指令上，还没有执行它
+    if handled
+        && cx.task.stepping.load(std::sync::atomic::Ordering::Relaxed)
+        && !crate::ptrace::handler_entered(cx, cpu)
+    {
+        return Flow::Exit;
     }
     // 没有处理函数打断：重新执行的那条 svc 改成 restart_syscall，接着做剩下的部分
     if !handled

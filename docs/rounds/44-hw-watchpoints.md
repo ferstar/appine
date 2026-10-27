@@ -1,6 +1,6 @@
 # M9 之前：硬件断点和观察点（2026-10-27）
 
-← [M9 之前：core dump（2026-10-27）](43-coredump.md) · [索引](../milestones.md)
+← [M9 之前：core dump（2026-10-27）](43-coredump.md) · [索引](../milestones.md) · [M9 之前：ptrace 和 procfs 的细节（2026-10-27）](45-ptrace-procfs.md) →
 
 [ptrace 的第二步](41-ptrace-gdb.md)让 `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 报告 0 个槽，gdb 的 `watch` 只能退回软件观察点：每执行一条指令都停下来让 gdb 比较一次值，在真实程序上基本不能用；`hbreak` 也不能用。这一轮实现硬件断点和观察点（§7.6）。
 
