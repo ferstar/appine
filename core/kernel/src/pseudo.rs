@@ -1450,12 +1450,17 @@ fn map_line(r: &Region) -> String {
     }
 }
 
-/// smaps 的计数，单位 kB。宿主看不出哪些页被别的进程共用、哪些被写过：匿名内存的
-/// 驻留页都算私有的脏页，文件映射的都算私有的干净页。
+/// smaps 的计数，单位 kB。宿主看不出哪些页被写过：匿名内存的驻留页都算脏页，文件映射的
+/// 都算干净页。匿名内存里 fork 之后和别的地址空间共用的页（写时复制）算共享的，Pss 按
+/// 共用的个数分摊（[`crate::mm::Mm::cow_shared`]），其余都算私有的。
 #[derive(Default)]
 struct Usage {
     rss: u64,
     anon: u64,
+    /// `anon` 里和别的地址空间共用的。
+    shared: u64,
+    /// `shared` 分摊之后的字节数。
+    shared_pss: u64,
     file: u64,
     shmem: u64,
     locked: u64,
@@ -1465,29 +1470,35 @@ impl Usage {
     fn add(&mut self, o: &Usage) {
         self.rss += o.rss;
         self.anon += o.anon;
+        self.shared += o.shared;
+        self.shared_pss += o.shared_pss;
         self.file += o.file;
         self.shmem += o.shmem;
         self.locked += o.locked;
     }
 
-    /// Linux 的 `__show_smap`：标签占 16 列，数字占 8 列。
+    /// Linux 的 `__show_smap`：标签占 16 列，数字占 8 列。Pss 与 Linux 一样先按字节累加，
+    /// 最后才换成 kB。
     fn write(&self, s: &mut String, rollup: bool) {
-        let dirty = self.anon + self.shmem;
+        let private = self.anon - self.shared;
+        let pss_anon = private * 1024 + self.shared_pss;
+        let pss_shmem = self.shmem * 1024;
+        let dirty = private + self.shmem;
         // Private_Hugetlb 的标签多一列，数字少一列，总宽度不变
         let mut put = |label: &str, kb: u64| {
             let w = 24 - label.len().max(16);
             writeln!(s, "{label:<16}{kb:>w$} kB").unwrap()
         };
         put("Rss:", self.rss);
-        put("Pss:", self.rss);
-        put("Pss_Dirty:", dirty);
+        put("Pss:", (pss_anon + pss_shmem) / 1024 + self.file);
+        put("Pss_Dirty:", (pss_anon + pss_shmem) / 1024);
         if rollup {
-            put("Pss_Anon:", self.anon);
+            put("Pss_Anon:", pss_anon / 1024);
             put("Pss_File:", self.file);
             put("Pss_Shmem:", self.shmem);
         }
         put("Shared_Clean:", 0);
-        put("Shared_Dirty:", 0);
+        put("Shared_Dirty:", self.shared);
         put("Private_Clean:", self.file);
         put("Private_Dirty:", dirty);
         put("Referenced:", self.rss);
@@ -1527,7 +1538,13 @@ fn smaps(task: &Task, rollup: bool) -> String {
         match (r.file, r.shared) {
             (Some(_), _) => u.file = rss,
             (None, true) => u.shmem = rss,
-            (None, false) => u.anon = rss,
+            (None, false) => {
+                let (pages, pss) = mm.cow_shared(r.start, r.end);
+                u.anon = rss;
+                // 借出的页一般都驻留；换出到 zram 的不算驻留，也就不算共用的
+                u.shared = (pages * 4).min(rss);
+                u.shared_pss = pss.min(u.shared * 1024);
+            }
         }
         total.add(&u);
         if rollup {

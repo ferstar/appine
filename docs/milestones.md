@@ -73,6 +73,7 @@
 | [M9 之前：负载普查](rounds/62-workload-survey.md) | 2026-10-28 | `scripts/survey` 在 appine 里跑 sshd、tmux、postgres、redis、mariadb、Rust、.NET 等 20 多种服务和工具：多数正常；找到 6 个问题：fork 之后父进程的页权限被改错（rustc 崩溃）、ssh 分配不了 PTY、redis/valkey 不肯启动、mariadb 卡住、.NET 看不到别的进程的内存、`/proc/meminfo` 的可用内存偏小 |
 | [M9 之前：fork 之后还回的页按各自的权限恢复](rounds/63-returned-loans.md) | 2026-10-28 | 子进程还回借来的页时，父进程把宿主内存连着的一段按第一页所在映射的权限恢复，保护页的 PROT_NONE 扩散到旁边的页（rustc 退出时崩溃），可写的权限扩散到只读的页；改为不跨映射接段（[fork 写时复制](rounds/26-fork-cow.md)那一轮起的 bug） |
 | [M9 之前：终端的属主和权限](rounds/64-pty-owner.md) | 2026-10-28 | `/dev/pts/N` 属于 tty 组，可以 chown、chmod：sshd 能把终端交给登录的用户，`ssh -t`、交互式登录和 mosh 能用了（原来 root 登录也被关掉） |
+| [M9 之前：smaps 里共用的页](rounds/65-smaps-shared.md) | 2026-10-28 | fork 之后写时复制共用的页在 smaps 里算共享的脏页，Pss 按共用的个数分摊：redis、valkey 启动时的 `ARM64-COW-BUG` 检查通过，能启动了，后台保存、AOF 正常 |
 
 ## 测量条件
 

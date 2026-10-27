@@ -1,7 +1,7 @@
 # fork 之后父子进程的内存互不影响（写时复制）：几个子进程和父进程同时写；多线程的父进程
 # 在别的线程不停写的时候 fork，子进程看到的是某一瞬间的快照；借出的内存解除映射、搬走、
-# 丢弃；子进程结束之后借出的页恢复成各自的权限；子进程里用锁和条件变量；一层套一层的
-# fork；python 的 os.fork
+# 丢弃；子进程结束之后借出的页恢复成各自的权限；smaps 里共用的页；子进程里用锁和条件
+# 变量；一层套一层的 fork；python 的 os.fork
 set -e
 cd /tmp
 cat > cow.c <<'C'
@@ -227,6 +227,64 @@ static void returned_loans(void)
     sigaction(SIGSEGV, &old, NULL);
 }
 
+/* fork 之后两边共用写过的页：smaps 里算共享的脏页，Pss 两边各算一半；一边写过之后各是
+ * 各的。redis、valkey 在 arm64 上启动时就这样检查内核（写一页、MADV_FREE、再写，fork 之后
+ * 子进程看 Shared_Dirty），是 0 就不肯启动 */
+static void smaps_of(const char *who, unsigned char *addr)
+{
+    FILE *f = fopen("/proc/self/smaps", "r");
+    char line[256];
+    int in = 0;
+    long rss = -1, pss = -1, shared = -1, private = -1;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi;
+        if (sscanf(line, "%lx-%lx ", &lo, &hi) == 2) {
+            in = (unsigned long)addr >= lo && (unsigned long)addr < hi;
+            continue;
+        }
+        if (in) {
+            sscanf(line, "Rss: %ld", &rss);
+            sscanf(line, "Pss: %ld", &pss);
+            sscanf(line, "Shared_Dirty: %ld", &shared);
+            sscanf(line, "Private_Dirty: %ld", &private);
+        }
+    }
+    fclose(f);
+    printf("%s: Rss %ld, Pss %ld, Shared_Dirty %ld, Private_Dirty %ld\n", who, rss, pss, shared, private);
+    fflush(stdout);
+}
+
+static void shared_in_smaps(void)
+{
+    unsigned char *p = mmap(NULL, 3 * PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *q = p + PAGE;
+    mprotect(q, PAGE, PROT_READ | PROT_WRITE);
+    *q = 1;
+    madvise(q, PAGE, MADV_FREE);
+    *q = 2;
+    int go[2], back[2];
+    char c = 0;
+    pipe(go);
+    pipe(back);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        smaps_of("child after fork", q);
+        write(back[1], &c, 1);
+        read(go[0], &c, 1);
+        *q = 3;
+        smaps_of("child after writing", q);
+        write(back[1], &c, 1);
+        _exit(0);
+    }
+    read(back[0], &c, 1);
+    smaps_of("parent after fork", q);
+    write(go[1], &c, 1);
+    read(back[0], &c, 1);
+    smaps_of("parent after the child wrote", q);
+    wait_all(1);
+}
+
 /* 子进程里的锁和条件变量（futex 在 fork 时借来的页上） */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -289,6 +347,7 @@ int main(void)
     printf("threads and fork: %d bad\n", threads_and_fork());
     printf("unmap, move, discard: %d bad\n", unmap_move_discard());
     returned_loans();
+    shared_in_smaps();
     printf("locks in child: %d bad\n", locks_in_child());
     memset(mem, 'p', PAGES * PAGE);
     printf("nested: %d bad\n", nested(0));

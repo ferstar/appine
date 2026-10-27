@@ -9,7 +9,7 @@ $C bgsave; sleep 0.2; while [ "$($C info persistence | grep rdb_bgsave_in_progre
 $C info persistence | grep -E 'rdb_last_bgsave_status|rdb_last_cow' | tr -d '\r'
 ls -la /tmp/dump.rdb | awk '{print $5}'
 $C config set appendonly yes >/dev/null; sleep 2; $C info persistence | grep -E 'aof_enabled|aof_last_bgrewrite_status' | tr -d '\r'
-redis-benchmark -p 6380 -q -n 50000 -t set,get,lpush,lpop 2>&1 | tr '\r' '\n' | grep -v '^$' | grep -v 'rps=' 
+redis-benchmark -p 6380 -q -n 50000 -t set,get,lpush,lpop 2>&1 | tr '\r' '\n' | grep 'requests per second'
 $C shutdown nosave 2>&1
 sleep 0.5
 echo "== log"; grep -iE 'warn|error|fail|#' /tmp/redis.log | head -20

@@ -531,6 +531,11 @@ impl Loan {
     fn borrowers(self) -> impl Iterator<Item = (MmRef, u64)> {
         self.first.into_iter().chain(self.others)
     }
+
+    /// 映射着这一页的地址空间个数（Linux 的 mapcount）：拥有者（还在的话）和借用方。
+    fn users(&self) -> usize {
+        usize::from(self.owner.is_some()) + usize::from(self.first.is_some()) + self.others.len()
+    }
 }
 
 /// 宿主页地址的哈希：按页对齐的地址去掉低位再乘一个奇数常数就足够分散。默认的 SipHash
@@ -2029,6 +2034,31 @@ impl Mm {
             out[((page - (addr & !(PAGE_SIZE - 1))) / PAGE_SIZE) as usize] = true;
         }
         Ok(out)
+    }
+
+    /// `[addr, end)` 里与别的地址空间共用的页（写时复制借出的、借来的）：页数，以及按
+    /// 共用它的地址空间个数分摊之后的字节数。smaps 把它们算作共享的脏页，Pss 只算分摊的
+    /// 一份，与 Linux 按 mapcount 算的一样；只剩一个借用方的孤儿页只属于它，不算。
+    pub fn cow_shared(&self, addr: u64, end: u64) -> (u64, u64) {
+        let c = self.cow.borrow();
+        let loans = self.loans.borrow();
+        let (mut pages, mut pss) = (0, 0);
+        let mut count = |key: usize| {
+            let users = loans.get(&key).map_or(1, Loan::users) as u64;
+            if users > 1 {
+                pages += 1;
+                pss += PAGE_SIZE / users;
+            }
+        };
+        for &page in c.lent.range(addr..end) {
+            if let Some((s, v)) = self.anon_vma(page) {
+                count(Self::own_page(s, v, page).as_ptr() as usize);
+            }
+        }
+        for b in c.borrowed.range(addr..end).map(|(_, b)| b) {
+            count(b.host.as_ptr() as usize);
+        }
+        (pages, pss)
     }
 
     /// msync(2) 的范围检查：区间必须完全已映射。
@@ -4167,6 +4197,35 @@ mod tests {
         assert!(writable(&parent, a + PAGE_SIZE));
         assert!(readable(a + 2 * PAGE_SIZE) && !writable(&parent, a + 2 * PAGE_SIZE));
         assert!(parent.borrow().cow.borrow().lent.is_empty());
+    }
+
+    #[test]
+    fn cow_shared_counts_pages_mapped_by_others() {
+        // smaps 的 Shared_Dirty 和 Pss：共用一页的地址空间个数与 Linux 的 mapcount 一样
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, 2 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        poke(&parent, a, b'p');
+        poke(&parent, a + PAGE_SIZE, b'p');
+        let shared = |mm: &Rc<RefCell<Mm>>| mm.borrow().cow_shared(a, a + 2 * PAGE_SIZE);
+        assert_eq!(shared(&parent), (0, 0));
+        let child = parent.borrow_mut().fork().unwrap();
+        assert_eq!(shared(&parent), (2, PAGE_SIZE));
+        assert_eq!(shared(&child), (2, PAGE_SIZE));
+        // 孙进程也借：三个地址空间各分摊三分之一
+        let grandchild = child.borrow_mut().fork().unwrap();
+        assert_eq!(shared(&grandchild), (2, 2 * (PAGE_SIZE / 3)));
+        // 子进程写了第 0 页，那一页只剩父进程和孙进程共用
+        poke(&child, a, b'c');
+        assert_eq!(shared(&child), (1, PAGE_SIZE / 3));
+        assert_eq!(shared(&parent), (2, PAGE_SIZE / 2 + PAGE_SIZE / 3));
+        // 父进程的地址空间销毁之后，只有一个借用方的孤儿页算私有的
+        drop(parent);
+        drop(child);
+        assert_eq!(shared(&grandchild), (0, 0));
     }
 
     #[test]
