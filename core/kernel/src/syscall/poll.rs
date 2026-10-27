@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, read_timespec, tty};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, HostEdges, OpenFile, oflags};
-use crate::kernel::{Cx, request_wake_files, request_wake_object, wake};
+use crate::kernel::{Cx, request_wake_object, wake};
 use crate::pipe::PIPE_BUF;
 use crate::process::RLIMIT_NOFILE;
 use crate::signal;
@@ -274,10 +274,10 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
 }
 
 /// 等打开文件 `f` 的就绪状态变化时要登记的唤醒对象（[`wake::of`]）。改变进程内对象
-/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求整个通道（挂起的信号、pidfd、
-/// POSIX 消息队列仍是这样）；宿主 fd 上的数据由宿主 poll 等，宿主 socket 列出它自己
-/// （关闭、DNS 存根的回答）。signalfd 只列出它自己（改掩码），epoll 只列出它自己
-/// （epoll_ctl），里面的关注由 [`Waits`] 逐个加上。
+/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求整个通道（挂起的信号、pidfd
+/// 仍是这样）；宿主 fd 上的数据由宿主 poll 等，宿主 socket 列出它自己（关闭、DNS 存根
+/// 的回答）。signalfd 只列出它自己（改掩码），epoll 只列出它自己（epoll_ctl），里面的
+/// 关注由 [`Waits`] 逐个加上。
 fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
     match &f.kind {
         FileKind::Pipe(end) => out.push(crate::pipe::object(&end.pipe)),
@@ -288,6 +288,7 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
         FileKind::SignalFd(s) => out.push(wake::of(s)),
         FileKind::Epoll(ep) => out.push(wake::of(ep)),
         FileKind::Socket(s) => super::net::wake_objects(s, out),
+        FileKind::MessageQueue(q) => out.push(wake::of(q)),
         _ => {}
     }
 }
@@ -546,9 +547,9 @@ pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
     for event in &cx.k().edge_waiters {
         crate::kernel::signal_later(event);
     }
-    // 信号驱动的 I/O 也按用完数据重新开始计算，见 check_fasync
+    // 信号驱动的 I/O 也按用完数据重新开始计算，见 check_fasync：只叫醒定时器线程
     if file.borrow().flags & oflags::O_ASYNC != 0 {
-        request_wake_files();
+        crate::kernel::signal_later(&cx.shared.timers);
     }
 }
 
@@ -576,6 +577,8 @@ pub(crate) struct Fasync {
 }
 
 /// 打开文件刚刚设置了 `O_ASYNC`：登记它。已经就绪的事件不发信号，与 Linux 一样。
+/// 叫醒定时器线程：原来没有 `O_ASYNC` 的文件时它只听"其余"通道，要等它因为别的事
+/// 醒来才开始检查这个文件。
 pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
     let k = cx.k();
     k.fasync.retain(|e| e.file.strong_count() > 0);
@@ -591,6 +594,7 @@ pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
         reads: f.reads,
         arrivals: arrivals(&f),
     });
+    crate::kernel::signal_later(&cx.shared.timers);
 }
 
 /// 检查设置了 `O_ASYNC` 的文件，新出现的就绪事件给属主发信号。返回等待时要一起 poll

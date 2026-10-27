@@ -240,8 +240,9 @@ impl Drop for OpenFile {
     /// epoll、阻塞的收发里等着它的线程的宿主 poll 还拿着它（宿主 socket 要等它们放手才
     /// 真正关闭），只叫醒登记了这个 socket 的等待者。别的文件关闭时不必叫醒谁：管道、
     /// PTY、AF_UNIX socket 的另一方由 `PipeEnd`、`PtyEnd`、`UnixSocket` 叫醒（只叫醒等这个
-    /// 管道、PTY、连接的），epoll、eventfd、inotify 这类对象关闭时没有线程在等它。shell
-    /// 每次 exec、退出都要关好几个文件，原来每关一个都把读着管道的进程叫醒一遍。
+    /// 管道、PTY、连接的），epoll、eventfd、inotify、消息队列这类对象关闭时没有线程在等它
+    /// （阻塞在上面的收发拿着打开文件，与 Linux 一样不因别人关闭 fd 而醒）。shell 每次
+    /// exec、退出都要关好几个文件，原来每关一个都把读着管道的进程叫醒一遍。
     fn drop(&mut self) {
         match &self.kind {
             FileKind::Socket(s)
@@ -251,7 +252,6 @@ impl Drop for OpenFile {
             {
                 crate::kernel::request_wake_object(crate::kernel::wake::of(s));
             }
-            FileKind::MessageQueue(_) => crate::kernel::request_wake_files(),
             _ => {}
         }
         if self.holds_locks {

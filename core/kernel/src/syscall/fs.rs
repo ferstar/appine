@@ -14,7 +14,7 @@ use super::{IO_CHUNK, MAX_COPY, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, Kernel, Tid, request_wake_files, request_wake_locks, request_wake_object};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_locks, request_wake_object};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -3411,8 +3411,9 @@ pub(super) fn read_file(
         };
         if k > 0 {
             file.borrow_mut().reads += 1;
+            // 信号驱动的 I/O 由定时器线程检查（check_fasync）：只叫醒它
             if file.borrow().flags & oflags::O_ASYNC != 0 {
-                request_wake_files();
+                crate::kernel::signal_later(&cx.shared.timers);
             }
         }
         if let Err(e) = cx.mm().write(

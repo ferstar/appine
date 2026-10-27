@@ -16,7 +16,7 @@ use super::{SysResult, get, put, read_timespec};
 use crate::cred::{MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
-use crate::kernel::{Cx, Tid, request_wake};
+use crate::kernel::{Cx, Tid, request_wake_object, wake};
 use crate::net::Socket;
 use crate::process::Signal;
 use crate::signal::{self, InfoFields, SigInfo};
@@ -336,7 +336,8 @@ pub(super) fn mq_timedsend(
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
-        cx.wait(deadline, &mut [])?;
+        // 收走消息时请求这个队列
+        cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(&q)])?;
     }
     let notify = {
         let mut q = q.borrow_mut();
@@ -377,11 +378,13 @@ pub(super) fn mq_timedsend(
                 cookie[31] = NOTIFY_WOKENUP;
                 n.queue.push_back(cookie.to_vec());
                 n.arrivals += 1;
+                request_wake_object(wake::of(&sock));
             }
         }
         _ => {}
     }
-    request_wake();
+    // 只叫醒等这个队列的（poll、epoll、阻塞的接收）：原来叫醒所有等待者
+    request_wake_object(wake::of(&q));
     Ok(0)
 }
 
@@ -418,11 +421,12 @@ pub(super) fn mq_timedreceive(
             return Err(Errno::EINTR);
         }
         q.borrow_mut().receivers += 1;
-        let r = cx.wait(deadline, &mut []);
+        // 来了消息时请求这个队列
+        let r = cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(&q)]);
         q.borrow_mut().receivers -= 1;
         r?;
     };
-    request_wake();
+    request_wake_object(wake::of(&q));
     cx.mm().write(UserSlice::new(msg, data.len()), &data)?;
     if prio != 0 {
         put(cx, prio, p.to_le_bytes())?;

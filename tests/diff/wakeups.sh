@@ -1,8 +1,9 @@
 # 等待和唤醒：别的进程在别的管道、socket、eventfd、PTY 上来回读写，起进程（含 vfork、
 # posix_spawn）、结束进程，改别的 epoll、timerfd、inotify、signalfd，设定时器，建立、关闭
-# TCP 连接，查 netlink，加锁解锁、设租约、改管道大小时，空闲着等自己的对象的进程不被叫醒
-# （自愿上下文切换的次数不变）；每一种对象上真正的事件都叫醒另一个进程里等着的线程，
-# vfork 的父进程、改短了的定时器、等锁和租约的进程照常
+# TCP 连接，查 netlink，加锁解锁、设租约、改管道大小，收发、开关消息队列，读写设了 O_ASYNC
+# 的管道时，空闲着等自己的对象的进程不被叫醒（自愿上下文切换的次数不变）；每一种对象上
+# 真正的事件都叫醒另一个进程里等着的线程，vfork 的父进程、改短了的定时器、等锁和租约的
+# 进程、消息队列的通知、读空之后再来数据的 SIGIO 照常
 set -e
 rm -rf /tmp/wakeups.d /tmp/wakeups.idle /tmp/wakeups.lock /dev/shm/wakeups.lease
 mkdir -p /tmp/wakeups.d /tmp/wakeups.idle
@@ -13,6 +14,7 @@ cat > wakeups.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <mqueue.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -120,7 +122,19 @@ static void ask_links(int nl)
 static const char *idle_kinds[] = {
     "epoll eventfd", "poll pipe",    "read unix stream", "poll unix dgram", "read pty",
     "read eventfd",  "epoll timerfd", "read inotify",    "read tcp",        "epoll tcp",
+    "read mqueue",   "poll mqueue",
 };
+
+/* 一个只有自己知道的空消息队列（名字马上删掉） */
+static mqd_t own_queue(int flags)
+{
+    char name[64];
+    struct mq_attr a = {.mq_maxmsg = 4, .mq_msgsize = 16};
+    snprintf(name, sizeof name, "/wakeups.%d", getpid());
+    mqd_t q = mq_open(name, O_RDWR | O_CREAT | flags, 0600, &a);
+    mq_unlink(name);
+    return q;
+}
 #define NIDLE (int)(sizeof idle_kinds / sizeof idle_kinds[0])
 
 /* 子进程：建好自己的对象，告诉父进程，然后一直等它 */
@@ -191,6 +205,18 @@ static void idle(int kind, int ready)
         write(ready, "r", 1);
         epoll_wait(e, &ev, 1, -1);
         break;
+    case 10: {
+        mqd_t q = own_queue(0);
+        write(ready, "r", 1);
+        mq_receive(q, buf, sizeof buf, NULL);
+        break;
+    }
+    case 11: {
+        struct pollfd p = {own_queue(0), POLLIN, 0};
+        write(ready, "r", 1);
+        poll(&p, 1, -1);
+        break;
+    }
     }
     _exit(0);
 }
@@ -365,6 +391,31 @@ static void traffic(void)
     for (int i = 0; i < 50; i++)
         fcntl(a[1], F_SETPIPE_SZ, i % 2 ? 65536 : 131072);
     close(a[0]), close(a[1]);
+
+    /* 收发、开关别的消息队列 */
+    mqd_t q = own_queue(O_NONBLOCK);
+    for (int i = 0; i < 200; i++) {
+        char m[16] = "m";
+        mq_send(q, m, 1, 0);
+        mq_receive(q, m, sizeof m, NULL);
+    }
+    mq_close(q);
+    struct mq_attr ma = {.mq_maxmsg = 4, .mq_msgsize = 16};
+    for (int i = 0; i < 50; i++)
+        mq_close(mq_open("/wakeups.traffic", O_RDWR | O_CREAT, 0600, &ma));
+    mq_unlink("/wakeups.traffic");
+
+    /* 读写设了 O_ASYNC 的管道（信号驱动的 I/O） */
+    signal(SIGIO, SIG_IGN);
+    pipe(a);
+    fcntl(a[0], F_SETOWN, getpid());
+    fcntl(a[0], F_SETFL, O_ASYNC);
+    for (int i = 0; i < 200; i++) {
+        write(a[1], &c, 1);
+        read(a[0], &c, 1);
+    }
+    close(a[0]), close(a[1]);
+    signal(SIGIO, SIG_DFL);
 }
 
 static void idle_waiters(void)
@@ -675,6 +726,65 @@ static int write_full(void)
 }
 static void grow_pipe(void) { fcntl(fds[1], F_SETPIPE_SZ, 1 << 20); }
 
+/* ---- 消息队列 ---- */
+static mqd_t mq;
+static int notified[2];
+static int mq_recv1(void)
+{
+    char m[16];
+    return mq_receive(mq, m, sizeof m, NULL) == 1;
+}
+static int mq_send1(void) { return mq_send(mq, "m", 1, 0) == 0; }
+static void mq_poke_send(void) { mq_send(mq, "m", 1, 0); }
+static void mq_poke_recv(void)
+{
+    char m[16];
+    mq_receive(mq, m, sizeof m, NULL);
+}
+static int poll_mq(void) { return pollin(mq); }
+/* SIGEV_THREAD：musl 用一个 netlink socket 和一个阻塞在 recv 里的线程实现 */
+static void on_notify(union sigval v)
+{
+    (void)v;
+    write(notified[1], "n", 1);
+}
+static int mq_notify_thread(void)
+{
+    struct sigevent sev = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = on_notify};
+    if (mq_notify(mq, &sev) != 0)
+        return 0;
+    char c;
+    return read(notified[0], &c, 1) == 1;
+}
+
+/* ---- 信号驱动的 I/O：TCP 连接读空之后，再来的数据也发 SIGIO ---- */
+static volatile int sigios;
+static void on_sigio(int sig) { (void)sig, sigios++; }
+static int sigio_again(void)
+{
+    struct sigaction sa = {.sa_handler = on_sigio};
+    sigaction(SIGIO, &sa, NULL);
+    sigset_t io, old;
+    sigemptyset(&io);
+    sigaddset(&io, SIGIO);
+    sigprocmask(SIG_BLOCK, &io, &old);
+    fcntl(tcp_c, F_SETOWN, getpid());
+    fcntl(tcp_c, F_SETFL, O_ASYNC | O_NONBLOCK);
+    while (sigios < 1)
+        sigsuspend(&old);
+    while (read(tcp_c, big, sizeof big) > 0)
+        ;
+    while (sigios < 2)
+        sigsuspend(&old);
+    return 1;
+}
+static void write_s_twice(void)
+{
+    write(tcp_s, "a", 1);
+    usleep(200000);
+    write(tcp_s, "b", 1);
+}
+
 static void wake_cases(void)
 {
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
@@ -820,6 +930,24 @@ static void wake_cases(void)
         ;
     check("write pipe (F_SETPIPE_SZ)", write_full, grow_pipe);
     closefds();
+
+    struct mq_attr ma = {.mq_maxmsg = 2, .mq_msgsize = 16};
+    mq_unlink("/wakeups.mq");
+    mq = mq_open("/wakeups.mq", O_RDWR | O_CREAT, 0600, &ma);
+    mq_unlink("/wakeups.mq");
+    check("mq_receive", mq_recv1, mq_poke_send);
+    check("poll mqueue", poll_mq, mq_poke_send);
+    mq_poke_send(); /* 满了：再发要等 */
+    check("mq_send (full)", mq_send1, mq_poke_recv);
+    mq_poke_recv(), mq_poke_recv();
+    pipe(notified);
+    check("mq_notify (SIGEV_THREAD)", mq_notify_thread, mq_poke_send);
+    close(notified[0]), close(notified[1]);
+    mq_close(mq);
+
+    tcp_pair(&tcp_s, &tcp_c);
+    check("SIGIO tcp (again after drain)", sigio_again, write_s_twice);
+    close(tcp_s), close(tcp_c);
 }
 
 int main(void)

@@ -17,5 +17,5 @@
 
 **推迟项**：
 
-- 所有线程都屏蔽的信号（signalfd、sigtimedwait 等它）、SysV IPC、POSIX 消息队列、AIO 完成、租约仍叫醒所有等待者；关闭宿主 socket 仍叫醒所有文件类的等待者。→ 租约改走锁的通道，关闭宿主 socket 只叫醒等这个 socket 的线程（M9 之前：锁和宿主 socket 只叫醒等它们的线程）；其余仍叫醒所有等待者
+- 所有线程都屏蔽的信号（signalfd、sigtimedwait 等它）、SysV IPC、POSIX 消息队列、AIO 完成、租约仍叫醒所有等待者；关闭宿主 socket 仍叫醒所有文件类的等待者。→ 租约改走锁的通道，关闭宿主 socket 只叫醒等这个 socket 的线程（M9 之前：锁和宿主 socket 只叫醒等它们的线程）；POSIX 消息队列只叫醒等这个队列的线程（M9 之前：消息队列和信号驱动的 I/O 不再叫醒所有人）；其余仍叫醒所有等待者
 - 有独占门、`O_ASYNC` 的文件时，定时器线程仍被每一次修改叫醒（[独占的唤醒](48-exclusive-wakeup.md)的推迟项）。

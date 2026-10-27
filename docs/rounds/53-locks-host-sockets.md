@@ -1,6 +1,6 @@
 # M9 之前：锁和宿主 socket 只叫醒等它们的线程（2026-10-27）
 
-← [M9 之前：signalfd 看调用的线程（2026-10-27）](52-signalfd-caller.md) · [索引](../milestones.md)
+← [M9 之前：signalfd 看调用的线程（2026-10-27）](52-signalfd-caller.md) · [索引](../milestones.md) · [M9 之前：消息队列和信号驱动的 I/O 不再叫醒所有人（2026-10-27）](54-mqueue-fasync.md) →
 
 [按对象唤醒](49-targeted-wakeups.md)之后，还有几处修改请求整个文件类的通道：解锁（flock、fcntl 的记录锁和 OFD 锁）、关闭加过锁的文件、持着记录锁的进程退出、f_pos 锁放开、关闭宿主 socket、netlink 和 DNS 存根的回答、`F_SETPIPE_SZ`。poll、epoll 的等待者都听这个通道，每一处都把系统里停在 poll、epoll 里的线程叫醒一遍；阻塞在宿主 socket 上的 recv、send、accept、connect 用的是听所有通道、不限对象的等待，连每一次管道、PTY 的读写都会叫醒它们。量下来（`target/herd/sockherd.c`）：8 个进程空等，各自用 epoll 等一个没人碰的 eventfd（"epoll"），或者阻塞在一个没有数据的 TCP 连接的 recv 里（"recv"），主进程各做 2000 次下面的操作，每次操作的微秒数和空等的进程被叫醒的次数（之前、之后各两次）：
 
@@ -54,5 +54,5 @@
 
 **推迟项**：
 
-- 关闭 POSIX 消息队列、有 `O_ASYNC` 的文件时信号驱动的 I/O 仍请求整个文件类的通道，叫醒所有 poll、epoll 的等待者。
+- 关闭 POSIX 消息队列、有 `O_ASYNC` 的文件时信号驱动的 I/O 仍请求整个文件类的通道，叫醒所有 poll、epoll 的等待者。→ 已改：消息队列按对象唤醒，信号驱动的 I/O 只叫醒定时器线程（M9 之前：消息队列和信号驱动的 I/O 不再叫醒所有人）
 - `appine-run` 交给 guest 的宿主 stdio（`FileKind::Host`）上的阻塞读写仍用听所有通道、不限对象的等待。App 里没有这种文件。

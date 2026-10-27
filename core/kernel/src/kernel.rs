@@ -48,7 +48,9 @@ pub(crate) const UTS_LEN: usize = 64;
 
 /// 唤醒的通道：等待者登记自己关心哪些（[`Cx::wait_on`]），修改只叫醒关心它的等待者。
 pub(crate) mod wake {
-    /// 文件、管道、socket、文件锁这类打开文件上的修改。
+    /// 打开文件（管道、socket、PTY、消息队列……）上的修改。这些修改都按对象请求
+    /// （[`super::request_wake_object`]）：只听这个通道的等待者被它登记的对象上的修改
+    /// （没有登记对象的，任何对象上的修改）和请求所有通道的修改叫醒。
     pub const FILE: u32 = 1;
     /// 其余一切：定时器的设置、信号等。
     pub const OTHER: u32 = 2;
@@ -115,12 +117,6 @@ static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
 /// 请求在释放 BKL 时唤醒所有等待中的线程。调用方持有 BKL。
 pub(crate) fn request_wake() {
     WAKE.fetch_or(wake::ALL, Ordering::Relaxed);
-}
-
-/// 只影响打开文件、又说不清是哪个对象的修改（关闭 POSIX 消息队列、信号驱动的 I/O
-/// 要重新检查等）：只叫醒关心 [`wake::FILE`] 的等待者。调用方持有 BKL。
-pub(crate) fn request_wake_files() {
-    request_wake_on(wake::FILE);
 }
 
 /// 文件锁、租约或者打开文件的位置锁放开了、变了：只叫醒关心 [`wake::LOCK`] 的等待者。
@@ -768,7 +764,7 @@ impl<'a> Cx<'a> {
         self.wait_for(deadline, host, interest, None)
     }
 
-    /// 等对象 `object`（管道）上的修改（[`request_wake_object`]、[`request_wake_files`]）、
+    /// 等对象 `object`（管道）上的修改（[`request_wake_object`]）、请求所有通道的修改、
     /// 直接的通知或者超时。
     pub fn wait_object(&mut self, object: wake::Object) -> Result<(), Errno> {
         self.wait_for(None, &mut [], wake::FILE, Some(&[object]))
@@ -776,7 +772,7 @@ impl<'a> Cx<'a> {
 
     /// 与 [`Cx::wait`] 相同，但只影响对象的修改（[`request_wake_object`]）只在是 `objects`
     /// 里的对象时才叫醒它。调用方必须保证让它的条件成立的修改要么请求了这些对象之一，
-    /// 要么请求了某个通道（[`request_wake_files`]、[`request_wake`]）。
+    /// 要么请求了 `interest` 里的某个通道（[`request_wake_on`]、[`request_wake`]）。
     pub fn wait_objects(
         &mut self,
         deadline: Option<Instant>,
