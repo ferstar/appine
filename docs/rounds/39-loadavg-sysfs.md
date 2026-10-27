@@ -20,4 +20,4 @@
 
 **推迟项**：
 
-- sysfs 只有 CPU 的拓扑：没有 `cpufreq`（Node.js 的 `os.cpus()` 的频率是 0）、`cache/`、`/sys/class`、`/sys/fs/cgroup`。`cpu<n>/online` 是只读的（Linux 上 root 可以写它让 CPU 下线）。
+- sysfs 只有 CPU 的拓扑：没有 `cpufreq`（Node.js 的 `os.cpus()` 的频率是 0）、`cache/`、`/sys/class`、`/sys/fs/cgroup`。`cpu<n>/online` 是只读的（Linux 上 root 可以写它让 CPU 下线）。→ `cache/`、`cpufreq/` 已补上，照搬宿主对应的 CPU 的（M9 之前：mremap 和 sysfs）；`/sys/class`、`/sys/fs/cgroup` 仍没有，`online` 仍是只读的

@@ -1459,3 +1459,74 @@ int main(void)
 C
 gcc -O1 -o limits limits.c
 ./limits
+
+# mremap 扩展私有文件映射：后面接着的是文件的内容，私有地写不影响文件，文件末尾之后的页
+# 是 SIGBUS
+cat > mrp.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static sigjmp_buf env;
+static void on_bus(int sig) { siglongjmp(env, sig); }
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    long ps = 4096;
+    int fd = open("/tmp/mrp.dat", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    char page[4096];
+    for (int i = 0; i < 3; i++) {
+        memset(page, 'a' + i, sizeof page);
+        write(fd, page, sizeof page);
+    }
+    /* 只映射第一页，再扩到三页、五页：后面接着的是文件的内容，文件末尾之后 SIGBUS */
+    int prots[] = {PROT_READ, PROT_READ | PROT_WRITE};
+    for (int k = 0; k < 2; k++) {
+        int prot = prots[k];
+        char *p = mmap(NULL, ps, prot, MAP_PRIVATE, fd, 0);
+        char *q = mremap(p, ps, 3 * ps, MREMAP_MAYMOVE);
+        printf("prot %d: grew %s: %c %c %c\n", prot, q == MAP_FAILED ? "failed" : "ok",
+               q == MAP_FAILED ? '-' : q[0], q == MAP_FAILED ? '-' : q[ps], q == MAP_FAILED ? '-' : q[2 * ps]);
+        if (q == MAP_FAILED)
+            continue;
+        if (prot & PROT_WRITE) {
+            q[2 * ps] = 'X';
+            char c;
+            pread(fd, &c, 1, 2 * ps);
+            printf("private write: mapping %c, file %c\n", q[2 * ps], c);
+        }
+        char *r = mremap(q, 3 * ps, 5 * ps, MREMAP_MAYMOVE);
+        signal(SIGBUS, on_bus);
+        int sig = sigsetjmp(env, 1);
+        if (!sig)
+            printf("past the end: %c\n", r[3 * ps]);
+        else
+            printf("past the end: signal %d\n", sig);
+        munmap(r, 5 * ps);
+    }
+    return 0;
+}
+C
+gcc -O1 -o mrp mrp.c && ./mrp
+
+# /sys/devices/system/cpu/cpu<n>/cache 照搬宿主的（CPU 编号换成 guest 的），只看已知的文件；
+# 宿主没有 cpufreq 时也没有
+cd /sys/devices/system/cpu
+for c in cpu*/; do
+    for d in "$c"cache/index*; do
+        [ -d "$d" ] || continue
+        for f in level type size coherency_line_size ways_of_associativity number_of_sets \
+            shared_cpu_list shared_cpu_map id; do
+            [ -e "$d/$f" ] && echo "$d/$f: $(cat "$d/$f")"
+        done
+    done
+done
+ls cpu0 | grep -c '^cache$' || true
+[ -d cpu0/cpufreq ] && echo cpufreq || echo no cpufreq
+cd /tmp

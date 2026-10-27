@@ -1,6 +1,6 @@
 # M9 之前：ptrace 和 procfs 的细节（2026-10-27）
 
-← [M9 之前：硬件断点和观察点（2026-10-27）](44-hw-watchpoints.md) · [索引](../milestones.md)
+← [M9 之前：硬件断点和观察点（2026-10-27）](44-hw-watchpoints.md) · [索引](../milestones.md) · [M9 之前：mremap 和 sysfs（2026-10-27）](46-mremap-sysfs.md) →
 
 [ptrace 的两步](40-ptrace-strace.md)留下几处没有和 Linux 对照、或者知道不同的细节，这一轮逐个在原生上量过再改（§7.6）。
 

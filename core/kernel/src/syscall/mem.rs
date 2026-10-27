@@ -226,8 +226,22 @@ fn remap(
         }
         return Ok(new);
     }
-    cx.mm_mut()
-        .mremap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
+    // 扩展私有文件映射：接着映射的是仓库里那个文件后面的内容，先打开它
+    let ino = (new_len > old_len)
+        .then(|| cx.mm().private_file_ino(old + old_len.max(1) - 1))
+        .flatten();
+    let file = match ino {
+        Some(ino) => Some(cx.vfs()?.store().open_object(ino, false)?),
+        None => None,
+    };
+    cx.mm_mut().mremap(
+        old,
+        old_len,
+        new_len,
+        flags & MREMAP_MAYMOVE != 0,
+        fixed,
+        file.as_ref().map(|f| f.as_raw_fd()),
+    )
 }
 
 /// remap_file_pages：已经废弃，与 Linux 4.0 起一样用 mmap 模拟（[`Mm::remap_file_pages`]）。

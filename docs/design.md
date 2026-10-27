@@ -494,7 +494,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `/dev/pts` | devpts：每个 PTY 一个 `/dev/pts/N`，随 PTY 的创建和关闭出现和消失 |
 | `/dev/shm`、`/run` | inode 仓库里的目录。Linux 上它们是 tmpfs，所以仓库被第一个使用者打开时清空其中的内容 |
 | `/proc` | procfs：根据内核层的 task、mm 等结构实时合成 |
-| `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。没有 `transparent_hugepage`，相当于没有编进 THP 的内核 |
+| `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。各个 `cpu<n>` 的 `cache/`、`cpufreq/` 照搬宿主对应的那个 CPU 的（宿主有、App 读得了的才有），CPU 列表和掩码换成 guest 的编号。没有 `transparent_hugepage`，相当于没有编进 THP 的内核 |
 | `/tmp` | 放在 inode 仓库里，不用内存 tmpfs，避免占用 App 内存配额 |
 | `/mnt/<名字>` | SAF 目录挂载（v1.x，见 §11.3） |
 

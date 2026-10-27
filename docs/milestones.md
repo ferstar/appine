@@ -54,6 +54,7 @@
 | [M9 之前：core dump](rounds/43-coredump.md) | 2026-10-27 | 默认动作生成 core 的信号结束进程时按 `core_pattern` 写 ELF core 文件，格式与 arm64 Linux 相同，gdb 可以事后分析；`WCOREDUMP`、`CLD_DUMPED`、`coredump_filter`、`MADV_DONTDUMP`；被结束的线程停在 svc 上；LTP 955 |
 | [M9 之前：硬件断点和观察点](rounds/44-hw-watchpoints.md) | 2026-10-27 | `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 报告 6 个断点、4 个观察点，由解释器检查，有它们的线程只用 Tier 0；gdb 的 `watch`、`rwatch`、`awatch`、`hbreak` 与原生一致 |
 | [M9 之前：ptrace 和 procfs 的细节](rounds/45-ptrace-procfs.md) | 2026-10-27 | 单步进信号处理函数先停在第一条指令上；sigsuspend 里 GETSIGMASK 读到原来的屏蔽字、SETSIGMASK 之后不再恢复；`/proc/<pid>/mem` 拿打开时的地址空间；auxv、environ、maps、smaps、pagemap 打开时要能跟踪 |
+| [M9 之前：mremap 和 sysfs](rounds/46-mremap-sysfs.md) | 2026-10-27 | mremap 可以扩展私有文件映射（接着映射文件后面的内容）；sysfs 的 `cache/`、`cpufreq/` 照搬宿主对应的 CPU 的 |
 
 ## 测量条件
 

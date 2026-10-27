@@ -222,6 +222,81 @@ const CPU_FILES: [&[u8]; 19] = [
     b"topology/thread_siblings_list",
 ];
 
+/// `/sys/devices/system/cpu/cpu<n>` 下照搬宿主的目录和文件：缓存（`cache/`）和频率
+/// （`cpufreq/`）。宿主对应的 CPU 有才有（[`host_cpu_has`]），内容也是宿主的，里面的 CPU
+/// 编号换成 guest 的。lscpu、hwloc、OpenBLAS 读缓存的大小，Node.js 的 `os.cpus()` 读
+/// `cpufreq/scaling_cur_freq`；没有 cpufreq 的宿主（虚拟机）上它们也没有，与 Linux 一样。
+const HOST_CPU_FILES: [&[u8]; 68] = [
+    b"cache/",
+    b"cache/index0/",
+    b"cache/index0/allocation_policy",
+    b"cache/index0/coherency_line_size",
+    b"cache/index0/id",
+    b"cache/index0/level",
+    b"cache/index0/number_of_sets",
+    b"cache/index0/physical_line_partition",
+    b"cache/index0/shared_cpu_list",
+    b"cache/index0/shared_cpu_map",
+    b"cache/index0/size",
+    b"cache/index0/type",
+    b"cache/index0/ways_of_associativity",
+    b"cache/index0/write_policy",
+    b"cache/index1/",
+    b"cache/index1/allocation_policy",
+    b"cache/index1/coherency_line_size",
+    b"cache/index1/id",
+    b"cache/index1/level",
+    b"cache/index1/number_of_sets",
+    b"cache/index1/physical_line_partition",
+    b"cache/index1/shared_cpu_list",
+    b"cache/index1/shared_cpu_map",
+    b"cache/index1/size",
+    b"cache/index1/type",
+    b"cache/index1/ways_of_associativity",
+    b"cache/index1/write_policy",
+    b"cache/index2/",
+    b"cache/index2/allocation_policy",
+    b"cache/index2/coherency_line_size",
+    b"cache/index2/id",
+    b"cache/index2/level",
+    b"cache/index2/number_of_sets",
+    b"cache/index2/physical_line_partition",
+    b"cache/index2/shared_cpu_list",
+    b"cache/index2/shared_cpu_map",
+    b"cache/index2/size",
+    b"cache/index2/type",
+    b"cache/index2/ways_of_associativity",
+    b"cache/index2/write_policy",
+    b"cache/index3/",
+    b"cache/index3/allocation_policy",
+    b"cache/index3/coherency_line_size",
+    b"cache/index3/id",
+    b"cache/index3/level",
+    b"cache/index3/number_of_sets",
+    b"cache/index3/physical_line_partition",
+    b"cache/index3/shared_cpu_list",
+    b"cache/index3/shared_cpu_map",
+    b"cache/index3/size",
+    b"cache/index3/type",
+    b"cache/index3/ways_of_associativity",
+    b"cache/index3/write_policy",
+    b"cpufreq/",
+    b"cpufreq/affected_cpus",
+    b"cpufreq/cpuinfo_cur_freq",
+    b"cpufreq/cpuinfo_max_freq",
+    b"cpufreq/cpuinfo_min_freq",
+    b"cpufreq/cpuinfo_transition_latency",
+    b"cpufreq/related_cpus",
+    b"cpufreq/scaling_available_frequencies",
+    b"cpufreq/scaling_available_governors",
+    b"cpufreq/scaling_cur_freq",
+    b"cpufreq/scaling_driver",
+    b"cpufreq/scaling_governor",
+    b"cpufreq/scaling_max_freq",
+    b"cpufreq/scaling_min_freq",
+    b"cpufreq/scaling_setspeed",
+];
+
 /// 固定的目录树（[`STATIC`] 这样相对树根的路径，目录以 `/` 结尾）里，目录 `dir`（树根是
 /// 空的）下名为 `name` 的项。
 fn tree_lookup(tree: &[&'static [u8]], dir: &[u8], name: &[u8]) -> Option<&'static [u8]> {
@@ -473,9 +548,9 @@ impl Pseudo for View<'_> {
             Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
             Sys(path) => tree_parent(&SYS_STATIC, path).map_or(SysRoot, Sys),
             SysCpu(_, b"") => Sys(SYS_CPU_DIR),
-            SysCpu(n, path) => {
-                tree_parent(&CPU_FILES, path).map_or(SysCpu(*n, b""), |p| SysCpu(*n, p))
-            }
+            SysCpu(n, path) => tree_parent(&CPU_FILES, path)
+                .or_else(|| tree_parent(&HOST_CPU_FILES, path))
+                .map_or(SysCpu(*n, b""), |p| SysCpu(*n, p)),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
             Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
@@ -539,7 +614,11 @@ impl Pseudo for View<'_> {
                 let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                 (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
             }),
-            SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name).map(|p| SysCpu(*n, p)),
+            SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name)
+                .or_else(|| {
+                    tree_lookup(&HOST_CPU_FILES, path, name).filter(|p| host_cpu_has(*n, p))
+                })
+                .map(|p| SysCpu(*n, p)),
             Pid(pid, tid) => {
                 let allowed = |e: &self::Entry| tid.is_none() || TASK_ENTRIES.contains(e);
                 ENTRIES
@@ -969,7 +1048,14 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
                 nodes.extend((0..cpus() as u32).map(|n| SysCpu(n, b"")));
             }
         }
-        SysCpu(n, path) => nodes.extend(tree_children(&CPU_FILES, path).map(|p| SysCpu(*n, p))),
+        SysCpu(n, path) => {
+            nodes.extend(tree_children(&CPU_FILES, path).map(|p| SysCpu(*n, p)));
+            nodes.extend(
+                tree_children(&HOST_CPU_FILES, path)
+                    .filter(|p| host_cpu_has(*n, p))
+                    .map(|p| SysCpu(*n, p)),
+            );
+        }
         Pid(pid, tid) => nodes.extend(
             ENTRIES
                 .iter()
@@ -1883,23 +1969,98 @@ fn cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
         | b"topology/thread_siblings_list" => cpu_list(me),
         b"topology/core_siblings" | b"topology/package_cpus" => cpu_mask(all),
         b"topology/core_siblings_list" | b"topology/package_cpus_list" => cpu_list(all),
+        _ if HOST_CPU_FILES.contains(&path) => return host_cpu_file(n, path),
         _ => return Err(Errno::EISDIR),
     })
 }
 
-/// CPU 列表的写法（`%*pbl`）：`0-3`，只有一个时是 `2`。
-fn cpu_list(set: Range<usize>) -> String {
-    match set.len() {
-        0 => "\n".to_owned(),
-        1 => format!("{}\n", set.start),
-        _ => format!("{}-{}\n", set.start, set.end - 1),
-    }
+/// 宿主上对应 guest CPU `n` 的那个 CPU。
+fn host_cpu(n: u32) -> Option<usize> {
+    appine_hal::host_cpus().get(n as usize).copied()
 }
 
-/// CPU 掩码的写法（`%*pb`）：十六进制，每 32 位一组，用逗号隔开，最高的一组补零到写得下
-/// CPU 总数的位数（4 个 CPU 时是 `f`，8 个时 cpu0 是 `01`）。
-fn cpu_mask(set: Range<usize>) -> String {
-    let bits = cpus();
+/// [`HOST_CPU_FILES`] 里的 `path`（相对 `cpu<n>`，目录以 `/` 结尾）宿主对应的 CPU 有没有。
+fn host_cpu_has(n: u32, path: &[u8]) -> bool {
+    let rel = String::from_utf8_lossy(path.strip_suffix(b"/").unwrap_or(path)).into_owned();
+    host_cpu(n).is_some_and(|h| appine_hal::cpu_sysfs(h, &rel).is_some())
+}
+
+/// 照搬宿主的缓存、频率文件：CPU 列表和掩码里宿主的 CPU 编号换成 guest 的（guest 用不了的
+/// CPU 去掉）。
+fn host_cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
+    let rel = String::from_utf8_lossy(path).into_owned();
+    let raw = host_cpu(n as u32)
+        .and_then(|h| appine_hal::cpu_sysfs(h, &rel))
+        .ok_or(Errno::ENOENT)?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let guest = |host: Vec<usize>| -> Vec<usize> {
+        let cpus = appine_hal::host_cpus();
+        (0..cpus.len())
+            .filter(|&i| host.contains(&cpus[i]))
+            .collect()
+    };
+    Ok(match tree_name(path) {
+        b"shared_cpu_list" => cpu_list_of(&guest(parse_cpu_list(text.trim()))),
+        b"shared_cpu_map" => cpu_mask_of(&guest(parse_cpu_mask(text.trim()))),
+        b"affected_cpus" | b"related_cpus" => {
+            let host = text
+                .split_whitespace()
+                .filter_map(|w| w.parse().ok())
+                .collect();
+            let cpus: Vec<String> = guest(host).iter().map(usize::to_string).collect();
+            format!("{}\n", cpus.join(" "))
+        }
+        _ => text,
+    })
+}
+
+/// CPU 列表（`0-3,5`）里的 CPU。
+fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.split(',').filter(|p| !p.is_empty()) {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+            out.extend(a..=b.min(a + 4096));
+        }
+    }
+    out
+}
+
+/// CPU 掩码（十六进制，每 32 位一组用逗号隔开，高位在前）里的 CPU。
+fn parse_cpu_mask(s: &str) -> Vec<usize> {
+    let words: Vec<u32> = s
+        .split(',')
+        .filter_map(|w| u32::from_str_radix(w, 16).ok())
+        .collect();
+    let mut out = Vec::new();
+    for (i, w) in words.iter().rev().enumerate() {
+        out.extend((0..32).filter(|b| w >> b & 1 != 0).map(|b| i * 32 + b));
+    }
+    out
+}
+
+/// 按 CPU 列表的写法（[`cpu_list`]，`0-1,3`）写出一组 CPU（从小到大）。
+fn cpu_list_of(cpus: &[usize]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < cpus.len() {
+        let mut j = i;
+        while j + 1 < cpus.len() && cpus[j + 1] == cpus[j] + 1 {
+            j += 1;
+        }
+        parts.push(if i == j {
+            cpus[i].to_string()
+        } else {
+            format!("{}-{}", cpus[i], cpus[j])
+        });
+        i = j + 1;
+    }
+    format!("{}\n", parts.join(","))
+}
+
+/// 按 CPU 掩码的写法（[`cpu_mask`]）写出一组 CPU。
+fn cpu_mask_of(cpus: &[usize]) -> String {
+    let bits = self::cpus();
     let groups = bits.div_ceil(32);
     let mut s = String::new();
     for g in (0..groups).rev() {
@@ -1908,9 +2069,10 @@ fn cpu_mask(set: Range<usize>) -> String {
         } else {
             8
         };
-        let word = (0..32)
-            .filter(|b| set.contains(&(g * 32 + b)))
-            .fold(0u32, |w, b| w | 1 << b);
+        let word = cpus
+            .iter()
+            .filter(|&&c| c / 32 == g)
+            .fold(0u32, |w, &c| w | 1 << (c % 32));
         if g != groups - 1 {
             s.push(',');
         }
@@ -1918,6 +2080,17 @@ fn cpu_mask(set: Range<usize>) -> String {
     }
     s.push('\n');
     s
+}
+
+/// CPU 列表的写法（`%*pbl`）：`0-3`，只有一个时是 `2`。
+fn cpu_list(set: Range<usize>) -> String {
+    cpu_list_of(&set.collect::<Vec<_>>())
+}
+
+/// CPU 掩码的写法（`%*pb`）：十六进制，每 32 位一组，用逗号隔开，最高的一组补零到写得下
+/// CPU 总数的位数（4 个 CPU 时是 `f`，8 个时 cpu0 是 `01`）。
+fn cpu_mask(set: Range<usize>) -> String {
+    cpu_mask_of(&set.collect::<Vec<_>>())
 }
 
 /// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec 和 64 位上总有的
@@ -1962,4 +2135,19 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
         _ => {}
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_lists_and_masks_round_trip() {
+        assert_eq!(parse_cpu_list("0-2,5"), vec![0, 1, 2, 5]);
+        assert_eq!(parse_cpu_list("7"), vec![7]);
+        assert_eq!(parse_cpu_mask("00000001,0000000f"), vec![0, 1, 2, 3, 32]);
+        assert_eq!(cpu_list_of(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8\n");
+        assert_eq!(cpu_list_of(&[3]), "3\n");
+        assert_eq!(cpu_list_of(&[]), "\n");
+    }
 }

@@ -1592,7 +1592,7 @@ impl Mm {
                 }),
             }
         }
-        let new = self.mremap(old, len, len, true, Some(dst))?;
+        let new = self.mremap(old, len, len, true, Some(dst), None)?;
         for (start, len, prot) in empty {
             self.map_anonymous(start, len, prot)?;
             self.vmas.get_mut(&start).unwrap().locked = false;
@@ -1644,9 +1644,17 @@ impl Mm {
         Ok(())
     }
 
+    /// `addr` 所在的私有文件映射映射的仓库文件的 inode（不是私有文件映射、不知道 inode 时是
+    /// None）：mremap 扩展它之前要打开这个文件（[`Mm::mremap`]）。
+    pub fn private_file_ino(&self, addr: u64) -> Option<u64> {
+        let (&s, v) = self.vmas.range(..=addr).next_back()?;
+        (addr < s + v.len && v.backing == Backing::PrivateFile && v.ino != 0).then_some(v.ino)
+    }
+
     /// 实现 mremap(2)：`fixed` 是 `MREMAP_FIXED` 的目标地址。变长时先尝试原地扩展，不行再搬到新的地址（`may_move`）：搬家不复制
     /// 数据，只是把同一段宿主内存映射到新地址。新增的部分是匿名内存，共享文件映射
-    /// 则接着映射文件后面的内容；私有文件映射不能扩展。
+    /// 则接着映射文件后面的内容；私有文件映射也是（私有地映射，`file` 是调用方按
+    /// [`Mm::private_file_ino`] 打开的那个文件），没有 `file` 时不能扩展。
     pub fn mremap(
         &mut self,
         old: u64,
@@ -1654,6 +1662,7 @@ impl Mm {
         new_len: u64,
         may_move: bool,
         fixed: Option<u64>,
+        file: Option<i32>,
     ) -> Result<u64, Errno> {
         let old_len = page_up(old_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let new_len = page_up(new_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
@@ -1671,7 +1680,7 @@ impl Mm {
         // 扩展出来的部分接在原来区间的后面，对应 VMA 里的偏移 old_end - s
         let extension = |mm: &Mm| -> Result<Option<Vma>, Errno> {
             (grow > 0)
-                .then(|| mm.extension(&template, old_end - s, grow))
+                .then(|| mm.extension(&template, old_end - s, grow, file))
                 .transpose()
         };
         if let Some(dst) = fixed {
@@ -1714,36 +1723,48 @@ impl Mm {
     }
 
     /// mremap 扩展出来的 `len` 字节：接在 `template` 里偏移 `offset` 处之后，类型和
-    /// 权限与它相同。
-    fn extension(&self, template: &Vma, offset: u64, len: u64) -> Result<Vma, Errno> {
-        let (region, host, file) = match (&template.backing, &template.file) {
+    /// 权限与它相同。私有文件映射要 `file`（映射的那个文件的宿主 fd）。
+    fn extension(
+        &self,
+        template: &Vma,
+        offset: u64,
+        len: u64,
+        file: Option<i32>,
+    ) -> Result<Vma, Errno> {
+        // (宿主内存, 宿主地址, 共享映射留着的 fd, 有文件内容的字节数)
+        let (region, host, file, file_len) = match (&template.backing, &template.file) {
             (Backing::Shared, Some((fd, start))) => {
                 let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
                 let file_offset = start + offset;
-                let writable = template.may_write;
-                let m = appine_hal::map_file(
-                    std::os::fd::AsRawFd::as_raw_fd(&**fd),
-                    file_offset,
-                    host_len,
-                    true,
-                    writable,
-                )
-                .map_err(Errno)?;
+                let raw = std::os::fd::AsRawFd::as_raw_fd(&**fd);
+                let m = appine_hal::map_file(raw, file_offset, host_len, true, template.may_write)
+                    .map_err(Errno)?;
                 let region = Arc::new(HostRegion {
                     base: m.base,
                     len: m.len,
                 });
-                (region, m.ptr, Some((fd.clone(), file_offset)))
+                let file_len = file_extent(raw, file_offset, len);
+                (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
             }
-            (Backing::PrivateFile, _) => return Err(Errno::ENOMEM),
+            // 私有文件映射：接着私有地映射文件后面的内容（文件末尾之后的部分不进页表，
+            // 访问是 SIGBUS，与 Linux 相同）
+            (Backing::PrivateFile, _) => {
+                let fd = file.ok_or(Errno::ENOMEM)?;
+                let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+                let file_offset = template.file_id.map_or(0, |(_, _, o)| o) + offset;
+                let m =
+                    appine_hal::map_file(fd, file_offset, host_len, false, true).map_err(Errno)?;
+                let region = Arc::new(HostRegion {
+                    base: m.base,
+                    len: m.len,
+                });
+                (region, m.ptr, None, file_extent(fd, file_offset, len))
+            }
             _ => {
                 let (region, host) = Self::new_anonymous(len, template.prot & prot::WRITE != 0)?;
-                (region, host, None)
+                (region, host, None, len)
             }
         };
-        let file_len = file.as_ref().map_or(len, |(fd, offset)| {
-            file_extent(std::os::fd::AsRawFd::as_raw_fd(&**fd), *offset, len)
-        });
         Ok(Vma {
             len,
             prot: template.prot,
@@ -3882,7 +3903,7 @@ mod tests {
         mm.write_kernel(a, b"keep").unwrap();
         // 后面是空的：原地扩展
         let b = mm
-            .mremap(a, 2 * PAGE_SIZE, 3 * PAGE_SIZE, false, None)
+            .mremap(a, 2 * PAGE_SIZE, 3 * PAGE_SIZE, false, None, None)
             .unwrap();
         assert_eq!(b, a);
         mm.write_kernel(a + 2 * PAGE_SIZE, b"x").unwrap();
@@ -3890,11 +3911,11 @@ mod tests {
         mm.mmap(a + 3 * PAGE_SIZE, PAGE_SIZE, RW, fixed, None)
             .unwrap();
         assert_eq!(
-            mm.mremap(a, 3 * PAGE_SIZE, 5 * PAGE_SIZE, false, None),
+            mm.mremap(a, 3 * PAGE_SIZE, 5 * PAGE_SIZE, false, None, None),
             Err(Errno::ENOMEM)
         );
         let c = mm
-            .mremap(a, 3 * PAGE_SIZE, 5 * PAGE_SIZE, true, None)
+            .mremap(a, 3 * PAGE_SIZE, 5 * PAGE_SIZE, true, None, None)
             .unwrap();
         assert_ne!(c, a);
         assert!(!mm.is_mapped(a));
@@ -3905,11 +3926,14 @@ mod tests {
             .unwrap();
         assert_eq!(buf, [0; 4]);
         // 缩小：去掉尾部
-        assert_eq!(mm.mremap(c, 5 * PAGE_SIZE, PAGE_SIZE, false, None), Ok(c));
+        assert_eq!(
+            mm.mremap(c, 5 * PAGE_SIZE, PAGE_SIZE, false, None, None),
+            Ok(c)
+        );
         assert!(!mm.is_mapped(c + PAGE_SIZE));
         // 没有完全映射的区间
         assert_eq!(
-            mm.mremap(c, 2 * PAGE_SIZE, PAGE_SIZE, true, None),
+            mm.mremap(c, 2 * PAGE_SIZE, PAGE_SIZE, true, None, None),
             Err(Errno::EFAULT)
         );
         assert_eq!(mm.check_mapped(c, 2 * PAGE_SIZE), Err(Errno::ENOMEM));
@@ -3941,7 +3965,9 @@ mod tests {
             )
             .unwrap();
         drop(f);
-        let b = mm.mremap(a, PAGE_SIZE, 2 * PAGE_SIZE, true, None).unwrap();
+        let b = mm
+            .mremap(a, PAGE_SIZE, 2 * PAGE_SIZE, true, None, None)
+            .unwrap();
         let mut buf = [0u8; 1];
         mm.read(UserSlice::new(b + PAGE_SIZE, 1), &mut buf).unwrap();
         assert_eq!(buf, [2]);
@@ -4104,6 +4130,7 @@ mod tests {
                 PAGE_SIZE,
                 true,
                 Some(0x1000_0000),
+                None,
             )
             .unwrap();
         poke(&parent, moved, b'q');

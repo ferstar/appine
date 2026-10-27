@@ -624,6 +624,18 @@ pub fn thread_cpu_clock() -> Option<i32> {
     }
 }
 
+/// 宿主 CPU `cpu` 的 sysfs 目录（`/sys/devices/system/cpu/cpu<n>`）下的 `path`：是文件时
+/// 返回内容，是目录时返回空的内容；没有或者读不了（Android 的 SELinux 可能不让 App 读
+/// cpufreq）时返回 None。
+pub fn cpu_sysfs(cpu: usize, path: &str) -> Option<Vec<u8>> {
+    let full = format!("/sys/devices/system/cpu/cpu{cpu}/{path}");
+    let meta = std::fs::metadata(&full).ok()?;
+    if meta.is_dir() {
+        return Some(Vec::new());
+    }
+    std::fs::read(&full).ok()
+}
+
 /// 本进程可以用的宿主 CPU 的编号（最多 64 个），第一次调用时的快照：guest 看到的 CPU
 /// `i` 是其中第 `i` 个。之后宿主线程的亲和性被改了（guest 的 sched_setaffinity）也不
 /// 影响它。
