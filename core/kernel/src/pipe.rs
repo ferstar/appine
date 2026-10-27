@@ -153,5 +153,5 @@ impl Drop for PipeEnd {
 
 /// 等这个管道的线程登记的对象（[`crate::kernel::Cx::wait_object`]）。
 pub(crate) fn object(pipe: &Rc<RefCell<Pipe>>) -> crate::kernel::wake::Object {
-    Rc::as_ptr(pipe) as usize
+    crate::kernel::wake::of(pipe)
 }

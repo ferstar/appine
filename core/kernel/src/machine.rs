@@ -26,7 +26,7 @@ use appine_hal::Event;
 use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::fd::FdTable;
-use crate::kernel::{INIT, Kernel, Shared, block, request_wake, wake};
+use crate::kernel::{INIT, Kernel, Shared, block, block_for, request_wake, wake};
 use crate::loader::{self, Args, Executable};
 use crate::mm::Mm;
 use crate::process::{
@@ -247,14 +247,25 @@ impl Machine {
     }
 
     /// 与 [`Machine::wait_for`] 相同，但只被 `interest` 里的通道（[`wake`]）叫醒。
-    fn wait_on<T>(&self, interest: u32, mut cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+    fn wait_on<T>(&self, interest: u32, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+        self.wait_objects(interest, None, cond)
+    }
+
+    /// 与 [`Machine::wait_on`] 相同；`objects` 不为 None 时，只影响别的对象的修改不叫醒它
+    /// （[`crate::kernel::Cx::wait_objects`]）。
+    fn wait_objects<T>(
+        &self,
+        interest: u32,
+        objects: Option<&[wake::Object]>,
+        mut cond: impl FnMut(&mut Kernel) -> Option<T>,
+    ) -> T {
         EVENT.with(|event| {
             let mut k = self.shared.lock();
             loop {
                 if let Some(v) = cond(&mut k) {
                     return v;
                 }
-                let (k2, _) = block(&self.shared, k, event, None, &mut [], interest);
+                let (k2, _) = block_for(&self.shared, k, event, None, &mut [], interest, objects);
                 k = k2;
             }
         })
@@ -297,7 +308,8 @@ impl Machine {
     /// 读控制台的输出，没有输出时等待。返回 0 表示会话结束：所有从设备都关闭了，
     /// 输出也已经读完。
     pub fn read_console(&self, id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
-        let out = self.wait_for(|k| {
+        let objects = terminal::wake_objects(&self.shared.lock(), id);
+        let out = self.wait_objects(wake::FILE, objects.as_deref(), |k| {
             on_console(k, id, "Machine::read_console", |k| {
                 terminal::take_output(k, id, buf.len())
             })
@@ -313,7 +325,8 @@ impl Machine {
         if data.is_empty() {
             return Ok(0);
         }
-        self.wait_for(|k| {
+        let objects = terminal::wake_objects(&self.shared.lock(), id);
+        self.wait_objects(wake::FILE, objects.as_deref(), |k| {
             on_console(k, id, "Machine::write_console", |k| {
                 let room = terminal::input_room(k, id)?;
                 if room > 0 {

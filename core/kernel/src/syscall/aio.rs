@@ -137,6 +137,8 @@ fn notify_resfd(cx: &mut Cx<'_>, fd: Option<i32>) {
     {
         let mut e = e.borrow_mut();
         e.count = e.count.saturating_add(1).min(u64::MAX - 1);
+        // 与 eventfd 的写一样算一次到达（EPOLLET 再触发）
+        e.writes += 1;
     }
     request_wake();
 }

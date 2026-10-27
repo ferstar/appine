@@ -29,7 +29,7 @@ use super::{SysResult, read_path};
 use crate::cred::MAY_READ;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
-use crate::kernel::{Cx, Kernel, request_wake_files};
+use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
@@ -218,6 +218,7 @@ impl Inotify {
         self.bytes += event.len();
         self.queue.push_back(event);
         self.queued += 1;
+        request_wake_object(wake::of_value(self));
     }
 }
 
@@ -258,7 +259,8 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// 把事件交给 `ino` 上关心它的监视；返回有没有排进事件。`child` 是目录收到子项
+    /// 把事件交给 `ino` 上关心它的监视；返回有没有排进事件（排进事件的实例请求唤醒，见
+    /// `Inotify::push`）。`child` 是目录收到子项
     /// 自己的事件时那个子项：带 `IN_EXCL_UNLINK` 的监视不要已经删除的子项的事件。
     fn deliver(
         &mut self,
@@ -337,17 +339,14 @@ impl Registry {
     }
 
     /// `ino` 自己的事件：先报给所在目录 `parent` 的监视（带名字），再报给它自己的。
+    /// 放进了事件的实例各自请求唤醒（`Inotify::push`）。
     fn notify(&mut self, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
-        let mut queued = false;
         if let Some((dir, name)) = parent
             && mask & SELF_EVENTS == 0
         {
-            queued |= self.deliver(dir, mask, 0, name, Some(ino));
+            self.deliver(dir, mask, 0, name, Some(ino));
         }
-        queued |= self.deliver(ino, mask, 0, b"", None);
-        if queued {
-            request_wake_files();
-        }
+        self.deliver(ino, mask, 0, b"", None);
     }
 }
 
@@ -413,12 +412,10 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
 
 /// 目录 `dir` 里名为 `name` 的子项被创建、删除、移入或移出。
 pub(crate) fn dir_event(k: &Kernel, dir: Ino, name: &[u8], mask: u32, cookie: u32) {
-    if !idle(k)
-        && k.inotify
+    if !idle(k) {
+        k.inotify
             .borrow_mut()
-            .deliver(dir, mask, cookie, name, None)
-    {
-        request_wake_files();
+            .deliver(dir, mask, cookie, name, None);
     }
 }
 
@@ -635,7 +632,6 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     let mut i = inotify.borrow_mut();
     let w = i.watches.remove(&wd).ok_or(Errno::EINVAL)?;
     i.push(wd, IN_IGNORED, 0, b"");
-    request_wake_files();
     let mut r = cx.kr().inotify.borrow_mut();
     r.uncharge(i.uid);
     if let Node::Store(ino) = w.node
@@ -692,7 +688,7 @@ pub(super) fn read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(inotify)])?;
     }
 }
 

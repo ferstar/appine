@@ -235,23 +235,19 @@ impl OpenFile {
 }
 
 impl Drop for OpenFile {
-    /// 最后一个引用消失：等在它上面的线程（flock、socket 和 PTY 的另一方、epoll）要重新
-    /// 检查。管道的另一端由 `PipeEnd` 叫醒（只叫醒等这个管道的），普通文件、目录这类
-    /// 没有锁的文件没有线程在等它关闭：shell 每次 exec、退出都要关好几个文件，原来每关一个
-    /// 都把读着管道的进程叫醒一遍。
+    /// 最后一个引用消失：持有的 flock、OFD 锁随之释放，等锁的线程要重新检查；宿主 socket
+    /// 的 fd 关掉了，在 poll、epoll 里等着它的线程要重新检查。别的文件关闭时不必广播：
+    /// 管道、PTY、AF_UNIX socket 的另一方由 `PipeEnd`、`PtyEnd`、`UnixSocket` 叫醒（只叫醒
+    /// 等这个管道、PTY、连接的），epoll、eventfd、inotify 这类对象关闭时没有线程在等它。
+    /// shell 每次 exec、退出都要关好几个文件，原来每关一个都把读着管道的进程叫醒一遍。
     fn drop(&mut self) {
-        let quiet = matches!(
-            self.kind,
-            FileKind::Host(_)
-                | FileKind::Regular { .. }
-                | FileKind::Directory { .. }
-                | FileKind::Path(_)
-                | FileKind::Pipe(_)
-                | FileKind::Device { .. }
-                | FileKind::EventFd(_)
-                | FileKind::TimerFd(_)
-                | FileKind::Proc { .. }
-        );
+        let quiet = match &self.kind {
+            FileKind::Socket(s) => s
+                .try_borrow()
+                .is_ok_and(|s| matches!(*s, crate::net::Socket::Unix(_))),
+            FileKind::MessageQueue(_) => false,
+            _ => true,
+        };
         if self.holds_locks || !quiet {
             crate::kernel::request_wake_files();
         }
@@ -444,11 +440,12 @@ struct Slot {
 }
 
 /// 一个进程的 fd 表。
-#[derive(Clone)]
 pub struct FdTable {
     slots: Vec<Option<Slot>>,
     /// 新的 fd 必须小于它（`RLIMIT_NOFILE` 的软限制，由 prlimit 同步过来）。
     pub limit: usize,
+    /// 加过 POSIX 记录锁（锁属于 fd 表，见 `crate::locks`）。
+    pub holds_locks: bool,
 }
 
 impl Default for FdTable {
@@ -456,6 +453,18 @@ impl Default for FdTable {
         FdTable {
             slots: Vec::new(),
             limit: DEFAULT_NOFILE.0,
+            holds_locks: false,
+        }
+    }
+}
+
+impl Clone for FdTable {
+    /// fork、`CLONE_FILES` 之外的 clone、unshare：POSIX 锁属于原来的 fd 表，不随之复制。
+    fn clone(&self) -> Self {
+        FdTable {
+            slots: self.slots.clone(),
+            limit: self.limit,
+            holds_locks: false,
         }
     }
 }
@@ -588,9 +597,12 @@ impl FdTable {
 }
 
 impl Drop for FdTable {
-    /// fd 表消失（进程退出）：它持有的记录锁随之失效，等锁的线程要重新检查。
+    /// fd 表消失（进程退出）：它持有的记录锁随之失效，等锁的线程要重新检查。没加过锁的
+    /// 不必：原来每个进程退出都把所有读着管道、在 poll 里等着的线程叫醒一遍。
     fn drop(&mut self) {
-        crate::kernel::request_wake_files();
+        if self.holds_locks {
+            crate::kernel::request_wake_files();
+        }
     }
 }
 

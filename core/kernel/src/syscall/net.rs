@@ -981,6 +981,14 @@ pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
     }
 }
 
+/// ppoll、epoll 等 socket 时登记的唤醒对象（`poll::wake_objects`）：AF_UNIX 的 channel。
+/// 宿主 socket 由宿主 poll 等，netlink 的回答和 DNS 存根的回答请求整个文件类的唤醒。
+pub(crate) fn wake_objects(sock: &Socket, out: &mut Vec<crate::kernel::wake::Object>) {
+    if let Socket::Unix(u) = sock {
+        u.wake_objects(out);
+    }
+}
+
 /// ppoll、epoll 用的就绪状态：(已经知道的事件, 需要问宿主的 fd)。
 pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
     match sock {

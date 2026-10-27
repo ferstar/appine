@@ -12,7 +12,7 @@ use super::misc::deadline_from_clock;
 use super::{SysResult, get, put};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, TimerFd, oflags};
-use crate::kernel::Cx;
+use crate::kernel::{Cx, request_wake_object, wake};
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -116,6 +116,8 @@ pub(super) fn timerfd_settime(
     } else {
         Some(Instant::now() + value)
     };
+    // 别的线程可能正带着原来的到期时刻等它（epoll_wait、read）
+    request_wake_object(wake::of(&timer));
     Ok(0)
 }
 
@@ -151,6 +153,6 @@ pub(super) fn read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(deadline, &mut [])?;
+        cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(timer)])?;
     }
 }

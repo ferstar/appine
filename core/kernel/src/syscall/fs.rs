@@ -1278,6 +1278,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
         file.borrow_mut().holds_locks = true;
         Owner::Ofd(Rc::downgrade(file))
     } else {
+        cx.fds_mut().holds_locks = true;
         Owner::Posix(Rc::downgrade(&cx.t.fds))
     };
     let req = Lock {

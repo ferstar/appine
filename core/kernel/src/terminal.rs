@@ -15,7 +15,7 @@ use appine_hal::Event;
 
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, oflags};
-use crate::kernel::{Kernel, Shared, Tid, block, request_wake};
+use crate::kernel::{Kernel, Shared, Tid, block_for, request_wake, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
 use crate::tty::{PtyEnd, Tty, Winsize};
@@ -108,6 +108,12 @@ fn tty_of(k: &Kernel, id: u32) -> Result<Rc<RefCell<Tty>>, Errno> {
         .ok_or(Errno::ENOENT)
 }
 
+/// 等控制台 `id` 的输出、输入队列的空间时登记的唤醒对象：它的 PTY。关闭控制台请求
+/// 整个通道的唤醒。控制台不存在时是 None。
+pub(crate) fn wake_objects(k: &Kernel, id: u32) -> Option<Vec<wake::Object>> {
+    tty_of(k, id).ok().map(|t| vec![wake::of(&t)])
+}
+
 /// 取走最多 `max` 字节的输出。没有输出时返回 None；会话已经结束（所有从设备都关闭了）
 /// 并且输出已经取完时返回空的 Vec。
 pub(crate) fn take_output(k: &Kernel, id: u32, max: usize) -> Result<Option<Vec<u8>>, Errno> {
@@ -115,7 +121,7 @@ pub(crate) fn take_output(k: &Kernel, id: u32, max: usize) -> Result<Option<Vec<
     let out = tty.borrow_mut().take_output(max);
     if !out.is_empty() {
         // 输出队列空出来了，等着写终端的线程可以继续
-        request_wake();
+        request_wake_object(wake::of(&tty));
         return Ok(Some(out));
     }
     let ended = k.consoles[&id].attached && tty.borrow().slaves == 0;
@@ -131,7 +137,7 @@ pub(crate) fn input_room(k: &Kernel, id: u32) -> Result<usize, Errno> {
 pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
     let tty = tty_of(k, id)?;
     let signals = tty.borrow_mut().write_input(data);
-    request_wake();
+    request_wake_object(wake::of(&tty));
     let fg = tty.borrow().fg;
     if let Some(fg) = fg {
         for sig in signals {
@@ -213,7 +219,16 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
         if let Some(r) = term.resize {
             fds.push((r, POLLIN, 0));
         }
-        let (k2, _) = block(&shared, k, &event, None, &mut fds, crate::kernel::wake::ALL);
+        let objects = wake_objects(&k, id);
+        let (k2, _) = block_for(
+            &shared,
+            k,
+            &event,
+            None,
+            &mut fds,
+            wake::ALL,
+            objects.as_deref(),
+        );
         k = k2;
         for (fd, _, revents) in fds {
             if revents == 0 {

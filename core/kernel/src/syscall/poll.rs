@@ -25,9 +25,11 @@
 //! `EPOLLEXCLUSIVE`：Linux 每次唤醒只叫醒一个独占的等待者。这里一个边沿（数据代数）
 //! 只报告给一个 epoll（[`OpenFile::exclusive_claim`]）：水平触发的关注由报告过它的
 //! epoll 接着报告，别的 epoll 等下一个边沿，所以几个进程各用一个 epoll 等同一个监听
-//! socket 时，一个新连接只让一个进程从 epoll_wait 返回。等待的线程仍然都会被叫醒
-//! （poll、epoll 的等待者被所有文件类的修改叫醒，§6），没轮到的在内核里重新检查之后
-//! 接着睡。
+//! socket 时，一个新连接只让一个进程从 epoll_wait 返回。等待的线程不自己等这个文件，
+//! 而是排在它的独占门上（[`ExGate`]），新的边沿只叫醒排在最前面的一个。
+//!
+//! 等待时登记关注的进程内对象（[`wake_objects`]）：只影响别的对象的修改（另一个管道的
+//! 读写、别的 eventfd、别的 AF_UNIX 连接……）不叫醒它（§6）。
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -37,7 +39,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, read_timespec, tty};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, HostEdges, OpenFile, oflags};
-use crate::kernel::{Cx, request_wake_files};
+use crate::kernel::{Cx, request_wake_files, request_wake_object, wake};
 use crate::pipe::PIPE_BUF;
 use crate::process::RLIMIT_NOFILE;
 use crate::signal;
@@ -271,10 +273,32 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
     ev & (wanted | POLLERR | POLLHUP | POLLNVAL)
 }
 
+/// 等打开文件 `f` 的就绪状态变化时要登记的唤醒对象（[`wake::of`]）。改变进程内对象
+/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求整个通道（关闭文件、信号和
+/// signalfd、pidfd、POSIX 消息队列、netlink、DNS 存根的回答仍是这样）；宿主 fd 由宿主
+/// poll 等。epoll 只列出它自己（epoll_ctl），里面的关注由 [`Waits`] 逐个加上。
+fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
+    match &f.kind {
+        FileKind::Pipe(end) => out.push(crate::pipe::object(&end.pipe)),
+        FileKind::Pty(end) => out.push(wake::of(&end.tty)),
+        FileKind::EventFd(e) => out.push(wake::of(e)),
+        FileKind::TimerFd(t) => out.push(wake::of(t)),
+        FileKind::Inotify(i) => out.push(wake::of(i)),
+        FileKind::Epoll(ep) => out.push(wake::of(ep)),
+        FileKind::Socket(s) => super::net::wake_objects(&s.borrow(), out),
+        _ => {}
+    }
+}
+
 /// 等待时要一起等的东西：宿主 fd，以及最早的 timerfd 到期时刻（含嵌套 epoll 里的）。
 #[derive(Default)]
 struct Waits {
     host: Vec<(i32, i16, i16)>,
+    /// 进程内对象的唤醒对象（[`wake_objects`]）。
+    objects: Vec<wake::Object>,
+    /// 有 pidfd：子进程状态的变化（[`wake::CHILD`]）也要叫醒它。别的文件都不关心这个
+    /// 通道，原来每个进程结束都把所有 poll、epoll 的等待者叫醒一遍。
+    pidfd: bool,
     timer: Option<Instant>,
     /// 有边沿触发的关注少等了报告过的位。
     edge: bool,
@@ -288,6 +312,8 @@ impl Waits {
     fn add(&mut self, f: &OpenFile, wanted: i16, depth: u32) {
         let (_, host) = readiness(f, depth);
         self.files |= host.is_none();
+        self.pidfd |= matches!(f.kind, FileKind::Pidfd(_));
+        wake_objects(f, &mut self.objects);
         match (&f.kind, host) {
             (_, Some(fd)) => self.host.push((fd, wanted, 0)),
             (FileKind::TimerFd(t), None) => {
@@ -320,6 +346,8 @@ impl Waits {
             if let Some(e) = &f.host_edges {
                 self.host.push((e.fd(), POLLIN, 0));
             }
+            wake_objects(&f, &mut self.objects);
+            self.pidfd |= matches!(f.kind, FileKind::Pidfd(_));
             match &f.kind {
                 FileKind::TimerFd(t) => {
                     if let Some(d) = t.borrow().deadline {
@@ -376,6 +404,10 @@ impl Waits {
             }
             if !hung_up {
                 self.add(&f, wanted, depth);
+            } else {
+                // 不等宿主 fd 本身，但进程内的对象之后还可能来事件（PTY 重新打开了从设备）
+                self.files = true;
+                wake_objects(&f, &mut self.objects);
             }
         }
     }
@@ -399,9 +431,9 @@ impl Waits {
         let interest = if only_gated {
             0
         } else {
-            crate::kernel::wake::ALL
+            wake::FILE | if self.pidfd { wake::CHILD } else { 0 }
         };
-        let r = cx.wait_on(until, &mut self.host, interest);
+        let r = cx.wait_objects(until, &mut self.host, interest, &self.objects);
         if self.edge {
             cx.k().edge_waiters.retain(|e| !Arc::ptr_eq(e, &event));
         }
@@ -1077,6 +1109,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         return Err(Errno::EINVAL);
     };
     let ep = ep.clone();
+    let key = wake::of(&ep);
     let file = cx.fds().get(fd)?;
     if file.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
@@ -1142,7 +1175,8 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         .interests
         .iter()
         .position(|i| i.fd == fd && i.file.as_ptr() == Rc::as_ptr(&file));
-    // 别的线程可能正在 epoll_wait：叫醒它们按新的关注重新等
+    // 别的线程可能正在 epoll_wait：叫醒它们按新的关注重新等。外面套着它的 epoll、poll 等
+    // 的是它的唤醒对象（下面的 request_wake_object）
     for w in &ep.waiters {
         crate::kernel::signal_later(w);
     }
@@ -1151,7 +1185,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         (EPOLL_CTL_ADD, None) => {
             ep.interests.push(Interest::new(fd, &file, events, data));
             ep.base.set(ep.base.get() + ready_now as u64);
-            request_wake_files();
+            request_wake_object(key);
             Ok(0)
         }
         // 带 EPOLLEXCLUSIVE 加入的不能修改
@@ -1164,7 +1198,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
                 std::mem::replace(&mut ep.interests[i], Interest::new(fd, &file, events, data));
             ep.base
                 .set(ep.base.get() + old.share.get() + ready_now as u64);
-            request_wake_files();
+            request_wake_object(key);
             Ok(0)
         }
         (EPOLL_CTL_DEL, Some(i)) => {
@@ -1319,7 +1353,7 @@ pub(super) fn eventfd_read(
                 e.count -= v;
                 e.reads += 1;
                 buf[..8].copy_from_slice(&v.to_le_bytes());
-                request_wake_files();
+                request_wake_object(wake::of(efd));
                 return Ok(8);
             }
         }
@@ -1329,7 +1363,7 @@ pub(super) fn eventfd_read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(efd)])?;
     }
 }
 
@@ -1353,7 +1387,7 @@ pub(super) fn eventfd_write(
             if e.count.checked_add(v).is_some_and(|c| c < u64::MAX) {
                 e.count += v;
                 e.writes += 1;
-                request_wake_files();
+                request_wake_object(wake::of(efd));
                 return Ok(8);
             }
         }
@@ -1363,7 +1397,7 @@ pub(super) fn eventfd_write(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(efd)])?;
     }
 }
 
@@ -1451,6 +1485,51 @@ mod tests {
         // 写零也算一次（Linux 照样唤醒）
         write(0);
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
+    }
+
+    #[test]
+    fn waits_register_the_objects_of_watched_files() {
+        let eventfd = || {
+            let e = Rc::new(RefCell::new(EventFd {
+                count: 0,
+                semaphore: false,
+                writes: 0,
+                reads: 0,
+            }));
+            (
+                OpenFile::new(FileKind::EventFd(e.clone()), oflags::O_RDWR),
+                e,
+            )
+        };
+        let (f1, e1) = eventfd();
+        let (f2, e2) = eventfd();
+        let mut inner = Epoll::default();
+        inner
+            .interests
+            .push(Interest::new(3, &f1, POLLIN as u32, 0));
+        let inner = Rc::new(RefCell::new(inner));
+        let inner_file = OpenFile::new(FileKind::Epoll(inner.clone()), oflags::O_RDWR);
+        let cred = crate::unix::Ucred::of(1, 0, 0);
+        let (a, _b) = crate::unix::UnixSocket::pair(crate::net::SOCK_STREAM, cred);
+        let mut unix_objects = Vec::new();
+        a.wake_objects(&mut unix_objects);
+        let sock = Rc::new(RefCell::new(crate::net::Socket::Unix(a)));
+        let sock_file = OpenFile::new(FileKind::Socket(sock), oflags::O_RDWR);
+        let mut outer = Epoll::default();
+        for (fd, f) in [(4, &inner_file), (5, &f2), (6, &sock_file)] {
+            outer.interests.push(Interest::new(fd, f, POLLIN as u32, 0));
+        }
+        let mut waits = Waits::default();
+        waits.add_epoll(&outer, 0);
+        // 嵌套的 epoll 自己（epoll_ctl）和它关注的文件，AF_UNIX socket 的接收队列和连接的
+        // 两个方向
+        let mut want = vec![wake::of(&inner), wake::of(&e1), wake::of(&e2)];
+        want.extend(&unix_objects);
+        assert_eq!(unix_objects.len(), 3);
+        for o in want {
+            assert!(waits.objects.contains(&o));
+        }
+        assert!(!waits.pidfd);
     }
 
     #[test]

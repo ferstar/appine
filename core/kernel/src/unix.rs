@@ -16,7 +16,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crate::fd::{FileKind, FileRef, OpenFile};
-use crate::kernel::{Kernel, request_wake_files};
+use crate::kernel::{Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, Socket};
 use crate::vfs::store::Ino;
 
@@ -126,7 +126,7 @@ impl Channel {
         self.bytes += p.remaining();
         self.packets.push_back(p);
         self.arrivals += 1;
-        request_wake_files();
+        request_wake_object(wake::of_value(self));
     }
 
     /// 接收方关闭：丢弃缓冲的消息。消息交给调用方在释放借用之后析构，因为里面的
@@ -173,7 +173,7 @@ impl Channel {
             if self.writable() {
                 self.taken += 1;
             }
-            request_wake_files();
+            request_wake_object(wake::of_value(self));
         }
         Received {
             len: data.len(),
@@ -204,7 +204,7 @@ impl Channel {
             if self.writable() {
                 self.taken += 1;
             }
-            request_wake_files();
+            request_wake_object(wake::of_value(self));
             (p.data, len, std::mem::take(&mut p.fds), p.cred, p.from)
         };
         Some(Received {
@@ -374,7 +374,33 @@ impl UnixSocket {
                 self.shut_wr |= wr;
             }
         }
-        request_wake_files();
+        self.wake();
+    }
+
+    /// poll、epoll 等它时登记的唤醒对象：自己的接收队列（数据报 socket 的消息，监听时
+    /// 来了连接、accept 取走连接也请求唤醒它），流式连接的两个方向，连着的数据报 socket
+    /// 对方的接收队列（有没有空间）。
+    pub fn wake_objects(&self, out: &mut Vec<wake::Object>) {
+        out.push(wake::of(&self.rx));
+        match &self.link {
+            Link::Stream { rx, tx, .. } => {
+                out.push(wake::of(rx));
+                out.push(wake::of(tx));
+            }
+            Link::Dgram { tx, .. } => {
+                if let Some(c) = tx.upgrade() {
+                    out.push(wake::of(&c));
+                }
+            }
+            Link::None | Link::Listening { .. } => {}
+        }
+    }
+
+    /// 叫醒等这个 socket 的线程（[`UnixSocket::wake_objects`]）。
+    fn wake(&self) {
+        let mut objects = Vec::new();
+        self.wake_objects(&mut objects);
+        objects.into_iter().for_each(request_wake_object);
     }
 
     /// FIONREAD：流式是缓冲的字节数，数据报是下一个数据报的长度。
@@ -451,7 +477,10 @@ impl UnixSocket {
 }
 
 impl Drop for UnixSocket {
+    /// 对方读到 EOF、写入失败，等着 accept 的连接随之关闭，等 backlog 空位的 connect
+    /// 重新检查（[`UnixSocket::wake_objects`] 里有自己的接收队列）。
     fn drop(&mut self) {
+        self.wake();
         let stale = match &self.link {
             Link::Stream { rx, tx, .. } => {
                 tx.borrow_mut().eof = true;
@@ -460,7 +489,6 @@ impl Drop for UnixSocket {
             _ => self.rx.borrow_mut().discard(),
         };
         drop(stale);
-        request_wake_files();
     }
 }
 

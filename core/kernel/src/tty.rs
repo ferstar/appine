@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::kernel::{Tid, request_wake};
+use crate::kernel::{Tid, request_wake_object, wake};
 use crate::process::Signal;
 
 /// PTY 从设备的主设备号（`/dev/pts/<n>`）。
@@ -650,7 +650,7 @@ impl Drop for PtyEnd {
             t.slaves -= 1;
         }
         // 另一端要看到挂断
-        request_wake();
+        request_wake_object(wake::of(&self.tty));
     }
 }
 

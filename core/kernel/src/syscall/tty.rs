@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, put};
 use crate::errno::Errno;
 use crate::fd::{FileKind, oflags};
-use crate::kernel::{Cx, Kernel, request_wake};
+use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigAction, SigInfo};
 use crate::tty::{PtyEnd, Termios, Tty, Winsize, cc, flags};
@@ -140,7 +140,7 @@ fn slave_read(
             let expired = deadline.is_some_and(|d| Instant::now() >= d);
             if canonical {
                 if let Some(n) = t.read(buf) {
-                    request_wake();
+                    request_wake_object(wake::of(tty));
                     return Ok(n);
                 }
             } else {
@@ -148,7 +148,7 @@ fn slave_read(
                 let enough = avail >= vmin.min(buf.len()).max(1);
                 if avail > 0 && (enough || expired || vmin == 0) {
                     let n = t.read(buf).unwrap_or(0);
-                    request_wake();
+                    request_wake_object(wake::of(tty));
                     return Ok(n);
                 }
                 if vmin == 0 && (vtime.is_zero() || expired) {
@@ -169,7 +169,7 @@ fn slave_read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(deadline, &mut [])?;
+        cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(tty)])?;
     }
 }
 
@@ -194,7 +194,7 @@ fn slave_write(
             if n > 0 {
                 t.write_output(&data[done..done + n]);
                 done += n;
-                request_wake();
+                request_wake_object(wake::of(tty));
             }
         }
         if done == data.len() {
@@ -208,7 +208,7 @@ fn slave_write(
             };
             return if done > 0 { Ok(done) } else { Err(e) };
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
     }
 }
 
@@ -225,7 +225,7 @@ fn master_read(
             let out = t.take_output(buf.len());
             if !out.is_empty() {
                 buf[..out.len()].copy_from_slice(&out);
-                request_wake();
+                request_wake_object(wake::of(tty));
                 return Ok(out.len());
             }
             if t.slaves == 0 && !t.locked {
@@ -238,7 +238,7 @@ fn master_read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
     }
 }
 
@@ -257,7 +257,7 @@ fn master_write(
             let s = t.write_input(&data[done..done + n]);
             done += n;
             if n > 0 {
-                request_wake();
+                request_wake_object(wake::of(tty));
             }
             s
         };
@@ -275,7 +275,7 @@ fn master_write(
             };
             return if done > 0 { Ok(done) } else { Err(e) };
         }
-        cx.wait(None, &mut [])?;
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
     }
 }
 
@@ -390,7 +390,7 @@ pub(crate) fn ioctl(
                 tt.flush_input();
             }
             tt.set_termios(t);
-            request_wake();
+            request_wake_object(wake::of(tty));
             Ok(0)
         }
         TIOCGWINSZ => put(cx, arg, tty.borrow().winsize.encode()).map(|()| 0),
@@ -413,7 +413,7 @@ pub(crate) fn ioctl(
                 }
                 _ => return Err(Errno::EINVAL),
             }
-            request_wake();
+            request_wake_object(wake::of(tty));
             Ok(0)
         }
         TCXONC => {
@@ -423,7 +423,7 @@ pub(crate) fn ioctl(
                 2 | 3 => {}
                 _ => return Err(Errno::EINVAL),
             }
-            request_wake();
+            request_wake_object(wake::of(tty));
             Ok(0)
         }
         TCSBRK | TCSBRKP | TIOCEXCL | TIOCNXCL | TIOCSETD => Ok(0),
@@ -447,7 +447,7 @@ pub(crate) fn ioctl(
             for sig in signals {
                 signal_fg(cx.kr(), tty, sig);
             }
-            request_wake();
+            request_wake_object(wake::of(tty));
             Ok(0)
         }
         TIOCGPTN if master => put(cx, arg, tty.borrow().index.to_le_bytes()).map(|()| 0),

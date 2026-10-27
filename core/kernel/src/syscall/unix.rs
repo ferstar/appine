@@ -1,8 +1,9 @@
 //! AF_UNIX socket 的 syscall（数据结构在 [`crate::unix`]）。
 //!
-//! 由 [`super::net`] 在发现 socket 是 AF_UNIX 时转过来。阻塞的操作经由 [`Cx::wait`]
-//! 等其他线程改变 channel 的状态（它们都会调用 `request_wake`），可以被信号打断，
-//! 并按 `SO_RCVTIMEO`/`SO_SNDTIMEO` 超时。
+//! 由 [`super::net`] 在发现 socket 是 AF_UNIX 时转过来。阻塞的操作经由
+//! [`Cx::wait_objects`] 等其他线程改变 channel 的状态（它们都会请求唤醒那个 channel，
+//! 见 [`UnixSocket::wake_objects`]），可以被信号打断，并按 `SO_RCVTIMEO`/`SO_SNDTIMEO`
+//! 超时。
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -12,7 +13,7 @@ use super::fs::{AT_FDCWD, lookup_at, parent_at};
 use super::net::{Message, SocketRef, epipe};
 use crate::errno::Errno;
 use crate::fd::FileRef;
-use crate::kernel::{Cx, request_wake_files};
+use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket};
 use crate::unix::{
     CAPACITY, ChannelRef, Link, Name, Packet, Received, SOCK_SEQPACKET, SOCKADDR_UN_LEN, Ucred,
@@ -204,15 +205,20 @@ pub(super) fn listen(u: &mut UnixSocket, backlog: i32, cred: Ucred) -> Result<()
 }
 
 /// 阻塞操作的公共部分：非阻塞或超时返回 EAGAIN，有信号返回 ERESTARTSYS，否则等到
-/// 有线程改变了某个 channel 或 socket 的状态。
-fn block(cx: &mut Cx<'_>, nonblock: bool, deadline: Option<Instant>) -> Result<(), Errno> {
+/// 有线程改变了 channel `on` 的状态（监听 socket 的连接队列记在它的接收队列上）。
+fn block(
+    cx: &mut Cx<'_>,
+    nonblock: bool,
+    deadline: Option<Instant>,
+    on: &ChannelRef,
+) -> Result<(), Errno> {
     if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Errno::EAGAIN);
     }
     if cx.interrupted() {
         return Err(Errno::ERESTARTSYS);
     }
-    cx.wait(deadline, &mut [])
+    cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(on)])
 }
 
 fn deadline(timeout: Option<Duration>) -> Option<Instant> {
@@ -224,7 +230,8 @@ pub(super) fn accept(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let deadline = deadline(with(sock, |u| u.rcvtimeo));
+    let (timeout, queue) = with(sock, |u| (u.rcvtimeo, u.rx.clone()));
+    let deadline = deadline(timeout);
     loop {
         let new = with(sock, |u| match &mut u.link {
             Link::Listening { pending, .. } => Ok(pending.pop_front()),
@@ -232,11 +239,11 @@ pub(super) fn accept(
         })?;
         if let Some(new) = new {
             // 等 backlog 有空位的 connect 可以继续了
-            request_wake_files();
+            request_wake_object(wake::of(&queue));
             let peer = with(&new, |u| u.peer_name()).unwrap_or_else(unnamed);
             return Ok((new, peer));
         }
-        block(cx, nonblock, deadline)?;
+        block(cx, nonblock, deadline, &queue)?;
     }
 }
 
@@ -262,7 +269,7 @@ pub(super) fn connect(
         if Rc::ptr_eq(&target, sock) {
             return Err(Errno::ECONNREFUSED);
         }
-        {
+        let queue = {
             let mut t = target.borrow_mut();
             let Socket::Unix(server) = &mut *t else {
                 return Err(Errno::ECONNREFUSED);
@@ -280,14 +287,22 @@ pub(super) fn connect(
             };
             // 与 Linux 相同，最多容纳 backlog + 1 个等待 accept 的连接
             if pending.len() <= *backlog {
-                let end = with(sock, |u| u.connect_stream(&server.addr, *server_cred, cred));
+                let (end, own) = with(sock, |u| {
+                    (
+                        u.connect_stream(&server.addr, *server_cred, cred),
+                        wake::of(&u.rx),
+                    )
+                });
                 pending.push_back(Rc::new(RefCell::new(Socket::Unix(end))));
                 server.connections += 1;
-                request_wake_files();
+                request_wake_object(wake::of(&server.rx));
+                // 连上了：poll 着这个 socket 的线程登记的是它自己的接收队列
+                request_wake_object(own);
                 return Ok(());
             }
-        }
-        block(cx, nonblock, deadline)?;
+            server.rx.clone()
+        };
+        block(cx, nonblock, deadline, &queue)?;
     }
 }
 
@@ -407,7 +422,7 @@ pub(super) fn send(
                 }
             }
         }
-        if let Err(e) = block(cx, nonblock, deadline) {
+        if let Err(e) = block(cx, nonblock, deadline, &tx) {
             return if done > 0 { Ok(done) } else { Err(e) };
         }
     }
@@ -485,7 +500,7 @@ fn send_dgram(
                 return Ok(data.len());
             }
         }
-        block(cx, nonblock, deadline)?;
+        block(cx, nonblock, deadline, &rx)?;
     }
 }
 
@@ -549,7 +564,7 @@ pub(super) fn recv(
                 },
             });
         }
-        if let Err(e) = block(cx, nonblock, deadline) {
+        if let Err(e) = block(cx, nonblock, deadline, &rx) {
             return match part.take() {
                 Some(r) => Ok(deliver(cx, r, passcred, control_len, flags)),
                 None => Err(e),

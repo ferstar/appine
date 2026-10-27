@@ -62,8 +62,19 @@ pub(crate) mod wake {
     /// 有只影响某些对象的修改（[`super::request_wake_object`]），不是等待者关心的通道。
     pub(super) const OBJECTS: u32 = 1 << 31;
 
-    /// 等待者等的对象（管道）：对象的地址。
+    /// 等待者等的对象（管道、eventfd、PTY、AF_UNIX 的 channel……）：对象的地址。
     pub type Object = usize;
+
+    /// `RefCell` 里的对象 `c` 的唤醒对象：里面的值的地址，与对象自己的方法里的
+    /// [`of_value`] 相同。
+    pub fn of<T>(c: &std::cell::RefCell<T>) -> Object {
+        c.as_ptr() as Object
+    }
+
+    /// 在对象自己的方法里（只有 `&self`）：与 [`of`] 相同的地址。
+    pub fn of_value<T>(v: &T) -> Object {
+        v as *const T as Object
+    }
 }
 
 /// 释放 BKL 时要叫醒的通道。
@@ -114,10 +125,11 @@ pub(crate) fn request_wake_on(channels: u32) {
     WAKE.fetch_or(channels, Ordering::Relaxed);
 }
 
-/// 只影响对象 `object` 的修改（管道里的数据、管道两端的打开和关闭）：只叫醒等这个对象的
-/// 等待者（[`Cx::wait_object`]），以及没有指明对象的 [`wake::FILE`] 等待者（poll、epoll）。
-/// 原来 shell 的每次管道读写都把读着别的管道的进程（`$(...)` 外面的 shell、`tail`）
-/// 叫醒一遍。调用方持有 BKL。
+/// 只影响对象 `object` 的修改（管道里的数据、eventfd 的计数、PTY 的输入输出、AF_UNIX
+/// channel 里的消息……）：只叫醒登记了这个对象的等待者（[`Cx::wait_object`]、
+/// [`Cx::wait_objects`]），以及没有指明对象的 [`wake::FILE`] 等待者。原来 shell 的每次
+/// 管道读写都把读着别的管道的进程（`$(...)` 外面的 shell、`tail`）叫醒一遍，poll、epoll
+/// 的等待者也被每一次这样的修改叫醒。调用方持有 BKL。
 pub(crate) fn request_wake_object(object: wake::Object) {
     let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
     if !objects.contains(&object) {
@@ -125,6 +137,11 @@ pub(crate) fn request_wake_object(object: wake::Object) {
     }
     WAKE.fetch_or(wake::OBJECTS, Ordering::Relaxed);
 }
+
+/// 一个正在等待的线程：它的事件、它关心的通道（[`wake`]）和它等的对象（排好序；None
+/// 时任何对象上的修改都叫醒它）。一个 epoll 可能关注几千个文件，每次有对象被修改都要
+/// 查一遍，所以二分查找。
+type Waiter = (Arc<Event>, u32, Option<Box<[wake::Object]>>);
 
 /// 持有 flock(2) 锁的打开文件（弱引用，关闭后锁随之释放），以及是不是排他锁。
 pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool);
@@ -190,8 +207,8 @@ pub(crate) struct Kernel {
     /// 被跟踪的线程退出了、还没被跟踪者的 wait 取走的（[`crate::ptrace`]）。
     pub trace_exits: Vec<crate::ptrace::TraceExit>,
     next_tid: Tid,
-    /// 正在等待的线程的事件、它关心的通道（[`wake`]）和它等的对象。
-    waiters: Vec<(Arc<Event>, u32, Option<wake::Object>)>,
+    /// 正在等待的线程。
+    waiters: Vec<Waiter>,
     /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
     pub edge_waiters: Vec<Arc<Event>>,
     /// `EPOLLEXCLUSIVE` 关注的文件上等着的线程（`syscall::poll` 的独占门），由定时器线程
@@ -331,11 +348,13 @@ impl Kernel {
             return;
         }
         let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-        for (event, interest, object) in &self.waiters {
+        for (event, interest, wanted) in &self.waiters {
             let hit = interest & channels & wake::ALL != 0
                 || interest & wake::FILE != 0
                     && !objects.is_empty()
-                    && object.is_none_or(|o| objects.contains(&o));
+                    && wanted
+                        .as_ref()
+                        .is_none_or(|w| objects.iter().any(|o| w.binary_search(o).is_ok()));
             if hit {
                 signal_later(event);
             }
@@ -519,21 +538,26 @@ pub(crate) fn block<'a>(
     block_for(shared, k, event, deadline, host, interest, None)
 }
 
-/// [`block`]；`object` 不为 None 时，只影响别的对象的修改（[`request_wake_object`]）
+/// [`block`]；`objects` 不为 None 时，只影响别的对象的修改（[`request_wake_object`]）
 /// 不叫醒它。
-fn block_for<'a>(
+pub(crate) fn block_for<'a>(
     shared: &'a Shared,
     mut k: Bkl<'a>,
     event: &Arc<Event>,
     deadline: Option<Instant>,
     host: &mut [(i32, i16, i16)],
     interest: u32,
-    object: Option<wake::Object>,
+    objects: Option<&[wake::Object]>,
 ) -> (Bkl<'a>, Result<(), Errno>) {
     const POLLIN: i16 = 1;
     let listed = interest != 0;
     if listed {
-        k.waiters.push((event.clone(), interest, object));
+        let objects = objects.map(|o| {
+            let mut o = Box::<[wake::Object]>::from(o);
+            o.sort_unstable();
+            o
+        });
+        k.waiters.push((event.clone(), interest, objects));
     }
     drop(k);
     let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
@@ -737,7 +761,20 @@ impl<'a> Cx<'a> {
     /// 等对象 `object`（管道）上的修改（[`request_wake_object`]、[`request_wake_files`]）、
     /// 直接的通知或者超时。
     pub fn wait_object(&mut self, object: wake::Object) -> Result<(), Errno> {
-        self.wait_for(None, &mut [], wake::FILE, Some(object))
+        self.wait_for(None, &mut [], wake::FILE, Some(&[object]))
+    }
+
+    /// 与 [`Cx::wait`] 相同，但只影响对象的修改（[`request_wake_object`]）只在是 `objects`
+    /// 里的对象时才叫醒它。调用方必须保证让它的条件成立的修改要么请求了这些对象之一，
+    /// 要么请求了某个通道（[`request_wake_files`]、[`request_wake`]）。
+    pub fn wait_objects(
+        &mut self,
+        deadline: Option<Instant>,
+        host: &mut [(i32, i16, i16)],
+        interest: u32,
+        objects: &[wake::Object],
+    ) -> Result<(), Errno> {
+        self.wait_for(deadline, host, interest, Some(objects))
     }
 
     fn wait_for(
@@ -745,12 +782,12 @@ impl<'a> Cx<'a> {
         deadline: Option<Instant>,
         host: &mut [(i32, i16, i16)],
         interest: u32,
-        object: Option<wake::Object>,
+        objects: Option<&[wake::Object]>,
     ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
         self.task.sleeping.store(true, Ordering::Relaxed);
         let event = &self.task.event;
-        let (k, r) = block_for(self.shared, k, event, deadline, host, interest, object);
+        let (k, r) = block_for(self.shared, k, event, deadline, host, interest, objects);
         self.task.sleeping.store(false, Ordering::Relaxed);
         self.k = Some(k);
         r
