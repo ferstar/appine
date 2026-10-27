@@ -1,6 +1,6 @@
 # M9 之前：smaps 里共用的页（2026-10-28）
 
-← [M9 之前：终端的属主和权限（2026-10-28）](64-pty-owner.md) · [索引](../milestones.md)
+← [M9 之前：终端的属主和权限（2026-10-28）](64-pty-owner.md) · [索引](../milestones.md) · [M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）](66-aio-destroy.md) →
 
 [负载普查](62-workload-survey.md)的问题 3：redis 8.8 和 valkey 9.0 启动就退出，日志说 "Your kernel has a bug that could lead to data corruption during background save"。
 

@@ -1216,6 +1216,7 @@ cat > aio.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -1268,6 +1269,22 @@ static void events(aio_context_t ctx, long min, const char *what)
     printf("\n");
 }
 
+/* 在 io_getevents 里一直等（不限时） */
+struct waiter {
+    aio_context_t ctx;
+    long min, n;
+    int err;
+};
+
+static void *wait_events(void *arg)
+{
+    struct waiter *w = arg;
+    struct io_event ev[8];
+    w->n = syscall(SYS_io_getevents, w->ctx, w->min, 8, ev, NULL);
+    w->err = errno;
+    return NULL;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1310,10 +1327,32 @@ int main(void)
     printf("min > nr %ld %s\n", syscall(SYS_io_getevents, ctx, 2, 1, &res, NULL), strerror(errno));
     printf("destroy %ld again %ld %s\n", syscall(SYS_io_destroy, ctx), syscall(SYS_io_destroy, ctx),
            strerror(errno));
+    /* 别的线程在 io_getevents 里等着时销毁上下文：它醒来返回，一个事件也没有是 EINVAL，
+     * 已经完成的照样取走。mariadb 关闭时这样结束等事件的线程 */
+    for (int done = 0; done <= 1; done++) {
+        struct waiter wt = {0, done ? 2 : 1, 0, 0};
+        syscall(SYS_io_setup, 8, &wt.ctx);
+        struct iocb w2 = cb(fd, IOCB_CMD_PWRITE, out, 9, 0, 7);
+        one[0] = &w2;
+        if (done)
+            syscall(SYS_io_submit, wt.ctx, 1, one);
+        pthread_t t;
+        pthread_create(&t, NULL, wait_events, &wt);
+        usleep(100000);
+        printf("destroy while waiting (%d done) %ld", done, syscall(SYS_io_destroy, wt.ctx));
+        struct timespec limit;
+        clock_gettime(CLOCK_REALTIME, &limit);
+        limit.tv_sec += 5;
+        if (pthread_timedjoin_np(t, NULL, &limit) != 0) {
+            printf(", the waiter is still waiting\n");
+            return 1;
+        }
+        printf(", the waiter got %ld %s\n", wt.n, wt.n < 0 ? strerror(wt.err) : "");
+    }
     return 0;
 }
 C
-gcc -O1 -o aio aio.c
+gcc -O1 -o aio aio.c -pthread
 ./aio
 
 # MREMAP_DONTUNMAP 用在各种映射上之后原来的地址上看到什么；remap_file_pages

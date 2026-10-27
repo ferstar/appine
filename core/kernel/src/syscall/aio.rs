@@ -50,6 +50,8 @@ pub(crate) struct AioContext {
     /// 完成事件（`struct io_event`）。
     events: VecDeque<[u8; 32]>,
     polls: Vec<PendingPoll>,
+    /// 已经 io_destroy：正在 io_getevents 里等的线程醒来之后返回（Linux 的 `ctx->dead`）。
+    dead: bool,
 }
 
 impl AioContext {
@@ -96,6 +98,7 @@ pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
         max: nr as usize,
         events: VecDeque::new(),
         polls: Vec::new(),
+        dead: false,
     };
     cx.t.group
         .borrow_mut()
@@ -104,6 +107,8 @@ pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
     Ok(0)
 }
 
+/// 销毁上下文：挂起的 poll 取消掉（不产生完成事件），正在 io_getevents 里等它的线程醒来
+/// 之后返回，与 Linux 的 `kill_ioctx` 一样。mariadb 关闭时靠这一点结束等事件的线程。
 pub(super) fn io_destroy(cx: &mut Cx<'_>, ctx: u64) -> SysResult {
     let c =
         cx.t.group
@@ -111,6 +116,11 @@ pub(super) fn io_destroy(cx: &mut Cx<'_>, ctx: u64) -> SysResult {
             .aio
             .remove(&ctx)
             .ok_or(Errno::EINVAL)?;
+    {
+        let mut c = c.borrow_mut();
+        c.dead = true;
+        c.polls.clear();
+    }
     released(cx.k(), std::iter::once((ctx, c)));
     let _ = cx.mm_mut().munmap(ctx, 4096);
     request_wake();
@@ -344,6 +354,11 @@ pub(super) fn io_getevents(
         let have = c.borrow().events.len() as i64;
         if have >= min_nr.max(1) || min_nr == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
             break Ok(());
+        }
+        // 等的时候上下文被销毁了：已经完成的事件照样取走，一个也没有就是 EINVAL（Linux 的
+        // aio_read_events）
+        if c.borrow().dead {
+            break if have > 0 { Ok(()) } else { Err(Errno::EINVAL) };
         }
         if cx.interrupted() {
             break Err(Errno::EINTR);
