@@ -1,11 +1,14 @@
 # fork 之后父子进程的内存互不影响（写时复制）：几个子进程和父进程同时写；多线程的父进程
 # 在别的线程不停写的时候 fork，子进程看到的是某一瞬间的快照；借出的内存解除映射、搬走、
-# 丢弃；子进程里用锁和条件变量；一层套一层的 fork；python 的 os.fork
+# 丢弃；子进程结束之后借出的页恢复成各自的权限；子进程里用锁和条件变量；一层套一层的
+# fork；python 的 os.fork
 set -e
 cd /tmp
 cat > cow.c <<'C'
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,6 +177,56 @@ static int unmap_move_discard(void)
     return bad;
 }
 
+/* 子进程结束、还回借来的页之后，父进程的页恢复成各自所在映射的权限。一次 mmap 用
+ * mprotect 切成的几段宿主内存是连着的，不能按第一段的权限一起恢复：保护页的 PROT_NONE
+ * 会让后面的页都访问不了，可写的一段会让后面只读的一段也能写 */
+static sigjmp_buf probe_jmp;
+
+static void probe_fault(int sig)
+{
+    (void)sig;
+    siglongjmp(probe_jmp, 1);
+}
+
+static int probe(volatile unsigned char *p, int write)
+{
+    if (sigsetjmp(probe_jmp, 1))
+        return 0;
+    if (write)
+        *p = 'w';
+    else
+        (void)*p;
+    return 1;
+}
+
+static void returned_loans(void)
+{
+    /* 保护页、两页可写、一页只读；一页可写、一页只读；最后像线程的信号栈那样，一段开头
+     * 是没写过的保护页的映射，接在上一段的下面 */
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    unsigned char *m = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, flags, -1, 0);
+    unsigned char *n = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, flags, -1, 0);
+    unsigned char *s = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, flags | MAP_STACK, -1, 0);
+    memset(m, 'r', 4 * PAGE);
+    memset(n, 'r', 2 * PAGE);
+    mprotect(m, PAGE, PROT_NONE);
+    mprotect(m + 3 * PAGE, PAGE, PROT_READ);
+    mprotect(n + PAGE, PAGE, PROT_READ);
+    mprotect(s, PAGE, PROT_NONE);
+    memset(s + PAGE, 's', 3 * PAGE);
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(0);
+    wait_all(1);
+    struct sigaction sa = {.sa_handler = probe_fault}, old;
+    sigaction(SIGSEGV, &sa, &old);
+    printf("returned loans: guard read %d, rw write %d %d, ro read %d write %d; rw write %d, ro write %d; "
+           "stack guard read %d, stack write %d\n",
+           probe(m, 0), probe(m + PAGE, 1), probe(m + 2 * PAGE, 1), probe(m + 3 * PAGE, 0),
+           probe(m + 3 * PAGE, 1), probe(n, 1), probe(n + PAGE, 1), probe(s, 0), probe(s + PAGE, 1));
+    sigaction(SIGSEGV, &old, NULL);
+}
+
 /* 子进程里的锁和条件变量（futex 在 fork 时借来的页上） */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -235,6 +288,7 @@ int main(void)
     printf("concurrent writers: %d bad\n", concurrent_writers());
     printf("threads and fork: %d bad\n", threads_and_fork());
     printf("unmap, move, discard: %d bad\n", unmap_move_discard());
+    returned_loans();
     printf("locks in child: %d bad\n", locks_in_child());
     memset(mem, 'p', PAGES * PAGE);
     printf("nested: %d bad\n", nested(0));

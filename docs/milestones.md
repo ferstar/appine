@@ -71,6 +71,7 @@
 | [M9 之前：seccomp 的缓存和快速路径](rounds/60-seccomp-cache.md) | 2026-10-28 | 按 Linux 的 `seccomp_cache` 记下过滤器总是放行的编号，不再运行程序；这些编号和 vDSO 里读时钟照常不持 BKL：46 条的过滤器下 futex 唤醒 313 → 60 纳秒（没有过滤器时 60），读时钟 143 → 89 纳秒 |
 | [M9 之前：进程结束的每一步分别兜住](rounds/61-finish-steps.md) | 2026-10-28 | 最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC、控制终端、跟踪、孤儿进程组等）各自兜住内核层的 bug，一步出错只丢掉这一步做的事，不再留下永远停着、等着的进程 |
 | [M9 之前：负载普查](rounds/62-workload-survey.md) | 2026-10-28 | `scripts/survey` 在 appine 里跑 sshd、tmux、postgres、redis、mariadb、Rust、.NET 等 20 多种服务和工具：多数正常；找到 6 个问题：fork 之后父进程的页权限被改错（rustc 崩溃）、ssh 分配不了 PTY、redis/valkey 不肯启动、mariadb 卡住、.NET 看不到别的进程的内存、`/proc/meminfo` 的可用内存偏小 |
+| [M9 之前：fork 之后还回的页按各自的权限恢复](rounds/63-returned-loans.md) | 2026-10-28 | 子进程还回借来的页时，父进程把宿主内存连着的一段按第一页所在映射的权限恢复，保护页的 PROT_NONE 扩散到旁边的页（rustc 退出时崩溃），可写的权限扩散到只读的页；改为不跨映射接段（[fork 写时复制](rounds/26-fork-cow.md)那一轮起的 bug） |
 
 ## 测量条件
 
@@ -90,7 +91,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | 测试 | 原因 |
 |---|---|
 | shmctl01 | 全量并发时子进程还没 `shmdt` 完就超时，单独运行多数通过；[多进程并行](rounds/36-parallel-processes.md)那一轮用 HEAD 的二进制单独跑 8 次也失败 3 次，写时复制之前的二进制并发跑 shm 子集也会失败 |
-| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样 |
+| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01_64 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样 |
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | futex_wake05 | [稳定性和内存](rounds/12-stability-memory.md)那一轮记为以前就时好时坏，原因没查 |

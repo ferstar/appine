@@ -1,6 +1,6 @@
 # M9 之前：负载普查（2026-10-28）
 
-← [M9 之前：进程结束的每一步分别兜住（2026-10-28）](61-finish-steps.md) · [索引](../milestones.md)
+← [M9 之前：进程结束的每一步分别兜住（2026-10-28）](61-finish-steps.md) · [索引](../milestones.md) · [M9 之前：fork 之后还回的页按各自的权限恢复（2026-10-28）](63-returned-loans.md) →
 
 剩下的内核推迟项按"常见程序碰不碰得到"筛下来，多是长尾。差分测试只覆盖 C 程序、coreutils、Go、Java、Node.js、Python、Lua/SQLite 和 gdb，手机终端上常见的服务和工具大多没在 appine 里跑过。这一轮把它们跑一遍，找出实际会碰到的缺口。
 

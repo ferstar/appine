@@ -557,23 +557,26 @@ impl std::hash::Hasher for PageHasher {
 /// 同一个 fork 家族共用的借出记录，键是宿主页的地址。
 type Loans = Rc<RefCell<HashMap<usize, Loan, std::hash::BuildHasherDefault<PageHasher>>>>;
 
-/// 页表里连续的一段：guest 地址、宿主地址、长度。逐页改页表项之前先接成段。
+/// 页表里连续的一段：所在 VMA 的起点、guest 地址、宿主地址、长度。逐页改页表项之前先
+/// 接成段。段不跨 VMA：mprotect 切开的几个 VMA、相邻的两次 mmap 的宿主内存也可能相连，
+/// 而它们的权限不同。
 #[derive(Default)]
 struct Runs {
-    runs: Vec<(u64, usize, u64)>,
+    runs: Vec<(u64, u64, usize, u64)>,
 }
 
 impl Runs {
-    fn push(&mut self, page: u64, host: NonNull<u8>) {
+    fn push(&mut self, vma: u64, page: u64, host: NonNull<u8>) {
         let host = host.as_ptr() as usize;
-        if let Some((g, h, len)) = self.runs.last_mut()
+        if let Some((v, g, h, len)) = self.runs.last_mut()
+            && *v == vma
             && *g + *len == page
             && *h + *len as usize == host
         {
             *len += PAGE_SIZE;
             return;
         }
-        self.runs.push((page, host, PAGE_SIZE));
+        self.runs.push((vma, page, host, PAGE_SIZE));
     }
 }
 
@@ -3109,14 +3112,14 @@ impl Mm {
                 if c.lent.remove(&page)
                     && let Some((s, v)) = self.anon_vma(page)
                 {
-                    runs.push(page, Self::own_page(s, v, page));
+                    runs.push(s, page, Self::own_page(s, v, page));
                 }
             }
         }
-        for (page, _, len) in runs.runs {
-            if let Some((_, v)) = self.anon_vma(page) {
-                let _ = self.mmu.protect_shared(page, len, mmu_prot(v.prot));
-            }
+        for (s, page, _, len) in runs.runs {
+            let _ = self
+                .mmu
+                .protect_shared(page, len, mmu_prot(self.vmas[&s].prot));
         }
     }
 
@@ -3278,20 +3281,20 @@ impl Mm {
                     let owner = Some((self.me.clone(), page));
                     loans.insert(key, Loan::new(owner, (child.me.clone(), page)));
                     lent.push(page);
-                    parent_runs.push(page, host);
+                    parent_runs.push(start, page, host);
                 }
                 (host, v.region.clone())
             } else {
                 continue;
             };
-            child_runs.push(page, host);
+            child_runs.push(start, page, host);
             borrowed.push((page, Borrowed { host, region }));
         }
         if ro != 0 {
-            for (page, _, len) in parent_runs.runs {
+            for (_, page, _, len) in parent_runs.runs {
                 let _ = self.mmu.protect_shared(page, len, ro);
             }
-            for (page, host, len) in child_runs.runs {
+            for (_, page, host, len) in child_runs.runs {
                 // SAFETY: 借来的宿主页由 Borrowed::region 持有，记在子进程的 borrowed 里
                 let _ = unsafe {
                     child
@@ -4137,6 +4140,33 @@ mod tests {
         assert_eq!(byte(&child, a + 2 * PAGE_SIZE), b'p');
         poke(&child, a + 2 * PAGE_SIZE, b'c');
         assert_eq!(byte(&parent, moved), b'q');
+    }
+
+    #[test]
+    fn returned_loans_restore_each_vma_its_own_protection() {
+        // mprotect 切开的几个 VMA 的宿主内存是连着的：子进程还回借来的页时，父进程按每页
+        // 所在 VMA 的权限恢复，而不是按连着的一段里第一页的
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, 3 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        for i in 0..3 {
+            poke(&parent, a + i * PAGE_SIZE, b'p');
+        }
+        parent.borrow_mut().mprotect(a, PAGE_SIZE, 0).unwrap();
+        parent
+            .borrow_mut()
+            .mprotect(a + 2 * PAGE_SIZE, PAGE_SIZE, prot::READ)
+            .unwrap();
+        let child = parent.borrow_mut().fork().unwrap();
+        drop(child);
+        let readable = |addr| parent.borrow().mmu().translate(addr, prot::READ).is_some();
+        assert!(!readable(a));
+        assert!(writable(&parent, a + PAGE_SIZE));
+        assert!(readable(a + 2 * PAGE_SIZE) && !writable(&parent, a + 2 * PAGE_SIZE));
+        assert!(parent.borrow().cow.borrow().lent.is_empty());
     }
 
     #[test]
