@@ -20,6 +20,6 @@
 **推迟项**：
 
 - 管道形式的 `core_pattern`（`|程序`）。
-- Linux 写 core 时连同共用地址空间的别的进程（vfork 的父进程、`CLONE_VM` 的子进程）一起结束，appine 只结束自己的线程组。
+- Linux 写 core 时连同共用地址空间的别的进程（vfork 的父进程、`CLONE_VM` 的子进程）一起结束，appine 只结束自己的线程组。→ 这一条记错了：那是 Linux 5.16 之前的行为，5.16 起（`coredump: Limit coredumps to a single thread group`）只结束自己的线程组，appine 报告的 6.1 也是这样，现在的做法与 Linux 相同（2026-10-27 核对）
 - 读内存持着 BKL（写文件时放开），几 GB 的进程写 core 时别的进程要等。
 - `NT_PRPSINFO` 的 `pr_flag`（Linux 的 `PF_*`）只有可以推断的几个位。
