@@ -2771,7 +2771,9 @@ fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     Ok(path)
 }
 
-/// 等宿主 fd 可读或可写；非阻塞时不等。
+/// 等宿主 fd（`appine-run` 交给 guest 的宿主 stdio）可读或可写；非阻塞时不等。只等宿主
+/// fd 本身，不登记任何对象：进程内没有修改会让它就绪，原来系统里每一次管道、PTY 的读写
+/// 都把阻塞在宿主 stdin 上的线程叫醒一遍。
 fn wait_host(cx: &mut Cx<'_>, fd: i32, events: i16, nonblock: bool) -> Result<(), Errno> {
     let mut pfd = [(fd, events, 0)];
     loop {
@@ -2785,7 +2787,7 @@ fn wait_host(cx: &mut Cx<'_>, fd: i32, events: i16, nonblock: bool) -> Result<()
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut pfd)?;
+        cx.wait_objects(None, &mut pfd, crate::kernel::wake::FILE, &[])?;
         if pfd[0].2 != 0 {
             return Ok(());
         }

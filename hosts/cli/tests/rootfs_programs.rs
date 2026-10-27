@@ -12,7 +12,7 @@
 //! `APPINE_NETWORK_TESTS=1` 时运行，宿主的 `http_proxy`、`https_proxy` 会传给 guest。
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -224,6 +224,53 @@ fn stdin_reaches_the_guest() {
         let out = child.wait_with_output().unwrap();
         assert_ok(tier, &out);
         assert_eq!(stdout(&out), "got typed\n", "tier {tier}");
+    }
+}
+
+#[test]
+fn idle_readers_of_host_stdin_sleep_through_other_traffic() {
+    // 不带 --pty 时 guest 的 stdin 是宿主的管道：阻塞在 read 里的进程只等宿主 fd，shell
+    // 在一个 FIFO 上的读写不叫醒它（自愿上下文切换的次数不变）；写进 stdin 之后照常读到。
+    // 用 dd 读：busybox 的 read 内建命令先 poll，测的就不是阻塞的读了。读写 FIFO 只用
+    // 内建命令：musl 的 fork 在 clone 前后屏蔽所有信号，这时有子进程退出的话 SIGCHLD 被所有
+    // 线程屏蔽，仍会叫醒所有等待者
+    let Some(store) = store() else {
+        return;
+    };
+    // 先等 dd 停在读里：已经 exec 成 dd、在内核里等着（S）、切换次数 0.2 秒没变（全量测试
+    // 并行时它可能还在启动）。读状态只用 shell 的内建命令，不起进程、不用管道
+    let script = "mkfifo /tmp/hoststdin.fifo
+        exec 3<&0 4<>/tmp/hoststdin.fifo
+        rm /tmp/hoststdin.fifo
+        dd bs=5 count=1 <&3 >/tmp/hoststdin.out 2>/dev/null &
+        r=$!
+        n() {
+            while read k v w; do
+                case $k in Name:) m=$v ;; State:) s=$v ;; voluntary_ctxt_switches:) c=$v ;; esac
+            done </proc/$r/status
+        }
+        n; b=$c; t=0
+        while sleep 0.2; n; [ \"$m $s $c\" != \"dd S $b\" ] && [ $t -lt 50 ]; do b=$c; t=$((t + 1)); done
+        i=0
+        while [ $i -lt 200 ]; do echo x >&4; read l <&4; i=$((i + 1)); done
+        n
+        echo \"woken $((c - b))\"
+        wait $r
+        echo \"reader got $(cat /tmp/hoststdin.out)\"
+        rm /tmp/hoststdin.out";
+    for tier in TIERS {
+        let mut child = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let woken = lines.next().unwrap().unwrap();
+        child.stdin.take().unwrap().write_all(b"typed\n").unwrap();
+        let rest: Vec<String> = lines.map(Result::unwrap).collect();
+        assert_eq!(child.wait().unwrap().code(), Some(0), "tier {tier}");
+        assert_eq!(woken, "woken 0", "tier {tier}");
+        assert_eq!(rest, ["reader got typed"], "tier {tier}");
     }
 }
 
