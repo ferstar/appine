@@ -17,5 +17,5 @@
 **推迟项**：
 
 - 有断点或观察点的线程整个用解释器执行，比 Tier 1 慢一个数量级（仍比软件观察点快得多）。要在 Tier 1 里做，得让翻译后的代码在观察的页上走慢路径（TLB 不填这些页）、在断点处结束块。→ 观察点已在 Tier 1 里做了（M9 之前：Tier 1 里的观察点），有断点的线程仍整个用解释器执行
-- 观察点不支持地址掩码（控制字的 MASK 位，Linux 也不支持）；断点不支持上下文匹配、关联的断点。
+- 观察点不支持地址掩码（控制字的 MASK 位，Linux 也不支持）；断点不支持上下文匹配、关联的断点。→ 后一半记错了：arm64 Linux 的 `arch_hw_breakpoint_ctrl` 只有 enabled、privilege、type、len 四个字段（`decode_ctrl_reg` 只取这些），经由 ptrace 同样设不了上下文匹配和关联的断点，与 appine 相同（2026-10-27 核对 Linux 的 `asm/hw_breakpoint.h`）
 - 内核替 guest 访问内存（`read`、`write` 的缓冲区等）不触发观察点，与 Linux 一样（Linux 只在用户态的访问上触发）。
