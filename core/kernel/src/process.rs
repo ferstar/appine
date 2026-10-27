@@ -139,6 +139,8 @@ pub enum ExitStatus {
         pc: Option<u64>,
         /// 访存出错时的 guest 地址。
         fault_addr: Option<u64>,
+        /// 写了 core 文件（`WCOREDUMP`）。
+        core_dumped: bool,
     },
 }
 
@@ -147,7 +149,11 @@ impl ExitStatus {
     pub(crate) fn wait_status(self) -> i32 {
         match self {
             ExitStatus::Exited(code) => (code & 0xff) << 8,
-            ExitStatus::Signaled { signal, .. } => signal.number(),
+            ExitStatus::Signaled {
+                signal,
+                core_dumped,
+                ..
+            } => signal.number() | if core_dumped { 0x80 } else { 0 },
         }
     }
 }
@@ -361,6 +367,10 @@ pub(crate) struct ThreadGroup {
     pub execed: bool,
     /// `PR_SET_THP_DISABLE`（没有透明大页，只记录），fork 继承。
     pub thp_disable: bool,
+    /// `/proc/<pid>/coredump_filter`（`mm::dump_filter`），fork 继承。
+    pub coredump_filter: u32,
+    /// 正在写 core 文件：其他线程退出时把寄存器留在这里（`crate::coredump`）。
+    pub core: Option<Vec<crate::coredump::ThreadCore>>,
     /// POSIX 定时器（timer_create），按 id；fork 不继承，execve 时删除。
     pub posix_timers: std::collections::BTreeMap<i32, crate::itimer::PosixTimer>,
     /// AIO 上下文，按 id（`syscall::aio`）。
@@ -411,6 +421,8 @@ impl ThreadGroup {
             cred: Cred::root(),
             personality: 0,
             thp_disable: false,
+            coredump_filter: crate::mm::dump_filter::DEFAULT,
+            core: None,
             execed: false,
             posix_timers: std::collections::BTreeMap::new(),
             aio: std::collections::BTreeMap::new(),

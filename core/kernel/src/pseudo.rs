@@ -114,7 +114,7 @@ const ENTRIES: [(&[u8], Entry); 23] = [
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 65] = [
+const STATIC: [&[u8]; 66] = [
     b"net/",
     b"net/dev",
     b"net/icmp",
@@ -149,6 +149,7 @@ const STATIC: [&[u8]; 65] = [
     b"sys/kernel/",
     b"sys/kernel/cap_last_cap",
     b"sys/kernel/core_pattern",
+    b"sys/kernel/core_uses_pid",
     b"sys/kernel/domainname",
     b"sys/kernel/hostname",
     b"sys/kernel/msgmax",
@@ -759,6 +760,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/kernel/threads-max"
                     | b"sys/kernel/ns_last_pid"
                     | b"sys/kernel/core_pattern"
+                    | b"sys/kernel/core_uses_pid"
                     | b"sys/kernel/msgmax"
                     | b"sys/kernel/msgmnb"
                     | b"sys/kernel/msgmni"
@@ -908,6 +910,33 @@ pub(crate) fn write(
         if privileged {
             g.oom_score_adj_min = value;
         }
+    }
+    // 与 Linux 的 proc_dostring 一样，长了截断（core_pattern 最长 127 个字节）
+    if let PseudoNode::Static(b"sys/kernel/core_pattern") = node {
+        let pattern = data.strip_suffix(b"\n").unwrap_or(data);
+        let len = pattern.len().min(crate::coredump::PATTERN_MAX - 1);
+        k.core_pattern = pattern[..len].to_vec();
+    }
+    if let PseudoNode::Static(b"sys/kernel/core_uses_pid") = node {
+        let v: i64 = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or(Errno::EINVAL)?;
+        k.core_uses_pid = v != 0;
+    }
+    // 与 Linux 一样按 C 的写法解析（0x 开头是十六进制，0 开头是八进制），只取 9 位
+    if let PseudoNode::Entry(pid, _, Entry::CoredumpFilter) = node {
+        let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?.trim();
+        let value = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16)
+        } else if s.len() > 1 && s.starts_with('0') {
+            u32::from_str_radix(&s[1..], 8)
+        } else {
+            s.parse()
+        }
+        .map_err(|_| Errno::EINVAL)?;
+        let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
+        group.borrow_mut().coredump_filter = value & 0x1ff;
     }
     Ok(())
 }
@@ -1400,6 +1429,7 @@ fn vm_flags(r: &Region) -> String {
         (r.locked, "lo"),
         // 计入提交量：可写的私有匿名映射
         (r.file.is_none() && !r.shared && r.prot & 2 != 0, "ac"),
+        (r.dontdump, "dd"),
     ];
     let mut s = String::from("VmFlags: ");
     for (on, name) in flags {
@@ -1731,7 +1761,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
-            b"sys/kernel/core_pattern" => "core\n".to_owned(),
+            b"sys/kernel/core_pattern" => {
+                format!("{}\n", String::from_utf8_lossy(&ps.k.core_pattern))
+            }
+            b"sys/kernel/core_uses_pid" => format!("{}\n", ps.k.core_uses_pid as u8),
             b"sys/kernel/domainname" => {
                 format!("{}\n", String::from_utf8_lossy(&ps.k.domainname))
             }
@@ -1802,8 +1835,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
                 }
-                // 不产生 core dump，只给出 Linux 的默认值（写入接受但不起作用）
-                self::Entry::CoredumpFilter => "00000033\n".to_owned(),
+                self::Entry::CoredumpFilter => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    format!("{:08x}\n", g.borrow().coredump_filter)
+                }
                 _ => return Err(Errno::EINVAL),
             }
         }

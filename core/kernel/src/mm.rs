@@ -424,6 +424,8 @@ struct Vma {
     written: Cell<bool>,
     /// `MAP_GROWSDOWN`：访问它下面的地址时向下增长（[`Mm::grow_down`]）。
     growsdown: bool,
+    /// `MADV_DONTDUMP`：core 文件里不写它的内容（[`Mm::dump_regions`]），fork 继承。
+    dontdump: bool,
 }
 
 /// 最近几个代码代数作废的范围。
@@ -724,6 +726,34 @@ pub struct Region {
     pub locked: bool,
     /// 能获得写权限（smaps 的 `mw`）。
     pub may_write: bool,
+    /// `MADV_DONTDUMP`（smaps 的 `dd`）。
+    pub dontdump: bool,
+}
+
+/// core dump 里的一个映射（[`Mm::dump_regions`]）。
+pub struct DumpRegion {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u32,
+    /// 从起点算起写进 core 文件的字节数。
+    pub size: u64,
+    /// 没有驻留在宿主内存里的页从来没碰过（匿名、共享内存），写成空洞；私有文件映射
+    /// 没碰过的页是文件的内容，要读出来。
+    pub sparse: bool,
+    /// 文件映射：起点对应的文件偏移和路径（`NT_FILE`）。
+    pub file: Option<(u64, Rc<[u8]>)>,
+}
+
+/// `/proc/<pid>/coredump_filter` 的位（Linux 的 `MMF_DUMP_*`），默认是
+/// [`dump_filter::DEFAULT`]。
+pub mod dump_filter {
+    pub const ANON_PRIVATE: u32 = 1;
+    pub const ANON_SHARED: u32 = 2;
+    pub const MAPPED_PRIVATE: u32 = 4;
+    pub const MAPPED_SHARED: u32 = 8;
+    pub const ELF_HEADERS: u32 = 16;
+    /// 匿名的私有、共享映射，ELF 文件头，私有的大页。
+    pub const DEFAULT: u32 = 0x33;
 }
 
 fn page_up(v: u64) -> Option<u64> {
@@ -1134,6 +1164,7 @@ impl Mm {
                 locked: self.lock_future,
                 written: Cell::new(prot & prot::WRITE != 0),
                 growsdown: false,
+                dontdump: false,
             },
         );
         Ok(())
@@ -1731,6 +1762,7 @@ impl Mm {
             locked: template.locked,
             written: Cell::new(template.prot & prot::WRITE != 0),
             growsdown: false,
+            dontdump: false,
         })
     }
 
@@ -1848,6 +1880,20 @@ impl Mm {
         self.split_at(end);
         for (_, v) in self.vmas.range_mut(start..end) {
             v.locked = locked;
+        }
+        Ok(())
+    }
+
+    /// `MADV_DONTDUMP`、`MADV_DODUMP`：`[addr, addr + len)` 在 core 文件里写不写，区间必须
+    /// 完全已映射。
+    pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
+        let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
+        self.check_mapped(addr, len)?;
+        self.room_for(self.splits(&[addr, end]))?;
+        self.split_at(addr);
+        self.split_at(end);
+        for (_, v) in self.vmas.range_mut(addr..end) {
+            v.dontdump = dontdump;
         }
         Ok(())
     }
@@ -2402,6 +2448,102 @@ impl Mm {
         Some((low, s + v.len))
     }
 
+    /// core dump 要写的映射（`crate::coredump`），一个 VMA 一项。写多少按 Linux 的
+    /// `vma_dump_size` 和 `coredump_filter`（`filter`，[`dump_filter`] 的位）：vDSO
+    /// 总是整个写；共享映射看它是匿名的（含 memfd、SysV 共享内存）还是文件的；写过的
+    /// 私有匿名映射整个写（从来没有可写过的、`PROT_NONE` 的预留不写）；私有文件映射
+    /// 可写过的整个写（数据段），否则只写 ELF 文件开头的一页，让调试器认出映射的是什么。
+    pub fn dump_regions(&self, filter: u32) -> Vec<DumpRegion> {
+        use dump_filter::*;
+        self.vmas
+            .iter()
+            .map(|(&s, v)| {
+                let offset = v.file_id.map(|(_, _, off)| off);
+                let size = if s == self.vdso {
+                    v.len
+                } else if v.dontdump {
+                    0
+                } else {
+                    match v.backing {
+                        Backing::Shared => {
+                            let anon = offset.is_none()
+                                || v.shm.is_some()
+                                || v.name.as_deref().is_some_and(|n| {
+                                    n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")
+                                });
+                            let bit = if anon { ANON_SHARED } else { MAPPED_SHARED };
+                            if filter & bit != 0 { v.len } else { 0 }
+                        }
+                        Backing::Anonymous if filter & ANON_PRIVATE != 0 && v.written.get() => {
+                            v.len
+                        }
+                        Backing::Anonymous => 0,
+                        Backing::PrivateFile
+                            if filter & ANON_PRIVATE != 0
+                                && (v.written.get() || v.prot & prot::WRITE != 0) =>
+                        {
+                            v.len
+                        }
+                        Backing::PrivateFile if filter & MAPPED_PRIVATE != 0 => v.len,
+                        Backing::PrivateFile
+                            if filter & ELF_HEADERS != 0
+                                && offset == Some(0)
+                                && v.prot & prot::READ != 0
+                                && v.file_len >= PAGE_SIZE =>
+                        {
+                            // SAFETY: 第一页落在文件内容里，宿主内存由这个 VMA 持有
+                            let magic = unsafe { std::slice::from_raw_parts(v.host.as_ptr(), 4) };
+                            if magic == b"\x7fELF" { PAGE_SIZE } else { 0 }
+                        }
+                        Backing::PrivateFile => 0,
+                    }
+                };
+                DumpRegion {
+                    start: s,
+                    end: s + v.len,
+                    prot: v.prot,
+                    size,
+                    sparse: v.backing != Backing::PrivateFile,
+                    file: offset
+                        .map(|off| (off, v.name.clone().unwrap_or_else(|| Rc::from(&b""[..])))),
+                }
+            })
+            .collect()
+    }
+
+    /// core dump 读一页（Linux 的 `get_dump_page`），不检查权限：`PROT_NONE` 的页不在
+    /// 页表里，按 VMA 读宿主内存。写时复制借来的页按页表读拥有者的。文件末尾之后的页
+    /// （一碰宿主就是 SIGBUS）和读不到的页返回 false，在 core 文件里留空洞。
+    pub fn dump_page(&self, addr: u64, buf: &mut [u8]) -> bool {
+        let Some((&s, v)) = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .filter(|&(&s, v)| addr < s + v.file_len.min(v.len))
+        else {
+            return false;
+        };
+        let n = buf.len().min((s + v.file_len - addr) as usize);
+        let host = if self
+            .cow
+            .borrow()
+            .borrowed
+            .contains_key(&(addr & !(PAGE_SIZE - 1)))
+        {
+            match self.mmu.translate(addr, prot::READ) {
+                Some(host) => host.as_ptr(),
+                None => return false,
+            }
+        } else {
+            // SAFETY: addr 落在这个 VMA 有文件内容的部分，宿主内存由它持有
+            unsafe { v.host.as_ptr().add((addr - s) as usize) }
+        };
+        // SAFETY: [host, host + n) 不越过这一页
+        unsafe { std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), n) };
+        buf[n..].fill(0);
+        true
+    }
+
     /// 所有映射，按地址排列；栈、堆和 vDSO 按 Linux 的习惯命名。相邻、权限相同的匿名映射（或者同一个文件里接着的部分）与 Linux 一样合成一段：
     /// 每次匿名 mmap 都是单独的宿主内存，VMA 合不起来，python 跑一会儿就有几百个。
     pub fn regions(&self) -> Vec<Region> {
@@ -2426,6 +2568,7 @@ impl Mm {
                 file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
                 locked: v.locked,
                 may_write: v.may_write,
+                dontdump: v.dontdump,
             }
         });
         for r in regions {
@@ -2440,7 +2583,7 @@ impl Mm {
                 if joins
                     && last.end == r.start
                     && (last.prot, last.shared, last.locked) == (r.prot, r.shared, r.locked)
-                    && last.may_write == r.may_write
+                    && (last.may_write, last.dontdump) == (r.may_write, r.dontdump)
                     && last.name == r.name
                 {
                     last.end = r.end;

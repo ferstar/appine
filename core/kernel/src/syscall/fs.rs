@@ -450,6 +450,42 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
 
 pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
+    let file = open_path(cx, dirfd, path, flags, perm)?;
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
+/// 内核自己新建一个文件（core dump）：相对当前目录，已经存在时是 EEXIST，不跟随符号
+/// 链接，只写打开。
+pub(crate) fn create_exclusive(cx: &mut Cx<'_>, path: &[u8], perm: u32) -> Result<FileRef, Errno> {
+    let flags = oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOFOLLOW | oflags::O_WRONLY;
+    open_path(cx, AT_FDCWD, path.to_vec(), flags, perm)
+}
+
+/// 内核自己删除一个文件（core dump 之前删掉同名的旧文件），相对当前目录。
+pub(crate) fn unlink_path(cx: &mut Cx<'_>, path: &[u8]) -> Result<(), Errno> {
+    unlink(cx, AT_FDCWD, path.to_vec(), 0)
+}
+
+/// 内核自己在 `offset` 处写打开文件（core dump），与 pwrite 相同。
+pub(crate) fn write_at(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    data: &[u8],
+    offset: u64,
+) -> Result<usize, Errno> {
+    write_bytes(cx, file, data, Some(offset))
+}
+
+/// openat 打开（或者新建）`path`，还没有放进 fd 表。
+fn open_path(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: Vec<u8>,
+    flags: u32,
+    perm: u32,
+) -> Result<FileRef, Errno> {
     let vfs = cx.vfs()?;
     let start = start_dir(cx, dirfd, &path)?;
     let create = flags & oflags::O_CREAT != 0;
@@ -535,9 +571,7 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
     if let Some(ino) = opened_ino {
         open_events(cx, &file, ino, parent, was_created, flags);
     }
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
-        .map(|fd| fd as u64)
+    Ok(file)
 }
 
 /// open 的 inotify 事件，顺序与 Linux 相同：新建（报给目录）、`O_TRUNC` 截断、打开。
@@ -1803,6 +1837,10 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
+    unlink(cx, dirfd, path, flags).map(|()| 0)
+}
+
+fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), Errno> {
     let (dir, name) = parent_at(cx, dirfd, &path)?;
     let store_vfs = cx.vfs()?;
     let store = store_vfs.store();
@@ -1847,7 +1885,7 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
             inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
         }
     }
-    Ok(0)
+    Ok(())
 }
 
 /// 去掉了文件 `ino` 的链接 `name`（unlink、被 rename 覆盖）：链接数变了（IN_ATTRIB），

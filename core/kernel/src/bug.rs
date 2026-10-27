@@ -109,6 +109,7 @@ fn segv(k: &Kernel, tgid: Tid) {
             signal: Signal::SEGV,
             pc: None,
             fault_addr: None,
+            core_dumped: false,
         };
         crate::signal::group_exit(k, group, status);
     }

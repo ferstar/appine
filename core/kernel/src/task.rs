@@ -10,7 +10,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use appine_engine::{Access, Cpu, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE, prot};
+use appine_engine::{
+    Access, Cpu, CpuState, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE, prot,
+};
 use appine_hal::Event;
 
 use crate::bug::Trap;
@@ -367,7 +369,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         let what = format_args!("kernel panic while starting the thread");
         crate::bug::kill(&k, &task, cpu.state().pc, what);
         drop(k);
-        return exit(shared, task, cpu.state().pc, None);
+        return exit(shared, task, cpu.state(), None);
     };
     let (sync, tier) = (task.sync.clone(), k.tier);
     // Tier 1 的翻译由这个地址空间里的线程共用。参数只是持有 BKL 的凭证：Mm 只在持有 BKL
@@ -478,7 +480,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             Flow::Exit => break,
         }
     }
-    exit(shared, task, cpu.state().pc, dbt.map(|(d, _)| d.stats()));
+    exit(shared, task, cpu.state(), dbt.map(|(d, _)| d.stats()));
 }
 
 // 合成 esr_context 用的 ESR 字段（ARM ARM D17.2.37）
@@ -655,12 +657,17 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
 ///
 /// 每一步分别兜住内核层的 bug（crate::bug）：出错时结束这个进程，后面的步骤照样做，所以
 /// 线程总会从内核里注销，进程也总会结束，等它的父进程和宿主不会卡住。
-fn exit(shared: &Arc<Shared>, task: Rc<Task>, pc: u64, stats: Option<DbtStats>) {
+fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<DbtStats>) {
+    let pc = state.pc;
     let mut k = shared.lock();
     let (tid, tgid) = (task.tid.get(), task.tgid);
     let group = task.state.borrow().group.clone();
     let released = crate::bug::catch(|| {
         crate::bug::trap(Trap::Exit, tid);
+        // 进程正在写 core 文件：留下寄存器（crate::coredump）
+        if let Some(core) = group.borrow_mut().core.as_mut() {
+            core.push(crate::coredump::ThreadCore::of(&task, state));
+        }
         if let Some(s) = stats {
             let total = k.dbt_stats.get_or_insert_with(DbtStats::default);
             add_stats(total, &s);

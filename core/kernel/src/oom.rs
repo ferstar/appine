@@ -128,6 +128,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
             signal: Signal::KILL,
             pc: None,
             fault_addr: None,
+            core_dumped: false,
         };
         crate::signal::group_exit(k, &victim, status);
     }

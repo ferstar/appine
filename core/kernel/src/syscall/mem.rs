@@ -41,6 +41,8 @@ const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 const MADV_DONTNEED: i32 = 4;
 const MADV_REMOVE: i32 = 9;
 const MADV_FREE: i32 = 8;
+const MADV_DONTDUMP: i32 = 16;
+const MADV_DODUMP: i32 = 17;
 const MADV_WIPEONFORK: i32 = 18;
 const MADV_KEEPONFORK: i32 = 19;
 const MCL_CURRENT: u32 = 1;
@@ -313,6 +315,11 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
         // 其余建议只影响性能，可以忽略；DONTNEED 之后匿名内存必须读回 0
         MADV_DONTNEED => cx.mm_mut().discard(addr, len).map(|()| 0),
         MADV_FREE | MADV_WIPEONFORK | MADV_KEEPONFORK if !private_anon => Err(Errno::EINVAL),
+        // core 文件里写不写（crate::coredump）
+        MADV_DONTDUMP | MADV_DODUMP => cx
+            .mm_mut()
+            .set_dontdump(addr, len, advice == MADV_DONTDUMP)
+            .map(|()| 0),
         _ => Ok(0),
     }
 }

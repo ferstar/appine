@@ -251,6 +251,90 @@ fn exit_status_and_errors_are_propagated() {
 }
 
 #[test]
+fn fatal_signals_write_core_files() {
+    // RLIMIT_CORE 打开时，SIGSEGV 结束的进程在当前目录留下 ELF core 文件（ET_CORE、
+    // aarch64）；限制是 0 时不写；core_pattern 里的 %e、%s 展开成程序名和信号
+    let script = "mkdir -p /tmp/cores && cd /tmp/cores && rm -f core* && ulimit -c unlimited && \
+                  sh -c 'kill -SEGV $$'; echo status $?; od -A n -t x1 -N 4 core; \
+                  od -A n -t d2 -j 16 -N 4 core; rm core; ulimit -c 0; \
+                  sh -c 'kill -SEGV $$'; echo status $?; test -e core && echo present || echo absent; \
+                  ulimit -c unlimited; echo 'core.%e.%s' > /proc/sys/kernel/core_pattern; \
+                  sh -c 'kill -ABRT $$'; ls core.*; cat /proc/self/coredump_filter";
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        let words: Vec<String> = shell(tier, &out)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "status",
+                "139",
+                "7f",
+                "45",
+                "4c",
+                "46",
+                "4",
+                "183",
+                "status",
+                "139",
+                "absent",
+                "core.sh.6",
+                "00000033"
+            ],
+            "tier {tier}"
+        );
+    }
+}
+
+/// 用 musl-gcc 静态编译 tests/guest/<name>.c；没有 musl-gcc 时返回 None。
+fn build_static(name: &str) -> Option<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/guest")
+        .join(format!("{name}.c"));
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("rootfs-{name}"));
+    let status = Command::new("musl-gcc")
+        .args([
+            "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-o",
+        ])
+        .arg(&out)
+        .arg(&src)
+        .status();
+    let Ok(status) = status else {
+        assert!(
+            std::env::var_os("APPINE_REQUIRE_MUSL").is_none_or(|v| v != "1"),
+            "musl-gcc not found; install musl-tools"
+        );
+        eprintln!("skipping {name}: musl-gcc not found");
+        return None;
+    };
+    assert!(status.success(), "compiling {} failed", src.display());
+    Some(out)
+}
+
+#[test]
+fn core_files_have_the_linux_layout() {
+    // 多线程的进程崩溃：core 文件的程序头、MADV_DONTDUMP、每个线程的 note、core_pattern、
+    // RLIMIT_CORE 的截断（tests/guest/coredump.c），程序要拷进仓库里运行
+    let (Some(store), Some(program)) = (store(), build_static("coredump")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/coredump && chmod +x /tmp/coredump && /tmp/coredump";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn missing_or_non_executable_programs_fail_to_start() {
     for (tier, out) in run(&["/bin/no-such-program"]) {
         assert_eq!(out.status.code(), Some(127), "tier {tier}");

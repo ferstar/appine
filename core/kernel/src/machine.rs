@@ -367,6 +367,7 @@ impl Machine {
                         signal: Signal::KILL,
                         pc: None,
                         fault_addr: None,
+                        core_dumped: false,
                     },
                 );
             }

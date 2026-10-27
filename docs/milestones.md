@@ -51,6 +51,7 @@
 | [M9 之前：ptrace 的第一步，strace](rounds/40-ptrace-strace.md) | 2026-10-27 | 系统调用、信号、group-stop 和 `PTRACE_EVENT_*` 的停止，寄存器经由 regset 读写，wait 报告被跟踪的线程；process_vm_readv/writev；strace 能用 |
 | [M9 之前：ptrace 的第二步，gdb](rounds/41-ptrace-gdb.md) | 2026-10-27 | 解释器单步、强制写入被跟踪进程的内存并作废翻译、`/proc/<pid>/mem`、`/proc/<pid>/auxv`；gdb 的断点、单步、软件观察点、`catch syscall` 与原生一致 |
 | [M9 之前：epoll 的边沿](rounds/42-epoll-edges.md) | 2026-10-27 | `EPOLLET` 按 Linux 的唤醒时机：已经就绪时又来了数据也再触发（进程内的对象记数据代数，宿主 socket 用一个边沿触发的宿主 epoll 记新到的数据），tokio 程序（uv）不再卡住；水平触发的 `EPOLLEXCLUSIVE` 一个边沿只让一个 epoll 返回 |
+| [M9 之前：core dump](rounds/43-coredump.md) | 2026-10-27 | 默认动作生成 core 的信号结束进程时按 `core_pattern` 写 ELF core 文件，格式与 arm64 Linux 相同，gdb 可以事后分析；`WCOREDUMP`、`CLD_DUMPED`、`coredump_filter`、`MADV_DONTDUMP`；被结束的线程停在 svc 上；LTP 955 |
 
 ## 测量条件
 

@@ -283,7 +283,7 @@ fn regset_shape(nt: u64) -> Result<(usize, usize), Errno> {
 }
 
 /// regset 的内容。
-fn encode_regset(nt: u64, r: &Regs, syscallno: i32) -> Vec<u8> {
+pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32) -> Vec<u8> {
     let mut b = Vec::new();
     match nt {
         NT_PRSTATUS => {

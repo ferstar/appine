@@ -449,6 +449,14 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - `process_vm_readv`、`process_vm_writev`：权限同上，远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少。
 - 没有硬件断点和观察点，gdb 的观察点靠逐条指令单步。
 
+### 7.7 core dump
+
+- 默认动作是生成 core 的信号（SIGQUIT、SIGILL、SIGTRAP、SIGABRT、SIGBUS、SIGFPE、SIGSEGV、SIGXCPU、SIGXFSZ、SIGSYS）结束进程时，与 Linux 一样：`RLIMIT_CORE` 不小于一页、进程可以 dump（`PR_SET_DUMPABLE`；setuid 程序 execve 之后不可以）才写；先结束其他线程并等它们退出，它们退出时把寄存器留在线程组里（`coredump.rs`）。
+- 文件名按 `/proc/sys/kernel/core_pattern`（默认 `core`，支持 `%p`、`%i`、`%u`、`%g`、`%s`、`%t`、`%h`、`%e`、`%E`、`%c`、`%d`）和 `core_uses_pid`，相对进程的当前目录；先删掉同名的文件再以 0600 新建。管道形式（`|程序`）不支持，不写。与 Linux 一样，写出的字节（空洞不算）到了 `RLIMIT_CORE` 就截断，截断了也算写了。
+- 格式与 arm64 Linux 写的相同，gdb 可以事后分析：每个映射一个 `PT_LOAD`，写多少按 `/proc/<pid>/coredump_filter`（默认 0x33）和 Linux 的 `vma_dump_size`：vDSO 总是写，写过的私有匿名映射和匿名共享内存整个写（没碰过的页留空洞，从来没有可写过的预留不写），私有文件映射可写过的整个写，否则只写 ELF 文件的第一页。`PT_NOTE` 里每个线程有 `NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`、`NT_ARM_SYSTEM_CALL`，产生信号的线程在最前面，后面接着进程的 `NT_PRPSINFO`、`NT_SIGINFO`、`NT_AUXV`、`NT_FILE`。
+- 建成了 core 文件的进程，wait 的状态带 `WCOREDUMP`，SIGCHLD 和 waitid 的 `si_code` 是 `CLD_DUMPED`。
+- 与 Linux 的 `do_signal` 一样，阻塞在系统调用里被结束的线程先按"重新执行"把 pc 退回 svc、x0 恢复成原来的参数再结束，core 文件和 `PTRACE_EVENT_EXIT` 看到的都是这样。`MADV_DONTDUMP` 的映射不写（smaps 的 `dd`）。
+
 ---
 
 ## 8. 文件系统
@@ -705,7 +713,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 未开始 | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
 
-M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace、epoll 的边沿触发，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
+M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace、epoll 的边沿触发、core dump，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 
 ### 14.2 排序依据
 

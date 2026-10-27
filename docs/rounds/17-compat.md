@@ -26,6 +26,6 @@
 **推迟项**：
 
 - pidfd：`PIDFD_THREAD`、`/proc/sys/kernel/ns_last_pid`（pidfd_send_signal03 要用它让新进程拿到同一个 pid）。→ `ns_last_pid` 已补上（M9 之前：推迟项）；`PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做
-- 不产生 core dump，`WCOREDUMP` 总是 0（waitid10）。
+- 不产生 core dump，`WCOREDUMP` 总是 0（waitid10）。→ 已补上（M9 之前：core dump）
 - getrusage 的 `ru_maxrss` 总是 0（getrusage03）。→ 已补上（M9 之前：剩下的小缺口）
 - `MREMAP_DONTUNMAP` 不支持文件映射；没有 `/proc/net/{icmp,raw}`。→ 都已补上（M9 之前：推迟项）

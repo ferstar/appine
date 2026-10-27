@@ -114,6 +114,8 @@ pub(crate) mod code {
     pub const CLD_EXITED: i32 = 1;
     /// 子进程被信号终止。
     pub const CLD_KILLED: i32 = 2;
+    /// 子进程被信号终止，写了 core 文件。
+    pub const CLD_DUMPED: i32 = 3;
     /// 被跟踪的线程停在 ptrace-stop 里。
     pub const CLD_TRAPPED: i32 = 4;
     /// 子进程停止。
@@ -199,7 +201,18 @@ impl SigInfo {
     pub fn child(pid: Tid, status: ExitStatus) -> SigInfo {
         let (code, status) = match status {
             ExitStatus::Exited(c) => (code::CLD_EXITED, c),
-            ExitStatus::Signaled { signal, .. } => (code::CLD_KILLED, signal.number()),
+            ExitStatus::Signaled {
+                signal,
+                core_dumped,
+                ..
+            } => {
+                let code = if core_dumped {
+                    code::CLD_DUMPED
+                } else {
+                    code::CLD_KILLED
+                };
+                (code, signal.number())
+            }
         };
         Self::child_event(pid, code, status)
     }
@@ -482,6 +495,7 @@ fn killed_by(sig: Signal) -> ExitStatus {
         signal: sig,
         pc: None,
         fault_addr: None,
+        core_dumped: false,
     }
 }
 
@@ -785,10 +799,9 @@ fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
 ///
 /// `syscall` 为 true 表示刚处理完一个 syscall，x0 是它的返回值。
 pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
-    if cx.task.killed.get() {
-        return Flow::Exit;
-    }
-    // (重启码, syscall 之后的 pc)：先按"重新执行"准备好，有处理函数时再按规则改回 EINTR
+    // (重启码, syscall 之后的 pc)：先按"重新执行"准备好，有处理函数时再按规则改回 EINTR。
+    // 与 Linux 的 do_signal 一样在看线程是否被结束之前做：被结束的线程停在 svc 上、x0 是
+    // 原来的参数，core 文件和 PTRACE_EVENT_EXIT 看到的就是这样
     let mut restart = None;
     if syscall {
         let st = cpu.state_mut();
@@ -806,6 +819,9 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             st.x[0] = st.orig_x0;
             st.pc -= 4;
         }
+    }
+    if cx.task.killed.get() {
+        return Flow::Exit;
     }
     // 线程组被别的线程停住了：在返回 guest 之前一起停下。被跟踪的停在 ptrace-stop 里报告
     // 给跟踪者，跟踪者用 PTRACE_INTERRUPT 要它停的也在这里停（crate::ptrace）
@@ -851,15 +867,26 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
                 continue;
             }
             SigAction::DEFAULT => {
-                let status = ExitStatus::Signaled {
+                let mut status = ExitStatus::Signaled {
                     signal: sig,
                     pc: matches!(info.fields, InfoFields::Fault { .. }).then_some(cpu.state().pc),
                     fault_addr: info
                         .fault_addr()
                         .filter(|_| sig == Signal::SEGV || sig == Signal::BUS),
+                    core_dumped: false,
                 };
                 let group = cx.t.group.clone();
+                // 别的线程已经在结束整个进程时（exit_group、另一个致命信号）不写 core
+                let first = group.borrow().exiting.is_none();
                 group_exit(cx.k(), &group, status);
+                if first
+                    && crate::coredump::dumps_core(sig)
+                    && crate::coredump::dump(cx, cpu.state(), sig, &info)
+                    && let ExitStatus::Signaled { core_dumped, .. } = &mut status
+                {
+                    *core_dumped = true;
+                    group.borrow_mut().exiting = Some(status);
+                }
                 crate::ptrace::exit(cx, cpu, status);
                 return Flow::Exit;
             }

@@ -279,6 +279,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.cred = parent.cred.clone();
         g.personality = parent.personality;
         g.thp_disable = parent.thp_disable;
+        g.coredump_filter = parent.coredump_filter;
         g.ctty = parent.ctty.clone();
         g.exe = parent.exe.clone();
         g.exit_signal = args.exit_signal;
@@ -1327,6 +1328,7 @@ mod tests {
             signal: Signal::TERM,
             pc: None,
             fault_addr: None,
+            core_dumped: false,
         };
         assert_eq!(killed.wait_status(), 15);
     }

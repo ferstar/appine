@@ -169,6 +169,7 @@ fn main() -> ExitCode {
             signal,
             pc,
             fault_addr,
+            ..
         } => {
             match (pc, fault_addr) {
                 (Some(pc), Some(addr)) => {

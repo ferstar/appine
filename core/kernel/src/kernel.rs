@@ -174,6 +174,9 @@ pub(crate) struct Kernel {
     /// [`UTS_LEN`] 字节。
     pub hostname: Vec<u8>,
     pub domainname: Vec<u8>,
+    /// `/proc/sys/kernel/core_pattern`、`core_uses_pid`（`crate::coredump`）。
+    pub core_pattern: Vec<u8>,
+    pub core_uses_pid: bool,
     /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
     pub pipe_max_size: usize,
     /// `/proc/sys/fs/nr_open`：fd 的上限（`RLIMIT_NOFILE` 不能超过它）。
@@ -245,6 +248,8 @@ impl Kernel {
             fifos: BTreeMap::new(),
             seals: BTreeMap::new(),
             hostname: b"localhost".to_vec(),
+            core_pattern: b"core".to_vec(),
+            core_uses_pid: false,
             domainname: b"(none)".to_vec(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,

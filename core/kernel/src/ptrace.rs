@@ -95,7 +95,7 @@ pub(crate) struct Regs {
 }
 
 impl Regs {
-    fn save(s: &CpuState) -> Regs {
+    pub(crate) fn save(s: &CpuState) -> Regs {
         Regs {
             x: s.x,
             sp: s.sp,

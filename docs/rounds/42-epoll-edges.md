@@ -1,6 +1,6 @@
 # M9 之前：epoll 的边沿（2026-10-27）
 
-← [M9 之前：ptrace 的第二步，gdb（2026-10-27）](41-ptrace-gdb.md) · [索引](../milestones.md)
+← [M9 之前：ptrace 的第二步，gdb（2026-10-27）](41-ptrace-gdb.md) · [索引](../milestones.md) · [M9 之前：core dump（2026-10-27）](43-coredump.md) →
 
 评估内核兼容性还剩哪些值得做时实测发现，[M8](10-m8.md) 起 `EPOLLET` 的近似会让 tokio 写的程序卡住：`uv pip install --offline` 在 appine 里一直不结束，原生 0 秒。卡住时三个线程都在睡，uv 的 eventfd 以 `EPOLLET | EPOLLIN | EPOLLRDHUP` 关注，计数是 2：写过两次、一次也没有读。mio（tokio 的底层）的唤醒器在 epoll 上从来不读走 eventfd 的计数，靠的是 Linux 每次写都让边沿触发的关注再报告一次；原来的近似只在某一位从未就绪变成就绪、或者程序用完数据时才触发，第二次唤醒就丢了。一个小程序对照下来，eventfd、管道、AF_UNIX、TCP 都是这样：已经可读、没有读完时又来了数据，Linux 每次都报告，appine 不报告。这一轮按 Linux 唤醒等待队列的时机重做 `EPOLLET`，顺带让水平触发的 `EPOLLEXCLUSIVE` 也只报告给一个 epoll（§10）。
 
