@@ -18,6 +18,10 @@
 //! 不是被 futex 唤醒、也没到期就醒了（多半是来了信号）时，交给持有 BKL 的路径重新做，
 //! 由它处理信号和重新开始。
 //!
+//! 有 seccomp 的线程只有两种系统调用走这里：过滤器对这个编号总是返回 ALLOW 的（按编号缓存，
+//! [`crate::seccomp::always_allowed`]），以及 vDSO 里读时钟的（Linux 上不进内核，不检查）。
+//! 别的交给持有 BKL 的路径检查。
+//!
 //! 线程在持有 BKL 时记下自己的根目录、当前目录和凭据（[`Fast`]）。它们可能被别的线程
 //! 改掉（`CLONE_FS` 共享的 chdir、线程组共享的凭据），改的一方让
 //! [`Shared::fast_changed`] 的计数加一，记下的就作废了。
@@ -59,6 +63,8 @@ pub(crate) struct Fast {
     /// 地址空间里可以写的共享文件映射所在的范围（[`crate::mm::Mm::shared_files`]）：那里
     /// futex 的键不是宿主地址。
     shared_files: Arc<RwLock<Vec<(u64, u64)>>>,
+    /// vDSO 映射的地址（换地址空间的 execve 让 [`Shared::fast_epoch`] 变了）。
+    vdso: u64,
 }
 
 struct Paths {
@@ -93,6 +99,7 @@ impl Fast {
             tid: task.tid.get(),
             cpu_clock: task.clock.get().map(|c| (c, task.cpu_base.get().0)),
             shared_files: t.mm.borrow().shared_files(),
+            vdso: t.mm.borrow().vdso,
         }
     }
 
@@ -113,7 +120,7 @@ impl Fast {
             || cpu.state().ivau_page != 0
             || task.syscall_traced.load(Ordering::Relaxed)
             || task.stepping.load(Ordering::Relaxed)
-            || task.seccomp_on.load(Ordering::Relaxed)
+            || !self.seccomp_allows(task, cpu)
         {
             return false;
         }
@@ -125,6 +132,17 @@ impl Fast {
             Err(e) => e.to_syscall_return(),
         };
         true
+    }
+
+    /// 有 seccomp 时不检查也能执行的：vDSO 里读时钟的存根（Linux 上它们不进内核），以及过滤器
+    /// 对这个编号总是返回 ALLOW 的（[`crate::seccomp::always_allowed`]）。
+    fn seccomp_allows(&self, task: &Task, cpu: &Cpu) -> bool {
+        if !task.seccomp_on.load(Ordering::Relaxed) {
+            return true;
+        }
+        let s = cpu.state();
+        crate::vdso::clock_stub_at(self.vdso, s.pc, s.x[8])
+            || crate::seccomp::always_allowed(task, s.x[8])
     }
 
     fn dispatch(&self, shared: &Shared, task: &Task, cpu: &Cpu) -> Option<SysResult> {

@@ -15,10 +15,16 @@
 //! 程序的检查与 Linux 相同：先按 cBPF 的规则（`bpf_check_classic`），再按 seccomp 的
 //! （`seccomp_check_filter`，只能读 `seccomp_data` 里对齐的字，不能读包）。执行用一个简单
 //! 的解释器，结果与 Linux 的 JIT 相同：移位按 32 取模，除以 0 时程序返回 0。
+//!
+//! 与 Linux 一样按编号缓存（`seccomp_cache`）：装过滤器时把程序当作只知道编号和架构来模拟
+//! 一遍（[`const_allow`]），对哪些编号总是返回 ALLOW 记在位图里，与上一个过滤器的位图按位与。
+//! 这些系统调用不再运行链上的程序。线程把位图另存一份原子的（[`publish`]），不持 BKL 的
+//! 快速路径（`syscall::fast`）对这些编号照常走。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use appine_engine::Cpu;
 use appine_hal::Event;
@@ -82,6 +88,10 @@ const MAX_INSNS: usize = 4096;
 const MAX_INSNS_PER_PATH: usize = (1 << 18) / 8;
 /// `struct seccomp_data` 的大小。
 const DATA_SIZE: usize = 64;
+/// 按编号缓存的位图覆盖多少个编号（Linux 是 arm64 的系统调用个数，这里取 512，appine 实现的
+/// 编号都在里面），以及它有几个字。
+const CACHED_NRS: usize = 512;
+pub(crate) const CACHE_WORDS: usize = CACHED_NRS / 64;
 /// SIGSYS 的 `si_code`。
 const SYS_SECCOMP: i32 = 1;
 /// ERRNO 的数据最大是 `MAX_ERRNO`。
@@ -393,6 +403,57 @@ fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
     }
 }
 
+/// 只知道编号 `nr` 和架构时，程序是不是一定返回 ALLOW（Linux 的 `seccomp_is_const_allow`）：
+/// 只读编号和架构，只有与常数比较的跳转、无条件跳转和与常数按位与。读别的数据、用别的指令的
+/// 都不算，返回值要正好是 ALLOW（带数据的不算）。
+fn const_allow(prog: &[Insn], nr: u32) -> bool {
+    use bpf::*;
+    let mut a = 0u32;
+    let mut pc = 0;
+    while let Some(i) = prog.get(pc) {
+        pc += 1;
+        match i.code {
+            LOAD_DATA => match i.k {
+                0 => a = nr,
+                4 => a = AUDIT_ARCH_AARCH64,
+                _ => return false,
+            },
+            c if c == RET | K => return i.k == ret::ALLOW,
+            c if c == JMP | JA => pc += i.k as usize,
+            c if conditional(c) && c & X == 0 => {
+                let taken = match c & 0xf0 {
+                    JEQ => a == i.k,
+                    JGT => a > i.k,
+                    JGE => a >= i.k,
+                    _ => a & i.k != 0,
+                };
+                pc += if taken { i.jt } else { i.jf } as usize;
+            }
+            c if c == ALU | AND | K => a &= i.k,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// 新过滤器的位图（Linux 的 `seccomp_cache_prepare_bitmap`）：上一个过滤器的位图里有（没有
+/// 上一个时是所有编号）、这个程序也总是返回 ALLOW 的编号。
+fn cache(prog: &[Insn], prev: Option<&[u64; CACHE_WORDS]>) -> [u64; CACHE_WORDS] {
+    let mut allow = prev.copied().unwrap_or([u64::MAX; CACHE_WORDS]);
+    for nr in 0..CACHED_NRS {
+        let bit = 1 << (nr % 64);
+        if allow[nr / 64] & bit != 0 && !const_allow(prog, nr as u32) {
+            allow[nr / 64] &= !bit;
+        }
+    }
+    allow
+}
+
+/// 位图（每个字由 `word` 给出）里有没有编号 `nr`。
+fn cached(word: impl Fn(usize) -> u64, nr: u64) -> bool {
+    nr < CACHED_NRS as u64 && word(nr as usize / 64) >> (nr % 64) & 1 != 0
+}
+
 /// `struct seccomp_data`：编号、架构、svc 之后的 pc 和六个参数（第一个是原来的 x0）。
 fn seccomp_data(nr: i32, pc: u64, args: [u64; 6]) -> [u8; DATA_SIZE] {
     let mut d = [0u8; DATA_SIZE];
@@ -412,6 +473,9 @@ pub(crate) struct Filter {
     prog: Box<[Insn]>,
     /// Linux 转换成 eBPF 后的长度（链容量计数用）。
     converted_len: usize,
+    /// 按编号缓存（Linux 的 `seccomp_cache`）：这条链（这个过滤器和它往上的）对哪些编号总是
+    /// 返回 ALLOW（[`cache`]）。
+    allow: [u64; CACHE_WORDS],
     /// 原样的程序（PTRACE_SECCOMP_GET_FILTER 读的）。
     orig: Box<[u8]>,
     /// `SECCOMP_FILTER_FLAG_LOG`：除了 ALLOW 以外的动作都记一笔。
@@ -432,6 +496,11 @@ impl Filter {
     /// 通知 fd 的唤醒对象：来了通知、通知被取走、没有用户了。
     fn object(&self) -> wake::Object {
         wake::of(&self.notif)
+    }
+
+    /// 这条链对编号 `nr` 总是返回 ALLOW。
+    fn always_allows(&self, nr: u64) -> bool {
+        cached(|i| self.allow[i], nr)
     }
 
     /// 从自己往上的一条链。
@@ -634,6 +703,7 @@ pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
         (mode::STRICT, _) => {
             log(cx, nr, Signal::KILL.number(), ret::KILL_THREAD, true);
             cx.task.seccomp.borrow_mut().mode = mode::DEAD;
+            publish(cx.task);
             exit_thread(cx, cpu, Signal::KILL)
         }
         // 已经被要求结束的线程又进了内核（Linux 也不应该走到这里）
@@ -674,6 +744,10 @@ fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
 /// 过滤模式：在链上运行过滤器，执行结果的动作（Linux 的 `__seccomp_filter`）。`recheck`
 /// 是跟踪者处理过 TRACE 之后的重新检查：这次 TRACE 当作允许。
 fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bool) -> Verdict {
+    // 缓存说总是 ALLOW 的不运行程序（Linux 的 seccomp_cache_check_allow）
+    if top.always_allows(nr) {
+        return Verdict::Run(nr);
+    }
     let data = {
         let s = cpu.state();
         let args = [s.orig_x0, s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]];
@@ -733,6 +807,7 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
         _ => {
             log(cx, nr, Signal::SYS.number(), action, true);
             cx.task.seccomp.borrow_mut().mode = mode::DEAD;
+            publish(cx.task);
             if action != ret::KILL_THREAD || cx.t.group.borrow().threads.len() == 1 {
                 cpu.state_mut().x[0] = cpu.state().orig_x0;
                 signal::force_fatal(cx, Signal::SYS, sigsys(cpu, nr, value));
@@ -981,9 +1056,7 @@ fn set_strict(cx: &mut Cx<'_>) -> Result<u64, Errno> {
     }
     s.mode = mode::STRICT;
     drop(s);
-    cx.task
-        .seccomp_on
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    publish(cx.task);
     Ok(0)
 }
 
@@ -1084,8 +1157,10 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
             return Ok(t.tid.get() as u64);
         }
     }
+    let allow = cache(&prog, prev.as_ref().map(|p| &p.allow));
     let filter = Rc::new(Filter {
         converted_len,
+        allow,
         prog: prog.into_boxed_slice(),
         orig: orig.into_boxed_slice(),
         log: flags & flag::LOG != 0,
@@ -1108,12 +1183,13 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     let chain = Chain(Some(filter.clone()));
     if flags & flag::TSYNC != 0 {
         for t in &others {
-            let mut s = t.seccomp.borrow_mut();
-            s.mode = mode::FILTER;
-            // 换下来的那条在 drop 时减掉它的用户数
-            s.chain = Some(chain.clone());
-            t.seccomp_on
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut s = t.seccomp.borrow_mut();
+                s.mode = mode::FILTER;
+                // 换下来的那条在 drop 时减掉它的用户数
+                s.chain = Some(chain.clone());
+            }
+            publish(t);
         }
     }
     {
@@ -1121,9 +1197,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         s.mode = mode::FILTER;
         s.chain = Some(chain);
     }
-    cx.task
-        .seccomp_on
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    publish(cx.task);
     match fd {
         Some(fd) => {
             let file = OpenFile::new(FileKind::SeccompNotify(Listener(filter)), oflags::O_RDWR);
@@ -1132,6 +1206,28 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         }
         None => Ok(0),
     }
+}
+
+/// 线程的 seccomp 变了（装了过滤器、TSYNC、clone、要结束它）：更新不持 BKL 时看的
+/// [`Task::seccomp_on`] 和放行位图 [`Task::seccomp_allow`]。只有过滤模式有位图。
+pub(crate) fn publish(task: &Task) {
+    let s = task.seccomp.borrow();
+    let allow = match (s.mode, &s.chain) {
+        (mode::FILTER, Some(c)) => c.filter().allow,
+        _ => [0; CACHE_WORDS],
+    };
+    for (w, bits) in task.seccomp_allow.iter().zip(allow) {
+        w.store(bits, Ordering::Relaxed);
+    }
+    task.seccomp_on
+        .store(s.mode != mode::DISABLED, Ordering::Relaxed);
+}
+
+/// 不持 BKL 时：线程的过滤器对编号 `nr` 总是返回 ALLOW（[`publish`] 的位图）。别的线程 TSYNC
+/// 时可能正在改它，读到的旧位是同步之前那条链的（新链只会更严），相当于这个系统调用发生在
+/// 同步之前。
+pub(crate) fn always_allowed(task: &Task, nr: u64) -> bool {
+    cached(|i| task.seccomp_allow[i].load(Ordering::Relaxed), nr)
 }
 
 /// 通知的 id 从一个随机数开始（与 Linux 一样，让监管进程不能猜别的通知）。
@@ -1499,5 +1595,69 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(run(&shift, &data), 2);
+    }
+
+    #[test]
+    fn the_cache_keeps_only_constant_allows() {
+        use bpf::*;
+        let allowed = |allow: &[u64; CACHE_WORDS], nr: u64| cached(|i| allow[i], nr);
+        // 先看架构，再按编号：98 返回 ERRNO，400 及以上 TRAP，别的 ALLOW
+        let by_nr = prepared(vec![
+            insn(LD | W | ABS, 0, 0, 4),
+            insn(JMP | JEQ | K, 1, 0, AUDIT_ARCH_AARCH64),
+            insn(RET | K, 0, 0, ret::KILL_PROCESS),
+            insn(LD | W | ABS, 0, 0, 0),
+            insn(JMP | JEQ | K, 2, 0, 98),
+            insn(JMP | JGE | K, 2, 0, 400),
+            insn(RET | K, 0, 0, ret::ALLOW),
+            insn(RET | K, 0, 0, ret::ERRNO | 1),
+            insn(RET | K, 0, 0, ret::TRAP),
+        ])
+        .unwrap();
+        let c = cache(&by_nr, None);
+        assert!(allowed(&c, 0) && allowed(&c, 97) && allowed(&c, 399));
+        assert!(!allowed(&c, 98) && !allowed(&c, 400) && !allowed(&c, 511));
+        // 编号以外的数据（这里是第一个参数）不是常数：98 要运行程序，别的仍是常数
+        let by_arg = prepared(vec![
+            insn(LD | W | ABS, 0, 0, 0),
+            insn(JMP | JEQ | K, 0, 2, 98),
+            insn(LD | W | ABS, 0, 0, 16),
+            insn(JMP | JSET | K, 1, 0, 1),
+            insn(RET | K, 0, 0, ret::ALLOW),
+            insn(RET | K, 0, 0, ret::ERRNO | 1),
+        ])
+        .unwrap();
+        let c = cache(&by_arg, None);
+        assert!(!allowed(&c, 98) && allowed(&c, 99));
+        // 按位与之后比较、无条件跳转
+        let masked = prepared(vec![
+            insn(LD | W | ABS, 0, 0, 0),
+            insn(ALU | AND | K, 0, 0, 0xf),
+            insn(JMP | JEQ | K, 1, 0, 3),
+            insn(JMP | JA, 0, 0, 1),
+            insn(RET | K, 0, 0, ret::LOG),
+            insn(RET | K, 0, 0, ret::ALLOW),
+        ])
+        .unwrap();
+        let c = cache(&masked, None);
+        assert!(!allowed(&c, 3) && !allowed(&c, 19) && allowed(&c, 4));
+        // 返回值要正好是 ALLOW；RET A、别的指令都不算
+        let data = prepared(vec![insn(RET | K, 0, 0, ret::ALLOW | 1)]).unwrap();
+        assert!(!allowed(&cache(&data, None), 0));
+        let ret_a = prepared(vec![
+            insn(LD | IMM, 0, 0, ret::ALLOW),
+            insn(RET | A, 0, 0, 0),
+        ])
+        .unwrap();
+        assert!(!allowed(&cache(&ret_a, None), 0));
+        // 新的过滤器总是放行，也不放开上一个不放行的
+        let all = prepared(vec![insn(RET | K, 0, 0, ret::ALLOW)]).unwrap();
+        let c = cache(&all, Some(&cache(&by_nr, None)));
+        assert!(!allowed(&c, 98) && allowed(&c, 97));
+        // 位图之外的编号、负数都要运行程序
+        assert!(
+            !allowed(&cache(&all, None), CACHED_NRS as u64)
+                && !allowed(&cache(&all, None), u64::MAX)
+        );
     }
 }

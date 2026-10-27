@@ -346,9 +346,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     task.timerslack.set((slack, slack));
     // seccomp 的模式和过滤器链与 Linux 一样继承
     let seccomp = cx.task.seccomp.borrow().clone();
-    task.seccomp_on
-        .store(seccomp.mode != 0, std::sync::atomic::Ordering::Relaxed);
     *task.seccomp.borrow_mut() = seccomp;
+    crate::seccomp::publish(&task);
     // 被跟踪的线程 clone 出来的可能也被跟踪（crate::ptrace）
     let traced = crate::ptrace::clone(cx.task, &task, flags, args.exit_signal);
 

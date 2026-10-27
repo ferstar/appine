@@ -1,6 +1,6 @@
 # M9 之前：seccomp（2026-10-28）
 
-← [M9 之前：cgroup v2 的视图（2026-10-27）](58-cgroup.md) · [索引](../milestones.md)
+← [M9 之前：cgroup v2 的视图（2026-10-27）](58-cgroup.md) · [索引](../milestones.md) · [M9 之前：seccomp 的缓存和快速路径（2026-10-28）](60-seccomp-cache.md) →
 
 原来 guest 不能自己装 seccomp 过滤器（§11.1）：`prctl(PR_SET_SECCOMP)` 做完参数和权限检查之后返回 EINVAL，`seccomp(2)` 是 ENOSYS。用 seccomp 给自己加沙箱的程序要么报错，要么不带沙箱运行；靠 `SECCOMP_RET_TRACE` 的 `strace --seccomp-bpf`、靠通知 fd 代办系统调用的监管程序也用不了。这一轮在内核层实现 seccomp（`seccomp.rs`），行为按 Linux 6.1。
 
@@ -62,9 +62,9 @@
 **推迟项**：
 
 - 记一笔只写 appine 的调试日志，没有 audit。
-- 没有 Linux 的按编号缓存（`seccomp_cache`：算出某个编号总是 ALLOW 时不再运行程序），每次系统调用都运行整条链。
-- 有 seccomp 的线程没有不持 BKL 的快速路径，vDSO 里读时钟也进了持 BKL 的路径（见上面的开销）。做了按编号缓存之后，缓存说总是 ALLOW 的编号可以照常走快速路径。
-- 解释器没有优化（每条指令约 4.5 纳秒，按操作码顺序比较），Linux 用 JIT。
+- 没有 Linux 的按编号缓存（`seccomp_cache`：算出某个编号总是 ALLOW 时不再运行程序），每次系统调用都运行整条链。→ 已补上（M9 之前：seccomp 的缓存和快速路径）
+- 有 seccomp 的线程没有不持 BKL 的快速路径，vDSO 里读时钟也进了持 BKL 的路径（见上面的开销）。做了按编号缓存之后，缓存说总是 ALLOW 的编号可以照常走快速路径。→ 已补上：缓存说总是 ALLOW 的编号和 vDSO 里读时钟照常走快速路径（M9 之前：seccomp 的缓存和快速路径）；别的编号仍要持 BKL 检查
+- 解释器没有优化（每条指令约 4.5 纳秒，按操作码顺序比较），Linux 用 JIT。→ 有了按编号缓存，常见的过滤器放行的编号不再运行程序（M9 之前：seccomp 的缓存和快速路径）；解释器本身仍没有优化
 - 没有 seccomp 的线程：跟踪者在系统调用中途的停止（fork、clone 的 `PTRACE_EVENT_*`）改用 PTRACE_SYSCALL 继续时，Linux 也在出口停，这里只有入口停过的才停。
 - vDSO 的存根对所有时钟都不检查：Linux 的 vDSO 只处理 REALTIME、MONOTONIC 这几种，进程、线程的 CPU 时钟退回真正的系统调用，过滤器看得到。
 - TRACE 停住之后重新检查用的是停住之前的那条链；Linux 重新读线程当前的，只有停住期间别的线程 TSYNC 了才不同。

@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use appine_engine::{
     Access, Cpu, CpuState, Dbt, DbtStats, Exit, FaultKind, Kicker, PAGE_SIZE, prot,
@@ -116,8 +116,12 @@ pub(crate) struct Task {
     exit_started: Cell<bool>,
     /// seccomp 的状态（[`crate::seccomp`]），只在持有 BKL 时访问。
     pub seccomp: RefCell<crate::seccomp::Seccomp>,
-    /// 线程有 seccomp：系统调用都交给持有 BKL 的路径检查（`syscall::fast` 不持 BKL 时读它）。
+    /// 线程有 seccomp：系统调用要先检查（`syscall::fast` 不持 BKL 时读它）。由
+    /// [`crate::seccomp::publish`] 随 `seccomp` 更新。
     pub seccomp_on: AtomicBool,
+    /// 过滤器对哪些编号总是返回 ALLOW（[`crate::seccomp::always_allowed`]）：这些系统调用照常
+    /// 走不持 BKL 的路径。由 [`crate::seccomp::publish`] 随 `seccomp` 更新。
+    pub seccomp_allow: [AtomicU64; crate::seccomp::CACHE_WORDS],
     /// 跟踪者用 PTRACE_SINGLESTEP 让它继续了：运行循环每次只让解释器执行一条指令
     /// （[`crate::ptrace::step_done`]），不持 BKL 时读它。
     pub stepping: AtomicBool,
@@ -199,6 +203,7 @@ impl Task {
             exit_started: Cell::new(false),
             seccomp: RefCell::default(),
             seccomp_on: AtomicBool::new(false),
+            seccomp_allow: [const { AtomicU64::new(0) }; crate::seccomp::CACHE_WORDS],
             stepping: AtomicBool::new(false),
             step_again: AtomicBool::new(false),
             state: RefCell::new(state),

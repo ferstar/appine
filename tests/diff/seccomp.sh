@@ -600,6 +600,70 @@ static void fast_path(void)
         }
         wait_for(pid);
     }
+
+    /* 按编号缓存（Linux 的 seccomp_cache）只记总是返回 ALLOW 的编号：看参数的、上一个过滤器
+       不放行的、返回别的动作的都要运行程序。appine 里这些编号照常走快速路径 */
+    pid_t pid = fork();
+    if (pid == 0) {
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        struct sock_filter f[] = {
+            STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+            JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_futex, 0, 3),
+            STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+            JUMP(BPF_JMP | BPF_JEQ | BPF_K, 1 /* FUTEX_WAKE */, 0, 1),
+            STMT(BPF_RET | BPF_K, RET_ERRNO | 77),
+            STMT(BPF_RET | BPF_K, RET_ALLOW),
+        };
+        struct sock_fprog p = {6, f};
+        sys_seccomp(1, 0, &p);
+        static int word;
+        result("futex wake, filtered by its argument", syscall(SYS_futex, &word, 1, 1, 0, 0, 0));
+        result("futex wake private", syscall(SYS_futex, &word, 129, 1, 0, 0, 0));
+        _exit(0);
+    }
+    wait_for(pid);
+    pid = fork();
+    if (pid == 0) {
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        install(SYS_futex, RET_ERRNO | 77, 0);
+        struct sock_filter all[] = {STMT(BPF_RET | BPF_K, RET_ALLOW)};
+        struct sock_fprog p = {1, all};
+        sys_seccomp(1, 0, &p);
+        static int word;
+        result("futex under a newer allow-all filter", syscall(SYS_futex, &word, 1, 1, 0, 0, 0));
+        _exit(0);
+    }
+    wait_for(pid);
+    pid = fork();
+    if (pid == 0) {
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        install(SYS_clock_getres, RET_TRAP, 0);
+        struct timespec ts;
+        syscall(SYS_clock_getres, CLOCK_MONOTONIC, &ts);
+        _exit(0);
+    }
+    printf("trap on clock_getres: %s\n", describe(wait_for(pid)));
+    /* 像 Chromium 那样按时钟过滤 clock_gettime：直接调用的被过滤，经由 vDSO 的不检查 */
+    pid = fork();
+    if (pid == 0) {
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        struct sock_filter f[] = {
+            STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+            JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clock_gettime, 0, 3),
+            STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+            JUMP(BPF_JMP | BPF_JEQ | BPF_K, CLOCK_MONOTONIC, 0, 1),
+            STMT(BPF_RET | BPF_K, RET_ERRNO | 77),
+            STMT(BPF_RET | BPF_K, RET_ALLOW),
+        };
+        struct sock_fprog p = {6, f};
+        sys_seccomp(1, 0, &p);
+        struct timespec ts;
+        result("clock_gettime monotonic, filtered by the clock", syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts));
+        result("clock_gettime realtime", syscall(SYS_clock_gettime, CLOCK_REALTIME, &ts));
+        result("  monotonic through the vDSO", clock_gettime(CLOCK_MONOTONIC, &ts));
+        _exit(0);
+    }
+    wait_for(pid);
 }
 
 static void inherit(void)
