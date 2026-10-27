@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile};
-use crate::kernel::{Cx, Kernel, request_wake};
+use crate::kernel::{Cx, Kernel, request_wake_locks, wake};
 use crate::process::Signal;
 use crate::signal::{InfoFields, SigInfo};
 use crate::vfs::store::Ino;
@@ -103,7 +103,7 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
         let i = mine.ok_or(Errno::EAGAIN)?;
         list.remove(i);
         prune(k, ino);
-        request_wake();
+        request_wake_locks();
         return Ok(());
     }
     let others = list.iter().filter(|l| !l.is(file)).count();
@@ -142,7 +142,7 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
             if list[i].breaking.is_some_and(|(target, _)| arg <= target) {
                 list[i].breaking = None;
             }
-            request_wake();
+            request_wake_locks();
         }
         None => {
             file.borrow_mut().holds_locks = true;
@@ -272,6 +272,7 @@ pub(super) fn break_leases(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(next, &mut [])?;
+        // 持有者降级、放弃租约或者关闭文件时请求 wake::LOCK
+        cx.wait_on(next, &mut [], wake::LOCK)?;
     }
 }

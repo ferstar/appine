@@ -61,6 +61,7 @@
 | [M9 之前：Tier 1 里的观察点](rounds/50-watchpoints-tier1.md) | 2026-10-27 | 有硬件观察点的线程照常用 Tier 1，只有被观察的页上的访问交给解释器（被观察的页不进 TLB）；gdb 里用 `watch` 等变量被写从 10.8 秒降到 0.45 秒 |
 | [M9 之前：起进程和设定时器不再叫醒所有人](rounds/51-spawn-timer-wakeups.md) | 2026-10-27 | vfork（`posix_spawn`）的子进程 execve 或退出时只叫醒父进程，setitimer、timer_settime 只叫醒定时器线程，signalfd 改掩码只叫醒等它的线程；原来都叫醒所有等待者 |
 | [M9 之前：signalfd 看调用的线程](rounds/52-signalfd-caller.md) | 2026-10-27 | signalfd 的 poll、epoll 与读一样看调用的线程和它的进程挂起的信号（原来看创建它的线程）：发给别的线程的信号不再让它报告可读却读不到，fork 出来的子进程看自己的 |
+| [M9 之前：锁和宿主 socket 只叫醒等它们的线程](rounds/53-locks-host-sockets.md) | 2026-10-27 | 文件锁、租约、f_pos 锁改走自己的通道，关闭宿主 socket、DNS 存根和 netlink 的回答只叫醒等这个 socket 的线程，阻塞在宿主 socket 上的收发只登记自己：有 8 个空等的进程时 flock 一次 10 → 0.2 微秒、TCP 建立连接再关闭 45–53 → 14–16 微秒，有阻塞在 recv 里的空等进程时管道读写 6.8 → 0.3 微秒；修了 flock 降级不叫醒等锁的一方 |
 
 ## 测量条件
 

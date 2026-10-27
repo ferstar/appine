@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, put, unix};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
-use crate::kernel::{Cx, request_wake_files};
+use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
     SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
@@ -97,9 +97,12 @@ fn write_addr_to(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(
     put(cx, addrlen, (value.len() as u32).to_le_bytes())
 }
 
-/// 等宿主 socket 就绪：非阻塞时直接 EAGAIN，超时时返回 `timeout_err`。
+/// 等宿主 socket `sock`（宿主 fd 是 `fd`）就绪：非阻塞时直接 EAGAIN，超时时返回
+/// `timeout_err`。只登记这个 socket（[`wake_objects`]）：别的文件上的修改不叫醒它，
+/// 原来系统里每一次管道、PTY 的读写都把阻塞在 recv 里的线程叫醒一遍。
 fn wait_host(
     cx: &mut Cx<'_>,
+    sock: &SocketRef,
     fd: i32,
     events: i16,
     nonblock: bool,
@@ -116,7 +119,7 @@ fn wait_host(
         return Err(Errno::ERESTARTSYS);
     }
     let mut pfd = [(fd, events, 0)];
-    cx.wait(deadline, &mut pfd)
+    cx.wait_objects(deadline, &mut pfd, wake::FILE, &[wake::of(sock)])
 }
 
 pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> SysResult {
@@ -280,7 +283,7 @@ fn accept_host(
                 return Ok((Rc::new(RefCell::new(new)), peer));
             }
             Err(e) if e == Errno::EAGAIN.0 => {
-                wait_host(cx, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
+                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
             }
             Err(e) => return Err(Errno(e)),
         }
@@ -330,7 +333,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
-        cx.wait(None, &mut pfd)?;
+        cx.wait_objects(None, &mut pfd, wake::FILE, &[wake::of(&sock)])?;
     }
     let err = appine_hal::net::getsockopt(host_fd, SOL_SOCKET, SO_ERROR, 4).map_err(Errno)?;
     match i32::from_le_bytes(err[..4].try_into().unwrap()) {
@@ -480,7 +483,7 @@ pub(crate) fn send(
         }
         Socket::Netlink(s) => {
             s.handle(data, appine_hal::net::interfaces);
-            request_wake_files();
+            request_wake_object(wake::of(sock));
             return Ok(data.len());
         }
         Socket::Unix(_) => unreachable!("handled above"),
@@ -498,7 +501,7 @@ pub(crate) fn send(
             s.answers.push_back(answer);
             s.answered += 1;
         }
-        request_wake_files();
+        request_wake_object(wake::of(sock));
         return Ok(data.len());
     }
     let deadline = timeout.map(|t| Instant::now() + t);
@@ -520,8 +523,15 @@ pub(crate) fn send(
                 }
             }
             Err(e) if e == Errno::EAGAIN.0 => {
-                if let Err(err) = wait_host(cx, host_fd, POLLOUT, nonblock, deadline, Errno::EAGAIN)
-                {
+                if let Err(err) = wait_host(
+                    cx,
+                    sock,
+                    host_fd,
+                    POLLOUT,
+                    nonblock,
+                    deadline,
+                    Errno::EAGAIN,
+                ) {
                     return if done > 0 { Ok(done) } else { Err(err) };
                 }
             }
@@ -613,7 +623,7 @@ pub(crate) fn recv(
                 if cx.interrupted() {
                     return Err(Errno::ERESTARTSYS);
                 }
-                cx.wait(None, &mut [])?;
+                cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(sock)])?;
             }
         }
     };
@@ -656,7 +666,7 @@ pub(crate) fn recv(
                         flags: 0,
                     });
                 }
-                wait_host(cx, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
+                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
             }
             Err(e) => return Err(Errno(e)),
         }
@@ -981,11 +991,13 @@ pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
     }
 }
 
-/// ppoll、epoll 等 socket 时登记的唤醒对象（`poll::wake_objects`）：AF_UNIX 的 channel。
-/// 宿主 socket 由宿主 poll 等，netlink 的回答和 DNS 存根的回答请求整个文件类的唤醒。
-pub(crate) fn wake_objects(sock: &Socket, out: &mut Vec<crate::kernel::wake::Object>) {
-    if let Socket::Unix(u) = sock {
-        u.wake_objects(out);
+/// ppoll、epoll 等 socket 时登记的唤醒对象（`poll::wake_objects`）：AF_UNIX 的 channel；
+/// 宿主 socket 和 netlink 是 socket 自己。宿主 socket 上的数据由宿主 poll 等，关闭它
+/// （等它的线程的宿主 poll 要放手）、DNS 存根和 netlink 的回答请求它。
+pub(crate) fn wake_objects(sock: &RefCell<Socket>, out: &mut Vec<wake::Object>) {
+    match &*sock.borrow() {
+        Socket::Unix(u) => u.wake_objects(out),
+        Socket::Inet(_) | Socket::Netlink(_) => out.push(wake::of(sock)),
     }
 }
 

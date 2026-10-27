@@ -14,7 +14,7 @@ use super::{IO_CHUNK, MAX_COPY, SysResult, get, inotify, put, read_path, tty};
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, Kernel, Tid, request_wake_files, request_wake_object};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_files, request_wake_locks, request_wake_object};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -1179,7 +1179,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
                 return Err(Errno::EBUSY);
             }
             p.capacity = size;
-            request_wake_files();
+            request_wake_object(crate::pipe::object(&end.pipe));
             Ok(size as u64)
         }
         // 只有 memfd 能加封印
@@ -1334,7 +1334,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             return Err(Errno::ERESTARTSYS);
         }
         // 持有锁的一方解锁、关闭文件或者退出时会请求唤醒
-        cx.wait(None, &mut [])?;
+        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
     }
 }
 
@@ -2462,7 +2462,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
             if let Some(locks) = cx.k().flocks.get_mut(&ino) {
                 locks.retain(|(f, _)| !f.ptr_eq(&me));
             }
-            request_wake_files();
+            request_wake_locks();
             return Ok(0);
         }
         _ => return Err(Errno::EINVAL),
@@ -2475,7 +2475,13 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
             .iter()
             .any(|(f, ex)| !f.ptr_eq(&me) && (exclusive || *ex));
         if !conflict {
+            // 转换锁的类型时先放开原来的（与 Linux 一样）：排他锁降成共享锁，等共享锁的
+            // 一方就可以拿到了
+            let before = locks.len();
             locks.retain(|(f, _)| !f.ptr_eq(&me));
+            if locks.len() != before {
+                request_wake_locks();
+            }
             locks.push((me, exclusive));
             file.borrow_mut().holds_locks = true;
             return Ok(0);
@@ -2486,8 +2492,8 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        // 持有锁的文件解锁或关闭（OpenFile 析构）时会请求唤醒
-        cx.wait(None, &mut [])?;
+        // 持有锁的文件解锁、转换或关闭（OpenFile 析构）时会请求唤醒
+        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
     }
 }
 
@@ -3114,7 +3120,7 @@ fn unlocked_io(
                     return Err(Errno::EINTR);
                 }
                 file.borrow_mut().pos_busy = 2;
-                cx.wait_on(None, &mut [], crate::kernel::wake::FILE)?;
+                cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
             }
             let mut f = file.borrow_mut();
             f.pos_busy = 1;
@@ -3128,7 +3134,7 @@ fn unlocked_io(
             f.pos = pos + n as u64;
         }
         if std::mem::take(&mut f.pos_busy) == 2 {
-            request_wake_files();
+            request_wake_locks();
         }
     }
     r.map_err(Errno)
@@ -3567,7 +3573,7 @@ fn copy_regular(
                 f.borrow_mut().pos_busy = 2;
             }
         }
-        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::FILE) {
+        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::LOCK) {
             return Some(Err(e));
         }
     }
@@ -3589,7 +3595,7 @@ fn copy_regular(
         }
     }
     if wake {
-        request_wake_files();
+        request_wake_locks();
     }
     match r.map_err(Errno) {
         // 宿主不支持这一对文件：调用方逐块读写

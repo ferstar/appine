@@ -1,15 +1,19 @@
 # 等待和唤醒：别的进程在别的管道、socket、eventfd、PTY 上来回读写，起进程（含 vfork、
-# posix_spawn）、结束进程，改别的 epoll、timerfd、inotify、signalfd，设定时器时，空闲着
-# 等自己的对象的进程不被叫醒（自愿上下文切换的次数不变）；每一种对象上真正的事件都叫醒
-# 另一个进程里等着的线程，vfork 的父进程、改短了的定时器照常
+# posix_spawn）、结束进程，改别的 epoll、timerfd、inotify、signalfd，设定时器，建立、关闭
+# TCP 连接，查 netlink，加锁解锁、设租约、改管道大小时，空闲着等自己的对象的进程不被叫醒
+# （自愿上下文切换的次数不变）；每一种对象上真正的事件都叫醒另一个进程里等着的线程，
+# vfork 的父进程、改短了的定时器、等锁和租约的进程照常
 set -e
-rm -rf /tmp/wakeups.d /tmp/wakeups.idle
+rm -rf /tmp/wakeups.d /tmp/wakeups.idle /tmp/wakeups.lock /dev/shm/wakeups.lease
 mkdir -p /tmp/wakeups.d /tmp/wakeups.idle
 cd /tmp
 cat > wakeups.c <<'C'
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -19,6 +23,7 @@ cat > wakeups.c <<'C'
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
@@ -70,11 +75,51 @@ static void arm(int tfd, long ns)
     timerfd_settime(tfd, 0, &its, NULL);
 }
 
+/* 回环地址上监听一个系统分配的端口 */
+static int tcp_listener(struct sockaddr_in *a)
+{
+    *a = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof *a;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    bind(l, (void *)a, sizeof *a);
+    listen(l, 16);
+    getsockname(l, (void *)a, &len);
+    return l;
+}
+
+/* 一个 TCP 连接的两端 */
+static void tcp_pair(int *s, int *c)
+{
+    struct sockaddr_in a;
+    int l = tcp_listener(&a);
+    *s = socket(AF_INET, SOCK_STREAM, 0);
+    connect(*s, (void *)&a, sizeof a);
+    *c = accept(l, NULL, NULL);
+    close(l);
+}
+
+/* netlink 查询所有网络接口（getifaddrs 的第一步）。镜像里没有 linux-headers：
+ * linux/netlink.h、linux/rtnetlink.h 的定义 */
+#define NETLINK_ROUTE 0
+#define RTM_GETLINK 18
+#define NLM_F_REQUEST 1
+#define NLM_F_DUMP 0x300
+static void ask_links(int nl)
+{
+    struct {
+        unsigned int len;
+        unsigned short type, flags;
+        unsigned int seq, pid;
+        unsigned char family, pad[3];
+    } req = {.len = sizeof req, .type = RTM_GETLINK, .flags = NLM_F_REQUEST | NLM_F_DUMP, .seq = 1};
+    send(nl, &req, sizeof req, 0);
+}
+
 /* ---- 空闲的等待者 ---- */
 
 static const char *idle_kinds[] = {
-    "epoll eventfd", "poll pipe",    "read unix stream", "poll unix dgram",
-    "read pty",      "read eventfd", "epoll timerfd",    "read inotify",
+    "epoll eventfd", "poll pipe",    "read unix stream", "poll unix dgram", "read pty",
+    "read eventfd",  "epoll timerfd", "read inotify",    "read tcp",        "epoll tcp",
 };
 #define NIDLE (int)(sizeof idle_kinds / sizeof idle_kinds[0])
 
@@ -133,6 +178,18 @@ static void idle(int kind, int ready)
         inotify_add_watch(a[0], "/tmp/wakeups.idle", IN_CREATE);
         write(ready, "r", 1);
         read(a[0], buf, sizeof buf);
+        break;
+    case 8:
+        tcp_pair(&a[0], &a[1]);
+        write(ready, "r", 1);
+        read(a[0], buf, sizeof buf);
+        break;
+    case 9:
+        tcp_pair(&a[0], &a[1]);
+        e = epoll_create1(0);
+        epoll_ctl(e, EPOLL_CTL_ADD, a[0], &ev);
+        write(ready, "r", 1);
+        epoll_wait(e, &ev, 1, -1);
         break;
     }
     _exit(0);
@@ -250,6 +307,64 @@ static void traffic(void)
         signalfd(sfd, &set, 0);
     }
     close(sfd);
+
+    /* 建立、关闭 TCP 连接（宿主 socket），查 netlink */
+    struct sockaddr_in sa;
+    int l = tcp_listener(&sa);
+    for (int i = 0; i < 50; i++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        connect(c, (void *)&sa, sizeof sa);
+        close(accept(l, NULL, NULL));
+        close(c);
+    }
+    close(l);
+    for (int i = 0; i < 20; i++) {
+        struct ifaddrs *ifa;
+        if (getifaddrs(&ifa) == 0)
+            freeifaddrs(ifa);
+    }
+
+    /* flock、记录锁、OFD 锁的加锁和解锁，持着记录锁的进程退出 */
+    int f = open("/tmp/wakeups.lock", O_RDWR | O_CREAT, 0644);
+    struct flock fl = {.l_whence = SEEK_SET};
+    for (int i = 0; i < 100; i++) {
+        flock(f, LOCK_EX);
+        flock(f, LOCK_SH);
+        flock(f, LOCK_UN);
+        fl.l_type = F_WRLCK;
+        fcntl(f, F_SETLK, &fl);
+        fl.l_type = F_UNLCK;
+        fcntl(f, F_SETLK, &fl);
+        fl.l_type = F_WRLCK;
+        fcntl(f, F_OFD_SETLK, &fl);
+        fl.l_type = F_UNLCK;
+        fcntl(f, F_OFD_SETLK, &fl);
+    }
+    for (int i = 0; i < 20; i++) {
+        pid_t p = fork();
+        if (p == 0) {
+            fl.l_type = F_WRLCK;
+            fcntl(f, F_SETLK, &fl);
+            _exit(0);
+        }
+        waitpid(p, NULL, 0);
+    }
+    close(f);
+
+    /* 设、放弃租约，关闭设过租约的文件 */
+    for (int i = 0; i < 20; i++) {
+        int lf = open("/dev/shm/wakeups.lease", O_RDONLY | O_CREAT, 0644);
+        fcntl(lf, F_SETLEASE, F_RDLCK);
+        fcntl(lf, F_SETLEASE, F_UNLCK);
+        fcntl(lf, F_SETLEASE, F_RDLCK);
+        close(lf);
+    }
+
+    /* 改管道的大小 */
+    pipe(a);
+    for (int i = 0; i < 50; i++)
+        fcntl(a[1], F_SETPIPE_SZ, i % 2 ? 65536 : 131072);
+    close(a[0]), close(a[1]);
 }
 
 static void idle_waiters(void)
@@ -484,6 +599,82 @@ static int signalfd_mask(void)
     return r != NULL;
 }
 
+/* ---- 锁和租约：放开的一方叫醒等着的进程（等的进程先关掉继承来的 fd，它与本进程共用
+ * 打开文件，否则 flock、OFD 锁、租约不会随本进程关闭而放开） ---- */
+static int lockfd, leasefd;
+static pid_t holder;
+static struct flock wrlck = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+
+static int open_lock(void)
+{
+    close(lockfd);
+    return open("/tmp/wakeups.lock", O_RDWR);
+}
+static int flock_ex(void) { return flock(open_lock(), LOCK_EX) == 0; }
+static int flock_sh(void) { return flock(open_lock(), LOCK_SH) == 0; }
+static int setlkw(void) { return fcntl(open_lock(), F_SETLKW, &wrlck) == 0; }
+static int ofd_setlkw(void) { return fcntl(open_lock(), F_OFD_SETLKW, &wrlck) == 0; }
+static void unflock(void) { flock(lockfd, LOCK_UN); }
+static void downgrade(void) { flock(lockfd, LOCK_SH); }
+static void unlock_posix(void)
+{
+    struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET};
+    fcntl(lockfd, F_SETLK, &fl);
+}
+static void close_lock(void) { close(lockfd); }
+static void kill_holder(void)
+{
+    kill(holder, SIGKILL);
+    waitpid(holder, NULL, 0);
+}
+
+static int open_leased(void)
+{
+    close(leasefd);
+    return open("/dev/shm/wakeups.lease", O_WRONLY) >= 0;
+}
+static void unlease(void) { fcntl(leasefd, F_SETLEASE, F_UNLCK); }
+
+/* ---- 宿主 socket ---- */
+static int tcp_s, tcp_c, tcp_ep, tcp_ev, nl;
+
+/* 一个线程 epoll 等着 tcp_s 时另一个线程把它关掉：对端读到 EOF（epoll 不持有文件，关闭
+ * 之后连接就断开了）。等着的线程要被叫醒，放开它在宿主上等着的 socket */
+static void *epoll_tcp(void *arg)
+{
+    (void)arg;
+    struct epoll_event ev;
+    epoll_wait(tcp_ep, &ev, 1, 5000);
+    return NULL;
+}
+static int eof_c(void)
+{
+    close(tcp_s);
+    return read(tcp_c, big, sizeof big) == 0;
+}
+static void close_s(void) { close(tcp_s); }
+static int read_c(void) { return read(tcp_c, big, sizeof big) == 1; }
+static void write_s(void) { write(tcp_s, "x", 1); }
+static int accept_tcp(void) { return accept(lsock, NULL, NULL) >= 0; }
+static struct sockaddr_in tcp_addr;
+static void connect_tcp(void)
+{
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&tcp_addr, sizeof tcp_addr);
+}
+
+static int poll_nl(void) { return pollin(nl); }
+static int read_nl(void) { return recv(nl, big, sizeof big, 0) > 0; }
+static void ask_nl(void) { ask_links(nl); }
+
+/* 写满的管道：改大之后写得进去 */
+static int write_full(void)
+{
+    fcntl(fds[1], F_SETFL, 0);
+    return write(fds[1], big, sizeof big) == sizeof big;
+}
+static void grow_pipe(void) { fcntl(fds[1], F_SETPIPE_SZ, 1 << 20); }
+
 static void wake_cases(void)
 {
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
@@ -566,6 +757,69 @@ static void wake_cases(void)
     check("setitimer (shortened)", itimer_shortened, nothing);
     check("timer_settime (shortened)", posix_timer_shortened, nothing);
     check("poll signalfd (mask)", signalfd_mask, nothing);
+
+    lockfd = open("/tmp/wakeups.lock", O_RDWR | O_CREAT, 0644);
+    flock(lockfd, LOCK_EX);
+    check("flock (unlock)", flock_ex, unflock);
+    flock(lockfd, LOCK_EX);
+    check("flock (downgrade)", flock_sh, downgrade);
+    flock(lockfd, LOCK_EX);
+    check("flock (close)", flock_ex, close_lock);
+    lockfd = open("/tmp/wakeups.lock", O_RDWR);
+    fcntl(lockfd, F_SETLK, &wrlck);
+    check("fcntl lock (unlock)", setlkw, unlock_posix);
+    int ready[2];
+    pipe(ready);
+    if ((holder = fork()) == 0) {
+        fcntl(open("/tmp/wakeups.lock", O_RDWR), F_SETLK, &wrlck);
+        write(ready[1], "r", 1);
+        pause();
+        _exit(0);
+    }
+    char c;
+    read(ready[0], &c, 1);
+    close(ready[0]), close(ready[1]);
+    check("fcntl lock (holder exits)", setlkw, kill_holder);
+    fcntl(lockfd, F_OFD_SETLK, &wrlck);
+    check("ofd lock (close)", ofd_setlkw, close_lock);
+
+    signal(SIGIO, SIG_IGN); /* 租约被打破时发给持有者 */
+    leasefd = open("/dev/shm/wakeups.lease", O_RDONLY | O_CREAT, 0644);
+    fcntl(leasefd, F_SETLEASE, F_RDLCK);
+    check("open (lease released)", open_leased, unlease);
+    close(leasefd);
+
+    tcp_pair(&tcp_s, &tcp_c);
+    check("read tcp", read_c, write_s);
+    tcp_ep = epoll_create1(0);
+    tcp_ev = eventfd(0, 0);
+    epoll_ctl(tcp_ep, EPOLL_CTL_ADD, tcp_s, &ev);
+    epoll_ctl(tcp_ep, EPOLL_CTL_ADD, tcp_ev, &ev);
+    pthread_t t;
+    pthread_create(&t, NULL, epoll_tcp, NULL);
+    usleep(100000);
+    check("epoll tcp (closed: peer eof)", eof_c, close_s);
+    long one = 1;
+    write(tcp_ev, &one, 8);
+    pthread_join(t, NULL);
+    close(tcp_c), close(tcp_ep), close(tcp_ev);
+    lsock = tcp_listener(&tcp_addr);
+    check("accept tcp", accept_tcp, connect_tcp);
+    close(lsock);
+
+    nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("poll netlink (answer)", poll_nl, ask_nl);
+    close(nl);
+    nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("read netlink (answer)", read_nl, ask_nl);
+    close(nl);
+
+    pipe(fds);
+    fcntl(fds[1], F_SETFL, O_NONBLOCK);
+    while (write(fds[1], big, sizeof big) > 0)
+        ;
+    check("write pipe (F_SETPIPE_SZ)", write_full, grow_pipe);
+    closefds();
 }
 
 int main(void)

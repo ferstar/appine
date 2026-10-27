@@ -58,7 +58,11 @@ pub(crate) mod wake {
     pub const WATCHED: u32 = 8;
     /// 有线程结束了（execve 在等别的线程结束，关闭时在等所有线程结束）。
     pub const EXITED: u32 = 16;
-    pub const ALL: u32 = FILE | OTHER | CHILD | WATCHED | EXITED;
+    /// 文件锁（flock、fcntl 的记录锁和 OFD 锁）、租约和打开文件的位置锁（f_pos_lock）
+    /// 放开了或者变了：只有等它们的线程听。原来走文件类的通道，每次解锁都把所有停在
+    /// poll、epoll 里的线程叫醒一遍。
+    pub const LOCK: u32 = 32;
+    pub const ALL: u32 = FILE | OTHER | CHILD | WATCHED | EXITED | LOCK;
     /// 有只影响某些对象的修改（[`super::request_wake_object`]），不是等待者关心的通道。
     pub(super) const OBJECTS: u32 = 1 << 31;
 
@@ -113,10 +117,16 @@ pub(crate) fn request_wake() {
     WAKE.fetch_or(wake::ALL, Ordering::Relaxed);
 }
 
-/// 只影响打开文件的修改（关闭文件、读写管道、释放文件锁等）：只叫醒关心
-/// [`wake::FILE`] 的等待者。调用方持有 BKL。
+/// 只影响打开文件、又说不清是哪个对象的修改（关闭 POSIX 消息队列、信号驱动的 I/O
+/// 要重新检查等）：只叫醒关心 [`wake::FILE`] 的等待者。调用方持有 BKL。
 pub(crate) fn request_wake_files() {
     request_wake_on(wake::FILE);
+}
+
+/// 文件锁、租约或者打开文件的位置锁放开了、变了：只叫醒关心 [`wake::LOCK`] 的等待者。
+/// 调用方持有 BKL。
+pub(crate) fn request_wake_locks() {
+    request_wake_on(wake::LOCK);
 }
 
 /// 请求在释放 BKL 时叫醒关心 `channels`（[`wake`]）里任何一个通道的等待者。调用方持有

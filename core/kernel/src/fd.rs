@@ -235,21 +235,27 @@ impl OpenFile {
 }
 
 impl Drop for OpenFile {
-    /// 最后一个引用消失：持有的 flock、OFD 锁随之释放，等锁的线程要重新检查；宿主 socket
-    /// 的 fd 关掉了，在 poll、epoll 里等着它的线程要重新检查。别的文件关闭时不必广播：
-    /// 管道、PTY、AF_UNIX socket 的另一方由 `PipeEnd`、`PtyEnd`、`UnixSocket` 叫醒（只叫醒
-    /// 等这个管道、PTY、连接的），epoll、eventfd、inotify 这类对象关闭时没有线程在等它。
-    /// shell 每次 exec、退出都要关好几个文件，原来每关一个都把读着管道的进程叫醒一遍。
+    /// 最后一个引用消失：持有的 flock、OFD 锁、租约随之释放，等锁的线程要重新检查
+    /// （[`wake::LOCK`](crate::kernel::wake::LOCK)）；宿主 socket 的 fd 要关掉了，在 poll、
+    /// epoll、阻塞的收发里等着它的线程的宿主 poll 还拿着它（宿主 socket 要等它们放手才
+    /// 真正关闭），只叫醒登记了这个 socket 的等待者。别的文件关闭时不必叫醒谁：管道、
+    /// PTY、AF_UNIX socket 的另一方由 `PipeEnd`、`PtyEnd`、`UnixSocket` 叫醒（只叫醒等这个
+    /// 管道、PTY、连接的），epoll、eventfd、inotify 这类对象关闭时没有线程在等它。shell
+    /// 每次 exec、退出都要关好几个文件，原来每关一个都把读着管道的进程叫醒一遍。
     fn drop(&mut self) {
-        let quiet = match &self.kind {
-            FileKind::Socket(s) => s
-                .try_borrow()
-                .is_ok_and(|s| matches!(*s, crate::net::Socket::Unix(_))),
-            FileKind::MessageQueue(_) => false,
-            _ => true,
-        };
-        if self.holds_locks || !quiet {
-            crate::kernel::request_wake_files();
+        match &self.kind {
+            FileKind::Socket(s)
+                if !s
+                    .try_borrow()
+                    .is_ok_and(|s| matches!(*s, crate::net::Socket::Unix(_))) =>
+            {
+                crate::kernel::request_wake_object(crate::kernel::wake::of(s));
+            }
+            FileKind::MessageQueue(_) => crate::kernel::request_wake_files(),
+            _ => {}
+        }
+        if self.holds_locks {
+            crate::kernel::request_wake_locks();
         }
     }
 }
@@ -610,7 +616,7 @@ impl Drop for FdTable {
     /// 不必：原来每个进程退出都把所有读着管道、在 poll 里等着的线程叫醒一遍。
     fn drop(&mut self) {
         if self.holds_locks {
-            crate::kernel::request_wake_files();
+            crate::kernel::request_wake_locks();
         }
     }
 }
