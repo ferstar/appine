@@ -479,8 +479,20 @@ fn timers(shared: Arc<Shared>) {
             k.fasync.clear();
             Vec::new()
         });
-        // 定时器的设置不是打开文件上的修改；有信号驱动的 I/O 时才要看每一次修改
-        let interest = if k.fasync.is_empty() {
+        // EPOLLEXCLUSIVE 的独占门：这里替等着的线程看文件，来了新的边沿只叫醒一个
+        match crate::bug::catch(|| crate::syscall::check_exclusive(&mut k)) {
+            Some(fds) => host.extend(fds),
+            None => {
+                crate::bug::report(format_args!(
+                    "kernel panic in EPOLLEXCLUSIVE wakeups; waking every exclusive waiter"
+                ));
+                for gate in std::mem::take(&mut k.ex_gates) {
+                    gate.wake_all();
+                }
+            }
+        }
+        // 定时器的设置不是打开文件上的修改；有信号驱动的 I/O、独占门时才要看每一次修改
+        let interest = if k.fasync.is_empty() && k.ex_gates.is_empty() {
             wake::OTHER
         } else {
             wake::ALL

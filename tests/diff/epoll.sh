@@ -1,5 +1,6 @@
 # epoll 的边沿触发和 EPOLLEXCLUSIVE：已经就绪时又来了数据也要再触发一次（mio 的唤醒器
-# 就靠这一点，tokio 程序原来会卡住），独占的关注一个边沿只叫醒一个进程
+# 就靠这一点，tokio 程序原来会卡住），独占的关注一个边沿只叫醒一个进程（没轮到的进程的
+# 自愿上下文切换次数不变）
 set -e
 cd /tmp
 rm -rf /tmp/etdir
@@ -214,37 +215,65 @@ static void mio_waker(void)
     pthread_join(t, NULL);
 }
 
+/* /proc/<pid>/status 的 voluntary_ctxt_switches：进程每睡下一次加一；读不到时是 -1 */
+static long switches(pid_t pid)
+{
+    char path[64], line[128];
+    snprintf(path, sizeof path, "/proc/%d/status", pid);
+    FILE *f = fopen(path, "r");
+    long n = -1;
+    while (f && fgets(line, sizeof line, f))
+        if (sscanf(line, "voluntary_ctxt_switches: %ld", &n) == 1)
+            break;
+    if (f)
+        fclose(f);
+    return n;
+}
+
 /* 几个进程各用一个 epoll，以 EPOLLEXCLUSIVE（水平触发）等同一个监听 socket：来一个连接
- * 只有一个进程从 epoll_wait 返回；那个进程不 accept 也一样（没轮到的继续睡到超时） */
+ * 只有一个进程从 epoll_wait 返回（不 accept 也一样），也只有它被叫醒过——没轮到的自愿
+ * 切换的次数不变 */
 static void exclusive(const char *name, int l, void (*poke)(void *))
 {
-    int out[2];
+    int ready[2], out[2];
+    pipe(ready);
     pipe(out);
+    fcntl(out[0], F_SETFL, O_NONBLOCK);
+    pid_t pids[3];
     for (int i = 0; i < 3; i++) {
-        if (fork() == 0) {
+        if ((pids[i] = fork()) == 0) {
             int e = epoll_create1(0);
             struct epoll_event ev = {.events = EPOLLIN | EPOLLEXCLUSIVE};
             epoll_ctl(e, EPOLL_CTL_ADD, l, &ev);
-            write(out[1], "r", 1);
+            write(ready[1], "r", 1);
             struct epoll_event got;
-            int n = epoll_wait(e, &got, 1, 1000);
-            write(out[1], n == 1 ? "w" : "t", 1);
+            if (epoll_wait(e, &got, 1, 10000) == 1)
+                write(out[1], "w", 1);
+            pause();
             _exit(0);
         }
     }
     char c;
     for (int i = 0; i < 3; i++)
-        read(out[0], &c, 1);
-    usleep(200000);
+        read(ready[0], &c, 1);
+    usleep(300000);
+    long before[3];
+    for (int i = 0; i < 3; i++)
+        before[i] = switches(pids[i]);
     poke(NULL);
-    int woken = 0;
-    for (int i = 0; i < 3; i++) {
-        read(out[0], &c, 1);
-        woken += c == 'w';
-    }
+    usleep(300000);
+    int woken = 0, returned = 0;
+    for (int i = 0; i < 3; i++)
+        woken += switches(pids[i]) != before[i];
+    while (read(out[0], &c, 1) == 1)
+        returned++;
+    for (int i = 0; i < 3; i++)
+        kill(pids[i], SIGKILL);
     while (wait(NULL) > 0)
         ;
-    printf("exclusive %-11s %d of 3 woken\n", name, woken);
+    printf("exclusive %-11s returned %d, woken %d\n", name, returned, woken);
+    close(ready[0]);
+    close(ready[1]);
     close(out[0]);
     close(out[1]);
 }

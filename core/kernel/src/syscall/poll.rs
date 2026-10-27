@@ -278,11 +278,17 @@ struct Waits {
     timer: Option<Instant>,
     /// 有边沿触发的关注少等了报告过的位。
     edge: bool,
+    /// 有要靠内核叫醒的进程内对象（管道、eventfd、AF_UNIX……）：要登记在文件类的唤醒里。
+    files: bool,
+    /// `EPOLLEXCLUSIVE` 关注的文件：不自己等，登记在它们的独占门上（[`ExGate`]）。
+    gated: Vec<FileRef>,
 }
 
 impl Waits {
     fn add(&mut self, f: &OpenFile, wanted: i16, depth: u32) {
-        match (&f.kind, readiness(f, depth).1) {
+        let (_, host) = readiness(f, depth);
+        self.files |= host.is_none();
+        match (&f.kind, host) {
             (_, Some(fd)) => self.host.push((fd, wanted, 0)),
             (FileKind::TimerFd(t), None) => {
                 if let Some(d) = t.borrow().deadline {
@@ -305,6 +311,7 @@ impl Waits {
     /// 嵌套的 epoll 里只等新事件：各个关注的宿主 fd 新到的数据（[`HostEdges`]，外层以边沿
     /// 触发关注它时建立，[`mark_edge_watched`]）、timerfd 的到期，再往里嵌套的照此。
     fn add_epoll_edges(&mut self, ep: &Epoll, depth: u32) {
+        self.files = true;
         for int in ep.interests.iter().filter(|i| i.armed) {
             let Some(file) = int.file.upgrade() else {
                 continue;
@@ -335,6 +342,18 @@ impl Waits {
             let Some(file) = int.file.upgrade() else {
                 continue;
             };
+            // 独占的关注：不自己等它（宿主 poll 会把所有等它的线程都叫醒），由独占门在新的
+            // 边沿上只叫醒一个等待者。宿主 fd 上新到的数据要从 HostEdges 看，建不了的仍然
+            // 自己等
+            let gate = {
+                let f = file.borrow();
+                int.events & EPOLLEXCLUSIVE != 0
+                    && (host_fd(&f).is_none() || f.host_edges.is_some())
+            };
+            if gate {
+                self.gated.push(file);
+                continue;
+            }
             let mut wanted = int.events as i16;
             let seen = int.seen.get() as i16;
             let f = file.borrow();
@@ -347,10 +366,9 @@ impl Waits {
                 hung_up = seen & (POLLHUP | POLLERR) != 0;
                 wanted &= !seen;
             }
-            // 现在的边沿轮到了别的 epoll：现在就绪的位不等，等新的边沿
+            // 自己等的独占关注（见上）：现在的边沿轮到了别的 epoll 时，现在就绪的位不等
             if claimed(int, &f, ep as *const Epoll as usize) {
                 self.edge = true;
-                edges = true;
                 wanted &= !poll_now(&f, wanted, depth);
             }
             if edges && let Some(e) = &f.host_edges {
@@ -368,15 +386,122 @@ impl Waits {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        if !self.edge {
-            return cx.wait(until, &mut self.host);
-        }
         let event = cx.task.event.clone();
-        cx.k().edge_waiters.push(event.clone());
-        let r = cx.wait(until, &mut self.host);
-        cx.k().edge_waiters.retain(|e| !Arc::ptr_eq(e, &event));
+        if self.edge {
+            cx.k().edge_waiters.push(event.clone());
+        }
+        if !self.gated.is_empty() {
+            gate_enter(cx, &self.gated, &event);
+        }
+        // 只等独占的关注时不登记在文件类的唤醒里：独占门、信号、epoll_ctl 都直接叫醒它，
+        // 别的文件上的修改不必叫醒它
+        let only_gated = !self.files && self.host.is_empty() && !self.gated.is_empty();
+        let interest = if only_gated {
+            0
+        } else {
+            crate::kernel::wake::ALL
+        };
+        let r = cx.wait_on(until, &mut self.host, interest);
+        if self.edge {
+            cx.k().edge_waiters.retain(|e| !Arc::ptr_eq(e, &event));
+        }
+        if !self.gated.is_empty() {
+            gate_leave(cx, &self.gated, &event);
+        }
         r
     }
+}
+
+/// `EPOLLEXCLUSIVE` 关注的一个文件上等着的线程（Linux 的等待队列里独占的那些项）。
+/// 等待者不自己等这个文件（宿主 poll、文件类的广播都会把所有等它的线程叫醒），而是登记在
+/// 这里，由定时器线程替它们看（[`check_exclusive`]）：数据代数变了、文件就绪、这个边沿还
+/// 没被哪个 epoll 报告过时，只叫醒排在最前面的一个，与 Linux 每次唤醒只叫醒一个独占的
+/// 等待者一样。
+pub(crate) struct ExGate {
+    file: Weak<RefCell<OpenFile>>,
+    /// 等着的线程，先来的在前。
+    sleepers: Vec<Arc<appine_hal::Event>>,
+    /// 上次检查时文件的数据代数（[`edge`]）。
+    last: [u64; 4],
+}
+
+impl ExGate {
+    /// 看一眼文件 `f`：数据代数变了、文件就绪、这个边沿还没被哪个 epoll 报告过时，取出
+    /// 排在最前面的等待者（要叫醒它）。
+    fn next_waiter(&mut self, f: &OpenFile) -> Option<Arc<appine_hal::Event>> {
+        let now = edge(f);
+        if now == self.last || self.sleepers.is_empty() {
+            return None;
+        }
+        self.last = now;
+        let ready = poll_now(f, POLLIN | POLLOUT | POLLPRI | POLLRDNORM | POLLWRNORM, 0) != 0;
+        let claimed = f.exclusive_claim.get().is_some_and(|(e, _)| e == now);
+        (ready && !claimed).then(|| self.sleepers.remove(0))
+    }
+
+    /// 叫醒所有等着的线程（检查出错时，宁可多叫醒）。
+    pub(crate) fn wake_all(&self) {
+        for e in &self.sleepers {
+            crate::kernel::signal_later(e);
+        }
+    }
+}
+
+/// 等待之前：在 `files` 各自的独占门上登记 `event`。门是新建的时叫醒定时器线程，让它
+/// 开始看这个文件。
+fn gate_enter(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>) {
+    let mut created = false;
+    for file in files {
+        let k = cx.k();
+        match k
+            .ex_gates
+            .iter_mut()
+            .find(|g| g.file.as_ptr() == Rc::as_ptr(file))
+        {
+            Some(g) => g.sleepers.push(event.clone()),
+            None => {
+                k.ex_gates.push(ExGate {
+                    file: Rc::downgrade(file),
+                    sleepers: vec![event.clone()],
+                    last: edge(&file.borrow()),
+                });
+                created = true;
+            }
+        }
+    }
+    if created {
+        crate::kernel::signal_later(&cx.shared.timers);
+    }
+}
+
+/// 等待之后：从 `files` 的独占门上去掉 `event`（被叫醒的已经去掉了）。
+fn gate_leave(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>) {
+    for g in cx.k().ex_gates.iter_mut() {
+        if files.iter().any(|f| g.file.as_ptr() == Rc::as_ptr(f)) {
+            g.sleepers.retain(|e| !Arc::ptr_eq(e, event));
+        }
+    }
+}
+
+/// 定时器线程替 `EPOLLEXCLUSIVE` 的等待者看文件（[`ExGate`]）：任何修改都会叫醒定时器
+/// 线程（有独占门时它登记在所有通道上），宿主 socket 上新到的数据从它的 [`HostEdges`]
+/// 看，返回这些宿主 fd 让定时器线程一起等。没有等待者、文件已经关闭的门去掉。
+pub(crate) fn check_exclusive(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)> {
+    let mut host = Vec::new();
+    k.ex_gates.retain_mut(|g| {
+        let Some(file) = g.file.upgrade().filter(|_| !g.sleepers.is_empty()) else {
+            return false;
+        };
+        let f = file.borrow();
+        if let Some(first) = g.next_waiter(&f) {
+            crate::kernel::signal_later(&first);
+        }
+        if let Some(e) = &f.host_edges {
+            host.push((e.fd(), POLLIN, 0));
+        }
+        true
+    });
+    host
 }
 
 /// 程序在 `file` 的一个方向（0 读，1 写）上用完了数据：读写返回 EAGAIN，或者没有读写
@@ -791,6 +916,9 @@ pub(crate) struct Epoll {
     /// 有别的 epoll 以边沿触发关注这个 epoll：它关注的宿主 fd 也要记录新到的数据
     /// （[`mark_edge_watched`]）。
     edge_watched: Cell<bool>,
+    /// 正在 epoll_wait 里等着的线程：epoll_ctl 改了关注时直接叫醒它们（只等独占关注的
+    /// 线程不在文件类的唤醒里）。
+    waiters: Vec<Arc<appine_hal::Event>>,
 }
 
 impl Epoll {
@@ -1015,6 +1143,9 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         .iter()
         .position(|i| i.fd == fd && i.file.as_ptr() == Rc::as_ptr(&file));
     // 别的线程可能正在 epoll_wait：叫醒它们按新的关注重新等
+    for w in &ep.waiters {
+        crate::kernel::signal_later(w);
+    }
     match (op, pos) {
         (EPOLL_CTL_ADD, Some(_)) => Err(Errno::EEXIST),
         (EPOLL_CTL_ADD, None) => {
@@ -1112,7 +1243,11 @@ pub(super) fn epoll_pwait(
         }
         let mut waits = Waits::default();
         waits.add_epoll(&ep.borrow(), 0);
-        waits.wait(cx, deadline)?;
+        let event = cx.task.event.clone();
+        ep.borrow_mut().waiters.push(event.clone());
+        let r = waits.wait(cx, deadline);
+        ep.borrow_mut().waiters.retain(|e| !Arc::ptr_eq(e, &event));
+        r?;
     })();
     restore_mask(cx, &r);
     let ready = r?;
@@ -1388,9 +1523,11 @@ mod tests {
         // 水平触发：报告过的 epoll 只要仍然就绪就接着报告，别的 epoll 等下一个边沿
         assert!(b.ready(0, 8).is_empty());
         assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
+        // 等待时不自己等独占关注的文件，登记在它的独占门上（定时器线程只叫醒一个）
         let mut waits = Waits::default();
         waits.add_epoll(&b, 0);
-        assert!(waits.edge);
+        assert_eq!(waits.gated.len(), 1);
+        assert!(waits.host.is_empty() && !waits.files);
         // 又来了数据：轮到先检查的那个
         write();
         assert_eq!(b.ready(0, 8), vec![(0, POLLIN as u32)]);
@@ -1404,6 +1541,47 @@ mod tests {
         assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
         a.reported(0, POLLIN as u32);
         assert!(b.ready(0, 8).is_empty());
+    }
+
+    #[test]
+    fn exclusive_gates_pick_one_waiter_per_edge() {
+        let efd = Rc::new(RefCell::new(EventFd {
+            count: 0,
+            semaphore: false,
+            writes: 0,
+            reads: 0,
+        }));
+        let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
+        let sleepers: Vec<_> = (0..3)
+            .map(|_| Arc::new(appine_hal::Event::new().unwrap()))
+            .collect();
+        let mut gate = ExGate {
+            file: Rc::downgrade(&file),
+            sleepers: sleepers.clone(),
+            last: edge(&file.borrow()),
+        };
+        let write = || {
+            let mut e = efd.borrow_mut();
+            e.count += 1;
+            e.writes += 1;
+        };
+        // 没有新的边沿：谁也不叫醒
+        assert!(gate.next_waiter(&file.borrow()).is_none());
+        // 一个新的边沿只叫醒排在最前面的一个，同一个边沿不再叫醒别的
+        write();
+        let w = gate.next_waiter(&file.borrow()).unwrap();
+        assert!(Arc::ptr_eq(&w, &sleepers[0]));
+        assert!(gate.next_waiter(&file.borrow()).is_none());
+        // 已经被某个 epoll 报告过的边沿不叫醒
+        write();
+        let now = edge(&file.borrow());
+        file.borrow().exclusive_claim.set(Some((now, 1)));
+        assert!(gate.next_waiter(&file.borrow()).is_none());
+        // 下一个边沿轮到第二个
+        write();
+        let w = gate.next_waiter(&file.borrow()).unwrap();
+        assert!(Arc::ptr_eq(&w, &sleepers[1]));
+        assert_eq!(gate.sleepers.len(), 1);
     }
 
     #[test]

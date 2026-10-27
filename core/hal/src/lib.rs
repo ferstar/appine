@@ -749,6 +749,21 @@ pub fn thread_system_ns(tid: i32) -> Option<u64> {
     Some(ticks * (1_000_000_000 / hz))
 }
 
+/// 本进程的宿主线程 `tid` 自愿、非自愿的上下文切换次数（`/proc/self/task/<tid>/status`）。
+pub fn thread_ctxt_switches(tid: i32) -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse().ok())
+    };
+    Some((
+        field("voluntary_ctxt_switches:")?,
+        field("nonvoluntary_ctxt_switches:")?,
+    ))
+}
+
 /// 把 `[ptr, ptr + len)` 的页调进内存：每个宿主页读一个字节。匿名内存没写过的页映射到
 /// 零页，不额外占内存。
 ///

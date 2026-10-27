@@ -33,7 +33,7 @@ pub(crate) use inotify::{Inotify, Opened, Registry};
 pub(crate) use lease::Lease;
 pub(crate) use mqueue::{Limits as MqLimits, MessageQueue};
 pub(crate) use net::SocketRef;
-pub(crate) use poll::{Epoll, Fasync, check_fasync};
+pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;
 

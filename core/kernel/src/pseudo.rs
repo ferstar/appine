@@ -1318,9 +1318,15 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "CapAmb:\t0000000000000000").unwrap();
     writeln!(s, "NoNewPrivs:\t{}\nSeccomp:\t0", g.no_new_privs as u8).unwrap();
     writeln!(s, "Cpus_allowed_list:\t0-{}", cpus() - 1).unwrap();
+    // 宿主线程睡下（等待）一次是一次自愿切换：没被叫醒的线程不会变
+    let (vol, nonvol) = task.as_ref().map_or((0, 0), |t| {
+        let (v, n) = appine_hal::thread_ctxt_switches(t.host_tid.get()).unwrap_or((0, 0));
+        let (bv, bn) = t.ctxt_base.get();
+        (v.saturating_sub(bv), n.saturating_sub(bn))
+    });
     writeln!(
         s,
-        "voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0"
+        "voluntary_ctxt_switches:\t{vol}\nnonvoluntary_ctxt_switches:\t{nonvol}"
     )
     .unwrap();
     Ok(s)

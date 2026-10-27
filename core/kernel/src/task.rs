@@ -99,6 +99,9 @@ pub(crate) struct Task {
     /// 线程开始时宿主线程已经用掉的 CPU 时间和其中的内核态时间（纳秒）：宿主线程可能
     /// 是线程池留下来的，跑过别的 guest 线程（[`pool`]）。
     pub cpu_base: Cell<(u64, u64)>,
+    /// 线程开始时宿主线程自愿、非自愿的上下文切换次数（宿主线程会被复用）：
+    /// `/proc/<pid>/status` 报告的是之后的。
+    pub ctxt_base: Cell<(u64, u64)>,
     /// 宿主线程的 tid（读宿主记的内核态时间）。
     pub host_tid: Cell<i32>,
     /// ptrace 的状态（[`crate::ptrace`]）。
@@ -181,6 +184,7 @@ impl Task {
             res: RefCell::new(res),
             clock: Cell::new(None),
             cpu_base: Cell::new((0, 0)),
+            ctxt_base: Cell::new((0, 0)),
             host_tid: Cell::new(0),
             trace: RefCell::default(),
             syscall_traced: AtomicBool::new(false),
@@ -365,6 +369,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         task.cpu_base
             .set((task.host_cpu_ns(), appine_hal::thread_system_ns_self()));
         task.host_tid.set(appine_hal::gettid());
+        task.ctxt_base
+            .set(appine_hal::thread_ctxt_switches(task.host_tid.get()).unwrap_or((0, 0)));
         crate::syscall::host_started(&task, reused);
         task.state.borrow().mm.borrow().generations()
     });

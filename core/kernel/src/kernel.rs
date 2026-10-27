@@ -194,6 +194,9 @@ pub(crate) struct Kernel {
     waiters: Vec<(Arc<Event>, u32, Option<wake::Object>)>,
     /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
     pub edge_waiters: Vec<Arc<Event>>,
+    /// `EPOLLEXCLUSIVE` 关注的文件上等着的线程（`syscall::poll` 的独占门），由定时器线程
+    /// 检查。
+    pub ex_gates: Vec<crate::syscall::ExGate>,
     /// 设置了 `O_ASYNC` 的打开文件（`syscall::poll` 的 fasync）。
     pub fasync: Vec<crate::syscall::Fasync>,
     /// 文件租约，按 inode（`syscall::lease`）。
@@ -260,6 +263,7 @@ impl Kernel {
             next_tid: INIT + 1,
             waiters: Vec::new(),
             edge_waiters: Vec::new(),
+            ex_gates: Vec::new(),
             fasync: Vec::new(),
             leases: BTreeMap::new(),
             lease_break_time: 45,
