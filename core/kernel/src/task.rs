@@ -6,7 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -348,8 +348,28 @@ pub(crate) mod pool {
     }
 }
 
+/// 一个 guest 线程和它的线程组（弱引用）。
+type Current = (Weak<Task>, Weak<RefCell<ThreadGroup>>);
+
+thread_local! {
+    /// 这个宿主线程正在执行的 guest 线程和它的线程组（[`current`]）。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
+}
+
+/// 调用者：这个宿主线程正在执行的 guest 线程和它的线程组。不在 guest 线程上（定时器线程、
+/// 宿主调用 Machine 的线程）时是 None。系统调用里 [`Task::state`] 已经被借走，拿不到
+/// 线程组，所以线程开始时记下。
+pub(crate) fn current() -> Option<(Rc<Task>, Rc<RefCell<ThreadGroup>>)> {
+    CURRENT.with_borrow(|c| {
+        let (task, group) = c.as_ref()?;
+        Some((task.upgrade()?, group.upgrade()?))
+    })
+}
+
 fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu, reused)));
+    CURRENT.set(None);
     if r.is_err() {
         // 内核层的 bug，而且不在兜住的地方（crate::bug）：线程找不到自己，或者出错之后的
         // 收拾本身又出了错。BKL 保护的状态可能已经不一致，不能让其他线程继续
@@ -362,6 +382,8 @@ fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
 fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     let k = shared.lock();
     let task = k.tasks[&tid].clone();
+    let group = Rc::downgrade(&task.state.borrow().group);
+    CURRENT.set(Some((Rc::downgrade(&task), group)));
     // 线程开始时的 bug 和进入内核时的一样只结束这个进程（crate::bug）
     let started = crate::bug::catch(|| {
         crate::bug::trap(Trap::Start, task.tgid);

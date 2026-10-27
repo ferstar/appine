@@ -1530,3 +1530,136 @@ done
 ls cpu0 | grep -c '^cache$' || true
 [ -d cpu0/cpufreq ] && echo cpufreq || echo no cpufreq
 cd /tmp
+
+# signalfd 不属于哪个线程：poll、epoll 和读看的都是调用的线程和它的进程挂起的信号。发给
+# 另一个线程的看不到，阻塞在 poll 里的线程收到发给自己的信号时醒来，fork 出来的子进程看
+# 自己的，创建它的线程退出之后照样可用
+cat > sfd.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/signalfd.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int sfd, cmd[2], res[2], ep_b;
+static sigset_t set;
+
+static int pollnow(int fd)
+{
+    struct pollfd p = {fd, POLLIN, 0};
+    return poll(&p, 1, 0) == 1 && p.revents & POLLIN;
+}
+
+/* 读到的信号；没有时是 0（EAGAIN） */
+static int readsig(int fd)
+{
+    struct signalfd_siginfo si;
+    ssize_t n = read(fd, &si, sizeof si);
+    return n == sizeof si ? (int)si.ssi_signo : errno == EAGAIN ? 0 : -errno;
+}
+
+/* 线程 B 按命令执行：p poll，e epoll（B 自己的 epoll），r 读，w 阻塞 poll 最多 2 秒 */
+static void *thread_b(void *arg)
+{
+    (void)arg;
+    ep_b = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN};
+    epoll_ctl(ep_b, EPOLL_CTL_ADD, sfd, &ev);
+    char c;
+    while (read(cmd[0], &c, 1) == 1 && c != 'q') {
+        struct pollfd p = {sfd, POLLIN, 0};
+        int r = 0;
+        if (c == 'p')
+            r = pollnow(sfd);
+        else if (c == 'e')
+            r = epoll_wait(ep_b, &ev, 1, 0);
+        else if (c == 'r')
+            r = readsig(sfd);
+        else if (c == 'w')
+            r = poll(&p, 1, 2000);
+        write(res[1], &r, sizeof r);
+    }
+    return NULL;
+}
+
+static int in_b(char c)
+{
+    int r;
+    write(cmd[1], &c, 1);
+    read(res[0], &r, sizeof r);
+    return r;
+}
+
+static void *create(void *arg)
+{
+    (void)arg;
+    return (void *)(long)signalfd(-1, &set, SFD_NONBLOCK);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    sfd = signalfd(-1, &set, SFD_NONBLOCK);
+    pipe(cmd);
+    pipe(res);
+    pthread_t b;
+    pthread_create(&b, NULL, thread_b, NULL);
+    int r[5];
+
+    pthread_kill(pthread_self(), SIGUSR1);
+    r[0] = pollnow(sfd), r[1] = in_b('p'), r[2] = in_b('e'), r[3] = in_b('r'), r[4] = readsig(sfd);
+    printf("to A: A poll %d, B poll %d, B epoll %d, B read %d, A read %d\n", r[0], r[1], r[2], r[3], r[4]);
+
+    pthread_kill(b, SIGUSR2);
+    r[0] = pollnow(sfd), r[1] = in_b('p'), r[2] = in_b('e'), r[3] = readsig(sfd), r[4] = in_b('r');
+    printf("to B: A poll %d, B poll %d, B epoll %d, A read %d, B read %d\n", r[0], r[1], r[2], r[3], r[4]);
+
+    kill(getpid(), SIGUSR1);
+    r[0] = pollnow(sfd), r[1] = in_b('p'), r[2] = in_b('r'), r[3] = pollnow(sfd), r[4] = in_b('p');
+    printf("to the process: A poll %d, B poll %d, B read %d, then A poll %d, B poll %d\n", r[0], r[1],
+           r[2], r[3], r[4]);
+
+    char c = 'w';
+    write(cmd[1], &c, 1);
+    usleep(100000);
+    pthread_kill(b, SIGUSR2);
+    read(res[0], &r[0], sizeof r[0]);
+    r[1] = in_b('r');
+    printf("B blocked in poll, signal to B: poll %d, read %d\n", r[0], r[1]);
+
+    pid_t child = fork();
+    if (child == 0) {
+        struct pollfd p = {sfd, POLLIN, 0};
+        int polled = poll(&p, 1, 2000);
+        printf("fork child: poll %d, read %d\n", polled, readsig(sfd));
+        _exit(0);
+    }
+    usleep(100000);
+    kill(child, SIGUSR2);
+    waitpid(child, NULL, 0);
+    printf("parent after the child's signal: poll %d\n", pollnow(sfd));
+
+    pthread_t creator;
+    void *fd2;
+    pthread_create(&creator, NULL, create, NULL);
+    pthread_join(creator, &fd2);
+    pthread_kill(pthread_self(), SIGUSR1);
+    r[0] = pollnow((int)(long)fd2), r[1] = readsig((int)(long)fd2);
+    printf("creator thread gone: poll %d, read %d\n", r[0], r[1]);
+
+    c = 'q';
+    write(cmd[1], &c, 1);
+    pthread_join(b, NULL);
+    return 0;
+}
+C
+gcc -O1 -o sfd sfd.c -lpthread && ./sfd

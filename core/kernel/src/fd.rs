@@ -254,33 +254,42 @@ impl Drop for OpenFile {
     }
 }
 
-/// signalfd 的状态。
+/// signalfd 的状态。与 Linux 一样不属于哪个线程：poll、epoll 和读看的都是调用的线程和
+/// 它的线程组挂起的信号（[`crate::task::current`]），fork 出来的进程看自己的。
 pub struct SignalFd {
     /// 关注的信号（不含 SIGKILL、SIGSTOP）。
     pub mask: u64,
-    /// 创建它的线程组和线程：poll 按它们挂起的信号判断是否可读（read 取的是调用者的）。
+    /// 创建它的线程组：不在 guest 线程上检查它时（定时器线程替信号驱动的 I/O、独占门
+    /// 检查）只看这个线程组挂起的信号。
     pub group: std::rc::Weak<RefCell<crate::process::ThreadGroup>>,
-    pub task: std::rc::Weak<crate::task::Task>,
 }
 
 impl SignalFd {
-    /// 创建它的线程组和线程一共挂起过几次信号（`syscall::poll` 的数据代数）。
-    pub fn arrivals(&self) -> u64 {
-        let group = self
-            .group
-            .upgrade()
-            .map_or(0, |g| g.borrow().pending.arrivals());
-        let task = self
-            .task
-            .upgrade()
-            .map_or(0, |t| t.pending.borrow().arrivals());
-        group + task
+    /// 调用的线程和它的线程组；不在 guest 线程上时是创建它的线程组。
+    fn pending(
+        &self,
+    ) -> (
+        Option<Rc<crate::task::Task>>,
+        Option<Rc<RefCell<crate::process::ThreadGroup>>>,
+    ) {
+        match crate::task::current() {
+            Some((task, group)) => (Some(task), Some(group)),
+            None => (None, self.group.upgrade()),
+        }
     }
 
-    /// 有没有可以读走的信号（poll）。
+    /// 调用的线程和它的线程组一共挂起过几次信号（`syscall::poll` 的数据代数）。
+    pub fn arrivals(&self) -> u64 {
+        let (task, group) = self.pending();
+        let group = group.map_or(0, |g| g.borrow().pending.arrivals());
+        group + task.map_or(0, |t| t.pending.borrow().arrivals())
+    }
+
+    /// 有没有调用的线程读得走的信号（poll）。
     pub fn ready(&self) -> bool {
-        let group = self.group.upgrade().map_or(0, |g| g.borrow().pending.set());
-        let task = self.task.upgrade().map_or(0, |t| t.pending.borrow().set());
+        let (task, group) = self.pending();
+        let group = group.map_or(0, |g| g.borrow().pending.set());
+        let task = task.map_or(0, |t| t.pending.borrow().set());
         (group | task) & self.mask != 0
     }
 }

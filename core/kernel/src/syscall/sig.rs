@@ -303,7 +303,6 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
     let s = SignalFd {
         mask: set,
         group: std::rc::Rc::downgrade(&cx.t.group),
-        task: std::rc::Rc::downgrade(cx.task),
     };
     let file = OpenFile::new(
         FileKind::SignalFd(std::rc::Rc::new(std::cell::RefCell::new(s))),

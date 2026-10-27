@@ -1,6 +1,6 @@
 # M9 之前：起进程和设定时器不再叫醒所有人（2026-10-27）
 
-← [M9 之前：Tier 1 里的观察点（2026-10-27）](50-watchpoints-tier1.md) · [索引](../milestones.md)
+← [M9 之前：Tier 1 里的观察点（2026-10-27）](50-watchpoints-tier1.md) · [索引](../milestones.md) · [M9 之前：signalfd 看调用的线程（2026-10-27）](52-signalfd-caller.md) →
 
 [按对象唤醒](49-targeted-wakeups.md)之后，核对剩下的"叫醒所有等待者"的地方，有两处常见：vfork 的子进程 execve 或退出时为了叫醒父进程，setitimer、timer_settime 为了让定时器线程重新计算，都请求了所有通道，读着管道的 shell、停在 poll 和 epoll 里的线程、等子进程的进程都被叫醒一遍。musl、glibc 的 `posix_spawn` 都用 `CLONE_VFORK`，gcc 的驱动程序起 cc1、as、ld，Python 的 subprocess，Java 的 ProcessBuilder，Go 的 os/exec 也都是 vfork 式的 clone，构建类的负载里每起一个进程就广播一次。量下来（`target/herd/spawn.c`）：8 个进程空等在 epoll 上，主进程 `posix_spawn` 300 次 `/bin/true`、调 2000 次 setitimer，空等的进程被叫醒 9400–10500 次，每次 spawn 从 174 微秒变成 195 微秒，每次 setitimer 从 2.1 微秒变成 11–15 微秒（原生 0.2 微秒，空等的进程不醒）。
 
@@ -14,4 +14,4 @@
 **推迟项**：
 
 - 仍请求所有通道的：SIGCONT 让停住的进程继续、所有线程都屏蔽的信号、SysV IPC、POSIX 消息队列、AIO 完成、租约、关闭控制台。
-- signalfd 在 poll、epoll 时看的是创建它的线程挂起的信号，读时看的是读它的线程的；Linux 两者都看调用的线程（这一轮的差分测试里发现）。
+- signalfd 在 poll、epoll 时看的是创建它的线程挂起的信号，读时看的是读它的线程的；Linux 两者都看调用的线程（这一轮的差分测试里发现）。→ 已改为看调用的线程（M9 之前：signalfd 看调用的线程）
