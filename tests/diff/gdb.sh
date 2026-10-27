@@ -48,8 +48,11 @@ int main(void)
 C
 gcc -g -O0 -o loop loop.c
 gcc -g -O0 -o threads threads.c -lpthread
+# info threads 里不是当前线程的那几行只留编号和名字：另一个线程停在哪一帧取决于调度（主
+# 线程可能还在 clone 里，也可能已经在 pthread_join 里等）
 norm() {
-    sed -E 's/0x[0-9a-f]+/ADDR/g; s/(process|LWP|Thread) [0-9]+/\1 N/g; s/^\[Inferior 1 \(process N\)/[Inferior 1/'
+    sed -E 's/0x[0-9a-f]+/ADDR/g; s/(process|LWP|Thread) [0-9]+/\1 N/g; s/^\[Inferior 1 \(process N\)/[Inferior 1/' |
+        sed -E 's/^(  [0-9]+ +LWP N "[^"]*").*/\1/'
 }
 # 软件观察点（逐条单步之后比较）
 gdb -batch -nx -ex 'set can-use-hw-watchpoints 0' -ex 'break square' -ex run -ex bt -ex 'print x' \
