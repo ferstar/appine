@@ -4,8 +4,12 @@
 cd /sys/fs/cgroup
 echo "self: $(cat /proc/self/cgroup)"
 echo "shell: $(cat /proc/$$/cgroup)"
+# /proc/cgroups 列出哪些控制器取决于内核的配置（新内核不列没有 v1 支持的 cpuset、memory），
+# 只比都在 v2 的层级（0）上、有 cpu
 head -1 /proc/cgroups
-awk '$1 ~ /^(cpuset|cpu|cpuacct|memory|pids)$/ { print $1, $2, $4 }' /proc/cgroups
+awk 'NR > 1 && $2 != 0 { v1 = 1 } $1 == "cpu" { cpu = 1 }
+    END { print (v1 ? "a v1 hierarchy" : "all on the v2 hierarchy"), (cpu ? "with cpu" : "without cpu") }' \
+    /proc/cgroups
 grep ' /sys/fs/cgroup ' /proc/self/mountinfo | cut -d ' ' -f 4-
 grep ' /sys/fs/cgroup ' /proc/mounts
 echo "fs type: $(stat -f -c %t /sys/fs/cgroup)"
@@ -13,19 +17,21 @@ stat -c '%A %n' /sys/fs/cgroup
 for c in cpuset cpu memory pids; do
     grep -qw $c cgroup.controllers && echo "controller $c"
 done
-# 内容与宿主无关的文件。appine 报告 6.1，新内核在 cgroup.stat、memory.events、cpu.stat 里
-# 多了项（nr_subsys_*、sock_throttled、nice_usec），这几个只比 6.1 就有的
+# 内容与宿主无关的文件。appine 报告 6.1，新内核在 cgroup.stat、memory.events、cpu.stat、
+# pids.events 里多了项（nr_subsys_*、sock_throttled、nice_usec……），这几个只比 6.1 就有的
 for f in cgroup.events cgroup.freeze cgroup.max.depth cgroup.max.descendants \
     cgroup.subtree_control cgroup.type cpu.idle cpu.max cpu.max.burst cpu.weight \
     cpu.weight.nice cpuset.cpus cpuset.cpus.effective cpuset.cpus.partition cpuset.mems \
     cpuset.mems.effective memory.high memory.low memory.min memory.oom.group \
-    memory.swap.current memory.swap.events memory.swap.high pids.events; do
+    memory.swap.current memory.swap.high; do
     echo "$(stat -c %A $f) $f: $(tr '\n' '|' < $f)"
 done
 echo "$(stat -c %A cgroup.stat) cgroup.stat: $(grep -E '^nr_(dying_)?descendants ' cgroup.stat | tr '\n' '|')"
 for f in memory.events memory.events.local; do
     echo "$(stat -c %A $f) $f: $(grep -E '^(low|high|max|oom|oom_kill|oom_group_kill) ' $f | tr '\n' '|')"
 done
+echo "$(stat -c %A memory.swap.events) memory.swap.events: $(grep -E '^(high|max|fail) ' memory.swap.events | tr '\n' '|')"
+echo "$(stat -c %A pids.events) pids.events: $(grep -E '^max ' pids.events | tr '\n' '|')"
 for k in usage_usec user_usec system_usec nr_periods nr_throttled throttled_usec nr_bursts \
     burst_usec; do
     grep -q "^$k " cpu.stat && printf '%s ' $k
