@@ -1,9 +1,10 @@
 # 等待和唤醒：别的进程在别的管道、socket、eventfd、PTY 上来回读写，起进程（含 vfork、
 # posix_spawn）、结束进程，改别的 epoll、timerfd、inotify、signalfd，设定时器，建立、关闭
 # TCP 连接，查 netlink，加锁解锁、设租约、改管道大小，收发、开关消息队列，读写设了 O_ASYNC
-# 的管道时，空闲着等自己的对象的进程不被叫醒（自愿上下文切换的次数不变）；每一种对象上
-# 真正的事件都叫醒另一个进程里等着的线程，vfork 的父进程、改短了的定时器、等锁和租约的
-# 进程、消息队列的通知、读空之后再来数据的 SIGIO 照常
+# 的管道，给自己发被屏蔽的信号、屏蔽着 SIGCHLD 起子进程时，空闲着等自己的对象的进程不被
+# 叫醒（自愿上下文切换的次数不变）；每一种对象上真正的事件都叫醒另一个进程里等着的线程，
+# vfork 的父进程、改短了的定时器、等锁和租约的进程、消息队列的通知、读空之后再来数据的
+# SIGIO、sigtimedwait 和 signalfd 等的被屏蔽的信号照常
 set -e
 rm -rf /tmp/wakeups.d /tmp/wakeups.idle /tmp/wakeups.lock /dev/shm/wakeups.lease
 mkdir -p /tmp/wakeups.d /tmp/wakeups.idle
@@ -416,6 +417,26 @@ static void traffic(void)
     }
     close(a[0]), close(a[1]);
     signal(SIGIO, SIG_DFL);
+
+    /* 给自己发被屏蔽的信号再取走；屏蔽着 SIGCHLD 起子进程（被所有线程屏蔽的信号） */
+    sigset_t blk, u1;
+    sigemptyset(&blk);
+    sigaddset(&blk, SIGUSR1);
+    sigaddset(&blk, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &blk, NULL);
+    sigemptyset(&u1);
+    sigaddset(&u1, SIGUSR1);
+    for (int i = 0; i < 200; i++) {
+        kill(getpid(), SIGUSR1);
+        sigwaitinfo(&u1, NULL);
+    }
+    for (int i = 0; i < 30; i++) {
+        pid_t p = fork();
+        if (p == 0)
+            _exit(0);
+        waitpid(p, NULL, 0);
+    }
+    sigprocmask(SIG_UNBLOCK, &blk, NULL);
 }
 
 static void idle_waiters(void)
@@ -462,6 +483,8 @@ static double now(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
+static pid_t last_child; /* check 的 poke 要发信号给它 */
+
 /* 子进程执行 waiter（返回非 0 表示等到了；最多 3 秒，到时 SIGALRM 打断阻塞的调用），
  * 100 毫秒之后本进程执行 poke。2 秒之内等到才算被叫醒：没被叫醒的线程被 SIGALRM 叫醒
  * 之后也会看到条件早已成立 */
@@ -475,6 +498,7 @@ static void check(const char *name, int (*waiter)(void), void (*poke)(void))
         alarm(3);
         _exit(waiter() ? 0 : 1);
     }
+    last_child = p;
     usleep(100000);
     poke();
     int st;
@@ -785,6 +809,111 @@ static void write_s_twice(void)
     write(tcp_s, "b", 1);
 }
 
+/* ---- 被屏蔽的信号：sigtimedwait、signalfd 等着它 ---- */
+static sigset_t usr12;
+static void block_usr12(void)
+{
+    sigemptyset(&usr12);
+    sigaddset(&usr12, SIGUSR1);
+    sigaddset(&usr12, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &usr12, NULL);
+}
+static int sigwait_usr1(void)
+{
+    block_usr12();
+    struct timespec ts = {3, 0};
+    return sigtimedwait(&usr12, NULL, &ts) == SIGUSR1;
+}
+static void kill_usr1(void) { kill(last_child, SIGUSR1); }
+static pthread_t main_thread;
+static void *tkill_main(void *arg)
+{
+    (void)arg;
+    usleep(100000);
+    pthread_kill(main_thread, SIGUSR1);
+    return NULL;
+}
+static int sigwait_thread(void)
+{
+    block_usr12();
+    main_thread = pthread_self();
+    pthread_t t;
+    pthread_create(&t, NULL, tkill_main, NULL);
+    struct timespec ts = {3, 0};
+    return sigtimedwait(&usr12, NULL, &ts) == SIGUSR1;
+}
+static int sigwait_timer(void)
+{
+    block_usr12();
+    struct sigevent sev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR2};
+    timer_t t;
+    timer_create(CLOCK_MONOTONIC, &sev, &t);
+    struct itimerspec it = {.it_value = {0, 100000000}};
+    timer_settime(t, 0, &it, NULL);
+    struct timespec ts = {3, 0};
+    return sigtimedwait(&usr12, NULL, &ts) == SIGUSR2;
+}
+static int sigwait_chld(void)
+{
+    sigset_t c;
+    sigemptyset(&c);
+    sigaddset(&c, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &c, NULL);
+    if (fork() == 0) {
+        usleep(100000);
+        _exit(0);
+    }
+    struct timespec ts = {3, 0};
+    return sigtimedwait(&c, NULL, &ts) == SIGCHLD;
+}
+static int read_sfd_usr1(void)
+{
+    block_usr12();
+    int fd = signalfd(-1, &usr12, 0);
+    return read(fd, big, sizeof big) == 128;
+}
+static int epoll_sfd_usr1(void)
+{
+    block_usr12();
+    int fd = signalfd(-1, &usr12, 0), e = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN};
+    epoll_ctl(e, EPOLL_CTL_ADD, fd, &ev);
+    return epoll_wait(e, &ev, 1, 3000) == 1;
+}
+static int nested_sfd_usr1(void)
+{
+    block_usr12();
+    int fd = signalfd(-1, &usr12, 0), in = epoll_create1(0), out = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN};
+    epoll_ctl(in, EPOLL_CTL_ADD, fd, &ev);
+    epoll_ctl(out, EPOLL_CTL_ADD, in, &ev);
+    return epoll_wait(out, &ev, 1, 3000) == 1;
+}
+/* 外层以边沿触发关注内层：SIGUSR1 已经挂着（报告过一次），过一会儿另一个线程发来
+ * SIGUSR2（两个线程都屏蔽着），要再报告一次 */
+static void *kill_self_usr2(void *arg)
+{
+    (void)arg;
+    usleep(100000);
+    kill(getpid(), SIGUSR2);
+    return NULL;
+}
+static int nested_sfd_edge(void)
+{
+    block_usr12();
+    int fd = signalfd(-1, &usr12, 0), in = epoll_create1(0), out = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN};
+    epoll_ctl(in, EPOLL_CTL_ADD, fd, &ev);
+    ev.events = EPOLLIN | EPOLLET;
+    epoll_ctl(out, EPOLL_CTL_ADD, in, &ev);
+    kill(getpid(), SIGUSR1);
+    if (epoll_wait(out, &ev, 1, 0) != 1)
+        return 0;
+    pthread_t t;
+    pthread_create(&t, NULL, kill_self_usr2, NULL);
+    return epoll_wait(out, &ev, 1, 3000) == 1;
+}
+
 static void wake_cases(void)
 {
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
@@ -948,6 +1077,16 @@ static void wake_cases(void)
     tcp_pair(&tcp_s, &tcp_c);
     check("SIGIO tcp (again after drain)", sigio_again, write_s_twice);
     close(tcp_s), close(tcp_c);
+
+    block_usr12(); /* 子进程继承：父进程发来的信号不会在它屏蔽之前到达 */
+    check("sigtimedwait (kill)", sigwait_usr1, kill_usr1);
+    check("sigtimedwait (pthread_kill)", sigwait_thread, nothing);
+    check("sigtimedwait (timer)", sigwait_timer, nothing);
+    check("sigtimedwait (SIGCHLD)", sigwait_chld, nothing);
+    check("read signalfd (kill)", read_sfd_usr1, kill_usr1);
+    check("epoll signalfd (kill)", epoll_sfd_usr1, kill_usr1);
+    check("nested epoll signalfd (kill)", nested_sfd_usr1, kill_usr1);
+    check("nested epoll signalfd (edge)", nested_sfd_edge, nothing);
 }
 
 int main(void)

@@ -274,10 +274,10 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
 }
 
 /// 等打开文件 `f` 的就绪状态变化时要登记的唤醒对象（[`wake::of`]）。改变进程内对象
-/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求整个通道（挂起的信号、pidfd
-/// 仍是这样）；宿主 fd 上的数据由宿主 poll 等，宿主 socket 列出它自己（关闭、DNS 存根
-/// 的回答）。signalfd 只列出它自己（改掩码），epoll 只列出它自己（epoll_ctl），里面的
-/// 关注由 [`Waits`] 逐个加上。
+/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求一个通道（挂起的信号请求
+/// [`wake::SIGNAL`]，pidfd 的子进程请求 [`wake::CHILD`]，关注了它们才听）；宿主 fd 上的
+/// 数据由宿主 poll 等，宿主 socket 列出它自己（关闭、DNS 存根的回答）。signalfd 只列出
+/// 它自己（改掩码），epoll 只列出它自己（epoll_ctl），里面的关注由 [`Waits`] 逐个加上。
 fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
     match &f.kind {
         FileKind::Pipe(end) => out.push(crate::pipe::object(&end.pipe)),
@@ -302,6 +302,8 @@ struct Waits {
     /// 有 pidfd：子进程状态的变化（[`wake::CHILD`]）也要叫醒它。别的文件都不关心这个
     /// 通道，原来每个进程结束都把所有 poll、epoll 的等待者叫醒一遍。
     pidfd: bool,
+    /// 有 signalfd：被屏蔽的信号挂起（[`wake::SIGNAL`]）也要叫醒它。
+    signalfd: bool,
     timer: Option<Instant>,
     /// 有边沿触发的关注少等了报告过的位。
     edge: bool,
@@ -316,6 +318,7 @@ impl Waits {
         let (_, host) = readiness(f, depth);
         self.files |= host.is_none();
         self.pidfd |= matches!(f.kind, FileKind::Pidfd(_));
+        self.signalfd |= matches!(f.kind, FileKind::SignalFd(_));
         wake_objects(f, &mut self.objects);
         match (&f.kind, host) {
             (_, Some(fd)) => self.host.push((fd, wanted, 0)),
@@ -351,6 +354,7 @@ impl Waits {
             }
             wake_objects(&f, &mut self.objects);
             self.pidfd |= matches!(f.kind, FileKind::Pidfd(_));
+            self.signalfd |= matches!(f.kind, FileKind::SignalFd(_));
             match &f.kind {
                 FileKind::TimerFd(t) => {
                     if let Some(d) = t.borrow().deadline {
@@ -434,7 +438,9 @@ impl Waits {
         let interest = if only_gated {
             0
         } else {
-            wake::FILE | if self.pidfd { wake::CHILD } else { 0 }
+            wake::FILE
+                | if self.pidfd { wake::CHILD } else { 0 }
+                | if self.signalfd { wake::SIGNAL } else { 0 }
         };
         let r = cx.wait_objects(until, &mut self.host, interest, &self.objects);
         if self.edge {

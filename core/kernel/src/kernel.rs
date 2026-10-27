@@ -64,7 +64,12 @@ pub(crate) mod wake {
     /// 放开了或者变了：只有等它们的线程听。原来走文件类的通道，每次解锁都把所有停在
     /// poll、epoll 里的线程叫醒一遍。
     pub const LOCK: u32 = 32;
-    pub const ALL: u32 = FILE | OTHER | CHILD | WATCHED | EXITED | LOCK;
+    /// 被屏蔽的信号挂起了（发给进程的被所有线程屏蔽，发给线程的被它屏蔽）：只有等它们的
+    /// 线程听（sigtimedwait、signalfd 的读，poll、epoll 关注了 signalfd 的）。原来叫醒
+    /// 所有等待者：musl 的 fork 在 clone 前后屏蔽所有信号，这时有子进程退出，SIGCHLD 就
+    /// 是被所有线程屏蔽的，shell 起管道时常常碰到。
+    pub const SIGNAL: u32 = 64;
+    pub const ALL: u32 = FILE | OTHER | CHILD | WATCHED | EXITED | LOCK | SIGNAL;
     /// 有只影响某些对象的修改（[`super::request_wake_object`]），不是等待者关心的通道。
     pub(super) const OBJECTS: u32 = 1 << 31;
 

@@ -585,8 +585,8 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
     if !blocked {
         wake(task);
     } else {
-        // sigtimedwait 等的正是被屏蔽的信号
-        request_wake();
+        // sigtimedwait、signalfd 等的正是被屏蔽的信号：只叫醒等它们的（wake::SIGNAL）
+        request_wake_on(wake::SIGNAL);
     }
 }
 
@@ -644,8 +644,8 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
     };
     match target.or_else(|| threads.iter().find(unmasked)) {
         Some(t) => wake(t),
-        // 所有线程都屏蔽了它：sigtimedwait 里等着的线程要重新检查
-        None => request_wake(),
+        // 所有线程都屏蔽了它：sigtimedwait、signalfd 里等着的线程要重新检查
+        None => request_wake_on(wake::SIGNAL),
     }
 }
 

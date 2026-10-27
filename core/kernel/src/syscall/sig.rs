@@ -8,7 +8,7 @@ use super::{SysResult, get, put, read_timespec};
 use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::fd::FileKind;
-use crate::kernel::{Cx, INIT, Tid};
+use crate::kernel::{Cx, INIT, Tid, wake};
 use crate::process::Signal;
 use crate::pseudo::PseudoNode;
 use crate::signal::{self, SigAction, SigInfo, UNBLOCKABLE, code};
@@ -343,7 +343,8 @@ pub(super) fn signalfd_read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        cx.wait(None, &mut [])?;
+        // 被屏蔽的信号挂起时请求 wake::SIGNAL，改掩码时请求这个 signalfd
+        cx.wait_objects(None, &mut [], wake::FILE | wake::SIGNAL, &[wake::of(s)])?;
     }
 }
 
@@ -549,7 +550,8 @@ pub(super) fn rt_sigtimedwait(
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
-        cx.wait(deadline, &mut [])?;
+        // 被屏蔽的信号挂起时请求 wake::SIGNAL；没有屏蔽的直接叫醒这个线程
+        cx.wait_on(deadline, &mut [], wake::SIGNAL)?;
     }
 }
 
