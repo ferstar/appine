@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -368,6 +369,14 @@ int main(void)
               errno == ETIMEDOUT,
           "futex in a shared file mapping");
     ok("futex timeout");
+    /* netlink 没有回答可读时按 SO_RCVTIMEO 等 */
+    int nl = socket(AF_NETLINK, SOCK_RAW, 0 /* NETLINK_ROUTE */);
+    struct timeval nl_wait = {0, 5000};
+    CHECK(nl >= 0 && setsockopt(nl, SOL_SOCKET, SO_RCVTIMEO, &nl_wait, sizeof nl_wait) == 0,
+          "netlink socket");
+    CHECK(recv(nl, buf, sizeof buf, 0) < 0 && errno == EAGAIN, "netlink recv");
+    close(nl);
+    ok("netlink recv timeout");
 
     /* 等另一个线程 */
     after(&l, write_byte, p[1]);

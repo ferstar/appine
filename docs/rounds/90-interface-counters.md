@@ -1,6 +1,6 @@
 # M9 之前：网络接口的流量计数（2026-10-29）
 
-← [M9 之前：测试用的发布构建也检查借用（2026-10-29）](89-release-borrow-check.md) · [索引](../milestones.md)
+← [M9 之前：测试用的发布构建也检查借用（2026-10-29）](89-release-borrow-check.md) · [索引](../milestones.md) · [M9 之前：NETLINK_GENERIC 只有 nlctrl（2026-10-29）](91-generic-netlink.md) →
 
 [网络信息的缺口](78-net-info-gaps.md)那一轮记下的推迟项之一：`/proc/net/dev` 的计数全是 0，`ifconfig` 的 RX/TX、htop、nload 的网络面板一直是 0。btop 读的是 `/sys/class/net/<接口>/statistics/{rx,tx}_bytes`（`strings` 看过它的二进制），appine 原来没有 `/sys/class`；`ip -s link` 和 getifaddrs 的 `ifa_data` 来自 netlink 的 `IFLA_STATS`，原来也没有。
 

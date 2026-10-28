@@ -17,4 +17,4 @@
 
 **推迟项**：
 
-- `NETLINK_GENERIC` 在 Linux 上总是有的，用它的程序（iw、ethtool 的 netlink 接口、wireguard 的工具）可能不预期 EPROTONOSUPPORT；原来是一直等，现在至少会报错。要的话可以只回答 `CTRL_CMD_GETFAMILY`：没有这个族（ENOENT）。
+- `NETLINK_GENERIC` 在 Linux 上总是有的，用它的程序（iw、ethtool 的 netlink 接口、wireguard 的工具）可能不预期 EPROTONOSUPPORT；原来是一直等，现在至少会报错。要的话可以只回答 `CTRL_CMD_GETFAMILY`：没有这个族（ENOENT）。→ 已补上（M9 之前：NETLINK_GENERIC 只有 nlctrl）：建得了，有 nlctrl 一个族，查别的族是 ENOENT，与 Linux 6.8 逐字节相同

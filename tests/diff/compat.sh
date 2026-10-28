@@ -547,6 +547,195 @@ same = b["proc"] == (b["rx_bytes"], b["rx_packets"], b["tx_bytes"], b["tx_packet
 print("/proc/net/dev and sysfs", "agree" if same else "disagree")
 PY
 
+# NETLINK_GENERIC：nlctrl 的 GETFAMILY（按名字、按编号、转储）、GETPOLICY，查不存在的族、
+# 发往不存在的族编号、nlctrl 不认识的命令；回答的属性、错误码、确认的标志和错误消息附上
+# 的长度。转储里只看 nlctrl，别的族取决于内核配置
+cat > genl.c <<'C'
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+/* linux/netlink.h、linux/genetlink.h 里的（仓库里没有内核头文件） */
+#define NETLINK_GENERIC 16
+#define NLM_F_REQUEST 1
+#define NLM_F_MULTI 2
+#define NLM_F_ACK 4
+#define NLM_F_DUMP 0x300
+#define NLMSG_ERROR 2
+#define NLMSG_DONE 3
+#define GENL_ID_CTRL 0x10
+#define CTRL_CMD_GETFAMILY 3
+#define CTRL_ATTR_FAMILY_ID 1
+#define CTRL_ATTR_FAMILY_NAME 2
+#define CTRL_ATTR_OPS 6
+#define CTRL_ATTR_MCAST_GROUPS 7
+#define NLA_TYPE_MASK 0x3fff
+struct nlmsghdr {
+    uint32_t nlmsg_len;
+    uint16_t nlmsg_type, nlmsg_flags;
+    uint32_t nlmsg_seq, nlmsg_pid;
+};
+struct nlmsgerr {
+    int error;
+    struct nlmsghdr msg;
+};
+struct genlmsghdr {
+    uint8_t cmd, version;
+    uint16_t reserved;
+};
+struct nlattr {
+    uint16_t nla_len, nla_type;
+};
+#define NLMSG_ALIGN(n) (((n) + 3) & ~3)
+#define NLMSG_LENGTH(n) ((n) + sizeof(struct nlmsghdr))
+#define NLMSG_DATA(h) ((void *)((char *)(h) + sizeof(struct nlmsghdr)))
+#define NLMSG_OK(h, n) ((n) >= (int)sizeof(struct nlmsghdr) && (h)->nlmsg_len >= sizeof(struct nlmsghdr) && (int)(h)->nlmsg_len <= (n))
+#define NLMSG_NEXT(h, n) ((n) -= NLMSG_ALIGN((h)->nlmsg_len), (struct nlmsghdr *)((char *)(h) + NLMSG_ALIGN((h)->nlmsg_len)))
+#define GENL_HDRLEN 4
+#define NLA_HDRLEN 4
+#define NLA_ALIGN(n) (((n) + 3) & ~3)
+
+static int fd;
+static unsigned seq;
+
+static void request(unsigned short type, unsigned short flags, unsigned char cmd, unsigned short attr,
+                    const void *val, int len)
+{
+    char buf[256];
+    memset(buf, 0, sizeof buf);
+    struct nlmsghdr *h = (void *)buf;
+    struct genlmsghdr *g = NLMSG_DATA(h);
+    g->cmd = cmd;
+    g->version = 1;
+    struct nlattr *a = (void *)(g + 1);
+    int total = NLMSG_LENGTH(GENL_HDRLEN);
+    if (attr) {
+        a->nla_type = attr;
+        a->nla_len = NLA_HDRLEN + len;
+        memcpy((char *)a + NLA_HDRLEN, val, len);
+        total += NLA_ALIGN(a->nla_len);
+    }
+    h->nlmsg_len = total;
+    h->nlmsg_type = type;
+    h->nlmsg_flags = NLM_F_REQUEST | flags;
+    h->nlmsg_seq = ++seq;
+    send(fd, buf, total, 0);
+}
+
+static void attrs(struct nlattr *a, int len, int depth)
+{
+    for (; len >= NLA_HDRLEN && a->nla_len >= NLA_HDRLEN && a->nla_len <= len;
+         len -= NLA_ALIGN(a->nla_len), a = (void *)((char *)a + NLA_ALIGN(a->nla_len))) {
+        int type = a->nla_type & NLA_TYPE_MASK, n = a->nla_len - NLA_HDRLEN;
+        void *d = (char *)a + NLA_HDRLEN;
+        printf("%*sattr %d", depth * 2, "", type);
+        if (depth == 0 && (type == CTRL_ATTR_OPS || type == CTRL_ATTR_MCAST_GROUPS)) {
+            printf(" nested\n");
+            attrs(d, n, 1);
+        } else if (depth == 1) {
+            printf(" nested\n");
+            attrs(d, n, 2);
+        } else if (n == 2)
+            printf(" u16 %u\n", *(unsigned short *)d);
+        else if (n == 4)
+            printf(" u32 %u\n", *(unsigned *)d);
+        else
+            printf(" \"%.*s\"\n", n, (char *)d);
+    }
+}
+
+/* 读回答直到 DONE、ERROR 或者没有更多 */
+static void replies(const char *what)
+{
+    printf("== %s\n", what);
+    char buf[16384];
+    for (;;) {
+        int n = recv(fd, buf, sizeof buf, 0);
+        if (n < 0) {
+            printf("recv errno %d\n", errno);
+            return;
+        }
+        for (struct nlmsghdr *h = (void *)buf; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                struct nlmsgerr *e = NLMSG_DATA(h);
+                printf("error %d, flags %#x, echoed %u bytes, type %u\n", e->error, h->nlmsg_flags,
+                       (unsigned)(h->nlmsg_len - NLMSG_LENGTH(sizeof(int))), e->msg.nlmsg_type);
+                return;
+            }
+            if (h->nlmsg_type == NLMSG_DONE) {
+                printf("done\n");
+                return;
+            }
+            struct genlmsghdr *g = NLMSG_DATA(h);
+            if (!(h->nlmsg_flags & NLM_F_MULTI))
+                printf("type %u flags %#x cmd %u version %u\n", h->nlmsg_type, h->nlmsg_flags,
+                       g->cmd, g->version);
+            struct nlattr *a = (void *)((char *)g + GENL_HDRLEN);
+            int len = h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+            /* 转储里只看 nlctrl，别的族取决于内核配置 */
+            if (h->nlmsg_flags & NLM_F_MULTI) {
+                char *name = NULL;
+                for (int l = len; l >= NLA_HDRLEN; ) {
+                    if (a->nla_type == CTRL_ATTR_FAMILY_NAME) name = (char *)a + NLA_HDRLEN;
+                    l -= NLA_ALIGN(a->nla_len);
+                    a = (void *)((char *)a + NLA_ALIGN(a->nla_len));
+                }
+                if (name && strcmp(name, "nlctrl") == 0)
+                    printf("  family nlctrl\n");
+                continue;
+            }
+            attrs(a, len, 0);
+            if (!(h->nlmsg_flags & NLM_F_MULTI))
+                return;
+        }
+    }
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+    if (fd < 0) {
+        printf("socket errno %d\n", errno);
+        return 0;
+    }
+    struct timeval tv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    request(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, CTRL_ATTR_FAMILY_NAME, "nlctrl", 7);
+    replies("GETFAMILY nlctrl");
+    unsigned short id = GENL_ID_CTRL;
+    request(GENL_ID_CTRL, NLM_F_ACK, CTRL_CMD_GETFAMILY, CTRL_ATTR_FAMILY_ID, &id, 2);
+    replies("GETFAMILY id 16, with ACK");
+    replies("ACK");
+    request(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, CTRL_ATTR_FAMILY_NAME, "appine-none", 12);
+    replies("GETFAMILY appine-none");
+    request(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, 0, NULL, 0);
+    replies("GETFAMILY without attributes");
+    request(0x7ff0, 0, 1, 0, NULL, 0);
+    replies("unknown family id");
+    request(GENL_ID_CTRL, 0, 99, 0, NULL, 0);
+    replies("unknown nlctrl command");
+    request(GENL_ID_CTRL, NLM_F_DUMP, CTRL_CMD_GETFAMILY, 0, NULL, 0);
+    replies("dump (only nlctrl shown)");
+    request(GENL_ID_CTRL, 0, 10 /* CTRL_CMD_GETPOLICY */, CTRL_ATTR_FAMILY_NAME, "appine-none", 12);
+    replies("GETPOLICY without NLM_F_DUMP");
+    request(GENL_ID_CTRL, NLM_F_DUMP, 10, CTRL_ATTR_FAMILY_NAME, "appine-none", 12);
+    replies("GETPOLICY appine-none");
+    request(GENL_ID_CTRL, NLM_F_DUMP, 10, 0, NULL, 0);
+    replies("GETPOLICY without attributes");
+    struct timeval short_wait = {0, 100000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &short_wait, sizeof short_wait);
+    replies("nothing left to read (SO_RCVTIMEO)");
+    return 0;
+}
+C
+gcc -O1 -o genl genl.c
+./genl
+
 # fdinfo 里 epoll、timerfd、signalfd 特有的行；mountinfo 的设备号与 stat 一致，
 # fdinfo 的 mnt_id 能在 mountinfo 里找到
 cat > fdinfo.c <<'C'

@@ -227,6 +227,8 @@ pub(crate) struct NetlinkSocket {
     pub queue: VecDeque<Vec<u8>>,
     /// 放进 `queue` 的数据报数（`EPOLLET` 每来一个都触发）。
     pub arrivals: u64,
+    /// `SO_RCVTIMEO`：没有回答可读时最多等多久。
+    pub rcvtimeo: Option<Duration>,
 }
 
 // ---- DNS 存根 ----
@@ -305,6 +307,8 @@ const IFA_F_PERMANENT: u8 = 0x80;
 pub const NETLINK_ROUTE: i32 = 0;
 /// NETLINK_KOBJECT_UEVENT 的协议号：内核发出的热插拔事件。
 pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
+/// NETLINK_GENERIC 的协议号。
+pub const NETLINK_GENERIC: i32 = 16;
 
 fn align4(b: &mut Vec<u8>) {
     b.resize(b.len().next_multiple_of(4), 0);
@@ -391,6 +395,159 @@ fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
         .collect()
 }
 
+// ---- NETLINK_GENERIC ----
+//
+// 只有 Linux 总会有的 nlctrl 一个族（GENL_ID_CTRL）。nl80211、ethtool、wireguard、TASKSTATS
+// 这些子系统都没有，查它们得到 ENOENT，与没有编进它们的 Linux 一样：iw、ethtool、wg、iotop
+// 照它报错或者退回别的做法（原来 socket 就是 EPROTONOSUPPORT，有的程序不预期它）。回答的
+// 内容、错误码和错误消息里附上的请求与 Linux 6.8 逐字节相同（差分测试）。
+
+const GENL_ID_CTRL: u16 = 0x10;
+/// 小于它的消息类型是 netlink 自己的控制消息（`NLMSG_NOOP` 等）。
+const NLMSG_MIN_TYPE: u16 = 0x10;
+/// 确认消息只附上请求的消息头。
+const NLM_F_CAPPED: u16 = 0x100;
+const CTRL_CMD_NEWFAMILY: u8 = 1;
+const CTRL_CMD_GETFAMILY: u8 = 3;
+const CTRL_CMD_GETPOLICY: u8 = 10;
+const CTRL_ATTR_FAMILY_ID: u16 = 1;
+const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+const CTRL_ATTR_VERSION: u16 = 3;
+const CTRL_ATTR_HDRSIZE: u16 = 4;
+const CTRL_ATTR_MAXATTR: u16 = 5;
+const CTRL_ATTR_OPS: u16 = 6;
+const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+const CTRL_ATTR_OP_ID: u16 = 1;
+const CTRL_ATTR_OP_FLAGS: u16 = 2;
+const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+const GENL_CMD_CAP_DO: u32 = 2;
+const GENL_CMD_CAP_DUMP: u32 = 4;
+const GENL_CMD_CAP_HASPOL: u32 = 8;
+const NLA_TYPE_MASK: u16 = 0x3fff;
+const ENOENT: i32 = 2;
+const EINVAL: i32 = 22;
+const EOPNOTSUPP: i32 = 95;
+
+/// nlctrl 的 `CTRL_CMD_NEWFAMILY`：genlmsghdr 和属性，与 Linux 6.8 的 `ctrl_fill_info` 相同
+/// （6.2 起 nlctrl 的命令各有自己的策略，族的 maxattr 是 0）。
+fn nlctrl_family() -> Vec<u8> {
+    let mut p = vec![CTRL_CMD_NEWFAMILY, 2, 0, 0];
+    attr(&mut p, CTRL_ATTR_FAMILY_NAME, b"nlctrl\0");
+    attr(&mut p, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes());
+    attr(&mut p, CTRL_ATTR_VERSION, &2u32.to_le_bytes());
+    attr(&mut p, CTRL_ATTR_HDRSIZE, &0u32.to_le_bytes());
+    attr(&mut p, CTRL_ATTR_MAXATTR, &0u32.to_le_bytes());
+    let caps = [
+        (
+            CTRL_CMD_GETFAMILY,
+            GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP | GENL_CMD_CAP_HASPOL,
+        ),
+        (CTRL_CMD_GETPOLICY, GENL_CMD_CAP_DUMP | GENL_CMD_CAP_HASPOL),
+    ];
+    let mut ops = Vec::new();
+    for (n, (cmd, flags)) in caps.into_iter().enumerate() {
+        let mut op = Vec::new();
+        attr(&mut op, CTRL_ATTR_OP_ID, &u32::from(cmd).to_le_bytes());
+        attr(&mut op, CTRL_ATTR_OP_FLAGS, &flags.to_le_bytes());
+        attr(&mut ops, n as u16 + 1, &op);
+    }
+    attr(&mut p, CTRL_ATTR_OPS, &ops);
+    let mut group = Vec::new();
+    attr(
+        &mut group,
+        CTRL_ATTR_MCAST_GRP_ID,
+        &u32::from(GENL_ID_CTRL).to_le_bytes(),
+    );
+    attr(&mut group, CTRL_ATTR_MCAST_GRP_NAME, b"notify\0");
+    let mut groups = Vec::new();
+    attr(&mut groups, 1, &group);
+    attr(&mut p, CTRL_ATTR_MCAST_GROUPS, &groups);
+    p
+}
+
+/// 请求 `req`（消息头之后是 genlmsghdr 和属性）指的族是不是 nlctrl：按 `CTRL_ATTR_FAMILY_ID`
+/// 或者 `CTRL_ATTR_FAMILY_NAME` 找（Linux 的 `ctrl_getfamily`），两个都没有是 EINVAL，找不到
+/// 是 ENOENT。
+fn names_nlctrl(req: &[u8]) -> Result<(), i32> {
+    let (mut id, mut name) = (None, None);
+    let mut b = req.get(20..).unwrap_or_default();
+    while b.len() >= 4 {
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        if len < 4 || len > b.len() {
+            break;
+        }
+        let data = &b[4..len];
+        match u16::from_le_bytes([b[2], b[3]]) & NLA_TYPE_MASK {
+            CTRL_ATTR_FAMILY_ID if data.len() >= 2 => {
+                id = Some(u16::from_le_bytes([data[0], data[1]]))
+            }
+            CTRL_ATTR_FAMILY_NAME => {
+                name = Some(data.split(|&c| c == 0).next().unwrap_or_default());
+            }
+            _ => {}
+        }
+        b = &b[len.next_multiple_of(4).min(b.len())..];
+    }
+    match (id, name) {
+        (Some(GENL_ID_CTRL), _) | (_, Some(b"nlctrl")) => Ok(()),
+        (None, None) => Err(EINVAL),
+        _ => Err(ENOENT),
+    }
+}
+
+/// 回答 `NETLINK_GENERIC` 上的一条请求 `req`（整条消息），`pid` 是这个 socket 的 `nl_pid`。
+/// 返回各个数据报：与 Linux 一样，回答和确认各是一个（`genlmsg_reply`、`netlink_ack`），
+/// 程序读一次只拿到回答。
+fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    let flags = u16::from_le_bytes([req[6], req[7]]);
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, pid, payload);
+    let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+    // Linux 的 netlink_rcv_skb：不是请求的、控制消息只在要确认时确认
+    let r = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
+        Ok(None)
+    } else if ty != GENL_ID_CTRL {
+        Err(ENOENT)
+    } else if req.len() < 20 {
+        Err(EINVAL)
+    } else {
+        match req[16] {
+            // 转储很小，与 Linux 一样 NLMSG_DONE 跟在同一个数据报里
+            CTRL_CMD_GETFAMILY if dump => {
+                let mut out = reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family());
+                out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
+                Ok(Some(out))
+            }
+            CTRL_CMD_GETFAMILY => {
+                names_nlctrl(req).map(|()| Some(reply(GENL_ID_CTRL, 0, &nlctrl_family())))
+            }
+            // 策略的转储没有做：只认得出要的族不存在
+            CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
+            _ => Err(EOPNOTSUPP),
+        }
+    };
+    match r {
+        // 转储之后不另外确认（Linux 的 netlink_dump_start 让 netlink_rcv_skb 跳过确认）
+        Ok(answer) => {
+            let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
+            if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
+                let mut p = 0i32.to_le_bytes().to_vec();
+                p.extend_from_slice(&req[..16]);
+                out.push(reply(NLMSG_ERROR, NLM_F_CAPPED, &p));
+            }
+            out
+        }
+        // 出错时附上整条请求（没有设 NETLINK_CAP_ACK）
+        Err(e) => {
+            let mut p = (-e).to_le_bytes().to_vec();
+            p.extend_from_slice(req);
+            vec![reply(NLMSG_ERROR, 0, &p)]
+        }
+    }
+}
+
 impl NetlinkSocket {
     pub fn new(protocol: i32) -> NetlinkSocket {
         NetlinkSocket {
@@ -398,6 +555,7 @@ impl NetlinkSocket {
             pid: 0,
             queue: VecDeque::new(),
             arrivals: 0,
+            rcvtimeo: None,
         }
     }
 
@@ -408,7 +566,7 @@ impl NetlinkSocket {
         interfaces: impl Fn() -> Vec<Interface>,
         stats: impl Fn(&str) -> IfStats,
     ) {
-        if self.protocol != NETLINK_ROUTE {
+        if !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
             return;
         }
         let mut off = 0;
@@ -422,6 +580,14 @@ impl NetlinkSocket {
             let flags = u16::from_le_bytes([h[6], h[7]]);
             let seq = u32::from_le_bytes(h[8..12].try_into().unwrap());
             let family = h.get(16).copied().unwrap_or(0);
+            if self.protocol == NETLINK_GENERIC {
+                for d in generic_request(&h[..len], self.pid) {
+                    self.queue.push_back(d);
+                    self.arrivals += 1;
+                }
+                off += len.next_multiple_of(4);
+                continue;
+            }
             let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
             let mut out = Vec::new();
             match ty {
@@ -558,6 +724,100 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0].1[..2], [AF_INET as u8, 8]);
         assert!(addrs[0].1.windows(4).any(|w| w == [127, 0, 0, 1]));
+    }
+
+    /// 一条 NETLINK_GENERIC 请求：genlmsghdr 之后是属性。
+    fn genl(ty: u16, flags: u16, cmd: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut p = vec![cmd, 1, 0, 0];
+        for (t, d) in attrs {
+            attr(&mut p, *t, d);
+        }
+        message(ty, NLM_F_REQUEST | flags, 9, 0, &p)
+    }
+
+    #[test]
+    fn generic_netlink_has_only_nlctrl() {
+        let mut s = NetlinkSocket::new(NETLINK_GENERIC);
+        s.pid = 42;
+        // 回答的各个数据报，每个解析成消息
+        let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
+            s.handle(req, Vec::new, |_| IfStats::default());
+            s.queue.drain(..).map(|d| parse(&d)).collect()
+        };
+        // 按名字查 nlctrl，要确认：回答和确认是两个数据报，确认只附上请求的消息头
+        let name: &[u8] = b"nlctrl\0";
+        let r = ask(&genl(
+            GENL_ID_CTRL,
+            NLM_F_ACK,
+            CTRL_CMD_GETFAMILY,
+            &[(CTRL_ATTR_FAMILY_NAME, name)],
+        ));
+        assert_eq!(r.len(), 2);
+        let (ty, reply) = &r[0][0];
+        assert_eq!(
+            (*ty, &reply[..2]),
+            (GENL_ID_CTRL, &[CTRL_CMD_NEWFAMILY, 2][..])
+        );
+        let a = attributes(&reply[4..]);
+        assert_eq!(a[&CTRL_ATTR_FAMILY_ID], GENL_ID_CTRL.to_le_bytes());
+        assert_eq!(a[&CTRL_ATTR_FAMILY_NAME], name);
+        let (ty, ack) = &r[1][0];
+        assert_eq!(*ty, NLMSG_ERROR);
+        assert_eq!(ack.len(), 4 + 16);
+        assert_eq!(ack[..4], 0i32.to_le_bytes());
+        // 按编号查也一样
+        let id = GENL_ID_CTRL.to_le_bytes();
+        let r = ask(&genl(
+            GENL_ID_CTRL,
+            0,
+            CTRL_CMD_GETFAMILY,
+            &[(CTRL_ATTR_FAMILY_ID, &id)],
+        ));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0][0].0, GENL_ID_CTRL);
+        // 出错时附上整条请求
+        let unknown: &[u8] = b"nl80211\0";
+        let cases: [(Vec<u8>, i32); 5] = [
+            (
+                genl(
+                    GENL_ID_CTRL,
+                    0,
+                    CTRL_CMD_GETFAMILY,
+                    &[(CTRL_ATTR_FAMILY_NAME, unknown)],
+                ),
+                -2,
+            ),
+            (genl(0x7ff0, 0, 1, &[]), -2),
+            (genl(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, &[]), -22),
+            (genl(GENL_ID_CTRL, 0, 99, &[]), -95),
+            (
+                genl(
+                    GENL_ID_CTRL,
+                    NLM_F_DUMP,
+                    CTRL_CMD_GETPOLICY,
+                    &[(CTRL_ATTR_FAMILY_NAME, unknown)],
+                ),
+                -2,
+            ),
+        ];
+        for (req, err) in cases {
+            let r = ask(&req);
+            assert_eq!(r.len(), 1);
+            let (ty, e) = &r[0][0];
+            assert_eq!(*ty, NLMSG_ERROR);
+            assert_eq!(e[..4], err.to_le_bytes());
+            assert_eq!(&e[4..], &req[..]);
+        }
+        // 转储只有 nlctrl，NLMSG_DONE 在同一个数据报里，之后不另外确认
+        let r = ask(&genl(
+            GENL_ID_CTRL,
+            NLM_F_DUMP | NLM_F_ACK,
+            CTRL_CMD_GETFAMILY,
+            &[],
+        ));
+        assert_eq!(r.len(), 1);
+        let types: Vec<u16> = r[0].iter().map(|m| m.0).collect();
+        assert_eq!(types, [GENL_ID_CTRL, NLMSG_DONE]);
     }
 
     #[test]

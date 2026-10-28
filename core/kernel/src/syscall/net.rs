@@ -12,8 +12,9 @@ use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_KOBJECT_UEVENT, NETLINK_ROUTE,
-    NetlinkSocket, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT,
+    NETLINK_ROUTE, NetlinkSocket, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket, is_stub, servfail,
+    stub_addr,
 };
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
@@ -145,11 +146,15 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
-            // 只有 NETLINK_ROUTE 回答查询，NETLINK_KOBJECT_UEVENT 只用来听热插拔事件（mdev、
-            // udev），这里不会有。别的协议与 Linux 上没有编进内核的子系统一样是
-            // EPROTONOSUPPORT：原来照样建出来、收到请求也不回答，libaudit 等 ACK 等 40 秒之后
-            // 失败，PAM 因此拒绝登录（Debian 的 sshd、login）
-            if !matches!(protocol, NETLINK_ROUTE | NETLINK_KOBJECT_UEVENT) {
+            // NETLINK_ROUTE 回答接口和地址的查询，NETLINK_GENERIC 只有 nlctrl 一个族
+            // （Linux 上总是有它）；NETLINK_KOBJECT_UEVENT 只用来听热插拔事件（mdev、udev），
+            // 这里不会有。别的协议与 Linux 上没有编进内核的子系统一样是 EPROTONOSUPPORT：
+            // 原来照样建出来、收到请求也不回答，libaudit 等 ACK 等 40 秒之后失败，PAM 因此
+            // 拒绝登录（Debian 的 sshd、login）
+            if !matches!(
+                protocol,
+                NETLINK_ROUTE | NETLINK_GENERIC | NETLINK_KOBJECT_UEVENT
+            ) {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             Socket::Netlink(NetlinkSocket::new(protocol))
@@ -426,7 +431,10 @@ pub(super) fn setsockopt(
             (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v),
             _ => appine_hal::net::setsockopt(s.fd, level, name, &v).map_err(Errno)?,
         },
-        // netlink 的缓冲区大小、组播等选项都接受，但不起作用
+        // 别的选项（缓冲区大小、组播等）都接受，但不起作用
+        Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => {
+            s.rcvtimeo = timeval(&v)
+        }
         Socket::Netlink(_) => {}
         Socket::Unix(u) => unix::setsockopt(u, level, name, &v)?,
     }
@@ -457,6 +465,7 @@ pub(super) fn getsockopt(
             (SOL_SOCKET, SO_TYPE) if s.raw => SOCK_RAW.to_le_bytes().to_vec(),
             _ => appine_hal::net::getsockopt(s.fd, level, name, room.min(256)).map_err(Errno)?,
         },
+        Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
         Socket::Netlink(_) => 0i32.to_le_bytes().to_vec(),
         Socket::Unix(u) => unix::getsockopt(u, level, name)?,
     };
@@ -618,6 +627,8 @@ pub(crate) fn recv(
             flags: if d.len() > n { MSG_TRUNC } else { 0 },
         })
     };
+    // netlink 等回答的期限（SO_RCVTIMEO），第一次没有回答可读时定下
+    let mut netlink_deadline = None;
     let (host_fd, ty, timeout) = loop {
         let host = match &mut *sock.borrow_mut() {
             Socket::Inet(s) => {
@@ -636,21 +647,24 @@ pub(crate) fn recv(
                 if let Some(m) = local(&mut s.queue, addr) {
                     return Ok(m);
                 }
+                let timeo = s.rcvtimeo;
+                netlink_deadline.get_or_insert_with(|| timeo.map(|t| Instant::now() + t));
                 None
             }
             Socket::Unix(_) => unreachable!("handled above"),
         };
         match host {
             Some(h) => break h,
-            // netlink 没有回答可读：除非被信号打断，否则一直等
+            // netlink 没有回答可读：等到被信号打断或者 SO_RCVTIMEO 到期（原来不看它，一直等）
             None => {
-                if nonblock {
+                let deadline = netlink_deadline.flatten();
+                if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(Errno::EAGAIN);
                 }
                 if cx.interrupted() {
                     return Err(Errno::ERESTARTSYS);
                 }
-                cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(sock)])?;
+                cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(sock)])?;
             }
         }
     };
