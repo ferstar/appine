@@ -1,6 +1,6 @@
 # M9 之前：终端的访问时间和修改时间（2026-10-28）
 
-← [M9 之前：网络信息的缺口（只补文档，2026-10-28）](78-net-info-gaps.md) · [索引](../milestones.md)
+← [M9 之前：网络信息的缺口（只补文档，2026-10-28）](78-net-info-gaps.md) · [索引](../milestones.md) · [M9 之前：CPU 时间不倒退（2026-10-28）](80-cpu-times.md) →
 
 [终端的属主和权限](64-pty-owner.md)那一轮的推迟项：`/dev/pts/<n>` 的访问时间、修改时间、状态改变时间都报告 stat 的那一刻，utimensat 是 EACCES。w、who 按终端的访问时间算空闲时间，在 appine 上永远是 0；util-linux 的 write 在用户有多个终端时挑访问时间最近的那个。
 

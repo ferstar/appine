@@ -99,6 +99,8 @@ pub(crate) struct Task {
     /// 线程开始时宿主线程已经用掉的 CPU 时间和其中的内核态时间（纳秒）：宿主线程可能
     /// 是线程池留下来的，跑过别的 guest 线程（[`pool`]）。
     pub cpu_base: Cell<(u64, u64)>,
+    /// 上一次报告的 CPU 时间（[`Task::cpu`]）：用户态、内核态的时间都不比它少。
+    cpu_prev: Cell<CpuTime>,
     /// 线程开始时宿主线程自愿、非自愿的上下文切换次数（宿主线程会被复用）：
     /// `/proc/<pid>/status` 报告的是之后的。
     pub ctxt_base: Cell<(u64, u64)>,
@@ -195,6 +197,7 @@ impl Task {
             res: RefCell::new(res),
             clock: Cell::new(None),
             cpu_base: Cell::new((0, 0)),
+            cpu_prev: Cell::new(CpuTime::default()),
             ctxt_base: Cell::new((0, 0)),
             host_tid: Cell::new(0),
             trace: RefCell::default(),
@@ -245,10 +248,7 @@ impl Task {
     pub fn cpu_self(&self) -> CpuTime {
         let total_ns = self.cpu_ns();
         let sys_ns = appine_hal::thread_system_ns_self().saturating_sub(self.cpu_base.get().1);
-        CpuTime {
-            total_ns,
-            sys_ns: sys_ns.min(total_ns),
-        }
+        self.cpu_adjust(total_ns, sys_ns)
     }
 
     /// 线程用掉的 CPU 时间，分出内核态：宿主内核替这个宿主线程干活的时间（转发的
@@ -258,10 +258,27 @@ impl Task {
         let sys_ns = appine_hal::thread_system_ns(self.host_tid.get())
             .unwrap_or(0)
             .saturating_sub(self.cpu_base.get().1);
-        CpuTime {
-            total_ns,
-            sys_ns: sys_ns.min(total_ns),
+        self.cpu_adjust(total_ns, sys_ns)
+    }
+
+    /// 让用户态、内核态的时间各自不倒退（Linux 的 `cputime_adjust`）。用户态的时间是总数
+    /// 减去内核态的，两者来源不同：总数是宿主线程的 CPU 时钟，精确到纳秒；内核态的时间
+    /// 读别的线程时只有 `/proc` 里按时钟滴答取整的值，线程自己读的 getrusage 也和总数不在
+    /// 同一刻。内核态的时间一下子多出一个滴答时，用户态的时间就会倒退（LTP 的 times03）。
+    fn cpu_adjust(&self, total_ns: u64, sys_ns: u64) -> CpuTime {
+        let prev = self.cpu_prev.get();
+        if total_ns <= prev.total_ns {
+            return prev;
         }
+        // 之前的内核态时间不超过之前的总数，所以这里不超过 total_ns；用户态时间也不倒退的
+        // 话，内核态时间只多出总数增加的部分
+        let mut sys_ns = sys_ns.min(total_ns).max(prev.sys_ns);
+        if total_ns - sys_ns < prev.user_ns() {
+            sys_ns = total_ns - prev.user_ns();
+        }
+        let now = CpuTime { total_ns, sys_ns };
+        self.cpu_prev.set(now);
+        now
     }
 }
 

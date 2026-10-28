@@ -27,6 +27,7 @@
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -330,6 +331,55 @@ static void test_clocks(void)
     ok("clocks");
 }
 
+static long long us_of(struct timeval t)
+{
+    return t.tv_sec * 1000000LL + t.tv_usec;
+}
+
+/* 用户态、内核态的 CPU 时间各自不倒退：用户态的时间是总数减去内核态的，内核态的时间一下子
+ * 多出一个时钟滴答时，用户态的时间原来会少掉同样多（LTP 的 times03）。边忙边让宿主内核干活
+ * （缺页、mmap），直到内核态的时间跨过几个滴答 */
+static void test_cpu_times(void)
+{
+    struct rusage prev = {0}, cur, tprev = {0}, tcur;
+    struct tms mprev = {0}, mcur;
+    struct timespec start, now;
+    long long last_tick = -1;
+    int ticks = 0;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0, "monotonic");
+    do {
+        for (volatile long i = 0; i < 100000; i++)
+            ;
+        char *p = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(p != MAP_FAILED, "mmap");
+        memset(p, 1, 1 << 20);
+        CHECK(munmap(p, 1 << 20) == 0, "munmap");
+        CHECK(getrusage(RUSAGE_SELF, &cur) == 0 && getrusage(RUSAGE_THREAD, &tcur) == 0,
+              "getrusage");
+        CHECK(times(&mcur) != (clock_t)-1, "times");
+        CHECK(us_of(cur.ru_utime) >= us_of(prev.ru_utime) &&
+                  us_of(cur.ru_stime) >= us_of(prev.ru_stime),
+              "process: user %lld -> %lld, system %lld -> %lld", us_of(prev.ru_utime),
+              us_of(cur.ru_utime), us_of(prev.ru_stime), us_of(cur.ru_stime));
+        CHECK(us_of(tcur.ru_utime) >= us_of(tprev.ru_utime) &&
+                  us_of(tcur.ru_stime) >= us_of(tprev.ru_stime),
+              "thread: user %lld -> %lld, system %lld -> %lld", us_of(tprev.ru_utime),
+              us_of(tcur.ru_utime), us_of(tprev.ru_stime), us_of(tcur.ru_stime));
+        CHECK(mcur.tms_utime >= mprev.tms_utime && mcur.tms_stime >= mprev.tms_stime,
+              "times: user %ld -> %ld, system %ld -> %ld", (long)mprev.tms_utime,
+              (long)mcur.tms_utime, (long)mprev.tms_stime, (long)mcur.tms_stime);
+        if (us_of(cur.ru_stime) / 10000 != last_tick) {
+            last_tick = us_of(cur.ru_stime) / 10000;
+            ticks++;
+        }
+        prev = cur;
+        tprev = tcur;
+        mprev = mcur;
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "monotonic");
+    } while (ticks < 4 && ns_of(&now) - ns_of(&start) < 5000000000LL);
+    ok("cpu times");
+}
+
 static void test_signalfd(void)
 {
     sigset_t set;
@@ -525,6 +575,7 @@ int main(void)
     test_shm();
     test_timers();
     test_clocks();
+    test_cpu_times();
     test_signalfd();
     test_splice();
     test_mremap();
