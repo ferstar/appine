@@ -30,7 +30,7 @@
   3. **FIFO 的读端在还没有写端连上过时，poll 报 POLLHUP**。Linux 的 `pipe_poll` 在第一个写端出现之前（`w_counter` 没变）不报挂断，poll 会一直等。Ruby 的 `load` 一个 FIFO 时以 `O_NONBLOCK` 打开再 poll，appine 上立刻读到 EOF，当作空文件 load 成功，test_require 的三个 FIFO 测试失败。
   4. **PTY 的 TCFLSH 在主设备上方向反了，TCOOFF 不让从设备的写阻塞**。`syscall::tty` 的 TCFLSH 不管是主设备还是从设备，一律按从设备的方向清：对主设备 TCOFLUSH 清掉了从设备写出、等主设备读的数据，之后主设备的读永远等不到（test_termios、test_ioctl 各卡到 20 分钟的超时）。TCXONC 的 TCOOFF 只让主设备读不到，从设备的 write 照样立刻成功，Linux 上要阻塞到 TCOON。
   5. **每个进程比原生多占约 12 MB**。20 个空闲的 python3 在 appine 里让宿主进程多了约 300 MB（RssAnon 约 100 MB、RssShmem 约 200 MB），原生上它们的匿名内存一共约 60 MB。RssShmem 是 Tier 1 的翻译缓冲区（W^X 的两个视图用共享匿名映射，`appine_map_code`），每个进程从模板复制一份，python 约 10 MB。CPython 的多进程测试一次起上百个进程，App 的匿名内存到了默认上限（虚拟机的一半，2 GB），OOM killer 结束了 33 个 python 进程，9 个多进程测试因此失败。这是已知的设计代价（[性能剖析](13-profiling.md)就提过翻译要在进程之间直接共用），不是 bug。
-  6. **FICLONE 返回 ENOTTY**。Linux 上不支持 reflink 的文件系统返回 EOPNOTSUPP，Python 3.14 的 `pathlib.Path.copy()` 遇到它才退回普通的复制，遇到 ENOTTY 就报错：appine 上 `Path.copy()` 复制任何文件都失败（test_pathlib 的 28 个 error）。
+  6. **FICLONE 返回 ENOTTY**。Linux 上不支持 reflink 的文件系统返回 EOPNOTSUPP，Python 3.14 的 `pathlib.Path.copy()` 遇到它才退回普通的复制，遇到 ENOTTY 就报错：appine 上 `Path.copy()` 复制任何文件都失败（test_pathlib 的 28 个 error）。→ 已修好（M9 之前：FICLONE 返回 EOPNOTSUPP）
   7. **Ruby 的测试 `-j4` 一起跑时卡住**：四个工作进程各占一个 CPU 却不推进，原因没查到。逐个文件跑都正常，可能与问题 2 的内存破坏有关，修完 2 之后重跑。→ 与问题 2 无关：修完 2 之后测试跑完了，留下的进程停在 Tier 1 往翻译表插入时找空位的循环里，表被作废的块留下的墓碑占满（M9 之前：线程退出时在 BKL 外丢掉弱引用）；已修好（M9 之前：翻译表里漏掉的墓碑）
 - **接下来**：先修 2（会让整个 App 崩溃），修完重跑 Node、Go、ripgrep 的测试和 Ruby 的 `-j4`，它们这次都被它挡住了；然后依次修 1、6、4、3。5 是优化方向，不在这一串里。
 - **工具**：`scripts/survey -n <镜像> [-s 仓库] 负载……`、`SURVEY_TIMEOUT=秒数`；负载在 `tests/survey/suites/`；导出仓库做原生镜像的命令写在 `scripts/survey` 的开头。

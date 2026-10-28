@@ -82,6 +82,7 @@
 | [M9 之前：线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md) | 2026-10-28 | 线程退出时在持有 BKL 时丢掉线程局部变量里 `ThreadGroup` 的弱引用（原来放开之后才丢，非原子的 Rc 计数和同一进程里刚开始的线程一起改，计数丢失后提前释放，宿主的堆被破坏）：4 个进程不停地起停线程，原来 10 秒内崩溃，现在 60 秒正常；Ruby 的测试 `-j4` 跑完了（[signalfd 看调用的线程](rounds/52-signalfd-caller.md)那一轮起的 bug） |
 | [M9 之前：翻译表里漏掉的墓碑](rounds/72-table-tombstones.md) | 2026-10-28 | Tier 1 恢复停放的块时原样恢复它留下的墓碑（原来插到新位置，旧墓碑没有记录、整体清空清不掉，计数却归零，反复之后翻译表被占满，插入找空位的循环一直转，进程连 SIGKILL 都结束不了）：Ruby 的测试 `-j4` 不再卡住，1781 → 479 秒；Node、Go、ripgrep 的测试重跑了，ripgrep、Go 与原生相同（[node 启动](rounds/34-node-startup.md)那一轮起的 bug） |
 | [M9 之前：目录和文件的时间戳](rounds/73-timestamps.md) | 2026-10-28 | 目录里新建、删除、改名改目录的 mtime、ctime，普通文件的 ctime 取自宿主 object（chmod、改名等也让宿主改它），utimensat 的 `UTIME_NOW` 交给宿主：Python 能 import 后来新建的模块，PHP 的文件测试 590 个全过；rename 多约 2 微秒 |
+| [M9 之前：FICLONE 返回 EOPNOTSUPP](rounds/74-ficlone.md) | 2026-10-28 | FICLONE、FICLONERANGE、FIDEDUPERANGE 按 Linux 的顺序检查之后返回 EOPNOTSUPP（原来 ENOTTY），和 ext4、f2fs 一样不支持 reflink：Python 3.14 的 `Path.copy()` 能用了，test_pathlib 全部通过 |
 
 ## 测量条件
 

@@ -141,6 +141,9 @@ const FIOGETOWN: u32 = 0x8903;
 const SIOCGPGRP: u32 = 0x8904;
 const FIONCLEX: u32 = 0x5450;
 const FIOCLEX: u32 = 0x5451;
+const FICLONE: u32 = 0x4004_9409;
+const FICLONERANGE: u32 = 0x4020_940d;
+const FIDEDUPERANGE: u32 = 0xc018_9436;
 
 const POLLIN: i16 = 0x001;
 
@@ -1440,6 +1443,29 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             }
             return Ok(0);
         }
+        // 与 Linux 一样在看文件类型之前处理（do_vfs_ioctl）
+        FICLONE | FICLONERANGE => {
+            let src = if request == FICLONE {
+                arg as i32
+            } else {
+                // struct file_clone_range 的第一项是源 fd（s64）
+                let b: [u8; 32] = get(cx, arg)?;
+                i64::from_le_bytes(b[..8].try_into().unwrap()) as i32
+            };
+            return clone_range(&cx.fds().get(src)?, &file);
+        }
+        FIDEDUPERANGE => {
+            // struct file_dedupe_range 的头：两个 u64，dest_count（u16）和两个保留项
+            let b: [u8; 24] = get(cx, arg)?;
+            if b[18..24].iter().any(|&x| x != 0) {
+                return Err(Errno::EINVAL);
+            }
+            return match file.borrow().kind {
+                FileKind::Regular { .. } => Err(Errno::EOPNOTSUPP),
+                FileKind::Directory { .. } => Err(Errno::EISDIR),
+                _ => Err(Errno::EINVAL),
+            };
+        }
         // socket 的属主（与 F_SETOWN、F_GETOWN 相同，负数是进程组）
         FIOSETOWN | SIOCSPGRP | FIOGETOWN | SIOCGPGRP
             if matches!(file.borrow().kind, FileKind::Socket(_)) =>
@@ -1507,6 +1533,33 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         cx.mm().write(UserSlice::new(arg, size), &buf)?;
     }
     Ok(rc as u64)
+}
+
+/// FICLONE、FICLONERANGE：按 Linux 的顺序检查（`ioctl_file_clone`、`generic_file_rw_checks`），
+/// 最后和宿主上的 ext4、f2fs 一样不支持 reflink（EOPNOTSUPP），程序退回普通的复制
+/// （Python 3.14 的 `pathlib.Path.copy`、`cp --reflink=auto`）。仓库之外的文件和仓库里的
+/// 不在同一个挂载点（EXDEV）。
+fn clone_range(src: &FileRef, dst: &FileRef) -> SysResult {
+    let (src, dst) = (src.borrow(), dst.borrow());
+    let in_store = |f: &OpenFile| {
+        matches!(
+            f.kind,
+            FileKind::Regular { .. } | FileKind::Directory { .. }
+        )
+    };
+    if !in_store(&src) || !in_store(&dst) {
+        return Err(Errno::EXDEV);
+    }
+    if [&src, &dst]
+        .iter()
+        .any(|f| matches!(f.kind, FileKind::Directory { .. }))
+    {
+        return Err(Errno::EISDIR);
+    }
+    if !src.readable() || !dst.writable() || dst.flags & oflags::O_APPEND != 0 {
+        return Err(Errno::EBADF);
+    }
+    Err(Errno::EOPNOTSUPP)
 }
 
 // ---- 元数据 ----

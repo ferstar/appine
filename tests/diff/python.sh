@@ -1,4 +1,4 @@
-# CPython：哈希、浮点格式化、十进制、unicode、sqlite3、线程；文件和目录的时间戳
+# CPython：哈希、浮点格式化、十进制、unicode、sqlite3、线程；文件和目录的时间戳；FICLONE
 python3 - <<'PY'
 import base64, decimal, fractions, hashlib, json, math, re, sqlite3, struct, threading, unicodedata, zlib
 print(hashlib.sha256(b"x" * 10**6).hexdigest(), hashlib.md5(b"appine").hexdigest())
@@ -74,4 +74,31 @@ with open("m/two.py", "w") as f:
     f.write("x = 2\n")
 import two
 print("import", one.x, two.x)
+PY
+
+# FICLONE：检查的顺序和错误码；文件系统不支持 reflink 时 Path.copy 退回普通的复制
+python3 - <<'PY'
+import errno, fcntl, os, pathlib, struct
+FICLONE, FICLONERANGE = 0x40049409, 0x4020940d
+def err(f):
+    try:
+        f()
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+with open("/tmp/ts/src", "w") as f:
+    f.write("cloned data\n")
+src = os.open("/tmp/ts/src", os.O_RDONLY)
+dst = os.open("/tmp/ts/dst", os.O_WRONLY | os.O_CREAT, 0o644)
+rdonly = os.open("/tmp/ts/dst", os.O_RDONLY)
+append = os.open("/tmp/ts/dst", os.O_WRONLY | os.O_APPEND)
+directory = os.open("/tmp/ts", os.O_RDONLY)
+pipe = os.pipe()[0]
+for name, fd, arg in [("file", dst, src), ("rdonly", rdonly, src), ("append", append, src),
+                      ("dir", dst, directory), ("pipe", dst, pipe), ("badfd", dst, 999)]:
+    print("ficlone", name, err(lambda: fcntl.ioctl(fd, FICLONE, arg)))
+print("ficlonerange", err(lambda: fcntl.ioctl(dst, FICLONERANGE, struct.pack("qQQQ", src, 0, 0, 0))))
+if hasattr(pathlib.Path, "copy"):
+    pathlib.Path("/tmp/ts/src").copy("/tmp/ts/copy")
+    print("path.copy", open("/tmp/ts/copy").read().strip())
 PY

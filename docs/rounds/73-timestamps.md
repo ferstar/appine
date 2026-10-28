@@ -1,6 +1,6 @@
 # M9 之前：目录和文件的时间戳（2026-10-28）
 
-← [M9 之前：翻译表里漏掉的墓碑（2026-10-28）](72-table-tombstones.md) · [索引](../milestones.md)
+← [M9 之前：翻译表里漏掉的墓碑（2026-10-28）](72-table-tombstones.md) · [索引](../milestones.md) · [M9 之前：FICLONE 返回 EOPNOTSUPP（2026-10-28）](74-ficlone.md) →
 
 [第二轮普查](70-survey-suites.md)的问题 1：目录的 mtime、ctime 不随目录项变化，普通文件的 ctime 不随内容变化。PHP 的 5 个 stat、touch 测试因此失败；Python 进程从一个目录 import 过之后，在那里新建的模块 import 不到（importlib 按目录的 mtime 决定要不要重新列目录）；Maildir、git 的 untracked cache 这类按目录 mtime 发现变化的程序会漏掉修改。
 
@@ -14,7 +14,7 @@
 - **测试**：
   - 仓库的单元测试新增 `directory_and_change_times_follow_modifications`，导入的测试检查目录的 mtime 还是 tar 里的。变异检查：去掉目录的时间、不取 object 的 ctime、utimensat 不改 ctime、chmod 不碰 object、导入时不推迟目录的 mtime，各自都会失败。
   - 差分测试 python 组加上时间戳的检查：新建、改名（两边）、链接、删除、mkdir、rmdir、symlink 改目录的 mtime 和 ctime；write、truncate、chmod 改文件的 ctime；utimensat 设成以前的时间之后 ctime 是现在（普通文件、目录、符号链接）；import 找得到后来在同一个目录里新建的模块。两层都与原生相同。上一轮的二进制上，目录的时间和文件的 ctime 都不变，import 报 `ModuleNotFoundError`。
-  - PHP 的 `ext/standard/tests/file` 590 个全部通过，第 70 轮失败的 `lstat_stat_*`、`touch_basic` 这 5 个都在其中。CPython 的 test_mailbox、test_importlib、test_shutil、test_tempfile、test_glob、test_posix、test_stat、test_zipfile、test_tarfile、test_compileall 等通过；test_pathlib 只剩 FICLONE 造成的 28 个错误（问题 6）。test_os 的 `test_utime_current`、`test_utime_current_old` 在 virtiofs 上的仓库里失败：它们要求 touch 之后的 mtime 和 `time.time()` 相差不到 50 毫秒，而 object 的时间戳快了 84 毫秒（原来是新建时快 84 毫秒、touch 时用 guest 的时钟，反过来让 test_touch_common 失败）。换到虚拟机本地卷上的仓库，新建和 touch 之后的 mtime 与 `time.time()` 只差 1–3 毫秒。
+  - PHP 的 `ext/standard/tests/file` 590 个全部通过，第 70 轮失败的 `lstat_stat_*`、`touch_basic` 这 5 个都在其中。CPython 的 test_mailbox、test_importlib、test_shutil、test_tempfile、test_glob、test_posix、test_stat、test_zipfile、test_tarfile、test_compileall 等通过；test_pathlib 只剩 FICLONE 造成的 28 个错误（问题 6，→ 已修好（M9 之前：FICLONE 返回 EOPNOTSUPP））。test_os 的 `test_utime_current`、`test_utime_current_old` 在 virtiofs 上的仓库里失败：它们要求 touch 之后的 mtime 和 `time.time()` 相差不到 50 毫秒，而 object 的时间戳快了 84 毫秒（原来是新建时快 84 毫秒、touch 时用 guest 的时钟，反过来让 test_touch_common 失败）。换到虚拟机本地卷上的仓库，新建和 touch 之后的 mtime 与 `time.time()` 只差 1–3 毫秒。
   - 开销：在 `appine-bench` 卷上，每次操作的微秒数（与上一轮的二进制交替跑 5 轮）：create 11.7–12.4 → 12.3–13.2，rename 5.8 → 8.0–8.3（其中 object 的 chmod 约 1.6，目录的时间约 0.7），unlink 3.6 → 4.3，stat 1.4–1.5 不变。剖析用的 shell、git、gcc、python、apk 负载看不出差别（gcc 2.17–2.18 → 2.19–2.21 秒，apk 35.5–35.6 → 35.5–35.7 秒）。
   - cargo test（203 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过，与 [/proc/meminfo 那一轮](68-meminfo.md)的结果逐项相同（utime、utimensat、stat、rename、link 这些都在其中）。
 
