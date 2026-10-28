@@ -44,6 +44,8 @@
 
 ptrace（§7.6）：strace、gdb 可以用。
 
+glibc 发行版不在 v1 的承诺里。探测过：Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库时，apt、gcc、gdb、python 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server 都能用；从 Alpine chroot 进去缺 `/proc`、`/sys`、`/dev`，因为没有 mount（§8.2，见 [glibc 发行版的探测](rounds/69-glibc-probe.md)）。
+
 ### 1.3 性能目标
 
 - CPU 密集任务比原生慢 **3–5 倍以内**（JIT 级别）。M2 用性能探针实测复核后保留了这个目标；目前 gcc 编译、`go build`、JVM 构建约 2.8–3.6 倍，python 的解释循环约 4.6 倍，起进程和文件操作 1–1.7 倍，见 §16 的 R1。
@@ -501,6 +503,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `/tmp` | 放在 inode 仓库里，不用内存 tmpfs，避免占用 App 内存配额 |
 | `/mnt/<名字>` | SAF 目录挂载（v1.x，见 §11.3） |
 
+挂载表是固定的：mount、umount2、pivot_root 和新的挂载接口（fsopen、open_tree 等）都返回 `ENOSYS`。
+
 ### 8.3 inotify
 
 所有文件系统修改都经过内核层，所以 inotify 不需要宿主参与：各个 syscall 改完仓库之后报告事件，报告的位置和顺序与 Linux 的 fsnotify 钩子相同。监视按仓库的 inode 登记；没有任何监视时，每个事件只多一次判空。
@@ -691,7 +695,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 - 测试分为五层：
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。被测的 guest 地址和原生一侧的宿主地址相同，同样的内容在两处都有，所以访存用错了 addend（比如取错表项而没有比较 tag）它发现不了，这类错误靠差分测试和真实程序。
   2. **LTP 的 syscall 测试**：`scripts/build-ltp` 在 `alpine` 容器里原生编译，`scripts/ltp` 每个测试起一个新的 `appine-run`，在本地运行，不在 CI 里。目前 1552 个里通过 955–959 个（差别是[已知的偶发失败](milestones.md#已知的偶发失败)），剩下的失败见 [M6 结果](rounds/08-m6.md)和之后几轮。原计划中的 musl libc-test 没有接入。
-  3. **端到端场景**：`hosts/cli/tests/rootfs_programs.rs` 里的 busybox、交互式 shell、`apk add`、`git clone` 等用例；从源码编译真实项目（Lua、SQLite）手工测量。`scripts/survey`（[负载普查](rounds/62-workload-survey.md)）在 appine 里跑常见的服务和工具（`tests/survey/`：sshd、tmux、postgres、redis、mariadb、Rust、.NET 等），收集失败和未实现的 syscall；输出要人看，要联网安装约 1 GB 软件包，不在 CI 里。
+  3. **端到端场景**：`hosts/cli/tests/rootfs_programs.rs` 里的 busybox、交互式 shell、`apk add`、`git clone` 等用例；从源码编译真实项目（Lua、SQLite）手工测量。`scripts/survey`（[负载普查](rounds/62-workload-survey.md)）在 appine 里跑常见的服务和工具（`tests/survey/`：sshd、tmux、postgres、redis、mariadb、Rust、.NET 等），收集失败和未实现的 syscall；`tests/survey/glibc/` 在 Debian、Ubuntu 的仓库里跑 glibc 的程序（[glibc 发行版的探测](rounds/69-glibc-probe.md)）；输出要人看，要联网安装约 1 GB 软件包，不在 CI 里。
   4. **差分测试**：同一条命令分别在 appine 和真正的 arm64 Linux 中运行，比对输出；信号测试比对 `ucontext` 的内容。`scripts/difftest`（M7）先在 appine 里把测试仓库的根文件系统打包、导入成 docker 镜像，再把 `tests/diff/` 下的每个脚本分别交给 docker 容器和 `appine-run` 执行，比对输出和退出码。
   5. **Android 专项**：用 arm64 Android 模拟器跑 instrumentation 测试（`MachineTest`），覆盖 4K 和 16K 页，包括用测试钩子在 App 进程里模拟内核层和引擎的 bug。GitHub 的 runner 没有 KVM，这一层在本地运行，CI 只构建 APK 并运行 lint。原计划核心库另外提供一个"模拟 Android 限制"的开关，在 Linux 上提前暴露问题，还没有做。
 

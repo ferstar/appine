@@ -1,6 +1,6 @@
 # M9 之前：/proc/meminfo 照搬宿主的（2026-10-28）
 
-← [M9 之前：cgroup 的 memory.stat（2026-10-28）](67-memory-stat.md) · [索引](../milestones.md)
+← [M9 之前：cgroup 的 memory.stat（2026-10-28）](67-memory-stat.md) · [索引](../milestones.md) · [M9 之前：glibc 发行版的探测（2026-10-28）](69-glibc-probe.md) →
 
 [负载普查](62-workload-survey.md)的问题 6：free 显示可用内存 650 MB（原生 3.4 GB），htop 的内存条几乎是满的。
 

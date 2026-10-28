@@ -77,6 +77,7 @@
 | [M9 之前：io_destroy 叫醒等事件的线程](rounds/66-aio-destroy.md) | 2026-10-28 | 销毁 AIO 上下文时正在 `io_getevents` 里等它的线程返回（没有事件是 EINVAL），与 Linux 相同：mariadb 的 install-db 和关闭不再卡住 |
 | [M9 之前：cgroup 的 memory.stat](rounds/67-memory-stat.md) | 2026-10-28 | 按 Linux 6.1 的格式补上 `memory.stat`：.NET 的 GC 改按整个 App 的用量（`memory.current` 减去 `inactive_file`）算内存负载，别的 guest 进程用的内存也算进去（原来只看自己的 RSS） |
 | [M9 之前：/proc/meminfo 照搬宿主的](rounds/68-meminfo.md) | 2026-10-28 | `/proc/meminfo` 和 sysinfo 照搬宿主的各项，`MemAvailable` 算上页缓存：free、htop 不再显示内存几乎用完（可用 650 MB → 3.3 GB，与原生相同） |
+| [M9 之前：glibc 发行版的探测](rounds/69-glibc-probe.md) | 2026-10-28 | Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库：apt、gcc、gdb、numpy/pandas 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server（浏览器连上去）都能用，内核层不用改；从 Alpine chroot 进去缺 `/proc` 等（没有 mount），mount 的子集先不做 |
 
 ## 测量条件
 

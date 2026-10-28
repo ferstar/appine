@@ -62,6 +62,7 @@ if [ $# -eq 0 ]; then
     set -- $(cd tests/survey && ls *.sh | sed 's/\.sh$//')
 fi
 for name in "$@"; do
+    mkdir -p "$(dirname "$out/$name")"
     start=$(date +%s)
     set +e
     # shellcheck disable=SC2046
