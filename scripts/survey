@@ -6,7 +6,8 @@
 #
 # 负载是 tests/survey/<名字>.sh（名字可以带子目录），拷进仓库里由 guest 的 /bin/sh 运行
 # （stdin 是 /dev/null），带 APPINE_LOG=1。stdout 写到 target/survey/<名字>.out，stderr
-# （含内核层的日志）写到 <名字>.err；最后每个负载一行：退出码、用时和未实现的 syscall。
+# （含内核层的日志）写到 <名字>.err；最后每个负载一行：退出码、用时、内核层报告的内部
+# 错误（内核 bug、放开 BKL 时借着内核对象）的条数和未实现的 syscall。
 # 输出要人看：脚本只打印结果，不和原生比对。不带名字时跑 tests/survey/ 下的全部。每个
 # 负载最多跑 SURVEY_TIMEOUT 秒（默认 1500）。
 #
@@ -106,6 +107,8 @@ for name in "$@"; do
     code=$?
     set -e
     enosys=$(sed -n 's/^appine: unimplemented syscall //p' "$out/$name.err" | sort -nu | tr '\n' ' ')
-    printf '%-10s exit %-3s %4ss  %s\n' "$name" "$code" "$(($(date +%s) - start))" \
-        "${enosys:+ENOSYS: $enosys}"
+    bugs=$(grep -c '^appine: internal error' "$out/$name.err" || true)
+    [ "$bugs" != 0 ] || bugs=""
+    printf '%-10s exit %-3s %4ss  %s%s\n' "$name" "$code" "$(($(date +%s) - start))" \
+        "${bugs:+INTERNAL ERRORS: $bugs  }" "${enosys:+ENOSYS: $enosys}"
 done

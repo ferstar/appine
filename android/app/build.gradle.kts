@@ -60,7 +60,8 @@ android {
 /**
  * 用 cargo-ndk 构建 libappine.so（hosts/android）。Rust 部分总是 release 构建：调试构建的解释器太慢。
  * debug 版 App 打开 `test-hooks` 特性，instrumentation 测试用测试钩子在 App 进程里模拟内核层和
- * 引擎的 bug（只在设置了 `APPINE_TEST_HOOKS=1` 时生效）。
+ * 引擎的 bug（只在设置了 `APPINE_TEST_HOOKS=1` 时生效）；也打开 `borrow-check`，放开 BKL 时检查
+ * 没有借着内核对象。
  */
 abstract class CargoNdkTask : DefaultTask() {
     @get:Internal
@@ -133,7 +134,7 @@ androidComponents {
         val buildRust = tasks.register<CargoNdkTask>("buildRust${variant.name.replaceFirstChar(Char::uppercase)}") {
             workspace.set(repoRoot)
             ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
-            features.set(if (variant.buildType == "debug") listOf("test-hooks") else emptyList())
+            features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
             outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)

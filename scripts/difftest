@@ -9,7 +9,9 @@
 # 运行的是完全相同的文件。镜像只在第一次或者带 -r 时生成，换了仓库要带 -r。
 #
 # 两边的输出写到 target/difftest/<名字>.native、.appine，下次运行时覆盖；不一致时另存
-# 一份到 target/difftest/failed/<时刻>-t<执行层>-<名字>.*，重跑之后也还能查。
+# 一份到 target/difftest/failed/<时刻>-t<执行层>-<名字>.*，重跑之后也还能查。appine-run
+# 自己的 stderr 写到 <名字>.appine.err：里面有内核层报告的内部错误（内核 bug、放开 BKL 时
+# 借着内核对象）时，输出一致也算失败。
 #
 # 仓库默认是 target/difftest/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
 # 再在 appine 里用 apk 安装用例需要的软件包，这一步要联网（沿用宿主或 docker 的代理）。
@@ -92,19 +94,22 @@ for name in "$@"; do
         /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
     echo "exit $?" >>"$out/$name.native"
     appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root -- \
-        /bin/sh -c "cd / && $script" >"$out/$name.appine" 2>/dev/null
+        /bin/sh -c "cd / && $script" >"$out/$name.appine" 2>"$out/$name.appine.err"
     echo "exit $?" >>"$out/$name.appine"
     set -e
-    if cmp -s "$out/$name.native" "$out/$name.appine"; then
+    bugs=$(grep '^appine: internal error' "$out/$name.appine.err" || true)
+    if cmp -s "$out/$name.native" "$out/$name.appine" && [ -z "$bugs" ]; then
         echo "ok   $name"
     else
         echo "FAIL $name"
         diff -u "$out/$name.native" "$out/$name.appine" | sed 's/^/    /' || true
+        [ -z "$bugs" ] || printf '%s\n' "$bugs" | sed 's/^/    /'
         kept=$out/failed/$(date +%Y%m%d-%H%M%S)-t$tier-$name
         mkdir -p "$out/failed"
         cp "$out/$name.native" "$kept.native"
         cp "$out/$name.appine" "$kept.appine"
-        echo "    saved as $kept.native, .appine"
+        cp "$out/$name.appine.err" "$kept.appine.err"
+        echo "    saved as $kept.native, .appine, .appine.err"
         failed=$((failed + 1))
     fi
 done

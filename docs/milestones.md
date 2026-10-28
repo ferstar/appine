@@ -97,6 +97,7 @@
 | [M9 之前：排查在 BKL 外改 Rc 的计数](rounds/86-rc-outside-bkl.md) | 2026-10-28 | 逐个查了不持 BKL 运行内核代码的地方，正常执行时没有在锁外改 `Rc` 计数、`RefCell` 借用标志的；放开 BKL（等待、`Cx::unlocked`）期间 panic 时，展开经过的外层各帧在锁外丢 `Rc`（比如 execve 的 vfs），改为先重新拿到 BKL；`Cx::unlocked` 的闭包要求 `Send` |
 | [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件](rounds/87-fast-panic-held-borrows.md) | 2026-10-29 | 不持 BKL 的系统调用里的内核 bug 只结束那个进程（原来整个 App 终止）；查了持着 `RefCell` 的借用去等待的地方，修了 epoll_wait 和 seccomp 通知 fd 的 `NOTIF_RECV` 等待时借着打开文件，另一个线程这时 `fcntl(F_SETFL)`、`ioctl(FIONBIO)` 会让进程被结束 |
 | [M9 之前：futex 等待者的清理，放开 BKL 时检查借用](rounds/88-futex-cleanup-borrow-check.md) | 2026-10-29 | futex 的等待者由守卫离开队列：中途 panic 也移除，超时、被信号打断时刚好被唤醒的算唤醒（原来持锁的路径和 `futex_waitv` 可能丢掉一次唤醒）；kernel crate 改用自己的 `RefCell`，调试构建里放开 BKL 时检查没有借着内核对象，新增 `waits` 用例让 19 种等待各走一遍 |
+| [M9 之前：测试用的发布构建也检查借用](rounds/89-release-borrow-check.md) | 2026-10-29 | `appine-run` 和 debug 版 App 的发布构建也在放开 BKL 时检查借用；差分测试、LTP、普查认出内核层报告的内部错误（差分测试原来把 `appine-run` 的 stderr 丢掉）；`waits` 用例补上文件位置锁、租约的打破和 AIO 的完成；开销在误差范围内，带检查跑差分测试、LTP、普查和语言的测试集都没有报告内部错误 |
 
 ## 测量条件
 

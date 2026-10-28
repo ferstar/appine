@@ -19,3 +19,6 @@ tar.workspace = true
 # 测试钩子（src/bug.rs）在 release 构建里也编进去：Android 的 debug 版 App 用它在 App 进程里
 # 模拟内核层和引擎的 bug。debug 构建总是有测试钩子
 test-hooks = []
+# 放开 BKL 时检查没有借着内核对象（src/cell.rs）的发布构建：appine-run 默认打开，app/build.gradle.kts
+# 给 debug 版 App 打开。debug 构建总是检查
+borrow-check = []

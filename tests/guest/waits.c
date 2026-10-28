@@ -1,7 +1,7 @@
 /*
  * 每种会在内核里等待的系统调用都真正等一次（设计文档 §6）：有超时的用很短的超时，别的由
- * 另一个线程稍后让它返回。调试构建的内核层在每次放开 BKL 时检查没有借着内核对象
- * （crate::cell），cargo test 跑这个程序就把这些等待的路径都查一遍，不用碰上并发。
+ * 另一个线程或者子进程稍后让它返回。调试构建的内核层在每次放开 BKL 时检查没有借着内核
+ * 对象（crate::cell），cargo test 跑这个程序就把这些等待的路径都查一遍，不用碰上并发。
  * 在仓库里运行（要 /tmp）。每项通过时打印一行 "ok <名字>"，失败时打印原因并以 1 退出，
  * 全部通过时最后打印 "all ok"。
  */
@@ -173,6 +173,106 @@ static void *answer(void *arg)
     return (void *)(long)(ioctl(listener, NOTIF_SEND, &r) != 0);
 }
 
+/* 租约的打破：子进程以写方式打开时，等父进程放弃读租约 */
+static void lease_break(void)
+{
+    signal(SIGIO, SIG_IGN); /* 打破时通知持有者的信号 */
+    int fd = open("/tmp/waits-lease", O_CREAT | O_RDONLY, 0644);
+    CHECK(fd >= 0 && fcntl(fd, F_SETLEASE, F_RDLCK) == 0, "F_SETLEASE");
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(open("/tmp/waits-lease", O_WRONLY) >= 0 ? 0 : 2);
+    /* 正在打破时 F_GETLEASE 报告要降成的类型：子进程已经在 open 里等了 */
+    for (int i = 0; i < 5000 && fcntl(fd, F_GETLEASE) != F_UNLCK; i++)
+        usleep(1000);
+    CHECK(fcntl(fd, F_GETLEASE) == F_UNLCK, "the lease is not being broken");
+    CHECK(fcntl(fd, F_SETLEASE, F_UNLCK) == 0, "F_SETLEASE F_UNLCK");
+    int st;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+          "open breaking the lease: status %#x", st);
+    close(fd);
+    signal(SIGIO, SIG_DFL);
+    ok("lease break");
+}
+
+/* 文件位置锁（f_pos_lock）：两个线程同时从同一个打开文件各读 2 字节，读到的位置不重不漏。
+ * 一个线程不持 BKL 地读宿主文件时，另一个的读等它做完；读这么多次总会碰上 */
+#define POS_SLOTS 4000
+static int pos_fd;
+static int pos_seen[POS_SLOTS];
+
+static void *read_slots(void *arg)
+{
+    (void)arg;
+    uint16_t slot;
+    while (read(pos_fd, &slot, sizeof slot) == sizeof slot)
+        if (slot < POS_SLOTS)
+            __atomic_fetch_add(&pos_seen[slot], 1, __ATOMIC_RELAXED);
+    return NULL;
+}
+
+static void file_position_lock(void)
+{
+    uint16_t slots[POS_SLOTS];
+    for (int i = 0; i < POS_SLOTS; i++)
+        slots[i] = i;
+    int fd = open("/tmp/waits-pos", O_CREAT | O_TRUNC | O_RDWR, 0644);
+    CHECK(fd >= 0 && write(fd, slots, sizeof slots) == sizeof slots, "write the slots");
+    pos_fd = open("/tmp/waits-pos", O_RDONLY);
+    CHECK(pos_fd >= 0, "open the slots");
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, read_slots, NULL) == 0, "pthread_create");
+    read_slots(NULL);
+    pthread_join(t, NULL);
+    for (int i = 0; i < POS_SLOTS; i++)
+        CHECK(pos_seen[i] == 1, "slot %d read %d times", i, pos_seen[i]);
+    close(pos_fd);
+    close(fd);
+    ok("file position lock");
+}
+
+/* AIO：管道上的 IOCB_CMD_POLL 由另一个线程写管道完成，io_getevents 不带超时一直等到它 */
+struct iocb {
+    uint64_t data;
+    uint32_t key, rw_flags;
+    uint16_t opcode;
+    int16_t reqprio;
+    uint32_t fildes;
+    uint64_t buf, nbytes;
+    int64_t offset;
+    uint64_t reserved2;
+    uint32_t flags, resfd;
+};
+
+struct io_event {
+    uint64_t data, obj;
+    int64_t res, res2;
+};
+
+#define IOCB_CMD_POLL 5
+
+static void aio_completion(void)
+{
+    int p[2];
+    CHECK(pipe(p) == 0, "pipe");
+    unsigned long ctx = 0;
+    CHECK(syscall(SYS_io_setup, 1, &ctx) == 0, "io_setup");
+    struct iocb cb = {.data = 7, .opcode = IOCB_CMD_POLL, .fildes = p[0], .buf = POLLIN};
+    struct iocb *list[] = {&cb};
+    CHECK(syscall(SYS_io_submit, ctx, 1, list) == 1, "io_submit");
+    struct later l;
+    after(&l, write_byte, p[1]);
+    struct io_event e;
+    CHECK(syscall(SYS_io_getevents, ctx, 1, 1, &e, NULL) == 1 && e.data == 7 &&
+              (e.res & POLLIN),
+          "io_getevents: res %lld", (long long)e.res);
+    join(&l);
+    syscall(SYS_io_destroy, ctx);
+    close(p[0]);
+    close(p[1]);
+    ok("AIO poll completion");
+}
+
 static void seccomp_listener(void)
 {
     pid_t pid = fork();
@@ -332,6 +432,9 @@ int main(void)
     CHECK(fcntl(b, F_OFD_SETLKW, &fl) == 0, "OFD lock waits");
     join(&l);
     ok("F_OFD_SETLKW");
+    lease_break();
+    file_position_lock();
+    aio_completion();
     int master = posix_openpt(O_RDWR | O_NOCTTY);
     CHECK(master >= 0 && grantpt(master) == 0 && unlockpt(master) == 0, "posix_openpt");
     int slave = open(ptsname(master), O_RDWR | O_NOCTTY);

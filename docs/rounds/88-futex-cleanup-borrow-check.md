@@ -1,6 +1,6 @@
 # M9 之前：futex 等待者的清理，放开 BKL 时检查借用（2026-10-29）
 
-← [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件（2026-10-29）](87-fast-panic-held-borrows.md) · [索引](../milestones.md)
+← [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件（2026-10-29）](87-fast-panic-held-borrows.md) · [索引](../milestones.md) · [M9 之前：测试用的发布构建也检查借用（2026-10-29）](89-release-borrow-check.md) →
 
 [上一轮](87-fast-panic-held-borrows.md)的两个推迟项。
 
@@ -45,3 +45,5 @@
   - 放开 BKL 时的 execve 和 DNS 存根；
   - 租约的打破；
   - AIO 的完成。
+
+  → 已补上（M9 之前：测试用的发布构建也检查借用）：`appine-run` 和 debug 版 App 的发布构建也检查，差分测试、LTP、普查把内核层报告的内部错误当作失败；`waits` 用例补上文件位置锁、租约的打破和 AIO 的完成，放开 BKL 时的 execve 和 DNS 存根原来就在进入 `Cx::unlocked` 时检查。几处都没跑到的等待仍然不查

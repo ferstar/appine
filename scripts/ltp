@@ -5,8 +5,9 @@
 #   scripts/dev scripts/ltp [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
 #
 # 每个测试在一个新的 appine-run 进程里运行，结果写到 target/ltp/results.txt，每行
-# "<名字> <PASS|CONF|FAIL|TIMEOUT> <退出码>"，输出在 target/ltp/logs/<名字>.log，上一次
-# 运行的留在 <名字>.prev.log（失败之后单独重跑不会把失败的那次冲掉）。
+# "<名字> <PASS|CONF|FAIL|TIMEOUT|BUG> <退出码>"，输出在 target/ltp/logs/<名字>.log，上一次
+# 运行的留在 <名字>.prev.log（失败之后单独重跑不会把失败的那次冲掉）。BUG 是内核层报告了
+# 内部错误（内核 bug、放开 BKL 时借着内核对象），不论退出码。
 # LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
 set -eu
 
@@ -36,6 +37,7 @@ if [ "${1:-}" = --one ]; then
     124) result=TIMEOUT ;;
     *) result=FAIL ;;
     esac
+    ! grep -q '^appine: internal error' "$log" || result=BUG
     echo "$name $result $code"
     exit 0
 fi
