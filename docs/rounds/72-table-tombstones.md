@@ -1,6 +1,6 @@
 # M9 之前：翻译表里漏掉的墓碑（2026-10-28）
 
-← [M9 之前：线程退出时在 BKL 外丢掉弱引用（2026-10-28）](71-thread-exit-race.md) · [索引](../milestones.md)
+← [M9 之前：线程退出时在 BKL 外丢掉弱引用（2026-10-28）](71-thread-exit-race.md) · [索引](../milestones.md) · [M9 之前：目录和文件的时间戳（2026-10-28）](73-timestamps.md) →
 
 [第二轮普查](70-survey-suites.md)的问题 7：Ruby 的测试 `-j4` 一起跑时工作进程不再推进。[上一轮](71-thread-exit-race.md)修完宿主堆的破坏之后，测试跑完了，但留下 3 个进程各占满一个 CPU，appine-run 一直不退出。
 

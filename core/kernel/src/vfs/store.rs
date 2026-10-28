@@ -2,7 +2,11 @@
 //!
 //! SQLite（WAL）保存完整的命名空间：目录项、inode、symlink 目标；普通文件的
 //! 数据存成宿主文件 `objects/<ino>`。普通文件的 size 和 mtime 以宿主 object
-//! 文件为准，其余元数据（mode、uid/gid、nlink、rdev、ctime）存在 SQLite 里。
+//! 文件为准，其余元数据（mode、uid/gid、nlink、rdev、ctime）存在 SQLite 里。普通文件
+//! 的 ctime 也取自 object：write、truncate、utimensat 改的是 object，数据库里改了它的
+//! 元数据（权限、属主、链接数、改名、xattr）时也 chmod 一下 object，由宿主更新它的
+//! ctime。数据库那一列用的时钟和宿主文件系统打时间戳的不一定一致（virtiofs 上差了几十
+//! 毫秒），两边取较晚的一个会漏掉改动。
 //! 硬链接就是多个目录项指向同一个 ino。宿主侧只会出现 `objects/<数字>` 这种
 //! 路径，永远不由 guest 输入拼出（§12 不变量 3）。
 //!
@@ -26,6 +30,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
@@ -44,6 +49,28 @@ pub const ROOT: Ino = 1;
 
 /// 写事务最多推迟这么久提交（模块文档）。
 pub const COMMIT_DELAY: Duration = Duration::from_millis(5);
+
+/// 宿主上 object 文件的权限位：只有 App 自己读写，guest 看到的权限记在数据库里。
+const OBJECT_MODE: u32 = 0o600;
+
+/// [`Store::set_times`] 设置的时间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTime {
+    /// 现在。普通文件由宿主取，和宿主文件系统自己打的时间戳用同一个时钟（见模块的说明）。
+    Now,
+    /// 指定的时间（纳秒）。
+    At(i64),
+}
+
+impl FileTime {
+    /// 交给宿主的 (秒, 纳秒)。
+    fn host(self) -> (i64, i64) {
+        match self {
+            FileTime::Now => appine_hal::TIME_NOW,
+            FileTime::At(ns) => split_ns(ns),
+        }
+    }
+}
 
 /// 文件类型位（`st_mode` 的高位）。
 pub mod mode {
@@ -295,7 +322,7 @@ impl Reader<'_> {
     }
 }
 
-/// 普通文件的 size 和时间取自宿主 object 文件。
+/// 普通文件的 size 和时间取自宿主 object 文件（ctime 见模块的说明）。
 fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     let mut name = [0u8; 21];
     let o =
@@ -303,6 +330,7 @@ fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), 
     st.size = o.st_size as u64;
     st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
     st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
+    st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
     Ok(())
 }
 
@@ -496,6 +524,7 @@ fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
     st.size = meta.len();
     st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
     st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
+    st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
 }
 
 /// 宿主上操作 object 出错（宿主的错误码）。
@@ -921,8 +950,19 @@ impl Store {
     fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
         let mut name = [0u8; 21];
         let dir = self.meta.objects_dir.as_raw_fd();
-        appine_hal::open_at(dir, object_name(ino, &mut name), flags, 0o666)
+        appine_hal::open_at(dir, object_name(ino, &mut name), flags, OBJECT_MODE)
             .map_err(|e| object_err(ino, e))
+    }
+
+    /// 数据库里改了 inode `ino` 的元数据：是普通文件的话 chmod 一下 object，宿主更新它
+    /// 的 ctime（见模块的说明）。object 不在了（删除之后还打开着）或者改不了时不管，
+    /// ctime 只是没有更新。
+    fn object_changed(&self, ino: Ino) {
+        if self.kind(ino) == Ok(mode::S_IFREG) {
+            let mut name = [0u8; 21];
+            let dir = self.meta.objects_dir.as_raw_fd();
+            let _ = appine_hal::chmod_at(dir, object_name(ino, &mut name), OBJECT_MODE);
+        }
     }
 
     /// 删除 object；它已经不在时不算错误。
@@ -1223,6 +1263,22 @@ impl Store {
             .map_err(db_err)?;
         self.touch_name(parent, name);
         self.fill(Fill::Name(parent, name.to_vec(), ino));
+        self.dir_changed(parent)
+    }
+
+    /// 目录 `dir` 里的名字变了：它的 mtime、ctime 改成现在，和 Linux 的新建、删除、改名
+    /// 一样（Python 的 import、Maildir、git 按目录的 mtime 发现变化）。缓存里放新的行：
+    /// 路径解析每一级都要读目录的行。
+    fn dir_changed(&self, dir: Ino) -> Result<(), Errno> {
+        let mut st = self.stat_row(dir)?;
+        let now = now_ns();
+        self.db
+            .prepare_cached("UPDATE inodes SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![dir, now]))
+            .map_err(db_err)?;
+        self.touch_ino(dir);
+        (st.atime_ns, st.mtime_ns, st.ctime_ns) = (now, now, now);
+        self.fill(Fill::Row(st));
         Ok(())
     }
 
@@ -1347,6 +1403,7 @@ impl Store {
             .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
             s.touch_ino(ino);
+            s.object_changed(ino);
             Ok(())
         })
     }
@@ -1361,7 +1418,11 @@ impl Store {
                 .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, now_ns()]))
                 .map_err(db_err)?;
             s.touch_ino(ino);
-            if n == 0 { Err(Errno::ENOENT) } else { Ok(()) }
+            if n == 0 {
+                return Err(Errno::ENOENT);
+            }
+            s.object_changed(ino);
+            Ok(())
         })
     }
 
@@ -1401,10 +1462,13 @@ impl Store {
             .map_err(db_err)?;
         self.touch_name(parent, name);
         self.touch_ino(ino);
+        self.dir_changed(parent)?;
         let st = self.stat_row(ino)?;
         if st.nlink == 0 && st.kind() == mode::S_IFREG {
             // 提交之后再删：提交之前 App 被杀掉的话，目录项还在，object 也得在
             self.doomed.borrow_mut().push(ino);
+        } else {
+            self.object_changed(ino);
         }
         Ok(())
     }
@@ -1429,7 +1493,7 @@ impl Store {
         self.touch_name(parent, name);
         self.touch_ino(ino);
         self.touch_ino(parent);
-        Ok(())
+        self.dir_changed(parent)
     }
 
     /// unlink(2)：删除一个非目录的目录项。
@@ -1499,6 +1563,12 @@ impl Store {
         Ok(())
     }
 
+    /// 改名改了两个目录（[`Store::dir_changed`]），同一个目录只改一次。
+    fn dirs_changed(&self, a: Ino, b: Ino) -> Result<(), Errno> {
+        self.dir_changed(a)?;
+        if b != a { self.dir_changed(b) } else { Ok(()) }
+    }
+
     /// rename(2)/renameat2(2)：`noreplace` 是 `RENAME_NOREPLACE`，`exchange` 是
     /// `RENAME_EXCHANGE`。整个操作在一个事务里完成。
     pub fn rename(
@@ -1533,7 +1603,9 @@ impl Store {
                 if dst_dir {
                     s.reparent_dir(dst, new_dir, old_dir)?;
                 }
-                return Ok(());
+                s.dirs_changed(old_dir, new_dir)?;
+                s.touch_ctime(src)?;
+                return s.touch_ctime(dst);
             }
             if let Some(d) = dst {
                 if noreplace {
@@ -1568,11 +1640,8 @@ impl Store {
             if src_dir {
                 s.reparent_dir(src, old_dir, new_dir)?;
             }
-            s.db.prepare_cached("UPDATE inodes SET ctime_ns = ?2 WHERE ino = ?1")
-                .and_then(|mut st| st.execute(params![src, now_ns()]))
-                .map_err(db_err)?;
-            s.touch_ino(src);
-            Ok(())
+            s.dirs_changed(old_dir, new_dir)?;
+            s.touch_ctime(src)
         })
     }
 
@@ -1593,6 +1662,7 @@ impl Store {
                 .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
                 .map_err(db_err)?;
             s.touch_ino(ino);
+            s.object_changed(ino);
             Ok(())
         })
     }
@@ -1664,42 +1734,47 @@ impl Store {
             .and_then(|mut st| st.execute(params![ino, now_ns()]))
             .map_err(db_err)?;
         self.touch_ino(ino);
+        self.object_changed(ino);
         Ok(())
     }
 
     /// 设置修改时间：普通文件改宿主 object 的 mtime，其余改数据库。
     pub fn set_mtime(&self, ino: Ino, mtime_ns: i64) -> Result<(), Errno> {
-        self.set_times(ino, None, Some(mtime_ns))
+        self.set_times(ino, None, Some(FileTime::At(mtime_ns)))
     }
 
     /// 设置访问时间和修改时间（None 表示不改）。普通文件改宿主 object 的时间；其余的
-    /// 只记录修改时间，访问时间跟着它。
+    /// 只记录修改时间，访问时间跟着它。ctime 都改成现在（普通文件的是 object 的）。
     pub fn set_times(
         &self,
         ino: Ino,
-        atime_ns: Option<i64>,
-        mtime_ns: Option<i64>,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
     ) -> Result<(), Errno> {
         if self.kind(ino)? == mode::S_IFREG {
             let mut name = [0u8; 21];
             return appine_hal::set_times_at(
                 self.meta.objects_dir.as_raw_fd(),
                 object_name(ino, &mut name),
-                atime_ns.map(split_ns),
-                mtime_ns.map(split_ns),
+                atime.map(FileTime::host),
+                mtime.map(FileTime::host),
             )
             .map_err(|e| object_err(ino, e));
         }
-        if let Some(ns) = mtime_ns {
-            self.statement(|s| {
-                s.db.prepare_cached("UPDATE inodes SET mtime_ns = ?2 WHERE ino = ?1")
-                    .and_then(|mut st| st.execute(params![ino, ns]))
-                    .map_err(db_err)?;
-                s.touch_ino(ino);
-                Ok(())
-            })?;
-        }
-        Ok(())
+        let now = now_ns();
+        let mtime_ns = mtime.map(|t| match t {
+            FileTime::Now => now,
+            FileTime::At(ns) => ns,
+        });
+        self.statement(|s| {
+            s.db.prepare_cached(
+                "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3 WHERE ino = ?1",
+            )
+            .and_then(|mut st| st.execute(params![ino, mtime_ns, now]))
+            .map_err(db_err)?;
+            s.touch_ino(ino);
+            Ok(())
+        })
     }
 
     /// 经由打开的 object 设置普通文件 `ino` 的访问时间和修改时间：文件删除之后（object
@@ -1708,13 +1783,13 @@ impl Store {
         &self,
         ino: Ino,
         file: &File,
-        atime_ns: Option<i64>,
-        mtime_ns: Option<i64>,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
     ) -> Result<(), Errno> {
         appine_hal::set_times_fd(
             file.as_raw_fd(),
-            atime_ns.map(split_ns),
-            mtime_ns.map(split_ns),
+            atime.map(FileTime::host),
+            mtime.map(FileTime::host),
         )
         .map_err(|e| object_err(ino, e))
     }
@@ -1953,6 +2028,68 @@ mod tests {
         drop(s);
         let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.stat(f), Err(Errno::ENOENT));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_and_change_times_follow_modifications() {
+        let (s, dir) = temp_store("times");
+        let times = |ino: Ino| {
+            let st = s.stat(ino).unwrap();
+            (st.mtime_ns, st.ctime_ns)
+        };
+        // 隔开一点再改：宿主的文件时间用的是粗粒度的时钟
+        let tick = || std::thread::sleep(Duration::from_millis(20));
+        let newer = |ino: Ino, (m, c): (i64, i64), op: &mut dyn FnMut()| {
+            tick();
+            op();
+            let (m2, c2) = times(ino);
+            (m2 > m, c2 > c)
+        };
+        let a = s.mkdir(ROOT, b"a", 0o755, 0, 0).unwrap();
+        let b = s.mkdir(ROOT, b"b", 0o755, 0, 0).unwrap();
+        // 目录里新建、改名、删除都改它的 mtime 和 ctime，改名时两边的目录都改
+        let mut created = None;
+        let op = &mut || created = Some(s.create_file(a, b"f", 0o644, 0, 0).unwrap());
+        assert_eq!(newer(a, times(a), op), (true, true));
+        let (f, mut file) = created.unwrap();
+        let tb = times(b);
+        let op = &mut || s.rename(a, b"f", b, b"g", false, false).unwrap();
+        assert_eq!(newer(a, times(a), op), (true, true));
+        assert!(times(b).0 > tb.0 && times(b).1 > tb.1);
+        let op = &mut || s.link(b, b"h", f).unwrap();
+        assert_eq!(newer(b, times(b), op), (true, true));
+        let op = &mut || s.unlink(b, b"h").unwrap();
+        assert_eq!(newer(b, times(b), op), (true, true));
+        let op = &mut || s.rmdir(ROOT, b"a").unwrap();
+        assert_eq!(newer(ROOT, times(ROOT), op), (true, true));
+        // 普通文件：写、截断改的是 object，ctime 也跟着变；chmod 只改 ctime
+        let op = &mut || file.write_all(b"data").unwrap();
+        assert_eq!(newer(f, times(f), op), (true, true));
+        let op = &mut || s.truncate(f, 1).unwrap();
+        assert_eq!(newer(f, times(f), op), (true, true));
+        let op = &mut || s.set_mode(f, 0o600).unwrap();
+        assert_eq!(newer(f, times(f), op), (false, true));
+        let op = &mut || s.rename(b, b"g", b, b"g2", false, false).unwrap();
+        assert_eq!(newer(f, times(f), op), (false, true));
+        let op = &mut || s.link(b, b"h", f).unwrap();
+        assert_eq!(newer(f, times(f), op), (false, true));
+        // utimensat 设成以前的时间，ctime 是现在；目录只给访问时间也改 ctime
+        let before = times(f);
+        tick();
+        s.set_times(f, Some(FileTime::At(1)), Some(FileTime::At(2_000_000_000)))
+            .unwrap();
+        assert_eq!(times(f).0, 2_000_000_000);
+        assert!(times(f).1 > before.1);
+        let before = times(b);
+        tick();
+        s.set_times(b, None, Some(FileTime::At(3_000_000_000)))
+            .unwrap();
+        assert_eq!(times(b).0, 3_000_000_000);
+        assert!(times(b).1 > before.1);
+        let op = &mut || s.set_times(b, Some(FileTime::Now), None).unwrap();
+        assert_eq!(newer(b, times(b), op), (false, true));
+        drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 

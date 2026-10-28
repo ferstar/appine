@@ -471,15 +471,15 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - **SQLite** 保存完整的命名空间：目录项、inode、symlink 目标、xattr。使用 WAL 模式，SQLite 以 amalgamation 形式随 App 打包（`rusqlite` 的 `bundled`；NDK 不对外提供系统 SQLite）。
 - 每个普通文件的数据存成一个宿主文件 `objects/<ino>`。目录、symlink、设备节点、FIFO、socket 文件只存在于数据库里。
 - 元数据的归属：
-  - 普通文件的 **size 和 mtime 以宿主 object 文件为准**。`utimensat` 直接对宿主 object 调用 `futimens`。
-  - mode、uid/gid、ctime、xattr、nlink 存在 SQLite 里。
+  - 普通文件的 **size、mtime 和 ctime 以宿主 object 文件为准**。`utimensat` 直接对宿主 object 调用 `futimens`，`UTIME_NOW` 原样交给宿主。数据库里改了普通文件的元数据（权限、属主、链接数、改名、xattr）时也 chmod 一下 object，由宿主把它的 ctime 改成当时的时间：数据库用的时钟和宿主文件系统打时间戳用的不一定一致（virtiofs 上差了几十毫秒），同一个文件的时间戳只用一个时钟。
+  - mode、uid/gid、xattr、nlink，以及别的 inode 的 mtime、ctime 存在 SQLite 里。目录里新建、删除、改名时，目录的 mtime、ctime 改成当时的时间（Python 的 import、Maildir、git 按目录的 mtime 发现变化）。
 - 硬链接就是多个目录项指向同一个 ino。每个元数据操作（新建、删除、`rename`、改属性）要么全部生效，要么全部不生效。
 - **推迟提交**：一次提交要把改了的页写进 WAL（每页两次 pwrite，加上 WAL 索引的加解锁），约 15 微秒，比操作本身（约 2 微秒）贵得多。所以写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是事务里的一个保存点，出错（或者内核层 panic）时只回滚到它自己的保存点。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，宿主调用 `Machine::sync`、`trim_memory`（Android 的 `onTrimMemory`，§11.2），以及内核实例关闭时立即提交。
   - App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态。Linux 断电时丢失的更多（ext4 默认每 5 秒提交一次日志）；guest 用 fsync 要求持久的修改不会丢。
   - 删除最后一个链接时，宿主 object 等提交之后再删：提交之前被杀掉的话，目录项还在，object 也得在。
   - 新建普通文件的 object 立即建好（guest 马上就要读写）。提交之前被杀掉的话，这些 inode 随事务丢失，object 却留了下来；编号以后会再分配出去，分给目录这类没有 object 的 inode 时它就永远留下了。所以 `lock` 文件里记着还没提交的写事务新分配的 inode 编号范围，下次开机删掉范围里没有 inode 行的 object；新建 object 时已经有同名的就清空接着用。
 - 读写数据直接对宿主 fd 做 `pread`/`pwrite`。两个普通文件之间的 `sendfile`、`copy_file_range` 交给宿主的 `sendfile`（Android 14 之前 App 的 seccomp 不允许 `copy_file_range`，会收到 SIGSYS），数据不经过内核层。
-- object 按 inode 编号相对 `objects` 目录打开、新建、删除和改时间（`openat`、`unlinkat`、`utimensat`），不解析整个路径。
+- object 按 inode 编号相对 `objects` 目录打开、新建、删除和改时间、权限（`openat`、`unlinkat`、`utimensat`、`fchmodat`），不解析整个路径。
 - **元数据缓存**：路径查找和 stat 走内存里的缓存（目录项，包括不存在的名字；inode 行；符号链接目标；目录列表），不逐级查询数据库。自己的写入在改的时候就去掉受影响的条目，所以操作里照样读缓存（只是不往里填：查到的可能被回滚）；操作成功之后，它新建的目录项和 inode 行直接放进缓存，新建之后马上按路径 chmod、chown、stat 不必再查数据库。缓存没命中时，一次路径解析里的所有查询共用一个读事务：WAL 模式下每条语句单独开、关读事务都要 fcntl 加解锁，比查询本身还贵。
   - 缓存也可以不持 BKL 读（§6 的不持 BKL 的 stat）：只有持 BKL 的线程修改缓存，修改时持有一把读写锁的写锁，它自己读时不加锁；别的线程持读锁读，没命中就交回正常路径（由它填进缓存）。普通文件的 size 和时间在持读锁时向宿主 stat object，inode 编号删除后被重新使用时结果不会一半来自旧文件。
 - **多个进程共用一个仓库**：

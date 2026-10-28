@@ -64,6 +64,8 @@ pub fn import_tar_gz(store: &Store, reader: impl Read) -> Result<ImportReport, E
     store.transaction(|store| {
         let mut archive = tar::Archive::new(GzDecoder::new(reader));
         let mut report = ImportReport::default();
+        // 目录的 mtime 最后再设：之后在里面新建的条目会把它改成现在（GNU tar 也是这样）
+        let mut dir_times = Vec::new();
         let entries = archive.entries().map_err(tar_err)?;
         for entry in entries {
             let mut entry = entry.map_err(tar_err)?;
@@ -78,7 +80,7 @@ pub fn import_tar_gz(store: &Store, reader: impl Read) -> Result<ImportReport, E
             let Some((name, parents)) = comps.split_last() else {
                 // tar 里的根目录：只更新属性
                 store.set_owner_mode(ROOT, perm, uid, gid)?;
-                store.set_mtime(ROOT, mtime_ns)?;
+                dir_times.push((ROOT, mtime_ns));
                 continue;
             };
             let parent = ensure_dir(store, parents, &mut report)?;
@@ -93,7 +95,8 @@ pub fn import_tar_gz(store: &Store, reader: impl Read) -> Result<ImportReport, E
                     }
                 };
                 store.set_owner_mode(ino, perm, uid, gid)?;
-                ino
+                dir_times.push((ino, mtime_ns));
+                continue;
             } else if existing.is_some() {
                 return Err(Errno::EEXIST);
             } else if kind.is_file() {
@@ -131,6 +134,9 @@ pub fn import_tar_gz(store: &Store, reader: impl Read) -> Result<ImportReport, E
             } else {
                 continue; // pax 头等元数据条目
             };
+            store.set_mtime(ino, mtime_ns)?;
+        }
+        for (ino, mtime_ns) in dir_times {
             store.set_mtime(ino, mtime_ns)?;
         }
         Ok(report)
@@ -192,6 +198,11 @@ mod tests {
         let st = store.stat(busybox).unwrap();
         assert_eq!((st.mode, st.size, st.nlink), (mode::S_IFREG | 0o4755, 5, 2));
         assert_eq!(st.mtime_ns, 1_700_000_000 * 1_000_000_000);
+        // 目录的 mtime 是 tar 里的，不是在里面新建条目的时间
+        assert_eq!(
+            store.stat(bin).unwrap().mtime_ns,
+            1_700_000_000 * 1_000_000_000
+        );
         let ls = store.lookup(bin, b"ls").unwrap().unwrap();
         assert_eq!(store.readlink(ls).unwrap(), b"/bin/busybox");
         let sbin = store.lookup(ROOT, b"sbin").unwrap().unwrap();

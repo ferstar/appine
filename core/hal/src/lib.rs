@@ -324,8 +324,11 @@ fn utime_spec(atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> [libc::ti
     [ts(atime), ts(mtime)]
 }
 
+/// [`set_times_at`]、[`set_times_fd`] 的时间取这个值时，由宿主取现在的时间（UTIME_NOW）。
+pub const TIME_NOW: (i64, i64) = (0, libc::UTIME_NOW);
+
 /// 设置目录 `dir` 里名为 `name` 的文件的访问时间和修改时间（utimensat，跟随符号链接），
-/// 时间是 (秒, 纳秒)，None 表示不改。
+/// 时间是 (秒, 纳秒)，None 表示不改，[`TIME_NOW`] 表示现在。
 pub fn set_times_at(
     dir: i32,
     name: &std::ffi::CStr,
@@ -347,6 +350,14 @@ pub fn set_times_fd(
 ) -> Result<(), i32> {
     let times = utime_spec(atime, mtime);
     if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// 修改目录 `dir` 里名为 `name` 的文件的权限位（fchmodat，跟随符号链接）。
+pub fn chmod_at(dir: i32, name: &std::ffi::CStr, mode: u32) -> Result<(), i32> {
+    if unsafe { libc::fchmodat(dir, name.as_ptr(), mode as libc::mode_t, 0) } < 0 {
         return Err(last_errno());
     }
     Ok(())

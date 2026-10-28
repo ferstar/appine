@@ -23,7 +23,7 @@ use crate::signal::{self, SigInfo};
 use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
-use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
+use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
 use crate::vfs::{Mount, Node, Pseudo, Vfs, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
@@ -2306,15 +2306,9 @@ pub(super) fn utimensat(
         let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
         (store_ino(&node)?, path)
     };
-    let now = || {
-        appine_hal::clock_gettime(0)
-            .map(|(s, ns)| s * 1_000_000_000 + ns)
-            .map_err(Errno)
-    };
-    // times[0] 是 atime，times[1] 是 mtime
+    // times[0] 是 atime，times[1] 是 mtime。现在的时间由仓库取（普通文件交给宿主）
     let (atime, mtime, explicit) = if times == 0 {
-        let t = now()?;
-        (Some(t), Some(t), false)
+        (Some(FileTime::Now), Some(FileTime::Now), false)
     } else {
         let b: [u8; 32] = get(cx, times)?;
         let word = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
@@ -2330,11 +2324,11 @@ pub(super) fn utimensat(
             .iter()
             .any(|&n| n != UTIME_NOW && n != UTIME_OMIT);
         let time = |sec: i64, nsec: i64| match nsec {
-            UTIME_OMIT => Ok(None),
-            UTIME_NOW => now().map(Some),
-            nsec => Ok(Some(sec * 1_000_000_000 + nsec)),
+            UTIME_OMIT => None,
+            UTIME_NOW => Some(FileTime::Now),
+            nsec => Some(FileTime::At(sec * 1_000_000_000 + nsec)),
         };
-        (time(word(0), word(1))?, time(word(2), word(3))?, explicit)
+        (time(word(0), word(1)), time(word(2), word(3)), explicit)
     };
     // 设成指定的时间只有属主可以，设成现在的时间有写权限也可以
     let st = cx.vfs()?.store().attrs(ino)?;

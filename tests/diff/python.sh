@@ -1,4 +1,4 @@
-# CPython：哈希、浮点格式化、十进制、unicode、sqlite3、线程
+# CPython：哈希、浮点格式化、十进制、unicode、sqlite3、线程；文件和目录的时间戳
 python3 - <<'PY'
 import base64, decimal, fractions, hashlib, json, math, re, sqlite3, struct, threading, unicodedata, zlib
 print(hashlib.sha256(b"x" * 10**6).hexdigest(), hashlib.md5(b"appine").hexdigest())
@@ -28,4 +28,50 @@ for t in threads:
 print(total[0])
 print(re.sub(r"(\w+)@(\w+)", r"\2 at \1", "alice@example bob@test"))
 print(int("9" * 400) % 1000000007, pow(3, 10**5, 10**9 + 7))
+PY
+
+# 时间戳：目录里新建、删除、改名改目录的 mtime 和 ctime；写、截断、chmod、utimensat 改
+# 文件的 ctime；import 找得到同一个目录里后来新建的模块（它按目录的 mtime 重新列目录）
+rm -rf /tmp/ts && mkdir /tmp/ts && cd /tmp/ts && python3 - <<'PY'
+import os, sys, time
+def times(p):
+    st = os.stat(p, follow_symlinks=False)
+    return st.st_mtime_ns, st.st_ctime_ns
+def check(name, p, op):
+    before = times(p)
+    time.sleep(0.05)
+    op()
+    after = times(p)
+    print(name, after[0] > before[0], after[1] > before[1])
+def append(p):
+    with open(p, "a") as f:
+        f.write("data")
+os.mkdir("a")
+os.mkdir("b")
+check("create", "a", lambda: open("a/f", "w").close())
+check("rename-from", "a", lambda: os.rename("a/f", "b/f"))
+check("rename-to", "a", lambda: os.rename("b/f", "a/f"))
+check("link", "a", lambda: os.link("a/f", "a/g"))
+check("unlink", "a", lambda: os.unlink("a/g"))
+check("mkdir", "a", lambda: os.mkdir("a/d"))
+check("rmdir", "a", lambda: os.rmdir("a/d"))
+check("symlink", "a", lambda: os.symlink("f", "a/l"))
+check("write", "a/f", lambda: append("a/f"))
+check("truncate", "a/f", lambda: os.truncate("a/f", 1))
+check("chmod", "a/f", lambda: os.chmod("a/f", 0o600))
+for p in ["a/f", "a", "a/l"]:
+    before = times(p)
+    time.sleep(0.05)
+    os.utime(p, ns=(10**9, 2 * 10**9), follow_symlinks=False)
+    print("utime", p, times(p)[0], times(p)[1] > before[1])
+os.mkdir("m")
+sys.path.insert(0, "/tmp/ts/m")
+with open("m/one.py", "w") as f:
+    f.write("x = 1\n")
+import one
+time.sleep(0.05)
+with open("m/two.py", "w") as f:
+    f.write("x = 2\n")
+import two
+print("import", one.x, two.x)
 PY
