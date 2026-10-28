@@ -1,6 +1,6 @@
 # M9 之前：删除的目录里不能新建，socket 可以 fchmod（2026-10-28）
 
-← [M9 之前：FIFO 在写端来之前不报 POLLHUP（2026-10-28）](76-fifo-pollhup.md) · [索引](../milestones.md)
+← [M9 之前：FIFO 在写端来之前不报 POLLHUP（2026-10-28）](76-fifo-pollhup.md) · [索引](../milestones.md) · [M9 之前：网络信息的缺口（只补文档，2026-10-28）](78-net-info-gaps.md) →
 
 [翻译表那一轮](72-table-tombstones.md)重跑 Node.js 的测试时新找到的两个问题。
 

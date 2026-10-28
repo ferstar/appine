@@ -86,6 +86,7 @@
 | [M9 之前：PTY 的 TCFLSH 和 TCXONC](rounds/75-pty-flow.md) | 2026-10-28 | 主设备上的 TCFLSH 按主设备的方向清；输出被 ^S、TCOOFF 停住时这一端的写阻塞（原来照样成功），已经写出的另一端照样能读，TCOOFF 要 TCOON 才恢复；TCIOFF、TCION 发 STOP、START 字符：CPython 的 test_termios、test_ioctl 不再各卡 20 分钟 |
 | [M9 之前：FIFO 在写端来之前不报 POLLHUP](rounds/76-fifo-pollhup.md) | 2026-10-28 | 以 `O_NONBLOCK` 只读打开、当时没有写端的 FIFO，有写端打开过之前 poll 不报 POLLHUP（Linux 读端的 `f_version`）：Ruby 的 test_require 全部通过 |
 | [M9 之前：删除的目录里不能新建，socket 可以 fchmod](rounds/77-dead-dir-socket-fchmod.md) | 2026-10-28 | 链接数已经是 0 的目录里新建、改名进去返回 ENOENT（原来成功了）；socket、匿名管道的 fd 可以 fchmod、fchown（原来 EACCES）：Node 的 test-fs-mkdir 和 `listen({ readableAll })` 的两个测试通过 |
+| [M9 之前：网络信息的缺口](rounds/78-net-info-gaps.md) | 2026-10-28 | 只补文档：没有路由表（`ip route` 为空、没有 `/proc/net/route`）、`/proc/net/dev` 的流量计数全是 0、没有 `if_inet6` 等，Android 上 App 读不到宿主的这些信息；记下影响和可能的做法（`LinkProperties` 的路由、内核层自己计数） |
 
 ## 测量条件
 
