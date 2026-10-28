@@ -5,7 +5,8 @@
 #   scripts/dev scripts/ltp [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
 #
 # 每个测试在一个新的 appine-run 进程里运行，结果写到 target/ltp/results.txt，每行
-# "<名字> <PASS|CONF|FAIL|TIMEOUT> <退出码>"，输出在 target/ltp/logs/<名字>.log。
+# "<名字> <PASS|CONF|FAIL|TIMEOUT> <退出码>"，输出在 target/ltp/logs/<名字>.log，上一次
+# 运行的留在 <名字>.prev.log（失败之后单独重跑不会把失败的那次冲掉）。
 # LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
 set -eu
 
@@ -19,13 +20,15 @@ if [ "${1:-}" = --one ]; then
     tier=$2
     name=$3
     shift 3
+    log=$out/logs/$name.log
+    [ -f "$log" ] && mv "$log" "$out/logs/$name.prev.log"
     set +e
     # LTP 按自己的计时器判超时；appine 比原生慢得多，放宽 20 倍
     timeout 900 "$run" --tier "$tier" --rootfs "$store" \
         --env PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         --env LTPROOT=/opt/ltp --env TMPDIR=/tmp --env LTP_TIMEOUT_MUL=20 \
         --env LTP_COLORIZE_OUTPUT=0 --env KCONFIG_PATH=/opt/ltp/appine.config \
-        -- /bin/sh -c "cd /tmp && exec $*" </dev/null >"$out/logs/$name.log" 2>&1
+        -- /bin/sh -c "cd /tmp && exec $*" </dev/null >"$log" 2>&1
     code=$?
     case $code in
     0) result=PASS ;;

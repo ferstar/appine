@@ -37,4 +37,4 @@
 
 - 管道负载仍是原生的 1.4 倍：两头的进程各自 execve、退出，BKL 上仍有排队（exit_group、clone 的持锁时间次于 execve），宿主内核里的缺页、munmap 合计还占三成。进程退出时宿主是一段段解除映射（逐页刷 TLB），Linux 销毁整个地址空间时只刷一次，这部分省不掉，除非 guest 进程的匿名内存来自更大的整块。→ 降到原生的 1.15 倍（M9 之前：BKL 的等待和持锁）
 - python 启动（`import json, re, subprocess, asyncio`）没有变化，时间在 guest 代码和读文件上。→ outline atomics 的 STXR 在 Tier 1 里做之后快了 6%（M9 之前：node 启动）
-- 上面那次 PTY 用例卡住的原因。
+- 上面那次 PTY 用例卡住的原因。→ 已查明，是测试自己的竞争：busybox ash 的 fg 先打印命令再把终端交给作业，测试看到命令就按 ^C，SIGINT 可能落到 shell 上，作业一直停着，exit 不退出；改了测试，等 shell 退出也加了超时（M9 之前：测试自己的竞争和丢掉的现场）

@@ -826,10 +826,22 @@ impl Interactive {
         }
     }
 
-    /// 退出 shell，返回它的退出码。
+    /// 退出 shell，返回它的退出码。shell 不肯退出时（比如还有停住的作业）不一直等下去。
     fn exit(mut self) -> Option<i32> {
         self.send(b"exit\n");
-        self.child.wait().unwrap().code()
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tier {}: the shell did not exit; output so far:\n{}",
+                self.tier,
+                String::from_utf8_lossy(&self.output.lock().unwrap())
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -865,8 +877,8 @@ fn ctrl_c_and_ctrl_z_control_the_foreground_job() {
     for tier in TIERS {
         let mut s = Interactive::start(store, tier);
         // 子进程打印 job-42 时已经是前台进程组；输出的文字不能出现在命令行里，
-        // 否则会先匹配到回显
-        s.send(b"sh -c 'echo job-$((6*7)); exec sleep 30'\n");
+        // 否则会先匹配到回显。作业停在读终端上
+        s.send(b"sh -c 'echo job-$((6*7)); while read x; do echo got-$x; done'\n");
         s.expect("job-42");
         s.send(b"\x1a");
         s.expect("Stopped");
@@ -874,9 +886,14 @@ fn ctrl_c_and_ctrl_z_control_the_foreground_job() {
         s.send(b"jobs\n");
         s.expect("Stopped");
         s.expect(PROMPT);
-        // fg 打印作业的命令之前已经把终端交给了它
+        // ash 的 fg 先打印作业的命令，再把终端交给它、让它继续。看到命令就按 ^C 的话，
+        // SIGINT 可能落到 shell 自己身上：shell 回到提示符，$? 也是 130，作业却一直停着，
+        // exit 不肯退出（原生 Linux 上也一样）。所以等作业读到一行、确实在前台运行了再按
+        // fg 打印的命令换成了双引号，`$` 前面加了反斜杠
         s.send(b"fg\n");
-        s.expect("exec sleep 30");
+        s.expect("; done");
+        s.send(b"ping\n");
+        s.expect("got-ping");
         s.send(b"\x03");
         s.expect(PROMPT);
         s.send(b"echo status $?\n");

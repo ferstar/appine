@@ -90,6 +90,7 @@
 | [M9 之前：终端的访问时间和修改时间](rounds/79-pty-times.md) | 2026-10-28 | `/dev/pts/<n>` 记下自己的三个时间：从设备读到数据改访问时间、写出数据改修改时间（与 Linux 一样只改秒、相差 8 秒以上才改），utimensat 可以改（原来 EACCES），chmod、chown 改状态改变时间：w、who 的空闲时间有意义了 |
 | [M9 之前：CPU 时间不倒退](rounds/80-cpu-times.md) | 2026-10-28 | 用户态、内核态的 CPU 时间按 Linux 的 `cputime_adjust` 各自不倒退（原来内核态时间按滴答取整，跨过一个滴答时用户态时间倒退，LTP 的 times03 偶发失败）；futex_wake05 不是偶发项，是[稳定性和内存](rounds/12-stability-memory.md)那一轮修好的 |
 | [M9 之前：被叫醒的进程在 /proc 里是 R](rounds/81-woken-state.md) | 2026-10-28 | 被信号等叫醒、还没跑起来的线程在 `/proc` 里是 R（原来到它重新拿到 BKL 之前都是 S）：LTP 按状态回到 S 来同步父子进程，shmctl01 不再失败（原来记作偶发项，最近每次都失败） |
+| [M9 之前：测试自己的竞争和丢掉的现场](rounds/82-test-races.md) | 2026-10-28 | 作业控制用例卡住是测试的竞争（ash 的 fg 先打印命令再交出终端，^C 可能落到 shell 上），原生 Linux 上用 strace 推迟 writev 的返回能稳定重现；改了测试，等 shell 退出加超时；差分测试失败时另存输出，LTP 保留上一次的日志 |
 
 ## 测量条件
 
@@ -111,10 +112,9 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02、prctl09 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败 |
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
-| exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |
+| exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了（[测试自己的竞争和丢掉的现场](rounds/82-test-races.md)那一轮起 `scripts/ltp` 保留上一次的日志）；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |
 | mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题 |
 
-cargo test 里 `ctrl_c_and_ctrl_z_control_the_foreground_job`（Tier 1）卡住过一次：作业停着、shell 在等输入，测试在等它退出（[起进程的宿主开销](rounds/28-spawn-host-cost.md)）。之后重放几十次都没再出现，原因没查明。
 
 ## R1 的测量记录
 
