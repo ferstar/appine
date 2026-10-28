@@ -69,7 +69,7 @@ pub(crate) struct Task {
     pub saved_sigmask: Cell<Option<u64>>,
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
     pub killed: Cell<bool>,
-    /// 线程正在内核里等待（`/proc/<pid>/stat` 的状态 S）。在释放 BKL 之前设置，重新拿到
+    /// 线程正在内核里等待（[`Task::asleep`]、平均负载）。在释放 BKL 之前设置，重新拿到
     /// BKL 之后清除；不持 BKL 的等待（`syscall::fast`）也设置。
     pub sleeping: AtomicBool,
     /// 线程名（`prctl(PR_SET_NAME)`）。
@@ -228,6 +228,14 @@ impl Task {
         {
             g.exiting.get_or_insert(status);
         }
+    }
+
+    /// 线程在内核里等待、还没被叫醒（`/proc/<pid>/stat` 的状态 S）。被叫醒之后到重新拿到
+    /// BKL 之前 [`Task::sleeping`] 还在，但它的事件已经触发了：与 Linux 的
+    /// `try_to_wake_up` 当场把状态改成可运行一样，算作 R。LTP 靠这个同步，比如 shmctl01
+    /// 给停在 pause() 里的子进程发信号，等它的状态回到 S 就当它做完了下一步。
+    pub fn asleep(&self) -> bool {
+        self.sleeping.load(Ordering::Relaxed) && !self.event.is_signaled()
     }
 
     /// 线程用掉的 CPU 时间（纳秒），以宿主线程的 CPU 时间计。

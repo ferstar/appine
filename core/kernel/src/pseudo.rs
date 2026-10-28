@@ -1171,11 +1171,9 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static
         return ('T', "stopped");
     }
     // 与 Linux 相同，进程的状态是主线程（主线程已退出时是代表线程）的状态：在内核里
-    // 等待是 S，其余（执行 guest 代码、处理 syscall、刚创建还没运行）都是 R
-    let sleeping = ps
-        .task(g.tgid, tid)
-        .is_some_and(|t| t.sleeping.load(std::sync::atomic::Ordering::Relaxed));
-    if sleeping {
+    // 等待是 S，其余（执行 guest 代码、处理 syscall、刚创建还没运行、被叫醒了还没跑起来）
+    // 都是 R
+    if ps.task(g.tgid, tid).is_some_and(|t| t.asleep()) {
         ('S', "sleeping")
     } else {
         ('R', "running")

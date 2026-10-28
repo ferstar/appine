@@ -89,6 +89,7 @@
 | [M9 之前：网络信息的缺口](rounds/78-net-info-gaps.md) | 2026-10-28 | 只补文档：没有路由表（`ip route` 为空、没有 `/proc/net/route`）、`/proc/net/dev` 的流量计数全是 0、没有 `if_inet6` 等，Android 上 App 读不到宿主的这些信息；记下影响和可能的做法（`LinkProperties` 的路由、内核层自己计数） |
 | [M9 之前：终端的访问时间和修改时间](rounds/79-pty-times.md) | 2026-10-28 | `/dev/pts/<n>` 记下自己的三个时间：从设备读到数据改访问时间、写出数据改修改时间（与 Linux 一样只改秒、相差 8 秒以上才改），utimensat 可以改（原来 EACCES），chmod、chown 改状态改变时间：w、who 的空闲时间有意义了 |
 | [M9 之前：CPU 时间不倒退](rounds/80-cpu-times.md) | 2026-10-28 | 用户态、内核态的 CPU 时间按 Linux 的 `cputime_adjust` 各自不倒退（原来内核态时间按滴答取整，跨过一个滴答时用户态时间倒退，LTP 的 times03 偶发失败）；futex_wake05 不是偶发项，是[稳定性和内存](rounds/12-stability-memory.md)那一轮修好的 |
+| [M9 之前：被叫醒的进程在 /proc 里是 R](rounds/81-woken-state.md) | 2026-10-28 | 被信号等叫醒、还没跑起来的线程在 `/proc` 里是 R（原来到它重新拿到 BKL 之前都是 S）：LTP 按状态回到 S 来同步父子进程，shmctl01 不再失败（原来记作偶发项，最近每次都失败） |
 
 ## 测量条件
 
@@ -107,7 +108,6 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 
 | 测试 | 原因 |
 |---|---|
-| shmctl01 | 全量并发时子进程还没 `shmdt` 完就超时，单独运行多数通过；[多进程并行](rounds/36-parallel-processes.md)那一轮用 HEAD 的二进制单独跑 8 次也失败 3 次，写时复制之前的二进制并发跑 shm 子集也会失败 |
 | futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02、prctl09 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败 |
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |

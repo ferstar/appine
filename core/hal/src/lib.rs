@@ -1154,6 +1154,13 @@ impl Event {
         unsafe { libc::write(self.write, one.as_ptr().cast(), one.len()) };
     }
 
+    /// 事件是否处于触发状态（不清除它）。
+    pub fn is_signaled(&self) -> bool {
+        const POLLIN: i16 = 1;
+        let mut fds = [(self.read, POLLIN, 0)];
+        matches!(poll(&mut fds, Some(Duration::ZERO)), Ok(n) if n > 0)
+    }
+
     /// 清除触发状态。
     pub fn clear(&self) {
         let mut buf = [0u8; 64];
@@ -1177,6 +1184,17 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn checking_an_event_does_not_clear_it() {
+        let e = Event::new().unwrap();
+        assert!(!e.is_signaled());
+        e.signal();
+        assert!(e.is_signaled());
+        assert!(e.is_signaled());
+        e.clear();
+        assert!(!e.is_signaled());
+    }
 
     #[test]
     fn counts_written_pages_as_cached() {

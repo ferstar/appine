@@ -1912,3 +1912,73 @@ now = time.time()
 print("pty after io", now - 10 < st.st_atime <= now + 1, now - 10 < st.st_mtime <= now + 1)
 print("pty fstat", os.fstat(s).st_mtime == st.st_mtime)
 PY
+
+# 被信号叫醒、还没跑起来的进程在 /proc 里是 R（Linux 的 try_to_wake_up 当场改状态）：
+# LTP 的 TST_PROCESS_STATE_WAIT 给停在 pause() 里的子进程发信号，等它的状态回到 S，就当它
+# 做完了下一步（shmctl01）
+cat > woken.c <<'C'
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#define N 8
+static void on_usr1(int sig) { (void)sig; }
+static char state(pid_t pid)
+{
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    if (f)
+        fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    return p && p[1] ? p[2] : 0;
+}
+static int wait_sleeping(pid_t pid)
+{
+    for (int i = 0; i < 10000; i++) {
+        if (state(pid) == 'S')
+            return 1;
+        usleep(1000);
+    }
+    return 0;
+}
+int main(void)
+{
+    volatile int *done = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sigaction(SIGUSR1, &sa, NULL);
+    pid_t pids[N];
+    for (int i = 0; i < N; i++) {
+        if ((pids[i] = fork()) == 0)
+            for (;;) {
+                pause();
+                done[i]++;
+            }
+    }
+    int stuck = 0, early = 0;
+    for (int round = 1; round <= 20; round++) {
+        for (int i = 0; i < N; i++)
+            stuck += !wait_sleeping(pids[i]);
+        for (int i = 0; i < N; i++)
+            kill(pids[i], SIGUSR1);
+        for (int i = 0; i < N; i++)
+            stuck += !wait_sleeping(pids[i]);
+        for (int i = 0; i < N; i++)
+            early += done[i] != round;
+    }
+    printf("woken children: never sleeping %d, sleeping again before running %d\n", stuck, early);
+    for (int i = 0; i < N; i++) {
+        kill(pids[i], SIGKILL);
+        waitpid(pids[i], NULL, 0);
+    }
+    return 0;
+}
+C
+gcc -O1 -o woken woken.c
+./woken
