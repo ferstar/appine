@@ -494,6 +494,10 @@ C
 gcc -O1 -o procnet procnet.c
 ./procnet
 
+# /proc/net/if_inet6：回环的那一行（别的接口的地址取决于容器的网络）。环境里没有 IPv6 时
+# 两边都没有这一行
+grep ' lo$' /proc/net/if_inet6 || echo "if_inet6: no lo"
+
 # fdinfo 里 epoll、timerfd、signalfd 特有的行；mountinfo 的设备号与 stat 一致，
 # fdinfo 的 mnt_id 能在 mountinfo 里找到
 cat > fdinfo.c <<'C'

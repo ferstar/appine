@@ -243,6 +243,57 @@ static void seize_fork(void)
     printf("child: %s\n", describe(wait_for(pid)));
 }
 
+/* 用 PTRACE_CONT 继续、停在系统调用中途的 fork 事件上时改用 PTRACE_SYSCALL：与 Linux
+   一样停在这个系统调用（clone）的出口，入口没有停过也一样；NT_ARM_SYSTEM_CALL 两次都是
+   clone 的编号 */
+static int syscall_number(pid_t pid)
+{
+    int nr = -2;
+    struct iovec iov = {&nr, sizeof nr};
+    if (ptrace(PTRACE_GETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov))
+        perror("NT_ARM_SYSTEM_CALL");
+    return nr;
+}
+
+static void event_then_syscall(void)
+{
+    printf("== syscall exit after an event stop\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        pid_t g = fork();
+        if (g == 0)
+            _exit(3);
+        int st;
+        waitpid(g, &st, 0);
+        _exit(WIFEXITED(st) ? WEXITSTATUS(st) + 10 : 1);
+    }
+    int st = wait_for(pid);
+    printf("first stop: %s\n", describe(st));
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACEFORK | PTRACE_O_TRACESYSGOOD);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    st = wait_for(pid);
+    unsigned long g = 0;
+    ptrace(PTRACE_GETEVENTMSG, pid, 0, &g);
+    printf("fork: %s, syscall %d\n", describe(st), syscall_number(pid));
+    printf("grandchild starts: %s\n", describe(wait_for(g)));
+    ptrace(PTRACE_DETACH, g, 0, 0);
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    st = wait_for(pid);
+    struct __ptrace_syscall_info info;
+    memset(&info, 0, sizeof info);
+    ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof info, &info);
+    printf("next: %s, op %d, syscall %d, returns the grandchild %d\n", describe(st), info.op,
+           syscall_number(pid), info.op == PTRACE_SYSCALL_INFO_EXIT && info.exit.rval == (long)g);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    while (st = wait_for(pid), WIFSTOPPED(st)) {
+        printf("child gets a signal: %s\n", describe(st));
+        ptrace(PTRACE_CONT, pid, 0, WSTOPSIG(st));
+    }
+    printf("child: %s\n", describe(st));
+}
+
 /* group-stop：SEIZE 时报告成 PTRACE_EVENT_STOP，PTRACE_LISTEN 等 SIGCONT；ATTACH 时
    group-stop 没有 siginfo */
 static void group_stop(void)
@@ -747,6 +798,7 @@ int main(void)
     syscalls();
     exec_events();
     seize_fork();
+    event_then_syscall();
     group_stop();
     stopped_attach();
     foreign_tracer();

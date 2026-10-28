@@ -1425,7 +1425,7 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
 }
 
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {
-    let file = cx.fds().get(fd)?;
+    let file = io_file(cx, fd)?;
     match request {
         FIOCLEX | FIONCLEX => {
             return cx.fds_mut().set_cloexec(fd, request == FIOCLEX).map(|()| 0);
@@ -1458,7 +1458,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
                 let b: [u8; 32] = get(cx, arg)?;
                 i64::from_le_bytes(b[..8].try_into().unwrap()) as i32
             };
-            return clone_range(&cx.fds().get(src)?, &file);
+            return clone_range(&io_file(cx, src)?, &file);
         }
         FIDEDUPERANGE => {
             // struct file_dedupe_range 的头：两个 u64，dest_count（u16）和两个保留项
@@ -1539,6 +1539,16 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         cx.mm().write(UserSlice::new(arg, size), &buf)?;
     }
     Ok(rc as u64)
+}
+
+/// ioctl 和 FICLONE 的源 fd 对应的打开文件：与 Linux 的 `fdget` 一样不接受 `O_PATH` 打开的
+/// （EBADF）。
+fn io_file(cx: &Cx<'_>, fd: i32) -> Result<FileRef, Errno> {
+    let file = cx.fds().get(fd)?;
+    if file.borrow().flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    Ok(file)
 }
 
 /// FICLONE、FICLONERANGE：按 Linux 的顺序检查（`ioctl_file_clone`、`generic_file_rw_checks`），

@@ -475,6 +475,20 @@ fn inject(cx: &Cx<'_>, data: i32) {
     }
 }
 
+/// 系统调用（编号 `nr`）的入口。没有跟踪者，或者是 vDSO 里读时钟的存根（Linux 上它们不进
+/// 内核，跟踪者看不到）时返回 None。否则与 Linux 的 `regs->syscallno` 一样记下编号：
+/// PTRACE_SYSCALL 之外的方式继续时，中途的事件停住（`PTRACE_EVENT_FORK` 等）和之后改用
+/// PTRACE_SYSCALL 的出口停住，`NT_ARM_SYSTEM_CALL` 也读到这个系统调用的；返回
+/// PTRACE_SYSCALL 要不要在入口停下。出口停不停由 [`syscall_exit`] 按那时的状态再看。
+pub(crate) fn syscall_start(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> Option<bool> {
+    if !traced(cx.task) || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
+        return None;
+    }
+    let mut t = cx.task.trace.borrow_mut();
+    t.syscallno = nr as i32;
+    Some(t.mode == Mode::Syscall)
+}
+
 /// PTRACE_SYSCALL 让线程继续之后，这个系统调用（编号 `nr`）要不要在入口和出口停下。vDSO
 /// 里读时钟的存根不算：Linux 上它们不进内核，跟踪者看不到。
 pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
@@ -516,14 +530,14 @@ fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
     }
 }
 
-/// 系统调用入口停下。返回跟踪者改过之后的编号（-1 是跳过这个系统调用）；线程被结束时
-/// 返回 None。
-pub(crate) fn syscall_entry(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Option<u64> {
-    cx.task.trace.borrow_mut().syscallno = nr as i32;
+/// 系统调用入口停下（编号已经由 [`syscall_start`] 记下）。返回跟踪者改过之后的编号（-1
+/// 是跳过这个系统调用）；线程被结束时返回 None。
+pub(crate) fn syscall_entry(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Option<u64> {
     syscall_stop(cx, cpu, true).then(|| cx.task.trace.borrow().syscallno as i64 as u64)
 }
 
-/// 系统调用出口停下（PTRACE_SYSCALL 让线程继续的话）。线程被结束时返回 false。
+/// 系统调用出口停下（这时是 PTRACE_SYSCALL 让线程继续的话，与 arm64 Linux 的
+/// `syscall_trace_exit` 一样重新看，入口停没停过都一样）。线程被结束时返回 false。
 pub(crate) fn syscall_exit(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     let nr = cx.task.trace.borrow().syscallno as i64 as u64;
     !syscall_traced(cx, cpu, nr) || syscall_stop(cx, cpu, false)

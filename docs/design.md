@@ -444,14 +444,14 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 ### 7.6 ptrace
 
 - 被跟踪的是线程，跟踪者记的是进程：Linux 只接受跟踪者线程自己发的请求，appine 放宽到跟踪者进程里的任何线程（appine 不记 fork 的是哪个线程，PTRACE_TRACEME 的跟踪者是父进程）。权限与 Linux 的 `PTRACE_MODE_ATTACH_REALCREDS` 相同：同一个用户并且可以 dump，或者有 `CAP_SYS_PTRACE`；没有 Yama 的限制。跟踪 pid 1 是 ESRCH，内置的 init 不是 guest 进程（§6）。
-- 被跟踪的线程在这些地方停下（ptrace-stop）：投递信号之前、group-stop、PTRACE_SYSCALL 让它继续之后系统调用的入口和出口，以及 `PTRACE_EVENT_*`（fork、vfork、clone、exec、vfork 结束、退出、seccomp，PTRACE_INTERRUPT 和 PTRACE_SEIZE 跟进来的新线程的 `PTRACE_EVENT_STOP`）。有 seccomp 的线程在 `PTRACE_EVENT_SECCOMP` 停住时被改用 PTRACE_SYSCALL 继续的，出口也停（`strace --seccomp-bpf`）。停住时把寄存器存一份，跟踪者读写的是这一份，继续时写回 CPU 状态；停住期间只有 SIGKILL 能让它离开。与 arm64 Linux 一样，系统调用停住时 x7 是 0（入口）或 1（出口），跟踪者看不到、也改不了它原来的值；入口处跟踪者可以经由 `NT_ARM_SYSTEM_CALL` 改编号，改成 -1 时跳过这个系统调用，x0 是跟踪者设的返回值。
+- 被跟踪的线程在这些地方停下（ptrace-stop）：投递信号之前、group-stop、PTRACE_SYSCALL 让它继续之后系统调用的入口和出口，以及 `PTRACE_EVENT_*`（fork、vfork、clone、exec、vfork 结束、退出、seccomp，PTRACE_INTERRUPT 和 PTRACE_SEIZE 跟进来的新线程的 `PTRACE_EVENT_STOP`）。出口停不停与 arm64 Linux 的 `syscall_trace_exit` 一样看出口时的状态：在系统调用中途停住（fork、vfork、clone 和 vfork 结束的 `PTRACE_EVENT_*`，`PTRACE_EVENT_SECCOMP`）时被改用 PTRACE_SYSCALL 继续的，出口也停，入口没停过也一样（`strace --seccomp-bpf` 靠它拿返回值）。有跟踪者时每个系统调用都记下编号（Linux 的 `regs->syscallno`），中途和出口停住时 `NT_ARM_SYSTEM_CALL` 读到的是这个系统调用的。停住时把寄存器存一份，跟踪者读写的是这一份，继续时写回 CPU 状态；停住期间只有 SIGKILL 能让它离开。与 arm64 Linux 一样，系统调用停住时 x7 是 0（入口）或 1（出口），跟踪者看不到、也改不了它原来的值；入口处跟踪者可以经由 `NT_ARM_SYSTEM_CALL` 改编号，改成 -1 时跳过这个系统调用，x0 是跟踪者设的返回值。
 - 与 Linux 一样，被跟踪的线程不丢弃被忽略的信号（跟踪者要看到它们）；参加完 group-stop 就照常执行，即使线程组仍然停着；SEIZE 跟踪的线程的 group-stop 报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 等它结束。跟踪一个已经停住的进程时，group-stop 报告停住它的信号（线程组记着，父进程取走了停止事件也一样），每取一个信号之前先报告 group-stop：ATTACH 时先是 group-stop，再是 ATTACH 发的 SIGSTOP。
 - wait 报告 ptrace-stop 不要求 `WUNTRACED`，被跟踪的线程退出时也报告给跟踪者（不是主线程的单独报告），报告 ptrace-stop 时带着被跟踪进程的 rusage（strace -c 用它算时间）。跟踪者不是父进程时，与 Linux 一样，结束了的进程先只有跟踪者看得见（只给它发 SIGCHLD，父进程的 wait 接着等），跟踪者用 wait 取走或者退出之后才交给父进程；被跟踪的非主线程退出时不让父进程等（Linux 的 `delay_group_leader` 会等）。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪，停在信号投递停止里的信号照常投递。
 - regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`（见下）。guest 没有 SVE、PAC、MTE、SME，也就没有它们的 regset。
 - 单步（PTRACE_SINGLESTEP）由解释器执行一条指令（`appine_cpu_step`），执行完了投递 `TRAP_TRACE` 的 SIGTRAP。与 arm64 Linux 一样，单步执行 svc 时系统调用做完再报告（`SI_USER`），下一次单步不执行指令、原地再报告一次；单步时进了信号处理函数，先停在处理函数的第一条指令上（`ptrace_notify` 的 SIGTRAP，`si_code` 也是 SIGTRAP），不执行它。
 - sigsuspend、ppoll 临时换掉屏蔽字时，PTRACE_GETSIGMASK 读到的是原来的（与 Linux 的 `TIF_RESTORE_SIGMASK` 一样）；PTRACE_SETSIGMASK 之后不再恢复原来的，处理函数返回后是跟踪者设的。
 - 改写被跟踪进程的内存（PTRACE_POKETEXT/POKEDATA、`/proc/<pid>/mem`）照 Linux 的 `FOLL_FORCE`：没有写权限的私有映射也能写（下断点），先复制成自己的一份；没有写权限的共享映射不能写。写过的地方作废翻译（§4.2），写过的映射不再算作翻译池里可信的来源。`/proc/<pid>/mem` 读写的是打开时那个进程的地址空间，进程 execve 之后旧的 fd 读到 EOF。`/proc/<pid>/auxv` 是加载器留下的一份 auxv，gdb 靠它算 PIE 程序的加载地址。打开 mem 要能跟踪那个进程（`PTRACE_MODE_ATTACH`），auxv、environ、maps、smaps、pagemap 要能以只读方式跟踪（`PTRACE_MODE_READ`，规则相同：同一个用户而且可以 dump，或者有 `CAP_SYS_PTRACE`）。
-- PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径，好在入口和出口停下（§6 的不持 BKL 的系统调用不走）。vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
+- PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径，好在入口和出口停下（§6 的不持 BKL 的系统调用不走）。vDSO 里读时钟的存根不停，有 seccomp 时出口也不停，与 Linux 上它们不进内核一样。
 - `process_vm_readv`、`process_vm_writev`：权限同上，远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少。
 - 硬件断点和观察点：与常见的 Cortex-A 核一样报告 6 个断点、4 个观察点的槽。控制字按 Linux 检查和规范化（字节选择必须连续，观察点的种类是读、写或两者，断点只能是 4 字节；地址按 8 字节对齐、偏移挪进字节选择）。它们属于线程，跟踪者让线程继续时交给 CPU，只有解释器检查：每条指令执行之前比较断点，每次访存（普通读写、原子操作、独占访问、SIMD、`dc zva`）在页表检查之后、产生副作用之前比较观察点，原子的读改写算读也算写。命中时指令不执行，投递 `TRAP_HWBKPT` 的 SIGTRAP，`si_addr` 是断点地址或者访问的起点，与 arm64 Linux 一样由调试器停用、单步越过再恢复。有断点的线程只用 Tier 0 执行，不影响别的线程；有观察点的线程照常用 Tier 1，被观察的页不进它的数据 TLB（读观察点让读的一半失效，有任何观察点时写的一半都失效，因为原子的读改写也查写的一半），有观察点时翻译后的代码里的回填例程直接失败，这两种访问都交给 Tier 0 执行那一条指令，由它检查观察点、按同样的规则填表；观察的范围变了就清空 TLB。fork、clone 出来的线程没有，execve 时清掉，PTRACE_DETACH 不清。
 
@@ -544,7 +544,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射（真机待确认） |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档（真机待确认） |
 | AF_UNIX | 进程内模拟（`core/kernel/src/unix.rs`）。`SCM_RIGHTS` 传递的是 guest 的打开文件，`SO_PEERCRED` 返回 guest 的 pid 和 uid；只经由在途消息互相引用的 socket 由垃圾回收释放 |
-| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 只列出宿主的接口，流量计数都是 0；没有 `route`、`ipv6_route`、`if_inet6`、`snmp`、`sockstat`、`arp` |
+| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 只列出宿主的接口，流量计数都是 0；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；没有 `route`、`ipv6_route`、`snmp`、`sockstat`、`arp` |
 | tun/VpnService | v1 不做 |
 
 **I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作，宿主 fd 和进程内对象统一在 §6 的等待机制里处理。

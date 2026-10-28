@@ -843,6 +843,35 @@ static void trace(void)
         ptrace(PTRACE_CONT, pid, 0, 0);
     }
     printf("end: %s\n", describe(wait_for(pid)));
+
+    /* 有过滤器的线程经由 vDSO 读时钟：Linux 上不进内核，PTRACE_SYSCALL 时也不停，在
+       raise 恢复信号掩码和 getpid 之间没有停止 */
+    pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        install(SYS_getppid, RET_TRACE | 3, 0);
+        raise(SIGSTOP);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        syscall(SYS_getpid);
+        _exit(0);
+    }
+    wait_for(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD);
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    for (;;) {
+        st = wait_for(pid);
+        if (!WIFSTOPPED(st))
+            break;
+        struct __ptrace_syscall_info info = {0};
+        ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof info, &info);
+        if (info.op == PTRACE_SYSCALL_INFO_ENTRY)
+            printf("stop: %s, entry %lld\n", describe(st), (long long)info.entry.nr);
+        else
+            printf("stop: %s, op %d\n", describe(st), info.op);
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    }
+    printf("end: %s\n", describe(st));
 }
 
 /* 通知 fd：子进程装过滤器，把通知 fd 交给父进程，父进程回答它的系统调用。子进程把每次的

@@ -14,4 +14,4 @@
 **推迟项**：
 
 - 宿主的文件系统支持 reflink 时（btrfs、XFS 上的开发机）也不转给宿主。
-- `O_PATH` 打开的源 fd 在 Linux 上是 EBADF（`fdget` 不接受），这里是 EXDEV。
+- `O_PATH` 打开的源 fd 在 Linux 上是 EBADF（`fdget` 不接受），这里是 EXDEV。→ 已补上（M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口），ioctl 的 fd 本身是 `O_PATH` 打开的也是 EBADF

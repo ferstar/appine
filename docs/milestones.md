@@ -93,6 +93,7 @@
 | [M9 之前：测试自己的竞争和丢掉的现场](rounds/82-test-races.md) | 2026-10-28 | 作业控制用例卡住是测试的竞争（ash 的 fg 先打印命令再交出终端，^C 可能落到 shell 上），原生 Linux 上用 strace 推迟 writev 的返回能稳定重现；改了测试，等 shell 退出加超时；差分测试失败时另存输出，LTP 保留上一次的日志 |
 | [M9 之前：没有实现的 netlink 协议建不了](rounds/83-netlink-protocols.md) | 2026-10-28 | `NETLINK_ROUTE`、`NETLINK_KOBJECT_UEVENT` 以外的 netlink 协议是 EPROTONOSUPPORT（原来建得出、收到请求不回答）：Debian、Ubuntu 上走 PAM 的 sshd、su、login 不再因为等审计的 ACK 失败，`ss` 不再卡住；Debian 的 sshd 会话里 w 的空闲时间与原生相同 |
 | [M9 之前：补测待查的几项](rounds/84-debt-checks.md) | 2026-10-28 | 只补测：CPython test_os 的失败是用例对负载敏感（原生满载时也超过 1 毫秒），Ruby 的 memory_leak 超时只是慢（其中一个原生也超时），VS Code 第一个终端丢字原生上一样；conda 能用，12 个普查负载在 Tier 0 下与 Tier 1 一致，Ubuntu 上 su、sshd 正常；普查不进 CI |
+| [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口](rounds/85-inet6-opath-exit.md) | 2026-10-28 | `/proc/net/if_inet6` 列出宿主的 IPv6 地址，JVM 不再关掉 IPv6；ioctl 和 FICLONE 的源不接受 `O_PATH` 的 fd（EBADF）；停在 fork 事件上再改用 PTRACE_SYSCALL 时停在这个系统调用的出口，有跟踪者时每个系统调用都记下编号；修了有 seccomp 的线程经由 vDSO 读时钟时多停一次出口（[seccomp](rounds/59-seccomp.md)那一轮起的 bug） |
 
 ## 测量条件
 

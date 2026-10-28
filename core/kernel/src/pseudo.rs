@@ -120,11 +120,12 @@ const ENTRIES: [(&[u8], Entry); 24] = [
 ];
 
 /// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 69] = [
+const STATIC: [&[u8]; 70] = [
     b"net/",
     b"net/dev",
     b"net/icmp",
     b"net/icmp6",
+    b"net/if_inet6",
     b"net/raw",
     b"net/raw6",
     b"net/tcp",
@@ -1859,6 +1860,32 @@ fn net_dev() -> String {
     s
 }
 
+/// `/proc/net/if_inet6`：宿主接口上的 IPv6 地址，格式与 Linux 的 `if6_seq_show` 相同。
+/// OpenJDK 靠它判断有没有 IPv6（`IPv6_supported`），没有这个文件或者是空的就整个关掉
+/// IPv6。scope 按 Linux 的 `ipv6_addr_scope` 从地址看；标志与 netlink 的回答一样都是
+/// `IFA_F_PERMANENT`（getifaddrs 分不出临时地址）。
+fn net_if_inet6() -> String {
+    let mut s = String::new();
+    for i in appine_hal::net::interfaces() {
+        for (_, addr, prefix) in i.addrs.iter().filter(|(f, ..)| *f == AF_INET6) {
+            let scope = match addr[..] {
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] => 0x10,
+                [0xfe, b, ..] if b & 0xc0 == 0x80 => 0x20,
+                [0xfe, b, ..] if b & 0xc0 == 0xc0 => 0x40,
+                _ => 0,
+            };
+            let hex: String = addr.iter().map(|b| format!("{b:02x}")).collect();
+            writeln!(
+                s,
+                "{hex} {:02x} {prefix:02x} {scope:02x} 80 {:>8}",
+                i.index, i.name
+            )
+            .unwrap();
+        }
+    }
+    s
+}
+
 fn random_uuid() -> String {
     let mut b = [0u8; 16];
     let _ = appine_hal::fill_random(&mut b);
@@ -1904,6 +1931,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         },
         Static(path) => match &path[..] {
             b"net/dev" => net_dev(),
+            b"net/if_inet6" => net_if_inet6(),
             b"net/tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Tcp),
             b"net/tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Tcp),
             b"net/udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Udp),

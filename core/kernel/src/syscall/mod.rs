@@ -86,13 +86,14 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // PTRACE_SYSCALL：入口停下，跟踪者可能改了编号（NT_ARM_SYSTEM_CALL）和参数。编号改成
     // -1 时跳过这个系统调用，x0 是跟踪者设好的返回值；程序自己用 -1 时与 Linux 一样是
     // ENOSYS（crate::ptrace）
-    let traced = crate::ptrace::syscall_traced(cx, cpu, nr);
+    let watched = crate::ptrace::syscall_start(cx, cpu, nr);
+    let traced = watched == Some(true);
     let filtered = cx.task.seccomp_on.load(Ordering::Relaxed);
     if (traced || filtered) && nr == NO_SYSCALL {
         cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
     }
     if traced {
-        match crate::ptrace::syscall_entry(cx, cpu, nr) {
+        match crate::ptrace::syscall_entry(cx, cpu) {
             Some(n) => nr = n,
             None => return Flow::Exit,
         }
@@ -107,10 +108,12 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         }
     }
     // 出口停不停与 arm64 Linux 一样看出口时的跟踪状态（syscall_trace_exit 重新读标志）：
-    // 跟踪者在 PTRACE_EVENT_SECCOMP 停住时改用 PTRACE_SYSCALL 继续的，出口也停
-    // （strace --seccomp-bpf 这样拿返回值）
-    let exit_stop = traced || filtered;
-    if exit_stop && nr == NO_SYSCALL {
+    // 跟踪者在系统调用中途停住时（PTRACE_EVENT_SECCOMP，fork、clone 的 PTRACE_EVENT_*）
+    // 改用 PTRACE_SYSCALL 继续的，出口也停，入口没停过也一样（strace --seccomp-bpf 这样
+    // 拿返回值）。vDSO 里读时钟的存根在 Linux 上不进内核，有 seccomp 时也没有出口的停止
+    let exit_stop =
+        watched.is_some() || (filtered && !crate::vdso::clock_stub(cx, cpu.state().pc, nr));
+    if (traced || filtered) && nr == NO_SYSCALL {
         if !crate::ptrace::syscall_exit(cx, cpu) {
             return Flow::Exit;
         }

@@ -65,7 +65,7 @@
 - 没有 Linux 的按编号缓存（`seccomp_cache`：算出某个编号总是 ALLOW 时不再运行程序），每次系统调用都运行整条链。→ 已补上（M9 之前：seccomp 的缓存和快速路径）
 - 有 seccomp 的线程没有不持 BKL 的快速路径，vDSO 里读时钟也进了持 BKL 的路径（见上面的开销）。做了按编号缓存之后，缓存说总是 ALLOW 的编号可以照常走快速路径。→ 已补上：缓存说总是 ALLOW 的编号和 vDSO 里读时钟照常走快速路径（M9 之前：seccomp 的缓存和快速路径）；别的编号仍要持 BKL 检查
 - 解释器没有优化（每条指令约 4.5 纳秒，按操作码顺序比较），Linux 用 JIT。→ 有了按编号缓存，常见的过滤器放行的编号不再运行程序（M9 之前：seccomp 的缓存和快速路径）；解释器本身仍没有优化
-- 没有 seccomp 的线程：跟踪者在系统调用中途的停止（fork、clone 的 `PTRACE_EVENT_*`）改用 PTRACE_SYSCALL 继续时，Linux 也在出口停，这里只有入口停过的才停。
+- 没有 seccomp 的线程：跟踪者在系统调用中途的停止（fork、clone 的 `PTRACE_EVENT_*`）改用 PTRACE_SYSCALL 继续时，Linux 也在出口停，这里只有入口停过的才停。→ 已补上（M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口）：出口都按那时的跟踪状态停；查的时候还发现有 seccomp 的线程经由 vDSO 读时钟时会多停一次出口，一起修了
 - vDSO 的存根对所有时钟都不检查：Linux 的 vDSO 只处理 REALTIME、MONOTONIC 这几种，进程、线程的 CPU 时钟退回真正的系统调用，过滤器看得到。
 - TRACE 停住之后重新检查用的是停住之前的那条链；Linux 重新读线程当前的，只有停住期间别的线程 TSYNC 了才不同。
 - ADDFD 由监管进程直接装：Linux 里对方这时被信号打断会让 ADDFD 返回 ESRCH，这里总能装上。

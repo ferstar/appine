@@ -1,7 +1,8 @@
 # Java（OpenJDK 21）：平台线程和虚拟线程、C2 编译后的隐式空指针检查和反优化、栈溢出
-# 保护页（都靠 SIGSEGV）、GC 与弱引用、子进程、NIO 上的 HTTP、文件映射和文件锁、crypto，
-# 信号处理线程和 SIGTERM 触发的关闭钩子；ZGC 多重映射堆；jcmd 的 attach（SIGQUIT +
-# AF_UNIX）。java 经由 /usr/bin/java 这个符号链接启动，靠 /proc/self/exe 找到 libjli.so
+# 保护页（都靠 SIGSEGV）、GC 与弱引用、子进程、NIO 上的 HTTP、IPv6 的回环、文件映射和
+# 文件锁、crypto，信号处理线程和 SIGTERM 触发的关闭钩子；ZGC 多重映射堆；jcmd 的 attach
+# （SIGQUIT + AF_UNIX）。java 经由 /usr/bin/java 这个符号链接启动，靠 /proc/self/exe
+# 找到 libjli.so
 set -e
 mkdir -p /tmp/diff-java
 cd /tmp/diff-java
@@ -128,6 +129,16 @@ public class Main {
         System.out.println("http " + resp.statusCode() + " " + resp.body());
         server.stop(0);
         ((ExecutorService) server.getExecutor()).shutdown();
+
+        // IPv6 的回环：JVM 看 /proc/net/if_inet6 里有没有地址，没有就整个关掉 IPv6
+        try (ServerSocket ss = new ServerSocket(0, 1, InetAddress.getByName("::1"));
+             Socket cs = new Socket(InetAddress.getByName("::1"), ss.getLocalPort());
+             Socket as = ss.accept()) {
+            cs.getOutputStream().write(42);
+            System.out.println("ipv6 " + as.getInetAddress().getHostAddress() + " " + as.getInputStream().read());
+        } catch (IOException e) {
+            System.out.println("ipv6 " + e);
+        }
 
         // 文件：内存映射、文件锁、遍历
         Path dir = Files.createTempDirectory("diff-java");

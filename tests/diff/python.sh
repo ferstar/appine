@@ -94,10 +94,16 @@ rdonly = os.open("/tmp/ts/dst", os.O_RDONLY)
 append = os.open("/tmp/ts/dst", os.O_WRONLY | os.O_APPEND)
 directory = os.open("/tmp/ts", os.O_RDONLY)
 pipe = os.pipe()[0]
+# O_PATH 打开的 fd 不能做 ioctl 的对象，也不能做源（fdget 不接受，EBADF）
+path_src = os.open("/tmp/ts/src", os.O_PATH)
+path_dst = os.open("/tmp/ts/dst", os.O_PATH)
 for name, fd, arg in [("file", dst, src), ("rdonly", rdonly, src), ("append", append, src),
-                      ("dir", dst, directory), ("pipe", dst, pipe), ("badfd", dst, 999)]:
+                      ("dir", dst, directory), ("pipe", dst, pipe), ("badfd", dst, 999),
+                      ("path-src", dst, path_src), ("path-dst", path_dst, src)]:
     print("ficlone", name, err(lambda: fcntl.ioctl(fd, FICLONE, arg)))
 print("ficlonerange", err(lambda: fcntl.ioctl(dst, FICLONERANGE, struct.pack("qQQQ", src, 0, 0, 0))))
+print("ficlonerange path-src", err(lambda: fcntl.ioctl(dst, FICLONERANGE, struct.pack("qQQQ", path_src, 0, 0, 0))))
+print("fioclex path", err(lambda: fcntl.ioctl(path_src, 0x5451)))
 if hasattr(pathlib.Path, "copy"):
     pathlib.Path("/tmp/ts/src").copy("/tmp/ts/copy")
     print("path.copy", open("/tmp/ts/copy").read().strip())

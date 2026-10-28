@@ -1,6 +1,6 @@
 # M9 之前：补测待查的几项（2026-10-28）
 
-← [M9 之前：没有实现的 netlink 协议建不了（2026-10-28）](83-netlink-protocols.md) · [索引](../milestones.md)
+← [M9 之前：没有实现的 netlink 协议建不了（2026-10-28）](83-netlink-protocols.md) · [索引](../milestones.md) · [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口（2026-10-28）](85-inet6-opath-exit.md) →
 
 把各篇推迟项里"没有查""没有对照""没跑"的几项补测完。只改了一个普查脚本，内核层不用改。补测时发现的两个问题已经在前几轮修好：shmctl01 的状态同步（[第 81 轮](81-woken-state.md)），Debian、Ubuntu 上 PAM 登录不了（[第 83 轮](83-netlink-protocols.md)）。
 
