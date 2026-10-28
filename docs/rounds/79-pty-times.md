@@ -14,4 +14,4 @@
 **推迟项**：
 
 - 经由 `/dev/tty` 打开的 fd 上的读写也改 `/dev/pts/<n>` 的时间；Linux 6.1 上改的是 `/dev/tty` 这个节点自己的（`file_inode`）。主设备（`/dev/ptmx`）的读写不改任何时间，fstat 报告的时间是 0。
-- 没有在 sshd 的登录会话里实测 w、who 的空闲时间。
+- 没有在 sshd 的登录会话里实测 w、who 的空闲时间。→ 已实测（M9 之前：没有实现的 netlink 协议建不了）：Alpine 的 musl 不写 utmp，w、who 什么也不列；Debian 的 sshd 会话里 w 的空闲时间与原生相同，实测时先修好了 Debian 上 PAM 登录不了的问题

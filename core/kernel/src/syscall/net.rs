@@ -12,8 +12,8 @@ use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
-    SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_KOBJECT_UEVENT, NETLINK_ROUTE,
+    NetlinkSocket, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
 };
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
@@ -145,6 +145,13 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
+            // 只有 NETLINK_ROUTE 回答查询，NETLINK_KOBJECT_UEVENT 只用来听热插拔事件（mdev、
+            // udev），这里不会有。别的协议与 Linux 上没有编进内核的子系统一样是
+            // EPROTONOSUPPORT：原来照样建出来、收到请求也不回答，libaudit 等 ACK 等 40 秒之后
+            // 失败，PAM 因此拒绝登录（Debian 的 sshd、login）
+            if !matches!(protocol, NETLINK_ROUTE | NETLINK_KOBJECT_UEVENT) {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
             Socket::Netlink(NetlinkSocket::new(protocol))
         }
         AF_NETLINK => return Err(Errno::ESOCKTNOSUPPORT),

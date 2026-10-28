@@ -539,6 +539,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | TCP/UDP | 透传给宿主：guest 的 file 对象内部持有一个宿主非阻塞 socket，地址、选项和控制消息按字节原样传递。阻塞在内核层的等待机制里模拟 |
 | ICMP | 把 guest 的 `SOCK_RAW + IPPROTO_ICMP` 翻译成宿主的 `SOCK_DGRAM + IPPROTO_ICMP`（ping socket），`SO_TYPE` 照样报告 `SOCK_RAW` |
 | `NETLINK_ROUTE` | 在进程内模拟，接口和地址取自宿主的 `getifaddrs`（targetSdk 37 下 bionic 仍能列出，只是没有 MAC）；不够用时再改为通过 JNI 从 `ConnectivityManager`/`LinkProperties` 获取。路由表没有模拟，`RTM_GETROUTE` 的转储是空的，别的请求（`RTM_GETNEIGH` 等）回答 `EOPNOTSUPP`（[网络信息的缺口](rounds/78-net-info-gaps.md)） |
+| 别的 netlink 协议 | `NETLINK_KOBJECT_UEVENT` 建得了、什么也收不到（mdev、udev 只听热插拔事件）。别的协议（审计、`SOCK_DIAG`、`GENERIC`、netfilter……）与 Linux 上没有编进内核的子系统一样，`socket` 返回 `EPROTONOSUPPORT`：libaudit 据此当作没有审计（PAM 登录不等 ACK），ss 退回读 `/proc/net` |
 | DNS | `resolv.conf` 写 `nameserver 127.0.0.53`（打开仓库时没有就写一份）。socket 层截下发往这个地址 53 端口的 UDP 数据报，交给 `android_res_nsend`，这样系统的私人 DNS、VPN 和按网络分流设置都能生效；Linux 开发宿主上转发给宿主 `/etc/resolv.conf` 里的服务器。发往存根的 TCP 连接没有截获，musl 的解析器只在 UDP 回答被截断时才用 TCP，而存根交给 guest 的是完整的回答 |
 | 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射（真机待确认） |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档（真机待确认） |

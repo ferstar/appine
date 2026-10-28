@@ -91,6 +91,7 @@
 | [M9 之前：CPU 时间不倒退](rounds/80-cpu-times.md) | 2026-10-28 | 用户态、内核态的 CPU 时间按 Linux 的 `cputime_adjust` 各自不倒退（原来内核态时间按滴答取整，跨过一个滴答时用户态时间倒退，LTP 的 times03 偶发失败）；futex_wake05 不是偶发项，是[稳定性和内存](rounds/12-stability-memory.md)那一轮修好的 |
 | [M9 之前：被叫醒的进程在 /proc 里是 R](rounds/81-woken-state.md) | 2026-10-28 | 被信号等叫醒、还没跑起来的线程在 `/proc` 里是 R（原来到它重新拿到 BKL 之前都是 S）：LTP 按状态回到 S 来同步父子进程，shmctl01 不再失败（原来记作偶发项，最近每次都失败） |
 | [M9 之前：测试自己的竞争和丢掉的现场](rounds/82-test-races.md) | 2026-10-28 | 作业控制用例卡住是测试的竞争（ash 的 fg 先打印命令再交出终端，^C 可能落到 shell 上），原生 Linux 上用 strace 推迟 writev 的返回能稳定重现；改了测试，等 shell 退出加超时；差分测试失败时另存输出，LTP 保留上一次的日志 |
+| [M9 之前：没有实现的 netlink 协议建不了](rounds/83-netlink-protocols.md) | 2026-10-28 | `NETLINK_ROUTE`、`NETLINK_KOBJECT_UEVENT` 以外的 netlink 协议是 EPROTONOSUPPORT（原来建得出、收到请求不回答）：Debian、Ubuntu 上走 PAM 的 sshd、su、login 不再因为等审计的 ACK 失败，`ss` 不再卡住；Debian 的 sshd 会话里 w 的空闲时间与原生相同 |
 
 ## 测量条件
 

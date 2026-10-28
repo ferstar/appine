@@ -310,6 +310,17 @@ static void test_netlink(void)
     CHECK(found, "lo with 127.0.0.1 not found");
     CHECK(if_nametoindex("lo") > 0, "if_nametoindex");
     ok("netlink interfaces");
+
+    /* 没有实现的协议与没有编进内核的子系统一样建不了：libaudit 据此当作没有审计，
+     * 不去等不会来的 ACK。uevent 只是听，建得了 */
+    CHECK(socket(AF_NETLINK, SOCK_RAW, 9 /* NETLINK_AUDIT */) < 0 && errno == EPROTONOSUPPORT,
+          "audit netlink socket");
+    CHECK(socket(AF_NETLINK, SOCK_RAW, 16 /* NETLINK_GENERIC */) < 0 && errno == EPROTONOSUPPORT,
+          "generic netlink socket");
+    int ue = socket(AF_NETLINK, SOCK_DGRAM, 15 /* NETLINK_KOBJECT_UEVENT */);
+    CHECK(ue >= 0, "uevent netlink socket");
+    close(ue);
+    ok("netlink protocols");
 }
 
 /* ---- epoll、eventfd、select ---- */

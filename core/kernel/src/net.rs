@@ -212,8 +212,8 @@ pub(crate) fn proc_listing(
     lines.iter().map(|l| format!("{l:<width$}\n")).collect()
 }
 
-/// 进程内模拟的 netlink socket。只有 `NETLINK_ROUTE` 回答查询，其他协议的 socket
-/// 什么也收不到（比如 mdev 监听的 uevent）。
+/// 进程内模拟的 netlink socket。只有 `NETLINK_ROUTE` 回答查询；`NETLINK_KOBJECT_UEVENT`
+/// 的 socket 什么也收不到（mdev 监听的 uevent），别的协议建不了（`syscall::net::socket`）。
 pub(crate) struct NetlinkSocket {
     pub protocol: i32,
     /// `nl_pid`：bind 时分配。
@@ -296,6 +296,8 @@ const RT_SCOPE_HOST: u8 = 254;
 const IFA_F_PERMANENT: u8 = 0x80;
 /// NETLINK_ROUTE 的协议号。
 pub const NETLINK_ROUTE: i32 = 0;
+/// NETLINK_KOBJECT_UEVENT 的协议号：内核发出的热插拔事件。
+pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
 
 fn align4(b: &mut Vec<u8>) {
     b.resize(b.len().next_multiple_of(4), 0);
