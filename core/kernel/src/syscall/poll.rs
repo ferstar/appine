@@ -1276,11 +1276,14 @@ pub(super) fn epoll_pwait(
     if maxevents <= 0 || maxevents > i32::MAX / 16 {
         return Err(Errno::EINVAL);
     }
+    // 打开文件只借这一句：`let … else` 绑定借用出来的引用时，借用一直活到函数结束，等的
+    // 时候别的线程改这个打开文件（fcntl、FIONBIO）就会 panic。epf 本身留到最后，等的时候
+    // fd 被关掉也保活
     let epf = cx.fds().get(epfd)?;
-    let FileKind::Epoll(ep) = &epf.borrow().kind else {
-        return Err(Errno::EINVAL);
+    let ep = match &epf.borrow().kind {
+        FileKind::Epoll(ep) => ep.clone(),
+        _ => return Err(Errno::EINVAL),
     };
-    let ep = ep.clone();
     set_temp_mask(cx, sigmask, sigsetsize)?;
     let r = (|| loop {
         let ready = ep.borrow().ready(0, maxevents as usize);

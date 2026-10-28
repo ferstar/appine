@@ -415,6 +415,50 @@ int main(void)
 C
 gcc -O1 -o nested nested.c && ./nested
 
+# 一个线程在 epoll_wait 里等时，另一个线程改 epoll fd 的打开标志（fcntl、FIONBIO）：
+# 等着的一方没有借着这个打开文件，改得了，之后照常被叫醒
+cat > flags.c <<'C'
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+static int ep, ev;
+static long set_flags, set_nbio;
+
+static void *change(void *arg)
+{
+    usleep(100000);
+    int on = 1;
+    set_flags = fcntl(ep, F_SETFL, O_NONBLOCK);
+    set_nbio = ioctl(ep, FIONBIO, &on);
+    uint64_t one = 1;
+    write(ev, &one, sizeof one);
+    return arg;
+}
+
+int main(void)
+{
+    ep = epoll_create1(0);
+    ev = eventfd(0, 0);
+    struct epoll_event e = {.events = EPOLLIN, .data.u32 = 7};
+    epoll_ctl(ep, EPOLL_CTL_ADD, ev, &e);
+    pthread_t t;
+    pthread_create(&t, NULL, change, NULL);
+    struct epoll_event got;
+    int n = epoll_wait(ep, &got, 1, 5000);
+    pthread_join(t, NULL);
+    printf("flags while waiting: fcntl %ld, FIONBIO %ld, epoll_wait %d (data %u), nonblocking %d\n",
+           set_flags, set_nbio, n, got.data.u32, (fcntl(ep, F_GETFL) & O_NONBLOCK) != 0);
+    return 0;
+}
+C
+gcc -O1 -o flags flags.c -lpthread && ./flags
+
 # 真实的 tokio 程序：uv 离线安装一个包（缓存里没有，失败）。原来 mio 的第二次唤醒丢了，
 # uv 一直卡住
 rm -rf /tmp/uvenv

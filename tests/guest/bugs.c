@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TEST_SYSCALL 0xa991
@@ -25,6 +26,7 @@
 #define HOOK_PANIC_IN_TIMERS 5 /* 定时器线程处理这个进程时 panic */
 #define HOOK_PANIC_IN_HOST 6   /* 宿主下一次调用 Machine 的方法时 panic */
 #define HOOK_PANIC_UNLOCKED 8  /* 放开 BKL 时 panic：展开时要先重新拿到 BKL */
+#define HOOK_PANIC_FAST 9      /* 下一次不持 BKL 的系统调用 panic */
 
 static void fail(const char *what)
 {
@@ -115,6 +117,16 @@ int main(int argc, char **argv)
         _exit(7);
     }
     expect_segv(pid, "kernel panic without the BKL");
+
+    /* clock_gettime 不持 BKL 做（syscall::fast） */
+    pid = fork();
+    if (pid == 0) {
+        struct timespec ts;
+        syscall(TEST_SYSCALL, HOOK_PANIC_FAST);
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+        _exit(7);
+    }
+    expect_segv(pid, "kernel panic in a syscall without the BKL");
 
     pid = fork();
     if (pid == 0)

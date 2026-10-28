@@ -615,6 +615,13 @@ struct Knotif {
 /// `seccomp_notify_detach`）。
 pub(crate) struct Listener(Rc<Filter>);
 
+impl Listener {
+    /// 通知所属的过滤器。ioctl 拿它的 Rc，等通知时不借着打开文件（`syscall::fs::ioctl`）。
+    pub(crate) fn filter(&self) -> Rc<Filter> {
+        self.0.clone()
+    }
+}
+
 impl Drop for Listener {
     fn drop(&mut self) {
         let Some(n) = self.0.notif.borrow_mut().take() else {
@@ -1238,8 +1245,7 @@ fn random_id() -> u64 {
 }
 
 /// 通知 fd 的 ioctl。
-pub(crate) fn ioctl(cx: &mut Cx<'_>, l: &Listener, request: u32, arg: u64) -> Result<u64, Errno> {
-    let f = &l.0;
+pub(crate) fn ioctl(cx: &mut Cx<'_>, f: &Filter, request: u32, arg: u64) -> Result<u64, Errno> {
     match request {
         IOCTL_NOTIF_RECV => recv(cx, f, arg),
         IOCTL_NOTIF_SEND => send(cx, f, arg),

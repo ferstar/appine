@@ -124,6 +124,7 @@ impl Fast {
         {
             return false;
         }
+        crate::bug::trap(crate::bug::Trap::Fast, self.tid);
         let Some(r) = self.dispatch(shared, task, cpu) else {
             return false;
         };

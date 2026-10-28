@@ -1491,8 +1491,14 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         }
         _ => {}
     }
-    if let FileKind::SeccompNotify(l) = &file.borrow().kind {
-        return crate::seccomp::ioctl(cx, l, request, arg);
+    // 取出要用的对象再放开打开文件的借用：NOTIF_RECV 会等，等的时候别的线程可能要改这个
+    // 打开文件（fcntl、FIONBIO）
+    let notify = match &file.borrow().kind {
+        FileKind::SeccompNotify(l) => Some(l.filter()),
+        _ => None,
+    };
+    if let Some(f) = notify {
+        return crate::seccomp::ioctl(cx, &f, request, arg);
     }
     let pty = match &file.borrow().kind {
         FileKind::Pty(end) => Some((end.tty.clone(), end.master)),

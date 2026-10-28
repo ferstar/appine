@@ -1,6 +1,6 @@
 # M9 之前：排查在 BKL 外改 Rc 的计数（2026-10-28）
 
-← [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口（2026-10-28）](85-inet6-opath-exit.md) · [索引](../milestones.md)
+← [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口（2026-10-28）](85-inet6-opath-exit.md) · [索引](../milestones.md) · [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件（2026-10-29）](87-fast-panic-held-borrows.md) →
 
 [线程退出时在 BKL 外丢掉弱引用](71-thread-exit-race.md)那一轮的推迟项。那一次，线程退出时在 BKL 外丢掉一个弱引用，与同时持有 BKL 的线程一起改同一个计数，计数改丢之后对象被提前释放，宿主的堆被破坏；`catch_unwind` 兜不住，整个 App 崩溃。那一轮只查了线程局部变量。这一轮把所有不持 BKL 运行内核代码的地方逐个查了一遍。`RefCell` 的借用标志和 `Rc` 的计数一样不是原子的，所以一起查。
 
@@ -32,5 +32,5 @@
 
 **推迟项**：
 
-- 不持 BKL 的系统调用（`syscall::fast`）没有兜住 panic：那里出了内核 bug，整个 App 会终止（`thread_main` 的 `catch_unwind` 之后 abort），而不是只结束那个进程。展开经过的帧里没有 `Rc`，要兜的话，在它外面加 `bug::catch`、再持锁结束进程就行。
-- 只查了在 BKL 外改 `Rc` 的计数和 `RefCell` 的借用标志。另一种情况没有逐个排查：持着某个 `RefCell` 的借用去等待（借用活过了放锁的那一刻）。它不会改坏计数，但别的线程这时借它会 panic（already borrowed）。
+- 不持 BKL 的系统调用（`syscall::fast`）没有兜住 panic：那里出了内核 bug，整个 App 会终止（`thread_main` 的 `catch_unwind` 之后 abort），而不是只结束那个进程。展开经过的帧里没有 `Rc`，要兜的话，在它外面加 `bug::catch`、再持锁结束进程就行。→ 已补上（M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件）
+- 只查了在 BKL 外改 `Rc` 的计数和 `RefCell` 的借用标志。另一种情况没有逐个排查：持着某个 `RefCell` 的借用去等待（借用活过了放锁的那一刻）。它不会改坏计数，但别的线程这时借它会 panic（already borrowed）。→ 已排查（M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件）：找到 epoll_pwait 和 seccomp 通知 fd 的 ioctl 两处，已修

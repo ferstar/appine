@@ -527,11 +527,23 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             (exit, false)
         };
         // 不持 BKL 就能做完的系统调用（syscall::fast）。它访问 guest 内存时仍然标记着在
-        // 执行 guest 代码
-        let done = matches!(exit, Exit::Svc { .. }) && fast.syscall(shared, &task, cpu);
+        // 执行 guest 代码。内核层的 bug 与持锁的路径一样只结束这个进程（crate::bug）：
+        // 这里展开经过的帧里没有 Rc，原来一直展开到 thread_main，终止整个 App
+        let done = match exit {
+            Exit::Svc { .. } => crate::bug::catch(|| fast.syscall(shared, &task, cpu)),
+            _ => Some(false),
+        };
         sync.in_guest.store(false, Ordering::SeqCst);
-        if done {
-            continue;
+        match done {
+            Some(true) => continue,
+            Some(false) => {}
+            None => {
+                task.sleeping.store(false, Ordering::Relaxed);
+                let nr = cpu.state().x[8];
+                let what = format_args!("kernel panic in syscall {nr} without the BKL");
+                crate::bug::kill(&shared.lock(), &task, cpu.state().pc, what);
+                break;
+            }
         }
 
         // 内核层的 bug 只结束这个进程（crate::bug）

@@ -1236,6 +1236,43 @@ static void close_listener(void)
     close(report[0]);
 }
 
+/* 一个线程在 NOTIF_RECV 里等通知时，另一个线程改通知 fd 的打开标志（fcntl、FIONBIO）：
+   等着的一方没有借着这个打开文件，改得了，之后照常收到通知 */
+static int waited_listener;
+
+static void *answer_one(void *arg)
+{
+    struct seccomp_notif n;
+    memset(&n, 0, sizeof n);
+    long r = ioctl(waited_listener, NOTIF_RECV, &n);
+    struct seccomp_notif_resp resp = {n.id, 42, 0, 0};
+    if (r == 0)
+        r = ioctl(waited_listener, NOTIF_SEND, &resp);
+    return (void *)r;
+}
+
+static void flags_while_receiving(void)
+{
+    printf("== flags of a listener while a thread receives\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        waited_listener = install(SYS_getppid, RET_USER_NOTIF, FLAG_NEW_LISTENER);
+        pthread_t t;
+        pthread_create(&t, NULL, answer_one, NULL);
+        usleep(100000);
+        int on = 1;
+        result("  fcntl F_SETFL", fcntl(waited_listener, F_SETFL, O_NONBLOCK));
+        result("  ioctl FIONBIO", ioctl(waited_listener, FIONBIO, &on));
+        long r = syscall(SYS_getppid);
+        void *sent;
+        pthread_join(t, &sent);
+        printf("  getppid answered %ld, send %ld\n", r, (long)sent);
+        _exit(0);
+    }
+    printf("end: %s\n", describe(wait_for(pid)));
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1252,6 +1289,7 @@ int main(void)
     addfd();
     close_listener();
     killable();
+    flags_while_receiving();
     return 0;
 }
 C

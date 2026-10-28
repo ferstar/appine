@@ -95,6 +95,7 @@
 | [M9 之前：补测待查的几项](rounds/84-debt-checks.md) | 2026-10-28 | 只补测：CPython test_os 的失败是用例对负载敏感（原生满载时也超过 1 毫秒），Ruby 的 memory_leak 超时只是慢（其中一个原生也超时），VS Code 第一个终端丢字原生上一样；conda 能用，12 个普查负载在 Tier 0 下与 Tier 1 一致，Ubuntu 上 su、sshd 正常；普查不进 CI |
 | [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口](rounds/85-inet6-opath-exit.md) | 2026-10-28 | `/proc/net/if_inet6` 列出宿主的 IPv6 地址，JVM 不再关掉 IPv6；ioctl 和 FICLONE 的源不接受 `O_PATH` 的 fd（EBADF）；停在 fork 事件上再改用 PTRACE_SYSCALL 时停在这个系统调用的出口，有跟踪者时每个系统调用都记下编号；修了有 seccomp 的线程经由 vDSO 读时钟时多停一次出口（[seccomp](rounds/59-seccomp.md)那一轮起的 bug） |
 | [M9 之前：排查在 BKL 外改 Rc 的计数](rounds/86-rc-outside-bkl.md) | 2026-10-28 | 逐个查了不持 BKL 运行内核代码的地方，正常执行时没有在锁外改 `Rc` 计数、`RefCell` 借用标志的；放开 BKL（等待、`Cx::unlocked`）期间 panic 时，展开经过的外层各帧在锁外丢 `Rc`（比如 execve 的 vfs），改为先重新拿到 BKL；`Cx::unlocked` 的闭包要求 `Send` |
+| [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件](rounds/87-fast-panic-held-borrows.md) | 2026-10-29 | 不持 BKL 的系统调用里的内核 bug 只结束那个进程（原来整个 App 终止）；查了持着 `RefCell` 的借用去等待的地方，修了 epoll_wait 和 seccomp 通知 fd 的 `NOTIF_RECV` 等待时借着打开文件，另一个线程这时 `fcntl(F_SETFL)`、`ioctl(FIONBIO)` 会让进程被结束 |
 
 ## 测量条件
 
