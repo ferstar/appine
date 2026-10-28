@@ -34,5 +34,5 @@ guest 里跑过的都是 Alpine 的 musl 程序（§1.1 的目标），glibc 的
 - 没有 mount、umount2、pivot_root（ENOSYS）：chroot 进别的发行版缺 `/proc`、`/sys`、`/dev`，做法和工作量见上。
 - 导入 docker export 出来的 rootfs 时，空的 resolv.conf、hosts 要由导入的一方写好：内核层只在 resolv.conf 不存在时写存根，App 首次启动写的 hosts 也是已有就不动（§11.4）。
 - rseq 没有实现：glibc 不注册也照常工作；用 rseq 做每个 CPU 缓存的程序（新版 tcmalloc）退回别的做法。
-- VS Code 第一个终端刚打开时丢字的那一次没有和原生的 code-server 对照。
-- 没跑的：conda/miniforge、Ubuntu 上更多的负载、Tier 0；都只在 colima 的虚拟机里跑，没上手机。
+- VS Code 第一个终端刚打开时丢字的那一次没有和原生的 code-server 对照。→ 已对照（M9 之前：补测待查的几项）：原生的 code-server 上同样丢字，而且丢得更多，是 VS Code 在终端起来之前不收输入
+- 没跑的：conda/miniforge、Ubuntu 上更多的负载、Tier 0；都只在 colima 的虚拟机里跑，没上手机。→ conda 能用，Alpine 普查的 12 个负载在 Tier 0 下与 Tier 1 一致，Ubuntu 上补了 su 和 sshd（M9 之前：补测待查的几项；补的时候发现并修好了 PAM 登录不了，见 M9 之前：没有实现的 netlink 协议建不了）；仍没上手机

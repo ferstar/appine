@@ -1,6 +1,6 @@
 # M9 之前：没有实现的 netlink 协议建不了（2026-10-28）
 
-← [M9 之前：测试自己的竞争和丢掉的现场（2026-10-28）](82-test-races.md) · [索引](../milestones.md)
+← [M9 之前：测试自己的竞争和丢掉的现场（2026-10-28）](82-test-races.md) · [索引](../milestones.md) · [M9 之前：补测待查的几项（2026-10-28）](84-debt-checks.md) →
 
 补测[终端的访问时间和修改时间](79-pty-times.md)那一轮的推迟项（在 sshd 的登录会话里看 w 的空闲时间）时发现：Alpine 的 musl 不写 utmp，w、who 什么也不列，换到 Debian 的仓库（[glibc 发行版的探测](69-glibc-probe.md)那一轮建的）里跑，sshd 根本登录不进去，日志是 "Access denied for user root by PAM account configuration"，原生的 `debian:trixie` 上同样的配置能登录。
 
