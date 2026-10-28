@@ -190,7 +190,9 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 /// 4. 这个进程下一个开始运行的线程 panic；
 /// 5. 定时器线程下次处理这个进程的定时器时 panic；
 /// 6. 宿主下一次调用 Machine 的方法时 panic；
-/// 7. 这个进程结束时（[`crate::process::finish_group`]）第 `addr` 步 panic。
+/// 7. 这个进程结束时（[`crate::process::finish_group`]）第 `addr` 步 panic；
+/// 8. 放开 BKL 时（[`Cx::unlocked`]）马上 panic。展开到这里时必须已经重新拿到 BKL，否则
+///    终止宿主进程：外层丢掉的 `Rc` 会和别的线程同时改计数。
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -222,6 +224,19 @@ pub(crate) fn test_hook(
         7 if addr != 0 => {
             FINISH_STEP.store(addr as u32, Ordering::SeqCst);
             arm(Trap::Finish, cx.tgid());
+        }
+        8 => {
+            struct MustHoldBkl;
+            impl Drop for MustHoldBkl {
+                fn drop(&mut self) {
+                    if !crate::kernel::bkl_held() {
+                        eprintln!("appine: unwound out of Cx::unlocked without the BKL");
+                        std::process::abort();
+                    }
+                }
+            }
+            let _check = MustHoldBkl;
+            cx.unlocked(|| panic!("panic injected by the test hook while the BKL is released"));
         }
         _ => return Err(Errno::EINVAL),
     }

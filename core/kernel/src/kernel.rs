@@ -3,7 +3,11 @@
 //! 所有 guest 线程共享一个 [`Kernel`]，由一把大内核锁（BKL）保护：处理 syscall
 //! 和投递信号时持有，执行 guest 代码时不持有，等待之前释放。内核对象之间用
 //! `Rc`/`RefCell` 共享，它们只在持有 BKL 时被访问；唯一的例外是线程自己的
-//! [`TaskState`]，只有它所属的线程会访问，等待期间也一直借用着。
+//! [`TaskState`]，只有它所属的线程会访问，等待期间也一直借用着。`Rc` 的计数、`RefCell`
+//! 的借用标志都不是原子的，放开 BKL 时连 clone、drop 也不行：系统调用中途放开 BKL 的
+//! 只有等待（[`Cx::wait_on`] 等）和 [`Cx::unlocked`]，后者的闭包要是 `Send`，碰不到
+//! 内核对象；这两处 panic 时也先重新拿到 BKL，展开时外层各帧丢掉的 `Rc` 才不会和别的
+//! 线程同时改计数。
 //!
 //! 等待统一走宿主 `poll()`：每个线程有一个 eventfd，等待时把它和要等的宿主 fd
 //! 放在一起 poll。任何可能让别人的等待条件成立的修改都调用 [`request_wake`]，
@@ -800,20 +804,35 @@ impl<'a> Cx<'a> {
     ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
         self.task.sleeping.store(true, Ordering::Relaxed);
-        let event = &self.task.event;
-        let (k, r) = block_for(self.shared, k, event, deadline, host, interest, objects);
-        self.task.sleeping.store(false, Ordering::Relaxed);
-        self.k = Some(k);
+        let relock = Relock(self);
+        let cx = &mut *relock.0;
+        let event = &cx.task.event;
+        let (k, r) = block_for(cx.shared, k, event, deadline, host, interest, objects);
+        cx.k = Some(k);
         r
     }
 
-    /// 释放 BKL 执行 `f`（可能阻塞的宿主 I/O）。`f` 不能访问任何内核对象。
-    pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+    /// 释放 BKL 执行 `f`（可能阻塞的宿主 I/O）。`f` 不能访问任何内核对象：它是 `Send`，
+    /// 捕获不了 `Rc`、`RefCell` 和它们的引用。
+    pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R + Send) -> R {
         self.task.sleeping.store(true, Ordering::Relaxed);
         drop(self.k.take());
-        let r = f();
-        self.k = Some(self.shared.lock());
-        self.task.sleeping.store(false, Ordering::Relaxed);
-        r
+        let _relock = Relock(self);
+        f()
+    }
+}
+
+/// 放开了 BKL 的 [`Cx`]（[`Cx::wait_on`] 等、[`Cx::unlocked`]）：析构时还没有重新拿到
+/// BKL 就拿到它。正常返回时就是重新拿锁；放锁期间 panic（内核层的 bug，[`crate::bug`]）
+/// 时也一样，展开经过的外层各帧丢掉的 `Rc`（vfs、打开文件……）要在持有 BKL 时丢：计数
+/// 不是原子的，会和同时持有 BKL 的线程一起改，改丢了就提前释放。
+struct Relock<'c, 'a>(&'c mut Cx<'a>);
+
+impl Drop for Relock<'_, '_> {
+    fn drop(&mut self) {
+        if self.0.k.is_none() {
+            self.0.k = Some(self.0.shared.lock());
+        }
+        self.0.task.sleeping.store(false, Ordering::Relaxed);
     }
 }

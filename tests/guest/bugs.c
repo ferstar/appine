@@ -24,6 +24,7 @@
 #define HOOK_PANIC_ON_START 4  /* 这个进程下一个开始运行的线程 panic */
 #define HOOK_PANIC_IN_TIMERS 5 /* 定时器线程处理这个进程时 panic */
 #define HOOK_PANIC_IN_HOST 6   /* 宿主下一次调用 Machine 的方法时 panic */
+#define HOOK_PANIC_UNLOCKED 8  /* 放开 BKL 时 panic：展开时要先重新拿到 BKL */
 
 static void fail(const char *what)
 {
@@ -107,6 +108,13 @@ int main(int argc, char **argv)
         _exit(7);
     }
     expect_segv(pid, "kernel panic");
+
+    pid = fork();
+    if (pid == 0) {
+        syscall(TEST_SYSCALL, HOOK_PANIC_UNLOCKED);
+        _exit(7);
+    }
+    expect_segv(pid, "kernel panic without the BKL");
 
     pid = fork();
     if (pid == 0)

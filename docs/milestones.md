@@ -94,6 +94,7 @@
 | [M9 之前：没有实现的 netlink 协议建不了](rounds/83-netlink-protocols.md) | 2026-10-28 | `NETLINK_ROUTE`、`NETLINK_KOBJECT_UEVENT` 以外的 netlink 协议是 EPROTONOSUPPORT（原来建得出、收到请求不回答）：Debian、Ubuntu 上走 PAM 的 sshd、su、login 不再因为等审计的 ACK 失败，`ss` 不再卡住；Debian 的 sshd 会话里 w 的空闲时间与原生相同 |
 | [M9 之前：补测待查的几项](rounds/84-debt-checks.md) | 2026-10-28 | 只补测：CPython test_os 的失败是用例对负载敏感（原生满载时也超过 1 毫秒），Ruby 的 memory_leak 超时只是慢（其中一个原生也超时），VS Code 第一个终端丢字原生上一样；conda 能用，12 个普查负载在 Tier 0 下与 Tier 1 一致，Ubuntu 上 su、sshd 正常；普查不进 CI |
 | [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口](rounds/85-inet6-opath-exit.md) | 2026-10-28 | `/proc/net/if_inet6` 列出宿主的 IPv6 地址，JVM 不再关掉 IPv6；ioctl 和 FICLONE 的源不接受 `O_PATH` 的 fd（EBADF）；停在 fork 事件上再改用 PTRACE_SYSCALL 时停在这个系统调用的出口，有跟踪者时每个系统调用都记下编号；修了有 seccomp 的线程经由 vDSO 读时钟时多停一次出口（[seccomp](rounds/59-seccomp.md)那一轮起的 bug） |
+| [M9 之前：排查在 BKL 外改 Rc 的计数](rounds/86-rc-outside-bkl.md) | 2026-10-28 | 逐个查了不持 BKL 运行内核代码的地方，正常执行时没有在锁外改 `Rc` 计数、`RefCell` 借用标志的；放开 BKL（等待、`Cx::unlocked`）期间 panic 时，展开经过的外层各帧在锁外丢 `Rc`（比如 execve 的 vfs），改为先重新拿到 BKL；`Cx::unlocked` 的闭包要求 `Send` |
 
 ## 测量条件
 

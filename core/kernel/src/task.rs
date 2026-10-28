@@ -419,6 +419,8 @@ thread_local! {
 /// 宿主调用 Machine 的线程）时是 None。系统调用里 [`Task::state`] 已经被借走，拿不到
 /// 线程组，所以线程开始时记下。
 pub(crate) fn current() -> Option<(Rc<Task>, Rc<RefCell<ThreadGroup>>)> {
+    // upgrade 改弱引用指向的对象的计数
+    debug_assert!(crate::kernel::bkl_held(), "task::current without the BKL");
     CURRENT.with_borrow(|c| {
         let (task, group) = c.as_ref()?;
         Some((task.upgrade()?, group.upgrade()?))

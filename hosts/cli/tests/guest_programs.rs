@@ -246,7 +246,7 @@ fn sockets_polling_and_timers() {
 
 #[test]
 fn bugs_kill_only_the_guest_process() {
-    // 内核层 panic（进入内核时、线程开始和退出时、定时器线程上）、引擎让宿主出错（用
+    // 内核层 panic（进入内核时、放开 BKL 时、线程开始和退出时、定时器线程上）、引擎让宿主出错（用
     // debug 构建的测试钩子模拟）都只结束撞上它的 guest 进程，App 里别的照常运行
     if !cfg!(debug_assertions) {
         return;

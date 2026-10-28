@@ -3287,7 +3287,7 @@ fn unlocked_io(
     file: &FileRef,
     fd: i32,
     offset: Option<u64>,
-    io: impl FnOnce(i32, u64) -> Result<usize, i32>,
+    io: impl FnOnce(i32, u64) -> Result<usize, i32> + Send,
 ) -> Result<usize, Errno> {
     let pos = match offset {
         Some(off) => off,
