@@ -263,11 +263,17 @@ pub struct Tty {
     /// 输入（从设备读的）、输出（主设备读的）各来过几次数据：与 Linux 一样，每来一次
     /// 都让读的一方的 `EPOLLET` 再触发一次。
     pub arrivals: [u64; 2],
+    /// `/dev/pts/<index>` 的访问、修改、状态改变时间（纳秒）：w、who 的空闲时间看访问
+    /// 时间（[`Tty::touch`]）。
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
 }
 
 impl Tty {
     /// 新建一对 PTY，两端都还没有打开。
     pub fn new(index: u32) -> Tty {
+        let now = wall_ns();
         Tty {
             index,
             termios: Termios::default(),
@@ -288,7 +294,29 @@ impl Tty {
             owner: (0, TTY_GID),
             mode: 0o620,
             arrivals: [0; 2],
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
         }
+    }
+
+    /// 从设备读到了数据（`mtime` 为 false）或者写出了数据：与 Linux 6.1 的 `tty_update_time`
+    /// 一样只改秒，并且只在和原来相差 8 秒以上时才改，精确的时刻会泄露别人敲键盘的节奏。
+    pub fn touch(&mut self, mtime: bool) {
+        let sec = wall_ns().div_euclid(NS);
+        let t = if mtime {
+            &mut self.mtime_ns
+        } else {
+            &mut self.atime_ns
+        };
+        if (sec ^ t.div_euclid(NS)) & !7 != 0 {
+            *t = sec * NS + t.rem_euclid(NS);
+        }
+    }
+
+    /// 修改了属主、权限或者时间（chmod、chown、utimensat）：状态改变时间是现在。
+    pub fn changed(&mut self) {
+        self.ctime_ns = wall_ns();
     }
 
     fn canonical(&self) -> bool {
@@ -729,6 +757,15 @@ impl Drop for PtyEnd {
 }
 
 /// 回显时显示成 `^X` 的控制字符：除 TAB、NL 之外的 C0 控制字符和 DEL。
+const NS: i64 = 1_000_000_000;
+
+/// 现在的墙上时间（纳秒）。
+pub(crate) fn wall_ns() -> i64 {
+    appine_hal::clock_gettime(0)
+        .map(|(s, ns)| s * NS + ns)
+        .unwrap_or(0)
+}
+
 fn is_ctrl(c: u8) -> bool {
     (c < 0x20 && c != b'\t' && c != b'\n') || c == 0x7f
 }
@@ -805,6 +842,24 @@ mod tests {
         assert!(!t.has_output() && t.take_output(16).is_empty());
         t.write_input(b"\x11");
         assert_eq!(t.take_output(16), b"x");
+    }
+
+    #[test]
+    fn reads_and_writes_touch_the_times_every_8_seconds() {
+        let mut t = Tty::new(0);
+        let sec = wall_ns().div_euclid(NS);
+        // 很久以前的时间：改成现在的秒，纳秒不变
+        t.atime_ns = 100 * NS + 123;
+        t.touch(false);
+        assert!((t.atime_ns.div_euclid(NS) - sec).abs() <= 1);
+        assert_eq!(t.atime_ns.rem_euclid(NS), 123);
+        // 同一个 8 秒里不改
+        t.mtime_ns = (sec & !7) * NS + 456;
+        let before = t.mtime_ns;
+        if wall_ns().div_euclid(NS) & !7 == sec & !7 {
+            t.touch(true);
+            assert_eq!(t.mtime_ns, before);
+        }
     }
 
     #[test]

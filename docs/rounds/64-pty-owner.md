@@ -18,5 +18,5 @@
 
 **推迟项**：
 
-- 终端的访问时间、修改时间仍是读的那一刻（w、who 的空闲时间看它），utimensat 仍是 EACCES。
+- 终端的访问时间、修改时间仍是读的那一刻（w、who 的空闲时间看它），utimensat 仍是 EACCES。→ 已修好（M9 之前：终端的访问时间和修改时间）
 - 经由 `/dev/tty` 打开的 fd 上 fchmod、fchown 改的是它对应的 `/dev/pts/<n>`；Linux 上改的是 `/dev/tty` 这个节点本身。

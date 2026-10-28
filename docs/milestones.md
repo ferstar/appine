@@ -87,6 +87,7 @@
 | [M9 之前：FIFO 在写端来之前不报 POLLHUP](rounds/76-fifo-pollhup.md) | 2026-10-28 | 以 `O_NONBLOCK` 只读打开、当时没有写端的 FIFO，有写端打开过之前 poll 不报 POLLHUP（Linux 读端的 `f_version`）：Ruby 的 test_require 全部通过 |
 | [M9 之前：删除的目录里不能新建，socket 可以 fchmod](rounds/77-dead-dir-socket-fchmod.md) | 2026-10-28 | 链接数已经是 0 的目录里新建、改名进去返回 ENOENT（原来成功了）；socket、匿名管道的 fd 可以 fchmod、fchown（原来 EACCES）：Node 的 test-fs-mkdir 和 `listen({ readableAll })` 的两个测试通过 |
 | [M9 之前：网络信息的缺口](rounds/78-net-info-gaps.md) | 2026-10-28 | 只补文档：没有路由表（`ip route` 为空、没有 `/proc/net/route`）、`/proc/net/dev` 的流量计数全是 0、没有 `if_inet6` 等，Android 上 App 读不到宿主的这些信息；记下影响和可能的做法（`LinkProperties` 的路由、内核层自己计数） |
+| [M9 之前：终端的访问时间和修改时间](rounds/79-pty-times.md) | 2026-10-28 | `/dev/pts/<n>` 记下自己的三个时间：从设备读到数据改访问时间、写出数据改修改时间（与 Linux 一样只改秒、相差 8 秒以上才改），utimensat 可以改（原来 EACCES），chmod、chown 改状态改变时间：w、who 的空闲时间有意义了 |
 
 ## 测量条件
 

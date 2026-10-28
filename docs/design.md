@@ -495,7 +495,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 |---|---|
 | `/` | inode 仓库 |
 | `/dev` | inode 仓库里的目录（M3b 决定不做内存里的 devfs，相当于 Linux 上"静态 `/dev` + devpts"）。标准设备节点（`null`、`zero`、`full`、`random`/`urandom`、`tty`、`console`、`ptmx`）每次启动时补齐，打开时按设备号找到进程内的实现 |
-| `/dev/pts` | devpts：每个 PTY 一个 `/dev/pts/N`，随 PTY 的创建和关闭出现和消失。与 Linux 按 `gid=5,mode=620` 挂载的一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod（按路径或者从设备的 fd）照常检查权限，结果记在终端上（sshd 把终端交给登录的用户），别的合成节点不能修改 |
+| `/dev/pts` | devpts：每个 PTY 一个 `/dev/pts/N`，随 PTY 的创建和关闭出现和消失。与 Linux 按 `gid=5,mode=620` 挂载的一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod、utimensat（按路径或者从设备的 fd）照常检查权限，结果记在终端上（sshd 把终端交给登录的用户），别的合成节点不能修改。访问、修改时间与 Linux 一样在从设备读到、写出数据时更新，只改秒、相差 8 秒以上才改（w、who 的空闲时间看访问时间） |
 | `/dev/shm`、`/run` | inode 仓库里的目录。Linux 上它们是 tmpfs，所以仓库被第一个使用者打开时清空其中的内容 |
 | `/proc` | procfs：根据内核层的 task、mm 等结构实时合成。smaps 的驻留页按宿主内存算（mincore）；匿名内存都算脏页，fork 之后和别的地址空间共用的（写时复制借出、借来的）算共享的，Pss 按共用的个数分摊，与 Linux 的 mapcount 一样（redis、valkey 启动时靠它检查内核），其余算私有的；文件映射都算私有的干净页。`/proc/meminfo` 和 sysinfo 的内存各项照搬宿主的（与 docker 的容器一样），guest 能用的上限看 cgroup 的 `memory.max` |
 | `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。各个 `cpu<n>` 的 `cache/`、`cpufreq/` 照搬宿主对应的那个 CPU 的（宿主有、App 读得了的才有），CPU 列表和掩码换成 guest 的编号。没有 `transparent_hugepage`，相当于没有编进 THP 的内核 |

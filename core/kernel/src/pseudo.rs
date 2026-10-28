@@ -813,9 +813,15 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         PseudoNode::PtsPtmx => rdev(5, 2),
         _ => 0,
     };
-    let now = appine_hal::clock_gettime(0)
-        .map(|(s, ns)| s * 1_000_000_000 + ns)
-        .unwrap_or(0);
+    let now = crate::tty::wall_ns();
+    let times = match node {
+        PseudoNode::Pts(n) => pty(ps.k, *n).map(|t| {
+            let t = t.borrow();
+            (t.atime_ns, t.mtime_ns, t.ctime_ns)
+        }),
+        _ => None,
+    };
+    let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
     let (uid, gid) = owner_of(ps.k, node);
     Ok(Stat {
         ino: node_ino(ps.k, node),
@@ -830,9 +836,9 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         } else {
             0
         },
-        atime_ns: now,
-        mtime_ns: now,
-        ctime_ns: now,
+        atime_ns,
+        mtime_ns,
+        ctime_ns,
     })
 }
 

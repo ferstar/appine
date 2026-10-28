@@ -1890,3 +1890,25 @@ s = socket.socket(socket.AF_UNIX)
 print("fchmod socket", err(lambda: os.fchmod(s.fileno(), 0o777)))
 print("fchmod pipe", err(lambda: os.fchmod(os.pipe()[0], 0o600)))
 PY
+
+# 终端的时间：utimensat 可以改，读到数据改访问时间、写出数据改修改时间（只在相差 8 秒以上
+# 时改，这里从很久以前改到现在），chmod、utimensat 改状态改变时间
+python3 - <<'PY'
+import os, time
+m, s = os.openpty()
+path = os.ttyname(s)
+os.utime(path, (1000, 2000))
+st = os.stat(path)
+print("pty utime", st.st_atime, st.st_mtime, st.st_ctime > 2000)
+ctime = os.stat(path).st_ctime_ns
+time.sleep(0.05)
+os.chmod(path, 0o600)
+print("pty chmod ctime", os.stat(path).st_ctime_ns > ctime)
+os.write(s, b"out\n")
+os.write(m, b"in\n")
+os.read(s, 16)
+st = os.stat(path)
+now = time.time()
+print("pty after io", now - 10 < st.st_atime <= now + 1, now - 10 < st.st_mtime <= now + 1)
+print("pty fstat", os.fstat(s).st_mtime == st.st_mtime)
+PY

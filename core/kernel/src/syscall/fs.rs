@@ -442,6 +442,9 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
                 uid: t.owner.0,
                 gid: t.owner.1,
                 rdev: rdev(PTS_MAJOR, t.index),
+                atime_ns: t.atime_ns,
+                mtime_ns: t.mtime_ns,
+                ctime_ns: t.ctime_ns,
                 ..Stat::default()
             };
             Ok(encode_stat(&st, DEVPTS_DEV))
@@ -2197,8 +2200,8 @@ pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
     Ok(0)
 }
 
-/// chmod、chown 作用的对象：仓库里的 inode，或者 `/dev/pts/<n>`（属主和权限记在终端上，
-/// 与 Linux 的 devpts 一样）。合成文件系统里别的节点不能修改。
+/// chmod、chown、utimensat 作用的对象：仓库里的 inode，或者 `/dev/pts/<n>`（属主、权限和
+/// 时间记在终端上，与 Linux 的 devpts 一样）。合成文件系统里别的节点不能修改。
 enum Attrs {
     Store(Ino),
     Pts(Rc<RefCell<Tty>>),
@@ -2293,7 +2296,11 @@ fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
     }
     match target {
         Attrs::Store(ino) => cx.vfs()?.store().set_mode(*ino, perm)?,
-        Attrs::Pts(t) => t.borrow_mut().mode = perm,
+        Attrs::Pts(t) => {
+            let mut t = t.borrow_mut();
+            t.mode = perm;
+            t.changed();
+        }
         Attrs::Anon => {}
     }
     Ok(0)
@@ -2350,6 +2357,7 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
             t.owner = (uid.unwrap_or(t.owner.0), gid.unwrap_or(t.owner.1));
+            t.changed();
         }
         Attrs::Anon => {}
     }
@@ -2368,15 +2376,15 @@ pub(super) fn utimensat(
     }
     // path 为 NULL 时作用于 dirfd 本身（futimens）
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let (ino, path) = if path == 0 {
+    let (target, path) = if path == 0 {
         if dirfd == AT_FDCWD {
             return Err(Errno::EFAULT);
         }
-        (file_ino(cx, dirfd)?, Vec::new())
+        (Attrs::of_fd(cx, dirfd)?, Vec::new())
     } else {
         let path = read_path(cx, path)?;
         let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
-        (store_ino(&node)?, path)
+        (Attrs::of(cx, &node)?, path)
     };
     // times[0] 是 atime，times[1] 是 mtime。现在的时间由仓库取（普通文件交给宿主）
     let (atime, mtime, explicit) = if times == 0 {
@@ -2403,7 +2411,7 @@ pub(super) fn utimensat(
         (time(word(0), word(1)), time(word(2), word(3)), explicit)
     };
     // 设成指定的时间只有属主可以，设成现在的时间有写权限也可以
-    let st = cx.vfs()?.store().attrs(ino)?;
+    let st = target.stat(cx)?;
     let cred = cx.cred();
     if !cred.owns(&st) {
         if explicit {
@@ -2411,6 +2419,23 @@ pub(super) fn utimensat(
         }
         cred.permission(&st, MAY_WRITE)?;
     }
+    let ino = match target {
+        Attrs::Store(ino) => ino,
+        // 终端的时间记在终端上（与 Linux 的 devpts 一样可以改）
+        Attrs::Pts(t) => {
+            let mut t = t.borrow_mut();
+            let now = crate::tty::wall_ns();
+            let ns = |time: FileTime| match time {
+                FileTime::Now => now,
+                FileTime::At(ns) => ns,
+            };
+            t.atime_ns = atime.map_or(t.atime_ns, ns);
+            t.mtime_ns = mtime.map_or(t.mtime_ns, ns);
+            t.changed();
+            return Ok(0);
+        }
+        Attrs::Anon => return Ok(0),
+    };
     // 按 fd 设置的普通文件经由打开的 object 设置：删除之后仍然打开着的文件也能用
     let open = match (path.is_empty(), dirfd) {
         (true, fd) if fd != AT_FDCWD => Some(cx.fds().get(fd)?),

@@ -290,7 +290,11 @@ pub(crate) fn read(
     if master {
         master_read(cx, tty, nonblock, buf)
     } else {
-        slave_read(cx, tty, nonblock, buf)
+        let n = slave_read(cx, tty, nonblock, buf)?;
+        if n > 0 {
+            tty.borrow_mut().touch(false);
+        }
+        Ok(n)
     }
 }
 
@@ -305,7 +309,11 @@ pub(crate) fn write(
     if master {
         master_write(cx, tty, nonblock, data)
     } else {
-        slave_write(cx, tty, nonblock, data)
+        let n = slave_write(cx, tty, nonblock, data)?;
+        if n > 0 {
+            tty.borrow_mut().touch(true);
+        }
+        Ok(n)
     }
 }
 
