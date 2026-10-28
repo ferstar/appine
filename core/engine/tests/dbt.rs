@@ -5,7 +5,8 @@
 use std::ptr::NonNull;
 
 use appine_engine::{
-    Access, Cpu, Dbt, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, WATCH_LOAD, WATCH_STORE, prot,
+    Access, Cpu, Dbt, DbtSource, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, WATCH_LOAD,
+    WATCH_STORE, prot,
 };
 
 #[repr(C, align(4096))]
@@ -247,6 +248,53 @@ fn recheck_retires_only_blocks_that_changed() {
     let after = dbt.stats();
     assert_eq!(after.invalidated - before.invalidated, 1);
     assert_eq!(after.blocks - before.blocks, 1);
+}
+
+#[test]
+fn parking_and_flushing_over_and_over_keeps_free_slots() {
+    if Dbt::new().is_none() {
+        return;
+    }
+    // 表里没有空位时插入一直找下去：在另一个线程里跑，超时算失败
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut dbt = Dbt::new().unwrap();
+        let mut g = Guest::new();
+        let second = CODE + PAGE_SIZE;
+        g.code(CODE, &[movz_x0(1), SVC]);
+        g.code(second, &[movz_x0(2), SVC]);
+        let source = DbtSource {
+            start: CODE,
+            len: 2 * PAGE_SIZE,
+            id: [1, 0, 0, 0, 0],
+        };
+        let host = NonNull::new(g.pages[1].0.as_mut_ptr()).unwrap();
+        // 最小的表 4096 项：每一轮漏掉一个墓碑的话，几千轮就占满了
+        for _ in 0..5000 {
+            assert_eq!(g.run(&mut dbt), 1);
+            assert_eq!(g.run_at(&mut dbt, second), 2);
+            // 换了地址空间（exec 了同一个程序），第二页还没映射：那里的块停放
+            dbt.space().set_sources(&[source]);
+            dbt.recheck();
+            dbt.space().trust(&[]);
+            g.mmu.unmap(second, PAGE_SIZE).unwrap();
+            g.cpu.tlb_flush();
+            assert_eq!(g.run(&mut dbt), 1);
+            // 映射回来，第一次执行到时恢复，不重新翻译
+            unsafe {
+                g.mmu
+                    .map(second, host, PAGE_SIZE, prot::READ | prot::EXEC)
+                    .unwrap();
+            }
+            let blocks = dbt.stats().blocks;
+            assert_eq!(g.run_at(&mut dbt, second), 2);
+            assert_eq!(dbt.stats().blocks, blocks);
+            dbt.flush();
+        }
+        done.send(()).unwrap();
+    });
+    let result = finished.recv_timeout(std::time::Duration::from_secs(60));
+    assert!(result.is_ok(), "翻译表被占满，插入找不到空位");
 }
 
 #[test]

@@ -3557,12 +3557,23 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
     d->ntrusted = d->nparkable = 0;
 }
 
-/* 停放的块重新放进翻译表（revive）。持有锁 */
+/*
+ * 停放的块重新放进翻译表（revive）。停放时留下的墓碑还在（这之后没有重建过表）就原样
+ * 恢复：代码没变，不持锁查表的线程读到恢复前后的哪一种都对。插到别的空位的话，没有
+ * 记录再指向那个墓碑，整体清空（flush_locked 只清 table_used 记下的位置）之后它还占着
+ * 位置却不再计数，反复停放、恢复、清空，表就被占满，插入和查表都找不到空位。持有锁
+ */
 static void table_relink(struct appine_dbt *d, size_t k)
 {
     struct table *t = d->table;
     const struct block *b = &d->blocks[k];
-    size_t i = table_index(t, b->pc);
+    size_t i = d->table_used[k];
+    if (i != SLOT_NONE && t->slots[i].pc == JC_EMPTY && t->slots[i].code == b->code) {
+        d->table_dead--;
+        __atomic_store_n(&t->slots[i].pc, b->pc, __ATOMIC_RELEASE);
+        return;
+    }
+    i = table_index(t, b->pc);
     while (t->slots[i].code)
         i = (i + 1) & table_mask(t);
     d->table_occupied++;
@@ -3988,9 +3999,11 @@ void appine_dbt_recheck(struct appine_dbt_thread *t)
     (void)t;
 }
 
-void appine_dbt_invalidate(struct appine_dbt_thread *t, uint64_t start, uint64_t len)
+void appine_dbt_invalidate(struct appine_dbt_thread *t, const struct appine_cpu *cpu, uint64_t start,
+                           uint64_t len)
 {
     (void)t;
+    (void)cpu;
     (void)start;
     (void)len;
 }
