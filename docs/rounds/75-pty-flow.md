@@ -1,6 +1,6 @@
 # M9 之前：PTY 的 TCFLSH 和 TCXONC（2026-10-28）
 
-← [M9 之前：FICLONE 返回 EOPNOTSUPP（2026-10-28）](74-ficlone.md) · [索引](../milestones.md)
+← [M9 之前：FICLONE 返回 EOPNOTSUPP（2026-10-28）](74-ficlone.md) · [索引](../milestones.md) · [M9 之前：FIFO 在写端来之前不报 POLLHUP（2026-10-28）](76-fifo-pollhup.md) →
 
 [第二轮普查](70-survey-suites.md)的问题 4：PTY 的 TCFLSH 在主设备上方向反了，TCOOFF 不让从设备的写阻塞。CPython 的 test_termios、test_ioctl 因此各卡到 20 分钟的超时。
 

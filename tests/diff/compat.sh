@@ -1848,3 +1848,24 @@ print("pty master write blocked", not done.wait(0.3))
 termios.tcflow(m, termios.TCOON)
 print("pty master resumed", done.wait(2), os.read(s, 16))
 PY
+
+# FIFO 的读端以 O_NONBLOCK 打开时还没有写端：有写端打开过之前 poll 不报 POLLHUP
+python3 - <<'PY'
+import os, select, tempfile
+fifo = os.path.join(tempfile.mkdtemp(), "fifo")
+os.mkfifo(fifo)
+def events(fd):
+    p = select.poll()
+    p.register(fd, select.POLLIN)
+    return [e for _, e in p.poll(0)]
+r = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+print("fifo before writer", events(r), os.read(r, 1))
+w = os.open(fifo, os.O_WRONLY)
+print("fifo with writer", events(r))
+os.write(w, b"x")
+print("fifo data", events(r))
+os.close(w)
+print("fifo writer gone", events(r), os.read(r, 2), events(r))
+r2 = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+print("fifo new reader", events(r2))
+PY

@@ -862,7 +862,10 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
     }
     let peer_opens = |p: &Pipe| if read { p.writer_opens } else { p.reader_opens };
     let before = peer_opens(&pipe.borrow());
-    let end = PipeEnd::open(&pipe, read, write);
+    let mut end = PipeEnd::open(&pipe, read, write);
+    if read && !write && nonblock && pipe.borrow().writers == 0 {
+        end.hup_after = Some(before);
+    }
     if read != write && !nonblock {
         // 等对端打开：对端来过就行，哪怕已经关掉
         loop {

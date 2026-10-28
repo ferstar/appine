@@ -101,6 +101,9 @@ pub struct PipeEnd {
     pub read: bool,
     /// 是不是写端。
     pub write: bool,
+    /// 以 `O_NONBLOCK` 只读打开 FIFO 时还没有写端：记下写端被打开过的次数，之后有写端
+    /// 打开过，没有写端时才报 POLLHUP（Linux 读端的 `f_version`，`pipe_poll`）。
+    pub hup_after: Option<u64>,
 }
 
 impl PipeEnd {
@@ -133,6 +136,7 @@ impl PipeEnd {
             pipe: pipe.clone(),
             read,
             write,
+            hup_after: None,
         }
     }
 }

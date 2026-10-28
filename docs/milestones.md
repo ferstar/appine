@@ -84,6 +84,7 @@
 | [M9 之前：目录和文件的时间戳](rounds/73-timestamps.md) | 2026-10-28 | 目录里新建、删除、改名改目录的 mtime、ctime，普通文件的 ctime 取自宿主 object（chmod、改名等也让宿主改它），utimensat 的 `UTIME_NOW` 交给宿主：Python 能 import 后来新建的模块，PHP 的文件测试 590 个全过；rename 多约 2 微秒 |
 | [M9 之前：FICLONE 返回 EOPNOTSUPP](rounds/74-ficlone.md) | 2026-10-28 | FICLONE、FICLONERANGE、FIDEDUPERANGE 按 Linux 的顺序检查之后返回 EOPNOTSUPP（原来 ENOTTY），和 ext4、f2fs 一样不支持 reflink：Python 3.14 的 `Path.copy()` 能用了，test_pathlib 全部通过 |
 | [M9 之前：PTY 的 TCFLSH 和 TCXONC](rounds/75-pty-flow.md) | 2026-10-28 | 主设备上的 TCFLSH 按主设备的方向清；输出被 ^S、TCOOFF 停住时这一端的写阻塞（原来照样成功），已经写出的另一端照样能读，TCOOFF 要 TCOON 才恢复；TCIOFF、TCION 发 STOP、START 字符：CPython 的 test_termios、test_ioctl 不再各卡 20 分钟 |
+| [M9 之前：FIFO 在写端来之前不报 POLLHUP](rounds/76-fifo-pollhup.md) | 2026-10-28 | 以 `O_NONBLOCK` 只读打开、当时没有写端的 FIFO，有写端打开过之前 poll 不报 POLLHUP（Linux 读端的 `f_version`）：Ruby 的 test_require 全部通过 |
 
 ## 测量条件
 

@@ -80,7 +80,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
                 if !p.buf.is_empty() {
                     ev |= POLLIN | POLLRDNORM;
                 }
-                if p.writers == 0 {
+                if p.writers == 0 && end.hup_after != Some(p.writer_opens) {
                     ev |= POLLHUP;
                 }
             }
