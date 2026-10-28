@@ -1,6 +1,6 @@
 # M9 之前：FIFO 在写端来之前不报 POLLHUP（2026-10-28）
 
-← [M9 之前：PTY 的 TCFLSH 和 TCXONC（2026-10-28）](75-pty-flow.md) · [索引](../milestones.md)
+← [M9 之前：PTY 的 TCFLSH 和 TCXONC（2026-10-28）](75-pty-flow.md) · [索引](../milestones.md) · [M9 之前：删除的目录里不能新建，socket 可以 fchmod（2026-10-28）](77-dead-dir-socket-fchmod.md) →
 
 [第二轮普查](70-survey-suites.md)的问题 3：FIFO 的读端在还没有写端连上过时，poll 报 POLLHUP。Ruby 的 `load` 一个 FIFO 时以 `O_NONBLOCK` 打开再 poll，在 appine 上立刻读到 EOF，当作空文件 load 成功，test_require 的三个 FIFO 测试因此失败。
 

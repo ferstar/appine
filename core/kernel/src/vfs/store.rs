@@ -1254,8 +1254,14 @@ impl Store {
         if self.lookup(parent, name)?.is_some() {
             return Err(Errno::EEXIST);
         }
-        if !self.stat_row(parent)?.is_dir() {
+        let dir = self.stat_row(parent)?;
+        if !dir.is_dir() {
             return Err(Errno::ENOTDIR);
+        }
+        // 已经删除的目录（还是谁的当前目录，或者还打开着）里不能新建：Linux 的 may_create
+        // 看到 IS_DEADDIR 返回 ENOENT
+        if dir.nlink == 0 {
+            return Err(Errno::ENOENT);
         }
         self.db
             .prepare_cached("INSERT INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)")
@@ -1624,6 +1630,9 @@ impl Store {
             }
             if src_dir && s.is_ancestor(src, new_dir)? {
                 return Err(Errno::EINVAL);
+            }
+            if dst.is_none() && s.stat_row(new_dir)?.nlink == 0 {
+                return Err(Errno::ENOENT);
             }
             if let Some(d) = dst {
                 if src_dir {
@@ -2089,6 +2098,29 @@ mod tests {
         assert!(times(b).1 > before.1);
         let op = &mut || s.set_times(b, Some(FileTime::Now), None).unwrap();
         assert_eq!(newer(b, times(b), op), (false, true));
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_directories_take_no_new_entries() {
+        let (s, dir) = temp_store("deaddir");
+        let d = s.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap();
+        let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
+        s.rmdir(ROOT, b"d").unwrap();
+        // 删除之后它还可能是当前目录：在里面新建、链接、改名进去都是 ENOENT
+        assert_eq!(
+            s.create_file(d, b"x", 0o644, 0, 0).err(),
+            Some(Errno::ENOENT)
+        );
+        assert_eq!(s.mkdir(d, b"x", 0o755, 0, 0), Err(Errno::ENOENT));
+        assert_eq!(s.symlink(d, b"x", b"f", 0, 0), Err(Errno::ENOENT));
+        assert_eq!(s.link(d, b"x", f), Err(Errno::ENOENT));
+        assert_eq!(
+            s.rename(ROOT, b"f", d, b"x", false, false),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(s.lookup(ROOT, b"f").unwrap(), Some(f));
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }

@@ -2202,6 +2202,10 @@ pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
 enum Attrs {
     Store(Ino),
     Pts(Rc<RefCell<Tty>>),
+    /// socket、匿名管道的 fd：Linux 上改的是 sockfs、pipefs 里它们自己的 inode，属主是
+    /// 创建它的进程（libuv 的 `uv_pipe_chmod` 先 fchmod socket 的 fd）。这里当作调用者
+    /// 的，改了不记下来，fstat 报告的属主和权限照旧是合成的。
+    Anon,
 }
 
 impl Attrs {
@@ -2222,6 +2226,8 @@ impl Attrs {
             FileKind::Pty(end) if !end.master && f.flags & oflags::O_PATH == 0 => {
                 Ok(Attrs::Pts(end.tty.clone()))
             }
+            FileKind::Socket(_) => Ok(Attrs::Anon),
+            FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => Ok(Attrs::Anon),
             _ => {
                 drop(f);
                 file_ino(cx, fd).map(Attrs::Store)
@@ -2238,6 +2244,14 @@ impl Attrs {
                     mode: mode::S_IFCHR | t.mode,
                     uid: t.owner.0,
                     gid: t.owner.1,
+                    ..Stat::default()
+                })
+            }
+            Attrs::Anon => {
+                let cred = cx.cred();
+                Ok(Stat {
+                    uid: cred.fsuid,
+                    gid: cred.fsgid,
                     ..Stat::default()
                 })
             }
@@ -2280,6 +2294,7 @@ fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
     match target {
         Attrs::Store(ino) => cx.vfs()?.store().set_mode(*ino, perm)?,
         Attrs::Pts(t) => t.borrow_mut().mode = perm,
+        Attrs::Anon => {}
     }
     Ok(0)
 }
@@ -2336,6 +2351,7 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
             let mut t = t.borrow_mut();
             t.owner = (uid.unwrap_or(t.owner.0), gid.unwrap_or(t.owner.1));
         }
+        Attrs::Anon => {}
     }
     Ok(0)
 }

@@ -1869,3 +1869,24 @@ print("fifo writer gone", events(r), os.read(r, 2), events(r))
 r2 = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
 print("fifo new reader", events(r2))
 PY
+
+# 已经删除的当前目录里不能新建（ENOENT）；socket、管道的 fd 可以 fchmod（libuv 的 uv_pipe_chmod）
+python3 - <<'PY'
+import errno, os, socket
+def err(f):
+    try:
+        f()
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+os.mkdir("/tmp/deadcwd")
+os.chdir("/tmp/deadcwd")
+os.rmdir("/tmp/deadcwd")
+print("dead cwd mkdir", err(lambda: os.mkdir("x")))
+print("dead cwd create", err(lambda: open("x", "w")))
+print("dead cwd symlink", err(lambda: os.symlink("a", "x")))
+os.chdir("/tmp")
+s = socket.socket(socket.AF_UNIX)
+print("fchmod socket", err(lambda: os.fchmod(s.fileno(), 0o777)))
+print("fchmod pipe", err(lambda: os.fchmod(os.pipe()[0], 0o600)))
+PY

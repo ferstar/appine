@@ -85,6 +85,7 @@
 | [M9 之前：FICLONE 返回 EOPNOTSUPP](rounds/74-ficlone.md) | 2026-10-28 | FICLONE、FICLONERANGE、FIDEDUPERANGE 按 Linux 的顺序检查之后返回 EOPNOTSUPP（原来 ENOTTY），和 ext4、f2fs 一样不支持 reflink：Python 3.14 的 `Path.copy()` 能用了，test_pathlib 全部通过 |
 | [M9 之前：PTY 的 TCFLSH 和 TCXONC](rounds/75-pty-flow.md) | 2026-10-28 | 主设备上的 TCFLSH 按主设备的方向清；输出被 ^S、TCOOFF 停住时这一端的写阻塞（原来照样成功），已经写出的另一端照样能读，TCOOFF 要 TCOON 才恢复；TCIOFF、TCION 发 STOP、START 字符：CPython 的 test_termios、test_ioctl 不再各卡 20 分钟 |
 | [M9 之前：FIFO 在写端来之前不报 POLLHUP](rounds/76-fifo-pollhup.md) | 2026-10-28 | 以 `O_NONBLOCK` 只读打开、当时没有写端的 FIFO，有写端打开过之前 poll 不报 POLLHUP（Linux 读端的 `f_version`）：Ruby 的 test_require 全部通过 |
+| [M9 之前：删除的目录里不能新建，socket 可以 fchmod](rounds/77-dead-dir-socket-fchmod.md) | 2026-10-28 | 链接数已经是 0 的目录里新建、改名进去返回 ENOENT（原来成功了）；socket、匿名管道的 fd 可以 fchmod、fchown（原来 EACCES）：Node 的 test-fs-mkdir 和 `listen({ readableAll })` 的两个测试通过 |
 
 ## 测量条件
 
@@ -104,7 +105,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | 测试 | 原因 |
 |---|---|
 | shmctl01 | 全量并发时子进程还没 `shmdt` 完就超时，单独运行多数通过；[多进程并行](rounds/36-parallel-processes.md)那一轮用 HEAD 的二进制单独跑 8 次也失败 3 次，写时复制之前的二进制并发跑 shm 子集也会失败 |
-| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败 |
+| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02、prctl09 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败 |
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | futex_wake05 | [稳定性和内存](rounds/12-stability-memory.md)那一轮记为以前就时好时坏，原因没查 |
