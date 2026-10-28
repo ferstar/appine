@@ -241,6 +241,8 @@ pub(crate) struct Kernel {
     pub mqueues: BTreeMap<Vec<u8>, Rc<RefCell<crate::syscall::MessageQueue>>>,
     /// `/proc/sys/fs/mqueue/*`。
     pub mq_limits: crate::syscall::MqLimits,
+    /// 网络接口的流量计数（[`crate::traffic`]）。
+    pub traffic: crate::traffic::Traffic,
     /// AIO 上下文占用的事件数（`/proc/sys/fs/aio-nr`）和上限（`aio-max-nr`）。
     pub aio_nr: u64,
     pub aio_max_nr: u64,
@@ -304,6 +306,7 @@ impl Kernel {
             seccomp_logged: crate::seccomp::logged::DEFAULT,
             mqueues: BTreeMap::new(),
             mq_limits: Default::default(),
+            traffic: Default::default(),
             aio_nr: 0,
             aio_max_nr: 65536,
             inotify: Rc::default(),

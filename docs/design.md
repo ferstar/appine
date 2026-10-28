@@ -499,7 +499,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `/dev/pts` | devpts：每个 PTY 一个 `/dev/pts/N`，随 PTY 的创建和关闭出现和消失。与 Linux 按 `gid=5,mode=620` 挂载的一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod、utimensat（按路径或者从设备的 fd）照常检查权限，结果记在终端上（sshd 把终端交给登录的用户），别的合成节点不能修改。访问、修改时间与 Linux 一样在从设备读到、写出数据时更新，只改秒、相差 8 秒以上才改（w、who 的空闲时间看访问时间） |
 | `/dev/shm`、`/run` | inode 仓库里的目录。Linux 上它们是 tmpfs，所以仓库被第一个使用者打开时清空其中的内容 |
 | `/proc` | procfs：根据内核层的 task、mm 等结构实时合成。smaps 的驻留页按宿主内存算（mincore）；匿名内存都算脏页，fork 之后和别的地址空间共用的（写时复制借出、借来的）算共享的，Pss 按共用的个数分摊，与 Linux 的 mapcount 一样（redis、valkey 启动时靠它检查内核），其余算私有的；文件映射都算私有的干净页。`/proc/meminfo` 和 sysinfo 的内存各项照搬宿主的（与 docker 的容器一样），guest 能用的上限看 cgroup 的 `memory.max` |
-| `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。各个 `cpu<n>` 的 `cache/`、`cpufreq/` 照搬宿主对应的那个 CPU 的（宿主有、App 读得了的才有），CPU 列表和掩码换成 guest 的编号。没有 `transparent_hugepage`，相当于没有编进 THP 的内核 |
+| `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。各个 `cpu<n>` 的 `cache/`、`cpufreq/` 照搬宿主对应的那个 CPU 的（宿主有、App 读得了的才有），CPU 列表和掩码换成 guest 的编号。没有 `transparent_hugepage`，相当于没有编进 THP 的内核。`/sys/class/net/<接口>` 是宿主的接口：`statistics/` 下的计数（§10）和 `address`、`flags`、`ifindex`、`mtu`、`operstate`、`type` 等几项属性，取值与 netlink 的回答一致；Linux 上接口目录是指向 `/sys/devices` 的符号链接，这里是目录 |
 | `/sys/fs/cgroup` | 只读的 cgroup2（`core/kernel/src/cgroup.rs`）：所有 guest 进程在同一个 cgroup 里，像 docker 用 cgroup 命名空间的容器（`/proc/<pid>/cgroup` 是 `0::/`），控制器有 cpuset、cpu、memory、pids。`memory.max` 是 §12 第 4 条的上限，`memory.current` 是那里量的用量，`memory.stat` 按 Linux 6.1 的格式把它分成匿名内存（含换出的）和共享内存（.NET 的 GC 按 `memory.current` 减去其中的 `inactive_file` 算用量），`memory.events` 记着超出上限和结束进程的次数；没有 CPU 配额，cpuset 是所有 CPU。JVM 的容器支持和 Node.js（libuv 的 `uv_get_constrained_memory`）据此按上限定堆。写、建子 cgroup 都是 EROFS |
 | `/tmp` | 放在 inode 仓库里，不用内存 tmpfs，避免占用 App 内存配额 |
 | `/mnt/<名字>` | SAF 目录挂载（v1.x，见 §11.3） |
@@ -538,13 +538,14 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 |---|---|
 | TCP/UDP | 透传给宿主：guest 的 file 对象内部持有一个宿主非阻塞 socket，地址、选项和控制消息按字节原样传递。阻塞在内核层的等待机制里模拟 |
 | ICMP | 把 guest 的 `SOCK_RAW + IPPROTO_ICMP` 翻译成宿主的 `SOCK_DGRAM + IPPROTO_ICMP`（ping socket），`SO_TYPE` 照样报告 `SOCK_RAW` |
-| `NETLINK_ROUTE` | 在进程内模拟，接口和地址取自宿主的 `getifaddrs`（targetSdk 37 下 bionic 仍能列出，只是没有 MAC）；不够用时再改为通过 JNI 从 `ConnectivityManager`/`LinkProperties` 获取。路由表没有模拟，`RTM_GETROUTE` 的转储是空的，别的请求（`RTM_GETNEIGH` 等）回答 `EOPNOTSUPP`（[网络信息的缺口](rounds/78-net-info-gaps.md)） |
+| `NETLINK_ROUTE` | 在进程内模拟，接口和地址取自宿主的 `getifaddrs`（targetSdk 37 下 bionic 仍能列出，只是没有 MAC），`RTM_NEWLINK` 带着下面的流量计数（`IFLA_STATS`、`IFLA_STATS64`）；不够用时再改为通过 JNI 从 `ConnectivityManager`/`LinkProperties` 获取。路由表没有模拟，`RTM_GETROUTE` 的转储是空的，别的请求（`RTM_GETNEIGH` 等）回答 `EOPNOTSUPP`（[网络信息的缺口](rounds/78-net-info-gaps.md)） |
 | 别的 netlink 协议 | `NETLINK_KOBJECT_UEVENT` 建得了、什么也收不到（mdev、udev 只听热插拔事件）。别的协议（审计、`SOCK_DIAG`、`GENERIC`、netfilter……）与 Linux 上没有编进内核的子系统一样，`socket` 返回 `EPROTONOSUPPORT`：libaudit 据此当作没有审计（PAM 登录不等 ACK），ss 退回读 `/proc/net` |
 | DNS | `resolv.conf` 写 `nameserver 127.0.0.53`（打开仓库时没有就写一份）。socket 层截下发往这个地址 53 端口的 UDP 数据报，交给 `android_res_nsend`，这样系统的私人 DNS、VPN 和按网络分流设置都能生效；Linux 开发宿主上转发给宿主 `/etc/resolv.conf` 里的服务器。发往存根的 TCP 连接没有截获，musl 的解析器只在 UDP 回答被截断时才用 TCP，而存根交给 guest 的是完整的回答 |
 | 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射（真机待确认） |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档（真机待确认） |
 | AF_UNIX | 进程内模拟（`core/kernel/src/unix.rs`）。`SCM_RIGHTS` 传递的是 guest 的打开文件，`SO_PEERCRED` 返回 guest 的 pid 和 uid；只经由在途消息互相引用的 socket 由垃圾回收释放 |
-| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 只列出宿主的接口，流量计数都是 0；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；没有 `route`、`ipv6_route`、`snmp`、`sockstat`、`arp` |
+| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 列出宿主的接口和下面的流量计数；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；没有 `route`、`ipv6_route`、`snmp`、`sockstat`、`arp` |
+| 流量计数 | 内核层自己数 guest 的 TCP、UDP、ping socket 收发的载荷（`core/kernel/src/traffic.rs`），`/proc/net/dev`、sysfs 的 `statistics/` 和 netlink 报告同样的数：Android 上 App 读不到宿主的计数，宿主的计数里也有别的 App 的流量。接口按 socket 的本端地址认（宿主选路的结果），本端地址还没定下的数据报按对端，回环地址算回环接口，别的算默认接口（发往公网时宿主选的本端地址所在的接口）。不含协议头和 ACK，流式 socket 的包数按 MSS 估计；DNS 存根的查询不经过宿主 socket，不算 |
 | tun/VpnService | v1 不做 |
 
 **I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作，宿主 fd 和进程内对象统一在 §6 的等待机制里处理。

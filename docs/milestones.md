@@ -98,6 +98,7 @@
 | [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件](rounds/87-fast-panic-held-borrows.md) | 2026-10-29 | 不持 BKL 的系统调用里的内核 bug 只结束那个进程（原来整个 App 终止）；查了持着 `RefCell` 的借用去等待的地方，修了 epoll_wait 和 seccomp 通知 fd 的 `NOTIF_RECV` 等待时借着打开文件，另一个线程这时 `fcntl(F_SETFL)`、`ioctl(FIONBIO)` 会让进程被结束 |
 | [M9 之前：futex 等待者的清理，放开 BKL 时检查借用](rounds/88-futex-cleanup-borrow-check.md) | 2026-10-29 | futex 的等待者由守卫离开队列：中途 panic 也移除，超时、被信号打断时刚好被唤醒的算唤醒（原来持锁的路径和 `futex_waitv` 可能丢掉一次唤醒）；kernel crate 改用自己的 `RefCell`，调试构建里放开 BKL 时检查没有借着内核对象，新增 `waits` 用例让 19 种等待各走一遍 |
 | [M9 之前：测试用的发布构建也检查借用](rounds/89-release-borrow-check.md) | 2026-10-29 | `appine-run` 和 debug 版 App 的发布构建也在放开 BKL 时检查借用；差分测试、LTP、普查认出内核层报告的内部错误（差分测试原来把 `appine-run` 的 stderr 丢掉）；`waits` 用例补上文件位置锁、租约的打破和 AIO 的完成；开销在误差范围内，带检查跑差分测试、LTP、普查和语言的测试集都没有报告内部错误 |
+| [M9 之前：网络接口的流量计数](rounds/90-interface-counters.md) | 2026-10-29 | 内核层自己数 guest 的 socket 收发的载荷，接口按 socket 的本端地址认：`/proc/net/dev`（原来全是 0）、新增的 `/sys/class/net/<接口>/statistics/`（btop 读它）和 netlink 的 `IFLA_STATS` 报告同样的数；回环上的短连接 +4%、UDP 来回 +3% |
 
 ## 测量条件
 

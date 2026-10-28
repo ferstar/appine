@@ -19,11 +19,11 @@
 - **为什么没有**：Android 10 起 App 读不了宿主的 `/proc/net`；targetSdk ≥ 30 不能 bind `NETLINK_ROUTE`，`RTM_GETLINK` 也被拦截（§2 的硬约束），宿主的路由表和流量计数都不能直接转给 guest。
 - **可以怎么做**（都没做）：
   - 路由：App 从 `ConnectivityManager` 取默认网络的 `LinkProperties.getRoutes()`，经由 Machine 接口交给内核层，用它合成 `/proc/net/route`、`ipv6_route` 和 `RTM_GETROUTE` 的回答，网络变化时（`NetworkCallback`）更新。Linux 开发宿主上可以直接读宿主的 `/proc/net/route`。
-  - 流量：guest 的 TCP、UDP 都经过内核层，可以自己数收发的字节；但选哪个接口是宿主决定的，分不出接口，只能都算在默认接口上。`TrafficStats` 只有整台设备和每个 uid 的总量（包括 App 自己的流量），也分不出接口。
+  - 流量：guest 的 TCP、UDP 都经过内核层，可以自己数收发的字节；但选哪个接口是宿主决定的，分不出接口，只能都算在默认接口上。`TrafficStats` 只有整台设备和每个 uid 的总量（包括 App 自己的流量），也分不出接口。→ 已补上（M9 之前：网络接口的流量计数）：内核层自己数，接口按 socket 的本端地址（宿主选路的结果）认，分得出来
   - `if_inet6`（地址已经有了，格式化一下就行）、`snmp`、`sockstat` 等按需要再补。→ `if_inet6` 已补上（M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口）
 
 **推迟项**：
 
 - 路由表：`RTM_GETROUTE`、`/proc/net/route`、`/proc/net/ipv6_route`。
-- `/proc/net/dev` 的流量计数。
+- `/proc/net/dev` 的流量计数。→ 已补上（M9 之前：网络接口的流量计数），另外新增 `/sys/class/net/<接口>/statistics/`（btop 读它）和 netlink 的 `IFLA_STATS`、`IFLA_STATS64`；只数载荷，包数是估计的
 - `/proc/net/if_inet6`、`snmp`、`netstat`、`sockstat`、`arp`，`RTM_GETNEIGH`。→ `if_inet6` 已补上（M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口），其余仍没有

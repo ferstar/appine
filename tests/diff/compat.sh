@@ -498,6 +498,55 @@ gcc -O1 -o procnet procnet.c
 # 两边都没有这一行
 grep ' lo$' /proc/net/if_inet6 || echo "if_inet6: no lo"
 
+# 接口的流量计数：/proc/net/dev 的表头和 lo 那一行的格式，/sys/class/net/lo 的属性和
+# statistics 下的文件；在回环上收发之后 lo 的计数至少增加载荷的字节数（Linux 还算协议头，
+# appine 只数载荷），两处读到的相同。别的接口取决于容器的网络
+head -n 2 /proc/net/dev
+grep '^ *lo:' /proc/net/dev | awk '{ print "lo fields:", NF }'
+for f in addr_len address broadcast carrier flags ifindex iflink mtu operstate type; do
+    echo "lo $f: $(cat /sys/class/net/lo/$f)"
+done
+ls /sys/class/net/lo/statistics | tr '\n' ' '
+echo
+python3 - <<'PY'
+import socket
+
+
+def lo():
+    v = {}
+    for f in ("rx_bytes", "tx_bytes", "rx_packets", "tx_packets"):
+        with open("/sys/class/net/lo/statistics/" + f) as s:
+            v[f] = int(s.read())
+    with open("/proc/net/dev") as d:
+        for line in d:
+            name, _, rest = line.partition(":")
+            if name.strip() == "lo":
+                n = rest.split()
+                v["proc"] = (int(n[0]), int(n[1]), int(n[8]), int(n[9]))
+    return v
+
+
+a = lo()
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen()
+c = socket.create_connection(listener.getsockname())
+s, _ = listener.accept()
+c.sendall(b"x" * 100000)
+c.close()
+got = 0
+while d := s.recv(65536):
+    got += len(d)
+b = lo()
+print("received", got)
+for k in ("rx_bytes", "tx_bytes"):
+    print("lo", k, "grew" if b[k] - a[k] >= 100000 else "did not grow")
+grew = b["rx_packets"] > a["rx_packets"] and b["tx_packets"] > a["tx_packets"]
+print("lo packets", "grew" if grew else "did not grow")
+same = b["proc"] == (b["rx_bytes"], b["rx_packets"], b["tx_bytes"], b["tx_packets"])
+print("/proc/net/dev and sysfs", "agree" if same else "disagree")
+PY
+
 # fdinfo 里 epoll、timerfd、signalfd 特有的行；mountinfo 的设备号与 stat 一致，
 # fdinfo 的 mnt_id 能在 mountinfo 里找到
 cat > fdinfo.c <<'C'

@@ -382,6 +382,28 @@ fn every_kind_of_wait_releases_the_bkl_without_borrows() {
 }
 
 #[test]
+fn interface_counters_count_guest_traffic() {
+    // 回环上收发之后 /proc/net/dev、sysfs、netlink 三处 lo 的计数相同，增加的正好是载荷
+    // （tests/guest/traffic.c）
+    let (Some(store), Some(program)) = (store(), build_static("traffic")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/traffic && chmod +x /tmp/traffic && /tmp/traffic";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn core_files_have_the_linux_layout() {
     // 多线程的进程崩溃：core 文件的程序头、MADV_DONTDUMP、每个线程的 note、core_pattern、
     // RLIMIT_CORE 的截断（tests/guest/coredump.c），程序要拷进仓库里运行

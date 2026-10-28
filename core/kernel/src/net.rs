@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use appine_hal::net::Interface;
 
+use crate::traffic::IfStats;
+
 /// 地址族。
 pub const AF_UNIX: i32 = 1;
 pub const AF_INET: i32 = 2;
@@ -54,6 +56,8 @@ pub(crate) struct InetSocket {
     /// `SO_RCVTIMEO`、`SO_SNDTIMEO`：阻塞由我们模拟，所以超时也由我们处理。
     pub rcvtimeo: Option<Duration>,
     pub sndtimeo: Option<Duration>,
+    /// 流量算在哪个接口上（[`crate::traffic`]），本端地址定下来之后才有。
+    pub route: Option<crate::traffic::Route>,
 }
 
 impl InetSocket {
@@ -69,6 +73,7 @@ impl InetSocket {
             answered: 0,
             rcvtimeo: None,
             sndtimeo: None,
+            route: None,
         }
     }
 }
@@ -283,6 +288,8 @@ const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const IFLA_STATS: u16 = 7;
+const IFLA_STATS64: u16 = 23;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
@@ -323,7 +330,7 @@ fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
     b
 }
 
-fn link_message(i: &Interface) -> Vec<u8> {
+fn link_message(i: &Interface, st: IfStats) -> Vec<u8> {
     let loopback = i.flags & IFF_LOOPBACK != 0;
     // struct ifinfomsg：family、pad、type、index、flags、change
     let mut p = vec![0u8, 0];
@@ -344,6 +351,16 @@ fn link_message(i: &Interface) -> Vec<u8> {
     attr(&mut p, IFLA_ADDRESS, &mac);
     let bcast = if loopback { [0; 6] } else { [0xff; 6] };
     attr(&mut p, IFLA_BROADCAST, &bcast);
+    // 流量计数（crate::traffic）：struct rtnl_link_stats 是 24 个 u32，rtnl_link_stats64
+    // 在 Linux 6.1 是 25 个 u64；前四项依次是收、发的包数和收、发的字节数，别的都是 0
+    let head = [st.rx_packets, st.tx_packets, st.rx_bytes, st.tx_bytes];
+    let field = |n: usize| head.get(n).copied().unwrap_or(0);
+    let stats: Vec<u8> = (0..24)
+        .flat_map(|n| (field(n) as u32).to_le_bytes())
+        .collect();
+    attr(&mut p, IFLA_STATS, &stats);
+    let stats64: Vec<u8> = (0..25).flat_map(|n| field(n).to_le_bytes()).collect();
+    attr(&mut p, IFLA_STATS64, &stats64);
     p
 }
 
@@ -385,7 +402,12 @@ impl NetlinkSocket {
     }
 
     /// 处理 guest 发来的一个数据报（可能含多条请求），把回答放进队列。
-    pub fn handle(&mut self, data: &[u8], interfaces: impl Fn() -> Vec<Interface>) {
+    pub fn handle(
+        &mut self,
+        data: &[u8],
+        interfaces: impl Fn() -> Vec<Interface>,
+        stats: impl Fn(&str) -> IfStats,
+    ) {
         if self.protocol != NETLINK_ROUTE {
             return;
         }
@@ -407,7 +429,8 @@ impl NetlinkSocket {
                     let list = interfaces();
                     for i in &list {
                         if ty == RTM_GETLINK {
-                            out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &link_message(i)));
+                            let st = stats(&i.name);
+                            out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &link_message(i, st)));
                         } else if ty == RTM_GETADDR {
                             for m in addr_messages(i, family) {
                                 out.extend(reply(RTM_NEWADDR, NLM_F_MULTI, &m));
@@ -465,6 +488,18 @@ mod tests {
         }
     }
 
+    /// 消息里的属性：类型 → 内容。
+    fn attributes(mut b: &[u8]) -> std::collections::BTreeMap<u16, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        while b.len() >= 4 {
+            let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+            let ty = u16::from_le_bytes([b[2], b[3]]);
+            out.insert(ty, b[4..len].to_vec());
+            b = &b[len.next_multiple_of(4).min(b.len())..];
+        }
+        out
+    }
+
     /// 按 musl 的 `__rtnetlink_enumerate` 解析回答：返回 (消息类型, 消息内容) 直到 DONE。
     fn parse(datagram: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let mut out = Vec::new();
@@ -490,11 +525,33 @@ mod tests {
             0,
             &[AF_INET as u8, 0, 0, 0],
         ));
-        s.handle(&req, || vec![lo()]);
+        let st = IfStats {
+            rx_bytes: 1000,
+            rx_packets: 3,
+            tx_bytes: 0x1_0000_0002,
+            tx_packets: 4,
+        };
+        s.handle(
+            &req,
+            || vec![lo()],
+            |name| if name == "lo" { st } else { IfStats::default() },
+        );
         let links = parse(&s.queue.pop_front().unwrap());
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].0, RTM_NEWLINK);
         assert!(links[0].1.windows(3).any(|w| w == b"lo\0"));
+        // IFLA_STATS 截成 32 位，IFLA_STATS64 是完整的
+        let attrs = attributes(&links[0].1[16..]);
+        let u32s = |n: usize| -> Vec<u32> {
+            attrs[&IFLA_STATS][..n * 4]
+                .chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        assert_eq!(attrs[&IFLA_STATS].len(), 96);
+        assert_eq!(u32s(5), [3, 4, 1000, 2, 0]);
+        assert_eq!(attrs[&IFLA_STATS64].len(), 200);
+        assert_eq!(attrs[&IFLA_STATS64][24..32], 0x1_0000_0002u64.to_le_bytes());
         assert_eq!(links[1].0, NLMSG_DONE);
         // 只要 IPv4 地址
         let addrs = parse(&s.queue.pop_front().unwrap());

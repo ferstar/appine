@@ -234,7 +234,11 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         }
     }
     match &mut *sock.borrow_mut() {
-        Socket::Inet(s) => appine_hal::net::bind(s.fd, &addr).map_err(Errno)?,
+        Socket::Inet(s) => {
+            // 流量算在哪个接口上重新认（connect 也一样）
+            s.route = None;
+            appine_hal::net::bind(s.fd, &addr).map_err(Errno)?
+        }
         Socket::Netlink(s) => {
             let pid = addr
                 .get(4..8)
@@ -305,6 +309,8 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     }
     let host_fd = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
+            // 本端地址可能变了：流量算在哪个接口上重新认
+            s.route = None;
             // UDP 连到 DNS 存根：只记下来，之后的 send 由存根处理
             if s.ty == SOCK_DGRAM {
                 s.stub_peer = is_stub(&addr);
@@ -489,7 +495,8 @@ pub(crate) fn send(
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
         Socket::Netlink(s) => {
-            s.handle(data, appine_hal::net::interfaces);
+            let traffic = &cx.kr().traffic;
+            s.handle(data, appine_hal::net::interfaces, |name| traffic.get(name));
             request_wake_object(wake::of(sock));
             return Ok(data.len());
         }
@@ -513,7 +520,8 @@ pub(crate) fn send(
     }
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut done = 0;
-    loop {
+    let mut sent_datagram = false;
+    let r = loop {
         let r = appine_hal::net::sendmsg(
             host_fd,
             &data[done..],
@@ -524,9 +532,10 @@ pub(crate) fn send(
         match r {
             Ok(n) => {
                 done += n;
+                sent_datagram = ty != SOCK_STREAM;
                 // 流式 socket 的阻塞发送要把数据全部发出去
                 if ty != SOCK_STREAM || done == data.len() || nonblock {
-                    return Ok(done);
+                    break Ok(done);
                 }
             }
             Err(e) if e == Errno::EAGAIN.0 => {
@@ -539,12 +548,23 @@ pub(crate) fn send(
                     deadline,
                     Errno::EAGAIN,
                 ) {
-                    return if done > 0 { Ok(done) } else { Err(err) };
+                    break if done > 0 { Ok(done) } else { Err(err) };
                 }
             }
-            Err(e) if e == Errno::EPIPE.0 => return Err(epipe(cx, flags)),
-            Err(e) => return if done > 0 { Ok(done) } else { Err(Errno(e)) },
+            Err(e) if e == Errno::EPIPE.0 => break Err(epipe(cx, flags)),
+            Err(e) => break if done > 0 { Ok(done) } else { Err(Errno(e)) },
         }
+    };
+    if done > 0 || sent_datagram {
+        account(cx, sock, false, done, addr);
+    }
+    r
+}
+
+/// 记下宿主 socket 上收发的流量（[`crate::traffic`]）。
+fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8]) {
+    if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+        cx.k().traffic.account(s, rx, bytes, peer);
     }
 }
 
@@ -637,6 +657,8 @@ pub(crate) fn recv(
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut buf = vec![0u8; max];
     let mut got = 0;
+    // 偷看的数据之后还会再读到，错误队列里不是收到的流量
+    let counted = flags & (MSG_PEEK | MSG_ERRQUEUE) == 0;
     loop {
         let host_flags = flags & !(MSG_DONTWAIT | MSG_WAITALL);
         match appine_hal::net::recvmsg(host_fd, &mut buf[got..], control_len, host_flags as i32) {
@@ -648,6 +670,9 @@ pub(crate) fn recv(
                 }
                 buf.truncate(got);
                 let len = if ty == SOCK_STREAM { got } else { r.len };
+                if counted {
+                    account(cx, sock, true, len, &r.addr);
+                }
                 return Ok(Message {
                     data: buf,
                     len,
@@ -665,6 +690,9 @@ pub(crate) fn recv(
                 }
                 if got > 0 {
                     buf.truncate(got);
+                    if counted {
+                        account(cx, sock, true, got, &[]);
+                    }
                     return Ok(Message {
                         len: got,
                         data: buf,

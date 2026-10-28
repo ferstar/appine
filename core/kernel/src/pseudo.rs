@@ -193,10 +193,12 @@ const STATIC: [&[u8]; 70] = [
     b"sysvipc/shm",
 ];
 
-/// `/sys` 下固定的目录和文件（相对 `/sys` 的路径，目录以 `/` 结尾）。只有 CPU 的拓扑：
-/// busybox 的 `nproc --all`、lscpu、glibc 的 get_nprocs 读它们。各个 `cpu<n>` 是
-/// [`PseudoNode::SysCpu`]。
-const SYS_STATIC: [&[u8]; 8] = [
+/// `/sys` 下固定的目录和文件（相对 `/sys` 的路径，目录以 `/` 结尾）。CPU 的拓扑：busybox
+/// 的 `nproc --all`、lscpu、glibc 的 get_nprocs 读它们，各个 `cpu<n>` 是
+/// [`PseudoNode::SysCpu`]；网络接口（btop 读流量计数），各个接口是 [`PseudoNode::SysNet`]。
+const SYS_STATIC: [&[u8]; 10] = [
+    b"class/",
+    b"class/net/",
     b"devices/",
     b"devices/system/",
     b"devices/system/cpu/",
@@ -205,6 +207,50 @@ const SYS_STATIC: [&[u8]; 8] = [
     b"devices/system/cpu/possible",
     b"devices/system/cpu/present",
     b"fs/",
+];
+
+/// `/sys/class/net`：各个接口在它下面。
+const SYS_NET_DIR: &[u8] = b"class/net/";
+
+/// `/sys/class/net/<接口>` 下的目录和文件（相对接口目录的路径），取值见 [`net_file`]。
+/// Linux 上的接口目录是指向 `/sys/devices` 下面的符号链接，这里是目录：宿主上的设备路径
+/// 拿不到。
+const NET_FILES: [&[u8]; 35] = [
+    b"addr_len",
+    b"address",
+    b"broadcast",
+    b"carrier",
+    b"flags",
+    b"ifindex",
+    b"iflink",
+    b"mtu",
+    b"operstate",
+    b"type",
+    b"statistics/",
+    b"statistics/collisions",
+    b"statistics/multicast",
+    b"statistics/rx_bytes",
+    b"statistics/rx_compressed",
+    b"statistics/rx_crc_errors",
+    b"statistics/rx_dropped",
+    b"statistics/rx_errors",
+    b"statistics/rx_fifo_errors",
+    b"statistics/rx_frame_errors",
+    b"statistics/rx_length_errors",
+    b"statistics/rx_missed_errors",
+    b"statistics/rx_nohandler",
+    b"statistics/rx_over_errors",
+    b"statistics/rx_packets",
+    b"statistics/tx_aborted_errors",
+    b"statistics/tx_bytes",
+    b"statistics/tx_carrier_errors",
+    b"statistics/tx_compressed",
+    b"statistics/tx_dropped",
+    b"statistics/tx_errors",
+    b"statistics/tx_fifo_errors",
+    b"statistics/tx_heartbeat_errors",
+    b"statistics/tx_packets",
+    b"statistics/tx_window_errors",
 ];
 
 /// `/sys/devices/system/cpu`：各个 `cpu<n>` 在它下面。
@@ -377,6 +423,9 @@ pub(crate) enum PseudoNode {
     /// `/sys/devices/system/cpu/cpu<n>`（路径为空），或者它下面的目录和文件（路径取值来自
     /// [`CPU_FILES`]）。
     SysCpu(u32, &'static [u8]),
+    /// `/sys/class/net/<接口>`（路径为空），或者它下面的目录和文件（路径取值来自
+    /// [`NET_FILES`]）；接口按宿主的接口编号记。
+    SysNet(u32, &'static [u8]),
     /// `/sys/fs/cgroup`（名字为空），或者它下面的文件（名字取值来自 [`crate::cgroup::FILES`]）。
     Cgroup(&'static [u8]),
 }
@@ -454,7 +503,10 @@ fn root_of(fs: Mount) -> PseudoNode {
 pub(crate) fn mount_of(node: &PseudoNode) -> Mount {
     match node {
         PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => Mount::Pts,
-        PseudoNode::SysRoot | PseudoNode::Sys(_) | PseudoNode::SysCpu(..) => Mount::Sys,
+        PseudoNode::SysRoot
+        | PseudoNode::Sys(_)
+        | PseudoNode::SysCpu(..)
+        | PseudoNode::SysNet(..) => Mount::Sys,
         PseudoNode::Cgroup(_) => Mount::Cgroup,
         _ => Mount::Proc,
     }
@@ -567,6 +619,10 @@ impl Pseudo for View<'_> {
             SysCpu(n, path) => tree_parent(&CPU_FILES, path)
                 .or_else(|| tree_parent(&HOST_CPU_FILES, path))
                 .map_or(SysCpu(*n, b""), |p| SysCpu(*n, p)),
+            SysNet(_, b"") => Sys(SYS_NET_DIR),
+            SysNet(n, path) => {
+                tree_parent(&NET_FILES, path).map_or(SysNet(*n, b""), |p| SysNet(*n, p))
+            }
             Cgroup(b"") => Sys(b"fs/"),
             Cgroup(_) => Cgroup(b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
@@ -590,6 +646,10 @@ impl Pseudo for View<'_> {
             SysRoot => b"sys".to_vec(),
             SysCpu(n, b"") => format!("cpu{n}").into_bytes(),
             SysCpu(_, path) => tree_name(path).to_vec(),
+            SysNet(n, b"") => interface(*n)
+                .map_or_else(|| n.to_string(), |i| i.name)
+                .into_bytes(),
+            SysNet(_, path) => tree_name(path).to_vec(),
             Cgroup(b"") => b"cgroup".to_vec(),
             Cgroup(name) => name.to_vec(),
             Pid(pid, None) => pid.to_string().into_bytes(),
@@ -633,6 +693,12 @@ impl Pseudo for View<'_> {
                 if *path == b"fs/" && name == b"cgroup" {
                     return Some(Cgroup(b""));
                 }
+                if *path == SYS_NET_DIR {
+                    return appine_hal::net::interfaces()
+                        .into_iter()
+                        .find(|i| i.name.as_bytes() == name)
+                        .map(|i| SysNet(i.index, b""));
+                }
                 let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
                 let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                 (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
@@ -646,6 +712,9 @@ impl Pseudo for View<'_> {
                     tree_lookup(&HOST_CPU_FILES, path, name).filter(|p| host_cpu_has(*n, p))
                 })
                 .map(|p| SysCpu(*n, p)),
+            SysNet(n, path) => tree_lookup(&NET_FILES, path, name)
+                .filter(|_| interface(*n).is_some())
+                .map(|p| SysNet(*n, p)),
             Pid(pid, tid) => {
                 let allowed = |e: &self::Entry| tid.is_none() || TASK_ENTRIES.contains(e);
                 ENTRIES
@@ -675,7 +744,7 @@ impl Pseudo for View<'_> {
         Ok(match node {
             PtsRoot | ProcRoot | Pid(..) | SysRoot => mode::S_IFDIR,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
-            SysCpu(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
+            SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
             Cgroup(b"") => mode::S_IFDIR,
             Entry(_, _, self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
@@ -1091,7 +1160,15 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
             if *path == b"fs/" {
                 nodes.push(Cgroup(b""));
             }
+            if *path == SYS_NET_DIR {
+                nodes.extend(
+                    appine_hal::net::interfaces()
+                        .iter()
+                        .map(|i| SysNet(i.index, b"")),
+                );
+            }
         }
+        SysNet(n, path) => nodes.extend(tree_children(&NET_FILES, path).map(|p| SysNet(*n, p))),
         Cgroup(b"") => nodes.extend(crate::cgroup::FILES.iter().map(|(n, _)| Cgroup(n))),
         SysCpu(n, path) => {
             nodes.extend(tree_children(&CPU_FILES, path).map(|p| SysCpu(*n, p)));
@@ -1847,15 +1924,39 @@ pub(crate) fn socket_ino(s: &SocketRef) -> u64 {
     Rc::as_ptr(s) as u64 >> 4
 }
 
-/// `/proc/net/dev`：宿主接口的列表，流量计数都是 0。
-fn net_dev() -> String {
+/// `/proc/net/dev`：宿主的接口，计数是 guest 自己收发的流量（[`crate::traffic`]），格式与
+/// Linux 的 `dev_seq_printf_stats` 相同。
+fn net_dev(k: &Kernel) -> String {
     let mut s = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
          face |bytes    packets errs drop fifo frame compressed multicast|\
          bytes    packets errs drop fifo colls carrier compressed\n",
     );
     for i in appine_hal::net::interfaces() {
-        writeln!(s, "{:>6}: {}", i.name, ["0"; 16].join(" ")).unwrap();
+        let st = k.traffic.get(&i.name);
+        writeln!(
+            s,
+            "{:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} \
+             {:>5} {:>7} {:>10}",
+            i.name,
+            st.rx_bytes,
+            st.rx_packets,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            st.tx_bytes,
+            st.tx_packets,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        )
+        .unwrap();
     }
     s
 }
@@ -1930,7 +2031,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             self::Global::Mounts => return Err(Errno::EINVAL),
         },
         Static(path) => match &path[..] {
-            b"net/dev" => net_dev(),
+            b"net/dev" => net_dev(ps.k),
             b"net/if_inet6" => net_if_inet6(),
             b"net/tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Tcp),
             b"net/tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Tcp),
@@ -2055,10 +2156,57 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             _ => return Err(Errno::EISDIR),
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
+        SysNet(n, path) => net_file(ps.k, *n, path)?,
         Cgroup(name) => crate::cgroup::file(ps.k, name).ok_or(Errno::EISDIR)?,
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())
+}
+
+/// 宿主编号为 `index` 的接口。
+fn interface(index: u32) -> Option<appine_hal::net::Interface> {
+    appine_hal::net::interfaces()
+        .into_iter()
+        .find(|i| i.index == index)
+}
+
+/// `/sys/class/net/<接口>` 下的文件。接口的类型与 netlink 的回答一样只分回环和以太网；
+/// `flags` 与 Linux 一样是 `dev->flags`，不含 `IFF_RUNNING` 这些按状态算出来的位。
+fn net_file(k: &Kernel, index: u32, path: &[u8]) -> Result<String, Errno> {
+    const IFF_UP: u32 = 0x1;
+    const IFF_LOOPBACK: u32 = 0x8;
+    const IFF_RUNNING: u32 = 0x40;
+    // IFF_RUNNING、IFF_LOWER_UP、IFF_DORMANT、IFF_ECHO（dev_get_flags 才加上它们）
+    const STATE_FLAGS: u32 = 0x40 | 0x1_0000 | 0x2_0000 | 0x4_0000;
+    // 接口没了：Linux 上目录随之消失，已经打开的文件读出 ENODEV
+    let i = interface(index).ok_or(Errno::ENODEV)?;
+    let loopback = i.flags & IFF_LOOPBACK != 0;
+    let mac = |m: [u8; 6]| {
+        let hex: Vec<String> = m.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{}\n", hex.join(":"))
+    };
+    let st = k.traffic.get(&i.name);
+    Ok(match path {
+        b"addr_len" => "6\n".to_owned(),
+        b"address" => mac(i.mac.unwrap_or([0; 6])),
+        b"broadcast" => mac(if loopback { [0; 6] } else { [0xff; 6] }),
+        // Linux 上停用的接口读 carrier 是 EINVAL
+        b"carrier" if i.flags & IFF_UP == 0 => return Err(Errno::EINVAL),
+        b"carrier" => format!("{}\n", u8::from(i.flags & IFF_RUNNING != 0)),
+        b"flags" => format!("{:#x}\n", i.flags & !STATE_FLAGS),
+        b"ifindex" | b"iflink" => format!("{index}\n"),
+        b"mtu" => format!("{}\n", i.mtu),
+        b"operstate" if loopback => "unknown\n".to_owned(),
+        b"operstate" if i.flags & IFF_UP != 0 && i.flags & IFF_RUNNING != 0 => "up\n".to_owned(),
+        b"operstate" => "down\n".to_owned(),
+        b"type" => format!("{}\n", if loopback { 772 } else { 1 }),
+        b"statistics/rx_bytes" => format!("{}\n", st.rx_bytes),
+        b"statistics/rx_packets" => format!("{}\n", st.rx_packets),
+        b"statistics/tx_bytes" => format!("{}\n", st.tx_bytes),
+        b"statistics/tx_packets" => format!("{}\n", st.tx_packets),
+        p if p.starts_with(b"statistics/") && !p.ends_with(b"/") => "0\n".to_owned(),
+        _ => return Err(Errno::EISDIR),
+    })
 }
 
 /// `/sys/devices/system/cpu/cpu<n>` 下的文件。CPU 都一样（`/proc/cpuinfo` 也是），各自是
