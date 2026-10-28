@@ -1,6 +1,6 @@
 # M9 之前：FICLONE 返回 EOPNOTSUPP（2026-10-28）
 
-← [M9 之前：目录和文件的时间戳（2026-10-28）](73-timestamps.md) · [索引](../milestones.md)
+← [M9 之前：目录和文件的时间戳（2026-10-28）](73-timestamps.md) · [索引](../milestones.md) · [M9 之前：PTY 的 TCFLSH 和 TCXONC（2026-10-28）](75-pty-flow.md) →
 
 [第二轮普查](70-survey-suites.md)的问题 6：FICLONE 返回 ENOTTY。Python 3.14 的 `pathlib.Path.copy()` 先用 FICLONE 试 reflink，只在 EBADF、EOPNOTSUPP、ETXTBSY、EXDEV 时退回普通的复制，遇到 ENOTTY 就报错，所以 appine 上它复制任何文件都失败（test_pathlib 的 28 个错误）。
 

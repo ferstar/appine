@@ -403,25 +403,54 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TCFLSH => {
+            let (input, output) = match arg {
+                0 => (true, false),
+                1 => (false, true),
+                2 => (true, true),
+                _ => return Err(Errno::EINVAL),
+            };
+            // 主设备和从设备是一对 tty，主设备的输入就是从设备的输出。主设备的 TCOFLUSH 在
+            // Linux 上只清掉还没交给从设备行规程的数据（pty_flush_buffer），这里写进来就
+            // 交给了，没有可清的
             let mut t = tty.borrow_mut();
-            match arg {
-                0 => t.flush_input(),
-                1 => t.flush_output(),
-                2 => {
-                    t.flush_input();
+            if master {
+                if input {
                     t.flush_output();
                 }
-                _ => return Err(Errno::EINVAL),
+            } else {
+                if input {
+                    t.flush_input();
+                }
+                if output {
+                    t.flush_output();
+                }
             }
             request_wake_object(wake::of(tty));
             Ok(0)
         }
         TCXONC => {
-            match arg {
-                0 => tty.borrow_mut().stopped = true,
-                1 => tty.borrow_mut().stopped = false,
-                2 | 3 => {}
-                _ => return Err(Errno::EINVAL),
+            let mut signals = Vec::new();
+            {
+                let mut t = tty.borrow_mut();
+                match (arg, master) {
+                    (0, false) => t.stop_output(),
+                    (1, false) => t.start_output(),
+                    (0, true) => t.master_stopped = true,
+                    (1, true) => t.master_stopped = false,
+                    // TCIOFF、TCION：发 STOP、START 字符（禁用的不发）。主设备发的是从设备的输入
+                    (2 | 3, _) => {
+                        let c = t.termios.cc[if arg == 2 { cc::VSTOP } else { cc::VSTART }];
+                        if c != 0 && master {
+                            signals = t.write_input(&[c]);
+                        } else if c != 0 {
+                            t.send_xchar(c);
+                        }
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
+            for sig in signals {
+                signal_fg(cx.kr(), tty, sig);
             }
             request_wake_object(wake::of(tty));
             Ok(0)

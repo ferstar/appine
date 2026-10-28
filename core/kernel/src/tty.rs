@@ -237,8 +237,15 @@ pub struct Tty {
     output: VecDeque<u8>,
     /// 下一个字符按字面输入（LNEXT）。
     lnext: bool,
-    /// 输出被 ^S 停止。
-    pub stopped: bool,
+    /// 从设备的输出被停住（^S 或 TCOOFF，Linux 的 `flow.stopped`）时，停住之前写出的、
+    /// 主设备照样能读走的字节数。停住期间从设备的写阻塞；之后的回显留到恢复时才给主设备
+    /// （Linux 把它们留在回显缓冲区里）。
+    held_from: Option<usize>,
+    /// 输出是被 TCOOFF 停住的：^Q 恢复不了，要 TCOON（Linux 的 `flow.tco_stopped`）。
+    tco_stopped: bool,
+    /// 主设备的输出被 TCOOFF 停住：主设备的写等到 TCOON。主设备的 termios 没有 IXON，
+    /// 只有 TCXONC 能停住它。
+    pub master_stopped: bool,
     /// 以它为控制终端的会话。
     pub session: Option<Tid>,
     /// 前台进程组。
@@ -270,7 +277,9 @@ impl Tty {
             raw: VecDeque::new(),
             output: VecDeque::new(),
             lnext: false,
-            stopped: false,
+            held_from: None,
+            tco_stopped: false,
+            master_stopped: false,
             session: None,
             fg: None,
             masters: 0,
@@ -293,6 +302,9 @@ impl Tty {
     /// 输入队列还能接收多少字节（主设备的写入据此阻塞）。规范模式下这一行已经写满时
     /// 仍然接收：多出来的字符被丢弃，只有行结束符有效，避免永远等不到换行。
     pub fn input_room(&self) -> usize {
+        if self.master_stopped {
+            return 0;
+        }
         let room = INPUT_MAX.saturating_sub(self.pending_input());
         if room == 0 && self.canonical() && self.lines.is_empty() {
             1
@@ -352,23 +364,73 @@ impl Tty {
         self.output.len()
     }
 
-    /// 输出队列还能接收多少字节。
+    /// 输出队列还能接收多少字节：输出被停住时不接收（Linux 的 `pty_write_room`）。
     pub fn output_room(&self) -> usize {
+        if self.held_from.is_some() {
+            return 0;
+        }
         OUTPUT_MAX.saturating_sub(self.output.len())
     }
 
-    /// 主设备的一次读：取走输出（被 ^S 停止时没有）。
+    /// 主设备现在能读走的字节数（[`Tty::held_from`]）。
+    fn visible(&self) -> usize {
+        self.held_from
+            .map_or(self.output.len(), |v| v.min(self.output.len()))
+    }
+
+    /// 主设备的一次读：取走输出。
     pub fn take_output(&mut self, max: usize) -> Vec<u8> {
-        if self.stopped {
-            return Vec::new();
+        let n = max.min(self.visible());
+        if let Some(v) = self.held_from.as_mut() {
+            *v = (*v).min(self.output.len()) - n;
         }
-        let n = max.min(self.output.len());
         self.output.drain(..n).collect()
     }
 
     /// 主设备有没有可读的输出。
     pub fn has_output(&self) -> bool {
-        !self.stopped && !self.output.is_empty()
+        self.visible() > 0
+    }
+
+    /// 停住从设备的输出（^S）。
+    fn stop(&mut self) {
+        if self.held_from.is_none() {
+            self.held_from = Some(self.output.len());
+        }
+    }
+
+    /// 恢复从设备的输出（^Q、IXANY、产生信号时，Linux 的 `start_tty`）：TCOOFF 停住的不管。
+    fn start(&mut self) {
+        if !self.tco_stopped {
+            self.held_from = None;
+        }
+    }
+
+    /// 从设备上的 TCOOFF。
+    pub fn stop_output(&mut self) {
+        if !self.tco_stopped {
+            self.tco_stopped = true;
+            self.stop();
+        }
+    }
+
+    /// 从设备上的 TCOON：^S 停住的也一起恢复。
+    pub fn start_output(&mut self) {
+        if self.tco_stopped {
+            self.tco_stopped = false;
+            self.held_from = None;
+        }
+    }
+
+    /// 从设备上的 TCIOFF、TCION：把 STOP、START 字符发给主设备，不受输出停住的限制，
+    /// 排在暂存的回显前面（Linux 的 `tty_send_xchar`）。
+    pub fn send_xchar(&mut self, c: u8) {
+        let at = self.visible();
+        self.output.insert(at, c);
+        if let Some(v) = self.held_from.as_mut() {
+            *v = at + 1;
+        }
+        self.arrivals[1] += 1;
     }
 
     /// 清空输入队列（TCIFLUSH、产生信号时）。
@@ -382,6 +444,9 @@ impl Tty {
     /// 清空输出队列（TCOFLUSH）。
     pub fn flush_output(&mut self) {
         self.output.clear();
+        if let Some(v) = self.held_from.as_mut() {
+            *v = 0;
+        }
     }
 
     /// 修改 termios。规范模式开关时，在两种队列之间搬运已有的输入。
@@ -508,15 +573,15 @@ impl Tty {
         }
         if t.i(IXON) {
             if t.is(c, VSTOP) {
-                self.stopped = true;
+                self.stop();
                 return None;
             }
             if t.is(c, VSTART) {
-                self.stopped = false;
+                self.start();
                 return None;
             }
             if t.i(IXANY) {
-                self.stopped = false;
+                self.start();
             }
         }
         if t.l(ISIG) {
@@ -532,9 +597,11 @@ impl Tty {
             if let Some(sig) = sig {
                 if !t.l(NOFLSH) {
                     self.flush_input();
-                    self.output.clear();
+                    self.flush_output();
                 }
-                self.stopped = false;
+                if t.i(IXON) {
+                    self.start();
+                }
                 self.echo(c);
                 return Some(sig);
             }
@@ -738,6 +805,30 @@ mod tests {
         assert!(!t.has_output() && t.take_output(16).is_empty());
         t.write_input(b"\x11");
         assert_eq!(t.take_output(16), b"x");
+    }
+
+    #[test]
+    fn stopped_output_blocks_the_slave_but_keeps_what_was_written() {
+        let mut t = Tty::new(0);
+        t.write_output(b"ab");
+        t.write_input(b"\x13");
+        // 停住之前写出的照样能读，从设备不能再写，之后的回显留到恢复
+        assert_eq!(t.output_room(), 0);
+        assert_eq!(t.take_output(1), b"a");
+        t.write_input(b"x");
+        assert_eq!(t.take_output(16), b"b");
+        assert!(!t.has_output());
+        t.write_input(b"\x11");
+        assert!(t.output_room() > 0);
+        assert_eq!(t.take_output(16), b"x");
+        // TCOOFF 停住的 ^Q 恢复不了，要 TCOON；TCIOFF 发的字符不受停住的限制
+        t.stop_output();
+        t.write_input(b"\x11");
+        assert_eq!(t.output_room(), 0);
+        t.send_xchar(0x13);
+        assert_eq!(t.take_output(16), b"\x13");
+        t.start_output();
+        assert!(t.output_room() > 0);
     }
 
     #[test]

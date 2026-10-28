@@ -1799,3 +1799,52 @@ int main(void)
 }
 C
 gcc -O1 -o si si.c && ./si
+
+# PTY 的 TCFLSH、TCXONC：主设备上 TCOFLUSH 不清从设备写出的数据、TCIFLUSH 清；TCOOFF 让
+# 这一端的写阻塞到 TCOON（^Q 恢复不了），停住之前写出的照样能读；TCIOFF 发 STOP 字符
+python3 - <<'PY'
+import os, select, termios, threading
+m, s = os.openpty()
+attrs = termios.tcgetattr(s)
+attrs[3] &= ~termios.ECHO
+termios.tcsetattr(s, termios.TCSANOW, attrs)
+def readable(fd):
+    return bool(select.select([fd], [], [], 0.2)[0])
+def writable(fd):
+    return bool(select.select([], [fd], [], 0)[1])
+def blocked_write(fd, data):
+    done = threading.Event()
+    threading.Thread(target=lambda: (os.write(fd, data), done.set())).start()
+    return done
+os.write(s, b"abcdef")
+print("pty read", os.read(m, 2))
+termios.tcflush(m, termios.TCOFLUSH)
+print("pty after master TCOFLUSH", os.read(m, 2))
+termios.tcflush(m, termios.TCIFLUSH)
+print("pty after master TCIFLUSH readable", readable(m))
+os.write(s, b"ABC")
+print("pty read", os.read(m, 1024))
+os.write(m, b"xy\n")
+termios.tcflush(s, termios.TCIFLUSH)
+print("pty after slave TCIFLUSH readable", readable(s))
+termios.tcflow(s, termios.TCOOFF)
+print("pty slave writable while stopped", writable(s))
+done = blocked_write(s, b"def")
+print("pty slave write blocked", not done.wait(0.3))
+os.write(m, b"\x11")
+print("pty still blocked after ^Q", not done.wait(0.3))
+termios.tcflow(s, termios.TCOON)
+print("pty resumed", done.wait(2), os.read(m, 1024))
+os.write(s, b"before")
+os.write(m, b"\x13")
+print("pty written before ^S", os.read(m, 16), "slave writable", writable(s))
+os.write(m, b"\x11")
+termios.tcflow(s, termios.TCIOFF)
+termios.tcflow(s, termios.TCION)
+print("pty xchars", os.read(m, 16))
+termios.tcflow(m, termios.TCOOFF)
+done = blocked_write(m, b"z\n")
+print("pty master write blocked", not done.wait(0.3))
+termios.tcflow(m, termios.TCOON)
+print("pty master resumed", done.wait(2), os.read(s, 16))
+PY
