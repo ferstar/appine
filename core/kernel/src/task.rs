@@ -384,7 +384,8 @@ pub(crate) mod pool {
 type Current = (Weak<Task>, Weak<RefCell<ThreadGroup>>);
 
 thread_local! {
-    /// 这个宿主线程正在执行的 guest 线程和它的线程组（[`current`]）。
+    /// 这个宿主线程正在执行的 guest 线程和它的线程组（[`current`]）。只在持有 BKL 时
+    /// 设置和清掉（[`exit`]）。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
     static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
 }
@@ -401,7 +402,7 @@ pub(crate) fn current() -> Option<(Rc<Task>, Rc<RefCell<ThreadGroup>>)> {
 
 fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu, reused)));
-    CURRENT.set(None);
+    // CURRENT 已经由 exit 在持有 BKL 时清掉了
     if r.is_err() {
         // 内核层的 bug，而且不在兜住的地方（crate::bug）：线程找不到自己，或者出错之后的
         // 收拾本身又出了错。BKL 保护的状态可能已经不一致，不能让其他线程继续
@@ -800,6 +801,10 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     // 子进程的状态变化由 finish_group 另外请求（wake::CHILD），vfork 的父进程由
     // release_mm 叫醒，关闭文件的各自请求；这里只叫醒等线程结束的（execve、关闭）
     request_wake_on(wake::EXITED);
+    // 线程局部变量里的两个弱引用也要在持有 BKL 时丢掉：Rc 的计数不是原子的，放开之后再丢，
+    // 会和同时持有 BKL 的线程（同一个进程里刚开始的线程做 Rc::downgrade）一起改同一个
+    // 计数，改丢了就提前释放，之后的访问都落在释放掉的内存上
+    CURRENT.set(None);
 }
 
 fn add_stats(total: &mut DbtStats, s: &DbtStats) {

@@ -193,6 +193,30 @@ fn threads_signals_and_fork() {
 }
 
 #[test]
+fn thread_churn_keeps_the_host_heap_intact() {
+    // 4 个进程各用 4 个线程不停地创建、join 短命的线程 5 秒：线程退出时在 BKL 外丢掉
+    // Rc 的弱引用会破坏宿主的堆，appine 以 SIGABRT 退出（tests/guest/churn.c）
+    let Some(program) = build_c_guest("churn") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .arg("5")
+            .output()
+            .expect("failed to run appine-run");
+        assert!(
+            out.status.success() && stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {:?} {}{}",
+            out.status,
+            stdout(&out),
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn sockets_polling_and_timers() {
     // AF_UNIX（socketpair、SCM_RIGHTS、SO_PEERCRED、抽象地址）、TCP/UDP 回环、netlink、
     // epoll/eventfd/select、setitimer；都不需要外网

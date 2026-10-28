@@ -79,6 +79,7 @@
 | [M9 之前：/proc/meminfo 照搬宿主的](rounds/68-meminfo.md) | 2026-10-28 | `/proc/meminfo` 和 sysinfo 照搬宿主的各项，`MemAvailable` 算上页缓存：free、htop 不再显示内存几乎用完（可用 650 MB → 3.3 GB，与原生相同） |
 | [M9 之前：glibc 发行版的探测](rounds/69-glibc-probe.md) | 2026-10-28 | Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库：apt、gcc、gdb、numpy/pandas 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server（浏览器连上去）都能用，内核层不用改；从 Alpine chroot 进去缺 `/proc` 等（没有 mount），mount 的子集先不做 |
 | [M9 之前：第二轮普查，语言的测试集和大项目](rounds/70-survey-suites.md) | 2026-10-28 | CPython、PHP、Ruby、Node.js、Go 的测试集和 ripgrep、Laravel、Rails，与原生用同一个仓库对照：Laravel、Rails 正常；找到 6 个问题：线程频繁起停时宿主的堆被破坏（Node、Go、ripgrep 的测试都让 appine 崩溃）、目录的 mtime 和文件的 ctime 不更新（Python 新建的模块 import 不到）、FIFO 的 poll、PTY 的 TCFLSH 方向、每个进程多占约 12 MB、FICLONE 的错误码 |
+| [M9 之前：线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md) | 2026-10-28 | 线程退出时在持有 BKL 时丢掉线程局部变量里 `ThreadGroup` 的弱引用（原来放开之后才丢，非原子的 Rc 计数和同一进程里刚开始的线程一起改，计数丢失后提前释放，宿主的堆被破坏）：4 个进程不停地起停线程，原来 10 秒内崩溃，现在 60 秒正常；Ruby 的测试 `-j4` 跑完了（[signalfd 看调用的线程](rounds/52-signalfd-caller.md)那一轮起的 bug） |
 
 ## 测量条件
 
@@ -98,12 +99,12 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | 测试 | 原因 |
 |---|---|
 | shmctl01 | 全量并发时子进程还没 `shmdt` 完就超时，单独运行多数通过；[多进程并行](rounds/36-parallel-processes.md)那一轮用 HEAD 的二进制单独跑 8 次也失败 3 次，写时复制之前的二进制并发跑 shm 子集也会失败 |
-| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01_64 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样 |
+| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败 |
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | futex_wake05 | [稳定性和内存](rounds/12-stability-memory.md)那一轮记为以前就时好时坏，原因没查 |
 | times03 | [翻译后代码里的访存](rounds/30-translated-access.md)那一轮看到一次进程的用户态 CPU 时间倒退了一个滴答（111 → 110），单独重跑 3 次都通过，之后没再出现，原因没查 |
-| exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查 |
+| exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |
 | mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题 |
 
 cargo test 里 `ctrl_c_and_ctrl_z_control_the_foreground_job`（Tier 1）卡住过一次：作业停着、shell 在等输入，测试在等它退出（[起进程的宿主开销](rounds/28-spawn-host-cost.md)）。之后重放几十次都没再出现，原因没查明。
