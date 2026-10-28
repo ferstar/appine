@@ -1845,7 +1845,11 @@ print("pty written before ^S", os.read(m, 16), "slave writable", writable(s))
 os.write(m, b"\x11")
 termios.tcflow(s, termios.TCIOFF)
 termios.tcflow(s, termios.TCION)
-print("pty xchars", os.read(m, 16))
+# 两次 tcflow 各写一个字符，Linux 经由 flip buffer 异步交给主设备，一次读可能只读到第一个
+xchars = os.read(m, 16)
+while len(xchars) < 2 and readable(m):
+    xchars += os.read(m, 16)
+print("pty xchars", xchars)
 termios.tcflow(m, termios.TCOOFF)
 done = blocked_write(m, b"z\n")
 print("pty master write blocked", not done.wait(0.3))
