@@ -2,12 +2,20 @@
 # 负载普查（docs/rounds/62-workload-survey.md）：在 appine 里跑常见的服务和工具，收集
 # 失败和内核层的日志。在有 docker 的宿主上运行：
 #
-#   scripts/survey [-t 执行层] [-s 仓库目录] [负载名……]
+#   scripts/survey [-t 执行层] [-s 仓库目录] [-n 镜像] [负载名……]
 #
-# 负载是 tests/survey/<名字>.sh，拷进仓库里由 guest 的 /bin/sh 运行（stdin 是 /dev/null），
-# 带 APPINE_LOG=1。stdout 写到 target/survey/<名字>.out，stderr（含内核层的日志）写到
-# <名字>.err；最后每个负载一行：退出码、用时和未实现的 syscall。输出要人看：脚本只打印
-# 结果，不和原生比对。不带名字时跑全部。
+# 负载是 tests/survey/<名字>.sh（名字可以带子目录），拷进仓库里由 guest 的 /bin/sh 运行
+# （stdin 是 /dev/null），带 APPINE_LOG=1。stdout 写到 target/survey/<名字>.out，stderr
+# （含内核层的日志）写到 <名字>.err；最后每个负载一行：退出码、用时和未实现的 syscall。
+# 输出要人看：脚本只打印结果，不和原生比对。不带名字时跑 tests/survey/ 下的全部。每个
+# 负载最多跑 SURVEY_TIMEOUT 秒（默认 1500）。
+#
+# -n 镜像：在这个 docker 镜像里原生运行同样的负载作为对照，输出写到 <名字>.native.out、
+# .native.err。镜像可以由仓库导出（docs/rounds/70-survey-suites.md）：
+#
+#   appine-run --rootfs <仓库> --no-pty -- /bin/tar -C / -cf - --exclude ./proc \
+#       --exclude ./sys --exclude ./dev --exclude ./tmp . > store.tar
+#   docker import --platform linux/arm64 store.tar <镜像>
 #
 # 仓库默认是 target/survey/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
 # 再用 apk 安装要的软件包，这一步要联网（沿用宿主或 docker 的代理），约 1 GB。
@@ -21,18 +29,44 @@ packages="openssh-server openssh-client tmux postgresql18 postgresql18-client po
     redis valkey valkey-cli mariadb mariadb-client cargo rust gcc musl-dev dotnet10-sdk php85
     ruby nginx curl neovim htop btop fish zsh rsync git git-daemon mosh zig python3 py3-pip socat"
 
-while getopts t:s: opt; do
+native=""
+while getopts t:s:n: opt; do
     case $opt in
     t) tier=$OPTARG ;;
     s) store=$OPTARG ;;
+    n) native=$OPTARG ;;
     *) exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
 
+limit=${SURVEY_TIMEOUT:-1500}
+out=target/survey
+if [ -n "$native" ]; then
+    # 原生对照：在宿主上直接用 docker，代理沿用 docker daemon 的（与 scripts/dev 相同）
+    IFS='|' read -r http https <<EOF
+$(docker info --format '{{.HTTPProxy}}|{{.HTTPSProxy}}' 2>/dev/null || true)
+EOF
+    [ $# -gt 0 ] || set -- $(cd tests/survey && ls *.sh | sed 's/\.sh$//')
+    for name in "$@"; do
+        mkdir -p "$(dirname "$out/$name")"
+        start=$(date +%s)
+        set +e
+        docker run --rm -i --platform linux/arm64 --ulimit nice=40:40 \
+            -e http_proxy="$http" -e https_proxy="$https" -e no_proxy=127.0.0.1,localhost \
+            -e PATH=/usr/sbin:/usr/bin:/sbin:/bin -e HOME=/root -e TERM=xterm "$native" \
+            timeout "$limit" /bin/sh -c 'mkdir -p /tmp && chmod 1777 /tmp && cat > /tmp/survey.sh && exec sh /tmp/survey.sh </dev/null' \
+            <"tests/survey/$name.sh" >"$out/$name.native.out" 2>"$out/$name.native.err"
+        code=$?
+        set -e
+        printf '%-10s exit %-3s %4ss  (native)\n' "$name" "$code" "$(($(date +%s) - start))"
+    done
+    exit 0
+fi
+
 # 在 Linux arm64 上直接运行，别的宿主上整个脚本经由 scripts/dev 重新运行
 if [ "$(uname -sm)" != "Linux aarch64" ]; then
-    exec scripts/dev scripts/survey -t "$tier" -s "$store" "$@"
+    exec scripts/dev env SURVEY_TIMEOUT="$limit" scripts/survey -t "$tier" -s "$store" "$@"
 fi
 run=${APPINE_RUN:-target/linux-arm64/release/appine-run}
 [ -x "$run" ] || run=target/release/appine-run
@@ -56,7 +90,6 @@ if [ ! -d "$store" ]; then
         -- /bin/sh -c "apk add -q $(echo $packages)"
 fi
 
-out=target/survey
 mkdir -p "$out"
 if [ $# -eq 0 ]; then
     set -- $(cd tests/survey && ls *.sh | sed 's/\.sh$//')
@@ -66,7 +99,7 @@ for name in "$@"; do
     start=$(date +%s)
     set +e
     # shellcheck disable=SC2046
-    APPINE_LOG=1 timeout 1500 "$run" --tier "$tier" --rootfs "$store" \
+    APPINE_LOG=1 timeout "$limit" "$run" --tier "$tier" --rootfs "$store" \
         --env PATH=/usr/sbin:/usr/bin:/sbin:/bin --env HOME=/root --env TERM=xterm $(proxy) \
         -- /bin/sh -c 'cat > /tmp/survey.sh && exec sh /tmp/survey.sh </dev/null' \
         <"tests/survey/$name.sh" >"$out/$name.out" 2>"$out/$name.err"

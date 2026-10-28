@@ -78,6 +78,7 @@
 | [M9 之前：cgroup 的 memory.stat](rounds/67-memory-stat.md) | 2026-10-28 | 按 Linux 6.1 的格式补上 `memory.stat`：.NET 的 GC 改按整个 App 的用量（`memory.current` 减去 `inactive_file`）算内存负载，别的 guest 进程用的内存也算进去（原来只看自己的 RSS） |
 | [M9 之前：/proc/meminfo 照搬宿主的](rounds/68-meminfo.md) | 2026-10-28 | `/proc/meminfo` 和 sysinfo 照搬宿主的各项，`MemAvailable` 算上页缓存：free、htop 不再显示内存几乎用完（可用 650 MB → 3.3 GB，与原生相同） |
 | [M9 之前：glibc 发行版的探测](rounds/69-glibc-probe.md) | 2026-10-28 | Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库：apt、gcc、gdb、numpy/pandas 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server（浏览器连上去）都能用，内核层不用改；从 Alpine chroot 进去缺 `/proc` 等（没有 mount），mount 的子集先不做 |
+| [M9 之前：第二轮普查，语言的测试集和大项目](rounds/70-survey-suites.md) | 2026-10-28 | CPython、PHP、Ruby、Node.js、Go 的测试集和 ripgrep、Laravel、Rails，与原生用同一个仓库对照：Laravel、Rails 正常；找到 6 个问题：线程频繁起停时宿主的堆被破坏（Node、Go、ripgrep 的测试都让 appine 崩溃）、目录的 mtime 和文件的 ctime 不更新（Python 新建的模块 import 不到）、FIFO 的 poll、PTY 的 TCFLSH 方向、每个进程多占约 12 MB、FICLONE 的错误码 |
 
 ## 测量条件
 

@@ -34,4 +34,4 @@
 
 - 只在 colima 的虚拟机里跑，没上手机：Android 上 App 的 sshd 能不能被别的设备连上、SELinux 下宿主的哪些文件读得到，仍待真机确认（R1、M5 起的推迟项）。
 - 普查的输出不和原生自动比对，也不进 CI（要联网安装约 1 GB 软件包）。
-- 没跑的：docker/podman、systemd（D 档）、图形界面，以及 PHP、Ruby、Rust 的大型项目和语言自带的测试集。
+- 没跑的：docker/podman、systemd（D 档）、图形界面，以及 PHP、Ruby、Rust 的大型项目和语言自带的测试集。→ 大型项目和测试集已经跑了（M9 之前：第二轮普查，语言的测试集和大项目）；docker/podman、systemd、图形界面仍没有
