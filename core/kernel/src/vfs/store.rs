@@ -170,6 +170,9 @@ pub struct Store {
     snapshot_at: Cell<Option<Option<u64>>>,
     /// 推迟提交的写事务开始的时刻；None 时没有打开的写事务。
     pending: Cell<Option<Instant>>,
+    /// 写事务最多推迟多久（[`COMMIT_DELAY`]）。测试里加长：调试构建在慢的机器上一次操作
+    /// 就可能超过 5 毫秒，当场提交了，看不到推迟的状态。
+    delay: Duration,
     /// 最后一个链接已经删除、等写事务提交之后再删除的 object。
     doomed: RefCell<Vec<Ino>>,
     /// 开始推迟提交时调用：叫醒到点提交的线程（[`Store::commit_due`]）。
@@ -704,6 +707,7 @@ impl Store {
             writing: Cell::new(false),
             snapshot_at: Cell::new(None),
             pending: Cell::new(None),
+            delay: COMMIT_DELAY,
             doomed: RefCell::default(),
             waker: RefCell::new(None),
             fills: RefCell::default(),
@@ -777,7 +781,7 @@ impl Store {
         let overdue = self
             .pending
             .get()
-            .is_some_and(|t| t.elapsed() >= COMMIT_DELAY);
+            .is_some_and(|t| t.elapsed() >= self.delay);
         if overdue || !self.defers() {
             self.commit()?;
         }
@@ -796,7 +800,7 @@ impl Store {
 
     /// 到点了就提交推迟的写事务；还没到点时返回该提交的时刻。
     pub fn commit_due(&self) -> Option<Instant> {
-        let due = self.pending.get()? + COMMIT_DELAY;
+        let due = self.pending.get()? + self.delay;
         if Instant::now() < due {
             return Some(due);
         }
@@ -1898,7 +1902,10 @@ mod tests {
     fn temp_store(name: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("appine-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        (Store::create(&dir).unwrap(), dir)
+        let mut s = Store::create(&dir).unwrap();
+        // 推迟的写事务只在测试自己提交时才提交，与机器快慢无关
+        s.delay = Duration::from_secs(3600);
+        (s, dir)
     }
 
     #[test]
