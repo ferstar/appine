@@ -1,7 +1,6 @@
 //! guest 进程（线程组）（设计文档 §6）。宿主启动的进程都是内置 init（pid 1）的子进程
 //! （[`crate::Machine`]）。
 
-use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -9,6 +8,7 @@ use std::rc::Rc;
 
 use appine_engine::DbtStats;
 
+use crate::cell::RefCell;
 use crate::cred::{Cred, MAY_EXEC};
 use crate::errno::Errno;
 use crate::kernel::{INIT, Kernel, Tid, request_wake_on, wake};

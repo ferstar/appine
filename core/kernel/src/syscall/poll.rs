@@ -31,12 +31,13 @@
 //! 等待时登记关注的进程内对象（[`wake_objects`]）：只影响别的对象的修改（另一个管道的
 //! 读写、别的 eventfd、别的 AF_UNIX 连接……）不叫醒它（§6）。
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{SysResult, get, read_timespec, tty};
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, HostEdges, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use appine_engine::prot;
 use appine_hal::Event;
 
+use crate::kernel::Shared;
 use crate::mm::Mm;
 use crate::uaccess::UserSlice;
 
@@ -92,6 +93,59 @@ impl Futexes {
             moved += 1;
         }
         woken + moved
+    }
+}
+
+/// 登记在队列里的等待者（[`Futexes::enqueue`]），等完了用 [`Enqueued::leave`] 离开。中途
+/// panic（内核层的 bug，[`crate::bug`]）时析构把还在队列里的移除：留下的条目没有人等，之后
+/// 的一次 FUTEX_WAKE 会算在它身上，真正的等待者就叫不醒了；键是宿主地址时，那段内存以后
+/// 还可能分给别的进程。
+pub(crate) struct Enqueued<'s, I: AsRef<[u64]>> {
+    shared: &'s Shared,
+    ids: I,
+    left: bool,
+}
+
+impl<'s, I: AsRef<[u64]>> Enqueued<'s, I> {
+    pub fn new(shared: &'s Shared, ids: I) -> Self {
+        Enqueued {
+            shared,
+            ids,
+            left: false,
+        }
+    }
+
+    /// 登记的编号。
+    pub fn ids(&self) -> &[u64] {
+        self.ids.as_ref()
+    }
+
+    /// 离开队列：在同一次持锁里移除还在队列里的，返回第一个已经不在队列里（被唤醒了）的
+    /// 下标。被唤醒与超时、被信号打断同时发生时算唤醒，与 Linux 的 `futex_unqueue` 一样，
+    /// 这次唤醒不会丢。
+    pub fn leave(mut self) -> Option<usize> {
+        self.left = true;
+        let mut futexes = self.shared.futexes();
+        let mut woken = None;
+        for (i, &id) in self.ids.as_ref().iter().enumerate() {
+            if futexes.is_queued(id) {
+                futexes.remove(id);
+            } else if woken.is_none() {
+                woken = Some(i);
+            }
+        }
+        woken
+    }
+}
+
+impl<I: AsRef<[u64]>> Drop for Enqueued<'_, I> {
+    fn drop(&mut self) {
+        if !self.left {
+            let mut futexes = self.shared.futexes();
+            for &id in self.ids.as_ref() {
+                futexes.remove(id);
+            }
+        }
     }
 }
 

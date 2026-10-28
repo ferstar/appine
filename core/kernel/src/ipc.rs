@@ -536,7 +536,7 @@ impl Ipc {
 
 /// 共享内存段被 shmat 的次数：数所有地址空间里的映射（每个地址空间只数一次）。
 pub(crate) fn nattch(k: &Kernel, id: i32) -> u64 {
-    let mut seen: Vec<*const std::cell::RefCell<crate::mm::Mm>> = Vec::new();
+    let mut seen: Vec<*const crate::cell::RefCell<crate::mm::Mm>> = Vec::new();
     let mut n = 0;
     for t in k.tasks.values() {
         let mm = t.res.borrow().mm.clone();

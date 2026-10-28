@@ -8,13 +8,13 @@
 //! （sigcontext 后面是 fpsimd_context，同步异常时再加 esr_context，以空记录结尾），
 //! 帧上方是 `{fp, lr}` 帧记录。syscall 重启的规则照搬 arm64 的 `do_signal`。
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use appine_engine::Cpu;
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::kernel::{Cx, Kernel, Tid, request_wake, request_wake_on, wake};
 use crate::process::{ExitStatus, RLIMIT_SIGPENDING, Signal, ThreadGroup};

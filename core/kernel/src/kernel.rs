@@ -7,7 +7,7 @@
 //! 的借用标志都不是原子的，放开 BKL 时连 clone、drop 也不行：系统调用中途放开 BKL 的
 //! 只有等待（[`Cx::wait_on`] 等）和 [`Cx::unlocked`]，后者的闭包要是 `Send`，碰不到
 //! 内核对象；这两处 panic 时也先重新拿到 BKL，展开时外层各帧丢掉的 `Rc` 才不会和别的
-//! 线程同时改计数。
+//! 线程同时改计数。放开 BKL 时也不能还借着内核对象，调试构建里由 [`crate::cell`] 检查。
 //!
 //! 等待统一走宿主 `poll()`：每个线程有一个 eventfd，等待时把它和要等的宿主 fd
 //! 放在一起 poll。任何可能让别人的等待条件成立的修改都调用 [`request_wake`]，
@@ -16,7 +16,6 @@
 //! 里等子进程的 shell 和定时器线程。futex 是例外：停在锁和条件变量上的线程很多，它们用
 //! [`Cx::wait_alone`] 等待，只被 FUTEX_WAKE、信号和结束线程组直接通知。
 
-use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
@@ -28,6 +27,7 @@ use std::time::Instant;
 use appine_engine::DbtStats;
 use appine_hal::Event;
 
+use crate::cell::{Ref, RefCell, RefMut};
 use crate::errno::Errno;
 use crate::fd::{FdTable, FileRef};
 use crate::futex::Futexes;
@@ -82,7 +82,7 @@ pub(crate) mod wake {
 
     /// `RefCell` 里的对象 `c` 的唤醒对象：里面的值的地址，与对象自己的方法里的
     /// [`of_value`] 相同。
-    pub fn of<T>(c: &std::cell::RefCell<T>) -> Object {
+    pub fn of<T>(c: &crate::cell::RefCell<T>) -> Object {
         c.as_ptr() as Object
     }
 
@@ -98,7 +98,7 @@ static WAKE: AtomicU32 = AtomicU32::new(0);
 thread_local! {
     /// 持有 BKL 时要触发的事件（[`signal_later`]）。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
-    static SIGNALS: RefCell<Vec<Arc<Event>>> = const { RefCell::new(Vec::new()) };
+    static SIGNALS: std::cell::RefCell<Vec<Arc<Event>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// 这个线程持有 BKL。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
     static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -568,6 +568,7 @@ pub(crate) fn block_for<'a>(
     objects: Option<&[wake::Object]>,
 ) -> (Bkl<'a>, Result<(), Errno>) {
     const POLLIN: i16 = 1;
+    crate::cell::assert_none_held();
     let listed = interest != 0;
     if listed {
         let objects = objects.map(|o| {
@@ -815,6 +816,7 @@ impl<'a> Cx<'a> {
     /// 释放 BKL 执行 `f`（可能阻塞的宿主 I/O）。`f` 不能访问任何内核对象：它是 `Send`，
     /// 捕获不了 `Rc`、`RefCell` 和它们的引用。
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R + Send) -> R {
+        crate::cell::assert_none_held();
         self.task.sleeping.store(true, Ordering::Relaxed);
         drop(self.k.take());
         let _relock = Relock(self);

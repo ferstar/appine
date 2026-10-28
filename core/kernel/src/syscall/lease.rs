@@ -23,7 +23,7 @@ pub(super) const F_UNLCK: i16 = 2;
 
 /// 一个租约。
 pub(crate) struct Lease {
-    file: Weak<std::cell::RefCell<OpenFile>>,
+    file: Weak<crate::cell::RefCell<OpenFile>>,
     /// 设置租约时用的 fd：`F_SETSIG` 的信号把它放在 si_fd 里。
     fd: i32,
     /// `F_RDLCK` 或 `F_WRLCK`。

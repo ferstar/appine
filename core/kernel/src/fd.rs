@@ -4,11 +4,11 @@
 //! fd 共享（dup、fork）；close-on-exec 标志属于 fd 本身。打开文件和 fd 表都
 //! 只在持有 BKL 时访问（[`crate::kernel`]）。
 
-use std::cell::RefCell;
 use std::fs::File;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::pipe::PipeEnd;
 use crate::pseudo::PseudoNode;

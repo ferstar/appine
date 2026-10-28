@@ -6,11 +6,11 @@
 //! 读写两端各自计数打开文件的个数：最后一个写端关闭后读端读到 EOF，最后一个
 //! 读端关闭后写入失败并产生 SIGPIPE。阻塞和唤醒走 [`crate::kernel`] 的统一等待机制。
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cell::RefCell;
 use crate::kernel::request_wake_object;
 use crate::vfs::store::Ino;
 

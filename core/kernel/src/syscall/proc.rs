@@ -1,11 +1,12 @@
 //! 进程与线程：clone、execve、exit、wait4，进程组和会话。
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use appine_engine::Cpu;
 
 use super::{Flow, SysResult, put, read_path};
+use crate::cell::RefCell;
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, Pidfd, oflags};

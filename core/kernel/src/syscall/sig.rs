@@ -1,10 +1,10 @@
 //! 信号类 syscall：kill 系列、sigaction、屏蔽字、sigsuspend、sigaltstack。
 
-use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use super::{SysResult, get, put, read_timespec};
+use crate::cell::RefCell;
 use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::fd::FileKind;
@@ -305,7 +305,7 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
         group: std::rc::Rc::downgrade(&cx.t.group),
     };
     let file = OpenFile::new(
-        FileKind::SignalFd(std::rc::Rc::new(std::cell::RefCell::new(s))),
+        FileKind::SignalFd(std::rc::Rc::new(crate::cell::RefCell::new(s))),
         oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
     );
     cx.fds_mut()
@@ -317,7 +317,7 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
 /// `struct signalfd_siginfo`。一个都没有时阻塞（非阻塞时 EAGAIN）。
 pub(super) fn signalfd_read(
     cx: &mut Cx<'_>,
-    s: &std::rc::Rc<std::cell::RefCell<crate::fd::SignalFd>>,
+    s: &std::rc::Rc<crate::cell::RefCell<crate::fd::SignalFd>>,
     nonblock: bool,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {

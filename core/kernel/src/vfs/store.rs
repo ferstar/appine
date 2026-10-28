@@ -26,7 +26,7 @@
 //!
 //! 缓存也可以不持 BKL 读（[`Meta`]）：并行的 lstat（`git status`、构建工具）不必排队。
 
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -39,6 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 
 /// inode 编号。

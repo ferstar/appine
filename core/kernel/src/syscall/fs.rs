@@ -4,13 +4,13 @@
 //! `read_file`/`write_file` 负责和 guest 内存之间的拷贝。宿主 fd 和管道可能阻塞，
 //! 阻塞期间释放 BKL，并且不持有任何打开文件的借用（别的线程可能在用同一个打开文件）。
 
-use std::cell::RefCell;
 use std::os::unix::fs::FileExt;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use super::SocketRef;
 use super::{IO_CHUNK, MAX_COPY, SysResult, get, inotify, put, read_path, tty};
+use crate::cell::RefCell;
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};

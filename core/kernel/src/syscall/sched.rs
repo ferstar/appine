@@ -9,10 +9,10 @@
 //! `RLIMIT_NICE` 允许或者 `CAP_SYS_NICE`，实时策略要求 `CAP_SYS_NICE`。`SCHED_DEADLINE`
 //! 的参数按 Linux 的规则检查后记录，不做带宽准入控制。
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{SysResult, get, put, write_pair};
+use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::kernel::{Cx, INIT};

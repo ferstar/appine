@@ -10,11 +10,11 @@
 //!   接收队列 → 消息 → 打开文件），程序已经够不着它们。与 Linux 的 unix_gc 一样，关闭
 //!   unix socket 和进程退出之后找出这样的 socket，清空它们的接收队列（[`collect`]）。
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
+use crate::cell::RefCell;
 use crate::fd::{FileKind, FileRef, OpenFile};
 use crate::kernel::{Kernel, request_wake_object, wake};
 use crate::net::{AF_UNIX, SOCK_DGRAM, Socket};

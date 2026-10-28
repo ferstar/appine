@@ -4,7 +4,7 @@
 //! guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL 进入内核；少数系统调用不必
 //! 取 BKL（[`crate::syscall::fast`]）。
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use appine_engine::{
 use appine_hal::Event;
 
 use crate::bug::Trap;
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake_on, wake};
@@ -130,7 +131,7 @@ pub(crate) struct Task {
     /// 单步执行了 svc：下一次单步不执行指令，原地再报告一次（[`crate::ptrace::syscall_stepped`]）。
     pub step_again: AtomicBool,
     /// 只有线程自己访问的状态。
-    pub state: RefCell<TaskState>,
+    pub state: std::cell::RefCell<TaskState>,
 }
 
 /// 线程私有的状态，以及它和其他线程共享的资源。
@@ -209,7 +210,7 @@ impl Task {
             seccomp_allow: [const { AtomicU64::new(0) }; crate::seccomp::CACHE_WORDS],
             stepping: AtomicBool::new(false),
             step_again: AtomicBool::new(false),
-            state: RefCell::new(state),
+            state: std::cell::RefCell::new(state),
         }))
     }
 
@@ -412,7 +413,7 @@ thread_local! {
     /// 这个宿主线程正在执行的 guest 线程和它的线程组（[`current`]）。只在持有 BKL 时
     /// 设置和清掉（[`exit`]）。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
-    static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
+    static CURRENT: std::cell::RefCell<Option<Current>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 调用者：这个宿主线程正在执行的 guest 线程和它的线程组。不在 guest 线程上（定时器线程、

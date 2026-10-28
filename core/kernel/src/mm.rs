@@ -27,7 +27,7 @@
 //! 页表项改指别处之前，使用这个地址空间的线程要先刷新 TLB（[`Mm::shootdown`]）；只是
 //! 恢复写权限不必。
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::mem::ManuallyDrop;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::loader::{STACK_SIZE, STACK_TOP};
 use crate::task::TaskSync;
@@ -124,7 +125,7 @@ thread_local! {
     /// 持有 BKL 时释放的宿主内存，放开 BKL 之后才交还宿主（[`release_unmapped`]）；
     /// 不持有 BKL 时是 None，当场交还。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
-    static UNMAPPED: RefCell<Option<Unmapped>> = const { RefCell::new(None) };
+    static UNMAPPED: std::cell::RefCell<Option<Unmapped>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 驻留内存的一次取样（[`Mm::rss_plan`]）。

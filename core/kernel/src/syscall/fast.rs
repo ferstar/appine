@@ -42,7 +42,7 @@ use super::fs::{
 };
 use super::{PATH_MAX, SysResult};
 use crate::errno::Errno;
-use crate::futex::Key;
+use crate::futex::{Enqueued, Key};
 use crate::kernel::{Shared, Tid};
 use crate::task::{Task, TaskState};
 use crate::vfs::store::{Ino, Stat};
@@ -296,17 +296,15 @@ fn futex(shared: &Shared, task: &Task, cpu: &Cpu, a: &[u64; 6]) -> Option<SysRes
         }
         futexes.enqueue(key, bitset, task.event.clone())
     };
+    let waiting = Enqueued::new(shared, [id]);
+    crate::bug::trap(crate::bug::Trap::FutexWait, task.tgid);
     let woke = sleep(task, deadline);
-    let mut futexes = shared.futexes();
-    if !futexes.is_queued(id) {
-        return Some(Ok(0));
-    }
-    futexes.remove(id);
-    if woke {
+    match waiting.leave() {
+        Some(_) => Some(Ok(0)),
         // 多半是来了信号：持锁的路径重新检查值、重新登记，处理信号
-        return None;
+        None if woke => None,
+        None => Some(Err(Errno::ETIMEDOUT)),
     }
-    Some(Err(Errno::ETIMEDOUT))
 }
 
 fn nanosleep(task: &Task, cpu: &Cpu, req: u64) -> Option<SysResult> {

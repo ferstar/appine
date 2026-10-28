@@ -6,9 +6,9 @@
 //! （进程退出、打开文件析构）后锁自动失效。同一个持有者的锁互不重叠，相邻的同类
 //! 锁合并，与 Linux 相同。
 
-use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+use crate::cell::RefCell;
 use crate::fd::{FdTable, FileRef, OpenFile};
 use crate::kernel::{Kernel, Tid, request_wake_locks};
 use crate::vfs::store::Ino;

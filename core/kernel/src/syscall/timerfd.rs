@@ -4,12 +4,12 @@
 //! 最早的到期时刻当作超时（[`super::poll`]）。设置绝对时间时按定时器的时钟换算。
 //! `TFD_TIMER_CANCEL_ON_SET` 接受但不起作用：guest 改不了宿主的时间。
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::misc::deadline_from_clock;
 use super::{SysResult, get, put};
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, TimerFd, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};

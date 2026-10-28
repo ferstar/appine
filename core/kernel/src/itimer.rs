@@ -15,10 +15,10 @@
 //!   `SI_TIMER` 信号（`SIGEV_THREAD_ID` 时发给指定线程）。上一个信号还没被取走时
 //!   不再发，只把超限次数（overrun）记在那个挂起的信号里。
 
-use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use crate::bug::Trap;
+use crate::cell::RefCell;
 use crate::kernel::{Kernel, Tid};
 use crate::process::{RLIMIT_CPU, Signal, ThreadGroup};
 use crate::signal::{self, InfoFields, Pending, SigInfo, code};

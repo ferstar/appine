@@ -7,12 +7,12 @@
 //!
 //! `appine-run` 用 [`bridge`] 把宿主终端接到控制台上。
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use appine_hal::Event;
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Kernel, Shared, Tid, block_for, request_wake, request_wake_object, wake};

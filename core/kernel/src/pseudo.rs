@@ -5,7 +5,6 @@
 //! 实现 [`Pseudo`]。procfs 的文件在打开时生成一份完整的内容（[`content`]），
 //! 之后的读都在这份快照上进行，与 Linux 的 seq_file 一次读完时的效果相同。
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
@@ -15,6 +14,7 @@ use std::sync::Arc;
 
 use appine_engine::PAGE_SIZE;
 
+use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};

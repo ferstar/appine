@@ -6,7 +6,6 @@
 //! fork 出来的子进程没有，execve 时清掉。上下文 id 是 guest 里一页只读内存的地址：
 //! libaio 会读那里的环形缓冲区头部，魔数不对就总是走 syscall。
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Instant;
@@ -14,6 +13,7 @@ use std::time::Instant;
 use appine_engine::prot;
 
 use super::{SysResult, get, put, read_timespec};
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, oflags};
 use crate::kernel::{Cx, request_wake};

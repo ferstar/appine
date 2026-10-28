@@ -7,12 +7,12 @@
 //! 发信号，或者把登记时给的 32 字节 cookie 送到 netlink socket（musl 的 `SIGEV_THREAD`
 //! 就是这样实现的）。上限按 `/proc/sys/fs/mqueue/*`。
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use super::{SysResult, get, put, read_timespec};
+use crate::cell::RefCell;
 use crate::cred::{MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};

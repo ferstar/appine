@@ -27,6 +27,10 @@
 #define HOOK_PANIC_IN_HOST 6   /* 宿主下一次调用 Machine 的方法时 panic */
 #define HOOK_PANIC_UNLOCKED 8  /* 放开 BKL 时 panic：展开时要先重新拿到 BKL */
 #define HOOK_PANIC_FAST 9      /* 下一次不持 BKL 的系统调用 panic */
+#define HOOK_PANIC_IN_FUTEX 10 /* 下一次在 futex 上等待、登记成等待者之后 panic */
+
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
 
 static void fail(const char *what)
 {
@@ -127,6 +131,38 @@ int main(int argc, char **argv)
         _exit(7);
     }
     expect_segv(pid, "kernel panic in a syscall without the BKL");
+
+    /*
+     * 在 futex 上等待时 panic：等待者要从队列里移除，否则之后的一次 FUTEX_WAKE 会算在
+     * 它身上，真正的等待者叫不醒
+     */
+    int *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (word == MAP_FAILED)
+        fail("mmap");
+    pid = fork();
+    if (pid == 0) {
+        syscall(TEST_SYSCALL, HOOK_PANIC_IN_FUTEX);
+        syscall(SYS_futex, word, FUTEX_WAIT, 0, NULL, NULL, 0);
+        _exit(7);
+    }
+    expect_segv(pid, "kernel panic while waiting on a futex");
+    pid = fork();
+    if (pid == 0)
+        _exit(syscall(SYS_futex, word, FUTEX_WAIT, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    /* 唤醒一次就够：第一次返回 1 时叫醒的必须是它 */
+    while (syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0) == 0)
+        usleep(10000);
+    int woken = 0, wst;
+    for (int i = 0; i < 200 && !woken; i++) {
+        usleep(10000);
+        woken = waitpid(pid, &wst, WNOHANG) == pid;
+    }
+    if (!woken) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &wst, 0);
+        fail("the futex waiter after a panicked one is woken");
+    }
+    printf("futex waiter after a panicked one: woken\n");
 
     pid = fork();
     if (pid == 0)

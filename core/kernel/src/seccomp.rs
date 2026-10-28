@@ -21,7 +21,7 @@
 //! 这些系统调用不再运行链上的程序。线程把位图另存一份原子的（[`publish`]），不持 BKL 的
 //! 快速路径（`syscall::fast`）对这些编号照常走。
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,6 +29,7 @@ use std::sync::atomic::Ordering;
 use appine_engine::Cpu;
 use appine_hal::Event;
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_object, signal_later, wake};

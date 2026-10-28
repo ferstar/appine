@@ -19,12 +19,12 @@
 //! 停住时把寄存器存一份在 [`Trace::regs`]，跟踪者读写的是这一份，继续时写回 Cpu。停住期间
 //! 不处理信号，只有 SIGKILL 让它离开（Linux 的 TASK_TRACED）。
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use appine_engine::{Cpu, CpuState};
 
+use crate::cell::RefCell;
 use crate::kernel::{Cx, Kernel, Tid, request_wake_on, wake};
 use crate::process::{ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, SigAction, SigInfo, code, sa};

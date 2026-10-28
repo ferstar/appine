@@ -11,7 +11,6 @@
 //! 的调用时还挂断那个控制台，免得终端标签页卡在坏掉的控制台上。只读一张表的方法
 //! （[`Machine::wait`] 等）不需要。
 
-use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -23,6 +22,7 @@ use std::thread::JoinHandle;
 use appine_engine::{Cpu, Dbt, DbtStats};
 use appine_hal::Event;
 
+use crate::cell::RefCell;
 use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::fd::FdTable;

@@ -133,11 +133,13 @@ pub(crate) enum Trap {
     Finish,
     /// 线程下一次不持 BKL 的系统调用（`syscall::fast`）：布给一个线程（tid）。
     Fast,
+    /// 在 futex 上等待（已经登记成等待者之后）：布给一个进程（pid）。
+    FutexWait,
 }
 
 /// 测试钩子布下的 bug：每个 [`Trap`] 上布给的 tid 或 pid，0 表示没有。
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
-static ARMED: [AtomicI32; 6] = [const { AtomicI32::new(0) }; 6];
+static ARMED: [AtomicI32; 7] = [const { AtomicI32::new(0) }; 7];
 
 /// [`Trap::Finish`] 布在第几步（从 1 开始）。
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
@@ -195,7 +197,8 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 /// 7. 这个进程结束时（[`crate::process::finish_group`]）第 `addr` 步 panic；
 /// 8. 放开 BKL 时（[`Cx::unlocked`]）马上 panic。展开到这里时必须已经重新拿到 BKL，否则
 ///    终止宿主进程：外层丢掉的 `Rc` 会和别的线程同时改计数；
-/// 9. 调用的线程下一次不持 BKL 的系统调用（`syscall::fast`）panic。
+/// 9. 调用的线程下一次不持 BKL 的系统调用（`syscall::fast`）panic；
+/// 10. 这个进程下一次在 futex 上等待时，登记成等待者之后 panic。
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -242,6 +245,7 @@ pub(crate) fn test_hook(
             cx.unlocked(|| panic!("panic injected by the test hook while the BKL is released"));
         }
         9 => arm(Trap::Fast, cx.tid()),
+        10 => arm(Trap::FutexWait, cx.tgid()),
         _ => return Err(Errno::EINVAL),
     }
     Ok(0)

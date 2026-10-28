@@ -21,11 +21,11 @@
 //!   之后丢弃新的，并排一个 `IN_Q_OVERFLOW`。每个用户（有效 uid）的实例数和监视数受
 //!   `max_user_instances`、`max_user_watches` 限制，超过时分别是 EMFILE、ENOSPC。
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
 use super::{SysResult, read_path};
+use crate::cell::RefCell;
 use crate::cred::MAY_READ;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};

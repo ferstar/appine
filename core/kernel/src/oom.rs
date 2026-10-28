@@ -13,13 +13,14 @@
 //! 在被发现之前还能多用几十 MB（Tier 1 下每秒能碰好几 GB 的新页），所以上限要留出余量。
 //! 结束一个进程之后，等它的线程都退出、内存还给宿主，再决定要不要结束下一个。
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use appine_engine::PAGE_SIZE;
 
+use crate::cell::RefCell;
 use crate::kernel::{INIT, Kernel, Shared};
 use crate::process::{ExitStatus, Signal, ThreadGroup};
 

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use super::{IO_CHUNK, SysResult, get, put, read_timespec, write_pair};
 use crate::cred::{SECBIT_KEEP_CAPS, cap};
 use crate::errno::Errno;
-use crate::futex::Key;
+use crate::futex::{Enqueued, Key};
 use crate::itimer::{CpuTimer, ITimer};
 use crate::kernel::Cx;
 use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Rusage, Signal};
@@ -129,8 +129,11 @@ pub(super) fn futex(
                 }
                 futexes.enqueue(key, bitset, cx.task.event.clone())
             };
+            let waiting = Enqueued::new(shared, [id]);
+            crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
             loop {
                 if !shared.futexes().is_queued(id) {
+                    waiting.leave();
                     return Ok(0);
                 }
                 let err = if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -141,8 +144,12 @@ pub(super) fn futex(
                     cx.wait_alone(deadline).err()
                 };
                 if let Some(e) = err {
-                    shared.futexes().remove(id);
-                    return Err(e);
+                    // 原来放开 futex 的锁之后才移除：这中间不持 BKL 的唤醒（syscall::fast）
+                    // 取走了它的话，唤醒丢了，它却返回错误
+                    return match waiting.leave() {
+                        Some(_) => Ok(0),
+                        None => Err(e),
+                    };
                 }
             }
         }
@@ -225,8 +232,13 @@ pub(super) fn futex_waitv(
             .map(|&(key, ..)| futexes.enqueue(key, u32::MAX, event.clone()))
             .collect()
     };
+    let waiting = Enqueued::new(shared, ids);
+    crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
     let r = loop {
-        let woken = ids.iter().position(|&id| !shared.futexes().is_queued(id));
+        let woken = waiting
+            .ids()
+            .iter()
+            .position(|&id| !shared.futexes().is_queued(id));
         if let Some(i) = woken {
             break Ok(i as u64);
         }
@@ -241,11 +253,11 @@ pub(super) fn futex_waitv(
             break Err(e);
         }
     };
-    let mut futexes = shared.futexes();
-    for id in ids {
-        futexes.remove(id);
+    // 与 Linux 的 futex_unqueue_multiple 一样，超时、被信号打断时刚好被唤醒的算唤醒
+    match (waiting.leave(), r) {
+        (Some(i), Err(_)) => Ok(i as u64),
+        (_, r) => r,
     }
-    r
 }
 
 /// 睡到 `deadline`，被信号打断时返回剩余时间。
