@@ -1,5 +1,5 @@
-//! 合成文件系统（设计文档 §8.2）：`/proc`（procfs）、`/dev/pts`（devpts）和 `/sys`（sysfs，
-//! 只有 CPU 的拓扑）。
+//! 合成文件系统（设计文档 §8.2）：procfs、devpts、sysfs（CPU 的拓扑、网络接口）和只读的
+//! cgroup2，开机时挂在 `/proc`、`/dev/pts`、`/sys`、`/sys/fs/cgroup` 上。
 //!
 //! 节点是 [`PseudoNode`]，目录结构经由 [`View`]（持有 BKL 时对内核状态的只读视图）
 //! 实现 [`Pseudo`]。procfs 的文件在打开时生成一份完整的内容（[`content`]），
@@ -30,7 +30,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::rdev;
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
-use crate::vfs::{Mount, Node, Pseudo, Vfs};
+use crate::vfs::{Fs, MountId, Node, PTS_MOUNT, Pseudo, Vfs};
 
 /// `/proc` 下的全局文件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -216,7 +216,7 @@ const STATIC: [&[u8]; 62] = [
 /// `/sys` 下固定的目录和文件（相对 `/sys` 的路径，目录以 `/` 结尾）。CPU 的拓扑：busybox
 /// 的 `nproc --all`、lscpu、glibc 的 get_nprocs 读它们，各个 `cpu<n>` 是
 /// [`PseudoNode::SysCpu`]；网络接口（btop 读流量计数），各个接口是 [`PseudoNode::SysNet`]。
-const SYS_STATIC: [&[u8]; 10] = [
+const SYS_STATIC: [&[u8]; 11] = [
     b"class/",
     b"class/net/",
     b"devices/",
@@ -227,6 +227,7 @@ const SYS_STATIC: [&[u8]; 10] = [
     b"devices/system/cpu/possible",
     b"devices/system/cpu/present",
     b"fs/",
+    b"fs/cgroup/",
 ];
 
 /// `/sys/class/net`：各个接口在它下面。
@@ -489,12 +490,6 @@ pub(crate) struct View<'a> {
 pub(crate) struct Offline;
 
 impl Pseudo for Offline {
-    fn root(&self, fs: Mount) -> PseudoNode {
-        root_of(fs)
-    }
-    fn mount_of(&self, node: &PseudoNode) -> Mount {
-        mount_of(node)
-    }
     fn parent(&self, _: &PseudoNode) -> Option<PseudoNode> {
         None
     }
@@ -510,31 +505,36 @@ impl Pseudo for Offline {
     fn readlink(&self, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
         Err(Errno::EINVAL)
     }
-    fn follow(&self, _: &PseudoNode) -> Option<Node> {
+    fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Node> {
         None
     }
 }
 
-fn root_of(fs: Mount) -> PseudoNode {
+/// 文件系统的根目录。
+pub(crate) fn root_of(fs: Fs) -> PseudoNode {
     match fs {
-        Mount::Proc => PseudoNode::ProcRoot,
-        Mount::Pts => PseudoNode::PtsRoot,
-        Mount::Sys => PseudoNode::SysRoot,
-        Mount::Cgroup => PseudoNode::Cgroup(b""),
+        Fs::Proc => PseudoNode::ProcRoot,
+        Fs::Pts => PseudoNode::PtsRoot,
+        Fs::Sys => PseudoNode::SysRoot,
+        Fs::Cgroup => PseudoNode::Cgroup(b""),
     }
 }
 
-pub(crate) fn mount_of(node: &PseudoNode) -> Mount {
+/// 节点所在的文件系统。
+pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     match node {
-        PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => Mount::Pts,
+        PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => Fs::Pts,
         PseudoNode::SysRoot
         | PseudoNode::Sys(_)
         | PseudoNode::SysCpu(..)
-        | PseudoNode::SysNet(..) => Mount::Sys,
-        PseudoNode::Cgroup(_) => Mount::Cgroup,
-        _ => Mount::Proc,
+        | PseudoNode::SysNet(..) => Fs::Sys,
+        PseudoNode::Cgroup(_) => Fs::Cgroup,
+        _ => Fs::Proc,
     }
 }
+
+/// sysfs 里 cgroup2 的挂载点 `fs/cgroup`（没有挂东西时是空目录）。
+pub(crate) const CGROUP_POINT: PseudoNode = PseudoNode::Sys(b"fs/cgroup/");
 
 fn parse_num(name: &[u8]) -> Option<i64> {
     if name.is_empty() || name.len() > 10 || (name.len() > 1 && name[0] == b'0') {
@@ -624,18 +624,10 @@ impl<'a> View<'a> {
 }
 
 impl Pseudo for View<'_> {
-    fn root(&self, fs: Mount) -> PseudoNode {
-        root_of(fs)
-    }
-
-    fn mount_of(&self, node: &PseudoNode) -> Mount {
-        mount_of(node)
-    }
-
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode> {
         use PseudoNode::*;
         Some(match node {
-            PtsRoot | ProcRoot | SysRoot => return None,
+            PtsRoot | ProcRoot | SysRoot | Cgroup(b"") => return None,
             Pts(_) | PtsPtmx => PtsRoot,
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
             Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
@@ -648,7 +640,6 @@ impl Pseudo for View<'_> {
             SysNet(n, path) => {
                 tree_parent(&NET_FILES, path).map_or(SysNet(*n, b""), |p| SysNet(*n, p))
             }
-            Cgroup(b"") => Sys(b"fs/"),
             Cgroup(_) => Cgroup(b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
@@ -717,9 +708,6 @@ impl Pseudo for View<'_> {
             Static(path) => tree_lookup(&STATIC, path, name).map(Static),
             SysRoot => tree_lookup(&SYS_STATIC, b"", name).map(Sys),
             Sys(path) => tree_lookup(&SYS_STATIC, path, name).map(Sys).or_else(|| {
-                if *path == b"fs/" && name == b"cgroup" {
-                    return Some(Cgroup(b""));
-                }
                 if *path == SYS_NET_DIR {
                     return appine_hal::net::interfaces()
                         .into_iter()
@@ -842,7 +830,7 @@ impl Pseudo for View<'_> {
         }
     }
 
-    fn follow(&self, node: &PseudoNode) -> Option<Node> {
+    fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
         let PseudoNode::Fd(pid, fd) = node else {
             return None;
         };
@@ -858,7 +846,7 @@ impl Pseudo for View<'_> {
                     .stat_open(*ino, file)
                     .is_ok_and(|st| st.nlink == 0) =>
             {
-                Node::Pseudo(PseudoNode::OpenFd(*pid, *fd))
+                Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd))
             }
             FileKind::Regular { ino, .. }
             | FileKind::Device { ino, .. }
@@ -868,11 +856,12 @@ impl Pseudo for View<'_> {
             }
             | FileKind::Path(Node::Store(ino)) => Node::Store(*ino),
             FileKind::Directory { node, .. } | FileKind::Path(node) => node.clone(),
-            FileKind::Proc { node, .. } => Node::Pseudo(node.clone()),
+            FileKind::Proc { mnt, node, .. } => Node::Pseudo(*mnt, node.clone()),
+            // 从设备不记得是经由哪个 devpts 挂载打开的，当作开机时的那个
             FileKind::Pty(end) if !end.master => {
-                Node::Pseudo(PseudoNode::Pts(end.tty.borrow().index))
+                Node::Pseudo(PTS_MOUNT, PseudoNode::Pts(end.tty.borrow().index))
             }
-            _ => Node::Pseudo(PseudoNode::OpenFd(*pid, *fd)),
+            _ => Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd)),
         })
     }
 }
@@ -920,7 +909,7 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 /// 合成节点的元数据。
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let kind = ps.kind(node)?;
-    let sysfs = matches!(mount_of(node), Mount::Sys | Mount::Cgroup);
+    let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
         (mode::S_IFDIR, _) if sysfs => 0o755,
         (_, PseudoNode::Cgroup(name)) if crate::cgroup::FILES.contains(&(name, true)) => 0o644,
@@ -1222,9 +1211,6 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
             nodes.extend(tree_children(&SYS_STATIC, path).map(Sys));
             if *path == SYS_CPU_DIR {
                 nodes.extend((0..cpus() as u32).map(|n| SysCpu(n, b"")));
-            }
-            if *path == b"fs/" {
-                nodes.push(Cgroup(b""));
             }
             if *path == SYS_NET_DIR {
                 nodes.extend(
@@ -1854,21 +1840,143 @@ pub(crate) fn write_mem(
     Ok(done)
 }
 
-const MOUNTS: &str = "appine / ext4 rw,relatime 0 0\n\
-    proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
-    devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0\n\
-    sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
-    cgroup /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0\n";
+/// `/proc/<pid>/mounts`（`info` 为 false）或 `mountinfo`：与 Linux 的 `show_vfsmnt`、
+/// `show_mountinfo` 一样按挂上的先后，挂载点相对那个进程的根目录 `root`，根目录以外的不列
+/// （chroot 进去之后看不到外面的挂载，包括根文件系统）。挂载编号与 fdinfo 的 `mnt_id`、
+/// 设备号与 stat 的 `st_dev` 一致。
+fn mounts(ps: &View<'_>, root: &Node, info: bool) -> Vec<u8> {
+    let visible = |node: &Node| {
+        ps.vfs
+            .path_of(ps, root, node)
+            .ok()
+            .filter(|p| !p.starts_with(b"(unreachable)"))
+    };
+    let mut out = Vec::new();
+    if let Some(point) = visible(&Node::ROOT) {
+        MountLine {
+            id: crate::vfs::ROOT_MOUNT,
+            parent: crate::vfs::ROOT_MOUNT,
+            dev: crate::vfs::ROOT_DEV,
+            fs_root: b"/".to_vec(),
+            point,
+            flags: crate::vfs::ROOT_FLAGS,
+            fstype: "ext4",
+            source: b"appine",
+            options: "",
+        }
+        .write(&mut out, info);
+    }
+    for m in ps.vfs.mounts() {
+        let Some(point) = visible(&Node::Pseudo(m.id, m.root.clone())) else {
+            continue;
+        };
+        MountLine {
+            id: m.id,
+            parent: m.parent(),
+            dev: m.dev,
+            fs_root: fs_path(ps, &m.root),
+            point,
+            flags: m.flags,
+            fstype: m.fs.type_name(),
+            source: if m.source.is_empty() {
+                b"none"
+            } else {
+                &m.source
+            },
+            options: m.fs.options(),
+        }
+        .write(&mut out, info);
+    }
+    out
+}
 
-/// `/proc/<pid>/mountinfo`：挂载点的编号与 fdinfo 的 mnt_id 一致，设备号与 stat 的
-/// st_dev 一致。
-const MOUNTINFO: &str = "1 1 8:1 / / rw,relatime - ext4 appine rw\n\
-    2 1 0:4 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n\
-    3 1 0:24 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts \
-    rw,gid=5,mode=620,ptmxmode=000\n\
-    4 1 0:22 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n\
-    6 4 0:26 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup \
-    rw,nsdelegate,memory_recursiveprot\n";
+/// mounts、mountinfo 里的一行。
+struct MountLine<'a> {
+    id: crate::vfs::MountId,
+    parent: crate::vfs::MountId,
+    dev: u64,
+    /// 挂载看到的部分在文件系统里的路径。
+    fs_root: Vec<u8>,
+    point: Vec<u8>,
+    flags: u64,
+    fstype: &'static str,
+    source: &'a [u8],
+    /// 超级块的选项（[`Fs::options`]）。
+    options: &'static str,
+}
+
+impl MountLine<'_> {
+    fn write(&self, out: &mut Vec<u8>, info: bool) {
+        let opts = mount_options(self.flags);
+        let (fstype, options) = (self.fstype, self.options);
+        if info {
+            let (id, parent) = (self.id, self.parent);
+            let (major, minor) = (self.dev >> 8, self.dev & 0xff);
+            out.extend_from_slice(format!("{id} {parent} {major}:{minor} ").as_bytes());
+            out.extend(mangle(&self.fs_root));
+            out.push(b' ');
+            out.extend(mangle(&self.point));
+            out.extend_from_slice(format!(" {opts} - {fstype} ").as_bytes());
+            out.extend(mangle(self.source));
+            out.extend_from_slice(format!(" rw{options}\n").as_bytes());
+        } else {
+            out.extend(mangle(self.source));
+            out.push(b' ');
+            out.extend(mangle(&self.point));
+            out.extend_from_slice(format!(" {fstype} {opts}{options} 0 0\n").as_bytes());
+        }
+    }
+}
+
+/// 挂载的选项（mountinfo 的第六列，Linux 的 `show_mnt_opts`）。
+fn mount_options(flags: u64) -> String {
+    use crate::vfs::ms;
+    let mut s = String::from(if flags & ms::RDONLY != 0 { "ro" } else { "rw" });
+    for (bit, name) in [
+        (ms::NOSUID, ",nosuid"),
+        (ms::NODEV, ",nodev"),
+        (ms::NOEXEC, ",noexec"),
+        (ms::NOATIME, ",noatime"),
+        (ms::NODIRATIME, ",nodiratime"),
+        (ms::RELATIME, ",relatime"),
+        (ms::NOSYMFOLLOW, ",nosymfollow"),
+    ] {
+        if flags & bit != 0 {
+            s += name;
+        }
+    }
+    s
+}
+
+/// 节点在它的文件系统里的路径（mountinfo 的第四列：bind 挂载的是哪个目录）。
+fn fs_path(ps: &View<'_>, node: &PseudoNode) -> Vec<u8> {
+    let mut names = Vec::new();
+    let mut cur = node.clone();
+    while let Some(up) = ps.parent(&cur) {
+        names.push(ps.name(&cur));
+        cur = up;
+    }
+    if names.is_empty() {
+        return b"/".to_vec();
+    }
+    names
+        .iter()
+        .rev()
+        .flat_map(|n| [&b"/"[..], n].concat())
+        .collect()
+}
+
+/// 与 Linux 的 `mangle` 一样，把空格、制表符、换行和反斜杠写成八进制的转义。
+fn mangle(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &b in s {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\\' => out.extend_from_slice(format!("\\{b:03o}").as_bytes()),
+            _ => out.push(b),
+        }
+    }
+    out
+}
 
 const HWCAP_NAMES: [&str; 12] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
@@ -2229,8 +2337,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                         task.map_or_else(Vec::new, |t| t.res.borrow().mm.borrow().auxv.to_vec());
                     return Ok(auxv.iter().flat_map(|w| w.to_le_bytes()).collect());
                 }
-                self::Entry::Mounts => MOUNTS.to_owned(),
-                self::Entry::MountInfo => MOUNTINFO.to_owned(),
+                self::Entry::Mounts | self::Entry::MountInfo => {
+                    let root = task.map_or(Node::ROOT, |t| t.res.borrow().fs.borrow().root.clone());
+                    return Ok(mounts(ps, &root, *e == self::Entry::MountInfo));
+                }
                 self::Entry::OomScoreAdj => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
@@ -2470,14 +2580,9 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
     };
     let f = file.borrow();
     let mnt_id = match f.node() {
-        Some(Node::Store(_)) => 1,
-        Some(Node::Pseudo(p)) => match mount_of(&p) {
-            Mount::Proc => 2,
-            Mount::Pts => 3,
-            Mount::Sys => 4,
-            Mount::Cgroup => 6,
-        },
-        None => 5,
+        Some(Node::Store(_)) => crate::vfs::ROOT_MOUNT,
+        Some(Node::Pseudo(id, _)) => id,
+        None => crate::vfs::ANON_MOUNT,
     };
     let mut s = format!(
         "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",

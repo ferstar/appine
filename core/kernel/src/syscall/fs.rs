@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
-use crate::vfs::{Dentry, Mount, Node, Pseudo, Vfs, normalize};
+use crate::vfs::{Dentry, Fs, Node, Pseudo, Vfs, ms, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -92,18 +92,12 @@ const CLOSE_RANGE_CLOEXEC: u32 = 4;
 /// readv/writev 最多接受的 iovec 个数（`UIO_MAXIOV`）。
 const UIO_MAXIOV: usize = 1024;
 
-/// inode 仓库对外报告的设备号。
-pub(super) const ROOT_DEV: u64 = 0x801;
+pub(super) use crate::vfs::ROOT_DEV;
 /// 管道报告的设备号（Linux 上 pipefs 是一个匿名设备）。
 const PIPE_DEV: u64 = 0xd;
 /// socket、anon_inode（epoll、eventfd）报告的设备号。
 const SOCK_DEV: u64 = 0x8;
 const ANON_DEV: u64 = 0xe;
-/// procfs、devpts、sysfs 报告的设备号。
-const PROC_DEV: u64 = 0x4;
-const DEVPTS_DEV: u64 = 0x18;
-const SYSFS_DEV: u64 = 0x16;
-const CGROUP_DEV: u64 = 0x1a;
 /// mqueue 文件系统的设备号。
 const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
@@ -218,7 +212,7 @@ pub(super) fn parent_at<'p>(
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    Ok((store_ino(&dir)?, name))
+    Ok((store_ino(cx, &dir)?, name))
 }
 
 /// 在目录 `dir` 里新建 `name` 之前的检查（`may_create`）：要能在目录里查找，名字
@@ -264,12 +258,12 @@ fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
     f.ino().ok_or(Errno::EBADF)
 }
 
-/// 仓库里的 inode；合成文件系统里的节点不能修改，只读挂载的 cgroup2 是 EROFS。
-fn store_ino(node: &Node) -> Result<Ino, Errno> {
+/// 仓库里的 inode；合成文件系统里的节点不能修改，在只读的挂载里（比如 cgroup2）是 EROFS。
+fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
     match node {
         Node::Store(ino) => Ok(*ino),
-        Node::Pseudo(p) if pseudo::mount_of(p) == Mount::Cgroup => Err(Errno::EROFS),
-        Node::Pseudo(_) => Err(Errno::EACCES),
+        Node::Pseudo(..) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
+        Node::Pseudo(..) => Err(Errno::EACCES),
     }
 }
 
@@ -331,7 +325,7 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
     // sysfs 的文件报告一页的大小，但不占块
-    let blocks = if dev == SYSFS_DEV {
+    let blocks = if dev == Fs::Sys.dev() {
         0
     } else {
         size.div_ceil(4096) * 8
@@ -346,24 +340,15 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     b
 }
 
-/// fstat 会报告的 (st_dev, st_ino)，不必查仓库就能知道的部分（epoll 的 fdinfo）。
+/// fstat 会报告的 (st_dev, st_ino)，不必查仓库就能知道的部分（epoll 的 fdinfo）。合成
+/// 节点的设备号按开机时的实例算（后来挂上的 procfs、devpts 实例另有设备号，[`Vfs::dev_of`]）。
 pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
     match (&f.kind, f.node()) {
         (_, Some(Node::Store(ino))) => (ROOT_DEV, ino),
         (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
         (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
-        (_, Some(Node::Pseudo(p))) => (pseudo_dev(&p), pseudo::ino_of(&p)),
+        (_, Some(Node::Pseudo(_, p))) => (pseudo::fs_of(&p).dev(), pseudo::ino_of(&p)),
         _ => (ANON_DEV, 1),
-    }
-}
-
-/// 合成文件系统里的节点报告的设备号。
-fn pseudo_dev(p: &PseudoNode) -> u64 {
-    match pseudo::mount_of(p) {
-        Mount::Proc => PROC_DEV,
-        Mount::Pts => DEVPTS_DEV,
-        Mount::Sys => SYSFS_DEV,
-        Mount::Cgroup => CGROUP_DEV,
     }
 }
 
@@ -374,11 +359,11 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     match node {
         Node::Store(ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, ROOT_DEV)),
         // 魔法链接指向的打开文件：报告那个文件本身
-        Node::Pseudo(PseudoNode::OpenFd(pid, fd)) => {
+        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
             let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
             file_stat(cx, &file)
         }
-        Node::Pseudo(p) => Ok(encode_stat(&pseudo::stat(&view, p)?, pseudo_dev(p))),
+        Node::Pseudo(_, p) => Ok(encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node))),
     }
 }
 
@@ -460,7 +445,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
                 ctime_ns: t.ctime_ns,
                 ..Stat::default()
             };
-            Ok(encode_stat(&st, DEVPTS_DEV))
+            Ok(encode_stat(&st, Fs::Pts.dev()))
         }
         FileKind::Regular { ino, file } => Ok(encode_stat(
             &cx.vfs()?.store().stat_open(*ino, file)?,
@@ -537,7 +522,7 @@ fn open_path(
                 if path.ends_with(b"/") || name == b"." || name == b".." {
                     return Err(Errno::EISDIR);
                 }
-                let dir = store_ino(&dir)?;
+                let dir = store_ino(cx, &dir)?;
                 if let Some(ino) = vfs.store().lookup(dir, name)?
                     && follow
                     && vfs.store().attrs(ino)?.kind() == mode::S_IFLNK
@@ -586,7 +571,7 @@ fn open_path(
                 };
                 open_store(cx, &cred, vfs.store(), ino, flags, created)?
             }
-            Node::Pseudo(p) => open_pseudo(cx, &cred, &vfs, p, flags)?,
+            Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
         }
     };
     if let FileKind::Pty(end) = &kind {
@@ -907,6 +892,7 @@ fn open_pseudo(
     cx: &mut Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
+    mnt: crate::vfs::MountId,
     node: PseudoNode,
     flags: u32,
 ) -> Result<FileKind, Errno> {
@@ -938,6 +924,12 @@ fn open_pseudo(
             mm = Some(Rc::downgrade(&pseudo::process_mm(cx.kr(), pid)?));
         }
     }
+    // 设备节点在 nodev 的挂载里打不开（Linux 的 may_open）
+    if matches!(node, PseudoNode::Pts(_) | PseudoNode::PtsPtmx)
+        && vfs.mount(mnt).is_some_and(|m| m.flags & ms::NODEV != 0)
+    {
+        return Err(Errno::EACCES);
+    }
     match node {
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
         PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), cred.fsuid),
@@ -949,7 +941,8 @@ fn open_pseudo(
     if Pseudo::kind(&view, &node)? == mode::S_IFLNK {
         return Err(Errno::ELOOP);
     }
-    if vfs.is_dir(&view, &Node::Pseudo(node.clone()))? {
+    let full = Node::Pseudo(mnt, node.clone());
+    if vfs.is_dir(&view, &full)? {
         if accmode != oflags::O_RDONLY {
             return Err(Errno::EISDIR);
         }
@@ -960,7 +953,7 @@ fn open_pseudo(
             _ => None,
         };
         return Ok(FileKind::Directory {
-            node: Node::Pseudo(node),
+            node: full,
             entries: None,
             process,
         });
@@ -968,14 +961,19 @@ fn open_pseudo(
     if flags & oflags::O_DIRECTORY != 0 {
         return Err(Errno::ENOTDIR);
     }
-    if accmode != oflags::O_RDONLY && pseudo::mount_of(&node) == Mount::Cgroup {
+    if accmode != oflags::O_RDONLY && vfs.readonly(&full) {
         return Err(Errno::EROFS);
     }
     if accmode != oflags::O_RDONLY && !pseudo::writable(&node) {
         return Err(Errno::EACCES);
     }
     let data = pseudo::content(&view, &node)?;
-    Ok(FileKind::Proc { node, data, mm })
+    Ok(FileKind::Proc {
+        mnt,
+        node,
+        data,
+        mm,
+    })
 }
 
 /// 经由 `/proc/<pid>/fd/<n>` 重新打开一个没有路径的文件：管道得到同一个管道的
@@ -1830,7 +1828,7 @@ pub(super) fn fstat(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
     put(cx, buf, st).map(|()| 0)
 }
 
-fn encode_statfs(magic: u64, s: &appine_hal::FsStats) -> [u8; 120] {
+fn encode_statfs(magic: u64, s: &appine_hal::FsStats, flags: u64) -> [u8; 120] {
     // asm-generic 的 struct statfs（64 位）
     let mut b = [0u8; 120];
     let words = [
@@ -1844,12 +1842,29 @@ fn encode_statfs(magic: u64, s: &appine_hal::FsStats) -> [u8; 120] {
         0, // f_fsid
         255,
         s.block_size,
-        0x20, // ST_VALID
+        statfs_flags(flags),
     ];
     for (i, w) in words.iter().enumerate() {
         b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
     }
     b
+}
+
+/// statfs 的 `f_flags`（Linux 的 `calculate_f_flags`）：挂载的标志加上 `ST_VALID`。
+fn statfs_flags(flags: u64) -> u64 {
+    const ST_VALID: u64 = 0x20;
+    const ST_RELATIME: u64 = 0x1000;
+    const ST_NOSYMFOLLOW: u64 = 0x2000;
+    // RDONLY、NOSUID、NODEV、NOEXEC、NOATIME、NODIRATIME 的取值与 MS_* 相同
+    let same = ms::RDONLY | ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::NOATIME | ms::NODIRATIME;
+    let mut f = ST_VALID | (flags & same);
+    if flags & ms::RELATIME != 0 {
+        f |= ST_RELATIME;
+    }
+    if flags & ms::NOSYMFOLLOW != 0 {
+        f |= ST_NOSYMFOLLOW;
+    }
+    f
 }
 
 /// 节点所在文件系统的 statfs。
@@ -1858,14 +1873,19 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
         block_size: 4096,
         ..Default::default()
     };
+    let vfs = cx.vfs()?;
+    let flags = vfs.mount_flags(node).unwrap_or(0);
     Ok(match node {
-        Node::Store(_) => encode_statfs(EXT4_SUPER_MAGIC, &cx.vfs()?.store().fs_stats()?),
-        Node::Pseudo(p) => match pseudo::mount_of(p) {
-            Mount::Proc => encode_statfs(PROC_SUPER_MAGIC, &empty),
-            Mount::Pts => encode_statfs(DEVPTS_SUPER_MAGIC, &empty),
-            Mount::Sys => encode_statfs(SYSFS_MAGIC, &empty),
-            Mount::Cgroup => encode_statfs(CGROUP2_SUPER_MAGIC, &empty),
-        },
+        Node::Store(_) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
+        Node::Pseudo(_, p) => {
+            let magic = match pseudo::fs_of(p) {
+                Fs::Proc => PROC_SUPER_MAGIC,
+                Fs::Pts => DEVPTS_SUPER_MAGIC,
+                Fs::Sys => SYSFS_MAGIC,
+                Fs::Cgroup => CGROUP2_SUPER_MAGIC,
+            };
+            encode_statfs(magic, &empty, flags)
+        }
     })
 }
 
@@ -1889,6 +1909,7 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
                 block_size: 4096,
                 ..Default::default()
             },
+            0,
         ),
         (false, Some(node)) => statfs_of(cx, &node)?,
         (false, None) => statfs_of(cx, &Node::ROOT)?,
@@ -1980,6 +2001,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
             b".." => return Err(Errno::ENOTEMPTY),
             _ => {
                 may_delete(store, &cred, dir, name)?;
+                not_mount_point(&store_vfs, dir, name)?;
                 store.rmdir(dir, name)?;
             }
         }
@@ -2002,6 +2024,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
             });
         }
         may_delete(store, &cred, dir, name)?;
+        not_mount_point(&store_vfs, dir, name)?;
         store.unlink(dir, name)?;
         if let Some(ino) = victim {
             unlinked_events(cx, store, ino, (dir, name));
@@ -2009,6 +2032,15 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// 删除、改名之前：目录 `dir` 里的 `name` 上挂着东西时是 EBUSY（Linux 的
+/// `is_local_mountpoint`）。
+fn not_mount_point(vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<(), Errno> {
+    match vfs.store().lookup(dir, name)? {
+        Some(ino) if vfs.is_mount_point(&Node::Store(ino)) => Err(Errno::EBUSY),
+        _ => Ok(()),
+    }
 }
 
 /// 去掉了文件 `ino` 的链接 `name`（unlink、被 rename 覆盖）：链接数变了（IN_ATTRIB），
@@ -2120,6 +2152,8 @@ pub(super) fn renameat2(
         (new_dir, new_name),
         exchange,
     )?;
+    not_mount_point(&vfs, old_dir, old_name)?;
+    not_mount_point(&vfs, new_dir, new_name)?;
     // 有 inotify 监视时先记下两边的 inode 和它们是不是目录
     let entry = |dir, name| -> Result<Option<(Ino, u32)>, Errno> {
         match vfs.store().lookup(dir, name)? {
@@ -2244,10 +2278,11 @@ enum Attrs {
 impl Attrs {
     fn of(cx: &Cx<'_>, node: &Node) -> Result<Attrs, Errno> {
         match node {
-            Node::Pseudo(PseudoNode::Pts(n)) => pseudo::pty(cx.kr(), *n)
+            Node::Pseudo(_, PseudoNode::Pts(_)) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
+            Node::Pseudo(_, PseudoNode::Pts(n)) => pseudo::pty(cx.kr(), *n)
                 .map(Attrs::Pts)
                 .ok_or(Errno::ENOENT),
-            _ => store_ino(node).map(Attrs::Store),
+            _ => store_ino(cx, node).map(Attrs::Store),
         }
     }
 
@@ -2491,7 +2526,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let len = u64::try_from(len).map_err(|_| Errno::EINVAL)?;
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
-    let ino = store_ino(&lookup_at(cx, AT_FDCWD, &path, true)?)?;
+    let ino = store_ino(cx, &lookup_at(cx, AT_FDCWD, &path, true)?)?;
     let st = vfs.store().attrs(ino)?;
     match st.kind() {
         mode::S_IFDIR => Err(Errno::EISDIR),
@@ -2788,7 +2823,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         let view = cx.view(&vfs);
         let ino_of = |n: &Node| match n {
             Node::Store(i) => *i,
-            Node::Pseudo(p) => pseudo::node_ino(view.k, p),
+            Node::Pseudo(_, p) => pseudo::node_ino(view.k, p),
         };
         let parent = vfs.parent(&view, node)?;
         let mut list = vec![
@@ -2805,7 +2840,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         ];
         match node {
             Node::Store(ino) => list.extend(vfs.store().readdir(*ino)?),
-            Node::Pseudo(p) => list.extend(pseudo::readdir(&view, p)?),
+            Node::Pseudo(_, p) => list.extend(pseudo::readdir(&view, p)?),
         }
         *entries = Some(list);
     }

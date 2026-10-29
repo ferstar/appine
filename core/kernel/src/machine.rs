@@ -189,7 +189,7 @@ impl Machine {
                 })
                 .and_then(|n| match n {
                     Node::Store(ino) => Some(ino),
-                    Node::Pseudo(_) => None,
+                    Node::Pseudo(..) => None,
                 })
                 .unwrap_or(0)
         };

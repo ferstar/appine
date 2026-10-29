@@ -173,7 +173,7 @@ impl Inotify {
             let (ino, sdev) = match &w.node {
                 // 内核内部的设备号编码：(主 << 20) | 次，仓库是 8:1，procfs 是 0:4
                 Node::Store(ino) => (*ino, 0x80_0001),
-                Node::Pseudo(p) => (crate::pseudo::ino_of(p), 0x4),
+                Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
             };
             out += &format!(
                 "inotify wd:{wd:x} ino:{ino:x} sdev:{sdev:x} mask:{:x} ignored_mask:0",

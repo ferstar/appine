@@ -159,7 +159,7 @@ pub(super) fn pidfd_send_signal(
         FileKind::Pidfd(p) => p.group(cx.kr()).map(|_| p.tgid).ok_or(Errno::ESRCH)?,
         // 打开的那个进程已经回收了：pid 可能已经给了新进程
         FileKind::Directory {
-            node: Node::Pseudo(PseudoNode::Pid(pid, None)),
+            node: Node::Pseudo(_, PseudoNode::Pid(pid, None)),
             process,
             ..
         } => {

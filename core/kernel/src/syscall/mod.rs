@@ -13,6 +13,7 @@ mod ipc;
 mod lease;
 mod mem;
 mod misc;
+mod mount;
 mod mqueue;
 mod net;
 mod poll;
@@ -214,6 +215,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         36 => fs::symlinkat(cx, a[0], a[1] as i32, a[2]),
         37 => fs::linkat(cx, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
         38 => fs::renameat2(cx, a[0] as i32, a[1], a[2] as i32, a[3], 0),
+        39 => mount::umount2(cx, a[0], a[1] as u32),
+        40 => mount::mount(cx, a[0], a[1], a[2], a[3], a[4]),
         43 => fs::statfs(cx, a[0], a[1]),
         44 => fs::fstatfs(cx, a[0] as i32, a[1]),
         45 => fs::truncate(cx, a[0], a[1] as i64),

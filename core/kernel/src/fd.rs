@@ -120,6 +120,8 @@ pub enum FileKind {
     SeccompNotify(crate::seccomp::Listener),
     /// procfs 的文件：打开时生成的内容。
     Proc {
+        /// 经由的挂载。
+        mnt: crate::vfs::MountId,
         /// 节点。
         node: PseudoNode,
         /// 内容。
@@ -219,7 +221,7 @@ impl OpenFile {
             | FileKind::MessageQueue(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
-            FileKind::Proc { node, .. } => Some(Node::Pseudo(node.clone())),
+            FileKind::Proc { mnt, node, .. } => Some(Node::Pseudo(*mnt, node.clone())),
         }
     }
 

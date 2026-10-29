@@ -55,7 +55,7 @@ fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
 fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
     match node {
         Node::Store(ino) => Ok(ino),
-        Node::Pseudo(_) => Err(pseudo),
+        Node::Pseudo(..) => Err(pseudo),
     }
 }
 
@@ -201,7 +201,7 @@ pub(super) fn getxattr(
 pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize) -> SysResult {
     let names = match node_of(cx, target)? {
         Node::Store(ino) => cx.vfs()?.store().list_xattr(ino)?,
-        Node::Pseudo(_) => Vec::new(),
+        Node::Pseudo(..) => Vec::new(),
     };
     // 与 Linux 的 trusted 处理函数一样，没有 CAP_SYS_ADMIN 时不列出 trusted.*
     let trusted = cx.cred().capable(cap::SYS_ADMIN);

@@ -44,7 +44,7 @@
 
 ptrace（§7.6）：strace、gdb 可以用。
 
-glibc 发行版不在 v1 的承诺里。探测过：Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库时，apt、gcc、gdb、python 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server 都能用；从 Alpine chroot 进去缺 `/proc`、`/sys`、`/dev`，因为没有 mount（§8.2，见 [glibc 发行版的探测](rounds/69-glibc-probe.md)）。
+glibc 发行版不在 v1 的承诺里。探测过：Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库时，apt、gcc、gdb、python 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server 都能用；从 Alpine chroot 进去要自己挂上 `/proc`、`/sys`、`/dev/pts`（§8.2，见 [glibc 发行版的探测](rounds/69-glibc-probe.md)、[mount 的子集](rounds/105-mount-subset.md)），`/dev` 里的设备节点要复制过去（仓库里的目录还不能 bind）。
 
 ### 1.3 性能目标
 
@@ -437,7 +437,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 ### 7.5 auxv 与内核版本
 
 - auxv 依次提供：`AT_SYSINFO_EHDR`、`AT_MINSIGSTKSZ`、`AT_HWCAP`（§4.4）、`AT_PAGESZ=4096`、`AT_CLKTCK=100`、`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`、`AT_SECURE`、`AT_RANDOM`、`AT_HWCAP2=0`、`AT_EXECFN`、`AT_PLATFORM="aarch64"`。
-- `uname -r` 固定报告一个 LTS 版本 `6.1.0-appine`。我们把它当作一份 **ABI 契约**：除文档明确列出的例外，按这个内核版本的语义实现。比 6.1 新的功能一般不做（比如 6.9 的 `PIDFD_THREAD`），例外是 6.5 的 `cachestat`。
+- `uname -r` 固定报告一个 LTS 版本 `6.1.0-appine`。我们把它当作一份 **ABI 契约**：除文档明确列出的例外，按这个内核版本的语义实现。比 6.1 新的功能一般不做（比如 6.9 的 `PIDFD_THREAD`），例外是 6.5 的 `cachestat`，以及 6.12 起 `/proc/<pid>/fd`、`fdinfo` 里的项不能当挂载点（§8.2）。
 - 未实现的 syscall **一律返回 `ENOSYS`，绝不崩溃**，同时记录一条本地调试日志（`APPINE_LOG=1` 时输出）。
 - 有意不实现的：io_uring 保持 `ENOSYS`（§15）。
 
@@ -492,6 +492,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ### 8.2 挂载表
 
+开机时的挂载：
+
 | 挂载点 | 文件系统 |
 |---|---|
 | `/` | inode 仓库 |
@@ -500,11 +502,16 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `/dev/shm`、`/run` | inode 仓库里的目录。Linux 上它们是 tmpfs，所以仓库被第一个使用者打开时清空其中的内容 |
 | `/proc` | procfs：根据内核层的 task、mm 等结构实时合成。smaps 的驻留页按宿主内存算（mincore）；匿名内存都算脏页，fork 之后和别的地址空间共用的（写时复制借出、借来的）算共享的，Pss 按共用的个数分摊，与 Linux 的 mapcount 一样（redis、valkey 启动时靠它检查内核），其余算私有的；文件映射都算私有的干净页。`/proc/meminfo` 和 sysinfo 的内存各项照搬宿主的（与 docker 的容器一样），guest 能用的上限看 cgroup 的 `memory.max`。`/proc/<pid>/exe`、`fd/<n>` 和 maps 里文件的路径与 Linux 的 `d_path` 一样解析完符号链接，在 execve、打开文件时按最后找到文件的目录和名字算好，之后改名不再更新；文件删除之后（inode 的 nlink 是 0），`fd/<n>` 和 maps 里的路径后面加上 ` (deleted)`，exe 不加 |
 | `/sys` | sysfs：只有 CPU 的拓扑（`/sys/devices/system/cpu` 下的 `online`、`possible`、各个 `cpu<n>` 的 `topology/`、`regs/identification/`）。CPU 都一样（与 `/proc/cpuinfo` 一致），各自是一个核，都在一个封装里。各个 `cpu<n>` 的 `cache/`、`cpufreq/` 照搬宿主对应的那个 CPU 的（宿主有、App 读得了的才有），CPU 列表和掩码换成 guest 的编号。没有 `transparent_hugepage`，相当于没有编进 THP 的内核。`/sys/class/net/<接口>` 是宿主的接口：`statistics/` 下的计数（§10）和 `address`、`flags`、`ifindex`、`mtu`、`operstate`、`type` 等几项属性，取值与 netlink 的回答一致；Linux 上接口目录是指向 `/sys/devices` 的符号链接，这里是目录 |
-| `/sys/fs/cgroup` | 只读的 cgroup2（`core/kernel/src/cgroup.rs`）：所有 guest 进程在同一个 cgroup 里，像 docker 用 cgroup 命名空间的容器（`/proc/<pid>/cgroup` 是 `0::/`），控制器有 cpuset、cpu、memory、pids。`memory.max` 是 §12 第 4 条的上限，`memory.current` 是那里量的用量，`memory.stat` 按 Linux 6.1 的格式把它分成匿名内存（含换出的）和共享内存（.NET 的 GC 按 `memory.current` 减去其中的 `inactive_file` 算用量），`memory.events` 记着超出上限和结束进程的次数；没有 CPU 配额，cpuset 是所有 CPU。JVM 的容器支持和 Node.js（libuv 的 `uv_get_constrained_memory`）据此按上限定堆。写、建子 cgroup 都是 EROFS |
+| `/sys/fs/cgroup` | 只读的 cgroup2（`core/kernel/src/cgroup.rs`），挂在 sysfs 的 `fs/cgroup` 目录上（新挂的 sysfs 里它是空目录，与 Linux 一样要另外挂）：所有 guest 进程在同一个 cgroup 里，像 docker 用 cgroup 命名空间的容器（`/proc/<pid>/cgroup` 是 `0::/`），控制器有 cpuset、cpu、memory、pids。`memory.max` 是 §12 第 4 条的上限，`memory.current` 是那里量的用量，`memory.stat` 按 Linux 6.1 的格式把它分成匿名内存（含换出的）和共享内存（.NET 的 GC 按 `memory.current` 减去其中的 `inactive_file` 算用量），`memory.events` 记着超出上限和结束进程的次数；没有 CPU 配额，cpuset 是所有 CPU。JVM 的容器支持和 Node.js（libuv 的 `uv_get_constrained_memory`）据此按上限定堆。写、建子 cgroup 都是 EROFS |
 | `/tmp` | 放在 inode 仓库里，不用内存 tmpfs，避免占用 App 内存配额 |
 | `/mnt/<名字>` | SAF 目录挂载（v1.x，见 §11.3） |
 
-挂载表是固定的：mount、umount2、pivot_root 和新的挂载接口（fsopen、open_tree 等）都返回 `ENOSYS`。
+之后可以用 mount(2) 把合成文件系统挂到别的目录上（`core/kernel/src/syscall/mount.rs`，[mount 的子集](rounds/105-mount-subset.md)）：chroot 进别的发行版的脚本要的 `mount -t proc|sysfs|devpts|cgroup2`，以及它们里面的目录的 bind（`mount --rbind /sys` 带上挂在里面的 cgroup2）。
+
+- 合成节点带着经由的挂载（`Node::Pseudo(挂载编号, 节点)`，相当于 Linux 的 `struct path`）：同一个节点挂在两处是两个节点，`..`、getcwd、`/proc/<pid>/{cwd,root,fd}` 经由各自的挂载点回到上一层，`..` 不越过 chroot 的根目录。仓库里的节点不带挂载，根文件系统只挂在 `/`。不持 BKL 的 stat（§6）遇到仓库里的挂载点交给正常的路径解析，挂载表变了让各线程重新取。
+- `/proc/<pid>/mounts`、`mountinfo` 按挂上的先后列出，挂载点相对那个进程的根目录，根目录以外的不列（chroot 进去之后看不到根文件系统），路径里的空格等按 Linux 的 `mangle` 转义。挂载编号不重复使用。新挂的 procfs 与 Linux 5.8 起一样是新的实例，有自己的设备号，可以叠在同一处；sysfs、cgroup2 只有一个实例，同一个挂载的根上再挂是 EBUSY；devpts 在 Linux 上每次是新的实例（有自己的一套终端），这里各个挂载看到的是同一套终端，设备号也相同（ttyname 拿 `/dev/pts/<n>` 的 `st_dev` 比对从设备的）。cgroup2 只能只读地挂，rw 时 EROFS（mount 命令会改成只读再试）。
+- 挂载的标志（ro、nosuid、nodev、noexec、访问时间）记在挂载上：只读的挂载里打开文件写、改 `/dev/pts/<n>` 的属性是 EROFS，nodev 的 devpts 里打不开终端，statfs 的 `f_flags` 按它报告。重新挂载只改这一个挂载（Linux 不带 bind 时还改共用的超级块）。传播类型可以设置，但不模拟，都相当于 private。卸下（含 `MNT_DETACH`、`MNT_EXPIRE`）、挂载在用时的 EBUSY，删除、改名挂载点的 EBUSY 与 Linux 6.1 相同；`/proc/<pid>/fd`、`fdinfo` 里的项不能当挂载点（ENOENT），与 6.12 起相同（LTP 的 mount08）。
+- 没有做的：仓库里的目录不能 bind（`mount --rbind /dev`、`--bind /run` 是 EOPNOTSUPP：仓库的节点也要带上挂载，路径换成挂载加节点，当前目录、打开文件记的路径、inotify、AF_UNIX 的路径名都要跟着改），没有 tmpfs 等别的文件系统（ENODEV，与没有编进内核的一样），`MS_MOVE` 是 EOPNOTSUPP，pivot_root 和新的挂载接口（fsopen、open_tree 等）仍是 ENOSYS（util-linux 的 mount 退回 mount(2)）。没有挂载命名空间（§6），所有进程看到同一张挂载表。
 
 ### 8.3 inotify
 

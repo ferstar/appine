@@ -516,7 +516,7 @@ pub(crate) fn interp_label(
         .unwrap_or_else(|_| path.clone());
     let ino = match node {
         Node::Store(ino) => ino,
-        Node::Pseudo(_) => 0,
+        Node::Pseudo(..) => 0,
     };
     Some((Rc::from(name), ino))
 }

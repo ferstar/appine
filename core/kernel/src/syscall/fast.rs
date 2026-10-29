@@ -86,7 +86,7 @@ impl Fast {
                     root,
                     cwd: match fs.cwd {
                         Node::Store(ino) => Some(ino),
-                        Node::Pseudo(_) => None,
+                        Node::Pseudo(..) => None,
                     },
                 })
             }
