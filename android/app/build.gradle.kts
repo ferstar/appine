@@ -98,7 +98,10 @@ abstract class CargoNdkTask : DefaultTask() {
                 "build", "--release", "-p", "appine-android",
             )
             if (features.get().isNotEmpty()) args("--features", features.get().joinToString(","))
+            // 两个都设：只设一个时，环境里另一个指向别的 NDK（GitHub 的 runner 预设了
+            // ANDROID_NDK_ROOT）cargo-ndk 会警告，用哪个取决于它的优先顺序
             environment("ANDROID_NDK_HOME", ndkDirectory.get())
+            environment("ANDROID_NDK_ROOT", ndkDirectory.get())
             environment("CARGO_TARGET_DIR", File(root, "target/android").path)
         }
     }
