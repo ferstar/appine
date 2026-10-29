@@ -1,6 +1,6 @@
 # M9 之前：起进程和 mmap 的持锁时间（2026-10-30）
 
-← [M9 之前：同一个程序共用翻译（2026-10-30）](108-shared-translation.md) · [索引](../milestones.md)
+← [M9 之前：同一个程序共用翻译（2026-10-30）](108-shared-translation.md) · [索引](../milestones.md) · [M9 之前：openat 的开销（2026-10-30）](110-openat-cost.md) →
 
 内存的三轮做完，接着拆 BKL。先用第 38 轮的插桩（`target/mem/bklinstr.py`、`bklsurvey.sh`，按系统调用记持锁、等锁的时间）重新量了一遍，前几轮之后的分布（arm64 的编号：222 mmap、215 munmap、56 openat、94 exit_group、220 clone、221 execve、260 wait4、165 getrusage、62 lseek）：
 
@@ -56,6 +56,6 @@
 - mmap、munmap 仍持 BKL（复用之后每次约 1.3 µs、0.6 µs），R1 的退路（地址空间的操作改用每个 mm 自己的锁）没做。
 - Go、JVM 的大块映射（`go build` 里 mmap 每次约 18 µs，最长 4.5 ms）：软件页表要逐页填进去，Linux 是缺页时才填。
 - clone 里 `Mm::fork` 约 10 µs（见上），exit_group 约 7 µs，execve 在锁里的部分约 5 µs；4 个同时起进程仍是原生的 2.4 倍多。
-- `go build` 的 openat 每次 10–21 µs，没有拆开看。
+- `go build` 的 openat 每次 10–21 µs，没有拆开看。→ 拆开看了（M9 之前：openat 的开销）：合计只占墙钟的 1.3%，平均数是被新建文件（55 µs，大头是宿主上建 object 和 SQLite）拉高的，没有便宜的改法，没改
 - 被打断的线程取 BKL 看信号（Maven 0.34 秒等锁），见上。
 - 所有 guest 进程共用宿主进程的一把 `mmap_lock`：复用只省掉了匿名内存的 mmap、munmap，文件映射、fork 预先映射以外的、exec 建地址空间的映射照旧。
