@@ -1293,8 +1293,11 @@ static void run(const char *what, int sig, int unwaited)
     int st;
     if (waitpid(child, &st, WNOHANG) == child && WIFSIGNALED(st))
         printf("  after tracer exit: killed by %s\n", strsignal(WTERMSIG(st)));
-    else
-        printf("  after tracer exit: state %c\n", state(child));
+    else {
+        /* 它在 usleep 的循环里，读到 R 还是 S 看时机：只看停没停住 */
+        char c = state(child);
+        printf("  after tracer exit: %s\n", c == 'T' || c == 't' ? "stopped" : c == 'R' || c == 'S' ? "running" : "?");
+    }
     fflush(stdout);
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);

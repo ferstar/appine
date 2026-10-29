@@ -49,10 +49,11 @@ if [ "$(uname -sm)" = "Linux aarch64" ]; then
     *) run=$root/$run ;;
     esac
     linux() { sh -c "$1"; }
-    # 与 scripts/dev 一样放开 nice 的上限（guest 线程的 nice 值设置到宿主线程上）
+    # 以调用者的身份运行，新建的仓库属于调用者，宿主上的 linux 也打得开；与 scripts/dev
+    # 一样放开 nice 的上限（guest 线程的 nice 值设置到宿主线程上）
     appine() {
         docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
-            --ulimit nice=40:40 -v "$root:$root" -w "$root" \
+            --user "$(id -u):$(id -g)" --ulimit nice=40:40 -v "$root:$root" -w "$root" \
             "${APPINE_IMAGE:-debian:trixie-slim}" "$run" "$@"
     }
 else
