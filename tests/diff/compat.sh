@@ -2228,3 +2228,59 @@ int main(void)
 C
 gcc -O1 -o woken woken.c
 ./woken
+
+# /proc/self/fd 和 maps 里的路径与 d_path 一样解析完符号链接：最后一级是链接、经由链接的
+# 目录、链接后面的 ..（按实际的目录回退）、O_PATH|O_NOFOLLOW 停在链接本身、沿着悬空的链接
+# 新建的文件、经由链接进入的当前目录下的相对路径；经由链接 mmap 的文件，PT_INTERP 指向
+# 链接的程序里解释器的映射（valgrind 按这些名字带着 O_NOFOLLOW 重新打开文件）
+rm -rf /tmp/rp; mkdir -p /tmp/rp/real/sub; ln -s real /tmp/rp/link; echo x > /tmp/rp/real/f
+ln -s f /tmp/rp/real/flink; ln -s new /tmp/rp/dangling; ln -s /lib/ld-musl-aarch64.so.1 /tmp/rp/ld
+cat > rp.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static void show(const char *what, int fd)
+{
+    char p[64], link[256] = {0};
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    if (fd < 0 || readlink(p, link, sizeof link - 1) < 0)
+        strcpy(link, "error");
+    printf("%s %s\n", what, link);
+}
+
+/* maps 里含 `key` 的第一行的路径 */
+static void mapped(const char *what, const char *key)
+{
+    char line[512];
+    FILE *f = fopen("/proc/self/maps", "r");
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, key)) {
+            printf("%s %s", what, strchr(line, '/'));
+            break;
+        }
+    fclose(f);
+}
+
+int main(void)
+{
+    show("last component", open("/tmp/rp/link/flink", O_RDONLY));
+    show("dot dot", open("/tmp/rp/link/sub/../f", O_RDONLY));
+    show("nofollow path", open("/tmp/rp/link/flink", O_PATH | O_NOFOLLOW));
+    show("created", open("/tmp/rp/dangling", O_CREAT | O_WRONLY, 0644));
+    show("directory", open("/tmp/rp/link/", O_RDONLY | O_DIRECTORY));
+    chdir("/tmp/rp/link/sub");
+    show("relative", open("../flink", O_RDONLY));
+    show("relative dir", open("..", O_RDONLY | O_DIRECTORY));
+    int fd = open("/tmp/rp/link/flink", O_RDONLY);
+    mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    mapped("mmap", "/tmp/rp/");
+    mapped("interpreter", "ld-musl");
+    return 0;
+}
+C
+gcc -O1 -Wl,--dynamic-linker=/tmp/rp/ld -o rpaths rp.c
+./rpaths

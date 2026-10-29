@@ -192,8 +192,16 @@ impl Machine {
                 })
                 .unwrap_or(0)
         };
-        let interp_ino = image.interp.as_ref().map_or(0, |(p, ..)| ino_of(p));
-        crate::syscall::label_image(&mut mm, &image, &exe, (ino_of(program), interp_ino));
+        let root = Node::ROOT;
+        let interp = crate::syscall::interp_label(
+            vfs.as_deref(),
+            &offline,
+            &Cred::root(),
+            &root,
+            &root,
+            &image,
+        );
+        crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program)), interp);
 
         let tid = k.alloc_tid().map_err(io_err)?;
         let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));

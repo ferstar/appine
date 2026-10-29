@@ -7,7 +7,7 @@ use appine_engine::Cpu;
 
 use super::{Flow, SysResult, put, read_path};
 use crate::cell::RefCell;
-use crate::cred::cap;
+use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, Pidfd, oflags};
 use crate::kernel::{Cx, Tid};
@@ -18,7 +18,7 @@ use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
 use crate::vfs::store::mode;
-use crate::vfs::{Node, normalize};
+use crate::vfs::{Node, Pseudo, Vfs, normalize};
 
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
@@ -464,18 +464,48 @@ fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
 }
 
-/// 给程序和解释器的映射起名字（`/proc/<pid>/maps`）。`inos` 是它们在仓库里的 inode
-/// （不知道时是 0）。
-pub(crate) fn label_image(mm: &mut Mm, image: &loader::Image, exe: &Rc<[u8]>, inos: (u64, u64)) {
+/// 给程序和解释器的映射起名字（`/proc/<pid>/maps`）。`exe`、`interp` 是名字和在仓库里的
+/// inode（不知道时是 0），解释器的见 [`interp_label`]。
+pub(crate) fn label_image(
+    mm: &mut Mm,
+    image: &loader::Image,
+    exe: (&Rc<[u8]>, u64),
+    interp: Option<(Rc<[u8]>, u64)>,
+) {
     mm.label(
         image.main.0,
         image.main.1 - image.main.0,
-        Some(exe.clone()),
-        inos.0,
+        Some(exe.0.clone()),
+        exe.1,
     );
-    if let Some((path, start, end)) = &image.interp {
-        mm.label(*start, end - start, Some(Rc::from(path.as_slice())), inos.1);
+    if let (Some((_, start, end)), Some((name, ino))) = (&image.interp, interp) {
+        mm.label(*start, end - start, Some(name), ino);
     }
+}
+
+/// 解释器在 maps 里的名字和 inode：名字与主程序一样解析完符号链接（Debian 的
+/// `/lib/ld-linux-aarch64.so.1` 是链接）；找不到时是 PT_INTERP 原样的路径。
+pub(crate) fn interp_label(
+    vfs: Option<&Vfs>,
+    ps: &dyn Pseudo,
+    cred: &Cred,
+    root: &Node,
+    cwd: &Node,
+    image: &loader::Image,
+) -> Option<(Rc<[u8]>, u64)> {
+    let (path, ..) = image.interp.as_ref()?;
+    let walked = vfs.and_then(|vfs| Some((vfs, vfs.walk(ps, cred, root, cwd, path, true).ok()?)));
+    let Some((vfs, (node, found))) = walked else {
+        return Some((Rc::from(path.as_slice()), 0));
+    };
+    let name = vfs
+        .found_path(ps, root, &node, found.as_ref())
+        .unwrap_or_else(|_| path.clone());
+    let ino = match node {
+        Node::Store(ino) => ino,
+        Node::Pseudo(_) => 0,
+    };
+    Some((Rc::from(name), ino))
 }
 
 fn load_error(e: LoadError) -> Errno {
@@ -647,13 +677,8 @@ fn exec(
     }
     let (mut mm, image) = built.map_err(load_error)?;
     let view = cx.view(&vfs);
-    let interp_ino = image.interp.as_ref().and_then(|(p, ..)| {
-        match vfs.resolve(&view, &cred, &root, &cwd, p, true) {
-            Ok(Node::Store(ino)) => Some(ino),
-            _ => None,
-        }
-    });
-    label_image(&mut mm, &image, &exe, (st.ino, interp_ino.unwrap_or(0)));
+    let interp = interp_label(Some(&*vfs), &view, &cred, &root, &cwd, &image);
+    label_image(&mut mm, &image, (&exe, st.ino), interp);
     mm.exe = Some(st.ino);
 
     // 从这里开始不能失败：结束同一线程组里的其他线程，然后换掉地址空间

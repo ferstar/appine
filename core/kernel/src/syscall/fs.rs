@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
-use crate::vfs::{Mount, Node, Pseudo, Vfs, normalize};
+use crate::vfs::{Dentry, Mount, Node, Pseudo, Vfs, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -273,8 +273,21 @@ fn store_ino(node: &Node) -> Result<Ino, Errno> {
     }
 }
 
-/// 打开时记下的绝对路径（`/proc/<pid>/fd/<n>`）：词法上规范化，不跟随符号链接。
-fn display_path(cx: &Cx<'_>, vfs: &Vfs, start: &Node, path: &[u8]) -> Option<Rc<[u8]>> {
+/// 打开时记下的绝对路径（`/proc/<pid>/fd/<n>`、maps）：与 Linux 的 `d_path` 一样解析完
+/// 符号链接，按最后找到文件的目录和名字 `found` 算。valgrind 按 `/proc/self/fd` 里的名字
+/// 带着 `O_NOFOLLOW` 重新打开 Debian 的 `/lib/ld-linux-aarch64.so.1`（最后一级是链接）。
+/// 经由 `/proc/<pid>/fd/<n>` 这种链接到达、不知道名字的文件按词法规范化的路径。
+fn display_path(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    start: &Node,
+    path: &[u8],
+    node: &Node,
+    found: Option<&Dentry>,
+) -> Option<Rc<[u8]>> {
+    if let Ok(p) = vfs.found_path(&cx.view(vfs), &cx.root(), node, found) {
+        return Some(Rc::from(p));
+    }
     let full = if path.first() == Some(&b'/') {
         path.to_vec()
     } else {
@@ -550,7 +563,7 @@ fn open_path(
         Err(e) => return Err(e),
     };
 
-    let mut display = display_path(cx, &vfs, &start, &path);
+    let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
     let was_created = created.is_some();
     let opened_ino = match &node {
         Node::Store(ino) if flags & oflags::O_PATH == 0 => Some(*ino),

@@ -370,17 +370,30 @@ impl Vfs {
         cwd: &Node,
         path: &[u8],
     ) -> Result<Vec<u8>, Errno> {
-        match self.walk(ps, cred, root, cwd, path, true)? {
-            (_, Some((dir, name))) => {
-                let mut p = self.path_of(ps, root, &dir)?;
+        let (node, found) = self.walk(ps, cred, root, cwd, path, true)?;
+        self.found_path(ps, root, &node, found.as_ref())
+    }
+
+    /// [`walk`](Self::walk) 找到的 `node` 的绝对路径，按最后找到它的目录和名字 `found`
+    /// 算，见 [`real_path`](Self::real_path)。
+    pub(crate) fn found_path(
+        &self,
+        ps: &dyn Pseudo,
+        root: &Node,
+        node: &Node,
+        found: Option<&Dentry>,
+    ) -> Result<Vec<u8>, Errno> {
+        match found {
+            Some((dir, name)) => {
+                let mut p = self.path_of(ps, root, dir)?;
                 if p != b"/" {
                     p.push(b'/');
                 }
-                p.extend_from_slice(&name);
+                p.extend_from_slice(name);
                 Ok(p)
             }
-            (node, None) if self.is_dir(ps, &node)? => self.path_of(ps, root, &node),
-            _ => Err(Errno::ENOENT),
+            None if self.is_dir(ps, node)? => self.path_of(ps, root, node),
+            None => Err(Errno::ENOENT),
         }
     }
 

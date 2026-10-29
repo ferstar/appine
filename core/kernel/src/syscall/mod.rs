@@ -528,7 +528,7 @@ fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flo
     }
 }
 
-pub(crate) use proc::label_image;
+pub(crate) use proc::{interp_label, label_image};
 
 /// 读取 guest 的路径参数。
 fn read_path(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {

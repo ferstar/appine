@@ -689,6 +689,27 @@ fn procfs_describes_processes() {
 }
 
 #[test]
+fn procfs_fd_paths_resolve_symlinks() {
+    // 与 Linux 的 d_path 一样，/proc/<pid>/fd 里是解析完符号链接的路径：valgrind 按它带着
+    // O_NOFOLLOW 重新打开 Debian 的 /lib/ld-linux-aarch64.so.1（最后一级是链接）
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "d=/tmp/rp.$$; mkdir -p $d/real/sub; ln -s real $d/link; echo x > $d/real/f; \
+         ln -s f $d/real/flink; ln -s new $d/dangling; \
+         exec 3<$d/link/flink 4<$d/link/sub/../f 5>$d/dangling; cd $d/link; exec 6<flink; \
+         for fd in 3 4 5 6; do readlink /proc/self/fd/$fd | sed \"s|^$d|D|\"; done; rm -rf $d",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["D/real/f", "D/real/f", "D/new", "D/real/f"],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
 fn sysfs_and_limits_describe_the_machine() {
     // busybox 的 nproc --all 数 /sys/devices/system/cpu 下的 cpu<n>；/proc/self/limits 与
     // ulimit 一致
