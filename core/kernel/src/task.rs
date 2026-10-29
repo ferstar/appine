@@ -468,18 +468,26 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     // （crate::mm::CodeGroup）。Mm 只在持有 BKL 时访问；挂上去（清空跳转缓存等）不用 BKL
     let space_of = |k: &Kernel| match tier {
         Tier::Interpreter => None,
-        Tier::Dbt => task.state.borrow().mm.borrow_mut().code_space(&k.code_groups),
+        Tier::Dbt => task
+            .state
+            .borrow()
+            .mm
+            .borrow_mut()
+            .code_space(&k.code_groups),
     };
-    let attach = |space: Option<Arc<CodeSpace>>| {
-        space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)))
-    };
+    let attach =
+        |space: Option<Arc<CodeSpace>>| space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)));
     let space = space_of(&k);
     let mut fast = Fast::new(shared, &task, &task.state.borrow());
     drop(k);
     let mut dbt = attach(space);
     let load = |g: &Generations| {
         let tlb = g.tlb.load(Ordering::SeqCst);
-        (tlb, g.code.load(Ordering::SeqCst), g.space.load(Ordering::SeqCst))
+        (
+            tlb,
+            g.code.load(Ordering::SeqCst),
+            g.space.load(Ordering::SeqCst),
+        )
     };
     let mut seen = load(&generations);
     loop {

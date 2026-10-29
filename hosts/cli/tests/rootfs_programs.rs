@@ -1401,7 +1401,11 @@ fn code_cache_pages_are_counted_once() {
         caches
     };
     let rss = |caches: &[(String, u64)], perms: &str| -> Vec<u64> {
-        caches.iter().filter(|(p, _)| p == perms).map(|&(_, kb)| kb).collect()
+        caches
+            .iter()
+            .filter(|(p, _)| p == perms)
+            .map(|&(_, kb)| kb)
+            .collect()
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = caches();
@@ -1411,7 +1415,13 @@ fn code_cache_pages_are_counted_once() {
     }
     child.stdin.take().unwrap().write_all(b"\n").unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(0));
-    assert!(rss(&seen, "r-xs").iter().max().is_some_and(|&kb| kb >= 1024), "{seen:?}");
+    assert!(
+        rss(&seen, "r-xs")
+            .iter()
+            .max()
+            .is_some_and(|&kb| kb >= 1024),
+        "{seen:?}"
+    );
     assert_eq!(rss(&seen, "rw-s").iter().sum::<u64>(), 0, "{seen:?}");
 }
 

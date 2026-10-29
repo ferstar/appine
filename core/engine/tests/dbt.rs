@@ -466,7 +466,11 @@ fn exits_beyond_48_bits_keep_the_whole_pc() {
     page[..4].copy_from_slice(&b(LAST, LAST + 4092).to_le_bytes());
     page[4092..].copy_from_slice(&movz_x0(5).to_le_bytes());
     let host = NonNull::new(g.pages[3].0.as_mut_ptr()).unwrap();
-    unsafe { g.mmu.map(LAST, host, PAGE_SIZE, prot::READ | prot::EXEC).unwrap() };
+    unsafe {
+        g.mmu
+            .map(LAST, host, PAGE_SIZE, prot::READ | prot::EXEC)
+            .unwrap()
+    };
     g.cpu.state_mut().pc = LAST;
     match dbt.run(&mut g.cpu) {
         Exit::Fault { addr, .. } => assert_eq!(addr, 1 << 48),

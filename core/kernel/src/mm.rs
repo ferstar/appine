@@ -105,9 +105,8 @@ impl Drop for HostRegion {
     fn drop(&mut self) {
         let (base, len, anonymous) = (self.base, self.len, self.anonymous);
         if let Some(reserve) = anonymous {
-            let deferred = UNMAPPED.with_borrow_mut(|u| {
-                u.as_mut().map(|u| u.anonymous.push((base, len, reserve)))
-            });
+            let deferred = UNMAPPED
+                .with_borrow_mut(|u| u.as_mut().map(|u| u.anonymous.push((base, len, reserve))));
             if deferred.is_some() {
                 UNMAPPING.fetch_add(len, Ordering::Relaxed);
             } else {
@@ -152,7 +151,9 @@ mod recycled {
 
     /// 拿一段留着的、内容是零的私有匿名宿主内存。
     pub(super) fn take(len: usize, reserve: bool) -> Option<NonNull<u8>> {
-        let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let c = cache.as_mut()?;
         let base = c.free.get_mut(&(len, reserve))?.pop()?;
         c.bytes -= len;
@@ -166,7 +167,9 @@ mod recycled {
     /// 这段宿主内存由 [`appine_hal::map_anonymous`] 申请，已经没有人用它。
     pub(super) unsafe fn put(base: NonNull<u8>, len: usize, reserve: bool) {
         {
-            let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cache = CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let c = cache.get_or_insert_with(|| Cache {
                 free: HashMap::new(),
                 bytes: 0,
@@ -1199,7 +1202,10 @@ impl Mm {
         let Some(key) = self.exe.filter(|_| !self.unshareable) else {
             return;
         };
-        let Some(layout) = self.exec_layout().filter(|l| l.len() <= CodeGroup::MAX_RANGES) else {
+        let Some(layout) = self
+            .exec_layout()
+            .filter(|l| l.len() <= CodeGroup::MAX_RANGES)
+        else {
             self.unshareable = true;
             return;
         };
@@ -1259,7 +1265,10 @@ impl Mm {
         let Some(group) = self.code_group.clone() else {
             return;
         };
-        if self.exec_layout().is_some_and(|layout| group.extend(&layout)) {
+        if self
+            .exec_layout()
+            .is_some_and(|layout| group.extend(&layout))
+        {
             return;
         }
         crate::debug::log(format_args!(
