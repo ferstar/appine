@@ -5,8 +5,9 @@ import java.io.IOException
 /**
  * 原生库 libappine.so 的 JNI 接口，实现在 hosts/android/src/lib.rs。
  *
- * `machine` 是 [start] 返回的句柄；[stop] 之后不能再用。阻塞的调用（[read]、[write]、
- * [waitFor]）只能在后台线程上进行。
+ * `machine` 是 [start] 返回的句柄。[stop] 之后再用它也安全：读写返回 -1，[waitFor] 返回
+ * -9（进程都被 SIGKILL 结束了），新开控制台、起进程抛出异常，别的什么也不做。阻塞的调用
+ * （[read]、[write]、[waitFor]）只能在后台线程上进行。
  */
 internal object Native {
     init {

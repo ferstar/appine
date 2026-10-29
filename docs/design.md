@@ -597,13 +597,14 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 `android/app/src/main/java/.../Rootfs.kt`：
 
-1. 把 APK assets 里的 Alpine minirootfs（`rootfs.tgz`）以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。tarball 由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里。原计划还要校验官方的 GPG 签名，没有做。
-2. 写入 `/etc/apk/repositories`、`/etc/hostname`、`/etc/hosts`（已有就不动）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、彩色 `PS1`，显示 motd，切到 `$HOME`）。`/etc/resolv.conf` 由内核层在打开仓库时补上（§10）。
-3. 以 root 身份启动 `ash -l`。
+1. 第一次运行时让用户选发行版：Alpine Linux、Debian 13、Ubuntu 24.04。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里；Debian（debuerreotype 构建的 `debian:trixie`，固定在一个提交上）、Ubuntu（官方的 ubuntu-base，清华、中科大的镜像上有同一份）的选了才下载，版本、长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。原计划还要校验官方的 GPG 签名，没有做。
+2. 以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。
+3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有，Ubuntu 的是空的）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、彩色 `PS1`，显示 motd，切到 `$HOME`）。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1、Ubuntu 的是空的，App 改成指向 DNS 存根。
+4. 终端标签页以 `/etc/passwd` 里 root 的 shell 登录（`ConsolePty.LOGIN`）：Alpine 是 ash，Debian、Ubuntu 是 bash，chsh 改过之后照样。
 
-- **镜像选择**：APK 里内置一份镜像列表：dl-cdn、清华、中科大、阿里云。首次启动时在后台并发测速（下载 APKINDEX 的前 128 KB，每个最多 5 秒），选最快的写入配置，全部失败时保持 dl-cdn。设置里手动更换镜像还没做。
-- **升级**：App 更新时不动用户已有的 rootfs。同一分支内由用户自己运行 `apk upgrade`；跨分支升级由用户修改 `repositories`。
-- **v1 提供"重置 rootfs"**（未实现，随设置界面一起做）。rootfs 导出和导入（tar 格式）放到 v1.x。
+- **镜像选择**：每个发行版内置一份镜像列表：官方的（dl-cdn、deb.debian.org、ports.ubuntu.com）、清华、中科大、阿里云。首次启动时在后台并发测速（与下载 tarball 的测速相同），选最快的写入包管理器的源，全部失败时保持官方的。设置里手动更换镜像还没做。
+- **升级**：App 更新时不动用户已有的 rootfs。同一分支内由用户自己运行 `apk upgrade`、`apt upgrade`；跨分支升级由用户修改源。
+- **重置 rootfs**：标签栏的菜单里，确认之后结束所有会话和 guest 进程，删掉仓库，重新选发行版（[App 里选 rootfs](rounds/99-choose-rootfs.md)）。一次只有一个 rootfs，换发行版就丢掉原来的文件；rootfs 导出和导入（tar 格式）放到 v1.x。
 
 ---
 

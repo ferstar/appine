@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
@@ -22,6 +23,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -45,12 +47,18 @@ class MainActivity : Activity(), TerminalService.Listener {
     private var current: TerminalSession? = null
     private var fontSize = 0
 
+    /** 选发行版的对话框；Activity 停下时关掉，回来时服务还在等就再弹出来。 */
+    private var chooser: AlertDialog? = null
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val s = (binder as TerminalService.LocalBinder).service
             service = s
             s.listener = this@MainActivity
-            if (s.machine != 0L || s.startError != null) onMachineReady(s.startError)
+            when {
+                s.needsDistro -> onNeedDistro(s.installError)
+                s.machine != 0L || s.startError != null -> onMachineReady(s.startError)
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -72,7 +80,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         status = TextView(this).apply {
             setTextColor(Color.LTGRAY)
             gravity = Gravity.CENTER
-            setText(R.string.preparing)
+            setText(R.string.starting)
         }
         tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         keys = ExtraKeysView(this) { terminal }
@@ -85,6 +93,7 @@ class MainActivity : Activity(), TerminalService.Listener {
                 addView(tabs)
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(barButton("+") { newSession() })
+            addView(barButton("⋮") { showMenu(it) })
         }
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -123,6 +132,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     override fun onStop() {
+        chooser?.dismiss()
+        chooser = null
         service?.listener = null
         unbindService(connection)
         service = null
@@ -138,11 +149,24 @@ class MainActivity : Activity(), TerminalService.Listener {
             return
         }
         status.visibility = View.GONE
+        terminal.visibility = View.VISIBLE
         if (s.sessions.isEmpty()) {
             newSession()
         } else {
             show(current?.takeIf { it in s.sessions } ?: s.sessions.last())
         }
+    }
+
+    override fun onNeedDistro(error: String?) {
+        terminal.visibility = View.INVISIBLE
+        status.visibility = View.VISIBLE
+        status.text = ""
+        showChooser(error)
+    }
+
+    override fun onProgress(text: String) {
+        status.visibility = View.VISIBLE
+        status.text = text
     }
 
     override fun onSessionsChanged() {
@@ -166,6 +190,65 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onExitAll() {
         finish()
+    }
+
+    // ---- rootfs ----
+
+    /**
+     * 第一次运行、重置之后选发行版（设计文档 §11.4）；要下载的标出大小。上次准备失败时
+     * 把原因写在标题下面（对话框挡住了中间的状态文字）。
+     */
+    private fun showChooser(error: String?) {
+        if (chooser != null) return
+        val distros = Rootfs.Distro.entries
+        val labels = distros.map { d ->
+            d.download?.let { getString(R.string.distro_download, d.label, it.size shr 20) } ?: d.label
+        }
+        val builder = AlertDialog.Builder(this)
+        if (error == null) {
+            builder.setTitle(R.string.choose_distro)
+        } else {
+            builder.setCustomTitle(TextView(this).apply {
+                text = getString(R.string.choose_distro_after_failure, error)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setPadding(dp(24), dp(20), dp(24), dp(4))
+            })
+        }
+        chooser = builder
+            .setItems(labels.toTypedArray()) { _, i ->
+                chooser = null
+                status.text = getString(R.string.preparing, distros[i].label)
+                service?.install(distros[i])
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun showMenu(anchor: View) {
+        val s = service ?: return
+        if (s.machine == 0L) return
+        PopupMenu(this, anchor).apply {
+            menu.add(R.string.menu_reset).setOnMenuItemClickListener {
+                confirmReset()
+                true
+            }
+            show()
+        }
+    }
+
+    private fun confirmReset() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.reset_title)
+            .setMessage(R.string.reset_message)
+            .setPositiveButton(R.string.reset) { _, _ ->
+                current = null
+                terminal.visibility = View.INVISIBLE
+                status.visibility = View.VISIBLE
+                status.setText(R.string.resetting)
+                service?.reset()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     // ---- 会话 ----
@@ -204,12 +287,12 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    private fun barButton(label: String, onClick: () -> Unit) = TextView(this).apply {
+    private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
         text = label
         setTextColor(Color.LTGRAY)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         setPadding(dp(12), dp(10), dp(12), dp(10))
-        setOnClickListener { onClick() }
+        setOnClickListener(onClick)
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()

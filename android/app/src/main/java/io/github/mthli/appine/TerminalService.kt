@@ -36,6 +36,15 @@ class TerminalService : Service() {
         /** 内核已经启动（或启动失败，[error] 不为 null）。 */
         fun onMachineReady(error: String?)
 
+        /**
+         * 还没有 rootfs（第一次运行、重置之后，或者上次准备失败，[error] 不为 null）：要用户
+         * 选发行版。
+         */
+        fun onNeedDistro(error: String?)
+
+        /** 准备 rootfs 的进度。 */
+        fun onProgress(text: String)
+
         /** 会话列表、标题或状态变了。 */
         fun onSessionsChanged()
 
@@ -69,6 +78,19 @@ class TerminalService : Service() {
     /** 启动失败的原因。 */
     var startError: String? = null
         private set
+
+    /** 在等用户选发行版（[install]）；[installError] 是上次准备失败的原因。 */
+    var needsDistro = false
+        private set
+    var installError: String? = null
+        private set
+
+    /** 第一次运行时给镜像测速的线程：重置之前要等它写完源。 */
+    @Volatile
+    private var mirrorThread: Thread? = null
+
+    /** 注册了 [network]。 */
+    private var watchingNetwork = false
 
     val sessions = mutableListOf<TerminalSession>()
 
@@ -175,22 +197,76 @@ class TerminalService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        if (Rootfs.isReady(this)) start(null) else needsDistro = true
+    }
+
+    /** 用户选了发行版：下载（如果要）、导入 rootfs，然后启动内核。 */
+    internal fun install(distro: Rootfs.Distro) {
+        if (!needsDistro) return
+        needsDistro = false
+        installError = null
+        start(distro)
+    }
+
+    /** 启动内核；[distro] 不为 null 时先准备它的 rootfs。 */
+    private fun start(distro: Rootfs.Distro?) {
         thread(name = "appine-start") {
             val result = runCatching {
-                val firstRun = !Rootfs.isReady(this)
-                Rootfs.prepare(this)
-                if (firstRun) thread(name = "appine-mirrors") { Rootfs.chooseMirror(this) }
+                if (distro != null) {
+                    Rootfs.prepare(this, distro, progress = { done, total ->
+                        val text = getString(R.string.downloading, distro.label, done shr 20, total shr 20)
+                        main.post { listener?.onProgress(text) }
+                    })
+                    mirrorThread = thread(name = "appine-mirrors") { Rootfs.chooseMirror(this, distro) }
+                }
                 Native.start(Rootfs.store(this).path, 1)
             }
             main.post {
                 result.onSuccess {
                     machine = it
                     getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
+                    watchingNetwork = true
+                    listener?.onMachineReady(null)
                 }.onFailure {
                     Log.e(TAG, "cannot start", it)
-                    startError = it.message ?: it.toString()
+                    val error = it.message ?: it.toString()
+                    if (distro != null && !Rootfs.isReady(this)) {
+                        // 下载、导入失败：让用户重试或者换一个
+                        needsDistro = true
+                        installError = error
+                        listener?.onNeedDistro(error)
+                    } else {
+                        startError = error
+                        listener?.onMachineReady(error)
+                    }
                 }
-                listener?.onMachineReady(startError)
+            }
+        }
+    }
+
+    /**
+     * 重置 rootfs（设计文档 §11.4）：结束所有会话和 guest 进程，删掉仓库，再让用户选发行版。
+     * 停内核、删文件在 [worker] 上做。
+     */
+    fun reset() {
+        if (machine == 0L) return
+        if (watchingNetwork) {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
+            watchingNetwork = false
+        }
+        val m = machine
+        // 先清掉句柄：会话结束时 Activity 看到内核还在，会以为是最后一个标签页关掉了而退出
+        machine = 0
+        for (s in sessions) s.finishIfRunning()
+        sessions.clear()
+        sessionsChanged()
+        worker.execute {
+            Native.stop(m)
+            mirrorThread?.join()
+            Rootfs.reset(this)
+            main.post {
+                needsDistro = true
+                listener?.onNeedDistro(null)
             }
         }
     }
@@ -205,7 +281,7 @@ class TerminalService : Service() {
 
     override fun onDestroy() {
         main.removeCallbacks(trimWhenHidden)
-        if (machine != 0L) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
+        if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
         val m = machine

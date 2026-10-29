@@ -107,6 +107,7 @@
 | [M9 之前：`/proc/<pid>/net`](rounds/96-proc-pid-net.md) | 2026-10-29 | 网络的那些文件与 Linux 一样放在 `/proc/<pid>/net` 下（task 子目录里也有），`/proc/net` 改成指向 `self/net` 的链接（原来是目录，经由 `/proc/self/net` 读不到） |
 | [M9 之前：已经删除的文件带 ` (deleted)`](rounds/97-deleted-suffix.md) | 2026-10-29 | 删除之后还开着、映射着的文件，`/proc/<pid>/fd` 和 maps、smaps 里的路径后面加上 ` (deleted)`，与 Linux 相同（needrestart 按它找出还在用旧库的进程）；exe 不加 |
 | [M9 之前：路由表](rounds/98-routes.md) | 2026-10-29 | 主表取自宿主（Android 上 App 从默认网络的 `LinkProperties` 交来，别处读宿主的 `/proc/net/route`），本地表按接口的地址合成：`ip route`、`ip route get`（原来 EOPNOTSUPP）、`ip rule`、`route -n`、`/proc/net/route`、`ipv6_route` 与 Linux 逐字节相同；`ip neigh` 是空表，新增 `/proc/net/sockstat`；NETLINK_ROUTE 的错误附上整条请求 |
+| [M9 之前：App 里选 rootfs](rounds/99-choose-rootfs.md) | 2026-10-29 | 首次启动选 Alpine、Debian 13 或 Ubuntu 24.04，后两个选了才下载（版本、sha256 固定，按吞吐量测速选来源，断点续传），菜单里可以重置 rootfs；登录 shell 取 `/etc/passwd` 里 root 的（Debian、Ubuntu 是 bash）；JNI 的句柄改为登记表，修了重置、服务销毁时用到已经释放的 Machine |
 
 ## 测量条件
 

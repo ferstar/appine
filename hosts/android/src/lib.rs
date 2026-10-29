@@ -1,8 +1,10 @@
 //! appine 的 Android 原生库（设计文档 §3、§11）：Kotlin 外壳经由 JNI 使用内核层。
 //!
 //! 对应的 Kotlin 声明是 `android/app/src/main/java/io/github/mthli/appine/Native.kt`。
-//! [`Machine`] 以 `Arc` 的裸指针交给 Kotlin（`long` 句柄），每次调用临时增加一个引用，
-//! 所以 `stop` 和别的线程上正在阻塞的读并发时也是安全的：最后一个引用消失时才析构。
+//! [`Machine`] 登记在一张表里，交给 Kotlin 的是编号（`long` 句柄）。每次调用临时取一个
+//! 引用，所以 `stop` 和别的线程上正在阻塞的读并发时也是安全的：最后一个引用消失时才析构。
+//! `stop` 把它从表里删掉，之后用这个句柄的调用（会话结束之后才清理的 `closeConsole` 等）
+//! 查不到它，当作控制台已经关闭。
 //! 出错时抛出 `java.io.IOException`。阻塞的调用（读控制台、等进程结束）由 Kotlin 在
 //! 后台线程上进行。内核层的 bug（panic）在 [`Machine`] 的方法里就兜住了，变成这些调用
 //! 的错误，不会穿过 JNI 边界让 App 进程 abort。
@@ -10,9 +12,11 @@
 //! 只为 Android 编译，其他宿主上是一个空库。
 #![cfg(target_os = "android")]
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Stdio, Tier};
 use jni::JNIEnv;
@@ -38,15 +42,17 @@ fn strings(env: &mut JNIEnv<'_>, array: &JObjectArray<'_>) -> Option<Vec<Vec<u8>
     Some(out)
 }
 
-/// 句柄对应的 Machine，调用期间持有一个引用。
-fn machine(handle: jlong) -> Arc<Machine> {
-    let ptr = handle as *const Machine;
-    // SAFETY: handle 来自 start 里的 Arc::into_raw，Kotlin 保证 stop 之后不再使用它；
-    // stop 只释放它自己的那个引用
-    unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }
+/// 句柄 → Machine（模块文档）。
+static MACHINES: Mutex<BTreeMap<jlong, Arc<Machine>>> = Mutex::new(BTreeMap::new());
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, Arc<Machine>>> {
+    MACHINES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 句柄对应的 Machine，调用期间持有一个引用；已经 stop 了是 None。
+fn machine(handle: jlong) -> Option<Arc<Machine>> {
+    machines().get(&handle).cloned()
 }
 
 /// 把 stderr（内核层的日志、内部错误）转到 logcat。
@@ -158,7 +164,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
         memory_limit: None,
     };
     match Machine::start(&options) {
-        Ok(m) => Arc::into_raw(Arc::new(m)) as jlong,
+        Ok(m) => {
+            let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+            machines().insert(handle, Arc::new(m));
+            handle
+        }
         Err(e) => {
             throw(&mut env, format!("cannot start: {e}"));
             0
@@ -166,16 +176,18 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     }
 }
 
-/// 结束所有 guest 进程，释放 Kotlin 持有的引用。
+/// 结束所有 guest 进程，从表里删掉句柄。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
 ) {
-    machine(handle).kill_all();
-    // SAFETY: 释放 start 交出去的那个引用
-    drop(unsafe { Arc::from_raw(handle as *const Machine) });
+    // 先删掉再结束：kill_all 要等，不能拿着表的锁
+    let m = machines().remove(&handle);
+    if let Some(m) = m {
+        m.kill_all();
+    }
 }
 
 /// 宿主内存紧张：丢掉可以重建的缓存（池里保留的翻译等），提交推迟的写事务。
@@ -185,7 +197,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    machine(handle).trim_memory();
+    if let Some(m) = machine(handle) {
+        m.trim_memory();
+    }
 }
 
 /// `Native.kt` 交来的一条路由：`<目标网段的十六进制>/<前缀长度> <网关的十六进制或者 -> <接口>`。
@@ -251,7 +265,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
                 .collect(),
         )
     };
-    machine(handle).set_routes(routes);
+    if let Some(m) = machine(handle) {
+        m.set_routes(routes);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -263,7 +279,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_openConsole<'l>(
     cols: jint,
 ) -> jint {
     let (rows, cols) = (rows.clamp(1, 0xffff) as u16, cols.clamp(1, 0xffff) as u16);
-    match machine(handle).open_console(rows, cols) {
+    let Some(m) = machine(handle) else {
+        throw(&mut env, "the machine is stopped");
+        return -1;
+    };
+    match m.open_console(rows, cols) {
         Ok(id) => id as jint,
         Err(e) => {
             throw(&mut env, format!("cannot open a console: {e}"));
@@ -289,7 +309,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_spawn<'l>(
         return -1;
     };
     let stdio = Stdio::Console(console as u32);
-    match machine(handle).spawn(program.as_bytes(), &argv, &envp, stdio) {
+    let Some(m) = machine(handle) else {
+        throw(&mut env, "the machine is stopped");
+        return -1;
+    };
+    match m.spawn(program.as_bytes(), &argv, &envp, stdio) {
         Ok(pid) => pid as jint,
         Err(e) => {
             throw(&mut env, format!("{program}: {e}"));
@@ -310,8 +334,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
     let Ok(len) = env.get_array_length(&buffer) else {
         return -1;
     };
+    let Some(m) = machine(handle) else {
+        return -1;
+    };
     let mut buf = vec![0u8; len as usize];
-    match machine(handle).read_console(console as u32, &mut buf) {
+    match m.read_console(console as u32, &mut buf) {
         Ok(n) => {
             // SAFETY: u8 和 i8 的布局相同
             let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n) };
@@ -344,7 +371,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_write<'l>(
     }
     // SAFETY: u8 和 i8 的布局相同
     let data = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len()) };
-    let m = machine(handle);
+    let Some(m) = machine(handle) else {
+        return -1;
+    };
     let mut done = 0;
     while done < data.len() {
         match m.write_console(console as u32, &data[done..]) {
@@ -364,11 +393,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_resize<'l>(
     rows: jint,
     cols: jint,
 ) {
-    let _ = machine(handle).resize_console(
-        console as u32,
-        rows.clamp(1, 0xffff) as u16,
-        cols.clamp(1, 0xffff) as u16,
-    );
+    if let Some(m) = machine(handle) {
+        let _ = m.resize_console(
+            console as u32,
+            rows.clamp(1, 0xffff) as u16,
+            cols.clamp(1, 0xffff) as u16,
+        );
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -378,10 +409,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_closeConsole<'l>(
     handle: jlong,
     console: jint,
 ) {
-    let _ = machine(handle).close_console(console as u32);
+    if let Some(m) = machine(handle) {
+        let _ = m.close_console(console as u32);
+    }
 }
 
-/// 等进程结束：返回退出码，被信号终止时返回负的信号编号（与 Termux 的约定相同）。
+/// 等进程结束：返回退出码，被信号终止时返回负的信号编号（与 Termux 的约定相同）。内核已经
+/// stop 时进程都被 SIGKILL 结束了。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     _: JNIEnv<'l>,
@@ -389,7 +423,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     handle: jlong,
     pid: jint,
 ) -> jint {
-    match machine(handle).wait(pid as u32) {
+    let Some(m) = machine(handle) else {
+        return -9;
+    };
+    match m.wait(pid as u32) {
         ExitStatus::Exited(code) => code,
         ExitStatus::Signaled { signal, .. } => -signal.number(),
     }

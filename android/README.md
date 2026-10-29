@@ -4,9 +4,11 @@ The Gradle project for the Android shell (design doc §3, §9, §11):
 
 - `app/`: the Kotlin app. `TerminalService` is a `specialUse` foreground service that
   owns the guest kernel and the terminal sessions; `MainActivity` shows them with tabs
-  and a row of extra keys. `Rootfs` imports the Alpine minirootfs from the APK assets on
-  first launch and picks the fastest mirror. `Native` is the JNI interface to
-  `libappine.so`, which is built from `hosts/android` with cargo-ndk.
+  and a row of extra keys. `Rootfs` asks which distribution to use on first launch
+  (Alpine from the APK assets, or Debian and Ubuntu downloaded and checked against
+  pinned sha256 digests), imports it and picks the fastest mirror; the tab bar's menu
+  can reset it. `Native` is the JNI interface to `libappine.so`, which is built from
+  `hosts/android` with cargo-ndk.
 - `terminal-emulator/`, `terminal-view/`: vendored from Termux (see below).
 
 ## Building
@@ -22,7 +24,11 @@ tarball (`scripts/fetch-rootfs`, run from the repository root).
 
 The native library is always built in release mode: the interpreter is too slow in a
 debug build. Only `arm64-v8a` is built. Run the instrumentation tests on both a 4K-page
-and a 16K-page system image.
+and a 16K-page system image. `downloadedDistributionsRun` downloads Debian and Ubuntu
+(about 80 MB) and is skipped unless
+`-Pandroid.testInstrumentationRunnerArguments.network=true` is given. An emulator started
+with `-http-proxy` sends connections to 127.0.0.1 to the proxy too, which breaks
+`downloadsResumeWhereTheyBrokeOff`.
 
 ## Vendored code
 

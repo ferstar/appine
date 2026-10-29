@@ -1,7 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name" translatable="false">appine</string>
-    <string name="preparing">Preparing Alpine Linux…</string>
+    <string name="starting">Starting…</string>
+    <string name="preparing">Preparing %1$s…</string>
+    <string name="downloading">Downloading %1$s… %2$d / %3$d MB</string>
+    <string name="choose_distro">Choose a Linux distribution</string>
+    <string name="distro_download">%1$s (%2$d MB download)</string>
+    <string name="choose_distro_after_failure">Choose a Linux distribution\n\nCannot prepare the rootfs: %1$s</string>
+    <string name="menu_reset">Reset rootfs…</string>
+    <string name="reset_title">Reset the rootfs?</string>
+    <string name="reset_message">All sessions end and every file in the rootfs, /root included, is deleted. Then you choose a distribution again.</string>
+    <string name="reset">Reset</string>
+    <string name="resetting">Resetting…</string>
     <string name="start_failed">Cannot start: %1$s</string>
     <string name="channel_sessions">Terminal sessions</string>
     <string name="exit_all">Exit all</string>

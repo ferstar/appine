@@ -26,13 +26,13 @@ guest 里跑过的都是 Alpine 的 musl 程序（§1.1 的目标），glibc 的
 - **mount 的子集先不做**：
   - chroot 进别的发行版的脚本（debootstrap、arch-chroot 和各种教程）要的是：在任意目录上挂 proc、sysfs、devpts，挂 tmpfs（`/dev/shm`、`/run`），以及 bind 挂载（`mount --rbind /dev`、把 `/root` 这类目录共享进去）。
   - 现在的挂载表是固定的（§8.2）：每种合成文件系统只有一个挂载点，路径里的节点不带"经由哪个挂载点进来"。只挂合成文件系统要给它们的节点记上挂载点，`..` 和 getcwd 才对（chroot 在 `/debian` 时，从 `/debian/proc` 往上 `..` 现在会到 `/`，越出 chroot），工作量中等。bind 挂载和 tmpfs 要把路径改成（挂载，节点）的二元组，当前目录、根目录、打开文件记的路径、`/proc/<pid>/{cwd,root,fd}`、mountinfo、inotify、AF_UNIX 的路径名都要跟着改，工作量大。
-  - 上面的结果说明 glibc 发行版直接当作仓库就能完整地用，内核层一行都不用改。给用户 glibc 环境更便宜的路是 App 支持用 Debian、Ubuntu 的 rootfs 建仓库（首次启动时选，或者"重置 rootfs"时换，§11.4），要做的是准备 rootfs（上面的 resolv.conf、hosts，profile）和镜像列表。用户想同时用 Alpine 和 Debian、在两边共用文件时，再回来做 mount。
+  - 上面的结果说明 glibc 发行版直接当作仓库就能完整地用，内核层一行都不用改。给用户 glibc 环境更便宜的路是 App 支持用 Debian、Ubuntu 的 rootfs 建仓库（首次启动时选，或者"重置 rootfs"时换，§11.4），要做的是准备 rootfs（上面的 resolv.conf、hosts，profile）和镜像列表。用户想同时用 Alpine 和 Debian、在两边共用文件时，再回来做 mount。 → 已按这个做法补上（M9 之前：App 里选 rootfs）：首次启动可以选 Debian 13、Ubuntu 24.04，选了才下载
 - **工具**：`tests/survey/glibc/` 里 `debian-install`（先运行，装后面要的软件包）、`debian-c`、`debian-py`、`debian-java`、`debian-node`、`debian-rust`、`debian-code` 和 `ubuntu`；建仓库的命令写在 `debian-install.sh` 的开头。
 
 **推迟项**：
 
-- 没有 mount、umount2、pivot_root（ENOSYS）：chroot 进别的发行版缺 `/proc`、`/sys`、`/dev`，做法和工作量见上。
-- 导入 docker export 出来的 rootfs 时，空的 resolv.conf、hosts 要由导入的一方写好：内核层只在 resolv.conf 不存在时写存根，App 首次启动写的 hosts 也是已有就不动（§11.4）。
+- 没有 mount、umount2、pivot_root（ENOSYS）：chroot 进别的发行版缺 `/proc`、`/sys`、`/dev`，做法和工作量见上。 → 先做了 App 里选 rootfs（M9 之前：App 里选 rootfs），mount 仍没有
+- 导入 docker export 出来的 rootfs 时，空的 resolv.conf、hosts 要由导入的一方写好：内核层只在 resolv.conf 不存在时写存根，App 首次启动写的 hosts 也是已有就不动（§11.4）。 → App 导入 Debian、Ubuntu 时写好了（M9 之前：App 里选 rootfs）
 - rseq 没有实现：glibc 不注册也照常工作；用 rseq 做每个 CPU 缓存的程序（新版 tcmalloc）退回别的做法。
 - VS Code 第一个终端刚打开时丢字的那一次没有和原生的 code-server 对照。→ 已对照（M9 之前：补测待查的几项）：原生的 code-server 上同样丢字，而且丢得更多，是 VS Code 在终端起来之前不收输入
 - 没跑的：conda/miniforge、Ubuntu 上更多的负载、Tier 0；都只在 colima 的虚拟机里跑，没上手机。→ conda 能用，Alpine 普查的 12 个负载在 Tier 0 下与 Tier 1 一致，Ubuntu 上补了 su 和 sshd（M9 之前：补测待查的几项；补的时候发现并修好了 PAM 登录不了，见 M9 之前：没有实现的 netlink 协议建不了）；仍没上手机

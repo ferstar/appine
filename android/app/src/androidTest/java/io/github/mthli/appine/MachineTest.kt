@@ -6,12 +6,20 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
@@ -28,7 +36,7 @@ class MachineTest {
 
     @Before
     fun prepare() {
-        Rootfs.prepare(context)
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE)
     }
 
     @After
@@ -62,6 +70,20 @@ class MachineTest {
 
     /** 在新控制台上运行 `sh -c script`，返回输出和退出码。 */
     private fun sh(machine: Long, script: String) = run(machine, "/bin/sh", "sh", "-c", script)
+
+    /** 在新控制台上像终端标签页一样启动登录 shell（[ConsolePty.LOGIN]），输入 [input]，返回输出。 */
+    private fun login(machine: Long, input: String): String {
+        val console = Native.openConsole(machine, 24, 200)
+        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", ConsolePty.LOGIN), ConsolePty.ENVIRONMENT)
+        var out = ""
+        val reader = thread { out = readAll(machine, console) }
+        val b = input.toByteArray()
+        assertEquals(b.size, Native.write(machine, console, b, 0, b.size))
+        Native.waitFor(machine, pid)
+        reader.join(5000)
+        Native.closeConsole(machine, console)
+        return out
+    }
 
     @Test
     fun busyboxRunsUnderBothTiers() {
@@ -132,6 +154,134 @@ class MachineTest {
         assertEquals("done\n" to 0, result)
         Native.trimMemory(machine)
         assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+    }
+
+    /**
+     * 内核停下之后再用它的句柄也安全：会话结束之后，TerminalSession 在主线程上才清理控制台，
+     * 这时服务可能已经停了内核（重置 rootfs、服务销毁）。
+     */
+    @Test
+    fun callsAfterStopAreHarmless() {
+        val machine = start(1)
+        val console = Native.openConsole(machine, 24, 80)
+        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", "sleep 30"), ConsolePty.ENVIRONMENT)
+        Native.stop(machine)
+        Native.closeConsole(machine, console)
+        Native.resize(machine, console, 30, 100)
+        Native.trimMemory(machine)
+        Native.setRoutes(machine, null)
+        assertEquals(-1, Native.read(machine, console, ByteArray(16)))
+        assertEquals(-1, Native.write(machine, console, ByteArray(1), 0, 1))
+        assertEquals(-9, Native.waitFor(machine, pid))
+        assertThrows(IOException::class.java) { Native.openConsole(machine, 24, 80) }
+        Native.stop(machine)
+    }
+
+    /** 登录 shell 是 /etc/passwd 里 root 的 shell，chsh 改过之后照样；它读 /etc/profile。 */
+    @Test
+    fun loginShellComesFromPasswd() {
+        val machine = start(1)
+        val shell = sh(machine, "awk -F: '\$1 == \"root\" { print \$7 }' /etc/passwd").first.trim()
+        val out = login(machine, "echo shell=\$SHELL\nexit\n")
+        assertTrue(out, out.contains("shell=$shell\n"))
+        assertTrue(out, out.contains("Welcome to appine"))
+        assertEquals("" to 0, sh(machine, "sed -i '1s|:[^:]*\$|:/bin/ash|' /etc/passwd"))
+        try {
+            val changed = login(machine, "echo shell=\$SHELL\nexit\n")
+            assertTrue(changed, changed.contains("shell=/bin/ash\n"))
+        } finally {
+            sh(machine, "sed -i '1s|:[^:]*\$|:$shell|' /etc/passwd")
+        }
+    }
+
+    /** 下载的 tarball 按长度和 sha256 校验，对不上时删掉（用 file: 地址代替网络）。 */
+    @Test
+    fun downloadsAreVerified() {
+        val src = File(context.cacheDir, "download-src.tgz")
+        context.assets.open("rootfs.tgz").use { input -> src.outputStream().use { input.copyTo(it) } }
+        val sha = MessageDigest.getInstance("SHA-256").digest(src.readBytes()).joinToString("") { "%02x".format(it) }
+        val dest = File(context.cacheDir, "download-dest.tgz")
+        var last = 0L to 0L
+        Rootfs.fetch(Rootfs.Download(listOf(src.toURI().toString()), sha, src.length()), dest) { done, total -> last = done to total }
+        assertEquals(src.length() to src.length(), last)
+        assertTrue(dest.readBytes().contentEquals(src.readBytes()))
+        dest.delete()
+        for (wrong in listOf(Rootfs.Download(listOf(src.toURI().toString()), "0".repeat(64), src.length()),
+            Rootfs.Download(listOf(src.toURI().toString()), sha, src.length() + 1))) {
+            assertThrows(IOException::class.java) { Rootfs.fetch(wrong, dest) { _, _ -> } }
+            assertFalse(dest.exists() || File(dest.path + ".part").exists())
+        }
+        src.delete()
+    }
+
+    /**
+     * 下载中途断开时带 Range 接着下；服务器不认 Range（回 200）时从头再来。本地的 HTTP 服务
+     * 第一次只发前三分之一就断开连接。
+     */
+    @Test
+    fun downloadsResumeWhereTheyBrokeOff() {
+        val data = ByteArray(300_000) { (it * 7 + it / 251).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
+        val dest = File(context.cacheDir, "download-resumed.tgz")
+        for (ranges in listOf(true, false)) {
+            val server = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+            val asked = mutableListOf<String>()
+            val serving = thread {
+                repeat(2) { n ->
+                    server.accept().use { c ->
+                        val reader = c.getInputStream().bufferedReader()
+                        val headers = generateSequence { reader.readLine() }.takeWhile { it.isNotEmpty() }.toList()
+                        val range = headers.firstOrNull { it.startsWith("Range:", ignoreCase = true) }
+                        asked.add(range ?: "-")
+                        val from = range?.substringAfter("bytes=")?.substringBefore('-')?.toInt()?.takeIf { ranges } ?: 0
+                        val head = if (from > 0) {
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes $from-${data.size - 1}/${data.size}\r\n"
+                        } else {
+                            "HTTP/1.1 200 OK\r\n"
+                        }
+                        val out = c.getOutputStream()
+                        out.write((head + "Content-Length: ${data.size - from}\r\nConnection: close\r\n\r\n").toByteArray())
+                        out.write(data, from, if (n == 0) data.size / 3 else data.size - from)
+                        out.flush()
+                    }
+                }
+            }
+            Rootfs.fetch(Rootfs.Download(listOf("http://127.0.0.1:${server.localPort}/rootfs.tgz"), sha, data.size.toLong()), dest) { _, _ -> }
+            serving.join(5000)
+            server.close()
+            assertEquals("ranges=$ranges", listOf("-", "Range: bytes=100000-"), asked)
+            assertTrue(dest.readBytes().contentEquals(data))
+            dest.delete()
+        }
+    }
+
+    /**
+     * 下载 Debian、Ubuntu 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
+     * apt-get update。要联网下载约 80 MB，默认跳过：
+     * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`。
+     */
+    @Test
+    fun downloadedDistributionsRun() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("network") == "true")
+        for (distro in listOf(Rootfs.Distro.DEBIAN, Rootfs.Distro.UBUNTU)) {
+            val store = File(context.cacheDir, "store-${distro.name.lowercase()}")
+            store.deleteRecursively()
+            Rootfs.prepare(context, distro, store = store)
+            val machine = Native.start(store.path, 1)
+            try {
+                val out = login(
+                    machine,
+                    "grep PRETTY_NAME /etc/os-release; echo shell=\$SHELL; getent hosts localhost | head -n 1; " +
+                        "apt-get update -qq && echo apt-ok\nexit\n",
+                )
+                assertTrue(out, out.contains(distro.label.substringBefore(' ')))
+                assertTrue(out, out.contains("shell=/bin/bash\n"))
+                assertTrue(out, out.contains("apt-ok\n"))
+            } finally {
+                Native.stop(machine)
+                store.deleteRecursively()
+            }
+        }
     }
 
     /**

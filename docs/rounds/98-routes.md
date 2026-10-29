@@ -1,6 +1,6 @@
 # M9 之前：路由表（2026-10-29）
 
-← [M9 之前：已经删除的文件带 ` (deleted)`（2026-10-29）](97-deleted-suffix.md) · [索引](../milestones.md)
+← [M9 之前：已经删除的文件带 ` (deleted)`（2026-10-29）](97-deleted-suffix.md) · [索引](../milestones.md) · [M9 之前：App 里选 rootfs（2026-10-29）](99-choose-rootfs.md) →
 
 [网络信息的缺口](78-net-info-gaps.md)那一轮的推迟项。原来没有路由表，看路由、按路由取地址的命令和程序都拿不到结果：
 

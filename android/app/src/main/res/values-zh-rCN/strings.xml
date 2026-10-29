@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="preparing">正在准备 Alpine Linux…</string>
+    <string name="starting">正在启动…</string>
+    <string name="preparing">正在准备 %1$s…</string>
+    <string name="downloading">正在下载 %1$s：%2$d / %3$d MB</string>
+    <string name="choose_distro">选择 Linux 发行版</string>
+    <string name="distro_download">%1$s（需下载 %2$d MB）</string>
+    <string name="choose_distro_after_failure">选择 Linux 发行版\n\n无法准备 rootfs：%1$s</string>
+    <string name="menu_reset">重置 rootfs…</string>
+    <string name="reset_title">重置 rootfs？</string>
+    <string name="reset_message">所有会话都会结束，rootfs 里的所有文件（包括 /root）都会删除，然后重新选择发行版。</string>
+    <string name="reset">重置</string>
+    <string name="resetting">正在重置…</string>
     <string name="start_failed">无法启动：%1$s</string>
     <string name="channel_sessions">终端会话</string>
     <string name="exit_all">全部退出</string>

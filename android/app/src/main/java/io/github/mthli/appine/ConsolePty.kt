@@ -10,8 +10,7 @@ internal class ConsolePty(private val machine: Long) : TerminalSession.Pty {
 
     override fun start(columns: Int, rows: Int): Int {
         console = Native.openConsole(machine, rows, columns)
-        // argv[0] 以 - 开头：ash 作为登录 shell 运行，读 /etc/profile
-        pid = Native.spawn(machine, console, "/bin/sh", arrayOf("-sh"), ENVIRONMENT)
+        pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", LOGIN), ENVIRONMENT)
         return pid
     }
 
@@ -35,6 +34,16 @@ internal class ConsolePty(private val machine: Long) : TerminalSession.Pty {
     }
 
     companion object {
+        /**
+         * 以 `/etc/passwd` 里 root 的 shell 作为登录 shell 运行（读 /etc/profile）：Alpine 是 ash，
+         * Debian、Ubuntu 是 bash，chsh 改过之后也照样。找不到时用 /bin/sh。passwd 从 fd 3 读：
+         * 循环的重定向也作用于里面 exec 的 shell，它的 stdin 得是终端。
+         */
+        const val LOGIN = "while IFS=: read -r name _ _ _ _ _ shell <&3; do " +
+            "if [ \"\$name\" = root ] && [ -x \"\$shell\" ]; then " +
+            "export SHELL=\"\$shell\"; exec \"\$shell\" -l 3<&-; fi; " +
+            "done 3< /etc/passwd; exec /bin/sh -l"
+
         val ENVIRONMENT = arrayOf(
             "HOME=/root",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
