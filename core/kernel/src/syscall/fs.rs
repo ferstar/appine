@@ -827,6 +827,7 @@ fn open_store(
                 None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
             };
             if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
+                remove_privs(cx, ino)?;
                 file.set_len(0).map_err(host_errno)?;
                 truncated(cx, &file);
             }
@@ -2501,6 +2502,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             }
             check_fsize(cx, len)?;
             super::lease::break_leases(cx, ino, true, false, None)?;
+            remove_privs(cx, ino)?;
             let host = vfs.store().open_object(ino, true)?;
             host.set_len(len).map_err(host_errno)?;
             truncated(cx, &host);
@@ -2525,9 +2527,10 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     }
     let f = file.borrow();
     match &f.kind {
-        FileKind::Regular { file, .. } if f.writable() => {
+        FileKind::Regular { ino, file } if f.writable() => {
             check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
+            remove_privs(cx, *ino)?;
             file.set_len(len).map_err(host_errno)?;
             truncated(cx, file);
             inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
@@ -2602,8 +2605,8 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     if !f.writable() {
         return Err(Errno::EBADF);
     }
-    let host = match &f.kind {
-        FileKind::Regular { file, .. } => file,
+    let (ino, host) = match &f.kind {
+        FileKind::Regular { ino, file } => (*ino, file),
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
         FileKind::Pipe(_) | FileKind::Socket(_) => return Err(Errno::ESPIPE),
         _ => return Err(Errno::ENODEV),
@@ -2621,6 +2624,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         check_fsize(cx, end)?;
     }
     check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
+    remove_privs(cx, ino)?;
     if zero {
         let zeros = vec![0u8; IO_CHUNK];
         let mut pos = offset;
@@ -3531,6 +3535,13 @@ fn write_bytes(
                 let cred = cx.cred();
                 pseudo::write(cx.k(), &cred, &node, data)?;
             }
+            let ino = match file.borrow().kind {
+                FileKind::Regular { ino, .. } => Some(ino),
+                _ => None,
+            };
+            if let Some(ino) = ino.filter(|_| !data.is_empty()) {
+                remove_privs(cx, ino)?;
+            }
             // 普通文件不持 BKL 写；O_APPEND 仍持锁做，几个进程同时追加时不会互相覆盖
             let regular = regular_fd(&file.borrow())
                 .filter(|_| offset.is_some() || file.borrow().flags & oflags::O_APPEND == 0);
@@ -3546,6 +3557,13 @@ fn write_bytes(
             Ok(n)
         }
     }
+}
+
+/// 写、截短普通文件 `ino` 之前去掉它的特权（[`Store::remove_privs`]）：setuid、setgid 位在
+/// 调用者没有 `CAP_FSETID` 时去掉，文件能力总是去掉。
+fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
+    let keep_setid = cx.t.group.borrow().cred.capable(cap::FSETID);
+    cx.vfs()?.store().remove_privs(ino, keep_setid)
 }
 
 /// `RLIMIT_FSIZE`：普通文件写到超过限制的位置时只写到限制为止；一个字节都写不了时
@@ -3765,6 +3783,11 @@ fn copy_regular(
         Ok(n) => n,
         Err(e) => return Some(Err(e)),
     };
+    if len > 0
+        && let Err(e) = remove_privs(cx, ino)
+    {
+        return Some(Err(e));
+    }
     let busy = |f: &FileRef, used: bool| used && f.borrow().pos_busy != 0;
     while busy(input, src.is_none()) || busy(output, true) {
         if cx.task.killed.get() {

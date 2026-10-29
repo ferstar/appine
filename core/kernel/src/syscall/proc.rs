@@ -7,7 +7,7 @@ use appine_engine::Cpu;
 
 use super::{Flow, SysResult, put, read_path};
 use crate::cell::RefCell;
-use crate::cred::{Cred, cap};
+use crate::cred::{Cred, FileCaps, XATTR_NAME_CAPS, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile, Pidfd, oflags};
 use crate::kernel::{Cx, Tid};
@@ -17,7 +17,7 @@ use crate::process::{self, ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
 use crate::uaccess::UserSlice;
-use crate::vfs::store::mode;
+use crate::vfs::store::{Ino, mode};
 use crate::vfs::{Node, Pseudo, Vfs, normalize};
 
 const CLONE_VM: u64 = 0x100;
@@ -483,6 +483,19 @@ pub(crate) fn label_image(
     }
 }
 
+/// 程序文件的能力（`security.capability`）；没有时是 None，格式不对时 execve 失败（EINVAL）。
+fn file_caps(vfs: &Vfs, ino: Ino) -> Result<Option<FileCaps>, Errno> {
+    let store = vfs.store();
+    if !store.has_file_caps(ino)? {
+        return Ok(None);
+    }
+    match store.get_xattr(ino, XATTR_NAME_CAPS) {
+        Ok(v) => FileCaps::parse(&v),
+        Err(Errno::ENODATA) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// 解释器在 maps 里的名字和 inode：名字与主程序一样解析完符号链接（Debian 的
 /// `/lib/ld-linux-aarch64.so.1` 是链接）；找不到时是 PT_INTERP 原样的路径。
 pub(crate) fn interp_label(
@@ -640,17 +653,25 @@ fn exec(
         }
     };
 
-    // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后不再生效）；脚本看的是解释器
+    // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后不再生效）和程序文件的能力；脚本看的
+    // 是解释器。被没有 CAP_SYS_PTRACE 的跟踪者跟踪着时得不到新的特权
     let no_new_privs = cx.t.group.borrow().no_new_privs;
     let setid = |bit: u32| st.mode & bit == bit && !no_new_privs;
+    let fcaps = file_caps(&vfs, st.ino)?;
+    let ptraced = {
+        let t = cx.task.trace.borrow();
+        t.tracer.is_some() && !t.privileged
+    };
     let mut new_cred = cred.clone();
-    new_cred.exec(
+    let secure = new_cred.exec(
         setid(mode::S_ISUID).then_some(st.uid),
         setid(mode::S_ISGID | 0o010).then_some(st.gid),
-    );
-    // 与 Linux 一样，setuid、setgid 程序的栈大小上限不超过默认值，免得调用者用它影响
-    // 新程序的地址空间布局；新的值在 execve 成功之后写回
-    let secure = new_cred.ruid != new_cred.euid || new_cred.rgid != new_cred.egid;
+        fcaps,
+        no_new_privs,
+        ptraced,
+    )?;
+    // 与 Linux 一样，特权执行的程序的栈大小上限不超过默认值，免得调用者用它影响新程序的
+    // 地址空间布局；新的值在 execve 成功之后写回
     if secure {
         stack_limit = stack_limit.min(loader::STACK_SIZE);
     }
@@ -659,6 +680,7 @@ fn exec(
         envp: &envp,
         execfn: &filename,
         ids: [new_cred.ruid, new_cred.euid, new_cred.rgid, new_cred.egid],
+        secure,
         stack_limit,
     };
     let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cred, &root, &cwd, p);
@@ -697,8 +719,19 @@ fn exec(
         // 驻留内存的峰值跨 execve 保留：换掉地址空间之前取一次样（在标记 execed 之前）
         g.sample_rss_at_exec(&cx.mm());
         g.exe = exe.to_vec();
-        if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid) {
+        // 与 Linux 的 commit_creds 一样，换了有效 ID、得到了新的能力时不能 core dump，
+        // 父进程退出时也不再发信号给它；特权执行同样不再发
+        let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
+        let gained = new_cred.cap_permitted & !g.cred.cap_permitted != 0;
+        if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid)
+            || ids(&new_cred) != ids(&g.cred)
+            || gained
+        {
             g.dumpable = false;
+            g.pdeathsig = 0;
+        }
+        if secure {
+            g.pdeathsig = 0;
         }
         g.cred = new_cred;
         cx.shared.fast_changed();

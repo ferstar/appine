@@ -164,6 +164,7 @@ impl Machine {
             envp,
             execfn: program,
             ids: [0; 4],
+            secure: false,
             stack_limit: loader::STACK_SIZE,
         };
         let mut mm = Mm::new();

@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use super::{IO_CHUNK, SysResult, get, put, read_timespec, write_pair};
-use crate::cred::{SECBIT_KEEP_CAPS, cap};
+use crate::cred::{cap, secbit};
 use crate::errno::Errno;
 use crate::futex::{Enqueued, Key};
 use crate::itimer::{CpuTimer, ITimer};
@@ -741,15 +741,16 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         PR_GET_KEEPCAPS => Ok(cx.cred().keep_caps() as u64),
         PR_SET_KEEPCAPS if arg <= 1 => {
             let c = &mut cx.t.group.borrow_mut().cred;
-            c.securebits = (c.securebits & !SECBIT_KEEP_CAPS) | (arg as u32 * SECBIT_KEEP_CAPS);
+            if c.securebits & secbit::KEEP_CAPS_LOCKED != 0 {
+                return Err(Errno::EPERM);
+            }
+            c.securebits = (c.securebits & !secbit::KEEP_CAPS) | (arg as u32 * secbit::KEEP_CAPS);
             Ok(0)
         }
         PR_GET_SECUREBITS => Ok(cx.cred().securebits as u64),
         PR_SET_SECUREBITS => {
-            if !cx.cred().capable(cap::SETPCAP) {
-                return Err(Errno::EPERM);
-            }
-            cx.t.group.borrow_mut().cred.securebits = arg as u32;
+            let bits = u32::try_from(arg).map_err(|_| Errno::EPERM)?;
+            cx.t.group.borrow_mut().cred.set_securebits(bits)?;
             Ok(0)
         }
         PR_GET_SECCOMP => Ok(u64::from(cx.task.seccomp.borrow().mode)),
@@ -762,18 +763,26 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             cx.t.group.borrow_mut().cred.cap_bounding &= !(1 << arg);
             Ok(0)
         }
-        // 没有环境能力：查询总是 0，清空总是成功，提升总是 EPERM
+        // 环境能力（capabilities(7)）
         PR_CAP_AMBIENT => match arg {
-            PR_CAP_AMBIENT_CLEAR_ALL => unused(1).map(|()| 0),
+            PR_CAP_AMBIENT_CLEAR_ALL => {
+                unused(1)?;
+                cx.t.group.borrow_mut().cred.cap_ambient = 0;
+                Ok(0)
+            }
             PR_CAP_AMBIENT_IS_SET | PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER => {
                 unused(2)?;
                 if args[1] > CAP_LAST_CAP {
                     return Err(Errno::EINVAL);
                 }
-                if arg == PR_CAP_AMBIENT_RAISE {
-                    Err(Errno::EPERM)
-                } else {
-                    Ok(0)
+                let c = &mut cx.t.group.borrow_mut().cred;
+                match arg {
+                    PR_CAP_AMBIENT_IS_SET => Ok((c.cap_ambient >> args[1]) & 1),
+                    PR_CAP_AMBIENT_RAISE => c.raise_ambient(args[1] as u32).map(|()| 0),
+                    _ => {
+                        c.cap_ambient &= !(1 << args[1]);
+                        Ok(0)
+                    }
                 }
             }
             _ => Err(Errno::EINVAL),

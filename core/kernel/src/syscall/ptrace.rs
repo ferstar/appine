@@ -176,11 +176,16 @@ fn traceme(cx: &mut Cx<'_>) -> SysResult {
     if ppid == INIT || !cx.kr().groups.contains_key(&ppid) {
         return Err(Errno::EPERM);
     }
+    let privileged = cx.kr().groups[&ppid]
+        .borrow()
+        .cred
+        .capable(crate::cred::cap::SYS_PTRACE);
     let mut t = cx.task.trace.borrow_mut();
     if t.tracer.is_some() {
         return Err(Errno::EPERM);
     }
     t.tracer = Some(ppid);
+    t.privileged = privileged;
     Ok(0)
 }
 
@@ -235,6 +240,7 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
         }
         *t = Trace {
             tracer: Some(cx.tgid()),
+            privileged: cx.cred().capable(crate::cred::cap::SYS_PTRACE),
             seized: seize,
             options,
             ..Trace::default()

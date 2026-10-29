@@ -1,6 +1,6 @@
 # M9 之前：App 里选 rootfs（2026-10-29）
 
-← [M9 之前：路由表（2026-10-29）](98-routes.md) · [索引](../milestones.md)
+← [M9 之前：路由表（2026-10-29）](98-routes.md) · [索引](../milestones.md) · [M9 之前：文件能力（2026-10-29）](100-file-caps.md) →
 
 [glibc 发行版的探测](69-glibc-probe.md)那一轮的结论是：Debian、Ubuntu 的 rootfs 直接当作仓库就能完整地用，内核层不用改，给用户 glibc 环境（pip 的 manylinux wheel、各种预编译的二进制）更便宜的路是 App 能用它们建仓库，mount 的子集先不做。原来 App 只能建 Alpine 的仓库。这一轮只改 App 和 JNI 层。
 

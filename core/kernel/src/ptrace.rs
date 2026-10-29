@@ -132,6 +132,9 @@ pub(crate) const PSTATE_NZCV: u64 = 0xf000_0000;
 pub(crate) struct Trace {
     /// 跟踪者进程；None 表示没有被跟踪。
     pub tracer: Option<Tid>,
+    /// 建立跟踪时跟踪者有 `CAP_SYS_PTRACE`（Linux 的 `ptracer_cred`）：没有时被跟踪的进程
+    /// execve setuid 程序、带文件能力的程序时得不到新的特权。
+    pub privileged: bool,
     /// PTRACE_SEIZE 跟踪的：group-stop 和 PTRACE_INTERRUPT 报告成 `PTRACE_EVENT_STOP`，
     /// 跟进来的新线程开始时也是；不会因为 execve 收到 SIGTRAP。
     pub seized: bool,
@@ -620,6 +623,7 @@ pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -
     {
         let mut c = child.trace.borrow_mut();
         c.tracer = p.tracer;
+        c.privileged = p.privileged;
         c.seized = p.seized;
         c.options = p.options;
         if p.seized {

@@ -40,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::cell::RefCell;
+use crate::cred::XATTR_NAME_CAPS;
 use crate::errno::Errno;
 
 /// inode 编号。
@@ -409,6 +410,9 @@ struct Cache {
     names: Map<Ino, Map<Ino, Option<Vec<u8>>>>,
     /// 目录的完整列表（readdir）。
     listings: Map<Ino, Vec<DirEntry>>,
+    /// 有文件能力（`security.capability`）的 inode（[`Store::has_file_caps`]）；None 表示
+    /// 还没查。写文件时要查它，所以整个集合一起缓存，随提交计数一起作废。
+    file_caps: Option<Map<Ino, ()>>,
 }
 
 impl Cache {
@@ -656,6 +660,7 @@ impl Store {
                 .prepare_cached("DELETE FROM xattrs WHERE ino = ?1")
                 .and_then(|mut st| st.execute(params![ino]))
                 .map_err(db_err)?;
+            self.touch_file_caps();
         }
         Ok(())
     }
@@ -1448,7 +1453,71 @@ impl Store {
                 perm &= !0o2000;
             }
         }
-        self.set_owner_mode(ino, perm, uid.unwrap_or(st.uid), gid.unwrap_or(st.gid))
+        self.transaction(|s| {
+            // 与 Linux 的 chown_common 一样，不是目录的还去掉文件能力（ATTR_KILL_PRIV）
+            if !st.is_dir() && s.has_file_caps(ino)? {
+                s.remove_xattr(ino, XATTR_NAME_CAPS)?;
+            }
+            s.set_owner_mode(ino, perm, uid.unwrap_or(st.uid), gid.unwrap_or(st.gid))
+        })
+    }
+
+    /// 写、截短普通文件之前去掉它的特权（Linux 的 `file_remove_privs`）：没有 `CAP_FSETID`
+    /// （`keep_setid` 为 false）时去掉 setuid 位，和带着组执行位时的 setgid 位；不论谁写都
+    /// 去掉文件能力。没有可去掉的时候不碰数据库。
+    pub fn remove_privs(&self, ino: Ino, keep_setid: bool) -> Result<(), Errno> {
+        let st = self.stat_row(ino)?;
+        if st.kind() != mode::S_IFREG {
+            return Ok(());
+        }
+        let mut perm = st.mode & 0o7777;
+        if !keep_setid {
+            perm &= !mode::S_ISUID;
+            if perm & 0o010 != 0 {
+                perm &= !mode::S_ISGID;
+            }
+        }
+        let caps = self.has_file_caps(ino)?;
+        if !caps && perm == st.mode & 0o7777 {
+            return Ok(());
+        }
+        self.transaction(|s| {
+            if caps {
+                s.remove_xattr(ino, XATTR_NAME_CAPS)?;
+            }
+            s.set_owner_mode(ino, perm, st.uid, st.gid)
+        })
+    }
+
+    /// inode `ino` 有没有文件能力（`security.capability`）：查的是缓存的整个集合。
+    pub fn has_file_caps(&self, ino: Ino) -> Result<bool, Errno> {
+        let generation = self.cache_generation();
+        if let Some(hit) = self.cached(|c| c.file_caps.as_ref().map(|m| m.contains_key(&ino))) {
+            return Ok(hit);
+        }
+        self.begin_read()?;
+        let all: Map<Ino, ()> = {
+            let mut stmt = self
+                .db
+                .prepare_cached("SELECT ino FROM xattrs WHERE name = ?1")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![XATTR_NAME_CAPS], |r| r.get(0))
+                .map_err(db_err)?;
+            rows.map(|r| r.map(|ino| (ino, ())))
+                .collect::<Result<_, _>>()
+                .map_err(db_err)?
+        };
+        let hit = all.contains_key(&ino);
+        if generation.is_some_and(|g| self.may_fill(g)) {
+            self.update(|c| c.file_caps = Some(all));
+        }
+        Ok(hit)
+    }
+
+    /// 改了文件能力：作废缓存的集合。
+    fn touch_file_caps(&self) {
+        self.update(|c| c.file_caps = None);
     }
 
     /// 目录是否为空。
@@ -1704,6 +1773,9 @@ impl Store {
             )
             .and_then(|mut st| st.execute(params![ino, name, value]))
             .map_err(db_err)?;
+            if name == XATTR_NAME_CAPS {
+                s.touch_file_caps();
+            }
             s.touch_ctime(ino)
         })
     }
@@ -1737,6 +1809,9 @@ impl Store {
                     .map_err(db_err)?;
             if n == 0 {
                 return Err(Errno::ENODATA);
+            }
+            if name == XATTR_NAME_CAPS {
+                s.touch_file_caps();
             }
             s.touch_ctime(ino)
         })
@@ -2130,6 +2205,41 @@ mod tests {
         );
         assert_eq!(s.lookup(ROOT, b"f").unwrap(), Some(f));
         drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_and_chown_remove_privileges() {
+        let (s, dir) = temp_store("privs");
+        let caps = [0x0200_0001u32, 1 << 13, 0, 0, 0];
+        let caps: Vec<u8> = caps.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (f, _) = s.create_file(ROOT, b"ping", 0o6755, 0, 0).unwrap();
+        assert!(!s.has_file_caps(f).unwrap());
+        s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
+            .unwrap();
+        // 别的进程设置的也看得到：缓存随提交计数作废
+        s.commit().unwrap();
+        let other = Store::open(&dir, &[]).unwrap();
+        assert!(other.has_file_caps(f).unwrap());
+        // 有 CAP_FSETID 的写：只去掉文件能力
+        other.remove_privs(f, true).unwrap();
+        other.commit().unwrap();
+        assert!(!s.has_file_caps(f).unwrap());
+        assert_eq!(s.attrs(f).unwrap().mode & 0o7777, 0o6755);
+        // 没有 CAP_FSETID：去掉 setuid 和（有组执行位时的）setgid
+        s.remove_privs(f, false).unwrap();
+        assert_eq!(s.attrs(f).unwrap().mode & 0o7777, 0o755);
+        let (g, _) = s.create_file(ROOT, b"lock", 0o2644, 0, 0).unwrap();
+        s.remove_privs(g, false).unwrap();
+        assert_eq!(s.attrs(g).unwrap().mode & 0o7777, 0o2644);
+        // chown 也去掉文件能力
+        s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
+            .unwrap();
+        assert!(s.has_file_caps(f).unwrap());
+        s.set_owner(f, None, Some(0)).unwrap();
+        assert!(!s.has_file_caps(f).unwrap());
+        assert_eq!(s.get_xattr(f, XATTR_NAME_CAPS), Err(Errno::ENODATA));
+        drop((other, s));
         let _ = fs::remove_dir_all(&dir);
     }
 

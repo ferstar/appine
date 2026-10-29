@@ -1496,7 +1496,7 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "CapPrm:\t{:016x}", c.cap_permitted).unwrap();
     writeln!(s, "CapEff:\t{:016x}", c.cap_effective).unwrap();
     writeln!(s, "CapBnd:\t{:016x}", c.cap_bounding).unwrap();
-    writeln!(s, "CapAmb:\t0000000000000000").unwrap();
+    writeln!(s, "CapAmb:\t{:016x}", c.cap_ambient).unwrap();
     let (seccomp, filters) = task.as_ref().map_or((0, 0), |t| {
         let s = t.seccomp.borrow();
         (s.mode, s.filters())

@@ -976,9 +976,287 @@ for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
 keep.append(socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP))
 after = counts()
 for k in sorted(before):
-    if k not in ("TCP alloc", "TCP mem", "UDP mem"):
+    if k not in ("TCP alloc", "TCP mem", "UDP mem", "sockets used"):
         print(k, after[k] - before[k])
+# 命名空间里的总数：前面用例的 socket 晚一点释放时 Linux 上会少一个
+print("sockets used grew by at least 12:", after["sockets used"] - before["sockets used"] >= 12)
 PY
+
+# 程序文件的能力（security.capability）和环境能力：以 nobody 等身份执行带不同能力的程序，
+# 看能力集、AT_SECURE、有效用户 ID；设置、读取、删除扩展属性的权限；写、截短、chown
+# 去掉文件能力和 setuid、setgid 位；securebits 的锁。能力集只打印用到的几个，等于边界集时
+# 打印 all（docker 默认的边界集比 appine 的小）
+cat > showcaps.c <<'C'
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <unistd.h>
+
+static unsigned long long field(const char *name)
+{
+    char line[256];
+    unsigned long long v = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, name, strlen(name)))
+            sscanf(line + strlen(name), "%llx", &v);
+    fclose(f);
+    return v;
+}
+
+static void set(const char *label, unsigned long long v, unsigned long long bnd)
+{
+    static const struct { int bit; const char *name; } caps[] = {
+        {0, "chown"}, {5, "kill"}, {10, "net_bind_service"}, {13, "net_raw"},
+    };
+    printf(" %s=", label);
+    if (v && v == bnd) {
+        printf("all");
+        return;
+    }
+    int any = 0;
+    for (unsigned i = 0; i < sizeof caps / sizeof *caps; i++)
+        if (v & 1ULL << caps[i].bit)
+            printf("%s%s", any++ ? "," : "", caps[i].name);
+    if (!any)
+        printf("-");
+}
+
+int main(void)
+{
+    unsigned long long bnd = field("CapBnd:");
+    printf("  euid=%d", (int)geteuid());
+    set("prm", field("CapPrm:"), bnd);
+    set("eff", field("CapEff:"), bnd);
+    set("inh", field("CapInh:"), bnd);
+    set("amb", field("CapAmb:"), bnd);
+    printf(" secure=%lu\n", getauxval(AT_SECURE));
+    return 0;
+}
+C
+gcc -O1 -o showcaps showcaps.c
+cat > fcaps.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <grp.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+
+/* linux/capability.h 里的（仓库里没有内核头文件） */
+struct cap_header { uint32_t version; int pid; };
+struct cap_data { uint32_t effective, permitted, inheritable; };
+#define CAP_V3 0x20080522
+#define CHOWN (1u << 0)
+#define NET_BIND (1u << 10)
+#define NET_RAW (1u << 13)
+#define NOBODY 65534
+
+static const char *showcaps;
+
+/* struct vfs_cap_data：版本（加上有效位）、两组 permitted、inheritable，v3 再加 rootid */
+static int setcaps(const char *path, uint32_t magic, uint32_t p, uint32_t i, int v3, uint32_t rootid)
+{
+    uint32_t v[6] = {magic, p, i, 0, 0, rootid};
+    return setxattr(path, "security.capability", v, v3 ? 24 : 20, 0);
+}
+
+static void copy(const char *to, int mode, int uid)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "cp %s %s", showcaps, to);
+    system(cmd);
+    chown(to, uid, uid);
+    chmod(to, mode);
+}
+
+static void result(const char *what, int r)
+{
+    printf("%s: %s\n", what, r < 0 ? strerror(errno) : "ok");
+}
+
+static int caps_xattr_size(const char *path)
+{
+    char v[64];
+    int n = getxattr(path, "security.capability", v, sizeof v);
+    return n < 0 ? -errno : n;
+}
+
+enum { NNP = 1, KEEP_INHERITABLE = 2, AMBIENT = 4, DROP_CHOWN = 8, NOROOT = 16 };
+
+/* 以 uid 执行 path；KEEP_INHERITABLE 时保留可继承集里的 net_raw、net_bind_service，
+ * AMBIENT 时再把 net_raw 提升为环境能力 */
+static void run(const char *label, const char *path, int uid, int opts)
+{
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (opts & DROP_CHOWN)
+            prctl(PR_CAPBSET_DROP, 0, 0, 0, 0);
+        if (opts & NOROOT)
+            prctl(PR_SET_SECUREBITS, 1, 0, 0, 0);
+        if (opts & (KEEP_INHERITABLE | AMBIENT))
+            prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+        if (uid) {
+            setgroups(0, NULL);
+            setresgid(uid, uid, uid);
+            setresuid(uid, uid, uid);
+        }
+        if (opts & (KEEP_INHERITABLE | AMBIENT)) {
+            struct cap_header h = {CAP_V3, 0};
+            struct cap_data d[2] = {{0, NET_RAW | NET_BIND, NET_RAW | NET_BIND}};
+            if (syscall(SYS_capset, &h, d) < 0)
+                printf("capset: %s\n", strerror(errno));
+        }
+        if (opts & AMBIENT) {
+            if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 13, 0, 0) < 0)
+                printf("ambient raise: %s\n", strerror(errno));
+            printf("ambient is set: %d\n", prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 13, 0, 0));
+            fflush(stdout);
+        }
+        if (opts & NNP)
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        printf("%s\n", label);
+        fflush(stdout);
+        char *argv[] = {(char *)path, NULL};
+        execv(path, argv);
+        printf("  execve: %s\n", strerror(errno));
+        _exit(1);
+    }
+    waitpid(pid, NULL, 0);
+}
+
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    showcaps = argv[1];
+    mkdir("/tmp/fcaps", 0755);
+    chdir("/tmp/fcaps");
+    copy("plain", 0755, 0);
+    copy("ep", 0755, 0);
+    result("set net_raw+ep", setcaps("ep", 0x02000001, NET_RAW, 0, 0, 0));
+    copy("p", 0755, 0);
+    result("set net_raw+p", setcaps("p", 0x02000000, NET_RAW, 0, 0, 0));
+    copy("i", 0755, 0);
+    result("set net_bind_service+ie", setcaps("i", 0x02000001, 0, NET_BIND, 0, 0));
+    copy("v3root", 0755, 0);
+    result("set v3 rootid 0", setcaps("v3root", 0x03000001, NET_RAW, 0, 1, 0));
+    printf("v3 rootid 0 reads back as %d bytes\n", caps_xattr_size("v3root"));
+    copy("v3other", 0755, 0);
+    result("set v3 rootid 1000", setcaps("v3other", 0x03000001, NET_RAW, 0, 1, 1000));
+    printf("v3 rootid 1000 reads back as %d bytes\n", caps_xattr_size("v3other"));
+    copy("suid", 04755, 0);
+    result("set net_raw+ep on setuid root", setcaps("suid", 0x02000001, NET_RAW, 0, 0, 0));
+    copy("chown", 0755, 0);
+    result("set chown+ep", setcaps("chown", 0x02000001, CHOWN, 0, 0, 0));
+    uint32_t v1[3] = {0x01000000, NET_RAW, 0};
+    result("set v1", setxattr("plain", "security.capability", v1, sizeof v1, 0));
+    result("set unknown revision", setcaps("plain", 0x04000000, NET_RAW, 0, 0, 0));
+    result("set the wrong length", setxattr("plain", "security.capability", v1, 16, 0));
+
+    run("nobody runs plain", "./plain", NOBODY, 0);
+    run("nobody runs net_raw+ep", "./ep", NOBODY, 0);
+    run("nobody runs net_raw+p", "./p", NOBODY, 0);
+    run("nobody runs v3 rootid 0", "./v3root", NOBODY, 0);
+    run("nobody runs v3 rootid 1000", "./v3other", NOBODY, 0);
+    run("nobody with inheritable caps runs net_bind_service+ie", "./i", NOBODY, KEEP_INHERITABLE);
+    run("nobody with ambient net_raw runs plain", "./plain", NOBODY, AMBIENT);
+    run("nobody with ambient net_raw runs net_raw+ep", "./ep", NOBODY, AMBIENT);
+    run("nobody runs setuid root with net_raw+ep", "./suid", NOBODY, 0);
+    run("nobody with no_new_privs runs net_raw+ep", "./ep", NOBODY, NNP);
+    run("nobody without chown in the bounding set runs chown+ep", "./chown", NOBODY, DROP_CHOWN);
+    run("root runs net_raw+ep", "./ep", 0, 0);
+    run("root with SECBIT_NOROOT runs plain", "./plain", 0, NOROOT);
+    run("root with SECBIT_NOROOT runs net_raw+ep", "./ep", 0, NOROOT);
+
+    /* 扩展属性的权限 */
+    copy("own", 0755, NOBODY);
+    fflush(stdout);
+    if (fork() == 0) {
+        setgroups(0, NULL);
+        setresgid(NOBODY, NOBODY, NOBODY);
+        setresuid(NOBODY, NOBODY, NOBODY);
+        result("nobody sets security.capability on its file", setcaps("own", 0x02000001, NET_RAW, 0, 0, 0));
+        printf("nobody reads security.capability: %d bytes\n", caps_xattr_size("ep"));
+        result("nobody removes security.capability", removexattr("ep", "security.capability"));
+        result("nobody sets security.appine", setxattr("own", "security.appine", "x", 1, 0));
+        result("nobody sets trusted.appine", setxattr("own", "trusted.appine", "x", 1, 0));
+        char v[8];
+        result("nobody reads trusted.appine", getxattr("own", "trusted.appine", v, sizeof v));
+        result("nobody sets user.appine on its file", setxattr("own", "user.appine", "x", 1, 0));
+        result("nobody sets user.appine on root's file", setxattr("plain", "user.appine", "x", 1, 0));
+        _exit(0);
+    }
+    wait(NULL);
+
+    /* 写、截短、chown 去掉特权 */
+    int fd = open("ep", O_WRONLY | O_APPEND);
+    write(fd, "", 0);
+    printf("after writing nothing: %d\n", caps_xattr_size("ep"));
+    write(fd, "x", 1);
+    close(fd);
+    printf("after root writes: %d\n", caps_xattr_size("ep"));
+    truncate("p", 100000);
+    printf("after truncate: %d\n", caps_xattr_size("p"));
+    close(open("i", O_WRONLY | O_TRUNC));
+    printf("after O_TRUNC: %d\n", caps_xattr_size("i"));
+    chown("suid", -1, -1);
+    struct stat st;
+    stat("suid", &st);
+    printf("after chown(-1, -1): %d, mode %o\n", caps_xattr_size("suid"), st.st_mode & 07777);
+    copy("rootsuid", 04755, 0);
+    fd = open("rootsuid", O_WRONLY | O_APPEND);
+    write(fd, "x", 1);
+    close(fd);
+    stat("rootsuid", &st);
+    printf("root writes a setuid file: mode %o\n", st.st_mode & 07777);
+    copy("nobodysuid", 06755, NOBODY);
+    copy("nobodylock", 02644, NOBODY);
+    fflush(stdout);
+    if (fork() == 0) {
+        setgroups(0, NULL);
+        setresgid(NOBODY, NOBODY, NOBODY);
+        setresuid(NOBODY, NOBODY, NOBODY);
+        const char *files[] = {"nobodysuid", "nobodylock"};
+        for (int i = 0; i < 2; i++) {
+            int f = open(files[i], O_WRONLY | O_APPEND);
+            write(f, "x", 1);
+            close(f);
+            stat(files[i], &st);
+            printf("nobody writes %s: mode %o\n", files[i], st.st_mode & 07777);
+        }
+        _exit(0);
+    }
+    wait(NULL);
+
+    /* securebits 的锁和环境能力的 prctl */
+    fflush(stdout);
+    if (fork() == 0) {
+        printf("lock keepcaps: %d\n", prctl(PR_SET_SECUREBITS, 1 << 5, 0, 0, 0));
+        printf("then set keepcaps: %d %s\n", prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), strerror(errno));
+        printf("then unlock: %d %s\n", prctl(PR_SET_SECUREBITS, 0, 0, 0, 0), strerror(errno));
+        printf("unknown bit: %d %s\n", prctl(PR_SET_SECUREBITS, 1 << 5 | 1 << 8, 0, 0, 0), strerror(errno));
+        printf("securebits: %d\n", prctl(PR_GET_SECUREBITS, 0, 0, 0, 0));
+        printf("raise without inheritable: %d %s\n", prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 13, 0, 0), strerror(errno));
+        printf("clear all with an argument: %d %s\n", prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 1, 0, 0), strerror(errno));
+        printf("lower: %d\n", prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, 13, 0, 0));
+        _exit(0);
+    }
+    wait(NULL);
+    return 0;
+}
+C
+gcc -O1 -o fcaps fcaps.c
+./fcaps "$PWD/showcaps"
+rm -rf /tmp/fcaps
 
 # fdinfo 里 epoll、timerfd、signalfd 特有的行；mountinfo 的设备号与 stat 一致，
 # fdinfo 的 mnt_id 能在 mountinfo 里找到

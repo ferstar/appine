@@ -118,9 +118,10 @@ pub struct Args<'a> {
     pub envp: &'a [Vec<u8>],
     /// 程序路径，放进 `AT_EXECFN`。
     pub execfn: &'a [u8],
-    /// 新程序的真实和有效用户 ID、组 ID（`AT_UID` 等）。两组不同时（setuid、setgid
-    /// 程序）设置 `AT_SECURE`。
+    /// 新程序的真实和有效用户 ID、组 ID（`AT_UID` 等）。
     pub ids: [u32; 4],
+    /// 特权执行（setuid、setgid、文件能力，[`crate::cred::Cred::exec`]）：设置 `AT_SECURE`。
+    pub secure: bool,
     /// 栈大小的上限（`RLIMIT_STACK` 的软限制）：决定地址空间的布局、参数最多占多少、
     /// 初始栈映射多大。
     pub stack_limit: u64,
@@ -678,10 +679,7 @@ pub fn load_prepared(
         (AT_EUID, args.ids[1] as u64),
         (AT_GID, args.ids[2] as u64),
         (AT_EGID, args.ids[3] as u64),
-        (
-            AT_SECURE,
-            (args.ids[0] != args.ids[1] || args.ids[2] != args.ids[3]) as u64,
-        ),
+        (AT_SECURE, args.secure as u64),
         (AT_RANDOM, 0),
         (AT_HWCAP2, 0),
         (AT_EXECFN, 0),
@@ -936,6 +934,7 @@ mod tests {
             envp: &envp,
             execfn: b"/bin/prog",
             ids: [0; 4],
+            secure: false,
             stack_limit: STACK_SIZE,
         };
         let image = load(
@@ -1004,6 +1003,7 @@ mod tests {
             envp: &[],
             execfn: b"prog",
             ids: [0; 4],
+            secure: false,
             stack_limit: STACK_SIZE,
         };
         let image = load(&mut mm, &exe(&main), &args, &mut read_interp).unwrap();
@@ -1053,6 +1053,7 @@ mod tests {
                 envp: &[],
                 execfn: b"",
                 ids: [0; 4],
+                secure: false,
                 stack_limit: STACK_SIZE,
             };
             let image = load(&mut mm, &file, &args, &mut no_interp).unwrap();
@@ -1075,6 +1076,7 @@ mod tests {
             envp: &[],
             execfn: b"",
             ids: [0; 4],
+            secure: false,
             stack_limit: STACK_SIZE,
         };
         assert_eq!(
