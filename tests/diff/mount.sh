@@ -170,15 +170,19 @@ if pid == 0:
     print("unprivileged umount", call(libc.umount2, d, 0), flush=True)
     os._exit(0)
 os.waitpid(pid, 0)
-# MNT_DETACH：当前目录在里面也卸得下，之后 getcwd 是 ENOENT（musl 不接受 (unreachable)），
-# 文件照样能读
+# MNT_DETACH：当前目录在里面也卸得下，之后 getcwd 系统调用以 (unreachable) 开头（musl 当作
+# ENOENT），/proc/self/cwd 是从卸下的挂载的根算起的路径，文件照样能读
 os.chdir(b"/tmp/mnt/py/self")
 print("busy", call(libc.umount2, d, 0))
 print("detach", call(libc.umount2, d, 2))
+buf = ctypes.create_string_buffer(4096)
+n = libc.syscall(17, buf, 4096)
+print("getcwd syscall", buf.value.replace(str(os.getpid()).encode(), b"PID") if n > 0 else n)
 try:
     os.getcwd()
 except FileNotFoundError:
     print("getcwd ENOENT")
+print("cwd link", os.readlink("/proc/self/cwd").replace(str(os.getpid()), "PID"))
 with open("comm") as f:
     print("comm", f.read().strip())
 os.chdir("..")
@@ -231,6 +235,9 @@ chroot /tmp/mnt/root /bin/busybox sh -c '
     /bin/busybox cut -d " " -f 1-3 /proc/self/mounts
     cd /proc/self && /bin/busybox pwd -P | /bin/busybox sed "s/[0-9][0-9]*/PID/" && cd ../.. && /bin/busybox pwd -P
     echo "root: $(/bin/busybox readlink /proc/self/root)"
+    # 根目录以外的：与 Linux 的 d_path 一样是从真正的根算起的路径，不加 (unreachable)
+    echo "outside cwd: $(/bin/busybox readlink /proc/$PPID/cwd)"
+    echo "outside root: $(/bin/busybox readlink /proc/$PPID/root)"
     echo "processes: $(/bin/busybox ps -o comm | /bin/busybox grep -c busybox)"
 '
 grep -c ' /tmp/mnt/root/proc ' /proc/self/mountinfo

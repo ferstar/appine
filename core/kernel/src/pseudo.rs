@@ -1845,11 +1845,9 @@ pub(crate) fn write_mem(
 /// （chroot 进去之后看不到外面的挂载，包括根文件系统）。挂载编号与 fdinfo 的 `mnt_id`、
 /// 设备号与 stat 的 `st_dev` 一致。
 fn mounts(ps: &View<'_>, root: &Node, info: bool) -> Vec<u8> {
-    let visible = |node: &Node| {
-        ps.vfs
-            .path_of(ps, root, node)
-            .ok()
-            .filter(|p| !p.starts_with(b"(unreachable)"))
+    let visible = |node: &Node| match ps.vfs.reach(ps, root, node) {
+        Ok((path, true)) => Some(path),
+        _ => None,
     };
     let mut out = Vec::new();
     if let Some(point) = visible(&Node::ROOT) {

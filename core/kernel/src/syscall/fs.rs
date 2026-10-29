@@ -1686,7 +1686,13 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
 
 pub(super) fn getcwd(cx: &mut Cx<'_>, buf: u64, size: u64) -> SysResult {
     let vfs = cx.vfs()?;
-    let mut path = vfs.path_of(&cx.view(&vfs), &cx.root(), &cx.cwd())?;
+    let (path, reached) = vfs.reach(&cx.view(&vfs), &cx.root(), &cx.cwd())?;
+    // 与 Linux 一样，当前目录不在根目录下面时以 (unreachable) 开头（musl、glibc 当作 ENOENT）
+    let mut path = if reached {
+        path
+    } else {
+        [&b"(unreachable)"[..], &path].concat()
+    };
     path.push(0);
     if (size as usize) < path.len() {
         return Err(Errno::ERANGE);

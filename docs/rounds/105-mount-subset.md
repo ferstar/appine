@@ -32,6 +32,6 @@
 - 传播类型不模拟：shared、slave 设置成功，但挂载之间没有传播，mountinfo 里没有 `shared:N` 这些可选字段。没有挂载命名空间（§6），所有进程看到同一张挂载表。
 - 终端从设备的打开文件不记得经由哪个 devpts 挂载打开的：`/proc/<pid>/fd/<n>` 跟随之后按开机时的那个算，卸下时也不算它在用。
 - `MNT_EXPIRE` 的标记在之后有人用过这个挂载时不清掉（Linux 的 `mntput` 清掉）。
-- 卸下（`MNT_DETACH`）了的挂载里还开着的节点，设备号按开机时的实例算；`/proc/<pid>/cwd`、`root` 这类链接带 `(unreachable)`，Linux 的 `d_path` 不带（只有 getcwd 带），chroot 之后看根目录以外的也一样（以前就是这样）。epoll 的 fdinfo 里合成文件的设备号也按开机时的实例算。
+- 卸下（`MNT_DETACH`）了的挂载里还开着的节点，设备号按开机时的实例算；`/proc/<pid>/cwd`、`root` 这类链接带 `(unreachable)`，Linux 的 `d_path` 不带（只有 getcwd 带），chroot 之后看根目录以外的也一样（以前就是这样）。epoll 的 fdinfo 里合成文件的设备号也按开机时的实例算。→ 链接和打开文件记的路径已改成与 `d_path` 一样不带 `(unreachable)`（2026-10-30，单独修补）：根目录以外的是从真正的根算起的路径，卸下了的挂载里的从那个挂载的根算起，只有 getcwd 还带；设备号仍按开机时的实例算
 - inotify 监视着的合成文件所在的挂载卸下时没有 `IN_UNMOUNT`。
 - 只在 colima 的虚拟机里跑，没上手机。

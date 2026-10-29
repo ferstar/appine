@@ -703,14 +703,26 @@ impl Vfs {
         Ok((dir, name))
     }
 
-    /// 目录相对根目录 `root` 的绝对路径（getcwd、`/proc/<pid>/cwd`）。不在 `root` 下面
-    /// 的目录与 Linux 一样以 `(unreachable)` 开头。
+    /// 目录相对根目录 `root` 的绝对路径（Linux 的 `d_path`：`/proc/<pid>/cwd`、打开文件记的
+    /// 路径）。不在 `root` 下面的目录与 Linux 一样不加标记，得到从仓库的根算起的路径，卸下了的
+    /// 挂载里的从那个挂载的根算起；要知道到不到得了用 [`reach`](Self::reach)。
     pub(crate) fn path_of(
         &self,
         ps: &dyn Pseudo,
         root: &Node,
         dir: &Node,
     ) -> Result<Vec<u8>, Errno> {
+        self.reach(ps, root, dir).map(|(path, _)| path)
+    }
+
+    /// [`path_of`](Self::path_of)，另外返回是不是从 `root` 到得了：到不了时 getcwd 以
+    /// `(unreachable)` 开头，mountinfo 不列。
+    pub(crate) fn reach(
+        &self,
+        ps: &dyn Pseudo,
+        root: &Node,
+        dir: &Node,
+    ) -> Result<(Vec<u8>, bool), Errno> {
         let mut names = Vec::new();
         let mut cur = dir.clone();
         let mut reached = true;
@@ -753,20 +765,15 @@ impl Vfs {
                 },
             }
         }
-        let mut out = if reached {
-            Vec::new()
-        } else {
-            b"(unreachable)".to_vec()
-        };
+        let mut out = Vec::new();
         if names.is_empty() {
             out.push(b'/');
-            return Ok(out);
         }
         for name in names.iter().rev() {
             out.push(b'/');
             out.extend_from_slice(name);
         }
-        Ok(out)
+        Ok((out, reached))
     }
 
     // ---- 挂载表（mount(2)、umount2(2)、mountinfo）----
@@ -1295,8 +1302,12 @@ mod tests {
         assert_eq!(r(&usr, &kernel, b"../../../../..").unwrap(), usr);
         assert_eq!(r(&usr, &usr, b"/bin/sys").unwrap(), Node::Pseudo(id, SYS));
         assert_eq!(
-            vfs.path_of(ps, &usr, &proc_sys).unwrap(),
-            b"(unreachable)/proc/sys"
+            vfs.reach(ps, &usr, &proc_sys).unwrap(),
+            (b"/proc/sys".to_vec(), false)
+        );
+        assert_eq!(
+            vfs.reach(ps, &usr, &kernel).unwrap(),
+            (b"/bin/sys/kernel".to_vec(), true)
         );
 
         // bind 挂载 procfs 里的 sys/：看到的是那个目录，`..` 回到挂载点的上级
@@ -1370,8 +1381,8 @@ mod tests {
             Node::Pseudo(id, PseudoNode::ProcRoot)
         );
         assert_eq!(
-            vfs.path_of(ps, &root, &kernel).unwrap(),
-            b"(unreachable)/sys/kernel"
+            vfs.reach(ps, &root, &kernel).unwrap(),
+            (b"/sys/kernel".to_vec(), false)
         );
         assert_eq!(
             vfs.cached().stat(ROOT, lib, b"..", true),
