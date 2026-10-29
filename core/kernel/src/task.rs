@@ -464,19 +464,22 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         return exit(shared, task, cpu.state(), None);
     };
     let (sync, tier) = (task.sync.clone(), k.tier);
-    // Tier 1 的翻译由这个地址空间里的线程共用。参数只是持有 BKL 的凭证：Mm 只在持有 BKL
-    // 时访问
-    let attach = |_: &Kernel| {
+    // Tier 1 的翻译由这个地址空间里的线程共用，同一个程序的几个地址空间也可能共用
+    // （crate::mm::CodeGroup）。Mm 只在持有 BKL 时访问
+    let attach = |k: &Kernel| {
         let space = match tier {
             Tier::Interpreter => None,
-            Tier::Dbt => task.state.borrow().mm.borrow_mut().code_space(),
+            Tier::Dbt => task.state.borrow().mm.borrow_mut().code_space(&k.code_groups),
         };
         space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)))
     };
     let mut dbt = attach(&k);
     let mut fast = Fast::new(shared, &task, &task.state.borrow());
     drop(k);
-    let load = |g: &Generations| (g.tlb.load(Ordering::SeqCst), g.code.load(Ordering::SeqCst));
+    let load = |g: &Generations| {
+        let tlb = g.tlb.load(Ordering::SeqCst);
+        (tlb, g.code.load(Ordering::SeqCst), g.space.load(Ordering::SeqCst))
+    };
     let mut seen = load(&generations);
     loop {
         // 所有线程都在等待时定时器线程的定期检查会停下来（crate::oom、crate::loadavg）
@@ -484,6 +487,17 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
         sync.in_guest.store(true, Ordering::SeqCst);
         let now = load(&generations);
+        // 地址空间离开了共用翻译的组（crate::mm::CodeGroup）：换用它自己的翻译。离开时做了
+        // shootdown，所以这个线程不会再执行组里的翻译
+        if now.2 != seen.2 {
+            sync.in_guest.store(false, Ordering::SeqCst);
+            let k = shared.lock();
+            if dbt.take().is_some() {
+                dbt = attach(&k);
+            }
+            seen.2 = now.2;
+            continue;
+        }
         if now.0 != seen.0 {
             cpu.tlb_flush();
         }

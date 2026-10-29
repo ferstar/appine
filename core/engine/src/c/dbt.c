@@ -3851,6 +3851,31 @@ void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, s
     pthread_mutex_unlock(&d->lock);
 }
 
+void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    pthread_mutex_lock(&d->lock);
+    d->st = &spare_stats; /* 上一个持锁的线程可能已经解挂 */
+    struct retire_batch r = {.n = 0};
+    for (size_t i = 0; i < d->table_count; i++) {
+        struct block *b = &d->blocks[i];
+        if (!b->code)
+            continue;
+        bool inside = false;
+        for (size_t j = 0; j < n && !inside; j++)
+            inside = b->pc - s[j].start < s[j].len;
+        if (inside)
+            continue;
+        if (b->parked) {
+            kill_parked(d, b);
+        } else if (!retire_add(d, &r, b, false)) {
+            __atomic_store_n(&d->flush_wanted, true, __ATOMIC_SEQ_CST);
+            break;
+        }
+    }
+    retire_flush(d, &r);
+    pthread_mutex_unlock(&d->lock);
+}
+
 /* 停下来等别人整体清空完。持有锁，等待期间放开 */
 static void park(struct appine_dbt *d)
 {
@@ -4163,6 +4188,13 @@ void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source
 }
 
 void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    (void)d;
+    (void)s;
+    (void)n;
+}
+
+void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
 {
     (void)d;
     (void)s;

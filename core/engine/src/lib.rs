@@ -188,6 +188,7 @@ unsafe extern "C" {
     fn appine_dbt_free(dbt: *mut RawDbt, key: u64);
     fn appine_dbt_set_sources(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_trust(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
+    fn appine_dbt_retire_outside(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_attach(dbt: *mut RawDbt) -> *mut RawDbtThread;
     fn appine_dbt_detach(t: *mut RawDbtThread);
     fn appine_dbt_flush(t: *mut RawDbtThread);
@@ -640,6 +641,12 @@ impl DbtSpace {
     /// （[`Self::set_sources`]）完全相同的映射里的块不必逐块核对。
     pub fn trust(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_trust(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
+    }
+
+    /// 作废 guest pc 不在这几段映射里的块（含停放着的）：要由几个地址空间共用之前，去掉只对
+    /// 原来那个地址空间有效的翻译。别的线程可以正在运行。
+    pub fn retire_outside(&self, sources: &[DbtSource]) {
+        unsafe { appine_dbt_retire_outside(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 }
 

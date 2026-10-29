@@ -116,6 +116,7 @@
 | [M9 之前：mount 的子集](rounds/105-mount-subset.md) | 2026-10-29 | procfs、sysfs、devpts、cgroup2 可以挂到任意目录上，它们里面的目录可以 bind（`--rbind` 带上挂在里面的）；合成节点带着经由的挂载，`..`、getcwd 经由挂载点回去，mountinfo 相对进程的根目录生成；卸下、EBUSY、只读挂载、新实例按 Linux 6.1：从 Alpine chroot 进 Debian 挂上之后 ps、top、free、findmnt 能用；仓库里的目录还不能 bind、没有 tmpfs |
 | [M9 之前：代码缓存只算一次](rounds/106-code-cache-rss.md) | 2026-10-30 | 拆开量多进程负载多占的内存：Tier 1 代码缓存的写入、执行两个视图在宿主的 RSS 里各算一次，翻译多算了一倍；引擎记下写入视图里写过的页，定时器线程每秒拆一次页表项，OOM killer 和 cgroup 的用量扣掉还没拆的：20 个空闲的 python3 的 App 用量 321 → 218 MB，Codex 的界面 294 → 208 MB，计时不变（按写入量拆时 Maven 慢 3%，没有采用）；16K 页的宿主上清空实例时交还代码缓存 |
 | [M9 之前：翻译代码的密度](rounds/107-code-density.md) | 2026-10-30 | 块尾的桩占翻译后代码的四成多：链接桩、退出桩、回填桩里的 guest pc 和退出原因改放在桩末尾的数据字里，由例程读出，回填失败时不再另带退出桩，`bl` 从落点读返回地址；每条 guest 指令翻译成的宿主字数 7.5–8.3 → 约 6，20 个 python3 的代码 100 → 78 MB，并行编译的峰值 185 → 155 MB，Maven、Gradle 快 3–5% |
+| [M9 之前：同一个程序共用翻译](rounds/108-shared-translation.md) | 2026-10-30 | 同一个程序的进程在同样的地址映射着同样的可信文件时共用一个 Tier 1 实例：映射了 JIT、写过的代码或不一致的文件的成员离开组（shootdown 之后换空间），第二个成员加入时作废登记范围以外的块；20 个空闲 python3 的 App 用量 193 → 84 MB，`xargs -P4` 编译时代码缓存的峰值 155 → 53 MB、快 13%，shell 起进程快三成；第一个进程也记下程序文件 |
 
 ## 测量条件
 
@@ -169,3 +170,4 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | [JIT 负载](rounds/35-jit.md) | Maven、Gradle 热构建 | 3.6×、3.4× |
 | [多进程并行](rounds/36-parallel-processes.md) | 4 个进程同时 exec；4 个同时跑管道 | 2.5×；3.1×（原来 3.1×、4×） |
 | [拆 BKL](rounds/38-split-bkl.md) | `go build` 冷编译 | 2.8× |
+| [同一个程序共用翻译](rounds/108-shared-translation.md) | shell 起进程 | 1.13×（原来 1.6×） |

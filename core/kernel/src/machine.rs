@@ -203,6 +203,8 @@ impl Machine {
             &image,
         );
         crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program)), interp);
+        // 与 execve 一样记下程序文件（ETXTBSY、池里翻译的键、共用翻译的组）
+        mm.exe = Some(ino_of(program)).filter(|&ino| ino != 0);
 
         let tid = k.alloc_tid().map_err(io_err)?;
         let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));

@@ -1416,6 +1416,42 @@ fn code_cache_pages_are_counted_once() {
 }
 
 #[test]
+fn processes_of_one_program_share_translations() {
+    // 同一个程序的进程映射得一样时共用 Tier 1 的翻译：shell 和它起的 6 个 sleep（都是
+    // busybox，sleep 在 fork 出来的进程里直接执行）只占一份代码缓存，原来各一份。文件的
+    // ctime 离现在超过两秒才算可信（这个仓库刚导入），所以先等一会儿再 exec 一个 shell
+    let Some(store) = store() else {
+        return;
+    };
+    let script = "sleep 3; exec sh -c 'for i in 1 2 3 4 5 6; do sleep 30 & done; echo ready; \
+                  read x; kill $(jobs -p)'";
+    let mut child = command(store, "1", &["/bin/sh", "-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "ready");
+    // 等这几个 sleep 都开始执行（翻译了代码）
+    std::thread::sleep(Duration::from_millis(500));
+    let smaps = std::fs::read_to_string(format!("/proc/{}/smaps", child.id())).unwrap();
+    child.stdin.take().unwrap().write_all(b"\n").unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let caches = smaps
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let (range, perms) = (f.next()?, f.next()?);
+            let (lo, hi) = range.split_once('-')?;
+            let size = u64::from_str_radix(hi, 16).ok()? - u64::from_str_radix(lo, 16).ok()?;
+            (size == 128 << 20 && perms == "r-xs").then_some(())
+        })
+        .count();
+    // 共用的一份，加上池里留着的（exec 之前的 shell）
+    assert!((1..=2).contains(&caches), "{caches} code caches");
+}
+
+#[test]
 fn one_machine_runs_several_terminal_sessions() {
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
     let Some(store) = store() else {

@@ -304,6 +304,11 @@ void appine_dbt_set_sources(struct appine_dbt *dbt, const struct appine_dbt_sour
  * 不必逐块核对（execve 时程序和动态链接器的代码段，核对它们要把每一页都读一遍）
  */
 void appine_dbt_trust(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+/*
+ * 作废 guest pc 不在这几段映射里的块（含停放着的）：实例要由几个地址空间共用之前，去掉只
+ * 对原来那个地址空间有效的翻译（比如池里上一个使用者留下的）。别的线程可以正在运行
+ */
+void appine_dbt_retire_outside(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
 
 struct appine_dbt_thread;
 struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *dbt);

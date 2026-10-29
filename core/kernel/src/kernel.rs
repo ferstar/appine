@@ -217,6 +217,8 @@ pub(crate) struct Kernel {
     pub threads_max: usize,
     /// App 内存的上限和 OOM killer（[`crate::oom`]）。
     pub oom: crate::oom::Oom,
+    /// 同一个程序的地址空间共用 Tier 1 翻译的组（[`crate::mm::CodeGroup`]）。
+    pub code_groups: crate::mm::CodeGroups,
     /// 平均负载（[`crate::loadavg`]）。
     pub load: crate::loadavg::LoadAvg,
     /// 被跟踪的线程退出了、还没被跟踪者的 wait 取走的（[`crate::ptrace`]）。
@@ -297,6 +299,7 @@ impl Kernel {
             nr_open: crate::fd::MAX_FDS,
             threads_max: crate::process::default_threads_max(),
             oom: Default::default(),
+            code_groups: Default::default(),
             load: crate::loadavg::LoadAvg::new(Instant::now()),
             trace_exits: Vec::new(),
             next_tid: INIT + 1,
