@@ -988,6 +988,32 @@ static int shown_link(int t)
            t == 6 || t == 39;
 }
 
+/* 链路消息的属性按类型排好再打印：属性的顺序随内核版本变（6.10 前后 IFLA_QDISC 挪到了
+ * 后面）；地址消息按原来的顺序 */
+static void attribute(struct nlmsghdr *h, int link, unsigned off)
+{
+    uint16_t len, t;
+    memcpy(&len, (char *)h + off, 2);
+    memcpy(&t, (char *)h + off + 2, 2);
+    t &= 0x3fff;
+    unsigned char *d = (unsigned char *)h + off + 4;
+    int n = len - 4;
+    if (link && (t == 1 || t == 2)) {
+        printf("  %d: %d bytes\n", t, n);
+        return;
+    }
+    printf("  %d:", t);
+    if (n == 4 && !memcmp(d, self, 4))
+        printf(" SELF");
+    else if (!link && t == 6 && n == 16)
+        for (int i = 0; i < 8; i++)
+            printf(" %02x", d[i]);
+    else
+        for (int i = 0; i < n; i++)
+            printf(" %02x", d[i]);
+    printf("\n");
+}
+
 static void message(struct nlmsghdr *h)
 {
     unsigned char *p = (void *)(h + 1);
@@ -998,28 +1024,16 @@ static void message(struct nlmsghdr *h)
             printf(" %02x", p[i]);
     index_name(p + 4);
     printf("\n");
-    for (unsigned off = 16 + hl; off + 4 <= h->nlmsg_len;) {
-        uint16_t len, t;
-        memcpy(&len, (char *)h + off, 2);
-        memcpy(&t, (char *)h + off + 2, 2);
-        unsigned char *d = (unsigned char *)h + off + 4;
-        int n = len - 4;
-        if (!link || shown_link(t & 0x3fff)) {
-            printf("  %d:", t & 0x3fff);
-            if (n == 4 && !memcmp(d, self, 4))
-                printf(" SELF");
-            else if (!link && t == 6 && n == 16)
-                for (int i = 0; i < 8; i++)
-                    printf(" %02x", d[i]);
-            else
-                for (int i = 0; i < n; i++)
-                    printf(" %02x", d[i]);
-            printf("\n");
-        } else if (t == 1 || t == 2) {
-            printf("  %d: %d bytes\n", t, n);
+    for (int t = link ? 0 : -1; t < (link ? 64 : 0); t++)
+        for (unsigned off = 16 + hl; off + 4 <= h->nlmsg_len;) {
+            uint16_t len, ty;
+            memcpy(&len, (char *)h + off, 2);
+            memcpy(&ty, (char *)h + off + 2, 2);
+            ty &= 0x3fff;
+            if (!link || (ty == t && (shown_link(ty) || ty == 1 || ty == 2)))
+                attribute(h, link, off);
+            off += (len + 3) & ~3;
         }
-        off += (len + 3) & ~3;
-    }
 }
 
 static void replies(const char *what)
