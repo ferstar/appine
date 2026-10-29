@@ -3,6 +3,8 @@
 
     <!-- guest 程序的网络（socket 透传）和首次启动时给镜像测速 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 默认网络的路由交给 guest 的路由表（设计文档 §10） -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

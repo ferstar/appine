@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::net::{AF_INET, AF_INET6, InetSocket, SOCK_DGRAM, SOCK_STREAM};
+use crate::net::{AF_INET, AF_INET6, InetSocket, SOCK_STREAM};
 
 /// 一个接口的计数。
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -217,21 +217,17 @@ impl Traffic {
     }
 }
 
-/// 宿主发往公网时选的本端地址：对一个公网地址 connect 一个 UDP socket，不发出数据报。
-/// 没有这个地址族的路由时是 None。
-fn outgoing_source(family: i32) -> Option<Vec<u8>> {
-    let dst: std::net::IpAddr = if family == AF_INET {
-        [8, 8, 8, 8].into()
+/// 宿主发往公网时选的本端地址（[`appine_hal::net::source_for`]），没有这个地址族的路由时
+/// 是 None。
+pub(crate) fn outgoing_source(family: i32) -> Option<Vec<u8>> {
+    let dst: &[u8] = if family == AF_INET {
+        &[8, 8, 8, 8]
     } else {
-        [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888].into()
+        &[
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ]
     };
-    let fd = appine_hal::net::socket(family, SOCK_DGRAM, 0).ok()?;
-    let addr = appine_hal::net::sockaddr(std::net::SocketAddr::new(dst, 53));
-    let local = appine_hal::net::connect(fd, &addr)
-        .ok()
-        .and_then(|()| appine_hal::net::sockname(fd, false).ok());
-    appine_hal::net::close(fd);
-    local.and_then(|a| ip_of(&a))
+    appine_hal::net::source_for(dst).ok()
 }
 
 /// sockaddr 里的 IP 地址：IPv4 是 4 字节，IPv6 是 16 字节，IPv4 映射的 IPv6 地址按 IPv4。
@@ -263,6 +259,7 @@ fn is_loopback(ip: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::SOCK_DGRAM;
 
     fn sockaddr(s: &str) -> Vec<u8> {
         appine_hal::net::sockaddr(s.parse().unwrap())

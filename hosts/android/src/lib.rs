@@ -14,9 +14,9 @@ use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::{Arc, Once};
 
-use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Stdio, Tier};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObjectArray, JString};
+use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jint, jlong};
 
 /// 抛出 `java.io.IOException`；JNI 调用之后由 Kotlin 看到。
@@ -186,6 +186,72 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
     handle: jlong,
 ) {
     machine(handle).trim_memory();
+}
+
+/// `Native.kt` 交来的一条路由：`<目标网段的十六进制>/<前缀长度> <网关的十六进制或者 -> <接口>`。
+/// 度量与 Linux 上同样的路由相同：IPv4 是 0，IPv6 的默认路由 1024（RA），别的 256（内核按
+/// 地址加的网段）。
+fn parse_route(line: &str) -> Option<HostRoute> {
+    let hex = |s: &str| -> Option<Vec<u8>> {
+        s.len()
+            .is_multiple_of(2)
+            .then(|| {
+                (0..s.len() / 2)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+                    .collect()
+            })
+            .flatten()
+    };
+    let mut f = line.split_whitespace();
+    let (dst, prefix) = f.next()?.split_once('/')?;
+    let (dst, prefix): (Vec<u8>, u8) = (hex(dst)?, prefix.parse().ok()?);
+    let gateway = match f.next()? {
+        "-" => None,
+        g => Some(hex(g)?),
+    };
+    let iface = f.next()?.to_owned();
+    let (family, metric) = match dst.len() {
+        4 => (libc::AF_INET, 0),
+        16 if prefix == 0 => (libc::AF_INET6, 1024),
+        16 => (libc::AF_INET6, 256),
+        _ => return None,
+    };
+    if gateway.as_ref().is_some_and(|g| g.len() != dst.len()) {
+        return None;
+    }
+    Some(HostRoute {
+        family,
+        dst,
+        prefix,
+        gateway,
+        iface,
+        metric,
+    })
+}
+
+/// 宿主的默认网络变了：guest 看到的路由表换成 `routes`（每一项见 [`parse_route`]），null 时
+/// 改回按接口的地址合成。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    routes: JObject<'l>,
+) {
+    let routes = if routes.is_null() {
+        None
+    } else {
+        let Some(lines) = strings(&mut env, &JObjectArray::from(routes)) else {
+            return;
+        };
+        Some(
+            lines
+                .iter()
+                .filter_map(|l| parse_route(std::str::from_utf8(l).ok()?))
+                .collect(),
+        )
+    };
+    machine(handle).set_routes(routes);
 }
 
 #[unsafe(no_mangle)]

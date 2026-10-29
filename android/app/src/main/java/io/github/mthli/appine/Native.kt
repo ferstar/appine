@@ -41,6 +41,14 @@ internal object Native {
     @JvmStatic
     external fun trimMemory(machine: Long)
 
+    /**
+     * 宿主的默认网络变了：guest 的路由表换成 [routes]，每一项是
+     * `<目标网段的十六进制>/<前缀长度> <网关的十六进制或者 -> <接口>`；null 时改回按接口的
+     * 地址合成。
+     */
+    @JvmStatic
+    external fun setRoutes(machine: Long, routes: Array<String>?)
+
     /** 新建一个控制台（进程内 PTY），返回它的编号。 */
     @JvmStatic
     @Throws(IOException::class)

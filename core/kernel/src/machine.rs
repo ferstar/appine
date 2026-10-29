@@ -411,6 +411,16 @@ impl Machine {
         self.sync();
     }
 
+    /// 宿主的网络变了（设计文档 §10）：主表里的路由换成 `routes`，guest 的 `ip route`、
+    /// `/proc/net/route` 等看到的就是它们（[`crate::route`]）。Android 上 App 读不到宿主的
+    /// 路由表，由它从默认网络的 `LinkProperties` 取了交进来；None 时改回读宿主的，读不到时
+    /// 按接口的地址合成。
+    pub fn set_routes(&self, routes: Option<Vec<crate::HostRoute>>) {
+        crate::bug::host_call("Machine::set_routes", || {
+            self.shared.lock().host_routes = routes;
+        });
+    }
+
     /// 提交 inode 仓库推迟提交的写事务（App 退到后台时，[`crate::vfs::store`]）。
     pub fn sync(&self) {
         crate::bug::host_call("Machine::sync", || {

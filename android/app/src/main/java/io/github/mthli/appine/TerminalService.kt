@@ -9,6 +9,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.RouteInfo
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
@@ -67,6 +71,20 @@ class TerminalService : Service() {
         private set
 
     val sessions = mutableListOf<TerminalSession>()
+
+    /**
+     * 默认网络的路由交给 guest（设计文档 §10）：Android 10 起 App 读不了宿主的路由表，guest
+     * 的 `ip route`、`/proc/net/route` 靠它。回调在系统的线程上，交给 [worker] 按顺序做。
+     */
+    private val network = object : ConnectivityManager.NetworkCallback() {
+        override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+            setRoutes(routes(lp))
+        }
+
+        override fun onLost(network: Network) {
+            setRoutes(emptyArray())
+        }
+    }
 
     /**
      * 当前的 Activity；它停下（切到别的 App、熄屏）时是 null。停下 [TRIM_DELAY_MS] 之后还没
@@ -165,7 +183,10 @@ class TerminalService : Service() {
                 Native.start(Rootfs.store(this).path, 1)
             }
             main.post {
-                result.onSuccess { machine = it }.onFailure {
+                result.onSuccess {
+                    machine = it
+                    getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
+                }.onFailure {
                     Log.e(TAG, "cannot start", it)
                     startError = it.message ?: it.toString()
                 }
@@ -184,6 +205,7 @@ class TerminalService : Service() {
 
     override fun onDestroy() {
         main.removeCallbacks(trimWhenHidden)
+        if (machine != 0L) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
         val m = machine
@@ -207,6 +229,12 @@ class TerminalService : Service() {
     private fun trimMemory() {
         val m = machine
         if (m != 0L) worker.execute { Native.trimMemory(m) }
+    }
+
+    private fun setRoutes(routes: Array<String>) {
+        val m = machine
+        // 回调可能和 onDestroy 交错：worker 已经关掉时就不用再交了
+        if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
     }
 
     /** 新开一个终端会话（登录 shell）。shell 在第一次知道窗口大小时启动。 */
@@ -257,6 +285,19 @@ class TerminalService : Service() {
 
     companion object {
         private const val TAG = "appine"
+
+        /** [Native.setRoutes] 的格式。Android 13 之前看不出路由的类型，都当作单播。 */
+        fun routes(lp: LinkProperties): Array<String> = lp.routes.mapNotNull { r ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && r.type != RouteInfo.RTN_UNICAST) {
+                return@mapNotNull null
+            }
+            val iface = r.`interface` ?: lp.interfaceName ?: return@mapNotNull null
+            val dst = r.destination
+            val gateway = r.gateway?.takeIf { r.hasGateway() }?.address?.let(::hex) ?: "-"
+            "${hex(dst.rawAddress)}/${dst.prefixLength} $gateway $iface"
+        }.toTypedArray()
+
+        private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
         private const val CHANNEL_ID = "sessions"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"

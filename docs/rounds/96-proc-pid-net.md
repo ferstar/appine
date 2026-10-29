@@ -23,4 +23,4 @@
 
 **推迟项**：
 
-- `/proc/<pid>/net` 仍然只有这 11 个文件（原生的容器里有 57 个），没有的见[网络信息的缺口](78-net-info-gaps.md)那一轮。
+- `/proc/<pid>/net` 仍然只有这 11 个文件（原生的容器里有 57 个），没有的见[网络信息的缺口](78-net-info-gaps.md)那一轮。→ 新增 `route`、`ipv6_route`、`sockstat`、`sockstat6`（M9 之前：路由表），现在 15 个；`snmp`、`netstat`、`arp` 等仍没有

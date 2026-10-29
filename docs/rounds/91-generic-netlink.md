@@ -22,4 +22,4 @@
 - nlctrl 自己的策略（`CTRL_CMD_GETPOLICY`）没有做，是 EOPNOTSUPP；iproute2 的 `genl ctrl policy` 用得到，别的程序只查自己的族的策略，那些族都不存在。
 - 没有别的族。要模拟某个子系统（比如让 ethtool 走 netlink）时再加。
 - 没有扩展确认：设了 `NETLINK_EXT_ACK` 的 socket 在 Linux 上的错误消息带着说明文字、出错的属性等（`NLMSGERR_ATTR_*`），这里没有。
-- `NETLINK_ROUTE` 的错误消息仍只附上请求的消息头，确认也不带 `NLM_F_CAPPED`（[M4](06-m4.md) 起）；Linux 与上面 genetlink 的一样。
+- `NETLINK_ROUTE` 的错误消息仍只附上请求的消息头，确认也不带 `NLM_F_CAPPED`（[M4](06-m4.md) 起）；Linux 与上面 genetlink 的一样。→ 已补上（M9 之前：路由表），两种协议用同一个函数回答确认和错误

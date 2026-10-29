@@ -801,6 +801,33 @@ fn network_configuration_is_visible() {
 }
 
 #[test]
+fn routing_tables_are_visible() {
+    // 本地表按接口的地址合成，规则是 Linux 默认的那几条；ip route get 的本机地址走 lo；
+    // /proc/net/route 有表头，sockstat 数得到 socket（主表取决于宿主的网络，这里不看）
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "ip route show table local | grep '^local 127.0.0.1 '; ip rule; ip route get 127.0.0.9; \
+         head -c 5 /proc/net/route; echo; head -n 1 /proc/net/sockstat",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().map(str::trim_end).collect::<Vec<_>>(),
+            [
+                "local 127.0.0.1 dev lo scope host  src 127.0.0.1",
+                "0:\tfrom all lookup local",
+                "32766:\tfrom all lookup main",
+                "32767:\tfrom all lookup default",
+                "local 127.0.0.9 dev lo  src 127.0.0.1",
+                "Iface",
+                "sockets: used 0",
+            ],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
 fn syslog_messages_travel_over_a_unix_socket() {
     // syslogd 把数据报 socket 绑定在 /dev/log 上，logger 按路径发过去
     for (tier, out) in run(&[

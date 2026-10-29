@@ -106,6 +106,7 @@
 | [M9 之前：跟踪者退出时丢掉已经取走的信号](rounds/95-tracer-exit-drops-signal.md) | 2026-10-29 | 跟踪者不 detach 就退出时，已经被 wait 取走的信号投递停止里的信号丢掉，与 Linux 6.8 实测的相同（原来照 ptrace(2) 投递）：delve attach 之后读到 EOF 退出，进程原来被 SIGSTOP 停住 |
 | [M9 之前：`/proc/<pid>/net`](rounds/96-proc-pid-net.md) | 2026-10-29 | 网络的那些文件与 Linux 一样放在 `/proc/<pid>/net` 下（task 子目录里也有），`/proc/net` 改成指向 `self/net` 的链接（原来是目录，经由 `/proc/self/net` 读不到） |
 | [M9 之前：已经删除的文件带 ` (deleted)`](rounds/97-deleted-suffix.md) | 2026-10-29 | 删除之后还开着、映射着的文件，`/proc/<pid>/fd` 和 maps、smaps 里的路径后面加上 ` (deleted)`，与 Linux 相同（needrestart 按它找出还在用旧库的进程）；exe 不加 |
+| [M9 之前：路由表](rounds/98-routes.md) | 2026-10-29 | 主表取自宿主（Android 上 App 从默认网络的 `LinkProperties` 交来，别处读宿主的 `/proc/net/route`），本地表按接口的地址合成：`ip route`、`ip route get`（原来 EOPNOTSUPP）、`ip rule`、`route -n`、`/proc/net/route`、`ipv6_route` 与 Linux 逐字节相同；`ip neigh` 是空表，新增 `/proc/net/sockstat`；NETLINK_ROUTE 的错误附上整条请求 |
 
 ## 测量条件
 
@@ -124,7 +125,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 
 | 测试 | 原因 |
 |---|---|
-| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02、prctl09 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败 |
+| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02、prctl09 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败；[路由表](rounds/98-routes.md)那一轮 select02 单独跑也失败，原生 1 毫秒睡眠的中位数 1.59 毫秒 |
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了（[测试自己的竞争和丢掉的现场](rounds/82-test-races.md)那一轮起 `scripts/ltp` 保留上一次的日志）；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |

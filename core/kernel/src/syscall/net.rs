@@ -484,6 +484,30 @@ pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
     Ok(0)
 }
 
+/// netlink 的回答用的宿主信息：接口取自宿主，流量计数和宿主交来的路由取自内核。
+struct KernelHost<'a> {
+    k: &'a crate::kernel::Kernel,
+    uid: u32,
+}
+
+impl crate::net::Host for KernelHost<'_> {
+    fn interfaces(&self) -> Vec<appine_hal::net::Interface> {
+        appine_hal::net::interfaces()
+    }
+
+    fn stats(&self, name: &str) -> crate::traffic::IfStats {
+        self.k.traffic.get(name)
+    }
+
+    fn routes(&self) -> Option<Vec<appine_hal::net::Route>> {
+        crate::route::host_routes(self.k)
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+}
+
 /// 发送一条消息（send、sendto、sendmsg、write 共用）。
 pub(crate) fn send(
     cx: &mut Cx<'_>,
@@ -504,8 +528,11 @@ pub(crate) fn send(
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
         Socket::Netlink(s) => {
-            let traffic = &cx.kr().traffic;
-            s.handle(data, appine_hal::net::interfaces, |name| traffic.get(name));
+            let host = KernelHost {
+                k: cx.kr(),
+                uid: cx.cred().ruid,
+            };
+            s.handle(data, &host);
             request_wake_object(wake::of(sock));
             return Ok(data.len());
         }

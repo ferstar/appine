@@ -1,10 +1,12 @@
 package io.github.mthli.appine
 
+import android.net.ConnectivityManager
 import android.system.Os
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -130,6 +132,32 @@ class MachineTest {
         assertEquals("done\n" to 0, result)
         Native.trimMemory(machine)
         assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+    }
+
+    /**
+     * guest 的路由表（设计文档 §10）：App 读不了宿主的 `/proc/net/route`，交来默认网络的
+     * `LinkProperties` 之前是按接口的地址合成的（默认路由没有网关），交来之后有网关；
+     * `ip route get` 的源地址由宿主选。
+     */
+    @Test
+    fun routesComeFromLinkProperties() {
+        val machine = start(1)
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val lp = cm.getLinkProperties(cm.activeNetwork)
+        assertNotNull("no default network", lp)
+        val default = lp!!.routes.first { it.isDefaultRoute && it.hasGateway() && it.gateway!!.address.size == 4 }
+        val (before, _) = sh(machine, "ip route; ip route get 1.1.1.1")
+        assertTrue(before, before.contains("default dev ${default.`interface`} scope link"))
+        assertTrue(before, before.contains("1.1.1.1 dev ${default.`interface`}  src "))
+        Native.setRoutes(machine, TerminalService.routes(lp))
+        val (after, code) = sh(machine, "ip route; ip route get 1.1.1.1; route -n")
+        assertEquals(after, 0, code)
+        val gateway = default.gateway!!.hostAddress
+        assertTrue(after, after.contains("default via $gateway dev ${default.`interface`}"))
+        assertTrue(after, after.contains("1.1.1.1 via $gateway dev ${default.`interface`}  src "))
+        assertTrue(after, after.lines().any { it.startsWith("0.0.0.0 ") && it.contains(gateway!!) })
+        Native.setRoutes(machine, null)
+        assertTrue(sh(machine, "ip route").first.contains("default dev "))
     }
 
     /**

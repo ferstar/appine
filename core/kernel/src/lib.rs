@@ -26,6 +26,7 @@ mod pipe;
 mod process;
 mod pseudo;
 mod ptrace;
+mod route;
 mod seccomp;
 mod signal;
 mod syscall;
@@ -39,6 +40,7 @@ mod vdso;
 pub mod vfs;
 
 pub use appine_engine::DbtStats;
+pub use appine_hal::net::Route as HostRoute;
 pub use loader::LoadError;
 pub use machine::{Machine, MachineOptions, Stdio, run};
 pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier};

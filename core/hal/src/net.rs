@@ -289,6 +289,126 @@ pub fn interfaces() -> Vec<Interface> {
     list
 }
 
+/// 宿主路由表（主表）里的一条路由（路由表的模拟用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// `AF_INET` 或 `AF_INET6`。
+    pub family: i32,
+    /// 目标网段：IPv4 是 4 字节，IPv6 是 16 字节。
+    pub dst: Vec<u8>,
+    /// 前缀长度。
+    pub prefix: u8,
+    /// 网关；直接相连的网段没有。
+    pub gateway: Option<Vec<u8>>,
+    /// 出口接口的名字。
+    pub iface: String,
+    /// 度量（`ip route` 的 metric）。
+    pub metric: u32,
+}
+
+/// 宿主主表里的单播路由：读宿主的 `/proc/net/route`、`/proc/net/ipv6_route`。读不到时
+/// （Android 10 起 App 读不了 `/proc/net`，macOS 没有这两个文件）是 None。
+pub fn routes() -> Option<Vec<Route>> {
+    let v4 = std::fs::read_to_string("/proc/net/route").ok()?;
+    let mut out = parse_route(&v4);
+    // 没有 IPv6 的宿主上没有这个文件
+    if let Ok(v6) = std::fs::read_to_string("/proc/net/ipv6_route") {
+        out.extend(parse_ipv6_route(&v6));
+    }
+    Some(out)
+}
+
+const RTF_GATEWAY: u32 = 0x2;
+const RTF_REJECT: u32 = 0x200;
+const RTF_ANYCAST: u32 = 0x10_0000;
+const RTF_CACHE: u32 = 0x100_0000;
+const RTF_LOCAL: u32 = 0x8000_0000;
+
+/// `/proc/net/route`（Linux 的 `fib_route_seq_show`）：只有主表，地址是按小端打印的
+/// 32 位字。不可达等拒绝的路由不要。
+fn parse_route(text: &str) -> Vec<Route> {
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    text.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (dst, gw, flags, metric, mask) = (
+                hex(f.get(1)?)?,
+                hex(f.get(2)?)?,
+                hex(f.get(3)?)?,
+                f.get(6)?,
+                hex(f.get(7)?)?,
+            );
+            (flags & RTF_REJECT == 0).then_some(())?;
+            Some(Route {
+                family: libc::AF_INET,
+                dst: dst.to_le_bytes().to_vec(),
+                prefix: mask.count_ones() as u8,
+                gateway: (flags & RTF_GATEWAY != 0).then(|| gw.to_le_bytes().to_vec()),
+                iface: f[0].to_owned(),
+                metric: metric.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// `/proc/net/ipv6_route`（Linux 的 `ipv6_route_native_seq_show`）：所有表都在里面，只要
+/// 主表里那种单播路由，本地表的地址、多播、任播、缓存和拒绝的路由（各表的空路由）不要。
+fn parse_ipv6_route(text: &str) -> Vec<Route> {
+    let addr = |s: &str| -> Option<Vec<u8>> {
+        (s.len() == 32)
+            .then(|| {
+                (0..16)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+                    .collect()
+            })
+            .flatten()
+    };
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (dst, prefix, gw) = (addr(f.first()?)?, hex(f.get(1)?)?, addr(f.get(4)?)?);
+            let (metric, flags, iface) = (hex(f.get(5)?)?, hex(f.get(8)?)?, f.get(9)?);
+            let rejected = RTF_REJECT | RTF_ANYCAST | RTF_CACHE | RTF_LOCAL;
+            (flags & rejected == 0 && dst[0] != 0xff).then_some(())?;
+            Some(Route {
+                family: libc::AF_INET6,
+                dst,
+                prefix: prefix as u8,
+                gateway: (flags & RTF_GATEWAY != 0).then_some(gw),
+                iface: (*iface).to_owned(),
+                metric,
+            })
+        })
+        .collect()
+}
+
+/// 宿主发往 `dst`（IPv4 4 字节、IPv6 16 字节）时选的本端地址：对它 connect 一个 UDP
+/// socket，不发出数据报。没有路由时是 connect 的错误（ENETUNREACH 等）。
+pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
+    let ip: std::net::IpAddr = match dst.len() {
+        4 => <[u8; 4]>::try_from(dst).unwrap().into(),
+        16 => <[u8; 16]>::try_from(dst).unwrap().into(),
+        _ => return Err(libc::EINVAL),
+    };
+    let family = if ip.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    let fd = socket(family, libc::SOCK_DGRAM, 0)?;
+    let local = connect(fd, &sockaddr(std::net::SocketAddr::new(ip, 53)))
+        .and_then(|()| sockname(fd, false));
+    close(fd);
+    let local = local?;
+    Ok(if family == libc::AF_INET {
+        local[4..8].to_vec()
+    } else {
+        local[8..24].to_vec()
+    })
+}
+
 /// 宿主 `/etc/resolv.conf` 里的名字服务器（sockaddr 的字节）。
 #[cfg(not(target_os = "android"))]
 fn nameservers() -> Vec<Vec<u8>> {
@@ -455,4 +575,43 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
         }
     }
     Err(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// docker 容器里的 `/proc/net/route`、`/proc/net/ipv6_route`：只要主表的单播路由。
+    #[test]
+    fn parses_the_host_routing_tables() {
+        let v4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                  eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                  eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+                  eth0\t000013AC\t00000000\t0201\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        let r = parse_route(v4);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].gateway.as_deref(), Some(&[172, 17, 0, 1][..]));
+        assert_eq!((r[0].prefix, &r[0].dst[..]), (0, &[0; 4][..]));
+        assert_eq!(
+            (r[1].prefix, &r[1].dst[..], r[1].gateway.is_none()),
+            (16, &[172, 17, 0, 0][..], true)
+        );
+        let z = "00000000000000000000000000000000";
+        let v6 = format!(
+            "{z} 00 {z} 00 {z} ffffffff 00000001 00000000 00200200       lo\n\
+             fe800000000000000000000000000000 40 {z} 00 {z} 00000100 00000001 00000000 00000001     eth0\n\
+             {z} 00 {z} 00 fe800000000000000000000000000001 00000400 00000001 00000000 00450003     eth0\n\
+             00000000000000000000000000000001 80 {z} 00 {z} 00000000 00000002 00000000 80200001       lo\n\
+             ff000000000000000000000000000000 08 {z} 00 {z} 00000100 00000001 00000000 00000001     eth0\n"
+        );
+        let r = parse_ipv6_route(&v6);
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            (r[0].prefix, r[0].metric, &r[0].iface[..]),
+            (64, 256, "eth0")
+        );
+        assert_eq!(r[0].dst[..2], [0xfe, 0x80]);
+        assert_eq!(r[1].gateway.as_ref().map(|g| g[15]), Some(1));
+        assert_eq!(r[1].metric, 1024);
+    }
 }

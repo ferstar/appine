@@ -5,14 +5,15 @@
 //! - DNS 存根：guest 的 `/etc/resolv.conf` 指向 `127.0.0.53`。发往 `127.0.0.53:53` 的
 //!   UDP 数据报不经过宿主网络，而是交给宿主的解析器（[`appine_hal::net::dns_query`]），
 //!   回答放进这个 socket 自己的队列，像是从 `127.0.0.53:53` 收到的。
-//! - `NETLINK_ROUTE`：在进程内回答接口和地址的查询（getifaddrs、`ip addr`）。
+//! - `NETLINK_ROUTE`：在进程内回答接口、地址、路由和规则的查询（getifaddrs、`ip addr`、
+//!   `ip route`、`ip rule`，路由见 [`crate::route`]）；邻居表总是空的。
 //! - AF_UNIX：完全在进程内模拟（[`crate::unix`]）。
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use appine_hal::net::Interface;
+use appine_hal::net::{Interface, Route};
 
 use crate::traffic::IfStats;
 
@@ -217,6 +218,66 @@ pub(crate) fn proc_listing(
     lines.iter().map(|l| format!("{l:<width$}\n")).collect()
 }
 
+/// `/proc/net/sockstat`、`sockstat6`（`v6`）：guest 的 socket 各有多少（Linux 的
+/// `sockstat_seq_show`）。TCP 的 inuse 数监听着、连接着（不是 CLOSE）的，alloc 数所有 TCP
+/// socket（两个地址族一起，Linux 上是整个系统的）；UDP 数绑定了端口的，raw 数所有的，
+/// ping socket 不显示。宿主内核里已经关掉、还在 TIME_WAIT 或者孤儿状态的连接这里看不到，
+/// 占用的内存页数也不知道，都是 0。
+pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -> String {
+    let int = |b: Result<Vec<u8>, i32>| {
+        b.ok()
+            .and_then(|b| Some(i32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+    };
+    let family = if v6 { AF_INET6 } else { AF_INET };
+    let (mut tcp, mut alloc, mut udp, mut raw) = (0, 0, 0, 0);
+    for (sock, _) in sockets {
+        let b = sock.borrow();
+        let Socket::Inet(inet) = &*b else {
+            continue;
+        };
+        let proto = int(appine_hal::net::getsockopt(
+            inet.fd,
+            SOL_SOCKET,
+            SO_PROTOCOL,
+            4,
+        ));
+        if inet.ty == SOCK_STREAM && proto == Some(IPPROTO_TCP) {
+            alloc += 1;
+            let state = appine_hal::net::getsockopt(inet.fd, IPPROTO_TCP, TCP_INFO, 8)
+                .ok()
+                .and_then(|b| b.first().copied());
+            if inet.family == family && state.is_some_and(|s| s != TCP_CLOSE) {
+                tcp += 1;
+            }
+            continue;
+        }
+        if inet.family != family {
+            continue;
+        }
+        if inet.raw {
+            raw += 1;
+        } else if inet.ty == SOCK_DGRAM && proto == Some(IPPROTO_UDP) {
+            let bound = appine_hal::net::sockname(inet.fd, false)
+                .is_ok_and(|a| a.get(2..4).is_some_and(|p| p != [0, 0]));
+            if bound || inet.stub_peer {
+                udp += 1;
+            }
+        }
+    }
+    if v6 {
+        format!(
+            "TCP6: inuse {tcp}\nUDP6: inuse {udp}\nUDPLITE6: inuse 0\nRAW6: inuse {raw}\n\
+             FRAG6: inuse 0 memory 0\n"
+        )
+    } else {
+        format!(
+            "sockets: used {}\nTCP: inuse {tcp} orphan 0 tw 0 alloc {alloc} mem 0\n\
+             UDP: inuse {udp} mem 0\nUDPLITE: inuse 0\nRAW: inuse {raw}\nFRAG: inuse 0 memory 0\n",
+            sockets.len()
+        )
+    }
+}
+
 /// 进程内模拟的 netlink socket。只有 `NETLINK_ROUTE` 回答查询；`NETLINK_KOBJECT_UEVENT`
 /// 的 socket 什么也收不到（mdev 监听的 uevent），别的协议建不了（`syscall::net::socket`）。
 pub(crate) struct NetlinkSocket {
@@ -285,7 +346,11 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
+const RTM_GETNEIGH: u16 = 30;
+const RTM_NEWRULE: u16 = 32;
+const RTM_GETRULE: u16 = 34;
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
@@ -314,7 +379,7 @@ fn align4(b: &mut Vec<u8>) {
     b.resize(b.len().next_multiple_of(4), 0);
 }
 
-fn attr(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
+pub(crate) fn attr(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
     b.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
     b.extend_from_slice(&ty.to_le_bytes());
     b.extend_from_slice(data);
@@ -322,7 +387,7 @@ fn attr(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
 }
 
 /// 一条 netlink 消息：消息头加上内容。
-fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
     let mut b = Vec::with_capacity(16 + payload.len());
     b.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
     b.extend_from_slice(&ty.to_le_bytes());
@@ -332,6 +397,20 @@ fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
     b.extend_from_slice(payload);
     align4(&mut b);
     b
+}
+
+/// 对请求 `req`（整条消息）的确认或者错误（Linux 的 `netlink_ack`）：成功时只附上请求的
+/// 消息头、带 `NLM_F_CAPPED`，出错时附上整条请求（没有设 `NETLINK_CAP_ACK`）。
+fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    let mut p = (-err).to_le_bytes().to_vec();
+    if err == 0 {
+        p.extend_from_slice(&req[..16]);
+        message(NLMSG_ERROR, NLM_F_CAPPED, seq, pid, &p)
+    } else {
+        p.extend_from_slice(req);
+        message(NLMSG_ERROR, 0, seq, pid, &p)
+    }
 }
 
 fn link_message(i: &Interface, st: IfStats) -> Vec<u8> {
@@ -533,19 +612,24 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
         Ok(answer) => {
             let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
             if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
-                let mut p = 0i32.to_le_bytes().to_vec();
-                p.extend_from_slice(&req[..16]);
-                out.push(reply(NLMSG_ERROR, NLM_F_CAPPED, &p));
+                out.push(ack(req, 0, pid));
             }
             out
         }
-        // 出错时附上整条请求（没有设 NETLINK_CAP_ACK）
-        Err(e) => {
-            let mut p = (-e).to_le_bytes().to_vec();
-            p.extend_from_slice(req);
-            vec![reply(NLMSG_ERROR, 0, &p)]
-        }
+        Err(e) => vec![ack(req, e, pid)],
     }
+}
+
+/// netlink 的回答要用到的宿主信息（测试里换成固定的）。
+pub(crate) trait Host {
+    /// 宿主的网络接口。
+    fn interfaces(&self) -> Vec<Interface>;
+    /// 接口的流量计数（[`crate::traffic`]）。
+    fn stats(&self, name: &str) -> IfStats;
+    /// 宿主主表里的路由，None 时按接口的地址合成（[`crate::route`]）。
+    fn routes(&self) -> Option<Vec<Route>>;
+    /// 发请求的进程的用户 ID（`ip route get` 回答里的 RTA_UID）。
+    fn uid(&self) -> u32;
 }
 
 impl NetlinkSocket {
@@ -560,12 +644,7 @@ impl NetlinkSocket {
     }
 
     /// 处理 guest 发来的一个数据报（可能含多条请求），把回答放进队列。
-    pub fn handle(
-        &mut self,
-        data: &[u8],
-        interfaces: impl Fn() -> Vec<Interface>,
-        stats: impl Fn(&str) -> IfStats,
-    ) {
+    pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
         if !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
             return;
         }
@@ -576,54 +655,106 @@ impl NetlinkSocket {
             if len < 16 || off + len > data.len() {
                 break;
             }
-            let ty = u16::from_le_bytes([h[4], h[5]]);
-            let flags = u16::from_le_bytes([h[6], h[7]]);
-            let seq = u32::from_le_bytes(h[8..12].try_into().unwrap());
-            let family = h.get(16).copied().unwrap_or(0);
-            if self.protocol == NETLINK_GENERIC {
-                for d in generic_request(&h[..len], self.pid) {
-                    self.queue.push_back(d);
-                    self.arrivals += 1;
-                }
-                off += len.next_multiple_of(4);
-                continue;
-            }
-            let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
-            let mut out = Vec::new();
-            match ty {
-                RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE if flags & NLM_F_DUMP != 0 => {
-                    let list = interfaces();
-                    for i in &list {
-                        if ty == RTM_GETLINK {
-                            let st = stats(&i.name);
-                            out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &link_message(i, st)));
-                        } else if ty == RTM_GETADDR {
-                            for m in addr_messages(i, family) {
-                                out.extend(reply(RTM_NEWADDR, NLM_F_MULTI, &m));
-                            }
-                        }
-                    }
-                    // 路由表没有模拟：只回答一个空的结果
-                    out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
-                }
-                _ if flags & NLM_F_REQUEST != 0 => {
-                    // 不支持的请求：回答 EOPNOTSUPP；只要确认时回答 0
-                    let err: i32 = if flags & NLM_F_ACK != 0 && ty < 16 {
-                        0
-                    } else {
-                        -95
-                    };
-                    let mut p = err.to_le_bytes().to_vec();
-                    p.extend_from_slice(&h[..16]);
-                    out.extend(reply(NLMSG_ERROR, 0, &p));
-                }
-                _ => {}
-            }
-            if !out.is_empty() {
-                self.queue.push_back(out);
+            let answers = if self.protocol == NETLINK_GENERIC {
+                generic_request(&h[..len], self.pid)
+            } else {
+                self.route_request(&h[..len], host)
+            };
+            for d in answers {
+                self.queue.push_back(d);
                 self.arrivals += 1;
             }
             off += len.next_multiple_of(4);
+        }
+    }
+
+    /// 回答 `NETLINK_ROUTE` 上的一条请求 `req`（整条消息），返回各个数据报。
+    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
+        let ty = u16::from_le_bytes([req[4], req[5]]);
+        let flags = u16::from_le_bytes([req[6], req[7]]);
+        let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+        let family = req.get(16).copied().unwrap_or(0) as i32;
+        let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
+        let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
+        let dump = flags & NLM_F_DUMP != 0;
+        match ty {
+            RTM_GETLINK | RTM_GETADDR if dump => {
+                let mut out = Vec::new();
+                for i in &host.interfaces() {
+                    if ty == RTM_GETLINK {
+                        let st = host.stats(&i.name);
+                        out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &link_message(i, st)));
+                    } else {
+                        for m in addr_messages(i, family as u8) {
+                            out.extend(reply(RTM_NEWADDR, NLM_F_MULTI, &m));
+                        }
+                    }
+                }
+                out.extend(done());
+                vec![out]
+            }
+            // 与 Linux 一样，每个地址族的路由是一个数据报，NLMSG_DONE 另是一个
+            RTM_GETROUTE if dump => {
+                let entries = crate::route::tables(&host.interfaces(), host.routes());
+                let mut out = Vec::new();
+                for f in [AF_INET, AF_INET6] {
+                    let d: Vec<u8> = entries
+                        .iter()
+                        .filter(|e| e.family == f && (family == 0 || family == f))
+                        .flat_map(|e| {
+                            reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e))
+                        })
+                        .collect();
+                    if !d.is_empty() {
+                        out.push(d);
+                    }
+                }
+                out.push(done());
+                out
+            }
+            RTM_GETROUTE => {
+                let ifaces = host.interfaces();
+                let entries = crate::route::tables(&ifaces, host.routes());
+                match crate::route::get(req, &entries, &ifaces, host.uid()) {
+                    Ok(p) => {
+                        let mut out = vec![reply(RTM_NEWROUTE, 0, &p)];
+                        if flags & NLM_F_ACK != 0 {
+                            out.push(ack(req, 0, self.pid));
+                        }
+                        out
+                    }
+                    Err(e) => vec![ack(req, e, self.pid)],
+                }
+            }
+            // 规则一个数据报装得下，NLMSG_DONE 另是一个
+            RTM_GETRULE if dump => {
+                const EAFNOSUPPORT: i32 = 97;
+                let rules = crate::route::rule_messages(family);
+                if rules.is_empty() {
+                    return vec![ack(req, EAFNOSUPPORT, self.pid)];
+                }
+                let d = rules
+                    .iter()
+                    .flat_map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m))
+                    .collect();
+                vec![d, done()]
+            }
+            // 邻居表（ARP、NDP）：Android 上 App 看不到宿主的，总是空的
+            RTM_GETNEIGH if dump => vec![done()],
+            RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
+            // 不支持的请求：EOPNOTSUPP；控制消息只在要确认时确认
+            _ if flags & NLM_F_REQUEST != 0 => {
+                if ty < NLMSG_MIN_TYPE {
+                    if flags & NLM_F_ACK != 0 {
+                        vec![ack(req, 0, self.pid)]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    vec![ack(req, EOPNOTSUPP, self.pid)]
+                }
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -666,6 +797,41 @@ mod tests {
         out
     }
 
+    /// 固定的宿主：只有 lo，`stats` 是它的流量计数，宿主给出的路由是 `routes`。
+    struct Fake {
+        stats: IfStats,
+        routes: Option<Vec<Route>>,
+    }
+
+    impl Host for Fake {
+        fn interfaces(&self) -> Vec<Interface> {
+            vec![lo()]
+        }
+        fn stats(&self, name: &str) -> IfStats {
+            if name == "lo" {
+                self.stats
+            } else {
+                IfStats::default()
+            }
+        }
+        fn routes(&self) -> Option<Vec<Route>> {
+            self.routes.clone()
+        }
+        fn uid(&self) -> u32 {
+            0
+        }
+    }
+
+    const NOTHING: Fake = Fake {
+        stats: IfStats {
+            rx_bytes: 0,
+            rx_packets: 0,
+            tx_bytes: 0,
+            tx_packets: 0,
+        },
+        routes: Some(Vec::new()),
+    };
+
     /// 按 musl 的 `__rtnetlink_enumerate` 解析回答：返回 (消息类型, 消息内容) 直到 DONE。
     fn parse(datagram: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let mut out = Vec::new();
@@ -699,8 +865,10 @@ mod tests {
         };
         s.handle(
             &req,
-            || vec![lo()],
-            |name| if name == "lo" { st } else { IfStats::default() },
+            &Fake {
+                stats: st,
+                routes: None,
+            },
         );
         let links = parse(&s.queue.pop_front().unwrap());
         assert_eq!(links.len(), 2);
@@ -726,6 +894,57 @@ mod tests {
         assert!(addrs[0].1.windows(4).any(|w| w == [127, 0, 0, 1]));
     }
 
+    /// 路由、规则的转储：每个地址族一个数据报，NLMSG_DONE 另是一个；邻居表是空的；不支持的
+    /// 请求的错误附上整条请求，确认只附上消息头。
+    #[test]
+    fn dumps_routes_rules_and_neighbours() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        s.pid = 42;
+        let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
+            s.handle(req, &NOTHING);
+            s.queue.drain(..).map(|d| parse(&d)).collect()
+        };
+        let dump = |ty, family: i32| {
+            message(
+                ty,
+                NLM_F_REQUEST | NLM_F_DUMP,
+                7,
+                0,
+                &[family as u8, 0, 0, 0],
+            )
+        };
+        // lo 上：IPv4 的本地表三条，IPv6 的 ::1 一条
+        let r = ask(&dump(RTM_GETROUTE, 0));
+        let counts: Vec<(usize, u16)> = r.iter().map(|d| (d.len(), d[0].0)).collect();
+        assert_eq!(
+            counts,
+            [(3, RTM_NEWROUTE), (1, RTM_NEWROUTE), (1, NLMSG_DONE)]
+        );
+        let r = ask(&dump(RTM_GETROUTE, AF_INET6));
+        assert_eq!(r.len(), 2);
+        let r = ask(&dump(RTM_GETRULE, AF_INET));
+        assert_eq!((r.len(), r[0].len(), r[1][0].0), (2, 3, NLMSG_DONE));
+        let r = ask(&dump(RTM_GETNEIGH, 0));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0][0].0, NLMSG_DONE);
+        // 不支持的请求
+        let req = message(
+            RTM_NEWROUTE,
+            NLM_F_REQUEST,
+            9,
+            0,
+            &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let r = ask(&req);
+        assert_eq!(r[0][0].0, NLMSG_ERROR);
+        assert_eq!(r[0][0].1[..4], (-95i32).to_le_bytes());
+        assert_eq!(&r[0][0].1[4..], &req[..]);
+        // 要确认的 NLMSG_NOOP
+        let r = ask(&message(1, NLM_F_REQUEST | NLM_F_ACK, 9, 0, &[]));
+        assert_eq!(r[0][0].1.len(), 4 + 16);
+        assert_eq!(r[0][0].1[..4], 0i32.to_le_bytes());
+    }
+
     /// 一条 NETLINK_GENERIC 请求：genlmsghdr 之后是属性。
     fn genl(ty: u16, flags: u16, cmd: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
         let mut p = vec![cmd, 1, 0, 0];
@@ -741,7 +960,7 @@ mod tests {
         s.pid = 42;
         // 回答的各个数据报，每个解析成消息
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
-            s.handle(req, Vec::new, |_| IfStats::default());
+            s.handle(req, &NOTHING);
             s.queue.drain(..).map(|d| parse(&d)).collect()
         };
         // 按名字查 nlctrl，要确认：回答和确认是两个数据报，确认只附上请求的消息头

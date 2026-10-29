@@ -736,6 +736,250 @@ C
 gcc -O1 -o genl genl.c
 ./genl
 
+# 路由表：RTM_GETROUTE 的转储（每个地址族一个数据报，NLMSG_DONE 另是一个）和单条查询
+# （经由网关、同一网段、本机地址、回环网段、网段广播、组播、::1、没有 IPv6 路由），
+# RTM_GETRULE 的转储，逐字节比对；RTM_GETNEIGH 的转储以 NLMSG_DONE 结束。本机地址打印成
+# SELF，接口编号打印成名字；rta_cacheinfo 里路由缓存条目的引用数、上次使用的时间不确定，
+# 只比错误码
+cat > route.c <<'C'
+#include <arpa/inet.h>
+#include <errno.h>
+#include <net/if.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+/* linux/netlink.h、linux/rtnetlink.h 里的（仓库里没有内核头文件） */
+#define NETLINK_ROUTE 0
+#define NLM_F_REQUEST 1
+#define NLM_F_MULTI 2
+#define NLM_F_DUMP 0x300
+#define NLMSG_ERROR 2
+#define NLMSG_DONE 3
+#define RTM_GETROUTE 26
+#define RTM_GETNEIGH 30
+#define RTM_GETRULE 34
+#define RTA_DST 1
+#define RTA_OIF 4
+#define RTA_CACHEINFO 12
+struct nlmsghdr {
+    uint32_t nlmsg_len;
+    uint16_t nlmsg_type, nlmsg_flags;
+    uint32_t nlmsg_seq, nlmsg_pid;
+};
+struct rtattr {
+    uint16_t rta_len, rta_type;
+};
+
+static int fd;
+static unsigned char self[4];
+
+static void request(int type, int flags, int family, const void *dst, int len)
+{
+    unsigned char buf[64] = {0};
+    struct nlmsghdr *h = (void *)buf;
+    unsigned char *r = buf + 16; /* struct rtmsg */
+    h->nlmsg_len = 16 + 12;
+    h->nlmsg_type = type;
+    h->nlmsg_flags = NLM_F_REQUEST | flags;
+    h->nlmsg_seq = 1;
+    r[0] = family;
+    if (dst) {
+        struct rtattr *a = (void *)(buf + 28);
+        a->rta_len = 4 + len;
+        a->rta_type = RTA_DST;
+        memcpy(a + 1, dst, len);
+        h->nlmsg_len += (a->rta_len + 3) & ~3;
+        r[1] = len * 8;
+    }
+    send(fd, buf, h->nlmsg_len, 0);
+}
+
+static void attribute(struct rtattr *a)
+{
+    unsigned char *d = (void *)(a + 1);
+    int n = a->rta_len - 4;
+    printf("  %d:", a->rta_type);
+    if (a->rta_type == RTA_OIF && n == 4) {
+        char name[IF_NAMESIZE] = "?";
+        if_indextoname(*(unsigned *)d, name);
+        printf(" %s\n", name);
+        return;
+    }
+    if (n == 4 && !memcmp(d, self, 4)) {
+        printf(" SELF\n");
+        return;
+    }
+    if (a->rta_type == RTA_CACHEINFO && n == 32) {
+        printf(" error %d\n", ((int *)d)[3]);
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        printf(" %02x", d[i]);
+    printf("\n");
+}
+
+/* 读回答直到 NLMSG_DONE、错误或者一条不是 NLM_F_MULTI 的消息 */
+static void replies(const char *what)
+{
+    unsigned char buf[16384];
+    printf("%s\n", what);
+    for (;;) {
+        int n = recv(fd, buf, sizeof buf, 0);
+        if (n < 0) {
+            printf(" recv errno %d\n", errno);
+            return;
+        }
+        printf(" datagram\n");
+        for (struct nlmsghdr *h = (void *)buf; n >= 16 && h->nlmsg_len <= (unsigned)n;) {
+            printf(" type %d flags %#x\n", h->nlmsg_type, h->nlmsg_flags);
+            if (h->nlmsg_type == NLMSG_DONE)
+                return;
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                printf("  error %d, %d bytes\n", *(int *)(h + 1), h->nlmsg_len);
+                return;
+            }
+            unsigned char *p = (void *)(h + 1);
+            printf("  hdr");
+            for (int i = 0; i < 12; i++)
+                printf(" %02x", p[i]);
+            printf("\n");
+            for (unsigned off = 16 + 12; off + 4 <= h->nlmsg_len;) {
+                struct rtattr *a = (void *)((char *)h + off);
+                attribute(a);
+                off += (a->rta_len + 3) & ~3;
+            }
+            if (!(h->nlmsg_flags & NLM_F_MULTI))
+                return;
+            int len = (h->nlmsg_len + 3) & ~3;
+            n -= len;
+            h = (void *)((char *)h + len);
+        }
+    }
+}
+
+static void get4(const char *what, uint32_t addr)
+{
+    request(RTM_GETROUTE, 0, AF_INET, &addr, 4);
+    replies(what);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    struct ifreq ifr = {0};
+    strcpy(ifr.ifr_name, "eth0");
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    ioctl(s, SIOCGIFADDR, &ifr);
+    uint32_t addr = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+    ioctl(s, SIOCGIFNETMASK, &ifr);
+    uint32_t mask = ((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr.s_addr;
+    memcpy(self, &addr, 4);
+
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    struct timeval tv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    request(RTM_GETROUTE, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
+    replies("dump: all families");
+    replies("dump: IPv6");
+    replies("dump: done");
+    request(RTM_GETROUTE, NLM_F_DUMP, AF_INET6, NULL, 0);
+    replies("dump: only IPv6");
+    replies("dump: done");
+    get4("get 1.1.1.1", inet_addr("1.1.1.1"));
+    get4("get the gateway's subnet", (addr & mask) | htonl(1));
+    get4("get SELF", addr);
+    get4("get 127.0.0.9", inet_addr("127.0.0.9"));
+    get4("get the subnet broadcast", addr | ~mask);
+    get4("get 224.0.0.1", inet_addr("224.0.0.1"));
+    get4("get 239.1.2.3", inet_addr("239.1.2.3"));
+    struct in6_addr one = IN6ADDR_LOOPBACK_INIT, doc;
+    inet_pton(AF_INET6, "2001:db8::1", &doc);
+    request(RTM_GETROUTE, 0, AF_INET6, &one, 16);
+    replies("get ::1");
+    request(RTM_GETROUTE, 0, AF_INET6, &doc, 16);
+    replies("get 2001:db8::1");
+    request(RTM_GETRULE, NLM_F_DUMP, AF_INET, NULL, 0);
+    replies("rules: IPv4");
+    replies("rules: done");
+    request(RTM_GETRULE, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
+    replies("rules: all families");
+    replies("rules: done");
+    /* 邻居表只看转储以 NLMSG_DONE 结束：Linux 上前面的用例在 lo 上留下了条目 */
+    request(RTM_GETNEIGH, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
+    for (;;) {
+        unsigned char buf[16384];
+        int n = recv(fd, buf, sizeof buf, 0);
+        struct nlmsghdr *h = (void *)buf, *last = h;
+        for (; n >= 16 && h->nlmsg_len >= 16 && h->nlmsg_len <= (unsigned)n;
+             n -= (h->nlmsg_len + 3) & ~3, h = (void *)((char *)h + ((h->nlmsg_len + 3) & ~3)))
+            last = h;
+        if (n < 0 || last->nlmsg_type == NLMSG_DONE || last->nlmsg_type == NLMSG_ERROR) {
+            printf("neighbours: ends with type %d\n", n < 0 ? -1 : last->nlmsg_type);
+            break;
+        }
+    }
+    return 0;
+}
+C
+gcc -O1 -o route route.c
+./route
+
+# 同样的表经由 busybox 的 ip、route、netstat 和 /proc/net 读出来；本机地址换成 SELF，
+# ipv6_route 的引用数不比
+self=$(ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
+ip route show table all | sed "s/$self/SELF/g"
+ip -6 route show table all
+ip rule
+ip -6 rule
+route -n
+netstat -rn
+ip route get 1.1.1.1 | sed "s/$self/SELF/g"
+cat /proc/net/route
+awk '{ $7 = "R"; print }' /proc/net/ipv6_route
+
+# /proc/net/sockstat、sockstat6：开几个 socket 前后各项的变化（绝对数里有命名空间里别的
+# socket，TCP 的 alloc 是整个系统的）
+python3 - <<'PY'
+import socket
+
+
+def counts():
+    out = {}
+    for name in ("sockstat", "sockstat6"):
+        with open("/proc/net/" + name) as f:
+            for line in f:
+                proto, rest = line.split(":")
+                fields = rest.split()
+                for k, v in zip(fields[::2], fields[1::2]):
+                    out[proto + " " + k] = int(v)
+    return out
+
+
+before = counts()
+keep = []
+for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    listener = socket.socket(family)
+    listener.bind((host, 0))
+    listener.listen()
+    client = socket.create_connection(listener.getsockname()[:2])
+    server, _ = listener.accept()
+    bound = socket.socket(family, socket.SOCK_DGRAM)
+    bound.bind((host, 0))
+    unbound = socket.socket(family, socket.SOCK_DGRAM)
+    closed = socket.socket(family)
+    keep += [listener, client, server, bound, unbound, closed]
+keep.append(socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP))
+after = counts()
+for k in sorted(before):
+    if k not in ("TCP alloc", "TCP mem", "UDP mem"):
+        print(k, after[k] - before[k])
+PY
+
 # fdinfo 里 epoll、timerfd、signalfd 特有的行；mountinfo 的设备号与 stat 一致，
 # fdinfo 的 mnt_id 能在 mountinfo 里找到
 cat > fdinfo.c <<'C'

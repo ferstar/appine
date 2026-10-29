@@ -243,6 +243,9 @@ pub(crate) struct Kernel {
     pub mq_limits: crate::syscall::MqLimits,
     /// 网络接口的流量计数（[`crate::traffic`]）。
     pub traffic: crate::traffic::Traffic,
+    /// 宿主交来的主表路由（[`crate::Machine::set_routes`]，Android 上取自 `LinkProperties`），
+    /// None 时读宿主的（[`crate::route`]）。
+    pub host_routes: Option<Vec<appine_hal::net::Route>>,
     /// AIO 上下文占用的事件数（`/proc/sys/fs/aio-nr`）和上限（`aio-max-nr`）。
     pub aio_nr: u64,
     pub aio_max_nr: u64,
@@ -307,6 +310,7 @@ impl Kernel {
             mqueues: BTreeMap::new(),
             mq_limits: Default::default(),
             traffic: Default::default(),
+            host_routes: None,
             aio_nr: 0,
             aio_max_nr: 65536,
             inotify: Rc::default(),
