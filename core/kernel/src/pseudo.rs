@@ -29,7 +29,7 @@ use crate::task::Task;
 use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::rdev;
-use crate::vfs::store::{DirEntry, Stat, mode};
+use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Mount, Node, Pseudo, Vfs};
 
 /// `/proc` 下的全局文件。
@@ -819,8 +819,12 @@ impl Pseudo for View<'_> {
             }
             Fd(pid, fd) => {
                 let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
-                let name = describe(&file.borrow());
-                Ok(name)
+                let f = file.borrow();
+                let name = describe(&f);
+                Ok(match &f.kind {
+                    FileKind::Regular { ino, .. } => mark_deleted(self.vfs.store(), *ino, name),
+                    _ => name,
+                })
             }
             _ => Err(Errno::EINVAL),
         }
@@ -859,6 +863,19 @@ impl Pseudo for View<'_> {
             _ => Node::Pseudo(PseudoNode::OpenFd(*pid, *fd)),
         })
     }
+}
+
+/// 与 Linux 的 `d_path` 一样，已经删除的文件（仍然打开着、映射着）在路径后面加上
+/// ` (deleted)`：`/proc/<pid>/fd/<n>`、maps、smaps。仓库里删掉最后一个名字之后 inode 的行
+/// 以 nlink = 0 留到下次独占打开仓库时，所以按 nlink 判断。Linux 看的是打开时那个名字，
+/// 别的硬链接还在、只删了这个名字时也加，这里不加。apt 升级时 dpkg 用 rename 换掉旧的库，
+/// needrestart 按 maps 里的 ` (deleted)` 找出要重启的进程。
+fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
+    const DELETED: &[u8] = b" (deleted)";
+    if !name.ends_with(DELETED) && store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
+        name.extend_from_slice(DELETED);
+    }
+    name
 }
 
 /// `/proc/<pid>/fd/<n>` 显示的目标：路径，或者 `pipe:[ino]` 这种描述。
@@ -1542,14 +1559,14 @@ fn limits(rlimits: &[(u64, u64); crate::process::RLIM_NLIMITS]) -> String {
     s
 }
 
-fn maps(task: &Task) -> String {
+fn maps(store: &Store, task: &Task) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
-    mm.regions().iter().map(map_line).collect()
+    mm.regions().iter().map(|r| map_line(store, r)).collect()
 }
 
 /// maps 的一行。与 Linux 一样，没有名字的行末尾也有一个空格，名字从第 74 列开始。
-fn map_line(r: &Region) -> String {
+fn map_line(store: &Store, r: &Region) -> String {
     let perms = format!(
         "{}{}{}{}",
         if r.prot & 1 != 0 { 'r' } else { '-' },
@@ -1567,7 +1584,13 @@ fn map_line(r: &Region) -> String {
         r.start, r.end
     );
     match &r.name {
-        Some(name) => format!("{line:<73}{}\n", String::from_utf8_lossy(name)),
+        Some(name) => {
+            let name = match r.file {
+                Some((_, ino)) => mark_deleted(store, ino, name.to_vec()),
+                None => name.to_vec(),
+            };
+            format!("{line:<73}{}\n", String::from_utf8_lossy(&name))
+        }
         None => format!("{line}\n"),
     }
 }
@@ -1643,7 +1666,7 @@ impl Usage {
 
 /// `/proc/<pid>/smaps`，或者 `rollup` 时的 `smaps_rollup`（所有映射的合计）。驻留的页
 /// 按宿主内存算（mincore）。
-fn smaps(task: &Task, rollup: bool) -> String {
+fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
     let regions = mm.regions();
@@ -1672,7 +1695,7 @@ fn smaps(task: &Task, rollup: bool) -> String {
         if rollup {
             continue;
         }
-        s += &map_line(r);
+        s += &map_line(store, r);
         let kb = (r.end - r.start) / 1024;
         writeln!(s, "{:<16}{kb:>8} kB", "Size:").unwrap();
         writeln!(s, "{:<16}{:>8} kB", "KernelPageSize:", 4).unwrap();
@@ -2167,9 +2190,13 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     limits(&g.borrow().rlimits)
                 }
-                self::Entry::Maps => task.map_or(String::new(), |t| maps(&t)),
-                self::Entry::Smaps => task.map_or(String::new(), |t| smaps(&t, false)),
-                self::Entry::SmapsRollup => task.map_or(String::new(), |t| smaps(&t, true)),
+                self::Entry::Maps => task.map_or(String::new(), |t| maps(ps.vfs.store(), &t)),
+                self::Entry::Smaps => {
+                    task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, false))
+                }
+                self::Entry::SmapsRollup => {
+                    task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, true))
+                }
                 // 二进制，按读写的位置现算（`read_pagemap`、`read_mem`、`write_mem`）
                 self::Entry::Pagemap | self::Entry::Mem => String::new(),
                 self::Entry::Auxv => {

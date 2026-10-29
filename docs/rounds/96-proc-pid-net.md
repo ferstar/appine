@@ -1,6 +1,6 @@
 # M9 之前：`/proc/<pid>/net`（2026-10-29）
 
-← [M9 之前：跟踪者退出时丢掉已经取走的信号（2026-10-29）](95-tracer-exit-drops-signal.md) · [索引](../milestones.md)
+← [M9 之前：跟踪者退出时丢掉已经取走的信号（2026-10-29）](95-tracer-exit-drops-signal.md) · [索引](../milestones.md) · [M9 之前：已经删除的文件带 ` (deleted)`（2026-10-29）](97-deleted-suffix.md) →
 
 [第 92 轮](92-debuggers-valgrind-chromium.md)对照目录的链接数时顺带看到的推迟项。Linux 上网络的那些文件按网络命名空间分，放在 `/proc/<pid>/net` 下（task 子目录里也有），`/proc/net` 只是指向 `self/net` 的链接。appine 的 `/proc/net` 是个普通目录，没有 `/proc/<pid>/net`，所以：
 

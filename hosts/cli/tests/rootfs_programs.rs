@@ -737,6 +737,24 @@ fn procfs_net_is_under_each_process() {
 }
 
 #[test]
+fn procfs_marks_deleted_files() {
+    // 与 Linux 的 d_path 一样，删除之后还开着的文件在 /proc/<pid>/fd 里带着 " (deleted)"
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "d=/tmp/del.$$; echo x > $d; exec 3<$d; readlink /proc/self/fd/3 | sed \"s|^$d|D|\"; \
+         rm $d; readlink /proc/self/fd/3 | sed \"s|^$d|D|\"",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["D", "D (deleted)"],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
 fn sysfs_and_limits_describe_the_machine() {
     // busybox 的 nproc --all 数 /sys/devices/system/cpu 下的 cpu<n>；/proc/self/limits 与
     // ulimit 一致

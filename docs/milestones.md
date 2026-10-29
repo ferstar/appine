@@ -105,6 +105,7 @@
 | [M9 之前：`/proc/<pid>/task` 的链接数](rounds/94-task-dir-links.md) | 2026-10-29 | task 目录的链接数是 2 加线程数（原来总是 2）：Chromium 的 zygote fork 之前按它判断自己是不是单线程，原来一启动就崩溃 |
 | [M9 之前：跟踪者退出时丢掉已经取走的信号](rounds/95-tracer-exit-drops-signal.md) | 2026-10-29 | 跟踪者不 detach 就退出时，已经被 wait 取走的信号投递停止里的信号丢掉，与 Linux 6.8 实测的相同（原来照 ptrace(2) 投递）：delve attach 之后读到 EOF 退出，进程原来被 SIGSTOP 停住 |
 | [M9 之前：`/proc/<pid>/net`](rounds/96-proc-pid-net.md) | 2026-10-29 | 网络的那些文件与 Linux 一样放在 `/proc/<pid>/net` 下（task 子目录里也有），`/proc/net` 改成指向 `self/net` 的链接（原来是目录，经由 `/proc/self/net` 读不到） |
+| [M9 之前：已经删除的文件带 ` (deleted)`](rounds/97-deleted-suffix.md) | 2026-10-29 | 删除之后还开着、映射着的文件，`/proc/<pid>/fd` 和 maps、smaps 里的路径后面加上 ` (deleted)`，与 Linux 相同（needrestart 按它找出还在用旧库的进程）；exe 不加 |
 
 ## 测量条件
 

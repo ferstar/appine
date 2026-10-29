@@ -2311,3 +2311,62 @@ stat -c '%A %U' /proc/self/net /proc/self/net/dev
 head -n 2 /proc/net/dev | cmp - /dev/fd/3 3<<HEAD && echo "same header"
 $(head -n 2 /proc/self/net/dev)
 HEAD
+
+# 已经删除、仍然打开着或映射着的文件，fd 链接和 maps 里的路径后面有 " (deleted)"：删除、
+# 被 rename 盖掉（dpkg 升级库的做法，needrestart 按它找要重启的进程）；memfd 只有一个
+cat > deleted.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static void link_of(const char *what, int fd)
+{
+    char p[64], l[256] = {0};
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    readlink(p, l, sizeof l - 1);
+    printf("%s: %s\n", what, l);
+}
+
+static void mapped(const char *what, const char *key)
+{
+    char line[512];
+    FILE *f = fopen("/proc/self/maps", "r");
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, key)) {
+            printf("%s: %s", what, strchr(line, '/'));
+            break;
+        }
+    fclose(f);
+}
+
+int main(void)
+{
+    int fd = open("/tmp/del-open", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    link_of("open", fd);
+    unlink("/tmp/del-open");
+    link_of("open, unlinked", fd);
+    int m = open("/tmp/del-map", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ftruncate(m, 4096);
+    mmap(NULL, 4096, PROT_READ, MAP_SHARED, m, 0);
+    close(m);
+    mapped("mapped", "/tmp/del-map");
+    unlink("/tmp/del-map");
+    mapped("mapped, unlinked", "/tmp/del-map");
+    int r = open("/tmp/del-lib", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ftruncate(r, 4096);
+    mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, r, 0);
+    close(r);
+    int n = open("/tmp/del-lib.new", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    close(n);
+    rename("/tmp/del-lib.new", "/tmp/del-lib");
+    mapped("mapped, replaced by rename", "/tmp/del-lib");
+    int mf = memfd_create("x", 0);
+    link_of("memfd", mf);
+    unlink("/tmp/del-lib");
+    return 0;
+}
+C
+gcc -O1 -o deleted deleted.c && ./deleted
