@@ -177,6 +177,10 @@ struct block {
 struct appine_dbt {
     uint32_t *cache;    /* 执行用的地址；所有代码指针都指向这里 */
     intptr_t rw_delta;  /* 写入用的别名减去执行用的地址；直接映射成 RWX 时为 0 */
+    struct written *written; /* 可写别名里写过的页（note_written）；RWX 时为 NULL */
+    /* 所有实例（活着的、池里的）串成的表 pool.all，appine_dbt_unmap_written 遍历它。持有
+     * pool.lock 时读写；不在表里时 prev_instance 为 NULL */
+    struct appine_dbt *next_instance, **prev_instance;
     size_t cache_words;
     size_t used_words;
     size_t routine_words;
@@ -340,10 +344,89 @@ static uint32_t *rw(const struct appine_dbt *d, const uint32_t *p)
     return (uint32_t *)((uintptr_t)p + (uintptr_t)d->rw_delta);
 }
 
+/* 宿主的页大小（4K、16K）：madvise 的范围要按它对齐 */
+static size_t host_page_size(void)
+{
+    static size_t cached;
+    size_t page = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (!page) {
+        page = (size_t)sysconf(_SC_PAGESIZE);
+        __atomic_store_n(&cached, page, __ATOMIC_RELAXED);
+    }
+    return page;
+}
+
+/*
+ * 宿主的 RSS 按映射数页：代码缓存的同一页经由写入、执行两个视图都碰过就算两次，
+ * RssShmem、LMK 看的 RSS 和内存上限量的用量里代码缓存都多算了一倍。所以记下可写视图里
+ * 写过的页，内核层的定时器线程每秒拆一次它们的页表项（appine_dbt_unmap_written）：共享
+ * 内存上的 MADV_DONTNEED 只拆映射、内容留着，下次写时再缺一次页。按时间拆而不按量拆：
+ * JIT 负载每秒要往几千个不同的页里回填链接、作废块，按量拆（每攒 256 KB 拆一次）时这些
+ * 页一次次重新缺页，Maven 慢了 3%。不持锁回填链接的线程也写，位图和计数都是原子的；
+ * 多记、漏记一页只影响拆的时机。
+ */
+struct written {
+    unsigned pages; /* bits 里置位的页数（原子） */
+    bool dropping;  /* 有线程正在拆（原子） */
+    uint64_t bits[CODE_CACHE_BYTES / 4096 / 64]; /* 可写视图里写过、还没拆的宿主页 */
+};
+
+/* 拆掉可写视图里记下的页 */
+static void drop_written(const struct appine_dbt *d)
+{
+    struct written *w = d->written;
+    if (!w || !__atomic_load_n(&w->pages, __ATOMIC_RELAXED) ||
+        __atomic_exchange_n(&w->dropping, true, __ATOMIC_ACQUIRE))
+        return;
+    size_t lo = SIZE_MAX, hi = 0;
+    unsigned n = 0;
+    for (size_t i = 0; i < sizeof(w->bits) / sizeof(w->bits[0]); i++) {
+        uint64_t bits = __atomic_exchange_n(&w->bits[i], 0, __ATOMIC_RELAXED);
+        if (!bits)
+            continue;
+        n += (unsigned)__builtin_popcountll(bits);
+        if (lo == SIZE_MAX)
+            lo = i * 64 + (size_t)__builtin_ctzll(bits);
+        hi = i * 64 + 63 - (size_t)__builtin_clzll(bits);
+    }
+    if (n) {
+        __atomic_sub_fetch(&w->pages, n, __ATOMIC_RELAXED);
+        size_t page = host_page_size();
+        madvise((char *)rw(d, d->cache) + lo * page, (hi - lo + 1) * page, MADV_DONTNEED);
+    }
+    __atomic_store_n(&w->dropping, false, __ATOMIC_RELEASE);
+}
+
+/* 经由可写视图写过 [start, end)（执行用的地址） */
+static void note_written(const struct appine_dbt *d, const void *start, const void *end)
+{
+    struct written *w = d->written;
+    if (!w || start == end)
+        return;
+    size_t page = host_page_size();
+    size_t first = ((uintptr_t)start - (uintptr_t)d->cache) / page;
+    size_t last = ((uintptr_t)end - 1 - (uintptr_t)d->cache) / page;
+    for (size_t p = first; p <= last; p++) {
+        uint64_t bit = UINT64_C(1) << (p & 63);
+        if (!(__atomic_load_n(&w->bits[p / 64], __ATOMIC_RELAXED) & bit) &&
+            !(__atomic_fetch_or(&w->bits[p / 64], bit, __ATOMIC_RELAXED) & bit))
+            __atomic_add_fetch(&w->pages, 1, __ATOMIC_RELAXED);
+    }
+}
+
+/* 写入几段代码之后让取指看到它们 */
+static void sync_written(const struct appine_dbt *d, void *const *start, void *const *end, unsigned n)
+{
+    sync_code_ranges(start, end, n, d->rw_delta);
+    for (unsigned i = 0; i < n; i++)
+        note_written(d, start[i], end[i]);
+}
+
 /* 写入 [start, end) 之后让取指看到新代码 */
 static void sync_range(const struct appine_dbt *d, const uint32_t *start, const uint32_t *end)
 {
-    sync_code((void *)start, (void *)end, d->rw_delta);
+    void *s = (void *)start, *e = (void *)end;
+    sync_written(d, &s, &e, 1);
 }
 
 /*
@@ -357,6 +440,9 @@ static void publish_link(const struct appine_dbt *d, uint32_t *site, uint32_t *b
     publish_code_lazily(site, site + 1, d->rw_delta);
     if (branch)
         publish_code_lazily(branch, branch + 1, d->rw_delta);
+    note_written(d, site, site + 1);
+    if (branch)
+        note_written(d, branch, branch + 1);
 }
 
 /* 攒着一起同步的几段代码（sync_code_ranges） */
@@ -375,7 +461,7 @@ static void sync_add(struct syncs *s, const uint32_t *start, const uint32_t *end
 static void sync_all(const struct appine_dbt *d, struct syncs *s)
 {
     if (s->n)
-        sync_code_ranges(s->start, s->end, s->n, d->rw_delta);
+        sync_written(d, s->start, s->end, s->n);
     s->n = 0;
 }
 
@@ -1980,13 +2066,15 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
  * 不同步指令缓存 */
 static bool relink_word(const struct appine_dbt *d, uint32_t *site, const uint32_t *target)
 {
-    uint32_t *w = rw(d, site);
-    bool test = (*w & 0x7e000000) == 0x36000000; /* TBZ/TBNZ：14 位偏移，其余 19 位 */
+    /* 读执行用的地址：在可写别名上读缺页时，宿主会顺带映射附近的十几页（fault-around），
+     * 它们没有记在 struct written 里 */
+    uint32_t insn = *site;
+    bool test = (insn & 0x7e000000) == 0x36000000; /* TBZ/TBNZ：14 位偏移，其余 19 位 */
     intptr_t off = target - site, limit = (intptr_t)1 << (test ? 13 : 18);
     if (off < -limit || off >= limit)
         return false;
     uint32_t mask = (test ? 0x3fffu : 0x7ffffu) << 5;
-    *w = (*w & ~mask) | (((uint32_t)off << 5) & mask);
+    *rw(d, site) = (insn & ~mask) | (((uint32_t)off << 5) & mask);
     return true;
 }
 
@@ -2291,7 +2379,7 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
     void *start[RETIRE_BATCH], *end[RETIRE_BATCH];
     start[0] = r->fwd_start;
     end[0] = d->cache + d->used_words;
-    sync_code_ranges(start, end, 1, d->rw_delta);
+    sync_written(d, start, end, 1);
     uint32_t *fwd = r->fwd_start;
     for (unsigned i = 0; i < r->n; i++) {
         uint32_t *code = r->blocks[i]->code;
@@ -2303,7 +2391,7 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
         end[i] = code + ENTRY_CHECK_WORDS + 1;
         fwd += 16;
     }
-    sync_code_ranges(start, end, r->n, d->rw_delta);
+    sync_written(d, start, end, r->n);
     for (unsigned i = 0; i < r->n; i++) {
         struct block *b = r->blocks[i];
         table_remove(d, b->pc);
@@ -3197,6 +3285,7 @@ static struct {
     size_t kept_words; /* 池里保留着的代码 */
     struct appine_dbt_thread *threads[THREAD_POOL_SIZE];
     unsigned nthreads;
+    struct appine_dbt *all; /* 所有实例 */
 } pool = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
 /* 从池里取出第 i 个。持有池的锁 */
@@ -3211,8 +3300,16 @@ static struct appine_dbt *pool_take(unsigned i)
 
 static void release(struct appine_dbt *d)
 {
+    pthread_mutex_lock(&pool.lock);
+    if (d->prev_instance) {
+        *d->prev_instance = d->next_instance;
+        if (d->next_instance)
+            d->next_instance->prev_instance = d->prev_instance;
+    }
+    pthread_mutex_unlock(&pool.lock);
     if (d->cache)
         appine_unmap_code(d->cache, CODE_CACHE_BYTES, d->rw_delta);
+    zfree(d->written, sizeof(*d->written));
     if (d->table)
         zfree(d->table, TABLE_BYTES(d->table->bits));
     zfree(d->table_used, TABLE_LIMIT * sizeof(*d->table_used));
@@ -3251,19 +3348,28 @@ struct appine_dbt *appine_dbt_new(uint64_t key)
     pthread_cond_init(&d->flushed, NULL);
     d->st = &spare_stats;
     d->cache = appine_map_code(CODE_CACHE_BYTES, &d->rw_delta);
+    if (d->cache && d->rw_delta)
+        d->written = zalloc(sizeof(*d->written));
     d->table = table_new(TABLE_MIN_BITS);
     d->table_used = zalloc(TABLE_LIMIT * sizeof(*d->table_used));
     d->blocks = zalloc(TABLE_LIMIT * sizeof(*d->blocks));
     d->words = zalloc(WORDS_LIMIT * sizeof(*d->words));
     d->page_head = zalloc(sizeof(*d->page_head) << PAGE_BUCKET_BITS);
     d->page_parked = zalloc(sizeof(*d->page_parked) << PAGE_BUCKET_BITS);
-    if (!d->cache || !d->table || !d->table_used || !d->blocks || !d->words || !d->page_head ||
-        !d->page_parked) {
+    if (!d->cache || (d->rw_delta && !d->written) || !d->table || !d->table_used || !d->blocks ||
+        !d->words || !d->page_head || !d->page_parked) {
         release(d);
         return NULL;
     }
     d->cache_words = CODE_CACHE_BYTES / 4;
     emit_routines(d);
+    pthread_mutex_lock(&pool.lock);
+    d->next_instance = pool.all;
+    if (pool.all)
+        pool.all->prev_instance = &d->next_instance;
+    d->prev_instance = &pool.all;
+    pool.all = d;
+    pthread_mutex_unlock(&pool.lock);
     return d;
 }
 
@@ -3305,12 +3411,13 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
          * 进入/退出例程所在的页保留，其余用过的部分交给宿主回收：私有映射用 MADV_FREE，
          * 内存紧张时才回收；双映射的共享内存不支持它，只能用 MADV_REMOVE 立即释放
          */
-        uintptr_t page = APPINE_PAGE_SIZE;
+        uintptr_t page = host_page_size();
         uintptr_t start = ((uintptr_t)rw(d, d->cache + d->routine_words) + page - 1) & ~(page - 1);
         uintptr_t end = ((uintptr_t)rw(d, d->cache + d->high_words) + page - 1) & ~(page - 1);
         if (end > start)
             madvise((void *)start, end - start, d->rw_delta ? MADV_REMOVE : MADV_FREE);
         d->high_words = 0;
+        drop_written(d); /* 例程所在的页、记下的页数 */
     }
     /* 腾出地方：池满了，或者保留的代码超出上限。先去掉空的（重建它们很便宜），再去掉
      * 最久没用的 */
@@ -3342,6 +3449,27 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
     pthread_mutex_unlock(&pool.lock);
     for (unsigned i = 0; i < nevicted; i++)
         release(evicted[i]);
+}
+
+/* 拆掉所有实例的代码缓存在可写视图里写过的页（struct written 前面的说明） */
+void appine_dbt_unmap_written(void)
+{
+    pthread_mutex_lock(&pool.lock);
+    for (struct appine_dbt *d = pool.all; d; d = d->next_instance)
+        drop_written(d);
+    pthread_mutex_unlock(&pool.lock);
+}
+
+/* 可写视图里写过、还没拆的页一共多少字节：它们在宿主的 RSS 里算了两次 */
+uint64_t appine_dbt_written_bytes(void)
+{
+    uint64_t pages = 0;
+    pthread_mutex_lock(&pool.lock);
+    for (struct appine_dbt *d = pool.all; d; d = d->next_instance)
+        if (d->written)
+            pages += __atomic_load_n(&d->written->pages, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&pool.lock);
+    return pages * host_page_size();
 }
 
 /* 释放池里所有的实例（App 内存紧张时，保留的翻译可以重建） */
@@ -3597,7 +3725,7 @@ static void revive_flush(struct appine_dbt *d, const uint32_t *idx, unsigned n)
         start[k] = d->blocks[idx[k]].code;
         end[k] = d->blocks[idx[k]].code + ENTRY_CHECK_WORDS + 1;
     }
-    sync_code_ranges(start, end, n, d->rw_delta);
+    sync_written(d, start, end, n);
     for (unsigned k = 0; k < n; k++)
         table_relink(d, idx[k]);
 }
@@ -3832,7 +3960,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
                 target != patch_site) {
                 uint32_t b = enc_b((intptr_t)target - (intptr_t)patch_site);
-                bool again = __atomic_load_n(rw(d, patch_site), __ATOMIC_RELAXED) == b;
+                /* 读执行用的地址，见 relink_word */
+                bool again = __atomic_load_n(patch_site, __ATOMIC_RELAXED) == b;
                 __atomic_store_n(rw(d, patch_site), b, __ATOMIC_RELAXED);
                 bool branch = patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1 &&
                               relink_word(d, patch_branch_site, target);
@@ -3962,6 +4091,15 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
 
 void appine_dbt_trim(void)
 {
+}
+
+void appine_dbt_unmap_written(void)
+{
+}
+
+uint64_t appine_dbt_written_bytes(void)
+{
+    return 0;
 }
 
 void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)

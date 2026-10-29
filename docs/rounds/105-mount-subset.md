@@ -1,6 +1,6 @@
 # M9 之前：mount 的子集（2026-10-29）
 
-← [M9 之前：关掉主设备时挂断从设备（2026-10-29）](104-pty-hangup.md) · [索引](../milestones.md)
+← [M9 之前：关掉主设备时挂断从设备（2026-10-29）](104-pty-hangup.md) · [索引](../milestones.md) · [M9 之前：代码缓存只算一次（2026-10-30）](106-code-cache-rss.md) →
 
 [glibc 发行版的探测](69-glibc-probe.md)那一轮发现，从 Alpine chroot 进 Debian 之后 `/proc`、`/sys` 是空的，ps、top、free 都不能用：mount、umount2 是 ENOSYS。那时估了两档工作量：只挂合成文件系统（procfs、sysfs、devpts）要让它们的节点记着经由的挂载点，中等；bind 仓库里的目录和 tmpfs 要把路径都换成"挂载加节点"，大。后来先做了 App 里选 rootfs（[第 99 轮](99-choose-rootfs.md)），这一轮做第一档：合成文件系统可以挂到任意目录上，它们里面的目录可以 bind。
 

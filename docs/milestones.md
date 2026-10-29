@@ -114,6 +114,7 @@
 | [M9 之前：AI 编程 CLI](rounds/103-ai-cli-survey.md) | 2026-10-29 | 模拟服务冒充三家的模型 API，Claude Code、Codex、Gemini CLI 在 appine 里调用工具（命令、读写改文件、grep、glob）与原生相同，交互界面也相同；两家用 bubblewrap 的沙箱与 docker 容器里一样建不了；补上 bubblewrap 先读的 `/proc/sys/kernel/overflowuid` 等 |
 | [M9 之前：关掉主设备时挂断从设备](rounds/104-pty-hangup.md) | 2026-10-29 | 最后一个主设备关掉时与 Linux 的 `tty_vhangup` 一样：会话组长收到 SIGHUP、SIGCONT（它退出时再发给挂断时的前台进程组），会话失去控制终端，从设备读到 EOF、写和 ioctl 是 EIO，`/dev/pts/<n>` 删掉（原来 `tmux kill-server` 之后 opencode 留下来）；appine-run 输入结束时的 VEOF 落在规范模式里丢掉时再送一次 |
 | [M9 之前：mount 的子集](rounds/105-mount-subset.md) | 2026-10-29 | procfs、sysfs、devpts、cgroup2 可以挂到任意目录上，它们里面的目录可以 bind（`--rbind` 带上挂在里面的）；合成节点带着经由的挂载，`..`、getcwd 经由挂载点回去，mountinfo 相对进程的根目录生成；卸下、EBUSY、只读挂载、新实例按 Linux 6.1：从 Alpine chroot 进 Debian 挂上之后 ps、top、free、findmnt 能用；仓库里的目录还不能 bind、没有 tmpfs |
+| [M9 之前：代码缓存只算一次](rounds/106-code-cache-rss.md) | 2026-10-30 | 拆开量多进程负载多占的内存：Tier 1 代码缓存的写入、执行两个视图在宿主的 RSS 里各算一次，翻译多算了一倍；引擎记下写入视图里写过的页，定时器线程每秒拆一次页表项，OOM killer 和 cgroup 的用量扣掉还没拆的：20 个空闲的 python3 的 App 用量 321 → 218 MB，Codex 的界面 294 → 208 MB，计时不变（按写入量拆时 Maven 慢 3%，没有采用）；16K 页的宿主上清空实例时交还代码缓存 |
 
 ## 测量条件
 

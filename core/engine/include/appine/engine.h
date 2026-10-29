@@ -278,6 +278,14 @@ struct appine_dbt *appine_dbt_new(uint64_t key);
 void appine_dbt_free(struct appine_dbt *dbt, uint64_t key);
 /* 释放池里保留的翻译（宿主内存紧张时） */
 void appine_dbt_trim(void);
+/*
+ * 拆掉所有实例的代码缓存在可写视图（W^X 双映射的写入用的那份）里写过的页，内容留着：
+ * 宿主按映射数 RSS，两个视图都碰过的页算两次。由调用方定期调用（内核层的定时器线程每秒
+ * 一次），任何线程都可以调用
+ */
+void appine_dbt_unmap_written(void);
+/* 可写视图里写过、还没拆掉的页一共多少字节（它们在宿主的 RSS 里算了两次） */
+uint64_t appine_dbt_written_bytes(void);
 
 /*
  * 翻译所在的一段映射：guest 地址范围，和调用方给出的、能断定内容相同的身份（文件和它的

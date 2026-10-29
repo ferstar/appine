@@ -1353,6 +1353,69 @@ fn cgroup_memory_files_follow_the_oom_killer() {
 }
 
 #[test]
+fn code_cache_pages_are_counted_once() {
+    // Tier 1 的代码缓存按 W^X 映射两次（写入用、执行用），宿主的 RSS 按映射数页：两个
+    // 视图都碰过的页算两次，App 的内存用量（内存上限、LMK 看的）里翻译多算一倍。所以定时器
+    // 线程每秒拆一次写入用的视图里写过的页，所有线程都等待之后再拆一次。一串 busybox 的
+    // 小程序拿到的是同一个程序留在池里的实例，翻译越攒越多，都在执行用的视图里占着；
+    // shell 停在 read 里之后，写入用的视图很快就不占页了
+    let Some(store) = store() else {
+        return;
+    };
+    let script = "for c in 'ls -lR /etc' 'find /usr -name *.so*' 'du -s /usr' ps df date \
+                  'sort -r /etc/passwd' 'sed s/a/b/g /etc/passwd' 'awk -F: {print} /etc/passwd' \
+                  'grep -r root /etc' 'tar c /etc' 'gzip -c /bin/busybox' 'sha256sum /bin/busybox' \
+                  'md5sum /bin/busybox' 'od -x /etc/passwd' 'hexdump -C /etc/hostname' \
+                  'cut -d: -f1 /etc/passwd' 'tr a-z A-Z' 'uniq /etc/passwd' 'base64 /etc/passwd' \
+                  'stat /etc' 'top -bn1' 'netstat -an' 'diff /etc/passwd /etc/group' \
+                  'bzip2 -c /etc/passwd' 'xargs echo'; do $c </etc/passwd; done >/dev/null 2>&1; \
+                  echo ready; read x";
+    let mut child = command(store, "1", &["/bin/sh", "-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "ready");
+    // 代码缓存是 128 MB 的共享映射：各个视图的 (权限, Rss KB)
+    let caches = || {
+        let smaps = std::fs::read_to_string(format!("/proc/{}/smaps", child.id())).unwrap();
+        let (mut caches, mut view) = (Vec::new(), None);
+        for line in smaps.lines() {
+            let mut f = line.split_whitespace();
+            match (f.next(), f.next()) {
+                (Some(range), Some(perms)) if range.contains('-') && perms.len() == 4 => {
+                    let (lo, hi) = range.split_once('-').unwrap();
+                    let size =
+                        u64::from_str_radix(hi, 16).unwrap() - u64::from_str_radix(lo, 16).unwrap();
+                    view = (size == 128 << 20 && perms.ends_with('s')).then(|| perms.to_owned());
+                }
+                (Some("Rss:"), Some(kb)) => {
+                    if let Some(perms) = view.take() {
+                        caches.push((perms, kb.parse::<u64>().unwrap()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        caches
+    };
+    let rss = |caches: &[(String, u64)], perms: &str| -> Vec<u64> {
+        caches.iter().filter(|(p, _)| p == perms).map(|&(_, kb)| kb).collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = caches();
+    while rss(&seen, "rw-s").iter().sum::<u64>() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        seen = caches();
+    }
+    child.stdin.take().unwrap().write_all(b"\n").unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert!(rss(&seen, "r-xs").iter().max().is_some_and(|&kb| kb >= 1024), "{seen:?}");
+    assert_eq!(rss(&seen, "rw-s").iter().sum::<u64>(), 0, "{seen:?}");
+}
+
+#[test]
 fn one_machine_runs_several_terminal_sessions() {
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
     let Some(store) = store() else {

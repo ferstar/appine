@@ -473,13 +473,8 @@ pub fn fd_limit() -> u64 {
     }
 }
 
-/// 宿主进程用掉的匿名内存（字节）：`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，
-/// 换出到 swap（Android 的 zram）的也算；文件页可以回收，不算。读不了时返回 None。
-pub fn memory_footprint() -> Option<u64> {
-    memory_usage().map(|u| u.anon + u.shmem + u.swap)
-}
-
-/// [`memory_footprint`] 的各项（字节）。
+/// 宿主进程用掉的匿名内存（字节），分项：`/proc/self/status` 的 RssAnon、RssShmem、VmSwap，
+/// 换出到 swap（Android 的 zram）的也算；文件页可以回收，不算。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryUsage {
     /// RssAnon：驻留的私有匿名内存。没有 RssAnon 的老内核（4.5 之前）是 VmRSS。
@@ -490,7 +485,7 @@ pub struct MemoryUsage {
     pub swap: u64,
 }
 
-/// 宿主进程的匿名内存，分项（[`memory_footprint`]）。
+/// 宿主进程的匿名内存（[`MemoryUsage`]）。读不了时返回 None。
 pub fn memory_usage() -> Option<MemoryUsage> {
     use std::os::unix::fs::FileExt;
     static STATUS: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();

@@ -2,7 +2,7 @@
 //!
 //! Android 的 LMK 只认 App 进程：内存吃紧时它杀掉整个 App，所有会话一起丢掉。所以给 App
 //! 进程的匿名内存设一个上限（默认是物理内存的一半），超出时像 Linux 的 OOM killer 那样
-//! 挑一个 guest 进程用 SIGKILL 结束。量的是整个宿主进程（[`appine_hal::memory_footprint`]）：
+//! 挑一个 guest 进程用 SIGKILL 结束。量的是整个宿主进程的匿名内存（[`app_memory`]）：
 //! LMK 看的就是它，guest 的私有、共享内存之外，内核层为 guest 付出的翻译缓存、元数据缓存
 //! 也在里面；宿主的文件页（仓库里的文件、映射的程序）可以回收，不算。
 //!
@@ -33,6 +33,8 @@ const NEAR_INTERVAL: Duration = Duration::from_millis(5);
 const VICTIM_TIMEOUT: Duration = Duration::from_secs(1);
 /// `oom_score_adj` 的下限：这样的进程不会被选中。
 const OOM_SCORE_ADJ_MIN: i32 = -1000;
+/// 多久拆一次代码缓存在可写视图里写过的页（[`unmap_code_views`]）。
+const CODE_VIEW_INTERVAL: Duration = Duration::from_secs(1);
 
 /// OOM killer 的状态，在 [`Kernel`] 里。
 pub(crate) struct Oom {
@@ -46,6 +48,8 @@ pub(crate) struct Oom {
     next: Option<Instant>,
     /// 最近结束的进程和结束它的时刻。
     victim: Option<(Weak<RefCell<ThreadGroup>>, Instant)>,
+    /// 下一次拆代码缓存的可写视图的时刻；None 表示所有线程都在等待，停下来了。
+    code_views: Option<Instant>,
 }
 
 /// `memory.events` 里的计数：量到超出上限的次数，因此要挑进程结束的次数（上次挑中的
@@ -65,6 +69,7 @@ impl Default for Oom {
             events: Cell::new(Events::default()),
             next: None,
             victim: None,
+            code_views: None,
         }
     }
 }
@@ -72,7 +77,7 @@ impl Default for Oom {
 impl Oom {
     /// 现在 App 的内存用量（量不了时是 0），顺便记下峰值。
     pub fn measure(&self) -> u64 {
-        let used = appine_hal::memory_footprint().unwrap_or(0);
+        let used = footprint().unwrap_or(0);
         self.note(used);
         used
     }
@@ -96,6 +101,51 @@ pub(crate) fn default_limit() -> u64 {
     }
 }
 
+/// App 的内存用量，分项（[`appine_hal::memory_usage`]）。Tier 1 的代码缓存在可写视图里
+/// 写过、还没拆掉的页（[`unmap_code_views`]）在宿主的 RssShmem 里算了两次，扣掉一次。
+pub(crate) fn app_memory() -> Option<appine_hal::MemoryUsage> {
+    let mut u = appine_hal::memory_usage()?;
+    u.shmem = u.shmem.saturating_sub(appine_engine::written_code_bytes());
+    Some(u)
+}
+
+/// App 的内存用量（字节）：[`app_memory`] 的各项之和。读不了时返回 None。
+fn footprint() -> Option<u64> {
+    app_memory().map(|u| u.anon + u.shmem + u.swap)
+}
+
+/// 所有 guest 线程都在内核里等待：内存不会再涨，代码缓存也不会再写。
+fn all_sleeping(k: &Kernel) -> bool {
+    k.tasks.values().all(|t| t.sleeping.load(Ordering::Relaxed))
+}
+
+/// 定时器线程每次醒来时调用：有 guest 线程在运行时每秒拆一次 Tier 1 的代码缓存在可写
+/// 视图里写过的页，所有线程都等待之后再拆一次，然后停下（[`appine_engine::unmap_written_code`]）。
+/// 代码缓存按 W^X 映射两次，宿主的 RSS 按映射数页，两个视图都碰过的页算两次：上面量的
+/// App 用量（[`app_memory`] 扣掉了还没拆的）和 LMK 看的 RSS 里翻译多算一倍。按时间拆而
+/// 不是写多少拆多少：JIT 负载每秒往几千个不同的页里回填链接、作废块，拆了之后这些页再写
+/// 都要重新缺页。返回下一次的时刻。
+pub(crate) fn unmap_code_views(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
+    let now = Instant::now();
+    if let Some(next) = k.oom.code_views
+        && now < next
+    {
+        return Some(next);
+    }
+    let idle = all_sleeping(k);
+    // 停下来之后被别的事叫醒：这期间没有线程运行，没有新写的页
+    if !idle || k.oom.code_views.is_some() {
+        appine_engine::unmap_written_code();
+    }
+    if idle {
+        shared.checks_idle.store(true, Ordering::Relaxed);
+        k.oom.code_views = None;
+        return None;
+    }
+    k.oom.code_views = Some(now + CODE_VIEW_INTERVAL);
+    k.oom.code_views
+}
+
 /// 定时器线程每次醒来时调用：到了检查的时刻就量一次 App 的内存，超出上限时结束一个
 /// guest 进程。返回下一次要检查的时刻。
 pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
@@ -108,16 +158,13 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     {
         return Some(next);
     }
-    let idle = k
-        .tasks
-        .values()
-        .all(|t| t.sleeping.load(std::sync::atomic::Ordering::Relaxed));
+    let idle = all_sleeping(k);
     shared.checks_idle.store(idle, Ordering::Relaxed);
     if idle {
         k.oom.next = None;
         return None;
     }
-    let Some(used) = appine_hal::memory_footprint() else {
+    let Some(used) = footprint() else {
         eprintln!("appine: cannot measure the memory use, the memory limit is off");
         k.oom.limit = u64::MAX;
         return None;

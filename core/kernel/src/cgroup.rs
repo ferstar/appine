@@ -155,7 +155,7 @@ pub(crate) fn file(k: &Kernel, name: &[u8]) -> Option<String> {
 /// 页缓存，inactive_file 是 0。.NET 的 GC 按 `memory.current` 减去 inactive_file 算用量，没有
 /// 这个文件就只看自己进程的 RSS。
 fn memory_stat() -> String {
-    let u = appine_hal::memory_usage().unwrap_or_default();
+    let u = crate::oom::app_memory().unwrap_or_default();
     let anon = u.anon + u.swap;
     let mut s = String::new();
     let mut put = |name: &str, v: u64| writeln!(s, "{name} {v}").unwrap();

@@ -183,6 +183,8 @@ unsafe extern "C" {
 
     fn appine_dbt_new(key: u64) -> *mut RawDbt;
     fn appine_dbt_trim();
+    fn appine_dbt_unmap_written();
+    fn appine_dbt_written_bytes() -> u64;
     fn appine_dbt_free(dbt: *mut RawDbt, key: u64);
     fn appine_dbt_set_sources(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_trust(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
@@ -645,6 +647,19 @@ impl DbtSpace {
 /// 可以丢掉，下次运行同一个程序时重新拷贝模板。
 pub fn trim_dbt_pool() {
     unsafe { appine_dbt_trim() }
+}
+
+/// 拆掉 Tier 1 的代码缓存在可写视图里写过的页（内容留着）。代码缓存按 W^X 映射两次，
+/// 宿主的 RSS 按映射数页，两个视图都碰过的页算两次；之后再写只是重新缺页。要定期调用：
+/// 内核层的定时器线程每秒一次。
+pub fn unmap_written_code() {
+    unsafe { appine_dbt_unmap_written() }
+}
+
+/// 可写视图里写过、还没拆掉的页（[`unmap_written_code`]）一共多少字节：它们在宿主的
+/// RSS 里算了两次。
+pub fn written_code_bytes() -> u64 {
+    unsafe { appine_dbt_written_bytes() }
 }
 
 impl Drop for DbtSpace {
