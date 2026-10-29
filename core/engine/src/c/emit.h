@@ -14,6 +14,12 @@ static inline uint32_t enc_ldr_x(unsigned rt, unsigned rn, size_t off)
     return 0xf9400000u | (uint32_t)(off / 8) << 10 | rn << 5 | rt;
 }
 
+/* LDUR Xt, [Xn, #off]：偏移不按 8 对齐（-256..255） */
+static inline uint32_t enc_ldur_x(unsigned rt, unsigned rn, int off)
+{
+    return 0xf8400000u | ((uint32_t)off & 0x1ff) << 12 | rn << 5 | rt;
+}
+
 static inline uint32_t enc_str_x(unsigned rt, unsigned rn, size_t off)
 {
     return 0xf9000000u | (uint32_t)(off / 8) << 10 | rn << 5 | rt;
@@ -118,6 +124,11 @@ static inline uint32_t enc_and_low(unsigned rd, unsigned rn, unsigned bits)
 static inline uint32_t enc_ubfx(unsigned rd, unsigned rn, unsigned lsb, unsigned width)
 {
     return 0xd3400000u | lsb << 16 | (lsb + width - 1) << 10 | rn << 5 | rd;
+}
+
+static inline uint32_t enc_sbfx(unsigned rd, unsigned rn, unsigned lsb, unsigned width)
+{
+    return 0x93400000u | lsb << 16 | (lsb + width - 1) << 10 | rn << 5 | rd;
 }
 
 static inline uint32_t enc_add_lsl(unsigned rd, unsigned rn, unsigned rm, unsigned amount)

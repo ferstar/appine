@@ -453,6 +453,30 @@ const LDR_X1_X2_8: u32 = 0xf940_0441; // ldr x1, [x2, #8]
 // （按 pc），所以每个测试的代码放在自己的地址上。
 
 #[test]
+fn exits_beyond_48_bits_keep_the_whole_pc() {
+    // 退出桩把 guest pc 和退出原因放在同一个数据字里（低 48 位、高 16 位），跳转目标算出来
+    // 超出 48 位时换一种桩。地址空间最后一页的代码执行到页尾、落到 2^48：取指故障报告的
+    // 是完整的地址，不能截成 0
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    let mut g = Guest::with_pages(4);
+    const LAST: u64 = (1 << 48) - PAGE_SIZE;
+    let page = &mut g.pages[3].0;
+    page[..4].copy_from_slice(&b(LAST, LAST + 4092).to_le_bytes());
+    page[4092..].copy_from_slice(&movz_x0(5).to_le_bytes());
+    let host = NonNull::new(g.pages[3].0.as_mut_ptr()).unwrap();
+    unsafe { g.mmu.map(LAST, host, PAGE_SIZE, prot::READ | prot::EXEC).unwrap() };
+    g.cpu.state_mut().pc = LAST;
+    match dbt.run(&mut g.cpu) {
+        Exit::Fault { addr, .. } => assert_eq!(addr, 1 << 48),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(g.cpu.state().pc, 1 << 48);
+    assert_eq!(g.cpu.state().x[0], 5);
+}
+
+#[test]
 fn accesses_with_the_same_base_share_one_check() {
     let Some(mut dbt) = Dbt::new() else {
         return;

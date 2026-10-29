@@ -83,8 +83,19 @@ enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
 /* 退出桩之外的另一种桩：TLB 未命中时进入回填例程，回填失败再退出（R_INTERP 或 R_UNGROUP） */
 #define STUB_REFILL 0
 
-/* 一个桩最多占的字数：回填桩 4 个字，后面接一个最长 7 个字的退出桩；链接桩最长 8 个字 */
-#define MAX_STUB_WORDS 11
+/* 一个桩最多占的字数：链接桩 5 个字（pc 放不进 48 位时 6 个），退出桩 4 个（5 个），回填桩
+ * 5 个 */
+#define MAX_STUB_WORDS 6
+
+/* 退出桩的数据字里 pc 占低 48 位，高 16 位是退出原因（emit_link_stub） */
+#define PACKED_PC_BITS 48
+
+/* 回填桩里的信息字（emit_refill_stub）：低 12 位是字节数减一（共用检查的一组访存最多覆盖
+ * GROUP_SPAN 再加一次访问），接着 3 位是回填失败时的退出原因，高 17 位是访问本身相对信息字
+ * 的字数（有符号） */
+#define REFILL_REASON_SHIFT 12
+#define REFILL_RESUME_SHIFT 15
+_Static_assert(MAX_BLOCK_WORDS < 1u << (31 - REFILL_RESUME_SHIFT), "访问相对信息字的字数要放进信息字");
 
 /* 块入口的 kick 检查占的字数 */
 #define ENTRY_CHECK_WORDS 2
@@ -186,6 +197,8 @@ struct appine_dbt {
     size_t routine_words;
     uint32_t *enter;
     uint32_t *exit;
+    uint32_t *exit_stub; /* 退出桩跳往的入口（emit_link_stub），接着就是 exit */
+    uint32_t *exit_full; /* 同上，pc 放不进 48 位的 */
     uint32_t *refill[2]; /* TLB 回填例程：读、写 */
     uint32_t *lookup;    /* 跳转缓存没命中时查翻译表的例程（emit_lookup） */
     uint32_t *rs_miss;   /* 影子返回栈空项的落点：按 guest x30 查找 */
@@ -290,7 +303,7 @@ struct link {
 #define NO_BRANCH UINT32_MAX
 
 /* 跳往例程的 b：拷贝翻译模板时要按新位置重新计算偏移 */
-enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE, TO_LOOKUP };
+enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE, TO_LOOKUP, TO_EXIT_FULL };
 
 /* 一组共用检查的访存最多覆盖多少字节、最多几条；同时最多几组（plan_group） */
 #define GROUP_SPAN 512
@@ -311,7 +324,7 @@ struct xlate {
     unsigned nstubs;
     struct fixup fixups[MAX_FIXUPS];
     unsigned nfixups;
-    uint32_t relocs[MAX_RELOCS]; /* 下标 << 2 | TO_* */
+    uint32_t relocs[MAX_RELOCS]; /* 下标 << 3 | TO_* */
     unsigned nrelocs;
     /* 正在翻译的块：起始 pc、guest 指令字、当前指令的下标、块最多能有几条指令 */
     uint64_t pc;
@@ -481,7 +494,9 @@ static uint32_t *routine(const struct appine_dbt *d, unsigned to)
 {
     switch (to) {
     case TO_EXIT:
-        return d->exit;
+        return d->exit_stub;
+    case TO_EXIT_FULL:
+        return d->exit_full;
     case TO_LOOKUP:
         return d->lookup;
     default:
@@ -489,11 +504,11 @@ static uint32_t *routine(const struct appine_dbt *d, unsigned to)
     }
 }
 
-/* 跳往进入/退出例程或回填例程的 b */
+/* 跳往例程的 b：TO_EXIT 是桩用的退出入口（exit_stub，见 emit_link_stub） */
 static void emit_to_routine(struct xlate *x, unsigned to)
 {
     if (x->nrelocs < MAX_RELOCS)
-        x->relocs[x->nrelocs] = (uint32_t)x->n << 2 | to;
+        x->relocs[x->nrelocs] = (uint32_t)x->n << 3 | to;
     x->nrelocs++; /* 溢出由 prepare() 检查 */
     emit(x, enc_b((intptr_t)routine(x->d, to) - (intptr_t)here(x)));
 }
@@ -557,11 +572,17 @@ static void emit_store_guest(struct xlate *x, unsigned host, unsigned guest)
 /* ---- 退出桩 ---- */
 
 /*
- * 退出桩把 T0 = guest pc、T1 = 回填位置（或 0）、T2 = 退出原因交给退出例程。
+ * 退出桩给退出例程的是 T0 = guest pc、T1 = 回填位置、T2 = 退出原因（emit_routines）。guest pc
+ * 是 48 位的地址，拼成立即数要三四条 mov，所以和退出原因一起放在桩末尾的两个数据字里
+ * （原因在高 16 位），由例程的桩入口（exit_stub）读出来：
+ *
+ *     [b 4]   adr T1, 0   b exit_stub   .quad 原因 << 48 | pc
+ *
  * 链接桩的第一条指令是跳到下一条的 b，链接时它被改写成直接跳往目标块的 b：别的线程
- * 可能正在执行它，b 改成 b 是架构允许并发修改的（ARM ARM 的 CMODX 规则），下一条
- * "adr x17, -4" 把它的地址交给分发器。branch 是唯一跳到这个桩的条件分支，链接时目标
- * 在它的偏移范围内就让它直接跳过去（只在没有别的线程时，见 dbt_run）。
+ * 可能正在执行它，b 改成 b 是架构允许并发修改的（ARM ARM 的 CMODX 规则）。例程把 T1 减 4
+ * 交给分发器：链接桩的是它的回填位置，别的桩的分发器不看。branch 是唯一跳到这个桩的
+ * 条件分支，链接时目标在它的偏移范围内就让它直接跳过去（只在没有别的线程时，见 dbt_run）。
+ * 跳转目标算出来超出 48 位时（guest 跳过去只会出错）原因另用 movz 交给 exit_full。
  */
 static void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc, const uint32_t *branch)
 {
@@ -570,15 +591,19 @@ static void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc, const 
         emit_to_routine(x, TO_LOOKUP);
         return;
     }
-    if (reason == R_CHAIN || reason == R_CHAIN_FWD) {
+    if (reason == R_CHAIN || reason == R_CHAIN_FWD)
         emit(x, enc_b(4));
-        emit(x, enc_adr(T1, -4));
+    emit(x, enc_adr_self(T1));
+    uint64_t code = reason | delta << REASON_BITS;
+    if (pc >> PACKED_PC_BITS == 0) {
+        emit_to_routine(x, TO_EXIT);
+        pc |= code << PACKED_PC_BITS;
     } else {
-        emit(x, enc_movz(T1, 0, 0));
+        emit(x, enc_movz(T2, (unsigned)code, 0));
+        emit_to_routine(x, TO_EXIT_FULL);
     }
-    emit_mov_const(x, T0, pc);
-    emit(x, enc_movz(T2, reason | delta << REASON_BITS, 0));
-    emit_to_routine(x, TO_EXIT);
+    emit(x, (uint32_t)pc);
+    emit(x, (uint32_t)(pc >> 32));
 }
 
 static void emit_exit_stub(struct xlate *x, unsigned reason, uint64_t pc)
@@ -631,17 +656,21 @@ static void emit_to_refill(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
 }
 
 /*
- * 回填桩：T1 指向桩里的 "b 访问"，T2 = 字节数 - 1，然后进入回填例程。例程成功时
- * T2 = addend 并跳回 T1，失败时跳到 T1 + 4，也就是紧接着的退出桩，由 Tier 0 执行
- * 这条指令。
+ * 回填桩：T1 指向信息字，进入回填例程；信息字后面是这条指令的 guest pc。例程成功时 T2 =
+ * addend，跳回访问本身；失败时按信息字里的原因带着 pc 退出，由 Tier 0 执行这条指令。
+ *
+ *     adr T1, 8   b 回填例程   .word 信息   .quad pc
  */
 static void emit_refill_stub(struct xlate *x, const struct stub *s)
 {
-    emit(x, enc_adr(T1, 12));
-    emit(x, enc_movz(T2, s->bytes - 1, 0));
+    if (s->bytes > 1u << REFILL_REASON_SHIFT || s->fail >> (REFILL_RESUME_SHIFT - REFILL_REASON_SHIFT))
+        abort(); /* 信息字放不下：属于引擎 bug */
+    emit(x, enc_adr(T1, 8));
     emit_to_routine(x, s->write ? TO_REFILL_WRITE : TO_REFILL_READ);
-    emit(x, enc_b((intptr_t)s->resume - (intptr_t)here(x)));
-    emit_exit_stub(x, s->fail, s->pc);
+    intptr_t resume = s->resume - here(x);
+    emit(x, (uint32_t)resume << REFILL_RESUME_SHIFT | s->fail << REFILL_REASON_SHIFT | (s->bytes - 1));
+    emit(x, (uint32_t)s->pc);
+    emit(x, (uint32_t)(s->pc >> 32));
 }
 
 static bool fallback(struct xlate *x, uint64_t pc)
@@ -1697,7 +1726,13 @@ static void emit_call(struct xlate *x, uint64_t pc)
     emit(x, enc_add_imm(T2, T1, 16, 0));
     emit(x, enc_bfxil_low(T1, T2, RS_SHIFT));
     emit(x, enc_str_x(T1, CTX, rs));
-    emit_mov_const(x, T2, pc + 4);
+    /* 宿主 x30 是落点，guest 返回地址在它末尾的数据字里（emit_link_stub） */
+    if ((pc + 4) >> PACKED_PC_BITS == 0) {
+        emit(x, enc_ldur_x(T2, 30, 12));
+        emit(x, enc_and_low(T2, T2, PACKED_PC_BITS));
+    } else {
+        emit(x, enc_ldur_x(T2, 30, 16));
+    }
     emit(x, enc_stp_x(T2, 30, T1, 0));
     emit(x, enc_mov(30, T2));
 }
@@ -2951,8 +2986,8 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     uint32_t *code = d->cache + d->used_words;
     memcpy(rw(d, code), p->host, p->nhost * 4);
     for (unsigned i = 0; i < p->nrelocs; i++) {
-        uint32_t *site = code + (p->relocs[i] >> 2);
-        *rw(d, site) = enc_b((intptr_t)routine(d, p->relocs[i] & 3) - (intptr_t)site);
+        uint32_t *site = code + (p->relocs[i] >> 3);
+        *rw(d, site) = enc_b((intptr_t)routine(d, p->relocs[i] & 7) - (intptr_t)site);
     }
     d->used_words += p->nhost;
     link_block(d, code, p->pc, p->links, p->nlinks);
@@ -3036,8 +3071,8 @@ static uint32_t *emit_probe(struct xlate *x, unsigned a, unsigned addend, bool w
 
 /*
  * TLB 回填例程：TLB 未命中或者访问跨页时，在翻译后的代码里处理，不必退出到分发器。
- * 入口：T0 = guest 地址，T1 和 T2 见 emit_refill_stub。成功时 T2 = addend，回到
- * 访问本身。
+ * 入口：T0 = guest 地址，T1 指向回填桩的信息字（emit_refill_stub）。成功时 T2 = addend，
+ * 回到访问本身；失败时按信息字里的原因退出。
  *
  * 不跨页时按页表填好表项。跨页时两页都要有这次访问的权限，宿主地址也要连续（两页
  * 的 addend 相同；同一次宿主映射里的页都是这样），这时整个访问照样在宿主上一次完成：
@@ -3063,7 +3098,9 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit_add_const(x, 0, CTX, (int64_t)(nwatch & ~(size_t)0xfff));
     emit(x, enc_ldr_w(0, 0, nwatch & 0xfff));
     emit_to_fail(x, &f, enc_cbnz_x(0));
-    emit(x, enc_add_lsl(3, T0, T2, 0)); /* 最后一个字节 */
+    emit(x, enc_ldr_w(3, T1, 0));
+    emit(x, enc_ubfx(3, 3, 0, REFILL_REASON_SHIFT));
+    emit(x, enc_add_lsl(3, T0, 3, 0)); /* 最后一个字节 */
     /* 两头的高位都要是 0：只看 x3 会漏掉加上字节数之后绕回来的地址 */
     emit(x, enc_orr_reg(0, T0, 3));
     emit(x, enc_ubfx(0, 0, APPINE_VA_BITS, 64 - APPINE_VA_BITS));
@@ -3076,6 +3113,9 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit_fill(x, T0, write, &f);
     emit(x, enc_mov(T2, 2));
     uint32_t *done = here(x);
+    emit(x, enc_ldr_w(0, T1, 0));
+    emit(x, enc_sbfx(0, 0, REFILL_RESUME_SHIFT, 32 - REFILL_RESUME_SHIFT));
+    emit(x, enc_add_lsl(T1, T1, 0, 2));
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
     emit(x, enc_ldr_x(4, CTX, x0 + 32));
@@ -3099,11 +3139,13 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
 
     for (unsigned i = 0; i < f.n; i++)
         patch_branch(x->wdelta, f.site[i], here(x));
+    emit(x, enc_ldr_w(0, T1, 0));
+    emit(x, enc_ubfx(T2, 0, REFILL_REASON_SHIFT, REFILL_RESUME_SHIFT - REFILL_REASON_SHIFT));
+    emit(x, enc_ldur_x(T0, T1, 4));
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
     emit(x, enc_ldr_x(4, CTX, x0 + 32));
-    emit(x, enc_add_imm(T1, T1, 4, 0));
-    emit(x, enc_br(T1));
+    emit(x, enc_b((intptr_t)x->d->exit - (intptr_t)here(x)));
     return entry;
 }
 
@@ -3215,7 +3257,18 @@ static void emit_routines(struct appine_dbt *d)
     emit(&x, enc_ldr_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
     emit(&x, enc_br(T0));
 
-    /* 退出：T0 = guest pc，T1 = 回填位置或 0，T2 = 原因 */
+    /* 桩用的两个入口：T1 指向桩里的 adr，pc 在桩末尾的数据字里（emit_link_stub） */
+    d->exit_full = here(&x);
+    emit(&x, enc_ldur_x(T0, T1, 12));
+    uint32_t *join = here(&x);
+    emit(&x, enc_b(0));
+    d->exit_stub = here(&x);
+    emit(&x, enc_ldur_x(T0, T1, 8));
+    emit(&x, enc_ubfx(T2, T0, PACKED_PC_BITS, 64 - PACKED_PC_BITS));
+    emit(&x, enc_and_low(T0, T0, PACKED_PC_BITS));
+    patch_branch(x.wdelta, join, here(&x));
+    emit(&x, enc_sub_imm(T1, T1, 4, 0));
+    /* 退出：T0 = guest pc，T1 = 回填位置（只有链接桩的有用），T2 = 原因 */
     d->exit = here(&x);
     emit(&x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, pc)));
     emit(&x, enc_str_x(T1, CTX, offsetof(struct appine_cpu, dbt_site)));
