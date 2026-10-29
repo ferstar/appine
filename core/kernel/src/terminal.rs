@@ -164,36 +164,65 @@ pub(crate) fn resize(k: &Kernel, id: u32, w: Winsize) -> Result<(), Errno> {
 /// 读到 EOF、写入失败。
 pub(crate) fn close(k: &mut Kernel, id: u32) -> Result<(), Errno> {
     let console = k.consoles.remove(&id).ok_or(Errno::ENOENT)?;
-    let leader = console.master.tty.borrow().session;
+    let tty = console.master.tty.clone();
     drop(console);
-    if let Some(leader) = leader {
-        signal::send_to_group(k, leader, Signal::HUP, SigInfo::kernel());
-        signal::send_to_group(k, leader, Signal::CONT, SigInfo::kernel());
-    }
+    crate::syscall::hang_up(k, &tty);
     request_wake();
     Ok(())
 }
 
+/// 宿主的输入结束之后交给程序的 EOF（[`send_eof`]）。
+#[derive(Clone, Copy, PartialEq)]
+enum Eof {
+    /// 输入还没结束。
+    Open,
+    /// 输入结束了，等程序读完已经送进去的输入。
+    Pending,
+    /// 在规范模式下送了：VEOF 是行尾的 EOF 标记。
+    Canonical,
+    Sent,
+}
+
 /// 宿主的输入结束之后，与 util-linux 的 script 一样往控制台的输入里送一个 VEOF（^D）：
 /// 规范模式下行首的 VEOF 让 read 返回 0，shell、cat 这类读到 EOF 就结束的程序随之退出；
-/// 不是规范模式时程序收到这个字符。与 script 一样等程序把已经送进去的输入读完再送，VEOF
-/// 按那时的终端模式处理（shell 的行编辑读一行时切到非规范模式，执行命令时切回来）。返回
-/// false 表示还没读完，程序读走输入时控制台的 PTY 叫醒桥接线程。VEOF 被禁用时什么也不送。
-fn send_eof(k: &Kernel, id: u32) -> bool {
+/// 不是规范模式时程序收到这个字符（shell 的行编辑当作 EOF）。与 script 一样等程序把已经
+/// 送进去的输入读完再送；还没读完时返回 None，程序读走输入时控制台的 PTY 叫醒桥接线程。
+/// 送了时返回送的时候是不是规范模式。VEOF 被禁用时什么也不送。
+fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
     let Ok(tty) = tty_of(k, id) else {
-        return true;
+        return Some(false);
     };
-    let eof = {
+    let (eof, canonical) = {
         let t = tty.borrow();
         if t.readable() {
-            return false;
+            return None;
         }
-        t.termios.cc[crate::tty::cc::VEOF]
+        (t.termios.cc[crate::tty::cc::VEOF], t.canonical())
     };
     if eof != 0 {
         let _ = feed(k, id, &[eof]);
     }
-    true
+    Some(canonical)
+}
+
+/// 在规范模式下送出的 EOF 之后的一步：程序没读到它就切到了非规范模式（shell 读完一行切回
+/// 规范模式执行命令，桥接线程这时送了 VEOF，回到提示符时行编辑又切到非规范模式），EOF 标记
+/// 就没了（Linux 上变成一个 NUL 字节，script 有同样的问题），这时再送一次，这次是字符。
+fn eof_after(k: &Kernel, id: u32, eof: Eof) -> Eof {
+    match eof {
+        Eof::Pending => match send_eof(k, id) {
+            Some(true) => Eof::Canonical,
+            Some(false) => Eof::Sent,
+            None => Eof::Pending,
+        },
+        Eof::Canonical if tty_of(k, id).is_ok_and(|t| !t.borrow().canonical()) => {
+            match send_eof(k, id) {
+                Some(_) => Eof::Sent,
+                None => Eof::Canonical,
+            }
+        }
+        e => e,
+    }
 }
 
 /// 把数据全部写到宿主 fd；宿主那边已经关闭时丢弃。
@@ -215,9 +244,7 @@ pub(crate) fn initial_size(term: &Terminal) -> Winsize {
 /// guest 线程退出并且输出写完为止。
 pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
     let event = Arc::new(Event::new().expect("cannot create an eventfd for the terminal"));
-    let mut input_open = true;
-    // 宿主的输入结束了，还没有把 EOF 交给程序
-    let mut eof_pending = false;
+    let mut eof = Eof::Open;
     let mut buf = vec![0u8; READ_CHUNK];
     let mut k = shared.lock();
     loop {
@@ -235,12 +262,10 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
         if k.watched.get(&pid).is_some_and(Option::is_some) && k.tasks.is_empty() {
             break;
         }
-        if eof_pending && send_eof(&k, id) {
-            eof_pending = false;
-        }
+        eof = eof_after(&k, id, eof);
         let room = input_room(&k, id).unwrap_or(0);
         let mut fds = Vec::new();
-        if input_open && room > 0 {
+        if eof == Eof::Open && room > 0 {
             fds.push((term.input, POLLIN, 0));
         }
         if let Some(r) = term.resize {
@@ -271,10 +296,7 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
                     }
                     // 宿主的输入结束了（stdin 是管道或者文件）：不再读，等程序读完已经送进去
                     // 的输入之后交给它一个 EOF
-                    _ => {
-                        input_open = false;
-                        eof_pending = true;
-                    }
+                    _ => eof = Eof::Pending,
                 }
             } else {
                 appine_hal::drain(fd);

@@ -2960,6 +2960,91 @@ print("pty after io", now - 10 < st.st_atime <= now + 1, now - 10 < st.st_mtime 
 print("pty fstat", os.fstat(s).st_mtime == st.st_mtime)
 PY
 
+# 关掉 PTY 的主设备挂断从设备（Linux 的 pty_close → tty_vhangup）：会话组长收到 SIGHUP 和
+# SIGCONT，会话里别的进程收不到、但都失去控制终端，组长退出时前台进程组才收到 SIGHUP
+# （tty_old_pgrp）；打开着的从设备读到 EOF（还没读的输入也没了），写和 ioctl 是 EIO，
+# tcsetpgrp 是 ENOTTY，poll 总是就绪；/dev/pts/<n> 删掉
+python3 - <<'PY'
+import errno, os, select, signal, time
+
+
+def err(f):
+    try:
+        return repr(f())
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+r, w = os.pipe()
+ready_r, ready_w = os.pipe()
+pg_r, pg_w = os.pipe()
+m, s = os.openpty()
+name = os.ttyname(s)
+os.close(s)
+if os.fork() == 0:
+    os.close(m)
+    got = []
+    signal.signal(signal.SIGHUP, lambda n, f: got.append("HUP"))
+    signal.signal(signal.SIGCONT, lambda n, f: got.append("CONT"))
+    os.setsid()
+    fd = os.open(name, os.O_RDWR)
+    # 组长进程组（前台进程组）里的另一个进程：挂断时收不到，组长退出时才收到 SIGHUP
+    leader = os.getpid()
+    if os.fork() == 0:
+        hups = []
+        signal.signal(signal.SIGHUP, lambda n, f: hups.append(os.getppid() != leader))
+        for _ in range(1000):
+            if hups:
+                break
+            time.sleep(0.01)
+        os.write(pg_w, f"foreground member: SIGHUP after the leader exited {hups}".encode())
+        os._exit(0)
+    kid_r, kid_w = os.pipe()
+    kid = os.fork()
+    if kid == 0:
+        kid_got = []
+        signal.signal(signal.SIGHUP, lambda n, f: kid_got.append("HUP"))
+        os.setpgid(0, 0)
+        os.write(kid_w, b"x")
+        time.sleep(1)
+        tty = err(lambda: os.open("/dev/tty", os.O_RDWR) and "opened")
+        os.write(kid_w, f"member: signals {kid_got}, /dev/tty {tty}".encode())
+        os._exit(0)
+    os.read(kid_r, 1)
+    os.write(ready_w, b"x")
+    for _ in range(500):
+        if got:
+            break
+        time.sleep(0.01)
+    time.sleep(0.2)
+    out = [f"leader: signals {got}"]
+    p = select.poll()
+    p.register(fd, select.POLLIN | select.POLLOUT)
+    out.append(f"poll {[hex(ev) for _, ev in p.poll(100)]}")
+    out.append(f"read {err(lambda: os.read(fd, 16))}")
+    out.append(f"write {err(lambda: os.write(fd, b'x'))}")
+    out.append(f"tcgetpgrp {err(lambda: os.tcgetpgrp(fd) == os.getpgrp())}")
+    out.append(f"tcsetpgrp {err(lambda: os.tcsetpgrp(fd, os.getpgrp()))}")
+    out.append(f"isatty {os.isatty(fd)}")
+    out.append(f"/dev/tty {err(lambda: os.open('/dev/tty', os.O_RDWR) and 'opened')}")
+    # 节点也没了（Linux 的 devpts_pty_kill），从设备还开着也一样
+    listed = os.path.basename(name) in os.listdir("/dev/pts")
+    out.append(f"{name.startswith('/dev/pts/')} listed {listed}, "
+               f"open {err(lambda: os.open(name, os.O_RDWR | os.O_NOCTTY) and 'opened')}")
+    os.waitpid(kid, 0)
+    out.append(os.read(kid_r, 200).decode())
+    os.write(w, "\n".join(out).encode())
+    os._exit(0)
+os.close(w)
+os.close(pg_w)
+os.read(ready_r, 1)
+os.write(m, b"unread\n")
+os.close(m)
+os.wait()
+print(os.read(r, 4096).decode())
+print(os.read(pg_r, 200).decode())
+PY
+
 # 被信号叫醒、还没跑起来的进程在 /proc 里是 R（Linux 的 try_to_wake_up 当场改状态）：
 # LTP 的 TST_PROCESS_STATE_WAIT 给停在 pause() 里的子进程发信号，等它的状态回到 S，就当它
 # 做完了下一步（shmctl01）

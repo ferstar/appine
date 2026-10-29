@@ -8,7 +8,7 @@
 //! 这里只有纯数据结构和行规程；阻塞、信号和作业控制的检查在 syscall 层完成。
 
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::cell::RefCell;
 use crate::kernel::{Tid, request_wake_object, wake};
@@ -255,6 +255,9 @@ pub struct Tty {
     pub slaves: usize,
     /// 从设备是否还没有解锁（unlockpt）。
     pub locked: bool,
+    /// 已经挂断（`syscall::tty::hang_up`）：打开着的从设备读返回 0，写和 ioctl 是 EIO，poll 总是就绪，
+    /// 带着 POLLERR、POLLHUP（Linux 的 `hung_up_tty_fops`）。
+    pub hung_up: bool,
     /// `/dev/pts/<index>` 的属主、属组和权限位：与 Linux 按挂载选项 `gid=5,mode=620` 的
     /// devpts 一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod
     /// 可以修改，记到终端关掉为止。
@@ -291,6 +294,7 @@ impl Tty {
             masters: 0,
             slaves: 0,
             locked: true,
+            hung_up: false,
             owner: (0, TTY_GID),
             mode: 0o620,
             arrivals: [0; 2],
@@ -319,7 +323,8 @@ impl Tty {
         self.ctime_ns = wall_ns();
     }
 
-    fn canonical(&self) -> bool {
+    /// 是不是规范模式（ICANON）。
+    pub fn canonical(&self) -> bool {
         self.termios.l(ICANON)
     }
 
@@ -745,15 +750,39 @@ impl PtyEnd {
 
 impl Drop for PtyEnd {
     fn drop(&mut self) {
-        let mut t = self.tty.borrow_mut();
-        if self.master {
-            t.masters -= 1;
-        } else {
-            t.slaves -= 1;
+        let closed = {
+            let mut t = self.tty.borrow_mut();
+            if self.master {
+                t.masters -= 1;
+            } else {
+                t.slaves -= 1;
+            }
+            self.master && t.masters == 0 && !t.hung_up
+        };
+        if closed {
+            CLOSED.with_borrow_mut(|c| c.push(Rc::downgrade(&self.tty)));
         }
         // 另一端要看到挂断
         request_wake_object(wake::of(&self.tty));
     }
+}
+
+thread_local! {
+    /// 主设备都关掉了、还没有挂断的终端。关闭打开文件是在 Drop 里，拿不到内核，由放开
+    /// BKL 的线程在放开之前挂断（[`take_closed`]）。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static CLOSED: std::cell::RefCell<Vec<Weak<RefCell<Tty>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 取走这个线程关掉了最后一个主设备、还没有挂断的终端（[`PtyEnd`] 记下的），由
+/// `syscall::tty::hang_up_closed` 挂断。
+pub(crate) fn take_closed() -> Vec<Rc<RefCell<Tty>>> {
+    if CLOSED.with_borrow(Vec::is_empty) {
+        return Vec::new();
+    }
+    let closed = CLOSED.with_borrow_mut(std::mem::take);
+    closed.iter().filter_map(Weak::upgrade).collect()
 }
 
 /// 回显时显示成 `^X` 的控制字符：除 TAB、NL 之外的 C0 控制字符和 DEL。

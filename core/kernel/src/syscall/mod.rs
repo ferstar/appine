@@ -36,6 +36,7 @@ pub(crate) use net::SocketRef;
 pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;
+pub(crate) use tty::{hang_up, hang_up_closed};
 
 use std::sync::atomic::Ordering;
 

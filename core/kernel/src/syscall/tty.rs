@@ -77,6 +77,7 @@ pub(crate) fn open_slave(cx: &mut Cx<'_>, index: u32, flags: u32) -> Result<File
             t.session = Some(g.sid);
             t.fg = Some(g.pgid);
             g.ctty = Some(tty.clone());
+            g.tty_old_pgrp = None;
         }
     }
     Ok(FileKind::Pty(PtyEnd::new(tty, false)))
@@ -129,11 +130,17 @@ fn slave_read(
     nonblock: bool,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
+    if tty.borrow().hung_up {
+        return Ok(0);
+    }
     check_background(cx, tty, Signal::TTIN)?;
     let mut deadline: Option<Instant> = None;
     loop {
         {
             let mut t = tty.borrow_mut();
+            if t.hung_up {
+                return Ok(0);
+            }
             let canonical = t.termios.lflag & flags::ICANON != 0;
             let vmin = t.termios.cc[cc::VMIN] as usize;
             let vtime = Duration::from_millis(100 * t.termios.cc[cc::VTIME] as u64);
@@ -180,6 +187,9 @@ fn slave_write(
     nonblock: bool,
     data: &[u8],
 ) -> Result<usize, Errno> {
+    if tty.borrow().hung_up {
+        return Err(Errno::EIO);
+    }
     if tty.borrow().termios.lflag & flags::TOSTOP != 0 {
         check_background(cx, tty, Signal::TTOU)?;
     }
@@ -317,6 +327,52 @@ pub(crate) fn write(
     }
 }
 
+/// 挂断终端（Linux 的 `__tty_hangup`）：会话组长收到 SIGHUP 和 SIGCONT，并且记下前台
+/// 进程组，等它退出时再发给它们（`process::release_ctty`）；会话里以它为控制终端的进程都
+/// 失去控制终端，打开着的从设备从此读到 EOF、写入失败（[`Tty::hung_up`]）。
+/// `/dev/pts/<n>` 随之消失，编号可以给新的终端（Linux 的 `devpts_pty_kill`）。最后一个
+/// 主设备关掉（Linux 的 `pty_close`，[`hang_up_closed`]）和关闭控制台
+/// （[`crate::terminal::close`]）时调用；已经挂断的什么也不做。
+pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
+    let (index, session, fg) = {
+        let mut t = tty.borrow_mut();
+        if t.hung_up {
+            return;
+        }
+        t.hung_up = true;
+        (t.index, t.session.take(), t.fg.take())
+    };
+    if k.ptys
+        .get(&index)
+        .is_some_and(|w| std::ptr::eq(w.as_ptr(), Rc::as_ptr(tty)))
+    {
+        k.ptys.remove(&index);
+    }
+    for g in k.groups.values() {
+        let mut g = g.borrow_mut();
+        if g.ctty.as_ref().is_some_and(|c| Rc::ptr_eq(c, tty)) {
+            g.ctty = None;
+        }
+    }
+    if let Some(leader) = session {
+        // 组长退出时没有控制终端了，给这时的前台进程组发 SIGHUP（Linux 的 tty_old_pgrp）
+        if let Some(g) = k.groups.get(&leader) {
+            g.borrow_mut().tty_old_pgrp = fg;
+        }
+        signal::send_to_group(k, leader, Signal::HUP, SigInfo::kernel());
+        signal::send_to_group(k, leader, Signal::CONT, SigInfo::kernel());
+    }
+    request_wake_object(wake::of(tty));
+}
+
+/// 挂断这个线程关掉了最后一个主设备的终端（[`crate::tty::take_closed`]）。放开 BKL 之前
+/// 调用（[`crate::kernel::Bkl`]）。
+pub(crate) fn hang_up_closed(k: &mut Kernel) {
+    for tty in crate::tty::take_closed() {
+        hang_up(k, &tty);
+    }
+}
+
 /// ppoll 的就绪状态。
 pub(crate) fn readiness(tty: &Tty, master: bool) -> i16 {
     const POLLIN: i16 = 0x001;
@@ -335,6 +391,9 @@ pub(crate) fn readiness(tty: &Tty, master: bool) -> i16 {
         if tty.slaves == 0 && !tty.locked {
             ev |= POLLHUP;
         }
+    } else if tty.hung_up {
+        const POLLERR: i16 = 0x008;
+        ev = POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDNORM | POLLWRNORM;
     } else {
         if tty.readable() {
             ev |= POLLIN | POLLRDNORM;
@@ -366,6 +425,13 @@ pub(crate) fn ioctl(
     request: u32,
     arg: u64,
 ) -> SysResult {
+    if !master && tty.borrow().hung_up {
+        return Err(if request == TIOCSPGRP {
+            Errno::ENOTTY
+        } else {
+            Errno::EIO
+        });
+    }
     match request {
         TCGETS => put(cx, arg, tty.borrow().termios.encode()).map(|()| 0),
         TCGETA => {
@@ -556,7 +622,9 @@ pub(crate) fn ioctl(
                 t.session = Some(sid);
                 t.fg = Some(pgid);
             }
-            cx.t.group.borrow_mut().ctty = Some(tty.clone());
+            let mut g = cx.t.group.borrow_mut();
+            g.ctty = Some(tty.clone());
+            g.tty_old_pgrp = None;
             Ok(0)
         }
         TIOCNOTTY => {

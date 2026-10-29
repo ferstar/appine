@@ -326,6 +326,10 @@ pub(crate) struct ThreadGroup {
     pub exit_signal: i32,
     /// 控制终端。
     pub ctty: Option<Rc<RefCell<Tty>>>,
+    /// 控制终端挂断时的前台进程组（Linux 的 `tty_old_pgrp`），只记在会话组长上：它退出时
+    /// 已经没有控制终端，改为给这个进程组发 SIGHUP 和 SIGCONT（[`release_ctty`]）。重新
+    /// 得到控制终端时清掉。
+    pub tty_old_pgrp: Option<Tid>,
     /// 整个线程组被停止信号停住了。
     pub stopped: bool,
     /// 停住线程组的停止信号（Linux 的 `JOBCTL_STOP_SIGMASK`），停着时有意义：父进程的
@@ -413,6 +417,7 @@ impl ThreadGroup {
             zombie: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
+            tty_old_pgrp: None,
             stopped: false,
             stop_signal: Signal::STOP,
             stop_report: None,
@@ -705,13 +710,22 @@ fn hand_to_parent(
 }
 
 /// 会话组长退出：控制终端不再属于这个会话，前台进程组收到 SIGHUP 和 SIGCONT
-/// （Linux 的 `disassociate_ctty`）。
+/// （Linux 的 `disassociate_ctty`）。控制终端已经挂断了的，发给挂断时的前台进程组：
+/// tmux 的窗口关掉时，`sh -c` 起的命令和不 exec 的 sh（dash）在同一个进程组里，组长 sh
+/// 收到 SIGHUP 退出时它们收到 SIGHUP。
 fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
-    let (tgid, sid, ctty) = {
-        let g = group.borrow();
-        (g.tgid, g.sid, g.ctty.clone())
+    let (tgid, sid, ctty, old_pgrp) = {
+        let mut g = group.borrow_mut();
+        (g.tgid, g.sid, g.ctty.clone(), g.tty_old_pgrp.take())
     };
-    let Some(tty) = ctty.filter(|_| sid == tgid) else {
+    if sid != tgid {
+        return;
+    }
+    let Some(tty) = ctty else {
+        if let Some(pgrp) = old_pgrp {
+            signal::send_to_pgrp(k, pgrp, Signal::HUP, SigInfo::kernel());
+            signal::send_to_pgrp(k, pgrp, Signal::CONT, SigInfo::kernel());
+        }
         return;
     };
     let fg = {

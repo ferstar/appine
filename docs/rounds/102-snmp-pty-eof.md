@@ -33,4 +33,4 @@
 - ICMP 只有 ping socket 自己的回显：ping 回环地址时 Linux 还数本机收到请求、发出回答（InEchos、OutEchoReps），这里答复的是宿主，不算。IPv6 的 ICMP、UDP 在 `/proc/net/snmp6` 里，没有这个文件。
 - DNS 存根的查询不经过宿主 socket，不算 UDP 的数据报（与接口的计数一样）。
 - `/proc/net` 仍没有 `snmp6`、`protocols`、`dev_mcast`、`igmp` 等（原生的容器里 57 个文件，这里 18 个）。
-- VEOF 只送一次：`printf 'cat\necho after\n' | appine-run --pty sh -i` 里 EOF 被 cat 读走，shell 之后仍然等输入（`script` 也这样）。
+- VEOF 只送一次：`printf 'cat\necho after\n' | appine-run --pty sh -i` 卡住。ash 在非规范模式下一次读走了两行，^D 随即送出；ash 起 cat 时切回规范模式，^D 只是一个还没读的普通字符，cat 一直等一整行（Linux 上用 `script` 也这样）。

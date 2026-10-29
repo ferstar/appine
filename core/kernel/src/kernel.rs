@@ -531,6 +531,11 @@ impl DerefMut for Bkl<'_> {
 
 impl Drop for Bkl<'_> {
     fn drop(&mut self) {
+        // 持有期间关掉了最后一个主设备的终端要挂断，挂断要发信号、叫醒等待者
+        let k: &mut Kernel = &mut self.0;
+        if crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none() {
+            crate::bug::report(format_args!("kernel panic while hanging up terminals"));
+        }
         self.0.flush_wakeups();
         self.1.store(false, Ordering::Relaxed);
         // SAFETY: 之后不再使用 self.0

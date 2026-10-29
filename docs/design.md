@@ -525,10 +525,11 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - **PTY 和行规程完全在进程内实现**（`core/kernel/src/tty.rs`）。如果借用宿主 PTY，宿主的 `ISIG` 会把信号发给宿主进程组，而宿主根本不知道 guest 进程组的存在。实现覆盖以下内容：
   - termios：`ICANON` 行编辑、`ECHO*`、`ICRNL`/`OPOST`/`ONLCR`、`VMIN`/`VTIME`。
   - 作业控制：`ISIG` 发信号给 guest 前台进程组；`setsid`/`TIOCSCTTY`/`tcsetpgrp`；后台进程组读写终端时的 `SIGTTIN`/`SIGTTOU`；会话关闭时的 `SIGHUP`；`TIOCSWINSZ` 触发的 `SIGWINCH`。
+  - 挂断：最后一个主设备关掉（tmux、sshd 的会话结束）或者 App 关掉控制台时，与 Linux 的 `pty_close` → `tty_vhangup` 一样，会话组长收到 `SIGHUP`、`SIGCONT`（它退出时再发给挂断时的前台进程组），会话里的进程都失去控制终端，`/dev/pts/<n>` 删掉、编号可以再用，打开着的从设备读到 EOF，写和 ioctl 是 `EIO`，poll 总是就绪（[关掉主设备时挂断从设备](rounds/104-pty-hangup.md)）。关闭文件在 Drop 里，拿不到内核，所以 `PtyEnd` 记下主设备都关掉了的终端，由放开 BKL 的线程在放开之前挂断。
 - guest 可以通过 `/dev/ptmx` 自己申请 PTY，tmux、screen、`script`、sshd 都依赖这一点。
 - App 里每个终端标签页对应一个 `/dev/pts/N`，在上面启动一个新会话和登录 shell。
 - **终端 UI**：把 Termux 的 `terminal-emulator` + `terminal-view` vendor 进仓库，替换掉原来的 `TerminalSession`（它是 `final` 类，并且写死了 `JNI.createSubprocess`）。新实现经由 `Pty` 接口接到进程内 PTY 的主设备（`Machine` 的控制台）。扩展键栏属于 GPLv3 的 `termux-app` 主模块，所以重写了一份（`ExtraKeysView.kt`）。来源和改动记在 `android/README.md`。
-- **开发用的 CLI 前端** `appine-run` 把宿主终端切到 raw 模式，把它当作 PTY master 使用：一个桥接线程把宿主的按键写进 master，把 master 的输出写回宿主，宿主的 SIGWINCH 变成 `TIOCSWINSZ`。`--pty` 在宿主 stdin 不是终端时也这样做，测试就是经由管道发送 ^C、^Z 这些字节。宿主 stdin 读到结束（管道、文件）之后，与 util-linux 的 `script` 一样，等程序读完已经送进去的输入，再往控制台送一个 VEOF（^D）：shell、cat 这类读到 EOF 就结束的程序随之退出，不当作挂断。
+- **开发用的 CLI 前端** `appine-run` 把宿主终端切到 raw 模式，把它当作 PTY master 使用：一个桥接线程把宿主的按键写进 master，把 master 的输出写回宿主，宿主的 SIGWINCH 变成 `TIOCSWINSZ`。`--pty` 在宿主 stdin 不是终端时也这样做，测试就是经由管道发送 ^C、^Z 这些字节。宿主 stdin 读到结束（管道、文件）之后，与 util-linux 的 `script` 一样，等程序读完已经送进去的输入，再往控制台送一个 VEOF（^D）：shell、cat 这类读到 EOF 就结束的程序随之退出，不当作挂断。规范模式下送出的 VEOF 是行尾的 EOF 标记，程序还没读到它就切到了非规范模式（shell 的行编辑回到提示符）时标记就没了，这时再送一次字符。
 
 ---
 
