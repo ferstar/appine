@@ -1,6 +1,6 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
-# 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex
+# 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -392,3 +392,55 @@ int main(void)
 C
 gcc -O2 -o diff4 diff4.c
 ./diff4
+
+# 新映射的匿名内存一定是零：appine 把拆掉的宿主内存丢弃内容之后留着，下一次申请同样大小
+# 的直接复用（docs/rounds/109-spawn-mmap-bkl.md）。几个线程和子进程反复映射、检查、写满、
+# 拆掉同样大小的几种块
+cat > diff5.c <<'C'
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static long dirty;
+
+static void *churn(void *arg)
+{
+    long seed = (long)arg, bad = 0;
+    size_t sizes[] = {4096, 65536, 1 << 20, 3 * 4096};
+    for (int i = 0; i < 400; i++) {
+        size_t len = sizes[(i + seed) % 4];
+        unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            return (void *)-1;
+        for (size_t j = 0; j < len; j += 512)
+            bad += p[j] != 0;
+        memset(p, 0xab, len);
+        munmap(p, len);
+    }
+    __atomic_add_fetch(&dirty, bad, __ATOMIC_RELAXED);
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_t t[4];
+    for (long i = 0; i < 4; i++)
+        pthread_create(&t[i], NULL, churn, (void *)i);
+    pid_t pid = fork();
+    if (pid == 0) {
+        churn((void *)7);
+        _exit(dirty != 0);
+    }
+    for (int i = 0; i < 4; i++)
+        pthread_join(t[i], NULL);
+    int status;
+    waitpid(pid, &status, 0);
+    printf("non-zero bytes in new mappings: %ld, child %d\n", dirty, WEXITSTATUS(status));
+    return 0;
+}
+C
+gcc -O2 -o diff5 diff5.c -pthread
+./diff5

@@ -20,7 +20,7 @@ use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::FdTable;
 use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake_on, wake};
-use crate::mm::{Generations, Mm};
+use crate::mm::{CodeSpace, Generations, Mm};
 use crate::process::{CpuTime, ExitStatus, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
 use crate::syscall::fast::Fast;
@@ -453,7 +453,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             .set((task.host_cpu_ns(), appine_hal::thread_system_ns_self()));
         task.host_tid.set(appine_hal::gettid());
         task.ctxt_base
-            .set(appine_hal::thread_ctxt_switches(task.host_tid.get()).unwrap_or((0, 0)));
+            .set(appine_hal::thread_ctxt_switches_self().unwrap_or((0, 0)));
         crate::syscall::host_started(&task, reused);
         task.state.borrow().mm.borrow().generations()
     });
@@ -465,17 +465,18 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     };
     let (sync, tier) = (task.sync.clone(), k.tier);
     // Tier 1 的翻译由这个地址空间里的线程共用，同一个程序的几个地址空间也可能共用
-    // （crate::mm::CodeGroup）。Mm 只在持有 BKL 时访问
-    let attach = |k: &Kernel| {
-        let space = match tier {
-            Tier::Interpreter => None,
-            Tier::Dbt => task.state.borrow().mm.borrow_mut().code_space(&k.code_groups),
-        };
+    // （crate::mm::CodeGroup）。Mm 只在持有 BKL 时访问；挂上去（清空跳转缓存等）不用 BKL
+    let space_of = |k: &Kernel| match tier {
+        Tier::Interpreter => None,
+        Tier::Dbt => task.state.borrow().mm.borrow_mut().code_space(&k.code_groups),
+    };
+    let attach = |space: Option<Arc<CodeSpace>>| {
         space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)))
     };
-    let mut dbt = attach(&k);
+    let space = space_of(&k);
     let mut fast = Fast::new(shared, &task, &task.state.borrow());
     drop(k);
+    let mut dbt = attach(space);
     let load = |g: &Generations| {
         let tlb = g.tlb.load(Ordering::SeqCst);
         (tlb, g.code.load(Ordering::SeqCst), g.space.load(Ordering::SeqCst))
@@ -491,9 +492,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         // shootdown，所以这个线程不会再执行组里的翻译
         if now.2 != seen.2 {
             sync.in_guest.store(false, Ordering::SeqCst);
-            let k = shared.lock();
             if dbt.take().is_some() {
-                dbt = attach(&k);
+                let space = space_of(&shared.lock());
+                dbt = attach(space);
             }
             seen.2 = now.2;
             continue;
@@ -594,7 +595,8 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 // 池里，新的地址空间多半就拿到它。又一次 exec 的多半是同一个程序（shell
                 // 脚本里的 busybox），保留下来的翻译核对后继续用
                 if dbt.take().is_some() {
-                    dbt = attach(&shared.lock());
+                    let space = space_of(&shared.lock());
+                    dbt = attach(space);
                 }
             }
             Flow::Exit => break,

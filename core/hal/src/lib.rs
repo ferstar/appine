@@ -859,6 +859,22 @@ pub fn thread_system_ns(tid: i32) -> Option<u64> {
     Some(ticks * (1_000_000_000 / hz))
 }
 
+/// 调用线程的（自愿, 非自愿）上下文切换次数，与 [`thread_ctxt_switches`] 是同样的计数，
+/// 但只要一次 getrusage：线程开始时持着 BKL 取基数，读 `/proc` 的 status 每次要十来微秒。
+pub fn thread_ctxt_switches_self() -> Option<(u64, u64)> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        const RUSAGE_THREAD: libc::c_int = 1;
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        (unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0)
+            .then_some((ru.ru_nvcsw as u64, ru.ru_nivcsw as u64))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
 /// 本进程的宿主线程 `tid` 自愿、非自愿的上下文切换次数（`/proc/self/task/<tid>/status`）。
 pub fn thread_ctxt_switches(tid: i32) -> Option<(u64, u64)> {
     let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;

@@ -92,6 +92,9 @@ type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
 struct HostRegion {
     base: NonNull<u8>,
     len: usize,
+    /// 私有匿名内存（[`Mm::new_anonymous`]、[`spare`]）和它计不计入提交量：交还时留着
+    /// 复用（[`recycled`]）。
+    anonymous: Option<bool>,
 }
 
 // SAFETY: 只是一段宿主地址范围，释放（Drop）时才用到它
@@ -100,7 +103,19 @@ unsafe impl Sync for HostRegion {}
 
 impl Drop for HostRegion {
     fn drop(&mut self) {
-        let (base, len) = (self.base, self.len);
+        let (base, len, anonymous) = (self.base, self.len, self.anonymous);
+        if let Some(reserve) = anonymous {
+            let deferred = UNMAPPED.with_borrow_mut(|u| {
+                u.as_mut().map(|u| u.anonymous.push((base, len, reserve)))
+            });
+            if deferred.is_some() {
+                UNMAPPING.fetch_add(len, Ordering::Relaxed);
+            } else {
+                // SAFETY: 这段私有匿名宿主内存归这个 HostRegion，已经没有人用它
+                unsafe { recycled::put(base, len, reserve) }
+            }
+            return;
+        }
         let deferred =
             UNMAPPED.with_borrow_mut(|u| u.as_mut().map(|u| u.regions.push((base, len))));
         if deferred.is_some() {
@@ -112,11 +127,72 @@ impl Drop for HostRegion {
     }
 }
 
+/// 交还之后留着复用的私有匿名宿主内存（[`HostRegion::anonymous`]）。所有 guest 进程都在
+/// 同一个宿主进程里，宿主的 mmap、munmap 都要拿这一个进程的 mmap_lock 写锁（原生的每个
+/// 进程各有一把）：musl 的 malloc 和 gcc 的垃圾回收器反复 mmap、munmap 同样大小的块，
+/// `xargs -P4` 编译 Lua 时有十几万次，每次持着 BKL 等宿主的 mmap。交还时只丢弃内容
+/// （`MADV_DONTNEED`，只拿读锁），下一次申请同样大小、同样计不计入提交量的直接用。
+mod recycled {
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
+    use std::sync::Mutex;
+
+    /// 留着的宿主地址空间最多这么大：页已经还给宿主，只占地址空间和一点页表。
+    const MAX_BYTES: usize = 256 << 20;
+    /// 每种大小最多留几段。
+    const MAX_EACH: usize = 32;
+
+    struct Cache {
+        /// (长度, 计不计入提交量) → 起点。
+        free: HashMap<(usize, bool), Vec<usize>>,
+        bytes: usize,
+    }
+
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+    /// 拿一段留着的、内容是零的私有匿名宿主内存。
+    pub(super) fn take(len: usize, reserve: bool) -> Option<NonNull<u8>> {
+        let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let c = cache.as_mut()?;
+        let base = c.free.get_mut(&(len, reserve))?.pop()?;
+        c.bytes -= len;
+        NonNull::new(base as *mut u8)
+    }
+
+    /// 交还一段私有匿名宿主内存：丢弃内容，留着复用，留不下时交还宿主。
+    ///
+    /// # Safety
+    ///
+    /// 这段宿主内存由 [`appine_hal::map_anonymous`] 申请，已经没有人用它。
+    pub(super) unsafe fn put(base: NonNull<u8>, len: usize, reserve: bool) {
+        {
+            let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = cache.get_or_insert_with(|| Cache {
+                free: HashMap::new(),
+                bytes: 0,
+            });
+            let list = c.free.entry((len, reserve)).or_default();
+            if c.bytes + len <= MAX_BYTES && list.len() < MAX_EACH {
+                // SAFETY: 由调用方保证；丢弃之后读到的是零，与新映射的一样
+                if unsafe { appine_hal::discard(base, len) }.is_ok() {
+                    list.push(base.as_ptr() as usize);
+                    c.bytes += len;
+                    return;
+                }
+            }
+        }
+        // SAFETY: 由调用方保证
+        unsafe { appine_hal::unmap(base, len) }
+    }
+}
+
 /// 持有 BKL 时释放、等放开之后再交还的东西。
 #[derive(Default)]
 struct Unmapped {
     /// 宿主内存：(起点, 长度)。
     regions: Vec<(NonNull<u8>, usize)>,
+    /// 留着复用的私有匿名宿主内存（[`recycled`]）：(起点, 长度, 计不计入提交量)。
+    anonymous: Vec<(NonNull<u8>, usize, bool)>,
     /// 销毁的地址空间的页表：逐个释放中间表要好几微秒。
     mmus: Vec<Mmu>,
 }
@@ -259,7 +335,10 @@ pub(crate) mod spare {
                 .position(|&(l, _)| l == host_len)
                 .map(|i| s.maps.swap_remove(i).1)
         };
-        let base = match found.and_then(|b| NonNull::new(b as *mut u8)) {
+        let base = match found
+            .and_then(|b| NonNull::new(b as *mut u8))
+            .or_else(|| super::recycled::take(host_len, false))
+        {
             Some(base) => base,
             None => appine_hal::map_anonymous(host_len, false).map_err(|_| Errno::ENOMEM)?,
         };
@@ -267,6 +346,7 @@ pub(crate) mod spare {
             Arc::new(HostRegion {
                 base,
                 len: host_len,
+                anonymous: Some(false),
             }),
             base,
         ))
@@ -316,6 +396,7 @@ pub(crate) fn defer_unmaps() {
 pub(crate) fn release_unmapped() {
     let Some(Unmapped {
         regions: mut list,
+        anonymous,
         mmus,
     }) = UNMAPPED.with_borrow_mut(Option::take)
     else {
@@ -323,6 +404,12 @@ pub(crate) fn release_unmapped() {
     };
     // 先释放页表，再交还它指向的宿主内存
     drop(mmus);
+    let reused: usize = anonymous.iter().map(|&(_, len, _)| len).sum();
+    for (base, len, reserve) in anonymous {
+        // SAFETY: 释放 HostRegion 时记下的私有匿名宿主内存，已经没有人用它
+        unsafe { recycled::put(base, len, reserve) };
+    }
+    UNMAPPING.fetch_sub(reused, Ordering::Release);
     if list.is_empty() {
         return;
     }
@@ -1450,11 +1537,15 @@ impl Mm {
     /// 计入的话在内存小的宿主上直接失败。
     fn new_anonymous(len: u64, reserve: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
-        let base = appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?;
+        let base = match recycled::take(host_len, reserve) {
+            Some(base) => base,
+            None => appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?,
+        };
         Ok((
             Arc::new(HostRegion {
                 base,
                 len: host_len,
+                anonymous: Some(reserve),
             }),
             base,
         ))
@@ -1721,6 +1812,7 @@ impl Mm {
                     let region = Arc::new(HostRegion {
                         base: m.base,
                         len: m.len,
+                        anonymous: None,
                     });
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
@@ -1955,6 +2047,7 @@ impl Mm {
                 let region = Arc::new(HostRegion {
                     base: m.base,
                     len: m.len,
+                    anonymous: None,
                 });
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
@@ -1970,6 +2063,7 @@ impl Mm {
                 let region = Arc::new(HostRegion {
                     base: m.base,
                     len: m.len,
+                    anonymous: None,
                 });
                 (region, m.ptr, None, file_extent(fd, file_offset, len))
             }

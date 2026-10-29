@@ -1,6 +1,6 @@
 # M9 之前：同一个程序共用翻译（2026-10-30）
 
-← [M9 之前：翻译代码的密度（2026-10-30）](107-code-density.md) · [索引](../milestones.md)
+← [M9 之前：翻译代码的密度（2026-10-30）](107-code-density.md) · [索引](../milestones.md) · [M9 之前：起进程和 mmap 的持锁时间（2026-10-30）](109-spawn-mmap-bkl.md) →
 
 [第二轮普查](70-survey-suites.md)的问题 5：每个进程各一份 Tier 1 的翻译。[上一轮](107-code-density.md)之后，`xargs -P4` 编译 Lua 时四个 cc1 各占 34–40 MB 代码缓存，峰值 155 MB；20 个空闲的 python3 各约 4 MB。手机上 `make -j8` 就是 300 多 MB。
 
