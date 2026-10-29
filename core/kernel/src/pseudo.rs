@@ -228,7 +228,7 @@ const SYS_NET_DIR: &[u8] = b"class/net/";
 /// `/sys/class/net/<接口>` 下的目录和文件（相对接口目录的路径），取值见 [`net_file`]。
 /// Linux 上的接口目录是指向 `/sys/devices` 下面的符号链接，这里是目录：宿主上的设备路径
 /// 拿不到。
-const NET_FILES: [&[u8]; 35] = [
+const NET_FILES: [&[u8]; 36] = [
     b"addr_len",
     b"address",
     b"broadcast",
@@ -238,6 +238,7 @@ const NET_FILES: [&[u8]; 35] = [
     b"iflink",
     b"mtu",
     b"operstate",
+    b"tx_queue_len",
     b"type",
     b"statistics/",
     b"statistics/collisions",
@@ -2274,9 +2275,16 @@ fn net_file(k: &Kernel, index: u32, path: &[u8]) -> Result<String, Errno> {
         b"flags" => format!("{:#x}\n", i.flags & !STATE_FLAGS),
         b"ifindex" | b"iflink" => format!("{index}\n"),
         b"mtu" => format!("{}\n", i.mtu),
-        b"operstate" if loopback => "unknown\n".to_owned(),
-        b"operstate" if i.flags & IFF_UP != 0 && i.flags & IFF_RUNNING != 0 => "up\n".to_owned(),
-        b"operstate" => "down\n".to_owned(),
+        b"operstate" => match crate::net::operstate(&i) {
+            0 => "unknown\n",
+            6 => "up\n",
+            _ => "down\n",
+        }
+        .to_owned(),
+        b"tx_queue_len" => format!(
+            "{}\n",
+            appine_hal::net::tx_queue_len(&i.name).unwrap_or(1000)
+        ),
         b"type" => format!("{}\n", if loopback { 772 } else { 1 }),
         b"statistics/rx_bytes" => format!("{}\n", st.rx_bytes),
         b"statistics/rx_packets" => format!("{}\n", st.rx_packets),

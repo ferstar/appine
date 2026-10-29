@@ -355,14 +355,38 @@ const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const IFLA_QDISC: u16 = 6;
 const IFLA_STATS: u16 = 7;
+const IFLA_TXQLEN: u16 = 13;
+const IFLA_OPERSTATE: u16 = 16;
+const IFLA_LINKMODE: u16 = 17;
 const IFLA_STATS64: u16 = 23;
+const IFLA_GROUP: u16 = 27;
+const IFLA_PROMISCUITY: u16 = 30;
+const IFLA_NUM_TX_QUEUES: u16 = 31;
+const IFLA_NUM_RX_QUEUES: u16 = 32;
+const IFLA_CARRIER: u16 = 33;
+const IFLA_PROTO_DOWN: u16 = 39;
+/// `IF_OPER_*`（RFC 2863 的接口状态）。
+const IF_OPER_UNKNOWN: u8 = 0;
+const IF_OPER_DOWN: u8 = 2;
+const IF_OPER_UP: u8 = 6;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
+const IFA_BROADCAST: u16 = 4;
+const IFA_CACHEINFO: u16 = 6;
+const IFA_FLAGS: u16 = 8;
+const IFA_PROTO: u16 = 11;
+/// 地址是内核加的：回环接口的 `::1`、自动配置的链路本地地址（`IFAPROT_KERNEL_*`）。
+const IFAPROT_KERNEL_LO: u8 = 1;
+const IFAPROT_KERNEL_LL: u8 = 3;
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
+const IFF_UP: u32 = 0x1;
+const IFF_BROADCAST: u32 = 0x2;
 const IFF_LOOPBACK: u32 = 0x8;
+const IFF_RUNNING: u32 = 0x40;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_HOST: u8 = 254;
@@ -413,7 +437,23 @@ fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
     }
 }
 
-fn link_message(i: &Interface, st: IfStats) -> Vec<u8> {
+/// 接口的状态（`IFLA_OPERSTATE`）：与 `/sys/class/net/<接口>/operstate` 一样，回环接口是
+/// unknown（Linux 的回环驱动不设置它），启用并且连着的是 up，别的是 down。
+pub(crate) fn operstate(i: &Interface) -> u8 {
+    if i.flags & IFF_LOOPBACK != 0 {
+        IF_OPER_UNKNOWN
+    } else if i.flags & IFF_UP != 0 && i.flags & IFF_RUNNING != 0 {
+        IF_OPER_UP
+    } else {
+        IF_OPER_DOWN
+    }
+}
+
+/// 一个接口的 `RTM_NEWLINK`（Linux 的 `rtnl_fill_ifinfo`，属性的顺序相同）：`ip link` 用到
+/// 的和程序常读的几项，`IFLA_AF_SPEC` 这些设备参数没有。发送队列长度 `txqlen` 取自宿主，
+/// 取不到时是 Linux 的默认值 1000；guest 的数据包交给宿主 socket，接口上没有自己的排队
+/// 规则，qdisc 都是 noqueue。
+fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
     let loopback = i.flags & IFF_LOOPBACK != 0;
     // struct ifinfomsg：family、pad、type、index、flags、change
     let mut p = vec![0u8, 0];
@@ -429,32 +469,63 @@ fn link_message(i: &Interface, st: IfStats) -> Vec<u8> {
     let mut name = i.name.clone().into_bytes();
     name.push(0);
     attr(&mut p, IFLA_IFNAME, &name);
+    attr(&mut p, IFLA_TXQLEN, &txqlen.unwrap_or(1000).to_le_bytes());
+    attr(&mut p, IFLA_OPERSTATE, &[operstate(i)]);
+    attr(&mut p, IFLA_LINKMODE, &[0]);
     attr(&mut p, IFLA_MTU, &i.mtu.to_le_bytes());
+    attr(&mut p, IFLA_GROUP, &0u32.to_le_bytes());
+    attr(&mut p, IFLA_PROMISCUITY, &0u32.to_le_bytes());
+    attr(&mut p, IFLA_NUM_TX_QUEUES, &1u32.to_le_bytes());
+    attr(&mut p, IFLA_NUM_RX_QUEUES, &1u32.to_le_bytes());
+    attr(
+        &mut p,
+        IFLA_CARRIER,
+        &[u8::from(i.flags & IFF_RUNNING != 0)],
+    );
+    attr(&mut p, IFLA_QDISC, b"noqueue\0");
+    attr(&mut p, IFLA_PROTO_DOWN, &[0]);
     let mac = i.mac.unwrap_or([0; 6]);
     attr(&mut p, IFLA_ADDRESS, &mac);
     let bcast = if loopback { [0; 6] } else { [0xff; 6] };
     attr(&mut p, IFLA_BROADCAST, &bcast);
-    // 流量计数（crate::traffic）：struct rtnl_link_stats 是 24 个 u32，rtnl_link_stats64
-    // 在 Linux 6.1 是 25 个 u64；前四项依次是收、发的包数和收、发的字节数，别的都是 0
+    // 流量计数（crate::traffic）：struct rtnl_link_stats64 在 Linux 6.1 是 25 个 u64，
+    // rtnl_link_stats 是 24 个 u32；前四项依次是收、发的包数和收、发的字节数，别的都是 0
     let head = [st.rx_packets, st.tx_packets, st.rx_bytes, st.tx_bytes];
     let field = |n: usize| head.get(n).copied().unwrap_or(0);
+    let stats64: Vec<u8> = (0..25).flat_map(|n| field(n).to_le_bytes()).collect();
+    attr(&mut p, IFLA_STATS64, &stats64);
     let stats: Vec<u8> = (0..24)
         .flat_map(|n| (field(n) as u32).to_le_bytes())
         .collect();
     attr(&mut p, IFLA_STATS, &stats);
-    let stats64: Vec<u8> = (0..25).flat_map(|n| field(n).to_le_bytes()).collect();
-    attr(&mut p, IFLA_STATS64, &stats64);
     p
 }
 
+/// IPv4 地址 `addr`/`prefix` 的广播地址：接口支持广播、网段里不止两个地址时是网段最后
+/// 一个地址（DHCP 和 `ip addr add ... brd +` 设的就是它），与本地表里的广播路由一致。
+fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
+    if i.flags & IFF_BROADCAST == 0 || prefix >= 31 {
+        return None;
+    }
+    let ip = u32::from_be_bytes(addr.try_into().ok()?);
+    Some((ip | u32::MAX >> prefix).to_be_bytes())
+}
+
+/// 一个接口上的 `RTM_NEWADDR`（Linux 的 `inet_fill_ifaddr`、`inet6_fill_ifaddr`，属性的顺序
+/// 相同）。地址都当作不会过期的（`IFA_F_PERMANENT`，`ip addr` 显示 forever），创建和更新
+/// 的时刻不知道，是 0。
 fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
+    // struct ifa_cacheinfo：preferred、valid（全 1 是永久）、cstamp、tstamp
+    let mut cacheinfo = [0xffu8; 16];
+    cacheinfo[8..].fill(0);
     i.addrs
         .iter()
         .filter(|(f, ..)| family == 0 || *f as u8 == family)
         .map(|(f, addr, prefix)| {
+            let link_local = *f == AF_INET6 && addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
             let scope = if i.flags & IFF_LOOPBACK != 0 {
                 RT_SCOPE_HOST
-            } else if *f == AF_INET6 && addr[0] == 0xfe && addr[1] & 0xc0 == 0x80 {
+            } else if link_local {
                 RT_SCOPE_LINK
             } else {
                 RT_SCOPE_UNIVERSE
@@ -462,13 +533,27 @@ fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
             // struct ifaddrmsg：family、prefixlen、flags、scope、index
             let mut p = vec![*f as u8, *prefix, IFA_F_PERMANENT, scope];
             p.extend_from_slice(&i.index.to_le_bytes());
+            let flags = u32::from(IFA_F_PERMANENT).to_le_bytes();
             attr(&mut p, IFA_ADDRESS, addr);
             if *f == AF_INET {
                 attr(&mut p, IFA_LOCAL, addr);
+                if let Some(b) = broadcast_of(i, addr, *prefix) {
+                    attr(&mut p, IFA_BROADCAST, &b);
+                }
+                let mut name = i.name.clone().into_bytes();
+                name.push(0);
+                attr(&mut p, IFA_LABEL, &name);
+                attr(&mut p, IFA_FLAGS, &flags);
+                attr(&mut p, IFA_CACHEINFO, &cacheinfo);
+            } else {
+                attr(&mut p, IFA_CACHEINFO, &cacheinfo);
+                attr(&mut p, IFA_FLAGS, &flags);
+                if i.flags & IFF_LOOPBACK != 0 {
+                    attr(&mut p, IFA_PROTO, &[IFAPROT_KERNEL_LO]);
+                } else if link_local {
+                    attr(&mut p, IFA_PROTO, &[IFAPROT_KERNEL_LL]);
+                }
             }
-            let mut name = i.name.clone().into_bytes();
-            name.push(0);
-            attr(&mut p, IFA_LABEL, &name);
             p
         })
         .collect()
@@ -628,6 +713,8 @@ pub(crate) trait Host {
     fn stats(&self, name: &str) -> IfStats;
     /// 宿主主表里的路由，None 时按接口的地址合成（[`crate::route`]）。
     fn routes(&self) -> Option<Vec<Route>>;
+    /// 接口的发送队列长度（`IFLA_TXQLEN`），取不到时是 None。
+    fn tx_queue_len(&self, name: &str) -> Option<u32>;
     /// 发请求的进程的用户 ID（`ip route get` 回答里的 RTA_UID）。
     fn uid(&self) -> u32;
 }
@@ -678,20 +765,68 @@ impl NetlinkSocket {
         let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
         let dump = flags & NLM_F_DUMP != 0;
         match ty {
-            RTM_GETLINK | RTM_GETADDR if dump => {
+            // 与 Linux 一样，接口是一个数据报；地址每个地址族一个（AF_UNSPEC 时先是 IPv4），
+            // NLMSG_DONE 另是一个
+            RTM_GETLINK if dump => {
                 let mut out = Vec::new();
                 for i in &host.interfaces() {
-                    if ty == RTM_GETLINK {
-                        let st = host.stats(&i.name);
-                        out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &link_message(i, st)));
-                    } else {
-                        for m in addr_messages(i, family as u8) {
-                            out.extend(reply(RTM_NEWADDR, NLM_F_MULTI, &m));
-                        }
+                    let m = link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name));
+                    out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &m));
+                }
+                if out.is_empty() {
+                    vec![done()]
+                } else {
+                    vec![out, done()]
+                }
+            }
+            RTM_GETADDR if dump => {
+                let ifaces = host.interfaces();
+                let mut out = Vec::new();
+                for f in [AF_INET, AF_INET6] {
+                    if family != 0 && family != f {
+                        continue;
+                    }
+                    let d: Vec<u8> = ifaces
+                        .iter()
+                        .flat_map(|i| addr_messages(i, f as u8))
+                        .flat_map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m))
+                        .collect();
+                    if !d.is_empty() {
+                        out.push(d);
                     }
                 }
-                out.extend(done());
-                vec![out]
+                out.push(done());
+                out
+            }
+            // `ip link show <接口>`：按 ifi_index 或者 IFLA_IFNAME 找（Linux 的 rtnl_getlink）
+            RTM_GETLINK => {
+                const ENODEV: i32 = 19;
+                let index = req
+                    .get(20..24)
+                    .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
+                let name = crate::route::attrs(req.get(32..).unwrap_or_default())
+                    .into_iter()
+                    .find(|(t, _)| *t == IFLA_IFNAME)
+                    .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default().to_vec());
+                if index <= 0 && name.is_none() {
+                    return vec![ack(req, EINVAL, self.pid)];
+                }
+                let found = host.interfaces().into_iter().find(|i| {
+                    if index > 0 {
+                        i.index as i32 == index
+                    } else {
+                        name.as_deref() == Some(i.name.as_bytes())
+                    }
+                });
+                let Some(i) = found else {
+                    return vec![ack(req, ENODEV, self.pid)];
+                };
+                let m = link_message(&i, host.stats(&i.name), host.tx_queue_len(&i.name));
+                let mut out = vec![reply(RTM_NEWLINK, 0, &m)];
+                if flags & NLM_F_ACK != 0 {
+                    out.push(ack(req, 0, self.pid));
+                }
+                out
             }
             // 与 Linux 一样，每个地址族的路由是一个数据报，NLMSG_DONE 另是一个
             RTM_GETROUTE if dump => {
@@ -817,6 +952,9 @@ mod tests {
         fn routes(&self) -> Option<Vec<Route>> {
             self.routes.clone()
         }
+        fn tx_queue_len(&self, _: &str) -> Option<u32> {
+            None
+        }
         fn uid(&self) -> u32 {
             0
         }
@@ -870,9 +1008,23 @@ mod tests {
                 routes: None,
             },
         );
-        let links = parse(&s.queue.pop_front().unwrap());
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].0, RTM_NEWLINK);
+        // 接口、NLMSG_DONE、IPv4 地址、NLMSG_DONE 各是一个数据报
+        let datagrams: Vec<_> = s.queue.drain(..).map(|d| parse(&d)).collect();
+        let types: Vec<Vec<u16>> = datagrams
+            .iter()
+            .map(|d| d.iter().map(|m| m.0).collect())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                vec![RTM_NEWLINK],
+                vec![NLMSG_DONE],
+                vec![RTM_NEWADDR],
+                vec![NLMSG_DONE]
+            ]
+        );
+        let links = &datagrams[0];
+        assert!(links[0].1.windows(3).any(|w| w == b"lo\0"));
         assert!(links[0].1.windows(3).any(|w| w == b"lo\0"));
         // IFLA_STATS 截成 32 位，IFLA_STATS64 是完整的
         let attrs = attributes(&links[0].1[16..]);
@@ -886,12 +1038,42 @@ mod tests {
         assert_eq!(u32s(5), [3, 4, 1000, 2, 0]);
         assert_eq!(attrs[&IFLA_STATS64].len(), 200);
         assert_eq!(attrs[&IFLA_STATS64][24..32], 0x1_0000_0002u64.to_le_bytes());
-        assert_eq!(links[1].0, NLMSG_DONE);
-        // 只要 IPv4 地址
-        let addrs = parse(&s.queue.pop_front().unwrap());
-        assert_eq!(addrs.len(), 2);
-        assert_eq!(addrs[0].1[..2], [AF_INET as u8, 8]);
-        assert!(addrs[0].1.windows(4).any(|w| w == [127, 0, 0, 1]));
+        assert_eq!(attrs[&IFLA_OPERSTATE], [IF_OPER_UNKNOWN]);
+        assert_eq!(attrs[&IFLA_QDISC], b"noqueue\0");
+        assert_eq!(attrs[&IFLA_TXQLEN], 1000u32.to_le_bytes());
+        // 只要 IPv4 地址：回环接口没有广播地址，地址是永久的
+        let addrs = &datagrams[2];
+        assert_eq!(
+            addrs[0].1[..4],
+            [AF_INET as u8, 8, IFA_F_PERMANENT, RT_SCOPE_HOST]
+        );
+        let a = attributes(&addrs[0].1[8..]);
+        assert_eq!(a[&IFA_LOCAL], [127, 0, 0, 1]);
+        assert!(!a.contains_key(&IFA_BROADCAST));
+        assert_eq!(a[&IFA_FLAGS], u32::from(IFA_F_PERMANENT).to_le_bytes());
+        assert_eq!(a[&IFA_CACHEINFO][..8], [0xff; 8]);
+        // 单条查询：按编号、按名字；查不到是 ENODEV，没有条件是 EINVAL
+        let get = |index: i32, name: Option<&[u8]>| {
+            let mut p = vec![0u8, 0, 0, 0];
+            p.extend_from_slice(&index.to_le_bytes());
+            p.extend_from_slice(&[0; 8]);
+            if let Some(n) = name {
+                attr(&mut p, IFLA_IFNAME, n);
+            }
+            message(RTM_GETLINK, NLM_F_REQUEST, 9, 0, &p)
+        };
+        let mut ask = |req: Vec<u8>| -> (u16, Vec<u8>) {
+            s.handle(&req, &NOTHING);
+            let d = parse(&s.queue.pop_front().unwrap());
+            assert!(s.queue.is_empty());
+            d[0].clone()
+        };
+        assert_eq!(ask(get(1, None)).0, RTM_NEWLINK);
+        assert_eq!(ask(get(0, Some(b"lo\0"))).0, RTM_NEWLINK);
+        let errno = |m: (u16, Vec<u8>)| i32::from_le_bytes(m.1[..4].try_into().unwrap());
+        assert_eq!(errno(ask(get(0, Some(b"eth9\0")))), -19);
+        assert_eq!(errno(ask(get(7, None))), -19);
+        assert_eq!(errno(ask(get(0, None))), -22);
     }
 
     /// 路由、规则的转储：每个地址族一个数据报，NLMSG_DONE 另是一个；邻居表是空的；不支持的

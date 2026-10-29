@@ -353,7 +353,7 @@ pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
 }
 
 /// 消息里的属性：(类型, 内容)。
-fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
+pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
     let mut out = Vec::new();
     while b.len() >= 4 {
         let len = u16::from_le_bytes([b[0], b[1]]) as usize;

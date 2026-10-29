@@ -39,7 +39,7 @@
 
 **推迟项**：
 
-- `RTM_NEWADDR` 少了 `IFA_BROADCAST`、`IFA_FLAGS`、`IFA_CACHEINFO`（[M4](06-m4.md) 起）：`ip addr` 不显示 `brd`，原生的地址消息长 76、88 字节，appine 的短一些。
+- `RTM_NEWADDR` 少了 `IFA_BROADCAST`、`IFA_FLAGS`、`IFA_CACHEINFO`（[M4](06-m4.md) 起）：`ip addr` 不显示 `brd`，原生的地址消息长 76、88 字节，appine 的短一些。→ 已补上（M9 之前：接口和地址的 netlink 消息），地址消息与 Linux 逐字节相同；链路消息也补了 `ip link` 用到的属性，iproute2 的单条 `RTM_GETLINK` 也能用了
 - `/proc/net` 仍没有 `snmp`、`netstat`、`arp` 等（原生的容器里 57 个文件，这里 15 个）：iproute2 的 `ss -s` 的汇总要读 `snmp` 里的 `CurrEstab`。
 - 主表的细节：
   - Android 上只有默认网络的路由。VPN 之外别的网络（同时连着的 Wi-Fi 和蜂窝）、464xlat 叠加链路（clat）的路由都没有，`getRoutes()` 不含它们。

@@ -929,6 +929,175 @@ C
 gcc -O1 -o route route.c
 ./route
 
+# 接口和地址：RTM_GETADDR 的转储（IPv4、IPv6）逐字节比对，ifa_cacheinfo 里创建、更新的时刻
+# 不比；RTM_GETLINK 的转储比对 ifinfomsg 和 ip link 用到的几个属性（Linux 还有设备参数等
+# 四十来个属性，这里没有）；不带 NLM_F_DUMP 的 RTM_GETLINK 按编号、名字查，查不到、
+# 没给条件、要确认。本机地址打印成 SELF，接口编号打印成名字，MAC 地址只看长度
+cat > links.c <<'C'
+#include <errno.h>
+#include <net/if.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+struct nlmsghdr {
+    uint32_t nlmsg_len;
+    uint16_t nlmsg_type, nlmsg_flags;
+    uint32_t nlmsg_seq, nlmsg_pid;
+};
+
+static int fd;
+static unsigned char self[4];
+
+static void request(int type, int flags, int family, int index, const char *name)
+{
+    unsigned char req[64] = {0};
+    struct nlmsghdr *h = (void *)req;
+    int hl = type == 18 ? 16 : 8;
+    h->nlmsg_len = 16 + hl;
+    h->nlmsg_type = type;
+    h->nlmsg_flags = 1 | flags;
+    h->nlmsg_seq = 1;
+    req[16] = family;
+    if (type == 18)
+        memcpy(req + 20, &index, 4);
+    if (name) {
+        int n = strlen(name) + 1;
+        uint16_t len = 4 + n, ty = 3;
+        memcpy(req + h->nlmsg_len, &len, 2);
+        memcpy(req + h->nlmsg_len + 2, &ty, 2);
+        memcpy(req + h->nlmsg_len + 4, name, n);
+        h->nlmsg_len += (len + 3) & ~3;
+    }
+    send(fd, req, h->nlmsg_len, 0);
+}
+
+static void index_name(const unsigned char *p)
+{
+    int index;
+    char name[IF_NAMESIZE] = "?";
+    memcpy(&index, p, 4);
+    if_indextoname(index, name);
+    printf(" index=%s", name);
+}
+
+/* 链路消息里比的属性：名字、txqlen、operstate、linkmode、mtu、group、promiscuity、carrier、
+ * qdisc、proto_down；地址只看长度。收发队列数不比：docker 的 veth 按 CPU 数分配 */
+static int shown_link(int t)
+{
+    return t == 3 || t == 13 || t == 16 || t == 17 || t == 4 || t == 27 || t == 30 || t == 33 ||
+           t == 6 || t == 39;
+}
+
+static void message(struct nlmsghdr *h)
+{
+    unsigned char *p = (void *)(h + 1);
+    int link = h->nlmsg_type == 16, hl = link ? 16 : 8;
+    printf(" type %d flags %#x\n  hdr", h->nlmsg_type, h->nlmsg_flags);
+    for (int i = 0; i < hl; i++)
+        if (!(link ? i >= 4 && i < 8 : i >= 4))
+            printf(" %02x", p[i]);
+    index_name(p + 4);
+    printf("\n");
+    for (unsigned off = 16 + hl; off + 4 <= h->nlmsg_len;) {
+        uint16_t len, t;
+        memcpy(&len, (char *)h + off, 2);
+        memcpy(&t, (char *)h + off + 2, 2);
+        unsigned char *d = (unsigned char *)h + off + 4;
+        int n = len - 4;
+        if (!link || shown_link(t & 0x3fff)) {
+            printf("  %d:", t & 0x3fff);
+            if (n == 4 && !memcmp(d, self, 4))
+                printf(" SELF");
+            else if (!link && t == 6 && n == 16)
+                for (int i = 0; i < 8; i++)
+                    printf(" %02x", d[i]);
+            else
+                for (int i = 0; i < n; i++)
+                    printf(" %02x", d[i]);
+            printf("\n");
+        } else if (t == 1 || t == 2) {
+            printf("  %d: %d bytes\n", t, n);
+        }
+        off += (len + 3) & ~3;
+    }
+}
+
+static void replies(const char *what)
+{
+    unsigned char buf[65536];
+    printf("%s\n", what);
+    for (;;) {
+        int n = recv(fd, buf, sizeof buf, 0);
+        if (n < 0) {
+            printf(" recv errno %d\n", errno);
+            return;
+        }
+        printf(" datagram\n");
+        for (struct nlmsghdr *h = (void *)buf; n >= 16 && h->nlmsg_len <= (unsigned)n;) {
+            if (h->nlmsg_type == 3) {
+                printf(" done\n");
+                return;
+            }
+            if (h->nlmsg_type == 2) {
+                printf(" error %d flags %#x, %u bytes\n", *(int *)(h + 1), h->nlmsg_flags, h->nlmsg_len);
+                return;
+            }
+            message(h);
+            if (!(h->nlmsg_flags & 2))
+                return;
+            int len = (h->nlmsg_len + 3) & ~3;
+            n -= len;
+            h = (void *)((char *)h + len);
+        }
+    }
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    struct ifreq ifr = {0};
+    strcpy(ifr.ifr_name, "eth0");
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    ioctl(s, SIOCGIFADDR, &ifr);
+    memcpy(self, &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr, 4);
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0);
+    struct timeval tv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    request(22, 0x300, AF_INET, 0, NULL);
+    replies("addresses: IPv4");
+    request(22, 0x300, AF_INET6, 0, NULL);
+    replies("addresses: IPv6");
+    request(18, 0x300, 0, 0, NULL);
+    replies("links");
+    request(18, 0, 0, 1, NULL);
+    replies("link 1");
+    request(18, 0, 0, 0, "eth0");
+    replies("link eth0");
+    request(18, 0, 0, 0, "nosuch0");
+    replies("link nosuch0");
+    request(18, 0, 0, 0, NULL);
+    replies("link without index or name");
+    request(18, 4, 0, 1, NULL);
+    replies("link 1 with ACK");
+    replies("ACK");
+    return 0;
+}
+C
+gcc -O1 -o links links.c
+./links
+# busybox 的 ip：MAC 地址和 docker 的 veth 特有的 @ifN、M-DOWN 不比
+self=$(ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
+norm() { sed -e "s/$self/SELF/g" -e 's/@if[0-9]*//' -e 's/,M-DOWN//' -e 's|link/ether [0-9a-f:]*|link/ether MAC|'; }
+ip addr | norm
+ip link | norm
+cat /sys/class/net/lo/tx_queue_len /sys/class/net/lo/operstate
+
 # 同样的表经由 busybox 的 ip、route、netstat 和 /proc/net 读出来；本机地址换成 SELF，
 # ipv6_route 的引用数不比
 self=$(ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')

@@ -503,6 +503,10 @@ impl crate::net::Host for KernelHost<'_> {
         crate::route::host_routes(self.k)
     }
 
+    fn tx_queue_len(&self, name: &str) -> Option<u32> {
+        appine_hal::net::tx_queue_len(name)
+    }
+
     fn uid(&self) -> u32 {
         self.uid
     }

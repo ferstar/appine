@@ -1,6 +1,6 @@
 # M9 之前：文件能力（2026-10-29）
 
-← [M9 之前：App 里选 rootfs（2026-10-29）](99-choose-rootfs.md) · [索引](../milestones.md)
+← [M9 之前：App 里选 rootfs（2026-10-29）](99-choose-rootfs.md) · [索引](../milestones.md) · [M9 之前：接口和地址的 netlink 消息（2026-10-29）](101-link-addr.md) →
 
 [M6](08-m6.md) 起的推迟项"文件能力和环境能力仍没有"，设计文档 §11.1 也写着 v1 不支持。程序文件的能力存在扩展属性 `security.capability` 里，比如 iputils-ping 的安装脚本用 setcap 给 ping 加 `cap_net_raw`，原来 appine 把它当普通的扩展属性存下来，execve 时不看。App 默认以 root 登录，root 本来就有全部能力；普通用户才用得上文件能力，比如 Debian 里 su 成别的用户、sshd 登录的用户，以及以后的"以指定用户登录"。
 

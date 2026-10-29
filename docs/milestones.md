@@ -109,6 +109,7 @@
 | [M9 之前：路由表](rounds/98-routes.md) | 2026-10-29 | 主表取自宿主（Android 上 App 从默认网络的 `LinkProperties` 交来，别处读宿主的 `/proc/net/route`），本地表按接口的地址合成：`ip route`、`ip route get`（原来 EOPNOTSUPP）、`ip rule`、`route -n`、`/proc/net/route`、`ipv6_route` 与 Linux 逐字节相同；`ip neigh` 是空表，新增 `/proc/net/sockstat`；NETLINK_ROUTE 的错误附上整条请求 |
 | [M9 之前：App 里选 rootfs](rounds/99-choose-rootfs.md) | 2026-10-29 | 首次启动选 Alpine、Debian 13 或 Ubuntu 24.04，后两个选了才下载（版本、sha256 固定，按吞吐量测速选来源，断点续传），菜单里可以重置 rootfs；登录 shell 取 `/etc/passwd` 里 root 的（Debian、Ubuntu 是 bash）；JNI 的句柄改为登记表，修了重置、服务销毁时用到已经释放的 Machine |
 | [M9 之前：文件能力](rounds/100-file-caps.md) | 2026-10-29 | execve 按 Linux 6.1 的规则算上程序文件的能力（`security.capability`）和环境能力，securebits 起作用；扩展属性按 `xattr_permission` 检查权限（原来不查）；写、截短、chown 时去掉文件能力和 setuid、setgid 位（原来写文件不去掉） |
+| [M9 之前：接口和地址的 netlink 消息](rounds/101-link-addr.md) | 2026-10-29 | 地址消息补上广播地址、标志、`ifa_cacheinfo`，与 Linux 逐字节相同；链路消息补上状态、qdisc、发送队列长度等，`ip addr`、`ip link` 显示 `brd`、`state UP`；iproute2 的 `ip link show eth0` 发的单条 `RTM_GETLINK` 原来是 EOPNOTSUPP |
 
 ## 测量条件
 

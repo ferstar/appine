@@ -306,6 +306,19 @@ pub struct Route {
     pub metric: u32,
 }
 
+/// 宿主上接口 `name` 的发送队列长度（`/sys/class/net/<接口>/tx_queue_len`）；读不到时
+/// （Android 上 App 可能读不了 sysfs 的这些文件）是 None。
+pub fn tx_queue_len(name: &str) -> Option<u32> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{name}/tx_queue_len"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// 宿主主表里的单播路由：读宿主的 `/proc/net/route`、`/proc/net/ipv6_route`。读不到时
 /// （Android 10 起 App 读不了 `/proc/net`，macOS 没有这两个文件）是 None。
 pub fn routes() -> Option<Vec<Route>> {
