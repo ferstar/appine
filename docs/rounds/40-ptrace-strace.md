@@ -9,7 +9,7 @@ ptrace 原来一律返回 EPERM，gdb、strace 都不能用（[M6](08-m6.md)、[
   - 信号投递停止之后，跟踪者可以换掉信号或者不投递；换了信号又没有用 PTRACE_SETSIGINFO 给 siginfo 时，当作跟踪者用 kill 发的；换成的信号被屏蔽着就重新挂起。跟踪者给的 siginfo 原样投递（`InfoFields::Raw`）。
   - 被跟踪的线程不丢弃被忽略的信号（SIGCHLD、SIGCONT 这些默认忽略的也是），跟踪者要看到它们。group-stop 时被跟踪的线程停在 ptrace-stop 里报告，跟踪者让它继续它就继续执行，即使线程组仍然停着；阻塞着的系统调用因此只在要参加 group-stop、或者跟踪者 PTRACE_INTERRUPT 时提前返回（`signal::interrupted`）。SEIZE 跟踪的报告成 `PTRACE_EVENT_STOP`，PTRACE_LISTEN 之后 SIGCONT 让它重新报告一次（`SIGTRAP`）。
   - clone 时父线程被跟踪、打开了对应的事件（或者用了 `CLONE_PTRACE`）、没有 `CLONE_UNTRACED`，新线程由同一个跟踪者跟踪，执行第一条指令之前先停下：SEIZE 的停一次 `PTRACE_EVENT_STOP`，否则挂一个 SIGSTOP。
-  - 被跟踪的线程退出时：不是主线程的单独报告给跟踪者（`Kernel::trace_exits`）；主线程记下跟踪者，整个进程结束时跟踪者不是父进程的话也报告给它。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪；停在信号投递停止里的信号照常投递，跟踪者改过的寄存器照样写回（PTRACE_DETACH 也是）。
+  - 被跟踪的线程退出时：不是主线程的单独报告给跟踪者（`Kernel::trace_exits`）；主线程记下跟踪者，整个进程结束时跟踪者不是父进程的话也报告给它。跟踪者退出时，设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪；停在信号投递停止里的信号照常投递，跟踪者改过的寄存器照样写回（PTRACE_DETACH 也是）。→ 已改正（M9 之前：跟踪者退出时丢掉已经取走的信号）：停住已经被 wait 取走的，Linux 上信号丢掉
   - 跟踪者用 PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径（`Task::syscall_traced`，不持 BKL 的路径读它）；vDSO 里读时钟的存根不停，与 Linux 上它们不进内核、strace 看不到一样。
   - 被跟踪的线程停着时 `/proc/<pid>/stat`、`status` 的状态是 `t (tracing stop)`，`TracerPid` 是跟踪者。
 - **跟踪者的一方**（`syscall/ptrace.rs`）：PTRACE_TRACEME、ATTACH、SEIZE、INTERRUPT、LISTEN、DETACH、CONT、SYSCALL、KILL、SETOPTIONS、GETEVENTMSG、GETSIGINFO、SETSIGINFO、GETREGSET、SETREGSET、GETSIGMASK、SETSIGMASK、GET_SYSCALL_INFO、PEEKTEXT、PEEKDATA。错误码按 Linux：不是自己跟踪的、或者没有停着（LISTEN 时也算没停）是 ESRCH，SEIZE 不认得的选项是 EIO、SETOPTIONS 的是 EINVAL，regset 的长度不是元素大小的整数倍是 EINVAL，PEEKUSR 这些 arm64 上没有的请求是 EIO。

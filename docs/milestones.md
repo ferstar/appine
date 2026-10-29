@@ -103,6 +103,7 @@
 | [M9 之前：调试器、valgrind 和 headless Chromium](rounds/92-debuggers-valgrind-chromium.md) | 2026-10-29 | 在 Debian 仓库里跑 delve、lldb、valgrind（memcheck、helgrind、drd、massif、callgrind）和 headless Chromium（命令行、Puppeteer、Playwright），与原生的 Debian 容器对照；找到内核层的 3 个问题（下面三轮），修好之后都与原生相同 |
 | [M9 之前：`/proc/<pid>/fd` 和 maps 里的路径解析符号链接](rounds/93-fd-paths-resolve-symlinks.md) | 2026-10-29 | 打开的文件、mmap 的文件和解释器的映射与 Linux 的 `d_path` 一样显示解析完符号链接的路径（原来是词法规范化的）：valgrind 按它带着 `O_NOFOLLOW` 重新打开 Debian 的 ld.so，原来 ELOOP，memcheck 多报几千个错误；开销在误差范围内 |
 | [M9 之前：`/proc/<pid>/task` 的链接数](rounds/94-task-dir-links.md) | 2026-10-29 | task 目录的链接数是 2 加线程数（原来总是 2）：Chromium 的 zygote fork 之前按它判断自己是不是单线程，原来一启动就崩溃 |
+| [M9 之前：跟踪者退出时丢掉已经取走的信号](rounds/95-tracer-exit-drops-signal.md) | 2026-10-29 | 跟踪者不 detach 就退出时，已经被 wait 取走的信号投递停止里的信号丢掉，与 Linux 6.8 实测的相同（原来照 ptrace(2) 投递）：delve attach 之后读到 EOF 退出，进程原来被 SIGSTOP 停住 |
 
 ## 测量条件
 

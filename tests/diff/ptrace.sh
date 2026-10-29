@@ -1221,3 +1221,94 @@ int main(void)
 }
 C
 gcc -O1 -o procmem procmem.c && ./procmem
+
+# 跟踪者不 detach 就退出：停住已经被 wait 取走的，信号投递停止里的信号丢掉，进程继续运行
+# （delve attach 之后不 detach 就退出）；还没取走的照常投递；group-stop 里的仍然停着
+cat > implicit.c <<'C'
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+    write(1, "  child: handler ran\n", 21);
+}
+
+static char state(pid_t p)
+{
+    char path[64], buf[256], c = '?';
+    snprintf(path, sizeof path, "/proc/%d/stat", p);
+    FILE *f = fopen(path, "r");
+    if (f && fgets(buf, sizeof buf, f))
+        sscanf(buf, "%*d %*s %c", &c);
+    if (f)
+        fclose(f);
+    return c;
+}
+
+/* sig: 跟踪者先让它继续，再发 sig，等到 sig 的信号投递停止之后退出（unwaited 时不 wait，
+ * 等 0.1 秒就退出）；0 表示停在 attach 的 SIGSTOP 上；-1 表示把 SIGSTOP 注入回去，等它进入
+ * group-stop 之后退出 */
+static void run(const char *what, int sig, int unwaited)
+{
+    pid_t child = fork();
+    if (child == 0) {
+        /* Yama 的 ptrace_scope 是 1 时，兄弟进程要被允许才能 attach */
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
+        signal(SIGUSR1, on_usr1);
+        for (;;)
+            usleep(1000);
+    }
+    usleep(100000);
+    pid_t tracer = fork();
+    if (tracer == 0) {
+        int st = 0;
+        ptrace(PTRACE_ATTACH, child, 0, 0);
+        waitpid(child, &st, 0);
+        if (sig > 0) {
+            ptrace(PTRACE_CONT, child, 0, 0);
+            kill(child, sig);
+            if (unwaited) {
+                usleep(100000);
+                printf("%s: tracer exits without waiting\n", what);
+                fflush(stdout);
+                _exit(0);
+            }
+            waitpid(child, &st, 0);
+        } else if (sig < 0) {
+            ptrace(PTRACE_CONT, child, 0, SIGSTOP);
+            waitpid(child, &st, 0);
+        }
+        printf("%s: tracee stopped by %s\n", what, WIFSTOPPED(st) ? strsignal(WSTOPSIG(st)) : "?");
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(tracer, NULL, 0);
+    usleep(200000);
+    int st;
+    if (waitpid(child, &st, WNOHANG) == child && WIFSIGNALED(st))
+        printf("  after tracer exit: killed by %s\n", strsignal(WTERMSIG(st)));
+    else
+        printf("  after tracer exit: state %c\n", state(child));
+    fflush(stdout);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+}
+
+int main(void)
+{
+    run("attach stop", 0, 0);
+    run("SIGUSR1 with handler", SIGUSR1, 0);
+    run("SIGTERM default", SIGTERM, 0);
+    run("group stop", -1, 0);
+    run("SIGUSR1 not waited for", SIGUSR1, 1);
+    run("SIGTERM not waited for", SIGTERM, 1);
+    return 0;
+}
+C
+gcc -O1 -o implicit implicit.c && ./implicit

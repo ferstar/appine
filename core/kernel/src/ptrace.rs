@@ -277,7 +277,7 @@ pub(crate) fn stop(
             if let Some(sig) = t.resume.take() {
                 break Some(sig);
             }
-            // 跟踪者没有让它继续就退出了：要投递的信号照常投递
+            // 跟踪者没有取走这次停住就退出了：要投递的信号照常投递（[`detach`]）
             if t.tracer.is_none() {
                 break Some(match t.stop {
                     Some(Stop::Signal(sig)) => sig.number(),
@@ -635,17 +635,20 @@ pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -
 }
 
 /// 跟踪者不再跟踪 `task`（PTRACE_DETACH、跟踪者退出）：停着的让它继续，写回跟踪者改过的
-/// 寄存器。`sig` 是 PTRACE_DETACH 要投递的信号；跟踪者退出时是 None，信号投递停止里的
-/// 信号照常投递（[`stop`]）。线程组被停住时它回到 group-stop 里。
+/// 寄存器。`sig` 是 PTRACE_DETACH 要投递的信号；跟踪者退出时是 None：这次停住已经被 wait
+/// 取走的，信号投递停止里的信号丢掉（Linux 的 `wait_task_stopped` 取走时把 `exit_code`
+/// 清成 0，ptrace(2) 说的照常投递只在还没取走时成立），没取走的照常投递（[`stop`]）。
+/// delve attach 之后不 detach 就退出，原来进程被 attach 的 SIGSTOP 停住。线程组被停住时
+/// 它回到 group-stop 里。
 pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     {
         let mut t = task.trace.borrow_mut();
-        let (stop, regs) = (t.stop, t.regs.take());
+        let (stop, regs, reported) = (t.stop, t.regs.take(), t.reported);
         *t = Trace::default();
         if stop.is_some() {
             t.stop = stop;
             t.regs = regs;
-            t.resume = sig;
+            t.resume = sig.or(reported.then_some(0));
         }
     }
     task.syscall_traced.store(false, Ordering::Relaxed);
