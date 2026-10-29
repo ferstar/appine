@@ -100,6 +100,7 @@
 | [M9 之前：测试用的发布构建也检查借用](rounds/89-release-borrow-check.md) | 2026-10-29 | `appine-run` 和 debug 版 App 的发布构建也在放开 BKL 时检查借用；差分测试、LTP、普查认出内核层报告的内部错误（差分测试原来把 `appine-run` 的 stderr 丢掉）；`waits` 用例补上文件位置锁、租约的打破和 AIO 的完成；开销在误差范围内，带检查跑差分测试、LTP、普查和语言的测试集都没有报告内部错误 |
 | [M9 之前：网络接口的流量计数](rounds/90-interface-counters.md) | 2026-10-29 | 内核层自己数 guest 的 socket 收发的载荷，接口按 socket 的本端地址认：`/proc/net/dev`（原来全是 0）、新增的 `/sys/class/net/<接口>/statistics/`（btop 读它）和 netlink 的 `IFLA_STATS` 报告同样的数；回环上的短连接 +4%、UDP 来回 +3% |
 | [M9 之前：NETLINK_GENERIC 只有 nlctrl](rounds/91-generic-netlink.md) | 2026-10-29 | `NETLINK_GENERIC` 建得了（原来 EPROTONOSUPPORT），只有 Linux 总会有的 nlctrl 一个族，查 nl80211、ethtool、wireguard 等别的族是 ENOENT；回答、错误码、确认的格式与 Linux 6.8 逐字节相同；netlink socket 上的等待按 `SO_RCVTIMEO` 超时（原来一直等） |
+| [M9 之前：调试器、valgrind 和 headless Chromium](rounds/92-debuggers-valgrind-chromium.md) | 2026-10-29 | 在 Debian 仓库里跑 delve、lldb、valgrind（memcheck、helgrind、drd、massif、callgrind）和 headless Chromium（命令行、Puppeteer、Playwright），与原生的 Debian 容器对照；找到内核层的 3 个问题（下面三轮），修好之后都与原生相同 |
 
 ## 测量条件
 
