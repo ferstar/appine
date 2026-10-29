@@ -736,11 +736,11 @@ C
 gcc -O1 -o genl genl.c
 ./genl
 
-# 路由表：RTM_GETROUTE 的转储（每个地址族一个数据报，NLMSG_DONE 另是一个）和单条查询
-# （经由网关、同一网段、本机地址、回环网段、网段广播、组播、::1、没有 IPv6 路由），
-# RTM_GETRULE 的转储，逐字节比对；RTM_GETNEIGH 的转储以 NLMSG_DONE 结束。本机地址打印成
-# SELF，接口编号打印成名字；rta_cacheinfo 里路由缓存条目的引用数、上次使用的时间不确定，
-# 只比错误码
+# 路由表：RTM_GETROUTE 的转储和单条查询（经由网关、同一网段、本机地址、回环网段、网段
+# 广播、组播、::1、没有 IPv6 路由），RTM_GETRULE 的转储，逐字节比对；RTM_GETNEIGH 的转储
+# 以 NLMSG_DONE 结束。转储怎么分成数据报随内核版本变（6.10 起有的转储把 NLMSG_DONE 并进
+# 最后一个数据报），只看消息。本机地址打印成 SELF，接口编号打印成名字；rta_cacheinfo 里
+# 路由缓存条目的引用数、上次使用的时间不确定，只比错误码
 cat > route.c <<'C'
 #include <arpa/inet.h>
 #include <errno.h>
@@ -834,7 +834,6 @@ static void replies(const char *what)
             printf(" recv errno %d\n", errno);
             return;
         }
-        printf(" datagram\n");
         for (struct nlmsghdr *h = (void *)buf; n >= 16 && h->nlmsg_len <= (unsigned)n;) {
             printf(" type %d flags %#x\n", h->nlmsg_type, h->nlmsg_flags);
             if (h->nlmsg_type == NLMSG_DONE)
@@ -885,11 +884,8 @@ int main(void)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     request(RTM_GETROUTE, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
     replies("dump: all families");
-    replies("dump: IPv6");
-    replies("dump: done");
     request(RTM_GETROUTE, NLM_F_DUMP, AF_INET6, NULL, 0);
     replies("dump: only IPv6");
-    replies("dump: done");
     get4("get 1.1.1.1", inet_addr("1.1.1.1"));
     get4("get the gateway's subnet", (addr & mask) | htonl(1));
     get4("get SELF", addr);
@@ -905,10 +901,8 @@ int main(void)
     replies("get 2001:db8::1");
     request(RTM_GETRULE, NLM_F_DUMP, AF_INET, NULL, 0);
     replies("rules: IPv4");
-    replies("rules: done");
     request(RTM_GETRULE, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
     replies("rules: all families");
-    replies("rules: done");
     /* 邻居表只看转储以 NLMSG_DONE 结束：Linux 上前面的用例在 lo 上留下了条目 */
     request(RTM_GETNEIGH, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
     for (;;) {
@@ -929,8 +923,8 @@ C
 gcc -O1 -o route route.c
 ./route
 
-# 接口和地址：RTM_GETADDR 的转储（IPv4、IPv6）逐字节比对，ifa_cacheinfo 里创建、更新的时刻
-# 不比；RTM_GETLINK 的转储比对 ifinfomsg 和 ip link 用到的几个属性（Linux 还有设备参数等
+# 接口和地址：RTM_GETADDR 的转储（IPv4、IPv6）逐字节比对（不看怎么分成数据报，同上），
+# ifa_cacheinfo 里创建、更新的时刻不比；RTM_GETLINK 的转储比对 ifinfomsg 和 ip link 用到的几个属性（Linux 还有设备参数等
 # 四十来个属性，这里没有）；不带 NLM_F_DUMP 的 RTM_GETLINK 按编号、名字查，查不到、
 # 没给条件、要确认。本机地址打印成 SELF，接口编号打印成名字，MAC 地址只看长度
 cat > links.c <<'C'
@@ -1038,7 +1032,6 @@ static void replies(const char *what)
             printf(" recv errno %d\n", errno);
             return;
         }
-        printf(" datagram\n");
         for (struct nlmsghdr *h = (void *)buf; n >= 16 && h->nlmsg_len <= (unsigned)n;) {
             if (h->nlmsg_type == 3) {
                 printf(" done\n");
@@ -1410,9 +1403,10 @@ int main(int argc, char **argv)
     fflush(stdout);
     if (fork() == 0) {
         printf("lock keepcaps: %d\n", prctl(PR_SET_SECUREBITS, 1 << 5, 0, 0, 0));
+        /* 6.14 起第 8、10 位有了定义（SECBIT_EXEC_*），用哪个版本都没定义的第 20 位 */
         printf("then set keepcaps: %d %s\n", prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), strerror(errno));
         printf("then unlock: %d %s\n", prctl(PR_SET_SECUREBITS, 0, 0, 0, 0), strerror(errno));
-        printf("unknown bit: %d %s\n", prctl(PR_SET_SECUREBITS, 1 << 5 | 1 << 8, 0, 0, 0), strerror(errno));
+        printf("unknown bit: %d %s\n", prctl(PR_SET_SECUREBITS, 1 << 5 | 1 << 20, 0, 0, 0), strerror(errno));
         printf("securebits: %d\n", prctl(PR_GET_SECUREBITS, 0, 0, 0, 0));
         printf("raise without inheritable: %d %s\n", prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, 13, 0, 0), strerror(errno));
         printf("clear all with an argument: %d %s\n", prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 1, 0, 0), strerror(errno));

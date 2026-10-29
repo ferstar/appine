@@ -15,8 +15,10 @@
 #
 # 仓库默认是 target/difftest/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
 # 再在 appine 里用 apk 安装用例需要的软件包，这一步要联网（沿用宿主或 docker 的代理）。
-# 仓库必须在工作区里。Linux arm64 宿主上直接运行 appine-run（环境变量 APPINE_RUN 可以
-# 指定），其他宿主上经由 scripts/dev。
+# 仓库必须在工作区里。appine-run 也在容器里运行，与原生一侧看到同一种网络（容器的 eth0、
+# 路由、地址），网络类的用例才比得了：Linux arm64 宿主上放进 APPINE_IMAGE（默认是
+# debian:trixie-slim，glibc 不能比编译 appine-run 的宿主旧）里运行，appine-run 可以用
+# 环境变量 APPINE_RUN 指定；其他宿主上经由 scripts/dev。
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,8 +44,17 @@ shift $((OPTIND - 1))
 if [ "$(uname -sm)" = "Linux aarch64" ]; then
     run=${APPINE_RUN:-target/linux-arm64/release/appine-run}
     [ -x "$run" ] || run=target/release/appine-run
+    case $run in
+    /*) ;;
+    *) run=$root/$run ;;
+    esac
     linux() { sh -c "$1"; }
-    appine() { "$run" "$@"; }
+    # 与 scripts/dev 一样放开 nice 的上限（guest 线程的 nice 值设置到宿主线程上）
+    appine() {
+        docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
+            --ulimit nice=40:40 -v "$root:$root" -w "$root" \
+            "${APPINE_IMAGE:-debian:trixie-slim}" "$run" "$@"
+    }
 else
     run=target/linux-arm64/release/appine-run
     linux() { scripts/dev sh -c "$1"; }

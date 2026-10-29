@@ -30,6 +30,10 @@
   - 变异检验：去掉 `IFLA_OPERSTATE`、单条查询改回 EOPNOTSUPP，差分测试有 62 行不同。
   - cargo test 231 个、clippy（含 Android 目标）、两层的差分测试都通过。LTP 958：与[上一轮](100-file-caps.md)相比只有 futex_wait05 由通过变成失败，它是[已知的偶发失败](../milestones.md#已知的偶发失败)（睡眠的超时精度）。
 
+- **推送之后**：CI 的差分测试 compat 组失败，问题都在测试环境，内核层没有问题。修了之后在 colima 的虚拟机里按 Linux 宿主的流程跑了两层的全部差分测试，Mac 上也跑了 compat。
+  - 路由、接口、地址类的用例（第 98、101 轮）在 CI 上两边看到的网络不一样：Linux 宿主上 `appine-run` 直接跑在宿主上，原生一侧在 docker 容器里。Mac 上两边都在容器里，所以本地一直通过；以前的网络用例只比 lo，正是为了避开这个。`scripts/difftest` 改为在 Linux 宿主上也把 `appine-run` 放进容器（默认 `debian:trixie-slim`，`APPINE_IMAGE` 可以换）里运行。
+  - runner 的内核比 colima 的 6.8 新：规则的转储把 NLMSG_DONE 并进了最后一个数据报（6.10 起有的转储这样做），securebits 的第 8 位有了定义（6.14 的 `SECBIT_EXEC_RESTRICT_FILE`）。用例改为不看转储怎么分成数据报，"不认识的位"换成第 20 位。原来几处读完转储之后多余的读每次白等 2 秒超时，一并去掉。
+
 **推迟项**：
 
 - 链路消息没有 Linux 的另外二十多个属性：`IFLA_MIN_MTU`、`IFLA_MAX_MTU`、GSO、GRO 的参数，`IFLA_MAP`、`IFLA_XDP`，`IFLA_AF_SPEC`（inet、inet6 的设备参数和统计）等。`ip -d link` 少了 minmtu、maxmtu 这些。

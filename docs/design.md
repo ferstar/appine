@@ -702,7 +702,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。被测的 guest 地址和原生一侧的宿主地址相同，同样的内容在两处都有，所以访存用错了 addend（比如取错表项而没有比较 tag）它发现不了，这类错误靠差分测试和真实程序。
   2. **LTP 的 syscall 测试**：`scripts/build-ltp` 在 `alpine` 容器里原生编译，`scripts/ltp` 每个测试起一个新的 `appine-run`，在本地运行，不在 CI 里。目前 1552 个里通过 955–959 个（差别是[已知的偶发失败](milestones.md#已知的偶发失败)），剩下的失败见 [M6 结果](rounds/08-m6.md)和之后几轮。原计划中的 musl libc-test 没有接入。
   3. **端到端场景**：`hosts/cli/tests/rootfs_programs.rs` 里的 busybox、交互式 shell、`apk add`、`git clone` 等用例；从源码编译真实项目（Lua、SQLite）手工测量。`scripts/survey`（[负载普查](rounds/62-workload-survey.md)）在 appine 里跑常见的服务和工具（`tests/survey/`：sshd、tmux、postgres、redis、mariadb、Rust、.NET 等），收集失败和未实现的 syscall；`tests/survey/glibc/` 在 Debian、Ubuntu 的仓库里跑 glibc 的程序（[glibc 发行版的探测](rounds/69-glibc-probe.md)），`tests/survey/suites/` 跑语言自带的测试集和大项目，`-n` 在由仓库导出的原生镜像里跑同样的负载对照（[第二轮普查](rounds/70-survey-suites.md)）；输出要人看，要联网安装约 1 GB 软件包，不在 CI 里。
-  4. **差分测试**：同一条命令分别在 appine 和真正的 arm64 Linux 中运行，比对输出；信号测试比对 `ucontext` 的内容。`scripts/difftest`（M7）先在 appine 里把测试仓库的根文件系统打包、导入成 docker 镜像，再把 `tests/diff/` 下的每个脚本分别交给 docker 容器和 `appine-run` 执行，比对输出和退出码。
+  4. **差分测试**：同一条命令分别在 appine 和真正的 arm64 Linux 中运行，比对输出；信号测试比对 `ucontext` 的内容。`scripts/difftest`（M7）先在 appine 里把测试仓库的根文件系统打包、导入成 docker 镜像，再把 `tests/diff/` 下的每个脚本分别交给 docker 容器和 `appine-run` 执行，比对输出和退出码。`appine-run` 也在容器里运行（macOS 上经由 `scripts/dev`，Linux 宿主上放进一个 Debian 镜像），两边看到同一种网络，路由、接口、地址类的用例才比得了；转储怎么分成数据报、新内核加的 securebits 这类随内核版本变的地方，用例不比。
   5. **Android 专项**：用 arm64 Android 模拟器跑 instrumentation 测试（`MachineTest`），覆盖 4K 和 16K 页，包括用测试钩子在 App 进程里模拟内核层和引擎的 bug。GitHub 的 runner 没有 KVM，这一层在本地运行，CI 只构建 APK 并运行 lint。原计划核心库另外提供一个"模拟 Android 限制"的开关，在 Linux 上提前暴露问题，还没有做。
 
 ---
