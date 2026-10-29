@@ -719,6 +719,24 @@ fn procfs_task_links_count_threads() {
 }
 
 #[test]
+fn procfs_net_is_under_each_process() {
+    // 与 Linux 一样，/proc/net 是指向 self/net 的链接，文件在每个进程（和线程）的目录下
+    for (tier, out) in run(&[
+        "/bin/sh",
+        "-c",
+        "readlink /proc/net; head -n 1 /proc/self/net/dev | cut -c1-6; \
+         ls /proc/$$/task/$$/net | grep -cx tcp",
+    ]) {
+        let out = shell(tier, &out);
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            ["self/net", "Inter-", "1"],
+            "tier {tier}"
+        );
+    }
+}
+
+#[test]
 fn sysfs_and_limits_describe_the_machine() {
     // busybox 的 nproc --all 数 /sys/devices/system/cpu 下的 cpu<n>；/proc/self/limits 与
     // ulimit 一致

@@ -2300,3 +2300,14 @@ ev.set()
 for t in ts:
     t.join()
 PY
+
+# /proc/net 是指向 self/net 的链接：文件在每个进程（和线程）的目录下，经由 /proc/net 打开的
+# 文件在 /proc/self/fd 里显示 /proc/<pid>/net/...；目录属于进程的用户，文件属于 root
+ls -ld /proc/net | cut -c1; readlink /proc/net
+for f in dev if_inet6 tcp tcp6 udp udp6 unix raw icmp; do test -r /proc/self/net/$f && echo "net/$f"; done
+ls /proc/self/task/*/net/ | grep -cx unix
+exec 7</proc/net/dev; readlink /proc/self/fd/7 | sed 's/[0-9][0-9]*/N/'; exec 7<&-
+stat -c '%A %U' /proc/self/net /proc/self/net/dev
+head -n 2 /proc/net/dev | cmp - /dev/fd/3 3<<HEAD && echo "same header"
+$(head -n 2 /proc/self/net/dev)
+HEAD

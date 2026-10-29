@@ -32,4 +32,4 @@
 
 - 只在 colima 的虚拟机里跑过，没上手机。手机上 Chromium 的内存（浏览器、zygote、GPU、网络服务、渲染器各是一个进程，每个进程各有一份翻译，见[第二轮普查](70-survey-suites.md)的问题 5）没量。
 - Chromium 都带着 `--no-sandbox`（root 运行时它要求这样，容器里也都这样用）。它的沙箱要用户命名空间或者 setuid 的辅助程序，加上 seccomp-bpf 的过滤，没试。
-- `/proc/<pid>/net` 不存在（`/proc/net` 有）。Linux 上 `/proc/net` 是指向 `self/net` 的链接，经由 `/proc/self/net/...` 读的程序读不到。这是对照目录的链接数时顺带看到的。
+- `/proc/<pid>/net` 不存在（`/proc/net` 有）。Linux 上 `/proc/net` 是指向 `self/net` 的链接，经由 `/proc/self/net/...` 读的程序读不到。这是对照目录的链接数时顺带看到的。→ 已补上（M9 之前：`/proc/<pid>/net`）

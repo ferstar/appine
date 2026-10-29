@@ -545,7 +545,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射（真机待确认） |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档（真机待确认） |
 | AF_UNIX | 进程内模拟（`core/kernel/src/unix.rs`）。`SCM_RIGHTS` 传递的是 guest 的打开文件，`SO_PEERCRED` 返回 guest 的 pid 和 uid；只经由在途消息互相引用的 socket 由垃圾回收释放 |
-| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 列出宿主的接口和下面的流量计数；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；没有 `route`、`ipv6_route`、`snmp`、`sockstat`、`arp` |
+| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 列出宿主的接口和下面的流量计数；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；没有 `route`、`ipv6_route`、`snmp`、`sockstat`、`arp`。与 Linux 一样，这些文件在 `/proc/<pid>/net`（含 task 子目录里的）下，所有进程都在同一个网络命名空间里，内容相同；`/proc/net` 是指向 `self/net` 的链接 |
 | 流量计数 | 内核层自己数 guest 的 TCP、UDP、ping socket 收发的载荷（`core/kernel/src/traffic.rs`），`/proc/net/dev`、sysfs 的 `statistics/` 和 netlink 报告同样的数：Android 上 App 读不到宿主的计数，宿主的计数里也有别的 App 的流量。接口按 socket 的本端地址认（宿主选路的结果），本端地址还没定下的数据报按对端，回环地址算回环接口，别的算默认接口（发往公网时宿主选的本端地址所在的接口）。不含协议头和 ACK，流式 socket 的包数按 MSS 估计；DNS 存根的查询不经过宿主 socket，不算 |
 | tun/VpnService | v1 不做 |
 

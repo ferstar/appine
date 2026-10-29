@@ -45,11 +45,13 @@ pub(crate) enum Global {
     Cmdline,
     /// 指向 `self/mounts` 的符号链接。
     Mounts,
+    /// 指向 `self/net` 的符号链接。
+    Net,
     /// cgroup 的控制器（[`crate::cgroup`]）。
     Cgroups,
 }
 
-const GLOBALS: [(&[u8], Global); 10] = [
+const GLOBALS: [(&[u8], Global); 11] = [
     (b"cpuinfo", Global::Cpuinfo),
     (b"meminfo", Global::Meminfo),
     (b"stat", Global::Stat),
@@ -59,6 +61,7 @@ const GLOBALS: [(&[u8], Global); 10] = [
     (b"filesystems", Global::Filesystems),
     (b"cmdline", Global::Cmdline),
     (b"mounts", Global::Mounts),
+    (b"net", Global::Net),
     (b"cgroups", Global::Cgroups),
 ];
 
@@ -86,13 +89,15 @@ pub(crate) enum Entry {
     Fd,
     FdInfo,
     Task,
+    /// 网络命名空间的文件（[`PROC_NET`]），所有进程都在同一个命名空间里。
+    Net,
     OomScoreAdj,
     CoredumpFilter,
     /// 所在的 cgroup（[`crate::cgroup`]）。
     Cgroup,
 }
 
-const ENTRIES: [(&[u8], Entry); 24] = [
+const ENTRIES: [(&[u8], Entry); 25] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -114,25 +119,29 @@ const ENTRIES: [(&[u8], Entry); 24] = [
     (b"fd", Entry::Fd),
     (b"fdinfo", Entry::FdInfo),
     (b"task", Entry::Task),
+    (b"net", Entry::Net),
     (b"oom_score_adj", Entry::OomScoreAdj),
     (b"coredump_filter", Entry::CoredumpFilter),
     (b"cgroup", Entry::Cgroup),
 ];
 
-/// `/proc/net`、`/proc/sys` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 70] = [
-    b"net/",
-    b"net/dev",
-    b"net/icmp",
-    b"net/icmp6",
-    b"net/if_inet6",
-    b"net/raw",
-    b"net/raw6",
-    b"net/tcp",
-    b"net/tcp6",
-    b"net/udp",
-    b"net/udp6",
-    b"net/unix",
+/// `/proc/<pid>/net` 下的文件。与 Linux 一样，`/proc/net` 是指向 `self/net` 的链接。
+const PROC_NET: [&[u8]; 11] = [
+    b"dev",
+    b"icmp",
+    b"icmp6",
+    b"if_inet6",
+    b"raw",
+    b"raw6",
+    b"tcp",
+    b"tcp6",
+    b"udp",
+    b"udp6",
+    b"unix",
+];
+
+/// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
+const STATIC: [&[u8]; 58] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -404,12 +413,14 @@ pub(crate) enum PseudoNode {
     SelfLink,
     /// `/proc/thread-self`。
     ThreadSelf,
-    /// `/proc/net`、`/proc/sys` 下的目录或文件，取值来自 [`STATIC`]。
+    /// `/proc/sys`、`/proc/sysvipc` 下的目录或文件，取值来自 [`STATIC`]。
     Static(&'static [u8]),
     /// `/proc/<pid>`；第二项是 `Some(tid)` 时是 `/proc/<pid>/task/<tid>`。
     Pid(Tid, Option<Tid>),
     /// `/proc/<pid>/<项>`（含 task 子目录里的）。
     Entry(Tid, Option<Tid>, Entry),
+    /// `/proc/<pid>/net/<名字>`（含 task 子目录里的），名字取值来自 [`PROC_NET`]。
+    Net(Tid, Option<Tid>, &'static [u8]),
     /// `/proc/<pid>/fd/<n>`。
     Fd(Tid, i32),
     /// `/proc/<pid>/fd/<n>` 跟随之后得到的那个打开文件（不在仓库里的那些：管道、宿主 fd）。
@@ -432,7 +443,7 @@ pub(crate) enum PseudoNode {
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
-const TASK_ENTRIES: [Entry; 18] = [
+const TASK_ENTRIES: [Entry; 19] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -451,6 +462,7 @@ const TASK_ENTRIES: [Entry; 18] = [
     Entry::Exe,
     Entry::Root,
     Entry::Cgroup,
+    Entry::Net,
 ];
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
@@ -532,6 +544,7 @@ pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
     let pid = match node {
         PseudoNode::Pid(pid, _)
         | PseudoNode::Entry(pid, ..)
+        | PseudoNode::Net(pid, ..)
         | PseudoNode::Fd(pid, _)
         | PseudoNode::OpenFd(pid, _)
         | PseudoNode::FdInfo(pid, _) => *pid,
@@ -627,6 +640,7 @@ impl Pseudo for View<'_> {
             Cgroup(_) => Cgroup(b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
+            Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
             Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
             FdInfo(pid, _) => Entry(*pid, None, self::Entry::FdInfo),
         })
@@ -655,6 +669,7 @@ impl Pseudo for View<'_> {
             Pid(pid, None) => pid.to_string().into_bytes(),
             Pid(_, Some(tid)) => tid.to_string().into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
+            Net(_, _, name) => name.to_vec(),
             Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
         }
     }
@@ -734,6 +749,11 @@ impl Pseudo for View<'_> {
                 .map(|t| t as Tid)
                 .filter(|&t| self.pid_exists(*pid, Some(t)))
                 .map(|t| Pid(*pid, Some(t))),
+            Entry(pid, tid, self::Entry::Net) => PROC_NET
+                .iter()
+                .find(|n| **n == name)
+                .filter(|_| self.pid_exists(*pid, *tid))
+                .map(|n| Net(*pid, *tid, n)),
             _ => return Err(Errno::ENOTDIR),
         };
         found.ok_or(Errno::ENOENT)
@@ -746,9 +766,14 @@ impl Pseudo for View<'_> {
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
             Cgroup(b"") => mode::S_IFDIR,
-            Entry(_, _, self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task) => mode::S_IFDIR,
+            Entry(
+                _,
+                _,
+                self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task | self::Entry::Net,
+            ) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
-            SelfLink | ThreadSelf | Global(self::Global::Mounts) | Fd(..) => mode::S_IFLNK,
+            SelfLink | ThreadSelf | Fd(..) => mode::S_IFLNK,
+            Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
             OpenFd(pid, fd) => {
                 let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
@@ -772,6 +797,7 @@ impl Pseudo for View<'_> {
             SelfLink => Ok(self.tgid.to_string().into_bytes()),
             ThreadSelf => Ok(format!("{}/task/{}", self.tgid, self.tid).into_bytes()),
             Global(self::Global::Mounts) => Ok(b"self/mounts".to_vec()),
+            Global(self::Global::Net) => Ok(b"self/net".to_vec()),
             Entry(pid, tid, self::Entry::Root) => {
                 let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
                 let root = task.res.borrow().fs.borrow().root.clone();
@@ -1188,6 +1214,9 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
                     .filter(|p| host_cpu_has(*n, p))
                     .map(|p| SysCpu(*n, p)),
             );
+        }
+        Entry(pid, tid, self::Entry::Net) => {
+            nodes.extend(PROC_NET.iter().map(|n| Net(*pid, *tid, n)));
         }
         Pid(pid, tid) => nodes.extend(
             ENTRIES
@@ -2039,20 +2068,23 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             }
             self::Global::Cmdline => "appine\n".to_owned(),
             self::Global::Cgroups => crate::cgroup::proc_cgroups(),
-            self::Global::Mounts => return Err(Errno::EINVAL),
+            self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
+        },
+        Net(_, _, name) => match &name[..] {
+            b"dev" => net_dev(ps.k),
+            b"if_inet6" => net_if_inet6(),
+            b"tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Tcp),
+            b"tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Tcp),
+            b"udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Udp),
+            b"udp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Udp),
+            b"icmp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Icmp),
+            b"icmp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Icmp),
+            b"raw" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Raw),
+            b"raw6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Raw),
+            b"unix" => crate::unix::proc_listing(&sockets(ps.k)),
+            _ => return Err(Errno::ENOENT),
         },
         Static(path) => match &path[..] {
-            b"net/dev" => net_dev(ps.k),
-            b"net/if_inet6" => net_if_inet6(),
-            b"net/tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Tcp),
-            b"net/tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Tcp),
-            b"net/udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Udp),
-            b"net/udp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Udp),
-            b"net/icmp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Icmp),
-            b"net/icmp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Icmp),
-            b"net/raw" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Raw),
-            b"net/raw6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Raw),
-            b"net/unix" => crate::unix::proc_listing(&sockets(ps.k)),
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => format!("{}\n", ps.k.lease_break_time),
             b"sys/fs/aio-max-nr" => format!("{}\n", ps.k.aio_max_nr),
