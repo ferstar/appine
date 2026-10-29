@@ -110,6 +110,7 @@
 | [M9 之前：App 里选 rootfs](rounds/99-choose-rootfs.md) | 2026-10-29 | 首次启动选 Alpine、Debian 13 或 Ubuntu 24.04，后两个选了才下载（版本、sha256 固定，按吞吐量测速选来源，断点续传），菜单里可以重置 rootfs；登录 shell 取 `/etc/passwd` 里 root 的（Debian、Ubuntu 是 bash）；JNI 的句柄改为登记表，修了重置、服务销毁时用到已经释放的 Machine |
 | [M9 之前：文件能力](rounds/100-file-caps.md) | 2026-10-29 | execve 按 Linux 6.1 的规则算上程序文件的能力（`security.capability`）和环境能力，securebits 起作用；扩展属性按 `xattr_permission` 检查权限（原来不查）；写、截短、chown 时去掉文件能力和 setuid、setgid 位（原来写文件不去掉） |
 | [M9 之前：接口和地址的 netlink 消息](rounds/101-link-addr.md) | 2026-10-29 | 地址消息补上广播地址、标志、`ifa_cacheinfo`，与 Linux 逐字节相同；链路消息补上状态、qdisc、发送队列长度等，`ip addr`、`ip link` 显示 `brd`、`state UP`；iproute2 的 `ip link show eth0` 发的单条 `RTM_GETLINK` 原来是 EOPNOTSUPP |
+| [M9 之前：`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md) | 2026-10-29 | 新增 `/proc/net/snmp`、`netstat`（字段照 Linux 6.1，计数是内核层自己数的连接、段、数据报和字节，`ss -s` 原来报错）和只有表头的 `arp`；`appine-run --pty` 的 stdin 结束之后，等程序读完输入再送一个 VEOF（与 `script` 相同），原来程序一直等下去 |
 
 ## 测量条件
 
@@ -132,7 +133,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了（[测试自己的竞争和丢掉的现场](rounds/82-test-races.md)那一轮起 `scripts/ltp` 保留上一次的日志）；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |
-| mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题 |
+| mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题；[`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md)那一轮是 `open` 这个文件得到 EEXIST，同一个原因 |
 
 
 ## R1 的测量记录

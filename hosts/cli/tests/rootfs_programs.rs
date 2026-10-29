@@ -991,6 +991,61 @@ impl Drop for Interactive {
 }
 
 #[test]
+fn end_of_piped_input_is_an_eof_on_the_terminal() {
+    // --pty 时 stdin 是管道：输入结束、程序读完送进去的输入之后，像 script 那样送一个 ^D，
+    // 读到 EOF 就结束的程序随之退出（原来一直等下去）。输出里有行规程回显的输入，cat 的
+    // 那一行因此出现两次
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in TIERS {
+        for (args, input, want, times) in [
+            (&["/bin/sh", "-i"][..], "echo $((6*7))\n", "42", 1),
+            (&["/bin/cat"][..], "one\ntwo\n", "two", 2),
+        ] {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+                .args(["--tier", tier, "--pty", "--env", PATH, "--rootfs"])
+                .arg(store)
+                .arg("--")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut out)
+                .unwrap();
+            assert!(
+                status.is_some_and(|s| s.success()) && out.matches(want).count() == times,
+                "tier {tier}: {args:?} exited with {status:?}; output:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
 fn interactive_shell_runs_on_a_terminal() {
     let Some(store) = store() else {
         return;

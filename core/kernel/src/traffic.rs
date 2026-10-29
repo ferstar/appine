@@ -1,5 +1,6 @@
-//! 网络接口的流量计数（设计文档 §10）：`/proc/net/dev`、`/sys/class/net/<接口>/statistics/`
-//! 和 netlink 的 `IFLA_STATS`、`IFLA_STATS64` 都取自这里。
+//! 网络接口和协议的流量计数（设计文档 §10）：`/proc/net/dev`、`/sys/class/net/<接口>/statistics/`
+//! 和 netlink 的 `IFLA_STATS`、`IFLA_STATS64` 取自接口的计数，`/proc/net/snmp`、`netstat`
+//! 取自协议的计数（[`Protocols`]）。
 //!
 //! Android 上 App 读不到宿主的计数（`/proc/net` 和 netlink 的 `RTM_GETLINK` 都被拦住），
 //! 宿主的计数里也还有 App 自己和别的 App 的流量。guest 的 TCP、UDP、ping socket 都经过内核层
@@ -16,7 +17,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::net::{AF_INET, AF_INET6, InetSocket, SOCK_STREAM};
+use crate::net::{
+    AF_INET, AF_INET6, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, InetSocket, SOCK_DGRAM, SOCK_STREAM,
+};
 
 /// 一个接口的计数。
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -27,12 +30,38 @@ pub(crate) struct IfStats {
     pub tx_packets: u64,
 }
 
+/// 协议的计数（`/proc/net/snmp`、`netstat`，[`crate::net::proc_snmp`]）。与接口的计数一样
+/// 只数 guest 经由内核层收发的载荷，包数（IP 的包、TCP 的段）是估计的，握手、ACK、重传
+/// 都不算。IP、UDP、ICMP 的只数 IPv4（IPv6 socket 上 IPv4 映射的地址也算），TCP 的不分
+/// 地址族，与 Linux 一样。ICMP 只有 ping socket 自己的回显请求和回答，回环地址上答复
+/// 请求的是宿主，不算。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct Protocols {
+    pub ip_in_packets: u64,
+    pub ip_out_packets: u64,
+    pub ip_in_octets: u64,
+    pub ip_out_octets: u64,
+    pub icmp_in_echo_replies: u64,
+    pub icmp_out_echoes: u64,
+    /// 宿主发出了 SYN 的 connect（`syscall::net::count_connect`）。
+    pub tcp_active_opens: u64,
+    /// accept 到的连接。Linux 在握手完成时数，还没有被 accept 的这里看不到。
+    pub tcp_passive_opens: u64,
+    pub tcp_attempt_fails: u64,
+    pub tcp_in_segs: u64,
+    pub tcp_out_segs: u64,
+    pub udp_in_datagrams: u64,
+    pub udp_out_datagrams: u64,
+}
+
 /// socket 认定的接口和估计包数用的 MSS，记在 [`InetSocket`] 上。`iface` 为 None 时本端是
 /// 通配地址，每一次按对端认。
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
     pub iface: Option<Rc<str>>,
     pub mss: u32,
+    /// 本端地址是 IPv4 的（IPv4 映射的也算）。本端是 IPv6 的通配地址时，每一次按对端认。
+    pub v4: bool,
 }
 
 /// 地址表过了这么久再用时重新取：网络切换之后，新的 socket 认得出新的接口。
@@ -78,6 +107,7 @@ impl Table {
 pub(crate) struct Traffic {
     stats: BTreeMap<Rc<str>, IfStats>,
     table: Option<Table>,
+    pub protocols: Protocols,
 }
 
 impl Traffic {
@@ -106,6 +136,35 @@ impl Traffic {
             st.tx_bytes += bytes as u64;
             st.tx_packets += packets;
         }
+        let v4 = s.family == AF_INET
+            || s.route.as_ref().is_some_and(|r| r.v4)
+            || ip_of(peer).is_some_and(|ip| ip.len() == 4);
+        let p = &mut self.protocols;
+        let (packets_in, packets_out) = if rx { (packets, 0) } else { (0, packets) };
+        if v4 {
+            p.ip_in_packets += packets_in;
+            p.ip_out_packets += packets_out;
+            if rx {
+                p.ip_in_octets += bytes as u64;
+            } else {
+                p.ip_out_octets += bytes as u64;
+            }
+        }
+        match (s.ty, s.proto) {
+            (SOCK_STREAM, IPPROTO_TCP) => {
+                p.tcp_in_segs += packets_in;
+                p.tcp_out_segs += packets_out;
+            }
+            (SOCK_DGRAM, IPPROTO_UDP) if v4 => {
+                p.udp_in_datagrams += packets_in;
+                p.udp_out_datagrams += packets_out;
+            }
+            (SOCK_DGRAM, IPPROTO_ICMP) => {
+                p.icmp_in_echo_replies += packets_in;
+                p.icmp_out_echoes += packets_out;
+            }
+            _ => {}
+        }
     }
 
     /// socket `s` 这一次的流量算在哪个接口上，和那个接口上 TCP 的 MSS（模块文档）。
@@ -120,11 +179,13 @@ impl Traffic {
                     Some(Route {
                         iface: Some(iface),
                         mss,
+                        v4: ip.len() == 4,
                     })
                 }
-                Some(_) => Some(Route {
+                Some(ip) => Some(Route {
                     iface: None,
                     mss: 0,
+                    v4: ip.len() == 4,
                 }),
                 // 取不到本端地址：这一次按对端认，下一次再取
                 None => None,
@@ -133,6 +194,7 @@ impl Traffic {
         if let Some(Route {
             iface: Some(iface),
             mss,
+            ..
         }) = &s.route
         {
             return (iface.clone(), *mss);

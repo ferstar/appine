@@ -1,15 +1,20 @@
 /*
- * 网络接口的流量计数（core/kernel/src/traffic.rs）：在回环上收发之后，/proc/net/dev、
+ * 网络接口和协议的流量计数（core/kernel/src/traffic.rs）：在回环上收发之后，/proc/net/dev、
  * /sys/class/net/lo/statistics 和 getifaddrs 的 ifa_data（netlink 的 IFLA_STATS）三处 lo 的
- * 计数相同，增加的字节数正好是收发的载荷，偷看（MSG_PEEK）的不算。只在 appine 里成立：Linux
- * 还算协议头和 ACK。通过时打印 "all ok"，失败时打印原因并以 1 退出。
+ * 计数相同，增加的字节数正好是收发的载荷，偷看（MSG_PEEK）的不算；/proc/net/snmp、netstat
+ * 里 IP 的包数、字节数与 lo 的相同，TCP 的连接、UDP 的数据报、ping 的回显也数得对。包数、
+ * 字节数只在 appine 里成立：Linux 还算协议头和 ACK。通过时打印 "all ok"，失败时打印原因并
+ * 以 1 退出。
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
+#include <netinet/ip_icmp.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +118,37 @@ static struct counts counters(void)
     return p;
 }
 
+/*
+ * /proc/net/snmp、netstat 里 group 这一组的 field。每一组是字段名一行、数值一行，组名
+ * 相同、个数相同；没有这一项时以 -1 返回（IcmpMsg 只列出不为 0 的类型）。
+ */
+static long long snmp(const char *file, const char *group, const char *field)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/net/%s", file);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "open %s", path);
+    static char names[8192], values[8192];
+    long long found = -1;
+    while (fgets(names, sizeof names, f)) {
+        CHECK(fgets(values, sizeof values, f), "%s: no values after %s", path, names);
+        char *n = strchr(names, ':'), *v = strchr(values, ':');
+        CHECK(n && v && n - names == v - values && memcmp(names, values, n - names) == 0,
+              "%s: names %s and values %s", path, names, values);
+        *n++ = 0;
+        v++;
+        int same = strcmp(names, group) == 0;
+        char *ns, *vs;
+        char *name = strtok_r(n, " \n", &ns), *value = strtok_r(v, " \n", &vs);
+        for (; name && value; name = strtok_r(NULL, " \n", &ns), value = strtok_r(NULL, " \n", &vs))
+            if (same && strcmp(name, field) == 0)
+                found = atoll(value);
+        CHECK(!name && !value, "%s: %s has as many names as values", path, names);
+    }
+    fclose(f);
+    return found;
+}
+
 static void read_line(const char *path, const char *want)
 {
     FILE *f = fopen(path, "r");
@@ -144,6 +180,21 @@ int main(void)
     printf("ok sysfs\n");
 
     struct counts before = counters();
+    long long opens = snmp("snmp", "Tcp", "ActiveOpens"),
+              passive = snmp("snmp", "Tcp", "PassiveOpens"),
+              estab = snmp("snmp", "Tcp", "CurrEstab"), in_segs = snmp("snmp", "Tcp", "InSegs"),
+              out_segs = snmp("snmp", "Tcp", "OutSegs"),
+              udp_in = snmp("snmp", "Udp", "InDatagrams"),
+              udp_out = snmp("snmp", "Udp", "OutDatagrams"),
+              ip_in = snmp("snmp", "Ip", "InReceives"), ip_out = snmp("snmp", "Ip", "OutRequests"),
+              octets_in = snmp("netstat", "IpExt", "InOctets"),
+              octets_out = snmp("netstat", "IpExt", "OutOctets");
+    CHECK(snmp("snmp", "Ip", "DefaultTTL") == 64 && snmp("snmp", "Tcp", "RtoMax") == 120000 &&
+              snmp("snmp", "Tcp", "MaxConn") == -1 && snmp("snmp", "UdpLite", "InDatagrams") == 0,
+          "the constant fields of /proc/net/snmp");
+    CHECK(snmp("netstat", "TcpExt", "TCPMigrateReqFailure") == 0 &&
+              snmp("netstat", "MPTcpExt", "RcvWndConflict") == 0,
+          "the last fields of TcpExt and MPTcpExt");
 
     /* 回环上的 TCP 连接 */
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
@@ -155,6 +206,12 @@ int main(void)
     CHECK(c >= 0 && connect(c, (void *)&addr, len) == 0, "connect");
     int s = accept(l, NULL, NULL);
     CHECK(s >= 0, "accept");
+    CHECK(snmp("snmp", "Tcp", "ActiveOpens") == opens + 1 &&
+              snmp("snmp", "Tcp", "PassiveOpens") == passive + 1 &&
+              snmp("snmp", "Tcp", "CurrEstab") == estab + 2,
+          "connections: %lld active, %lld passive, %lld established",
+          snmp("snmp", "Tcp", "ActiveOpens") - opens, snmp("snmp", "Tcp", "PassiveOpens") - passive,
+          snmp("snmp", "Tcp", "CurrEstab") - estab);
     static char buf[STREAM_BYTES];
     memset(buf, 'x', sizeof buf);
     if (fork() == 0) {
@@ -204,6 +261,83 @@ int main(void)
           "packets: sent %llu, received %llu", after.tx_packets - before.tx_packets,
           after.rx_packets - before.rx_packets);
     printf("ok counters\n");
+
+    /* IP 的包数、字节数与 lo 的相同（都是 IPv4）；TCP 的段是除去数据报的那些，偷看的数据报
+     * 不算，没人读的只算发出的 */
+    long long rx = after.rx_packets - before.rx_packets, tx = after.tx_packets - before.tx_packets;
+    CHECK(snmp("snmp", "Ip", "InReceives") - ip_in == rx &&
+              snmp("snmp", "Ip", "OutRequests") - ip_out == tx &&
+              snmp("netstat", "IpExt", "InOctets") - octets_in == (long long)bytes &&
+              snmp("netstat", "IpExt", "OutOctets") - octets_out == (long long)bytes + UNREAD_BYTES,
+          "ip: %lld in, %lld out, %lld octets in, %lld octets out",
+          snmp("snmp", "Ip", "InReceives") - ip_in, snmp("snmp", "Ip", "OutRequests") - ip_out,
+          snmp("netstat", "IpExt", "InOctets") - octets_in,
+          snmp("netstat", "IpExt", "OutOctets") - octets_out);
+    CHECK(snmp("snmp", "Tcp", "InSegs") - in_segs == rx - DATAGRAMS &&
+              snmp("snmp", "Tcp", "OutSegs") - out_segs == tx - DATAGRAMS - 1 &&
+              snmp("snmp", "Udp", "InDatagrams") - udp_in == DATAGRAMS &&
+              snmp("snmp", "Udp", "OutDatagrams") - udp_out == DATAGRAMS + 1 &&
+              snmp("snmp", "Tcp", "CurrEstab") == estab,
+          "tcp: %lld segments in, %lld out, %lld established; udp: %lld in, %lld out",
+          snmp("snmp", "Tcp", "InSegs") - in_segs, snmp("snmp", "Tcp", "OutSegs") - out_segs,
+          snmp("snmp", "Tcp", "CurrEstab") - estab, snmp("snmp", "Udp", "InDatagrams") - udp_in,
+          snmp("snmp", "Udp", "OutDatagrams") - udp_out);
+
+    /* 连不上：阻塞的直接得到 ECONNREFUSED，非阻塞的从 SO_ERROR 得知，各算一次 */
+    long long fails = snmp("snmp", "Tcp", "AttemptFails");
+    opens = snmp("snmp", "Tcp", "ActiveOpens");
+    l = socket(AF_INET, SOCK_STREAM, 0);
+    addr.sin_port = 0;
+    len = sizeof addr;
+    CHECK(l >= 0 && bind(l, (void *)&addr, len) == 0 && getsockname(l, (void *)&addr, &len) == 0,
+          "bind a port nobody listens on");
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(c, (void *)&addr, len) < 0 && errno == ECONNREFUSED, "blocking connect");
+    close(c);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (connect(c, (void *)&addr, len) < 0 && errno == EINPROGRESS) {
+        struct pollfd p = {.fd = c, .events = POLLOUT};
+        CHECK(poll(&p, 1, 5000) == 1, "poll the refused connection");
+        int err = 0;
+        socklen_t elen = sizeof err;
+        CHECK(getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == ECONNREFUSED,
+              "SO_ERROR is %d", err);
+        CHECK(getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == 0,
+              "SO_ERROR is cleared");
+    } else {
+        CHECK(errno == ECONNREFUSED, "non-blocking connect");
+    }
+    close(c);
+    close(l);
+    CHECK(snmp("snmp", "Tcp", "ActiveOpens") - opens == 2 &&
+              snmp("snmp", "Tcp", "AttemptFails") - fails == 2,
+          "refused: %lld active, %lld failed", snmp("snmp", "Tcp", "ActiveOpens") - opens,
+          snmp("snmp", "Tcp", "AttemptFails") - fails);
+
+    /* ping socket 的回显：宿主不让建 ping socket 时跳过 */
+    int ping = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (ping >= 0) {
+        long long echos = snmp("snmp", "Icmp", "OutEchos"),
+                  replies = snmp("snmp", "Icmp", "InEchoReps");
+        struct icmphdr echo = {.type = ICMP_ECHO, .un.echo.sequence = htons(1)};
+        addr.sin_port = 0;
+        CHECK(sendto(ping, &echo, sizeof echo, 0, (void *)&addr, sizeof addr) == sizeof echo,
+              "send an echo request");
+        struct pollfd p = {.fd = ping, .events = POLLIN};
+        CHECK(poll(&p, 1, 5000) == 1 && recv(ping, buf, sizeof buf, 0) == sizeof echo,
+              "receive the echo reply");
+        close(ping);
+        CHECK(snmp("snmp", "Icmp", "OutEchos") - echos == 1 &&
+                  snmp("snmp", "Icmp", "InEchoReps") - replies == 1 &&
+                  snmp("snmp", "Icmp", "OutMsgs") >= 1 &&
+                  snmp("snmp", "IcmpMsg", "OutType8") >= 1 &&
+                  snmp("snmp", "IcmpMsg", "InType0") >= 1,
+              "icmp: %lld echoes, %lld replies", snmp("snmp", "Icmp", "OutEchos") - echos,
+              snmp("snmp", "Icmp", "InEchoReps") - replies);
+    } else {
+        printf("skip icmp (errno %d)\n", errno);
+    }
+    printf("ok snmp\n");
     printf("all ok\n");
     return 0;
 }

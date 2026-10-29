@@ -42,6 +42,8 @@ pub(crate) struct InetSocket {
     pub family: i32,
     /// 宿主 socket 的类型。
     pub ty: i32,
+    /// 协议号：guest 建 socket 时给的，给的是 0 时按类型取默认的 TCP、UDP。
+    pub proto: i32,
     /// guest 建的是 `SOCK_RAW`：raw ICMP 在宿主上是 ping socket，`SO_TYPE` 和
     /// `/proc/net/raw` 按 guest 建的报告。
     pub raw: bool,
@@ -59,6 +61,8 @@ pub(crate) struct InetSocket {
     pub sndtimeo: Option<Duration>,
     /// 流量算在哪个接口上（[`crate::traffic`]），本端地址定下来之后才有。
     pub route: Option<crate::traffic::Route>,
+    /// TCP 发起的连接已经数进了 ActiveOpens、还没有数过它失败（[`crate::traffic::Protocols`]）。
+    pub opening: bool,
 }
 
 impl InetSocket {
@@ -68,6 +72,11 @@ impl InetSocket {
             family,
             raw: ty == SOCK_RAW,
             ty,
+            proto: match ty {
+                SOCK_STREAM => IPPROTO_TCP,
+                SOCK_DGRAM => IPPROTO_UDP,
+                _ => 0,
+            },
             peer: None,
             stub_peer: false,
             answers: VecDeque::new(),
@@ -75,6 +84,7 @@ impl InetSocket {
             rcvtimeo: None,
             sndtimeo: None,
             route: None,
+            opening: false,
         }
     }
 }
@@ -89,9 +99,9 @@ impl Drop for InetSocket {
 
 const SOL_SOCKET: i32 = 1;
 const SO_PROTOCOL: i32 = 38;
-const IPPROTO_ICMP: i32 = 1;
-const IPPROTO_TCP: i32 = 6;
-const IPPROTO_UDP: i32 = 17;
+pub(crate) const IPPROTO_ICMP: i32 = 1;
+pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_UDP: i32 = 17;
 const IPPROTO_ICMPV6: i32 = 58;
 const TCP_INFO: i32 = 11;
 /// `/proc/net` 的 st 列（Linux 的 TCP 状态，UDP 也借用其中两个）。
@@ -277,6 +287,243 @@ pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -
         )
     }
 }
+
+/// `/proc/net/snmp` 里 TCP 的字段（Linux 6.1 的 `snmp4_tcp_list`）。
+const SNMP_TCP: [&str; 15] = [
+    "RtoAlgorithm",
+    "RtoMin",
+    "RtoMax",
+    "MaxConn",
+    "ActiveOpens",
+    "PassiveOpens",
+    "AttemptFails",
+    "EstabResets",
+    "CurrEstab",
+    "InSegs",
+    "OutSegs",
+    "RetransSegs",
+    "InErrs",
+    "OutRsts",
+    "InCsumErrors",
+];
+
+/// UDP、UDP-Lite 的字段（`snmp4_udp_list`）。
+const SNMP_UDP: [&str; 9] = [
+    "InDatagrams",
+    "NoPorts",
+    "InErrors",
+    "OutDatagrams",
+    "RcvbufErrors",
+    "SndbufErrors",
+    "InCsumErrors",
+    "IgnoredMulti",
+    "MemErrors",
+];
+
+/// IP 的字段（`snmp4_ipstats_list`），前面还有 Forwarding、DefaultTTL。
+const SNMP_IP: [&str; 17] = [
+    "InReceives",
+    "InHdrErrors",
+    "InAddrErrors",
+    "ForwDatagrams",
+    "InUnknownProtos",
+    "InDiscards",
+    "InDelivers",
+    "OutRequests",
+    "OutDiscards",
+    "OutNoRoutes",
+    "ReasmTimeout",
+    "ReasmReqds",
+    "ReasmOKs",
+    "ReasmFails",
+    "FragOKs",
+    "FragFails",
+    "FragCreates",
+];
+
+/// ICMP 按类型的字段和类型号（`icmpmibmap`），收、发各一组。
+const SNMP_ICMP: [(&str, u8); 11] = [
+    ("DestUnreachs", 3),
+    ("TimeExcds", 11),
+    ("ParmProbs", 12),
+    ("SrcQuenchs", 4),
+    ("Redirects", 5),
+    ("Echos", 8),
+    ("EchoReps", 0),
+    ("Timestamps", 13),
+    ("TimestampReps", 14),
+    ("AddrMasks", 17),
+    ("AddrMaskReps", 18),
+];
+const ICMP_ECHOREPLY: u8 = 0;
+const ICMP_ECHO: u8 = 8;
+
+/// `/proc/net/snmp`（Linux 6.1 的 `snmp_seq_show`）：IPv4 的 IP、ICMP 和 TCP、UDP 的计数，
+/// 每一组一行字段名、一行数值。计数取自 [`crate::traffic::Protocols`]，CurrEstab 是现在
+/// ESTABLISHED 的 TCP socket 数；不转发（没有 `ip_forward`），TTL 是默认的 64，RTO 的
+/// 几项与 Linux 的初值相同，内核层看不到的错误、重传、复位、分片都是 0。
+pub(crate) fn proc_snmp(
+    sockets: &[(crate::syscall::SocketRef, u32)],
+    p: &crate::traffic::Protocols,
+) -> String {
+    let established = sockets
+        .iter()
+        .filter(|(sock, _)| {
+            let b = sock.borrow();
+            let Socket::Inet(inet) = &*b else {
+                return false;
+            };
+            (inet.ty, inet.proto) == (SOCK_STREAM, IPPROTO_TCP)
+                && appine_hal::net::getsockopt(inet.fd, IPPROTO_TCP, TCP_INFO, 8)
+                    .is_ok_and(|b| b.first() == Some(&TCP_ESTABLISHED))
+        })
+        .count() as u64;
+    let line = |group: &str, names: &[&str], values: &[String]| {
+        format!(
+            "{group}: {}\n{group}: {}\n",
+            names.join(" "),
+            values.join(" ")
+        )
+    };
+    let nums = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>();
+    let mut out = String::new();
+
+    let mut ip = vec!["2".to_owned(), "64".to_owned()];
+    let mut counts = [0u64; SNMP_IP.len()];
+    counts[0] = p.ip_in_packets; // InReceives
+    counts[6] = p.ip_in_packets; // InDelivers
+    counts[7] = p.ip_out_packets; // OutRequests
+    ip.extend(nums(&counts));
+    let names: Vec<&str> = ["Forwarding", "DefaultTTL"]
+        .into_iter()
+        .chain(SNMP_IP)
+        .collect();
+    out += &line("Ip", &names, &ip);
+
+    let by_type = |ty: u8, rx: bool| match (ty, rx) {
+        (ICMP_ECHOREPLY, true) => p.icmp_in_echo_replies,
+        (ICMP_ECHO, false) => p.icmp_out_echoes,
+        _ => 0,
+    };
+    let mut names = vec![
+        "InMsgs".to_owned(),
+        "InErrors".into(),
+        "InCsumErrors".into(),
+    ];
+    let mut icmp = vec![p.icmp_in_echo_replies, 0, 0];
+    for (name, ty) in SNMP_ICMP {
+        names.push(format!("In{name}"));
+        icmp.push(by_type(ty, true));
+    }
+    names.extend(["OutMsgs".to_owned(), "OutErrors".into()]);
+    icmp.extend([p.icmp_out_echoes, 0]);
+    for (name, ty) in SNMP_ICMP {
+        names.push(format!("Out{name}"));
+        icmp.push(by_type(ty, false));
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    out += &line("Icmp", &names, &nums(&icmp));
+    // 只列出不为 0 的类型：先收后发，各按类型号
+    let msgs: Vec<(String, u64)> = [(ICMP_ECHOREPLY, true), (ICMP_ECHO, false)]
+        .into_iter()
+        .map(|(ty, rx)| {
+            let dir = if rx { "In" } else { "Out" };
+            (format!("{dir}Type{ty}"), by_type(ty, rx))
+        })
+        .filter(|(_, n)| *n != 0)
+        .collect();
+    if !msgs.is_empty() {
+        let names: Vec<&str> = msgs.iter().map(|(n, _)| n.as_str()).collect();
+        let values: Vec<u64> = msgs.iter().map(|(_, v)| *v).collect();
+        out += &line("IcmpMsg", &names, &nums(&values));
+    }
+
+    let mut tcp = vec!["1".to_owned(), "200".into(), "120000".into(), "-1".into()];
+    tcp.extend(nums(&[
+        p.tcp_active_opens,
+        p.tcp_passive_opens,
+        p.tcp_attempt_fails,
+        0,
+        established,
+        p.tcp_in_segs,
+        p.tcp_out_segs,
+        0,
+        0,
+        0,
+        0,
+    ]));
+    out += &line("Tcp", &SNMP_TCP, &tcp);
+    let mut udp = [0u64; SNMP_UDP.len()];
+    udp[0] = p.udp_in_datagrams;
+    udp[3] = p.udp_out_datagrams;
+    out += &line("Udp", &SNMP_UDP, &nums(&udp));
+    out += &line("UdpLite", &SNMP_UDP, &nums(&[0; SNMP_UDP.len()]));
+    out
+}
+
+/// `/proc/net/netstat` 里 TcpExt 的字段（Linux 6.1 的 `snmp4_net_list`）。
+const NETSTAT_TCP: &str = "SyncookiesSent SyncookiesRecv SyncookiesFailed EmbryonicRsts \
+PruneCalled RcvPruned OfoPruned OutOfWindowIcmps LockDroppedIcmps ArpFilter TW TWRecycled \
+TWKilled PAWSActive PAWSEstab DelayedACKs DelayedACKLocked DelayedACKLost ListenOverflows \
+ListenDrops TCPHPHits TCPPureAcks TCPHPAcks TCPRenoRecovery TCPSackRecovery TCPSACKReneging \
+TCPSACKReorder TCPRenoReorder TCPTSReorder TCPFullUndo TCPPartialUndo TCPDSACKUndo \
+TCPLossUndo TCPLostRetransmit TCPRenoFailures TCPSackFailures TCPLossFailures \
+TCPFastRetrans TCPSlowStartRetrans TCPTimeouts TCPLossProbes TCPLossProbeRecovery \
+TCPRenoRecoveryFail TCPSackRecoveryFail TCPRcvCollapsed TCPBacklogCoalesce TCPDSACKOldSent \
+TCPDSACKOfoSent TCPDSACKRecv TCPDSACKOfoRecv TCPAbortOnData TCPAbortOnClose \
+TCPAbortOnMemory TCPAbortOnTimeout TCPAbortOnLinger TCPAbortFailed TCPMemoryPressures \
+TCPMemoryPressuresChrono TCPSACKDiscard TCPDSACKIgnoredOld TCPDSACKIgnoredNoUndo \
+TCPSpuriousRTOs TCPMD5NotFound TCPMD5Unexpected TCPMD5Failure TCPSackShifted TCPSackMerged \
+TCPSackShiftFallback TCPBacklogDrop PFMemallocDrop TCPMinTTLDrop TCPDeferAcceptDrop \
+IPReversePathFilter TCPTimeWaitOverflow TCPReqQFullDoCookies TCPReqQFullDrop \
+TCPRetransFail TCPRcvCoalesce TCPOFOQueue TCPOFODrop TCPOFOMerge TCPChallengeACK \
+TCPSYNChallenge TCPFastOpenActive TCPFastOpenActiveFail TCPFastOpenPassive \
+TCPFastOpenPassiveFail TCPFastOpenListenOverflow TCPFastOpenCookieReqd \
+TCPFastOpenBlackhole TCPSpuriousRtxHostQueues BusyPollRxPackets TCPAutoCorking \
+TCPFromZeroWindowAdv TCPToZeroWindowAdv TCPWantZeroWindowAdv TCPSynRetrans TCPOrigDataSent \
+TCPHystartTrainDetect TCPHystartTrainCwnd TCPHystartDelayDetect TCPHystartDelayCwnd \
+TCPACKSkippedSynRecv TCPACKSkippedPAWS TCPACKSkippedSeq TCPACKSkippedFinWait2 \
+TCPACKSkippedTimeWait TCPACKSkippedChallenge TCPWinProbe TCPKeepAlive TCPMTUPFail \
+TCPMTUPSuccess TCPDelivered TCPDeliveredCE TCPAckCompressed TCPZeroWindowDrop TCPRcvQDrop \
+TCPWqueueTooBig TCPFastOpenPassiveAltKey TcpTimeoutRehash TcpDuplicateDataRehash \
+TCPDSACKRecvSegs TCPDSACKIgnoredDubious TCPMigrateReqSuccess TCPMigrateReqFailure";
+
+/// IpExt 的字段（`snmp4_ipextstats_list`）。
+const NETSTAT_IP: &str = "InNoRoutes InTruncatedPkts InMcastPkts OutMcastPkts InBcastPkts \
+OutBcastPkts InOctets OutOctets InMcastOctets OutMcastOctets InBcastOctets OutBcastOctets \
+InCsumErrors InNoECTPkts InECT1Pkts InECT0Pkts InCEPkts ReasmOverlaps";
+
+/// MPTcpExt 的字段（`mptcp_snmp_list`）。
+const NETSTAT_MPTCP: &str = "MPCapableSYNRX MPCapableSYNTX MPCapableSYNACKRX MPCapableACKRX \
+MPCapableFallbackACK MPCapableFallbackSYNACK MPFallbackTokenInit MPTCPRetrans \
+MPJoinNoTokenFound MPJoinSynRx MPJoinSynAckRx MPJoinSynAckHMacFailure MPJoinAckRx \
+MPJoinAckHMacFailure DSSNotMatching InfiniteMapTx InfiniteMapRx DSSNoMatchTCP DataCsumErr \
+OFOQueueTail OFOQueue OFOMerge NoDSSInWindow DuplicateData AddAddr EchoAdd PortAdd \
+AddAddrDrop MPJoinPortSynRx MPJoinPortSynAckRx MPJoinPortAckRx MismatchPortSynRx \
+MismatchPortAckRx RmAddr RmAddrDrop RmSubflow MPPrioTx MPPrioRx MPFailTx MPFailRx \
+MPFastcloseTx MPFastcloseRx MPRstTx MPRstRx RcvPruned SubflowStale SubflowRecover \
+SndWndShared RcvWndShared RcvWndConflictUpdate RcvWndConflict";
+
+/// `/proc/net/netstat`（`netstat_seq_show`）：TCP、MPTCP 的扩展计数内核层都看不到，是 0；
+/// IpExt 里收发的字节数是 IPv4 的载荷（Linux 的含 IP 头），收到的包都当作不带 ECN 标记。
+pub(crate) fn proc_netstat(p: &crate::traffic::Protocols) -> String {
+    let group = |name: &str, fields: &str, values: &dyn Fn(&str) -> u64| {
+        let values: Vec<String> = fields.split(' ').map(|f| values(f).to_string()).collect();
+        format!("{name}: {fields}\n{name}: {}\n", values.join(" "))
+    };
+    group("TcpExt", NETSTAT_TCP, &|_| 0)
+        + &group("IpExt", NETSTAT_IP, &|f| match f {
+            "InOctets" => p.ip_in_octets,
+            "OutOctets" => p.ip_out_octets,
+            "InNoECTPkts" => p.ip_in_packets,
+            _ => 0,
+        })
+        + &group("MPTcpExt", NETSTAT_MPTCP, &|_| 0)
+}
+
+/// `/proc/net/arp`：邻居表总是空的（与 `RTM_GETNEIGH` 一样），只有表头。
+pub(crate) const PROC_ARP: &str =
+    "IP address       HW type     Flags       HW address            Mask     Device\n";
 
 /// 进程内模拟的 netlink socket。只有 `NETLINK_ROUTE` 回答查询；`NETLINK_KOBJECT_UEVENT`
 /// 的 socket 什么也收不到（mdev 监听的 uevent），别的协议建不了（`syscall::net::socket`）。

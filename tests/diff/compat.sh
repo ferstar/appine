@@ -1158,6 +1158,104 @@ for k in sorted(before):
 print("sockets used grew by at least 12:", after["sockets used"] - before["sockets used"] >= 12)
 PY
 
+# /proc/net/snmp、netstat：每一组字段名一行、数值一行；字段随内核版本增加（Icmp 的还插在
+# 中间），只看各版本都有的几项。回环上连接、连不上、收发数据报前后几项计数的变化；IP 的
+# 包数、TCP 的段 Linux 还算握手和 ACK，不比
+python3 - <<'PY'
+import errno
+import select
+import socket
+
+
+def groups(name):
+    with open("/proc/net/" + name) as f:
+        lines = f.read().splitlines()
+    out = {}
+    for names, values in zip(lines[::2], lines[1::2]):
+        group, names = names.split(":")
+        same, values = values.split(":")
+        names, values = names.split(), values.split()
+        if same != group or len(names) != len(values):
+            print(name, group, "is malformed")
+        out[group] = dict(zip(names, map(int, values)))
+    return out
+
+
+snmp, netstat = groups("snmp"), groups("netstat")
+print("snmp groups:", [g for g in snmp if g != "IcmpMsg"])
+print("netstat groups:", list(netstat))
+print("Ip DefaultTTL", snmp["Ip"]["DefaultTTL"])
+for k in ("RtoAlgorithm", "RtoMin", "RtoMax", "MaxConn"):
+    print("Tcp", k, snmp["Tcp"][k])
+print("IpExt has InOctets:", "InOctets" in netstat["IpExt"])
+print("TcpExt has TCPMigrateReqFailure:", "TCPMigrateReqFailure" in netstat["TcpExt"])
+
+WATCH = [("Tcp", f) for f in ("ActiveOpens", "PassiveOpens", "AttemptFails", "CurrEstab")]
+WATCH += [("Udp", f) for f in ("InDatagrams", "OutDatagrams")]
+
+
+def counts():
+    s = groups("snmp")
+    return {g + " " + f: s[g][f] for g, f in WATCH}
+
+
+def changes(what, before):
+    after = counts()
+    print(what + ":", " ".join(f"{k}={after[k] - before[k]}" for k in after if after[k] != before[k]))
+
+
+before = counts()
+keep = []
+for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    listener = socket.socket(family)
+    listener.bind((host, 0))
+    listener.listen()
+    client = socket.create_connection(listener.getsockname()[:2])
+    server, _ = listener.accept()
+    keep += [listener, client, server]
+changes("two connections", before)
+before = counts()
+for s in keep:
+    s.close()
+changes("closed", before)
+
+before = counts()
+closed = socket.socket()
+closed.bind(("127.0.0.1", 0))
+port = closed.getsockname()[1]
+blocking = socket.socket()
+print("blocking connect:", errno.errorcode[blocking.connect_ex(("127.0.0.1", port))])
+blocking.close()
+nonblocking = socket.socket()
+nonblocking.setblocking(False)
+r = nonblocking.connect_ex(("127.0.0.1", port))
+if r == errno.EINPROGRESS:
+    select.select([], [nonblocking], [], 5)
+    r = nonblocking.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+print("non-blocking connect:", errno.errorcode[r])
+nonblocking.close()
+closed.close()
+changes("refused twice", before)
+
+# IPv4、IPv4 映射的地址算 Udp，IPv6 的不算
+before = counts()
+v4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+v4.bind(("127.0.0.1", 0))
+v6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+v6.bind(("::1", 0))
+mapped = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+for i in range(3):
+    v4.sendto(b"x", v4.getsockname())
+mapped.sendto(b"x", ("::ffff:127.0.0.1", v4.getsockname()[1]))
+v6.sendto(b"x", v6.getsockname()[:2])
+for i in range(4):
+    v4.recvfrom(10)
+v6.recvfrom(10)
+for s in (v4, v6, mapped):
+    s.close()
+changes("datagrams", before)
+PY
+
 # 程序文件的能力（security.capability）和环境能力：以 nobody 等身份执行带不同能力的程序，
 # 看能力集、AT_SECURE、有效用户 ID；设置、读取、删除扩展属性的权限；写、截短、chown
 # 去掉文件能力和 setuid、setgid 位；securebits 的锁。能力集只打印用到的几个，等于边界集时

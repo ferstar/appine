@@ -126,15 +126,18 @@ const ENTRIES: [(&[u8], Entry); 25] = [
 ];
 
 /// `/proc/<pid>/net` 下的文件。与 Linux 一样，`/proc/net` 是指向 `self/net` 的链接。
-const PROC_NET: [&[u8]; 15] = [
+const PROC_NET: [&[u8]; 18] = [
+    b"arp",
     b"dev",
     b"icmp",
     b"icmp6",
     b"if_inet6",
     b"ipv6_route",
+    b"netstat",
     b"raw",
     b"raw6",
     b"route",
+    b"snmp",
     b"sockstat",
     b"sockstat6",
     b"tcp",
@@ -2099,7 +2102,10 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
         },
         Net(_, _, name) => match &name[..] {
+            b"arp" => crate::net::PROC_ARP.to_owned(),
             b"dev" => net_dev(ps.k),
+            b"netstat" => crate::net::proc_netstat(&ps.k.traffic.protocols),
+            b"snmp" => crate::net::proc_snmp(&sockets(ps.k), &ps.k.traffic.protocols),
             b"if_inet6" => net_if_inet6(),
             b"route" => crate::route::proc_route(&crate::route::kernel_tables(ps.k)),
             b"ipv6_route" => crate::route::proc_ipv6_route(&crate::route::kernel_tables(ps.k)),

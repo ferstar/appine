@@ -143,6 +143,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             let fd = appine_hal::net::socket(domain, host_ty, protocol).map_err(Errno)?;
             let mut s = InetSocket::new(fd, domain, host_ty);
             s.raw = base == SOCK_RAW;
+            if protocol != 0 {
+                s.proto = protocol;
+            }
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
@@ -286,8 +289,8 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, timeout) = match &*sock.borrow() {
-        Socket::Inet(s) => (s.fd, s.family, s.ty, s.rcvtimeo),
+    let (host_fd, family, ty, proto, timeout) = match &*sock.borrow() {
+        Socket::Inet(s) => (s.fd, s.family, s.ty, s.proto, s.rcvtimeo),
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(_) => unreachable!("handled by accept4"),
     };
@@ -295,8 +298,12 @@ fn accept_host(
     loop {
         match appine_hal::net::accept(host_fd) {
             Ok((new, peer)) => {
-                let new = Socket::Inet(InetSocket::new(new, family, ty));
-                return Ok((Rc::new(RefCell::new(new)), peer));
+                let mut new = InetSocket::new(new, family, ty);
+                new.proto = proto;
+                if proto == IPPROTO_TCP {
+                    cx.k().traffic.protocols.tcp_passive_opens += 1;
+                }
+                return Ok((Rc::new(RefCell::new(Socket::Inet(new))), peer));
             }
             Err(e) if e == Errno::EAGAIN.0 => {
                 wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
@@ -312,7 +319,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     if is_unix(&sock) {
         return unix::connect(cx, &sock, nonblock, &addr).map(|()| 0);
     }
-    let host_fd = match &mut *sock.borrow_mut() {
+    let (host_fd, tcp) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             // 本端地址可能变了：流量算在哪个接口上重新认
             s.route = None;
@@ -323,12 +330,16 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                     return Ok(0);
                 }
             }
-            s.fd
+            (s.fd, s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP)
         }
         Socket::Netlink(_) => return Ok(0),
         Socket::Unix(_) => unreachable!("handled above"),
     };
-    match appine_hal::net::connect(host_fd, &addr) {
+    let r = appine_hal::net::connect(host_fd, &addr);
+    if tcp {
+        count_connect(cx, &sock, r.err().map(Errno));
+    }
+    match r {
         Ok(()) => {
             // 数据报 socket 记下对端，AF_UNSPEC 是断开
             if let Socket::Inet(s) = &mut *sock.borrow_mut()
@@ -360,9 +371,50 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         // EISCONN
         0 => {
             let _ = appine_hal::net::connect(host_fd, &addr);
+            if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+                s.opening = false;
+            }
             Ok(0)
         }
-        e => Err(Errno(e)),
+        e => {
+            if tcp {
+                count_connect(cx, &sock, Some(Errno(e)));
+            }
+            Err(Errno(e))
+        }
+    }
+}
+
+/// TCP 主动连接的计数（`/proc/net/snmp` 的 ActiveOpens、AttemptFails，[`crate::traffic`]）：
+/// 宿主发出了 SYN（connect 成功、正在连接、被拒绝或者超时）时数一次 ActiveOpens，之后
+/// 看到这次连接失败时数一次 AttemptFails。`err` 是这一次 connect 或者阻塞等到的结果。
+/// 非阻塞的连接失败了、guest 只从 poll 和 SO_ERROR 得知时，只数得到 SO_ERROR 是
+/// ECONNREFUSED 的（[`getsockopt`]）。
+fn count_connect(cx: &mut Cx<'_>, sock: &SocketRef, err: Option<Errno>) {
+    let Socket::Inet(s) = &mut *sock.borrow_mut() else {
+        return;
+    };
+    let p = &mut cx.k().traffic.protocols;
+    match err {
+        None | Some(Errno::EINPROGRESS) => {
+            if !s.opening {
+                p.tcp_active_opens += 1;
+                s.opening = true;
+            }
+        }
+        // 前一次 connect 发出的 SYN 失败了（非阻塞时再 connect 一次得到的）
+        Some(Errno::ECONNREFUSED | Errno::ETIMEDOUT | Errno::EHOSTUNREACH | Errno::ENETUNREACH)
+            if s.opening =>
+        {
+            p.tcp_attempt_fails += 1;
+            s.opening = false;
+        }
+        // 这一次发出的 SYN 马上就失败了
+        Some(Errno::ECONNREFUSED | Errno::ETIMEDOUT) => {
+            p.tcp_active_opens += 1;
+            p.tcp_attempt_fails += 1;
+        }
+        Some(_) => {}
     }
 }
 
@@ -469,6 +521,15 @@ pub(super) fn getsockopt(
         Socket::Netlink(_) => 0i32.to_le_bytes().to_vec(),
         Socket::Unix(u) => unix::getsockopt(u, level, name)?,
     };
+    // 非阻塞的 TCP 连接被拒绝：guest 从这里得知（宿主读一次就清掉，不会数两次）
+    if (level, name) == (SOL_SOCKET, SO_ERROR)
+        && out.get(..4) == Some(&Errno::ECONNREFUSED.0.to_le_bytes())
+    {
+        let opening = matches!(&*sock.borrow(), Socket::Inet(s) if s.opening);
+        if opening {
+            count_connect(cx, &sock, Some(Errno::ECONNREFUSED));
+        }
+    }
     let n = room.min(out.len());
     cx.mm().write(UserSlice::new(value, n), &out[..n])?;
     put(cx, len, (n as u32).to_le_bytes()).map(|()| 0)

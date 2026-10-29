@@ -528,7 +528,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - guest 可以通过 `/dev/ptmx` 自己申请 PTY，tmux、screen、`script`、sshd 都依赖这一点。
 - App 里每个终端标签页对应一个 `/dev/pts/N`，在上面启动一个新会话和登录 shell。
 - **终端 UI**：把 Termux 的 `terminal-emulator` + `terminal-view` vendor 进仓库，替换掉原来的 `TerminalSession`（它是 `final` 类，并且写死了 `JNI.createSubprocess`）。新实现经由 `Pty` 接口接到进程内 PTY 的主设备（`Machine` 的控制台）。扩展键栏属于 GPLv3 的 `termux-app` 主模块，所以重写了一份（`ExtraKeysView.kt`）。来源和改动记在 `android/README.md`。
-- **开发用的 CLI 前端** `appine-run` 把宿主终端切到 raw 模式，把它当作 PTY master 使用：一个桥接线程把宿主的按键写进 master，把 master 的输出写回宿主，宿主的 SIGWINCH 变成 `TIOCSWINSZ`。`--pty` 在宿主 stdin 不是终端时也这样做，测试就是经由管道发送 ^C、^Z 这些字节。
+- **开发用的 CLI 前端** `appine-run` 把宿主终端切到 raw 模式，把它当作 PTY master 使用：一个桥接线程把宿主的按键写进 master，把 master 的输出写回宿主，宿主的 SIGWINCH 变成 `TIOCSWINSZ`。`--pty` 在宿主 stdin 不是终端时也这样做，测试就是经由管道发送 ^C、^Z 这些字节。宿主 stdin 读到结束（管道、文件）之后，与 util-linux 的 `script` 一样，等程序读完已经送进去的输入，再往控制台送一个 VEOF（^D）：shell、cat 这类读到 EOF 就结束的程序随之退出，不当作挂断。
 
 ---
 
@@ -546,8 +546,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射（真机待确认） |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档（真机待确认） |
 | AF_UNIX | 进程内模拟（`core/kernel/src/unix.rs`）。`SCM_RIGHTS` 传递的是 guest 的打开文件，`SO_PEERCRED` 返回 guest 的 pid 和 uid；只经由在途消息互相引用的 socket 由垃圾回收释放 |
-| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 列出宿主的接口和下面的流量计数；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；`route`、`ipv6_route` 见上面的路由表；`sockstat`、`sockstat6` 数 guest 的 socket（已经关掉、还在 TIME_WAIT 的连接看不到）；没有 `snmp`、`netstat`、`arp`。与 Linux 一样，这些文件在 `/proc/<pid>/net`（含 task 子目录里的）下，所有进程都在同一个网络命名空间里，内容相同；`/proc/net` 是指向 `self/net` 的链接 |
-| 流量计数 | 内核层自己数 guest 的 TCP、UDP、ping socket 收发的载荷（`core/kernel/src/traffic.rs`），`/proc/net/dev`、sysfs 的 `statistics/` 和 netlink 报告同样的数：Android 上 App 读不到宿主的计数，宿主的计数里也有别的 App 的流量。接口按 socket 的本端地址认（宿主选路的结果），本端地址还没定下的数据报按对端，回环地址算回环接口，别的算默认接口（发往公网时宿主选的本端地址所在的接口）。不含协议头和 ACK，流式 socket 的包数按 MSS 估计；DNS 存根的查询不经过宿主 socket，不算 |
+| `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 列出宿主的接口和下面的流量计数；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；`route`、`ipv6_route` 见上面的路由表；`sockstat`、`sockstat6` 数 guest 的 socket（已经关掉、还在 TIME_WAIT 的连接看不到）；`snmp`、`netstat` 的字段和格式与 Linux 6.1 相同，计数取自下面的流量计数（CurrEstab 是现在 ESTABLISHED 的 TCP socket 数），内核层看不到的（错误、重传、复位、TCP 的扩展计数）是 0；`arp` 只有表头。没有 `snmp6` 等。与 Linux 一样，这些文件在 `/proc/<pid>/net`（含 task 子目录里的）下，所有进程都在同一个网络命名空间里，内容相同；`/proc/net` 是指向 `self/net` 的链接 |
+| 流量计数 | 内核层自己数 guest 的 TCP、UDP、ping socket 收发的载荷（`core/kernel/src/traffic.rs`），`/proc/net/dev`、sysfs 的 `statistics/` 和 netlink 报告同样的数：Android 上 App 读不到宿主的计数，宿主的计数里也有别的 App 的流量。接口按 socket 的本端地址认（宿主选路的结果），本端地址还没定下的数据报按对端，回环地址算回环接口，别的算默认接口（发往公网时宿主选的本端地址所在的接口）。不含协议头和 ACK，流式 socket 的包数按 MSS 估计；DNS 存根的查询不经过宿主 socket，不算。同时按协议数（`/proc/net/snmp`、`netstat`）：IPv4 的包数和字节数，TCP 的段，IPv4 UDP 的数据报，ping socket 的回显请求和回答；TCP 主动连接在宿主发出 SYN（connect 成功、正在连接、被拒绝）时算一次，阻塞的 connect、再一次 connect 或者 SO_ERROR 得知它失败时算一次失败，accept 到的算被动连接 |
 | tun/VpnService | v1 不做 |
 
 **I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作，宿主 fd 和进程内对象统一在 §6 的等待机制里处理。

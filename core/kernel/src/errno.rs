@@ -105,6 +105,8 @@ impl Errno {
     pub const EAFNOSUPPORT: Errno = Errno(97);
     /// 地址已被占用。
     pub const EADDRINUSE: Errno = Errno(98);
+    /// 网络不可达。
+    pub const ENETUNREACH: Errno = Errno(101);
     /// 已经连接。
     pub const EISCONN: Errno = Errno(106);
     /// 没有连接。
@@ -113,6 +115,8 @@ impl Errno {
     pub const ETIMEDOUT: Errno = Errno(110);
     /// 连接被拒绝。
     pub const ECONNREFUSED: Errno = Errno(111);
+    /// 主机不可达。
+    pub const EHOSTUNREACH: Errno = Errno(113);
     /// 连接正在进行。
     pub const EINPROGRESS: Errno = Errno(115);
 
