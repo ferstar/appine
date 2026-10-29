@@ -102,6 +102,7 @@
 | [M9 之前：NETLINK_GENERIC 只有 nlctrl](rounds/91-generic-netlink.md) | 2026-10-29 | `NETLINK_GENERIC` 建得了（原来 EPROTONOSUPPORT），只有 Linux 总会有的 nlctrl 一个族，查 nl80211、ethtool、wireguard 等别的族是 ENOENT；回答、错误码、确认的格式与 Linux 6.8 逐字节相同；netlink socket 上的等待按 `SO_RCVTIMEO` 超时（原来一直等） |
 | [M9 之前：调试器、valgrind 和 headless Chromium](rounds/92-debuggers-valgrind-chromium.md) | 2026-10-29 | 在 Debian 仓库里跑 delve、lldb、valgrind（memcheck、helgrind、drd、massif、callgrind）和 headless Chromium（命令行、Puppeteer、Playwright），与原生的 Debian 容器对照；找到内核层的 3 个问题（下面三轮），修好之后都与原生相同 |
 | [M9 之前：`/proc/<pid>/fd` 和 maps 里的路径解析符号链接](rounds/93-fd-paths-resolve-symlinks.md) | 2026-10-29 | 打开的文件、mmap 的文件和解释器的映射与 Linux 的 `d_path` 一样显示解析完符号链接的路径（原来是词法规范化的）：valgrind 按它带着 `O_NOFOLLOW` 重新打开 Debian 的 ld.so，原来 ELOOP，memcheck 多报几千个错误；开销在误差范围内 |
+| [M9 之前：`/proc/<pid>/task` 的链接数](rounds/94-task-dir-links.md) | 2026-10-29 | task 目录的链接数是 2 加线程数（原来总是 2）：Chromium 的 zygote fork 之前按它判断自己是不是单线程，原来一启动就崩溃 |
 
 ## 测量条件
 

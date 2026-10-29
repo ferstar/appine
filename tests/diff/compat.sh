@@ -2284,3 +2284,19 @@ int main(void)
 C
 gcc -O1 -Wl,--dynamic-linker=/tmp/rp/ld -o rpaths rp.c
 ./rpaths
+
+# /proc/<pid>/task 的链接数是 2 加线程数：Chromium 的 zygote 按它判断自己是不是单线程，
+# fork 之前检查它至少是 3
+python3 - <<'PY'
+import os, threading
+print("task links, 1 thread", os.stat("/proc/self/task").st_nlink)
+ev = threading.Event()
+ts = [threading.Thread(target=ev.wait) for _ in range(3)]
+for t in ts:
+    t.start()
+print("task links, 4 threads", os.stat("/proc/self/task").st_nlink)
+print("thread's own task dir", os.stat("/proc/thread-self/..").st_nlink)
+ev.set()
+for t in ts:
+    t.join()
+PY

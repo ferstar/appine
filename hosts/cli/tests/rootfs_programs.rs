@@ -710,6 +710,15 @@ fn procfs_fd_paths_resolve_symlinks() {
 }
 
 #[test]
+fn procfs_task_links_count_threads() {
+    // 与 Linux 的 proc_task_getattr 一样，/proc/<pid>/task 的链接数是 2 加线程数：Chromium
+    // 的 zygote fork 之前按它判断自己是不是单线程，不到 3 就崩溃
+    for (tier, out) in run(&["/bin/sh", "-c", "stat -c %h /proc/self/task"]) {
+        assert_eq!(shell(tier, &out), "3\n", "tier {tier}");
+    }
+}
+
+#[test]
 fn sysfs_and_limits_describe_the_machine() {
     // busybox 的 nproc --all 数 /sys/devices/system/cpu 下的 cpu<n>；/proc/self/limits 与
     // ulimit 一致

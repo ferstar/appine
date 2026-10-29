@@ -893,10 +893,21 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     };
     let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
     let (uid, gid) = owner_of(ps.k, node);
+    // 与 Linux 的 proc_task_getattr 一样，task 目录的链接数加上线程数：Chromium 的沙箱按它
+    // 判断自己是不是单线程，zygote fork 之前检查它至少是 3，不是就崩溃
+    let nlink = match node {
+        PseudoNode::Entry(pid, None, Entry::Task) => {
+            2 + ps
+                .group(*pid)
+                .map_or(0, |g| g.borrow().threads.len() as u32)
+        }
+        _ if kind == mode::S_IFDIR => 2,
+        _ => 1,
+    };
     Ok(Stat {
         ino: node_ino(ps.k, node),
         mode: kind | perm,
-        nlink: if kind == mode::S_IFDIR { 2 } else { 1 },
+        nlink,
         uid,
         gid,
         rdev: rdev_value,
