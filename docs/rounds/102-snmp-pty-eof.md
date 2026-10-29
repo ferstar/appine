@@ -1,6 +1,6 @@
 # M9 之前：`/proc/net/snmp` 和输入结束时的 EOF（2026-10-29）
 
-← [M9 之前：接口和地址的 netlink 消息（2026-10-29）](101-link-addr.md) · [索引](../milestones.md)
+← [M9 之前：接口和地址的 netlink 消息（2026-10-29）](101-link-addr.md) · [索引](../milestones.md) · [M9 之前：AI 编程 CLI（2026-10-29）](103-ai-cli-survey.md) →
 
 审推迟项时挑出来的两个便宜的兼容性缺口：
 

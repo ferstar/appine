@@ -148,7 +148,7 @@ const PROC_NET: [&[u8]; 18] = [
 ];
 
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 58] = [
+const STATIC: [&[u8]; 62] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -166,6 +166,8 @@ const STATIC: [&[u8]; 58] = [
     b"sys/fs/mqueue/msgsize_max",
     b"sys/fs/mqueue/queues_max",
     b"sys/fs/nr_open",
+    b"sys/fs/overflowgid",
+    b"sys/fs/overflowuid",
     b"sys/fs/pipe-max-size",
     b"sys/fs/pipe-user-pages-hard",
     b"sys/fs/pipe-user-pages-soft",
@@ -182,6 +184,8 @@ const STATIC: [&[u8]; 58] = [
     b"sys/kernel/ns_last_pid",
     b"sys/kernel/osrelease",
     b"sys/kernel/ostype",
+    b"sys/kernel/overflowgid",
+    b"sys/kernel/overflowuid",
     b"sys/kernel/pid_max",
     b"sys/kernel/random/",
     b"sys/kernel/random/boot_id",
@@ -2174,6 +2178,12 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
+            // 映射不到的用户、组 ID 显示成的 ID（Linux 的默认值，bubblewrap 启动时读它）。
+            // 没有用户命名空间，用不上，不能改
+            b"sys/kernel/overflowuid"
+            | b"sys/kernel/overflowgid"
+            | b"sys/fs/overflowuid"
+            | b"sys/fs/overflowgid" => "65534\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
             b"sys/kernel/random/boot_id" => format!("{}\n", format_uuid(&ps.k.boot_id)),
             b"sys/kernel/random/entropy_avail" | b"sys/kernel/random/poolsize" => {

@@ -1158,6 +1158,10 @@ for k in sorted(before):
 print("sockets used grew by at least 12:", after["sockets used"] - before["sockets used"] >= 12)
 PY
 
+# 映射不到的用户、组 ID 显示成的 ID：bubblewrap 启动时读 kernel 下的这两个
+cat /proc/sys/kernel/overflowuid /proc/sys/kernel/overflowgid /proc/sys/fs/overflowuid \
+    /proc/sys/fs/overflowgid
+
 # /proc/net/snmp、netstat：每一组字段名一行、数值一行；字段随内核版本增加（Icmp 的还插在
 # 中间），只看各版本都有的几项。回环上连接、连不上、收发数据报前后几项计数的变化；IP 的
 # 包数、TCP 的段 Linux 还算握手和 ACK，不比

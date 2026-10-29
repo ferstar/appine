@@ -111,6 +111,7 @@
 | [M9 之前：文件能力](rounds/100-file-caps.md) | 2026-10-29 | execve 按 Linux 6.1 的规则算上程序文件的能力（`security.capability`）和环境能力，securebits 起作用；扩展属性按 `xattr_permission` 检查权限（原来不查）；写、截短、chown 时去掉文件能力和 setuid、setgid 位（原来写文件不去掉） |
 | [M9 之前：接口和地址的 netlink 消息](rounds/101-link-addr.md) | 2026-10-29 | 地址消息补上广播地址、标志、`ifa_cacheinfo`，与 Linux 逐字节相同；链路消息补上状态、qdisc、发送队列长度等，`ip addr`、`ip link` 显示 `brd`、`state UP`；iproute2 的 `ip link show eth0` 发的单条 `RTM_GETLINK` 原来是 EOPNOTSUPP |
 | [M9 之前：`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md) | 2026-10-29 | 新增 `/proc/net/snmp`、`netstat`（字段照 Linux 6.1，计数是内核层自己数的连接、段、数据报和字节，`ss -s` 原来报错）和只有表头的 `arp`；`appine-run --pty` 的 stdin 结束之后，等程序读完输入再送一个 VEOF（与 `script` 相同），原来程序一直等下去 |
+| [M9 之前：AI 编程 CLI](rounds/103-ai-cli-survey.md) | 2026-10-29 | 模拟服务冒充三家的模型 API，Claude Code、Codex、Gemini CLI 在 appine 里调用工具（命令、读写改文件、grep、glob）与原生相同，交互界面也相同；两家用 bubblewrap 的沙箱与 docker 容器里一样建不了；补上 bubblewrap 先读的 `/proc/sys/kernel/overflowuid` 等 |
 
 ## 测量条件
 
