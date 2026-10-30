@@ -136,6 +136,7 @@
 | [M9 之前：raw ICMP 的模拟](rounds/125-raw-icmp.md) | 2026-10-30 | guest 的 raw ICMP socket 在宿主上是 ping socket，收到的回答把 id 换回 guest 发的、IPv4 补上 IP 头（TTL、目的地址取自宿主的控制消息），`ICMP_FILTER`、`ICMPV6_FILTER`、`IPV6_CHECKSUM` 记在内核层：Alpine 默认的 busybox `ping` 原来一个回答也收不到，`ping6` 一开始就退出，现在与原生相同；建 raw socket 要 `CAP_NET_RAW`（原来不查） |
 | [M9 之前：PR_SET_CHILD_SUBREAPER](rounds/126-child-subreaper.md) | 2026-10-31 | 进程可以设成 subreaper：孤儿先过继给同一个 pid 命名空间里最近的、还活着的 subreaper 祖先，没有才给 1 号进程（tini、s6 这类进程管理程序用它，原来 EINVAL） |
 | [M9 之前：LTP 剩下的小差异](rounds/127-ltp-leftovers.md) | 2026-10-31 | 剩下的 LTP 失败逐项在原生上对照，多数是 musl 的行为；改了 6 处：readlink 的空路径、TCP 的 sendto 不把地址交给宿主（开发宿主的 AppArmor 拒绝 AF_UNSPEC）、`SHM_HUGETLB` 是 EINVAL、name_to_handle_at 和 open_by_handle_at 的错误顺序和 ESTALE、`O_APPEND` 文件上的 pwrite64 照 Linux 写到末尾；差分测试的脚本超过 128 KB 时报失败（原来两边都执行不了也算通过） |
+| [M9 之前：traceroute 和 mtr](rounds/128-traceroute.md) | 2026-10-31 | 每个网络命名空间一个 ICMP 汇集点：raw socket 背后的 ping socket、设过 TTL 的 UDP socket 在宿主上打开 `IP_RECVERR`，到了的报文和错误拼回的 ICMP 错误报文分给所有 raw socket，替 guest 模拟 Linux 不开 `IP_RECVERR` 时的错误规矩；raw socket 不再把端口交给宿主，guest 的 `IP_RECVERR` 有了错误队列，非 ICMP 的 raw socket 与 Android 上一样是 EPERM：busybox 的 traceroute、Debian 的 `traceroute -I`、开发宿主上的 mtr 能用了；新的网络命名空间里 `ping6 ::1` 能用了 |
 
 ## 测量条件
 

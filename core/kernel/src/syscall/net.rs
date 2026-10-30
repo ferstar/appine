@@ -51,13 +51,12 @@ const MSG_FASTOPEN: u32 = 0x2000_0000;
 
 const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
 
 /// sockaddr 的最大长度（`sockaddr_storage`）。
 const SOCKADDR_MAX: usize = 128;
 /// 一次收发的最大字节数。
 const MSG_MAX: usize = 1 << 20;
-/// 一个 ICMP 报文最长的长度（IP 的总长度是 16 位）。
-const RAW_ICMP_MAX: usize = 1 << 16;
 
 /// fd 对应的 socket；不是 socket 时返回 ENOTSOCK。
 fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(SocketRef, bool), Errno> {
@@ -142,17 +141,21 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             // raw socket 要在网络命名空间的属主里有 CAP_NET_RAW（Linux 的 inet_create：协议号
             // 不对的先报告，交给宿主）。宿主上用 ping socket 模拟的 raw ICMP 不需要特权，不
             // 查的话普通用户也建得出来，busybox 的 ping 就不会退回 ping socket
-            if base == SOCK_RAW
-                && (1..256).contains(&protocol)
-                && !cx.cred().ns_capable(&owner, crate::cred::cap::NET_RAW)
-            {
-                return Err(Errno::EPERM);
-            }
             // guest 的 raw ICMP socket 换成不需要特权的 ping socket
             let icmp = matches!(
                 (domain, protocol),
                 (AF_INET, IPPROTO_ICMP) | (AF_INET6, IPPROTO_ICMPV6)
             );
+            // 别的 raw socket 与 Android 上的 App 一样建不了：宿主有 CAP_NET_RAW 时（开发用的
+            // Linux 宿主）也不交给它，不然发出去的报文引起的 ICMP 到不了模拟的 raw ICMP
+            // socket，mtr 这类用 raw socket 发、raw ICMP socket 收的程序就两头对不上（它们
+            // 遇到 EPERM 会退回 ping socket）
+            if base == SOCK_RAW
+                && (1..256).contains(&protocol)
+                && (!icmp || !cx.cred().ns_capable(&owner, crate::cred::cap::NET_RAW))
+            {
+                return Err(Errno::EPERM);
+            }
             let host_ty = if base == SOCK_RAW && icmp {
                 SOCK_DGRAM
             } else {
@@ -161,12 +164,15 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             let fd = appine_hal::net::socket(domain, host_ty, protocol).map_err(Errno)?;
             let mut s = InetSocket::new(fd, domain, host_ty);
             s.raw = base == SOCK_RAW;
-            if s.raw && icmp {
-                let r = crate::net::RawIcmp::new(domain);
-                for &(level, name) in r.host_options() {
+            if s.raw {
+                // 宿主上替它打开 IP_RECVERR 等（crate::rawicmp），收到的都经由汇集点
+                for &(level, name) in crate::rawicmp::RawIcmp::host_options(domain) {
                     let _ = appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes());
                 }
-                s.icmp = Some(r);
+                let tap = crate::rawicmp::tap_for(cx.k(), &net)?;
+                s.icmp = Some(crate::rawicmp::RawIcmp::new(domain, tap));
+                // 定时器线程替 poll、epoll 的等待者看着汇集点：可能是新建的，叫醒它
+                crate::kernel::signal_later(&cx.shared.timers);
             }
             if protocol != 0 {
                 s.proto = protocol;
@@ -200,7 +206,17 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
         }
         _ => return Err(Errno::EAFNOSUPPORT),
     };
-    install(cx, Rc::new(RefCell::new(sock)), ty).map(|fd| fd as u64)
+    let sock = Rc::new(RefCell::new(sock));
+    if let Socket::Inet(InetSocket {
+        icmp: Some(r),
+        fd,
+        family,
+        ..
+    }) = &*sock.borrow()
+    {
+        crate::rawicmp::register(&r.tap, &sock, *fd, *family);
+    }
+    install(cx, sock, ty).map(|fd| fd as u64)
 }
 
 /// 新的网络命名空间里还没有绑定的宿主 socket：先绑到这个命名空间的回环地址（Linux 自动
@@ -208,7 +224,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
 fn ensure_bound(s: &mut InetSocket) -> Result<(), Errno> {
     if let Some(ns) = &s.net
         && !s.bound
-        && let Some(addr) = crate::netns::implicit_bind(ns, s.family)
+        && let Some(addr) = crate::netns::implicit_bind(ns, s.family, s.icmp6())
     {
         appine_hal::net::bind(s.fd, &addr).map_err(Errno)?;
         s.bound = true;
@@ -280,12 +296,19 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
     }
     // 新的网络命名空间里先换成宿主的地址（不是本地地址时 EADDRNOTAVAIL）
-    let net = match &*sock.borrow() {
-        Socket::Inet(s) => s.net.clone(),
-        _ => None,
+    let (net, icmp6, raw) = match &*sock.borrow() {
+        Socket::Inet(s) => (s.net.clone(), s.icmp6(), s.icmp.is_some()),
+        _ => (None, false, false),
     };
+    // raw socket 没有端口（Linux 的 raw_bind 不看它）。宿主的 ping socket 却把它当作 echo 的
+    // 编号：busybox 的 traceroute 把收的 socket 绑到发的 socket 的地址上（getsockname 拿到
+    // 的，带着端口），两个就共用一个编号，回答到了另一个上
+    let mut addr = addr;
+    if raw && addr.len() >= 4 {
+        addr[2..4].fill(0);
+    }
     let host_addr = match &net {
-        Some(ns) => crate::netns::to_host(ns, &addr, crate::netns::Use::Bind)?,
+        Some(ns) => crate::netns::to_host(ns, &addr, crate::netns::Use::Bind, icmp6)?,
         None => addr.clone(),
     };
     // 1024 以下的端口要求网络命名空间的属主里的 CAP_NET_BIND_SERVICE
@@ -380,7 +403,7 @@ fn accept_host(
                     cx.k().traffic.protocols.tcp_passive_opens += 1;
                 }
                 let peer = match &net {
-                    Some(ns) => crate::netns::from_host(ns, &peer, false),
+                    Some(ns) => crate::netns::from_host(ns, &peer, false, false),
                     None => peer,
                 };
                 new.bound = net.is_some();
@@ -407,7 +430,8 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             s.route = None;
             // 新的网络命名空间里只到得了 lo（crate::netns）；DNS 存根也不在里面
             if let Some(ns) = s.net.clone() {
-                let host_addr = crate::netns::to_host(&ns, &addr, crate::netns::Use::Reach)?;
+                let host_addr =
+                    crate::netns::to_host(&ns, &addr, crate::netns::Use::Reach, s.icmp6())?;
                 ensure_bound(s)?;
                 // 它的流量不算进宿主的接口（/proc/net/snmp 也不数）
                 (s.fd, false, host_addr)
@@ -522,10 +546,21 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
     let (sock, _) = socket_of(cx, fd)?;
     let value = match &*sock.borrow() {
         Socket::Inet(s) if peer && s.stub_peer => stub_addr(s.family),
+        // 汇集点看着的 UDP socket 的宿主连接可能改过（[`send`]），对端报告 guest 连的
+        Socket::Inet(InetSocket {
+            udp_tap: Some(_),
+            peer: Some(p),
+            ..
+        }) if peer => p.clone(),
         Socket::Inet(s) => {
-            let a = appine_hal::net::sockname(s.fd, peer).map_err(Errno)?;
+            let mut a = appine_hal::net::sockname(s.fd, peer).map_err(Errno)?;
+            // raw socket 的本端"端口"是协议号（Linux 的 inet_create 设的 inet_sport），宿主的
+            // ping socket 报告的是它的编号
+            if s.icmp.is_some() && !peer && a.len() >= 4 {
+                a[2..4].copy_from_slice(&(s.proto as u16).to_be_bytes());
+            }
             match &s.net {
-                Some(ns) => crate::netns::from_host(ns, &a, !peer && s.any),
+                Some(ns) => crate::netns::from_host(ns, &a, !peer && s.any, s.icmp6()),
                 None => a,
             }
         }
@@ -583,11 +618,25 @@ pub(super) fn setsockopt(
         (SOL_SOCKET, SO_RCVBUFFORCE) => SO_RCVBUF,
         _ => name,
     };
-    // raw ICMP 自己的选项（crate::net::RawIcmp）
+    // raw ICMP 自己的选项（crate::rawicmp::RawIcmp）
     if let Socket::Inet(InetSocket { icmp: Some(r), .. }) = &mut *sock.borrow_mut()
         && let Some(res) = r.setsockopt(level, name, &v)
     {
         return res.map(|()| 0).map_err(Errno);
+    }
+    // UDP：记下设过 TTL、自己打开的 IP_RECVERR（crate::rawicmp）。汇集点看着它时宿主上的
+    // IP_RECVERR 总是开着：guest 关掉它只记下来，打开它之后不再看着，宿主上的就是 guest 的
+    let udp = match &mut *sock.borrow_mut() {
+        Socket::Inet(s) => crate::rawicmp::udp_setsockopt(s, level, name, &v),
+        _ => None,
+    };
+    match udp {
+        Some(true) => {
+            crate::rawicmp::untap(&sock);
+            return Ok(0);
+        }
+        Some(false) => return Ok(0),
+        None => {}
     }
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => match (level, name) {
@@ -627,9 +676,25 @@ pub(super) fn getsockopt(
         b
     };
     let pid_ns = cx.pid_ns();
-    // raw ICMP 自己的选项（crate::net::RawIcmp）
+    // 宿主替 raw ICMP socket、汇集点看着的 UDP socket 记下的 ICMP 错误 guest 不该看到
+    // （crate::rawicmp）
+    if (level, name) == (SOL_SOCKET, SO_ERROR)
+        && let Some(t) = crate::rawicmp::before_io(cx.kr(), &sock)
+    {
+        let fd = match &*sock.borrow() {
+            Socket::Inet(s) => s.fd,
+            _ => unreachable!("raw ICMP and UDP sockets are inet"),
+        };
+        take_errors(cx, &t, fd);
+    }
+    // raw ICMP 自己的选项（crate::rawicmp::RawIcmp），汇集点看着的 UDP socket 的 IP_RECVERR，
+    // 汇集点替它记下的要报告的错误
     let raw = match &*sock.borrow() {
+        Socket::Inet(s) if (level, name) == (SOL_SOCKET, SO_ERROR) && s.icmp_err.get() != 0 => {
+            Some(Ok(s.icmp_err.replace(0).to_le_bytes().to_vec()))
+        }
         Socket::Inet(InetSocket { icmp: Some(r), .. }) => r.getsockopt(level, name),
+        Socket::Inet(s) => crate::rawicmp::udp_getsockopt(s, level, name).map(Ok),
         _ => None,
     };
     let out = if let Some(r) = raw {
@@ -784,7 +849,7 @@ pub(crate) fn send(
             let a = if addr.is_empty() {
                 Vec::new()
             } else {
-                crate::netns::to_host(&ns, addr, crate::netns::Use::Reach)?
+                crate::netns::to_host(&ns, addr, crate::netns::Use::Reach, s.icmp6())?
             };
             ensure_bound(s)?;
             Some(a)
@@ -799,6 +864,27 @@ pub(crate) fn send(
     } else {
         addr
     };
+    // raw ICMP socket、交给汇集点看着的 UDP socket（crate::rawicmp）：宿主替它记下的 ICMP
+    // 错误会让发送失败，先取走；因为它失败了也取走再试一次
+    let tap = crate::rawicmp::before_io(cx.kr(), sock);
+    if let Some(t) = &tap {
+        take_errors(cx, t, host_fd);
+        if let Some(e) = crate::rawicmp::take_error(sock) {
+            return Err(e);
+        }
+        // 已连接的 UDP socket 发往别的地址（busybox 的 traceroute 连上目的地址之后每个探测包
+        // 换一个端口）：宿主只把与 socket 的连接对得上的报文引起的错误交给它，先改连到这个
+        // 地址。guest 看到的对端仍是它连的（getpeername）
+        let connected_udp = matches!(&*sock.borrow(),
+            Socket::Inet(s) if s.icmp.is_none() && s.peer.is_some());
+        if connected_udp && !addr.is_empty() {
+            let current = appine_hal::net::sockname(host_fd, true).unwrap_or_default();
+            if !same_endpoint(&current, addr) {
+                let _ = appine_hal::net::connect(host_fd, addr);
+            }
+        }
+    }
+    let mut retried = false;
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut done = 0;
     let mut sent_datagram = false;
@@ -833,6 +919,12 @@ pub(crate) fn send(
                 }
             }
             Err(e) if e == Errno::EPIPE.0 => break Err(epipe(cx, flags)),
+            Err(e) if !retried && tap.is_some() && crate::rawicmp::from_icmp(e) => {
+                if let Some(t) = &tap {
+                    take_errors(cx, t, host_fd);
+                }
+                retried = true;
+            }
             Err(e) => break if done > 0 { Ok(done) } else { Err(Errno(e)) },
         }
     };
@@ -840,6 +932,22 @@ pub(crate) fn send(
         account(cx, sock, false, done, addr);
     }
     r
+}
+
+/// 两个 IPv4、IPv6 地址的协议族、端口和地址都相同。
+fn same_endpoint(a: &[u8], b: &[u8]) -> bool {
+    let n = match a.get(..2).map(|f| u16::from_le_bytes([f[0], f[1]]) as i32) {
+        Some(AF_INET) => 8,
+        Some(AF_INET6) => 24,
+        _ => return false,
+    };
+    a.get(..n).is_some() && a.get(..n) == b.get(..n)
+}
+
+/// 取走宿主记在 `fd` 上的 ICMP 错误（分给 raw socket，[`crate::rawicmp::dispatch`]）。
+fn take_errors(cx: &mut Cx<'_>, tap: &Rc<RefCell<crate::rawicmp::Tap>>, fd: i32) {
+    let arrivals = crate::rawicmp::dispatch(tap, Some(fd));
+    crate::rawicmp::account(cx.k(), arrivals);
 }
 
 /// 记下宿主 socket 上收发的流量（[`crate::traffic`]）。
@@ -860,7 +968,7 @@ fn local_addr(s: &InetSocket, a: [u8; 4]) -> [u8; 4] {
     let mut sa = vec![0u8; 16];
     sa[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
     sa[4..8].copy_from_slice(&a);
-    let g = crate::netns::from_host(ns, &sa, false);
+    let g = crate::netns::from_host(ns, &sa, false, false);
     g.get(4..8).and_then(|b| b.try_into().ok()).unwrap_or(a)
 }
 
@@ -898,6 +1006,14 @@ pub(crate) fn recv(
     }
     // 读错误队列（MSG_ERRQUEUE）从不等待：没有排队的错误时 EAGAIN
     let nonblock = nonblock || flags & (MSG_DONTWAIT | MSG_ERRQUEUE) != 0;
+    // raw ICMP socket 收到的报文都经由汇集点（crate::rawicmp）
+    let raw = match &*sock.borrow() {
+        Socket::Inet(InetSocket { icmp: Some(r), .. }) => Some(r.tap.clone()),
+        _ => None,
+    };
+    if let Some(tap) = raw {
+        return raw_recv(cx, sock, &tap, nonblock, max, control_len, flags);
+    }
     // 进程内产生的数据报：DNS 存根的回答、netlink 的回答
     let local = |q: &mut std::collections::VecDeque<Vec<u8>>, addr: Vec<u8>| {
         let d = if flags & MSG_PEEK != 0 {
@@ -916,17 +1032,14 @@ pub(crate) fn recv(
     };
     // netlink 等回答的期限（SO_RCVTIMEO），第一次没有回答可读时定下
     let mut netlink_deadline = None;
-    let (host_fd, ty, timeout, raw) = loop {
+    let (host_fd, ty, timeout) = loop {
         let host = match &mut *sock.borrow_mut() {
             Socket::Inet(s) => {
                 let addr = stub_addr(s.family);
                 if let Some(m) = local(&mut s.answers, addr) {
                     return Ok(m);
                 }
-                // raw ICMP：宿主接收时多留控制消息的空间，错误队列里的原样交出
-                let raw = s.icmp.as_ref().map(|r| r.control_room());
-                let raw = raw.filter(|_| flags & MSG_ERRQUEUE == 0);
-                Some((s.fd, s.ty, s.rcvtimeo, raw))
+                Some((s.fd, s.ty, s.rcvtimeo))
             }
             Socket::Netlink(s) => {
                 let addr = {
@@ -958,19 +1071,26 @@ pub(crate) fn recv(
             }
         }
     };
+    // 交给汇集点看着的 UDP socket：宿主替它记下的 ICMP 错误会让接收失败，先取走；因为它
+    // 失败了也取走再试一次
+    let tap = crate::rawicmp::before_io(cx.kr(), sock);
+    if let Some(t) = &tap {
+        take_errors(cx, t, host_fd);
+        if flags & MSG_ERRQUEUE == 0
+            && let Some(e) = crate::rawicmp::take_error(sock)
+        {
+            return Err(e);
+        }
+    }
+    let mut retried = false;
     let deadline = timeout.map(|t| Instant::now() + t);
-    // raw ICMP 要看到 ICMP 头（类型、id）才改得了，还要知道完整的长度（IP 头里的总长度、
-    // MSG_TRUNC），ping socket 的 recvmsg 又不认 MSG_TRUNC 标志：整个收下来，拼上 IP 头
-    // 之后再截
-    let room = if raw.is_some() { RAW_ICMP_MAX } else { max };
-    let mut buf = vec![0u8; room];
+    let mut buf = vec![0u8; max];
     let mut got = 0;
     // 偷看的数据之后还会再读到，错误队列里不是收到的流量
     let counted = flags & (MSG_PEEK | MSG_ERRQUEUE) == 0;
     loop {
         let host_flags = flags & !(MSG_DONTWAIT | MSG_WAITALL);
-        let host_control = control_len + raw.unwrap_or(0);
-        match appine_hal::net::recvmsg(host_fd, &mut buf[got..], host_control, host_flags as i32) {
+        match appine_hal::net::recvmsg(host_fd, &mut buf[got..], control_len, host_flags as i32) {
             Ok(r) => {
                 let wait_all = flags & MSG_WAITALL != 0 && ty == SOCK_STREAM;
                 got += r.len.min(buf.len() - got);
@@ -983,43 +1103,11 @@ pub(crate) fn recv(
                     account(cx, sock, true, len, &r.addr);
                 }
                 let addr = match &*sock.borrow() {
-                    Socket::Inet(InetSocket { net: Some(ns), .. }) if !r.addr.is_empty() => {
-                        crate::netns::from_host(ns, &r.addr, false)
+                    Socket::Inet(s @ InetSocket { net: Some(ns), .. }) if !r.addr.is_empty() => {
+                        crate::netns::from_host(ns, &r.addr, false, s.icmp6())
                     }
                     _ => r.addr,
                 };
-                if raw.is_some() {
-                    let delivered = match &*sock.borrow() {
-                        Socket::Inet(s @ InetSocket { icmp: Some(i), .. }) => {
-                            let dst = |a: [u8; 4]| local_addr(s, a);
-                            i.deliver(buf, len, &addr, &r.control, dst)
-                        }
-                        _ => unreachable!("raw ICMP socket"),
-                    };
-                    let Some((mut data, len, control)) = delivered else {
-                        // 过滤器丢掉的：偷看的也要真的读走，不然一直偷看到它
-                        if flags & MSG_PEEK != 0 {
-                            let _ =
-                                appine_hal::net::recvmsg(host_fd, &mut [], 0, MSG_DONTWAIT as i32);
-                        }
-                        buf = vec![0u8; room];
-                        got = 0;
-                        continue;
-                    };
-                    data.truncate(max);
-                    let (control, ctrunc) = crate::net::fit_control(&control, control_len);
-                    let mut flags = r.flags as u32 & !MSG_TRUNC | ctrunc;
-                    if len > max {
-                        flags |= MSG_TRUNC;
-                    }
-                    return Ok(Message {
-                        data,
-                        len,
-                        addr,
-                        control,
-                        flags,
-                    });
-                }
                 return Ok(Message {
                     data: buf,
                     len,
@@ -1050,8 +1138,116 @@ pub(crate) fn recv(
                 }
                 wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
             }
+            Err(e) if !retried && tap.is_some() && crate::rawicmp::from_icmp(e) => {
+                if let Some(t) = &tap {
+                    take_errors(cx, t, host_fd);
+                }
+                retried = true;
+            }
             Err(e) => return Err(Errno(e)),
         }
+    }
+}
+
+/// raw ICMP socket 的接收：报文在汇集点里它自己的队列中（[`crate::rawicmp`]），先取下
+/// 宿主上已经到了的，没有就连同汇集点的宿主 fd 一起等。
+fn raw_recv(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    tap: &Rc<RefCell<crate::rawicmp::Tap>>,
+    nonblock: bool,
+    max: usize,
+    control_len: usize,
+    flags: u32,
+) -> Result<Message, Errno> {
+    // 错误队列：guest 打开了 IP_RECVERR 时汇集点放进来的（从不等待）
+    if flags & MSG_ERRQUEUE != 0 {
+        let arrivals = crate::rawicmp::dispatch(tap, None);
+        crate::rawicmp::account(cx.k(), arrivals);
+        let e = crate::rawicmp::take_err(tap, sock).ok_or(Errno::EAGAIN)?;
+        let s = sock.borrow();
+        let Socket::Inet(
+            s @ InetSocket {
+                icmp: Some(raw), ..
+            },
+        ) = &*s
+        else {
+            unreachable!("raw ICMP socket");
+        };
+        let addr = match &s.net {
+            Some(ns) => crate::netns::from_host(ns, &e.addr, false, s.icmp6()),
+            None => e.addr.clone(),
+        };
+        let (control, mut out_flags) =
+            crate::rawicmp::fit_control(&raw.err_control(&e), control_len);
+        let mut data = e.data;
+        let len = data.len();
+        if len > max {
+            data.truncate(max);
+            out_flags |= MSG_TRUNC;
+        }
+        return Ok(Message {
+            data,
+            len,
+            addr,
+            control,
+            flags: out_flags | MSG_ERRQUEUE,
+        });
+    }
+    let key = wake::of(sock);
+    let timeout = match &*sock.borrow() {
+        Socket::Inet(s) => s.rcvtimeo,
+        _ => None,
+    };
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        let arrivals = crate::rawicmp::dispatch(tap, None);
+        crate::rawicmp::account(cx.k(), arrivals);
+        if let Some(e) = crate::rawicmp::take_error(sock) {
+            return Err(e);
+        }
+        if let Some(it) = crate::rawicmp::take(tap, key, flags & MSG_PEEK != 0) {
+            let s = sock.borrow();
+            let Socket::Inet(
+                s @ InetSocket {
+                    icmp: Some(raw), ..
+                },
+            ) = &*s
+            else {
+                unreachable!("raw ICMP socket");
+            };
+            let src = match &s.net {
+                Some(ns) => crate::netns::from_host(ns, &it.src, false, s.icmp6()),
+                None => it.src.clone(),
+            };
+            let (mut data, control) = raw.present(&it, key, &src, |a| local_addr(s, a));
+            let len = data.len();
+            let (control, mut out_flags) = crate::rawicmp::fit_control(&control, control_len);
+            if len > max {
+                data.truncate(max);
+                out_flags |= MSG_TRUNC;
+            }
+            return Ok(Message {
+                data,
+                len,
+                addr: src,
+                control,
+                flags: out_flags,
+            });
+        }
+        if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        let fd = tap.borrow().fd();
+        cx.wait_objects(
+            deadline,
+            &mut [(fd, POLLIN, 0)],
+            wake::FILE,
+            &[wake::of(sock)],
+        )?;
     }
 }
 
@@ -1414,6 +1610,9 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
 /// 上的数据不经过内核层，由 [`crate::fd::HostEdges`] 记录。
 pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
     match sock {
+        Socket::Inet(InetSocket { icmp: Some(r), .. }) => {
+            [crate::rawicmp::queued(&r.tap, wake::of_value(sock)).1, 0]
+        }
         Socket::Inet(s) => [s.answered, 0],
         Socket::Netlink(s) => [s.arrivals, 0],
         Socket::Unix(u) => u.arrivals(),
@@ -1432,7 +1631,32 @@ pub(crate) fn wake_objects(sock: &RefCell<Socket>, out: &mut Vec<wake::Object>) 
 
 /// ppoll、epoll 用的就绪状态：(已经知道的事件, 需要问宿主的 fd)。
 pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
+    const POLLRDNORM: i16 = 0x040;
+    const POLLWRNORM: i16 = 0x100;
     match sock {
+        // raw ICMP socket 收到的在汇集点的队列里（crate::rawicmp），由定时器线程取下来
+        Socket::Inet(s @ InetSocket { icmp: Some(r), .. }) => {
+            let key = wake::of_value(sock);
+            let ready = crate::rawicmp::queued(&r.tap, key).0;
+            let read = if ready { POLLIN | POLLRDNORM } else { 0 };
+            let errors = s.icmp_err.get() != 0 || crate::rawicmp::has_errors(&r.tap, key);
+            let err = if errors { POLLERR } else { 0 };
+            (read | err | POLLOUT | POLLWRNORM, None)
+        }
+        // 汇集点看着的 UDP socket：宿主替它记下的 ICMP 错误让宿主 poll 报告 POLLERR，先取走，
+        // 要报告给 guest 的另外记着
+        Socket::Inet(s) if s.udp_tap.is_some() => {
+            if let Some(t) = &s.udp_tap {
+                let _ = crate::rawicmp::dispatch(t, Some(s.fd));
+            }
+            let err = if s.icmp_err.get() != 0 { POLLERR } else { 0 };
+            let stub = if s.answers.is_empty() {
+                0
+            } else {
+                POLLIN | POLLOUT
+            };
+            (err | stub, Some(s.fd))
+        }
         Socket::Inet(s) if !s.answers.is_empty() => (POLLIN | POLLOUT, None),
         Socket::Inet(s) => (0, Some(s.fd)),
         Socket::Netlink(s) => (POLLOUT | if s.queue.is_empty() { 0 } else { POLLIN }, None),

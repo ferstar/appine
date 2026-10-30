@@ -73,8 +73,17 @@ pub(crate) struct InetSocket {
     pub any: bool,
     /// 新的网络命名空间里的 `IPV6_V6ONLY`：宿主 socket 要用 IPv4 映射的地址，不设它。
     pub v6only: bool,
-    /// guest 建的是 raw ICMP socket：收到的回答要改成 raw socket 上的样子（[`RawIcmp`]）。
-    pub icmp: Option<RawIcmp>,
+    /// guest 建的是 raw ICMP socket：收到的报文经由汇集点，改成 raw socket 上的样子
+    /// （[`crate::rawicmp`]）。
+    pub icmp: Option<crate::rawicmp::RawIcmp>,
+    /// UDP：guest 设过 `IP_TTL`、`IPV6_UNICAST_HOPS`（traceroute 的探测包），自己打开了
+    /// `IP_RECVERR`、`IPV6_RECVERR`，以及看着它的错误的汇集点（[`crate::rawicmp::before_io`]）。
+    pub ttl_set: bool,
+    pub guest_recverr: bool,
+    pub udp_tap: Option<Rc<crate::cell::RefCell<crate::rawicmp::Tap>>>,
+    /// 汇集点替这个 socket 取走了宿主上的 ICMP 错误，按 Linux 的规矩要报告给 guest 的那个
+    /// （errno，0 是没有）：下一次收发、`SO_ERROR` 取走它（Linux 的 `sk_err`）。
+    pub icmp_err: std::cell::Cell<i32>,
 }
 
 impl InetSocket {
@@ -102,7 +111,19 @@ impl InetSocket {
             any: false,
             v6only: false,
             icmp: None,
+            ttl_set: false,
+            guest_recverr: false,
+            udp_tap: None,
+            icmp_err: std::cell::Cell::new(0),
         }
+    }
+}
+
+impl InetSocket {
+    /// ICMPv6 的 socket（ping socket，或者模拟 raw socket 的那个）：在新的网络命名空间里
+    /// 用不了 IPv4 映射的地址（[`crate::netns::to_host`]）。
+    pub fn icmp6(&self) -> bool {
+        self.family == AF_INET6 && self.proto == IPPROTO_ICMPV6
     }
 }
 
@@ -110,303 +131,6 @@ impl Drop for InetSocket {
     fn drop(&mut self) {
         appine_hal::net::close(self.fd);
     }
-}
-
-// ---- raw ICMP ----
-
-pub(crate) const SOL_IP: i32 = 0;
-pub(crate) const SOL_IPV6: i32 = 41;
-const SOL_ICMPV6: i32 = 58;
-const SOL_RAW: i32 = 255;
-pub(crate) const IP_TTL: i32 = 2;
-pub(crate) const IP_PKTINFO: i32 = 8;
-pub(crate) const IP_RECVTTL: i32 = 12;
-/// `ICMP_FILTER`（SOL_RAW）、`ICMPV6_FILTER`（SOL_ICMPV6）。
-const ICMP_FILTER: i32 = 1;
-const IPV6_CHECKSUM: i32 = 7;
-const ICMPV6_ECHO_REQUEST: u8 = 128;
-const ICMPV6_ECHO_REPLY: u8 = 129;
-const MSG_CTRUNC: u32 = 0x08;
-/// 宿主 `struct cmsghdr` 的长度（arm64 Linux：`size_t cmsg_len` 加两个 int）。
-const CMSG_HDR: usize = 16;
-
-/// guest 的 raw ICMP socket 在宿主上是 ping socket（不需要特权），这里补上两者的差别：
-///
-/// - ping socket 发出 echo 请求时把 id 换成自己的编号，收到的回答里也是这个编号；raw
-///   socket 原样发出，程序（busybox 的 ping 用 pid）按自己的 id 认回答。这里记下 guest
-///   最后发出的 id，收到 echo 回答时换回它，校验和跟着增量更新。
-/// - IPv4 的 raw socket 收到的数据带 IP 头，ping socket 的不带。这里拼一个 20 字节的头：
-///   TTL 和目的地址取自宿主的 `IP_TTL`、`IP_PKTINFO` 控制消息（宿主上总是打开这两项，
-///   guest 自己没打开的不交给它），TOS、IP 的 id 和标志都是 0。IPv6 的 raw socket 本来就
-///   不带 IP 头。
-/// - `ICMP_FILTER`、`ICMPV6_FILTER` 是 raw socket 才有的选项：这里记下来，过滤收到的
-///   报文。`IPV6_CHECKSUM`（ICMPv6 的默认是 2）只记下来，宿主的 ping socket 总是算校验和。
-///
-/// ping socket 只收得到自己发出的 echo 请求的回答：别的 ICMP 报文（发给本机的 echo
-/// 请求、目的不可达、超时）raw socket 上收得到，这里收不到；也只能发 echo 请求。
-pub(crate) struct RawIcmp {
-    family: i32,
-    /// guest 最后发出的 echo 请求的 id（网络字节序）。
-    id: Option<[u8; 2]>,
-    /// 过滤器，置位的类型丢掉（Linux 按 u32 数组存，IPv4 只用第一个）。
-    filter: [u8; 32],
-    /// guest 自己打开了 `IP_RECVTTL`、`IP_PKTINFO`（IPv4）。
-    recvttl: bool,
-    pktinfo: bool,
-    /// `IPV6_CHECKSUM` 的值，-1 是不算。
-    checksum: i32,
-}
-
-impl RawIcmp {
-    pub fn new(family: i32) -> RawIcmp {
-        RawIcmp {
-            family,
-            id: None,
-            filter: [0; 32],
-            recvttl: false,
-            pktinfo: false,
-            checksum: 2,
-        }
-    }
-
-    /// 宿主 socket 上要额外打开的选项。
-    pub fn host_options(&self) -> &'static [(i32, i32)] {
-        match self.family {
-            AF_INET => &[(SOL_IP, IP_RECVTTL), (SOL_IP, IP_PKTINFO)],
-            _ => &[],
-        }
-    }
-
-    /// 宿主接收时要额外留的控制消息空间（`IP_TTL`、`IP_PKTINFO` 各一条）。
-    pub fn control_room(&self) -> usize {
-        match self.family {
-            AF_INET => 2 * (CMSG_HDR + 16),
-            _ => 0,
-        }
-    }
-
-    fn echo(&self) -> (u8, u8) {
-        match self.family {
-            AF_INET => (ICMP_ECHO, ICMP_ECHOREPLY),
-            _ => (ICMPV6_ECHO_REQUEST, ICMPV6_ECHO_REPLY),
-        }
-    }
-
-    /// guest 发出一个报文：是 echo 请求时记下它的 id。
-    pub fn sent(&mut self, data: &[u8]) {
-        if data.len() >= 8 && data[0] == self.echo().0 {
-            self.id = Some([data[4], data[5]]);
-        }
-    }
-
-    /// raw socket 自己的选项。不归这里管的返回 None（交给宿主）。
-    pub fn setsockopt(&mut self, level: i32, name: i32, v: &[u8]) -> Option<Result<(), i32>> {
-        const EINVAL: i32 = 22;
-        const ENOPROTOOPT: i32 = 92;
-        let int = || match v.len() {
-            0 => 0,
-            1..4 => v[0] as i32,
-            _ => i32::from_le_bytes(v[..4].try_into().unwrap()),
-        };
-        Some(match (self.family, level, name) {
-            // Linux 的 raw_seticmpfilter、rawv6_seticmpfilter：最多拷过滤器那么长，短的只盖住
-            // 前面一部分
-            (AF_INET, SOL_RAW, ICMP_FILTER) | (AF_INET6, SOL_ICMPV6, ICMP_FILTER) => {
-                let n = v.len().min(if self.family == AF_INET { 4 } else { 32 });
-                self.filter[..n].copy_from_slice(&v[..n]);
-                Ok(())
-            }
-            (AF_INET, SOL_RAW, _) => Err(ENOPROTOOPT),
-            (AF_INET, SOL_IP, IP_RECVTTL) => {
-                self.recvttl = int() != 0;
-                Ok(())
-            }
-            (AF_INET, SOL_IP, IP_PKTINFO) => {
-                self.pktinfo = int() != 0;
-                Ok(())
-            }
-            // RFC 3542 不让在 IPPROTO_IPV6 一级给 ICMPv6 设它（Linux 的 do_rawv6_setsockopt）
-            (AF_INET6, SOL_IPV6, IPV6_CHECKSUM) => Err(EINVAL),
-            (AF_INET6, SOL_RAW, IPV6_CHECKSUM) => {
-                if v.len() < 4 {
-                    return Some(Err(EINVAL));
-                }
-                match int() {
-                    n if n > 0 && n & 1 != 0 => Err(EINVAL),
-                    n => {
-                        self.checksum = n.max(-1);
-                        Ok(())
-                    }
-                }
-            }
-            (AF_INET6, SOL_RAW, _) => Err(ENOPROTOOPT),
-            _ => return None,
-        })
-    }
-
-    /// raw socket 自己的选项的值。不归这里管的返回 None。
-    pub fn getsockopt(&self, level: i32, name: i32) -> Option<Result<Vec<u8>, i32>> {
-        const ENOPROTOOPT: i32 = 92;
-        Some(Ok(match (self.family, level, name) {
-            (AF_INET, SOL_RAW, ICMP_FILTER) => self.filter[..4].to_vec(),
-            (AF_INET6, SOL_ICMPV6, ICMP_FILTER) => self.filter.to_vec(),
-            (AF_INET, SOL_RAW, _) => return Some(Err(ENOPROTOOPT)),
-            (AF_INET, SOL_IP, IP_RECVTTL) => (self.recvttl as i32).to_le_bytes().to_vec(),
-            (AF_INET, SOL_IP, IP_PKTINFO) => (self.pktinfo as i32).to_le_bytes().to_vec(),
-            (AF_INET6, SOL_RAW | SOL_IPV6, IPV6_CHECKSUM) => self.checksum.to_le_bytes().to_vec(),
-            (AF_INET6, SOL_RAW, _) => return Some(Err(ENOPROTOOPT)),
-            _ => return None,
-        }))
-    }
-
-    /// 收到的报文改成 raw socket 上的样子。`icmp` 是收到的数据（可能被截短），`len` 是它的
-    /// 完整长度，`src` 是对端地址（已经换算成 guest 的），`control` 是宿主的控制消息，
-    /// `dst` 把宿主上的本端地址换成 guest 的。返回数据、完整长度和交给 guest 的控制消息；
-    /// 被过滤器丢掉时返回 None。
-    pub fn deliver(
-        &self,
-        mut icmp: Vec<u8>,
-        len: usize,
-        src: &[u8],
-        control: &[u8],
-        dst: impl Fn([u8; 4]) -> [u8; 4],
-    ) -> Option<(Vec<u8>, usize, Vec<u8>)> {
-        let ty = *icmp.first()?;
-        let word = |i: usize| u32::from_le_bytes(self.filter[4 * i..4 * i + 4].try_into().unwrap());
-        let blocked = match self.family {
-            AF_INET => ty < 32 && word(0) & (1 << ty) != 0,
-            _ => word(ty as usize >> 5) & (1 << (ty & 31)) != 0,
-        };
-        if blocked {
-            return None;
-        }
-        if let Some(id) = self.id
-            && ty == self.echo().1
-            && icmp.len() >= 6
-        {
-            let sum = csum_replace([icmp[2], icmp[3]], [icmp[4], icmp[5]], id);
-            icmp[2..4].copy_from_slice(&sum);
-            icmp[4..6].copy_from_slice(&id);
-        }
-        if self.family != AF_INET {
-            return Some((icmp, len, control.to_vec()));
-        }
-        let mut ttl = 64;
-        let mut daddr = [0; 4];
-        let mut kept = Vec::new();
-        for (level, ty, whole, data) in cmsgs(control) {
-            let start = kept.len();
-            match (level, ty) {
-                (SOL_IP, IP_TTL) => {
-                    if let Some(b) = data.first_chunk::<4>() {
-                        ttl = i32::from_le_bytes(*b) as u8;
-                    }
-                    if self.recvttl {
-                        kept.extend_from_slice(whole);
-                    }
-                }
-                // struct in_pktinfo：ipi_addr 是 IP 头里的目的地址。ping socket 不填
-                // ipi_spec_dst，raw socket 填回答时用的本端地址（Linux 的
-                // fib_compute_spec_dst：发给本机单播地址的就是这个地址）
-                (SOL_IP, IP_PKTINFO) if data.len() >= 12 => {
-                    daddr = dst(data[8..12].try_into().unwrap());
-                    if self.pktinfo {
-                        kept.extend_from_slice(whole);
-                        let info = &mut kept[start + CMSG_HDR..];
-                        if info[4..8] == [0; 4] {
-                            info[4..8].copy_from_slice(&daddr);
-                        } else {
-                            let spec = dst(info[4..8].try_into().unwrap());
-                            info[4..8].copy_from_slice(&spec);
-                        }
-                        info[8..12].copy_from_slice(&daddr);
-                    }
-                }
-                _ => kept.extend_from_slice(whole),
-            }
-        }
-        let total = 20 + len;
-        let mut h = vec![0u8; 20];
-        h[0] = 0x45;
-        h[2..4].copy_from_slice(&(total.min(0xffff) as u16).to_be_bytes());
-        h[8] = ttl;
-        h[9] = IPPROTO_ICMP as u8;
-        if let Some(a) = src.get(4..8) {
-            h[12..16].copy_from_slice(a);
-        }
-        h[16..20].copy_from_slice(&daddr);
-        let sum = checksum(&h);
-        h[10..12].copy_from_slice(&sum);
-        h.extend_from_slice(&icmp);
-        Some((h, total, kept))
-    }
-}
-
-/// 网际校验和（RFC 1071），网络字节序。
-fn checksum(b: &[u8]) -> [u8; 2] {
-    let mut acc: u32 = b
-        .chunks(2)
-        .map(|w| u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]) as u32)
-        .sum();
-    while acc > 0xffff {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    (!(acc as u16)).to_be_bytes()
-}
-
-/// 校验和覆盖的一个 16 位字从 `old` 改成 `new` 之后的校验和（RFC 1624 的式 3）：不用知道
-/// 别的内容（ICMPv6 的伪头部）。
-fn csum_replace(sum: [u8; 2], old: [u8; 2], new: [u8; 2]) -> [u8; 2] {
-    let mut acc = !u16::from_be_bytes(sum) as u32
-        + !u16::from_be_bytes(old) as u32
-        + u16::from_be_bytes(new) as u32;
-    while acc > 0xffff {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    (!(acc as u16)).to_be_bytes()
-}
-
-/// 逐条取宿主的控制消息：(level, type, 整条连同对齐的空白, 数据)。
-fn cmsgs(control: &[u8]) -> impl Iterator<Item = (i32, i32, &[u8], &[u8])> {
-    let mut off = 0;
-    std::iter::from_fn(move || {
-        let h = control.get(off..off + CMSG_HDR)?;
-        let len = u64::from_le_bytes(h[..8].try_into().unwrap()) as usize;
-        if len < CMSG_HDR || off + len > control.len() {
-            return None;
-        }
-        let level = i32::from_le_bytes(h[8..12].try_into().unwrap());
-        let ty = i32::from_le_bytes(h[12..16].try_into().unwrap());
-        let space = (len + 7) & !7;
-        let whole = &control[off..(off + space).min(control.len())];
-        let data = &control[off + CMSG_HDR..off + len];
-        off += space;
-        Some((level, ty, whole, data))
-    })
-}
-
-/// 控制消息放进 guest 给的 `room` 字节（Linux 的 `put_cmsg`）：放不下的那一条截短
-/// （`cmsg_len` 写成剩下的长度），之后的不再放，返回的标志带 `MSG_CTRUNC`。
-pub(crate) fn fit_control(control: &[u8], room: usize) -> (Vec<u8>, u32) {
-    let mut out = Vec::new();
-    let mut flags = 0;
-    for (_, _, whole, _) in cmsgs(control) {
-        let left = room - out.len();
-        let len = u64::from_le_bytes(whole[..8].try_into().unwrap()) as usize;
-        if left < CMSG_HDR {
-            flags |= MSG_CTRUNC;
-            break;
-        }
-        if left < len {
-            flags |= MSG_CTRUNC;
-            let start = out.len();
-            out.extend_from_slice(&whole[..left]);
-            out[start..start + 8].copy_from_slice(&(left as u64).to_le_bytes());
-            break;
-        }
-        out.extend_from_slice(&whole[..whole.len().min(left)]);
-    }
-    (out, flags)
 }
 
 // ---- /proc/net ----
@@ -505,7 +229,7 @@ pub(crate) fn proc_listing(
         }
         // 新的网络命名空间里的地址换成 guest 看到的（crate::netns）
         let guest = |a: Vec<u8>, any: bool| match &inet.net {
-            Some(ns) => crate::netns::from_host(ns, &a, any),
+            Some(ns) => crate::netns::from_host(ns, &a, any, inet.icmp6()),
             None => a,
         };
         let local = appine_hal::net::sockname(fd, false)
@@ -1819,87 +1543,5 @@ mod tests {
         assert!(!is_stub(&other));
         let fail = servfail(&[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(fail[..4], [0x12, 0x34, 0x81, 0x82]);
-    }
-
-    /// 宿主的一条控制消息。
-    fn cmsg(level: i32, ty: i32, data: &[u8]) -> Vec<u8> {
-        let mut c = ((CMSG_HDR + data.len()) as u64).to_le_bytes().to_vec();
-        c.extend_from_slice(&level.to_le_bytes());
-        c.extend_from_slice(&ty.to_le_bytes());
-        c.extend_from_slice(data);
-        c.resize(c.len().next_multiple_of(8), 0);
-        c
-    }
-
-    #[test]
-    fn raw_icmp_replies_look_like_raw_ones() {
-        // echo 回答：宿主的 ping socket 给的 id 是 0x0597，guest 发出的是 0x1234
-        let mut reply = vec![0, 0, 0, 0, 0x05, 0x97, 0, 7];
-        reply.extend(8u8..64);
-        let sum = checksum(&reply);
-        reply[2..4].copy_from_slice(&sum);
-        let mut r = RawIcmp::new(AF_INET);
-        let mut request = reply.clone();
-        request[0] = ICMP_ECHO;
-        request[4..6].copy_from_slice(&[0x12, 0x34]);
-        r.sent(&request);
-        r.setsockopt(SOL_IP, IP_PKTINFO, &[1]).unwrap().unwrap();
-        let mut control = cmsg(SOL_IP, IP_PKTINFO, &[1, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 2]);
-        control.extend(cmsg(SOL_IP, IP_TTL, &57i32.to_le_bytes()));
-        let src = [2, 0, 0, 0, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
-        let (packet, len, kept) = r.deliver(reply.clone(), 64, &src, &control, |a| a).unwrap();
-        assert_eq!(len, 84);
-        assert_eq!(packet[..4], [0x45, 0, 0, 84]);
-        assert_eq!((packet[8], packet[9]), (57, 1));
-        assert_eq!(packet[12..20], [10, 0, 0, 1, 10, 0, 0, 2]);
-        assert_eq!(checksum(&packet[..20]), [0, 0]);
-        assert_eq!(packet[24..26], [0x12, 0x34]);
-        assert_eq!(checksum(&packet[20..]), [0, 0], "ICMP 的校验和跟着改了");
-        assert_eq!(packet[28..], reply[8..]);
-        // 没打开 IP_RECVTTL：只交出 PKTINFO，ipi_spec_dst 填上目的地址
-        assert_eq!(kept.len(), 32);
-        assert_eq!(
-            kept[CMSG_HDR + 4..CMSG_HDR + 12],
-            [10, 0, 0, 2, 10, 0, 0, 2]
-        );
-
-        // 过滤器挡掉 echo 回答
-        r.setsockopt(SOL_RAW, ICMP_FILTER, &1u32.to_le_bytes())
-            .unwrap()
-            .unwrap();
-        assert!(
-            r.deliver(reply.clone(), 64, &src, &control, |a| a)
-                .is_none()
-        );
-
-        // 控制消息放不下：第一条整条，第二条截到剩下的长度；最后一条的对齐空白可以不要
-        let (fit, flags) = fit_control(&control, 32 + 18);
-        assert_eq!(flags, MSG_CTRUNC);
-        assert_eq!(fit.len(), 50);
-        assert_eq!(fit[32..40], 18u64.to_le_bytes());
-        assert_eq!(
-            fit_control(&control, 32 + 12),
-            (control[..32].to_vec(), MSG_CTRUNC)
-        );
-        assert_eq!(fit_control(&control, 32 + 20), (control[..52].to_vec(), 0));
-        assert_eq!(fit_control(&control, 8), (Vec::new(), MSG_CTRUNC));
-        assert_eq!(fit_control(&control, 64), (control.clone(), 0));
-
-        // IPv6：不拼头，只换 id；类型 129 以上按第五个字过滤
-        let mut r6 = RawIcmp::new(AF_INET6);
-        let mut v6 = reply.clone();
-        v6[0] = ICMPV6_ECHO_REQUEST;
-        r6.sent(&v6);
-        v6[0] = ICMPV6_ECHO_REPLY;
-        v6[4..6].copy_from_slice(&[0xab, 0xcd]);
-        let (out, len, _) = r6.deliver(v6.clone(), 64, &[], &[], |a| a).unwrap();
-        assert_eq!((out.len(), len), (64, 64));
-        assert_eq!(out[4..6], [0x05, 0x97]);
-        let mut filter = [0u8; 32];
-        filter[16] = 2;
-        r6.setsockopt(SOL_ICMPV6, ICMP_FILTER, &filter)
-            .unwrap()
-            .unwrap();
-        assert!(r6.deliver(v6, 64, &[], &[], |a| a).is_none());
     }
 }

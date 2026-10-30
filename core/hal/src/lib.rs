@@ -721,6 +721,64 @@ impl Edges {
     }
 }
 
+/// 一组宿主 fd：其中有就绪的（水平触发）时它本身可读，可以放进 [`poll`] 里一起等。
+pub struct Watch {
+    epfd: std::os::fd::OwnedFd,
+}
+
+impl Watch {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn new() -> Result<Watch, i32> {
+        use std::os::fd::FromRawFd;
+        let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if raw < 0 {
+            return Err(last_errno());
+        }
+        Ok(Watch {
+            epfd: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn new() -> Result<Watch, i32> {
+        Err(libc::ENOSYS)
+    }
+
+    /// 开始看 `fd`：`readable` 时看它可读，否则只看出错和挂断（总会报告的两种）。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn add(&self, fd: i32, readable: bool) -> Result<(), i32> {
+        let mut ev = libc::epoll_event {
+            events: if readable { libc::EPOLLIN as u32 } else { 0 },
+            u64: fd as u64,
+        };
+        if unsafe { libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) } < 0 {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn add(&self, _fd: i32, _readable: bool) -> Result<(), i32> {
+        Err(libc::ENOSYS)
+    }
+
+    /// 不再看 `fd`（关闭了的 fd 宿主自己会去掉）。
+    pub fn remove(&self, fd: i32) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = fd;
+    }
+
+    /// 宿主 epoll 本身的 fd。
+    pub fn fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.epfd.as_raw_fd()
+    }
+}
+
 /// 当前线程的 CPU 时间时钟，其他线程也可以用 [`clock_gettime`] 读它（线程退出后失效）。
 pub fn thread_cpu_clock() -> Option<i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]

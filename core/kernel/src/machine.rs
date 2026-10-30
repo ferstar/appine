@@ -540,6 +540,11 @@ fn timers(shared: Arc<Shared>) {
                 }
             }
         }
+        // raw ICMP socket 的汇集点：替 poll、epoll 的等待者取下到了的报文
+        match crate::bug::catch(|| crate::rawicmp::check_taps(&mut k)) {
+            Some(fds) => host.extend(fds),
+            None => crate::bug::report(format_args!("kernel panic in the raw ICMP sockets")),
+        }
         // 定时器的设置不是打开文件上的修改；有信号驱动的 I/O、独占门时才要看每一次修改
         let interest = if k.fasync.is_empty() && k.ex_gates.is_empty() {
             wake::OTHER

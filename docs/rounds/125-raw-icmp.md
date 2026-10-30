@@ -28,9 +28,9 @@ guest 建 raw ICMP socket 时，内核层记下一份 `RawIcmp`（`core/kernel/s
 
 **推迟项**：
 
-- ping socket 只收得到自己发出的 echo 请求的回答：raw socket 上收得到的别的 ICMP（发给本机的 echo 请求、目的不可达、超时）这里收不到，traceroute、mtr 这类靠 raw socket 收超时报文的仍不能用（可以经由宿主 socket 的 `IP_RECVERR` 错误队列转过来，没做）；也只能发 echo 请求，别的类型是 EINVAL。
+- ping socket 只收得到自己发出的 echo 请求的回答：raw socket 上收得到的别的 ICMP（发给本机的 echo 请求、目的不可达、超时）这里收不到，traceroute、mtr 这类靠 raw socket 收超时报文的仍不能用（可以经由宿主 socket 的 `IP_RECVERR` 错误队列转过来，没做）；也只能发 echo 请求，别的类型是 EINVAL。 → 汇集点把 raw socket 背后的 ping socket、设过 TTL 的 UDP socket 上到了的报文和 ICMP 错误分给所有 raw socket，busybox 和 Debian 的 traceroute、mtr 能用了（M9 之前：traceroute 和 mtr）；发给本机的 echo 请求、别的 UDP socket 引起的错误仍收不到，仍只能发 echo 请求
 - 一个 socket 上用几个 id 时，回答都换成最后发出的那个（宿主的 ping socket 只有一个编号，分不出来）。
 - IP 头的 TOS、id、标志都是 0，没有 IP 选项；`IP_HDRINCL`、`IPV6_HDRINCL` 设不上（LTP 的 sendmsg03 仍失败）。
-- 被过滤器挡掉的报文仍让 poll、epoll 报告可读，读的时候才丢掉。
-- 新的网络命名空间里 ICMPv6 发不到 ::1：::1 换成了 IPv4 映射的地址，ICMPv6 的 ping socket 发不过去（EINVAL），`ping6 ::1` 失败，ping socket 也一样（[网络命名空间](122-net-namespaces.md)的换算）。
+- 被过滤器挡掉的报文仍让 poll、epoll 报告可读，读的时候才丢掉。 → 已改为分发时就过滤掉（M9 之前：traceroute 和 mtr）
+- 新的网络命名空间里 ICMPv6 发不到 ::1：::1 换成了 IPv4 映射的地址，ICMPv6 的 ping socket 发不过去（EINVAL），`ping6 ::1` 失败，ping socket 也一样（[网络命名空间](122-net-namespaces.md)的换算）。 → 已补上：ICMPv6 的 socket 在新的命名空间里用宿主的 ::1（M9 之前：traceroute 和 mtr）
 - 只在 colima 的虚拟机里跑，没上手机（Android 允许 App 建 ping socket，`ping_group_range` 包括所有组）。

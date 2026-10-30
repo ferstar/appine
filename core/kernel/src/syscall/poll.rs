@@ -237,7 +237,8 @@ fn host_fd(f: &OpenFile) -> Option<i32> {
     match &f.kind {
         FileKind::Host(fd) => Some(*fd),
         FileKind::Socket(s) => match &*s.borrow() {
-            crate::net::Socket::Inet(i) => Some(i.fd),
+            // raw ICMP socket 收到的报文在汇集点的队列里（crate::rawicmp），不看宿主 fd
+            crate::net::Socket::Inet(i) if i.icmp.is_none() => Some(i.fd),
             _ => None,
         },
         _ => None,

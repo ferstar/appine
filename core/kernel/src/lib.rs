@@ -29,6 +29,7 @@ mod pipe;
 mod process;
 mod pseudo;
 mod ptrace;
+mod rawicmp;
 mod route;
 mod seccomp;
 mod signal;

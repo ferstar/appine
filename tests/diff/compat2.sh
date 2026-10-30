@@ -471,3 +471,198 @@ int main(void)
 }
 C
 gcc -O1 -o positional positional.c && ./positional
+
+# raw ICMP socket 收得到到达的所有 ICMP（appine 里经由汇集点）：别的 UDP socket 发的报文引起
+# 的端口不可达（引用原来的 IP 头、UDP 头和载荷），别的 raw socket 发的 echo 的回答；没连接的
+# UDP socket 看不到错误，连接了的只看到与连接对得上的硬错误（ECONNREFUSED）；raw socket 打开
+# IP_RECVERR 之后，网关报告的超时（TTL 1 发往外面的地址）进它的错误队列。引用的 IP 头的
+# TTL、id 不比
+cat > icmperr.c <<'C'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define ICMP_FILTER 1
+
+/* linux/errqueue.h（仓库里没有内核头文件） */
+struct sock_extended_err {
+    unsigned ee_errno;
+    unsigned char ee_origin, ee_type, ee_code, ee_pad;
+    unsigned ee_info, ee_data;
+};
+#define SO_EE_OFFENDER(ee) ((struct sockaddr *)((ee) + 1))
+
+static unsigned long add(unsigned long acc, const unsigned char *b, int n)
+{
+    for (int i = 0; i + 1 < n; i += 2)
+        acc += b[i] << 8 | b[i + 1];
+    if (n & 1)
+        acc += b[n - 1] << 8;
+    return acc;
+}
+
+static int sum_ok(const void *p, int n)
+{
+    unsigned long acc = add(0, p, n);
+    while (acc >> 16)
+        acc = (acc & 0xffff) + (acc >> 16);
+    return acc == 0xffff;
+}
+
+static int raw(unsigned pass)
+{
+    int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    unsigned filt = ~pass;
+    setsockopt(s, SOL_RAW, ICMP_FILTER, &filt, sizeof filt);
+    return s;
+}
+
+static int udp(void)
+{
+    int u = socket(AF_INET, SOCK_DGRAM, 0), ttl = 64;
+    setsockopt(u, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl);
+    return u;
+}
+
+static struct sockaddr_in lo(int port)
+{
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port),
+                            .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    return a;
+}
+
+static const char *err(long n)
+{
+    return n < 0 ? strerror(errno) : "ok";
+}
+
+/* 等 raw socket 收到一个报文，打印外层和引用的 UDP */
+static void unreachable(int r, int port)
+{
+    unsigned char b[512];
+    struct pollfd p = {r, POLLIN, 0};
+    if (poll(&p, 1, 3000) != 1) {
+        printf("  nothing\n");
+        return;
+    }
+    int n = recv(r, b, sizeof b, 0);
+    struct ip *o = (void *)b;
+    struct icmp *ic = (void *)(b + o->ip_hl * 4);
+    struct ip *in = &ic->icmp_ip;
+    unsigned char *u = (unsigned char *)in + in->ip_hl * 4;
+    printf("  %d bytes from %s:", n, inet_ntoa(o->ip_src));
+    printf(" type %d code %d checksum %s; quoted proto %d src %s", ic->icmp_type, ic->icmp_code,
+           sum_ok(ic, n - o->ip_hl * 4) ? "ok" : "bad", in->ip_p, inet_ntoa(in->ip_src));
+    printf(" dst %s len %d header %s dport %s udp len %d payload %.4s\n", inet_ntoa(in->ip_dst),
+           ntohs(in->ip_len), sum_ok(in, 20) ? "ok" : "bad",
+           u[2] << 8 == (port & 0xff00) && u[3] == (port & 0xff) ? "matches" : "differs",
+           u[4] << 8 | u[5], (char *)u + 8);
+}
+
+int main(void)
+{
+    int r = raw(1u << ICMP_DEST_UNREACH), closed = 33999;
+    struct sockaddr_in to = lo(closed);
+    char buf[64];
+
+    printf("unconnected UDP to a closed port:\n");
+    int u = udp();
+    sendto(u, "abcd", 4, 0, (void *)&to, sizeof to);
+    unreachable(r, closed);
+    printf("  UDP sendto again: %s\n", err(sendto(u, "abcd", 4, 0, (void *)&to, sizeof to)));
+    unreachable(r, closed);
+    usleep(100000);
+    printf("  recv: %s\n", err(recv(u, buf, sizeof buf, MSG_DONTWAIT)));
+    int e = -1;
+    socklen_t l = sizeof e;
+    getsockopt(u, SOL_SOCKET, SO_ERROR, &e, &l);
+    printf("  SO_ERROR %d, error queue: %s\n", e, err(recv(u, buf, sizeof buf, MSG_ERRQUEUE)));
+
+    printf("connected UDP to a closed port:\n");
+    int c = udp();
+    connect(c, (void *)&to, sizeof to);
+    send(c, "abcd", 4, 0);
+    unreachable(r, closed);
+    printf("  recv: %s\n", err(recv(c, buf, sizeof buf, MSG_DONTWAIT)));
+    printf("  recv again: %s\n", err(recv(c, buf, sizeof buf, MSG_DONTWAIT)));
+
+    printf("connected UDP, sendto another closed port:\n");
+    struct sockaddr_in other = lo(closed + 1);
+    int c2 = udp();
+    connect(c2, (void *)&to, sizeof to);
+    sendto(c2, "abcd", 4, 0, (void *)&other, sizeof other);
+    unreachable(r, closed + 1);
+    printf("  recv: %s\n", err(recv(c2, buf, sizeof buf, MSG_DONTWAIT)));
+    struct sockaddr_in peer;
+    l = sizeof peer;
+    getpeername(c2, (void *)&peer, &l);
+    printf("  peer port %d\n", ntohs(peer.sin_port));
+
+    printf("echo from another raw socket:\n");
+    int s = raw(0), r2 = raw(1u << ICMP_ECHOREPLY);
+    unsigned char e1[16] = {ICMP_ECHO, 0, 0, 0, 0x12, 0x34, 0, 1};
+    unsigned long acc = add(0, e1, sizeof e1);
+    while (acc >> 16)
+        acc = (acc & 0xffff) + (acc >> 16);
+    e1[2] = ~acc >> 8;
+    e1[3] = ~acc;
+    struct sockaddr_in any = lo(0);
+    sendto(s, e1, sizeof e1, 0, (void *)&any, sizeof any);
+    struct pollfd p = {r2, POLLIN, 0};
+    if (poll(&p, 1, 3000) == 1) {
+        unsigned char b[128];
+        int n = recv(r2, b, sizeof b, 0);
+        struct icmp *ic = (void *)(b + 20);
+        printf("  %d bytes: type %d id %#x seq %d\n", n, ic->icmp_type, ntohs(ic->icmp_id),
+               ntohs(ic->icmp_seq));
+    }
+
+    printf("IP_RECVERR on a raw socket, TTL 1 to an outside address:\n");
+    int q = raw(~0u), on = 1, one = 1;
+    setsockopt(q, IPPROTO_IP, IP_RECVERR, &on, sizeof on);
+    struct sockaddr_in out = {.sin_family = AF_INET, .sin_addr.s_addr = inet_addr("1.1.1.1")};
+    connect(q, (void *)&out, sizeof out);
+    setsockopt(q, IPPROTO_IP, IP_TTL, &one, sizeof one);
+    unsigned char e2[16] = {ICMP_ECHO, 0, 0, 0, 0x43, 0x21, 0, 1};
+    send(q, e2, sizeof e2, 0);
+    p.fd = q;
+    p.events = 0;
+    printf("  poll %d revents%s\n", poll(&p, 1, 3000), p.revents & POLLERR ? " POLLERR" : "");
+    unsigned char data[64], ctl[256];
+    struct sockaddr_in from;
+    struct iovec iov = {data, sizeof data};
+    struct msghdr m = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &iov,
+                       .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+    int n = recvmsg(q, &m, MSG_ERRQUEUE);
+    printf("  error queue: %d, flags %s, original type %d id %#x seq %d, to %s\n", n,
+           m.msg_flags & MSG_ERRQUEUE ? "MSG_ERRQUEUE" : "-", data[0], data[4] << 8 | data[5],
+           data[6] << 8 | data[7], inet_ntoa(from.sin_addr));
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level != IPPROTO_IP || h->cmsg_type != IP_RECVERR)
+            continue;
+        struct sock_extended_err *ee = (void *)CMSG_DATA(h);
+        struct sockaddr_in *off = (void *)SO_EE_OFFENDER(ee);
+        printf("  errno %s origin %d type %d code %d offender %s\n", strerror(ee->ee_errno),
+               ee->ee_origin, ee->ee_type, ee->ee_code, inet_ntoa(off->sin_addr));
+    }
+    l = sizeof e;
+    getsockopt(q, SOL_SOCKET, SO_ERROR, &e, &l);
+    printf("  then SO_ERROR %d, error queue: %s\n", e, err(recv(q, buf, sizeof buf, MSG_ERRQUEUE)));
+    return 0;
+}
+C
+gcc -O1 -o icmperr icmperr.c && ./icmperr
+
+# busybox 的 traceroute：UDP 探测包（每个换一个端口）和 -I 的 echo，都用另一个 raw socket 收。
+# 只到本机的地址：网关对 ICMP 限速（每秒一个），几个探测包接着发时原生上也时有时无
+traceroute -n -q 2 -w 2 127.0.0.1 2>&1 | sed 's/ [0-9.]* ms//g'
+traceroute -I -n -q 2 -w 2 127.0.0.1 2>&1 | sed 's/ [0-9.]* ms//g'
+traceroute6 -n -q 2 -w 2 ::1 2>&1 | sed 's/ [0-9.]* ms//g'

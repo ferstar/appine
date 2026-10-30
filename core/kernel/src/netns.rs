@@ -58,7 +58,10 @@ fn mapped(ip: &[u8]) -> Option<[u8; 4]> {
 }
 
 /// guest 给的地址换成宿主上的。不是 IPv4、IPv6 的（AF_UNSPEC 断开）原样返回。
-pub(crate) fn to_host(ns: &NetNs, addr: &[u8], usage: Use) -> Result<Vec<u8>, Errno> {
+///
+/// `icmp6` 是 ICMPv6 的 socket：它发不到 IPv4 映射的地址，::1 换成宿主真正的 ::1（echo 由
+/// 宿主内核回答，没有别的东西经由它），通配地址也绑到 ::1，别的地址照样到不了。
+pub(crate) fn to_host(ns: &NetNs, addr: &[u8], usage: Use, icmp6: bool) -> Result<Vec<u8>, Errno> {
     let Some([a, b]) = ns.host_net else {
         return Ok(addr.to_vec());
     };
@@ -81,6 +84,21 @@ pub(crate) fn to_host(ns: &NetNs, addr: &[u8], usage: Use) -> Result<Vec<u8>, Er
         Some(AF_INET) if addr.len() >= 8 => {
             let mut out = addr.to_vec();
             out[4..8].copy_from_slice(&v4(addr[4..8].try_into().unwrap())?);
+            Ok(out)
+        }
+        Some(AF_INET6) if addr.len() >= 24 && icmp6 => {
+            let ip = &addr[8..24];
+            if ip == LOOPBACK6 && !(lo.up && lo.v6) {
+                return Err(Errno::EADDRNOTAVAIL);
+            }
+            if !(ip == LOOPBACK6 || ip == [0; 16] && usage == Use::Bind) {
+                return Err(fail());
+            }
+            let mut out = addr.to_vec();
+            out[8..24].copy_from_slice(&LOOPBACK6);
+            if let Some(s) = out.get_mut(24..28) {
+                s.fill(0);
+            }
             Ok(out)
         }
         Some(AF_INET6) if addr.len() >= 24 => {
@@ -114,8 +132,8 @@ pub(crate) fn to_host(ns: &NetNs, addr: &[u8], usage: Use) -> Result<Vec<u8>, Er
 }
 
 /// 宿主给的地址（本端、对端）换成 guest 看到的。`any` 是 guest 绑的是通配地址、还没有
-/// 连接：本端地址报告成通配的。
-pub(crate) fn from_host(ns: &NetNs, addr: &[u8], any: bool) -> Vec<u8> {
+/// 连接：本端地址报告成通配的。`icmp6` 见 [`to_host`]：宿主的 ::1 就是 guest 的 ::1。
+pub(crate) fn from_host(ns: &NetNs, addr: &[u8], any: bool, icmp6: bool) -> Vec<u8> {
     let Some([a, b]) = ns.host_net else {
         return addr.to_vec();
     };
@@ -126,6 +144,11 @@ pub(crate) fn from_host(ns: &NetNs, addr: &[u8], any: bool) -> Vec<u8> {
                 out[4..8].fill(0);
             } else if addr[4..7] == [127, a, b] {
                 out[4..8].copy_from_slice(&[127, 0, 0, addr[7]]);
+            }
+        }
+        Some(AF_INET6) if addr.len() >= 24 && icmp6 => {
+            if any {
+                out[8..24].fill(0);
             }
         }
         Some(AF_INET6) if addr.len() >= 24 => {
@@ -159,9 +182,14 @@ pub(crate) fn is_any(addr: &[u8]) -> bool {
 }
 
 /// 没有绑定的 socket 先绑到的宿主地址（端口 0）。
-pub(crate) fn implicit_bind(ns: &NetNs, family: i32) -> Option<Vec<u8>> {
+pub(crate) fn implicit_bind(ns: &NetNs, family: i32, icmp6: bool) -> Option<Vec<u8>> {
     let [a, b] = ns.host_net?;
-    Some(if family == AF_INET6 {
+    Some(if icmp6 {
+        let mut s = vec![0u8; 28];
+        s[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+        s[8..24].copy_from_slice(&LOOPBACK6);
+        s
+    } else if family == AF_INET6 {
         let mut s = vec![0u8; 28];
         s[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
         s[18..20].copy_from_slice(&[0xff, 0xff]);
@@ -456,37 +484,37 @@ mod tests {
         let ns = ns();
         // lo 还关着：通配地址能绑，127.0.0.1 绑不上、连不到，外面的地址总是连不到
         assert_eq!(
-            to_host(&ns, &v4([0; 4], 80), Use::Bind).unwrap(),
+            to_host(&ns, &v4([0; 4], 80), Use::Bind, false).unwrap(),
             v4([127, 1, 2, 1], 80)
         );
         assert_eq!(
-            to_host(&ns, &v4([127, 0, 0, 1], 80), Use::Bind).unwrap(),
+            to_host(&ns, &v4([127, 0, 0, 1], 80), Use::Bind, false).unwrap(),
             v4([127, 1, 2, 1], 80)
         );
         assert_eq!(
-            to_host(&ns, &v4([127, 0, 0, 1], 80), Use::Reach),
+            to_host(&ns, &v4([127, 0, 0, 1], 80), Use::Reach, false),
             Err(Errno::ENETUNREACH)
         );
         assert_eq!(
-            to_host(&ns, &v6(LOOPBACK6, 80), Use::Reach),
+            to_host(&ns, &v6(LOOPBACK6, 80), Use::Reach, false),
             Err(Errno::EADDRNOTAVAIL)
         );
         up(&ns);
         assert_eq!(ns.lo.borrow().v4, [([127, 0, 0, 1], 8)]);
         assert_eq!(
-            to_host(&ns, &v4([127, 0, 0, 1], 80), Use::Reach).unwrap(),
+            to_host(&ns, &v4([127, 0, 0, 1], 80), Use::Reach, false).unwrap(),
             v4([127, 1, 2, 1], 80)
         );
         assert_eq!(
-            to_host(&ns, &v4([127, 0, 0, 9], 80), Use::Bind).unwrap(),
+            to_host(&ns, &v4([127, 0, 0, 9], 80), Use::Bind, false).unwrap(),
             v4([127, 1, 2, 9], 80)
         );
         assert_eq!(
-            to_host(&ns, &v4([8, 8, 8, 8], 53), Use::Reach),
+            to_host(&ns, &v4([8, 8, 8, 8], 53), Use::Reach, false),
             Err(Errno::ENETUNREACH)
         );
         assert_eq!(
-            to_host(&ns, &v4([127, 1, 0, 1], 80), Use::Bind),
+            to_host(&ns, &v4([127, 1, 0, 1], 80), Use::Bind, false),
             Err(Errno::EADDRNOTAVAIL)
         );
         // ::1 和 :: 是 IPv4 映射的 127.a.b.1，反过来是 ::1
@@ -497,30 +525,60 @@ mod tests {
             ip
         };
         assert_eq!(
-            to_host(&ns, &v6(LOOPBACK6, 80), Use::Reach).unwrap(),
+            to_host(&ns, &v6(LOOPBACK6, 80), Use::Reach, false).unwrap(),
             v6(mapped, 80)
         );
         assert_eq!(
-            to_host(&ns, &v6([0; 16], 80), Use::Bind).unwrap(),
+            to_host(&ns, &v6([0; 16], 80), Use::Bind, false).unwrap(),
             v6(mapped, 80)
         );
-        assert_eq!(from_host(&ns, &v6(mapped, 80), false), v6(LOOPBACK6, 80));
-        assert_eq!(from_host(&ns, &v6(mapped, 80), true), v6([0; 16], 80));
         assert_eq!(
-            from_host(&ns, &v4([127, 1, 2, 7], 9), false),
+            from_host(&ns, &v6(mapped, 80), false, false),
+            v6(LOOPBACK6, 80)
+        );
+        assert_eq!(
+            from_host(&ns, &v6(mapped, 80), true, false),
+            v6([0; 16], 80)
+        );
+        assert_eq!(
+            from_host(&ns, &v4([127, 1, 2, 7], 9), false, false),
             v4([127, 0, 0, 7], 9)
         );
-        assert_eq!(from_host(&ns, &v4([127, 1, 2, 1], 9), true), v4([0; 4], 9));
+        assert_eq!(
+            from_host(&ns, &v4([127, 1, 2, 1], 9), true, false),
+            v4([0; 4], 9)
+        );
         let mut doc = [0u8; 16];
         doc[0] = 0x20;
         assert_eq!(
-            to_host(&ns, &v6(doc, 80), Use::Reach),
+            to_host(&ns, &v6(doc, 80), Use::Reach, false),
             Err(Errno::ENETUNREACH)
+        );
+        // ICMPv6 的 socket：::1 是宿主的 ::1，通配地址也绑到它，别的照样到不了
+        assert_eq!(
+            to_host(&ns, &v6(LOOPBACK6, 0), Use::Reach, true).unwrap(),
+            v6(LOOPBACK6, 0)
+        );
+        assert_eq!(
+            to_host(&ns, &v6([0; 16], 0), Use::Bind, true).unwrap(),
+            v6(LOOPBACK6, 0)
+        );
+        assert_eq!(
+            to_host(&ns, &v6(doc, 0), Use::Reach, true),
+            Err(Errno::ENETUNREACH)
+        );
+        assert_eq!(
+            from_host(&ns, &v6(LOOPBACK6, 0), false, true),
+            v6(LOOPBACK6, 0)
+        );
+        assert_eq!(
+            from_host(&ns, &v6(LOOPBACK6, 0), true, true),
+            v6([0; 16], 0)
         );
         // 开机时的命名空间不换
         let init = crate::nsproxy::NsProxy::init().net;
         assert_eq!(
-            to_host(&init, &v4([8, 8, 8, 8], 53), Use::Reach).unwrap(),
+            to_host(&init, &v4([8, 8, 8, 8], 53), Use::Reach, false).unwrap(),
             v4([8, 8, 8, 8], 53)
         );
         let _ = Rc::clone(&init);

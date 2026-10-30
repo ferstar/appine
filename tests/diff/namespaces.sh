@@ -952,6 +952,9 @@ unshare -n sh -c '
     ping -c 1 -W 1 10.0.0.1 2>&1 | tail -1
 '
 
+# ICMPv6 在新的网络命名空间里：lo 打开之后 ::1 ping 得通（appine 的 ICMPv6 socket 用宿主的 ::1）
+unshare -n sh -c 'ping6 -c 1 -W 1 ::1 2>&1 | tail -1; ip link set lo up; ping6 -c 1 ::1 | sed "s/ time=.*//; /round-trip/d"'
+
 python3 - <<'PY5'
 import ctypes, errno, functools, os, socket, struct, time
 

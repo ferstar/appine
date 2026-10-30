@@ -241,6 +241,8 @@ pub(crate) struct Kernel {
     pub ex_gates: Vec<crate::syscall::ExGate>,
     /// 设置了 `O_ASYNC` 的打开文件（`syscall::poll` 的 fasync）。
     pub fasync: Vec<crate::syscall::Fasync>,
+    /// 各个网络命名空间的 ICMP 汇集点（[`crate::rawicmp`]），由定时器线程看着。
+    pub icmp_taps: Vec<std::rc::Weak<crate::cell::RefCell<crate::rawicmp::Tap>>>,
     /// 文件租约，按 inode（`syscall::lease`）。
     pub leases: BTreeMap<Ino, Vec<crate::syscall::Lease>>,
     /// `/proc/sys/fs/lease-break-time`：打破租约时最多等多少秒。
@@ -319,6 +321,7 @@ impl Kernel {
             edge_waiters: Vec::new(),
             ex_gates: Vec::new(),
             fasync: Vec::new(),
+            icmp_taps: Vec::new(),
             leases: BTreeMap::new(),
             lease_break_time: 45,
             seccomp_logged: crate::seccomp::logged::DEFAULT,

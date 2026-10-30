@@ -1,6 +1,6 @@
 # M9 之前：LTP 剩下的小差异（2026-10-31）
 
-← [M9 之前：PR_SET_CHILD_SUBREAPER（2026-10-31）](126-child-subreaper.md) · [索引](../milestones.md)
+← [M9 之前：PR_SET_CHILD_SUBREAPER（2026-10-31）](126-child-subreaper.md) · [索引](../milestones.md) · [M9 之前：traceroute 和 mtr（2026-10-31）](128-traceroute.md) →
 
 LTP 的 syscall 测试全量 214 个失败里，146 个要 loop 设备（"Failed to acquire device"），17 个是测试自己缺命令（退出码 127），还有改时钟（App 改不了宿主的）、跟踪 pid 1 这些已知的。剩下十几个真正的失败，这一轮逐个放到原生 Alpine 容器里对照：不只看通不通过，还看是哪几条失败，并且换掉会影响结果的原生环境（容器的 overlayfs 不支持文件句柄，docker 默认的 AppArmor 会检查 sendmsg 带的地址）。[剩下的小缺口](18-small-gaps.md)那一轮也这样对照过，当时的原生环境掩盖了其中几个。
 
