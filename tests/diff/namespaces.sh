@@ -27,7 +27,7 @@ unshare -m sh -c '
 echo "outside: $(grep -c ' /tmp/ns/a ' /proc/self/mountinfo)"
 
 python3 - <<'PY'
-import ctypes, errno, functools, os, threading
+import ctypes, errno, functools, os, threading, time
 
 print = functools.partial(print, flush=True)
 
@@ -41,6 +41,16 @@ MS_REC, MS_PRIVATE, MS_BIND = 0x4000, 1 << 18, 0x1000
 def call(f, *args):
     r = f(*args)
     return "ok" if r == 0 else errno.errorcode[ctypes.get_errno()]
+
+
+def join(t):
+    # t.join() 返回时内核里的线程可能还没退完，紧接着 fork 时 Python 会按 /proc/self/stat 的
+    # 线程数警告"多线程的进程 fork"（原生上时有时无），所以等它退完
+    t.join()
+    for _ in range(500):
+        if len(os.listdir("/proc/self/task")) == 1:
+            break
+        time.sleep(0.01)
 
 
 def mounted(path, pid="self"):
@@ -121,7 +131,7 @@ t = threading.Thread(target=ev.wait)
 t.start()
 print("setns with threads", call(libc.setns, mine, CLONE_NEWNS))
 ev.set()
-t.join()
+join(t)
 pid = os.fork()
 if pid == 0:
     os.setuid(65534)
@@ -141,7 +151,7 @@ cat /proc/self/uid_map /proc/self/gid_map /proc/self/projid_map /proc/self/setgr
 echo "max_user_namespaces: $(test -r /proc/sys/user/max_user_namespaces && echo yes)"
 echo "unshare -r: $(unshare -r sh -c 'id -u; id -g; cat /proc/self/uid_map' | tr -s ' \n' ' ')"
 python3 - <<'PY2'
-import ctypes, errno, functools, os, threading
+import ctypes, errno, functools, os, threading, time
 
 print = functools.partial(print, flush=True)
 libc = ctypes.CDLL(None, use_errno=True)
@@ -153,6 +163,16 @@ CLONE_NEWNS, CLONE_NEWUSER, CLONE_FS = 0x20000, 0x10000000, 0x200
 def call(f, *args):
     r = f(*args)
     return "ok" if r == 0 else errno.errorcode[ctypes.get_errno()]
+
+
+def join(t):
+    # t.join() 返回时内核里的线程可能还没退完，紧接着 fork 时 Python 会按 /proc/self/stat 的
+    # 线程数警告"多线程的进程 fork"（原生上时有时无），所以等它退完
+    t.join()
+    for _ in range(500):
+        if len(os.listdir("/proc/self/task")) == 1:
+            break
+        time.sleep(0.01)
 
 
 def write(path, data):
@@ -282,7 +302,7 @@ try:
 except OSError as e:
     print("threaded unshare", errno.errorcode[e.errno])
 ev.set()
-t.join()
+join(t)
 print("clone NEWUSER with FS", libc.syscall(220, CLONE_NEWUSER | CLONE_FS | 17, 0, 0, 0, 0), errno.errorcode[ctypes.get_errno()])
 
 
@@ -350,6 +370,16 @@ def err(f, *args):
         return "ok"
     except OSError as e:
         return errno.errorcode[e.errno]
+
+
+def join(t):
+    # t.join() 返回时内核里的线程可能还没退完，紧接着 fork 时 Python 会按 /proc/self/stat 的
+    # 线程数警告"多线程的进程 fork"（原生上时有时无），所以等它退完
+    t.join()
+    for _ in range(500):
+        if len(os.listdir("/proc/self/task")) == 1:
+            break
+        time.sleep(0.01)
 
 
 def fork(f):
@@ -464,7 +494,7 @@ def first():
         t.start()
         print("thread", t.native_id, "pthread_kill", signal.pthread_kill(t.ident, 0))
         ev.set()
-        t.join()
+        join(t)
         sleepers = [fork(lambda: time.sleep(30)) for _ in range(2)]
         time.sleep(0.2)
         os.kill(-1, signal.SIGTERM)
