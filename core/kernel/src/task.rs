@@ -67,6 +67,10 @@ pub(crate) struct Task {
     pub pending: RefCell<Pending>,
     /// 信号屏蔽字。
     pub sigmask: Cell<u64>,
+    /// 新建的子进程所在的 pid 命名空间，None 是与自己的相同（Linux 的
+    /// `nsproxy->pid_ns_for_children`；unshare、setns 的 `CLONE_NEWPID` 改它）。放在这里
+    /// 而不是 TaskState 里，`/proc/<pid>/ns/pid_for_children` 要读它。
+    pub pid_ns_children: RefCell<Option<Rc<crate::pidns::PidNs>>>,
     /// sigsuspend、ppoll 临时替换屏蔽字时原来的屏蔽字（Linux 的 `saved_sigmask` 加上
     /// `TIF_RESTORE_SIGMASK`）：处理函数的帧里保存它，没有处理函数时恢复它。放在这里而不是
     /// TaskState 里，跟踪者要读写它（PTRACE_GETSIGMASK、SETSIGMASK）。
@@ -183,6 +187,7 @@ impl Task {
             tgid,
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),
+            pid_ns_children: RefCell::default(),
             saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
             sleeping: AtomicBool::new(false),
@@ -771,8 +776,10 @@ fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
 /// 并唤醒等它的线程（pthread_join），让 vfork 的父进程继续，从使用者里注销。
 pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
     let (head, _) = task.robust_list.replace((0, 0));
+    // 锁里记的是线程自己看到的 tid（它的 pid 命名空间里的）
+    let tid = st.group.borrow().pid_ns.vnr(task.tid.get()).unwrap_or(0);
     let mut futexes = shared.futexes();
-    crate::futex::exit_robust_list(&mut futexes, &st.mm.borrow(), head, task.tid.get() as u32);
+    crate::futex::exit_robust_list(&mut futexes, &st.mm.borrow(), head, tid as u32);
     let addr = std::mem::take(&mut st.clear_child_tid);
     {
         let mm = st.mm.borrow();
@@ -836,6 +843,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         crate::bug::kill(&k, &task, pc, what);
     }
     k.tasks.remove(&tid);
+    k.release_pid(tid);
     let last = {
         let mut g = group.borrow_mut();
         g.threads.retain(|&t| t != tid);

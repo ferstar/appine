@@ -250,14 +250,15 @@ pub(crate) struct Mount {
 pub(crate) trait Pseudo {
     /// 上级目录；根目录返回 None。
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode>;
-    /// 节点在上级目录里的名字。
-    fn name(&self, node: &PseudoNode) -> Vec<u8>;
+    /// 节点在上级目录里的名字。`mnt` 是节点所在的挂载：procfs 里的 pid 按挂载的实例的
+    /// pid 命名空间算。
+    fn name(&self, mnt: MountId, node: &PseudoNode) -> Vec<u8>;
     /// 在目录里查找。
-    fn lookup(&self, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno>;
+    fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno>;
     /// 文件类型位（`S_IFMT` 部分）。
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno>;
     /// 符号链接的内容。
-    fn readlink(&self, node: &PseudoNode) -> Result<Vec<u8>, Errno>;
+    fn readlink(&self, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno>;
     /// "魔法链接"（`/proc/<pid>/fd/<n>` 等）跟随之后直接得到的节点，不按内容解析；不是魔法
     /// 链接时是 None，不许跟随时是错误（EACCES）。`mnt` 是链接所在的挂载。
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>>;
@@ -292,6 +293,9 @@ struct Mounts {
     next_dev: u64,
     /// tmpfs 的实例，按设备号（bind 挂载与源共用设备号）。
     tmpfs: std::collections::HashMap<u64, Tmpfs>,
+    /// mount(2) 挂上的 procfs 实例的 pid 命名空间（挂载的进程所在的），按设备号；开机时
+    /// 的那个和没有记的是开机时的 pid 命名空间。
+    proc_ns: std::collections::HashMap<u64, std::rc::Rc<crate::pidns::PidNs>>,
 }
 
 /// 新挂一个 tmpfs 的参数（mount(2) 的选项解析出来的）。
@@ -536,6 +540,7 @@ impl Vfs {
             next: CGROUP_MOUNT + 1,
             next_dev: 0x30,
             tmpfs: Default::default(),
+            proc_ns: Default::default(),
         };
         let cached = Cached {
             meta: store.meta().clone(),
@@ -645,7 +650,7 @@ impl Vfs {
             Node::Store(id, ino) => {
                 Node::Store(*id, self.store.lookup(*ino, name)?.ok_or(Errno::ENOENT)?)
             }
-            Node::Pseudo(id, p) => Node::Pseudo(*id, ps.lookup(p, name)?),
+            Node::Pseudo(id, p) => Node::Pseudo(*id, ps.lookup(*id, p, name)?),
         };
         Ok(self.mounted(child))
     }
@@ -713,7 +718,7 @@ impl Vfs {
     pub(crate) fn readlink(&self, ps: &dyn Pseudo, node: &Node) -> Result<Vec<u8>, Errno> {
         match node {
             Node::Store(_, ino) => self.store.readlink(*ino),
-            Node::Pseudo(_, p) => ps.readlink(p),
+            Node::Pseudo(id, p) => ps.readlink(*id, p),
         }
     }
 
@@ -964,7 +969,7 @@ impl Vfs {
                 }
                 Node::Pseudo(id, p) => match ps.parent(&p) {
                     Some(up) => {
-                        names.push(ps.name(&p));
+                        names.push(ps.name(id, &p));
                         cur = Node::Pseudo(id, up);
                     }
                     // 卸下了的挂载（MNT_DETACH）的根
@@ -1214,10 +1219,10 @@ impl Vfs {
                     cur = up;
                 }
             }
-            Node::Pseudo(_, p) => {
+            Node::Pseudo(id, p) => {
                 let mut cur = p.clone();
                 while let Some(up) = ps.parent(&cur) {
-                    names.push(ps.name(&cur));
+                    names.push(ps.name(*id, &cur));
                     cur = up;
                 }
             }
@@ -1275,6 +1280,25 @@ impl Vfs {
         drop(mounts);
         self.mounts_changed();
         id
+    }
+
+    /// 挂载 `id` 是 procfs 的实例时，挂上它的进程所在的 pid 命名空间（开机时的是 None）。
+    pub(crate) fn proc_pid_ns(&self, id: MountId) -> Option<std::rc::Rc<crate::pidns::PidNs>> {
+        let mounts = self.mounts.borrow();
+        let m = mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .find(|m| m.id == id)?;
+        mounts.proc_ns.get(&m.dev).cloned()
+    }
+
+    /// 新的 procfs 实例 `id` 属于 pid 命名空间 `ns`。
+    pub(crate) fn set_proc_pid_ns(&self, id: MountId, ns: std::rc::Rc<crate::pidns::PidNs>) {
+        let mut mounts = self.mounts.borrow_mut();
+        if let Some(dev) = mounts.list.iter().find(|m| m.id == id).map(|m| m.dev) {
+            mounts.proc_ns.insert(dev, ns);
+        }
     }
 
     /// 挂上一个新的 tmpfs 实例（根目录由这里新建），返回新挂载的编号。
@@ -1393,6 +1417,14 @@ impl Vfs {
                 .filter(|dev| !live.contains(dev))
                 .copied()
                 .collect();
+            let procs: std::collections::HashSet<u64> = mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .filter(|m| m.fs == Fs::Proc)
+                .map(|m| m.dev)
+                .collect();
+            mounts.proc_ns.retain(|dev, _| procs.contains(dev));
             dead.iter()
                 .filter_map(|dev| mounts.tmpfs.remove(dev))
                 .map(|t| t.root)
@@ -1608,14 +1640,14 @@ mod tests {
                 _ => None,
             }
         }
-        fn name(&self, node: &PseudoNode) -> Vec<u8> {
+        fn name(&self, _: MountId, node: &PseudoNode) -> Vec<u8> {
             match node {
                 PseudoNode::Static(b"sys/kernel/") => b"kernel".to_vec(),
                 PseudoNode::Static(_) => b"sys".to_vec(),
                 _ => Vec::new(),
             }
         }
-        fn lookup(&self, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
+        fn lookup(&self, _: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
             match (dir, name) {
                 (PseudoNode::ProcRoot, b"sys") => Ok(SYS),
                 (PseudoNode::Static(b"sys/"), b"kernel") => Ok(KERNEL),
@@ -1625,7 +1657,7 @@ mod tests {
         fn kind(&self, _: &PseudoNode) -> Result<u32, Errno> {
             Ok(mode::S_IFDIR)
         }
-        fn readlink(&self, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
+        fn readlink(&self, _: MountId, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
             Err(Errno::EINVAL)
         }
         fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Result<Node, Errno>> {

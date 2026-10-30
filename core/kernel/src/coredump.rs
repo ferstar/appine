@@ -116,17 +116,20 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
             Some(s) => s,
             None => break,
         };
+        // %p、%i 是进程自己的 pid 命名空间里的编号，%P、%I 是开机时的命名空间里的
+        let vnr = |id: Tid| g.pid_ns.vnr(id).unwrap_or(0).to_string();
         let text = match spec {
             b'%' => "%".to_owned(),
             b'p' => {
                 has_pid = true;
-                g.tgid.to_string()
+                vnr(g.tgid)
             }
             b'P' => {
                 has_pid = true;
                 g.tgid.to_string()
             }
-            b'i' | b'I' => cx.tid().to_string(),
+            b'i' => vnr(cx.tid()),
+            b'I' => cx.tid().to_string(),
             b'u' => g.cred.ruid.to_string(),
             b'g' => g.cred.rgid.to_string(),
             b's' => sig.number().to_string(),
@@ -150,7 +153,8 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
         out.extend_from_slice(text.as_bytes());
     }
     if k.core_uses_pid && !has_pid {
-        out.extend_from_slice(format!(".{}", g.tgid).as_bytes());
+        let pid = g.pid_ns.vnr(g.tgid).unwrap_or(0);
+        out.extend_from_slice(format!(".{pid}").as_bytes());
     }
     out
 }
@@ -419,7 +423,9 @@ fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) 
     b[12..14].copy_from_slice(&(sig.number() as u16).to_le_bytes());
     b[16..24].copy_from_slice(&t.pending.to_le_bytes());
     b[24..32].copy_from_slice(&t.blocked.to_le_bytes());
-    for (i, v) in [t.tid, g.ppid, g.pgid, g.sid].iter().enumerate() {
+    // pid 是进程自己的 pid 命名空间里的编号（Linux 的 fill_prstatus 用 task_pid_vnr）
+    for (i, &v) in [t.tid, g.ppid, g.pgid, g.sid].iter().enumerate() {
+        let v = g.pid_ns.vnr(v).unwrap_or(0);
         b[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     let cpu = if t.tid == g.tgid { process_cpu } else { t.cpu };
@@ -449,7 +455,8 @@ fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
     b[8..16].copy_from_slice(&flags.to_le_bytes());
     b[16..20].copy_from_slice(&g.cred.ruid.to_le_bytes());
     b[20..24].copy_from_slice(&g.cred.rgid.to_le_bytes());
-    for (i, v) in [g.tgid, g.ppid, g.pgid, g.sid].iter().enumerate() {
+    for (i, &v) in [g.tgid, g.ppid, g.pgid, g.sid].iter().enumerate() {
+        let v = g.pid_ns.vnr(v).unwrap_or(0);
         b[24 + i * 4..28 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     b[40..56].copy_from_slice(&cx.task.comm.get());

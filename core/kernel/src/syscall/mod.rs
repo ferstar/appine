@@ -47,7 +47,7 @@ use appine_engine::Cpu;
 
 use crate::debug;
 use crate::errno::Errno;
-use crate::kernel::Cx;
+use crate::kernel::{Cx, Tid};
 use crate::process::ExitStatus;
 use crate::signal;
 use crate::uaccess::UserSlice;
@@ -80,6 +80,57 @@ pub(crate) const NR_RESTART_SYSCALL: u64 = 128;
 
 /// 编号 -1：跟踪者在入口把编号改成它时跳过这个系统调用（Linux 的 `NO_SYSCALL`）。
 const NO_SYSCALL: u64 = u64::MAX;
+
+/// pid 命名空间里看不到的进程换成的编号：各处的查找找不到它，按各自的规矩报 ESRCH、
+/// ECHILD 等（比 `PID_MAX` 大）。
+pub(crate) const NO_PID: Tid = 0x3fff_ffff;
+
+/// 在 pid 命名空间 `ns` 里调用 `nr`：参数里的 pid、tid、进程组号换成全局编号（Linux 的
+/// `find_vpid`），看不到的换成 [`NO_PID`]。0、-1 这些特殊值不变，负数的进程组号取反换。
+/// 在结构体里的（capget、`F_SETOWN_EX`、`TIOCSPGRP`、`SCM_CREDENTIALS`）各自换。
+fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
+    let global = |v: u64| -> u64 {
+        let p = v as i32;
+        let g = |l: Tid| ns.find(l).unwrap_or(NO_PID);
+        (match p {
+            p if p > 0 => g(p),
+            p if p < -1 && p != i32::MIN => -g(-p),
+            p => p,
+        }) as u32 as u64
+    };
+    let idx: &[usize] = match nr {
+        // process_vm_readv/writev、get_robust_list、sched_*、kill、tkill、rt_sigqueueinfo、
+        // getpgid、getsid、prlimit64、wait4、sched_setattr/getattr、pidfd_open
+        270
+        | 271
+        | 100
+        | 118..=123
+        | 127
+        | 129
+        | 130
+        | 138
+        | 155
+        | 156
+        | 261
+        | 260
+        | 274
+        | 275
+        | 434 => &[0],
+        // ptrace（第一个参数是请求）
+        117 => &[1],
+        // tgkill、rt_tgsigqueueinfo、setpgid、kcmp
+        131 | 240 | 154 | 272 => &[0, 1],
+        // waitid(P_PID 或 P_PGID)、setpriority/getpriority(PRIO_PROCESS 或 PRIO_PGRP)
+        95 if matches!(a[0], 1 | 2) => &[1],
+        140 | 141 if matches!(a[0], 0 | 1) => &[1],
+        // fcntl(F_SETOWN)
+        25 if a[1] == 8 => &[2],
+        _ => &[],
+    };
+    for &i in idx {
+        a[i] = global(a[i]);
+    }
+}
 
 /// 按 aarch64 Linux 的约定处理一次 `svc #0`：x8 是编号，x0–x5 是参数，返回值写回 x0。
 pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
@@ -123,7 +174,15 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         }
         return signal::deliver(cx, cpu, true);
     }
-    let a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
+    let mut a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
+    // 在新的 pid 命名空间里：参数里的 pid 换成全局编号，返回的 pid 换回来
+    let pid_ns = {
+        let g = cx.t.group.borrow();
+        (g.pid_ns.level > 0).then(|| g.pid_ns.clone())
+    };
+    if let Some(ns) = &pid_ns {
+        pid_args(ns, nr, &mut a);
+    }
     let started = debug::trace_start();
     use xattr::Target::{Fd, Path};
 
@@ -483,6 +542,19 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             debug::unimplemented_syscall(nr);
             Err(Errno::ENOSYS)
         }
+    };
+    // set_tid_address、getpgid、getsid、setsid、getpid、getppid、gettid 返回的 pid，
+    // fcntl(F_GETOWN) 返回的 pid 或者负的进程组号（wait4 的在回收之前换好了）
+    let result = match &pid_ns {
+        Some(ns) if matches!(nr, 96 | 155 | 156 | 157 | 172 | 173 | 178) => {
+            result.map(|v| ns.vnr(v as Tid).unwrap_or(0) as u64)
+        }
+        Some(ns) if nr == 25 && a[1] == 9 => result.map(|v| {
+            let v = v as i32;
+            let l = ns.vnr(v.abs()).unwrap_or(0);
+            (if v < 0 { -l } else { l }) as u32 as u64
+        }),
+        _ => result,
     };
     // fd 上的读写返回 EAGAIN，或者 read、write、recvfrom、sendto 没有读写满要求的长度：
     // 程序在这个方向上用完了 EPOLLET 上次报告的事件（poll::drained）。表里是 (参数下标,

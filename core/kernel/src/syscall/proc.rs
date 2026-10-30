@@ -36,11 +36,12 @@ const CLONE_CHILD_SETTID: u64 = 0x1000000;
 const CLONE_SYSVSEM: u64 = 0x40000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
-/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载命名空间、用户
+const CLONE_NEWPID: u64 = 0x2000_0000;
+/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载、用户、pid
 /// 命名空间（`syscall::ns`），别的是 EPERM（设计文档 §6）。
 const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
 /// 支持的 `CLONE_NEW*`。
-const CLONE_NEW_DONE: u64 = CLONE_NEWNS | CLONE_NEWUSER;
+const CLONE_NEW_DONE: u64 = CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID;
 /// clone3：子进程的信号处理函数恢复默认。
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// clone3：子进程放进 `cgroup` 指定的 cgroup。
@@ -105,6 +106,8 @@ struct CloneArgs {
     ctid: u64,
     /// `CLONE_PIDFD`：新进程的 pidfd 写到哪里。
     pidfd: u64,
+    /// clone3 指定的新进程在各层 pid 命名空间里的编号，从它所在的那层起往外。
+    set_tid: Vec<Tid>,
 }
 
 pub(super) fn clone(
@@ -129,6 +132,7 @@ pub(super) fn clone(
         tls,
         ctid,
         pidfd: ptid,
+        set_tid: Vec::new(),
     };
     do_clone(cx, cpu, args)
 }
@@ -163,15 +167,22 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) ->
         || flags & (CLONE_THREAD | CLONE_PARENT) != 0 && exit_signal != 0
         || exit_signal > Signal::MAX as u64
         || (stack == 0) != (stack_size == 0)
-        || set_tid_size > 32
+        || set_tid_size > crate::pidns::MAX_PID_NS_LEVEL as u64
         || (set_tid == 0) != (set_tid_size == 0);
     if invalid {
         return Err(Errno::EINVAL);
     }
-    // 不能指定 pid（要 CAP_CHECKPOINT_RESTORE，CRIU 用），也没有 cgroup
-    if set_tid_size != 0 || flags & CLONE_INTO_CGROUP != 0 {
+    // 没有 cgroup
+    if flags & CLONE_INTO_CGROUP != 0 {
         return Err(Errno::EINVAL);
     }
+    // 指定各层的 pid（CRIU 用；能不能指定在 Kernel::choose_pid 里看）
+    let mut buf = vec![0u8; set_tid_size as usize * 4];
+    cx.mm().read(UserSlice::new(set_tid, buf.len()), &mut buf)?;
+    let set_tid: Vec<Tid> = buf
+        .chunks_exact(4)
+        .map(|b| Tid::from_le_bytes(b.try_into().unwrap()))
+        .collect();
     if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 && pidfd == ptid {
         return Err(Errno::EINVAL);
     }
@@ -187,6 +198,7 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) ->
         tls,
         ctid,
         pidfd,
+        set_tid,
     };
     do_clone(cx, cpu, args)
 }
@@ -206,6 +218,15 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         || both(CLONE_NEWUSER, CLONE_THREAD)
         || (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
         || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    // pid 命名空间的 1 号进程不能给自己建兄弟进程；线程要和自己在同一个 pid 命名空间里
+    let active = cx.pid_ns();
+    let for_children = cx.pid_ns_children();
+    let thread = flags & CLONE_THREAD != 0;
+    if flags & CLONE_PARENT != 0 && active.reaper.get() == Some(cx.tgid())
+        || thread && (flags & CLONE_NEWPID != 0 || for_children.id != active.id)
         || (flags & CLONE_PIDFD != 0 && flags & (CLONE_DETACHED | CLONE_THREAD) != 0)
     {
         return Err(Errno::EINVAL);
@@ -219,10 +240,14 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     if flags & CLONE_NEWUSER != 0 {
         super::ns::new_user_ns(&mut child_cred, super::ns::chrooted(cx))?;
     }
-    if flags & CLONE_NEWNS != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
+    if flags & (CLONE_NEWNS | CLONE_NEWPID) != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    let thread = flags & CLONE_THREAD != 0;
+    let pid_ns = if flags & CLONE_NEWPID != 0 {
+        super::ns::new_pid_ns(&active, &for_children, child_cred.user_ns.clone())?
+    } else {
+        for_children
+    };
     // 线程数的限制（Linux 的 copy_process）：RLIMIT_NPROC 按真实用户 ID 数线程，root 和
     // 有 CAP_SYS_RESOURCE 或 CAP_SYS_ADMIN 的不受它限制；threads-max 对谁都有效
     {
@@ -240,7 +265,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
             return Err(Errno::EAGAIN);
         }
     }
-    let tid = cx.k().alloc_tid()?;
+    let cred = cx.cred();
+    let tid = cx.k().choose_pid(&pid_ns, &cred, &args.set_tid)?;
 
     let mm = if flags & CLONE_VM != 0 {
         cx.t.mm.clone()
@@ -304,6 +330,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.ctty = parent.ctty.clone();
         g.exe = parent.exe.clone();
         g.exit_signal = args.exit_signal;
+        g.pid_ns = pid_ns.clone();
         Rc::new(RefCell::new(g))
     };
 
@@ -371,30 +398,40 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     // 被跟踪的线程 clone 出来的可能也被跟踪（crate::ptrace）
     let traced = crate::ptrace::clone(cx.task, &task, flags, args.exit_signal);
 
+    // 在 pid 命名空间的各层分配编号：父进程看到的是它那层的，子线程自己看到的是它那层的
+    cx.k().register_pid(&pid_ns, tid, &args.set_tid)?;
+    let (vtid, child_vtid) = (cx.pid_out(tid), pid_ns.vnr(tid).unwrap_or(0));
     // 写 tid 之前先确认能启动线程，失败时不留下任何痕迹
-    if flags & CLONE_PARENT_SETTID != 0 {
-        put(cx, ptid, tid.to_le_bytes())?;
-    }
-    if flags & CLONE_CHILD_SETTID != 0 {
-        mm.borrow()
-            .write(UserSlice::new(ctid, 4), &tid.to_le_bytes())?;
-    }
-    // CLONE_PIDFD：在父进程里打开新进程的 pidfd（没有 CLONE_FILES 时子进程看不到它）
-    let pidfd = if flags & CLONE_PIDFD != 0 {
-        let fd = cx.fds_mut().install(new_pidfd(tid, &group, 0), true, 0)?;
-        if let Err(e) = put(cx, args.pidfd, fd.to_le_bytes()) {
-            let _ = cx.fds_mut().close(fd);
+    let started = (|| {
+        if flags & CLONE_PARENT_SETTID != 0 {
+            put(cx, ptid, vtid.to_le_bytes())?;
+        }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            mm.borrow()
+                .write(UserSlice::new(ctid, 4), &child_vtid.to_le_bytes())?;
+        }
+        // CLONE_PIDFD：在父进程里打开新进程的 pidfd（没有 CLONE_FILES 时子进程看不到它）
+        let pidfd = if flags & CLONE_PIDFD != 0 {
+            let fd = cx.fds_mut().install(new_pidfd(tid, &group, 0), true, 0)?;
+            if let Err(e) = put(cx, args.pidfd, fd.to_le_bytes()) {
+                let _ = cx.fds_mut().close(fd);
+                return Err(e);
+            }
+            Some(fd)
+        } else {
+            None
+        };
+        let shared = cx.shared;
+        if let Err(e) = task::start(shared, cx.k(), task, child_cpu) {
+            if let Some(fd) = pidfd {
+                let _ = cx.fds_mut().close(fd);
+            }
             return Err(e);
         }
-        Some(fd)
-    } else {
-        None
-    };
-    let shared = cx.shared;
-    if let Err(e) = task::start(shared, cx.k(), task, child_cpu) {
-        if let Some(fd) = pidfd {
-            let _ = cx.fds_mut().close(fd);
-        }
+        Ok(())
+    })();
+    if let Err(e) = started {
+        cx.k().release_pid(tid);
         return Err(e);
     }
     if !thread {
@@ -407,11 +444,12 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         }
     }
 
-    // 跟踪者打开了这个事件：报告新线程（PTRACE_EVENT_FORK、VFORK、CLONE）
+    // 跟踪者打开了这个事件：报告新线程（PTRACE_EVENT_FORK、VFORK、CLONE），编号是跟踪者
+    // 看到的（Linux 的 ptrace_event_pid）
     if let Some(e) = traced
-        && !crate::ptrace::event(cx, cpu, e, tid as u64)
+        && !crate::ptrace::event(cx, cpu, e, crate::ptrace::tracer_pid_of(cx, tid) as u64)
     {
-        return Ok(tid as u64);
+        return Ok(vtid as u64);
     }
     // vfork：等子进程 execve 或退出；只有致命信号能打断（Linux 的 TASK_KILLABLE）。两者都
     // 直接叫醒这个线程（task::release_mm、signal::group_exit）
@@ -419,9 +457,10 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         while !done.get() && !cx.task.killed.get() {
             cx.wait_alone(None)?;
         }
-        crate::ptrace::event(cx, cpu, crate::ptrace::event::VFORK_DONE, tid as u64);
+        let pid = crate::ptrace::tracer_pid_of(cx, tid);
+        crate::ptrace::event(cx, cpu, crate::ptrace::event::VFORK_DONE, pid as u64);
     }
-    Ok(tid as u64)
+    Ok(vtid as u64)
 }
 
 /// 真实用户 ID 是 `uid` 的线程数（`RLIMIT_NPROC`）。
@@ -830,6 +869,7 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
         let task = k.tasks.remove(&me).unwrap();
         task.tid.set(tgid);
         k.tasks.insert(tgid, task);
+        k.release_pid(me);
         let mut g = cx.t.group.borrow_mut();
         g.threads = vec![tgid];
         // 原来的主线程已经被回收了（Linux 的 de_thread 里 release_task）
@@ -890,6 +930,7 @@ struct Wanted {
 }
 
 /// 找到的子进程状态变化：(pid, 事件, 子进程和它回收过的子进程用掉的 CPU 时间)。
+/// 子进程（调用者看到的编号）、它的状态变化和资源用量。
 type Found = (Tid, ChildEvent, process::Rusage);
 
 /// 找到一个符合条件的子进程状态变化，`consume` 时取走它（已结束的子进程同时被回收）。
@@ -929,17 +970,20 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         if g.exit_tracer.is_some() {
             continue;
         }
+        // 回收之前换算：回收之后编号就不在 pid 命名空间里了
+        let vpid = cx.pid_out(c);
         if let (true, Some(status)) = (want.exited, g.zombie) {
             let usage = usage(&g, cx.kr());
             if want.consume {
                 drop(g);
                 cx.k().groups.remove(&c);
+                cx.k().release_pid(c);
                 let mut me = cx.t.group.borrow_mut();
                 me.children.retain(|&x| x != c);
                 me.child_cpu += usage.cpu;
                 me.child_maxrss_kb = me.child_maxrss_kb.max(usage.maxrss_kb);
             }
-            return Ok(Some((c, ChildEvent::Exited(status), usage)));
+            return Ok(Some((vpid, ChildEvent::Exited(status), usage)));
         }
         if traced {
             continue;
@@ -948,13 +992,13 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
             if want.consume {
                 g.stop_report = None;
             }
-            return Ok(Some((c, ChildEvent::Stopped(sig), usage(&g, cx.kr()))));
+            return Ok(Some((vpid, ChildEvent::Stopped(sig), usage(&g, cx.kr()))));
         }
         if want.continued && g.cont_report {
             if want.consume {
                 g.cont_report = false;
             }
-            return Ok(Some((c, ChildEvent::Continued, usage(&g, cx.kr()))));
+            return Ok(Some((vpid, ChildEvent::Continued, usage(&g, cx.kr()))));
         }
     }
     // 跟踪着的线程：ptrace-stop 不要求 WUNTRACED（与 Linux 一样，也不要求 __WALL）
@@ -982,7 +1026,11 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
                 .groups
                 .get(&t.tgid)
                 .map_or_else(process::Rusage::default, |g| usage(&g.borrow(), cx.kr()));
-            return Ok(Some((t.tid.get(), ChildEvent::Trapped(code), usage)));
+            return Ok(Some((
+                cx.pid_out(t.tid.get()),
+                ChildEvent::Trapped(code),
+                usage,
+            )));
         }
     }
     // 跟踪着的线程退出了
@@ -993,7 +1041,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
     {
         any = true;
         if want.exited {
-            let (pid, status) = (exits[i].pid, exits[i].status);
+            let (pid, seen, status) = (exits[i].pid, exits[i].seen, exits[i].status);
             // 整个进程的结束：与 Linux 一样报告它的用量（它还在，等着交给父进程）
             let usage = match cx.kr().groups.get(&pid) {
                 Some(g) if exits[i].process => usage(&g.borrow(), cx.kr()),
@@ -1003,7 +1051,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
                 let e = cx.k().trace_exits.remove(i);
                 crate::ptrace::released(cx.k(), &e);
             }
-            return Ok(Some((pid, ChildEvent::Exited(status), usage)));
+            return Ok(Some((seen, ChildEvent::Exited(status), usage)));
         }
     }
     if any { Ok(None) } else { Err(Errno::ECHILD) }
@@ -1307,9 +1355,20 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEWUSER != 0 {
         super::ns::new_user_ns(&mut new_cred, super::ns::chrooted(cx))?;
     }
-    if flags & CLONE_NEWNS != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
+    if flags & (CLONE_NEWNS | CLONE_NEWPID) != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
+    // 新的 pid 命名空间只给以后的子进程用（自己不进去）；进去之前不能再 unshare 一次
+    let pid_ns = if flags & CLONE_NEWPID != 0 {
+        let owner = new_cred.user_ns.clone();
+        Some(super::ns::new_pid_ns(
+            &cx.pid_ns(),
+            &cx.pid_ns_children(),
+            owner,
+        )?)
+    } else {
+        None
+    };
     // 每个线程的 TaskState 和 TaskRes 各持有一份引用
     let others = |count: usize| count > 2;
     if flags & CLONE_FILES != 0 && others(Rc::strong_count(&cx.t.fds)) {
@@ -1341,6 +1400,9 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         let owner = new_cred.user_ns.clone();
         super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut cx.t.fs.borrow_mut(), owner);
         cx.shared.fast_changed();
+    }
+    if pid_ns.is_some() {
+        *cx.task.pid_ns_children.borrow_mut() = pid_ns;
     }
     // 与 Linux 的 exit_sem 一样，执行并丢掉 SysV 信号量的 undo
     if flags & CLONE_SYSVSEM != 0 {

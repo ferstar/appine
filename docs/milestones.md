@@ -128,6 +128,7 @@
 | [M9 之前：tmpfs](rounds/117-tmpfs.md) | 2026-10-30 | 让 bubblewrap 能用的第二轮：tmpfs 是仓库里不挂在根目录下面的一棵树（上级是自己的目录，记在 `detached_roots` 里），每次挂上是新实例、有自己的设备号，挂载和 bind 都没了时连同里面的一起删掉、开机删上次留下的；选项和 mountinfo 照 Linux 6.1 的 shmem；差分测试里照 bubblewrap 的步骤换根（tmpfs 做底、两次 pivot_root、只读 bind、`--dev`、`--proc`）与原生相同 |
 | [M9 之前：挂载命名空间](rounds/118-mount-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第三轮：`clone`、`unshare` 的 `CLONE_NEWNS` 复制整棵挂载树（挂载命名空间放在 `FsContext` 里，挂载记着所属的命名空间，没人用了就卸下），mountinfo 和 mount、umount、pivot_root 只看自己的命名空间；`/proc/<pid>/ns/*` 和 nsfs 文件、setns(2)；`/proc/<pid>/root`、`cwd` 改成魔法链接 |
 | [M9 之前：用户命名空间](rounds/119-user-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第四轮：`CLONE_NEWUSER`（不要特权），凭据记着用户命名空间，对外的 ID 按 uid_map、gid_map 换算，`/proc/<pid>/uid_map`、`gid_map`、`setgroups` 照 Linux 6.1 读写；74 处能力检查分成 `capable()`、`capable_wrt_inode_uidgid`、`ns_capable` 三种；顺带照 Linux 补上 ptrace 访问检查的 commoncap 一步、setuid 之后不可 dump、execve 恢复可以 dump |
+| [M9 之前：pid 命名空间](rounds/120-pid-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第五轮：`CLONE_NEWPID`（clone、unshare、setns），内核里的 pid 仍是全局的，每个命名空间记一张本层编号的表，系统调用的参数、返回值、siginfo、wait、`SO_PEERCRED` 等在边界换算；1 号进程收养孤儿、不接收按默认方式处理的信号，它退出时结束里面的进程、等它们被回收；procfs 按挂上它的进程所在的命名空间编号，status 补上 `NSpid` 等四行 |
 
 ## 测量条件
 

@@ -1,6 +1,7 @@
-//! 命名空间（设计文档 §6）：`clone`、`unshare` 的 `CLONE_NEWNS`、`CLONE_NEWUSER` 新建挂载
-//! 命名空间、用户命名空间，`/proc/<pid>/ns/*`（`crate::pseudo::NsKind`）和 setns(2)。别的
-//! 命名空间还没有：`/proc/<pid>/ns` 里它们总是开机时的那个，setns 到它们什么也不做。
+//! 命名空间（设计文档 §6）：`clone`、`unshare` 的 `CLONE_NEWNS`、`CLONE_NEWUSER`、
+//! `CLONE_NEWPID` 新建挂载命名空间、用户命名空间、pid 命名空间（`crate::pidns`），
+//! `/proc/<pid>/ns/*`（`crate::pseudo::NsKind`）和 setns(2)。别的命名空间还没有：
+//! `/proc/<pid>/ns` 里它们总是开机时的那个，setns 到它们什么也不做。
 
 use std::rc::Rc;
 
@@ -9,6 +10,7 @@ use crate::cred::{Cred, MAX_USER_NS_LEVEL, UserNs, cap};
 use crate::errno::Errno;
 use crate::fd::FileKind;
 use crate::kernel::{Cx, Kernel};
+use crate::pidns::{MAX_PID_NS_LEVEL, PidNs};
 use crate::pseudo::{NsKind, PseudoNode};
 use crate::task::FsContext;
 use crate::vfs::{MntNs, Node, Vfs, new_ns_id};
@@ -54,6 +56,27 @@ pub(super) fn new_user_ns(cred: &mut Cred, chrooted: bool) -> Result<(), Errno> 
     Ok(())
 }
 
+/// 新建 pid 命名空间（Linux 6.1 的 `copy_pid_ns`、`create_pid_namespace`），在 `parent`
+/// （新建的子进程所在的那个）下面、属于用户命名空间 `owner`：`parent` 要是自己所在的
+/// （unshare 了还没有进去时 EINVAL），`owner` 要是 `parent` 的属主或者它的后代（EPERM），
+/// 最多嵌套 32 层（ENOSPC）。
+pub(super) fn new_pid_ns(
+    active: &PidNs,
+    parent: &Rc<PidNs>,
+    owner: Rc<UserNs>,
+) -> Result<Rc<PidNs>, Errno> {
+    if parent.id != active.id {
+        return Err(Errno::EINVAL);
+    }
+    if !parent.owner.is_ancestor_of(&owner) {
+        return Err(Errno::EPERM);
+    }
+    if parent.level + 1 > MAX_PID_NS_LEVEL {
+        return Err(Errno::ENOSPC);
+    }
+    Ok(PidNs::child(parent, owner))
+}
+
 /// 根目录不是挂载命名空间的根（chroot 了，Linux 的 `current_chrooted`）。
 pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
     let Ok(vfs) = cx.vfs() else {
@@ -61,6 +84,28 @@ pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
     };
     vfs.ns_root(cx.mnt_ns())
         .is_some_and(|root| root != cx.root())
+}
+
+/// 编号为 `id`、还有进程在里面（或者在它下面），或者是哪个线程给子进程用的 pid 命名空间。
+fn find_pid_ns(k: &Kernel, id: u64) -> Option<Rc<PidNs>> {
+    let up = |ns: Rc<PidNs>| {
+        let mut ns = Some(ns);
+        while let Some(n) = ns {
+            if n.id == id {
+                return Some(n);
+            }
+            ns = n.parent.clone();
+        }
+        None
+    };
+    k.groups
+        .values()
+        .find_map(|g| up(g.borrow().pid_ns.clone()))
+        .or_else(|| {
+            k.tasks
+                .values()
+                .find_map(|t| t.pid_ns_children.borrow().clone().and_then(up))
+        })
 }
 
 /// 编号为 `id`、还有进程在里面（或者在它下面）的用户命名空间。
@@ -135,7 +180,52 @@ pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
             cx.shared.fast_changed();
             Ok(0)
         }
+        // Linux 的 pidns_install：在它的属主和自己的用户命名空间里都要有 CAP_SYS_ADMIN，
+        // 只能是自己所在的或者它的后代；之后建的子进程在里面
+        NsKind::Pid | NsKind::PidForChildren => {
+            let ns = find_pid_ns(cx.kr(), id).ok_or(Errno::EINVAL)?;
+            if !cred.ns_capable(&ns.owner, cap::SYS_ADMIN) || !cred.capable_here(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            if !cx.pid_ns().is_ancestor_of(&ns) {
+                return Err(Errno::EINVAL);
+            }
+            *cx.task.pid_ns_children.borrow_mut() = Some(ns);
+            Ok(0)
+        }
         _ if cred.capable(cap::SYS_ADMIN) => Ok(0),
         _ => Err(Errno::EPERM),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_namespace_limits() {
+        let init = PidNs::init();
+        let user = UserNs::init();
+        // 最多 32 层：在第 31 层里还能建，第 32 层里是 ENOSPC
+        let mut ns = init.clone();
+        for level in 1..=MAX_PID_NS_LEVEL {
+            ns = new_pid_ns(&ns, &ns, user.clone()).unwrap();
+            assert_eq!(ns.level, level);
+        }
+        assert_eq!(
+            new_pid_ns(&ns, &ns, user.clone()).unwrap_err(),
+            Errno::ENOSPC
+        );
+        // unshare 了、还没进去：给子进程用的和自己所在的不同时 EINVAL
+        let child = new_pid_ns(&init, &init, user.clone()).unwrap();
+        assert_eq!(
+            new_pid_ns(&init, &child, user.clone()).unwrap_err(),
+            Errno::EINVAL
+        );
+        // 属主要是父命名空间的属主或者它的后代
+        let other = UserNs::child(&user, 1000);
+        let owned = new_pid_ns(&init, &init, other.clone()).unwrap();
+        assert_eq!(new_pid_ns(&owned, &owned, user).unwrap_err(), Errno::EPERM);
+        assert!(new_pid_ns(&owned, &owned, other).is_ok());
     }
 }

@@ -14,7 +14,7 @@ use crate::ipc::{
     IPC_NOWAIT, Ipc, Msg, MsgQueue, Perm, SHM_DEST, SHM_LOCKED, SemOp, SemSet, ShmSeg, limits,
     nattch, now, reap_shm,
 };
-use crate::kernel::{Cx, Kernel};
+use crate::kernel::{Cx, Kernel, Tid};
 use crate::mm::SharedMemory;
 use crate::uaccess::UserSlice;
 
@@ -195,7 +195,8 @@ pub(super) fn msgrcv(
 }
 
 /// `struct msqid64_ds`（120 字节）。
-fn encode_msqid(perm: &Perm, q: &MsgQueue) -> [u8; 120] {
+/// `pid` 把记下的 pid 换成调用者看到的。
+fn encode_msqid(perm: &Perm, q: &MsgQueue, pid: impl Fn(Tid) -> Tid) -> [u8; 120] {
     let mut b = [0u8; 120];
     b[..48].copy_from_slice(&perm.encode());
     words(
@@ -211,7 +212,7 @@ fn encode_msqid(perm: &Perm, q: &MsgQueue) -> [u8; 120] {
         ],
         8,
     );
-    words(&mut b, 96, &[q.lspid as u64, q.lrpid as u64], 4);
+    words(&mut b, 96, &[pid(q.lspid) as u64, pid(q.lrpid) as u64], 4);
     b
 }
 
@@ -243,10 +244,11 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             Ok(max as u64)
         }
         IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
+            let ns = cx.pid_ns();
             let t = &cx.kr().ipc.msg;
             let (full, (perm, q)) =
                 stat_target(t, &cred, id, cmd != IPC_STAT, cmd == MSG_STAT_ANY)?;
-            let b = encode_msqid(perm, q);
+            let b = encode_msqid(perm, q, |p| ns.vnr(p).unwrap_or(0));
             put(cx, buf, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
         }
@@ -383,6 +385,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
             Ok(0)
         }
         GETVAL | GETPID | GETNCNT | GETZCNT => {
+            let ns = cx.pid_ns();
             let (perm, s) = cx.kr().ipc.sem.get(id)?;
             perm.check(&cred, READ)?;
             let i = usize::try_from(num)
@@ -391,7 +394,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
                 .ok_or(Errno::EINVAL)?;
             Ok(match cmd {
                 GETVAL => s.vals[i] as u64,
-                GETPID => s.pids[i] as u64,
+                GETPID => ns.vnr(s.pids[i]).unwrap_or(0) as u64,
                 GETNCNT => s.ncnt[i] as u64,
                 _ => s.zcnt[i] as u64,
             })
@@ -635,7 +638,8 @@ pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
 }
 
 /// `struct shmid64_ds`（112 字节）。
-fn encode_shmid(perm: &Perm, s: &ShmSeg, nattch: u64) -> [u8; 112] {
+/// `pid` 把记下的 pid 换成调用者看到的。
+fn encode_shmid(perm: &Perm, s: &ShmSeg, nattch: u64, pid: impl Fn(Tid) -> Tid) -> [u8; 112] {
     let mut b = [0u8; 112];
     b[..48].copy_from_slice(&perm.encode());
     words(
@@ -644,7 +648,7 @@ fn encode_shmid(perm: &Perm, s: &ShmSeg, nattch: u64) -> [u8; 112] {
         &[s.size, s.atime as u64, s.dtime as u64, s.ctime as u64],
         8,
     );
-    words(&mut b, 80, &[s.cpid as u64, s.lpid as u64], 4);
+    words(&mut b, 80, &[pid(s.cpid) as u64, pid(s.lpid) as u64], 4);
     words(&mut b, 88, &[nattch], 8);
     b
 }
@@ -680,10 +684,11 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             Ok(max as u64)
         }
         IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
+            let ns = cx.pid_ns();
             let k = cx.kr();
             let (full, (perm, s)) =
                 stat_target(&k.ipc.shm, &cred, id, cmd != IPC_STAT, cmd == SHM_STAT_ANY)?;
-            let b = encode_shmid(perm, s, nattch(k, full));
+            let b = encode_shmid(perm, s, nattch(k, full), |p| ns.vnr(p).unwrap_or(0));
             put(cx, buf, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
         }

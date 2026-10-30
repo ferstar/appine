@@ -358,14 +358,16 @@ pub(super) fn mq_timedsend(
     };
     match notify {
         Some(Notify::Signal { tgid, sig, value }) => {
+            // si_pid 是登记通知的进程看到的（Linux 的 __do_notify）
             let info = SigInfo {
                 code: SI_MESGQ,
                 fields: InfoFields::Queue {
-                    pid: cx.tgid(),
+                    pid: cx.kr().pid_seen_by(tgid, cx.tgid()),
                     uid: cx.cred().ruid,
                     value,
                 },
                 esr: 0,
+                sender: cx.tgid(),
             };
             signal::send_to_group(cx.kr(), tgid, sig, info);
         }

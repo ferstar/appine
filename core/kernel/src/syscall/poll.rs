@@ -680,6 +680,7 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
                     fd,
                 },
                 esr: 0,
+                sender: 0,
             }
         };
         send_to_owner(k, ty, pid, signo, info);

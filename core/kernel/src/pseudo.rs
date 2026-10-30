@@ -22,6 +22,7 @@ use crate::ipc;
 use crate::kernel::{INIT, Kernel, Tid};
 use crate::mm::Region;
 use crate::net::{AF_INET, AF_INET6, Table};
+use crate::pidns::PidNs;
 use crate::process::{Signal, ThreadGroup};
 use crate::signal::SigAction;
 use crate::syscall::SocketRef;
@@ -176,21 +177,30 @@ impl NsKind {
     }
 
     /// 线程 `task` 的这种命名空间的编号（inode 号）：挂载命名空间的按它的 `FsContext`，
-    /// 用户命名空间的按它的凭据，别的是开机时的那个（与 Linux 常见的编号相同）。
-    pub(crate) fn id_of(self, k: &Kernel, task: &Task) -> u64 {
-        match self {
+    /// 用户命名空间的按它的凭据，pid 命名空间的按它的进程和线程，别的是开机时的那个（与
+    /// Linux 常见的编号相同）。没有时（ENOENT）是 None。
+    pub(crate) fn id_of(self, k: &Kernel, task: &Task) -> Option<u64> {
+        let group = k.groups.get(&task.tgid);
+        Some(match self {
             NsKind::Mnt => task.res.borrow().fs.borrow().mnt_ns.id,
-            NsKind::User => k
-                .groups
-                .get(&task.tgid)
-                .map_or(crate::cred::INIT_USER_NS, |g| g.borrow().cred.user_ns.id),
+            NsKind::User => group.map_or(crate::cred::INIT_USER_NS, |g| g.borrow().cred.user_ns.id),
             NsKind::Cgroup => 4_026_531_835,
             NsKind::Ipc => 4_026_531_839,
             NsKind::Net => 4_026_531_840,
-            NsKind::Pid | NsKind::PidForChildren => 4_026_531_836,
+            NsKind::Pid => k.pid_ns_of(task.tgid).id,
+            // unshare 了、还没有建子进程时没有（Linux 的 pidns_for_children_get 看
+            // child_reaper）
+            NsKind::PidForChildren => {
+                let ns = task.pid_ns_children.borrow().clone();
+                let ns = ns.unwrap_or_else(|| k.pid_ns_of(task.tgid));
+                if ns.level > 0 && ns.reaper.get().is_none() {
+                    return None;
+                }
+                ns.id
+            }
             NsKind::Time | NsKind::TimeForChildren => 4_026_531_834,
             NsKind::Uts => 4_026_531_838,
-        }
+        })
     }
 }
 
@@ -613,16 +623,16 @@ impl Pseudo for Offline {
     fn parent(&self, _: &PseudoNode) -> Option<PseudoNode> {
         None
     }
-    fn name(&self, _: &PseudoNode) -> Vec<u8> {
+    fn name(&self, _: MountId, _: &PseudoNode) -> Vec<u8> {
         Vec::new()
     }
-    fn lookup(&self, _: &PseudoNode, _: &[u8]) -> Result<PseudoNode, Errno> {
+    fn lookup(&self, _: MountId, _: &PseudoNode, _: &[u8]) -> Result<PseudoNode, Errno> {
         Err(Errno::ENOENT)
     }
     fn kind(&self, _: &PseudoNode) -> Result<u32, Errno> {
         Ok(mode::S_IFDIR)
     }
-    fn readlink(&self, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
+    fn readlink(&self, _: MountId, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
         Err(Errno::EINVAL)
     }
     fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Result<Node, Errno>> {
@@ -707,6 +717,23 @@ impl<'a> View<'a> {
             .and_then(|t| self.k.tasks.get(t).cloned())
     }
 
+    /// 挂载 `mnt`（procfs 的一个实例）的 pid 命名空间：目录名、链接和文件里的 pid 按它
+    /// 算（Linux 的 `proc_pid_ns`）。
+    pub(crate) fn pid_ns(&self, mnt: MountId) -> Rc<PidNs> {
+        self.vfs.proc_pid_ns(mnt).unwrap_or_else(PidNs::init)
+    }
+
+    /// 读者所在的 pid 命名空间里最后分配的编号（`ns_last_pid`、`loadavg`，Linux 按读者的
+    /// 命名空间，不按挂载的）。
+    fn last_pid(&self) -> Tid {
+        let ns = self.k.pid_ns_of(self.tgid);
+        if ns.level == 0 {
+            self.k.last_pid()
+        } else {
+            ns.last_pid()
+        }
+    }
+
     /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
     pub(crate) fn reader(&self) -> Cred {
         self.group(self.tgid)
@@ -769,7 +796,7 @@ impl Pseudo for View<'_> {
         })
     }
 
-    fn name(&self, node: &PseudoNode) -> Vec<u8> {
+    fn name(&self, mnt: MountId, node: &PseudoNode) -> Vec<u8> {
         use PseudoNode::*;
         match node {
             PtsRoot => b"pts".to_vec(),
@@ -789,8 +816,18 @@ impl Pseudo for View<'_> {
             SysNet(_, path) => tree_name(path).to_vec(),
             Cgroup(b"") => b"cgroup".to_vec(),
             Cgroup(name) => name.to_vec(),
-            Pid(pid, None) => pid.to_string().into_bytes(),
-            Pid(_, Some(tid)) => tid.to_string().into_bytes(),
+            Pid(pid, None) => self
+                .pid_ns(mnt)
+                .vnr(*pid)
+                .unwrap_or(0)
+                .to_string()
+                .into_bytes(),
+            Pid(_, Some(tid)) => self
+                .pid_ns(mnt)
+                .vnr(*tid)
+                .unwrap_or(0)
+                .to_string()
+                .into_bytes(),
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
             Net(_, _, name) => name.to_vec(),
             Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
@@ -799,8 +836,13 @@ impl Pseudo for View<'_> {
         }
     }
 
-    fn lookup(&self, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
+    fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
         use PseudoNode::*;
+        // 名字里的 pid 是挂载的 pid 命名空间里的编号
+        let global = |name: &[u8]| {
+            let n = Tid::try_from(parse_num(name)?).ok()?;
+            self.pid_ns(mnt).find(n)
+        };
         let found = match dir {
             PtsRoot => {
                 if name == b"ptmx" {
@@ -823,7 +865,7 @@ impl Pseudo for View<'_> {
                     .find(|(n, _)| *n == name)
                     .map(|(_, g)| Global(*g))
                     .or_else(|| {
-                        let pid = parse_num(name)? as Tid;
+                        let pid = global(name)?;
                         self.pid_exists(pid, None).then_some(Pid(pid, None))
                     }),
             },
@@ -867,8 +909,7 @@ impl Pseudo for View<'_> {
                     self::Entry::Fd => Fd(*pid, fd),
                     _ => FdInfo(*pid, fd),
                 }),
-            Entry(pid, None, self::Entry::Task) => parse_num(name)
-                .map(|t| t as Tid)
+            Entry(pid, None, self::Entry::Task) => global(name)
                 .filter(|&t| self.pid_exists(*pid, Some(t)))
                 .map(|t| Pid(*pid, Some(t))),
             Entry(pid, tid, self::Entry::Net) => PROC_NET
@@ -922,11 +963,24 @@ impl Pseudo for View<'_> {
         })
     }
 
-    fn readlink(&self, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
+    fn readlink(&self, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
         use PseudoNode::*;
+        // 读者在挂载的 pid 命名空间里看不到时没有 self、thread-self（ENOENT）
+        let ns = || self.pid_ns(mnt);
         match node {
-            SelfLink => Ok(self.tgid.to_string().into_bytes()),
-            ThreadSelf => Ok(format!("{}/task/{}", self.tgid, self.tid).into_bytes()),
+            SelfLink => Ok(ns()
+                .vnr(self.tgid)
+                .ok_or(Errno::ENOENT)?
+                .to_string()
+                .into_bytes()),
+            ThreadSelf => {
+                let ns = ns();
+                let (tgid, tid) = (ns.vnr(self.tgid), ns.vnr(self.tid));
+                let (Some(tgid), Some(tid)) = (tgid, tid) else {
+                    return Err(Errno::ENOENT);
+                };
+                Ok(format!("{tgid}/task/{tid}").into_bytes())
+            }
             Global(self::Global::Mounts) => Ok(b"self/mounts".to_vec()),
             Global(self::Global::Net) => Ok(b"self/net".to_vec()),
             Entry(pid, tid, self::Entry::Root) => {
@@ -968,7 +1022,8 @@ impl Pseudo for View<'_> {
                 if !self.may_read(*pid) {
                     return Err(Errno::EACCES);
                 }
-                Ok(self.name(&NsFile(*k, k.id_of(self.k, &task))))
+                let id = k.id_of(self.k, &task).ok_or(Errno::ENOENT)?;
+                Ok(self.name(mnt, &NsFile(*k, id)))
             }
             _ => Err(Errno::EINVAL),
         }
@@ -981,8 +1036,10 @@ impl Pseudo for View<'_> {
                 if !self.may_read(*pid) {
                     return Some(Err(Errno::EACCES));
                 }
-                let ns = PseudoNode::NsFile(*k, k.id_of(self.k, &task));
-                return Some(Ok(Node::Pseudo(mnt, ns)));
+                let Some(id) = k.id_of(self.k, &task) else {
+                    return Some(Err(Errno::ENOENT));
+                };
+                return Some(Ok(Node::Pseudo(mnt, PseudoNode::NsFile(*k, id))));
             }
             // 根目录、当前目录直接指到那个进程的节点（Linux 的 proc_root_link、
             // proc_cwd_link）：经由它们能进到别的挂载命名空间、chroot 的外面
@@ -1220,6 +1277,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
 pub(crate) fn write(
     k: &mut Kernel,
     cred: &Cred,
+    pid_ns: &PidNs,
     node: &PseudoNode,
     data: &[u8],
 ) -> Result<(), Errno> {
@@ -1288,14 +1346,19 @@ pub(crate) fn write(
             _ => r.max_watches = n,
         }
     }
-    // 与 Linux 一样在 0 到 pid_max 之间（checkpoint/restore 用它让新进程拿到指定的 pid）
+    // 与 Linux 一样在 0 到 pid_max 之间（checkpoint/restore 用它让新进程拿到指定的 pid），
+    // 改的是写入者所在的 pid 命名空间的
     if let PseudoNode::Static(b"sys/kernel/ns_last_pid") = node {
         let pid: i32 = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .filter(|&n| (0..=crate::kernel::PID_MAX).contains(&n))
             .ok_or(Errno::EINVAL)?;
-        k.set_last_pid(pid);
+        if pid_ns.level == 0 {
+            k.set_last_pid(pid);
+        } else {
+            pid_ns.set_last_pid(pid);
+        }
     }
     // 与 Linux 一样在 MIN_THREADS 到 FUTEX_TID_MASK 之间；已经设置的 RLIMIT_NPROC 不变
     if let PseudoNode::Static(b"sys/kernel/threads-max") = node {
@@ -1382,9 +1445,14 @@ pub(crate) fn write(
 }
 
 /// 目录的内容（不含 `.` 和 `..`）。
-pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, Errno> {
+pub(crate) fn readdir(
+    ps: &View<'_>,
+    mnt: MountId,
+    dir: &PseudoNode,
+) -> Result<Vec<DirEntry>, Errno> {
     use PseudoNode::*;
     let mut nodes: Vec<PseudoNode> = Vec::new();
+    let ns = ps.pid_ns(mnt);
     match dir {
         PtsRoot => {
             nodes.push(PtsPtmx);
@@ -1399,7 +1467,14 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
             nodes.extend([SelfLink, ThreadSelf]);
             nodes.extend(tree_children(&STATIC, b"").map(Static));
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
-            nodes.extend(ps.k.groups.keys().map(|&pid| Pid(pid, None)));
+            // 挂载的 pid 命名空间里看得到的进程，按那里的编号排
+            let mut pids: Vec<(Tid, Tid)> =
+                ps.k.groups
+                    .keys()
+                    .filter_map(|&pid| Some((ns.vnr(pid)?, pid)))
+                    .collect();
+            pids.sort_unstable();
+            nodes.extend(pids.into_iter().map(|(_, pid)| Pid(pid, None)));
         }
         Static(path) => nodes.extend(tree_children(&STATIC, path).map(Static)),
         SysRoot => nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys)),
@@ -1459,7 +1534,7 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
         .into_iter()
         .map(|n| {
             Ok(DirEntry {
-                name: ps.name(&n),
+                name: ps.name(mnt, &n),
                 ino: node_ino(ps.k, &n),
                 mode: ps.kind(&n).unwrap_or(mode::S_IFREG),
             })
@@ -1564,24 +1639,26 @@ fn mem_of(task: Option<&Task>) -> (u64, u64) {
     (mm.size(), mm.resident_pages())
 }
 
-fn ctty_info(ps: &View<'_>, g: &ThreadGroup) -> (u64, i64) {
+/// 控制终端的设备号和前台进程组（在 pid 命名空间 `ns` 里的编号）。
+fn ctty_info(ns: &PidNs, g: &ThreadGroup) -> (u64, i64) {
     match &g.ctty {
         Some(tty) => {
             let t = tty.borrow();
-            let _ = ps;
-            (rdev(PTS_MAJOR, t.index), t.fg.map_or(-1, |p| p as i64))
+            let fg = t.fg.map_or(-1, |p| ns.vnr(p).unwrap_or(0) as i64);
+            (rdev(PTS_MAJOR, t.index), fg)
         }
         None => (0, -1),
     }
 }
 
-fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> {
+fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> {
     let g = ps.group(pid).ok_or(Errno::ENOENT)?;
     let g = g.borrow();
     let task = ps.task(pid, tid);
     let nice = task.as_ref().map_or(0, |t| t.nice.get());
     let (state, _) = state_of(ps, &g, tid);
-    let (tty_nr, tpgid) = ctty_info(ps, &g);
+    let (tty_nr, tpgid) = ctty_info(ns, &g);
+    let v = |p: Tid| ns.vnr(p).unwrap_or(0);
     let cpu = match (tid, &task) {
         (Some(_), Some(t)) => t.cpu(),
         _ => g.cpu(ps.k),
@@ -1600,12 +1677,12 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     write!(
         s,
         "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} {} {} {} {} {} {} 0 {} {} {} 18446744073709551615",
-        tid.unwrap_or(pid),
+        v(tid.unwrap_or(pid)),
         comm_str(task.as_deref(), pid),
         state,
-        g.ppid,
-        g.pgid,
-        g.sid,
+        v(g.ppid),
+        v(g.pgid),
+        v(g.sid),
         tty_nr,
         tpgid,
         ticks(cpu.user_ns()),
@@ -1629,7 +1706,7 @@ fn pid_stat(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> 
     Ok(s)
 }
 
-fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> {
+fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> {
     let g = ps.group(pid).ok_or(Errno::ENOENT)?;
     let g = g.borrow();
     let task = ps.task(pid, tid);
@@ -1649,9 +1726,17 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "Name:\t{comm}").unwrap();
     writeln!(s, "Umask:\t{umask:04o}").unwrap();
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
-    writeln!(s, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{}", tid.unwrap_or(pid)).unwrap();
+    let v = |p: Tid| ns.vnr(p).unwrap_or(0);
+    let tid = tid.unwrap_or(pid);
+    writeln!(s, "Tgid:\t{}\nNgid:\t0\nPid:\t{}", v(pid), v(tid)).unwrap();
     let tracer = task.as_ref().and_then(|t| t.trace.borrow().tracer);
-    writeln!(s, "PPid:\t{}\nTracerPid:\t{}", g.ppid, tracer.unwrap_or(0)).unwrap();
+    writeln!(
+        s,
+        "PPid:\t{}\nTracerPid:\t{}",
+        v(g.ppid),
+        tracer.map_or(0, v)
+    )
+    .unwrap();
     // ID 按读者的用户命名空间换算（Linux 的 seq_user_ns）
     let c = &g.cred;
     let r = ps.reader();
@@ -1677,6 +1762,23 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     .unwrap();
     let groups: Vec<String> = c.groups.iter().map(|&g| gi(g).to_string()).collect();
     writeln!(s, "FDSize:\t{fdsize}\nGroups:\t{}", groups.join(" ")).unwrap();
+    // 从挂载的 pid 命名空间到进程所在的那个，每层一列
+    let levels = g.pid_ns.levels_from(ns.level);
+    let col = |p: Tid| -> String {
+        levels
+            .iter()
+            .map(|n| format!("\t{}", n.vnr(p).unwrap_or(0)))
+            .collect()
+    };
+    writeln!(
+        s,
+        "NStgid:{}\nNSpid:{}\nNSpgid:{}\nNSsid:{}",
+        col(pid),
+        col(tid),
+        col(g.pgid),
+        col(g.sid)
+    )
+    .unwrap();
     if task.is_some() {
         let kb = vsize / 1024;
         writeln!(s, "VmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB").unwrap();
@@ -2377,8 +2479,9 @@ pub(crate) fn format_uuid(b: &[u8; 16]) -> String {
 }
 
 /// 打开 procfs 文件时生成的内容。
-pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
+pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
     use PseudoNode::*;
+    let ns = ps.pid_ns(mnt);
     let s = match node {
         Global(g) => match g {
             self::Global::Cpuinfo => cpuinfo(),
@@ -2392,7 +2495,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 let up = uptime_ns();
                 format!("{} {}\n", hundredths(up), hundredths(up * cpus() as u64))
             }
-            self::Global::Loadavg => crate::loadavg::proc_loadavg(ps.k),
+            self::Global::Loadavg => crate::loadavg::proc_loadavg(ps.k, ps.last_pid()),
             self::Global::Version => {
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
@@ -2472,7 +2575,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             }
             b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
-            b"sys/kernel/ns_last_pid" => format!("{}\n", ps.k.last_pid()),
+            b"sys/kernel/ns_last_pid" => format!("{}\n", ps.last_pid()),
             b"sys/kernel/seccomp/actions_avail" => crate::seccomp::actions_avail(),
             b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
@@ -2499,8 +2602,8 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         Entry(pid, tid, e) => {
             let task = ps.task(*pid, *tid);
             match e {
-                self::Entry::Stat => pid_stat(ps, *pid, *tid)?,
-                self::Entry::Status => pid_status(ps, *pid, *tid)?,
+                self::Entry::Stat => pid_stat(ps, &ns, *pid, *tid)?,
+                self::Entry::Status => pid_status(ps, &ns, *pid, *tid)?,
                 self::Entry::Statm => {
                     let (vsize, rss) = mem_of(task.as_deref());
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
@@ -2560,7 +2663,7 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 _ => return Err(Errno::EINVAL),
             }
         }
-        FdInfo(pid, fd) => fdinfo(ps, *pid, *fd)?,
+        FdInfo(pid, fd) => fdinfo(ps, &ns, *pid, *fd)?,
         Sys(path) => match &path[..] {
             b"devices/system/cpu/online"
             | b"devices/system/cpu/possible"
@@ -2870,7 +2973,7 @@ fn cpu_mask(set: Range<usize>) -> String {
 
 /// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec 和 64 位上总有的
 /// `O_LARGEFILE`）、挂载编号、inode，以及 eventfd、inotify 的附加行。
-fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
+fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
     const O_LARGEFILE: u32 = 0o400000;
     let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();
@@ -2892,9 +2995,21 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
     match &f.kind {
         FileKind::EventFd(e) => s += &format!("eventfd-count: {:16x}\n", e.borrow().count),
         FileKind::Inotify(i) => s += &i.borrow().fdinfo(),
+        // 挂载的 pid 命名空间里的编号（看不到时是 0），NSpid 接着列出更下层的
         FileKind::Pidfd(p) => {
-            let pid = if p.exited() { -1 } else { p.tgid };
-            s += &format!("Pid:\t{pid}\nNSpid:\t{pid}\n");
+            let nr = if p.exited() {
+                -1
+            } else {
+                ns.vnr(p.tgid).unwrap_or(0)
+            };
+            s += &format!("Pid:\t{nr}\nNSpid:\t{nr}");
+            if nr > 0 {
+                let levels = ps.k.pid_ns_of(p.tgid).levels_from(ns.level + 1);
+                for n in levels {
+                    s += &format!("\t{}", n.vnr(p.tgid).unwrap_or(0));
+                }
+            }
+            s.push('\n');
         }
         FileKind::Epoll(e) => s += &e.borrow().fdinfo(),
         FileKind::TimerFd(t) => s += &t.borrow_mut().fdinfo(),

@@ -269,7 +269,7 @@ pub(crate) fn stop(
         t.message = message;
     }
     notify(cx.kr(), cx.task);
-    let (tid, uid) = (cx.tid(), cx.cred().ruid);
+    let (tid, uid) = (cx.pid_out(cx.tid()), cx.cred().ruid);
     let resumed = loop {
         if cx.task.killed.get() {
             break None;
@@ -362,7 +362,8 @@ fn notify(k: &Kernel, task: &Task) {
         Stop::Group(_) | Stop::Event(event::STOP, _) => code::CLD_STOPPED,
         _ => code::CLD_TRAPPED,
     };
-    let info = SigInfo::child_event(task.tid.get(), why, exit_code & 0x7f);
+    let pid = k.pid_seen_by(tracer, task.tid.get());
+    let info = SigInfo::child_event(pid, why, exit_code & 0x7f);
     signal::send_to_group(k, tracer, Signal::CHLD, info);
 }
 
@@ -393,7 +394,7 @@ pub(crate) fn signal_stop(
             .groups
             .get(&tracer)
             .map_or(0, |g| g.borrow().cred.ruid);
-        SigInfo::kill(code::SI_USER, tracer, uid)
+        SigInfo::kill(code::SI_USER, cx.pid_out(tracer), uid)
     } else if now == raw {
         info
     } else {
@@ -419,7 +420,7 @@ pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     };
     let (why, info) = if seized {
         let si_code = sig.number() | (event::STOP as i32) << 8;
-        let info = notify_info(sig, si_code, cx.tid(), cx.cred().ruid);
+        let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
         (Stop::Event(event::STOP, sig), Some(info))
     } else {
         (Stop::Group(sig), None)
@@ -438,7 +439,7 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     }
     let sig = Signal::TRAP;
     let si_code = sig.number() | (event::STOP as i32) << 8;
-    let info = notify_info(sig, si_code, cx.tid(), cx.cred().ruid);
+    let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
     stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
 }
 
@@ -450,7 +451,7 @@ pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
         return true;
     }
     let sig = Signal::TRAP;
-    let info = notify_info(sig, sig.number(), cx.tid(), cx.cred().ruid);
+    let info = notify_info(sig, sig.number(), cx.pid_out(cx.tid()), cx.cred().ruid);
     stop(cx, cpu, Stop::Event(0, sig), Some(info), 0).is_some()
 }
 
@@ -515,7 +516,7 @@ fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
         } else {
             0
         };
-    let info = notify_info(sig, si_code, cx.tid(), cx.cred().ruid);
+    let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
     let message = if entry {
         EVENTMSG_SYSCALL_ENTRY
     } else {
@@ -562,8 +563,16 @@ pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> boo
     }
     let sig = Signal::TRAP;
     let si_code = sig.number() | (e as i32) << 8;
-    let info = notify_info(sig, si_code, cx.tid(), cx.cred().ruid);
+    let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
     stop(cx, cpu, Stop::Event(e, sig), Some(info), message).is_some()
+}
+
+/// 线程 `tid` 在跟踪着自己的进程看来的编号（`ptrace_event_pid`），没有跟踪者时是自己看到的。
+pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
+    match cx.task.trace.borrow().tracer {
+        Some(tracer) => cx.kr().pid_seen_by(tracer, tid),
+        None => cx.pid_out(tid),
+    }
 }
 
 /// execve 成功之后：`PTRACE_EVENT_EXEC`（消息是 execve 之前的 tid），没有打开这个事件、
@@ -574,10 +583,11 @@ pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
         (t.tracer.is_some(), t.seized, t.enabled(event::EXEC))
     };
     if enabled {
-        return event(cx, cpu, event::EXEC, old_tid as u64);
+        let old = tracer_pid_of(cx, old_tid);
+        return event(cx, cpu, event::EXEC, old as u64);
     }
     if traced && !seized {
-        let info = SigInfo::kill(code::SI_USER, cx.tgid(), cx.cred().ruid);
+        let info = SigInfo::kill(code::SI_USER, cx.pid_out(cx.tgid()), cx.cred().ruid);
         signal::send_to_task(cx.kr(), cx.task, Signal::TRAP, info);
     }
     true
@@ -694,6 +704,8 @@ pub(crate) fn tracer_exited(k: &mut Kernel, tgid: Tid) {
 pub(crate) struct TraceExit {
     pub tracer: Tid,
     pub pid: Tid,
+    /// 跟踪者看到的 pid（报告时算好：wait 取走时线程的编号可能已经不在了）。
+    pub seen: Tid,
     /// 退出时所在的进程组（wait 按进程组等）。
     pub pgid: Tid,
     pub status: ExitStatus,
@@ -722,6 +734,7 @@ pub(crate) fn tracee_exited(
     let exit = TraceExit {
         tracer,
         pid: tid,
+        seen: 0,
         pgid: group.pgid,
         status,
         process: false,
@@ -743,6 +756,7 @@ pub(crate) fn group_finished(
             Some(tracer) if tracer != g.ppid && k.groups.contains_key(&tracer) => TraceExit {
                 tracer,
                 pid: g.tgid,
+                seen: 0,
                 pgid: g.pgid,
                 status,
                 process: true,
@@ -771,11 +785,12 @@ pub(crate) fn released(k: &mut Kernel, e: &TraceExit) {
     }
 }
 
-fn report_exit(k: &mut Kernel, exit: TraceExit) {
+fn report_exit(k: &mut Kernel, mut exit: TraceExit) {
     if !k.groups.contains_key(&exit.tracer) {
         return;
     }
-    let (tracer, info) = (exit.tracer, SigInfo::child(exit.pid, exit.status));
+    exit.seen = k.pid_seen_by(exit.tracer, exit.pid);
+    let (tracer, info) = (exit.tracer, SigInfo::child(exit.seen, exit.status));
     k.trace_exits.push(exit);
     request_wake_on(wake::CHILD);
     signal::send_to_group(k, tracer, Signal::CHLD, info);

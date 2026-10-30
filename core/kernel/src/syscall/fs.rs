@@ -610,8 +610,8 @@ fn open_path(
 
     let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
     // 命名空间在 `/proc/<pid>/fd/<n>` 里是 `mnt:[编号]` 这样
-    if let Node::Pseudo(_, p @ PseudoNode::NsFile(..)) = &node {
-        display = Some(Rc::from(cx.view(&vfs).name(p)));
+    if let Node::Pseudo(mnt, p @ PseudoNode::NsFile(..)) = &node {
+        display = Some(Rc::from(cx.view(&vfs).name(*mnt, p)));
     }
     let was_created = created.is_some();
     let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
@@ -1056,7 +1056,7 @@ fn open_pseudo(
     if accmode != oflags::O_RDONLY && !pseudo::writable(&node) {
         return Err(Errno::EACCES);
     }
-    let data = pseudo::content(&view, &node)?;
+    let data = pseudo::content(&view, mnt, &node)?;
     Ok(FileKind::Proc {
         mnt,
         node,
@@ -1259,11 +1259,12 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if !matches!(ty, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
                 return Err(Errno::EINVAL);
             }
-            file.borrow_mut().owner = (ty, pid);
+            file.borrow_mut().owner = (ty, cx.pid_in(pid));
             Ok(0)
         }
         F_GETOWN_EX => {
             let (ty, pid) = file.borrow().owner;
+            let pid = cx.pid_out(pid);
             let mut b = [0u8; 8];
             b[..4].copy_from_slice(&ty.to_le_bytes());
             b[4..].copy_from_slice(&pid.to_le_bytes());
@@ -1426,7 +1427,9 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
                 b[2..4].copy_from_slice(&(SEEK_SET as i16).to_le_bytes());
                 b[8..16].copy_from_slice(&l.start.to_le_bytes());
                 b[16..24].copy_from_slice(&len.to_le_bytes());
-                b[24..28].copy_from_slice(&l.pid.to_le_bytes());
+                // OFD 锁是 -1，别的是调用者看到的编号（Linux 的 locks_translate_pid）
+                let pid = if l.pid > 0 { cx.pid_out(l.pid) } else { l.pid };
+                b[24..28].copy_from_slice(&pid.to_le_bytes());
             }
         }
         return put(cx, arg, b).map(|()| 0);
@@ -1581,13 +1584,14 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             if matches!(request, FIOSETOWN | SIOCSPGRP) {
                 let pid = i32::from_le_bytes(get(cx, arg)?);
                 file.borrow_mut().owner = if pid < 0 {
-                    (F_OWNER_PGRP, -pid)
+                    (F_OWNER_PGRP, cx.pid_in(pid.saturating_neg()))
                 } else {
-                    (F_OWNER_PID, pid)
+                    (F_OWNER_PID, cx.pid_in(pid))
                 };
                 return Ok(0);
             }
             let (ty, pid) = file.borrow().owner;
+            let pid = cx.pid_out(pid);
             let pid = if ty == F_OWNER_PGRP { -pid } else { pid };
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
@@ -3001,7 +3005,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         ];
         match node {
             Node::Store(_, ino) => list.extend(vfs.store().readdir(*ino)?),
-            Node::Pseudo(_, p) => list.extend(pseudo::readdir(&view, p)?),
+            Node::Pseudo(id, p) => list.extend(pseudo::readdir(&view, *id, p)?),
         }
         *entries = Some(list);
     }
@@ -3734,7 +3738,8 @@ fn write_bytes(
             };
             if let Some(node) = proc_node {
                 let cred = cx.cred();
-                pseudo::write(cx.k(), &cred, &node, data)?;
+                let pid_ns = cx.pid_ns();
+                pseudo::write(cx.k(), &cred, &pid_ns, &node, data)?;
             }
             let ino = match file.borrow().kind {
                 FileKind::Regular { ino, .. } => Some(ino),

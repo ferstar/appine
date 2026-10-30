@@ -18,7 +18,7 @@
 
 **推迟项**：
 
-- 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。 → 用户命名空间已补上（M9 之前：用户命名空间）；别的仍没有
+- 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。 → 用户命名空间已补上（M9 之前：用户命名空间），pid 命名空间也补上了（M9 之前：pid 命名空间）；别的仍没有
 - 打开着的命名空间文件、bind 挂载出去的命名空间文件不让命名空间活着：用它的进程都退出之后就卸下了，之后对那个 fd setns 是 EINVAL。
 - 命名空间文件的 `NS_GET_USERNS`、`NS_GET_PARENT`、`NS_GET_NSTYPE`、`NS_GET_OWNER_UID` 这些 ioctl 没有（ENOTTY）；setns 不接受 pidfd。
 - `/proc/<pid>/ns/*`、`root`、`cwd` 跟随时不检查能不能跟踪那个进程（Linux 要 `PTRACE_MODE_READ_FSCREDS`）；`/proc/<pid>/exe` 仍按读出来的文字跟随。

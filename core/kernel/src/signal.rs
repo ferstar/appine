@@ -180,6 +180,9 @@ pub(crate) struct SigInfo {
     /// 同步异常的 ESR，放进信号帧的 esr_context；0 表示没有（与 Linux 一样，断点和
     /// 不是同步异常的信号都没有）。
     pub esr: u64,
+    /// 发出它的进程（全局编号，不编码），内核产生的是 0。si_pid 是发送者自己看到的编号，
+    /// 对方的 pid 命名空间看不到发送者时改成 0（[`for_target`]）。
+    pub sender: Tid,
 }
 
 impl SigInfo {
@@ -189,7 +192,13 @@ impl SigInfo {
             code,
             fields: InfoFields::Kill { pid, uid },
             esr: 0,
+            sender: 0,
         }
+    }
+
+    /// 由进程 `sender`（全局编号）发出。
+    pub fn from(self, sender: Tid) -> SigInfo {
+        SigInfo { sender, ..self }
     }
 
     /// 内核自己产生的信号（比如 SIGPIPE）。
@@ -206,6 +215,7 @@ impl SigInfo {
             code,
             fields: InfoFields::Fault { addr },
             esr,
+            sender: 0,
         }
     }
 
@@ -239,6 +249,7 @@ impl SigInfo {
                 status,
             },
             esr: 0,
+            sender: 0,
         }
     }
 
@@ -248,6 +259,7 @@ impl SigInfo {
             code: i32::from_le_bytes(b[8..12].try_into().unwrap()),
             fields: InfoFields::Raw(b[16..].try_into().unwrap()),
             esr: 0,
+            sender: 0,
         }
     }
 
@@ -296,6 +308,16 @@ impl SigInfo {
             InfoFields::Raw(rest) => b[16..].copy_from_slice(&rest),
         }
         b
+    }
+
+    /// 去掉发送者（si_pid 写 0）。
+    fn hide_sender(&mut self) {
+        if let InfoFields::Kill { pid, .. }
+        | InfoFields::Child { pid, .. }
+        | InfoFields::Queue { pid, .. } = &mut self.fields
+        {
+            *pid = 0;
+        }
     }
 
     fn fault_addr(&self) -> Option<u64> {
@@ -576,13 +598,46 @@ fn notify_parent(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, code: i32, status
     };
     let act = parent.borrow().sighand.borrow().get(Signal::CHLD);
     if act.flags & sa::NOCLDSTOP == 0 {
+        let pid = k.pid_seen_by(ppid, tgid);
         send_to_group(
             k,
             ppid,
             Signal::CHLD,
-            SigInfo::child_event(tgid, code, status),
+            SigInfo::child_event(pid, code, status),
         );
     }
+}
+
+/// 信号发给 `group` 之前（Linux 的 `send_signal_locked`、`sig_task_ignored`）：发送者在
+/// 它的 pid 命名空间里看不到时 si_pid 改成 0。pid 命名空间的 1 号进程不接收按默认方式
+/// 处理的信号，祖先命名空间里发来的和内核产生的 SIGKILL、SIGSTOP 除外；没有屏蔽、不被
+/// 跟踪时在这里丢掉（返回 None），屏蔽着的到投递时再丢（[`deliver`]）。
+fn for_target(
+    group: &ThreadGroup,
+    sig: Signal,
+    mut info: SigInfo,
+    blocked: bool,
+    traced: bool,
+) -> Option<SigInfo> {
+    let ns = &group.pid_ns;
+    if ns.level == 0 {
+        return Some(info);
+    }
+    let mut force = info.code == code::SI_KERNEL;
+    if info.sender != 0 && !ns.sees(info.sender) {
+        info.hide_sender();
+        force = true;
+    }
+    let ignored = unkillable(group)
+        && (!blocked && !traced || sig == Signal::KILL)
+        && group.sighand.borrow().get(sig).handler == SigAction::DEFAULT
+        && !(force && (sig == Signal::KILL || sig == Signal::STOP));
+    (!ignored).then_some(info)
+}
+
+/// 进程 `group` 是 pid 命名空间的 1 号进程（Linux 的 `SIGNAL_UNKILLABLE`）。
+fn unkillable(group: &ThreadGroup) -> bool {
+    group.pid_ns.level > 0 && group.pid_ns.reaper.get() == Some(group.tgid) && !group.killable
 }
 
 /// 给一个线程发信号（tkill、SIGPIPE 等）。
@@ -590,15 +645,23 @@ pub(crate) fn send_to_task(k: &Kernel, task: &Task, sig: Signal, info: SigInfo) 
     let Some(group) = k.groups.get(&task.tgid).cloned() else {
         return;
     };
+    let blocked = task.sigmask.get() & sig.bit() != 0;
+    let traced = crate::ptrace::traced(task);
+    let target = for_target(&group.borrow(), sig, info, blocked, traced);
     if sig == Signal::KILL {
-        group_exit(k, &group, killed_by(sig));
+        if target.is_some() {
+            group_exit(k, &group, killed_by(sig));
+        }
         return;
     }
+    // SIGCONT 让进程继续这类副作用即使信号随后被丢掉也要做（Linux 的 prepare_signal）
     prepare(k, &group, sig);
-    let blocked = task.sigmask.get() & sig.bit() != 0;
+    let Some(info) = target else {
+        return;
+    };
     // 被屏蔽的信号即使当前被忽略也要挂起：解除屏蔽之前处理方式可能会变。被跟踪的线程
     // 也挂起，跟踪者要看到它
-    if !blocked && group.borrow().sighand.borrow().ignores(sig) && !crate::ptrace::traced(task) {
+    if !blocked && group.borrow().sighand.borrow().ignores(sig) && !traced {
         return;
     }
     let room = sig.is_realtime() && queue_room(k, &group.borrow());
@@ -636,13 +699,21 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
     let Some(leader) = threads.first() else {
         return;
     };
+    let blocked = leader.sigmask.get() & sig.bit() != 0;
+    let traced = crate::ptrace::traced(leader);
+    let target = for_target(&group.borrow(), sig, info, blocked, traced);
     if sig == Signal::KILL {
-        group_exit(k, &group, killed_by(sig));
+        if target.is_some() {
+            group_exit(k, &group, killed_by(sig));
+        }
         return;
     }
     prepare(k, &group, sig);
+    let Some(info) = target else {
+        return;
+    };
     let ignored = group.borrow().sighand.borrow().ignores(sig);
-    if ignored && leader.sigmask.get() & sig.bit() == 0 && !crate::ptrace::traced(leader) {
+    if ignored && !blocked && !traced {
         return;
     }
     {
@@ -701,7 +772,7 @@ pub(crate) fn pgrp_orphaned(k: &Kernel, pgid: Tid) -> bool {
 /// 然后挂到当前线程上。
 pub(crate) fn force(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
     let blocked = cx.task.sigmask.get() & sig.bit() != 0;
-    {
+    let default = {
         let group = cx.t.group.borrow();
         let mut sh = group.sighand.borrow_mut();
         let mut act = sh.get(sig);
@@ -709,6 +780,11 @@ pub(crate) fn force(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
             act.handler = SigAction::DEFAULT;
             sh.set(sig, act);
         }
+        act.handler == SigAction::DEFAULT
+    };
+    // 按默认方式处理时 pid 命名空间的 1 号进程也会被它结束，被跟踪时除外（跟踪者先看到）
+    if default && !crate::ptrace::traced(cx.task) {
+        cx.t.group.borrow_mut().killable = true;
     }
     if blocked {
         cx.task.sigmask.set(cx.task.sigmask.get() & !sig.bit());
@@ -730,6 +806,7 @@ pub(crate) fn force_fatal(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
         };
         sh.set(sig, act);
     }
+    cx.t.group.borrow_mut().killable = true;
     cx.task.sigmask.set(cx.task.sigmask.get() & !sig.bit());
     cx.task.pending.borrow_mut().add(sig, info, false);
 }
@@ -896,9 +973,12 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             (sig, info)
         };
         let act = cx.t.group.borrow().sighand.borrow().get(sig);
+        // pid 命名空间的 1 号进程：按默认方式处理的只有 SIGKILL、SIGSTOP（发送时已经筛过）
+        // 和强制的同步信号（[`force`]）
+        let unkillable = unkillable(&cx.t.group.borrow()) && sig != Signal::STOP;
         match act.handler {
             SigAction::IGNORE => continue,
-            SigAction::DEFAULT if sig.ignored_by_default() => continue,
+            SigAction::DEFAULT if sig.ignored_by_default() || unkillable => continue,
             SigAction::DEFAULT if sig.is_stop() => {
                 // 孤儿进程组不响应终端产生的停止信号（SIGSTOP 除外）
                 let pgid = cx.t.group.borrow().pgid;
@@ -1255,6 +1335,7 @@ mod tests {
                 value: v,
             },
             esr: 0,
+            sender: 0,
         };
         let rt = Signal::new(40).unwrap();
         let mut p = Pending::default();

@@ -251,7 +251,11 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
             let pid = addr
                 .get(4..8)
                 .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
-            s.pid = if pid == 0 { cx.tgid() as u32 } else { pid };
+            s.pid = if pid == 0 {
+                cx.pid_out(cx.tgid()) as u32
+            } else {
+                pid
+            };
         }
         Socket::Unix(_) => unreachable!("handled above"),
     }
@@ -509,6 +513,7 @@ pub(super) fn getsockopt(
         b.extend_from_slice(&(t.subsec_micros() as i64).to_le_bytes());
         b
     };
+    let pid_ns = cx.pid_ns();
     let out = match &*sock.borrow() {
         Socket::Inet(s) => match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
@@ -519,7 +524,7 @@ pub(super) fn getsockopt(
         },
         Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
         Socket::Netlink(_) => 0i32.to_le_bytes().to_vec(),
-        Socket::Unix(u) => unix::getsockopt(u, level, name)?,
+        Socket::Unix(u) => unix::getsockopt(u, level, name, &pid_ns)?,
     };
     // 非阻塞的 TCP 连接被拒绝：guest 从这里得知（宿主读一次就清掉，不会数两次）
     if (level, name) == (SOL_SOCKET, SO_ERROR)

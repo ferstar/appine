@@ -157,6 +157,8 @@ pub(crate) fn request_wake_object(object: wake::Object) {
 /// 时任何对象上的修改都叫醒它）。一个 epoll 可能关注几千个文件，每次有对象被修改都要
 /// 查一遍，所以二分查找。
 type Waiter = (Arc<Event>, u32, Option<Box<[wake::Object]>>);
+/// 在等命名空间里的进程被回收的 pid 命名空间 1 号进程：命名空间、进程、可能变成孤儿的进程组。
+type HeldReaper = (Rc<crate::pidns::PidNs>, Rc<RefCell<ThreadGroup>>, Vec<Tid>);
 
 /// 持有 flock(2) 锁的打开文件（弱引用，关闭后锁随之释放），以及是不是排他锁。
 pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool);
@@ -167,6 +169,11 @@ pub(crate) struct Kernel {
     pub tasks: BTreeMap<Tid, Rc<Task>>,
     /// 所有线程组，包括僵尸进程和 init。
     pub groups: BTreeMap<Tid, Rc<RefCell<ThreadGroup>>>,
+    /// 在新的 pid 命名空间里的线程、进程所在的那个命名空间（[`crate::pidns`]），编号不再
+    /// 使用时从各层的表里去掉。
+    pid_nss: std::collections::HashMap<Tid, Rc<crate::pidns::PidNs>>,
+    /// 退出了、在等命名空间里别的进程被回收的 pid 命名空间 1 号进程。
+    held_reapers: Vec<HeldReaper>,
     /// 执行引擎。
     pub tier: Tier,
     /// 宿主在等它结束的进程（[`crate::Machine::spawn`] 启动的进程）：结束后记下结束方式。
@@ -268,6 +275,8 @@ impl Kernel {
         Kernel {
             tasks: BTreeMap::new(),
             groups: BTreeMap::new(),
+            pid_nss: Default::default(),
+            held_reapers: Vec::new(),
             tier,
             watched: BTreeMap::new(),
             vfs: None,
@@ -331,6 +340,103 @@ impl Kernel {
             }
         }
         Err(Errno::EAGAIN)
+    }
+
+    /// 给 pid 命名空间 `ns` 里的新线程、进程选好全局编号（Linux 的 `alloc_pid` 的检查部分）。
+    /// `set_tid` 是 clone3 指定的各层编号，从 `ns` 那层起往外：层数不能比 `ns` 的多，
+    /// 编号在 1 到 pid_max 之间、命名空间里还没有进程时只能是 1（EINVAL），`cred` 要在那层的
+    /// 属主里有 `CAP_SYS_ADMIN` 或者 `CAP_CHECKPOINT_RESTORE`（EPERM），编号已经有人用了是
+    /// EEXIST。指定了全局编号就用它，否则另外分配。
+    pub fn choose_pid(
+        &mut self,
+        ns: &Rc<crate::pidns::PidNs>,
+        cred: &crate::cred::Cred,
+        set_tid: &[Tid],
+    ) -> Result<Tid, Errno> {
+        use crate::cred::cap;
+        let levels = ns.levels_from(0);
+        if set_tid.len() > levels.len() {
+            return Err(Errno::EINVAL);
+        }
+        for (n, &tid) in levels.iter().rev().zip(set_tid) {
+            if !(1..PID_MAX).contains(&tid) || tid != 1 && n.level > 0 && n.reaper.get().is_none() {
+                return Err(Errno::EINVAL);
+            }
+            if !cred.ns_capable(&n.owner, cap::SYS_ADMIN)
+                && !cred.ns_capable(&n.owner, cap::CHECKPOINT_RESTORE)
+            {
+                return Err(Errno::EPERM);
+            }
+            let taken = if n.level == 0 {
+                self.tasks.contains_key(&tid) || self.groups.contains_key(&tid)
+            } else {
+                n.find(tid).is_some()
+            };
+            if taken {
+                return Err(Errno::EEXIST);
+            }
+        }
+        match set_tid.get(ns.level as usize) {
+            Some(&tid) => Ok(tid),
+            None => self.alloc_tid(),
+        }
+    }
+
+    /// 新的线程、进程 `tid` 在 pid 命名空间 `ns` 里：在各层分配编号（[`crate::pidns`]），
+    /// `set_tid` 见 [`Kernel::choose_pid`]。
+    pub fn register_pid(
+        &mut self,
+        ns: &Rc<crate::pidns::PidNs>,
+        tid: Tid,
+        set_tid: &[Tid],
+    ) -> Result<(), Errno> {
+        if ns.level == 0 {
+            return Ok(());
+        }
+        crate::pidns::PidNs::register(ns, tid, set_tid)?;
+        self.pid_nss.insert(tid, ns.clone());
+        Ok(())
+    }
+
+    /// 线程退出、僵尸进程被回收之后：编号 `tid` 线程和进程都不再用了，从各层的表里去掉。
+    /// 等着命名空间里的进程都被回收的 1 号进程（[`Kernel::hold_reaper`]）这时等到了就结束。
+    pub fn release_pid(&mut self, tid: Tid) {
+        if !self.tasks.contains_key(&tid)
+            && !self.groups.contains_key(&tid)
+            && let Some(ns) = self.pid_nss.remove(&tid)
+        {
+            crate::pidns::PidNs::unregister(&ns, tid);
+            while let Some(i) = self.held_reapers.iter().position(|(ns, g, _)| {
+                let tgid = g.borrow().tgid;
+                ns.members().iter().all(|&m| m == tgid)
+            }) {
+                let (_, group, pgrps) = self.held_reapers.swap_remove(i);
+                crate::process::finish_reported(self, &group, pgrps);
+            }
+        }
+    }
+
+    /// pid 命名空间 `ns` 的 1 号进程 `group` 退出了，命名空间里还有别的进程：等它们都被
+    /// 回收了再报告给父进程（`pgrps` 是 [`crate::process::finish_group`] 算好的进程组）。
+    pub fn hold_reaper(
+        &mut self,
+        ns: Rc<crate::pidns::PidNs>,
+        group: Rc<RefCell<ThreadGroup>>,
+        pgrps: Vec<Tid>,
+    ) {
+        self.held_reapers.push((ns, group, pgrps));
+    }
+
+    /// 进程 `tgid` 所在的 pid 命名空间。
+    pub fn pid_ns_of(&self, tgid: Tid) -> Rc<crate::pidns::PidNs> {
+        self.groups
+            .get(&tgid)
+            .map_or_else(crate::pidns::PidNs::init, |g| g.borrow().pid_ns.clone())
+    }
+
+    /// 全局编号 `g` 在进程 `viewer` 的 pid 命名空间里的编号，看不到时是 0。
+    pub fn pid_seen_by(&self, viewer: Tid, g: Tid) -> Tid {
+        self.pid_ns_of(viewer).vnr(g).unwrap_or(0)
     }
 
     /// 最后分配的 tid（`/proc/sys/kernel/ns_last_pid`）。
@@ -748,6 +854,31 @@ impl<'a> Cx<'a> {
             tid: self.tid(),
             tgid: self.tgid(),
         }
+    }
+
+    /// 所在的 pid 命名空间。
+    pub fn pid_ns(&self) -> Rc<crate::pidns::PidNs> {
+        self.t.group.borrow().pid_ns.clone()
+    }
+
+    /// 新建的子进程所在的 pid 命名空间。
+    pub fn pid_ns_children(&self) -> Rc<crate::pidns::PidNs> {
+        let ns = self.task.pid_ns_children.borrow().clone();
+        ns.unwrap_or_else(|| self.pid_ns())
+    }
+
+    /// 全局编号 `g` 在自己的 pid 命名空间里的编号，看不到时是 0（返回给 guest 的 pid）。
+    pub fn pid_out(&self, g: Tid) -> Tid {
+        self.pid_ns().vnr(g).unwrap_or(0)
+    }
+
+    /// guest 给的 pid（自己的 pid 命名空间里的编号）对应的全局编号，看不到的是一个不存在
+    /// 的编号；0 和负数不变（Linux 的 `find_vpid`）。
+    pub fn pid_in(&self, l: Tid) -> Tid {
+        if l <= 0 {
+            return l;
+        }
+        self.pid_ns().find(l).unwrap_or(crate::syscall::NO_PID)
     }
 
     /// 当前进程的凭据。

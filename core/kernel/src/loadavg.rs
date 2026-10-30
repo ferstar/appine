@@ -134,7 +134,7 @@ pub(crate) fn sample(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
 }
 
 /// `/proc/loadavg` 的内容。
-pub(crate) fn proc_loadavg(k: &Kernel) -> String {
+pub(crate) fn proc_loadavg(k: &Kernel, last_pid: crate::kernel::Tid) -> String {
     // 与 Linux 一样加上 0.005 再截断成两位小数
     let avg = k.load.current(Instant::now()).map(|a| a + FIXED_1 / 200);
     let int = |a: u64| a >> FSHIFT;
@@ -149,7 +149,7 @@ pub(crate) fn proc_loadavg(k: &Kernel) -> String {
         frac(avg[2]),
         running(k).max(1),
         k.tasks.len(),
-        k.last_pid(),
+        last_pid,
     )
 }
 

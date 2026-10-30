@@ -309,4 +309,402 @@ def nested():
 
 child(nested)
 PY2
+
+# pid 命名空间：busybox 的 unshare -p -f --mount-proc，里面的 sh 是 1 号进程
+unshare -p -f --mount-proc sh -c '
+    echo "pid $$ ppid $PPID"
+    echo /proc/[0-9]*
+    echo "self $(readlink /proc/self) thread-self $(readlink /proc/thread-self)"
+    sh -c "echo child \$\$ ppid \$PPID"
+    cut -d" " -f1,4-6 /proc/self/stat
+    grep -E "^(Tgid|Pid|PPid|NStgid|NSpid|NSpgid|NSsid)" /proc/self/status
+    sleep 100 &
+    kill -0 $! && echo "background $!"
+    # ash 报告作业被结束（Terminated）的时机与快慢有关，不比
+    kill $! 2>/dev/null; wait $! 2>/dev/null; echo "killed with status $?"
+    kill -TERM 1; kill -KILL 1; echo "init survives its own SIGTERM and SIGKILL"
+    echo "last pid $(cat /proc/sys/kernel/ns_last_pid)"
+'
+echo "unshare exits with $?"
+# 在里面 strace -f：跟踪者拿到的新进程的编号（PTRACE_GETEVENTMSG）和 wait 的结果都是里面的
+unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
+
+python3 - <<'PY3'
+import ctypes, errno, functools, os, signal, socket, struct, threading, time
+
+print = functools.partial(print, flush=True)
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
+libc.umount.argtypes = [ctypes.c_char_p]
+CLONE_NEWPID, CLONE_NEWNS, CLONE_THREAD, CLONE_SIGHAND, CLONE_VM, CLONE_PARENT = (
+    0x20000000, 0x20000, 0x10000, 0x800, 0x100, 0x8000)
+SIGCHLD = 17
+os.makedirs("/tmp/ns/p", exist_ok=True)
+
+
+def err(f, *args):
+    try:
+        f(*args)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def fork(f):
+    """在子进程里运行 f：出了什么错都打印出来，然后退出，不会接着跑父进程的代码。"""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            f()
+        except OSError as e:
+            print("raised", errno.errorcode[e.errno])
+        except BaseException as e:
+            print("raised", repr(e))
+        finally:
+            os._exit(0)
+    return pid
+
+
+def child(f):
+    pid = fork(f)
+    return os.waitpid(pid, 0)[1]
+
+
+def try_fork():
+    try:
+        pid = os.fork()
+    except OSError as e:
+        return errno.errorcode[e.errno]
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    return "ok"
+
+
+def link(path):
+    try:
+        return os.readlink(path)
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def status(pid, key, proc="/proc"):
+    with open("%s/%s/status" % (proc, pid)) as f:
+        return next(l.split(":", 1)[1].split() for l in f if l.startswith(key + ":"))
+
+
+def pids(proc):
+    return sorted(int(d) for d in os.listdir(proc) if d.isdigit())
+
+
+def inner_global(init, local):
+    """1 号进程是全局的 init 时，它的命名空间里编号为 local 的进程在外面的编号。"""
+    for d in pids("/proc"):
+        try:
+            if status(d, "NSpid")[-1] == str(local) and init in (d, int(status(d, "PPid")[0])):
+                return d
+        except (OSError, StopIteration):
+            pass
+
+
+# unshare 之后自己不变，之后的子进程在新的命名空间里、是那里的 1 号进程；进去之前不能再
+# unshare，也不能建线程；1 号进程退出之后不能再在里面建进程
+def unshared():
+    me = os.getpid()
+    os.unshare(CLONE_NEWPID)
+    print("pid unchanged", os.getpid() == me, "ns unchanged", link("/proc/self/ns/pid") == mine)
+    print("pid_for_children before fork", link("/proc/self/ns/pid_for_children"))
+    print("unshare again", err(os.unshare, CLONE_NEWPID))
+    try:
+        threading.Thread(target=lambda: None).start()
+        print("thread started")
+    except RuntimeError as e:
+        print("thread:", e)
+    r, w = os.pipe()
+
+    def init():
+        print("init pid", os.getpid(), "ppid", os.getppid(), "tid", threading.get_native_id())
+        print("pgid", os.getpgid(0), "sid", os.getsid(0), "getpgid(1)", os.getpgid(1))
+        os.write(w, link("/proc/self/ns/pid").encode())
+        print("outside pid", err(os.kill, me, 0), "wait for it", err(os.waitpid, me, 0))
+        print("CLONE_PARENT", libc.syscall(220, CLONE_PARENT | SIGCHLD, 0, 0, 0, 0), errno.errorcode[ctypes.get_errno()])
+
+    pid = fork(init)
+    os.close(w)
+    inner = os.read(r, 100).decode()
+    os.waitpid(pid, 0)
+    print("child pid is not 1", pid != 1)
+    print("child's ns is pid_for_children", inner == link("/proc/self/ns/pid_for_children"))
+    print("pid_for_children differs from pid", inner != mine)
+    print("fork after init exited", try_fork())
+
+
+mine = link("/proc/self/ns/pid")
+child(unshared)
+print("thread NEWPID", libc.syscall(220, CLONE_NEWPID | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0), errno.errorcode[ctypes.get_errno()])
+
+
+# 1 号进程：它的子进程、孤儿过继给它、setsid、线程、kill(-1)、ns_last_pid、新的 procfs 实例
+def first():
+    os.unshare(CLONE_NEWPID)
+
+    def init():
+        def grandchild():
+            print("grandchild", os.getpid(), "ppid", os.getppid())
+            orphan = fork(lambda: (time.sleep(1), print("orphan", os.getpid(), "adopted by", os.getppid())))
+            print("orphan's parent exits, orphan is", orphan)
+
+        print("grandchild status", child(grandchild))
+        print("reaped orphan", os.waitpid(-1, 0))
+        print("setsid", os.setsid(), "pgid", os.getpgid(0), "sid", os.getsid(0))
+        ev = threading.Event()
+        t = threading.Thread(target=ev.wait)
+        t.start()
+        print("thread", t.native_id, "pthread_kill", signal.pthread_kill(t.ident, 0))
+        ev.set()
+        t.join()
+        sleepers = [fork(lambda: time.sleep(30)) for _ in range(2)]
+        time.sleep(0.2)
+        os.kill(-1, signal.SIGTERM)
+        print("kill -1:", [os.waitpid(p, 0) for p in sleepers])
+        print("mount proc", libc.mount(b"proc", b"/tmp/ns/p", b"proc", 0, None))
+        print("pids inside", pids("/tmp/ns/p"), "self", link("/tmp/ns/p/self"))
+        print("task", sorted(int(x) for x in os.listdir("/tmp/ns/p/self/task")))
+        with open("/tmp/ns/p/sys/kernel/ns_last_pid") as f:
+            print("ns_last_pid", f.read().strip())
+        with open("/tmp/ns/p/sys/kernel/ns_last_pid", "w") as f:
+            f.write("100")
+        print("next child", child(lambda: print("child pid", os.getpid())))
+        print("stat", open("/tmp/ns/p/1/stat").read().split()[:8:3])
+        print("status", status(1, "Pid", "/tmp/ns/p"), status(1, "PPid", "/tmp/ns/p"), status(1, "NSpid", "/tmp/ns/p"))
+        os.write(w, b"x")
+        os.read(r2, 1)
+        print("umount", libc.umount(b"/tmp/ns/p"))
+
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    pid = fork(init)
+    os.read(r, 1)
+    # 外面看里面：新的 procfs 实例里的编号是里面的，self 没有；全局的 procfs 里有两层编号
+    print("outside: pids", pids("/tmp/ns/p"), "self", link("/tmp/ns/p/self"))
+    print("outside: init status", status(1, "Pid", "/tmp/ns/p"), len(status(pid, "NStgid")), status(pid, "NStgid")[-1])
+    print("outside: own NSpid", len(status("self", "NSpid")))
+    os.write(w2, b"x")
+    print("init status", os.waitpid(pid, 0)[1])
+
+
+child(first)
+
+
+# 信号：里面发给 1 号进程的 si_pid 是发送者在里面的编号，外面发的是 0；外面发的 SIGTERM
+# 按默认处理时被忽略，SIGKILL 不会
+def signals():
+    os.unshare(CLONE_NEWPID)
+    r, w = os.pipe()
+
+    def init():
+        signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGUSR1])
+        sender = fork(lambda: os.kill(1, signal.SIGUSR1))
+        info = signal.sigwaitinfo([signal.SIGUSR1])
+        print("from inside: si_pid", info.si_pid, "sender", sender, "code", info.si_code)
+        os.waitpid(sender, 0)
+        os.write(w, b"x")
+        info = signal.sigwaitinfo([signal.SIGUSR1])
+        print("from outside: si_pid", info.si_pid, "code", info.si_code)
+        os.write(w, b"x")
+        time.sleep(30)
+
+    pid = fork(init)
+    os.read(r, 1)
+    os.kill(pid, signal.SIGUSR1)
+    os.read(r, 1)
+    os.kill(pid, signal.SIGTERM)
+    time.sleep(0.3)
+    print("after SIGTERM", os.waitpid(pid, os.WNOHANG))
+    os.kill(pid, signal.SIGKILL)
+    print("after SIGKILL", os.waitpid(pid, 0)[1])
+
+
+child(signals)
+
+
+# 外面发的 SIGSTOP 让 1 号进程停下，里面发的 SIGCONT 虽然被丢掉也让它继续；按默认方式处理
+# 的同步异常照常结束它
+def stop_cont():
+    os.unshare(CLONE_NEWPID)
+    ready, go = os.pipe(), os.pipe()
+
+    def init():
+        fork(lambda: (os.read(go[0], 1), os.kill(1, signal.SIGCONT)))
+        os.write(ready[1], b"x")
+        time.sleep(0.5)
+        print("init resumed")
+        ctypes.string_at(0)
+
+    def state(pid):
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+
+    def until(pid, f):
+        for _ in range(200):
+            if f(state(pid)):
+                return True
+            time.sleep(0.01)
+
+    pid = fork(init)
+    os.read(ready[0], 1)
+    os.kill(pid, signal.SIGSTOP)
+    print("stopped", until(pid, lambda s: s == "T"))
+    os.write(go[1], b"x")
+    print("continued", until(pid, lambda s: s != "T"))
+    print("killed by", os.WTERMSIG(os.waitpid(pid, 0)[1]))
+
+
+child(stop_cont)
+
+
+# 1 号进程退出：里面别的进程都被结束、回收之后父进程才等到它。父进程在外面的（unshare、
+# setns 之后 fork 的）结束了要等父进程回收
+def zap():
+    os.unshare(CLONE_NEWPID)
+    r, w = os.pipe()
+    go = os.pipe()
+
+    def init():
+        fork(lambda: time.sleep(30))
+        os.write(w, b"x")
+        os.read(go[0], 1)
+
+    pid = fork(init)
+    os.read(r, 1)
+    sleeper = inner_global(pid, 2)
+    print("sleeper found", sleeper is not None)
+    zombie = fork(lambda: None)
+    time.sleep(0.2)
+    os.write(go[1], b"x")
+    time.sleep(0.3)
+    print("init waits for the zombie", os.waitpid(pid, os.WNOHANG))
+    print("zombie", os.waitpid(zombie, 0)[1])
+    print("init status", os.waitpid(pid, 0)[1], "sleeper gone", err(os.kill, sleeper, 0))
+
+
+child(zap)
+
+
+# setns 到 pid 命名空间：之后的子进程在里面，看不到父进程；只能进自己的和后代命名空间
+def entered():
+    os.unshare(CLONE_NEWPID)
+    r, w = os.pipe()
+    outer = os.open("/proc/self/ns/pid", os.O_RDONLY)
+
+    def init():
+        print("setns to an ancestor", err(os.setns, outer, CLONE_NEWPID))
+        os.write(w, b"x")
+        time.sleep(30)
+
+    pid = fork(init)
+    os.read(r, 1)
+    fd = os.open("/proc/%d/ns/pid" % pid, os.O_RDONLY)
+    print("wrong type", err(os.setns, fd, CLONE_NEWNS))
+    print("setns back to own", err(os.setns, outer, CLONE_NEWPID))
+    print("children in own", link("/proc/self/ns/pid_for_children") == mine)
+    print("setns into the child's", err(os.setns, fd, CLONE_NEWPID))
+    print("own unchanged", link("/proc/self/ns/pid") == mine)
+    print("child", child(lambda: print("joined: pid", os.getpid(), "ppid", os.getppid())))
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+
+
+child(entered)
+
+
+# SO_PEERCRED：外面监听、里面连接，里面看到的对方 pid 是 0
+def peercred():
+    os.unshare(CLONE_NEWPID)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind("\0appine-pidns")
+    srv.listen()
+
+    def init():
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect("\0appine-pidns")
+        cred = c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        print("inside sees peer pid", struct.unpack("3i", cred)[0])
+        c.recv(1)
+
+    pid = fork(init)
+    conn, _ = srv.accept()
+    cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    print("outside sees the init", struct.unpack("3i", cred)[0] == pid)
+    conn.send(b"x")
+    os.waitpid(pid, 0)
+
+
+child(peercred)
+
+
+# clone3 的 set_tid：指定新进程在各层的编号，从它所在的那层起往外。只比里面两层：docker 的
+# 容器本身在一个 pid 命名空间里，再往外的层两边不同
+class CloneArgs(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in (
+        "flags", "pidfd", "child_tid", "parent_tid", "exit_signal", "stack", "stack_size",
+        "tls", "set_tid", "set_tid_size", "cgroup")]
+
+
+def clone3(*set_tid):
+    tids = (ctypes.c_int * len(set_tid))(*set_tid)
+    args = CloneArgs(exit_signal=SIGCHLD, set_tid=ctypes.addressof(tids), set_tid_size=len(set_tid))
+    pid = libc.syscall(435, ctypes.byref(args), ctypes.sizeof(args))
+    if pid == 0:
+        print("  clone3 child: pid", os.getpid())
+        os._exit(0)
+    if pid < 0:
+        return errno.errorcode[ctypes.get_errno()]
+    os.waitpid(pid, 0)
+    return pid
+
+
+def set_tid():
+    os.unshare(CLONE_NEWPID)
+    print("no init yet", clone3(5))
+    r, w = os.pipe()
+    pid = fork(lambda: os.read(r, 1))
+    print("taken", clone3(1))
+    print("inner only", clone3(50) not in (50, "EINVAL"))
+    print("two levels", clone3(50, 30000))
+    print("out of range", clone3(-1), clone3(0))
+    os.write(w, b"x")
+    os.waitpid(pid, 0)
+
+
+child(set_tid)
+
+
+def unprivileged_set_tid():
+    os.setuid(65534)
+    print("unprivileged", clone3(30000))
+
+
+child(unprivileged_set_tid)
+
+
+# 最多嵌套 32 层。docker 的容器本身在一个 pid 命名空间里，原生一侧少嵌套一层，只比错误
+# （层数在单元测试 pid_namespaces 里）
+def nested():
+    for level in range(1, 40):
+        try:
+            os.unshare(CLONE_NEWPID)
+        except OSError as e:
+            print("nesting stops:", errno.errorcode[e.errno], "pid", os.getpid(), "deep", level > 30)
+            return
+        pid = os.fork()
+        if pid:
+            os.waitpid(pid, 0)
+            os._exit(0)
+
+
+child(nested)
+PY3
 rm -rf /tmp/ns

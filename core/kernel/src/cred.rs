@@ -48,8 +48,9 @@ pub(crate) mod cap {
     pub const LEASE: u32 = 28;
     pub const SETFCAP: u32 = 31;
     pub const MAC_OVERRIDE: u32 = 32;
-    /// 最大的能力编号（`CAP_CHECKPOINT_RESTORE`）。
-    pub const LAST: u32 = 40;
+    pub const CHECKPOINT_RESTORE: u32 = 40;
+    /// 最大的能力编号。
+    pub const LAST: u32 = CHECKPOINT_RESTORE;
 }
 
 /// 全部能力（也是默认的边界集）。
@@ -235,6 +236,18 @@ impl UserNs {
             gid_map: RefCell::new(IdMap::default()),
             setgroups: Cell::new(parent.setgroups.get()),
         })
+    }
+
+    /// `self` 是 `other` 或者它的祖先（Linux 的 `in_userns(self, other)`）。
+    pub fn is_ancestor_of(&self, other: &UserNs) -> bool {
+        let mut ns = other;
+        while ns.level > self.level {
+            match &ns.parent {
+                Some(p) => ns = p,
+                None => return false,
+            }
+        }
+        ns.id == self.id
     }
 }
 

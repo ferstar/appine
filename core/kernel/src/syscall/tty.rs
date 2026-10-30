@@ -563,7 +563,7 @@ pub(crate) fn ioctl(
             if !is_ctty(cx, tty) {
                 return Err(Errno::ENOTTY);
             }
-            let fg = tty.borrow().fg.unwrap_or(0);
+            let fg = tty.borrow().fg.map_or(0, |p| cx.pid_out(p));
             put(cx, arg, fg.to_le_bytes()).map(|()| 0)
         }
         TIOCSPGRP => {
@@ -575,6 +575,7 @@ pub(crate) fn ioctl(
             if pgid < 0 {
                 return Err(Errno::EINVAL);
             }
+            let pgid = cx.pid_in(pgid);
             let sid = cx.t.group.borrow().sid;
             let exists = cx
                 .kr()
@@ -592,7 +593,7 @@ pub(crate) fn ioctl(
                 return Err(Errno::ENOTTY);
             }
             let sid = tty.borrow().session.ok_or(Errno::ENOTTY)?;
-            put(cx, arg, sid.to_le_bytes()).map(|()| 0)
+            put(cx, arg, cx.pid_out(sid).to_le_bytes()).map(|()| 0)
         }
         TIOCSCTTY => {
             let (sid, pgid, tgid, has_ctty) = {

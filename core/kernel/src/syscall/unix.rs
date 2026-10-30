@@ -586,7 +586,12 @@ fn deliver(
     let mut out_flags = if r.len > r.data.len() { MSG_TRUNC } else { 0 };
     if passcred {
         if control_len >= CMSG_HDR + 12 {
-            push_cmsg(&mut control, SCM_CREDENTIALS, &r.cred.encode());
+            // pid 是接收者看到的（Linux 的 scm_recv 用 pid_vnr）
+            let cred = Ucred {
+                pid: cx.pid_out(r.cred.pid),
+                ..r.cred
+            };
+            push_cmsg(&mut control, SCM_CREDENTIALS, &cred.encode());
         } else {
             out_flags |= MSG_CTRUNC;
         }
@@ -664,7 +669,13 @@ pub(super) fn setsockopt(
     Ok(())
 }
 
-pub(super) fn getsockopt(u: &UnixSocket, level: i32, name: i32) -> Result<Vec<u8>, Errno> {
+/// `pid_ns` 是调用者的 pid 命名空间：`SO_PEERCRED` 的 pid 按它算。
+pub(super) fn getsockopt(
+    u: &UnixSocket,
+    level: i32,
+    name: i32,
+    pid_ns: &crate::pidns::PidNs,
+) -> Result<Vec<u8>, Errno> {
     if level != SOL_SOCKET {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -681,6 +692,10 @@ pub(super) fn getsockopt(u: &UnixSocket, level: i32, name: i32) -> Result<Vec<u8
         // 没有对方时与 Linux 相同：pid 为 0，uid、gid 是 overflowuid
         SO_PEERCRED => u
             .peer_cred
+            .map(|c| Ucred {
+                pid: pid_ns.vnr(c.pid).unwrap_or(0),
+                ..c
+            })
             .unwrap_or(Ucred {
                 pid: 0,
                 uid: 65534,

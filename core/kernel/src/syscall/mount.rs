@@ -158,7 +158,7 @@ fn new_mount(
         return Ok(0);
     }
     let dev = (!fs.own_dev()).then(|| fs.dev());
-    vfs.add_mount(
+    let id = vfs.add_mount(
         fs,
         fs.root(),
         (target, at),
@@ -166,6 +166,11 @@ fn new_mount(
         source.unwrap_or_default(),
         dev,
     );
+    // procfs 里的 pid 按挂上它的进程所在的 pid 命名空间算
+    let pid_ns = cx.pid_ns();
+    if fs == Fs::Proc && pid_ns.level > 0 {
+        vfs.set_proc_pid_ns(id, pid_ns);
+    }
     cx.shared.fast_changed();
     Ok(0)
 }

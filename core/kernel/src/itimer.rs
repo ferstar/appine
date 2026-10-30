@@ -257,6 +257,7 @@ fn expire_group(
                     value: t.value,
                 },
                 esr: 0,
+                sender: 0,
             };
             if !add_overrun(k, tgid, tid, sig, id, missed) {
                 let cpu = matches!(t.clock, Clock::Process(_));

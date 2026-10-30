@@ -746,6 +746,7 @@ fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
             arch: AUDIT_ARCH_AARCH64,
         },
         esr: 0,
+        sender: 0,
     }
 }
 

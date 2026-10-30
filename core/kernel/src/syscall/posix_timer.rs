@@ -94,6 +94,7 @@ pub(super) fn timer_create(cx: &mut Cx<'_>, clockid: i32, sevp: u64, idp: u64) -
             let sig = Signal::new(signo).ok_or(Errno::EINVAL)?;
             let target = if notify == SIGEV_THREAD_ID {
                 // 目标线程必须在同一个进程里
+                let tid = cx.pid_in(tid);
                 match cx.kr().tasks.get(&tid) {
                     Some(t) if t.tgid == cx.tgid() => Some(tid),
                     _ => return Err(Errno::EINVAL),

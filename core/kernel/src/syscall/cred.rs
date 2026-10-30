@@ -174,6 +174,7 @@ pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
     let cred = if pid == 0 {
         cx.cred()
     } else {
+        let pid = cx.pid_in(pid);
         let k = cx.kr();
         let task = k.tasks.get(&pid).ok_or(Errno::ESRCH)?;
         let group = k.groups.get(&task.tgid).ok_or(Errno::ESRCH)?;
@@ -198,7 +199,7 @@ pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
 
 pub(super) fn capset(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
     let (words, pid) = cap_header(cx, hdr)?;
-    if pid != 0 && pid != cx.tid() {
+    if pid != 0 && cx.pid_in(pid) != cx.tid() {
         return Err(Errno::EPERM);
     }
     let mut sets = [0u64; 3];

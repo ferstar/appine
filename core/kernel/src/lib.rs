@@ -22,6 +22,7 @@ mod machine;
 mod mm;
 mod net;
 mod oom;
+mod pidns;
 mod pipe;
 mod process;
 mod pseudo;

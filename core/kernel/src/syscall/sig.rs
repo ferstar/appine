@@ -45,7 +45,8 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
         };
     }
     // 活着的目标线程组：pid > 0 是一个进程，0 是本进程组，-1 是除 init 和自己以外的
-    // 所有进程，< -1 是进程组 -pid
+    // 所有进程（自己的 pid 命名空间里看得到、编号大于 1 的），< -1 是进程组 -pid
+    let ns = cx.pid_ns();
     let targets: Vec<Tid> = cx
         .kr()
         .groups
@@ -55,7 +56,7 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
             let hit = match pid {
                 p if p > 0 => g.tgid == p,
                 0 => g.pgid == my_pgid,
-                -1 => g.tgid != INIT && g.tgid != me,
+                -1 => g.tgid != me && ns.vnr(g.tgid).is_some_and(|v| v > 1),
                 p => g.pgid == -p,
             };
             (hit && g.tgid != INIT).then_some(g.tgid)
@@ -74,7 +75,7 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     }
     if let Some(sig) = sig {
         for tgid in allowed {
-            let info = SigInfo::kill(code::SI_USER, me, cred.ruid);
+            let info = SigInfo::kill(code::SI_USER, cx.pid_out(me), cred.ruid).from(me);
             signal::send_to_group(cx.kr(), tgid, sig, info);
         }
     }
@@ -122,7 +123,8 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
         if !signal::can_queue(cx.kr(), task.tgid, sig) {
             return Err(Errno::EAGAIN);
         }
-        let info = SigInfo::kill(code::SI_TKILL, cx.tgid(), cred.ruid);
+        let me = cx.tgid();
+        let info = SigInfo::kill(code::SI_TKILL, cx.pid_out(me), cred.ruid).from(me);
         signal::send_to_task(cx.kr(), &task, sig, info);
     }
     Ok(0)
@@ -139,6 +141,7 @@ fn queue_info(b: &[u8; 128]) -> SigInfo {
             value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
         },
         esr: 0,
+        sender: 0,
     }
 }
 
@@ -190,8 +193,9 @@ pub(super) fn pidfd_send_signal(
         }
         info
     } else {
-        SigInfo::kill(code::SI_USER, me, cred.ruid)
-    };
+        SigInfo::kill(code::SI_USER, cx.pid_out(me), cred.ruid)
+    }
+    .from(me);
     if !cx.kr().groups.contains_key(&tgid) {
         return Err(Errno::ESRCH);
     }
@@ -223,7 +227,7 @@ pub(super) fn sigqueueinfo(
     uinfo: u64,
 ) -> SysResult {
     let b: [u8; 128] = get(cx, uinfo)?;
-    let info = queue_info(&b);
+    let info = queue_info(&b).from(cx.tgid());
     let code = info.code;
     let target = tid.unwrap_or(tgid);
     if (code >= 0 || code == code::SI_TKILL) && target != cx.tid() && tgid != cx.tgid() {

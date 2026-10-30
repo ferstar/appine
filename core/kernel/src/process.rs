@@ -309,6 +309,11 @@ pub(crate) struct ThreadGroup {
     pub threads: Vec<Tid>,
     /// 子进程（含僵尸进程）。
     pub children: Vec<Tid>,
+    /// 所在的 pid 命名空间（线程都在这里）。
+    pub pid_ns: Rc<crate::pidns::PidNs>,
+    /// 按默认方式处理的同步信号被强制投递过：是 pid 命名空间的 1 号进程也照常结束（Linux 的
+    /// `force_sig_info_to_task` 去掉 `SIGNAL_UNKILLABLE`）。
+    pub killable: bool,
     /// 发给整个进程、尚未处理的信号。
     pub pending: Pending,
     /// 信号处理方式。
@@ -409,6 +414,8 @@ impl ThreadGroup {
             sid: tgid,
             threads: Vec::new(),
             children: Vec::new(),
+            pid_ns: crate::pidns::PidNs::init(),
+            killable: false,
             pending: Pending::default(),
             sighand,
             rlimits: default_rlimits(),
@@ -548,10 +555,9 @@ impl Rusage {
 /// 做的事丢了，别的不受牵连：父进程和宿主总能等到它结束，它的子进程、跟踪的进程、孤儿进程组
 /// 和 SysV IPC 的清理不会因为前面的一步出错而卡住。
 pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
-    let (tgid, ppid, pgid, sid, status, exit_signal) = {
+    let (tgid, pgid, sid) = {
         let g = group.borrow();
-        let status = g.exiting.unwrap_or(g.leader_status);
-        (g.tgid, g.ppid, g.pgid, g.sid, status, g.exit_signal)
+        (g.tgid, g.pgid, g.sid)
     };
     step(k, tgid, 1, "releasing AIO contexts", |k| {
         let contexts = std::mem::take(&mut group.borrow_mut().aio);
@@ -561,8 +567,26 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     // 另一个进程组和这个进程组连在一起时，是它自己的进程组；以及同一会话里、另一个进程组的子进程的
     let mut pgrps = Vec::new();
     let mut orphaned = Vec::new();
+    // pid 命名空间的 1 号进程退出：命名空间里的进程都被结束，之后不能再建进程，它等到
+    // 它们都被回收了才算结束（Linux 的 zap_pid_ns_processes）
+    let ns = group.borrow().pid_ns.clone();
+    let zap = ns.level > 0 && ns.reaper.get() == Some(tgid);
     step(k, tgid, 2, "handing its children to init", |k| {
-        let init = k.groups[&INIT].clone();
+        if zap {
+            ns.dead.set(true);
+            for g in ns.members() {
+                if g != tgid && k.groups.contains_key(&g) {
+                    signal::send_to_group(k, g, Signal::KILL, SigInfo::kernel());
+                }
+            }
+        }
+        // 孤儿过继给它所在的 pid 命名空间的 1 号进程（Linux 的 find_child_reaper），
+        // 开机时的命名空间里、或者 1 号进程自己退出时给 init
+        let reaper = ns
+            .reaper
+            .get()
+            .filter(|&r| ns.level > 0 && !zap && k.groups.contains_key(&r))
+            .unwrap_or(INIT);
         let children = std::mem::take(&mut group.borrow_mut().children);
         for c in children {
             let Some(child) = k.groups.get(&c).cloned() else {
@@ -570,20 +594,31 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             };
             let zombie = {
                 let mut cg = child.borrow_mut();
-                cg.ppid = INIT;
+                cg.ppid = reaper;
+                cg.exit_signal = Signal::CHLD.number();
                 if cg.pgid != pgid && cg.sid == sid {
                     pgrps.push(cg.pgid);
                 }
                 if let Some(sig) = Signal::new(cg.pdeathsig) {
                     orphaned.push((c, sig));
                 }
-                // 跟踪者还没取走的僵尸进程交给 init，跟踪者取走之后由 init 回收
-                cg.zombie.is_some() && cg.exit_tracer.is_none()
+                // 跟踪者还没取走的僵尸进程交给新的父进程，跟踪者取走之后由它回收
+                cg.zombie.filter(|_| cg.exit_tracer.is_none())
             };
-            if zombie {
-                k.groups.remove(&c);
-            } else {
-                init.borrow_mut().children.push(c);
+            if reaper != INIT {
+                k.groups[&reaper].borrow_mut().children.push(c);
+            }
+            match zombie {
+                Some(_) if reaper == INIT => {
+                    k.groups.remove(&c);
+                    k.release_pid(c);
+                }
+                // 新的父进程要回收它：与 Linux 的 reparent_leader 一样再通知一次
+                Some(status) => {
+                    hand_to_parent(k, &child, (c, reaper, Signal::CHLD.number()), status)
+                }
+                None if reaper == INIT => k.groups[&INIT].borrow_mut().children.push(c),
+                None => {}
             }
         }
     });
@@ -593,13 +628,32 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             signal::send_to_group(k, c, sig, SigInfo::kernel());
         }
     });
-    if let Some(slot) = k.watched.get_mut(&tgid) {
-        *slot = Some(status);
-    }
     step(k, tgid, 4, "releasing SysV IPC", |k| k.ipc.exit(tgid));
     step(k, tgid, 5, "releasing the controlling terminal", |k| {
         release_ctty(k, group)
     });
+    if zap && ns.members().iter().any(|&g| g != tgid) {
+        k.hold_reaper(ns, group.clone(), pgrps);
+    } else {
+        finish_reported(k, group, pgrps);
+    }
+}
+
+/// [`finish_group`] 的后一半：报告给跟踪者、父进程。pid 命名空间的 1 号进程等到命名空间里
+/// 别的进程都被回收了才做这一半（[`Kernel::release_pid`]）。
+pub(crate) fn finish_reported(
+    k: &mut Kernel,
+    group: &Rc<RefCell<ThreadGroup>>,
+    mut pgrps: Vec<Tid>,
+) {
+    let (tgid, ppid, pgid, sid, status, exit_signal) = {
+        let g = group.borrow();
+        let status = g.exiting.unwrap_or(g.leader_status);
+        (g.tgid, g.ppid, g.pgid, g.sid, status, g.exit_signal)
+    };
+    if let Some(slot) = k.watched.get_mut(&tgid) {
+        *slot = Some(status);
+    }
     // 被父进程以外的进程跟踪着的先报告给跟踪者，它取走之后再交给父进程
     let traced = step(k, tgid, 6, "reporting to its tracer", |k| {
         crate::ptrace::group_finished(k, group, status)
@@ -698,13 +752,15 @@ fn hand_to_parent(
         });
     if reap {
         k.groups.remove(&tgid);
+        k.release_pid(tgid);
         if let Some(p) = &parent {
             p.borrow_mut().children.retain(|&c| c != tgid);
         }
     } else {
         group.borrow_mut().zombie = Some(status);
         if let Some(sig) = Signal::new(exit_signal) {
-            signal::send_to_group(k, ppid, sig, SigInfo::child(tgid, status));
+            let pid = k.pid_seen_by(ppid, tgid);
+            signal::send_to_group(k, ppid, sig, SigInfo::child(pid, status));
         }
     }
 }
