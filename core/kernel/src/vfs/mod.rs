@@ -117,6 +117,9 @@ pub(crate) enum Fs {
     Sys,
     /// 只读的 cgroup2。
     Cgroup,
+    /// nsfs：命名空间文件（`/proc/<pid>/ns/*` 跟随之后得到的）所在的文件系统。挂不上，只有
+    /// bind 挂载出去的命名空间文件在挂载表里。
+    Nsfs,
 }
 
 impl Fs {
@@ -141,6 +144,7 @@ impl Fs {
             Fs::Pts => "devpts",
             Fs::Sys => "sysfs",
             Fs::Cgroup => "cgroup2",
+            Fs::Nsfs => "nsfs",
         }
     }
 
@@ -150,11 +154,12 @@ impl Fs {
             Fs::Store => ROOT_DEV,
             // 没有开机时的实例，每次挂上另外分配
             Fs::Tmpfs => 0,
-            // 0:4 是 nsfs 的（`/proc/<pid>/ns/*`），与 Linux 一样
             Fs::Proc => 0x17,
             Fs::Pts => 0x18,
             Fs::Sys => 0x16,
             Fs::Cgroup => 0x1a,
+            // 与 Linux 一样
+            Fs::Nsfs => 0x4,
         }
     }
 
@@ -177,18 +182,18 @@ impl Fs {
             Fs::Pts => ",gid=5,mode=620,ptmxmode=000",
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
             // tmpfs 的按实例（[`Vfs::sb_options`]）
-            Fs::Store | Fs::Tmpfs | Fs::Proc | Fs::Sys => "",
+            Fs::Store | Fs::Tmpfs | Fs::Proc | Fs::Sys | Fs::Nsfs => "",
         }
     }
 
     /// 文件系统的根目录（挂载编号是 0，挂上时换成新挂载的）。tmpfs 的根是挂上时新建的
-    /// 目录（[`Vfs::new_tmpfs`]），不用这个。
+    /// 目录（[`Vfs::new_tmpfs`]），nsfs 挂不上，都不用这个。
     pub(crate) fn root(self) -> Node {
         Node::Pseudo(
             0,
             match self {
                 Fs::Store | Fs::Tmpfs => return Node::Store(0, ROOT),
-                Fs::Proc => PseudoNode::ProcRoot,
+                Fs::Proc | Fs::Nsfs => PseudoNode::ProcRoot,
                 Fs::Pts => PseudoNode::PtsRoot,
                 Fs::Sys => PseudoNode::SysRoot,
                 Fs::Cgroup => PseudoNode::Cgroup(b""),
@@ -244,6 +249,8 @@ pub(crate) struct Mount {
     pub source: Vec<u8>,
     /// `umount2(MNT_EXPIRE)` 标记过：再来一次就卸下。
     pub expiring: bool,
+    /// bind 挂载出去的命名空间文件（[`Fs::Nsfs`]）：它让那个命名空间活着。
+    pub pin: Option<crate::nsproxy::NsRef>,
 }
 
 /// 合成文件系统的目录结构（内核层实现，内容来自内核状态）。
@@ -500,6 +507,7 @@ impl Vfs {
             dev: ROOT_DEV,
             source: b"appine".to_vec(),
             expiring: false,
+            pin: None,
         }];
         for (id, fs, path, flags, source) in boot {
             let mut ino = Some(ROOT);
@@ -519,6 +527,7 @@ impl Vfs {
                     dev: fs.dev(),
                     source: source.to_vec(),
                     expiring: false,
+                    pin: None,
                 }),
                 _ => crate::debug::log(format_args!("no mount point for {fs:?}")),
             }
@@ -537,6 +546,7 @@ impl Vfs {
                 dev: Fs::Cgroup.dev(),
                 source: b"cgroup".to_vec(),
                 expiring: false,
+                pin: None,
             });
         }
         let mounts = Mounts {
@@ -1015,7 +1025,20 @@ impl Vfs {
         self.init_ns.clone()
     }
 
-    /// 编号为 `id`、还有人用的挂载命名空间。
+    /// bind 挂载出去的、编号为 `id` 的命名空间文件留着的命名空间（[`Mount::pin`]，卸下了
+    /// 还有人用的挂载里的也算）。
+    pub(crate) fn pinned_ns(&self, id: u64) -> Option<crate::nsproxy::NsRef> {
+        let mounts = self.mounts.borrow();
+        mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .filter_map(|m| m.pin.as_ref())
+            .find(|r| r.id() == id)
+            .cloned()
+    }
+
+    /// 编号为 `id`、还有人用的挂载命名空间（进程在里面，或者有命名空间文件留着它）。
     pub(crate) fn find_ns(&self, id: u64) -> Option<std::rc::Rc<MntNs>> {
         if id == INIT_MNT_NS {
             return Some(self.init_ns.clone());
@@ -1043,12 +1066,23 @@ impl Vfs {
             owner,
         });
         let mut mounts = self.mounts.borrow_mut();
-        let old: Vec<Mount> = mounts
+        let mut old: Vec<Mount> = mounts
             .list
             .iter()
             .filter(|m| m.ns == from)
             .cloned()
             .collect();
+        // bind 出去的挂载命名空间文件和挂在它上面的不复制（Linux 的 copy_tree 不带
+        // CL_COPY_MNT_NS_FILE）：新的命名空间比它新，留着它可能成环
+        let mut skip = std::collections::HashSet::new();
+        while let Some(m) = old.iter().find(|m| {
+            !skip.contains(&m.id)
+                && (matches!(m.pin, Some(crate::nsproxy::NsRef::Mnt(_)))
+                    || m.parent().is_some_and(|p| skip.contains(&p)))
+        }) {
+            skip.insert(m.id);
+        }
+        old.retain(|m| !skip.contains(&m.id));
         // 先分配编号再复制：MS_MOVE、pivot_root 之后挂载点所在的挂载可能比它后挂上
         let mut map = std::collections::HashMap::new();
         for m in &old {
@@ -1207,10 +1241,12 @@ impl Vfs {
         }
     }
 
-    /// 目录在它的文件系统里的路径。
+    /// 目录在它的文件系统里的路径。命名空间文件是 `net:[编号]` 这样（Linux 的 nsfs 的
+    /// `d_dname`），前面没有 `/`。
     fn fs_path(&self, ps: &dyn Pseudo, node: &Node) -> Vec<u8> {
         let mut names = Vec::new();
         match node {
+            Node::Pseudo(id, p @ PseudoNode::NsFile(..)) => return ps.name(*id, p),
             Node::Store(_, ino) => {
                 let mut cur = *ino;
                 while cur != ROOT {
@@ -1281,6 +1317,7 @@ impl Vfs {
             dev,
             source,
             expiring: false,
+            pin: None,
         });
         drop(mounts);
         self.mounts_changed();
@@ -1439,6 +1476,10 @@ impl Vfs {
             if let Err(e) = self.store.remove_detached_dir(root) {
                 crate::debug::log(format_args!("cannot remove tmpfs {root}: {e}"));
             }
+        }
+        // 丢掉的挂载里有 bind 出去的挂载命名空间文件：那个命名空间可能也没人用了
+        if self.has_dead_ns() {
+            self.collect(in_use);
         }
     }
 
@@ -2189,6 +2230,45 @@ mod tests {
         assert!(vfs.mount(t).is_none());
         assert_eq!(vfs.store().stat(troot).unwrap().nlink, 0);
         assert_eq!(vfs.mounts_in(INIT_MNT_NS).len(), before.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bound_namespace_files_keep_namespaces() {
+        let (vfs, dir) = sample("nsfs");
+        let (pin, _) = vfs.store().create_file(ROOT, b"pin", 0o444, 0, 0).unwrap();
+        let point = (
+            Node::Store(ROOT_MOUNT, pin),
+            Some((Node::ROOT, b"pin".to_vec())),
+        );
+        let before = vfs.mounts_in(INIT_MNT_NS).len();
+        // 新的挂载命名空间 A 的文件 bind 到开机时的命名空间里
+        let (a, _) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let a_id = a.id;
+        let file = Node::Pseudo(
+            PROC_MOUNT,
+            PseudoNode::NsFile(crate::pseudo::NsKind::Mnt, a_id),
+        );
+        let fs = Fs::Nsfs;
+        let id = vfs.add_mount(fs, file, point, 0, b"nsfs".to_vec(), Some(fs.dev()));
+        vfs.update_mount(id, |m| m.pin = Some(crate::nsproxy::NsRef::Mnt(a.clone())));
+        // 复制开机时的命名空间时不带它（不然 A 经由复制出来的挂载留着自己）
+        let (c, _) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
+        let copied = vfs.mounts_in(c.id);
+        assert_eq!(copied.len(), before);
+        assert!(copied.iter().all(|m| m.pin.is_none()));
+        // A 里没有进程了：挂载留着它
+        drop(a);
+        assert!(!vfs.has_dead_ns());
+        assert!(vfs.find_ns(a_id).is_some());
+        assert_eq!(vfs.pinned_ns(a_id).map(|r| r.id()), Some(a_id));
+        // 卸下之后清理：A 连同它的挂载一起没了
+        vfs.remove_mount(id);
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(vfs.find_ns(a_id).is_none());
+        assert!(vfs.mounts_in(a_id).is_empty());
+        assert!(vfs.pinned_ns(a_id).is_none());
+        assert_eq!(vfs.mounts_in(c.id).len(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

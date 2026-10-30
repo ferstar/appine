@@ -3,8 +3,8 @@
 //! setns 只改调用的线程，clone 出来的线程、进程沿用父线程的。
 //!
 //! UTS 命名空间有自己的主机名和 NIS 域名。IPC 命名空间有自己的 System V IPC 对象、POSIX
-//! 消息队列和它们的限制，内容放在 [`crate::kernel::Kernel::ipcs`] 里按编号存，最后一个
-//! 用它的线程退出之后丢掉。网络命名空间见 [`NetNs`]。
+//! 消息队列和它们的限制，内容放在 [`crate::kernel::Kernel::ipcs`] 里按编号存，没有线程用它、
+//! 也没有命名空间文件留着它（[`NsRef`]）之后丢掉。网络命名空间见 [`NetNs`]。
 
 use std::rc::Rc;
 
@@ -19,6 +19,8 @@ pub(crate) const INIT_IPC_NS: u64 = 4_026_531_839;
 pub(crate) const INIT_NET_NS: u64 = 4_026_531_840;
 /// 开机时的 cgroup 命名空间的编号。
 pub(crate) const INIT_CGROUP_NS: u64 = 4_026_531_835;
+/// time 命名空间的编号：只有开机时的那个（`CLONE_NEWTIME` 是 EPERM）。
+pub(crate) const INIT_TIME_NS: u64 = 4_026_531_834;
 
 /// 一个 UTS 命名空间。
 #[derive(Debug)]
@@ -86,6 +88,54 @@ pub(crate) struct Loopback {
     pub v6: bool,
     /// 设过的 MTU（`SIOCSIFMTU`），默认 65536。
     pub mtu: Option<u32>,
+}
+
+/// 一个命名空间（Linux 的 `struct ns_common`）。打开着的命名空间文件、bind 挂载出去的
+/// 命名空间文件（nsfs）持有它：里面的进程都退出之后命名空间也还在，可以 setns 进去
+/// （`ip netns add` 就是这样留住网络命名空间的）。
+#[derive(Clone, Debug)]
+pub(crate) enum NsRef {
+    Mnt(Rc<crate::vfs::MntNs>),
+    User(Rc<UserNs>),
+    /// `pid` 和 `pid_for_children` 的文件都是它。
+    Pid(Rc<crate::pidns::PidNs>),
+    Uts(Rc<UtsNs>),
+    Ipc(Rc<IpcNs>),
+    Net(Rc<NetNs>),
+    Cgroup(Rc<CgroupNs>),
+    /// time 命名空间只有开机时的那个。
+    Time,
+}
+
+impl NsRef {
+    /// 编号（命名空间文件的 inode 号）。
+    pub fn id(&self) -> u64 {
+        match self {
+            NsRef::Mnt(n) => n.id,
+            NsRef::User(n) => n.id,
+            NsRef::Pid(n) => n.id,
+            NsRef::Uts(n) => n.id,
+            NsRef::Ipc(n) => n.id,
+            NsRef::Net(n) => n.id,
+            NsRef::Cgroup(n) => n.id,
+            NsRef::Time => INIT_TIME_NS,
+        }
+    }
+
+    /// 属主（Linux 的 `ns->ops->owner`）：建立它时所在的用户命名空间，用户命名空间的是
+    /// 上一层，开机时的用户命名空间没有。
+    pub fn owner(&self) -> Option<Rc<UserNs>> {
+        Some(match self {
+            NsRef::Mnt(n) => n.owner.clone(),
+            NsRef::User(n) => return n.parent.clone(),
+            NsRef::Pid(n) => n.owner.clone(),
+            NsRef::Uts(n) => n.owner.clone(),
+            NsRef::Ipc(n) => n.owner.clone(),
+            NsRef::Net(n) => n.owner.clone(),
+            NsRef::Cgroup(n) => n.owner.clone(),
+            NsRef::Time => UserNs::init(),
+        })
+    }
 }
 
 /// 线程的 UTS、IPC、网络、cgroup 命名空间。

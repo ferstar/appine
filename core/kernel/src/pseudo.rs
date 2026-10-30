@@ -199,7 +199,7 @@ impl NsKind {
                 }
                 ns.id
             }
-            NsKind::Time | NsKind::TimeForChildren => 4_026_531_834,
+            NsKind::Time | NsKind::TimeForChildren => crate::nsproxy::INIT_TIME_NS,
             NsKind::Uts => task.ns.borrow().uts.id,
         })
     }
@@ -650,6 +650,7 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         | PseudoNode::SysCpu(..)
         | PseudoNode::SysNet(..) => Fs::Sys,
         PseudoNode::Cgroup(_) => Fs::Cgroup,
+        PseudoNode::NsFile(..) => Fs::Nsfs,
         _ => Fs::Proc,
     }
 }
@@ -3065,10 +3066,9 @@ fn cpu_mask(set: Range<usize>) -> String {
     cpu_mask_of(&set.collect::<Vec<_>>())
 }
 
-/// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec 和 64 位上总有的
+/// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec；open 打开的带着
 /// `O_LARGEFILE`）、挂载编号、inode，以及 eventfd、inotify 的附加行。
 fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
-    const O_LARGEFILE: u32 = 0o400000;
     let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();
     let fds = res.fds.borrow();
@@ -3083,7 +3083,7 @@ fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno>
     let mut s = format!(
         "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",
         f.pos,
-        f.flags | O_LARGEFILE | cloexec,
+        f.flags | cloexec,
         f.ino().unwrap_or(0)
     );
     match &f.kind {

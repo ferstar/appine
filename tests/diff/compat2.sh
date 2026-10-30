@@ -1,5 +1,6 @@
 # compat.sh 的续篇（difftest 把整个脚本作为 sh -c 的一个参数，不能超过 128 KB）：raw ICMP
-# socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径
+# socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径、F_GETFL 里的
+# O_LARGEFILE
 set -e
 cd /tmp
 # raw ICMP socket（appine 在宿主上用 ping socket 模拟）：IPv4 收到的数据带 IP 头，echo 回答
@@ -666,3 +667,26 @@ gcc -O1 -o icmperr icmperr.c && ./icmperr
 traceroute -n -q 2 -w 2 127.0.0.1 2>&1 | sed 's/ [0-9.]* ms//g'
 traceroute -I -n -q 2 -w 2 127.0.0.1 2>&1 | sed 's/ [0-9.]* ms//g'
 traceroute6 -n -q 2 -w 2 ::1 2>&1 | sed 's/ [0-9.]* ms//g'
+
+# F_GETFL、fdinfo 的标志：open 打开的带 O_LARGEFILE（O_PATH 的不带），管道、socket、eventfd、
+# epoll、memfd 这些按各自的系统调用
+python3 - <<'PY'
+import os, socket, select, fcntl
+def show(what, fd):
+    with open("/proc/self/fdinfo/%d" % fd) as f:
+        info = [l.split()[1] for l in f if l.startswith("flags:")][0]
+    print(what, oct(fcntl.fcntl(fd, fcntl.F_GETFL)), info)
+show("open", os.open("/tmp", os.O_RDONLY))
+show("open wronly", os.open("/tmp/largefile", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+show("o_path", os.open("/tmp", os.O_PATH))
+r, w = os.pipe()
+show("pipe r", r)
+show("pipe w", w)
+keep = [socket.socket(), socket.socketpair(), select.epoll()]
+show("socket", keep[0].fileno())
+show("unix pair", keep[1][0].fileno())
+show("eventfd", os.eventfd(0, os.EFD_NONBLOCK))
+show("epoll", keep[2].fileno())
+show("memfd", os.memfd_create("x"))
+show("reopened pipe", os.open("/proc/self/fd/%d" % r, os.O_RDONLY))
+PY

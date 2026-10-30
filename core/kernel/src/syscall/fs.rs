@@ -104,8 +104,6 @@ const MQUEUE_DEV: u64 = 0x13;
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const NSFS_MAGIC: u64 = 0x6e73_6673;
-/// nsfs 的设备号（`/proc/<pid>/ns/*` 跟随之后的 `st_dev`）。
-const NSFS_DEV: u64 = 0x4;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
@@ -411,7 +409,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
         Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
         // 命名空间在 nsfs 里
         Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
-            Ok(encode_stat(&pseudo::stat(&view, p)?, NSFS_DEV))
+            Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
         }
         // 魔法链接指向的打开文件：报告那个文件本身
         Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
@@ -609,8 +607,11 @@ fn open_path(
     };
 
     let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
-    // 命名空间在 `/proc/<pid>/fd/<n>` 里是 `mnt:[编号]` 这样
-    if let Node::Pseudo(mnt, p @ PseudoNode::NsFile(..)) = &node {
+    // 命名空间在 `/proc/<pid>/fd/<n>` 里是 `mnt:[编号]` 这样；经由 bind 挂载出去的命名空间
+    // 文件打开的是挂载点的路径（Linux 的 d_path）
+    if let Node::Pseudo(mnt, p @ PseudoNode::NsFile(..)) = &node
+        && vfs.mount(*mnt).is_none_or(|m| m.fs != Fs::Nsfs)
+    {
         display = Some(Rc::from(cx.view(&vfs).name(*mnt, p)));
     }
     let was_created = created.is_some();
@@ -643,7 +644,7 @@ fn open_path(
             .then(|| Rc::from(format!("/dev/pts/{}", end.tty.borrow().index).into_bytes()));
     }
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
-    let file = OpenFile::with_path(kind, flags & keep, display);
+    let file = OpenFile::with_path(kind, flags & keep | largefile(flags), display);
     if let Some(mnt) = store_mnt {
         file.borrow_mut().mnt = mnt;
     }
@@ -652,6 +653,16 @@ fn open_path(
         open_events(cx, &file, ino, parent, was_created, flags);
     }
     Ok(file)
+}
+
+/// open、openat2、open_by_handle_at 打开的文件带 `O_LARGEFILE`（64 位上 Linux 总是加上，
+/// `O_PATH` 时去掉），F_GETFL、fdinfo 看得到；管道、socket 这些别的系统调用建的文件没有。
+fn largefile(flags: u32) -> u32 {
+    if flags & oflags::O_PATH != 0 {
+        0
+    } else {
+        oflags::O_LARGEFILE
+    }
 }
 
 /// open 的 inotify 事件，顺序与 Linux 相同：新建（报给目录）、`O_TRUNC` 截断、打开。
@@ -803,7 +814,7 @@ pub(super) fn open_by_handle_at(
         open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, None)?
     };
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
-    let file = OpenFile::new(kind, flags & keep);
+    let file = OpenFile::new(kind, flags & keep | largefile(flags));
     file.borrow_mut().mnt = mnt;
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)
@@ -1074,11 +1085,19 @@ fn open_pseudo(
         return Err(Errno::EACCES);
     }
     let data = pseudo::content(&view, mnt, &node)?;
+    // 命名空间文件拿着那个命名空间
+    let ns = match node {
+        PseudoNode::NsFile(kind, id) => {
+            Some(super::ns::find(cx.kr(), Some(vfs), kind, id).ok_or(Errno::ENOENT)?)
+        }
+        _ => None,
+    };
     Ok(FileKind::Proc {
         mnt,
         node,
         data,
         mm,
+        ns,
     })
 }
 
@@ -1240,7 +1259,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             .fds_mut()
             .set_cloexec(fd, arg & FD_CLOEXEC != 0)
             .map(|()| 0),
-        F_GETFL => Ok((file.borrow().flags | oflags::O_LARGEFILE) as u64),
+        F_GETFL => Ok(file.borrow().flags as u64),
         F_SETFL => {
             let async_on = {
                 let mut f = file.borrow_mut();
@@ -1613,6 +1632,18 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
         _ => {}
+    }
+    let ns = match &file.borrow().kind {
+        FileKind::Proc {
+            mnt,
+            node: PseudoNode::NsFile(kind, _),
+            ns: Some(r),
+            ..
+        } => Some((*mnt, *kind, r.clone())),
+        _ => None,
+    };
+    if let Some((mnt, kind, r)) = ns {
+        return super::ns::ioctl(cx, mnt, kind, &r, request, arg);
     }
     // 取出要用的对象再放开打开文件的借用：NOTIF_RECV 会等，等的时候别的线程可能要改这个
     // 打开文件（fcntl、FIONBIO）
@@ -2053,6 +2084,7 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
                 Fs::Pts => DEVPTS_SUPER_MAGIC,
                 Fs::Sys => SYSFS_MAGIC,
                 Fs::Cgroup => CGROUP2_SUPER_MAGIC,
+                Fs::Nsfs => NSFS_MAGIC,
             };
             encode_statfs(magic, &empty, flags)
         }

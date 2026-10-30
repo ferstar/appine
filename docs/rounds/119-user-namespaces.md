@@ -32,6 +32,6 @@
 - 复制到权限更小的用户命名空间里的挂载不上锁（Linux 的 `MNT_LOCKED`）：里面可以单独卸下、去掉 nosuid 这些；在用户命名空间里挂 procfs、sysfs 不检查 `mount_too_revealing`。
 - `max_*_namespaces` 只读、不实际限制，没有 ucounts。 → 可以写了（M9 之前：网络命名空间）；仍不实际限制，没有 ucounts
 - v3 的文件能力仍只认 rootid 0，命名空间里设置文件能力不转成 v3（[文件能力](100-file-caps.md)的推迟项）；ptrace 建立跟踪时记的 CAP_SYS_PTRACE 仍按开机时的命名空间。
-- 命名空间文件不让用户命名空间活着：里面的进程都退出之后，对打开着的 `/proc/<pid>/ns/user` setns 是 EINVAL。
+- 命名空间文件不让用户命名空间活着：里面的进程都退出之后，对打开着的 `/proc/<pid>/ns/user` setns 是 EINVAL。→ 已补上（M9 之前：命名空间文件留住命名空间）
 - 不持 BKL 的 stat 只给开机时的用户命名空间里的进程用。
 - 普通用户自己建的用户命名空间没有和原生比对过（见上），只按上游的行为写了集成测试。

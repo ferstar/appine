@@ -646,6 +646,14 @@ const RTM_GETROUTE: u16 = 26;
 const RTM_GETNEIGH: u16 = 30;
 const RTM_NEWRULE: u16 = 32;
 const RTM_GETRULE: u16 = 34;
+const RTM_NEWNSID: u16 = 88;
+const RTM_GETNSID: u16 = 90;
+const NETNSA_NSID: u16 = 1;
+/// RTM_GETNSID 按进程找网络命名空间（[`Host::peer_net`]）。
+pub(crate) const NETNSA_PID: u16 = 2;
+/// RTM_GETNSID 按命名空间文件找网络命名空间。
+pub(crate) const NETNSA_FD: u16 = 3;
+const NETNSA_TARGET_NSID: u16 = 4;
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
@@ -1023,6 +1031,11 @@ pub(crate) trait Host {
     fn configure(&self, _req: &[u8]) -> Option<i32> {
         None
     }
+    /// RTM_GETNSID 要找的网络命名空间在不在：`attr` 是 [`NETNSA_PID`]（进程）或者
+    /// [`NETNSA_FD`]（命名空间文件），`value` 是它的值。在的话是 Ok，不然是错误码。
+    fn peer_net(&self, _attr: u16, _value: u32) -> Result<(), i32> {
+        Ok(())
+    }
 }
 
 impl NetlinkSocket {
@@ -1187,6 +1200,43 @@ impl NetlinkSocket {
                     .flat_map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m))
                     .collect();
                 vec![d, done()]
+            }
+            // 网络命名空间的编号（`ip netns list`）：appine 不给命名空间分配编号（RTM_NEWNSID
+            // 是 EOPNOTSUPP），找得到对方时总是回答 -1（Linux 的 NETNSA_NSID_NOT_ASSIGNED），
+            // 按编号找的都找不到。顺序与 Linux 的 rtnl_net_getid 相同
+            RTM_GETNSID => {
+                let attrs = crate::route::attrs(req.get(20..).unwrap_or_default());
+                let get = |t| {
+                    attrs
+                        .iter()
+                        .find(|(a, d)| *a == t && d.len() >= 4)
+                        .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
+                };
+                let peer = if let Some(pid) = get(NETNSA_PID) {
+                    host.peer_net(NETNSA_PID, pid)
+                } else if let Some(fd) = get(NETNSA_FD) {
+                    host.peer_net(NETNSA_FD, fd)
+                } else if get(NETNSA_NSID).is_some() {
+                    Err(ENOENT)
+                } else {
+                    Err(EINVAL)
+                };
+                let r = peer.and_then(|()| match get(NETNSA_TARGET_NSID) {
+                    Some(_) => Err(EINVAL),
+                    None => Ok(()),
+                });
+                match r {
+                    Ok(()) => {
+                        let mut p = vec![0u8; 4];
+                        attr(&mut p, NETNSA_NSID, &(-1i32).to_le_bytes());
+                        let mut out = vec![reply(RTM_NEWNSID, 0, &p)];
+                        if flags & NLM_F_ACK != 0 {
+                            out.push(ack(req, 0, self.pid));
+                        }
+                        out
+                    }
+                    Err(e) => vec![ack(req, e, self.pid)],
+                }
             }
             // 邻居表（ARP、NDP）：Android 上 App 看不到宿主的，总是空的
             RTM_GETNEIGH if dump => vec![done()],
@@ -1439,6 +1489,35 @@ mod tests {
         let r = ask(&message(1, NLM_F_REQUEST | NLM_F_ACK, 9, 0, &[]));
         assert_eq!(r[0][0].1.len(), 4 + 16);
         assert_eq!(r[0][0].1[..4], 0i32.to_le_bytes());
+    }
+
+    #[test]
+    fn netns_ids_are_never_assigned() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        s.pid = 42;
+        let mut ask = |attrs: &[(u16, &[u8])]| -> Vec<(u16, Vec<u8>)> {
+            let mut p = vec![0u8; 4];
+            for (t, d) in attrs {
+                attr(&mut p, *t, d);
+            }
+            s.handle(&message(RTM_GETNSID, NLM_F_REQUEST, 5, 0, &p), &NOTHING);
+            s.queue.drain(..).flat_map(|d| parse(&d)).collect()
+        };
+        // 找得到对方：回答 -1（没有分配编号），与 `ip netns list` 在 Linux 上看到的一样
+        let r = ask(&[(NETNSA_FD, &3u32.to_le_bytes())]);
+        let mut want = vec![0u8; 4];
+        attr(&mut want, NETNSA_NSID, &(-1i32).to_le_bytes());
+        assert_eq!(r, [(RTM_NEWNSID, want)]);
+        assert_eq!(ask(&[(NETNSA_PID, &1u32.to_le_bytes())]).len(), 1);
+        // 按编号找的都找不到；什么也没给是 EINVAL；要按编号换算成别的命名空间里的也是
+        let errno = |r: Vec<(u16, Vec<u8>)>| i32::from_le_bytes(r[0].1[..4].try_into().unwrap());
+        assert_eq!(errno(ask(&[(NETNSA_NSID, &0i32.to_le_bytes())])), -ENOENT);
+        assert_eq!(errno(ask(&[])), -EINVAL);
+        let target = [
+            (NETNSA_FD, &3u32.to_le_bytes()[..]),
+            (NETNSA_TARGET_NSID, &0i32.to_le_bytes()[..]),
+        ];
+        assert_eq!(errno(ask(&target)), -EINVAL);
     }
 
     /// 一条 NETLINK_GENERIC 请求：genlmsghdr 之后是属性。

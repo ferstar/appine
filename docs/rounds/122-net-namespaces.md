@@ -33,4 +33,4 @@ appine 的 TCP、UDP、ping socket 都是宿主 socket，宿主上没有可用�
 - 没有 AF_PACKET、veth、tun 这些，新命名空间里除了 lo 建不出别的接口；sysfs 里的 `/sys/class/net` 仍是宿主的接口（Linux 按挂载 sysfs 的进程的命名空间）。
 - raw ICMP socket 是用 ping socket 模拟的，`IP_HDRINCL` 设不上，busybox 的 ping 收不到回答（原来就这样，开机时的命名空间里也是）；LTP 的 sendmsg03 因此由跳过变成失败。 → busybox 的 ping 收不到回答已修好（M9 之前：raw ICMP 的模拟）；`IP_HDRINCL` 仍设不上，sendmsg03 仍失败
 - 新命名空间里 lo 上的流量不计数，`/proc/net/snmp`、`netstat` 都是 0。
-- 命名空间文件不让网络命名空间活着（与[挂载命名空间](118-mount-namespaces.md)的推迟项相同）。
+- 命名空间文件不让网络命名空间活着（与[挂载命名空间](118-mount-namespaces.md)的推迟项相同）。→ 已补上（M9 之前：命名空间文件留住命名空间），`ip netns add`、`exec`、`list`、`delete` 能用

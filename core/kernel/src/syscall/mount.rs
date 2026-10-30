@@ -1,7 +1,8 @@
 //! mount(2)、umount2(2)、pivot_root(2)（设计文档 §8.2）。
 //!
 //! 合成文件系统（procfs、sysfs、devpts、cgroup2）可以挂到任意目录上；仓库里的和合成文件
-//! 系统里的目录、文件都可以 bind 挂载（`MS_REC` 带上挂在里面的挂载），挂载的标志、重新
+//! 系统里的目录、文件都可以 bind 挂载（`MS_REC` 带上挂在里面的挂载），命名空间文件也可以
+//! （nsfs，挂载留住那个命名空间），挂载的标志、重新
 //! 挂载、`MS_MOVE`、卸下（`MNT_DETACH`、`MNT_EXPIRE`）、pivot_root 和各种错误按 Linux 6.1
 //! 的 `path_mount`、`path_umount`、`pivot_root`。传播类型可以设置，但不模拟：挂载之间没有
 //! 传播，都相当于 private。挂载要在调用者的挂载命名空间里（Linux 的 `check_mnt`），别的
@@ -16,6 +17,8 @@ use super::{SysResult, get, read_path};
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::kernel::Cx;
+use crate::nsproxy::NsRef;
+use crate::pseudo::NsKind;
 use crate::vfs::{Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, ms};
 
 const MS_REMOUNT: u64 = 0x20;
@@ -321,6 +324,9 @@ fn bind(
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
     let (src, found) = vfs.walk(&view, &cx.cred(), &cx.root(), &start, source, true)?;
+    if let Node::Pseudo(_, PseudoNode::NsFile(kind, ns)) = src {
+        return bind_ns(cx, &vfs, kind, ns, src, (target, at));
+    }
     may_mount_on(&target)?;
     let dir = vfs.is_dir(&view, &src)?;
     if dir != vfs.is_dir(&view, &target)? {
@@ -344,6 +350,34 @@ fn bind(
         vfs.set_root_at(id, found);
     }
     copy_submounts(&vfs, &view, &inside, &src, id);
+    cx.shared.fast_changed();
+    Ok(0)
+}
+
+/// bind 挂载命名空间文件（`ip netns add` 这样留住命名空间）：挂载持有那个命名空间
+/// （[`Mount::pin`]），在 nsfs 里，标志只有 rw。与 Linux 的 do_loopback 一样，经由别的挂载
+/// 命名空间里的路径找到的也行；挂载命名空间的文件只能挂进比它旧的命名空间（`mnt_ns_loop`：
+/// 不然命名空间可能经由挂载留着自己）。
+fn bind_ns(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    kind: NsKind,
+    id: u64,
+    src: Node,
+    (target, at): (Node, Option<Dentry>),
+) -> SysResult {
+    let ns = super::ns::find(cx.kr(), Some(vfs), kind, id).ok_or(Errno::ENOENT)?;
+    if matches!(&ns, NsRef::Mnt(m) if cx.mnt_ns() >= m.id) {
+        return Err(Errno::EINVAL);
+    }
+    check_mnt(cx, vfs, target.mnt())?;
+    may_mount_on(&target)?;
+    if vfs.is_dir(&cx.view(vfs), &target)? {
+        return Err(Errno::ENOTDIR);
+    }
+    let fs = Fs::Nsfs;
+    let id = vfs.add_mount(fs, src, (target, at), 0, b"nsfs".to_vec(), Some(fs.dev()));
+    vfs.update_mount(id, |m| m.pin = Some(ns));
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -382,6 +416,7 @@ fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, t
             Some(c.dev),
         );
         vfs.set_root_at(id, c.root_at.clone());
+        vfs.update_mount(id, |m| m.pin = c.pin.clone());
         copy_submounts(vfs, ps, snapshot, &c.root, id);
     }
 }

@@ -95,7 +95,7 @@ pub(crate) fn attach(
     let path: Rc<[u8]> = Rc::from(format!("/dev/pts/{id}").into_bytes());
     let slave = OpenFile::with_path(
         FileKind::Pty(PtyEnd::new(tty.clone(), false)),
-        oflags::O_RDWR,
+        oflags::O_RDWR | oflags::O_LARGEFILE,
         Some(path),
     );
     Ok((slave, tty))

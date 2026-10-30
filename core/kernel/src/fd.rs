@@ -129,6 +129,8 @@ pub enum FileKind {
         /// `/proc/<pid>/mem`：打开时那个进程的地址空间。与 Linux 一样，进程 execve 之后
         /// 读写的仍是它（已经释放时读到 EOF），不是新程序的。
         mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
+        /// 命名空间文件（nsfs）：打开着就让那个命名空间活着，setns、`NS_GET_*` 用它。
+        ns: Option<crate::nsproxy::NsRef>,
     },
 }
 
@@ -505,10 +507,11 @@ impl FdTable {
     /// 0/1/2 分别是宿主的 stdin/stdout/stderr。
     pub fn with_host_stdio() -> Self {
         let mut t = Self::new();
+        // 与原来一样带着 O_LARGEFILE：宿主那边多半是 open 打开的终端、文件
         for (fd, flags) in [
-            (0, oflags::O_RDONLY),
-            (1, oflags::O_WRONLY),
-            (2, oflags::O_WRONLY),
+            (0, oflags::O_RDONLY | oflags::O_LARGEFILE),
+            (1, oflags::O_WRONLY | oflags::O_LARGEFILE),
+            (2, oflags::O_WRONLY | oflags::O_LARGEFILE),
         ] {
             t.install(OpenFile::new(FileKind::Host(fd), flags), false, 0)
                 .unwrap();

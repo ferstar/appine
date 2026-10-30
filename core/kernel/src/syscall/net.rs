@@ -750,6 +750,9 @@ struct KernelHost<'a> {
     k: &'a crate::kernel::Kernel,
     cred: crate::cred::Cred,
     net: Option<Rc<crate::nsproxy::NetNs>>,
+    /// 发请求的进程的 pid 命名空间和 fd 表（RTM_GETNSID 的 NETNSA_PID、NETNSA_FD）。
+    pid_ns: Rc<crate::pidns::PidNs>,
+    fds: Rc<crate::cell::RefCell<crate::fd::FdTable>>,
 }
 
 impl crate::net::Host for KernelHost<'_> {
@@ -788,6 +791,26 @@ impl crate::net::Host for KernelHost<'_> {
     fn configure(&self, req: &[u8]) -> Option<i32> {
         crate::netns::configure(self.net.as_ref()?, &self.cred, req)
     }
+
+    /// 进程要还没退出（Linux 的 get_net_ns_by_pid），fd 要是网络命名空间的文件
+    /// （get_net_ns_by_fd）。
+    fn peer_net(&self, attr: u16, value: u32) -> Result<(), i32> {
+        if attr == crate::net::NETNSA_PID {
+            let tid = self.pid_ns.find(value as i32).ok_or(Errno::ESRCH.0)?;
+            if !self.k.tasks.contains_key(&tid) {
+                return Err(Errno::ESRCH.0);
+            }
+            return Ok(());
+        }
+        let file = self.fds.borrow().get(value as i32).map_err(|e| e.0)?;
+        match &file.borrow().kind {
+            FileKind::Proc {
+                ns: Some(crate::nsproxy::NsRef::Net(_)),
+                ..
+            } => Ok(()),
+            _ => Err(Errno::EINVAL.0),
+        }
+    }
 }
 
 /// 发送一条消息（send、sendto、sendmsg、write 共用）。
@@ -819,6 +842,8 @@ pub(crate) fn send(
                 k: cx.kr(),
                 cred: cx.cred(),
                 net: s.net.clone(),
+                pid_ns: cx.pid_ns(),
+                fds: cx.t.fds.clone(),
             };
             s.handle(data, &host);
             request_wake_object(wake::of(sock));

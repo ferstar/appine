@@ -1098,23 +1098,24 @@ int main(void)
 C
 gcc -O1 -o links links.c
 ./links
-# busybox 的 ip：MAC 地址和 docker 的 veth 特有的 @ifN、M-DOWN 不比
-self=$(ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
+# busybox 的 ip（软件包里有 iproute2，/sbin/ip 是它的）：MAC 地址和 docker 的 veth 特有的
+# @ifN、M-DOWN 不比
+self=$(busybox ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
 norm() { sed -e "s/$self/SELF/g" -e 's/@if[0-9]*//' -e 's/,M-DOWN//' -e 's|link/ether [0-9a-f:]*|link/ether MAC|'; }
-ip addr | norm
-ip link | norm
+busybox ip addr | norm
+busybox ip link | norm
 cat /sys/class/net/lo/tx_queue_len /sys/class/net/lo/operstate
 
 # 同样的表经由 busybox 的 ip、route、netstat 和 /proc/net 读出来；本机地址换成 SELF，
 # ipv6_route 的引用数不比
-self=$(ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
-ip route show table all | sed "s/$self/SELF/g"
-ip -6 route show table all
-ip rule
-ip -6 rule
+self=$(busybox ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
+busybox ip route show table all | sed "s/$self/SELF/g"
+busybox ip -6 route show table all
+busybox ip rule
+busybox ip -6 rule
 route -n
 netstat -rn
-ip route get 1.1.1.1 | sed "s/$self/SELF/g"
+busybox ip route get 1.1.1.1 | sed "s/$self/SELF/g"
 cat /proc/net/route
 awk '{ $7 = "R"; print }' /proc/net/ipv6_route
 

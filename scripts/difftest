@@ -29,7 +29,7 @@ tier=1
 rebuild=0
 store=target/difftest/store
 image=appine-difftest
-packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap"
+packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2"
 env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 while getopts t:rs: opt; do
