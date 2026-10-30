@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::rc::Rc;
 use std::time::Duration;
 
 use appine_hal::net::{Interface, Route};
@@ -63,6 +64,15 @@ pub(crate) struct InetSocket {
     pub route: Option<crate::traffic::Route>,
     /// TCP 发起的连接已经数进了 ActiveOpens、还没有数过它失败（[`crate::traffic::Protocols`]）。
     pub opening: bool,
+    /// 建在新的网络命名空间里：地址要换算（[`crate::netns`]）；None 是宿主的网络。
+    pub net: Option<Rc<crate::nsproxy::NetNs>>,
+    /// 新的网络命名空间里：宿主 socket 已经绑定了（guest 绑的，或者 connect、sendto、
+    /// listen 之前替它绑的）。
+    pub bound: bool,
+    /// 新的网络命名空间里：本端是通配地址、还没有连接（getsockname 报告通配地址）。
+    pub any: bool,
+    /// 新的网络命名空间里的 `IPV6_V6ONLY`：宿主 socket 要用 IPv4 映射的地址，不设它。
+    pub v6only: bool,
 }
 
 impl InetSocket {
@@ -85,6 +95,10 @@ impl InetSocket {
             sndtimeo: None,
             route: None,
             opening: false,
+            net: None,
+            bound: false,
+            any: false,
+            v6only: false,
         }
     }
 }
@@ -189,9 +203,17 @@ pub(crate) fn proc_listing(
         if !listed {
             continue;
         }
-        let local = appine_hal::net::sockname(fd, false).ok();
+        // 新的网络命名空间里的地址换成 guest 看到的（crate::netns）
+        let guest = |a: Vec<u8>, any: bool| match &inet.net {
+            Some(ns) => crate::netns::from_host(ns, &a, any),
+            None => a,
+        };
+        let local = appine_hal::net::sockname(fd, false)
+            .ok()
+            .map(|a| guest(a, inet.any));
         let peer = appine_hal::net::sockname(fd, true)
             .ok()
+            .map(|a| guest(a, false))
             .or_else(|| inet.peer.clone());
         let state = if tcp {
             appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)
@@ -537,6 +559,8 @@ pub(crate) struct NetlinkSocket {
     pub arrivals: u64,
     /// `SO_RCVTIMEO`：没有回答可读时最多等多久。
     pub rcvtimeo: Option<Duration>,
+    /// 建在新的网络命名空间里时是它（回答它的 lo、配置 lo）。
+    pub net: Option<Rc<crate::nsproxy::NetNs>>,
 }
 
 // ---- DNS 存根 ----
@@ -687,7 +711,7 @@ fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
 /// 接口的状态（`IFLA_OPERSTATE`）：与 `/sys/class/net/<接口>/operstate` 一样，回环接口是
 /// unknown（Linux 的回环驱动不设置它），启用并且连着的是 up，别的是 down。
 pub(crate) fn operstate(i: &Interface) -> u8 {
-    if i.flags & IFF_LOOPBACK != 0 {
+    if i.flags & IFF_LOOPBACK != 0 && i.flags & IFF_UP != 0 {
         IF_OPER_UNKNOWN
     } else if i.flags & IFF_UP != 0 && i.flags & IFF_RUNNING != 0 {
         IF_OPER_UP
@@ -729,7 +753,13 @@ fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
         IFLA_CARRIER,
         &[u8::from(i.flags & IFF_RUNNING != 0)],
     );
-    attr(&mut p, IFLA_QDISC, b"noqueue\0");
+    // 新的网络命名空间里还没起来的 lo 还没有 qdisc（crate::netns）
+    let qdisc: &[u8] = if i.flags & (IFF_LOOPBACK | IFF_UP) == IFF_LOOPBACK {
+        b"noop\0"
+    } else {
+        b"noqueue\0"
+    };
+    attr(&mut p, IFLA_QDISC, qdisc);
     attr(&mut p, IFLA_PROTO_DOWN, &[0]);
     let mac = i.mac.unwrap_or([0; 6]);
     attr(&mut p, IFLA_ADDRESS, &mac);
@@ -964,6 +994,11 @@ pub(crate) trait Host {
     fn tx_queue_len(&self, name: &str) -> Option<u32>;
     /// 发请求的进程的用户 ID（`ip route get` 回答里的 RTA_UID）。
     fn uid(&self) -> u32;
+    /// 修改接口、地址的请求（新的网络命名空间里的 lo，[`crate::netns::configure`]）：
+    /// None 是不处理，Some 里是错误码。
+    fn configure(&self, _req: &[u8]) -> Option<i32> {
+        None
+    }
 }
 
 impl NetlinkSocket {
@@ -974,6 +1009,7 @@ impl NetlinkSocket {
             queue: VecDeque::new(),
             arrivals: 0,
             rcvtimeo: None,
+            net: None,
         }
     }
 
@@ -1011,6 +1047,13 @@ impl NetlinkSocket {
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
         let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
         let dump = flags & NLM_F_DUMP != 0;
+        if let Some(e) = host.configure(req) {
+            return if e != 0 || flags & NLM_F_ACK != 0 {
+                vec![ack(req, e, self.pid)]
+            } else {
+                Vec::new()
+            };
+        }
         match ty {
             // 与 Linux 一样，接口是一个数据报；地址每个地址族一个（AF_UNSPEC 时先是 IPv4），
             // NLMSG_DONE 另是一个

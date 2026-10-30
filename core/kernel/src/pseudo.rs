@@ -187,7 +187,7 @@ impl NsKind {
             NsKind::User => group.map_or(crate::cred::INIT_USER_NS, |g| g.borrow().cred.user_ns.id),
             NsKind::Cgroup => 4_026_531_835,
             NsKind::Ipc => task.ns.borrow().ipc.id,
-            NsKind::Net => 4_026_531_840,
+            NsKind::Net => task.ns.borrow().net.id,
             NsKind::Pid => k.pid_ns_of(task.tgid).id,
             // unshare 了、还没有建子进程时没有（Linux 的 pidns_for_children_get 看
             // child_reaper）
@@ -1279,7 +1279,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/inotify/max_user_watches"
                     | b"sys/vm/max_map_count"
             )
-    )
+    ) || matches!(node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"))
 }
 
 /// 写 procfs 文件：`oom_score_adj`、主机名、域名和 System V IPC 的限制记下新值，其余
@@ -1333,6 +1333,17 @@ pub(crate) fn write(
             .and_then(|s| s.trim().parse().ok())
             .filter(|&v: &u64| v > 0)
             .ok_or(Errno::EINVAL)?;
+    }
+    // 与 Linux 一样在 0 到 INT_MAX 之间；只记下，不实际限制
+    if let PseudoNode::Static(path) = node
+        && path.starts_with(b"sys/user/max_")
+    {
+        let n: u64 = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| n <= i32::MAX as u64)
+            .ok_or(Errno::EINVAL)?;
+        k.max_namespaces.insert(path.to_vec(), n);
     }
     if let PseudoNode::Static(b"sys/fs/aio-max-nr") = node {
         k.aio_max_nr = std::str::from_utf8(data)
@@ -2368,6 +2379,17 @@ fn global_stat(ps: &View<'_>) -> String {
 
 /// 所有打开着的 socket（同一个只算一次）和打开它的进程的 fsuid，按 inode 排列。
 /// 只在 SCM_RIGHTS 消息里、或者等着 accept 的 socket 不算。
+/// socket 所在的网络命名空间的编号。
+fn socket_net(s: &crate::net::Socket) -> u64 {
+    use crate::net::Socket;
+    let net = match s {
+        Socket::Inet(i) => i.net.as_ref(),
+        Socket::Netlink(n) => n.net.as_ref(),
+        Socket::Unix(u) => u.net.as_ref(),
+    };
+    net.map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
+}
+
 fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
     let mut tables = HashSet::new();
     let mut seen = HashSet::new();
@@ -2407,14 +2429,19 @@ pub(crate) fn socket_ino(s: &SocketRef) -> u64 {
 
 /// `/proc/net/dev`：宿主的接口，计数是 guest 自己收发的流量（[`crate::traffic`]），格式与
 /// Linux 的 `dev_seq_printf_stats` 相同。
-fn net_dev(k: &Kernel) -> String {
+/// `/proc/net/dev`：接口 `ifaces` 的流量计数（`counted` 为假时都是 0）。
+fn net_dev(k: &Kernel, ifaces: &[appine_hal::net::Interface], counted: bool) -> String {
     let mut s = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
          face |bytes    packets errs drop fifo frame compressed multicast|\
          bytes    packets errs drop fifo colls carrier compressed\n",
     );
-    for i in appine_hal::net::interfaces() {
-        let st = k.traffic.get(&i.name);
+    for i in ifaces {
+        let st = if counted {
+            k.traffic.get(&i.name)
+        } else {
+            Default::default()
+        };
         writeln!(
             s,
             "{:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} \
@@ -2446,9 +2473,9 @@ fn net_dev(k: &Kernel) -> String {
 /// OpenJDK 靠它判断有没有 IPv6（`IPv6_supported`），没有这个文件或者是空的就整个关掉
 /// IPv6。scope 按 Linux 的 `ipv6_addr_scope` 从地址看；标志与 netlink 的回答一样都是
 /// `IFA_F_PERMANENT`（getifaddrs 分不出临时地址）。
-fn net_if_inet6() -> String {
+fn net_if_inet6(ifaces: &[appine_hal::net::Interface]) -> String {
     let mut s = String::new();
-    for i in appine_hal::net::interfaces() {
+    for i in ifaces {
         for (_, addr, prefix) in i.addrs.iter().filter(|(f, ..)| *f == AF_INET6) {
             let scope = match addr[..] {
                 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] => 0x10,
@@ -2517,27 +2544,54 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             self::Global::Cgroups => crate::cgroup::proc_cgroups(),
             self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
         },
-        Net(_, _, name) => match &name[..] {
-            b"arp" => crate::net::PROC_ARP.to_owned(),
-            b"dev" => net_dev(ps.k),
-            b"netstat" => crate::net::proc_netstat(&ps.k.traffic.protocols),
-            b"snmp" => crate::net::proc_snmp(&sockets(ps.k), &ps.k.traffic.protocols),
-            b"if_inet6" => net_if_inet6(),
-            b"route" => crate::route::proc_route(&crate::route::kernel_tables(ps.k)),
-            b"ipv6_route" => crate::route::proc_ipv6_route(&crate::route::kernel_tables(ps.k)),
-            b"sockstat" => crate::net::sockstat(&sockets(ps.k), false),
-            b"sockstat6" => crate::net::sockstat(&sockets(ps.k), true),
-            b"tcp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Tcp),
-            b"tcp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Tcp),
-            b"udp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Udp),
-            b"udp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Udp),
-            b"icmp" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Icmp),
-            b"icmp6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Icmp),
-            b"raw" => crate::net::proc_listing(&sockets(ps.k), AF_INET, Table::Raw),
-            b"raw6" => crate::net::proc_listing(&sockets(ps.k), AF_INET6, Table::Raw),
-            b"unix" => crate::unix::proc_listing(&sockets(ps.k)),
-            _ => return Err(Errno::ENOENT),
-        },
+        // 那个进程所在的网络命名空间的：新建的里面只有 lo，socket 只列建在里面的，流量
+        // 和协议的计数都是 0（crate::netns）
+        Net(pid, tid, name) => {
+            let net = ps
+                .task(*pid, *tid)
+                .map(|t| t.ns.borrow().net.clone())
+                .filter(|n| n.host_net.is_some());
+            let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
+            let socks: Vec<(SocketRef, u32)> = sockets(ps.k)
+                .into_iter()
+                .filter(|(s, _)| socket_net(&s.borrow()) == id)
+                .collect();
+            let ifaces = match &net {
+                Some(n) => vec![crate::netns::lo_interface(n)],
+                None => appine_hal::net::interfaces(),
+            };
+            let quiet = crate::traffic::Protocols::default();
+            let protocols = if net.is_some() {
+                &quiet
+            } else {
+                &ps.k.traffic.protocols
+            };
+            let tables = || match &net {
+                Some(_) => crate::route::tables(&ifaces, None),
+                None => crate::route::kernel_tables(ps.k),
+            };
+            match &name[..] {
+                b"arp" => crate::net::PROC_ARP.to_owned(),
+                b"dev" => net_dev(ps.k, &ifaces, net.is_none()),
+                b"netstat" => crate::net::proc_netstat(protocols),
+                b"snmp" => crate::net::proc_snmp(&socks, protocols),
+                b"if_inet6" => net_if_inet6(&ifaces),
+                b"route" => crate::route::proc_route(&tables()),
+                b"ipv6_route" => crate::route::proc_ipv6_route(&tables()),
+                b"sockstat" => crate::net::sockstat(&socks, false),
+                b"sockstat6" => crate::net::sockstat(&socks, true),
+                b"tcp" => crate::net::proc_listing(&socks, AF_INET, Table::Tcp),
+                b"tcp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Tcp),
+                b"udp" => crate::net::proc_listing(&socks, AF_INET, Table::Udp),
+                b"udp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Udp),
+                b"icmp" => crate::net::proc_listing(&socks, AF_INET, Table::Icmp),
+                b"icmp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Icmp),
+                b"raw" => crate::net::proc_listing(&socks, AF_INET, Table::Raw),
+                b"raw6" => crate::net::proc_listing(&socks, AF_INET6, Table::Raw),
+                b"unix" => crate::unix::proc_listing(&socks),
+                _ => return Err(Errno::ENOENT),
+            }
+        }
         Static(path) => match &path[..] {
             b"sys/fs/file-max" => "9223372036854775807\n".to_owned(),
             b"sys/fs/lease-break-time" => format!("{}\n", ps.k.lease_break_time),
@@ -2611,7 +2665,10 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
             // 每个用户能建的各种命名空间个数的上限：与 Linux 的默认值一样是 threads-max 的
             // 一半，只读，不实际限制
-            p if p.starts_with(b"sys/user/max_") => format!("{}\n", ps.k.threads_max / 2),
+            p if p.starts_with(b"sys/user/max_") => {
+                let v = ps.k.max_namespaces.get(p).copied();
+                format!("{}\n", v.unwrap_or(ps.k.threads_max as u64 / 2))
+            }
             b"sys/kernel/random/boot_id" => format!("{}\n", format_uuid(&ps.k.boot_id)),
             b"sys/kernel/random/entropy_avail" | b"sys/kernel/random/poolsize" => {
                 format!("{}\n", crate::syscall::ENTROPY)

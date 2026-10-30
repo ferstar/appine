@@ -1,10 +1,10 @@
-//! 线程所在的 UTS、IPC 命名空间（Linux 的 `struct nsproxy` 里的这两种；挂载命名空间在
-//! `FsContext` 里，pid 命名空间见 [`crate::pidns`]）。与 Linux 一样按线程记：unshare、setns
-//! 只改调用的线程，clone 出来的线程、进程沿用父线程的。
+//! 线程所在的 UTS、IPC、网络命名空间（Linux 的 `struct nsproxy` 里的这几种；挂载命名空间
+//! 在 `FsContext` 里，pid 命名空间见 [`crate::pidns`]）。与 Linux 一样按线程记：unshare、
+//! setns 只改调用的线程，clone 出来的线程、进程沿用父线程的。
 //!
 //! UTS 命名空间有自己的主机名和 NIS 域名。IPC 命名空间有自己的 System V IPC 对象、POSIX
 //! 消息队列和它们的限制，内容放在 [`crate::kernel::Kernel::ipcs`] 里按编号存，最后一个
-//! 用它的线程退出之后丢掉。
+//! 用它的线程退出之后丢掉。网络命名空间见 [`NetNs`]。
 
 use std::rc::Rc;
 
@@ -15,6 +15,8 @@ use crate::cred::UserNs;
 pub(crate) const INIT_UTS_NS: u64 = 4_026_531_838;
 /// 开机时的 IPC 命名空间的编号。
 pub(crate) const INIT_IPC_NS: u64 = 4_026_531_839;
+/// 开机时的网络命名空间的编号。
+pub(crate) const INIT_NET_NS: u64 = 4_026_531_840;
 
 /// 一个 UTS 命名空间。
 #[derive(Debug)]
@@ -48,11 +50,39 @@ pub(crate) struct IpcNs {
     pub owner: Rc<UserNs>,
 }
 
-/// 线程的 UTS、IPC 命名空间。
+/// 一个网络命名空间。开机时的那个就是宿主的网络（socket 直接用宿主的）。新建的里面只有
+/// 回环接口 lo：socket 仍是宿主 socket，地址换成宿主上给这个命名空间的回环地址
+/// 127.a.b.0/24（[`crate::netns`]），别的地址都到不了。
+#[derive(Debug)]
+pub(crate) struct NetNs {
+    pub id: u64,
+    /// 建立它时所在的用户命名空间：在这里有 `CAP_NET_ADMIN` 才能配置 lo。
+    pub owner: Rc<UserNs>,
+    /// 宿主上的回环地址 127.a.b.0/24 的 a、b；开机时的命名空间是 None。
+    pub host_net: Option<[u8; 2]>,
+    /// lo 的状态。
+    pub lo: RefCell<Loopback>,
+}
+
+/// 新的网络命名空间里 lo 的状态：一开始是关着的、没有地址（Linux 的 `loopback_net_init`）。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Loopback {
+    /// `IFF_UP`。
+    pub up: bool,
+    /// IPv4 地址和前缀长度。
+    pub v4: Vec<([u8; 4], u8)>,
+    /// 有 ::1（lo 起来时自动加上，Linux 的 addrconf）。
+    pub v6: bool,
+    /// 设过的 MTU（`SIOCSIFMTU`），默认 65536。
+    pub mtu: Option<u32>,
+}
+
+/// 线程的 UTS、IPC、网络命名空间。
 #[derive(Clone, Debug)]
 pub(crate) struct NsProxy {
     pub uts: Rc<UtsNs>,
     pub ipc: Rc<IpcNs>,
+    pub net: Rc<NetNs>,
 }
 
 impl NsProxy {
@@ -68,6 +98,12 @@ impl NsProxy {
             ipc: Rc::new(IpcNs {
                 id: INIT_IPC_NS,
                 owner: UserNs::init(),
+            }),
+            net: Rc::new(NetNs {
+                id: INIT_NET_NS,
+                owner: UserNs::init(),
+                host_net: None,
+                lo: RefCell::default(),
             }),
         }
     }

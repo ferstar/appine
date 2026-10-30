@@ -105,6 +105,7 @@ impl Errno {
     pub const EAFNOSUPPORT: Errno = Errno(97);
     /// 地址已被占用。
     pub const EADDRINUSE: Errno = Errno(98);
+    pub const EADDRNOTAVAIL: Errno = Errno(99);
     /// 网络不可达。
     pub const ENETUNREACH: Errno = Errno(101);
     /// 已经连接。

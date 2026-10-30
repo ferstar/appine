@@ -197,6 +197,16 @@ pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
             cx.task.ns.borrow_mut().uts = ns;
             Ok(0)
         }
+        // Linux 的 netns_install：同样要两处的 CAP_SYS_ADMIN
+        NsKind::Net => {
+            let ns = find_nsproxy(cx.kr(), |p| (p.net.id == id).then(|| p.net.clone()))
+                .ok_or(Errno::EINVAL)?;
+            if !cred.ns_capable(&ns.owner, cap::SYS_ADMIN) || !cred.capable_here(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            cx.task.ns.borrow_mut().net = ns;
+            Ok(0)
+        }
         NsKind::Ipc => {
             let ns = find_nsproxy(cx.kr(), |p| (p.ipc.id == id).then(|| p.ipc.clone()))
                 .ok_or(Errno::EINVAL)?;

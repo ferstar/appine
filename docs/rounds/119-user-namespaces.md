@@ -26,11 +26,11 @@
 
 **推迟项**：
 
-- pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起）。 → pid 命名空间已补上（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间）；网络、cgroup、time 仍没有
+- pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起）。 → pid 命名空间已补上（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间）；cgroup、time 仍没有
 - 还按内核 ID 报告、没有换算的：`SO_PEERCRED`、`SCM_CREDENTIALS`、siginfo 的 `si_uid`、SysV IPC 和消息队列的属主、core dump 里的 ID。
 - 写映射时按写的进程的凭据检查，Linux 有两条按打开文件的凭据（`file_ns_capable`）；projid_map 不能写。
 - 复制到权限更小的用户命名空间里的挂载不上锁（Linux 的 `MNT_LOCKED`）：里面可以单独卸下、去掉 nosuid 这些；在用户命名空间里挂 procfs、sysfs 不检查 `mount_too_revealing`。
-- `max_*_namespaces` 只读、不实际限制，没有 ucounts。
+- `max_*_namespaces` 只读、不实际限制，没有 ucounts。 → 可以写了（M9 之前：网络命名空间）；仍不实际限制，没有 ucounts
 - v3 的文件能力仍只认 rootid 0，命名空间里设置文件能力不转成 v3（[文件能力](100-file-caps.md)的推迟项）；ptrace 建立跟踪时记的 CAP_SYS_PTRACE 仍按开机时的命名空间。
 - 命名空间文件不让用户命名空间活着：里面的进程都退出之后，对打开着的 `/proc/<pid>/ns/user` setns 是 EINVAL。
 - 不持 BKL 的 stat 只给开机时的用户命名空间里的进程用。

@@ -72,7 +72,12 @@ pub(super) fn socket(ty: i32, protocol: i32) -> Result<Socket, Errno> {
 
 /// socketpair(2)：两个互相连接的 socket。
 pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socket), Errno> {
-    let (a, b) = UnixSocket::pair(socket_type(ty, protocol)?, cx.ucred());
+    let (mut a, mut b) = UnixSocket::pair(socket_type(ty, protocol)?, cx.ucred());
+    let net = cx.task.ns.borrow().net.clone();
+    if net.host_net.is_some() {
+        a.net = Some(net.clone());
+        b.net = Some(net);
+    }
     Ok((Socket::Unix(a), Socket::Unix(b)))
 }
 
@@ -109,11 +114,11 @@ fn parse(addr: &[u8]) -> Result<Addr<'_>, Errno> {
     })
 }
 
-/// 按地址找到绑定在上面的 socket。
-fn find(cx: &Cx<'_>, addr: &[u8]) -> Result<SocketRef, Errno> {
+/// 按地址找到绑定在上面的 socket（抽象地址在 `sock` 所在的网络命名空间里找）。
+fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> {
     let name = match parse(addr)? {
         Addr::Unnamed => return Err(Errno::EINVAL),
-        Addr::Abstract(p) => Name::Abstract(p.to_vec()),
+        Addr::Abstract(p) => Name::Abstract(with(sock, |u| u.net_id()), p.to_vec()),
         Addr::Path(p) => {
             let node = lookup_at(cx, AT_FDCWD, p, true)?;
             let vfs = cx.vfs()?;
@@ -136,13 +141,14 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
         return Err(Errno::EINVAL);
     }
     let mut bound = unnamed();
+    let net = with(sock, |u| u.net_id());
     match parse(addr)? {
         Addr::Unnamed => {
-            let path = cx.k().unix.autobind(sock).ok_or(Errno::EADDRINUSE)?;
+            let path = cx.k().unix.autobind(net, sock).ok_or(Errno::EADDRINUSE)?;
             bound.extend_from_slice(&path);
         }
         Addr::Abstract(p) => {
-            if !cx.k().unix.insert(Name::Abstract(p.to_vec()), sock) {
+            if !cx.k().unix.insert(Name::Abstract(net, p.to_vec()), sock) {
                 return Err(Errno::EADDRINUSE);
             }
             bound.extend_from_slice(p);
@@ -265,7 +271,7 @@ pub(super) fn connect(
             Link::Listening { .. } => Err(Errno::EINVAL),
             _ => Err(Errno::EISCONN),
         })?;
-        let target = find(cx, addr)?;
+        let target = find(cx, sock, addr)?;
         if Rc::ptr_eq(&target, sock) {
             return Err(Errno::ECONNREFUSED);
         }
@@ -312,7 +318,7 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
         with(sock, |u| u.link = Link::None);
         return Ok(());
     }
-    let target = find(cx, addr)?;
+    let target = find(cx, sock, addr)?;
     let link = match &*target.borrow() {
         Socket::Unix(p) if p.ty == SOCK_DGRAM => Link::Dgram {
             tx: Rc::downgrade(&p.rx),
@@ -465,7 +471,7 @@ fn send_dgram(
             .upgrade()
             .ok_or(Errno::ECONNREFUSED)?
     } else {
-        let target = find(cx, addr)?;
+        let target = find(cx, sock, addr)?;
         let t = target.borrow();
         let Socket::Unix(p) = &*t else {
             return Err(Errno::ECONNREFUSED);

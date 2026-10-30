@@ -28,6 +28,8 @@ const SOCK_NONBLOCK: u32 = oflags::O_NONBLOCK;
 const SOCK_CLOEXEC: u32 = oflags::O_CLOEXEC;
 const IPPROTO_ICMP: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
+const IPPROTO_IPV6: i32 = 41;
+const IPV6_V6ONLY: i32 = 26;
 const IPPROTO_UDP: i32 = 17;
 const IPPROTO_ICMPV6: i32 = 58;
 const IPPROTO_UDPLITE: i32 = 136;
@@ -128,6 +130,9 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
         return Err(Errno::EINVAL);
     }
     let base = (ty & SOCK_TYPE_MASK) as i32;
+    // 建在新的网络命名空间里的 socket 记下它（crate::netns）
+    let net = cx.task.ns.borrow().net.clone();
+    let net = net.host_net.is_some().then_some(net);
     let sock = match domain {
         AF_INET | AF_INET6 => {
             // guest 的 raw ICMP socket 换成不需要特权的 ping socket
@@ -146,6 +151,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             if protocol != 0 {
                 s.proto = protocol;
             }
+            s.net = net;
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
@@ -160,13 +166,35 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             ) {
                 return Err(Errno::EPROTONOSUPPORT);
             }
-            Socket::Netlink(NetlinkSocket::new(protocol))
+            let mut s = NetlinkSocket::new(protocol);
+            s.net = net;
+            Socket::Netlink(s)
         }
         AF_NETLINK => return Err(Errno::ESOCKTNOSUPPORT),
-        AF_UNIX => unix::socket(base, protocol)?,
+        AF_UNIX => {
+            let mut s = unix::socket(base, protocol)?;
+            if let Socket::Unix(u) = &mut s {
+                u.net = net;
+            }
+            s
+        }
         _ => return Err(Errno::EAFNOSUPPORT),
     };
     install(cx, Rc::new(RefCell::new(sock)), ty).map(|fd| fd as u64)
+}
+
+/// 新的网络命名空间里还没有绑定的宿主 socket：先绑到这个命名空间的回环地址（Linux 自动
+/// 绑定时绑的是命名空间里的通配地址，宿主上绑通配地址就到了所有接口上）。
+fn ensure_bound(s: &mut InetSocket) -> Result<(), Errno> {
+    if let Some(ns) = &s.net
+        && !s.bound
+        && let Some(addr) = crate::netns::implicit_bind(ns, s.family)
+    {
+        appine_hal::net::bind(s.fd, &addr).map_err(Errno)?;
+        s.bound = true;
+        s.any = true;
+    }
+    Ok(())
 }
 
 /// 把 socket 放进 fd 表；`flags` 里可以有 `SOCK_NONBLOCK`、`SOCK_CLOEXEC`。
@@ -231,13 +259,30 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
     }
-    // 1024 以下的端口要求 CAP_NET_BIND_SERVICE
+    // 新的网络命名空间里先换成宿主的地址（不是本地地址时 EADDRNOTAVAIL）
+    let net = match &*sock.borrow() {
+        Socket::Inet(s) => s.net.clone(),
+        _ => None,
+    };
+    let host_addr = match &net {
+        Some(ns) => crate::netns::to_host(ns, &addr, crate::netns::Use::Bind)?,
+        None => addr.clone(),
+    };
+    // 1024 以下的端口要求网络命名空间的属主里的 CAP_NET_BIND_SERVICE
     let family = addr
         .get(..2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]) as i32);
     if matches!(family, Some(AF_INET | AF_INET6)) && addr.len() >= 4 {
         let port = u16::from_be_bytes([addr[2], addr[3]]);
-        if port != 0 && port < 1024 && !cx.cred().capable(crate::cred::cap::NET_BIND_SERVICE) {
+        let owner = net
+            .as_ref()
+            .map_or_else(crate::cred::UserNs::init, |n| n.owner.clone());
+        if port != 0
+            && port < 1024
+            && !cx
+                .cred()
+                .ns_capable(&owner, crate::cred::cap::NET_BIND_SERVICE)
+        {
             return Err(Errno::EACCES);
         }
     }
@@ -245,7 +290,11 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         Socket::Inet(s) => {
             // 流量算在哪个接口上重新认（connect 也一样）
             s.route = None;
-            appine_hal::net::bind(s.fd, &addr).map_err(Errno)?
+            appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?;
+            if s.net.is_some() {
+                s.bound = true;
+                s.any = crate::netns::is_any(&addr);
+            }
         }
         Socket::Netlink(s) => {
             let pid = addr
@@ -265,7 +314,10 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
 pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
     let (sock, _) = socket_of(cx, fd)?;
     match &mut *sock.borrow_mut() {
-        Socket::Inet(s) => appine_hal::net::listen(s.fd, backlog).map_err(Errno)?,
+        Socket::Inet(s) => {
+            ensure_bound(s)?;
+            appine_hal::net::listen(s.fd, backlog).map_err(Errno)?
+        }
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(u) => unix::listen(u, backlog, cx.ucred())?,
     }
@@ -293,8 +345,8 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, proto, timeout) = match &*sock.borrow() {
-        Socket::Inet(s) => (s.fd, s.family, s.ty, s.proto, s.rcvtimeo),
+    let (host_fd, family, ty, proto, timeout, net) = match &*sock.borrow() {
+        Socket::Inet(s) => (s.fd, s.family, s.ty, s.proto, s.rcvtimeo, s.net.clone()),
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(_) => unreachable!("handled by accept4"),
     };
@@ -304,9 +356,15 @@ fn accept_host(
             Ok((new, peer)) => {
                 let mut new = InetSocket::new(new, family, ty);
                 new.proto = proto;
-                if proto == IPPROTO_TCP {
+                if proto == IPPROTO_TCP && net.is_none() {
                     cx.k().traffic.protocols.tcp_passive_opens += 1;
                 }
+                let peer = match &net {
+                    Some(ns) => crate::netns::from_host(ns, &peer, false),
+                    None => peer,
+                };
+                new.bound = net.is_some();
+                new.net = net;
                 return Ok((Rc::new(RefCell::new(Socket::Inet(new))), peer));
             }
             Err(e) if e == Errno::EAGAIN.0 => {
@@ -323,25 +381,43 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     if is_unix(&sock) {
         return unix::connect(cx, &sock, nonblock, &addr).map(|()| 0);
     }
-    let (host_fd, tcp) = match &mut *sock.borrow_mut() {
+    let (host_fd, tcp, host_addr) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             // 本端地址可能变了：流量算在哪个接口上重新认
             s.route = None;
-            // UDP 连到 DNS 存根：只记下来，之后的 send 由存根处理
-            if s.ty == SOCK_DGRAM {
-                s.stub_peer = is_stub(&addr);
-                if s.stub_peer {
-                    return Ok(0);
+            // 新的网络命名空间里只到得了 lo（crate::netns）；DNS 存根也不在里面
+            if let Some(ns) = s.net.clone() {
+                let host_addr = crate::netns::to_host(&ns, &addr, crate::netns::Use::Reach)?;
+                ensure_bound(s)?;
+                // 它的流量不算进宿主的接口（/proc/net/snmp 也不数）
+                (s.fd, false, host_addr)
+            } else {
+                // UDP 连到 DNS 存根：只记下来，之后的 send 由存根处理
+                if s.ty == SOCK_DGRAM {
+                    s.stub_peer = is_stub(&addr);
+                    if s.stub_peer {
+                        return Ok(0);
+                    }
                 }
+                (
+                    s.fd,
+                    s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP,
+                    addr.clone(),
+                )
             }
-            (s.fd, s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP)
         }
         Socket::Netlink(_) => return Ok(0),
         Socket::Unix(_) => unreachable!("handled above"),
     };
-    let r = appine_hal::net::connect(host_fd, &addr);
+    let r = appine_hal::net::connect(host_fd, &host_addr);
     if tcp {
         count_connect(cx, &sock, r.err().map(Errno));
+    }
+    let connected = addr.get(..2) != Some(&[0, 0]);
+    if (r.is_ok() || r == Err(Errno::EINPROGRESS.0))
+        && let Socket::Inet(s) = &mut *sock.borrow_mut()
+    {
+        s.any &= !connected;
     }
     match r {
         Ok(()) => {
@@ -349,7 +425,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             if let Socket::Inet(s) = &mut *sock.borrow_mut()
                 && s.ty != SOCK_STREAM
             {
-                s.peer = (addr.get(..2) != Some(&[0, 0])).then(|| addr.clone());
+                s.peer = connected.then(|| addr.clone());
             }
             return Ok(0);
         }
@@ -374,7 +450,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         // guest 之后再 connect 会成功，而 Linux 上阻塞的 connect 返回之后再 connect 是
         // EISCONN
         0 => {
-            let _ = appine_hal::net::connect(host_fd, &addr);
+            let _ = appine_hal::net::connect(host_fd, &host_addr);
             if let Socket::Inet(s) = &mut *sock.borrow_mut() {
                 s.opening = false;
             }
@@ -426,7 +502,13 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
     let (sock, _) = socket_of(cx, fd)?;
     let value = match &*sock.borrow() {
         Socket::Inet(s) if peer && s.stub_peer => stub_addr(s.family),
-        Socket::Inet(s) => appine_hal::net::sockname(s.fd, peer).map_err(Errno)?,
+        Socket::Inet(s) => {
+            let a = appine_hal::net::sockname(s.fd, peer).map_err(Errno)?;
+            match &s.net {
+                Some(ns) => crate::netns::from_host(ns, &a, !peer && s.any),
+                None => a,
+            }
+        }
         Socket::Netlink(_) if peer => {
             let mut b = vec![0u8; 12];
             b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
@@ -485,6 +567,11 @@ pub(super) fn setsockopt(
         Socket::Inet(s) => match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v),
             (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v),
+            // 新的网络命名空间里宿主 socket 要用 IPv4 映射的地址：只记下来
+            (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
+                let on = v.get(..4).ok_or(Errno::EINVAL)?;
+                s.v6only = i32::from_le_bytes(on.try_into().unwrap()) != 0;
+            }
             _ => appine_hal::net::setsockopt(s.fd, level, name, &v).map_err(Errno)?,
         },
         // 别的选项（缓冲区大小、组播等）都接受，但不起作用
@@ -516,6 +603,9 @@ pub(super) fn getsockopt(
     let pid_ns = cx.pid_ns();
     let out = match &*sock.borrow() {
         Socket::Inet(s) => match (level, name) {
+            (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
+                (s.v6only as i32).to_le_bytes().to_vec()
+            }
             (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
             (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
             // raw ICMP 在宿主上是 ping socket
@@ -551,30 +641,48 @@ pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
 }
 
 /// netlink 的回答用的宿主信息：接口取自宿主，流量计数和宿主交来的路由取自内核。
+/// 新的网络命名空间里只有它的 lo（[`crate::netns`]），流量不计。
 struct KernelHost<'a> {
     k: &'a crate::kernel::Kernel,
-    uid: u32,
+    cred: crate::cred::Cred,
+    net: Option<Rc<crate::nsproxy::NetNs>>,
 }
 
 impl crate::net::Host for KernelHost<'_> {
     fn interfaces(&self) -> Vec<appine_hal::net::Interface> {
-        appine_hal::net::interfaces()
+        match &self.net {
+            Some(ns) => vec![crate::netns::lo_interface(ns)],
+            None => appine_hal::net::interfaces(),
+        }
     }
 
     fn stats(&self, name: &str) -> crate::traffic::IfStats {
-        self.k.traffic.get(name)
+        match &self.net {
+            Some(_) => Default::default(),
+            None => self.k.traffic.get(name),
+        }
     }
 
     fn routes(&self) -> Option<Vec<appine_hal::net::Route>> {
-        crate::route::host_routes(self.k)
+        match &self.net {
+            Some(_) => None,
+            None => crate::route::host_routes(self.k),
+        }
     }
 
     fn tx_queue_len(&self, name: &str) -> Option<u32> {
-        appine_hal::net::tx_queue_len(name)
+        match &self.net {
+            Some(_) => Some(1000),
+            None => appine_hal::net::tx_queue_len(name),
+        }
     }
 
     fn uid(&self) -> u32 {
-        self.uid
+        self.cred.ruid
+    }
+
+    fn configure(&self, req: &[u8]) -> Option<i32> {
+        crate::netns::configure(self.net.as_ref()?, &self.cred, req)
     }
 }
 
@@ -594,13 +702,16 @@ pub(crate) fn send(
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let (host_fd, ty, timeout, to_stub) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
-            let to_stub = s.ty == SOCK_DGRAM && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
+            let to_stub = s.net.is_none()
+                && s.ty == SOCK_DGRAM
+                && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
         Socket::Netlink(s) => {
             let host = KernelHost {
                 k: cx.kr(),
-                uid: cx.cred().ruid,
+                cred: cx.cred(),
+                net: s.net.clone(),
             };
             s.handle(data, &host);
             request_wake_object(wake::of(sock));
@@ -624,6 +735,21 @@ pub(crate) fn send(
         request_wake_object(wake::of(sock));
         return Ok(data.len());
     }
+    // 新的网络命名空间里：目的地址换成宿主的（到不了时 ENETUNREACH），没绑定的先绑上
+    let host_addr = match &mut *sock.borrow_mut() {
+        Socket::Inet(s) if s.net.is_some() && ty != SOCK_STREAM => {
+            let ns = s.net.clone().unwrap();
+            let a = if addr.is_empty() {
+                Vec::new()
+            } else {
+                crate::netns::to_host(&ns, addr, crate::netns::Use::Reach)?
+            };
+            ensure_bound(s)?;
+            Some(a)
+        }
+        _ => None,
+    };
+    let addr = host_addr.as_deref().unwrap_or(addr);
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut done = 0;
     let mut sent_datagram = false;
@@ -669,7 +795,10 @@ pub(crate) fn send(
 
 /// 记下宿主 socket 上收发的流量（[`crate::traffic`]）。
 fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8]) {
-    if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+    // 新的网络命名空间里的流量不算进宿主的接口
+    if let Socket::Inet(s) = &mut *sock.borrow_mut()
+        && s.net.is_none()
+    {
         cx.k().traffic.account(s, rx, bytes, peer);
     }
 }
@@ -784,10 +913,16 @@ pub(crate) fn recv(
                 if counted {
                     account(cx, sock, true, len, &r.addr);
                 }
+                let addr = match &*sock.borrow() {
+                    Socket::Inet(InetSocket { net: Some(ns), .. }) if !r.addr.is_empty() => {
+                        crate::netns::from_host(ns, &r.addr, false)
+                    }
+                    _ => r.addr,
+                };
                 return Ok(Message {
                     data: buf,
                     len,
-                    addr: r.addr,
+                    addr,
                     control: r.control,
                     flags: r.flags as u32,
                 });
@@ -1029,6 +1164,18 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
 /// socket 的 ioctl：FIONREAD，以及接口信息（`SIOCGIF*`）。
 pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
     const FIONREAD: u32 = 0x541b;
+    const SIOCATMARK: u32 = 0x8905;
+    // 新的网络命名空间里的 socket：接口类 ioctl 只看到它的 lo（crate::netns）
+    let net = match &*sock.borrow() {
+        Socket::Inet(s) => s.net.clone(),
+        Socket::Netlink(s) => s.net.clone(),
+        Socket::Unix(u) => u.net.clone(),
+    };
+    if let Some(ns) = net
+        && (0x8910..0x8960).contains(&request)
+    {
+        return netns_ioctl(cx, &ns, request, arg);
+    }
     let host_fd = match &*sock.borrow() {
         Socket::Inet(s) => Some(s.fd),
         Socket::Unix(u) if request == FIONREAD => {
@@ -1036,7 +1183,6 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         }
         Socket::Netlink(_) | Socket::Unix(_) => None,
     };
-    const SIOCATMARK: u32 = 0x8905;
     match (request, host_fd) {
         // 先问宿主（UDP 是 EINVAL），再写回 guest（地址不对是 EFAULT）
         (SIOCATMARK, Some(fd)) => {
@@ -1059,6 +1205,42 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
             appine_hal::net::close(fd);
             r
         }
+    }
+}
+
+/// 新的网络命名空间里的接口 ioctl：只有 lo。
+fn netns_ioctl(cx: &mut Cx<'_>, ns: &crate::nsproxy::NetNs, request: u32, arg: u64) -> SysResult {
+    const SIOCGIFCONF: u32 = 0x8912;
+    if request == SIOCGIFCONF {
+        let conf: [u8; 16] = get(cx, arg)?;
+        let len = i32::from_le_bytes(conf[..4].try_into().unwrap()).max(0) as usize;
+        let buf = u64::from_le_bytes(conf[8..].try_into().unwrap());
+        let all = crate::netns::ifconf(ns);
+        // 缓冲区为空时只报告要多大；否则放得下几个整项写几个
+        let n = if buf == 0 {
+            all.len()
+        } else {
+            let n = (len / 40 * 40).min(all.len());
+            cx.mm().write(UserSlice::new(buf, n), &all[..n])?;
+            n
+        };
+        return put(cx, arg, (n as i32).to_le_bytes()).map(|()| 0);
+    }
+    let mut ifr: [u8; 40] = get(cx, arg)?;
+    match crate::netns::interface_ioctl(ns, &cx.cred(), request, &mut ifr) {
+        Some(r) => {
+            r?;
+            put(cx, arg, ifr).map(|()| 0)
+        }
+        // 别的修改（地址、MTU 等）不支持
+        None if matches!(
+            request,
+            0x8916 | 0x8918 | 0x891a | 0x891c | 0x8923 | 0x8924 | 0x8943
+        ) =>
+        {
+            Err(Errno::EPERM)
+        }
+        None => Err(Errno::ENOTTY),
     }
 }
 

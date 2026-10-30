@@ -204,6 +204,8 @@ pub(crate) struct Kernel {
     /// 各个 IPC 命名空间里的 System V IPC 对象和 POSIX 消息队列，按命名空间的编号；没有
     /// 线程用了的命名空间丢掉（[`Kernel::collect_ipc`]）。
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
+    /// 新建的网络命名空间（[`crate::nsproxy::NetNs`]）：分配宿主上的回环地址时避开还在用的。
+    net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
     /// AF_UNIX socket 绑定的地址。
     pub unix: crate::unix::Names,
     /// 消息里带着打开文件的 AF_UNIX channel（`unix::collect` 用）。
@@ -253,6 +255,8 @@ pub(crate) struct Kernel {
     /// AIO 上下文占用的事件数（`/proc/sys/fs/aio-nr`）和上限（`aio-max-nr`）。
     pub aio_nr: u64,
     pub aio_max_nr: u64,
+    /// 写过的 `/proc/sys/user/max_*_namespaces`（按名字；只记下，不实际限制）。
+    pub max_namespaces: BTreeMap<Vec<u8>, u64>,
     /// inotify 的所有监视。打开文件析构时要报告 `IN_CLOSE_*`，所以用 Rc 共享。
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
     /// 所有地址空间共用的只读文件映射（[`crate::mm::FileMaps`]）。
@@ -292,6 +296,7 @@ impl Kernel {
             flocks: BTreeMap::new(),
             locks: crate::locks::Locks::default(),
             init_ns: init_ns.clone(),
+            net_nss: Vec::new(),
             ipcs: BTreeMap::from([(
                 init_ns.ipc.id,
                 (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),
@@ -321,6 +326,7 @@ impl Kernel {
             host_routes: None,
             aio_nr: 0,
             aio_max_nr: 65536,
+            max_namespaces: BTreeMap::new(),
             inotify: Rc::default(),
             file_maps: Default::default(),
         }
@@ -388,6 +394,32 @@ impl Kernel {
         let objects = (Rc::downgrade(&ns), crate::ipc::Ipc::default());
         self.ipcs.insert(ns.id, objects);
         ns
+    }
+
+    /// 新建一个网络命名空间，属于用户命名空间 `owner`：里面只有关着的 lo，宿主上的回环
+    /// 地址 127.a.b.0/24 取一个还没有命名空间用的（a、b 不全为 0）。
+    pub fn new_net_ns(
+        &mut self,
+        owner: Rc<crate::cred::UserNs>,
+    ) -> Result<Rc<crate::nsproxy::NetNs>, Errno> {
+        self.net_nss.retain(|w| w.strong_count() > 0);
+        let used: Vec<[u8; 2]> = self
+            .net_nss
+            .iter()
+            .filter_map(|w| w.upgrade().and_then(|n| n.host_net))
+            .collect();
+        let net = (1..=u16::MAX)
+            .map(u16::to_be_bytes)
+            .find(|n| !used.contains(n))
+            .ok_or(Errno::ENOMEM)?;
+        let ns = Rc::new(crate::nsproxy::NetNs {
+            id: crate::vfs::new_ns_id(),
+            owner,
+            host_net: Some(net),
+            lo: Default::default(),
+        });
+        self.net_nss.push(Rc::downgrade(&ns));
+        Ok(ns)
     }
 
     /// IPC 命名空间 `id` 里的对象。

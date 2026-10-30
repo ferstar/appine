@@ -259,6 +259,8 @@ pub(crate) struct UnixSocket {
     pub shut_wr: bool,
     /// 监听 socket 来过的连接数（`EPOLLET` 每来一个都触发）。
     pub connections: u64,
+    /// 建在新的网络命名空间里时是它（抽象地址按它分开，接口 ioctl 看它的 lo）。
+    pub net: Option<Rc<crate::nsproxy::NetNs>>,
 }
 
 impl UnixSocket {
@@ -274,7 +276,15 @@ impl UnixSocket {
             sndtimeo: None,
             shut_wr: false,
             connections: 0,
+            net: None,
         }
+    }
+
+    /// 所在的网络命名空间的编号。
+    pub fn net_id(&self) -> u64 {
+        self.net
+            .as_ref()
+            .map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
     }
 
     /// socketpair：两个互相连接的 socket。
@@ -337,6 +347,8 @@ impl UnixSocket {
     ) -> UnixSocket {
         let (up, down) = (ChannelRef::default(), ChannelRef::default());
         let mut server = UnixSocket::new(self.ty);
+        // 与 Linux 的 unix_stream_connect 一样，新的一端建在连接方的网络命名空间里
+        server.net = self.net.clone();
         server.addr = server_addr.to_vec();
         server.link = Link::Stream {
             rx: up.clone(),
@@ -497,8 +509,9 @@ impl Drop for UnixSocket {
 pub(crate) enum Name {
     /// 路径地址：仓库里 socket 节点的 inode。
     Path(Ino),
-    /// 抽象地址：`sun_path` 的全部字节（以 NUL 开头）。
-    Abstract(Vec<u8>),
+    /// 抽象地址：所在的网络命名空间的编号和 `sun_path` 的全部字节（以 NUL 开头）。与
+    /// Linux 一样，各个网络命名空间的抽象地址互不相干，路径地址不分。
+    Abstract(u64, Vec<u8>),
 }
 
 /// `/proc/net/unix`：所有 AF_UNIX socket。地址是抽象地址时以 `@` 开头，其中的 NUL
@@ -714,13 +727,14 @@ impl Names {
         true
     }
 
-    /// 自动绑定：与 Linux 相同，分配一个 `\0` 加 5 位十六进制数字的抽象地址。
-    pub fn autobind(&mut self, sock: &Rc<RefCell<Socket>>) -> Option<Vec<u8>> {
+    /// 自动绑定：与 Linux 相同，在网络命名空间 `net` 里分配一个 `\0` 加 5 位十六进制数字的
+    /// 抽象地址。
+    pub fn autobind(&mut self, net: u64, sock: &Rc<RefCell<Socket>>) -> Option<Vec<u8>> {
         for _ in 0..0x100000 {
             self.next_auto = (self.next_auto + 1) & 0xfffff;
             let mut path = vec![0u8];
             path.extend_from_slice(format!("{:05x}", self.next_auto).as_bytes());
-            if self.insert(Name::Abstract(path.clone()), sock) {
+            if self.insert(Name::Abstract(net, path.clone()), sock) {
                 return Some(path);
             }
         }
@@ -858,10 +872,10 @@ mod tests {
     fn abstract_names_are_released_with_the_socket() {
         let mut names = Names::default();
         let s = Rc::new(RefCell::new(Socket::Unix(UnixSocket::new(SOCK_STREAM))));
-        let name = Name::Abstract(b"\0test".to_vec());
+        let name = Name::Abstract(0, b"\0test".to_vec());
         assert!(names.insert(name.clone(), &s));
         assert!(!names.insert(name.clone(), &s));
-        let auto = names.autobind(&s).unwrap();
+        let auto = names.autobind(0, &s).unwrap();
         assert_eq!(auto, b"\x0000001");
         drop(s);
         assert!(names.lookup(&name).is_none());

@@ -1,6 +1,6 @@
 # M9 之前：UTS 和 IPC 命名空间（2026-10-30）
 
-← [M9 之前：pid 命名空间（2026-10-30）](120-pid-namespaces.md) · [索引](../milestones.md)
+← [M9 之前：pid 命名空间（2026-10-30）](120-pid-namespaces.md) · [索引](../milestones.md) · [M9 之前：网络命名空间（2026-10-30）](122-net-namespaces.md) →
 
 让 bubblewrap 能用的第六轮。Codex 的命令都带 `--unshare-ipc`，`--unshare-uts`、`--hostname` 也常用；原来 `CLONE_NEWUTS`、`CLONE_NEWIPC` 是 EPERM。网络命名空间要另外做一套隔离的回环，下一轮单独做。
 
@@ -16,8 +16,8 @@
 
 **推迟项**：
 
-- 没有网络命名空间（下一轮）；cgroup、time 命名空间仍没有。
+- 没有网络命名空间（下一轮）；cgroup、time 命名空间仍没有。 → 网络命名空间已补上（M9 之前：网络命名空间）；cgroup、time 仍没有
 - 没有 mqueue 文件系统（原来就没有），POSIX 消息队列只能经由 mq_open 这些系统调用用。
 - 在用户命名空间里的 root 写 `/proc/sys/kernel` 下的 IPC 限制、主机名仍按文件本身的属主检查（Linux 的 IPC 限制按命名空间的属主，`ipc_set_ownership`）。
 - 命名空间文件不让 UTS、IPC 命名空间活着（与[挂载命名空间](118-mount-namespaces.md)的推迟项相同）。
-- `max_uts_namespaces`、`max_ipc_namespaces` 只读、不实际限制。
+- `max_uts_namespaces`、`max_ipc_namespaces` 只读、不实际限制。 → 可以写了（M9 之前：网络命名空间），仍不实际限制

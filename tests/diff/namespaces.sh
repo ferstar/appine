@@ -1,4 +1,4 @@
-# docker-run-options: --cap-add SYS_ADMIN --security-opt apparmor=unconfined
+# docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
 # 命名空间：/proc/<pid>/ns 的链接和打开之后的文件，挂载命名空间（unshare、clone 的
 # CLONE_NEWNS，两边的挂载互不可见，/proc/<pid>/mountinfo 看那个进程的，setns 回去，在新的
 # 命名空间里 pivot_root 不影响外面），以及各种错误。原生一侧是有 CAP_SYS_ADMIN 的 docker 容器。
@@ -909,4 +909,178 @@ libc.semctl(sem, 0, IPC_RMID)
 libc.msgctl(msq, IPC_RMID, None)
 libc.mq_unlink(b"/appine-ns")
 PY4
+
+# 网络命名空间：busybox 的 unshare -n 里只有关着的 lo，ip 把它打开之后有 127.0.0.1/8、::1
+# 和 local 表里的路由，外面的地址到不了
+unshare -n sh -c '
+    ip link show
+    ip -o addr
+    ip link set lo up
+    ip link show
+    ip -o addr
+    ip route show table local
+    sed 1,2d /proc/net/dev | cut -d: -f1
+    ping -c 1 -W 1 10.0.0.1 2>&1 | tail -1
+'
+
+python3 - <<'PY5'
+import ctypes, errno, functools, os, socket, struct, time
+
+print = functools.partial(print, flush=True)
+
+CLONE_NEWNET, CLONE_NEWUSER = 0x40000000, 0x10000000
+
+
+def err(f, *args):
+    try:
+        f(*args)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def fork(f):
+    pid = os.fork()
+    if pid == 0:
+        try:
+            f()
+        except OSError as e:
+            print("raised", errno.errorcode[e.errno])
+        except BaseException as e:
+            print("raised", repr(e))
+        finally:
+            os._exit(0)
+    return pid
+
+
+def child(f):
+    return os.waitpid(fork(f), 0)[1]
+
+
+def tcp(family=socket.AF_INET):
+    return socket.socket(family, socket.SOCK_STREAM)
+
+
+def udp(family=socket.AF_INET):
+    return socket.socket(family, socket.SOCK_DGRAM)
+
+
+def lo_up():
+    os.system("ip link set lo up")
+
+
+def rtattr(ty, data):
+    return struct.pack("=HH", 4 + len(data), ty) + data + b"\0" * (-len(data) % 4)
+
+
+def rtnl(*msgs):
+    """经由 NETLINK_ROUTE 发请求，返回每个请求的确认里的错误码。"""
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
+    s.bind((0, 0))
+    out = []
+    for seq, (ty, flags, body) in enumerate(msgs, 1):
+        s.send(struct.pack("=LHHLL", 16 + len(body), ty, flags | 1, seq, 0) + body)
+        r = s.recv(4096)
+        out.append(struct.unpack("=i", r[16:20])[0] if struct.unpack("=H", r[4:6])[0] == 2 else None)
+    return out
+
+
+# bubblewrap 的 loopback_setup：RTM_NEWADDR 加 127.0.0.1/8，再 RTM_NEWLINK 把 lo 打开，都要确认
+NEWADDR = (20, 0x4 | 0x200 | 0x400, struct.pack("=BBBBI", socket.AF_INET, 8, 0x80, 254, 1)
+           + rtattr(2, bytes([127, 0, 0, 1])) + rtattr(1, bytes([127, 0, 0, 1])))
+NEWLINK = (16, 0x4, struct.pack("=BBHiII", 0, 0, 0, 1, 1, 1))
+
+
+# 外面监听的回环端口和抽象地址：里面都连不到
+outer = tcp()
+outer.bind(("127.0.0.1", 0))
+outer.listen()
+outer_port = outer.getsockname()[1]
+outer_unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+outer_unix.bind("\0appine-netns")
+outer_unix.listen()
+me = os.readlink("/proc/self/ns/net")
+
+
+def netns():
+    os.unshare(CLONE_NEWNET)
+    print("new ns", os.readlink("/proc/self/ns/net") != me)
+    print("interfaces", socket.if_nameindex(), "lo", socket.if_nametoindex("lo"),
+          "eth0", err(socket.if_nametoindex, "eth0"))
+    # lo 关着：通配地址能绑，127.0.0.1 绑不上、连不到
+    print("down: bind any", err(tcp().bind, ("0.0.0.0", 0)), "bind lo", err(tcp().bind, ("127.0.0.1", 0)),
+          "connect", err(tcp().connect, ("127.0.0.1", 9)), "v6", err(tcp(socket.AF_INET6).connect, ("::1", 9)))
+    r, w = os.pipe()
+    pid = fork(lambda: (os.setuid(65534), os.write(w, str(rtnl(NEWADDR)).encode())))
+    os.waitpid(pid, 0)
+    print("unprivileged rtnl", os.read(r, 100).decode())
+    print("bwrap's loopback_setup", rtnl(NEWADDR, NEWLINK), "again", rtnl(NEWADDR))
+    # 回环上的 TCP：两端的地址都是 127.0.0.1
+    srv = tcp()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    port = srv.getsockname()[1]
+    c = tcp()
+    c.connect(("127.0.0.1", port))
+    conn, peer = srv.accept()
+    c.sendall(b"hello")
+    print("tcp", srv.getsockname()[0], c.getpeername() == ("127.0.0.1", port), peer[0],
+          conn.getsockname() == c.getpeername(), conn.recv(5))
+    # 通配地址：getsockname 是 0.0.0.0，连 127.0.0.1 也连得上
+    any4 = tcp()
+    any4.bind(("0.0.0.0", 0))
+    any4.listen()
+    print("any", any4.getsockname()[0], err(tcp().connect, ("127.0.0.1", any4.getsockname()[1])))
+    # IPv6 的 ::1 和 ::
+    s6 = tcp(socket.AF_INET6)
+    s6.bind(("::", 0))
+    s6.listen()
+    c6 = tcp(socket.AF_INET6)
+    c6.connect(("::1", s6.getsockname()[1]))
+    a6, p6 = s6.accept()
+    print("v6", s6.getsockname()[0], p6[0], c6.getpeername()[0])
+    # UDP 和自动绑定
+    u = udp()
+    u.bind(("127.0.0.1", 0))
+    v = udp()
+    v.sendto(b"x", u.getsockname())
+    data, frm = u.recvfrom(10)
+    print("udp", data, frm[0], frm == v.getsockname()[:0] or frm[1] == v.getsockname()[1], v.getsockname()[0])
+    # 外面的地址到不了；外面的回环端口和抽象地址在这里是另一套
+    print("outside", err(tcp().connect, ("10.0.0.1", 80)), err(udp().sendto, b"x", ("8.8.8.8", 53)),
+          err(udp().connect, ("192.0.2.1", 9)), "bind", err(tcp().bind, ("10.0.0.1", 0)))
+    print("outer port", err(tcp().connect, ("127.0.0.1", outer_port)))
+    un = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    print("outer abstract", err(un.connect, "\0appine-netns"),
+          "bind it here", err(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind, "\0appine-netns"))
+    # /proc/net 是这个命名空间的：dev 只有 lo，tcp 里只有这里的 socket
+    with open("/proc/self/net/dev") as f:
+        print("dev", [l.split(":")[0].strip() for l in f.readlines()[2:]])
+    with open("/proc/self/net/tcp") as f:
+        listed = {l.split()[1] for l in f.readlines()[1:]}
+    mine = {"0100007F:%04X" % port, "00000000:%04X" % any4.getsockname()[1],
+            "0100007F:%04X" % c.getsockname()[1], "0100007F:%04X" % conn.getsockname()[1]}
+    print("tcp listing has ours", mine <= listed, "not the outer one", "0100007F:%04X" % outer_port not in listed)
+    # setns 回原来的命名空间：之后建的 socket 连得上外面的端口
+    fd = os.open("/proc/%d/ns/net" % os.getppid(), os.O_RDONLY)
+    print("setns back", err(os.setns, fd, CLONE_NEWNET), err(tcp().connect, ("127.0.0.1", outer_port)),
+          "old socket", err(c.send, b"y"))
+
+
+child(netns)
+child(lambda: (os.setuid(65534), print("unprivileged unshare", err(os.unshare, CLONE_NEWNET))))
+
+
+# root 建的用户命名空间里的网络命名空间：属主是新的用户命名空间，在里面能配 lo
+def owned():
+    os.unshare(CLONE_NEWUSER | CLONE_NEWNET)
+    lo_up()
+    s = tcp()
+    s.bind(("127.0.0.1", 0))
+    s.listen()
+    print("in a user namespace", err(tcp().connect, s.getsockname()))
+
+
+child(owned)
+PY5
 rm -rf /tmp/ns
