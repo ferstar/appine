@@ -181,7 +181,7 @@ unsafe extern "C" {
     fn appine_guest_hwcap() -> u64;
     fn appine_guest_midr() -> u64;
 
-    fn appine_dbt_new(key: u64) -> *mut RawDbt;
+    fn appine_dbt_new(key: u64, regs: DbtRegs) -> *mut RawDbt;
     fn appine_dbt_trim();
     fn appine_dbt_unmap_written();
     fn appine_dbt_written_bytes() -> u64;
@@ -598,6 +598,19 @@ pub struct DbtStats {
     pub ungrouped: u64,
 }
 
+/// Tier 1 翻译后的代码自己占用哪几个宿主寄存器（与它们同号的 guest 寄存器改存在
+/// [`CpuState`] 里，引用它们的指令要多读写一次）。只影响速度。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DbtRegs {
+    /// x16、x17、x26–x28：编译器生成的代码里用得少。
+    #[default]
+    Default,
+    /// x21–x25：Go 的程序常用 x16、x26–x28（栈检查、闭包上下文、汇编器的临时寄存器、
+    /// 当前的 goroutine），几乎不用这几个。
+    Go,
+}
+
 /// 一个地址空间的 Tier 1 翻译（代码缓存、翻译表），这个地址空间里的所有线程共用：每个
 /// 线程经由 [`Dbt::attach`] 得到自己的 [`Dbt`]。最后一个 [`Dbt`] 和这里的引用都没了之后
 /// 放回池里，翻译不多时保留下来，下一个使用者运行之前逐块核对。
@@ -625,10 +638,11 @@ impl DbtSpace {
     pub const SOURCES: usize = 64;
 
     /// 创建（或者从池里取出）一个实例；宿主不是 aarch64 Linux 时返回 `None`。`key` 区分
-    /// 程序（0 表示不区分）：池里有同一个键留下的翻译时优先拿回它，用完放回池里时也按它
-    /// 记下。
-    pub fn new(key: u64) -> Option<Arc<Self>> {
-        NonNull::new(unsafe { appine_dbt_new(key) }).map(|raw| Arc::new(DbtSpace { raw, key }))
+    /// 程序（0 表示不区分）：池里有同一个键、同一种 `regs` 留下的翻译时优先拿回它，用完
+    /// 放回池里时也按它记下。
+    pub fn new(key: u64, regs: DbtRegs) -> Option<Arc<Self>> {
+        NonNull::new(unsafe { appine_dbt_new(key, regs) })
+            .map(|raw| Arc::new(DbtSpace { raw, key }))
     }
 
     /// 地址空间不再使用了（翻译要放回池里）：记下翻译所在的映射，最多 [`Self::SOURCES`]
@@ -694,7 +708,12 @@ unsafe impl Send for Dbt {}
 impl Dbt {
     /// 创建一个只有这个线程用的实例；宿主不是 aarch64 Linux 时返回 `None`。
     pub fn new() -> Option<Self> {
-        Self::attach(&DbtSpace::new(0)?)
+        Self::with_regs(DbtRegs::Default)
+    }
+
+    /// 同 [`Dbt::new`]，翻译后的代码占用 `regs` 这一组寄存器。
+    pub fn with_regs(regs: DbtRegs) -> Option<Self> {
+        Self::attach(&DbtSpace::new(0, regs)?)
     }
 
     /// 挂到 `space` 上。

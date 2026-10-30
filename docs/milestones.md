@@ -121,6 +121,7 @@
 | [M9 之前：openat 的开销](rounds/110-openat-cost.md) | 2026-10-30 | 分阶段量了 openat：`go build` 里合计只占墙钟的 1.3%，新建文件一次 55 µs（宿主上建 object 约 27 µs、SQLite 约 16 µs，缓存是冷的），打开已有文件 7.6 µs；没有便宜的改法，没改代码 |
 | [M9 之前：检查点挪到后台](rounds/111-background-checkpoint.md) | 2026-10-30 | SQLite 的检查点（要 fsync）由仓库的后台线程做，不在持着 BKL 的提交里：写入停下之后补写回让 WAL 从头再用，一直在写时到 1 万页由提交的线程就地补上；解包时持锁的提交最长 8.4 → 0.6 ms |
 | [M9 之前：宿主内存的接缝](rounds/112-host-seams.md) | 2026-10-30 | mremap 扩展、`mmap(MAP_FIXED)` 分块提交留下宿主地址不连续的接缝，访存组跨接缝失败就被拆掉（微基准里之后慢四成）；JVM、Go 九成以上的拆组来自接缝，但完全不拆组时只有 Maven 快 1.4%，没改代码 |
+| [M9 之前：Go 换一组被占用的寄存器](rounds/113-go-registers.md) | 2026-10-30 | Go 的编译器固定用 Tier 1 占用的 x16、x26–x28（原生的 compile 里 15.5% 的执行时间），几乎不用 x19–x25：execve 时认出 Go 的 build ID 注记，Tier 1 改占 x21–x25，翻译模板、池里的实例按寄存器分配区分；`go build` 快 3–5%，计算型的 Go 程序快 2–3%，lockstep、差分测试、LTP 另用 Go 的一组跑所有程序 |
 
 ## 测量条件
 
@@ -175,3 +176,4 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | [多进程并行](rounds/36-parallel-processes.md) | 4 个进程同时 exec；4 个同时跑管道 | 2.5×；3.1×（原来 3.1×、4×） |
 | [拆 BKL](rounds/38-split-bkl.md) | `go build` 冷编译 | 2.8× |
 | [同一个程序共用翻译](rounds/108-shared-translation.md) | shell 起进程 | 1.13×（原来 1.6×） |
+| [Go 换一组被占用的寄存器](rounds/113-go-registers.md) | `go build` 冷编译 | 2.6×（默认的一组 2.7×） |

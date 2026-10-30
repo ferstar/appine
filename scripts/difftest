@@ -19,7 +19,8 @@
 # 仓库必须在工作区里。appine-run 也在容器里运行，与原生一侧看到同一种网络（容器的 eth0、
 # 路由、地址），网络类的用例才比得了：Linux arm64 宿主上放进 APPINE_IMAGE（默认是
 # debian:trixie-slim，glibc 不能比编译 appine-run 的宿主旧）里运行，appine-run 可以用
-# 环境变量 APPINE_RUN 指定；其他宿主上经由 scripts/dev。
+# 环境变量 APPINE_RUN 指定；其他宿主上经由 scripts/dev。环境变量 APPINE_DBT_REGS 照样交给
+# appine-run（APPINE_DBT_REGS=go 时所有程序都用 Tier 1 给 Go 的那组寄存器）。
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -54,6 +55,7 @@ if [ "$(uname -sm)" = "Linux aarch64" ]; then
     # 一样放开 nice 的上限（guest 线程的 nice 值设置到宿主线程上）
     appine() {
         docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
+            ${APPINE_DBT_REGS:+-e APPINE_DBT_REGS} \
             --user "$(id -u):$(id -g)" --ulimit nice=40:40 -v "$root:$root" -w "$root" \
             "${APPINE_IMAGE:-debian:trixie-slim}" "$run" "$@"
     }

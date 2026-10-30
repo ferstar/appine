@@ -268,13 +268,18 @@ struct appine_dbt_stats {
  * 线程用 appine_dbt_attach() 挂上去得到自己的部分（跳转缓存、影子返回栈、统计），再用
  * 它运行。宿主不是 aarch64 Linux 时返回 NULL。appine_dbt_free() 在所有线程都解挂之后
  * 调用；实例放回池里，翻译不多时保留下来，下一个使用者运行之前逐块核对。`key` 区分程序
- * （0 表示不区分）：appine_dbt_new() 优先拿回同一个键留下的翻译。
+ * （0 表示不区分）：appine_dbt_new() 优先拿回同一个键留下的翻译。`regs` 选翻译后的代码
+ * 自己占用哪几个宿主寄存器（enum appine_dbt_regs），只影响速度。
  *
  * 翻译结果不会自己失效：guest 用 ic ivau 声明修改了代码（APPINE_EXIT_CODE），
  * 或者可执行的映射被拆除、改了权限之后，调用方要调用 appine_dbt_invalidate() 或
  * appine_dbt_flush()（对地址空间调用一次即可，经由任意一个挂着的线程）。
  */
-struct appine_dbt *appine_dbt_new(uint64_t key);
+enum appine_dbt_regs {
+    APPINE_DBT_REGS_DEFAULT, /* x16、x17、x26–x28：编译器生成的代码里用得少 */
+    APPINE_DBT_REGS_GO,      /* x21–x25：Go 的程序常用 x16、x26–x28，几乎不用这几个 */
+};
+struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs);
 void appine_dbt_free(struct appine_dbt *dbt, uint64_t key);
 /* 释放池里保留的翻译（宿主内存紧张时） */
 void appine_dbt_trim(void);

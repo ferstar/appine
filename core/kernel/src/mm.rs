@@ -800,6 +800,8 @@ pub struct Mm {
     pub lock_onfault: bool,
     /// 正在执行的程序文件在仓库里的 inode（ETXTBSY）。
     pub exe: Option<u64>,
+    /// Tier 1 翻译这个程序时占用哪一组寄存器，execve 时按程序定（Go 的另用一组）。
+    pub dbt_regs: appine_engine::DbtRegs,
     /// vDSO 的加载地址（信号处理函数默认返回到其中的 sigreturn 跳板）。
     pub vdso: u64,
     /// 初始栈上 argv 字符串的范围（`/proc/<pid>/cmdline`）。
@@ -1058,6 +1060,7 @@ impl Mm {
             lock_future: false,
             lock_onfault: false,
             exe: None,
+            dbt_regs: appine_engine::DbtRegs::Default,
             vdso: 0,
             args: (0, 0),
             env: (0, 0),
@@ -1160,7 +1163,7 @@ impl Mm {
             let space = match self.join_group(groups) {
                 Some(space) => space,
                 None => {
-                    let space = appine_engine::DbtSpace::new(self.exe.unwrap_or(0))?;
+                    let space = appine_engine::DbtSpace::new(self.exe.unwrap_or(0), self.dbt_regs)?;
                     // 从池里拿到上一个使用者留下的翻译时，同一个版本的程序文件里的块不必再核对
                     space.trust(&self.code_sources());
                     self.found_group(groups, &space);
@@ -2585,6 +2588,7 @@ impl Mm {
         child.env = self.env;
         child.auxv = self.auxv.clone();
         child.exe = self.exe;
+        child.dbt_regs = self.dbt_regs;
         child.mmap_top = self.mmap_top;
         child.start_stack = self.start_stack;
         child.stack_low = self.stack_low;
@@ -3758,7 +3762,7 @@ mod tests {
     #[test]
     fn code_groups_register_only_consistent_mappings() {
         // 宿主不支持 Tier 1 时没有翻译可以共用
-        let Some(space) = appine_engine::DbtSpace::new(0) else {
+        let Some(space) = appine_engine::DbtSpace::new(0, appine_engine::DbtRegs::Default) else {
             return;
         };
         let src = |start: u64, len: u64, ino: u64, offset: u64| appine_engine::DbtSource {

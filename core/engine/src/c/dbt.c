@@ -1,7 +1,7 @@
 /*
  * Tier 1：同 ISA 直通式 DBT（设计文档 §4.2）。
  *
- * 翻译后的代码运行期间的寄存器约定：
+ * 翻译后的代码运行期间的寄存器约定（这里是默认的一组，Go 的程序另用一组，见 struct regs）：
  *   - guest X0–X15、X19–X25、X29、X30 放在同号的宿主寄存器里，guest SP 放在宿主 X26；
  *   - 宿主 X28 指向 struct appine_cpu，宿主 X16、X17、X27 是临时寄存器；
  *   - 宿主 X18 是平台寄存器（Android 上是 bionic 给每个线程设的影子调用栈指针），
@@ -9,7 +9,8 @@
  *   - guest X16、X17、X18、X26、X27、X28 存放在 cpu 结构体里（"被占用的寄存器"），
  *     引用它们的指令改写后执行。SP 出现在 17% 的指令里（函数的序言、尾声），X26 在
  *     编译器生成的代码里是用得最少的被调用者保存寄存器（gcc 的 cc1 里不到 SP 的十分之一），
- *     所以把宿主 X26 让给 SP；
+ *     所以把宿主 X26 让给 SP。宿主寄存器只在翻译后的代码之间约定，与宿主的调用约定无关：
+ *     翻译后的代码不调用宿主的函数，进入例程保存了全部被调用者保存的寄存器；
  *   - guest NZCV 就是宿主 NZCV，所以插入的代码一律不改动条件标志；
  *   - guest V0–V31、FPCR、FPSR 就是宿主的 V0–V31、FPCR、FPSR，SIMD&FP 数据处理
  *     指令原样执行。
@@ -66,13 +67,30 @@ _Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "b 的偏移范围");
 /* 进入例程的栈帧：x19–x30、宿主 FPCR、d8–d15 */
 #define FRAME_BYTES 176
 
-/* 宿主寄存器 */
-#define CTX 28
-#define T0 16
-#define T1 17
-#define T2 27
+/*
+ * 宿主寄存器：CTX 指向 struct appine_cpu，T0、T1、T2 是临时寄存器，SP_HOST 存放 guest SP。
+ * 一个实例用哪一组在创建时选定（appine_dbt_new），例程、翻译、模板都按它生成，所以这几个
+ * 名字只能用在有 `x`（struct xlate *）的地方。与它们同号的 guest 寄存器和 X18 是被占用的
+ * 寄存器（is_stolen）。
+ *
+ * Go 的编译器把 X28 当作当前 goroutine（g）、X27 当作汇编器的临时寄存器、X26 当作闭包的
+ * 上下文，函数序言的栈检查用 X16：原生的 `go build` 里 compile 有 15.5% 的执行时间落在用到
+ * 默认一组被占用寄存器的指令上（gcc 的 cc1 是 5.2%），而 X19–X25 合计不到 1.5%（寄存器分配
+ * 从低号用起）。所以 Go 的程序改占 X21–X25（设计文档 §4.2）。
+ */
+struct regs {
+    unsigned ctx, t0, t1, t2, sp;
+};
+static const struct regs reg_sets[] = {
+    [APPINE_DBT_REGS_DEFAULT] = {.ctx = 28, .t0 = 16, .t1 = 17, .t2 = 27, .sp = 26},
+    [APPINE_DBT_REGS_GO] = {.ctx = 25, .t0 = 21, .t1 = 22, .t2 = 23, .sp = 24},
+};
+#define CTX (x->d->r->ctx)
+#define T0 (x->d->r->t0)
+#define T1 (x->d->r->t1)
+#define T2 (x->d->r->t2)
+#define SP_HOST (x->d->r->sp)
 #define REG_SP 32 /* 伪寄存器编号：guest SP */
-#define SP_HOST 26 /* 翻译后的代码运行期间存放 guest SP 的宿主寄存器 */
 
 /* 退出原因（从翻译后的代码返回分发器）。R_CHAIN_FWD 是前向的直接跳转，链接时
  * 跳过目标块入口的 kick 检查：块的起始地址沿前向边严格递增，所以任何循环里至少
@@ -186,6 +204,7 @@ struct block {
  * 线程打断其他线程，等它们都停在分发器里（parked）或者离开 dbt_run，见 flush_world。
  */
 struct appine_dbt {
+    const struct regs *r; /* 宿主寄存器的分配（reg_sets 里的一组），例程和翻译都按它生成 */
     uint32_t *cache;    /* 执行用的地址；所有代码指针都指向这里 */
     intptr_t rw_delta;  /* 写入用的别名减去执行用的地址；直接映射成 RWX 时为 0 */
     struct written *written; /* 可写别名里写过的页（note_written）；RWX 时为 NULL */
@@ -549,10 +568,12 @@ static void emit_add_const(struct xlate *x, unsigned rd, unsigned rn, int64_t im
         emit(x, sub ? enc_sub_imm(rd, src, lo, 0) : enc_add_imm(rd, src, lo, 0));
 }
 
-static bool is_stolen(unsigned r)
+/* guest Xr 是不是被占用的寄存器 */
+static bool stolen_in(const struct regs *regs, unsigned r)
 {
-    return r == 16 || r == 17 || r == 18 || r == SP_HOST || r == 27 || r == 28;
+    return r == 18 || r == regs->ctx || r == regs->t0 || r == regs->t1 || r == regs->t2 || r == regs->sp;
 }
+#define is_stolen(g) stolen_in(x->d->r, g)
 
 static size_t guest_off(unsigned r)
 {
@@ -787,7 +808,7 @@ static bool dp_operands(uint32_t insn, struct operands *o)
 /* 被占用的 guest 寄存器换成临时寄存器：先从 cpu 结构体读入，执行后写回 Rd */
 static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands *o)
 {
-    static const unsigned pool[3] = {T0, T1, T2};
+    const unsigned pool[3] = {T0, T1, T2};
     unsigned guest[3], nmap = 0, rd_host = 0, rd_guest = 0;
     bool rd_stolen = false;
     uint32_t out = insn;
@@ -1269,12 +1290,12 @@ static bool member_insn(const struct memop *m, int64_t off, uint32_t *out)
 }
 
 /* 立即数放不下时借来放宿主地址的寄存器：被占用的 Rt 用 T1（成对时用 T0、T1） */
-static unsigned member_scratch(const struct memop *m)
+static unsigned member_scratch(const struct xlate *x, const struct memop *m)
 {
     return m->pair && !m->simd && is_stolen(m->rt) ? T1 : T0;
 }
 
-static bool member_fits(const struct memop *m, int64_t off)
+static bool member_fits(const struct xlate *x, const struct memop *m, int64_t off)
 {
     uint32_t insn = 0;
     if (member_insn(m, off, &insn))
@@ -1298,7 +1319,7 @@ static bool nogroup(const struct appine_dbt *d, uint64_t pc)
  * 不写基址、不结束块的指令可以夹在组员之间：返回 1，用到 T2 时返回 2，否则返回 0。按常数
  * 加减基址的 ADD/SUB（立即数）把改变量记进 `delta`。
  */
-static int keeps_group(uint32_t insn, unsigned rn, int64_t *delta)
+static int keeps_group(const struct xlate *x, uint32_t insn, unsigned rn, int64_t *delta)
 {
     unsigned top = FIELD(insn, 28, 25), stolen[3], nstolen = 0;
     struct operands o = {.n = 0};
@@ -1373,7 +1394,7 @@ static int plan_group(struct xlate *x, const struct memop *lead)
         return -1;
     int64_t delta = 0, lo = member_start(lead, 0), hi = lo + memop_bytes(lead);
     bool write = !lead->load;
-    if (!member_fits(lead, lo))
+    if (!member_fits(x, lead, lo))
         return -1;
     g->idx[0] = x->idx;
     g->off[0] = (int32_t)lo;
@@ -1387,7 +1408,7 @@ static int plan_group(struct xlate *x, const struct memop *lead)
         uint32_t insn = x->guest[j];
         unsigned top = FIELD(insn, 28, 25);
         if (top != 0x4 && top != 0x6 && top != 0xc && top != 0xe) {
-            int keep = keeps_group(insn, rn, &delta);
+            int keep = keeps_group(x, insn, rn, &delta);
             if (!keep)
                 break;
             clobbered |= keep == 2;
@@ -1410,7 +1431,7 @@ static int plan_group(struct xlate *x, const struct memop *lead)
             break;
         int64_t start = member_start(&m, delta), end = start + memop_bytes(&m);
         int64_t nlo = start < lo ? start : lo, nhi = end > hi ? end : hi;
-        if (nhi - nlo > GROUP_SPAN || !member_fits(&m, start))
+        if (nhi - nlo > GROUP_SPAN || !member_fits(x, &m, start))
             break;
         lo = nlo;
         hi = nhi;
@@ -1446,7 +1467,7 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
     bool s1 = !m->simd && is_stolen(m->rt), s2 = m->pair && !m->simd && is_stolen(m->rt2);
     uint32_t insn = 0;
     if (!member_insn(m, off, &insn)) {
-        addr = member_scratch(m);
+        addr = member_scratch(x, m);
         emit_add_const(x, addr, T2, off);
         member_insn(m, 0, &insn);
     }
@@ -1552,7 +1573,7 @@ struct atomic_operand {
 static void emit_on_host_address(struct xlate *x, uint32_t insn, const struct atomic_operand *ops,
                                  unsigned n)
 {
-    static const unsigned pool[2] = {T0, T1};
+    const unsigned pool[2] = {T0, T1};
     uint32_t out = (insn & ~(31u << 5)) | T2 << 5;
     for (unsigned i = 0; i < n; i++) {
         unsigned r = (insn >> ops[i].pos) & 31;
@@ -2462,16 +2483,17 @@ static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct bloc
         retire_flush(d, r);
     if (d->used_words + 16 > d->cache_words)
         return false;
-    struct xlate x = {.d = d, .buf = d->cache + d->used_words, .wdelta = d->rw_delta, .st = d->st};
-    emit_mov_const(&x, T1, (uint64_t)(uintptr_t)b->code);
-    emit_mov_const(&x, T0, b->pc);
-    emit(&x, enc_movz(T2, R_CHAIN, 0));
-    emit(&x, enc_b((intptr_t)d->exit - (intptr_t)here(&x)));
-    while (x.n < 16)
-        emit(&x, enc_b(4)); /* 补齐，转发桩按 16 个字排列 */
-    d->used_words += x.n;
+    struct xlate fwd = {.d = d, .buf = d->cache + d->used_words, .wdelta = d->rw_delta, .st = d->st},
+                 *x = &fwd;
+    emit_mov_const(x, T1, (uint64_t)(uintptr_t)b->code);
+    emit_mov_const(x, T0, b->pc);
+    emit(x, enc_movz(T2, R_CHAIN, 0));
+    emit(x, enc_b((intptr_t)d->exit - (intptr_t)here(x)));
+    while (x->n < 16)
+        emit(x, enc_b(4)); /* 补齐，转发桩按 16 个字排列 */
+    d->used_words += x->n;
     if (!r->n)
-        r->fwd_start = x.buf;
+        r->fwd_start = x->buf;
     r->park[r->n] = park;
     r->blocks[r->n++] = b;
     return true;
@@ -2576,9 +2598,9 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
 /* ---- 翻译模板：所有实例共享（§4.2） ---- */
 
 /*
- * 一个块的翻译只取决于它的 guest pc 和翻译过的指令字（以及全局的特性集合），与
- * 进程、映射无关。每翻译一个块就把结果存成模板；别的实例（另一个线程、fork 出来的
- * 子进程、又一次 exec 的同一个程序）要翻译同一个 pc 时，先比对模板记下的指令字和
+ * 一个块的翻译只取决于它的 guest pc 和翻译过的指令字（以及全局的特性集合、实例的
+ * 寄存器分配），与进程、映射无关。每翻译一个块就把结果存成模板；别的实例（另一个线程、
+ * fork 出来的子进程、又一次 exec 的同一个程序）要翻译同一个 pc 时，先比对模板记下的指令字和
  * 自己内存里的是否相同，相同就把模板拷进自己的代码缓存，只重新计算跳往例程的几条
  * b。块之间的链接在各自的拷贝里回填，所以不同进程在同一地址映射了不同的代码也
  * 互不影响。模板区写满时整体丢弃，因为实例只拷贝模板、从不引用它。
@@ -2597,6 +2619,7 @@ struct template {
     struct template *next;
     uint64_t pc;
     uint64_t key; /* 翻译时用到的分组记录（nogroup_key） */
+    const struct regs *r;
     uint32_t nguest, nhost, nrelocs, nlinks;
     uint32_t copied, remapped, memory, fallback, grouped; /* 统计，拷贝时累加 */
     uint32_t words[]; /* guest 指令字、宿主指令字、重定位、链接（每个 4 个字，见 struct link） */
@@ -2659,10 +2682,10 @@ static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
 }
 
 /* 调用方持有 pc 所在的分片的锁 */
-static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key)
+static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r)
 {
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
-        if (t->pc == pc && t->key == key && memcmp(t->words, guest, t->nguest * 4) == 0)
+        if (t->pc == pc && t->key == key && t->r == r && memcmp(t->words, guest, t->nguest * 4) == 0)
             return t;
     }
     return NULL;
@@ -2686,11 +2709,11 @@ struct prep {
 };
 
 /* 有和 `guest`（翻译时读到的指令字）相同的模板时，拷进线程的暂存区记在 p 里 */
-static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, struct prep *p,
-                           uint32_t *scratch, struct appine_dbt_stats *st)
+static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
+                           struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
 {
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find(pc, guest, key);
+    struct template *t = template_find(pc, guest, key, r);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
         memcpy(scratch, host, t->nhost * 4);
@@ -2760,11 +2783,12 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
     size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs + 4 * nlinks);
     bytes = (bytes + 7) & ~(size_t)7;
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find(pc, guest, key) ? NULL : template_alloc(bytes);
+    struct template *t = template_find(pc, guest, key, x->d->r) ? NULL : template_alloc(bytes);
     if (t) {
         *t = (struct template){
             .pc = pc,
             .key = key,
+            .r = x->d->r,
             .nguest = nguest,
             .nhost = (uint32_t)x->n,
             .nrelocs = x->nrelocs,
@@ -2788,7 +2812,8 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
         struct template **b = template_bucket(pc);
         t->next = *b;
         *b = t;
-        /* 新的在前面：同一个 pc 超出上限的旧版本从链上摘掉（空间等模板区清空时回收） */
+        /* 新的在前面：同一个 pc 超出上限的旧版本（不分寄存器分配）从链上摘掉（空间等模板区
+         * 清空时回收） */
         unsigned versions = 0;
         for (struct template **p = &t->next; *p;) {
             if ((*p)->pc == pc && ++versions >= TEMPLATES_PER_PC)
@@ -2871,7 +2896,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     /* 不持锁读分组记录：读到旧的只影响分组，检查没通过时会再撤销（ungroup） */
     uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
     t->stats.blocks++;
-    if (template_fetch(pc, guest, key, p, t->scratch, &t->stats))
+    if (template_fetch(pc, guest, key, d->r, p, t->scratch, &t->stats))
         return true;
 
     struct appine_dbt_stats before = t->stats;
@@ -3216,100 +3241,109 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     return entry;
 }
 
+/* 放在同号宿主寄存器里的 guest 寄存器与 cpu 结构体（`base` 指向 x[0]）之间读写：相邻的
+ * 两个用一条 ldp/stp */
+static void move_guest_regs(struct xlate *x, unsigned base, bool store)
+{
+    for (unsigned r = 0; r < 31; r++) {
+        if (is_stolen(r))
+            continue;
+        if (r < 30 && !is_stolen(r + 1)) {
+            emit(x, store ? enc_stp_x(r, r + 1, base, (int)(8 * r)) : enc_ldp_x(r, r + 1, base, (int)(8 * r)));
+            r++;
+        } else {
+            emit(x, store ? enc_str_x(r, base, 8 * r) : enc_ldr_x(r, base, 8 * r));
+        }
+    }
+}
+
 /* 进入与退出例程：放在代码缓存开头，所有退出桩都能用一条 b 到达 */
 static void emit_routines(struct appine_dbt *d)
 {
-    static const unsigned pairs[] = {0, 2, 4, 6, 8, 10, 12, 14, 19, 21, 23};
-    struct xlate x = {.d = d, .buf = d->cache, .wdelta = d->rw_delta, .st = d->st};
+    struct xlate routines = {.d = d, .buf = d->cache, .wdelta = d->rw_delta, .st = d->st}, *x = &routines;
     size_t x0 = offsetof(struct appine_cpu, x), v0 = offsetof(struct appine_cpu, v);
 
     /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code)：保存被调用者保存的寄存器
      * （含 d8–d15）和宿主 FPCR。栈帧布局：x29/x30、x27–x19 的五对、空着的 8 字节、
      * 宿主 FPCR（+104）、d8–d15（+112） */
-    d->enter = here(&x);
-    emit(&x, enc_stp_x_pre(29, 30, 31, -FRAME_BYTES));
-    emit(&x, enc_stp_x(27, 28, 31, 16));
-    emit(&x, enc_stp_x(25, 26, 31, 32));
-    emit(&x, enc_stp_x(23, 24, 31, 48));
-    emit(&x, enc_stp_x(21, 22, 31, 64));
-    emit(&x, enc_stp_x(19, 20, 31, 80));
+    d->enter = here(x);
+    emit(x, enc_stp_x_pre(29, 30, 31, -FRAME_BYTES));
+    emit(x, enc_stp_x(27, 28, 31, 16));
+    emit(x, enc_stp_x(25, 26, 31, 32));
+    emit(x, enc_stp_x(23, 24, 31, 48));
+    emit(x, enc_stp_x(21, 22, 31, 64));
+    emit(x, enc_stp_x(19, 20, 31, 80));
     for (unsigned r = 8; r < 16; r += 2)
-        emit(&x, enc_stp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
-    emit(&x, enc_mrs_fpcr(T1));
-    emit(&x, enc_str_x(T1, 31, 104));
-    emit(&x, enc_mov(CTX, 0));
-    emit(&x, enc_mov(T0, 1));
+        emit(x, enc_stp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
+    emit(x, enc_mrs_fpcr(T1));
+    emit(x, enc_str_x(T1, 31, 104));
+    emit(x, enc_mov(CTX, 0));
+    emit(x, enc_mov(T0, 1));
     /* guest 的 FP 状态在翻译后的代码里一直放在宿主寄存器里（§4.3） */
-    emit(&x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
-    emit(&x, enc_msr_fpcr(T1));
-    emit(&x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));
-    emit(&x, enc_msr_fpsr(T1));
-    emit(&x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, nzcv)));
-    emit(&x, enc_msr_nzcv(T1));
-    emit_add_const(&x, T1, CTX, (int64_t)v0);
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
+    emit(x, enc_msr_fpcr(T1));
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));
+    emit(x, enc_msr_fpsr(T1));
+    emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, nzcv)));
+    emit(x, enc_msr_nzcv(T1));
+    emit_add_const(x, T1, CTX, (int64_t)v0);
     for (unsigned q = 0; q < 32; q += 2)
-        emit(&x, enc_ldp_q(q, q + 1, T1, (int)(16 * q)));
-    emit_add_const(&x, T1, CTX, (int64_t)x0);
-    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++)
-        emit(&x, enc_ldp_x(pairs[i], pairs[i] + 1, T1, (int)(8 * pairs[i])));
-    emit(&x, enc_ldr_x(25, T1, 8 * 25));
-    emit(&x, enc_ldp_x(29, 30, T1, 8 * 29));
-    emit(&x, enc_ldr_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
-    emit(&x, enc_br(T0));
+        emit(x, enc_ldp_q(q, q + 1, T1, (int)(16 * q)));
+    emit_add_const(x, T1, CTX, (int64_t)x0);
+    move_guest_regs(x, T1, false);
+    emit(x, enc_ldr_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
+    emit(x, enc_br(T0));
 
     /* 桩用的两个入口：T1 指向桩里的 adr，pc 在桩末尾的数据字里（emit_link_stub） */
-    d->exit_full = here(&x);
-    emit(&x, enc_ldur_x(T0, T1, 12));
-    uint32_t *join = here(&x);
-    emit(&x, enc_b(0));
-    d->exit_stub = here(&x);
-    emit(&x, enc_ldur_x(T0, T1, 8));
-    emit(&x, enc_ubfx(T2, T0, PACKED_PC_BITS, 64 - PACKED_PC_BITS));
-    emit(&x, enc_and_low(T0, T0, PACKED_PC_BITS));
-    patch_branch(x.wdelta, join, here(&x));
-    emit(&x, enc_sub_imm(T1, T1, 4, 0));
+    d->exit_full = here(x);
+    emit(x, enc_ldur_x(T0, T1, 12));
+    uint32_t *join = here(x);
+    emit(x, enc_b(0));
+    d->exit_stub = here(x);
+    emit(x, enc_ldur_x(T0, T1, 8));
+    emit(x, enc_ubfx(T2, T0, PACKED_PC_BITS, 64 - PACKED_PC_BITS));
+    emit(x, enc_and_low(T0, T0, PACKED_PC_BITS));
+    patch_branch(x->wdelta, join, here(x));
+    emit(x, enc_sub_imm(T1, T1, 4, 0));
     /* 退出：T0 = guest pc，T1 = 回填位置（只有链接桩的有用），T2 = 原因 */
-    d->exit = here(&x);
-    emit(&x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, pc)));
-    emit(&x, enc_str_x(T1, CTX, offsetof(struct appine_cpu, dbt_site)));
-    emit(&x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_reason)));
-    emit(&x, enc_mrs_nzcv(T0));
-    emit(&x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, nzcv)));
-    emit_add_const(&x, T1, CTX, (int64_t)x0);
-    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++)
-        emit(&x, enc_stp_x(pairs[i], pairs[i] + 1, T1, (int)(8 * pairs[i])));
-    emit(&x, enc_str_x(25, T1, 8 * 25));
-    emit(&x, enc_stp_x(29, 30, T1, 8 * 29));
-    emit(&x, enc_str_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
-    emit_add_const(&x, T1, CTX, (int64_t)v0);
+    d->exit = here(x);
+    emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, pc)));
+    emit(x, enc_str_x(T1, CTX, offsetof(struct appine_cpu, dbt_site)));
+    emit(x, enc_str_x(T2, CTX, offsetof(struct appine_cpu, dbt_reason)));
+    emit(x, enc_mrs_nzcv(T0));
+    emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, nzcv)));
+    emit_add_const(x, T1, CTX, (int64_t)x0);
+    move_guest_regs(x, T1, true);
+    emit(x, enc_str_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
+    emit_add_const(x, T1, CTX, (int64_t)v0);
     for (unsigned q = 0; q < 32; q += 2)
-        emit(&x, enc_stp_q(q, q + 1, T1, (int)(16 * q)));
-    emit(&x, enc_mrs_fpsr(T0));
-    emit(&x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, fpsr)));
-    emit(&x, enc_ldr_x(T0, 31, 104));
-    emit(&x, enc_msr_fpcr(T0));
-    emit(&x, enc_mov(0, T2));
+        emit(x, enc_stp_q(q, q + 1, T1, (int)(16 * q)));
+    emit(x, enc_mrs_fpsr(T0));
+    emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, fpsr)));
+    emit(x, enc_ldr_x(T0, 31, 104));
+    emit(x, enc_msr_fpcr(T0));
+    emit(x, enc_mov(0, T2));
     for (unsigned r = 8; r < 16; r += 2)
-        emit(&x, enc_ldp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
-    emit(&x, enc_ldp_x(19, 20, 31, 80));
-    emit(&x, enc_ldp_x(21, 22, 31, 64));
-    emit(&x, enc_ldp_x(23, 24, 31, 48));
-    emit(&x, enc_ldp_x(25, 26, 31, 32));
-    emit(&x, enc_ldp_x(27, 28, 31, 16));
-    emit(&x, enc_ldp_x_post(29, 30, 31, FRAME_BYTES));
-    emit(&x, enc_ret());
+        emit(x, enc_ldp_d(r, r + 1, 31, (int)(112 + 8 * (r - 8))));
+    emit(x, enc_ldp_x(19, 20, 31, 80));
+    emit(x, enc_ldp_x(21, 22, 31, 64));
+    emit(x, enc_ldp_x(23, 24, 31, 48));
+    emit(x, enc_ldp_x(25, 26, 31, 32));
+    emit(x, enc_ldp_x(27, 28, 31, 16));
+    emit(x, enc_ldp_x_post(29, 30, 31, FRAME_BYTES));
+    emit(x, enc_ret());
 
-    d->refill[0] = emit_refill(&x, false);
-    d->refill[1] = emit_refill(&x, true);
-    d->lookup = emit_lookup(&x, d);
+    d->refill[0] = emit_refill(x, false);
+    d->refill[1] = emit_refill(x, true);
+    d->lookup = emit_lookup(x, d);
 
     /* 影子返回栈空项的落点：像间接跳转没命中跳转缓存那样，按 guest x30 查找 */
-    d->rs_miss = here(&x);
-    emit(&x, enc_mov(T0, 30));
-    emit(&x, enc_b((intptr_t)d->lookup - (intptr_t)here(&x)));
+    d->rs_miss = here(x);
+    emit(x, enc_mov(T0, 30));
+    emit(x, enc_b((intptr_t)d->lookup - (intptr_t)here(x)));
 
-    d->routine_words = d->used_words = x.n;
-    sync_range(d, d->cache, d->cache + x.n);
+    d->routine_words = d->used_words = x->n;
+    sync_range(d, d->cache, d->cache + x->n);
 }
 
 /*
@@ -3317,7 +3351,7 @@ static void emit_routines(struct appine_dbt *d)
  * 都重新映射代码缓存和各张表，再在第一次写入每一页时缺页。翻译不多时保留下来，按程序
  * （调用方给的键，内核层用可执行文件的 inode）区分：同一个程序再运行时（shell 脚本里反复
  * exec 的 busybox、go build 的一个个 compile、一次次 `node -e`）拿回它留下的翻译，核对之后
- * 接着用；没有同键的就拿一个空的或者新建，不去清空别的程序留下的。几个进程同时跑同一个
+ * 接着用（寄存器分配也要相同）；没有同键的就拿一个空的或者新建，不去清空别的程序留下的。几个进程同时跑同一个
  * 程序时各占一个实例，池子要放得下它们。池里保留的代码总量有上限，超出时先去掉最久没用的。
  * 清空了的实例把代码缓存用过的部分标成 MADV_FREE，宿主内存紧张时可以直接回收（之后再写入
  * 只是重新缺页）。线程的部分（跳转缓存、影子返回栈）另有一个池子。
@@ -3378,12 +3412,13 @@ static void release(struct appine_dbt *d)
 /* 没有线程挂着的实例自己的统计（从池里取出、放回池里时的清空和核对） */
 static struct appine_dbt_stats spare_stats;
 
-struct appine_dbt *appine_dbt_new(uint64_t key)
+struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
 {
+    const struct regs *r = &reg_sets[regs];
     pthread_mutex_lock(&pool.lock);
     int best = -1;
     for (unsigned i = 0; i < pool.n; i++) {
-        bool same = key && pool.free[i].key == key;
+        bool same = key && pool.free[i].key == key && pool.free[i].d->r == r;
         bool empty = !pool.free[i].key;
         if ((same && (best < 0 || pool.free[best].key != key || pool.free[i].when > pool.free[best].when)) ||
             (empty && best < 0))
@@ -3391,6 +3426,10 @@ struct appine_dbt *appine_dbt_new(uint64_t key)
     }
     struct appine_dbt *d = best >= 0 ? pool_take((unsigned)best) : NULL;
     pthread_mutex_unlock(&pool.lock);
+    if (d && d->r != r) { /* 空的实例：例程按这一组寄存器重新生成 */
+        d->r = r;
+        emit_routines(d);
+    }
     if (d)
         return d;
 
@@ -3415,6 +3454,7 @@ struct appine_dbt *appine_dbt_new(uint64_t key)
         return NULL;
     }
     d->cache_words = CODE_CACHE_BYTES / 4;
+    d->r = r;
     emit_routines(d);
     pthread_mutex_lock(&pool.lock);
     d->next_instance = pool.all;
@@ -3790,7 +3830,7 @@ static uint32_t *revive(struct appine_dbt *d, const struct appine_cpu *c, uint64
     uint32_t *found = NULL, idx[RETIRE_BATCH];
     unsigned n = 0;
     /* 入口检查的第一条对所有块都一样（prepare），不必另外记 */
-    uint32_t check = enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, pending));
+    uint32_t check = enc_ldr_x(d->r->t0, d->r->ctx, offsetof(struct appine_cpu, pending));
     for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
         struct block *b = &d->blocks[i - 1];
         if (!b->parked || b->pc >> APPINE_PAGE_SHIFT != page)
@@ -4155,9 +4195,10 @@ void appine_dbt_get_stats(const struct appine_dbt_thread *t, struct appine_dbt_s
 
 #else /* !DBT_SUPPORTED */
 
-struct appine_dbt *appine_dbt_new(uint64_t key)
+struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
 {
     (void)key;
+    (void)regs;
     return NULL;
 }
 

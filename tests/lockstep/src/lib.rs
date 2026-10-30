@@ -1,8 +1,8 @@
 //! 指令级 lockstep 测试（设计文档 §13.3 第 1 层）：宿主 CPU 就是标准答案。
 //!
 //! 每个随机用例（最多 4 条指令、随机的寄存器和 FP 状态、随机的数据区内容）分别
-//! 在硬件、Tier 0 和 Tier 1 上执行一次，逐项比对 X0–X30、NZCV、V0–V31、FPCR、
-//! FPSR、PC、SP 和数据区。原生执行端只能在 Linux aarch64 宿主上编译，其他宿主上
+//! 在硬件、Tier 0 和 Tier 1（两种寄存器分配各一次，见 `DbtRegs`）上执行一次，逐项比对
+//! X0–X30、NZCV、V0–V31、FPCR、FPSR、PC、SP 和数据区。原生执行端只能在 Linux aarch64 宿主上编译，其他宿主上
 //! [`AVAILABLE`] 为 false。
 
 pub mod classes;
@@ -177,7 +177,7 @@ pub fn run(_config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
 mod runner {
     use std::ptr::NonNull;
 
-    use appine_engine::{Cpu, Dbt, Exit, Mmu, guest_hwcap, prot};
+    use appine_engine::{Cpu, Dbt, DbtRegs, Exit, Mmu, guest_hwcap, prot};
 
     use super::*;
     use crate::classes::{CLASSES, Case, Class, DATA_BYTES, Env, Gen};
@@ -303,7 +303,8 @@ mod runner {
     }
 
     impl Machine {
-        fn new(slot: u64, data_va: u64, tier1: bool) -> Self {
+        /// `tier1` 是 Tier 1 用的寄存器分配，没有时用 Tier 0。
+        fn new(slot: u64, data_va: u64, tier1: Option<DbtRegs>) -> Self {
             let mut code = Box::new(Page([0; 4096]));
             let mut data = Box::new([Page([0; 4096]), Page([0; 4096])]);
             let mut mmu = Mmu::new();
@@ -318,7 +319,8 @@ mod runner {
             }
             // SAFETY: mmu 由 Machine 持有，比 cpu 活得久
             let cpu = unsafe { Cpu::new(&mmu) };
-            let dbt = tier1.then(|| Dbt::new().expect("tier 1 is unavailable on this host"));
+            let dbt =
+                tier1.map(|regs| Dbt::with_regs(regs).expect("tier 1 is unavailable on this host"));
             Machine {
                 dbt,
                 cpu,
@@ -390,7 +392,7 @@ mod runner {
     struct Harness {
         oracle: Oracle,
         page: Vec<u8>,
-        tiers: [(&'static str, Machine); 2],
+        tiers: [(&'static str, Machine); 3],
     }
 
     pub(super) fn run(config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
@@ -402,8 +404,15 @@ mod runner {
             oracle,
             page,
             tiers: [
-                ("tier 0", Machine::new(slot, data_va, false)),
-                ("tier 1", Machine::new(slot, data_va, true)),
+                ("tier 0", Machine::new(slot, data_va, None)),
+                (
+                    "tier 1",
+                    Machine::new(slot, data_va, Some(DbtRegs::Default)),
+                ),
+                (
+                    "tier 1 (Go registers)",
+                    Machine::new(slot, data_va, Some(DbtRegs::Go)),
+                ),
             ],
         };
         let mut reports = Vec::new();
@@ -496,7 +505,7 @@ mod runner {
 
             let mut hw = run_hardware(&mut h.oracle, &case.insns, &before, &data);
             let mut kinds = Vec::new();
-            for t in 0..2 {
+            for t in 0..h.tiers.len() {
                 let name = h.tiers[t].0;
                 let machine = &mut h.tiers[t].1;
                 let (exit, state) = machine.run(&h.page, &case.insns, &before, &data);
@@ -543,9 +552,12 @@ mod runner {
                     Err(reason) => return Err(mismatch(reason, Some(hw.1.clone()), Some(interp))),
                 }
             }
-            if kinds[0] != kinds[1] {
+            if let Some(t) = (1..kinds.len()).find(|&t| kinds[t] != kinds[0]) {
                 return Err(mismatch(
-                    format!("tier 0 and tier 1 disagree: {} vs {}", kinds[0], kinds[1]),
+                    format!(
+                        "{} and {} disagree: {} vs {}",
+                        h.tiers[0].0, h.tiers[t].0, kinds[0], kinds[t]
+                    ),
                     None,
                     None,
                 ));

@@ -27,6 +27,10 @@ done
 docker build --quiet --platform linux/arm64 -t "$image" $proxy_build \
     -f "$root/scripts/dev.Dockerfile" "$root/scripts" >/dev/null
 
+# 测试用的开关带进容器：APPINE_DBT_REGS 让所有程序都用 Tier 1 的某一组寄存器（loader.rs）
+env_run=""
+[ -z "${APPINE_DBT_REGS:-}" ] || env_run="-e APPINE_DBT_REGS"
+
 tty_flags=""
 if [ -t 0 ] && [ -t 1 ]; then
     tty_flags="-it"
@@ -35,7 +39,7 @@ fi
 # --ulimit nice：与 Android 的 init.rc（setrlimit nice 40 40）一样，线程不需要特权就能
 # 把 nice 值调到 -20；appine 把 guest 线程的 nice 值设置到宿主线程上
 # shellcheck disable=SC2086
-exec docker run --rm $tty_flags $proxy_run --platform linux/arm64 \
+exec docker run --rm $tty_flags $proxy_run $env_run --platform linux/arm64 \
     --ulimit nice=40:40 \
     -v "$root:/work" -w /work \
     -v appine-cargo-registry:/usr/local/cargo/registry \

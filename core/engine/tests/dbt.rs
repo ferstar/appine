@@ -5,7 +5,7 @@
 use std::ptr::NonNull;
 
 use appine_engine::{
-    Access, Cpu, Dbt, DbtSource, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, WATCH_LOAD,
+    Access, Cpu, Dbt, DbtRegs, DbtSource, DbtSpace, Exit, FaultKind, Mmu, PAGE_SIZE, WATCH_LOAD,
     WATCH_STORE, prot,
 };
 
@@ -179,7 +179,7 @@ fn pooled_instances_are_checked_before_use() {
 fn pooled_instances_keep_translations_of_the_same_program() {
     // 别的测试不用这个键；池里同一个键的实例只会还给它
     const KEY: u64 = 0x5eed_0001;
-    let Some(space) = DbtSpace::new(KEY) else {
+    let Some(space) = DbtSpace::new(KEY, DbtRegs::Default) else {
         return;
     };
     let mut g = Guest::new();
@@ -188,24 +188,83 @@ fn pooled_instances_keep_translations_of_the_same_program() {
     assert_eq!(g.run(&mut dbt), 7);
     drop((dbt, space));
     // 同一个程序再运行：拿回留下的翻译，核对之后直接用，不再翻译
-    let space = DbtSpace::new(KEY).unwrap();
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
     let mut dbt = Dbt::attach(&space).unwrap();
     assert_eq!(g.run(&mut dbt), 7);
     assert_eq!(dbt.stats().blocks, 0);
     drop((dbt, space));
     // 这期间代码变了：核对时作废，重新翻译
     g.code(CODE, &[movz_x0(8), SVC]);
-    let space = DbtSpace::new(KEY).unwrap();
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
     let mut dbt = Dbt::attach(&space).unwrap();
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
     drop((dbt, space));
     // 宿主内存紧张时丢掉池里保留的翻译：再运行要重新翻译（或者拷贝模板）
     appine_engine::trim_dbt_pool();
-    let space = DbtSpace::new(KEY).unwrap();
+    let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
     let mut dbt = Dbt::attach(&space).unwrap();
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
+}
+
+#[test]
+fn both_register_sets_run_the_same_code() {
+    if Dbt::new().is_none() {
+        return;
+    }
+    let mut g = Guest::new();
+    // x0 = x1 + … + x30，再改两个各组占用的寄存器，经由栈把 x25 复制到 x26
+    let mut code: Vec<u32> = (1..=30).map(|n| 0x8b00_0000 | n << 16).collect(); // add x0, x0, xn
+    code.extend([
+        0x9100_0610, // add x16, x16, #1
+        0x9100_06b5, // add x21, x21, #1
+        0xf81f_0ff9, // str x25, [sp, #-16]!
+        0xf841_07fa, // ldr x26, [sp], #16
+        SVC,
+    ]);
+    g.code(CODE, &code);
+    let sum: u64 = (1..=30).map(|n| n * 0x101).sum();
+    // 两组交替：同一个 pc 的翻译模板按寄存器分配区分，池里空的实例换一组时重新生成例程
+    for regs in [DbtRegs::Default, DbtRegs::Go, DbtRegs::Default, DbtRegs::Go] {
+        let mut dbt = Dbt::with_regs(regs).unwrap();
+        let s = g.cpu.state_mut();
+        s.x[0] = 0;
+        for n in 1..=30 {
+            s.x[n] = n as u64 * 0x101;
+        }
+        assert_eq!(g.run(&mut dbt), sum, "{regs:?}");
+        let s = g.cpu.state();
+        assert_eq!(
+            (s.x[16], s.x[21], s.x[26]),
+            (16 * 0x101 + 1, 21 * 0x101 + 1, 25 * 0x101),
+            "{regs:?}"
+        );
+        assert_eq!(s.sp, STACK);
+    }
+    // Go 的程序常用的 x16、x26–x28 在 Go 的一组里不用改写，x21–x25 要改写
+    let other = CODE + 0x200;
+    g.code(
+        other,
+        &[
+            0x8b10_0000, // add x0, x0, x16
+            0x8b1a_0000, // add x0, x0, x26
+            0x8b1b_0000, // add x0, x0, x27
+            0x8b1c_0000, // add x0, x0, x28
+            0x8b15_0000, // add x0, x0, x21
+            SVC,
+        ],
+    );
+    for (regs, remapped) in [(DbtRegs::Default, 4), (DbtRegs::Go, 1)] {
+        let mut dbt = Dbt::with_regs(regs).unwrap();
+        g.run_at(&mut dbt, other);
+        let st = dbt.stats();
+        assert_eq!(
+            (st.insns_remapped, st.insns_copied),
+            (remapped, 5 - remapped),
+            "{regs:?}"
+        );
+    }
 }
 
 #[test]

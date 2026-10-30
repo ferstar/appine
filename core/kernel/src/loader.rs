@@ -12,9 +12,9 @@ use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use appine_engine::{PAGE_SIZE, VA_BITS, prot};
+use appine_engine::{DbtRegs, PAGE_SIZE, VA_BITS, prot};
 
 use crate::errno::Errno;
 use crate::mm::{Mm, flags};
@@ -24,7 +24,12 @@ const ET_DYN: u16 = 3;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
+const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
+/// Go 的链接器写的 build ID 注记（`.note.go.buildid`）的类型，名字是 "Go"。
+const NT_GO_BUILDID: u32 = 4;
+/// 找 Go 的注记时最多读多少字节的 `PT_NOTE`（Go 的程序里只有一百来字节）。
+const MAX_NOTES: u64 = 4096;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -314,6 +319,8 @@ struct Elf<'a> {
     phdr_vaddr: Option<u64>,
     interp: Option<Vec<u8>>,
     segments: Vec<Segment>,
+    /// Go 编译出来的程序（带 Go 的 build ID 注记）。
+    go: bool,
 }
 
 /// 映射到内存后的 ELF。
@@ -358,6 +365,7 @@ impl<'a> Elf<'a> {
             phdr_vaddr: None,
             interp: None,
             segments: Vec::new(),
+            go: false,
         };
         if phoff.checked_add(phnum * PHDR_SIZE).is_none() {
             return Err(LoadError::Malformed("program header out of range"));
@@ -390,6 +398,11 @@ impl<'a> Elf<'a> {
                         return Err(LoadError::Malformed("bad interpreter path"));
                     }
                     elf.interp = Some(path.to_vec());
+                }
+                // 只是选 Tier 1 的寄存器分配（load_prepared），读不出来就当作不是
+                PT_NOTE if !elf.go && filesz <= MAX_NOTES => {
+                    elf.go =
+                        matches!(exe.read(offset, filesz), Ok(Some(notes)) if has_go_note(&notes));
                 }
                 PT_LOAD => {
                     if filesz > memsz {
@@ -658,6 +671,7 @@ pub fn load_prepared(
         .and_then(|()| mm.write_kernel(vdso_base, vdso))
         .map_err(LoadError::Memory)?;
     mm.vdso = vdso_base;
+    mm.dbt_regs = dbt_regs(exe.go);
 
     mm.set_brk(main.end);
     let mut random = [0u8; 16];
@@ -700,6 +714,37 @@ pub fn load_prepared(
         main: (main.bias + exe.span().0, main.end),
         interp: interp_range,
     })
+}
+
+/// 一段 `PT_NOTE` 里有没有 Go 的 build ID 注记。
+fn has_go_note(mut notes: &[u8]) -> bool {
+    while let (Ok(namesz), Ok(descsz), Ok(kind)) =
+        (u32_at(notes, 0), u32_at(notes, 4), u32_at(notes, 8))
+    {
+        let name = notes.get(12..12 + namesz as usize);
+        if kind == NT_GO_BUILDID && name.is_some_and(|n| n.starts_with(b"Go\0")) {
+            return true;
+        }
+        let end =
+            12 + (namesz as usize).next_multiple_of(4) + (descsz as usize).next_multiple_of(4);
+        let Some(rest) = notes.get(end..) else {
+            return false;
+        };
+        notes = rest;
+    }
+    false
+}
+
+/// Tier 1 给程序用哪一组寄存器：Go 的程序另用一组（[`DbtRegs::Go`]）。环境变量
+/// `APPINE_DBT_REGS`（`go` 或 `default`）让所有程序都用同一组，测试另一组用。
+fn dbt_regs(go: bool) -> DbtRegs {
+    static FORCED: OnceLock<Option<DbtRegs>> = OnceLock::new();
+    let forced = *FORCED.get_or_init(|| match std::env::var("APPINE_DBT_REGS").as_deref() {
+        Ok("go") => Some(DbtRegs::Go),
+        Ok("default") => Some(DbtRegs::Default),
+        _ => None,
+    });
+    forced.unwrap_or(if go { DbtRegs::Go } else { DbtRegs::Default })
 }
 
 /// 初始栈的布局。
@@ -868,18 +913,22 @@ mod tests {
     }
 
     /// 在 `tiny_elf` 后面追加一个 PT_INTERP 程序头和路径。
-    fn with_interp(mut f: Vec<u8>, path: &[u8]) -> Vec<u8> {
+    fn with_interp(f: Vec<u8>, path: &[u8]) -> Vec<u8> {
+        with_segment(f, PT_INTERP, &[path, &[0]].concat())
+    }
+
+    /// 在 `tiny_elf` 后面追加一个 `p_type` 类型的程序头，内容是 `data`。
+    fn with_segment(mut f: Vec<u8>, p_type: u32, data: &[u8]) -> Vec<u8> {
         let code = f.split_off(0x78);
         f.truncate(64 + 56);
         f[56..58].copy_from_slice(&2u16.to_le_bytes());
-        let path_at = 64 + 2 * 56;
+        let data_at = 64 + 2 * 56;
         let mut ph = vec![0u8; 56];
-        ph[..4].copy_from_slice(&PT_INTERP.to_le_bytes());
-        ph[8..16].copy_from_slice(&(path_at as u64).to_le_bytes());
-        ph[32..40].copy_from_slice(&(path.len() as u64 + 1).to_le_bytes());
+        ph[..4].copy_from_slice(&p_type.to_le_bytes());
+        ph[8..16].copy_from_slice(&(data_at as u64).to_le_bytes());
+        ph[32..40].copy_from_slice(&(data.len() as u64).to_le_bytes());
         f.extend_from_slice(&ph);
-        f.extend_from_slice(path);
-        f.push(0);
+        f.extend_from_slice(data);
         f.resize(f.len().next_multiple_of(4), 0);
         let code_at = f.len() as u64;
         f[24..32].copy_from_slice(&(0x400000 + code_at).to_le_bytes());
@@ -921,6 +970,48 @@ mod tests {
             out.insert(k, v);
             p += 16;
         }
+    }
+
+    #[test]
+    fn go_programs_get_their_own_tier1_registers() {
+        let note = |name: &[u8], kind: u32, desc: &[u8]| {
+            let mut n = Vec::new();
+            for word in [name.len() as u32, desc.len() as u32, kind] {
+                n.extend_from_slice(&word.to_le_bytes());
+            }
+            n.extend_from_slice(name);
+            n.resize(n.len().next_multiple_of(4), 0);
+            n.extend_from_slice(desc);
+            n.resize(n.len().next_multiple_of(4), 0);
+            n
+        };
+        let regs = |notes: &[u8]| {
+            let mut mm = Mm::new();
+            let elf = with_segment(
+                tiny_elf(ET_EXEC, &0xd503201fu32.to_le_bytes()),
+                PT_NOTE,
+                notes,
+            );
+            let args = Args {
+                argv: &[b"prog".to_vec()],
+                envp: &[],
+                execfn: b"/bin/prog",
+                ids: [0; 4],
+                secure: false,
+                stack_limit: STACK_SIZE,
+            };
+            load(&mut mm, &exe(&elf), &args, &mut no_interp).unwrap();
+            mm.dbt_regs
+        };
+        // 外部链接的 Go 程序（Alpine 的 go）先有 GNU 的 build ID，再有 Go 的
+        let gnu = note(b"GNU\0", 3, &[0xab; 20]);
+        let go = note(b"Go\0\0", NT_GO_BUILDID, b"abc/def");
+        assert_eq!(regs(&[&gnu[..], &go].concat()), DbtRegs::Go);
+        assert_eq!(regs(&go), DbtRegs::Go);
+        assert_eq!(regs(&gnu), DbtRegs::Default);
+        // 类型不对、名字被截断都不算
+        assert_eq!(regs(&note(b"Go\0\0", 1, b"x")), DbtRegs::Default);
+        assert_eq!(regs(&go[..14]), DbtRegs::Default);
     }
 
     #[test]
