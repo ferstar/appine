@@ -126,6 +126,7 @@
 | [M9 之前：有 JIT 代码的进程也共用翻译](rounds/115-shared-with-jit.md) | 2026-10-30 | 组里的成员映射 JIT 等不可信的可执行内存时不再离开组：每个成员一个标签，登记过的文件映射里的块共用，别处的块按 pc 和标签私有，一次探测比两个键，共用块不链接到私有块；node 的翻译 89–99% 在程序文件里，4 个空闲的 node 的代码缓存 70 → 21 MB、App 用量 190 → 119 MB，计时不变 |
 | [M9 之前：仓库里的目录 bind](rounds/116-store-binds.md) | 2026-10-30 | 为了让 bubblewrap（Codex、Claude Code 的沙箱）能用拆成几轮，这是第一轮：仓库节点带上挂载，仓库里的目录、文件可以 bind（`--rbind` 带上挂在里面的），只读、noexec、nosuid、nodev、nosymfollow 对仓库按经由的挂载生效（顺序照 Linux，`mkdir -p` 碰到已有的目录照常），跨挂载的 rename、link 是 EXDEV，`MS_MOVE`、pivot_root；卸下的挂载留着记录，`..` 不出挂载 |
 | [M9 之前：tmpfs](rounds/117-tmpfs.md) | 2026-10-30 | 让 bubblewrap 能用的第二轮：tmpfs 是仓库里不挂在根目录下面的一棵树（上级是自己的目录，记在 `detached_roots` 里），每次挂上是新实例、有自己的设备号，挂载和 bind 都没了时连同里面的一起删掉、开机删上次留下的；选项和 mountinfo 照 Linux 6.1 的 shmem；差分测试里照 bubblewrap 的步骤换根（tmpfs 做底、两次 pivot_root、只读 bind、`--dev`、`--proc`）与原生相同 |
+| [M9 之前：挂载命名空间](rounds/118-mount-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第三轮：`clone`、`unshare` 的 `CLONE_NEWNS` 复制整棵挂载树（挂载命名空间放在 `FsContext` 里，挂载记着所属的命名空间，没人用了就卸下），mountinfo 和 mount、umount、pivot_root 只看自己的命名空间；`/proc/<pid>/ns/*` 和 nsfs 文件、setns(2)；`/proc/<pid>/root`、`cwd` 改成魔法链接 |
 
 ## 测量条件
 

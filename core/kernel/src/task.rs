@@ -36,12 +36,15 @@ pub(crate) struct TaskSync {
     pub kicker: Kicker,
 }
 
-/// 根目录、当前目录和文件创建掩码（`CLONE_FS` 共享的部分）。
+/// 根目录、当前目录和文件创建掩码（`CLONE_FS` 共享的部分），以及挂载命名空间。Linux 的
+/// 挂载命名空间在 nsproxy 里，但 `CLONE_NEWNS` 不能和 `CLONE_FS` 同用、setns 要求 fs 没有
+/// 共用，共用一个 fs 的任务总在同一个挂载命名空间里，放在一起是一样的。
 pub(crate) struct FsContext {
     /// 根目录（chroot）。
     pub root: Node,
     pub cwd: Node,
     pub umask: u32,
+    pub mnt_ns: Rc<crate::vfs::MntNs>,
 }
 
 /// 线程用着的地址空间、fd 表和当前目录。它们本来在 [`TaskState`] 里，这里是一份
@@ -802,6 +805,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     let mut k = shared.lock();
     let (tid, tgid) = (task.tid.get(), task.tgid);
     let group = task.state.borrow().group.clone();
+    let vfs = task.state.borrow().vfs.clone();
     task.begin_exit(&k, &group, task.exit_status.get());
     let released = crate::bug::catch(|| {
         crate::bug::trap(Trap::Exit, tid);
@@ -862,6 +866,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         && crate::bug::catch(|| crate::unix::collect(&mut k)).is_none()
     {
         failed(&k, "collecting unix sockets");
+    }
+    // 最后一个用某个挂载命名空间的线程退出了：卸下它的挂载（里面的 tmpfs 随之删掉）
+    if let Some(vfs) = &vfs
+        && crate::bug::catch(|| crate::syscall::collect_namespaces(&k, vfs)).is_none()
+    {
+        failed(&k, "collecting mount namespaces");
     }
     // 子进程的状态变化由 finish_group 另外请求（wake::CHILD），vfork 的父进程由
     // release_mm 叫醒，关闭文件的各自请求；这里只叫醒等线程结束的（execve、关闭）

@@ -36,7 +36,8 @@ const CLONE_CHILD_SETTID: u64 = 0x1000000;
 const CLONE_SYSVSEM: u64 = 0x40000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
-/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：不支持 namespace（设计文档 §6）。
+/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：只支持挂载命名空间
+/// （`syscall::ns`），别的是 EPERM（设计文档 §6）。
 const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
 /// clone3：子进程的信号处理函数恢复默认。
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
@@ -206,7 +207,10 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     {
         return Err(Errno::EINVAL);
     }
-    if flags & CLONE_NEW_MASK != 0 {
+    if flags & CLONE_NEW_MASK & !CLONE_NEWNS != 0 {
+        return Err(Errno::EPERM);
+    }
+    if flags & CLONE_NEWNS != 0 && !cx.cred().capable(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let thread = flags & CLONE_THREAD != 0;
@@ -245,11 +249,16 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         cx.t.fs.clone()
     } else {
         let f = cx.t.fs.borrow();
-        Rc::new(RefCell::new(FsContext {
+        let mut copy = FsContext {
             root: f.root.clone(),
             cwd: f.cwd.clone(),
             umask: f.umask,
-        }))
+            mnt_ns: f.mnt_ns.clone(),
+        };
+        if flags & CLONE_NEWNS != 0 {
+            super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut copy);
+        }
+        Rc::new(RefCell::new(copy))
     };
     let group = if thread {
         cx.t.group.clone()
@@ -1242,9 +1251,9 @@ pub(super) fn kcmp(
     })
 }
 
-/// unshare：不再和别的线程、进程共用某些资源。命名空间不支持，与 clone 一样返回
-/// EPERM。与 Linux 一样，`CLONE_THREAD`、`CLONE_SIGHAND`、`CLONE_VM` 只在本来就没有
-/// 共用时成功（什么也不用做）。
+/// unshare：不再和别的线程、进程共用某些资源。命名空间只支持挂载命名空间，别的与 clone
+/// 一样返回 EPERM。与 Linux 一样，`CLONE_THREAD`、`CLONE_SIGHAND`、`CLONE_VM` 只在本来就
+/// 没有共用时成功（什么也不用做）。
 pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     let known = CLONE_THREAD
         | CLONE_FS
@@ -1278,7 +1287,10 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if shared {
         return Err(Errno::EINVAL);
     }
-    if flags & CLONE_NEW_MASK != 0 {
+    if flags & CLONE_NEW_MASK & !CLONE_NEWNS != 0 {
+        return Err(Errno::EPERM);
+    }
+    if flags & CLONE_NEWNS != 0 && !cx.cred().capable(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     // 每个线程的 TaskState 和 TaskRes 各持有一份引用
@@ -1299,9 +1311,14 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
                 root: f.root.clone(),
                 cwd: f.cwd.clone(),
                 umask: f.umask,
+                mnt_ns: f.mnt_ns.clone(),
             }
         };
         cx.set_fs(Rc::new(RefCell::new(copy)));
+    }
+    if flags & CLONE_NEWNS != 0 {
+        super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut cx.t.fs.borrow_mut());
+        cx.shared.fast_changed();
     }
     // 与 Linux 的 exit_sem 一样，执行并丢掉 SysV 信号量的 undo
     if flags & CLONE_SYSVSEM != 0 {

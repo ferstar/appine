@@ -231,6 +231,14 @@ impl Machine {
                 root: Node::ROOT,
                 cwd: Node::ROOT,
                 umask: 0o022,
+                mnt_ns: vfs.as_ref().map_or_else(
+                    || {
+                        Rc::new(crate::vfs::MntNs {
+                            id: crate::vfs::INIT_MNT_NS,
+                        })
+                    },
+                    |v| v.init_ns(),
+                ),
             })),
             group: group.clone(),
             vfs,

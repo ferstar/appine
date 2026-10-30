@@ -95,9 +95,97 @@ pub(crate) enum Entry {
     CoredumpFilter,
     /// 所在的 cgroup（[`crate::cgroup`]）。
     Cgroup,
+    /// 命名空间的目录（[`NsKind`]）。
+    Ns,
 }
 
-const ENTRIES: [(&[u8], Entry); 25] = [
+/// 命名空间的种类（`/proc/<pid>/ns` 里的项）。只有挂载命名空间可以新建，别的都是开机时的
+/// 那个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum NsKind {
+    Cgroup,
+    Ipc,
+    Mnt,
+    Net,
+    Pid,
+    PidForChildren,
+    Time,
+    TimeForChildren,
+    User,
+    Uts,
+}
+
+impl NsKind {
+    /// 按名字排好的（`/proc/<pid>/ns` 的列表）。
+    pub(crate) const ALL: [NsKind; 10] = [
+        NsKind::Cgroup,
+        NsKind::Ipc,
+        NsKind::Mnt,
+        NsKind::Net,
+        NsKind::Pid,
+        NsKind::PidForChildren,
+        NsKind::Time,
+        NsKind::TimeForChildren,
+        NsKind::User,
+        NsKind::Uts,
+    ];
+
+    /// `/proc/<pid>/ns` 里的名字。
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            NsKind::Cgroup => "cgroup",
+            NsKind::Ipc => "ipc",
+            NsKind::Mnt => "mnt",
+            NsKind::Net => "net",
+            NsKind::Pid => "pid",
+            NsKind::PidForChildren => "pid_for_children",
+            NsKind::Time => "time",
+            NsKind::TimeForChildren => "time_for_children",
+            NsKind::User => "user",
+            NsKind::Uts => "uts",
+        }
+    }
+
+    /// 链接内容里的类型（`*_for_children` 与对应的相同）。
+    pub(crate) const fn type_name(self) -> &'static str {
+        match self {
+            NsKind::PidForChildren => "pid",
+            NsKind::TimeForChildren => "time",
+            k => k.name(),
+        }
+    }
+
+    /// setns 的 `nstype`（`CLONE_NEW*`）。
+    pub(crate) const fn clone_flag(self) -> u64 {
+        match self {
+            NsKind::Cgroup => 0x0200_0000,
+            NsKind::Ipc => 0x0800_0000,
+            NsKind::Mnt => 0x0002_0000,
+            NsKind::Net => 0x4000_0000,
+            NsKind::Pid | NsKind::PidForChildren => 0x2000_0000,
+            NsKind::Time | NsKind::TimeForChildren => 0x80,
+            NsKind::User => 0x1000_0000,
+            NsKind::Uts => 0x0400_0000,
+        }
+    }
+
+    /// 线程 `task` 的这种命名空间的编号（inode 号）：挂载命名空间的按它的 `FsContext`，
+    /// 别的是开机时的那个（与 Linux 常见的编号相同）。
+    pub(crate) fn id_of(self, task: &Task) -> u64 {
+        match self {
+            NsKind::Mnt => task.res.borrow().fs.borrow().mnt_ns.id,
+            NsKind::Cgroup => 4_026_531_835,
+            NsKind::Ipc => 4_026_531_839,
+            NsKind::Net => 4_026_531_840,
+            NsKind::Pid | NsKind::PidForChildren => 4_026_531_836,
+            NsKind::Time | NsKind::TimeForChildren => 4_026_531_834,
+            NsKind::User => 4_026_531_837,
+            NsKind::Uts => 4_026_531_838,
+        }
+    }
+}
+
+const ENTRIES: [(&[u8], Entry); 26] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -123,6 +211,7 @@ const ENTRIES: [(&[u8], Entry); 25] = [
     (b"oom_score_adj", Entry::OomScoreAdj),
     (b"coredump_filter", Entry::CoredumpFilter),
     (b"cgroup", Entry::Cgroup),
+    (b"ns", Entry::Ns),
 ];
 
 /// `/proc/<pid>/net` 下的文件。与 Linux 一样，`/proc/net` 是指向 `self/net` 的链接。
@@ -452,11 +541,15 @@ pub(crate) enum PseudoNode {
     SysNet(u32, &'static [u8]),
     /// `/sys/fs/cgroup`（名字为空），或者它下面的文件（名字取值来自 [`crate::cgroup::FILES`]）。
     Cgroup(&'static [u8]),
+    /// `/proc/<pid>/ns/<种类>`（含 task 子目录里的）：指向命名空间的魔法链接。
+    Ns(Tid, Option<Tid>, NsKind),
+    /// `/proc/<pid>/ns/<种类>` 跟随之后得到的命名空间（Linux 的 nsfs 里的文件），按编号。
+    NsFile(NsKind, u64),
 }
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
-const TASK_ENTRIES: [Entry; 19] = [
+const TASK_ENTRIES: [Entry; 20] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -476,6 +569,7 @@ const TASK_ENTRIES: [Entry; 19] = [
     Entry::Root,
     Entry::Cgroup,
     Entry::Net,
+    Entry::Ns,
 ];
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
@@ -544,6 +638,8 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
 /// 一样，pid 被新进程重新使用之后 inode 不同。
 pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
     let pid = match node {
+        // 命名空间的 inode 号就是它的编号
+        PseudoNode::NsFile(_, id) => return *id,
         PseudoNode::Pid(pid, _)
         | PseudoNode::Entry(pid, ..)
         | PseudoNode::Net(pid, ..)
@@ -636,6 +732,8 @@ impl Pseudo for View<'_> {
             Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
             Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
             FdInfo(pid, _) => Entry(*pid, None, self::Entry::FdInfo),
+            Ns(pid, tid, _) => Entry(*pid, *tid, self::Entry::Ns),
+            NsFile(..) => return None,
         })
     }
 
@@ -664,6 +762,8 @@ impl Pseudo for View<'_> {
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
             Net(_, _, name) => name.to_vec(),
             Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
+            Ns(_, _, k) => k.name().as_bytes().to_vec(),
+            NsFile(k, id) => format!("{}:[{id}]", k.type_name()).into_bytes(),
         }
     }
 
@@ -744,6 +844,11 @@ impl Pseudo for View<'_> {
                 .find(|n| **n == name)
                 .filter(|_| self.pid_exists(*pid, *tid))
                 .map(|n| Net(*pid, *tid, n)),
+            Entry(pid, tid, self::Entry::Ns) => NsKind::ALL
+                .into_iter()
+                .find(|k| k.name().as_bytes() == name)
+                .filter(|_| self.pid_exists(*pid, *tid))
+                .map(|k| Ns(*pid, *tid, k)),
             _ => return Err(Errno::ENOTDIR),
         };
         found.ok_or(Errno::ENOENT)
@@ -759,10 +864,14 @@ impl Pseudo for View<'_> {
             Entry(
                 _,
                 _,
-                self::Entry::Fd | self::Entry::FdInfo | self::Entry::Task | self::Entry::Net,
+                self::Entry::Fd
+                | self::Entry::FdInfo
+                | self::Entry::Task
+                | self::Entry::Net
+                | self::Entry::Ns,
             ) => mode::S_IFDIR,
             Pts(_) | PtsPtmx => mode::S_IFCHR,
-            SelfLink | ThreadSelf | Fd(..) => mode::S_IFLNK,
+            SelfLink | ThreadSelf | Fd(..) | Ns(..) => mode::S_IFLNK,
             Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
             OpenFd(pid, fd) => {
@@ -816,11 +925,33 @@ impl Pseudo for View<'_> {
                     _ => name,
                 })
             }
+            Ns(pid, tid, k) => {
+                let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
+                Ok(self.name(&NsFile(*k, k.id_of(&task))))
+            }
             _ => Err(Errno::EINVAL),
         }
     }
 
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
+        match node {
+            PseudoNode::Ns(pid, tid, k) => {
+                let task = self.task(*pid, *tid)?;
+                return Some(Node::Pseudo(mnt, PseudoNode::NsFile(*k, k.id_of(&task))));
+            }
+            // 根目录、当前目录直接指到那个进程的节点（Linux 的 proc_root_link、
+            // proc_cwd_link）：经由它们能进到别的挂载命名空间、chroot 的外面
+            PseudoNode::Entry(pid, tid, e @ (Entry::Root | Entry::Cwd)) => {
+                let task = self.task(*pid, *tid)?;
+                let res = task.res.borrow();
+                let fs = res.fs.borrow();
+                return Some(match e {
+                    Entry::Root => fs.root.clone(),
+                    _ => fs.cwd.clone(),
+                });
+            }
+            _ => {}
+        }
         let PseudoNode::Fd(pid, fd) = node else {
             return None;
         };
@@ -1218,6 +1349,9 @@ pub(crate) fn readdir(ps: &View<'_>, dir: &PseudoNode) -> Result<Vec<DirEntry>, 
         }
         Entry(pid, tid, self::Entry::Net) => {
             nodes.extend(PROC_NET.iter().map(|n| Net(*pid, *tid, n)));
+        }
+        Entry(pid, tid, self::Entry::Ns) => {
+            nodes.extend(NsKind::ALL.iter().map(|k| Ns(*pid, *tid, *k)));
         }
         Pid(pid, tid) => nodes.extend(
             ENTRIES
@@ -1827,16 +1961,16 @@ pub(crate) fn write_mem(
 }
 
 /// `/proc/<pid>/mounts`（`info` 为 false）或 `mountinfo`：与 Linux 的 `show_vfsmnt`、
-/// `show_mountinfo` 一样按挂上的先后，挂载点相对那个进程的根目录 `root`，根目录以外的不列
-/// （chroot 进去之后看不到外面的挂载，包括根文件系统）。挂载编号与 fdinfo 的 `mnt_id`、
-/// 设备号与 stat 的 `st_dev` 一致。
-fn mounts(ps: &View<'_>, root: &Node, info: bool) -> Vec<u8> {
+/// `show_mountinfo` 一样列出那个进程的挂载命名空间 `ns` 里的挂载，按挂上的先后，挂载点相对
+/// 它的根目录 `root`，根目录以外的不列（chroot 进去之后看不到外面的挂载，包括根文件系统）。
+/// 挂载编号与 fdinfo 的 `mnt_id`、设备号与 stat 的 `st_dev` 一致。
+fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
     let visible = |node: &Node| match ps.vfs.reach(ps, root, node) {
         Ok((path, true)) => Some(path),
         _ => None,
     };
     let mut out = Vec::new();
-    for m in ps.vfs.mounts() {
+    for m in ps.vfs.mounts_in(ns) {
         let Some(point) = visible(&m.root) else {
             continue;
         };
@@ -2292,8 +2426,12 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                     return Ok(auxv.iter().flat_map(|w| w.to_le_bytes()).collect());
                 }
                 self::Entry::Mounts | self::Entry::MountInfo => {
-                    let root = task.map_or(Node::ROOT, |t| t.res.borrow().fs.borrow().root.clone());
-                    return Ok(mounts(ps, &root, *e == self::Entry::MountInfo));
+                    let (root, ns) = task.map_or((Node::ROOT, crate::vfs::INIT_MNT_NS), |t| {
+                        let res = t.res.borrow();
+                        let fs = res.fs.borrow();
+                        (fs.root.clone(), fs.mnt_ns.id)
+                    });
+                    return Ok(mounts(ps, &root, ns, *e == self::Entry::MountInfo));
                 }
                 self::Entry::OomScoreAdj => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
@@ -2317,6 +2455,8 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
         SysNet(n, path) => net_file(ps.k, *n, path)?,
         Cgroup(name) => crate::cgroup::file(ps.k, name).ok_or(Errno::EISDIR)?,
+        // 打开命名空间只为 setns，读不出东西
+        NsFile(..) => String::new(),
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())

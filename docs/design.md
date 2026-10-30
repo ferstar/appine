@@ -397,7 +397,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - **PID 1**：内核层内置一个虚拟的 init。它不对应任何 guest 程序，只负责收养孤儿进程、回收僵尸进程。每个终端标签页的登录 shell 都是它的子进程。v1 不运行 OpenRC。
 - **调度参数**：nice 值按线程设置到宿主线程上（guest 提高优先级时宿主线程最低到 -4，不超过 Android 上与显示有关的线程）；`sched_setaffinity` 设置宿主线程的亲和性；实时调度策略只记录，由宿主按普通线程调度。
 - **线程数的上限**：`/proc/sys/kernel/threads-max` 对 root 也有效，默认按物理内存每 MB 一个，并且不超过宿主 fd 上限的一半：每个 guest 线程是一个宿主线程，还占一个 eventfd。`RLIMIT_NPROC` 默认是它的一半，与 Linux 一样按真实用户 ID 数线程，root 和有 `CAP_SYS_RESOURCE`、`CAP_SYS_ADMIN` 的不受它限制。两者超出时 fork 和建线程返回 `EAGAIN`，fork 炸弹因此停在上限，不会把宿主的线程和 fd 用完。
-- **namespace**：不支持。`clone(CLONE_NEW*)` 和 `unshare` 的命名空间标志返回 `EPERM`（`unshare` 的 `CLONE_FILES`、`CLONE_FS`、`CLONE_SYSVSEM` 是支持的），`setns` 返回 `ENOSYS`。与没有特权的 docker 容器里一样，靠用户命名空间的 bubblewrap 建不了沙箱，Claude Code、Codex 的沙箱因此用不了（[AI 编程 CLI](rounds/103-ai-cli-survey.md)）。
+- **namespace**：为了 bubblewrap（Claude Code、Codex 的沙箱，[AI 编程 CLI](rounds/103-ai-cli-survey.md)）一种种补上，现在有挂载命名空间（`core/kernel/src/syscall/ns.rs`，[挂载命名空间](rounds/118-mount-namespaces.md)）：`clone`、`unshare` 的 `CLONE_NEWNS` 要 `CAP_SYS_ADMIN`，复制原来的整棵挂载树（新的挂载编号），根目录、当前目录换到复制出来的挂载上；挂载命名空间放在 `FsContext` 里（`CLONE_NEWNS` 不能和 `CLONE_FS` 同用、setns 要求 fs 没有共用，共用一个 fs 的任务总在同一个挂载命名空间里）。最后一个用它的线程退出之后卸下它的挂载。`/proc/<pid>/ns/` 下是十种命名空间的魔法链接（`mnt:[4026531841]` 这样），跟随之后是 nsfs 里的文件（设备号 0:4，inode 号是命名空间的编号，读是 EINVAL）；setns 可以换挂载命名空间（根目录、当前目录换成那边的根），别的种类只有开机时的那个，setns 到它们什么也不做。别的 `CLONE_NEW*` 仍是 `EPERM`（`unshare` 的 `CLONE_FILES`、`CLONE_FS`、`CLONE_SYSVSEM` 是支持的）。
 
 ---
 
@@ -524,7 +524,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - `/proc/<pid>/mounts`、`mountinfo` 按挂上的先后列出，挂载点相对那个进程的根目录，根目录以外的不列（chroot 进去之后看不到根文件系统），第四列是 bind 的目录、文件在文件系统里的路径，路径里的空格等按 Linux 的 `mangle` 转义。挂载编号不重复使用。仓库的 bind 挂载与源共用设备号（8:1）。新挂的 procfs 与 Linux 5.8 起一样是新的实例，有自己的设备号，可以叠在同一处；sysfs、cgroup2 只有一个实例，同一个挂载的根上再挂是 EBUSY；devpts 在 Linux 上每次是新的实例（有自己的一套终端），这里各个挂载看到的是同一套终端，设备号也相同（ttyname 拿 `/dev/pts/<n>` 的 `st_dev` 比对从设备的）。cgroup2 只能只读地挂，rw 时 EROFS（mount 命令会改成只读再试）。
 - 挂载的标志（ro、nosuid、nodev、noexec、nosymfollow、访问时间）记在挂载上，按经由的挂载算，顺序与 Linux 6.1 相同：只读的挂载里新建、删除、改名、改属性和扩展属性、写方式打开普通文件、截断都是 EROFS（新建已经存在的名字先报 EEXIST，设备节点、FIFO 照常能写）；noexec 的挂载里的文件不能执行（EACCES）、不能映射成可执行的（EPERM，之后 mprotect 成可执行是 EACCES，smaps 没有 `me`）；nosuid 的挂载里 setuid、setgid 位和文件能力不起作用；nodev 的挂载里打不开设备节点和终端；nosymfollow 的挂载里的符号链接不跟随（ELOOP）；statfs 的 `f_flags` 按它报告。跨挂载的 rename、link 是 EXDEV（同一个文件系统 bind 到两处也是）。bind 挂载的标志与源所在的挂载相同。重新挂载只改这一个挂载（Linux 不带 bind 时还改共用的超级块）。`MS_MOVE` 连同挂在里面的一起挪。pivot_root 把 `new_root` 的挂载换到根目录所在的挂载的位置，原来的根挂到 `put_old` 上，根目录、当前目录是原来的根的进程都换过去，各种检查与 Linux 6.1 相同。传播类型可以设置，但不模拟，都相当于 private。卸下（含 `MNT_DETACH`、`MNT_EXPIRE`）、挂载在用时的 EBUSY，删除、改名挂载点的 EBUSY 与 Linux 6.1 相同；`/proc/<pid>/fd`、`fdinfo` 里的项不能当挂载点（ENOENT），与 6.12 起相同（LTP 的 mount08）。
 - tmpfs（[tmpfs](rounds/117-tmpfs.md)）是仓库里不挂在根目录下面的一棵树：挂上时新建一个上级是它自己的目录（记在仓库的 `detached_roots` 表里），文件照常是宿主上的 object，不占 App 的内存；所有挂载、bind 挂载都没了（卸下了的也没有进程在用）时连同里面的一起删掉，App 被杀掉留下的在下次开机时删。每次挂上是新的实例，有自己的设备号，statfs 报告 `TMPFS_MAGIC`；`mode=`、`uid=`、`gid=`、`size=`（可以是物理内存的百分比）、`nr_blocks=`、`nr_inodes=`、`inode32`/`inode64`、`huge=`、`mpol=` 和通用的超级块标志按 Linux 6.1 的 `shmem_parse_one` 解析，不认识的是 EINVAL，mountinfo 的超级块选项照 `shmem_show_options` 写；大小不限制，statfs 的总量是 `size=` 或物理内存的一半，用量不记。
-- 没有做的：别的文件系统是 ENODEV（与没有编进内核的一样），新的挂载接口（fsopen、open_tree 等）仍是 ENOSYS（util-linux 的 mount 退回 mount(2)）。没有挂载命名空间（§6），所有进程看到同一张挂载表。
+- 没有做的：别的文件系统是 ENODEV（与没有编进内核的一样），新的挂载接口（fsopen、open_tree 等）仍是 ENOSYS（util-linux 的 mount 退回 mount(2)）。
+- 挂载命名空间（§6）：挂载记录全局按编号存，每个记着所属的命名空间；mountinfo 只列那个进程的命名空间里的，mount、umount、pivot_root 只能动自己的命名空间里的挂载（Linux 的 `check_mnt`，别的是 EINVAL）。`/proc/<pid>/root`、`cwd` 是直接指到那个进程的根目录、当前目录的魔法链接，经由它们能进到别的挂载命名空间、chroot 的外面。
 
 ### 8.3 inotify
 

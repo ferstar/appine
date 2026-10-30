@@ -16,6 +16,7 @@ mod misc;
 mod mount;
 mod mqueue;
 mod net;
+mod ns;
 mod poll;
 mod posix_timer;
 mod proc;
@@ -32,6 +33,7 @@ pub(crate) use fs::ENTROPY;
 pub(crate) use fs::{create_exclusive, unlink_path, write_at};
 pub(crate) use inotify::{Inotify, Opened, Registry};
 pub(crate) use lease::Lease;
+pub(crate) use mount::collect_namespaces;
 pub(crate) use mqueue::{Limits as MqLimits, MessageQueue};
 pub(crate) use net::SocketRef;
 pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
@@ -218,6 +220,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         39 => mount::umount2(cx, a[0], a[1] as u32),
         40 => mount::mount(cx, a[0], a[1], a[2], a[3], a[4]),
         41 => mount::pivot_root(cx, a[0], a[1]),
+        268 => ns::setns(cx, a[0] as i32, a[1] as i32),
         43 => fs::statfs(cx, a[0], a[1]),
         44 => fs::fstatfs(cx, a[0] as i32, a[1]),
         45 => fs::truncate(cx, a[0], a[1] as i64),

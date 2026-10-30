@@ -103,6 +103,9 @@ const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
+const NSFS_MAGIC: u64 = 0x6e73_6673;
+/// nsfs 的设备号（`/proc/<pid>/ns/*` 跟随之后的 `st_dev`）。
+const NSFS_DEV: u64 = 0x4;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
@@ -406,6 +409,10 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     let view = cx.view(&vfs);
     match node {
         Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
+        // 命名空间在 nsfs 里
+        Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
+            Ok(encode_stat(&pseudo::stat(&view, p)?, NSFS_DEV))
+        }
         // 魔法链接指向的打开文件：报告那个文件本身
         Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
             let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
@@ -602,6 +609,10 @@ fn open_path(
     };
 
     let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
+    // 命名空间在 `/proc/<pid>/fd/<n>` 里是 `mnt:[编号]` 这样
+    if let Node::Pseudo(_, p @ PseudoNode::NsFile(..)) = &node {
+        display = Some(Rc::from(cx.view(&vfs).name(p)));
+    }
     let was_created = created.is_some();
     let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
     // 仓库里的文件记下经由的挂载（[`OpenFile::mnt`]）
@@ -1987,6 +1998,7 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
             encode_statfs(TMPFS_MAGIC, &s, flags)
         }
         Node::Store(..) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
+        Node::Pseudo(_, PseudoNode::NsFile(..)) => encode_statfs(NSFS_MAGIC, &empty, 0),
         Node::Pseudo(_, p) => {
             let magic = match pseudo::fs_of(p) {
                 Fs::Store => EXT4_SUPER_MAGIC,
@@ -3515,6 +3527,11 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
                 buf.len()
             }
         },
+        // 命名空间（nsfs）读不了
+        FileKind::Proc {
+            node: PseudoNode::NsFile(..),
+            ..
+        } => return Err(Errno::EINVAL),
         FileKind::Proc { data, .. } => {
             let start = (pos as usize).min(data.len());
             let n = buf.len().min(data.len() - start);

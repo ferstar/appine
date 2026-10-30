@@ -716,6 +716,11 @@ impl<'a> Cx<'a> {
         self.t.fs.borrow().root.clone()
     }
 
+    /// 挂载命名空间的编号。
+    pub fn mnt_ns(&self) -> u64 {
+        self.t.fs.borrow().mnt_ns.id
+    }
+
     /// 换掉地址空间（execve），同时更新 procfs 能看到的那份。
     pub fn set_mm(&mut self, mm: Rc<RefCell<Mm>>) {
         self.task.res.borrow_mut().mm = mm.clone();

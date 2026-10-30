@@ -4,7 +4,9 @@
 //! 系统里的目录、文件都可以 bind 挂载（`MS_REC` 带上挂在里面的挂载），挂载的标志、重新
 //! 挂载、`MS_MOVE`、卸下（`MNT_DETACH`、`MNT_EXPIRE`）、pivot_root 和各种错误按 Linux 6.1
 //! 的 `path_mount`、`path_umount`、`pivot_root`。传播类型可以设置，但不模拟：挂载之间没有
-//! 传播，都相当于 private。tmpfs 是仓库里不挂在根目录下面的一棵树（`Vfs::new_tmpfs`）。
+//! 传播，都相当于 private。挂载要在调用者的挂载命名空间里（Linux 的 `check_mnt`），别的
+//! 命名空间里的（经由 `/proc/<pid>/root` 看到的）是 EINVAL。tmpfs 是仓库里不挂在根目录下面
+//! 的一棵树（`Vfs::new_tmpfs`）。
 //! 别的文件系统与没有编进内核的一样是 ENODEV。
 
 use std::collections::HashSet;
@@ -137,6 +139,7 @@ fn new_mount(
     }
     let vfs = cx.vfs()?;
     may_mount_on(&target)?;
+    check_mnt(cx, &vfs, target.mnt())?;
     // 只有一个实例的文件系统不能再挂在它自己的挂载的根上（Linux 的 do_add_mount）
     if !fs.new_instance()
         && let Some(id) = vfs.mount_root(&target)
@@ -317,7 +320,9 @@ fn bind(
     if dir != vfs.is_dir(&view, &target)? {
         return Err(Errno::ENOTDIR);
     }
-    // 卸下了的挂载里的不能 bind（Linux 的 check_mnt）
+    // 卸下了的、别的命名空间里的不能 bind（Linux 的 check_mnt）
+    check_mnt(cx, &vfs, src.mnt())?;
+    check_mnt(cx, &vfs, target.mnt())?;
     let m = vfs.mount(src.mnt()).ok_or(Errno::EINVAL)?;
     // 挂上之前先记下源里面的挂载：目标在源里面时不会把新挂载自己也复制一遍
     let inside = if recursive { vfs.mounts() } else { Vec::new() };
@@ -380,6 +385,7 @@ fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, t
 fn remount(cx: &mut Cx<'_>, target: &Node, flags: u64, keep_atime: bool) -> SysResult {
     let vfs = cx.vfs()?;
     let id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
+    check_mnt(cx, &vfs, id)?;
     let m = vfs.mount(id).ok_or(Errno::EINVAL)?;
     let flags = if keep_atime {
         (flags & !ATIME) | (m.flags & ATIME)
@@ -416,9 +422,10 @@ fn move_mount(
     let src = lookup_at(cx, AT_FDCWD, source, true)?;
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
-    vfs.mount(target.mnt()).ok_or(Errno::EINVAL)?;
+    check_mnt(cx, &vfs, target.mnt())?;
     // 挂载树的根也挂在（看不到的 rootfs）上，挪它时目标总在它里面，是下面的 ELOOP
     let id = vfs.mount_root(&src).ok_or(Errno::EINVAL)?;
+    check_mnt(cx, &vfs, id)?;
     if vfs.is_dir(&view, &src)? != vfs.is_dir(&view, &target)? {
         return Err(Errno::EINVAL);
     }
@@ -452,10 +459,12 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     }
     // put_old 上挂着东西时挂在最上面的那个上（lock_mount）
     let old = vfs.mounted(old);
+    check_mnt(cx, &vfs, new.mnt())?;
+    check_mnt(cx, &vfs, root.mnt())?;
+    check_mnt(cx, &vfs, old.mnt())?;
     let (Some(new_mnt), Some(root_mnt)) = (vfs.mount(new.mnt()), vfs.mount(root.mnt())) else {
         return Err(Errno::EINVAL);
     };
-    vfs.mount(old.mnt()).ok_or(Errno::EINVAL)?;
     // 已经删除的目录（d_unlinked）
     for node in [&new, &old] {
         if let Node::Store(_, ino) = node
@@ -505,6 +514,7 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     // `.`、当前目录这类路径也卸挂在上面的（LOOKUP_MOUNTPOINT）
     let node = vfs.mounted(node);
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
+    check_mnt(cx, &vfs, id)?;
     let own_root = id == cx.root().mnt();
     let detach = flags & MNT_DETACH != 0;
     if flags & MNT_EXPIRE != 0 {
@@ -530,21 +540,36 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         return Err(Errno::EBUSY);
     }
     vfs.remove_mount(id);
-    vfs.collect(&in_use(cx));
+    vfs.collect(&in_use(cx.kr()));
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// 挂载 `id` 挂在树上、在调用者的挂载命名空间里（Linux 的 `check_mnt`），否则 EINVAL。
+fn check_mnt(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> Result<(), Errno> {
+    match vfs.mount_ns(id) {
+        Some(ns) if ns == cx.mnt_ns() => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// 有挂载命名空间没人用了（最后一个用它的进程退出了）：卸下它的挂载，丢掉没人用的。
+pub(crate) fn collect_namespaces(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    if vfs.has_dead_ns() {
+        vfs.collect(&in_use(k));
+    }
 }
 
 /// 挂载 `id` 在用：里面挂着别的挂载，或者有进程的根目录、当前目录、打开的文件在里面。
 /// 从设备的打开文件不记得经由哪个 devpts 挂载，不算。
 fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
-    !vfs.children(id).is_empty() || in_use(cx).contains(&id)
+    !vfs.children(id).is_empty() || in_use(cx.kr()).contains(&id)
 }
 
 /// 进程的根目录、当前目录和打开的文件所在的挂载。
-fn in_use(cx: &Cx<'_>) -> HashSet<MountId> {
+fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
     let mut used = HashSet::new();
-    for task in cx.kr().tasks.values() {
+    for task in k.tasks.values() {
         let res = task.res.borrow();
         {
             let fs = res.fs.borrow();
