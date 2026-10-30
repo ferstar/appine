@@ -47,6 +47,7 @@ const MSG_DONTWAIT: u32 = 0x40;
 const MSG_ERRQUEUE: u32 = 0x2000;
 const MSG_WAITALL: u32 = 0x100;
 const MSG_NOSIGNAL: u32 = 0x4000;
+const MSG_FASTOPEN: u32 = 0x2000_0000;
 
 const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
@@ -791,6 +792,13 @@ pub(crate) fn send(
         _ => None,
     };
     let addr = host_addr.as_deref().unwrap_or(addr);
+    // TCP 不看给的地址（MSG_FASTOPEN 除外，Linux 的 tcp_sendmsg_locked），这里也不交给宿主：
+    // 宿主的 LSM 可能按地址族检查它（Ubuntu 24.04 的 AppArmor 拒绝 AF_UNSPEC，EAFNOSUPPORT）
+    let addr = if ty == SOCK_STREAM && flags & MSG_FASTOPEN == 0 {
+        &[][..]
+    } else {
+        addr
+    };
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut done = 0;
     let mut sent_datagram = false;

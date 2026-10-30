@@ -2,7 +2,7 @@
 
 ← [M9 之前：兼容性补漏（2026-10-25）](17-compat.md) · [索引](../milestones.md) · [M9 之前：推迟项（2026-10-25）](19-deferred.md) →
 
-把推迟项和全量 LTP 的失败重新过了一遍：疑似 musl 的那些先在原生 Alpine 容器里跑，16 个在原生上同样失败（gethostname02、pathconf02、pwrite04、sbrk01、recvmmsg01、sendmsg01、readlink03、open13、clone08 等，sendto01 的第 4 项也是），不归 appine。剩下原生通过、appine 不通过的补上：
+把推迟项和全量 LTP 的失败重新过了一遍：疑似 musl 的那些先在原生 Alpine 容器里跑，16 个在原生上同样失败（gethostname02、pathconf02、pwrite04、sbrk01、recvmmsg01、sendmsg01、readlink03、open13、clone08 等，sendto01 的第 4 项也是），不归 appine。 → 后来查明其中两处与 appine 有关（M9 之前：LTP 剩下的小差异）：sendto01 的第 4 项原生失败是宿主的 AppArmor 拒绝 AF_UNSPEC 的地址，上游 Linux 上成功，appine 已改为不把 TCP 的地址交给宿主；readlink03 在 appine 上还多一项空路径的失败，已修。剩下原生通过、appine 不通过的补上：
 
 - **/dev/shm 和 /run 开机清空**：Linux 上它们是 tmpfs。仓库被第一个使用者打开时（拿得到排他锁，也就是没有别的 appine 进程在用，相当于开机）清空这两个目录的内容，目录本身保留。原来共享内存、命名信号量、pid 文件会一直留在仓库里，LTP 的 cachestat02 就撞上了前一天的运行留下的文件。
 - **`/proc/<pid>/smaps`、`smaps_rollup`、`pagemap`**：驻留页按宿主内存算（mincore），匿名内存都算私有的脏页，文件映射都算私有的干净页；pagemap 每页 8 字节，在读的时候按位置现算（文件有 2^36 项），给驻留、文件页和独占位，与没有特权的进程在 Linux 上看到的一样不给页框号。maps 里没有名字的行末尾补上空格（Linux 就是这样），合并相邻映射时也比较是否锁住。

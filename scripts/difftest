@@ -101,6 +101,13 @@ fi
 failed=0
 for name in "$@"; do
     script="exec 2>&1; $(cat "tests/diff/$name.sh")"
+    # 脚本整个作为 sh -c 的一个参数交出去，Linux 不让单个参数超过 128 KB（MAX_ARG_STRLEN）：
+    # 超过时两边都执行不了（E2BIG），输出一样，会被当成通过
+    if [ "$(printf '%s' "cd / && $script" | wc -c)" -ge 131072 ]; then
+        echo "FAIL $name: tests/diff/$name.sh is longer than one argument can be (128 KB), split it"
+        failed=$((failed + 1))
+        continue
+    fi
     options=$(sed -n 's/^# docker-run-options: //p' "tests/diff/$name.sh")
     set +e
     # Docker 默认的 seccomp 规则会改掉一些 syscall 的结果（clone3 返回 ENOSYS，

@@ -47,6 +47,7 @@ const SHM_UNLOCK: i32 = 12;
 const SHM_STAT: i32 = 13;
 const SHM_INFO: i32 = 14;
 const SHM_STAT_ANY: i32 = 15;
+const SHM_HUGETLB: i32 = 0o4000;
 const SHM_RDONLY: i32 = 0o10000;
 const SHM_RND: i32 = 0o20000;
 const SHM_REMAP: i32 = 0o40000;
@@ -561,6 +562,11 @@ pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysRes
             },
             || {
                 if !(limits::SHMMIN..=t.shmmax).contains(&size) {
+                    return Err(Errno::EINVAL);
+                }
+                // 没有大页，与没有编进 hugetlbfs 的 Linux 一样是 EINVAL（newseg 里的
+                // hstate_sizelog 是 NULL）。原来当作普通的段建出来
+                if flags & SHM_HUGETLB != 0 {
                     return Err(Errno::EINVAL);
                 }
                 Ok(ShmSeg {

@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
-use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, ROOT_MOUNT, Vfs, ms, normalize};
+use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, Vfs, ms, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -703,6 +703,8 @@ fn open_notify(
 /// 文件句柄（`struct file_handle`）里的类型和长度：句柄就是仓库里的 inode 编号。
 const FILE_HANDLE_TYPE: i32 = 1;
 const FILE_HANDLE_BYTES: u32 = 8;
+/// 放不下句柄时写回的类型（Linux 的 `FILEID_INVALID`）。
+const FILEID_INVALID: i32 = 255;
 const MAX_HANDLE_SZ: u32 = 128;
 const AT_HANDLE_FID: u32 = 0x200;
 
@@ -730,22 +732,25 @@ pub(super) fn name_to_handle_at(
     let Node::Store(mnt, ino) = node else {
         return Err(Errno::EOPNOTSUPP);
     };
-    let room = u32::from_le_bytes(get(cx, handle)?);
+    let header: [u8; 8] = get(cx, handle)?;
+    let room = u32::from_le_bytes(header[..4].try_into().unwrap());
     if room > MAX_HANDLE_SZ {
         return Err(Errno::EINVAL);
     }
-    // 放不下时写回需要的长度
-    if room < FILE_HANDLE_BYTES {
-        put(cx, handle, FILE_HANDLE_BYTES.to_le_bytes())?;
-        return Err(Errno::EOVERFLOW);
-    }
-    let mut b = [0u8; 16];
-    b[..4].copy_from_slice(&FILE_HANDLE_BYTES.to_le_bytes());
-    b[4..8].copy_from_slice(&FILE_HANDLE_TYPE.to_le_bytes());
-    b[8..].copy_from_slice(&ino.to_le_bytes());
-    put(cx, handle, b)?;
+    // 放不下时只写回句柄头（需要的长度、FILEID_INVALID），返回 EOVERFLOW。两种情况都写
+    // mount_id，它或者句柄写不进去时是 EFAULT（Linux 的 do_sys_name_to_handle）
+    let mut b = FILE_HANDLE_BYTES.to_le_bytes().to_vec();
+    let ret = if room < FILE_HANDLE_BYTES {
+        b.extend_from_slice(&FILEID_INVALID.to_le_bytes());
+        Err(Errno::EOVERFLOW)
+    } else {
+        b.extend_from_slice(&FILE_HANDLE_TYPE.to_le_bytes());
+        b.extend_from_slice(&ino.to_le_bytes());
+        Ok(0)
+    };
     put(cx, mount_id, (mnt as i32).to_le_bytes())?;
-    Ok(0)
+    cx.mm().write(UserSlice::new(handle, b.len()), &b)?;
+    ret
 }
 
 /// open_by_handle_at：按 inode 编号打开，要求 `CAP_DAC_READ_SEARCH`。
@@ -758,24 +763,35 @@ pub(super) fn open_by_handle_at(
     if !cx.cred().capable(cap::DAC_READ_SEARCH) {
         return Err(Errno::EPERM);
     }
-    // 文件经由 mount_fd 所在的挂载打开
-    let mnt = if mount_fd == AT_FDCWD {
-        cx.cwd().mnt()
-    } else {
-        let file = cx.fds().get(mount_fd)?;
-        file.borrow().node().map_or(ROOT_MOUNT, |n| n.mnt())
-    };
-    let b: [u8; 16] = get(cx, handle)?;
-    let bytes = u32::from_le_bytes(b[..4].try_into().unwrap());
+    // 与 Linux 的 handle_to_path 一样先读句柄头、查长度，再读整个句柄，最后才看 mount_fd
+    let header: [u8; 8] = get(cx, handle)?;
+    let bytes = u32::from_le_bytes(header[..4].try_into().unwrap());
     if bytes == 0 || bytes > MAX_HANDLE_SZ {
         return Err(Errno::EINVAL);
     }
-    let ty = i32::from_le_bytes(b[4..8].try_into().unwrap());
-    let ino = u64::from_le_bytes(b[8..].try_into().unwrap());
+    let ty = i32::from_le_bytes(header[4..].try_into().unwrap());
+    let mut f_handle = vec![0u8; bytes as usize];
+    cx.mm()
+        .read(UserSlice::new(handle + 8, f_handle.len()), &mut f_handle)?;
+    // 文件经由 mount_fd 所在的挂载打开。句柄只在仓库里解得开：mount_fd 在管道、socket、
+    // 合成文件系统上时，与 Linux 上这些文件系统没有 export_operations 一样是 ESTALE
+    let node = if mount_fd == AT_FDCWD {
+        Some(cx.cwd())
+    } else {
+        cx.fds().get(mount_fd)?.borrow().node()
+    };
+    let Some(node @ Node::Store(..)) = node else {
+        return Err(Errno::ESTALE);
+    };
+    let mnt = node.mnt();
+    let ino = match f_handle.first_chunk::<8>() {
+        Some(b) if bytes == FILE_HANDLE_BYTES && ty == FILE_HANDLE_TYPE => u64::from_le_bytes(*b),
+        _ => return Err(Errno::ESTALE),
+    };
     let vfs = cx.vfs()?;
     // 文件已经删除（或者句柄不是这里发的）：ESTALE
     let st = match vfs.store().stat(ino) {
-        Ok(st) if bytes == FILE_HANDLE_BYTES && ty == FILE_HANDLE_TYPE && st.nlink > 0 => st,
+        Ok(st) if st.nlink > 0 => st,
         _ => return Err(Errno::ESTALE),
     };
     let kind = if flags & oflags::O_PATH != 0 {
@@ -1816,14 +1832,21 @@ pub(super) fn readlinkat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    // 路径为空时读 dirfd 本身（以 O_PATH | O_NOFOLLOW 打开的符号链接）
-    let node = if path.is_empty() {
-        cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::ENOENT)?
-    } else {
+    // 路径为空时读 dirfd 本身（以 O_PATH | O_NOFOLLOW 打开的符号链接），`AT_FDCWD` 是当前
+    // 目录；它不是符号链接时是 ENOENT（Linux 的 do_readlinkat：`empty ? -ENOENT : -EINVAL`）
+    let empty = path.is_empty();
+    let node = if !empty {
         lookup_at(cx, dirfd, &path, false)?
+    } else if dirfd == AT_FDCWD {
+        cx.cwd()
+    } else {
+        cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::ENOENT)?
     };
     let vfs = cx.vfs()?;
-    let target = vfs.readlink(&cx.view(&vfs), &node)?;
+    let target = match vfs.readlink(&cx.view(&vfs), &node) {
+        Err(e) if empty && e == Errno::EINVAL => return Err(Errno::ENOENT),
+        r => r?,
+    };
     let n = target.len().min(size);
     cx.mm().write(UserSlice::new(buf, n), &target[..n])?;
     Ok(n as u64)
@@ -3749,9 +3772,10 @@ fn write_bytes(
             if let Some(ino) = ino.filter(|_| !data.is_empty()) {
                 remove_privs(cx, ino)?;
             }
-            // 普通文件不持 BKL 写；O_APPEND 仍持锁做，几个进程同时追加时不会互相覆盖
-            let regular = regular_fd(&file.borrow())
-                .filter(|_| offset.is_some() || file.borrow().flags & oflags::O_APPEND == 0);
+            // 普通文件不持 BKL 写；O_APPEND 的仍持锁做（包括带偏移的写，[`append_offset`]），
+            // 几个进程同时追加时不会互相覆盖
+            let regular =
+                regular_fd(&file.borrow()).filter(|_| file.borrow().flags & oflags::O_APPEND == 0);
             let n = match regular {
                 Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
                     appine_hal::pwrite(fd, data, pos)
@@ -4164,7 +4188,21 @@ pub(super) fn pread(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64)
 
 pub(super) fn pwrite(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
     let file = cx.fds().get(fd)?;
-    write_file(cx, &file, buf, len, checked_offset(offset)?)
+    let offset = append_offset(&file, checked_offset(offset)?)?;
+    write_file(cx, &file, buf, len, offset)
+}
+
+/// 带偏移的写在 `O_APPEND` 的普通文件上照样写到末尾，文件位置不变（Linux 的
+/// generic_write_checks，pwrite(2) 的 BUGS 一节），只有 pwritev2 的 `RWF_NOAPPEND` 写在给的
+/// 偏移处。这样的写持着 BKL 做（[`write_bytes`]），与别的追加不会写到同一个位置。
+fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
+    let f = file.borrow();
+    match &f.kind {
+        FileKind::Regular { file, .. } if offset.is_some() && f.flags & oflags::O_APPEND != 0 => {
+            Ok(Some(file.metadata().map_err(host_errno)?.len()))
+        }
+        _ => Ok(offset),
+    }
 }
 
 /// 读取 iovec 数组。
@@ -4238,14 +4276,18 @@ pub(super) fn pvectored(
     flags: Option<u32>,
     write: bool,
 ) -> SysResult {
-    // RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果；带偏移的写本来就不管 O_APPEND，所以
-    // RWF_NOAPPEND 也不影响结果（musl 的 pwrite 用它）；RWF_NOWAIT、RWF_APPEND 不支持，
+    // RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果；RWF_NOAPPEND（Linux 6.9 起，musl 的 pwrite
+    // 用它）让带偏移的写在 O_APPEND 的文件上也写在给的偏移处；RWF_NOWAIT、RWF_APPEND 不支持，
     // 与 Linux 一样，不认识的标志都是 EOPNOTSUPP
-    const RWF_SUPPORTED: u32 = 0x7 | 0x20;
-    let offset = match flags {
+    const RWF_NOAPPEND: u32 = 0x20;
+    const RWF_SUPPORTED: u32 = 0x7 | RWF_NOAPPEND;
+    let mut offset = match flags {
         Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
         Some(_) if offset == -1 => None,
         _ => checked_offset(offset)?,
     };
+    if write && flags.is_none_or(|f| f & RWF_NOAPPEND == 0) {
+        offset = append_offset(&cx.fds().get(fd)?, offset)?;
+    }
     vectored(cx, fd, iov, count, offset, write)
 }
