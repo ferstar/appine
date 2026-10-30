@@ -135,4 +135,178 @@ if pid == 0:
 os.waitpid(pid, 0)
 PY
 echo "left: $(grep -c ' /tmp/ns' /proc/self/mountinfo)"
+
+# 用户命名空间
+cat /proc/self/uid_map /proc/self/gid_map /proc/self/projid_map /proc/self/setgroups
+echo "max_user_namespaces: $(test -r /proc/sys/user/max_user_namespaces && echo yes)"
+echo "unshare -r: $(unshare -r sh -c 'id -u; id -g; cat /proc/self/uid_map' | tr -s ' \n' ' ')"
+python3 - <<'PY2'
+import ctypes, errno, functools, os, threading
+
+print = functools.partial(print, flush=True)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
+libc.syscall.restype = ctypes.c_long
+CLONE_NEWNS, CLONE_NEWUSER, CLONE_FS = 0x20000, 0x10000000, 0x200
+
+
+def call(f, *args):
+    r = f(*args)
+    return "ok" if r == 0 else errno.errorcode[ctypes.get_errno()]
+
+
+def write(path, data):
+    try:
+        with open(path, "w") as f:
+            f.write(data)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def read(path):
+    with open(path) as f:
+        return " ".join(f.read().split())
+
+
+def capeff():
+    with open("/proc/self/status") as f:
+        return [l.split()[1] for l in f if l.startswith("CapEff")][0]
+
+
+def fork(f):
+    """在子进程里运行 f：出了什么错都打印出来，然后退出，不会接着跑父进程的代码。"""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            f()
+        except OSError as e:
+            print("raised", errno.errorcode[e.errno])
+        except BaseException as e:
+            print("raised", repr(e))
+        finally:
+            os._exit(0)
+    return pid
+
+
+def child(f):
+    pid = fork(f)
+    os.waitpid(pid, 0)
+    return pid
+
+
+init_user = os.open("/proc/self/ns/user", os.O_RDONLY)
+print("setns to own user namespace", call(libc.setns, init_user, CLONE_NEWUSER))
+
+
+# root 新建的：没写映射时 ID 是 65534，有全部能力；自己写 0 0 1；gid_map 要先禁止 setgroups
+def root_inside():
+    os.unshare(CLONE_NEWUSER)
+    print("new user ns", os.readlink("/proc/self/ns/user") != os.readlink("/proc/self/fd/%d" % init_user))
+    # 别的用户命名空间里的进程（父进程）的链接看不了：不在同一个用户命名空间，又没有那边的
+    # CAP_SYS_PTRACE
+    try:
+        os.readlink("/proc/%d/ns/user" % os.getppid())
+    except OSError as e:
+        print("parent's link", errno.errorcode[e.errno])
+    print("unmapped", os.getuid(), os.getgid(), os.getresuid(), "map", repr(read("/proc/self/uid_map")))
+    print("caps", capeff(), "setgroups", read("/proc/self/setgroups"))
+    print("bad map", write("/proc/self/uid_map", "0 0\n"), write("/proc/self/uid_map", "0 0 0\n"))
+    print("map someone else", write("/proc/self/uid_map", "0 1000 1\n"))
+    print("uid_map", write("/proc/self/uid_map", "0 0 1\n"), os.getuid(), read("/proc/self/uid_map"))
+    print("again", write("/proc/self/uid_map", "0 0 1\n"))
+    print("gid_map before deny", write("/proc/self/gid_map", "0 0 1\n"))
+    print("deny", write("/proc/self/setgroups", "deny"), read("/proc/self/setgroups"))
+    print("allow again", write("/proc/self/setgroups", "allow"), write("/proc/self/setgroups", "bogus"))
+    print("gid_map", write("/proc/self/gid_map", "0 0 1\n"), os.getgid())
+    try:
+        os.setgroups([])
+        print("setgroups ok")
+    except OSError as e:
+        print("setgroups", errno.errorcode[e.errno])
+    for uid in (1, 5000):
+        try:
+            os.setuid(uid)
+        except OSError as e:
+            print("setuid", uid, errno.errorcode[e.errno])
+    print("stat /", os.stat("/").st_uid, "stat /proc/1", os.stat("/proc/1").st_uid)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.dup2(w, 1)
+        os.execv("/bin/sh", ["sh", "-c", "id -u; grep CapEff /proc/self/status"])
+    os.close(w)
+    print("exec", os.read(r, 100).split())
+    os.waitpid(pid, 0)
+    # 在这个用户命名空间里不能回到上一层的
+    print("setns to the parent", call(libc.setns, init_user, CLONE_NEWUSER))
+    # 外面的 root 看它的映射
+    os.write(wfd, b"x")
+    os.read(rfd2, 1)
+
+
+rfd, wfd = os.pipe()
+rfd2, wfd2 = os.pipe()
+pid = fork(root_inside)
+os.close(wfd)
+os.read(rfd, 1)
+print("parent sees", read("/proc/%d/uid_map" % pid), "|", read("/proc/%d/gid_map" % pid), "|", read("/proc/%d/setgroups" % pid))
+with open("/proc/%d/status" % pid) as f:
+    print("parent sees ids", [l.split()[1:3] for l in f if l.split()[0] in ("Uid:", "Gid:")])
+
+
+# 外面的 root 可以 setns 进去
+def enter():
+    fd = os.open("/proc/%d/ns/user" % pid, os.O_RDONLY)
+    print("setns into it", call(libc.setns, fd, CLONE_NEWUSER), os.getuid(), capeff())
+
+
+child(enter)
+os.write(wfd2, b"x")
+os.waitpid(pid, 0)
+
+
+# 普通用户自己建的用户命名空间不在这里比：Ubuntu 23.10 起的
+# kernel.apparmor_restrict_unprivileged_userns（开发用的虚拟机、GitHub 的 runner 都开着）不让
+# 它们在里面有能力，原生一侧比出来的不是上游 Linux 的行为。这部分在 hosts/cli/tests 里按
+# 上游的行为检查（user_namespace_of_an_unprivileged_user）
+
+
+# 错误：多线程不能 unshare，CLONE_NEWUSER 和 CLONE_FS 不能同用，chroot 了不能建，嵌套最多 32 层
+ev = threading.Event()
+t = threading.Thread(target=ev.wait)
+t.start()
+try:
+    os.unshare(CLONE_NEWUSER)
+except OSError as e:
+    print("threaded unshare", errno.errorcode[e.errno])
+ev.set()
+t.join()
+print("clone NEWUSER with FS", libc.syscall(220, CLONE_NEWUSER | CLONE_FS | 17, 0, 0, 0, 0), errno.errorcode[ctypes.get_errno()])
+
+
+def chrooted():
+    os.chroot("/tmp")
+    os.unshare(CLONE_NEWUSER)
+    print("chrooted unshare ok")
+
+
+child(chrooted)
+
+
+def nested():
+    for level in range(1, 40):
+        try:
+            os.unshare(CLONE_NEWUSER)
+        except OSError as e:
+            print("nesting stops at", level, errno.errorcode[e.errno])
+            return
+        write("/proc/self/uid_map", "0 0 1\n")
+        write("/proc/self/setgroups", "deny")
+        write("/proc/self/gid_map", "0 0 1\n")
+
+
+child(nested)
+PY2
 rm -rf /tmp/ns

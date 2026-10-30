@@ -47,7 +47,7 @@
 
 **推迟项**：
 
-- 没有用户命名空间：rootid 不是 0 的 v3 文件能力不起作用，setcap 也只能在初始命名空间里用。
+- 没有用户命名空间：rootid 不是 0 的 v3 文件能力不起作用，setcap 也只能在初始命名空间里用。 → 用户命名空间补上了（M9 之前：用户命名空间）；v3 的 rootid 仍只认 0，命名空间里设置的文件能力也不转成 v3
 - 跟踪者只记了建立跟踪时有没有 `CAP_SYS_PTRACE`；Linux 记下整份凭据。和别的进程共用文件系统上下文（`CLONE_FS`，Linux 的 `LSM_UNSAFE_SHARE`）时也照样得到特权。
 - `system.*`（POSIX ACL）仍按普通的扩展属性存，不检查格式和属主，也不起访问控制的作用。没有 immutable、append-only 属性，`xattr_permission` 里对它们的检查不适用。
 - 不记审计日志（`audit_log_bprm_fcaps`）。

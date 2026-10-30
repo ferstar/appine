@@ -7,10 +7,19 @@
 //! 相关的能力跟着 fsuid 走；capset 可以去掉其中一部分，`PR_CAPBSET_DROP` 可以缩小边界
 //! 集。execve 按 Linux 6.1 的 `cap_bprm_creds_from_file` 变换能力，算上程序文件的能力
 //! （`security.capability`，[`FileCaps`]）和环境（ambient）能力；securebits 的几个位和
-//! 它们的锁与 Linux 相同。没有用户命名空间：v3 的文件能力只有 rootid 是 0 的起作用。
+//! 它们的锁与 Linux 相同。v3 的文件能力只有 rootid 是 0 的起作用。
+//!
+//! 用户命名空间（[`UserNs`]）：凭据里的 ID 总是内核 ID（开机时的命名空间里的），对外按
+//! 调用者的命名空间的 uid_map、gid_map 换算，映射不到的显示成 65534。能力只在自己的命名
+//! 空间和它的后代里有效（[`Cred::ns_capable`]）：[`Cred::capable`] 是 Linux 的
+//! `capable()`，只看开机时的命名空间；文件的 DAC 检查用 [`Cred::capable_wrt`]（Linux 的
+//! `capable_wrt_inode_uidgid`），setuid 系列、capset 这些看自己的命名空间
+//! （[`Cred::capable_here`]）。
 
+use std::cell::Cell;
 use std::rc::Rc;
 
+use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::vfs::store::{Stat, mode};
 
@@ -79,6 +88,156 @@ pub(crate) const MAY_READ: u32 = 4;
 /// setgroups 最多接受的附加组个数（`NGROUPS_MAX`）。
 pub(crate) const NGROUPS_MAX: usize = 65536;
 
+/// 开机时的用户命名空间的编号（`/proc/<pid>/ns/user`）。
+pub(crate) const INIT_USER_NS: u64 = 4_026_531_837;
+/// 映射不到的 ID 对外显示成它（`/proc/sys/kernel/overflowuid`、`overflowgid`）。
+pub(crate) const OVERFLOW_ID: u32 = 65534;
+/// 层数超过它的用户命名空间里不能再建（Linux 的 32，最深是第 33 层）。
+pub(crate) const MAX_USER_NS_LEVEL: u32 = 32;
+/// 一张 ID 映射最多的段数（Linux 的 `UID_GID_MAP_MAX_EXTENTS`）。
+const MAX_EXTENTS: usize = 340;
+
+/// 一张 ID 映射（uid_map、gid_map）：每段是 (命名空间里的起点, 内核 ID 的起点, 个数)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IdMap(Vec<(u32, u32, u32)>);
+
+impl IdMap {
+    /// 开机时的命名空间：所有 ID 映射到自己（Linux 的 `0 0 4294967295`）。
+    fn identity() -> IdMap {
+        IdMap(vec![(0, 0, u32::MAX)])
+    }
+
+    /// 命名空间里的 `id` 对应的内核 ID（`make_kuid`）。
+    pub fn down(&self, id: u32) -> Option<u32> {
+        self.0
+            .iter()
+            .find(|&&(first, _, count)| id >= first && id - first < count)
+            .map(|&(first, lower, _)| lower + (id - first))
+    }
+
+    /// 内核 ID `k` 在命名空间里的 ID（`from_kuid`）。
+    pub fn up(&self, k: u32) -> Option<u32> {
+        self.0
+            .iter()
+            .find(|&&(_, lower, count)| k >= lower && k - lower < count)
+            .map(|&(first, lower, _)| first + (k - lower))
+    }
+
+    /// 各段。
+    pub fn extents(&self) -> &[(u32, u32, u32)] {
+        &self.0
+    }
+
+    /// 写 uid_map、gid_map 的内容（Linux 的 `map_write` 的解析部分）：每行
+    /// "命名空间里的起点 上一层的起点 个数"，个数不能是 0，不能溢出、重叠，最多 340 段。
+    /// 第二列还是上一层命名空间里的 ID，由调用方换成内核 ID。
+    pub fn parse(data: &[u8]) -> Result<IdMap, Errno> {
+        let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let mut extents: Vec<(u32, u32, u32)> = Vec::new();
+        for line in text.split('\n').filter(|l| !l.is_empty()) {
+            let nums: Vec<u32> = line
+                .split_ascii_whitespace()
+                .map(|n| n.parse().map_err(|_| Errno::EINVAL))
+                .collect::<Result<_, _>>()?;
+            let &[first, lower, count] = nums.as_slice() else {
+                return Err(Errno::EINVAL);
+            };
+            let fits = |start: u32| {
+                count > 0 && start.checked_add(count - 1).is_some_and(|e| e != u32::MAX)
+            };
+            if !fits(first) || !fits(lower) {
+                return Err(Errno::EINVAL);
+            }
+            let overlaps = |&(f, l, c): &(u32, u32, u32)| {
+                first < f + c && f < first + count || lower < l + c && l < lower + count
+            };
+            if extents.iter().any(overlaps) || extents.len() == MAX_EXTENTS {
+                return Err(Errno::EINVAL);
+            }
+            extents.push((first, lower, count));
+        }
+        if extents.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        Ok(IdMap(extents))
+    }
+
+    /// 把每段的第二列从上一层命名空间（映射是 `parent`）的 ID 换成内核 ID；有映射不到的是
+    /// EPERM。一段在上一层里可能对应几段，按上一层的段拆开。
+    pub fn lower_to_kernel(&self, parent: &IdMap) -> Result<IdMap, Errno> {
+        let mut out = Vec::new();
+        for &(first, lower, count) in &self.0 {
+            let mut done = 0;
+            while done < count {
+                let id = lower + done;
+                let &(pf, pl, pc) = parent
+                    .0
+                    .iter()
+                    .find(|&&(f, _, c)| id >= f && id - f < c)
+                    .ok_or(Errno::EPERM)?;
+                let n = (count - done).min(pc - (id - pf));
+                out.push((first + done, pl + (id - pf), n));
+                done += n;
+            }
+        }
+        Ok(IdMap(out))
+    }
+}
+
+/// 用户命名空间（user_namespaces(7)）。开机时的那个所有 ID 都映射到自己；新建的一开始没有
+/// 映射，由 `/proc/<pid>/uid_map`、`gid_map` 写一次。
+#[derive(Debug)]
+pub(crate) struct UserNs {
+    /// 编号（`/proc/<pid>/ns/user` 里的 inode 号）。
+    pub id: u64,
+    pub parent: Option<Rc<UserNs>>,
+    /// 嵌套的层数，开机时的是 0。
+    pub level: u32,
+    /// 建立者的有效用户 ID（内核 ID）：它在上一层命名空间里对这个命名空间有全部能力。
+    pub owner: u32,
+    pub uid_map: RefCell<IdMap>,
+    pub gid_map: RefCell<IdMap>,
+    /// `/proc/<pid>/setgroups` 是 "allow"：写成 "deny" 之后这个命名空间里不能 setgroups。
+    pub setgroups: Cell<bool>,
+}
+
+impl PartialEq for UserNs {
+    fn eq(&self, other: &UserNs) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for UserNs {}
+
+impl UserNs {
+    /// 开机时的用户命名空间（每次新建一份，按编号比较）。
+    pub fn init() -> Rc<UserNs> {
+        Rc::new(UserNs {
+            id: INIT_USER_NS,
+            parent: None,
+            level: 0,
+            owner: 0,
+            uid_map: RefCell::new(IdMap::identity()),
+            gid_map: RefCell::new(IdMap::identity()),
+            setgroups: Cell::new(true),
+        })
+    }
+
+    /// 在 `parent` 下面新建的命名空间，建立者的有效用户 ID 是 `owner`。setgroups 的状态
+    /// 继承上一层的。
+    pub fn child(parent: &Rc<UserNs>, owner: u32) -> Rc<UserNs> {
+        Rc::new(UserNs {
+            id: crate::vfs::new_ns_id(),
+            parent: Some(parent.clone()),
+            level: parent.level + 1,
+            owner,
+            uid_map: RefCell::new(IdMap::default()),
+            gid_map: RefCell::new(IdMap::default()),
+            setgroups: Cell::new(parent.setgroups.get()),
+        })
+    }
+}
+
 /// 一个进程的凭据。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cred {
@@ -101,6 +260,8 @@ pub(crate) struct Cred {
     pub cap_ambient: u64,
     /// `PR_SET_SECUREBITS`（[`secbit`]）。
     pub securebits: u32,
+    /// 所在的用户命名空间。
+    pub user_ns: Rc<UserNs>,
 }
 
 impl Cred {
@@ -122,7 +283,45 @@ impl Cred {
             cap_bounding: CAP_FULL,
             cap_ambient: 0,
             securebits: 0,
+            user_ns: UserNs::init(),
         }
+    }
+
+    /// 进入用户命名空间 `ns`（新建它、setns 到它）：拥有那里的全部能力，securebits 恢复默认
+    /// （Linux 的 `set_cred_user_ns`）。ID 不变，没有映射的在里面显示成 65534。
+    pub fn enter_user_ns(&mut self, ns: Rc<UserNs>) {
+        self.securebits = 0;
+        self.cap_inheritable = 0;
+        self.cap_permitted = CAP_FULL;
+        self.cap_effective = CAP_FULL;
+        self.cap_ambient = 0;
+        self.cap_bounding = CAP_FULL;
+        self.user_ns = ns;
+    }
+
+    /// 内核 ID `k` 在自己的命名空间里的用户 ID，映射不到时是 65534（`from_kuid_munged`）。
+    pub fn uid_out(&self, k: u32) -> u32 {
+        self.user_ns.uid_map.borrow().up(k).unwrap_or(OVERFLOW_ID)
+    }
+
+    /// 内核 ID `k` 在自己的命名空间里的组 ID，映射不到时是 65534。
+    pub fn gid_out(&self, k: u32) -> u32 {
+        self.user_ns.gid_map.borrow().up(k).unwrap_or(OVERFLOW_ID)
+    }
+
+    /// 自己的命名空间里的用户 ID `id` 对应的内核 ID（`make_kuid`）；映射不到是 None。
+    pub fn uid_in(&self, id: u32) -> Option<u32> {
+        self.user_ns.uid_map.borrow().down(id)
+    }
+
+    /// 自己的命名空间里的组 ID `id` 对应的内核 ID；映射不到是 None。
+    pub fn gid_in(&self, id: u32) -> Option<u32> {
+        self.user_ns.gid_map.borrow().down(id)
+    }
+
+    /// 自己的命名空间里的 root（用户 ID 0）的内核 ID；没有映射是 None。
+    fn root_uid(&self) -> Option<u32> {
+        self.uid_in(0)
     }
 
     /// `SECBIT_KEEP_CAPS`。
@@ -130,9 +329,45 @@ impl Cred {
         self.securebits & secbit::KEEP_CAPS != 0
     }
 
-    /// 有效集里有没有能力 `c`。
+    /// 在开机时的用户命名空间里有没有能力 `c`（Linux 的 `capable()`）：别的命名空间里的
+    /// 进程总是没有。
     pub fn capable(&self, c: u32) -> bool {
+        self.user_ns.level == 0 && self.capable_here(c)
+    }
+
+    /// 在自己的用户命名空间里有没有能力 `c`（有效集里有没有，`ns_capable(current_user_ns(), c)`）。
+    pub fn capable_here(&self, c: u32) -> bool {
         self.cap_effective & (1 << c) != 0
+    }
+
+    /// 在用户命名空间 `ns` 里有没有能力 `c`（Linux 的 `cap_capable`）：`ns` 是自己的命名
+    /// 空间时看有效集；是自己的命名空间的后代时，建立它（或它的祖先）的、有效用户 ID 与它的
+    /// 属主相同的进程拥有全部能力；别的没有。
+    pub fn ns_capable(&self, ns: &UserNs, c: u32) -> bool {
+        let mut ns = ns;
+        loop {
+            if ns.id == self.user_ns.id {
+                return self.capable_here(c);
+            }
+            if ns.level <= self.user_ns.level {
+                return false;
+            }
+            let Some(parent) = &ns.parent else {
+                return false;
+            };
+            if parent.id == self.user_ns.id && ns.owner == self.euid {
+                return true;
+            }
+            ns = parent;
+        }
+    }
+
+    /// 对属主、属组是 `st` 的文件有没有能力 `c`（Linux 的 `capable_wrt_inode_uidgid`）：
+    /// 自己的命名空间里有，并且属主、属组在里面都有映射。
+    pub fn capable_wrt(&self, st: &Stat, c: u32) -> bool {
+        self.capable_here(c)
+            && self.user_ns.uid_map.borrow().up(st.uid).is_some()
+            && self.user_ns.gid_map.borrow().up(st.gid).is_some()
     }
 
     /// fsgid 或附加组里有没有 `gid`。
@@ -142,7 +377,7 @@ impl Cred {
 
     /// 是文件的属主，或者有 `CAP_FOWNER`（chmod、设置时间戳等）。
     pub fn owns(&self, st: &Stat) -> bool {
-        self.fsuid == st.uid || self.capable(cap::FOWNER)
+        self.fsuid == st.uid || self.capable_wrt(st, cap::FOWNER)
     }
 
     /// 文件访问的权限检查（`generic_permission`）：`mask` 是 `MAY_*` 的组合。
@@ -159,24 +394,27 @@ impl Cred {
         }
         if st.kind() == mode::S_IFDIR {
             // 目录的权限总是可以被能力越过
-            if mask & MAY_WRITE == 0 && self.capable(cap::DAC_READ_SEARCH)
-                || self.capable(cap::DAC_OVERRIDE)
+            if mask & MAY_WRITE == 0 && self.capable_wrt(st, cap::DAC_READ_SEARCH)
+                || self.capable_wrt(st, cap::DAC_OVERRIDE)
             {
                 return Ok(());
             }
         } else {
-            if mask == MAY_READ && self.capable(cap::DAC_READ_SEARCH) {
+            if mask == MAY_READ && self.capable_wrt(st, cap::DAC_READ_SEARCH) {
                 return Ok(());
             }
             // 执行权限只有在至少一个 x 位存在时才能越过
-            if (mask & MAY_EXEC == 0 || st.mode & 0o111 != 0) && self.capable(cap::DAC_OVERRIDE) {
+            if (mask & MAY_EXEC == 0 || st.mode & 0o111 != 0)
+                && self.capable_wrt(st, cap::DAC_OVERRIDE)
+            {
                 return Ok(());
             }
         }
         Err(Errno::EACCES)
     }
 
-    /// 能不能越过所有目录的搜索权限检查（路径解析的快速路径）。
+    /// 能不能越过所有目录的搜索权限检查（路径解析的快速路径）。别的用户命名空间里只能越过
+    /// 属主、属组有映射的目录，不算。
     pub fn searches_all(&self) -> bool {
         self.capable(cap::DAC_READ_SEARCH) || self.capable(cap::DAC_OVERRIDE)
     }
@@ -187,20 +425,20 @@ impl Cred {
         if dir.mode & mode::S_ISVTX != 0
             && self.fsuid != victim.uid
             && self.fsuid != dir.uid
-            && !self.capable(cap::FOWNER)
+            && !self.capable_wrt(victim, cap::FOWNER)
         {
             return Err(Errno::EPERM);
         }
         Ok(())
     }
 
-    /// access(2) 用的凭据：用真实用户 ID 和组 ID 检查，能力按真实用户 ID 是不是 root
-    /// 决定。
+    /// access(2) 用的凭据：用真实用户 ID 和组 ID 检查，能力按真实用户 ID 是不是（自己的
+    /// 命名空间里的）root 决定。
     pub fn for_access(&self) -> Cred {
         let mut c = self.clone();
         c.fsuid = self.ruid;
         c.fsgid = self.rgid;
-        c.cap_effective = if self.ruid == 0 {
+        c.cap_effective = if Some(self.ruid) == self.root_uid() {
             self.cap_permitted
         } else {
             0
@@ -224,21 +462,23 @@ impl Cred {
         if !is_dir
             && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
             && !self.in_group(gid)
-            && !self.capable(cap::FSETID)
+            && !self.capable_wrt(dir, cap::FSETID)
         {
             perm &= !mode::S_ISGID;
         }
         (self.fsuid, gid, perm)
     }
 
-    /// 用户 ID 变化之后按 Linux 的规则调整能力（`cap_emulate_setxuid`）；
-    /// `SECBIT_NO_SETUID_FIXUP` 时不调整。
+    /// 用户 ID 变化之后按 Linux 的规则调整能力（`cap_emulate_setxuid`），root 是自己的命名
+    /// 空间里的；`SECBIT_NO_SETUID_FIXUP` 时不调整。
     fn fix_caps(&mut self, old: &Cred) {
         if self.securebits & secbit::NO_SETUID_FIXUP != 0 {
             return;
         }
-        let had_root = old.ruid == 0 || old.euid == 0 || old.suid == 0;
-        let has_root = self.ruid == 0 || self.euid == 0 || self.suid == 0;
+        let root = old.root_uid();
+        let is_root = |id: u32| Some(id) == root;
+        let had_root = is_root(old.ruid) || is_root(old.euid) || is_root(old.suid);
+        let has_root = is_root(self.ruid) || is_root(self.euid) || is_root(self.suid);
         if had_root && !has_root {
             if !self.keep_caps() {
                 self.cap_permitted = 0;
@@ -247,10 +487,10 @@ impl Cred {
             // 原来的程序在 setresuid 成非 root 再 execve 之后就没有能力了，环境能力不能让它失效
             self.cap_ambient = 0;
         }
-        if old.euid == 0 && self.euid != 0 {
+        if is_root(old.euid) && !is_root(self.euid) {
             self.cap_effective = 0;
         }
-        if old.euid != 0 && self.euid == 0 {
+        if !is_root(old.euid) && is_root(self.euid) {
             self.cap_effective = self.cap_permitted;
         }
     }
@@ -260,10 +500,11 @@ impl Cred {
         if self.securebits & secbit::NO_SETUID_FIXUP != 0 {
             return;
         }
-        if old_fsuid == 0 && self.fsuid != 0 {
+        let root = self.root_uid();
+        if Some(old_fsuid) == root && Some(self.fsuid) != root {
             self.cap_effective &= !CAP_FS_MASK;
         }
-        if old_fsuid != 0 && self.fsuid == 0 {
+        if Some(old_fsuid) != root && Some(self.fsuid) == root {
             self.cap_effective |= self.cap_permitted & CAP_FS_MASK;
         }
     }
@@ -271,7 +512,7 @@ impl Cred {
     /// setuid(2)。
     pub fn setuid(&mut self, uid: u32) -> Result<(), Errno> {
         let old = self.clone();
-        if self.capable(cap::SETUID) {
+        if self.capable_here(cap::SETUID) {
             self.ruid = uid;
             self.suid = uid;
         } else if uid != self.ruid && uid != self.suid {
@@ -290,7 +531,7 @@ impl Cred {
             (old.ruid, old.euid, old.suid),
             r,
             e,
-            self.capable(cap::SETUID),
+            self.capable_here(cap::SETUID),
         )?;
         self.ruid = ruid;
         self.euid = euid;
@@ -311,7 +552,7 @@ impl Cred {
     ) -> Result<(), Errno> {
         let old = self.clone();
         let known = |id: u32| id == old.ruid || id == old.euid || id == old.suid;
-        if [r, e, s].into_iter().flatten().any(|id| !known(id)) && !self.capable(cap::SETUID) {
+        if [r, e, s].into_iter().flatten().any(|id| !known(id)) && !self.capable_here(cap::SETUID) {
             return Err(Errno::EPERM);
         }
         self.ruid = r.unwrap_or(old.ruid);
@@ -330,7 +571,7 @@ impl Cred {
                 || uid == self.euid
                 || uid == self.suid
                 || uid == self.fsuid
-                || self.capable(cap::SETUID))
+                || self.capable_here(cap::SETUID))
         {
             self.fsuid = uid;
             self.fix_fs_caps(old);
@@ -340,7 +581,7 @@ impl Cred {
 
     /// setgid(2)。
     pub fn setgid(&mut self, gid: u32) -> Result<(), Errno> {
-        if self.capable(cap::SETGID) {
+        if self.capable_here(cap::SETGID) {
             self.rgid = gid;
             self.sgid = gid;
         } else if gid != self.rgid && gid != self.sgid {
@@ -358,7 +599,7 @@ impl Cred {
             (self.rgid, self.egid, self.sgid),
             r,
             e,
-            self.capable(cap::SETGID),
+            self.capable_here(cap::SETGID),
         )?;
         self.rgid = rgid;
         self.egid = egid;
@@ -377,7 +618,7 @@ impl Cred {
         s: Option<u32>,
     ) -> Result<(), Errno> {
         let known = |id: u32| id == self.rgid || id == self.egid || id == self.sgid;
-        if [r, e, s].into_iter().flatten().any(|id| !known(id)) && !self.capable(cap::SETGID) {
+        if [r, e, s].into_iter().flatten().any(|id| !known(id)) && !self.capable_here(cap::SETGID) {
             return Err(Errno::EPERM);
         }
         self.rgid = r.unwrap_or(self.rgid);
@@ -395,16 +636,19 @@ impl Cred {
                 || gid == self.egid
                 || gid == self.sgid
                 || gid == self.fsgid
-                || self.capable(cap::SETGID))
+                || self.capable_here(cap::SETGID))
         {
             self.fsgid = gid;
         }
         old
     }
 
-    /// setgroups(2)。
+    /// setgroups(2)：用户命名空间的 gid_map 写过、setgroups 没有被禁止时才行
+    /// （`userns_may_setgroups`）。
     pub fn setgroups(&mut self, mut groups: Vec<u32>) -> Result<(), Errno> {
-        if !self.capable(cap::SETGID) {
+        let ns = &self.user_ns;
+        let allowed = ns.setgroups.get() && !ns.gid_map.borrow().extents().is_empty();
+        if !self.capable_here(cap::SETGID) || !allowed {
             return Err(Errno::EPERM);
         }
         groups.sort_unstable();
@@ -422,7 +666,7 @@ impl Cred {
         inheritable: u64,
     ) -> Result<(), Errno> {
         let inh_limit = self.cap_inheritable
-            | if self.capable(cap::SETPCAP) {
+            | if self.capable_here(cap::SETPCAP) {
                 CAP_FULL
             } else {
                 self.cap_permitted
@@ -462,7 +706,7 @@ impl Cred {
         if locked & (old ^ bits) != 0
             || old & secbit::ALL_LOCKS & !bits != 0
             || bits & !(secbit::ALL_LOCKS | secbit::ALL_BITS) != 0
-            || !self.capable(cap::SETPCAP)
+            || !self.capable_here(cap::SETPCAP)
         {
             return Err(Errno::EPERM);
         }
@@ -510,13 +754,15 @@ impl Cred {
                 return Err(Errno::EPERM);
             }
         }
-        // root：文件的允许集、可继承集当作全 1（handle_privileged_root）
-        let setuid_root = new.ruid != 0 && new.euid == 0;
+        // root（自己的命名空间里的）：文件的允许集、可继承集当作全 1（handle_privileged_root）
+        let root = old.root_uid();
+        let is_root = |id: u32| Some(id) == root;
+        let setuid_root = !is_root(new.ruid) && is_root(new.euid);
         if old.securebits & secbit::NOROOT == 0 && !(fcaps.is_some() && setuid_root) {
-            if new.euid == 0 || new.ruid == 0 {
+            if is_root(new.euid) || is_root(new.ruid) {
                 new.cap_permitted = old.cap_bounding | old.cap_inheritable;
             }
-            if new.euid == 0 {
+            if is_root(new.euid) {
                 effective = true;
             }
         }
@@ -524,7 +770,7 @@ impl Cred {
         let setid = new.euid != old.ruid || new.egid != old.rgid;
         let gained = new.cap_permitted & !old.cap_permitted != 0;
         if (setid || gained) && (no_new_privs || ptraced) {
-            if !old.capable(cap::SETUID) || no_new_privs {
+            if !old.capable_here(cap::SETUID) || no_new_privs {
                 new.euid = new.ruid;
                 new.egid = new.rgid;
             }
@@ -545,18 +791,40 @@ impl Cred {
         };
         new.securebits &= !secbit::KEEP_CAPS;
         let secure =
-            setid || new.ruid != 0 && (effective || new.cap_permitted & !new.cap_ambient != 0);
+            setid || !is_root(new.ruid) && (effective || new.cap_permitted & !new.cap_ambient != 0);
         *self = new;
         Ok(secure)
     }
 
+    /// 能不能像 ptrace 那样访问凭据为 `target` 的另一个进程（Linux 的 `__ptrace_may_access`
+    /// 加上 `cap_ptrace_access_check`）：真实用户、组（`fscreds` 时用文件系统的）等于目标的
+    /// 所有用户、组并且目标可以 dump，或者在目标的用户命名空间里有 `CAP_SYS_PTRACE`；然后两者
+    /// 在同一个用户命名空间里、目标的允许集不超过自己的，或者有那个 `CAP_SYS_PTRACE`。
+    pub fn may_ptrace(&self, target: &Cred, dumpable: bool, fscreds: bool) -> bool {
+        let (uid, gid) = if fscreds {
+            (self.fsuid, self.fsgid)
+        } else {
+            (self.ruid, self.rgid)
+        };
+        let same = [target.ruid, target.euid, target.suid]
+            .iter()
+            .all(|&u| u == uid)
+            && [target.rgid, target.egid, target.sgid]
+                .iter()
+                .all(|&g| g == gid);
+        let privileged = self.ns_capable(&target.user_ns, cap::SYS_PTRACE);
+        let subset =
+            self.user_ns.id == target.user_ns.id && target.cap_permitted & !self.cap_permitted == 0;
+        privileged || same && dumpable && subset
+    }
+
     /// 能不能给凭据为 `target` 的进程发信号（`kill_ok_by_cred`）：发送者的真实或有效
-    /// 用户 ID 等于目标的真实或保存的用户 ID，或者有 `CAP_KILL`。
+    /// 用户 ID 等于目标的真实或保存的用户 ID，或者在目标的用户命名空间里有 `CAP_KILL`。
     pub fn may_signal(&self, target: &Cred) -> bool {
         [self.euid, self.ruid]
             .iter()
             .any(|&u| u == target.suid || u == target.ruid)
-            || self.capable(cap::KILL)
+            || self.ns_capable(&target.user_ns, cap::KILL)
     }
 }
 
@@ -685,6 +953,92 @@ mod tests {
         c.setresgid(Some(gid), Some(gid), Some(gid)).unwrap();
         c.setresuid(Some(uid), Some(uid), Some(uid)).unwrap();
         c
+    }
+
+    #[test]
+    fn user_namespaces() {
+        // 映射的解析：三列、个数不为 0、不重叠、不溢出
+        assert_eq!(
+            IdMap::parse(b"0 1000 1\n").unwrap().extents(),
+            &[(0, 1000, 1)]
+        );
+        assert_eq!(
+            IdMap::parse(b"0 0 1\n1 100000 65536").unwrap().extents(),
+            &[(0, 0, 1), (1, 100_000, 65536)]
+        );
+        for bad in [
+            &b""[..],
+            b"0 0",
+            b"0 0 0",
+            b"0 0 1\n0 5 1",
+            b"x 0 1",
+            b"4294967295 0 1",
+        ] {
+            assert_eq!(IdMap::parse(bad), Err(Errno::EINVAL), "{bad:?}");
+        }
+        // 第二列按上一层的映射换成内核 ID，跨段时拆开
+        let parent = IdMap(vec![(0, 100_000, 10), (10, 200_000, 10)]);
+        let m = IdMap::parse(b"0 5 10")
+            .unwrap()
+            .lower_to_kernel(&parent)
+            .unwrap();
+        assert_eq!(m.extents(), &[(0, 100_005, 5), (5, 200_000, 5)]);
+        assert_eq!(m.down(6), Some(200_001));
+        assert_eq!(m.up(100_007), Some(2));
+        assert_eq!(
+            IdMap::parse(b"0 15 10").unwrap().lower_to_kernel(&parent),
+            Err(Errno::EPERM)
+        );
+
+        // uid 1000 新建的命名空间：里面有全部能力，开机时的命名空间里没有；没写映射时 ID
+        // 显示成 65534
+        let user = Cred {
+            ruid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            cap_effective: 0,
+            cap_permitted: 0,
+            ..Cred::root()
+        };
+        let init = user.user_ns.clone();
+        let mut inside = user.clone();
+        inside.enter_user_ns(UserNs::child(&init, 1000));
+        let ns = inside.user_ns.clone();
+        assert!(inside.capable_here(cap::SYS_ADMIN));
+        assert!(!inside.capable(cap::SYS_ADMIN));
+        assert!(inside.ns_capable(&ns, cap::SYS_ADMIN));
+        assert!(!inside.ns_capable(&init, cap::SYS_ADMIN));
+        assert_eq!(inside.uid_out(1000), OVERFLOW_ID);
+        // 建立者（同一个有效用户 ID）在上一层对它有全部能力，别的用户、root 的普通能力不算
+        assert!(user.ns_capable(&ns, cap::SYS_ADMIN));
+        assert!(Cred::root().ns_capable(&ns, cap::SYS_ADMIN));
+        let other = Cred {
+            euid: 2000,
+            ..user.clone()
+        };
+        assert!(!other.ns_capable(&ns, cap::SYS_ADMIN));
+        // 写好 0 -> 1000 的映射：里面是 root；DAC 的能力只对有映射的文件有效
+        *ns.uid_map.borrow_mut() = IdMap(vec![(0, 1000, 1)]);
+        *ns.gid_map.borrow_mut() = IdMap(vec![(0, 0, 1)]);
+        assert_eq!(inside.uid_out(1000), 0);
+        assert_eq!(inside.uid_in(0), Some(1000));
+        assert_eq!(inside.uid_in(1), None);
+        assert!(inside.permission(&file(0o600, 1000, 0), MAY_READ).is_ok());
+        assert_eq!(
+            inside.permission(&file(0o600, 0, 0), MAY_READ),
+            Err(Errno::EACCES)
+        );
+        // 换成映射不到的用户之后（setuid 的参数由 syscall 层换算）不再是 root，能力随之清掉
+        let mut c = inside.clone();
+        c.setresuid(None, Some(5000), None).unwrap();
+        assert!(!c.capable_here(cap::SYS_ADMIN));
+        c.setresuid(None, Some(1000), None).unwrap();
+        assert!(c.capable_here(cap::SYS_ADMIN));
+        // 执行程序：里面的 root 保留能力
+        let mut e = inside.clone();
+        e.exec(None, None, None, false, false).unwrap();
+        assert_eq!(e.cap_effective, CAP_FULL);
     }
 
     #[test]

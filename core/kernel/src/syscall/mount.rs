@@ -83,7 +83,7 @@ pub(super) fn mount(
     if flags & MS_NOUSER != 0 {
         return Err(Errno::EINVAL);
     }
-    if !cx.cred().capable(cap::SYS_ADMIN) {
+    if !may_mount(cx) {
         return Err(Errno::EPERM);
     }
     // 挂载的标志，默认 relatime
@@ -442,7 +442,7 @@ fn move_mount(
 /// 挂载的位置，原来的根挂到 `put_old` 上；根目录、当前目录是原来的根目录的进程都换成
 /// `new_root`（`chroot_fs_refs`）。
 pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysResult {
-    if !cx.cred().capable(cap::SYS_ADMIN) {
+    if !may_mount(cx) {
         return Err(Errno::EPERM);
     }
     let new = read_path(cx, new_root)?;
@@ -507,7 +507,7 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     }
     let path = read_path(cx, target)?;
     let node = lookup_at(cx, AT_FDCWD, &path, flags & UMOUNT_NOFOLLOW == 0)?;
-    if !cx.cred().capable(cap::SYS_ADMIN) {
+    if !may_mount(cx) {
         return Err(Errno::EPERM);
     }
     let vfs = cx.vfs()?;
@@ -543,6 +543,13 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     vfs.collect(&in_use(cx.kr()));
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// 能不能动挂载（Linux 的 `may_mount`）：在挂载命名空间的属主（用户命名空间）里有
+/// `CAP_SYS_ADMIN`。
+fn may_mount(cx: &Cx<'_>) -> bool {
+    let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
+    cx.cred().ns_capable(&owner, cap::SYS_ADMIN)
 }
 
 /// 挂载 `id` 挂在树上、在调用者的挂载命名空间里（Linux 的 `check_mnt`），否则 EINVAL。

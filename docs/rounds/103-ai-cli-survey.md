@@ -57,7 +57,7 @@
 
 **推迟项**：
 
-- Codex、Claude Code 的沙箱用不了，与在没有特权的 docker 容器里一样：没有用户命名空间（§6）。要关掉沙箱用：Codex 用 `--dangerously-bypass-approvals-and-sandbox` 或者 `-s danger-full-access`，Claude Code 的沙箱默认就是关的。 → 拆成几轮在做：仓库里的目录 bind、`MS_MOVE`、pivot_root 已补上（M9 之前：仓库里的目录 bind），tmpfs 也补上了（M9 之前：tmpfs），挂载命名空间也补上了（M9 之前：挂载命名空间）；用户、pid、网络等命名空间仍没有，沙箱仍用不了
+- Codex、Claude Code 的沙箱用不了，与在没有特权的 docker 容器里一样：没有用户命名空间（§6）。要关掉沙箱用：Codex 用 `--dangerously-bypass-approvals-and-sandbox` 或者 `-s danger-full-access`，Claude Code 的沙箱默认就是关的。 → 拆成几轮在做：仓库里的目录 bind、`MS_MOVE`、pivot_root 已补上（M9 之前：仓库里的目录 bind），tmpfs 也补上了（M9 之前：tmpfs），挂载命名空间也补上了（M9 之前：挂载命名空间），用户命名空间也补上了（M9 之前：用户命名空间）；pid、网络、IPC 命名空间仍没有，沙箱仍用不了
 - 内存：每个 CLI 的界面在 appine 里多占的是原生的 1.5 到 5 倍（Codex 最多：211 MiB 对 40 MiB），几个一起开，或者同时开着别的大程序，手机上容易碰到 App 的内存上限（[第二轮普查](70-survey-suites.md)的问题 5）。→ 代码缓存的两个视图原来各算一次，已改为只算一次（M9 之前：代码缓存只算一次），Codex 的界面 294 → 208 MB；剩下多的主要是 codex 本身的翻译（43.9 MB），要提高翻译代码的密度；密度提高之后 codex 的代码缓存 44.4 → 38.3 MB（M9 之前：翻译代码的密度），Codex 只有两个大进程，同一个程序共用翻译帮不上忙（M9 之前：同一个程序共用翻译）
 - 只跑了无头模式和交互界面的启动画面，没有在交互界面里走完一轮对话；没有连真正的模型（没有账号）；Debian 上没有原生对照（开发虚拟机上 docker 的磁盘满了），Ubuntu 没跑；没上手机。
-- `overflowuid` 这几个文件只读，Linux 上 root 可以改。没有用户命名空间，这几个值用不上。
+- `overflowuid` 这几个文件只读，Linux 上 root 可以改。没有用户命名空间，这几个值用不上。 → 用户命名空间补上之后用上了（M9 之前：用户命名空间）；仍只读

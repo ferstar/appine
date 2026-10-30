@@ -97,6 +97,12 @@ pub(crate) enum Entry {
     Cgroup,
     /// 命名空间的目录（[`NsKind`]）。
     Ns,
+    /// 用户命名空间的 ID 映射（user_namespaces(7)）：`uid_map`、`gid_map`、`projid_map`，
+    /// 以及 `setgroups`。
+    UidMap,
+    GidMap,
+    ProjidMap,
+    Setgroups,
 }
 
 /// 命名空间的种类（`/proc/<pid>/ns` 里的项）。只有挂载命名空间可以新建，别的都是开机时的
@@ -170,22 +176,25 @@ impl NsKind {
     }
 
     /// 线程 `task` 的这种命名空间的编号（inode 号）：挂载命名空间的按它的 `FsContext`，
-    /// 别的是开机时的那个（与 Linux 常见的编号相同）。
-    pub(crate) fn id_of(self, task: &Task) -> u64 {
+    /// 用户命名空间的按它的凭据，别的是开机时的那个（与 Linux 常见的编号相同）。
+    pub(crate) fn id_of(self, k: &Kernel, task: &Task) -> u64 {
         match self {
             NsKind::Mnt => task.res.borrow().fs.borrow().mnt_ns.id,
+            NsKind::User => k
+                .groups
+                .get(&task.tgid)
+                .map_or(crate::cred::INIT_USER_NS, |g| g.borrow().cred.user_ns.id),
             NsKind::Cgroup => 4_026_531_835,
             NsKind::Ipc => 4_026_531_839,
             NsKind::Net => 4_026_531_840,
             NsKind::Pid | NsKind::PidForChildren => 4_026_531_836,
             NsKind::Time | NsKind::TimeForChildren => 4_026_531_834,
-            NsKind::User => 4_026_531_837,
             NsKind::Uts => 4_026_531_838,
         }
     }
 }
 
-const ENTRIES: [(&[u8], Entry); 26] = [
+const ENTRIES: [(&[u8], Entry); 30] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -212,6 +221,10 @@ const ENTRIES: [(&[u8], Entry); 26] = [
     (b"coredump_filter", Entry::CoredumpFilter),
     (b"cgroup", Entry::Cgroup),
     (b"ns", Entry::Ns),
+    (b"uid_map", Entry::UidMap),
+    (b"gid_map", Entry::GidMap),
+    (b"projid_map", Entry::ProjidMap),
+    (b"setgroups", Entry::Setgroups),
 ];
 
 /// `/proc/<pid>/net` 下的文件。与 Linux 一样，`/proc/net` 是指向 `self/net` 的链接。
@@ -237,7 +250,7 @@ const PROC_NET: [&[u8]; 18] = [
 ];
 
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 62] = [
+const STATIC: [&[u8]; 71] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -292,6 +305,15 @@ const STATIC: [&[u8]; 62] = [
     b"sys/kernel/tainted",
     b"sys/kernel/threads-max",
     b"sys/kernel/version",
+    b"sys/user/",
+    b"sys/user/max_cgroup_namespaces",
+    b"sys/user/max_ipc_namespaces",
+    b"sys/user/max_mnt_namespaces",
+    b"sys/user/max_net_namespaces",
+    b"sys/user/max_pid_namespaces",
+    b"sys/user/max_time_namespaces",
+    b"sys/user/max_user_namespaces",
+    b"sys/user/max_uts_namespaces",
     b"sys/vm/",
     b"sys/vm/max_map_count",
     b"sys/vm/overcommit_memory",
@@ -549,7 +571,7 @@ pub(crate) enum PseudoNode {
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
-const TASK_ENTRIES: [Entry; 20] = [
+const TASK_ENTRIES: [Entry; 24] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -570,6 +592,10 @@ const TASK_ENTRIES: [Entry; 20] = [
     Entry::Cgroup,
     Entry::Net,
     Entry::Ns,
+    Entry::UidMap,
+    Entry::GidMap,
+    Entry::ProjidMap,
+    Entry::Setgroups,
 ];
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
@@ -599,7 +625,7 @@ impl Pseudo for Offline {
     fn readlink(&self, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
         Err(Errno::EINVAL)
     }
-    fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Node> {
+    fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Result<Node, Errno>> {
         None
     }
 }
@@ -679,6 +705,12 @@ impl<'a> View<'a> {
             .find(|&&t| t == pid)
             .or(threads.first())
             .and_then(|t| self.k.tasks.get(t).cloned())
+    }
+
+    /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
+    pub(crate) fn reader(&self) -> Cred {
+        self.group(self.tgid)
+            .map_or_else(Cred::root, |g| g.borrow().cred.clone())
     }
 
     /// `/proc/<pid>/task/<tid>` 用指定的线程，否则用代表线程。
@@ -899,6 +931,9 @@ impl Pseudo for View<'_> {
             Global(self::Global::Net) => Ok(b"self/net".to_vec()),
             Entry(pid, tid, self::Entry::Root) => {
                 let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*pid) {
+                    return Err(Errno::EACCES);
+                }
                 let root = task.res.borrow().fs.borrow().root.clone();
                 self.vfs.path_of(self, &self.root(), &root)
             }
@@ -913,6 +948,9 @@ impl Pseudo for View<'_> {
             }
             Entry(pid, tid, self::Entry::Cwd) => {
                 let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*pid) {
+                    return Err(Errno::EACCES);
+                }
                 let cwd = task.res.borrow().fs.borrow().cwd.clone();
                 self.vfs.path_of(self, &self.root(), &cwd)
             }
@@ -927,31 +965,58 @@ impl Pseudo for View<'_> {
             }
             Ns(pid, tid, k) => {
                 let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
-                Ok(self.name(&NsFile(*k, k.id_of(&task))))
+                if !self.may_read(*pid) {
+                    return Err(Errno::EACCES);
+                }
+                Ok(self.name(&NsFile(*k, k.id_of(self.k, &task))))
             }
             _ => Err(Errno::EINVAL),
         }
     }
 
-    fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
+    fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
         match node {
             PseudoNode::Ns(pid, tid, k) => {
                 let task = self.task(*pid, *tid)?;
-                return Some(Node::Pseudo(mnt, PseudoNode::NsFile(*k, k.id_of(&task))));
+                if !self.may_read(*pid) {
+                    return Some(Err(Errno::EACCES));
+                }
+                let ns = PseudoNode::NsFile(*k, k.id_of(self.k, &task));
+                return Some(Ok(Node::Pseudo(mnt, ns)));
             }
             // 根目录、当前目录直接指到那个进程的节点（Linux 的 proc_root_link、
             // proc_cwd_link）：经由它们能进到别的挂载命名空间、chroot 的外面
             PseudoNode::Entry(pid, tid, e @ (Entry::Root | Entry::Cwd)) => {
                 let task = self.task(*pid, *tid)?;
+                if !self.may_read(*pid) {
+                    return Some(Err(Errno::EACCES));
+                }
                 let res = task.res.borrow();
                 let fs = res.fs.borrow();
-                return Some(match e {
+                return Some(Ok(match e {
                     Entry::Root => fs.root.clone(),
                     _ => fs.cwd.clone(),
-                });
+                }));
             }
             _ => {}
         }
+        self.follow_fd(mnt, node).map(Ok)
+    }
+}
+
+impl View<'_> {
+    /// 读者能不能看进程 `pid` 的根目录、当前目录、命名空间（Linux 的
+    /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`）。
+    fn may_read(&self, pid: Tid) -> bool {
+        pid == self.tgid
+            || self.group(pid).is_some_and(|g| {
+                let g = g.borrow();
+                self.reader().may_ptrace(&g.cred, g.dumpable, true)
+            })
+    }
+
+    /// `/proc/<pid>/fd/<n>` 跟随之后的节点（[`Pseudo::follow`]）。
+    fn follow_fd(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
         let PseudoNode::Fd(pid, fd) = node else {
             return None;
         };
@@ -1093,10 +1158,16 @@ pub(crate) fn pty(k: &Kernel, n: u32) -> Option<Rc<RefCell<Tty>>> {
 /// 记在终端上（[`Tty::owner`]），其余是 root。
 fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     match node {
+        // 不可 dump 的进程的文件属于它的用户命名空间里的 root（Linux 的 task_dump_owner）
         PseudoNode::Pid(pid, _) | PseudoNode::Entry(pid, ..) | PseudoNode::Fd(pid, _) => {
             k.groups.get(pid).map_or((0, 0), |g| {
-                let c = &g.borrow().cred;
-                (c.euid, c.egid)
+                let g = g.borrow();
+                let c = &g.cred;
+                if g.dumpable {
+                    (c.euid, c.egid)
+                } else {
+                    (c.uid_in(0).unwrap_or(0), c.gid_in(0).unwrap_or(0))
+                }
             })
         }
         PseudoNode::Pts(n) => pty(k, *n).map_or((0, 0), |t| t.borrow().owner),
@@ -1110,6 +1181,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
         node,
         PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
             | PseudoNode::Entry(_, _, Entry::Mem)
+            | PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap | Entry::Setgroups)
             | PseudoNode::Static(
                 b"sys/kernel/hostname"
                     | b"sys/kernel/domainname"
@@ -1151,6 +1223,13 @@ pub(crate) fn write(
     node: &PseudoNode,
     data: &[u8],
 ) -> Result<(), Errno> {
+    match node {
+        PseudoNode::Entry(pid, _, e @ (Entry::UidMap | Entry::GidMap)) => {
+            return write_id_map(k, cred, *pid, *e == Entry::GidMap, data);
+        }
+        PseudoNode::Entry(pid, _, Entry::Setgroups) => return write_setgroups(k, cred, *pid, data),
+        _ => {}
+    }
     if let PseudoNode::Static(path) = node
         && let Some(name) = path.strip_prefix(b"sys/kernel/")
         && k.ipc.tunables.read(name).is_some()
@@ -1573,10 +1652,30 @@ fn pid_status(ps: &View<'_>, pid: Tid, tid: Option<Tid>) -> Result<String, Errno
     writeln!(s, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{}", tid.unwrap_or(pid)).unwrap();
     let tracer = task.as_ref().and_then(|t| t.trace.borrow().tracer);
     writeln!(s, "PPid:\t{}\nTracerPid:\t{}", g.ppid, tracer.unwrap_or(0)).unwrap();
+    // ID 按读者的用户命名空间换算（Linux 的 seq_user_ns）
     let c = &g.cred;
-    writeln!(s, "Uid:\t{}\t{}\t{}\t{}", c.ruid, c.euid, c.suid, c.fsuid).unwrap();
-    writeln!(s, "Gid:\t{}\t{}\t{}\t{}", c.rgid, c.egid, c.sgid, c.fsgid).unwrap();
-    let groups: Vec<String> = c.groups.iter().map(u32::to_string).collect();
+    let r = ps.reader();
+    let u = |k: u32| r.uid_out(k);
+    let gi = |k: u32| r.gid_out(k);
+    writeln!(
+        s,
+        "Uid:\t{}\t{}\t{}\t{}",
+        u(c.ruid),
+        u(c.euid),
+        u(c.suid),
+        u(c.fsuid)
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "Gid:\t{}\t{}\t{}\t{}",
+        gi(c.rgid),
+        gi(c.egid),
+        gi(c.sgid),
+        gi(c.fsgid)
+    )
+    .unwrap();
+    let groups: Vec<String> = c.groups.iter().map(|&g| gi(g).to_string()).collect();
     writeln!(s, "FDSize:\t{fdsize}\nGroups:\t{}", groups.join(" ")).unwrap();
     if task.is_some() {
         let kb = vsize / 1024;
@@ -2285,9 +2384,13 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             self::Global::Cpuinfo => cpuinfo(),
             self::Global::Meminfo => meminfo(),
             self::Global::Stat => global_stat(ps),
+            // 与 Linux 的 uptime_proc_show 一样截断到百分之一秒（四舍五入的话 x.996 秒会写成
+            // 下一秒，比随后 sysinfo 报告的还大）
             self::Global::Uptime => {
-                let up = uptime_ns() as f64 / 1e9;
-                format!("{up:.2} {:.2}\n", up * cpus() as f64)
+                let hundredths =
+                    |ns: u64| format!("{}.{:02}", ns / 1_000_000_000, ns / 10_000_000 % 100);
+                let up = uptime_ns();
+                format!("{} {}\n", hundredths(up), hundredths(up * cpus() as u64))
             }
             self::Global::Loadavg => crate::loadavg::proc_loadavg(ps.k),
             self::Global::Version => {
@@ -2375,12 +2478,15 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
             // 映射不到的用户、组 ID 显示成的 ID（Linux 的默认值，bubblewrap 启动时读它）。
-            // 没有用户命名空间，用不上，不能改
+            // 不能改
             b"sys/kernel/overflowuid"
             | b"sys/kernel/overflowgid"
             | b"sys/fs/overflowuid"
             | b"sys/fs/overflowgid" => "65534\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
+            // 每个用户能建的各种命名空间个数的上限：与 Linux 的默认值一样是 threads-max 的
+            // 一半，只读，不实际限制
+            p if p.starts_with(b"sys/user/max_") => format!("{}\n", ps.k.threads_max / 2),
             b"sys/kernel/random/boot_id" => format!("{}\n", format_uuid(&ps.k.boot_id)),
             b"sys/kernel/random/entropy_avail" | b"sys/kernel/random/poolsize" => {
                 format!("{}\n", crate::syscall::ENTROPY)
@@ -2437,6 +2543,16 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
                 }
+                e @ (self::Entry::UidMap | self::Entry::GidMap | self::Entry::ProjidMap) => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let ns = g.borrow().cred.user_ns.clone();
+                    id_map(&ps.reader(), &ns, *e)
+                }
+                self::Entry::Setgroups => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let allow = g.borrow().cred.user_ns.setgroups.get();
+                    format!("{}\n", if allow { "allow" } else { "deny" })
+                }
                 self::Entry::CoredumpFilter => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{:08x}\n", g.borrow().coredump_filter)
@@ -2460,6 +2576,99 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())
+}
+
+/// `/proc/<pid>/uid_map`、`gid_map`、`projid_map`（Linux 的 `uid_m_show`）：每段
+/// "命名空间里的起点 上一层的起点 个数"，各占 10 列。第二列按读者的命名空间换算；读者就在
+/// 这个命名空间里时按上一层的。映射不到写 4294967295。projid_map 只有开机时的命名空间有。
+fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
+    let lower = match &ns.parent {
+        Some(parent) if reader.user_ns.id == ns.id => parent.clone(),
+        _ => reader.user_ns.clone(),
+    };
+    let (map, lower_map) = match e {
+        Entry::GidMap => (ns.gid_map.borrow().clone(), lower.gid_map.borrow().clone()),
+        Entry::UidMap => (ns.uid_map.borrow().clone(), lower.uid_map.borrow().clone()),
+        _ if ns.level == 0 => return format!("{:>10} {:>10} {:>10}\n", 0, 0, u32::MAX),
+        _ => return String::new(),
+    };
+    map.extents()
+        .iter()
+        .map(|&(first, k, count)| {
+            let shown = lower_map.up(k).unwrap_or(u32::MAX);
+            format!("{first:>10} {shown:>10} {count:>10}\n")
+        })
+        .collect()
+}
+
+/// 写 `/proc/<pid>/uid_map`、`gid_map`（Linux 的 `map_write`）：只能写一次（EPERM），写的
+/// 进程要在那个用户命名空间里有 `CAP_SYS_ADMIN`（EPERM），内容不对是 EINVAL；然后看
+/// `new_idmap_permitted`：建立者把自己的有效 ID 映射成一段一个（gid_map 要先把 setgroups
+/// 写成 deny），或者在上一层命名空间里有 `CAP_SETUID`/`CAP_SETGID`，否则 EPERM。第二列在
+/// 上一层里映射不到也是 EPERM。Linux 按打开文件的凭据检查前两条，这里按写的进程的。
+fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> Result<(), Errno> {
+    let g = k.groups.get(&pid).ok_or(Errno::ESRCH)?;
+    let ns = g.borrow().cred.user_ns.clone();
+    let map = if gid { &ns.gid_map } else { &ns.uid_map };
+    if !map.borrow().extents().is_empty() || !writer.ns_capable(&ns, cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let new = crate::cred::IdMap::parse(data)?;
+    let parent = ns.parent.clone().ok_or(Errno::EPERM)?;
+    let parent_map = if gid {
+        parent.gid_map.borrow().clone()
+    } else {
+        parent.uid_map.borrow().clone()
+    };
+    let own = match new.extents() {
+        &[(_, lower, 1)] if ns.owner == writer.euid => {
+            if gid {
+                !ns.setgroups.get() && parent_map.down(lower) == Some(writer.egid)
+            } else {
+                parent_map.down(lower) == Some(writer.euid)
+            }
+        }
+        _ => false,
+    };
+    let setid = if gid { cap::SETGID } else { cap::SETUID };
+    if !own && !writer.ns_capable(&parent, setid) {
+        return Err(Errno::EPERM);
+    }
+    let kernel = new.lower_to_kernel(&parent_map)?;
+    *map.borrow_mut() = kernel;
+    Ok(())
+}
+
+/// 写 `/proc/<pid>/setgroups`（Linux 的 `proc_setgroups_write`）："allow" 或 "deny"，后面
+/// 只能有空白（EINVAL）；要在那个用户命名空间里有 `CAP_SYS_ADMIN`。禁止了之后不能再允许，
+/// gid_map 写过之后不能禁止（EPERM）。
+fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
+    let g = k.groups.get(&pid).ok_or(Errno::ESRCH)?;
+    let ns = g.borrow().cred.user_ns.clone();
+    if !writer.ns_capable(&ns, cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let (allow, rest) = if let Some(rest) = data.strip_prefix(b"allow") {
+        (true, rest)
+    } else if let Some(rest) = data.strip_prefix(b"deny") {
+        (false, rest)
+    } else {
+        return Err(Errno::EINVAL);
+    };
+    if !rest.iter().all(u8::is_ascii_whitespace) {
+        return Err(Errno::EINVAL);
+    }
+    if allow {
+        if !ns.setgroups.get() {
+            return Err(Errno::EPERM);
+        }
+    } else {
+        if !ns.gid_map.borrow().extents().is_empty() {
+            return Err(Errno::EPERM);
+        }
+        ns.setgroups.set(false);
+    }
+    Ok(())
 }
 
 /// 宿主编号为 `index` 的接口。

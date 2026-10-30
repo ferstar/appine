@@ -757,7 +757,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         PR_SET_SECCOMP => crate::seccomp::prctl_set(cx, arg, args[1]),
         PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok((cx.cred().cap_bounding >> arg) & 1),
         PR_CAPBSET_DROP if arg <= CAP_LAST_CAP => {
-            if !cx.cred().capable(cap::SETPCAP) {
+            if !cx.cred().capable_here(cap::SETPCAP) {
                 return Err(Errno::EPERM);
             }
             cx.t.group.borrow_mut().cred.cap_bounding &= !(1 << arg);
@@ -870,7 +870,7 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
             .map(|g| g.borrow().cred.clone())
             .ok_or(Errno::ESRCH)?;
         let cred = cx.cred();
-        if cred.ruid != target.ruid && !cred.capable(cap::SYS_PTRACE) {
+        if cred.ruid != target.ruid && !cred.ns_capable(&target.user_ns, cap::SYS_PTRACE) {
             return Err(Errno::EPERM);
         }
         task.robust_list.get()
@@ -881,7 +881,9 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
 }
 
 pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
-    let (uptime, _) = appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME).map_err(Errno)?;
+    // 与 Linux 的 do_sysinfo 一样有零头就进一秒
+    let (secs, ns) = appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME).map_err(Errno)?;
+    let uptime = secs + i64::from(ns != 0);
     let m = appine_hal::host_meminfo();
     let procs = cx.kr().tasks.len().min(u16::MAX as usize) as u16;
     // struct sysinfo（64 位）：uptime、loads[3]、totalram、freeram、sharedram、bufferram、

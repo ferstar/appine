@@ -79,6 +79,9 @@ pub(crate) const INIT_MNT_NS: u64 = 4_026_531_841;
 #[derive(Debug)]
 pub(crate) struct MntNs {
     pub id: u64,
+    /// 属主：建立它时所在的用户命名空间（挂载要在这里有 `CAP_SYS_ADMIN`，Linux 的
+    /// `may_mount`）。
+    pub owner: std::rc::Rc<crate::cred::UserNs>,
 }
 
 /// 分配新的命名空间编号（Linux 的 `proc_alloc_inum`，各种命名空间共用）。
@@ -255,9 +258,9 @@ pub(crate) trait Pseudo {
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno>;
     /// 符号链接的内容。
     fn readlink(&self, node: &PseudoNode) -> Result<Vec<u8>, Errno>;
-    /// "魔法链接"（`/proc/<pid>/fd/<n>` 等）跟随之后直接得到的节点，不按内容解析。
-    /// `mnt` 是链接所在的挂载。
-    fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Node>;
+    /// "魔法链接"（`/proc/<pid>/fd/<n>` 等）跟随之后直接得到的节点，不按内容解析；不是魔法
+    /// 链接时是 None，不许跟随时是错误（EACCES）。`mnt` 是链接所在的挂载。
+    fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>>;
 }
 
 /// 一个虚拟文件系统实例。
@@ -544,7 +547,10 @@ impl Vfs {
             mounts: RefCell::new(mounts),
             cached: RefCell::new(cached),
             executables: Default::default(),
-            init_ns: std::rc::Rc::new(MntNs { id: INIT_MNT_NS }),
+            init_ns: std::rc::Rc::new(MntNs {
+                id: INIT_MNT_NS,
+                owner: crate::cred::UserNs::init(),
+            }),
             namespaces: Default::default(),
         })
     }
@@ -842,7 +848,7 @@ impl Vfs {
                 if let Node::Pseudo(id, p) = &node
                     && let Some(target) = ps.follow(*id, p)
                 {
-                    dir = target;
+                    dir = target?;
                     found = None;
                     continue;
                 }
@@ -1011,17 +1017,21 @@ impl Vfs {
             .find(|ns| ns.id == id)
     }
 
-    /// 复制挂载命名空间 `from` 里挂在树上的所有挂载，成为新的命名空间（Linux 的
-    /// `copy_mnt_ns`）。返回新的命名空间和旧挂载编号到新挂载编号的对照：调用方据此把进程的
+    /// 复制挂载命名空间 `from` 里挂在树上的所有挂载，成为属于用户命名空间 `owner` 的新的
+    /// 命名空间（Linux 的 `copy_mnt_ns`）。返回新的命名空间和旧挂载编号到新挂载编号的对照：调用方据此把进程的
     /// 根目录、当前目录换到新的挂载上。
     pub(crate) fn copy_ns(
         &self,
         from: u64,
+        owner: std::rc::Rc<crate::cred::UserNs>,
     ) -> (
         std::rc::Rc<MntNs>,
         std::collections::HashMap<MountId, MountId>,
     ) {
-        let ns = std::rc::Rc::new(MntNs { id: new_ns_id() });
+        let ns = std::rc::Rc::new(MntNs {
+            id: new_ns_id(),
+            owner,
+        });
         let mut mounts = self.mounts.borrow_mut();
         let old: Vec<Mount> = mounts
             .list
@@ -1618,7 +1628,7 @@ mod tests {
         fn readlink(&self, _: &PseudoNode) -> Result<Vec<u8>, Errno> {
             Err(Errno::EINVAL)
         }
-        fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Node> {
+        fn follow(&self, _: MountId, _: &PseudoNode) -> Option<Result<Node, Errno>> {
             None
         }
     }
@@ -2108,7 +2118,7 @@ mod tests {
             .unwrap();
         let before = vfs.mounts_in(INIT_MNT_NS);
         // 复制出来的命名空间：挂载一一对应，编号是新的，挂载点、根目录跟着换
-        let (ns, map) = vfs.copy_ns(INIT_MNT_NS);
+        let (ns, map) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
         let copied = vfs.mounts_in(ns.id);
         assert_eq!(copied.len(), before.len());
         assert!(copied.iter().all(|m| !map.contains_key(&m.id)));

@@ -36,9 +36,11 @@ const CLONE_CHILD_SETTID: u64 = 0x1000000;
 const CLONE_SYSVSEM: u64 = 0x40000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
-/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：只支持挂载命名空间
-/// （`syscall::ns`），别的是 EPERM（设计文档 §6）。
+/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载命名空间、用户
+/// 命名空间（`syscall::ns`），别的是 EPERM（设计文档 §6）。
 const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
+/// 支持的 `CLONE_NEW*`。
+const CLONE_NEW_DONE: u64 = CLONE_NEWNS | CLONE_NEWUSER;
 /// clone3：子进程的信号处理函数恢复默认。
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// clone3：子进程放进 `cgroup` 指定的 cgroup。
@@ -201,16 +203,23 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let both = |a: u64, b: u64| flags & (a | b) == a | b;
     if both(CLONE_NEWNS, CLONE_FS)
         || both(CLONE_NEWUSER, CLONE_FS)
+        || both(CLONE_NEWUSER, CLONE_THREAD)
         || (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
         || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
         || (flags & CLONE_PIDFD != 0 && flags & (CLONE_DETACHED | CLONE_THREAD) != 0)
     {
         return Err(Errno::EINVAL);
     }
-    if flags & CLONE_NEW_MASK & !CLONE_NEWNS != 0 {
+    if flags & CLONE_NEW_MASK & !CLONE_NEW_DONE != 0 {
         return Err(Errno::EPERM);
     }
-    if flags & CLONE_NEWNS != 0 && !cx.cred().capable(cap::SYS_ADMIN) {
+    // 新的用户命名空间先建好，别的命名空间属于它、按它的能力检查（Linux 的 copy_creds 在
+    // copy_namespaces 之前）
+    let mut child_cred = cx.cred();
+    if flags & CLONE_NEWUSER != 0 {
+        super::ns::new_user_ns(&mut child_cred, super::ns::chrooted(cx))?;
+    }
+    if flags & CLONE_NEWNS != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let thread = flags & CLONE_THREAD != 0;
@@ -256,7 +265,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
             mnt_ns: f.mnt_ns.clone(),
         };
         if flags & CLONE_NEWNS != 0 {
-            super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut copy);
+            let owner = child_cred.user_ns.clone();
+            super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut copy, owner);
         }
         Rc::new(RefCell::new(copy))
     };
@@ -287,7 +297,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
         g.oom_score_adj_min = parent.oom_score_adj_min;
-        g.cred = parent.cred.clone();
+        g.cred = child_cred;
         g.personality = parent.personality;
         g.thp_disable = parent.thp_disable;
         g.coredump_filter = parent.coredump_filter;
@@ -662,7 +672,10 @@ fn exec(
     // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后、nosuid 的挂载里不生效）和程序文件的
     // 能力；脚本看的是解释器。被没有 CAP_SYS_PTRACE 的跟踪者跟踪着时得不到新的特权
     let no_new_privs = cx.t.group.borrow().no_new_privs;
-    let setid = |bit: u32| st.mode & bit == bit && !no_new_privs && !nosuid;
+    // 文件的属主、属组在自己的用户命名空间里没有映射时也不生效（bprm_fill_uid）
+    let mapped = cred.user_ns.uid_map.borrow().up(st.uid).is_some()
+        && cred.user_ns.gid_map.borrow().up(st.gid).is_some();
+    let setid = |bit: u32| st.mode & bit == bit && !no_new_privs && !nosuid && mapped;
     let fcaps = if nosuid {
         None
     } else {
@@ -730,7 +743,8 @@ fn exec(
         g.sample_rss_at_exec(&cx.mm());
         g.exe = exe.to_vec();
         // 与 Linux 的 commit_creds 一样，换了有效 ID、得到了新的能力时不能 core dump，
-        // 父进程退出时也不再发信号给它；特权执行同样不再发
+        // 父进程退出时也不再发信号给它；特权执行同样不再发。别的执行恢复成可以 dump
+        // （begin_new_exec），程序文件不让调用者读时除外（would_dump）
         let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
         let gained = new_cred.cap_permitted & !g.cred.cap_permitted != 0;
         if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid)
@@ -739,6 +753,8 @@ fn exec(
         {
             g.dumpable = false;
             g.pdeathsig = 0;
+        } else {
+            g.dumpable = cred.permission(&st, crate::cred::MAY_READ).is_ok();
         }
         if secure {
             g.pdeathsig = 0;
@@ -1137,14 +1153,10 @@ pub(super) fn pidfd_open(cx: &mut Cx<'_>, pid: i32, flags: u32) -> SysResult {
     cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
 }
 
-/// 能不能像 ptrace 那样访问 `target`（`PTRACE_MODE_ATTACH_REALCREDS`）：是自己；或者
-/// 真实用户和组等于目标的所有用户和组，并且目标可以 dump；或者有 `CAP_SYS_PTRACE`。
+/// 能不能像 ptrace 那样访问 `target`（`PTRACE_MODE_ATTACH_REALCREDS`）：是自己，或者
+/// [`Cred::may_ptrace`]。
 pub(super) fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
-    let me = cx.cred();
-    let t = &target.cred;
-    let same = [t.ruid, t.euid, t.suid].iter().all(|&u| u == me.ruid)
-        && [t.rgid, t.egid, t.sgid].iter().all(|&g| g == me.rgid);
-    target.tgid == cx.tgid() || (same && target.dumpable) || me.capable(cap::SYS_PTRACE)
+    target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, false)
 }
 
 /// pidfd_getfd：把 pidfd 指向的进程的 `target` 复制一份到调用者，带 close-on-exec。
@@ -1251,8 +1263,8 @@ pub(super) fn kcmp(
     })
 }
 
-/// unshare：不再和别的线程、进程共用某些资源。命名空间只支持挂载命名空间，别的与 clone
-/// 一样返回 EPERM。与 Linux 一样，`CLONE_THREAD`、`CLONE_SIGHAND`、`CLONE_VM` 只在本来就
+/// unshare：不再和别的线程、进程共用某些资源。命名空间只支持挂载命名空间、用户命名空间，
+/// 别的与 clone 一样返回 EPERM。与 Linux 一样，`CLONE_THREAD`、`CLONE_SIGHAND`、`CLONE_VM` 只在本来就
 /// 没有共用时成功（什么也不用做）。
 pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     let known = CLONE_THREAD
@@ -1287,10 +1299,15 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if shared {
         return Err(Errno::EINVAL);
     }
-    if flags & CLONE_NEW_MASK & !CLONE_NEWNS != 0 {
+    if flags & CLONE_NEW_MASK & !CLONE_NEW_DONE != 0 {
         return Err(Errno::EPERM);
     }
-    if flags & CLONE_NEWNS != 0 && !cx.cred().capable(cap::SYS_ADMIN) {
+    // 先算好新的凭据和各种检查，都通过了才改（Linux 的 ksys_unshare 最后才提交）
+    let mut new_cred = cx.cred();
+    if flags & CLONE_NEWUSER != 0 {
+        super::ns::new_user_ns(&mut new_cred, super::ns::chrooted(cx))?;
+    }
+    if flags & CLONE_NEWNS != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     // 每个线程的 TaskState 和 TaskRes 各持有一份引用
@@ -1316,8 +1333,13 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         };
         cx.set_fs(Rc::new(RefCell::new(copy)));
     }
+    if flags & CLONE_NEWUSER != 0 {
+        cx.t.group.borrow_mut().cred = new_cred.clone();
+        cx.shared.fast_changed();
+    }
     if flags & CLONE_NEWNS != 0 {
-        super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut cx.t.fs.borrow_mut());
+        let owner = new_cred.user_ns.clone();
+        super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut cx.t.fs.borrow_mut(), owner);
         cx.shared.fast_changed();
     }
     // 与 Linux 的 exit_sem 一样，执行并丢掉 SysV 信号量的 undo

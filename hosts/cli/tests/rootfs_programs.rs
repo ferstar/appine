@@ -508,6 +508,32 @@ fn file_permissions_apply_to_other_users() {
 }
 
 #[test]
+fn user_namespace_of_an_unprivileged_user() {
+    // nobody 自己建用户命名空间和挂载命名空间（busybox 的 unshare -r -m）：把自己映射成 root，
+    // 在里面有能力，但对没有映射的文件（属于真正的 root 的）没有特权，设备节点建不了；能在
+    // 自己的挂载命名空间里挂 tmpfs，外面看不到。期望值是上游 Linux 的行为：差分测试比不了，
+    // Ubuntu 的 kernel.apparmor_restrict_unprivileged_userns 不让这种命名空间里有能力
+    let inside = "id -u; id -g; tr -s ' ' < /proc/self/uid_map; \
+                  cat /etc/shadow 2>/dev/null || echo denied; \
+                  chown root /tmp 2>/dev/null || echo eperm; stat -c %u:%g /; \
+                  mount -t tmpfs t /mnt && touch /mnt/f && stat -c %u:%g /mnt/f; \
+                  mknod /mnt/d c 1 3 2>/dev/null || echo eperm; \
+                  grep -c ' /mnt ' /proc/self/mountinfo";
+    let script = format!(
+        "su -s /bin/sh nobody -c \"unshare -r -m sh -c \\\"{inside}\\\"\"; \
+         grep -c ' /mnt ' /proc/self/mountinfo"
+    );
+    for (tier, out) in run(&["/bin/sh", "-c", &script]) {
+        assert_eq!(
+            stdout(&out),
+            "0\n0\n 0 65534 1\ndenied\neperm\n65534:65534\n0:0\neperm\n1\n0\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn pipelines_connect_processes() {
     for (tier, out) in run(&[
         "/bin/sh",

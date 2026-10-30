@@ -235,6 +235,7 @@ impl Machine {
                     || {
                         Rc::new(crate::vfs::MntNs {
                             id: crate::vfs::INIT_MNT_NS,
+                            owner: crate::cred::UserNs::init(),
                         })
                     },
                     |v| v.init_ns(),

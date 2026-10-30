@@ -1761,7 +1761,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
     if let Node::Store(_, ino) = node {
         cred.permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
     }
-    if !cred.capable(cap::SYS_CHROOT) {
+    if !cred.capable_here(cap::SYS_CHROOT) {
         return Err(Errno::EPERM);
     }
     cx.t.fs.borrow_mut().root = node;
@@ -1847,6 +1847,24 @@ pub(super) fn newfstatat_flags(flags: u32) -> Result<(), Errno> {
 
 /// newfstatat、statx 共用：`*at` 风格地找到对象，返回 `struct stat`。
 fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
+    stat_at_kernel(cx, dirfd, path, flags).map(|st| owner_out(cx, st))
+}
+
+/// stat 结果里的属主、属组换成调用者的用户命名空间里的（映射不到是 65534）。
+fn owner_out(cx: &Cx<'_>, mut st: [u8; 128]) -> [u8; 128] {
+    let cred = cx.cred();
+    if cred.user_ns.level > 0 {
+        let word =
+            |b: &[u8; 128], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let (uid, gid) = (cred.uid_out(word(&st, 24)), cred.gid_out(word(&st, 28)));
+        st[24..28].copy_from_slice(&uid.to_le_bytes());
+        st[28..32].copy_from_slice(&gid.to_le_bytes());
+    }
+    st
+}
+
+/// [`stat_at`]，属主、属组是内核 ID。
+fn stat_at_kernel(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         file_stat(cx, &cx.fds().get(dirfd)?)
     } else {
@@ -1929,7 +1947,7 @@ pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
 }
 
 pub(super) fn fstat(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
-    let st = file_stat(cx, &cx.fds().get(fd)?)?;
+    let st = owner_out(cx, file_stat(cx, &cx.fds().get(fd)?)?);
     put(cx, buf, st).map(|()| 0)
 }
 
@@ -2493,7 +2511,7 @@ fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
         return Err(Errno::EPERM);
     }
     let mut perm = perm & 0o7777;
-    if !cred.in_group(st.gid) && !cred.capable(cap::FSETID) {
+    if !cred.in_group(st.gid) && !cred.capable_wrt(&st, cap::FSETID) {
         perm &= !mode::S_ISGID;
     }
     match target {
@@ -2543,15 +2561,21 @@ pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult 
     Ok(0)
 }
 
-/// 没有 `CAP_CHOWN` 时，属主只能把属组改成自己所在的组，不能修改属主。
+/// 没有 `CAP_CHOWN` 时，属主只能把属组改成自己所在的组，不能修改属主。ID 是调用者的用户
+/// 命名空间里的，映射不到是 EINVAL；`CAP_CHOWN` 要文件原来的属主、属组在里面有映射。
 fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
-    let (uid, gid) = (owner_arg(uid), owner_arg(gid));
-    let st = target.stat(cx)?;
     let cred = cx.cred();
+    let uid = owner_arg(uid)
+        .map(|u| cred.uid_in(u).ok_or(Errno::EINVAL))
+        .transpose()?;
+    let gid = owner_arg(gid)
+        .map(|g| cred.gid_in(g).ok_or(Errno::EINVAL))
+        .transpose()?;
+    let st = target.stat(cx)?;
     let owner = cred.fsuid == st.uid;
     let uid_ok = uid.is_none_or(|u| owner && u == st.uid);
     let gid_ok = gid.is_none_or(|g| owner && (g == st.gid || cred.in_group(g)));
-    if !(cred.capable(cap::CHOWN) || uid_ok && gid_ok) {
+    if !(cred.capable_wrt(&st, cap::CHOWN) || uid_ok && gid_ok) {
         return Err(Errno::EPERM);
     }
     match target {

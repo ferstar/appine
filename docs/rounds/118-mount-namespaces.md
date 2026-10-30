@@ -1,6 +1,6 @@
 # M9 之前：挂载命名空间（2026-10-30）
 
-← [M9 之前：tmpfs（2026-10-30）](117-tmpfs.md) · [索引](../milestones.md)
+← [M9 之前：tmpfs（2026-10-30）](117-tmpfs.md) · [索引](../milestones.md) · [M9 之前：用户命名空间（2026-10-30）](119-user-namespaces.md) →
 
 让 bubblewrap 能用的第三轮（[仓库里的目录 bind](116-store-binds.md)、[tmpfs](117-tmpfs.md) 之后）。bwrap 用一次 `clone(CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET)` 建好所有命名空间，原来这些标志都是 EPERM（§6 定过不做）。用户命名空间牵涉 70 多处能力检查和所有对外的 uid、gid，单独一轮；这一轮先做挂载命名空间，连同 `/proc/<pid>/ns` 和 setns 这些各种命名空间共用的部分。
 
@@ -18,7 +18,7 @@
 
 **推迟项**：
 
-- 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。
+- 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。 → 用户命名空间已补上（M9 之前：用户命名空间）；别的仍没有
 - 打开着的命名空间文件、bind 挂载出去的命名空间文件不让命名空间活着：用它的进程都退出之后就卸下了，之后对那个 fd setns 是 EINVAL。
 - 命名空间文件的 `NS_GET_USERNS`、`NS_GET_PARENT`、`NS_GET_NSTYPE`、`NS_GET_OWNER_UID` 这些 ioctl 没有（ENOTTY）；setns 不接受 pidfd。
 - `/proc/<pid>/ns/*`、`root`、`cwd` 跟随时不检查能不能跟踪那个进程（Linux 要 `PTRACE_MODE_READ_FSCREDS`）；`/proc/<pid>/exe` 仍按读出来的文字跟随。
