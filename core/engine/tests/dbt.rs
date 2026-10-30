@@ -184,26 +184,26 @@ fn pooled_instances_keep_translations_of_the_same_program() {
     };
     let mut g = Guest::new();
     g.code(CODE, &[movz_x0(7), SVC]);
-    let mut dbt = Dbt::attach(&space).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 7);
     drop((dbt, space));
     // 同一个程序再运行：拿回留下的翻译，核对之后直接用，不再翻译
     let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
-    let mut dbt = Dbt::attach(&space).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 7);
     assert_eq!(dbt.stats().blocks, 0);
     drop((dbt, space));
     // 这期间代码变了：核对时作废，重新翻译
     g.code(CODE, &[movz_x0(8), SVC]);
     let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
-    let mut dbt = Dbt::attach(&space).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
     drop((dbt, space));
     // 宿主内存紧张时丢掉池里保留的翻译：再运行要重新翻译（或者拷贝模板）
     appine_engine::trim_dbt_pool();
     let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
-    let mut dbt = Dbt::attach(&space).unwrap();
+    let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
 }
@@ -308,6 +308,47 @@ fn branches_to_unaligned_addresses_fault() {
         }
     }
     drop((dbt, cpu, mmu));
+}
+
+#[test]
+fn members_share_file_code_and_keep_jit_code_apart() {
+    // 两个地址空间共用一个实例：第一页是登记过的文件（共用），第二页各是各的 JIT 代码。共用的块
+    // 直接调用第二页：第一个成员链接过去之后，第二个成员照样要执行到自己的代码
+    let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
+        return;
+    };
+    let file = DbtSource {
+        start: CODE,
+        len: PAGE_SIZE,
+        id: [1, 2, 0, 3, 4],
+    };
+    space.share(&[file]);
+    let jit = CODE + PAGE_SIZE;
+    let tags = [space.new_tag().unwrap(), space.new_tag().unwrap()];
+    let mut members: Vec<(Guest, Dbt)> = (0..2)
+        .map(|i| {
+            let mut g = Guest::new();
+            g.code(CODE, &[bl(CODE, jit), SVC]);
+            g.code(jit, &[movz_x0(i as u16 + 1), RET]);
+            (g, Dbt::attach(&space, tags[i]).unwrap())
+        })
+        .collect();
+    for round in 0..3 {
+        for (n, (g, dbt)) in members.iter_mut().enumerate() {
+            assert_eq!(g.run(dbt), n as u64 + 1, "round {round}");
+        }
+    }
+    // 第二个成员只翻译了自己的 JIT 代码，第一页的两个块用第一个成员翻译的
+    assert_eq!(members[1].1.stats().blocks, 1);
+    // pc 超出 48 位时不会查到带标签的块：第二个成员跳到"第一个成员的标签 | JIT 代码的地址"
+    let (g, dbt) = &mut members[1];
+    let forged = jit | u64::from(tags[0]) << 48;
+    g.code(CODE + 8, &[0xd61f_0020]); // br x1
+    g.cpu.state_mut().x[1] = forged;
+    g.cpu.state_mut().pc = CODE + 8;
+    assert!(
+        matches!(dbt.run(&mut g.cpu), Exit::Fault { addr, access: Access::Exec, .. } if addr == forged)
+    );
 }
 
 #[test]

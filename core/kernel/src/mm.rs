@@ -577,6 +577,8 @@ pub struct Generations {
 /// 一个地址空间的 Tier 1 翻译，这个地址空间里的线程共用（[`Mm::code_space`]）。
 pub struct CodeSpace {
     pub space: Arc<appine_engine::DbtSpace>,
+    /// 这个地址空间在共用翻译的组里的标签（[`CodeGroup`]），不在组里时是 0。
+    pub tag: u16,
     /// 已经按代码失效的记录作废到的代码代数：第一个看到新代数的线程作废一次就够了。
     pub seen: Mutex<u64>,
 }
@@ -585,12 +587,15 @@ pub struct CodeSpace {
 /// 翻译时，并行编译的四个 cc1 各占 35–40 MB 代码缓存，20 个空闲的 python3 各 4 MB。
 ///
 /// 翻译只取决于 pc 和指令字，所以几个地址空间在同样的地址映射着同样的代码时，块对它们
-/// 都有效。成员的可执行映射都得是可信的文件映射（没写过、有版本的私有文件映射，和
-/// vDSO），而且与组里登记的一致：同一段地址只能是同一个版本的同一段文件（appine 没有
-/// ASLR，同一个程序的进程映射在同样的地址）。每次系统调用之后核对（[`Mm::sync`]）：映射了
-/// 别的可执行内存（JIT、写过的代码、与登记的不一致的文件）的成员离开组，换用自己的
-/// 翻译；只剩它一个时组就关掉，它留着原来的翻译。所以别的成员不会执行到只对它有效的块。
-/// 成员拆掉自己的映射时照常作废，别的成员只是要重新翻译。
+/// 都有效。成员可信的可执行映射（没写过、有版本的私有文件映射，和 vDSO）要与组里登记的
+/// 一致：同一段地址只能是同一个版本的同一段文件（appine 没有 ASLR，同一个程序的进程映射
+/// 在同样的地址）。登记过的映射里的块所有成员共用；别的可执行内存（JIT 生成的、写过的代码）
+/// 是成员私有的：引擎按成员的标签把那里的块分开（[`appine_engine::DbtSpace::share`]），
+/// 私有的范围不能压着登记过的，登记的也不能压着别的成员私有的（[`CodeGroup::admit`]）。
+/// node 的进程各有各的 JIT 代码，V8 的解释器、内置函数和 ICU 这些在 node 程序文件里的代码
+/// 照样共用。每次系统调用之后核对（[`Mm::sync`]）：不满足的成员离开组，换用自己的翻译；只剩
+/// 它一个时组就关掉，它留着原来的翻译。所以别的成员不会执行到只对它有效的块。成员拆掉自己的
+/// 映射时照常作废，别的成员只是要重新翻译。
 ///
 /// 只在持有 BKL 时访问。
 pub struct CodeGroup {
@@ -600,6 +605,8 @@ pub struct CodeGroup {
     members: Cell<usize>,
     /// 成员映射过的可执行映射，同一段地址只登记一个身份（[`CodeGroup::extend`]）。
     ranges: RefCell<Vec<appine_engine::DbtSource>>,
+    /// 成员私有的可执行内存 `(标签, 起点, 终点)`（[`CodeGroup::admit`]）。
+    claims: RefCell<Vec<(u16, u64, u64)>>,
     /// 不再接受新成员。
     closed: Cell<bool>,
     /// 有过不止一个成员：作废过登记范围以外的块。
@@ -642,6 +649,39 @@ impl CodeGroup {
             return false;
         }
         ranges.extend(new);
+        true
+    }
+
+    /// 成员 `tag` 的全部可执行映射：可信的 `layout` 和私有的 `private`（[`Mm::exec_split`]）。
+    /// layout 要与登记的一致（[`CodeGroup::extend`]）、不压着别的成员私有的范围，private 不压着
+    /// 登记过的：满足时登记 layout、换上这个成员私有的范围，返回 true，否则什么也不改。
+    fn admit(&self, tag: u16, layout: &[appine_engine::DbtSource], private: &[(u64, u64)]) -> bool {
+        let overlap = |start: u64, end: u64, s: u64, e: u64| start < e && s < end;
+        let ranges = self.ranges.borrow();
+        if private.iter().any(|&(s, e)| {
+            ranges
+                .iter()
+                .any(|r| overlap(r.start, r.start + r.len, s, e))
+        }) {
+            return false;
+        }
+        let before = ranges.len();
+        drop(ranges);
+        let mut claims = self.claims.borrow_mut();
+        if layout.iter().any(|l| {
+            claims
+                .iter()
+                .any(|&(t, s, e)| t != tag && overlap(l.start, l.start + l.len, s, e))
+        }) || !self.extend(layout)
+        {
+            return false;
+        }
+        claims.retain(|c| c.0 != tag);
+        claims.extend(private.iter().map(|&(s, e)| (tag, s, e)));
+        let ranges = self.ranges.borrow();
+        if ranges.len() != before {
+            self.space.share(&ranges);
+        }
         true
     }
 }
@@ -784,9 +824,10 @@ pub struct Mm {
     users: Vec<Arc<TaskSync>>,
     /// Tier 1 的翻译，第一个线程开始运行时创建（[`Mm::code_space`]）。
     code_space: Option<Arc<CodeSpace>>,
-    /// 共用翻译的组（[`CodeGroup`]）。
+    /// 共用翻译的组（[`CodeGroup`]）和在里面的标签。
     code_group: Option<Rc<CodeGroup>>,
-    /// 离开过组（或者一开始就有不可信的可执行映射）：不再加入。
+    code_tag: u16,
+    /// 离开过组（或者一开始就不能加入）：不再加入。
     unshareable: bool,
     /// 可执行映射有了变化，下一次 [`Mm::sync`] 时与组里登记的核对。
     exec_changed: bool,
@@ -1053,6 +1094,7 @@ impl Mm {
             users: Vec::new(),
             code_space: None,
             code_group: None,
+            code_tag: 0,
             unshareable: false,
             exec_changed: false,
             space_generation: Arc::new(AtomicU64::new(0)),
@@ -1172,6 +1214,7 @@ impl Mm {
             };
             self.code_space = Some(Arc::new(CodeSpace {
                 space,
+                tag: self.code_tag,
                 seen: Mutex::new(self.code_generation.load(Ordering::SeqCst)),
             }));
         }
@@ -1181,42 +1224,55 @@ impl Mm {
     /// 加入同一个程序的、映射一致的组，返回它的翻译。
     fn join_group(&mut self, groups: &CodeGroups) -> Option<Arc<appine_engine::DbtSpace>> {
         let key = self.exe.filter(|_| !self.unshareable)?;
-        let Some(layout) = self.exec_layout() else {
-            self.unshareable = true;
-            return None;
-        };
-        let group = groups
+        let (layout, private) = self.exec_split();
+        let candidates: Vec<_> = groups
             .borrow()
             .iter()
             .filter_map(Weak::upgrade)
-            .find(|g| g.key == key && !g.closed.get() && g.extend(&layout))?;
-        group.members.set(group.members.get() + 1);
-        // 原来只有一个成员：它从池里拿到的翻译可能还有只对它有效的块（上一个使用者留下的）
-        if !group.shared.replace(true) {
-            group.space.retire_outside(&group.ranges.borrow());
+            .filter(|g| g.key == key && !g.closed.get())
+            .collect();
+        for group in candidates {
+            let Some(tag) = group.space.new_tag() else {
+                // 标签用完了：不再接受新成员，之后的进程另开一组
+                group.closed.set(true);
+                continue;
+            };
+            if !group.admit(tag, &layout, &private) {
+                continue;
+            }
+            group.members.set(group.members.get() + 1);
+            // 原来只有一个成员：它从池里拿到的翻译可能还有只对它有效的块（上一个使用者留下的）
+            if !group.shared.replace(true) {
+                group.space.retire_outside(&group.ranges.borrow());
+            }
+            let space = group.space.clone();
+            self.code_group = Some(group);
+            self.code_tag = tag;
+            return Some(space);
         }
-        let space = group.space.clone();
-        self.code_group = Some(group);
-        Some(space)
+        None
     }
 
-    /// 刚创建了自己的翻译：映射都可信时开一个组，等同一个程序的别的地址空间来加入。
+    /// 刚创建了自己的翻译：开一个组，等同一个程序的别的地址空间来加入。
     fn found_group(&mut self, groups: &CodeGroups, space: &Arc<appine_engine::DbtSpace>) {
         let Some(key) = self.exe.filter(|_| !self.unshareable) else {
             return;
         };
-        let Some(layout) = self
-            .exec_layout()
-            .filter(|l| l.len() <= CodeGroup::MAX_RANGES)
+        let (layout, private) = self.exec_split();
+        let Some(tag) = (layout.len() <= CodeGroup::MAX_RANGES)
+            .then(|| space.new_tag())
+            .flatten()
         else {
             self.unshareable = true;
             return;
         };
+        space.share(&layout);
         let group = Rc::new(CodeGroup {
             key,
             space: space.clone(),
             members: Cell::new(1),
             ranges: RefCell::new(layout),
+            claims: RefCell::new(private.iter().map(|&(s, e)| (tag, s, e)).collect()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         });
@@ -1224,6 +1280,7 @@ impl Mm {
         groups.retain(|g| g.strong_count() > 0);
         groups.push(Rc::downgrade(&group));
         self.code_group = Some(group);
+        self.code_tag = tag;
     }
 
     /// 一个可执行的映射能不能和别的地址空间共用翻译：能时返回它的身份。可信的是没写过、
@@ -1251,13 +1308,20 @@ impl Mm {
         })
     }
 
-    /// 全部可执行映射的身份（[`Mm::exec_source`]）；有不可信的时返回 None。
-    fn exec_layout(&self) -> Option<Vec<appine_engine::DbtSource>> {
-        self.vmas
-            .iter()
-            .filter(|(_, v)| v.prot & prot::EXEC != 0)
-            .map(|(&s, v)| self.exec_source(s, v))
-            .collect()
+    /// 全部可执行映射：可信的身份（[`Mm::exec_source`]），和其余的范围 `[起点, 终点)`（JIT
+    /// 生成的、写过的代码，相接的合并成一段）。
+    fn exec_split(&self) -> (Vec<appine_engine::DbtSource>, Vec<(u64, u64)>) {
+        let (mut trusted, mut private) = (Vec::new(), Vec::<(u64, u64)>::new());
+        for (&start, v) in self.vmas.iter().filter(|(_, v)| v.prot & prot::EXEC != 0) {
+            match self.exec_source(start, v) {
+                Some(s) => trusted.push(s),
+                None => match private.last_mut() {
+                    Some(last) if last.1 == start => last.1 = start + v.len,
+                    _ => private.push((start, start + v.len)),
+                },
+            }
+        }
+        (trusted, private)
     }
 
     /// 可执行映射变了之后与组里登记的核对（[`CodeGroup`]），不一致时离开组。
@@ -1268,20 +1332,20 @@ impl Mm {
         let Some(group) = self.code_group.clone() else {
             return;
         };
-        if self
-            .exec_layout()
-            .is_some_and(|layout| group.extend(&layout))
-        {
+        let (layout, private) = self.exec_split();
+        if group.admit(self.code_tag, &layout, &private) {
             return;
         }
         crate::debug::log(format_args!(
             "Tier 1: an address space leaves the shared translations of inode {} ({} members): \
-             an executable mapping is untrusted or differs from theirs",
+             an executable mapping differs from theirs",
             group.key,
             group.members.get()
         ));
+        group.claims.borrow_mut().retain(|c| c.0 != self.code_tag);
         self.unshareable = true;
         self.code_group = None;
+        self.code_tag = 0;
         if group.members.get() == 1 {
             // 只有它自己：留着原来的翻译，组不再接受新成员
             group.closed.set(true);
@@ -3676,6 +3740,7 @@ impl Drop for Mm {
     fn drop(&mut self) {
         if let Some(group) = self.code_group.take() {
             group.members.set(group.members.get() - 1);
+            group.claims.borrow_mut().retain(|c| c.0 != self.code_tag);
         }
         self.release_cow();
         // SAFETY: 之后不再使用 self.mmu
@@ -3776,6 +3841,7 @@ mod tests {
             space,
             members: Cell::new(1),
             ranges: RefCell::new(vec![src(lib, 0x22000, 5, 0)]),
+            claims: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             shared: Cell::new(false),
         };
@@ -3801,6 +3867,47 @@ mod tests {
         assert!(!group.extend(&more));
         assert!(group.extend(&more[..CodeGroup::MAX_RANGES - 2]));
         assert_eq!(count(), CodeGroup::MAX_RANGES);
+    }
+
+    #[test]
+    fn code_groups_keep_private_code_apart_from_registered_files() {
+        let Some(space) = appine_engine::DbtSpace::new(0, appine_engine::DbtRegs::Default) else {
+            return;
+        };
+        let src = |start: u64, len: u64, ino: u64| appine_engine::DbtSource {
+            start,
+            len,
+            id: [1, ino, 0, 7, 8],
+        };
+        let lib = 0x7000_0000;
+        let group = CodeGroup {
+            key: 1,
+            space,
+            members: Cell::new(1),
+            ranges: RefCell::new(vec![src(lib, 0x10000, 5)]),
+            claims: RefCell::new(vec![(1, 0x9000_0000, 0x9010_0000)]),
+            closed: Cell::new(false),
+            shared: Cell::new(false),
+        };
+        // 别的成员（标签 2）在同一个地址也有 JIT 的代码：私有的范围之间可以重叠
+        let jit = [(0x9000_0000, 0x9001_0000), (0xb000_0000, 0xb001_0000)];
+        assert!(group.admit(2, &[src(lib, 0x10000, 5)], &jit));
+        // JIT 的代码压着登记过的文件、文件压着别的成员的 JIT 代码：都不行，什么也不改
+        assert!(!group.admit(2, &[], &[(lib + 0x8000, lib + 0x9000)]));
+        assert!(!group.admit(2, &[src(0x9000_8000, 0x1000, 6)], &[]));
+        assert_eq!(group.ranges.borrow().len(), 1);
+        assert_eq!(group.claims.borrow().len(), 3);
+        // 自己原来 JIT 的地方换成了文件：登记，换上新的私有范围
+        assert!(group.admit(
+            2,
+            &[src(0xb000_0000, 0x1000, 6)],
+            &[(0xa000_0000, 0xa000_1000)]
+        ));
+        assert_eq!(group.ranges.borrow().len(), 2);
+        assert_eq!(
+            *group.claims.borrow(),
+            [(1, 0x9000_0000, 0x9010_0000), (2, 0xa000_0000, 0xa000_1000)]
+        );
     }
 
     #[test]

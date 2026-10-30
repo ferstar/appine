@@ -118,7 +118,7 @@ struct appine_cpu {
     uint64_t excl_addr;
     uint64_t excl_value[2];
     uint32_t excl_size; /* 0 表示没有独占标记 */
-    uint32_t reserved2;
+    uint32_t dbt_tag;   /* Tier 1：线程所在的地址空间在共用翻译的组里的标签（dbt.c 的 TAG_SHIFT） */
     /* 以下字段由 Tier 1 内部使用 */
     uint64_t dbt_reason;
     uint64_t dbt_site;
@@ -314,9 +314,18 @@ void appine_dbt_trust(struct appine_dbt *dbt, const struct appine_dbt_source *s,
  * 对原来那个地址空间有效的翻译（比如池里上一个使用者留下的）。别的线程可以正在运行
  */
 void appine_dbt_retire_outside(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+/*
+ * 几个地址空间共用一个实例时：它们一致地映射着的几段可信的文件映射（同一段地址上是同一个
+ * 版本的同一个文件），每次给出全部，只增不减。这些映射里的块所有成员共用，别处的块（JIT
+ * 生成的代码）只给翻译它的成员用，按挂上来时给的标签区分（appine_dbt_attach）
+ */
+void appine_dbt_share(struct appine_dbt *dbt, const struct appine_dbt_source *s, size_t n);
+/* 给共用这个实例的一个地址空间分配标签（1–65535，实例回到池里之前不重复）；用完了返回 0 */
+unsigned appine_dbt_new_tag(struct appine_dbt *dbt);
 
 struct appine_dbt_thread;
-struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *dbt);
+/* `tag` 是线程所在的地址空间的标签（appine_dbt_new_tag），不共用时是 0 */
+struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *dbt, unsigned tag);
 void appine_dbt_detach(struct appine_dbt_thread *t);
 
 /* 丢弃全部翻译：要等所有线程离开翻译后的代码，所以只是请求，由下一次进入 appine_dbt_run()

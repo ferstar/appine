@@ -63,8 +63,8 @@ _Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "b 的偏移范围");
 #define TABLE_LIMIT (TABLE_SIZE / 4 * 3)
 #define JC_BITS 12
 #define JC_SIZE (1u << JC_BITS)
-/* 翻译表里墓碑的 pc：未对齐，查表时先排除未对齐的 pc（table_find、emit_lookup），所以不会
- * 被查到。跳转缓存的空项另用 jc_empty */
+/* 翻译表里墓碑的键：未对齐，查表时先排除未对齐的 pc（table_find_for、emit_lookup），所以
+ * 不会被查到。跳转缓存的空项另用 jc_empty */
 #define JC_EMPTY UINT64_C(1)
 /* 进入例程的栈帧：x19–x30、宿主 FPCR、d8–d15 */
 #define FRAME_BYTES 176
@@ -120,11 +120,15 @@ _Static_assert(MAX_BLOCK_WORDS < 1u << (31 - REFILL_RESUME_SHIFT), "访问相对
 /* 块入口的 kick 检查占的字数 */
 #define ENTRY_CHECK_WORDS 2
 
-/* 退出原因的低 3 位是 R_*；链接桩在高位带上跳到它的条件分支相对桩的字数（0 表示没有） */
+/* 退出原因的低 3 位是 R_*；链接桩在高位带上跳到它的条件分支相对桩的字数（0 表示没有），
+ * 共用的块（TAG_SHIFT）的链接桩再带上 LINK_SHARED：只能链接到共用的块 */
 #define REASON_BITS 3
 #define REASON_MASK ((1u << REASON_BITS) - 1)
+#define BRANCH_MASK (MAX_BLOCK_WORDS - 1)
+#define LINK_SHARED (1u << 15)
 _Static_assert(R_UNGROUP <= REASON_MASK, "退出原因放在低 3 位");
-_Static_assert(MAX_BLOCK_WORDS < 1u << (16 - REASON_BITS), "条件分支到桩的距离要放进 movz 的立即数");
+_Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON_BITS <= LINK_SHARED,
+               "条件分支到桩的距离和 LINK_SHARED 要放进 movz 的立即数");
 
 #define SYSREG_NZCV 0xda10
 #define SYSREG_TPIDR_EL0 0xde82
@@ -171,6 +175,20 @@ struct table {
 #define RS_SHIFT 10
 #define RS_ENTRIES ((1u << RS_SHIFT) / 16)
 
+/*
+ * 同一个程序的几个地址空间共用一个实例时（内核层的 CodeGroup），组里登记过的可信文件映射
+ * （appine_dbt_share）里的块对所有成员都有效，按 pc 放进翻译表；别处的块（JIT 生成的、写过
+ * 的代码）只对翻译它的成员有效，表里的键是 pc | 成员的标签 << TAG_SHIFT。guest 的 pc 只有
+ * 48 位，更高的不会有块（查表之前先排除），所以两种键不会相同。两种键都按 pc 散列，一次线性
+ * 探测同时找共用的和这个成员私有的：分两次找的话，JIT 代码每次没命中跳转缓存都要多一次缓存
+ * 未命中。共用的块不链接到私有的块（LINK_SHARED）。标签由实例分配（appine_dbt_new_tag），实例
+ * 回到池里时去掉私有的块（drop_private），标签从头分配。标签 0 表示不在组里，所有的块都按 pc
+ * 放。
+ */
+#define TAG_SHIFT APPINE_VA_BITS
+#define TAG_MAX 0xffffu
+#define PC_MASK ((UINT64_C(1) << TAG_SHIFT) - 1)
+
 /* 作废翻译时按 guest 页找到其中开始的块（appine_dbt_invalidate） */
 #define PAGE_BUCKET_BITS 14
 #define INVALIDATE_MAX_PAGES 256 /* 超过这么多页就逐个看所有的块 */
@@ -180,10 +198,23 @@ struct block {
     uint32_t *code;  /* 已作废时为 NULL */
     uint32_t next;   /* 同一个桶里的上一个块（下标加 1），0 表示没有 */
     uint32_t words;  /* 翻译时的 guest 指令字在 words 里的位置（recheck 用） */
-    uint16_t nguest; /* guest 指令条数 */
-    uint16_t parked; /* 停放着（revive）：入口像作废块一样跳往转发桩，代码还在 */
+    uint8_t nguest;  /* guest 指令条数 */
+    uint8_t parked;  /* 停放着（revive）：入口像作废块一样跳往转发桩，代码还在 */
+    uint16_t tag;    /* 私有的块所属成员的标签，共用的是 0（TAG_SHIFT） */
     uint32_t first;  /* 停放时被改写的那条入口检查之后的指令 */
 };
+_Static_assert(MAX_BLOCK_INSNS <= UINT8_MAX, "struct block 的 nguest");
+
+/* 块在翻译表里的键 */
+static uint64_t tagged(uint64_t pc, unsigned tag)
+{
+    return pc | (uint64_t)tag << TAG_SHIFT;
+}
+
+static uint64_t block_key(const struct block *b)
+{
+    return tagged(b->pc, b->tag);
+}
 
 /* 一组访存第二次没通过共用的检查之后，组长的 pc 记在这里，重新翻译时它和后面同一个
  * 块里的访存都不再当组长；记满了从最早的开始覆盖。第一次失败只记进 strikes（按 pc
@@ -248,6 +279,10 @@ struct appine_dbt {
     bool poisoned;
     uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
     uint32_t *page_parked; /* 同一个哈希：停放着的块数，查表失败时不持锁看一眼（revive） */
+    /* 组里登记过的映射（appine_dbt_share），按起点排好、不重叠；不持锁读。换下来的旧数组挂在
+     * 新的 older 上，等实例回到池里时再释放 */
+    struct shared_ranges *shared;
+    unsigned next_tag; /* 下一个可以分配的标签（appine_dbt_new_tag） */
     uint64_t nogroup[NOGROUP_MAX];
     unsigned nogroup_count;
     uint64_t strikes[STRIKES];
@@ -266,9 +301,36 @@ struct appine_dbt {
     struct appine_dbt_stats *st; /* 持锁的线程的统计：翻译、作废记在它头上 */
 };
 
+/* 登记过的映射：[r[i][0], r[i][1])，按起点排好、不重叠 */
+struct shared_ranges {
+    struct shared_ranges *older;
+    unsigned n;
+    uint64_t r[][2];
+};
+
+/* pc 在不在登记过的映射里（不持锁） */
+static bool in_shared(const struct appine_dbt *d, uint64_t pc)
+{
+    const struct shared_ranges *s = __atomic_load_n(&d->shared, __ATOMIC_ACQUIRE);
+    if (!s)
+        return false;
+    unsigned lo = 0, hi = s->n;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        if (pc < s->r[mid][0])
+            hi = mid;
+        else if (pc >= s->r[mid][1])
+            lo = mid + 1;
+        else
+            return true;
+    }
+    return false;
+}
+
 /* 一个线程在某个地址空间里运行用的部分：跳转缓存、影子返回栈和统计 */
 struct appine_dbt_thread {
     struct appine_dbt *d;
+    unsigned tag; /* 线程所在的地址空间在组里的标签，0 表示不在组里（TAG_SHIFT） */
     struct appine_dbt_thread *next; /* d->threads 链表，持有 d->lock 时读写 */
     struct appine_cpu *cpu; /* 正在 dbt_run 里运行的 cpu，否则为 NULL（原子）：整体清空时打断它 */
     uint64_t generation;    /* jc、rs 对应的 d->generation */
@@ -351,6 +413,8 @@ struct xlate {
     uint64_t pc;
     const uint32_t *guest;
     unsigned idx, limit;
+    /* 本块按 pc 放进翻译表（TAG_SHIFT），链接桩带上 LINK_SHARED */
+    bool shared;
     /* 本块里 SP 已经检查过对齐，之后只按 16 的倍数改过 */
     bool sp_aligned;
     /* 本块里值在翻译时已知的通用寄存器（ADR/ADRP 设下的，和在它上面加的立即数），第
@@ -618,6 +682,8 @@ static void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc, const 
         emit(x, enc_b(4));
     emit(x, enc_adr_self(T1));
     uint64_t code = reason | delta << REASON_BITS;
+    if ((reason == R_CHAIN || reason == R_CHAIN_FWD) && x->shared)
+        code |= LINK_SHARED;
     if (pc >> PACKED_PC_BITS == 0) {
         emit_to_routine(x, TO_EXIT);
         pc |= code << PACKED_PC_BITS;
@@ -2163,9 +2229,10 @@ static void zfree(void *p, size_t bytes)
 
 #define TABLE_BYTES(bits) (sizeof(struct table) + (sizeof(struct slot) << (bits)))
 
-static size_t table_index(const struct table *t, uint64_t pc)
+/* 键的下标：带标签的键按它的 pc 散列，和同一个 pc 的共用块在同一串里（TAG_SHIFT） */
+static size_t table_index(const struct table *t, uint64_t key)
 {
-    return (size_t)(((pc >> 2) * GOLDEN) >> t->shift);
+    return (size_t)((((key & PC_MASK) >> 2) * GOLDEN) >> t->shift);
 }
 
 static size_t table_mask(const struct table *t)
@@ -2185,19 +2252,28 @@ static struct table *table_new(unsigned bits)
     return t;
 }
 
-/* 在 t 里找 pc。持有锁时直接调用；不持锁时经由 table_lookup。未对齐的 pc 没有块（Tier 0 报告
- * 对齐错误），也不能拿去和墓碑的 JC_EMPTY 比 */
-static uint32_t *table_find(const struct table *t, uint64_t pc)
+/*
+ * 在 t 里找标签为 `tag` 的成员（不在组里的是 0）在 pc 处执行的块：共用的或者它私有的
+ * （TAG_SHIFT），`*found` 是找到的块的标签；两种都有时（登记范围长大之前翻译的私有块）哪个
+ * 都对。持有锁时直接调用；不持锁时经由 table_lookup。未对齐、超出 48 位的 pc 没有块（Tier 0
+ * 报告错误），也不能拿去和墓碑的 JC_EMPTY、别的成员的键比
+ */
+static uint32_t *table_find_for(const struct table *t, uint64_t pc, unsigned tag, unsigned *found)
 {
-    if (pc & 3)
+    *found = 0;
+    if (pc & (3 | ~PC_MASK))
         return NULL;
+    uint64_t mine = tagged(pc, tag);
     for (size_t i = table_index(t, pc);; i = (i + 1) & table_mask(t)) {
-        /* 插入时先写 pc 再写 code：读到 code 不为空，pc 就是对应的那个 */
+        /* 插入时先写键再写 code：读到 code 不为空，键就是对应的那个 */
         uint32_t *code = __atomic_load_n(&t->slots[i].code, __ATOMIC_ACQUIRE);
         if (!code)
             return NULL;
-        if (__atomic_load_n(&t->slots[i].pc, __ATOMIC_RELAXED) == pc)
+        uint64_t key = __atomic_load_n(&t->slots[i].pc, __ATOMIC_RELAXED);
+        if (key == pc || key == mine) {
+            *found = key == pc ? 0 : tag;
             return code;
+        }
     }
 }
 
@@ -2205,10 +2281,10 @@ static uint32_t *table_find(const struct table *t, uint64_t pc)
  * 分发器和查表例程（emit_lookup）不持锁查表：cpu 的 dbt_lookup_seq 为奇数期间，换下来的
  * 旧表不会被释放（table_publish）
  */
-static uint32_t *table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc)
+static uint32_t *table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc, unsigned *found)
 {
     __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_SEQ_CST);
-    uint32_t *code = table_find(__atomic_load_n(&d->table, __ATOMIC_SEQ_CST), pc);
+    uint32_t *code = table_find_for(__atomic_load_n(&d->table, __ATOMIC_SEQ_CST), pc, c->dbt_tag, found);
     __atomic_store_n(&c->dbt_lookup_seq, c->dbt_lookup_seq + 1, __ATOMIC_RELEASE);
     return code;
 }
@@ -2231,15 +2307,17 @@ static void table_publish(struct appine_dbt *d, struct table *table)
 }
 
 /*
- * 刚建好、还没同步指令缓存的块（起始 pc 为 `pc`）：目标已经翻译过的出口直接链接，和分发器
- * 里第一次走到时的链接（dbt_run 的 R_CHAIN）一样。改动随整个块一起同步。持有锁
+ * 刚建好、还没同步指令缓存的块（起始 pc 为 `pc`，私有的块是成员 `tag` 的）：目标已经翻译过的
+ * 出口直接链接，和分发器里第一次走到时的链接（dbt_run 的 R_CHAIN）一样。共用的块只链接到
+ * 共用的块（TAG_SHIFT）。改动随整个块一起同步。持有锁
  */
-static void link_block(const struct appine_dbt *d, uint32_t *code, uint64_t pc, const struct link *links,
-                       unsigned n)
+static void link_block(const struct appine_dbt *d, uint32_t *code, uint64_t pc, unsigned tag,
+                       const struct link *links, unsigned n)
 {
     for (unsigned i = 0; i < n; i++) {
         const struct link *l = &links[i];
-        uint32_t *target = l->pc == pc ? code : table_find(d->table, l->pc);
+        unsigned found;
+        uint32_t *target = l->pc == pc ? code : table_find_for(d->table, l->pc, tag, &found);
         if (!target)
             continue;
         if (l->stub & LINK_FWD)
@@ -2282,10 +2360,10 @@ static void table_rebuild(struct appine_dbt *d, struct table *table)
             d->table_used[k] = SLOT_NONE;
             continue;
         }
-        size_t i = table_index(table, b->pc);
+        size_t i = table_index(table, block_key(b));
         while (table->slots[i].code)
             i = (i + 1) & table_mask(table);
-        table->slots[i] = (struct slot){b->pc, b->code};
+        table->slots[i] = (struct slot){block_key(b), b->code};
         d->table_used[k] = (uint32_t)i;
         occupied++;
     }
@@ -2294,35 +2372,35 @@ static void table_rebuild(struct appine_dbt *d, struct table *table)
     table_publish(d, table);
 }
 
-/* pc 不在表里时才插入，只用空位（见 struct table）。持有锁 */
-static void table_insert(struct appine_dbt *d, uint64_t pc, uint32_t *code, const uint32_t *guest,
-                         uint32_t nguest)
+/* pc 不在表里时才插入（私有的块是成员 `tag` 的），只用空位（见 struct table）。持有锁 */
+static void table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32_t *code,
+                         const uint32_t *guest, uint32_t nguest)
 {
     struct table *t = d->table;
-    size_t i = table_index(t, pc);
+    size_t i = table_index(t, tagged(pc, tag));
     while (t->slots[i].code)
         i = (i + 1) & table_mask(t);
     d->table_occupied++;
-    __atomic_store_n(&t->slots[i].pc, pc, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->slots[i].pc, tagged(pc, tag), __ATOMIC_RELAXED);
     __atomic_store_n(&t->slots[i].code, code, __ATOMIC_RELEASE);
     unsigned h = page_bucket(pc >> APPINE_PAGE_SHIFT);
     memcpy(d->words + d->words_used, guest, nguest * 4);
     d->blocks[d->table_count] =
-        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, (uint16_t)nguest, 0, 0};
+        (struct block){pc, code, d->page_head[h], (uint32_t)d->words_used, (uint8_t)nguest, 0, (uint16_t)tag, 0};
     d->words_used += nguest;
     d->table_used[d->table_count++] = (uint32_t)i;
     d->page_head[h] = (uint32_t)d->table_count;
 }
 
 /*
- * 从翻译表里删掉 pc，留一个永远不会命中的墓碑。各线程跳转缓存里的旧项不用删：它们指向
- * 作废块的入口，那里跳往转发桩。持有锁
+ * 从翻译表里删掉键为 `key` 的块，留一个永远不会命中的墓碑。各线程跳转缓存里的旧项不用删：
+ * 它们指向作废块的入口，那里跳往转发桩。持有锁
  */
-static void table_remove(struct appine_dbt *d, uint64_t pc)
+static void table_remove(struct appine_dbt *d, uint64_t key)
 {
     struct table *t = d->table;
-    for (size_t i = table_index(t, pc); t->slots[i].code; i = (i + 1) & table_mask(t)) {
-        if (t->slots[i].pc == pc) {
+    for (size_t i = table_index(t, key); t->slots[i].code; i = (i + 1) & table_mask(t)) {
+        if (t->slots[i].pc == key) {
             __atomic_store_n(&t->slots[i].pc, JC_EMPTY, __ATOMIC_RELEASE);
             d->table_dead++;
             break;
@@ -2465,7 +2543,7 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
     sync_written(d, start, end, r->n);
     for (unsigned i = 0; i < r->n; i++) {
         struct block *b = r->blocks[i];
-        table_remove(d, b->pc);
+        table_remove(d, block_key(b));
         if (r->park[i]) {
             b->parked = 1;
             d->nparked++;
@@ -2502,7 +2580,7 @@ static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct bloc
                  *x = &fwd;
     emit_mov_const(x, T1, (uint64_t)(uintptr_t)b->code);
     emit_mov_const(x, T0, b->pc);
-    emit(x, enc_movz(T2, R_CHAIN, 0));
+    emit(x, enc_movz(T2, R_CHAIN | (b->tag ? 0 : LINK_SHARED), 0));
     emit(x, enc_b((intptr_t)d->exit - (intptr_t)here(x)));
     while (x->n < 16)
         emit(x, enc_b(4)); /* 补齐，转发桩按 16 个字排列 */
@@ -2635,6 +2713,7 @@ struct template {
     uint64_t pc;
     uint64_t key; /* 翻译时用到的分组记录（nogroup_key） */
     const struct regs *r;
+    bool shared; /* 共用的块（链接桩带着 LINK_SHARED） */
     uint32_t nguest, nhost, nrelocs, nlinks;
     uint32_t copied, remapped, memory, fallback, grouped; /* 统计，拷贝时累加 */
     uint32_t words[]; /* guest 指令字、宿主指令字、重定位、链接（每个 4 个字，见 struct link） */
@@ -2697,10 +2776,12 @@ static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
 }
 
 /* 调用方持有 pc 所在的分片的锁 */
-static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r)
+static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
+                                      bool shared)
 {
     for (struct template *t = *template_bucket(pc); t; t = t->next) {
-        if (t->pc == pc && t->key == key && t->r == r && memcmp(t->words, guest, t->nguest * 4) == 0)
+        if (t->pc == pc && t->key == key && t->r == r && t->shared == shared &&
+            memcmp(t->words, guest, t->nguest * 4) == 0)
             return t;
     }
     return NULL;
@@ -2712,6 +2793,7 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
  */
 struct prep {
     uint64_t pc;
+    unsigned tag; /* 私有的块：所属成员的标签（TAG_SHIFT） */
     const uint32_t *guest; /* guest 指令字在宿主内存里的位置：装进去之前再比对一次 */
     uint32_t nguest;
     uint32_t words[MAX_BLOCK_INSNS]; /* 翻译时读到的 guest 指令字 */
@@ -2725,10 +2807,10 @@ struct prep {
 
 /* 有和 `guest`（翻译时读到的指令字）相同的模板时，拷进线程的暂存区记在 p 里 */
 static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
-                           struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
+                           bool shared, struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
 {
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find(pc, guest, key, r);
+    struct template *t = template_find(pc, guest, key, r, shared);
     if (t) {
         const uint32_t *host = t->words + t->nguest, *relocs = host + t->nhost;
         memcpy(scratch, host, t->nhost * 4);
@@ -2798,12 +2880,13 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
     size_t bytes = sizeof(struct template) + 4 * (nguest + x->n + x->nrelocs + 4 * nlinks);
     bytes = (bytes + 7) & ~(size_t)7;
     pthread_mutex_t *lock = template_lock(pc);
-    struct template *t = template_find(pc, guest, key, x->d->r) ? NULL : template_alloc(bytes);
+    struct template *t = template_find(pc, guest, key, x->d->r, x->shared) ? NULL : template_alloc(bytes);
     if (t) {
         *t = (struct template){
             .pc = pc,
             .key = key,
             .r = x->d->r,
+            .shared = x->shared,
             .nguest = nguest,
             .nhost = (uint32_t)x->n,
             .nrelocs = x->nrelocs,
@@ -2880,6 +2963,7 @@ static void perf_map(const void *code, size_t bytes, uint64_t pc)
 /* install 建好、还没放进翻译表的块：同步了指令缓存之后才能放进去，别的线程不持锁查表 */
 struct fresh {
     uint64_t pc;
+    unsigned tag;
     uint32_t *code;
     const uint32_t *guest;
     uint32_t nguest;
@@ -2904,6 +2988,8 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     if (limit > MAX_BLOCK_INSNS)
         limit = MAX_BLOCK_INSNS;
     p->pc = pc;
+    /* 组里的成员在登记过的映射以外翻译的块只对它自己有效（TAG_SHIFT） */
+    p->tag = t->tag && !in_shared(d, pc) ? t->tag : 0;
     p->guest = page + (pc & PAGE_MASK) / 4;
     memcpy(p->words, p->guest, limit * 4);
     p->nlinks = 0;
@@ -2911,7 +2997,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     /* 不持锁读分组记录：读到旧的只影响分组，检查没通过时会再撤销（ungroup） */
     uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
     t->stats.blocks++;
-    if (template_fetch(pc, guest, key, d->r, p, t->scratch, &t->stats))
+    if (template_fetch(pc, guest, key, d->r, !p->tag, p, t->scratch, &t->stats))
         return true;
 
     struct appine_dbt_stats before = t->stats;
@@ -2929,6 +3015,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     x->pc = pc;
     x->guest = guest;
     x->limit = limit;
+    x->shared = !p->tag;
     x->sp_aligned = false;
     x->konst = 0;
     for (unsigned i = 0; i < GROUP_SLOTS; i++)
@@ -3030,10 +3117,10 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
         *rw(d, site) = enc_b((intptr_t)routine(d, p->relocs[i] & 7) - (intptr_t)site);
     }
     d->used_words += p->nhost;
-    link_block(d, code, p->pc, p->links, p->nlinks);
+    link_block(d, code, p->pc, p->tag, p->links, p->nlinks);
     perf_map(code, p->nhost * 4, p->pc);
     sync_add(sync, code, code + p->nhost);
-    *f = (struct fresh){p->pc, code, p->guest, p->nguest};
+    *f = (struct fresh){p->pc, p->tag, code, p->guest, p->nguest};
     return code;
 }
 
@@ -3213,33 +3300,40 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
     /* 序号改成奇数之后再读表：stlr 与随后的 ldar 之间有序 */
     emit_seq_step(x);
-    /* 未对齐的 pc 交给分发器，见 table_find */
-    emit(x, enc_and_low(2, T0, 2));
-    uint32_t *unaligned = here(x);
+    /* 未对齐、超出 48 位的 pc 交给分发器，见 table_find_for */
+    emit(x, enc_and_ror(2, T0, 2 + 64 - TAG_SHIFT, 64 - TAG_SHIFT));
+    uint32_t *invalid = here(x);
     emit(x, enc_cbnz_x(2));
+    /* x1 = 这个成员的标签 << TAG_SHIFT：表项的键异或 pc 等于 0 是共用的块，等于 x1 是它私有的 */
+    emit(x, enc_ldr_w(1, CTX, offsetof(struct appine_cpu, dbt_tag)));
+    emit(x, enc_orr_lsl(1, 31, 1, TAG_SHIFT));
     emit_mov_const(x, 0, (uint64_t)(uintptr_t)&d->table);
     emit(x, enc_ldar(3, 0, 0));
     emit(x, enc_ldr_w(2, 0, offsetof(struct table, shift)));
     emit(x, enc_ldr_x(3, 0, offsetof(struct table, mask)));
     emit(x, enc_add_imm(0, 0, offsetof(struct table, slots), 0));
-    emit(x, enc_ubfx(T1, T0, 2, 62));
+    emit(x, enc_ubfx(T1, T0, 2, TAG_SHIFT - 2));
     emit_mov_const(x, T2, GOLDEN);
     emit(x, enc_mul(T1, T1, T2));
     emit(x, enc_lsrv(T1, T1, 2));
-    /* 线性探测：x2 = 表项的 pc，T2 = code */
+    /* 线性探测：x2 = 表项的键，T2 = code */
     uint32_t *loop = here(x);
     emit(x, enc_add_lsl(T2, 0, T1, 4));
     emit(x, enc_ldp_x(2, T2, T2, 0));
     uint32_t *miss = here(x);
     emit(x, enc_cbz_x(T2));
     emit(x, enc_eor_lsr(2, 2, T0, 0));
-    uint32_t *found = here(x);
+    uint32_t *found[2] = {here(x)};
+    emit(x, enc_cbz_x(2));
+    emit(x, enc_eor_lsr(2, 2, 1, 0));
+    found[1] = here(x);
     emit(x, enc_cbz_x(2));
     emit(x, enc_add_imm(T1, T1, 1, 0));
     emit(x, enc_and_reg(T1, T1, 3));
     emit(x, enc_b((intptr_t)loop - (intptr_t)here(x)));
 
-    patch_branch(x->wdelta, found, here(x));
+    patch_branch(x->wdelta, found[0], here(x));
+    patch_branch(x->wdelta, found[1], here(x));
     emit_seq_step(x);
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, dbt_jump_cache)));
     emit(x, enc_ubfx(1, T0, 2, JC_BITS));
@@ -3251,7 +3345,7 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_br(T1));
 
     patch_branch(x->wdelta, miss, here(x));
-    patch_branch(x->wdelta, unaligned, here(x));
+    patch_branch(x->wdelta, invalid, here(x));
     emit_seq_step(x);
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));
@@ -3405,8 +3499,19 @@ static struct appine_dbt *pool_take(unsigned i)
     return d;
 }
 
+/* 换下来的登记范围（appine_dbt_share）全部释放；没有线程在用这个实例 */
+static void drop_shared(struct appine_dbt *d)
+{
+    for (struct shared_ranges *s = d->shared, *older; s; s = older) {
+        older = s->older;
+        free(s);
+    }
+    d->shared = NULL;
+}
+
 static void release(struct appine_dbt *d)
 {
+    drop_shared(d);
     pthread_mutex_lock(&pool.lock);
     if (d->prev_instance) {
         *d->prev_instance = d->next_instance;
@@ -3475,6 +3580,7 @@ struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
     }
     d->cache_words = CODE_CACHE_BYTES / 4;
     d->r = r;
+    d->next_tag = 1;
     emit_routines(d);
     pthread_mutex_lock(&pool.lock);
     d->next_instance = pool.all;
@@ -3484,6 +3590,26 @@ struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
     pool.all = d;
     pthread_mutex_unlock(&pool.lock);
     return d;
+}
+
+/*
+ * 放回池里、保留翻译时去掉成员私有的块，标签就可以从头分配。只有同一个成员的私有块链接到
+ * 它们（共用的块不链接到私有的块），也没有线程挂着，所以不用转发桩
+ */
+static void drop_private(struct appine_dbt *d)
+{
+    for (size_t i = 0; i < d->table_count; i++) {
+        struct block *b = &d->blocks[i];
+        if (!b->tag || !b->code)
+            continue;
+        if (b->parked) {
+            kill_parked(d, b);
+            continue;
+        }
+        table_remove(d, block_key(b));
+        b->code = NULL;
+        d->blocks_dead++;
+    }
 }
 
 /* 放回池里：没有线程挂着，所以可以直接清空 */
@@ -3507,7 +3633,9 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         keep = pool.kept_words + words <= POOL_KEEP_WORDS;
         pthread_mutex_unlock(&pool.lock);
     }
+    drop_shared(d);
     if (keep) {
+        drop_private(d);
         d->stale = d->table_count > 0;
     } else {
         key = 0;
@@ -3532,6 +3660,7 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         d->high_words = 0;
         drop_written(d); /* 例程所在的页、记下的页数 */
     }
+    d->next_tag = 1; /* 带标签的块都去掉了 */
     /* 腾出地方：池满了，或者保留的代码超出上限。先去掉空的（重建它们很便宜），再去掉
      * 最久没用的 */
     struct appine_dbt *evicted[POOL_SIZE];
@@ -3632,7 +3761,49 @@ static void unlock_dbt(struct appine_dbt *d)
     pthread_mutex_unlock(&d->lock);
 }
 
-struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
+unsigned appine_dbt_new_tag(struct appine_dbt *d)
+{
+    pthread_mutex_lock(&d->lock);
+    unsigned tag = d->next_tag <= TAG_MAX ? d->next_tag++ : 0;
+    pthread_mutex_unlock(&d->lock);
+    return tag;
+}
+
+static int range_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? -1 : x > y;
+}
+
+void appine_dbt_share(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    struct shared_ranges *r = malloc(sizeof(*r) + n * sizeof(r->r[0]));
+    if (!r) /* 照旧用原来的：不在里面的块都当作私有的，只是共用得少 */
+        return;
+    for (size_t i = 0; i < n; i++) {
+        r->r[i][0] = s[i].start;
+        r->r[i][1] = s[i].start + s[i].len;
+    }
+    qsort(r->r, n, sizeof(r->r[0]), range_cmp);
+    unsigned m = 0; /* 重叠、相接的合并成一段 */
+    for (size_t i = 0; i < n; i++) {
+        if (m && r->r[i][0] <= r->r[m - 1][1]) {
+            if (r->r[i][1] > r->r[m - 1][1])
+                r->r[m - 1][1] = r->r[i][1];
+        } else {
+            r->r[m][0] = r->r[i][0];
+            r->r[m][1] = r->r[i][1];
+            m++;
+        }
+    }
+    r->n = m;
+    pthread_mutex_lock(&d->lock);
+    r->older = d->shared;
+    __atomic_store_n(&d->shared, r, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&d->lock);
+}
+
+struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d, unsigned tag)
 {
     pthread_mutex_lock(&pool.lock);
     struct appine_dbt_thread *t = pool.nthreads ? pool.threads[--pool.nthreads] : NULL;
@@ -3656,6 +3827,7 @@ struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
         t->jc_dirty = true;
     }
     t->d = d;
+    t->tag = tag;
     t->cpu = NULL;
     t->stats = (struct appine_dbt_stats){0};
     if (t->jc_dirty)
@@ -3811,14 +3983,14 @@ static void table_relink(struct appine_dbt *d, size_t k)
     size_t i = d->table_used[k];
     if (i != SLOT_NONE && t->slots[i].pc == JC_EMPTY && t->slots[i].code == b->code) {
         d->table_dead--;
-        __atomic_store_n(&t->slots[i].pc, b->pc, __ATOMIC_RELEASE);
+        __atomic_store_n(&t->slots[i].pc, block_key(b), __ATOMIC_RELEASE);
         return;
     }
-    i = table_index(t, b->pc);
+    i = table_index(t, block_key(b));
     while (t->slots[i].code)
         i = (i + 1) & table_mask(t);
     d->table_occupied++;
-    __atomic_store_n(&t->slots[i].pc, b->pc, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->slots[i].pc, block_key(b), __ATOMIC_RELAXED);
     __atomic_store_n(&t->slots[i].code, b->code, __ATOMIC_RELEASE);
     d->table_used[k] = (uint32_t)i;
 }
@@ -3833,6 +4005,8 @@ static void table_relink(struct appine_dbt *d, size_t k)
 /* 恢复的这一批先同步、再放进表里，别的线程才可能跳过去 */
 static void revive_flush(struct appine_dbt *d, const uint32_t *idx, unsigned n)
 {
+    if (!n)
+        return;
     void *start[RETIRE_BATCH], *end[RETIRE_BATCH];
     for (unsigned k = 0; k < n; k++) {
         start[k] = d->blocks[idx[k]].code;
@@ -3843,11 +4017,11 @@ static void revive_flush(struct appine_dbt *d, const uint32_t *idx, unsigned n)
         table_relink(d, idx[k]);
 }
 
-static uint32_t *revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc)
+static void revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc)
 {
     uint64_t page = pc >> APPINE_PAGE_SHIFT, p = 1;
     const uint32_t *host = NULL;
-    uint32_t *found = NULL, idx[RETIRE_BATCH];
+    uint32_t idx[RETIRE_BATCH];
     unsigned n = 0;
     /* 入口检查的第一条对所有块都一样（prepare），不必另外记 */
     uint32_t check = enc_ldr_x(d->r->t0, d->r->ctx, offsetof(struct appine_cpu, pending));
@@ -3871,11 +4045,8 @@ static uint32_t *revive(struct appine_dbt *d, const struct appine_cpu *c, uint64
         d->nparked--;
         d->page_parked[page_bucket(page)]--;
         idx[n++] = i - 1;
-        if (b->pc == pc)
-            found = b->code;
     }
     revive_flush(d, idx, n);
-    return found;
 }
 
 void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
@@ -3918,7 +4089,7 @@ void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_sou
     struct retire_batch r = {.n = 0};
     for (size_t i = 0; i < d->table_count; i++) {
         struct block *b = &d->blocks[i];
-        if (!b->code)
+        if (!b->code || b->tag) /* 私有的块只有它的成员查得到 */
             continue;
         bool inside = false;
         for (size_t j = 0; j < n && !inside; j++)
@@ -3996,7 +4167,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         (uint64_t(*)(struct appine_cpu *, uint32_t *))(uintptr_t)d->enter;
     uint32_t *patch_site = NULL, *patch_branch_site = NULL;
     uint64_t patch_generation = 0;
-    bool patch_forward = false;
+    bool patch_forward = false, patch_shared = false;
     bool fill_jump_cache = false;
 
     if (UNLIKELY(d->stale)) {
@@ -4006,6 +4177,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         unlock_dbt(d);
     }
     c->dbt_jump_cache = t->jc;
+    c->dbt_tag = t->tag;
     t->jc_dirty = true; /* 查表例程会往里填 */
     if (((uintptr_t)c->dbt_rs & ~(uintptr_t)((1u << RS_SHIFT) - 1)) != (uintptr_t)t->rs)
         c->dbt_rs = t->rs;
@@ -4026,14 +4198,17 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE))
             return APPINE_EXIT_KICK;
 
-        uint32_t *code = table_lookup(d, c, c->pc);
+        unsigned found; /* 找到的块的标签：共用的块不链接到私有的块（LINK_SHARED） */
+        uint32_t *code = table_lookup(d, c, c->pc, &found);
         if (!code && __atomic_load_n(&d->page_parked[page_bucket(c->pc >> APPINE_PAGE_SHIFT)],
                                      __ATOMIC_RELAXED)) {
             lock_dbt(d, &t->stats);
             if (!__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) && !d->flush_wanted) {
-                code = table_find(d->table, c->pc);
-                if (!code)
-                    code = revive(d, c, c->pc);
+                code = table_find_for(d->table, c->pc, t->tag, &found);
+                if (!code) {
+                    revive(d, c, c->pc);
+                    code = table_find_for(d->table, c->pc, t->tag, &found);
+                }
             }
             unlock_dbt(d);
         }
@@ -4051,9 +4226,10 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * 别的线程才可能跳过去 */
             bool alone = d->threads == t && !t->next;
             /* 别的线程可能刚装进去同一个块 */
-            code = table_find(d->table, c->pc);
+            code = table_find_for(d->table, c->pc, t->tag, &found);
             if (!code && fetched) {
                 code = install(d, t->prep, &sync, &f);
+                found = t->prep->tag;
                 if (code == NEED_FLUSH) {
                     flush_world(d, t);
                     unlock_dbt(d);
@@ -4066,12 +4242,13 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                 }
                 if (!alone) {
                     sync_all(d, &sync);
-                    table_insert(d, f.pc, f.code, f.guest, f.nguest);
+                    table_insert(d, f.pc, f.tag, f.code, f.guest, f.nguest);
                 }
             }
             /* 持锁时表里只有有效的块：回填的目标不会是作废块（它的入口跳往自己） */
             uint32_t *target = code && patch_forward ? code + ENTRY_CHECK_WORDS : code;
-            if (code && patch_site && patch_generation == d->generation && target != patch_site) {
+            if (code && patch_site && patch_generation == d->generation && target != patch_site &&
+                !(patch_shared && found)) {
                 *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
                 /* 条件分支不在 CMODX 允许并发修改的指令里：有别的线程时不改它 */
                 bool branch = patch_branch_site && alone && relink_word(d, patch_branch_site, target);
@@ -4085,7 +4262,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             }
             sync_all(d, &sync);
             if (f.code && alone)
-                table_insert(d, f.pc, f.code, f.guest, f.nguest);
+                table_insert(d, f.pc, f.tag, f.code, f.guest, f.nguest);
             unlock_dbt(d);
             patch_site = NULL;
         } else if (patch_site) {
@@ -4096,7 +4273,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              */
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
-                target != patch_site) {
+                target != patch_site && !(patch_shared && found)) {
                 uint32_t b = enc_b((intptr_t)target - (intptr_t)patch_site);
                 /* 读执行用的地址，见 relink_word */
                 bool again = __atomic_load_n(patch_site, __ATOMIC_RELAXED) == b;
@@ -4134,7 +4311,10 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         case R_CHAIN_FWD:
             t->stats.exits_chain++;
             patch_site = (uint32_t *)(uintptr_t)c->dbt_site;
-            patch_branch_site = reason >> REASON_BITS ? patch_site - (reason >> REASON_BITS) : NULL;
+            patch_branch_site = reason >> REASON_BITS & BRANCH_MASK
+                                    ? patch_site - (reason >> REASON_BITS & BRANCH_MASK)
+                                    : NULL;
+            patch_shared = reason & LINK_SHARED;
             patch_generation = __atomic_load_n(&d->generation, __ATOMIC_RELAXED);
             patch_forward = (reason & REASON_MASK) == R_CHAIN_FWD;
             break;
@@ -4262,9 +4442,23 @@ void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_sou
     (void)n;
 }
 
-struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d)
+unsigned appine_dbt_new_tag(struct appine_dbt *d)
 {
     (void)d;
+    return 0;
+}
+
+void appine_dbt_share(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
+{
+    (void)d;
+    (void)s;
+    (void)n;
+}
+
+struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d, unsigned tag)
+{
+    (void)d;
+    (void)tag;
     return NULL;
 }
 

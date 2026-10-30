@@ -475,8 +475,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             .borrow_mut()
             .code_space(&k.code_groups),
     };
-    let attach =
-        |space: Option<Arc<CodeSpace>>| space.and_then(|s| Dbt::attach(&s.space).map(|d| (d, s)));
+    let attach = |space: Option<Arc<CodeSpace>>| {
+        space.and_then(|s| Dbt::attach(&s.space, s.tag).map(|d| (d, s)))
+    };
     let space = space_of(&k);
     let mut fast = Fast::new(shared, &task, &task.state.borrow());
     drop(k);

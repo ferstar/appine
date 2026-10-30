@@ -3,7 +3,7 @@
 //! 引擎负责执行 guest 指令和 soft-MMU 快速路径（设计文档 §4、§5）。内核层用
 //! [`Cpu::run`] 驱动执行，再根据返回的 [`Exit`] 处理 syscall、异常等事件。
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_uint, c_void};
 use std::fmt;
 use std::mem::offset_of;
 use std::ptr::NonNull;
@@ -78,7 +78,7 @@ pub struct CpuState {
     excl_addr: u64,
     excl_value: [u64; 2],
     excl_size: u32,
-    reserved2: u32,
+    dbt_tag: u32,
     dbt_reason: u64,
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
@@ -189,7 +189,9 @@ unsafe extern "C" {
     fn appine_dbt_set_sources(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_trust(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
     fn appine_dbt_retire_outside(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
-    fn appine_dbt_attach(dbt: *mut RawDbt) -> *mut RawDbtThread;
+    fn appine_dbt_share(dbt: *mut RawDbt, s: *const DbtSource, n: usize);
+    fn appine_dbt_new_tag(dbt: *mut RawDbt) -> c_uint;
+    fn appine_dbt_attach(dbt: *mut RawDbt, tag: c_uint) -> *mut RawDbtThread;
     fn appine_dbt_detach(t: *mut RawDbtThread);
     fn appine_dbt_flush(t: *mut RawDbtThread);
     fn appine_dbt_recheck(t: *mut RawDbtThread);
@@ -657,10 +659,27 @@ impl DbtSpace {
         unsafe { appine_dbt_trust(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 
-    /// 作废 guest pc 不在这几段映射里的块（含停放着的）：要由几个地址空间共用之前，去掉只对
-    /// 原来那个地址空间有效的翻译。别的线程可以正在运行。
+    /// 作废 guest pc 不在这几段映射里的块（含停放着的），只对某个地址空间有效的（带标签的，
+    /// 见 [`DbtSpace::share`]）除外：要由几个地址空间共用之前，去掉只对原来那个地址空间有效的
+    /// 翻译。别的线程可以正在运行。
     pub fn retire_outside(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_retire_outside(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
+    }
+
+    /// 几个地址空间共用这个实例时，它们一致地映射着的可信文件映射（每次给出全部，只增不减）：
+    /// 这些映射里的块所有地址空间共用，别处的块（JIT 生成的代码）只给翻译它的地址空间用，
+    /// 按 [`Dbt::attach`] 时给的标签区分。
+    pub fn share(&self, sources: &[DbtSource]) {
+        unsafe { appine_dbt_share(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
+    }
+
+    /// 给共用这个实例的一个地址空间分配标签（实例回到池里之前不重复）；用完了（6 万多个）返回
+    /// `None`。
+    pub fn new_tag(&self) -> Option<u16> {
+        match unsafe { appine_dbt_new_tag(self.raw.as_ptr()) } {
+            0 => None,
+            tag => Some(tag as u16),
+        }
     }
 }
 
@@ -713,12 +732,13 @@ impl Dbt {
 
     /// 同 [`Dbt::new`]，翻译后的代码占用 `regs` 这一组寄存器。
     pub fn with_regs(regs: DbtRegs) -> Option<Self> {
-        Self::attach(&DbtSpace::new(0, regs)?)
+        Self::attach(&DbtSpace::new(0, regs)?, 0)
     }
 
-    /// 挂到 `space` 上。
-    pub fn attach(space: &Arc<DbtSpace>) -> Option<Self> {
-        NonNull::new(unsafe { appine_dbt_attach(space.raw.as_ptr()) }).map(|raw| Dbt {
+    /// 挂到 `space` 上。`tag` 是线程所在的地址空间的标签（[`DbtSpace::new_tag`]），实例不由几个
+    /// 地址空间共用时是 0。
+    pub fn attach(space: &Arc<DbtSpace>, tag: u16) -> Option<Self> {
+        NonNull::new(unsafe { appine_dbt_attach(space.raw.as_ptr(), tag.into()) }).map(|raw| Dbt {
             raw,
             space: space.clone(),
         })

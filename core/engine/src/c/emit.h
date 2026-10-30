@@ -121,6 +121,12 @@ static inline uint32_t enc_and_low(unsigned rd, unsigned rn, unsigned bits)
     return 0x92400000u | (bits - 1) << 10 | rn << 5 | rd;
 }
 
+/* AND Xd, Xn, #掩码：连续 `ones` 个 1，循环右移 `ror` 位 */
+static inline uint32_t enc_and_ror(unsigned rd, unsigned rn, unsigned ones, unsigned ror)
+{
+    return 0x92400000u | ror << 16 | (ones - 1) << 10 | rn << 5 | rd;
+}
+
 static inline uint32_t enc_ubfx(unsigned rd, unsigned rn, unsigned lsb, unsigned width)
 {
     return 0xd3400000u | lsb << 16 | (lsb + width - 1) << 10 | rn << 5 | rd;
@@ -241,6 +247,12 @@ static inline uint32_t enc_sub_reg(unsigned rd, unsigned rn, unsigned rm)
 static inline uint32_t enc_orr_reg(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0xaa000000u | rm << 16 | rn << 5 | rd;
+}
+
+/* ORR Xd, Xn, Xm, LSL #amount */
+static inline uint32_t enc_orr_lsl(unsigned rd, unsigned rn, unsigned rm, unsigned amount)
+{
+    return 0xaa000000u | rm << 16 | amount << 10 | rn << 5 | rd;
 }
 
 /* LSR Xd, Xn, Xm（LSRV） */
