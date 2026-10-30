@@ -142,6 +142,9 @@ pub struct OpenFile {
     pub pos: u64,
     /// `/proc/<pid>/fd/<n>` 显示的路径（打开时的绝对路径）。
     pub path: Option<Rc<[u8]>>,
+    /// 经由路径打开时最后经过的目录和名字：经由 `/proc/<pid>/fd/<n>` 把它当挂载点时
+    /// （bubblewrap 这样挂），挂载记下它（[`crate::vfs::Mount::at`]）。
+    pub dentry: Option<crate::vfs::Dentry>,
     /// 仓库里的普通文件、设备节点和 FIFO 是经由哪个挂载打开的（[`OpenFile::node`]）：
     /// 只读、noexec 这些标志按它算。目录和 `O_PATH` 的节点本来就带着挂载。
     pub mnt: crate::vfs::MountId,
@@ -185,6 +188,7 @@ impl OpenFile {
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
             path,
+            dentry: None,
             mnt: crate::vfs::ROOT_MOUNT,
             owner: (0, 0),
             sig: 0,

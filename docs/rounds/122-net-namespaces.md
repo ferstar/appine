@@ -1,6 +1,6 @@
 # M9 之前：网络命名空间（2026-10-30）
 
-← [M9 之前：UTS 和 IPC 命名空间（2026-10-30）](121-uts-ipc-namespaces.md) · [索引](../milestones.md)
+← [M9 之前：UTS 和 IPC 命名空间（2026-10-30）](121-uts-ipc-namespaces.md) · [索引](../milestones.md) · [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱（2026-10-30）](123-bwrap.md) →
 
 让 bubblewrap 能用的第七轮。Codex 默认的沙箱带着 `--unshare-net`：命令在只有 lo 的网络命名空间里运行，bwrap 先用 netlink 给 lo 配上 127.0.0.1/8、把它打开（`loopback_setup`，要收到确认）。原来 `CLONE_NEWNET` 是 EPERM。
 

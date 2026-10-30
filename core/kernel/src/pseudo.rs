@@ -185,7 +185,7 @@ impl NsKind {
         Some(match self {
             NsKind::Mnt => task.res.borrow().fs.borrow().mnt_ns.id,
             NsKind::User => group.map_or(crate::cred::INIT_USER_NS, |g| g.borrow().cred.user_ns.id),
-            NsKind::Cgroup => 4_026_531_835,
+            NsKind::Cgroup => task.ns.borrow().cgroup.id,
             NsKind::Ipc => task.ns.borrow().ipc.id,
             NsKind::Net => task.ns.borrow().net.id,
             NsKind::Pid => k.pid_ns_of(task.tgid).id,
@@ -1037,6 +1037,21 @@ impl Pseudo for View<'_> {
             }
             _ => Err(Errno::EINVAL),
         }
+    }
+
+    fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::Dentry> {
+        let PseudoNode::Fd(pid, fd) = node else {
+            return None;
+        };
+        let file = self.open_file(*pid, *fd)?;
+        let f = file.borrow();
+        // 只有不是目录的文件要它（目录的路径按上级目录算）
+        let dir = match &f.kind {
+            FileKind::Path(n) => self.vfs.is_dir(self, n).unwrap_or(true),
+            FileKind::Directory { .. } => true,
+            _ => false,
+        };
+        f.dentry.clone().filter(|_| !dir)
     }
 
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {

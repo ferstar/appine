@@ -26,7 +26,7 @@
 
 **推迟项**：
 
-- pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起）。 → pid 命名空间已补上（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间）；cgroup、time 仍没有
+- pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起）。 → pid 命名空间已补上（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间），cgroup 命名空间也补上了（M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱）；time 仍没有
 - 还按内核 ID 报告、没有换算的：`SO_PEERCRED`、`SCM_CREDENTIALS`、siginfo 的 `si_uid`、SysV IPC 和消息队列的属主、core dump 里的 ID。
 - 写映射时按写的进程的凭据检查，Linux 有两条按打开文件的凭据（`file_ns_capable`）；projid_map 不能写。
 - 复制到权限更小的用户命名空间里的挂载不上锁（Linux 的 `MNT_LOCKED`）：里面可以单独卸下、去掉 nosuid 这些；在用户命名空间里挂 procfs、sysfs 不检查 `mount_too_revealing`。

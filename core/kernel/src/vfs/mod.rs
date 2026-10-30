@@ -262,6 +262,11 @@ pub(crate) trait Pseudo {
     /// "魔法链接"（`/proc/<pid>/fd/<n>` 等）跟随之后直接得到的节点，不按内容解析；不是魔法
     /// 链接时是 None，不许跟随时是错误（EACCES）。`mnt` 是链接所在的挂载。
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>>;
+    /// 魔法链接指向的打开文件是经由哪个目录里的哪个名字打开的（不是目录的文件没有唯一
+    /// 的上级目录，挂载点是它时 mountinfo 的路径按这个算）。
+    fn follow_dentry(&self, _node: &PseudoNode) -> Option<Dentry> {
+        None
+    }
 }
 
 /// 一个虚拟文件系统实例。
@@ -854,7 +859,7 @@ impl Vfs {
                     && let Some(target) = ps.follow(*id, p)
                 {
                     dir = target?;
-                    found = None;
+                    found = if last { ps.follow_dentry(p) } else { None };
                     continue;
                 }
                 let target = self.readlink(ps, &node)?;

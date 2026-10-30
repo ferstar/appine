@@ -12,7 +12,9 @@
 # 负载最多跑 SURVEY_TIMEOUT 秒（默认 1500）。
 #
 # -n 镜像：在这个 docker 镜像里原生运行同样的负载作为对照，输出写到 <名字>.native.out、
-# .native.err。镜像可以由仓库导出（docs/rounds/70-survey-suites.md）：
+# .native.err。环境变量 SURVEY_DOCKER_OPTS 另外加给原生的容器（比如沙箱要的
+# `--cap-add SYS_ADMIN --security-opt apparmor=unconfined`）。镜像可以由仓库导出
+# （docs/rounds/70-survey-suites.md）：
 #
 #   appine-run --rootfs <仓库> --no-pty -- /bin/tar -C / -cf - --exclude ./proc \
 #       --exclude ./sys --exclude ./dev --exclude ./tmp . > store.tar
@@ -53,7 +55,8 @@ EOF
         mkdir -p "$(dirname "$out/$name")"
         start=$(date +%s)
         set +e
-        docker run --rm -i --platform linux/arm64 --ulimit nice=40:40 \
+        # shellcheck disable=SC2086 # 选项要按空白拆开
+        docker run --rm -i --platform linux/arm64 --ulimit nice=40:40 ${SURVEY_DOCKER_OPTS:-} \
             -e http_proxy="$http" -e https_proxy="$https" -e no_proxy=127.0.0.1,localhost \
             -e PATH=/usr/sbin:/usr/bin:/sbin:/bin -e HOME=/root -e TERM=xterm "$native" \
             timeout "$limit" /bin/sh -c 'mkdir -p /tmp && chmod 1777 /tmp && cat > /tmp/survey.sh && exec sh /tmp/survey.sh </dev/null' \

@@ -29,7 +29,7 @@ tier=1
 rebuild=0
 store=target/difftest/store
 image=appine-difftest
-packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv"
+packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap"
 env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 while getopts t:rs: opt; do
@@ -80,7 +80,7 @@ if [ ! -d "$store" ]; then
 fi
 # 只看目录在不在不够：安装中途失败、缓存只恢复了一部分的仓库会让每个用例都失败
 if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
-    /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv" >/dev/null 2>&1; then
+    /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap" >/dev/null 2>&1; then
     echo "difftest: $store lacks some of: $packages" >&2
     echo "difftest: install them with apk add, or delete $store to create it again" >&2
     exit 1

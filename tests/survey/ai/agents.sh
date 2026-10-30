@@ -366,7 +366,8 @@ echo '{"security": {"auth": {"selectedType": "gemini-api-key"}, "folderTrust": {
 export GOOGLE_GEMINI_BASE_URL=$M GEMINI_API_KEY=mock
 case_ gemini gemini -p "do the steps" --yolo
 
-# 沙箱：两家都用 bubblewrap，要用户命名空间（docker 容器里也没有）
+# 沙箱：两家都用 bubblewrap。原生的 docker 容器要另外给权限才建得了命名空间
+# （SURVEY_DOCKER_OPTS，docs/rounds/123-bwrap.md）
 case_ codex-sandbox codex exec --skip-git-repo-check -s workspace-write "do the steps"
 echo "== codex sandbox"
 codex sandbox -- sh -c 'echo inside' 2>&1 | tail -n 3

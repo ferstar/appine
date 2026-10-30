@@ -1083,4 +1083,38 @@ def owned():
 
 child(owned)
 PY5
+
+# cgroup 命名空间：只有编号不同，里面看到的 cgroup 仍是根
+python3 -c '
+import os
+me = os.readlink("/proc/self/ns/cgroup")
+os.unshare(0x02000000)
+print("cgroup:", open("/proc/self/cgroup").read().strip(), "different ns:", os.readlink("/proc/self/ns/cgroup") != me)
+'
+
+# bubblewrap 的挂法：源和挂载点都经由 /proc/self/fd/N 给出，挂载点是 tmpfs 里的文件；
+# mountinfo 里的挂载点照样是那个文件的路径（bwrap 靠它找到挂载再改成只读）
+python3 - <<'PY6'
+import ctypes, os
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [ctypes.c_char_p] * 3 + [ctypes.c_ulong, ctypes.c_void_p]
+MS_BIND, MS_REC, MS_PRIVATE, MS_RDONLY, MS_REMOUNT = 0x1000, 0x4000, 1 << 18, 1, 32
+os.unshare(0x20000)
+libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
+os.makedirs("/tmp/ns/m", exist_ok=True)
+with open("/tmp/ns/src", "w") as f:
+    f.write("source\n")
+print("tmpfs", libc.mount(b"tmpfs", b"/tmp/ns/m", b"tmpfs", 0, None))
+open("/tmp/ns/m/h", "w").close()
+src = os.open("/tmp/ns/src", os.O_PATH)
+dst = os.open("/tmp/ns/m/h", os.O_PATH)
+print("bind by fd", libc.mount(b"/proc/self/fd/%d" % src, b"/proc/self/fd/%d" % dst, None, MS_BIND | MS_REC, None))
+# bind 之前打开的是被盖住的文件，不是挂载的根；bind 之后重新打开的才是
+print("remount the covered one", libc.mount(None, b"/proc/self/fd/%d" % dst, None, MS_BIND | MS_REMOUNT | MS_RDONLY, None))
+top = os.open("/tmp/ns/m/h", os.O_PATH)
+print("remount ro", libc.mount(None, b"/proc/self/fd/%d" % top, None, MS_BIND | MS_REMOUNT | MS_RDONLY, None))
+print([l.split()[4:6] for l in open("/proc/self/mountinfo") if "/tmp/ns/m" in l])
+print(open("/tmp/ns/m/h").read().strip())
+PY6
 rm -rf /tmp/ns

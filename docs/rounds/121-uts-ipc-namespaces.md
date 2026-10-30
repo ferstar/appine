@@ -16,7 +16,7 @@
 
 **推迟项**：
 
-- 没有网络命名空间（下一轮）；cgroup、time 命名空间仍没有。 → 网络命名空间已补上（M9 之前：网络命名空间）；cgroup、time 仍没有
+- 没有网络命名空间（下一轮）；cgroup、time 命名空间仍没有。 → 网络命名空间已补上（M9 之前：网络命名空间），cgroup 命名空间也补上了（M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱）；time 仍没有
 - 没有 mqueue 文件系统（原来就没有），POSIX 消息队列只能经由 mq_open 这些系统调用用。
 - 在用户命名空间里的 root 写 `/proc/sys/kernel` 下的 IPC 限制、主机名仍按文件本身的属主检查（Linux 的 IPC 限制按命名空间的属主，`ipc_set_ownership`）。
 - 命名空间文件不让 UTS、IPC 命名空间活着（与[挂载命名空间](118-mount-namespaces.md)的推迟项相同）。

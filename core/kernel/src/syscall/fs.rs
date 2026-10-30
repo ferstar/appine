@@ -647,6 +647,7 @@ fn open_path(
     if let Some(mnt) = store_mnt {
         file.borrow_mut().mnt = mnt;
     }
+    file.borrow_mut().dentry = parent.clone();
     if let Some(ino) = opened_ino {
         open_events(cx, &file, ino, parent, was_created, flags);
     }

@@ -40,15 +40,21 @@ const CLONE_NEWPID: u64 = 0x2000_0000;
 const CLONE_NEWUTS: u64 = 0x0400_0000;
 const CLONE_NEWIPC: u64 = 0x0800_0000;
 const CLONE_NEWNET: u64 = 0x4000_0000;
+const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 /// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载、用户、pid、UTS、
-/// IPC、网络命名空间（`syscall::ns`），别的是 EPERM（设计文档 §6）。
+/// IPC、网络、cgroup 命名空间（`syscall::ns`），time 命名空间是 EPERM（设计文档 §6）。
 const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
 /// 支持的 `CLONE_NEW*`。
-const CLONE_NEW_DONE: u64 =
-    CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
+const CLONE_NEW_DONE: u64 = CLONE_NEWNS
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWCGROUP;
 /// 要在新进程的用户命名空间里有 `CAP_SYS_ADMIN` 的 `CLONE_NEW*`（Linux 的 copy_namespaces）。
 const CLONE_NEW_ADMIN: u64 =
-    CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
+    CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP;
 /// clone3：子进程的信号处理函数恢复默认。
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// clone3：子进程放进 `cgroup` 指定的 cgroup。
@@ -398,6 +404,9 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     }
     if flags & CLONE_NEWNET != 0 {
         ns.net = cx.k().new_net_ns(child_cred_owner.clone())?;
+    }
+    if flags & CLONE_NEWCGROUP != 0 {
+        ns.cgroup = super::ns::new_cgroup_ns(child_cred_owner.clone());
     }
     let task = Task::new(
         tid,
@@ -1436,9 +1445,12 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     }
     // 新的 UTS 命名空间复制原来的名字，新的 IPC 命名空间是空的，新的网络命名空间里只有
     // 关着的 lo
-    if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET) != 0 {
+    if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP) != 0 {
         let owner = new_cred.user_ns.clone();
         let mut ns = cx.ns();
+        if flags & CLONE_NEWCGROUP != 0 {
+            ns.cgroup = super::ns::new_cgroup_ns(owner.clone());
+        }
         if flags & CLONE_NEWNET != 0 {
             ns.net = cx.k().new_net_ns(owner.clone())?;
         }

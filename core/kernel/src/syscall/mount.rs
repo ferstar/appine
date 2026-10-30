@@ -60,7 +60,7 @@ pub(super) fn mount(
         Vec::new()
     };
     let target = read_path(cx, target)?;
-    let (node, at) = {
+    let (node, at, resolved) = {
         let vfs = cx.vfs()?;
         let (node, at) = vfs.walk(
             &cx.view(&vfs),
@@ -74,7 +74,7 @@ pub(super) fn mount(
         // 这类不经过查找的路径也一样
         let top = vfs.mounted(node.clone());
         let at = at.filter(|_| top == node);
-        (top, at)
+        (top, at, node)
     };
     let mut flags = flags;
     if flags & MS_MGC_MSK == MS_MGC_VAL {
@@ -94,9 +94,10 @@ pub(super) fn mount(
     if flags & MS_STRICTATIME != 0 {
         mnt &= !(ms::RELATIME | ms::NOATIME);
     }
+    // remount 不往上找：经由魔法链接给出的被盖住的节点不是挂载的根（EINVAL）
     if flags & MS_REMOUNT != 0 {
         let keep_atime = flags & (ATIME | MS_STRICTATIME) == 0;
-        return remount(cx, &node, mnt, keep_atime);
+        return remount(cx, &resolved, mnt, keep_atime);
     }
     if flags & MS_BIND != 0 {
         return bind(cx, source.as_deref(), (node, at), flags & MS_REC != 0);

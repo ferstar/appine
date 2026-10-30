@@ -78,6 +78,15 @@ pub(super) fn new_pid_ns(
     Ok(PidNs::child(parent, owner))
 }
 
+/// 新的 cgroup 命名空间，属于用户命名空间 `owner`（根是调用者所在的 cgroup，也就是唯一的
+/// 那个 "/"）。
+pub(super) fn new_cgroup_ns(owner: Rc<UserNs>) -> Rc<crate::nsproxy::CgroupNs> {
+    Rc::new(crate::nsproxy::CgroupNs {
+        id: new_ns_id(),
+        owner,
+    })
+}
+
 /// 根目录不是挂载命名空间的根（chroot 了，Linux 的 `current_chrooted`）。
 pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
     let Ok(vfs) = cx.vfs() else {
@@ -195,6 +204,16 @@ pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
                 return Err(Errno::EPERM);
             }
             cx.task.ns.borrow_mut().uts = ns;
+            Ok(0)
+        }
+        // Linux 的 cgroupns_install：同样要两处的 CAP_SYS_ADMIN
+        NsKind::Cgroup => {
+            let ns = find_nsproxy(cx.kr(), |p| (p.cgroup.id == id).then(|| p.cgroup.clone()))
+                .ok_or(Errno::EINVAL)?;
+            if !cred.ns_capable(&ns.owner, cap::SYS_ADMIN) || !cred.capable_here(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            cx.task.ns.borrow_mut().cgroup = ns;
             Ok(0)
         }
         // Linux 的 netns_install：同样要两处的 CAP_SYS_ADMIN

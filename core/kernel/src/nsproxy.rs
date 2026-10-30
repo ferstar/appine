@@ -1,4 +1,4 @@
-//! 线程所在的 UTS、IPC、网络命名空间（Linux 的 `struct nsproxy` 里的这几种；挂载命名空间
+//! 线程所在的 UTS、IPC、网络、cgroup 命名空间（Linux 的 `struct nsproxy` 里的这几种；挂载命名空间
 //! 在 `FsContext` 里，pid 命名空间见 [`crate::pidns`]）。与 Linux 一样按线程记：unshare、
 //! setns 只改调用的线程，clone 出来的线程、进程沿用父线程的。
 //!
@@ -17,6 +17,8 @@ pub(crate) const INIT_UTS_NS: u64 = 4_026_531_838;
 pub(crate) const INIT_IPC_NS: u64 = 4_026_531_839;
 /// 开机时的网络命名空间的编号。
 pub(crate) const INIT_NET_NS: u64 = 4_026_531_840;
+/// 开机时的 cgroup 命名空间的编号。
+pub(crate) const INIT_CGROUP_NS: u64 = 4_026_531_835;
 
 /// 一个 UTS 命名空间。
 #[derive(Debug)]
@@ -50,6 +52,15 @@ pub(crate) struct IpcNs {
     pub owner: Rc<UserNs>,
 }
 
+/// 一个 cgroup 命名空间。所有进程都在同一个 cgroup "/" 里（[`crate::cgroup`]），从哪个
+/// 命名空间看都是根，所以只有编号和属主。
+#[derive(Debug)]
+pub(crate) struct CgroupNs {
+    pub id: u64,
+    /// 建立它时所在的用户命名空间（setns 的权限检查用）。
+    pub owner: Rc<UserNs>,
+}
+
 /// 一个网络命名空间。开机时的那个就是宿主的网络（socket 直接用宿主的）。新建的里面只有
 /// 回环接口 lo：socket 仍是宿主 socket，地址换成宿主上给这个命名空间的回环地址
 /// 127.a.b.0/24（[`crate::netns`]），别的地址都到不了。
@@ -77,12 +88,13 @@ pub(crate) struct Loopback {
     pub mtu: Option<u32>,
 }
 
-/// 线程的 UTS、IPC、网络命名空间。
+/// 线程的 UTS、IPC、网络、cgroup 命名空间。
 #[derive(Clone, Debug)]
 pub(crate) struct NsProxy {
     pub uts: Rc<UtsNs>,
     pub ipc: Rc<IpcNs>,
     pub net: Rc<NetNs>,
+    pub cgroup: Rc<CgroupNs>,
 }
 
 impl NsProxy {
@@ -104,6 +116,10 @@ impl NsProxy {
                 owner: UserNs::init(),
                 host_net: None,
                 lo: RefCell::default(),
+            }),
+            cgroup: Rc::new(CgroupNs {
+                id: INIT_CGROUP_NS,
+                owner: UserNs::init(),
             }),
         }
     }
