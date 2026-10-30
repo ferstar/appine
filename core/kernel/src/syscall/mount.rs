@@ -4,7 +4,8 @@
 //! 系统里的目录、文件都可以 bind 挂载（`MS_REC` 带上挂在里面的挂载），挂载的标志、重新
 //! 挂载、`MS_MOVE`、卸下（`MNT_DETACH`、`MNT_EXPIRE`）、pivot_root 和各种错误按 Linux 6.1
 //! 的 `path_mount`、`path_umount`、`pivot_root`。传播类型可以设置，但不模拟：挂载之间没有
-//! 传播，都相当于 private。别的文件系统（tmpfs 等）与没有编进内核的一样是 ENODEV。
+//! 传播，都相当于 private。tmpfs 是仓库里不挂在根目录下面的一棵树（`Vfs::new_tmpfs`）。
+//! 别的文件系统与没有编进内核的一样是 ENODEV。
 
 use std::collections::HashSet;
 
@@ -13,7 +14,7 @@ use super::{SysResult, get, read_path};
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::kernel::Cx;
-use crate::vfs::{Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, Vfs, ms};
+use crate::vfs::{Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, ms};
 
 const MS_REMOUNT: u64 = 0x20;
 const MS_BIND: u64 = 0x1000;
@@ -49,9 +50,13 @@ pub(super) fn mount(
     // （devpts 的 mode、gid，proc 的 hidepid 等）不看，只要求能读
     let fstype = optional_str(cx, fstype)?;
     let source = optional_str(cx, source)?;
-    if data != 0 {
+    // 选项只有 tmpfs 看；Linux 复制最多一页，读不了第一个字节是 EFAULT
+    let data = if data != 0 {
         get::<1>(cx, data)?;
-    }
+        cx.mm().read_cstr(data, 4096).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let target = read_path(cx, target)?;
     let (node, at) = {
         let vfs = cx.vfs()?;
@@ -100,7 +105,7 @@ pub(super) fn mount(
     if flags & MS_MOVE != 0 {
         return move_mount(cx, source.as_deref(), (node, at));
     }
-    new_mount(cx, fstype, source, (node, at), mnt)
+    new_mount(cx, fstype, source, (node, at), mnt, &data)
 }
 
 /// mount(2) 的字符串参数，空指针是 None。
@@ -118,6 +123,7 @@ fn new_mount(
     source: Option<Vec<u8>>,
     (target, at): (Node, Option<Dentry>),
     flags: u64,
+    data: &[u8],
 ) -> SysResult {
     let fstype = fstype.ok_or(Errno::EINVAL)?;
     let Some(fs) = Fs::from_type(&fstype) else {
@@ -141,6 +147,13 @@ fn new_mount(
     if !vfs.is_dir(&cx.view(&vfs), &target)? {
         return Err(Errno::ENOTDIR);
     }
+    if fs == Fs::Tmpfs {
+        let params = tmpfs_options(data, &cx.cred())?;
+        let source = source.unwrap_or_default();
+        vfs.new_tmpfs((target, at), flags, source, params)?;
+        cx.shared.fast_changed();
+        return Ok(0);
+    }
     let dev = (!fs.own_dev()).then(|| fs.dev());
     vfs.add_mount(
         fs,
@@ -152,6 +165,138 @@ fn new_mount(
     );
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// tmpfs 的挂载选项（Linux 6.1 的 `shmem_parse_one`）：根目录的权限、属主、属组和
+/// mountinfo 里的超级块选项、`size=` 的字节数。不认识的选项是 EINVAL。属主、属组默认是
+/// 挂载的进程的 fsuid、fsgid，权限默认 1777。
+fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, Errno> {
+    const PAGE: u64 = 4096;
+    let total = appine_hal::memory_info().0;
+    let (mut perm, mut uid, mut gid) = (0o1777, cred.fsuid, cred.fsgid);
+    let (mut blocks, mut inodes, mut inode64) = (None, None, true);
+    for opt in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
+        let (key, value) = match opt.iter().position(|&b| b == b'=') {
+            Some(i) => (&opt[..i], Some(&opt[i + 1..])),
+            None => (opt, None),
+        };
+        let id = |v: &[u8]| {
+            parse_num(v)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n != u32::MAX)
+                .ok_or(Errno::EINVAL)
+        };
+        match (key, value) {
+            (b"size", Some(v)) => {
+                let (n, rest) = memparse(v)?;
+                let bytes = match rest {
+                    b"" => n,
+                    b"%" => n.saturating_mul(total) / 100,
+                    _ => return Err(Errno::EINVAL),
+                };
+                blocks = Some(bytes.div_ceil(PAGE));
+            }
+            (b"nr_blocks", Some(v)) => match memparse(v)? {
+                (n, b"") => blocks = Some(n),
+                _ => return Err(Errno::EINVAL),
+            },
+            (b"nr_inodes", Some(v)) => match memparse(v)? {
+                (n, b"") => inodes = Some(n),
+                _ => return Err(Errno::EINVAL),
+            },
+            (b"mode", Some(v)) => {
+                let s = std::str::from_utf8(v).map_err(|_| Errno::EINVAL)?;
+                perm = u32::from_str_radix(s, 8).map_err(|_| Errno::EINVAL)? & 0o7777;
+            }
+            (b"uid", Some(v)) => uid = id(v)?,
+            (b"gid", Some(v)) => gid = id(v)?,
+            (b"inode64", None) => inode64 = true,
+            (b"inode32", None) => inode64 = false,
+            (
+                b"huge",
+                Some(b"never" | b"always" | b"within_size" | b"advise" | b"deny" | b"force"),
+            ) => {}
+            (b"mpol", Some(_)) => {}
+            // 通用的超级块标志（`vfs_parse_sb_flag`），mount(8) 本来就会换成 MS_* 标志
+            (
+                b"ro" | b"rw" | b"sync" | b"async" | b"dirsync" | b"mand" | b"nomand" | b"lazytime"
+                | b"nolazytime" | b"posixacl" | b"noposixacl" | b"silent" | b"loud",
+                None,
+            ) => {}
+            _ => {
+                let name = String::from_utf8_lossy(opt);
+                crate::debug::log(format_args!("tmpfs: unknown parameter {name}"));
+                return Err(Errno::EINVAL);
+            }
+        }
+    }
+    // 与 Linux 一样，大小、inode 数是默认值（物理内存的一半）时不写
+    let default = total / 2 / PAGE;
+    let mut options = String::new();
+    if let Some(b) = blocks.filter(|&b| b != default) {
+        options += &format!(",size={}k", b * (PAGE / 1024));
+    }
+    if let Some(n) = inodes.filter(|&n| n != default) {
+        options += &format!(",nr_inodes={n}");
+    }
+    if perm != 0o1777 {
+        options += &format!(",mode={perm:03o}");
+    }
+    if uid != 0 {
+        options += &format!(",uid={uid}");
+    }
+    if gid != 0 {
+        options += &format!(",gid={gid}");
+    }
+    options += if inode64 { ",inode64" } else { ",inode32" };
+    Ok(TmpfsParams {
+        perm,
+        uid,
+        gid,
+        options,
+        size: blocks.map(|b| b * PAGE),
+    })
+}
+
+/// 无符号数，前缀与 C 的 `strtoull(…, 0)` 相同（`0x` 十六进制、`0` 八进制）。
+fn parse_num(s: &[u8]) -> Option<u64> {
+    let (n, rest) = leading_num(s)?;
+    rest.is_empty().then_some(n)
+}
+
+/// 开头的无符号数和剩下的部分。
+fn leading_num(s: &[u8]) -> Option<(u64, &[u8])> {
+    let (radix, digits) = match s {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', rest @ ..] if !rest.is_empty() => (8, rest),
+        _ => (10, s),
+    };
+    let end = digits
+        .iter()
+        .position(|&b| !(b as char).is_digit(radix))
+        .unwrap_or(digits.len());
+    let n = std::str::from_utf8(&digits[..end]).ok()?;
+    let n = if n.is_empty() && radix == 8 {
+        0
+    } else {
+        u64::from_str_radix(n, radix).ok()?
+    };
+    Some((n, &digits[end..]))
+}
+
+/// Linux 的 `memparse`：数后面可以跟 K、M、G、T、P、E（不分大小写）。返回剩下的部分。
+fn memparse(s: &[u8]) -> Result<(u64, &[u8]), Errno> {
+    let (n, rest) = leading_num(s).ok_or(Errno::EINVAL)?;
+    let shift = match rest.first().map(u8::to_ascii_uppercase) {
+        Some(b'K') => 10,
+        Some(b'M') => 20,
+        Some(b'G') => 30,
+        Some(b'T') => 40,
+        Some(b'P') => 50,
+        Some(b'E') => 60,
+        _ => return Ok((n, rest)),
+    };
+    Ok((n.saturating_mul(1 << shift), &rest[1..]))
 }
 
 /// bind 挂载（Linux 的 `do_loopback`）：新挂载看到源的那个目录或文件，标志、设备号与源

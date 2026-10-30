@@ -4,7 +4,8 @@
 //! devpts、sysfs 和 cgroup2 是合成文件系统：它们的内容来自内核状态，由内核层经由
 //! [`Pseudo`] 提供。开机时挂在 `/proc`、`/dev/pts`、`/sys`、`/sys/fs/cgroup` 上，之后
 //! 可以用 mount(2) 挂到别的目录上；仓库里的和合成文件系统里的目录、文件都可以 bind 挂载
-//! （[`Mount`]），没有 tmpfs。节点带着它所在的挂载（Linux 的 `struct path`），`..` 和
+//! （[`Mount`]）。tmpfs 是仓库里不挂在根目录下面的一棵树（[`Vfs::new_tmpfs`]），最后一个
+//! 挂载没了时删掉。节点带着它所在的挂载（Linux 的 `struct path`），`..` 和
 //! getcwd 经由挂载点回到上一层，挂载的标志（只读、noexec 等）按经由的挂载算。路径解析在
 //! 整棵树里进行，符号链接最多跟随 40 层；经过的每个仓库目录都要有搜索权限。进程的根目录
 //! 可以被 chroot、pivot_root 换掉：绝对路径从它开始，`..` 不会越过它。
@@ -86,6 +87,8 @@ pub(crate) const CGROUP_MOUNT: MountId = 6;
 pub(crate) enum Fs {
     /// inode 仓库（根文件系统）。
     Store,
+    /// tmpfs：仓库里不挂在根目录下面的一棵树（[`Vfs::new_tmpfs`]）。
+    Tmpfs,
     /// procfs。
     Proc,
     /// devpts。
@@ -104,6 +107,7 @@ impl Fs {
             b"devpts" => Some(Fs::Pts),
             b"sysfs" => Some(Fs::Sys),
             b"cgroup2" => Some(Fs::Cgroup),
+            b"tmpfs" => Some(Fs::Tmpfs),
             _ => None,
         }
     }
@@ -112,6 +116,7 @@ impl Fs {
     pub(crate) const fn type_name(self) -> &'static str {
         match self {
             Fs::Store => "ext4",
+            Fs::Tmpfs => "tmpfs",
             Fs::Proc => "proc",
             Fs::Pts => "devpts",
             Fs::Sys => "sysfs",
@@ -123,6 +128,8 @@ impl Fs {
     pub(crate) const fn dev(self) -> u64 {
         match self {
             Fs::Store => ROOT_DEV,
+            // 没有开机时的实例，每次挂上另外分配
+            Fs::Tmpfs => 0,
             Fs::Proc => 0x4,
             Fs::Pts => 0x18,
             Fs::Sys => 0x16,
@@ -133,14 +140,14 @@ impl Fs {
     /// 每次挂载是一个新的实例（Linux 5.8 起的 procfs、4.7 起的 devpts）：同一处可以再挂
     /// 一个。sysfs、cgroup2 在同一个命名空间里只有一个实例，同一个挂载的根上再挂是 EBUSY。
     pub(crate) const fn new_instance(self) -> bool {
-        matches!(self, Fs::Proc | Fs::Pts)
+        matches!(self, Fs::Proc | Fs::Pts | Fs::Tmpfs)
     }
 
     /// 新挂上的有自己的设备号：只有 procfs。devpts 的新实例在 Linux 上有自己的一套终端
     /// （编号各自从 0 开始）和设备号，这里各个挂载看到的仍是同一套终端，设备号也相同：
     /// 从设备的 fstat 报告的是它，ttyname 要拿它比对 `/dev/pts/<n>` 的 `st_dev`。
     pub(crate) const fn own_dev(self) -> bool {
-        matches!(self, Fs::Proc)
+        matches!(self, Fs::Proc | Fs::Tmpfs)
     }
 
     /// 超级块的选项（mountinfo 最后一列 `rw` 之后的部分）。
@@ -148,16 +155,18 @@ impl Fs {
         match self {
             Fs::Pts => ",gid=5,mode=620,ptmxmode=000",
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
-            Fs::Store | Fs::Proc | Fs::Sys => "",
+            // tmpfs 的按实例（[`Vfs::sb_options`]）
+            Fs::Store | Fs::Tmpfs | Fs::Proc | Fs::Sys => "",
         }
     }
 
-    /// 文件系统的根目录（挂载编号是 0，挂上时换成新挂载的）。
+    /// 文件系统的根目录（挂载编号是 0，挂上时换成新挂载的）。tmpfs 的根是挂上时新建的
+    /// 目录（[`Vfs::new_tmpfs`]），不用这个。
     pub(crate) fn root(self) -> Node {
         Node::Pseudo(
             0,
             match self {
-                Fs::Store => return Node::Store(0, ROOT),
+                Fs::Store | Fs::Tmpfs => return Node::Store(0, ROOT),
                 Fs::Proc => PseudoNode::ProcRoot,
                 Fs::Pts => PseudoNode::PtsRoot,
                 Fs::Sys => PseudoNode::SysRoot,
@@ -254,6 +263,33 @@ struct Mounts {
     next: MountId,
     /// 下一个新实例的设备号（0:48 起，避开 [`Fs::dev`] 和管道、socket 等用的）。
     next_dev: u64,
+    /// tmpfs 的实例，按设备号（bind 挂载与源共用设备号）。
+    tmpfs: std::collections::HashMap<u64, Tmpfs>,
+}
+
+/// 新挂一个 tmpfs 的参数（mount(2) 的选项解析出来的）。
+pub(crate) struct TmpfsParams {
+    /// 根目录的权限、属主、属组。
+    pub perm: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// [`Tmpfs::options`]。
+    pub options: String,
+    /// [`Tmpfs::size`]。
+    pub size: Option<u64>,
+}
+
+/// tmpfs 的一个实例（Linux 的超级块）：挂上时在仓库里新建一个不挂在根目录下面的目录
+/// （[`Store::create_detached_dir`]），挂载和 bind 挂载都没了时连同里面的一起删掉。数据
+/// 照常存在宿主的文件里，不占 App 的内存，大小不限。
+pub(crate) struct Tmpfs {
+    /// 根目录。
+    pub root: Ino,
+    /// mountinfo 里超级块的选项（`,size=1024k,mode=755,inode64` 这样，Linux 的
+    /// `shmem_show_options`）。
+    pub options: String,
+    /// `size=` 给的字节数：statfs 按它报告总量。
+    pub size: Option<u64>,
 }
 
 /// 不持 BKL 解析路径要用的部分（`syscall::fast`）：仓库的元数据缓存和挂载点。
@@ -469,6 +505,7 @@ impl Vfs {
             detached: Vec::new(),
             next: CGROUP_MOUNT + 1,
             next_dev: 0x30,
+            tmpfs: Default::default(),
         };
         let cached = Cached {
             meta: store.meta().clone(),
@@ -881,6 +918,11 @@ impl Vfs {
                 }
                 Node::Store(id, ino) => {
                     let parent = self.store.parent(ino)?;
+                    // tmpfs 的根：上级是它自己
+                    if parent == ino {
+                        reached = false;
+                        break;
+                    }
                     // 已被删除的目录找不到名字，与 Linux 一样报 ENOENT
                     names.push(self.store.name_of(parent, ino)?.ok_or(Errno::ENOENT)?);
                     cur = Node::Store(id, parent);
@@ -961,6 +1003,34 @@ impl Vfs {
                 Node::Store(..) => ROOT_DEV,
                 Node::Pseudo(_, p) => crate::pseudo::fs_of(p).dev(),
             })
+    }
+
+    /// `node` 所在的文件系统的种类。
+    pub(crate) fn fs_of(&self, node: &Node) -> Fs {
+        self.with_mount(node.mnt(), |m| m.fs)
+            .unwrap_or_else(|| match node {
+                Node::Store(..) => Fs::Store,
+                Node::Pseudo(_, p) => crate::pseudo::fs_of(p),
+            })
+    }
+
+    /// `node` 所在的 tmpfs 实例给的大小（statfs）；不在 tmpfs 里、没给大小时是 None。
+    pub(crate) fn tmpfs_size(&self, node: &Node) -> Option<u64> {
+        let dev = self.dev_of(node);
+        self.mounts.borrow().tmpfs.get(&dev)?.size
+    }
+
+    /// 挂载的超级块选项（mountinfo 最后一列 `rw` 之后的部分）。
+    pub(crate) fn sb_options(&self, m: &Mount) -> String {
+        match m.fs {
+            Fs::Tmpfs => self
+                .mounts
+                .borrow()
+                .tmpfs
+                .get(&m.dev)
+                .map_or_else(String::new, |t| t.options.clone()),
+            fs => fs.options().to_owned(),
+        }
     }
 
     /// `node` 所在的挂载的标志；不知道是哪个挂载时是 None。
@@ -1061,6 +1131,36 @@ impl Vfs {
         id
     }
 
+    /// 挂上一个新的 tmpfs 实例（根目录由这里新建），返回新挂载的编号。
+    pub(crate) fn new_tmpfs(
+        &self,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        params: TmpfsParams,
+    ) -> Result<MountId, Errno> {
+        let TmpfsParams {
+            perm,
+            uid,
+            gid,
+            options,
+            size,
+        } = params;
+        let root = self.store.create_detached_dir(perm, uid, gid)?;
+        let id = self.add_mount(Fs::Tmpfs, Node::Store(0, root), point, flags, source, None);
+        let mut mounts = self.mounts.borrow_mut();
+        let dev = mounts.list.iter().find(|m| m.id == id).map_or(0, |m| m.dev);
+        mounts.tmpfs.insert(
+            dev,
+            Tmpfs {
+                root,
+                options,
+                size,
+            },
+        );
+        Ok(id)
+    }
+
     /// 直接挂在挂载 `id` 里的挂载，按挂上的先后。
     pub(crate) fn children(&self, id: MountId) -> Vec<Mount> {
         self.mounts
@@ -1097,11 +1197,34 @@ impl Vfs {
     }
 
     /// 丢掉卸下了的、`in_use` 里没有的挂载（进程的根目录、当前目录和打开的文件都不在里面）。
+    /// 哪个挂载都不再看得到的 tmpfs 实例连同里面的文件一起删掉。
     pub(crate) fn collect(&self, in_use: &std::collections::HashSet<MountId>) {
-        self.mounts
-            .borrow_mut()
-            .detached
-            .retain(|m| in_use.contains(&m.id));
+        let gone: Vec<Ino> = {
+            let mut mounts = self.mounts.borrow_mut();
+            mounts.detached.retain(|m| in_use.contains(&m.id));
+            let live: std::collections::HashSet<u64> = mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .filter(|m| m.fs == Fs::Tmpfs)
+                .map(|m| m.dev)
+                .collect();
+            let dead: Vec<u64> = mounts
+                .tmpfs
+                .keys()
+                .filter(|dev| !live.contains(dev))
+                .copied()
+                .collect();
+            dead.iter()
+                .filter_map(|dev| mounts.tmpfs.remove(dev))
+                .map(|t| t.root)
+                .collect()
+        };
+        for root in gone {
+            if let Err(e) = self.store.remove_detached_dir(root) {
+                crate::debug::log(format_args!("cannot remove tmpfs {root}: {e}"));
+            }
+        }
     }
 
     /// 把挂在树上的挂载 `id` 改挂到 `point` 上（`MS_MOVE`、pivot_root）；None 是挂成挂载树
@@ -1749,6 +1872,61 @@ mod tests {
         assert!(vfs.readonly(&inner));
         vfs.collect(&std::collections::HashSet::new());
         assert!(!vfs.readonly(&inner));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tmpfs_lives_while_mounted() {
+        let (vfs, dir) = sample("tmpfs");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let r = |p: &[u8]| vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, p, true);
+        let usr = r(b"/usr").unwrap();
+        let bin = r(b"/bin").unwrap();
+        let params = TmpfsParams {
+            perm: 0o755,
+            uid: 0,
+            gid: 0,
+            options: ",mode=755,inode64".to_string(),
+            size: None,
+        };
+        let a = vfs
+            .new_tmpfs((usr.clone(), None), 0, b"t".to_vec(), params)
+            .unwrap();
+        let top = r(b"/usr").unwrap();
+        assert_eq!(top.mnt(), a);
+        assert_eq!(vfs.fs_of(&top), Fs::Tmpfs);
+        assert_ne!(vfs.dev_of(&top), ROOT_DEV);
+        assert_eq!(vfs.sb_options(&vfs.mount(a).unwrap()), ",mode=755,inode64");
+        let root = top.ino().unwrap();
+        let sub = vfs.store().mkdir(root, b"sub", 0o755, 0, 0).unwrap();
+        let (f, _) = vfs.store().create_file(sub, b"f", 0o644, 0, 0).unwrap();
+        // tmpfs 的根上面是挂载点；里面的路径经由它
+        assert_eq!(r(b"/usr/sub/..").unwrap(), top);
+        assert_eq!(r(b"/usr/..").unwrap(), Node::ROOT);
+        assert_eq!(
+            vfs.path_of(ps, &Node::ROOT, &Node::Store(a, sub)).unwrap(),
+            b"/usr/sub"
+        );
+        // bind 出去的子目录让它活着
+        let b = vfs.add_mount(
+            Fs::Tmpfs,
+            Node::Store(a, sub),
+            (bin, None),
+            0,
+            Vec::new(),
+            Some(vfs.dev_of(&top)),
+        );
+        assert_eq!(vfs.root_path(ps, &vfs.mount(b).unwrap()), b"/sub");
+        vfs.remove_mount(a);
+        vfs.collect(&std::collections::HashSet::new());
+        assert_eq!(vfs.store().stat(f).unwrap().nlink, 1);
+        assert_eq!(r(b"/bin/f").unwrap(), Node::Store(b, f));
+        // 都没了：连同里面的一起删掉
+        vfs.remove_mount(b);
+        vfs.collect(&std::collections::HashSet::new());
+        assert_eq!(vfs.store().stat(f).unwrap().nlink, 0);
+        assert_eq!(vfs.store().stat(root).unwrap().nlink, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

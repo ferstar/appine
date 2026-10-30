@@ -1,6 +1,6 @@
 # M9 之前：仓库里的目录 bind（2026-10-30）
 
-← [M9 之前：有 JIT 代码的进程也共用翻译（2026-10-30）](115-shared-with-jit.md) · [索引](../milestones.md)
+← [M9 之前：有 JIT 代码的进程也共用翻译（2026-10-30）](115-shared-with-jit.md) · [索引](../milestones.md) · [M9 之前：tmpfs（2026-10-30）](117-tmpfs.md) →
 
 Codex、Claude Code 的沙箱用 bubblewrap 建，在 appine 里第一步就失败（[AI 编程 CLI](103-ai-cli-survey.md)的推迟项）。看了 Codex 0.165 实际的调用：默认参数下每条命令都经由 `bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-net --ro-bind / / --tmpfs … --remount-ro … --dev /dev --proc /proc` 运行；它留着的 Landlock 退路（`features.use_legacy_landlock`）也要 bwrap，直接 panic（"filesystem-restricted execution requires bubblewrap"）。所以要让 bwrap 在 appine 里跑通，拆成几轮：仓库里的目录 bind（这一轮）、tmpfs、挂载命名空间和用户命名空间、pid 命名空间、网络等命名空间，最后用 bwrap、Codex、Claude Code 端到端地试。
 
@@ -30,7 +30,7 @@ Codex、Claude Code 的沙箱用 bubblewrap 建，在 appine 里第一步就失�
 
 **推迟项**：
 
-- 没有 tmpfs（下一轮）。
+- 没有 tmpfs（下一轮）。→ 已补上（M9 之前：tmpfs）
 - 没有挂载命名空间（§6），pivot_root、`umount -l` 原来的根这些都作用于所有进程看到的同一张挂载表。
 - 卸下的挂载的记录只在 umount 时清理：进程退出、关掉文件之后不再用的，要等下一次 umount 才丢掉。
 - 经由 `/proc/<pid>/fd/<n>` 重新打开的已经删除的文件算根文件系统的挂载，不是原来打开它时经由的。

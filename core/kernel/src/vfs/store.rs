@@ -630,6 +630,10 @@ const SCHEMA: &str = "
         value BLOB NOT NULL,
         PRIMARY KEY (ino, name)
     ) WITHOUT ROWID;
+    -- 不挂在根目录下面的目录（tmpfs 的根）：开机时连同里面的一起删掉
+    CREATE TABLE IF NOT EXISTS detached_roots (
+        ino INTEGER PRIMARY KEY
+    );
 ";
 
 fn db_err(e: rusqlite::Error) -> Errno {
@@ -705,6 +709,7 @@ impl Store {
             for path in volatile {
                 store.empty_dir(path)?;
             }
+            store.remove_detached_dirs()?;
             store.transaction(|s| s.remove_orphans())?;
             store.commit()?;
         }
@@ -758,6 +763,22 @@ impl Store {
             } else {
                 self.unlink(dir, &e.name)?;
             }
+        }
+        Ok(())
+    }
+
+    /// 删掉上次运行留下的不挂在根目录下面的目录（[`Store::create_detached_dir`]）。
+    fn remove_detached_dirs(&self) -> Result<(), Errno> {
+        let roots: Vec<Ino> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT ino FROM detached_roots")
+                .map_err(db_err)?;
+            let rows = stmt.query_map([], |r| r.get(0)).map_err(db_err)?;
+            rows.collect::<Result<_, _>>().map_err(db_err)?
+        };
+        for ino in roots {
+            self.remove_detached_dir(ino)?;
         }
         Ok(())
     }
@@ -1490,6 +1511,40 @@ impl Store {
         self.object(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
     }
 
+    /// 新建一个不挂在根目录下面的目录（tmpfs 的根）：上级是它自己，记在 `detached_roots`
+    /// 里，[`Store::remove_detached_dir`] 或者下次开机时连同里面的一起删掉。
+    pub fn create_detached_dir(&self, perm: u32, uid: u32, gid: u32) -> Result<Ino, Errno> {
+        self.transaction(|s| {
+            let ino = s.new_inode(mode::S_IFDIR | (perm & 0o7777), uid, gid, 2, 0)?;
+            s.db.prepare_cached("UPDATE inodes SET parent = ?1 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino]))
+                .map_err(db_err)?;
+            s.db.prepare_cached("INSERT INTO detached_roots (ino) VALUES (?1)")
+                .and_then(|mut st| st.execute(params![ino]))
+                .map_err(db_err)?;
+            s.touch_ino(ino);
+            Ok(ino)
+        })
+    }
+
+    /// 删掉不挂在根目录下面的目录 `dir` 和里面的一切（tmpfs 卸下了）。与 unlink 一样，
+    /// 还打开着、映射着的文件照常能用，inode 的行留到下次开机。
+    pub fn remove_detached_dir(&self, dir: Ino) -> Result<(), Errno> {
+        self.transaction(|s| {
+            if s.stat_row(dir).is_ok_and(|st| st.nlink > 0) {
+                s.remove_contents(dir)?;
+                s.db.prepare_cached("UPDATE inodes SET nlink = 0 WHERE ino = ?1")
+                    .and_then(|mut st| st.execute(params![dir]))
+                    .map_err(db_err)?;
+                s.touch_ino(dir);
+            }
+            s.db.prepare_cached("DELETE FROM detached_roots WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![dir]))
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
     /// 新建一个没有名字的普通文件（memfd_create）：链接数为 0，object 一开始就删除，
     /// 关闭之后数据随之消失，inode 在下次打开仓库时清理。
     pub fn create_anonymous(&self, perm: u32) -> Result<(Ino, File), Errno> {
@@ -1739,16 +1794,18 @@ impl Store {
         self.transaction(|s| s.remove_dir(parent, name, ino))
     }
 
-    /// `ancestor` 是不是 `dir` 本身或者它的上级目录。
+    /// `ancestor` 是不是 `dir` 本身或者它的上级目录。根目录和不挂在根目录下面的目录的
+    /// 上级是它自己。
     fn is_ancestor(&self, ancestor: Ino, mut dir: Ino) -> Result<bool, Errno> {
         loop {
             if dir == ancestor {
                 return Ok(true);
             }
-            if dir == ROOT {
+            let up = self.parent(dir)?;
+            if up == dir {
                 return Ok(false);
             }
-            dir = self.parent(dir)?;
+            dir = up;
         }
     }
 
@@ -2450,6 +2507,39 @@ mod tests {
         assert!(s.readdir(run).unwrap().is_empty());
         assert_eq!(s.stat(shm).unwrap().mode & 0o7777, 0o1777);
         assert!(s.lookup(ROOT, b"tmp").unwrap().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detached_directories_are_removed() {
+        let (s, dir) = temp_store("detached");
+        // 不挂在根目录下面：上级是它自己，根目录里看不到；里面照常建文件、目录
+        let a = s.create_detached_dir(0o1777, 0, 0).unwrap();
+        assert_eq!(s.parent(a).unwrap(), a);
+        assert_eq!(s.stat(a).unwrap().mode, mode::S_IFDIR | 0o1777);
+        assert!(s.readdir(ROOT).unwrap().is_empty());
+        let sub = s.mkdir(a, b"sub", 0o755, 0, 0).unwrap();
+        let (f, _) = s.create_file(sub, b"f", 0o644, 0, 0).unwrap();
+        // 挪到别的子目录下面：祖先的检查停在它这里
+        let other = s.mkdir(a, b"other", 0o755, 0, 0).unwrap();
+        s.rename(a, b"sub", other, b"sub", false, false).unwrap();
+        assert_eq!(
+            s.rename(other, b"sub", sub, b"x", false, false),
+            Err(Errno::EINVAL)
+        );
+        // 卸下了：连同里面的一起删掉
+        s.remove_detached_dir(a).unwrap();
+        assert_eq!(s.stat(f).unwrap().nlink, 0);
+        assert_eq!(s.stat(a).unwrap().nlink, 0);
+        // 下次开机时删掉上次留下的
+        let b = s.create_detached_dir(0o755, 0, 0).unwrap();
+        let (g, _) = s.create_file(b, b"g", 0o644, 0, 0).unwrap();
+        s.commit().unwrap();
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.stat(b), Err(Errno::ENOENT));
+        assert_eq!(s.stat(g), Err(Errno::ENOENT));
+        assert_eq!(s.stat(f), Err(Errno::ENOENT));
         let _ = fs::remove_dir_all(&dir);
     }
 

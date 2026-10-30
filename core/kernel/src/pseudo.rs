@@ -1854,7 +1854,7 @@ fn mounts(ps: &View<'_>, root: &Node, info: bool) -> Vec<u8> {
             } else {
                 &m.source
             },
-            options: m.fs.options(),
+            options: ps.vfs.sb_options(&m),
         }
         .write(&mut out, info);
     }
@@ -1872,14 +1872,14 @@ struct MountLine<'a> {
     flags: u64,
     fstype: &'static str,
     source: &'a [u8],
-    /// 超级块的选项（[`Fs::options`]）。
-    options: &'static str,
+    /// 超级块的选项（[`crate::vfs::Vfs::sb_options`]）。
+    options: String,
 }
 
 impl MountLine<'_> {
     fn write(&self, out: &mut Vec<u8>, info: bool) {
         let opts = mount_options(self.flags);
-        let (fstype, options) = (self.fstype, self.options);
+        let (fstype, options) = (self.fstype, &self.options);
         if info {
             let (id, parent) = (self.id, self.parent);
             let (major, minor) = (self.dev >> 8, self.dev & 0xff);
@@ -2160,7 +2160,8 @@ pub(crate) fn content(ps: &View<'_>, node: &PseudoNode) -> Result<Vec<u8>, Errno
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
             self::Global::Filesystems => {
-                "nodev\tsysfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\n".to_owned()
+                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\n"
+                    .to_owned()
             }
             self::Global::Cmdline => "appine\n".to_owned(),
             self::Global::Cgroups => crate::cgroup::proc_cgroups(),

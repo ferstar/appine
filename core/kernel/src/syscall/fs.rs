@@ -102,6 +102,7 @@ const ANON_DEV: u64 = 0xe;
 const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
@@ -454,7 +455,11 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
     match &f.kind {
         FileKind::Host(fd) => host_stat(*fd),
         FileKind::Pipe(end) => match end.pipe.borrow().fifo {
-            Some(ino) => Ok(encode_stat(&cx.vfs()?.store().stat(ino)?, ROOT_DEV)),
+            Some(ino) => {
+                let vfs = cx.vfs()?;
+                let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
+                Ok(encode_stat(&vfs.store().stat(ino)?, dev))
+            }
             None => Ok(anon(
                 end.pipe.borrow().ino,
                 mode::S_IFIFO | 0o600,
@@ -494,10 +499,11 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
             };
             Ok(encode_stat(&st, Fs::Pts.dev()))
         }
-        FileKind::Regular { ino, file } => Ok(encode_stat(
-            &cx.vfs()?.store().stat_open(*ino, file)?,
-            ROOT_DEV,
-        )),
+        FileKind::Regular { ino, file } => {
+            let vfs = cx.vfs()?;
+            let dev = vfs.dev_of(&Node::Store(f.mnt, *ino));
+            Ok(encode_stat(&vfs.store().stat_open(*ino, file)?, dev))
+        }
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
             drop(f);
@@ -1964,10 +1970,27 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     let vfs = cx.vfs()?;
     let flags = vfs.mount_flags(node).unwrap_or(0);
     Ok(match node {
+        // tmpfs 的总量是 `size=` 或者物理内存的一半，用量不记，都算空闲
+        Node::Store(..) if vfs.fs_of(node) == Fs::Tmpfs => {
+            let bytes = vfs
+                .tmpfs_size(node)
+                .unwrap_or(appine_hal::memory_info().0 / 2);
+            let blocks = bytes / 4096;
+            let s = appine_hal::FsStats {
+                block_size: 4096,
+                blocks,
+                free: blocks,
+                available: blocks,
+                files: blocks,
+                files_free: blocks,
+            };
+            encode_statfs(TMPFS_MAGIC, &s, flags)
+        }
         Node::Store(..) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
         Node::Pseudo(_, p) => {
             let magic = match pseudo::fs_of(p) {
                 Fs::Store => EXT4_SUPER_MAGIC,
+                Fs::Tmpfs => TMPFS_MAGIC,
                 Fs::Proc => PROC_SUPER_MAGIC,
                 Fs::Pts => DEVPTS_SUPER_MAGIC,
                 Fs::Sys => SYSFS_MAGIC,

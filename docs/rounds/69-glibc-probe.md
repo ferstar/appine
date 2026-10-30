@@ -31,7 +31,7 @@ guest 里跑过的都是 Alpine 的 musl 程序（§1.1 的目标），glibc 的
 
 **推迟项**：
 
-- 没有 mount、umount2、pivot_root（ENOSYS）：chroot 进别的发行版缺 `/proc`、`/sys`、`/dev`，做法和工作量见上。 → 先做了 App 里选 rootfs（M9 之前：App 里选 rootfs）；之后做了第一档（M9 之前：mount 的子集）：procfs、sysfs、devpts、cgroup2 可以挂到任意目录上，它们里面的目录可以 bind，chroot 进去之后 ps、top、free 能用了；仓库里的目录的 bind、pivot_root 后来也补上了（M9 之前：仓库里的目录 bind），tmpfs 仍没有
+- 没有 mount、umount2、pivot_root（ENOSYS）：chroot 进别的发行版缺 `/proc`、`/sys`、`/dev`，做法和工作量见上。 → 先做了 App 里选 rootfs（M9 之前：App 里选 rootfs）；之后做了第一档（M9 之前：mount 的子集）：procfs、sysfs、devpts、cgroup2 可以挂到任意目录上，它们里面的目录可以 bind，chroot 进去之后 ps、top、free 能用了；仓库里的目录的 bind、pivot_root 后来也补上了（M9 之前：仓库里的目录 bind），tmpfs 也补上了（M9 之前：tmpfs）
 - 导入 docker export 出来的 rootfs 时，空的 resolv.conf、hosts 要由导入的一方写好：内核层只在 resolv.conf 不存在时写存根，App 首次启动写的 hosts 也是已有就不动（§11.4）。 → App 导入 Debian、Ubuntu 时写好了（M9 之前：App 里选 rootfs）
 - rseq 没有实现：glibc 不注册也照常工作；用 rseq 做每个 CPU 缓存的程序（新版 tcmalloc）退回别的做法。
 - VS Code 第一个终端刚打开时丢字的那一次没有和原生的 code-server 对照。→ 已对照（M9 之前：补测待查的几项）：原生的 code-server 上同样丢字，而且丢得更多，是 VS Code 在终端起来之前不收输入
