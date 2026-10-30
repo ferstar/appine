@@ -2558,7 +2558,7 @@ mod tests {
         let (s, dir) = temp_store("checkpoint");
         let state = |s: &Store| {
             let st = s.meta.reaper.state.lock().unwrap();
-            (st.checkpoints, st.pages)
+            (st.checkpoints, st.pages, st.backfilled)
         };
         // 每个操作单独提交，直到 WAL 攒够要做检查点的页数。提交的线程自己做的话（SQLite
         // 默认的自动检查点），后台线程一次也没做过
@@ -2570,9 +2570,13 @@ mod tests {
             s.commit().unwrap();
             i += 1;
         }
-        // 写入停下来之后后台写回剩下的帧：下一个写事务让 WAL 从头再用
+        // 写入停下来之后后台写回剩下的帧：下一个写事务让 WAL 从头再用。不能只等第二次检查点：
+        // 机器慢时第二次可能是最后几次提交期间请求的那一次，写不回它们，要等停下来之后的那次
         let start = Instant::now();
-        while state(&s).0 < 2 {
+        while {
+            let (_, pages, backfilled) = state(&s);
+            backfilled < pages
+        } {
             assert!(
                 start.elapsed() < Duration::from_secs(10),
                 "no checkpoint after the writes stopped"
