@@ -171,10 +171,12 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
             };
             let dir_st = super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
             let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777 & !cx.umask(), false);
+            let tmpfs = super::fs::tmpfs_reserve(&vfs, (mnt, dir), 0)?;
             let ino = vfs
                 .store()
                 .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
                 .map_err(in_use)?;
+            super::fs::tmpfs_created(&vfs, tmpfs, 0);
             super::inotify::dir_event(cx.kr(), dir, name, super::inotify::IN_CREATE, 0);
             cx.k().unix.insert(Name::Path(ino), sock);
             bound.extend_from_slice(p);

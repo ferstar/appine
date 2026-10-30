@@ -84,6 +84,16 @@ pub(crate) struct MntNs {
     pub owner: std::rc::Rc<crate::cred::UserNs>,
 }
 
+/// tmpfs 里一个 inode 占的页数：普通文件按大小，符号链接的目标有 128 字节以上时一页
+/// （Linux 的 `SHORT_SYMLINK_LEN`，短的放在 inode 里），别的不占。
+pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
+    match st.kind() {
+        mode::S_IFREG => st.size.div_ceil(TMPFS_PAGE),
+        mode::S_IFLNK => u64::from(st.size >= 128),
+        _ => 0,
+    }
+}
+
 /// 分配新的命名空间编号（Linux 的 `proc_alloc_inum`，各种命名空间共用）。
 pub(crate) fn new_ns_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4_026_532_160);
@@ -310,29 +320,68 @@ struct Mounts {
     proc_ns: std::collections::HashMap<u64, std::rc::Rc<crate::pidns::PidNs>>,
 }
 
-/// 新挂一个 tmpfs 的参数（mount(2) 的选项解析出来的）。
+/// tmpfs 按页记用量，页的大小（guest 的页）。
+pub(crate) const TMPFS_PAGE: u64 = 4096;
+
+/// tmpfs 的超级块参数（Linux 的 `shmem_sb_info` 里的这几项）：挂上时由 mount(2) 的选项
+/// 定下，重新挂载可以改大小、inode 数和 inode32/64。
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TmpfsParams {
-    /// 根目录的权限、属主、属组。
+    /// 根目录的权限、属主、属组（只在挂上时用）。
     pub perm: u32,
     pub uid: u32,
     pub gid: u32,
-    /// [`Tmpfs::options`]。
-    pub options: String,
-    /// [`Tmpfs::size`]。
-    pub size: Option<u64>,
+    /// 最多的页数、inode 数，0 是不限（`size=0`、`nr_inodes=0`）。
+    pub blocks: u64,
+    pub inodes: u64,
+    /// `inode64`（默认）或者 `inode32`。
+    pub inode64: bool,
+}
+
+impl TmpfsParams {
+    /// 默认的页数和 inode 数：物理内存的一半（Linux 的 `shmem_default_max_blocks`、
+    /// `shmem_default_max_inodes`，没有高端内存时两者相同）。
+    pub fn default_limit() -> u64 {
+        appine_hal::memory_info().0 / 2 / TMPFS_PAGE
+    }
+
+    /// mountinfo 里超级块的选项（`,size=1024k,mode=755,inode64` 这样，Linux 的
+    /// `shmem_show_options`）：大小、inode 数不是默认值才写，权限不是 1777、属主属组不是 0
+    /// 才写，最后是 `inode64` 或 `inode32`。
+    pub fn options(&self) -> String {
+        let default = Self::default_limit();
+        let mut s = String::new();
+        if self.blocks != default {
+            s += &format!(",size={}k", self.blocks * (TMPFS_PAGE / 1024));
+        }
+        if self.inodes != default {
+            s += &format!(",nr_inodes={}", self.inodes);
+        }
+        if self.perm != 0o1777 {
+            s += &format!(",mode={:03o}", self.perm);
+        }
+        if self.uid != 0 {
+            s += &format!(",uid={}", self.uid);
+        }
+        if self.gid != 0 {
+            s += &format!(",gid={}", self.gid);
+        }
+        s += if self.inode64 { ",inode64" } else { ",inode32" };
+        s
+    }
 }
 
 /// tmpfs 的一个实例（Linux 的超级块）：挂上时在仓库里新建一个不挂在根目录下面的目录
 /// （[`Store::create_detached_dir`]），挂载和 bind 挂载都没了时连同里面的一起删掉。数据
-/// 照常存在宿主的文件里，不占 App 的内存，大小不限。
+/// 照常存在宿主的文件里，不占 App 的内存。用量与 Linux 一样按页数和 inode 数限制
+/// （[`Vfs::tmpfs_usage`]）。
 pub(crate) struct Tmpfs {
     /// 根目录。
     pub root: Ino,
-    /// mountinfo 里超级块的选项（`,size=1024k,mode=755,inode64` 这样，Linux 的
-    /// `shmem_show_options`）。
-    pub options: String,
-    /// `size=` 给的字节数：statfs 按它报告总量。
-    pub size: Option<u64>,
+    pub params: TmpfsParams,
+    /// 记下的用量（页数、inode 数），新建、删除、写、截短时跟着改，statfs 时现数一遍
+    /// （[`Vfs::count_tmpfs`]）；None 时下次要用时数。
+    used: Option<(u64, u64)>,
 }
 
 /// 不持 BKL 解析路径要用的部分（`syscall::fast`）：仓库的元数据缓存和挂载点。
@@ -1196,10 +1245,105 @@ impl Vfs {
             })
     }
 
-    /// `node` 所在的 tmpfs 实例给的大小（statfs）；不在 tmpfs 里、没给大小时是 None。
-    pub(crate) fn tmpfs_size(&self, node: &Node) -> Option<u64> {
-        let dev = self.dev_of(node);
-        self.mounts.borrow().tmpfs.get(&dev)?.size
+    /// `node` 在 tmpfs 里时，那个实例的设备号（[`Vfs::tmpfs_usage`] 等用它）。
+    pub(crate) fn tmpfs_dev(&self, node: &Node) -> Option<u64> {
+        (self.fs_of(node) == Fs::Tmpfs).then(|| self.dev_of(node))
+    }
+
+    /// tmpfs 实例 `dev` 的参数和用量（页数、inode 数）。用量与 Linux 的 tmpfs 一样算：根目录
+    /// 和每个名字各占一个 inode（硬链接也是，Linux 的 `shmem_link` 每个链接另占一个），
+    /// 普通文件按页数（与 appine 的 `st_blocks` 一样当作没有空洞），长的符号链接一页。
+    /// `fresh` 时重新数一遍（statfs、重新挂载：直接改仓库的、共享映射里写的这些不经过
+    /// 记账的改动也算进去），否则用记下的，没记下时才数。
+    pub(crate) fn tmpfs_usage(
+        &self,
+        dev: u64,
+        fresh: bool,
+    ) -> Result<(TmpfsParams, u64, u64), Errno> {
+        let (params, root, used) = {
+            let mounts = self.mounts.borrow();
+            let t = mounts.tmpfs.get(&dev).ok_or(Errno::EINVAL)?;
+            (t.params.clone(), t.root, t.used)
+        };
+        let (pages, inodes) = match used {
+            Some(u) if !fresh => u,
+            _ => {
+                let u = self.count_tmpfs(root)?;
+                if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
+                    t.used = Some(u);
+                }
+                u
+            }
+        };
+        Ok((params, pages, inodes))
+    }
+
+    /// 在 tmpfs 实例 `dev` 里再用 `pages` 页、`inodes` 个 inode 放不放得下（Linux 的
+    /// `shmem_reserve_inode`、`shmem_inode_acct_block`）：放不下是 ENOSPC。放得下时由调用方
+    /// 做完之后记账（[`Vfs::tmpfs_charge`]）。
+    pub(crate) fn tmpfs_check(&self, dev: u64, pages: u64, inodes: u64) -> Result<(), Errno> {
+        let (p, used_pages, used_inodes) = self.tmpfs_usage(dev, false)?;
+        let over = |max: u64, used: u64, more: u64| max != 0 && more > 0 && used + more > max;
+        if over(p.blocks, used_pages, pages) || over(p.inodes, used_inodes, inodes) {
+            return Err(Errno::ENOSPC);
+        }
+        Ok(())
+    }
+
+    /// tmpfs 实例 `dev` 里一个文件还能用多少页：本来有 `own` 页，加上没用掉的。不限时是 None。
+    pub(crate) fn tmpfs_room(&self, dev: u64, own: u64) -> Result<Option<u64>, Errno> {
+        let (p, used, _) = self.tmpfs_usage(dev, false)?;
+        Ok((p.blocks != 0).then(|| (p.blocks + own).saturating_sub(used)))
+    }
+
+    /// 记下 tmpfs 实例 `dev` 的用量变了（新建、删除、写、截短之后）。还没数过时什么也不做，
+    /// 要用时再数。
+    pub(crate) fn tmpfs_charge(&self, dev: u64, pages: i64, inodes: i64) {
+        if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev)
+            && let Some((p, i)) = &mut t.used
+        {
+            *p = p.saturating_add_signed(pages);
+            *i = i.saturating_add_signed(inodes);
+        }
+    }
+
+    /// 重新挂载时改 tmpfs 实例 `dev` 的参数：`f` 拿到参数和现在的用量（页数、inode 数），
+    /// 出错时什么也不改。
+    pub(crate) fn tmpfs_reconfigure(
+        &self,
+        dev: u64,
+        f: impl FnOnce(&mut TmpfsParams, u64, u64) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        let (mut params, pages, inodes) = self.tmpfs_usage(dev, true)?;
+        f(&mut params, pages, inodes)?;
+        if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
+            t.params = params;
+        }
+        Ok(())
+    }
+
+    /// 数一遍以 `root` 为根的 tmpfs 的用量（页数、inode 数，见 [`Vfs::tmpfs_usage`]）。
+    /// 删掉之后还开着的文件不算（Linux 关掉时才释放）。
+    fn count_tmpfs(&self, root: Ino) -> Result<(u64, u64), Errno> {
+        let (mut pages, mut inodes) = (0, 1);
+        let mut seen = std::collections::HashSet::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            for e in self.store.readdir(dir)? {
+                if e.ino == dir {
+                    continue;
+                }
+                inodes += 1;
+                match e.mode & mode::S_IFMT {
+                    mode::S_IFDIR => dirs.push(e.ino),
+                    mode::S_IFREG | mode::S_IFLNK if seen.insert(e.ino) => {
+                        pages += tmpfs_pages(&self.store.stat(e.ino)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok((pages, inodes))
     }
 
     /// 挂载的超级块选项（mountinfo 最后一列 `rw` 之后的部分）。
@@ -1210,7 +1354,7 @@ impl Vfs {
                 .borrow()
                 .tmpfs
                 .get(&m.dev)
-                .map_or_else(String::new, |t| t.options.clone()),
+                .map_or_else(String::new, |t| t.params.options()),
             fs => fs.options().to_owned(),
         }
     }
@@ -1351,14 +1495,9 @@ impl Vfs {
         source: Vec<u8>,
         params: TmpfsParams,
     ) -> Result<MountId, Errno> {
-        let TmpfsParams {
-            perm,
-            uid,
-            gid,
-            options,
-            size,
-        } = params;
-        let root = self.store.create_detached_dir(perm, uid, gid)?;
+        let root = self
+            .store
+            .create_detached_dir(params.perm, params.uid, params.gid)?;
         let id = self.add_mount(Fs::Tmpfs, Node::Store(0, root), point, flags, source, None);
         let mut mounts = self.mounts.borrow_mut();
         let dev = mounts.list.iter().find(|m| m.id == id).map_or(0, |m| m.dev);
@@ -1366,8 +1505,9 @@ impl Vfs {
             dev,
             Tmpfs {
                 root,
-                options,
-                size,
+                params,
+                // 只有根目录
+                used: Some((0, 1)),
             },
         );
         Ok(id)
@@ -2143,8 +2283,9 @@ mod tests {
             perm: 0o755,
             uid: 0,
             gid: 0,
-            options: ",mode=755,inode64".to_string(),
-            size: None,
+            blocks: TmpfsParams::default_limit(),
+            inodes: TmpfsParams::default_limit(),
+            inode64: true,
         };
         let a = vfs
             .new_tmpfs((usr.clone(), None), 0, b"t".to_vec(), params)
@@ -2211,8 +2352,9 @@ mod tests {
             perm: 0o1777,
             uid: 0,
             gid: 0,
-            options: ",inode64".to_string(),
-            size: None,
+            blocks: TmpfsParams::default_limit(),
+            inodes: TmpfsParams::default_limit(),
+            inode64: true,
         };
         let t = vfs.new_tmpfs((point, None), 0, Vec::new(), params).unwrap();
         assert_eq!(vfs.mount_ns(t), Some(ns.id));
@@ -2269,6 +2411,67 @@ mod tests {
         assert!(vfs.mounts_in(a_id).is_empty());
         assert!(vfs.pinned_ns(a_id).is_none());
         assert_eq!(vfs.mounts_in(c.id).len(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tmpfs_counts_pages_and_inodes() {
+        let (vfs, dir) = sample("tmpfs-usage");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let usr = vfs
+            .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true)
+            .unwrap();
+        let params = TmpfsParams {
+            perm: 0o1777,
+            uid: 0,
+            gid: 0,
+            blocks: 4,
+            inodes: 5,
+            inode64: true,
+        };
+        let id = vfs.new_tmpfs((usr, None), 0, Vec::new(), params).unwrap();
+        let m = vfs.mount(id).unwrap();
+        let (root, dev) = (m.root.ino().unwrap(), m.dev);
+        assert_eq!(vfs.sb_options(&m), ",size=16k,nr_inodes=5,inode64");
+        let usage = |fresh| {
+            let (_, pages, inodes) = vfs.tmpfs_usage(dev, fresh).unwrap();
+            (pages, inodes)
+        };
+        // 只有根目录
+        assert_eq!(usage(true), (0, 1));
+        // 目录、两页的文件和它的另一个链接、长的符号链接：每个名字一个 inode，页按文件算一次
+        let sub = vfs.store().mkdir(root, b"sub", 0o755, 0, 0).unwrap();
+        let (f, file) = vfs.store().create_file(sub, b"f", 0o644, 0, 0).unwrap();
+        file.set_len(5000).unwrap();
+        vfs.store().link(root, b"g", f).unwrap();
+        vfs.store().symlink(root, b"s", &[b'x'; 200], 0, 0).unwrap();
+        assert_eq!(usage(false), (0, 1), "直接改仓库不记账");
+        assert_eq!(usage(true), (3, 5));
+        assert_eq!(vfs.tmpfs_check(dev, 0, 1), Err(Errno::ENOSPC));
+        assert_eq!(vfs.tmpfs_check(dev, 2, 0), Err(Errno::ENOSPC));
+        assert_eq!(vfs.tmpfs_check(dev, 1, 0), Ok(()));
+        // f 本来有两页，加上没用掉的一页
+        assert_eq!(vfs.tmpfs_room(dev, 2), Ok(Some(3)));
+        vfs.tmpfs_charge(dev, 1, 0);
+        assert_eq!(usage(false), (4, 5));
+        assert_eq!(vfs.tmpfs_room(dev, 2), Ok(Some(2)));
+        // 现数一遍：记下的跟着改
+        assert_eq!(usage(true), (3, 5));
+        assert_eq!(usage(false), (3, 5));
+        // 重新挂载：不能小于用量
+        let shrink = |blocks| {
+            vfs.tmpfs_reconfigure(dev, |p, pages, _| {
+                if blocks < pages {
+                    return Err(Errno::EINVAL);
+                }
+                p.blocks = blocks;
+                Ok(())
+            })
+        };
+        assert_eq!(shrink(2), Err(Errno::EINVAL));
+        assert_eq!(shrink(3), Ok(()));
+        assert_eq!(vfs.sb_options(&m), ",size=12k,nr_inodes=5,inode64");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

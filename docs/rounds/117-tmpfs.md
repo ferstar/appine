@@ -17,8 +17,8 @@ Linux 的 tmpfs 在内存里。另写一个内存里的文件系统要让所有�
 
 **推迟项**：
 
-- 不限大小：`size=` 只影响 statfs，写满了也不会 ENOSPC；inode 数也不限。用量不记，df 看到的已用总是 0。
+- 不限大小：`size=` 只影响 statfs，写满了也不会 ENOSPC；inode 数也不限。用量不记，df 看到的已用总是 0。→ 已补上（M9 之前：tmpfs 的用量和限制）：按页数、inode 数记用量和限制，普通文件按大小算页数（当作没有空洞），删掉最后一个名字时就释放
 - 数据在宿主的文件里、元数据在 SQLite 里，比 Linux 的内存 tmpfs 慢，也写闪存。
-- 重新挂载时不看选项（Linux 可以改 `size=`、`nr_inodes=` 这些）。
+- 重新挂载时不看选项（Linux 可以改 `size=`、`nr_inodes=` 这些）。→ 已补上（M9 之前：tmpfs 的用量和限制）：`size=`、`nr_inodes=`、`inode32`/`inode64` 照 Linux 6.1 的 `shmem_reconfigure` 改，`mode=` 这些与 Linux 一样不变
 - epoll 的 fdinfo 里 tmpfs 文件的设备号仍是根文件系统的（与合成文件的一样，见 [mount 的子集](105-mount-subset.md)的推迟项）。
 - 别的文件系统类型仍是 ENODEV。

@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
-use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, Vfs, ms, normalize};
+use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, TMPFS_PAGE, Vfs, ms, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -595,7 +595,9 @@ fn open_path(
                 }
                 let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
                 let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
+                let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
                 let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
+                tmpfs_created(&vfs, tmpfs, 0);
                 break (
                     Node::Store(mnt, ino),
                     Some(file),
@@ -930,7 +932,9 @@ fn open_store(
             };
             if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
                 remove_privs(cx, ino)?;
+                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), &file)?;
                 file.set_len(0).map_err(host_errno)?;
+                tmpfs_resized(vfs, tmpfs, 0);
                 truncated(cx, &file);
             }
             FileKind::Regular { ino, file }
@@ -2057,23 +2061,21 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     };
     let vfs = cx.vfs()?;
     let flags = vfs.mount_flags(node).unwrap_or(0);
+    // tmpfs 按页数、inode 数（Linux 的 shmem_statfs）：不限的那一项都是 0；用量现数一遍
+    if let Some(dev) = vfs.tmpfs_dev(node) {
+        let (p, pages, inodes) = vfs.tmpfs_usage(dev, true)?;
+        let free = p.blocks.saturating_sub(pages);
+        let s = appine_hal::FsStats {
+            block_size: TMPFS_PAGE,
+            blocks: p.blocks,
+            free,
+            available: free,
+            files: p.inodes,
+            files_free: p.inodes.saturating_sub(inodes),
+        };
+        return Ok(encode_statfs(TMPFS_MAGIC, &s, flags));
+    }
     Ok(match node {
-        // tmpfs 的总量是 `size=` 或者物理内存的一半，用量不记，都算空闲
-        Node::Store(..) if vfs.fs_of(node) == Fs::Tmpfs => {
-            let bytes = vfs
-                .tmpfs_size(node)
-                .unwrap_or(appine_hal::memory_info().0 / 2);
-            let blocks = bytes / 4096;
-            let s = appine_hal::FsStats {
-                block_size: 4096,
-                blocks,
-                free: blocks,
-                available: blocks,
-                files: blocks,
-                files_free: blocks,
-            };
-            encode_statfs(TMPFS_MAGIC, &s, flags)
-        }
         Node::Store(..) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
         Node::Pseudo(_, PseudoNode::NsFile(..)) => encode_statfs(NSFS_MAGIC, &empty, 0),
         Node::Pseudo(_, p) => {
@@ -2131,7 +2133,9 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     let cred = cx.cred();
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, true);
+    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
     vfs.store().mkdir(dir, name, perm, uid, gid)?;
+    tmpfs_created(&vfs, tmpfs, 0);
     inotify::dir_event(
         cx.kr(),
         dir,
@@ -2168,12 +2172,14 @@ pub(super) fn mknodat(
         return Err(Errno::EPERM);
     }
     let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg & !cx.umask() & 0o7777, false);
+    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
     if kind == 0 || kind == mode::S_IFREG {
         vfs.store().create_file(dir, name, perm, uid, gid)?;
     } else {
         vfs.store()
             .mknod(dir, name, kind | perm, dev & 0xffff_ffff, uid, gid)?;
     }
+    tmpfs_created(&vfs, tmpfs, 0);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
 }
@@ -2205,7 +2211,9 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
                 writable_dir(&store_vfs, (mnt, dir))?;
                 may_delete(store, &cred, dir, name)?;
                 not_mount_point(&store_vfs, dir, name)?;
+                let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
                 store.rmdir(dir, name)?;
+                tmpfs_removed(&store_vfs, tmpfs);
             }
         }
         if let Some(ino) = victim {
@@ -2229,7 +2237,9 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         }
         may_delete(store, &cred, dir, name)?;
         not_mount_point(&store_vfs, dir, name)?;
+        let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
         store.unlink(dir, name)?;
+        tmpfs_removed(&store_vfs, tmpfs);
         if let Some(ino) = victim {
             unlinked_events(cx, store, ino, (dir, name));
             inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
@@ -2272,7 +2282,11 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
+    // 长的符号链接在 tmpfs 里另占一页（Linux 的 SHORT_SYMLINK_LEN）
+    let pages = u64::from(target.len() >= 128);
+    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), pages)?;
     vfs.store().symlink(dir, name, &target, uid, gid)?;
+    tmpfs_created(&vfs, tmpfs, pages);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
 }
@@ -2317,7 +2331,10 @@ pub(super) fn linkat(
         return Err(Errno::EXDEV);
     }
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    // tmpfs 里每个硬链接也占一个 inode（Linux 的 shmem_link）
+    let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
     vfs.store().link(dir, name, src)?;
+    tmpfs_created(&vfs, tmpfs, 0);
     inotify::path_event(cx.kr(), src, None, inotify::IN_ATTRIB);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
@@ -2382,6 +2399,16 @@ pub(super) fn renameat2(
     } else {
         (None, None)
     };
+    // 覆盖掉的名字在 tmpfs 里空出来（改名成自己的另一个硬链接什么也不做）
+    let replaced = match exchange {
+        false
+            if vfs.store().lookup(old_dir, old_name)?
+                != vfs.store().lookup(new_dir, new_name)? =>
+        {
+            tmpfs_victim(&vfs, (new_mnt, new_dir), new_name)?
+        }
+        _ => None,
+    };
     vfs.store().rename(
         old_dir,
         old_name,
@@ -2390,6 +2417,7 @@ pub(super) fn renameat2(
         flags & RENAME_NOREPLACE != 0,
         exchange,
     )?;
+    tmpfs_removed(&vfs, replaced);
     // 经由移动的名字打开着的文件跟着改名
     let k = cx.kr();
     let store = vfs.store();
@@ -2747,7 +2775,8 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let len = u64::try_from(len).map_err(|_| Errno::EINVAL)?;
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
-    let ino = store_ino(cx, &lookup_at(cx, AT_FDCWD, &path, true)?)?;
+    let node = lookup_at(cx, AT_FDCWD, &path, true)?;
+    let ino = store_ino(cx, &node)?;
     let st = vfs.store().attrs(ino)?;
     match st.kind() {
         mode::S_IFDIR => Err(Errno::EISDIR),
@@ -2760,7 +2789,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             super::lease::break_leases(cx, ino, true, false, None)?;
             remove_privs(cx, ino)?;
             let host = vfs.store().open_object(ino, true)?;
+            let tmpfs = tmpfs_size(&vfs, &node, &host)?;
             host.set_len(len).map_err(host_errno)?;
+            tmpfs_resized(&vfs, tmpfs, len);
             truncated(cx, &host);
             if inotify::active(cx.kr()) {
                 let parent = inotify::watched_parent(cx, AT_FDCWD, &path, true);
@@ -2787,7 +2818,10 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
             remove_privs(cx, *ino)?;
+            let vfs = cx.vfs()?;
+            let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)?;
             file.set_len(len).map_err(host_errno)?;
+            tmpfs_resized(&vfs, tmpfs, len);
             truncated(cx, file);
             inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
             Ok(0)
@@ -2880,6 +2914,17 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         check_fsize(cx, end)?;
     }
     check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
+    // tmpfs 里要分到这一段的页（Linux 的 shmem_fallocate），打洞不用；不过记账只按大小
+    let vfs = cx.vfs()?;
+    let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, ino), host)?;
+    if let Some((dev, own)) = tmpfs
+        && mode & FALLOC_FL_PUNCH_HOLE == 0
+        && vfs
+            .tmpfs_room(dev, own)?
+            .is_some_and(|room| end.div_ceil(TMPFS_PAGE) > room.max(own))
+    {
+        return Err(Errno::ENOSPC);
+    }
     remove_privs(cx, ino)?;
     if zero {
         let zeros = vec![0u8; IO_CHUNK];
@@ -2892,6 +2937,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     }
     if !keep && end > size {
         host.set_len(end).map_err(host_errno)?;
+        tmpfs_resized(&vfs, tmpfs, end);
     }
     inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
     Ok(0)
@@ -3780,6 +3826,8 @@ fn write_bytes(
         }
         IoPath::Local => {
             let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
+            let (n, tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len())?;
+            let data = &data[..n];
             check_seals(cx, &file.borrow(), true, |size| {
                 let f = file.borrow();
                 let pos = match offset {
@@ -3815,6 +3863,11 @@ fn write_bytes(
                 })?,
                 None => local_write(&mut file.borrow_mut(), data, offset)?,
             };
+            if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind)
+                && let Ok(meta) = host.metadata()
+            {
+                tmpfs_resized(&*cx.vfs()?, Some(t), meta.len());
+            }
             if n > 0 {
                 inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
             }
@@ -3854,6 +3907,110 @@ fn fsize_allowed(
         return Err(file_too_big(cx));
     }
     Ok(len.min((limit - pos) as usize))
+}
+
+/// 写 tmpfs 里的普通文件：写到实例满了为止（Linux 的 `shmem_write_begin` 一页页地要，
+/// 要不到时已经写了的照样返回），一页也写不了时 ENOSPC；写在原来的大小以内的不受限制。
+/// 返回允许写的字节数，和写完之后记账要的设备号、写之前的页数（[`tmpfs_resized`]）。
+fn tmpfs_write_room(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    offset: Option<u64>,
+    len: usize,
+) -> Result<(usize, Option<(u64, u64)>), Errno> {
+    let FileKind::Regular { ino, file } = &f.kind else {
+        return Ok((len, None));
+    };
+    let vfs = cx.vfs()?;
+    let Some(t @ (dev, own)) = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)? else {
+        return Ok((len, None));
+    };
+    let Some(room) = vfs.tmpfs_room(dev, own)?.filter(|_| len > 0) else {
+        return Ok((len, Some(t)));
+    };
+    let pos = match offset {
+        Some(off) => off,
+        None if f.flags & oflags::O_APPEND != 0 => file.metadata().map_err(host_errno)?.len(),
+        None => f.pos,
+    };
+    let end = room.max(own).saturating_mul(TMPFS_PAGE);
+    if pos >= end {
+        return Err(Errno::ENOSPC);
+    }
+    Ok((
+        len.min((end - pos).try_into().unwrap_or(usize::MAX)),
+        Some(t),
+    ))
+}
+
+/// `node`（普通文件，宿主上是 `host`）在 tmpfs 里时，那个实例的设备号和文件现在的页数：
+/// 改大小之后交给 [`tmpfs_resized`] 记账。
+fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<(u64, u64)>, Errno> {
+    let Some(dev) = vfs.tmpfs_dev(node) else {
+        return Ok(None);
+    };
+    let size = host.metadata().map_err(host_errno)?.len();
+    Ok(Some((dev, size.div_ceil(TMPFS_PAGE))))
+}
+
+/// tmpfs 里的普通文件改成了 `size` 字节：按页数的差记账（[`tmpfs_size`] 记下的是原来的）。
+fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, size: u64) {
+    if let Some((dev, own)) = tmpfs {
+        let pages = size.div_ceil(TMPFS_PAGE) as i64 - own as i64;
+        vfs.tmpfs_charge(dev, pages, 0);
+    }
+}
+
+/// 在目录 `dir`（经由的挂载和 inode）里新建一个名字（新的 inode，或者硬链接）之前：在 tmpfs
+/// 里时看放不放得下，放不下是 ENOSPC（Linux 的 `shmem_reserve_inode`；`pages` 是长的符号
+/// 链接要的一页）。返回实例的设备号，建好之后交给 [`tmpfs_created`]。
+pub(super) fn tmpfs_reserve(
+    vfs: &Vfs,
+    (mnt, dir): (MountId, Ino),
+    pages: u64,
+) -> Result<Option<u64>, Errno> {
+    let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
+        return Ok(None);
+    };
+    vfs.tmpfs_check(dev, pages, 1)?;
+    Ok(Some(dev))
+}
+
+/// 建好了 [`tmpfs_reserve`] 放得下的名字：记账。
+pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
+    if let Some(dev) = dev {
+        vfs.tmpfs_charge(dev, pages as i64, 1);
+    }
+}
+
+/// 删掉目录 `dir` 里的 `name`（unlink、rmdir、被 rename 覆盖）之前：在 tmpfs 里时记下它
+/// 占的，名字一个 inode，删的是最后一个链接时还有它的页（Linux 等最后一次关掉才释放，这里
+/// 删掉时就释放）。删掉之后交给 [`tmpfs_removed`]。
+fn tmpfs_victim(
+    vfs: &Vfs,
+    (mnt, dir): (MountId, Ino),
+    name: &[u8],
+) -> Result<Option<(u64, u64)>, Errno> {
+    let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
+        return Ok(None);
+    };
+    let Some(ino) = vfs.store().lookup(dir, name)? else {
+        return Ok(None);
+    };
+    let st = vfs.store().stat(ino)?;
+    let pages = if st.is_dir() || st.nlink <= 1 {
+        crate::vfs::tmpfs_pages(&st)
+    } else {
+        0
+    };
+    Ok(Some((dev, pages)))
+}
+
+/// 删掉了 [`tmpfs_victim`] 记下的名字：记账。
+fn tmpfs_removed(vfs: &Vfs, victim: Option<(u64, u64)>) {
+    if let Some((dev, pages)) = victim {
+        vfs.tmpfs_charge(dev, -(pages as i64), -1);
+    }
 }
 
 /// 超过 `RLIMIT_FSIZE`：发 SIGXFSZ，返回 EFBIG。
@@ -4040,7 +4197,12 @@ fn copy_regular(
         }
         (regular_fd(&i)?, regular_fd(&o)?, o.ino()?)
     };
-    if cx.kr().seals.contains_key(&ino) {
+    // 封印要逐块检查；tmpfs 要逐块记账、写满了停下（write_bytes）
+    let in_tmpfs = cx.vfs().is_ok_and(|v| {
+        v.tmpfs_dev(&Node::Store(output.borrow().mnt, ino))
+            .is_some()
+    });
+    if cx.kr().seals.contains_key(&ino) || in_tmpfs {
         return None;
     }
     let len = match fsize_allowed(cx, &output.borrow(), dst, len.min(MAX_COPY)) {

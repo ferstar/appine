@@ -116,6 +116,94 @@ echo "still open: $(cat <&3)"
 exec 3<&-
 umount /tmp/t/c && echo "umount the bind $?"
 echo "left: $(show | wc -l)"
+# 用量和限制（Linux 的 shmem_statfs、shmem_reserve_inode、shmem_inode_acct_block）：statfs
+# 的块、inode 按用量算（根目录、每个名字各占一个 inode，硬链接也是；普通文件按页数，长的
+# 符号链接一页）；写满了是 ENOSPC（能写一部分时写到满为止），inode 用完了新建、mkdir、
+# link、symlink 都是 ENOSPC；删掉、截短之后空出来。重新挂载可以改 size=、nr_inodes=：小于
+# 已经用掉的、原来不限的改成限制都是 EINVAL，mode= 这些不变
+mkdir -p /tmp/quota
+mount -t tmpfs -o size=64k,nr_inodes=8,mode=700 quota /tmp/quota
+python3 - <<'PY'
+import errno, os
+D = "/tmp/quota"
+def usage(what):
+    s = os.statvfs(D)
+    print(what, "bsize", s.f_bsize, "blocks", s.f_blocks, "bfree", s.f_bfree, "bavail", s.f_bavail,
+          "files", s.f_files, "ffree", s.f_ffree, "namemax", s.f_namemax)
+def err(f, *args):
+    try:
+        r = f(*args)
+        return "ok" if r is None else r
+    except OSError as e:
+        return errno.errorcode[e.errno]
+usage("empty")
+os.mkdir(D + "/d")
+with open(D + "/d/a", "wb") as f:
+    f.write(b"x" * 10000)
+os.link(D + "/d/a", D + "/b")
+os.symlink("short", D + "/s")
+os.symlink("L" * 200, D + "/long")
+usage("used")
+# 写满：能写的写进去，之后 ENOSPC
+fd = os.open(D + "/big", os.O_WRONLY | os.O_CREAT, 0o644)
+print("write", err(os.write, fd, b"y" * 100000), "then", err(os.write, fd, b"y"))
+print("size", os.fstat(fd).st_size)
+usage("full")
+af = os.open(D + "/b", os.O_WRONLY | os.O_APPEND)
+print("pwrite inside", err(os.pwrite, fd, b"z" * 100, 0), "append to other", err(os.write, af, b"q" * 5000))
+# 删掉之后还开着的文件 Linux 上关掉时才释放，appine 删掉最后一个名字时就释放，不比
+os.close(af)
+print("fallocate", err(os.posix_fallocate, fd, 0, 200000))
+os.ftruncate(fd, 4096)
+usage("truncated")
+os.close(fd)
+# inode 用完
+names = []
+for i in range(10):
+    r = err(os.mknod, D + "/n%d" % i)
+    names.append(r)
+print("mknod", names)
+print("mkdir", err(os.mkdir, D + "/d2"), "link", err(os.link, D + "/b", D + "/b2"),
+      "symlink", err(os.symlink, "x", D + "/s2"), "open", err(os.open, D + "/o", os.O_CREAT | os.O_WRONLY))
+usage("no inodes")
+os.unlink(D + "/b")
+os.unlink(D + "/n0")
+usage("unlinked")
+os.unlink(D + "/d/a")
+usage("last link")
+os.rename(D + "/s", D + "/long")
+usage("renamed over")
+# sendfile 拷进来（busybox 的 cp 用它）：也写到满为止；inode 用完时 AF_UNIX 的 bind 也是 ENOSPC
+src = os.open("/bin/busybox", os.O_RDONLY)
+dst = os.open(D + "/copy", os.O_WRONLY | os.O_CREAT, 0o644)
+print("sendfile", err(os.sendfile, dst, src, None, 1 << 20), "then", err(os.sendfile, dst, src, None, 4096))
+os.close(dst)
+made = [n for n in range(10) if err(os.mknod, D + "/m%d" % n) == "ok"]
+import socket
+print("made", len(made), "bind", err(socket.socket(socket.AF_UNIX).bind, D + "/sock"))
+usage("filled")
+os.unlink(D + "/copy")
+for n in made:
+    os.unlink(D + "/m%d" % n)
+# 删掉之后不经过 statfs 直接新建、写：空出来的照样能用
+fd = os.open(D + "/again", os.O_WRONLY | os.O_CREAT, 0o644)
+print("after unlink", err(os.mknod, D + "/again2"), err(os.write, fd, b"a" * 40000))
+os.close(fd)
+os.unlink(D + "/again")
+os.unlink(D + "/again2")
+PY
+grep ' /tmp/quota ' /proc/self/mountinfo | awk '{ for (i = 7; $i != "-"; i++) {} print $(i + 3) }'
+for o in size=16k size=4k nr_inodes=2 nr_inodes=20,mode=755,inode32 nr_inodes=0 size=0 size=1m; do
+    mount -o remount,$o /tmp/quota 2>/dev/null; echo "remount $o: $?"
+    grep ' /tmp/quota ' /proc/self/mountinfo | awk '{ for (i = 7; $i != "-"; i++) {} print $(i + 3) }'
+done
+python3 -c 'import os; s = os.statvfs("/tmp/quota"); print(s.f_blocks, s.f_files, oct(os.stat("/tmp/quota").st_mode))'
+umount /tmp/quota
+mount -t tmpfs -o size=0,nr_inodes=0 unlimited /tmp/quota
+python3 -c 'import os; s = os.statvfs("/tmp/quota"); print("unlimited", s.f_blocks, s.f_bfree, s.f_files, s.f_ffree)'
+mount -o remount,size=1m /tmp/quota 2>/dev/null; echo "limit unlimited: $?"
+mount -o remount,nr_inodes=10 /tmp/quota 2>/dev/null; echo "limit unlimited inodes: $?"
+umount /tmp/quota
 
 # 照 bubblewrap 换根
 cat >t/minibwrap.c <<'C'
@@ -223,3 +311,4 @@ exec /tmp/t/minibwrap /bin/busybox sh -c '
         print id[\$1], (\$2 in id) ? id[\$2] : \"-\", \$5, dev ? \"-\" : \$6, bound ? \"-\" : \$(i + 1)
     }" /proc/self/mountinfo
 '
+

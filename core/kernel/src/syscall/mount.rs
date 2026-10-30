@@ -100,7 +100,8 @@ pub(super) fn mount(
     // remount 不往上找：经由魔法链接给出的被盖住的节点不是挂载的根（EINVAL）
     if flags & MS_REMOUNT != 0 {
         let keep_atime = flags & (ATIME | MS_STRICTATIME) == 0;
-        return remount(cx, &resolved, mnt, keep_atime);
+        let data = (flags & MS_BIND == 0).then_some(&data[..]);
+        return remount(cx, &resolved, mnt, keep_atime, data);
     }
     if flags & MS_BIND != 0 {
         return bind(cx, source.as_deref(), (node, at), flags & MS_REC != 0);
@@ -179,14 +180,22 @@ fn new_mount(
     Ok(0)
 }
 
-/// tmpfs 的挂载选项（Linux 6.1 的 `shmem_parse_one`）：根目录的权限、属主、属组和
-/// mountinfo 里的超级块选项、`size=` 的字节数。不认识的选项是 EINVAL。属主、属组默认是
-/// 挂载的进程的 fsuid、fsgid，权限默认 1777。
-fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, Errno> {
-    const PAGE: u64 = 4096;
-    let total = appine_hal::memory_info().0;
-    let (mut perm, mut uid, mut gid) = (0o1777, cred.fsuid, cred.fsgid);
-    let (mut blocks, mut inodes, mut inode64) = (None, None, true);
+/// tmpfs 的挂载选项里给了的那些（Linux 6.1 的 `shmem_parse_one` 解析出来的
+/// `shmem_options`）。不认识的选项是 EINVAL。
+#[derive(Default)]
+struct TmpfsOptions {
+    perm: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    /// 页数、inode 数（0 是不限）。
+    blocks: Option<u64>,
+    inodes: Option<u64>,
+    inode64: Option<bool>,
+}
+
+fn parse_tmpfs(data: &[u8]) -> Result<TmpfsOptions, Errno> {
+    const PAGE: u64 = crate::vfs::TMPFS_PAGE;
+    let mut o = TmpfsOptions::default();
     for opt in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
         let (key, value) = match opt.iter().position(|&b| b == b'=') {
             Some(i) => (&opt[..i], Some(&opt[i + 1..])),
@@ -203,27 +212,27 @@ fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, E
                 let (n, rest) = memparse(v)?;
                 let bytes = match rest {
                     b"" => n,
-                    b"%" => n.saturating_mul(total) / 100,
+                    b"%" => n.saturating_mul(appine_hal::memory_info().0) / 100,
                     _ => return Err(Errno::EINVAL),
                 };
-                blocks = Some(bytes.div_ceil(PAGE));
+                o.blocks = Some(bytes.div_ceil(PAGE));
             }
             (b"nr_blocks", Some(v)) => match memparse(v)? {
-                (n, b"") => blocks = Some(n),
+                (n, b"") => o.blocks = Some(n),
                 _ => return Err(Errno::EINVAL),
             },
             (b"nr_inodes", Some(v)) => match memparse(v)? {
-                (n, b"") => inodes = Some(n),
+                (n, b"") => o.inodes = Some(n),
                 _ => return Err(Errno::EINVAL),
             },
             (b"mode", Some(v)) => {
                 let s = std::str::from_utf8(v).map_err(|_| Errno::EINVAL)?;
-                perm = u32::from_str_radix(s, 8).map_err(|_| Errno::EINVAL)? & 0o7777;
+                o.perm = Some(u32::from_str_radix(s, 8).map_err(|_| Errno::EINVAL)? & 0o7777);
             }
-            (b"uid", Some(v)) => uid = id(v)?,
-            (b"gid", Some(v)) => gid = id(v)?,
-            (b"inode64", None) => inode64 = true,
-            (b"inode32", None) => inode64 = false,
+            (b"uid", Some(v)) => o.uid = Some(id(v)?),
+            (b"gid", Some(v)) => o.gid = Some(id(v)?),
+            (b"inode64", None) => o.inode64 = Some(true),
+            (b"inode32", None) => o.inode64 = Some(false),
             (
                 b"huge",
                 Some(b"never" | b"always" | b"within_size" | b"advise" | b"deny" | b"force"),
@@ -242,31 +251,44 @@ fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, E
             }
         }
     }
-    // 与 Linux 一样，大小、inode 数是默认值（物理内存的一半）时不写
-    let default = total / 2 / PAGE;
-    let mut options = String::new();
-    if let Some(b) = blocks.filter(|&b| b != default) {
-        options += &format!(",size={}k", b * (PAGE / 1024));
-    }
-    if let Some(n) = inodes.filter(|&n| n != default) {
-        options += &format!(",nr_inodes={n}");
-    }
-    if perm != 0o1777 {
-        options += &format!(",mode={perm:03o}");
-    }
-    if uid != 0 {
-        options += &format!(",uid={uid}");
-    }
-    if gid != 0 {
-        options += &format!(",gid={gid}");
-    }
-    options += if inode64 { ",inode64" } else { ",inode32" };
+    Ok(o)
+}
+
+/// 新挂的 tmpfs 的参数：没给的用默认值（权限 1777，属主、属组是挂载的进程的 fsuid、
+/// fsgid，大小和 inode 数是物理内存的一半，inode64）。
+fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, Errno> {
+    let o = parse_tmpfs(data)?;
+    let default = TmpfsParams::default_limit();
     Ok(TmpfsParams {
-        perm,
-        uid,
-        gid,
-        options,
-        size: blocks.map(|b| b * PAGE),
+        perm: o.perm.unwrap_or(0o1777),
+        uid: o.uid.unwrap_or(cred.fsuid),
+        gid: o.gid.unwrap_or(cred.fsgid),
+        blocks: o.blocks.unwrap_or(default),
+        inodes: o.inodes.unwrap_or(default),
+        inode64: o.inode64.unwrap_or(true),
+    })
+}
+
+/// 重新挂载 tmpfs 时改它的超级块（Linux 6.1 的 `shmem_reconfigure`）：给了非 0 的
+/// `size=`、`nr_inodes=` 时，原来不限的不能改成限制、不能小于已经用掉的（都是 EINVAL）；
+/// 给了的大小、inode 数（0 是改成不限）和 inode32/64 照改；`mode=`、`uid=`、`gid=` 不变。
+fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
+    let o = parse_tmpfs(data)?;
+    vfs.tmpfs_reconfigure(dev, |p, pages, inodes| {
+        if let Some(b) = o.blocks.filter(|&b| b != 0)
+            && (p.blocks == 0 || b < pages)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(n) = o.inodes.filter(|&n| n != 0)
+            && (p.inodes == 0 || n < inodes)
+        {
+            return Err(Errno::EINVAL);
+        }
+        p.blocks = o.blocks.unwrap_or(p.blocks);
+        p.inodes = o.inodes.unwrap_or(p.inodes);
+        p.inode64 = o.inode64.unwrap_or(p.inode64);
+        Ok(())
     })
 }
 
@@ -422,12 +444,25 @@ fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, t
 }
 
 /// 重新挂载：改挂载的标志（Linux 不带 `MS_BIND` 时还改超级块的，超级块在几个挂载之间
-/// 共用，这里只改这一个挂载）。
-fn remount(cx: &mut Cx<'_>, target: &Node, flags: u64, keep_atime: bool) -> SysResult {
+/// 共用，这里只改这一个挂载）。不带 `MS_BIND` 时 `data` 是选项：tmpfs 照它改超级块的
+/// 大小、inode 数（[`remount_tmpfs`]）。
+fn remount(
+    cx: &mut Cx<'_>,
+    target: &Node,
+    flags: u64,
+    keep_atime: bool,
+    data: Option<&[u8]>,
+) -> SysResult {
     let vfs = cx.vfs()?;
     let id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
     check_mnt(cx, &vfs, id)?;
     let m = vfs.mount(id).ok_or(Errno::EINVAL)?;
+    // 不带 MS_BIND 时还改超级块：tmpfs 的大小、inode 数，出错时挂载的标志也不改
+    if let Some(data) = data
+        && m.fs == Fs::Tmpfs
+    {
+        remount_tmpfs(&vfs, m.dev, data)?;
+    }
     let flags = if keep_atime {
         (flags & !ATIME) | (m.flags & ATIME)
     } else {
