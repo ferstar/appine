@@ -1,6 +1,6 @@
 # M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱（2026-10-30）
 
-← [M9 之前：网络命名空间（2026-10-30）](122-net-namespaces.md) · [索引](../milestones.md)
+← [M9 之前：网络命名空间（2026-10-30）](122-net-namespaces.md) · [索引](../milestones.md) · [M9 之前：V8 和 HotSpot 的寄存器（2026-10-30）](124-v8-hotspot-registers.md) →
 
 让 bubblewrap 能用的最后一轮：前六轮补上了仓库里的目录 bind、tmpfs 和挂载、用户、pid、UTS、IPC、网络命名空间，这一轮直接用 bwrap 和 [AI 编程 CLI](103-ai-cli-survey.md) 的沙箱端到端地试，修掉试出来的三个问题，再加一个 bwrap 的差分测试组。
 

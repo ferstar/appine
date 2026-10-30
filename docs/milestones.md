@@ -132,6 +132,7 @@
 | [M9 之前：UTS 和 IPC 命名空间](rounds/121-uts-ipc-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第六轮：`CLONE_NEWUTS`、`CLONE_NEWIPC`（clone、unshare、setns），按线程记；每个 UTS 命名空间有自己的主机名、域名，每个 IPC 命名空间有自己的 System V IPC 对象、POSIX 消息队列和限制，共享内存段的映射记着段所在的命名空间；sethostname 按命名空间的属主查能力 |
 | [M9 之前：网络命名空间](rounds/122-net-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第七轮：`CLONE_NEWNET`（clone、unshare、setns），新命名空间里只有 lo；socket 仍是宿主 socket，记着建立时的命名空间，地址在边界上换算（127.0.0.x ↔ 宿主上给它的 127.a.b.x，::1、:: ↔ IPv4 映射的 127.a.b.1），别的地址到不了；lo 经由 netlink（bwrap 的 `loopback_setup`）、接口 ioctl 配置，netlink、ioctl、`/proc/<pid>/net` 只看到它；AF_UNIX 的抽象地址按命名空间分开 |
 | [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱](rounds/123-bwrap.md) | 2026-10-30 | 让 bubblewrap 能用的最后一轮：端到端试 bwrap、Codex、Claude Code 的沙箱，补上 cgroup 命名空间、经由 `/proc/self/fd/N` 挂文件时 mountinfo 里的挂载点、remount 不往上找；Codex 的 `-s workspace-write`、`codex sandbox`、Claude Code 的 `sandbox.enabled` 在 appine 里都能用；新的差分测试组 `bwrap` |
+| [M9 之前：V8 和 HotSpot 的寄存器](rounds/124-v8-hotspot-registers.md) | 2026-10-30 | 原生采样时记下 JIT 代码的字节（jitdump、JVMTI 代理）：V8 的 x26–x28、HotSpot 的 x27、x28 多是只读的基址，被 Tier 1 占用代价小，按"用到"挑的组合实测反而让 TurboFan 的循环慢 7–40%；"写被占用寄存器"的比例与实测一致，默认的一组对 HotSpot 已经最好，V8 换 Go 的一组只让 tsc 快 2–4%，不换 |
 
 ## 测量条件
 
