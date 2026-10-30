@@ -29,8 +29,8 @@ appine 的 TCP、UDP、ping socket 都是宿主 socket，宿主上没有可用�
 
 - 127.0.0.0/8 里只有 127.0.0.0/24 换得了（宿主上每个命名空间只有一段 /24），别的回环地址绑不上、连不到；lo 上配的别的 IPv4 地址只记下、到不了；IPv6 只有 ::1。
 - 隔离只在 guest 一侧：宿主上别的进程（包括开机时的命名空间里的 guest 进程）连 127.a.b.x 连得到新命名空间里的服务；新命名空间里绑定的端口和宿主上绑通配地址的端口冲突。
-- IPv4 的客户端连到 IPv6 的通配地址时，服务端看到的对端是 ::1，Linux 是 ::ffff:127.0.0.1；`IP_PKTINFO` 这些控制消息里的地址不换。
+- IPv4 的客户端连到 IPv6 的通配地址时，服务端看到的对端是 ::1，Linux 是 ::ffff:127.0.0.1；`IP_PKTINFO` 这些控制消息里的地址不换。 → raw ICMP socket 的 `IP_PKTINFO` 换了（M9 之前：raw ICMP 的模拟）；别的 socket 的控制消息、IPv4 客户端的对端地址仍不换
 - 没有 AF_PACKET、veth、tun 这些，新命名空间里除了 lo 建不出别的接口；sysfs 里的 `/sys/class/net` 仍是宿主的接口（Linux 按挂载 sysfs 的进程的命名空间）。
-- raw ICMP socket 是用 ping socket 模拟的，`IP_HDRINCL` 设不上，busybox 的 ping 收不到回答（原来就这样，开机时的命名空间里也是）；LTP 的 sendmsg03 因此由跳过变成失败。
+- raw ICMP socket 是用 ping socket 模拟的，`IP_HDRINCL` 设不上，busybox 的 ping 收不到回答（原来就这样，开机时的命名空间里也是）；LTP 的 sendmsg03 因此由跳过变成失败。 → busybox 的 ping 收不到回答已修好（M9 之前：raw ICMP 的模拟）；`IP_HDRINCL` 仍设不上，sendmsg03 仍失败
 - 新命名空间里 lo 上的流量不计数，`/proc/net/snmp`、`netstat` 都是 0。
 - 命名空间文件不让网络命名空间活着（与[挂载命名空间](118-mount-namespaces.md)的推迟项相同）。

@@ -1,6 +1,6 @@
 # M9 之前：V8 和 HotSpot 的寄存器（2026-10-30）
 
-← [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱（2026-10-30）](123-bwrap.md) · [索引](../milestones.md)
+← [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱（2026-10-30）](123-bwrap.md) · [索引](../milestones.md) · [M9 之前：raw ICMP 的模拟（2026-10-30）](125-raw-icmp.md) →
 
 [Go 换一组被占用的寄存器](113-go-registers.md)的推迟项：V8 固定用 x26（根表）、x27（上下文）、x28（指针压缩的基址），HotSpot 固定用 x27（堆基址）、x28（当前线程），正好是 Tier 1 默认占用的几个（§4.2）。这一轮量它们的 JIT 代码，结论是不换：只读不写的寄存器被占用代价很小，默认的一组对 HotSpot 已经是最好的，对 V8 换成 Go 的一组只让 tsc 快 2–4%。
 
