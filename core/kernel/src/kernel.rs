@@ -199,8 +199,11 @@ pub(crate) struct Kernel {
     pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
     /// fcntl(2) 的记录锁。
     pub locks: crate::locks::Locks,
-    /// System V IPC 对象。
-    pub ipc: crate::ipc::Ipc,
+    /// 开机时的 UTS、IPC 命名空间（[`crate::nsproxy`]）。
+    pub init_ns: crate::nsproxy::NsProxy,
+    /// 各个 IPC 命名空间里的 System V IPC 对象和 POSIX 消息队列，按命名空间的编号；没有
+    /// 线程用了的命名空间丢掉（[`Kernel::collect_ipc`]）。
+    pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
     /// AF_UNIX socket 绑定的地址。
     pub unix: crate::unix::Names,
     /// 消息里带着打开文件的 AF_UNIX channel（`unix::collect` 用）。
@@ -209,10 +212,6 @@ pub(crate) struct Kernel {
     pub fifos: BTreeMap<Ino, Weak<RefCell<crate::pipe::Pipe>>>,
     /// memfd 的封印（F_ADD_SEALS），以 inode 为键；不在这里的文件不能加封印。
     pub seals: BTreeMap<Ino, u32>,
-    /// 主机名和 NIS 域名（uname、sethostname、`/proc/sys/kernel/hostname`），最长
-    /// [`UTS_LEN`] 字节。
-    pub hostname: Vec<u8>,
-    pub domainname: Vec<u8>,
     /// `/proc/sys/kernel/core_pattern`、`core_uses_pid`（`crate::coredump`）。
     pub core_pattern: Vec<u8>,
     pub core_uses_pid: bool,
@@ -246,10 +245,6 @@ pub(crate) struct Kernel {
     pub lease_break_time: u64,
     /// `/proc/sys/kernel/seccomp/actions_logged`：记哪些 seccomp 动作（`seccomp::logged`）。
     pub seccomp_logged: u32,
-    /// POSIX 消息队列，按名字（`syscall::mqueue`）。
-    pub mqueues: BTreeMap<Vec<u8>, Rc<RefCell<crate::syscall::MessageQueue>>>,
-    /// `/proc/sys/fs/mqueue/*`。
-    pub mq_limits: crate::syscall::MqLimits,
     /// 网络接口的流量计数（[`crate::traffic`]）。
     pub traffic: crate::traffic::Traffic,
     /// 宿主交来的主表路由（[`crate::Machine::set_routes`]，Android 上取自 `LinkProperties`），
@@ -272,6 +267,7 @@ impl Kernel {
     pub fn new(tier: Tier) -> Kernel {
         // 在任何 guest 线程改变宿主亲和性之前记下宿主的 CPU
         appine_hal::host_cpus();
+        let init_ns = crate::nsproxy::NsProxy::init();
         Kernel {
             tasks: BTreeMap::new(),
             groups: BTreeMap::new(),
@@ -295,15 +291,17 @@ impl Kernel {
             consoles: BTreeMap::new(),
             flocks: BTreeMap::new(),
             locks: crate::locks::Locks::default(),
-            ipc: crate::ipc::Ipc::default(),
+            init_ns: init_ns.clone(),
+            ipcs: BTreeMap::from([(
+                init_ns.ipc.id,
+                (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),
+            )]),
             unix: Default::default(),
             unix_inflight: Vec::new(),
             fifos: BTreeMap::new(),
             seals: BTreeMap::new(),
-            hostname: b"localhost".to_vec(),
             core_pattern: b"core".to_vec(),
             core_uses_pid: false,
-            domainname: b"(none)".to_vec(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
             threads_max: crate::process::default_threads_max(),
@@ -319,8 +317,6 @@ impl Kernel {
             leases: BTreeMap::new(),
             lease_break_time: 45,
             seccomp_logged: crate::seccomp::logged::DEFAULT,
-            mqueues: BTreeMap::new(),
-            mq_limits: Default::default(),
             traffic: Default::default(),
             host_routes: None,
             aio_nr: 0,
@@ -380,6 +376,33 @@ impl Kernel {
             Some(&tid) => Ok(tid),
             None => self.alloc_tid(),
         }
+    }
+
+    /// 新建一个空的 IPC 命名空间，属于用户命名空间 `owner`（Linux 的 `create_ipc_ns`：
+    /// 限制都是默认值）。
+    pub fn new_ipc_ns(&mut self, owner: Rc<crate::cred::UserNs>) -> Rc<crate::nsproxy::IpcNs> {
+        let ns = Rc::new(crate::nsproxy::IpcNs {
+            id: crate::vfs::new_ns_id(),
+            owner,
+        });
+        let objects = (Rc::downgrade(&ns), crate::ipc::Ipc::default());
+        self.ipcs.insert(ns.id, objects);
+        ns
+    }
+
+    /// IPC 命名空间 `id` 里的对象。
+    pub fn ipc(&self, id: u64) -> &crate::ipc::Ipc {
+        &self.ipcs[&id].1
+    }
+
+    pub fn ipc_mut(&mut self, id: u64) -> &mut crate::ipc::Ipc {
+        &mut self.ipcs.get_mut(&id).expect("IPC namespace in use").1
+    }
+
+    /// 没有线程用了的 IPC 命名空间：丢掉里面的对象（Linux 的 `free_ipc_ns`；共享内存段
+    /// 还映射着的，内存由映射留着）。
+    pub fn collect_ipc(&mut self) {
+        self.ipcs.retain(|_, (ns, _)| ns.strong_count() > 0);
     }
 
     /// 新的线程、进程 `tid` 在 pid 命名空间 `ns` 里：在各层分配编号（[`crate::pidns`]），
@@ -854,6 +877,22 @@ impl<'a> Cx<'a> {
             tid: self.tid(),
             tgid: self.tgid(),
         }
+    }
+
+    /// 所在的 UTS、IPC 命名空间。
+    pub fn ns(&self) -> crate::nsproxy::NsProxy {
+        self.task.ns.borrow().clone()
+    }
+
+    /// 所在的 IPC 命名空间里的对象。
+    pub fn ipc(&self) -> &crate::ipc::Ipc {
+        let id = self.task.ns.borrow().ipc.id;
+        self.kr().ipc(id)
+    }
+
+    pub fn ipc_mut(&mut self) -> &mut crate::ipc::Ipc {
+        let id = self.task.ns.borrow().ipc.id;
+        self.k().ipc_mut(id)
     }
 
     /// 所在的 pid 命名空间。

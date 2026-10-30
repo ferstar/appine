@@ -21,6 +21,7 @@ mod locks;
 mod machine;
 mod mm;
 mod net;
+mod nsproxy;
 mod oom;
 mod pidns;
 mod pipe;

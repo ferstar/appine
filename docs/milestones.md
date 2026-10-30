@@ -129,6 +129,7 @@
 | [M9 之前：挂载命名空间](rounds/118-mount-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第三轮：`clone`、`unshare` 的 `CLONE_NEWNS` 复制整棵挂载树（挂载命名空间放在 `FsContext` 里，挂载记着所属的命名空间，没人用了就卸下），mountinfo 和 mount、umount、pivot_root 只看自己的命名空间；`/proc/<pid>/ns/*` 和 nsfs 文件、setns(2)；`/proc/<pid>/root`、`cwd` 改成魔法链接 |
 | [M9 之前：用户命名空间](rounds/119-user-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第四轮：`CLONE_NEWUSER`（不要特权），凭据记着用户命名空间，对外的 ID 按 uid_map、gid_map 换算，`/proc/<pid>/uid_map`、`gid_map`、`setgroups` 照 Linux 6.1 读写；74 处能力检查分成 `capable()`、`capable_wrt_inode_uidgid`、`ns_capable` 三种；顺带照 Linux 补上 ptrace 访问检查的 commoncap 一步、setuid 之后不可 dump、execve 恢复可以 dump |
 | [M9 之前：pid 命名空间](rounds/120-pid-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第五轮：`CLONE_NEWPID`（clone、unshare、setns），内核里的 pid 仍是全局的，每个命名空间记一张本层编号的表，系统调用的参数、返回值、siginfo、wait、`SO_PEERCRED` 等在边界换算；1 号进程收养孤儿、不接收按默认方式处理的信号，它退出时结束里面的进程、等它们被回收；procfs 按挂上它的进程所在的命名空间编号，status 补上 `NSpid` 等四行 |
+| [M9 之前：UTS 和 IPC 命名空间](rounds/121-uts-ipc-namespaces.md) | 2026-10-30 | 让 bubblewrap 能用的第六轮：`CLONE_NEWUTS`、`CLONE_NEWIPC`（clone、unshare、setns），按线程记；每个 UTS 命名空间有自己的主机名、域名，每个 IPC 命名空间有自己的 System V IPC 对象、POSIX 消息队列和限制，共享内存段的映射记着段所在的命名空间；sethostname 按命名空间的属主查能力 |
 
 ## 测量条件
 

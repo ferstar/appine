@@ -1,7 +1,8 @@
 //! 命名空间（设计文档 §6）：`clone`、`unshare` 的 `CLONE_NEWNS`、`CLONE_NEWUSER`、
-//! `CLONE_NEWPID` 新建挂载命名空间、用户命名空间、pid 命名空间（`crate::pidns`），
-//! `/proc/<pid>/ns/*`（`crate::pseudo::NsKind`）和 setns(2)。别的命名空间还没有：
-//! `/proc/<pid>/ns` 里它们总是开机时的那个，setns 到它们什么也不做。
+//! `CLONE_NEWPID`、`CLONE_NEWUTS`、`CLONE_NEWIPC` 新建挂载命名空间、用户命名空间、pid
+//! 命名空间（`crate::pidns`）、UTS 和 IPC 命名空间（`crate::nsproxy`），`/proc/<pid>/ns/*`
+//! （`crate::pseudo::NsKind`）和 setns(2)。别的命名空间还没有：`/proc/<pid>/ns` 里它们总是
+//! 开机时的那个，setns 到它们什么也不做。
 
 use std::rc::Rc;
 
@@ -108,6 +109,11 @@ fn find_pid_ns(k: &Kernel, id: u64) -> Option<Rc<PidNs>> {
         })
 }
 
+/// 编号为 `id`、还有线程在里面的 UTS、IPC 命名空间。
+fn find_nsproxy<T>(k: &Kernel, f: impl Fn(&crate::nsproxy::NsProxy) -> Option<T>) -> Option<T> {
+    k.tasks.values().find_map(|t| f(&t.ns.borrow()))
+}
+
 /// 编号为 `id`、还有进程在里面（或者在它下面）的用户命名空间。
 fn find_user_ns(k: &Kernel, id: u64) -> Option<Rc<UserNs>> {
     k.groups.values().find_map(|g| {
@@ -178,6 +184,29 @@ pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
             g.cred.enter_user_ns(ns);
             drop(g);
             cx.shared.fast_changed();
+            Ok(0)
+        }
+        // Linux 的 utsns_install、ipcns_install：在它的属主和自己的用户命名空间里都要有
+        // CAP_SYS_ADMIN；换 IPC 命名空间之前执行并丢掉 SEM_UNDO 的撤销值（exit_sem）
+        NsKind::Uts => {
+            let ns = find_nsproxy(cx.kr(), |p| (p.uts.id == id).then(|| p.uts.clone()))
+                .ok_or(Errno::EINVAL)?;
+            if !cred.ns_capable(&ns.owner, cap::SYS_ADMIN) || !cred.capable_here(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            cx.task.ns.borrow_mut().uts = ns;
+            Ok(0)
+        }
+        NsKind::Ipc => {
+            let ns = find_nsproxy(cx.kr(), |p| (p.ipc.id == id).then(|| p.ipc.clone()))
+                .ok_or(Errno::EINVAL)?;
+            if !cred.ns_capable(&ns.owner, cap::SYS_ADMIN) || !cred.capable_here(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            let tgid = cx.tgid();
+            cx.ipc_mut().exit(tgid);
+            cx.task.ns.borrow_mut().ipc = ns;
+            cx.k().collect_ipc();
             Ok(0)
         }
         // Linux 的 pidns_install：在它的属主和自己的用户命名空间里都要有 CAP_SYS_ADMIN，

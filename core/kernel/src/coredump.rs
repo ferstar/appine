@@ -137,7 +137,9 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
                 .to_string(),
-            b'h' => String::from_utf8_lossy(&k.hostname).into_owned(),
+            b'h' => {
+                String::from_utf8_lossy(&cx.task.ns.borrow().uts.hostname.borrow()).into_owned()
+            }
             b'e' => {
                 // 名字里的 / 换成 !（Linux 的 cn_esc_printf）
                 let comm = cx.task.comm.get();

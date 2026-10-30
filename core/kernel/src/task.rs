@@ -71,6 +71,8 @@ pub(crate) struct Task {
     /// `nsproxy->pid_ns_for_children`；unshare、setns 的 `CLONE_NEWPID` 改它）。放在这里
     /// 而不是 TaskState 里，`/proc/<pid>/ns/pid_for_children` 要读它。
     pub pid_ns_children: RefCell<Option<Rc<crate::pidns::PidNs>>>,
+    /// 所在的 UTS、IPC 命名空间（[`crate::nsproxy`]）。
+    pub ns: RefCell<crate::nsproxy::NsProxy>,
     /// sigsuspend、ppoll 临时替换屏蔽字时原来的屏蔽字（Linux 的 `saved_sigmask` 加上
     /// `TIF_RESTORE_SIGMASK`）：处理函数的帧里保存它，没有处理函数时恢复它。放在这里而不是
     /// TaskState 里，跟踪者要读写它（PTRACE_GETSIGMASK、SETSIGMASK）。
@@ -173,6 +175,7 @@ impl Task {
         tgid: Tid,
         cpu: &Cpu,
         state: TaskState,
+        ns: crate::nsproxy::NsProxy,
         sigmask: u64,
         comm: [u8; 16],
     ) -> Result<Rc<Task>, Errno> {
@@ -188,6 +191,7 @@ impl Task {
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),
             pid_ns_children: RefCell::default(),
+            ns: RefCell::new(ns),
             saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
             sleeping: AtomicBool::new(false),
@@ -864,7 +868,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
         failed(&k, "finishing the process");
     }
-    // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……
+    // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……线程对象
+    // 可能还有别处拿着，命名空间先放掉
+    *task.ns.borrow_mut() = k.init_ns.clone();
     if crate::bug::catch(|| drop((group, task))).is_none() {
         failed(&k, "releasing its resources");
     }
@@ -875,6 +881,8 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     {
         failed(&k, "collecting unix sockets");
     }
+    // 最后一个用某个 IPC 命名空间的线程退出了：丢掉里面的对象
+    k.collect_ipc();
     // 最后一个用某个挂载命名空间的线程退出了：卸下它的挂载（里面的 tmpfs 随之删掉）
     if let Some(vfs) = &vfs
         && crate::bug::catch(|| crate::syscall::collect_namespaces(&k, vfs)).is_none()

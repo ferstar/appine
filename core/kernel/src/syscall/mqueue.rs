@@ -1,7 +1,7 @@
 //! POSIX 消息队列：mq_open、mq_unlink、mq_timedsend、mq_timedreceive、mq_notify、
 //! mq_getsetattr。
 //!
-//! 队列按名字登记在 [`Kernel::mqueues`](crate::kernel::Kernel)，打开得到一个可以 poll
+//! 队列按名字登记在所在的 IPC 命名空间里（[`crate::ipc::Ipc::mqueues`]），打开得到一个可以 poll
 //! 的 fd（有消息时可读，没满时可写），read 它得到与 Linux 相同的状态行。消息按优先级
 //! 排列，同一优先级先进先出。mq_notify 在空队列来了消息、又没有人在等着接收时通知一次：
 //! 发信号，或者把登记时给的 32 字节 cookie 送到 netlink socket（musl 的 `SIGEV_THREAD`
@@ -206,7 +206,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         return Err(Errno::EINVAL);
     }
     let cred = cx.cred();
-    let existing = cx.kr().mqueues.get(&name).cloned();
+    let existing = cx.ipc().mqueues.get(&name).cloned();
     let queue = match existing {
         Some(_)
             if flags & (oflags::O_CREAT | oflags::O_EXCL) == oflags::O_CREAT | oflags::O_EXCL =>
@@ -226,7 +226,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         None if flags & oflags::O_CREAT == 0 => return Err(Errno::ENOENT),
         None => {
             let privileged = cred.capable(cap::SYS_RESOURCE);
-            let limits = &cx.kr().mq_limits;
+            let limits = &cx.ipc().mq_limits;
             let (mut maxmsg, mut msgsize) = (limits.msg_default, limits.msgsize_default);
             if attr != 0 {
                 let b: [u8; 64] = get(cx, attr)?;
@@ -242,7 +242,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
                 }
                 (maxmsg, msgsize) = (m as u64, s as u64);
             }
-            if cx.kr().mqueues.len() as u64 >= limits.queues_max && !privileged {
+            if cx.ipc().mqueues.len() as u64 >= limits.queues_max && !privileged {
                 return Err(Errno::ENOSPC);
             }
             Rc::new(RefCell::new(MessageQueue {
@@ -267,19 +267,19 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
     );
     // 与 Linux 一样总是 close-on-exec；fd 用完时（EMFILE）不留下新建的队列
     let fd = cx.fds_mut().install(file, true, 0)?;
-    cx.k().mqueues.entry(name).or_insert(queue);
+    cx.ipc_mut().mqueues.entry(name).or_insert(queue);
     Ok(fd as u64)
 }
 
 pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
     let name = queue_name(cx, name)?;
-    let q = cx.kr().mqueues.get(&name).cloned().ok_or(Errno::ENOENT)?;
+    let q = cx.ipc().mqueues.get(&name).cloned().ok_or(Errno::ENOENT)?;
     // 删除名字要求属主或者有 CAP_FOWNER（mqueue 文件系统的根目录有粘滞位）
     let cred = cx.cred();
     if cred.fsuid != q.borrow().uid && !cred.capable(cap::FOWNER) {
         return Err(Errno::EACCES);
     }
-    cx.k().mqueues.remove(&name);
+    cx.ipc_mut().mqueues.remove(&name);
     Ok(0)
 }
 

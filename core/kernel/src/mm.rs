@@ -508,8 +508,9 @@ struct Vma {
     /// 文件的共享映射：复制出来的宿主 fd 和起点对应的文件偏移（mremap 扩展映射时
     /// 接着映射文件后面的内容）。
     file: Option<(Rc<OwnedFd>, u64)>,
-    /// shmat 映射的共享内存段：段的 id 和这次 shmat 的起点（切开之后不变）。
-    shm: Option<(i32, u64)>,
+    /// shmat 映射的共享内存段：段（所在的 IPC 命名空间和 id）和这次 shmat 的起点（切开
+    /// 之后不变）。
+    shm: Option<(crate::ipc::ShmKey, u64)>,
     /// mlock 锁住了（只记录，宿主内存不会被换出到 guest 能察觉的地方）。
     locked: bool,
     /// 匿名映射可写过，或者内核写过（加载器）。没写过的内容全是零，fork 时不用复制：
@@ -2216,7 +2217,7 @@ impl Mm {
         mem: &SharedMemory,
         prot: u32,
         remap: bool,
-        id: i32,
+        id: crate::ipc::ShmKey,
     ) -> Result<u64, Errno> {
         let len = mem.len();
         let start = match addr {
@@ -2248,8 +2249,8 @@ impl Mm {
         Ok(start)
     }
 
-    /// shmdt：解除从 `addr` 开始的那次 shmat 的映射，返回段的 id。
-    pub fn detach_shm(&mut self, addr: u64) -> Result<i32, Errno> {
+    /// shmdt：解除从 `addr` 开始的那次 shmat 的映射，返回是哪个段。
+    pub fn detach_shm(&mut self, addr: u64) -> Result<crate::ipc::ShmKey, Errno> {
         let id = self
             .vmas
             .get(&addr)
@@ -2270,7 +2271,7 @@ impl Mm {
     }
 
     /// 共享内存段 `id` 在这个地址空间里被 shmat 了几次。
-    pub fn shm_attachments(&self, id: i32) -> usize {
+    pub fn shm_attachments(&self, id: crate::ipc::ShmKey) -> usize {
         let mut bases: Vec<u64> = self
             .vmas
             .values()

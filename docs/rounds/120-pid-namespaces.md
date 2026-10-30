@@ -1,6 +1,6 @@
 # M9 之前：pid 命名空间（2026-10-30）
 
-← [M9 之前：用户命名空间（2026-10-30）](119-user-namespaces.md) · [索引](../milestones.md)
+← [M9 之前：用户命名空间（2026-10-30）](119-user-namespaces.md) · [索引](../milestones.md) · [M9 之前：UTS 和 IPC 命名空间（2026-10-30）](121-uts-ipc-namespaces.md) →
 
 让 bubblewrap 能用的第五轮。bwrap 的 `--unshare-pid` 在 `clone` 里带上 `CLONE_NEWPID`，它自己（`--as-pid-1` 时是要运行的命令）成为新命名空间里的 1 号进程，再挂一个新的 procfs；Codex 每条命令都这样跑。原来 `CLONE_NEWPID` 是 EPERM。
 

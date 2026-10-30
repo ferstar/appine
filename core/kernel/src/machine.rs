@@ -249,7 +249,8 @@ impl Machine {
             restart: None,
             fast_sleep: None,
         };
-        let task = Task::new(tid, tid, &cpu, state, 0, comm_of(program)).map_err(io_err)?;
+        let ns = k.init_ns.clone();
+        let task = Task::new(tid, tid, &cpu, state, ns, 0, comm_of(program)).map_err(io_err)?;
         k.groups.insert(tid, group);
         k.groups[&INIT].borrow_mut().children.push(tid);
         k.forks += 1;

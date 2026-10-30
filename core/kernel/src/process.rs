@@ -628,7 +628,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             signal::send_to_group(k, c, sig, SigInfo::kernel());
         }
     });
-    step(k, tgid, 4, "releasing SysV IPC", |k| k.ipc.exit(tgid));
+    step(k, tgid, 4, "releasing SysV IPC", |k| {
+        crate::ipc::exit(k, tgid)
+    });
     step(k, tgid, 5, "releasing the controlling terminal", |k| {
         release_ctty(k, group)
     });

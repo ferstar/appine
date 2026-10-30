@@ -37,11 +37,16 @@ const CLONE_SYSVSEM: u64 = 0x40000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
 const CLONE_NEWPID: u64 = 0x2000_0000;
-/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载、用户、pid
-/// 命名空间（`syscall::ns`），别的是 EPERM（设计文档 §6）。
+const CLONE_NEWUTS: u64 = 0x0400_0000;
+const CLONE_NEWIPC: u64 = 0x0800_0000;
+/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载、用户、pid、UTS、
+/// IPC 命名空间（`syscall::ns`），别的是 EPERM（设计文档 §6）。
 const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
 /// 支持的 `CLONE_NEW*`。
-const CLONE_NEW_DONE: u64 = CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID;
+const CLONE_NEW_DONE: u64 =
+    CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC;
+/// 要在新进程的用户命名空间里有 `CAP_SYS_ADMIN` 的 `CLONE_NEW*`（Linux 的 copy_namespaces）。
+const CLONE_NEW_ADMIN: u64 = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC;
 /// clone3：子进程的信号处理函数恢复默认。
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// clone3：子进程放进 `cgroup` 指定的 cgroup。
@@ -240,14 +245,20 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     if flags & CLONE_NEWUSER != 0 {
         super::ns::new_user_ns(&mut child_cred, super::ns::chrooted(cx))?;
     }
-    if flags & (CLONE_NEWNS | CLONE_NEWPID) != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
+    if flags & CLONE_NEW_ADMIN != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
+    }
+    // 新的 IPC 命名空间里不能再共用原来的 SEM_UNDO 撤销值
+    if both(CLONE_NEWIPC, CLONE_SYSVSEM) {
+        return Err(Errno::EINVAL);
     }
     let pid_ns = if flags & CLONE_NEWPID != 0 {
         super::ns::new_pid_ns(&active, &for_children, child_cred.user_ns.clone())?
     } else {
         for_children
     };
+    // 新的 UTS、IPC 命名空间属于新进程的用户命名空间
+    let child_cred_owner = child_cred.user_ns.clone();
     // 线程数的限制（Linux 的 copy_process）：RLIMIT_NPROC 按真实用户 ID 数线程，root 和
     // 有 CAP_SYS_RESOURCE 或 CAP_SYS_ADMIN 的不受它限制；threads-max 对谁都有效
     {
@@ -376,11 +387,19 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         fast_sleep: None,
     };
     let tgid = if thread { cx.tgid() } else { tid };
+    let mut ns = cx.ns();
+    if flags & CLONE_NEWUTS != 0 {
+        ns.uts = ns.uts.copy(child_cred_owner.clone());
+    }
+    if flags & CLONE_NEWIPC != 0 {
+        ns.ipc = cx.k().new_ipc_ns(child_cred_owner.clone());
+    }
     let task = Task::new(
         tid,
         tgid,
         &child_cpu,
         state,
+        ns,
         cx.task.sigmask.get(),
         cx.task.comm.get(),
     )?;
@@ -1355,7 +1374,7 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEWUSER != 0 {
         super::ns::new_user_ns(&mut new_cred, super::ns::chrooted(cx))?;
     }
-    if flags & (CLONE_NEWNS | CLONE_NEWPID) != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
+    if flags & CLONE_NEW_ADMIN != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     // 新的 pid 命名空间只给以后的子进程用（自己不进去）；进去之前不能再 unshare 一次
@@ -1404,10 +1423,24 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if pid_ns.is_some() {
         *cx.task.pid_ns_children.borrow_mut() = pid_ns;
     }
-    // 与 Linux 的 exit_sem 一样，执行并丢掉 SysV 信号量的 undo
-    if flags & CLONE_SYSVSEM != 0 {
+    // 与 Linux 的 exit_sem 一样，执行并丢掉 SysV 信号量的 undo；换 IPC 命名空间时也要做
+    // （原来的命名空间里的信号量以后够不着了）
+    if flags & (CLONE_SYSVSEM | CLONE_NEWIPC) != 0 {
         let tgid = cx.tgid();
-        cx.k().ipc.exit(tgid);
+        cx.ipc_mut().exit(tgid);
+    }
+    // 新的 UTS 命名空间复制原来的名字，新的 IPC 命名空间是空的
+    if flags & (CLONE_NEWUTS | CLONE_NEWIPC) != 0 {
+        let owner = new_cred.user_ns.clone();
+        let mut ns = cx.ns();
+        if flags & CLONE_NEWUTS != 0 {
+            ns.uts = ns.uts.copy(owner.clone());
+        }
+        if flags & CLONE_NEWIPC != 0 {
+            ns.ipc = cx.k().new_ipc_ns(owner);
+        }
+        *cx.task.ns.borrow_mut() = ns;
+        cx.k().collect_ipc();
     }
     Ok(0)
 }

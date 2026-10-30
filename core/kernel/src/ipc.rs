@@ -476,7 +476,11 @@ pub(crate) struct ShmSeg {
     pub lpid: Tid,
 }
 
-/// 所有 System V IPC 对象。
+/// 一个共享内存段：所在的 IPC 命名空间的编号和段的 id（各个命名空间的 id 各自编号）。
+pub(crate) type ShmKey = (u64, i32);
+
+/// 一个 IPC 命名空间里的所有对象（[`crate::nsproxy::IpcNs`]）：System V IPC 对象和 POSIX
+/// 消息队列，以及它们的限制。
 #[derive(Default)]
 pub(crate) struct Ipc {
     pub msg: Table<MsgQueue>,
@@ -485,6 +489,10 @@ pub(crate) struct Ipc {
     /// SEM_UNDO 的撤销值：(进程, 信号量集) → 每个信号量的值。
     pub undo: BTreeMap<(Tid, i32), Vec<i32>>,
     pub tunables: Tunables,
+    /// POSIX 消息队列，按名字（`syscall::mqueue`）。
+    pub mqueues: BTreeMap<Vec<u8>, Rc<crate::cell::RefCell<crate::syscall::MessageQueue>>>,
+    /// `/proc/sys/fs/mqueue/*`。
+    pub mq_limits: crate::syscall::MqLimits,
 }
 
 impl Ipc {
@@ -535,7 +543,7 @@ impl Ipc {
 }
 
 /// 共享内存段被 shmat 的次数：数所有地址空间里的映射（每个地址空间只数一次）。
-pub(crate) fn nattch(k: &Kernel, id: i32) -> u64 {
+pub(crate) fn nattch(k: &Kernel, id: ShmKey) -> u64 {
     let mut seen: Vec<*const crate::cell::RefCell<crate::mm::Mm>> = Vec::new();
     let mut n = 0;
     for t in k.tasks.values() {
@@ -549,30 +557,41 @@ pub(crate) fn nattch(k: &Kernel, id: i32) -> u64 {
     n
 }
 
-/// 释放已经标记删除、不再有映射的共享内存段。
+/// 释放已经标记删除、不再有映射的共享内存段（各个 IPC 命名空间里的）。
 pub(crate) fn reap_shm(k: &mut Kernel) {
-    let doomed: Vec<i32> = k
-        .ipc
-        .shm
+    let doomed: Vec<ShmKey> = k
+        .ipcs
         .iter()
-        .filter(|(_, p, _)| p.mode & SHM_DEST != 0)
-        .map(|(id, _, _)| id)
+        .flat_map(|(&ns, (_, ipc))| {
+            ipc.shm
+                .iter()
+                .filter(|(_, p, _)| p.mode & SHM_DEST != 0)
+                .map(move |(id, _, _)| (ns, id))
+        })
         .collect();
-    for id in doomed {
-        if nattch(k, id) == 0 {
-            k.ipc.shm.remove(id);
+    for key in doomed {
+        if nattch(k, key) == 0 {
+            k.ipc_mut(key.0).shm.remove(key.1);
         }
     }
 }
 
-/// `/proc/sysvipc/{msg,sem,shm}` 的内容。
-pub(crate) fn proc_listing(k: &Kernel, which: &[u8]) -> String {
+/// 进程退出：各个 IPC 命名空间里它的 SEM_UNDO 的撤销值（[`Ipc::exit`]）。
+pub(crate) fn exit(k: &mut Kernel, tgid: Tid) {
+    for (_, ipc) in k.ipcs.values_mut() {
+        ipc.exit(tgid);
+    }
+}
+
+/// IPC 命名空间 `ns` 的 `/proc/sysvipc/{msg,sem,shm}` 的内容。
+pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8]) -> String {
     use std::fmt::Write;
+    let ipc = k.ipc(ns);
     let mut s = String::new();
     match which {
         b"msg" => {
             s.push_str("       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n");
-            for (id, p, q) in k.ipc.msg.iter() {
+            for (id, p, q) in ipc.msg.iter() {
                 writeln!(
                     s,
                     "{:10} {:10} {:5o} {:11} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}",
@@ -596,7 +615,7 @@ pub(crate) fn proc_listing(k: &Kernel, which: &[u8]) -> String {
         }
         b"sem" => {
             s.push_str("       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n");
-            for (id, p, set) in k.ipc.sem.iter() {
+            for (id, p, set) in ipc.sem.iter() {
                 writeln!(
                     s,
                     "{:10} {:10} {:5o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}",
@@ -616,11 +635,11 @@ pub(crate) fn proc_listing(k: &Kernel, which: &[u8]) -> String {
         }
         _ => {
             s.push_str("       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n");
-            for (id, p, seg) in k.ipc.shm.iter() {
+            for (id, p, seg) in ipc.shm.iter() {
                 writeln!(
                     s,
                     "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}",
-                    p.key, id, p.mode & 0o1777, seg.size, seg.cpid, seg.lpid, nattch(k, id),
+                    p.key, id, p.mode & 0o1777, seg.size, seg.cpid, seg.lpid, nattch(k, (ns, id)),
                     p.uid, p.gid, p.cuid, p.cgid, seg.atime, seg.dtime, seg.ctime,
                     seg.mem.len(), 0
                 )

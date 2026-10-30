@@ -539,7 +539,7 @@ def stop_cont():
     def init():
         fork(lambda: (os.read(go[0], 1), os.kill(1, signal.SIGCONT)))
         os.write(ready[1], b"x")
-        time.sleep(0.5)
+        time.sleep(2)
         print("init resumed")
         ctypes.string_at(0)
 
@@ -632,10 +632,12 @@ def peercred():
         c.connect("\0appine-pidns")
         cred = c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         print("inside sees peer pid", struct.unpack("3i", cred)[0])
+        c.send(b"y")
         c.recv(1)
 
     pid = fork(init)
     conn, _ = srv.accept()
+    conn.recv(1)
     cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
     print("outside sees the init", struct.unpack("3i", cred)[0] == pid)
     conn.send(b"x")
@@ -707,4 +709,204 @@ def nested():
 
 child(nested)
 PY3
+
+# UTS 命名空间：busybox 的 unshare -u 里改的主机名外面看不到
+before=$(hostname)
+unshare -u sh -c '
+    hostname inner
+    echo "inside: $(hostname) $(uname -n) $(cat /proc/sys/kernel/hostname)"
+    echo "different ns: $([ "$(readlink /proc/self/ns/uts)" != "$(readlink /proc/$PPID/ns/uts)" ] && echo yes)"
+'
+echo "outside unchanged: $([ "$(hostname)" = "$before" ] && echo yes)"
+
+python3 - <<'PY4'
+import ctypes, errno, functools, os, socket, struct, time
+
+print = functools.partial(print, flush=True)
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.shmat.restype = ctypes.c_void_p
+libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+libc.shmdt.argtypes = [ctypes.c_void_p]
+libc.mq_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
+libc.umount.argtypes = [ctypes.c_char_p]
+CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_SYSVSEM = 0x04000000, 0x08000000, 0x10000000, 0x40000
+IPC_CREAT, IPC_EXCL, IPC_RMID, IPC_STAT, SEM_UNDO, GETVAL = 0o1000, 0o2000, 0, 2, 0x1000, 12
+KEY = 0x4170704E
+os.makedirs("/tmp/ns/p", exist_ok=True)
+
+
+def err(f, *args):
+    try:
+        f(*args)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def c(r):
+    return r if r != -1 else errno.errorcode[ctypes.get_errno()]
+
+
+def fork(f):
+    pid = os.fork()
+    if pid == 0:
+        try:
+            f()
+        except OSError as e:
+            print("raised", errno.errorcode[e.errno])
+        except BaseException as e:
+            print("raised", repr(e))
+        finally:
+            os._exit(0)
+    return pid
+
+
+def child(f):
+    return os.waitpid(fork(f), 0)[1]
+
+
+def link(kind, pid="self"):
+    return os.readlink("/proc/%s/ns/%s" % (pid, kind))
+
+
+def sysvipc(which):
+    with open("/proc/sysvipc/" + which) as f:
+        return [l.split()[:2] for l in f.readlines()[1:]]
+
+
+def semop(sem, op, flg):
+    buf = struct.pack("HhH", 0, op, flg)
+    return c(libc.semop(sem, buf, 1))
+
+
+name = socket.gethostname()
+
+
+# 新的 UTS 命名空间复制原来的名字；里面改的外面看不到；名字太长是 EINVAL；没有能力是 EPERM
+def uts():
+    os.unshare(CLONE_NEWUTS)
+    print("copied", socket.gethostname() == name, "domain", os.uname().nodename == name)
+    print("too long", err(socket.sethostname, "x" * 65))
+    socket.sethostname("inside")
+    print("domain", c(libc.setdomainname(b"dom", 3)), open("/proc/sys/kernel/domainname").read().strip())
+    print("inside", socket.gethostname(), os.uname().nodename, open("/proc/sys/kernel/hostname").read().strip())
+    r, w = os.pipe()
+    pid = fork(lambda: (os.write(w, b"x"), time.sleep(30)))
+    os.read(r, 1)
+    print("child shares it", link("uts", pid) == link("uts"))
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+
+
+child(uts)
+print("outside", socket.gethostname() == name, open("/proc/sys/kernel/domainname").read().strip())
+child(lambda: (os.setuid(65534), print("unprivileged sethostname", err(socket.sethostname, "x"),
+                                     "unshare", err(os.unshare, CLONE_NEWUTS))))
+
+
+# root 建的用户命名空间里的 UTS 命名空间：属主是新的用户命名空间，在里面能改名字；
+# setns 进去之后看到的是它的名字
+def owned():
+    os.unshare(CLONE_NEWUSER | CLONE_NEWUTS)
+    socket.sethostname("owned")
+    print("in a user namespace", socket.gethostname())
+
+
+child(owned)
+
+
+def joined():
+    r, w = os.pipe()
+
+    def other():
+        os.unshare(CLONE_NEWUTS)
+        socket.sethostname("other")
+        os.write(w, b"x")
+        time.sleep(30)
+
+    pid = fork(other)
+    os.read(r, 1)
+    fd = os.open("/proc/%d/ns/uts" % pid, os.O_RDONLY)
+    print("setns uts", err(os.setns, fd, CLONE_NEWUTS), socket.gethostname())
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+
+
+child(joined)
+
+
+# IPC 命名空间：里面看不到外面的 System V IPC 对象和 POSIX 消息队列，id 重新编号；
+# shmat 的段在 unshare 之后照样能 shmdt；换命名空间时执行 SEM_UNDO 的撤销值
+shm = libc.shmget(KEY, 4096, IPC_CREAT | 0o600)
+sem = libc.semget(KEY, 1, IPC_CREAT | 0o600)
+msq = libc.msgget(KEY, IPC_CREAT | 0o600)
+mq = libc.mq_open(b"/appine-ns", os.O_CREAT | os.O_RDONLY, 0o600, None)
+print("outside objects", shm >= 0, sem >= 0, msq >= 0, mq >= 0)
+
+
+step, go = os.pipe(), os.pipe()
+
+
+def ipc():
+    addr = libc.shmat(shm, None, 0)
+    print("semop with undo", semop(sem, 1, SEM_UNDO), "value", libc.semctl(sem, 0, GETVAL))
+    me = link("ipc")
+    os.unshare(CLONE_NEWIPC)
+    os.write(step[1], b"x")
+    os.read(go[0], 1)
+    print("new ns", link("ipc") != me)
+    print("shmget", c(libc.shmget(KEY, 4096, 0)), "semget", c(libc.semget(KEY, 1, 0)),
+          "msgget", c(libc.msgget(KEY, 0)), "mq_open", c(libc.mq_open(b"/appine-ns", os.O_RDONLY, 0, None)))
+    print("sysvipc", sysvipc("shm"), sysvipc("sem"), sysvipc("msg"))
+    mine = libc.shmget(0, 4096, IPC_CREAT | 0o600)
+    print("first id", mine, "same key again", c(libc.shmget(KEY, 8192, IPC_CREAT | IPC_EXCL | 0o600)) >= 0)
+    print("shmdt the old one", c(libc.shmdt(addr)))
+    print("mount proc", libc.mount(b"proc", b"/tmp/ns/p", b"proc", 0, None))
+    with open("/tmp/ns/p/sys/kernel/msgmax", "w") as f:
+        f.write("1234")
+    print("msgmax", open("/tmp/ns/p/sys/kernel/msgmax").read().strip())
+    print("umount", libc.umount(b"/tmp/ns/p"))
+
+
+pid = fork(ipc)
+os.read(step[0], 1)
+print("undone at unshare", libc.semctl(sem, 0, GETVAL))
+os.write(go[1], b"x")
+os.waitpid(pid, 0)
+print("outside after: nattch",
+      [l.split()[6] for l in open("/proc/sysvipc/shm") if l.split()[1:2] == [str(shm)]],
+      "msgmax", open("/proc/sys/kernel/msgmax").read().strip())
+print("clone NEWIPC with SYSVSEM", libc.syscall(220, CLONE_NEWIPC | CLONE_SYSVSEM | 17, 0, 0, 0, 0),
+      errno.errorcode[ctypes.get_errno()])
+child(lambda: (os.setuid(65534), print("unprivileged unshare", err(os.unshare, CLONE_NEWIPC))))
+
+
+# setns 到别的进程的 IPC 命名空间：看到的是它的对象
+def joined_ipc():
+    r, w = os.pipe()
+
+    def other():
+        os.unshare(CLONE_NEWIPC)
+        libc.msgget(KEY + 1, IPC_CREAT | 0o600)
+        os.write(w, b"x")
+        time.sleep(30)
+
+    pid = fork(other)
+    os.read(r, 1)
+    fd = os.open("/proc/%d/ns/ipc" % pid, os.O_RDONLY)
+    print("setns ipc", err(os.setns, fd, CLONE_NEWIPC), "msgget", libc.msgget(KEY + 1, 0) >= 0,
+          "outer one", c(libc.msgget(KEY, 0)))
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+
+
+child(joined_ipc)
+libc.shmctl(shm, IPC_RMID, None)
+libc.semctl(sem, 0, IPC_RMID)
+libc.msgctl(msq, IPC_RMID, None)
+libc.mq_unlink(b"/appine-ns")
+PY4
 rm -rf /tmp/ns

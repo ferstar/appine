@@ -3738,8 +3738,8 @@ fn write_bytes(
             };
             if let Some(node) = proc_node {
                 let cred = cx.cred();
-                let pid_ns = cx.pid_ns();
-                pseudo::write(cx.k(), &cred, &pid_ns, &node, data)?;
+                let (ns, pid_ns) = (cx.ns(), cx.pid_ns());
+                pseudo::write(cx.k(), &cred, (&ns, &pid_ns), &node, data)?;
             }
             let ino = match file.borrow().kind {
                 FileKind::Regular { ino, .. } => Some(ino),

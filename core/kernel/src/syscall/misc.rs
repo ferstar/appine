@@ -562,14 +562,14 @@ pub(super) fn getrusage(cx: &mut Cx<'_>, who: i32, usage: u64) -> SysResult {
 }
 
 pub(super) fn uname(cx: &mut Cx<'_>, buf: u64) -> SysResult {
-    let k = cx.kr();
+    let uts = cx.task.ns.borrow().uts.clone();
     let fields: [&[u8]; 6] = [
         b"Linux",
-        &k.hostname,
+        &uts.hostname.borrow(),
         RELEASE,
         b"#1 SMP PREEMPT appine",
         b"aarch64",
-        &k.domainname,
+        &uts.domainname.borrow(),
     ];
     let mut out = [0u8; 6 * 65];
     for (i, f) in fields.iter().enumerate() {
@@ -608,9 +608,11 @@ pub(super) fn reboot(cx: &mut Cx<'_>, magic1: u32, magic2: u32, cmd: u32) -> Sys
     }
 }
 
-/// sethostname、setdomainname。
+/// sethostname、setdomainname：改的是所在的 UTS 命名空间的，要在它的属主里有
+/// `CAP_SYS_ADMIN`。
 pub(super) fn set_uts_name(cx: &mut Cx<'_>, name: u64, len: i64, domain: bool) -> SysResult {
-    if !cx.cred().capable(cap::SYS_ADMIN) {
+    let uts = cx.task.ns.borrow().uts.clone();
+    if !cx.cred().ns_capable(&uts.owner, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let len = usize::try_from(len)
@@ -619,11 +621,10 @@ pub(super) fn set_uts_name(cx: &mut Cx<'_>, name: u64, len: i64, domain: bool) -
         .ok_or(Errno::EINVAL)?;
     let mut value = vec![0u8; len];
     cx.mm().read(UserSlice::new(name, len), &mut value)?;
-    let k = cx.k();
     *if domain {
-        &mut k.domainname
+        uts.domainname.borrow_mut()
     } else {
-        &mut k.hostname
+        uts.hostname.borrow_mut()
     } = value;
     Ok(0)
 }

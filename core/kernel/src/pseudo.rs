@@ -177,15 +177,16 @@ impl NsKind {
     }
 
     /// 线程 `task` 的这种命名空间的编号（inode 号）：挂载命名空间的按它的 `FsContext`，
-    /// 用户命名空间的按它的凭据，pid 命名空间的按它的进程和线程，别的是开机时的那个（与
-    /// Linux 常见的编号相同）。没有时（ENOENT）是 None。
+    /// 用户命名空间的按它的凭据，pid 命名空间的按它的进程和线程，UTS、IPC 的按它的
+    /// [`crate::nsproxy::NsProxy`]，别的是开机时的那个（与 Linux 常见的编号相同）。没有时
+    /// （ENOENT）是 None。
     pub(crate) fn id_of(self, k: &Kernel, task: &Task) -> Option<u64> {
         let group = k.groups.get(&task.tgid);
         Some(match self {
             NsKind::Mnt => task.res.borrow().fs.borrow().mnt_ns.id,
             NsKind::User => group.map_or(crate::cred::INIT_USER_NS, |g| g.borrow().cred.user_ns.id),
             NsKind::Cgroup => 4_026_531_835,
-            NsKind::Ipc => 4_026_531_839,
+            NsKind::Ipc => task.ns.borrow().ipc.id,
             NsKind::Net => 4_026_531_840,
             NsKind::Pid => k.pid_ns_of(task.tgid).id,
             // unshare 了、还没有建子进程时没有（Linux 的 pidns_for_children_get 看
@@ -199,7 +200,7 @@ impl NsKind {
                 ns.id
             }
             NsKind::Time | NsKind::TimeForChildren => 4_026_531_834,
-            NsKind::Uts => 4_026_531_838,
+            NsKind::Uts => task.ns.borrow().uts.id,
         })
     }
 }
@@ -732,6 +733,15 @@ impl<'a> View<'a> {
         } else {
             ns.last_pid()
         }
+    }
+
+    /// 读者（`self` 指向的线程）所在的 UTS、IPC 命名空间：`/proc/sys/kernel/hostname`、
+    /// System V IPC 的限制和 `/proc/sysvipc` 按它。
+    pub(crate) fn ns(&self) -> crate::nsproxy::NsProxy {
+        self.k
+            .tasks
+            .get(&self.tid)
+            .map_or_else(|| self.k.init_ns.clone(), |t| t.ns.borrow().clone())
     }
 
     /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
@@ -1277,7 +1287,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
 pub(crate) fn write(
     k: &mut Kernel,
     cred: &Cred,
-    pid_ns: &PidNs,
+    (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
     node: &PseudoNode,
     data: &[u8],
 ) -> Result<(), Errno> {
@@ -1290,19 +1300,19 @@ pub(crate) fn write(
     }
     if let PseudoNode::Static(path) = node
         && let Some(name) = path.strip_prefix(b"sys/kernel/")
-        && k.ipc.tunables.read(name).is_some()
+        && k.ipc(ns.ipc.id).tunables.read(name).is_some()
     {
-        return k.ipc.tunables.write(name, data);
+        return k.ipc_mut(ns.ipc.id).tunables.write(name, data);
     }
     if let PseudoNode::Static(path @ (b"sys/kernel/hostname" | b"sys/kernel/domainname")) = node {
         let name = data.strip_suffix(b"\n").unwrap_or(data);
         if name.len() > crate::kernel::UTS_LEN {
             return Err(Errno::EINVAL);
         }
-        let slot = if *path == b"sys/kernel/hostname" {
-            &mut k.hostname
+        let mut slot = if *path == b"sys/kernel/hostname" {
+            ns.uts.hostname.borrow_mut()
         } else {
-            &mut k.domainname
+            ns.uts.domainname.borrow_mut()
         };
         *slot = name.to_vec();
     }
@@ -1316,7 +1326,7 @@ pub(crate) fn write(
     }
     if let PseudoNode::Static(path) = node
         && let Some(name) = path.strip_prefix(b"sys/fs/mqueue/")
-        && let Some(slot) = k.mq_limits.slot(name)
+        && let Some(slot) = k.ipc_mut(ns.ipc.id).mq_limits.slot(name)
     {
         *slot = std::str::from_utf8(data)
             .ok()
@@ -2534,7 +2544,8 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/fs/aio-max-nr" => format!("{}\n", ps.k.aio_max_nr),
             b"sys/fs/aio-nr" => format!("{}\n", ps.k.aio_nr),
             p if p.starts_with(b"sys/fs/mqueue/") => {
-                format!("{}\n", ps.k.mq_limits.get(&p[14..]).unwrap_or(0))
+                let ns = ps.ns().ipc.id;
+                format!("{}\n", ps.k.ipc(ns).mq_limits.get(&p[14..]).unwrap_or(0))
             }
             b"sys/fs/inotify/max_queued_events" => {
                 format!("{}\n", ps.k.inotify.borrow().max_queued)
@@ -2555,16 +2566,27 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
             b"sys/kernel/core_uses_pid" => format!("{}\n", ps.k.core_uses_pid as u8),
             b"sys/kernel/domainname" => {
-                format!("{}\n", String::from_utf8_lossy(&ps.k.domainname))
+                format!(
+                    "{}\n",
+                    String::from_utf8_lossy(&ps.ns().uts.domainname.borrow())
+                )
             }
-            b"sys/kernel/hostname" => format!("{}\n", String::from_utf8_lossy(&ps.k.hostname)),
+            b"sys/kernel/hostname" => {
+                format!(
+                    "{}\n",
+                    String::from_utf8_lossy(&ps.ns().uts.hostname.borrow())
+                )
+            }
             b"sys/kernel/sched_rr_timeslice_ms" => "100\n".to_owned(),
             b"sys/kernel/msgmax" | b"sys/kernel/msgmnb" | b"sys/kernel/msgmni"
             | b"sys/kernel/sem" | b"sys/kernel/shmall" | b"sys/kernel/shmmax"
-            | b"sys/kernel/shmmni" => ps.k.ipc.tunables.read(&path[11..]).unwrap(),
-            b"sysvipc/msg" => ipc::proc_listing(ps.k, b"msg"),
-            b"sysvipc/sem" => ipc::proc_listing(ps.k, b"sem"),
-            b"sysvipc/shm" => ipc::proc_listing(ps.k, b"shm"),
+            | b"sys/kernel/shmmni" => {
+                let ns = ps.ns().ipc.id;
+                ps.k.ipc(ns).tunables.read(&path[11..]).unwrap()
+            }
+            b"sysvipc/msg" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"msg"),
+            b"sysvipc/sem" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"sem"),
+            b"sysvipc/shm" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"shm"),
             b"sys/kernel/tainted" => "0\n".to_owned(),
             b"sys/kernel/threads-max" => format!("{}\n", ps.k.threads_max),
             b"sys/vm/max_map_count" => {
