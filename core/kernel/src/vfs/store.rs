@@ -17,7 +17,8 @@
 //! 写事务推迟提交（[`COMMIT_DELAY`]）：每次提交都要把改了的页写进 WAL，比修改本身贵十
 //! 倍，所以几毫秒里的元数据操作一起提交，每个操作是事务里的一个保存点，出错时只回滚
 //! 它自己。App 被杀掉时最多丢失最后几毫秒的修改，仓库仍然是某个时刻的完整状态（Linux
-//! 断电时丢失的更多）。别的 appine 进程也在用仓库时每个操作立即提交。
+//! 断电时丢失的更多）。别的 appine 进程也在用仓库时每个操作立即提交。检查点（把 WAL
+//! 写回数据库文件，要 fsync）由后台线程做（[`wal_hook`]），不在多半持着 BKL 的提交里。
 //!
 //! 路径解析和 stat 走内存里的元数据缓存（目录项，包括不存在的名字；inode 行；符号
 //! 链接目标），不逐级查询数据库。自己的写入只去掉受影响的条目。多个 appine 进程可以
@@ -28,6 +29,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
@@ -37,7 +39,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, ffi, params};
 
 use crate::cell::RefCell;
 use crate::cred::XATTR_NAME_CAPS;
@@ -51,6 +53,18 @@ pub const ROOT: Ino = 1;
 
 /// 写事务最多推迟这么久提交（模块文档）。
 pub const COMMIT_DELAY: Duration = Duration::from_millis(5);
+
+/// WAL 里攒够这么多页没写回的，就请后台线程做检查点（与 SQLite 默认的自动检查点相同）。
+const CHECKPOINT_PAGES: c_int = 1000;
+
+/// WAL 长到这么多页时，提交的线程就地做检查点，让 WAL 从头再用（[`wal_hook`]）。
+const INLINE_CHECKPOINT_PAGES: c_int = 10 * CHECKPOINT_PAGES;
+
+/// 写入停下来这么久之后，后台线程把 WAL 剩下的帧写回去（[`reap`]）。
+const CHECKPOINT_QUIET: Duration = Duration::from_millis(100);
+
+/// WAL 从头再用时截短到这么长（`journal_size_limit`），不长期占着连续写入时长出来的空间。
+const WAL_SIZE_LIMIT: i64 = 8 << 20;
 
 /// 宿主上 object 文件的权限位：只有 App 自己读写，guest 看到的权限记在数据库里。
 const OBJECT_MODE: u32 = 0o600;
@@ -209,13 +223,14 @@ pub(crate) struct Meta {
     commits: Commits,
     /// `objects` 目录（宿主 `O_PATH`），按 inode 编号 stat object 不必解析整个路径。
     objects_dir: OwnedFd,
-    /// 等着后台线程删除的 object（[`reap`]）。
+    /// 等着后台线程删除的 object、要做的检查点（[`reap`]）。
     reaper: Reaper,
 }
 
 /// 提交之后要删除的 object 交给后台线程（[`reap`]）：宿主的 unlink 每个几微秒，还要拿
 /// `objects` 目录的锁，`rm -rf` 时占了 guest 线程一成多的时间，而且是持着 BKL 做的。
-/// 删除之前 App 被杀掉也没关系：inode 行以 nlink = 0 留着，开机时清理。
+/// 删除之前 App 被杀掉也没关系：inode 行以 nlink = 0 留着，开机时清理。检查点也由它做
+/// （[`wal_hook`]）。
 #[derive(Default)]
 struct Reaper {
     state: Mutex<Reaping>,
@@ -228,16 +243,55 @@ struct Reaper {
 #[derive(Default)]
 struct Reaping {
     queue: Vec<Ino>,
+    /// 提交的线程请它做一次检查点。
+    checkpoint: bool,
+    /// 上一次请它做检查点时 WAL 里的页数：做完之后至少写回到这里。
+    requested: c_int,
+    /// 最近一次提交之后 WAL 里的页数，和一共提交了几次。
+    pages: c_int,
+    commits: u64,
+    /// 上一次检查点写回到 WAL 的第几帧。
+    backfilled: c_int,
     busy: bool,
     quit: bool,
     /// 一共交给它多少个（测试用）。
     #[cfg(test)]
     handed: usize,
+    /// 做过几次检查点（测试用）。
+    #[cfg(test)]
+    checkpoints: usize,
+    /// 不做检查点，模拟后台线程赶不上（测试用）。
+    #[cfg(test)]
+    paused: bool,
 }
 
-/// 删除 object 的后台线程，直到 Store 关闭；关闭之前删完队列里的。
-fn reap(meta: Arc<Meta>) {
+impl Reaper {
+    /// 提交之后 WAL 里有 `pages` 页（[`wal_hook`]）：比上次请求时多出
+    /// [`CHECKPOINT_PAGES`] 页就请后台线程做检查点。
+    fn committed(&self, pages: c_int) {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.pages = pages;
+        st.commits += 1;
+        // 比原来还少：WAL 从头再用了
+        if pages < st.requested {
+            st.requested = 0;
+        }
+        if pages < st.backfilled {
+            st.backfilled = 0;
+        }
+        if pages - st.requested >= CHECKPOINT_PAGES {
+            st.requested = pages;
+            st.checkpoint = true;
+            self.work.notify_one();
+        }
+    }
+}
+
+/// 仓库的后台线程，直到 Store 关闭：删除 object（关闭之前删完队列里的），做检查点。
+fn reap(meta: Arc<Meta>, db: PathBuf) {
     let r = &meta.reaper;
+    // 检查点用自己的连接，第一次要做时才打开
+    let mut conn = None;
     let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
         if !st.queue.is_empty() {
@@ -251,12 +305,86 @@ fn reap(meta: Arc<Meta>) {
             st.busy = false;
             continue;
         }
+        #[cfg(test)]
+        let paused = st.paused;
+        #[cfg(not(test))]
+        let paused = false;
+        if st.checkpoint && !paused {
+            st.checkpoint = false;
+            st.busy = true;
+            drop(st);
+            let backfilled = checkpoint(&mut conn, &db);
+            st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.busy = false;
+            if let Some(n) = backfilled {
+                st.backfilled = n;
+            }
+            #[cfg(test)]
+            {
+                st.checkpoints += 1;
+            }
+            continue;
+        }
         r.idle.notify_all();
         if st.quit {
             return;
         }
+        // WAL 已经长过一次检查点、还有没写回的帧：写入停下来之后写回剩下的，下一个写事务
+        // 就让 WAL 从头再用（[`wal_hook`]）。零星的小写入不到这么长，不为它们 fsync
+        if st.pages >= CHECKPOINT_PAGES && st.pages > st.backfilled {
+            let seen = st.commits;
+            let (g, wait) = r
+                .work
+                .wait_timeout(st, CHECKPOINT_QUIET)
+                .unwrap_or_else(PoisonError::into_inner);
+            st = g;
+            if wait.timed_out() && st.commits == seen {
+                st.checkpoint = true;
+            }
+            continue;
+        }
         st = r.work.wait(st).unwrap_or_else(PoisonError::into_inner);
     }
+}
+
+/// PASSIVE 检查点：不等读者，也不挡写者，这时写不回去的帧留到下一次。返回写回到了第几
+/// 帧。失败时只记下来，WAL 接着变长，到 [`INLINE_CHECKPOINT_PAGES`] 时由提交的线程就地做。
+fn checkpoint(conn: &mut Option<Connection>, db: &Path) -> Option<c_int> {
+    if conn.is_none() {
+        match Connection::open(db) {
+            Ok(c) => *conn = Some(c),
+            Err(e) => crate::debug::log(format_args!("inode store: checkpoint: {e}")),
+        }
+    }
+    // 结果是（是否被挡住、WAL 的帧数、写回到的帧）
+    conn.as_ref()?
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(2))
+        .inspect_err(|e| crate::debug::log(format_args!("inode store: checkpoint: {e}")))
+        .ok()
+}
+
+/// 代替 SQLite 默认的自动检查点（`sqlite3_wal_hook`）：每次提交之后由提交的线程调用，
+/// `pages` 是 WAL 里现在的页数。检查点要把 WAL 写回数据库文件、fsync 两次，提交多半
+/// 持着 BKL（推迟到点的提交在定时器线程里），手机上一次 fsync 就是几毫秒到几十毫秒，
+/// 这期间所有 guest 线程都要等，所以交给后台线程（[`reap`]）。
+///
+/// 后台的检查点不挡写者，可 WAL 只有在全部写回之后开始的写事务里才从头再用：一直有
+/// 提交时，后台总差最后几帧，WAL 越来越长。写入停下来的时候（交互使用多半如此）后台
+/// 赶得上；一直写到 [`INLINE_CHECKPOINT_PAGES`] 页时由提交的线程就地补上，这时大部分帧
+/// 后台已经写回，补的只是最后一千页以内的。
+unsafe extern "C" fn wal_hook(
+    meta: *mut c_void,
+    db: *mut ffi::sqlite3,
+    name: *const c_char,
+    pages: c_int,
+) -> c_int {
+    // SAFETY: 注册时传的是这个连接所属的 Store 的 Meta，它比连接活得久（Store::connect）
+    unsafe { &*meta.cast::<Meta>() }.reaper.committed(pages);
+    if pages >= INLINE_CHECKPOINT_PAGES {
+        // SAFETY: SQLite 传来的是刚提交的那个连接和数据库的名字
+        unsafe { ffi::sqlite3_wal_checkpoint(db, name) };
+    }
+    ffi::SQLITE_OK
 }
 
 /// 删除 `objects` 目录里的 object；它已经不在时不算错误。
@@ -671,6 +799,8 @@ impl Store {
             .map_err(db_err)?;
         db.pragma_update(None, "synchronous", "NORMAL")
             .map_err(db_err)?;
+        db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)
+            .map_err(db_err)?;
         // 多个 appine 进程可以同时使用同一个仓库：等别人的写事务结束，而不是立即失败
         db.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
         // 元数据操作很频繁：所有语句都只编译一次
@@ -697,12 +827,24 @@ impl Store {
             reaper: Reaper::default(),
         });
         let reaper = {
-            let meta = meta.clone();
+            let (meta, db) = (meta.clone(), dir.join("meta.db"));
             std::thread::Builder::new()
                 .name("objects-reaper".into())
-                .spawn(move || reap(meta))
+                .spawn(move || reap(meta, db))
                 .ok()
         };
+        if reaper.is_some() {
+            // SAFETY: 钩子拿到的 Meta 由 Store 和后台线程一起持有；Store 的字段里 db 最先
+            // 丢掉，连接关闭之后钩子不会再被调用。后台线程没起来时保留 SQLite 自己的
+            // 自动检查点
+            unsafe {
+                ffi::sqlite3_wal_hook(
+                    db.handle(),
+                    Some(wal_hook),
+                    Arc::as_ptr(&meta).cast_mut().cast(),
+                );
+            }
+        }
         Ok(Store {
             db,
             objects: dir.join("objects"),
@@ -2407,6 +2549,63 @@ mod tests {
             assert!(inos.contains(&ino));
             assert!(dir.join("objects").join(ino.to_string()).exists());
         }
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoints_run_in_the_background() {
+        let (s, dir) = temp_store("checkpoint");
+        let state = |s: &Store| {
+            let st = s.meta.reaper.state.lock().unwrap();
+            (st.checkpoints, st.pages)
+        };
+        // 每个操作单独提交，直到 WAL 攒够要做检查点的页数。提交的线程自己做的话（SQLite
+        // 默认的自动检查点），后台线程一次也没做过
+        let mut i = 0;
+        while state(&s).0 == 0 {
+            assert!(i < 5000, "no checkpoint after {i} commits");
+            s.create_file(ROOT, format!("f{i}").as_bytes(), 0o644, 0, 0)
+                .unwrap();
+            s.commit().unwrap();
+            i += 1;
+        }
+        // 写入停下来之后后台写回剩下的帧：下一个写事务让 WAL 从头再用
+        let start = Instant::now();
+        while state(&s).0 < 2 {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "no checkpoint after the writes stopped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        s.reaped();
+        let f = s.lookup(ROOT, b"f0").unwrap().unwrap();
+        s.set_mode(f, 0o600).unwrap();
+        s.commit().unwrap();
+        assert!(
+            state(&s).1 < CHECKPOINT_PAGES,
+            "WAL has {} pages",
+            state(&s).1
+        );
+        // 一直在写、后台赶不上：WAL 到 INLINE_CHECKPOINT_PAGES 页时由提交的线程补上，
+        // 之后也从头再用
+        s.meta.reaper.state.lock().unwrap().paused = true;
+        let (mut most, mut restarted) = (0, false);
+        for k in 0..1500 {
+            let value = vec![k as u8; 60 << 10];
+            s.set_xattr(f, b"user.big", &value, false, false).unwrap();
+            s.commit().unwrap();
+            let pages = state(&s).1;
+            restarted |= most >= INLINE_CHECKPOINT_PAGES && pages < CHECKPOINT_PAGES;
+            most = most.max(pages);
+        }
+        assert!(restarted, "WAL grew to {most} pages and never restarted");
+        assert!(
+            most < INLINE_CHECKPOINT_PAGES + 100,
+            "WAL grew to {most} pages"
+        );
+        s.meta.reaper.state.lock().unwrap().paused = false;
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }

@@ -487,6 +487,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - **推迟提交**：一次提交要把改了的页写进 WAL（每页两次 pwrite，加上 WAL 索引的加解锁），约 15 微秒，比操作本身（约 2 微秒）贵得多。所以写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是事务里的一个保存点，出错（或者内核层 panic）时只回滚到它自己的保存点。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，宿主调用 `Machine::sync`、`trim_memory`（Android 的 `onTrimMemory`，§11.2），以及内核实例关闭时立即提交。
   - App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态。Linux 断电时丢失的更多（ext4 默认每 5 秒提交一次日志）；guest 用 fsync 要求持久的修改不会丢。
   - 删除最后一个链接时，宿主 object 等提交之后再删：提交之前被杀掉的话，目录项还在，object 也得在。
+  - **检查点**（把 WAL 写回数据库文件，fsync 两次）由仓库的后台线程用自己的连接做（PASSIVE，不挡写者），不在多半持着 BKL 的提交里：手机上一次 fsync 就是几毫秒到几十毫秒，这期间要进内核的 guest 线程都要等。`sqlite3_wal_hook` 代替 SQLite 默认的自动检查点，每多出 1000 页请后台线程做一次；WAL 只有在全部写回之后开始的写事务里才从头再用，所以 WAL 长过 1000 页、还有没写回的帧时，后台线程在写入停下 100 毫秒之后再写回一次。一直有提交、后台总差最后几帧时，WAL 长到 1 万页由提交的线程就地补上（大部分帧后台已经写回）。WAL 从头再用时截短到 8 MB（`journal_size_limit`）。
   - 新建普通文件的 object 立即建好（guest 马上就要读写）。提交之前被杀掉的话，这些 inode 随事务丢失，object 却留了下来；编号以后会再分配出去，分给目录这类没有 object 的 inode 时它就永远留下了。所以 `lock` 文件里记着还没提交的写事务新分配的 inode 编号范围，下次开机删掉范围里没有 inode 行的 object；新建 object 时已经有同名的就清空接着用。
 - 读写数据直接对宿主 fd 做 `pread`/`pwrite`。两个普通文件之间的 `sendfile`、`copy_file_range` 交给宿主的 `sendfile`（Android 14 之前 App 的 seccomp 不允许 `copy_file_range`，会收到 SIGSYS），数据不经过内核层。
 - object 按 inode 编号相对 `objects` 目录打开、新建、删除和改时间、权限（`openat`、`unlinkat`、`utimensat`、`fchmodat`），不解析整个路径。
