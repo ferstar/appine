@@ -1,6 +1,6 @@
 # 内核的边角：别的进程截短已映射的文件（SIGBUS，不能带走整个 App）、MADV_DONTNEED、
 # PROT_NONE 的大片预留、停止又继续之后 nanosleep 只睡剩下的时间、持有 robust 锁的进程
-# 退出之后等待者拿到 EOWNERDEAD、EPOLLEXCLUSIVE 的参数检查
+# 退出之后等待者拿到 EOWNERDEAD、EPOLLEXCLUSIVE 的参数检查、跳到未对齐的地址（SIGBUS）
 set -e
 mkdir -p /tmp/diff-edges
 cd /tmp/diff-edges
@@ -11,6 +11,7 @@ cat > edges.c <<'C'
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -21,12 +22,14 @@ cat > edges.c <<'C'
 
 static sigjmp_buf env;
 static volatile int last_sig, last_code;
+static void *volatile last_addr;
 
 static void on_fault(int sig, siginfo_t *si, void *ctx)
 {
     (void)ctx;
     last_sig = sig;
     last_code = si->si_code;
+    last_addr = si->si_addr;
     siglongjmp(env, 1);
 }
 
@@ -199,6 +202,22 @@ int main(void)
     printf("exclusive oneshot %d %d\n", epoll_ctl(ep, EPOLL_CTL_ADD, pipefd[1], &ev), errno);
     ev.events = EPOLLIN | EPOLLEXCLUSIVE;
     printf("exclusive epoll %d %d\n", epoll_ctl(ep, EPOLL_CTL_ADD, ep2, &ev), errno);
+
+    /* 跳到未对齐的地址：取指时 SIGBUS（BUS_ADRALN），si_addr 是目标。经由函数指针调用和 ret */
+    uintptr_t targets[] = {1, 2, 0x1001};
+    for (int i = 0; i < 3; i++) {
+        for (int how = 0; how < 2; how++) {
+            if (sigsetjmp(env, 1)) {
+                printf("unaligned %s %#lx: %s/%d addr=%p\n", how ? "ret" : "call", (unsigned long)targets[i],
+                       last_sig == SIGBUS ? "SIGBUS" : "SIGSEGV", last_code, last_addr);
+                continue;
+            }
+            if (how)
+                __asm__ volatile("mov x30, %0\n ret" ::"r"(targets[i]) : "x30");
+            else
+                ((void (*)(void))targets[i])();
+        }
+    }
     return 0;
 }
 C

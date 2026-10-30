@@ -63,7 +63,9 @@ _Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "b 的偏移范围");
 #define TABLE_LIMIT (TABLE_SIZE / 4 * 3)
 #define JC_BITS 12
 #define JC_SIZE (1u << JC_BITS)
-#define JC_EMPTY UINT64_C(1) /* 未对齐的 pc 永远不会是合法的查找键 */
+/* 翻译表里墓碑的 pc：未对齐，查表时先排除未对齐的 pc（table_find、emit_lookup），所以不会
+ * 被查到。跳转缓存的空项另用 jc_empty */
+#define JC_EMPTY UINT64_C(1)
 /* 进入例程的栈帧：x19–x30、宿主 FPCR、d8–d15 */
 #define FRAME_BYTES 176
 
@@ -2183,9 +2185,12 @@ static struct table *table_new(unsigned bits)
     return t;
 }
 
-/* 在 t 里找 pc。持有锁时直接调用；不持锁时经由 table_lookup */
+/* 在 t 里找 pc。持有锁时直接调用；不持锁时经由 table_lookup。未对齐的 pc 没有块（Tier 0 报告
+ * 对齐错误），也不能拿去和墓碑的 JC_EMPTY 比 */
 static uint32_t *table_find(const struct table *t, uint64_t pc)
 {
+    if (pc & 3)
+        return NULL;
     for (size_t i = table_index(t, pc);; i = (i + 1) & table_mask(t)) {
         /* 插入时先写 pc 再写 code：读到 code 不为空，pc 就是对应的那个 */
         uint32_t *code = __atomic_load_n(&t->slots[i].code, __ATOMIC_ACQUIRE);
@@ -2325,10 +2330,20 @@ static void table_remove(struct appine_dbt *d, uint64_t pc)
     }
 }
 
+/*
+ * 跳转缓存第 i 项是空项时的 pc：未对齐，而且按它算出的下标不是 i，所以 guest 跳到哪里都不会
+ * 命中空项（翻译后的代码命中就直接跳往 code，空项的是 NULL）。都用同一个未对齐的值的话，跳到
+ * 这个地址时就命中它的下标那一项
+ */
+static uint64_t jc_empty(unsigned i)
+{
+    return (uint64_t)((i + 1) & (JC_SIZE - 1)) << 2 | 1;
+}
+
 static void clear_jump_cache(struct appine_dbt_thread *t)
 {
     for (unsigned i = 0; i < JC_SIZE; i++)
-        t->jc[i] = (struct slot){JC_EMPTY, NULL};
+        t->jc[i] = (struct slot){jc_empty(i), NULL};
     t->jc_dirty = false;
 }
 
@@ -3198,6 +3213,10 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
     /* 序号改成奇数之后再读表：stlr 与随后的 ldar 之间有序 */
     emit_seq_step(x);
+    /* 未对齐的 pc 交给分发器，见 table_find */
+    emit(x, enc_and_low(2, T0, 2));
+    uint32_t *unaligned = here(x);
+    emit(x, enc_cbnz_x(2));
     emit_mov_const(x, 0, (uint64_t)(uintptr_t)&d->table);
     emit(x, enc_ldar(3, 0, 0));
     emit(x, enc_ldr_w(2, 0, offsetof(struct table, shift)));
@@ -3232,6 +3251,7 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     emit(x, enc_br(T1));
 
     patch_branch(x->wdelta, miss, here(x));
+    patch_branch(x->wdelta, unaligned, here(x));
     emit_seq_step(x);
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));

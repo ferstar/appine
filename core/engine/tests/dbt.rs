@@ -268,6 +268,49 @@ fn both_register_sets_run_the_same_code() {
 }
 
 #[test]
+fn branches_to_unaligned_addresses_fault() {
+    let Some(mut dbt) = Dbt::new() else {
+        return;
+    };
+    // 第 0 页放一个块，作废之后它在翻译表里留下墓碑（pc 字段是未对齐的 1），位置就是查 1 时
+    // 开始找的地方；第 1 页是三种间接跳转
+    let mut pages: Box<[Page]> = (0..2).map(|_| Page([0; 4096])).collect();
+    let mut mmu = Mmu::new();
+    let base = NonNull::new(pages.as_mut_ptr().cast::<u8>()).unwrap();
+    unsafe { mmu.map(0, base, 2 * PAGE_SIZE, prot::READ | prot::EXEC) }.unwrap();
+    let mut cpu = unsafe { Cpu::new(&mmu) };
+    let code = |page: &mut Page, off: usize, insns: &[u32]| {
+        for (i, w) in insns.iter().enumerate() {
+            page.0[off + 4 * i..off + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    };
+    code(&mut pages[0], 0, &[movz_x0(7), SVC]);
+    code(&mut pages[1], 0, &[0xd61f_0020, 0xd63f_0020, RET]); // br x1, blr x1, ret
+    cpu.state_mut().pc = 0;
+    assert_eq!(dbt.run(&mut cpu), Exit::Svc { imm: 0 });
+    code(&mut pages[0], 0, &[movz_x0(8)]);
+    dbt.invalidate(&cpu, 0, PAGE_SIZE);
+    for target in [1, 2, 3, PAGE_SIZE + 1] {
+        for at in [PAGE_SIZE, PAGE_SIZE + 4, PAGE_SIZE + 8] {
+            let s = cpu.state_mut();
+            s.x[1] = target;
+            s.x[30] = target;
+            s.pc = at;
+            // 与 Linux 一样在跳过去之后、取指时报告对齐错误，pc 是目标；原来跳到 1 时进入跳转
+            // 缓存的空项（code 是 NULL）或者墓碑那个作废了的块
+            let fault = Exit::Fault {
+                addr: target,
+                access: Access::Exec,
+                kind: FaultKind::Alignment,
+            };
+            assert_eq!(dbt.run(&mut cpu), fault, "{at:#x} → {target:#x}");
+            assert_eq!(cpu.state().pc, target);
+        }
+    }
+    drop((dbt, cpu, mmu));
+}
+
+#[test]
 fn invalidation_keeps_blocks_whose_code_did_not_change() {
     let Some(mut dbt) = Dbt::new() else {
         return;
