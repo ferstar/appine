@@ -53,10 +53,15 @@ fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
 
 /// 仓库里的 inode；合成文件系统的节点返回 `pseudo`。
 fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
-    match node {
-        Node::Store(ino) => Ok(ino),
-        Node::Pseudo(..) => Err(pseudo),
+    node.ino().ok_or(pseudo)
+}
+
+/// 要改扩展属性的 inode：只读的挂载里是 EROFS（Linux 的 `mnt_want_write`，在别的检查之前）。
+fn writable_ino(cx: &Cx<'_>, node: Node) -> Result<Ino, Errno> {
+    if cx.vfs()?.readonly(&node) {
+        return Err(Errno::EROFS);
     }
+    store_ino(node, Errno::EOPNOTSUPP)
 }
 
 fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
@@ -142,7 +147,7 @@ pub(super) fn setxattr(
     }
     let mut v = vec![0u8; size];
     cx.mm().read(UserSlice::new(value, size), &mut v)?;
-    let ino = store_ino(node_of(cx, target)?, Errno::EOPNOTSUPP)?;
+    let ino = writable_ino(cx, node_of(cx, target)?)?;
     let vfs = cx.vfs()?;
     let store = vfs.store();
     // 程序文件的能力：只接受 v2、v3，要有 CAP_SETFCAP（cap_convert_nscap，在别的检查之前；
@@ -200,7 +205,7 @@ pub(super) fn getxattr(
 
 pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize) -> SysResult {
     let names = match node_of(cx, target)? {
-        Node::Store(ino) => cx.vfs()?.store().list_xattr(ino)?,
+        Node::Store(_, ino) => cx.vfs()?.store().list_xattr(ino)?,
         Node::Pseudo(..) => Vec::new(),
     };
     // 与 Linux 的 trusted 处理函数一样，没有 CAP_SYS_ADMIN 时不列出 trusted.*
@@ -218,7 +223,7 @@ pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize)
 
 pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResult {
     let name = read_name(cx, name)?;
-    let ino = store_ino(node_of(cx, target)?, Errno::EOPNOTSUPP)?;
+    let ino = writable_ino(cx, node_of(cx, target)?)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
     // 去掉程序文件的能力要 CAP_SETFCAP（cap_inode_removexattr）

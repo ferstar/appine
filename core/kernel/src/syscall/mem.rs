@@ -12,6 +12,7 @@ use crate::kernel::Cx;
 use crate::mm::flags;
 use crate::process::RLIMIT_MEMLOCK;
 use crate::vfs::dev::Device;
+use crate::vfs::ms;
 
 const PROT_MASK: u32 = prot::READ | prot::WRITE | prot::EXEC;
 /// `PROT_GROWSDOWN`、`PROT_GROWSUP`：只对栈有意义，按 Linux 的做法忽略。
@@ -86,6 +87,7 @@ pub(super) fn mmap(
     let mut deny_write = false;
     // 文件映射在 /proc/<pid>/maps 里显示的路径和 inode
     let mut label = None;
+    let mut deny_exec = false;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         None
     } else {
@@ -104,6 +106,18 @@ pub(super) fn mmap(
                 label = Some((f.path.clone(), *ino));
                 if shared_write && !f.writable() {
                     return Err(Errno::EACCES);
+                }
+                // noexec 的挂载里的文件不能映射成可执行的，以后也不能改成可执行
+                // （Linux 的 do_mmap 去掉 VM_MAYEXEC）
+                let noexec = f
+                    .node()
+                    .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
+                    .is_some_and(|m| m & ms::NOEXEC != 0);
+                if noexec {
+                    if prot & prot::EXEC != 0 {
+                        return Err(Errno::EPERM);
+                    }
+                    deny_exec = true;
                 }
                 // 封印了写入的 memfd 不能有可写的共享映射，以后也不能改成可写
                 let sealed = cx
@@ -154,6 +168,9 @@ pub(super) fn mmap(
     }
     if deny_write {
         cx.mm_mut().deny_write(start, len);
+    }
+    if deny_exec {
+        cx.mm_mut().deny_exec(start, len);
     }
     if flags & MAP_LOCKED != 0 {
         cx.mm_mut().set_locked(start, len, true)?;

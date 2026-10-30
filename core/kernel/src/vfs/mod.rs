@@ -3,10 +3,11 @@
 //! 根文件系统是 inode 仓库，`/dev` 里的设备节点也存在仓库里（[`dev`]）。procfs、
 //! devpts、sysfs 和 cgroup2 是合成文件系统：它们的内容来自内核状态，由内核层经由
 //! [`Pseudo`] 提供。开机时挂在 `/proc`、`/dev/pts`、`/sys`、`/sys/fs/cgroup` 上，之后
-//! 可以用 mount(2) 挂到别的目录上，也可以 bind 挂载它们里面的目录（[`Mount`]）；仓库里的
-//! 目录不能 bind，也没有 tmpfs。合成节点带着它所在的挂载，`..` 和 getcwd 经由挂载点回到
-//! 上一层。路径解析在整棵树里进行，符号链接最多跟随 40 层；经过的每个仓库目录都要有搜索
-//! 权限。进程的根目录可以被 chroot 换掉：绝对路径从它开始，`..` 不会越过它。
+//! 可以用 mount(2) 挂到别的目录上；仓库里的和合成文件系统里的目录、文件都可以 bind 挂载
+//! （[`Mount`]），没有 tmpfs。节点带着它所在的挂载（Linux 的 `struct path`），`..` 和
+//! getcwd 经由挂载点回到上一层，挂载的标志（只读、noexec 等）按经由的挂载算。路径解析在
+//! 整棵树里进行，符号链接最多跟随 40 层；经过的每个仓库目录都要有搜索权限。进程的根目录
+//! 可以被 chroot、pivot_root 换掉：绝对路径从它开始，`..` 不会越过它。
 
 pub mod dev;
 pub mod import;
@@ -27,19 +28,42 @@ pub(crate) const MAX_SYMLINKS: u32 = 40;
 /// 路径组件的最大长度（`NAME_MAX`）。
 const NAME_MAX: usize = 255;
 
-/// 文件系统树里的一个节点。
+/// 文件系统树里的一个节点和经由的挂载（Linux 的 `struct path`）：同一个目录挂在（bind 到）
+/// 两处时是两个节点，`..` 各自回到自己的挂载点。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Node {
     /// inode 仓库里的 inode。
-    Store(Ino),
-    /// 合成文件系统里的节点和经由的挂载（Linux 的 `struct path` 里的 vfsmount）：同一个
-    /// 节点挂在两处时是两个节点，`..` 各自回到自己的挂载点。
+    Store(MountId, Ino),
+    /// 合成文件系统里的节点。
     Pseudo(MountId, PseudoNode),
 }
 
 impl Node {
-    /// 根目录。
-    pub const ROOT: Node = Node::Store(ROOT);
+    /// 开机时的根目录。
+    pub const ROOT: Node = Node::Store(ROOT_MOUNT, ROOT);
+
+    /// 经由的挂载。
+    pub(crate) fn mnt(&self) -> MountId {
+        match self {
+            Node::Store(id, _) | Node::Pseudo(id, _) => *id,
+        }
+    }
+
+    /// 仓库里的 inode；合成文件系统里的节点是 None。
+    pub(crate) fn ino(&self) -> Option<Ino> {
+        match self {
+            Node::Store(_, ino) => Some(*ino),
+            Node::Pseudo(..) => None,
+        }
+    }
+
+    /// 同一个文件经由挂载 `id` 时的节点。
+    pub(crate) fn in_mount(self, id: MountId) -> Node {
+        match self {
+            Node::Store(_, ino) => Node::Store(id, ino),
+            Node::Pseudo(_, p) => Node::Pseudo(id, p),
+        }
+    }
 }
 
 /// 挂载的编号（mountinfo 的第一列、fdinfo 的 `mnt_id`）。
@@ -57,9 +81,11 @@ pub(crate) const ANON_MOUNT: MountId = 5;
 /// 开机时挂在 `/sys/fs/cgroup` 上的 cgroup2。
 pub(crate) const CGROUP_MOUNT: MountId = 6;
 
-/// 合成文件系统的种类。
+/// 文件系统的种类：inode 仓库和几种合成文件系统。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Fs {
+    /// inode 仓库（根文件系统）。
+    Store,
     /// procfs。
     Proc,
     /// devpts。
@@ -71,7 +97,7 @@ pub(crate) enum Fs {
 }
 
 impl Fs {
-    /// mount(2) 的文件系统类型（与 `/proc/filesystems` 里的名字相同）。
+    /// mount(2) 能新挂上的文件系统类型（与 `/proc/filesystems` 里的名字相同）。
     pub(crate) fn from_type(name: &[u8]) -> Option<Fs> {
         match name {
             b"proc" => Some(Fs::Proc),
@@ -85,6 +111,7 @@ impl Fs {
     /// 文件系统类型的名字。
     pub(crate) const fn type_name(self) -> &'static str {
         match self {
+            Fs::Store => "ext4",
             Fs::Proc => "proc",
             Fs::Pts => "devpts",
             Fs::Sys => "sysfs",
@@ -95,6 +122,7 @@ impl Fs {
     /// 开机时挂上的实例的设备号（stat 的 `st_dev`、mountinfo 的第三列）。
     pub(crate) const fn dev(self) -> u64 {
         match self {
+            Fs::Store => ROOT_DEV,
             Fs::Proc => 0x4,
             Fs::Pts => 0x18,
             Fs::Sys => 0x16,
@@ -120,8 +148,22 @@ impl Fs {
         match self {
             Fs::Pts => ",gid=5,mode=620,ptmxmode=000",
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
-            Fs::Proc | Fs::Sys => "",
+            Fs::Store | Fs::Proc | Fs::Sys => "",
         }
+    }
+
+    /// 文件系统的根目录（挂载编号是 0，挂上时换成新挂载的）。
+    pub(crate) fn root(self) -> Node {
+        Node::Pseudo(
+            0,
+            match self {
+                Fs::Store => return Node::Store(0, ROOT),
+                Fs::Proc => PseudoNode::ProcRoot,
+                Fs::Pts => PseudoNode::PtsRoot,
+                Fs::Sys => PseudoNode::SysRoot,
+                Fs::Cgroup => PseudoNode::Cgroup(b""),
+            },
+        )
     }
 }
 
@@ -145,18 +187,23 @@ pub(crate) const ROOT_FLAGS: u64 = ms::RELATIME;
 /// 根文件系统（inode 仓库）对外报告的设备号（8:1）。
 pub(crate) const ROOT_DEV: u64 = 0x801;
 
-/// 一个挂载（Linux 的 `struct mount`）：合成文件系统 `fs` 里的 `root` 出现在 `point` 上。
+/// 一个挂载（Linux 的 `struct mount`）：文件系统 `fs` 里的 `root` 出现在 `point` 上。
 #[derive(Debug, Clone)]
 pub(crate) struct Mount {
     pub id: MountId,
     pub fs: Fs,
-    /// 挂载看到的部分的根：文件系统的根目录，bind 挂载时是被 bind 的那个节点。
-    pub root: PseudoNode,
-    /// 挂载点：仓库里的目录（bind 挂载文件时是文件），或者别的挂载里的目录。
-    pub point: Node,
+    /// 挂载看到的部分的根（经由这个挂载的节点）：文件系统的根目录，bind 挂载时是被 bind
+    /// 的那个目录或文件。
+    pub root: Node,
+    /// 挂载点：别的挂载里的目录（bind 挂载文件时是文件）。挂载树的根（开机时是仓库，
+    /// pivot_root 之后是换上来的那个）和卸下了的挂载没有，Linux 上前者挂在看不到的
+    /// rootfs 上。
+    pub point: Option<Node>,
     /// 挂载点是仓库里的文件时，它所在的目录和名字：文件可能有几个链接，没有唯一的上级
     /// 目录，路径要按挂上时的这个算。
     pub at: Option<Dentry>,
+    /// bind 挂载仓库里的文件时，找到它的目录和名字（mountinfo 的第四列按它算）。
+    pub root_at: Option<Dentry>,
     /// [`ms`] 里的标志。
     pub flags: u64,
     /// 实例的设备号（[`Fs::own_dev`]）。
@@ -196,9 +243,14 @@ pub struct Vfs {
 }
 
 struct Mounts {
+    /// 挂在树上的挂载，按挂上的先后（mountinfo 的顺序）；第一个是挂载树的根，pivot_root
+    /// 之后不是了也不挪。
     list: Vec<Mount>,
-    /// 下一个挂载的编号。卸下的编号不再使用：卸下（`MNT_DETACH`）之后还开着的文件、
-    /// 当前目录仍然带着原来的编号，不能算到新的挂载上。
+    /// 卸下了、还有进程的根目录、当前目录或者打开的文件在里面的挂载（`MNT_DETACH`）：它们
+    /// 的节点照常能用，挂载的根没有上级（[`Vfs::collect`] 去掉没人用的）。
+    detached: Vec<Mount>,
+    /// 下一个挂载的编号。卸下的编号不再使用：卸下之后还开着的文件、当前目录仍然带着原来的
+    /// 编号，不能算到新的挂载上。
     next: MountId,
     /// 下一个新实例的设备号（0:48 起，避开 [`Fs::dev`] 和管道、socket 等用的）。
     next_dev: u64,
@@ -209,6 +261,9 @@ struct Mounts {
 pub(crate) struct Cached {
     meta: Arc<store::Meta>,
     mounts: Arc<[Ino]>,
+    /// 根文件系统的挂载（[`ROOT_MOUNT`]）还挂在树上、没有 nosymfollow：根目录、当前目录在
+    /// 它里面的线程才能不持 BKL 解析。
+    pub(crate) usable: bool,
 }
 
 impl Cached {
@@ -361,7 +416,18 @@ impl Vfs {
             ),
             (SYS_MOUNT, Fs::Sys, b"sys", flags, b"sysfs"),
         ];
-        let mut list = Vec::new();
+        let mut list = vec![Mount {
+            id: ROOT_MOUNT,
+            fs: Fs::Store,
+            root: Node::ROOT,
+            point: None,
+            at: None,
+            root_at: None,
+            flags: ROOT_FLAGS,
+            dev: ROOT_DEV,
+            source: b"appine".to_vec(),
+            expiring: false,
+        }];
         for (id, fs, path, flags, source) in boot {
             let mut ino = Some(ROOT);
             for name in path.split(|&b| b == b'/') {
@@ -371,9 +437,10 @@ impl Vfs {
                 Some(ino) if store.stat(ino)?.is_dir() => list.push(Mount {
                     id,
                     fs,
-                    root: crate::pseudo::root_of(fs),
-                    point: Node::Store(ino),
+                    root: fs.root().in_mount(id),
+                    point: Some(Node::Store(ROOT_MOUNT, ino)),
                     at: None,
+                    root_at: None,
                     flags,
                     dev: fs.dev(),
                     source: source.to_vec(),
@@ -387,9 +454,10 @@ impl Vfs {
             list.push(Mount {
                 id: CGROUP_MOUNT,
                 fs: Fs::Cgroup,
-                root: crate::pseudo::root_of(Fs::Cgroup),
-                point: Node::Pseudo(SYS_MOUNT, crate::pseudo::CGROUP_POINT),
+                root: Fs::Cgroup.root().in_mount(CGROUP_MOUNT),
+                point: Some(Node::Pseudo(SYS_MOUNT, crate::pseudo::CGROUP_POINT)),
                 at: None,
+                root_at: None,
                 flags: flags | ms::RDONLY,
                 dev: Fs::Cgroup.dev(),
                 source: b"cgroup".to_vec(),
@@ -398,12 +466,14 @@ impl Vfs {
         }
         let mounts = Mounts {
             list,
+            detached: Vec::new(),
             next: CGROUP_MOUNT + 1,
             next_dev: 0x30,
         };
         let cached = Cached {
             meta: store.meta().clone(),
             mounts: mounts.store_points(),
+            usable: mounts.fast_usable(),
         };
         Ok(Vfs {
             store,
@@ -438,13 +508,35 @@ impl Vfs {
 
     /// 节点上挂着东西时换成挂在上面的挂载的根；几个挂载叠在一起时一直换到最上面的
     /// （Linux 的 `follow_mount`）。
-    fn mounted(&self, node: Node) -> Node {
+    pub(crate) fn mounted(&self, node: Node) -> Node {
         let mounts = self.mounts.borrow();
         let mut node = node;
-        while let Some(m) = mounts.list.iter().rev().find(|m| m.point == node) {
-            node = Node::Pseudo(m.id, m.root.clone());
+        while let Some(m) = mounts
+            .list
+            .iter()
+            .rev()
+            .find(|m| m.point.as_ref() == Some(&node))
+        {
+            node = m.root.clone();
         }
         node
+    }
+
+    /// 对编号为 `id` 的挂载（挂在树上的或者卸下了的）做 `f`。
+    fn with_mount<T>(&self, id: MountId, f: impl FnOnce(&Mount) -> T) -> Option<T> {
+        let mounts = self.mounts.borrow();
+        mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .find(|m| m.id == id)
+            .map(f)
+    }
+
+    /// `node` 是它所在的挂载的根（挂在树上的和卸下了的都算）。
+    fn is_mount_root(&self, node: &Node) -> bool {
+        self.with_mount(node.mnt(), |m| m.root == *node)
+            .unwrap_or(false)
     }
 
     /// `node` 是一个挂载的根时，那个挂载的挂载点。
@@ -452,20 +544,20 @@ impl Vfs {
         self.root_point(node).map(|(point, _)| point)
     }
 
-    /// `node` 是一个挂载的根时，那个挂载的挂载点和 [`Mount::at`]。
+    /// `node` 是一个挂在树上、有挂载点的挂载的根时，挂载点和 [`Mount::at`]。
     fn root_point(&self, node: &Node) -> Option<(Node, Option<Dentry>)> {
-        let Node::Pseudo(id, p) = node else {
-            return None;
-        };
         let mounts = self.mounts.borrow();
-        let m = mounts.list.iter().find(|m| m.id == *id)?;
-        (m.root == *p).then(|| (m.point.clone(), m.at.clone()))
+        let m = mounts.list.iter().find(|m| m.id == node.mnt())?;
+        if m.root != *node {
+            return None;
+        }
+        Some((m.point.clone()?, m.at.clone()))
     }
 
     /// 节点的文件类型位。
     pub(crate) fn kind(&self, ps: &dyn Pseudo, node: &Node) -> Result<u32, Errno> {
         match node {
-            Node::Store(ino) => self.store.kind(*ino),
+            Node::Store(_, ino) => self.store.kind(*ino),
             Node::Pseudo(_, p) => ps.kind(p),
         }
     }
@@ -478,7 +570,9 @@ impl Vfs {
     /// 在目录里查找一个名字（不是 `.` 或 `..`）。
     fn lookup(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> Result<Node, Errno> {
         let child = match dir {
-            Node::Store(ino) => Node::Store(self.store.lookup(*ino, name)?.ok_or(Errno::ENOENT)?),
+            Node::Store(id, ino) => {
+                Node::Store(*id, self.store.lookup(*ino, name)?.ok_or(Errno::ENOENT)?)
+            }
             Node::Pseudo(id, p) => Node::Pseudo(*id, ps.lookup(p, name)?),
         };
         Ok(self.mounted(child))
@@ -493,10 +587,14 @@ impl Vfs {
         self.parent_in_fs(ps, &dir)
     }
 
-    /// 同一个文件系统里的上级目录。卸下了的挂载（`MNT_DETACH`）的根没有上级，是它自己。
+    /// 同一个挂载里的上级目录。挂载的根没有上级，是它自己：挂载树的根、卸下了的挂载
+    /// （`MNT_DETACH`）的根，bind 挂载里看不到被 bind 的目录外面。
     fn parent_in_fs(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
+        if self.is_mount_root(dir) {
+            return Ok(dir.clone());
+        }
         Ok(match dir {
-            Node::Store(ino) => Node::Store(self.store.parent(*ino)?),
+            Node::Store(id, ino) => Node::Store(*id, self.store.parent(*ino)?),
             Node::Pseudo(id, p) => ps.parent(p).map_or(dir.clone(), |up| Node::Pseudo(*id, up)),
         })
     }
@@ -517,10 +615,32 @@ impl Vfs {
         Ok(self.mounted(up))
     }
 
+    /// `node` 是 `top` 或者在它下面：经由挂载点往上找（Linux 的 `is_path_reachable`）。挂在
+    /// 文件上的挂载经由挂上时的目录。
+    pub(crate) fn is_under(&self, ps: &dyn Pseudo, node: &Node, top: &Node) -> bool {
+        let mut cur = node.clone();
+        loop {
+            if cur == *top {
+                return true;
+            }
+            if let Some((point, at)) = self.root_point(&cur) {
+                cur = match at {
+                    Some((dir, _)) if point != *top => dir,
+                    _ => point,
+                };
+                continue;
+            }
+            match self.parent_in_fs(ps, &cur) {
+                Ok(up) if up != cur => cur = up,
+                _ => return false,
+            }
+        }
+    }
+
     /// 符号链接的内容。
     pub(crate) fn readlink(&self, ps: &dyn Pseudo, node: &Node) -> Result<Vec<u8>, Errno> {
         match node {
-            Node::Store(ino) => self.store.readlink(*ino),
+            Node::Store(_, ino) => self.store.readlink(*ino),
             Node::Pseudo(_, p) => ps.readlink(p),
         }
     }
@@ -528,7 +648,7 @@ impl Vfs {
     /// 凭据为 `cred` 的进程能不能在目录 `dir` 里查找。合成文件系统的目录总是可以。
     fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
         match dir {
-            Node::Store(ino) if !cred.searches_all() => {
+            Node::Store(_, ino) if !cred.searches_all() => {
                 cred.permission(&self.store.stat(*ino)?, MAY_EXEC)
             }
             _ => Ok(()),
@@ -646,6 +766,13 @@ impl Vfs {
                 if links > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
                 }
+                // nosymfollow 的挂载里的符号链接（包括魔法链接）不跟随（Linux 的 pick_link）
+                if self
+                    .mount_flags(&node)
+                    .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
+                {
+                    return Err(Errno::ELOOP);
+                }
                 if let Node::Pseudo(id, p) = &node
                     && let Some(target) = ps.follow(*id, p)
                 {
@@ -741,16 +868,22 @@ impl Vfs {
                 }
                 continue;
             }
+            // 挂载树的根、卸下了的挂载的根
+            if self.is_mount_root(&cur) {
+                reached = false;
+                break;
+            }
             match cur {
-                Node::Store(ROOT) => {
+                // 改了名、不在挂载看到的部分里了
+                Node::Store(_, ROOT) => {
                     reached = false;
                     break;
                 }
-                Node::Store(ino) => {
+                Node::Store(id, ino) => {
                     let parent = self.store.parent(ino)?;
                     // 已被删除的目录找不到名字，与 Linux 一样报 ENOENT
                     names.push(self.store.name_of(parent, ino)?.ok_or(Errno::ENOENT)?);
-                    cur = Node::Store(parent);
+                    cur = Node::Store(id, parent);
                 }
                 Node::Pseudo(id, p) => match ps.parent(&p) {
                     Some(up) => {
@@ -776,14 +909,15 @@ impl Vfs {
         Ok((out, reached))
     }
 
-    // ---- 挂载表（mount(2)、umount2(2)、mountinfo）----
+    // ---- 挂载表（mount(2)、umount2(2)、pivot_root(2)、mountinfo）----
 
-    /// 挂载表，按挂上的先后。根文件系统（[`ROOT_MOUNT`]）不在里面。
+    /// 挂在树上的挂载，按挂上的先后。第一个是开机时的根文件系统（[`ROOT_MOUNT`]），
+    /// pivot_root 之后它可能挂在别处、卸下了。
     pub(crate) fn mounts(&self) -> Vec<Mount> {
         self.mounts.borrow().list.clone()
     }
 
-    /// 编号为 `id` 的挂载；卸下了的是 None。
+    /// 编号为 `id`、挂在树上的挂载；卸下了的是 None。
     pub(crate) fn mount(&self, id: MountId) -> Option<Mount> {
         self.mounts
             .borrow()
@@ -793,56 +927,110 @@ impl Vfs {
             .cloned()
     }
 
-    /// `node` 是一个挂载的根时，那个挂载的编号；仓库的根目录是 [`ROOT_MOUNT`] 的根。
+    /// `node` 是一个挂在树上的挂载的根时，那个挂载的编号。
     pub(crate) fn mount_root(&self, node: &Node) -> Option<MountId> {
-        match node {
-            Node::Store(ROOT) => Some(ROOT_MOUNT),
-            Node::Store(_) => None,
-            Node::Pseudo(id, _) => self.point_of(node).map(|_| *id),
-        }
+        let mounts = self.mounts.borrow();
+        mounts.list.iter().find(|m| m.root == *node).map(|m| m.id)
     }
 
-    /// 有挂载挂在 `node` 上（rmdir、rename、unlink 它是 EBUSY）。
-    pub(crate) fn is_mount_point(&self, node: &Node) -> bool {
-        self.mounts.borrow().list.iter().any(|m| m.point == *node)
+    /// 有挂载挂在 `node` 上。
+    #[cfg(test)]
+    fn is_mount_point(&self, node: &Node) -> bool {
+        self.mounts
+            .borrow()
+            .list
+            .iter()
+            .any(|m| m.point.as_ref() == Some(node))
     }
 
-    /// `node` 的设备号（stat 的 `st_dev`）。卸下了的挂载里的节点按开机时的实例算。
+    /// 仓库里的 `ino` 经由哪个挂载上面挂着东西都算（rmdir、rename、unlink 它是 EBUSY，Linux
+    /// 的 `is_local_mountpoint` 看的是目录项）。
+    pub(crate) fn is_store_point(&self, ino: Ino) -> bool {
+        self.mounts
+            .borrow()
+            .list
+            .iter()
+            .any(|m| matches!(m.point, Some(Node::Store(_, i)) if i == ino))
+    }
+
+    /// `node` 的设备号（stat 的 `st_dev`）：所在的挂载的；不知道是哪个挂载时按开机时的
+    /// 实例算。
     pub(crate) fn dev_of(&self, node: &Node) -> u64 {
-        match node {
-            Node::Store(_) => ROOT_DEV,
-            Node::Pseudo(id, p) => self
-                .mount(*id)
-                .map_or_else(|| crate::pseudo::fs_of(p).dev(), |m| m.dev),
-        }
+        self.with_mount(node.mnt(), |m| m.dev)
+            .unwrap_or_else(|| match node {
+                Node::Store(..) => ROOT_DEV,
+                Node::Pseudo(_, p) => crate::pseudo::fs_of(p).dev(),
+            })
     }
 
-    /// `node` 所在的挂载的标志；卸下了的挂载是 None。
+    /// `node` 所在的挂载的标志；不知道是哪个挂载时是 None。
     pub(crate) fn mount_flags(&self, node: &Node) -> Option<u64> {
-        match node {
-            Node::Store(_) => Some(ROOT_FLAGS),
-            Node::Pseudo(id, _) => self.mount(*id).map(|m| m.flags),
-        }
+        self.with_mount(node.mnt(), |m| m.flags)
     }
 
     /// `node` 在只读的挂载里（cgroup2 总是只读的）：改它是 EROFS。
     pub(crate) fn readonly(&self, node: &Node) -> bool {
-        match node {
-            Node::Store(_) => false,
-            Node::Pseudo(id, p) => {
-                crate::pseudo::fs_of(p) == Fs::Cgroup
-                    || self.mount(*id).is_some_and(|m| m.flags & ms::RDONLY != 0)
+        matches!(node, Node::Pseudo(_, p) if crate::pseudo::fs_of(p) == Fs::Cgroup)
+            || self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)
+    }
+
+    /// 挂载看到的部分在文件系统里的路径（mountinfo 的第四列：bind 挂载的是哪个目录、文件）。
+    pub(crate) fn root_path(&self, ps: &dyn Pseudo, m: &Mount) -> Vec<u8> {
+        match &m.root_at {
+            Some((dir, name)) => {
+                let mut p = self.fs_path(ps, dir);
+                if p != b"/" {
+                    p.push(b'/');
+                }
+                p.extend_from_slice(name);
+                p
             }
+            None => self.fs_path(ps, &m.root),
         }
     }
 
-    /// 挂上 `fs` 里的 `root`，返回新挂载的编号。`dev` 是 None 时另外分配一个设备号
-    /// （[`Fs::own_dev`]）；bind 挂载用源的。`point` 是仓库里的文件时，
-    /// `at` 是找到它的目录和名字（[`Mount::at`]）。
+    /// 目录在它的文件系统里的路径。
+    fn fs_path(&self, ps: &dyn Pseudo, node: &Node) -> Vec<u8> {
+        let mut names = Vec::new();
+        match node {
+            Node::Store(_, ino) => {
+                let mut cur = *ino;
+                while cur != ROOT {
+                    let Ok(up) = self.store.parent(cur) else {
+                        break;
+                    };
+                    match self.store.name_of(up, cur) {
+                        Ok(Some(name)) => names.push(name),
+                        _ => break,
+                    }
+                    cur = up;
+                }
+            }
+            Node::Pseudo(_, p) => {
+                let mut cur = p.clone();
+                while let Some(up) = ps.parent(&cur) {
+                    names.push(ps.name(&cur));
+                    cur = up;
+                }
+            }
+        }
+        if names.is_empty() {
+            return b"/".to_vec();
+        }
+        names
+            .iter()
+            .rev()
+            .flat_map(|n| [&b"/"[..], n].concat())
+            .collect()
+    }
+
+    /// 把文件系统 `fs` 里的 `root`（[`Fs::root`] 或者经由别的挂载的节点）挂到 `point` 上，
+    /// 返回新挂载的编号。`dev` 是 None 时另外分配一个设备号（[`Fs::own_dev`]）；bind 挂载
+    /// 用源的。`point` 是仓库里的文件时，`at` 是找到它的目录和名字（[`Mount::at`]）。
     pub(crate) fn add_mount(
         &self,
         fs: Fs,
-        root: PseudoNode,
+        root: Node,
         (point, at): (Node, Option<Dentry>),
         flags: u64,
         source: Vec<u8>,
@@ -855,13 +1043,14 @@ impl Vfs {
             mounts.next_dev += 1;
             mounts.next_dev - 1
         });
-        let at = at.filter(|_| matches!(point, Node::Store(_)));
+        let at = at.filter(|_| matches!(point, Node::Store(..)));
         mounts.list.push(Mount {
             id,
             fs,
-            root,
-            point,
+            root: root.in_mount(id),
+            point: Some(point),
             at,
+            root_at: None,
             flags: flags & ms::PER_MOUNT,
             dev,
             source,
@@ -878,24 +1067,67 @@ impl Vfs {
             .borrow()
             .list
             .iter()
-            .filter(|m| m.parent() == id)
+            .filter(|m| m.parent() == Some(id))
             .cloned()
             .collect()
     }
 
-    /// 卸下挂载 `id` 和挂在它里面的所有挂载（Linux 的 `umount_tree`）。
+    /// 卸下挂载 `id` 和挂在它里面的所有挂载（Linux 的 `umount_tree`）：它们都不再挂在
+    /// 别的挂载上，各自的根没有上级。
     pub(crate) fn remove_mount(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
         let mut gone = vec![id];
-        // 挂载总是挂在比它先挂上的挂载里，按先后找一遍就找全了
-        for m in &mounts.list {
-            if gone.contains(&m.parent()) {
-                gone.push(m.id);
-            }
+        let mut i = 0;
+        // MS_MOVE、pivot_root 之后挂载不一定挂在比它先挂上的挂载里，一层层找
+        while let Some(&parent) = gone.get(i) {
+            let inside = mounts.list.iter().filter(|m| m.parent() == Some(parent));
+            gone.extend(inside.map(|m| m.id).collect::<Vec<_>>());
+            i += 1;
         }
-        mounts.list.retain(|m| !gone.contains(&m.id));
+        let list = std::mem::take(&mut mounts.list);
+        let (out, keep): (Vec<_>, Vec<_>) = list.into_iter().partition(|m| gone.contains(&m.id));
+        mounts.list = keep;
+        for mut m in out {
+            m.point = None;
+            m.at = None;
+            mounts.detached.push(m);
+        }
         drop(mounts);
         self.mounts_changed();
+    }
+
+    /// 丢掉卸下了的、`in_use` 里没有的挂载（进程的根目录、当前目录和打开的文件都不在里面）。
+    pub(crate) fn collect(&self, in_use: &std::collections::HashSet<MountId>) {
+        self.mounts
+            .borrow_mut()
+            .detached
+            .retain(|m| in_use.contains(&m.id));
+    }
+
+    /// 把挂在树上的挂载 `id` 改挂到 `point` 上（`MS_MOVE`、pivot_root）；None 是挂成挂载树
+    /// 的根。
+    pub(crate) fn move_mount(&self, id: MountId, point: Option<(Node, Option<Dentry>)>) {
+        if let Some(m) = self
+            .mounts
+            .borrow_mut()
+            .list
+            .iter_mut()
+            .find(|m| m.id == id)
+        {
+            (m.point, m.at) = match point {
+                Some((p, at)) => {
+                    let at = at.filter(|_| matches!(p, Node::Store(..)));
+                    (Some(p), at)
+                }
+                None => (None, None),
+            };
+        }
+        self.mounts_changed();
+    }
+
+    /// 记下 bind 挂载的文件是在哪个目录里、叫什么名字找到的（[`Mount::root_at`]）。
+    pub(crate) fn set_root_at(&self, id: MountId, at: Option<Dentry>) {
+        self.update_mount(id, |m| m.root_at = at);
     }
 
     /// 改挂载 `id` 的标志、MNT_EXPIRE 的标记。
@@ -910,36 +1142,52 @@ impl Vfs {
             f(m);
             m.flags &= ms::PER_MOUNT;
         }
+        self.mounts_changed();
     }
 
     /// 挂载表变了：不持 BKL 解析路径用的挂载点跟着换（调用方另外让各线程重新取，
     /// [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)）。
     fn mounts_changed(&self) {
-        let points = self.mounts.borrow().store_points();
-        self.cached.borrow_mut().mounts = points;
+        let (points, usable) = {
+            let mounts = self.mounts.borrow();
+            (mounts.store_points(), mounts.fast_usable())
+        };
+        let mut cached = self.cached.borrow_mut();
+        cached.mounts = points;
+        cached.usable = usable;
     }
 }
 
 impl Mount {
-    /// 挂载点所在的挂载（mountinfo 的第二列）。
-    pub(crate) fn parent(&self) -> MountId {
-        match self.point {
-            Node::Store(_) => ROOT_MOUNT,
-            Node::Pseudo(id, _) => id,
-        }
+    /// 挂载点所在的挂载（mountinfo 的第二列）；挂载树的根、卸下了的没有。
+    pub(crate) fn parent(&self) -> Option<MountId> {
+        self.point.as_ref().map(Node::mnt)
     }
 }
 
 impl Mounts {
-    /// 仓库里的挂载点。
+    /// 仓库里的挂载点，不持 BKL 的解析遇到就交回正常的解析。开机时的根文件系统不是挂载树
+    /// 的根时（pivot_root 之后），它的根目录也算：`..` 要经由它的挂载点出去。
     fn store_points(&self) -> Arc<[Ino]> {
+        let top = self
+            .list
+            .iter()
+            .any(|m| m.id == ROOT_MOUNT && m.point.is_none());
         self.list
             .iter()
             .filter_map(|m| match m.point {
-                Node::Store(ino) => Some(ino),
-                Node::Pseudo(..) => None,
+                Some(Node::Store(_, ino)) => Some(ino),
+                _ => None,
             })
+            .chain((!top).then_some(ROOT))
             .collect()
+    }
+
+    /// 开机时的根文件系统还挂在树上、没有 nosymfollow：不持 BKL 的解析只在它里面走。
+    fn fast_usable(&self) -> bool {
+        self.list
+            .iter()
+            .any(|m| m.id == ROOT_MOUNT && m.flags & ms::NOSYMFOLLOW == 0)
     }
 }
 
@@ -1202,7 +1450,7 @@ mod tests {
         let cred = &Cred::root();
         let cached = vfs.cached();
         let usr = match vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true) {
-            Ok(Node::Store(ino)) => ino,
+            Ok(Node::Store(_, ino)) => ino,
             other => panic!("{other:?}"),
         };
         let paths: [&[u8]; 20] = [
@@ -1231,9 +1479,16 @@ mod tests {
             for cwd in [ROOT, usr] {
                 for p in paths {
                     let full = vfs
-                        .resolve(ps, cred, &Node::ROOT, &Node::Store(cwd), p, follow)
+                        .resolve(
+                            ps,
+                            cred,
+                            &Node::ROOT,
+                            &Node::Store(ROOT_MOUNT, cwd),
+                            p,
+                            follow,
+                        )
                         .and_then(|n| match n {
-                            Node::Store(ino) => vfs.store().stat(ino),
+                            Node::Store(_, ino) => vfs.store().stat(ino),
                             Node::Pseudo(..) => unreachable!(),
                         });
                     // 正常解析把要用的都填进了缓存，之后只用缓存也得到同样的结果
@@ -1253,7 +1508,7 @@ mod tests {
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin/sh", true), None);
         // 改了之后不会用到旧的条目
         let bin = match vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/bin", true) {
-            Ok(Node::Store(ino)) => ino,
+            Ok(Node::Store(_, ino)) => ino,
             other => panic!("{other:?}"),
         };
         vfs.store().unlink(bin, b"busybox").unwrap();
@@ -1277,7 +1532,7 @@ mod tests {
         // /usr/bin 上挂一个 procfs：进去是它的根，路径经由挂载点，`..` 回到 /usr
         let id = vfs.add_mount(
             Fs::Proc,
-            PseudoNode::ProcRoot,
+            Fs::Proc.root(),
             (ubin.clone(), None),
             0,
             b"p".to_vec(),
@@ -1313,7 +1568,7 @@ mod tests {
         // bind 挂载 procfs 里的 sys/：看到的是那个目录，`..` 回到挂载点的上级
         let b = vfs.add_mount(
             Fs::Proc,
-            SYS,
+            Node::Pseudo(0, SYS),
             (bin.clone(), None),
             0,
             b"p".to_vec(),
@@ -1336,7 +1591,7 @@ mod tests {
         // 叠在上面的挂载：最上面的那个可见，`..` 一层层回到挂载点
         let s = vfs.add_mount(
             Fs::Pts,
-            PseudoNode::PtsRoot,
+            Fs::Pts.root(),
             (top.clone(), None),
             0,
             b"d".to_vec(),
@@ -1358,14 +1613,14 @@ mod tests {
         // 不持 BKL 的解析把挂载点交给正常解析，当前目录的上级是挂载点时也是
         let cached = vfs.cached();
         let ino = |n: &Node| match n {
-            Node::Store(i) => *i,
+            Node::Store(_, i) => *i,
             Node::Pseudo(..) => unreachable!(),
         };
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin", true), None);
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin/../usr", true), None);
         let lib = vfs.store().mkdir(ino(&ubin), b"lib", 0o755, 0, 0).unwrap();
         assert_eq!(
-            r(&root, &Node::Store(lib), b"..").unwrap(),
+            r(&root, &Node::Store(ROOT_MOUNT, lib), b"..").unwrap(),
             r(&root, &root, b"/usr/bin").unwrap()
         );
         assert_eq!(cached.stat(ROOT, lib, b"..", true), None);
@@ -1389,16 +1644,111 @@ mod tests {
             Some(vfs.store().stat(ino(&ubin)))
         );
         // 卸下的编号不再使用
-        assert!(
-            vfs.add_mount(
-                Fs::Sys,
-                PseudoNode::SysRoot,
-                (usr, None),
-                0,
-                Vec::new(),
-                None
-            ) > s
+        assert!(vfs.add_mount(Fs::Sys, Fs::Sys.root(), (usr, None), 0, Vec::new(), None) > s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binds_store_directories() {
+        let (vfs, dir) = sample("binds");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let r = |root: &Node, cwd: &Node, p: &[u8]| vfs.resolve(ps, cred, root, cwd, p, true);
+        let root = Node::ROOT;
+        let usr = r(&root, &root, b"/usr").unwrap();
+        let ubin = r(&root, &root, b"/usr/bin").unwrap();
+        let bin = r(&root, &root, b"/bin").unwrap();
+        let busybox = r(&root, &root, b"/bin/busybox").unwrap();
+        let ino = |n: &Node| n.ino().unwrap();
+
+        // /usr bind 到 /bin 上：进去是经由新挂载的 /usr，`..` 回到挂载点的上级，路径经由挂载点
+        let id = vfs.add_mount(
+            Fs::Store,
+            usr.clone(),
+            (bin.clone(), None),
+            ms::RELATIME,
+            b"appine".to_vec(),
+            Some(ROOT_DEV),
         );
+        let top = Node::Store(id, ino(&usr));
+        assert_eq!(r(&root, &root, b"/bin").unwrap(), top);
+        let inner = r(&root, &root, b"/bin/bin").unwrap();
+        assert_eq!(inner, Node::Store(id, ino(&ubin)));
+        assert_ne!(inner, ubin);
+        assert_eq!(vfs.path_of(ps, &root, &inner).unwrap(), b"/bin/bin");
+        assert_eq!(vfs.path_of(ps, &root, &ubin).unwrap(), b"/usr/bin");
+        assert_eq!(r(&root, &inner, b"..").unwrap(), top);
+        assert_eq!(r(&root, &inner, b"../..").unwrap(), root);
+        assert_eq!(vfs.parent(ps, &top).unwrap(), root);
+        // 经由挂载的符号链接按挂载的路径解析：/bin/bin/rel 是 ../../bin/busybox，到了挂载的
+        // 根之后回到仓库的根，再进 /bin 就又是这个挂载
+        assert_eq!(
+            r(&root, &root, b"/bin/bin/rel"),
+            Err(Errno::ENOENT),
+            "/bin is now /usr, which has no busybox"
+        );
+        assert_eq!(vfs.mount_root(&top), Some(id));
+        assert_eq!(vfs.mount_root(&inner), None);
+        assert!(vfs.is_mount_point(&bin));
+        assert!(!vfs.is_mount_point(&Node::Store(id, ino(&bin))));
+        assert!(vfs.is_store_point(ino(&bin)));
+        assert_eq!(vfs.dev_of(&inner), ROOT_DEV);
+        assert_eq!(vfs.root_path(ps, &vfs.mount(id).unwrap()), b"/usr");
+        assert!(vfs.is_under(ps, &inner, &root));
+        assert!(vfs.is_under(ps, &inner, &top));
+        assert!(!vfs.is_under(ps, &inner, &usr));
+        // 根目录换成挂载里的目录：`..` 不越过它，外面的到不了
+        assert_eq!(r(&inner, &inner, b"/..").unwrap(), inner);
+        assert_eq!(
+            vfs.reach(ps, &inner, &top).unwrap(),
+            (b"/bin".to_vec(), false)
+        );
+
+        // 只读：标志按经由的挂载算
+        vfs.update_mount(id, |m| m.flags |= ms::RDONLY);
+        assert!(vfs.readonly(&inner));
+        assert!(!vfs.readonly(&ubin));
+
+        // 文件 bind 到文件上：路径按挂上时的目录和名字
+        let (f, at) = vfs
+            .walk(ps, cred, &root, &root, b"/usr/bin/env", false)
+            .unwrap();
+        let fb = vfs.add_mount(
+            Fs::Store,
+            busybox.clone(),
+            (f, at),
+            0,
+            Vec::new(),
+            Some(ROOT_DEV),
+        );
+        let bound = vfs
+            .walk(ps, cred, &root, &root, b"/usr/bin/env", false)
+            .unwrap();
+        assert_eq!(bound.0, Node::Store(fb, ino(&busybox)));
+        assert_eq!(vfs.path_of(ps, &root, &ubin).unwrap(), b"/usr/bin");
+        assert_eq!(
+            vfs.reach(ps, &root, &bound.0).unwrap(),
+            (b"/usr/bin/env".to_vec(), true)
+        );
+
+        // 改挂到 /proc 上：/bin 又是原来的目录
+        let proc_top = r(&root, &root, b"/proc").unwrap();
+        vfs.move_mount(id, Some((proc_top.clone(), None)));
+        assert_eq!(r(&root, &root, b"/bin").unwrap(), bin);
+        assert_eq!(r(&root, &root, b"/proc/bin").unwrap(), inner);
+        assert_eq!(vfs.path_of(ps, &root, &inner).unwrap(), b"/proc/bin");
+
+        // 卸下：里面的节点照常能用，挂载的根没有上级、到不了根目录；没人用了就丢掉记录
+        vfs.remove_mount(id);
+        assert_eq!(r(&root, &root, b"/proc").unwrap(), proc_top);
+        assert_eq!(r(&root, &inner, b"../../..").unwrap(), top);
+        assert_eq!(
+            vfs.reach(ps, &root, &inner).unwrap(),
+            (b"/bin".to_vec(), false)
+        );
+        assert!(vfs.readonly(&inner));
+        vfs.collect(&std::collections::HashSet::new());
+        assert!(!vfs.readonly(&inner));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

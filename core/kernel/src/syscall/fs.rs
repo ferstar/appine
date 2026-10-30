@@ -24,7 +24,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
 use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
-use crate::vfs::{Dentry, Fs, Node, Pseudo, Vfs, ms, normalize};
+use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, ROOT_MOUNT, Vfs, ms, normalize};
 
 pub(super) const AT_FDCWD: i32 = -100;
 pub(super) const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -203,28 +203,69 @@ fn lookup_at_or_fd(
     resolve_at(cx, cred, dirfd, path, follow)
 }
 
-/// 解析要新建或删除的路径：返回父目录和最后一个组件。只有仓库里的目录可以修改。
+/// 解析要新建或删除的路径：返回父目录经由的挂载、父目录和最后一个组件。只有仓库里的
+/// 目录可以修改；挂载是不是只读的由调用方按 Linux 的顺序检查。
 pub(super) fn parent_at<'p>(
     cx: &Cx<'_>,
     dirfd: i32,
     path: &'p [u8],
-) -> Result<(Ino, &'p [u8]), Errno> {
+) -> Result<(MountId, Ino, &'p [u8]), Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    Ok((store_ino(cx, &dir)?, name))
+    let (mnt, dir) = store_dir(&vfs, &dir)?;
+    Ok((mnt, dir, name))
 }
 
-/// 在目录 `dir` 里新建 `name` 之前的检查（`may_create`）：要能在目录里查找，名字
-/// 不存在，目录可写。返回目录的元数据。
-pub(super) fn may_create(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
+/// 要在里面新建、删除的目录：仓库里的；合成文件系统里的不能修改，在只读的挂载里
+/// （比如 cgroup2）是 EROFS。
+fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
+    match dir {
+        Node::Store(mnt, ino) => Ok((*mnt, *ino)),
+        Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
+        Node::Pseudo(..) => Err(Errno::EACCES),
+    }
+}
+
+/// 在目录 `dir` 里新建 `name` 之前对名字和挂载的检查（Linux 的 `filename_create`）：要能
+/// 在目录里查找，名字不存在，然后才是只读的挂载（EROFS）。返回目录的元数据。
+fn may_create_name(
+    vfs: &Vfs,
+    cred: &Cred,
+    (mnt, dir): (MountId, Ino),
+    name: &[u8],
+) -> Result<Stat, Errno> {
+    let store = vfs.store();
     let st = store.stat(dir)?;
     cred.permission(&st, MAY_EXEC)?;
     if store.lookup(dir, name)?.is_some() {
         return Err(Errno::EEXIST);
     }
+    if vfs.readonly(&Node::Store(mnt, dir)) {
+        return Err(Errno::EROFS);
+    }
+    Ok(st)
+}
+
+/// 在目录 `dir` 里新建 `name` 之前的检查（`may_create`）：[`may_create_name`]，再要求
+/// 目录可写。返回目录的元数据。
+pub(super) fn may_create(
+    vfs: &Vfs,
+    cred: &Cred,
+    dir: (MountId, Ino),
+    name: &[u8],
+) -> Result<Stat, Errno> {
+    let st = may_create_name(vfs, cred, dir, name)?;
     cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
     Ok(st)
+}
+
+/// 删除、改名之前：只读的挂载里是 EROFS（Linux 的 `mnt_want_write`，在查找名字之前）。
+fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
+    if vfs.readonly(&Node::Store(mnt, dir)) {
+        return Err(Errno::EROFS);
+    }
+    Ok(())
 }
 
 /// 要新建的不是目录、名字却以 `/` 结尾：已经存在时是 EEXIST，否则 ENOENT（与 Linux
@@ -248,23 +289,29 @@ fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat,
     Ok(victim)
 }
 
-/// fchmod、fchown 等作用的打开文件在仓库里的 inode：`O_PATH` 打开的文件不行。
+/// fchmod、fchown 等作用的打开文件在仓库里的 inode：`O_PATH` 打开的文件不行，只读的
+/// 挂载里是 EROFS（Linux 的 `mnt_want_write_file`）。
 fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
     if f.flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
-    f.ino().ok_or(Errno::EBADF)
+    let node = f.node().ok_or(Errno::EBADF)?;
+    let ino = node.ino().ok_or(Errno::EBADF)?;
+    if cx.vfs()?.readonly(&node) {
+        return Err(Errno::EROFS);
+    }
+    Ok(ino)
 }
 
-/// 仓库里的 inode；合成文件系统里的节点不能修改，在只读的挂载里（比如 cgroup2）是 EROFS。
+/// 要修改的仓库里的 inode：只读的挂载里（包括总是只读的 cgroup2）是 EROFS，合成文件系统
+/// 里别的节点不能修改。
 fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
-    match node {
-        Node::Store(ino) => Ok(*ino),
-        Node::Pseudo(..) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
-        Node::Pseudo(..) => Err(Errno::EACCES),
+    if cx.vfs()?.readonly(node) {
+        return Err(Errno::EROFS);
     }
+    node.ino().ok_or(Errno::EACCES)
 }
 
 /// 打开时记下的绝对路径（`/proc/<pid>/fd/<n>`、maps）：与 Linux 的 `d_path` 一样解析完
@@ -344,7 +391,7 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
 /// 节点的设备号按开机时的实例算（后来挂上的 procfs、devpts 实例另有设备号，[`Vfs::dev_of`]）。
 pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
     match (&f.kind, f.node()) {
-        (_, Some(Node::Store(ino))) => (ROOT_DEV, ino),
+        (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
         (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
         (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
         (_, Some(Node::Pseudo(_, p))) => (pseudo::fs_of(&p).dev(), pseudo::ino_of(&p)),
@@ -357,7 +404,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
     match node {
-        Node::Store(ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, ROOT_DEV)),
+        Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
         // 魔法链接指向的打开文件：报告那个文件本身
         Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
             let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
@@ -522,7 +569,7 @@ fn open_path(
                 if path.ends_with(b"/") || name == b"." || name == b".." {
                     return Err(Errno::EISDIR);
                 }
-                let dir = store_ino(cx, &dir)?;
+                let (mnt, dir) = store_dir(&vfs, &dir)?;
                 if let Some(ino) = vfs.store().lookup(dir, name)?
                     && follow
                     && vfs.store().attrs(ino)?.kind() == mode::S_IFLNK
@@ -532,16 +579,16 @@ fn open_path(
                         return Err(Errno::ELOOP);
                     }
                     path = vfs.store().readlink(ino)?;
-                    start = Node::Store(dir);
+                    start = Node::Store(mnt, dir);
                     continue;
                 }
-                let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+                let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
                 let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
                 let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
                 break (
-                    Node::Store(ino),
+                    Node::Store(mnt, ino),
                     Some(file),
-                    Some((Node::Store(dir), name.to_vec())),
+                    Some((Node::Store(mnt, dir), name.to_vec())),
                 );
             }
         }
@@ -550,10 +597,9 @@ fn open_path(
 
     let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
     let was_created = created.is_some();
-    let opened_ino = match &node {
-        Node::Store(ino) if flags & oflags::O_PATH == 0 => Some(*ino),
-        _ => None,
-    };
+    let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
+    // 仓库里的文件记下经由的挂载（[`OpenFile::mnt`]）
+    let store_mnt = node.ino().map(|_| node.mnt());
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
@@ -561,7 +607,7 @@ fn open_path(
         FileKind::Path(node)
     } else {
         match node {
-            Node::Store(ino) => {
+            Node::Store(mnt, ino) => {
                 // 刚建好的文件本来就是空的，不截断：ext4 把截断到 0 之后又写过的文件当成
                 // 整个替换，关闭时立即开始回写，比写本身还慢
                 let flags = if was_created {
@@ -569,7 +615,7 @@ fn open_path(
                 } else {
                     flags
                 };
-                open_store(cx, &cred, vfs.store(), ino, flags, created)?
+                open_store(cx, &cred, &vfs, (mnt, ino), flags, created)?
             }
             Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
         }
@@ -581,6 +627,9 @@ fn open_path(
     }
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
     let file = OpenFile::with_path(kind, flags & keep, display);
+    if let Some(mnt) = store_mnt {
+        file.borrow_mut().mnt = mnt;
+    }
     if let Some(ino) = opened_ino {
         open_events(cx, &file, ino, parent, was_created, flags);
     }
@@ -599,7 +648,7 @@ fn open_events(
 ) {
     let k = cx.kr();
     let parent = match parent {
-        Some((Node::Store(dir), name)) => Some((dir, name)),
+        Some((Node::Store(_, dir), name)) => Some((dir, name)),
         _ => None,
     };
     if inotify::active(k) {
@@ -660,7 +709,7 @@ pub(super) fn name_to_handle_at(
         flags,
         flags & AT_SYMLINK_FOLLOW != 0,
     )?;
-    let Node::Store(ino) = node else {
+    let Node::Store(mnt, ino) = node else {
         return Err(Errno::EOPNOTSUPP);
     };
     let room = u32::from_le_bytes(get(cx, handle)?);
@@ -677,8 +726,7 @@ pub(super) fn name_to_handle_at(
     b[4..8].copy_from_slice(&FILE_HANDLE_TYPE.to_le_bytes());
     b[8..].copy_from_slice(&ino.to_le_bytes());
     put(cx, handle, b)?;
-    // 根文件系统的挂载 id
-    put(cx, mount_id, 1i32.to_le_bytes())?;
+    put(cx, mount_id, (mnt as i32).to_le_bytes())?;
     Ok(0)
 }
 
@@ -692,9 +740,13 @@ pub(super) fn open_by_handle_at(
     if !cx.cred().capable(cap::DAC_READ_SEARCH) {
         return Err(Errno::EPERM);
     }
-    if mount_fd != AT_FDCWD {
-        cx.fds().get(mount_fd)?;
-    }
+    // 文件经由 mount_fd 所在的挂载打开
+    let mnt = if mount_fd == AT_FDCWD {
+        cx.cwd().mnt()
+    } else {
+        let file = cx.fds().get(mount_fd)?;
+        file.borrow().node().map_or(ROOT_MOUNT, |n| n.mnt())
+    };
     let b: [u8; 16] = get(cx, handle)?;
     let bytes = u32::from_le_bytes(b[..4].try_into().unwrap());
     if bytes == 0 || bytes > MAX_HANDLE_SZ {
@@ -712,12 +764,13 @@ pub(super) fn open_by_handle_at(
         if flags & oflags::O_DIRECTORY != 0 && !st.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        FileKind::Path(Node::Store(ino))
+        FileKind::Path(Node::Store(mnt, ino))
     } else {
-        open_store(cx, &cx.cred(), vfs.store(), ino, flags, None)?
+        open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, None)?
     };
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
     let file = OpenFile::new(kind, flags & keep);
+    file.borrow_mut().mnt = mnt;
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)
         .map(|fd| fd as u64)
@@ -757,31 +810,50 @@ fn open_mask(flags: u32) -> u32 {
     }
 }
 
-/// 打开仓库里的 inode。刚刚由这次 open 新建的文件（`created`）不检查权限。
+/// 打开经由挂载 `mnt` 的仓库里的 inode。刚刚由这次 open 新建的文件（`created`）不检查
+/// 权限。
 fn open_store(
     cx: &mut Cx<'_>,
     cred: &Cred,
-    store: &Store,
-    ino: Ino,
+    vfs: &Vfs,
+    (mnt, ino): (MountId, Ino),
     flags: u32,
     created: Option<std::fs::File>,
 ) -> Result<FileKind, Errno> {
+    let store = vfs.store();
     let accmode = flags & oflags::O_ACCMODE;
     // 只用到类型、权限、属主和设备号，不必向宿主 stat object
     let st = store.attrs(ino)?;
     if created.is_none() {
+        let mnt_flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
+        let readonly = mnt_flags & ms::RDONLY != 0;
         let mut mask = open_mask(flags);
         match st.kind() {
             mode::S_IFLNK => return Err(Errno::ELOOP),
             mode::S_IFDIR if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 => {
                 return Err(Errno::EISDIR);
             }
-            mode::S_IFREG if flags & oflags::O_TRUNC != 0 => mask |= MAY_WRITE,
+            // 截断：只读的挂载里先是 EROFS（Linux 的 do_open 在 may_open 之前）
+            mode::S_IFREG if flags & oflags::O_TRUNC != 0 => {
+                if readonly {
+                    return Err(Errno::EROFS);
+                }
+                mask |= MAY_WRITE;
+            }
+            // nodev 的挂载里的设备节点打不开（may_open_dev）
+            mode::S_IFCHR | mode::S_IFBLK if mnt_flags & ms::NODEV != 0 => {
+                return Err(Errno::EACCES);
+            }
             _ => {}
         }
         cred.permission(&st, mask)?;
         if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
             return Err(Errno::EPERM);
+        }
+        // 只读的挂载里写方式打开普通文件是 EROFS；设备、FIFO 照常（do_dentry_open 不管
+        // special_file）
+        if readonly && st.kind() == mode::S_IFREG && accmode != oflags::O_RDONLY {
+            return Err(Errno::EROFS);
         }
     }
     Ok(match st.kind() {
@@ -791,7 +863,7 @@ fn open_store(
                 return Err(Errno::EISDIR);
             }
             FileKind::Directory {
-                node: Node::Store(ino),
+                node: Node::Store(mnt, ino),
                 entries: None,
                 process: None,
             }
@@ -1014,8 +1086,9 @@ fn reopen(
                 ))
         }
         .map_err(host_errno)?;
+        let mnt = f.mnt;
         drop(f);
-        return open_store(cx, cred, vfs.store(), ino, flags, Some(new));
+        return open_store(cx, cred, vfs, (mnt, ino), flags, Some(new));
     }
     match &f.kind {
         FileKind::Pipe(end) => Ok(FileKind::Pipe(PipeEnd::open(
@@ -1635,7 +1708,16 @@ pub(super) fn faccessat(
         ..Stat::default()
     };
     // R_OK、W_OK、X_OK 与 MAY_READ、MAY_WRITE、MAY_EXEC 的取值相同
-    cred.permission(&st, amode).map(|()| 0)
+    cred.permission(&st, amode)?;
+    // 只读的挂载里的普通文件、目录、符号链接问能不能写是 EROFS（在权限之后）
+    let special = !matches!(
+        st.mode & mode::S_IFMT,
+        mode::S_IFREG | mode::S_IFDIR | mode::S_IFLNK
+    );
+    if amode & MAY_WRITE != 0 && !special && cx.vfs()?.readonly(&node) {
+        return Err(Errno::EROFS);
+    }
+    Ok(0)
 }
 
 pub(super) fn chdir(cx: &mut Cx<'_>, path: u64) -> SysResult {
@@ -1659,7 +1741,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::ENOTDIR);
     }
     let cred = cx.cred();
-    if let Node::Store(ino) = node {
+    if let Node::Store(_, ino) = node {
         cred.permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
     }
     if !cred.capable(cap::SYS_CHROOT) {
@@ -1676,7 +1758,7 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
     if !vfs.is_dir(&cx.view(&vfs), &node)? {
         return Err(Errno::ENOTDIR);
     }
-    if let Node::Store(ino) = node {
+    if let Node::Store(_, ino) = node {
         cx.cred().permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
     }
     cx.t.fs.borrow_mut().cwd = node;
@@ -1882,9 +1964,10 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     let vfs = cx.vfs()?;
     let flags = vfs.mount_flags(node).unwrap_or(0);
     Ok(match node {
-        Node::Store(_) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
+        Node::Store(..) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
         Node::Pseudo(_, p) => {
             let magic = match pseudo::fs_of(p) {
+                Fs::Store => EXT4_SUPER_MAGIC,
                 Fs::Proc => PROC_SUPER_MAGIC,
                 Fs::Pts => DEVPTS_SUPER_MAGIC,
                 Fs::Sys => SYSFS_MAGIC,
@@ -1927,13 +2010,13 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
 
 pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
-    let (dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
     let vfs = cx.vfs()?;
     let cred = cx.cred();
-    let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+    let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, true);
     vfs.store().mkdir(dir, name, perm, uid, gid)?;
     inotify::dir_event(
@@ -1954,7 +2037,7 @@ pub(super) fn mknodat(
     dev: u64,
 ) -> SysResult {
     let path = read_path(cx, path)?;
-    let (dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -1967,7 +2050,7 @@ pub(super) fn mknodat(
     let vfs = cx.vfs()?;
     let cred = cx.cred();
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
-    let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+    let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !cred.capable(cap::MKNOD) {
         return Err(Errno::EPERM);
     }
@@ -1991,7 +2074,7 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
 }
 
 fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), Errno> {
-    let (dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
     let store_vfs = cx.vfs()?;
     let store = store_vfs.store();
     let cred = cx.cred();
@@ -2006,6 +2089,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
             b"." => return Err(Errno::EINVAL),
             b".." => return Err(Errno::ENOTEMPTY),
             _ => {
+                writable_dir(&store_vfs, (mnt, dir))?;
                 may_delete(store, &cred, dir, name)?;
                 not_mount_point(&store_vfs, dir, name)?;
                 store.rmdir(dir, name)?;
@@ -2020,6 +2104,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         if name == b"." || name == b".." {
             return Err(Errno::EISDIR);
         }
+        writable_dir(&store_vfs, (mnt, dir))?;
         // 以 / 结尾的名字只能是目录：是目录时 EISDIR，否则 ENOTDIR
         if path.ends_with(b"/") {
             let ino = store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
@@ -2040,11 +2125,11 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
     Ok(())
 }
 
-/// 删除、改名之前：目录 `dir` 里的 `name` 上挂着东西时是 EBUSY（Linux 的
-/// `is_local_mountpoint`）。
+/// 删除、改名之前：目录 `dir` 里的 `name` 上（经由哪个挂载都算）挂着东西时是 EBUSY
+/// （Linux 的 `is_local_mountpoint`）。
 fn not_mount_point(vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<(), Errno> {
     match vfs.store().lookup(dir, name)? {
-        Some(ino) if vfs.is_mount_point(&Node::Store(ino)) => Err(Errno::EBUSY),
+        Some(ino) if vfs.is_store_point(ino) => Err(Errno::EBUSY),
         _ => Ok(()),
     }
 }
@@ -2065,14 +2150,14 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
         return Err(Errno::ENOENT);
     }
     let path = read_path(cx, path)?;
-    let (dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
     let vfs = cx.vfs()?;
     let cred = cx.cred();
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
-    let dir_st = may_create(vfs.store(), &cred, dir, name)?;
+    let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
     vfs.store().symlink(dir, name, &target, uid, gid)?;
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
@@ -2105,14 +2190,20 @@ pub(super) fn linkat(
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &newpath)?;
     // 合成文件系统是另一个"设备"：跨设备不能建硬链接
-    let (Node::Store(src), Node::Store(dir)) = (src, dir) else {
+    let (Node::Store(src_mnt, src), Node::Store(mnt, dir)) = (src, dir) else {
         return Err(Errno::EXDEV);
     };
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
     reject_trailing_slash(vfs.store(), dir, name, &newpath)?;
-    may_create(vfs.store(), &cred, dir, name)?;
+    // 两边经由不同的挂载（同一个文件系统 bind 到两处也是）是 EXDEV，在名字已经存在、
+    // 只读的挂载之后，在目录可写之前（Linux 的 do_linkat）
+    let dir_st = may_create_name(&vfs, &cred, (mnt, dir), name)?;
+    if src_mnt != mnt {
+        return Err(Errno::EXDEV);
+    }
+    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
     vfs.store().link(dir, name, src)?;
     inotify::path_event(cx.kr(), src, None, inotify::IN_ATTRIB);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
@@ -2134,8 +2225,12 @@ pub(super) fn renameat2(
     }
     let oldpath = read_path(cx, oldpath)?;
     let newpath = read_path(cx, newpath)?;
-    let (old_dir, old_name) = parent_at(cx, olddirfd, &oldpath)?;
-    let (new_dir, new_name) = parent_at(cx, newdirfd, &newpath)?;
+    let (old_mnt, old_dir, old_name) = parent_at(cx, olddirfd, &oldpath)?;
+    let (new_mnt, new_dir, new_name) = parent_at(cx, newdirfd, &newpath)?;
+    // 两边经由不同的挂载是 EXDEV，然后才看 `.`、`..` 和只读的挂载（Linux 的 do_renameat2）
+    if old_mnt != new_mnt {
+        return Err(Errno::EXDEV);
+    }
     if [old_name, new_name]
         .iter()
         .any(|n| *n == b"." || *n == b"..")
@@ -2143,6 +2238,7 @@ pub(super) fn renameat2(
         return Err(Errno::EBUSY);
     }
     let vfs = cx.vfs()?;
+    writable_dir(&vfs, (old_mnt, old_dir))?;
     // 任何一边以 / 结尾，被移动的就必须是目录
     if (oldpath.ends_with(b"/") || newpath.ends_with(b"/"))
         && let Some(src) = vfs.store().lookup(old_dir, old_name)?
@@ -2828,7 +2924,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         let vfs = cx.vfs()?;
         let view = cx.view(&vfs);
         let ino_of = |n: &Node| match n {
-            Node::Store(i) => *i,
+            Node::Store(_, i) => *i,
             Node::Pseudo(_, p) => pseudo::node_ino(view.k, p),
         };
         let parent = vfs.parent(&view, node)?;
@@ -2845,7 +2941,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
             },
         ];
         match node {
-            Node::Store(ino) => list.extend(vfs.store().readdir(*ino)?),
+            Node::Store(_, ino) => list.extend(vfs.store().readdir(*ino)?),
             Node::Pseudo(_, p) => list.extend(pseudo::readdir(&view, p)?),
         }
         *entries = Some(list);

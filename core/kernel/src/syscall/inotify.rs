@@ -136,7 +136,7 @@ impl Drop for Inotify {
         user.0 = user.0.saturating_sub(1);
         user.1 = user.1.saturating_sub(self.watches.len());
         for w in self.watches.values() {
-            if let Node::Store(ino) = w.node
+            if let Node::Store(_, ino) = w.node
                 && let Some(list) = r.by_ino.get_mut(&ino)
             {
                 // 正在析构的实例已经没有强引用，指向它的弱引用都失效了
@@ -172,14 +172,14 @@ impl Inotify {
         for (wd, w) in &self.watches {
             let (ino, sdev) = match &w.node {
                 // 内核内部的设备号编码：(主 << 20) | 次，仓库是 8:1，procfs 是 0:4
-                Node::Store(ino) => (*ino, 0x80_0001),
+                Node::Store(_, ino) => (*ino, 0x80_0001),
                 Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
             };
             out += &format!(
                 "inotify wd:{wd:x} ino:{ino:x} sdev:{sdev:x} mask:{:x} ignored_mask:0",
                 w.mask
             );
-            if let Node::Store(ino) = w.node {
+            if let Node::Store(_, ino) = w.node {
                 let handle: String = ino
                     .to_le_bytes()
                     .iter()
@@ -397,7 +397,7 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
     let (ino, mask) = match &f.kind {
         FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => (*ino, mask),
         FileKind::Directory {
-            node: Node::Store(ino),
+            node: Node::Store(_, ino),
             ..
         } => (*ino, mask | IN_ISDIR),
         _ => return,
@@ -431,7 +431,7 @@ pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -
     let ino = match &f.kind {
         FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => *ino,
         FileKind::Directory {
-            node: Node::Store(ino),
+            node: Node::Store(_, ino),
             ..
         } => *ino,
         _ => return None,
@@ -534,7 +534,7 @@ pub(crate) fn watched_parent(
         .walk(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path, follow)
         .ok()?;
     match found? {
-        (Node::Store(dir), name) => Some((dir, name)),
+        (Node::Store(_, dir), name) => Some((dir, name)),
         _ => None,
     }
 }
@@ -584,7 +584,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     if mask & IN_ONLYDIR != 0 && !vfs.is_dir(&view, &node)? {
         return Err(Errno::ENOTDIR);
     }
-    if let Node::Store(ino) = node {
+    if let Node::Store(_, ino) = node {
         cx.cred().permission(&vfs.store().stat(ino)?, MAY_READ)?;
     }
     let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
@@ -617,7 +617,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
             mask: mask & keep,
         },
     );
-    if let Node::Store(ino) = node {
+    if let Node::Store(_, ino) = node {
         r.vfs = Rc::downgrade(&vfs);
         r.by_ino
             .entry(ino)
@@ -634,7 +634,7 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     i.push(wd, IN_IGNORED, 0, b"");
     let mut r = cx.kr().inotify.borrow_mut();
     r.uncharge(i.uid);
-    if let Node::Store(ino) = w.node
+    if let Node::Store(_, ino) = w.node
         && let Some(list) = r.by_ino.get_mut(&ino)
     {
         list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
@@ -703,7 +703,7 @@ mod tests {
         inotify.watches.insert(
             wd,
             Watch {
-                node: Node::Store(ino),
+                node: Node::Store(crate::vfs::ROOT_MOUNT, ino),
                 mask,
             },
         );
@@ -770,7 +770,10 @@ mod tests {
         let i = Rc::new(RefCell::new(Inotify::default()));
         let wd = watch(&mut registry.borrow_mut(), &i, 7, IN_ALL_EVENTS);
         let open = || {
-            let file = OpenFile::new(FileKind::Path(Node::Store(7)), oflags::O_RDONLY);
+            let file = OpenFile::new(
+                FileKind::Path(Node::Store(crate::vfs::ROOT_MOUNT, 7)),
+                oflags::O_RDONLY,
+            );
             file.borrow_mut().watch = Some(Opened {
                 registry: Rc::downgrade(&registry),
                 ino: 7,

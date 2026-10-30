@@ -187,10 +187,7 @@ impl Machine {
                     vfs.resolve(&offline, &Cred::root(), &Node::ROOT, &Node::ROOT, p, true)
                         .ok()
                 })
-                .and_then(|n| match n {
-                    Node::Store(ino) => Some(ino),
-                    Node::Pseudo(..) => None,
-                })
+                .and_then(|n| n.ino())
                 .unwrap_or(0)
         };
         let root = Node::ROOT;

@@ -514,10 +514,7 @@ pub(crate) fn interp_label(
     let name = vfs
         .found_path(ps, root, &node, found.as_ref())
         .unwrap_or_else(|_| path.clone());
-    let ino = match node {
-        Node::Store(ino) => ino,
-        Node::Pseudo(..) => 0,
-    };
+    let ino = node.ino().unwrap_or(0);
     Some((Rc::from(name), ino))
 }
 
@@ -611,7 +608,7 @@ fn exec(
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         vfs.resolve(&view, &cred, &root, &start, &path, follow)?
     };
-    let (mut file, mut st) = process::open_node(&vfs, &cred, &node)?;
+    let (mut file, mut st, mut nosuid) = process::open_node(&vfs, &cred, &node)?;
 
     // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
     let mut file_path = filename.clone();
@@ -631,7 +628,7 @@ fn exec(
         new_argv.push(file_path);
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
-        (file, st) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
+        (file, st, nosuid) = process::open_executable(&vfs, &view, &cred, &root, &cwd, &interp)?;
         exe_at = (cwd.clone(), interp.clone());
         file_path = interp;
     }
@@ -653,11 +650,15 @@ fn exec(
         }
     };
 
-    // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后不再生效）和程序文件的能力；脚本看的
-    // 是解释器。被没有 CAP_SYS_PTRACE 的跟踪者跟踪着时得不到新的特权
+    // setuid、setgid 程序（`PR_SET_NO_NEW_PRIVS` 之后、nosuid 的挂载里不生效）和程序文件的
+    // 能力；脚本看的是解释器。被没有 CAP_SYS_PTRACE 的跟踪者跟踪着时得不到新的特权
     let no_new_privs = cx.t.group.borrow().no_new_privs;
-    let setid = |bit: u32| st.mode & bit == bit && !no_new_privs;
-    let fcaps = file_caps(&vfs, st.ino)?;
+    let setid = |bit: u32| st.mode & bit == bit && !no_new_privs && !nosuid;
+    let fcaps = if nosuid {
+        None
+    } else {
+        file_caps(&vfs, st.ino)?
+    };
     let ptraced = {
         let t = cx.task.trace.borrow();
         t.tracer.is_some() && !t.privileged

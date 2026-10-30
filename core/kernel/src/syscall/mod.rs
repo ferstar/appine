@@ -217,6 +217,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         38 => fs::renameat2(cx, a[0] as i32, a[1], a[2] as i32, a[3], 0),
         39 => mount::umount2(cx, a[0], a[1] as u32),
         40 => mount::mount(cx, a[0], a[1], a[2], a[3], a[4]),
+        41 => mount::pivot_root(cx, a[0], a[1]),
         43 => fs::statfs(cx, a[0], a[1]),
         44 => fs::fstatfs(cx, a[0] as i32, a[1]),
         45 => fs::truncate(cx, a[0], a[1] as i64),

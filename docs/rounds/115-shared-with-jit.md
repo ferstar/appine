@@ -1,6 +1,6 @@
 # M9 之前：有 JIT 代码的进程也共用翻译（2026-10-30）
 
-← [M9 之前：跳到未对齐的地址（2026-10-30）](114-unaligned-branch.md) · [索引](../milestones.md)
+← [M9 之前：跳到未对齐的地址（2026-10-30）](114-unaligned-branch.md) · [索引](../milestones.md) · [M9 之前：仓库里的目录 bind（2026-10-30）](116-store-binds.md) →
 
 [同一个程序共用翻译](108-shared-translation.md)的推迟项：组里的成员一映射可写可执行的内存（JIT）就离开组，只剩它一个时组就关掉，所以几个 node 进程各翻译一份。
 

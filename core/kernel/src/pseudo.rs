@@ -510,16 +510,6 @@ impl Pseudo for Offline {
     }
 }
 
-/// 文件系统的根目录。
-pub(crate) fn root_of(fs: Fs) -> PseudoNode {
-    match fs {
-        Fs::Proc => PseudoNode::ProcRoot,
-        Fs::Pts => PseudoNode::PtsRoot,
-        Fs::Sys => PseudoNode::SysRoot,
-        Fs::Cgroup => PseudoNode::Cgroup(b""),
-    }
-}
-
 /// 节点所在的文件系统。
 pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     match node {
@@ -848,13 +838,9 @@ impl Pseudo for View<'_> {
             {
                 Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd))
             }
-            FileKind::Regular { ino, .. }
-            | FileKind::Device { ino, .. }
-            | FileKind::Directory {
-                node: Node::Store(ino),
-                ..
+            FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
+                Node::Store(f.mnt, *ino)
             }
-            | FileKind::Path(Node::Store(ino)) => Node::Store(*ino),
             FileKind::Directory { node, .. } | FileKind::Path(node) => node.clone(),
             FileKind::Proc { mnt, node, .. } => Node::Pseudo(*mnt, node.clone()),
             // 从设备不记得是经由哪个 devpts 挂载打开的，当作开机时的那个
@@ -1722,7 +1708,7 @@ fn vm_flags(r: &Region) -> String {
         (r.shared, "sh"),
         (true, "mr"),
         (r.may_write, "mw"),
-        (true, "me"),
+        (r.may_exec, "me"),
         (r.shared, "ms"),
         (r.name.as_deref() == Some(b"[stack]"), "gd"),
         (r.locked, "lo"),
@@ -1850,29 +1836,16 @@ fn mounts(ps: &View<'_>, root: &Node, info: bool) -> Vec<u8> {
         _ => None,
     };
     let mut out = Vec::new();
-    if let Some(point) = visible(&Node::ROOT) {
-        MountLine {
-            id: crate::vfs::ROOT_MOUNT,
-            parent: crate::vfs::ROOT_MOUNT,
-            dev: crate::vfs::ROOT_DEV,
-            fs_root: b"/".to_vec(),
-            point,
-            flags: crate::vfs::ROOT_FLAGS,
-            fstype: "ext4",
-            source: b"appine",
-            options: "",
-        }
-        .write(&mut out, info);
-    }
     for m in ps.vfs.mounts() {
-        let Some(point) = visible(&Node::Pseudo(m.id, m.root.clone())) else {
+        let Some(point) = visible(&m.root) else {
             continue;
         };
         MountLine {
             id: m.id,
-            parent: m.parent(),
+            // 挂载树的根挂在看不到的 rootfs 上（Linux 上它的编号不在列表里），写 0
+            parent: m.parent().unwrap_or(0),
             dev: m.dev,
-            fs_root: fs_path(ps, &m.root),
+            fs_root: ps.vfs.root_path(ps, &m),
             point,
             flags: m.flags,
             fstype: m.fs.type_name(),
@@ -1944,24 +1917,6 @@ fn mount_options(flags: u64) -> String {
         }
     }
     s
-}
-
-/// 节点在它的文件系统里的路径（mountinfo 的第四列：bind 挂载的是哪个目录）。
-fn fs_path(ps: &View<'_>, node: &PseudoNode) -> Vec<u8> {
-    let mut names = Vec::new();
-    let mut cur = node.clone();
-    while let Some(up) = ps.parent(&cur) {
-        names.push(ps.name(&cur));
-        cur = up;
-    }
-    if names.is_empty() {
-        return b"/".to_vec();
-    }
-    names
-        .iter()
-        .rev()
-        .flat_map(|n| [&b"/"[..], n].concat())
-        .collect()
 }
 
 /// 与 Linux 的 `mangle` 一样，把空格、制表符、换行和反斜杠写成八进制的转义。
@@ -2577,11 +2532,7 @@ fn fdinfo(ps: &View<'_>, pid: Tid, fd: i32) -> Result<String, Errno> {
         0
     };
     let f = file.borrow();
-    let mnt_id = match f.node() {
-        Some(Node::Store(_)) => crate::vfs::ROOT_MOUNT,
-        Some(Node::Pseudo(id, _)) => id,
-        None => crate::vfs::ANON_MOUNT,
-    };
+    let mnt_id = f.node().map_or(crate::vfs::ANON_MOUNT, |n| n.mnt());
     let mut s = format!(
         "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{mnt_id}\nino:\t{}\n",
         f.pos,

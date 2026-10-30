@@ -46,7 +46,7 @@ use crate::futex::{Enqueued, Key};
 use crate::kernel::{Shared, Tid};
 use crate::task::{Task, TaskState};
 use crate::vfs::store::{Ino, Stat};
-use crate::vfs::{Cached, Node};
+use crate::vfs::{Cached, Node, ROOT_MOUNT};
 
 /// 线程为不持 BKL 的系统调用记下的状态。
 pub(crate) struct Fast {
@@ -70,7 +70,7 @@ pub(crate) struct Fast {
 struct Paths {
     vfs: Cached,
     root: Ino,
-    /// 当前目录不在仓库里（在 `/proc` 里）时是 None。
+    /// 当前目录不在开机时的根文件系统里（在 `/proc` 里、bind 挂载里）时是 None。
     cwd: Option<Ino>,
 }
 
@@ -79,14 +79,16 @@ impl Fast {
     pub(crate) fn new(shared: &Shared, task: &Task, t: &TaskState) -> Fast {
         let epoch = shared.fast_epoch();
         let fs = t.fs.borrow();
+        // 只在开机时的根文件系统里解析：别的挂载里 `..` 要经由挂载点
         let paths = match (&t.vfs, &fs.root) {
-            (Some(vfs), &Node::Store(root)) if t.group.borrow().cred.searches_all() => {
-                Some(Paths {
-                    vfs: vfs.cached().clone(),
+            (Some(vfs), &Node::Store(ROOT_MOUNT, root)) if t.group.borrow().cred.searches_all() => {
+                let vfs = vfs.cached();
+                vfs.usable.then(|| Paths {
+                    vfs,
                     root,
                     cwd: match fs.cwd {
-                        Node::Store(ino) => Some(ino),
-                        Node::Pseudo(..) => None,
+                        Node::Store(ROOT_MOUNT, ino) => Some(ino),
+                        _ => None,
                     },
                 })
             }

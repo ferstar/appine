@@ -253,7 +253,10 @@ mod tests {
     fn closing_any_fd_releases_the_posix_locks() {
         let a = Rc::new(RefCell::new(FdTable::new()));
         let mut l = Locks::default();
-        let file = OpenFile::new(FileKind::Path(crate::vfs::Node::Store(7)), 0);
+        let file = OpenFile::new(
+            FileKind::Path(crate::vfs::Node::Store(crate::vfs::ROOT_MOUNT, 7)),
+            0,
+        );
         l.set(7, lock(&owner(&a), 0, 10, true), false);
         l.closed(&a, &[file]);
         assert!(ranges(&l, 7).is_empty());

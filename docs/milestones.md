@@ -124,6 +124,7 @@
 | [M9 之前：Go 换一组被占用的寄存器](rounds/113-go-registers.md) | 2026-10-30 | Go 的编译器固定用 Tier 1 占用的 x16、x26–x28（原生的 compile 里 15.5% 的执行时间），几乎不用 x19–x25：execve 时认出 Go 的 build ID 注记，Tier 1 改占 x21–x25，翻译模板、池里的实例按寄存器分配区分；`go build` 快 3–5%，计算型的 Go 程序快 2–3%，lockstep、差分测试、LTP 另用 Go 的一组跑所有程序 |
 | [M9 之前：跳到未对齐的地址](rounds/114-unaligned-branch.md) | 2026-10-30 | guest 的间接跳转到地址 1 时 Tier 1 跳进 NULL（跳转缓存的空项）或者作废了的块（翻译表的墓碑），进程以内部错误结束；空项的 pc 改成各项不同、命中不了的值，查表时先排除未对齐的 pc，与 Linux 一样是 SIGBUS |
 | [M9 之前：有 JIT 代码的进程也共用翻译](rounds/115-shared-with-jit.md) | 2026-10-30 | 组里的成员映射 JIT 等不可信的可执行内存时不再离开组：每个成员一个标签，登记过的文件映射里的块共用，别处的块按 pc 和标签私有，一次探测比两个键，共用块不链接到私有块；node 的翻译 89–99% 在程序文件里，4 个空闲的 node 的代码缓存 70 → 21 MB、App 用量 190 → 119 MB，计时不变 |
+| [M9 之前：仓库里的目录 bind](rounds/116-store-binds.md) | 2026-10-30 | 为了让 bubblewrap（Codex、Claude Code 的沙箱）能用拆成几轮，这是第一轮：仓库节点带上挂载，仓库里的目录、文件可以 bind（`--rbind` 带上挂在里面的），只读、noexec、nosuid、nodev、nosymfollow 对仓库按经由的挂载生效（顺序照 Linux，`mkdir -p` 碰到已有的目录照常），跨挂载的 rename、link 是 EXDEV，`MS_MOVE`、pivot_root；卸下的挂载留着记录，`..` 不出挂载 |
 
 ## 测量条件
 

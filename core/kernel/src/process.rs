@@ -757,14 +757,19 @@ pub(crate) fn open_executable(
     root: &Node,
     cwd: &Node,
     path: &[u8],
-) -> Result<(Executable, Stat), Errno> {
+) -> Result<(Executable, Stat, bool), Errno> {
     open_node(vfs, cred, &vfs.resolve(ps, cred, root, cwd, path, true)?)
 }
 
 /// 打开要执行的文件 `node`（execveat 已经解析好的路径或者 fd）。没有跟随的符号链接
-/// 是 ELOOP（`AT_SYMLINK_NOFOLLOW`）。
-pub(crate) fn open_node(vfs: &Vfs, cred: &Cred, node: &Node) -> Result<(Executable, Stat), Errno> {
-    let Node::Store(ino) = *node else {
+/// 是 ELOOP（`AT_SYMLINK_NOFOLLOW`），noexec 的挂载里的是 EACCES（Linux 的 `path_noexec`）。
+/// 第三项是它在 nosuid 的挂载里：setuid、setgid 位和文件能力不起作用。
+pub(crate) fn open_node(
+    vfs: &Vfs,
+    cred: &Cred,
+    node: &Node,
+) -> Result<(Executable, Stat, bool), Errno> {
+    let Node::Store(_, ino) = *node else {
         return Err(Errno::EACCES);
     };
     let st = vfs.store().stat(ino)?;
@@ -774,7 +779,12 @@ pub(crate) fn open_node(vfs: &Vfs, cred: &Cred, node: &Node) -> Result<(Executab
         _ => return Err(Errno::EACCES),
     }
     cred.permission(&st, MAY_EXEC)?;
-    Ok((vfs.executable(ino)?, st))
+    let flags = vfs.mount_flags(node).unwrap_or(0);
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
+    Ok((vfs.executable(ino)?, st, nosuid))
 }
 
 /// [`open_executable`]，只要文件本身。
@@ -786,7 +796,7 @@ pub(crate) fn read_executable(
     cwd: &Node,
     path: &[u8],
 ) -> Result<Executable, Errno> {
-    open_executable(vfs, ps, cred, root, cwd, path).map(|(file, _)| file)
+    open_executable(vfs, ps, cred, root, cwd, path).map(|(file, ..)| file)
 }
 
 /// 程序路径的最后一个组件，截到 15 字节（`comm`）。

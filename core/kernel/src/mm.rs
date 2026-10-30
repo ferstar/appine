@@ -483,6 +483,8 @@ struct Vma {
     backing: Backing,
     /// 能否获得写权限：只读打开的文件的共享映射不能（宿主映射本身就是只读的）。
     may_write: bool,
+    /// 能否获得执行权限：noexec 的挂载里的文件的映射不能（Linux 的 `VM_MAYEXEC`）。
+    may_exec: bool,
     /// 持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
     region: Arc<HostRegion>,
     /// `/proc/<pid>/maps` 里显示的名字（映射的文件、程序）和文件的 inode。
@@ -944,6 +946,8 @@ pub struct Region {
     pub locked: bool,
     /// 能获得写权限（smaps 的 `mw`）。
     pub may_write: bool,
+    /// 能获得执行权限（smaps 的 `me`）。
+    pub may_exec: bool,
     /// `MADV_DONTDUMP`（smaps 的 `dd`）。
     pub dontdump: bool,
 }
@@ -1525,6 +1529,7 @@ impl Mm {
                 prot,
                 backing,
                 may_write,
+                may_exec: true,
                 region,
                 name: None,
                 ino: 0,
@@ -2001,8 +2006,14 @@ impl Mm {
         let Some((fd, _)) = v.file.clone() else {
             return Err(Errno::EINVAL);
         };
-        let (prot, may_write, name, ino, locked) =
-            (v.prot, v.may_write, v.name.clone(), v.ino, v.locked);
+        let (prot, may_write, may_exec, name, ino, locked) = (
+            v.prot,
+            v.may_write,
+            v.may_exec,
+            v.name.clone(),
+            v.ino,
+            v.locked,
+        );
         // 同一个文件：按宿主的 (设备号, inode) 比较
         let id = v.file_id.map(|(d, i, _)| (d, i));
         let mut at = s + v.len;
@@ -2018,6 +2029,9 @@ impl Mm {
         let raw = std::os::fd::AsRawFd::as_raw_fd(&*fd);
         let flags = flags::MAP_SHARED | flags::MAP_FIXED;
         self.mmap(start, len, prot, flags, Some((raw, offset, may_write)))?;
+        if !may_exec {
+            self.deny_exec(start, len);
+        }
         self.label(start, len, name, ino);
         if locked {
             self.set_locked(start, len, true)?;
@@ -2153,6 +2167,7 @@ impl Mm {
             prot: template.prot,
             backing: template.backing,
             may_write: template.may_write,
+            may_exec: template.may_exec,
             region,
             name: template.name.clone(),
             ino: template.ino,
@@ -2271,6 +2286,13 @@ impl Mm {
     pub fn deny_write(&mut self, start: u64, len: u64) {
         for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
             v.may_write = false;
+        }
+    }
+
+    /// 起点在 `[start, start + len)` 里的映射以后不能改成可执行（noexec 的挂载里的文件）。
+    pub fn deny_exec(&mut self, start: u64, len: u64) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            v.may_exec = false;
         }
     }
 
@@ -2532,7 +2554,7 @@ impl Mm {
         }
         let end = addr + len;
         // 区间必须被 VMA 连续覆盖：先看跨过 addr 的那个，再逐个往后接
-        let (mut cursor, mut writable) = (addr, true);
+        let (mut cursor, mut writable, mut executable) = (addr, true, true);
         if let Some((&s, v)) = self
             .vmas
             .range(..addr)
@@ -2541,6 +2563,7 @@ impl Mm {
         {
             cursor = s + v.len;
             writable = v.may_write;
+            executable = v.may_exec;
         }
         for (&s, v) in self.vmas.range(addr..end) {
             if s > cursor {
@@ -2548,11 +2571,12 @@ impl Mm {
             }
             cursor = cursor.max(s + v.len);
             writable &= v.may_write;
+            executable &= v.may_exec;
         }
         if cursor < end {
             return Err(Errno::ENOMEM);
         }
-        if prot & prot::WRITE != 0 && !writable {
+        if prot & prot::WRITE != 0 && !writable || prot & prot::EXEC != 0 && !executable {
             return Err(Errno::EACCES);
         }
         self.room_for(self.splits(&[addr, end]))?;
@@ -2727,6 +2751,7 @@ impl Mm {
             };
             child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
             let c = child.vmas.get_mut(&start).unwrap();
+            c.may_exec = v.may_exec;
             c.written.set(v.written.get());
             c.name = v.name.clone();
             c.ino = v.ino;
@@ -2999,6 +3024,7 @@ impl Mm {
                 file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
                 locked: v.locked,
                 may_write: v.may_write,
+                may_exec: v.may_exec,
                 dontdump: v.dontdump,
             }
         });

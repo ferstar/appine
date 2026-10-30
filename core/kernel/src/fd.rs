@@ -142,6 +142,9 @@ pub struct OpenFile {
     pub pos: u64,
     /// `/proc/<pid>/fd/<n>` 显示的路径（打开时的绝对路径）。
     pub path: Option<Rc<[u8]>>,
+    /// 仓库里的普通文件、设备节点和 FIFO 是经由哪个挂载打开的（[`OpenFile::node`]）：
+    /// 只读、noexec 这些标志按它算。目录和 `O_PATH` 的节点本来就带着挂载。
+    pub mnt: crate::vfs::MountId,
     /// `F_SETOWN_EX` 的 (类型, pid) 和 `F_SETSIG` 的信号：`O_ASYNC` 时就绪发给谁、发
     /// 什么信号（0 是 SIGIO），文件租约被打破时也发给它们。
     pub owner: (i32, i32),
@@ -182,6 +185,7 @@ impl OpenFile {
             flags: flags & !oflags::O_CLOEXEC,
             pos: 0,
             path,
+            mnt: crate::vfs::ROOT_MOUNT,
             owner: (0, 0),
             sig: 0,
             drained: [0; 2],
@@ -207,7 +211,7 @@ impl OpenFile {
     /// 对应的文件系统节点（宿主 fd、匿名管道和 PTY 没有）。
     pub fn node(&self) -> Option<Node> {
         match &self.kind {
-            FileKind::Pipe(end) => end.pipe.borrow().fifo.map(Node::Store),
+            FileKind::Pipe(end) => end.pipe.borrow().fifo.map(|ino| Node::Store(self.mnt, ino)),
             FileKind::Host(_)
             | FileKind::Pty(_)
             | FileKind::Socket(_)
@@ -219,7 +223,9 @@ impl OpenFile {
             | FileKind::Pidfd(_)
             | FileKind::SeccompNotify(_)
             | FileKind::MessageQueue(_) => None,
-            FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => Some(Node::Store(*ino)),
+            FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
+                Some(Node::Store(self.mnt, *ino))
+            }
             FileKind::Directory { node, .. } | FileKind::Path(node) => Some(node.clone()),
             FileKind::Proc { mnt, node, .. } => Some(Node::Pseudo(*mnt, node.clone())),
         }
@@ -227,10 +233,7 @@ impl OpenFile {
 
     /// 仓库里的 inode（chmod、chown 等只对它们有意义）。
     pub fn ino(&self) -> Option<Ino> {
-        match self.node() {
-            Some(Node::Store(ino)) => Some(ino),
-            _ => None,
-        }
+        self.node()?.ino()
     }
 
     /// 是否以非阻塞方式打开。
