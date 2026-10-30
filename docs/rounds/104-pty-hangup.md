@@ -26,7 +26,7 @@ appine 原来：组长收不到信号，所以捕获 SIGHUP 的 opencode 不知�
 
 **推迟项**：
 
-- `vhangup(2)`、`TIOCVHANGUP` 没有实现：程序自己不能挂断终端。
+- `vhangup(2)`、`TIOCVHANGUP` 没有实现：程序自己不能挂断终端。→ 已补上（M9 之前：vhangup）
 - 规范模式切到非规范模式时，排着的 EOF 标记丢掉，Linux 上变成 NUL 字节；以 VEOF 结束的不完整的行也不记 VEOF 的位置。只有切换模式的那一刻还没读走的输入受影响。
 - 已经挂断的从设备在 `/proc/<pid>/fd` 里的路径仍是 `/dev/pts/<n>`；Linux 上节点删掉了，后面带 ` (deleted)`。编号给了新的终端之后，两个终端的设备号相同，Linux 上也是这样。
 - appine-run 的桥接线程最多补送一次：程序在规范模式下读到了 EOF 之后接着运行，后来又切到非规范模式时，这一次补送它也会收到。

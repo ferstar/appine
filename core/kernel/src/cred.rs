@@ -45,6 +45,7 @@ pub(crate) mod cap {
     pub const SYS_ADMIN: u32 = 21;
     pub const SYS_NICE: u32 = 23;
     pub const SYS_RESOURCE: u32 = 24;
+    pub const SYS_TTY_CONFIG: u32 = 26;
     pub const MKNOD: u32 = 27;
     pub const LEASE: u32 = 28;
     pub const SETFCAP: u32 = 31;

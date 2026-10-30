@@ -255,9 +255,14 @@ pub struct Tty {
     pub slaves: usize,
     /// 从设备是否还没有解锁（unlockpt）。
     pub locked: bool,
-    /// 已经挂断（`syscall::tty::hang_up`）：打开着的从设备读返回 0，写和 ioctl 是 EIO，poll 总是就绪，
-    /// 带着 POLLERR、POLLHUP（Linux 的 `hung_up_tty_fops`）。
+    /// 主设备都关掉了，已经挂断（`syscall::tty::hang_up`）：打开着的从设备读返回 0，写和
+    /// ioctl 是 EIO，poll 总是就绪，带着 POLLERR、POLLHUP（Linux 的 `hung_up_tty_fops`）。
     pub hung_up: bool,
+    /// 从设备、主设备这一边被 vhangup、TIOCVHANGUP 挂断过几次（`syscall::tty::vhangup`）：
+    /// 在那之前打开的文件都挂断了（[`Tty::hung`]），之后打开的照常能用。
+    pub vhangups: [u32; 2],
+    /// 这一边挂断之后还没有重新打开过（Linux 的 `TTY_HUPPED`）：再挂断什么也不做。
+    pub hupped: [bool; 2],
     /// `/dev/pts/<index>` 的属主、属组和权限位：与 Linux 按挂载选项 `gid=5,mode=620` 的
     /// devpts 一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod
     /// 可以修改，记到终端关掉为止。
@@ -295,6 +300,8 @@ impl Tty {
             slaves: 0,
             locked: true,
             hung_up: false,
+            vhangups: [0; 2],
+            hupped: [false; 2],
             owner: (0, TTY_GID),
             mode: 0o620,
             arrivals: [0; 2],
@@ -464,6 +471,12 @@ impl Tty {
             *v = at + 1;
         }
         self.arrivals[1] += 1;
+    }
+
+    /// 在这一边第 `born` 次 vhangup 之后打开的文件（主设备是 `master`）已经挂断：从设备在
+    /// 主设备都关掉之后，两边在打开之后又被 vhangup、TIOCVHANGUP 挂断过时。
+    pub fn hung(&self, master: bool, born: u32) -> bool {
+        (!master && self.hung_up) || self.vhangups[master as usize] != born
     }
 
     /// 清空输入队列（TCIFLUSH、产生信号时）。
@@ -732,19 +745,24 @@ pub struct PtyEnd {
     pub tty: Rc<RefCell<Tty>>,
     /// 是不是主设备。
     pub master: bool,
+    /// 打开时这一边被 vhangup 过几次（[`Tty::hung`]）。
+    pub born: u32,
 }
 
 impl PtyEnd {
     pub fn new(tty: Rc<RefCell<Tty>>, master: bool) -> PtyEnd {
-        {
+        let born = {
             let mut t = tty.borrow_mut();
             if master {
                 t.masters += 1;
             } else {
                 t.slaves += 1;
+                // 重新打开之后又能挂断了（Linux 的 tty_open 清掉 TTY_HUPPED）
+                t.hupped[0] = false;
             }
-        }
-        PtyEnd { tty, master }
+            t.vhangups[master as usize]
+        };
+        PtyEnd { tty, master, born }
     }
 }
 

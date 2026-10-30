@@ -295,6 +295,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         55 => fs::fchown(cx, a[0] as i32, a[1] as u32, a[2] as u32),
         56 => fs::openat(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
         57 => fs::close(cx, a[0] as i32),
+        58 => tty::vhangup_ctty(cx),
         59 => fs::pipe2(cx, a[0], a[1] as u32),
         61 => fs::getdents64(cx, a[0] as i32, a[1], a[2] as usize),
         62 => fs::lseek(cx, a[0] as i32, a[1] as i64, a[2] as u32),

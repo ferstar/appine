@@ -87,7 +87,10 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             }
             (ev, None)
         }
-        FileKind::Pty(end) => (tty::readiness(&end.tty.borrow(), end.master), None),
+        FileKind::Pty(end) => (
+            tty::readiness(&end.tty.borrow(), end.master, end.born),
+            None,
+        ),
         FileKind::EventFd(e) => {
             let e = e.borrow();
             let mut ev = 0;

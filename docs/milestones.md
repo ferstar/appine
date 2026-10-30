@@ -138,6 +138,7 @@
 | [M9 之前：LTP 剩下的小差异](rounds/127-ltp-leftovers.md) | 2026-10-31 | 剩下的 LTP 失败逐项在原生上对照，多数是 musl 的行为；改了 6 处：readlink 的空路径、TCP 的 sendto 不把地址交给宿主（开发宿主的 AppArmor 拒绝 AF_UNSPEC）、`SHM_HUGETLB` 是 EINVAL、name_to_handle_at 和 open_by_handle_at 的错误顺序和 ESTALE、`O_APPEND` 文件上的 pwrite64 照 Linux 写到末尾；差分测试的脚本超过 128 KB 时报失败（原来两边都执行不了也算通过） |
 | [M9 之前：traceroute 和 mtr](rounds/128-traceroute.md) | 2026-10-31 | 每个网络命名空间一个 ICMP 汇集点：raw socket 背后的 ping socket、设过 TTL 的 UDP socket 在宿主上打开 `IP_RECVERR`，到了的报文和错误拼回的 ICMP 错误报文分给所有 raw socket，替 guest 模拟 Linux 不开 `IP_RECVERR` 时的错误规矩；raw socket 不再把端口交给宿主，guest 的 `IP_RECVERR` 有了错误队列，非 ICMP 的 raw socket 与 Android 上一样是 EPERM：busybox 的 traceroute、Debian 的 `traceroute -I`、开发宿主上的 mtr 能用了；新的网络命名空间里 `ping6 ::1` 能用了 |
 | [M9 之前：命名空间文件留住命名空间](rounds/129-namespace-files.md) | 2026-10-31 | 打开着的、bind 挂载出去的命名空间文件持有命名空间，里面的进程都退出之后照样能 setns 进去，`ip netns add`、`exec`、`list` 和 busybox 的 `unshare --net=<文件>`、`nsenter` 能用；挂载命名空间的文件不能经由挂载留住自己；`NS_GET_USERNS`、`NS_GET_PARENT`、`NS_GET_NSTYPE`、`NS_GET_OWNER_UID`；RTM_GETNSID；F_GETFL 的 `O_LARGEFILE` 只在 open 打开的文件上 |
+| [M9 之前：vhangup](rounds/130-vhangup.md) | 2026-10-31 | `vhangup(2)`、`TIOCVHANGUP` 按 Linux 的 `tty_vhangup`：终端记着被挂断过几次，只挂断挂断时打开着的文件，会话组长收到 SIGHUP、SIGCONT，会话失去控制终端，没读的输入丢掉；节点还在，重新打开照常能用 |
 
 ## 测量条件
 

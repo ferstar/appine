@@ -1655,11 +1655,11 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         return crate::seccomp::ioctl(cx, &f, request, arg);
     }
     let pty = match &file.borrow().kind {
-        FileKind::Pty(end) => Some((end.tty.clone(), end.master)),
+        FileKind::Pty(end) => Some((end.tty.clone(), (end.master, end.born))),
         _ => None,
     };
-    if let Some((t, master)) = pty {
-        return tty::ioctl(cx, &t, master, request, arg);
+    if let Some((t, side)) = pty {
+        return tty::ioctl(cx, &t, side, request, arg);
     }
     let sock = match &file.borrow().kind {
         FileKind::Socket(s) => Some(s.clone()),
@@ -3169,7 +3169,8 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
 enum IoPath {
     Host(i32),
     Pipe(Rc<RefCell<Pipe>>),
-    Pty(Rc<RefCell<Tty>>, bool),
+    /// 终端，打开文件是不是主设备、打开时挂断过几次（[`crate::tty::PtyEnd::born`]）。
+    Pty(Rc<RefCell<Tty>>, (bool, u32)),
     Socket(SocketRef),
     EventFd(Rc<RefCell<EventFd>>),
     TimerFd(Rc<RefCell<TimerFd>>),
@@ -3187,7 +3188,7 @@ fn io_path(f: &OpenFile) -> IoPath {
     match &f.kind {
         FileKind::Host(fd) => IoPath::Host(*fd),
         FileKind::Pipe(end) => IoPath::Pipe(end.pipe.clone()),
-        FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), end.master),
+        FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), (end.master, end.born)),
         FileKind::Socket(s) => IoPath::Socket(s.clone()),
         FileKind::EventFd(e) => IoPath::EventFd(e.clone()),
         FileKind::TimerFd(t) => IoPath::TimerFd(t.clone()),
@@ -3698,7 +3699,7 @@ fn read_bytes(
             cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
         }
         IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
-        IoPath::Pty(t, master) => tty::read(cx, &t, master, nonblock, buf),
+        IoPath::Pty(t, side) => tty::read(cx, &t, side, nonblock, buf),
         IoPath::Socket(s) => {
             let m = super::net::recv(cx, &s, nonblock, buf.len(), 0, 0)?;
             buf[..m.data.len()].copy_from_slice(&m.data);
@@ -3762,7 +3763,7 @@ fn write_bytes(
             Err(e) => Err(Errno(e)),
         },
         IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data),
-        IoPath::Pty(t, master) => tty::write(cx, &t, master, nonblock, data),
+        IoPath::Pty(t, side) => tty::write(cx, &t, side, nonblock, data),
         IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
         IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
         IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {

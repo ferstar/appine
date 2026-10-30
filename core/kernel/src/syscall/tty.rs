@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use super::{SysResult, get, put};
 use crate::cell::RefCell;
+use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, oflags};
-use crate::kernel::{Cx, Kernel, request_wake_object, wake};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigAction, SigInfo};
 use crate::tty::{PtyEnd, Termios, Tty, Winsize, cc, flags};
@@ -42,6 +43,7 @@ const TIOCSETD: u32 = 0x5423;
 const TIOCGETD: u32 = 0x5424;
 const TCSBRKP: u32 = 0x5425;
 const TIOCGSID: u32 = 0x5429;
+const TIOCVHANGUP: u32 = 0x5437;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 
@@ -123,14 +125,15 @@ pub(crate) fn signal_fg(k: &Kernel, tty: &Rc<RefCell<Tty>>, sig: Signal) {
     }
 }
 
-/// 从设备的读：规范模式下读一行；非规范模式按 VMIN/VTIME。
+/// 从设备的读：规范模式下读一行；非规范模式按 VMIN/VTIME。`born` 见 [`Tty::hung`]。
 fn slave_read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
+    born: u32,
     nonblock: bool,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
-    if tty.borrow().hung_up {
+    if tty.borrow().hung(false, born) {
         return Ok(0);
     }
     check_background(cx, tty, Signal::TTIN)?;
@@ -138,7 +141,7 @@ fn slave_read(
     loop {
         {
             let mut t = tty.borrow_mut();
-            if t.hung_up {
+            if t.hung(false, born) {
                 return Ok(0);
             }
             let canonical = t.termios.lflag & flags::ICANON != 0;
@@ -184,10 +187,11 @@ fn slave_read(
 fn slave_write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
+    born: u32,
     nonblock: bool,
     data: &[u8],
 ) -> Result<usize, Errno> {
-    if tty.borrow().hung_up {
+    if tty.borrow().hung(false, born) {
         return Err(Errno::EIO);
     }
     if tty.borrow().termios.lflag & flags::TOSTOP != 0 {
@@ -197,7 +201,7 @@ fn slave_write(
     loop {
         {
             let mut t = tty.borrow_mut();
-            if t.masters == 0 {
+            if t.masters == 0 || t.hung(false, born) {
                 return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
             }
             let n = t.output_room().min(data.len() - done);
@@ -222,16 +226,21 @@ fn slave_write(
     }
 }
 
-/// 主设备的读：取走输出。从设备打开过又全部关闭之后返回 EIO。
+/// 主设备的读：取走输出。从设备打开过又全部关闭之后返回 EIO，主设备这一边被 TIOCVHANGUP
+/// 挂断了是 0。
 fn master_read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
+    born: u32,
     nonblock: bool,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
     loop {
         {
             let mut t = tty.borrow_mut();
+            if t.hung(true, born) {
+                return Ok(0);
+            }
             let out = t.take_output(buf.len());
             if !out.is_empty() {
                 buf[..out.len()].copy_from_slice(&out);
@@ -256,6 +265,7 @@ fn master_read(
 fn master_write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
+    born: u32,
     nonblock: bool,
     data: &[u8],
 ) -> Result<usize, Errno> {
@@ -263,6 +273,9 @@ fn master_write(
     loop {
         let signals = {
             let mut t = tty.borrow_mut();
+            if t.hung(true, born) {
+                return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
+            }
             let n = t.input_room().min(data.len() - done);
             let s = t.write_input(&data[done..done + n]);
             done += n;
@@ -289,18 +302,18 @@ fn master_write(
     }
 }
 
-/// PTY 的一次读。
+/// PTY 的一次读。`born` 是打开文件的 [`PtyEnd::born`]。
 pub(crate) fn read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
-    master: bool,
+    (master, born): (bool, u32),
     nonblock: bool,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
     if master {
-        master_read(cx, tty, nonblock, buf)
+        master_read(cx, tty, born, nonblock, buf)
     } else {
-        let n = slave_read(cx, tty, nonblock, buf)?;
+        let n = slave_read(cx, tty, born, nonblock, buf)?;
         if n > 0 {
             tty.borrow_mut().touch(false);
         }
@@ -308,18 +321,18 @@ pub(crate) fn read(
     }
 }
 
-/// PTY 的一次写。
+/// PTY 的一次写。`born` 是打开文件的 [`PtyEnd::born`]。
 pub(crate) fn write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
-    master: bool,
+    (master, born): (bool, u32),
     nonblock: bool,
     data: &[u8],
 ) -> Result<usize, Errno> {
     if master {
-        master_write(cx, tty, nonblock, data)
+        master_write(cx, tty, born, nonblock, data)
     } else {
-        let n = slave_write(cx, tty, nonblock, data)?;
+        let n = slave_write(cx, tty, born, nonblock, data)?;
         if n > 0 {
             tty.borrow_mut().touch(true);
         }
@@ -348,6 +361,42 @@ pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
     {
         k.ptys.remove(&index);
     }
+    detach(k, tty, session, fg);
+}
+
+/// 挂断终端的一边（Linux 的 `tty_vhangup`，vhangup(2)、TIOCVHANGUP）：这一边打开着的文件
+/// 都挂断（[`Tty::hung`]），没读的输入丢掉（行规程的缓冲区随之清空）。从设备这一边还与
+/// [`hang_up`] 一样给会话组长发信号、让会话失去控制终端；与关掉主设备不同，
+/// `/dev/pts/<n>` 还在，重新打开就照常能用（login、agetty 靠这个赶走终端上留下的进程）。
+/// 主设备那边没有会话，只挂断主设备的文件、丢掉从设备还没被读走的输出。挂断之后还没有
+/// 重新打开过的什么也不做（Linux 的 `TTY_HUPPED`）。
+pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
+    let side = master as usize;
+    let session = {
+        let mut t = tty.borrow_mut();
+        if t.hupped[side] || (!master && t.hung_up) {
+            return;
+        }
+        t.hupped[side] = true;
+        t.vhangups[side] = t.vhangups[side].wrapping_add(1);
+        if master {
+            t.flush_output();
+            None
+        } else {
+            t.flush_input();
+            Some((t.session.take(), t.fg.take()))
+        }
+    };
+    match session {
+        Some((session, fg)) => detach(k, tty, session, fg),
+        None => request_wake_object(wake::of(tty)),
+    }
+}
+
+/// 挂断时的会话部分（Linux 的 `tty_signal_session_leader`）：以它为控制终端的进程都失去
+/// 控制终端，会话组长收到 SIGHUP 和 SIGCONT，并且记下前台进程组 `fg`，等它退出时再发给
+/// 它们（`process::release_ctty`）。叫醒等这个终端的线程。
+fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Option<Tid>) {
     for g in k.groups.values() {
         let mut g = g.borrow_mut();
         if g.ctty.as_ref().is_some_and(|c| Rc::ptr_eq(c, tty)) {
@@ -365,6 +414,20 @@ pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
     request_wake_object(wake::of(tty));
 }
 
+/// vhangup(2)：挂断调用者的控制终端（[`vhangup`]），没有控制终端时什么也不做。要
+/// `CAP_SYS_TTY_CONFIG`（Linux 的 capable()，只看开机时的用户命名空间）。调用者是会话组长
+/// 时自己也收到 SIGHUP、SIGCONT（login 先忽略 SIGHUP）。
+pub(super) fn vhangup_ctty(cx: &mut Cx<'_>) -> SysResult {
+    if !cx.cred().capable(cap::SYS_TTY_CONFIG) {
+        return Err(Errno::EPERM);
+    }
+    let ctty = cx.t.group.borrow().ctty.clone();
+    if let Some(tty) = ctty {
+        vhangup(cx.k(), &tty, false);
+    }
+    Ok(0)
+}
+
 /// 挂断这个线程关掉了最后一个主设备的终端（[`crate::tty::take_closed`]）。放开 BKL 之前
 /// 调用（[`crate::kernel::Bkl`]）。
 pub(crate) fn hang_up_closed(k: &mut Kernel) {
@@ -373,15 +436,18 @@ pub(crate) fn hang_up_closed(k: &mut Kernel) {
     }
 }
 
-/// ppoll 的就绪状态。
-pub(crate) fn readiness(tty: &Tty, master: bool) -> i16 {
+/// ppoll 的就绪状态。`born` 是打开文件的 [`PtyEnd::born`]。
+pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
     const POLLIN: i16 = 0x001;
     const POLLOUT: i16 = 0x004;
     const POLLHUP: i16 = 0x010;
     const POLLRDNORM: i16 = 0x040;
     const POLLWRNORM: i16 = 0x100;
     let mut ev = 0;
-    if master {
+    if tty.hung(master, born) {
+        const POLLERR: i16 = 0x008;
+        ev = POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDNORM | POLLWRNORM;
+    } else if master {
         if tty.has_output() {
             ev |= POLLIN | POLLRDNORM;
         }
@@ -391,9 +457,6 @@ pub(crate) fn readiness(tty: &Tty, master: bool) -> i16 {
         if tty.slaves == 0 && !tty.locked {
             ev |= POLLHUP;
         }
-    } else if tty.hung_up {
-        const POLLERR: i16 = 0x008;
-        ev = POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDNORM | POLLWRNORM;
     } else {
         if tty.readable() {
             ev |= POLLIN | POLLRDNORM;
@@ -417,15 +480,15 @@ fn is_ctty(cx: &Cx<'_>, tty: &Rc<RefCell<Tty>>) -> bool {
         .is_some_and(|c| Rc::ptr_eq(c, tty))
 }
 
-/// PTY 的 ioctl。
+/// PTY 的 ioctl。`born` 是打开文件的 [`PtyEnd::born`]。
 pub(crate) fn ioctl(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
-    master: bool,
+    (master, born): (bool, u32),
     request: u32,
     arg: u64,
 ) -> SysResult {
-    if !master && tty.borrow().hung_up {
+    if tty.borrow().hung(master, born) {
         return Err(if request == TIOCSPGRP {
             Errno::ENOTTY
         } else {
@@ -586,6 +649,14 @@ pub(crate) fn ioctl(
                 return Err(Errno::EPERM);
             }
             tty.borrow_mut().fg = Some(pgid);
+            Ok(0)
+        }
+        // Linux 的 tty_ioctl 用 capable()：只看开机时的用户命名空间
+        TIOCVHANGUP => {
+            if !cx.cred().capable(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            vhangup(cx.k(), tty, master);
             Ok(0)
         }
         TIOCGSID => {
