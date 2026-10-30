@@ -29,7 +29,7 @@
 **推迟项**：
 
 - 命名空间文件不让 pid 命名空间活着（与[挂载命名空间](118-mount-namespaces.md)的推迟项相同）；`NS_GET_PID_FROM_PIDNS` 这些 ioctl 没有，setns 仍不接受 pidfd。
-- `/proc/sysvipc/*` 里的 pid 仍是全局的（Linux 按 procfs 实例的命名空间）；没有 `PR_SET_CHILD_SUBREAPER`，孤儿只过继给 1 号进程或内置的 init。
+- `/proc/sysvipc/*` 里的 pid 仍是全局的（Linux 按 procfs 实例的命名空间）；没有 `PR_SET_CHILD_SUBREAPER`，孤儿只过继给 1 号进程或内置的 init。 → `PR_SET_CHILD_SUBREAPER` 已补上（M9 之前：PR_SET_CHILD_SUBREAPER）；`/proc/sysvipc/*` 里的 pid 仍是全局的
 - 写 `ns_last_pid` 只有文件本身的权限检查（root 才能写），没有 Linux 按命名空间属主查的 `checkpoint_restore_ns_capable`。
 - siginfo 的 `si_uid` 仍按内核 ID（[用户命名空间](119-user-namespaces.md)的推迟项）。
 - `max_pid_namespaces` 只读、不实际限制。

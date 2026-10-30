@@ -134,6 +134,7 @@
 | [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱](rounds/123-bwrap.md) | 2026-10-30 | 让 bubblewrap 能用的最后一轮：端到端试 bwrap、Codex、Claude Code 的沙箱，补上 cgroup 命名空间、经由 `/proc/self/fd/N` 挂文件时 mountinfo 里的挂载点、remount 不往上找；Codex 的 `-s workspace-write`、`codex sandbox`、Claude Code 的 `sandbox.enabled` 在 appine 里都能用；新的差分测试组 `bwrap` |
 | [M9 之前：V8 和 HotSpot 的寄存器](rounds/124-v8-hotspot-registers.md) | 2026-10-30 | 原生采样时记下 JIT 代码的字节（jitdump、JVMTI 代理）：V8 的 x26–x28、HotSpot 的 x27、x28 多是只读的基址，被 Tier 1 占用代价小，按"用到"挑的组合实测反而让 TurboFan 的循环慢 7–40%；"写被占用寄存器"的比例与实测一致，默认的一组对 HotSpot 已经最好，V8 换 Go 的一组只让 tsc 快 2–4%，不换 |
 | [M9 之前：raw ICMP 的模拟](rounds/125-raw-icmp.md) | 2026-10-30 | guest 的 raw ICMP socket 在宿主上是 ping socket，收到的回答把 id 换回 guest 发的、IPv4 补上 IP 头（TTL、目的地址取自宿主的控制消息），`ICMP_FILTER`、`ICMPV6_FILTER`、`IPV6_CHECKSUM` 记在内核层：Alpine 默认的 busybox `ping` 原来一个回答也收不到，`ping6` 一开始就退出，现在与原生相同；建 raw socket 要 `CAP_NET_RAW`（原来不查） |
+| [M9 之前：PR_SET_CHILD_SUBREAPER](rounds/126-child-subreaper.md) | 2026-10-31 | 进程可以设成 subreaper：孤儿先过继给同一个 pid 命名空间里最近的、还活着的 subreaper 祖先，没有才给 1 号进程（tini、s6 这类进程管理程序用它，原来 EINVAL） |
 
 ## 测量条件
 

@@ -1,6 +1,6 @@
 # M9 之前：raw ICMP 的模拟（2026-10-30）
 
-← [M9 之前：V8 和 HotSpot 的寄存器（2026-10-30）](124-v8-hotspot-registers.md) · [索引](../milestones.md)
+← [M9 之前：V8 和 HotSpot 的寄存器（2026-10-30）](124-v8-hotspot-registers.md) · [索引](../milestones.md) · [M9 之前：PR_SET_CHILD_SUBREAPER（2026-10-31）](126-child-subreaper.md) →
 
 Alpine 默认的 `ping` 是 busybox 的，以 root 运行时用 raw ICMP socket。appine 一直把 guest 的 raw ICMP socket 换成宿主的 ping socket（Android 上 App 没有 `CAP_NET_RAW`，§2、§10），但两者收到的数据不一样，busybox 的 ping 一个回答也收不到：回环和外面的地址都是 `0 packets received`。`ping6` 更早，设 `ICMP6_FILTER` 失败就退出了。[网络命名空间](122-net-namespaces.md)那一轮记过这一条，这次盘点推迟项时实测确认。
 

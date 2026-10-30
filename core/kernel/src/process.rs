@@ -364,6 +364,9 @@ pub(crate) struct ThreadGroup {
     pub cpu_itimers: [Option<crate::itimer::CpuTimer>; 2],
     /// `PR_SET_PDEATHSIG`：父进程退出时收到的信号，0 表示不发；fork 不继承。
     pub pdeathsig: i32,
+    /// `PR_SET_CHILD_SUBREAPER`：后代成了孤儿时过继给最近的这样的祖先，而不是 init
+    /// （[`finish_group`]）；fork 不继承，execve 保留。
+    pub child_subreaper: bool,
     /// `PR_SET_DUMPABLE`，fork 继承。
     pub dumpable: bool,
     /// `PR_SET_NO_NEW_PRIVS`，fork 和 execve 都保留。
@@ -439,6 +442,7 @@ impl ThreadGroup {
             itimer: None,
             cpu_itimers: [None; 2],
             pdeathsig: 0,
+            child_subreaper: false,
             dumpable: true,
             no_new_privs: false,
             oom_score_adj: 0,
@@ -580,12 +584,20 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                 }
             }
         }
-        // 孤儿过继给它所在的 pid 命名空间的 1 号进程（Linux 的 find_child_reaper），
-        // 开机时的命名空间里、或者 1 号进程自己退出时给 init
-        let reaper = ns
-            .reaper
-            .get()
-            .filter(|&r| ns.level > 0 && !zap && k.groups.contains_key(&r))
+        // 孤儿先过继给最近的 subreaper（Linux 的 find_new_reaper），没有就给它所在的 pid
+        // 命名空间的 1 号进程（find_child_reaper），开机时的命名空间里、或者 1 号进程自己
+        // 退出时给 init
+        let subreaper = if zap {
+            None
+        } else {
+            find_subreaper(k, &group.borrow())
+        };
+        let reaper = subreaper
+            .or_else(|| {
+                ns.reaper
+                    .get()
+                    .filter(|&r| ns.level > 0 && !zap && k.groups.contains_key(&r))
+            })
             .unwrap_or(INIT);
         let children = std::mem::take(&mut group.borrow_mut().children);
         for c in children {
@@ -639,6 +651,25 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     } else {
         finish_reported(k, group, pgrps);
     }
+}
+
+/// 退出的进程 `group` 的孤儿要过继给的 subreaper：从父进程往上，同一层 pid 命名空间里最近
+/// 的设了 `PR_SET_CHILD_SUBREAPER`、还有活着的线程的进程（Linux 的 find_new_reaper 比 pid
+/// 的层数，不跨出命名空间；整个进程都在退出的跳过）。
+fn find_subreaper(k: &Kernel, group: &ThreadGroup) -> Option<Tid> {
+    let level = group.pid_ns.level;
+    let mut p = group.ppid;
+    while p != INIT {
+        let a = k.groups.get(&p)?.borrow();
+        if a.pid_ns.level != level {
+            return None;
+        }
+        if a.child_subreaper && !a.threads.is_empty() {
+            return Some(p);
+        }
+        p = a.ppid;
+    }
+    None
 }
 
 /// [`finish_group`] 的后一半：报告给跟踪者、父进程。pid 命名空间的 1 号进程等到命名空间里

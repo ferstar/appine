@@ -54,6 +54,8 @@ const PR_GET_SPECULATION_CTRL: i32 = 52;
 const PR_SPEC_NOT_AFFECTED: u64 = 0;
 const PR_SET_TIMERSLACK: i32 = 29;
 const PR_GET_TIMERSLACK: i32 = 30;
+const PR_SET_CHILD_SUBREAPER: i32 = 36;
+const PR_GET_CHILD_SUBREAPER: i32 = 37;
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 const PR_GET_NO_NEW_PRIVS: i32 = 39;
 /// 最大的 capability 编号（`CAP_CHECKPOINT_RESTORE`）。
@@ -724,6 +726,15 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         PR_GET_PDEATHSIG => {
             let sig = cx.t.group.borrow().pdeathsig;
             put(cx, arg, sig.to_le_bytes()).map(|()| 0)
+        }
+        // 与 Linux 一样不检查别的参数，非 0 都算设上
+        PR_SET_CHILD_SUBREAPER => {
+            cx.t.group.borrow_mut().child_subreaper = arg != 0;
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let on = cx.t.group.borrow().child_subreaper as i32;
+            put(cx, arg, on.to_le_bytes()).map(|()| 0)
         }
         PR_GET_DUMPABLE => Ok(cx.t.group.borrow().dumpable as u64),
         PR_SET_DUMPABLE if arg <= 1 => {

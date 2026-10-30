@@ -708,6 +708,35 @@ def nested():
 
 
 child(nested)
+
+
+# PR_SET_CHILD_SUBREAPER：外面的 subreaper 不收养里面的孤儿（不跨出命名空间），里面的照常收养
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def subreapers():
+    libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    os.unshare(CLONE_NEWPID)
+
+    def init():
+        def orphan(note):
+            fork(lambda: (time.sleep(0.3), print(note, "adopted by", os.getppid())))
+
+        print("parent status", child(lambda: orphan("without a subreaper inside:")))
+        print("init reaped", os.waitpid(-1, 0)[1])
+
+        def middle():
+            libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+            print("middle is", os.getpid())
+            print("parent status", child(lambda: orphan("with a subreaper inside:")))
+            print("middle reaped", os.waitpid(-1, 0)[1])
+
+        print("middle status", child(middle))
+
+    print("init status", child(init))
+
+
+child(subreapers)
 PY3
 
 # UTS 命名空间：busybox 的 unshare -u 里改的主机名外面看不到

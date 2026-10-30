@@ -3525,3 +3525,141 @@ int main(void)
 }
 C
 gcc -O1 -o deleted deleted.c && ./deleted
+
+# PR_SET_CHILD_SUBREAPER：孤儿过继给祖先里最近的 subreaper，已经是僵尸的也由它回收；它退出
+# 之后它的孤儿交给再往上的；fork 不继承，execve 保留；没有 subreaper 时给 1 号进程
+cat > subreaper.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int get(void)
+{
+    int v = -1;
+    prctl(PR_GET_CHILD_SUBREAPER, &v);
+    return v;
+}
+
+static void wait_byte(int fd)
+{
+    char c;
+    if (read(fd, &c, 1) != 1)
+        perror("read");
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1) {
+        printf("after execve: %d\n", get());
+        return 0;
+    }
+    pid_t me = getpid(), r;
+    int st;
+    /* 行缓冲：fork 出来的进程不会再输出一遍父进程缓冲着的内容 */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("default: %d\n", get());
+    printf("set 5: %d, now %d\n", prctl(PR_SET_CHILD_SUBREAPER, 5), get());
+    printf("set 0: %d, now %d\n", prctl(PR_SET_CHILD_SUBREAPER, 0), get());
+    errno = 0;
+    printf("get into a bad pointer: %d %s\n", prctl(PR_GET_CHILD_SUBREAPER, (int *)8),
+           strerror(errno));
+    prctl(PR_SET_CHILD_SUBREAPER, 1);
+    fflush(stdout);
+
+    if (fork() == 0) {
+        printf("child: %d\n", get());
+        prctl(PR_SET_CHILD_SUBREAPER, 1);
+        fflush(stdout);
+        execl("/proc/self/exe", argv[0], "again", (char *)NULL);
+        _exit(1);
+    }
+    wait(NULL);
+
+    /* 孙子进程在父进程退出之后过继给这里，由这里回收 */
+    int p[2];
+    pipe(p);
+    pid_t a = fork();
+    if (a == 0) {
+        if (fork() == 0) {
+            wait_byte(p[0]);
+            printf("orphan's parent is the subreaper: %s\n", getppid() == me ? "yes" : "no");
+            fflush(stdout);
+            _exit(3);
+        }
+        _exit(0);
+    }
+    waitpid(a, NULL, 0);
+    write(p[1], "x", 1);
+    r = waitpid(-1, &st, 0);
+    printf("reaped the orphan: %s, status %d\n", r > 0 && r != a ? "yes" : "no", WEXITSTATUS(st));
+
+    /* 父进程退出时已经是僵尸的孙子进程 */
+    a = fork();
+    if (a == 0) {
+        pid_t g = fork();
+        if (g == 0)
+            _exit(5);
+        siginfo_t si;
+        waitid(P_PID, g, &si, WEXITED | WNOWAIT);
+        _exit(0);
+    }
+    waitpid(a, NULL, 0);
+    r = waitpid(-1, &st, 0);
+    printf("reaped the zombie: %s, status %d\n", r > 0 ? "yes" : "no", WEXITSTATUS(st));
+
+    /* 最近的 subreaper；它退出之后交给再往上的 */
+    int q[2], back[2];
+    pipe(q);
+    pipe(back);
+    pid_t b = fork();
+    if (b == 0) {
+        prctl(PR_SET_CHILD_SUBREAPER, 1);
+        pid_t bpid = getpid();
+        pid_t c = fork();
+        if (c == 0) {
+            if (fork() == 0) {
+                wait_byte(q[0]);
+                printf("adopted by the nearest subreaper: %s\n", getppid() == bpid ? "yes" : "no");
+                fflush(stdout);
+                write(back[1], "x", 1);
+                wait_byte(q[0]);
+                printf("then by the next one up: %s\n", getppid() == me ? "yes" : "no");
+                fflush(stdout);
+                _exit(0);
+            }
+            _exit(0);
+        }
+        waitpid(c, NULL, 0);
+        write(q[1], "x", 1);
+        wait_byte(back[0]);
+        _exit(0);
+    }
+    waitpid(b, NULL, 0);
+    write(q[1], "x", 1);
+    r = waitpid(-1, &st, 0);
+    printf("reaped it: %s\n", r > 0 && r != b ? "yes" : "no");
+
+    /* 清掉之后孤儿给 1 号进程 */
+    prctl(PR_SET_CHILD_SUBREAPER, 0);
+    a = fork();
+    if (a == 0) {
+        if (fork() == 0) {
+            wait_byte(p[0]);
+            printf("without a subreaper: adopted by pid %d\n", getppid());
+            fflush(stdout);
+            write(back[1], "x", 1);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    waitpid(a, NULL, 0);
+    write(p[1], "x", 1);
+    wait_byte(back[0]);
+    return 0;
+}
+C
+gcc -O1 -o subreaper subreaper.c && ./subreaper
