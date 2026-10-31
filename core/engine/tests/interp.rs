@@ -381,6 +381,7 @@ fn id_registers_match_hwcap() {
         assert_eq!(simd, (caps & hwcap::ASIMDHP != 0) as u64);
     }
     assert_eq!(caps & hwcap::FPHP != 0, caps & hwcap::ASIMDHP != 0);
+    assert_eq!(caps & hwcap::DIT != 0, (g.x(0) >> 48) & 0xf == 1);
 }
 
 #[test]
@@ -673,6 +674,49 @@ fn flagm_sb_dpb_follow_the_feature_set() {
             }
         }
     }
+}
+
+/// DIT：MSR DIT, #imm 与硬件一样取 CRm 的最低位，MSR、MRS DIT 只有第 24 位；不宣告时
+/// 都是未定义指令。
+#[test]
+fn dit_follows_the_feature_set() {
+    let mut g = Guest::new();
+    let mrs = 0xd53b42a0; // mrs x0, dit
+    let msr = 0xd51b42a1; // msr dit, x1
+    let imm = |crm: u32| 0xd503405f | crm << 8; // msr dit, #crm
+    if appine_engine::guest_hwcap() & hwcap::DIT == 0 {
+        for insn in [mrs, msr, imm(1)] {
+            assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
+        }
+        return;
+    }
+    // 宿主线程的 DIT 跟着 guest 的（appine_sync_dit）
+    #[cfg(target_arch = "aarch64")]
+    let host = || {
+        let v: u64;
+        // SAFETY: mrs x0, dit（宣告了 DIT 说明宿主有它）
+        unsafe { std::arch::asm!(".inst 0xd53b42a0", out("x0") v) };
+        v >> 24
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let host = || 0;
+    assert_eq!(g.cpu.state().dit, 0);
+    for (crm, want) in [(1, 1), (0, 0), (3, 1), (2, 0), (15, 1), (14, 0)] {
+        g.step(imm(crm));
+        assert_eq!(g.cpu.state().dit, want, "crm {crm}");
+        assert_eq!(host(), u64::from(want), "crm {crm}");
+        g.step(mrs);
+        assert_eq!(g.x(0), u64::from(want) << 24);
+    }
+    g.set_x(1, !0);
+    g.step(msr);
+    g.step(mrs);
+    assert_eq!(g.x(0), 1 << 24);
+    assert_eq!(host(), 1);
+    g.set_x(1, !(1 << 24));
+    g.step(msr);
+    assert_eq!(g.cpu.state().dit, 0);
+    assert_eq!(host(), 0);
 }
 
 /// FRINTTS：舍入成整数值，超出 32、64 位整数范围的和 NaN 得到最小的那个整数，并且置

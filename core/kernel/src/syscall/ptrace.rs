@@ -12,8 +12,8 @@ use crate::errno::Errno;
 use crate::kernel::{Cx, INIT};
 use crate::process::Signal;
 use crate::ptrace::{
-    BRK_SLOTS, EVENTMSG_SYSCALL_ENTRY, EVENTMSG_SYSCALL_EXIT, HwDebug, Mode, PSTATE_NZCV, Regs,
-    Stop, Trace, WATCH_SLOTS, event, opt,
+    BRK_SLOTS, EVENTMSG_SYSCALL_ENTRY, EVENTMSG_SYSCALL_EXIT, HwDebug, Mode, Regs, Stop, Trace,
+    WATCH_SLOTS, event, opt,
 };
 use crate::signal::{self, SigInfo};
 use crate::task::Task;
@@ -313,7 +313,7 @@ pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32, hw: &HwDebug) -> 
     let mut b = Vec::new();
     match nt {
         NT_PRSTATUS => {
-            for v in r.x.iter().chain(&[r.sp, r.pc, r.nzcv]) {
+            for v in r.x.iter().chain(&[r.sp, r.pc, r.pstate]) {
                 b.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -364,7 +364,7 @@ fn decode_regset(
             }
             r.sp = u64_at(31);
             r.pc = u64_at(32);
-            r.nzcv = u64_at(33) & PSTATE_NZCV;
+            r.pstate = crate::ptrace::user_pstate(u64_at(33));
         }
         NT_PRFPREG => {
             for (i, v) in r.v.iter_mut().enumerate() {

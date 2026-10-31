@@ -1,7 +1,7 @@
 # compat.sh 的续篇（difftest 把整个脚本作为 sh -c 的一个参数，不能超过 128 KB）：raw ICMP
 # socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径、F_GETFL 里的
 # O_LARGEFILE、/proc/<pid>/task/<tid>/children、PR_SET_PDEATHSIG 和 __WNOTHREAD、短的符号链接、
-# /proc/<pid>/exe 指向程序文件本身
+# /proc/<pid>/exe 指向程序文件本身、DIT 在信号、fork、execve、ptrace 里
 set -e
 cd /tmp
 # raw ICMP socket（appine 在宿主上用 ping socket 模拟）：IPv4 收到的数据带 IP 头，echo 回答
@@ -1342,3 +1342,134 @@ int main(int argc, char **argv)
 }
 C
 gcc -O1 -o exelink exelink.c && ./exelink
+
+# DIT 是线程的状态（Linux 6.1）：信号处理函数带着被打断时的 DIT、信号帧的 pstate 第 24 位是它、
+# sigreturn 照帧里的恢复；fork、线程继承，execve 清零；ptrace 的 NT_PRSTATUS 里是 pstate 的第 24 位，
+# 跟踪者改了之后被跟踪者看到新的值。宿主没有 DIT 时两边都只打印 no DIT
+cd /tmp
+cat > ditstate.c <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+static int dit(void)
+{
+    uint64_t v;
+    __asm__ volatile("mrs %0, dit" : "=r"(v));
+    return (int)(v >> 24 & 1);
+}
+
+static void set(int on)
+{
+    if (on)
+        __asm__ volatile("msr dit, #1");
+    else
+        __asm__ volatile("msr dit, #0");
+}
+
+static volatile int in_handler = -1, frame_bit = -1;
+
+static void handler(int sig, siginfo_t *si, void *p)
+{
+    ucontext_t *uc = p;
+    (void)sig, (void)si;
+    in_handler = dit();
+    frame_bit = (int)(uc->uc_mcontext.pstate >> 24 & 1);
+    uc->uc_mcontext.pstate ^= UINT64_C(1) << 24; /* sigreturn 照帧里的恢复 */
+    set(!in_handler);                            /* 处理函数自己改的不算 */
+}
+
+static void *thread(void *a)
+{
+    (void)a;
+    return (void *)(intptr_t)dit();
+}
+
+static uint64_t regs_pstate(pid_t p, struct user_regs_struct *r)
+{
+    struct iovec io = {r, sizeof *r};
+    ptrace(PTRACE_GETREGSET, p, (void *)NT_PRSTATUS, &io);
+    return r->pstate;
+}
+
+int main(int argc, char **argv)
+{
+    if (!(getauxval(AT_HWCAP) & HWCAP_DIT)) {
+        printf("no DIT\n");
+        return 0;
+    }
+    if (argc > 1) {
+        printf("after execve: %d\n", dit());
+        return 0;
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("start: %d\n", dit());
+    struct sigaction sa = {.sa_sigaction = handler, .sa_flags = SA_SIGINFO};
+    sigaction(SIGUSR1, &sa, NULL);
+    for (int on = 1; on >= 0; on--) {
+        set(on);
+        raise(SIGUSR1);
+        printf("dit %d: handler %d, frame bit %d, after sigreturn %d\n", on, in_handler, frame_bit,
+               dit());
+    }
+    set(1);
+    pid_t p = fork();
+    if (p == 0) {
+        printf("fork child: %d\n", dit());
+        _exit(0);
+    }
+    waitpid(p, NULL, 0);
+    pthread_t t;
+    void *r;
+    pthread_create(&t, NULL, thread, NULL);
+    pthread_join(t, &r);
+    printf("thread: %d\n", (int)(intptr_t)r);
+    p = fork();
+    if (p == 0) {
+        execl("/proc/self/exe", argv[0], "exec", (char *)NULL);
+        _exit(1);
+    }
+    waitpid(p, NULL, 0);
+
+    p = fork();
+    if (p == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        set(1);
+        raise(SIGSTOP);
+        printf("tracee after the tracer cleared it: %d\n", dit());
+        set(0);
+        raise(SIGSTOP);
+        printf("tracee after the tracer set it: %d\n", dit());
+        _exit(0);
+    }
+    struct user_regs_struct regs;
+    int st;
+    waitpid(p, &st, 0);
+    printf("tracer sees %d\n", (int)(regs_pstate(p, &regs) >> 24 & 1));
+    regs.pstate &= ~(UINT64_C(1) << 24);
+    struct iovec io = {&regs, sizeof regs};
+    ptrace(PTRACE_SETREGSET, p, (void *)NT_PRSTATUS, &io);
+    printf("tracer reads back %d\n", (int)(regs_pstate(p, &regs) >> 24 & 1));
+    ptrace(PTRACE_CONT, p, 0, 0);
+    waitpid(p, &st, 0);
+    printf("tracer sees %d\n", (int)(regs_pstate(p, &regs) >> 24 & 1));
+    regs.pstate |= UINT64_C(1) << 24;
+    ptrace(PTRACE_SETREGSET, p, (void *)NT_PRSTATUS, &io);
+    ptrace(PTRACE_CONT, p, 0, 0);
+    waitpid(p, &st, 0);
+    printf("dit at exit: %d\n", dit());
+    return 0;
+}
+C
+gcc -O1 -march=armv8.4-a -pthread -o ditstate ditstate.c && ./ditstate

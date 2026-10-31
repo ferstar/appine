@@ -441,7 +441,7 @@ fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) 
     b[96..112].copy_from_slice(&timeval(g.child_cpu.sys_ns));
     let r = &t.regs;
     // user_pt_regs：x0–x30、sp、pc、pstate
-    for (i, v) in r.x.iter().chain(&[r.sp, r.pc, r.nzcv]).enumerate() {
+    for (i, v) in r.x.iter().chain(&[r.sp, r.pc, r.pstate]).enumerate() {
         b[112 + i * 8..120 + i * 8].copy_from_slice(&v.to_le_bytes());
     }
     b[384..388].copy_from_slice(&1i32.to_le_bytes()); // pr_fpvalid

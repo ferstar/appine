@@ -163,6 +163,7 @@
 | [M9 之前：nmap 以 root 运行](rounds/152-nmap-unprivileged.md) | 2026-11-01 | nmap 以 root 运行时默认要 raw socket、打不开就退出；App 给会话设 `NMAP_UNPRIVILEGED=1`，改用 connect 扫描，与没有 CAP_NET_RAW 的原生 root 相同 |
 | [M9 之前：/proc/<pid>/exe 指向程序文件本身](rounds/153-exe-file.md) | 2026-11-01 | exe 照 Linux 的 `mm->exe_file` 指向程序文件本身：删除之后带 ` (deleted)`，改了名、被删除、被 rename 换掉之后经由它 stat、open、execve 到的仍是原来那个（删除了的经由记着的宿主文件） |
 | [M9 之前：FRINTTS、FlagM、SB 和 DPB](rounds/154-frintts-flagm-sb-dpb.md) | 2026-11-01 | 宿主有时宣告 FRINTTS（FRINT32Z 等）、FlagM（CFINV、RMIF、SETF8/16）、FlagM2（XAFLAG、AXFLAG）、SB、DPB/DPB2（DC CVAP、CVADP）；`/proc/cpuinfo` 的名字表补到 `sb`，`gcc -mcpu=native` 与原生相同 |
+| [M9 之前：DIT](rounds/155-dit.md) | 2026-11-01 | 宿主有时宣告 DIT：MSR、MRS DIT；信号处理函数带着它、sigreturn 和 ptrace 照 pstate 第 24 位恢复，fork、线程继承，execve 清零；宿主线程的 DIT 跟着 guest 的 |
 
 ## 测量条件
 

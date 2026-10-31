@@ -87,8 +87,8 @@ pub(crate) struct Regs {
     pub x: [u64; 31],
     pub sp: u64,
     pub pc: u64,
-    /// 只有 NZCV。
-    pub nzcv: u64,
+    /// NZCV 和 DIT（第 24 位），[`pstate_of`]。
+    pub pstate: u64,
     pub fpcr: u64,
     pub fpsr: u64,
     pub tpidr: u64,
@@ -103,7 +103,7 @@ impl Regs {
             x: s.x,
             sp: s.sp,
             pc: s.pc,
-            nzcv: s.nzcv,
+            pstate: pstate_of(s),
             fpcr: s.fpcr,
             fpsr: s.fpsr,
             tpidr: s.tpidr_el0,
@@ -116,7 +116,7 @@ impl Regs {
         s.x = self.x;
         s.sp = self.sp;
         s.pc = self.pc;
-        s.nzcv = self.nzcv & PSTATE_NZCV;
+        set_pstate(s, self.pstate);
         s.fpcr = self.fpcr;
         s.fpsr = self.fpsr;
         s.tpidr_el0 = self.tpidr;
@@ -124,8 +124,30 @@ impl Regs {
     }
 }
 
-/// pstate 里跟踪者能改的位：NZCV。
-pub(crate) const PSTATE_NZCV: u64 = 0xf000_0000;
+/// pstate 里的 NZCV。
+const PSTATE_NZCV: u64 = 0xf000_0000;
+/// pstate 里的 DIT。
+const PSTATE_DIT: u64 = 1 << 24;
+
+/// guest 看得到的 pstate（信号帧、ptrace 的寄存器集、core dump）：NZCV 和 DIT，别的位
+/// 总是 0（EL0t、AArch64）。
+pub(crate) fn pstate_of(s: &CpuState) -> u64 {
+    (s.nzcv & PSTATE_NZCV) | (u64::from(s.dit) << 24)
+}
+
+/// 信号帧、跟踪者给的 pstate 里 guest 能改的位：NZCV，宣告了 DIT 时还有 DIT（Linux 的
+/// `valid_native_regs` 只清掉 RES0 的位，DIT 照恢复；没有 DIT 的硬件上这一位不起作用）。
+pub(crate) fn user_pstate(pstate: u64) -> u64 {
+    let dit = appine_engine::guest_hwcap() & appine_engine::hwcap::DIT != 0;
+    pstate & (PSTATE_NZCV | if dit { PSTATE_DIT } else { 0 })
+}
+
+/// 按 pstate 恢复 NZCV 和 DIT（[`user_pstate`]）。
+pub(crate) fn set_pstate(s: &mut CpuState, pstate: u64) {
+    let p = user_pstate(pstate);
+    s.nzcv = p & PSTATE_NZCV;
+    s.dit = u32::from(p & PSTATE_DIT != 0);
+}
 
 /// 线程的 ptrace 状态（[`Task::trace`]），只在持有 BKL 时访问。
 #[derive(Default)]

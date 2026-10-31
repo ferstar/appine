@@ -1153,8 +1153,6 @@ const FPSIMD_MAGIC: u32 = 0x4650_8001;
 const FPSIMD_SIZE: usize = 528;
 const ESR_MAGIC: u32 = 0x4553_5201;
 const ESR_SIZE: usize = 16;
-/// pstate 里 guest 可以看到和恢复的位：NZCV。
-const PSTATE_NZCV: u64 = 0xf000_0000;
 /// pstate 的异常级别和 AArch32 位：信号帧里必须是 EL0t、AArch64。
 const PSTATE_MODE: u64 = 0x1f;
 
@@ -1205,7 +1203,8 @@ fn setup_frame(
     }
     w64(&mut b, SP, st.sp);
     w64(&mut b, PC, st.pc);
-    w64(&mut b, PSTATE, st.nzcv & PSTATE_NZCV);
+    // 处理函数照样带着被打断时的 DIT（Linux 的 setup_return 只清 BTYPE、TCO）
+    w64(&mut b, PSTATE, crate::ptrace::pstate_of(st));
     // __reserved：fpsimd_context，可选的 esr_context，最后是空记录
     let mut off = RESERVED;
     w32(&mut b, off, FPSIMD_MAGIC);
@@ -1308,7 +1307,7 @@ fn restore_frame(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Result<(), Errno> {
     }
     st.sp = r64(&b, SP);
     st.pc = r64(&b, PC);
-    st.nzcv = pstate & PSTATE_NZCV;
+    crate::ptrace::set_pstate(st, pstate);
     st.fpsr = r32(&b, fp + 8) as u64;
     st.fpcr = r32(&b, fp + 12) as u64;
     for (i, v) in st.v.iter_mut().enumerate() {

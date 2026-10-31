@@ -1,6 +1,6 @@
 # M9 之前：FRINTTS、FlagM、SB 和 DPB（2026-11-01）
 
-← [M9 之前：/proc/<pid>/exe 指向程序文件本身（2026-11-01）](153-exe-file.md) · [索引](../milestones.md)
+← [M9 之前：/proc/<pid>/exe 指向程序文件本身（2026-11-01）](153-exe-file.md) · [索引](../milestones.md) · [M9 之前：DIT（2026-11-01）](155-dit.md) →
 
 [RDM、FCMA、FHM 和 BF16](142-rdm-fcma-fhm-bf16.md)那一轮的推迟项：宿主（开发用的 M2 Pro、常见的手机核心）有、appine 仍不宣告的 CPU 扩展（§4.4 表里的"还没做"）。这一轮做其中只是指令层面的几种：
 

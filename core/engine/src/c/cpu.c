@@ -56,6 +56,7 @@ void appine_cpu_init(struct appine_cpu *cpu, struct appine_mmu *mmu)
     memset(cpu, 0, offsetof(struct appine_cpu, tlb));
     memset(cpu->v, 0, sizeof(cpu->v));
     cpu->nbrk = cpu->nwatch = 0;
+    cpu->dit = 0;
     cpu->mmu = mmu;
     appine_cpu_tlb_flush(cpu);
 }
@@ -138,7 +139,34 @@ static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
 
 enum appine_exit appine_cpu_run(struct appine_cpu *cpu)
 {
+    appine_sync_dit(cpu);
     return appine_guard_run(cpu_run, NULL, cpu);
+}
+
+/* 宿主线程现在的 PSTATE.DIT：-1 是不知道（新线程从创建它的线程继承） */
+static __thread int host_dit = -1;
+
+/*
+ * 让宿主线程的 DIT 与 guest 的一样（一个宿主线程只跑一个 guest 线程）：Tier 1 原样执行的
+ * 数据处理指令这样也有数据无关的执行时间。guest 的 DIT 也会在 MSR 之外变（sigreturn、
+ * ptrace、execve），所以每次进入 guest 代码时比较一次。宿主没有 DIT 时不会宣告它，
+ * guest 的 DIT 总是 0。Tier 1 翻译时用来问 Tier 0 认不认识指令的探测用 cpu 没有 mmu，
+ * 它执行的 MSR DIT 不碰宿主。
+ */
+void appine_sync_dit(struct appine_cpu *cpu)
+{
+#ifdef __aarch64__
+    int want = (int)cpu->dit;
+    if (LIKELY(want == host_dit) || !cpu->mmu || !appine_has(APPINE_HWCAP_DIT))
+        return;
+    if (want)
+        __asm__ volatile(".inst 0xd503415f" ::: "memory"); /* msr dit, #1 */
+    else
+        __asm__ volatile(".inst 0xd503405f" ::: "memory"); /* msr dit, #0 */
+    host_dit = want;
+#else
+    (void)cpu;
+#endif
 }
 
 /* pc 命中了硬件断点（只有 ptrace 设置了断点的线程才有） */
@@ -185,6 +213,7 @@ static enum appine_exit cpu_step(void *ctx, struct appine_cpu *cpu)
 
 enum appine_exit appine_cpu_step(struct appine_cpu *cpu)
 {
+    appine_sync_dit(cpu);
     return appine_guard_run(cpu_step, NULL, cpu);
 }
 

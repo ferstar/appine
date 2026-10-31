@@ -140,6 +140,10 @@ struct appine_cpu {
      * 被观察的页不进 tlb（appine_tlb_fill），Tier 1 访问它们时退给 Tier 0。改了观察点
      * 之后要清空 tlb */
     uint32_t nbrk, nwatch;
+    /* PSTATE.DIT（0 或 1）：MSR、MRS DIT 读写它，信号帧、ptrace 的 pstate 第 24 位。进入
+     * guest 代码时宿主线程的 DIT 跟着它（appine_sync_dit） */
+    uint32_t dit;
+    uint32_t reserved;
     uint64_t brk[APPINE_HW_SLOTS];
     struct appine_watch watch[APPINE_HW_SLOTS];
 };
@@ -166,6 +170,7 @@ struct appine_cpu {
 #define APPINE_HWCAP_ASIMDDP (UINT64_C(1) << 20)
 #define APPINE_HWCAP_SHA512 (UINT64_C(1) << 21)
 #define APPINE_HWCAP_ASIMDFHM (UINT64_C(1) << 23)
+#define APPINE_HWCAP_DIT (UINT64_C(1) << 24)
 #define APPINE_HWCAP_ILRCPC (UINT64_C(1) << 26)
 #define APPINE_HWCAP_FLAGM (UINT64_C(1) << 27)
 #define APPINE_HWCAP_SB (UINT64_C(1) << 29)

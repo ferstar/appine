@@ -4419,6 +4419,7 @@ enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *
     /* 宿主故障作废了这个实例：其余线程用 Tier 0 跑到进程被结束 */
     if (UNLIKELY(d->poisoned))
         return appine_cpu_run(c);
+    appine_sync_dit(c);
     /* 先登记 cpu、再计入 running（见 flush_world） */
     __atomic_store_n(&t->cpu, c, __ATOMIC_SEQ_CST);
     __atomic_fetch_add(&d->running, 1, __ATOMIC_SEQ_CST);

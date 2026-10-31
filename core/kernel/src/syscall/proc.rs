@@ -368,6 +368,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         c.sp = if stack != 0 { stack } else { p.sp };
         c.pc = p.pc;
         c.nzcv = p.nzcv;
+        c.dit = p.dit;
         c.fpcr = p.fpcr;
         c.fpsr = p.fpsr;
         c.v = p.v;

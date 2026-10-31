@@ -94,6 +94,9 @@ pub struct CpuState {
     tlb_used: [u64; TLB_ENTRIES / 64],
     nbrk: u32,
     nwatch: u32,
+    /// PSTATE.DIT（0 或 1），信号帧、ptrace 里是 pstate 的第 24 位。
+    pub dit: u32,
+    reserved: u32,
     brk: [u64; HW_SLOTS],
     watch: [WatchSlot; HW_SLOTS],
 }
@@ -853,6 +856,8 @@ pub mod hwcap {
     pub const SHA512: u64 = 1 << 21;
     /// FHM：半精度乘、加到单精度（FMLAL、FMLSL）。
     pub const ASIMDFHM: u64 = 1 << 23;
+    /// DIT：PSTATE 里的"数据无关的执行时间"（MSR、MRS DIT）。
+    pub const DIT: u64 = 1 << 24;
     /// LRCPC2：带偏移的 LDAPUR、STLUR 这些。
     pub const ILRCPC: u64 = 1 << 26;
     /// FlagM：CFINV、RMIF、SETF8、SETF16。

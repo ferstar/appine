@@ -146,6 +146,7 @@ pub const CLASSES: &[Class] = &[
     case("sb", sb, hwcap::SB),
     case("dcpop", dcpop, hwcap::DCPOP),
     case("dcpodp", dcpodp, HWCAP2_DCPODP),
+    case("dit", dit, hwcap::DIT),
     Class {
         name: "fuzz_simd_fp",
         strict: false,
@@ -1383,6 +1384,21 @@ fn dcpop(g: &mut Rng, _: &Env) -> Case {
 
 fn dcpodp(g: &mut Rng, _: &Env) -> Case {
     dc_persist(g, 0xd50b_7d20)
+}
+
+/// DIT：先用 MSR DIT, #imm（任意 CRm）或者 MSR DIT, Xn（随机值）设，再用 MRS 读回；原生
+/// 一侧上一个用例留下的 DIT 不影响结果。
+fn dit(g: &mut Rng, _: &Env) -> Case {
+    let (rt, rn) = (reg(g), reg(g));
+    let set = if g.bit() == 1 {
+        0xd503_405f | (g.bits(4) << 8)
+    } else {
+        0xd51b_42a0 | rn
+    };
+    Case {
+        insns: vec![set, 0xd53b_42a0 | rt],
+        ..Case::default()
+    }
 }
 
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {

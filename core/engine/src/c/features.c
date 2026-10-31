@@ -2,7 +2,7 @@
  * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
  * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
  * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16/
- * FRINTTS/FlagM/FlagM2/SB/DPB/DPB2 等可选指令是否合法。
+ * FRINTTS/FlagM/FlagM2/SB/DPB/DPB2/DIT 等可选指令是否合法。
  */
 #include <pthread.h>
 
@@ -23,8 +23,9 @@
 #define IMPLEMENTED2 (APPINE_HWCAP2_I8MM | APPINE_HWCAP2_BF16 | APPINE_HWCAP2_FRINT)
 
 /* 不用原生指令桩的：FlagM、FlagM2 由解释器算标志位，SB 和 DC CVAP、DC CVADP 在解释器里不需要
- * 做什么；Tier 1 原样拷贝 CFINV、AXFLAG、XAFLAG、RMIF、SETF 和 SB，所以宿主也要有 */
-#define INTEGER (APPINE_HWCAP_FLAGM | APPINE_HWCAP_SB | APPINE_HWCAP_DCPOP)
+ * 做什么，DIT 记在 cpu 里；Tier 1 原样拷贝 CFINV、AXFLAG、XAFLAG、RMIF、SETF 和 SB，宿主线程的
+ * DIT 跟着 guest 的（appine_sync_dit），所以宿主也要有 */
+#define INTEGER (APPINE_HWCAP_FLAGM | APPINE_HWCAP_SB | APPINE_HWCAP_DCPOP | APPINE_HWCAP_DIT)
 #define INTEGER2 (APPINE_HWCAP2_FLAGM2 | APPINE_HWCAP2_DCPODP)
 
 /* SHA3、SHA512 只一起宣告，还要有 SHA2：LLVM 的 sha3 特性同时管这两组，白名单的核对分不开，
@@ -128,6 +129,8 @@ bool appine_id_register(unsigned key, uint64_t *value)
             v |= UINT64_C(0xf) << 20;
         else if (h & APPINE_HWCAP_ASIMDHP)
             v |= UINT64_C(1) << 20;
+        if (h & APPINE_HWCAP_DIT)
+            v |= UINT64_C(1) << 48;
     } else if (crm == 6 && op2 == 0) { /* ID_AA64ISAR0_EL1 */
         if (h & APPINE_HWCAP_PMULL)
             v |= UINT64_C(2) << 4;

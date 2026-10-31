@@ -2,8 +2,8 @@
  * Tier 0 解释器（设计文档 §4.2）。
  *
  * 覆盖范围：整数数据处理（立即数、寄存器，含 FlagM 的 RMIF、SETF）、CRC32、分支、
- * svc/brk、hint 与屏障（含 SB）、CFINV/XAFLAG/AXFLAG、
- * NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR 与 ID 寄存器、整数 load/store
+ * svc/brk、hint 与屏障（含 SB）、CFINV/XAFLAG/AXFLAG、MSR DIT、
+ * NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR/DIT 与 ID 寄存器、整数 load/store
  * （立即数、寄存器偏移、literal、pair）。SIMD&FP 在 simd.c，独占访问与原子
  * 操作在 atomic.c。其余编码一律按未定义指令上报，与 §4.4 的白名单原则一致：
  * 没实现的就不执行。
@@ -31,6 +31,7 @@
 #define SYSREG_CTR_EL0 SYSREG(3, 3, 0, 0, 1)
 #define SYSREG_CNTFRQ_EL0 SYSREG(3, 3, 14, 0, 0)
 #define SYSREG_CNTVCT_EL0 SYSREG(3, 3, 14, 0, 2)
+#define SYSREG_DIT SYSREG(3, 3, 4, 2, 5)
 
 /*
  * guest 读到的 CTR_EL0：64 字节的缓存行，PIPT 指令缓存。DIC = IDC = 0，即修改代码
@@ -634,6 +635,16 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         else
             c->tpidr_el0 = v;
         return next(c);
+    case SYSREG_DIT: /* 只有第 24 位 */
+        if (!appine_has(APPINE_HWCAP_DIT))
+            return undef(c, insn);
+        if (read) {
+            wx(c, rt, (uint64_t)c->dit << 24);
+        } else {
+            c->dit = (v >> 24) & 1;
+            appine_sync_dit(c);
+        }
+        return next(c);
     case SYSREG_TPIDRRO_EL0: /* Linux 用户态总是读到 0，EL0 不可写 */
         if (!read)
             return undef(c, insn);
@@ -765,6 +776,13 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
     }
     if ((insn & 0xffffff1f) == 0xd500401f) /* MSR（立即数）的 PSTATE.NZCV：CFINV、XAFLAG、AXFLAG */
         return flags_convert(c, insn);
+    if ((insn & 0xfffff0ff) == 0xd503405f) { /* MSR DIT, #imm：与硬件一样取 CRm 的最低位 */
+        if (!appine_has(APPINE_HWCAP_DIT))
+            return undef(c, insn);
+        c->dit = BIT(insn, 8);
+        appine_sync_dit(c);
+        return next(c);
+    }
     if ((insn & 0xffd00000) == 0xd5100000) /* MRS / MSR（寄存器） */
         return sysreg_move(c, insn);
     if ((insn & 0xffffffe0) == 0xd50b7420) { /* DC ZVA：把地址所在的整块清零，块总在一页之内 */
