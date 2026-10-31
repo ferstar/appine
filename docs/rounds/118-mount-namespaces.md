@@ -21,7 +21,7 @@
 - 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。 → 用户命名空间已补上（M9 之前：用户命名空间），pid 命名空间也补上了（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间），cgroup 命名空间也补上了（M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱）；time 仍没有
 - 打开着的命名空间文件、bind 挂载出去的命名空间文件不让命名空间活着：用它的进程都退出之后就卸下了，之后对那个 fd setns 是 EINVAL。→ 已补上（M9 之前：命名空间文件留住命名空间）
 - 命名空间文件的 `NS_GET_USERNS`、`NS_GET_PARENT`、`NS_GET_NSTYPE`、`NS_GET_OWNER_UID` 这些 ioctl 没有（ENOTTY）；setns 不接受 pidfd。→ 这四个 ioctl 已补上（M9 之前：命名空间文件留住命名空间）；setns 接受 pidfd 也补上了（M9 之前：setns 经由 pidfd）
-- `/proc/<pid>/ns/*`、`root`、`cwd` 跟随时不检查能不能跟踪那个进程（Linux 要 `PTRACE_MODE_READ_FSCREDS`）；`/proc/<pid>/exe` 仍按读出来的文字跟随。
+- `/proc/<pid>/ns/*`、`root`、`cwd` 跟随时不检查能不能跟踪那个进程（Linux 要 `PTRACE_MODE_READ_FSCREDS`）；`/proc/<pid>/exe` 仍按读出来的文字跟随。→ `ns/*`、`root`、`cwd` 的检查已补上，跟随和读链接时都查（M9 之前：用户命名空间）；`exe` 仍按读出来的文字跟随，读链接、跟随时也不查（Linux 的 `proc_pid_get_link` 对它同样要求 `PTRACE_MODE_READ_FSCREDS`）
 - 删除、改名一个目录时，它在别的挂载命名空间里是挂载点也算 EBUSY（Linux 只看调用者的命名空间）。
 - 不持 BKL 的 stat 只在开机时的根文件系统的挂载里走：新命名空间里的进程的 stat 都要取 BKL。
 - 没人用的命名空间只在线程退出、umount 时清理；没有 `/proc/sys/user/max_mnt_namespaces`。→ `max_mnt_namespaces` 在下一轮补上了（M9 之前：用户命名空间），后来可以写（M9 之前：网络命名空间），不实际限制；清理的时机没变，命名空间文件留住的关掉之后也一样（M9 之前：命名空间文件留住命名空间）

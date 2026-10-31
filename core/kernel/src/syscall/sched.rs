@@ -9,6 +9,7 @@
 //! `RLIMIT_NICE` 允许或者 `CAP_SYS_NICE`，实时策略要求 `CAP_SYS_NICE`。`SCHED_DEADLINE`
 //! 的参数按 Linux 的规则检查后记录，不做带宽准入控制。
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use super::{SysResult, get, put, write_pair};
@@ -139,14 +140,256 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
     result
 }
 
+// ---- IO 优先级（Linux 6.1 的 block/ioprio.c、blk-ioc.c） ----
+
+const IOPRIO_WHO_PROCESS: i32 = 1;
+const IOPRIO_WHO_PGRP: i32 = 2;
+const IOPRIO_WHO_USER: i32 = 3;
+
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_CLASS_NONE: u16 = 0;
+const IOPRIO_CLASS_RT: u16 = 1;
+const IOPRIO_CLASS_BE: u16 = 2;
+const IOPRIO_CLASS_IDLE: u16 = 3;
+/// RT、BE 的级别数（0 最高）。
+const IOPRIO_NR_LEVELS: u16 = 8;
+
+fn ioprio_class(ioprio: u16) -> u16 {
+    (ioprio >> IOPRIO_CLASS_SHIFT) & 7
+}
+
+fn ioprio_value(class: u16, data: u16) -> u16 {
+    (class << IOPRIO_CLASS_SHIFT) | data
+}
+
+/// ioprio_set、ioprio_get 作用的线程。与 Linux 一样，`IOPRIO_WHO_PROCESS` 是一个线程，
+/// `IOPRIO_WHO_PGRP` 是进程组里所有进程的所有线程，`IOPRIO_WHO_USER` 是真实用户 ID 为它的
+/// 所有线程（看不到的 pid 命名空间里的不算）。内置的 init 没有线程，是 None。找不到是
+/// ESRCH。`uid` 是 `IOPRIO_WHO_USER` 时要找的内核用户 ID（set、get 对 who = 0 的理解不同，
+/// 由调用者算好）。
+fn ioprio_targets(
+    cx: &Cx<'_>,
+    which: i32,
+    who: i32,
+    uid: Option<u32>,
+) -> Result<Vec<Target>, Errno> {
+    let k = cx.kr();
+    let threads = |g: &Rc<RefCell<ThreadGroup>>| -> Vec<Target> {
+        let gb = g.borrow();
+        if gb.tgid == INIT && gb.threads.is_empty() {
+            return vec![(None, g.clone())];
+        }
+        gb.threads
+            .iter()
+            .filter_map(|tid| k.tasks.get(tid))
+            .map(|t| (Some(t.clone()), g.clone()))
+            .collect()
+    };
+    let found: Vec<_> = match which {
+        IOPRIO_WHO_PROCESS => match who {
+            0 => vec![(Some(cx.task.clone()), cx.t.group.clone())],
+            tid => match k.tasks.get(&tid) {
+                Some(t) => k
+                    .groups
+                    .get(&t.tgid)
+                    .map(|g| (Some(t.clone()), g.clone()))
+                    .into_iter()
+                    .collect(),
+                None if tid == INIT => k.groups.get(&INIT).map(threads).unwrap_or_default(),
+                None => Vec::new(),
+            },
+        },
+        IOPRIO_WHO_PGRP => {
+            let pgid = if who == 0 {
+                cx.t.group.borrow().pgid
+            } else {
+                who
+            };
+            k.groups
+                .values()
+                .filter(|g| g.borrow().pgid == pgid)
+                .flat_map(threads)
+                .collect()
+        }
+        IOPRIO_WHO_USER => match uid {
+            Some(uid) => k
+                .groups
+                .values()
+                .filter(|g| {
+                    let g = g.borrow();
+                    g.cred.ruid == uid && cx.pid_out(g.tgid) != 0
+                })
+                .flat_map(threads)
+                .collect(),
+            None => Vec::new(),
+        },
+        _ => return Err(Errno::EINVAL),
+    };
+    if found.is_empty() {
+        return Err(Errno::ESRCH);
+    }
+    Ok(found)
+}
+
+/// ioprio_set 的值本身合不合法、调用者能不能设（`ioprio_check_cap`）：RT 要
+/// `CAP_SYS_ADMIN` 或 `CAP_SYS_NICE`，RT、BE 的级别是 0–7，NONE 的级别只能是 0，IDLE 的
+/// 级别不检查。
+fn ioprio_check(cred: &Cred, ioprio: u16) -> Result<(), Errno> {
+    let data = ioprio & ((1 << IOPRIO_CLASS_SHIFT) - 1);
+    match ioprio_class(ioprio) {
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE => {
+            if ioprio_class(ioprio) == IOPRIO_CLASS_RT
+                && !cred.capable(cap::SYS_ADMIN)
+                && !cred.capable(cap::SYS_NICE)
+            {
+                return Err(Errno::EPERM);
+            }
+            if data >= IOPRIO_NR_LEVELS {
+                return Err(Errno::EINVAL);
+            }
+            Ok(())
+        }
+        IOPRIO_CLASS_IDLE => Ok(()),
+        IOPRIO_CLASS_NONE if data == 0 => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+pub(super) fn ioprio_set(cx: &mut Cx<'_>, which: i32, who: i32, ioprio: i32) -> SysResult {
+    let cred = cx.cred();
+    // io_context 里的是 unsigned short，高位丢掉（检查只看第 0–15 位）
+    let ioprio = ioprio as u16;
+    ioprio_check(&cred, ioprio)?;
+    // Linux 在这里用 make_kuid(current_user_ns(), who)：who = 0 是 root，不是自己
+    let uid = (which == IOPRIO_WHO_USER)
+        .then(|| cred.uid_in(who as u32))
+        .flatten();
+    for (t, g) in ioprio_targets(cx, which, who, uid)? {
+        // set_task_ioprio：目标的真实用户 ID 要等于自己的有效或真实用户 ID，或者有
+        // CAP_SYS_NICE；进程组、用户的第一次失败就返回，前面的已经改了
+        let target = g.borrow().cred.ruid;
+        if target != cred.euid && target != cred.ruid && !cred.capable(cap::SYS_NICE) {
+            return Err(Errno::EPERM);
+        }
+        if let Some(t) = t {
+            set_task_ioprio(cx, &t, ioprio);
+        }
+    }
+    Ok(0)
+}
+
+/// 记下线程 `t` 的 IO 优先级（没有 io_context 时建一个），交给宿主线程。`CLONE_IO` 共用
+/// 这一份的线程也一起交给宿主。
+fn set_task_ioprio(cx: &Cx<'_>, t: &Rc<Task>, ioprio: u16) {
+    let shared = {
+        let mut slot = t.ioprio.borrow_mut();
+        let cell = slot.get_or_insert_with(|| Rc::new(Cell::new(0)));
+        cell.set(ioprio);
+        Rc::strong_count(cell) > 1
+    };
+    if shared {
+        let mine = t.ioprio.borrow().clone();
+        for other in cx.kr().tasks.values() {
+            let same =
+                matches!((&*other.ioprio.borrow(), &mine), (Some(a), Some(b)) if Rc::ptr_eq(a, b));
+            if same {
+                apply_host_ioprio(other, false);
+            }
+        }
+    } else {
+        apply_host_ioprio(t, false);
+    }
+}
+
+/// 线程的原始 IO 优先级：没有设置过是 0（`IOPRIO_DEFAULT`，NONE 类）。
+fn raw_ioprio(t: &Task) -> u16 {
+    t.ioprio.borrow().as_ref().map_or(0, |c| c.get())
+}
+
+/// 线程实际的 IO 优先级（`__get_task_ioprio`）：NONE 类按调度策略和 nice 值推出来，
+/// `SCHED_IDLE` 是 IDLE，实时策略是 RT，其余是 BE，级别是 (nice + 20) / 5。内置的 init
+/// 是 BE 4。
+fn effective_ioprio(t: Option<&Task>) -> u16 {
+    let Some(t) = t else {
+        return ioprio_value(IOPRIO_CLASS_BE, 4);
+    };
+    let raw = raw_ioprio(t);
+    if ioprio_class(raw) != IOPRIO_CLASS_NONE {
+        return raw;
+    }
+    let class = match t.sched.get().0 & !SCHED_RESET_ON_FORK {
+        SCHED_IDLE => IOPRIO_CLASS_IDLE,
+        SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => IOPRIO_CLASS_RT,
+        _ => IOPRIO_CLASS_BE,
+    };
+    ioprio_value(class, ((t.nice.get() + 20) / 5) as u16)
+}
+
+pub(super) fn ioprio_get(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
+    let cred = cx.cred();
+    // 这里 who = 0 是自己的真实用户（current_user()）
+    let uid = (which == IOPRIO_WHO_USER)
+        .then(|| {
+            if who == 0 {
+                Some(cred.ruid)
+            } else {
+                cred.uid_in(who as u32)
+            }
+        })
+        .flatten();
+    let targets = ioprio_targets(cx, which, who, uid)?;
+    // 一个线程时是它原来设的值（`get_task_raw_ioprio`），进程组和用户是实际的优先级里
+    // 最高的（数值最小，`ioprio_best`）
+    let prio = if which == IOPRIO_WHO_PROCESS {
+        targets[0].0.as_deref().map_or(0, raw_ioprio)
+    } else {
+        targets
+            .iter()
+            .map(|(t, _)| effective_ioprio(t.as_deref()))
+            .min()
+            .unwrap()
+    };
+    Ok(prio as u64)
+}
+
+/// 新线程的 IO 优先级（`copy_io`）：创建者有 io_context 时，`CLONE_IO` 共用它，否则类别
+/// 不是 NONE 的复制一份；创建者没有的，新线程也没有。
+pub(super) fn inherit_ioprio(parent: &Option<Rc<Cell<u16>>>, flags: u64) -> Option<Rc<Cell<u16>>> {
+    const CLONE_IO: u64 = 0x8000_0000;
+    let p = parent.as_ref()?;
+    if flags & CLONE_IO != 0 {
+        Some(p.clone())
+    } else {
+        (ioprio_class(p.get()) != IOPRIO_CLASS_NONE).then(|| Rc::new(Cell::new(p.get())))
+    }
+}
+
+/// 按 guest 线程的 IO 优先级设置它的宿主线程的：RT 降成同一级的 BE（与 nice 值一样，
+/// guest 不能让宿主线程的 IO 压过界面），NONE 让宿主按 nice 值推。`reset` 时没设置过的也
+/// 写一次（线程池里复用的宿主线程还留着上一个 guest 线程的）。
+fn apply_host_ioprio(t: &Task, reset: bool) {
+    let tid = t.host_tid.get();
+    if tid == 0 || (!reset && t.ioprio.borrow().is_none()) {
+        return;
+    }
+    let raw = raw_ioprio(t);
+    let host = if ioprio_class(raw) == IOPRIO_CLASS_RT {
+        ioprio_value(IOPRIO_CLASS_BE, raw & ((1 << IOPRIO_CLASS_SHIFT) - 1))
+    } else {
+        raw
+    };
+    appine_hal::set_thread_ioprio(tid, host);
+}
+
 /// guest 提高优先级时，宿主线程的 nice 值最低到这里：不超过 Android 上与显示有关的
 /// 线程（-4 到 -10），guest 的忙循环不会拖慢界面。
 const HOST_NICE_FLOOR: i32 = -4;
 
-/// 宿主线程开始运行 guest 线程 `t`：它继承的是创建它的宿主线程的优先级和亲和性（`reused`
-/// 时是上一个 guest 线程的），换成 `t` 自己的。
+/// 宿主线程开始运行 guest 线程 `t`：它继承的是创建它的宿主线程的优先级、IO 优先级和
+/// 亲和性（`reused` 时是上一个 guest 线程的），换成 `t` 自己的。
 pub(crate) fn host_started(t: &Task, reused: bool) {
     apply_host(t);
+    apply_host_ioprio(t, reused);
     let mask = t.affinity.get() & online_cpus();
     // 线程池里复用的宿主线程还留着上一个 guest 线程的亲和性
     if mask != online_cpus() || reused {

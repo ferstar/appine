@@ -861,6 +861,95 @@ pub fn set_thread_nice(tid: i32, nice: i32) {
     let _ = (tid, nice);
 }
 
+/// 设置宿主线程 `tid` 的 IO 优先级（`ioprio_set(IOPRIO_WHO_PROCESS, tid, ioprio)`，值按
+/// Linux 的编码：类别在第 13–15 位）。Android 的应用 seccomp 放行它。没有权限时保持原样。
+pub fn set_thread_ioprio(tid: i32, ioprio: u16) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            tid as libc::c_long,
+            ioprio as libc::c_long,
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (tid, ioprio);
+}
+
+/// 宿主线程 `tid` 的 IO 优先级（`ioprio_get(IOPRIO_WHO_PROCESS, tid)`）。
+pub fn thread_ioprio(tid: i32) -> Option<u16> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_get,
+                IOPRIO_WHO_PROCESS,
+                tid as libc::c_long,
+            )
+        };
+        (r >= 0).then_some(r as u16)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = tid;
+        None
+    }
+}
+
+/// `struct __kernel_timex` 的大小（arm64、x86_64 的 Linux 相同）。
+pub const TIMEX_SIZE: usize = 208;
+
+/// 宿主时钟的 NTP 状态（只读的 adjtimex）：返回 adjtimex 的返回值（时钟状态，比如
+/// `TIME_OK`、`TIME_ERROR`）和填好的 `struct __kernel_timex`。`adjtime` 为真时按
+/// `ADJ_OFFSET_SS_READ` 查询（offset 是 adjtime(3) 剩下的调整量），否则按 modes = 0。
+///
+/// Android 的应用 seccomp 不让调 adjtimex（`SECCOMP_BLOCKLIST_APP.TXT`，调了整个 App
+/// 收到 SIGSYS），按 Android 上内核的实际状态合成：Android 用 settimeofday 校时、不运行
+/// 内核的 NTP 调整，时钟一直是未同步（`STA_UNSYNC`），各项是 `ntp_clear` 之后的初值。
+pub fn adjtimex_query(adjtime: bool) -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
+    let mut buf = [0u8; TIMEX_SIZE];
+    #[cfg(target_os = "linux")]
+    {
+        const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+        let modes: u32 = if adjtime { ADJ_OFFSET_SS_READ } else { 0 };
+        buf[..4].copy_from_slice(&modes.to_le_bytes());
+        let r = unsafe { libc::syscall(libc::SYS_adjtimex, buf.as_mut_ptr()) };
+        if r < 0 {
+            return Err(last_errno());
+        }
+        Ok((r as i32, buf))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (adjtime, &mut buf);
+        unsynchronized_timex()
+    }
+}
+
+/// 没有运行内核 NTP 调整的时钟的状态（`ntp_clear` 之后的初值）：`STA_UNSYNC`，误差是
+/// `NTP_PHASE_LIMIT`，time_constant = 2，precision 1，tolerance 为 `MAXFREQ_SCALED /
+/// PPM_SCALE`（500 ppm 左移 16 位），tick 是 1000000 / USER_HZ，返回 `TIME_ERROR`。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn unsynchronized_timex() -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
+    const TIME_ERROR: i32 = 5;
+    let mut buf = [0u8; TIMEX_SIZE];
+    let mut put = |off: usize, v: i64| buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    put(24, 16_000_000); // maxerror
+    put(32, 16_000_000); // esterror
+    put(48, 2); // constant
+    put(56, 1); // precision
+    put(64, 500 << 16); // tolerance
+    let (sec, nsec) = clock_gettime(0)?; // CLOCK_REALTIME
+    put(72, sec);
+    put(80, nsec / 1000); // 没有 STA_NANO：微秒
+    put(88, 10_000); // tick
+    buf[40..44].copy_from_slice(&0x40i32.to_le_bytes()); // status = STA_UNSYNC
+    Ok((TIME_ERROR, buf))
+}
+
 /// 当前宿主线程的 tid。
 pub fn gettid() -> i32 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1253,6 +1342,31 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn synthesized_clock_state_matches_a_kernel_without_ntp() {
+        // Android 上合成的（unsynchronized_timex）与宿主内核的只读查询在不随 NTP 状态变的
+        // 字段上相同；合成的是未同步、TIME_ERROR，时间是现在
+        let field = |b: &[u8; TIMEX_SIZE], off: usize| {
+            i64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+        };
+        let (state, fake) = unsynchronized_timex().unwrap();
+        assert_eq!(state, 5);
+        assert_eq!(i32::from_le_bytes(fake[40..44].try_into().unwrap()), 0x40);
+        assert_eq!(
+            (field(&fake, 24), field(&fake, 32)),
+            (16_000_000, 16_000_000)
+        );
+        let now = clock_gettime(0).unwrap().0;
+        assert!((now - field(&fake, 72)).abs() <= 1);
+        #[cfg(target_os = "linux")]
+        {
+            let (_, host) = adjtimex_query(false).unwrap();
+            for off in [56, 64, 88] {
+                assert_eq!(field(&fake, off), field(&host, off), "offset {off}");
+            }
+        }
+    }
 
     #[test]
     fn checking_an_event_does_not_clear_it() {

@@ -264,7 +264,7 @@ const PROC_NET: [&[u8]; 18] = [
 ];
 
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 71] = [
+const STATIC: [&[u8]; 73] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -291,6 +291,7 @@ const STATIC: [&[u8]; 71] = [
     b"sys/kernel/cap_last_cap",
     b"sys/kernel/core_pattern",
     b"sys/kernel/core_uses_pid",
+    b"sys/kernel/dmesg_restrict",
     b"sys/kernel/domainname",
     b"sys/kernel/hostname",
     b"sys/kernel/msgmax",
@@ -303,6 +304,7 @@ const STATIC: [&[u8]; 71] = [
     b"sys/kernel/overflowgid",
     b"sys/kernel/overflowuid",
     b"sys/kernel/pid_max",
+    b"sys/kernel/printk",
     b"sys/kernel/random/",
     b"sys/kernel/random/boot_id",
     b"sys/kernel/random/entropy_avail",
@@ -1287,6 +1289,8 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/kernel/core_pattern"
                     | b"sys/kernel/seccomp/actions_logged"
                     | b"sys/kernel/core_uses_pid"
+                    | b"sys/kernel/dmesg_restrict"
+                    | b"sys/kernel/printk"
                     | b"sys/kernel/msgmax"
                     | b"sys/kernel/msgmnb"
                     | b"sys/kernel/msgmni"
@@ -1469,6 +1473,31 @@ pub(crate) fn write(
         let pattern = data.strip_suffix(b"\n").unwrap_or(data);
         let len = pattern.len().min(crate::coredump::PATTERN_MAX - 1);
         k.core_pattern = pattern[..len].to_vec();
+    }
+    // proc_dointvec_minmax_sysadmin：写要开机时的命名空间里的 CAP_SYS_ADMIN，只能是 0、1
+    if let PseudoNode::Static(b"sys/kernel/dmesg_restrict") = node {
+        if !cred.capable(cap::SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        k.dmesg_restrict = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|v| (0..=1).contains(v))
+            .ok_or(Errno::EINVAL)?
+            == 1;
+    }
+    // proc_dointvec：按顺序写前几个，最多四个；第一个就不是数时 EINVAL
+    if let PseudoNode::Static(b"sys/kernel/printk") = node {
+        let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let values: Vec<i32> = text
+            .split_ascii_whitespace()
+            .map_while(|t| t.parse().ok())
+            .take(4)
+            .collect();
+        if values.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        k.printk[..values.len()].copy_from_slice(&values);
     }
     if let PseudoNode::Static(b"sys/kernel/core_uses_pid") = node {
         let v: i64 = std::str::from_utf8(data)
@@ -2715,6 +2744,11 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             | b"sys/fs/overflowuid"
             | b"sys/fs/overflowgid" => "65534\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
+            b"sys/kernel/dmesg_restrict" => format!("{}\n", ps.k.dmesg_restrict as u8),
+            b"sys/kernel/printk" => {
+                let [a, b, c, d] = ps.k.printk;
+                format!("{a}\t{b}\t{c}\t{d}\n")
+            }
             // 每个用户能建的各种命名空间个数的上限：与 Linux 的默认值一样是 threads-max 的
             // 一半，只读，不实际限制
             p if p.starts_with(b"sys/user/max_") => {

@@ -123,6 +123,8 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
         // waitid(P_PID 或 P_PGID)、setpriority/getpriority(PRIO_PROCESS 或 PRIO_PGRP)
         95 if matches!(a[0], 1 | 2) => &[1],
         140 | 141 if matches!(a[0], 0 | 1) => &[1],
+        // ioprio_set/ioprio_get(IOPRIO_WHO_PROCESS 或 IOPRIO_WHO_PGRP)
+        30 | 31 if matches!(a[0], 1 | 2) => &[1],
         // fcntl(F_SETOWN)
         25 if a[1] == 8 => &[2],
         _ => &[],
@@ -269,6 +271,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         27 => inotify::inotify_add_watch(cx, a[0] as i32, a[1], a[2] as u32),
         28 => inotify::inotify_rm_watch(cx, a[0] as i32, a[1] as i32),
         29 => fs::ioctl(cx, a[0] as i32, a[1] as u32, a[2]),
+        30 => sched::ioprio_set(cx, a[0] as i32, a[1] as i32, a[2] as i32),
+        31 => sched::ioprio_get(cx, a[0] as i32, a[1] as i32),
         32 => fs::flock(cx, a[0] as i32, a[1] as u32),
         33 => fs::mknodat(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
         34 => fs::mkdirat(cx, a[0] as i32, a[1], a[2] as u32),
@@ -360,6 +364,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         113 => misc::clock_gettime(cx, a[0] as i32, a[1]),
         114 => misc::clock_getres(cx, a[0] as i32, a[1]),
         115 => misc::clock_nanosleep(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        116 => misc::syslog(cx, a[0] as i32, a[1], a[2] as i32),
         118 => sched::sched_setparam(cx, a[0] as i32, a[1]),
         119 => sched::sched_setscheduler(cx, a[0] as i32, a[1] as i32, a[2]),
         120 => sched::sched_getscheduler(cx, a[0] as i32),
@@ -409,8 +414,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         166 => misc::umask(cx, a[0] as u32),
         167 => misc::prctl(cx, a[0] as i32, [a[1], a[2], a[3], a[4]]),
         169 => misc::gettimeofday(cx, a[0], a[1]),
-        170 => Err(Errno::EPERM),    // settimeofday：guest 不能改宿主的时间
-        172 => Ok(cx.tgid() as u64), // getpid
+        170 => Err(Errno::EPERM), // settimeofday：guest 不能改宿主的时间
+        171 => misc::adjtimex(cx, None, a[0]),
+        172 => Ok(cx.tgid() as u64),                // getpid
         173 => Ok(cx.t.group.borrow().ppid as u64), // getppid
         174 | 175 => cred::getuid(cx, nr == 175),
         176 | 177 => cred::getgid(cx, nr == 177),
@@ -488,6 +494,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         243 => net::recvmmsg(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
         260 => proc::wait4(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
         261 => misc::prlimit(cx, a[0] as i32, a[1] as u32, a[2], a[3]),
+        266 => misc::adjtimex(cx, Some(a[0] as i32), a[1]),
         267 => fs::cache_hint(cx, a[0] as i32, 0, 0, 0, 2).and_then(|_| fs::sync(cx)),
         264 => fs::name_to_handle_at(cx, a[0] as i32, a[1], a[2], a[3], a[4] as u32),
         265 => fs::open_by_handle_at(cx, a[0] as i32, a[1], a[2] as u32),

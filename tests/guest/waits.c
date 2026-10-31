@@ -117,6 +117,17 @@ static void send_usr1(long unused)
     syscall(SYS_tgkill, getpid(), main_tid, SIGUSR1);
 }
 
+static void send_alrm(long unused)
+{
+    (void)unused;
+    syscall(SYS_tgkill, getpid(), main_tid, SIGALRM);
+}
+
+static void on_alrm(int sig)
+{
+    (void)sig;
+}
+
 static int msq;
 
 static void send_msg(long unused)
@@ -461,6 +472,13 @@ int main(void)
     CHECK(waitpid(child, &st, 0) == child && WEXITSTATUS(st) == 5, "waitpid");
     ok("waitpid");
     seccomp_listener();
+    /* syslog 的读：appine 的日志是空的，等到信号来（处理函数不带 SA_RESTART，EINTR） */
+    struct sigaction sa = {.sa_handler = on_alrm};
+    sigaction(SIGALRM, &sa, NULL);
+    after(&l, send_alrm, 0);
+    CHECK(syscall(SYS_syslog, 2, buf, (int)sizeof buf) == -1 && errno == EINTR, "syslog read");
+    join(&l);
+    ok("syslog read");
     printf("all ok\n");
     return 0;
 }

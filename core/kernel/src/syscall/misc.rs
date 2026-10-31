@@ -501,6 +501,151 @@ pub(super) fn clock_settime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
     }
 }
 
+/// adjtimex（`clock` 为 None）和 clock_adjtime：只回答查询，宿主时钟的 NTP 状态由
+/// [`appine_hal::adjtimex_query`] 给出。要改时钟、NTP 参数的一律是 EPERM，与
+/// clock_settime 一样当作没有 `CAP_SYS_TIME`（`timekeeping_validate_timex`）。adjtimex
+/// 无论成败都把结构体写回去，clock_adjtime 只在成功时写回，与 Linux 相同。
+pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResult {
+    const ADJ_FREQUENCY: u32 = 0x0002;
+    const ADJ_SETOFFSET: u32 = 0x0100;
+    // 内核里的定义（用户态头文件的 ADJ_OFFSET_SINGLESHOT 是 0x8001，带着 ADJ_ADJTIME）
+    const ADJ_OFFSET_SINGLESHOT: u32 = 0x0001;
+    const ADJ_OFFSET_READONLY: u32 = 0x2000;
+    const ADJ_ADJTIME: u32 = 0x8000;
+    /// `PPM_SCALE`：NSEC_PER_USEC << (NTP_SCALE_SHIFT - SHIFT_USEC)。
+    const PPM_SCALE: i64 = 1000 << 16;
+    const CLOCKFD: i32 = 3;
+    const CLOCK_SGI_CYCLE: i32 = 10;
+    const CLOCK_TAI: i32 = 11;
+
+    let mut tx: [u8; appine_hal::TIMEX_SIZE] = get(cx, buf)?;
+    let modes = u32::from_le_bytes(tx[..4].try_into().unwrap());
+    let freq = i64::from_le_bytes(tx[16..24].try_into().unwrap());
+    let result = (|| {
+        // do_clock_adjtime：只有 CLOCK_REALTIME 能调；fd 编码的动态时钟要是 PTP 这类设备
+        // 的 fd，appine 里没有
+        match clock {
+            None | Some(CLOCK_REALTIME) => {}
+            Some(c) if c < 0 && c & 7 == CLOCKFD => return Err(Errno::EINVAL),
+            Some(c) if c < 0 => return Err(Errno::EOPNOTSUPP),
+            Some(CLOCK_SGI_CYCLE) => return Err(Errno::EINVAL),
+            Some(c) if c > CLOCK_TAI => return Err(Errno::EINVAL),
+            Some(_) => return Err(Errno::EOPNOTSUPP),
+        }
+        // ADJ_ADJTIME 要带 ADJ_OFFSET_SINGLESHOT，再带 ADJ_OFFSET_READONLY 的（adjtime(3)
+        // 查剩下的调整量）是查询；不是 ADJ_ADJTIME 时 modes 不为 0 的都要改东西
+        let query_adjtime = modes & ADJ_ADJTIME != 0;
+        if query_adjtime {
+            if modes & ADJ_OFFSET_SINGLESHOT == 0 {
+                return Err(Errno::EINVAL);
+            }
+            if modes & ADJ_OFFSET_READONLY == 0 {
+                return Err(Errno::EPERM);
+            }
+        } else if modes != 0 {
+            return Err(Errno::EPERM);
+        }
+        if modes & ADJ_SETOFFSET != 0 {
+            return Err(Errno::EPERM);
+        }
+        if modes & ADJ_FREQUENCY != 0
+            && !(i64::MIN / PPM_SCALE..=i64::MAX / PPM_SCALE).contains(&freq)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let (state, host) = appine_hal::adjtimex_query(query_adjtime).map_err(Errno)?;
+        // __do_adjtimex 填所有有名字的字段，modes 和填充不动
+        for range in [8..44, 48..116, 120..164] {
+            tx[range.clone()].copy_from_slice(&host[range]);
+        }
+        Ok(state as u64)
+    })();
+    if result.is_ok() || clock.is_none() {
+        cx.mm().write(UserSlice::new(buf, tx.len()), &tx)?;
+    }
+    result
+}
+
+/// syslog(2)（klogctl）：appine 没有内核日志，日志总是空的。权限与 Linux 6.1 的
+/// `check_syslog_permissions` 相同：`dmesg_restrict` 为 0 时谁都能读全部和问缓冲区大小，
+/// 别的动作（和 `dmesg_restrict` 为 1 时的所有动作）要开机时的命名空间里的 `CAP_SYSLOG`
+/// 或 `CAP_SYS_ADMIN`，先于参数检查。控制台的日志级别照常记下（`/proc/sys/kernel/printk`），
+/// 只是没有控制台可打印。
+pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResult {
+    const SYSLOG_ACTION_READ: i32 = 2;
+    const SYSLOG_ACTION_READ_ALL: i32 = 3;
+    const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+    const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+    /// `log_buf_len`：CONFIG_LOG_BUF_SHIFT 的默认值 17。
+    const LOG_BUF_LEN: u64 = 1 << 17;
+    /// arm64 的 `TASK_SIZE_MAX`（48 位地址）：`access_ok` 只看地址范围。
+    const TASK_SIZE_MAX: u64 = 1 << 48;
+
+    let restricted = cx.kr().dmesg_restrict
+        || (kind != SYSLOG_ACTION_READ_ALL && kind != SYSLOG_ACTION_SIZE_BUFFER);
+    if restricted {
+        let cred = cx.cred();
+        if !cred.capable(cap::SYSLOG) && !cred.capable(cap::SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+    }
+    let check_buf = || -> Result<bool, Errno> {
+        if buf == 0 || len < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if len > 0
+            && buf
+                .checked_add(len as u64)
+                .is_none_or(|end| end > TASK_SIZE_MAX)
+        {
+            return Err(Errno::EFAULT);
+        }
+        Ok(len > 0)
+    };
+    match kind {
+        // 关闭、打开、清空、未读的字节数
+        0 | 1 | 5 | 9 => Ok(0),
+        // 没有新的日志：一直等到被信号打断
+        SYSLOG_ACTION_READ => {
+            if !check_buf()? {
+                return Ok(0);
+            }
+            while !cx.interrupted() {
+                cx.wait_alone(None)?;
+            }
+            Err(Errno::ERESTARTSYS)
+        }
+        SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => check_buf().map(|_| 0),
+        // 关掉控制台：存下现在的级别（还没存过时），换成最低级别
+        6 => {
+            let k = cx.k();
+            let level = k.printk[0];
+            k.saved_console_loglevel.get_or_insert(level);
+            k.printk[0] = k.printk[2];
+            Ok(0)
+        }
+        7 => {
+            let k = cx.k();
+            if let Some(level) = k.saved_console_loglevel.take() {
+                k.printk[0] = level;
+            }
+            Ok(0)
+        }
+        // 设控制台级别（1–8，不低于最低级别），同时重新打开控制台
+        8 => {
+            if !(1..=8).contains(&len) {
+                return Err(Errno::EINVAL);
+            }
+            let k = cx.k();
+            k.printk[0] = len.max(k.printk[2]);
+            k.saved_console_loglevel = None;
+            Ok(0)
+        }
+        SYSLOG_ACTION_SIZE_BUFFER => Ok(LOG_BUF_LEN),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
     if tv != 0 {
         let (sec, nsec) = appine_hal::clock_gettime(CLOCK_REALTIME).map_err(Errno)?;

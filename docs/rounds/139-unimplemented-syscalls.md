@@ -1,6 +1,6 @@
 # M9 之前：未实现的系统调用（2026-10-31）
 
-← [M9 之前：LRCPC2（2026-10-31）](138-lrcpc2.md) · [索引](../milestones.md)
+← [M9 之前：LRCPC2（2026-10-31）](138-lrcpc2.md) · [索引](../milestones.md) · [M9 之前：ioprio、syslog 和 adjtimex（2026-10-31）](140-ioprio-syslog-adjtimex.md) →
 
 第 138 轮之后全量核对推迟项时，拿分发表（`core/kernel/src/syscall/mod.rs`）对照 Linux 6.1 的系统调用表（`include/uapi/asm-generic/unistd.h`），发现一批返回 ENOSYS 的编号没有写进任何一篇。这一轮只记下来，不改代码。
 
@@ -55,8 +55,8 @@ Linux 6.1 上一般都有，appine 是 ENOSYS：
 **推迟项**：
 
 - openat2：`RESOLVE_*` 的几种限制（不越出起点、把起点当作根、不跟随符号链接、不跨挂载、不跟随魔法链接）要在路径解析里加上。
-- adjtimex、clock_adjtime：至少可以回答只读的查询。改时钟与 settimeofday 一样，宿主的时间 guest 改不了。
-- ioprio_set、ioprio_get：appine 没有 I/O 调度，可以只记下、读回优先级，或者像 nice 那样交给宿主线程（[推迟项](19-deferred.md)那一轮）。
-- syslog：appine 没有内核日志，可以按 Linux 的权限检查（`dmesg_restrict`、CAP_SYSLOG）回答一份空的日志。
+- adjtimex、clock_adjtime：至少可以回答只读的查询。改时钟与 settimeofday 一样，宿主的时间 guest 改不了。→ 已补上（M9 之前：ioprio、syslog 和 adjtimex）：查询取宿主的 NTP 状态，Android 上按未同步合成；要改东西的是 EPERM
+- ioprio_set、ioprio_get：appine 没有 I/O 调度，可以只记下、读回优先级，或者像 nice 那样交给宿主线程（[推迟项](19-deferred.md)那一轮）。→ 已补上（M9 之前：ioprio、syslog 和 adjtimex）：按线程记，交给宿主线程（RT 降成 BE）
+- syslog：appine 没有内核日志，可以按 Linux 的权限检查（`dmesg_restrict`、CAP_SYSLOG）回答一份空的日志。→ 已补上（M9 之前：ioprio、syslog 和 adjtimex），加了 `/proc/sys/kernel/printk`、`dmesg_restrict`
 - process_madvise、process_mrelease：用得少，有程序要时再做。
 - 上面第二组不做，与没配对应功能的 Linux 一样。

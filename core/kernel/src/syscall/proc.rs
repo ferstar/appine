@@ -426,6 +426,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let (sched, nice) = super::sched::inherit(cx.task.sched.get(), cx.task.nice.get());
     task.sched.set(sched);
     task.nice.set(nice);
+    *task.ioprio.borrow_mut() = super::sched::inherit_ioprio(&cx.task.ioprio.borrow(), flags);
     task.deadline.set(cx.task.deadline.get());
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));

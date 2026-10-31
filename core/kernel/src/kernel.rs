@@ -217,6 +217,12 @@ pub(crate) struct Kernel {
     /// `/proc/sys/kernel/core_pattern`、`core_uses_pid`（`crate::coredump`）。
     pub core_pattern: Vec<u8>,
     pub core_uses_pid: bool,
+    /// 内核日志（`syscall::misc::syslog`）：`/proc/sys/kernel/printk` 的四个级别（控制台、
+    /// 默认消息、控制台最低、控制台默认），`SYSLOG_ACTION_CONSOLE_OFF` 存下的控制台级别，
+    /// `/proc/sys/kernel/dmesg_restrict`。
+    pub printk: [i32; 4],
+    pub saved_console_loglevel: Option<i32>,
+    pub dmesg_restrict: bool,
     /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
     pub pipe_max_size: usize,
     /// `/proc/sys/fs/nr_open`：fd 的上限（`RLIMIT_NOFILE` 不能超过它）。
@@ -309,6 +315,11 @@ impl Kernel {
             seals: BTreeMap::new(),
             core_pattern: b"core".to_vec(),
             core_uses_pid: false,
+            // CONSOLE_LOGLEVEL_DEFAULT、MESSAGE_LOGLEVEL_DEFAULT、CONSOLE_LOGLEVEL_MIN 的默认
+            // 配置；没有 CONFIG_SECURITY_DMESG_RESTRICT
+            printk: [7, 4, 1, 7],
+            saved_console_loglevel: None,
+            dmesg_restrict: false,
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
             threads_max: crate::process::default_threads_max(),

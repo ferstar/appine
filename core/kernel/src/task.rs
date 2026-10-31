@@ -93,6 +93,10 @@ pub(crate) struct Task {
     pub nice: Cell<i32>,
     /// 调度策略（含 `SCHED_RESET_ON_FORK`）和实时优先级：只记录，由宿主调度。
     pub sched: Cell<(i32, i32)>,
+    /// IO 优先级（ioprio_set 设置的原始值，Linux 的 `io_context->ioprio`）。None 是还没有
+    /// io_context（ioprio_get 读到 0）；`CLONE_IO` 建的线程与创建者共用一份。宿主线程
+    /// 跟着设置（`syscall::sched`）。
+    pub ioprio: RefCell<Option<Rc<Cell<u16>>>>,
     /// `SCHED_DEADLINE` 的 (runtime, deadline, period)，纳秒。
     pub deadline: Cell<(u64, u64, u64)>,
     /// `PR_SET_TIMERSLACK` 的定时器松弛量和默认值（纳秒）：只记录。新线程的两者都是
@@ -203,6 +207,7 @@ impl Task {
             comm: Cell::new(comm),
             nice: Cell::new(0),
             sched: Cell::new((0, 0)),
+            ioprio: RefCell::new(None),
             deadline: Cell::new((0, 0, 0)),
             timerslack: Cell::new((50_000, 50_000)),
             affinity: Cell::new(u64::MAX),

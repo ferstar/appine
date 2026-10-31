@@ -382,6 +382,65 @@ fn every_kind_of_wait_releases_the_bkl_without_borrows() {
 }
 
 #[test]
+fn kernel_log_is_empty_and_keeps_console_levels() {
+    // appine 没有内核日志：dmesg 什么也不打印；dmesg -n 改的控制台级别在
+    // /proc/sys/kernel/printk 里看得到；dmesg_restrict 为 1 时普通用户读不了，只能写 0、1
+    let script = "dmesg; echo rc=$?; dmesg -n 3; cat /proc/sys/kernel/printk; \
+        echo '6 4 1' > /proc/sys/kernel/printk; cat /proc/sys/kernel/printk; \
+        echo 1 > /proc/sys/kernel/dmesg_restrict; su -s /bin/sh nobody -c dmesg; echo rc=$?; \
+        echo 2 > /proc/sys/kernel/dmesg_restrict 2>/dev/null || echo rejected; \
+        echo 0 > /proc/sys/kernel/dmesg_restrict; su -s /bin/sh nobody -c dmesg; echo rc=$?";
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        assert_eq!(
+            stdout(&out),
+            "rc=0\n3\t4\t1\t7\n6\t4\t1\t7\nrc=1\nrejected\nrc=0\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("klogctl: Operation not permitted"),
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn io_priority_reaches_the_host_thread() {
+    // ionice 之后执行的程序在宿主上的线程也设上了（Android 的应用 seccomp 放行 ioprio_set）：
+    // IDLE 照搬，RT 降成同一级的 BE
+    let Some(store) = store() else {
+        return;
+    };
+    for tier in TIERS {
+        for (class, want) in [("-c3", 0x6000u16), ("-c1 -n2", 0x4002)] {
+            let script = format!("ionice {class} sh -c 'echo ready; read x'");
+            let mut child = command(store, tier, &["/bin/sh", "-c", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "ready\n", "tier {tier}");
+            let prios: Vec<u16> = std::fs::read_dir(format!("/proc/{}/task", child.id()))
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .filter_map(appine_hal::thread_ioprio)
+                .collect();
+            child.stdin.take().unwrap().write_all(b"\n").unwrap();
+            assert!(child.wait().unwrap().success(), "tier {tier}");
+            assert!(
+                prios.contains(&want) && prios.iter().all(|p| p >> 13 != 1),
+                "tier {tier} {class}: {prios:x?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn interface_counters_count_guest_traffic() {
     // 回环上收发之后 /proc/net/dev、sysfs、netlink 三处 lo 的计数相同，增加的正好是载荷
     // （tests/guest/traffic.c）

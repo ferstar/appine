@@ -148,6 +148,7 @@
 | [M9 之前：PDEATHSIG 和 __WNOTHREAD](rounds/137-pdeathsig-wnothread.md) | 2026-10-31 | `PR_SET_PDEATHSIG` 按线程记，父进程里建立它的线程一退出就发（`SI_USER`，发送者是父进程）；wait 的 `__WNOTHREAD` 只等调用的线程建的子进程 |
 | [M9 之前：LRCPC2](rounds/138-lrcpc2.md) | 2026-10-31 | 宿主有时宣告 LRCPC2（`ilrcpc`）：带 9 位偏移的 LDAPUR、LDAPURS、STLUR 在 Tier 0 里照 LDAR、STLR 读写，在 Tier 1 里检查基址加偏移之后去掉偏移原样执行 |
 | [M9 之前：未实现的系统调用](rounds/139-unimplemented-syscalls.md) | 2026-10-31 | 只有文档：对照 Linux 6.1 的系统调用表补记返回 ENOSYS 的编号；openat2、adjtimex、ioprio、syslog、process_madvise、process_mrelease 与 6.1 不同，其余与没配对应功能的 Linux 一样 |
+| [M9 之前：ioprio、syslog 和 adjtimex](rounds/140-ioprio-syslog-adjtimex.md) | 2026-10-31 | ioprio_set、ioprio_get 按线程记、交给宿主线程（`ionice` 原来设不上就不执行命令）；syslog(2) 回答空的日志，权限、控制台级别按 6.1，新增 `/proc/sys/kernel/printk`、`dmesg_restrict`；adjtimex、clock_adjtime 回答查询（Linux 宿主上取宿主的 NTP 状态，Android 上按未同步合成），要改东西的是 EPERM |
 
 ## 测量条件
 
