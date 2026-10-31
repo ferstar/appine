@@ -247,7 +247,10 @@ fn data_accesses_ignore_the_top_byte() {
 fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
-        0x1e284020, // frint32z s0, s1：FRINTTS 不在白名单内
+        0x1ee84020, // 半精度的 frint32z 未定义
+        0xd50331ff, // CRm 不是 0 的 sb 未定义
+        0xd500411f, // CRm 不是 0 的 cfinv 未定义
+        0xd503413f, // msr ssbs, #1：SSBS 不宣告
         0xce62c020, // sm3partw1 v0.4s, v1.4s, v2.4s：SM3 不在白名单内
         0xcec08420, // sm4e v0.4s, v1.4s：SM4 不在白名单内
         0x6e02fc20, // size 00 的 bfdot：BF16 只有 size 01、11
@@ -335,6 +338,16 @@ fn id_registers_match_hwcap() {
     assert_eq!(caps & hwcap::ASIMDDP != 0, (isar0 >> 44) & 0xf == 1);
     assert_eq!(caps & hwcap::ASIMDRDM != 0, (isar0 >> 28) & 0xf == 1);
     assert_eq!(caps & hwcap::ASIMDFHM != 0, (isar0 >> 48) & 0xf == 1);
+    let caps2 = appine_engine::guest_hwcap2();
+    let ts = match (caps & hwcap::FLAGM != 0, caps2 & hwcap2::FLAGM2 != 0) {
+        (_, true) => 2,
+        (true, false) => 1,
+        _ => 0,
+    };
+    assert_eq!((isar0 >> 52) & 0xf, ts);
+    // FlagM2、DPB2 只在前一级上宣告
+    assert!(caps2 & hwcap2::FLAGM2 == 0 || caps & hwcap::FLAGM != 0);
+    assert!(caps2 & hwcap2::DCPODP == 0 || caps & hwcap::DCPOP != 0);
     // FHM 只和 FP16 一起宣告
     assert!(caps & hwcap::ASIMDFHM == 0 || caps & hwcap::FPHP != 0);
     // SHA3、SHA512 只一起宣告
@@ -352,6 +365,14 @@ fn id_registers_match_hwcap() {
     assert_eq!(caps & hwcap::FCMA != 0, (g.x(0) >> 16) & 0xf == 1);
     let bf16 = appine_engine::guest_hwcap2() & hwcap2::BF16 != 0;
     assert_eq!(bf16, (g.x(0) >> 44) & 0xf == 1);
+    let dpb = match (caps & hwcap::DCPOP != 0, caps2 & hwcap2::DCPODP != 0) {
+        (_, true) => 2,
+        (true, false) => 1,
+        _ => 0,
+    };
+    assert_eq!(g.x(0) & 0xf, dpb);
+    assert_eq!(caps2 & hwcap2::FRINT != 0, (g.x(0) >> 32) & 0xf == 1);
+    assert_eq!(caps & hwcap::SB != 0, (g.x(0) >> 36) & 0xf == 1);
     // ID_AA64PFR0_EL1 的 FP、AdvSIMD：带半精度时是 1；两者只一起宣告
     g.step(0xd5380400); // mrs x0, id_aa64pfr0_el1
     let (fp, simd) = ((g.x(0) >> 16) & 0xf, (g.x(0) >> 20) & 0xf);
@@ -558,6 +579,144 @@ fn half_precision_follows_the_feature_set() {
 }
 
 /// RDM、FCMA、FHM、BF16 各挑一两条：宣告了才能执行，结果与架构的定义相同。
+/// FlagM、FlagM2、SB、DPB、DPB2：不宣告时未定义；宣告时 NZCV 按 ARM ARM 的伪代码变化，
+/// SB 什么也不做，DC CVAP、CVADP 只按读访问检查地址。
+#[test]
+fn flagm_sb_dpb_follow_the_feature_set() {
+    let mut g = Guest::new();
+    let caps = appine_engine::guest_hwcap();
+    let caps2 = appine_engine::guest_hwcap2();
+    let flagm = caps & hwcap::FLAGM != 0;
+    let flagm2 = caps2 & hwcap2::FLAGM2 != 0;
+    let nzcv = |n: u64, z: u64, c: u64, v: u64| n << 31 | z << 30 | c << 29 | v << 28;
+    let cases = [
+        (flagm, 0xd500401f),                       // cfinv
+        (flagm, 0xba02040a),                       // rmif x0, #4, #0b1010
+        (flagm, 0x3a00080d),                       // setf8 w0
+        (flagm, 0x3a00480d),                       // setf16 w0
+        (flagm2, 0xd500403f),                      // xaflag
+        (flagm2, 0xd500405f),                      // axflag
+        (caps & hwcap::SB != 0, 0xd50330ff),       // sb
+        (caps & hwcap::DCPOP != 0, 0xd50b7c21),    // dc cvap, x1
+        (caps2 & hwcap2::DCPODP != 0, 0xd50b7d21), // dc cvadp, x1
+    ];
+    for (on, insn) in cases {
+        if !on {
+            assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
+            continue;
+        }
+        match insn {
+            0xd500401f => {
+                for f in 0..16u64 {
+                    g.cpu.state_mut().nzcv = f << 28;
+                    g.step(insn);
+                    assert_eq!(g.cpu.state().nzcv, (f ^ 2) << 28);
+                }
+            }
+            0xba02040a => {
+                // 0xa0 循环右移 4 位，低 4 位 1010：mask 1010 选中 N、C，Z、V 不变
+                g.set_x(0, 0xa0);
+                g.cpu.state_mut().nzcv = nzcv(0, 1, 0, 1);
+                g.step(insn);
+                assert_eq!(g.cpu.state().nzcv, nzcv(1, 1, 1, 1));
+                g.set_x(0, 0x50);
+                g.step(insn);
+                assert_eq!(g.cpu.state().nzcv, nzcv(0, 1, 0, 1));
+            }
+            0x3a00080d | 0x3a00480d => {
+                let top = if insn == 0x3a00080d { 7 } else { 15 };
+                for w in [0u64, 0x80, 0x180, 0x100, 0x7f, 0x8000, 0x18000, 0x1_0000] {
+                    g.set_x(0, w);
+                    g.cpu.state_mut().nzcv = nzcv(0, 0, 1, 0);
+                    g.step(insn);
+                    let low = w & ((2 << top) - 1);
+                    let (n, v) = ((w >> top) & 1, ((w >> (top + 1)) ^ (w >> top)) & 1);
+                    assert_eq!(
+                        g.cpu.state().nzcv,
+                        nzcv(n, (low == 0) as u64, 1, v),
+                        "{w:#x}"
+                    );
+                }
+            }
+            0xd500403f | 0xd500405f => {
+                for f in 0..16u64 {
+                    let (z, c, v) = ((f >> 2) & 1, (f >> 1) & 1, f & 1);
+                    g.cpu.state_mut().nzcv = f << 28;
+                    g.step(insn);
+                    let want = if insn == 0xd500403f {
+                        nzcv((c | z) ^ 1, z & c, c | z, (c ^ 1) & z)
+                    } else {
+                        nzcv(0, z | v, c & (v ^ 1), 0)
+                    };
+                    assert_eq!(g.cpu.state().nzcv, want, "flags {f:#x}");
+                }
+            }
+            0xd50330ff => {
+                g.cpu.state_mut().nzcv = nzcv(1, 0, 1, 0);
+                g.step(insn);
+                assert_eq!(g.cpu.state().nzcv, nzcv(1, 0, 1, 0));
+            }
+            _ => {
+                g.set_x(1, RODATA + 8);
+                g.step(insn);
+                g.set_x(1, 0x5000);
+                let pc = g.pc();
+                assert!(matches!(
+                    g.cpu.exec_insn(insn),
+                    Some(Exit::Fault {
+                        addr: 0x5000,
+                        access: Access::Read,
+                        ..
+                    })
+                ));
+                assert_eq!(g.pc(), pc);
+            }
+        }
+    }
+}
+
+/// FRINTTS：舍入成整数值，超出 32、64 位整数范围的和 NaN 得到最小的那个整数，并且置
+/// FPSR.IOC。运算由宿主执行，这里核对白名单和寄存器的去向。
+#[test]
+fn frintts_follows_the_feature_set() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let frint32z = 0x1e284020; // frint32z s0, s1
+    let frint64x = 0x1e69c020; // frint64x d0, d1
+    let vfrint32x = 0x6e21e820; // frint32x v0.4s, v1.4s
+    if appine_engine::guest_hwcap2() & hwcap2::FRINT == 0 {
+        for insn in [frint32z, frint64x, vfrint32x] {
+            assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
+        }
+        return;
+    }
+    let s = g.cpu.state_mut();
+    s.v[1] = [3.7f32.to_bits() as u64, 0];
+    s.fpsr = 0;
+    g.step(frint32z);
+    assert_eq!(g.cpu.state().v[0], [3.0f32.to_bits() as u64, 0]);
+    assert_eq!(g.cpu.state().fpsr & 1, 0);
+    g.cpu.state_mut().v[1] = [3e10f32.to_bits() as u64, 0];
+    g.step(frint32z);
+    assert_eq!(g.cpu.state().v[0][0], (-2147483648.0f32).to_bits() as u64);
+    assert_eq!(g.cpu.state().fpsr & 1, 1);
+    g.cpu.state_mut().v[1] = [2.5f64.to_bits(), 0];
+    g.step(frint64x);
+    assert_eq!(g.cpu.state().v[0], [2.0f64.to_bits(), 0]);
+    let lanes = |a: [f32; 4]| {
+        let b = a.map(|f| f.to_bits() as u64);
+        [b[0] | b[1] << 32, b[2] | b[3] << 32]
+    };
+    g.cpu.state_mut().v[1] = lanes([1.5, -1.5, 1e10, f32::NAN]);
+    g.step(vfrint32x);
+    assert_eq!(
+        g.cpu.state().v[0],
+        lanes([2.0, -2.0, -2147483648.0, -2147483648.0])
+    );
+}
+
 #[test]
 fn rdm_fcma_fhm_bf16_follow_the_feature_set() {
     if !has_simd() {

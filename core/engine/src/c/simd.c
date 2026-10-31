@@ -3,8 +3,8 @@
  *
  * 数据处理指令：这里只做白名单判定，运算交给原生指令桩。白名单是 ARMv8.0
  * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2/
- * SHA3/SHA512/DotProd/I8MM/FP16/JSCVT/RDM/FHM/FCMA/BF16；FRINTTS、SM3/SM4、
- * EBF16 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
+ * SHA3/SHA512/DotProd/I8MM/FP16/JSCVT/RDM/FHM/FCMA/BF16/FRINTTS；SM3/SM4、EBF16
+ * 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
  * Floating-Point and Advanced SIMD" 编码表。
  *
  * 访存指令（LDR/STR/LDP/STP 的 B/H/S/D/Q 形式、LD1–LD4/ST1–ST4）用 C 实现：
@@ -61,6 +61,12 @@ static bool fcma(unsigned q, unsigned size)
 static bool bf16(void)
 {
     return appine_has2(APPINE_HWCAP2_BF16);
+}
+
+/* FRINTTS：FRINT32Z/X、FRINT64Z/X，舍入成 32、64 位整数范围里的整数值（JavaScript、C 的转换） */
+static bool frint(void)
+{
+    return appine_has2(APPINE_HWCAP2_FRINT);
 }
 
 /* FP 指令的 type/size 字段选的精度能不能用：3 是半精度，2 只有 FMOV 的上半部分形式 */
@@ -192,6 +198,8 @@ static bool vec_two_reg_misc(uint32_t insn)
         case 0x1b:                                  /* FCVTMS / FCVTZS */
         case 0x1d: return fpq;                      /* SCVTF / FRECPE */
         case 0x1c: return hi ? size == 2 : fpq;     /* FCVTAS / URECPE */
+        case 0x1e:                                  /* FRINT32Z（FRINTTS） */
+        case 0x1f: return !hi && fpq && frint();    /* FRINT64Z */
         default: return false;
         }
     }
@@ -219,7 +227,8 @@ static bool vec_two_reg_misc(uint32_t insn)
     case 0x1b:                                      /* FCVTMU / FCVTZU */
     case 0x1d: return fpq;                          /* UCVTF / FRSQRTE */
     case 0x1c: return hi ? size == 2 : fpq;         /* FCVTAU / URSQRTE */
-    case 0x1f: return hi && fpq;                    /* FSQRT */
+    case 0x1e: return !hi && fpq && frint();        /* FRINT32X（FRINTTS） */
+    case 0x1f: return fpq && (hi || frint());       /* FSQRT；FRINT64X（FRINTTS） */
     default: return false;
     }
 }
@@ -620,6 +629,8 @@ static bool fp_one_source(uint32_t insn)
             return type == 1 && bf16();
         return to != type;
     }
+    if (opcode >= 0x10 && opcode <= 0x13) /* FRINT32Z/X、FRINT64Z/X（FRINTTS）：没有半精度 */
+        return type <= 1 && frint();
     return opcode >= 0x08 && opcode <= 0x0f && opcode != 0x0d; /* FRINT 系列 */
 }
 

@@ -1,7 +1,8 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
 # 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
-# 点积指令；SHA3、SHA512、I8MM；LRCPC、LRCPC2；FP16、JSCVT；RDM、FCMA、FHM、BF16
+# 点积指令；SHA3、SHA512、I8MM；LRCPC、LRCPC2；FP16、JSCVT；RDM、FCMA、FHM、BF16；FRINTTS、
+# FlagM、FlagM2、SB、DPB、DPB2
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -932,4 +933,138 @@ int main(void)
 C
 gcc -O2 -march=armv8.3-a+fp16fml+bf16 -o ext ext.c && ./ext
 echo "instructions: $(gcc -O2 -march=armv8.3-a+fp16fml+bf16 -S -o - ext.c | grep -cE '^	(sqrdmlah|sqrdmlsh|fcmla|fcadd|fmlal|fmlsl|fmlal2|fmlsl2|bfdot|bfmmla|bfmlalb|bfmlalt|bfcvt|bfcvtn|bfcvtn2)	')"
+
+# FRINTTS、FlagM、FlagM2、SB、DPB、DPB2（宿主有时才宣告）：HWCAP、ID 寄存器的字段；CFINV、RMIF、
+# SETF8、SETF16、XAFLAG、AXFLAG 对 16 种 NZCV 的结果；FRINT32Z/X、FRINT64Z/X 的标量和向量形式
+# （含超出范围的、NaN、无穷，以及 FPCR 的四种舍入方式）和 FPSR.IOC；SB；DC CVAP、DC CVADP
+# 在可读、PROT_NONE、没有映射的地址上
+cat > ext2.c <<'C'
+#include <arm_acle.h>
+#include <arm_neon.h>
+#include <math.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <sys/mman.h>
+
+
+static uint64_t run_flags(int which, uint64_t nzcv, uint64_t x)
+{
+    uint64_t out;
+    switch (which) {
+    case 0: __asm__ volatile("msr nzcv, %1\n\tcfinv\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv)); break;
+    case 1: __asm__ volatile("msr nzcv, %1\n\trmif %2, #4, #0xa\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv), "r"(x)); break;
+    case 2: __asm__ volatile("msr nzcv, %1\n\trmif %2, #61, #0x5\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv), "r"(x)); break;
+    case 3: __asm__ volatile("msr nzcv, %1\n\tsetf8 %w2\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv), "r"(x)); break;
+    case 4: __asm__ volatile("msr nzcv, %1\n\tsetf16 %w2\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv), "r"(x)); break;
+    case 5: __asm__ volatile("msr nzcv, %1\n\txaflag\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv)); break;
+    default: __asm__ volatile("msr nzcv, %1\n\taxflag\n\tmrs %0, nzcv" : "=r"(out) : "r"(nzcv)); break;
+    }
+    return out >> 28;
+}
+
+static sigjmp_buf env;
+static void on_segv(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig, (void)uc;
+    siglongjmp(env, si->si_code);
+}
+
+/* DC CVAP（cvadp 为真时 DC CVADP）x0；返回 0 或者 SIGSEGV 的 si_code */
+static int persist(void *p, int cvadp)
+{
+    int code = sigsetjmp(env, 1);
+    if (code)
+        return code;
+    if (cvadp)
+        __asm__ volatile("mov x0, %0\n\t.inst 0xd50b7d20" ::"r"(p) : "x0", "memory");
+    else
+        __asm__ volatile("mov x0, %0\n\t.inst 0xd50b7c20" ::"r"(p) : "x0", "memory");
+    return 0;
+}
+
+static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static uint64_t d2u(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+    uint64_t isar0, isar1;
+    __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+    __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
+    printf("hwcap dcpop %d flagm %d sb %d dcpodp %d flagm2 %d frint %d; TS %d DPB %d FRINTTS %d SB %d\n",
+           !!(hw & HWCAP_DCPOP), !!(hw & HWCAP_FLAGM), !!(hw & HWCAP_SB), !!(hw2 & HWCAP2_DCPODP),
+           !!(hw2 & HWCAP2_FLAGM2), !!(hw2 & HWCAP2_FRINT), (int)(isar0 >> 52 & 15),
+           (int)(isar1 & 15), (int)(isar1 >> 32 & 15), (int)(isar1 >> 36 & 15));
+    if (hw & HWCAP_FLAGM) {
+        static const char *names[] = {"cfinv", "rmif #4,#0xa", "rmif #61,#0x5", "setf8", "setf16",
+                                      "xaflag", "axflag"};
+        static const uint64_t xs[] = {0, 0x80, 0x7f, 0x180, 0xa5, 0x8000, 0x18000, 0x10000, 0xfffffffffffffffa};
+        for (int w = 0; w < 7; w++) {
+            if (w >= 5 && !(hw2 & HWCAP2_FLAGM2))
+                continue;
+            printf("%-14s", names[w]);
+            for (unsigned i = 0; i < (w == 0 || w >= 5 ? 1 : sizeof xs / sizeof xs[0]); i++)
+                for (uint64_t f = 0; f < 16; f++)
+                    printf("%x", (unsigned)run_flags(w, f << 28, xs[i]));
+            printf("\n");
+        }
+    }
+    if (hw2 & HWCAP2_FRINT) {
+        static const double ds[] = {0.0, -0.0, 2.5, -2.5, 3.7, -3.7, 2147483647.5, -2147483648.6,
+                                    2147483648.0, 9.3e18, -9.3e18, 1e300, INFINITY, -INFINITY, NAN};
+        static const uint64_t modes[] = {0, 1UL << 22, 2UL << 22, 3UL << 22};
+        for (int m = 0; m < 4; m++) {
+            __asm__ volatile("msr fpcr, %0" ::"r"(modes[m]));
+            printf("rmode %d\n", m);
+            for (unsigned i = 0; i < sizeof ds / sizeof ds[0]; i++) {
+                uint64_t fpsr;
+                __asm__ volatile("msr fpsr, xzr");
+                float f = (float)ds[i];
+                uint32_t a = f2u(__rint32zf(f)), b = f2u(__rint32xf(f)), c = f2u(__rint64zf(f)),
+                         e = f2u(__rint64xf(f));
+                uint64_t g = d2u(__rint32z(ds[i])), h = d2u(__rint32x(ds[i])), k = d2u(__rint64z(ds[i])),
+                         l = d2u(__rint64x(ds[i]));
+                __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
+                printf("  %08x %08x %08x %08x %016llx %016llx %016llx %016llx ioc %d\n", a, b, c, e,
+                       (unsigned long long)g, (unsigned long long)h, (unsigned long long)k,
+                       (unsigned long long)l, (int)(fpsr & 1));
+            }
+            float32x4_t v = {1.5f, -2.5f, 3e9f, NAN};
+            float32x2_t v2 = {0.5f, -7.5f};
+            float64x2_t dv = {2.5e18, -1e19};
+            uint32_t r[4], r2[2];
+            uint64_t dr[2];
+            vst1q_u32(r, vreinterpretq_u32_f32(vrnd32xq_f32(v)));
+            vst1_u32(r2, vreinterpret_u32_f32(vrnd64z_f32(v2)));
+            vst1q_u64(dr, vreinterpretq_u64_f64(vrnd64xq_f64(dv)));
+            printf("  vector %08x %08x %08x %08x %08x %08x %016llx %016llx\n", r[0], r[1], r[2], r[3],
+                   r2[0], r2[1], (unsigned long long)dr[0], (unsigned long long)dr[1]);
+        }
+        __asm__ volatile("msr fpcr, xzr");
+    }
+    if (hw & HWCAP_SB) {
+        __asm__ volatile("sb");
+        printf("sb ok\n");
+    }
+    struct sigaction sa = {.sa_sigaction = on_segv, .sa_flags = SA_SIGINFO};
+    sigaction(SIGSEGV, &sa, NULL);
+    char *page = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(page + 4096, 4096, PROT_NONE);
+    char *gone = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(gone, 4096);
+    for (int cvadp = 0; cvadp < 2; cvadp++) {
+        if (!(cvadp ? hw2 & HWCAP2_DCPODP : hw & HWCAP_DCPOP))
+            continue;
+        printf("%s: readable %d, PROT_NONE %d, unmapped %d\n", cvadp ? "dc cvadp" : "dc cvap",
+               persist(page + 100, cvadp), persist(page + 4096 + 8, cvadp), persist(gone, cvadp));
+    }
+    return 0;
+}
+C
+gcc -O1 -march=armv8.5-a -o ext2 ext2.c -lm && ./ext2
+echo "frint in the code: $(gcc -O1 -march=armv8.5-a -S -o - ext2.c | grep -cE '	frint(32|64)[zx]	')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'asimdrdm|fcma|asimdfhm|bf16')"

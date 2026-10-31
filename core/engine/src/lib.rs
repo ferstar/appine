@@ -843,6 +843,8 @@ pub mod hwcap {
     pub const FCMA: u64 = 1 << 14;
     /// RCpc 的 load-acquire（LDAPR、LDAPRB、LDAPRH）。
     pub const LRCPC: u64 = 1 << 15;
+    /// DC CVAP（清到持久化点）。
+    pub const DCPOP: u64 = 1 << 16;
     /// SHA3 指令（EOR3、RAX1、XAR、BCAX）。
     pub const SHA3: u64 = 1 << 17;
     /// Advanced SIMD 的点积指令（SDOT、UDOT）。
@@ -853,10 +855,20 @@ pub mod hwcap {
     pub const ASIMDFHM: u64 = 1 << 23;
     /// LRCPC2：带偏移的 LDAPUR、STLUR 这些。
     pub const ILRCPC: u64 = 1 << 26;
+    /// FlagM：CFINV、RMIF、SETF8、SETF16。
+    pub const FLAGM: u64 = 1 << 27;
+    /// 推测执行屏障 SB。
+    pub const SB: u64 = 1 << 29;
 }
 
 /// `AT_HWCAP2` 的位，取值与 Linux 的 `HWCAP2_*` 一致。
 pub mod hwcap2 {
+    /// DC CVADP（清到深持久化点）。
+    pub const DCPODP: u64 = 1 << 0;
+    /// FlagM2：AXFLAG、XAFLAG。
+    pub const FLAGM2: u64 = 1 << 7;
+    /// FRINTTS：FRINT32Z、FRINT32X、FRINT64Z、FRINT64X。
+    pub const FRINT: u64 = 1 << 8;
     /// int8 矩阵乘（SMMLA、UMMLA、USMMLA、USDOT、SUDOT）。
     pub const I8MM: u64 = 1 << 13;
     /// BFloat16（BFDOT、BFMMLA、BFMLALB/T、BFCVT、BFCVTN）。

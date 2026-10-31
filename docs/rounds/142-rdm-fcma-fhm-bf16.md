@@ -44,5 +44,5 @@
 
 **推迟项**：
 
-- §4.4 的表里，宿主（M2 Pro、常见的手机核心）有、仍不宣告的：FRINTTS（FRINT32Z 等）、FLAGM/FLAGM2（CFINV、RMIF、SETF、AXFLAG）、SB、DIT、DCPOP/DCPODP（DC CVAP、CVADP）、SM3/SM4、LSE2（`uscat`，[LRCPC2](138-lrcpc2.md) 的推迟项）。EBF16 宿主没有，没做。
+- §4.4 的表里，宿主（M2 Pro、常见的手机核心）有、仍不宣告的：FRINTTS（FRINT32Z 等）、FLAGM/FLAGM2（CFINV、RMIF、SETF、AXFLAG）、SB、DIT、DCPOP/DCPODP（DC CVAP、CVADP）、SM3/SM4、LSE2（`uscat`，[LRCPC2](138-lrcpc2.md) 的推迟项）。EBF16 宿主没有，没做。→ FRINTTS、FLAGM/FLAGM2、SB、DCPOP/DCPODP 已补上（M9 之前：FRINTTS、FlagM、SB 和 DPB）；DIT、LSE2 仍没有；SM3/SM4 开发机的 M2 没有，与 EBF16 一样测不了
 - 这几个扩展只在 M2 上量过：BF16 以外的三种在这里收益很小，在手机的核心上没量（R1）。

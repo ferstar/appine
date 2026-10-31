@@ -59,6 +59,12 @@ pub const SPACES: &[Space] = &[
         requires: 0,
     },
     Space {
+        name: "adc_flags",
+        mask: 0x1fe0_0000,
+        value: 0x1a00_0000, // ADC、SBC 和 FlagM 的 RMIF、SETF8、SETF16
+        requires: 0,
+    },
+    Space {
         name: "rcpc_unscaled",
         mask: 0x3f20_0c00,
         value: 0x1900_0000, // LRCPC2 的 LDAPUR*、STLUR*
@@ -123,6 +129,10 @@ fn mattr(caps: u64, caps2: u64) -> String {
     attrs.push(flag(caps & hwcap::FCMA != 0, "complxnum"));
     attrs.push(flag(caps & hwcap::ASIMDFHM != 0, "fp16fml"));
     attrs.push(flag(caps2 & hwcap2::BF16 != 0, "bf16"));
+    attrs.push(flag(caps2 & hwcap2::FRINT != 0, "fptoint"));
+    attrs.push(flag(caps & hwcap::FLAGM != 0, "flagm"));
+    attrs.push(flag(caps2 & hwcap2::FLAGM2 != 0, "altnzcv"));
+    attrs.push(flag(caps & hwcap::SB != 0, "sb"));
     attrs.join(",")
 }
 

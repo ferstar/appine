@@ -845,6 +845,12 @@ static bool dp_operands(uint32_t insn, struct operands *o)
     }
     switch (op2) {
     case 0: /* ADC/SBC */
+        if (FIELD(insn, 15, 10)) { /* RMIF、SETF8、SETF16（FlagM）：只读 Rn，只写标志 */
+            o->writes_rd = false;
+            add_operand(o, 5, false);
+            return true;
+        }
+        /* fallthrough */
     case 4: /* CSEL 系列 */
         add_operand(o, 0, false);
         add_operand(o, 5, false);
@@ -1813,6 +1819,14 @@ static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
 }
 
 /* ---- 分支与系统指令 ---- */
+/* FlagM、FlagM2 的五条：RMIF、SETF8/SETF16、CFINV、XAFLAG、AXFLAG。都只改 NZCV，guest 的 NZCV
+ * 在翻译后的代码里就是宿主的（宣告了它们说明宿主有），原样执行 */
+static bool is_flagm(uint32_t insn)
+{
+    return (insn & 0xffe07c10) == 0xba000400 || (insn & 0xffffbc1f) == 0x3a00080d ||
+           insn == 0xd500401f || insn == 0xd500403f || insn == 0xd500405f;
+}
+
 
 static int64_t sext(uint64_t v, unsigned bits)
 {
@@ -1905,7 +1919,12 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     if ((insn & 0xfffff01f) == 0xd503201f) /* HINT：与 Tier 0 一样当作 NOP */
         return true;
-    if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障：白名单已由 Tier 0 确认 */
+    if (is_flagm(insn)) { /* CFINV、XAFLAG、AXFLAG：白名单已由 Tier 0 确认 */
+        emit(x, insn);
+        x->st->insns_copied++;
+        return true;
+    }
+    if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障（含 SB）：白名单已由 Tier 0 确认 */
         if (FIELD(insn, 7, 5) == 2) { /* CLREX：清掉 guest 的独占标记 */
             emit(x, enc_str_w(31, CTX, offsetof(struct appine_cpu, excl_size)));
             x->st->insns_remapped++;
@@ -1978,12 +1997,14 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         return true;
     }
     /*
-     * DC CVAC、DC CVAU、DC CIVAC、IC IVAU：与 Tier 0 一样只按读访问检查地址。ic ivau 不再
-     * 每条都退出：记下所在的页（JIT 刷新缓存时一页要执行几十条），等 dsb、isb 时一次交给
-     * 调用方作废翻译；已经记着另一页时由 Tier 0 执行这一条，退出时两页一起作废。
+     * DC CVAC、DC CVAU、DC CIVAC、DC CVAP、DC CVADP、IC IVAU：与 Tier 0 一样只按读访问检查
+     * 地址（DC CVAP、CVADP 的特性已由 Tier 0 确认）。ic ivau 不再每条都退出：记下所在的页
+     * （JIT 刷新缓存时一页要执行几十条），等 dsb、isb 时一次交给调用方作废翻译；已经记着
+     * 另一页时由 Tier 0 执行这一条，退出时两页一起作废。
      */
     uint32_t cmo = insn & 0xffffffe0;
-    if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520) {
+    if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520 ||
+        cmo == 0xd50b7c20 || cmo == 0xd50b7d20) {
         unsigned rt = insn & 31;
         if (rt == 31)
             emit(x, enc_movz(T0, 0, 0));
@@ -2069,6 +2090,7 @@ static bool translate_simd_dp(struct xlate *x, uint32_t insn)
 /* 翻译一条指令；返回 false 表示块到此结束 */
 static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc);
 
+
 /*
  * 这条指令之后哪些寄存器的值已知（xlate.konst）：ADR/ADRP 设下常数，在已知值上加立即数
  * 仍然已知，其余可能写通用寄存器的指令让它们失效。拿不准的一律当作全都写了。
@@ -2077,6 +2099,8 @@ static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     unsigned rd = insn & 31, rn = FIELD(insn, 9, 5);
     uint32_t kill = 1u << rd;
+    if (is_flagm(insn)) /* 只写标志 */
+        return;
     if (FIELD(insn, 28, 24) == 0x10) { /* ADR/ADRP */
         uint64_t imm = ((uint64_t)FIELD(insn, 23, 5) << 2) | FIELD(insn, 30, 29);
         int64_t off = (int64_t)(imm << 43) >> 43;

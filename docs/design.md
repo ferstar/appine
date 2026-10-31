@@ -254,13 +254,13 @@ Tier 1 的进入例程保存宿主的 d8–d15 和 FPCR，载入 guest 的 FPCR�
 | 级别 | 特性 |
 |---|---|
 | 必须 | FP、ASIMD（v8.0）、CPUID |
-| 宿主支持时宣告 | ATOMICS（LSE）、AES、PMULL、SHA1、SHA2、CRC32、ASIMDDP（点积，[ASIMDDP](rounds/133-asimddp.md)）、SHA3 和 SHA512（两者都有才宣告）、I8MM（`AT_HWCAP2`，[SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md)）、LRCPC（LDAPR，[LRCPC](rounds/136-lrcpc.md)）、LRCPC2（带偏移的 LDAPUR、STLUR，[LRCPC2](rounds/138-lrcpc2.md)）、FP16（FPHP、ASIMDHP，两者都有才宣告，FPCR 的 FZ16 随之可写）和 JSCVT（FJCVTZS，[FP16 和 JSCVT](rounds/141-fp16-jscvt.md)）、RDM（SQRDMLAH）、FCMA（FCMLA、FCADD，半精度的形式还要 FP16）、FHM（FMLAL，只和 FP16 一起宣告）、BF16（`AT_HWCAP2`，[RDM、FCMA、FHM 和 BF16](rounds/142-rdm-fcma-fhm-bf16.md)） |
-| 还没做 | FRINTTS、FLAGM/FLAGM2、SB、DIT、DCPOP/DCPODP、SM3/SM4、LSE2（`uscat`）（数据处理类的白名单照上面几轮加就行） |
+| 宿主支持时宣告 | ATOMICS（LSE）、AES、PMULL、SHA1、SHA2、CRC32、ASIMDDP（点积，[ASIMDDP](rounds/133-asimddp.md)）、SHA3 和 SHA512（两者都有才宣告）、I8MM（`AT_HWCAP2`，[SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md)）、LRCPC（LDAPR，[LRCPC](rounds/136-lrcpc.md)）、LRCPC2（带偏移的 LDAPUR、STLUR，[LRCPC2](rounds/138-lrcpc2.md)）、FP16（FPHP、ASIMDHP，两者都有才宣告，FPCR 的 FZ16 随之可写）和 JSCVT（FJCVTZS，[FP16 和 JSCVT](rounds/141-fp16-jscvt.md)）、RDM（SQRDMLAH）、FCMA（FCMLA、FCADD，半精度的形式还要 FP16）、FHM（FMLAL，只和 FP16 一起宣告）、BF16（`AT_HWCAP2`，[RDM、FCMA、FHM 和 BF16](rounds/142-rdm-fcma-fhm-bf16.md)）、FRINTTS（`AT_HWCAP2`）、FLAGM、FLAGM2（`AT_HWCAP2`，只和 FLAGM 一起）、SB、DCPOP、DCPODP（`AT_HWCAP2`，只和 DCPOP 一起，[FRINTTS、FlagM、SB 和 DPB](rounds/154-frintts-flagm-sb-dpb.md)） |
+| 还没做 | DIT、LSE2（`uscat`）；SM3/SM4（开发机的 M2 没有，测不了） |
 | v1 不做 | SVE/SVE2/SME、PACA/PACG、BTI、MTE |
 
 宣告 LSE 之后，libgcc 的 outline atomics 和 Go 会改走单条原子指令，这类指令很容易翻译。但 musl 的原子操作是用 `ldaxr`/`stlxr` 内联汇编写死的，所以 **LL/SC 必须支持**。
 
-**实现**（M1a，`core/engine/src/c/features.c`）：启动时读宿主的 `AT_HWCAP`、`AT_HWCAP2`，与 Tier 0 已实现的集合求交，作为 guest 的 `AT_HWCAP`、`AT_HWCAP2`（后者只有 I8MM、BF16）。宿主没有 FP、ASIMD，或者原生指令桩不可用时，不宣告任何 SIMD&FP 特性。SIMD&FP 的数据处理指令（含这些扩展）在 Tier 0 里由原生指令桩执行、在 Tier 1 里原样拷贝，所以加一个这类特性只要放行它的编码。guest 读 ID 寄存器空间（`MIDR_EL1`、`ID_AA64ISAR0_EL1`、`ID_AA64ISAR1_EL1`、`ID_AA64PFR0_EL1` 等）时，返回与这份集合一致的值。`/proc/cpuinfo` 随 procfs 一起生成（M3b）。
+**实现**（M1a，`core/engine/src/c/features.c`）：启动时读宿主的 `AT_HWCAP`、`AT_HWCAP2`，与 Tier 0 已实现的集合求交，作为 guest 的 `AT_HWCAP`、`AT_HWCAP2`（后者有 I8MM、BF16、FRINT、FLAGM2、DCPODP）。宿主没有 FP、ASIMD，或者原生指令桩不可用时，不宣告任何 SIMD&FP 特性；FlagM、FlagM2、SB、DPB、DPB2 不用原生指令桩，照样宣告（解释器自己算标志位，Tier 1 原样执行，所以也要宿主有）。SIMD&FP 的数据处理指令（含这些扩展）在 Tier 0 里由原生指令桩执行、在 Tier 1 里原样拷贝，所以加一个这类特性只要放行它的编码。guest 读 ID 寄存器空间（`MIDR_EL1`、`ID_AA64ISAR0_EL1`、`ID_AA64ISAR1_EL1`、`ID_AA64PFR0_EL1` 等）时，返回与这份集合一致的值。`/proc/cpuinfo` 随 procfs 一起生成（M3b）。
 
 **白名单的独立核对**：硬件只能告诉我们一条编码能否执行，分不清它属于基础集还是 FP16 之类没宣告的扩展。所以另用 LLVM 的反汇编器（`llvm-mc`，按 guest 特性集合设置 `-mattr`）做对照：
 

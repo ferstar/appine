@@ -1,8 +1,8 @@
 /*
  * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
  * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
- * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16
- * 等可选指令是否合法。
+ * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16/
+ * FRINTTS/FlagM/FlagM2/SB/DPB/DPB2 等可选指令是否合法。
  */
 #include <pthread.h>
 
@@ -20,7 +20,12 @@
      APPINE_HWCAP_SHA3 | APPINE_HWCAP_ASIMDDP | APPINE_HWCAP_SHA512 | APPINE_HWCAP_LRCPC |         \
      APPINE_HWCAP_ILRCPC | APPINE_HWCAP_FPHP | APPINE_HWCAP_ASIMDHP | APPINE_HWCAP_JSCVT |       \
      APPINE_HWCAP_ASIMDRDM | APPINE_HWCAP_FCMA | APPINE_HWCAP_ASIMDFHM)
-#define IMPLEMENTED2 (APPINE_HWCAP2_I8MM | APPINE_HWCAP2_BF16)
+#define IMPLEMENTED2 (APPINE_HWCAP2_I8MM | APPINE_HWCAP2_BF16 | APPINE_HWCAP2_FRINT)
+
+/* 不用原生指令桩的：FlagM、FlagM2 由解释器算标志位，SB 和 DC CVAP、DC CVADP 在解释器里不需要
+ * 做什么；Tier 1 原样拷贝 CFINV、AXFLAG、XAFLAG、RMIF、SETF 和 SB，所以宿主也要有 */
+#define INTEGER (APPINE_HWCAP_FLAGM | APPINE_HWCAP_SB | APPINE_HWCAP_DCPOP)
+#define INTEGER2 (APPINE_HWCAP2_FLAGM2 | APPINE_HWCAP2_DCPODP)
 
 /* SHA3、SHA512 只一起宣告，还要有 SHA2：LLVM 的 sha3 特性同时管这两组，白名单的核对分不开，
  * 实际的 CPU 也总是一起实现 */
@@ -54,6 +59,13 @@ static void detect(void)
             guest_hwcap &= ~APPINE_HWCAP_ILRCPC;
         guest_hwcap2 = getauxval(AT_HWCAP2) & IMPLEMENTED2;
     }
+    guest_hwcap |= host & INTEGER;
+    guest_hwcap2 |= getauxval(AT_HWCAP2) & INTEGER2;
+    /* FlagM2、DPB2 都是在前一级上加的（ID 寄存器里是同一个字段的 2） */
+    if (!(guest_hwcap & APPINE_HWCAP_FLAGM))
+        guest_hwcap2 &= ~APPINE_HWCAP2_FLAGM2;
+    if (!(guest_hwcap & APPINE_HWCAP_DCPOP))
+        guest_hwcap2 &= ~APPINE_HWCAP2_DCPODP;
     if (host & APPINE_HWCAP_CPUID)
         __asm__ volatile("mrs %0, midr_el1" : "=r"(host_midr));
 #endif
@@ -139,7 +151,15 @@ bool appine_id_register(unsigned key, uint64_t *value)
             v |= UINT64_C(1) << 44;
         if (h & APPINE_HWCAP_ASIMDFHM)
             v |= UINT64_C(1) << 48;
+        if (h2 & APPINE_HWCAP2_FLAGM2) /* TS */
+            v |= UINT64_C(2) << 52;
+        else if (h & APPINE_HWCAP_FLAGM)
+            v |= UINT64_C(1) << 52;
     } else if (crm == 6 && op2 == 1) { /* ID_AA64ISAR1_EL1 */
+        if (h2 & APPINE_HWCAP2_DCPODP) /* DPB */
+            v |= 2;
+        else if (h & APPINE_HWCAP_DCPOP)
+            v |= 1;
         if (h & APPINE_HWCAP_JSCVT)
             v |= UINT64_C(1) << 12;
         if (h & APPINE_HWCAP_FCMA)
@@ -148,6 +168,10 @@ bool appine_id_register(unsigned key, uint64_t *value)
             v |= UINT64_C(2) << 20;
         else if (h & APPINE_HWCAP_LRCPC)
             v |= UINT64_C(1) << 20;
+        if (h2 & APPINE_HWCAP2_FRINT) /* FRINTTS */
+            v |= UINT64_C(1) << 32;
+        if (h & APPINE_HWCAP_SB)
+            v |= UINT64_C(1) << 36;
         if (h2 & APPINE_HWCAP2_BF16)
             v |= UINT64_C(1) << 44;
         if (h2 & APPINE_HWCAP2_I8MM)

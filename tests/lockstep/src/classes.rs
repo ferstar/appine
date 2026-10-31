@@ -13,6 +13,12 @@ use crate::rng::Rng;
 pub const HWCAP2_I8MM: u64 = hwcap2::I8MM << 32;
 /// 同上，`HWCAP2_BF16`。
 pub const HWCAP2_BF16: u64 = hwcap2::BF16 << 32;
+/// 同上，`HWCAP2_FLAGM2`。
+pub const HWCAP2_FLAGM2: u64 = hwcap2::FLAGM2 << 32;
+/// 同上，`HWCAP2_FRINT`。
+pub const HWCAP2_FRINT: u64 = hwcap2::FRINT << 32;
+/// 同上，`HWCAP2_DCPODP`。
+pub const HWCAP2_DCPODP: u64 = hwcap2::DCPODP << 32;
 
 /// guest 的 `AT_HWCAP` 和左移 32 位的 `AT_HWCAP2`，与 [`Class::requires`] 比较。
 pub fn guest_caps() -> u64 {
@@ -134,6 +140,12 @@ pub const CLASSES: &[Class] = &[
     case("fcma", fcma, hwcap::FCMA),
     case("fhm", fhm, hwcap::ASIMDFHM),
     case("bf16", bf16, HWCAP2_BF16),
+    case("frint", frint, HWCAP2_FRINT),
+    case("flagm", flagm, hwcap::FLAGM),
+    case("flagm2", flagm2, HWCAP2_FLAGM2),
+    case("sb", sb, hwcap::SB),
+    case("dcpop", dcpop, hwcap::DCPOP),
+    case("dcpodp", dcpodp, HWCAP2_DCPODP),
     Class {
         name: "fuzz_simd_fp",
         strict: false,
@@ -1322,6 +1334,55 @@ fn bf16(g: &mut Rng, _: &Env) -> Case {
         5 => 0x1e63_4000 | rn_rd,                  // BFCVT
         _ => 0x0ea1_6800 | q | rn_rd,              // BFCVTN、BFCVTN2
     })
+}
+
+/// FRINTTS：FRINT32Z/X、FRINT64Z/X 的标量（单、双精度）和向量形式（2S、4S、2D）。X 的形式按
+/// 随机的 FPCR.RMode 舍入。
+fn frint(g: &mut Rng, _: &Env) -> Case {
+    let (rn_rd, op) = ((reg(g) << 5) | reg(g), g.bits(2));
+    Case::one(if g.bit() == 1 {
+        0x1e20_4000 | (g.bit() << 22) | ((0x10 | op) << 15) | rn_rd
+    } else {
+        let sz = g.bit();
+        let q = if sz == 1 { 1 } else { g.bit() };
+        let (u, opcode) = (op & 1, 0x1e | (op >> 1));
+        0x0e20_0800 | (q << 30) | (u << 29) | (sz << 22) | (opcode << 12) | rn_rd
+    })
+}
+
+/// FlagM：CFINV、RMIF（随机的移位和掩码）、SETF8、SETF16；NZCV 的初值是随机的。
+fn flagm(g: &mut Rng, _: &Env) -> Case {
+    Case::one(match g.bits(2) {
+        0 => 0xd500_401f,
+        1 => 0xba00_0400 | (g.bits(6) << 15) | (reg(g) << 5) | g.bits(4),
+        _ => 0x3a00_080d | (g.bit() << 14) | (reg(g) << 5),
+    })
+}
+
+/// FlagM2：XAFLAG、AXFLAG。
+fn flagm2(g: &mut Rng, _: &Env) -> Case {
+    Case::one(0xd500_401f | ((1 + g.bit()) << 5))
+}
+
+/// SB（推测执行屏障）。
+fn sb(_: &mut Rng, _: &Env) -> Case {
+    Case::one(0xd503_30ff)
+}
+
+/// DC CVAP、DC CVADP：地址指向数据区里任意字节。
+fn dc_persist(g: &mut Rng, insn: u32) -> Case {
+    let rt = reg_except(g, &[]);
+    let mut c = Case::one(insn | rt);
+    c.pointers.push((rt, target(g, 1, 1)));
+    c
+}
+
+fn dcpop(g: &mut Rng, _: &Env) -> Case {
+    dc_persist(g, 0xd50b_7c20)
+}
+
+fn dcpodp(g: &mut Rng, _: &Env) -> Case {
+    dc_persist(g, 0xd50b_7d20)
 }
 
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {

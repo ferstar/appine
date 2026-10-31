@@ -2418,10 +2418,10 @@ fn mangle(s: &[u8]) -> Vec<u8> {
 }
 
 /// `/proc/cpuinfo` 里 HWCAP 各位的名字（Linux 6.1 的 `hwcap_str`），按位的顺序。
-const HWCAP_NAMES: [&str; 27] = [
+const HWCAP_NAMES: [&str; 30] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
     "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
-    "asimddp", "sha512", "sve", "asimdfhm", "dit", "uscat", "ilrcpc",
+    "asimddp", "sha512", "sve", "asimdfhm", "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb",
 ];
 
 /// 同上，HWCAP2 各位的名字，排在 HWCAP 的后面。
