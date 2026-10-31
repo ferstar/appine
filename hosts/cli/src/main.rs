@@ -33,6 +33,9 @@ const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
   --no-pty             give the guest the host stdin/stdout/stderr directly
   --memory-limit <n>   kill a guest process when appine's anonymous memory exceeds n
                        bytes (K, M, G suffixes; \"none\" for no limit; default: half the RAM)
+  --low-port-offset <n>
+                       bind guest ports below 1024 to port + n on the host (then + 2n,
+                       + 3n, or any free port); 0 binds them as they are (default: 10000)
   --stats              print Tier 1 statistics to stderr on exit";
 
 fn main() -> ExitCode {
@@ -92,6 +95,10 @@ fn main() -> ExitCode {
             "--memory-limit" => match value().as_ref().and_then(|v| v.to_str()).map(parse_size) {
                 Some(Some(n)) => options.memory_limit = Some(n),
                 _ => return usage_error(),
+            },
+            "--low-port-offset" => match value().as_ref().and_then(|v| v.to_str()?.parse().ok()) {
+                Some(n) => options.low_port_offset = Some(n),
+                None => return usage_error(),
             },
             _ => return usage_error(),
         }

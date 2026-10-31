@@ -71,6 +71,25 @@ class TerminalService : Service() {
     /** 界面隐藏一段时间之后还没回来才释放缓存（[listener]）。 */
     private val trimWhenHidden = Runnable { trimMemory() }
 
+    /**
+     * guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
+     * 1024 以下的端口在宿主上换了一个，要告诉用户连哪个。内核攒着事件，这里每隔
+     * [LISTEN_POLL_MS] 在 [worker] 上取一次（要取 BKL）。
+     */
+    private val pollListens = object : Runnable {
+        override fun run() {
+            val m = machine
+            if (m == 0L) return
+            runCatching {
+                worker.execute {
+                    val lines = Native.takeListens(m)
+                    if (!lines.isNullOrEmpty()) main.post { lines.forEach(::notifyListen) }
+                }
+            }
+            main.postDelayed(this, LISTEN_POLL_MS)
+        }
+    }
+
     /** 内核句柄，启动之前是 0。 */
     var machine = 0L
         private set
@@ -226,6 +245,7 @@ class TerminalService : Service() {
                     machine = it
                     getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
                     watchingNetwork = true
+                    main.post(pollListens)
                     listener?.onMachineReady(null)
                 }.onFailure {
                     Log.e(TAG, "cannot start", it)
@@ -257,6 +277,7 @@ class TerminalService : Service() {
         val m = machine
         // 先清掉句柄：会话结束时 Activity 看到内核还在，会以为是最后一个标签页关掉了而退出
         machine = 0
+        main.removeCallbacks(pollListens)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
         sessionsChanged()
@@ -281,6 +302,7 @@ class TerminalService : Service() {
 
     override fun onDestroy() {
         main.removeCallbacks(trimWhenHidden)
+        main.removeCallbacks(pollListens)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
@@ -337,7 +359,36 @@ class TerminalService : Service() {
         val channel = NotificationChannel(
             CHANNEL_ID, getString(R.string.channel_sessions), NotificationManager.IMPORTANCE_LOW,
         )
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val services = NotificationChannel(
+            NETWORK_CHANNEL_ID, getString(R.string.channel_network), NotificationManager.IMPORTANCE_DEFAULT,
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannels(listOf(channel, services))
+    }
+
+    /** [Native.takeListens] 的一项：`<进程名>\t<端口>\t<宿主上的端口>`。每个端口一条通知。 */
+    private fun notifyListen(line: String) {
+        val fields = line.split('\t')
+        if (fields.size != 3) return
+        val comm = fields[0]
+        val port = fields[1].toIntOrNull() ?: return
+        val hostPort = fields[2].toIntOrNull() ?: return
+        val text = if (hostPort != port) {
+            getString(R.string.listening_mapped, hostPort)
+        } else {
+            getString(R.string.listening_direct)
+        }
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, NETWORK_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.listening_title, comm, port))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(LISTEN_NOTIFICATION_BASE + port, notification)
     }
 
     private fun notification(): Notification {
@@ -375,7 +426,11 @@ class TerminalService : Service() {
 
         private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
         private const val CHANNEL_ID = "sessions"
+        private const val NETWORK_CHANNEL_ID = "network"
         private const val NOTIFICATION_ID = 1
+        /** 监听的通知按端口编号，与 [NOTIFICATION_ID] 错开。 */
+        private const val LISTEN_NOTIFICATION_BASE = 1000
+        private const val LISTEN_POLL_MS = 2_000L
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val TRANSCRIPT_ROWS = 2000
         private const val TRIM_DELAY_MS = 60_000L

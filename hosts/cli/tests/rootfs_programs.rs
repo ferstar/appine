@@ -1579,6 +1579,67 @@ fn processes_of_one_program_share_translations() {
     assert!((1..=2).contains(&caches), "{caches} code caches");
 }
 
+/// 1024 以下的端口在宿主上换一个（docs/rounds/156-low-ports.md）：宿主上先占住 10000 + 端口，
+/// guest 的端口就换到 20000 + 端口；Machine 报告这次在非回环地址上的监听，宿主经由换过的
+/// 端口连得上，guest 的内核日志记着换到了哪里。两个执行层用不同的端口：前一次连接留下的
+/// TIME_WAIT 不影响后一次。
+#[test]
+fn low_ports_bind_elsewhere_on_the_host() {
+    use appine_kernel::{ExitStatus, ListenEvent, Machine, MachineOptions, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    for (tier, port) in [(Tier::Interpreter, 79u16), (Tier::Dbt, 78)] {
+        // busybox 的 nc 绑 IPv6 的通配地址，这里也占住同一种
+        let Ok(_busy) = std::net::TcpListener::bind(("::", 10000 + port)) else {
+            eprintln!("skipped: cannot bind [::]:{} on the host", 10000 + port);
+            return;
+        };
+        let machine = Machine::start(&MachineOptions {
+            tier,
+            rootfs: Some(store.to_path_buf()),
+            memory_limit: None,
+            low_port_offset: None,
+        })
+        .unwrap();
+        let env = [PATH.as_bytes().to_vec()];
+        let id = machine.open_console(24, 80).unwrap();
+        let script = format!("echo hello | nc -l -p {port}; dmesg | grep 'port {port}/'");
+        let argv = [b"sh".to_vec(), b"-c".to_vec(), script.into_bytes()];
+        let pid = machine
+            .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let event = loop {
+            if let Some(e) = machine.take_listens().into_iter().next() {
+                break e;
+            }
+            assert!(Instant::now() < deadline, "{tier:?}: no listen event");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let host_port = 20000 + port;
+        let want = ListenEvent {
+            comm: "nc".into(),
+            port,
+            host_port,
+        };
+        assert_eq!(event, want, "{tier:?}");
+        // nc 读完 stdin 之后不关连接，这一边读到了就关掉，它才退出
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", host_port)).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut got = [0u8; 6];
+        conn.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello\n", "{tier:?}");
+        drop(conn);
+        let out = read_console(&machine, id);
+        let log = format!("appine: port {port}/tcp is {host_port} on the host");
+        assert!(out.contains(&log), "{tier:?}: {out}");
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+        assert!(machine.take_listens().is_empty(), "{tier:?}");
+    }
+}
+
 #[test]
 fn one_machine_runs_several_terminal_sessions() {
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
@@ -1590,6 +1651,7 @@ fn one_machine_runs_several_terminal_sessions() {
             tier,
             rootfs: Some(store.to_path_buf()),
             memory_limit: None,
+            low_port_offset: None,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];

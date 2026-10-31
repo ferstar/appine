@@ -343,6 +343,7 @@ fn host_calls_survive_kernel_bugs() {
             tier,
             rootfs: None,
             memory_limit: None,
+            low_port_offset: None,
         })
         .unwrap();
         // spawn 里出错：spawn 失败

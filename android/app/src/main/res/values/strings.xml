@@ -15,6 +15,10 @@
     <string name="start_failed">Cannot start: %1$s</string>
     <string name="channel_sessions">Terminal sessions</string>
     <string name="exit_all">Exit all</string>
+    <string name="channel_network">Network services</string>
+    <string name="listening_title">%1$s is listening on port %2$d</string>
+    <string name="listening_mapped">Other devices connect to port %1$d: apps cannot use ports below 1024, so appine moved it there.</string>
+    <string name="listening_direct">Other devices on the network can connect to it.</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>

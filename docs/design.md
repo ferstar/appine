@@ -575,7 +575,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `NETLINK_GENERIC` | 只有 Linux 总会有的 `nlctrl` 一个族：`CTRL_CMD_GETFAMILY` 回答它自己，查别的族（nl80211、ethtool、wireguard、TASKSTATS……）、发往别的族编号都是 `ENOENT`，与没有编进这些子系统的 Linux 一样，iw、ethtool、wg、iotop 照它报错或者退回别的做法。回答、错误码、确认和错误消息的格式与 Linux 6.8 逐字节相同（差分测试） |
 | 别的 netlink 协议 | `NETLINK_KOBJECT_UEVENT` 建得了、什么也收不到（mdev、udev 只听热插拔事件）。别的协议（审计、`SOCK_DIAG`、netfilter……）与 Linux 上没有编进内核的子系统一样，`socket` 返回 `EPROTONOSUPPORT`：libaudit 据此当作没有审计（PAM 登录不等 ACK），ss 退回读 `/proc/net`。netlink socket 上的等待按 `SO_RCVTIMEO` 超时 |
 | DNS | `resolv.conf` 写 `nameserver 127.0.0.53`（打开仓库时没有就写一份）。socket 层截下发往这个地址 53 端口的 UDP 数据报，交给 `android_res_nsend`，这样系统的私人 DNS、VPN 和按网络分流设置都能生效；Linux 开发宿主上转发给宿主 `/etc/resolv.conf` 里的服务器。发往存根的 TCP 连接没有截获，musl 的解析器只在 UDP 回答被截断时才用 TCP，而存根交给 guest 的是完整的回答 |
-| 1024 以下的端口 | v1 直接返回宿主给出的 `EACCES`，之后再加可配置的端口映射（真机待确认） |
+| 1024 以下的端口 | App 没有 `CAP_NET_BIND_SERVICE`，宿主上绑不了。guest 绑它们时宿主 socket 依次试 `端口 + 10000`、`+ 20000`、`+ 30000`，都被占了就让宿主分配一个；guest 一侧看不出来：getsockname、getpeername、accept 到的对端、recvfrom 的来源、`/proc/net` 都是原来的端口，连本机（回环、通配地址、宿主接口的地址）上 guest 绑着的这些端口时换成宿主上的。同一个端口还有 socket 绑着、或者释放不到 2 分钟（TIME_WAIT）时仍用原来的宿主端口，冲突照 Linux 是 EADDRINUSE。偏移由 `MachineOptions::low_port_offset`、`appine-run --low-port-offset` 设，0 表示不映射。换了端口时写一条内核日志（`core/kernel/src/portmap.rs`，[低端口映射](rounds/156-low-ports.md)） |
 | 回环地址 | 透传给宿主，Android 上的浏览器能直接访问 guest 里起的服务。代价是设备上的其他 App 同样能访问，需要写进文档（真机待确认） |
 | AF_UNIX | 进程内模拟（`core/kernel/src/unix.rs`）。`SCM_RIGHTS` 传递的是 guest 的打开文件，`SO_PEERCRED` 返回 guest 的 pid 和 uid；只经由在途消息互相引用的 socket 由垃圾回收释放 |
 | `/proc/net/*` | 遍历所有进程的 fd 表合成 tcp、udp、unix、icmp、raw 等文件，地址和状态向宿主 socket 查询，不读宿主的 `/proc/net`（Android 10 起 App 读不了）。`dev` 列出宿主的接口和下面的流量计数；`if_inet6` 列出宿主接口上的 IPv6 地址（getifaddrs，OpenJDK 靠它判断有没有 IPv6），标志都是 `IFA_F_PERMANENT`；`route`、`ipv6_route` 见上面的路由表；`sockstat`、`sockstat6` 数 guest 的 socket（已经关掉、还在 TIME_WAIT 的连接看不到）；`snmp`、`netstat` 的字段和格式与 Linux 6.1 相同，计数取自下面的流量计数（CurrEstab 是现在 ESTABLISHED 的 TCP socket 数），内核层看不到的（错误、重传、复位、TCP 的扩展计数）是 0；`arp` 只有表头。没有 `snmp6` 等。与 Linux 一样，这些文件在 `/proc/<pid>/net`（含 task 子目录里的）下，内容是那个进程所在的网络命名空间的（新建的里面只有 lo、socket 只列建在里面的、计数是 0，[网络命名空间](rounds/122-net-namespaces.md)）；`/proc/net` 是指向 `self/net` 的链接 |
@@ -655,7 +655,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 5 | 内核层以 `panic=unwind` 编译，在 syscall 入口用 `catch_unwind` 兜住 panic，只杀掉当前 guest 进程并生成报告。debug 构建下直接 abort | ✅ `core/kernel/src/bug.rs`。运行循环在每次进入内核的地方（包括不持 BKL 的系统调用）兜住 panic，获取 BKL 时忽略中毒标记；引擎的 bug 走 §7.4 的 `APPINE_EXIT_HOST_FAULT`。两种情况都像 Linux 的 oops 结束当前任务那样，用 SIGSEGV 结束整个进程，并往 stderr（Android 上转到 logcat）写报告，同一份报告也记进内核日志（§7.8，guest 里 `dmesg` 看得到）。BKL 保护的状态可能只改了一半，结束出问题的进程之后大部分不一致也随之消失。运行循环之外的内核代码也兜住：guest 线程开始时、退出的每一步（出错之后其余步骤照做，进程总会结束）、定时器线程处理一个进程的定时器时，都结束那个进程；最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC 的清理、释放控制终端、交给跟踪者或父进程、放开它跟踪的进程、孤儿进程组的 SIGHUP/SIGCONT 等）也各自兜住，一步出错只丢掉这一步做的事，进程已经结束，只报告；内存上限的检查、信号驱动的 I/O 分不出进程，出错时关掉这项功能；宿主调用 `Machine` 的方法（Android 上是 JNI 调用）时只让那次调用失败，控制台上的调用还挂断那个控制台。debug 构建默认直接终止宿主进程，`APPINE_ON_BUG=kill`/`abort` 可以覆盖 |
 | | **对 Android 暴露的接口** | |
 | 6 | 只导出启动 Activity 和 DocumentsProvider，不提供供其他 App 执行命令的 intent | ✅ 目前只导出启动 Activity（还没有 DocumentsProvider） |
-| 7 | guest 第一次在非回环地址上 `listen` 某个端口时，发出一条通知 | 未实现 |
+| 7 | guest 第一次在非回环地址上 `listen` 某个端口时，发出一条通知 | ✅ 内核攒着事件（`Machine::take_listens`），App 每 2 秒取一次，在"网络服务"渠道里发通知：进程名、端口，低端口换到了宿主上的哪个端口（[低端口映射](rounds/156-low-ports.md)） |
 | 8 | JIT 代码页使用 W^X 双映射 | ✅ M7 |
 
 **信任链**：`apk` 用 rootfs 中自带的 Alpine 公钥验证每个软件包的签名，所以更换镜像不会削弱信任。调试日志只保存在本地；如果以后加入遥测，必须由用户主动开启，并同步更新 Play 的数据安全表单。

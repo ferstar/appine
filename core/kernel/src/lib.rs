@@ -27,6 +27,7 @@ mod nsproxy;
 mod oom;
 mod pidns;
 mod pipe;
+mod portmap;
 mod process;
 mod pseudo;
 mod ptrace;
@@ -48,6 +49,7 @@ pub use appine_engine::DbtStats;
 pub use appine_hal::net::Route as HostRoute;
 pub use loader::LoadError;
 pub use machine::{Machine, MachineOptions, Stdio, run};
+pub use portmap::ListenEvent;
 pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier};
 pub use terminal::Terminal;
 

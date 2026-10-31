@@ -164,6 +164,7 @@
 | [M9 之前：/proc/<pid>/exe 指向程序文件本身](rounds/153-exe-file.md) | 2026-11-01 | exe 照 Linux 的 `mm->exe_file` 指向程序文件本身：删除之后带 ` (deleted)`，改了名、被删除、被 rename 换掉之后经由它 stat、open、execve 到的仍是原来那个（删除了的经由记着的宿主文件） |
 | [M9 之前：FRINTTS、FlagM、SB 和 DPB](rounds/154-frintts-flagm-sb-dpb.md) | 2026-11-01 | 宿主有时宣告 FRINTTS（FRINT32Z 等）、FlagM（CFINV、RMIF、SETF8/16）、FlagM2（XAFLAG、AXFLAG）、SB、DPB/DPB2（DC CVAP、CVADP）；`/proc/cpuinfo` 的名字表补到 `sb`，`gcc -mcpu=native` 与原生相同 |
 | [M9 之前：DIT](rounds/155-dit.md) | 2026-11-01 | 宿主有时宣告 DIT：MSR、MRS DIT；信号处理函数带着它、sigreturn 和 ptrace 照 pstate 第 24 位恢复，fork、线程继承，execve 清零；宿主线程的 DIT 跟着 guest 的 |
+| [M9 之前：低端口映射和监听通知](rounds/156-low-ports.md) | 2026-11-01 | guest 绑 1024 以下的端口时宿主上换成 +10000（被占依次 +20000、+30000、宿主分配），guest 一侧看不出来；App 第一次看到非回环地址上的监听时发通知，告诉用户别的设备连哪个端口 |
 
 ## 测量条件
 
@@ -186,7 +187,7 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
 | nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
 | exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了（[测试自己的竞争和丢掉的现场](rounds/82-test-races.md)那一轮起 `scripts/ltp` 保留上一次的日志）；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |
-| mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题；[`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md)那一轮是 `open` 这个文件得到 EEXIST，同一个原因 |
+| mmap21_01、mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题；[`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md)那一轮是 `open` 这个文件得到 EEXIST，同一个原因；[低端口映射](rounds/156-low-ports.md)那一轮是 mmap21_01 失败（unlink 得到 ENOENT），同一个原因 |
 
 
 ## R1 的测量记录

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Once, PoisonError};
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jint, jlong, jobjectArray};
 
 /// 抛出 `java.io.IOException`；JNI 调用之后由 Kotlin 看到。
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
@@ -162,6 +162,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
         },
         rootfs: Some(PathBuf::from(store)),
         memory_limit: None,
+        low_port_offset: None,
     };
     match Machine::start(&options) {
         Ok(m) => {
@@ -268,6 +269,33 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
     if let Some(m) = machine(handle) {
         m.set_routes(routes);
     }
+}
+
+/// 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 #7）：每一项是
+/// `<进程名>\t<端口>\t<宿主上的端口>`，没有时是空数组。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jobjectArray {
+    let events = machine(handle)
+        .map(|m| m.take_listens())
+        .unwrap_or_default();
+    let Ok(array) = env.new_object_array(events.len() as jint, "java/lang/String", JObject::null())
+    else {
+        return std::ptr::null_mut();
+    };
+    for (i, e) in events.iter().enumerate() {
+        let line = format!("{}\t{}\t{}", e.comm, e.port, e.host_port);
+        let Ok(s) = env.new_string(line) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_object_array_element(&array, i as jint, s).is_err() {
+            return std::ptr::null_mut();
+        }
+    }
+    array.into_raw()
 }
 
 #[unsafe(no_mangle)]

@@ -185,6 +185,8 @@ pub struct RunOptions {
     pub terminal: Option<Terminal>,
     /// 宿主进程匿名内存的上限，见 [`crate::MachineOptions::memory_limit`]。
     pub memory_limit: Option<u64>,
+    /// 低端口映射的偏移，见 [`crate::MachineOptions::low_port_offset`]。
+    pub low_port_offset: Option<u16>,
 }
 
 /// 一次运行的结果。

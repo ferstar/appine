@@ -329,11 +329,40 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
             return Err(Errno::EACCES);
         }
     }
+    let map = cx.k().portmap.clone();
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             // 流量算在哪个接口上重新认（connect 也一样）
             s.route = None;
-            appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?;
+            // 1024 以下的端口在宿主上换一个（crate::portmap）
+            match port_of(&host_addr).filter(|&p| mappable(s) && map.borrow().maps(p)) {
+                Some(port) => {
+                    let fd = s.fd;
+                    let try_bind = |h: u16| {
+                        let mut a = host_addr.clone();
+                        set_port(&mut a, h);
+                        appine_hal::net::bind(fd, &a)
+                    };
+                    let bound = || {
+                        appine_hal::net::sockname(fd, false)
+                            .ok()
+                            .and_then(|a| port_of(&a))
+                    };
+                    let (host, lease, new) =
+                        crate::portmap::bind(&map, ns_key(s), s.proto, port, try_bind, bound)?;
+                    if new {
+                        let proto = if s.proto == IPPROTO_TCP { "tcp" } else { "udp" };
+                        crate::klog::printk(
+                            &cx.kr().klog,
+                            crate::klog::level::INFO,
+                            format_args!("appine: port {port}/{proto} is {host} on the host"),
+                        );
+                    }
+                    s.lease = Some(lease);
+                    s.local_map = Some((port, host));
+                }
+                None => appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?,
+            }
             if s.net.is_some() {
                 s.bound = true;
                 s.any = crate::netns::is_any(&addr);
@@ -359,7 +388,21 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             ensure_bound(s)?;
-            appine_hal::net::listen(s.fd, backlog).map_err(Errno)?
+            appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
+            // 别的设备连得到的监听（设计文档 §12 #7）：App 发通知，告诉用户连宿主上的哪个端口
+            if let Ok(local) = appine_hal::net::sockname(s.fd, false)
+                && let (Some(ip), Some(host)) = (ip_of(&local), port_of(&local))
+                && !ip.is_loopback()
+            {
+                let port = match s.local_map {
+                    Some((g, h)) if h == host => g,
+                    _ => host,
+                };
+                let comm = cx.task.comm.get();
+                let len = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+                let comm = String::from_utf8_lossy(&comm[..len]).into_owned();
+                cx.kr().portmap.borrow_mut().listened(comm, port, host);
+            }
         }
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(u) => unix::listen(u, backlog, cx.ucred())?,
@@ -388,8 +431,16 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, proto, timeout, net) = match &*sock.borrow() {
-        Socket::Inet(s) => (s.fd, s.family, s.ty, s.proto, s.rcvtimeo, s.net.clone()),
+    let (host_fd, family, ty, proto, timeout, net, local_map) = match &*sock.borrow() {
+        Socket::Inet(s) => (
+            s.fd,
+            s.family,
+            s.ty,
+            s.proto,
+            s.rcvtimeo,
+            s.net.clone(),
+            s.local_map,
+        ),
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(_) => unreachable!("handled by accept4"),
     };
@@ -399,9 +450,12 @@ fn accept_host(
             Ok((new, peer)) => {
                 let mut new = InetSocket::new(new, family, ty);
                 new.proto = proto;
+                new.local_map = local_map;
+                new.net = net.clone();
                 if proto == IPPROTO_TCP && net.is_none() {
                     cx.k().traffic.protocols.tcp_passive_opens += 1;
                 }
+                let peer = unmap_addr(&cx.kr().portmap, &new, peer, false);
                 let peer = match &net {
                     Some(ns) => crate::netns::from_host(ns, &peer, false, false),
                     None => peer,
@@ -424,6 +478,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     if is_unix(&sock) {
         return unix::connect(cx, &sock, nonblock, &addr).map(|()| 0);
     }
+    let map = cx.k().portmap.clone();
     let (host_fd, tcp, host_addr) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             // 本端地址可能变了：流量算在哪个接口上重新认
@@ -433,6 +488,9 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 let host_addr =
                     crate::netns::to_host(&ns, &addr, crate::netns::Use::Reach, s.icmp6())?;
                 ensure_bound(s)?;
+                // 本机上映射了的低端口换成宿主上的（crate::portmap）
+                let (host_addr, pm) = map_dest(&map, s, host_addr);
+                s.peer_map = pm;
                 // 它的流量不算进宿主的接口（/proc/net/snmp 也不数）
                 (s.fd, false, host_addr)
             } else {
@@ -443,10 +501,12 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                         return Ok(0);
                     }
                 }
+                let (host_addr, pm) = map_dest(&map, s, addr.clone());
+                s.peer_map = pm;
                 (
                     s.fd,
                     s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP,
-                    addr.clone(),
+                    host_addr,
                 )
             }
         }
@@ -559,6 +619,7 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
             if s.icmp.is_some() && !peer && a.len() >= 4 {
                 a[2..4].copy_from_slice(&(s.proto as u16).to_be_bytes());
             }
+            let a = unmap_addr(&cx.kr().portmap, s, a, !peer);
             match &s.net {
                 Some(ns) => crate::netns::from_host(ns, &a, !peer && s.any, s.icmp6()),
                 None => a,
@@ -889,6 +950,15 @@ pub(crate) fn send(
     } else {
         addr
     };
+    // 发往本机上映射了的低端口：换成宿主上的（crate::portmap）
+    let mapped = match &*sock.borrow() {
+        Socket::Inet(s) if !addr.is_empty() => {
+            let (a, pm) = map_dest(&cx.kr().portmap, s, addr.to_vec());
+            pm.map(|_| a)
+        }
+        _ => None,
+    };
+    let addr = mapped.as_deref().unwrap_or(addr);
     // raw ICMP socket、交给汇集点看着的 UDP socket（crate::rawicmp）：宿主替它记下的 ICMP
     // 错误会让发送失败，先取走；因为它失败了也取走再试一次
     let tap = crate::rawicmp::before_io(cx.kr(), sock);
@@ -983,6 +1053,120 @@ fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8
     {
         cx.k().traffic.account(s, rx, bytes, peer);
     }
+}
+
+/// sockaddr（AF_INET、AF_INET6）里的端口。
+fn port_of(addr: &[u8]) -> Option<u16> {
+    let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
+    match family {
+        AF_INET | AF_INET6 if addr.len() >= 4 => Some(u16::from_be_bytes([addr[2], addr[3]])),
+        _ => None,
+    }
+}
+
+fn set_port(addr: &mut [u8], port: u16) {
+    addr[2..4].copy_from_slice(&port.to_be_bytes());
+}
+
+/// 映射了的低端口在这个 socket 上起作用（[`crate::portmap`]）：TCP、UDP，不是 raw socket。
+fn mappable(s: &InetSocket) -> bool {
+    !s.raw && matches!(s.proto, IPPROTO_TCP | IPPROTO_UDP)
+}
+
+/// 登记表里的网络命名空间：开机时的是 0。
+fn ns_key(s: &InetSocket) -> usize {
+    s.net.as_ref().map_or(0, |n| Rc::as_ptr(n) as usize)
+}
+
+/// sockaddr 里的 IP（IPv4 映射的 IPv6 地址取 IPv4 的那部分）。
+fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
+    match family {
+        AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(addr.get(4..8)?).ok()?,
+        ))),
+        AF_INET6 => {
+            let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(addr.get(8..24)?).ok()?);
+            Some(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
+        }
+        _ => None,
+    }
+}
+
+/// 宿主地址是本机的：回环、通配地址，或者宿主接口上的（连自己的 wlan0 地址）。
+fn is_local(addr: &[u8]) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let Some(ip) = ip_of(addr) else {
+        return false;
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    appine_hal::net::interfaces().iter().any(|i| {
+        i.addrs.iter().any(|(_, a, _)| {
+            let own = match a.len() {
+                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&a[..]).unwrap())),
+                16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&a[..]).unwrap())),
+                _ => return false,
+            };
+            own == ip
+        })
+    })
+}
+
+/// 要连、要发往宿主地址 `addr`：本机上映射了的低端口换成宿主端口（[`crate::portmap`]）。
+/// 返回换过的地址和 (guest 端口, 宿主端口)。guest 里没有程序绑着这个端口时不换：手机上
+/// 别的 App 恰好占着宿主端口时连过去就错了，应该与原来一样连不上。
+fn map_dest(
+    map: &crate::cell::RefCell<crate::portmap::PortMap>,
+    s: &InetSocket,
+    mut addr: Vec<u8>,
+) -> (Vec<u8>, Option<(u16, u16)>) {
+    let Some(port) = port_of(&addr) else {
+        return (addr, None);
+    };
+    let host = {
+        let m = map.borrow();
+        if !mappable(s) || !m.maps(port) {
+            return (addr, None);
+        }
+        m.host_port(ns_key(s), s.proto, port)
+    };
+    match host {
+        Some(h) if is_local(&addr) => {
+            set_port(&mut addr, h);
+            (addr, Some((port, h)))
+        }
+        _ => (addr, None),
+    }
+}
+
+/// 宿主给的本端（`local`）或者对端地址里，映射来的宿主端口换回 guest 的：本端按 socket
+/// 绑的映射；对端先按 connect 时记下的，再看是不是本机上映射来的（UDP 的来源、accept 到的
+/// 对端用低端口绑定过）。
+pub(crate) fn unmap_addr(
+    map: &crate::cell::RefCell<crate::portmap::PortMap>,
+    s: &InetSocket,
+    mut addr: Vec<u8>,
+    local: bool,
+) -> Vec<u8> {
+    let Some(port) = port_of(&addr) else {
+        return addr;
+    };
+    let known = if local { s.local_map } else { s.peer_map };
+    let guest = match known {
+        Some((g, h)) if h == port => Some(g),
+        _ if local || !mappable(s) => None,
+        _ => map
+            .borrow()
+            .guest_port(ns_key(s), s.proto, port)
+            .filter(|_| is_local(&addr)),
+    };
+    if let Some(g) = guest {
+        set_port(&mut addr, g);
+    }
+    addr
 }
 
 /// 宿主上的本端 IPv4 地址换成 guest 看到的（新的网络命名空间里要换算，[`crate::netns`]）。
@@ -1128,8 +1312,13 @@ pub(crate) fn recv(
                     account(cx, sock, true, len, &r.addr);
                 }
                 let addr = match &*sock.borrow() {
-                    Socket::Inet(s @ InetSocket { net: Some(ns), .. }) if !r.addr.is_empty() => {
-                        crate::netns::from_host(ns, &r.addr, false, s.icmp6())
+                    Socket::Inet(s) if !r.addr.is_empty() => {
+                        // 来自本机上映射了的低端口：报告 guest 的端口（crate::portmap）
+                        let a = unmap_addr(&cx.kr().portmap, s, r.addr, false);
+                        match &s.net {
+                            Some(ns) => crate::netns::from_host(ns, &a, false, s.icmp6()),
+                            None => a,
+                        }
                     }
                     _ => r.addr,
                 };

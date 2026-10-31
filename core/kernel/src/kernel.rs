@@ -259,6 +259,9 @@ pub(crate) struct Kernel {
     pub seccomp_logged: u32,
     /// 网络接口的流量计数（[`crate::traffic`]）。
     pub traffic: crate::traffic::Traffic,
+    /// 1024 以下的端口映射和 guest 在非回环地址上的监听（[`crate::portmap`]）。socket 的
+    /// 租约也引用它，所以用 Rc 共享。
+    pub portmap: std::rc::Rc<crate::cell::RefCell<crate::portmap::PortMap>>,
     /// 宿主交来的主表路由（[`crate::Machine::set_routes`]，Android 上取自 `LinkProperties`），
     /// None 时读宿主的（[`crate::route`]）。
     pub host_routes: Option<Vec<appine_hal::net::Route>>,
@@ -340,6 +343,7 @@ impl Kernel {
             lease_break_time: 45,
             seccomp_logged: crate::seccomp::logged::DEFAULT,
             traffic: Default::default(),
+            portmap: Default::default(),
             host_routes: None,
             aio_nr: 0,
             aio_max_nr: 65536,

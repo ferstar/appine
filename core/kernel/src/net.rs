@@ -84,6 +84,12 @@ pub(crate) struct InetSocket {
     /// 汇集点替这个 socket 取走了宿主上的 ICMP 错误，按 Linux 的规矩要报告给 guest 的那个
     /// （errno，0 是没有）：下一次收发、`SO_ERROR` 取走它（Linux 的 `sk_err`）。
     pub icmp_err: std::cell::Cell<i32>,
+    /// 绑的是映射了的低端口（[`crate::portmap`]）：租约，以及 (guest 端口, 宿主端口)。
+    /// accept 出来的连接只有后者（本端是监听的那个端口）。
+    pub lease: Option<crate::portmap::Lease>,
+    pub local_map: Option<(u16, u16)>,
+    /// 连到了本机上映射了的低端口：(guest 端口, 宿主端口)。
+    pub peer_map: Option<(u16, u16)>,
 }
 
 impl InetSocket {
@@ -115,6 +121,9 @@ impl InetSocket {
             guest_recverr: false,
             udp_tap: None,
             icmp_err: std::cell::Cell::new(0),
+            lease: None,
+            local_map: None,
+            peer_map: None,
         }
     }
 }
@@ -187,6 +196,7 @@ pub(crate) fn proc_listing(
     sockets: &[(crate::syscall::SocketRef, u32)],
     family: i32,
     table: Table,
+    portmap: &crate::cell::RefCell<crate::portmap::PortMap>,
 ) -> String {
     let (v6, tcp) = (family == AF_INET6, table == Table::Tcp);
     let width = match table {
@@ -232,12 +242,14 @@ pub(crate) fn proc_listing(
             Some(ns) => crate::netns::from_host(ns, &a, any, inet.icmp6()),
             None => a,
         };
+        // 映射了的低端口报告 guest 的（crate::portmap）
+        let unmap = |a: Vec<u8>, local: bool| crate::syscall::unmap_addr(portmap, inet, a, local);
         let local = appine_hal::net::sockname(fd, false)
             .ok()
-            .map(|a| guest(a, inet.any));
+            .map(|a| guest(unmap(a, true), inet.any));
         let peer = appine_hal::net::sockname(fd, true)
             .ok()
-            .map(|a| guest(a, false))
+            .map(|a| guest(unmap(a, false), false))
             .or_else(|| inet.peer.clone());
         let state = if tcp {
             appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)

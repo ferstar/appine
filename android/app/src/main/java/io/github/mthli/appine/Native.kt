@@ -50,6 +50,14 @@ internal object Native {
     @JvmStatic
     external fun setRoutes(machine: Long, routes: Array<String>?)
 
+    /**
+     * 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 #7）：每一项是
+     * `<进程名>\t<端口>\t<宿主上的端口>`。1024 以下的端口在宿主上换成了别的端口，别的设备
+     * 要连宿主上的那个。要取 BKL，不在主线程上调用。
+     */
+    @JvmStatic
+    external fun takeListens(machine: Long): Array<String>?
+
     /** 新建一个控制台（进程内 PTY），返回它的编号。 */
     @JvmStatic
     @Throws(IOException::class)

@@ -50,6 +50,9 @@ pub struct MachineOptions {
     /// App 进程匿名内存的上限（字节）：超出时结束一个 guest 进程，免得 Android 的 LMK
     /// 杀掉整个 App（设计文档 §12）。None 时取宿主物理内存的一半，`u64::MAX` 表示不限制。
     pub memory_limit: Option<u64>,
+    /// 1024 以下的端口在宿主上换成的端口的偏移（[`crate::portmap`]）：None 是默认的 10000，
+    /// 0 表示不映射（Android 上绑低端口是 EACCES）。
+    pub low_port_offset: Option<u16>,
 }
 
 /// 新进程的 stdin/stdout/stderr。
@@ -104,6 +107,9 @@ impl Machine {
             k.oom.limit = options
                 .memory_limit
                 .unwrap_or_else(crate::oom::default_limit);
+            k.portmap.borrow_mut().offset = options
+                .low_port_offset
+                .unwrap_or(crate::portmap::DEFAULT_OFFSET);
             let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
             k.groups.insert(INIT, Rc::new(RefCell::new(init)));
         }
@@ -460,6 +466,15 @@ impl Machine {
         });
     }
 
+    /// 取走 guest 在非回环地址上第一次监听的端口（设计文档 §12 #7）：App 据此发通知，
+    /// 告诉用户别的设备连哪个端口（低端口映射到了别处，[`crate::portmap`]）。
+    pub fn take_listens(&self) -> Vec<crate::ListenEvent> {
+        crate::bug::host_call("Machine::take_listens", || {
+            self.shared.lock().portmap.borrow_mut().take_listens()
+        })
+        .unwrap_or_default()
+    }
+
     /// 使用 Tier 1 时已退出线程的统计之和。
     pub fn dbt_stats(&self) -> Option<DbtStats> {
         self.shared.lock().dbt_stats
@@ -590,6 +605,7 @@ pub fn run(
         tier: options.tier,
         rootfs: options.rootfs.clone(),
         memory_limit: options.memory_limit,
+        low_port_offset: options.low_port_offset,
     })?;
     // 有终端时，进程是会话组长，接到宿主终端的控制台是它的控制终端
     let console = options

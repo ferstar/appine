@@ -15,10 +15,12 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
 import java.io.File
 import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.net.Socket
 import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -308,6 +310,41 @@ class MachineTest {
         assertTrue(after, after.lines().any { it.startsWith("0.0.0.0 ") && it.contains(gateway!!) })
         Native.setRoutes(machine, null)
         assertTrue(sh(machine, "ip route").first.contains("default dev "))
+    }
+
+    /**
+     * 1024 以下的端口（设计文档 §10）：App 没有 CAP_NET_BIND_SERVICE，宿主上绑不了 22；guest 的
+     * nc 绑 22 时宿主上换成 10022，guest 里看到的还是 22。App 经由 [Native.takeListens] 知道
+     * 外部端口（§12 #7 的通知用它），从 App 进程连 10022 收得到 guest 发的数据。
+     */
+    @Test
+    fun lowPortsMoveToHighPortsOnTheHost() {
+        val denied = runCatching { ServerSocket(22).close() }.isFailure
+        val machine = start(1)
+        val console = Native.openConsole(machine, 24, 80)
+        val script = "echo hello | nc -l -p 22; dmesg | grep 'port 22/'"
+        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", script), ConsolePty.ENVIRONMENT)
+        var out = ""
+        val reader = thread { out = readAll(machine, console) }
+        var listens: Array<String>? = null
+        val deadline = System.currentTimeMillis() + 30_000
+        while (System.currentTimeMillis() < deadline) {
+            listens = Native.takeListens(machine)
+            if (!listens.isNullOrEmpty()) break
+            Thread.sleep(50)
+        }
+        assertEquals("nc\t22\t10022", listens?.singleOrNull())
+        // nc 读完 stdin 之后不关连接：读到了就关掉，它才退出
+        Socket("127.0.0.1", 10022).use { s ->
+            val got = ByteArray(6)
+            DataInputStream(s.getInputStream()).readFully(got)
+            assertEquals("hello\n", String(got))
+        }
+        reader.join(10_000)
+        assertEquals(out, 0, Native.waitFor(machine, pid))
+        assertTrue(out, out.contains("appine: port 22/tcp is 10022 on the host"))
+        assertTrue("the app itself could bind port 22", denied)
+        assertEquals(0, Native.takeListens(machine)?.size)
     }
 
     /**
