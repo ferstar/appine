@@ -22,5 +22,5 @@
 
 **推迟项**：
 
-- `PR_SET_PDEATHSIG` 仍在父进程结束时才发；Linux 上"父进程"是建立它的线程，那个线程退出（比如 `pthread_exit`）就发，进程还在也一样（prctl(2)）。现在记着父线程了，可以照改。
-- wait 系列的 `__WNOTHREAD` 接受但不起作用，仍等整个进程的子进程；Linux 只等调用的线程建的。
+- `PR_SET_PDEATHSIG` 仍在父进程结束时才发；Linux 上"父进程"是建立它的线程，那个线程退出（比如 `pthread_exit`）就发，进程还在也一样（prctl(2)）。现在记着父线程了，可以照改。→ 已补上（M9 之前：PDEATHSIG 和 __WNOTHREAD）
+- wait 系列的 `__WNOTHREAD` 接受但不起作用，仍等整个进程的子进程；Linux 只等调用的线程建的。→ 已补上（M9 之前：PDEATHSIG 和 __WNOTHREAD）；跟踪着的线程仍按进程算

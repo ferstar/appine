@@ -79,6 +79,10 @@ pub(crate) struct Task {
     pub saved_sigmask: Cell<Option<u64>>,
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
     pub killed: Cell<bool>,
+    /// `PR_SET_PDEATHSIG`：父进程里建立这个进程的线程退出时发给这个进程的信号，0 表示不发
+    /// （[`crate::process::pdeath_signals`]）。与 Linux 一样按线程记，新的线程、进程都从 0
+    /// 开始，execve 保留。
+    pub pdeathsig: Cell<i32>,
     /// 线程正在内核里等待（[`Task::asleep`]、平均负载）。在释放 BKL 之前设置，重新拿到
     /// BKL 之后清除；不持 BKL 的等待（`syscall::fast`）也设置。
     pub sleeping: AtomicBool,
@@ -194,6 +198,7 @@ impl Task {
             ns: RefCell::new(ns),
             saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
+            pdeathsig: Cell::new(0),
             sleeping: AtomicBool::new(false),
             comm: Cell::new(comm),
             nice: Cell::new(0),
@@ -857,7 +862,21 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     // 线程的由 finish_group 过继出去
     if !last {
         let to = crate::process::alive_thread(&k, &group.borrow());
+        let mine: Vec<Tid> = group
+            .borrow()
+            .children
+            .iter()
+            .copied()
+            .filter(|c| {
+                k.groups
+                    .get(c)
+                    .is_some_and(|g| g.borrow().parent_thread == tid)
+            })
+            .collect();
+        let signals = crate::process::pdeath_signals(&k, &mine);
         crate::process::hand_thread_children(&k, &group, tid, to);
+        let ruid = group.borrow().cred.ruid;
+        crate::process::send_pdeath(&k, signals, tgid, ruid);
     }
     // 后面的步骤出错时：还有别的线程就结束这个进程，否则它已经结束了，只报告
     let failed = |k: &Kernel, step: &str| {

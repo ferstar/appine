@@ -1,6 +1,6 @@
 # compat.sh 的续篇（difftest 把整个脚本作为 sh -c 的一个参数，不能超过 128 KB）：raw ICMP
 # socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径、F_GETFL 里的
-# O_LARGEFILE、/proc/<pid>/task/<tid>/children
+# O_LARGEFILE、/proc/<pid>/task/<tid>/children、PR_SET_PDEATHSIG 和 __WNOTHREAD
 set -e
 cd /tmp
 # raw ICMP socket（appine 在宿主上用 ping socket 模拟）：IPv4 收到的数据带 IP 头，echo 回答
@@ -884,3 +884,251 @@ int main(int argc, char **argv)
 C
 gcc -O1 -pthread -o children children.c && ./children
 echo "children in task/<tid>: $(ls /proc/$$/task/$$ | grep -c '^children$'), in /proc/<pid>: $(ls /proc/$$ | grep -c '^children$')"
+
+# PR_SET_PDEATHSIG 按线程：建立子进程的线程一退出就发（进程还在也一样），别的线程退出不发；
+# 设置跟着设它的线程，新线程、fork 出来的子进程都是 0，execve 保留，setuid 之后清掉；
+# siginfo 是 SI_USER，发送者是父进程。wait 的 __WNOTHREAD 只等调用的线程建的子进程
+cat > pdeath.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef __WNOTHREAD
+#define __WNOTHREAD 0x20000000
+#endif
+
+static int fds[2];
+static pid_t parent;
+static char *self;
+
+/* 子进程等 PR_SET_PDEATHSIG 的信号：在 ms 毫秒里收到的都写进管道 */
+static void await_signals(int ms)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGUSR2);
+    char buf[256] = "", one[96];
+    siginfo_t si;
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    while (sigtimedwait(&set, &si, &ts) > 0) {
+        snprintf(one, sizeof one, " %s code %d from parent %d uid %d",
+                 si.si_signo == SIGUSR1 ? "USR1" : "USR2", si.si_code, si.si_pid == parent,
+                 (int)si.si_uid);
+        strcat(buf, one);
+    }
+    strcat(buf, buf[0] ? "\n" : " none\n");
+    write(fds[1], buf, strlen(buf));
+}
+
+static void block(void)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+static int stay;
+static volatile int usr2_set;
+static void *set_usr2(void *arg)
+{
+    prctl(PR_SET_PDEATHSIG, SIGUSR2);
+    usr2_set = 1;
+    if (stay)
+        for (;;)
+            pause();
+    return NULL;
+}
+
+/* how：0 只在主线程设 SIGUSR1；1 另一个线程再设 SIGUSR2、一直活着；2 设了之后 exec；3 另一个
+ * 线程设了 SIGUSR2 之后退出（跟着它没了） */
+static pid_t spawn(int how, int ms)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        block();
+        prctl(PR_SET_PDEATHSIG, SIGUSR1);
+        if (how == 1 || how == 3) {
+            pthread_t t;
+            stay = how == 1;
+            pthread_create(&t, NULL, set_usr2, NULL);
+            if (stay)
+                while (!usr2_set)
+                    usleep(1000);
+            else
+                pthread_join(t, NULL);
+        }
+        if (how == 2) {
+            char a[16], b[16], c[16];
+            snprintf(a, sizeof a, "%d", fds[1]);
+            snprintf(b, sizeof b, "%d", parent);
+            snprintf(c, sizeof c, "%d", ms);
+            execl(self, self, "pdeath-exec", a, b, c, (char *)NULL);
+            _exit(1);
+        }
+        char ok = 'r';
+        write(fds[1], &ok, 1);
+        await_signals(ms);
+        _exit(0);
+    }
+    char c;
+    read(fds[0], &c, 1);
+    return p;
+}
+
+static void report(const char *what, pid_t p)
+{
+    char buf[300];
+    waitpid(p, NULL, 0);
+    ssize_t n = read(fds[0], buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = 0;
+    printf("%s:%s", what, buf);
+}
+
+static pid_t from_thread;
+static int how_in_thread;
+static void *thread_spawn(void *arg)
+{
+    from_thread = spawn(how_in_thread, 1000);
+    return NULL;
+}
+
+static void *nothing(void *arg) { return NULL; }
+
+static void *get_pdeath(void *arg)
+{
+    int s = -1;
+    prctl(PR_GET_PDEATHSIG, &s);
+    printf("a new thread sees %d\n", s);
+    return NULL;
+}
+
+static const char *err(long r) { return r < 0 ? strerror(errno) : "ok"; }
+
+static pid_t a_pid, b_pid, c_pid;
+static void *waiter_thread(void *arg)
+{
+    int st;
+    b_pid = fork();
+    if (b_pid == 0)
+        _exit(7);
+    pid_t r = waitpid(-1, &st, __WNOTHREAD);
+    printf("thread waits any: %s, status %d\n", r == b_pid ? "its own child" : "other", WEXITSTATUS(st));
+    r = waitpid(-1, &st, WNOHANG | __WNOTHREAD);
+    printf("thread waits any again: %s\n", err(r));
+    r = waitpid(a_pid, &st, WNOHANG | __WNOTHREAD);
+    printf("thread waits the main thread's child: %s\n", err(r));
+    r = waitpid(a_pid, &st, WNOHANG);
+    printf("without __WNOTHREAD: %ld\n", (long)r);
+    siginfo_t si;
+    printf("waitid: %s\n", err(waitid(P_ALL, 0, &si, WEXITED | WNOHANG | __WNOTHREAD)));
+    c_pid = fork();
+    if (c_pid == 0) {
+        pause();
+        _exit(0);
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    self = argv[0];
+    if (argc > 1 && strcmp(argv[1], "pdeath-exec") == 0) {
+        fds[1] = atoi(argv[2]);
+        parent = atoi(argv[3]);
+        int s = -1;
+        prctl(PR_GET_PDEATHSIG, &s);
+        char buf[64];
+        snprintf(buf, sizeof buf, "after exec %d,", s);
+        write(fds[1], "r", 1);
+        write(fds[1], buf, strlen(buf));
+        await_signals(atoi(argv[4]));
+        _exit(0);
+    }
+    pipe(fds);
+    parent = getpid();
+    pthread_t t;
+
+    how_in_thread = 0;
+    pthread_create(&t, NULL, thread_spawn, NULL);
+    pthread_join(t, NULL);
+    report("creating thread exited", from_thread);
+
+    pid_t p = spawn(0, 300);
+    pthread_create(&t, NULL, nothing, NULL);
+    pthread_join(t, NULL);
+    report("another thread exited", p);
+
+    how_in_thread = 1;
+    pthread_create(&t, NULL, thread_spawn, NULL);
+    pthread_join(t, NULL);
+    report("set in two threads", from_thread);
+
+    how_in_thread = 3;
+    pthread_create(&t, NULL, thread_spawn, NULL);
+    pthread_join(t, NULL);
+    report("set in a thread that exited", from_thread);
+
+    how_in_thread = 2;
+    pthread_create(&t, NULL, thread_spawn, NULL);
+    pthread_join(t, NULL);
+    report("set before exec", from_thread);
+
+    prctl(PR_SET_PDEATHSIG, SIGUSR2);
+    int s = -1;
+    prctl(PR_GET_PDEATHSIG, &s);
+    printf("own %d\n", s);
+    pthread_create(&t, NULL, get_pdeath, NULL);
+    pthread_join(t, NULL);
+    p = fork();
+    if (p == 0) {
+        prctl(PR_GET_PDEATHSIG, &s);
+        printf("a forked child sees %d\n", s);
+        prctl(PR_SET_PDEATHSIG, SIGUSR1);
+        setuid(1000);
+        prctl(PR_GET_PDEATHSIG, &s);
+        printf("after setuid %d\n", s);
+        _exit(0);
+    }
+    waitpid(p, NULL, 0);
+    prctl(PR_SET_PDEATHSIG, 0);
+
+
+    a_pid = fork();
+    if (a_pid == 0) {
+        pause();
+        _exit(0);
+    }
+    pthread_create(&t, NULL, waiter_thread, NULL);
+    pthread_join(t, NULL);
+    kill(c_pid, SIGKILL);
+    printf("main waits the exited thread's child: %s\n", waitpid(c_pid, NULL, __WNOTHREAD) == c_pid ? "ok" : strerror(errno));
+    kill(a_pid, SIGKILL);
+    printf("main waits any: %s\n", waitpid(-1, NULL, __WNOTHREAD) == a_pid ? "its own child" : strerror(errno));
+
+    /* 放在最后：孙进程成了孤儿，原生一侧这个程序是容器的 1 号进程时会收养它 */
+    pid_t mid = fork();
+    if (mid == 0) {
+        parent = getpid();
+        spawn(0, 1000);
+        _exit(0);
+    }
+    waitpid(mid, NULL, 0);
+    char buf[300];
+    ssize_t n = read(fds[0], buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = 0;
+    printf("parent process exited:%s", buf);
+    return 0;
+}
+C
+gcc -O1 -pthread -o pdeath pdeath.c && ./pdeath

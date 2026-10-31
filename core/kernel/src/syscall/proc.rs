@@ -829,12 +829,12 @@ fn exec(
             || gained
         {
             g.dumpable = false;
-            g.pdeathsig = 0;
+            cx.task.pdeathsig.set(0);
         } else {
             g.dumpable = cred.permission(&st, crate::cred::MAY_READ).is_ok();
         }
         if secure {
-            g.pdeathsig = 0;
+            cx.task.pdeathsig.set(0);
         }
         g.cred = new_cred;
         cx.shared.fast_changed();
@@ -970,13 +970,15 @@ impl ChildEvent {
     }
 }
 
-/// 要等哪些状态变化（`WEXITED`、`WUNTRACED`/`WSTOPPED`、`WCONTINUED`），以及是否取走事件。
+/// 要等哪些状态变化（`WEXITED`、`WUNTRACED`/`WSTOPPED`、`WCONTINUED`），是否取走事件，以及
+/// 是否只等调用的线程建的子进程（`__WNOTHREAD`）。
 #[derive(Clone, Copy)]
 struct Wanted {
     exited: bool,
     stopped: bool,
     continued: bool,
     consume: bool,
+    own_thread: bool,
 }
 
 /// 找到的子进程状态变化：(pid, 事件, 子进程和它回收过的子进程用掉的 CPU 时间)。
@@ -1001,11 +1003,16 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         maxrss_kb: g.maxrss_kb.max(g.child_maxrss_kb),
     };
     let mut any = false;
+    let tid = cx.tid();
     for c in children {
         let Some(child) = cx.kr().groups.get(&c).cloned() else {
             continue;
         };
         if !matches(c, child.borrow().pgid) {
+            continue;
+        }
+        // __WNOTHREAD：别的线程建的子进程看不见（Linux 的 do_wait 只看这个线程的 children）
+        if want.own_thread && child.borrow().parent_thread != tid {
             continue;
         }
         any = true;
@@ -1154,6 +1161,7 @@ pub(super) fn wait4(
         stopped: options & WUNTRACED != 0,
         continued: options & WCONTINUED != 0,
         consume: true,
+        own_thread: options & WNOTHREAD != 0,
     };
     let Some((child, event, usage)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
         return Ok(0);
@@ -1207,6 +1215,7 @@ pub(super) fn waitid(
         stopped: options & WUNTRACED != 0,
         continued: options & WCONTINUED != 0,
         consume: options & WNOWAIT == 0,
+        own_thread: options & WNOTHREAD != 0,
     };
     let nohang = options & WNOHANG != 0;
     let found = wait_child(cx, who, nohang || nonblock, want)?;

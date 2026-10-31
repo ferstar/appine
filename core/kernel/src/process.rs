@@ -366,8 +366,6 @@ pub(crate) struct ThreadGroup {
     pub itimer: Option<crate::itimer::ITimer>,
     /// `ITIMER_VIRTUAL`、`ITIMER_PROF`，按进程用掉的 CPU 时间计时。
     pub cpu_itimers: [Option<crate::itimer::CpuTimer>; 2],
-    /// `PR_SET_PDEATHSIG`：父进程退出时收到的信号，0 表示不发；fork 不继承。
-    pub pdeathsig: i32,
     /// `PR_SET_CHILD_SUBREAPER`：后代成了孤儿时过继给最近的这样的祖先，而不是 init
     /// （[`finish_group`]）；fork 不继承，execve 保留。
     pub child_subreaper: bool,
@@ -446,7 +444,6 @@ impl ThreadGroup {
             rss_sampled: None,
             itimer: None,
             cpu_itimers: [None; 2],
-            pdeathsig: 0,
             child_subreaper: false,
             dumpable: true,
             no_new_privs: false,
@@ -570,6 +567,36 @@ pub(crate) fn alive_thread(k: &Kernel, g: &ThreadGroup) -> Tid {
         .unwrap_or(g.tgid)
 }
 
+/// 子进程 `children` 里设了 `PR_SET_PDEATHSIG` 的线程各要收的信号：它们的父线程退出了
+/// （Linux 的 `forget_original_parent`：每个这样的线程一个，发给它所在的进程）。
+pub(crate) fn pdeath_signals(k: &Kernel, children: &[Tid]) -> Vec<(Tid, Signal)> {
+    let mut out = Vec::new();
+    for c in children {
+        let Some(g) = k.groups.get(c) else {
+            continue;
+        };
+        for t in &g.borrow().threads {
+            if let Some(sig) = k.tasks.get(t).and_then(|t| Signal::new(t.pdeathsig.get())) {
+                out.push((*c, sig));
+            }
+        }
+    }
+    out
+}
+
+/// 发 [`pdeath_signals`] 的信号：与 Linux 一样是 `SI_USER`，发送者是父进程 `parent`（真实
+/// 用户 ID 是 `ruid`），子进程的 pid 命名空间里看不到它时编号是 0、按强制的信号处理。
+pub(crate) fn send_pdeath(k: &Kernel, signals: Vec<(Tid, Signal)>, parent: Tid, ruid: u32) {
+    for (c, sig) in signals {
+        let Some(g) = k.groups.get(&c) else {
+            continue;
+        };
+        let uid = g.borrow().cred.uid_out(ruid);
+        let info = SigInfo::kill(signal::code::SI_USER, k.pid_seen_by(c, parent), uid).from(parent);
+        signal::send_to_group(k, c, sig, info);
+    }
+}
+
 /// 进程 `parent` 里的线程 `from` 退出了：它建的子进程改由同一个进程里的线程 `to` 当父线程，
 /// 排到子进程列表的最后（Linux 的 `forget_original_parent` 在本进程里找到新的父线程时
 /// `list_splice_tail_init`）。
@@ -637,6 +664,8 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             .groups
             .get(&reaper)
             .map_or(reaper, |g| alive_thread(k, &g.borrow()));
+        // 最后一个线程建的（别的线程退出时转给了它的）子进程要收的 PR_SET_PDEATHSIG
+        orphaned = pdeath_signals(k, &group.borrow().children);
         let children = std::mem::take(&mut group.borrow_mut().children);
         for c in children {
             let Some(child) = k.groups.get(&c).cloned() else {
@@ -649,9 +678,6 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                 cg.exit_signal = Signal::CHLD.number();
                 if cg.pgid != pgid && cg.sid == sid {
                     pgrps.push(cg.pgid);
-                }
-                if let Some(sig) = Signal::new(cg.pdeathsig) {
-                    orphaned.push((c, sig));
                 }
                 // 跟踪者还没取走的僵尸进程交给新的父进程，跟踪者取走之后由它回收
                 cg.zombie.filter(|_| cg.exit_tracer.is_none())
@@ -674,10 +700,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         }
     });
     // PR_SET_PDEATHSIG：通知失去父进程的子进程
+    let ruid = group.borrow().cred.ruid;
     step(k, tgid, 3, "sending parent-death signals", |k| {
-        for (c, sig) in orphaned {
-            signal::send_to_group(k, c, sig, SigInfo::kernel());
-        }
+        send_pdeath(k, orphaned, tgid, ruid)
     });
     step(k, tgid, 4, "releasing SysV IPC", |k| {
         crate::ipc::exit(k, tgid)

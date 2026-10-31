@@ -720,11 +720,11 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             if arg != 0 && Signal::new(arg as i32).is_none() {
                 return Err(Errno::EINVAL);
             }
-            cx.t.group.borrow_mut().pdeathsig = arg as i32;
+            cx.task.pdeathsig.set(arg as i32);
             Ok(0)
         }
         PR_GET_PDEATHSIG => {
-            let sig = cx.t.group.borrow().pdeathsig;
+            let sig = cx.task.pdeathsig.get();
             put(cx, arg, sig.to_le_bytes()).map(|()| 0)
         }
         // 与 Linux 一样不检查别的参数，非 0 都算设上

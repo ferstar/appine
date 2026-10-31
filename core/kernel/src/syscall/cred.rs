@@ -42,7 +42,13 @@ fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Resu
     let mut g = cx.t.group.borrow_mut();
     if ids(&cred) != ids(&old) || cred.cap_permitted & !old.cap_permitted != 0 {
         g.dumpable = false;
-        g.pdeathsig = 0;
+        // 凭据按进程记，所有线程的一起变了：Linux 上 libc 让每个线程各自 commit_creds，
+        // 各自的 pdeath_signal 都清掉
+        for t in &g.threads {
+            if let Some(t) = cx.kr().tasks.get(t) {
+                t.pdeathsig.set(0);
+            }
+        }
     }
     g.cred = cred;
     drop(g);

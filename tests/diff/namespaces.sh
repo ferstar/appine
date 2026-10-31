@@ -350,6 +350,21 @@ echo "unshare exits with $?"
 busybox unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
 # 1 号进程的 task/1/children 里是里面的编号（两个后台的 sleep 和 cat 自己）
 busybox unshare -p -f --mount-proc sh -c 'sleep 100 & sleep 100 & echo "children of 1: $(cat /proc/1/task/1/children)."; kill 2 3'
+# 父进程在 pid 命名空间外面被结束：里面的 1 号进程设的 PR_SET_PDEATHSIG（SIGKILL）照样收到，
+# 发送者在里面看不见，按强制的信号处理（util-linux 的 unshare --kill-child、bwrap 的
+# --die-with-parent 靠它）。exec 成 sleep 之前已经设好
+unshare -p -f --kill-child sleep 1000 &
+u=$!
+c=
+while [ "$(cat /proc/$c/comm 2>/dev/null)" != sleep ]; do sleep 0.01; c=$(pgrep -P $u); done
+kill -9 $u
+wait $u 2>/dev/null
+n=0
+while [ -e /proc/$c ] && [ "$(cut -d" " -f3 /proc/$c/stat 2>/dev/null)" != Z ] && [ $n -lt 300 ]; do
+    sleep 0.01
+    n=$((n + 1))
+done
+echo "pid 1 of the namespace dies with its parent: $([ $n -lt 300 ] && echo yes)"
 
 python3 - <<'PY3'
 import ctypes, errno, functools, os, signal, socket, struct, threading, time
