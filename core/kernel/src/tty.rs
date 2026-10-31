@@ -48,10 +48,24 @@ pub mod flags {
     /// 输出时 CR 转成 NL。
     pub const OCRNL: u32 = 0o10;
 
+    /// 字符宽度的几位。
+    pub const CSIZE: u32 = 0o60;
     /// 8 位字符。
     pub const CS8: u32 = 0o60;
     /// 允许接收。
     pub const CREAD: u32 = 0o200;
+    /// 奇偶校验。
+    pub const PARENB: u32 = 0o400;
+    /// 输出速率的几位：低 4 位是 B0–B38400，加上 `CBAUDEX` 是 B57600 起的 15 档。
+    pub const CBAUD: u32 = 0o10017;
+    /// `CBAUD` 里的扩展位。
+    pub const CBAUDEX: u32 = 0o10000;
+    /// 只有 `CBAUDEX` 时表示速率另写在 `c_ospeed`（输入速率的几位里是 `c_ispeed`）。
+    pub const BOTHER: u32 = 0o10000;
+    /// 输入速率在 `CBAUD` 左移这么多位的地方（`CIBAUD`），0 表示与输出相同。
+    pub const IBSHIFT: u32 = 16;
+    /// 地址位（RS-485），只能经由驱动改。
+    pub const ADDRB: u32 = 0o4000000000;
     /// 波特率 38400。
     pub const B38400: u32 = 0o17;
 
@@ -103,7 +117,8 @@ pub mod cc {
 use cc::*;
 use flags::*;
 
-/// asm-generic 的 `struct termios`（36 字节）。
+/// 内核的 `ktermios`，即 asm-generic 的 `struct termios2`（44 字节）：`struct termios`
+/// （36 字节，TCGETS、TCSETS 用）后面接着输入、输出速率（TCGETS2、TCSETS2 用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Termios {
     pub iflag: u32,
@@ -112,6 +127,29 @@ pub struct Termios {
     pub lflag: u32,
     pub line: u8,
     pub cc: [u8; NCCS],
+    pub ispeed: u32,
+    pub ospeed: u32,
+}
+
+/// `CBAUD` 各档的速率（Linux 的 `baud_table`，不是 sparc 的那份）：B0–B38400，之后是
+/// `CBAUDEX` 加 1–15。
+const BAUD_TABLE: [u32; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
+    3000000, 3500000, 4000000,
+];
+
+/// 一组 `CBAUD` 位对应的速率；`BOTHER` 时是 `other`。
+fn baud(cbaud: u32, other: u32) -> u32 {
+    if cbaud == BOTHER {
+        return other;
+    }
+    let i = if cbaud & CBAUDEX != 0 {
+        (cbaud & !CBAUDEX) + 15
+    } else {
+        cbaud
+    };
+    BAUD_TABLE.get(i as usize).copied().unwrap_or(0)
 }
 
 impl Default for Termios {
@@ -128,14 +166,16 @@ impl Default for Termios {
             lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
             line: 0,
             cc: c,
+            ispeed: 38400,
+            ospeed: 38400,
         }
     }
 }
 
 impl Termios {
-    /// 编码成 guest 的 `struct termios`。
-    pub fn encode(&self) -> [u8; 36] {
-        let mut b = [0u8; 36];
+    /// 编码成 guest 的 `struct termios2`；前 36 字节就是 `struct termios`。
+    pub fn encode(&self) -> [u8; 44] {
+        let mut b = [0u8; 44];
         for (i, v) in [self.iflag, self.oflag, self.cflag, self.lflag]
             .iter()
             .enumerate()
@@ -143,15 +183,17 @@ impl Termios {
             b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         b[16] = self.line;
-        b[17..].copy_from_slice(&self.cc);
+        b[17..36].copy_from_slice(&self.cc);
+        b[36..40].copy_from_slice(&self.ispeed.to_le_bytes());
+        b[40..].copy_from_slice(&self.ospeed.to_le_bytes());
         b
     }
 
-    /// 从 guest 的 `struct termios` 解码。
-    pub fn decode(b: &[u8; 36]) -> Termios {
+    /// 从 guest 的 `struct termios2` 解码。
+    pub fn decode(b: &[u8; 44]) -> Termios {
         let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let mut c = [0u8; NCCS];
-        c.copy_from_slice(&b[17..]);
+        c.copy_from_slice(&b[17..36]);
         Termios {
             iflag: word(0),
             oflag: word(1),
@@ -159,7 +201,23 @@ impl Termios {
             lflag: word(3),
             line: b[16],
             cc: c,
+            ispeed: word(9),
+            ospeed: word(10),
         }
+    }
+
+    /// 按 `CBAUD`、`CIBAUD` 填好两个速率（Linux 的 `set_termios` 在设置之前做的，
+    /// `tty_termios_baud_rate`、`tty_termios_input_baud_rate`）：用老的 `Bxxx` 写法设置时
+    /// 速率字段也总是可用的，`BOTHER` 时沿用字段里的值。输入速率的几位是 0 时与输出相同。
+    pub fn load_speeds(&mut self) {
+        let ospeed = baud(self.cflag & CBAUD, self.ospeed);
+        let input = (self.cflag >> IBSHIFT) & CBAUD;
+        self.ispeed = if input == 0 {
+            ospeed
+        } else {
+            baud(input, self.ispeed)
+        };
+        self.ospeed = ospeed;
     }
 
     fn l(&self, f: u32) -> bool {
@@ -495,8 +553,11 @@ impl Tty {
         }
     }
 
-    /// 修改 termios。规范模式开关时，在两种队列之间搬运已有的输入。
-    pub fn set_termios(&mut self, t: Termios) {
+    /// 修改 termios。地址位不变（Linux 的 `tty_set_termios`），PTY 总是 8 位、不校验、
+    /// 允许接收（`pty_set_termios`）。规范模式开关时，在两种队列之间搬运已有的输入。
+    pub fn set_termios(&mut self, mut t: Termios) {
+        t.cflag ^= (t.cflag ^ self.termios.cflag) & ADDRB;
+        t.cflag = t.cflag & !(CSIZE | PARENB) | CS8 | CREAD;
         let was = self.canonical();
         self.termios = t;
         match (was, self.canonical()) {
@@ -941,6 +1002,37 @@ mod tests {
         t.set_termios(tio);
         t.write_input("aé\x7f\n".as_bytes());
         assert_eq!(read_all(&mut t), b"a\n");
+    }
+
+    #[test]
+    fn speeds_follow_the_baud_bits() {
+        let mut t = Termios::default();
+        t.load_speeds();
+        assert_eq!((t.ispeed, t.ospeed), (38400, 38400));
+        // B115200（CBAUDEX 加 2）输出、B1200 输入
+        t.cflag = t.cflag & !CBAUD & !(CBAUD << IBSHIFT) | 0o10002 | (0o11 << IBSHIFT);
+        t.load_speeds();
+        assert_eq!((t.ispeed, t.ospeed), (1200, 115200));
+        // BOTHER 用字段里的速率；B0 时也是 0
+        t.cflag = t.cflag & !CBAUD & !(CBAUD << IBSHIFT) | BOTHER | (BOTHER << IBSHIFT);
+        (t.ispeed, t.ospeed) = (12345, 54321);
+        t.load_speeds();
+        assert_eq!((t.ispeed, t.ospeed), (12345, 54321));
+        t.cflag &= !CBAUD & !(CBAUD << IBSHIFT);
+        t.load_speeds();
+        assert_eq!((t.ispeed, t.ospeed), (0, 0));
+    }
+
+    #[test]
+    fn pty_keeps_eight_bits_and_the_address_bit() {
+        let mut tty = Tty::new(0);
+        let mut t = tty.termios;
+        t.cflag = t.cflag & !(CSIZE | CREAD) | PARENB | ADDRB;
+        tty.set_termios(t);
+        assert_eq!(
+            tty.termios.cflag & (CSIZE | CREAD | PARENB | ADDRB),
+            CS8 | CREAD
+        );
     }
 
     #[test]

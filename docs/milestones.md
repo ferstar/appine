@@ -153,6 +153,7 @@
 | [M9 之前：RDM、FCMA、FHM 和 BF16](rounds/142-rdm-fcma-fhm-bf16.md) | 2026-10-31 | 宿主有时宣告的另外四个 SIMD 扩展：只放行编码，FHM 只和 FP16 一起宣告；在 appine 里 `gcc -mcpu=native` 也用上它们；BF16 点积用 BFDOT 原生快 2.4 倍、appine 里快 1.5 倍，另外三种在 M2 上差别在 5% 以内 |
 | [M9 之前：/dev/kmsg 和内核日志](rounds/143-kmsg.md) | 2026-10-31 | 内核层有了自己的日志（6.1 的 printk 环形缓冲区）：`/dev/kmsg` 的读写、lseek、poll 和限速，syslog(2) 的各个动作、`/proc/kmsg`、`printk_devkmsg`；OOM killer 和内部错误结束进程记进去，guest 里 `dmesg` 看得到；差分测试的镜像不再带上仓库 /tmp 里的东西 |
 | [M9 之前：openat2](rounds/144-openat2.md) | 2026-10-31 | openat2 按 6.1 实现：`open_how` 和标志的检查，路径解析里的 `RESOLVE_BENEATH`、`IN_ROOT`、`NO_SYMLINKS`、`NO_MAGICLINKS`、`NO_XDEV`（含 `nd_jump_root` 在 nd->root 还没取过时的 EXDEV）；GNU tar 的新版本配 glibc ≥ 2.43 离不开它，bubblewrap 0.12 原来走退路 |
+| [M9 之前：termios2](rounds/145-termios2.md) | 2026-10-31 | `TCGETS2`、`TCSETS2`、`TCSETSW2`、`TCSETSF2` 和 termios 里的速率（按 `CBAUD`、`CIBAUD` 换算，`BOTHER`）：glibc 2.42 起 `tcgetattr`、`isatty`、`tcsetattr` 只用它们，Ubuntu 26.04 里原来每个终端都"不是终端"；PTY 总是 `CS8`、`CREAD`，地址位改不了 |
 
 ## 测量条件
 

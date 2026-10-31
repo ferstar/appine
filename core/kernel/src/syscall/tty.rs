@@ -44,6 +44,11 @@ const TIOCGETD: u32 = 0x5424;
 const TCSBRKP: u32 = 0x5425;
 const TIOCGSID: u32 = 0x5429;
 const TIOCVHANGUP: u32 = 0x5437;
+/// `struct termios2`：多了输入、输出速率（glibc 2.42 起 tcgetattr、tcsetattr 只用这几个）。
+const TCGETS2: u32 = 0x802c_542a;
+const TCSETS2: u32 = 0x402c_542b;
+const TCSETSW2: u32 = 0x402c_542c;
+const TCSETSF2: u32 = 0x402c_542d;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 
@@ -496,7 +501,11 @@ pub(crate) fn ioctl(
         });
     }
     match request {
-        TCGETS => put(cx, arg, tty.borrow().termios.encode()).map(|()| 0),
+        TCGETS => {
+            let t = tty.borrow().termios.encode();
+            put(cx, arg, <[u8; 36]>::try_from(&t[..36]).unwrap()).map(|()| 0)
+        }
+        TCGETS2 => put(cx, arg, tty.borrow().termios.encode()).map(|()| 0),
         TCGETA => {
             let t = tty.borrow().termios.encode();
             let mut b = [0u8; 18];
@@ -506,24 +515,30 @@ pub(crate) fn ioctl(
             b[8..17].copy_from_slice(&t[16..25]);
             put(cx, arg, b).map(|()| 0)
         }
-        TCSETS | TCSETSW | TCSETSF | TCSETA | TCSETAW | TCSETAF => {
+        TCSETS | TCSETSW | TCSETSF | TCSETA | TCSETAW | TCSETAF | TCSETS2 | TCSETSW2 | TCSETSF2 => {
             if !master {
                 check_background(cx, tty, Signal::TTOU)?;
             }
-            let t = if request >= TCSETA {
-                // 只换掉标志的低 16 位和前 8 个控制字符
-                let b: [u8; 18] = get(cx, arg)?;
-                let mut t = tty.borrow().termios.encode();
-                for i in 0..4 {
-                    t[i * 4..i * 4 + 2].copy_from_slice(&b[i * 2..i * 2 + 2]);
+            // 在原来的设置上换掉给出的部分（Linux 的 set_termios）：termio 只换标志的低
+            // 16 位和前 8 个控制字符，termios 不换速率字段
+            let mut t = tty.borrow().termios.encode();
+            match request {
+                TCSETA | TCSETAW | TCSETAF => {
+                    let b: [u8; 18] = get(cx, arg)?;
+                    for i in 0..4 {
+                        t[i * 4..i * 4 + 2].copy_from_slice(&b[i * 2..i * 2 + 2]);
+                    }
+                    t[16..25].copy_from_slice(&b[8..17]);
                 }
-                t[16..25].copy_from_slice(&b[8..17]);
-                Termios::decode(&t)
-            } else {
-                Termios::decode(&get(cx, arg)?)
-            };
+                TCSETS | TCSETSW | TCSETSF => {
+                    t[..36].copy_from_slice(&get::<36>(cx, arg)?);
+                }
+                _ => t = get(cx, arg)?,
+            }
+            let mut t = Termios::decode(&t);
+            t.load_speeds();
             let mut tt = tty.borrow_mut();
-            if request == TCSETSF || request == TCSETAF {
+            if matches!(request, TCSETSF | TCSETAF | TCSETSF2) {
                 tt.flush_input();
             }
             tt.set_termios(t);

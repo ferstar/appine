@@ -113,17 +113,21 @@ const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 const PTMX_RDEV: u64 = rdev(5, 2);
 
 /// 可以透传给宿主终端的 ioctl：编号、参数大小、是否是输出参数。
-const TTY_IOCTLS: [(u32, usize, bool); 10] = [
-    (0x5401, 36, true),  // TCGETS
-    (0x5402, 36, false), // TCSETS
-    (0x5403, 36, false), // TCSETSW
-    (0x5404, 36, false), // TCSETSF
-    (0x5405, 18, true),  // TCGETA
-    (0x5406, 18, false), // TCSETA
-    (0x5407, 18, false), // TCSETAW
-    (0x5408, 18, false), // TCSETAF
-    (0x5413, 8, true),   // TIOCGWINSZ
-    (0x5414, 8, false),  // TIOCSWINSZ
+const TTY_IOCTLS: [(u32, usize, bool); 14] = [
+    (0x5401, 36, true),       // TCGETS
+    (0x5402, 36, false),      // TCSETS
+    (0x5403, 36, false),      // TCSETSW
+    (0x5404, 36, false),      // TCSETSF
+    (0x5405, 18, true),       // TCGETA
+    (0x5406, 18, false),      // TCSETA
+    (0x5407, 18, false),      // TCSETAW
+    (0x5408, 18, false),      // TCSETAF
+    (0x5413, 8, true),        // TIOCGWINSZ
+    (0x5414, 8, false),       // TIOCSWINSZ
+    (0x802c_542a, 44, true),  // TCGETS2
+    (0x402c_542b, 44, false), // TCSETS2
+    (0x402c_542c, 44, false), // TCSETSW2
+    (0x402c_542d, 44, false), // TCSETSF2
 ];
 const FIONREAD: u32 = 0x541b;
 const RNDGETENTCNT: u32 = 0x8004_5200;

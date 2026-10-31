@@ -1,6 +1,6 @@
 # M9 之前：openat2（2026-10-31）
 
-← [M9 之前：/dev/kmsg 和内核日志（2026-10-31）](143-kmsg.md) · [索引](../milestones.md)
+← [M9 之前：/dev/kmsg 和内核日志（2026-10-31）](143-kmsg.md) · [索引](../milestones.md) · [M9 之前：termios2（2026-10-31）](145-termios2.md) →
 
 [未实现的系统调用](139-unimplemented-syscalls.md)那一轮记下 openat2 返回 ENOSYS。第 143 轮之后读源码查了谁在用（结论记在那一条推迟项下面）：多数调用者在 ENOSYS 时退回逐级打开，硬失败的是 GNU tar 的新版本（上游 git 从 2025-11 起、Fedora 44 已带）配 glibc ≥ 2.43，解包带子目录的归档全部失败；App 里现在的三个发行版不受影响，换到 glibc 2.43 和新 tar 之后会。差分测试的仓库里的 bubblewrap 0.12 也用它（`RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`），原来走退路。Android 16 及以前的应用 seccomp 不放行 openat2，不能交给宿主内核，在 appine 自己的路径解析里做。
 

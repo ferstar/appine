@@ -553,7 +553,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 ## 9. TTY 与终端
 
 - **PTY 和行规程完全在进程内实现**（`core/kernel/src/tty.rs`）。如果借用宿主 PTY，宿主的 `ISIG` 会把信号发给宿主进程组，而宿主根本不知道 guest 进程组的存在。实现覆盖以下内容：
-  - termios：`ICANON` 行编辑、`ECHO*`、`ICRNL`/`OPOST`/`ONLCR`、`VMIN`/`VTIME`。
+  - termios：`ICANON` 行编辑、`ECHO*`、`ICRNL`/`OPOST`/`ONLCR`、`VMIN`/`VTIME`。`struct termios2` 的 `TCGETS2`、`TCSETS2` 这几个 ioctl 和输入、输出速率也有（glibc 2.42 起只用它们），速率按 `CBAUD`、`CIBAUD` 换算、只记下不起作用；与 Linux 的 PTY 一样总是 `CS8`、`CREAD`（[termios2](rounds/145-termios2.md)）。
   - 作业控制：`ISIG` 发信号给 guest 前台进程组；`setsid`/`TIOCSCTTY`/`tcsetpgrp`；后台进程组读写终端时的 `SIGTTIN`/`SIGTTOU`；会话关闭时的 `SIGHUP`；`TIOCSWINSZ` 触发的 `SIGWINCH`。
   - 挂断：最后一个主设备关掉（tmux、sshd 的会话结束）或者 App 关掉控制台时，与 Linux 的 `pty_close` → `tty_vhangup` 一样，会话组长收到 `SIGHUP`、`SIGCONT`（它退出时再发给挂断时的前台进程组），会话里的进程都失去控制终端，`/dev/pts/<n>` 删掉、编号可以再用，打开着的从设备读到 EOF，写和 ioctl 是 `EIO`，poll 总是就绪（[关掉主设备时挂断从设备](rounds/104-pty-hangup.md)）。关闭文件在 Drop 里，拿不到内核，所以 `PtyEnd` 记下主设备都关掉了的终端，由放开 BKL 的线程在放开之前挂断。`vhangup(2)`（要 `CAP_SYS_TTY_CONFIG`，挂断调用者的控制终端）和 `TIOCVHANGUP`（要 `CAP_SYS_ADMIN`）按 Linux 的 `tty_vhangup` 只挂断挂断时打开着的文件（终端记着这一边被挂断过几次，打开文件记着打开时的次数），信号和失去控制终端同上，没读的输入丢掉；节点不删，重新打开照常能用（login、agetty 靠这个赶走终端上留下的进程），挂断之后还没重新打开时再挂断什么也不做（`TTY_HUPPED`）。主设备上的 `TIOCVHANGUP` 只挂断主设备这一边（[vhangup](rounds/130-vhangup.md)）。
 - guest 可以通过 `/dev/ptmx` 自己申请 PTY，tmux、screen、`script`、sshd 都依赖这一点。
