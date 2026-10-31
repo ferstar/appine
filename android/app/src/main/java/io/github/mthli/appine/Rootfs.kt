@@ -294,6 +294,7 @@ internal object Rootfs {
             cat /etc/motd 2>/dev/null
             export TERM=xterm-256color
             export LANG=C.UTF-8
+            export NMAP_UNPRIVILEGED=1
             PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
             cd "${'$'}HOME" 2>/dev/null
 

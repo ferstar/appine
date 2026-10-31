@@ -52,6 +52,9 @@ internal class ConsolePty(private val machine: Long) : TerminalSession.Pty {
             "SHELL=/bin/sh",
             "USER=root",
             "LOGNAME=root",
+            // nmap 以 root 运行时默认做要 raw socket 的扫描，App 建不了这种 socket（与没有
+            // CAP_NET_RAW 的 root 一样），nmap 直接退出；设了它就改用 connect 扫描
+            "NMAP_UNPRIVILEGED=1",
         )
     }
 }

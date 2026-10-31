@@ -160,6 +160,7 @@
 | [M9 之前：Ubuntu 26.04 的普查](rounds/149-ubuntu26-survey.md) | 2026-10-31 | glibc 2.43、Rust 写的 coreutils 的 Ubuntu 26.04 当仓库，apt 装了 238 个包，常用命令与原生相同；tar 已经离不开 openat2；找到三处：从设备没打开过时主设备就 EIO（screen 时好时坏）、短的符号链接报了数据块、新分配的 PTY 的窗口大小 |
 | [M9 之前：新分配的 PTY](rounds/150-new-pty-state.md) | 2026-11-01 | 主设备只在从设备打开过、又全部关掉之后才 EIO、POLLHUP（Linux 的 `TTY_OTHER_CLOSED`），原来没打开过时就是，GNU screen 的窗口时好时坏；新终端的窗口大小从 0×0 开始 |
 | [M9 之前：短的符号链接不占块](rounds/151-short-symlink-blocks.md) | 2026-11-01 | 目标短于 60 字节（仓库，对应 ext4）、128 字节（tmpfs）的符号链接 `st_blocks` 是 0，`ls -l` 的 total 与原生相同 |
+| [M9 之前：nmap 以 root 运行](rounds/152-nmap-unprivileged.md) | 2026-11-01 | nmap 以 root 运行时默认要 raw socket、打不开就退出；App 给会话设 `NMAP_UNPRIVILEGED=1`，改用 connect 扫描，与没有 CAP_NET_RAW 的原生 root 相同 |
 
 ## 测量条件
 

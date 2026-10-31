@@ -1,6 +1,6 @@
 # M9 之前：短的符号链接不占块（2026-11-01）
 
-← [M9 之前：新分配的 PTY（2026-11-01）](150-new-pty-state.md) · [索引](../milestones.md)
+← [M9 之前：新分配的 PTY（2026-11-01）](150-new-pty-state.md) · [索引](../milestones.md) · [M9 之前：nmap 以 root 运行（2026-11-01）](152-nmap-unprivileged.md) →
 
 [Ubuntu 26.04 的普查](149-ubuntu26-survey.md)的问题 2：`ls -l` 一个有符号链接的目录，total 比原生多 4。appine 对所有文件按大小向上取整到 4 KB 报 `st_blocks`，符号链接也是；Linux 上短的符号链接存在 inode 里，不占数据块。
 

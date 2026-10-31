@@ -30,7 +30,7 @@ tier=1
 store=target/survey/store
 packages="openssh-server openssh-client tmux postgresql18 postgresql18-client postgresql18-contrib
     redis valkey valkey-cli mariadb mariadb-client cargo rust gcc musl-dev dotnet10-sdk php85
-    ruby nginx curl neovim htop btop fish zsh rsync git git-daemon mosh zig python3 py3-pip socat"
+    ruby nginx curl neovim htop btop fish zsh rsync git git-daemon mosh zig python3 py3-pip socat nmap nmap-nselibs nmap-scripts"
 
 native=""
 while getopts t:s:n: opt; do
