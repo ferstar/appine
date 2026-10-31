@@ -446,10 +446,10 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ### 7.5 auxv 与内核版本
 
-- auxv 依次提供：`AT_SYSINFO_EHDR`、`AT_MINSIGSTKSZ`、`AT_HWCAP`（§4.4）、`AT_PAGESZ=4096`、`AT_CLKTCK=100`、`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`、`AT_SECURE`、`AT_RANDOM`、`AT_HWCAP2=0`、`AT_EXECFN`、`AT_PLATFORM="aarch64"`。
+- auxv 依次提供：`AT_SYSINFO_EHDR`、`AT_MINSIGSTKSZ`、`AT_HWCAP`（§4.4）、`AT_PAGESZ=4096`、`AT_CLKTCK=100`、`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`、`AT_SECURE`、`AT_RANDOM`、`AT_HWCAP2`（§4.4，宿主没有 I8MM 时是 0）、`AT_EXECFN`、`AT_PLATFORM="aarch64"`。
 - `uname -r` 固定报告一个 LTS 版本 `6.1.0-appine`。我们把它当作一份 **ABI 契约**：除文档明确列出的例外，按这个内核版本的语义实现。比 6.1 新的功能一般不做（比如 6.9 的 `PIDFD_THREAD`），例外是 6.5 的 `cachestat`，以及 6.12 起 `/proc/<pid>/fd`、`fdinfo` 里的项不能当挂载点（§8.2）。
 - 未实现的 syscall **一律返回 `ENOSYS`，绝不崩溃**，同时记录一条本地调试日志（`APPINE_LOG=1` 时输出）。
-- 有意不实现的：io_uring 保持 `ENOSYS`（§15）。
+- 有意不实现的：io_uring 保持 `ENOSYS`（§15）。别的返回 `ENOSYS` 的编号，以及哪些与没配对应功能的 Linux 6.1 一样，见[未实现的系统调用](rounds/139-unimplemented-syscalls.md)。
 
 ### 7.6 ptrace
 

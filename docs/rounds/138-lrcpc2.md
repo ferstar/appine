@@ -1,6 +1,6 @@
 # M9 之前：LRCPC2（2026-10-31）
 
-← [M9 之前：PDEATHSIG 和 __WNOTHREAD（2026-10-31）](137-pdeathsig-wnothread.md) · [索引](../milestones.md)
+← [M9 之前：PDEATHSIG 和 __WNOTHREAD（2026-10-31）](137-pdeathsig-wnothread.md) · [索引](../milestones.md) · [M9 之前：未实现的系统调用（2026-10-31）](139-unimplemented-syscalls.md) →
 
 [LRCPC](136-lrcpc.md)那一轮的推迟项。LRCPC2（ARMv8.4 起必有，cpuinfo 里是 `ilrcpc`）给 RCpc 的读和 release 的写加上 9 位有符号偏移：LDAPUR、LDAPURH、LDAPURB（补零），LDAPURSB、LDAPURSH（按符号扩展到 32 或 64 位）、LDAPURSW，STLUR、STLURH、STLURB。LLVM 在 v8.4 以上（`+rcpc-immo`）把带偏移的 acquire 读、release 写编成它们，省掉一条算地址的加法；这样编译的程序在宿主有、appine 不宣告时一碰到就 SIGILL。
 
