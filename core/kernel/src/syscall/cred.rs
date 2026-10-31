@@ -173,7 +173,16 @@ fn cap_header(cx: &Cx<'_>, hdr: u64) -> Result<(usize, i32), Errno> {
 }
 
 pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
-    let (words, pid) = cap_header(cx, hdr)?;
+    let header = cap_header(cx, hdr);
+    // 数据指针为空时只是探测版本：不认识的版本写回内核的版本之后也返回 0，pid 不看
+    // （Linux 的 capget；moby/sys/capability 这样取版本，podman、runc 都用它）
+    if data == 0 {
+        return match header {
+            Ok(_) | Err(Errno::EINVAL) => Ok(0),
+            Err(e) => Err(e),
+        };
+    }
+    let (words, pid) = header?;
     if pid < 0 {
         return Err(Errno::EINVAL);
     }
@@ -186,10 +195,6 @@ pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
         let group = k.groups.get(&task.tgid).ok_or(Errno::ESRCH)?;
         group.borrow().cred.clone()
     };
-    // 数据指针为空时只是探测版本
-    if data == 0 {
-        return Ok(0);
-    }
     for i in 0..words {
         let mut b = [0u8; 12];
         for (j, set) in [cred.cap_effective, cred.cap_permitted, cred.cap_inheritable]

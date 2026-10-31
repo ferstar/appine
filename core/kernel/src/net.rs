@@ -910,7 +910,9 @@ const GENL_CMD_CAP_DO: u32 = 2;
 const GENL_CMD_CAP_DUMP: u32 = 4;
 const GENL_CMD_CAP_HASPOL: u32 = 8;
 const NLA_TYPE_MASK: u16 = 0x3fff;
+const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
+const EEXIST: i32 = 17;
 const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 
@@ -1026,6 +1028,92 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
     }
 }
 
+/// 开机时的网络命名空间里修改宿主接口的请求（`RTM_NEWLINK`、`RTM_SETLINK`，Linux 的
+/// `rtnl_setlink`、`__rtnl_newlink`）。App 改不了宿主的接口，只接受什么也不改的：标志按
+/// `rtnl_dev_combine_flags` 合起来之后，`__dev_change_flags` 改得了的那些位与现在的相同，
+/// 带着的名字、MTU 也与现在的相同。dockerd 给容器的默认网络沙箱拉起本来就起着的 lo 就是
+/// 这样（`loopbackUp`）。真要改什么的仍是 EOPNOTSUPP，新建接口（`NLM_F_CREATE`，veth、
+/// bridge 这些）也是。`net_admin`：有没有 `CAP_NET_ADMIN`（没有时 EPERM，Linux 在解析
+/// 之前就查）。None：不是这两种请求。
+pub(crate) fn configure_host_link(
+    ifaces: &[Interface],
+    net_admin: bool,
+    req: &[u8],
+) -> Option<i32> {
+    const RTM_SETLINK: u16 = 19;
+    const NLM_F_REPLACE: u16 = 0x100;
+    const NLM_F_EXCL: u16 = 0x200;
+    const NLM_F_CREATE: u16 = 0x400;
+    const ENODEV: i32 = 19;
+    // __dev_change_flags 按请求改的位（IFF_UP、IFF_PROMISC、IFF_ALLMULTI 另外处理，也算）
+    const CHANGEABLE: u32 =
+        0x1 | 0x4 | 0x20 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    if ty != RTM_NEWLINK && ty != RTM_SETLINK {
+        return None;
+    }
+    if !net_admin {
+        return Some(EPERM);
+    }
+    let flags = u16::from_le_bytes([req[6], req[7]]);
+    // struct ifinfomsg：地址族、类型、编号、标志、要改的标志
+    let Some(m) = req.get(16..32) else {
+        return Some(EINVAL);
+    };
+    let index = i32::from_le_bytes(m[4..8].try_into().unwrap());
+    let ifi_flags = u32::from_le_bytes(m[8..12].try_into().unwrap());
+    let change = u32::from_le_bytes(m[12..16].try_into().unwrap());
+    let attrs = crate::route::attrs(&req[32..]);
+    let name = attrs
+        .iter()
+        .find(|(t, _)| *t == IFLA_IFNAME)
+        .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default());
+    let newlink = ty == RTM_NEWLINK;
+    if newlink && index < 0 {
+        return Some(EINVAL);
+    }
+    // 按编号找，编号不是正数时按名字找；都没给时 RTM_SETLINK 是 EINVAL，RTM_NEWLINK 当作
+    // 没找到
+    if !newlink && index <= 0 && name.is_none() {
+        return Some(EINVAL);
+    }
+    let found = ifaces.iter().find(|i| {
+        if index > 0 {
+            i.index as i32 == index
+        } else {
+            name.is_some() && name == Some(i.name.as_bytes())
+        }
+    });
+    let Some(dev) = found else {
+        // 要新建的话 appine 建不了（Linux 没有那种接口的驱动时也是 EOPNOTSUPP）
+        return Some(if newlink && flags & NLM_F_CREATE != 0 {
+            EOPNOTSUPP
+        } else {
+            ENODEV
+        });
+    };
+    if newlink && flags & NLM_F_EXCL != 0 {
+        return Some(EEXIST);
+    }
+    if newlink && flags & NLM_F_REPLACE != 0 {
+        return Some(EOPNOTSUPP);
+    }
+    let same = attrs.iter().all(|&(t, d)| match t {
+        IFLA_IFNAME => d.split(|&c| c == 0).next() == Some(dev.name.as_bytes()),
+        IFLA_MTU => d.get(..4) == Some(&dev.mtu.to_le_bytes()[..]),
+        _ => false,
+    });
+    // ifi_change 是 0 时整个 ifi_flags 都算要的（Linux 的"bugwards compatibility"），两个
+    // 都是 0 时不改标志
+    let wanted = if change != 0 {
+        (ifi_flags & change) | (dev.flags & !change)
+    } else {
+        ifi_flags
+    };
+    let flags_same = (ifi_flags == 0 && change == 0) || (wanted ^ dev.flags) & CHANGEABLE == 0;
+    Some(if same && flags_same { 0 } else { EOPNOTSUPP })
+}
+
 /// netlink 的回答要用到的宿主信息（测试里换成固定的）。
 pub(crate) trait Host {
     /// 宿主的网络接口。
@@ -1038,8 +1126,8 @@ pub(crate) trait Host {
     fn tx_queue_len(&self, name: &str) -> Option<u32>;
     /// 发请求的进程的用户 ID（`ip route get` 回答里的 RTA_UID）。
     fn uid(&self) -> u32;
-    /// 修改接口、地址的请求（新的网络命名空间里的 lo，[`crate::netns::configure`]）：
-    /// None 是不处理，Some 里是错误码。
+    /// 修改接口、地址的请求（新的网络命名空间里的 lo，[`crate::netns::configure`]；开机时的
+    /// 命名空间里什么也不改的，[`configure_host_link`]）：None 是不处理，Some 里是错误码。
     fn configure(&self, _req: &[u8]) -> Option<i32> {
         None
     }
@@ -1634,5 +1722,99 @@ mod tests {
         assert!(!is_stub(&other));
         let fail = servfail(&[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(fail[..4], [0x12, 0x34, 0x81, 0x82]);
+    }
+
+    /// 开机时的命名空间里改宿主的接口：什么也不改的成功，要改的 EOPNOTSUPP，错误码的顺序
+    /// 照 Linux 6.1 的 rtnl_setlink、__rtnl_newlink。
+    #[test]
+    fn host_links_accept_requests_that_change_nothing() {
+        const SET: u16 = 19;
+        const UP: u32 = 0x1;
+        // 消息：头、ifinfomsg（编号、标志、要改的标志），后面是属性
+        let msg = |ty: u16, flags: u16, index: i32, ifi: (u32, u32), attrs: &[(u16, &[u8])]| {
+            let mut m = vec![0u8; 32];
+            m[4..6].copy_from_slice(&ty.to_le_bytes());
+            m[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK | flags).to_le_bytes());
+            m[20..24].copy_from_slice(&index.to_le_bytes());
+            m[24..28].copy_from_slice(&ifi.0.to_le_bytes());
+            m[28..32].copy_from_slice(&ifi.1.to_le_bytes());
+            for (t, d) in attrs {
+                attr(&mut m, *t, d);
+            }
+            let len = m.len() as u32;
+            m[..4].copy_from_slice(&len.to_le_bytes());
+            m
+        };
+        let ifaces = [lo()];
+        let ask = |m: Vec<u8>| configure_host_link(&ifaces, true, &m);
+        let lo_name: &[u8] = b"lo\0";
+        let mtu = 65536u32.to_le_bytes();
+        // 已经起着的 lo：按编号、按名字、两种消息、标志都是 0、整个 ifi_flags（ifi_change 0）
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, 1, (UP, UP), &[])), Some(0));
+        assert_eq!(ask(msg(SET, 0, 1, (UP, UP), &[])), Some(0));
+        assert_eq!(
+            ask(msg(RTM_NEWLINK, 0, 0, (UP, UP), &[(IFLA_IFNAME, lo_name)])),
+            Some(0)
+        );
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, 1, (0, 0), &[])), Some(0));
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, 1, (UP | 0x48, 0), &[])), Some(0));
+        assert_eq!(
+            ask(msg(RTM_NEWLINK, 0x400, 1, (UP, UP), &[(IFLA_MTU, &mtu)])),
+            Some(0)
+        );
+        // 要改的：关掉、混杂模式、别的 MTU、改名、别的属性
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, 1, (0, UP), &[])), Some(EOPNOTSUPP));
+        assert_eq!(
+            ask(msg(RTM_NEWLINK, 0, 1, (0x100, 0x100), &[])),
+            Some(EOPNOTSUPP)
+        );
+        assert_eq!(
+            ask(msg(
+                RTM_NEWLINK,
+                0,
+                1,
+                (0, 0),
+                &[(IFLA_MTU, &1500u32.to_le_bytes())]
+            )),
+            Some(EOPNOTSUPP)
+        );
+        assert_eq!(
+            ask(msg(SET, 0, 1, (0, 0), &[(IFLA_IFNAME, b"lo2\0")])),
+            Some(EOPNOTSUPP)
+        );
+        assert_eq!(
+            ask(msg(SET, 0, 1, (0, 0), &[(IFLA_TXQLEN, &[0; 4])])),
+            Some(EOPNOTSUPP)
+        );
+        // 找不到、新建、EXCL、REPLACE、编号和名字都没给
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, 9, (UP, UP), &[])), Some(19));
+        assert_eq!(
+            ask(msg(SET, 0, 0, (UP, UP), &[(IFLA_IFNAME, b"eth9\0")])),
+            Some(19)
+        );
+        assert_eq!(
+            ask(msg(
+                RTM_NEWLINK,
+                0x400,
+                0,
+                (0, 0),
+                &[(IFLA_IFNAME, b"eth9\0")]
+            )),
+            Some(EOPNOTSUPP)
+        );
+        assert_eq!(ask(msg(RTM_NEWLINK, 0x200, 1, (UP, UP), &[])), Some(EEXIST));
+        assert_eq!(
+            ask(msg(RTM_NEWLINK, 0x100, 1, (UP, UP), &[])),
+            Some(EOPNOTSUPP)
+        );
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, 0, (UP, UP), &[])), Some(19));
+        assert_eq!(ask(msg(SET, 0, 0, (UP, UP), &[])), Some(EINVAL));
+        assert_eq!(ask(msg(RTM_NEWLINK, 0, -1, (UP, UP), &[])), Some(EINVAL));
+        // 没有 CAP_NET_ADMIN 时先是 EPERM；别的消息不归它管
+        assert_eq!(
+            configure_host_link(&ifaces, false, &msg(RTM_NEWLINK, 0, 9, (0, 0), &[])),
+            Some(EPERM)
+        );
+        assert_eq!(ask(msg(RTM_GETLINK, 0, 1, (0, 0), &[])), None);
     }
 }

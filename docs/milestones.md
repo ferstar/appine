@@ -166,6 +166,7 @@
 | [M9 之前：DIT](rounds/155-dit.md) | 2026-11-01 | 宿主有时宣告 DIT：MSR、MRS DIT；信号处理函数带着它、sigreturn 和 ptrace 照 pstate 第 24 位恢复，fork、线程继承，execve 清零；宿主线程的 DIT 跟着 guest 的 |
 | [M9 之前：低端口映射和监听通知](rounds/156-low-ports.md) | 2026-11-01 | guest 绑 1024 以下的端口时宿主上换成 +10000（被占依次 +20000、+30000、宿主分配），guest 一侧看不出来；App 第一次看到非回环地址上的监听时发通知，告诉用户别的设备连哪个端口 |
 | [M9 之前：podman 和 docker 的普查](rounds/157-container-survey.md) | 2026-11-01 | vfs 存储、host 网络、不用 cgroup 时 podman 的常用功能与原生相同（改掉 capget 等四处小问题、临时绕过 mqueue 和可写挂载 cgroup2 之后）；docker 停在 runc 经由 fd 执行 memfd；找到 12 个问题，按顺序排好 |
+| [M9 之前：容器运行时碰到的四处小问题](rounds/158-container-small-fixes.md) | 2026-11-01 | capget 空数据指针探测版本返回 0；开机时的命名空间里什么也不改的 `RTM_NEWLINK`、`RTM_SETLINK` 成功（dockerd 拉起 lo）；合成文件系统根目录的 inode 是 1（runc 检查 /proc）；线程目录里有 fd、fdinfo |
 
 ## 测量条件
 

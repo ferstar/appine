@@ -850,7 +850,14 @@ impl crate::net::Host for KernelHost<'_> {
     }
 
     fn configure(&self, req: &[u8]) -> Option<i32> {
-        crate::netns::configure(self.net.as_ref()?, &self.cred, req)
+        match &self.net {
+            Some(ns) => crate::netns::configure(ns, &self.cred, req),
+            None => crate::net::configure_host_link(
+                &appine_hal::net::interfaces(),
+                self.cred.capable(crate::cred::cap::NET_ADMIN),
+                req,
+            ),
+        }
     }
 
     /// 进程要还没退出（Linux 的 get_net_ns_by_pid），fd 要是网络命名空间的文件

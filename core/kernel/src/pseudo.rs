@@ -594,7 +594,7 @@ pub(crate) enum PseudoNode {
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
-const TASK_ENTRIES: [Entry; 25] = [
+const TASK_ENTRIES: [Entry; 27] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -613,6 +613,8 @@ const TASK_ENTRIES: [Entry; 25] = [
     Entry::Cwd,
     Entry::Exe,
     Entry::Root,
+    Entry::Fd,
+    Entry::FdInfo,
     Entry::Cgroup,
     Entry::Net,
     Entry::Ns,
@@ -687,8 +689,16 @@ fn parse_num(name: &[u8]) -> Option<i64> {
     std::str::from_utf8(name).ok()?.parse().ok()
 }
 
-/// 合成节点的 inode 编号：对节点取哈希（同一次运行里稳定），避开 0。
+/// 合成节点的 inode 编号：对节点取哈希（同一次运行里稳定），避开 0。各个文件系统的根目录
+/// 与 Linux 一样是 1（procfs 的 `PROC_ROOT_INO`、kernfs 的根、devpts 的根）：runc 打开
+/// `/proc` 之后检查它（pathrs-lite 的 `verifyProcRoot`），不是 1 就当作被换掉的 procfs。
 pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
+    if matches!(
+        node,
+        PseudoNode::ProcRoot | PseudoNode::SysRoot | PseudoNode::PtsRoot | PseudoNode::Cgroup(b"")
+    ) {
+        return 1;
+    }
     let mut h = std::hash::DefaultHasher::new();
     node.hash(&mut h);
     h.finish() | 1
@@ -938,7 +948,8 @@ impl Pseudo for View<'_> {
                     .map(|(_, e)| Entry(*pid, *tid, *e))
                     .filter(|_| self.pid_exists(*pid, *tid))
             }
-            Entry(pid, None, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
+            // 线程目录里的 fd、fdinfo 也是进程的打开文件（fd 表按进程记）
+            Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
                 .map(|fd| fd as i32)
                 .filter(|&fd| self.open_file(*pid, fd).is_some())
                 .map(|fd| match e {
@@ -1664,7 +1675,7 @@ pub(crate) fn readdir(
                 .filter(|(_, e)| in_pid_dir(*tid, e))
                 .map(|(_, e)| Entry(*pid, *tid, *e)),
         ),
-        Entry(pid, None, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
+        Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
             if let Some(task) = ps.leader(*pid) {
                 let fds = task.res.borrow().fds.borrow().open_fds();
                 nodes.extend(fds.into_iter().map(|fd| match e {

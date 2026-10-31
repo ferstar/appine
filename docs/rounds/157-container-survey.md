@@ -1,6 +1,6 @@
 # M9 之前：podman 和 docker 的普查（2026-11-01）
 
-← [M9 之前：低端口映射和监听通知（2026-11-01）](156-low-ports.md) · [索引](../milestones.md)
+← [M9 之前：低端口映射和监听通知（2026-11-01）](156-low-ports.md) · [索引](../milestones.md) · [M9 之前：容器运行时碰到的四处小问题（2026-11-01）](158-container-small-fixes.md) →
 
 设计文档 §1.2 把 docker、podman 放在 D 档（不做），理由是"namespace、cgroup"。命名空间那一半后来为 bubblewrap 做了（除 time 以外都有，[bubblewrap](123-bwrap.md)），容器服务又很常见，这一轮普查现在离能跑容器还有多远：先用最省事的一组参数（vfs 存储驱动、host 网络、不用 cgroup），看依次撞到什么。
 
@@ -38,12 +38,12 @@
 
 ## 找到的问题
 
-小的（已在工作区里改掉，下一轮补测试再提交）：
+小的（普查时在工作区里改掉，下一轮补了测试）：
 
-1. **capget 探测版本**：数据指针为空、版本不认识时，Linux 写回内核的版本之后返回 0（`(dataptr == NULL) && (ret == -EINVAL) ? 0 : ret`），也不看 pid；appine 返回 EINVAL。moby/sys/capability 就这样取版本，podman、buildah、runc 都用它。
-2. **初始网络命名空间里拉起 lo**：dockerd 给容器的默认网络沙箱拉起 lo（`loopbackUp`，`RTM_NEWLINK` 带 `IFF_UP`），appine 对开机时命名空间里的所有修改请求都回 EOPNOTSUPP，dockerd 报 `failed to create default sandbox: operation not supported`。Linux 上 lo 本来就起着，这是个什么也不改的请求。改法：什么也不改的 `RTM_NEWLINK`、`RTM_SETLINK` 照 Linux 成功，真要改的仍是 EOPNOTSUPP。
-3. **合成文件系统根目录的 inode 编号**：procfs、sysfs、cgroup2、devpts 的根目录在 Linux 上都是 1，appine 是哈希值。runc（pathrs-lite 的 `verifyProcRoot`）打开 `/proc` 之后检查它，报 `unsafe procfs detected: incorrect procfs root inode number`。
-4. **线程目录里没有 fd、fdinfo**：`/proc/<pid>/task/<tid>/` 里缺这两项（Linux 有），runc 经由 `/proc/thread-self/fd/` 读自己的 fd 的链接，得到 ENOENT。
+1. **capget 探测版本**：数据指针为空、版本不认识时，Linux 写回内核的版本之后返回 0（`(dataptr == NULL) && (ret == -EINVAL) ? 0 : ret`），也不看 pid；appine 返回 EINVAL。moby/sys/capability 就这样取版本，podman、buildah、runc 都用它。→ 已改（M9 之前：容器运行时碰到的四处小问题）
+2. **初始网络命名空间里拉起 lo**：dockerd 给容器的默认网络沙箱拉起 lo（`loopbackUp`，`RTM_NEWLINK` 带 `IFF_UP`），appine 对开机时命名空间里的所有修改请求都回 EOPNOTSUPP，dockerd 报 `failed to create default sandbox: operation not supported`。Linux 上 lo 本来就起着，这是个什么也不改的请求。改法：什么也不改的 `RTM_NEWLINK`、`RTM_SETLINK` 照 Linux 成功，真要改的仍是 EOPNOTSUPP。→ 已改（M9 之前：容器运行时碰到的四处小问题）
+3. **合成文件系统根目录的 inode 编号**：procfs、sysfs、cgroup2、devpts 的根目录在 Linux 上都是 1，appine 是哈希值。runc（pathrs-lite 的 `verifyProcRoot`）打开 `/proc` 之后检查它，报 `unsafe procfs detected: incorrect procfs root inode number`。→ 已改（M9 之前：容器运行时碰到的四处小问题）
+4. **线程目录里没有 fd、fdinfo**：`/proc/<pid>/task/<tid>/` 里缺这两项（Linux 有），runc 经由 `/proc/thread-self/fd/` 读自己的 fd 的链接，得到 ENOENT。→ 已改（M9 之前：容器运行时碰到的四处小问题）
 
 大一些的，按建议的顺序：
 
