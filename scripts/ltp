@@ -2,13 +2,18 @@
 # 在 appine 里运行 LTP 的 syscall 测试（设计文档 §13.3 第 2 层）。先用 scripts/build-ltp
 # 编译 LTP。在 Linux arm64 上运行，macOS 上经由 scripts/dev：
 #
-#   scripts/dev scripts/ltp [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
+#   scripts/dev scripts/ltp [-a] [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
 #
 # 每个测试在一个新的 appine-run 进程里运行，结果写到 target/ltp/results.txt，每行
-# "<名字> <PASS|CONF|FAIL|TIMEOUT|BUG> <退出码>"，输出在 target/ltp/logs/<名字>.log，上一次
+# "<名字> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP> <退出码>"，输出在 target/ltp/logs/<名字>.log，上一次
 # 运行的留在 <名字>.prev.log（失败之后单独重跑不会把失败的那次冲掉）。BUG 是内核层报告了
 # 内部错误（内核 bug、放开 BKL 时借着内核对象），不论退出码。
 # LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
+#
+# 下面 skip 里的测试不跑，结果记 SKIP（退出码 -），-a 时照常跑：
+# - sigtimedwait01、sigwaitinfo01：第一项等"空集合被信号打断返回 EINTR"，musl 的
+#   sigtimedwait、sigwaitinfo 遇到 EINTR 自己重试，又没有超时，每次都跑满 LTP 的 10 分钟
+#   超时；原生的 Alpine 上一样，内核这一层是对的（docs/rounds/17-compat.md）。
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,10 +47,12 @@ if [ "${1:-}" = --one ]; then
     exit 0
 fi
 
+skip='sigtimedwait01|sigwaitinfo01'
 jobs=8
 tier=1
-while getopts j:t: opt; do
+while getopts aj:t: opt; do
     case $opt in
+    a) skip= ;;
     j) jobs=$OPTARG ;;
     t) tier=$OPTARG ;;
     *) exit 2 ;;
@@ -104,6 +111,14 @@ EOF
 mkdir -p "$out/logs"
 "$run" --rootfs "$store" -- /bin/cat /opt/ltp/runtest/syscalls |
     grep -v '^#' | grep -E "^($pattern)[[:space:]]" >"$out/tests.txt" || true
-xargs -r -P "$jobs" -L 1 "$0" --one "$tier" <"$out/tests.txt" | sort >"$out/results.txt"
+if [ -n "$skip" ]; then
+    grep -Ev "^($skip)[[:space:]]" "$out/tests.txt" >"$out/run.txt" || true
+else
+    cp "$out/tests.txt" "$out/run.txt"
+fi
+{
+    xargs -r -P "$jobs" -L 1 "$0" --one "$tier" <"$out/run.txt"
+    [ -z "$skip" ] || grep -E "^($skip)[[:space:]]" "$out/tests.txt" | awk '{print $1, "SKIP -"}'
+} | sort >"$out/results.txt"
 awk '{n[$2]++} END {for (r in n) printf "%s %d\n", r, n[r]}' "$out/results.txt" | sort
 echo "results: $out/results.txt"
