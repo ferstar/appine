@@ -161,6 +161,7 @@
 | [M9 之前：新分配的 PTY](rounds/150-new-pty-state.md) | 2026-11-01 | 主设备只在从设备打开过、又全部关掉之后才 EIO、POLLHUP（Linux 的 `TTY_OTHER_CLOSED`），原来没打开过时就是，GNU screen 的窗口时好时坏；新终端的窗口大小从 0×0 开始 |
 | [M9 之前：短的符号链接不占块](rounds/151-short-symlink-blocks.md) | 2026-11-01 | 目标短于 60 字节（仓库，对应 ext4）、128 字节（tmpfs）的符号链接 `st_blocks` 是 0，`ls -l` 的 total 与原生相同 |
 | [M9 之前：nmap 以 root 运行](rounds/152-nmap-unprivileged.md) | 2026-11-01 | nmap 以 root 运行时默认要 raw socket、打不开就退出；App 给会话设 `NMAP_UNPRIVILEGED=1`，改用 connect 扫描，与没有 CAP_NET_RAW 的原生 root 相同 |
+| [M9 之前：/proc/<pid>/exe 指向程序文件本身](rounds/153-exe-file.md) | 2026-11-01 | exe 照 Linux 的 `mm->exe_file` 指向程序文件本身：删除之后带 ` (deleted)`，改了名、被删除、被 rename 换掉之后经由它 stat、open、execve 到的仍是原来那个（删除了的经由记着的宿主文件） |
 
 ## 测量条件
 

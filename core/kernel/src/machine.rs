@@ -175,10 +175,23 @@ impl Machine {
         };
         let image =
             loader::load(&mut mm, &file, &args, &mut read_interp).map_err(RunError::Load)?;
-        let real = vfs.as_ref().and_then(|vfs| {
-            vfs.real_path(&offline, &Cred::root(), &Node::ROOT, &Node::ROOT, program)
-                .ok()
+        let walked = vfs.as_ref().and_then(|vfs| {
+            vfs.walk(
+                &offline,
+                &Cred::root(),
+                &Node::ROOT,
+                &Node::ROOT,
+                program,
+                true,
+            )
+            .ok()
         });
+        let real = match (&vfs, &walked) {
+            (Some(vfs), Some((node, found))) => vfs
+                .found_path(&offline, &Node::ROOT, node, found.as_ref())
+                .ok(),
+            _ => None,
+        };
         let exe: Rc<[u8]> =
             Rc::from(real.unwrap_or_else(|| crate::vfs::normalize(&[b"/", program].concat())));
         let ino_of = |p: &[u8]| {
@@ -205,7 +218,14 @@ impl Machine {
 
         let tid = k.alloc_tid().map_err(io_err)?;
         let mut group = ThreadGroup::new(tid, INIT, Rc::new(RefCell::new(SigHandlers::default())));
-        group.exe = exe.to_vec();
+        group.exe = Some(Rc::new(crate::process::ExeFile::new(
+            exe.clone(),
+            walked,
+            None,
+            None,
+            mm.exe,
+            &file,
+        )));
         let fds = match stdio {
             Stdio::Host => FdTable::with_host_stdio(),
             Stdio::Console(id) => {

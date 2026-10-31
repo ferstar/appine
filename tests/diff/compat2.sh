@@ -1,6 +1,7 @@
 # compat.sh 的续篇（difftest 把整个脚本作为 sh -c 的一个参数，不能超过 128 KB）：raw ICMP
 # socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径、F_GETFL 里的
-# O_LARGEFILE、/proc/<pid>/task/<tid>/children、PR_SET_PDEATHSIG 和 __WNOTHREAD
+# O_LARGEFILE、/proc/<pid>/task/<tid>/children、PR_SET_PDEATHSIG 和 __WNOTHREAD、短的符号链接、
+# /proc/<pid>/exe 指向程序文件本身
 set -e
 cd /tmp
 # raw ICMP socket（appine 在宿主上用 ping socket 模拟）：IPv4 收到的数据带 IP 头，echo 回答
@@ -1158,3 +1159,186 @@ ln -s "$(printf %059d 0)" sl59
 ln -s "$(printf %060d 0)" sl60
 stat -c '%s %b' sl59 sl60
 rm -f sl59 sl60
+
+# /proc/<pid>/exe 指向程序文件本身（Linux 的 mm->exe_file）：删除、被 rename 换掉之后读出来
+# 带 " (deleted)"，跟随时（stat、open、execve）到的仍是原来那个文件；只改了名的也是原来
+# 那个（读出来的路径 Linux 跟着变，appine 不变，不比）
+cd /tmp
+cat > exelink.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void show(const char *what, const char *link)
+{
+    char buf[512];
+    ssize_t n = readlink(link, buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = 0;
+    printf("%s: %s\n", what, n > 0 ? buf : strerror(errno));
+}
+
+/* 经由链接 stat、open：是不是原来那个文件 */
+static void probe(const char *what, const char *link, const struct stat *orig)
+{
+    struct stat st;
+    if (stat(link, &st) != 0) {
+        printf("%s stat: %s\n", what, strerror(errno));
+        return;
+    }
+    printf("%s stat: same file %d, nlink %ld, same size %d, reg %d\n", what,
+           st.st_dev == orig->st_dev && st.st_ino == orig->st_ino, (long)st.st_nlink,
+           st.st_size == orig->st_size, S_ISREG(st.st_mode));
+    int fd = open(link, O_RDONLY);
+    if (fd < 0) {
+        printf("%s open: %s\n", what, strerror(errno));
+        return;
+    }
+    char magic[4] = {0};
+    struct stat fs;
+    ssize_t n = read(fd, magic, 4);
+    fstat(fd, &fs);
+    printf("%s open: %s, same file %d, nlink %ld\n", what,
+           n == 4 && memcmp(magic, "\177ELF", 4) == 0 ? "ELF" : "not ELF",
+           fs.st_dev == orig->st_dev && fs.st_ino == orig->st_ino, (long)fs.st_nlink);
+    close(fd);
+}
+
+/* 主程序在 maps 里的那一行的路径 */
+static void maps(const char *what)
+{
+    char line[600];
+    FILE *f = fopen("/proc/self/maps", "r");
+    while (fgets(line, sizeof line, f)) {
+        char *p = strchr(line, '/');
+        if (p && strstr(p, "exe-")) {
+            printf("%s maps: %s", what, p);
+            break;
+        }
+    }
+    fclose(f);
+}
+
+static void copy_self(const char *to)
+{
+    char buf[65536];
+    int in = open("/proc/self/exe", O_RDONLY), out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    ssize_t n;
+    while ((n = read(in, buf, sizeof buf)) > 0)
+        write(out, buf, n);
+    close(in);
+    close(out);
+}
+
+static void run(const char *path, const char *mode)
+{
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        execl(path, "exelink", mode, (char *)NULL);
+        perror("execl");
+        _exit(1);
+    }
+    int st;
+    waitpid(p, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st))
+        printf("%s: status %#x\n", mode, st);
+}
+
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    struct stat orig;
+    if (argc > 1 && !strcmp(argv[1], "deleted")) {
+        show("before unlink", "/proc/self/exe");
+        stat("/tmp/exe-del", &orig);
+        unlink("/tmp/exe-del");
+        show("after unlink", "/proc/self/exe");
+        probe("after unlink", "/proc/self/exe", &orig);
+        maps("after unlink");
+        fflush(stdout);
+        /* 重新执行自己：Linux 执行的是删掉的那个文件 */
+        char ino[64];
+        snprintf(ino, sizeof ino, "%lu:%lu", (unsigned long)orig.st_dev, (unsigned long)orig.st_ino);
+        execl("/proc/self/exe", "exelink", "again", ino, (char *)NULL);
+        printf("re-exec: %s\n", strerror(errno));
+        return 1;
+    }
+    if (argc > 2 && !strcmp(argv[1], "again")) {
+        show("re-exec", "/proc/self/exe");
+        struct stat st;
+        char ino[64];
+        stat("/proc/self/exe", &st);
+        snprintf(ino, sizeof ino, "%lu:%lu", (unsigned long)st.st_dev, (unsigned long)st.st_ino);
+        printf("re-exec runs the deleted file: %d\n", !strcmp(ino, argv[2]));
+        maps("re-exec");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "replaced")) {
+        stat("/tmp/exe-up", &orig);
+        int fd = open("/tmp/exe-up.new", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        write(fd, "#!/bin/sh\necho new\n", 19);
+        close(fd);
+        rename("/tmp/exe-up.new", "/tmp/exe-up");
+        show("after replace", "/proc/self/exe");
+        probe("after replace", "/proc/self/exe", &orig);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "renamed")) {
+        stat("/tmp/exe-mv", &orig);
+        rename("/tmp/exe-mv", "/tmp/exe-mv2");
+        probe("after rename", "/proc/self/exe", &orig);
+        unlink("/tmp/exe-mv2");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "waiting")) {
+        stat("/tmp/exe-other", &orig);
+        unlink("/tmp/exe-other");
+        char c;
+        /* 告诉父进程已经删了，等它看完 */
+        write(10, "x", 1);
+        read(11, &c, 1);
+        return 0;
+    }
+
+    copy_self("/tmp/exe-del");
+    run("/tmp/exe-del", "deleted");
+    copy_self("/tmp/exe-up");
+    run("/tmp/exe-up", "replaced");
+    copy_self("/tmp/exe-mv");
+    run("/tmp/exe-mv", "renamed");
+
+    /* 别的进程的 exe：子进程删掉自己的程序文件之后，经由 /proc/<pid>/exe 看 */
+    copy_self("/tmp/exe-other");
+    stat("/tmp/exe-other", &orig);
+    int up[2], down[2];
+    pipe2(up, O_CLOEXEC);
+    pipe2(down, O_CLOEXEC);
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        dup2(up[1], 10);
+        dup2(down[0], 11);
+        execl("/tmp/exe-other", "exelink", "waiting", (char *)NULL);
+        _exit(1);
+    }
+    close(up[1]);
+    close(down[0]);
+    char c, link[64];
+    read(up[0], &c, 1);
+    snprintf(link, sizeof link, "/proc/%d/exe", p);
+    show("other process", link);
+    probe("other process", link, &orig);
+    close(down[1]);
+    waitpid(p, NULL, 0);
+    unlink("/tmp/exe-up");
+    return 0;
+}
+C
+gcc -O1 -o exelink exelink.c && ./exelink

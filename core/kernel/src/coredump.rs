@@ -146,7 +146,11 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
                 let len = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
                 String::from_utf8_lossy(&comm[..len]).replace('/', "!")
             }
-            b'E' => String::from_utf8_lossy(&g.exe).replace('/', "!"),
+            b'E' => g
+                .exe
+                .as_ref()
+                .map(|e| String::from_utf8_lossy(&e.path).replace('/', "!"))
+                .unwrap_or_default(),
             b'c' => g.rlimits[RLIMIT_CORE as usize].0.to_string(),
             b'd' => (!g.dumpable as u32).to_string(),
             // 不认识的说明符：与 Linux 一样什么也不输出

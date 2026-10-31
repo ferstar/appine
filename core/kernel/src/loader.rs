@@ -265,6 +265,11 @@ impl Executable {
         })
     }
 
+    /// 宿主文件（`/proc/<pid>/exe` 记着它，[`crate::process::ExeFile`]）。
+    pub fn host(&self) -> Option<Arc<File>> {
+        self.file.clone()
+    }
+
     /// 同一个文件的又一个句柄（[`ExeCache`]）。
     fn share(&self) -> Executable {
         Executable {

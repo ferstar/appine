@@ -37,6 +37,6 @@
 
 下面三处原来就和 Linux 不同，都是因为 appine 在打开时就算好路径，Linux 是读的时候按 dentry 算：
 
-- 打开之后删除的文件，Linux 的路径后面有 ` (deleted)`，这里没有（memfd 有）。→ fd 和 maps 已补上（M9 之前：已经删除的文件带 ` (deleted)`），exe 仍然没有
+- 打开之后删除的文件，Linux 的路径后面有 ` (deleted)`，这里没有（memfd 有）。→ fd 和 maps 已补上（M9 之前：已经删除的文件带 ` (deleted)`），exe 后来也补上了（M9 之前：/proc/<pid>/exe 指向程序文件本身）
 - 经由 `/proc/<pid>/fd/<n>` 重新打开的文件，Linux 显示原来那个文件的路径，这里显示 `/proc/<pid>/fd/<n>`。
 - 打开之后文件或上级目录改了名，Linux 显示新的路径，这里仍是打开时的。

@@ -705,7 +705,18 @@ fn exec(
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         vfs.resolve(&view, &cred, &root, &start, &path, follow)?
     };
-    let (mut file, mut st, mut nosuid) = process::open_node(&vfs, &cred, &node)?;
+    // 经由 /proc/<pid>/exe 执行已经删除的程序（重新 exec 自己）：打开那个进程记着的宿主文件
+    let from = match &node {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::OpenExe(pid)) => {
+            Some(super::fs::exe_file(cx, *pid)?)
+        }
+        _ => None,
+    };
+    let (mut file, mut st, mut nosuid) = match &from {
+        Some(exe) => process::open_exe_file(&vfs, &cred, exe)?,
+        None => process::open_node(&vfs, &cred, &node)?,
+    };
+    let script = parse_shebang(file.head()).is_some();
 
     // `#!` 脚本：换成解释器，argv 变成 [解释器, 参数, 脚本路径, 原来的 argv[1..]]
     let mut file_path = filename.clone();
@@ -736,7 +747,12 @@ fn exec(
     // /proc/<pid>/exe 和 maps 里显示的绝对路径，符号链接全部解析：musl 按它展开主程序
     // 的 `$ORIGIN`，经由 /usr/bin/java 这种链接启动的程序靠它找到自己的库
     let (exe_dir, exe_path) = &exe_at;
-    let exe: Rc<[u8]> = match vfs.real_path(&view, &cred, &root, exe_dir, exe_path) {
+    let walked = vfs.walk(&view, &cred, &root, exe_dir, exe_path, true).ok();
+    let real = match &walked {
+        Some((n, found)) => vfs.found_path(&view, &root, n, found.as_ref()),
+        None => Err(Errno::ENOENT),
+    };
+    let exe: Rc<[u8]> = match real {
         Ok(p) => Rc::from(p),
         Err(_) if exe_path.starts_with(b"/") => Rc::from(normalize(exe_path)),
         Err(_) => {
@@ -825,7 +841,14 @@ fn exec(
         let mut g = group.borrow_mut();
         // 驻留内存的峰值跨 execve 保留：换掉地址空间之前取一次样（在标记 execed 之前）
         g.sample_rss_at_exec(&cx.mm());
-        g.exe = exe.to_vec();
+        g.exe = Some(Rc::new(process::ExeFile::new(
+            exe.clone(),
+            walked,
+            (!script).then_some(&node),
+            from.as_deref().filter(|_| !script),
+            Some(st.ino),
+            &file,
+        )));
         // 与 Linux 的 commit_creds 一样，换了有效 ID、得到了新的能力时不能 core dump，
         // 父进程退出时也不再发信号给它；特权执行同样不再发。别的执行恢复成可以 dump
         // （begin_new_exec），程序文件不让调用者读时除外（would_dump）

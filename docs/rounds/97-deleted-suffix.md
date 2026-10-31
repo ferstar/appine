@@ -25,5 +25,5 @@
 - 按 nlink 判断与 Linux 不同的地方：
   - Linux 看的是打开或映射时那个名字被删掉了没有，只删了这个名字、别的硬链接还在时也加；这里不加。
   - Linux 上文件改了名路径会跟着变，这里不变（[第 93 轮](93-fd-paths-resolve-symlinks.md)的推迟项）。
-- `/proc/<pid>/exe` 没有加。appine 的 exe 链接按读出来的文字跟随，Linux 的是直接指向那个文件的链接。加了后缀，经由 `/proc/self/exe` 重新 exec 自己的程序会得到 ENOENT。要加的话，exe 先得改成与 fd 一样指向打开文件本身的链接，执行中的程序文件被删除之后也要留着它的 object。
+- `/proc/<pid>/exe` 没有加。appine 的 exe 链接按读出来的文字跟随，Linux 的是直接指向那个文件的链接。加了后缀，经由 `/proc/self/exe` 重新 exec 自己的程序会得到 ENOENT。要加的话，exe 先得改成与 fd 一样指向打开文件本身的链接，执行中的程序文件被删除之后也要留着它的 object。→ 已补上（M9 之前：/proc/<pid>/exe 指向程序文件本身）：exe 指向程序文件本身，删除之后带 ` (deleted)`，经由它打开、执行的仍是原来那个（靠记着的宿主文件）
 - core dump 按 `coredump_filter` 决定写不写共享映射时，Linux 把已经删除的文件的共享映射当作匿名共享内存（`vma_dump_size` 看 `i_nlink`），这里只认出 memfd。

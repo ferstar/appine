@@ -2,9 +2,11 @@
 //! （[`crate::Machine`]）。
 
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use appine_engine::DbtStats;
 
@@ -16,8 +18,8 @@ use crate::loader::{self, Executable, LoadError};
 use crate::signal::{self, Pending, SigAction, SigHandlers, SigInfo, sa};
 use crate::terminal::Terminal;
 use crate::tty::Tty;
-use crate::vfs::store::{Stat, mode};
-use crate::vfs::{Node, Pseudo, Vfs};
+use crate::vfs::store::{Ino, Stat, mode};
+use crate::vfs::{Dentry, MountId, Node, Pseudo, Vfs};
 
 /// 一个信号编号（1–64）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,8 +350,8 @@ pub(crate) struct ThreadGroup {
     pub stop_report: Option<Signal>,
     /// 还没有被父进程的 wait 取走的"继续"事件。
     pub cont_report: bool,
-    /// 当前程序的路径（`/proc/<pid>/exe`）。
-    pub exe: Vec<u8>,
+    /// 正在执行的程序文件（`/proc/<pid>/exe`）；还没执行过程序的（内置的 init）是 None。
+    pub exe: Option<Rc<ExeFile>>,
     /// 创建时刻，开机以来的时钟滴答数（`/proc/<pid>/stat`）。
     pub start_ticks: u64,
     /// 已退出线程用掉的 CPU 时间。
@@ -435,7 +437,7 @@ impl ThreadGroup {
             stop_signal: Signal::STOP,
             stop_report: None,
             cont_report: false,
-            exe: Vec::new(),
+            exe: None,
             start_ticks: crate::pseudo::uptime_ns() / (1_000_000_000 / loader::CLOCK_TICKS),
             cpu: CpuTime::default(),
             child_cpu: CpuTime::default(),
@@ -900,6 +902,80 @@ fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         signal::send_to_pgrp(k, fg, Signal::HUP, SigInfo::kernel());
         signal::send_to_pgrp(k, fg, Signal::CONT, SigInfo::kernel());
     }
+}
+
+/// 进程正在执行的程序文件（Linux 的 `mm->exe_file`）：`/proc/<pid>/exe` 读出来是它的路径，
+/// 跟随时直接到这个文件，不按路径重新解析。程序文件改了名、被删除或者被换掉（dpkg 升级
+/// 时用 rename 换掉正在运行的程序）之后，经由 exe 打开、执行的仍是原来那个。fork 共用，
+/// execve 换掉。
+pub struct ExeFile {
+    /// 执行时的绝对路径，符号链接全部解析：musl 按它展开主程序的 `$ORIGIN`，经由
+    /// /usr/bin/java 这种链接启动的程序靠它找到自己的库。
+    pub path: Rc<[u8]>,
+    /// 经由的挂载和仓库里的 inode；开发用的宿主文件（没有仓库）时是 None，按路径跟随。
+    pub node: Option<(MountId, Ino)>,
+    /// 最后经过的目录和名字：经由 exe 执行的程序的路径按它算（[`Pseudo::follow_dentry`]）。
+    pub dentry: Option<Dentry>,
+    /// 打开着的宿主文件（仓库里的 object）：程序文件被删除之后 object 也删掉了，重新打开、
+    /// 执行靠它（[`open_exe_file`]）。
+    pub host: Option<Arc<File>>,
+}
+
+impl ExeFile {
+    /// 刚执行的程序 `file`（仓库里的 inode `ino`）。`walked` 是按执行时的路径重新走一遍
+    /// 得到的节点和最后经过的目录项（[`Vfs::walk`]）；走不通时（经由 fd 执行已经删除的
+    /// 文件）用打开的节点 `opened`（执行的是脚本时没有：程序是解释器）。经由别的进程的
+    /// exe 执行已经删除的程序时（[`crate::pseudo::PseudoNode::OpenExe`]），挂载和 inode
+    /// 沿用那个进程的 `from`。
+    pub(crate) fn new(
+        path: Rc<[u8]>,
+        walked: Option<(Node, Option<Dentry>)>,
+        opened: Option<&Node>,
+        from: Option<&ExeFile>,
+        ino: Option<Ino>,
+        file: &Executable,
+    ) -> ExeFile {
+        let (node, dentry) = match (walked, opened, from) {
+            (Some((Node::Store(mnt, i), found)), ..) if Some(i) == ino => (Some((mnt, i)), found),
+            (Some((Node::Pseudo(..), found)), _, Some(from)) => (from.node, found),
+            (_, Some(&Node::Store(mnt, i)), _) if Some(i) == ino => (Some((mnt, i)), None),
+            (_, Some(Node::Pseudo(..)), Some(from)) => (from.node, from.dentry.clone()),
+            _ => (None, None),
+        };
+        ExeFile {
+            path,
+            node,
+            dentry,
+            host: file.host(),
+        }
+    }
+}
+
+/// 已经删除的程序文件（`/proc/<pid>/exe` 跟随之后得到的
+/// [`crate::pseudo::PseudoNode::OpenExe`]）：经由记着的宿主文件打开，检查与 [`open_node`]
+/// 相同。
+pub(crate) fn open_exe_file(
+    vfs: &Vfs,
+    cred: &Cred,
+    exe: &ExeFile,
+) -> Result<(Executable, Stat, bool), Errno> {
+    let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
+        return Err(Errno::ENOENT);
+    };
+    let st = vfs.store().stat_open(ino, host)?;
+    if st.kind() != mode::S_IFREG {
+        return Err(Errno::EACCES);
+    }
+    cred.permission(&st, MAY_EXEC)?;
+    let flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
+    let file = host
+        .try_clone()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok((Executable::open(file)?, st, nosuid))
 }
 
 /// 按 execve 的规则打开 guest 文件：必须是仓库里的普通文件，凭据为 `cred` 的进程

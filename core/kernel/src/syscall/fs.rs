@@ -423,6 +423,15 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
             let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
             file_stat(cx, &file)
         }
+        // 已经删除的程序文件
+        Node::Pseudo(_, PseudoNode::OpenExe(pid)) => {
+            let exe = exe_file(cx, *pid)?;
+            let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
+                return Err(Errno::ENOENT);
+            };
+            let st = vfs.store().stat_open(ino, host)?;
+            Ok(encode_stat(&st, vfs.dev_of(&Node::Store(mnt, ino))))
+        }
         Node::Pseudo(_, p) => Ok(encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node))),
     }
 }
@@ -1196,7 +1205,7 @@ fn open_pseudo(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
-    if !matches!(node, PseudoNode::OpenFd(..)) {
+    if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
         cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
     }
     // /proc/<pid>/mem 与 ptrace 一样要求能跟踪那个进程（PTRACE_MODE_ATTACH），auxv、environ、
@@ -1233,6 +1242,7 @@ fn open_pseudo(
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
         PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), cred.fsuid),
         PseudoNode::OpenFd(pid, fd) => return reopen(cx, cred, vfs, pid, fd, flags),
+        PseudoNode::OpenExe(pid) => return reopen_exe(cx, cred, vfs, pid, flags),
         _ => {}
     }
     let view = cx.view(vfs);
@@ -1343,6 +1353,49 @@ fn reopen(
         FileKind::Host(fd) => Ok(FileKind::Host(*fd)),
         _ => Err(Errno::ENXIO),
     }
+}
+
+/// 进程 `pid` 正在执行的程序文件（`/proc/<pid>/exe`）。
+pub(super) fn exe_file(cx: &Cx<'_>, pid: i32) -> Result<Rc<crate::process::ExeFile>, Errno> {
+    let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ENOENT)?;
+    group.borrow().exe.clone().ok_or(Errno::ENOENT)
+}
+
+/// 经由 `/proc/<pid>/exe` 打开已经删除的程序文件（[`PseudoNode::OpenExe`]）：复制记着的
+/// 宿主文件，与 [`reopen`] 打开已经删除的普通文件一样。还在执行的程序不能以写方式打开
+/// （ETXTBSY），权限先查（Linux 在 may_open 之后才 get_write_access）。
+fn reopen_exe(
+    cx: &mut Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    pid: i32,
+    flags: u32,
+) -> Result<FileKind, Errno> {
+    let exe = exe_file(cx, pid)?;
+    let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
+        return Err(Errno::ENOENT);
+    };
+    let st = vfs.store().stat_open(ino, host)?;
+    let truncate = flags & oflags::O_TRUNC != 0;
+    let accmode = flags & oflags::O_ACCMODE;
+    cred.permission(&st, open_mask(flags) | if truncate { MAY_WRITE } else { 0 })?;
+    let write = accmode != oflags::O_RDONLY || truncate;
+    if write && executing(cx, ino) {
+        return Err(Errno::ETXTBSY);
+    }
+    let new = if accmode == oflags::O_RDONLY {
+        host.try_clone()
+    } else {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&**host)
+            ))
+    }
+    .map_err(host_errno)?;
+    open_store(cx, cred, vfs, (mnt, ino), flags, Some(new))
 }
 
 pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {

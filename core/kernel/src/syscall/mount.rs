@@ -404,14 +404,18 @@ fn bind_ns(
     Ok(0)
 }
 
-/// 挂载点不能是 ENOENT 的那些（Linux 的 `lock_mount`）：经由 `/proc/<pid>/fd/<n>` 到了已经
-/// 删除的文件、管道这类没有名字的打开文件；`/proc/<pid>/fd`、`fdinfo` 里的项本身（经由
+/// 挂载点不能是 ENOENT 的那些（Linux 的 `lock_mount`）：经由 `/proc/<pid>/fd/<n>`、`exe` 到了
+/// 已经删除的文件、管道这类没有名字的打开文件；`/proc/<pid>/fd`、`fdinfo` 里的项本身（经由
 /// 指向它的 `O_PATH` fd 到达，Linux 6.12 起不能当挂载点，LTP 的 mount08）。
 fn may_mount_on(target: &Node) -> Result<(), Errno> {
     match target {
-        Node::Pseudo(_, PseudoNode::OpenFd(..) | PseudoNode::Fd(..) | PseudoNode::FdInfo(..)) => {
-            Err(Errno::ENOENT)
-        }
+        Node::Pseudo(
+            _,
+            PseudoNode::OpenFd(..)
+            | PseudoNode::OpenExe(_)
+            | PseudoNode::Fd(..)
+            | PseudoNode::FdInfo(..),
+        ) => Err(Errno::ENOENT),
         _ => Ok(()),
     }
 }

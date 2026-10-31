@@ -839,8 +839,8 @@ impl Vfs {
             .map(|(node, _)| node)
     }
 
-    /// 路径指向的文件的绝对路径，符号链接全部解析（`/proc/<pid>/exe`，与 Linux 的
-    /// `d_path` 相同）。经由 `/proc/<pid>/fd/<n>` 到达、不知道名字的文件报 ENOENT。
+    /// 路径指向的文件的绝对路径，符号链接全部解析（[`found_path`](Self::found_path)）。
+    #[cfg(test)]
     pub(crate) fn real_path(
         &self,
         ps: &dyn Pseudo,
@@ -854,7 +854,8 @@ impl Vfs {
     }
 
     /// [`walk`](Self::walk) 找到的 `node` 的绝对路径，按最后找到它的目录和名字 `found`
-    /// 算，见 [`real_path`](Self::real_path)。
+    /// 算，符号链接全部解析（`/proc/<pid>/exe`，与 Linux 的 `d_path` 相同）。经由
+    /// `/proc/<pid>/fd/<n>` 到达、不知道名字的文件报 ENOENT。
     pub(crate) fn found_path(
         &self,
         ps: &dyn Pseudo,

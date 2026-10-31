@@ -569,6 +569,9 @@ pub(crate) enum PseudoNode {
     Fd(Tid, i32),
     /// `/proc/<pid>/fd/<n>` 跟随之后得到的那个打开文件（不在仓库里的那些：管道、宿主 fd）。
     OpenFd(Tid, i32),
+    /// `/proc/<pid>/exe` 跟随之后得到的程序文件，已经删除、没法按 inode 打开时
+    /// （[`crate::process::ExeFile`]）。
+    OpenExe(Tid),
     /// `/proc/<pid>/fdinfo/<n>`。
     FdInfo(Tid, i32),
     /// `/sys`。
@@ -702,6 +705,7 @@ pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
         | PseudoNode::Net(pid, ..)
         | PseudoNode::Fd(pid, _)
         | PseudoNode::OpenFd(pid, _)
+        | PseudoNode::OpenExe(pid)
         | PseudoNode::FdInfo(pid, _) => *pid,
         _ => return ino_of(node),
     };
@@ -820,6 +824,7 @@ impl Pseudo for View<'_> {
             Entry(pid, tid, _) => Pid(*pid, *tid),
             Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
             Fd(pid, _) | OpenFd(pid, _) => Entry(*pid, None, self::Entry::Fd),
+            OpenExe(pid) => Pid(*pid, None),
             FdInfo(pid, _) => Entry(*pid, None, self::Entry::FdInfo),
             Ns(pid, tid, _) => Entry(*pid, *tid, self::Entry::Ns),
             NsFile(..) => return None,
@@ -861,6 +866,7 @@ impl Pseudo for View<'_> {
             Entry(_, _, e) => ENTRIES.iter().find(|(_, x)| x == e).unwrap().0.to_vec(),
             Net(_, _, name) => name.to_vec(),
             Fd(_, fd) | OpenFd(_, fd) | FdInfo(_, fd) => fd.to_string().into_bytes(),
+            OpenExe(_) => b"exe".to_vec(),
             Ns(_, _, k) => k.name().as_bytes().to_vec(),
             NsFile(k, id) => format!("{}:[{id}]", k.type_name()).into_bytes(),
         }
@@ -1022,18 +1028,18 @@ impl Pseudo for View<'_> {
                 self.vfs.path_of(self, &self.root(), &root)
             }
             // 与 root、cwd 一样要能看那个进程（Linux 的 proc_pid_readlink、proc_pid_get_link
-            // 都先 proc_fd_access_allowed）；跟随也经过这里
+            // 都先 proc_fd_access_allowed）。程序文件删除之后与 fd 一样带 ` (deleted)`
             Entry(pid, _, self::Entry::Exe) => {
                 let g = self.group(*pid).ok_or(Errno::ENOENT)?;
                 if !self.may_read(*pid) {
                     return Err(Errno::EACCES);
                 }
-                let exe = g.borrow().exe.clone();
-                if exe.is_empty() {
-                    Err(Errno::ENOENT)
-                } else {
-                    Ok(exe)
-                }
+                let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
+                let path = exe.path.to_vec();
+                Ok(match exe.node {
+                    Some((_, ino)) => mark_deleted(self.vfs.store(), ino, path),
+                    None => path,
+                })
             }
             Entry(pid, tid, self::Entry::Cwd) => {
                 let task = self.task(*pid, *tid).ok_or(Errno::ENOENT)?;
@@ -1065,6 +1071,9 @@ impl Pseudo for View<'_> {
     }
 
     fn follow_dentry(&self, node: &PseudoNode) -> Option<crate::vfs::Dentry> {
+        if let PseudoNode::Entry(pid, _, Entry::Exe) = node {
+            return self.group(*pid)?.borrow().exe.as_ref()?.dentry.clone();
+        }
         let PseudoNode::Fd(pid, fd) = node else {
             return None;
         };
@@ -1114,6 +1123,25 @@ impl Pseudo for View<'_> {
                 return Some(Ok(match e {
                     Entry::Root => fs.root.clone(),
                     _ => fs.cwd.clone(),
+                }));
+            }
+            // 程序文件本身（Linux 的 proc_exe_link）：改了名、被删除、被换掉之后仍是原来
+            // 那个。删除了的仓库里的 object 也删了，经由记着的宿主文件打开（OpenExe）。没有
+            // 仓库（开发用的宿主文件）时按读出来的路径跟随
+            PseudoNode::Entry(pid, _, Entry::Exe) => {
+                let g = self.group(*pid)?;
+                if !self.may_read(*pid) {
+                    return Some(Err(Errno::EACCES));
+                }
+                let Some(exe) = g.borrow().exe.clone() else {
+                    return Some(Err(Errno::ENOENT));
+                };
+                let (m, ino) = exe.node?;
+                let deleted = self.vfs.store().attrs(ino).map_or(true, |st| st.nlink == 0);
+                return Some(Ok(if deleted && exe.host.is_some() {
+                    Node::Pseudo(mnt, PseudoNode::OpenExe(*pid))
+                } else {
+                    Node::Store(m, ino)
                 }));
             }
             _ => {}
