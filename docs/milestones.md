@@ -157,6 +157,7 @@
 | [M9 之前：PTY 的包模式](rounds/146-pty-packet-mode.md) | 2026-10-31 | 主设备的 `TIOCPKT`、`TIOCGPKT`：每次读先给一个状态字节（从设备这一边的清空、^S/^Q 停住和恢复、流控的开关、EXTPROC），有状态时 poll 带 POLLPRI；顺带补上 `TIOCGPTLCK`、`TIOCSIG`。GNU screen 原来一个窗口也开不了 |
 | [M9 之前：/proc/<pid>/exe 的跟踪权限](rounds/147-proc-exe-access.md) | 2026-10-31 | 读 `/proc/<pid>/exe` 和经由它打开、执行，与 `root`、`cwd` 一样要能以 `PTRACE_MODE_READ_FSCREDS` 看那个进程（别的用户的、不可 dump 的是 EACCES） |
 | [M9 之前：用户命名空间里的 ID 换算](rounds/148-userns-ids.md) | 2026-10-31 | `SO_PEERCRED`、`SCM_CREDENTIALS`（声明的凭据按 `scm_check_creds` 检查，没声明时是真实 ID）、信号和 waitid 的 si_uid（SIGCHLD 原来总是 0）、SysV IPC 的属主、auxv 的 `AT_UID`、core dump、`/proc/net/tcp` 的 uid 按命名空间换算 |
+| [M9 之前：Ubuntu 26.04 的普查](rounds/149-ubuntu26-survey.md) | 2026-10-31 | glibc 2.43、Rust 写的 coreutils 的 Ubuntu 26.04 当仓库，apt 装了 238 个包，常用命令与原生相同；tar 已经离不开 openat2；找到三处：从设备没打开过时主设备就 EIO（screen 时好时坏）、短的符号链接报了数据块、新分配的 PTY 的窗口大小 |
 
 ## 测量条件
 

@@ -1,6 +1,6 @@
 # M9 之前：用户命名空间里的 ID 换算（2026-10-31）
 
-← [M9 之前：/proc/<pid>/exe 的跟踪权限（2026-10-31）](147-proc-exe-access.md) · [索引](../milestones.md)
+← [M9 之前：/proc/<pid>/exe 的跟踪权限（2026-10-31）](147-proc-exe-access.md) · [索引](../milestones.md) · [M9 之前：Ubuntu 26.04 的普查（2026-10-31）](149-ubuntu26-survey.md) →
 
 [用户命名空间](119-user-namespaces.md)那一轮把 getuid、stat、`/proc/<pid>/status` 这些按调用者的命名空间换算了，记下几处还按内核 ID 报告：`SO_PEERCRED`、`SCM_CREDENTIALS`、siginfo 的 `si_uid`、SysV IPC 的属主、core dump 里的 ID。只有映射改了 ID 时（`unshare -r`、rootless 的容器、`0 1000 1` 这类映射）看得出来，比如 ssh-agent、D-Bus 拿对端的 uid 和自己的 getuid 比，会拒绝连接。这一轮照 Linux 6.1 补上，顺带查出几处与命名空间无关的老问题：SIGCHLD 和 waitid 的 si_uid 总是 0，没有声明凭据时附带的 `SCM_CREDENTIALS` 用的是有效 ID，发送者在 `SCM_CREDENTIALS` 里声明的凭据被直接忽略（注释还写着"所有进程都是 root"）。
 
