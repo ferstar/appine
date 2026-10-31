@@ -97,6 +97,8 @@ pub enum FileKind {
         ino: Ino,
         /// 设备。
         dev: Device,
+        /// `/dev/kmsg` 的读位置和写的限速（[`Device::Kmsg`] 才有）。
+        kmsg: Option<Box<crate::klog::KmsgFile>>,
     },
     /// PTY 的主设备或从设备。
     Pty(PtyEnd),
@@ -131,6 +133,8 @@ pub enum FileKind {
         mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
         /// 命名空间文件（nsfs）：打开着就让那个命名空间活着，setns、`NS_GET_*` 用它。
         ns: Option<crate::nsproxy::NsRef>,
+        /// `/proc/kmsg`：内核日志（poll 要看它）。
+        klog: Option<Rc<RefCell<crate::klog::Klog>>>,
     },
 }
 

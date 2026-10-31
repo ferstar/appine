@@ -432,6 +432,7 @@ pub(super) fn ioctl(
             data: Vec::new(),
             mm: None,
             ns: Some(related),
+            klog: None,
         },
         crate::fd::oflags::O_RDONLY,
         Some(Rc::from(name.into_bytes())),

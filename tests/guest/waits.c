@@ -128,6 +128,14 @@ static void on_alrm(int sig)
     (void)sig;
 }
 
+static void write_kmsg(long unused)
+{
+    (void)unused;
+    int fd = open("/dev/kmsg", O_WRONLY);
+    write(fd, "waits\n", 6);
+    close(fd);
+}
+
 static int msq;
 
 static void send_msg(long unused)
@@ -472,13 +480,33 @@ int main(void)
     CHECK(waitpid(child, &st, 0) == child && WEXITSTATUS(st) == 5, "waitpid");
     ok("waitpid");
     seccomp_listener();
-    /* syslog 的读：appine 的日志是空的，等到信号来（处理函数不带 SA_RESTART，EINTR） */
+    /* syslog 的读：新开的 appine 里日志是空的，等到信号来（处理函数不带 SA_RESTART，
+     * EINTR）；再等到有人写 /dev/kmsg */
     struct sigaction sa = {.sa_handler = on_alrm};
     sigaction(SIGALRM, &sa, NULL);
     after(&l, send_alrm, 0);
     CHECK(syscall(SYS_syslog, 2, buf, (int)sizeof buf) == -1 && errno == EINTR, "syslog read");
     join(&l);
+    after(&l, write_kmsg, 0);
+    CHECK(syscall(SYS_syslog, 2, buf, (int)sizeof buf) > 0, "syslog read woken by a record");
+    join(&l);
     ok("syslog read");
+    /* /proc/kmsg 与 syslog 的读共用位置：上面读走了，等下一条 */
+    int pk = open("/proc/kmsg", O_RDONLY);
+    CHECK(pk >= 0, "open /proc/kmsg");
+    after(&l, write_kmsg, 0);
+    CHECK(read(pk, buf, sizeof buf) > 0, "/proc/kmsg read");
+    join(&l);
+    close(pk);
+    ok("/proc/kmsg read");
+    /* /dev/kmsg：每个打开文件自己的位置，从末尾开始等 */
+    int dk = open("/dev/kmsg", O_RDONLY);
+    CHECK(dk >= 0 && lseek(dk, 0, SEEK_END) == 0, "open /dev/kmsg");
+    after(&l, write_kmsg, 0);
+    CHECK(read(dk, buf, sizeof buf) > 0, "/dev/kmsg read");
+    join(&l);
+    close(dk);
+    ok("/dev/kmsg read");
     printf("all ok\n");
     return 0;
 }

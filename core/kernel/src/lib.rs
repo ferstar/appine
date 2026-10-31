@@ -15,6 +15,7 @@ mod futex;
 mod ipc;
 mod itimer;
 mod kernel;
+mod klog;
 mod loadavg;
 mod loader;
 mod locks;

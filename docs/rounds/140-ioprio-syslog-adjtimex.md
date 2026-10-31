@@ -39,8 +39,8 @@ Android 的应用 seccomp（bionic 的 `SECCOMP_BLOCKLIST_APP.TXT`）不让调 a
 
 **推迟项**：
 
-- 日志总是空的。OOM killer 结束进程、内核层报告的内部错误（§12 第 4、5 条）只写宿主的 stderr（Android 上是 logcat），没有进 dmesg；Linux 上它们都在内核日志里（[稳健性](20-robustness.md)那一轮"终端里只看到 Killed"的推迟项可以借它做）。
-- 没有 `/dev/kmsg` 和 `/proc/kmsg`：util-linux 的 dmesg 退回 syslog(2)，往 `/dev/kmsg` 写日志的程序（systemd、一些 init 脚本）打不开它。
+- 日志总是空的。OOM killer 结束进程、内核层报告的内部错误（§12 第 4、5 条）只写宿主的 stderr（Android 上是 logcat），没有进 dmesg；Linux 上它们都在内核日志里（[稳健性](20-robustness.md)那一轮"终端里只看到 Killed"的推迟项可以借它做）。→ 已补上（M9 之前：/dev/kmsg 和内核日志）：OOM killer、内部错误结束进程和 guest 写 `/dev/kmsg` 的都记进日志
+- 没有 `/dev/kmsg` 和 `/proc/kmsg`：util-linux 的 dmesg 退回 syslog(2)，往 `/dev/kmsg` 写日志的程序（systemd、一些 init 脚本）打不开它。→ 已补上（M9 之前：/dev/kmsg 和内核日志）
 - io_context 只在 ioprio_set 之后才有。Linux 上做过块 IO 的线程可能已经有了（看 IO 调度器），这时 `CLONE_IO` 照样共用，appine 里不共用；正在退出的线程（`PF_EXITING`）Linux 不设，appine 照设。
 - 仓库的后台线程（检查点、删除 object）的 IO 不跟着哪个 guest 线程的优先级。
 - 改时钟、NTP 参数的 adjtimex 是 EPERM：chronyd、ntpd 调不了时钟（宿主的时间 guest 本来就改不了）。Android 上合成的状态总是未同步，maxerror 不随时间增长。

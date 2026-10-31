@@ -18,6 +18,8 @@ pub enum Device {
     Full,
     /// `/dev/random`、`/dev/urandom`：宿主的随机数。
     Random,
+    /// `/dev/kmsg`：内核日志（[`crate::klog`]），每个打开文件有自己的读位置。
+    Kmsg,
 }
 
 /// Linux 的设备号编码（`new_encode_dev`）。
@@ -33,6 +35,7 @@ impl Device {
             v if v == rdev(1, 5) => Ok(Device::Zero),
             v if v == rdev(1, 7) => Ok(Device::Full),
             v if v == rdev(1, 8) || v == rdev(1, 9) => Ok(Device::Random),
+            v if v == rdev(1, 11) => Ok(Device::Kmsg),
             _ => Err(Errno::ENXIO),
         }
     }
@@ -40,12 +43,13 @@ impl Device {
 
 /// `/dev` 里的标准节点：名字、设备号、权限。终端设备（tty、console、ptmx）由
 /// syscall 层按设备号接到 PTY 上。
-const NODES: [(&[u8], u64, u32); 8] = [
+const NODES: [(&[u8], u64, u32); 9] = [
     (b"null", rdev(1, 3), 0o666),
     (b"zero", rdev(1, 5), 0o666),
     (b"full", rdev(1, 7), 0o666),
     (b"random", rdev(1, 8), 0o666),
     (b"urandom", rdev(1, 9), 0o666),
+    (b"kmsg", rdev(1, 11), 0o644),
     (b"tty", rdev(5, 0), 0o666),
     (b"console", rdev(5, 1), 0o600),
     (b"ptmx", rdev(5, 2), 0o666),

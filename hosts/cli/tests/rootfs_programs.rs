@@ -406,6 +406,37 @@ fn kernel_log_is_empty_and_keeps_console_levels() {
 }
 
 #[test]
+fn kmsg_records_reach_dmesg() {
+    // 写 /dev/kmsg 的记录 dmesg 读得到（busybox 的 dmesg 用 syslog(2) 的读全部），结尾没有
+    // 换行的等下一条来了才读得到；printk_devkmsg 默认 ratelimit：一个打开文件 5 秒内最多
+    // 10 条，关闭时记一条丢了几条；on 不限，off 打不开；/proc/kmsg 只有 root 能读，与
+    // syslog 的读共用位置，dmesg -c 不影响它
+    let script = "strip() { sed 's/\\[ *[0-9]*\\.[0-9]*\\] //'; }; \
+        echo '<11>user err' > /dev/kmsg; printf 'no newline' > /dev/kmsg; dmesg -r | strip; \
+        echo closes > /dev/kmsg; dmesg | strip; cat /proc/sys/kernel/printk_devkmsg; \
+        for i in $(seq 12); do echo n$i; done > /dev/kmsg; dmesg | grep -c '] n[0-9]'; \
+        dmesg | grep suppressed | strip; \
+        echo on > /proc/sys/kernel/printk_devkmsg; \
+        for i in $(seq 12); do echo m$i; done > /dev/kmsg; dmesg | grep -c '] m[0-9]'; \
+        echo onx > /proc/sys/kernel/printk_devkmsg 2>/dev/null || echo rejected; \
+        echo off > /proc/sys/kernel/printk_devkmsg; (echo x > /dev/kmsg) 2>/dev/null || echo off; \
+        echo ratelimit > /proc/sys/kernel/printk_devkmsg; cat /proc/sys/kernel/printk_devkmsg; \
+        ls -l /dev/kmsg | cut -c1-10; dmesg -c > /dev/null; dmesg | wc -l; \
+        dd if=/proc/kmsg bs=4096 count=1 2>/dev/null | head -n 1 | strip; \
+        su -s /bin/sh nobody -c 'cat /proc/kmsg' 2>/dev/null || echo denied";
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        assert_eq!(
+            stdout(&out),
+            "<11>user err\nuser err\nno newline\ncloses\nratelimit\n10\n\
+             printk: sh: 2 output lines suppressed due to ratelimiting\n12\nrejected\noff\n\
+             ratelimit\ncrw-r--r--\n0\n<11>user err\ndenied\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn io_priority_reaches_the_host_thread() {
     // ionice 之后执行的程序在宿主上的线程也设上了（Android 的应用 seccomp 放行 ioprio_set）：
     // IDLE 照搬，RT 降成同一级的 BE
@@ -1430,10 +1461,12 @@ fn cgroup_memory_files_follow_the_oom_killer() {
     let script = "cd /sys/fs/cgroup; cat memory.max; grep oom_kill memory.events; \
                   awk 'BEGIN { s = \"x\"; for (i = 0; i < 27; i++) s = s s; print length(s) }'; \
                   echo awk $?; grep -E '^(max|oom|oom_kill) ' memory.events | sed 's/ [1-9][0-9]*$/ N/'; \
-                  [ $(cat memory.peak) -gt 134217728 ] && echo peak over the limit";
+                  [ $(cat memory.peak) -gt 134217728 ] && echo peak over the limit; \
+                  dmesg | grep -oE 'task=awk,pid=[0-9]+|Killed process [0-9]+ \\(awk\\)' | sed 's/[0-9][0-9]*/N/'";
     assert_eq!(
         run("128M", script),
-        "134217728\noom_kill 0\nawk 137\nmax N\noom N\noom_kill N\npeak over the limit\n"
+        "134217728\noom_kill 0\nawk 137\nmax N\noom N\noom_kill N\npeak over the limit\n\
+         task=awk,pid=N\nKilled process N (awk)\n"
     );
 }
 

@@ -223,6 +223,8 @@ pub(crate) struct Kernel {
     pub printk: [i32; 4],
     pub saved_console_loglevel: Option<i32>,
     pub dmesg_restrict: bool,
+    /// 内核日志的记录（[`crate::klog`]）：`/dev/kmsg` 的打开文件也拿着它。
+    pub klog: Rc<RefCell<crate::klog::Klog>>,
     /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
     pub pipe_max_size: usize,
     /// `/proc/sys/fs/nr_open`：fd 的上限（`RLIMIT_NOFILE` 不能超过它）。
@@ -320,6 +322,7 @@ impl Kernel {
             printk: [7, 4, 1, 7],
             saved_console_loglevel: None,
             dmesg_restrict: false,
+            klog: Default::default(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
             threads_max: crate::process::default_threads_max(),

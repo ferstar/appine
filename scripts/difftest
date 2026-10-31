@@ -29,7 +29,7 @@ tier=1
 rebuild=0
 store=target/difftest/store
 image=appine-difftest
-packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc"
+packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc dmesg"
 env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 while getopts t:rs: opt; do
@@ -81,7 +81,7 @@ fi
 # 只看目录在不在不够：安装中途失败、缓存只恢复了一部分的仓库会让每个用例都失败
 if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
     /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap &&
-        nsenter --version | grep -q util-linux" >/dev/null 2>&1; then
+        nsenter --version | grep -q util-linux && dmesg --version | grep -q util-linux" >/dev/null 2>&1; then
     echo "difftest: $store lacks some of: $packages" >&2
     echo "difftest: install them with apk add, or delete $store to create it again" >&2
     exit 1
@@ -89,7 +89,9 @@ fi
 
 if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "exporting the root filesystem of $store"
-    appine --tier 1 --rootfs "$store" -- /bin/tar -c -f - -C / bin etc lib sbin usr tmp 2>/dev/null |
+    # /tmp 只要目录本身：历次运行留在仓库 /tmp 里的东西（可能上 GB）不必进镜像
+    appine --tier 1 --rootfs "$store" -- /bin/tar -c -f - -C / --exclude='tmp/*' \
+        bin etc lib sbin usr tmp 2>/dev/null |
         docker import --platform linux/arm64 - "$image" >/dev/null
 fi
 

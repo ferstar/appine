@@ -151,6 +151,7 @@
 | [M9 之前：ioprio、syslog 和 adjtimex](rounds/140-ioprio-syslog-adjtimex.md) | 2026-10-31 | ioprio_set、ioprio_get 按线程记、交给宿主线程（`ionice` 原来设不上就不执行命令）；syslog(2) 回答空的日志，权限、控制台级别按 6.1，新增 `/proc/sys/kernel/printk`、`dmesg_restrict`；adjtimex、clock_adjtime 回答查询（Linux 宿主上取宿主的 NTP 状态，Android 上按未同步合成），要改东西的是 EPERM |
 | [M9 之前：FP16 和 JSCVT](rounds/141-fp16-jscvt.md) | 2026-10-31 | 宿主有时宣告半精度浮点运算（FPHP、ASIMDHP，一起宣告）和 FJCVTZS：只放行编码，FPCR 的 FZ16 可写；llama.cpp 的 ggml 要 FP16 才会用 armv8.2_1 以上的后端；llama.cpp 的 F16 模型提示处理快 82%、生成快 44%（Qwen2.5-0.5B，Q4_0 不变） |
 | [M9 之前：RDM、FCMA、FHM 和 BF16](rounds/142-rdm-fcma-fhm-bf16.md) | 2026-10-31 | 宿主有时宣告的另外四个 SIMD 扩展：只放行编码，FHM 只和 FP16 一起宣告；在 appine 里 `gcc -mcpu=native` 也用上它们；BF16 点积用 BFDOT 原生快 2.4 倍、appine 里快 1.5 倍，另外三种在 M2 上差别在 5% 以内 |
+| [M9 之前：/dev/kmsg 和内核日志](rounds/143-kmsg.md) | 2026-10-31 | 内核层有了自己的日志（6.1 的 printk 环形缓冲区）：`/dev/kmsg` 的读写、lseek、poll 和限速，syslog(2) 的各个动作、`/proc/kmsg`、`printk_devkmsg`；OOM killer 和内部错误结束进程记进去，guest 里 `dmesg` 看得到；差分测试的镜像不再带上仓库 /tmp 里的东西 |
 
 ## 测量条件
 

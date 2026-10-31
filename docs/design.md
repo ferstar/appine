@@ -451,7 +451,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - `uname -r` 固定报告一个 LTS 版本 `6.1.0-appine`。我们把它当作一份 **ABI 契约**：除文档明确列出的例外，按这个内核版本的语义实现。比 6.1 新的功能一般不做（比如 6.9 的 `PIDFD_THREAD`），例外是 6.5 的 `cachestat`，以及 6.12 起 `/proc/<pid>/fd`、`fdinfo` 里的项不能当挂载点（§8.2）。
 - 未实现的 syscall **一律返回 `ENOSYS`，绝不崩溃**，同时记录一条本地调试日志（`APPINE_LOG=1` 时输出）。
 - 有意不实现的：io_uring 保持 `ENOSYS`（§15）。别的返回 `ENOSYS` 的编号，以及哪些与没配对应功能的 Linux 6.1 一样，见[未实现的系统调用](rounds/139-unimplemented-syscalls.md)。
-- 时钟和内核日志：settimeofday、clock_settime 和要改东西的 adjtimex 是 `EPERM`（当作没有 `CAP_SYS_TIME`，guest 改不了宿主的时间）；adjtimex、clock_adjtime 的查询取宿主的 NTP 状态，Android 的应用 seccomp 不让调，按不运行内核 NTP 调整的 Android 内核的样子合成（未同步）。syslog(2) 的日志总是空的，权限（`dmesg_restrict`、`CAP_SYSLOG`）和控制台级别（`/proc/sys/kernel/printk`）按 6.1（[ioprio、syslog 和 adjtimex](rounds/140-ioprio-syslog-adjtimex.md)）。
+- 时钟和内核日志：settimeofday、clock_settime 和要改东西的 adjtimex 是 `EPERM`（当作没有 `CAP_SYS_TIME`，guest 改不了宿主的时间）；adjtimex、clock_adjtime 的查询取宿主的 NTP 状态，Android 的应用 seccomp 不让调，按不运行内核 NTP 调整的 Android 内核的样子合成（未同步）。syslog(2) 读的是内核层自己的日志（§7.8），权限（`dmesg_restrict`、`CAP_SYSLOG`）和控制台级别（`/proc/sys/kernel/printk`）按 6.1（[ioprio、syslog 和 adjtimex](rounds/140-ioprio-syslog-adjtimex.md)）。
 
 ### 7.6 ptrace
 
@@ -474,6 +474,12 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - 格式与 arm64 Linux 写的相同，gdb 可以事后分析：每个映射一个 `PT_LOAD`，写多少按 `/proc/<pid>/coredump_filter`（默认 0x33）和 Linux 的 `vma_dump_size`：vDSO 总是写，写过的私有匿名映射和匿名共享内存整个写（没碰过的页留空洞，从来没有可写过的预留不写），私有文件映射可写过的整个写，否则只写 ELF 文件的第一页。`PT_NOTE` 里每个线程有 `NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`、`NT_ARM_SYSTEM_CALL`，产生信号的线程在最前面，后面接着进程的 `NT_PRPSINFO`、`NT_SIGINFO`、`NT_AUXV`、`NT_FILE`。
 - 建成了 core 文件的进程，wait 的状态带 `WCOREDUMP`，SIGCHLD 和 waitid 的 `si_code` 是 `CLD_DUMPED`。
 - 与 Linux 的 `do_signal` 一样，阻塞在系统调用里被结束的线程先按"重新执行"把 pc 退回 svc、x0 恢复成原来的参数再结束，core 文件和 `PTRACE_EVENT_EXIT` 看到的都是这样。`MADV_DONTDUMP` 的映射不写（smaps 的 `dd`）。
+
+### 7.8 内核日志
+
+- 内核层有一份自己的日志（`core/kernel/src/klog.rs`），与 Linux 6.1 的 printk 环形缓冲区一样：128 KB、最多 4096 条，满了丢掉最老的；每条有序号、时间戳（宿主的 `CLOCK_MONOTONIC`）、facility 和级别；结尾没有换行的记录还没定稿，下一条来了才读得到。宿主内核的日志拿不到（Android 上 App 也读不了），不在里面。
+- 记进去的：guest 写 `/dev/kmsg` 的（一次写或一次 writev 是一条，开头的 `<N>` 是前缀，`/proc/sys/kernel/printk_devkmsg` 默认 `ratelimit`，每个打开文件 5 秒内最多 10 条）；OOM killer 结束进程（§12 第 4 条，按 Linux 的 memcg OOM 写 `Memory cgroup out of memory: Killed process …`）；内核层、引擎的 bug 结束进程（§12 第 5 条，与写给宿主 stderr 的报告相同）；只有 `CAP_SYS_ADMIN` 读日志时的那条警告。
+- 读的接口与 Linux 相同：`/dev/kmsg`（0644，每个打开文件自己的位置，一次读一条，`SEEK_SET`/`SEEK_DATA`/`SEEK_END`，被挤掉时 EPIPE，poll 只报告可读）；syslog(2) 的读全部、读后清空、清空（`dmesg`、`dmesg -c`）；syslog(2) 的读和 `/proc/kmsg`（0400，共用一个读的位置，读走就没了）。权限按 `dmesg_restrict`、`CAP_SYSLOG`（[/dev/kmsg 和内核日志](rounds/143-kmsg.md)）。
 
 ---
 
@@ -643,8 +649,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 2 | 内核层不把 guest 指针当作宿主指针 | ✅ syscall 参数里的地址一律是 `u64` 或 `UserSlice`（`core/kernel/src/uaccess.rs`），只能经由 `Mm` 读写。计划中带类型的 `UserPtr<T>` 没有引入 |
 | 3 | 宿主路径永远不由 guest 输入拼出来，宿主侧只出现 `objects/<数字>` 形式的路径，symlink 只存在于数据库里。因此"恶意 tar 包借 symlink 逃逸"这类问题在结构上不可能发生 | ✅ |
 | | **稳健性** | |
-| 4 | **guest 自己的 OOM killer**：给所有 guest 内存设一个总上限，默认按设备内存的比例计算，可以配置。超出上限时由我们挑选一个 guest 进程杀掉，不让系统 LMK 杀掉整个 App。同时为 `RLIMIT_NPROC` 设置默认值，防止 fork 炸弹 | ✅ `core/kernel/src/oom.rs`。上限量的是整个 App 进程的匿名内存（`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，LMK 看的就是它；Tier 1 代码缓存在写入视图里还没拆掉的页算了两次，扣掉一次，见 §4.2 的 W^X），默认是物理内存的一半，`MachineOptions::memory_limit`、`appine-run --memory-limit` 可以改。guest 碰新的页由宿主内核处理，所以是定时检查：有 guest 线程在运行时每 20 毫秒量一次，超过上限的 3/4 之后每 5 毫秒，全都在等待时停下。超出时按 Linux 的 oom_badness（驻留页数加上按物理内存折算的 `oom_score_adj`）挑一个进程（与 Linux 一样，没有 `CAP_SYS_RESOURCE` 的进程不能把 `oom_score_adj` 调到 `oom_score_adj_min` 以下），用 SIGKILL 结束，等它退完（最多 1 秒）再看下一个。不停分配内存的程序在被发现之前还能多用几十 MB。fork 炸弹由 `threads-max` 和 `RLIMIT_NPROC` 挡住（§6）。上限和用量也以 cgroup v2 的 `memory.max`、`memory.current` 告诉 guest（§8.2），运行时按上限而不是物理内存定堆 |
-| 5 | 内核层以 `panic=unwind` 编译，在 syscall 入口用 `catch_unwind` 兜住 panic，只杀掉当前 guest 进程并生成报告。debug 构建下直接 abort | ✅ `core/kernel/src/bug.rs`。运行循环在每次进入内核的地方（包括不持 BKL 的系统调用）兜住 panic，获取 BKL 时忽略中毒标记；引擎的 bug 走 §7.4 的 `APPINE_EXIT_HOST_FAULT`。两种情况都像 Linux 的 oops 结束当前任务那样，用 SIGSEGV 结束整个进程，并往 stderr（Android 上转到 logcat）写报告。BKL 保护的状态可能只改了一半，结束出问题的进程之后大部分不一致也随之消失。运行循环之外的内核代码也兜住：guest 线程开始时、退出的每一步（出错之后其余步骤照做，进程总会结束）、定时器线程处理一个进程的定时器时，都结束那个进程；最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC 的清理、释放控制终端、交给跟踪者或父进程、放开它跟踪的进程、孤儿进程组的 SIGHUP/SIGCONT 等）也各自兜住，一步出错只丢掉这一步做的事，进程已经结束，只报告；内存上限的检查、信号驱动的 I/O 分不出进程，出错时关掉这项功能；宿主调用 `Machine` 的方法（Android 上是 JNI 调用）时只让那次调用失败，控制台上的调用还挂断那个控制台。debug 构建默认直接终止宿主进程，`APPINE_ON_BUG=kill`/`abort` 可以覆盖 |
+| 4 | **guest 自己的 OOM killer**：给所有 guest 内存设一个总上限，默认按设备内存的比例计算，可以配置。超出上限时由我们挑选一个 guest 进程杀掉，不让系统 LMK 杀掉整个 App。同时为 `RLIMIT_NPROC` 设置默认值，防止 fork 炸弹 | ✅ `core/kernel/src/oom.rs`。上限量的是整个 App 进程的匿名内存（`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，LMK 看的就是它；Tier 1 代码缓存在写入视图里还没拆掉的页算了两次，扣掉一次，见 §4.2 的 W^X），默认是物理内存的一半，`MachineOptions::memory_limit`、`appine-run --memory-limit` 可以改。guest 碰新的页由宿主内核处理，所以是定时检查：有 guest 线程在运行时每 20 毫秒量一次，超过上限的 3/4 之后每 5 毫秒，全都在等待时停下。超出时按 Linux 的 oom_badness（驻留页数加上按物理内存折算的 `oom_score_adj`）挑一个进程（与 Linux 一样，没有 `CAP_SYS_RESOURCE` 的进程不能把 `oom_score_adj` 调到 `oom_score_adj_min` 以下），用 SIGKILL 结束，记进内核日志（§7.8），等它退完（最多 1 秒）再看下一个。不停分配内存的程序在被发现之前还能多用几十 MB。fork 炸弹由 `threads-max` 和 `RLIMIT_NPROC` 挡住（§6）。上限和用量也以 cgroup v2 的 `memory.max`、`memory.current` 告诉 guest（§8.2），运行时按上限而不是物理内存定堆 |
+| 5 | 内核层以 `panic=unwind` 编译，在 syscall 入口用 `catch_unwind` 兜住 panic，只杀掉当前 guest 进程并生成报告。debug 构建下直接 abort | ✅ `core/kernel/src/bug.rs`。运行循环在每次进入内核的地方（包括不持 BKL 的系统调用）兜住 panic，获取 BKL 时忽略中毒标记；引擎的 bug 走 §7.4 的 `APPINE_EXIT_HOST_FAULT`。两种情况都像 Linux 的 oops 结束当前任务那样，用 SIGSEGV 结束整个进程，并往 stderr（Android 上转到 logcat）写报告，同一份报告也记进内核日志（§7.8，guest 里 `dmesg` 看得到）。BKL 保护的状态可能只改了一半，结束出问题的进程之后大部分不一致也随之消失。运行循环之外的内核代码也兜住：guest 线程开始时、退出的每一步（出错之后其余步骤照做，进程总会结束）、定时器线程处理一个进程的定时器时，都结束那个进程；最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC 的清理、释放控制终端、交给跟踪者或父进程、放开它跟踪的进程、孤儿进程组的 SIGHUP/SIGCONT 等）也各自兜住，一步出错只丢掉这一步做的事，进程已经结束，只报告；内存上限的检查、信号驱动的 I/O 分不出进程，出错时关掉这项功能；宿主调用 `Machine` 的方法（Android 上是 JNI 调用）时只让那次调用失败，控制台上的调用还挂断那个控制台。debug 构建默认直接终止宿主进程，`APPINE_ON_BUG=kill`/`abort` 可以覆盖 |
 | | **对 Android 暴露的接口** | |
 | 6 | 只导出启动 Activity 和 DocumentsProvider，不提供供其他 App 执行命令的 intent | ✅ 目前只导出启动 Activity（还没有 DocumentsProvider） |
 | 7 | guest 第一次在非回环地址上 `listen` 某个端口时，发出一条通知 | 未实现 |

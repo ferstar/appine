@@ -50,9 +50,11 @@ pub(crate) enum Global {
     Net,
     /// cgroup 的控制器（[`crate::cgroup`]）。
     Cgroups,
+    /// syslog 的读（[`crate::klog`]）：内容不在打开时生成，读的时候取。
+    Kmsg,
 }
 
-const GLOBALS: [(&[u8], Global); 11] = [
+const GLOBALS: [(&[u8], Global); 12] = [
     (b"cpuinfo", Global::Cpuinfo),
     (b"meminfo", Global::Meminfo),
     (b"stat", Global::Stat),
@@ -64,6 +66,7 @@ const GLOBALS: [(&[u8], Global); 11] = [
     (b"mounts", Global::Mounts),
     (b"net", Global::Net),
     (b"cgroups", Global::Cgroups),
+    (b"kmsg", Global::Kmsg),
 ];
 
 /// `/proc/<pid>` 下的项。
@@ -264,7 +267,7 @@ const PROC_NET: [&[u8]; 18] = [
 ];
 
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 73] = [
+const STATIC: [&[u8]; 74] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -305,6 +308,7 @@ const STATIC: [&[u8]; 73] = [
     b"sys/kernel/overflowuid",
     b"sys/kernel/pid_max",
     b"sys/kernel/printk",
+    b"sys/kernel/printk_devkmsg",
     b"sys/kernel/random/",
     b"sys/kernel/random/boot_id",
     b"sys/kernel/random/entropy_avail",
@@ -1200,6 +1204,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
         (_, n) if writable(n) => 0o644,
         (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv)) => 0o400,
+        (_, PseudoNode::Global(Global::Kmsg)) => 0o400,
         _ => 0o444,
     };
     let rdev_value = match node {
@@ -1291,6 +1296,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/kernel/core_uses_pid"
                     | b"sys/kernel/dmesg_restrict"
                     | b"sys/kernel/printk"
+                    | b"sys/kernel/printk_devkmsg"
                     | b"sys/kernel/msgmax"
                     | b"sys/kernel/msgmnb"
                     | b"sys/kernel/msgmni"
@@ -1485,6 +1491,28 @@ pub(crate) fn write(
             .filter(|v| (0..=1).contains(v))
             .ok_or(Errno::EINVAL)?
             == 1;
+    }
+    // devkmsg_sysctl_set_loglvl：proc_dostring 取到换行或第 9 个字节为止，必须恰好是 on、off、
+    // ratelimit 之一再加一个字节（echo 的换行），否则 EINVAL、保持原样
+    if let PseudoNode::Static(b"sys/kernel/printk_devkmsg") = node {
+        let value = &data[..data.len().min(9)];
+        let value = &value[..value
+            .iter()
+            .position(|&b| b == 0 || b == b'\n')
+            .unwrap_or(value.len())];
+        let (mode, len) = if value.starts_with(b"on") {
+            (crate::klog::Devkmsg::On, 2)
+        } else if value.starts_with(b"off") {
+            (crate::klog::Devkmsg::Off, 3)
+        } else if value.starts_with(b"ratelimit") {
+            (crate::klog::Devkmsg::Ratelimit, 9)
+        } else {
+            return Err(Errno::EINVAL);
+        };
+        if len + 1 != data.len() {
+            return Err(Errno::EINVAL);
+        }
+        k.klog.borrow_mut().devkmsg = mode;
     }
     // proc_dointvec：按顺序写前几个，最多四个；第一个就不是数时 EINVAL
     if let PseudoNode::Static(b"sys/kernel/printk") = node {
@@ -2624,6 +2652,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
             self::Global::Cmdline => "appine\n".to_owned(),
             self::Global::Cgroups => crate::cgroup::proc_cgroups(),
+            self::Global::Kmsg => String::new(),
             self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
         },
         // 那个进程所在的网络命名空间的：新建的里面只有 lo，socket 只列建在里面的，流量
@@ -2750,6 +2779,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 let [a, b, c, d] = ps.k.printk;
                 format!("{a}\t{b}\t{c}\t{d}\n")
             }
+            b"sys/kernel/printk_devkmsg" => format!("{}\n", ps.k.klog.borrow().devkmsg.name()),
             // 每个用户能建的各种命名空间个数的上限：与 Linux 的默认值一样是 threads-max 的
             // 一半，只读，不实际限制
             p if p.starts_with(b"sys/user/max_") => {

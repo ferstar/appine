@@ -208,6 +208,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
             used / 1024,
             k.oom.limit / 1024,
         );
+        log_kill(k, &g, task.map(|t| &**t), used);
         drop(g);
         let status = ExitStatus::Signaled {
             signal: Signal::KILL,
@@ -219,6 +220,62 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
         k.oom.count(|e| e.oom_kill += 1);
     }
     k.oom.next
+}
+
+/// 结束进程时记进内核日志（[`crate::klog`]）：App 的上限在 guest 看来是它所在的 cgroup 的
+/// `memory.max`，所以按 Linux 的 memcg OOM 写（`mem_cgroup_print_oom_meminfo` 的第一行、
+/// `dump_oom_summary`、`__oom_kill_process`），`dmesg` 里看得到是谁、为什么被结束。调用的
+/// 栈、各个进程的表这些略去。驻留的页按映射的种类分开（与 smaps 一样按宿主内存算），没有
+/// 页表的计数（`VmPTE` 也是 0）。
+fn log_kill(k: &Kernel, g: &ThreadGroup, task: Option<&crate::task::Task>, used: u64) {
+    use crate::klog::{level, printk};
+    let comm = crate::pseudo::comm_str(task, g.tgid);
+    let (pid, uid) = (g.tgid, g.cred.ruid);
+    let (mut vm, mut anon, mut file, mut shmem) = (0, 0, 0, 0);
+    if let Some(t) = task {
+        let res = t.res.borrow();
+        let mm = res.mm.borrow();
+        vm = mm.size() / 1024;
+        for r in mm.regions() {
+            let pages = mm
+                .residency(r.start, r.end - r.start)
+                .map_or(0, |v| v.iter().filter(|&&p| p).count() as u64);
+            match (r.file, r.shared) {
+                (Some(_), _) => file += pages * 4,
+                (None, true) => shmem += pages * 4,
+                (None, false) => anon += pages * 4,
+            }
+        }
+    }
+    let log = &k.klog;
+    printk(
+        log,
+        level::INFO,
+        format_args!(
+            "memory: usage {}kB, limit {}kB, failcnt {}",
+            used / 1024,
+            k.oom.limit / 1024,
+            k.oom.events.get().max
+        ),
+    );
+    printk(
+        log,
+        level::INFO,
+        format_args!(
+            "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,\
+             oom_memcg=/,task_memcg=/,task={comm},pid={pid},uid={uid}"
+        ),
+    );
+    printk(
+        log,
+        level::ERR,
+        format_args!(
+            "Memory cgroup out of memory: Killed process {pid} ({comm}) total-vm:{vm}kB, \
+             anon-rss:{anon}kB, file-rss:{file}kB, shmem-rss:{shmem}kB, UID:{uid} \
+             pgtables:0kB oom_score_adj:{}",
+            g.oom_score_adj
+        ),
+    );
 }
 
 /// 挑要结束的进程（跳过 `skip`），按 Linux 的 oom_badness：驻留的页数，加上

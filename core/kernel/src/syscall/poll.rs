@@ -140,6 +140,32 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
         FileKind::MessageQueue(q) => (q.borrow().readiness(), None),
         FileKind::SeccompNotify(l) => (l.readiness(), None),
         FileKind::Path(_) => (POLLNVAL, None),
+        // /dev/kmsg（`devkmsg_poll`）：有没读的记录时可读，要读的那条已经被挤掉时还有
+        // POLLERR、POLLPRI；从来不报告可写
+        FileKind::Device {
+            kmsg: Some(user), ..
+        } => {
+            let log = user.log.borrow();
+            let ev = if !log.readable(user.seq) {
+                0
+            } else if user.seq < log.first_seq() {
+                POLLIN | POLLRDNORM | POLLERR | POLLPRI
+            } else {
+                POLLIN | POLLRDNORM
+            };
+            (ev, None)
+        }
+        // /proc/kmsg（`kmsg_poll`）：syslog 还有没读的记录时可读
+        FileKind::Proc {
+            klog: Some(log), ..
+        } => (
+            if log.borrow_mut().size_unread(true) > 0 {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            },
+            None,
+        ),
         _ => (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, None),
     }
 }
@@ -189,6 +215,12 @@ fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> 
         FileKind::SignalFd(s) => [s.borrow().arrivals(), 0],
         FileKind::MessageQueue(q) => q.borrow().arrivals(),
         FileKind::SeccompNotify(l) => l.arrivals(),
+        FileKind::Device {
+            kmsg: Some(user), ..
+        } => [user.log.borrow().next_seq(), 0],
+        FileKind::Proc {
+            klog: Some(log), ..
+        } => [log.borrow().next_seq(), 0],
         _ => [0, 0],
     };
     let host = f.host_edges.as_ref().map_or([0, 0], host);
@@ -297,6 +329,12 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
         FileKind::Socket(s) => super::net::wake_objects(s, out),
         FileKind::MessageQueue(q) => out.push(wake::of(q)),
         FileKind::SeccompNotify(l) => out.push(l.object()),
+        FileKind::Device {
+            kmsg: Some(user), ..
+        } => out.push(wake::of(&*user.log)),
+        FileKind::Proc {
+            klog: Some(log), ..
+        } => out.push(wake::of(&**log)),
         _ => {}
     }
 }
@@ -1143,7 +1181,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         file.borrow().kind,
         FileKind::Regular { .. }
             | FileKind::Directory { .. }
-            | FileKind::Proc { .. }
+            | FileKind::Proc { klog: None, .. }
             | FileKind::Device {
                 dev: Device::Null | Device::Zero | Device::Full,
                 ..

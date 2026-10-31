@@ -14,7 +14,7 @@ use crate::cell::RefCell;
 use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{EventFd, FileKind, FileRef, OpenFile, TimerFd, oflags};
-use crate::kernel::{Cx, Kernel, Tid, request_wake_locks, request_wake_object};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_locks, request_wake_object, wake};
 use crate::locks::{self, Lock, Owner, Waiter};
 use crate::pipe::{PIPE_BUF, PIPE_CAPACITY, Pipe, PipeEnd};
 use crate::process::{RLIMIT_FSIZE, Signal};
@@ -945,16 +945,33 @@ fn open_store(
             PTMX_RDEV => tty::open_ptmx(cx.k(), cred.fsuid)?,
             r => match pts_index(r) {
                 Some(index) => tty::open_slave(cx, index, flags)?,
-                None => FileKind::Device {
-                    ino,
-                    dev: dev::open(store, ino)?,
-                },
+                None => {
+                    let dev = dev::open(store, ino)?;
+                    let kmsg = match dev {
+                        Device::Kmsg => Some(open_kmsg(cx, accmode)?),
+                        _ => None,
+                    };
+                    FileKind::Device { ino, dev, kmsg }
+                }
             },
         },
         mode::S_IFIFO => open_fifo(cx, ino, flags)?,
         // 块设备、socket 文件不能打开（socket 文件用 connect）
         _ => return Err(Errno::ENXIO),
     })
+}
+
+/// 打开 `/dev/kmsg`（`devkmsg_open`）：`printk_devkmsg` 为 `off` 时谁都打不开；读方式打开
+/// 按 syslog 的读全部查权限（`dmesg_restrict`），只写不查。读的位置从最老的一条开始。
+fn open_kmsg(cx: &mut Cx<'_>, accmode: u32) -> Result<Box<crate::klog::KmsgFile>, Errno> {
+    let log = cx.kr().klog.clone();
+    if log.borrow().devkmsg == crate::klog::Devkmsg::Off {
+        return Err(Errno::EPERM);
+    }
+    if accmode != oflags::O_WRONLY {
+        super::misc::check_syslog_permissions(cx, super::misc::syslog_action::READ_ALL, false)?;
+    }
+    Ok(Box::new(crate::klog::KmsgFile::new(log)))
 }
 
 /// 打开命名管道（FIFO）：同一个 inode 的所有打开共用一个管道。与 Linux 相同，只读打开
@@ -1089,6 +1106,14 @@ fn open_pseudo(
         return Err(Errno::EACCES);
     }
     let data = pseudo::content(&view, mnt, &node)?;
+    // /proc/kmsg（`kmsg_open`）：打开时按 syslog 的打开查权限，之后的读不再查
+    let klog = match node {
+        PseudoNode::Global(pseudo::Global::Kmsg) => {
+            super::misc::do_syslog(cx, super::misc::syslog_action::OPEN, 0, 0, true)?;
+            Some(cx.kr().klog.clone())
+        }
+        _ => None,
+    };
     // 命名空间文件拿着那个命名空间
     let ns = match node {
         PseudoNode::NsFile(kind, id) => {
@@ -1102,6 +1127,7 @@ fn open_pseudo(
         data,
         mm,
         ns,
+        klog,
     })
 }
 
@@ -3167,6 +3193,24 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             SEEK_END => q.borrow().status().len() as i64,
             _ => return Err(Errno::EINVAL),
         },
+        // /dev/kmsg 按记录定位（`devkmsg_llseek`）：只能是偏移 0，SEEK_SET 到最老的一条，
+        // SEEK_DATA 到 syslog 上次清空之后的第一条（`dmesg -c` 之后），SEEK_END 到下一条；
+        // 文件位置不变，返回 0
+        FileKind::Device {
+            kmsg: Some(user), ..
+        } => {
+            if offset != 0 {
+                return Err(Errno::ESPIPE);
+            }
+            let log = user.log.borrow();
+            user.seq = match whence {
+                SEEK_SET => log.first_seq(),
+                SEEK_DATA => log.clear_seq(),
+                SEEK_END => log.next_seq(),
+                _ => return Err(Errno::EINVAL),
+            };
+            return Ok(0);
+        }
         // 与 Linux 的 /dev/null 等一样，seek 总是成功并停在 0
         FileKind::Device { .. } => return Ok(0),
         FileKind::Directory { entries, .. } => {
@@ -3227,6 +3271,10 @@ enum IoPath {
     /// `/proc/<pid>/mem`：位置就是地址。
     /// `/proc/<pid>/mem` 打开时的地址空间，已经释放时是 None。
     Mem(Option<Rc<RefCell<crate::mm::Mm>>>),
+    /// `/dev/kmsg`：按记录读写，读的位置在打开文件里（[`crate::klog::KmsgFile`]）。
+    Kmsg,
+    /// `/proc/kmsg`：syslog 的读。
+    ProcKmsg(Rc<RefCell<crate::klog::Klog>>),
     Local,
 }
 
@@ -3249,6 +3297,10 @@ fn io_path(f: &OpenFile) -> IoPath {
             mm,
             ..
         } => IoPath::Mem(mm.as_ref().and_then(std::rc::Weak::upgrade)),
+        FileKind::Device { kmsg: Some(_), .. } => IoPath::Kmsg,
+        FileKind::Proc {
+            klog: Some(log), ..
+        } => IoPath::ProcKmsg(log.clone()),
         _ => IoPath::Local,
     }
 }
@@ -3265,7 +3317,11 @@ pub(super) fn seekable(f: &OpenFile) -> bool {
 /// Linux 一样先于打开方式检查（只读打开的管道 pwrite 也是 ESPIPE），`O_PATH` 除外。
 fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     let path = io_path(f);
-    let seekable = matches!(path, IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_));
+    // /dev/kmsg、/proc/kmsg 的 pread、pwrite 不看偏移，与 read、write 一样
+    let seekable = matches!(
+        path,
+        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Kmsg | IoPath::ProcKmsg(_)
+    );
     if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
         return Err(Errno::ESPIPE);
     }
@@ -3389,7 +3445,7 @@ pub(super) fn splice(
             FileKind::Regular { .. }
                 | FileKind::Pipe(_)
                 | FileKind::Socket(_)
-                | FileKind::Device { .. }
+                | FileKind::Device { kmsg: None, .. }
                 | FileKind::Pty(_)
                 | FileKind::Proc { .. }
                 | FileKind::Host(_)
@@ -3594,6 +3650,92 @@ fn pipe_write(
     }
 }
 
+/// `/dev/kmsg` 的读（`devkmsg_read`）：一次读一条记录（[`crate::klog::Klog::ext_text`]），
+/// 没有新的记录时等（非阻塞时 EAGAIN）。要读的那条已经被挤掉时是 EPIPE，位置跳到最老的
+/// 一条；缓冲区放不下这条是 EINVAL，这条也算读过了，与 Linux 相同。
+fn kmsg_read(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    loop {
+        let object = {
+            let mut f = file.borrow_mut();
+            let FileKind::Device {
+                kmsg: Some(user), ..
+            } = &mut f.kind
+            else {
+                return Err(Errno::EBADF);
+            };
+            let log = user.log.clone();
+            let l = log.borrow();
+            if let Some(r) = l.ext_text(user.seq) {
+                if r.seq != user.seq {
+                    user.seq = r.seq;
+                    return Err(Errno::EPIPE);
+                }
+                user.seq = r.seq + 1;
+                if r.text.len() > buf.len() {
+                    return Err(Errno::EINVAL);
+                }
+                buf[..r.text.len()].copy_from_slice(&r.text);
+                return Ok(r.text.len());
+            }
+            wake::of(&*log)
+        };
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(object)?;
+    }
+}
+
+/// `/dev/kmsg` 的写（`devkmsg_write`）：一次写是一条记录（[`crate::klog::KmsgFile::write`]），
+/// 超过 `LOG_LINE_MAX` 是 EINVAL；没有前缀时的级别是 `/proc/sys/kernel/printk` 的默认
+/// 消息级别。
+fn kmsg_write(cx: &mut Cx<'_>, file: &FileRef, data: &[u8]) -> Result<usize, Errno> {
+    if data.len() > crate::klog::LOG_LINE_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let level = cx.kr().printk[1];
+    if let FileKind::Device {
+        kmsg: Some(user), ..
+    } = &mut file.borrow_mut().kind
+    {
+        user.write(data, level);
+    }
+    Ok(data.len())
+}
+
+/// `/proc/kmsg` 的读（`kmsg_read`）：syslog 的读，与 syslog(2) 共用读的位置，读走就没了；
+/// 非阻塞时没有未读的记录是 EAGAIN。
+fn proc_kmsg_read(
+    cx: &mut Cx<'_>,
+    log: &Rc<RefCell<crate::klog::Klog>>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    if nonblock && log.borrow_mut().size_unread(true) == 0 {
+        return Err(Errno::EAGAIN);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    while !log.borrow().syslog_readable() {
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(wake::of(&**log))?;
+    }
+    let text = log.borrow_mut().syslog_read(buf.len());
+    buf[..text.len()].copy_from_slice(&text);
+    Ok(text.len())
+}
+
 /// 仓库里的文件和设备：不会阻塞，直接在持有借用时完成。
 /// 普通文件的宿主 fd：读写它时可以放开 BKL（[`unlocked_io`]）。
 fn regular_fd(f: &OpenFile) -> Option<i32> {
@@ -3657,6 +3799,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
                 appine_hal::fill_random(buf).map_err(Errno)?;
                 buf.len()
             }
+            Device::Kmsg => return Err(Errno::EBADF),
         },
         // 命名空间（nsfs）读不了
         FileKind::Proc {
@@ -3763,6 +3906,8 @@ fn read_bytes(
             }
             Ok(n)
         }
+        IoPath::Kmsg => kmsg_read(cx, file, nonblock, buf),
+        IoPath::ProcKmsg(log) => proc_kmsg_read(cx, &log, nonblock, buf),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
             let n = pseudo::read_mem(mm, buf, pos)?;
@@ -3815,6 +3960,9 @@ fn write_bytes(
         IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {
             Err(Errno::EINVAL)
         }
+        IoPath::Kmsg => kmsg_write(cx, file, data),
+        // 只读打开（没有 proc_write）
+        IoPath::ProcKmsg(_) => Err(Errno::EBADF),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
             let sync = cx.task.sync.clone();
@@ -4038,7 +4186,7 @@ pub(super) fn read_file(
     // 终端、管道每次 read 只返回已经就绪的数据，不能为了凑满缓冲区再次阻塞
     let fill = matches!(
         file.borrow().kind,
-        FileKind::Regular { .. } | FileKind::Proc { .. }
+        FileKind::Regular { .. } | FileKind::Proc { klog: None, .. }
     );
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;
@@ -4086,6 +4234,10 @@ pub(super) fn write_file(
     positional(&file.borrow(), offset)?;
     if !file.borrow().writable() {
         return Err(Errno::EBADF);
+    }
+    // write(2) 不跳过长度 0 的写：/dev/kmsg 因此记一条空记录
+    if len == 0 && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
+        return kmsg_write(cx, file, &[]).map(|n| n as u64);
     }
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;
@@ -4431,6 +4583,29 @@ pub(super) fn vectored(
     write: bool,
 ) -> SysResult {
     let file = cx.fds().get(fd)?;
+    // /dev/kmsg 的 write_iter：整个 writev 是一条记录（systemd 这样写日志）
+    if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
+        let vecs = iovecs(cx, iov, count)?;
+        let total: usize = vecs.iter().map(|&(_, len)| len).sum();
+        if !file.borrow().writable() {
+            return Err(Errno::EBADF);
+        }
+        // writev 总长为 0 时不调用文件的写（do_iter_write）
+        if total == 0 {
+            return Ok(0);
+        }
+        if total > crate::klog::LOG_LINE_MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut data = Vec::new();
+        for (base, len) in vecs {
+            let start = data.len();
+            data.resize(start + len, 0);
+            cx.mm()
+                .read(UserSlice::new(base, len), &mut data[start..])?;
+        }
+        return kmsg_write(cx, &file, &data).map(|n| n as u64);
+    }
     let mut total = 0;
     for (base, len) in iovecs(cx, iov, count)? {
         let at = offset.map(|o| o + total);

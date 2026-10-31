@@ -76,13 +76,15 @@ pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
 /// 结束撞上 bug 的线程所在的进程：报告 `what`，用 SIGSEGV 结束整个线程组。`pc` 是这个
 /// 线程最后一次进入内核时的 guest pc。
 pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
-    eprintln!(
+    let report = format!(
         "appine: internal error in pid {} ({}), thread {}, last guest pc {pc:#x}: {what}; \
          killed the process with SIGSEGV",
         task.tgid,
         crate::pseudo::comm_str(Some(task), task.tgid),
         task.tid.get(),
     );
+    eprintln!("{report}");
+    log(k, &report);
     task.killed.set(true);
     segv(k, task.tgid);
 }
@@ -93,11 +95,22 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
         let first = g.borrow().threads.first().copied();
         first.and_then(|t| k.tasks.get(&t).cloned())
     });
-    eprintln!(
+    let report = format!(
         "appine: internal error in pid {tgid} ({}): {what}; killed the process with SIGSEGV",
         crate::pseudo::comm_str(task.as_deref(), tgid),
     );
+    eprintln!("{report}");
+    log(k, &report);
     segv(k, tgid);
+}
+
+/// 结束进程的报告也记进内核日志（[`crate::klog`]），guest 里用 `dmesg` 看得到进程为什么
+/// 以 SIGSEGV 结束。Linux 的 oops 用 KERN_EMERG，那是整个内核出了错；这里只结束一个进程，
+/// 与 OOM killer 结束进程一样用 KERN_ERR。报告里的换行（panic 的消息可能有）各成一行。
+fn log(k: &Kernel, report: &str) {
+    for line in report.lines() {
+        crate::klog::printk(&k.klog, crate::klog::level::ERR, format_args!("{line}"));
+    }
 }
 
 /// 报告一个不能归到某个 guest 进程上的 bug。

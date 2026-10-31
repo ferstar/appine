@@ -7,7 +7,8 @@ use crate::cred::{cap, secbit};
 use crate::errno::Errno;
 use crate::futex::{Enqueued, Key};
 use crate::itimer::{CpuTimer, ITimer};
-use crate::kernel::Cx;
+use crate::kernel::{Cx, wake};
+use crate::klog;
 use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Rusage, Signal};
 use crate::uaccess::UserSlice;
 
@@ -566,29 +567,75 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
     result
 }
 
-/// syslog(2)（klogctl）：appine 没有内核日志，日志总是空的。权限与 Linux 6.1 的
-/// `check_syslog_permissions` 相同：`dmesg_restrict` 为 0 时谁都能读全部和问缓冲区大小，
-/// 别的动作（和 `dmesg_restrict` 为 1 时的所有动作）要开机时的命名空间里的 `CAP_SYSLOG`
-/// 或 `CAP_SYS_ADMIN`，先于参数检查。控制台的日志级别照常记下（`/proc/sys/kernel/printk`），
-/// 只是没有控制台可打印。
+/// syslog(2)（klogctl），内容见 [`crate::klog`]。
 pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResult {
-    const SYSLOG_ACTION_READ: i32 = 2;
-    const SYSLOG_ACTION_READ_ALL: i32 = 3;
-    const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
-    const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
-    /// `log_buf_len`：CONFIG_LOG_BUF_SHIFT 的默认值 17。
-    const LOG_BUF_LEN: u64 = 1 << 17;
+    do_syslog(cx, kind, buf, len, false)
+}
+
+pub(crate) mod syslog_action {
+    pub const CLOSE: i32 = 0;
+    pub const OPEN: i32 = 1;
+    pub const READ: i32 = 2;
+    pub const READ_ALL: i32 = 3;
+    pub const READ_CLEAR: i32 = 4;
+    pub const CLEAR: i32 = 5;
+    pub const SIZE_UNREAD: i32 = 9;
+    pub const SIZE_BUFFER: i32 = 10;
+}
+
+/// 权限（`check_syslog_permissions`），先于参数检查：`dmesg_restrict` 为 0 时谁都能读全部
+/// 和问缓冲区大小，别的动作（和 `dmesg_restrict` 为 1 时的所有动作）要开机时的命名空间里的
+/// `CAP_SYSLOG`；只有 `CAP_SYS_ADMIN` 也行，但第一次时记一条警告。`/proc/kmsg` 打开时查过
+/// 了，之后的读不再查（`from_proc`）。`/dev/kmsg` 读方式打开时按读全部查。
+pub(crate) fn check_syslog_permissions(cx: &Cx<'_>, kind: i32, from_proc: bool) -> SysResult {
+    use syslog_action::*;
+    if from_proc && kind != OPEN {
+        return Ok(0);
+    }
+    let restricted = cx.kr().dmesg_restrict || (kind != READ_ALL && kind != SIZE_BUFFER);
+    if !restricted {
+        return Ok(0);
+    }
+    let cred = cx.cred();
+    if cred.capable(cap::SYSLOG) {
+        return Ok(0);
+    }
+    if !cred.capable(cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let log = cx.kr().klog.clone();
+    if !std::mem::replace(&mut log.borrow_mut().sys_admin_warned, true) {
+        let comm = crate::pseudo::comm_str(Some(cx.task), cx.tgid());
+        klog::printk(
+            &log,
+            klog::level::WARNING,
+            format_args!(
+                "printk: {comm} ({}): Attempt to access syslog with CAP_SYS_ADMIN but no \
+                 CAP_SYSLOG (deprecated).",
+                cx.tid()
+            ),
+        );
+    }
+    Ok(0)
+}
+
+/// syslog(2) 和 `/proc/kmsg`（`from_proc`）的各个动作（`do_syslog`）：读（2）等到有记录、
+/// 读走（与 `/proc/kmsg` 共用位置），读全部（3）、读后清空（4）不改变读的位置，清空（5）只
+/// 影响读全部，未读的字节数（9，`/proc/kmsg` 用它时是记录数），缓冲区大小（10）。打开、
+/// 关闭没有作用。控制台的开关和级别（6、7、8）照常记下（`/proc/sys/kernel/printk`），只是
+/// 没有控制台可打印。
+pub(crate) fn do_syslog(
+    cx: &mut Cx<'_>,
+    kind: i32,
+    buf: u64,
+    len: i32,
+    from_proc: bool,
+) -> SysResult {
+    use syslog_action::*;
     /// arm64 的 `TASK_SIZE_MAX`（48 位地址）：`access_ok` 只看地址范围。
     const TASK_SIZE_MAX: u64 = 1 << 48;
 
-    let restricted = cx.kr().dmesg_restrict
-        || (kind != SYSLOG_ACTION_READ_ALL && kind != SYSLOG_ACTION_SIZE_BUFFER);
-    if restricted {
-        let cred = cx.cred();
-        if !cred.capable(cap::SYSLOG) && !cred.capable(cap::SYS_ADMIN) {
-            return Err(Errno::EPERM);
-        }
-    }
+    check_syslog_permissions(cx, kind, from_proc)?;
     let check_buf = || -> Result<bool, Errno> {
         if buf == 0 || len < 0 {
             return Err(Errno::EINVAL);
@@ -602,20 +649,35 @@ pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResul
         }
         Ok(len > 0)
     };
+    let log = cx.kr().klog.clone();
     match kind {
-        // 关闭、打开、清空、未读的字节数
-        0 | 1 | 5 | 9 => Ok(0),
-        // 没有新的日志：一直等到被信号打断
-        SYSLOG_ACTION_READ => {
+        CLOSE | OPEN => Ok(0),
+        READ => {
             if !check_buf()? {
                 return Ok(0);
             }
-            while !cx.interrupted() {
-                cx.wait_alone(None)?;
+            while !log.borrow().syslog_readable() {
+                if cx.interrupted() {
+                    return Err(Errno::ERESTARTSYS);
+                }
+                cx.wait_object(wake::of(&*log))?;
             }
-            Err(Errno::ERESTARTSYS)
+            let text = log.borrow_mut().syslog_read(len as usize);
+            cx.mm().write(UserSlice::new(buf, text.len()), &text)?;
+            Ok(text.len() as u64)
         }
-        SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => check_buf().map(|_| 0),
+        READ_ALL | READ_CLEAR => {
+            if !check_buf()? {
+                return Ok(0);
+            }
+            let text = log.borrow_mut().read_all(len as usize, kind == READ_CLEAR);
+            cx.mm().write(UserSlice::new(buf, text.len()), &text)?;
+            Ok(text.len() as u64)
+        }
+        CLEAR => {
+            log.borrow_mut().clear();
+            Ok(0)
+        }
         // 关掉控制台：存下现在的级别（还没存过时），换成最低级别
         6 => {
             let k = cx.k();
@@ -641,7 +703,8 @@ pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResul
             k.saved_console_loglevel = None;
             Ok(0)
         }
-        SYSLOG_ACTION_SIZE_BUFFER => Ok(LOG_BUF_LEN),
+        SIZE_UNREAD => Ok(log.borrow_mut().size_unread(from_proc)),
+        SIZE_BUFFER => Ok(klog::LOG_BUF_LEN as u64),
         _ => Err(Errno::EINVAL),
     }
 }
