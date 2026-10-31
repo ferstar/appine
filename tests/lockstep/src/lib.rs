@@ -177,7 +177,7 @@ pub fn run(_config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
 mod runner {
     use std::ptr::NonNull;
 
-    use appine_engine::{Cpu, Dbt, DbtRegs, Exit, Mmu, guest_hwcap, prot};
+    use appine_engine::{Cpu, Dbt, DbtRegs, Exit, Mmu, prot};
 
     use super::*;
     use crate::classes::{CLASSES, Case, Class, DATA_BYTES, Env, Gen};
@@ -437,7 +437,7 @@ mod runner {
             stricter: 0,
             tier1_fallback: 0,
             tier1_grouped: 0,
-            skipped: guest_hwcap() & class.requires != class.requires,
+            skipped: crate::classes::guest_caps() & class.requires != class.requires,
         };
         if report.skipped {
             return Ok(report);

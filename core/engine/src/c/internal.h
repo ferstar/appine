@@ -252,6 +252,9 @@ void appine_guard_drop(void);
 /* guest 特性集合是否包含 hwcap 里的全部位 */
 bool appine_has(uint64_t hwcap);
 
+/* 同上，AT_HWCAP2 的位 */
+bool appine_has2(uint64_t hwcap2);
+
 /* EL0 读取 ID 寄存器空间时的值；key 是 MRS 编码的 bits 20:5，不在该空间时返回 false */
 bool appine_id_register(unsigned key, uint64_t *value);
 

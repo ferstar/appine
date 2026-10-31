@@ -2317,19 +2317,40 @@ fn mangle(s: &[u8]) -> Vec<u8> {
 }
 
 /// `/proc/cpuinfo` 里 HWCAP 各位的名字（Linux 6.1 的 `hwcap_str`），按位的顺序。
-const HWCAP_NAMES: [&str; 21] = [
+const HWCAP_NAMES: [&str; 22] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
     "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
-    "asimddp",
+    "asimddp", "sha512",
+];
+
+/// 同上，HWCAP2 各位的名字，排在 HWCAP 的后面。
+const HWCAP2_NAMES: [&str; 14] = [
+    "dcpodp",
+    "sve2",
+    "sveaes",
+    "svepmull",
+    "svebitperm",
+    "svesha3",
+    "svesm4",
+    "flagm2",
+    "frint",
+    "svei8mm",
+    "svef32mm",
+    "svef64mm",
+    "svebf16",
+    "i8mm",
 ];
 
 fn cpuinfo() -> String {
-    let hwcap = appine_engine::guest_hwcap();
-    let features: Vec<&str> = HWCAP_NAMES
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| hwcap & (1 << i) != 0)
-        .map(|(_, n)| *n)
+    let named = |names: &'static [&'static str], caps: u64| {
+        names
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| caps & (1 << i) != 0)
+            .map(|(_, n)| *n)
+    };
+    let features: Vec<&str> = named(&HWCAP_NAMES, appine_engine::guest_hwcap())
+        .chain(named(&HWCAP2_NAMES, appine_engine::guest_hwcap2()))
         .collect();
     let midr = appine_engine::guest_midr();
     let mut s = String::new();

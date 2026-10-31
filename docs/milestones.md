@@ -143,6 +143,7 @@
 | [M9 之前：setns 经由 pidfd](rounds/132-setns-pidfd.md) | 2026-10-31 | setns 接受 pidfd，按 Linux 的顺序逐个检查、全部通过才一起换成那个进程的几种命名空间，一起进用户命名空间时按那里的能力算：util-linux 2.41 起的 `nsenter -t`（Alpine 3.24、Debian 13）原来每次都失败，现在能用；多线程进 time 命名空间是 EUSERS |
 | [M9 之前：点积指令 ASIMDDP](rounds/133-asimddp.md) | 2026-10-31 | 宿主有点积指令时宣告 ASIMDDP（HWCAP、ID 寄存器、cpuinfo），SDOT、UDOT 由原生指令桩执行、Tier 1 原样拷贝；libvpx 的 VP9 编码在 appine 里快 4.5%（原生 11%） |
 | [M9 之前：task 目录的 children](rounds/134-task-children.md) | 2026-10-31 | `/proc/<pid>/task/<tid>/children` 列出线程建的子进程：子进程记着父线程，那个线程退出时转给进程里还活着的线程、排到最后，过继、`CLONE_PARENT`、非主线程 exec 都与 Linux 相同 |
+| [M9 之前：SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md) | 2026-10-31 | 宿主有时宣告 SHA3、SHA512（两者一起）和 I8MM（`AT_HWCAP2` 不再总是 0），放行它们的编码；OpenSSL 的 SHA-512 在 appine 里快 4.1 倍，与原生持平 |
 
 ## 测量条件
 
@@ -199,3 +200,4 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | [同一个程序共用翻译](rounds/108-shared-translation.md) | shell 起进程 | 1.13×（原来 1.6×） |
 | [Go 换一组被占用的寄存器](rounds/113-go-registers.md) | `go build` 冷编译 | 2.6×（默认的一组 2.7×） |
 | [点积指令 ASIMDDP](rounds/133-asimddp.md) | `vpxenc` VP9 编码（单线程，360p 60 帧） | 2.2×（不宣告点积时 2.3×） |
+| [SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md) | Python `hashlib.sha512`（32 MiB） | 1.0×（不宣告 SHA512 时 4.1×） |

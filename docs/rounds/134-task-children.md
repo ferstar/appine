@@ -1,6 +1,6 @@
 # M9 之前：task 目录的 children（2026-10-31）
 
-← [M9 之前：点积指令 ASIMDDP（2026-10-31）](133-asimddp.md) · [索引](../milestones.md)
+← [M9 之前：点积指令 ASIMDDP（2026-10-31）](133-asimddp.md) · [索引](../milestones.md) · [M9 之前：SHA3、SHA512 和 I8MM（2026-10-31）](135-sha3-sha512-i8mm.md) →
 
 [setns 经由 pidfd](132-setns-pidfd.md)那一轮写测试时发现没有 `/proc/<pid>/task/<tid>/children`（Linux 的 `CONFIG_PROC_CHILDREN`，3.5 起，Debian、Ubuntu 的内核都打开）。它列出这个线程的直接子进程，是为 CRIU 遍历进程树加的；进程在 fork、退出时它可能漏掉一些，所以 ps、pstree、`pgrep -P`、psutil 都扫 `/proc/*/stat` 的父进程号，差分测试镜像里的程序没有一个读它，用得到的主要是手写的脚本（`cat /proc/$pid/task/*/children` 找子进程、递归结束一棵进程树）。原来 appine 里是 ENOENT，这样的脚本会当作没有子进程。
 

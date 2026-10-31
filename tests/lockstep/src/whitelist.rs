@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use appine_engine::{Cpu, Exit, Mmu, hwcap};
+use appine_engine::{Cpu, Exit, Mmu, hwcap, hwcap2};
 
 use crate::rng::Rng;
 
@@ -89,7 +89,7 @@ pub fn find_llvm_mc() -> Option<PathBuf> {
 }
 
 /// guest 特性集合对应的 LLVM `-mattr`。
-fn mattr(caps: u64) -> String {
+fn mattr(caps: u64, caps2: u64) -> String {
     let mut attrs = vec!["-fullfp16".to_string()];
     let flag = |on: bool, name: &str| format!("{}{name}", if on { '+' } else { '-' });
     attrs.push(flag(caps & hwcap::FP != 0, "fp-armv8"));
@@ -99,6 +99,9 @@ fn mattr(caps: u64) -> String {
     attrs.push(flag(caps & hwcap::CRC32 != 0, "crc"));
     attrs.push(flag(caps & hwcap::ATOMICS != 0, "lse"));
     attrs.push(flag(caps & hwcap::ASIMDDP != 0, "dotprod"));
+    // LLVM 的 sha3 同时管 SHA3 和 SHA512，guest 也总是一起宣告
+    attrs.push(flag(caps & hwcap::SHA3 != 0, "sha3"));
+    attrs.push(flag(caps2 & hwcap2::I8MM != 0, "i8mm"));
     attrs.join(",")
 }
 
@@ -167,6 +170,7 @@ pub fn check(
     limit: usize,
 ) -> (Vec<SpaceReport>, Vec<Disagreement>) {
     let caps = appine_engine::guest_hwcap();
+    let caps2 = appine_engine::guest_hwcap2();
     let dir = std::env::temp_dir();
     let mmu = Mmu::new();
     // SAFETY: mmu 比 cpu 先声明、后析构
@@ -178,7 +182,7 @@ pub fn check(
         let insns: Vec<u32> = (0..samples)
             .map(|_| (g.next_u64() as u32 & !space.mask) | space.value)
             .collect();
-        let restricted = disassemble(llvm_mc, &insns, &mattr(caps), &dir);
+        let restricted = disassemble(llvm_mc, &insns, &mattr(caps, caps2), &dir);
         let mut disagree = Vec::new();
         let mut defined = 0;
         for (k, &insn) in insns.iter().enumerate() {

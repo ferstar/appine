@@ -179,6 +179,7 @@ unsafe extern "C" {
     fn appine_host_fault_last(out: *mut RawHostFault);
 
     fn appine_guest_hwcap() -> u64;
+    fn appine_guest_hwcap2() -> u64;
     fn appine_guest_midr() -> u64;
 
     fn appine_dbt_new(key: u64, regs: DbtRegs) -> *mut RawDbt;
@@ -800,6 +801,11 @@ pub fn guest_hwcap() -> u64 {
     unsafe { appine_guest_hwcap() }
 }
 
+/// 宣告给 guest 的 `AT_HWCAP2`，规则与 [`guest_hwcap`] 相同。
+pub fn guest_hwcap2() -> u64 {
+    unsafe { appine_guest_hwcap2() }
+}
+
 /// guest 读到的 `MIDR_EL1`（`/proc/cpuinfo` 用）；宿主不允许读 ID 寄存器时为 0。
 pub fn guest_midr() -> u64 {
     unsafe { appine_guest_midr() }
@@ -825,8 +831,18 @@ pub mod hwcap {
     pub const ATOMICS: u64 = 1 << 8;
     /// EL0 可以读取 ID 寄存器。
     pub const CPUID: u64 = 1 << 11;
+    /// SHA3 指令（EOR3、RAX1、XAR、BCAX）。
+    pub const SHA3: u64 = 1 << 17;
     /// Advanced SIMD 的点积指令（SDOT、UDOT）。
     pub const ASIMDDP: u64 = 1 << 20;
+    /// SHA512 指令。
+    pub const SHA512: u64 = 1 << 21;
+}
+
+/// `AT_HWCAP2` 的位，取值与 Linux 的 `HWCAP2_*` 一致。
+pub mod hwcap2 {
+    /// int8 矩阵乘（SMMLA、UMMLA、USMMLA、USDOT、SUDOT）。
+    pub const I8MM: u64 = 1 << 13;
 }
 
 /// 校验 [`CpuState`] 与 C 结构体的布局是否一致。

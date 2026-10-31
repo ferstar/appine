@@ -5,7 +5,7 @@
 
 use std::ptr::NonNull;
 
-use appine_engine::{Access, Cpu, Exit, FaultKind, Mmu, PAGE_SIZE, hwcap, prot};
+use appine_engine::{Access, Cpu, Exit, FaultKind, Mmu, PAGE_SIZE, hwcap, hwcap2, prot};
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -248,7 +248,8 @@ fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
         0x4e421420, // fadd v0.8h, v1.8h, v2.8h：FP16 不在白名单内
-        0x4e829c20, // usdot v0.4s, v1.16b, v2.16b：I8MM 不在白名单内
+        0x6e42fc20, // bfdot v0.4s, v1.8h, v2.8h：BF16 不在白名单内
+        0xcec08420, // sm4e v0.4s, v1.4s：SM4 不在白名单内
         0x4f42e020, // 按元素的 sdot 要 32 位的元素（size = 01 未定义）
         0xb8bfc020, // ldapr w0, [x1]：LRCPC 不在白名单内
         0x00000000, // udf #0
@@ -324,8 +325,64 @@ fn id_registers_match_hwcap() {
     let caps = appine_engine::guest_hwcap();
     assert_eq!(caps & hwcap::CRC32 != 0, (isar0 >> 16) & 0xf == 1);
     assert_eq!(caps & hwcap::ATOMICS != 0, (isar0 >> 20) & 0xf == 2);
-    assert_eq!(caps & hwcap::SHA2 != 0, (isar0 >> 12) & 0xf == 1);
+    let sha2 = if caps & hwcap::SHA512 != 0 { 2 } else { 1 };
+    assert_eq!(caps & hwcap::SHA2 != 0, (isar0 >> 12) & 0xf == sha2);
+    assert_eq!(caps & hwcap::SHA3 != 0, (isar0 >> 32) & 0xf == 1);
     assert_eq!(caps & hwcap::ASIMDDP != 0, (isar0 >> 44) & 0xf == 1);
+    // SHA3、SHA512 只一起宣告
+    assert_eq!(caps & hwcap::SHA3 != 0, caps & hwcap::SHA512 != 0);
+    g.step(0xd5380620); // mrs x0, id_aa64isar1_el1
+    let i8mm = appine_engine::guest_hwcap2() & hwcap2::I8MM != 0;
+    assert_eq!(i8mm, (g.x(0) >> 52) & 0xf == 1);
+}
+
+#[test]
+fn sha3_and_i8mm_follow_the_feature_set() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let eor3 = 0xce020c20; // eor3 v0.16b, v1.16b, v2.16b, v3.16b
+    let smmla = 0x4e85a483; // smmla v3.4s, v4.16b, v5.16b
+    if appine_engine::guest_hwcap() & hwcap::SHA3 == 0 {
+        assert_eq!(g.cpu.exec_insn(eor3), Some(Exit::Undefined { insn: eor3 }));
+    } else {
+        let s = g.cpu.state_mut();
+        s.v[1] = [0x0f0f_0f0f_0f0f_0f0f, 1];
+        s.v[2] = [0x00ff_00ff_00ff_00ff, 2];
+        s.v[3] = [0x3333_3333_3333_3333, 4];
+        g.step(eor3);
+        assert_eq!(
+            g.cpu.state().v[0],
+            [
+                0x0f0f_0f0f_0f0f_0f0f ^ 0x00ff_00ff_00ff_00ff ^ 0x3333_3333_3333_3333,
+                7
+            ]
+        );
+    }
+    if appine_engine::guest_hwcap2() & hwcap2::I8MM == 0 {
+        assert_eq!(
+            g.cpu.exec_insn(smmla),
+            Some(Exit::Undefined { insn: smmla })
+        );
+        return;
+    }
+    // 2x8 乘 8x2：v4 的两行是 1..=8 和全 -1，v5 的两列是全 1 和 0、1、0、1……
+    let row0: Vec<u8> = (1..=8).collect();
+    let s = g.cpu.state_mut();
+    s.v[3] = [100, 0];
+    s.v[4] = [u64::from_le_bytes(row0.try_into().unwrap()), u64::MAX];
+    s.v[5] = [0x0101_0101_0101_0101, 0x0100_0100_0100_0100];
+    g.step(smmla);
+    let v = g.cpu.state().v[3];
+    let lanes = [
+        v[0] as u32 as i32,
+        (v[0] >> 32) as i32,
+        v[1] as u32 as i32,
+        (v[1] >> 32) as i32,
+    ];
+    // [r0·c0 + 100, r0·c1, r1·c0, r1·c1] = [36 + 100, 2 + 4 + 6 + 8, -8, -4]
+    assert_eq!(lanes, [136, 20, -8, -4]);
 }
 
 #[test]

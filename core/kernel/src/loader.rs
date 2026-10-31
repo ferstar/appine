@@ -695,7 +695,7 @@ pub fn load_prepared(
         (AT_EGID, args.ids[3] as u64),
         (AT_SECURE, args.secure as u64),
         (AT_RANDOM, 0),
-        (AT_HWCAP2, 0),
+        (AT_HWCAP2, appine_engine::guest_hwcap2()),
         (AT_EXECFN, 0),
         (AT_PLATFORM, 0),
     ];
@@ -1053,6 +1053,7 @@ mod tests {
         assert_eq!(aux[&AT_PAGESZ], PAGE_SIZE);
         assert_eq!(aux[&AT_ENTRY], 0x400078);
         assert_eq!(aux[&AT_HWCAP], appine_engine::guest_hwcap());
+        assert_eq!(aux[&AT_HWCAP2], appine_engine::guest_hwcap2());
         assert_eq!(aux[&AT_PHDR], 0x400040);
         assert_eq!((aux[&AT_PHENT], aux[&AT_PHNUM]), (56, 1));
         assert_eq!(aux[&AT_BASE], 0);

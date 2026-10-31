@@ -3,7 +3,7 @@
  *
  * 数据处理指令：这里只做白名单判定，运算交给原生指令桩。白名单是 ARMv8.0
  * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2/
- * DotProd；FP16、RDM、FHM、FCMA、FRINTTS、JSCVT、BF16、I8MM、SHA3/SHA512/SM3/SM4
+ * SHA3/SHA512/DotProd/I8MM；FP16、RDM、FHM、FCMA、FRINTTS、JSCVT、BF16、SM3/SM4
  * 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
  * Floating-Point and Advanced SIMD" 编码表。
  *
@@ -247,6 +247,26 @@ static bool vec_shift_imm(uint32_t insn)
     }
 }
 
+/* 三寄存器扩展：DotProd 和 I8MM 的几条；RDM、FCMA、BF16 拒绝 */
+static bool vec_three_extra(uint32_t insn)
+{
+    unsigned q = BIT(insn, 30), u = BIT(insn, 29), size = FIELD(insn, 23, 22);
+    if (size != 2)
+        return false;
+    switch (FIELD(insn, 14, 11)) {
+    case 0x2: /* SDOT/UDOT (vector) */
+        return appine_has(APPINE_HWCAP_ASIMDDP);
+    case 0x3: /* USDOT (vector) */
+        return !u && appine_has2(APPINE_HWCAP2_I8MM);
+    case 0x4: /* SMMLA/UMMLA：只有 128 位的形式 */
+        return q && appine_has2(APPINE_HWCAP2_I8MM);
+    case 0x5: /* USMMLA */
+        return q && !u && appine_has2(APPINE_HWCAP2_I8MM);
+    default:
+        return false;
+    }
+}
+
 static bool vec_indexed(uint32_t insn)
 {
     unsigned q = BIT(insn, 30), u = BIT(insn, 29), size = FIELD(insn, 23, 22);
@@ -275,7 +295,9 @@ static bool vec_indexed(uint32_t insn)
         return !u && hs;
     case 0xe: /* SDOT/UDOT (by element) */
         return size == 2 && appine_has(APPINE_HWCAP_ASIMDDP);
-    default: /* RDM、FHM、I8MM 等 */
+    case 0xf: /* USDOT（size 10）、SUDOT（size 00）(by element)；BFDOT、BFMLAL 拒绝 */
+        return !u && (size == 0 || size == 2) && appine_has2(APPINE_HWCAP2_I8MM);
+    default: /* RDM、FHM 等 */
         return false;
     }
 }
@@ -515,6 +537,22 @@ static bool fp_scalar(uint32_t insn, struct native_desc *d)
 
 /* ---- 顶层 ---- */
 
+/* ---- 1100 开头的加密扩展：SHA3（EOR3、BCAX、RAX1、XAR）、SHA512；SM3、SM4 拒绝 ---- */
+
+static bool crypto_ext(uint32_t insn)
+{
+    bool sha3 = appine_has(APPINE_HWCAP_SHA3), sha512 = appine_has(APPINE_HWCAP_SHA512);
+    if ((insn & 0xffc08000) == 0xce000000) /* EOR3、BCAX（四寄存器，SM3SS1 的 bit 22 是 1） */
+        return sha3;
+    if ((insn & 0xffe00000) == 0xce800000) /* XAR */
+        return sha3;
+    if ((insn & 0xffe0f000) == 0xce608000) /* SHA512H、SHA512H2、SHA512SU1；opcode 11 是 RAX1 */
+        return FIELD(insn, 11, 10) == 3 ? sha3 : sha512;
+    if ((insn & 0xfffffc00) == 0xcec08000) /* SHA512SU0 */
+        return sha512;
+    return false;
+}
+
 bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
 {
     unsigned op0 = FIELD(insn, 31, 28);
@@ -559,9 +597,8 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
             return vec_copy(insn, d);
         if ((insn & 0x9f200400) == 0x0e200400)
             return vec_three_same(insn);
-        if ((insn & 0x9f208400) == 0x0e008400) /* 三寄存器扩展：只有 SDOT/UDOT (vector) */
-            return FIELD(insn, 14, 11) == 0x2 && FIELD(insn, 23, 22) == 2 &&
-                   appine_has(APPINE_HWCAP_ASIMDDP);
+        if ((insn & 0x9f208400) == 0x0e008400)
+            return vec_three_extra(insn);
         if ((insn & 0x9f200c00) == 0x0e200000)
             return vec_three_different(insn);
         if ((insn & 0x9f3e0c00) == 0x0e200800)
@@ -576,7 +613,9 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
             return vec_indexed(insn);
         return false;
     }
-    return false; /* 1100 等：SHA512、SM3、SM4、EOR3、XAR 等扩展 */
+    if (op0 == 0xc)
+        return crypto_ext(insn);
+    return false;
 }
 
 /* ---- 访存 ---- */

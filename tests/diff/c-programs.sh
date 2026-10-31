@@ -1,7 +1,7 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
 # 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
-# 点积指令
+# 点积指令；SHA3、SHA512、I8MM
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -519,3 +519,84 @@ C
 gcc -O3 -march=armv8-a+dotprod -o dotprod dotprod.c && ./dotprod
 echo "sdot in the loop: $(gcc -O3 -march=armv8-a+dotprod -S -o - dotprod.c | grep -c 'sdot	v')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | grep -cw asimddp)"
+
+# SHA3（EOR3、BCAX、RAX1、XAR）、SHA512、I8MM（SMMLA、UMMLA、USMMLA、USDOT、SUDOT）：宿主有时
+# 宣告，HWCAP、HWCAP2、ID_AA64ISAR0_EL1 的 SHA2、SHA3 字段、ID_AA64ISAR1_EL1 的 I8MM 字段、
+# /proc/cpuinfo 一致，intrinsics 的结果相同。整个文件只加 +sha3+i8mm
+cat > crypto.c <<'C'
+#include <arm_neon.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/auxv.h>
+
+#define HWCAP_SHA3 (1 << 17)
+#define HWCAP_SHA512 (1 << 21)
+#define HWCAP2_I8MM (1 << 13)
+
+static void show8(const char *name, uint8x16_t v)
+{
+    uint8_t b[16];
+    vst1q_u8(b, v);
+    printf("%s", name);
+    for (int i = 0; i < 16; i++)
+        printf(" %02x", b[i]);
+    printf("\n");
+}
+
+static void show64(const char *name, uint64x2_t v)
+{
+    printf("%s %016llx %016llx\n", name, (unsigned long long)vgetq_lane_u64(v, 0),
+           (unsigned long long)vgetq_lane_u64(v, 1));
+}
+
+static void show32(const char *name, int32x4_t v)
+{
+    printf("%s %d %d %d %d\n", name, vgetq_lane_s32(v, 0), vgetq_lane_s32(v, 1),
+           vgetq_lane_s32(v, 2), vgetq_lane_s32(v, 3));
+}
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+    uint64_t isar0, isar1;
+    __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+    __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
+    printf("sha3 %d sha512 %d i8mm %d; SHA2 field %d, SHA3 field %d, I8MM field %d\n",
+           !!(hw & HWCAP_SHA3), !!(hw & HWCAP_SHA512), !!(hw2 & HWCAP2_I8MM),
+           (int)(isar0 >> 12 & 15), (int)(isar0 >> 32 & 15), (int)(isar1 >> 52 & 15));
+    uint8_t x[64];
+    for (int i = 0; i < 64; i++)
+        x[i] = i * 37 + 11;
+    uint8x16_t a = vld1q_u8(x), b = vld1q_u8(x + 16), c = vld1q_u8(x + 32);
+    uint64x2_t A = vreinterpretq_u64_u8(a), B = vreinterpretq_u64_u8(b), C = vreinterpretq_u64_u8(c);
+    if (hw & HWCAP_SHA3) {
+        show8("eor3", veor3q_u8(a, b, c));
+        show8("bcax", vbcaxq_u8(a, b, c));
+        show64("rax1", vrax1q_u64(A, B));
+        show64("xar", vxarq_u64(A, B, 23));
+    }
+    if (hw & HWCAP_SHA512) {
+        show64("sha512h", vsha512hq_u64(A, B, C));
+        show64("sha512h2", vsha512h2q_u64(A, B, C));
+        show64("sha512su0", vsha512su0q_u64(A, B));
+        show64("sha512su1", vsha512su1q_u64(A, B, C));
+    }
+    if (hw2 & HWCAP2_I8MM) {
+        int8x16_t sa = vreinterpretq_s8_u8(a), sb = vreinterpretq_s8_u8(b);
+        int32x4_t acc = {1, -2, 3000000, -2147483000};
+        uint32x4_t uacc = vreinterpretq_u32_s32(acc);
+        show32("smmla", vmmlaq_s32(acc, sa, sb));
+        show32("ummla", vreinterpretq_s32_u32(vmmlaq_u32(uacc, a, b)));
+        show32("usmmla", vusmmlaq_s32(acc, a, sb));
+        show32("usdot", vusdotq_s32(acc, a, sb));
+        show32("usdot 2s", vcombine_s32(vusdot_s32(vget_low_s32(acc), vget_low_u8(a), vget_low_s8(sb)),
+                                        vdup_n_s32(0)));
+        show32("usdot lane 2", vusdotq_laneq_s32(acc, a, sb, 2));
+        show32("sudot lane 3", vsudotq_laneq_s32(acc, sa, b, 3));
+    }
+    return 0;
+}
+C
+gcc -O2 -march=armv8-a+sha3+i8mm -o crypto crypto.c && ./crypto
+echo "instructions: $(gcc -O2 -march=armv8-a+sha3+i8mm -S -o - crypto.c | grep -cE '^	(eor3|bcax|rax1|xar|sha512h|sha512h2|sha512su0|sha512su1|smmla|ummla|usmmla|usdot|sudot)	')"
+echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'sha3|sha512|i8mm')"

@@ -5,9 +5,17 @@
 //! 寄存器相对数据区起点的偏移，由运行器换算成真实地址。PAC/BTI 等 hint 被有意
 //! 实现为 NOP（设计文档 §4.4），与硬件不同，所以也不在这里测。
 
-use appine_engine::hwcap;
+use appine_engine::{hwcap, hwcap2};
 
 use crate::rng::Rng;
+
+/// [`Class::requires`] 里 `AT_HWCAP2` 的位放在高 32 位（`AT_HWCAP` 只用到第 31 位）。
+pub const HWCAP2_I8MM: u64 = hwcap2::I8MM << 32;
+
+/// guest 的 `AT_HWCAP` 和左移 32 位的 `AT_HWCAP2`，与 [`Class::requires`] 比较。
+pub fn guest_caps() -> u64 {
+    appine_engine::guest_hwcap() | appine_engine::guest_hwcap2() << 32
+}
 
 /// 数据区大小（两页），与原生执行端一致。
 pub const DATA_BYTES: u64 = 8192;
@@ -60,7 +68,7 @@ pub struct Class {
     pub flaky: bool,
     /// 迭代次数是基准次数的几倍。
     pub weight: u64,
-    /// 只有 guest 特性集合包含这些 HWCAP 位时才运行。
+    /// 只有 guest 特性集合包含这些 HWCAP 位时才运行（HWCAP2 的见 [`HWCAP2_I8MM`]）。
     pub requires: u64,
     /// 生成方式。
     pub generate: Gen,
@@ -114,6 +122,8 @@ pub const CLASSES: &[Class] = &[
     case("lse", lse, hwcap::ATOMICS),
     case("crc32", crc32, hwcap::CRC32),
     case("dotprod", dotprod, hwcap::ASIMDDP),
+    case("sha3_sha512", sha3_sha512, hwcap::SHA3 | hwcap::SHA512),
+    case("i8mm", i8mm, HWCAP2_I8MM),
     Class {
         name: "fuzz_simd_fp",
         strict: false,
@@ -1074,6 +1084,37 @@ fn dotprod(g: &mut Rng, _: &Env) -> Case {
     } else {
         // 按元素：H:L 选 Vm 的第几个 32 位元素，M:Rm 是完整的寄存器号
         0x0f80_e000 | q_u | (g.bit() << 21) | (rm << 16) | (g.bit() << 11) | rn_rd
+    })
+}
+
+/// SHA3 的 EOR3、BCAX、XAR、RAX1，SHA512 的 SHA512H、SHA512H2、SHA512SU0、SHA512SU1。
+fn sha3_sha512(g: &mut Rng, _: &Env) -> Case {
+    let rn_rd = (reg(g) << 5) | reg(g);
+    let rm = reg(g) << 16;
+    Case::one(match g.bits(3) {
+        0 => 0xce00_0000 | rm | (reg(g) << 10) | rn_rd, // EOR3
+        1 => 0xce20_0000 | rm | (reg(g) << 10) | rn_rd, // BCAX
+        2 => 0xce80_0000 | rm | (g.bits(6) << 10) | rn_rd, // XAR
+        3 => 0xce60_8c00 | rm | rn_rd,                  // RAX1
+        4 => 0xcec0_8000 | rn_rd,                       // SHA512SU0
+        // SHA512H、SHA512H2、SHA512SU1
+        k => 0xce60_8000 | ((k - 5) << 10) | rm | rn_rd,
+    })
+}
+
+/// I8MM：SMMLA、UMMLA、USMMLA（只有 128 位）、USDOT 的向量形式，USDOT、SUDOT 的按元素形式。
+fn i8mm(g: &mut Rng, _: &Env) -> Case {
+    let q = g.bit() << 30;
+    let rn_rd = (reg(g) << 5) | reg(g);
+    let rm = reg(g) << 16;
+    let lane = (g.bit() << 21) | (g.bit() << 11);
+    Case::one(match g.bits(3) {
+        0 => 0x4e80_a400 | rm | rn_rd,                // SMMLA
+        1 => 0x6e80_a400 | rm | rn_rd,                // UMMLA
+        2 => 0x4e80_ac00 | rm | rn_rd,                // USMMLA
+        3 | 4 => 0x0e80_9c00 | q | rm | rn_rd,        // USDOT (vector)
+        5 | 6 => 0x0f80_f000 | q | lane | rm | rn_rd, // USDOT (by element)
+        _ => 0x0f00_f000 | q | lane | rm | rn_rd,     // SUDOT (by element)
     })
 }
 

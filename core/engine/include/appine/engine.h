@@ -155,10 +155,18 @@ struct appine_cpu {
 #define APPINE_HWCAP_CRC32 (UINT64_C(1) << 7)
 #define APPINE_HWCAP_ATOMICS (UINT64_C(1) << 8)
 #define APPINE_HWCAP_CPUID (UINT64_C(1) << 11)
+#define APPINE_HWCAP_SHA3 (UINT64_C(1) << 17)
 #define APPINE_HWCAP_ASIMDDP (UINT64_C(1) << 20)
+#define APPINE_HWCAP_SHA512 (UINT64_C(1) << 21)
+
+/* AT_HWCAP2 的位，取值与 Linux 的 HWCAP2_* 一致 */
+#define APPINE_HWCAP2_I8MM (UINT64_C(1) << 13)
 
 /* 宣告给 guest 的 AT_HWCAP：宿主支持 ∩ Tier 0 已实现 ∩ 白名单 */
 uint64_t appine_guest_hwcap(void);
+
+/* 宣告给 guest 的 AT_HWCAP2，规则同上 */
+uint64_t appine_guest_hwcap2(void);
 
 /* guest 读到的 MIDR_EL1（宿主不允许读 ID 寄存器时为 0） */
 uint64_t appine_guest_midr(void);
