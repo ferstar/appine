@@ -154,6 +154,7 @@
 | [M9 之前：/dev/kmsg 和内核日志](rounds/143-kmsg.md) | 2026-10-31 | 内核层有了自己的日志（6.1 的 printk 环形缓冲区）：`/dev/kmsg` 的读写、lseek、poll 和限速，syslog(2) 的各个动作、`/proc/kmsg`、`printk_devkmsg`；OOM killer 和内部错误结束进程记进去，guest 里 `dmesg` 看得到；差分测试的镜像不再带上仓库 /tmp 里的东西 |
 | [M9 之前：openat2](rounds/144-openat2.md) | 2026-10-31 | openat2 按 6.1 实现：`open_how` 和标志的检查，路径解析里的 `RESOLVE_BENEATH`、`IN_ROOT`、`NO_SYMLINKS`、`NO_MAGICLINKS`、`NO_XDEV`（含 `nd_jump_root` 在 nd->root 还没取过时的 EXDEV）；GNU tar 的新版本配 glibc ≥ 2.43 离不开它，bubblewrap 0.12 原来走退路 |
 | [M9 之前：termios2](rounds/145-termios2.md) | 2026-10-31 | `TCGETS2`、`TCSETS2`、`TCSETSW2`、`TCSETSF2` 和 termios 里的速率（按 `CBAUD`、`CIBAUD` 换算，`BOTHER`）：glibc 2.42 起 `tcgetattr`、`isatty`、`tcsetattr` 只用它们，Ubuntu 26.04 里原来每个终端都"不是终端"；PTY 总是 `CS8`、`CREAD`，地址位改不了 |
+| [M9 之前：PTY 的包模式](rounds/146-pty-packet-mode.md) | 2026-10-31 | 主设备的 `TIOCPKT`、`TIOCGPKT`：每次读先给一个状态字节（从设备这一边的清空、^S/^Q 停住和恢复、流控的开关、EXTPROC），有状态时 poll 带 POLLPRI；顺带补上 `TIOCGPTLCK`、`TIOCSIG`。GNU screen 原来一个窗口也开不了 |
 
 ## 测量条件
 

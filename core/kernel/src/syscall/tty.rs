@@ -14,7 +14,7 @@ use crate::fd::{FileKind, oflags};
 use crate::kernel::{Cx, Kernel, Tid, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigAction, SigInfo};
-use crate::tty::{PtyEnd, Termios, Tty, Winsize, cc, flags};
+use crate::tty::{PtyEnd, Termios, Tty, Winsize, cc, flags, pkt};
 
 const TCGETS: u32 = 0x5401;
 const TCSETS: u32 = 0x5402;
@@ -49,8 +49,14 @@ const TCGETS2: u32 = 0x802c_542a;
 const TCSETS2: u32 = 0x402c_542b;
 const TCSETSW2: u32 = 0x402c_542c;
 const TCSETSF2: u32 = 0x402c_542d;
+/// 主设备的包模式：设置、查询（[`crate::tty::pkt`]）。
+const TIOCPKT: u32 = 0x5420;
+const TIOCGPKT: u32 = 0x8004_5438;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
+const TIOCGPTLCK: u32 = 0x8004_5439;
+/// 经由主设备给从设备的前台进程组发信号（只能是 SIGINT、SIGQUIT、SIGTSTP）。
+const TIOCSIG: u32 = 0x4004_5436;
 
 /// 打开 `/dev/ptmx`：分配一对新的 PTY，返回主设备。从设备属于调用者的 fsuid 和 tty 组。
 pub(crate) fn open_ptmx(k: &mut Kernel, uid: u32) -> Result<FileKind, Errno> {
@@ -232,7 +238,8 @@ fn slave_write(
 }
 
 /// 主设备的读：取走输出。从设备打开过又全部关闭之后返回 EIO，主设备这一边被 TIOCVHANGUP
-/// 挂断了是 0。
+/// 挂断了是 0。包模式下（Linux 的 `n_tty_read`）有状态时只读到那一个状态字节，否则数据
+/// 前面加一个 `TIOCPKT_DATA`（也占读的长度）。
 fn master_read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -246,11 +253,22 @@ fn master_read(
             if t.hung(true, born) {
                 return Ok(0);
             }
-            let out = t.take_output(buf.len());
-            if !out.is_empty() {
-                buf[..out.len()].copy_from_slice(&out);
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if let Some(status) = t.take_pktstatus() {
+                buf[0] = status;
+                return Ok(1);
+            }
+            let head = t.packet as usize;
+            if t.has_output() {
+                let out = t.take_output(buf.len() - head);
+                if head == 1 {
+                    buf[0] = pkt::DATA;
+                }
+                buf[head..head + out.len()].copy_from_slice(&out);
                 request_wake_object(wake::of(tty));
-                return Ok(out.len());
+                return Ok(head + out.len());
             }
             if t.slaves == 0 && !t.locked {
                 return Err(Errno::EIO);
@@ -388,7 +406,9 @@ pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
             t.flush_output();
             None
         } else {
+            // Linux 的 tty_ldisc_hangup 清空从设备的输入，之后 __tty_hangup 丢掉包模式的状态
             t.flush_input();
+            t.pktstatus = 0;
             Some((t.session.take(), t.fg.take()))
         }
     };
@@ -455,6 +475,10 @@ pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
     } else if master {
         if tty.has_output() {
             ev |= POLLIN | POLLRDNORM;
+        }
+        if tty.packet && tty.pktstatus != 0 {
+            const POLLPRI: i16 = 0x002;
+            ev |= POLLPRI | POLLIN | POLLRDNORM;
         }
         if tty.input_room() > 0 {
             ev |= POLLOUT | POLLWRNORM;
@@ -539,7 +563,9 @@ pub(crate) fn ioctl(
             t.load_speeds();
             let mut tt = tty.borrow_mut();
             if matches!(request, TCSETSF | TCSETAF | TCSETSF2) {
+                // 两边都是清空从设备的输入（Linux 在 real_tty 上 set_termios）
                 tt.flush_input();
+                tt.report_flush(true, false);
             }
             tt.set_termios(t);
             request_wake_object(wake::of(tty));
@@ -576,6 +602,7 @@ pub(crate) fn ioctl(
                 if output {
                     t.flush_output();
                 }
+                t.report_flush(input, output);
             }
             request_wake_object(wake::of(tty));
             Ok(0)
@@ -635,6 +662,31 @@ pub(crate) fn ioctl(
         TIOCSPTLCK if master => {
             let lock = u32::from_le_bytes(get(cx, arg)?) != 0;
             tty.borrow_mut().locked = lock;
+            Ok(0)
+        }
+        TIOCGPTLCK if master => {
+            put(cx, arg, (tty.borrow().locked as i32).to_le_bytes()).map(|()| 0)
+        }
+        // 打开包模式时丢掉以前的状态（Linux 的 pty_set_pktmode）
+        TIOCPKT if master => {
+            let on = i32::from_le_bytes(get(cx, arg)?) != 0;
+            let mut t = tty.borrow_mut();
+            if on && !t.packet {
+                t.pktstatus = 0;
+            }
+            t.packet = on;
+            Ok(0)
+        }
+        TIOCGPKT if master => put(cx, arg, (tty.borrow().packet as i32).to_le_bytes()).map(|()| 0),
+        // Linux 的 pty_signal：发给从设备的前台进程组，与按键产生的一样是内核发的
+        TIOCSIG if master => {
+            let sig = match arg {
+                2 => Signal::INT,
+                3 => Signal::QUIT,
+                20 => Signal::TSTP,
+                _ => return Err(Errno::EINVAL),
+            };
+            signal_fg(cx.kr(), tty, sig);
             Ok(0)
         }
         TIOCGPGRP => {

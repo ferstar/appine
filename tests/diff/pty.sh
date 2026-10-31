@@ -133,3 +133,197 @@ termios.tcsetattr(s, termios.TCSANOW, a)
 show("tcsetattr b57600", s)
 print("isatty", os.isatty(s), os.isatty(m), os.isatty(r))
 PY
+
+# 包模式（TIOCPKT，Linux 的 pty_set_pktmode、n_tty_read、n_tty_poll）：主设备每次读先给
+# 一个状态字节。有状态（从设备的清空、^S/^Q 停住和恢复、流控的开关、EXTPROC 时 termios
+# 变了）时只读到它，否则是 TIOCPKT_DATA（0）加数据；有状态时 poll 带 POLLPRI。GNU screen
+# 打开每个窗口都要它，失败就不开窗口
+python3 - <<'PY'
+import errno, fcntl, functools, os, select, signal, struct, termios, time
+
+print = functools.partial(print, flush=True)
+TIOCPKT, TIOCGPKT, TIOCGPTLCK, TIOCSIG = 0x5420, 0x80045438, 0x80045439, 0x40045436
+EXTPROC = 0o200000
+NAMES = {select.POLLIN: "IN", select.POLLPRI: "PRI", select.POLLOUT: "OUT", select.POLLERR: "ERR",
+         select.POLLHUP: "HUP", select.POLLRDNORM: "RDNORM", select.POLLWRNORM: "WRNORM"}
+
+
+def err(f, *args):
+    try:
+        r = f(*args)
+        return "ok" if r is None else r
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def geti(fd, req):
+    return struct.unpack("i", fcntl.ioctl(fd, req, bytes(4)))[0]
+
+
+def pkt(fd, on):
+    return fcntl.ioctl(fd, TIOCPKT, struct.pack("i", on))
+
+
+def events(fd):
+    p = select.poll()
+    p.register(fd, select.POLLIN | select.POLLPRI | select.POLLOUT)
+    r = p.poll(0)
+    return "|".join(n for b, n in sorted(NAMES.items()) if r and r[0][1] & b) or "-"
+
+
+def wait(fd, pri=False):
+    # 原生上写进主设备的数据经由 flip buffer 异步交给行规程，等到它产生结果
+    select.select([] if pri else [fd], [], [fd] if pri else [], 5)
+
+
+def rd(fd, n=100):
+    try:
+        return os.read(fd, n)
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+def change(fd, f):
+    a = termios.tcgetattr(fd)
+    f(a)
+    termios.tcsetattr(fd, termios.TCSANOW, a)
+
+
+m, s = os.openpty()
+os.set_blocking(m, False)
+print("slave TIOCPKT", err(pkt, s, 1), "slave TIOCGPKT", err(geti, s, TIOCGPKT),
+      "slave TIOCGPTLCK", err(geti, s, TIOCGPTLCK), "slave TIOCSIG", err(fcntl.ioctl, s, TIOCSIG, 2))
+print("TIOCGPKT", geti(m, TIOCGPKT), "TIOCGPTLCK", geti(m, TIOCGPTLCK))
+print("bad pointer", err(fcntl.ioctl, m, TIOCPKT, 0))
+os.write(s, b"before")
+wait(m)
+print("plain read", rd(m))
+pkt(m, 1)
+print("TIOCGPKT on", geti(m, TIOCGPKT), "events", events(m), "empty read", rd(m), "zero read", rd(m, 0))
+os.write(s, b"hello\n")
+wait(m)
+print("events with data", events(m))
+print("one byte", rd(m, 1), "then", rd(m))
+print("select exc", select.select([], [], [m], 0)[2] == [])
+
+# 从设备这一边的清空：输入是 FLUSHREAD，输出是 FLUSHWRITE；主设备那边的不报告
+for name, q in [("TCIFLUSH", termios.TCIFLUSH), ("TCOFLUSH", termios.TCOFLUSH), ("TCIOFLUSH", termios.TCIOFLUSH)]:
+    termios.tcflush(s, q)
+    print("slave", name, events(m), select.select([], [], [m], 0)[2] == [m], rd(m), rd(m))
+termios.tcflush(m, termios.TCIOFLUSH)
+print("master TCIOFLUSH", events(m), rd(m))
+# TCSETSF 从哪一边都是清空从设备的输入
+termios.tcsetattr(m, termios.TCSAFLUSH, termios.tcgetattr(m))
+print("TCSAFLUSH via master", rd(m))
+termios.tcsetattr(s, termios.TCSADRAIN, termios.tcgetattr(s))
+print("TCSADRAIN", rd(m))
+
+# 停住、恢复：TCOOFF/TCOON 和 ^S/^Q；两个都发生过时只剩后一个
+termios.tcflow(s, termios.TCOOFF)
+print("TCOOFF", rd(m))
+termios.tcflow(s, termios.TCOOFF)
+print("TCOOFF again", rd(m))
+termios.tcflow(s, termios.TCOON)
+print("TCOON", rd(m))
+termios.tcflow(s, termios.TCOOFF)
+termios.tcflow(s, termios.TCOON)
+print("off and on", rd(m))
+os.write(m, b"\x13")
+wait(m, True)
+print("^S", rd(m))
+os.write(m, b"\x11")
+wait(m, True)
+print("^Q", rd(m), rd(m))
+termios.tcflow(m, termios.TCOOFF)
+termios.tcflow(m, termios.TCOON)
+print("master TCOOFF/TCOON", rd(m))
+
+# ^S/^Q 流控的开关：IXON、VSTOP、VSTART 都要是默认的才算
+change(s, lambda a: a.__setitem__(0, a[0] & ~termios.IXON))
+print("IXON off", rd(m))
+change(s, lambda a: a.__setitem__(0, a[0] & ~termios.IXON))
+print("again", rd(m))
+change(m, lambda a: a.__setitem__(0, a[0] | termios.IXON))
+print("IXON on via master", rd(m))
+
+
+def vstop(c):
+    def f(a):
+        a[6][termios.VSTOP] = c
+    return f
+
+
+change(s, vstop(b"\x01"))
+print("VSTOP changed", rd(m))
+change(s, vstop(b"\x13"))
+print("VSTOP back", rd(m))
+change(s, lambda a: a.__setitem__(3, a[3] | EXTPROC))
+print("EXTPROC on", rd(m))
+change(s, lambda a: a.__setitem__(1, a[1]))
+print("EXTPROC kept", rd(m))
+change(s, lambda a: a.__setitem__(3, a[3] & ~EXTPROC))
+print("EXTPROC off", rd(m), rd(m))
+
+# ^C：没有前台进程组也清空两边（没设 NOFLSH）。关掉回显：Linux 清空输出只清还在 flip
+# buffer 里的，回显什么时候到主设备那边说不准
+change(s, lambda a: a.__setitem__(3, a[3] & ~termios.ECHO))
+os.write(m, b"abc\x03")
+wait(m, True)
+print("^C", rd(m), "input left", fcntl.ioctl(s, termios.FIONREAD, bytes(4)) == bytes(4))
+change(s, lambda a: a.__setitem__(3, a[3] | termios.NOFLSH))
+os.write(m, b"x\x03")
+time.sleep(0.2)
+print("^C with NOFLSH", rd(m))
+change(s, lambda a: a.__setitem__(3, a[3] & ~termios.NOFLSH | termios.ECHO))
+termios.tcflush(s, termios.TCIFLUSH)
+rd(m)
+
+# 关掉包模式：没有头，状态不记；再打开时以前的状态也没有了
+termios.tcflush(s, termios.TCIFLUSH)
+pkt(m, 0)
+print("off", geti(m, TIOCGPKT), events(m))
+os.write(s, b"plain")
+wait(m)
+print("off read", rd(m))
+termios.tcflush(s, termios.TCOFLUSH)
+pkt(m, 1)
+print("on again", events(m), rd(m))
+termios.tcflush(s, termios.TCIFLUSH)
+pkt(m, 1)
+print("on while on", rd(m))
+
+# epoll 的 EPOLLPRI
+ep = select.epoll()
+ep.register(m, select.EPOLLIN | select.EPOLLPRI)
+termios.tcflow(s, termios.TCOOFF)
+print("epoll", ep.poll(0), rd(m))
+termios.tcflow(s, termios.TCOON)
+rd(m)
+
+# 从设备都关掉之后：先读完状态和数据，再是 EIO
+os.write(s, b"last")
+wait(m)
+termios.tcflush(s, termios.TCIFLUSH)
+os.close(s)
+print("closed", events(m), rd(m), rd(m), rd(m))
+os.close(m)
+
+# TIOCSIG：给从设备的前台进程组发信号，只能是 SIGINT、SIGQUIT、SIGTSTP
+m, s = os.openpty()
+name = os.ttyname(s)
+print("TIOCSIG without fg", err(fcntl.ioctl, m, TIOCSIG, signal.SIGINT), err(fcntl.ioctl, m, TIOCSIG, signal.SIGKILL),
+      err(fcntl.ioctl, m, TIOCSIG, 0))
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    os.setsid()
+    fd = os.open(name, os.O_RDWR)
+    os.write(w, b"x")
+    signal.pause()
+    os._exit(0)
+os.read(r, 1)
+print("TIOCSIG SIGINT", err(fcntl.ioctl, m, TIOCSIG, signal.SIGINT))
+_, st = os.waitpid(pid, 0)
+print("child", os.WIFSIGNALED(st) and signal.Signals(os.WTERMSIG(st)).name)
+PY

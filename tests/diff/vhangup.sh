@@ -137,4 +137,13 @@ def master_side():
     m2 = os.open("/dev/ptmx", os.O_RDWR | os.O_NOCTTY)
     print("new master", polled(m2))
 print("master side", fork(master_side))
+
+# 包模式下从设备被挂断：清空了从设备的输入、输出，主设备先读到这两个状态
+def packet():
+    m, s = os.openpty()
+    fcntl.ioctl(m, 0x5420, struct.pack("i", 1))  # TIOCPKT
+    os.set_blocking(m, False)
+    print("packet TIOCVHANGUP", err(fcntl.ioctl, s, TIOCVHANGUP))
+    print("packet master", polled(m), err(os.read, m, 100), err(os.read, m, 100))
+print("packet", fork(packet))
 PY

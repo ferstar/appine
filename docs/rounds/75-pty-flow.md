@@ -22,4 +22,4 @@
 **推迟项**：
 
 - 从设备的 TCOFLUSH 和产生信号时（没有 NOFLSH）仍然清掉主设备还没读的全部输出。Linux 上只清还在 flip buffer 里、没交给主设备行规程的部分，通常没有可清的。
-- 包模式（TIOCPKT）整个没有实现，停住、恢复、清空时也就没有 `TIOCPKT_STOP`、`TIOCPKT_START`、`TIOCPKT_FLUSHREAD` 这些通知。
+- 包模式（TIOCPKT）整个没有实现，停住、恢复、清空时也就没有 `TIOCPKT_STOP`、`TIOCPKT_START`、`TIOCPKT_FLUSHREAD` 这些通知。→ 已补上（M9 之前：PTY 的包模式），GNU screen 离不开它

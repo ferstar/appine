@@ -91,6 +91,28 @@ pub mod flags {
     pub const ECHOKE: u32 = 0o4000;
     /// 扩展功能（LNEXT、WERASE、REPRINT）。
     pub const IEXTEN: u32 = 0o100000;
+    /// 行编辑由外部（主设备那边）做。
+    pub const EXTPROC: u32 = 0o200000;
+}
+
+/// 包模式（TIOCPKT）下主设备读到的状态字节（`TIOCPKT_*`）。
+pub mod pkt {
+    /// 后面是数据。
+    pub const DATA: u8 = 0;
+    /// 从设备的输入被清空了。
+    pub const FLUSHREAD: u8 = 1;
+    /// 从设备的输出被清空了。
+    pub const FLUSHWRITE: u8 = 2;
+    /// 从设备的输出被停住了（^S、TCOOFF）。
+    pub const STOP: u8 = 4;
+    /// 恢复了。
+    pub const START: u8 = 8;
+    /// 不再是 ^S/^Q 流控。
+    pub const NOSTOP: u8 = 16;
+    /// 改成了 ^S/^Q 流控。
+    pub const DOSTOP: u8 = 32;
+    /// 设置了 EXTPROC 时 termios 变了。
+    pub const IOCTL: u8 = 64;
 }
 
 /// `c_cc` 的下标。
@@ -304,6 +326,10 @@ pub struct Tty {
     /// 主设备的输出被 TCOOFF 停住：主设备的写等到 TCOON。主设备的 termios 没有 IXON，
     /// 只有 TCXONC 能停住它。
     pub master_stopped: bool,
+    /// 主设备在包模式（TIOCPKT）：每次读先给一个状态字节（[`pkt`]），之后是数据。
+    pub packet: bool,
+    /// 包模式下还没读走的状态（Linux 记在从设备的 `ctrl.pktstatus`）。
+    pub pktstatus: u8,
     /// 以它为控制终端的会话。
     pub session: Option<Tid>,
     /// 前台进程组。
@@ -352,6 +378,8 @@ impl Tty {
             held_from: None,
             tco_stopped: false,
             master_stopped: false,
+            packet: false,
+            pktstatus: 0,
             session: None,
             fg: None,
             masters: 0,
@@ -490,17 +518,46 @@ impl Tty {
         self.visible() > 0
     }
 
-    /// 停住从设备的输出（^S）。
-    fn stop(&mut self) {
-        if self.held_from.is_none() {
-            self.held_from = Some(self.output.len());
+    /// 包模式下记下状态 `set`、去掉 `clear`，主设备的读者随之可读（Linux 只在主设备
+    /// 是包模式时才记）。
+    fn report(&mut self, set: u8, clear: u8) {
+        if self.packet {
+            self.pktstatus = self.pktstatus & !clear | set;
+            self.arrivals[1] += 1;
         }
     }
 
-    /// 恢复从设备的输出（^Q、IXANY、产生信号时，Linux 的 `start_tty`）：TCOOFF 停住的不管。
+    /// 包模式下报告从设备这一边的清空（Linux 的 `n_tty_packet_mode_flush` 是输入，
+    /// `pty_flush_buffer` 是输出）。主设备那边的清空不报告。
+    pub fn report_flush(&mut self, input: bool, output: bool) {
+        let set = if input { pkt::FLUSHREAD } else { 0 } | if output { pkt::FLUSHWRITE } else { 0 };
+        if set != 0 {
+            self.report(set, 0);
+        }
+    }
+
+    /// 包模式下主设备的一次读要给的状态字节，取走它。
+    pub fn take_pktstatus(&mut self) -> Option<u8> {
+        if self.packet && self.pktstatus != 0 {
+            Some(std::mem::take(&mut self.pktstatus))
+        } else {
+            None
+        }
+    }
+
+    /// 停住从设备的输出（^S，Linux 的 `__stop_tty`，`pty_stop` 报告 STOP）。
+    fn stop(&mut self) {
+        if self.held_from.is_none() {
+            self.held_from = Some(self.output.len());
+            self.report(pkt::STOP, pkt::START);
+        }
+    }
+
+    /// 恢复从设备的输出（^Q、IXANY、产生信号时，Linux 的 `start_tty`，`pty_start` 报告
+    /// START）：TCOOFF 停住的不管。
     fn start(&mut self) {
-        if !self.tco_stopped {
-            self.held_from = None;
+        if !self.tco_stopped && self.held_from.take().is_some() {
+            self.report(pkt::START, pkt::STOP);
         }
     }
 
@@ -516,7 +573,7 @@ impl Tty {
     pub fn start_output(&mut self) {
         if self.tco_stopped {
             self.tco_stopped = false;
-            self.held_from = None;
+            self.start();
         }
     }
 
@@ -558,6 +615,17 @@ impl Tty {
     pub fn set_termios(&mut self, mut t: Termios) {
         t.cflag ^= (t.cflag ^ self.termios.cflag) & ADDRB;
         t.cflag = t.cflag & !(CSIZE | PARENB) | CS8 | CREAD;
+        // 包模式下报告 ^S/^Q 流控的开关，EXTPROC 时报告 termios 变了（`pty_set_termios`）
+        let flow = |t: &Termios| t.i(IXON) && t.cc[VSTOP] == 0o23 && t.cc[VSTART] == 0o21;
+        let (old_flow, new_flow) = (flow(&self.termios), flow(&t));
+        let extproc = (self.termios.lflag | t.lflag) & EXTPROC != 0;
+        if old_flow != new_flow {
+            let set = if new_flow { pkt::DOSTOP } else { pkt::NOSTOP };
+            self.report(set, pkt::DOSTOP | pkt::NOSTOP);
+        }
+        if extproc {
+            self.report(pkt::IOCTL, 0);
+        }
         let was = self.canonical();
         self.termios = t;
         match (was, self.canonical()) {
@@ -705,6 +773,7 @@ impl Tty {
                 if !t.l(NOFLSH) {
                     self.flush_input();
                     self.flush_output();
+                    self.report_flush(true, true);
                 }
                 if t.i(IXON) {
                     self.start();
