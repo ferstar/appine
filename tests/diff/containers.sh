@@ -1,7 +1,7 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
 # 容器运行时（podman、crun、docker、runc）用到的内核接口（docs/rounds/157-container-survey.md
 # 起）：capget 探测版本、开机时的命名空间里拉起已经起着的 lo、合成文件系统根目录的 inode
-# 编号、线程目录里的 fd
+# 编号、线程目录里的 fd；不带只读地挂 cgroup2
 set -e
 cd /tmp
 
@@ -255,3 +255,17 @@ int main(void)
 C
 gcc -D_GNU_SOURCE -pthread -o threadfd threadfd.c && ./threadfd
 ls /proc/$$/task/$$/ | grep -x 'fd\|fdinfo'
+
+# cgroup2 可以不带只读挂上（crun 给容器挂 /sys/fs/cgroup 时这样挂），之后 bind 地重新挂成
+# 只读、可写。写文件、建子 cgroup 在原生上真会改，不比；不带 bind 的 remount 改的是超级块，
+# 原生上会改到 docker 给容器的 cgroup，也不做
+mkdir -p mnt/cg
+mount -t cgroup2 cgroup2 mnt/cg && echo "cgroup2 rw: ok"
+opts() { awk -v p="$PWD/$1" '$5 == p {split($6, o, ","); print $5, o[1]}' /proc/self/mountinfo; }
+opts mnt/cg
+python3 -c 'import os; print("ST_RDONLY", os.statvfs("mnt/cg").f_flag & 1)'
+[ -f mnt/cg/cgroup.procs ] && echo "has cgroup.procs"
+mount -o remount,bind,ro mnt/cg && opts mnt/cg
+python3 -c 'import os; print("ST_RDONLY", os.statvfs("mnt/cg").f_flag & 1)'
+mount -o remount,bind,rw mnt/cg && opts mnt/cg
+umount mnt/cg

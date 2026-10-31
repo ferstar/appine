@@ -138,10 +138,8 @@ fn new_mount(
         crate::debug::log(format_args!("mount: no filesystem type {name}"));
         return Err(Errno::ENODEV);
     };
-    // cgroup2 只能只读（util-linux、busybox 的 mount 得到 EROFS 会改成只读再试）
-    if fs == Fs::Cgroup && flags & ms::RDONLY == 0 {
-        return Err(Errno::EROFS);
-    }
+    // cgroup2 可以不带只读挂上（crun 给容器挂 /sys/fs/cgroup 时就这样），只是里面的文件改不了
+    // （[`Vfs::readonly`]）
     let vfs = cx.vfs()?;
     may_mount_on(&target)?;
     check_mnt(cx, &vfs, target.mnt())?;
@@ -472,9 +470,6 @@ fn remount(
     } else {
         flags
     };
-    if m.fs == Fs::Cgroup && flags & ms::RDONLY == 0 {
-        return Err(Errno::EROFS);
-    }
     vfs.update_mount(id, |m| m.flags = flags);
     // 根文件系统改成 nosymfollow 时不能再不持 BKL 地解析
     cx.shared.fast_changed();

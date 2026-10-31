@@ -1479,7 +1479,8 @@ impl Vfs {
         self.with_mount(node.mnt(), |m| m.flags)
     }
 
-    /// `node` 在只读的挂载里（cgroup2 总是只读的）：改它是 EROFS。
+    /// `node` 在只读的挂载里，或者在 cgroup2 里（不论怎么挂的，文件都改不了、建不了子
+    /// cgroup，相当于只读的超级块）：改它是 EROFS。
     pub(crate) fn readonly(&self, node: &Node) -> bool {
         matches!(node, Node::Pseudo(_, p) if crate::pseudo::fs_of(p) == Fs::Cgroup)
             || self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)

@@ -48,7 +48,7 @@
 大一些的，按建议的顺序：
 
 5. **mqueue 文件系统**（[UTS 和 IPC 命名空间](121-uts-ipc-namespaces.md)的推迟项）：OCI 的默认挂载里有 `/dev/mqueue`，crun 给每个容器都挂，appine 是 ENODEV，podman 的容器一个也起不来。要做一个按 IPC 命名空间列出 POSIX 消息队列的文件系统（读文件得到 `QSIZE:… NOTIFY:…`，可以建、删）。
-6. **可写地挂 cgroup2**：crun 挂容器里的 `/sys/fs/cgroup` 时不带只读，appine 对可写的 cgroup2 挂载回 EROFS（[mount 的子集](105-mount-subset.md)："cgroup2 只能只读"）。可以先允许可写地挂上，写文件、建目录仍是现在的 EROFS，问题 9 再改。
+6. **可写地挂 cgroup2**：crun 挂容器里的 `/sys/fs/cgroup` 时不带只读，appine 对可写的 cgroup2 挂载回 EROFS（[mount 的子集](105-mount-subset.md)："cgroup2 只能只读"）。可以先允许可写地挂上，写文件、建目录仍是现在的 EROFS，问题 9 再改。→ 已改（M9 之前：可写地挂 cgroup2），里面照旧改不了
 7. **time 命名空间**：appine 有 `/proc/<pid>/ns/time`，dockerd 据此在规范里加上 time 命名空间；runc 再检查 `/proc/self/timens_offsets`，没有就报 `time namespaces aren't enabled in the kernel`。appine 的 `CLONE_NEWTIME` 是 EPERM，没有 `timens_offsets`，与哪种 Linux 都对不上：配了 `CONFIG_TIME_NS` 的都有，没配的连 `ns/time` 也没有、`CLONE_NEWTIME` 是 EINVAL。两条路：做 time 命名空间（时钟都经过内核层，CLOCK_MONOTONIC、CLOCK_BOOTTIME 加偏移不难，要把绝对时间的定时器、`/proc/uptime` 这些都换算），或者像没配的内核一样去掉 `ns/time`。
 8. **经由 fd 执行 memfd、已删除的文件**（[/proc/<pid>/exe 指向程序文件本身](153-exe-file.md)的推迟项）：runc 把自己复制进 memfd 再经由 `/proc/self/fd/<n>` 执行，得到 `fork/exec /proc/self/fd/6: permission denied`；buildah 的 chroot 隔离（containers/storage 的 `pkg/unshare`，memfd 加 fexecve）得到 `Error during reexec(...): No such file or directory`。153 篇说"用到它的多是 runc、systemd 这类 D 档的程序"，现在容器就要用。
 9. **可写的 cgroup v2**：podman 不加 `--cgroups disabled` 时、`podman build` 不加 runtime 参数时、`--memory` 这类限制、以 root 运行的 runc（docker）都要建子 cgroup、写 `cgroup.procs`、启用控制器。可以分两步：先只有层级和迁移（原生的 docker 在没有控制器时也能跑），再让 `pids.max`、`memory.max`（接 OOM killer）、`cgroup.freeze`、`cgroup.kill` 真正生效；`cpu.max`、`io.max` 只能记下，宿主线程的调度不归 appine 管。

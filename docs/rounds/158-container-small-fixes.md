@@ -1,6 +1,6 @@
 # M9 之前：容器运行时碰到的四处小问题（2026-11-01）
 
-← [M9 之前：podman 和 docker 的普查（2026-11-01）](157-container-survey.md) · [索引](../milestones.md)
+← [M9 之前：podman 和 docker 的普查（2026-11-01）](157-container-survey.md) · [索引](../milestones.md) · [M9 之前：可写地挂 cgroup2（2026-11-01）](159-cgroup2-rw-mount.md) →
 
 [podman 和 docker 的普查](157-container-survey.md)找到的问题 1–4。普查时已经在工作区里改掉了，这一轮补上测试。都是与 Linux 6.1 对不上的小地方，每一处都让 podman 或 docker 的某一步直接失败。
 

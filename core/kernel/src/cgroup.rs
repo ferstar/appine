@@ -16,7 +16,8 @@
 //! - 没有 CPU 配额和权重：`cpu.max` 是 `max 100000`，cpuset 是 guest 看到的所有 CPU；
 //! - `pids.current` 是 guest 的线程数，`pids.max` 不限（限制在 threads-max 和 `RLIMIT_NPROC`）。
 //!
-//! 只读：不能写这些文件，也不能建子 cgroup（EROFS），与 docker 默认的挂载一样。
+//! 只读：不能写这些文件，也不能建子 cgroup（EROFS），与 docker 默认的挂载一样。可以不带只读
+//! 再挂一份（crun 给容器挂 `/sys/fs/cgroup` 时这样挂），里面照样改不了。
 
 use std::fmt::Write;
 
