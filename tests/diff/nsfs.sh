@@ -82,9 +82,12 @@ for k in ("net", "uts", "ipc"):
     st = os.stat("%s/%s" % (RUN, k))
     print(k, "dev", same(st.st_dev, own.st_dev), "ino", same(st.st_ino, os.stat("/proc/self/ns/" + k).st_ino),
           "mode", oct(st.st_mode), "nlink", st.st_nlink)
+net_dev = os.stat(RUN + "/net").st_dev
 for m in mounted(RUN + "/net"):
-    # 编号、设备号之外的列
-    print("mountinfo", m[2], m[3].split(":")[0], m[5], m[6:])
+    # 编号之外的列；nsfs 的设备号随内核版本不同（6.1、6.8 上是 0:4，更新的是 0:5），只比它是不是
+    # 这个文件 stat 出来的
+    dev = "%d:%d" % (os.major(net_dev), os.minor(net_dev))
+    print("mountinfo dev is the file's", m[2] == dev, m[3].split(":")[0], m[5], m[6:])
 
 def enter():
     fd = os.open(RUN + "/net", os.O_RDONLY)
