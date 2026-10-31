@@ -2303,9 +2303,11 @@ fn mangle(s: &[u8]) -> Vec<u8> {
     out
 }
 
-const HWCAP_NAMES: [&str; 12] = [
+/// `/proc/cpuinfo` 里 HWCAP 各位的名字（Linux 6.1 的 `hwcap_str`），按位的顺序。
+const HWCAP_NAMES: [&str; 21] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
-    "asimdhp", "cpuid",
+    "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
+    "asimddp",
 ];
 
 fn cpuinfo() -> String {

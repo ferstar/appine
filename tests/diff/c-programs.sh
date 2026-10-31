@@ -1,6 +1,7 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
-# 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零
+# 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
+# 点积指令
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -444,3 +445,77 @@ int main(void)
 C
 gcc -O2 -o diff5 diff5.c -pthread
 ./diff5
+
+# 点积指令（ASIMDDP）：宿主有时宣告，HWCAP、ID_AA64ISAR0_EL1 的 DP 字段、/proc/cpuinfo 的
+# asimddp 一致；SDOT、UDOT 的向量形式和按元素形式，-O3 时编译器把 int8 的点积循环向量化成
+# SDOT。整个文件只加 +dotprod，别的 v8.2 指令（RDM 等）appine 不宣告
+cat > dotprod.c <<'C'
+#include <arm_neon.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/auxv.h>
+
+#define HWCAP_ASIMDDP (1 << 20)
+
+static int8_t a[4096], b[4096];
+static uint8_t ua[4096], ub[4096];
+
+static int32_t dot_loop(const int8_t *x, const int8_t *y, int n)
+{
+    int32_t s = 0;
+    for (int i = 0; i < n; i++)
+        s += x[i] * y[i];
+    return s;
+}
+
+static void show(const char *name, int32x4_t v)
+{
+    printf("%s %d %d %d %d\n", name, vgetq_lane_s32(v, 0), vgetq_lane_s32(v, 1),
+           vgetq_lane_s32(v, 2), vgetq_lane_s32(v, 3));
+}
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP);
+    uint64_t isar0;
+    __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+    printf("hwcap %d, DP field %d\n", !!(hw & HWCAP_ASIMDDP), (int)(isar0 >> 44 & 15));
+    if (!(hw & HWCAP_ASIMDDP))
+        return 0;
+    uint32_t seed = 1;
+    for (int i = 0; i < 4096; i++) {
+        seed = seed * 1103515245 + 12345;
+        a[i] = seed >> 16;
+        b[i] = seed >> 24;
+        ua[i] = seed >> 8;
+        ub[i] = seed >> 20;
+    }
+    int8x16_t va = vld1q_s8(a), vb = vld1q_s8(b);
+    uint8x16_t vua = vld1q_u8(ua), vub = vld1q_u8(ub);
+    int32x4_t acc = {-7, 100000, -2147483000, 2147483000};
+    uint32x4_t uacc = vreinterpretq_u32_s32(acc);
+    int32x2_t zero = vdup_n_s32(0);
+    show("sdot 4s", vdotq_s32(acc, va, vb));
+    show("udot 4s", vreinterpretq_s32_u32(vdotq_u32(uacc, vua, vub)));
+    show("sdot 2s", vcombine_s32(vdot_s32(vget_low_s32(acc), vget_low_s8(va), vget_high_s8(vb)), zero));
+    for (int lane = 0; lane < 4; lane++) {
+        int32x4_t s, u;
+        switch (lane) {
+        case 0: s = vdotq_laneq_s32(acc, va, vb, 0); u = vreinterpretq_s32_u32(vdotq_laneq_u32(uacc, vua, vub, 0)); break;
+        case 1: s = vdotq_laneq_s32(acc, va, vb, 1); u = vreinterpretq_s32_u32(vdotq_laneq_u32(uacc, vua, vub, 1)); break;
+        case 2: s = vdotq_laneq_s32(acc, va, vb, 2); u = vreinterpretq_s32_u32(vdotq_laneq_u32(uacc, vua, vub, 2)); break;
+        default: s = vdotq_laneq_s32(acc, va, vb, 3); u = vreinterpretq_s32_u32(vdotq_laneq_u32(uacc, vua, vub, 3)); break;
+        }
+        printf("lane %d: ", lane);
+        show("sdot", s);
+        printf("lane %d: ", lane);
+        show("udot", u);
+    }
+    show("sdot 2s lane 1", vcombine_s32(vdot_lane_s32(vget_low_s32(acc), vget_low_s8(va), vget_high_s8(vb), 1), zero));
+    printf("loop %d\n", dot_loop(a, b, 4096));
+    return 0;
+}
+C
+gcc -O3 -march=armv8-a+dotprod -o dotprod dotprod.c && ./dotprod
+echo "sdot in the loop: $(gcc -O3 -march=armv8-a+dotprod -S -o - dotprod.c | grep -c 'sdot	v')"
+echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | grep -cw asimddp)"

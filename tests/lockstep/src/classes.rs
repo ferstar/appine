@@ -113,6 +113,7 @@ pub const CLASSES: &[Class] = &[
     },
     case("lse", lse, hwcap::ATOMICS),
     case("crc32", crc32, hwcap::CRC32),
+    case("dotprod", dotprod, hwcap::ASIMDDP),
     Class {
         name: "fuzz_simd_fp",
         strict: false,
@@ -1063,6 +1064,19 @@ fn crc32(g: &mut Rng, _: &Env) -> Case {
 
 /// 整个 SIMD&FP 数据处理编码空间（bits 27:25 = 111）。白名单本身由 LLVM 对照
 /// 检查（whitelist.rs），这里检查被执行的指令的语义和寄存器搬运。
+/// SDOT、UDOT 的向量形式和按元素形式（2S、4S）。
+fn dotprod(g: &mut Rng, _: &Env) -> Case {
+    let q_u = (g.bit() << 30) | (g.bit() << 29);
+    let rm = reg(g);
+    let rn_rd = (reg(g) << 5) | reg(g);
+    Case::one(if g.bit() == 1 {
+        0x0e80_9400 | q_u | (rm << 16) | rn_rd
+    } else {
+        // 按元素：H:L 选 Vm 的第几个 32 位元素，M:Rm 是完整的寄存器号
+        0x0f80_e000 | q_u | (g.bit() << 21) | (rm << 16) | (g.bit() << 11) | rn_rd
+    })
+}
+
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {
     g.next_u64() as u32 | 0x0e00_0000
 }

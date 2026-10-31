@@ -248,7 +248,8 @@ fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
         0x4e421420, // fadd v0.8h, v1.8h, v2.8h：FP16 不在白名单内
-        0x4e829420, // sdot v0.4s, v1.16b, v2.16b：DotProd 不在白名单内
+        0x4e829c20, // usdot v0.4s, v1.16b, v2.16b：I8MM 不在白名单内
+        0x4f42e020, // 按元素的 sdot 要 32 位的元素（size = 01 未定义）
         0xb8bfc020, // ldapr w0, [x1]：LRCPC 不在白名单内
         0x00000000, // udf #0
         0xd51bd060, // msr tpidrro_el0, x0：EL0 不可写
@@ -324,6 +325,51 @@ fn id_registers_match_hwcap() {
     assert_eq!(caps & hwcap::CRC32 != 0, (isar0 >> 16) & 0xf == 1);
     assert_eq!(caps & hwcap::ATOMICS != 0, (isar0 >> 20) & 0xf == 2);
     assert_eq!(caps & hwcap::SHA2 != 0, (isar0 >> 12) & 0xf == 1);
+    assert_eq!(caps & hwcap::ASIMDDP != 0, (isar0 >> 44) & 0xf == 1);
+}
+
+#[test]
+fn dot_product_follows_the_feature_set() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let sdot = 0x4e829420; // sdot v0.4s, v1.16b, v2.16b
+    if appine_engine::guest_hwcap() & hwcap::ASIMDDP == 0 {
+        assert_eq!(g.cpu.exec_insn(sdot), Some(Exit::Undefined { insn: sdot }));
+        return;
+    }
+    // v1 的字节是 -1、2、-3、4……，v2 全是 3：每组四个之和是 -3 + 6 - 9 + 12 = 6
+    let a: Vec<u8> = (1..=16i8)
+        .map(|i| if i % 2 == 1 { -i } else { i } as u8)
+        .collect();
+    let s = g.cpu.state_mut();
+    s.v[0] = [10 | 20 << 32, 30 | 40 << 32];
+    s.v[1] = [
+        u64::from_le_bytes(a[..8].try_into().unwrap()),
+        u64::from_le_bytes(a[8..].try_into().unwrap()),
+    ];
+    s.v[2] = [0x0303_0303_0303_0303; 2];
+    s.v[3] = [0; 2];
+    g.step(sdot);
+    let lanes = |v: [u64; 2]| {
+        [
+            v[0] as u32,
+            (v[0] >> 32) as u32,
+            v[1] as u32,
+            (v[1] >> 32) as u32,
+        ]
+    };
+    assert_eq!(lanes(g.cpu.state().v[0]), [16, 26, 36, 46]);
+    // udot v3.4s, v1.16b, v2.4b[1]：v2 的第 1 个 32 位元素是 3、3、3、3，按无符号算
+    g.step(0x6fa2e023);
+    let sum = |k: usize| {
+        a[4 * k..4 * k + 4]
+            .iter()
+            .map(|&b| b as u32 * 3)
+            .sum::<u32>()
+    };
+    assert_eq!(lanes(g.cpu.state().v[3]), [sum(0), sum(1), sum(2), sum(3)]);
 }
 
 #[test]

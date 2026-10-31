@@ -1,7 +1,7 @@
 /*
  * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
  * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
- * 也按它决定 AES/SHA/CRC32/LSE 等可选指令是否合法。
+ * 也按它决定 AES/SHA/CRC32/LSE/DotProd 等可选指令是否合法。
  */
 #include <pthread.h>
 
@@ -15,7 +15,8 @@
 /* Tier 0 实现了的特性。FP、ASIMD 和这些可选扩展都依赖原生指令桩 */
 #define IMPLEMENTED                                                                                \
     (APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD | APPINE_HWCAP_AES | APPINE_HWCAP_PMULL |                \
-     APPINE_HWCAP_SHA1 | APPINE_HWCAP_SHA2 | APPINE_HWCAP_CRC32 | APPINE_HWCAP_ATOMICS)
+     APPINE_HWCAP_SHA1 | APPINE_HWCAP_SHA2 | APPINE_HWCAP_CRC32 | APPINE_HWCAP_ATOMICS |          \
+     APPINE_HWCAP_ASIMDDP)
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static uint64_t guest_hwcap;
@@ -89,6 +90,8 @@ bool appine_id_register(unsigned key, uint64_t *value)
             v |= UINT64_C(1) << 16;
         if (h & APPINE_HWCAP_ATOMICS)
             v |= UINT64_C(2) << 20;
+        if (h & APPINE_HWCAP_ASIMDDP)
+            v |= UINT64_C(1) << 44;
     }
     *value = v;
     return true;

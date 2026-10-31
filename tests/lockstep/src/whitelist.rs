@@ -98,6 +98,7 @@ fn mattr(caps: u64) -> String {
     attrs.push(flag(caps & (hwcap::SHA1 | hwcap::SHA2) != 0, "sha2"));
     attrs.push(flag(caps & hwcap::CRC32 != 0, "crc"));
     attrs.push(flag(caps & hwcap::ATOMICS != 0, "lse"));
+    attrs.push(flag(caps & hwcap::ASIMDDP != 0, "dotprod"));
     attrs.join(",")
 }
 

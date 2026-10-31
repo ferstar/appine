@@ -2,9 +2,9 @@
  * SIMD&FP（设计文档 §4.2、§4.4）。
  *
  * 数据处理指令：这里只做白名单判定，运算交给原生指令桩。白名单是 ARMv8.0
- * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2；
- * FP16、DotProd、RDM、FHM、FCMA、FRINTTS、JSCVT、BF16、I8MM、SHA3/SM3/SM4 等
- * 扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
+ * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2/
+ * DotProd；FP16、RDM、FHM、FCMA、FRINTTS、JSCVT、BF16、I8MM、SHA3/SHA512/SM3/SM4
+ * 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
  * Floating-Point and Advanced SIMD" 编码表。
  *
  * 访存指令（LDR/STR/LDP/STP 的 B/H/S/D/Q 形式、LD1–LD4/ST1–ST4）用 C 实现：
@@ -273,7 +273,9 @@ static bool vec_indexed(uint32_t insn)
     case 0xc: /* SQDMULH */
     case 0xd: /* SQRDMULH */
         return !u && hs;
-    default: /* DotProd、RDM、FHM 等 */
+    case 0xe: /* SDOT/UDOT (by element) */
+        return size == 2 && appine_has(APPINE_HWCAP_ASIMDDP);
+    default: /* RDM、FHM、I8MM 等 */
         return false;
     }
 }
@@ -557,6 +559,9 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
             return vec_copy(insn, d);
         if ((insn & 0x9f200400) == 0x0e200400)
             return vec_three_same(insn);
+        if ((insn & 0x9f208400) == 0x0e008400) /* 三寄存器扩展：只有 SDOT/UDOT (vector) */
+            return FIELD(insn, 14, 11) == 0x2 && FIELD(insn, 23, 22) == 2 &&
+                   appine_has(APPINE_HWCAP_ASIMDDP);
         if ((insn & 0x9f200c00) == 0x0e200000)
             return vec_three_different(insn);
         if ((insn & 0x9f3e0c00) == 0x0e200800)

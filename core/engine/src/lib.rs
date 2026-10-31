@@ -825,6 +825,8 @@ pub mod hwcap {
     pub const ATOMICS: u64 = 1 << 8;
     /// EL0 可以读取 ID 寄存器。
     pub const CPUID: u64 = 1 << 11;
+    /// Advanced SIMD 的点积指令（SDOT、UDOT）。
+    pub const ASIMDDP: u64 = 1 << 20;
 }
 
 /// 校验 [`CpuState`] 与 C 结构体的布局是否一致。

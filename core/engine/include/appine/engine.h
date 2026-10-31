@@ -155,6 +155,7 @@ struct appine_cpu {
 #define APPINE_HWCAP_CRC32 (UINT64_C(1) << 7)
 #define APPINE_HWCAP_ATOMICS (UINT64_C(1) << 8)
 #define APPINE_HWCAP_CPUID (UINT64_C(1) << 11)
+#define APPINE_HWCAP_ASIMDDP (UINT64_C(1) << 20)
 
 /* 宣告给 guest 的 AT_HWCAP：宿主支持 ∩ Tier 0 已实现 ∩ 白名单 */
 uint64_t appine_guest_hwcap(void);

@@ -141,6 +141,7 @@
 | [M9 之前：vhangup](rounds/130-vhangup.md) | 2026-10-31 | `vhangup(2)`、`TIOCVHANGUP` 按 Linux 的 `tty_vhangup`：终端记着被挂断过几次，只挂断挂断时打开着的文件，会话组长收到 SIGHUP、SIGCONT，会话失去控制终端，没读的输入丢掉；节点还在，重新打开照常能用 |
 | [M9 之前：tmpfs 的用量和限制](rounds/131-tmpfs-usage.md) | 2026-10-31 | tmpfs 与 Linux 一样按页数、inode 数记用量和限制：statfs 报告用量，新建、链接放不下和写满了是 ENOSPC（能写的写进去），fallocate 放不下是 ENOSPC；重新挂载可以改 `size=`、`nr_inodes=` |
 | [M9 之前：setns 经由 pidfd](rounds/132-setns-pidfd.md) | 2026-10-31 | setns 接受 pidfd，按 Linux 的顺序逐个检查、全部通过才一起换成那个进程的几种命名空间，一起进用户命名空间时按那里的能力算：util-linux 2.41 起的 `nsenter -t`（Alpine 3.24、Debian 13）原来每次都失败，现在能用；多线程进 time 命名空间是 EUSERS |
+| [M9 之前：点积指令 ASIMDDP](rounds/133-asimddp.md) | 2026-10-31 | 宿主有点积指令时宣告 ASIMDDP（HWCAP、ID 寄存器、cpuinfo），SDOT、UDOT 由原生指令桩执行、Tier 1 原样拷贝；libvpx 的 VP9 编码在 appine 里快 4.5%（原生 11%） |
 
 ## 测量条件
 
@@ -196,3 +197,4 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | [拆 BKL](rounds/38-split-bkl.md) | `go build` 冷编译 | 2.8× |
 | [同一个程序共用翻译](rounds/108-shared-translation.md) | shell 起进程 | 1.13×（原来 1.6×） |
 | [Go 换一组被占用的寄存器](rounds/113-go-registers.md) | `go build` 冷编译 | 2.6×（默认的一组 2.7×） |
+| [点积指令 ASIMDDP](rounds/133-asimddp.md) | `vpxenc` VP9 编码（单线程，360p 60 帧） | 2.2×（不宣告点积时 2.3×） |
