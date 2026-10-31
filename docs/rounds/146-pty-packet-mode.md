@@ -1,6 +1,6 @@
 # M9 之前：PTY 的包模式（2026-10-31）
 
-← [M9 之前：termios2（2026-10-31）](145-termios2.md) · [索引](../milestones.md)
+← [M9 之前：termios2（2026-10-31）](145-termios2.md) · [索引](../milestones.md) · [M9 之前：/proc/<pid>/exe 的跟踪权限（2026-10-31）](147-proc-exe-access.md) →
 
 [终端的流控和清空](75-pty-flow.md)那一轮记下包模式（TIOCPKT）整个没有实现。第 144 轮之后筛兼容性推迟项时读 GNU screen 的源码发现它离不开包模式：`src/window.c` 的 `OpenDevice` 给每个新窗口的主设备设 TIOCPKT，失败就关掉终端、不开这个窗口（"TIOCPKT ioctl"）；读主设备时（`win_readev_fn`）把第一个字节当作包头去掉，用 `TIOCPKT_DOSTOP`、`TIOCPKT_NOSTOP` 做自动流控。appine 原来回 ENOTTY，screen 一个窗口也开不了。另外用到它的有 inetutils 的 telnetd、rlogind。
 

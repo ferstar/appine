@@ -215,6 +215,38 @@ def child(f):
     return pid
 
 
+def errno_of(f, *args):
+    try:
+        f(*args)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+# /proc/<pid>/exe 要能看那个进程（PTRACE_MODE_READ_FSCREDS）：别的用户的、不可 dump 的
+# 看不了，自己的总可以
+def exe_as_nobody():
+    os.setgid(65534)
+    os.setuid(65534)
+    ppid = os.getppid()
+    print("nobody: parent's exe", errno_of(os.readlink, "/proc/%d/exe" % ppid),
+          "open", errno_of(os.open, "/proc/%d/exe" % ppid, os.O_RDONLY),
+          "own", os.readlink("/proc/self/exe") == os.readlink("/proc/%d/exe" % os.getpid()))
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
+        print("non-dumpable own exe", errno_of(os.readlink, "/proc/self/exe"))
+        os.write(w, b"x")
+        time.sleep(0.5)
+        os._exit(0)
+    os.read(r, 1)
+    print("non-dumpable child's exe", errno_of(os.readlink, "/proc/%d/exe" % pid))
+    os.waitpid(pid, 0)
+
+
+child(exe_as_nobody)
+
 init_user = os.open("/proc/self/ns/user", os.O_RDONLY)
 print("setns to own user namespace", call(libc.setns, init_user, CLONE_NEWUSER))
 
@@ -229,6 +261,11 @@ def root_inside():
         os.readlink("/proc/%d/ns/user" % os.getppid())
     except OSError as e:
         print("parent's link", errno.errorcode[e.errno])
+    # exe 与 root、cwd 一样（proc_fd_access_allowed），读链接和跟随都不行
+    for link in ("exe", "cwd", "root"):
+        path = "/proc/%d/%s" % (os.getppid(), link)
+        print("parent's", link, errno_of(os.readlink, path), errno_of(os.stat, path),
+              "lstat", errno_of(os.lstat, path))
     print("unmapped", os.getuid(), os.getgid(), os.getresuid(), "map", repr(read("/proc/self/uid_map")))
     print("caps", capeff(), "setgroups", read("/proc/self/setgroups"))
     print("bad map", write("/proc/self/uid_map", "0 0\n"), write("/proc/self/uid_map", "0 0 0\n"))

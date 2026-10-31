@@ -1021,8 +1021,13 @@ impl Pseudo for View<'_> {
                 let root = task.res.borrow().fs.borrow().root.clone();
                 self.vfs.path_of(self, &self.root(), &root)
             }
+            // 与 root、cwd 一样要能看那个进程（Linux 的 proc_pid_readlink、proc_pid_get_link
+            // 都先 proc_fd_access_allowed）；跟随也经过这里
             Entry(pid, _, self::Entry::Exe) => {
                 let g = self.group(*pid).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*pid) {
+                    return Err(Errno::EACCES);
+                }
                 let exe = g.borrow().exe.clone();
                 if exe.is_empty() {
                     Err(Errno::ENOENT)
@@ -1118,7 +1123,7 @@ impl Pseudo for View<'_> {
 }
 
 impl View<'_> {
-    /// 读者能不能看进程 `pid` 的根目录、当前目录、命名空间（Linux 的
+    /// 读者能不能看进程 `pid` 的根目录、当前目录、程序文件、命名空间（Linux 的
     /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`）。
     fn may_read(&self, pid: Tid) -> bool {
         pid == self.tgid
