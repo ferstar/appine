@@ -144,6 +144,7 @@
 | [M9 之前：点积指令 ASIMDDP](rounds/133-asimddp.md) | 2026-10-31 | 宿主有点积指令时宣告 ASIMDDP（HWCAP、ID 寄存器、cpuinfo），SDOT、UDOT 由原生指令桩执行、Tier 1 原样拷贝；libvpx 的 VP9 编码在 appine 里快 4.5%（原生 11%） |
 | [M9 之前：task 目录的 children](rounds/134-task-children.md) | 2026-10-31 | `/proc/<pid>/task/<tid>/children` 列出线程建的子进程：子进程记着父线程，那个线程退出时转给进程里还活着的线程、排到最后，过继、`CLONE_PARENT`、非主线程 exec 都与 Linux 相同 |
 | [M9 之前：SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md) | 2026-10-31 | 宿主有时宣告 SHA3、SHA512（两者一起）和 I8MM（`AT_HWCAP2` 不再总是 0），放行它们的编码；OpenSSL 的 SHA-512 在 appine 里快 4.1 倍，与原生持平 |
+| [M9 之前：LRCPC](rounds/136-lrcpc.md) | 2026-10-31 | 宿主有时宣告 LRCPC：LDAPR、LDAPRH、LDAPRB 在 Tier 0 里照 LDAR 读，在 Tier 1 里检查过地址之后原样执行；§4.4 的 v1.x 特性都做完了 |
 
 ## 测量条件
 

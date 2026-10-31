@@ -1780,6 +1780,13 @@ static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
         emit_on_host_address(x, insn, ops, 2);
         return true;
     }
+    /* LDAPR（LRCPC，Tier 0 确认过宿主有它）：与 LDAR 一样在宿主地址上原样执行，Rs 不是操作数 */
+    if ((insn & 0x3ffffc00) == 0x38bfc000) {
+        struct atomic_operand rt = {0, false, true};
+        emit_atomic_address(x, rn, 1u << size, false, pc);
+        emit_on_host_address(x, insn, &rt, 1);
+        return true;
+    }
     /* LD<op>、SWP */
     struct atomic_operand ops[2] = {{16, true, false}, {0, false, true}};
     emit_atomic_address(x, rn, 1u << size, true, pc);

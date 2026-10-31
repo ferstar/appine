@@ -120,6 +120,7 @@ pub const CLASSES: &[Class] = &[
         generate: Gen::Case(exclusive),
     },
     case("lse", lse, hwcap::ATOMICS),
+    case("lrcpc", lrcpc, hwcap::LRCPC),
     case("crc32", crc32, hwcap::CRC32),
     case("dotprod", dotprod, hwcap::ASIMDDP),
     case("sha3_sha512", sha3_sha512, hwcap::SHA3 | hwcap::SHA512),
@@ -1054,6 +1055,17 @@ fn lse(g: &mut Rng, _: &Env) -> Case {
             c.pointers.push((rn, t));
         }
     }
+    c
+}
+
+/// LDAPR、LDAPRB、LDAPRH（32、64 位），基址指向数据区里对齐的地方。
+fn lrcpc(g: &mut Rng, _: &Env) -> Case {
+    let rn = reg_except(g, &[]);
+    let size = g.bits(2);
+    let mut c = Case::default();
+    c.insns
+        .push((size << 30) | 0x38bf_c000 | (rn << 5) | reg_or_zr(g, &[rn]));
+    c.pointers.push((rn, target(g, 1 << size, 1 << size)));
     c
 }
 

@@ -212,6 +212,19 @@ static enum appine_exit acquire_release(struct appine_cpu *c, uint32_t insn)
     return next(c);
 }
 
+/* LDAPR、LDAPRB、LDAPRH（LRCPC）：照 LDAR 读，acquire 比 RCpc 更强，架构允许 */
+static enum appine_exit load_acquire_rcpc(struct appine_cpu *c, uint32_t insn)
+{
+    unsigned bytes = 1u << FIELD(insn, 31, 30), rt = insn & 31;
+    void *p = atomic_target(c, FIELD(insn, 9, 5), bytes, APPINE_ACCESS_READ, APPINE_WATCH_LOAD);
+    if (!p)
+        return APPINE_EXIT_FAULT;
+    uint64_t v[2];
+    load_atomic(p, bytes, true, v);
+    set_x(c, rt, v[0]);
+    return next(c);
+}
+
 /* 在翻译后的宿主地址上原样执行一条 LSE 指令 */
 static enum appine_exit native_atomic(struct appine_cpu *c, uint32_t insn, unsigned bytes,
                                       const struct native_desc *d)
@@ -261,9 +274,12 @@ enum appine_exit appine_atomic_exec(struct appine_cpu *c, uint32_t insn)
         return native_atomic(c, insn, 1u << size, &d);
     }
 
+    /* LDAPR 在 LSE 那一组里：A = 1、R = 0、Rs 全是 1（LLVM 认的只有这一种）、o3 = 1、opc = 100 */
+    if ((insn & 0x3ffffc00) == 0x38bfc000)
+        return appine_has(APPINE_HWCAP_LRCPC) ? load_acquire_rcpc(c, insn) : undef(c, insn);
     if ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26)) { /* LD<op>、SWP */
         unsigned o3 = BIT(insn, 15), opc = FIELD(insn, 14, 12);
-        if (!lse || (o3 && opc != 0)) /* o3 = 1 且 opc ≠ 0 包括 LDAPR（LRCPC） */
+        if (!lse || (o3 && opc != 0)) /* o3 = 1 且 opc ≠ 0 的另外几种未定义 */
             return undef(c, insn);
         struct native_desc d = {.addr_pos = 5, .n = 2};
         d.gpr[0] = (struct native_operand){.pos = 16, .load = 1};

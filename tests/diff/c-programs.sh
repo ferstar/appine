@@ -1,7 +1,7 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
 # 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
-# 点积指令；SHA3、SHA512、I8MM
+# 点积指令；SHA3、SHA512、I8MM；LRCPC
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -600,3 +600,69 @@ C
 gcc -O2 -march=armv8-a+sha3+i8mm -o crypto crypto.c && ./crypto
 echo "instructions: $(gcc -O2 -march=armv8-a+sha3+i8mm -S -o - crypto.c | grep -cE '^	(eor3|bcax|rax1|xar|sha512h|sha512h2|sha512su0|sha512su1|smmla|ummla|usmmla|usdot|sudot)	')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'sha3|sha512|i8mm')"
+
+# LRCPC：宿主有时宣告，HWCAP、ID_AA64ISAR1_EL1 的 LRCPC 字段、/proc/cpuinfo 的 lrcpc 一致；
+# LDAPR、LDAPRH、LDAPRB 读到的值，-march=armv8-a+rcpc 时 acquire 读编成 LDAPR，两个线程用
+# STLR、LDAPR 传消息时读到序号之后它对应的数据一定已经写好
+cat > lrcpc.c <<'C'
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/auxv.h>
+
+#define HWCAP_LRCPC (1 << 15)
+#define N 200000
+
+static uint64_t slots[64];
+static uint64_t seq;
+/* 只读的页上也能 LDAPR（读不要写权限） */
+static const uint64_t ro_word = 0x0123456789abcdefull;
+
+static void *producer(void *arg)
+{
+    for (uint64_t i = 1; i <= N; i++) {
+        slots[i % 64] = i * 3;
+        __atomic_store_n(&seq, i, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP);
+    uint64_t isar1;
+    __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
+    /* 宿主还有 LRCPC2（LDAPUR 这些）时 Linux 报 2，appine 只实现了 LRCPC，报 1 */
+    printf("lrcpc %d, LRCPC field at least 1: %d\n", !!(hw & HWCAP_LRCPC), (int)(isar1 >> 20 & 15) >= 1);
+    if (!(hw & HWCAP_LRCPC))
+        return 0;
+    uint64_t word = 0x8899aabbccddeeffull, x;
+    uint32_t w, h, b;
+    __asm__ volatile("ldapr %0, [%1]" : "=r"(x) : "r"(&word) : "memory");
+    __asm__ volatile("ldapr %w0, [%1]" : "=r"(w) : "r"(&word) : "memory");
+    __asm__ volatile("ldaprh %w0, [%1]" : "=r"(h) : "r"((char *)&word + 2) : "memory");
+    __asm__ volatile("ldaprb %w0, [%1]" : "=r"(b) : "r"((char *)&word + 7) : "memory");
+    printf("ldapr %016llx %08x ldaprh %04x ldaprb %02x\n", (unsigned long long)x, w, h, b);
+    __asm__ volatile("ldapr %0, [%1]" : "=r"(x) : "r"(&ro_word) : "memory");
+    printf("ldapr from .rodata %016llx\n", (unsigned long long)x);
+    pthread_t t;
+    pthread_create(&t, NULL, producer, NULL);
+    uint64_t seen = 0, bad = 0, reads = 0;
+    while (seen < N) {
+        uint64_t s = __atomic_load_n(&seq, __ATOMIC_ACQUIRE);
+        if (s == 0)
+            continue;
+        uint64_t v = *(volatile uint64_t *)&slots[s % 64];
+        if (v < s * 3 || (v - s * 3) % (64 * 3) != 0)
+            bad++;
+        seen = s;
+        reads++;
+    }
+    pthread_join(t, NULL);
+    printf("message passing: %s, out of order %llu\n", reads > 0 ? "read" : "none", (unsigned long long)bad);
+    return 0;
+}
+C
+gcc -O2 -march=armv8-a+rcpc -pthread -o lrcpc lrcpc.c && ./lrcpc
+echo "ldapr in the code: $(gcc -O2 -march=armv8-a+rcpc -S -o - lrcpc.c | grep -c '	ldapr')"
+echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cx lrcpc)"

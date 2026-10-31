@@ -251,7 +251,8 @@ fn unimplemented_encodings_are_undefined() {
         0x6e42fc20, // bfdot v0.4s, v1.8h, v2.8h：BF16 不在白名单内
         0xcec08420, // sm4e v0.4s, v1.4s：SM4 不在白名单内
         0x4f42e020, // 按元素的 sdot 要 32 位的元素（size = 01 未定义）
-        0xb8bfc020, // ldapr w0, [x1]：LRCPC 不在白名单内
+        0x99404020, // ldapur w0, [x1, #4]：LRCPC2 不在白名单内
+        0xb8a0c020, // Rs 不全是 1 的 ldapr（LLVM 不认）
         0x00000000, // udf #0
         0xd51bd060, // msr tpidrro_el0, x0：EL0 不可写
     ] {
@@ -334,6 +335,42 @@ fn id_registers_match_hwcap() {
     g.step(0xd5380620); // mrs x0, id_aa64isar1_el1
     let i8mm = appine_engine::guest_hwcap2() & hwcap2::I8MM != 0;
     assert_eq!(i8mm, (g.x(0) >> 52) & 0xf == 1);
+    assert_eq!(caps & hwcap::LRCPC != 0, (g.x(0) >> 20) & 0xf == 1);
+}
+
+#[test]
+fn ldapr_follows_the_feature_set() {
+    let mut g = Guest::new();
+    let ldapr = 0xf8bfc020; // ldapr x0, [x1]
+    if appine_engine::guest_hwcap() & hwcap::LRCPC == 0 {
+        assert_eq!(
+            g.cpu.exec_insn(ldapr),
+            Some(Exit::Undefined { insn: ldapr })
+        );
+        return;
+    }
+    g.put_u64(DATA, 0x1122_3344_5566_7788);
+    g.set_x(1, DATA);
+    g.step(ldapr);
+    assert_eq!(g.x(0), 0x1122_3344_5566_7788);
+    g.step(0x78bfc022); // ldaprh w2, [x1]
+    assert_eq!(g.x(2), 0x7788);
+    g.set_x(1, DATA + 1);
+    g.step(0x38bfc023); // ldaprb w3, [x1]
+    assert_eq!(g.x(3), 0x77);
+    // 只读的页上也能读
+    g.set_x(1, RODATA);
+    g.step(0xb8bfc024); // ldapr w4, [x1]
+    assert_eq!(g.x(4), g.get_u64(RODATA) & 0xffff_ffff);
+    // 与 LDAR 一样要对齐
+    g.set_x(1, DATA + 1);
+    assert!(matches!(
+        g.cpu.exec_insn(0xb8bfc020),
+        Some(Exit::Fault {
+            kind: FaultKind::Alignment,
+            ..
+        })
+    ));
 }
 
 #[test]

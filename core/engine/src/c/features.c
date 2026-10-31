@@ -1,7 +1,7 @@
 /*
  * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
  * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
- * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM 等可选指令是否合法。
+ * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC 等可选指令是否合法。
  */
 #include <pthread.h>
 
@@ -16,7 +16,7 @@
 #define IMPLEMENTED                                                                                \
     (APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD | APPINE_HWCAP_AES | APPINE_HWCAP_PMULL |                \
      APPINE_HWCAP_SHA1 | APPINE_HWCAP_SHA2 | APPINE_HWCAP_CRC32 | APPINE_HWCAP_ATOMICS |          \
-     APPINE_HWCAP_SHA3 | APPINE_HWCAP_ASIMDDP | APPINE_HWCAP_SHA512)
+     APPINE_HWCAP_SHA3 | APPINE_HWCAP_ASIMDDP | APPINE_HWCAP_SHA512 | APPINE_HWCAP_LRCPC)
 #define IMPLEMENTED2 APPINE_HWCAP2_I8MM
 
 /* SHA3、SHA512 只一起宣告，还要有 SHA2：LLVM 的 sha3 特性同时管这两组，白名单的核对分不开，
@@ -117,6 +117,8 @@ bool appine_id_register(unsigned key, uint64_t *value)
         if (h & APPINE_HWCAP_ASIMDDP)
             v |= UINT64_C(1) << 44;
     } else if (crm == 6 && op2 == 1) { /* ID_AA64ISAR1_EL1 */
+        if (h & APPINE_HWCAP_LRCPC)
+            v |= UINT64_C(1) << 20;
         if (h2 & APPINE_HWCAP2_I8MM)
             v |= UINT64_C(1) << 52;
     }

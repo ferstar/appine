@@ -1,6 +1,6 @@
 # M9 之前：SHA3、SHA512 和 I8MM（2026-10-31）
 
-← [M9 之前：task 目录的 children（2026-10-31）](134-task-children.md) · [索引](../milestones.md)
+← [M9 之前：task 目录的 children（2026-10-31）](134-task-children.md) · [索引](../milestones.md) · [M9 之前：LRCPC（2026-10-31）](136-lrcpc.md) →
 
 [点积指令 ASIMDDP](133-asimddp.md)那一轮的推迟项：§4.4 的 v1.x 里还有 SHA3、SHA512，表外的 I8MM 和点积一样是 int8 的 SIMD 指令。三者都是 SIMD&FP 的数据处理指令，Tier 0 交给原生指令桩、Tier 1 原样拷贝，只要放行编码、宿主有时宣告。用得到它们的：OpenSSL、Go 的 `crypto/sha512`、`crypto/sha3` 和 ed25519（SHA-512）用 SHA512、SHA3 指令；llama.cpp、libvpx、libaom、onnxruntime 按 `HWCAP2_I8MM` 选 int8 矩阵乘的代码路径。
 

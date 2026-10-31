@@ -102,6 +102,7 @@ fn mattr(caps: u64, caps2: u64) -> String {
     // LLVM 的 sha3 同时管 SHA3 和 SHA512，guest 也总是一起宣告
     attrs.push(flag(caps & hwcap::SHA3 != 0, "sha3"));
     attrs.push(flag(caps2 & hwcap2::I8MM != 0, "i8mm"));
+    attrs.push(flag(caps & hwcap::LRCPC != 0, "rcpc"));
     attrs.join(",")
 }
 

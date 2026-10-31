@@ -831,6 +831,8 @@ pub mod hwcap {
     pub const ATOMICS: u64 = 1 << 8;
     /// EL0 可以读取 ID 寄存器。
     pub const CPUID: u64 = 1 << 11;
+    /// RCpc 的 load-acquire（LDAPR、LDAPRB、LDAPRH）。
+    pub const LRCPC: u64 = 1 << 15;
     /// SHA3 指令（EOR3、RAX1、XAR、BCAX）。
     pub const SHA3: u64 = 1 << 17;
     /// Advanced SIMD 的点积指令（SDOT、UDOT）。

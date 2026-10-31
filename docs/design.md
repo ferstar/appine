@@ -254,8 +254,7 @@ Tier 1 的进入例程保存宿主的 d8–d15 和 FPCR，载入 guest 的 FPCR�
 | 级别 | 特性 |
 |---|---|
 | 必须 | FP、ASIMD（v8.0）、CPUID |
-| 宿主支持时宣告 | ATOMICS（LSE）、AES、PMULL、SHA1、SHA2、CRC32、ASIMDDP（点积，[ASIMDDP](rounds/133-asimddp.md)）、SHA3 和 SHA512（两者都有才宣告）、I8MM（`AT_HWCAP2`，[SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md)） |
-| v1.x | LRCPC |
+| 宿主支持时宣告 | ATOMICS（LSE）、AES、PMULL、SHA1、SHA2、CRC32、ASIMDDP（点积，[ASIMDDP](rounds/133-asimddp.md)）、SHA3 和 SHA512（两者都有才宣告）、I8MM（`AT_HWCAP2`，[SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md)）、LRCPC（LDAPR，[LRCPC](rounds/136-lrcpc.md)） |
 | v1 不做 | FP16（FPHP/ASIMDHP）、SVE/SVE2/SME、BF16、PACA/PACG、BTI、MTE |
 
 宣告 LSE 之后，libgcc 的 outline atomics 和 Go 会改走单条原子指令，这类指令很容易翻译。但 musl 的原子操作是用 `ldaxr`/`stlxr` 内联汇编写死的，所以 **LL/SC 必须支持**。
