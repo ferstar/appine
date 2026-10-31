@@ -1,6 +1,6 @@
 # M9 之前：/proc/<pid>/exe 的跟踪权限（2026-10-31）
 
-← [M9 之前：PTY 的包模式（2026-10-31）](146-pty-packet-mode.md) · [索引](../milestones.md)
+← [M9 之前：PTY 的包模式（2026-10-31）](146-pty-packet-mode.md) · [索引](../milestones.md) · [M9 之前：用户命名空间里的 ID 换算（2026-10-31）](148-userns-ids.md) →
 
 [挂载命名空间](118-mount-namespaces.md)那一轮记下 `/proc/<pid>/ns/*`、`root`、`cwd` 跟随时不检查能不能看那个进程，[用户命名空间](119-user-namespaces.md)那一轮补上了这三种，`exe` 一直没查：任何进程都能读别的用户的进程、不可 dump 的进程的程序路径，也能经由它打开那个程序。Linux 的 `proc_pid_readlink`、`proc_pid_get_link` 对这几种链接都先 `proc_fd_access_allowed`（`PTRACE_MODE_READ_FSCREDS`），看不了是 EACCES。
 

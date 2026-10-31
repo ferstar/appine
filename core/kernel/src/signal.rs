@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use appine_engine::Cpu;
 
 use crate::cell::RefCell;
+use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::kernel::{Cx, Kernel, Tid, request_wake, request_wake_on, wake};
 use crate::process::{ExitStatus, RLIMIT_SIGPENDING, Signal, ThreadGroup};
@@ -183,6 +184,10 @@ pub(crate) struct SigInfo {
     /// 发出它的进程（全局编号，不编码），内核产生的是 0。si_pid 是发送者自己看到的编号，
     /// 对方的 pid 命名空间看不到发送者时改成 0（[`for_target`]）。
     pub sender: Tid,
+    /// si_uid 是按哪个用户命名空间填的（编号；0 表示不再换算），和它在那里对应的内核 ID
+    /// （映射不到是 `u32::MAX`）：目标在别的用户命名空间里时按目标的换算（[`SigInfo::sent_by`]）。
+    pub uid_ns: u64,
+    pub kuid: u32,
 }
 
 impl SigInfo {
@@ -191,9 +196,45 @@ impl SigInfo {
         SigInfo {
             code,
             fields: InfoFields::Kill { pid, uid },
-            esr: 0,
-            sender: 0,
+            ..SigInfo::default()
         }
+    }
+
+    /// si_uid 是发送者 `sender` 按自己的用户命名空间填的（Linux 的 `send_signal_locked`）：
+    /// 目标在别的用户命名空间里时，先在发送者的命名空间里映射回内核 ID（映射不到的成了无效
+    /// ID），再按目标的命名空间换算（[`for_target`]），无效 ID 是 65534。同一个命名空间里
+    /// 原样投递（sigqueue 给的值也是）。
+    pub fn sent_by(mut self, sender: &Cred) -> SigInfo {
+        if let Some(uid) = self.uid() {
+            self.uid_ns = sender.user_ns.id;
+            self.kuid = sender.uid_in(uid).unwrap_or(u32::MAX);
+        }
+        self
+    }
+
+    /// 带 si_uid 的几种（Linux 的 `has_si_pid_and_uid`：kill、SIGCHLD、实时信号的布局）。
+    fn uid(&self) -> Option<u32> {
+        match self.fields {
+            InfoFields::Kill { uid, .. }
+            | InfoFields::Child { uid, .. }
+            | InfoFields::Queue { uid, .. } => Some(uid),
+            _ => None,
+        }
+    }
+
+    /// 投给凭据是 `target` 的进程：按 [`SigInfo::sent_by`] 换算 si_uid。
+    fn retarget_uid(&mut self, target: &Cred) {
+        if self.uid_ns == 0 || self.uid_ns == target.user_ns.id {
+            return;
+        }
+        let v = target.uid_out(self.kuid);
+        if let InfoFields::Kill { uid, .. }
+        | InfoFields::Child { uid, .. }
+        | InfoFields::Queue { uid, .. } = &mut self.fields
+        {
+            *uid = v;
+        }
+        self.uid_ns = 0;
     }
 
     /// 由进程 `sender`（全局编号）发出。
@@ -215,12 +256,13 @@ impl SigInfo {
             code,
             fields: InfoFields::Fault { addr },
             esr,
-            sender: 0,
+            ..SigInfo::default()
         }
     }
 
-    /// 子进程退出时发给父进程的 SIGCHLD。
-    pub fn child(pid: Tid, status: ExitStatus) -> SigInfo {
+    /// 子进程退出时发给父进程的 SIGCHLD。`uid` 是子进程的真实用户 ID 在父进程的命名空间
+    /// 里的值。
+    pub fn child(pid: Tid, uid: u32, status: ExitStatus) -> SigInfo {
         let (code, status) = match status {
             ExitStatus::Exited(c) => (code::CLD_EXITED, c),
             ExitStatus::Signaled {
@@ -236,20 +278,15 @@ impl SigInfo {
                 (code, signal.number())
             }
         };
-        Self::child_event(pid, code, status)
+        Self::child_event(pid, uid, code, status)
     }
 
-    /// 子进程状态改变（`CLD_*`）时发给父进程的 SIGCHLD。
-    pub fn child_event(pid: Tid, code: i32, status: i32) -> SigInfo {
+    /// 子进程状态改变（`CLD_*`）时发给父进程的 SIGCHLD。`uid` 同 [`SigInfo::child`]。
+    pub fn child_event(pid: Tid, uid: u32, code: i32, status: i32) -> SigInfo {
         SigInfo {
             code,
-            fields: InfoFields::Child {
-                pid,
-                uid: 0,
-                status,
-            },
-            esr: 0,
-            sender: 0,
+            fields: InfoFields::Child { pid, uid, status },
+            ..SigInfo::default()
         }
     }
 
@@ -258,8 +295,7 @@ impl SigInfo {
         SigInfo {
             code: i32::from_le_bytes(b[8..12].try_into().unwrap()),
             fields: InfoFields::Raw(b[16..].try_into().unwrap()),
-            esr: 0,
-            sender: 0,
+            ..SigInfo::default()
         }
     }
 
@@ -599,13 +635,25 @@ fn notify_parent(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>, code: i32, status
     let act = parent.borrow().sighand.borrow().get(Signal::CHLD);
     if act.flags & sa::NOCLDSTOP == 0 {
         let pid = k.pid_seen_by(ppid, tgid);
-        send_to_group(
-            k,
-            ppid,
-            Signal::CHLD,
-            SigInfo::child_event(pid, code, status),
-        );
+        let info = child_info(&group.borrow().cred, &parent.borrow().cred, |uid| {
+            SigInfo::child_event(pid, uid, code, status)
+        });
+        send_to_group(k, ppid, Signal::CHLD, info);
     }
+}
+
+/// 子进程（凭据是 `child`）停止、继续时发给父进程或跟踪者（`parent`）的 SIGCHLD：si_uid 是
+/// 子进程的真实用户 ID 在父进程的命名空间里的值，之后与别的信号一样当作子进程自己发的再
+/// 换算一次（Linux 的 `do_notify_parent_cldstop` 用 `send_signal_locked`；子进程在别的用户
+/// 命名空间里时，在那里映射不到的成了 65534）。退出时的 SIGCHLD 不再换算
+/// （`do_notify_parent` 用 `__send_signal_locked`），见 [`exit_info`]。
+pub(crate) fn child_info(child: &Cred, parent: &Cred, f: impl FnOnce(u32) -> SigInfo) -> SigInfo {
+    f(parent.uid_out(child.ruid)).sent_by(child)
+}
+
+/// 子进程退出时的 SIGCHLD：si_uid 是子进程的真实用户 ID 在父进程的命名空间里的值。
+pub(crate) fn exit_info(child: &Cred, parent: &Cred, pid: Tid, status: ExitStatus) -> SigInfo {
+    SigInfo::child(pid, parent.uid_out(child.ruid), status)
 }
 
 /// 信号发给 `group` 之前（Linux 的 `send_signal_locked`、`sig_task_ignored`）：发送者在
@@ -619,6 +667,7 @@ fn for_target(
     blocked: bool,
     traced: bool,
 ) -> Option<SigInfo> {
+    info.retarget_uid(&group.cred);
     let ns = &group.pid_ns;
     if ns.level == 0 {
         return Some(info);
@@ -1307,13 +1356,47 @@ mod tests {
         assert_eq!(alt, AltStack::default());
     }
 
+    /// si_uid 按发送者的命名空间填，投给别的用户命名空间里的进程时按那里换算，映射不到的
+    /// 是 65534；同一个命名空间里原样投递。
+    #[test]
+    fn si_uid_follows_the_user_namespace() {
+        use crate::cred::{IdMap, UserNs};
+        let root = Cred::root();
+        let mut inside = root.clone();
+        inside.enter_user_ns(UserNs::child(&root.user_ns, 0));
+        // 里面的 0 是外面的 1000，100 是外面的 0
+        *inside.user_ns.uid_map.borrow_mut() = IdMap::parse(b"0 1000 1\n100 0 1\n").unwrap();
+        let uid = |i: SigInfo| match i.fields {
+            InfoFields::Kill { uid, .. } | InfoFields::Queue { uid, .. } => uid,
+            _ => unreachable!(),
+        };
+        let mut i = SigInfo::kill(code::SI_USER, 1, root.uid_out(0)).sent_by(&root);
+        i.retarget_uid(&inside);
+        assert_eq!(uid(i), 100);
+        let mut i = SigInfo::kill(code::SI_USER, 1, 5000).sent_by(&root);
+        i.retarget_uid(&inside);
+        assert_eq!(uid(i), 65534);
+        // 里面发出来的：里面的 0 在外面是 1000；里面没有映射的值换算之后是 65534
+        let mut i = SigInfo::kill(code::SI_USER, 1, 0).sent_by(&inside);
+        i.retarget_uid(&root);
+        assert_eq!(uid(i), 1000);
+        let mut i = SigInfo::kill(code::SI_USER, 1, 4242).sent_by(&inside);
+        i.retarget_uid(&root);
+        assert_eq!(uid(i), 65534);
+        // 同一个命名空间里不换算，sigqueue 给的没有映射的值也原样投递
+        let mut i = SigInfo::kill(-1, 1, 4242).sent_by(&inside);
+        i.retarget_uid(&inside);
+        assert_eq!(uid(i), 4242);
+    }
+
     #[test]
     fn siginfo_encoding() {
         let b = SigInfo::fault(code::SEGV_MAPERR, 0x1000, 0).encode(Signal::SEGV);
         assert_eq!(&b[..4], &11i32.to_le_bytes());
         assert_eq!(&b[8..12], &1i32.to_le_bytes());
         assert_eq!(&b[16..24], &0x1000u64.to_le_bytes());
-        let b = SigInfo::child(42, ExitStatus::Exited(3)).encode(Signal::CHLD);
+        let b = SigInfo::child(42, 1000, ExitStatus::Exited(3)).encode(Signal::CHLD);
+        assert_eq!(&b[20..24], &1000u32.to_le_bytes());
         assert_eq!(&b[16..20], &42i32.to_le_bytes());
         assert_eq!(&b[24..28], &3i32.to_le_bytes());
     }
@@ -1334,8 +1417,7 @@ mod tests {
                 uid: 0,
                 value: v,
             },
-            esr: 0,
-            sender: 0,
+            ..SigInfo::default()
         };
         let rt = Signal::new(40).unwrap();
         let mut p = Pending::default();

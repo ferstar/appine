@@ -163,15 +163,16 @@ impl Perm {
         }
     }
 
-    /// 按 asm-generic 的 `struct ipc64_perm`（48 字节）编码。
-    pub fn encode(&self) -> [u8; 48] {
+    /// 按 asm-generic 的 `struct ipc64_perm`（48 字节）编码，ID 按调用者 `cred` 的用户命名空间
+    /// 换算（Linux 的 `kernel_to_ipc64_perm`）。
+    pub fn encode(&self, cred: &Cred) -> [u8; 48] {
         let mut b = [0u8; 48];
         for (i, v) in [
             self.key as u32,
-            self.uid,
-            self.gid,
-            self.cuid,
-            self.cgid,
+            cred.uid_out(self.uid),
+            cred.gid_out(self.gid),
+            cred.uid_out(self.cuid),
+            cred.gid_out(self.cgid),
             self.mode,
         ]
         .into_iter()
@@ -183,12 +184,17 @@ impl Perm {
         b
     }
 
-    /// IPC_SET：从 `struct ipc64_perm` 取属主、属组和权限位。
-    pub fn set(&mut self, b: &[u8]) {
+    /// IPC_SET：从 `struct ipc64_perm` 取属主、属组和权限位。属主、属组按调用者 `cred` 的用户
+    /// 命名空间换成内核 ID，没有映射是 EINVAL（Linux 的 `ipc_update_perm`）。
+    pub fn set(&mut self, b: &[u8], cred: &Cred) -> Result<(), Errno> {
         let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
-        self.uid = word(4);
-        self.gid = word(8);
+        let (Some(uid), Some(gid)) = (cred.uid_in(word(4)), cred.gid_in(word(8))) else {
+            return Err(Errno::EINVAL);
+        };
+        self.uid = uid;
+        self.gid = gid;
         self.mode = (self.mode & !0o777) | (word(20) & 0o777);
+        Ok(())
     }
 }
 
@@ -583,8 +589,9 @@ pub(crate) fn exit(k: &mut Kernel, tgid: Tid) {
     }
 }
 
-/// IPC 命名空间 `ns` 的 `/proc/sysvipc/{msg,sem,shm}` 的内容。
-pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8]) -> String {
+/// IPC 命名空间 `ns` 的 `/proc/sysvipc/{msg,sem,shm}` 的内容，属主、属组按读者 `reader` 的用户
+/// 命名空间换算（Linux 的 `seq_user_ns`）。
+pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> String {
     use std::fmt::Write;
     let ipc = k.ipc(ns);
     let mut s = String::new();
@@ -602,10 +609,10 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8]) -> String {
                     q.msgs.len(),
                     q.lspid,
                     q.lrpid,
-                    p.uid,
-                    p.gid,
-                    p.cuid,
-                    p.cgid,
+                    reader.uid_out(p.uid),
+                    reader.gid_out(p.gid),
+                    reader.uid_out(p.cuid),
+                    reader.gid_out(p.cgid),
                     q.stime,
                     q.rtime,
                     q.ctime
@@ -623,10 +630,10 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8]) -> String {
                     id,
                     p.mode & 0o777,
                     set.vals.len(),
-                    p.uid,
-                    p.gid,
-                    p.cuid,
-                    p.cgid,
+                    reader.uid_out(p.uid),
+                    reader.gid_out(p.gid),
+                    reader.uid_out(p.cuid),
+                    reader.gid_out(p.cgid),
                     set.otime,
                     set.ctime
                 )
@@ -640,7 +647,7 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8]) -> String {
                     s,
                     "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} {:21}",
                     p.key, id, p.mode & 0o1777, seg.size, seg.cpid, seg.lpid, nattch(k, (ns, id)),
-                    p.uid, p.gid, p.cuid, p.cgid, seg.atime, seg.dtime, seg.ctime,
+                    reader.uid_out(p.uid), reader.gid_out(p.gid), reader.uid_out(p.cuid), reader.gid_out(p.cgid), seg.atime, seg.dtime, seg.ctime,
                     seg.mem.len(), 0
                 )
                 .unwrap();

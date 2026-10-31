@@ -780,7 +780,13 @@ fn exec(
         argv: &argv,
         envp: &envp,
         execfn: &filename,
-        ids: [new_cred.ruid, new_cred.euid, new_cred.rgid, new_cred.egid],
+        // AT_UID 这几项是自己的用户命名空间里的值（Linux 的 create_elf_tables）
+        ids: [
+            new_cred.uid_out(new_cred.ruid),
+            new_cred.uid_out(new_cred.euid),
+            new_cred.gid_out(new_cred.rgid),
+            new_cred.gid_out(new_cred.egid),
+        ],
         secure,
         stack_limit,
     };
@@ -958,15 +964,19 @@ impl ChildEvent {
         }
     }
 
-    /// waitid 的 siginfo。
-    fn siginfo(self, pid: Tid) -> SigInfo {
+    /// waitid 的 siginfo：`uid` 是子进程的真实用户 ID 在调用者的命名空间里的值。
+    fn siginfo(self, pid: Tid, uid: u32) -> SigInfo {
         match self {
-            ChildEvent::Exited(s) => SigInfo::child(pid, s),
-            ChildEvent::Stopped(sig) => SigInfo::child_event(pid, code::CLD_STOPPED, sig.number()),
-            ChildEvent::Continued => {
-                SigInfo::child_event(pid, code::CLD_CONTINUED, Signal::CONT.number())
+            ChildEvent::Exited(s) => SigInfo::child(pid, uid, s),
+            ChildEvent::Stopped(sig) => {
+                SigInfo::child_event(pid, uid, code::CLD_STOPPED, sig.number())
             }
-            ChildEvent::Trapped(status) => SigInfo::child_event(pid, code::CLD_TRAPPED, status),
+            ChildEvent::Continued => {
+                SigInfo::child_event(pid, uid, code::CLD_CONTINUED, Signal::CONT.number())
+            }
+            ChildEvent::Trapped(status) => {
+                SigInfo::child_event(pid, uid, code::CLD_TRAPPED, status)
+            }
         }
     }
 }
@@ -982,9 +992,9 @@ struct Wanted {
     own_thread: bool,
 }
 
-/// 找到的子进程状态变化：(pid, 事件, 子进程和它回收过的子进程用掉的 CPU 时间)。
-/// 子进程（调用者看到的编号）、它的状态变化和资源用量。
-type Found = (Tid, ChildEvent, process::Rusage);
+/// 找到的子进程状态变化：子进程（调用者看到的编号）、它的状态变化、资源用量（包括它回收过的
+/// 子进程用掉的 CPU 时间），和它的真实用户 ID（内核 ID，waitid 的 si_uid）。
+type Found = (Tid, ChildEvent, process::Rusage, u32);
 
 /// 找到一个符合条件的子进程状态变化，`consume` 时取走它（已结束的子进程同时被回收）。
 /// 跟踪着的线程（不一定是子进程）的 ptrace-stop 和退出也算。没有子进程、跟踪着的线程
@@ -1030,6 +1040,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         }
         // 回收之前换算：回收之后编号就不在 pid 命名空间里了
         let vpid = cx.pid_out(c);
+        let uid = g.cred.ruid;
         if let (true, Some(status)) = (want.exited, g.zombie) {
             let usage = usage(&g, cx.kr());
             if want.consume {
@@ -1041,7 +1052,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
                 me.child_cpu += usage.cpu;
                 me.child_maxrss_kb = me.child_maxrss_kb.max(usage.maxrss_kb);
             }
-            return Ok(Some((vpid, ChildEvent::Exited(status), usage)));
+            return Ok(Some((vpid, ChildEvent::Exited(status), usage, uid)));
         }
         if traced {
             continue;
@@ -1050,13 +1061,18 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
             if want.consume {
                 g.stop_report = None;
             }
-            return Ok(Some((vpid, ChildEvent::Stopped(sig), usage(&g, cx.kr()))));
+            return Ok(Some((
+                vpid,
+                ChildEvent::Stopped(sig),
+                usage(&g, cx.kr()),
+                uid,
+            )));
         }
         if want.continued && g.cont_report {
             if want.consume {
                 g.cont_report = false;
             }
-            return Ok(Some((vpid, ChildEvent::Continued, usage(&g, cx.kr()))));
+            return Ok(Some((vpid, ChildEvent::Continued, usage(&g, cx.kr()), uid)));
         }
     }
     // 跟踪着的线程：ptrace-stop 不要求 WUNTRACED（与 Linux 一样，也不要求 __WALL）
@@ -1079,15 +1095,15 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
                 trace.reported = true;
             }
             // 与 Linux 一样报告它所在进程的用量（strace -c 用它算系统调用的时间）
-            let usage = cx
-                .kr()
-                .groups
-                .get(&t.tgid)
-                .map_or_else(process::Rusage::default, |g| usage(&g.borrow(), cx.kr()));
+            let (usage, uid) = cx.kr().groups.get(&t.tgid).map_or_else(
+                || (process::Rusage::default(), 0),
+                |g| (usage(&g.borrow(), cx.kr()), g.borrow().cred.ruid),
+            );
             return Ok(Some((
                 cx.pid_out(t.tid.get()),
                 ChildEvent::Trapped(code),
                 usage,
+                uid,
             )));
         }
     }
@@ -1100,6 +1116,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         any = true;
         if want.exited {
             let (pid, seen, status) = (exits[i].pid, exits[i].seen, exits[i].status);
+            let uid = exits[i].cred.ruid;
             // 整个进程的结束：与 Linux 一样报告它的用量（它还在，等着交给父进程）
             let usage = match cx.kr().groups.get(&pid) {
                 Some(g) if exits[i].process => usage(&g.borrow(), cx.kr()),
@@ -1109,7 +1126,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
                 let e = cx.k().trace_exits.remove(i);
                 crate::ptrace::released(cx.k(), &e);
             }
-            return Ok(Some((seen, ChildEvent::Exited(status), usage)));
+            return Ok(Some((seen, ChildEvent::Exited(status), usage, uid)));
         }
     }
     if any { Ok(None) } else { Err(Errno::ECHILD) }
@@ -1164,7 +1181,7 @@ pub(super) fn wait4(
         consume: true,
         own_thread: options & WNOTHREAD != 0,
     };
-    let Some((child, event, usage)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
+    let Some((child, event, usage, _)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
         return Ok(0);
     };
     if wstatus != 0 {
@@ -1226,7 +1243,9 @@ pub(super) fn waitid(
     }
     if infop != 0 {
         let info = match found {
-            Some((child, event, _)) => event.siginfo(child).encode(Signal::CHLD),
+            Some((child, event, _, uid)) => event
+                .siginfo(child, cx.cred().uid_out(uid))
+                .encode(Signal::CHLD),
             None => [0; 128],
         };
         cx.mm().write(UserSlice::new(infop, 128), &info)?;

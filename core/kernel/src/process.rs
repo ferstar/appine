@@ -855,9 +855,10 @@ fn hand_to_parent(
         }
     } else {
         group.borrow_mut().zombie = Some(status);
-        if let Some(sig) = Signal::new(exit_signal) {
+        if let (Some(sig), Some(p)) = (Signal::new(exit_signal), &parent) {
             let pid = k.pid_seen_by(ppid, tgid);
-            signal::send_to_group(k, ppid, sig, SigInfo::child(pid, status));
+            let info = signal::exit_info(&group.borrow().cred, &p.borrow().cred, pid, status);
+            signal::send_to_group(k, ppid, sig, info);
         }
     }
 }

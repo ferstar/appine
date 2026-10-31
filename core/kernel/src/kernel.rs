@@ -974,10 +974,17 @@ impl<'a> Cx<'a> {
         self.t.group.borrow().cred.clone()
     }
 
-    /// AF_UNIX 的 `SO_PEERCRED`、`SCM_CREDENTIALS`：pid 和有效用户 ID、组 ID。
+    /// AF_UNIX 的 `SO_PEERCRED`：pid 和有效用户 ID、组 ID（内核 ID，Linux 的 `cred_to_ucred`）。
     pub fn ucred(&self) -> crate::unix::Ucred {
         let g = self.t.group.borrow();
         crate::unix::Ucred::of(self.tgid(), g.cred.euid, g.cred.egid)
+    }
+
+    /// 没有声明时附带的 `SCM_CREDENTIALS`：pid 和真实用户 ID、组 ID（Linux 的
+    /// `maybe_add_creds` 用 `current_uid_gid`）。
+    pub fn scm_cred(&self) -> crate::unix::Ucred {
+        let g = self.t.group.borrow();
+        crate::unix::Ucred::of(self.tgid(), g.cred.ruid, g.cred.rgid)
     }
 
     /// 文件创建掩码。

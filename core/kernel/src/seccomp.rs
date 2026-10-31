@@ -745,8 +745,7 @@ fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
             syscall: nr as i32,
             arch: AUDIT_ARCH_AARCH64,
         },
-        esr: 0,
-        sender: 0,
+        ..SigInfo::default()
     }
 }
 

@@ -269,7 +269,7 @@ pub(crate) fn stop(
         t.message = message;
     }
     notify(cx.kr(), cx.task);
-    let (tid, uid) = (cx.pid_out(cx.tid()), cx.cred().ruid);
+    let (tid, uid) = (cx.pid_out(cx.tid()), cx.cred().uid_out(cx.cred().ruid));
     let resumed = loop {
         if cx.task.killed.get() {
             break None;
@@ -363,7 +363,12 @@ fn notify(k: &Kernel, task: &Task) {
         _ => code::CLD_TRAPPED,
     };
     let pid = k.pid_seen_by(tracer, task.tid.get());
-    let info = SigInfo::child_event(pid, why, exit_code & 0x7f);
+    let Some(me) = k.groups.get(&task.tgid) else {
+        return;
+    };
+    let info = signal::child_info(&me.borrow().cred, &g.borrow().cred, |uid| {
+        SigInfo::child_event(pid, uid, why, exit_code & 0x7f)
+    });
     signal::send_to_group(k, tracer, Signal::CHLD, info);
 }
 
@@ -394,7 +399,8 @@ pub(crate) fn signal_stop(
             .groups
             .get(&tracer)
             .map_or(0, |g| g.borrow().cred.ruid);
-        SigInfo::kill(code::SI_USER, cx.pid_out(tracer), uid)
+        // Linux 的 ptrace_signal：跟踪者的真实用户 ID 在被跟踪者的命名空间里的值
+        SigInfo::kill(code::SI_USER, cx.pid_out(tracer), cx.cred().uid_out(uid))
     } else if now == raw {
         info
     } else {
@@ -420,7 +426,12 @@ pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     };
     let (why, info) = if seized {
         let si_code = sig.number() | (event::STOP as i32) << 8;
-        let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
+        let info = notify_info(
+            sig,
+            si_code,
+            cx.pid_out(cx.tid()),
+            cx.cred().uid_out(cx.cred().ruid),
+        );
         (Stop::Event(event::STOP, sig), Some(info))
     } else {
         (Stop::Group(sig), None)
@@ -439,7 +450,12 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     }
     let sig = Signal::TRAP;
     let si_code = sig.number() | (event::STOP as i32) << 8;
-    let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
+    let info = notify_info(
+        sig,
+        si_code,
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
     stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
 }
 
@@ -451,7 +467,12 @@ pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
         return true;
     }
     let sig = Signal::TRAP;
-    let info = notify_info(sig, sig.number(), cx.pid_out(cx.tid()), cx.cred().ruid);
+    let info = notify_info(
+        sig,
+        sig.number(),
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
     stop(cx, cpu, Stop::Event(0, sig), Some(info), 0).is_some()
 }
 
@@ -516,7 +537,12 @@ fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
         } else {
             0
         };
-    let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
+    let info = notify_info(
+        sig,
+        si_code,
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
     let message = if entry {
         EVENTMSG_SYSCALL_ENTRY
     } else {
@@ -563,7 +589,12 @@ pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> boo
     }
     let sig = Signal::TRAP;
     let si_code = sig.number() | (e as i32) << 8;
-    let info = notify_info(sig, si_code, cx.pid_out(cx.tid()), cx.cred().ruid);
+    let info = notify_info(
+        sig,
+        si_code,
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
     stop(cx, cpu, Stop::Event(e, sig), Some(info), message).is_some()
 }
 
@@ -587,7 +618,12 @@ pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
         return event(cx, cpu, event::EXEC, old as u64);
     }
     if traced && !seized {
-        let info = SigInfo::kill(code::SI_USER, cx.pid_out(cx.tgid()), cx.cred().ruid);
+        let cred = cx.cred();
+        let info = SigInfo::kill(
+            code::SI_USER,
+            cx.pid_out(cx.tgid()),
+            cred.uid_out(cred.ruid),
+        );
         signal::send_to_task(cx.kr(), cx.task, Signal::TRAP, info);
     }
     true
@@ -711,6 +747,8 @@ pub(crate) struct TraceExit {
     pub status: ExitStatus,
     /// 是整个进程的结束：跟踪者取走之后进程才交给父进程（[`group_finished`]）。
     pub process: bool,
+    /// 退出时的凭据：SIGCHLD 和 waitid 的 si_uid 是它的真实用户 ID。
+    pub cred: crate::cred::Cred,
 }
 
 /// 被跟踪的线程 `task` 退出了（已经从 `kernel.tasks` 里拿掉）：不是主线程的单独报告给
@@ -738,6 +776,7 @@ pub(crate) fn tracee_exited(
         pgid: group.pgid,
         status,
         process: false,
+        cred: group.cred.clone(),
     };
     report_exit(k, exit);
 }
@@ -760,6 +799,7 @@ pub(crate) fn group_finished(
                 pgid: g.pgid,
                 status,
                 process: true,
+                cred: g.cred.clone(),
             },
             _ => return false,
         }
@@ -790,7 +830,13 @@ fn report_exit(k: &mut Kernel, mut exit: TraceExit) {
         return;
     }
     exit.seen = k.pid_seen_by(exit.tracer, exit.pid);
-    let (tracer, info) = (exit.tracer, SigInfo::child(exit.seen, exit.status));
+    let tracer = exit.tracer;
+    let info = signal::exit_info(
+        &exit.cred,
+        &k.groups[&tracer].borrow().cred,
+        exit.seen,
+        exit.status,
+    );
     k.trace_exits.push(exit);
     request_wake_on(wake::CHILD);
     signal::send_to_group(k, tracer, Signal::CHLD, info);

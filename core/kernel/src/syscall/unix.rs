@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use super::fs::{AT_FDCWD, lookup_at, parent_at};
 use super::net::{Message, SocketRef, epipe};
 use crate::cell::RefCell;
+use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::FileRef;
 use crate::kernel::{Cx, request_wake_object, wake};
@@ -333,9 +334,11 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
     Ok(())
 }
 
-/// 解析 sendmsg 的控制消息，取出 `SCM_RIGHTS` 要传递的打开文件。
-fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<Vec<FileRef>, Errno> {
+/// 解析 sendmsg 的控制消息，取出 `SCM_RIGHTS` 要传递的打开文件和 `SCM_CREDENTIALS` 声明的
+/// 凭据（内核 ID、全局 pid）。
+fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), Errno> {
     let mut files = Vec::new();
+    let mut declared = None;
     let mut off = 0;
     while off + CMSG_HDR <= control.len() {
         let h = &control[off..];
@@ -355,13 +358,46 @@ fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<Vec<FileRef>, Errno> {
                     files.push(cx.fds().get(i32::from_le_bytes(fd.try_into().unwrap()))?);
                 }
             }
-            // 所有进程都是 root，可以声明任何凭据；接收方看到的总是真实的发送方
-            (SOL_SOCKET, SCM_CREDENTIALS) => {}
+            (SOL_SOCKET, SCM_CREDENTIALS) => {
+                if len != CMSG_HDR + 12 {
+                    return Err(Errno::EINVAL);
+                }
+                let word = |i: usize| {
+                    u32::from_le_bytes(
+                        h[CMSG_HDR + i * 4..CMSG_HDR + i * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    )
+                };
+                declared = Some(check_creds(cx, word(0) as i32, word(1), word(2))?);
+            }
             _ => return Err(Errno::EINVAL),
         }
         off += len.next_multiple_of(8);
     }
-    Ok(files)
+    Ok((files, declared))
+}
+
+/// 发送者在 `SCM_CREDENTIALS` 里声明的凭据（Linux 的 `scm_check_creds` 和 `__scm_send`）：ID 在
+/// 自己的命名空间里要有映射（EINVAL）；pid 要是自己，或者在自己的 pid 命名空间的属主那里有
+/// CAP_SYS_ADMIN；用户 ID 要是自己的真实、有效、保存的之一，或者有 CAP_SETUID，组 ID 同样
+/// （CAP_SETGID），否则 EPERM；pid 不存在是 ESRCH。
+fn check_creds(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<Ucred, Errno> {
+    let c = cx.cred();
+    let (Some(kuid), Some(kgid)) = (c.uid_in(uid), c.gid_in(gid)) else {
+        return Err(Errno::EINVAL);
+    };
+    let pid_ok = pid == cx.pid_out(cx.tgid()) || c.ns_capable(&cx.pid_ns().owner, cap::SYS_ADMIN);
+    let uid_ok = [c.ruid, c.euid, c.suid].contains(&kuid) || c.capable_here(cap::SETUID);
+    let gid_ok = [c.rgid, c.egid, c.sgid].contains(&kgid) || c.capable_here(cap::SETGID);
+    if !(pid_ok && uid_ok && gid_ok) {
+        return Err(Errno::EPERM);
+    }
+    let global = cx.pid_in(pid);
+    if pid <= 0 || !cx.kr().tasks.contains_key(&global) {
+        return Err(Errno::ESRCH);
+    }
+    Ok(Ucred::of(global, kuid, kgid))
 }
 
 pub(super) fn send(
@@ -374,8 +410,9 @@ pub(super) fn send(
     flags: u32,
 ) -> Result<usize, Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
-    let mut files = rights(cx, control)?;
-    let cred = cx.ucred();
+    let (mut files, declared) = rights(cx, control)?;
+    // 没有声明时是发送者自己（Linux 的 maybe_add_creds 用真实用户 ID、组 ID）
+    let cred = declared.unwrap_or_else(|| cx.scm_cred());
     let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
     let deadline = deadline(timeout);
     if ty == SOCK_DGRAM {
@@ -594,10 +631,12 @@ fn deliver(
     let mut out_flags = if r.len > r.data.len() { MSG_TRUNC } else { 0 };
     if passcred {
         if control_len >= CMSG_HDR + 12 {
-            // pid 是接收者看到的（Linux 的 scm_recv 用 pid_vnr）
+            // pid、ID 是接收者看到的（Linux 的 scm_recv 用 pid_vnr、from_kuid_munged）
+            let me = cx.cred();
             let cred = Ucred {
                 pid: cx.pid_out(r.cred.pid),
-                ..r.cred
+                uid: me.uid_out(r.cred.uid),
+                gid: me.gid_out(r.cred.gid),
             };
             push_cmsg(&mut control, SCM_CREDENTIALS, &cred.encode());
         } else {
@@ -677,12 +716,14 @@ pub(super) fn setsockopt(
     Ok(())
 }
 
-/// `pid_ns` 是调用者的 pid 命名空间：`SO_PEERCRED` 的 pid 按它算。
+/// `pid_ns`、`cred` 是调用者的 pid 命名空间和凭据：`SO_PEERCRED` 的 pid、ID 按它们换算
+/// （Linux 的 `cred_to_ucred`）。
 pub(super) fn getsockopt(
     u: &UnixSocket,
     level: i32,
     name: i32,
     pid_ns: &crate::pidns::PidNs,
+    cred: &crate::cred::Cred,
 ) -> Result<Vec<u8>, Errno> {
     if level != SOL_SOCKET {
         return Err(Errno::EOPNOTSUPP);
@@ -702,7 +743,8 @@ pub(super) fn getsockopt(
             .peer_cred
             .map(|c| Ucred {
                 pid: pid_ns.vnr(c.pid).unwrap_or(0),
-                ..c
+                uid: cred.uid_out(c.uid),
+                gid: cred.gid_out(c.gid),
             })
             .unwrap_or(Ucred {
                 pid: 0,

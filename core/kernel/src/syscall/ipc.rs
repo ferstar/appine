@@ -197,9 +197,9 @@ pub(super) fn msgrcv(
 
 /// `struct msqid64_ds`（120 字节）。
 /// `pid` 把记下的 pid 换成调用者看到的。
-fn encode_msqid(perm: &Perm, q: &MsgQueue, pid: impl Fn(Tid) -> Tid) -> [u8; 120] {
+fn encode_msqid(perm: &Perm, cred: &Cred, q: &MsgQueue, pid: impl Fn(Tid) -> Tid) -> [u8; 120] {
     let mut b = [0u8; 120];
-    b[..48].copy_from_slice(&perm.encode());
+    b[..48].copy_from_slice(&perm.encode(cred));
     words(
         &mut b,
         48,
@@ -249,7 +249,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             let t = &cx.ipc().msg;
             let (full, (perm, q)) =
                 stat_target(t, &cred, id, cmd != IPC_STAT, cmd == MSG_STAT_ANY)?;
-            let b = encode_msqid(perm, q, |p| ns.vnr(p).unwrap_or(0));
+            let b = encode_msqid(perm, &cred, q, |p| ns.vnr(p).unwrap_or(0));
             put(cx, buf, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
         }
@@ -262,7 +262,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             if qbytes > msgmnb && !cred.capable(cap::SYS_RESOURCE) {
                 return Err(Errno::EPERM);
             }
-            perm.set(&b[..48]);
+            perm.set(&b[..48], &cred)?;
             q.qbytes = qbytes;
             q.ctime = now();
             crate::kernel::request_wake();
@@ -313,9 +313,9 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
 }
 
 /// `struct semid64_ds`（88 字节）。
-fn encode_semid(perm: &Perm, s: &SemSet) -> [u8; 88] {
+fn encode_semid(perm: &Perm, cred: &Cred, s: &SemSet) -> [u8; 88] {
     let mut b = [0u8; 88];
-    b[..48].copy_from_slice(&perm.encode());
+    b[..48].copy_from_slice(&perm.encode(cred));
     words(
         &mut b,
         48,
@@ -366,7 +366,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
             let t = &cx.ipc().sem;
             let (full, (perm, s)) =
                 stat_target(t, &cred, id, cmd != IPC_STAT, cmd == SEM_STAT_ANY)?;
-            let b = encode_semid(perm, s);
+            let b = encode_semid(perm, &cred, s);
             put(cx, arg, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
         }
@@ -374,7 +374,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
             let b: [u8; 88] = get(cx, arg)?;
             let (perm, s) = cx.ipc_mut().sem.get_mut(id)?;
             perm.may_change(&cred)?;
-            perm.set(&b[..48]);
+            perm.set(&b[..48], &cred)?;
             s.ctime = now();
             Ok(0)
         }
@@ -648,9 +648,15 @@ pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
 
 /// `struct shmid64_ds`（112 字节）。
 /// `pid` 把记下的 pid 换成调用者看到的。
-fn encode_shmid(perm: &Perm, s: &ShmSeg, nattch: u64, pid: impl Fn(Tid) -> Tid) -> [u8; 112] {
+fn encode_shmid(
+    perm: &Perm,
+    cred: &Cred,
+    s: &ShmSeg,
+    nattch: u64,
+    pid: impl Fn(Tid) -> Tid,
+) -> [u8; 112] {
     let mut b = [0u8; 112];
-    b[..48].copy_from_slice(&perm.encode());
+    b[..48].copy_from_slice(&perm.encode(cred));
     words(
         &mut b,
         48,
@@ -704,7 +710,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
                 cmd == SHM_STAT_ANY,
             )?;
             let attached = nattch(k, (ipc_ns, full));
-            let b = encode_shmid(perm, s, attached, |p| ns.vnr(p).unwrap_or(0));
+            let b = encode_shmid(perm, &cred, s, attached, |p| ns.vnr(p).unwrap_or(0));
             put(cx, buf, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
         }
@@ -712,7 +718,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             let b: [u8; 112] = get(cx, buf)?;
             let (perm, s) = cx.ipc_mut().shm.get_mut(id)?;
             perm.may_change(&cred)?;
-            perm.set(&b[..48]);
+            perm.set(&b[..48], &cred)?;
             s.ctime = now();
             Ok(0)
         }

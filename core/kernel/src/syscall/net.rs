@@ -717,7 +717,7 @@ pub(super) fn getsockopt(
                 encode_tv(s.rcvtimeo)
             }
             Socket::Netlink(_) => 0i32.to_le_bytes().to_vec(),
-            Socket::Unix(u) => unix::getsockopt(u, level, name, &pid_ns)?,
+            Socket::Unix(u) => unix::getsockopt(u, level, name, &pid_ns, &cx.cred())?,
         }
     };
     // 非阻塞的 TCP 连接被拒绝：guest 从这里得知（宿主读一次就清掉，不会数两次）

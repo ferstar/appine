@@ -75,7 +75,9 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     }
     if let Some(sig) = sig {
         for tgid in allowed {
-            let info = SigInfo::kill(code::SI_USER, cx.pid_out(me), cred.ruid).from(me);
+            let info = SigInfo::kill(code::SI_USER, cx.pid_out(me), cred.uid_out(cred.ruid))
+                .sent_by(&cred)
+                .from(me);
             signal::send_to_group(cx.kr(), tgid, sig, info);
         }
     }
@@ -124,7 +126,9 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
             return Err(Errno::EAGAIN);
         }
         let me = cx.tgid();
-        let info = SigInfo::kill(code::SI_TKILL, cx.pid_out(me), cred.ruid).from(me);
+        let info = SigInfo::kill(code::SI_TKILL, cx.pid_out(me), cred.uid_out(cred.ruid))
+            .sent_by(&cred)
+            .from(me);
         signal::send_to_task(cx.kr(), &task, sig, info);
     }
     Ok(0)
@@ -140,8 +144,7 @@ fn queue_info(b: &[u8; 128]) -> SigInfo {
             uid: word(20) as u32,
             value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
         },
-        esr: 0,
-        sender: 0,
+        ..SigInfo::default()
     }
 }
 
@@ -187,13 +190,13 @@ pub(super) fn pidfd_send_signal(
         if i32::from_le_bytes(b[..4].try_into().unwrap()) != sig.map_or(0, Signal::number) {
             return Err(Errno::EINVAL);
         }
-        let info = queue_info(&b);
+        let info = queue_info(&b).sent_by(&cred);
         if (info.code >= 0 || info.code == code::SI_TKILL) && tgid != me {
             return Err(Errno::EPERM);
         }
         info
     } else {
-        SigInfo::kill(code::SI_USER, cx.pid_out(me), cred.ruid)
+        SigInfo::kill(code::SI_USER, cx.pid_out(me), cred.uid_out(cred.ruid)).sent_by(&cred)
     }
     .from(me);
     if !cx.kr().groups.contains_key(&tgid) {
@@ -227,7 +230,7 @@ pub(super) fn sigqueueinfo(
     uinfo: u64,
 ) -> SysResult {
     let b: [u8; 128] = get(cx, uinfo)?;
-    let info = queue_info(&b).from(cx.tgid());
+    let info = queue_info(&b).sent_by(&cx.cred()).from(cx.tgid());
     let code = info.code;
     let target = tid.unwrap_or(tgid);
     if (code >= 0 || code == code::SI_TKILL) && target != cx.tid() && tgid != cx.tgid() {

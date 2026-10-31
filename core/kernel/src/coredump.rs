@@ -455,8 +455,9 @@ fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
     b[3] = cx.task.nice.get() as i8 as u8;
     let flags = PF_DUMPCORE | PF_SIGNALED | if g.execed { 0 } else { PF_FORKNOEXEC };
     b[8..16].copy_from_slice(&flags.to_le_bytes());
-    b[16..20].copy_from_slice(&g.cred.ruid.to_le_bytes());
-    b[20..24].copy_from_slice(&g.cred.rgid.to_le_bytes());
+    // 真实用户 ID、组 ID 在进程自己的用户命名空间里的值（Linux 的 fill_psinfo）
+    b[16..20].copy_from_slice(&g.cred.uid_out(g.cred.ruid).to_le_bytes());
+    b[20..24].copy_from_slice(&g.cred.gid_out(g.cred.rgid).to_le_bytes());
     for (i, &v) in [g.tgid, g.ppid, g.pgid, g.sid].iter().enumerate() {
         let v = g.pid_ns.vnr(v).unwrap_or(0);
         b[24 + i * 4..28 + i * 4].copy_from_slice(&v.to_le_bytes());

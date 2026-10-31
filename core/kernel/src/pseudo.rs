@@ -2679,9 +2679,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 .map(|t| t.ns.borrow().net.clone())
                 .filter(|n| n.host_net.is_some());
             let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
+            // uid 列按读者的用户命名空间换算（Linux 的 seq_user_ns）
+            let reader = ps.reader();
             let socks: Vec<(SocketRef, u32)> = sockets(ps.k)
                 .into_iter()
                 .filter(|(s, _)| socket_net(&s.borrow()) == id)
+                .map(|(s, uid)| (s, reader.uid_out(uid)))
                 .collect();
             let ifaces = match &net {
                 Some(n) => vec![crate::netns::lo_interface(n)],
@@ -2765,9 +2768,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 let ns = ps.ns().ipc.id;
                 ps.k.ipc(ns).tunables.read(&path[11..]).unwrap()
             }
-            b"sysvipc/msg" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"msg"),
-            b"sysvipc/sem" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"sem"),
-            b"sysvipc/shm" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"shm"),
+            b"sysvipc/msg" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"msg", &ps.reader()),
+            b"sysvipc/sem" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"sem", &ps.reader()),
+            b"sysvipc/shm" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"shm", &ps.reader()),
             b"sys/kernel/tainted" => "0\n".to_owned(),
             b"sys/kernel/threads-max" => format!("{}\n", ps.k.threads_max),
             b"sys/vm/max_map_count" => {
