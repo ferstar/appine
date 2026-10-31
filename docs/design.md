@@ -44,7 +44,7 @@
 
 ptrace（§7.6）：strace、gdb 可以用。
 
-glibc 发行版不在 v1 的承诺里。探测过：Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库时，apt、gcc、gdb、python 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server 都能用；从 Alpine chroot 进去要自己挂上 `/proc`、`/sys`、`/dev/pts`（§8.2，见 [glibc 发行版的探测](rounds/69-glibc-probe.md)、[mount 的子集](rounds/105-mount-subset.md)），`/dev` 里的设备节点要复制过去（仓库里的目录还不能 bind）。
+glibc 发行版不在 v1 的承诺里。探测过：Debian 13、Ubuntu 24.04 的 rootfs 直接当作仓库时，apt、gcc、gdb、python 的 manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK、code-server 都能用；从 Alpine chroot 进去要自己挂上 `/proc`、`/sys`，`/dev` 用 `mount --rbind` 带进去（连同挂在里面的 `/dev/pts`；§8.2，见 [glibc 发行版的探测](rounds/69-glibc-probe.md)、[mount 的子集](rounds/105-mount-subset.md)、[仓库里的目录 bind](rounds/116-store-binds.md)）。
 
 ### 1.3 性能目标
 
