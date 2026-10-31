@@ -327,3 +327,65 @@ print("TIOCSIG SIGINT", err(fcntl.ioctl, m, TIOCSIG, signal.SIGINT))
 _, st = os.waitpid(pid, 0)
 print("child", os.WIFSIGNALED(st) and signal.Signals(os.WTERMSIG(st)).name)
 PY
+
+# 新分配的终端：窗口大小全是 0；主设备的读只在从设备打开过、又全部关掉之后才是 EIO（poll
+# 带 POLLHUP，Linux 的 TTY_OTHER_CLOSED），从来没打开过时照常等。GNU screen 的子进程打开从
+# 设备之前，主进程就在读主设备
+python3 - <<'PY'
+import errno, fcntl, functools, os, select, struct, time
+
+print = functools.partial(print, flush=True)
+TIOCGPTN, TIOCSPTLCK = 0x80045430, 0x40045431
+
+
+def st(m):
+    p = select.poll()
+    p.register(m, select.POLLIN | select.POLLOUT)
+    ev = p.poll(0)
+    try:
+        r = os.read(m, 10)
+    except OSError as e:
+        r = errno.errorcode[e.errno]
+    return (ev[0][1] if ev else 0), r
+
+
+def lock(m, on):
+    fcntl.ioctl(m, TIOCSPTLCK, struct.pack("i", on))
+
+
+m = os.open("/dev/ptmx", os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+name = "/dev/pts/%d" % struct.unpack("I", fcntl.ioctl(m, TIOCGPTN, bytes(4)))[0]
+print("winsize", struct.unpack("4H", fcntl.ioctl(m, 0x5413, bytes(8))))  # TIOCGWINSZ
+print("locked", st(m))
+lock(m, 0)
+print("unlocked, never opened", st(m))
+s = os.open(name, os.O_RDWR | os.O_NOCTTY)
+print("slave open", st(m))
+s2 = os.dup(s)
+os.close(s)
+print("one of two closed", st(m))
+os.close(s2)
+print("all closed", st(m))
+lock(m, 1)
+print("locked again", st(m))
+lock(m, 0)
+s = os.open(name, os.O_RDWR | os.O_NOCTTY)
+print("reopened", st(m))
+os.close(s)
+os.close(m)
+
+# 阻塞的读：子进程过一会儿才打开从设备、写一行再关掉
+m = os.open("/dev/ptmx", os.O_RDWR | os.O_NOCTTY)
+name = "/dev/pts/%d" % struct.unpack("I", fcntl.ioctl(m, TIOCGPTN, bytes(4)))[0]
+lock(m, 0)
+pid = os.fork()
+if pid == 0:
+    time.sleep(0.3)
+    s = os.open(name, os.O_RDWR | os.O_NOCTTY)
+    os.write(s, b"late\n")
+    time.sleep(0.2)
+    os._exit(0)
+print("blocking read", os.read(m, 100))
+os.waitpid(pid, 0)
+print("after the child", st(m))
+PY

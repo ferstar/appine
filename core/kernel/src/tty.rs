@@ -266,6 +266,7 @@ pub struct Winsize {
 }
 
 impl Default for Winsize {
+    /// 不知道宿主终端的大小时控制台用的 24×80。
     fn default() -> Self {
         Winsize {
             rows: 24,
@@ -337,6 +338,9 @@ pub struct Tty {
     /// 打开着的主设备、从设备个数。
     pub masters: usize,
     pub slaves: usize,
+    /// 从设备打开过、现在全部关掉了（Linux 的 `TTY_OTHER_CLOSED`）：主设备的读是 EIO，poll
+    /// 带 POLLHUP；重新打开从设备时清掉。从来没打开过时不算，主设备的读照常阻塞。
+    pub slave_closed: bool,
     /// 从设备是否还没有解锁（unlockpt）。
     pub locked: bool,
     /// 主设备都关掉了，已经挂断（`syscall::tty::hang_up`）：打开着的从设备读返回 0，写和
@@ -369,7 +373,13 @@ impl Tty {
         Tty {
             index,
             termios: Termios::default(),
-            winsize: Winsize::default(),
+            // 与 Linux 新分配的终端一样全是 0；控制台建好之后另外设（`terminal::open`）
+            winsize: Winsize {
+                rows: 0,
+                cols: 0,
+                xpixel: 0,
+                ypixel: 0,
+            },
             editing: Vec::new(),
             lines: VecDeque::new(),
             raw: VecDeque::new(),
@@ -384,6 +394,7 @@ impl Tty {
             fg: None,
             masters: 0,
             slaves: 0,
+            slave_closed: false,
             locked: true,
             hung_up: false,
             vhangups: [0; 2],
@@ -887,6 +898,7 @@ impl PtyEnd {
                 t.masters += 1;
             } else {
                 t.slaves += 1;
+                t.slave_closed = false;
                 // 重新打开之后又能挂断了（Linux 的 tty_open 清掉 TTY_HUPPED）
                 t.hupped[0] = false;
             }
@@ -904,6 +916,7 @@ impl Drop for PtyEnd {
                 t.masters -= 1;
             } else {
                 t.slaves -= 1;
+                t.slave_closed = t.slaves == 0;
             }
             self.master && t.masters == 0 && !t.hung_up
         };

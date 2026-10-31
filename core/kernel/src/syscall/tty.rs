@@ -270,7 +270,7 @@ fn master_read(
                 request_wake_object(wake::of(tty));
                 return Ok(head + out.len());
             }
-            if t.slaves == 0 && !t.locked {
+            if t.slave_closed {
                 return Err(Errno::EIO);
             }
         }
@@ -483,7 +483,7 @@ pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
         if tty.input_room() > 0 {
             ev |= POLLOUT | POLLWRNORM;
         }
-        if tty.slaves == 0 && !tty.locked {
+        if tty.slave_closed {
             ev |= POLLHUP;
         }
     } else {
