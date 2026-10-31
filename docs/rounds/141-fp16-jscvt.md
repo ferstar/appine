@@ -23,10 +23,22 @@
 - 引擎的单元测试：`half_precision_follows_the_feature_set`（FADD h、FMLA 8H、FMOV 8H）、`javascript_conversion_follows_the_feature_set`（取模 2^32、只有精确时 Z 置位），`id_registers_match_hwcap` 加上 PFR0 和 ISAR1 的新字段；`unimplemented_encodings_are_undefined` 里原来的 FP16 例子换成 RDM 的 SQRDMLAH 和 FHM 的 FMLAL。
 - 差分测试 `c-programs` 加上 `fp16.c`（`-march=armv8.2-a+fp16`）：HWCAP 和 ID 寄存器的字段；FJCVTZS 的 13 个输入（3.0、-1.5、超出 2^32、±2^31 附近、1e20、-0、0.5、±∞、NaN 等）的结果和 Z；编译器向量化成 `fmla v.8h` 的数组乘加的校验和；vfmaq、vdivq、vsqrtq、vrndnq、vrecpeq、按元素的 vfmaq、比较、转换、跨元素的最大最小；标量的加、除、乘加、转换、开方；FZ16 把非规格化的半精度结果冲成 0、读回来还在。两个执行层下都与原生逐字相同。
 - 测量（开发用的虚拟机，Apple Silicon 上的 colima，4 核）：模仿 ggml 的 `ggml_vec_dot_f16` 写了两种 4096 个元素的 F16 点积，一种用 FP16 向量 FMLA（armv8.2_2 那一档的做法），一种先用 FCVTL 转成 f32 再 FMLA（armv8.2_1 和更低）。原生 0.0326 对 0.0734 ns/元素（2.25 倍）；appine 的 Tier 1 下 0.069 对 0.149 ns/元素（2.2 倍，两种都比原生慢一倍左右，是 soft-MMU 的访存检查）。上一轮的二进制不宣告 FP16，前一种 SIGILL，程序只能走后一种。
+- llama.cpp（v0.8.0）：在差分测试的 Alpine 镜像里原生编译 `-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF`，得到 armv8.0_1 到 armv9.2_2 八档 CPU 后端；一个目录放全部后端，另一个只留 armv8.0_1、armv8.2_1（相当于没有 FP16）。模型是 stories15M、Qwen2.5-0.5B-Instruct 的 Q4_0 和由它们转出来的 F16（`llama-quantize`）。`llama-bench -p 128 -n 32 -t 4 -r 3`，两个目录交替各跑两遍取平均，单位 tokens/s。原生在本地盘上，appine 的仓库在虚拟机本地的卷上（`/bench/store`），都用 Tier 1。
+
+  | 模型 | 测试 | 原生 8.2_1 | 原生 8.2_2 | appine 8.2_1 | appine 8.2_2 |
+  |---|---|---|---|---|---|
+  | Qwen2.5-0.5B F16 | 提示 128 | 229.6 | 378.1（+65%） | 126.9 | 230.9（+82%） |
+  | Qwen2.5-0.5B F16 | 生成 32 | 83.8 | 95.6（+14%） | 54.2 | 78.3（+44%） |
+  | stories15M F16 | 提示 128 | 11886 | 16170（+36%） | 5982 | 8725（+46%） |
+  | stories15M F16 | 生成 32 | 2042 | 2640 | 1257 | 1691（+35%） |
+  | Qwen2.5-0.5B Q4_0 | 提示 128 / 生成 32 | 1128 / 230 | 1171 / 225 | 843 / 190 | 851 / 187 |
+
+  - 带全部后端时，新的二进制挑中 armv8.2_2，上一轮的二进制挑中 armv8.2_1（ggml 的 `load_backend` 打印），数字与只留 armv8.2_1 的目录相同：差别全部来自宣告 FP16。
+  - F16 的权重和注意力（KV cache 默认是 F16）走半精度的向量 FMA，提示处理在 appine 里快 82%，比原生的收益（65%）还大，原因没有细查（可能是没有 FP16 的那条路径访存更多，每次访存在 Tier 1 里都要过 soft-MMU 的检查）。Q4_0 的矩阵乘走 int8 点积，两档没有差别。
+  - 相对原生（都用最好的那档）：Qwen F16 的提示 1.64×、生成 1.22×（不宣告 FP16 时 2.98×、1.74×），Q4_0 1.38×、1.21×。
 - cargo test、clippy（含 Android）、两层的全部差分测试通过。全量 cargo test 第一次和差分测试同时跑时 `stop_and_continue_signals` 失败过一次（STOP、CONT 之后各只等 0.2 秒就读进程状态），单独跑、空闲时全量跑都通过。LTP 的 syscall 测试 1006 个通过（上次 1006）：epoll_pwait03 由失败变回通过，mmap21_02 这次是 `/dev/shm/ltp_mmap21_2` 的 EEXIST，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
 
 **推迟项**：
 
-- llama.cpp 本身的收益没量：要在 appine 里编译、运行带 `GGML_CPU_ALL_VARIANTS` 的 llama.cpp，比较 armv8.2_1 和 armv8.2_2 两档（F16 的 KV cache、F16 的权重）。
 - FHM（FMLAL/FMLSL，半精度乘加到单精度）、BF16、RDM、FCMA 仍不宣告；FHM 依赖 FP16，ML 库（XNNPACK、onnxruntime）用它，可以照这一轮的做法加。
 - 宿主只有 FPHP、ASIMDHP 中的一个时两个都不宣告（实际的 CPU 总是一起实现）。
