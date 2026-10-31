@@ -1,6 +1,6 @@
 # M9 之前：新分配的 PTY（2026-11-01）
 
-← [M9 之前：Ubuntu 26.04 的普查（2026-10-31）](149-ubuntu26-survey.md) · [索引](../milestones.md)
+← [M9 之前：Ubuntu 26.04 的普查（2026-10-31）](149-ubuntu26-survey.md) · [索引](../milestones.md) · [M9 之前：短的符号链接不占块（2026-11-01）](151-short-symlink-blocks.md) →
 
 [Ubuntu 26.04 的普查](149-ubuntu26-survey.md)的问题 1 和 3，都是新分配的终端的初始状态。
 

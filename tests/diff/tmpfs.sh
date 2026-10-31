@@ -26,6 +26,10 @@ stat -c '%a %u %g' /tmp/t/a /tmp/t/b
 stat -f -c %T /tmp/t/a
 echo "own device: $([ "$(stat -c %d /tmp/t/a)" != "$(stat -c %d /tmp/t)" ] && [ "$(stat -c %d /tmp/t/a)" != "$(stat -c %d /tmp/t/b)" ] && echo yes)"
 umount /tmp/t/c
+# 128 字节以内的符号链接存在 inode 里，不占块（shmem_symlink 的 SHORT_SYMLINK_LEN），长的一页
+ln -s "$(printf %0127d 0)" /tmp/t/a/s127 && ln -s "$(printf %0128d 0)" /tmp/t/a/s128
+stat -c '%s %b' /tmp/t/a/s127 /tmp/t/a/s128
+rm /tmp/t/a/s127 /tmp/t/a/s128
 
 python3 - <<'PY'
 import ctypes, errno, mmap, os, socket, stat

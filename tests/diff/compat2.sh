@@ -1149,3 +1149,12 @@ int main(int argc, char **argv)
 }
 C
 gcc -O1 -pthread -o pdeath pdeath.c && ./pdeath
+
+# 短的符号链接存在 inode 里，不占块：ext4 上是目标短于 60 字节的（ext4_symlink），ls -l 的
+# total 因此不算它们（tmpfs 的在 tmpfs 组）
+cd /tmp
+rm -f sl59 sl60
+ln -s "$(printf %059d 0)" sl59
+ln -s "$(printf %060d 0)" sl60
+stat -c '%s %b' sl59 sl60
+rm -f sl59 sl60

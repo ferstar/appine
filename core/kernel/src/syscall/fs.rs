@@ -377,8 +377,11 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     };
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
-    // sysfs 的文件报告一页的大小，但不占块
-    let blocks = if dev == Fs::Sys.dev() {
+    // sysfs 的文件报告一页的大小，但不占块。短的符号链接存在 inode 里、不占块：ext4 是目标
+    // 短于 60 字节（`ext4_symlink`，连同结尾的 NUL 放得进 `i_data`），tmpfs 这类别的是 128
+    // 字节以内（`shmem_symlink` 的 `SHORT_SYMLINK_LEN`）
+    let inline = if dev == ROOT_DEV { 60 } else { 128 };
+    let blocks = if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
         0
     } else {
         size.div_ceil(4096) * 8
