@@ -21,7 +21,7 @@
 
 ## 测试
 
-- 新的差分测试组 `openat2`：在 `/tmp` 里搭一棵目录树（相对、绝对、指到外面、指到 `/proc/self`、悬空、循环的符号链接），比 struct 的各种长度和尾部、各种不合法的标志和 mode、`O_PATH` 的组合、`RESOLVE_CACHED`、fd 标志（`FD_CLOEXEC`、`O_LARGEFILE`）；`BENEATH`、`IN_ROOT` 下的绝对路径、`..`、各种符号链接、无效的 dirfd、从文件出发；`NO_SYMLINKS` 下途中和最后的链接、`O_NOFOLLOW`；`NO_MAGICLINKS` 下 `fd`、`cwd`、`root`、`exe`、`ns` 和普通链接 `/proc/self`；`NO_XDEV` 下进出 `/proc`、相对和绝对路径里的绝对链接、`a/../abs`、从 `/proc` 出发的魔法链接和 `..`，有作用域时的魔法链接；`O_CREAT` 沿着悬空链接新建（建在哪里、外面有没有建出来）、越出起点的新建、目录和 `/`。原生的 6.8 与 6.1 不同的两处（`O_DIRECTORY | O_CREAT`、`RESOLVE_CACHED` 配 `O_DIRECTORY`）不比。两个执行层下都与原生逐字相同。
+- 新的差分测试组 `openat2`：在 `/tmp` 里搭一棵目录树（相对、绝对、指到外面、指到 `/proc/self`、悬空、循环的符号链接），比 struct 的各种长度和尾部、各种不合法的标志和 mode、`O_PATH` 的组合、`RESOLVE_CACHED`、fd 标志（`FD_CLOEXEC`、`O_LARGEFILE`）；`BENEATH`、`IN_ROOT` 下的绝对路径、`..`、各种符号链接、无效的 dirfd、从文件出发；`NO_SYMLINKS` 下途中和最后的链接、`O_NOFOLLOW`；`NO_MAGICLINKS` 下 `fd`、`cwd`、`root`、`exe`、`ns` 和普通链接 `/proc/self`；`NO_XDEV` 下进出 `/proc`、相对和绝对路径里的绝对链接、`a/../abs`、从 `/proc` 出发的魔法链接和 `..`，有作用域时的魔法链接；`O_CREAT` 沿着悬空链接新建（建在哪里、外面有没有建出来）、越出起点的新建、目录和 `/`。原生的 6.8 与 6.1 不同的两处（`O_DIRECTORY | O_CREAT`、`RESOLVE_CACHED` 配 `O_DIRECTORY`）不比；推送之后 CI 上更新的内核又多一处：6.1、6.8 去掉 `FMODE_NONOTIFY` 这一位、照常打开，它返回 EINVAL，也拿掉了。两个执行层下都与原生逐字相同。
 - 第一版漏了 `NO_XDEV` 时 nd->root 还没取过的情形（相对路径里的绝对链接放行了），差分测试发现、按 `nd_jump_root` 改。变异检查：有作用域时放行魔法链接，用例在两行起不同。
 - `bwrap`、`namespaces`、`tmpfs` 三组（bubblewrap 0.12 现在真的走 openat2）两层都通过。
 - 单元测试 `openat2_resolve_flags_limit_the_walk`（`vfs`）：五种限制在仓库和挂载上的各种情形，新建时的父目录。

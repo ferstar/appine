@@ -3,8 +3,9 @@
 # 对路径解析的限制，O_CREAT 沿着悬空的符号链接新建时也受限制。都在 /tmp 和 /proc 里做：容器
 # 里的 /etc/hosts 这些是 bind 挂载，appine 里不是。6.4 起 O_DIRECTORY|O_CREAT 是 EINVAL（6.1
 # 不是）；6.1 里 RESOLVE_CACHED 配 O_DIRECTORY 是 EAGAIN（O_TMPFILE 的宏含 O_DIRECTORY），
-# 后来的内核不是：这两种不比。RESOLVE_CACHED 在原生上要看 dentry 在不在缓存里，只比"成功
-# 或 EAGAIN"
+# 后来的内核不是；6.1、6.8 把 FMODE_NONOTIFY（0x4000000）当作不该给的位去掉，CI 上更新的
+# 内核把它当作不认识的位、EINVAL：这三种不比。RESOLVE_CACHED 在原生上要看 dentry 在不在缓存
+# 里，只比"成功或 EAGAIN"
 set -e
 cd /tmp
 cat > openat2.c <<'C'
@@ -124,7 +125,6 @@ int main(void)
     puts("flags");
     show("unknown flag bit", o2(root, "a", 1u << 30, 0, 0));
     show("bit 32", o2(root, "a", 1ull << 32, 0, 0));
-    show("FMODE_NONOTIFY is dropped", o2(root, "a", 0x4000000, 0, 0));
     show("unknown resolve bit", o2(root, "a", 0, 0, 0x40));
     show("BENEATH | IN_ROOT", o2(root, "a", 0, 0, RESOLVE_BENEATH | RESOLVE_IN_ROOT));
     show("mode without O_CREAT", o2(root, "a", 0, 0644, 0));
