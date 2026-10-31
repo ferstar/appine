@@ -853,6 +853,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         g.threads.retain(|&t| t != tid);
         g.threads.is_empty()
     };
+    // 这个线程建的子进程交给进程里还活着的线程（Linux 的 forget_original_parent）；最后一个
+    // 线程的由 finish_group 过继出去
+    if !last {
+        let to = crate::process::alive_thread(&k, &group.borrow());
+        crate::process::hand_thread_children(&k, &group, tid, to);
+    }
     // 后面的步骤出错时：还有别的线程就结束这个进程，否则它已经结束了，只报告
     let failed = |k: &Kernel, step: &str| {
         if last {

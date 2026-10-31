@@ -301,6 +301,10 @@ pub(crate) struct ThreadGroup {
     pub tgid: Tid,
     /// 父进程。
     pub ppid: Tid,
+    /// 父进程里建立它的线程（Linux 的 `real_parent`；`CLONE_PARENT` 时是调用者的父线程）：
+    /// 那个线程退出之后换成同一个进程里还活着的线程，过继时换成新的父进程里的线程。
+    /// `/proc/<pid>/task/<tid>/children` 按它列出线程的子进程。
+    pub parent_thread: Tid,
     /// 进程组。
     pub pgid: Tid,
     /// 会话。
@@ -413,6 +417,7 @@ impl ThreadGroup {
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             tgid,
             ppid,
+            parent_thread: ppid,
             pgid: tgid,
             sid: tgid,
             threads: Vec::new(),
@@ -553,6 +558,35 @@ impl Rusage {
     }
 }
 
+/// 进程 `g` 里还活着、没有正在被结束的第一个线程（Linux 的 `find_alive_thread`，主线程在
+/// 最前面），都在被结束时是第一个线程，没有线程时是 `tgid`。孤儿过继给一个进程时由它当父
+/// 线程。
+pub(crate) fn alive_thread(k: &Kernel, g: &ThreadGroup) -> Tid {
+    g.threads
+        .iter()
+        .copied()
+        .find(|t| k.tasks.get(t).is_some_and(|t| !t.killed.get()))
+        .or_else(|| g.threads.first().copied())
+        .unwrap_or(g.tgid)
+}
+
+/// 进程 `parent` 里的线程 `from` 退出了：它建的子进程改由同一个进程里的线程 `to` 当父线程，
+/// 排到子进程列表的最后（Linux 的 `forget_original_parent` 在本进程里找到新的父线程时
+/// `list_splice_tail_init`）。
+pub(crate) fn hand_thread_children(k: &Kernel, parent: &RefCell<ThreadGroup>, from: Tid, to: Tid) {
+    let mut p = parent.borrow_mut();
+    let (moved, kept): (Vec<Tid>, Vec<Tid>) = p.children.iter().partition(|c| {
+        k.groups
+            .get(c)
+            .is_some_and(|g| g.borrow().parent_thread == from)
+    });
+    for c in &moved {
+        k.groups[c].borrow_mut().parent_thread = to;
+    }
+    p.children = kept;
+    p.children.extend(moved);
+}
+
 /// 线程组的最后一个线程退出之后：把子进程交给 init，通知父进程或者直接回收。
 ///
 /// 每一步分别兜住内核层的 bug（[`crate::bug`]）：出错时报告，后面的步骤照样做。出错的那一步
@@ -599,6 +633,10 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                     .filter(|&r| ns.level > 0 && !zap && k.groups.contains_key(&r))
             })
             .unwrap_or(INIT);
+        let reaper_thread = k
+            .groups
+            .get(&reaper)
+            .map_or(reaper, |g| alive_thread(k, &g.borrow()));
         let children = std::mem::take(&mut group.borrow_mut().children);
         for c in children {
             let Some(child) = k.groups.get(&c).cloned() else {
@@ -607,6 +645,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             let zombie = {
                 let mut cg = child.borrow_mut();
                 cg.ppid = reaper;
+                cg.parent_thread = reaper_thread;
                 cg.exit_signal = Signal::CHLD.number();
                 if cg.pgid != pgid && cg.sid == sid {
                     pgrps.push(cg.pgid);

@@ -1,6 +1,6 @@
 # M9 之前：点积指令 ASIMDDP（2026-10-31）
 
-← [M9 之前：setns 经由 pidfd（2026-10-31）](132-setns-pidfd.md) · [索引](../milestones.md)
+← [M9 之前：setns 经由 pidfd（2026-10-31）](132-setns-pidfd.md) · [索引](../milestones.md) · [M9 之前：task 目录的 children（2026-10-31）](134-task-children.md) →
 
 设计文档 §4.4 把 ASIMDDP、LRCPC、SHA3、SHA512 放在 v1.x。ASIMDDP 是 Advanced SIMD 的 int8 点积（SDOT、UDOT，ARMv8.2 可选、v8.4 起必有，手机上 Cortex-A55、A75 起的核都有）：llama.cpp、onnxruntime、XNNPACK、libvpx、libaom、ffmpeg 等看 `HWCAP_ASIMDDP` 选点积的代码路径，没有时走慢的 NEON 路径；直接按 `+dotprod` 编译、不检测的预编译程序在 appine 里会 SIGILL。
 

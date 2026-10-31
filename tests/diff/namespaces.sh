@@ -331,7 +331,7 @@ child(nested)
 PY2
 
 # pid 命名空间：busybox 的 unshare -p -f --mount-proc，里面的 sh 是 1 号进程
-unshare -p -f --mount-proc sh -c '
+busybox unshare -p -f --mount-proc sh -c '
     echo "pid $$ ppid $PPID"
     echo /proc/[0-9]*
     echo "self $(readlink /proc/self) thread-self $(readlink /proc/thread-self)"
@@ -347,7 +347,9 @@ unshare -p -f --mount-proc sh -c '
 '
 echo "unshare exits with $?"
 # 在里面 strace -f：跟踪者拿到的新进程的编号（PTRACE_GETEVENTMSG）和 wait 的结果都是里面的
-unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
+busybox unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
+# 1 号进程的 task/1/children 里是里面的编号（两个后台的 sleep 和 cat 自己）
+busybox unshare -p -f --mount-proc sh -c 'sleep 100 & sleep 100 & echo "children of 1: $(cat /proc/1/task/1/children)."; kill 2 3'
 
 python3 - <<'PY3'
 import ctypes, errno, functools, os, signal, socket, struct, threading, time
@@ -771,7 +773,7 @@ PY3
 
 # UTS 命名空间：busybox 的 unshare -u 里改的主机名外面看不到
 before=$(hostname)
-unshare -u sh -c '
+busybox unshare -u sh -c '
     hostname inner
     echo "inside: $(hostname) $(uname -n) $(cat /proc/sys/kernel/hostname)"
     echo "different ns: $([ "$(readlink /proc/self/ns/uts)" != "$(readlink /proc/$PPID/ns/uts)" ] && echo yes)"
@@ -971,7 +973,7 @@ PY4
 
 # 网络命名空间：busybox 的 unshare -n 里只有关着的 lo，ip 把它打开之后有 127.0.0.1/8、::1
 # 和 local 表里的路由，外面的地址到不了
-unshare -n sh -c '
+busybox unshare -n sh -c '
     ip link show
     ip -o addr
     ip link set lo up
@@ -983,7 +985,7 @@ unshare -n sh -c '
 '
 
 # ICMPv6 在新的网络命名空间里：lo 打开之后 ::1 ping 得通（appine 的 ICMPv6 socket 用宿主的 ::1）
-unshare -n sh -c 'ping6 -c 1 -W 1 ::1 2>&1 | tail -1; ip link set lo up; ping6 -c 1 ::1 | sed "s/ time=.*//; /round-trip/d"'
+busybox unshare -n sh -c 'ping6 -c 1 -W 1 ::1 2>&1 | tail -1; ip link set lo up; ping6 -c 1 ::1 | sed "s/ time=.*//; /round-trip/d"'
 
 python3 - <<'PY5'
 import ctypes, errno, functools, os, socket, struct, time

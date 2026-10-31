@@ -77,6 +77,8 @@ pub(crate) enum Entry {
     Comm,
     Environ,
     Limits,
+    /// 线程建的子进程（只在 `task/<tid>/` 下，Linux 的 `CONFIG_PROC_CHILDREN`）。
+    Children,
     Maps,
     Mem,
     Smaps,
@@ -205,7 +207,7 @@ impl NsKind {
     }
 }
 
-const ENTRIES: [(&[u8], Entry); 30] = [
+const ENTRIES: [(&[u8], Entry); 31] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -214,6 +216,7 @@ const ENTRIES: [(&[u8], Entry); 30] = [
     (b"comm", Entry::Comm),
     (b"environ", Entry::Environ),
     (b"limits", Entry::Limits),
+    (b"children", Entry::Children),
     (b"maps", Entry::Maps),
     (b"mem", Entry::Mem),
     (b"smaps", Entry::Smaps),
@@ -582,7 +585,7 @@ pub(crate) enum PseudoNode {
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
-const TASK_ENTRIES: [Entry; 24] = [
+const TASK_ENTRIES: [Entry; 25] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -590,6 +593,7 @@ const TASK_ENTRIES: [Entry; 24] = [
     Entry::Cmdline,
     Entry::Environ,
     Entry::Limits,
+    Entry::Children,
     Entry::Auxv,
     Entry::Mem,
     Entry::Maps,
@@ -608,6 +612,15 @@ const TASK_ENTRIES: [Entry; 24] = [
     Entry::ProjidMap,
     Entry::Setgroups,
 ];
+
+/// `/proc/<pid>`（`tid` 是 None）或者 `/proc/<pid>/task/<tid>` 里有没有 `e` 这一项：
+/// `children` 只在后者里。
+fn in_pid_dir(tid: Option<Tid>, e: &Entry) -> bool {
+    match tid {
+        None => *e != Entry::Children,
+        Some(_) => TASK_ENTRIES.contains(e),
+    }
+}
 
 /// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
 pub(crate) struct View<'a> {
@@ -906,7 +919,7 @@ impl Pseudo for View<'_> {
                 .filter(|_| interface(*n).is_some())
                 .map(|p| SysNet(*n, p)),
             Pid(pid, tid) => {
-                let allowed = |e: &self::Entry| tid.is_none() || TASK_ENTRIES.contains(e);
+                let allowed = |e: &self::Entry| in_pid_dir(*tid, e);
                 ENTRIES
                     .iter()
                     .find(|(n, e)| *n == name && allowed(e))
@@ -1547,7 +1560,7 @@ pub(crate) fn readdir(
         Pid(pid, tid) => nodes.extend(
             ENTRIES
                 .iter()
-                .filter(|(_, e)| tid.is_none() || TASK_ENTRIES.contains(e))
+                .filter(|(_, e)| in_pid_dir(*tid, e))
                 .map(|(_, e)| Entry(*pid, *tid, *e)),
         ),
         Entry(pid, None, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
@@ -2706,6 +2719,24 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
                 }
                 self::Entry::Comm => format!("{}\n", comm_str(task.as_deref(), *pid)),
+                // 线程建的、还没有被回收的子进程，每个后面一个空格，没有换行（Linux 的
+                // children_seq_show）
+                self::Entry::Children => {
+                    let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
+                    let me = tid.unwrap_or(*pid);
+                    let mut s = String::new();
+                    for c in &g.borrow().children {
+                        if ps
+                            .k
+                            .groups
+                            .get(c)
+                            .is_some_and(|g| g.borrow().parent_thread == me)
+                        {
+                            write!(s, "{} ", ns.vnr(*c).unwrap_or(0)).unwrap();
+                        }
+                    }
+                    s
+                }
                 self::Entry::Cgroup => crate::cgroup::PROC_CGROUP.to_owned(),
                 self::Entry::Cmdline => {
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.args)));

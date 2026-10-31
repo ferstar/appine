@@ -28,4 +28,4 @@
 
 - 连同别的一起换挂载命名空间、fs 又和别的线程共用时，Linux 只换调用的线程的挂载命名空间（在它的 nsproxy 里），共用 fs 的线程的根目录、当前目录跟着变；appine 的挂载命名空间在 `FsContext` 里，那些线程的挂载命名空间也跟着换了（它们的 `/proc/<tid>/ns/mnt` 与 Linux 不同）。
 - 进 time 命名空间时只看线程数：Linux 的 `current_is_single_threaded` 还看有没有别的进程共用地址空间（`CLONE_VM` 不带 `CLONE_THREAD`、vfork 出来还没 exec 的子进程）。
-- 写测试时发现 `/proc/<pid>/task/<tid>/children` 没有（Linux 的 `CONFIG_PROC_CHILDREN`，列出这个线程的子进程），用例改用 `pgrep -P`。
+- 写测试时发现 `/proc/<pid>/task/<tid>/children` 没有（Linux 的 `CONFIG_PROC_CHILDREN`，列出这个线程的子进程），用例改用 `pgrep -P`。→ 已补上（M9 之前：task 目录的 children）

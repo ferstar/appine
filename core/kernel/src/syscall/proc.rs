@@ -335,6 +335,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
             parent.tgid
         };
         let mut g = ThreadGroup::new(tid, ppid, sighand);
+        g.parent_thread = if flags & CLONE_PARENT != 0 {
+            parent.parent_thread
+        } else {
+            cx.tid()
+        };
         g.pgid = parent.pgid;
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
@@ -903,10 +908,22 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
         task.tid.set(tgid);
         k.tasks.insert(tgid, task);
         k.release_pid(me);
-        let mut g = cx.t.group.borrow_mut();
-        g.threads = vec![tgid];
-        // 原来的主线程已经被回收了（Linux 的 de_thread 里 release_task）
-        g.leader_seccomp = None;
+        let children = {
+            let mut g = cx.t.group.borrow_mut();
+            g.threads = vec![tgid];
+            // 原来的主线程已经被回收了（Linux 的 de_thread 里 release_task）
+            g.leader_seccomp = None;
+            g.children.clone()
+        };
+        // 别的线程建的子进程在它们退出时已经交给了自己，现在自己的编号变了
+        for c in children {
+            if let Some(cg) = cx.kr().groups.get(&c) {
+                let mut cg = cg.borrow_mut();
+                if cg.parent_thread == me {
+                    cg.parent_thread = tgid;
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 # compat.sh 的续篇（difftest 把整个脚本作为 sh -c 的一个参数，不能超过 128 KB）：raw ICMP
 # socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径、F_GETFL 里的
-# O_LARGEFILE
+# O_LARGEFILE、/proc/<pid>/task/<tid>/children
 set -e
 cd /tmp
 # raw ICMP socket（appine 在宿主上用 ping socket 模拟）：IPv4 收到的数据带 IP 头，echo 回答
@@ -690,3 +690,197 @@ show("epoll", keep[2].fileno())
 show("memfd", os.memfd_create("x"))
 show("reopened pipe", os.open("/proc/self/fd/%d" % r, os.O_RDONLY))
 PY
+
+# /proc/<pid>/task/<tid>/children：线程建的子进程（含僵尸进程），线程不算；建它们的线程退出
+# 之后排到同一个进程里还活着的线程的最后；CLONE_PARENT 建的算调用者的父线程的；subreaper
+# 收养的孤儿；非主线程 exec 之后都归它（它接过主线程的编号）。pid 换成名字比
+cat > children.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static pid_t pids[32];
+static const char *names[32];
+static int n;
+static int fds[2];
+static pthread_barrier_t bar;
+static pid_t thread_tid;
+
+static void add(pid_t p, const char *name)
+{
+    pids[n] = p;
+    names[n++] = name;
+}
+
+static const char *name_of(pid_t p)
+{
+    for (int i = 0; i < n; i++)
+        if (pids[i] == p)
+            return names[i];
+    return "?";
+}
+
+static void show(const char *what, pid_t tid)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof path, "/proc/self/task/%d/children", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("%s: %s\n", what, strerror(errno));
+        return;
+    }
+    size_t len = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[len] = 0;
+    int tail = len == 0 || buf[len - 1] == ' ';
+    printf("%s:", what);
+    char *save;
+    for (char *t = strtok_r(buf, " ", &save); t; t = strtok_r(NULL, " ", &save))
+        printf(" %s", name_of(atoi(t)));
+    printf("%s\n", tail ? "" : " (no trailing space)");
+}
+
+static pid_t spawn(const char *name)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        pause();
+        _exit(0);
+    }
+    add(p, name);
+    return p;
+}
+
+static void *worker(void *arg)
+{
+    thread_tid = gettid();
+    spawn("t1");
+    pthread_barrier_wait(&bar);
+    pthread_barrier_wait(&bar);
+    return NULL;
+}
+
+static void *execer(void *arg)
+{
+    static char pairs[32][32];
+    char *argv[40];
+    int a = 0;
+    spawn("f");
+    argv[a++] = "children";
+    argv[a++] = "after-exec";
+    for (int i = 0; i < n; i++) {
+        snprintf(pairs[i], sizeof pairs[i], "%s=%d", names[i], pids[i]);
+        argv[a++] = pairs[i];
+    }
+    argv[a] = NULL;
+    execv("/proc/self/exe", argv);
+    perror("execv");
+    _exit(1);
+}
+
+static void wait_zombie(pid_t p)
+{
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", p);
+    for (;;) {
+        FILE *f = fopen(path, "r");
+        size_t len = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+        if (f)
+            fclose(f);
+        buf[len] = 0;
+        char *s = strrchr(buf, ')');
+        if (s && s[1] && s[2] == 'Z')
+            return;
+        usleep(1000);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    /* 线程 exec 时缓冲区里还没写出去的会丢掉 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && strcmp(argv[1], "after-exec") == 0) {
+        for (int i = 2; i < argc; i++) {
+            char *eq = strchr(argv[i], '=');
+            *eq = 0;
+            add(atoi(eq + 1), argv[i]);
+        }
+        printf("after exec, tid is the pid: %d\n", gettid() == getpid());
+        show("after exec", getpid());
+        for (int i = 0; i < n; i++)
+            kill(pids[i], SIGKILL);
+        while (wait(NULL) > 0)
+            ;
+        return 0;
+    }
+    pid_t me = getpid();
+    spawn("a");
+    pid_t b = spawn("b");
+    pthread_t t;
+    pthread_barrier_init(&bar, NULL, 2);
+    pthread_create(&t, NULL, worker, NULL);
+    pthread_barrier_wait(&bar);
+    show("main", me);
+    show("thread", thread_tid);
+    printf("/proc/self/children: %s\n", access("/proc/self/children", F_OK) ? strerror(errno) : "exists");
+    pthread_barrier_wait(&bar);
+    pthread_join(t, NULL);
+    show("after the thread exited", me);
+    kill(b, SIGKILL);
+    wait_zombie(b);
+    show("b is a zombie", me);
+    waitpid(b, NULL, 0);
+    show("b reaped", me);
+
+    pipe(fds);
+    pid_t c = fork();
+    if (c == 0) {
+        long gc = syscall(SYS_clone, CLONE_PARENT, 0, 0, 0, 0);
+        if (gc == 0) {
+            pause();
+            _exit(0);
+        }
+        write(fds[1], &gc, sizeof gc);
+        pause();
+        _exit(0);
+    }
+    add(c, "c");
+    long gc;
+    read(fds[0], &gc, sizeof gc);
+    add(gc, "gc");
+    show("CLONE_PARENT", me);
+
+    prctl(PR_SET_CHILD_SUBREAPER, 1);
+    pid_t d = fork();
+    if (d == 0) {
+        long e = fork();
+        if (e == 0) {
+            pause();
+            _exit(0);
+        }
+        write(fds[1], &e, sizeof e);
+        _exit(0);
+    }
+    add(d, "d");
+    long e;
+    read(fds[0], &e, sizeof e);
+    add(e, "e");
+    waitpid(d, NULL, 0);
+    show("orphan taken by the subreaper", me);
+
+    pthread_create(&t, NULL, execer, NULL);
+    pthread_join(t, NULL);
+    return 1;
+}
+C
+gcc -O1 -pthread -o children children.c && ./children
+echo "children in task/<tid>: $(ls /proc/$$/task/$$ | grep -c '^children$'), in /proc/<pid>: $(ls /proc/$$ | grep -c '^children$')"
