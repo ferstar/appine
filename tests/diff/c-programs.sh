@@ -1,7 +1,7 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
 # 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
-# 点积指令；SHA3、SHA512、I8MM；LRCPC、LRCPC2
+# 点积指令；SHA3、SHA512、I8MM；LRCPC、LRCPC2；FP16、JSCVT；RDM、FCMA、FHM、BF16
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -834,3 +834,102 @@ C
 gcc -O3 -march=armv8.2-a+fp16 -o fp16 fp16.c -lm && ./fp16
 echo "fmla in the loop: $(gcc -O3 -march=armv8.2-a+fp16 -S -o - fp16.c | grep -c 'fmla	v[0-9]*\.8h')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'fphp|asimdhp|jscvt')"
+# RDM（SQRDMLAH、SQRDMLSH）、FCMA（FCMLA、FCADD）、FHM（FMLAL、FMLSL）、BF16（BFDOT、BFMMLA、
+# BFMLALB/T、BFCVT、BFCVTN）：宿主有时宣告，HWCAP、ID 寄存器的字段、/proc/cpuinfo 一致，intrinsics
+# 的结果相同；SQRDMLAH 饱和时置 FPSR.QC
+cat > ext.c <<'C'
+#include <arm_neon.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+
+#define HWCAP_ASIMDRDM (1 << 12)
+#define HWCAP_FCMA (1 << 14)
+#define HWCAP_ASIMDFHM (1 << 23)
+#define HWCAP2_BF16 (1 << 14)
+
+static void show(const char *name, const void *v, int n)
+{
+    uint32_t u[4];
+    memcpy(u, v, n);
+    printf("%s", name);
+    for (int i = 0; i < n / 4; i++)
+        printf(" %08x", u[i]);
+    printf("\n");
+}
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+    uint64_t isar0, isar1;
+    __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+    __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
+    printf("hwcap rdm %d fcma %d fhm %d bf16 %d; RDM %d FHM %d FCMA %d BF16 %d\n",
+           !!(hw & HWCAP_ASIMDRDM), !!(hw & HWCAP_FCMA), !!(hw & HWCAP_ASIMDFHM),
+           !!(hw2 & HWCAP2_BF16), (int)(isar0 >> 28 & 15), (int)(isar0 >> 48 & 15),
+           (int)(isar1 >> 16 & 15), (int)(isar1 >> 44 & 15));
+    int16_t h16[16];
+    int32_t s32[8];
+    for (int i = 0; i < 16; i++)
+        h16[i] = (int16_t)(i * 4111 - 30000);
+    for (int i = 0; i < 8; i++)
+        s32[i] = (int32_t)(i * 400000007u - 1500000000u);
+    if (hw & HWCAP_ASIMDRDM) {
+        int16x8_t a = vld1q_s16(h16), b = vld1q_s16(h16 + 8), c = vdupq_n_s16(30000);
+        /* 先清 QC，再算（操作数经过这条 asm，计算排不到它前面），结果经过下一条 asm 再读 FPSR */
+        __asm__ volatile("msr fpsr, %1" : "+w"(c) : "r"(0UL));
+        int16x8_t r = vqrdmlahq_s16(b, b, c); /* b 的后几个元素加上约 0.9b 超出 32767 */
+        uint64_t qc;
+        __asm__ volatile("mrs %0, fpsr" : "=r"(qc) : "w"(r));
+        printf("fpsr.qc after a saturating sqrdmlah %d\n", (int)(qc >> 27 & 1));
+        show("vqrdmlahq_s16", &r, 16);
+        show("vqrdmlshq_laneq_s16", (int16x8_t[]){vqrdmlshq_laneq_s16(a, b, a, 5)}, 16);
+        int32x4_t x = vld1q_s32(s32), y = vld1q_s32(s32 + 4);
+        show("vqrdmlahq_s32", (int32x4_t[]){vqrdmlahq_s32(x, y, x)}, 16);
+        printf("vqrdmlahh_s16 %d vqrdmlshs_s32 %d\n", vqrdmlahh_s16(1000, -20000, 30000),
+               vqrdmlshs_s32(5, 2000000000, -2000000000));
+    }
+    float f[8] = {1.5f, -2.25f, 3.0f, 0.5f, -1.0f, 4.0f, 2.5f, -0.75f};
+    float32x4_t fa = vld1q_f32(f), fb = vld1q_f32(f + 4), acc = vdupq_n_f32(0.125f);
+    if (hw & HWCAP_FCMA) {
+        show("vcmlaq_f32", (float32x4_t[]){vcmlaq_f32(acc, fa, fb)}, 16);
+        show("vcmlaq_rot90_f32", (float32x4_t[]){vcmlaq_rot90_f32(acc, fa, fb)}, 16);
+        show("vcmlaq_rot180_laneq_f32", (float32x4_t[]){vcmlaq_rot180_laneq_f32(acc, fa, fb, 1)}, 16);
+        show("vcmlaq_rot270_f32", (float32x4_t[]){vcmlaq_rot270_f32(acc, fa, fb)}, 16);
+        show("vcaddq_rot90_f32", (float32x4_t[]){vcaddq_rot90_f32(fa, fb)}, 16);
+        float64x2_t da = {1.25, -3.5}, db = {0.5, 2.0};
+        show("vcaddq_rot270_f64", (float64x2_t[]){vcaddq_rot270_f64(da, db)}, 16);
+        /* 半精度的形式还要 FP16 */
+        float16x8_t ha = vcvt_high_f16_f32(vcvt_f16_f32(fa), fb), hb = vrev64q_f16(ha);
+        show("vcmlaq_f16", (float16x8_t[]){vcmlaq_f16(ha, ha, hb)}, 16);
+    }
+    if (hw & HWCAP_ASIMDFHM) {
+        float16x8_t ha = vcvt_high_f16_f32(vcvt_f16_f32(fa), fb);
+        float16x8_t hb = vcvt_high_f16_f32(vcvt_f16_f32(vmulq_n_f32(fb, 1.001f)), fa);
+        show("vfmlalq_low_f16", (float32x4_t[]){vfmlalq_low_f16(acc, ha, hb)}, 16);
+        show("vfmlslq_high_f16", (float32x4_t[]){vfmlslq_high_f16(acc, ha, hb)}, 16);
+        show("vfmlalq_laneq_high_f16", (float32x4_t[]){vfmlalq_laneq_high_f16(acc, ha, hb, 6)}, 16);
+        show("vfmlsl_low_f16", (float32x2_t[]){vfmlsl_low_f16(vget_low_f32(acc), vget_low_f16(ha), vget_low_f16(hb))}, 8);
+    }
+    if (hw2 & HWCAP2_BF16) {
+        bfloat16x8_t ba = vcvtq_high_bf16_f32(vcvtq_low_bf16_f32(fa), fb);
+        bfloat16x8_t bb = vcvtq_high_bf16_f32(vcvtq_low_bf16_f32(vmulq_n_f32(fb, 1.37f)), fa);
+        show("vcvtq_bf16", &ba, 16);
+        show("vbfdotq_f32", (float32x4_t[]){vbfdotq_f32(acc, ba, bb)}, 16);
+        show("vbfdotq_laneq_f32", (float32x4_t[]){vbfdotq_laneq_f32(acc, ba, bb, 3)}, 16);
+        show("vbfmmlaq_f32", (float32x4_t[]){vbfmmlaq_f32(acc, ba, bb)}, 16);
+        show("vbfmlalbq_f32", (float32x4_t[]){vbfmlalbq_f32(acc, ba, bb)}, 16);
+        show("vbfmlaltq_laneq_f32", (float32x4_t[]){vbfmlaltq_laneq_f32(acc, ba, bb, 5)}, 16);
+        bfloat16_t one = vcvth_bf16_f32(1.00390625f), tie = vcvth_bf16_f32(1.01171875f);
+        uint16_t u[2];
+        memcpy(u, &one, 2);
+        memcpy(u + 1, &tie, 2);
+        printf("vcvth_bf16_f32 %04x %04x\n", u[0], u[1]);
+    }
+    return 0;
+}
+C
+gcc -O2 -march=armv8.3-a+fp16fml+bf16 -o ext ext.c && ./ext
+echo "instructions: $(gcc -O2 -march=armv8.3-a+fp16fml+bf16 -S -o - ext.c | grep -cE '^	(sqrdmlah|sqrdmlsh|fcmla|fcadd|fmlal|fmlsl|fmlal2|fmlsl2|bfdot|bfmmla|bfmlalb|bfmlalt|bfcvt|bfcvtn|bfcvtn2)	')"
+echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'asimdrdm|fcma|asimdfhm|bf16')"

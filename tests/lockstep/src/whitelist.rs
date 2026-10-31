@@ -119,6 +119,10 @@ fn mattr(caps: u64, caps2: u64) -> String {
     attrs.push(flag(caps & hwcap::LRCPC != 0, "rcpc"));
     attrs.push(flag(caps & hwcap::ILRCPC != 0, "rcpc-immo"));
     attrs.push(flag(caps & hwcap::JSCVT != 0, "jsconv"));
+    attrs.push(flag(caps & hwcap::ASIMDRDM != 0, "rdm"));
+    attrs.push(flag(caps & hwcap::FCMA != 0, "complxnum"));
+    attrs.push(flag(caps & hwcap::ASIMDFHM != 0, "fp16fml"));
+    attrs.push(flag(caps2 & hwcap2::BF16 != 0, "bf16"));
     attrs.join(",")
 }
 

@@ -2353,7 +2353,7 @@ const HWCAP_NAMES: [&str; 27] = [
 ];
 
 /// 同上，HWCAP2 各位的名字，排在 HWCAP 的后面。
-const HWCAP2_NAMES: [&str; 14] = [
+const HWCAP2_NAMES: [&str; 15] = [
     "dcpodp",
     "sve2",
     "sveaes",
@@ -2368,6 +2368,7 @@ const HWCAP2_NAMES: [&str; 14] = [
     "svef64mm",
     "svebf16",
     "i8mm",
+    "bf16",
 ];
 
 fn cpuinfo() -> String {

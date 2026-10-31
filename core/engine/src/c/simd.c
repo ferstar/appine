@@ -3,8 +3,8 @@
  *
  * 数据处理指令：这里只做白名单判定，运算交给原生指令桩。白名单是 ARMv8.0
  * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2/
- * SHA3/SHA512/DotProd/I8MM/FP16/JSCVT；RDM、FHM、FCMA、FRINTTS、BF16、SM3/SM4
- * 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
+ * SHA3/SHA512/DotProd/I8MM/FP16/JSCVT/RDM/FHM/FCMA/BF16；FRINTTS、SM3/SM4、
+ * EBF16 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
  * Floating-Point and Advanced SIMD" 编码表。
  *
  * 访存指令（LDR/STR/LDP/STP 的 B/H/S/D/Q 形式、LD1–LD4/ST1–ST4）用 C 实现：
@@ -37,6 +37,32 @@ static bool fp16(void)
     return appine_has(APPINE_HWCAP_FPHP | APPINE_HWCAP_ASIMDHP);
 }
 
+/* RDM：SQRDMLAH、SQRDMLSH */
+static bool rdm(void)
+{
+    return appine_has(APPINE_HWCAP_ASIMDRDM);
+}
+
+/* FHM：FMLAL、FMLSL（半精度乘、加到单精度），只和 FP16 一起宣告（features.c） */
+static bool fhm(void)
+{
+    return appine_has(APPINE_HWCAP_ASIMDFHM);
+}
+
+/* FCMA：FCMLA、FCADD。半精度的形式还要 FP16，双精度只有 128 位的形式 */
+static bool fcma(unsigned q, unsigned size)
+{
+    if (size == 0 || (size == 3 && !q) || (size == 1 && !fp16()))
+        return false;
+    return appine_has(APPINE_HWCAP_FCMA);
+}
+
+/* BF16：BFDOT、BFMMLA、BFMLALB/T、BFCVT、BFCVTN */
+static bool bf16(void)
+{
+    return appine_has2(APPINE_HWCAP2_BF16);
+}
+
 /* FP 指令的 type/size 字段选的精度能不能用：3 是半精度，2 只有 FMOV 的上半部分形式 */
 static bool fp_type_ok(unsigned type)
 {
@@ -54,6 +80,9 @@ static bool vec_three_same(uint32_t insn)
         static const uint8_t allowed[2][2] = {{0xdf, 0xc7}, {0xfd, 0x75}};
         if ((size & 1) && !q)
             return false;
+        /* FMLAL/FMLSL（U = 0，11101）、FMLAL2/FMLSL2（U = 1，11001）：FHM，sz 必须是 0 */
+        if (opcode == (u ? 0x19 : 0x1d) && !(size & 1) && fhm())
+            return true;
         return (allowed[u][size >> 1] >> (opcode - 0x18)) & 1;
     }
     bool q64 = size != 3 || q; /* 64 位元素只能用于 128 位向量 */
@@ -155,7 +184,7 @@ static bool vec_two_reg_misc(uint32_t insn)
         case 0x0f: return hi && fpq;                /* FABS */
         case 0x12: return size != 3;                /* XTN */
         case 0x14: return size != 3;                /* SQXTN */
-        case 0x16:                                  /* FCVTN */
+        case 0x16: return !hi || (size == 2 && bf16()); /* FCVTN；BFCVTN（BF16） */
         case 0x17: return !hi;                      /* FCVTL */
         case 0x18:                                  /* FRINTN / FRINTP */
         case 0x19:                                  /* FRINTM / FRINTZ */
@@ -283,21 +312,29 @@ static bool vec_shift_imm(uint32_t insn)
     }
 }
 
-/* 三寄存器扩展：DotProd 和 I8MM 的几条；RDM、FCMA、BF16 拒绝 */
+/* 三寄存器扩展：RDM、DotProd、I8MM、BF16、FCMA */
 static bool vec_three_extra(uint32_t insn)
 {
     unsigned q = BIT(insn, 30), u = BIT(insn, 29), size = FIELD(insn, 23, 22);
-    if (size != 2)
-        return false;
-    switch (FIELD(insn, 14, 11)) {
+    unsigned opcode = FIELD(insn, 14, 11);
+    if (opcode >= 0x8 && opcode != 0xd && opcode != 0xf) /* FCMLA（10xx）、FCADD（11x0） */
+        return u && fcma(q, size);
+    switch (opcode) {
+    case 0x0: /* SQRDMLAH (vector) */
+    case 0x1: /* SQRDMLSH (vector) */
+        return u && (size == 1 || size == 2) && rdm();
     case 0x2: /* SDOT/UDOT (vector) */
-        return appine_has(APPINE_HWCAP_ASIMDDP);
+        return size == 2 && appine_has(APPINE_HWCAP_ASIMDDP);
     case 0x3: /* USDOT (vector) */
-        return !u && appine_has2(APPINE_HWCAP2_I8MM);
+        return size == 2 && !u && appine_has2(APPINE_HWCAP2_I8MM);
     case 0x4: /* SMMLA/UMMLA：只有 128 位的形式 */
-        return q && appine_has2(APPINE_HWCAP2_I8MM);
+        return size == 2 && q && appine_has2(APPINE_HWCAP2_I8MM);
     case 0x5: /* USMMLA */
-        return q && !u && appine_has2(APPINE_HWCAP2_I8MM);
+        return size == 2 && q && !u && appine_has2(APPINE_HWCAP2_I8MM);
+    case 0xd: /* BFMMLA：只有 128 位的形式 */
+        return u && size == 1 && q && bf16();
+    case 0xf: /* BFDOT（size 01）、BFMLALB/BFMLALT（size 11，Q 选 B/T） */
+        return u && (size == 1 || size == 3) && bf16();
     default:
         return false;
     }
@@ -306,36 +343,46 @@ static bool vec_three_extra(uint32_t insn)
 static bool vec_indexed(uint32_t insn)
 {
     unsigned q = BIT(insn, 30), u = BIT(insn, 29), size = FIELD(insn, 23, 22);
-    unsigned l = BIT(insn, 21), opcode = FIELD(insn, 15, 12);
+    unsigned h = BIT(insn, 11), l = BIT(insn, 21), opcode = FIELD(insn, 15, 12);
     bool hs = size == 1 || size == 2;
+    if (u && (opcode & 0x9) == 0x1) {
+        /* FCMLA（FCMA，opcode<2:1> 是旋转）：半精度按 H:L 选一对元素，64 位时只有前两对；
+         * 单精度按 H 选，只有 128 位的形式 */
+        if (size == 1 && h && !q)
+            return false;
+        return (size == 1 || (size == 2 && !l && q)) && fcma(q, size);
+    }
     switch (opcode) {
     case 0x1: /* FMLA */
     case 0x5: /* FMLS */
     case 0x9: /* FMUL / FMULX */
-        if (u && opcode != 0x9)
-            return false; /* FCMLA（FCMA） */
         if (size == 0) /* 半精度：H:L:M 选元素，Rm 只有 4 位 */
             return fp16();
         return (size & 2) && !((size & 1) && (l || !q));
-    case 0x0: /* MLA */
-    case 0x4: /* MLS */
-        return u && hs;
+    case 0x0: /* MLA；U = 0 是 FMLAL（FHM） */
+    case 0x4: /* MLS；U = 0 是 FMLSL（FHM） */
+        return u ? hs : size == 2 && fhm();
     case 0x2: /* SMLAL/UMLAL */
     case 0x6: /* SMLSL/UMLSL */
     case 0xa: /* SMULL/UMULL */
         return hs;
     case 0x3: /* SQDMLAL */
     case 0x7: /* SQDMLSL */
-    case 0x8: /* MUL */
     case 0xb: /* SQDMULL */
-    case 0xc: /* SQDMULH */
-    case 0xd: /* SQRDMULH */
         return !u && hs;
+    case 0x8: /* MUL；U = 1 是 FMLAL2（FHM） */
+    case 0xc: /* SQDMULH；U = 1 是 FMLSL2（FHM） */
+        return u ? size == 2 && fhm() : hs;
+    case 0xd: /* SQRDMULH；U = 1 是 SQRDMLAH（RDM） */
+        return hs && (!u || rdm());
     case 0xe: /* SDOT/UDOT (by element) */
         return size == 2 && appine_has(APPINE_HWCAP_ASIMDDP);
-    case 0xf: /* USDOT（size 10）、SUDOT（size 00）(by element)；BFDOT、BFMLAL 拒绝 */
-        return !u && (size == 0 || size == 2) && appine_has2(APPINE_HWCAP2_I8MM);
-    default: /* RDM、FHM 等 */
+    case 0xf:
+        if (u) /* SQRDMLSH（RDM） */
+            return hs && rdm();
+        /* SUDOT（size 00）、USDOT（size 10）：I8MM；BFDOT（size 01）、BFMLALB/T（size 11）：BF16 */
+        return (size & 1) ? bf16() : appine_has2(APPINE_HWCAP2_I8MM);
+    default:
         return false;
     }
 }
@@ -500,11 +547,21 @@ static bool scalar_indexed(uint32_t insn)
     case 0x7: /* SQDMLSL */
     case 0xb: /* SQDMULL */
     case 0xc: /* SQDMULH */
-    case 0xd: /* SQRDMULH */
         return !u && (size == 1 || size == 2);
+    case 0xd: /* SQRDMULH；U = 1 是 SQRDMLAH（RDM） */
+        return (size == 1 || size == 2) && (!u || rdm());
+    case 0xf: /* SQRDMLSH（RDM） */
+        return u && (size == 1 || size == 2) && rdm();
     default:
         return false;
     }
+}
+
+/* 标量三寄存器扩展：只有 RDM 的 SQRDMLAH、SQRDMLSH */
+static bool scalar_three_extra(uint32_t insn)
+{
+    unsigned u = BIT(insn, 29), size = FIELD(insn, 23, 22), opcode = FIELD(insn, 14, 11);
+    return u && opcode <= 1 && (size == 1 || size == 2) && rdm();
 }
 
 static bool crypto_sha3(uint32_t insn)
@@ -557,9 +614,11 @@ static bool fp_one_source(uint32_t insn)
         return false;
     if (opcode <= 0x03) /* FMOV/FABS/FNEG/FSQRT */
         return true;
-    if ((opcode & 0x3c) == 0x04) { /* FCVT：目标精度不能等于源精度，10 是 BFCVT */
+    if ((opcode & 0x3c) == 0x04) { /* FCVT：目标精度不能等于源精度 */
         unsigned to = opcode & 3;
-        return to != 2 && to != type;
+        if (to == 2) /* BFCVT（BF16）：只有单精度到 BFloat16 */
+            return type == 1 && bf16();
+        return to != type;
     }
     return opcode >= 0x08 && opcode <= 0x0f && opcode != 0x0d; /* FRINT 系列 */
 }
@@ -642,6 +701,8 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
             return scalar_two_reg_misc_fp16(insn);
         if ((insn & 0xdf200400) == 0x5e200400)
             return scalar_three_same(insn);
+        if ((insn & 0xdf208400) == 0x5e008400)
+            return scalar_three_extra(insn);
         if ((insn & 0xdf200c00) == 0x5e200000) /* SQDMLAL/SQDMLSL/SQDMULL */
             return !BIT(insn, 29) && (FIELD(insn, 15, 12) == 0x9 || FIELD(insn, 15, 12) == 0xb ||
                                       FIELD(insn, 15, 12) == 0xd) &&

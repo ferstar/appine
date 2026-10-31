@@ -1,7 +1,8 @@
 /*
  * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
  * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
- * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT 等可选指令是否合法。
+ * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16
+ * 等可选指令是否合法。
  */
 #include <pthread.h>
 
@@ -17,8 +18,9 @@
     (APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD | APPINE_HWCAP_AES | APPINE_HWCAP_PMULL |                \
      APPINE_HWCAP_SHA1 | APPINE_HWCAP_SHA2 | APPINE_HWCAP_CRC32 | APPINE_HWCAP_ATOMICS |          \
      APPINE_HWCAP_SHA3 | APPINE_HWCAP_ASIMDDP | APPINE_HWCAP_SHA512 | APPINE_HWCAP_LRCPC |         \
-     APPINE_HWCAP_ILRCPC | APPINE_HWCAP_FPHP | APPINE_HWCAP_ASIMDHP | APPINE_HWCAP_JSCVT)
-#define IMPLEMENTED2 APPINE_HWCAP2_I8MM
+     APPINE_HWCAP_ILRCPC | APPINE_HWCAP_FPHP | APPINE_HWCAP_ASIMDHP | APPINE_HWCAP_JSCVT |       \
+     APPINE_HWCAP_ASIMDRDM | APPINE_HWCAP_FCMA | APPINE_HWCAP_ASIMDFHM)
+#define IMPLEMENTED2 (APPINE_HWCAP2_I8MM | APPINE_HWCAP2_BF16)
 
 /* SHA3、SHA512 只一起宣告，还要有 SHA2：LLVM 的 sha3 特性同时管这两组，白名单的核对分不开，
  * 实际的 CPU 也总是一起实现 */
@@ -44,6 +46,9 @@ static void detect(void)
             guest_hwcap &= ~(APPINE_HWCAP_SHA3 | APPINE_HWCAP_SHA512);
         if ((guest_hwcap & FP16_SET) != FP16_SET)
             guest_hwcap &= ~FP16_SET;
+        /* FHM 的源操作数是半精度，架构上要求有 FP16（LLVM 的 fp16fml 也隐含 fullfp16） */
+        if (!(guest_hwcap & APPINE_HWCAP_FPHP))
+            guest_hwcap &= ~APPINE_HWCAP_ASIMDFHM;
         /* LRCPC2 包含 LRCPC（ID 寄存器里是同一个字段） */
         if (!(guest_hwcap & APPINE_HWCAP_LRCPC))
             guest_hwcap &= ~APPINE_HWCAP_ILRCPC;
@@ -126,17 +131,25 @@ bool appine_id_register(unsigned key, uint64_t *value)
             v |= UINT64_C(1) << 16;
         if (h & APPINE_HWCAP_ATOMICS)
             v |= UINT64_C(2) << 20;
+        if (h & APPINE_HWCAP_ASIMDRDM)
+            v |= UINT64_C(1) << 28;
         if (h & APPINE_HWCAP_SHA3)
             v |= UINT64_C(1) << 32;
         if (h & APPINE_HWCAP_ASIMDDP)
             v |= UINT64_C(1) << 44;
+        if (h & APPINE_HWCAP_ASIMDFHM)
+            v |= UINT64_C(1) << 48;
     } else if (crm == 6 && op2 == 1) { /* ID_AA64ISAR1_EL1 */
         if (h & APPINE_HWCAP_JSCVT)
             v |= UINT64_C(1) << 12;
+        if (h & APPINE_HWCAP_FCMA)
+            v |= UINT64_C(1) << 16;
         if (h & APPINE_HWCAP_ILRCPC)
             v |= UINT64_C(2) << 20;
         else if (h & APPINE_HWCAP_LRCPC)
             v |= UINT64_C(1) << 20;
+        if (h2 & APPINE_HWCAP2_BF16)
+            v |= UINT64_C(1) << 44;
         if (h2 & APPINE_HWCAP2_I8MM)
             v |= UINT64_C(1) << 52;
     }

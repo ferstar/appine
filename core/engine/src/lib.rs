@@ -835,8 +835,12 @@ pub mod hwcap {
     pub const ASIMDHP: u64 = 1 << 10;
     /// EL0 可以读取 ID 寄存器。
     pub const CPUID: u64 = 1 << 11;
+    /// RDM：SQRDMLAH、SQRDMLSH。
+    pub const ASIMDRDM: u64 = 1 << 12;
     /// FJCVTZS（JavaScript 语义的双精度转 int32）。
     pub const JSCVT: u64 = 1 << 13;
+    /// FCMA：复数的乘加和加法（FCMLA、FCADD）。
+    pub const FCMA: u64 = 1 << 14;
     /// RCpc 的 load-acquire（LDAPR、LDAPRB、LDAPRH）。
     pub const LRCPC: u64 = 1 << 15;
     /// SHA3 指令（EOR3、RAX1、XAR、BCAX）。
@@ -845,6 +849,8 @@ pub mod hwcap {
     pub const ASIMDDP: u64 = 1 << 20;
     /// SHA512 指令。
     pub const SHA512: u64 = 1 << 21;
+    /// FHM：半精度乘、加到单精度（FMLAL、FMLSL）。
+    pub const ASIMDFHM: u64 = 1 << 23;
     /// LRCPC2：带偏移的 LDAPUR、STLUR 这些。
     pub const ILRCPC: u64 = 1 << 26;
 }
@@ -853,6 +859,8 @@ pub mod hwcap {
 pub mod hwcap2 {
     /// int8 矩阵乘（SMMLA、UMMLA、USMMLA、USDOT、SUDOT）。
     pub const I8MM: u64 = 1 << 13;
+    /// BFloat16（BFDOT、BFMMLA、BFMLALB/T、BFCVT、BFCVTN）。
+    pub const BF16: u64 = 1 << 14;
 }
 
 /// 校验 [`CpuState`] 与 C 结构体的布局是否一致。

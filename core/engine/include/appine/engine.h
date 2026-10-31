@@ -157,15 +157,19 @@ struct appine_cpu {
 #define APPINE_HWCAP_FPHP (UINT64_C(1) << 9)
 #define APPINE_HWCAP_ASIMDHP (UINT64_C(1) << 10)
 #define APPINE_HWCAP_CPUID (UINT64_C(1) << 11)
+#define APPINE_HWCAP_ASIMDRDM (UINT64_C(1) << 12)
 #define APPINE_HWCAP_JSCVT (UINT64_C(1) << 13)
+#define APPINE_HWCAP_FCMA (UINT64_C(1) << 14)
 #define APPINE_HWCAP_LRCPC (UINT64_C(1) << 15)
 #define APPINE_HWCAP_SHA3 (UINT64_C(1) << 17)
 #define APPINE_HWCAP_ASIMDDP (UINT64_C(1) << 20)
 #define APPINE_HWCAP_SHA512 (UINT64_C(1) << 21)
+#define APPINE_HWCAP_ASIMDFHM (UINT64_C(1) << 23)
 #define APPINE_HWCAP_ILRCPC (UINT64_C(1) << 26)
 
 /* AT_HWCAP2 的位，取值与 Linux 的 HWCAP2_* 一致 */
 #define APPINE_HWCAP2_I8MM (UINT64_C(1) << 13)
+#define APPINE_HWCAP2_BF16 (UINT64_C(1) << 14)
 
 /* 宣告给 guest 的 AT_HWCAP：宿主支持 ∩ Tier 0 已实现 ∩ 白名单 */
 uint64_t appine_guest_hwcap(void);

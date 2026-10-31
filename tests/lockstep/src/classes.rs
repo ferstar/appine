@@ -11,6 +11,8 @@ use crate::rng::Rng;
 
 /// [`Class::requires`] 里 `AT_HWCAP2` 的位放在高 32 位（`AT_HWCAP` 只用到第 31 位）。
 pub const HWCAP2_I8MM: u64 = hwcap2::I8MM << 32;
+/// 同上，`HWCAP2_BF16`。
+pub const HWCAP2_BF16: u64 = hwcap2::BF16 << 32;
 
 /// guest 的 `AT_HWCAP` 和左移 32 位的 `AT_HWCAP2`，与 [`Class::requires`] 比较。
 pub fn guest_caps() -> u64 {
@@ -128,6 +130,10 @@ pub const CLASSES: &[Class] = &[
     case("i8mm", i8mm, HWCAP2_I8MM),
     case("fp16", fp16, hwcap::FPHP | hwcap::ASIMDHP),
     case("jscvt", jscvt, hwcap::JSCVT),
+    case("rdm", rdm, hwcap::ASIMDRDM),
+    case("fcma", fcma, hwcap::FCMA),
+    case("fhm", fhm, hwcap::ASIMDFHM),
+    case("bf16", bf16, HWCAP2_BF16),
     Class {
         name: "fuzz_simd_fp",
         strict: false,
@@ -1240,6 +1246,82 @@ fn fp16(g: &mut Rng, _: &Env) -> Case {
 /// FJCVTZS：输入是随机的双精度位型（含 NaN、无穷、超出范围的），比对 W 和 NZCV。
 fn jscvt(g: &mut Rng, _: &Env) -> Case {
     Case::one(0x1e7e_0000 | (reg(g) << 5) | reg(g))
+}
+
+/// RDM：SQRDMLAH、SQRDMLSH 的向量、标量形式和按元素形式（H、S 两种元素）。
+fn rdm(g: &mut Rng, _: &Env) -> Case {
+    let size = (1 + g.bit()) << 22;
+    let sub = g.bit(); // 0 是 SQRDMLAH，1 是 SQRDMLSH
+    let (rn_rd, rm) = ((reg(g) << 5) | reg(g), reg(g) << 16);
+    // 按元素：H 元素时 H:L:M 选元素、Rm 只有 4 位；S 元素时 H:L 选元素、M:Rm 是寄存器号
+    let lane = (g.bit() << 21) | (g.bit() << 20) | ((reg(g) & 15) << 16) | (g.bit() << 11);
+    Case::one(match g.bits(2) {
+        0 => 0x2e00_8400 | (g.bit() << 30) | size | rm | (sub << 11) | rn_rd,
+        1 => 0x7e00_8400 | size | rm | (sub << 11) | rn_rd,
+        2 => 0x2f00_d000 | (sub << 13) | (g.bit() << 30) | size | lane | rn_rd,
+        _ => 0x7f00_d000 | (sub << 13) | size | lane | rn_rd,
+    })
+}
+
+/// FCMA：FCMLA（向量、按元素，四种旋转）、FCADD（90、270）。半精度、单精度、双精度（只有 128 位）。
+fn fcma(g: &mut Rng, _: &Env) -> Case {
+    let (rn_rd, rm) = ((reg(g) << 5) | reg(g), reg(g) << 16);
+    let size = 1 + (g.next_u64() % 3) as u32;
+    let q = if size == 3 { 1 } else { g.bit() };
+    Case::one(match g.bits(2) {
+        0 | 1 => 0x2e00_c400 | (q << 30) | (size << 22) | rm | (g.bits(2) << 11) | rn_rd,
+        2 => 0x2e00_e400 | (q << 30) | (size << 22) | rm | (g.bit() << 12) | rn_rd,
+        // 按元素：半精度按 H:L 选一对（64 位时 H = 0），单精度按 H 选（只有 128 位，L = 0）
+        _ => {
+            let half = g.bit() == 1;
+            let q = if half { g.bit() } else { 1 };
+            let h = if half && q == 0 { 0 } else { g.bit() };
+            let l = if half { g.bit() } else { 0 };
+            let size = if half { 1 } else { 2 };
+            0x2f00_1000
+                | (q << 30)
+                | (size << 22)
+                | (l << 21)
+                | rm
+                | (g.bits(2) << 13)
+                | (h << 11)
+                | rn_rd
+        }
+    })
+}
+
+/// FHM：FMLAL、FMLSL、FMLAL2、FMLSL2 的向量和按元素形式（H:L:M 选元素，Rm 只有 4 位）。
+fn fhm(g: &mut Rng, _: &Env) -> Case {
+    let q = g.bit() << 30;
+    let rn_rd = (reg(g) << 5) | reg(g);
+    let lane = (g.bit() << 21) | (g.bit() << 20) | ((reg(g) & 15) << 16) | (g.bit() << 11);
+    Case::one(match g.bits(3) {
+        0 => 0x0e20_ec00 | q | (reg(g) << 16) | rn_rd, // FMLAL
+        1 => 0x0ea0_ec00 | q | (reg(g) << 16) | rn_rd, // FMLSL
+        2 => 0x2e20_cc00 | q | (reg(g) << 16) | rn_rd, // FMLAL2
+        3 => 0x2ea0_cc00 | q | (reg(g) << 16) | rn_rd, // FMLSL2
+        4 => 0x0f80_0000 | q | lane | rn_rd,           // FMLAL (by element)
+        5 => 0x0f80_4000 | q | lane | rn_rd,           // FMLSL (by element)
+        6 => 0x2f80_8000 | q | lane | rn_rd,           // FMLAL2 (by element)
+        _ => 0x2f80_c000 | q | lane | rn_rd,           // FMLSL2 (by element)
+    })
+}
+
+/// BF16：BFDOT、BFMLALB/T（向量和按元素）、BFMMLA、BFCVT、BFCVTN/BFCVTN2。
+fn bf16(g: &mut Rng, _: &Env) -> Case {
+    let q = g.bit() << 30;
+    let (rn_rd, rm) = ((reg(g) << 5) | reg(g), reg(g) << 16);
+    // BFDOT 按 H:L 选一对、M:Rm 是寄存器号；BFMLAL 按 H:L:M 选元素、Rm 只有 4 位
+    let (l, m, h) = (g.bit() << 21, g.bit() << 20, g.bit() << 11);
+    Case::one(match g.bits(3) {
+        0 => 0x2e40_fc00 | q | rm | rn_rd,         // BFDOT
+        1 => 0x6e40_ec00 | rm | rn_rd,             // BFMMLA
+        2 => 0x2ec0_fc00 | q | rm | rn_rd,         // BFMLALB、BFMLALT
+        3 => 0x0f40_f000 | q | l | rm | h | rn_rd, // BFDOT (by element)
+        4 => 0x0fc0_f000 | q | l | m | (rm & 0xf_0000) | h | rn_rd, // BFMLALB/T (by element)
+        5 => 0x1e63_4000 | rn_rd,                  // BFCVT
+        _ => 0x0ea1_6800 | q | rn_rd,              // BFCVTN、BFCVTN2
+    })
 }
 
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {

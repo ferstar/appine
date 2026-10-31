@@ -247,10 +247,12 @@ fn data_accesses_ignore_the_top_byte() {
 fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
-        0x6e828420, // sqrdmlah v0.4s, v1.4s, v2.4s：RDM 不在白名单内
-        0x4e22ec20, // fmlal v0.4s, v1.4h, v2.4h：FHM 不在白名单内
-        0x6e42fc20, // bfdot v0.4s, v1.8h, v2.8h：BF16 不在白名单内
+        0x1e284020, // frint32z s0, s1：FRINTTS 不在白名单内
+        0xce62c020, // sm3partw1 v0.4s, v1.4s, v2.4s：SM3 不在白名单内
         0xcec08420, // sm4e v0.4s, v1.4s：SM4 不在白名单内
+        0x6e02fc20, // size 00 的 bfdot：BF16 只有 size 01、11
+        0x2ec2f420, // 双精度的 fcadd 只有 128 位的形式
+        0x6e02cc20, // size 00 的 fcmla 未定义
         0x4f42e020, // 按元素的 sdot 要 32 位的元素（size = 01 未定义）
         0xd9800020, // size 11、opc 10：没有扩展到 64 位的 LDAPURS
         0xb8a0c020, // Rs 不全是 1 的 ldapr（LLVM 不认）
@@ -331,6 +333,10 @@ fn id_registers_match_hwcap() {
     assert_eq!(caps & hwcap::SHA2 != 0, (isar0 >> 12) & 0xf == sha2);
     assert_eq!(caps & hwcap::SHA3 != 0, (isar0 >> 32) & 0xf == 1);
     assert_eq!(caps & hwcap::ASIMDDP != 0, (isar0 >> 44) & 0xf == 1);
+    assert_eq!(caps & hwcap::ASIMDRDM != 0, (isar0 >> 28) & 0xf == 1);
+    assert_eq!(caps & hwcap::ASIMDFHM != 0, (isar0 >> 48) & 0xf == 1);
+    // FHM 只和 FP16 一起宣告
+    assert!(caps & hwcap::ASIMDFHM == 0 || caps & hwcap::FPHP != 0);
     // SHA3、SHA512 只一起宣告
     assert_eq!(caps & hwcap::SHA3 != 0, caps & hwcap::SHA512 != 0);
     g.step(0xd5380620); // mrs x0, id_aa64isar1_el1
@@ -343,6 +349,9 @@ fn id_registers_match_hwcap() {
     };
     assert_eq!((g.x(0) >> 20) & 0xf, lrcpc);
     assert_eq!(caps & hwcap::JSCVT != 0, (g.x(0) >> 12) & 0xf == 1);
+    assert_eq!(caps & hwcap::FCMA != 0, (g.x(0) >> 16) & 0xf == 1);
+    let bf16 = appine_engine::guest_hwcap2() & hwcap2::BF16 != 0;
+    assert_eq!(bf16, (g.x(0) >> 44) & 0xf == 1);
     // ID_AA64PFR0_EL1 的 FP、AdvSIMD：带半精度时是 1；两者只一起宣告
     g.step(0xd5380400); // mrs x0, id_aa64pfr0_el1
     let (fp, simd) = ((g.x(0) >> 16) & 0xf, (g.x(0) >> 20) & 0xf);
@@ -546,6 +555,74 @@ fn half_precision_follows_the_feature_set() {
     assert_eq!(g.cpu.state().v[0], [0x4400_4400_4400_4400; 2]);
     g.step(fmov);
     assert_eq!(g.cpu.state().v[0], [0x3c00_3c00_3c00_3c00; 2]);
+}
+
+/// RDM、FCMA、FHM、BF16 各挑一两条：宣告了才能执行，结果与架构的定义相同。
+#[test]
+fn rdm_fcma_fhm_bf16_follow_the_feature_set() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let caps = appine_engine::guest_hwcap();
+    let sqrdmlah = 0x6e428420; // sqrdmlah v0.8h, v1.8h, v2.8h
+    let fcadd = 0x6ec2f420; // fcadd v0.2d, v1.2d, v2.2d, #270
+    let fmlal = 0x4e22ec20; // fmlal v0.4s, v1.4h, v2.4h
+    let bfdot = 0x6e42fc20; // bfdot v0.4s, v1.8h, v2.8h
+    let bfcvt = 0x1e634020; // bfcvt h0, s1
+    let cases = [
+        (caps & hwcap::ASIMDRDM != 0, sqrdmlah),
+        (caps & hwcap::FCMA != 0, fcadd),
+        (caps & hwcap::ASIMDFHM != 0, fmlal),
+        (appine_engine::guest_hwcap2() & hwcap2::BF16 != 0, bfdot),
+        (appine_engine::guest_hwcap2() & hwcap2::BF16 != 0, bfcvt),
+    ];
+    for (on, insn) in cases {
+        if !on {
+            assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
+            continue;
+        }
+        let s = g.cpu.state_mut();
+        match insn {
+            // 0.5 × 0.5 加到 Q15 的累加值上：d + 0x2000，上半部分饱和到 0x7fff
+            0x6e428420 => {
+                s.v[0] = [0x1000_1000_1000_1000, 0x7000_7000_7000_7000];
+                s.v[1] = [0x4000_4000_4000_4000; 2];
+                s.v[2] = [0x4000_4000_4000_4000; 2];
+            }
+            // (1 + 2i) + (−i)(3 + 4i) = 5 − i
+            0x6ec2f420 => {
+                s.v[1] = [1f64.to_bits(), 2f64.to_bits()];
+                s.v[2] = [3f64.to_bits(), 4f64.to_bits()];
+            }
+            // (1 + 2^-10)² 在单精度里累加：1 + 2^-9 + 2^-20，半精度表示不了最后一项
+            0x4e22ec20 => {
+                s.v[0] = [0; 2];
+                s.v[1] = [0x3c01_3c01_3c01_3c01, u64::MAX];
+                s.v[2] = [0x3c01_3c01_3c01_3c01, u64::MAX];
+            }
+            // 每个单精度元素 1.0 + 2 × 3 + 2 × 3 = 13.0
+            0x6e42fc20 => {
+                s.v[0] = [0x3f80_0000_3f80_0000; 2];
+                s.v[1] = [0x4000_4000_4000_4000; 2];
+                s.v[2] = [0x4040_4040_4040_4040; 2];
+            }
+            // 0x3f818000 正好在 0x3f81 和 0x3f82 中间，舍入到偶数；标量写清掉高位
+            _ => {
+                s.v[0] = [u64::MAX; 2];
+                s.v[1] = [0x3f81_8000, 0];
+            }
+        }
+        g.step(insn);
+        let want = match insn {
+            0x6e428420 => [0x3000_3000_3000_3000, 0x7fff_7fff_7fff_7fff],
+            0x6ec2f420 => [5f64.to_bits(), (-1f64).to_bits()],
+            0x4e22ec20 => [0x3f80_4008_3f80_4008; 2],
+            0x6e42fc20 => [0x4150_0000_4150_0000; 2],
+            _ => [0x3f82, 0],
+        };
+        assert_eq!(g.cpu.state().v[0], want, "{insn:#010x}");
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # M9 之前：FP16 和 JSCVT（2026-10-31）
 
-← [M9 之前：ioprio、syslog 和 adjtimex（2026-10-31）](140-ioprio-syslog-adjtimex.md) · [索引](../milestones.md)
+← [M9 之前：ioprio、syslog 和 adjtimex（2026-10-31）](140-ioprio-syslog-adjtimex.md) · [索引](../milestones.md) · [M9 之前：RDM、FCMA、FHM 和 BF16（2026-10-31）](142-rdm-fcma-fhm-bf16.md) →
 
 宿主有时宣告半精度浮点运算（FEAT_FP16，`AT_HWCAP` 的 FPHP、ASIMDHP）和 FJCVTZS（FEAT_JSCVT）。§4.4 原来把 FP16 列在"v1 不做"，那时 SIMD&FP 的运算还没有交给原生指令桩；现在数据处理指令在 Tier 0 里由原生指令桩执行、在 Tier 1 里原样拷贝，加一个这类特性只要放行它的编码（与 [ASIMDDP](133-asimddp.md)、[SHA3、SHA512 和 I8MM](135-sha3-sha512-i8mm.md) 一样）。
 
@@ -40,5 +40,5 @@
 
 **推迟项**：
 
-- FHM（FMLAL/FMLSL，半精度乘加到单精度）、BF16、RDM、FCMA 仍不宣告；FHM 依赖 FP16，ML 库（XNNPACK、onnxruntime）用它，可以照这一轮的做法加。
+- FHM（FMLAL/FMLSL，半精度乘加到单精度）、BF16、RDM、FCMA 仍不宣告；FHM 依赖 FP16，ML 库（XNNPACK、onnxruntime）用它，可以照这一轮的做法加。→ 已补上（M9 之前：RDM、FCMA、FHM 和 BF16），FHM 只和 FP16 一起宣告
 - 宿主只有 FPHP、ASIMDHP 中的一个时两个都不宣告（实际的 CPU 总是一起实现）。
