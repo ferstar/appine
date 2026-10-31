@@ -1346,7 +1346,9 @@ mod tests {
     #[test]
     fn synthesized_clock_state_matches_a_kernel_without_ntp() {
         // Android 上合成的（unsynchronized_timex）与宿主内核的只读查询在不随 NTP 状态变的
-        // 字段上相同；合成的是未同步、TIME_ERROR，时间是现在
+        // 字段（precision、tolerance）上相同；合成的是未同步、TIME_ERROR，时间是现在。tick
+        // 不比：chrony 这类守护进程频率偏差大时用 ADJ_TICK 改它（CI 的 runner 上见过 9999），
+        // 合成的是 USER_HZ 100 的 10000，宿主的只要在内核允许的 ±10% 里
         let field = |b: &[u8; TIMEX_SIZE], off: usize| {
             i64::from_le_bytes(b[off..off + 8].try_into().unwrap())
         };
@@ -1362,9 +1364,11 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             let (_, host) = adjtimex_query(false).unwrap();
-            for off in [56, 64, 88] {
+            for off in [56, 64] {
                 assert_eq!(field(&fake, off), field(&host, off), "offset {off}");
             }
+            assert_eq!(field(&fake, 88), 10_000);
+            assert!((9_000..=11_000).contains(&field(&host, 88)));
         }
     }
 
