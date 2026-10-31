@@ -1,6 +1,6 @@
 # M9 之前：tmpfs 的用量和限制（2026-10-31）
 
-← [M9 之前：vhangup（2026-10-31）](130-vhangup.md) · [索引](../milestones.md)
+← [M9 之前：vhangup（2026-10-31）](130-vhangup.md) · [索引](../milestones.md) · [M9 之前：setns 经由 pidfd（2026-10-31）](132-setns-pidfd.md) →
 
 [tmpfs](117-tmpfs.md)那一轮的推迟项：`size=` 只影响 statfs 报告的总量，写满了也不会 ENOSPC，inode 数不限，用量不记，`df` 看到的已用总是 0；重新挂载时不看选项。bubblewrap 的 `--tmpfs`（Codex、Claude Code 的沙箱）、`--dev` 和手动挂的 tmpfs 都是这样。
 

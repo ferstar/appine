@@ -25,7 +25,7 @@
 **推迟项**：
 
 - 最后一个打开着的命名空间文件关掉之后，命名空间留下的挂载、IPC 对象要等下一次线程退出或者 umount 才清理（Linux 上马上释放）。没有进程在里面，看不出来，只是多占一会儿。
-- setns 仍不接受 pidfd（一次换几种命名空间）。
+- setns 仍不接受 pidfd（一次换几种命名空间）。→ 已补上（M9 之前：setns 经由 pidfd）
 - `NS_GET_*` 得到的 fd 记在原来那个文件经由的 procfs 挂载上（fdinfo 的 `mnt_id`），Linux 上在看不到的 nsfs 挂载上。
 - RTM_NEWNSID（`ip netns set`）仍是 EOPNOTSUPP，`ip netns list-id` 是空的。
 - `appine-run` 交给 guest 的宿主 stdio 的 F_GETFL 总带着 `O_LARGEFILE`，宿主那边是管道时 Linux 上没有。

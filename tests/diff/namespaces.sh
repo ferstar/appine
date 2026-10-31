@@ -19,7 +19,7 @@ echo "same for threads: $([ "$(readlink /proc/$$/ns/mnt)" = "$(readlink /proc/$$
 stat -f -c %t /proc/self/ns/mnt
 
 # busybox 的 unshare -m：里面挂的外面看不到
-unshare -m sh -c '
+busybox unshare -m sh -c '
     mount --make-rprivate /
     mount -t tmpfs inside /tmp/ns/a && echo "inside: $(grep -c " /tmp/ns/a " /proc/self/mountinfo)"
     echo "different ns: $([ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/$PPID/ns/mnt)" ] && echo yes)"
@@ -149,7 +149,7 @@ echo "left: $(grep -c ' /tmp/ns' /proc/self/mountinfo)"
 # 用户命名空间
 cat /proc/self/uid_map /proc/self/gid_map /proc/self/projid_map /proc/self/setgroups
 echo "max_user_namespaces: $(test -r /proc/sys/user/max_user_namespaces && echo yes)"
-echo "unshare -r: $(unshare -r sh -c 'id -u; id -g; cat /proc/self/uid_map' | tr -s ' \n' ' ')"
+echo "unshare -r: $(busybox unshare -r sh -c 'id -u; id -g; cat /proc/self/uid_map' | tr -s ' \n' ' ')"
 python3 - <<'PY2'
 import ctypes, errno, functools, os, threading, time
 

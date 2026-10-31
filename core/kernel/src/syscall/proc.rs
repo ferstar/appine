@@ -43,7 +43,7 @@ const CLONE_NEWNET: u64 = 0x4000_0000;
 const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 /// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载、用户、pid、UTS、
 /// IPC、网络、cgroup 命名空间（`syscall::ns`），time 命名空间是 EPERM（设计文档 §6）。
-const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
+pub(super) const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
 /// 支持的 `CLONE_NEW*`。
 const CLONE_NEW_DONE: u64 = CLONE_NEWNS
     | CLONE_NEWUSER

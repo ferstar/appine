@@ -231,11 +231,11 @@ PY
 
 # busybox 的 unshare、nsenter：命名空间文件的路径
 touch nsfs/run/bbnet nsfs/run/bbuts
-unshare --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname bb; ip link show | grep -c "^[0-9]"'
+busybox unshare --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname bb; ip link show | grep -c "^[0-9]"'
 echo "outside: $(hostname | grep -c bb)"
-nsenter --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname; ip -o link show | cut -d: -f2'
+busybox nsenter --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname; ip -o link show | cut -d: -f2'
 umount /tmp/nsfs/run/bbnet /tmp/nsfs/run/bbuts
-nsenter --net=/tmp/nsfs/run/bbnet true; echo "after umount: $?"
+busybox nsenter --net=/tmp/nsfs/run/bbnet true; echo "after umount: $?"
 
 # iproute2 的 ip netns：add 把 unshare 出来的网络命名空间 bind 到 /var/run/netns 下面（原生
 # 一侧的镜像里没有 /var、/run）

@@ -140,6 +140,7 @@
 | [M9 之前：命名空间文件留住命名空间](rounds/129-namespace-files.md) | 2026-10-31 | 打开着的、bind 挂载出去的命名空间文件持有命名空间，里面的进程都退出之后照样能 setns 进去，`ip netns add`、`exec`、`list` 和 busybox 的 `unshare --net=<文件>`、`nsenter` 能用；挂载命名空间的文件不能经由挂载留住自己；`NS_GET_USERNS`、`NS_GET_PARENT`、`NS_GET_NSTYPE`、`NS_GET_OWNER_UID`；RTM_GETNSID；F_GETFL 的 `O_LARGEFILE` 只在 open 打开的文件上 |
 | [M9 之前：vhangup](rounds/130-vhangup.md) | 2026-10-31 | `vhangup(2)`、`TIOCVHANGUP` 按 Linux 的 `tty_vhangup`：终端记着被挂断过几次，只挂断挂断时打开着的文件，会话组长收到 SIGHUP、SIGCONT，会话失去控制终端，没读的输入丢掉；节点还在，重新打开照常能用 |
 | [M9 之前：tmpfs 的用量和限制](rounds/131-tmpfs-usage.md) | 2026-10-31 | tmpfs 与 Linux 一样按页数、inode 数记用量和限制：statfs 报告用量，新建、链接放不下和写满了是 ENOSPC（能写的写进去），fallocate 放不下是 ENOSPC；重新挂载可以改 `size=`、`nr_inodes=` |
+| [M9 之前：setns 经由 pidfd](rounds/132-setns-pidfd.md) | 2026-10-31 | setns 接受 pidfd，按 Linux 的顺序逐个检查、全部通过才一起换成那个进程的几种命名空间，一起进用户命名空间时按那里的能力算：util-linux 2.41 起的 `nsenter -t`（Alpine 3.24、Debian 13）原来每次都失败，现在能用；多线程进 time 命名空间是 EUSERS |
 
 ## 测量条件
 
