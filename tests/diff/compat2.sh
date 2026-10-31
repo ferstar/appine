@@ -760,6 +760,16 @@ static pid_t spawn(const char *name)
     return p;
 }
 
+/* pthread_join 返回时线程还可能没退完（Linux 在把子进程交出去之前就叫醒 join 的线程），等到
+ * /proc/self/task 里没有它 */
+static void wait_gone(pid_t tid)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid);
+    while (access(path, F_OK) == 0)
+        usleep(1000);
+}
+
 static void *worker(void *arg)
 {
     thread_tid = gettid();
@@ -834,6 +844,7 @@ int main(int argc, char **argv)
     printf("/proc/self/children: %s\n", access("/proc/self/children", F_OK) ? strerror(errno) : "exists");
     pthread_barrier_wait(&bar);
     pthread_join(t, NULL);
+    wait_gone(thread_tid);
     show("after the thread exited", me);
     kill(b, SIGKILL);
     wait_zombie(b);
@@ -1014,10 +1025,11 @@ static void *get_pdeath(void *arg)
 
 static const char *err(long r) { return r < 0 ? strerror(errno) : "ok"; }
 
-static pid_t a_pid, b_pid, c_pid;
+static pid_t a_pid, b_pid, c_pid, waiter_tid;
 static void *waiter_thread(void *arg)
 {
     int st;
+    waiter_tid = gettid();
     b_pid = fork();
     if (b_pid == 0)
         _exit(7);
@@ -1111,6 +1123,11 @@ int main(int argc, char **argv)
     }
     pthread_create(&t, NULL, waiter_thread, NULL);
     pthread_join(t, NULL);
+    /* pthread_join 返回时线程还可能没退完、它的子进程还没交给主线程：等到 /proc/self/task 里没有它 */
+    char task[64];
+    snprintf(task, sizeof task, "/proc/self/task/%d", waiter_tid);
+    while (access(task, F_OK) == 0)
+        usleep(1000);
     kill(c_pid, SIGKILL);
     printf("main waits the exited thread's child: %s\n", waitpid(c_pid, NULL, __WNOTHREAD) == c_pid ? "ok" : strerror(errno));
     kill(a_pid, SIGKILL);
