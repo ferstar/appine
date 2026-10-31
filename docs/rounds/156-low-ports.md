@@ -1,6 +1,6 @@
 # M9 之前：低端口映射和监听通知（2026-11-01）
 
-← [M9 之前：DIT（2026-11-01）](155-dit.md) · [索引](../milestones.md)
+← [M9 之前：DIT（2026-11-01）](155-dit.md) · [索引](../milestones.md) · [M9 之前：podman 和 docker 的普查（2026-11-01）](157-container-survey.md) →
 
 第 151 轮之后筛兼容性推迟项时找出来的两件之一（设计文档 §10 的"之后再加可配置的端口映射"、§12 #7 的"未实现"）：appine 默认以 root 登录，guest 里的 sshd（Debian、Ubuntu 默认 22）、nginx、caddy（80、443）、dnsmasq（53）都要绑 1024 以下的端口；guest 的权限检查通过，交给宿主之后，Android 上的 App 没有 `CAP_NET_BIND_SERVICE`，得到 EACCES，这些服务按默认配置起不来。普查的 sshd 一直用 `-p 2222`，开发环境的宿主进程又能绑低端口，所以从来没碰到。Termux 不是 root，用户早就习惯了 8022。
 
