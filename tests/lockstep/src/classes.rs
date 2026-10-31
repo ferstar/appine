@@ -121,6 +121,7 @@ pub const CLASSES: &[Class] = &[
     },
     case("lse", lse, hwcap::ATOMICS),
     case("lrcpc", lrcpc, hwcap::LRCPC),
+    case("lrcpc2", lrcpc2, hwcap::ILRCPC),
     case("crc32", crc32, hwcap::CRC32),
     case("dotprod", dotprod, hwcap::ASIMDDP),
     case("sha3_sha512", sha3_sha512, hwcap::SHA3 | hwcap::SHA512),
@@ -1066,6 +1067,32 @@ fn lrcpc(g: &mut Rng, _: &Env) -> Case {
     c.insns
         .push((size << 30) | 0x38bf_c000 | (rn << 5) | reg_or_zr(g, &[rn]));
     c.pointers.push((rn, target(g, 1 << size, 1 << size)));
+    c
+}
+
+/// LRCPC2 的 STLUR*、LDAPUR*、LDAPURS*：基址加 9 位偏移指向数据区里对齐的地方。
+fn lrcpc2(g: &mut Rng, _: &Env) -> Case {
+    let rn = reg_except(g, &[]);
+    let size = g.bits(2);
+    let bytes = 1u32 << size;
+    // size 11 没有带符号扩展的读，size 10 没有扩展到 32 位的
+    let opc = match size {
+        3 => g.below(2),
+        2 => g.below(3),
+        _ => g.below(4),
+    };
+    let off = (g.below(512 / bytes) as i64 - (256 / bytes) as i64) * bytes as i64;
+    let rt = if opc == 0 {
+        reg_or_zr(g, &[])
+    } else {
+        reg_or_zr(g, &[rn])
+    };
+    let mut c = Case::default();
+    c.insns.push(
+        (size << 30) | 0x1900_0000 | (opc << 22) | ((off as u32 & 0x1ff) << 12) | (rn << 5) | rt,
+    );
+    c.pointers
+        .push((rn, target(g, bytes.into(), bytes.into()) - off));
     c
 }
 

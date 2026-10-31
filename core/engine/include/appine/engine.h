@@ -159,6 +159,7 @@ struct appine_cpu {
 #define APPINE_HWCAP_SHA3 (UINT64_C(1) << 17)
 #define APPINE_HWCAP_ASIMDDP (UINT64_C(1) << 20)
 #define APPINE_HWCAP_SHA512 (UINT64_C(1) << 21)
+#define APPINE_HWCAP_ILRCPC (UINT64_C(1) << 26)
 
 /* AT_HWCAP2 的位，取值与 Linux 的 HWCAP2_* 一致 */
 #define APPINE_HWCAP2_I8MM (UINT64_C(1) << 13)

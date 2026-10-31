@@ -839,6 +839,8 @@ pub mod hwcap {
     pub const ASIMDDP: u64 = 1 << 20;
     /// SHA512 指令。
     pub const SHA512: u64 = 1 << 21;
+    /// LRCPC2：带偏移的 LDAPUR、STLUR 这些。
+    pub const ILRCPC: u64 = 1 << 26;
 }
 
 /// `AT_HWCAP2` 的位，取值与 Linux 的 `HWCAP2_*` 一致。

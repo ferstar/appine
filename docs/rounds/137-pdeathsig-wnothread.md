@@ -1,6 +1,6 @@
 # M9 之前：PDEATHSIG 和 __WNOTHREAD（2026-10-31）
 
-← [M9 之前：LRCPC（2026-10-31）](136-lrcpc.md) · [索引](../milestones.md)
+← [M9 之前：LRCPC（2026-10-31）](136-lrcpc.md) · [索引](../milestones.md) · [M9 之前：LRCPC2（2026-10-31）](138-lrcpc2.md) →
 
 [task 目录的 children](134-task-children.md)那一轮记下父线程之后剩下的两条推迟项，都是 Linux 上按线程、appine 原来按进程的地方：
 

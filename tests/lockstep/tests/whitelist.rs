@@ -27,7 +27,11 @@ fn whitelist_matches_llvm() {
             "  {:<12} {} samples, {} executable",
             r.space, r.samples, r.defined
         );
-        assert!(r.defined > 0, "no executable samples in {}", r.space);
+        assert!(
+            r.defined > 0 || !r.available,
+            "no executable samples in {}",
+            r.space
+        );
     }
     if !found.is_empty() {
         let lines: Vec<String> = found

@@ -1613,7 +1613,8 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, i
  * 以 SP 为基址时 SP 要 16 字节对齐，不满足时交给 Tier 0 报告对齐错误。结束时
  * T0 = guest 地址，T2 = 宿主地址。
  */
-static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bool write, uint64_t pc)
+static void emit_atomic_address_off(struct xlate *x, unsigned rn, int64_t off, unsigned bytes,
+                                    bool write, uint64_t pc)
 {
     if (rn == 31) {
         emit(x, enc_mov(T0, SP_HOST));
@@ -1623,6 +1624,8 @@ static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bo
     } else {
         emit(x, enc_mov(T0, rn));
     }
+    if (off) /* LRCPC2 的 9 位偏移，放得进 12 位立即数 */
+        emit(x, off < 0 ? enc_sub_imm(T0, T0, (uint32_t)-off, 0) : enc_add_imm(T0, T0, (uint32_t)off, 0));
     if (bytes > 1) {
         emit(x, enc_and_low(T1, T0, (unsigned)__builtin_ctz(bytes)));
         emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
@@ -1630,6 +1633,11 @@ static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bo
     emit_tlb_check(x, pc, bytes, write, true, false, R_INTERP);
     emit(x, enc_add_lsl(T2, T2, T0, 0));
     x->st->insns_memory++;
+}
+
+static void emit_atomic_address(struct xlate *x, unsigned rn, unsigned bytes, bool write, uint64_t pc)
+{
+    emit_atomic_address_off(x, rn, 0, bytes, write, pc);
 }
 
 struct atomic_operand {
@@ -1748,13 +1756,23 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
 
 static bool is_atomic(uint32_t insn)
 {
-    return (insn & 0x3f000000) == 0x08000000 || ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26));
+    return (insn & 0x3f000000) == 0x08000000 || ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26)) ||
+           (insn & 0x3f200c00) == 0x19000000;
 }
 
 /* 编码已由 tier0_defined 确认合法；返回 false 时还没有发射任何指令 */
 static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     unsigned size = FIELD(insn, 31, 30), rn = FIELD(insn, 9, 5);
+    /* LRCPC2 的 LDAPUR*、STLUR*：检查基址加偏移，在宿主地址上去掉偏移原样执行 */
+    if ((insn & 0x3f200c00) == 0x19000000) {
+        bool load = FIELD(insn, 23, 22) != 0;
+        int64_t off = (int64_t)((uint64_t)FIELD(insn, 20, 12) << 55) >> 55;
+        struct atomic_operand rt = {0, !load, load};
+        emit_atomic_address_off(x, rn, off, 1u << size, !load, pc);
+        emit_on_host_address(x, insn & ~(0x1ffu << 12), &rt, 1);
+        return true;
+    }
     if ((insn & 0x3f000000) == 0x08000000) {
         unsigned o2 = BIT(insn, 23), o1 = BIT(insn, 21);
         if (!o2 && !o1)

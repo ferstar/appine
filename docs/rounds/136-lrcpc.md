@@ -21,5 +21,5 @@
 
 **推迟项**：
 
-- LRCPC2（LDAPUR、STLUR 这些带偏移的形式）不做。
+- LRCPC2（LDAPUR、STLUR 这些带偏移的形式）不做。→ 已补上（M9 之前：LRCPC2）
 - 宿主没有 LRCPC 时，编译时假定它的程序仍会 SIGILL（与在没有 LRCPC 的 CPU 上一样）。

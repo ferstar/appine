@@ -42,15 +42,15 @@ static uint64_t get_x(const struct appine_cpu *c, unsigned r)
  * 访问不会跨页。access 为写时同时要求可读。watch 是这次访问算作哪种硬件观察点
  * （APPINE_WATCH_*，读改写两种都算）。
  */
-static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, uint32_t access,
-                           uint32_t watch)
+static void *atomic_target_off(struct appine_cpu *c, unsigned rn, int64_t off, unsigned bytes,
+                               uint32_t access, uint32_t watch)
 {
     uint64_t va = rn == 31 ? c->sp : c->x[rn];
     if (rn == 31 && (c->sp & 15)) {
         raise_fault(c, c->sp, access, APPINE_FAULT_SP_ALIGN);
         return NULL;
     }
-    va = untag(va);
+    va = untag(va + (uint64_t)off);
     if (va & (bytes - 1)) {
         raise_fault(c, va, access, APPINE_FAULT_ALIGN);
         return NULL;
@@ -65,6 +65,12 @@ static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, ui
     else if (UNLIKELY(watch_hit(c, va, bytes, watch)))
         return raise_fault(c, va, access, APPINE_FAULT_WATCH), NULL;
     return p;
+}
+
+static void *atomic_target(struct appine_cpu *c, unsigned rn, unsigned bytes, uint32_t access,
+                           uint32_t watch)
+{
+    return atomic_target_off(c, rn, 0, bytes, access, watch);
 }
 
 static void load_atomic(const void *p, unsigned bytes, bool acquire, uint64_t out[2])
@@ -187,6 +193,16 @@ static enum appine_exit exclusive(struct appine_cpu *c, uint32_t insn, bool pair
     return next(c);
 }
 
+static void store_release(void *p, unsigned bytes, uint64_t v)
+{
+    switch (bytes) {
+    case 1: __atomic_store_n((uint8_t *)p, (uint8_t)v, __ATOMIC_RELEASE); break;
+    case 2: __atomic_store_n((uint16_t *)p, (uint16_t)v, __ATOMIC_RELEASE); break;
+    case 4: __atomic_store_n((uint32_t *)p, (uint32_t)v, __ATOMIC_RELEASE); break;
+    default: __atomic_store_n((uint64_t *)p, v, __ATOMIC_RELEASE); break;
+    }
+}
+
 /* LDAR/STLR */
 static enum appine_exit acquire_release(struct appine_cpu *c, uint32_t insn)
 {
@@ -202,13 +218,7 @@ static enum appine_exit acquire_release(struct appine_cpu *c, uint32_t insn)
         set_x(c, rt, v[0]);
         return next(c);
     }
-    uint64_t v = get_x(c, rt);
-    switch (bytes) {
-    case 1: __atomic_store_n((uint8_t *)p, (uint8_t)v, __ATOMIC_RELEASE); break;
-    case 2: __atomic_store_n((uint16_t *)p, (uint16_t)v, __ATOMIC_RELEASE); break;
-    case 4: __atomic_store_n((uint32_t *)p, (uint32_t)v, __ATOMIC_RELEASE); break;
-    default: __atomic_store_n((uint64_t *)p, v, __ATOMIC_RELEASE); break;
-    }
+    store_release(p, bytes, get_x(c, rt));
     return next(c);
 }
 
@@ -221,6 +231,35 @@ static enum appine_exit load_acquire_rcpc(struct appine_cpu *c, uint32_t insn)
         return APPINE_EXIT_FAULT;
     uint64_t v[2];
     load_atomic(p, bytes, true, v);
+    set_x(c, rt, v[0]);
+    return next(c);
+}
+
+/*
+ * LRCPC2 的 STLUR*、LDAPUR*、LDAPURS*：基址加 9 位有符号偏移，照 STLR、LDAR 读写（要对齐）。
+ * opc 是 00 写、01 读后补零、10 读后按符号扩展到 64 位、11 扩展到 32 位
+ */
+static enum appine_exit rcpc_unscaled(struct appine_cpu *c, uint32_t insn)
+{
+    unsigned bytes = 1u << FIELD(insn, 31, 30), opc = FIELD(insn, 23, 22), rt = insn & 31;
+    int64_t off = (int64_t)((uint64_t)FIELD(insn, 20, 12) << 55) >> 55;
+    bool load = opc != 0;
+    void *p = atomic_target_off(c, FIELD(insn, 9, 5), off, bytes,
+                                load ? APPINE_ACCESS_READ : APPINE_ACCESS_WRITE,
+                                load ? APPINE_WATCH_LOAD : APPINE_WATCH_STORE);
+    if (!p)
+        return APPINE_EXIT_FAULT;
+    if (!load) {
+        store_release(p, bytes, get_x(c, rt));
+        return next(c);
+    }
+    uint64_t v[2];
+    load_atomic(p, bytes, true, v);
+    unsigned shift = 64 - 8 * bytes;
+    if (opc >= 2)
+        v[0] = (uint64_t)((int64_t)(v[0] << shift) >> shift);
+    if (opc == 3)
+        v[0] = (uint32_t)v[0];
     set_x(c, rt, v[0]);
     return next(c);
 }
@@ -274,6 +313,13 @@ enum appine_exit appine_atomic_exec(struct appine_cpu *c, uint32_t insn)
         return native_atomic(c, insn, 1u << size, &d);
     }
 
+    /* size 11 没有带符号扩展的读，size 10 没有扩展到 32 位的 */
+    if ((insn & 0x3f200c00) == 0x19000000) {
+        unsigned opc = FIELD(insn, 23, 22);
+        if (!appine_has(APPINE_HWCAP_ILRCPC) || (size == 3 && opc >= 2) || (size == 2 && opc == 3))
+            return undef(c, insn);
+        return rcpc_unscaled(c, insn);
+    }
     /* LDAPR 在 LSE 那一组里：A = 1、R = 0、Rs 全是 1（LLVM 认的只有这一种）、o3 = 1、opc = 100 */
     if ((insn & 0x3ffffc00) == 0x38bfc000)
         return appine_has(APPINE_HWCAP_LRCPC) ? load_acquire_rcpc(c, insn) : undef(c, insn);

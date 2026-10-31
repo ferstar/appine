@@ -1,7 +1,7 @@
 # gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
 # 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
 # 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
-# 点积指令；SHA3、SHA512、I8MM；LRCPC
+# 点积指令；SHA3、SHA512、I8MM；LRCPC、LRCPC2
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -666,3 +666,58 @@ C
 gcc -O2 -march=armv8-a+rcpc -pthread -o lrcpc lrcpc.c && ./lrcpc
 echo "ldapr in the code: $(gcc -O2 -march=armv8-a+rcpc -S -o - lrcpc.c | grep -c '	ldapr')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cx lrcpc)"
+
+# LRCPC2（带偏移的 LDAPUR*、LDAPURS*、STLUR*）：宿主有时宣告，HWCAP 的 ilrcpc、
+# ID_AA64ISAR1_EL1 的 LRCPC 字段（至少 2）、cpuinfo 一致；各种宽度、补零和符号扩展的读，正负
+# 偏移，写，.rodata 上的读。汇编器不一定认这些助记符，直接写指令字，固定用 x0、x1
+cat > lrcpc2.c <<'C'
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/auxv.h>
+
+#define HWCAP_ILRCPC (1 << 26)
+
+static uint64_t buf[4] = {0x8899aabbccddeeffull, 0x0011223344556677ull, 0, 0};
+static const uint64_t ro[2] = {0x0123456789abcdefull, 0xfedcba9876543210ull};
+
+#define LOAD(word, base)                                                                           \
+    ({                                                                                             \
+        register uint64_t b __asm__("x1") = (uint64_t)(base);                                      \
+        register uint64_t r __asm__("x0");                                                         \
+        __asm__ volatile(".inst " #word : "=r"(r) : "r"(b) : "memory");                            \
+        r;                                                                                         \
+    })
+#define STORE(word, base, value)                                                                   \
+    do {                                                                                           \
+        register uint64_t b __asm__("x1") = (uint64_t)(base);                                      \
+        register uint64_t v __asm__("x0") = (value);                                               \
+        __asm__ volatile(".inst " #word : : "r"(b), "r"(v) : "memory");                            \
+    } while (0)
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP);
+    uint64_t isar1;
+    __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
+    /* 宿主还有 LRCPC3 时 Linux 报 3，appine 报 2 */
+    printf("ilrcpc %d, LRCPC field at least 2: %d\n", !!(hw & HWCAP_ILRCPC), (int)(isar1 >> 20 & 15) >= 2);
+    if (!(hw & HWCAP_ILRCPC))
+        return 0;
+    printf("ldapur x  %016llx\n", (unsigned long long)LOAD(0xd9408020, buf));
+    printf("ldapur w  %016llx\n", (unsigned long long)LOAD(0x99404020, buf));
+    printf("ldapurh   %016llx\n", (unsigned long long)LOAD(0x59406020, buf));
+    printf("ldapurb   %016llx\n", (unsigned long long)LOAD(0x19407020, buf));
+    printf("ldapursb  %016llx\n", (unsigned long long)LOAD(0x19804020, buf));
+    printf("ldapursh  %016llx\n", (unsigned long long)LOAD(0x59c06020, buf));
+    printf("ldapursw  %016llx\n", (unsigned long long)LOAD(0x99804020, buf));
+    printf("ldapur -8 %016llx\n", (unsigned long long)LOAD(0xd95f8020, buf + 2));
+    printf("rodata    %016llx\n", (unsigned long long)LOAD(0xd9408020, ro));
+    STORE(0xd9010020, buf, 0x1122334455667788ull);
+    STORE(0x59012020, buf, 0xbeefull);
+    STORE(0x19015020, buf, 0x5aull);
+    printf("stored    %016llx %016llx\n", (unsigned long long)buf[2], (unsigned long long)buf[3]);
+    return 0;
+}
+C
+gcc -O1 -o lrcpc2 lrcpc2.c && ./lrcpc2
+echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cx ilrcpc)"

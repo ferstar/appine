@@ -22,6 +22,8 @@ pub struct Space {
     pub mask: u32,
     /// 这些位的取值。
     pub value: u32,
+    /// guest 特性集合有这些 HWCAP 位时这个空间里才有能执行的编码。
+    pub requires: u64,
 }
 
 /// 全部抽样空间。
@@ -30,26 +32,37 @@ pub const SPACES: &[Space] = &[
         name: "simd_fp_dp",
         mask: 0x0e00_0000,
         value: 0x0e00_0000, // bits 27:25 = 111
+        requires: 0,
     },
     Space {
         name: "simd_ldst",
         mask: 0x0e00_0000,
         value: 0x0c00_0000, // bits 27:25 = 110：bit 26 = 1 的访存
+        requires: 0,
     },
     Space {
         name: "exclusive",
         mask: 0x3f00_0000,
         value: 0x0800_0000,
+        requires: 0,
     },
     Space {
         name: "lse",
         mask: 0x3f20_0c00,
         value: 0x3820_0000,
+        requires: 0,
     },
     Space {
         name: "dp_2src",
         mask: 0x5fe0_0000,
         value: 0x1ac0_0000,
+        requires: 0,
+    },
+    Space {
+        name: "rcpc_unscaled",
+        mask: 0x3f20_0c00,
+        value: 0x1900_0000, // LRCPC2 的 LDAPUR*、STLUR*
+        requires: hwcap::ILRCPC,
     },
 ];
 
@@ -103,6 +116,7 @@ fn mattr(caps: u64, caps2: u64) -> String {
     attrs.push(flag(caps & hwcap::SHA3 != 0, "sha3"));
     attrs.push(flag(caps2 & hwcap2::I8MM != 0, "i8mm"));
     attrs.push(flag(caps & hwcap::LRCPC != 0, "rcpc"));
+    attrs.push(flag(caps & hwcap::ILRCPC != 0, "rcpc-immo"));
     attrs.join(",")
 }
 
@@ -161,6 +175,8 @@ pub struct SpaceReport {
     pub samples: usize,
     /// Tier 0 认为能执行的样本数。
     pub defined: usize,
+    /// guest 有这个空间要的特性（没有时空间里不该有能执行的编码）。
+    pub available: bool,
 }
 
 /// 抽样比对 Tier 0 与 LLVM。返回各空间的统计和分歧列表（最多 `limit` 条）。
@@ -199,6 +215,7 @@ pub fn check(
             space: space.name,
             samples,
             defined,
+            available: caps & space.requires == space.requires,
         });
         if disagree.is_empty() {
             continue;
