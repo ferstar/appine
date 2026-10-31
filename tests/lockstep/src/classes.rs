@@ -126,6 +126,8 @@ pub const CLASSES: &[Class] = &[
     case("dotprod", dotprod, hwcap::ASIMDDP),
     case("sha3_sha512", sha3_sha512, hwcap::SHA3 | hwcap::SHA512),
     case("i8mm", i8mm, HWCAP2_I8MM),
+    case("fp16", fp16, hwcap::FPHP | hwcap::ASIMDHP),
+    case("jscvt", jscvt, hwcap::JSCVT),
     Class {
         name: "fuzz_simd_fp",
         strict: false,
@@ -1155,6 +1157,89 @@ fn i8mm(g: &mut Rng, _: &Env) -> Case {
         5 | 6 => 0x0f80_f000 | q | lane | rm | rn_rd, // USDOT (by element)
         _ => 0x0f00_f000 | q | lane | rm | rn_rd,     // SUDOT (by element)
     })
+}
+
+/// FP16：向量和标量的三寄存器、两寄存器杂项，按元素，跨元素，标量浮点的各组（算术、
+/// 乘加、比较、条件选择、与整数互转、FMOV），向量的 FMOV 立即数。按表只挑有定义的编码。
+fn fp16(g: &mut Rng, _: &Env) -> Case {
+    // (U, a, opcode) 的位表，与 simd.c 的相同：三寄存器 opcode 0–7，杂项 opcode 0x0c–0x1f
+    const THREE: [[u32; 2]; 2] = [[0xdf, 0xc7], [0xfd, 0x75]];
+    const SCALAR_THREE: [[u32; 2]; 2] = [[0x98, 0x80], [0x30, 0x34]];
+    const MISC: [[u32; 2]; 2] = [[0x3f00_0000, 0x2f00_f000], [0x3f00_0000, 0xae00_b000]];
+    const SCALAR_MISC: [[u32; 2]; 2] = [[0x3c00_0000, 0xac00_7000], [0x3c00_0000, 0x2c00_3000]];
+    let pick = |g: &mut Rng, table: &[[u32; 2]; 2], width: u32| loop {
+        let (u, a, op) = (g.bit(), g.bit(), g.bits(width));
+        if (table[u as usize][a as usize] >> op) & 1 == 1 {
+            return (u << 29) | (a << 23) | op;
+        }
+    };
+    let q = g.bit() << 30;
+    let (rd, rn, rm) = (reg(g), reg(g) << 5, reg(g) << 16);
+    Case::one(match g.bits(4) {
+        0 | 1 => {
+            let f = pick(g, &THREE, 3);
+            0x0e40_0400 | q | (f & !7) | ((f & 7) << 11) | rm | rn | rd
+        }
+        2 => {
+            let f = pick(g, &MISC, 5);
+            0x0e78_0800 | q | (f & !31) | ((f & 31) << 12) | rn | rd
+        }
+        3 => {
+            let f = pick(g, &SCALAR_THREE, 3);
+            0x5e40_0400 | (f & !7) | ((f & 7) << 11) | rm | rn | rd
+        }
+        4 => {
+            let f = pick(g, &SCALAR_MISC, 5);
+            0x5e78_0800 | (f & !31) | ((f & 31) << 12) | rn | rd
+        }
+        // FMLA、FMLS、FMUL、FMULX（按元素）：H:L:M 选元素，Rm 只有 4 位
+        5 => {
+            let op = [0x0f00_1000, 0x0f00_5000, 0x0f00_9000, 0x2f00_9000][g.bits(2) as usize];
+            let lane = (g.bit() << 11) | (g.bit() << 21) | (g.bit() << 20);
+            op | q | lane | ((reg(g) & 15) << 16) | rn | rd
+        }
+        // FMAXNMV、FMAXV、FMINNMV、FMINV（opcode 0x0c、0x0f）
+        6 => 0x0e30_c800 | q | (g.bit() << 23) | (g.bit() * 0x3000) | rn | rd,
+        // 标量的 FMUL、FDIV、FADD、FSUB、FMAX、FMIN、FMAXNM、FMINNM、FNMUL
+        7 | 8 => 0x1ee0_0800 | rm | ((g.next_u64() % 9) as u32) << 12 | rn | rd,
+        // FMADD、FMSUB、FNMADD、FNMSUB
+        9 => 0x1fc0_0000 | (g.bit() << 21) | rm | (g.bit() << 15) | (reg(g) << 10) | rn | rd,
+        // FCMP、FCMPE（和 0 比）、FCCMP、FCSEL
+        10 => {
+            let opc = g.bits(2);
+            0x1ee0_2000 | if opc & 1 == 1 { 0 } else { rm } | rn | (opc << 3)
+        }
+        11 => 0x1ee0_0400 | rm | (g.bits(4) << 12) | rn | (g.bit() << 4) | g.bits(4),
+        12 => 0x1ee0_0c00 | rm | (g.bits(4) << 12) | rn | rd,
+        // FMOV、FABS、FNEG、FSQRT、FCVT（到单、双精度）、FRINT*
+        13 => {
+            let op = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 14, 15][(g.next_u64() % 13) as usize];
+            0x1ee0_4000 | (op << 15) | rn | rd
+        }
+        // 与 W/X 互转：FCVT*S/U、SCVTF/UCVTF、FMOV
+        14 => {
+            let (rmode, op) = [
+                (0, 0),
+                (1, 0),
+                (2, 1),
+                (3, 0),
+                (0, 2),
+                (0, 3),
+                (0, 4),
+                (0, 5),
+                (0, 6),
+                (0, 7),
+            ][(g.next_u64() % 10) as usize];
+            (g.bit() << 31) | 0x1ee0_0000 | (rmode << 19) | (op << 16) | rn | rd
+        }
+        // 向量的 FMOV 立即数（半精度）
+        _ => 0x0f00_fc00 | q | (g.bits(3) << 16) | (g.bits(5) << 5) | rd,
+    })
+}
+
+/// FJCVTZS：输入是随机的双精度位型（含 NaN、无穷、超出范围的），比对 W 和 NZCV。
+fn jscvt(g: &mut Rng, _: &Env) -> Case {
+    Case::one(0x1e7e_0000 | (reg(g) << 5) | reg(g))
 }
 
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {

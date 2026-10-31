@@ -103,8 +103,9 @@ pub fn find_llvm_mc() -> Option<PathBuf> {
 
 /// guest 特性集合对应的 LLVM `-mattr`。
 fn mattr(caps: u64, caps2: u64) -> String {
-    let mut attrs = vec!["-fullfp16".to_string()];
     let flag = |on: bool, name: &str| format!("{}{name}", if on { '+' } else { '-' });
+    // LLVM 的 fullfp16 同时管标量和向量的半精度，guest 也总是一起宣告
+    let mut attrs = vec![flag(caps & hwcap::FPHP != 0, "fullfp16")];
     attrs.push(flag(caps & hwcap::FP != 0, "fp-armv8"));
     attrs.push(flag(caps & hwcap::ASIMD != 0, "neon"));
     attrs.push(flag(caps & (hwcap::AES | hwcap::PMULL) != 0, "aes"));
@@ -117,6 +118,7 @@ fn mattr(caps: u64, caps2: u64) -> String {
     attrs.push(flag(caps2 & hwcap2::I8MM != 0, "i8mm"));
     attrs.push(flag(caps & hwcap::LRCPC != 0, "rcpc"));
     attrs.push(flag(caps & hwcap::ILRCPC != 0, "rcpc-immo"));
+    attrs.push(flag(caps & hwcap::JSCVT != 0, "jsconv"));
     attrs.join(",")
 }
 

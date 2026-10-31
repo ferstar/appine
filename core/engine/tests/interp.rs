@@ -247,7 +247,8 @@ fn data_accesses_ignore_the_top_byte() {
 fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
-        0x4e421420, // fadd v0.8h, v1.8h, v2.8h：FP16 不在白名单内
+        0x6e828420, // sqrdmlah v0.4s, v1.4s, v2.4s：RDM 不在白名单内
+        0x4e22ec20, // fmlal v0.4s, v1.4h, v2.4h：FHM 不在白名单内
         0x6e42fc20, // bfdot v0.4s, v1.8h, v2.8h：BF16 不在白名单内
         0xcec08420, // sm4e v0.4s, v1.4s：SM4 不在白名单内
         0x4f42e020, // 按元素的 sdot 要 32 位的元素（size = 01 未定义）
@@ -341,6 +342,15 @@ fn id_registers_match_hwcap() {
         _ => 0,
     };
     assert_eq!((g.x(0) >> 20) & 0xf, lrcpc);
+    assert_eq!(caps & hwcap::JSCVT != 0, (g.x(0) >> 12) & 0xf == 1);
+    // ID_AA64PFR0_EL1 的 FP、AdvSIMD：带半精度时是 1；两者只一起宣告
+    g.step(0xd5380400); // mrs x0, id_aa64pfr0_el1
+    let (fp, simd) = ((g.x(0) >> 16) & 0xf, (g.x(0) >> 20) & 0xf);
+    if caps & hwcap::FP != 0 {
+        assert_eq!(fp, (caps & hwcap::FPHP != 0) as u64);
+        assert_eq!(simd, (caps & hwcap::ASIMDHP != 0) as u64);
+    }
+    assert_eq!(caps & hwcap::FPHP != 0, caps & hwcap::ASIMDHP != 0);
 }
 
 #[test]
@@ -503,6 +513,69 @@ fn dot_product_follows_the_feature_set() {
             .sum::<u32>()
     };
     assert_eq!(lanes(g.cpu.state().v[3]), [sum(0), sum(1), sum(2), sum(3)]);
+}
+
+#[test]
+fn half_precision_follows_the_feature_set() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let fadd = 0x1ee22820; // fadd h0, h1, h2
+    let fmla = 0x4e420c20; // fmla v0.8h, v1.8h, v2.8h
+    let fmov = 0x4f03fe00; // fmov v0.8h, #1.0
+    if appine_engine::guest_hwcap() & hwcap::FPHP == 0 {
+        for insn in [fadd, fmla, fmov] {
+            assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
+        }
+        return;
+    }
+    // 1.0 + 2.0 = 3.0（0x3c00 + 0x4000 = 0x4200），标量写清掉高位
+    let s = g.cpu.state_mut();
+    s.v[0] = [u64::MAX; 2];
+    s.v[1] = [0x3c00, 0];
+    s.v[2] = [0x4000, 0];
+    g.step(fadd);
+    assert_eq!(g.cpu.state().v[0], [0x4200, 0]);
+    // 每个半精度元素 1.0 + 1.5 × 2.0 = 4.0（0x4400）
+    let s = g.cpu.state_mut();
+    s.v[0] = [0x3c00_3c00_3c00_3c00; 2];
+    s.v[1] = [0x3e00_3e00_3e00_3e00; 2];
+    s.v[2] = [0x4000_4000_4000_4000; 2];
+    g.step(fmla);
+    assert_eq!(g.cpu.state().v[0], [0x4400_4400_4400_4400; 2]);
+    g.step(fmov);
+    assert_eq!(g.cpu.state().v[0], [0x3c00_3c00_3c00_3c00; 2]);
+}
+
+#[test]
+fn javascript_conversion_follows_the_feature_set() {
+    if !has_simd() {
+        return;
+    }
+    let mut g = Guest::new();
+    let fjcvtzs = 0x1e7e0020; // fjcvtzs w0, d1
+    if appine_engine::guest_hwcap() & hwcap::JSCVT == 0 {
+        assert_eq!(
+            g.cpu.exec_insn(fjcvtzs),
+            Some(Exit::Undefined { insn: fjcvtzs })
+        );
+        return;
+    }
+    // 按 JavaScript 的 ToInt32 取模 2^32；精确时只有 Z 置位
+    for (d, w, z) in [
+        (3.0f64, 3u64, true),
+        (4294967301.0, 5, false),
+        (-1.5, u32::MAX as u64, false),
+    ] {
+        let s = g.cpu.state_mut();
+        s.v[1] = [d.to_bits(), 0];
+        s.nzcv = 0xf000_0000;
+        g.set_x(0, u64::MAX);
+        g.step(fjcvtzs);
+        assert_eq!(g.x(0), w, "{d}");
+        assert_eq!(g.cpu.state().nzcv, if z { 0x4000_0000 } else { 0 }, "{d}");
+    }
 }
 
 #[test]

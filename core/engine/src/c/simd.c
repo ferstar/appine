@@ -3,7 +3,7 @@
  *
  * 数据处理指令：这里只做白名单判定，运算交给原生指令桩。白名单是 ARMv8.0
  * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2/
- * SHA3/SHA512/DotProd/I8MM；FP16、RDM、FHM、FCMA、FRINTTS、JSCVT、BF16、SM3/SM4
+ * SHA3/SHA512/DotProd/I8MM/FP16/JSCVT；RDM、FHM、FCMA、FRINTTS、BF16、SM3/SM4
  * 等扩展一律拒绝。分组和编码按 ARM ARM 的 "Data Processing -- Scalar
  * Floating-Point and Advanced SIMD" 编码表。
  *
@@ -29,6 +29,18 @@ static bool with_gpr(struct native_desc *d, unsigned pos)
     *d = (struct native_desc){.fp = 1, .addr_pos = NATIVE_NO_ADDR, .n = 1};
     d->gpr[0] = (struct native_operand){.pos = (uint8_t)pos, .load = pos != 0, .store = pos == 0};
     return true;
+}
+
+/* 半精度的数据处理（FEAT_FP16）：FPHP、ASIMDHP 总是一起宣告（features.c） */
+static bool fp16(void)
+{
+    return appine_has(APPINE_HWCAP_FPHP | APPINE_HWCAP_ASIMDHP);
+}
+
+/* FP 指令的 type/size 字段选的精度能不能用：3 是半精度，2 只有 FMOV 的上半部分形式 */
+static bool fp_type_ok(unsigned type)
+{
+    return type <= 1 || (type == 3 && fp16());
 }
 
 /* ---- Advanced SIMD：向量 ---- */
@@ -79,6 +91,25 @@ static bool vec_three_same(uint32_t insn)
     default:
         return false;
     }
+}
+
+/* 三寄存器同类型（FP16）：a（bit 23）与 U 一起选指令，表与单、双精度的那组相同 */
+static bool vec_three_same_fp16(uint32_t insn)
+{
+    static const uint8_t allowed[2][2] = {{0xdf, 0xc7}, {0xfd, 0x75}};
+    unsigned u = BIT(insn, 29), a = BIT(insn, 23), opcode = FIELD(insn, 13, 11);
+    return fp16() && ((allowed[u][a] >> opcode) & 1);
+}
+
+/* 两寄存器杂项（FP16）：每一位是 opcode 0x0c–0x1f 里的一条 */
+static bool vec_two_reg_misc_fp16(uint32_t insn)
+{
+    static const uint32_t allowed[2][2] = {
+        {0x3f000000, 0x2f00f000}, /* FRINTN/M、FCVTNS/MS/AS、SCVTF；FCM*#0、FABS、FRINTP/Z、FCVTPS/ZS、FRECPE */
+        {0x3f000000, 0xae00b000}, /* FRINTA/X、FCVTNU/MU/AU、UCVTF；FCMGE/LE#0、FNEG、FRINTI、FCVTPU/ZU、FRSQRTE、FSQRT */
+    };
+    unsigned u = BIT(insn, 29), a = BIT(insn, 23), opcode = FIELD(insn, 16, 12);
+    return fp16() && ((allowed[u][a] >> opcode) & 1);
 }
 
 static bool vec_three_different(uint32_t insn)
@@ -168,8 +199,11 @@ static bool vec_across_lanes(uint32_t insn)
 {
     unsigned q = BIT(insn, 30), u = BIT(insn, 29), size = FIELD(insn, 23, 22);
     unsigned opcode = FIELD(insn, 16, 12);
-    if (opcode == 0x0c || opcode == 0x0f) /* FMAXNMV/FMINNMV、FMAXV/FMINV：只有 4S */
-        return u && q && !(size & 1);
+    if (opcode == 0x0c || opcode == 0x0f) { /* FMAXNMV/FMINNMV、FMAXV/FMINV */
+        if (!u) /* 半精度：4H、8H */
+            return !(size & 1) && fp16();
+        return q && !(size & 1); /* 单精度只有 4S */
+    }
     if (size == 3 || (size == 2 && !q))
         return false;
     switch (opcode) {
@@ -213,7 +247,7 @@ static bool vec_modified_imm(uint32_t insn)
 {
     unsigned q = BIT(insn, 30), op = BIT(insn, 29), cmode = FIELD(insn, 15, 12);
     if (BIT(insn, 11)) /* o2 = 1：半精度 FMOV（FP16） */
-        return false;
+        return !op && cmode == 0xf && fp16();
     return !(op && cmode == 0xf && !q); /* 双精度 FMOV 只有 2D */
 }
 
@@ -241,6 +275,8 @@ static bool vec_shift_imm(uint32_t insn)
         return !d64;
     case 0x1c: /* SCVTF/UCVTF（定点） */
     case 0x1f: /* FCVTZS/FCVTZU（定点）：immh = 001x 是半精度 */
+        if ((immh & 0xe) == 0x2)
+            return fp16();
         return (immh & 0xc) && !(d64 && !q);
     default:
         return false;
@@ -278,6 +314,8 @@ static bool vec_indexed(uint32_t insn)
     case 0x9: /* FMUL / FMULX */
         if (u && opcode != 0x9)
             return false; /* FCMLA（FCMA） */
+        if (size == 0) /* 半精度：H:L:M 选元素，Rm 只有 4 位 */
+            return fp16();
         return (size & 2) && !((size & 1) && (l || !q));
     case 0x0: /* MLA */
     case 0x4: /* MLS */
@@ -331,6 +369,25 @@ static bool scalar_three_same(uint32_t insn)
     }
 }
 
+/* 标量三寄存器同类型（FP16）：表与单、双精度的那组相同 */
+static bool scalar_three_same_fp16(uint32_t insn)
+{
+    static const uint8_t allowed[2][2] = {{0x98, 0x80}, {0x30, 0x34}};
+    unsigned u = BIT(insn, 29), a = BIT(insn, 23), opcode = FIELD(insn, 13, 11);
+    return fp16() && ((allowed[u][a] >> opcode) & 1);
+}
+
+/* 标量两寄存器杂项（FP16），位的含义同 vec_two_reg_misc_fp16 */
+static bool scalar_two_reg_misc_fp16(uint32_t insn)
+{
+    static const uint32_t allowed[2][2] = {
+        {0x3c000000, 0xac007000}, /* FCVTNS/MS/AS、SCVTF；FCM*#0、FCVTPS/ZS、FRECPE、FRECPX */
+        {0x3c000000, 0x2c003000}, /* FCVTNU/MU/AU、UCVTF；FCMGE/LE#0、FCVTPU/ZU、FRSQRTE */
+    };
+    unsigned u = BIT(insn, 29), a = BIT(insn, 23), opcode = FIELD(insn, 16, 12);
+    return fp16() && ((allowed[u][a] >> opcode) & 1);
+}
+
 static bool scalar_two_reg_misc(uint32_t insn)
 {
     unsigned u = BIT(insn, 29), size = FIELD(insn, 23, 22), opcode = FIELD(insn, 16, 12);
@@ -372,8 +429,14 @@ static bool scalar_two_reg_misc(uint32_t insn)
 static bool scalar_pairwise(uint32_t insn)
 {
     unsigned u = BIT(insn, 29), size = FIELD(insn, 23, 22), opcode = FIELD(insn, 16, 12);
-    if (!u) /* ADDP；U = 0 的 FP 形式属于 FP16 */
-        return opcode == 0x1b && size == 3;
+    if (!u) { /* ADDP；U = 0 的 FP 形式是半精度（FP16），size 的低位必须是 0 */
+        if (opcode == 0x1b)
+            return size == 3;
+        if (size & 1)
+            return false;
+        bool ok = opcode == 0x0c || opcode == 0x0f || (opcode == 0x0d && size == 0);
+        return ok && fp16();
+    }
     switch (opcode) {
     case 0x0c: /* FMAXNMP/FMINNMP */
     case 0x0f: /* FMAXP/FMINP */
@@ -411,7 +474,9 @@ static bool scalar_shift_imm(uint32_t insn)
     case 0x13: /* SQRSHRN/UQRSHRN */
         return !d64;
     case 0x1c: /* SCVTF/UCVTF（定点） */
-    case 0x1f: /* FCVTZS/FCVTZU（定点） */
+    case 0x1f: /* FCVTZS/FCVTZU（定点）：immh = 001x 是半精度 */
+        if ((immh & 0xe) == 0x2)
+            return fp16();
         return immh & 0xc;
     default:
         return false;
@@ -428,6 +493,8 @@ static bool scalar_indexed(uint32_t insn)
     case 0x9: /* FMUL / FMULX */
         if (u && opcode != 0x9)
             return false;
+        if (size == 0) /* 半精度 */
+            return fp16();
         return (size & 2) && !((size & 1) && l);
     case 0x3: /* SQDMLAL */
     case 0x7: /* SQDMLSL */
@@ -462,17 +529,20 @@ static bool fp_int_conversion(uint32_t insn, struct native_desc *d)
 {
     unsigned sf = BIT(insn, 31), type = FIELD(insn, 23, 22), rmode = FIELD(insn, 20, 19);
     unsigned opcode = FIELD(insn, 18, 16);
+    if (!sf && type == 1 && rmode == 3 && opcode == 6) /* FJCVTZS（JSCVT）：还写 NZCV */
+        return appine_has(APPINE_HWCAP_JSCVT) && with_gpr(d, 0);
     if (opcode == 6 || opcode == 7) { /* FMOV（通用寄存器 ↔ 浮点） */
         bool ok = (rmode == 0 && ((!sf && type == 0) || (sf && type == 1))) ||
-                  (rmode == 1 && sf && type == 2);
+                  (rmode == 1 && sf && type == 2) ||
+                  (rmode == 0 && type == 3 && fp16()); /* Wn/Xn ↔ Hn */
         return ok && with_gpr(d, opcode == 6 ? 0 : 5);
     }
-    if (type > 1)
+    if (!fp_type_ok(type))
         return false;
     if (opcode <= 1) /* FCVTNS/FCVTPS/FCVTMS/FCVTZS 及无符号形式 */
         return with_gpr(d, 0);
     if (rmode != 0)
-        return false; /* 包括 FJCVTZS（JSCVT） */
+        return false;
     if (opcode <= 3) /* SCVTF/UCVTF */
         return with_gpr(d, 5);
     return with_gpr(d, 0); /* FCVTAS/FCVTAU */
@@ -481,7 +551,7 @@ static bool fp_int_conversion(uint32_t insn, struct native_desc *d)
 static bool fp_one_source(uint32_t insn)
 {
     unsigned type = FIELD(insn, 23, 22), opcode = FIELD(insn, 20, 15);
-    if (type == 3) /* 半精度源操作数只能做 FCVT */
+    if (type == 3 && !fp16()) /* 没有 FP16 时半精度源操作数只能做 FCVT */
         return opcode == 0x04 || opcode == 0x05;
     if (type == 2)
         return false;
@@ -500,10 +570,10 @@ static bool fp_scalar(uint32_t insn, struct native_desc *d)
     if (BIT(insn, 29))
         return false; /* S = 1 */
     if (BIT(insn, 24)) /* FMADD/FMSUB/FNMADD/FNMSUB */
-        return !BIT(insn, 31) && type <= 1 && only_v(d);
+        return !BIT(insn, 31) && fp_type_ok(type) && only_v(d);
     if (!BIT(insn, 21)) { /* 浮点 ↔ 定点 */
         unsigned rmode = FIELD(insn, 20, 19), opcode = FIELD(insn, 18, 16);
-        if (type > 1 || (!BIT(insn, 31) && !BIT(insn, 15)))
+        if (!fp_type_ok(type) || (!BIT(insn, 31) && !BIT(insn, 15)))
             return false;
         if (rmode == 0 && (opcode == 2 || opcode == 3))
             return with_gpr(d, 5);
@@ -515,10 +585,10 @@ static bool fp_scalar(uint32_t insn, struct native_desc *d)
         return fp_int_conversion(insn, d);
     if (BIT(insn, 31))
         return false; /* 以下各组 M 必须为 0 */
-    if (BIT(insn, 14) && FIELD(insn, 13, 10) == 0) /* 1 源操作数：半精度只允许 FCVT */
+    if (BIT(insn, 14) && FIELD(insn, 13, 10) == 0) /* 1 源操作数 */
         return fp_one_source(insn) && only_v(d);
-    if (type > 1)
-        return false; /* 其余各组只有单精度和双精度 */
+    if (!fp_type_ok(type))
+        return false; /* 其余各组：单精度、双精度，有 FP16 时还有半精度 */
     switch (FIELD(insn, 11, 10)) {
     case 1: /* FCCMP/FCCMPE */
     case 3: /* FCSEL */
@@ -566,6 +636,10 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
             return crypto_sha2(insn);
         if ((insn & 0xdfe08400) == 0x5e000400) /* DUP (element)，标量 */
             return !BIT(insn, 29) && FIELD(insn, 14, 11) == 0 && (FIELD(insn, 19, 16) != 0);
+        if ((insn & 0xdf60c400) == 0x5e400400)
+            return scalar_three_same_fp16(insn);
+        if ((insn & 0xdf7e0c00) == 0x5e780800)
+            return scalar_two_reg_misc_fp16(insn);
         if ((insn & 0xdf200400) == 0x5e200400)
             return scalar_three_same(insn);
         if ((insn & 0xdf200c00) == 0x5e200000) /* SQDMLAL/SQDMLSL/SQDMULL */
@@ -595,6 +669,10 @@ bool appine_simd_dp_decode(uint32_t insn, struct native_desc *d)
             return BIT(insn, 30) || !BIT(insn, 14);
         if ((insn & 0x9fe08400) == 0x0e000400)
             return vec_copy(insn, d);
+        if ((insn & 0x9f60c400) == 0x0e400400)
+            return vec_three_same_fp16(insn);
+        if ((insn & 0x9f7e0c00) == 0x0e780800)
+            return vec_two_reg_misc_fp16(insn);
         if ((insn & 0x9f200400) == 0x0e200400)
             return vec_three_same(insn);
         if ((insn & 0x9f208400) == 0x0e008400)

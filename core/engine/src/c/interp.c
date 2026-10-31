@@ -40,8 +40,9 @@
 /* DC ZVA 清零的块大小：DCZID_EL0.BS = 4，即 2^4 个字，与常见的 arm64 核心一致 */
 #define DCZ_BLOCK 64
 
-/* FPCR 中 AArch64 用户态可写的位：AHP、DN、FZ、RMode */
+/* FPCR 中 AArch64 用户态可写的位：AHP、DN、FZ、RMode；有 FP16 时还有 FZ16 */
 #define FPCR_MASK UINT64_C(0x07c00000)
+#define FPCR_FZ16 (UINT64_C(1) << 19)
 /* FPSR 中的累积异常位：QC、IDC、IXC、UFC、OFC、DZC、IOC */
 #define FPSR_MASK UINT64_C(0x0800009f)
 
@@ -590,7 +591,7 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         if (read)
             wx(c, rt, c->fpcr);
         else
-            c->fpcr = v & FPCR_MASK;
+            c->fpcr = v & (FPCR_MASK | (appine_has(APPINE_HWCAP_FPHP) ? FPCR_FZ16 : 0));
         return next(c);
     case SYSREG_FPSR:
         if (read)

@@ -721,3 +721,116 @@ int main(void)
 C
 gcc -O1 -o lrcpc2 lrcpc2.c && ./lrcpc2
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cx ilrcpc)"
+# FP16（标量和向量的半精度运算）和 JSCVT（FJCVTZS）：宿主有时宣告。半精度的数组运算由编译器
+# 向量化成 fmla v.8h；FPCR.FZ16 写得进去、把非规格化的半精度结果冲成 0；FJCVTZS 按 JavaScript
+# 的 ToInt32 取模 2^32，精确时 Z 置位
+cat > fp16.c <<'C'
+#include <arm_neon.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+
+#define HWCAP_FPHP (1 << 9)
+#define HWCAP_ASIMDHP (1 << 10)
+#define HWCAP_JSCVT (1 << 13)
+
+static __fp16 a[1024], b[1024], c[1024];
+
+static void fma_loop(int n)
+{
+    for (int i = 0; i < n; i++)
+        c[i] = a[i] * b[i] + c[i];
+}
+
+static uint16_t bits(__fp16 h)
+{
+    uint16_t u;
+    memcpy(&u, &h, 2);
+    return u;
+}
+
+static void show(const char *name, float16x8_t v)
+{
+    uint16_t u[8];
+    memcpy(u, &v, 16);
+    printf("%s", name);
+    for (int i = 0; i < 8; i++)
+        printf(" %04x", u[i]);
+    printf("\n");
+}
+
+static unsigned jcvt(double d, int *z)
+{
+    register double in __asm__("d1") = d;
+    register unsigned out __asm__("w0");
+    unsigned long nzcv;
+    __asm__ volatile(".inst 0x1e7e0020\n\tmrs %1, nzcv" : "=r"(out), "=r"(nzcv) : "w"(in) : "cc");
+    *z = (nzcv >> 30) & 1;
+    return out;
+}
+
+int main(void)
+{
+    unsigned long hw = getauxval(AT_HWCAP);
+    uint64_t pfr0, isar1;
+    __asm__ volatile("mrs %0, id_aa64pfr0_el1" : "=r"(pfr0));
+    __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
+    printf("hwcap fphp %d asimdhp %d jscvt %d; FP %d AdvSIMD %d JSCVT %d\n", !!(hw & HWCAP_FPHP),
+           !!(hw & HWCAP_ASIMDHP), !!(hw & HWCAP_JSCVT), (int)(pfr0 >> 16 & 15),
+           (int)(pfr0 >> 20 & 15), (int)(isar1 >> 12 & 15));
+    if (hw & HWCAP_JSCVT) {
+        double in[] = {3.0, -1.5, 4294967301.0, 2147483648.0, -2147483649.0, 1e20, -0.0,
+                       0.5, INFINITY, -INFINITY, NAN, 1.0 / 3, 123456789012.75};
+        for (unsigned i = 0; i < sizeof in / sizeof *in; i++) {
+            int z;
+            unsigned w = jcvt(in[i], &z);
+            printf("fjcvtzs %g -> %u z %d\n", in[i], w, z);
+        }
+    }
+    if (!(hw & HWCAP_FPHP) || !(hw & HWCAP_ASIMDHP))
+        return 0;
+    for (int i = 0; i < 1024; i++) {
+        a[i] = (__fp16)((i % 37) * 0.25f - 4);
+        b[i] = (__fp16)((i % 11) * 0.125f + 0.5f);
+        c[i] = (__fp16)(i * 0.01f);
+    }
+    fma_loop(1024);
+    unsigned sum = 0;
+    for (int i = 0; i < 1024; i++)
+        sum = sum * 31 + bits(c[i]);
+    printf("fma loop checksum %08x, c[1000] = %g\n", sum, (float)c[1000]);
+    float16x8_t x = vld1q_f16(a + 3), y = vld1q_f16(b + 5), z = vld1q_f16(c + 7);
+    show("vfmaq", vfmaq_f16(z, x, y));
+    show("vdivq", vdivq_f16(x, y));
+    show("vsqrtq", vsqrtq_f16(vabsq_f16(x)));
+    show("vrndnq", vrndnq_f16(vmulq_n_f16(x, (__fp16)1.37f)));
+    show("vrecpeq", vrecpeq_f16(y));
+    show("vfmaq_laneq", vfmaq_laneq_f16(z, x, y, 6));
+    uint16x8_t gt = vcgtq_f16(x, y);
+    int16x8_t conv = vcvtq_s16_f16(vmulq_n_f16(x, (__fp16)3.3f));
+    show("vcgtq", vreinterpretq_f16_u16(gt));
+    show("vcvtq_s16", vreinterpretq_f16_s16(conv));
+    printf("vmaxnmvq %04x vminvq %04x\n", bits(vmaxnmvq_f16(x)), bits(vminvq_f16(y)));
+    __fp16 h = (__fp16)2.5f, k = (__fp16)-0.75f;
+    printf("scalar: add %04x div %04x fma %04x cvt %d %u sqrt %04x\n", bits(h + k),
+           bits(vdivh_f16(h, k)), bits(vfmah_f16(h, k, h)), vcvth_s32_f16(k * (__fp16)10),
+           vcvtah_u32_f16(h), bits(vsqrth_f16(h)));
+    /* FZ16：非规格化的半精度结果冲成 0（单精度的 FZ 不管半精度） */
+    volatile __fp16 tiny = (__fp16)6.1e-5f, half = (__fp16)0.25f, r0, r1;
+    r0 = tiny * half;
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr)::"memory");
+    __asm__ volatile("msr fpcr, %0" ::"r"(fpcr | 1 << 19) : "memory");
+    r1 = tiny * half;
+    uint64_t now;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(now)::"memory");
+    __asm__ volatile("msr fpcr, %0" ::"r"(fpcr) : "memory");
+    printf("subnormal %04x, with FZ16 %04x, FZ16 kept %d\n", bits(r0), bits(r1), !!(now & 1 << 19));
+    return 0;
+}
+C
+gcc -O3 -march=armv8.2-a+fp16 -o fp16 fp16.c -lm && ./fp16
+echo "fmla in the loop: $(gcc -O3 -march=armv8.2-a+fp16 -S -o - fp16.c | grep -c 'fmla	v[0-9]*\.8h')"
+echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'fphp|asimdhp|jscvt')"

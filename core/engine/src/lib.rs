@@ -829,8 +829,14 @@ pub mod hwcap {
     pub const CRC32: u64 = 1 << 7;
     /// LSE 原子指令。
     pub const ATOMICS: u64 = 1 << 8;
+    /// 标量的半精度浮点运算（FP16）。
+    pub const FPHP: u64 = 1 << 9;
+    /// Advanced SIMD 的半精度浮点运算（FP16）。
+    pub const ASIMDHP: u64 = 1 << 10;
     /// EL0 可以读取 ID 寄存器。
     pub const CPUID: u64 = 1 << 11;
+    /// FJCVTZS（JavaScript 语义的双精度转 int32）。
+    pub const JSCVT: u64 = 1 << 13;
     /// RCpc 的 load-acquire（LDAPR、LDAPRB、LDAPRH）。
     pub const LRCPC: u64 = 1 << 15;
     /// SHA3 指令（EOR3、RAX1、XAR、BCAX）。
