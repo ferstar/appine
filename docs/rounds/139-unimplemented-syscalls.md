@@ -54,7 +54,7 @@ Linux 6.1 上一般都有，appine 是 ENOSYS：
 
 **推迟项**：
 
-- openat2：`RESOLVE_*` 的几种限制（不越出起点、把起点当作根、不跟随符号链接、不跨挂载、不跟随魔法链接）要在路径解析里加上。
+- openat2：`RESOLVE_*` 的几种限制（不越出起点、把起点当作根、不跟随符号链接、不跨挂载、不跟随魔法链接）要在路径解析里加上。→ 已补上（M9 之前：openat2），`RESOLVE_CACHED` 照常解析（与 gVisor 一样），没有照下面说的总回 EAGAIN
   - 2026-10-31 读源码查了谁在用（第 143 轮之后）：Go（含 1.24 起的 `os.Root`）、Rust std、musl、CPython、libuv、git、coreutils、dpkg、apk-tools 都不调；glibc 2.43 才有包装函数。调用的有 systemd v261 起的 `chase()`、filepath-securejoin（runc、containerd、podman）、libpathrs、crun、bubblewrap 0.12 起、cap-std 和 wasmtime 的 WASI、Bun、Nix 2.33 起、util-linux 2.42.2 起、rsync 3.4.3–3.4.4，几乎都在 ENOSYS 时退回逐级打开（rsync 3.4.3–3.4.4 的退路不认 `..`）。硬失败的是 GNU tar 的 git 版本（2025-11 的 75b03fdf 起，Fedora 44 的 tar 1.35-9 已带）配 glibc ≥ 2.43：`src/misc.c` 的 `open_subdir` 直接 `openat2(…, RESOLVE_BENEATH)`，gnulib 的替代只在 libc 没有它时编进去，解包带子目录的归档全部失败。现在 App 里的三个发行版（Alpine、Debian 13、Ubuntu 24.04）不受影响，换到 glibc 2.43 和新的 tar 之后会。
   - 要做的话：BENEATH、IN_ROOT、NO_SYMLINKS、NO_MAGICLINKS、NO_XDEV，`RESOLVE_CACHED` 回 EAGAIN（gnulib 也这样）；`open_how` 照 6.1 检查（小于 24 字节 EINVAL，多出的字节不全是 0 E2BIG，mode 只能配 `O_CREAT`/`O_TMPFILE`，BENEATH 和 IN_ROOT 不能同时）。做不到的组合回 ENOSYS，不能回 EINVAL：systemd、cap-std、Nix 把 EINVAL 当真的错误。Android 16 及以前的应用 seccomp 不放行 openat2，不能交给宿主内核，只能在 appine 的路径解析里做。
 - adjtimex、clock_adjtime：至少可以回答只读的查询。改时钟与 settimeofday 一样，宿主的时间 guest 改不了。→ 已补上（M9 之前：ioprio、syslog 和 adjtimex）：查询取宿主的 NTP 状态，Android 上按未同步合成；要改东西的是 EPERM

@@ -1074,6 +1074,17 @@ impl Pseudo for View<'_> {
         f.dentry.clone().filter(|_| !dir)
     }
 
+    /// `/proc/<pid>/fd/<n>`、`ns/*`、`root`、`cwd`、`exe`（Linux 的 proc_pid_get_link、
+    /// proc_ns_get_link 都经由 nd_jump_link）。`/proc/self`、`thread-self` 是普通的链接。
+    fn magic(&self, node: &PseudoNode) -> bool {
+        matches!(
+            node,
+            PseudoNode::Fd(..)
+                | PseudoNode::Ns(..)
+                | PseudoNode::Entry(_, _, Entry::Root | Entry::Cwd | Entry::Exe)
+        )
+    }
+
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
         match node {
             PseudoNode::Ns(pid, tid, k) => {

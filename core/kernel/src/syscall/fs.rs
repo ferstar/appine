@@ -527,6 +527,123 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         .map(|fd| fd as u64)
 }
 
+/// openat2（Linux 6.1 的 `fs/open.c`）：`struct open_how` 的 flags、mode、resolve。与 openat
+/// 不同，不认识的标志、不该有的 mode 都是 EINVAL，路径解析带着 `resolve` 的限制
+/// （[`crate::vfs::resolve`]）。
+pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: usize) -> SysResult {
+    use crate::vfs::resolve;
+    const OPEN_HOW_SIZE_VER0: usize = 24;
+    /// `FMODE_NONOTIFY`：用户态不该给，与 `O_CLOEXEC` 一起去掉、不算错。
+    const FMODE_NONOTIFY: u64 = 0x400_0000;
+    const O_SYNC_BIT: u64 = 0o4000000; // __O_SYNC
+    const O_DSYNC: u64 = 0o10000;
+    const O_NOATIME: u64 = oflags::O_NOATIME as u64;
+    const O_TMPFILE_BIT: u64 = 0o20000000; // __O_TMPFILE
+    const VALID_OPEN_FLAGS: u64 = (oflags::O_ACCMODE
+        | oflags::O_CREAT
+        | oflags::O_EXCL
+        | oflags::O_NOCTTY
+        | oflags::O_TRUNC
+        | oflags::O_APPEND
+        | oflags::O_NONBLOCK
+        | oflags::O_ASYNC
+        | oflags::O_DIRECT
+        | oflags::O_LARGEFILE
+        | oflags::O_DIRECTORY
+        | oflags::O_NOFOLLOW
+        | oflags::O_CLOEXEC
+        | oflags::O_PATH) as u64
+        | O_SYNC_BIT
+        | O_DSYNC
+        | O_NOATIME
+        | O_TMPFILE_BIT;
+    const O_PATH_FLAGS: u64 =
+        (oflags::O_DIRECTORY | oflags::O_NOFOLLOW | oflags::O_PATH | oflags::O_CLOEXEC) as u64;
+    if size < OPEN_HOW_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > 4096 {
+        return Err(Errno::E2BIG);
+    }
+    // copy_struct_from_user：比 24 字节长的部分必须全是 0（以后的版本加的字段）
+    let mut raw = vec![0u8; size];
+    cx.mm().read(UserSlice::new(how, size), &mut raw)?;
+    if raw[OPEN_HOW_SIZE_VER0..].iter().any(|&b| b != 0) {
+        return Err(Errno::E2BIG);
+    }
+    let field = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+    let (mut flags, mode, res) = (field(0), field(1), field(2));
+    // O_LARGEFILE 只给不是 O_PATH 的
+    if flags & oflags::O_PATH as u64 == 0 {
+        flags |= oflags::O_LARGEFILE as u64;
+    }
+    // build_open_flags 的检查，按它的顺序
+    let f = flags & !(oflags::O_CLOEXEC as u64 | FMODE_NONOTIFY);
+    if f & !VALID_OPEN_FLAGS != 0 || res & !resolve::ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if res & resolve::SCOPED == resolve::SCOPED {
+        return Err(Errno::EINVAL);
+    }
+    let will_create = f & (oflags::O_CREAT as u64 | O_TMPFILE_BIT) != 0;
+    if (will_create && mode & !0o7777 != 0) || (!will_create && mode != 0) {
+        return Err(Errno::EINVAL);
+    }
+    // O_TMPFILE 必须带着 O_DIRECTORY、不带 O_CREAT，还要能写
+    let o_tmpfile = O_TMPFILE_BIT | oflags::O_DIRECTORY as u64;
+    if f & O_TMPFILE_BIT != 0
+        && (f & (o_tmpfile | oflags::O_CREAT as u64) != o_tmpfile
+            || f & oflags::O_ACCMODE as u64 == oflags::O_RDONLY as u64)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if f & oflags::O_PATH as u64 != 0 && f & !O_PATH_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // RESOLVE_CACHED：新建、截断、O_TMPFILE（它含 O_DIRECTORY，所以 O_DIRECTORY 也算）的
+    // 不试；别的照常解析，appine 的解析不等宿主的 I/O 以外的东西
+    let busy = (oflags::O_TRUNC | oflags::O_CREAT | oflags::O_DIRECTORY) as u64 | O_TMPFILE_BIT;
+    if res & resolve::CACHED != 0 && f & busy != 0 {
+        return Err(Errno::EAGAIN);
+    }
+    let path = read_path(cx, path)?;
+    let flags = flags as u32;
+    let file = open_path_with(cx, dirfd, path, flags, mode as u32, res)?;
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
+/// openat2 的起点和根目录（path_init）。有作用域（`BENEATH`、`IN_ROOT`）时根目录就是起点；
+/// `IN_ROOT` 的绝对路径也从 dirfd 起；别的绝对路径不看 dirfd（`BENEATH` 的由解析报 EXDEV）。
+fn openat2_start(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u64) -> Result<(Node, Node), Errno> {
+    use crate::vfs::resolve;
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    if path[0] == b'/' && flags & resolve::IN_ROOT == 0 {
+        let root = cx.root();
+        return Ok((root.clone(), root));
+    }
+    let start = if dirfd == AT_FDCWD {
+        cx.cwd()
+    } else {
+        let file = cx.fds().get(dirfd)?;
+        let node = file.borrow().node().ok_or(Errno::ENOTDIR)?;
+        let vfs = cx.vfs()?;
+        if !vfs.is_dir(&cx.view(&vfs), &node)? {
+            return Err(Errno::ENOTDIR);
+        }
+        node
+    };
+    let root = if flags & resolve::SCOPED != 0 {
+        start.clone()
+    } else {
+        cx.root()
+    };
+    Ok((start, root))
+}
+
 /// 内核自己新建一个文件（core dump）：相对当前目录，已经存在时是 EEXIST，不跟随符号
 /// 链接，只写打开。
 pub(crate) fn create_exclusive(cx: &mut Cx<'_>, path: &[u8], perm: u32) -> Result<FileRef, Errno> {
@@ -557,26 +674,45 @@ fn open_path(
     flags: u32,
     perm: u32,
 ) -> Result<FileRef, Errno> {
+    open_path_with(cx, dirfd, path, flags, perm, 0)
+}
+
+/// [`open_path`]，路径解析带着 openat2 的限制（[`crate::vfs::resolve`]）。
+fn open_path_with(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: Vec<u8>,
+    flags: u32,
+    perm: u32,
+    res: u64,
+) -> Result<FileRef, Errno> {
+    use crate::vfs::resolve;
     let vfs = cx.vfs()?;
-    let start = start_dir(cx, dirfd, &path)?;
+    let (start, root) = if res == 0 {
+        (start_dir(cx, dirfd, &path)?, cx.root())
+    } else {
+        openat2_start(cx, dirfd, &path, res)?
+    };
     let create = flags & oflags::O_CREAT != 0;
     let excl = create && flags & oflags::O_EXCL != 0;
     let follow = flags & oflags::O_NOFOLLOW == 0 && !excl;
     let cred = cx.cred();
 
-    let root = cx.root();
-    let resolved = vfs.walk(&cx.view(&vfs), &cred, &root, &start, &path, follow);
+    let resolved = vfs.walk_resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow, res);
     // parent 是最后经过的目录和名字，报告 inotify 事件用
     let (node, created, parent) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
         Ok((node, found)) => (node, None, found),
         Err(e) if e == Errno::ENOENT && create => {
             // 最后一个组件是悬空的符号链接时，与 Linux 一样沿着它新建目标文件
+            let mut root_set = path.first() == Some(&b'/')
+                || res & resolve::SCOPED != 0
+                || path.split(|&b| b == b'/').any(|c| c == b"..");
             let (mut start, mut path) = (start.clone(), path.clone());
             let mut links = 0;
             loop {
                 let (dir, name) =
-                    vfs.resolve_parent(&cx.view(&vfs), &cred, &root, &start, &path)?;
+                    vfs.resolve_parent_with(&cx.view(&vfs), &cred, &root, &start, &path, res)?;
                 if path.ends_with(b"/") || name == b"." || name == b".." {
                     return Err(Errno::EISDIR);
                 }
@@ -589,7 +725,25 @@ fn open_path(
                     if links > crate::vfs::MAX_SYMLINKS {
                         return Err(Errno::ELOOP);
                     }
+                    // 与 walk 里一样（pick_link、nd_jump_root）：RESOLVE_NO_SYMLINKS、nosymfollow
+                    // 的挂载不跟随；绝对路径的目标在 NO_XDEV 时要与根目录在同一个挂载里
+                    if res & resolve::NO_SYMLINKS != 0
+                        || vfs
+                            .mount_flags(&Node::Store(mnt, ino))
+                            .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
+                    {
+                        return Err(Errno::ELOOP);
+                    }
                     path = vfs.store().readlink(ino)?;
+                    // 解析时取过根目录没有：近似地按原来的路径看（绝对路径、有作用域、
+                    // 有 `..`，或者这里已经跳过一次），前面的符号链接里的不算
+                    if path.first() == Some(&b'/')
+                        && res & resolve::NO_XDEV != 0
+                        && (!root_set || mnt != root.mnt())
+                    {
+                        return Err(Errno::EXDEV);
+                    }
+                    root_set |= path.first() == Some(&b'/');
                     start = Node::Store(mnt, dir);
                     continue;
                 }

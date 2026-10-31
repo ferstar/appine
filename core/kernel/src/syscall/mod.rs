@@ -298,6 +298,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         54 => fs::fchownat(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4] as u32),
         55 => fs::fchown(cx, a[0] as i32, a[1] as u32, a[2] as u32),
         56 => fs::openat(cx, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
+        437 => fs::openat2(cx, a[0] as i32, a[1], a[2], a[3] as usize),
         57 => fs::close(cx, a[0] as i32),
         58 => tty::vhangup_ctty(cx),
         59 => fs::pipe2(cx, a[0], a[1] as u32),

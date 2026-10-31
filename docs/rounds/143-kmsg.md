@@ -1,6 +1,6 @@
 # M9 之前：/dev/kmsg 和内核日志（2026-10-31）
 
-← [M9 之前：RDM、FCMA、FHM 和 BF16（2026-10-31）](142-rdm-fcma-fhm-bf16.md) · [索引](../milestones.md)
+← [M9 之前：RDM、FCMA、FHM 和 BF16（2026-10-31）](142-rdm-fcma-fhm-bf16.md) · [索引](../milestones.md) · [M9 之前：openat2（2026-10-31）](144-openat2.md) →
 
 [ioprio、syslog 和 adjtimex](140-ioprio-syslog-adjtimex.md)那一轮让 syslog(2) 回答一份空的日志，留下两条推迟项：日志总是空的，OOM killer 和内部错误结束进程只写宿主的 stderr（Android 上是 logcat），guest 里看不到进程为什么死了（[稳健性](20-robustness.md)那一轮起的"终端里只看到 Killed"）；没有 `/dev/kmsg`、`/proc/kmsg`，util-linux 的 `dmesg`、往 `/dev/kmsg` 写日志的程序（systemd、一些 init 脚本）打不开它。这一轮按 Linux 6.1 的 `kernel/printk/printk.c` 加上一份真的内核日志。
 

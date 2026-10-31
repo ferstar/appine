@@ -284,6 +284,34 @@ pub(crate) trait Pseudo {
     fn follow_dentry(&self, _node: &PseudoNode) -> Option<Dentry> {
         None
     }
+    /// 是不是 Linux 的魔法链接（`nd_jump_link`）：openat2 的 `RESOLVE_NO_MAGICLINKS` 和
+    /// 有作用域的解析不跟随它们。包括 [`Pseudo::follow`] 直接跳过去的，也包括这里按内容
+    /// 解析、Linux 上直接跳过去的（`/proc/<pid>/exe`）。
+    fn magic(&self, _node: &PseudoNode) -> bool {
+        false
+    }
+}
+
+/// openat2 的 `struct open_how` 的 `resolve`（Linux 的 `RESOLVE_*`，对应路径解析的
+/// `LOOKUP_NO_XDEV` 这些）。
+pub(crate) mod resolve {
+    /// 不跨挂载（含 bind 挂载）：经由挂载点进出、`..` 越过挂载的根、跳到别的挂载上的
+    /// 绝对路径的符号链接、魔法链接都是 EXDEV。
+    pub const NO_XDEV: u64 = 0x01;
+    /// 不跟随魔法链接（ELOOP）。
+    pub const NO_MAGICLINKS: u64 = 0x02;
+    /// 不跟随任何符号链接（ELOOP）。
+    pub const NO_SYMLINKS: u64 = 0x04;
+    /// 不越出起点：绝对路径、绝对路径的符号链接、在起点上的 `..`、魔法链接都是 EXDEV。
+    pub const BENEATH: u64 = 0x08;
+    /// 把起点当作根目录：绝对路径和绝对路径的符号链接从起点算，在起点上的 `..` 不动；
+    /// 魔法链接是 EXDEV。
+    pub const IN_ROOT: u64 = 0x10;
+    /// 只用缓存里的（不会阻塞的）解析。
+    pub const CACHED: u64 = 0x20;
+    pub const ALL: u64 = 0x3f;
+    /// 有作用域（`LOOKUP_IS_SCOPED`）：根目录是起点。
+    pub const SCOPED: u64 = BENEATH | IN_ROOT;
 }
 
 /// 一个虚拟文件系统实例。
@@ -859,10 +887,27 @@ impl Vfs {
         path: &[u8],
         follow: bool,
     ) -> Result<(Node, Option<Dentry>), Errno> {
-        self.store
-            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow))
+        self.walk_resolve(ps, cred, root, cwd, path, follow, 0)
     }
 
+    /// [`walk`](Self::walk)，带着 openat2 的限制（[`resolve`]）。有作用域时
+    /// （`BENEATH`、`IN_ROOT`）`root` 是起点。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn walk_resolve(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+        follow: bool,
+        flags: u64,
+    ) -> Result<(Node, Option<Dentry>), Errno> {
+        self.store
+            .snapshot(|_| self.walk_in(ps, cred, root, cwd, path, follow, flags))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn walk_in(
         &self,
         ps: &dyn Pseudo,
@@ -871,15 +916,25 @@ impl Vfs {
         cwd: &Node,
         path: &[u8],
         follow: bool,
+        flags: u64,
     ) -> Result<(Node, Option<Dentry>), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
+        // 开头的 / 跳到根目录（path_init 的 nd_jump_root）：BENEATH 不许；IN_ROOT 的根就是
+        // 起点；NO_XDEV 只管解析途中的跳转
         let mut dir = if path[0] == b'/' {
+            if flags & resolve::BENEATH != 0 {
+                return Err(Errno::EXDEV);
+            }
             root.clone()
         } else {
             cwd.clone()
         };
+        // Linux 的 nd->root 取过了没有：绝对路径、有作用域时一开始就取，否则到第一个 `..`
+        // 或者第一次跳到根目录时才取。NO_XDEV 时还没取就跳到根目录（绝对路径的符号链接）
+        // 总是 EXDEV：nd_jump_root 拿当前的挂载与空的 nd->root.mnt 比
+        let mut root_set = path[0] == b'/' || flags & resolve::SCOPED != 0;
         let mut found = None;
         let mut pending = components(path);
         let mut links = 0;
@@ -897,32 +952,74 @@ impl Vfs {
                 continue;
             }
             if comp == b".." {
-                dir = self.dotdot(ps, root, dir)?;
+                // 在起点上（follow_dotdot 的 in_root）：BENEATH 越不出去；越过挂载的根、
+                // 回到挂着东西的目录（进到那个挂载里）是跨挂载
+                if dir == *root && flags & resolve::BENEATH != 0 {
+                    return Err(Errno::EXDEV);
+                }
+                root_set = true;
+                let up = self.dotdot(ps, root, dir.clone())?;
+                if flags & resolve::NO_XDEV != 0 && up.mnt() != dir.mnt() {
+                    return Err(Errno::EXDEV);
+                }
+                dir = up;
                 found = None;
                 continue;
             }
             let node = self.lookup(ps, &dir, &comp)?;
+            // 名字上挂着东西：进到那个挂载里（traverse_mounts）
+            if flags & resolve::NO_XDEV != 0 && node.mnt() != dir.mnt() {
+                return Err(Errno::EXDEV);
+            }
             if self.kind(ps, &node)? == mode::S_IFLNK && (!last || follow) {
                 links += 1;
                 if links > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
                 }
-                // nosymfollow 的挂载里的符号链接（包括魔法链接）不跟随（Linux 的 pick_link）
-                if self
-                    .mount_flags(&node)
-                    .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
+                // nosymfollow 的挂载里的符号链接（包括魔法链接）、RESOLVE_NO_SYMLINKS 时的
+                // 任何符号链接都不跟随（Linux 的 pick_link）
+                if flags & resolve::NO_SYMLINKS != 0
+                    || self
+                        .mount_flags(&node)
+                        .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
                 {
                     return Err(Errno::ELOOP);
                 }
-                if let Node::Pseudo(id, p) = &node
-                    && let Some(target) = ps.follow(*id, p)
-                {
-                    dir = target?;
+                // 魔法链接（nd_jump_link）：先查能不能看那个进程，再看限制
+                let magic = matches!(&node, Node::Pseudo(_, p) if ps.magic(p));
+                let jump = match &node {
+                    Node::Pseudo(id, p) => ps.follow(*id, p).transpose()?,
+                    Node::Store(..) => None,
+                };
+                if magic {
+                    if flags & resolve::NO_MAGICLINKS != 0 {
+                        return Err(Errno::ELOOP);
+                    }
+                    if let Some(target) = &jump
+                        && flags & resolve::NO_XDEV != 0
+                        && target.mnt() != dir.mnt()
+                    {
+                        return Err(Errno::EXDEV);
+                    }
+                    if flags & resolve::SCOPED != 0 {
+                        return Err(Errno::EXDEV);
+                    }
+                }
+                if let (Node::Pseudo(_, p), Some(target)) = (&node, jump) {
+                    dir = target;
                     found = if last { ps.follow_dentry(p) } else { None };
                     continue;
                 }
                 let target = self.readlink(ps, &node)?;
+                // 绝对路径的符号链接（nd_jump_root）：BENEATH 不许，NO_XDEV 时根目录要已经
+                // 取过、与链接所在的目录在同一个挂载里
                 if target.first() == Some(&b'/') {
+                    if flags & resolve::BENEATH != 0
+                        || (flags & resolve::NO_XDEV != 0 && (!root_set || dir.mnt() != root.mnt()))
+                    {
+                        return Err(Errno::EXDEV);
+                    }
+                    root_set = true;
                     dir = root.clone();
                     found = None;
                 }
@@ -947,17 +1044,34 @@ impl Vfs {
         cwd: &Node,
         path: &'p [u8],
     ) -> Result<(Node, &'p [u8]), Errno> {
+        self.resolve_parent_with(ps, cred, root, cwd, path, 0)
+    }
+
+    /// [`resolve_parent`](Self::resolve_parent)，带着 openat2 的限制（[`resolve`]）。
+    pub(crate) fn resolve_parent_with<'p>(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &'p [u8],
+        flags: u64,
+    ) -> Result<(Node, &'p [u8]), Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
         let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
         let trimmed = &path[..end];
         if trimmed.is_empty() {
+            if flags & resolve::BENEATH != 0 {
+                return Err(Errno::EXDEV);
+            }
             return Ok((root.clone(), b"."));
         }
         let (dir, name) = match trimmed.iter().rposition(|&b| b == b'/') {
             Some(i) => (
-                self.resolve(ps, cred, root, cwd, &trimmed[..=i], true)?,
+                self.walk_resolve(ps, cred, root, cwd, &trimmed[..=i], true, flags)?
+                    .0,
                 &trimmed[i + 1..],
             ),
             None => (cwd.clone(), trimmed),
@@ -1867,6 +1981,77 @@ mod tests {
         s.symlink(ROOT, b"slash", b"bin/busybox/", 0, 0).unwrap();
         drop(s);
         (Vfs::open(&dir).unwrap(), dir)
+    }
+
+    #[test]
+    fn openat2_resolve_flags_limit_the_walk() {
+        // sample 里：/usr/bin/env -> /bin/busybox，/usr/bin/rel -> ../../bin/busybox，
+        // /bindir -> bin；/proc 挂着 procfs
+        let (vfs, dir) = sample("openat2");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let root = Node::ROOT;
+        let usr = vfs.resolve(ps, cred, &root, &root, b"/usr", true).unwrap();
+        let ubin = vfs
+            .resolve(ps, cred, &root, &root, b"/usr/bin", true)
+            .unwrap();
+        let busybox = vfs
+            .resolve(ps, cred, &root, &root, b"/bin/busybox", true)
+            .unwrap();
+        // 有作用域时根目录是起点
+        let scoped = |start: &Node, p: &[u8], flags| {
+            vfs.walk_resolve(ps, cred, start, start, p, true, flags)
+                .map(|(n, _)| n)
+        };
+        let plain = |start: &Node, p: &[u8], flags| {
+            vfs.walk_resolve(ps, cred, &root, start, p, true, flags)
+                .map(|(n, _)| n)
+        };
+        use resolve::*;
+        // BENEATH：绝对路径、越出起点的 ..、绝对路径的符号链接、越出起点的相对链接都是 EXDEV
+        assert_eq!(scoped(&usr, b"bin", BENEATH), Ok(ubin.clone()));
+        assert_eq!(scoped(&usr, b"bin/..", BENEATH), Ok(usr.clone()));
+        assert_eq!(scoped(&usr, b"..", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(scoped(&usr, b"/bin", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(scoped(&usr, b"bin/env", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(scoped(&usr, b"bin/rel", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(scoped(&root, b"usr/bin/rel", BENEATH), Ok(busybox.clone()));
+        // IN_ROOT：起点当作根目录，.. 停在起点，绝对路径从起点算
+        assert_eq!(scoped(&usr, b"..", IN_ROOT), Ok(usr.clone()));
+        assert_eq!(scoped(&usr, b"/bin", IN_ROOT), Ok(ubin.clone()));
+        assert_eq!(scoped(&usr, b"../../bin", IN_ROOT), Ok(ubin.clone()));
+        assert_eq!(scoped(&usr, b"bin/env", IN_ROOT), Err(Errno::ENOENT));
+        // NO_SYMLINKS：途中和最后的符号链接都是 ELOOP，不跟随最后一个时照常
+        assert_eq!(
+            plain(&root, b"/bindir/busybox", NO_SYMLINKS),
+            Err(Errno::ELOOP)
+        );
+        assert_eq!(
+            plain(&root, b"/usr/bin/env", NO_SYMLINKS),
+            Err(Errno::ELOOP)
+        );
+        assert!(
+            vfs.walk_resolve(ps, cred, &root, &root, b"/usr/bin/env", false, NO_SYMLINKS)
+                .is_ok()
+        );
+        // NO_XDEV：进出挂载是 EXDEV；还没取过根目录时跳到根目录也是
+        assert_eq!(plain(&root, b"/proc", NO_XDEV), Err(Errno::EXDEV));
+        assert_eq!(plain(&root, b"/usr/bin/env", NO_XDEV), Ok(busybox.clone()));
+        assert_eq!(plain(&ubin, b"env", NO_XDEV), Err(Errno::EXDEV));
+        assert_eq!(plain(&ubin, b"../bin/env", NO_XDEV), Ok(busybox.clone()));
+        let proc = plain(&root, b"/proc", 0).unwrap();
+        assert_eq!(plain(&proc, b"..", NO_XDEV), Err(Errno::EXDEV));
+        // 新建时的父目录也受限制
+        assert_eq!(
+            vfs.resolve_parent_with(ps, cred, &usr, &usr, b"/x", BENEATH),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(
+            vfs.resolve_parent_with(ps, cred, &usr, &usr, b"/x", IN_ROOT),
+            Ok((usr.clone(), &b"x"[..]))
+        );
+        drop(vfs);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
