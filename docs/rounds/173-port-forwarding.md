@@ -1,6 +1,6 @@
 # M9 之前：发布的端口：PREROUTING 的 DNAT 和宿主上的转发（2026-11-01）
 
-← [M9 之前：nftables 的子集和 socket 层的 DNAT（2026-11-01）](172-nftables.md) · [索引](../milestones.md)
+← [M9 之前：nftables 的子集和 socket 层的 DNAT（2026-11-01）](172-nftables.md) · [索引](../milestones.md) · [M9 之前：各个网络命名空间的端口互不相干（2026-11-01）](174-namespace-ports.md) →
 
 [容器网络的普查](169-container-network-survey.md)定下的方案 1 的第四步，也是最后一步。[上一轮](172-nftables.md)之后，podman 用 nftables 驱动时，`-p 8080:80` 只在 appine 里面经由 127.0.0.1、外层地址连得上：那是 OUTPUT 钩子上的 DNAT。别的情形还不行：
 
@@ -59,5 +59,5 @@
   - 同一个网段里原生连不上的情形（没有 masquerade 时回答不经过网关），这里连得上。
 - 从外面来的连接，转不转发、转到哪里，按探测的包定，不按每个连接真实的来源：只看来源地址、入口接口的规则可能判断得不一样。转发线程接管了监听 socket 之后，guest 自己 accept 时与它抢连接：podman 的那个从不 accept；docker-proxy 抢到的同样转给容器。只转发 IPv4 的监听。
 - 从外面转发进来的连接，容器看到的来源是网关（与 docker-proxy 一样），原生 DNAT 时是外面客户端的真实地址。
-- 开机时的命名空间里监听通配地址的 socket，在宿主上也盖住了别的命名空间的回环地址：别的命名空间里这个端口没有监听时，连它的地址会连到这个 socket 上，原生是 ECONNREFUSED。
+- 开机时的命名空间里监听通配地址的 socket，在宿主上也盖住了别的命名空间的回环地址：别的命名空间里这个端口没有监听时，连它的地址会连到这个 socket 上，原生是 ECONNREFUSED。 → TCP 按命名空间里登记的监听判断，修了（M9 之前：各个网络命名空间的端口互不相干）
 - 从外面来的 UDP，每个来源一个转发 socket，闲置两分钟才关；没有连接跟踪那样的超时和计数。

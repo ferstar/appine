@@ -2953,6 +2953,7 @@ mod tests {
             lo: Default::default(),
             devs: RefCell::new(Devices::for_new_ns(&NetConf::default())),
             nft: Default::default(),
+            listeners: Default::default(),
         })
     }
 

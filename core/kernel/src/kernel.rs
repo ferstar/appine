@@ -462,6 +462,7 @@ impl Kernel {
             lo: Default::default(),
             devs: crate::cell::RefCell::new(devs),
             nft: Default::default(),
+            listeners: Default::default(),
         });
         self.net_nss.push(Rc::downgrade(&ns));
         Ok(ns)

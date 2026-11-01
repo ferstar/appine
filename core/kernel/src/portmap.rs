@@ -213,6 +213,39 @@ pub fn bind(
     Err(Errno::EADDRINUSE)
 }
 
+/// 新的网络命名空间里显式绑的端口（[`bind`] 是开机时的命名空间里的低端口）：宿主上一律另选
+/// 一个（让宿主分配），不占宿主上的这个端口，开机时的命名空间、手机上别的 App 照样绑得了
+/// 它（宿主上别人绑了通配地址时，绑这个命名空间的回环地址本来也会冲突）。同一个命名空间里
+/// 已经有 socket 绑着这个端口时用同一个宿主端口，冲突就是 guest 自己的（EADDRINUSE、
+/// `SO_REUSEPORT`）。没有 [`STICKY`]：宿主端口别人不会去连，换一个就是。
+pub fn bind_any(
+    map: &Rc<RefCell<PortMap>>,
+    ns: usize,
+    proto: i32,
+    port: u16,
+    mut bind: impl FnMut(u16) -> Result<(), i32>,
+    bound_port: impl Fn() -> Option<u16>,
+) -> Result<(u16, Lease), Errno> {
+    let key = (ns, proto, port);
+    let lease = |map: &Rc<RefCell<PortMap>>, host: u16| {
+        let mut m = map.borrow_mut();
+        m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
+        m.by_host.insert((ns, proto, host), port);
+        Lease {
+            map: map.clone(),
+            key,
+        }
+    };
+    let existing = map.borrow().host_port(ns, proto, port);
+    if let Some(host) = existing {
+        bind(host).map_err(Errno)?;
+        return Ok((host, lease(map, host)));
+    }
+    bind(0).map_err(Errno)?;
+    let host = bound_port().ok_or(Errno::EADDRINUSE)?;
+    Ok((host, lease(map, host)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +300,75 @@ mod tests {
             bind(&m, 0, TCP, 23, |_| Err(Errno::EACCES.0), || None).err(),
             Some(Errno::EACCES)
         );
+    }
+
+    /// 新命名空间里的端口：宿主分配；同一个命名空间里再绑用同一个宿主端口（冲突交给宿主），
+    /// 别的命名空间的同一个端口另外分配，全部释放之后再绑不必用原来的。
+    #[test]
+    fn namespace_ports_let_the_host_choose() {
+        let m = map();
+        let mut tried = Vec::new();
+        let (h, a) = bind_any(
+            &m,
+            7,
+            TCP,
+            8080,
+            |p| {
+                tried.push(p);
+                Ok(())
+            },
+            || Some(41000),
+        )
+        .unwrap();
+        assert_eq!((h, tried), (41000, vec![0]));
+        assert_eq!(m.borrow().host_port(7, TCP, 8080), Some(41000));
+        assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(8080));
+        // 同一个命名空间：同一个宿主端口，宿主说冲突就是 EADDRINUSE
+        let r = bind_any(
+            &m,
+            7,
+            TCP,
+            8080,
+            |p| {
+                assert_eq!(p, 41000);
+                Err(Errno::EADDRINUSE.0)
+            },
+            || None,
+        );
+        assert_eq!(r.err(), Some(Errno::EADDRINUSE));
+        let (h2, b) = bind_any(&m, 7, TCP, 8080, |_| Ok(()), || None).unwrap();
+        assert_eq!(h2, 41000);
+        // 别的命名空间、开机时的命名空间的同一个端口互不相干
+        let (h3, _c) = bind_any(
+            &m,
+            9,
+            TCP,
+            8080,
+            |p| {
+                assert_eq!(p, 0);
+                Ok(())
+            },
+            || Some(42000),
+        )
+        .unwrap();
+        assert_eq!(h3, 42000);
+        assert_eq!(m.borrow().host_port(0, TCP, 8080), None);
+        // 最后一个租约归还之后登记就没了，再绑重新分配
+        drop((a, b));
+        assert_eq!(m.borrow().host_port(7, TCP, 8080), None);
+        let (h4, _d) = bind_any(
+            &m,
+            7,
+            TCP,
+            8080,
+            |p| {
+                assert_eq!(p, 0);
+                Ok(())
+            },
+            || Some(43000),
+        )
+        .unwrap();
+        assert_eq!(h4, 43000);
     }
 
     #[test]

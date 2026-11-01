@@ -143,6 +143,23 @@ pub(crate) struct NetNs {
     pub devs: RefCell<crate::netdev::Devices>,
     /// nftables 的规则集（[`crate::nft`]）。
     pub nft: RefCell<crate::nft::Nft>,
+    /// 新的网络命名空间里监听着的 TCP socket（[`crate::netns::listening`]）。
+    pub listeners: RefCell<Vec<Listener>>,
+}
+
+/// 新的网络命名空间里一个监听着的 TCP socket：宿主上它们都在这个命名空间的回环地址上，连
+/// 过来时按这里判断有没有人监听、绑的地址对不对得上（Linux 上没有就是 ECONNREFUSED）。
+#[derive(Debug, Clone)]
+pub(crate) struct Listener {
+    /// 去掉时用的编号（[`crate::net::InetSocket::listener`]）。
+    pub id: u64,
+    /// guest 的端口。
+    pub port: u16,
+    /// 绑的 guest 地址（4 或 16 字节），None 是通配地址。
+    pub addr: Option<Vec<u8>>,
+    /// AF_INET6 的 socket，以及它的 `IPV6_V6ONLY`。
+    pub v6: bool,
+    pub v6only: bool,
 }
 
 /// 新的网络命名空间里 lo 的状态：一开始是关着的、没有地址（Linux 的 `loopback_net_init`）。
@@ -243,6 +260,7 @@ impl NsProxy {
                 lo: RefCell::default(),
                 devs: RefCell::default(),
                 nft: Default::default(),
+                listeners: Default::default(),
             }),
             cgroup: Rc::new(CgroupNs {
                 id: INIT_CGROUP_NS,

@@ -2404,6 +2404,7 @@ mod tests {
             lo: Default::default(),
             devs: Default::default(),
             nft: RefCell::new(Nft::default()),
+            listeners: Default::default(),
         }
     }
 

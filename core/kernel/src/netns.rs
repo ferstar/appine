@@ -494,6 +494,62 @@ pub(crate) fn from_host(
     }
 }
 
+/// 新的网络命名空间 `t` 里有没有在 guest 地址 `dst`（sockaddr，`t` 里看到的）上监听着的 TCP
+/// socket（[`crate::nsproxy::Listener`]）：通配地址的接受 IPv4 和 IPv6（AF_INET 的只接受
+/// IPv4，设了 `IPV6_V6ONLY` 的只接受 IPv6），绑在某个地址上的只接受发往它的。
+pub(crate) fn listening(t: &NetNs, dst: &[u8]) -> bool {
+    let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
+        return true;
+    };
+    let ip: Vec<u8> = match (family(dst), ipv4_of(dst)) {
+        (_, Some(v4)) => v4.to_vec(),
+        (Some(AF_INET6), None) if dst.len() >= 24 => dst[8..24].to_vec(),
+        _ => return true,
+    };
+    t.listeners.borrow().iter().any(|l| {
+        l.port == port
+            && match &l.addr {
+                None if ip.len() == 4 => !l.v6 || !l.v6only,
+                None => l.v6,
+                Some(a) => *a == ip,
+            }
+    })
+}
+
+/// 新的网络命名空间里的 socket 开始监听：登记它（[`listening`]）。`host` 是它在宿主上的本端。
+pub(crate) fn add_listener(
+    me: &NetNs,
+    port: u16,
+    any: bool,
+    vaddr: Option<[u8; 4]>,
+    host: &[u8],
+    v6: bool,
+    v6only: bool,
+) -> std::num::NonZeroU64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 绑的 guest 地址：虚拟地址；127.a.b.x 是 127.0.0.x，AF_INET6 的 127.a.b.1 是 ::1
+    let addr = if any {
+        None
+    } else if let Some(v) = vaddr {
+        Some(v.to_vec())
+    } else {
+        match ipv4_of(host) {
+            Some([_, _, _, 1]) if v6 && mapped(&host[8..24]).is_some() => Some(LOOPBACK6.to_vec()),
+            Some([_, _, _, x]) => Some(vec![127, 0, 0, x]),
+            None => None,
+        }
+    };
+    me.listeners.borrow_mut().push(crate::nsproxy::Listener {
+        id,
+        port,
+        addr,
+        v6,
+        v6only,
+    });
+    std::num::NonZeroU64::new(id).expect("starts at 1")
+}
+
 /// 宿主地址 `host` 是 `me` 的 127.a.b.254（发给自己的虚拟地址时绑的源地址）。
 pub(crate) fn is_self_source(me: &NetNs, host: &[u8]) -> bool {
     matches!((me.host_net, ipv4_of(host)), (Some([a, b]), Some(x)) if x == [127, a, b, SELF_VIA_VADDR])
@@ -1081,6 +1137,7 @@ mod tests {
             lo: Default::default(),
             devs: Default::default(),
             nft: Default::default(),
+            listeners: Default::default(),
         }
     }
 
@@ -1102,6 +1159,43 @@ mod tests {
 
     fn up(ns: &NetNs) {
         set_up(&mut ns.lo.borrow_mut(), true);
+    }
+
+    /// 监听的登记：通配地址按地址族、`IPV6_V6ONLY`，绑了地址的只接受发往它的。
+    #[test]
+    fn listeners_match_like_linux() {
+        let n = ns();
+        let host = |x: u8| v4([127, 1, 2, x], 0);
+        let mapped = |x: u8| {
+            let mut a = [0u8; 16];
+            a[10..12].copy_from_slice(&[0xff, 0xff]);
+            a[12..].copy_from_slice(&[127, 1, 2, x]);
+            v6(a, 0)
+        };
+        let eth0 = [10, 9, 0, 2];
+        let a = add_listener(&n, 7000, true, None, &host(1), false, false);
+        add_listener(&n, 7001, true, None, &mapped(1), true, true);
+        add_listener(&n, 7002, false, None, &host(1), false, false);
+        add_listener(&n, 7003, false, Some(eth0), &host(1), false, false);
+        add_listener(&n, 7004, false, None, &mapped(1), true, false);
+        // 0.0.0.0：IPv4 的都行，纯 IPv6 的不行
+        assert!(listening(&n, &v4(eth0, 7000)));
+        assert!(listening(&n, &v4([127, 0, 0, 1], 7000)));
+        assert!(!listening(&n, &v6(LOOPBACK6, 7000)));
+        // [::] 且 IPV6_V6ONLY：只有 IPv6
+        assert!(listening(&n, &v6(LOOPBACK6, 7001)));
+        assert!(!listening(&n, &v4(eth0, 7001)));
+        // 127.0.0.1、eth0 的地址、::1 只接受发往它的
+        assert!(listening(&n, &v4([127, 0, 0, 1], 7002)));
+        assert!(!listening(&n, &v4(eth0, 7002)));
+        assert!(listening(&n, &v4(eth0, 7003)));
+        assert!(!listening(&n, &v4([127, 0, 0, 1], 7003)));
+        assert!(listening(&n, &v6(LOOPBACK6, 7004)));
+        assert!(!listening(&n, &v4([127, 0, 0, 1], 7004)));
+        // 没有监听的端口；去掉之后也没有了
+        assert!(!listening(&n, &v4(eth0, 7999)));
+        n.listeners.borrow_mut().retain(|l| l.id != a.get());
+        assert!(!listening(&n, &v4(eth0, 7000)));
     }
 
     /// 只有开机时的命名空间和 `ns` 的世界里换算（只看地址）。
@@ -1229,6 +1323,7 @@ mod tests {
                 lo: Default::default(),
                 devs: RefCell::new(crate::netdev::Devices::for_new_ns(&Default::default())),
                 nft: Default::default(),
+                listeners: Default::default(),
             })
         };
         let (a, b) = (net(1), net(2));

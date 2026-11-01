@@ -390,8 +390,36 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         Socket::Inet(s) => {
             // 流量算在哪个接口上重新认（connect 也一样）
             s.route = None;
-            // 1024 以下的端口在宿主上换一个（crate::portmap）
-            match port_of(&host_addr).filter(|&p| mappable(s) && map.borrow().maps(p)) {
+            // 1024 以下的端口在宿主上换一个（crate::portmap）；新的网络命名空间里显式绑的端口
+            // 都换（宿主上不占这个端口，外层和别的命名空间照样绑得了）
+            let own = s.net.is_some() && !wide;
+            match port_of(&host_addr)
+                .filter(|&p| mappable(s) && p != 0 && (own || map.borrow().maps(p)))
+            {
+                Some(port) if own => {
+                    let fd = s.fd;
+                    let try_bind = |h: u16| {
+                        let mut a = host_addr.clone();
+                        set_port(&mut a, h);
+                        appine_hal::net::bind(fd, &a)
+                    };
+                    let bound = || {
+                        appine_hal::net::sockname(fd, false)
+                            .ok()
+                            .and_then(|a| port_of(&a))
+                    };
+                    let (host, lease) = crate::portmap::bind_any(
+                        &map,
+                        ns_key(s),
+                        map_proto(s),
+                        port,
+                        try_bind,
+                        bound,
+                    )?;
+                    s.lease = Some(lease);
+                    s.local_map = Some((port, host));
+                    remap = true;
+                }
                 Some(port) => {
                     let fd = s.fd;
                     let try_bind = |h: u16| {
@@ -420,7 +448,6 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     }
                     s.lease = Some(lease);
                     s.local_map = Some((port, host));
-                    remap = new && s.net.is_some();
                 }
                 None => appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?,
             }
@@ -472,6 +499,22 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
             ensure_bound(s, src.as_deref())?;
             appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
             s.listening = true;
+            // 新的网络命名空间里的 TCP 监听登记在命名空间里：连过来时按它判断（crate::netns）
+            if let Some(net) = &s.net
+                && s.listener.is_none()
+                && map_proto(s) == IPPROTO_TCP
+                && let Ok(local) = appine_hal::net::sockname(s.fd, false)
+                && let Some(host) = port_of(&local)
+            {
+                let port = match s.local_map {
+                    Some((g, h)) if h == host => g,
+                    _ => host,
+                };
+                let v6 = s.family == AF_INET6;
+                s.listener = Some(crate::netns::add_listener(
+                    net, port, s.any, s.vaddr, &local, v6, s.v6only,
+                ));
+            }
             // 开机时的命名空间里的监听：PREROUTING 有 DNAT 时转发外面来的连接（crate::forward）
             forward_socket(cx.kr(), s);
             // 别的设备连得到的监听（设计文档 §12 #7）：App 发通知，告诉用户连宿主上的哪个端口
@@ -583,7 +626,21 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             // （crate::nft）先换目的地址：guest 看到的对端仍是它连的，收到的数据报的来源
             // 换回来
             let me = s.net.clone().unwrap_or_else(|| init.clone());
-            let Routed { m, dst, actual } = route(&w, s, &me, &addr, &cred)?;
+            let Routed {
+                m,
+                dst,
+                there,
+                actual,
+            } = route(&w, s, &me, &addr, &cred)?;
+            // 连到新的网络命名空间里：那里没有对得上的监听就是 ECONNREFUSED（宿主上开机时的
+            // 命名空间里监听通配地址的 socket 也盖住这个地址，不能交给宿主去连）
+            if s.ty == SOCK_STREAM
+                && let Some(t) = &m.target
+                && t.host_net.is_some()
+                && !crate::netns::listening(t, &there)
+            {
+                return Err(Errno::ECONNREFUSED);
+            }
             s.nat_back = actual.iter().map(|t| (t.clone(), addr.clone())).collect();
             let dst = &dst;
             if crate::netns::is_inet(&addr) {
@@ -1197,7 +1254,7 @@ pub(crate) fn send(
                 Some(Vec::new())
             } else {
                 // nftables 的 nat 换了目的地址的：记下，回来的数据报的来源换回去
-                let Routed { m, dst, actual } = route(&w, s, &me, addr, &cred)?;
+                let Routed { m, dst, actual, .. } = route(&w, s, &me, addr, &cred)?;
                 if let Some(t) = &actual
                     && !s.nat_back.iter().any(|(x, o)| x == t && o == addr)
                 {
@@ -1388,7 +1445,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     let mut addr = m.addr;
     let key = m.target.as_ref().map_or(0, key_of);
     let map = k.portmap.borrow();
-    if let Some(p) = port_of(&addr).filter(|&p| map.maps(p))
+    if let Some(p) = port_of(&addr)
         && let Some(h) = map.host_port(key, proto, p)
     {
         set_port(&mut addr, h);
@@ -1429,6 +1486,8 @@ struct Routed {
     m: crate::netns::Mapped,
     /// OUTPUT nat 之后的目的地（`me` 里看到的）。
     dst: Vec<u8>,
+    /// 最后的目的地在它所在的命名空间（`m.target`）里看到的样子（PREROUTING nat 之后）。
+    there: Vec<u8>,
     /// nat 换过目的地时，`me` 里看到的实际的目的地：从它回来的数据报报告成来自 guest 给的
     /// 地址（[`InetSocket::nat_back`]）。
     actual: Option<Vec<u8>>,
@@ -1448,11 +1507,13 @@ fn route(
     let dst = nat.clone().unwrap_or_else(|| addr.to_vec());
     let mut m = crate::netns::to_host(w, me, &dst, crate::netns::Use::Reach, s.icmp6())?;
     let mut actual = nat;
+    let mut there = dst.clone();
     if let Some(proto) = nat_proto(s)
         && let Some(t) = crate::netns::entering(w, me, &m, &dst)
         && let Some(d2) = crate::netns::prerouting_nat(me, &t, proto, local_port(s), &dst)?
     {
         let m2 = crate::netns::to_host(w, &t, &d2, crate::netns::Use::Reach, s.icmp6())?;
+        there = d2;
         actual = Some(crate::netns::from_host(
             w,
             me,
@@ -1472,7 +1533,12 @@ fn route(
             vaddr: m.vaddr,
         };
     }
-    Ok(Routed { m, dst, actual })
+    Ok(Routed {
+        m,
+        dst,
+        there,
+        actual,
+    })
 }
 
 /// 要过 nftables 的 nat 的 socket 的协议：TCP（含 MPTCP）、UDP。
@@ -1624,11 +1690,11 @@ fn map_dest(
         return (addr, None);
     };
     let host = {
-        let m = map.borrow();
-        if !mappable(s) || !m.maps(port) {
+        if !mappable(s) {
             return (addr, None);
         }
-        m.host_port(key, map_proto(s), port)
+        // 低端口和新命名空间里显式绑的端口才有登记，没有登记的不换
+        map.borrow().host_port(key, map_proto(s), port)
     };
     match host {
         Some(h) if is_local(&addr) => {

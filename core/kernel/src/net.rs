@@ -92,6 +92,9 @@ pub(crate) struct InetSocket {
     pub fwd: Option<Box<crate::forward::Handle>>,
     /// guest 调用过 listen（MPTCP 的宿主 socket 上取不到 `SO_ACCEPTCONN`）。
     pub listening: bool,
+    /// 新的网络命名空间里的监听登记在命名空间里的编号（[`crate::nsproxy::Listener`]），
+    /// 关掉时去掉。
+    pub listener: Option<std::num::NonZeroU64>,
     /// UDP：宿主上绑在 127.a.b.254 上（发给自己的虚拟地址的），端口登记在命名空间的
     /// [`crate::nsproxy::Loopback::self_udp`] 里，关掉时去掉。
     pub self_port: Option<u16>,
@@ -146,6 +149,7 @@ impl InetSocket {
             nat_back: Vec::new(),
             fwd: None,
             listening: false,
+            listener: None,
             self_port: None,
             v6only: false,
             icmp: None,
@@ -176,6 +180,11 @@ impl Drop for InetSocket {
             && let Some(i) = lo.self_udp.iter().position(|&x| x == p)
         {
             lo.self_udp.swap_remove(i);
+        }
+        if let (Some(id), Some(n)) = (self.listener, &self.net)
+            && let Ok(mut l) = n.listeners.try_borrow_mut()
+        {
+            l.retain(|x| x.id != id.get());
         }
     }
 }

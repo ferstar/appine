@@ -9,6 +9,8 @@
 #
 # - 外层命名空间直接连 B 上没有监听的 8080 不比：appine 里外层占着 8080 的监听在宿主上绑的
 #   是通配地址，B 在宿主上的回环地址也在里面，连得上（原生是 ECONNREFUSED）。
+# - iifname 的规则用一个不存在的接口：appine 判断外面来的连接转不转发时，假设它从宿主上第一个
+#   接口进来；规则对它成立的话外层的这个监听交给转发线程，A 的连接也被它接走（推迟项）。
 # - 同一个网段里的容器经由网关连到发布的端口、容器连回自己发布的端口（hairpin）不比：原生上
 #   回答不经过网关，没有 masquerade 时连不上（netavark 为此加 masquerade，appine 不执行）。
 exec 2>&1
@@ -103,7 +105,7 @@ table ip pf {
 		type nat hook prerouting priority dstnat; policy accept;
 		fib daddr type local tcp dport 8080 dnat to 10.61.0.3:80
 		fib daddr type local udp dport 5353 dnat to 10.61.0.3:53
-		iifname != "br0" tcp dport 8081 dnat to 10.61.0.3:80
+		iifname "eth9" tcp dport 8081 dnat to 10.61.0.3:80
 		tcp dport 8082 redirect to :9000
 	}
 }
@@ -126,7 +128,7 @@ serve "$B" udp 0.0.0.0 53 2
 nsenter -t "$A" -n python3 cli.py udp 10.60.0.1 5353 a-udp | tidy
 nsenter -t "$A" -n python3 cli.py udpconn "$host" 5353 a-udpconn | tidy
 served
-echo "== iifname: from br0 no DNAT"
+echo "== iifname: from br0, not eth9: no DNAT"
 serve $$ tcp 0.0.0.0 8081 1
 nsenter -t "$A" -n python3 cli.py tcp 10.60.0.1 8081 a-8081 | tidy
 served
