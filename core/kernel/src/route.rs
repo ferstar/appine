@@ -79,10 +79,15 @@ pub(crate) struct Entry {
     pub iface: String,
     pub index: u32,
     pub metric: u32,
+    /// rtm_flags：下一跳的接口没有载波时是 `RTNH_F_LINKDOWN`（虚拟设备上的路由）。
+    pub flags: u32,
+    /// 宿主的路由（开机时的命名空间里宿主的接口上的）：`ip route get` 的源地址由宿主选。
+    /// 虚拟设备（[`crate::netdev`]）、新的命名空间里的是 false。
+    pub host: bool,
 }
 
 /// `addr` 的前 `prefix` 位，其余清零。
-fn network(addr: &[u8], prefix: u8) -> Vec<u8> {
+pub(crate) fn network(addr: &[u8], prefix: u8) -> Vec<u8> {
     addr.iter()
         .enumerate()
         .map(|(i, &b)| {
@@ -153,6 +158,8 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
         iface: i.name.clone(),
         index: i.index,
         metric: 0,
+        flags: 0,
+        host: true,
     };
     let mut main = Vec::new();
     match host {
@@ -187,6 +194,8 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
                     iface: r.iface,
                     index: i.map_or(0, |i| i.index),
                     metric: r.metric,
+                    flags: 0,
+                    host: true,
                 });
             }
         }
@@ -283,14 +292,24 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
     all
 }
 
+/// 把两组路由（各自按 Linux 的顺序）合在一起：按地址族（IPv4 在前）、表的编号、表里的
+/// 顺序（[`order`]）排，同样的保持原来的先后（`a` 的在 `b` 的前面）。
+pub(crate) fn merge(a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
+    let mut all = a;
+    all.extend(b);
+    all.sort_by(|x, y| {
+        let fam = |e: &Entry| u8::from(e.family != AF_INET);
+        fam(x)
+            .cmp(&fam(y))
+            .then(x.table.cmp(&y.table))
+            .then_with(|| order(x, y))
+    });
+    all
+}
+
 /// 宿主主表里的路由：宿主交来的（[`crate::Machine::set_routes`]），没有时读宿主的。
 pub(crate) fn host_routes(k: &crate::kernel::Kernel) -> Option<Vec<Route>> {
     k.host_routes.clone().or_else(appine_hal::net::routes)
-}
-
-/// 内核 `k` 现在的两张表（[`tables`]）。
-pub(crate) fn kernel_tables(k: &crate::kernel::Kernel) -> Vec<Entry> {
-    tables(&appine_hal::net::interfaces(), host_routes(k))
 }
 
 // ---- netlink ----
@@ -326,7 +345,9 @@ fn cacheinfo(clntref: u32) -> [u8; 32] {
 
 /// 转储里的一条路由（Linux 的 `fib_dump_info`、`rt6_fill_node`）。
 pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
-    let mut p = rtmsg(e.family, e.prefix, 0, e.table, e.proto, e.scope, e.ty, 0);
+    let mut p = rtmsg(
+        e.family, e.prefix, 0, e.table, e.proto, e.scope, e.ty, e.flags,
+    );
     put(&mut p, RTA_TABLE, &u32::from(e.table).to_le_bytes());
     if e.prefix > 0 {
         put(&mut p, RTA_DST, &e.dst);
@@ -366,20 +387,61 @@ pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
     out
 }
 
-/// `entries` 里包含 `ip` 的最长前缀的路由。
+/// `entries` 里包含 `ip` 的最长前缀的路由，一样长的取度量最小的（同样的取先出现的）。
 fn longest_match<'a>(entries: impl Iterator<Item = &'a Entry>, ip: &[u8]) -> Option<&'a Entry> {
     entries
         .filter(|e| e.dst.len() == ip.len() && network(ip, e.prefix) == e.dst)
-        .max_by_key(|e| e.prefix)
+        .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
+}
+
+/// 没有首选源地址时的源地址（`inet_select_addr`，IPv6 粗略地照 `ipv6_dev_get_saddr`）：出口
+/// 接口上与网关（没有时是目标）同一网段的地址，再是它上面别的地址，再是别的接口上的；
+/// 不取链路本地地址，除非出口接口上只有它。
+fn select_source(ifaces: &[Interface], route: &Entry, dst: &[u8]) -> Option<Vec<u8>> {
+    let toward = route.gateway.as_deref().unwrap_or(dst);
+    let family = route.family;
+    let usable = |a: &Vec<u8>| !(family == AF_INET6 && a[0] == 0xfe && a[1] & 0xc0 == 0x80);
+    let of = |i: &Interface| -> Vec<(Vec<u8>, u8)> {
+        i.addrs
+            .iter()
+            .filter(|(f, ..)| *f == family)
+            .map(|(_, a, p)| (a.clone(), *p))
+            .collect()
+    };
+    let out = ifaces.iter().find(|i| i.index == route.index);
+    if let Some(o) = out {
+        let mine = of(o);
+        if let Some((a, _)) = mine
+            .iter()
+            .find(|(a, p)| usable(a) && network(a, *p) == network(toward, *p))
+        {
+            return Some(a.clone());
+        }
+        if let Some((a, _)) = mine.iter().find(|(a, _)| usable(a)) {
+            return Some(a.clone());
+        }
+    }
+    let others = ifaces
+        .iter()
+        .filter(|i| i.flags & IFF_LOOPBACK == 0)
+        .flat_map(of)
+        .find(|(a, _)| usable(a))
+        .map(|(a, _)| a);
+    others.or_else(|| out.and_then(|o| of(o).into_iter().next().map(|(a, _)| a)))
 }
 
 /// `ip route get`：回答 `RTM_GETROUTE` 的单条查询 `req`（整条消息，rtmsg 之后是属性），`uid`
 /// 是发请求的进程的用户 ID。返回回答的内容（RTM_NEWROUTE）或者错误码。
+///
+/// 主表里最长前缀匹配到的是虚拟设备上的路由（[`crate::netdev`]），或者不在开机时的命名空间
+/// 里（`host_ok` 是 false）时，按这个命名空间的表选：出口是那条路由的接口，源地址是它的
+/// 首选源地址，没有时取出口接口上的地址（`inet_select_addr`）。
 pub(crate) fn get(
     req: &[u8],
     entries: &[Entry],
     ifaces: &[Interface],
     uid: u32,
+    host_ok: bool,
 ) -> Result<Vec<u8>, i32> {
     const EINVAL: i32 = 22;
     const EOPNOTSUPP: i32 = 95;
@@ -408,8 +470,12 @@ pub(crate) fn get(
     // 匹配到的路由、出口接口、源地址、缓存条目的 rt_flags
     let (route, oif, saddr, rt_flags) = match local_hit {
         Some(e) if e.ty == RTN_LOCAL => {
-            // 本机地址：走回环接口，源地址是这个地址本身（127.0.0.0/8 里别的地址用回环的）
-            let saddr = owner(ifaces, &dst).map_or(e.prefsrc.clone(), |_| Some(dst.clone()));
+            // 本机地址：走回环接口，源地址是本地路由的首选源地址（这个地址本身；secondary
+            // 是同一网段的 primary，127.0.0.0/8 里别的地址是回环的）
+            let saddr = e
+                .prefsrc
+                .clone()
+                .or_else(|| owner(ifaces, &dst).map(|_| dst.clone()));
             (
                 e.clone(),
                 lo.map_or(e.index, |i| i.index),
@@ -423,6 +489,24 @@ pub(crate) fn get(
             e.prefsrc.clone(),
             RTCF_BROADCAST | RTCF_LOCAL,
         ),
+        _ if !host_ok
+            || longest_match(of_family().filter(|e| e.table == RT_TABLE_MAIN), &dst)
+                .is_some_and(|e| !e.host) =>
+        {
+            let route = longest_match(of_family().filter(|e| e.table == RT_TABLE_MAIN), &dst)
+                .ok_or(ENETUNREACH)?
+                .clone();
+            let saddr = match &src {
+                Some(s) => s.clone(),
+                None => route
+                    .prefsrc
+                    .clone()
+                    .or_else(|| select_source(ifaces, &route, &dst))
+                    .ok_or(ENETUNREACH)?,
+            };
+            let index = route.index;
+            (route, index, Some(saddr), 0)
+        }
         _ => {
             let saddr = match &src {
                 Some(s) => s.clone(),
@@ -456,6 +540,8 @@ pub(crate) fn get(
                     iface: i.name.clone(),
                     index: i.index,
                     metric: 0,
+                    flags: 0,
+                    host: true,
                 },
                 (None, None) => return Err(ENETUNREACH),
             };
@@ -818,6 +904,8 @@ mod tests {
             iface: "eth0".into(),
             index: 2,
             metric: 0,
+            flags: 0,
+            host: true,
         };
         let mut v = [
             e(&[0; 16], 0),
@@ -877,7 +965,7 @@ mod tests {
         let ifaces = container();
         let t = tables(&ifaces, Some(host_routes()));
         // 本机地址：表是主表（并在一起了），类型 local，走 lo，标志 RTCF_LOCAL | RTM_F_CLONED
-        let r = get(&request(AF_INET, &[172, 17, 0, 2], 0), &t, &ifaces, 0).unwrap();
+        let r = get(&request(AF_INET, &[172, 17, 0, 2], 0), &t, &ifaces, 0, true).unwrap();
         assert_eq!(r[..12], [2, 32, 0, 0, 254, 0, 0, 2, 0, 2, 0, 0x80]);
         let a: Vec<(u16, Vec<u8>)> = attrs(&r[12..])
             .iter()
@@ -898,15 +986,22 @@ mod tests {
         assert_eq!(a[2].1, 1u32.to_le_bytes());
         assert_eq!(a[3].1, [172, 17, 0, 2]);
         // 回环网段里别的地址：源地址是回环的地址
-        let r = get(&request(AF_INET, &[127, 0, 0, 9], 0), &t, &ifaces, 0).unwrap();
+        let r = get(&request(AF_INET, &[127, 0, 0, 9], 0), &t, &ifaces, 0, true).unwrap();
         assert!(attrs(&r[12..]).contains(&(RTA_PREFSRC, &[127, 0, 0, 1][..])));
         // 网段的广播
-        let r = get(&request(AF_INET, &[172, 17, 255, 255], 0), &t, &ifaces, 0).unwrap();
+        let r = get(
+            &request(AF_INET, &[172, 17, 255, 255], 0),
+            &t,
+            &ifaces,
+            0,
+            true,
+        )
+        .unwrap();
         assert_eq!(r[7], RTN_BROADCAST);
         // IPv6 的 ::1：本地表，带上 RTA_SRC ::、度量和优先级
         let mut one = [0u8; 16];
         one[15] = 1;
-        let r = get(&request(AF_INET6, &one, 0), &t, &ifaces, 0).unwrap();
+        let r = get(&request(AF_INET6, &one, 0), &t, &ifaces, 0, true).unwrap();
         assert_eq!(r[..12], [10, 128, 128, 0, 255, 2, 0, 2, 0, 0, 0, 0]);
         let types: Vec<u16> = attrs(&r[12..]).iter().map(|(t, _)| *t).collect();
         assert_eq!(
@@ -928,6 +1023,7 @@ mod tests {
             &t,
             &ifaces,
             0,
+            true,
         )
         .unwrap();
         assert_eq!(r, route_message(&t[5]));
@@ -939,7 +1035,7 @@ mod tests {
         let n = req.len() as u32;
         req[..4].copy_from_slice(&n.to_le_bytes());
         let empty = tables(&ifaces, Some(Vec::new()));
-        let r = get(&req, &empty, &ifaces, 0).unwrap();
+        let r = get(&req, &empty, &ifaces, 0, true).unwrap();
         let a = attrs(&r[12..]);
         assert!(a.contains(&(RTA_OIF, &2u32.to_le_bytes()[..])));
         assert!(
@@ -953,7 +1049,7 @@ mod tests {
         req.extend_from_slice(&iif);
         let n = req.len() as u32;
         req[..4].copy_from_slice(&n.to_le_bytes());
-        assert_eq!(get(&req, &t, &ifaces, 0), Err(95));
+        assert_eq!(get(&req, &t, &ifaces, 0, true), Err(95));
     }
 
     #[test]

@@ -230,7 +230,7 @@ pub(crate) fn lo_interface(ns: &NetNs) -> Interface {
 
 /// 把 lo 打开或关上（`RTM_NEWLINK`、`SIOCSIFFLAGS`）：打开时没有 IPv4 地址就加上
 /// 127.0.0.1/8（Linux 的 `inetdev_event`），并且加上 ::1（addrconf）；关上时 ::1 随之去掉。
-fn set_up(lo: &mut Loopback, up: bool) {
+pub(crate) fn set_up(lo: &mut Loopback, up: bool) {
     if up && !lo.up {
         if lo.v4.is_empty() {
             lo.v4.push(([127, 0, 0, 1], 8));
@@ -456,6 +456,7 @@ mod tests {
             owner: crate::cred::UserNs::init(),
             host_net: Some([1, 2]),
             lo: Default::default(),
+            devs: Default::default(),
         }
     }
 

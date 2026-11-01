@@ -23,6 +23,8 @@ mod locks;
 mod machine;
 mod mm;
 mod net;
+mod netconf;
+mod netdev;
 mod netns;
 mod nsproxy;
 mod oom;

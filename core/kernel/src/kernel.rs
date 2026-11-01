@@ -434,7 +434,8 @@ impl Kernel {
     }
 
     /// 新建一个网络命名空间，属于用户命名空间 `owner`：里面只有关着的 lo，宿主上的回环
-    /// 地址 127.a.b.0/24 取一个还没有命名空间用的（a、b 不全为 0）。
+    /// 地址 127.a.b.0/24 取一个还没有命名空间用的（a、b 不全为 0）；IPv4 的 sysctl 照抄
+    /// 开机时的命名空间现在的（[`crate::netconf`]）。
     pub fn new_net_ns(
         &mut self,
         owner: Rc<crate::cred::UserNs>,
@@ -449,11 +450,13 @@ impl Kernel {
             .map(u16::to_be_bytes)
             .find(|n| !used.contains(n))
             .ok_or(Errno::ENOMEM)?;
+        let devs = crate::netdev::Devices::for_new_ns(&self.init_ns.net.devs.borrow().conf);
         let ns = Rc::new(crate::nsproxy::NetNs {
             id: crate::vfs::new_ns_id(),
             owner,
             host_net: Some(net),
             lo: Default::default(),
+            devs: crate::cell::RefCell::new(devs),
         });
         self.net_nss.push(Rc::downgrade(&ns));
         Ok(ns)

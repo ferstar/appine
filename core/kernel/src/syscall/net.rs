@@ -311,17 +311,18 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         Some(ns) => crate::netns::to_host(ns, &addr, crate::netns::Use::Bind, icmp6)?,
         None => addr.clone(),
     };
-    // 1024 以下的端口要求网络命名空间的属主里的 CAP_NET_BIND_SERVICE
+    // ip_unprivileged_port_start（默认 1024）以下的端口要求网络命名空间的属主里的
+    // CAP_NET_BIND_SERVICE（Linux 的 inet_port_requires_bind_service）
     let family = addr
         .get(..2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]) as i32);
     if matches!(family, Some(AF_INET | AF_INET6)) && addr.len() >= 4 {
         let port = u16::from_be_bytes([addr[2], addr[3]]);
-        let owner = net
-            .as_ref()
-            .map_or_else(crate::cred::UserNs::init, |n| n.owner.clone());
+        let ns = net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
+        let owner = ns.owner.clone();
+        let prot_sock = ns.devs.borrow().conf.prot_sock;
         if port != 0
-            && port < 1024
+            && i64::from(port) < prot_sock
             && !cx
                 .cred()
                 .ns_capable(&owner, crate::cred::cap::NET_BIND_SERVICE)
@@ -714,6 +715,16 @@ pub(super) fn setsockopt(
         Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => {
             s.rcvtimeo = timeval(&v)
         }
+        // SOL_NETLINK 的 NETLINK_CAP_ACK、NETLINK_EXT_ACK
+        Socket::Netlink(s) if level == 270 && (name == 10 || name == 11) => {
+            let on = v.get(..4).ok_or(Errno::EINVAL)?;
+            let on = i32::from_le_bytes(on.try_into().unwrap()) != 0;
+            if name == 10 {
+                s.cap_ack = on;
+            } else {
+                s.ext_ack = on;
+            }
+        }
         Socket::Netlink(_) => {}
         Socket::Unix(u) => unix::setsockopt(u, level, name, &v)?,
     }
@@ -816,12 +827,73 @@ struct KernelHost<'a> {
     fds: Rc<crate::cell::RefCell<crate::fd::FdTable>>,
 }
 
+impl KernelHost<'_> {
+    /// 这个 socket 所在的网络命名空间（开机时的那个记作 None）。
+    fn ns(&self) -> Rc<crate::nsproxy::NetNs> {
+        self.net
+            .clone()
+            .unwrap_or_else(|| self.k.init_ns.net.clone())
+    }
+
+    /// 按进程（`by_pid`）或者命名空间文件找网络命名空间：进程要还没退出（Linux 的
+    /// get_net_ns_by_pid，ESRCH），fd 要是网络命名空间的文件（get_net_ns_by_fd，EINVAL）。
+    fn net_of(&self, by_pid: bool, value: u32) -> Result<Rc<crate::nsproxy::NetNs>, Errno> {
+        if by_pid {
+            let tid = self.pid_ns.find(value as i32).ok_or(Errno::ESRCH)?;
+            // 虚拟的 1 号进程（没有 Task）在开机时的命名空间里
+            if tid == crate::kernel::INIT && !self.k.tasks.contains_key(&tid) {
+                return Ok(self.k.init_ns.net.clone());
+            }
+            let t = self.k.tasks.get(&tid).ok_or(Errno::ESRCH)?;
+            return Ok(t.ns.borrow().net.clone());
+        }
+        let file = self.fds.borrow().get(value as i32)?;
+        match &file.borrow().kind {
+            FileKind::Proc {
+                ns: Some(crate::nsproxy::NsRef::Net(n)),
+                ..
+            } => Ok(n.clone()),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+}
+
 impl crate::net::Host for KernelHost<'_> {
     fn interfaces(&self) -> Vec<appine_hal::net::Interface> {
-        match &self.net {
-            Some(ns) => vec![crate::netns::lo_interface(ns)],
-            None => appine_hal::net::interfaces(),
+        crate::netdev::base(&self.ns())
+    }
+
+    fn links(&self) -> Vec<crate::net::Link> {
+        let ns = self.ns();
+        let mut all: Vec<crate::net::Link> = crate::netdev::base(&ns)
+            .into_iter()
+            .map(crate::net::Link::Host)
+            .collect();
+        for v in crate::netdev::views(&ns) {
+            let nsid = v
+                .link
+                .as_ref()
+                .and_then(|(_, other)| other.as_ref())
+                .map(|o| crate::netdev::nsid_alloc(&ns, o));
+            all.push(crate::net::Link::Virt(v, nsid));
         }
+        all.sort_by_key(|l| match l {
+            crate::net::Link::Host(i) => i.index,
+            crate::net::Link::Virt(v, _) => v.index,
+        });
+        all
+    }
+
+    fn tables(&self) -> Vec<crate::route::Entry> {
+        crate::netdev::tables(&self.ns(), self.routes())
+    }
+
+    fn all_interfaces(&self) -> Vec<appine_hal::net::Interface> {
+        crate::netdev::interfaces(&self.ns())
+    }
+
+    fn init_net(&self) -> bool {
+        self.net.is_none()
     }
 
     fn stats(&self, name: &str) -> crate::traffic::IfStats {
@@ -849,35 +921,17 @@ impl crate::net::Host for KernelHost<'_> {
         self.cred.ruid
     }
 
-    fn configure(&self, req: &[u8]) -> Option<i32> {
-        match &self.net {
-            Some(ns) => crate::netns::configure(ns, &self.cred, req),
-            None => crate::net::configure_host_link(
-                &appine_hal::net::interfaces(),
-                self.cred.capable(crate::cred::cap::NET_ADMIN),
-                req,
-            ),
-        }
+    fn configure(&self, req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
+        // IFLA_NET_NS_PID（19）是进程，IFLA_NET_NS_FD（28）是命名空间文件
+        let resolve = |attr: u16, value: u32| self.net_of(attr == 19, value);
+        crate::netdev::request(&self.ns(), &self.cred, req, &resolve)
     }
 
-    /// 进程要还没退出（Linux 的 get_net_ns_by_pid），fd 要是网络命名空间的文件
-    /// （get_net_ns_by_fd）。
-    fn peer_net(&self, attr: u16, value: u32) -> Result<(), i32> {
-        if attr == crate::net::NETNSA_PID {
-            let tid = self.pid_ns.find(value as i32).ok_or(Errno::ESRCH.0)?;
-            if !self.k.tasks.contains_key(&tid) {
-                return Err(Errno::ESRCH.0);
-            }
-            return Ok(());
-        }
-        let file = self.fds.borrow().get(value as i32).map_err(|e| e.0)?;
-        match &file.borrow().kind {
-            FileKind::Proc {
-                ns: Some(crate::nsproxy::NsRef::Net(_)),
-                ..
-            } => Ok(()),
-            _ => Err(Errno::EINVAL.0),
-        }
+    fn peer_net(&self, attr: u16, value: u32) -> Result<Option<i32>, i32> {
+        let peer = self
+            .net_of(attr == crate::net::NETNSA_PID, value)
+            .map_err(|e| e.0)?;
+        Ok(crate::netdev::nsid(&self.ns(), &peer))
     }
 }
 
@@ -1694,6 +1748,17 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
     {
         return netns_ioctl(cx, &ns, request, arg);
     }
+    // 开机时的命名空间里的虚拟设备（crate::netdev）：按名字、编号认出来的不交给宿主
+    if (0x8910..0x8960).contains(&request)
+        && request != 0x8912
+        && let Ok(mut ifr) = get::<40>(cx, arg)
+    {
+        let init = cx.kr().init_ns.net.clone();
+        if let Some(r) = crate::netdev::ioctl(&init, &cx.cred(), request, &mut ifr) {
+            r?;
+            return put(cx, arg, ifr).map(|()| 0);
+        }
+    }
     let host_fd = match &*sock.borrow() {
         Socket::Inet(s) => Some(s.fd),
         Socket::Unix(u) if request == FIONREAD => {
@@ -1726,14 +1791,20 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
     }
 }
 
-/// 新的网络命名空间里的接口 ioctl：只有 lo。
-fn netns_ioctl(cx: &mut Cx<'_>, ns: &crate::nsproxy::NetNs, request: u32, arg: u64) -> SysResult {
+/// 新的网络命名空间里的接口 ioctl：虚拟设备（[`crate::netdev`]）和 lo。
+fn netns_ioctl(
+    cx: &mut Cx<'_>,
+    ns: &Rc<crate::nsproxy::NetNs>,
+    request: u32,
+    arg: u64,
+) -> SysResult {
     const SIOCGIFCONF: u32 = 0x8912;
     if request == SIOCGIFCONF {
         let conf: [u8; 16] = get(cx, arg)?;
         let len = i32::from_le_bytes(conf[..4].try_into().unwrap()).max(0) as usize;
         let buf = u64::from_le_bytes(conf[8..].try_into().unwrap());
-        let all = crate::netns::ifconf(ns);
+        let mut all = crate::netns::ifconf(ns);
+        all.extend(crate::netdev::ifconf(ns));
         // 缓冲区为空时只报告要多大；否则放得下几个整项写几个
         let n = if buf == 0 {
             all.len()
@@ -1745,6 +1816,10 @@ fn netns_ioctl(cx: &mut Cx<'_>, ns: &crate::nsproxy::NetNs, request: u32, arg: u
         return put(cx, arg, (n as i32).to_le_bytes()).map(|()| 0);
     }
     let mut ifr: [u8; 40] = get(cx, arg)?;
+    if let Some(r) = crate::netdev::ioctl(ns, &cx.cred(), request, &mut ifr) {
+        r?;
+        return put(cx, arg, ifr).map(|()| 0);
+    }
     match crate::netns::interface_ioctl(ns, &cx.cred(), request, &mut ifr) {
         Some(r) => {
             r?;
@@ -1815,13 +1890,18 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
             req[8..].copy_from_slice(&ptr.to_le_bytes());
             appine_hal::ioctl(host_fd, SIOCGIFCONF as u64, &mut req).map_err(Errno)?;
             let got = i32::from_le_bytes(req[..4].try_into().unwrap()).max(0) as usize;
-            if guest_buf != 0 {
-                cx.mm().write(
-                    UserSlice::new(guest_buf, got.min(len)),
-                    &host[..got.min(len)],
-                )?;
+            // 开机时的命名空间里的虚拟设备接在宿主的后面
+            let extra = crate::netdev::ifconf(&cx.kr().init_ns.net);
+            if guest_buf == 0 {
+                return put(cx, arg, ((got + extra.len()) as i32).to_le_bytes()).map(|()| 0);
             }
-            put(cx, arg, (got as i32).to_le_bytes()).map(|()| 0)
+            let got = got.min(len);
+            cx.mm()
+                .write(UserSlice::new(guest_buf, got), &host[..got])?;
+            let n = ((len - got) / 40 * 40).min(extra.len());
+            cx.mm()
+                .write(UserSlice::new(guest_buf + got as u64, n), &extra[..n])?;
+            put(cx, arg, ((got + n) as i32).to_le_bytes()).map(|()| 0)
         }
         _ => Err(Errno::ENOTTY),
     }

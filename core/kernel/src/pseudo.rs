@@ -271,7 +271,9 @@ const PROC_NET: [&[u8]; 18] = [
 ];
 
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-const STATIC: [&[u8]; 74] = [
+/// `sys/net` 下的按读者所在的网络命名空间（与 Linux 一样），`ipv4/conf`、`ipv6/conf` 下的
+/// 目录是 [`PseudoNode::NetConf`]。
+const STATIC: [&[u8]; 85] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -329,6 +331,17 @@ const STATIC: [&[u8]; 74] = [
     b"sys/kernel/tainted",
     b"sys/kernel/threads-max",
     b"sys/kernel/version",
+    b"sys/net/",
+    b"sys/net/core/",
+    b"sys/net/core/somaxconn",
+    b"sys/net/ipv4/",
+    b"sys/net/ipv4/conf/",
+    b"sys/net/ipv4/ip_forward",
+    b"sys/net/ipv4/ip_local_port_range",
+    b"sys/net/ipv4/ip_unprivileged_port_start",
+    b"sys/net/ipv4/ping_group_range",
+    b"sys/net/ipv6/",
+    b"sys/net/ipv6/conf/",
     b"sys/user/",
     b"sys/user/max_cgroup_namespaces",
     b"sys/user/max_ipc_namespaces",
@@ -408,6 +421,29 @@ const NET_FILES: [&[u8]; 36] = [
     b"statistics/tx_heartbeat_errors",
     b"statistics/tx_packets",
     b"statistics/tx_window_errors",
+];
+
+/// bridge 的 `/sys/class/net/<接口>` 下另有的（`brif/<端口>` 是 [`PseudoNode::SysBrif`]）。
+/// dockerd 读 `bridge/stp_state` 和端口的 `state`，等端口进入转发状态。
+const BRIDGE_FILES: [&[u8]; 10] = [
+    b"bridge/",
+    b"bridge/ageing_time",
+    b"bridge/bridge_id",
+    b"bridge/forward_delay",
+    b"bridge/hello_time",
+    b"bridge/max_age",
+    b"bridge/priority",
+    b"bridge/root_id",
+    b"bridge/stp_state",
+    b"brif/",
+];
+
+/// bridge 的端口的 `/sys/class/net/<接口>` 下另有的。
+const PORT_FILES: [&[u8]; 4] = [
+    b"brport/",
+    b"brport/path_cost",
+    b"brport/priority",
+    b"brport/state",
 ];
 
 /// `/sys/devices/system/cpu`：各个 `cpu<n>` 在它下面。
@@ -588,6 +624,9 @@ pub(crate) enum PseudoNode {
     /// `/sys/class/net/<接口>`（路径为空），或者它下面的目录和文件（路径取值来自
     /// [`NET_FILES`]）；接口按宿主的接口编号记。
     SysNet(u32, &'static [u8]),
+    /// `/sys/class/net/<bridge>/brif/<端口>`：指向 `../../<端口>/brport` 的链接（bridge 和
+    /// 端口的接口编号）。
+    SysBrif(u32, u32),
     /// cgroup 的目录（名字为空），或者它里面的文件（名字取值来自 [`crate::cgroup::FILES`]）：
     /// cgroup 的编号和文件名。
     Cgroup(u64, &'static [u8]),
@@ -600,7 +639,15 @@ pub(crate) enum PseudoNode {
     MqRoot(u64),
     /// mqueue 文件系统里的一个队列：IPC 命名空间和队列的 inode 编号。
     Mq(u64, u64),
+    /// `/proc/sys/net/ipv4/conf/<目录>`（第一项是 false）或者 `ipv6/conf/<目录>`（名字为空），
+    /// 或者它下面的一项（名字取值来自 [`crate::netconf`] 的表）；按读者所在的网络命名空间
+    /// （[`crate::netdev::conf_read`]）。
+    NetConf(bool, crate::netdev::ConfDir, &'static [u8]),
 }
+
+/// `ipv4/conf`、`ipv6/conf` 的目录。
+const NET_CONF4: &[u8] = b"sys/net/ipv4/conf/";
+const NET_CONF6: &[u8] = b"sys/net/ipv6/conf/";
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
 /// mem）。
@@ -682,7 +729,8 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         PseudoNode::SysRoot
         | PseudoNode::Sys(_)
         | PseudoNode::SysCpu(..)
-        | PseudoNode::SysNet(..) => Fs::Sys,
+        | PseudoNode::SysNet(..)
+        | PseudoNode::SysBrif(..) => Fs::Sys,
         PseudoNode::Cgroup(..) => Fs::Cgroup,
         PseudoNode::NsFile(..) => Fs::Nsfs,
         PseudoNode::MqRoot(_) | PseudoNode::Mq(..) => Fs::Mqueue,
@@ -803,6 +851,31 @@ impl<'a> View<'a> {
     }
 
     /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
+    /// 读者所在网络命名空间里编号为 `index` 的接口（宿主的或者 lo，和虚拟设备）。
+    fn interface(&self, index: u32) -> Option<appine_hal::net::Interface> {
+        crate::netdev::interfaces(&self.ns().net)
+            .into_iter()
+            .find(|i| i.index == index)
+    }
+
+    /// 读者所在网络命名空间里编号为 `index` 的接口是不是 bridge、是不是 bridge 的端口。
+    fn bridge_roles(&self, index: u32) -> (bool, bool) {
+        crate::netdev::views(&self.ns().net)
+            .into_iter()
+            .find(|v| v.index == index)
+            .map_or((false, false), |v| {
+                (v.kind == crate::netdev::Kind::Bridge, v.master.is_some())
+            })
+    }
+
+    /// `/proc/sys/net/ipv*/conf` 下的目录还在（接口没有删掉）。
+    fn conf_dir_exists(&self, dir: crate::netdev::ConfDir) -> bool {
+        match dir {
+            crate::netdev::ConfDir::Dev(i) => self.interface(i).is_some(),
+            _ => true,
+        }
+    }
+
     /// 读者所在的 cgroup 命名空间的根（cgroup 的编号）。
     pub(crate) fn cgroup_root(&self) -> u64 {
         self.k
@@ -872,10 +945,14 @@ impl Pseudo for View<'_> {
                 .or_else(|| tree_parent(&HOST_CPU_FILES, path))
                 .map_or(SysCpu(*n, b""), |p| SysCpu(*n, p)),
             SysNet(_, b"") => Sys(SYS_NET_DIR),
-            SysNet(n, path) => {
-                tree_parent(&NET_FILES, path).map_or(SysNet(*n, b""), |p| SysNet(*n, p))
-            }
+            SysNet(n, path) => tree_parent(&NET_FILES, path)
+                .or_else(|| tree_parent(&BRIDGE_FILES, path))
+                .or_else(|| tree_parent(&PORT_FILES, path))
+                .map_or(SysNet(*n, b""), |p| SysNet(*n, p)),
+            SysBrif(n, _) => SysNet(*n, b"brif/"),
             Cgroup(id, _) => Cgroup(*id, b""),
+            NetConf(v6, _, b"") => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
+            NetConf(v6, dir, _) => NetConf(*v6, *dir, b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
             Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
@@ -908,10 +985,19 @@ impl Pseudo for View<'_> {
                 .map_or_else(|| ino.to_string().into_bytes(), |(n, _)| n.to_vec()),
             SysCpu(n, b"") => format!("cpu{n}").into_bytes(),
             SysCpu(_, path) => tree_name(path).to_vec(),
-            SysNet(n, b"") => interface(*n)
+            SysNet(n, b"") => self
+                .interface(*n)
                 .map_or_else(|| n.to_string(), |i| i.name)
                 .into_bytes(),
+            NetConf(_, dir, b"") => {
+                crate::netdev::conf_dir_name(&self.ns().net, *dir).unwrap_or_else(|| b"?".to_vec())
+            }
+            NetConf(_, _, name) => name.to_vec(),
             SysNet(_, path) => tree_name(path).to_vec(),
+            SysBrif(_, p) => self
+                .interface(*p)
+                .map_or_else(|| p.to_string(), |i| i.name)
+                .into_bytes(),
             Cgroup(crate::cgroup::ROOT, b"") => b"cgroup".to_vec(),
             Cgroup(id, b"") => self
                 .k
@@ -979,11 +1065,22 @@ impl Pseudo for View<'_> {
                         self.pid_exists(pid, None).then_some(Pid(pid, None))
                     }),
             },
+            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
+                crate::netdev::conf_dirs(&self.ns().net)
+                    .into_iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| NetConf(*path == NET_CONF6, d, b""))
+            }
             Static(path) => tree_lookup(&STATIC, path, name).map(Static),
+            NetConf(v6, dir, b"") => crate::netconf::table(*v6)
+                .iter()
+                .find(|(n, ..)| n.as_bytes() == name)
+                .filter(|_| self.conf_dir_exists(*dir))
+                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
             SysRoot => tree_lookup(&SYS_STATIC, b"", name).map(Sys),
             Sys(path) => tree_lookup(&SYS_STATIC, path, name).map(Sys).or_else(|| {
                 if *path == SYS_NET_DIR {
-                    return appine_hal::net::interfaces()
+                    return crate::netdev::interfaces(&self.ns().net)
                         .into_iter()
                         .find(|i| i.name.as_bytes() == name)
                         .map(|i| SysNet(i.index, b""));
@@ -1007,8 +1104,18 @@ impl Pseudo for View<'_> {
                     tree_lookup(&HOST_CPU_FILES, path, name).filter(|p| host_cpu_has(*n, p))
                 })
                 .map(|p| SysCpu(*n, p)),
+            SysNet(n, b"brif/") => crate::netdev::views(&self.ns().net)
+                .into_iter()
+                .find(|v| v.master == Some(*n) && v.name == name)
+                .map(|v| SysBrif(*n, v.index)),
             SysNet(n, path) => tree_lookup(&NET_FILES, path, name)
-                .filter(|_| interface(*n).is_some())
+                .filter(|_| self.interface(*n).is_some())
+                .or_else(|| {
+                    let (bridge, port) = self.bridge_roles(*n);
+                    tree_lookup(&BRIDGE_FILES, path, name)
+                        .filter(|_| bridge)
+                        .or_else(|| tree_lookup(&PORT_FILES, path, name).filter(|_| port))
+                })
                 .map(|p| SysNet(*n, p)),
             Pid(pid, tid) => {
                 let allowed = |e: &self::Entry| in_pid_dir(*tid, e);
@@ -1052,6 +1159,16 @@ impl Pseudo for View<'_> {
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
             Cgroup(_, b"") => mode::S_IFDIR,
+            NetConf(_, dir, name) => {
+                if !self.conf_dir_exists(*dir) {
+                    return Err(Errno::ENOENT);
+                }
+                if name.is_empty() {
+                    mode::S_IFDIR
+                } else {
+                    mode::S_IFREG
+                }
+            }
             Entry(
                 _,
                 _,
@@ -1062,7 +1179,7 @@ impl Pseudo for View<'_> {
                 | self::Entry::Ns,
             ) => mode::S_IFDIR,
             Pts(..) | PtsPtmx(_) => mode::S_IFCHR,
-            SelfLink | ThreadSelf | Fd(..) | Ns(..) => mode::S_IFLNK,
+            SelfLink | ThreadSelf | Fd(..) | Ns(..) | SysBrif(..) => mode::S_IFLNK,
             Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
             OpenFd(pid, fd) => {
@@ -1147,6 +1264,10 @@ impl Pseudo for View<'_> {
                 }
                 let id = k.id_of(self.k, &task).ok_or(Errno::ENOENT)?;
                 Ok(self.name(mnt, &NsFile(*k, id)))
+            }
+            SysBrif(_, p) => {
+                let i = self.interface(*p).ok_or(Errno::ENOENT)?;
+                Ok(format!("../../{}/brport", i.name).into_bytes())
             }
             _ => Err(Errno::EINVAL),
         }
@@ -1441,6 +1562,9 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     if let PseudoNode::Cgroup(_, name) = node {
         return crate::cgroup::file_mode(name).is_some_and(|m| m & 0o200 != 0);
     }
+    if let PseudoNode::NetConf(_, _, name) = node {
+        return !name.is_empty() && !crate::netconf::read_only(name);
+    }
     matches!(
         node,
         PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
@@ -1479,6 +1603,11 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/inotify/max_user_instances"
                     | b"sys/fs/inotify/max_user_watches"
                     | b"sys/vm/max_map_count"
+                    | b"sys/net/core/somaxconn"
+                    | b"sys/net/ipv4/ip_forward"
+                    | b"sys/net/ipv4/ip_local_port_range"
+                    | b"sys/net/ipv4/ip_unprivileged_port_start"
+                    | b"sys/net/ipv4/ping_group_range"
             )
     ) || matches!(node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"))
 }
@@ -1507,6 +1636,42 @@ pub(crate) fn write(
         PseudoNode::Entry(pid, _, Entry::Setgroups) => return write_setgroups(k, cred, *pid, data),
         PseudoNode::Entry(pid, None, Entry::TimensOffsets) => {
             return write_timens_offsets(k, cred, *pid, data);
+        }
+        // 网络命名空间的 sysctl：写入者所在的那个（crate::netconf）
+        PseudoNode::NetConf(v6, dir, name) => {
+            return crate::netdev::conf_write(&ns.net, *v6, *dir, name, data);
+        }
+        PseudoNode::Static(b"sys/net/ipv4/ip_forward") => {
+            return crate::netdev::conf_write(
+                &ns.net,
+                false,
+                crate::netdev::ConfDir::All,
+                b"forwarding",
+                data,
+            );
+        }
+        PseudoNode::Static(b"sys/net/core/somaxconn") => {
+            let v = crate::netconf::parse_int(data)?;
+            if !(0..=i32::MAX as i64).contains(&v) {
+                return Err(Errno::EINVAL);
+            }
+            ns.net.devs.borrow_mut().conf.somaxconn = v;
+            return Ok(());
+        }
+        PseudoNode::Static(b"sys/net/ipv4/ip_local_port_range") => {
+            let mut d = ns.net.devs.borrow_mut();
+            d.conf.port_range = crate::netconf::parse_port_range(data, d.conf.prot_sock)?;
+            return Ok(());
+        }
+        PseudoNode::Static(b"sys/net/ipv4/ip_unprivileged_port_start") => {
+            let mut d = ns.net.devs.borrow_mut();
+            d.conf.prot_sock = crate::netconf::parse_prot_sock(data, d.conf.port_range.0)?;
+            return Ok(());
+        }
+        PseudoNode::Static(b"sys/net/ipv4/ping_group_range") => {
+            let r = crate::netconf::parse_ping_group(data)?;
+            ns.net.devs.borrow_mut().conf.ping_group = r;
+            return Ok(());
         }
         _ => {}
     }
@@ -1800,7 +1965,20 @@ pub(crate) fn readdir(
             pids.sort_unstable();
             nodes.extend(pids.into_iter().map(|(_, pid)| Pid(pid, None)));
         }
+        Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => {
+            let v6 = *path == NET_CONF6;
+            nodes.extend(
+                crate::netdev::conf_dirs(&ps.ns().net)
+                    .into_iter()
+                    .map(|(_, d)| NetConf(v6, d, b"")),
+            );
+        }
         Static(path) => nodes.extend(tree_children(&STATIC, path).map(Static)),
+        NetConf(v6, dir, b"") => nodes.extend(
+            crate::netconf::table(*v6)
+                .iter()
+                .map(|(n, ..)| NetConf(*v6, *dir, n.as_bytes())),
+        ),
         SysRoot => nodes.extend(tree_children(&SYS_STATIC, b"").map(Sys)),
         Sys(path) => {
             nodes.extend(tree_children(&SYS_STATIC, path).map(Sys));
@@ -1809,13 +1987,28 @@ pub(crate) fn readdir(
             }
             if *path == SYS_NET_DIR {
                 nodes.extend(
-                    appine_hal::net::interfaces()
+                    crate::netdev::interfaces(&ps.ns().net)
                         .iter()
                         .map(|i| SysNet(i.index, b"")),
                 );
             }
         }
-        SysNet(n, path) => nodes.extend(tree_children(&NET_FILES, path).map(|p| SysNet(*n, p))),
+        SysNet(n, b"brif/") => nodes.extend(
+            crate::netdev::views(&ps.ns().net)
+                .into_iter()
+                .filter(|v| v.master == Some(*n))
+                .map(|v| SysBrif(*n, v.index)),
+        ),
+        SysNet(n, path) => {
+            nodes.extend(tree_children(&NET_FILES, path).map(|p| SysNet(*n, p)));
+            let (bridge, port) = ps.bridge_roles(*n);
+            if bridge {
+                nodes.extend(tree_children(&BRIDGE_FILES, path).map(|p| SysNet(*n, p)));
+            }
+            if port {
+                nodes.extend(tree_children(&PORT_FILES, path).map(|p| SysNet(*n, p)));
+            }
+        }
         Cgroup(id, b"") => {
             nodes.extend(ps.k.cgroups.files(*id).map(|f| Cgroup(*id, f)));
             if let Some(g) = ps.k.cgroups.get(*id) {
@@ -2879,13 +3072,14 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             self::Global::Kmsg => String::new(),
             self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
         },
-        // 那个进程所在的网络命名空间的：新建的里面只有 lo，socket 只列建在里面的，流量
-        // 和协议的计数都是 0（crate::netns）
+        // 那个进程所在的网络命名空间的：接口是宿主的（新建的里面是 lo）加上虚拟设备
+        // （crate::netdev），socket 只列建在里面的；新建的里面流量和协议的计数都是 0
+        // （crate::netns）
         Net(pid, tid, name) => {
-            let net = ps
+            let full = ps
                 .task(*pid, *tid)
-                .map(|t| t.ns.borrow().net.clone())
-                .filter(|n| n.host_net.is_some());
+                .map_or_else(|| ps.k.init_ns.net.clone(), |t| t.ns.borrow().net.clone());
+            let net = Some(full.clone()).filter(|n| n.host_net.is_some());
             let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
             // uid 列按读者的用户命名空间换算（Linux 的 seq_user_ns）
             let reader = ps.reader();
@@ -2894,19 +3088,16 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 .filter(|(s, _)| socket_net(&s.borrow()) == id)
                 .map(|(s, uid)| (s, reader.uid_out(uid)))
                 .collect();
-            let ifaces = match &net {
-                Some(n) => vec![crate::netns::lo_interface(n)],
-                None => appine_hal::net::interfaces(),
-            };
+            let ifaces = crate::netdev::interfaces(&full);
             let quiet = crate::traffic::Protocols::default();
             let protocols = if net.is_some() {
                 &quiet
             } else {
                 &ps.k.traffic.protocols
             };
-            let tables = || match &net {
-                Some(_) => crate::route::tables(&ifaces, None),
-                None => crate::route::kernel_tables(ps.k),
+            let tables = || {
+                let host = net.is_none().then(|| crate::route::host_routes(ps.k)).flatten();
+                crate::netdev::tables(&full, host)
             };
             match &name[..] {
                 b"arp" => crate::net::PROC_ARP.to_owned(),
@@ -2953,6 +3144,21 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
             b"sys/kernel/cap_last_cap" => "40\n".to_owned(),
+            b"sys/net/core/somaxconn" => {
+                format!("{}\n", ps.ns().net.devs.borrow().conf.somaxconn)
+            }
+            b"sys/net/ipv4/ip_forward" => format!("{}\n", crate::netdev::ip_forward(&ps.ns().net)),
+            b"sys/net/ipv4/ip_local_port_range" => {
+                let (lo, hi) = ps.ns().net.devs.borrow().conf.port_range;
+                format!("{lo}\t{hi}\n")
+            }
+            b"sys/net/ipv4/ip_unprivileged_port_start" => {
+                format!("{}\n", ps.ns().net.devs.borrow().conf.prot_sock)
+            }
+            b"sys/net/ipv4/ping_group_range" => {
+                let (lo, hi) = ps.ns().net.devs.borrow().conf.ping_group;
+                format!("{lo}\t{hi}\n")
+            }
             b"sys/kernel/core_pattern" => {
                 format!("{}\n", String::from_utf8_lossy(&ps.k.core_pattern))
             }
@@ -3127,7 +3333,10 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             _ => return Err(Errno::EISDIR),
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
-        SysNet(n, path) => net_file(ps.k, *n, path)?,
+        SysNet(n, path) => net_file(ps.k, &ps.ns().net, *n, path)?,
+        NetConf(v6, dir, name) => {
+            crate::netdev::conf_read(&ps.ns().net, *v6, *dir, name)?
+        }
         // 只能写的（cgroup.kill）读是 EINVAL
         Cgroup(_, b"") => return Err(Errno::EISDIR),
         Cgroup(id, name) => crate::cgroup::file(ps.k, *id, name).ok_or(Errno::EINVAL)?,
@@ -3291,23 +3500,72 @@ fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(
     Ok(())
 }
 
-/// 宿主编号为 `index` 的接口。
-fn interface(index: u32) -> Option<appine_hal::net::Interface> {
-    appine_hal::net::interfaces()
-        .into_iter()
-        .find(|i| i.index == index)
-}
-
-/// `/sys/class/net/<接口>` 下的文件。接口的类型与 netlink 的回答一样只分回环和以太网；
-/// `flags` 与 Linux 一样是 `dev->flags`，不含 `IFF_RUNNING` 这些按状态算出来的位。
-fn net_file(k: &Kernel, index: u32, path: &[u8]) -> Result<String, Errno> {
+/// `/sys/class/net/<接口>` 下的文件，接口按读者所在网络命名空间里的编号（与 Linux 不同：
+/// Linux 看的是挂载 sysfs 的那个进程所在的）。接口的类型与 netlink 的回答一样只分回环和
+/// 以太网；`flags` 与 Linux 一样是 `dev->flags`，不含 `IFF_RUNNING` 这些按状态算出来的位。
+/// 虚拟设备（[`crate::netdev`]）的 `iflink` 是 veth 的对端，`operstate` 可以是
+/// lowerlayerdown。
+fn net_file(
+    k: &Kernel,
+    ns: &crate::nsproxy::NetNs,
+    index: u32,
+    path: &[u8],
+) -> Result<String, Errno> {
     const IFF_UP: u32 = 0x1;
     const IFF_LOOPBACK: u32 = 0x8;
     const IFF_RUNNING: u32 = 0x40;
     // IFF_RUNNING、IFF_LOWER_UP、IFF_DORMANT、IFF_ECHO（dev_get_flags 才加上它们）
     const STATE_FLAGS: u32 = 0x40 | 0x1_0000 | 0x2_0000 | 0x4_0000;
+    let virt = crate::netdev::views(ns)
+        .into_iter()
+        .find(|v| v.index == index);
+    if let Some(v) = virt {
+        let mac = |m: [u8; 6]| {
+            let hex: Vec<String> = m.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{}\n", hex.join(":"))
+        };
+        return Ok(match path {
+            b"addr_len" => "6\n".to_owned(),
+            b"address" => mac(v.mac),
+            b"broadcast" => mac([0xff; 6]),
+            b"carrier" if v.flags & IFF_UP == 0 => return Err(Errno::EINVAL),
+            b"carrier" => format!("{}\n", u8::from(v.carrier)),
+            b"flags" => format!("{:#x}\n", v.flags & !STATE_FLAGS),
+            b"ifindex" => format!("{index}\n"),
+            b"iflink" => format!("{}\n", v.link.as_ref().map_or(index, |l| l.0)),
+            b"mtu" => format!("{}\n", v.mtu),
+            b"operstate" => match v.operstate {
+                0 => "unknown\n",
+                3 => "lowerlayerdown\n",
+                6 => "up\n",
+                _ => "down\n",
+            }
+            .to_owned(),
+            b"tx_queue_len" => format!("{}\n", v.txqlen),
+            b"type" => "1\n".to_owned(),
+            // bridge 的参数都是默认值，STP 关着（crate::netdev::bridge_info）
+            b"bridge/ageing_time" => "30000\n".to_owned(),
+            b"bridge/forward_delay" => "1500\n".to_owned(),
+            b"bridge/hello_time" => "200\n".to_owned(),
+            b"bridge/max_age" => "2000\n".to_owned(),
+            b"bridge/priority" => "32768\n".to_owned(),
+            b"bridge/stp_state" => "0\n".to_owned(),
+            b"bridge/bridge_id" | b"bridge/root_id" => {
+                let hex: String = v.mac.iter().map(|b| format!("{b:02x}")).collect();
+                format!("8000.{hex}\n")
+            }
+            b"brport/state" => format!("{}\n", v.port_state.unwrap_or(0)),
+            b"brport/priority" => "32\n".to_owned(),
+            b"brport/path_cost" => "2\n".to_owned(),
+            p if p.starts_with(b"statistics/") && !p.ends_with(b"/") => "0\n".to_owned(),
+            _ => return Err(Errno::EISDIR),
+        });
+    }
     // 接口没了：Linux 上目录随之消失，已经打开的文件读出 ENODEV
-    let i = interface(index).ok_or(Errno::ENODEV)?;
+    let i = crate::netdev::base(ns)
+        .into_iter()
+        .find(|i| i.index == index)
+        .ok_or(Errno::ENODEV)?;
     let loopback = i.flags & IFF_LOOPBACK != 0;
     let mac = |m: [u8; 6]| {
         let hex: Vec<String> = m.iter().map(|b| format!("{b:02x}")).collect();

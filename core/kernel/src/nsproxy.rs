@@ -126,9 +126,10 @@ pub(crate) struct CgroupNs {
     pub owner: Rc<UserNs>,
 }
 
-/// 一个网络命名空间。开机时的那个就是宿主的网络（socket 直接用宿主的）。新建的里面只有
-/// 回环接口 lo：socket 仍是宿主 socket，地址换成宿主上给这个命名空间的回环地址
-/// 127.a.b.0/24（[`crate::netns`]），别的地址都到不了。
+/// 一个网络命名空间。开机时的那个就是宿主的网络（socket 直接用宿主的）。新建的里面一开始
+/// 只有回环接口 lo：socket 仍是宿主 socket，地址换成宿主上给这个命名空间的回环地址
+/// 127.a.b.0/24（[`crate::netns`]），别的地址都到不了。两种都可以有虚拟设备
+/// （[`crate::netdev`]）。
 #[derive(Debug)]
 pub(crate) struct NetNs {
     pub id: u64,
@@ -138,6 +139,8 @@ pub(crate) struct NetNs {
     pub host_net: Option<[u8; 2]>,
     /// lo 的状态。
     pub lo: RefCell<Loopback>,
+    /// 虚拟设备、经由它们的路由和 sysctl（[`crate::netdev`]）。
+    pub devs: RefCell<crate::netdev::Devices>,
 }
 
 /// 新的网络命名空间里 lo 的状态：一开始是关着的、没有地址（Linux 的 `loopback_net_init`）。
@@ -233,6 +236,7 @@ impl NsProxy {
                 owner: UserNs::init(),
                 host_net: None,
                 lo: RefCell::default(),
+                devs: RefCell::default(),
             }),
             cgroup: Rc::new(CgroupNs {
                 id: INIT_CGROUP_NS,

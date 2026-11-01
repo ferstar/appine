@@ -597,6 +597,10 @@ pub(crate) struct NetlinkSocket {
     pub rcvtimeo: Option<Duration>,
     /// 建在新的网络命名空间里时是它（回答它的 lo、配置 lo）。
     pub net: Option<Rc<crate::nsproxy::NetNs>>,
+    /// `NETLINK_EXT_ACK`：出错的确认附上 extack 的消息（iproute2 打印成 `Error: ….`）。
+    pub ext_ack: bool,
+    /// `NETLINK_CAP_ACK`：出错的确认只附上请求的消息头。
+    pub cap_ack: bool,
 }
 
 // ---- DNS 存根 ----
@@ -682,6 +686,10 @@ const IFLA_NUM_TX_QUEUES: u16 = 31;
 const IFLA_NUM_RX_QUEUES: u16 = 32;
 const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
+const IFLA_MASTER: u16 = 10;
+const IFLA_LINKINFO: u16 = 18;
+/// 转储的一个数据报最多多大：接口多时分成几个（musl 的 if_nameindex 等用 8 KiB 的缓冲区）。
+const DUMP_CHUNK: usize = 8192;
 /// `IF_OPER_*`（RFC 2863 的接口状态）。
 const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_DOWN: u8 = 2;
@@ -741,14 +749,53 @@ pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -
 /// 对请求 `req`（整条消息）的确认或者错误（Linux 的 `netlink_ack`）：成功时只附上请求的
 /// 消息头、带 `NLM_F_CAPPED`，出错时附上整条请求（没有设 `NETLINK_CAP_ACK`）。
 fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
+    ack_ext(req, err, pid, None, false)
+}
+
+/// 同 [`ack`]，另外按 `NETLINK_EXT_ACK` 附上 extack 的消息（`NLMSGERR_ATTR_MSG`，带
+/// `NLM_F_ACK_TLVS`），`cap` 是设了 `NETLINK_CAP_ACK`。
+fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
+    const NLM_F_ACK_TLVS: u16 = 0x200;
+    const NLMSGERR_ATTR_MSG: u16 = 1;
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
     let mut p = (-err).to_le_bytes().to_vec();
-    if err == 0 {
+    let mut flags = 0;
+    if err == 0 || cap {
         p.extend_from_slice(&req[..16]);
-        message(NLMSG_ERROR, NLM_F_CAPPED, seq, pid, &p)
+        flags |= NLM_F_CAPPED;
     } else {
         p.extend_from_slice(req);
-        message(NLMSG_ERROR, 0, seq, pid, &p)
+    }
+    if let Some(m) = msg {
+        align4(&mut p);
+        let mut s = m.as_bytes().to_vec();
+        s.push(0);
+        attr(&mut p, NLMSGERR_ATTR_MSG, &s);
+        flags |= NLM_F_ACK_TLVS;
+    }
+    message(NLMSG_ERROR, flags, seq, pid, &p)
+}
+
+/// 网络命名空间里的一个接口（netlink 的转储用）：宿主的（或者新的命名空间里的 lo），或者
+/// 虚拟设备（[`crate::netdev`]，带着对端所在命名空间的编号）。
+pub(crate) enum Link {
+    Host(Interface),
+    Virt(crate::netdev::View, Option<i32>),
+}
+
+impl Link {
+    fn index(&self) -> u32 {
+        match self {
+            Link::Host(i) => i.index,
+            Link::Virt(v, _) => v.index,
+        }
+    }
+
+    fn name(&self) -> &[u8] {
+        match self {
+            Link::Host(i) => i.name.as_bytes(),
+            Link::Virt(v, _) => &v.name,
+        }
     }
 }
 
@@ -1126,17 +1173,36 @@ pub(crate) trait Host {
     fn tx_queue_len(&self, name: &str) -> Option<u32>;
     /// 发请求的进程的用户 ID（`ip route get` 回答里的 RTA_UID）。
     fn uid(&self) -> u32;
-    /// 修改接口、地址的请求（新的网络命名空间里的 lo，[`crate::netns::configure`]；开机时的
-    /// 命名空间里什么也不改的，[`configure_host_link`]）：None 是不处理，Some 里是错误码。
-    fn configure(&self, _req: &[u8]) -> Option<i32> {
+    /// 修改接口、地址、路由的请求（[`crate::netdev::request`]）：None 是不处理，Some 里是
+    /// 结果。
+    fn configure(&self, _req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
         None
     }
-    /// RTM_GETNSID 要找的网络命名空间在不在：`attr` 是 [`NETNSA_PID`]（进程）或者
-    /// [`NETNSA_FD`]（命名空间文件），`value` 是它的值。在的话是 Ok，不然是错误码。
-    fn peer_net(&self, _attr: u16, _value: u32) -> Result<(), i32> {
-        Ok(())
+    /// RTM_GETNSID 要找的网络命名空间：`attr` 是 [`NETNSA_PID`]（进程）或者 [`NETNSA_FD`]
+    /// （命名空间文件），`value` 是它的值。找得到时是这个命名空间给它分配的编号（没有分配
+    /// 是 None），不然是错误码。
+    fn peer_net(&self, _attr: u16, _value: u32) -> Result<Option<i32>, i32> {
+        Ok(None)
+    }
+    /// 所有的接口：宿主的（或者 lo）和虚拟设备，按编号。
+    fn links(&self) -> Vec<Link> {
+        self.interfaces().into_iter().map(Link::Host).collect()
+    }
+    /// 路由表（[`crate::route::tables`]，含虚拟设备上的）。
+    fn tables(&self) -> Vec<Route2> {
+        crate::route::tables(&self.interfaces(), self.routes())
+    }
+    /// 所有接口（含虚拟设备）的地址，`ip route get` 用。
+    fn all_interfaces(&self) -> Vec<Interface> {
+        self.interfaces()
+    }
+    /// 是开机时的命名空间：`ip route get` 可以让宿主选源地址。
+    fn init_net(&self) -> bool {
+        true
     }
 }
+
+type Route2 = crate::route::Entry;
 
 impl NetlinkSocket {
     pub fn new(protocol: i32) -> NetlinkSocket {
@@ -1147,6 +1213,8 @@ impl NetlinkSocket {
             arrivals: 0,
             rcvtimeo: None,
             net: None,
+            ext_ack: false,
+            cap_ack: false,
         }
     }
 
@@ -1184,38 +1252,87 @@ impl NetlinkSocket {
         let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
         let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
         let dump = flags & NLM_F_DUMP != 0;
-        if let Some(e) = host.configure(req) {
-            return if e != 0 || flags & NLM_F_ACK != 0 {
-                vec![ack(req, e, self.pid)]
-            } else {
-                Vec::new()
+        if let Some(r) = host.configure(req) {
+            return match r {
+                Err(f) => vec![ack_ext(
+                    req,
+                    f.errno,
+                    self.pid,
+                    f.msg.filter(|_| self.ext_ack),
+                    self.cap_ack,
+                )],
+                Ok(()) if flags & NLM_F_ACK != 0 => vec![ack(req, 0, self.pid)],
+                Ok(()) => Vec::new(),
             };
         }
+        let one = |l: &Link| match l {
+            Link::Host(i) => link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name)),
+            Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
+        };
         match ty {
-            // 与 Linux 一样，接口是一个数据报；地址每个地址族一个（AF_UNSPEC 时先是 IPv4），
-            // NLMSG_DONE 另是一个
+            // 与 Linux 一样，接口是一个数据报（太大时分成几个）；地址每个地址族一个
+            // （AF_UNSPEC 时先是 IPv4），NLMSG_DONE 另是一个。按 IFLA_MASTER、IFLA_LINKINFO
+            // 的种类过滤时消息带 NLM_F_DUMP_FILTERED（Linux 的 rtnl_dump_ifinfo）
             RTM_GETLINK if dump => {
-                let mut out = Vec::new();
-                for i in &host.interfaces() {
-                    let m = link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name));
-                    out.extend(reply(RTM_NEWLINK, NLM_F_MULTI, &m));
+                const NLM_F_DUMP_FILTERED: u16 = 0x20;
+                let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
+                let master = attrs
+                    .iter()
+                    .find(|(t, d)| *t == IFLA_MASTER && d.len() >= 4)
+                    .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
+                    .filter(|&m| m != 0);
+                let kind = attrs
+                    .iter()
+                    .find(|(t, _)| *t == IFLA_LINKINFO)
+                    .and_then(|(_, d)| {
+                        crate::route::attrs(d)
+                            .into_iter()
+                            .find(|(t, _)| *t == 1)
+                            .map(|(_, k)| k.split(|&c| c == 0).next().unwrap_or_default().to_vec())
+                    })
+                    .filter(|k| matches!(&k[..], b"bridge" | b"veth" | b"dummy"));
+                let filtered = master.is_some() || kind.is_some();
+                let mflags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                let mut cur = Vec::new();
+                for l in &host.links() {
+                    let keep = match l {
+                        Link::Host(_) => master.is_none() && kind.is_none(),
+                        Link::Virt(v, _) => {
+                            master.is_none_or(|m| v.master == Some(m))
+                                && kind
+                                    .as_deref()
+                                    .is_none_or(|k| k == v.kind.name().as_bytes())
+                        }
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    let m = reply(RTM_NEWLINK, mflags, &one(l));
+                    if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    cur.extend(m);
                 }
-                if out.is_empty() {
-                    vec![done()]
-                } else {
-                    vec![out, done()]
+                if !cur.is_empty() {
+                    out.push(cur);
                 }
+                out.push(done());
+                out
             }
             RTM_GETADDR if dump => {
-                let ifaces = host.interfaces();
+                let links = host.links();
                 let mut out = Vec::new();
                 for f in [AF_INET, AF_INET6] {
                     if family != 0 && family != f {
                         continue;
                     }
-                    let d: Vec<u8> = ifaces
+                    let d: Vec<u8> = links
                         .iter()
-                        .flat_map(|i| addr_messages(i, f as u8))
+                        .flat_map(|l| match l {
+                            Link::Host(i) => addr_messages(i, f as u8),
+                            Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
+                        })
                         .flat_map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m))
                         .collect();
                     if !d.is_empty() {
@@ -1238,18 +1355,17 @@ impl NetlinkSocket {
                 if index <= 0 && name.is_none() {
                     return vec![ack(req, EINVAL, self.pid)];
                 }
-                let found = host.interfaces().into_iter().find(|i| {
+                let found = host.links().into_iter().find(|l| {
                     if index > 0 {
-                        i.index as i32 == index
+                        l.index() as i32 == index
                     } else {
-                        name.as_deref() == Some(i.name.as_bytes())
+                        name.as_deref() == Some(l.name())
                     }
                 });
-                let Some(i) = found else {
+                let Some(l) = found else {
                     return vec![ack(req, ENODEV, self.pid)];
                 };
-                let m = link_message(&i, host.stats(&i.name), host.tx_queue_len(&i.name));
-                let mut out = vec![reply(RTM_NEWLINK, 0, &m)];
+                let mut out = vec![reply(RTM_NEWLINK, 0, &one(&l))];
                 if flags & NLM_F_ACK != 0 {
                     out.push(ack(req, 0, self.pid));
                 }
@@ -1257,7 +1373,7 @@ impl NetlinkSocket {
             }
             // 与 Linux 一样，每个地址族的路由是一个数据报，NLMSG_DONE 另是一个
             RTM_GETROUTE if dump => {
-                let entries = crate::route::tables(&host.interfaces(), host.routes());
+                let entries = host.tables();
                 let mut out = Vec::new();
                 for f in [AF_INET, AF_INET6] {
                     let d: Vec<u8> = entries
@@ -1275,9 +1391,9 @@ impl NetlinkSocket {
                 out
             }
             RTM_GETROUTE => {
-                let ifaces = host.interfaces();
-                let entries = crate::route::tables(&ifaces, host.routes());
-                match crate::route::get(req, &entries, &ifaces, host.uid()) {
+                let ifaces = host.all_interfaces();
+                let entries = host.tables();
+                match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
                     Ok(p) => {
                         let mut out = vec![reply(RTM_NEWROUTE, 0, &p)];
                         if flags & NLM_F_ACK != 0 {
@@ -1301,9 +1417,10 @@ impl NetlinkSocket {
                     .collect();
                 vec![d, done()]
             }
-            // 网络命名空间的编号（`ip netns list`）：appine 不给命名空间分配编号（RTM_NEWNSID
-            // 是 EOPNOTSUPP），找得到对方时总是回答 -1（Linux 的 NETNSA_NSID_NOT_ASSIGNED），
-            // 按编号找的都找不到。顺序与 Linux 的 rtnl_net_getid 相同
+            // 网络命名空间的编号（`ip netns list`）：只在转储 veth 时给对端所在的命名空间分配
+            // （IFLA_LINK_NETNSID，Linux 的 peernet2id_alloc），RTM_NEWNSID 是 EOPNOTSUPP；
+            // 找得到对方时回答分配了的编号，没有分配是 -1（NETNSA_NSID_NOT_ASSIGNED），按编号
+            // 找的都找不到。顺序与 Linux 的 rtnl_net_getid 相同
             RTM_GETNSID => {
                 let attrs = crate::route::attrs(req.get(20..).unwrap_or_default());
                 let get = |t| {
@@ -1321,14 +1438,14 @@ impl NetlinkSocket {
                 } else {
                     Err(EINVAL)
                 };
-                let r = peer.and_then(|()| match get(NETNSA_TARGET_NSID) {
+                let r = peer.and_then(|id| match get(NETNSA_TARGET_NSID) {
                     Some(_) => Err(EINVAL),
-                    None => Ok(()),
+                    None => Ok(id),
                 });
                 match r {
-                    Ok(()) => {
+                    Ok(id) => {
                         let mut p = vec![0u8; 4];
-                        attr(&mut p, NETNSA_NSID, &(-1i32).to_le_bytes());
+                        attr(&mut p, NETNSA_NSID, &id.unwrap_or(-1).to_le_bytes());
                         let mut out = vec![reply(RTM_NEWNSID, 0, &p)];
                         if flags & NLM_F_ACK != 0 {
                             out.push(ack(req, 0, self.pid));

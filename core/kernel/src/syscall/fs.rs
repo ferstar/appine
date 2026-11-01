@@ -1400,10 +1400,19 @@ fn open_pseudo(
     {
         return Err(Errno::EACCES);
     }
+    // 网络的 sysctl 读的时候才出错（没有设过的 stable_secret 是 EIO，Linux 的
+    // proc_sys_call_handler）：打开时先放空的，第一次读重新生成
+    let mut fresh = true;
     let data = if pseudo::unreadable(&node) {
         Vec::new()
     } else {
-        pseudo::content(&view, mnt, &node)?
+        match pseudo::content(&view, mnt, &node) {
+            Err(_) if matches!(node, PseudoNode::NetConf(..)) => {
+                fresh = false;
+                Vec::new()
+            }
+            r => r?,
+        }
     };
     // /proc/kmsg（`kmsg_open`）：打开时按 syslog 的打开查权限，之后的读不再查
     let klog = match node {
@@ -1424,7 +1433,7 @@ fn open_pseudo(
         mnt,
         node,
         data,
-        fresh: true,
+        fresh,
         mm,
         ns,
         klog,

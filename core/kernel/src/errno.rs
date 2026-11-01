@@ -49,6 +49,8 @@ impl Errno {
     pub const EISDIR: Errno = Errno(21);
     /// 参数无效。
     pub const EINVAL: Errno = Errno(22);
+    /// 系统的打开文件表满了（这里也用于接口名的编号用尽）。
+    pub const ENFILE: Errno = Errno(23);
     /// fd 用尽。
     pub const EMFILE: Errno = Errno(24);
     /// 不是终端。
@@ -110,6 +112,8 @@ impl Errno {
     /// 地址已被占用。
     pub const EADDRINUSE: Errno = Errno(98);
     pub const EADDRNOTAVAIL: Errno = Errno(99);
+    /// 网络（接口）停用着。
+    pub const ENETDOWN: Errno = Errno(100);
     /// 网络不可达。
     pub const ENETUNREACH: Errno = Errno(101);
     /// 已经连接。

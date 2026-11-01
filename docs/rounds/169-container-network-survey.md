@@ -1,6 +1,6 @@
 # M9 之前：容器网络的普查（2026-11-01）
 
-← [M9 之前：open_tree、move_mount 和 mount_setattr（2026-11-01）](168-open-tree.md) · [索引](../milestones.md)
+← [M9 之前：open_tree、move_mount 和 mount_setattr（2026-11-01）](168-open-tree.md) · [索引](../milestones.md) · [M9 之前：有状态的网卡（2026-11-01）](170-netdev.md) →
 
 [podman 和 docker 的普查](157-container-survey.md)的问题 12：容器现在只能用 host 网络。讨论之后先走"按地址映射模拟 bridge"这条路（方案 1）：容器的 socket 仍是宿主 socket，appine 里不出现包，容器的地址在系统调用的边界上换成宿主上的回环地址，与[网络命名空间](122-net-namespaces.md)现在的做法一样。动手之前先查清楚 docker 和 podman 的 bridge 网络到底依赖什么，重点是三件事：关掉防火墙之后还剩哪些依赖；自定义网络按容器名解析靠什么；端口发布（`-p`）是怎么实现的。
 
@@ -52,6 +52,7 @@
    - 建 bridge、veth 对（含 `VETH_INFO_PEER`、经由命名空间的 fd 或 pid 建在别的命名空间里、`IFLA_MASTER`），启用、改名、设 MAC、挂到 bridge、移到别的命名空间，删除。
    - 地址、路由（现在改路由是 EOPNOTSUPP）记在各自的命名空间里，转储、`ip` 的输出照 Linux 的格式。
    - 接口的 sysctl 目录（`ipv4/conf/<if>`、`ipv6/conf/<if>`）跟着接口出现，上面这些项可以写。
+   - → 已做（M9 之前：有状态的网卡）：两家的 bridge 网络建得起来，容器起得来；`-p` 时 docker 给监听 socket 装 BPF 过滤器失败（`SO_ATTACH_FILTER` 的指针没换），归到第 2 步
 2. **socket 层的地址映射**：veth、bridge 上的地址各自对应宿主上的一个回环地址。容器之间、外层到容器、容器到网关（aardvark-dns、宿主上的服务）都换成宿主回环上的连接。访问 bridge 以外的直接用宿主 socket，所以即使防火墙关着也通（比原生"关着防火墙"时好）。docker-proxy 从外层连容器的 IP 也走这个映射。
 3. **netfilter 的一个子集**：
    - 至少要接受 docker 写进容器命名空间的那几条 nat 规则，并在 socket 层执行：发往 127.0.0.11:53 的换成那个端口，回来的源端口换回 53。这要实现 `NETLINK_NETFILTER` 上 nftables 的消息（表、链、规则的增删查），以及 iptables-nft 用的 `nft_compat` xt 目标（DNAT、SNAT）。
