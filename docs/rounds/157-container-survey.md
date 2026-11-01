@@ -54,7 +54,7 @@
 9. **可写的 cgroup v2**：podman 不加 `--cgroups disabled` 时、`podman build` 不加 runtime 参数时、`--memory` 这类限制、以 root 运行的 runc（docker）都要建子 cgroup、写 `cgroup.procs`、启用控制器。可以分两步：先只有层级和迁移（原生的 docker 在没有控制器时也能跑），再让 `pids.max`、`memory.max`（接 OOM killer）、`cgroup.freeze`、`cgroup.kill` 真正生效；`cpu.max`、`io.max` 只能记下，宿主线程的调度不归 appine 管。→ 第一步已做（M9 之前：cgroup 树：建子 cgroup、迁移进程），限制还不起作用；`pids.max`、`memory.max` 起作用了（M9 之前：cgroup 的 pids.max 和 memory.max 起作用），`cgroup.freeze` 还没有；`cgroup.freeze` 也有了（M9 之前：cgroup.freeze）
 10. **open_tree、move_mount**（[未实现的系统调用](139-unimplemented-syscalls.md)里的新挂载接口）：容器有用户命名空间（`--uidmap`、`--userns`）时，crun 在命名空间外面先用 `open_tree(OPEN_TREE_CLONE)` 打开要 bind 的文件，把 fd 交给里面（crun 1.30.1 的 `prepare_and_send_mount_mounts`）。open_tree 是 ENOSYS 时它就在用户命名空间里面按路径 stat，`/run/containers` 是 0700、属于没有映射的 root，得到 EACCES。原生上目录权限一样，靠的就是 open_tree。→ 已改（M9 之前：open_tree、move_mount 和 mount_setattr），`--uidmap` 的容器起得来了
 11. **devpts 的新实例共用终端**（[mount 的子集](105-mount-subset.md)的推迟项）：容器里 `tty` 是 `/dev/pts/1`，`ls /dev/pts` 看得到宿主的 0 号终端；Linux 上 `newinstance` 的 devpts 有自己的一套，编号从 0 开始。到了容器里这就是隔离上的漏洞。→ 已改（M9 之前：devpts 的实例）
-12. **容器网络**：默认的 bridge 网络、端口发布要 iptables 或 nftables（netfilter 的 netlink 是 EPROTONOSUPPORT）、bridge 和 veth（[网络命名空间](122-net-namespaces.md)的推迟项），无 root 的 podman 用的 pasta 要 tun。最大的一块，可以一直只用 host 网络。
+12. **容器网络**：默认的 bridge 网络、端口发布要 iptables 或 nftables（netfilter 的 netlink 是 EPROTONOSUPPORT）、bridge 和 veth（[网络命名空间](122-net-namespaces.md)的推迟项），无 root 的 podman 用的 pasta 要 tun。最大的一块，可以一直只用 host 网络。→ 普查了 bridge 网络的依赖（M9 之前：容器网络的普查），按地址映射的方案做
 
 ## 推迟项
 

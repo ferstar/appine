@@ -1,6 +1,6 @@
 # M9 之前：open_tree、move_mount 和 mount_setattr（2026-11-01）
 
-← [M9 之前：devpts 的实例（2026-11-01）](167-devpts-instances.md) · [索引](../milestones.md)
+← [M9 之前：devpts 的实例（2026-11-01）](167-devpts-instances.md) · [索引](../milestones.md) · [M9 之前：容器网络的普查（2026-11-01）](169-container-network-survey.md) →
 
 [podman 和 docker 的普查](157-container-survey.md)的问题 10：容器有用户命名空间（`--uidmap`、`--userns`）时，crun 在命名空间外面用 `open_tree(OPEN_TREE_CLONE)` 打开要 bind 的东西，把 fd 交给里面的进程去 `move_mount`。appine 的新挂载接口都是 ENOSYS，crun 退回在用户命名空间里按路径 stat，`userdata/shm` 所在的目录是 0700、属于没有映射的 root，得到 EACCES，容器起不来。照 Linux 6.1 的 `fs/namespace.c` 做了 open_tree、move_mount、mount_setattr 三个。
 

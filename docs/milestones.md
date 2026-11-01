@@ -177,6 +177,7 @@
 | [M9 之前：cgroup 的设备过滤（eBPF）](rounds/166-bpf-devices.md) | 2026-11-01 | bpf(2) 的子集：`BPF_PROG_TYPE_CGROUP_DEVICE` 的加载（校验器的错误码与 Linux 相同）、挂到 cgroup、查询、按编号取、取信息，解释执行；打开设备、mknod 时按 cgroup 的有效程序放行；伪文件从偏移 0 再读时重新生成（seq_file）；docker、podman 不用 `--cgroups disabled` 也能跑容器，限制、OOM、pause 都起作用 |
 | [M9 之前：devpts 的实例](rounds/167-devpts-instances.md) | 2026-11-01 | 每次挂 devpts 是一个新的实例：自己的一套终端（编号从 0 开始）、设备号和选项（uid、gid、mode、ptmxmode、max），ptmx 设备节点按同目录的 `pts` 找实例，fd 链接、ttyname 按经由的挂载；TIOCGPTPEER；开着终端时卸不下；容器里只看得到自己的终端 |
 | [M9 之前：open_tree、move_mount 和 mount_setattr](rounds/168-open-tree.md) | 2026-11-01 | open_tree（`OPEN_TREE_CLONE` 复制出不挂在任何地方的树，fd 关掉就拆）、move_mount 接上或者挪、mount_setattr 改挂载的标志；删除挂载点只看自己的命名空间，别处的随之卸下；用户命名空间里的 root 能装 seccomp 过滤器；podman `--uidmap` 的容器起得来了 |
+| [M9 之前：容器网络的普查](rounds/169-container-network-survey.md) | 2026-11-01 | docker、podman 的 bridge 网络依赖什么：netlink 建 bridge 和 veth、按接口的 sysctl；docker 关掉 iptables 也在容器里写内置 DNS 的 nat 规则，`-p` 用 docker-proxy；podman 按名字解析靠 aardvark-dns，`-p` 只靠 nftables；appine 里两家都卡在建 bridge；地址映射方案的四步 |
 
 ## 测量条件
 

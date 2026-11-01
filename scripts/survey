@@ -56,7 +56,9 @@ EOF
         start=$(date +%s)
         set +e
         # shellcheck disable=SC2086 # 选项要按空白拆开
-        docker run --rm -i --platform linux/arm64 --ulimit nice=40:40 ${SURVEY_DOCKER_OPTS:-} \
+        # --init：busybox 的 timeout 执行的 sh 不能是容器里的 1 号进程，1 号进程不理会超时时的
+        # SIGTERM，卡住的负载就一直不结束
+        docker run --rm -i --init --platform linux/arm64 --ulimit nice=40:40 ${SURVEY_DOCKER_OPTS:-} \
             -e http_proxy="$http" -e https_proxy="$https" -e no_proxy=127.0.0.1,localhost \
             -e PATH=/usr/sbin:/usr/bin:/sbin:/bin -e HOME=/root -e TERM=xterm "$native" \
             timeout "$limit" /bin/sh -c 'mkdir -p /tmp && chmod 1777 /tmp && cat > /tmp/survey.sh && exec sh /tmp/survey.sh </dev/null' \
