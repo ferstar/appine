@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::misc::deadline_from_clock;
+use super::misc::deadline_in_ns;
 use super::{SysResult, get, put};
 use crate::errno::Errno;
 use crate::itimer::{Clock, PosixTimer};
@@ -180,7 +180,7 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
         t.deadline = None;
     } else {
         let at = match (t.clock, abs) {
-            (Clock::Wall(clock), true) => Some(deadline_from_clock(clock, value)?),
+            (Clock::Wall(clock), true) => Some(deadline_in_ns(cx, clock, value)?),
             _ => None,
         };
         t.arm(cx.kr(), value, at, abs);

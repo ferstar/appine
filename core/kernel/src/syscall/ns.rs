@@ -11,7 +11,7 @@ use crate::cred::{Cred, MAX_USER_NS_LEVEL, UserNs, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, Pidfd};
 use crate::kernel::{Cx, Kernel};
-use crate::nsproxy::{CgroupNs, INIT_TIME_NS, IpcNs, NetNs, NsRef, UtsNs};
+use crate::nsproxy::{CgroupNs, IpcNs, NetNs, NsRef, TimeNs, UtsNs};
 use crate::pidns::{MAX_PID_NS_LEVEL, PidNs};
 use crate::pseudo::{NsKind, PseudoNode};
 use crate::task::FsContext;
@@ -151,7 +151,12 @@ pub(crate) fn find(k: &Kernel, vfs: Option<&Vfs>, kind: NsKind, id: u64) -> Opti
         NsKind::Cgroup => find_nsproxy(k, |p| {
             (p.cgroup.id == id).then(|| NsRef::Cgroup(p.cgroup.clone()))
         }),
-        NsKind::Time | NsKind::TimeForChildren => (id == INIT_TIME_NS).then_some(NsRef::Time),
+        NsKind::Time | NsKind::TimeForChildren => find_nsproxy(k, |p| {
+            [&p.time, &p.time_for_children]
+                .into_iter()
+                .find(|n| n.id == id)
+                .map(|n| NsRef::Time(n.clone()))
+        }),
     };
     live.or_else(|| vfs.and_then(|v| v.pinned_ns(id)))
         .or_else(|| {
@@ -212,7 +217,7 @@ struct NsSet {
     pid: Option<Rc<PidNs>>,
     cgroup: Option<Rc<CgroupNs>>,
     net: Option<Rc<NetNs>>,
-    time: bool,
+    time: Option<Rc<TimeNs>>,
 }
 
 impl NsSet {
@@ -226,7 +231,7 @@ impl NsSet {
             NsRef::Ipc(n) => set.ipc = Some(n),
             NsRef::Net(n) => set.net = Some(n),
             NsRef::Cgroup(n) => set.cgroup = Some(n),
-            NsRef::Time => set.time = true,
+            NsRef::Time(n) => set.time = Some(n),
         }
         set
     }
@@ -252,7 +257,7 @@ impl NsSet {
             pid: want(NsKind::Pid).then(|| g.pid_ns.clone()),
             cgroup: want(NsKind::Cgroup).then(|| ns.cgroup.clone()),
             net: want(NsKind::Net).then(|| ns.net.clone()),
-            time: want(NsKind::Time),
+            time: want(NsKind::Time).then(|| ns.time.clone()),
         })
     }
 }
@@ -324,12 +329,12 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
     if let Some(ns) = &set.net {
         may_enter(&ns.owner)?;
     }
-    // Linux 的 timens_install：多线程的进程不行
-    if set.time {
+    // Linux 的 timens_install：多线程的进程不行（EUSERS），之后与别的一样查能力
+    if let Some(ns) = &set.time {
         if threaded {
             return Err(Errno::EUSERS);
         }
-        may_enter(&UserNs::init())?;
+        may_enter(&ns.owner)?;
     }
     Ok(root)
 }
@@ -337,7 +342,7 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
 /// 换成 `set` 里的命名空间（Linux 的 `commit_nsset`），`root` 是挂载命名空间的根目录：
 /// 根目录、当前目录换到那里；换 IPC 命名空间之前执行并丢掉 SEM_UNDO 的撤销值（`exit_sem`）；
 /// pid 命名空间是之后建的子进程所在的（1 号进程已经退出的建不了，ENOMEM）。time 命名空间
-/// 只有开机时的那个，什么也不用换。
+/// 自己和给子进程的都换成它，偏移从此不能再改（Linux 的 `timens_commit`）。
 fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     if let Some(ns) = set.user {
         cx.t.group.borrow_mut().cred.enter_user_ns(ns);
@@ -373,6 +378,15 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     }
     if let Some(ns) = set.pid {
         *cx.task.pid_ns_children.borrow_mut() = Some(ns);
+    }
+    if let Some(ns) = set.time {
+        ns.frozen.set(true);
+        let mut p = cx.task.ns.borrow_mut();
+        p.time = ns.clone();
+        p.time_for_children = ns;
+        drop(p);
+        // 不持 BKL 读时钟的路径记着偏移
+        cx.shared.fast_changed();
     }
 }
 

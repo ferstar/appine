@@ -109,6 +109,8 @@ pub(crate) enum Entry {
     GidMap,
     ProjidMap,
     Setgroups,
+    /// 给子进程用的 time 命名空间的偏移（[`crate::nsproxy::TimeNs`]），只在 `/proc/<pid>` 下。
+    TimensOffsets,
 }
 
 /// 命名空间的种类（`/proc/<pid>/ns` 里的项）。只有挂载命名空间可以新建，别的都是开机时的
@@ -204,13 +206,14 @@ impl NsKind {
                 }
                 ns.id
             }
-            NsKind::Time | NsKind::TimeForChildren => crate::nsproxy::INIT_TIME_NS,
+            NsKind::Time => task.ns.borrow().time.id,
+            NsKind::TimeForChildren => task.ns.borrow().time_for_children.id,
             NsKind::Uts => task.ns.borrow().uts.id,
         })
     }
 }
 
-const ENTRIES: [(&[u8], Entry); 31] = [
+const ENTRIES: [(&[u8], Entry); 32] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -242,6 +245,7 @@ const ENTRIES: [(&[u8], Entry); 31] = [
     (b"gid_map", Entry::GidMap),
     (b"projid_map", Entry::ProjidMap),
     (b"setgroups", Entry::Setgroups),
+    (b"timens_offsets", Entry::TimensOffsets),
 ];
 
 /// `/proc/<pid>/net` 下的文件。与 Linux 一样，`/proc/net` 是指向 `self/net` 的链接。
@@ -789,6 +793,17 @@ impl<'a> View<'a> {
     }
 
     /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
+    /// 开机以来的纳秒数 `ns` 加上读者所在的 time 命名空间里 boottime 的偏移（Linux 的
+    /// `timens_add_boottime_ns`：`/proc/uptime`、进程的启动时间），不小于 0。
+    fn with_boot_offset(&self, ns: u64) -> u64 {
+        let offset = self
+            .k
+            .tasks
+            .get(&self.tid)
+            .map_or(0, |t| t.ns.borrow().time.offset(7));
+        (ns as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64
+    }
+
     pub(crate) fn reader(&self) -> Cred {
         self.group(self.tgid)
             .map_or_else(Cred::root, |g| g.borrow().cred.clone())
@@ -1378,6 +1393,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     matches!(
         node,
         PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
+            | PseudoNode::Entry(_, None, Entry::TimensOffsets)
             | PseudoNode::Entry(_, _, Entry::Mem)
             | PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap | Entry::Setgroups)
             | PseudoNode::Static(
@@ -1430,6 +1446,9 @@ pub(crate) fn write(
             return write_id_map(k, cred, *pid, *e == Entry::GidMap, data);
         }
         PseudoNode::Entry(pid, _, Entry::Setgroups) => return write_setgroups(k, cred, *pid, data),
+        PseudoNode::Entry(pid, None, Entry::TimensOffsets) => {
+            return write_timens_offsets(k, cred, *pid, data);
+        }
         _ => {}
     }
     if let PseudoNode::Static(path) = node
@@ -1904,7 +1923,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Str
         20 + nice,
         nice,
         g.threads.len().max(1),
-        g.start_ticks,
+        ps.with_boot_offset(g.start_ticks * (1_000_000_000 / HZ)) / (1_000_000_000 / HZ),
         vsize,
         rss,
     )
@@ -2744,15 +2763,17 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             self::Global::Uptime => {
                 let hundredths =
                     |ns: u64| format!("{}.{:02}", ns / 1_000_000_000, ns / 10_000_000 % 100);
-                let up = uptime_ns();
-                format!("{} {}\n", hundredths(up), hundredths(up * cpus() as u64))
+                // 空闲时间不受 time 命名空间影响（Linux 的 uptime_proc_show）
+                let idle = uptime_ns() * cpus() as u64;
+                let up = ps.with_boot_offset(uptime_ns());
+                format!("{} {}\n", hundredths(up), hundredths(idle))
             }
             self::Global::Loadavg => crate::loadavg::proc_loadavg(ps.k, ps.last_pid()),
             self::Global::Version => {
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
             self::Global::Filesystems => {
-                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\n"
+                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tmqueue\n"
                     .to_owned()
             }
             self::Global::Cmdline => "appine\n".to_owned(),
@@ -2968,6 +2989,15 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
                 }
+                // Linux 的 proc_timens_show_offsets：给子进程用的那个
+                self::Entry::TimensOffsets => {
+                    let t = ps.k.tasks.get(pid).ok_or(Errno::ESRCH)?;
+                    let [mono, boot] = t.ns.borrow().time_for_children.offsets.get();
+                    format!(
+                        "{:<10} {:>10} {:>9}\n{:<10} {:>10} {:>9}\n",
+                        "monotonic", mono.0, mono.1, "boottime", boot.0, boot.1
+                    )
+                }
                 e @ (self::Entry::UidMap | self::Entry::GidMap | self::Entry::ProjidMap) => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     let ns = g.borrow().cred.user_ns.clone();
@@ -3061,6 +3091,66 @@ fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> 
     }
     let kernel = new.lower_to_kernel(&parent_map)?;
     *map.borrow_mut() = kernel;
+    Ok(())
+}
+
+/// 写 `/proc/<pid>/timens_offsets`（Linux 6.1 的 `timens_offsets_write`、
+/// `proc_timens_set_offset`）：一两行 `<时钟> <秒> <纳秒>`，时钟是 `monotonic`、`boottime` 或者
+/// 它们的编号 1、7。写进那个进程给子进程用的 time 命名空间：要在它的属主里有 `CAP_SYS_TIME`
+/// （EPERM，Linux 按打开文件时的凭据，这里按写的进程的），加上偏移之后的时钟要在
+/// [0, KTIME_SEC_MAX / 2] 里（ERANGE），已经有进程进去过是 EACCES。
+fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
+    const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+    if data.len() >= 4096 {
+        return Err(Errno::EINVAL);
+    }
+    let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    let mut offsets = Vec::new();
+    for line in text.split_terminator('\n') {
+        let mut words = line.split_ascii_whitespace();
+        let (Some(clock), Some(sec), Some(nsec)) = (words.next(), words.next(), words.next())
+        else {
+            return Err(Errno::EINVAL);
+        };
+        let sec: i64 = sec.parse().map_err(|_| Errno::EINVAL)?;
+        let nsec: u64 = nsec.parse().map_err(|_| Errno::EINVAL)?;
+        if nsec >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        let index = match clock {
+            "monotonic" | "1" => 0,
+            "boottime" | "7" => 1,
+            _ => return Err(Errno::EINVAL),
+        };
+        offsets.push((index, (sec, nsec as i64)));
+        if offsets.len() == 2 {
+            break;
+        }
+    }
+    let task = k.tasks.get(&pid).ok_or(Errno::ESRCH)?;
+    let ns = task.ns.borrow().time_for_children.clone();
+    if !cred.ns_capable(&ns.owner, cap::SYS_TIME) {
+        return Err(Errno::EPERM);
+    }
+    for &(index, (sec, nsec)) in &offsets {
+        let clock = [1, appine_hal::CLOCK_BOOTTIME][index];
+        let (now, now_ns) = appine_hal::clock_gettime(clock).map_err(Errno)?;
+        if !(-KTIME_SEC_MAX..=KTIME_SEC_MAX).contains(&sec) {
+            return Err(Errno::ERANGE);
+        }
+        let total = now + sec + (now_ns + nsec) / 1_000_000_000;
+        if !(0..=KTIME_SEC_MAX / 2).contains(&total) {
+            return Err(Errno::ERANGE);
+        }
+    }
+    if ns.frozen.get() {
+        return Err(Errno::EACCES);
+    }
+    let mut all = ns.offsets.get();
+    for (index, value) in offsets {
+        all[index] = value;
+    }
+    ns.offsets.set(all);
     Ok(())
 }
 

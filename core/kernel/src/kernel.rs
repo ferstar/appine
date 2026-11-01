@@ -942,6 +942,11 @@ impl<'a> Cx<'a> {
     }
 
     /// 所在的 UTS、IPC 命名空间。
+    /// 线程所在的 time 命名空间里时钟 `clock` 的偏移（纳秒）。
+    pub fn time_offset(&self, clock: i32) -> i64 {
+        self.task.ns.borrow().time.offset(clock)
+    }
+
     pub fn ns(&self) -> crate::nsproxy::NsProxy {
         self.task.ns.borrow().clone()
     }

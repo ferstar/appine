@@ -7,7 +7,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::misc::deadline_from_clock;
+use super::misc::deadline_in_ns;
 use super::{SysResult, get, put};
 use crate::cell::RefCell;
 use crate::errno::Errno;
@@ -112,7 +112,7 @@ pub(super) fn timerfd_settime(
             CLOCK_BOOTTIME_ALARM => CLOCK_BOOTTIME,
             c => c,
         };
-        Some(deadline_from_clock(clock, value)?)
+        Some(deadline_in_ns(cx, clock, value)?)
     } else {
         Some(Instant::now() + value)
     };

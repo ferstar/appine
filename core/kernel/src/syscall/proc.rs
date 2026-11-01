@@ -41,9 +41,11 @@ const CLONE_NEWUTS: u64 = 0x0400_0000;
 const CLONE_NEWIPC: u64 = 0x0800_0000;
 const CLONE_NEWNET: u64 = 0x4000_0000;
 const CLONE_NEWCGROUP: u64 = 0x0200_0000;
-/// 各种 `CLONE_NEW*`（含 clone3 才能用的 `CLONE_NEWTIME`）：支持挂载、用户、pid、UTS、
-/// IPC、网络、cgroup 命名空间（`syscall::ns`），time 命名空间是 EPERM（设计文档 §6）。
-pub(super) const CLONE_NEW_MASK: u64 = 0x80 | CLONE_NEWNS | 0x7e00_0000;
+/// 在 clone 的退出信号那几位里，只有 unshare、clone3 能用。
+const CLONE_NEWTIME: u64 = 0x80;
+/// 各种 `CLONE_NEW*`：挂载、用户、pid、UTS、IPC、网络、cgroup、time 命名空间
+/// （`syscall::ns`）。
+pub(super) const CLONE_NEW_MASK: u64 = CLONE_NEWTIME | CLONE_NEWNS | 0x7e00_0000;
 /// 支持的 `CLONE_NEW*`。
 const CLONE_NEW_DONE: u64 = CLONE_NEWNS
     | CLONE_NEWUSER
@@ -51,10 +53,16 @@ const CLONE_NEW_DONE: u64 = CLONE_NEWNS
     | CLONE_NEWUTS
     | CLONE_NEWIPC
     | CLONE_NEWNET
-    | CLONE_NEWCGROUP;
+    | CLONE_NEWCGROUP
+    | CLONE_NEWTIME;
 /// 要在新进程的用户命名空间里有 `CAP_SYS_ADMIN` 的 `CLONE_NEW*`（Linux 的 copy_namespaces）。
-const CLONE_NEW_ADMIN: u64 =
-    CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP;
+const CLONE_NEW_ADMIN: u64 = CLONE_NEWNS
+    | CLONE_NEWPID
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWCGROUP
+    | CLONE_NEWTIME;
 /// clone3：子进程的信号处理函数恢复默认。
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// clone3：子进程放进 `cgroup` 指定的 cgroup。
@@ -416,6 +424,16 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     }
     if flags & CLONE_NEWCGROUP != 0 {
         ns.cgroup = super::ns::new_cgroup_ns(child_cred_owner.clone());
+    }
+    // time 命名空间（Linux 6.2 起的 copy_namespaces、timens_on_fork）：clone3 的 CLONE_NEWTIME
+    // 新建给子进程用的那个；不共用地址空间的子进程进给子进程用的那个，偏移从此不能再改；
+    // 线程、vfork 留在父线程的里，execve 换了地址空间时再进（6.1 是 EINVAL，见设计文档 §7.5）
+    if flags & CLONE_NEWTIME != 0 {
+        ns.time_for_children = ns.time_for_children.copy(child_cred_owner.clone());
+    }
+    if flags & CLONE_VM == 0 && ns.time.id != ns.time_for_children.id {
+        ns.time = ns.time_for_children.clone();
+        ns.time.frozen.set(true);
     }
     let task = Task::new(
         tid,
@@ -857,6 +875,17 @@ fn exec(
 
     // 从这里开始不能失败：结束同一线程组里的其他线程，然后换掉地址空间
     kill_other_threads(cx)?;
+    // 换了地址空间：unshare 过 CLONE_NEWTIME 的话进给子进程用的那个（Linux 6.2 起的
+    // exec_task_namespaces），偏移从此不能再改
+    {
+        let mut p = cx.task.ns.borrow_mut();
+        if p.time.id != p.time_for_children.id {
+            p.time = p.time_for_children.clone();
+            p.time.frozen.set(true);
+            drop(p);
+            cx.shared.fast_changed();
+        }
+    }
     if Rc::strong_count(&cx.t.fds) > 1 {
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
@@ -1542,10 +1571,13 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         cx.ipc_mut().exit(tgid);
     }
     // 新的 UTS 命名空间复制原来的名字，新的 IPC 命名空间是空的，新的网络命名空间里只有
-    // 关着的 lo
-    if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP) != 0 {
+    // 关着的 lo；新的 time 命名空间只给以后的子进程用，偏移照抄原来给子进程用的那个
+    if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME) != 0 {
         let owner = new_cred.user_ns.clone();
         let mut ns = cx.ns();
+        if flags & CLONE_NEWTIME != 0 {
+            ns.time_for_children = ns.time_for_children.copy(owner.clone());
+        }
         if flags & CLONE_NEWCGROUP != 0 {
             ns.cgroup = super::ns::new_cgroup_ns(owner.clone());
         }

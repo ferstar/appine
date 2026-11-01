@@ -65,6 +65,9 @@ pub(crate) struct Fast {
     shared_files: Arc<RwLock<Vec<(u64, u64)>>>,
     /// vDSO 映射的地址（换地址空间的 execve 让 [`Shared::fast_epoch`] 变了）。
     vdso: u64,
+    /// 所在的 time 命名空间的偏移（纳秒）：单调时钟的、boottime 的。setns 换命名空间时
+    /// [`Shared::fast_changed`]，有进程进来之后偏移不再变。
+    time: [i64; 2],
 }
 
 struct Paths {
@@ -102,6 +105,7 @@ impl Fast {
             cpu_clock: task.clock.get().map(|c| (c, task.cpu_base.get().0)),
             shared_files: t.mm.borrow().shared_files(),
             vdso: t.mm.borrow().vdso,
+            time: task.ns.borrow().time.offsets_ns(),
         }
     }
 
@@ -152,9 +156,12 @@ impl Fast {
         let s = cpu.state();
         let a = [s.x[0], s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]];
         match s.x[8] {
-            98 if !self.in_shared_file(a[0]) => futex(shared, task, cpu, &a),
+            98 if !self.in_shared_file(a[0]) => futex(shared, task, cpu, &a, self.time[0]),
             101 => nanosleep(task, cpu, a[0]),
-            115 => clock_nanosleep(task, cpu, a[0] as i32, a[1] as u32, a[2]),
+            115 => {
+                let clock = a[0] as i32;
+                clock_nanosleep(task, cpu, (clock, self.offset(clock)), a[1] as u32, a[2])
+            }
             113 => self.clock_gettime(cpu, a[0] as i32, a[1]),
             114 => clock_getres(cpu, a[0] as i32, a[1]),
             169 => gettimeofday(cpu, a[0], a[1]),
@@ -180,12 +187,21 @@ impl Fast {
             let ns = (sec as u64 * 1_000_000_000 + nsec as u64).saturating_sub(base);
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         } else if host_clock(clock) {
-            appine_hal::clock_gettime(clock).ok()?
+            super::misc::add_offset(appine_hal::clock_gettime(clock).ok()?, self.offset(clock))
         } else {
             return None;
         };
         write(cpu, tp, &pair(sec, nsec))?;
         Some(Ok(0))
+    }
+
+    /// time 命名空间里时钟 `clock` 的偏移（[`crate::nsproxy::TimeNs::offset`]）。
+    fn offset(&self, clock: i32) -> i64 {
+        match clock {
+            1 | 4 | 6 => self.time[0],
+            7 | 9 => self.time[1],
+            _ => 0,
+        }
     }
 
     /// `addr` 在可以写的共享文件映射里。
@@ -252,7 +268,14 @@ const TIMER_ABSTIME: u32 = 1;
 
 /// `misc::futex` 的等待和唤醒，`a` 是 syscall 的参数。超时在 FUTEX_WAIT 里是相对的，在
 /// WAIT_BITSET 里是绝对的。
-fn futex(shared: &Shared, task: &Task, cpu: &Cpu, a: &[u64; 6]) -> Option<SysResult> {
+/// `monotonic` 是 time 命名空间里单调时钟的偏移（WAIT_BITSET 的绝对超时按它换算）。
+fn futex(
+    shared: &Shared,
+    task: &Task,
+    cpu: &Cpu,
+    a: &[u64; 6],
+    monotonic: i64,
+) -> Option<SysResult> {
     let (uaddr, op, val, timeout, val3) = (a[0], a[1] as u32, a[2] as u32, a[3], a[5] as u32);
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     let bitset = match cmd {
@@ -279,11 +302,12 @@ fn futex(shared: &Shared, task: &Task, cpu: &Cpu, a: &[u64; 6]) -> Option<SysRes
             Some(if cmd == FUTEX_WAIT {
                 Instant::now() + t
             } else {
-                let clock = if op & FUTEX_CLOCK_REALTIME != 0 {
-                    CLOCK_REALTIME
+                let (clock, offset) = if op & FUTEX_CLOCK_REALTIME != 0 {
+                    (CLOCK_REALTIME, 0)
                 } else {
-                    CLOCK_MONOTONIC
+                    (CLOCK_MONOTONIC, monotonic)
                 };
+                let t = super::misc::to_host_clock(offset, t);
                 super::misc::deadline_from_clock(clock, t).ok()?
             })
         }
@@ -314,8 +338,15 @@ fn nanosleep(task: &Task, cpu: &Cpu, req: u64) -> Option<SysResult> {
     sleep_until(task, deadline, true)
 }
 
-/// `misc::clock_nanosleep` 里墙上时钟、单调时钟和启动以来的时钟。
-fn clock_nanosleep(task: &Task, cpu: &Cpu, clock: i32, flags: u32, req: u64) -> Option<SysResult> {
+/// `misc::clock_nanosleep` 里墙上时钟、单调时钟和启动以来的时钟。`offset` 是 time 命名空间
+/// 里这个时钟的偏移（绝对时刻按它换算）。
+fn clock_nanosleep(
+    task: &Task,
+    cpu: &Cpu,
+    (clock, offset): (i32, i64),
+    flags: u32,
+    req: u64,
+) -> Option<SysResult> {
     if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME)
         || flags & !TIMER_ABSTIME != 0
     {
@@ -326,6 +357,7 @@ fn clock_nanosleep(task: &Task, cpu: &Cpu, clock: i32, flags: u32, req: u64) -> 
         return sleep_until(task, Instant::now() + t, true);
     }
     // 绝对时刻：持锁的路径按同样的参数重新换算，就是接着睡
+    let t = super::misc::to_host_clock(offset, t);
     let deadline = super::misc::deadline_from_clock(clock, t).ok()?;
     sleep_until(task, deadline, false)
 }

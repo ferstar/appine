@@ -18,7 +18,7 @@
 
 **推迟项**：
 
-- 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。 → 用户命名空间已补上（M9 之前：用户命名空间），pid 命名空间也补上了（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间），cgroup 命名空间也补上了（M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱）；time 仍没有
+- 用户、pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起），`/proc/<pid>/ns` 里它们总是开机时的那个。 → 用户命名空间已补上（M9 之前：用户命名空间），pid 命名空间也补上了（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间），cgroup 命名空间也补上了（M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱）；time 仍没有；time 命名空间也补上了（M9 之前：time 命名空间）
 - 打开着的命名空间文件、bind 挂载出去的命名空间文件不让命名空间活着：用它的进程都退出之后就卸下了，之后对那个 fd setns 是 EINVAL。→ 已补上（M9 之前：命名空间文件留住命名空间）
 - 命名空间文件的 `NS_GET_USERNS`、`NS_GET_PARENT`、`NS_GET_NSTYPE`、`NS_GET_OWNER_UID` 这些 ioctl 没有（ENOTTY）；setns 不接受 pidfd。→ 这四个 ioctl 已补上（M9 之前：命名空间文件留住命名空间）；setns 接受 pidfd 也补上了（M9 之前：setns 经由 pidfd）
 - `/proc/<pid>/ns/*`、`root`、`cwd` 跟随时不检查能不能跟踪那个进程（Linux 要 `PTRACE_MODE_READ_FSCREDS`）；`/proc/<pid>/exe` 仍按读出来的文字跟随。→ `ns/*`、`root`、`cwd` 的检查已补上，跟随和读链接时都查（M9 之前：用户命名空间）；`exe` 仍按读出来的文字跟随，读链接、跟随时也不查（Linux 的 `proc_pid_get_link` 对它同样要求 `PTRACE_MODE_READ_FSCREDS`）；`exe` 的检查后来也补上了（M9 之前：/proc/<pid>/exe 的跟踪权限），跟随后来也改成直接到程序文件本身（M9 之前：/proc/<pid>/exe 指向程序文件本身）

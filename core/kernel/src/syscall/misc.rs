@@ -81,6 +81,30 @@ pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, 
     })
 }
 
+/// time 命名空间里时钟 `clock` 上的绝对时刻 `abs` 换成等待的截止时刻：先减去偏移
+/// （Linux 的 `timens_ktime_to_host`，早于偏移的当作已经过去），再按宿主的时钟算。
+pub(super) fn deadline_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<Instant, Errno> {
+    deadline_from_clock(clock, to_host_clock(cx.time_offset(clock), abs))
+}
+
+/// 加上偏移 `offset` 的时刻 `abs` 在宿主时钟上是多少：减去偏移，不早于 0。
+pub(super) fn to_host_clock(offset: i64, abs: Duration) -> Duration {
+    let ns = abs.as_nanos() as i128 - offset as i128;
+    Duration::from_nanos(ns.clamp(0, u64::MAX as i128) as u64)
+}
+
+/// 宿主时钟的读数 (秒, 纳秒) 加上 time 命名空间的偏移 `offset`（纳秒）。
+pub(super) fn add_offset((sec, nsec): (i64, i64), offset: i64) -> (i64, i64) {
+    if offset == 0 {
+        return (sec, nsec);
+    }
+    let ns = sec as i128 * 1_000_000_000 + nsec as i128 + offset as i128;
+    (
+        ns.div_euclid(1_000_000_000) as i64,
+        ns.rem_euclid(1_000_000_000) as i64,
+    )
+}
+
 /// futex 的键：翻译后的宿主地址。
 fn futex_key(cx: &Cx<'_>, uaddr: u64) -> Result<Key, Errno> {
     if !uaddr.is_multiple_of(4) {
@@ -118,7 +142,7 @@ pub(super) fn futex(
                         } else {
                             CLOCK_MONOTONIC
                         };
-                        deadline_from_clock(clock, t)?
+                        deadline_in_ns(cx, clock, t)?
                     })
                 }
             };
@@ -205,7 +229,7 @@ pub(super) fn futex_waitv(
     let deadline = match timeout {
         0 => None,
         _ if clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME => return Err(Errno::EINVAL),
-        addr => Some(deadline_from_clock(clock, read_timespec(cx, addr)?)?),
+        addr => Some(deadline_in_ns(cx, clock, read_timespec(cx, addr)?)?),
     };
     // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 __reserved; }
     let mut keys = Vec::with_capacity(nr as usize);
@@ -431,7 +455,7 @@ pub(super) fn clock_nanosleep(
         return sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem);
     }
     // 绝对时刻：重新执行同样的参数就是接着睡
-    match sleep_until(cx, deadline_from_clock(clock, t)?) {
+    match sleep_until(cx, deadline_in_ns(cx, clock, t)?) {
         Ok(()) => Ok(0),
         Err(_) => Err(Errno::ERESTARTNOHAND),
     }
@@ -476,7 +500,11 @@ pub(super) fn clock_gettime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
             let ns = ns?;
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
-        None => appine_hal::clock_gettime(clock).map_err(Errno)?,
+        // 单调时钟、boottime 加上 time 命名空间的偏移
+        None => add_offset(
+            appine_hal::clock_gettime(clock).map_err(Errno)?,
+            cx.time_offset(clock),
+        ),
     };
     write_pair(cx, tp, sec, nsec).map(|()| 0)
 }
@@ -1103,6 +1131,8 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
 pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     // 与 Linux 的 do_sysinfo 一样有零头就进一秒
     let (secs, ns) = appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME).map_err(Errno)?;
+    // 加上 time 命名空间里 boottime 的偏移（Linux 的 timens_add_boottime）
+    let (secs, ns) = add_offset((secs, ns), cx.time_offset(appine_hal::CLOCK_BOOTTIME));
     let uptime = secs + i64::from(ns != 0);
     let m = appine_hal::host_meminfo();
     let procs = cx.kr().tasks.len().min(u16::MAX as usize) as u16;
@@ -1203,4 +1233,27 @@ pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> Sy
         done += n;
     }
     Ok(done as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// time 命名空间的换算：读数加上偏移（借位、负的偏移），绝对时刻减去偏移、不早于 0。
+    #[test]
+    fn time_namespace_conversions() {
+        assert_eq!(
+            add_offset((10, 900_000_000), 200_000_000),
+            (11, 100_000_000)
+        );
+        assert_eq!(
+            add_offset((10, 100_000_000), -200_000_000),
+            (9, 900_000_000)
+        );
+        assert_eq!(add_offset((10, 5), 0), (10, 5));
+        let s = Duration::from_secs;
+        assert_eq!(to_host_clock(86_400_000_000_000, s(86_410)), s(10));
+        assert_eq!(to_host_clock(86_400_000_000_000, s(5)), Duration::ZERO);
+        assert_eq!(to_host_clock(-1_000_000_000, s(5)), s(6));
+    }
 }

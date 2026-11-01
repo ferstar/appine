@@ -31,5 +31,5 @@
 **推迟项**：
 
 - 没有 `mount_too_revealing`（[用户命名空间](119-user-namespaces.md)的推迟项）：appine 的 procfs 上本来没有盖住的路径，看不出区别。
-- 没有 time 命名空间（`CLONE_NEWTIME` 仍是 EPERM），bwrap、Codex、Claude Code 都不用。
+- 没有 time 命名空间（`CLONE_NEWTIME` 仍是 EPERM），bwrap、Codex、Claude Code 都不用。 → 已补上（M9 之前：time 命名空间）：dockerd 看到 `/proc/self/ns/time` 就让 runc 建一个
 - Claude Code 沙箱里的网络代理、Codex `-s workspace-write` 下写工作目录以外这些关不关得住，只在 `codex sandbox` 里手工试过，普查的 8 步里没有。

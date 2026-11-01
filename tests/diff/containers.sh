@@ -1,7 +1,8 @@
-# docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
+# docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add SYS_TIME --security-opt apparmor=unconfined
 # 容器运行时（podman、crun、docker、runc）用到的内核接口（docs/rounds/157-container-survey.md
 # 起）：capget 探测版本、开机时的命名空间里拉起已经起着的 lo、合成文件系统根目录的 inode
-# 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统；经由 fd 执行 memfd 和已经删除的文件
+# 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统；经由 fd 执行 memfd 和已经删除的文件；
+# time 命名空间（原生一侧要 CAP_SYS_TIME 才能写 timens_offsets，用例不改宿主的时间）
 set -e
 cd /tmp
 
@@ -556,3 +557,223 @@ int main(void)
 }
 C
 gcc -D_GNU_SOURCE -o fdexec fdexec.c && ./fdexec
+
+# time 命名空间（dockerd 看到 /proc/self/ns/time 就让 runc 建一个）：unshare(CLONE_NEWTIME)
+# 只建给子进程用的那个，偏移照抄、经由 /proc/<pid>/timens_offsets 设置，fork 出来的子进程
+# 进去之后不能再改；子进程看到的单调时钟、boottime、/proc/uptime、sysinfo、启动时间都加上
+# 偏移，绝对时刻的等待按偏移换算；setns 进去；线程、vfork 留在原来的里，execve 之后进新的
+# （Linux 6.2 起）。只比是否相差偏移、是否同一个命名空间，不比具体的时刻
+cat > timens.c <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysinfo.h>
+#include <sys/timerfd.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x80
+#endif
+
+static double now(clockid_t c)
+{
+    struct timespec t;
+    clock_gettime(c, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static double uptime(void)
+{
+    double u = 0;
+    FILE *f = fopen("/proc/uptime", "r");
+    fscanf(f, "%lf", &u);
+    fclose(f);
+    return u;
+}
+
+static ino_t ns_ino(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_ino : 0;
+}
+
+static void offsets(const char *what)
+{
+    char buf[256] = "";
+    int fd = open("/proc/self/timens_offsets", O_RDONLY);
+    int n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    printf("%s:\n%.*s", what, n > 0 ? n : 0, buf);
+}
+
+static void set(const char *what, const char *text)
+{
+    int fd = open("/proc/self/timens_offsets", O_WRONLY);
+    int n = write(fd, text, strlen(text));
+    printf("%-28s %s\n", what, n < 0 ? strerror(errno) : "ok");
+    close(fd);
+}
+
+static int near(double a, double b) { return a - b < 1.0 && b - a < 1.0; }
+
+static void *thread(void *arg)
+{
+    printf("thread stays in the old ns: %d\n", ns_ino("/proc/thread-self/ns/time") == *(ino_t *)arg);
+    return NULL;
+}
+
+static int gate[2];
+
+static void *blocked(void *arg)
+{
+    char x;
+    read(gate[0], &x, 1);
+    return arg;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 3) {
+        // execve 之后的 vfork 子进程：进了给子进程用的那个
+        printf("after execve in the new ns: %d\n", ns_ino("/proc/self/ns/time") == (ino_t)atoll(argv[2]));
+        return 0;
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    ino_t old = ns_ino("/proc/self/ns/time");
+    printf("same at start: %d\n", old == ns_ino("/proc/self/ns/time_for_children"));
+    offsets("init offsets");
+    printf("unshare: %s\n", unshare(CLONE_NEWTIME) ? strerror(errno) : "ok");
+    ino_t fresh = ns_ino("/proc/self/ns/time_for_children");
+    printf("self unchanged: %d, for children new: %d\n", ns_ino("/proc/self/ns/time") == old, fresh != old);
+    offsets("copied offsets");
+    set("bad clock", "realtime 1 0\n");
+    set("bad nsec", "monotonic 1 1000000000\n");
+    set("missing field", "monotonic 1\n");
+    set("before boot", "boottime -100000000 0\n");
+    set("set", "monotonic 86400 0\nboottime 3600 500000000\n");
+    offsets("new offsets");
+    set("one line", "7 3600 500000000");
+    offsets("after one line");
+
+    // nobody 没有 CAP_SYS_TIME
+    pid_t c = fork();
+    if (c == 0) {
+        setuid(65534);
+        set("nobody writes", "monotonic 1 0\n");
+        _exit(0);
+    }
+    waitpid(c, NULL, 0);
+
+    double m0 = now(CLOCK_MONOTONIC), b0 = now(CLOCK_BOOTTIME), r0 = now(CLOCK_REALTIME), u0 = uptime();
+    struct sysinfo si0;
+    sysinfo(&si0);
+    int ready[2];
+    pipe(ready);
+    c = fork();
+    if (c == 0) {
+        printf("child in the new ns: %d\n", ns_ino("/proc/self/ns/time") == fresh);
+        printf("monotonic +86400: %d\n", near(now(CLOCK_MONOTONIC) - m0, 86400));
+        printf("monotonic raw, coarse +86400: %d %d\n", near(now(CLOCK_MONOTONIC_RAW) - m0, 86400),
+               near(now(CLOCK_MONOTONIC_COARSE) - m0, 86400));
+        printf("boottime +3600.5: %d\n", near(now(CLOCK_BOOTTIME) - b0, 3600.5));
+        printf("realtime unchanged: %d\n", near(now(CLOCK_REALTIME), r0));
+        printf("uptime +3600.5: %d\n", near(uptime() - u0, 3600.5));
+        struct sysinfo si;
+        sysinfo(&si);
+        printf("sysinfo uptime +3600: %d\n", si.uptime - si0.uptime >= 3600 && si.uptime - si0.uptime <= 3602);
+        // 启动时间（时钟滴答）也按 boottime 的偏移
+        unsigned long long start = 0;
+        FILE *f = fopen("/proc/self/stat", "r");
+        fscanf(f, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &start);
+        fclose(f);
+        printf("start time near uptime: %d\n", near(start / (double)sysconf(_SC_CLK_TCK), uptime()));
+        // 绝对时刻的等待按偏移换算，不会多等一天
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        t.tv_nsec += 100000000;
+        if (t.tv_nsec >= 1000000000) {
+            t.tv_sec++;
+            t.tv_nsec -= 1000000000;
+        }
+        double s = now(CLOCK_REALTIME);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+        printf("clock_nanosleep abs: %d\n", now(CLOCK_REALTIME) - s < 2);
+        int tfd = timerfd_create(CLOCK_BOOTTIME, 0);
+        struct itimerspec its = {0};
+        clock_gettime(CLOCK_BOOTTIME, &its.it_value);
+        its.it_value.tv_sec += 1;
+        timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL);
+        unsigned long long n;
+        s = now(CLOCK_REALTIME);
+        read(tfd, &n, sizeof n);
+        printf("timerfd abs: %d\n", now(CLOCK_REALTIME) - s < 3);
+        timer_t tm;
+        struct sigevent ev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        timer_create(CLOCK_MONOTONIC, &ev, &tm);
+        clock_gettime(CLOCK_MONOTONIC, &its.it_value);
+        its.it_value.tv_sec += 1;
+        timer_settime(tm, TIMER_ABSTIME, &its, NULL);
+        s = now(CLOCK_REALTIME);
+        int sig;
+        sigwait(&set, &sig);
+        printf("timer_settime abs: %d\n", now(CLOCK_REALTIME) - s < 3);
+        int word = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        t.tv_sec += 1;
+        s = now(CLOCK_REALTIME);
+        long r = syscall(SYS_futex, &word, 9 /* FUTEX_WAIT_BITSET */ | 128, 0, &t, NULL, ~0u);
+        printf("futex abs: %s %d\n", r ? strerror(errno) : "woken", now(CLOCK_REALTIME) - s < 3);
+        char x = 1;
+        write(ready[1], &x, 1);
+        pause();
+        _exit(0);
+    }
+    char x;
+    read(ready[0], &x, 1);
+    set("after a child entered", "monotonic 1 0\n");
+    printf("parent unchanged: %d\n", now(CLOCK_MONOTONIC) - m0 < 60);
+
+    // 线程留在原来的里；vfork 的子进程 execve 之后才进新的
+    pthread_t th;
+    pthread_create(&th, NULL, thread, &old);
+    pthread_join(th, NULL);
+    char arg[32];
+    snprintf(arg, sizeof arg, "%llu", (unsigned long long)fresh);
+    pid_t v = vfork();
+    if (v == 0) {
+        execl("/proc/self/exe", "timens", "show", arg, (char *)NULL);
+        _exit(1);
+    }
+    waitpid(v, NULL, 0);
+
+    // setns 进子进程所在的
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/ns/time", c);
+    int nsfd = open(path, O_RDONLY);
+    pipe(gate);
+    pthread_create(&th, NULL, blocked, NULL);
+    printf("setns while threaded: %s\n", setns(nsfd, CLONE_NEWTIME) ? strerror(errno) : "ok");
+    write(gate[1], "x", 1);
+    pthread_join(th, NULL);
+    printf("setns: %s\n", setns(nsfd, CLONE_NEWTIME) ? strerror(errno) : "ok");
+    printf("now in it: %d %d\n", ns_ino("/proc/self/ns/time") == fresh, ns_ino("/proc/self/ns/time_for_children") == fresh);
+    printf("monotonic after setns +86400: %d\n", near(now(CLOCK_MONOTONIC) - m0, 86400) || now(CLOCK_MONOTONIC) - m0 > 86400);
+    kill(c, SIGKILL);
+    waitpid(c, NULL, 0);
+    return 0;
+}
+C
+gcc -D_GNU_SOURCE -pthread -o timens timens.c && ./timens
