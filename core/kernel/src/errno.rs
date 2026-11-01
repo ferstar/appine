@@ -87,6 +87,8 @@ impl Errno {
     pub const ELOOP: Errno = Errno(40);
     /// 值溢出。
     pub const EOVERFLOW: Errno = Errno(75);
+    /// fd 的状态不对（bpf(2) 取信息时 fd 不存在）。
+    pub const EBADFD: Errno = Errno(77);
     /// 用户太多（多线程的进程 setns 进 time 命名空间）。
     pub const EUSERS: Errno = Errno(87);
     /// 不是 socket。

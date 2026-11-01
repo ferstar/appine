@@ -120,7 +120,9 @@ pub enum FileKind {
     MessageQueue(Rc<RefCell<crate::syscall::MessageQueue>>),
     /// seccomp 的通知 fd（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）。
     SeccompNotify(crate::seccomp::Listener),
-    /// procfs 的文件：打开时生成的内容。
+    /// eBPF 程序（[`crate::bpf`]）。
+    Bpf(std::rc::Rc<crate::bpf::Prog>),
+    /// procfs、sysfs、cgroup2 的文件：打开时生成的内容，从偏移 0 再读时重新生成。
     Proc {
         /// 经由的挂载。
         mnt: crate::vfs::MountId,
@@ -128,6 +130,8 @@ pub enum FileKind {
         node: PseudoNode,
         /// 内容。
         data: Vec<u8>,
+        /// `data` 是打开时刚生成的，还没有读过、写过：第一次从 0 读时不用再生成。
+        fresh: bool,
         /// `/proc/<pid>/mem`：打开时那个进程的地址空间。与 Linux 一样，进程 execve 之后
         /// 读写的仍是它（已经释放时读到 EOF），不是新程序的。
         mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
@@ -237,6 +241,7 @@ impl OpenFile {
             | FileKind::Inotify(_)
             | FileKind::Pidfd(_)
             | FileKind::SeccompNotify(_)
+            | FileKind::Bpf(_)
             | FileKind::MessageQueue(_) => None,
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
                 Some(Node::Store(self.mnt, *ino))

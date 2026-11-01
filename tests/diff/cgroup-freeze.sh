@@ -169,6 +169,17 @@ int main(void)
     show("cgroup.events");
     put("f/cgroup.freeze", "0");
     show("f/cgroup.events");
+    // runc 的读法：读写方式打开，写进去，seek 回 0 读回来确认（seq_file 从 0 读时重新生成）
+    int ff = open(CG "f/cgroup.freeze", O_RDWR);
+    char fb[4] = "";
+    write(ff, "1", 1);
+    lseek(ff, 0, SEEK_SET);
+    read(ff, fb, 2);
+    printf("read back after writing 1: %c\n", fb[0]);
+    write(ff, "0", 1);
+    pread(ff, fb, 2, 0);
+    printf("pread back after writing 0: %c\n", fb[0]);
+    close(ff);
 
     pipe(data);
     int r1, r2, r3, r4, r5;

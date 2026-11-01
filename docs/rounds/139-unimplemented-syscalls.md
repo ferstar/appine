@@ -45,7 +45,7 @@ Linux 6.1 上一般都有，appine 是 ENOSYS：
 | 224、225 | swapon、swapoff | 交换区（`CONFIG_SWAP`），guest 的内存由宿主管 |
 | 237–239、450 | set_mempolicy、migrate_pages、move_pages、set_mempolicy_home_node | NUMA（`CONFIG_NUMA`），同一组的 mbind、get_mempolicy 以前记过 |
 | 241 | perf_event_open | 性能计数器（`CONFIG_PERF_EVENTS`），硬件计数器在宿主上 |
-| 280 | bpf | eBPF（`CONFIG_BPF_SYSCALL`） |
+| 280 | bpf | eBPF（`CONFIG_BPF_SYSCALL`）→ 有了 cgroup 设备过滤的子集（M9 之前：cgroup 的设备过滤（eBPF）） |
 | 282 | userfaultfd | `CONFIG_USERFAULTFD`，[M6](08-m6.md) 的 LTP 失败里提过 |
 | 288–290 | pkey_mprotect、pkey_alloc、pkey_free | arm64 的 6.1 没有内存保护键，原生（6.8）也是 ENOSYS |
 | 447 | memfd_secret | `CONFIG_SECRETMEM` |

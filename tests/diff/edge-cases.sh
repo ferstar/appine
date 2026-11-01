@@ -17,6 +17,7 @@ cat > edges.c <<'C'
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -135,6 +136,23 @@ int main(void)
     munmap(reserve, 1L << 33);
     probe("unmapped", mid);
     printf("\n");
+
+    /* procfs 的文件从偏移 0 再读时是现在的内容（seq_file）：改名之后 seek 回 0、pread 0 */
+    {
+        int st = open("/proc/self/status", O_RDONLY);
+        char sb[64] = "";
+        read(st, sb, sizeof sb - 1);
+        prctl(PR_SET_NAME, "renamed");
+        lseek(st, 0, SEEK_SET);
+        memset(sb, 0, sizeof sb);
+        read(st, sb, sizeof sb - 1);
+        printf("status after seek: %.*s\n", (int)strcspn(sb, "\n"), sb);
+        prctl(PR_SET_NAME, "again");
+        memset(sb, 0, sizeof sb);
+        pread(st, sb, sizeof sb - 1, 0);
+        printf("status by pread: %.*s\n", (int)strcspn(sb, "\n"), sb);
+        close(st);
+    }
 
     /* 停止又继续：nanosleep 接着睡剩下的时间，而不是重新睡满 */
     int pipefd[2];

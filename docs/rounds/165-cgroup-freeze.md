@@ -1,6 +1,6 @@
 # M9 之前：cgroup.freeze（2026-11-01）
 
-← [M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）](164-cgroup-limits.md) · [索引](../milestones.md)
+← [M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）](164-cgroup-limits.md) · [索引](../milestones.md) · [M9 之前：cgroup 的设备过滤（eBPF）（2026-11-01）](166-bpf-devices.md) →
 
 [podman 和 docker 的普查](157-container-survey.md)的问题 9 的第二步的后一半：`docker pause`、`podman pause`、runc/crun 的 `pause` 写 `cgroup.freeze`，systemd 冻结单元也用它。[cgroup 树](163-cgroup-tree.md)里写 1 是 EOPNOTSUPP。照 Linux 6.1 的 `kernel/cgroup/freezer.c`：冻结不是停止信号，父进程、wait 看不到，等待中的系统调用解冻后接着做。
 
@@ -20,7 +20,7 @@
 - `edge-cases` 组新增：停止又继续之后 poll（600 毫秒）按原来的到期时刻返回，epoll_wait 提前返回 EINTR，futex 等待（600 毫秒）按原来的到期时刻超时；有超时的 futex 等待被带 SA_RESTART 的处理函数打断是 EINTR。改之前 appine 在 epoll_wait、poll、futex 三处都与原生不同（epoll_wait 超时返回 0，poll、futex 从头再等）。
 - 两个执行层下都与原生逐字相同。变异检查：投递信号前不为冻结停下，`cgroup-freeze` 从冻结起大段不同（线程状态是 R、管道里的数据被读走、迁移进来的子进程跑完了）。
 - cargo test（297 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过，与上一轮逐项相同（epoll_wait、poll、futex 的用例照旧通过）。
-- 在 appine 里实际跑 `docker pause`、`podman pause` 要等容器起得来（下一步：eBPF 的设备过滤）。
+- 在 appine 里实际跑 `docker pause`、`podman pause` 要等容器起得来（下一步：eBPF 的设备过滤）。→ 起得来之后 `docker pause` 先撞上伪文件读不到写过的值，改了之后正常（M9 之前：cgroup 的设备过滤（eBPF））
 
 **推迟项**：
 

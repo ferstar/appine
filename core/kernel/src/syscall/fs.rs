@@ -511,7 +511,8 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::SignalFd(_)
         | FileKind::Inotify(_)
         | FileKind::Pidfd(_)
-        | FileKind::SeccompNotify(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        | FileKind::SeccompNotify(_)
+        | FileKind::Bpf(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
         // 设备号是队列所在的 IPC 命名空间的 mqueue 文件系统的
         FileKind::MessageQueue(q) => {
             let q = q.borrow();
@@ -1062,6 +1063,18 @@ pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
     })
 }
 
+/// 访问权限（`MAY_*`）换成设备过滤的访问（`BPF_DEVCG_ACC_*`）。
+fn device_access(mask: u32) -> u32 {
+    let mut access = 0;
+    if mask & MAY_WRITE != 0 {
+        access |= crate::bpf::ACC_WRITE;
+    }
+    if mask & MAY_READ != 0 {
+        access |= crate::bpf::ACC_READ;
+    }
+    access
+}
+
 /// open 要求的访问权限（`MAY_*`）。
 fn open_mask(flags: u32) -> u32 {
     match flags & oflags::O_ACCMODE {
@@ -1108,6 +1121,10 @@ fn open_store(
             _ => {}
         }
         cred.permission(&st, mask)?;
+        // 设备节点再过 cgroup 的设备过滤（Linux 的 devcgroup_inode_permission）
+        if matches!(st.kind(), mode::S_IFCHR | mode::S_IFBLK) && st.rdev != 0 {
+            super::bpf::check_device(cx, st.kind(), st.rdev, device_access(mask))?;
+        }
         if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
             return Err(Errno::EPERM);
         }
@@ -1301,6 +1318,15 @@ fn open_pseudo(
     {
         return Err(Errno::EACCES);
     }
+    // devpts 的终端也过 cgroup 的设备过滤
+    let rdev = match node {
+        PseudoNode::Pts(n) => Some(rdev(PTS_MAJOR + (n >> 8), n & 0xff)),
+        PseudoNode::PtsPtmx => Some(PTMX_RDEV),
+        _ => None,
+    };
+    if let Some(r) = rdev {
+        super::bpf::check_device(cx, mode::S_IFCHR, r, device_access(open_mask(flags)))?;
+    }
     match node {
         PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
         PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), cred.fsuid),
@@ -1367,6 +1393,7 @@ fn open_pseudo(
         mnt,
         node,
         data,
+        fresh: true,
         mm,
         ns,
         klog,
@@ -2492,8 +2519,13 @@ pub(super) fn mknodat(
     let cred = cx.cred();
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
-    if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !cred.capable(cap::MKNOD) {
-        return Err(Errno::EPERM);
+    // whiteout（字符设备 0:0）不要 CAP_MKNOD，也不过设备过滤（Linux 的 vfs_mknod）
+    let whiteout = kind == mode::S_IFCHR && dev & 0xffff_ffff == 0;
+    if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !whiteout {
+        if !cred.capable(cap::MKNOD) {
+            return Err(Errno::EPERM);
+        }
+        super::bpf::check_device(cx, kind, dev & 0xffff_ffff, crate::bpf::ACC_MKNOD)?;
     }
     let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg & !cx.umask() & 0o7777, false);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
@@ -3663,7 +3695,8 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         | FileKind::SignalFd(_)
         | FileKind::Inotify(_)
         | FileKind::Pidfd(_)
-        | FileKind::SeccompNotify(_) => return Err(Errno::ESPIPE),
+        | FileKind::SeccompNotify(_)
+        | FileKind::Bpf(_) => return Err(Errno::ESPIPE),
         FileKind::Proc { data, .. } => match whence {
             SEEK_SET => 0,
             SEEK_CUR => *pos as i64,
@@ -4268,6 +4301,38 @@ fn unlocked_io(
     r.map_err(Errno)
 }
 
+/// 与 Linux 的 seq_file 一样（`seq_read_iter` 在偏移 0 时从头再来），从偏移 0 读 procfs、
+/// sysfs、cgroup2 的文件时重新生成内容：一直开着、seek 回 0 再读的程序（procps，runc 写了
+/// `cgroup.freeze` 再读回来确认）读到的是现在的。打开时刚生成、还没有读写过的不再生成。
+fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Result<(), Errno> {
+    let (mnt, node) = {
+        let mut f = file.borrow_mut();
+        let pos = offset.unwrap_or(f.pos);
+        match &mut f.kind {
+            FileKind::Proc {
+                mnt,
+                node,
+                fresh,
+                ns: None,
+                klog: None,
+                ..
+            } if pos == 0 && !pseudo::unreadable(node) => {
+                if std::mem::take(fresh) {
+                    return Ok(());
+                }
+                (*mnt, node.clone())
+            }
+            _ => return Ok(()),
+        }
+    };
+    let vfs = cx.vfs()?;
+    let content = pseudo::content(&cx.view(&vfs), mnt, &node)?;
+    if let FileKind::Proc { data, .. } = &mut file.borrow_mut().kind {
+        *data = content;
+    }
+    Ok(())
+}
+
 fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<usize, Errno> {
     let pos = offset.unwrap_or(f.pos);
     let n = match &f.kind {
@@ -4305,7 +4370,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             n
         }
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
-        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::SeccompNotify(_) => {
+        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::SeccompNotify(_) | FileKind::Bpf(_) => {
             return Err(Errno::EINVAL);
         }
         _ => return Err(Errno::EBADF),
@@ -4346,7 +4411,8 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
         FileKind::Epoll(_)
         | FileKind::Pidfd(_)
         | FileKind::MessageQueue(_)
-        | FileKind::SeccompNotify(_) => Err(Errno::EINVAL),
+        | FileKind::SeccompNotify(_)
+        | FileKind::Bpf(_) => Err(Errno::EINVAL),
         _ => Err(Errno::EBADF),
     }
 }
@@ -4406,7 +4472,10 @@ fn read_bytes(
                 Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
                     appine_hal::pread(fd, buf, pos)
                 })?,
-                None => local_read(&mut file.borrow_mut(), buf, offset)?,
+                None => {
+                    refresh_pseudo(cx, file, offset)?;
+                    local_read(&mut file.borrow_mut(), buf, offset)?
+                }
             };
             if n > 0 {
                 inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
@@ -4480,6 +4549,9 @@ fn write_bytes(
                 let tid = cx.tid();
                 pseudo::write(cx.k(), (tid, &cred), (&ns, &pid_ns), &node, data)?;
                 written = pseudo::written(&node, data.len());
+                if let FileKind::Proc { fresh, .. } = &mut file.borrow_mut().kind {
+                    *fresh = false;
+                }
                 // 改了 cgroup 的内存上限：叫醒定时器线程马上量一次
                 if let PseudoNode::Cgroup(_, b"memory.max") = node {
                     cx.k().oom.recheck();

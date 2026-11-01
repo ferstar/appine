@@ -5,6 +5,7 @@
 //! 需要等待的会经由 [`Cx::wait`] 暂时释放它。
 
 mod aio;
+mod bpf;
 mod cred;
 pub(crate) mod fast;
 mod fs;
@@ -508,6 +509,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         278 => misc::getrandom(cx, a[0], a[1] as usize, a[2] as u32),
         283 => misc::membarrier(cx, a[0] as i32, a[1] as u32),
         279 => fs::memfd_create(cx, a[0], a[1] as u32),
+        280 => bpf::bpf(cx, a[0] as i32, a[1], a[2] as u32),
         284 => mem::mlock(cx, a[0], a[1], a[2] as u32, true),
         285 => fs::copy_file_range(
             cx,

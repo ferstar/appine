@@ -1298,6 +1298,7 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
         FileKind::Pidfd(_) => b"anon_inode:[pidfd]".to_vec(),
         FileKind::SeccompNotify(_) => b"anon_inode:seccomp notify".to_vec(),
+        FileKind::Bpf(_) => b"anon_inode:bpf-prog".to_vec(),
         FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
         FileKind::SignalFd(_) => b"anon_inode:[signalfd]".to_vec(),
         FileKind::Host(fd) => std::fs::read_link(format!("/proc/self/fd/{fd}"))

@@ -174,6 +174,7 @@
 | [M9 之前：cgroup 树：建子 cgroup、迁移进程](rounds/163-cgroup-tree.md) | 2026-11-01 | `/sys/fs/cgroup` 可写：mkdir、rmdir 子 cgroup，经由 `cgroup.procs`、`cgroup.threads`、clone3 的 `CLONE_INTO_CGROUP` 迁移进程，`subtree_control` 的规则，`cgroup.kill`，cgroup 命名空间以所在的 cgroup 为根；限制只按格式记下（下一步起作用）；`oom_score_adj` 照 Linux 解析（runc 写的带 NUL）；dockerd 建得了容器的 cgroup |
 | [M9 之前：cgroup 的 pids.max 和 memory.max 起作用](rounds/164-cgroup-limits.md) | 2026-11-01 | fork、建线程按各层的 `pids.max` 检查（EAGAIN，僵尸进程也算）；OOM killer 也量设了 `memory.max` 的 cgroup，超出时在里面挑一个结束（`memory.events` 往上累加、`memory.oom.group` 整组结束、调低上限时马上结束）；量的开销压在 BKL 时间的 5% 以内 |
 | [M9 之前：cgroup.freeze](rounds/165-cgroup-freeze.md) | 2026-11-01 | 冻结的进程在返回 guest 之前停下（与停止信号同一处等待，父进程、wait 看不到），迁移、fork 跟着 cgroup，`cgroup.events` 的 frozen；被打断的系统调用照 Linux 重新执行：epoll_wait 改成 EINTR，ppoll、pselect6 写回剩下的时间，有超时的 futex 等待经由 restart_syscall 保持到期时刻 |
+| [M9 之前：cgroup 的设备过滤（eBPF）](rounds/166-bpf-devices.md) | 2026-11-01 | bpf(2) 的子集：`BPF_PROG_TYPE_CGROUP_DEVICE` 的加载（校验器的错误码与 Linux 相同）、挂到 cgroup、查询、按编号取、取信息，解释执行；打开设备、mknod 时按 cgroup 的有效程序放行；伪文件从偏移 0 再读时重新生成（seq_file）；docker、podman 不用 `--cgroups disabled` 也能跑容器，限制、OOM、pause 都起作用 |
 
 ## 测量条件
 

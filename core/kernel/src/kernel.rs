@@ -206,6 +206,8 @@ pub(crate) struct Kernel {
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
     /// cgroup 树（[`crate::cgroup`]）。
     pub cgroups: crate::cgroup::Cgroups,
+    /// 加载了的 eBPF 程序的编号（[`crate::bpf`]）。
+    pub bpf: crate::bpf::Registry,
     /// 新建的网络命名空间（[`crate::nsproxy::NetNs`]）：分配宿主上的回环地址时避开还在用的。
     net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
     /// AF_UNIX socket 绑定的地址。
@@ -313,6 +315,7 @@ impl Kernel {
             init_ns: init_ns.clone(),
             net_nss: Vec::new(),
             cgroups: Default::default(),
+            bpf: Default::default(),
             ipcs: BTreeMap::from([(
                 init_ns.ipc.id,
                 (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),

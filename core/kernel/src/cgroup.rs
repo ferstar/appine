@@ -135,6 +135,10 @@ pub(crate) struct Cgroup {
     pub mem_peak: Cell<u64>,
     /// `cgroup.freeze`：这个 cgroup 自己要求冻结（祖先的也冻结它，[`Cgroups::freezing`]）。
     pub freeze: bool,
+    /// 挂着的设备过滤程序（[`crate::bpf`]），按挂上的先后。
+    pub device_progs: Vec<Rc<crate::bpf::Prog>>,
+    /// 挂它们时的标志（`BPF_F_ALLOW_OVERRIDE`、`BPF_F_ALLOW_MULTI`）；都取下之后是 0。
+    pub device_flags: u32,
 }
 
 impl Cgroup {
@@ -152,6 +156,8 @@ impl Cgroup {
             mem_events_local: Events::default(),
             mem_peak: Cell::new(0),
             freeze: false,
+            device_progs: Vec::new(),
+            device_flags: 0,
         }
     }
 }
@@ -832,6 +838,39 @@ fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     for t in g.threads.iter().filter_map(|t| k.tasks.get(t)) {
         crate::signal::wake(t);
     }
+}
+
+/// cgroup `id` 里的进程打开设备时要跑的程序（Linux 的 `compute_effective_progs`）：从它
+/// 自己往上，自己的都算；已经有了之后，祖先的只在它带 `BPF_F_ALLOW_MULTI` 挂的时候算。
+pub(crate) fn effective_device_progs(k: &Kernel, id: u64) -> Vec<Rc<crate::bpf::Prog>> {
+    let mut progs: Vec<Rc<crate::bpf::Prog>> = Vec::new();
+    for c in k.cgroups.ancestors(id) {
+        let Some(g) = k.cgroups.get(c) else {
+            continue;
+        };
+        if !progs.is_empty() && g.device_flags & crate::bpf::ALLOW_MULTI == 0 {
+            continue;
+        }
+        progs.extend(g.device_progs.iter().cloned());
+    }
+    progs
+}
+
+/// 能不能在 cgroup `id` 上挂程序（Linux 的 `hierarchy_allows_attach`）：往上找到第一个挂了
+/// 程序的祖先，它带 `ALLOW_MULTI` 或者 `ALLOW_OVERRIDE` 挂的才行。
+pub(crate) fn hierarchy_allows_attach(k: &Kernel, id: u64) -> bool {
+    for c in k.cgroups.ancestors(id).skip(1) {
+        let Some(g) = k.cgroups.get(c) else {
+            continue;
+        };
+        if g.device_flags & crate::bpf::ALLOW_MULTI != 0 {
+            return true;
+        }
+        if !g.device_progs.is_empty() {
+            return g.device_flags & crate::bpf::ALLOW_OVERRIDE != 0;
+        }
+    }
+    true
 }
 
 /// `cgroup.events` 的 frozen：要求冻结，子树里的线程也都停下了（要退出的不算）。空的

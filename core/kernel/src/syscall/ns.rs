@@ -444,6 +444,7 @@ pub(super) fn ioctl(
             mnt,
             node: PseudoNode::NsFile(kind, id),
             data: Vec::new(),
+            fresh: false,
             mm: None,
             ns: Some(related),
             klog: None,

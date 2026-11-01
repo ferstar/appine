@@ -52,6 +52,7 @@ pub(crate) mod cap {
     pub const SETFCAP: u32 = 31;
     pub const MAC_OVERRIDE: u32 = 32;
     pub const SYSLOG: u32 = 34;
+    pub const BPF: u32 = 39;
     pub const CHECKPOINT_RESTORE: u32 = 40;
     /// 最大的能力编号。
     pub const LAST: u32 = CHECKPOINT_RESTORE;
