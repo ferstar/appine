@@ -97,6 +97,13 @@ probe() {
     nsenter -t "$pid" -n nft list ruleset 2>&1 | grep -E 'table|DNAT|SNAT|127\.0\.0\.11' | sed -E 's/(port|sport|dport) [0-9]+/\1 N/g; s/packets [0-9]+ bytes [0-9]+/C/' | tidy | head -12
     step "$1: chains in the outer namespace"
     nft list ruleset 2>&1 | grep -E '^table|chain' | tr -d '{' | tidy | head -24
+    step "$1: isolation between networks"
+    docker network create other >/dev/null
+    docker network create --internal inner >/dev/null
+    ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' named)
+    docker run --rm --network other alpine:3.24 wget -q -T 3 -O - "http://$ip/" 2>&1 | head -1 | sed 's/^/from another network: /; s/([0-9.]*)/(IP)/'
+    docker run --rm --network inner alpine:3.24 sh -c "echo default routes: \$(ip route | grep -c default); wget -q -T 3 -O - http://$ip/ 2>&1 | head -1" | sed 's/^/from an internal network: /; s/([0-9.]*)/(IP)/'
+    docker network rm other inner >/dev/null
     docker rm -f named >/dev/null
     docker network rm mynet >/dev/null
 }

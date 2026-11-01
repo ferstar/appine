@@ -1641,9 +1641,15 @@ pub(crate) struct Packet<'a> {
     pub oif: &'a dyn Fn() -> Vec<u8>,
     /// 钩子：[`HOOK_PRE_ROUTING`] 或者 [`HOOK_LOCAL_OUT`]。
     pub hook: u32,
-    /// 入口接口（PREROUTING 上；OUTPUT 上没有）。
+    /// 入口接口（PREROUTING、INPUT、FORWARD 上；OUTPUT 上没有）。
     pub iif: Option<Iif>,
+    /// 连接跟踪的状态（`NF_CT_STATE_BIT`）：新连接的第一个包是 [`CT_NEW`]，已经收到过对方的
+    /// UDP 回过去的是 [`CT_ESTABLISHED`]。
+    pub ct_state: u32,
 }
+
+pub(crate) const CT_ESTABLISHED: u32 = 2;
+pub(crate) const CT_NEW: u32 = 8;
 
 /// 包进来的接口：编号、名字和它的第一个地址（redirect 换成这个地址，`nf_nat_redirect_ipv4`）。
 #[derive(Debug, Clone, Default)]
@@ -1653,11 +1659,13 @@ pub(crate) struct Iif {
     pub addr: Vec<u8>,
 }
 
-/// nat 链的结果。
+/// nat 链、过滤链的结果。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Accept,
     Drop,
+    /// reject：发起方收到的错误码（ICMP 不可达、TCP RST 换成的）。
+    Reject(i32),
     /// 目的地换成这个地址、端口（`None` 是端口不变）。
     Dnat(Vec<u8>, Option<u16>),
 }
@@ -1685,6 +1693,8 @@ struct Eval<'a> {
     chain: Option<Vec<u8>>,
     mark: u32,
     dnat: Option<(Vec<u8>, Option<u16>)>,
+    /// reject 的错误码（判决同时是 NF_DROP）。
+    reject: Option<i32>,
 }
 
 /// 寄存器在 [`Eval::regs`] 里的位置（`nft_parse_register`）：NFT_REG_1..4 是 16 字节的，
@@ -1767,7 +1777,16 @@ impl Eval<'_> {
         let ok = match name {
             b"counter" | b"log" | b"limit" | b"quota" | b"notrack" | b"dynset" | b"objref"
             | b"last" | b"masq" | b"connlimit" | b"dup" => true,
-            b"reject" | b"queue" => {
+            b"reject" => {
+                self.reject = Some(reject_errno(
+                    u(1),
+                    get(&a, 2).and_then(|c| c.first().copied()).unwrap_or(0),
+                    self.p.dst.len() == 16,
+                ));
+                self.verdict = NF_DROP;
+                true
+            }
+            b"queue" => {
                 self.verdict = NF_DROP;
                 true
             }
@@ -1780,7 +1799,7 @@ impl Eval<'_> {
             b"ct" => match (get(&a, 4), u(2)) {
                 (Some(_), _) => true,
                 // 发出去的都是新连接的第一个包：状态 NEW、方向 ORIGINAL
-                (None, 0) => self.store_u32(u(1), 8),
+                (None, 0) => self.store_u32(u(1), self.p.ct_state),
                 (None, 1) => self.store(u(1), &[0]),
                 (None, 2 | 3) => self.store_u32(u(1), 0),
                 _ => false,
@@ -1956,7 +1975,7 @@ impl Eval<'_> {
             0 => self.store_u32(dreg, (self.nh.len() + self.th.len()) as u32),
             1 => self.store(dreg, if v6 { &[0x86, 0xdd] } else { &[0x08, 0x00] }),
             3 => self.store_u32(dreg, self.mark),
-            // OUTPUT 上没有入口接口、PREROUTING 上没有出口接口：编号 0、名字是空的
+            // OUTPUT 上没有入口接口、PREROUTING 和 INPUT 上没有出口接口：编号 0、名字是空的
             // （nft_meta_store_ifname）
             4 => self.store_u32(dreg, self.p.iif.as_ref().map_or(0, |i| i.index)),
             6 => {
@@ -1970,10 +1989,11 @@ impl Eval<'_> {
                 self.store(dreg, &n)
             }
             7 => {
-                let mut n = if self.p.hook == HOOK_LOCAL_OUT {
-                    (self.p.oif)()
-                } else {
+                // PREROUTING、INPUT 上还没有出口接口
+                let mut n = if matches!(self.p.hook, HOOK_PRE_ROUTING | 1) {
                     Vec::new()
+                } else {
+                    (self.p.oif)()
                 };
                 n.resize(16, 0);
                 self.store(dreg, &n)
@@ -2160,7 +2180,25 @@ impl Eval<'_> {
                 self.verdict = NF_ACCEPT;
                 true
             }
-            b"DROP" | b"REJECT" => {
+            b"DROP" => {
+                self.verdict = NF_DROP;
+                true
+            }
+            b"REJECT" => {
+                // ipt_reject_info：with（ipt_reject_with）；IPv6 的 ip6t_reject_with 不同，按
+                // 端口不可达
+                let with = ne32(info, 0).unwrap_or(3);
+                let e = if v4 {
+                    match with {
+                        0 | 5 => Errno::ENETUNREACH.0,
+                        1 | 6 | 8 => Errno::EHOSTUNREACH.0,
+                        2 => Errno::ENOPROTOOPT.0,
+                        _ => Errno::ECONNREFUSED.0,
+                    }
+                } else {
+                    Errno::ECONNREFUSED.0
+                };
+                self.reject = Some(e);
                 self.verdict = NF_DROP;
                 true
             }
@@ -2184,6 +2222,27 @@ impl Eval<'_> {
         };
         match name {
             b"comment" => true,
+            // 连接跟踪的状态：xt_conntrack_mtinfo1..3 里 match_flags、invert_flags 在 146、148，
+            // state_mask 在 150（版本 1 是一个字节）；只认 XT_CONNTRACK_STATE（和 STATE_ALIAS）
+            b"conntrack" => {
+                let (Some(flags), Some(inv)) = (ne16(146), ne16(148)) else {
+                    return false;
+                };
+                if flags & !(1 | 0x2000) != 0 {
+                    return false;
+                }
+                let mask = if rev == 1 {
+                    info.get(150).map(|&b| u16::from(b))
+                } else {
+                    ne16(150)
+                };
+                let Some(mask) = mask else {
+                    return false;
+                };
+                flags & 1 == 0 || ((u32::from(mask) & self.p.ct_state != 0) != (inv & 1 != 0))
+            }
+            // xt_state_info：statemask
+            b"state" => ne32(0).is_some_and(|m| m & self.p.ct_state != 0),
             b"addrtype" => {
                 let (Some(src), Some(dst)) = (ne16(0), ne16(2)) else {
                     return false;
@@ -2269,14 +2328,65 @@ fn set_find(set: &Set, key: &[u8]) -> Option<Vec<u8>> {
 impl Nft {
     /// 钩子 `hook` 上有没有 nat 类型的基础链（没有就不必合成包）。
     pub(crate) fn has_nat(&self, hook: u32) -> bool {
+        self.has(hook, true)
+    }
+
+    /// 钩子 `hook` 上有没有 filter、route 类型的基础链。
+    pub(crate) fn has_filter(&self, hook: u32) -> bool {
+        self.has(hook, false)
+    }
+
+    fn has(&self, hook: u32, nat: bool) -> bool {
         self.tables.iter().any(|t| {
             t.flags & 1 == 0
                 && t.chains.iter().any(|c| {
                     c.base
                         .as_ref()
-                        .is_some_and(|b| b.hooknum == hook && b.ty == b"nat")
+                        .is_some_and(|b| b.hooknum == hook && (b.ty == b"nat") == nat)
                 })
         })
+    }
+
+    /// 跑 `p.hook` 钩子上 filter、route 类型的链：按优先级逐个，有一个丢弃（reject）就停，
+    /// 接受了的接着跑下一个（每个基础链各自判决）。
+    pub(crate) fn filter(&self, p: &Packet<'_>) -> Outcome {
+        let fam = if p.dst.len() == 4 { 2 } else { 10 };
+        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
+        for t in &self.tables {
+            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
+                continue;
+            }
+            for c in &t.chains {
+                if let Some(b) = &c.base
+                    && b.hooknum == p.hook
+                    && b.ty != b"nat"
+                {
+                    chains.push((t, c, b.priority));
+                }
+            }
+        }
+        chains.sort_by_key(|(_, _, prio)| *prio);
+        let (nh, th) = headers(p);
+        let mut mark = 0;
+        for (t, c, _) in chains {
+            let mut e = Eval {
+                p,
+                nh: nh.clone(),
+                th: th.clone(),
+                regs: [0; 80],
+                verdict: NFT_CONTINUE,
+                chain: None,
+                mark,
+                dnat: None,
+                reject: None,
+            };
+            let v = run_chain(&mut e, t, c);
+            mark = e.mark;
+            if v == NF_DROP {
+                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
+            }
+        }
+        Outcome::Accept
     }
 
     /// 跑 `p.hook` 钩子上的 nat 链（`nf_nat_inet_fn`）：按优先级逐个，有一个做了 DNAT 或者
@@ -2313,11 +2423,12 @@ impl Nft {
                 chain: None,
                 mark,
                 dnat: None,
+                reject: None,
             };
             let v = run_chain(&mut e, t, c);
             mark = e.mark;
             if v == NF_DROP {
-                return Outcome::Drop;
+                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
             }
             if let Some((a, port)) = e.dnat {
                 return Outcome::Dnat(a, port);
@@ -2325,6 +2436,28 @@ impl Nft {
         }
         Outcome::Accept
     }
+}
+
+/// reject 表达式（`NFTA_REJECT_TYPE`、`NFTA_REJECT_ICMP_CODE`）让发起方收到的错误码
+/// （`icmp_err_convert`、`icmpv6_err_convert`）：TCP RST 是 ECONNREFUSED；ICMPX 的
+/// 无路由、端口不可达、主机不可达、管理禁止；ICMP、ICMPv6 按各自的代码。
+fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
+    let e = match (ty, code, v6) {
+        (1, _, _) => Errno::ECONNREFUSED,
+        (2, 0, _) => Errno::ENETUNREACH,
+        (2, 1, _) => Errno::ECONNREFUSED,
+        (2, 2 | 3, _) => Errno::EHOSTUNREACH,
+        (0, 0 | 6 | 9 | 11, false) => Errno::ENETUNREACH,
+        (0, 2, false) => Errno::ENOPROTOOPT,
+        (0, 3, false) => Errno::ECONNREFUSED,
+        (0, _, false) => Errno::EHOSTUNREACH,
+        (0, 0, true) => Errno::ENETUNREACH,
+        (0, 1, true) => Errno::EACCES,
+        (0, 4, true) => Errno::ECONNREFUSED,
+        (0, _, true) => Errno::EHOSTUNREACH,
+        _ => Errno::ECONNREFUSED,
+    };
+    e.0
 }
 
 /// 从基础链 `base` 开始执行（`nft_do_chain`），返回最后的判决。
@@ -2586,6 +2719,7 @@ mod tests {
             oif: &|| b"lo".to_vec(),
             hook: HOOK_LOCAL_OUT,
             iif: None,
+            ct_state: CT_NEW,
         }
     }
 
@@ -2938,6 +3072,110 @@ mod tests {
             [Errno::ENOENT.0]
         );
         assert!(handle(&ns, &root, &batch(&[msg(DESTROYTABLE, 0, 1, &p)]), &peer()).is_empty());
+    }
+
+    /// 过滤链：FORWARD 上按入口接口、端口丢弃和 reject，xt 的 conntrack 匹配认 ESTABLISHED，
+    /// INPUT 的策略是丢弃。
+    #[test]
+    fn filter_chains() {
+        let ns = ns();
+        let root = Cred::root();
+        let reg = |r: u32| be32(r).to_vec();
+        let mut br0 = b"br0".to_vec();
+        br0.resize(16, 0);
+        let dport = |p: u16| [payload(2, 2, 2), cmp_eq(&p.to_be_bytes())];
+        let verdict_expr = |code: i32| expr("immediate", &[(1, reg(0)), (2, verdict(code, None))]);
+        // xt_conntrack_mtinfo3：match_flags = XT_CONNTRACK_STATE，state_mask = ESTABLISHED|RELATED
+        let mut ct = vec![0u8; 168];
+        ct[146..148].copy_from_slice(&1u16.to_ne_bytes());
+        ct[150..152].copy_from_slice(&6u16.to_ne_bytes());
+        let conntrack = expr(
+            "match",
+            &[(1, cstr(b"conntrack")), (2, be32(3).to_vec()), (3, ct)],
+        );
+        let mut input = chain_msg(1, b"t", b"INPUT", Some((1, 0, b"filter")));
+        // 策略丢弃（chain_msg 写的是接受）
+        let at = input
+            .windows(8)
+            .position(|w| w == [8, 0, CHAIN_POLICY as u8, 0, 0, 0, 0, 1])
+            .unwrap();
+        input[at + 7] = 0;
+        let r = handle(
+            &ns,
+            &root,
+            &batch(&[
+                table_msg(1, b"t"),
+                chain_msg(1, b"t", b"FORWARD", Some((2, 0, b"filter"))),
+                input,
+                rule_msg(1, b"t", b"FORWARD", &[conntrack, verdict_expr(NF_ACCEPT)]),
+                rule_msg(
+                    1,
+                    b"t",
+                    b"FORWARD",
+                    &[
+                        expr("meta", &[(2, reg(6)), (1, reg(1))]),
+                        cmp_eq(&br0),
+                        dport(7001)[0].clone(),
+                        dport(7001)[1].clone(),
+                        verdict_expr(NF_DROP),
+                    ],
+                ),
+                rule_msg(
+                    1,
+                    b"t",
+                    b"FORWARD",
+                    &[
+                        dport(7002)[0].clone(),
+                        dport(7002)[1].clone(),
+                        expr("reject", &[(1, be32(1).to_vec())]),
+                    ],
+                ),
+                rule_msg(
+                    1,
+                    b"t",
+                    b"INPUT",
+                    &[
+                        dport(22)[0].clone(),
+                        dport(22)[1].clone(),
+                        verdict_expr(NF_ACCEPT),
+                    ],
+                ),
+            ]),
+            &peer(),
+        );
+        assert!(r.is_empty(), "{:?}", errors(&r));
+        let unicast = |_: &[u8]| RTN_UNICAST;
+        let st = ns.nft.borrow();
+        let dst = [10, 81, 0, 3];
+        let at = |hook: u32, port: u16, iif: &[u8], ct: u32| {
+            let mut p = packet(6, &dst, port, &unicast);
+            p.hook = hook;
+            p.iif = Some(Iif {
+                index: 3,
+                name: iif.to_vec(),
+                addr: vec![10, 80, 0, 1],
+            });
+            p.ct_state = ct;
+            st.filter(&p)
+        };
+        assert_eq!(at(2, 7000, b"br0", CT_NEW), Outcome::Accept);
+        assert_eq!(at(2, 7001, b"br0", CT_NEW), Outcome::Drop);
+        assert_eq!(at(2, 7001, b"br1", CT_NEW), Outcome::Accept);
+        assert_eq!(at(2, 7001, b"br0", CT_ESTABLISHED), Outcome::Accept);
+        assert_eq!(
+            at(2, 7002, b"br1", CT_NEW),
+            Outcome::Reject(Errno::ECONNREFUSED.0)
+        );
+        assert_eq!(at(1, 22, b"br0", CT_NEW), Outcome::Accept);
+        assert_eq!(at(1, 80, b"br0", CT_NEW), Outcome::Drop);
+        // 别的钩子上没有过滤链
+        assert_eq!(at(3, 7001, b"br0", CT_NEW), Outcome::Accept);
+        assert!(st.has_filter(2) && st.has_filter(1) && !st.has_filter(0));
+        // reject 的错误码
+        assert_eq!(reject_errno(2, 1, false), Errno::ECONNREFUSED.0);
+        assert_eq!(reject_errno(0, 1, false), Errno::EHOSTUNREACH.0);
+        assert_eq!(reject_errno(0, 0, false), Errno::ENETUNREACH.0);
+        assert_eq!(reject_errno(0, 4, true), Errno::ECONNREFUSED.0);
     }
 
     /// 区间集合：排好序的端点，结尾的元素带 NFT_SET_ELEM_INTERVAL_END；有 KEY_END 的是闭区间。

@@ -84,9 +84,8 @@ pub(crate) struct InetSocket {
     /// 本端就定成宿主选的 127.0.0.1，回到这个命名空间的回环地址的数据报对不上），不带地址的
     /// 发送发往它，收到的只要来自它的（Linux 已连接的 UDP）。
     pub vconn: Option<Vec<u8>>,
-    /// nftables 的 OUTPUT nat 换过目的地址的（[`crate::nft`]）：(换成的, guest 给的)，都是
-    /// guest 的 sockaddr。从前者收到的数据报报告成来自后者（Linux 由 conntrack 换回）。
-    pub nat_back: Vec<(Vec<u8>, Vec<u8>)>,
+    /// nftables 的 nat、过滤要记下的（[`Track`]），用到时才分配。
+    pub track: Option<Box<Track>>,
     /// 开机时的命名空间里监听着的、PREROUTING 有 DNAT 的端口：从宿主外面连进来的由转发线程
     /// 转给目的地（[`crate::forward`]）。
     pub fwd: Option<Box<crate::forward::Handle>>,
@@ -146,7 +145,7 @@ impl InetSocket {
             guest_peer: None,
             wide: false,
             vconn: None,
-            nat_back: Vec::new(),
+            track: None,
             fwd: None,
             listening: false,
             listener: None,
@@ -169,6 +168,26 @@ impl InetSocket {
     /// 用不了 IPv4 映射的地址（[`crate::netns::to_host`]）。
     pub fn icmp6(&self) -> bool {
         self.family == AF_INET6 && self.proto == IPPROTO_ICMPV6
+    }
+}
+
+/// 一个 socket 上 Linux 由连接跟踪记着的东西（[`crate::nft`]，docs/rounds/175-filter.md）。
+#[derive(Debug, Default)]
+pub(crate) struct Track {
+    /// nat 换过目的地址的：(换成的, guest 给的)，都是 guest 的 sockaddr。从前者收到的数据报
+    /// 报告成来自后者。
+    pub nat_back: Vec<(Vec<u8>, Vec<u8>)>,
+    /// UDP：收到过数据报的对方（guest 的 sockaddr）。回给它们的是 ESTABLISHED 的，过滤链里
+    /// `ct state established` 的规则认它们。
+    pub seen: Vec<Vec<u8>>,
+    /// 连接了的 UDP：连的目的地被过滤链丢弃了。不带地址的发送不发出去：0 是悄悄丢掉，别的
+    /// 是错误码（OUTPUT 上的丢弃是 EPERM）。
+    pub blocked: Option<i32>,
+}
+
+impl InetSocket {
+    pub(crate) fn track_mut(&mut self) -> &mut Track {
+        self.track.get_or_insert_with(Default::default)
     }
 }
 

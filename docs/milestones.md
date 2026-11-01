@@ -183,6 +183,7 @@
 | [M9 之前：nftables 的子集和 socket 层的 DNAT](rounds/172-nftables.md) | 2026-11-01 | 地址映射方案的第三步：`NETLINK_NETFILTER` 上 nftables 的表、链、规则、集合照 6.8 的内核记在每个网络命名空间里（批、生成号、句柄、转储、extack 的偏移），iptables-nft 的 `nft_compat`；connect、sendto 时执行 OUTPUT 钩子上的 nat 链，DNAT 在 socket 层换目的地址、收到的来源换回；docker 自定义网络按名字解析、`"iptables": true` 的 dockerd、podman 的 nftables 驱动（含经由 OUTPUT 的 `-p`）都能用了；修了新命名空间里发给自己虚拟地址的 UDP 收不到回答 |
 | [M9 之前：发布的端口：PREROUTING 的 DNAT 和宿主上的转发](rounds/173-port-forwarding.md) | 2026-11-01 | 地址映射方案的第四步：进入别的命名空间（虚拟地址、容器连外层地址）的连接、数据报执行那里的 PREROUTING nat（入口接口、redirect 到入口接口的地址）；开机时的命名空间里被 PREROUTING DNAT 的监听交给宿主上的转发线程，从 appine 外面（手机上的浏览器、别的设备）连进来的转给容器；MPTCP 的 socket 列进 `/proc/net/tcp`、低端口映射按 TCP；podman 的 `-p` 从外面也连得通，普查与原生一致 |
 | [M9 之前：各个网络命名空间的端口互不相干](rounds/174-namespace-ports.md) | 2026-11-01 | 新命名空间里显式绑的端口在宿主上另选、登记在映射表里：外层（podman、docker-proxy）占着同一个端口时容器照样绑得上，`-p 8080:8080` 这类内外同端口的发布原来起不来；新命名空间里的 TCP 监听登记在命名空间里，连过去没有对得上的监听就是 ECONNREFUSED（不再被外层的通配监听接走），只绑 127.0.0.1 的服务从别处连不到 |
+| [M9 之前：过滤链](rounds/175-filter.md) | 2026-11-01 | connect、sendto 时执行连接沿途经过的过滤链（发送方的 OUTPUT，经由开机时的命名空间的 FORWARD、INPUT，目的地的 INPUT，各自的 PREROUTING 上的 filter 链）；reject 带错误码，xt 的 REJECT、conntrack、state；UDP 回给收到过的对方是 ESTABLISHED；TCP 被丢弃的连到接受队列满了的宿主监听上、照 Linux 的重传超时；docker 网络之间的隔离与原生一致 |
 
 ## 测量条件
 

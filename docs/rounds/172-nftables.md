@@ -89,7 +89,7 @@
 - 只执行 OUTPUT 钩子上的 nat 链。别的钩子上的链只记下、能列出来，不执行：
   - PREROUTING 的 DNAT：从宿主外面连进来的端口转发，第 4 步。 → 从别的命名空间进来的执行 PREROUTING，从 appine 外面进来的由宿主上的线程转发（M9 之前：发布的端口）
   - POSTROUTING 的 SNAT、MASQUERADE。
-  - INPUT、FORWARD 等过滤的链：防火墙的隔离、丢弃规则都不起作用。容器出去总是有 NAT（上一轮的推迟项）。
+  - INPUT、FORWARD 等过滤的链：防火墙的隔离、丢弃规则都不起作用。容器出去总是有 NAT（上一轮的推迟项）。 → 连接沿途经过的 OUTPUT、FORWARD、INPUT、PREROUTING 上的过滤链执行了（M9 之前：过滤链）
 - 没有 conntrack：
   - 每次 connect 和每个未连接的 sendto 都按规则判断，服务端的回答也一样。回答的目的端口碰巧匹配 DNAT 规则时会被换掉；Linux 上回答属于已有的连接，不再看 nat 规则。
   - DNAT 的换回只按 socket 记，未连接的 UDP socket 最多 16 对。
