@@ -980,6 +980,38 @@ pub(crate) fn open_exe_file(
     Ok((Executable::open(file)?, st, nosuid))
 }
 
+/// 经由打开着的文件执行（fexecve、execveat 的 `AT_EMPTY_PATH`、`/proc/<pid>/fd/<n>`）：用
+/// 它的宿主文件，已经删除的文件和 memfd 的 object 都不在了，按 inode 打不开。检查与
+/// [`open_node`] 相同，noexec、nosuid 按打开它时经由的挂载（memfd 不经由挂载）。不是
+/// 普通文件是 EACCES。
+pub(crate) fn open_open_file(
+    vfs: &Vfs,
+    cred: &Cred,
+    f: &crate::fd::OpenFile,
+) -> Result<(Executable, Stat, bool), Errno> {
+    let crate::fd::FileKind::Regular { ino, file } = &f.kind else {
+        return Err(Errno::EACCES);
+    };
+    let st = vfs.store().stat_open(*ino, file)?;
+    if st.kind() != mode::S_IFREG {
+        return Err(Errno::EACCES);
+    }
+    cred.permission(&st, MAY_EXEC)?;
+    let flags = if f.pseudo {
+        0
+    } else {
+        vfs.mount_flags(&Node::Store(f.mnt, *ino)).unwrap_or(0)
+    };
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
+    let file = file
+        .try_clone()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok((Executable::open(file)?, st, nosuid))
+}
+
 /// 按 execve 的规则打开 guest 文件：必须是仓库里的普通文件，凭据为 `cred` 的进程
 /// 有执行权限。同时返回文件的元数据（setuid、setgid 位）。
 pub(crate) fn open_executable(

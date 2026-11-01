@@ -1048,10 +1048,11 @@ pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
 }
 
 /// 有没有以写方式打开着的 `ino`（执行它时 ETXTBSY）。
+/// memfd_create 得到的 fd 不算（[`OpenFile::pseudo`]）。
 pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
     cx.kr().open_files().iter().any(|f| {
         let f = f.borrow();
-        f.writable() && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
+        f.writable() && !f.pseudo && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
     })
 }
 
@@ -1860,6 +1861,7 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
         oflags::O_RDWR | oflags::O_LARGEFILE,
         Some(Rc::from(path)),
     );
+    file.borrow_mut().pseudo = true;
     cx.fds_mut()
         .install(file, flags & MFD_CLOEXEC != 0, 0)
         .map(|fd| fd as u64)

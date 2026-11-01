@@ -179,6 +179,10 @@ pub struct OpenFile {
     /// 加过 flock、OFD 锁或者租约：它们以打开文件为持有者，关闭时随之释放，等锁的线程
     /// 要重新检查。
     pub holds_locks: bool,
+    /// 不是经由 open 建的（memfd_create，Linux 的 `alloc_file_pseudo`）：不算文件的写者，
+    /// 执行它不是 ETXTBSY；经由 `/proc/<pid>/fd/<n>` 重新打开的照常算。也不经由挂载，
+    /// noexec、nosuid 不适用。
+    pub pseudo: bool,
 }
 
 impl OpenFile {
@@ -205,6 +209,7 @@ impl OpenFile {
             pos_busy: 0,
             holds_locks: false,
             watch: None,
+            pseudo: false,
         }))
     }
 

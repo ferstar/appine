@@ -691,23 +691,47 @@ fn exec(
     // comm 取路径的最后一段；执行的是 fd 本身时取文件名，不是 fd 的编号
     let mut comm = filename.clone();
     let root = cx.root();
+    // 经由打开着的普通文件执行（fexecve、/proc/<pid>/fd/<n>）：用它的宿主文件
+    // （[`process::open_open_file`]），已经删除的文件、memfd 按 inode 打不开
+    let mut by_file: Option<FileRef> = None;
     let node = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd == AT_FDCWD {
             cwd.clone()
         } else {
             let file = cx.fds().get(dirfd)?;
             let f = file.borrow();
-            exe_at.1 = f.path.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
+            // memfd 的路径带着 ` (deleted)`，/proc/<pid>/exe 读的时候按 nlink 再加
+            let shown = f.path.as_deref().unwrap_or_default();
+            exe_at.1 = shown.strip_suffix(b" (deleted)").unwrap_or(shown).to_vec();
             if !exe_at.1.is_empty() {
                 comm.clone_from(&exe_at.1);
             }
-            f.node().ok_or(Errno::EACCES)?
+            let node = f.node().ok_or(Errno::EACCES)?;
+            if matches!(f.kind, FileKind::Regular { .. }) {
+                by_file = Some(file.clone());
+            }
+            node
         }
     } else {
         let start = super::fs::start_dir(cx, dirfd, &path)?;
         exe_at.0 = start.clone();
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        vfs.resolve(&view, &cred, &root, &start, &path, follow)?
+        match vfs.resolve(&view, &cred, &root, &start, &path, follow)? {
+            // /proc/<pid>/fd/<n> 跟随到的不在仓库里的打开文件：已经删除的文件、memfd 可以
+            // 执行，管道这些是 EACCES
+            Node::Pseudo(_, crate::pseudo::PseudoNode::OpenFd(pid, fd)) => {
+                let file = view.open_file(pid, fd).ok_or(Errno::ENOENT)?;
+                let f = file.borrow();
+                let node = f.node().ok_or(Errno::EACCES)?;
+                let shown = f.path.as_deref().unwrap_or_default();
+                exe_at.1 = shown.strip_suffix(b" (deleted)").unwrap_or(shown).to_vec();
+                if matches!(f.kind, FileKind::Regular { .. }) {
+                    by_file = Some(file.clone());
+                }
+                node
+            }
+            node => node,
+        }
     };
     // 经由 /proc/<pid>/exe 执行已经删除的程序（重新 exec 自己）：打开那个进程记着的宿主文件
     let from = match &node {
@@ -716,9 +740,10 @@ fn exec(
         }
         _ => None,
     };
-    let (mut file, mut st, mut nosuid) = match &from {
-        Some(exe) => process::open_exe_file(&vfs, &cred, exe)?,
-        None => process::open_node(&vfs, &cred, &node)?,
+    let (mut file, mut st, mut nosuid) = match (&from, &by_file) {
+        (Some(exe), _) => process::open_exe_file(&vfs, &cred, exe)?,
+        (None, Some(f)) => process::open_open_file(&vfs, &cred, &f.borrow())?,
+        (None, None) => process::open_node(&vfs, &cred, &node)?,
     };
     let script = parse_shebang(file.head()).is_some();
 

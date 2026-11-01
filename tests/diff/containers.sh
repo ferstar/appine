@@ -1,7 +1,7 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
 # 容器运行时（podman、crun、docker、runc）用到的内核接口（docs/rounds/157-container-survey.md
 # 起）：capget 探测版本、开机时的命名空间里拉起已经起着的 lo、合成文件系统根目录的 inode
-# 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统
+# 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统；经由 fd 执行 memfd 和已经删除的文件
 set -e
 cd /tmp
 
@@ -429,3 +429,130 @@ int main(void)
 C
 gcc -D_GNU_SOURCE -o mqfs mqfs.c && ./mqfs
 umount mnt/mq2 2>/dev/null; umount mnt/mq
+
+# 经由 fd 执行 memfd 和已经删除的文件（runc 把自己复制进 memfd 再经由 /proc/self/fd/<n>
+# 执行，buildah 的 chroot 隔离用 fexecve）：fexecve（execveat 的 AT_EMPTY_PATH）、
+# execve("/proc/self/fd/<n>")；memfd 自己的 fd 不算写者（Linux 的 alloc_file_pseudo），经由
+# /proc 以写方式重新打开的算（ETXTBSY）；MFD_NOEXEC_SEAL 的执行不了。不比 comm：执行 fd
+# 时 Linux 6.8 用 fd 的编号，新内核改成文件名
+cat > fdexec-hello.c <<'C'
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <unistd.h>
+int main(int argc, char **argv)
+{
+    char exe[256] = "";
+    readlink("/proc/self/exe", exe, sizeof exe - 1);
+    char maps[512] = "";
+    FILE *f = fopen("/proc/self/maps", "r");
+    fgets(maps, sizeof maps, f);
+    char *path = strchr(maps, '/');
+    printf("  ran %s: exe=%s execfn=%s map=%s", argv[1], exe, (char *)getauxval(AT_EXECFN), path ? path : "?\n");
+    return 0;
+}
+C
+gcc -O1 -o fdexec-hello fdexec-hello.c
+cat > fdexec.c <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 8
+#endif
+
+extern char **environ;
+
+static int copy_to(int fd)
+{
+    int src = open("/tmp/fdexec-hello", O_RDONLY);
+    struct stat st;
+    fstat(src, &st);
+    off_t off = 0;
+    int n = sendfile(fd, src, &off, st.st_size);
+    close(src);
+    return n;
+}
+
+// 在子进程里执行，报告 execve 的错误或者程序的输出
+static void run(const char *what, int how, int fd, const char *path)
+{
+    fflush(stdout);
+    pid_t c = fork();
+    if (c == 0) {
+        char *argv[] = {"hello", (char *)what, NULL};
+        if (how == 0)
+            fexecve(fd, argv, environ);
+        else if (how == 1)
+            execve(path, argv, environ);
+        else
+            syscall(SYS_execveat, fd, "", argv, environ, AT_EMPTY_PATH);
+        printf("%-34s %s\n", what, strerror(errno));
+        fflush(stdout);
+        _exit(1);
+    }
+    int status;
+    waitpid(c, &status, 0);
+}
+
+int main(void)
+{
+    char path[64];
+    int m = memfd_create("hello", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    copy_to(m);
+    run("memfd fexecve", 0, m, NULL);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", m);
+    run("memfd /proc/self/fd", 1, 0, path);
+    run("memfd execveat AT_EMPTY_PATH", 2, m, NULL);
+    // 封住之后（runc 这样做）照样能执行
+    fcntl(m, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+    run("sealed memfd", 0, m, NULL);
+    // 经由 /proc 以写方式重新打开的算写者
+    int m2 = memfd_create("hello2", MFD_CLOEXEC);
+    copy_to(m2);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", m2);
+    int w = open(path, O_RDWR | O_CLOEXEC);
+    printf("reopen memfd for write: %s\n", w >= 0 ? "ok" : strerror(errno));
+    run("memfd reopened for write", 0, m2, NULL);
+    close(w);
+    run("memfd after closing the reopen", 0, m2, NULL);
+    // MFD_NOEXEC_SEAL：没有执行权限
+    int m3 = memfd_create("hello3", MFD_CLOEXEC | MFD_NOEXEC_SEAL);
+    copy_to(m3);
+    run("memfd MFD_NOEXEC_SEAL", 0, m3, NULL);
+
+    // 已经删除的普通文件
+    int fd = open("/tmp/fdexec-copy", O_CREAT | O_TRUNC | O_RDWR, 0755);
+    copy_to(fd);
+    close(fd);
+    fd = open("/tmp/fdexec-copy", O_RDONLY | O_CLOEXEC);
+    unlink("/tmp/fdexec-copy");
+    run("deleted file fexecve", 0, fd, NULL);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    run("deleted file /proc/self/fd", 1, 0, path);
+    // 以写方式打开着的已经删除的文件：ETXTBSY
+    int wf = open("/tmp/fdexec-copy2", O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0755);
+    copy_to(wf);
+    unlink("/tmp/fdexec-copy2");
+    run("deleted file open for write", 0, wf, NULL);
+    // O_PATH 的 fd、还没有删除的文件
+    int p = open("/tmp/fdexec-hello", O_PATH | O_CLOEXEC);
+    run("O_PATH fd", 2, p, NULL);
+    int r = open("/tmp/fdexec-hello", O_RDONLY | O_CLOEXEC);
+    run("regular file fexecve", 0, r, NULL);
+    // 不是普通文件
+    int pipefd[2];
+    pipe2(pipefd, O_CLOEXEC);
+    run("pipe", 2, pipefd[0], NULL);
+    return 0;
+}
+C
+gcc -D_GNU_SOURCE -o fdexec fdexec.c && ./fdexec

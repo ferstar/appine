@@ -169,6 +169,7 @@
 | [M9 之前：容器运行时碰到的四处小问题](rounds/158-container-small-fixes.md) | 2026-11-01 | capget 空数据指针探测版本返回 0；开机时的命名空间里什么也不改的 `RTM_NEWLINK`、`RTM_SETLINK` 成功（dockerd 拉起 lo）；合成文件系统根目录的 inode 是 1（runc 检查 /proc）；线程目录里有 fd、fdinfo |
 | [M9 之前：可写地挂 cgroup2](rounds/159-cgroup2-rw-mount.md) | 2026-11-01 | 不带只读也挂得上 cgroup2（crun 给容器这样挂），里面照旧改不了 |
 | [M9 之前：mqueue 文件系统](rounds/160-mqueue-fs.md) | 2026-11-01 | `mount -t mqueue` 列出挂上它的进程所在的 IPC 命名空间里的 POSIX 消息队列（每个命名空间一个实例）：建、删、chmod、chown，打开得到 mq 描述符；podman 不再需要临时绕过就能起容器 |
+| [M9 之前：经由 fd 执行 memfd 和已经删除的文件](rounds/161-exec-open-file.md) | 2026-11-01 | fexecve、`/proc/<pid>/fd/<n>` 用打开文件的宿主文件执行；memfd 的 fd 与 Linux 一样不算写者；runc 起容器、`podman build --isolation chroot` 要用 |
 
 ## 测量条件
 

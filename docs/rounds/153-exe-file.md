@@ -34,6 +34,6 @@
 **推迟项**：
 
 - 读出来的路径仍是执行时的，程序文件改了名不跟着变（与 fd 一样，[第 93 轮](93-fd-paths-resolve-symlinks.md)的推迟项）。
-- 经由 fd 执行已经删除的文件和 memfd（glibc 的 fexecve、`execveat` 的 `AT_EMPTY_PATH`、`execve("/proc/self/fd/<n>")`）：原生上四种都能执行；appine 里 memfd 的 fexecve 是 ENOENT（object 在创建时就删了，execve 按 inode 重新打开 object），经由 `/proc/self/fd/<n>` 是 EACCES（execve 不接受 `OpenFd`），已经删除的普通文件的 fexecve 只在删除还没提交时碰巧成功。做法可以与这一轮的 `OpenExe` 一样，按打开文件记着的宿主文件执行；另外 Linux 上 memfd_create 得到的 fd 不算写者（`alloc_file_pseudo` 不增加 `i_writecount`），执行它不是 ETXTBSY，appine 的检查会把它当作以写方式打开着。用到它的多是 runc、systemd 这类 D 档的程序。
+- 经由 fd 执行已经删除的文件和 memfd（glibc 的 fexecve、`execveat` 的 `AT_EMPTY_PATH`、`execve("/proc/self/fd/<n>")`）：原生上四种都能执行；appine 里 memfd 的 fexecve 是 ENOENT（object 在创建时就删了，execve 按 inode 重新打开 object），经由 `/proc/self/fd/<n>` 是 EACCES（execve 不接受 `OpenFd`），已经删除的普通文件的 fexecve 只在删除还没提交时碰巧成功。做法可以与这一轮的 `OpenExe` 一样，按打开文件记着的宿主文件执行；另外 Linux 上 memfd_create 得到的 fd 不算写者（`alloc_file_pseudo` 不增加 `i_writecount`），执行它不是 ETXTBSY，appine 的检查会把它当作以写方式打开着。用到它的多是 runc、systemd 这类 D 档的程序。→ 已补上（M9 之前：经由 fd 执行 memfd 和已经删除的文件）：runc、buildah 的 chroot 隔离都要用
 - core dump 的 `%E` 不带 ` (deleted)`（Linux 的 `cn_print_exe_file` 用 `d_path`，带）。
 - `PR_SET_MM_EXE_FILE`（换掉 exe，CRIU 用）没有实现。
