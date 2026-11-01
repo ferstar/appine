@@ -799,7 +799,8 @@ pub(super) fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Resul
 }
 
 pub(super) fn restore_mask<T>(cx: &mut Cx<'_>, r: &Result<T, Errno>) {
-    let interrupted = matches!(r, Err(e) if *e == Errno::ERESTARTNOHAND);
+    // epoll_pwait 被打断是 EINTR（Linux 的 restore_saved_sigmask_unless(error == -EINTR)）
+    let interrupted = matches!(r, Err(e) if *e == Errno::ERESTARTNOHAND || *e == Errno::EINTR);
     if !interrupted && let Some(saved) = cx.task.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
     }
@@ -816,9 +817,12 @@ pub(super) fn ppoll(
     if nfds as u64 > cx.t.group.borrow().rlimits[RLIMIT_NOFILE as usize].0 {
         return Err(Errno::EINVAL);
     }
-    let deadline = match timeout {
-        0 => None,
-        addr => Some(Instant::now() + read_timespec(cx, addr)?),
+    let (deadline, zero) = match timeout {
+        0 => (None, false),
+        addr => {
+            let t = read_timespec(cx, addr)?;
+            (Some(Instant::now() + t), t.is_zero())
+        }
     };
     let mut raw = vec![0u8; nfds * 8];
     cx.mm().read(UserSlice::new(fds, raw.len()), &mut raw)?;
@@ -839,6 +843,7 @@ pub(super) fn ppoll(
     set_temp_mask(cx, sigmask, sigsetsize)?;
     let r = wait_ready(cx, &wanted, deadline);
     restore_mask(cx, &r);
+    let r = write_back_timeout(cx, timeout, deadline.filter(|_| !zero), r);
     let mut ready = r?.into_iter();
     let mut n = 0;
     for ((_, _, skip), out) in items.iter().zip(raw.chunks_exact_mut(8)) {
@@ -893,10 +898,12 @@ pub(super) fn pselect6(
             fds.push(fd);
         }
     }
-    let start = Instant::now();
-    let deadline = match timeout {
-        0 => None,
-        addr => Some(start + read_timespec(cx, addr)?),
+    let (deadline, zero) = match timeout {
+        0 => (None, false),
+        addr => {
+            let t = read_timespec(cx, addr)?;
+            (Some(Instant::now() + t), t.is_zero())
+        }
     };
     // 第六个参数指向 { const sigset_t *ss; size_t ss_len; }
     if sigdata != 0 {
@@ -907,7 +914,7 @@ pub(super) fn pselect6(
     }
     let r = wait_ready(cx, &items, deadline);
     restore_mask(cx, &r);
-    let ready = r?;
+    let ready = write_back_timeout(cx, timeout, deadline.filter(|_| !zero), r)?;
     let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
     let mut n = 0;
     for (&fd, &ev) in fds.iter().zip(&ready) {
@@ -929,17 +936,33 @@ pub(super) fn pselect6(
             cx.mm().write(UserSlice::new(addr, b.len()), &b)?;
         }
     }
-    // 与 Linux 一样把剩余时间写回 timeout
-    if let (Some(d), true) = (deadline, timeout != 0) {
-        let left = d.saturating_duration_since(Instant::now());
-        super::write_pair(
-            cx,
-            timeout,
-            left.as_secs() as i64,
-            left.subsec_nanos() as i64,
-        )?;
-    }
     Ok(n)
+}
+
+/// 与 Linux 的 `poll_select_finish` 一样，把剩下的时间写回 guest 给的 `timeout`（给了、不是
+/// 0 时，`deadline` 是它的到期时刻），被信号打断时也写：重新执行时就按剩下的时间等，停止
+/// 又继续、cgroup 冻结又解冻之后不会从头再等。写不了时被打断改成 EINTR（不能重新执行），
+/// 做完了的照样返回。
+fn write_back_timeout<T>(
+    cx: &mut Cx<'_>,
+    timeout: u64,
+    deadline: Option<Instant>,
+    r: Result<T, Errno>,
+) -> Result<T, Errno> {
+    let Some(d) = deadline.filter(|_| timeout != 0) else {
+        return r;
+    };
+    let left = d.saturating_duration_since(Instant::now());
+    let written = super::write_pair(
+        cx,
+        timeout,
+        left.as_secs() as i64,
+        left.subsec_nanos() as i64,
+    );
+    match r {
+        Err(e) if e == Errno::ERESTARTNOHAND && written.is_err() => Err(Errno::EINTR),
+        r => r,
+    }
 }
 
 // ---- epoll ----
@@ -1333,8 +1356,10 @@ pub(super) fn epoll_pwait(
         if !ready.is_empty() || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(ready);
         }
+        // 与 Linux 的 ep_poll 一样是 EINTR，不重新执行：没有处理函数的信号（停止之后又继续）、
+        // cgroup 冻结之后解冻也是 EINTR（signal(7)）
         if cx.interrupted() {
-            return Err(Errno::ERESTARTNOHAND);
+            return Err(Errno::EINTR);
         }
         let mut waits = Waits::default();
         waits.add_epoll(&ep.borrow(), 0);

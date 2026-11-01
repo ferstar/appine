@@ -1,6 +1,6 @@
 # M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）
 
-← [M9 之前：cgroup 树：建子 cgroup、迁移进程（2026-11-01）](163-cgroup-tree.md) · [索引](../milestones.md)
+← [M9 之前：cgroup 树：建子 cgroup、迁移进程（2026-11-01）](163-cgroup-tree.md) · [索引](../milestones.md) · [M9 之前：cgroup.freeze（2026-11-01）](165-cgroup-freeze.md) →
 
 [podman 和 docker 的普查](157-container-survey.md)的问题 9 的第二步的前一半：[上一轮](163-cgroup-tree.md)的限制只按格式记下，这一轮让 `pids.max`、`memory.max` 起作用（`docker run --pids-limit`、`--memory`，podman 的同名选项，systemd 的 `TasksMax=`、`MemoryMax=` 写的就是它们）。`cgroup.freeze` 要做透明的冻结和系统调用重启，下一轮单独做。照 Linux 6.1 的 `kernel/cgroup/pids.c`、`mm/memcontrol.c`、`mm/oom_kill.c`。
 
@@ -37,4 +37,4 @@
 - `memory.current` 是各个进程的驻留内存之和：fork 之后共用的页、共享的映射在每个进程里各算一次，没有页缓存、内核内存；Linux 每页只记在第一次用它的 cgroup 上。
 - `memory.high`（限速回收）、`memory.low`、`memory.min`（保护）、`memory.swap.max`、`memory.swap.high` 只记下，不起作用，`memory.events` 的 low、high 总是 0；没有 `memory.pressure`。
 - `cpu.max`、`cpu.weight`、`cpuset.cpus` 不起作用：宿主线程的调度不归 appine 管（要做的话可以按周期停下超额的线程，与冻结用同一套办法）。
-- `cgroup.freeze`：下一轮。
+- `cgroup.freeze`：下一轮。→ 已做（M9 之前：cgroup.freeze）

@@ -129,13 +129,15 @@ pub(super) fn futex(
             if bitset == 0 {
                 return Err(Errno::EINVAL);
             }
-            // FUTEX_WAIT 的超时是相对的（CLOCK_MONOTONIC），WAIT_BITSET 的是绝对的
+            // FUTEX_WAIT 的超时是相对的（CLOCK_MONOTONIC），WAIT_BITSET 的是绝对的。不持 BKL
+            // 的路径（syscall::fast）已经睡过一阵的，按它算好的到期时刻
+            let early = cx.t.fast_sleep.take();
             let deadline = match timeout {
                 0 => None,
                 addr => {
                     let t = read_timespec(cx, addr)?;
                     Some(if cmd == FUTEX_WAIT {
-                        Instant::now() + t
+                        early.unwrap_or_else(|| Instant::now() + t)
                     } else {
                         let clock = if op & FUTEX_CLOCK_REALTIME != 0 {
                             CLOCK_REALTIME
@@ -146,39 +148,7 @@ pub(super) fn futex(
                     })
                 }
             };
-            let key = futex_key(cx, uaddr)?;
-            let shared = cx.shared;
-            // 不持 BKL 的唤醒（syscall::fast）也取 futex 的锁：检查值和登记之间不会漏掉
-            let id = {
-                let mut futexes = shared.futexes();
-                if u32::from_le_bytes(get(cx, uaddr)?) != val {
-                    return Err(Errno::EAGAIN);
-                }
-                futexes.enqueue(key, bitset, cx.task.event.clone())
-            };
-            let waiting = Enqueued::new(shared, [id]);
-            crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
-            loop {
-                if !shared.futexes().is_queued(id) {
-                    waiting.leave();
-                    return Ok(0);
-                }
-                let err = if deadline.is_some_and(|d| Instant::now() >= d) {
-                    Some(Errno::ETIMEDOUT)
-                } else if cx.interrupted() {
-                    Some(Errno::ERESTARTSYS)
-                } else {
-                    cx.wait_alone(deadline).err()
-                };
-                if let Some(e) = err {
-                    // 原来放开 futex 的锁之后才移除：这中间不持 BKL 的唤醒（syscall::fast）
-                    // 取走了它的话，唤醒丢了，它却返回错误
-                    return match waiting.leave() {
-                        Some(_) => Ok(0),
-                        None => Err(e),
-                    };
-                }
-            }
+            futex_wait(cx, (uaddr, val, bitset), deadline)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let bitset = if cmd == FUTEX_WAKE { u32::MAX } else { val3 };
@@ -204,6 +174,63 @@ pub(super) fn futex(
             Ok(n as u64)
         }
         _ => Err(Errno::ENOSYS),
+    }
+}
+
+/// futex 等待（Linux 的 `futex_wait`）：`*uaddr` 是 `val` 时等到被唤醒、`deadline` 或者被
+/// 打断。被打断时没有超时的是 ERESTARTSYS；有超时的记下到期时刻，返回
+/// ERESTART_RESTARTBLOCK：没有处理函数时由 restart_syscall 接着等到原来的时刻（停止又继续、
+/// cgroup 冻结又解冻之后不从头再等），有处理函数时是 EINTR（即使有 SA_RESTART）。
+fn futex_wait(
+    cx: &mut Cx<'_>,
+    (uaddr, val, bitset): (u64, u32, u32),
+    deadline: Option<Instant>,
+) -> SysResult {
+    let key = futex_key(cx, uaddr)?;
+    let shared = cx.shared;
+    // 不持 BKL 的唤醒（syscall::fast）也取 futex 的锁：检查值和登记之间不会漏掉
+    let id = {
+        let mut futexes = shared.futexes();
+        if u32::from_le_bytes(get(cx, uaddr)?) != val {
+            return Err(Errno::EAGAIN);
+        }
+        futexes.enqueue(key, bitset, cx.task.event.clone())
+    };
+    let waiting = Enqueued::new(shared, [id]);
+    crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
+    loop {
+        if !shared.futexes().is_queued(id) {
+            waiting.leave();
+            return Ok(0);
+        }
+        let err = if deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(Errno::ETIMEDOUT)
+        } else if cx.interrupted() {
+            Some(match deadline {
+                Some(_) => Errno::ERESTART_RESTARTBLOCK,
+                None => Errno::ERESTARTSYS,
+            })
+        } else {
+            cx.wait_alone(deadline).err()
+        };
+        if let Some(e) = err {
+            // 原来放开 futex 的锁之后才移除：这中间不持 BKL 的唤醒（syscall::fast）
+            // 取走了它的话，唤醒丢了，它却返回错误
+            return match waiting.leave() {
+                Some(_) => Ok(0),
+                None => {
+                    if let (Errno::ERESTART_RESTARTBLOCK, Some(deadline)) = (e, deadline) {
+                        cx.t.restart = Some(Restart::Futex {
+                            uaddr,
+                            val,
+                            bitset,
+                            deadline,
+                        });
+                    }
+                    Err(e)
+                }
+            };
+        }
     }
 }
 
@@ -316,16 +343,36 @@ fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
             if rem != 0 {
                 write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
             }
-            cx.t.restart = Some((deadline, rem));
+            cx.t.restart = Some(Restart::Sleep { deadline, rem });
             Err(Errno::ERESTART_RESTARTBLOCK)
         }
     }
 }
 
-/// restart_syscall：接着做被打断的 nanosleep。与 Linux 相同，没有可以接着做的时返回 EINTR。
+/// 被打断、没有处理函数时由 restart_syscall 接着做的（Linux 的 `restart_block`）。
+pub(crate) enum Restart {
+    /// nanosleep、clock_nanosleep：到期时刻和 `rem` 的地址。
+    Sleep { deadline: Instant, rem: u64 },
+    /// 有超时的 futex 等待（`futex_wait_restart`）：照原来的参数接着等到原来的到期时刻。
+    Futex {
+        uaddr: u64,
+        val: u32,
+        bitset: u32,
+        deadline: Instant,
+    },
+}
+
+/// restart_syscall：接着做被打断的 nanosleep、futex 等待。与 Linux 相同，没有可以接着做的
+/// 时返回 EINTR。
 pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
     match cx.t.restart.take() {
-        Some((deadline, rem)) => sleep_rest(cx, deadline, rem),
+        Some(Restart::Sleep { deadline, rem }) => sleep_rest(cx, deadline, rem),
+        Some(Restart::Futex {
+            uaddr,
+            val,
+            bitset,
+            deadline,
+        }) => futex_wait(cx, (uaddr, val, bitset), Some(deadline)),
         None => Err(Errno::EINTR),
     }
 }

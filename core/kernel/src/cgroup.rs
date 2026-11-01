@@ -23,7 +23,8 @@
 //! （没有内部进程、在用的不能关）。限制按 Linux 的格式检查后记下来，读出来是写进去的值：
 //! `pids.max` 挡住 fork 和建线程（[`pids_charge`]），`memory.max` 由 OOM killer 定时检查
 //! （[`crate::oom`]），别的（`memory.high`、`cpu.max`、`cpuset.cpus`……）不起作用；
-//! `cgroup.freeze` 还不能冻结；`cgroup.kill` 结束整棵子树里的进程。
+//! `cgroup.freeze` 冻结子树里的进程（线程在返回 guest 之前停下，等待中的系统调用与被
+//! 信号打断一样返回、解冻后重新执行）；`cgroup.kill` 结束整棵子树里的进程。
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -31,8 +32,12 @@ use std::fmt::Write;
 
 use crate::cred::Cred;
 use crate::errno::Errno;
+use std::rc::Rc;
+
+use crate::cell::RefCell;
 use crate::kernel::{INIT, Kernel, Tid};
 use crate::oom::Events;
+use crate::process::ThreadGroup;
 
 /// 根 cgroup 的编号（也是它的 inode 号，与 Linux 一样是 1）。
 pub(crate) const ROOT: u64 = 1;
@@ -128,6 +133,8 @@ pub(crate) struct Cgroup {
     pub mem_events_local: Events,
     /// `memory.peak`：量到过的子树的最大用量（字节）。根的是 OOM killer 量的。
     pub mem_peak: Cell<u64>,
+    /// `cgroup.freeze`：这个 cgroup 自己要求冻结（祖先的也冻结它，[`Cgroups::freezing`]）。
+    pub freeze: bool,
 }
 
 impl Cgroup {
@@ -144,6 +151,7 @@ impl Cgroup {
             mem_events: Events::default(),
             mem_events_local: Events::default(),
             mem_peak: Cell::new(0),
+            freeze: false,
         }
     }
 }
@@ -172,6 +180,12 @@ impl Cgroups {
     /// `id` 和它的祖先，从它自己开始。
     fn ancestors(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
         std::iter::successors(Some(id), |&c| self.map.get(&c).and_then(|g| g.parent))
+    }
+
+    /// `id` 或者它的祖先要求冻结（`cgroup.freeze`）：里面的进程要停下。
+    pub fn freezing(&self, id: u64) -> bool {
+        self.ancestors(id)
+            .any(|c| self.map.get(&c).is_some_and(|g| g.freeze))
     }
 
     /// `id` 在 `top` 下面（或者就是它）。
@@ -373,8 +387,13 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
                 .filter(|(_, t)| t.tgid != INIT && group_cgroup(k, t.tgid) == Some(id))
                 .map(|(&tid, _)| tid),
         ),
-        b"cgroup.events" => format!("populated {}\nfrozen 0", populated(k, id) as u8),
-        b"cgroup.freeze" | b"cpu.idle" | b"cpu.max.burst" | b"cpu.weight.nice" => "0".to_owned(),
+        b"cgroup.events" => format!(
+            "populated {}\nfrozen {}",
+            populated(k, id) as u8,
+            frozen(k, id) as u8
+        ),
+        b"cgroup.freeze" => (g.freeze as u8).to_string(),
+        b"cpu.idle" | b"cpu.max.burst" | b"cpu.weight.nice" => "0".to_owned(),
         b"memory.min" | b"memory.low" | b"memory.oom.group" | b"memory.swap.current" => {
             "0".to_owned()
         }
@@ -611,12 +630,25 @@ pub(crate) fn write(
             }
             _ => Err(Errno::ERANGE),
         },
-        b"cgroup.freeze" => match word.parse::<i32>().map_err(|_| Errno::EINVAL)? {
-            0 => Ok(()),
-            // 还不能冻结
-            1 => Err(Errno::EOPNOTSUPP),
-            _ => Err(Errno::ERANGE),
-        },
+        // 0 或 1，别的整数是 ERANGE（Linux 的 cgroup_freeze_write）
+        b"cgroup.freeze" => {
+            let freeze = match word.parse::<i32>().map_err(|_| Errno::EINVAL)? {
+                0 => false,
+                1 => true,
+                _ => return Err(Errno::ERANGE),
+            };
+            k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?.freeze = freeze;
+            let groups: Vec<_> = k
+                .groups
+                .iter()
+                .filter(|&(&tgid, g)| tgid != INIT && k.cgroups.is_within(g.borrow().cgroup, id))
+                .map(|(_, g)| g.clone())
+                .collect();
+            for g in groups {
+                refreeze(k, &g);
+            }
+            Ok(())
+        }
         b"cgroup.type" => match word {
             "threaded" => Err(Errno::EOPNOTSUPP),
             _ => Err(Errno::EINVAL),
@@ -783,7 +815,35 @@ fn migrate(k: &mut Kernel, tid: Tid, (dst, ns_root): (u64, u64), procs: bool) ->
         return Err(Errno::EBUSY);
     }
     g.borrow_mut().cgroup = dst;
+    // 迁移进冻结的 cgroup 就停下，迁移出来就接着运行（Linux 的 cgroup_freezer_migrate_task）
+    refreeze(k, &g);
     Ok(())
+}
+
+/// 进程 `group` 按它所在的 cgroup 该不该冻结（[`Cgroups::freezing`]）：变了时叫醒它的
+/// 线程，让它们在返回 guest 之前停下或者离开那里（[`crate::signal::deliver`]）。
+fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let freezing = k.cgroups.freezing(group.borrow().cgroup);
+    let mut g = group.borrow_mut();
+    if g.frozen == freezing {
+        return;
+    }
+    g.frozen = freezing;
+    for t in g.threads.iter().filter_map(|t| k.tasks.get(t)) {
+        crate::signal::wake(t);
+    }
+}
+
+/// `cgroup.events` 的 frozen：要求冻结，子树里的线程也都停下了（要退出的不算）。空的
+/// cgroup 要求冻结就是冻结的。
+fn frozen(k: &Kernel, id: u64) -> bool {
+    k.cgroups.freezing(id)
+        && k.tasks.values().all(|t| {
+            t.tgid == INIT
+                || t.frozen.get()
+                || t.killed.get()
+                || group_cgroup(k, t.tgid).is_none_or(|c| !k.cgroups.is_within(c, id))
+        })
 }
 
 /// 写 `cgroup.subtree_control`（Linux 的 `cgroup_subtree_control_write`）：`+名字`、`-名字`，

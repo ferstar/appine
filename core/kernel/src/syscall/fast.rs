@@ -327,8 +327,14 @@ fn futex(
     let woke = sleep(task, deadline);
     match waiting.leave() {
         Some(_) => Some(Ok(0)),
-        // 多半是来了信号：持锁的路径重新检查值、重新登记，处理信号
-        None if woke => None,
+        // 多半是来了信号：持锁的路径重新检查值、重新登记，处理信号。相对的超时按这里算好的
+        // 到期时刻接着等（[`TaskState::fast_sleep`]）
+        None if woke => {
+            if cmd == FUTEX_WAIT && deadline.is_some() {
+                task.state.borrow_mut().fast_sleep = deadline;
+            }
+            None
+        }
         None => Some(Err(Errno::ETIMEDOUT)),
     }
 }

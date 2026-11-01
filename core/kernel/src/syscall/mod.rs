@@ -33,6 +33,7 @@ pub(crate) use fs::ENTROPY;
 pub(crate) use fs::{create_exclusive, unlink_path, write_at};
 pub(crate) use inotify::{Inotify, Opened, Registry};
 pub(crate) use lease::Lease;
+pub(crate) use misc::Restart;
 pub(crate) use mount::collect_namespaces;
 pub(crate) use mqueue::{Limits as MqLimits, MessageQueue, MqDir, find as mqueue_find};
 pub(crate) use net::{SocketRef, unmap_addr};

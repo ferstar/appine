@@ -347,6 +347,9 @@ pub(crate) struct ThreadGroup {
     pub tty_old_pgrp: Option<Tid>,
     /// 整个线程组被停止信号停住了。
     pub stopped: bool,
+    /// 所在的 cgroup 或者它的祖先被冻结了（`cgroup.freeze`）：线程在返回 guest 之前停下，
+    /// 与停止信号不同，父进程、wait 看不到。
+    pub frozen: bool,
     /// 停住线程组的停止信号（Linux 的 `JOBCTL_STOP_SIGMASK`），停着时有意义：父进程的
     /// wait 取走停止事件之后仍然记着，停着的时候被跟踪的线程按它报告 group-stop。
     pub stop_signal: Signal,
@@ -439,6 +442,7 @@ impl ThreadGroup {
             ctty: None,
             tty_old_pgrp: None,
             stopped: false,
+            frozen: false,
             stop_signal: Signal::STOP,
             stop_report: None,
             cont_report: false,

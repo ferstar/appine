@@ -79,6 +79,9 @@ pub(crate) struct Task {
     pub saved_sigmask: Cell<Option<u64>>,
     /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
     pub killed: Cell<bool>,
+    /// 线程因为所在的 cgroup 被冻结而停在了投递信号之前（[`crate::signal::deliver`]）：
+    /// `cgroup.events` 的 frozen 看它。
+    pub frozen: Cell<bool>,
     /// `PR_SET_PDEATHSIG`：父进程里建立这个进程的线程退出时发给这个进程的信号，0 表示不发
     /// （[`crate::process::pdeath_signals`]）。与 Linux 一样按线程记，新的线程、进程都从 0
     /// 开始，execve 保留。
@@ -169,10 +172,10 @@ pub(crate) struct TaskState {
     pub clear_child_tid: u64,
     /// vfork 的子进程：execve 或退出时置位，并直接叫醒父进程（它的事件）让它继续。
     pub vfork_done: Option<(Rc<Cell<bool>>, Arc<Event>)>,
-    /// 被信号打断的 nanosleep 剩下的部分（`restart_syscall`）：到期时刻和 `rem` 的地址。
-    pub restart: Option<(std::time::Instant, u64)>,
-    /// 不持 BKL 的 nanosleep（`syscall::fast`）还没睡够就被叫醒，交给持锁的路径：原来的
-    /// 到期时刻。持锁的路径接着睡到它，被信号打断时也按它算剩下多少。
+    /// 被信号打断的 nanosleep、有超时的 futex 等待剩下的部分（`restart_syscall`）。
+    pub restart: Option<crate::syscall::Restart>,
+    /// 不持 BKL 的 nanosleep、有相对超时的 futex 等待（`syscall::fast`）还没睡够就被叫醒，
+    /// 交给持锁的路径：原来的到期时刻。持锁的路径接着睡到它，被信号打断时也按它算剩下多少。
     pub fast_sleep: Option<std::time::Instant>,
 }
 
@@ -202,6 +205,7 @@ impl Task {
             ns: RefCell::new(ns),
             saved_sigmask: Cell::new(None),
             killed: Cell::new(false),
+            frozen: Cell::new(false),
             pdeathsig: Cell::new(0),
             sleeping: AtomicBool::new(false),
             comm: Cell::new(comm),

@@ -919,7 +919,7 @@ pub(crate) fn interrupted(cx: &Cx<'_>) -> bool {
         Some(_) => t.group_stop.is_some() || t.trap,
         None => g.stopped,
     };
-    cx.task.killed.get() || stopping || pending & !mask != 0
+    cx.task.killed.get() || stopping || g.frozen || pending & !mask != 0
 }
 
 /// 停住整个线程组（停止信号的默认动作）：通知父进程，打断其他线程，让它们也停下来。
@@ -949,18 +949,26 @@ fn group_stop(cx: &mut Cx<'_>, sig: Signal) {
 }
 
 /// 线程组停住期间，在这里等到 SIGCONT 或者被结束。停着的时候被 ptrace 跟踪了也离开，
-/// 改为停在 ptrace-stop 里（[`deliver`]）。
+/// 改为停在 ptrace-stop 里（[`deliver`]）。所在的 cgroup 被冻结时也在这里等到解冻
+/// （Linux 的 `do_freezer_trap`），被跟踪的也一样；这期间记着已经停下（`cgroup.events`）。
 fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
-    loop {
+    let flow = loop {
         if cx.task.killed.get() {
-            return Flow::Exit;
+            break Flow::Exit;
         }
-        if !cx.t.group.borrow().stopped || crate::ptrace::traced(cx.task) {
-            return Flow::Continue;
+        let (stopped, frozen) = {
+            let g = cx.t.group.borrow();
+            (g.stopped && !crate::ptrace::traced(cx.task), g.frozen)
+        };
+        if !stopped && !frozen {
+            break Flow::Continue;
         }
-        // 只有 SIGCONT、SIGKILL 能让它离开这里，所以不检查其他信号
+        cx.task.frozen.set(frozen);
+        // 只有 SIGCONT、SIGKILL、解冻能让它离开这里，所以不检查其他信号
         let _ = cx.wait(None, &mut []);
-    }
+    };
+    cx.task.frozen.set(false);
+    flow
 }
 
 /// 返回 guest 之前：处理 syscall 重启，投递所有可以投递的信号。

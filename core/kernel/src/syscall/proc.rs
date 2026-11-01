@@ -319,6 +319,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     // cgroup 的 pids.max（Linux 的 cgroup_can_fork）：线程也算
     let dst = args.cgroup.unwrap_or(cx.t.group.borrow().cgroup);
     crate::cgroup::pids_charge(cx.k(), dst)?;
+    // 放进冻结的 cgroup 的子进程一开始就停下（Linux 的 cgroup_post_fork）
+    let frozen = cx.kr().cgroups.freezing(dst);
     let cred = cx.cred();
     let tid = cx.k().choose_pid(&pid_ns, &cred, &args.set_tid)?;
 
@@ -390,7 +392,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.exe = parent.exe.clone();
         g.exit_signal = args.exit_signal;
         g.pid_ns = pid_ns.clone();
-        g.cgroup = args.cgroup.unwrap_or(parent.cgroup);
+        g.cgroup = dst;
+        g.frozen = frozen;
         Rc::new(RefCell::new(g))
     };
 
@@ -523,6 +526,12 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     if let Err(e) = started {
         cx.k().release_pid(tid);
         return Err(e);
+    }
+    // 它还没运行：kick 之后第一次运行就进内核，在返回 guest 之前停下
+    if group.borrow().frozen
+        && let Some(t) = cx.kr().tasks.get(&tid)
+    {
+        crate::signal::wake(t);
     }
     if !thread {
         let ppid = group.borrow().ppid;

@@ -8,6 +8,7 @@ cat > edges.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -16,6 +17,7 @@ cat > edges.c <<'C'
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -155,6 +157,45 @@ int main(void)
     waitpid(sleeper, NULL, 0);
     printf("stopped sleep %s\n", slept >= 600 && slept < 850 ? "kept its deadline" : "restarted");
 
+    /* 停止又继续：poll（剩下的时间写回 timespec）、futex（restart_block）按原来的到期时刻
+       接着等，epoll_wait 是 EINTR（signal(7)，cgroup 冻结之后解冻也一样） */
+    for (int which = 0; which < 3; which++) {
+        pid_t waiter = fork();
+        if (waiter == 0) {
+            int q[2];
+            pipe(q);
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            long r;
+            if (which == 0) {
+                struct pollfd p = {q[0], POLLIN, 0};
+                r = poll(&p, 1, 600);
+            } else if (which == 2) {
+                static int word;
+                struct timespec rel = {0, 600 * 1000000L};
+                r = syscall(SYS_futex, &word, 128 /* FUTEX_WAIT | FUTEX_PRIVATE_FLAG */, 0, &rel, NULL, 0);
+            } else {
+                int ep = epoll_create1(0);
+                struct epoll_event ev = {.events = EPOLLIN};
+                epoll_ctl(ep, EPOLL_CTL_ADD, q[0], &ev);
+                r = epoll_wait(ep, &ev, 1, 600);
+            }
+            long out[3] = {r, r < 0 ? errno : 0, ms_since(&t0)};
+            write(pipefd[1], out, sizeof out);
+            _exit(0);
+        }
+        usleep(150000);
+        kill(waiter, SIGSTOP);
+        usleep(150000);
+        kill(waiter, SIGCONT);
+        long out[3];
+        read(pipefd[0], out, sizeof out);
+        waitpid(waiter, NULL, 0);
+        printf("stopped %s: %ld %s %s\n", which == 2 ? "futex" : which ? "epoll_wait" : "poll", out[0],
+               out[1] ? strerror(out[1]) : "", out[2] >= 600 && out[2] < 850 ? "kept its deadline"
+               : out[2] < 600 ? "returned early" : "restarted");
+    }
+
     /* 有处理函数时返回 EINTR，rem 是剩下的时间 */
     struct sigaction su = {.sa_handler = on_usr1};
     sigaction(SIGUSR1, &su, NULL);
@@ -168,6 +209,21 @@ int main(void)
     struct timespec req = {2, 0}, rem = {0, 0};
     int r = nanosleep(&req, &rem);
     printf("interrupted sleep %d %s rem<2s %d\n", r, strerror(errno), rem.tv_sec < 2 && (rem.tv_sec || rem.tv_nsec));
+    waitpid(poker, NULL, 0);
+
+    /* 有超时的 futex 等待被处理函数打断是 EINTR，即使有 SA_RESTART（restart_block） */
+    su.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &su, NULL);
+    poker = fork();
+    if (poker == 0) {
+        usleep(100000);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    static int fword;
+    struct timespec ft = {2, 0};
+    r = syscall(SYS_futex, &fword, 128, 0, &ft, NULL, 0);
+    printf("interrupted futex with SA_RESTART %d %s\n", r, strerror(errno));
     waitpid(poker, NULL, 0);
 
     /* 进程持有进程间共享的 robust 锁时退出：等待者拿到 EOWNERDEAD */
