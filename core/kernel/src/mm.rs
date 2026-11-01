@@ -2163,7 +2163,8 @@ impl Mm {
                 (region, m.ptr, None, file_extent(fd, file_offset, len))
             }
             _ => {
-                let (region, host) = Self::new_anonymous(len, template.prot & prot::WRITE != 0)?;
+                let reserve = template.prot & prot::WRITE != 0 && !template.noreserve;
+                let (region, host) = Self::new_anonymous(len, reserve)?;
                 (region, host, None, len)
             }
         };
@@ -2747,7 +2748,8 @@ impl Mm {
                     let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(below as usize)) };
                     (region, host)
                 } else {
-                    Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?
+                    // MAP_NORESERVE 的照样不计入（mmap 时的规则）：ASan 十几 TB 的影子内存
+                    Self::new_anonymous(v.len, v.prot & prot::WRITE != 0 && !v.noreserve)?
                 };
                 let len = v.file_len as usize;
                 if v.backing == Backing::Anonymous && v.written.get() {
@@ -2872,7 +2874,8 @@ impl Mm {
     /// 给一个和别的地址空间共用宿主内存的私有文件映射复制一份自己的。
     fn unshare(&mut self, start: u64) -> Result<(), Errno> {
         let v = &self.vmas[&start];
-        let (region, host) = Self::new_anonymous(v.len, v.prot & prot::WRITE != 0)?;
+        let reserve = v.prot & prot::WRITE != 0 && !v.noreserve;
+        let (region, host) = Self::new_anonymous(v.len, reserve)?;
         // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
         unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
         // 超出文件末尾的页仍然不进页表
