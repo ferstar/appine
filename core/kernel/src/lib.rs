@@ -26,6 +26,7 @@ mod net;
 mod netconf;
 mod netdev;
 mod netns;
+mod nft;
 mod nsproxy;
 mod oom;
 mod pidns;

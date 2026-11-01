@@ -458,6 +458,7 @@ impl Kernel {
             host_net: Some(net),
             lo: Default::default(),
             devs: crate::cell::RefCell::new(devs),
+            nft: Default::default(),
         });
         self.net_nss.push(Rc::downgrade(&ns));
         Ok(ns)

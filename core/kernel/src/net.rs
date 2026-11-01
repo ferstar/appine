@@ -84,6 +84,12 @@ pub(crate) struct InetSocket {
     /// 本端就定成宿主选的 127.0.0.1，回到这个命名空间的回环地址的数据报对不上），不带地址的
     /// 发送发往它，收到的只要来自它的（Linux 已连接的 UDP）。
     pub vconn: Option<Vec<u8>>,
+    /// nftables 的 OUTPUT nat 换过目的地址的（[`crate::nft`]）：(换成的, guest 给的)，都是
+    /// guest 的 sockaddr。从前者收到的数据报报告成来自后者（Linux 由 conntrack 换回）。
+    pub nat_back: Vec<(Vec<u8>, Vec<u8>)>,
+    /// UDP：宿主上绑在 127.a.b.254 上（发给自己的虚拟地址的），端口登记在命名空间的
+    /// [`crate::nsproxy::Loopback::self_udp`] 里，关掉时去掉。
+    pub self_port: Option<u16>,
     /// 新的网络命名空间里的 `IPV6_V6ONLY`：宿主 socket 要用 IPv4 映射的地址，不设它。
     pub v6only: bool,
     /// guest 建的是 raw ICMP socket：收到的报文经由汇集点，改成 raw socket 上的样子
@@ -132,6 +138,8 @@ impl InetSocket {
             guest_peer: None,
             wide: false,
             vconn: None,
+            nat_back: Vec::new(),
+            self_port: None,
             v6only: false,
             icmp: None,
             ttl_set: false,
@@ -156,6 +164,12 @@ impl InetSocket {
 impl Drop for InetSocket {
     fn drop(&mut self) {
         appine_hal::net::close(self.fd);
+        if let (Some(p), Some(n)) = (self.self_port, &self.net)
+            && let Ok(mut lo) = n.lo.try_borrow_mut()
+            && let Some(i) = lo.self_udp.iter().position(|&x| x == p)
+        {
+            lo.self_udp.swap_remove(i);
+        }
     }
 }
 
@@ -745,6 +759,8 @@ pub const NETLINK_ROUTE: i32 = 0;
 pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
 /// NETLINK_GENERIC 的协议号。
 pub const NETLINK_GENERIC: i32 = 16;
+/// NETLINK_NETFILTER 的协议号（nftables，[`crate::nft`]）。
+pub const NETLINK_NETFILTER: i32 = 12;
 
 fn align4(b: &mut Vec<u8>) {
     b.resize(b.len().next_multiple_of(4), 0);
@@ -778,7 +794,7 @@ fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
 
 /// 同 [`ack`]，另外按 `NETLINK_EXT_ACK` 附上 extack 的消息（`NLMSGERR_ATTR_MSG`，带
 /// `NLM_F_ACK_TLVS`），`cap` 是设了 `NETLINK_CAP_ACK`。
-fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
+pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
     const NLM_F_ACK_TLVS: u16 = 0x200;
     const NLMSGERR_ATTR_MSG: u16 = 1;
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
@@ -1224,6 +1240,10 @@ pub(crate) trait Host {
     fn init_net(&self) -> bool {
         true
     }
+    /// `NETLINK_NETFILTER` 上的一个数据报（[`crate::nft::handle`]），返回各个回答的数据报。
+    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 type Route2 = crate::route::Entry;
@@ -1244,6 +1264,21 @@ impl NetlinkSocket {
 
     /// 处理 guest 发来的一个数据报（可能含多条请求），把回答放进队列。
     pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
+        // nftables 的批跨几条消息，整个数据报一起处理
+        if self.protocol == NETLINK_NETFILTER {
+            let peer = crate::nft::Peer {
+                pid: self.pid,
+                ext_ack: self.ext_ack,
+                cap_ack: self.cap_ack,
+                proc_pid: 0,
+                comm: b"",
+            };
+            for d in host.netfilter(data, &peer) {
+                self.queue.push_back(d);
+                self.arrivals += 1;
+            }
+            return;
+        }
         if !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
             return;
         }

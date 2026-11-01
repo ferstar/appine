@@ -180,6 +180,7 @@
 | [M9 之前：容器网络的普查](rounds/169-container-network-survey.md) | 2026-11-01 | docker、podman 的 bridge 网络依赖什么：netlink 建 bridge 和 veth、按接口的 sysctl；docker 关掉 iptables 也在容器里写内置 DNS 的 nat 规则，`-p` 用 docker-proxy；podman 按名字解析靠 aardvark-dns，`-p` 只靠 nftables；appine 里两家都卡在建 bridge；地址映射方案的四步 |
 | [M9 之前：有状态的网卡](rounds/170-netdev.md) | 2026-11-01 | 地址映射方案的第一步：bridge、veth、dummy 的建删改照 Linux 6.1 记在内核层，veth 的对端可以在别的命名空间里，载波和状态、地址、按地址加的和经由 netlink 加的路由、IPv6 的链路本地地址、extack、命名空间的编号；`/sys/class/net` 按读者的命名空间、bridge 的 `brif`；新的 `/proc/sys/net`（接口的配置、`ip_forward`、`ip_unprivileged_port_start` 等）；docker、podman 的 bridge 网络建得起来，容器里的地址和路由与原生相同 |
 | [M9 之前：经由虚拟网卡的连接](rounds/171-netmap.md) | 2026-11-01 | 地址映射方案的第二步：虚拟地址在 socket 层换成宿主上的回环地址（新命名空间的都是它的 127.a.b.1，开机时的命名空间的各分一个 127.255.x.y），低端口映射按目的地的命名空间，经由默认路由出去的交给宿主网络，反过来按"谁在看"换回；绑通配地址的数据报 socket 宿主上也绑通配地址、发往映射的目的地时指定源地址；`SO_ATTACH_FILTER` 的指针；容器之间、外层到容器、docker 的 `-p`、podman 的按名字解析都通了 |
+| [M9 之前：nftables 的子集和 socket 层的 DNAT](rounds/172-nftables.md) | 2026-11-01 | 地址映射方案的第三步：`NETLINK_NETFILTER` 上 nftables 的表、链、规则、集合照 6.8 的内核记在每个网络命名空间里（批、生成号、句柄、转储、extack 的偏移），iptables-nft 的 `nft_compat`；connect、sendto 时执行 OUTPUT 钩子上的 nat 链，DNAT 在 socket 层换目的地址、收到的来源换回；docker 自定义网络按名字解析、`"iptables": true` 的 dockerd、podman 的 nftables 驱动（含经由 OUTPUT 的 `-p`）都能用了；修了新命名空间里发给自己虚拟地址的 UDP 收不到回答 |
 
 ## 测量条件
 

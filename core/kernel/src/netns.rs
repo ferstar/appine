@@ -494,12 +494,132 @@ pub(crate) fn from_host(
     }
 }
 
+/// 宿主地址 `host` 是 `me` 的 127.a.b.254（发给自己的虚拟地址时绑的源地址）。
+pub(crate) fn is_self_source(me: &NetNs, host: &[u8]) -> bool {
+    matches!((me.host_net, ipv4_of(host)), (Some([a, b]), Some(x)) if x == [127, a, b, SELF_VIA_VADDR])
+}
+
+/// `me` 里的数据报发往自己的虚拟地址 `dst`（guest 的）：端口是绑在 127.a.b.254 上的 socket
+/// 的（[`crate::nsproxy::Loopback::self_udp`]，发给自己的虚拟地址的客户端，这是对它的回答）
+/// 时，宿主上的目的地 `host` 换成 127.a.b.254。
+pub(crate) fn toward_self(me: &NetNs, dst: &[u8], host: Vec<u8>) -> Vec<u8> {
+    let (Some([a, b]), Some(ip)) = (me.host_net, ipv4_of(dst)) else {
+        return host;
+    };
+    let port = u16::from_be_bytes([dst[2], dst[3]]);
+    if me.lo.borrow().self_udp.contains(&port)
+        && crate::netdev::local_v4(me).iter().any(|(x, _)| *x == ip)
+    {
+        return with_ipv4(&host, [127, a, b, SELF_VIA_VADDR]);
+    }
+    host
+}
+
+/// 绑在 127.a.b.254 上的 socket 收到来自 127.a.b.1 的数据报（`host` 是来源）：对方发往的是
+/// 自己的虚拟地址，来源也是它（[`toward_self`]）。
+pub(crate) fn from_self(me: &NetNs, host: &[u8]) -> Option<Vec<u8>> {
+    let ([a, b], x) = (me.host_net?, ipv4_of(host)?);
+    if x != [127, a, b, 1] {
+        return None;
+    }
+    let v = crate::netdev::local_v4(me).first()?.0;
+    Some(with_ipv4(host, v))
+}
+
 /// `me` 里发往 guest 地址 `peer` 时的本端：`local`（宿主上的本端，取它的端口）换成发往它时
 /// 的源地址。
 pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<u8>> {
     let ip = ipv4_of(peer)?;
     let src = source(me, ip)?;
     Some(with_ipv4(local, src))
+}
+
+/// nftables 的 OUTPUT nat（[`crate::nft::Nft::output_nat`]）：`me` 里协议 `proto`（TCP、UDP）
+/// 发往 guest 地址 `dst`（sockaddr）的连接、数据报。DNAT 了的返回新的目的地址，规则丢弃时
+/// 是 EPERM。`vaddr` 是 socket 绑的虚拟地址（源地址；没有时按路由选），`sport` 取本端端口。
+pub(crate) fn output_nat(
+    me: &NetNs,
+    proto: u8,
+    vaddr: Option<[u8; 4]>,
+    sport: impl FnOnce() -> u16,
+    dst: &[u8],
+    uid: u32,
+    gid: u32,
+) -> Result<Option<Vec<u8>>, Errno> {
+    let nft = me.nft.borrow();
+    if nft.is_empty() {
+        return Ok(None);
+    }
+    // IPv4 映射的 IPv6 地址按 IPv4 的包
+    let (ip, v4): (Vec<u8>, bool) = match (family(dst), ipv4_of(dst)) {
+        (Some(AF_INET | AF_INET6), Some(x)) => (x.to_vec(), true),
+        (Some(AF_INET6), None) if dst.len() >= 24 => (dst[8..24].to_vec(), false),
+        _ => return Ok(None),
+    };
+    let loopback =
+        |a: &[u8]| (a.len() == 4 && a[0] == 127) || a == std::net::Ipv6Addr::LOCALHOST.octets();
+    let local = |a: &[u8]| {
+        loopback(a)
+            || crate::netdev::interfaces(me)
+                .iter()
+                .any(|i| i.addrs.iter().any(|(_, x, _)| x == a))
+    };
+    let src = match (vaddr, v4) {
+        (Some(v), true) => v.to_vec(),
+        _ if loopback(&ip) => ip.clone(),
+        (None, true) => source(me, ip[..4].try_into().unwrap())
+            .unwrap_or_default()
+            .to_vec(),
+        _ => vec![0; 16],
+    };
+    let src = if src.len() == ip.len() {
+        src
+    } else {
+        vec![0; ip.len()]
+    };
+    let addr_type = |a: &[u8]| crate::nft::addr_type(a, local);
+    let oif = || -> Vec<u8> {
+        if local(&ip) {
+            return b"lo".to_vec();
+        }
+        let index = v4
+            .then(|| crate::netdev::route_v4(me, ip[..4].try_into().unwrap()))
+            .flatten()
+            .map(|e| e.index);
+        crate::netdev::interfaces(me)
+            .into_iter()
+            .find(|i| Some(i.index) == index)
+            .map(|i| i.name.into_bytes())
+            .unwrap_or_default()
+    };
+    let p = crate::nft::Packet {
+        src: &src,
+        dst: &ip,
+        proto,
+        sport: sport(),
+        dport: u16::from_be_bytes([dst[2], dst[3]]),
+        uid,
+        gid,
+        addr_type: &addr_type,
+        oif: &oif,
+    };
+    match nft.output_nat(&p) {
+        crate::nft::Outcome::Accept => Ok(None),
+        crate::nft::Outcome::Drop => Err(Errno::EPERM),
+        crate::nft::Outcome::Dnat(a, port) => {
+            let mut out = if v4 {
+                with_ipv4(dst, a[..4].try_into().map_err(|_| Errno::EINVAL)?)
+            } else {
+                let mut o = dst.to_vec();
+                o[8..24].copy_from_slice(&a);
+                o
+            };
+            if let Some(port) = port {
+                out[2..4].copy_from_slice(&port.to_be_bytes());
+            }
+            Ok(Some(out))
+        }
+    }
 }
 
 /// 宿主上别的命名空间的回环地址（127.c.d.1、127.255.x.y）在 `me` 里看到的虚拟地址。
@@ -816,6 +936,7 @@ mod tests {
             host_net: Some([1, 2]),
             lo: Default::default(),
             devs: Default::default(),
+            nft: Default::default(),
         }
     }
 
@@ -963,6 +1084,7 @@ mod tests {
                 host_net: Some([7, b]),
                 lo: Default::default(),
                 devs: RefCell::new(crate::netdev::Devices::for_new_ns(&Default::default())),
+                nft: Default::default(),
             })
         };
         let (a, b) = (net(1), net(2));

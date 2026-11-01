@@ -61,6 +61,8 @@ impl Errno {
     pub const ESPIPE: Errno = Errno(29);
     /// 只读文件系统。
     pub const EROFS: Errno = Errno(30);
+    /// 链接太多（nftables 跳转的深度超过上限）。
+    pub const EMLINK: Errno = Errno(31);
     /// 管道的读端已全部关闭。
     pub const EPIPE: Errno = Errno(32);
     /// 结果超出范围。

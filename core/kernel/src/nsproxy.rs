@@ -141,6 +141,8 @@ pub(crate) struct NetNs {
     pub lo: RefCell<Loopback>,
     /// 虚拟设备、经由它们的路由和 sysctl（[`crate::netdev`]）。
     pub devs: RefCell<crate::netdev::Devices>,
+    /// nftables 的规则集（[`crate::nft`]）。
+    pub nft: RefCell<crate::nft::Nft>,
 }
 
 /// 新的网络命名空间里 lo 的状态：一开始是关着的、没有地址（Linux 的 `loopback_net_init`）。
@@ -154,6 +156,9 @@ pub(crate) struct Loopback {
     pub v6: bool,
     /// 设过的 MTU（`SIOCSIFMTU`），默认 65536。
     pub mtu: Option<u32>,
+    /// 宿主上绑在 127.a.b.254 上的 UDP 端口：发给自己的虚拟地址的 socket 绑在那里
+    /// （[`crate::netns`]），发往虚拟地址的这些端口的数据报（对它们的回答）要送到那里。
+    pub self_udp: Vec<u16>,
 }
 
 /// 一个命名空间（Linux 的 `struct ns_common`）。打开着的命名空间文件、bind 挂载出去的
@@ -237,6 +242,7 @@ impl NsProxy {
                 host_net: None,
                 lo: RefCell::default(),
                 devs: RefCell::default(),
+                nft: Default::default(),
             }),
             cgroup: Rc::new(CgroupNs {
                 id: INIT_CGROUP_NS,

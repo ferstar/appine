@@ -2952,6 +2952,7 @@ mod tests {
             host_net: Some([9, b]),
             lo: Default::default(),
             devs: RefCell::new(Devices::for_new_ns(&NetConf::default())),
+            nft: Default::default(),
         })
     }
 

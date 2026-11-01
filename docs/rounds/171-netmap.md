@@ -1,6 +1,6 @@
 # M9 之前：经由虚拟网卡的连接：socket 层的地址映射（2026-11-01）
 
-← [M9 之前：有状态的网卡（2026-11-01）](170-netdev.md) · [索引](../milestones.md)
+← [M9 之前：有状态的网卡（2026-11-01）](170-netdev.md) · [索引](../milestones.md) · [M9 之前：nftables 的子集和 socket 层的 DNAT（2026-11-01）](172-nftables.md) →
 
 [容器网络的普查](169-container-network-survey.md)定下的方案 1 的第二步。[上一轮](170-netdev.md)之后 docker、podman 的 bridge 网络建得起来、容器起得来，但数据包不经过虚拟网卡：容器之间、外层到容器都是 "Network unreachable"，docker 的 `-p` 容器起不来，podman 自定义网络的 aardvark-dns 绑不上网关地址。这一轮在 socket 层把虚拟设备上的地址换成宿主上的回环地址，连接、数据报都经由宿主的回环接口，与[网络命名空间](122-net-namespaces.md)换 lo 的地址是同一个办法。
 
@@ -36,8 +36,8 @@
 - 单元测试新增 1 个（`netns`）：开机时的命名空间和两个新命名空间各有一个带地址的设备，各个方向的 to_host、from_host，去掉默认路由之后外面到不了。原有的 lo 的用例改成新的接口。
 - 变异检查：别的命名空间的回环段不换回虚拟地址、目的地一律换成自己的段、低端口按自己命名空间的登记换、不加 `IP_PKTINFO`，`netmap` 组分别在看到的对端、能不能连上、连 80、绑通配地址的 UDP 客户端那几处与原生不同。
 - 普查（与原生对照）：
-  - docker（`"iptables": false`）：容器之间按 IP、外层到容器的 IP、`-p 8080:80`（docker-proxy 起来了，经由 127.0.0.1 拿到回答，经由外层地址的 "Connection reset by peer" 也与原生相同）都与原生一致。不同的只剩两处：容器里 ping 外层的网关通了（原生没有 NAT 时不通，见推迟项）；自定义网络按名字解析（内置 DNS 的 nat 规则，第 3 步）。
-  - podman（`firewall_driver = "none"`）：容器之间、外层到容器、自定义网络按名字解析（aardvark-dns 绑在网关地址上，nslookup、wget 按容器名都对）都与原生一致。不同的是 ping 外层的网关（同上）和 `-p` 时 podman 占着端口的那个监听 socket（第 4 步）。nftables 驱动仍是第 3 步。
+  - docker（`"iptables": false`）：容器之间按 IP、外层到容器的 IP、`-p 8080:80`（docker-proxy 起来了，经由 127.0.0.1 拿到回答，经由外层地址的 "Connection reset by peer" 也与原生相同）都与原生一致。不同的只剩两处：容器里 ping 外层的网关通了（原生没有 NAT 时不通，见推迟项）；自定义网络按名字解析（内置 DNS 的 nat 规则，第 3 步）。 → 按名字解析通了（M9 之前：nftables 的子集和 socket 层的 DNAT）
+  - podman（`firewall_driver = "none"`）：容器之间、外层到容器、自定义网络按名字解析（aardvark-dns 绑在网关地址上，nslookup、wget 按容器名都对）都与原生一致。不同的是 ping 外层的网关（同上）和 `-p` 时 podman 占着端口的那个监听 socket（第 4 步）。nftables 驱动仍是第 3 步。 → nftables 驱动能用了，`-p` 经由 127.0.0.1 和外层地址也通了（M9 之前：nftables 的子集和 socket 层的 DNAT）
   - 两个普查都没有内核层报告的内部错误。
 - cargo test（308 个）、clippy（含 Android）、格式、两层的全部差分测试（45 组）通过。LTP 的 syscall 测试 1011 个通过（上次 1012）：pselect01_64 因为睡得太久失败（多睡了 0.5–2 ms）；用上一轮的提交编的二进制这时也连续失败；随后 pselect01、nanosleep01、select02、poll02 也都超了阈值，原生容器里同样的 `select` 也多睡这么多（睡 25 ms 多 4.4 ms，appine 里多 4.2 ms），是 colima 虚拟机这段时间的计时器精度，不是回归。
 
@@ -48,5 +48,6 @@
 - 宿主上绑通配地址的数据报 socket（上面那种）在宿主的所有接口上收得到发给那个临时端口的数据报；它 connect 到映射的目的地之后，ICMP 错误（对方没有监听时的 ECONNREFUSED）收不到。
 - IPv6 的虚拟地址（`fd00::` 这种）没有映射：连、绑都不行；只有经由虚拟设备的 IPv6 路由出去的交给宿主网络。
 - 直连网段里没有的地址马上是 EHOSTUNREACH，不等 ARP 超时；没有 ARP、邻居表。
+- 新命名空间里发给自己的虚拟地址的 UDP 收不到回答（客户端绑在 127.a.b.254，回答发往 127.a.b.1；写这一篇时没有发现）。 → 修了（M9 之前：nftables 的子集和 socket 层的 DNAT）
 - 组播、广播不经过 bridge。
 - raw ICMP 的错误匹配（汇集点里）只换自己的回环段：别的容器的地址引起的 ICMP 错误可能对不上连接。
