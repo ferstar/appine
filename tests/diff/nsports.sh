@@ -123,6 +123,15 @@ hold tcp 7003
 nsenter -t "$B" -n python3 cli.py tcp 10.70.0.2 7003 b-to-a-7003
 python3 cli.py tcp 10.70.0.2 7003 outer-to-a-7003
 nsenter -t "$A" -n python3 cli.py tcp 127.0.0.1 7003 a-to-itself-7003
+echo "== UDP to A where nothing is bound (the outer namespace answers on that port)"
+serve $$ udp 0.0.0.0 7009 1
+nsenter -t "$B" -n python3 cli.py udp 10.70.0.2 7009 b-to-a-udp-unbound
+python3 cli.py udp 127.0.0.1 7009 outer-to-itself
+served
+serve "$A" udp 127.0.0.1 7010 1
+nsenter -t "$B" -n python3 cli.py udp 10.70.0.2 7010 b-to-a-udp-lo
+nsenter -t "$A" -n python3 cli.py udp 127.0.0.1 7010 a-to-lo-udp
+served
 echo "== bound to 127.0.0.1 in A"
 serve "$A" tcp 127.0.0.1 7004 1
 nsenter -t "$B" -n python3 cli.py tcp 10.70.0.2 7004 b-to-a-lo

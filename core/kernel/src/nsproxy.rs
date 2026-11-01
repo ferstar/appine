@@ -143,12 +143,13 @@ pub(crate) struct NetNs {
     pub devs: RefCell<crate::netdev::Devices>,
     /// nftables 的规则集（[`crate::nft`]）。
     pub nft: RefCell<crate::nft::Nft>,
-    /// 新的网络命名空间里监听着的 TCP socket（[`crate::netns::listening`]）。
+    /// 新的网络命名空间里监听着的 TCP socket、绑了的 UDP socket（[`crate::netns::listening`]）。
     pub listeners: RefCell<Vec<Listener>>,
 }
 
-/// 新的网络命名空间里一个监听着的 TCP socket：宿主上它们都在这个命名空间的回环地址上，连
-/// 过来时按这里判断有没有人监听、绑的地址对不对得上（Linux 上没有就是 ECONNREFUSED）。
+/// 新的网络命名空间里一个监听着的 TCP socket 或者绑了的 UDP socket：宿主上它们都在这个命名
+/// 空间的回环地址上，连过来、发过来时按这里判断有没有人、绑的地址对不对得上（Linux 上 TCP
+/// 是 ECONNREFUSED，UDP 被丢掉）。
 #[derive(Debug, Clone)]
 pub(crate) struct Listener {
     /// 去掉时用的编号（[`crate::net::InetSocket::listener`]）。
@@ -160,6 +161,8 @@ pub(crate) struct Listener {
     /// AF_INET6 的 socket，以及它的 `IPV6_V6ONLY`。
     pub v6: bool,
     pub v6only: bool,
+    /// UDP 的（绑了的），不然是 TCP 的（监听着的）。
+    pub udp: bool,
 }
 
 /// 新的网络命名空间里 lo 的状态：一开始是关着的、没有地址（Linux 的 `loopback_net_init`）。

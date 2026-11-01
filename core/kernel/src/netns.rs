@@ -506,7 +506,7 @@ pub(crate) fn from_host(
 /// 新的网络命名空间 `t` 里有没有在 guest 地址 `dst`（sockaddr，`t` 里看到的）上监听着的 TCP
 /// socket（[`crate::nsproxy::Listener`]）：通配地址的接受 IPv4 和 IPv6（AF_INET 的只接受
 /// IPv4，设了 `IPV6_V6ONLY` 的只接受 IPv6），绑在某个地址上的只接受发往它的。
-pub(crate) fn listening(t: &NetNs, dst: &[u8]) -> bool {
+pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
     let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
         return true;
     };
@@ -517,6 +517,7 @@ pub(crate) fn listening(t: &NetNs, dst: &[u8]) -> bool {
     };
     t.listeners.borrow().iter().any(|l| {
         l.port == port
+            && l.udp == udp
             && match &l.addr {
                 None if ip.len() == 4 => !l.v6 || !l.v6only,
                 None => l.v6,
@@ -525,16 +526,30 @@ pub(crate) fn listening(t: &NetNs, dst: &[u8]) -> bool {
     })
 }
 
-/// 新的网络命名空间里的 socket 开始监听：登记它（[`listening`]）。`host` 是它在宿主上的本端。
-pub(crate) fn add_listener(
-    me: &NetNs,
-    port: u16,
-    any: bool,
-    vaddr: Option<[u8; 4]>,
-    host: &[u8],
-    v6: bool,
-    v6only: bool,
-) -> std::num::NonZeroU64 {
+/// [`add_listener`] 登记的：guest 的端口、绑的是不是通配地址、绑的虚拟地址、宿主上的本端、
+/// 地址族和 `IPV6_V6ONLY`、是不是 UDP。
+#[derive(Clone, Copy)]
+pub(crate) struct ListenAt<'a> {
+    pub port: u16,
+    pub any: bool,
+    pub vaddr: Option<[u8; 4]>,
+    pub host: &'a [u8],
+    pub v6: bool,
+    pub v6only: bool,
+    pub udp: bool,
+}
+
+/// 新的网络命名空间里的 TCP socket 开始监听、UDP socket 绑定：登记它（[`listening`]）。
+pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64 {
+    let ListenAt {
+        port,
+        any,
+        vaddr,
+        host,
+        v6,
+        v6only,
+        udp,
+    } = *l;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 绑的 guest 地址：虚拟地址；127.a.b.x 是 127.0.0.x，AF_INET6 的 127.a.b.1 是 ::1
@@ -545,6 +560,10 @@ pub(crate) fn add_listener(
     } else {
         match ipv4_of(host) {
             Some([_, _, _, 1]) if v6 && mapped(&host[8..24]).is_some() => Some(LOOPBACK6.to_vec()),
+            // 发给自己的虚拟地址时绑的 127.a.b.254：收的是发往虚拟地址的
+            Some([_, _, _, SELF_VIA_VADDR]) => {
+                crate::netdev::local_v4(me).first().map(|(a, _)| a.to_vec())
+            }
             Some([_, _, _, x]) => Some(vec![127, 0, 0, x]),
             None => None,
         }
@@ -555,6 +574,7 @@ pub(crate) fn add_listener(
         addr,
         v6,
         v6only,
+        udp,
     });
     std::num::NonZeroU64::new(id).expect("starts at 1")
 }
@@ -1459,29 +1479,100 @@ mod tests {
             v6(a, 0)
         };
         let eth0 = [10, 9, 0, 2];
-        let a = add_listener(&n, 7000, true, None, &host(1), false, false);
-        add_listener(&n, 7001, true, None, &mapped(1), true, true);
-        add_listener(&n, 7002, false, None, &host(1), false, false);
-        add_listener(&n, 7003, false, Some(eth0), &host(1), false, false);
-        add_listener(&n, 7004, false, None, &mapped(1), true, false);
+        let a = add_listener(
+            &n,
+            &ListenAt {
+                port: 7000,
+                any: true,
+                vaddr: None,
+                host: &host(1),
+                v6: false,
+                v6only: false,
+                udp: false,
+            },
+        );
+        add_listener(
+            &n,
+            &ListenAt {
+                port: 7001,
+                any: true,
+                vaddr: None,
+                host: &mapped(1),
+                v6: true,
+                v6only: true,
+                udp: false,
+            },
+        );
+        add_listener(
+            &n,
+            &ListenAt {
+                port: 7002,
+                any: false,
+                vaddr: None,
+                host: &host(1),
+                v6: false,
+                v6only: false,
+                udp: false,
+            },
+        );
+        add_listener(
+            &n,
+            &ListenAt {
+                port: 7003,
+                any: false,
+                vaddr: Some(eth0),
+                host: &host(1),
+                v6: false,
+                v6only: false,
+                udp: false,
+            },
+        );
+        add_listener(
+            &n,
+            &ListenAt {
+                port: 7004,
+                any: false,
+                vaddr: None,
+                host: &mapped(1),
+                v6: true,
+                v6only: false,
+                udp: false,
+            },
+        );
         // 0.0.0.0：IPv4 的都行，纯 IPv6 的不行
-        assert!(listening(&n, &v4(eth0, 7000)));
-        assert!(listening(&n, &v4([127, 0, 0, 1], 7000)));
-        assert!(!listening(&n, &v6(LOOPBACK6, 7000)));
+        assert!(listening(&n, &v4(eth0, 7000), false));
+        assert!(listening(&n, &v4([127, 0, 0, 1], 7000), false));
+        assert!(!listening(&n, &v6(LOOPBACK6, 7000), false));
         // [::] 且 IPV6_V6ONLY：只有 IPv6
-        assert!(listening(&n, &v6(LOOPBACK6, 7001)));
-        assert!(!listening(&n, &v4(eth0, 7001)));
+        assert!(listening(&n, &v6(LOOPBACK6, 7001), false));
+        assert!(!listening(&n, &v4(eth0, 7001), false));
         // 127.0.0.1、eth0 的地址、::1 只接受发往它的
-        assert!(listening(&n, &v4([127, 0, 0, 1], 7002)));
-        assert!(!listening(&n, &v4(eth0, 7002)));
-        assert!(listening(&n, &v4(eth0, 7003)));
-        assert!(!listening(&n, &v4([127, 0, 0, 1], 7003)));
-        assert!(listening(&n, &v6(LOOPBACK6, 7004)));
-        assert!(!listening(&n, &v4([127, 0, 0, 1], 7004)));
+        assert!(listening(&n, &v4([127, 0, 0, 1], 7002), false));
+        assert!(!listening(&n, &v4(eth0, 7002), false));
+        assert!(listening(&n, &v4(eth0, 7003), false));
+        assert!(!listening(&n, &v4([127, 0, 0, 1], 7003), false));
+        assert!(listening(&n, &v6(LOOPBACK6, 7004), false));
+        assert!(!listening(&n, &v4([127, 0, 0, 1], 7004), false));
+        // UDP 和 TCP 分开登记
+        add_listener(
+            &n,
+            &ListenAt {
+                port: 7005,
+                any: true,
+                vaddr: None,
+                host: &host(1),
+                v6: false,
+                v6only: false,
+                udp: true,
+            },
+        );
+        assert!(listening(&n, &v4(eth0, 7005), true));
+        assert!(!listening(&n, &v4(eth0, 7005), false));
+        assert!(!listening(&n, &v4(eth0, 7000), true));
         // 没有监听的端口；去掉之后也没有了
-        assert!(!listening(&n, &v4(eth0, 7999)));
+        assert!(!listening(&n, &v4(eth0, 7999), false));
         n.listeners.borrow_mut().retain(|l| l.id != a.get());
-        assert!(!listening(&n, &v4(eth0, 7000)));
+        assert!(!listening(&n, &v4(eth0, 7000), false));
     }
 
     /// 只有开机时的命名空间和 `ns` 的世界里换算（只看地址）。

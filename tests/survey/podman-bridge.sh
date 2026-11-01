@@ -8,6 +8,7 @@
 exec 2>&1
 command -v strace >/dev/null || apk add -q strace
 command -v nft >/dev/null || apk add -q nftables
+command -v iptables >/dev/null || apk add -q iptables
 step() { echo; echo "== $*"; }
 tidy() { sed -E 's/[0-9a-f]{12,64}/ID/g; s/veth[0-9a-f]+/vethX/g; s/podman[0-9]+/podmanN/g'; }
 # 服务端是 nc -l 的循环（Alpine 的 busybox 没有 httpd）
@@ -91,8 +92,12 @@ config 'firewall_driver = "none"'
 probe "firewall none"
 report "firewall none"
 
-# 默认的驱动是 iptables（镜像里没有），显式用 nftables
+# 默认的驱动是 iptables（装了 iptables 时），也试 nftables
 config 'firewall_driver = "nftables"'
 probe "firewall nftables"
 report "firewall nftables"
+
+config 'firewall_driver = "iptables"'
+probe "firewall iptables"
+report "firewall iptables"
 podman rm -af >/dev/null 2>&1

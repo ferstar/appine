@@ -231,6 +231,7 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
                 Some(addr) => {
                     appine_hal::net::bind(s.fd, addr).map_err(Errno)?;
                     s.any = true;
+                    register_udp(s);
                     // 发给自己的虚拟地址的 UDP socket：登记端口，回答才送得到（crate::netns）
                     if s.ty == SOCK_DGRAM
                         && crate::netns::is_self_source(&net, addr)
@@ -258,6 +259,39 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
         s.any = true;
     }
     Ok(())
+}
+
+/// 新的网络命名空间里绑了的 UDP socket 登记在命名空间里（[`crate::netns::listening`]）：
+/// 发往那里的数据报按它判断有没有人收。显式绑的、发送之前替它绑的都算。
+fn register_udp(s: &mut InetSocket) {
+    let Some(net) = s.net.clone() else {
+        return;
+    };
+    if s.ty != SOCK_DGRAM || s.icmp.is_some() || s.listener.is_some() || map_proto(s) != IPPROTO_UDP
+    {
+        return;
+    }
+    let Ok(local) = appine_hal::net::sockname(s.fd, false) else {
+        return;
+    };
+    let Some(host) = port_of(&local).filter(|&p| p != 0) else {
+        return;
+    };
+    let port = match s.local_map {
+        Some((g, h)) if h == host => g,
+        _ => host,
+    };
+    let any = s.any || s.wide || crate::netns::is_any(&local);
+    let at = crate::netns::ListenAt {
+        port,
+        any,
+        vaddr: s.vaddr,
+        host: &local,
+        v6: s.family == AF_INET6,
+        v6only: s.v6only,
+        udp: true,
+    };
+    s.listener = Some(crate::netns::add_listener(&net, &at));
 }
 
 /// 这个 socket 所在的网络命名空间（开机时的记作 None）。
@@ -456,6 +490,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                 s.any = crate::netns::is_any(&addr);
                 s.vaddr = mapped.vaddr;
                 s.wide = wide;
+                register_udp(s);
             }
             // 开机时的命名空间里绑了端口的 UDP socket：PREROUTING 有 DNAT 时转发外面来的
             if s.ty == SOCK_DGRAM {
@@ -511,9 +546,16 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
                     _ => host,
                 };
                 let v6 = s.family == AF_INET6;
-                s.listener = Some(crate::netns::add_listener(
-                    net, port, s.any, s.vaddr, &local, v6, s.v6only,
-                ));
+                let at = crate::netns::ListenAt {
+                    port,
+                    any: s.any,
+                    vaddr: s.vaddr,
+                    host: &local,
+                    v6,
+                    v6only: s.v6only,
+                    udp: false,
+                };
+                s.listener = Some(crate::netns::add_listener(net, &at));
             }
             // 开机时的命名空间里的监听：PREROUTING 有 DNAT 时转发外面来的连接（crate::forward）
             forward_socket(cx.kr(), s);
@@ -662,7 +704,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 if s.ty == SOCK_STREAM
                     && let Some(t) = &m.target
                     && t.host_net.is_some()
-                    && !crate::netns::listening(t, &there)
+                    && !crate::netns::listening(t, &there, false)
                 {
                     return Err(Errno::ECONNREFUSED);
                 }
@@ -691,8 +733,20 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 // 这里记下对端（InetSocket::vconn）；原来宿主上连着的先断开
                 let was = s.vconn.take();
                 if s.wide && s.ty == SOCK_DGRAM && m.target.is_some() {
-                    if was.is_none() {
+                    // 宿主上真连着才断开；断开会放掉内核分的端口（绑的是端口 0 时，
+                    // udp_disconnect），绑回原来的，getsockname 和登记的端口才不变
+                    if was.is_none() && appine_hal::net::sockname(s.fd, true).is_ok() {
+                        let old = appine_hal::net::sockname(s.fd, false).ok();
                         let _ = appine_hal::net::connect(s.fd, &[0u8; 16]);
+                        if let Some(o) = old
+                            && appine_hal::net::sockname(s.fd, false)
+                                .ok()
+                                .as_deref()
+                                .and_then(port_of)
+                                != port_of(&o)
+                        {
+                            let _ = appine_hal::net::bind(s.fd, &o);
+                        }
                     }
                     s.vconn = Some(host_addr);
                     s.peer = Some(addr.clone());
@@ -1304,9 +1358,9 @@ pub(crate) fn send(
                 let Routed {
                     m,
                     dst,
+                    there,
                     actual,
                     verdict,
-                    ..
                 } = route(&w, s, &me, addr, &cred)?;
                 // 过滤链丢弃、拒绝了的：OUTPUT 上的是 EPERM（Linux 的 ip_local_out），别处的
                 // 悄悄丢掉
@@ -1314,6 +1368,15 @@ pub(crate) fn send(
                     (crate::nft::Outcome::Accept | crate::nft::Outcome::Dnat(..), _) => {}
                     (_, true) => return Err(Errno::EPERM),
                     (_, false) => return Ok(data.len()),
+                }
+                // 发往新的网络命名空间里没人绑的端口（或者只绑了别的地址）：Linux 上丢掉，
+                // 不能交给宿主（外层绑通配地址的 UDP socket 会收到）
+                if nat_proto(s) == Some(IPPROTO_UDP as u8)
+                    && let Some(t) = &m.target
+                    && t.host_net.is_some()
+                    && !crate::netns::listening(t, &there, true)
+                {
+                    return Ok(data.len());
                 }
                 if let Some(t) = &actual
                     && !s
@@ -1426,6 +1489,13 @@ pub(crate) fn send(
     };
     if done > 0 || sent_datagram {
         account(cx, sock, false, done, addr);
+    }
+    // 宿主自动绑定的（新命名空间里第一次发往外面的）：这时才知道端口，登记它
+    if sent_datagram
+        && let Socket::Inet(s) = &mut *sock.borrow_mut()
+        && s.listener.is_none()
+    {
+        register_udp(s);
     }
     r
 }

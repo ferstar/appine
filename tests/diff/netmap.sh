@@ -55,8 +55,11 @@ try:
         if kind in ("udpbind", "udpconn"):
             c.bind(("0.0.0.0", 0))
         if kind == "udpconn":
+            before = c.getsockname()[1]
             c.connect((addr, port))
-            print(f"{msg}: connected {c.getsockname()[0]} -> {c.getpeername()[0]}")
+            # 端口不变（appine 原来在这里放掉了宿主分的端口）
+            same = c.getsockname()[1] == before
+            print(f"{msg}: connected {c.getsockname()[0]} -> {c.getpeername()[0]}, same port {same}")
             c.send(msg.encode())
         else:
             c.sendto(msg.encode(), (addr, port))

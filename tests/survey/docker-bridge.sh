@@ -97,6 +97,9 @@ probe() {
     nsenter -t "$pid" -n nft list ruleset 2>&1 | grep -E 'table|DNAT|SNAT|127\.0\.0\.11' | sed -E 's/(port|sport|dport) [0-9]+/\1 N/g; s/packets [0-9]+ bytes [0-9]+/C/' | tidy | head -12
     step "$1: chains in the outer namespace"
     nft list ruleset 2>&1 | grep -E '^table|chain' | tr -d '{' | tidy | head -24
+    step "$1: --sysctl"
+    docker run --rm --sysctl net.ipv4.tcp_keepalive_time=600 --sysctl net.core.somaxconn=1024 alpine:3.24 \
+        sh -c 'cat /proc/sys/net/ipv4/tcp_keepalive_time /proc/sys/net/core/somaxconn' 2>&1 | head -3
     step "$1: isolation between networks"
     docker network create other >/dev/null
     docker network create --internal inner >/dev/null

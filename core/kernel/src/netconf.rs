@@ -195,6 +195,8 @@ pub(crate) struct NetConf {
     pub prot_sock: i64,
     /// `ipv4/ping_group_range`。
     pub ping_group: (i64, i64),
+    /// 写过的 [`SYSCTLS`]（没写过的是默认值）。
+    pub sysctls: BTreeMap<&'static str, String>,
 }
 
 impl Default for NetConf {
@@ -211,6 +213,7 @@ impl Default for NetConf {
             // 开机时的命名空间与 Android（和 systemd 的默认配置）一样允许所有组；新建的
             // 命名空间是 Linux 的默认值，谁也不允许（只记下，不限制）
             ping_group: (0, 2_147_483_647),
+            sysctls: BTreeMap::new(),
         }
     }
 }
@@ -324,9 +327,295 @@ pub(crate) fn parse_ping_group(data: &[u8]) -> Result<(i64, i64), Errno> {
     Ok(if hi < lo { (1, 0) } else { (lo, hi) })
 }
 
+/// `/proc/sys/net` 下别的 sysctl（docs/rounds/177-net-sysctls.md）：路径（`core/`、`ipv4/`、`ipv6/`、
+/// `unix/` 下）、默认值（几个数之间是 tab）、权限位，以及是不是只在开机时的命名空间里有。
+/// 照 Linux 6.1 在新的网络命名空间里给出的那些（ipv4/conf、route 这些子目录除外）。写入的值
+/// 只记下，不起作用。
+pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
+    ("core/netdev_max_backlog", "1000", 0o644, true),
+    ("core/optmem_max", "131072", 0o644, false),
+    ("core/rmem_default", "212992", 0o644, true),
+    ("core/rmem_max", "212992", 0o644, true),
+    ("core/txrehash", "1", 0o644, false),
+    ("core/wmem_default", "212992", 0o644, true),
+    ("core/wmem_max", "212992", 0o644, true),
+    ("core/xfrm_acq_expires", "30", 0o644, false),
+    ("core/xfrm_aevent_etime", "10", 0o644, false),
+    ("core/xfrm_aevent_rseqth", "2", 0o644, false),
+    ("core/xfrm_larval_drop", "1", 0o644, false),
+    ("ipv4/fib_multipath_hash_fields", "7", 0o644, false),
+    ("ipv4/fib_multipath_hash_policy", "0", 0o644, false),
+    ("ipv4/fib_multipath_use_neigh", "0", 0o644, false),
+    ("ipv4/fib_notify_on_flag_change", "0", 0o644, false),
+    ("ipv4/fwmark_reflect", "0", 0o644, false),
+    ("ipv4/icmp_echo_enable_probe", "0", 0o644, false),
+    ("ipv4/icmp_echo_ignore_all", "0", 0o644, false),
+    ("ipv4/icmp_echo_ignore_broadcasts", "1", 0o644, false),
+    ("ipv4/icmp_errors_use_inbound_ifaddr", "0", 0o644, false),
+    ("ipv4/icmp_ignore_bogus_error_responses", "1", 0o644, false),
+    ("ipv4/icmp_ratelimit", "1000", 0o644, false),
+    ("ipv4/icmp_ratemask", "6168", 0o644, false),
+    ("ipv4/igmp_link_local_mcast_reports", "1", 0o644, false),
+    ("ipv4/igmp_max_memberships", "20", 0o644, false),
+    ("ipv4/igmp_max_msf", "10", 0o644, false),
+    ("ipv4/igmp_qrv", "2", 0o644, false),
+    ("ipv4/ip_autobind_reuse", "0", 0o644, false),
+    ("ipv4/ip_default_ttl", "64", 0o644, false),
+    ("ipv4/ip_dynaddr", "0", 0o644, false),
+    ("ipv4/ip_early_demux", "1", 0o644, false),
+    ("ipv4/ip_forward_update_priority", "1", 0o644, false),
+    ("ipv4/ip_forward_use_pmtu", "0", 0o644, false),
+    ("ipv4/ip_local_reserved_ports", "", 0o644, false),
+    ("ipv4/ip_no_pmtu_disc", "0", 0o644, false),
+    ("ipv4/ip_nonlocal_bind", "0", 0o644, false),
+    ("ipv4/ipfrag_high_thresh", "4194304", 0o644, false),
+    ("ipv4/ipfrag_low_thresh", "3145728", 0o644, false),
+    ("ipv4/ipfrag_max_dist", "64", 0o644, false),
+    ("ipv4/ipfrag_time", "30", 0o644, false),
+    ("ipv4/nexthop_compat_mode", "1", 0o644, false),
+    ("ipv4/raw_l3mdev_accept", "1", 0o644, false),
+    ("ipv4/tcp_abort_on_overflow", "0", 0o644, false),
+    ("ipv4/tcp_adv_win_scale", "1", 0o644, false),
+    (
+        "ipv4/tcp_allowed_congestion_control",
+        "reno cubic",
+        0o444,
+        false,
+    ),
+    ("ipv4/tcp_app_win", "31", 0o644, false),
+    ("ipv4/tcp_autocorking", "1", 0o644, false),
+    (
+        "ipv4/tcp_available_congestion_control",
+        "reno cubic",
+        0o444,
+        false,
+    ),
+    ("ipv4/tcp_base_mss", "1024", 0o644, false),
+    ("ipv4/tcp_challenge_ack_limit", "2147483647", 0o644, false),
+    ("ipv4/tcp_child_ehash_entries", "0", 0o644, false),
+    ("ipv4/tcp_comp_sack_delay_ns", "1000000", 0o644, false),
+    ("ipv4/tcp_comp_sack_nr", "44", 0o644, false),
+    ("ipv4/tcp_comp_sack_slack_ns", "100000", 0o644, false),
+    ("ipv4/tcp_congestion_control", "cubic", 0o644, false),
+    ("ipv4/tcp_dsack", "1", 0o644, false),
+    ("ipv4/tcp_early_demux", "1", 0o644, false),
+    ("ipv4/tcp_early_retrans", "3", 0o644, false),
+    ("ipv4/tcp_ecn", "2", 0o644, false),
+    ("ipv4/tcp_ecn_fallback", "1", 0o644, false),
+    ("ipv4/tcp_ehash_entries", "-32768", 0o444, false),
+    ("ipv4/tcp_fack", "0", 0o644, false),
+    ("ipv4/tcp_fastopen", "1", 0o644, false),
+    ("ipv4/tcp_fastopen_blackhole_timeout_sec", "0", 0o644, false),
+    (
+        "ipv4/tcp_fastopen_key",
+        "00000000-00000000-00000000-00000000",
+        0o600,
+        false,
+    ),
+    ("ipv4/tcp_fin_timeout", "60", 0o644, false),
+    ("ipv4/tcp_frto", "2", 0o644, false),
+    ("ipv4/tcp_fwmark_accept", "0", 0o644, false),
+    ("ipv4/tcp_invalid_ratelimit", "500", 0o644, false),
+    ("ipv4/tcp_keepalive_intvl", "75", 0o644, false),
+    ("ipv4/tcp_keepalive_probes", "9", 0o644, false),
+    ("ipv4/tcp_keepalive_time", "7200", 0o644, false),
+    ("ipv4/tcp_l3mdev_accept", "0", 0o644, false),
+    ("ipv4/tcp_limit_output_bytes", "1048576", 0o644, false),
+    ("ipv4/tcp_max_reordering", "300", 0o644, false),
+    ("ipv4/tcp_max_syn_backlog", "256", 0o644, false),
+    ("ipv4/tcp_max_tw_buckets", "16384", 0o644, false),
+    ("ipv4/tcp_migrate_req", "0", 0o644, false),
+    ("ipv4/tcp_min_rtt_wlen", "300", 0o644, false),
+    ("ipv4/tcp_min_snd_mss", "48", 0o644, false),
+    ("ipv4/tcp_min_tso_segs", "2", 0o644, false),
+    ("ipv4/tcp_moderate_rcvbuf", "1", 0o644, false),
+    ("ipv4/tcp_mtu_probe_floor", "48", 0o644, false),
+    ("ipv4/tcp_mtu_probing", "0", 0o644, false),
+    ("ipv4/tcp_no_metrics_save", "0", 0o644, false),
+    ("ipv4/tcp_no_ssthresh_metrics_save", "1", 0o644, false),
+    ("ipv4/tcp_notsent_lowat", "4294967295", 0o644, false),
+    ("ipv4/tcp_orphan_retries", "0", 0o644, false),
+    ("ipv4/tcp_pacing_ca_ratio", "120", 0o644, false),
+    ("ipv4/tcp_pacing_ss_ratio", "200", 0o644, false),
+    ("ipv4/tcp_pingpong_thresh", "1", 0o644, false),
+    ("ipv4/tcp_probe_interval", "600", 0o644, false),
+    ("ipv4/tcp_probe_threshold", "8", 0o644, false),
+    ("ipv4/tcp_recovery", "1", 0o644, false),
+    ("ipv4/tcp_reflect_tos", "0", 0o644, false),
+    ("ipv4/tcp_reordering", "3", 0o644, false),
+    ("ipv4/tcp_retrans_collapse", "1", 0o644, false),
+    ("ipv4/tcp_retries1", "3", 0o644, false),
+    ("ipv4/tcp_retries2", "15", 0o644, false),
+    ("ipv4/tcp_rfc1337", "0", 0o644, false),
+    ("ipv4/tcp_rmem", "4096\t131072\t6291456", 0o644, false),
+    ("ipv4/tcp_sack", "1", 0o644, false),
+    ("ipv4/tcp_slow_start_after_idle", "1", 0o644, false),
+    ("ipv4/tcp_stdurg", "0", 0o644, false),
+    ("ipv4/tcp_syn_retries", "6", 0o644, false),
+    ("ipv4/tcp_synack_retries", "5", 0o644, false),
+    ("ipv4/tcp_syncookies", "1", 0o644, false),
+    ("ipv4/tcp_thin_linear_timeouts", "0", 0o644, false),
+    ("ipv4/tcp_timestamps", "1", 0o644, false),
+    ("ipv4/tcp_tso_rtt_log", "9", 0o644, false),
+    ("ipv4/tcp_tso_win_divisor", "3", 0o644, false),
+    ("ipv4/tcp_tw_reuse", "2", 0o644, false),
+    ("ipv4/tcp_window_scaling", "1", 0o644, false),
+    ("ipv4/tcp_wmem", "4096\t16384\t4194304", 0o644, false),
+    ("ipv4/tcp_workaround_signed_windows", "0", 0o644, false),
+    ("ipv4/udp_early_demux", "1", 0o644, false),
+    ("ipv4/udp_l3mdev_accept", "0", 0o644, false),
+    ("ipv4/udp_rmem_min", "4096", 0o644, false),
+    ("ipv4/udp_wmem_min", "4096", 0o644, false),
+    ("ipv4/xfrm4_gc_thresh", "32768", 0o644, false),
+    ("ipv6/anycast_src_echo_reply", "0", 0o644, false),
+    ("ipv6/auto_flowlabels", "1", 0o644, false),
+    ("ipv6/bindv6only", "0", 0o644, false),
+    ("ipv6/fib_multipath_hash_fields", "7", 0o644, false),
+    ("ipv6/fib_multipath_hash_policy", "0", 0o644, false),
+    ("ipv6/fib_notify_on_flag_change", "0", 0o644, false),
+    ("ipv6/flowlabel_consistency", "1", 0o644, false),
+    ("ipv6/flowlabel_reflect", "0", 0o644, false),
+    ("ipv6/flowlabel_state_ranges", "0", 0o644, false),
+    ("ipv6/fwmark_reflect", "0", 0o644, false),
+    ("ipv6/idgen_delay", "1", 0o644, false),
+    ("ipv6/idgen_retries", "3", 0o644, false),
+    ("ipv6/ioam6_id", "16777215", 0o644, false),
+    ("ipv6/ioam6_id_wide", "72057594037927935", 0o644, false),
+    ("ipv6/ip6frag_high_thresh", "4194304", 0o644, false),
+    ("ipv6/ip6frag_low_thresh", "3145728", 0o644, false),
+    ("ipv6/ip6frag_time", "60", 0o644, false),
+    ("ipv6/ip_nonlocal_bind", "0", 0o644, false),
+    ("ipv6/max_dst_opts_length", "2147483647", 0o644, false),
+    ("ipv6/max_dst_opts_number", "8", 0o644, false),
+    ("ipv6/max_hbh_length", "2147483647", 0o644, false),
+    ("ipv6/max_hbh_opts_number", "8", 0o644, false),
+    ("ipv6/seg6_flowlabel", "0", 0o644, false),
+    ("ipv6/xfrm6_gc_thresh", "32768", 0o644, false),
+    ("unix/max_dgram_qlen", "10", 0o644, false),
+];
+
+/// `/proc/sys/net/` 下的路径 `path`（如 `ipv4/tcp_keepalive_time`）在 [`SYSCTLS`] 里的那一项；
+/// `init` 是开机时的命名空间（只在那里有的也算）。
+pub(crate) fn sysctl(
+    path: &[u8],
+    init: bool,
+) -> Option<&'static (&'static str, &'static str, u16, bool)> {
+    SYSCTLS
+        .iter()
+        .find(|(p, _, _, only)| p.as_bytes() == path && (init || !only))
+}
+
+/// 读 [`SYSCTLS`] 里的一项：写过的值或者默认值。
+pub(crate) fn sysctl_read(conf: &NetConf, path: &'static str) -> String {
+    let dflt = sysctl(path.as_bytes(), true).map_or("", |e| e.1);
+    let v = conf.sysctls.get(path).map_or(dflt, String::as_str);
+    format!("{v}\n")
+}
+
+/// 写 [`SYSCTLS`] 里的一项：整数的按默认值的个数，写几个改前几个、多出来的不看
+/// （`proc_dointvec`）；
+/// 拥塞控制算法要是有的（不然 ENOENT）；保留的端口、TCP Fast Open 的密钥按格式。
+pub(crate) fn sysctl_write(
+    conf: &mut NetConf,
+    path: &'static str,
+    data: &[u8],
+) -> Result<(), Errno> {
+    let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    let text = text.trim_end_matches(['\n', '\0']).trim();
+    let value = match path {
+        "ipv4/tcp_congestion_control" => {
+            if !matches!(text, "reno" | "cubic") {
+                return Err(Errno::ENOENT);
+            }
+            text.to_owned()
+        }
+        "ipv4/ip_local_reserved_ports" => {
+            let ok = text
+                .split(',')
+                .all(|r| r.is_empty() || r.split('-').all(|p| p.trim().parse::<u16>().is_ok()));
+            if !ok {
+                return Err(Errno::EINVAL);
+            }
+            text.to_owned()
+        }
+        "ipv4/tcp_fastopen_key" => {
+            let ok = text.split(',').all(|k| {
+                let parts: Vec<&str> = k.split('-').collect();
+                parts.len() == 4
+                    && parts
+                        .iter()
+                        .all(|p| p.len() <= 8 && u32::from_str_radix(p, 16).is_ok())
+            });
+            if !ok {
+                return Err(Errno::EINVAL);
+            }
+            text.to_owned()
+        }
+        _ => {
+            let old = sysctl_read(conf, path);
+            let mut vals: Vec<String> = old.trim_end().split('\t').map(str::to_owned).collect();
+            let new: Vec<&str> = text.split_whitespace().collect();
+            // 多出来的不看（`__do_proc_dointvec` 按表里的个数读）
+            let new = &new[..new.len().min(vals.len())];
+            if new.is_empty() || new.iter().any(|v| v.parse::<i64>().is_err()) {
+                return Err(Errno::EINVAL);
+            }
+            for (slot, v) in vals.iter_mut().zip(new) {
+                *slot = v.parse::<i64>().unwrap().to_string();
+            }
+            vals.join("\t")
+        }
+    };
+    conf.sysctls.insert(path, value);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 别的 sysctl：默认值，整数写几个改前几个、多出来的不看，不是数是 EINVAL，拥塞控制算法
+    /// 要是有的，只在开机时的命名空间里有的。
+    #[test]
+    fn plain_sysctls() {
+        let mut c = NetConf::default();
+        assert_eq!(sysctl_read(&c, "ipv4/tcp_keepalive_time"), "7200\n");
+        assert_eq!(sysctl_read(&c, "ipv4/tcp_rmem"), "4096\t131072\t6291456\n");
+        sysctl_write(&mut c, "ipv4/tcp_rmem", b"8192\n").unwrap();
+        assert_eq!(sysctl_read(&c, "ipv4/tcp_rmem"), "8192\t131072\t6291456\n");
+        sysctl_write(&mut c, "ipv4/tcp_rmem", b"1 2 3 4").unwrap();
+        assert_eq!(sysctl_read(&c, "ipv4/tcp_rmem"), "1\t2\t3\n");
+        assert_eq!(
+            sysctl_write(&mut c, "ipv4/tcp_fin_timeout", b"abc"),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            sysctl_write(&mut c, "ipv4/tcp_fin_timeout", b""),
+            Err(Errno::EINVAL)
+        );
+        sysctl_write(&mut c, "ipv4/tcp_congestion_control", b"reno\n").unwrap();
+        assert_eq!(
+            sysctl_write(&mut c, "ipv4/tcp_congestion_control", b"bbr"),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(sysctl_read(&c, "ipv4/tcp_congestion_control"), "reno\n");
+        sysctl_write(&mut c, "ipv4/ip_local_reserved_ports", b"8080,9000-9010").unwrap();
+        assert_eq!(
+            sysctl_write(&mut c, "ipv4/ip_local_reserved_ports", b"x"),
+            Err(Errno::EINVAL)
+        );
+        // 新的命名空间里没有只在开机时的命名空间里有的
+        assert!(sysctl(b"core/rmem_max", true).is_some());
+        assert!(sysctl(b"core/rmem_max", false).is_none());
+        assert!(sysctl(b"ipv4/tcp_keepalive_time", false).is_some());
+        assert!(sysctl(b"ipv4/no_such", true).is_none());
+        // 每个命名空间各有一份
+        let other = NetConf::for_new_ns(&c);
+        assert_eq!(
+            sysctl_read(&other, "ipv4/tcp_congestion_control"),
+            "cubic\n"
+        );
+    }
 
     #[test]
     fn tables_are_sorted_and_parse_like_proc_dointvec() {

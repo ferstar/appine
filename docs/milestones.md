@@ -185,6 +185,7 @@
 | [M9 之前：各个网络命名空间的端口互不相干](rounds/174-namespace-ports.md) | 2026-11-01 | 新命名空间里显式绑的端口在宿主上另选、登记在映射表里：外层（podman、docker-proxy）占着同一个端口时容器照样绑得上，`-p 8080:8080` 这类内外同端口的发布原来起不来；新命名空间里的 TCP 监听登记在命名空间里，连过去没有对得上的监听就是 ECONNREFUSED（不再被外层的通配监听接走），只绑 127.0.0.1 的服务从别处连不到 |
 | [M9 之前：过滤链](rounds/175-filter.md) | 2026-11-01 | connect、sendto 时执行连接沿途经过的过滤链（发送方的 OUTPUT，经由开机时的命名空间的 FORWARD、INPUT，目的地的 INPUT，各自的 PREROUTING 上的 filter 链）；reject 带错误码，xt 的 REJECT、conntrack、state；UDP 回给收到过的对方是 ESTABLISHED；TCP 被丢弃的连到接受队列满了的宿主监听上、照 Linux 的重传超时；docker 网络之间的隔离与原生一致 |
 | [M9 之前：从外面转发进来的连接带上真实的客户端地址](rounds/176-real-client-address.md) | 2026-11-01 | 转发线程接受的外面设备的 TCP 连接按连接分一个 127.254.x.y、绑客户端的端口再连容器，登记下来；容器里 accept、getpeername、`/proc/net` 报告客户端真实的地址（原来是网关），回环地址来的照旧 |
+| [M9 之前：网络命名空间的 sysctl 补齐、UDP 也查有没有人绑](rounds/177-net-sysctls.md) | 2026-11-02 | `/proc/sys/net` 的 `core/`、`ipv4/`、`ipv6/`、`unix/` 下照 Linux 补齐（140 项加开机时的命名空间才有的 5 项，值按命名空间记、只记不起作用），docker 的 `--sysctl`、compose 的 `sysctls:` 能用了；新命名空间里绑了的 UDP socket 也登记，发往没人绑的端口的悄悄丢掉；修了先绑通配地址的 UDP socket connect 时端口变了；podman 的 iptables 驱动普查与原生一致 |
 
 ## 测量条件
 

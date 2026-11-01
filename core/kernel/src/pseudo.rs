@@ -273,7 +273,7 @@ const PROC_NET: [&[u8]; 18] = [
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
 /// `sys/net` 下的按读者所在的网络命名空间（与 Linux 一样），`ipv4/conf`、`ipv6/conf` 下的
 /// 目录是 [`PseudoNode::NetConf`]。
-const STATIC: [&[u8]; 85] = [
+const STATIC: [&[u8]; 86] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -342,6 +342,7 @@ const STATIC: [&[u8]; 85] = [
     b"sys/net/ipv4/ping_group_range",
     b"sys/net/ipv6/",
     b"sys/net/ipv6/conf/",
+    b"sys/net/unix/",
     b"sys/user/",
     b"sys/user/max_cgroup_namespaces",
     b"sys/user/max_ipc_namespaces",
@@ -643,6 +644,9 @@ pub(crate) enum PseudoNode {
     /// 或者它下面的一项（名字取值来自 [`crate::netconf`] 的表）；按读者所在的网络命名空间
     /// （[`crate::netdev::conf_read`]）。
     NetConf(bool, crate::netdev::ConfDir, &'static [u8]),
+    /// `/proc/sys/net/` 下的一项 sysctl（[`crate::netconf::SYSCTLS`] 里的，路径如
+    /// `ipv4/tcp_keepalive_time`），按读者所在的网络命名空间。
+    NetSysctl(&'static str),
 }
 
 /// `ipv4/conf`、`ipv6/conf` 的目录。
@@ -952,6 +956,11 @@ impl Pseudo for View<'_> {
             SysBrif(n, _) => SysNet(*n, b"brif/"),
             Cgroup(id, _) => Cgroup(*id, b""),
             NetConf(v6, _, b"") => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
+            NetSysctl(path) => {
+                let dir = &path[..=path.find('/').unwrap_or(0)];
+                tree_lookup(&STATIC, b"sys/net/", dir.trim_end_matches('/').as_bytes())
+                    .map_or(ProcRoot, Static)
+            }
             NetConf(v6, dir, _) => NetConf(*v6, *dir, b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
@@ -993,6 +1002,7 @@ impl Pseudo for View<'_> {
                 crate::netdev::conf_dir_name(&self.ns().net, *dir).unwrap_or_else(|| b"?".to_vec())
             }
             NetConf(_, _, name) => name.to_vec(),
+            NetSysctl(path) => tree_name(path.as_bytes()).to_vec(),
             SysNet(_, path) => tree_name(path).to_vec(),
             SysBrif(_, p) => self
                 .interface(*p)
@@ -1071,7 +1081,12 @@ impl Pseudo for View<'_> {
                     .find(|(n, _)| n == name)
                     .map(|(_, d)| NetConf(*path == NET_CONF6, d, b""))
             }
-            Static(path) => tree_lookup(&STATIC, path, name).map(Static),
+            Static(path) => tree_lookup(&STATIC, path, name).map(Static).or_else(|| {
+                let rest = path.strip_prefix(b"sys/net/")?;
+                let full = [rest, name].concat();
+                let init = self.ns().net.host_net.is_none();
+                crate::netconf::sysctl(&full, init).map(|e| NetSysctl(e.0))
+            }),
             NetConf(v6, dir, b"") => crate::netconf::table(*v6)
                 .iter()
                 .find(|(n, ..)| n.as_bytes() == name)
@@ -1159,6 +1174,7 @@ impl Pseudo for View<'_> {
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
             Cgroup(_, b"") => mode::S_IFDIR,
+            NetSysctl(_) => mode::S_IFREG,
             NetConf(_, dir, name) => {
                 if !self.conf_dir_exists(*dir) {
                     return Err(Errno::ENOENT);
@@ -1473,6 +1489,9 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
                 .map_or(0o666, |v| v.devpts_options(*fs).ptmxmode)
         }
         (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
+        (_, PseudoNode::NetSysctl(path)) => {
+            u32::from(crate::netconf::sysctl(path.as_bytes(), true).map_or(0o444, |e| e.2))
+        }
         (_, n) if writable(n) => 0o644,
         (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv)) => 0o400,
         (_, PseudoNode::Global(Global::Kmsg)) => 0o400,
@@ -1565,6 +1584,9 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     if let PseudoNode::NetConf(_, _, name) = node {
         return !name.is_empty() && !crate::netconf::read_only(name);
     }
+    if let PseudoNode::NetSysctl(path) = node {
+        return crate::netconf::sysctl(path.as_bytes(), true).is_some_and(|e| e.2 & 0o200 != 0);
+    }
     matches!(
         node,
         PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
@@ -1640,6 +1662,9 @@ pub(crate) fn write(
         // 网络命名空间的 sysctl：写入者所在的那个（crate::netconf）
         PseudoNode::NetConf(v6, dir, name) => {
             return crate::netdev::conf_write(&ns.net, *v6, *dir, name, data);
+        }
+        PseudoNode::NetSysctl(path) => {
+            return crate::netconf::sysctl_write(&mut ns.net.devs.borrow_mut().conf, path, data);
         }
         PseudoNode::Static(b"sys/net/ipv4/ip_forward") => {
             return crate::netdev::conf_write(
@@ -1973,7 +1998,23 @@ pub(crate) fn readdir(
                     .map(|(_, d)| NetConf(v6, d, b"")),
             );
         }
-        Static(path) => nodes.extend(tree_children(&STATIC, path).map(Static)),
+        Static(path) => {
+            nodes.extend(tree_children(&STATIC, path).map(Static));
+            // /proc/sys/net/core、ipv4、ipv6、unix 下的 sysctl
+            if let Some(dir) = path.strip_prefix(b"sys/net/") {
+                let init = ps.ns().net.host_net.is_none();
+                nodes.extend(
+                    crate::netconf::SYSCTLS
+                        .iter()
+                        .filter(|(p, _, _, only)| {
+                            (init || !only)
+                                && p.as_bytes().starts_with(dir)
+                                && !p.as_bytes()[dir.len()..].contains(&b'/')
+                        })
+                        .map(|e| NetSysctl(e.0)),
+                );
+            }
+        }
         NetConf(v6, dir, b"") => nodes.extend(
             crate::netconf::table(*v6)
                 .iter()
@@ -3338,6 +3379,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         NetConf(v6, dir, name) => {
             crate::netdev::conf_read(&ps.ns().net, *v6, *dir, name)?
         }
+        NetSysctl(path) => crate::netconf::sysctl_read(&ps.ns().net.devs.borrow().conf, path),
         // 只能写的（cgroup.kill）读是 EINVAL
         Cgroup(_, b"") => return Err(Errno::EISDIR),
         Cgroup(id, name) => crate::cgroup::file(ps.k, *id, name).ok_or(Errno::EINVAL)?,
