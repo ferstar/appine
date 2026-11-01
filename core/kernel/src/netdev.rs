@@ -362,6 +362,9 @@ pub(crate) struct Devices {
     pub conf: NetConf,
     /// 给别的命名空间分配的编号（`IFLA_LINK_NETNSID`、`RTM_GETNSID`）。
     pub nsids: Vec<(Weak<NetNs>, i32)>,
+    /// 开机时的命名空间里：虚拟地址和它在宿主上的回环地址（127.255.x.y，用到时分配，
+    /// [`crate::netns`]）。
+    pub hostmap: Vec<([u8; 4], [u8; 4])>,
 }
 
 impl Devices {
@@ -668,6 +671,48 @@ pub(crate) fn views(ns: &NetNs) -> Vec<View> {
     let mut v: Vec<View> = d.list.iter().map(|x| view(x, &d, ns)).collect();
     v.sort_by_key(|x| x.index);
     v
+}
+
+/// 命名空间 `ns` 里虚拟设备上的 IPv4 地址和前缀长度（地址映射用，[`crate::netns`]）。
+pub(crate) fn local_v4(ns: &NetNs) -> Vec<([u8; 4], u8)> {
+    let d = devs(ns);
+    let mut v = Vec::new();
+    for x in &d.list {
+        v.extend(x.borrow().v4.iter().map(|a| (a.local, a.prefix)));
+    }
+    v
+}
+
+/// 命名空间 `ns` 里经由虚拟设备到 IPv4 地址 `ip` 的路由（主表里的最长前缀，一样长的取度量
+/// 小的）。
+pub(crate) fn route_v4(ns: &NetNs, ip: [u8; 4]) -> Option<Entry> {
+    entries(ns)
+        .into_iter()
+        .filter(|e| {
+            e.family == AF_INET
+                && e.table == RT_TABLE_MAIN
+                && crate::route::network(&ip, e.prefix) == e.dst
+        })
+        .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
+}
+
+/// 命名空间 `ns` 里经由虚拟设备有没有 IPv6 的路由到 `ip`。
+pub(crate) fn routes_v6(ns: &NetNs, ip: &[u8; 16]) -> bool {
+    entries(ns).iter().any(|e| {
+        e.family == AF_INET6
+            && e.table == RT_TABLE_MAIN
+            && crate::route::network(ip, e.prefix) == e.dst
+    })
+}
+
+/// 命名空间 `ns` 里编号为 `index` 的虚拟设备上的第一个 primary IPv4 地址。
+pub(crate) fn first_v4(ns: &NetNs, index: u32) -> Option<[u8; 4]> {
+    let d = devs(ns);
+    let x = d.by_index(index)?;
+    let x = x.borrow();
+    x.v4.iter()
+        .find(|a| a.flags & IFA_F_SECONDARY == 0)
+        .map(|a| a.local)
 }
 
 /// 命名空间 `ns` 里所有的接口（宿主的或者 lo，加上虚拟设备），按编号。
@@ -2844,6 +2889,55 @@ fn ipv6_switch(ns: &NetNs) {
 /// `ipv4/ip_forward`（`all/forwarding` 的别名）。
 pub(crate) fn ip_forward(ns: &NetNs) -> i64 {
     ns.devs.borrow().conf.all4.get(false, "forwarding")
+}
+
+/// 测试用：在 `ns` 里建一个启用着的 dummy 设备，配上地址 `addr`/`prefix`，给了网关时再加
+/// 一条经由它的默认路由。
+#[cfg(test)]
+pub(crate) fn test_dev(ns: &Rc<NetNs>, name: &str, addr: [u8; 4], prefix: u8, gw: Option<[u8; 4]>) {
+    let none = |_: u16, _: u32| -> Result<Rc<NetNs>, Errno> { Err(Errno::ESRCH) };
+    let root = Cred::root();
+    let send = |ty: u16, flags: u16, body: Vec<u8>| {
+        let req = crate::net::message(ty, flags | 1, 1, 0, &body);
+        request(ns, &root, &req, &none).unwrap().unwrap();
+    };
+    let mut link = vec![0u8; 16];
+    link[8..12].copy_from_slice(&IFF_UP.to_le_bytes());
+    link[12..16].copy_from_slice(&IFF_UP.to_le_bytes());
+    let mut n = name.as_bytes().to_vec();
+    n.push(0);
+    attr(&mut link, IFLA_IFNAME, &n);
+    let mut li = Vec::new();
+    attr(&mut li, IFLA_INFO_KIND, b"dummy");
+    attr(&mut link, IFLA_LINKINFO, &li);
+    send(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, link);
+    let index = views(ns)
+        .iter()
+        .find(|v| v.name == name.as_bytes())
+        .unwrap()
+        .index;
+    let mut a = vec![AF_INET as u8, prefix, 0, 0];
+    a.extend_from_slice(&index.to_le_bytes());
+    attr(&mut a, IFA_LOCAL, &addr);
+    send(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, a);
+    if let Some(g) = gw {
+        let mut r = vec![
+            AF_INET as u8,
+            0,
+            0,
+            0,
+            RT_TABLE_MAIN,
+            3,
+            0,
+            RTN_UNICAST,
+            0,
+            0,
+            0,
+            0,
+        ];
+        attr(&mut r, RTA_GATEWAY, &g);
+        send(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, r);
+    }
 }
 
 #[cfg(test)]

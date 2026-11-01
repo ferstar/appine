@@ -71,6 +71,19 @@ pub(crate) struct InetSocket {
     pub bound: bool,
     /// 新的网络命名空间里：本端是通配地址、还没有连接（getsockname 报告通配地址）。
     pub any: bool,
+    /// 新的网络命名空间里：绑在自己的虚拟地址上（宿主上与通配地址一样是 127.a.b.1，
+    /// getsockname 报告它，[`crate::netns`]）。
+    pub vaddr: Option<[u8; 4]>,
+    /// connect 给的对端（guest 的地址）：getpeername 报告它。
+    pub guest_peer: Option<Vec<u8>>,
+    /// 新的网络命名空间里宿主 socket 绑在通配地址上（数据报 socket 显式绑通配地址、端口
+    /// 为 0 的，第一次发往宿主网络时由宿主自动绑定的）：发得到外面。发往映射的目的地时
+    /// 用 `IP_PKTINFO` 把源地址指定成这个命名空间的回环地址（[`crate::netns`]）。
+    pub wide: bool,
+    /// `wide` 的数据报 socket 连到了映射的目的地（宿主上的地址）：宿主 socket 不连接（连了
+    /// 本端就定成宿主选的 127.0.0.1，回到这个命名空间的回环地址的数据报对不上），不带地址的
+    /// 发送发往它，收到的只要来自它的（Linux 已连接的 UDP）。
+    pub vconn: Option<Vec<u8>>,
     /// 新的网络命名空间里的 `IPV6_V6ONLY`：宿主 socket 要用 IPv4 映射的地址，不设它。
     pub v6only: bool,
     /// guest 建的是 raw ICMP socket：收到的报文经由汇集点，改成 raw socket 上的样子
@@ -115,6 +128,10 @@ impl InetSocket {
             net: None,
             bound: false,
             any: false,
+            vaddr: None,
+            guest_peer: None,
+            wide: false,
+            vconn: None,
             v6only: false,
             icmp: None,
             ttl_set: false,
@@ -197,6 +214,7 @@ pub(crate) fn proc_listing(
     family: i32,
     table: Table,
     portmap: &crate::cell::RefCell<crate::portmap::PortMap>,
+    w: &crate::netns::World,
 ) -> String {
     let (v6, tcp) = (family == AF_INET6, table == Table::Tcp);
     let width = match table {
@@ -237,19 +255,25 @@ pub(crate) fn proc_listing(
         if !listed {
             continue;
         }
-        // 新的网络命名空间里的地址换成 guest 看到的（crate::netns）
-        let guest = |a: Vec<u8>, any: bool| match &inet.net {
-            Some(ns) => crate::netns::from_host(ns, &a, any, inet.icmp6()),
-            None => a,
-        };
-        // 映射了的低端口报告 guest 的（crate::portmap）
-        let unmap = |a: Vec<u8>, local: bool| crate::syscall::unmap_addr(portmap, inet, a, local);
-        let local = appine_hal::net::sockname(fd, false)
-            .ok()
-            .map(|a| guest(unmap(a, true), inet.any));
-        let peer = appine_hal::net::sockname(fd, true)
-            .ok()
-            .map(|a| guest(unmap(a, false), false))
+        // 地址换成 guest 看到的（crate::netns），映射了的低端口报告 guest 的（crate::portmap）
+        let me = inet.net.clone().unwrap_or_else(|| w.all[0].clone());
+        let unmap =
+            |a: Vec<u8>, local: bool| crate::syscall::unmap_addr(portmap, w, inet, a, local);
+        let host_peer = appine_hal::net::sockname(fd, true).ok();
+        let local = appine_hal::net::sockname(fd, false).ok().map(|a| {
+            let role = crate::netns::Role::Local {
+                any: inet.any,
+                vaddr: inet.vaddr,
+                peer: host_peer.as_deref(),
+            };
+            crate::netns::from_host(w, &me, &unmap(a, true), role, inet.icmp6())
+        });
+        let peer = host_peer
+            .clone()
+            .map(|a| {
+                let role = crate::netns::Role::Peer;
+                crate::netns::from_host(w, &me, &unmap(a, false), role, inet.icmp6())
+            })
             .or_else(|| inet.peer.clone());
         let state = if tcp {
             appine_hal::net::getsockopt(fd, IPPROTO_TCP, TCP_INFO, 8)

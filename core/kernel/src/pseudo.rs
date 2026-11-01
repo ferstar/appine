@@ -3089,6 +3089,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 .map(|(s, uid)| (s, reader.uid_out(uid)))
                 .collect();
             let ifaces = crate::netdev::interfaces(&full);
+            let world = ps.k.world();
             let quiet = crate::traffic::Protocols::default();
             let protocols = if net.is_some() {
                 &quiet
@@ -3109,14 +3110,14 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 b"ipv6_route" => crate::route::proc_ipv6_route(&tables()),
                 b"sockstat" => crate::net::sockstat(&socks, false),
                 b"sockstat6" => crate::net::sockstat(&socks, true),
-                b"tcp" => crate::net::proc_listing(&socks, AF_INET, Table::Tcp, &ps.k.portmap),
-                b"tcp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Tcp, &ps.k.portmap),
-                b"udp" => crate::net::proc_listing(&socks, AF_INET, Table::Udp, &ps.k.portmap),
-                b"udp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Udp, &ps.k.portmap),
-                b"icmp" => crate::net::proc_listing(&socks, AF_INET, Table::Icmp, &ps.k.portmap),
-                b"icmp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Icmp, &ps.k.portmap),
-                b"raw" => crate::net::proc_listing(&socks, AF_INET, Table::Raw, &ps.k.portmap),
-                b"raw6" => crate::net::proc_listing(&socks, AF_INET6, Table::Raw, &ps.k.portmap),
+                b"tcp" => crate::net::proc_listing(&socks, AF_INET, Table::Tcp, &ps.k.portmap, &world),
+                b"tcp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Tcp, &ps.k.portmap, &world),
+                b"udp" => crate::net::proc_listing(&socks, AF_INET, Table::Udp, &ps.k.portmap, &world),
+                b"udp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Udp, &ps.k.portmap, &world),
+                b"icmp" => crate::net::proc_listing(&socks, AF_INET, Table::Icmp, &ps.k.portmap, &world),
+                b"icmp6" => crate::net::proc_listing(&socks, AF_INET6, Table::Icmp, &ps.k.portmap, &world),
+                b"raw" => crate::net::proc_listing(&socks, AF_INET, Table::Raw, &ps.k.portmap, &world),
+                b"raw6" => crate::net::proc_listing(&socks, AF_INET6, Table::Raw, &ps.k.portmap, &world),
                 b"unix" => crate::unix::proc_listing(&socks),
                 _ => return Err(Errno::ENOENT),
             }

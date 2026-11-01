@@ -179,6 +179,7 @@
 | [M9 之前：open_tree、move_mount 和 mount_setattr](rounds/168-open-tree.md) | 2026-11-01 | open_tree（`OPEN_TREE_CLONE` 复制出不挂在任何地方的树，fd 关掉就拆）、move_mount 接上或者挪、mount_setattr 改挂载的标志；删除挂载点只看自己的命名空间，别处的随之卸下；用户命名空间里的 root 能装 seccomp 过滤器；podman `--uidmap` 的容器起得来了 |
 | [M9 之前：容器网络的普查](rounds/169-container-network-survey.md) | 2026-11-01 | docker、podman 的 bridge 网络依赖什么：netlink 建 bridge 和 veth、按接口的 sysctl；docker 关掉 iptables 也在容器里写内置 DNS 的 nat 规则，`-p` 用 docker-proxy；podman 按名字解析靠 aardvark-dns，`-p` 只靠 nftables；appine 里两家都卡在建 bridge；地址映射方案的四步 |
 | [M9 之前：有状态的网卡](rounds/170-netdev.md) | 2026-11-01 | 地址映射方案的第一步：bridge、veth、dummy 的建删改照 Linux 6.1 记在内核层，veth 的对端可以在别的命名空间里，载波和状态、地址、按地址加的和经由 netlink 加的路由、IPv6 的链路本地地址、extack、命名空间的编号；`/sys/class/net` 按读者的命名空间、bridge 的 `brif`；新的 `/proc/sys/net`（接口的配置、`ip_forward`、`ip_unprivileged_port_start` 等）；docker、podman 的 bridge 网络建得起来，容器里的地址和路由与原生相同 |
+| [M9 之前：经由虚拟网卡的连接](rounds/171-netmap.md) | 2026-11-01 | 地址映射方案的第二步：虚拟地址在 socket 层换成宿主上的回环地址（新命名空间的都是它的 127.a.b.1，开机时的命名空间的各分一个 127.255.x.y），低端口映射按目的地的命名空间，经由默认路由出去的交给宿主网络，反过来按"谁在看"换回；绑通配地址的数据报 socket 宿主上也绑通配地址、发往映射的目的地时指定源地址；`SO_ATTACH_FILTER` 的指针；容器之间、外层到容器、docker 的 `-p`、podman 的按名字解析都通了 |
 
 ## 测量条件
 

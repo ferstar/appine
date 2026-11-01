@@ -53,7 +53,7 @@
    - 地址、路由（现在改路由是 EOPNOTSUPP）记在各自的命名空间里，转储、`ip` 的输出照 Linux 的格式。
    - 接口的 sysctl 目录（`ipv4/conf/<if>`、`ipv6/conf/<if>`）跟着接口出现，上面这些项可以写。
    - → 已做（M9 之前：有状态的网卡）：两家的 bridge 网络建得起来，容器起得来；`-p` 时 docker 给监听 socket 装 BPF 过滤器失败（`SO_ATTACH_FILTER` 的指针没换），归到第 2 步
-2. **socket 层的地址映射**：veth、bridge 上的地址各自对应宿主上的一个回环地址。容器之间、外层到容器、容器到网关（aardvark-dns、宿主上的服务）都换成宿主回环上的连接。访问 bridge 以外的直接用宿主 socket，所以即使防火墙关着也通（比原生"关着防火墙"时好）。docker-proxy 从外层连容器的 IP 也走这个映射。
+2. **socket 层的地址映射**（→ 已做，M9 之前：经由虚拟网卡的连接；docker 的 `-p` 也通了）：veth、bridge 上的地址各自对应宿主上的一个回环地址。容器之间、外层到容器、容器到网关（aardvark-dns、宿主上的服务）都换成宿主回环上的连接。访问 bridge 以外的直接用宿主 socket，所以即使防火墙关着也通（比原生"关着防火墙"时好）。docker-proxy 从外层连容器的 IP 也走这个映射。
 3. **netfilter 的一个子集**：
    - 至少要接受 docker 写进容器命名空间的那几条 nat 规则，并在 socket 层执行：发往 127.0.0.11:53 的换成那个端口，回来的源端口换回 53。这要实现 `NETLINK_NETFILTER` 上 nftables 的消息（表、链、规则的增删查），以及 iptables-nft 用的 `nft_compat` xt 目标（DNAT、SNAT）。
    - 别的规则（隔离、MASQUERADE、raw 表）接受下来、能列出来，但不执行。这一点要写进文档：防火墙的隔离不起作用。

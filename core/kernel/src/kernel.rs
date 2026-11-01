@@ -446,9 +446,10 @@ impl Kernel {
             .iter()
             .filter_map(|w| w.upgrade().and_then(|n| n.host_net))
             .collect();
+        // 127.255.0.0/16 留给开机时的命名空间里的虚拟地址（crate::netns::INIT_BLOCK）
         let net = (1..=u16::MAX)
             .map(u16::to_be_bytes)
-            .find(|n| !used.contains(n))
+            .find(|n| n[0] != crate::netns::INIT_BLOCK && !used.contains(n))
             .ok_or(Errno::ENOMEM)?;
         let devs = crate::netdev::Devices::for_new_ns(&self.init_ns.net.devs.borrow().conf);
         let ns = Rc::new(crate::nsproxy::NetNs {
@@ -460,6 +461,13 @@ impl Kernel {
         });
         self.net_nss.push(Rc::downgrade(&ns));
         Ok(ns)
+    }
+
+    /// 所有活着的网络命名空间，开机时的在前（地址换算用，[`crate::netns::World`]）。
+    pub fn world(&self) -> crate::netns::World {
+        let mut all = vec![self.init_ns.net.clone()];
+        all.extend(self.net_nss.iter().filter_map(Weak::upgrade));
+        crate::netns::World { all }
     }
 
     /// IPC 命名空间 `id` 里的对象。

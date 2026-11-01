@@ -484,8 +484,15 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
             let Some((it, errno, original)) = it else {
                 continue;
             };
+            // 只为与连接的对端比较：别的命名空间的地址不换（这里拿不到内核），只换自己的回环段
             let dst = match &net {
-                Some(ns) => crate::netns::from_host(ns, &r.addr, false, family == AF_INET6 && !udp),
+                Some(ns) => {
+                    let w = crate::netns::World {
+                        all: vec![ns.clone()],
+                    };
+                    let role = crate::netns::Role::Peer;
+                    crate::netns::from_host(&w, ns, &r.addr, role, family == AF_INET6 && !udp)
+                }
                 None => r.addr.clone(),
             };
             let to_peer = peer.as_ref().is_some_and(|p| same_peer(p, &dst, udp));

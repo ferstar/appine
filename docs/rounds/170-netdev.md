@@ -1,6 +1,6 @@
 # M9 之前：有状态的网卡：bridge、veth、地址和路由（2026-11-01）
 
-← [M9 之前：容器网络的普查（2026-11-01）](169-container-network-survey.md) · [索引](../milestones.md)
+← [M9 之前：容器网络的普查（2026-11-01）](169-container-network-survey.md) · [索引](../milestones.md) · [M9 之前：经由虚拟网卡的连接（2026-11-01）](171-netmap.md) →
 
 [容器网络的普查](169-container-network-survey.md)定下的方案 1 的第一步：docker、podman 搭 bridge 网络用的 netlink 请求原来都是 EOPNOTSUPP（dockerd 报 `Failed to create bridge docker0 via netlink: operation not supported` 退出，netavark 报 `create bridge: Netlink error: Not supported`），新的网络命名空间里也只有 lo。这一轮照 Linux 6.1 记下虚拟网卡的状态：bridge、veth、dummy 的建删改，地址，路由，接口的 sysctl。做完之后两家的 bridge 网络建得起来，容器起得来，容器里 `ip addr`、`ip route` 看到的与原生相同。数据包仍然不经过这些设备：容器之间、容器与外面的流量要下一步在 socket 层按地址映射。
 
@@ -55,7 +55,7 @@
 
 **推迟项**：
 
-- 数据包不经过这些设备：容器之间、外层到容器、容器到网关的连接都还到不了（"Network unreachable"），容器里的程序只能用 lo 和宿主的网络（下一步：socket 层的地址映射）。
+- 数据包不经过这些设备：容器之间、外层到容器、容器到网关的连接都还到不了（"Network unreachable"），容器里的程序只能用 lo 和宿主的网络（下一步：socket 层的地址映射）。 → 在 socket 层按地址映射连通了（M9 之前：经由虚拟网卡的连接）；数据包仍不经过它们
 - 没有 DAD，IPv6 地址加上就可用；没有路由通告、`autoconf`、临时地址。
 - 只有 bridge、veth、dummy 三种；vlan、macvlan、vxlan、tun 等是 EOPNOTSUPP "Unknown device type"。没有 AF_PACKET（dockerd 发免费 ARP 时只打一条警告）。
 - 只有单播路由，表的编号不大于 255；没有多路径、`onlink`、blackhole 这些；没有自定义规则（`ip rule`）。开机时的命名空间里只能经由虚拟设备加路由，删宿主的路由仍是 EOPNOTSUPP。
