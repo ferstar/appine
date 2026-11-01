@@ -1,7 +1,7 @@
 # fork 之后父子进程的内存互不影响（写时复制）：几个子进程和父进程同时写；多线程的父进程
 # 在别的线程不停写的时候 fork，子进程看到的是某一瞬间的快照；借出的内存解除映射、搬走、
 # 丢弃；子进程结束之后借出的页恢复成各自的权限；smaps 里共用的页；子进程里用锁和条件
-# 变量；一层套一层的 fork；python 的 os.fork
+# 变量；一层套一层的 fork；python 的 os.fork；fork 时按合起来的 VMA 估算提交量
 set -e
 cd /tmp
 cat > cow.c <<'C'
@@ -356,6 +356,71 @@ int main(void)
 C
 gcc -O2 -o cow cow.c -pthread
 ./cow
+# fork 时的提交量估算（vm.overcommit_memory 是 0，Linux 的 dup_mmap）：可写的私有映射
+# 按合起来的 VMA 算，超过内存和交换区的总量时 fork 是 ENOMEM。两段各一半多一点的首尾
+# 相接（每段自己都不超过）；有空隙、后一段是 MAP_NORESERVE 或只读的都不合起来算
+cat > commit.c <<'C'
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/sysinfo.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static unsigned long half;
+static char *base;
+
+static const char *try_fork(void)
+{
+    pid_t p = fork();
+    if (p < 0)
+        return strerror(errno);
+    if (p == 0)
+        _exit(0);
+    waitpid(p, NULL, 0);
+    return "ok";
+}
+
+static void case_(const char *name, unsigned long gap, int prot, int flags)
+{
+    char *a = mmap(base, half, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    char *b = mmap(base + half + gap, half, prot,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | flags, -1, 0);
+    if (a == MAP_FAILED || b == MAP_FAILED)
+        printf("%s: mmap %s\n", name, strerror(errno));
+    else
+        printf("%s: fork %s\n", name, try_fork());
+    munmap(base, 2 * half + gap);
+}
+
+int main(void)
+{
+    struct sysinfo si;
+    sysinfo(&si);
+    unsigned long limit = (si.totalram + si.totalswap) * (unsigned long)si.mem_unit;
+    half = (limit / 2 / 4096 + 1) * 4096;
+    base = mmap(NULL, 2 * half + (1 << 20), PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    munmap(base, 2 * half + (1 << 20));
+    char *a = mmap(base, half, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf("one half: %s, fork %s\n", a == MAP_FAILED ? strerror(errno) : "mapped", try_fork());
+    munmap(base, half);
+    case_("adjacent", 0, PROT_READ | PROT_WRITE, 0);
+    case_("with a gap", 1 << 20, PROT_READ | PROT_WRITE, 0);
+    case_("second MAP_NORESERVE", 0, PROT_READ | PROT_WRITE, MAP_NORESERVE);
+    case_("second read-only", 0, PROT_READ, 0);
+    /* 原来的上限：一次映射超过总量的是 ENOMEM（宿主拒绝） */
+    char *big = mmap(NULL, limit + (1 << 20), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("one mapping over the limit: %s\n", big == MAP_FAILED ? strerror(errno) : "mapped");
+    return 0;
+}
+C
+gcc -O2 -o commit commit.c
+./commit
 python3 -c '
 import os
 data = bytearray(b"p" * (1 << 22))

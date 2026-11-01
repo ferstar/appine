@@ -520,6 +520,8 @@ struct Vma {
     growsdown: bool,
     /// `MADV_DONTDUMP`：core 文件里不写它的内容（[`Mm::dump_regions`]），fork 继承。
     dontdump: bool,
+    /// `MAP_NORESERVE`：不计入提交量（[`Mm::commit_too_big`]）。
+    noreserve: bool,
 }
 
 /// 最近几个代码代数作废的范围。
@@ -1545,6 +1547,7 @@ impl Mm {
                 written: Cell::new(prot & prot::WRITE != 0),
                 growsdown: false,
                 dontdump: false,
+                noreserve: false,
             },
         );
         Ok(())
@@ -1930,6 +1933,7 @@ impl Mm {
         v.content = content;
         v.cow = cached;
         v.file = dup;
+        v.noreserve = flags & flags::MAP_NORESERVE != 0;
         self.trim_to_file(start)?;
         if backing == Backing::Shared && file_id.is_some() && may_write {
             self.note_shared_files(false);
@@ -2183,6 +2187,7 @@ impl Mm {
             written: Cell::new(template.prot & prot::WRITE != 0),
             growsdown: false,
             dontdump: false,
+            noreserve: template.noreserve,
         })
     }
 
@@ -2666,6 +2671,9 @@ impl Mm {
     /// 文件末尾之前的部分）。共享映射和只读的私有文件映射与子进程共用宿主内存。调用方
     /// 先让同一地址空间的其他线程停在 guest 代码之外（[`Mm::quiesce`]）。
     pub fn fork(&mut self) -> Result<Rc<RefCell<Mm>>, Errno> {
+        if self.commit_too_big(appine_hal::ram_and_swap()) {
+            return Err(Errno::ENOMEM);
+        }
         let shared = Mm::new().into_shared();
         let mut child = shared.borrow_mut();
         child.loans = self.loans.clone();
@@ -2763,6 +2771,7 @@ impl Mm {
             c.file = v.file.clone();
             c.shm = v.shm;
             c.growsdown = v.growsdown;
+            c.noreserve = v.noreserve;
             child.trim_to_file(start)?;
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
@@ -2785,6 +2794,54 @@ impl Mm {
         }
         drop(child);
         Ok(shared)
+    }
+
+    /// fork 之前与 Linux 的 `dup_mmap` 一样按提交量的估算（`vm.overcommit_memory` 是 0）
+    /// 检查每个计入提交量的 VMA（可写的私有映射，没有 `MAP_NORESERVE`）：有一个超过内存
+    /// 和交换区的总量 `limit`（字节，0 是不知道）就是 ENOMEM。appine 里每次 mmap 各是一段
+    /// 宿主内存，VMA 合不起来，而 Linux 把相邻、标志相同的合成一个，所以按合起来的算。
+    /// LTP 的 fork14 每次多映射 1 GB 再 fork：原生上合起来的一超过内存总量 fork 就失败，
+    /// 原来 appine 里一直成功，子进程的页表越建越大（soft-MMU 每 GB 2 MB）。
+    ///
+    /// 与 Linux 不同：Linux 的 `VM_ACCOUNT` 在可写过之后就一直带着，这里只看现在的权限。
+    fn commit_too_big(&self, limit: u64) -> bool {
+        if limit == 0 {
+            return false;
+        }
+        let accounted =
+            |v: &Vma| v.backing != Backing::Shared && v.prot & prot::WRITE != 0 && !v.noreserve;
+        // Linux 的 vma_merge：首尾相接，权限、标志、名字相同，文件映射的偏移接得上
+        let merges = |a: &Vma, b: &Vma| {
+            (a.backing, a.locked, a.dontdump, a.growsdown, &a.name)
+                == (b.backing, b.locked, b.dontdump, b.growsdown, &b.name)
+                && match (a.file_id, b.file_id) {
+                    (None, None) => true,
+                    (Some((d, i, o)), Some(f)) => (d, i, o + a.len) == f,
+                    _ => false,
+                }
+                && a.prot == b.prot
+        };
+        // 上一个计入的 VMA 的起点、它，和合起来的长度
+        let mut run: Option<(u64, &Vma, u64)> = None;
+        for (&s, v) in &self.vmas {
+            if !accounted(v) {
+                run = None;
+                continue;
+            }
+            let total = match run {
+                Some((last_start, last, total))
+                    if last_start + last.len == s && merges(last, v) =>
+                {
+                    total + v.len
+                }
+                _ => v.len,
+            };
+            if total > limit {
+                return true;
+            }
+            run = Some((s, v, total));
+        }
+        false
     }
 
     /// fork 时给子进程的小映射（起点是 `pieces`）切出宿主内存：切自同一段，各自按宿主页
@@ -4757,5 +4814,53 @@ mod tests {
         mm.mmap(0, PAGE_SIZE, RW, shared, None).unwrap();
         mm.mmap(0, PAGE_SIZE, RW, shared, None).unwrap();
         assert_eq!(mm.regions().len(), 4);
+    }
+
+    /// fork 前的提交量检查按 Linux 合起来的 VMA 算：相邻的可写私有匿名映射合起来超过
+    /// 上限才算；中间隔着只读的、`MAP_NORESERVE` 的、共享的都断开，它们自己也不计入。
+    #[test]
+    fn fork_counts_the_commit_of_merged_mappings() {
+        let mut mm = Mm::new();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let fixed = anon | flags::MAP_FIXED;
+        let base = 0x1000_0000;
+        let mb = 1 << 20;
+        // 4 MB + 4 MB 首尾相接：8 MB
+        mm.mmap(base, 4 * mb, RW, fixed, None).unwrap();
+        mm.mmap(base + 4 * mb, 4 * mb, RW, fixed, None).unwrap();
+        assert!(!mm.commit_too_big(8 * mb));
+        assert!(mm.commit_too_big(8 * mb - PAGE_SIZE));
+        assert!(!mm.commit_too_big(0));
+        // 后一半改成只读：断开，各 4 MB
+        mm.mprotect(base + 4 * mb, 4 * mb, prot::READ).unwrap();
+        assert!(!mm.commit_too_big(5 * mb));
+        assert!(mm.commit_too_big(4 * mb - PAGE_SIZE));
+        mm.mprotect(base + 4 * mb, 4 * mb, RW).unwrap();
+        assert!(mm.commit_too_big(5 * mb));
+        // 中间夹一段 MAP_NORESERVE 的：不计入，也断开
+        mm.munmap(base + 4 * mb, 4 * mb).unwrap();
+        mm.mmap(
+            base + 4 * mb,
+            4 * mb,
+            RW,
+            fixed | flags::MAP_NORESERVE,
+            None,
+        )
+        .unwrap();
+        mm.mmap(base + 8 * mb, 4 * mb, RW, fixed, None).unwrap();
+        assert!(!mm.commit_too_big(5 * mb));
+        // 共享的不计入
+        let shared = flags::MAP_SHARED | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        mm.mmap(base + 12 * mb, 64 * mb, RW, shared, None).unwrap();
+        assert!(!mm.commit_too_big(5 * mb));
+        // 中间有空隙的不合
+        mm.mmap(base + 77 * mb, 4 * mb, RW, fixed, None).unwrap();
+        assert!(!mm.commit_too_big(5 * mb));
+        mm.mmap(base + 76 * mb, mb, RW, fixed, None).unwrap();
+        assert!(mm.commit_too_big(5 * mb - PAGE_SIZE));
+        assert!(!mm.commit_too_big(5 * mb));
+        // 子进程照样带着 MAP_NORESERVE
+        let child = mm.fork().unwrap();
+        assert!(child.borrow().vmas[&(base + 4 * mb)].noreserve);
     }
 }

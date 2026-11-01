@@ -538,6 +538,25 @@ pub fn memory_info() -> (u64, u64) {
     ((pages.max(0) as u64) * page_size() as u64, 0)
 }
 
+/// 宿主的物理内存和交换区的总量（字节）：Linux 估算提交量（`vm.overcommit_memory` 是 0）
+/// 时一次申请的上限。读不到时是 0。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::unnecessary_cast)] // unsigned long 在 32 位宿主上是 32 位
+pub fn ram_and_swap() -> u64 {
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } < 0 {
+        return 0;
+    }
+    let unit = info.mem_unit.max(1) as u64;
+    (info.totalram as u64 + info.totalswap as u64) * unit
+}
+
+/// 宿主的物理内存和交换区的总量（字节）。
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn ram_and_swap() -> u64 {
+    memory_info().0
+}
+
 /// 宿主 `/proc/meminfo` 的几项（字节），guest 的 `/proc/meminfo` 和 sysinfo 照搬它们，与
 /// docker 的容器看到的一样。
 #[derive(Debug, Clone, Copy, Default)]
