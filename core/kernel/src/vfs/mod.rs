@@ -71,6 +71,8 @@ impl Node {
 pub(crate) type MountId = u32;
 
 /// 开机时的挂载命名空间的编号（`/proc/<pid>/ns/mnt` 里的 inode 号，与 Linux 常见的相同）。
+/// 开机时的 IPC 命名空间的 mqueue 文件系统的设备号（0:19）。
+pub(crate) const MQUEUE_DEV: u64 = 0x13;
 pub(crate) const INIT_MNT_NS: u64 = 4_026_531_841;
 
 /// 挂载命名空间（Linux 的 `struct mnt_namespace`）：只有编号，每个挂载记着它属于哪个
@@ -130,6 +132,9 @@ pub(crate) enum Fs {
     /// nsfs：命名空间文件（`/proc/<pid>/ns/*` 跟随之后得到的）所在的文件系统。挂不上，只有
     /// bind 挂载出去的命名空间文件在挂载表里。
     Nsfs,
+    /// mqueue：挂上它的进程所在的 IPC 命名空间里的 POSIX 消息队列（`crate::syscall::mqueue`）。
+    /// 每个命名空间一个实例（Linux 的 `get_tree_keyed`），挂载留住那个命名空间。
+    Mqueue,
 }
 
 impl Fs {
@@ -141,6 +146,7 @@ impl Fs {
             b"sysfs" => Some(Fs::Sys),
             b"cgroup2" => Some(Fs::Cgroup),
             b"tmpfs" => Some(Fs::Tmpfs),
+            b"mqueue" => Some(Fs::Mqueue),
             _ => None,
         }
     }
@@ -155,6 +161,7 @@ impl Fs {
             Fs::Sys => "sysfs",
             Fs::Cgroup => "cgroup2",
             Fs::Nsfs => "nsfs",
+            Fs::Mqueue => "mqueue",
         }
     }
 
@@ -170,6 +177,8 @@ impl Fs {
             Fs::Cgroup => 0x1a,
             // 与 Linux 一样
             Fs::Nsfs => 0x4,
+            // 开机时的 IPC 命名空间的；别的命名空间的另外分配（[`Vfs::mq_dev`]）
+            Fs::Mqueue => MQUEUE_DEV,
         }
     }
 
@@ -192,7 +201,7 @@ impl Fs {
             Fs::Pts => ",gid=5,mode=620,ptmxmode=000",
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
             // tmpfs 的按实例（[`Vfs::sb_options`]）
-            Fs::Store | Fs::Tmpfs | Fs::Proc | Fs::Sys | Fs::Nsfs => "",
+            Fs::Store | Fs::Tmpfs | Fs::Proc | Fs::Sys | Fs::Nsfs | Fs::Mqueue => "",
         }
     }
 
@@ -207,6 +216,8 @@ impl Fs {
                 Fs::Pts => PseudoNode::PtsRoot,
                 Fs::Sys => PseudoNode::SysRoot,
                 Fs::Cgroup => PseudoNode::Cgroup(b""),
+                // 挂上时换成调用者所在的 IPC 命名空间的
+                Fs::Mqueue => PseudoNode::MqRoot(crate::nsproxy::INIT_IPC_NS),
             },
         )
     }
@@ -346,6 +357,8 @@ struct Mounts {
     /// mount(2) 挂上的 procfs 实例的 pid 命名空间（挂载的进程所在的），按设备号；开机时
     /// 的那个和没有记的是开机时的 pid 命名空间。
     proc_ns: std::collections::HashMap<u64, std::rc::Rc<crate::pidns::PidNs>>,
+    /// 各个 IPC 命名空间的 mqueue 实例的设备号（[`Vfs::mq_dev`]），按命名空间的编号。
+    mq_dev: std::collections::HashMap<u64, u64>,
 }
 
 /// tmpfs 按页记用量，页的大小（guest 的页）。
@@ -633,6 +646,7 @@ impl Vfs {
             next_dev: 0x30,
             tmpfs: Default::default(),
             proc_ns: Default::default(),
+            mq_dev: Default::default(),
         };
         let cached = Cached {
             meta: store.meta().clone(),
@@ -1593,6 +1607,22 @@ impl Vfs {
             .chain(&mounts.detached)
             .find(|m| m.id == id)?;
         mounts.proc_ns.get(&m.dev).cloned()
+    }
+
+    /// IPC 命名空间 `ns` 的 mqueue 实例的设备号（mqueue 文件系统里的节点和 mq_open 得到的
+    /// fd 都报告它）：开机时的命名空间是 [`MQUEUE_DEV`]，别的第一次用到时分配。
+    pub(crate) fn mq_dev(&self, ns: u64) -> u64 {
+        if ns == crate::nsproxy::INIT_IPC_NS {
+            return MQUEUE_DEV;
+        }
+        let mut mounts = self.mounts.borrow_mut();
+        if let Some(&dev) = mounts.mq_dev.get(&ns) {
+            return dev;
+        }
+        mounts.next_dev += 1;
+        let dev = mounts.next_dev - 1;
+        mounts.mq_dev.insert(ns, dev);
+        dev
     }
 
     /// 新的 procfs 实例 `id` 属于 pid 命名空间 `ns`。

@@ -168,6 +168,7 @@
 | [M9 之前：podman 和 docker 的普查](rounds/157-container-survey.md) | 2026-11-01 | vfs 存储、host 网络、不用 cgroup 时 podman 的常用功能与原生相同（改掉 capget 等四处小问题、临时绕过 mqueue 和可写挂载 cgroup2 之后）；docker 停在 runc 经由 fd 执行 memfd；找到 12 个问题，按顺序排好 |
 | [M9 之前：容器运行时碰到的四处小问题](rounds/158-container-small-fixes.md) | 2026-11-01 | capget 空数据指针探测版本返回 0；开机时的命名空间里什么也不改的 `RTM_NEWLINK`、`RTM_SETLINK` 成功（dockerd 拉起 lo）；合成文件系统根目录的 inode 是 1（runc 检查 /proc）；线程目录里有 fd、fdinfo |
 | [M9 之前：可写地挂 cgroup2](rounds/159-cgroup2-rw-mount.md) | 2026-11-01 | 不带只读也挂得上 cgroup2（crun 给容器这样挂），里面照旧改不了 |
+| [M9 之前：mqueue 文件系统](rounds/160-mqueue-fs.md) | 2026-11-01 | `mount -t mqueue` 列出挂上它的进程所在的 IPC 命名空间里的 POSIX 消息队列（每个命名空间一个实例）：建、删、chmod、chown，打开得到 mq 描述符；podman 不再需要临时绕过就能起容器 |
 
 ## 测量条件
 

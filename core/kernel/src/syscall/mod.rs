@@ -34,7 +34,7 @@ pub(crate) use fs::{create_exclusive, unlink_path, write_at};
 pub(crate) use inotify::{Inotify, Opened, Registry};
 pub(crate) use lease::Lease;
 pub(crate) use mount::collect_namespaces;
-pub(crate) use mqueue::{Limits as MqLimits, MessageQueue};
+pub(crate) use mqueue::{Limits as MqLimits, MessageQueue, MqDir, find as mqueue_find};
 pub(crate) use net::{SocketRef, unmap_addr};
 pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use ptrace::encode_regset;

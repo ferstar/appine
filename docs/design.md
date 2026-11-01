@@ -525,7 +525,9 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | `/tmp` | 仓库里的目录，开机时不挂 tmpfs，避免占用 App 内存配额（mount(2) 挂的 tmpfs 也存在仓库里，见下面） |
 | `/mnt/<名字>` | SAF 目录挂载（v1.x，见 §11.3） |
 
-之后可以用 mount(2) 把合成文件系统、tmpfs 挂到别的目录上，仓库里的和合成文件系统里的目录、文件都可以 bind（`core/kernel/src/syscall/mount.rs`，[mount 的子集](rounds/105-mount-subset.md)、[仓库里的目录 bind](rounds/116-store-binds.md)）：chroot 进别的发行版的脚本要的 `mount -t proc|sysfs|devpts|cgroup2`、`mount --rbind /dev`，bubblewrap 这类沙箱要的 `--ro-bind`、`--tmpfs`、`MS_MOVE`、pivot_root。
+之后可以用 mount(2) 把合成文件系统、tmpfs 挂到别的目录上，仓库里的和合成文件系统里的目录、文件都可以 bind（`core/kernel/src/syscall/mount.rs`，[mount 的子集](rounds/105-mount-subset.md)、[仓库里的目录 bind](rounds/116-store-binds.md)）：chroot 进别的发行版的脚本要的 `mount -t proc|sysfs|devpts|cgroup2`、`mount --rbind /dev`，bubblewrap 这类沙箱要的 `--ro-bind`、`--tmpfs`、`MS_MOVE`、pivot_root，容器运行时要的 `mount -t mqueue`。
+
+- mqueue（[mqueue 文件系统](rounds/160-mqueue-fs.md)）：列出挂上它的进程所在的 IPC 命名空间里的 POSIX 消息队列，每个命名空间一个实例（设备号按命名空间，mq_open 得到的 fd 的 fstat 也是它），挂载留住那个命名空间。根目录 01777、属于建立命名空间的进程；在里面 open(O_CREAT) 新建的是默认大小的队列，打开得到的 fd 与 mq_open 的一样；unlink 删除队列（粘滞位不过是 EPERM，mq_unlink 系统调用也是，libc 换成 EACCES）；chmod、chown、utimensat 改队列自己的；mkdir、mknod、symlink、link、rename 是 EPERM。
 
 - 节点带着经由的挂载（`Node::Store(挂载编号, inode)`、`Node::Pseudo(挂载编号, 节点)`，相当于 Linux 的 `struct path`）：同一个目录挂在（bind 到）两处是两个节点，`..`、getcwd、`/proc/<pid>/{cwd,root,fd}` 经由各自的挂载点回到上一层，`..` 不越过 chroot 的根目录，bind 挂载里看不到被 bind 的目录外面。仓库里的普通文件、设备节点、FIFO 的打开文件另记经由的挂载（`OpenFile::mnt`）。根文件系统也是挂载表里的一项（编号 1），挂载树的根挂在看不到的 rootfs 上（mountinfo 里它的上级写 0），pivot_root 可以换掉它。卸下（`MNT_DETACH`）了、还有进程的根目录、当前目录或打开的文件在里面的挂载留一份记录，里面的节点照常能用，挂载的根没有上级，没人用了就丢掉。不持 BKL 的 stat（§6）只在根文件系统的挂载里走，遇到仓库里的挂载点、根目录或当前目录在别的挂载里时交给正常的路径解析，挂载表变了让各线程重新取。
 - openat2 的 `RESOLVE_*`（`vfs::resolve`）按 Linux 6.1 的路径解析加在同一个 walk 里：`BENEATH`、`IN_ROOT` 以起点为根目录（绝对路径、绝对路径的符号链接、在起点上的 `..` 前者 EXDEV、后者回到起点），`NO_SYMLINKS` 遇到要跟随的符号链接 ELOOP，`NO_MAGICLINKS` 遇到魔法链接（`/proc/<pid>/{fd/*,cwd,root,exe,ns/*}`）ELOOP、有作用域时它们是 EXDEV，`NO_XDEV` 进出挂载、跳到别的挂载上都是 EXDEV（还没取过根目录时跳到根目录也是，与 `nd_jump_root` 一样）；`O_CREAT` 沿着悬空的符号链接新建时同样受限。`RESOLVE_CACHED` 照常解析，只有新建、截断和 `O_TMPFILE` 的（6.1 里含 `O_DIRECTORY`）是 EAGAIN（[openat2](rounds/144-openat2.md)）。

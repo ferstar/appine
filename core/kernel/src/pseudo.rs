@@ -590,6 +590,11 @@ pub(crate) enum PseudoNode {
     Ns(Tid, Option<Tid>, NsKind),
     /// `/proc/<pid>/ns/<种类>` 跟随之后得到的命名空间（Linux 的 nsfs 里的文件），按编号。
     NsFile(NsKind, u64),
+    /// mqueue 文件系统的根目录：IPC 命名空间（编号）的 POSIX 消息队列
+    /// （[`crate::syscall::MessageQueue`]）。
+    MqRoot(u64),
+    /// mqueue 文件系统里的一个队列：IPC 命名空间和队列的 inode 编号。
+    Mq(u64, u64),
 }
 
 /// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
@@ -675,6 +680,7 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         | PseudoNode::SysNet(..) => Fs::Sys,
         PseudoNode::Cgroup(_) => Fs::Cgroup,
         PseudoNode::NsFile(..) => Fs::Nsfs,
+        PseudoNode::MqRoot(_) | PseudoNode::Mq(..) => Fs::Mqueue,
         _ => Fs::Proc,
     }
 }
@@ -698,6 +704,10 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
         PseudoNode::ProcRoot | PseudoNode::SysRoot | PseudoNode::PtsRoot | PseudoNode::Cgroup(b"")
     ) {
         return 1;
+    }
+    // 队列按它自己的编号（mq_open 得到的 fd 的 fstat 也是它）
+    if let PseudoNode::Mq(_, ino) = node {
+        return *ino;
     }
     let mut h = std::hash::DefaultHasher::new();
     node.hash(&mut h);
@@ -816,7 +826,8 @@ impl Pseudo for View<'_> {
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode> {
         use PseudoNode::*;
         Some(match node {
-            PtsRoot | ProcRoot | SysRoot | Cgroup(b"") => return None,
+            PtsRoot | ProcRoot | SysRoot | Cgroup(b"") | MqRoot(_) => return None,
+            Mq(ns, _) => MqRoot(*ns),
             Pts(_) | PtsPtmx => PtsRoot,
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
             Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
@@ -853,6 +864,13 @@ impl Pseudo for View<'_> {
             ThreadSelf => b"thread-self".to_vec(),
             Static(path) | Sys(path) => tree_name(path).to_vec(),
             SysRoot => b"sys".to_vec(),
+            MqRoot(_) => b"mqueue".to_vec(),
+            Mq(ns, ino) => self
+                .k
+                .ipcs
+                .get(ns)
+                .and_then(|(_, ipc)| crate::syscall::mqueue_find(ipc, *ino))
+                .map_or_else(|| ino.to_string().into_bytes(), |(n, _)| n.to_vec()),
             SysCpu(n, b"") => format!("cpu{n}").into_bytes(),
             SysCpu(_, path) => tree_name(path).to_vec(),
             SysNet(n, b"") => interface(*n)
@@ -890,6 +908,12 @@ impl Pseudo for View<'_> {
             self.pid_ns(mnt).find(n)
         };
         let found = match dir {
+            MqRoot(ns) => self
+                .k
+                .ipcs
+                .get(ns)
+                .and_then(|(_, ipc)| ipc.mqueues.get(name))
+                .map(|q| Mq(*ns, q.borrow().ino)),
             PtsRoot => {
                 if name == b"ptmx" {
                     Some(PtsPtmx)
@@ -977,7 +1001,8 @@ impl Pseudo for View<'_> {
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno> {
         use PseudoNode::*;
         Ok(match node {
-            PtsRoot | ProcRoot | Pid(..) | SysRoot => mode::S_IFDIR,
+            PtsRoot | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
+            Mq(..) => mode::S_IFREG,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
             Cgroup(b"") => mode::S_IFDIR,
@@ -1247,6 +1272,21 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
 
 /// 合成节点的元数据。
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
+    // mqueue 文件系统：属主、权限、时间记在队列和命名空间里
+    match node {
+        PseudoNode::MqRoot(ns) => {
+            let (_, ipc) = ps.k.ipcs.get(ns).ok_or(Errno::ENOENT)?;
+            let mut st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+            st.ino = ino_of(node);
+            return Ok(st);
+        }
+        PseudoNode::Mq(ns, ino) => {
+            let (_, ipc) = ps.k.ipcs.get(ns).ok_or(Errno::ENOENT)?;
+            let (_, q) = crate::syscall::mqueue_find(ipc, *ino).ok_or(Errno::ENOENT)?;
+            return Ok(q.borrow().stat());
+        }
+        _ => {}
+    }
     let kind = ps.kind(node)?;
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
@@ -1616,6 +1656,16 @@ pub(crate) fn readdir(
     let mut nodes: Vec<PseudoNode> = Vec::new();
     let ns = ps.pid_ns(mnt);
     match dir {
+        MqRoot(ipc) => {
+            if let Some((_, ipc_objects)) = ps.k.ipcs.get(ipc) {
+                nodes.extend(
+                    ipc_objects
+                        .mqueues
+                        .values()
+                        .map(|q| Mq(*ipc, q.borrow().ino)),
+                );
+            }
+        }
         PtsRoot => {
             nodes.push(PtsPtmx);
             nodes.extend(

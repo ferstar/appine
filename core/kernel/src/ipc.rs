@@ -499,6 +499,8 @@ pub(crate) struct Ipc {
     pub mqueues: BTreeMap<Vec<u8>, Rc<crate::cell::RefCell<crate::syscall::MessageQueue>>>,
     /// `/proc/sys/fs/mqueue/*`。
     pub mq_limits: crate::syscall::MqLimits,
+    /// mqueue 文件系统的根目录的属主和时间。
+    pub mq_dir: crate::cell::RefCell<crate::syscall::MqDir>,
 }
 
 impl Ipc {

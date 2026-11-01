@@ -98,10 +98,9 @@ const PIPE_DEV: u64 = 0xd;
 /// socket、anon_inode（epoll、eventfd）报告的设备号。
 const SOCK_DEV: u64 = 0x8;
 const ANON_DEV: u64 = 0xe;
-/// mqueue 文件系统的设备号。
-const MQUEUE_DEV: u64 = 0x13;
 /// statfs 报告的文件系统类型。
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
+const MQUEUE_MAGIC: u64 = 0x1980_0202;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const NSFS_MAGIC: u64 = 0x6e73_6673;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
@@ -224,13 +223,23 @@ pub(super) fn parent_at<'p>(
 }
 
 /// 要在里面新建、删除的目录：仓库里的；合成文件系统里的不能修改，在只读的挂载里
-/// （比如 cgroup2）是 EROFS。
+/// （比如 cgroup2）是 EROFS。mqueue 文件系统的根目录里只能新建、删除队列（openat、
+/// unlinkat 另外处理），别的（mkdir、mknod、symlink、link、rename）与 Linux 一样是 EPERM：
+/// 它的目录没有这些操作。
 fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Store(mnt, ino) => Ok((*mnt, *ino)),
         Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
+        Node::Pseudo(_, PseudoNode::MqRoot(_)) => Err(Errno::EPERM),
         Node::Pseudo(..) => Err(Errno::EACCES),
     }
+}
+
+/// IPC 命名空间 `ns` 的 mqueue 文件系统里 inode 编号是 `ino` 的队列：删掉了的是 ENOENT。
+fn mq_queue(cx: &Cx<'_>, ns: u64, ino: u64) -> Result<Rc<RefCell<super::MessageQueue>>, Errno> {
+    super::mqueue::find(cx.kr().ipc(ns), ino)
+        .map(|(_, q)| q.clone())
+        .ok_or(Errno::ENOENT)
 }
 
 /// 在目录 `dir` 里新建 `name` 之前对名字和挂载的检查（Linux 的 `filename_create`）：要能
@@ -503,7 +512,11 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::Inotify(_)
         | FileKind::Pidfd(_)
         | FileKind::SeccompNotify(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
-        FileKind::MessageQueue(q) => Ok(encode_stat(&q.borrow().stat(), MQUEUE_DEV)),
+        // 设备号是队列所在的 IPC 命名空间的 mqueue 文件系统的
+        FileKind::MessageQueue(q) => {
+            let q = q.borrow();
+            Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)))
+        }
         FileKind::Pty(end) => {
             let t = end.tty.borrow();
             let st = Stat {
@@ -715,6 +728,8 @@ fn open_path_with(
     let cred = cx.cred();
 
     let resolved = vfs.walk_resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow, res);
+    // mqueue 文件系统里新建了队列（不再检查打开的权限，与仓库里新建的文件一样）
+    let mut mq_created = false;
     // parent 是最后经过的目录和名字，报告 inotify 事件用
     let (node, created, parent) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
@@ -731,6 +746,25 @@ fn open_path_with(
                     vfs.resolve_parent_with(&cx.view(&vfs), &cred, &root, &start, &path, res)?;
                 if path.ends_with(b"/") || name == b"." || name == b".." {
                     return Err(Errno::EISDIR);
+                }
+                // mqueue 文件系统里新建的是消息队列（Linux 的 mqueue_create），属性是默认的
+                if let Node::Pseudo(mnt, PseudoNode::MqRoot(ns)) = dir {
+                    if vfs.readonly(&dir) {
+                        return Err(Errno::EROFS);
+                    }
+                    let ipc = cx.kr().ipc(ns);
+                    let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+                    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+                    let perm = perm & !cx.umask();
+                    let q = super::mqueue::new_queue(ipc, ns, &cred, perm, None)?;
+                    let ino = q.borrow().ino;
+                    super::mqueue::insert_queue(cx.k().ipc_mut(ns), name.to_vec(), q);
+                    mq_created = true;
+                    break (
+                        Node::Pseudo(mnt, PseudoNode::Mq(ns, ino)),
+                        None,
+                        Some((dir.clone(), name.to_vec())),
+                    );
                 }
                 let (mnt, dir) = store_dir(&vfs, &dir)?;
                 if let Some(ino) = vfs.store().lookup(dir, name)?
@@ -806,6 +840,9 @@ fn open_path_with(
                     flags
                 };
                 open_store(cx, &cred, &vfs, (mnt, ino), flags, created)?
+            }
+            Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => {
+                open_mq(cx, &cred, (ns, ino), flags, mq_created)?
             }
             Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
         }
@@ -1196,6 +1233,25 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
 }
 
 /// 打开合成文件系统里的节点。
+/// 打开 mqueue 文件系统里的队列：得到的 fd 与 mq_open 的一样（Linux 上就是同一种文件），
+/// mq_timedsend 这些照样能用。刚新建的不再检查权限。
+fn open_mq(
+    cx: &Cx<'_>,
+    cred: &Cred,
+    (ns, ino): (u64, u64),
+    flags: u32,
+    created: bool,
+) -> Result<FileKind, Errno> {
+    if flags & oflags::O_DIRECTORY != 0 {
+        return Err(Errno::ENOTDIR);
+    }
+    let q = mq_queue(cx, ns, ino)?;
+    if !created {
+        cred.permission(&q.borrow().stat(), open_mask(flags))?;
+    }
+    Ok(FileKind::MessageQueue(q))
+}
+
 fn open_pseudo(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -2327,6 +2383,7 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
                 Fs::Sys => SYSFS_MAGIC,
                 Fs::Cgroup => CGROUP2_SUPER_MAGIC,
                 Fs::Nsfs => NSFS_MAGIC,
+                Fs::Mqueue => MQUEUE_MAGIC,
             };
             encode_statfs(magic, &empty, flags)
         }
@@ -2346,6 +2403,14 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
         let f = file.borrow();
         (matches!(f.kind, FileKind::Pipe(_)), f.node())
     };
+    // 消息队列的 fd 在 mqueue 文件系统里
+    if matches!(file.borrow().kind, FileKind::MessageQueue(_)) {
+        let empty = appine_hal::FsStats {
+            block_size: 4096,
+            ..Default::default()
+        };
+        return put(cx, buf, encode_statfs(MQUEUE_MAGIC, &empty, 0)).map(|()| 0);
+    }
     let b = match (pipe, node) {
         (true, _) => encode_statfs(
             PIPEFS_MAGIC,
@@ -2424,6 +2489,53 @@ pub(super) fn mknodat(
     Ok(0)
 }
 
+/// 删除 mqueue 文件系统里的队列（与 mq_unlink 一样）：父目录是 mqueue 的根目录时返回
+/// Some。顺序照 Linux 的 do_unlinkat、do_rmdir：`.`、`..`，只读的挂载，找不到，unlink 以
+/// `/` 结尾的名字，目录的写权限，粘滞位（EPERM），rmdir 的 ENOTDIR。
+fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Result<(), Errno>> {
+    let start = start_dir(cx, dirfd, path).ok()?;
+    let vfs = cx.vfs().ok()?;
+    let cred = cx.cred();
+    let (dir, name) = vfs
+        .resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)
+        .ok()?;
+    let Node::Pseudo(_, PseudoNode::MqRoot(ns)) = dir else {
+        return None;
+    };
+    let rmdir = flags & AT_REMOVEDIR != 0;
+    Some((|| {
+        match name {
+            b"." if rmdir => return Err(Errno::EINVAL),
+            b".." if rmdir => return Err(Errno::ENOTEMPTY),
+            b"." | b".." => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let ipc = cx.kr().ipc(ns);
+        if !ipc.mqueues.contains_key(name) {
+            return Err(Errno::ENOENT);
+        }
+        // unlink 以 / 结尾的名字在 may_delete 之前就是 ENOTDIR
+        if !rmdir && path.ends_with(b"/") {
+            return Err(Errno::ENOTDIR);
+        }
+        let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+        cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+        if rmdir {
+            // rmdir 先查粘滞位（may_delete），队列不是目录
+            let q = ipc.mqueues[name].borrow().stat();
+            let dir_uid = ipc.mq_dir.borrow().uid;
+            if cred.fsuid != q.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&q, cap::FOWNER) {
+                return Err(Errno::EPERM);
+            }
+            return Err(Errno::ENOTDIR);
+        }
+        super::mqueue::remove_queue(cx.k().ipc_mut(ns), &cred, name)
+    })())
+}
+
 pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(Errno::EINVAL);
@@ -2433,6 +2545,9 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
 }
 
 fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), Errno> {
+    if let Some(r) = unlink_mq(cx, dirfd, &path, flags) {
+        return r;
+    }
     let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
     let store_vfs = cx.vfs()?;
     let store = store_vfs.store();
@@ -2756,6 +2871,10 @@ enum Attrs {
     /// 创建它的进程（libuv 的 `uv_pipe_chmod` 先 fchmod socket 的 fd）。这里当作调用者
     /// 的，改了不记下来，fstat 报告的属主和权限照旧是合成的。
     Anon,
+    /// POSIX 消息队列：mqueue 文件系统里的文件，或者 mq_open 得到的 fd。
+    Mq(Rc<RefCell<super::MessageQueue>>),
+    /// IPC 命名空间（编号）的 mqueue 文件系统的根目录。
+    MqDir(u64),
 }
 
 impl Attrs {
@@ -2765,6 +2884,13 @@ impl Attrs {
             Node::Pseudo(_, PseudoNode::Pts(n)) => pseudo::pty(cx.kr(), *n)
                 .map(Attrs::Pts)
                 .ok_or(Errno::ENOENT),
+            Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Mq(..))
+                if cx.vfs()?.readonly(node) =>
+            {
+                Err(Errno::EROFS)
+            }
+            Node::Pseudo(_, PseudoNode::MqRoot(ns)) => Ok(Attrs::MqDir(*ns)),
+            Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => mq_queue(cx, *ns, *ino).map(Attrs::Mq),
             _ => store_ino(cx, node).map(Attrs::Store),
         }
     }
@@ -2779,6 +2905,7 @@ impl Attrs {
             }
             FileKind::Socket(_) => Ok(Attrs::Anon),
             FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => Ok(Attrs::Anon),
+            FileKind::MessageQueue(q) => Ok(Attrs::Mq(q.clone())),
             _ => {
                 drop(f);
                 file_ino(cx, fd).map(Attrs::Store)
@@ -2805,6 +2932,11 @@ impl Attrs {
                     gid: cred.fsgid,
                     ..Stat::default()
                 })
+            }
+            Attrs::Mq(q) => Ok(q.borrow().stat()),
+            Attrs::MqDir(ns) => {
+                let ipc = cx.kr().ipc(*ns);
+                Ok(ipc.mq_dir.borrow().stat(ipc.mqueues.len()))
             }
         }
     }
@@ -2850,6 +2982,13 @@ fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
             t.changed();
         }
         Attrs::Anon => {}
+        Attrs::Mq(q) => q.borrow_mut().set_mode(perm),
+        Attrs::MqDir(ns) => {
+            let ipc = cx.kr().ipc(*ns);
+            let mut d = ipc.mq_dir.borrow_mut();
+            d.mode = perm;
+            d.ctime_ns = crate::tty::wall_ns();
+        }
     }
     Ok(0)
 }
@@ -2914,6 +3053,13 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
             t.changed();
         }
         Attrs::Anon => {}
+        Attrs::Mq(q) => q.borrow_mut().set_owner(uid, gid),
+        Attrs::MqDir(ns) => {
+            let ipc = cx.kr().ipc(*ns);
+            let mut d = ipc.mq_dir.borrow_mut();
+            (d.uid, d.gid) = (uid.unwrap_or(d.uid), gid.unwrap_or(d.gid));
+            d.ctime_ns = crate::tty::wall_ns();
+        }
     }
     Ok(0)
 }
@@ -2989,6 +3135,29 @@ pub(super) fn utimensat(
             return Ok(0);
         }
         Attrs::Anon => return Ok(0),
+        // 消息队列和 mqueue 的根目录的时间记在内核层里
+        Attrs::Mq(q) => {
+            let now = crate::tty::wall_ns();
+            let ns = |time: FileTime| match time {
+                FileTime::Now => now,
+                FileTime::At(ns) => ns,
+            };
+            q.borrow_mut().set_times(atime.map(ns), mtime.map(ns));
+            return Ok(0);
+        }
+        Attrs::MqDir(id) => {
+            let now = crate::tty::wall_ns();
+            let ns = |time: FileTime| match time {
+                FileTime::Now => now,
+                FileTime::At(ns) => ns,
+            };
+            let ipc = cx.kr().ipc(id);
+            let mut d = ipc.mq_dir.borrow_mut();
+            d.atime_ns = atime.map_or(d.atime_ns, ns);
+            d.mtime_ns = mtime.map_or(d.mtime_ns, ns);
+            d.ctime_ns = now;
+            return Ok(0);
+        }
     };
     // 按 fd 设置的普通文件经由打开的 object 设置：删除之后仍然打开着的文件也能用
     let open = match (path.is_empty(), dirfd) {

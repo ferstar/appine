@@ -2,18 +2,22 @@
 //! mq_getsetattr。
 //!
 //! 队列按名字登记在所在的 IPC 命名空间里（[`crate::ipc::Ipc::mqueues`]），打开得到一个可以 poll
-//! 的 fd（有消息时可读，没满时可写），read 它得到与 Linux 相同的状态行。消息按优先级
+//! 的 fd（有消息时可读，没满时可写），read 它得到与 Linux 相同的状态行。mqueue 文件系统
+//! （`mount -t mqueue`，`crate::pseudo` 的 `MqRoot`、`Mq`）把同一张表列成目录：在里面
+//! open(O_CREAT) 新建、unlink 删除、chmod、chown 的都是这些队列，打开得到的 fd 与 mq_open 的
+//! 一样。消息按优先级
 //! 排列，同一优先级先进先出。mq_notify 在空队列来了消息、又没有人在等着接收时通知一次：
 //! 发信号，或者把登记时给的 32 字节 cookie 送到 netlink socket（musl 的 `SIGEV_THREAD`
 //! 就是这样实现的）。上限按 `/proc/sys/fs/mqueue/*`。
 
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::{SysResult, get, put, read_timespec};
 use crate::cell::RefCell;
-use crate::cred::{MAY_READ, MAY_WRITE, cap};
+use crate::cred::{Cred, MAY_READ, MAY_WRITE, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Tid, request_wake_object, wake};
@@ -114,11 +118,86 @@ impl Notify {
     }
 }
 
+/// 队列的 inode 编号（Linux 的 `get_next_ino`），所有命名空间一起编号。
+static NEXT_INO: AtomicU64 = AtomicU64::new(1);
+
+/// mqueue 文件系统里一个目录项的大小、一个队列文件的大小（Linux 的 DIRENT_SIZE、
+/// FILENT_SIZE）：根目录报告 2 + 队列数个目录项。
+const DIRENT_SIZE: u64 = 20;
+const FILENT_SIZE: u64 = 80;
+
+/// 一个 IPC 命名空间里 mqueue 文件系统的根目录：属主是建立命名空间的进程（开机时的是
+/// root），权限 01777，时间在新建、删除队列时更新。可以 chmod、chown。
+pub(crate) struct MqDir {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+impl MqDir {
+    pub fn new(uid: u32, gid: u32) -> MqDir {
+        let now = crate::tty::wall_ns();
+        MqDir {
+            uid,
+            gid,
+            mode: mode::S_ISVTX | 0o777,
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
+        }
+    }
+
+    /// stat：`queues` 是里面的队列数。
+    pub fn stat(&self, queues: usize) -> Stat {
+        Stat {
+            ino: 0,
+            mode: mode::S_IFDIR | self.mode,
+            nlink: 2,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            size: (2 + queues as u64) * DIRENT_SIZE,
+            atime_ns: self.atime_ns,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+        }
+    }
+
+    fn touch(&mut self) {
+        let now = crate::tty::wall_ns();
+        (self.atime_ns, self.mtime_ns, self.ctime_ns) = (now, now, now);
+    }
+}
+
+/// 命名空间里 inode 编号是 `ino` 的队列和它的名字（mqueue 文件系统里的节点）。
+pub(crate) fn find(ipc: &crate::ipc::Ipc, ino: u64) -> Option<(&[u8], &Rc<RefCell<MessageQueue>>)> {
+    ipc.mqueues
+        .iter()
+        .find(|(_, q)| q.borrow().ino == ino)
+        .map(|(n, q)| (n.as_slice(), q))
+}
+
+impl Default for MqDir {
+    fn default() -> MqDir {
+        MqDir::new(0, 0)
+    }
+}
+
 /// 一个消息队列。
 pub struct MessageQueue {
+    /// inode 编号：mqueue 文件系统里的节点按它找队列。
+    pub ino: u64,
+    /// 所在的 IPC 命名空间的编号（fstat 的设备号按它）。
+    pub ns: u64,
     uid: u32,
     gid: u32,
     mode: u32,
+    atime_ns: i64,
+    mtime_ns: i64,
+    ctime_ns: i64,
     maxmsg: usize,
     msgsize: usize,
     /// (优先级, 内容)，优先级高的在前，同一优先级先来的在前。
@@ -169,18 +248,119 @@ impl MessageQueue {
     /// fstat：mqueue 文件系统里的普通文件。
     pub fn stat(&self) -> Stat {
         Stat {
-            ino: 0,
+            ino: self.ino,
             mode: mode::S_IFREG | self.mode,
             nlink: 1,
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
-            size: 80,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            size: FILENT_SIZE,
+            atime_ns: self.atime_ns,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
         }
     }
+
+    /// 读了状态行、登记或取消通知、改了标志：atime、ctime 是现在。
+    pub fn touch_read(&mut self) {
+        let now = crate::tty::wall_ns();
+        (self.atime_ns, self.ctime_ns) = (now, now);
+    }
+
+    /// 发送、接收了一条消息：三个时间都是现在。
+    fn touch_all(&mut self) {
+        let now = crate::tty::wall_ns();
+        (self.atime_ns, self.mtime_ns, self.ctime_ns) = (now, now, now);
+    }
+
+    /// chmod：只改权限位（文件类型、setuid 这些没有）。
+    pub fn set_mode(&mut self, perm: u32) {
+        self.mode = perm & 0o7777;
+        self.ctime_ns = crate::tty::wall_ns();
+    }
+
+    /// chown：None 的不改。
+    pub fn set_owner(&mut self, uid: Option<u32>, gid: Option<u32>) {
+        if let Some(uid) = uid {
+            self.uid = uid;
+        }
+        if let Some(gid) = gid {
+            self.gid = gid;
+        }
+        self.ctime_ns = crate::tty::wall_ns();
+    }
+
+    /// utimensat：None 的不改，ctime 是现在。
+    pub fn set_times(&mut self, atime: Option<i64>, mtime: Option<i64>) {
+        if let Some(t) = atime {
+            self.atime_ns = t;
+        }
+        if let Some(t) = mtime {
+            self.mtime_ns = t;
+        }
+        self.ctime_ns = crate::tty::wall_ns();
+    }
+}
+
+/// 在 IPC 命名空间 `ns`（对象是 `ipc`）里新建队列 `name`（Linux 的 `mqueue_create_attr`）：
+/// 属主是调用者的 fsuid、fsgid，`perm` 已经去掉了 umask；`size` 是 (消息数, 消息长度) 的上限，
+/// None 时用 `msg_default`、`msgsize_default`。队列数到了 `queues_max` 时没有
+/// `CAP_SYS_RESOURCE` 是 ENOSPC。还没有登记进名字表（mq_open 装好 fd 之后才登记）。
+pub(crate) fn new_queue(
+    ipc: &crate::ipc::Ipc,
+    ns: u64,
+    cred: &Cred,
+    perm: u32,
+    size: Option<(u64, u64)>,
+) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
+    let limits = &ipc.mq_limits;
+    if ipc.mqueues.len() as u64 >= limits.queues_max && !cred.capable(cap::SYS_RESOURCE) {
+        return Err(Errno::ENOSPC);
+    }
+    let (maxmsg, msgsize) = size.unwrap_or((limits.msg_default, limits.msgsize_default));
+    let now = crate::tty::wall_ns();
+    Ok(Rc::new(RefCell::new(MessageQueue {
+        ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+        ns,
+        uid: cred.fsuid,
+        gid: cred.fsgid,
+        mode: perm & 0o777,
+        atime_ns: now,
+        mtime_ns: now,
+        ctime_ns: now,
+        maxmsg: maxmsg as usize,
+        msgsize: msgsize as usize,
+        messages: VecDeque::new(),
+        notify: None,
+        receivers: 0,
+        sent: 0,
+        received: 0,
+    })))
+}
+
+/// 把新建的队列登记进名字表，根目录的时间随之更新。
+pub(crate) fn insert_queue(ipc: &mut crate::ipc::Ipc, name: Vec<u8>, q: Rc<RefCell<MessageQueue>>) {
+    ipc.mqueues.entry(name).or_insert(q);
+    ipc.mq_dir.borrow_mut().touch();
+}
+
+/// 删除队列 `name`（mq_unlink 和 mqueue 文件系统里的 unlink，都是 Linux 的 `vfs_unlink`）：
+/// 根目录有粘滞位，要是队列或根目录的属主，或者对队列有 `CAP_FOWNER`，否则 EPERM（libc 的
+/// mq_unlink 把它换成 EACCES）。
+pub(crate) fn remove_queue(
+    ipc: &mut crate::ipc::Ipc,
+    cred: &Cred,
+    name: &[u8],
+) -> Result<(), Errno> {
+    let q = ipc.mqueues.get(name).ok_or(Errno::ENOENT)?;
+    let st = q.borrow().stat();
+    let dir_uid = ipc.mq_dir.borrow().uid;
+    if cred.fsuid != st.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&st, cap::FOWNER) {
+        return Err(Errno::EPERM);
+    }
+    ipc.mqueues.remove(name);
+    ipc.mq_dir.borrow_mut().touch();
+    Ok(())
 }
 
 /// 名字去掉开头的 `/`（musl 已经去掉了），检查长度和字符。
@@ -226,9 +406,9 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         None if flags & oflags::O_CREAT == 0 => return Err(Errno::ENOENT),
         None => {
             let privileged = cred.capable(cap::SYS_RESOURCE);
-            let limits = &cx.ipc().mq_limits;
-            let (mut maxmsg, mut msgsize) = (limits.msg_default, limits.msgsize_default);
+            let mut size = None;
             if attr != 0 {
+                let limits = &cx.ipc().mq_limits;
                 let b: [u8; 64] = get(cx, attr)?;
                 let field = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
                 let (m, s) = (field(1), field(2));
@@ -240,23 +420,10 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
                 if m <= 0 || s <= 0 || m as u64 > cap_m || s as u64 > cap_s {
                     return Err(Errno::EINVAL);
                 }
-                (maxmsg, msgsize) = (m as u64, s as u64);
+                size = Some((m as u64, s as u64));
             }
-            if cx.ipc().mqueues.len() as u64 >= limits.queues_max && !privileged {
-                return Err(Errno::ENOSPC);
-            }
-            Rc::new(RefCell::new(MessageQueue {
-                uid: cred.fsuid,
-                gid: cred.fsgid,
-                mode: perm & 0o777 & !cx.umask(),
-                maxmsg: maxmsg as usize,
-                msgsize: msgsize as usize,
-                messages: VecDeque::new(),
-                notify: None,
-                receivers: 0,
-                sent: 0,
-                received: 0,
-            }))
+            let ns = cx.ns().ipc.id;
+            new_queue(cx.ipc(), ns, &cred, perm & !cx.umask(), size)?
         }
     };
     let path: Rc<[u8]> = Rc::from([b"/".as_slice(), &name].concat());
@@ -267,19 +434,14 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
     );
     // 与 Linux 一样总是 close-on-exec；fd 用完时（EMFILE）不留下新建的队列
     let fd = cx.fds_mut().install(file, true, 0)?;
-    cx.ipc_mut().mqueues.entry(name).or_insert(queue);
+    insert_queue(cx.ipc_mut(), name, queue);
     Ok(fd as u64)
 }
 
 pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
     let name = queue_name(cx, name)?;
-    let q = cx.ipc().mqueues.get(&name).cloned().ok_or(Errno::ENOENT)?;
-    // 删除名字要求属主或者有 CAP_FOWNER（mqueue 文件系统的根目录有粘滞位）
     let cred = cx.cred();
-    if cred.fsuid != q.borrow().uid && !cred.capable(cap::FOWNER) {
-        return Err(Errno::EACCES);
-    }
-    cx.ipc_mut().mqueues.remove(&name);
+    remove_queue(cx.ipc_mut(), &cred, &name)?;
     Ok(0)
 }
 
@@ -349,6 +511,7 @@ pub(super) fn mq_timedsend(
             .unwrap_or(q.messages.len());
         q.messages.insert(at, (prio, data));
         q.sent += 1;
+        q.touch_all();
         // 空队列来了消息、又没有人在等着接收：通知一次，登记随之取消
         if was_empty && q.receivers == 0 {
             q.notify.take()
@@ -418,6 +581,7 @@ pub(super) fn mq_timedreceive(
         let mut queue = q.borrow_mut();
         if let Some(m) = queue.messages.pop_front() {
             queue.received += 1;
+            queue.touch_all();
             break m;
         }
         drop(queue);
@@ -466,6 +630,7 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
         let mut q = q.borrow_mut();
         if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
             q.notify = None;
+            q.touch_read();
         }
         return Ok(0);
     };
@@ -506,6 +671,7 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
         return Err(Errno::EBUSY);
     }
     q.notify = Some(notify);
+    q.touch_read();
     Ok(0)
 }
 
@@ -542,6 +708,7 @@ pub(super) fn mq_getsetattr(cx: &mut Cx<'_>, fd: i32, new: u64, old: u64) -> Sys
     if let Some(flags) = attr {
         let mut f = file.borrow_mut();
         f.flags = (f.flags & !oflags::O_NONBLOCK) | flags;
+        q.borrow_mut().touch_read();
     }
     Ok(0)
 }

@@ -406,7 +406,10 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         ns.uts = ns.uts.copy(child_cred_owner.clone());
     }
     if flags & CLONE_NEWIPC != 0 {
-        ns.ipc = cx.k().new_ipc_ns(child_cred_owner.clone());
+        let cred = cx.cred();
+        ns.ipc = cx
+            .k()
+            .new_ipc_ns(child_cred_owner.clone(), (cred.fsuid, cred.fsgid));
     }
     if flags & CLONE_NEWNET != 0 {
         ns.net = cx.k().new_net_ns(child_cred_owner.clone())?;
@@ -1528,7 +1531,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
             ns.uts = ns.uts.copy(owner.clone());
         }
         if flags & CLONE_NEWIPC != 0 {
-            ns.ipc = cx.k().new_ipc_ns(owner);
+            let cred = cx.cred();
+            ns.ipc = cx.k().new_ipc_ns(owner, (cred.fsuid, cred.fsgid));
         }
         *cx.task.ns.borrow_mut() = ns;
         cx.k().collect_ipc();

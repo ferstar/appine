@@ -406,13 +406,22 @@ impl Kernel {
     }
 
     /// 新建一个空的 IPC 命名空间，属于用户命名空间 `owner`（Linux 的 `create_ipc_ns`：
-    /// 限制都是默认值）。
-    pub fn new_ipc_ns(&mut self, owner: Rc<crate::cred::UserNs>) -> Rc<crate::nsproxy::IpcNs> {
+    /// 限制都是默认值）。`creator` 是建立它的进程的 fsuid、fsgid：mqueue 文件系统的根目录
+    /// 属于它（`mq_init_ns` 里 `mqueue_get_inode` 取 `current_fsuid()`）。
+    pub fn new_ipc_ns(
+        &mut self,
+        owner: Rc<crate::cred::UserNs>,
+        creator: (u32, u32),
+    ) -> Rc<crate::nsproxy::IpcNs> {
         let ns = Rc::new(crate::nsproxy::IpcNs {
             id: crate::vfs::new_ns_id(),
             owner,
         });
-        let objects = (Rc::downgrade(&ns), crate::ipc::Ipc::default());
+        let ipc = crate::ipc::Ipc {
+            mq_dir: crate::cell::RefCell::new(crate::syscall::MqDir::new(creator.0, creator.1)),
+            ..Default::default()
+        };
+        let objects = (Rc::downgrade(&ns), ipc);
         self.ipcs.insert(ns.id, objects);
         ns
     }

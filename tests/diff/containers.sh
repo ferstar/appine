@@ -1,7 +1,7 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
 # 容器运行时（podman、crun、docker、runc）用到的内核接口（docs/rounds/157-container-survey.md
 # 起）：capget 探测版本、开机时的命名空间里拉起已经起着的 lo、合成文件系统根目录的 inode
-# 编号、线程目录里的 fd；不带只读地挂 cgroup2
+# 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统
 set -e
 cd /tmp
 
@@ -269,3 +269,163 @@ mount -o remount,bind,ro mnt/cg && opts mnt/cg
 python3 -c 'import os; print("ST_RDONLY", os.statvfs("mnt/cg").f_flag & 1)'
 mount -o remount,bind,rw mnt/cg && opts mnt/cg
 umount mnt/cg
+
+# mqueue 文件系统（crun 给每个容器挂 /dev/mqueue）：列出的是挂上它的进程所在的 IPC 命名
+# 空间里的 POSIX 消息队列。根目录 01777、大小按队列数；队列文件读到状态行；在里面新建的
+# 是队列（默认的大小），fd 可以当 mq 描述符用；unlink 删除队列（粘滞位：别人的是 EPERM，
+# libc 的 mq_unlink 换成 EACCES）；mkdir、mknod、symlink、rename 是 EPERM；同一个命名
+# 空间在自己的根上再挂是 EBUSY，新的 IPC 命名空间里是另一个实例
+mkdir -p mnt/mq mnt/mq2
+mount -t mqueue mqueue mnt/mq && echo "mqueue: ok"
+awk -v p="$PWD/mnt/mq" '$5 == p {for (i = 7; $i != "-"; i++) {}; split($6, o, ","); print "mountinfo", o[1], $(i + 1), $(i + 2)}' /proc/self/mountinfo
+stat -c '%A %h %s %u' mnt/mq
+stat -f -c 'type %t' mnt/mq
+mount -t mqueue mqueue mnt/mq 2>&1 || true
+cat > mqfs.c <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <unistd.h>
+
+#define D "/tmp/mnt/mq/"
+
+static void show(const char *what, long r)
+{
+    printf("%-34s %s\n", what, r < 0 ? strerror(errno) : "ok");
+}
+
+static void ls(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    printf("ls %s:", dir);
+    while (d && (e = readdir(d)))
+        if (e->d_name[0] != '.')
+            printf(" %s(%s)", e->d_name, e->d_type == DT_REG ? "reg" : "?");
+    printf("\n");
+    if (d)
+        closedir(d);
+}
+
+int main(void)
+{
+    umask(022);
+    struct mq_attr a = {.mq_maxmsg = 4, .mq_msgsize = 64};
+    mqd_t q1 = mq_open("/q1", O_CREAT | O_RDWR, 0640, &a);
+    show("mq_open /q1", q1);
+    show("mq_send", mq_send(q1, "hello", 5, 3));
+    struct stat st, fst;
+    stat(D "q1", &st);
+    fstat(q1, &fst);
+    printf("q1: mode %o nlink %d size %lld uid %d same ino %d same dev %d\n", st.st_mode, (int)st.st_nlink,
+           (long long)st.st_size, st.st_uid, st.st_ino == fst.st_ino, st.st_dev == fst.st_dev);
+    struct stat dst;
+    stat(D, &dst);
+    printf("dir: size %lld, queue on the same device %d\n", (long long)dst.st_size, dst.st_dev == st.st_dev);
+    char buf[128] = "";
+    int fd = open(D "q1", O_RDONLY);
+    int n = read(fd, buf, sizeof buf - 1);
+    printf("read %d: %s", n, buf);
+    close(fd);
+    ls(D);
+
+    // 在文件系统里新建的是队列
+    int q2 = open(D "q2", O_CREAT | O_RDWR, 0666);
+    show("open O_CREAT q2", q2);
+    stat(D "q2", &st);
+    printf("q2: mode %o\n", st.st_mode);
+    struct mq_attr ga;
+    show("mq_getattr on the open fd", mq_getattr(q2, &ga));
+    printf("q2 attr: maxmsg %ld msgsize %ld\n", ga.mq_maxmsg, ga.mq_msgsize);
+    show("mq_send on the open fd", mq_send(q2, "x", 1, 0));
+    mqd_t q2b = mq_open("/q2", O_RDONLY | O_NONBLOCK);
+    char m[8192];
+    show("mq_receive via mq_open", mq_receive(q2b, m, sizeof m, NULL));
+    show("write to the queue fd", write(q2, "x", 1));
+    struct statfs sf;
+    fstatfs(q2, &sf);
+    printf("fstatfs type %lx\n", (unsigned long)sf.f_type);
+    show("open O_CREAT|O_EXCL existing", open(D "q2", O_CREAT | O_EXCL | O_RDWR, 0600));
+    show("open O_DIRECTORY on a queue", open(D "q2", O_RDONLY | O_DIRECTORY));
+    stat(D, &dst);
+    printf("dir: size %lld\n", (long long)dst.st_size);
+
+    // 元数据
+    show("chmod q1 0600", chmod(D "q1", 0600));
+    fstat(q1, &fst);
+    printf("q1 mode via mq fd: %o\n", fst.st_mode);
+    show("fchmod on the mq fd 0640", fchmod(q1, 0640));
+    stat(D "q1", &st);
+    printf("q1 mode: %o\n", st.st_mode);
+    show("chown q1 1000:1000", chown(D "q1", 1000, 1000));
+    stat(D "q1", &st);
+    printf("q1 owner: %d %d\n", st.st_uid, st.st_gid);
+    struct timespec ts[2] = {{1000, 0}, {2000, 0}};
+    show("utimensat q1", utimensat(AT_FDCWD, D "q1", ts, 0));
+    stat(D "q1", &st);
+    printf("q1 times: %lld %lld\n", (long long)st.st_atime, (long long)st.st_mtime);
+
+    // 不支持的操作
+    show("mkdir", mkdir(D "d", 0755));
+    show("mknod fifo", mknod(D "f", S_IFIFO | 0644, 0));
+    show("symlink", symlink("q1", D "l"));
+    show("rename", rename(D "q1", D "q3"));
+    show("rmdir a queue", rmdir(D "q1"));
+    show("unlink q1/", unlink(D "q1/"));
+    show("unlink missing", unlink(D "nosuch"));
+
+    // 别人的队列：粘滞位
+    fflush(stdout);
+    pid_t c = fork();
+    if (c == 0) {
+        setgid(65534);
+        setuid(65534);
+        show("nobody unlink q1", unlink(D "q1"));
+        show("nobody raw mq_unlink q1", syscall(SYS_mq_unlink, "q1"));
+        show("nobody libc mq_unlink q1", mq_unlink("/q1"));
+        int fd = open(D "q4", O_CREAT | O_RDWR, 0600);
+        show("nobody creates q4", fd);
+        struct stat st;
+        stat(D "q4", &st);
+        printf("q4 owner %d\n", st.st_uid);
+        show("nobody unlinks q4", unlink(D "q4"));
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(c, NULL, 0);
+
+    show("unlink q2", unlink(D "q2"));
+    show("mq_open /q2 after unlink", mq_open("/q2", O_RDONLY));
+    ls(D);
+
+    // 新的 IPC 命名空间里另外挂一个：是空的，设备号不同
+    fflush(stdout);
+    c = fork();
+    if (c == 0) {
+        show("unshare CLONE_NEWIPC", unshare(CLONE_NEWIPC));
+        show("mount in the new ns", mount("mqueue", "/tmp/mnt/mq2", "mqueue", 0, NULL));
+        ls("/tmp/mnt/mq2");
+        struct stat a, b;
+        stat("/tmp/mnt/mq", &a);
+        stat("/tmp/mnt/mq2", &b);
+        printf("other instance has its own device: %d\n", a.st_dev != b.st_dev);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(c, NULL, 0);
+    ls(D);
+    mq_unlink("/q1");
+    return 0;
+}
+C
+gcc -D_GNU_SOURCE -o mqfs mqfs.c && ./mqfs
+umount mnt/mq2 2>/dev/null; umount mnt/mq

@@ -7,7 +7,8 @@
 //! 的 `path_mount`、`path_umount`、`pivot_root`。传播类型可以设置，但不模拟：挂载之间没有
 //! 传播，都相当于 private。挂载要在调用者的挂载命名空间里（Linux 的 `check_mnt`），别的
 //! 命名空间里的（经由 `/proc/<pid>/root` 看到的）是 EINVAL。tmpfs 是仓库里不挂在根目录下面
-//! 的一棵树（`Vfs::new_tmpfs`）。
+//! 的一棵树（`Vfs::new_tmpfs`）。mqueue 列出挂上它的进程所在的 IPC 命名空间里的 POSIX
+//! 消息队列（`syscall::mqueue`）。
 //! 别的文件系统与没有编进内核的一样是 ENODEV。
 
 use std::collections::HashSet;
@@ -138,15 +139,27 @@ fn new_mount(
         crate::debug::log(format_args!("mount: no filesystem type {name}"));
         return Err(Errno::ENODEV);
     };
+    // mqueue 挂上的是调用者所在的 IPC 命名空间的实例，要在它的属主里有 CAP_SYS_ADMIN
+    // （Linux 的 mqueue_init_fs_context 把 fc->user_ns 换成它的，再 mount_capable）
+    let ipc = cx.ns().ipc;
+    if fs == Fs::Mqueue && !cx.cred().ns_capable(&ipc.owner, cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
     // cgroup2 可以不带只读挂上（crun 给容器挂 /sys/fs/cgroup 时就这样），只是里面的文件改不了
     // （[`Vfs::readonly`]）
     let vfs = cx.vfs()?;
     may_mount_on(&target)?;
     check_mnt(cx, &vfs, target.mnt())?;
-    // 只有一个实例的文件系统不能再挂在它自己的挂载的根上（Linux 的 do_add_mount）
+    // 只有一个实例的文件系统不能再挂在它自己的挂载的根上（Linux 的 do_add_mount）；mqueue
+    // 是每个 IPC 命名空间一个实例
+    let same_instance = |m: &Mount| {
+        m.fs == fs
+            && (fs != Fs::Mqueue
+                || matches!(&m.root, Node::Pseudo(_, PseudoNode::MqRoot(n)) if *n == ipc.id))
+    };
     if !fs.new_instance()
         && let Some(id) = vfs.mount_root(&target)
-        && vfs.mount(id).is_some_and(|m| m.fs == fs)
+        && vfs.mount(id).is_some_and(|m| same_instance(&m))
     {
         return Err(Errno::EBUSY);
     }
@@ -160,15 +173,25 @@ fn new_mount(
         cx.shared.fast_changed();
         return Ok(0);
     }
-    let dev = (!fs.own_dev()).then(|| fs.dev());
+    let (root, dev) = match fs {
+        Fs::Mqueue => (
+            Node::Pseudo(0, PseudoNode::MqRoot(ipc.id)),
+            Some(vfs.mq_dev(ipc.id)),
+        ),
+        _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),
+    };
     let id = vfs.add_mount(
         fs,
-        fs.root(),
+        root,
         (target, at),
         flags,
         source.unwrap_or_default(),
         dev,
     );
+    // mqueue 的挂载留住那个 IPC 命名空间（和里面的队列），与 Linux 的超级块引用着它一样
+    if fs == Fs::Mqueue {
+        vfs.update_mount(id, |m| m.pin = Some(crate::nsproxy::NsRef::Ipc(ipc)));
+    }
     // procfs 里的 pid 按挂上它的进程所在的 pid 命名空间算
     let pid_ns = cx.pid_ns();
     if fs == Fs::Proc && pid_ns.level > 0 {
