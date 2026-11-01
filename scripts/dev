@@ -37,11 +37,13 @@ if [ -t 0 ] && [ -t 1 ]; then
 fi
 
 # --ulimit nice：与 Android 的 init.rc（setrlimit nice 40 40）一样，线程不需要特权就能
-# 把 nice 值调到 -20；appine 把 guest 线程的 nice 值设置到宿主线程上
+# 把 nice 值调到 -20；appine 把 guest 线程的 nice 值设置到宿主线程上。/ltp 是虚拟机本地的
+# docker 卷，scripts/ltp 的仓库放在那里（不经过 virtiofs）
 # shellcheck disable=SC2086
 exec docker run --rm $tty_flags $proxy_run $env_run --platform linux/arm64 \
     --ulimit nice=40:40 \
     -v "$root:/work" -w /work \
     -v appine-cargo-registry:/usr/local/cargo/registry \
+    -v appine-ltp:/ltp \
     -e CARGO_TARGET_DIR=/work/target/linux-arm64 \
     "$image" "$@"

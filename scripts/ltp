@@ -10,6 +10,11 @@
 # 内部错误（内核 bug、放开 BKL 时借着内核对象），不论退出码。
 # LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
 #
+# 测试用的仓库在 scripts/dev 的容器里放在虚拟机本地的 docker 卷上（/ltp/store），别处是
+# target/ltp/store，LTP_STORE 可以另指。macOS 上 target/ 经由 virtiofs，每次文件操作都要到
+# 宿主那边：八路同时写同一个仓库的 SQLite 时，等写锁超过 10 秒的操作是 EIO，每次全量都有
+# 几个到几十个测试因此失败；放在本地卷上全量从两分多钟降到一分钟。sendfile09 要 5 GB 空闲。
+#
 # 下面 skip 里的测试不跑，结果记 SKIP（退出码 -），-a 时照常跑：
 # - sigtimedwait01、sigwaitinfo01：第一项等"空集合被信号打断返回 EINTR"，musl 的
 #   sigtimedwait、sigwaitinfo 遇到 EINTR 自己重试，又没有超时，每次都跑满 LTP 的 10 分钟
@@ -19,6 +24,8 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/target/ltp
 store=$out/store
+[ ! -d /ltp ] || store=/ltp/store
+store=${LTP_STORE:-$store}
 run=${APPINE_RUN:-$root/target/linux-arm64/release/appine-run}
 
 # xargs 为每个测试调用一次：scripts/ltp --one <执行层> <名字> <命令行……>
@@ -121,9 +128,10 @@ else
     cp "$out/tests.txt" "$out/run.txt"
 fi
 # 最长的先跑（按 durations.txt 里记的上次的耗时，没记过的当作 1 秒）：长的测试一开始就与
-# 别的并行，不在最后拖尾
+# 别的并行，不在最后拖尾。awk 按文件名分开两个文件：NR == FNR 在第一个文件是空的时候对
+# 第二个也成立
 if [ -f "$out/durations.txt" ]; then
-    awk 'NR == FNR { d[$1] = $2; next } { print ($1 in d ? d[$1] : 1), $0 }' \
+    awk 'FILENAME == ARGV[1] { d[$1] = $2; next } { print ($1 in d ? d[$1] : 1), $0 }' \
         "$out/durations.txt" "$out/run.txt" | sort -s -k1,1 -gr | cut -d' ' -f2- >"$out/run.sorted"
     mv "$out/run.sorted" "$out/run.txt"
 fi
@@ -133,7 +141,7 @@ fi
 } | sort >"$out/results.txt"
 # 记下这次跑过的耗时（单独重跑几个测试时只更新它们）
 touch "$out/durations.txt"
-awk 'NR == FNR { if ($4 != "-") d[$1] = $4; next } !($1 in d) { print } END { for (n in d) print n, d[n] }' \
+awk 'FILENAME == ARGV[1] { if ($4 != "-") d[$1] = $4; next } !($1 in d) { print } END { for (n in d) print n, d[n] }' \
     "$out/results.txt" "$out/durations.txt" | sort >"$out/durations.new"
 mv "$out/durations.new" "$out/durations.txt"
 awk '{n[$2]++} END {for (r in n) printf "%s %d\n", r, n[r]}' "$out/results.txt" | sort

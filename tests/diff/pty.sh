@@ -172,8 +172,10 @@ def events(fd):
 
 
 def wait(fd, pri=False):
-    # 原生上写进主设备的数据经由 flip buffer 异步交给行规程，等到它产生结果
-    select.select([] if pri else [fd], [], [fd] if pri else [], 5)
+    # 原生上写进主设备的数据经由 flip buffer 异步交给行规程，等到它产生结果。等状态（pri）
+    # 时也等可读：Linux 的 pty_stop、pty_start 唤醒时只带 EPOLLIN，只等异常条件的 select
+    # 不会被叫醒，要等到超时
+    select.select([fd], [], [fd] if pri else [], 5)
 
 
 def rd(fd, n=100):

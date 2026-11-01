@@ -2,8 +2,15 @@
 # 差分测试（设计文档 §13.3 第 4 层）：同一个脚本分别在 appine 和真正的 arm64 Linux 上
 # 运行，比对输出和退出码。在有 docker 的宿主上运行：
 #
-#   scripts/difftest [-t 执行层] [-r] [-s 仓库目录] [用例名……]
+#   scripts/difftest [-t 执行层] [-r] [-s 仓库目录] [-j 并发数] [用例名……]
 #
+# -j 同时跑几组（macOS 上默认 4，别的宿主上默认 1）：原生一侧各在各的容器里；appine 一侧
+# 每个并发通道用一份仓库的克隆（<仓库>-w<n>，各组都往 guest 的 /tmp 里写同名的文件，共用
+# 一个仓库会互相覆盖），macOS 上是 APFS 的 clonefile（`cp -c`，写时复制，几乎不占空间），
+# 别处是 `cp --reflink=auto`（不支持时真复制）。克隆在没有时、带 -r 时重新做（主仓库装了
+# 新的软件包之后本来就要 -r 重新导出镜像）。上次耗时长的组先开始（记在
+# target/difftest/durations-t<执行层>.txt）。每组的结果整段打印，`ok` 一行带耗时（原生、
+# appine 各几秒）。-j 1 照原来一组一组地跑。
 # 用例是 tests/diff/<名字>.sh，由 guest 的 /bin/sh 执行，stderr 并入 stdout。真正的
 # Linux 一侧是 docker 容器：先在 appine 里把仓库的根文件系统打包、导入成镜像，所以两边
 # 运行的是完全相同的文件。镜像只在第一次或者带 -r 时生成，换了仓库要带 -r。用例里
@@ -28,15 +35,21 @@ cd "$root"
 tier=1
 rebuild=0
 store=target/difftest/store
+jobs=1
+[ "$(uname)" != Darwin ] || jobs=4
+# 并发时由自己调用自己跑一组（-G 用例名），这时不再准备仓库、镜像
+group=
 image=appine-difftest
 packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc dmesg iptables nftables"
 env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-while getopts t:rs: opt; do
+while getopts t:rs:j:G: opt; do
     case $opt in
     t) tier=$OPTARG ;;
     r) rebuild=1 ;;
     s) store=$OPTARG ;;
+    j) jobs=$OPTARG ;;
+    G) group=$OPTARG ;;
     *) exit 2 ;;
     esac
 done
@@ -65,6 +78,7 @@ else
     appine() { scripts/dev "$run" "$@"; }
 fi
 
+if [ -z "$group" ]; then
 if [ ! -d "$store" ]; then
     tarball=$(ls target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | tail -n 1)
     [ -n "$tarball" ] || {
@@ -94,6 +108,7 @@ if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
         bin etc lib sbin usr tmp 2>/dev/null |
         docker import --platform linux/arm64 - "$image" >/dev/null
 fi
+fi
 
 out=target/difftest
 mkdir -p "$out"
@@ -101,32 +116,35 @@ if [ $# -eq 0 ]; then
     set -- $(cd tests/diff && ls *.sh | sed 's/\.sh$//')
 fi
 
-failed=0
-for name in "$@"; do
+# 跑一组：两边各运行一次，比对；不一致时返回 1
+run_group() {
+    name=$1
     script="exec 2>&1; $(cat "tests/diff/$name.sh")"
     # 脚本整个作为 sh -c 的一个参数交出去，Linux 不让单个参数超过 128 KB（MAX_ARG_STRLEN）：
     # 超过时两边都执行不了（E2BIG），输出一样，会被当成通过
     if [ "$(printf '%s' "cd / && $script" | wc -c)" -ge 131072 ]; then
         echo "FAIL $name: tests/diff/$name.sh is longer than one argument can be (128 KB), split it"
-        failed=$((failed + 1))
-        continue
+        return 1
     fi
     options=$(sed -n 's/^# docker-run-options: //p' "tests/diff/$name.sh")
     set +e
     # Docker 默认的 seccomp 规则会改掉一些 syscall 的结果（clone3 返回 ENOSYS，
     # pidfd_getfd 返回 EPERM），比对的应当是内核本身的行为
     # shellcheck disable=SC2086 # 选项要按空白拆开
+    t0=$(date +%s)
     docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined $options \
         -e "$env_path" -e HOME=/root -w / "$image" \
         /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
     echo "exit $?" >>"$out/$name.native"
+    t1=$(date +%s)
     appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root -- \
         /bin/sh -c "cd / && $script" >"$out/$name.appine" 2>"$out/$name.appine.err"
     echo "exit $?" >>"$out/$name.appine"
+    t2=$(date +%s)
     set -e
     bugs=$(grep '^appine: internal error' "$out/$name.appine.err" || true)
     if cmp -s "$out/$name.native" "$out/$name.appine" && [ -z "$bugs" ]; then
-        echo "ok   $name"
+        echo "ok   $name ($((t1 - t0))s native, $((t2 - t1))s appine)"
     else
         echo "FAIL $name"
         diff -u "$out/$name.native" "$out/$name.appine" | sed 's/^/    /' || true
@@ -137,9 +155,68 @@ for name in "$@"; do
         cp "$out/$name.appine" "$kept.appine"
         cp "$out/$name.appine.err" "$kept.appine.err"
         echo "    saved as $kept.native, .appine, .appine.err"
-        failed=$((failed + 1))
+        return 1
     fi
-done
+}
+
+# 并发时由自己调用自己：只跑 -G 给的那一组，用一个空闲的通道的仓库
+if [ -n "$group" ]; then
+    slot=""
+    for w in $(seq 1 "$jobs"); do
+        if mkdir "$out/.slot-$w" 2>/dev/null; then
+            slot=$w
+            break
+        fi
+    done
+    [ -n "$slot" ] || {
+        echo "FAIL $group: no free slot"
+        exit 1
+    }
+    store=$store-w$slot
+    # 整段输出攒好一次写出，几组同时结束时不交错
+    report=$(run_group "$group" 2>&1) && code=0 || code=1
+    rmdir "$out/.slot-$slot"
+    printf '%s\n' "$report"
+    exit "$code"
+fi
+
+failed=0
+if [ "$jobs" -le 1 ]; then
+    for name in "$@"; do
+        run_group "$name" || failed=$((failed + 1))
+    done
+else
+    rm -rf "$out"/.slot-*
+    for w in $(seq 1 "$jobs"); do
+        clone=$store-w$w
+        if [ ! -f "$clone/.cloned" ] || [ "$rebuild" = 1 ]; then
+            rm -rf "$clone"
+            if [ "$(uname)" = Darwin ]; then
+                cp -cR "$store" "$clone"
+            else
+                cp -a --reflink=auto "$store" "$clone"
+            fi
+            touch "$clone/.cloned"
+        fi
+    done
+    # 上次耗时（原生加 appine）长的先开始，最后不剩一组长的单独跑；没跑过的排在最后
+    durations=$out/durations-t$tier.txt
+    touch "$durations"
+    # 各组的结果按结束的先后打印；FAIL 的行数就是失败的组数
+    reports=$out/.reports
+    # awk 按文件名分开两个文件：NR == FNR 在第一个文件是空的时候对第二个也成立
+    printf '%s\n' "$@" >"$out/.groups"
+    awk 'FILENAME == ARGV[1] { d[$1] = $2; next } { print ($1 in d ? d[$1] : 0), $1 }' \
+        "$durations" "$out/.groups" | sort -s -k1,1 -nr | cut -d' ' -f2 |
+        xargs -P "$jobs" -I '{}' "$0" -t "$tier" -s "$store" -j "$jobs" -G '{}' | tee "$reports" || true
+    failed=$(grep -c '^FAIL ' "$reports" || true)
+    # 记下这次通过的各组的耗时，没通过的留着上次的
+    sed -n 's/^ok   \([^ ]*\) (\([0-9]*\)s native, \([0-9]*\)s appine)$/\1 \2 \3/p' "$reports" \
+        >"$out/.times"
+    awk 'FILENAME == ARGV[1] { d[$1] = $2 + $3; next } !($1 in d) { print } END { for (n in d) print n, d[n] }' \
+        "$out/.times" "$durations" | sort >"$durations.new"
+    mv "$durations.new" "$durations"
+fi
 [ "$failed" = 0 ] || {
     echo "$failed failed"
     exit 1

@@ -289,7 +289,11 @@ wait_for /tmp/ready3
 nsenter -t $p3 -U -u sh -c 'echo "user: $(hostname) uid $(id -u) map $(tr -s " " </proc/self/uid_map)"'
 nsenter -t $p3 -a sh -c 'echo "user -a: $(hostname) uid $(id -u)"'
 echo "unshare -r: $(unshare -r sh -c 'id -u; id -g; cat /proc/self/setgroups' | tr '\n' ' ')"
+# unshare -f 的父进程等子进程时屏蔽了 SIGTERM，子进程是新的 pid 命名空间里的 1 号进程，
+# 祖先命名空间发来的信号只有 SIGKILL、SIGSTOP 一定送到：用 SIGKILL 杀它，不然 wait 要等
+# 里面的 sleep 100 自己结束
 kill $p1 $p2 $p3
+kill -9 $(pgrep -P $p2)
 wait
 nsenter -t $p1 -u true 2>/dev/null
 echo "exited: $?"
