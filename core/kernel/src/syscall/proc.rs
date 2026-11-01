@@ -316,6 +316,9 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
             return Err(Errno::EAGAIN);
         }
     }
+    // cgroup 的 pids.max（Linux 的 cgroup_can_fork）：线程也算
+    let dst = args.cgroup.unwrap_or(cx.t.group.borrow().cgroup);
+    crate::cgroup::pids_charge(cx.k(), dst)?;
     let cred = cx.cred();
     let tid = cx.k().choose_pid(&pid_ns, &cred, &args.set_tid)?;
 

@@ -14,21 +14,25 @@
 //!   换出到 zram 的也算在里面，所以 `memory.swap.max` 是 0），`memory.stat` 把它分成匿名内存和
 //!   共享内存，`memory.events` 记着超出上限和结束进程的次数；
 //! - 没有 CPU 配额和权重：`cpu.max` 是 `max 100000`，cpuset 是 guest 看到的所有 CPU；
-//! - `pids.current` 是 guest 的线程数，`pids.max` 不限（限制在 threads-max 和 `RLIMIT_NPROC`）。
+//! - `pids.current` 是 guest 的任务数（含僵尸进程），`pids.max` 不限（限制在 threads-max 和
+//!   `RLIMIT_NPROC`）。
 //!
 //! 下面可以建子 cgroup（dockerd、runc、crun、systemd 这样管容器和服务），进程经由
 //! `cgroup.procs` 迁移、fork 时随父进程，`/proc/<pid>/cgroup` 是相对读者的 cgroup 命名空间的
 //! 根的路径。子 cgroup 的控制器按父 cgroup 的 `cgroup.subtree_control`，规则与 Linux 6.1 相同
-//! （没有内部进程、在用的不能关）。限制（`memory.max`、`pids.max`、`cpu.max`……）按 Linux 的格式
-//! 检查后记下来，读出来是写进去的值，还不起作用；`cgroup.freeze` 还不能冻结；`cgroup.kill`
-//! 结束整棵子树里的进程。
+//! （没有内部进程、在用的不能关）。限制按 Linux 的格式检查后记下来，读出来是写进去的值：
+//! `pids.max` 挡住 fork 和建线程（[`pids_charge`]），`memory.max` 由 OOM killer 定时检查
+//! （[`crate::oom`]），别的（`memory.high`、`cpu.max`、`cpuset.cpus`……）不起作用；
+//! `cgroup.freeze` 还不能冻结；`cgroup.kill` 结束整棵子树里的进程。
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use crate::cred::Cred;
 use crate::errno::Errno;
 use crate::kernel::{INIT, Kernel, Tid};
+use crate::oom::Events;
 
 /// 根 cgroup 的编号（也是它的 inode 号，与 Linux 一样是 1）。
 pub(crate) const ROOT: u64 = 1;
@@ -47,7 +51,10 @@ const CONTROLLERS: [(&str, bool); 8] = [
 ];
 
 /// appine 有的控制器（[`CONTROLLERS`] 里的位）。
-const AVAILABLE: u32 = 1 | 1 << 1 | 1 << 3 | 1 << 5;
+const AVAILABLE: u32 = 1 | 1 << 1 | 1 << MEMORY | 1 << PIDS;
+/// memory、pids 控制器在 [`CONTROLLERS`] 里的位置。
+const MEMORY: usize = 3;
+const PIDS: usize = 5;
 
 /// cgroup 目录里的文件：名字、权限位、属于哪个控制器（None 是核心文件，每个 cgroup 都有）。
 /// 按名字排好（readdir 的顺序）。
@@ -112,6 +119,33 @@ pub(crate) struct Cgroup {
     pub gid: u32,
     /// 写过的接口文件（限制这些）的值，按 Linux 显示的格式；没写过的显示默认值。
     pub values: BTreeMap<&'static [u8], String>,
+    /// 因为 pids 的上限没能 fork 的次数（`pids.events` 的 max，记在 fork 的 cgroup 或者离它
+    /// 最近的开了 pids 的祖先上，与 Linux 6.1 一样不往上加）。
+    pub pids_events: u64,
+    /// `memory.events`：这里和下面的 cgroup 超出上限、要结束进程、结束了进程的次数。
+    pub mem_events: Events,
+    /// `memory.events.local`：只算这个 cgroup 自己的。
+    pub mem_events_local: Events,
+    /// `memory.peak`：量到过的子树的最大用量（字节）。根的是 OOM killer 量的。
+    pub mem_peak: Cell<u64>,
+}
+
+impl Cgroup {
+    fn new(name: Vec<u8>, parent: Option<u64>, (uid, gid): (u32, u32)) -> Cgroup {
+        Cgroup {
+            name,
+            parent,
+            children: BTreeMap::new(),
+            subtree_control: 0,
+            uid,
+            gid,
+            values: BTreeMap::new(),
+            pids_events: 0,
+            mem_events: Events::default(),
+            mem_events_local: Events::default(),
+            mem_peak: Cell::new(0),
+        }
+    }
 }
 
 /// 所有的 cgroup，按编号。编号不重复使用。
@@ -122,15 +156,7 @@ pub(crate) struct Cgroups {
 
 impl Default for Cgroups {
     fn default() -> Cgroups {
-        let root = Cgroup {
-            name: Vec::new(),
-            parent: None,
-            children: BTreeMap::new(),
-            subtree_control: 0,
-            uid: 0,
-            gid: 0,
-            values: BTreeMap::new(),
-        };
+        let root = Cgroup::new(Vec::new(), None, (0, 0));
         Cgroups {
             map: BTreeMap::from([(ROOT, root)]),
             next: ROOT + 1,
@@ -234,15 +260,7 @@ impl Cgroups {
         self.next += 1;
         self.map.insert(
             id,
-            Cgroup {
-                name: name.to_vec(),
-                parent: Some(parent),
-                children: BTreeMap::new(),
-                subtree_control: 0,
-                uid: cred.fsuid,
-                gid: cred.fsgid,
-                values: BTreeMap::new(),
-            },
+            Cgroup::new(name.to_vec(), Some(parent), (cred.fsuid, cred.fsgid)),
         );
         self.map
             .get_mut(&parent)
@@ -395,30 +413,133 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
             k.oom.measure();
             k.oom.peak.get().to_string()
         }
-        b"memory.current" | b"memory.peak" => subtree_rss(k, id).to_string(),
+        b"memory.current" => {
+            let used = subtree_rss(k, id);
+            g.mem_peak.set(g.mem_peak.get().max(used));
+            used.to_string()
+        }
+        b"memory.peak" => {
+            let used = subtree_rss(k, id);
+            g.mem_peak.set(g.mem_peak.get().max(used));
+            g.mem_peak.get().to_string()
+        }
         b"memory.max" if root => max(k.oom.limit),
         b"memory.swap.max" if root => "0".to_owned(),
         b"memory.max" | b"memory.swap.max" => "max".to_owned(),
-        b"memory.events" | b"memory.events.local" if root => {
-            let e = k.oom.events.get();
-            format!(
-                "low 0\nhigh 0\nmax {}\noom {}\noom_kill {}\noom_group_kill 0",
-                e.max, e.oom, e.oom_kill
-            )
-        }
-        b"memory.events" | b"memory.events.local" => {
-            "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0".to_owned()
-        }
+        b"memory.events" => events(&g.mem_events),
+        b"memory.events.local" => events(&g.mem_events_local),
         b"memory.stat" if root => memory_stat(),
         b"memory.stat" => child_memory_stat(subtree_rss(k, id)),
         b"memory.swap.events" => "high 0\nmax 0\nfail 0".to_owned(),
-        b"pids.current" if root => k.tasks.len().to_string(),
-        b"pids.current" => tasks().count().to_string(),
-        b"pids.events" => "max 0".to_owned(),
+        b"pids.current" => pids_current(k, id).to_string(),
+        b"pids.events" => format!("max {}", g.pids_events),
         // 只能写的（cgroup.kill）
         _ => return None,
     };
     Some(s + "\n")
+}
+
+/// `memory.events` 的内容（low、high 总是 0：没有回收）。
+fn events(e: &Events) -> String {
+    format!(
+        "low 0\nhigh 0\nmax {}\noom {}\noom_kill {}\noom_group_kill {}",
+        e.max, e.oom, e.oom_kill, e.oom_group_kill
+    )
+}
+
+/// cgroup `id` 子树里的任务数（`pids.current`）：与 Linux 一样到回收为止都算，进程的
+/// 活着的线程，主线程退出了（僵尸进程、主线程先退出的进程）的再加 1。
+fn pids_current(k: &Kernel, id: u64) -> usize {
+    k.groups
+        .iter()
+        .filter(|&(&tgid, _)| tgid != INIT)
+        .map(|(_, g)| g.borrow())
+        .filter(|g| k.cgroups.is_within(g.cgroup, id))
+        .map(|g| g.threads.len() + !g.threads.contains(&g.tgid) as usize)
+        .sum()
+}
+
+/// fork 出一个任务放进 cgroup `dst` 之前（Linux 的 `pids_can_fork`）：它和每个开了 pids 的
+/// 祖先的任务数都不能超过 `pids.max`，超过是 EAGAIN，记进离它最近的开了 pids 的 cgroup 的
+/// `pids.events`，第一次时写一条内核日志。
+pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
+    let enabled = |c: u64| k.cgroups.controllers(c) & 1 << PIDS != 0;
+    let Some(css) = k.cgroups.ancestors(dst).find(|&c| enabled(c)) else {
+        return Ok(());
+    };
+    let over = k.cgroups.ancestors(css).filter(|&c| enabled(c)).any(|c| {
+        let limit = k.cgroups.map[&c].values.get(&b"pids.max"[..]);
+        limit
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|max| pids_current(k, c) + 1 > max)
+    });
+    if !over {
+        return Ok(());
+    }
+    let path = k.cgroups.path(css, ROOT);
+    let g = k.cgroups.map.get_mut(&css).unwrap();
+    g.pids_events += 1;
+    if g.pids_events == 1 {
+        crate::klog::printk(
+            &k.klog,
+            crate::klog::level::INFO,
+            format_args!("cgroup: fork rejected by pids controller in {path}"),
+        );
+    }
+    Err(Errno::EAGAIN)
+}
+
+/// 设了 `memory.max` 的 cgroup（开着 memory 控制器的）和上限（字节）。根的上限是 OOM killer
+/// 的，不在这里。
+pub(crate) fn memory_limits(k: &Kernel) -> Vec<(u64, u64)> {
+    k.cgroups
+        .map
+        .iter()
+        .filter(|&(&id, _)| id != ROOT && k.cgroups.controllers(id) & 1 << MEMORY != 0)
+        .filter_map(|(&id, g)| Some((id, g.values.get(&b"memory.max"[..])?.parse().ok()?)))
+        .collect()
+}
+
+/// 量 cgroup `id` 的内存用量（字节），顺便记下峰值。
+pub(crate) fn measure_memory(k: &Kernel, id: u64) -> u64 {
+    let used = subtree_rss(k, id);
+    if let Some(g) = k.cgroups.get(id) {
+        g.mem_peak.set(g.mem_peak.get().max(used));
+    }
+    used
+}
+
+/// 记一次内存事件（Linux 的 `memcg_memory_event`）：`id` 自己的 `memory.events.local`，
+/// 它和祖先的 `memory.events`。
+pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
+    let chain: Vec<u64> = k.cgroups.ancestors(id).collect();
+    for c in chain {
+        if let Some(g) = k.cgroups.map.get_mut(&c) {
+            f(&mut g.mem_events);
+            if c == id {
+                f(&mut g.mem_events_local);
+            }
+        }
+    }
+}
+
+/// 进程 `victim` 所在的 cgroup 到 OOM 的范围 `domain` 之间、设了 `memory.oom.group` 的最上面
+/// 那个（Linux 的 `mem_cgroup_get_oom_group`）：要连同它里面的进程一起结束。
+pub(crate) fn oom_group(k: &Kernel, victim: u64, domain: u64) -> Option<u64> {
+    if !k.cgroups.is_within(victim, domain) {
+        return None;
+    }
+    let mut group = None;
+    for c in k.cgroups.ancestors(victim) {
+        let set = k.cgroups.map[&c].values.get(&b"memory.oom.group"[..]);
+        if set.is_some_and(|v| v == "1") {
+            group = Some(c);
+        }
+        if c == domain {
+            break;
+        }
+    }
+    group
 }
 
 /// cgroup `id` 子树里的进程的驻留内存之和（字节）：子 cgroup 的 `memory.current`。
@@ -505,6 +626,18 @@ pub(crate) fn write(
             let g = k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?;
             let key = FILES.iter().find(|f| f.0 == name).ok_or(Errno::EINVAL)?.0;
             g.values.insert(key, value);
+            // 调低 memory.max：已经超出时马上结束一个进程（Linux 的 memory_max_write 回收
+            // 不了时 OOM，不记 max 事件）
+            if let Some(max) = g.values[key]
+                .parse::<u64>()
+                .ok()
+                .filter(|_| key == b"memory.max")
+            {
+                let used = measure_memory(k, id);
+                if used > max {
+                    crate::oom::out_of_memory(k, (id, used, max));
+                }
+            }
             Ok(())
         }
     }
@@ -556,7 +689,8 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
         },
         b"pids.max" if word == "max" => "max".to_owned(),
         b"pids.max" => match int(word)? {
-            v if (0..1 << 22).contains(&v) => v.to_string(),
+            // PID_MAX_LIMIT（2^22）也行（Linux 的 PIDS_MAX 是它加 1）
+            v if (0..=1 << 22).contains(&v) => v.to_string(),
             _ => return Err(Errno::EINVAL),
         },
         // 负数是 ERANGE（Linux 的 cgroup_max_depth_write）
@@ -698,6 +832,27 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     }
     let g = k.cgroups.map.get_mut(&id).unwrap();
     g.subtree_control = (g.subtree_control | enable) & !disable;
+    // 关掉的控制器在子 cgroup 里的状态（Linux 的 css）丢掉，再开时是默认值
+    for c in children {
+        let Some(child) = k.cgroups.map.get_mut(&c) else {
+            continue;
+        };
+        child.values.retain(|name, _| {
+            FILES
+                .iter()
+                .find(|f| f.0 == *name)
+                .and_then(|f| f.2)
+                .is_none_or(|ctl| disable & 1 << ctl == 0)
+        });
+        if disable & 1 << PIDS != 0 {
+            child.pids_events = 0;
+        }
+        if disable & 1 << MEMORY != 0 {
+            child.mem_events = Events::default();
+            child.mem_events_local = Events::default();
+            child.mem_peak.set(0);
+        }
+    }
     Ok(())
 }
 
@@ -875,6 +1030,8 @@ mod tests {
         assert_eq!(parse_value(b"memory.max", "max").unwrap(), "max");
         assert_eq!(parse_value(b"memory.max", "1x"), Err(Errno::EINVAL));
         assert_eq!(parse_value(b"pids.max", "-1"), Err(Errno::EINVAL));
+        assert_eq!(parse_value(b"pids.max", "4194304").unwrap(), "4194304");
+        assert_eq!(parse_value(b"pids.max", "4194305"), Err(Errno::EINVAL));
         assert_eq!(parse_value(b"cgroup.max.depth", "-1"), Err(Errno::ERANGE));
         assert_eq!(parse_value(b"cpu.weight", "0"), Err(Errno::ERANGE));
         assert_eq!(parse_value(b"cpu.max", "50000").unwrap(), "50000 100000");

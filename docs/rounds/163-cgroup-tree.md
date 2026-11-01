@@ -1,6 +1,6 @@
 # M9 之前：cgroup 树：建子 cgroup、迁移进程（2026-11-01）
 
-← [M9 之前：time 命名空间（2026-11-01）](162-time-namespaces.md) · [索引](../milestones.md)
+← [M9 之前：time 命名空间（2026-11-01）](162-time-namespaces.md) · [索引](../milestones.md) · [M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）](164-cgroup-limits.md) →
 
 [podman 和 docker 的普查](157-container-survey.md)的问题 9 的第一步：dockerd 起容器时先 `mkdir /sys/fs/cgroup/docker`，appine 的 cgroup v2 是只读的（[cgroup v2 的视图](58-cgroup.md)），回 `read-only file system`。podman 不加 `--cgroups disabled`、`podman build` 不加 runtime 参数时也要建子 cgroup、写 `cgroup.procs`。普查时原生的 docker 嵌套在容器里、启用不了控制器也能跑，所以分两步：这一轮只做层级和迁移，限制先按 Linux 的格式检查、记下，下一步再让 `pids.max`、`memory.max`、`cgroup.freeze` 真正起作用。照 Linux 6.1 的 `kernel/cgroup/cgroup.c`。
 
@@ -35,7 +35,7 @@
 
 **推迟项**：
 
-- 限制不起作用（`pids.max`、`memory.max`、`memory.high`、`cpu.max`、`cpuset.cpus` 这些只记下），`cgroup.freeze` 写 1 是 EOPNOTSUPP：下一步（普查的问题 9 的第二步）。子 cgroup 的 `memory.events`、`pids.events` 总是 0，`memory.peak` 就是当时的驻留内存。
+- 限制不起作用（`pids.max`、`memory.max`、`memory.high`、`cpu.max`、`cpuset.cpus` 这些只记下），`cgroup.freeze` 写 1 是 EOPNOTSUPP：下一步（普查的问题 9 的第二步）。子 cgroup 的 `memory.events`、`pids.events` 总是 0，`memory.peak` 就是当时的驻留内存。→ `pids.max`、`memory.max` 起作用了，事件和峰值也有了（M9 之前：cgroup 的 pids.max 和 memory.max 起作用）；别的限制仍只记下，`cgroup.freeze` 仍没有
 - 没有 threaded cgroup（`cgroup.type` 写 `threaded` 是 EOPNOTSUPP），线程总在进程所在的 cgroup 里。
 - cgroup 的目录、文件不能 chmod、chown：Linux 上可以，systemd、无 root 的 podman 靠它把一棵子树委派给普通用户。委派的另外几条检查（写 `cgroup.procs` 时对共同祖先的 `cgroup.procs` 也要有写权限，`cgroup_procs_write_permission`）也没有，普通用户的迁移只看目的地的文件权限。
 - `cgroup.events`、`memory.events` 内容变了不通知（inotify 的 IN_MODIFY、poll 的 POLLPRI，Linux 的 `kernfs_notify`）：systemd 靠它知道子树空了，containerd 靠它看 OOM。

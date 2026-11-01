@@ -4480,6 +4480,11 @@ fn write_bytes(
                 let tid = cx.tid();
                 pseudo::write(cx.k(), (tid, &cred), (&ns, &pid_ns), &node, data)?;
                 written = pseudo::written(&node, data.len());
+                // 改了 cgroup 的内存上限：叫醒定时器线程马上量一次
+                if let PseudoNode::Cgroup(_, b"memory.max") = node {
+                    cx.k().oom.recheck();
+                    crate::kernel::signal_later(&cx.shared.timers);
+                }
             }
             let ino = match file.borrow().kind {
                 FileKind::Regular { ino, .. } => Some(ino),
