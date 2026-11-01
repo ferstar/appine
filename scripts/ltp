@@ -5,7 +5,7 @@
 #   scripts/dev scripts/ltp [-a] [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
 #
 # 每个测试在一个新的 appine-run 进程里运行，结果写到 target/ltp/results.txt，每行
-# "<名字> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP> <退出码>"，输出在 target/ltp/logs/<名字>.log，上一次
+# "<名字> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP> <退出码> <秒数>"，输出在 target/ltp/logs/<名字>.log，上一次
 # 运行的留在 <名字>.prev.log（失败之后单独重跑不会把失败的那次冲掉）。BUG 是内核层报告了
 # 内部错误（内核 bug、放开 BKL 时借着内核对象），不论退出码。
 # LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
@@ -28,11 +28,15 @@ if [ "${1:-}" = --one ]; then
     shift 3
     log=$out/logs/$name.log
     [ -f "$log" ] && mv "$log" "$out/logs/$name.prev.log"
+    start=$(date +%s.%N)
     set +e
-    # LTP 按自己的计时器判超时；appine 比原生慢得多，放宽 20 倍
+    # LTP 按自己的计时器判超时；appine 比原生慢，放宽 5 倍（每个测试至少 2.5 分钟）。它也
+    # 乘在 TST_RETRY_FUNC 的退避上限上：20 倍时一直失败的系统调用（bpf 的那些）要重试
+    # 33 秒。跑满规定时长的竞争测试（inotify09、timerfd_settime02 等，fuzzy sync）只跑
+    # 十分之一：它们找的是 Linux 自己的竞争，原来一个就要 1–2 分钟
     timeout 900 "$run" --tier "$tier" --rootfs "$store" \
         --env PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-        --env LTPROOT=/opt/ltp --env TMPDIR=/tmp --env LTP_TIMEOUT_MUL=20 \
+        --env LTPROOT=/opt/ltp --env TMPDIR=/tmp --env LTP_TIMEOUT_MUL=5 --env LTP_RUNTIME_MUL=0.1 \
         --env LTP_COLORIZE_OUTPUT=0 --env KCONFIG_PATH=/opt/ltp/appine.config \
         -- /bin/sh -c "cd /tmp && exec $*" </dev/null >"$log" 2>&1
     code=$?
@@ -43,7 +47,7 @@ if [ "${1:-}" = --one ]; then
     *) result=FAIL ;;
     esac
     ! grep -q '^appine: internal error' "$log" || result=BUG
-    echo "$name $result $code"
+    echo "$name $result $code $(echo "$(date +%s.%N) $start" | awk '{printf "%.1f", $1 - $2}')"
     exit 0
 fi
 
@@ -116,9 +120,21 @@ if [ -n "$skip" ]; then
 else
     cp "$out/tests.txt" "$out/run.txt"
 fi
+# 最长的先跑（按 durations.txt 里记的上次的耗时，没记过的当作 1 秒）：长的测试一开始就与
+# 别的并行，不在最后拖尾
+if [ -f "$out/durations.txt" ]; then
+    awk 'NR == FNR { d[$1] = $2; next } { print ($1 in d ? d[$1] : 1), $0 }' \
+        "$out/durations.txt" "$out/run.txt" | sort -s -k1,1 -gr | cut -d' ' -f2- >"$out/run.sorted"
+    mv "$out/run.sorted" "$out/run.txt"
+fi
 {
     xargs -r -P "$jobs" -L 1 "$0" --one "$tier" <"$out/run.txt"
-    [ -z "$skip" ] || grep -E "^($skip)[[:space:]]" "$out/tests.txt" | awk '{print $1, "SKIP -"}'
+    [ -z "$skip" ] || grep -E "^($skip)[[:space:]]" "$out/tests.txt" | awk '{print $1, "SKIP - -"}'
 } | sort >"$out/results.txt"
+# 记下这次跑过的耗时（单独重跑几个测试时只更新它们）
+touch "$out/durations.txt"
+awk 'NR == FNR { if ($4 != "-") d[$1] = $4; next } !($1 in d) { print } END { for (n in d) print n, d[n] }' \
+    "$out/results.txt" "$out/durations.txt" | sort >"$out/durations.new"
+mv "$out/durations.new" "$out/durations.txt"
 awk '{n[$2]++} END {for (r in n) printf "%s %d\n", r, n[r]}' "$out/results.txt" | sort
 echo "results: $out/results.txt"
