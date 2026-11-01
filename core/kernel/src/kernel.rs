@@ -452,10 +452,15 @@ impl Kernel {
             .iter()
             .filter_map(|w| w.upgrade().and_then(|n| n.host_net))
             .collect();
-        // 127.255.0.0/16 留给开机时的命名空间里的虚拟地址（crate::netns::INIT_BLOCK）
+        // 127.255.0.0/16 留给开机时的命名空间里的虚拟地址（crate::netns::INIT_BLOCK），
+        // 127.254.0.0/16 留给从外面转发进来的连接（crate::forward::OUTSIDE_BLOCK）
         let net = (1..=u16::MAX)
             .map(u16::to_be_bytes)
-            .find(|n| n[0] != crate::netns::INIT_BLOCK && !used.contains(n))
+            .find(|n| {
+                n[0] != crate::netns::INIT_BLOCK
+                    && n[0] != crate::forward::OUTSIDE_BLOCK
+                    && !used.contains(n)
+            })
             .ok_or(Errno::ENOMEM)?;
         let devs = crate::netdev::Devices::for_new_ns(&self.init_ns.net.devs.borrow().conf);
         let ns = Rc::new(crate::nsproxy::NetNs {

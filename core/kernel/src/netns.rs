@@ -434,6 +434,15 @@ pub(crate) fn from_host(
     if x == [0; 4] {
         return out;
     }
+    // 从外面转发进来的连接（crate::forward）：客户端真实的地址和端口
+    if x[..2] == [127, crate::forward::OUTSIDE_BLOCK]
+        && let Some((ip, port)) =
+            crate::forward::outside_peer(x, u16::from_be_bytes([addr[2], addr[3]]))
+    {
+        out = with_ipv4(addr, ip);
+        out[2..4].copy_from_slice(&port.to_be_bytes());
+        return out;
+    }
     let guest_of_peer = |p: &[u8]| from_host(w, me, p, Role::Peer, icmp6);
     match me.host_net {
         Some([a, b]) => {
@@ -1416,6 +1425,26 @@ mod tests {
 
     fn up(ns: &NetNs) {
         set_up(&mut ns.lo.borrow_mut(), true);
+    }
+
+    /// 从外面转发进来的连接（127.254.x.y，crate::forward）：对端报告成客户端真实的地址和端口，
+    /// 宿主端口对不上的不换。
+    #[test]
+    fn outside_peers_show_the_real_client() {
+        let n = Rc::new(ns());
+        let w = World {
+            all: vec![crate::nsproxy::NsProxy::init().net, n.clone()],
+        };
+        crate::forward::record_outside_for_test(
+            [127, 254, 200, 7],
+            [192, 168, 1, 50],
+            51000,
+            51000,
+        );
+        let got = from_host(&w, &n, &v4([127, 254, 200, 7], 51000), Role::Peer, false);
+        assert_eq!(got, v4([192, 168, 1, 50], 51000));
+        let other = from_host(&w, &n, &v4([127, 254, 200, 7], 51001), Role::Peer, false);
+        assert_ne!(other[4..8], [192, 168, 1, 50]);
     }
 
     /// 监听的登记：通配地址按地址族、`IPV6_V6ONLY`，绑了地址的只接受发往它的。

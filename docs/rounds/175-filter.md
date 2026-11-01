@@ -1,6 +1,6 @@
 # M9 之前：过滤链（2026-11-01）
 
-← [M9 之前：各个网络命名空间的端口互不相干（2026-11-01）](174-namespace-ports.md) · [索引](../milestones.md)
+← [M9 之前：各个网络命名空间的端口互不相干（2026-11-01）](174-namespace-ports.md) · [索引](../milestones.md) · [M9 之前：从外面转发进来的连接带上真实的客户端地址（2026-11-01）](176-real-client-address.md) →
 
 [第 172 轮](172-nftables.md)的推迟项：nftables、iptables-nft 的规则集只执行 nat 链，过滤的链只记下、能列出来，不起作用。所以下面这些都没有效果：
 

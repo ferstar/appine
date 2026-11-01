@@ -1846,9 +1846,14 @@ pub(crate) fn unmap_addr(
         return addr;
     };
     let known = if local { s.local_map } else { s.peer_map };
+    // 从外面转发进来的连接的来源不是映射来的端口（crate::forward）
+    let outside = ip_of(&addr).is_some_and(|ip| match ip {
+        std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
+        std::net::IpAddr::V6(_) => false,
+    });
     let guest = match known {
         Some((g, h)) if h == port => Some(g),
-        _ if local || !mappable(s) => None,
+        _ if local || !mappable(s) || outside => None,
         _ => {
             let key =
                 crate::netns::owner_of_host(w, &addr).map_or_else(|| ns_key(s), |n| key_of(&n));

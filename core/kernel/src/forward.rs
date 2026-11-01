@@ -6,6 +6,12 @@
 //! 它接受连接，连到 DNAT 的目的地（容器在宿主上的回环地址），在两边之间转发数据，相当于
 //! 内核层里的 docker-proxy。UDP 的按来源各开一个宿主 socket 转发，闲置两分钟就关掉。
 //!
+//! 外面的客户端是 IPv4、不是回环地址时（别的设备），转发的连接先绑一个 127.254.x.y 和客户端的
+//! 端口再连过去，登记下来（[`outside_peer`]）：容器里 accept、getpeername 看到的是客户端真实的
+//! 地址，与 Linux 上 DNAT 一样（docs/rounds/176-real-client-address.md）。回环地址来的（手机上
+//! 的别的 App、浏览器开 localhost）照旧绑网关在宿主上的地址：Linux 上从本机连发布的端口时
+//! netavark 做 masquerade、docker 经由 docker-proxy，容器看到的也是网关。
+//!
 //! 线程只碰宿主 fd，不拿 BKL。要转发哪些端口、转到哪里由 `syscall::net` 按规则算好交来
 //! （[`Forwarder::add`]），socket 关掉、规则变了时丢掉 [`Handle`] 就不再转发。
 
@@ -28,6 +34,73 @@ const SHUT_WR: i32 = 1;
 const BUFFER: usize = 64 * 1024;
 /// UDP 的转发 socket 闲置多久关掉（docker-proxy 是 90 秒）。
 const UDP_IDLE: Duration = Duration::from_secs(120);
+
+/// 宿主上 127.254.0.0/16 留给从外面转发进来的连接（新的网络命名空间的段不取它）。
+pub(crate) const OUTSIDE_BLOCK: u8 = 254;
+
+/// 从外面转发进来的连接绑的宿主地址 → (客户端的地址, 客户端的端口, 绑上的宿主端口)。
+/// 进程里一份：地址按进程里的计数器分配，不会重复。
+static OUTSIDE: Mutex<Option<Outside>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Outside {
+    next: u16,
+    peers: HashMap<[u8; 4], ([u8; 4], u16, u16)>,
+}
+
+/// 宿主地址 `host`（127.254.x.y）、端口 `port` 是从外面转发进来的连接时，客户端真实的地址和
+/// 端口。
+pub(crate) fn outside_peer(host: [u8; 4], port: u16) -> Option<([u8; 4], u16)> {
+    let g = OUTSIDE.lock().unwrap();
+    let &(ip, cport, hport) = g.as_ref()?.peers.get(&host)?;
+    (hport == port).then_some((ip, cport))
+}
+
+/// 给一个从外面来的连接分一个 127.254.x.y（跳过 .0.0）。
+fn take_outside() -> [u8; 4] {
+    let mut g = OUTSIDE.lock().unwrap();
+    let o = g.get_or_insert_with(Default::default);
+    loop {
+        o.next = o.next.wrapping_add(1);
+        let [a, b] = o.next.to_be_bytes();
+        let addr = [127, OUTSIDE_BLOCK, a, b];
+        if o.next != 0 && !o.peers.contains_key(&addr) {
+            return addr;
+        }
+    }
+}
+
+fn record_outside(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
+    let mut g = OUTSIDE.lock().unwrap();
+    g.get_or_insert_with(Default::default)
+        .peers
+        .insert(host, (client, cport, hport));
+}
+
+/// 测试里登记一个从外面转发进来的连接（[`outside_peer`]）。
+#[cfg(test)]
+pub(crate) fn record_outside_for_test(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
+    record_outside(host, client, cport, hport);
+}
+
+fn forget_outside(host: [u8; 4]) {
+    if let Some(o) = OUTSIDE.lock().unwrap().as_mut() {
+        o.peers.remove(&host);
+    }
+}
+
+/// accept 到的客户端地址里的 IPv4 地址和端口：IPv4 映射的 IPv6 地址取 IPv4 的部分；回环地址、
+/// 纯 IPv6 的是 None。
+fn outside_client(addr: &[u8]) -> Option<([u8; 4], u16)> {
+    const MAPPED: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+    let port = u16::from_be_bytes([*addr.get(2)?, *addr.get(3)?]);
+    let ip: [u8; 4] = match family(addr) {
+        2 => addr.get(4..8)?.try_into().ok()?,
+        10 if addr.get(8..20)? == MAPPED => addr.get(20..24)?.try_into().ok()?,
+        _ => return None,
+    };
+    (ip[0] != 127).then_some((ip, port))
+}
 
 /// 一个要转发的端口。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +216,8 @@ impl Forwarder {
 struct Conn {
     client: i32,
     upstream: i32,
+    /// 绑的 127.254.x.y（[`outside_peer`]），连接结束时去掉登记。
+    outside: Option<[u8; 4]>,
     /// 连到目的地完成了。
     ready: bool,
     to_up: Vec<u8>,
@@ -162,6 +237,9 @@ impl Conn {
     fn close(&self) {
         appine_hal::net::close(self.client);
         appine_hal::net::close(self.upstream);
+        if let Some(a) = self.outside {
+            forget_outside(a);
+        }
     }
 }
 
@@ -177,24 +255,48 @@ fn family(addr: &[u8]) -> i32 {
     i32::from(u16::from_le_bytes([addr[0], addr[1]]))
 }
 
-/// 新建连到 `t` 的宿主 socket（非阻塞，连接可能还在进行）。
-fn open(t: &Target) -> Result<(i32, bool), i32> {
+/// 新建连到 `t` 的宿主 socket（非阻塞，连接可能还在进行），返回 (fd, 连上了, 绑的
+/// 127.254.x.y)。`client` 是外面的客户端的 IPv4 地址和端口时，先绑一个 127.254.x.y 和这个
+/// 端口（绑不上这个端口就让宿主选），登记下来；不然绑 `t.source`。
+fn open(t: &Target, client: Option<([u8; 4], u16)>) -> Result<(i32, bool, Option<[u8; 4]>), i32> {
     let fd = appine_hal::net::socket(
         family(&t.addr),
         if t.udp { SOCK_DGRAM } else { SOCK_STREAM },
         0,
     )?;
-    if let Some(src) = &t.source
-        && let Err(e) = appine_hal::net::bind(fd, src)
-    {
+    let mut outside = None;
+    let bound = match client.filter(|_| family(&t.addr) == 2) {
+        Some((ip, port)) => {
+            let host = take_outside();
+            let at = |p: u16| appine_hal::net::sockaddr(std::net::SocketAddr::from((host, p)));
+            let r =
+                appine_hal::net::bind(fd, &at(port)).or_else(|_| appine_hal::net::bind(fd, &at(0)));
+            if r.is_ok() {
+                let hport = appine_hal::net::sockname(fd, false)
+                    .ok()
+                    .map_or(0, |a| u16::from_be_bytes([a[2], a[3]]));
+                record_outside(host, ip, port, hport);
+                outside = Some(host);
+            }
+            r
+        }
+        None => t
+            .source
+            .as_ref()
+            .map_or(Ok(()), |src| appine_hal::net::bind(fd, src)),
+    };
+    if let Err(e) = bound {
         appine_hal::net::close(fd);
         return Err(e);
     }
     match appine_hal::net::connect(fd, &t.addr) {
-        Ok(()) => Ok((fd, true)),
-        Err(EINPROGRESS) => Ok((fd, false)),
+        Ok(()) => Ok((fd, true, outside)),
+        Err(EINPROGRESS) => Ok((fd, false, outside)),
         Err(e) => {
             appine_hal::net::close(fd);
+            if let Some(a) = outside {
+                forget_outside(a);
+            }
             Err(e)
         }
     }
@@ -318,13 +420,14 @@ fn run(shared: &Shared) {
             }
             // 一次最多接受 64 个，别的连接不至于饿着
             for _ in 0..64 {
-                let Ok((client, _)) = appine_hal::net::accept(fd) else {
+                let Ok((client, from)) = appine_hal::net::accept(fd) else {
                     break;
                 };
-                match open(target) {
-                    Ok((upstream, ready)) => conns.push(Conn {
+                match open(target, outside_client(&from)) {
+                    Ok((upstream, ready, outside)) => conns.push(Conn {
                         client,
                         upstream,
+                        outside,
                         ready,
                         to_up: Vec::new(),
                         to_client: Vec::new(),
@@ -424,7 +527,9 @@ fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
         {
             Some(i) => &mut relays[i],
             None => {
-                let Ok((rfd, _)) = open(target) else {
+                // UDP 照旧绑网关的地址：容器回给真实地址的数据报要经由转发 socket 回去，
+                // 地址映射里没有这个方向
+                let Ok((rfd, _, _)) = open(target, None) else {
                     continue;
                 };
                 relays.push(Relay {
@@ -513,6 +618,66 @@ mod tests {
         for fd in [server, held, c, c2] {
             appine_hal::net::close(fd);
         }
+    }
+
+    /// 外面的客户端（不是回环地址）：转发的连接绑一个 127.254.x.y 和客户端的端口，登记着客户端
+    /// 真实的地址；连接结束时去掉。
+    #[test]
+    fn outside_clients_keep_their_address() {
+        // 宿主上一个不是回环的 IPv4 地址当作外面的客户端，没有就不测
+        let Some(ip) = appine_hal::net::interfaces().iter().find_map(|i| {
+            i.addrs
+                .iter()
+                .find(|(f, a, _)| *f == AF_INET && a.len() == 4 && a[0] != 127)
+                .map(|(_, a, _)| <[u8; 4]>::try_from(&a[..]).unwrap())
+        }) else {
+            return;
+        };
+        let at =
+            |ip: [u8; 4], p: u16| appine_hal::net::sockaddr(std::net::SocketAddr::from((ip, p)));
+        let server = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(server, &loopback(0)).unwrap();
+        appine_hal::net::listen(server, 8).unwrap();
+        let held = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(held, &at([0; 4], 0)).unwrap();
+        appine_hal::net::listen(held, 8).unwrap();
+        let f = Forwarder::default();
+        let _h = f
+            .add(
+                held,
+                Target {
+                    udp: false,
+                    addr: loopback(port(server)),
+                    source: None,
+                },
+            )
+            .unwrap();
+        let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(c, &at(ip, 0)).unwrap();
+        let _ = appine_hal::net::connect(c, &at(ip, port(held)));
+        wait(server, POLLIN);
+        let (s, peer) = appine_hal::net::accept(server).unwrap();
+        let host: [u8; 4] = peer[4..8].try_into().unwrap();
+        let hport = u16::from_be_bytes([peer[2], peer[3]]);
+        assert_eq!(host[..2], [127, OUTSIDE_BLOCK]);
+        // 绑的是客户端的端口
+        assert_eq!(hport, port(c));
+        assert_eq!(outside_peer(host, hport), Some((ip, port(c))));
+        assert_eq!(outside_peer(host, hport.wrapping_add(1)), None);
+        // 两边都关掉之后登记没了
+        appine_hal::net::close(c);
+        appine_hal::net::close(s);
+        for _ in 0..50 {
+            if outside_peer(host, hport).is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(outside_peer(host, hport), None);
+        // 回环地址来的不是外面的客户端
+        assert_eq!(outside_client(&loopback(4000)), None);
+        appine_hal::net::close(server);
+        appine_hal::net::close(held);
     }
 
     /// UDP：数据报转给目的地，回答从监听的 socket 发回来源。
