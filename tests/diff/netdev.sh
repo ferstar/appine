@@ -9,7 +9,8 @@
 #   6.1 和 6.8 都有的那些。
 # - 原生上 bridge 经由 linkwatch（最多晚 1 秒）才知道端口的载波变了，启用端口之后等一下再看。
 # - 6.1 与 6.8 不同、这里不比的：启用着的接口改名（6.1 是 EBUSY，6.2 起可以）；veth 停用
-#   之后对端在别的命名空间里时的 operstate（6.8 看对端的载波）。
+#   之后对端在别的命名空间里时的 operstate（6.8 看对端的载波）。把 lo 移到它所在的命名空间：
+#   6.1、6.8 是 EINVAL，新内核（CI 的）什么也不做，所以移到别的命名空间（都是 EINVAL）。
 # - 原生的 IPv4 sysctl 在新命名空间里照抄宿主的（Ubuntu 开着 ip_forward、rp_filter），
 #   只比两边都是默认值的项。
 exec 2>&1
@@ -117,7 +118,7 @@ ip link add br1 type bridge; ip link set br1 master br0; ip link del br1
 busybox ip link del lo
 ip link del nosuch
 busybox ip link set br0 netns 1
-busybox ip link set lo netns $$
+busybox ip link set lo netns 1
 busybox ip addr del 10.1.0.99/24 dev br0
 ip link add "$(printf "a%.0s" $(seq 16))" type dummy
 

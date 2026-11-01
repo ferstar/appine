@@ -18,7 +18,9 @@ done
 echo "controllers [$(cat t/cgroup.controllers)] subtree [$(cat t/cgroup.subtree_control)]"
 echo "type $(cat t/cgroup.type)"
 mkdir t/a t/b
-cat t/cgroup.stat t/cgroup.events
+# cgroup.stat 只比 6.1 就有的两项：新内核（CI 的）多了每个控制器的 nr_subsys_*
+grep -vE '^nr_(dying_)?subsys_' t/cgroup.stat
+cat t/cgroup.events
 # 迁移进程
 sleep 100 &
 pid=$!

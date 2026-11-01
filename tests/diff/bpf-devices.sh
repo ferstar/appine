@@ -194,13 +194,14 @@ int main(void)
     *(uint32_t *)(ia + 4) = sizeof info;
     *(uint64_t *)(ia + 8) = (uintptr_t)info;
     r = bpf(GET_INFO, ia, sizeof ia);
-    printf("info: %s type %u same id %d name %s gpl %u xlated %u insns same %d tag ", err(r),
-           *(uint32_t *)info, *(uint32_t *)(info + 4) == id1, (char *)info + 64,
-           *(uint32_t *)(info + 84) & 1, *(uint32_t *)(info + 20),
-           memcmp(xl, prog, sizeof prog) == 0);
+    // tag 只比有没有：6.1、6.8 是程序的 SHA-1 的前 8 字节，新内核（CI 的）换了算法
+    int tagged = 0;
     for (int i = 0; i < 8; i++)
-        printf("%02x", info[8 + i]);
-    printf("\n");
+        tagged |= info[8 + i] != 0;
+    printf("info: %s type %u same id %d name %s gpl %u xlated %u insns same %d tag set %d\n",
+           err(r), *(uint32_t *)info, *(uint32_t *)(info + 4) == id1, (char *)info + 64,
+           *(uint32_t *)(info + 84) & 1, *(uint32_t *)(info + 20),
+           memcmp(xl, prog, sizeof prog) == 0, tagged);
     *(uint32_t *)(ia + 0) = d;
     printf("info of a cgroup fd: %s\n", err(bpf(GET_INFO, ia, sizeof ia)));
     char link[64] = "";

@@ -93,7 +93,8 @@ int main(void)
     close(p);
     // 错误的参数
     printf("recursive without clone: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/src", AT_RECURSIVE)));
-    printf("bad flags: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/src", 2)));
+    // 用一个不会有定义的位：新内核（CI 的）给 open_tree 加了标志 2
+    printf("bad flags: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/src", 1u << 30)));
     printf("missing: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/missing", OPEN_TREE_CLONE)));
     printf("empty path without AT_EMPTY_PATH: %s\n", err(open_tree(AT_FDCWD, "", OPEN_TREE_CLONE)));
 
@@ -160,9 +161,12 @@ int main(void)
     int g = open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE);
     close(g);
     mounts("mounts after closing an unattached clone");
-    // 不在调用者的命名空间里挂着的挂载不能再 clone（open_tree 出来还没接上的）
+    // 不在调用者的命名空间里挂着的挂载不能再 clone（open_tree 出来还没接上的）：6.1、6.8 是
+    // EINVAL，新内核（CI 的）可以，不比
     g = open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE);
-    printf("clone of an unattached clone: %s\n", err(open_tree(g, "", OPEN_TREE_CLONE | AT_EMPTY_PATH)));
+    int gg = open_tree(g, "", OPEN_TREE_CLONE | AT_EMPTY_PATH);
+    if (gg >= 0)
+        close(gg);
     printf("plain open_tree of it: %s\n", err(open_tree(g, "", AT_EMPTY_PATH)));
     close(g);
     // 普通用户

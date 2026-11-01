@@ -13,7 +13,9 @@ mkdir t
 echo "t controllers: $(cat t/cgroup.controllers)"
 echo "+pids +memory" > t/cgroup.subtree_control
 mkdir t/p t/p/q
-echo "p: max $(cat t/p/pids.max) current $(cat t/p/pids.current) $(cat t/p/pids.events)"
+# pids.events：新内核（CI 的）改成往上累加，6.1、6.8 的含义挪到了 pids.events.local
+pev() { cat "$1/pids.events.local" 2>/dev/null || cat "$1/pids.events"; }
+echo "p: max $(cat t/p/pids.max) current $(cat t/p/pids.current) $(pev t/p)"
 [ -e t/p/q/pids.max ] || echo "q has no pids.max"
 for v in -1 4194305 abc 4194304 max 3; do
     echo $v > t/p/pids.max && echo "pids.max $v ok"
@@ -64,7 +66,7 @@ int main(void)
 C
 gcc -pthread -o /tmp/pids /tmp/pids.c
 sh -c 'echo $$ > /sys/fs/cgroup/t/p/q/cgroup.procs; /tmp/pids'
-echo "events p: $(cat t/p/pids.events), t: $(cat t/pids.events)"
+echo "events p: $(pev t/p), t: $(pev t)"
 echo "p current after: $(cat t/p/pids.current)"
 # 迁移进来不看上限
 sleep 100 & s1=$!
@@ -78,11 +80,11 @@ wait 2>/dev/null
 # shell 里 fork 不出来：ash 报错退出，留下两个 sleep
 sh -c 'echo $$ > /sys/fs/cgroup/t/p/cgroup.procs; for i in 1 2 3; do sleep 100 & done; echo unreachable'
 echo "shell status $?"
-echo "events p: $(cat t/p/pids.events)"
+echo "events p: $(pev t/p)"
 kill $(cat t/p/cgroup.procs)
 # 关掉再开 pids：上限、事件回到默认
 echo "-pids" > t/cgroup.subtree_control && echo "+pids" > t/cgroup.subtree_control
-echo "p after re-enable: max $(cat t/p/pids.max) $(cat t/p/pids.events)"
+echo "p after re-enable: max $(cat t/p/pids.max) $(pev t/p)"
 
 # memory.max：超出时结束进程（swap.max 设 0，有交换分区的宿主上也不换出）
 cat > /tmp/eat.c <<'C'
