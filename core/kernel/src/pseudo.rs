@@ -31,7 +31,7 @@ use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::rdev;
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
-use crate::vfs::{Fs, MountId, Node, PTS_MOUNT, Pseudo, Vfs};
+use crate::vfs::{Fs, MountId, Node, Pseudo, Vfs};
 
 /// `/proc` 下的全局文件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -547,12 +547,12 @@ fn tree_name(path: &[u8]) -> &[u8] {
 /// 合成文件系统里的一个节点。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PseudoNode {
-    /// `/dev/pts`。
-    PtsRoot,
-    /// `/dev/pts/<n>`。
-    Pts(u32),
-    /// `/dev/pts/ptmx`。
-    PtsPtmx,
+    /// devpts 实例（它的设备号，[`crate::tty::PtsOptions`]）的根目录，`/dev/pts`。
+    PtsRoot(u64),
+    /// 实例里的终端，`/dev/pts/<n>`。
+    Pts(u64, u32),
+    /// 实例里的 ptmx，`/dev/pts/ptmx`。
+    PtsPtmx(u64),
     /// `/proc`。
     ProcRoot,
     /// `/proc` 下的全局文件。
@@ -678,7 +678,7 @@ impl Pseudo for Offline {
 /// 节点所在的文件系统。
 pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     match node {
-        PseudoNode::PtsRoot | PseudoNode::Pts(_) | PseudoNode::PtsPtmx => Fs::Pts,
+        PseudoNode::PtsRoot(_) | PseudoNode::Pts(..) | PseudoNode::PtsPtmx(_) => Fs::Pts,
         PseudoNode::SysRoot
         | PseudoNode::Sys(_)
         | PseudoNode::SysCpu(..)
@@ -703,15 +703,21 @@ fn parse_num(name: &[u8]) -> Option<i64> {
 /// 合成节点的 inode 编号：对节点取哈希（同一次运行里稳定），避开 0。各个文件系统的根目录
 /// 与 Linux 一样是 1（procfs 的 `PROC_ROOT_INO`、kernfs 的根、devpts 的根）：runc 打开
 /// `/proc` 之后检查它（pathrs-lite 的 `verifyProcRoot`），不是 1 就当作被换掉的 procfs。
+/// devpts 里的也照 Linux：ptmx 是 2，终端 n 是 n + 3。
 pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     if matches!(
         node,
         PseudoNode::ProcRoot
             | PseudoNode::SysRoot
-            | PseudoNode::PtsRoot
+            | PseudoNode::PtsRoot(_)
             | PseudoNode::Cgroup(crate::cgroup::ROOT, b"")
     ) {
         return 1;
+    }
+    match node {
+        PseudoNode::PtsPtmx(_) => return 2,
+        PseudoNode::Pts(_, n) => return *n as u64 + 3,
+        _ => {}
     }
     // 队列按它自己的编号（mq_open 得到的 fd 的 fstat 也是它）
     if let PseudoNode::Mq(_, ino) = node {
@@ -844,8 +850,8 @@ impl<'a> View<'a> {
         res.fds.borrow().get(fd).ok()
     }
 
-    fn pty(&self, n: u32) -> Option<Rc<RefCell<Tty>>> {
-        self.k.ptys.get(&n).and_then(|w| w.upgrade())
+    fn pty(&self, fs: u64, n: u32) -> Option<Rc<RefCell<Tty>>> {
+        self.k.ptys.get(&(fs, n)).and_then(|w| w.upgrade())
     }
 }
 
@@ -853,11 +859,11 @@ impl Pseudo for View<'_> {
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode> {
         use PseudoNode::*;
         Some(match node {
-            PtsRoot | ProcRoot | SysRoot | MqRoot(_) => return None,
+            PtsRoot(_) | ProcRoot | SysRoot | MqRoot(_) => return None,
             // 子 cgroup 的上级是父 cgroup，根没有
             Cgroup(id, b"") => Cgroup(self.k.cgroups.get(*id)?.parent?, b""),
             Mq(ns, _) => MqRoot(*ns),
-            Pts(_) | PtsPtmx => PtsRoot,
+            Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
             Static(path) => tree_parent(&STATIC, path).map_or(ProcRoot, Static),
             Sys(path) => tree_parent(&SYS_STATIC, path).map_or(SysRoot, Sys),
@@ -884,10 +890,10 @@ impl Pseudo for View<'_> {
     fn name(&self, mnt: MountId, node: &PseudoNode) -> Vec<u8> {
         use PseudoNode::*;
         match node {
-            PtsRoot => b"pts".to_vec(),
+            PtsRoot(_) => b"pts".to_vec(),
             ProcRoot => b"proc".to_vec(),
-            Pts(n) => n.to_string().into_bytes(),
-            PtsPtmx => b"ptmx".to_vec(),
+            Pts(_, n) => n.to_string().into_bytes(),
+            PtsPtmx(_) => b"ptmx".to_vec(),
             Global(g) => GLOBALS.iter().find(|(_, x)| x == g).unwrap().0.to_vec(),
             SelfLink => b"self".to_vec(),
             ThreadSelf => b"thread-self".to_vec(),
@@ -948,14 +954,14 @@ impl Pseudo for View<'_> {
                 .get(ns)
                 .and_then(|(_, ipc)| ipc.mqueues.get(name))
                 .map(|q| Mq(*ns, q.borrow().ino)),
-            PtsRoot => {
+            PtsRoot(fs) => {
                 if name == b"ptmx" {
-                    Some(PtsPtmx)
+                    Some(PtsPtmx(*fs))
                 } else {
                     parse_num(name)
                         .and_then(|n| u32::try_from(n).ok())
-                        .filter(|&n| self.pty(n).is_some())
-                        .map(Pts)
+                        .filter(|&n| self.pty(*fs, n).is_some())
+                        .map(|n| Pts(*fs, n))
                 }
             }
             ProcRoot => match name {
@@ -1041,7 +1047,7 @@ impl Pseudo for View<'_> {
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno> {
         use PseudoNode::*;
         Ok(match node {
-            PtsRoot | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
+            PtsRoot(_) | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
             Mq(..) => mode::S_IFREG,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
@@ -1055,7 +1061,7 @@ impl Pseudo for View<'_> {
                 | self::Entry::Net
                 | self::Entry::Ns,
             ) => mode::S_IFDIR,
-            Pts(_) | PtsPtmx => mode::S_IFCHR,
+            Pts(..) | PtsPtmx(_) => mode::S_IFCHR,
             SelfLink | ThreadSelf | Fd(..) | Ns(..) => mode::S_IFLNK,
             Global(self::Global::Mounts | self::Global::Net) => mode::S_IFLNK,
             Entry(_, _, self::Entry::Cwd | self::Entry::Exe | self::Entry::Root) => mode::S_IFLNK,
@@ -1261,9 +1267,10 @@ impl View<'_> {
             }
             FileKind::Directory { node, .. } | FileKind::Path(node) => node.clone(),
             FileKind::Proc { mnt, node, .. } => Node::Pseudo(*mnt, node.clone()),
-            // 从设备不记得是经由哪个 devpts 挂载打开的，当作开机时的那个
+            // 从设备：经由的 devpts 挂载里的路径
             FileKind::Pty(end) if !end.master => {
-                Node::Pseudo(PTS_MOUNT, PseudoNode::Pts(end.tty.borrow().index))
+                let t = end.tty.borrow();
+                Node::Pseudo(end.mnt, PseudoNode::Pts(t.fs, t.index))
             }
             _ => Node::Pseudo(mnt, PseudoNode::OpenFd(*pid, *fd)),
         })
@@ -1337,8 +1344,13 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         }
         (mode::S_IFDIR, _) => 0o555,
         (mode::S_IFLNK, _) => 0o777,
-        (_, PseudoNode::Pts(n)) => pty(ps.k, *n).map_or(0o620, |t| t.borrow().mode),
-        (_, PseudoNode::PtsPtmx) => 0o666,
+        (_, PseudoNode::Pts(fs, n)) => pty(ps.k, *fs, *n).map_or(0o620, |t| t.borrow().mode),
+        // ptmx 的权限位按实例的 ptmxmode
+        (_, PseudoNode::PtsPtmx(fs)) => {
+            ps.k.vfs
+                .as_ref()
+                .map_or(0o666, |v| v.devpts_options(*fs).ptmxmode)
+        }
         (_, PseudoNode::Entry(_, _, Entry::Mem)) => 0o600,
         (_, n) if writable(n) => 0o644,
         (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv)) => 0o400,
@@ -1346,13 +1358,13 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         _ => 0o444,
     };
     let rdev_value = match node {
-        PseudoNode::Pts(n) => rdev(PTS_MAJOR, *n),
-        PseudoNode::PtsPtmx => rdev(5, 2),
+        PseudoNode::Pts(_, n) => rdev(PTS_MAJOR, *n),
+        PseudoNode::PtsPtmx(_) => rdev(5, 2),
         _ => 0,
     };
     let now = crate::tty::wall_ns();
     let times = match node {
-        PseudoNode::Pts(n) => pty(ps.k, *n).map(|t| {
+        PseudoNode::Pts(fs, n) => pty(ps.k, *fs, *n).map(|t| {
             let t = t.borrow();
             (t.atime_ns, t.mtime_ns, t.ctime_ns)
         }),
@@ -1391,8 +1403,8 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
 }
 
 /// `/dev/pts/<n>` 的终端，已经关掉的是 None。
-pub(crate) fn pty(k: &Kernel, n: u32) -> Option<Rc<RefCell<Tty>>> {
-    k.ptys.get(&n).and_then(std::rc::Weak::upgrade)
+pub(crate) fn pty(k: &Kernel, fs: u64, n: u32) -> Option<Rc<RefCell<Tty>>> {
+    k.ptys.get(&(fs, n)).and_then(std::rc::Weak::upgrade)
 }
 
 /// 节点的属主和属组：`/proc/<pid>` 下是进程的有效用户 ID 和组 ID，`/dev/pts/<n>`
@@ -1411,7 +1423,7 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
                 }
             })
         }
-        PseudoNode::Pts(n) => pty(k, *n).map_or((0, 0), |t| t.borrow().owner),
+        PseudoNode::Pts(fs, n) => pty(k, *fs, *n).map_or((0, 0), |t| t.borrow().owner),
         PseudoNode::Cgroup(id, _) => k.cgroups.get(*id).map_or((0, 0), |g| (g.uid, g.gid)),
         _ => (0, 0),
     }
@@ -1766,13 +1778,13 @@ pub(crate) fn readdir(
                 );
             }
         }
-        PtsRoot => {
-            nodes.push(PtsPtmx);
+        PtsRoot(fs) => {
+            nodes.push(PtsPtmx(*fs));
             nodes.extend(
                 ps.k.ptys
-                    .iter()
+                    .range((*fs, 0)..=(*fs, u32::MAX))
                     .filter(|(_, w)| w.upgrade().is_some())
-                    .map(|(n, _)| Pts(*n)),
+                    .map(|((_, n), _)| Pts(*fs, *n)),
             );
         }
         ProcRoot => {

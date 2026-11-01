@@ -521,7 +521,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         FileKind::Pty(end) => {
             let t = end.tty.borrow();
             let st = Stat {
-                ino: pseudo::ino_of(&PseudoNode::Pts(t.index)),
+                ino: pseudo::ino_of(&PseudoNode::Pts(t.fs, t.index)),
                 mode: mode::S_IFCHR | t.mode,
                 nlink: 1,
                 uid: t.owner.0,
@@ -532,7 +532,8 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
                 ctime_ns: t.ctime_ns,
                 ..Stat::default()
             };
-            Ok(encode_stat(&st, Fs::Pts.dev()))
+            // 设备号是终端所在的 devpts 实例的（ttyname 拿它比对 /dev/pts/<n> 的）
+            Ok(encode_stat(&st, t.fs))
         }
         FileKind::Regular { ino, file } => {
             let vfs = cx.vfs()?;
@@ -828,6 +829,7 @@ fn open_path_with(
         display = Some(Rc::from(cx.view(&vfs).name(*mnt, p)));
     }
     let was_created = created.is_some();
+    let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
     let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
     // 仓库里的文件记下经由的挂载（[`OpenFile::mnt`]）
     let store_mnt = node.ino().map(|_| node.mnt());
@@ -846,7 +848,8 @@ fn open_path_with(
                 } else {
                     flags
                 };
-                open_store(cx, &cred, &vfs, (mnt, ino), flags, created)?
+                let beside = parent.as_ref().map(|(dir, _)| dir);
+                open_store(cx, &cred, &vfs, (mnt, ino), flags, (created, beside))?
             }
             Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => {
                 open_mq(cx, &cred, (ns, ino), flags, mq_created)?
@@ -854,10 +857,13 @@ fn open_path_with(
             Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
         }
     };
-    if let FileKind::Pty(end) = &kind {
-        // /dev/tty、/dev/ptmx 打开的是具体的某个 PTY
-        display = (!end.master)
-            .then(|| Rc::from(format!("/dev/pts/{}", end.tty.borrow().index).into_bytes()));
+    // /dev/tty 这样的设备节点打开的是具体的某个从设备：路径是它在 devpts 里的（fd 的链接
+    // 按经由的挂载算）；主设备、经由 devpts 打开的从设备照常是打开的路径
+    if let FileKind::Pty(end) = &kind
+        && !end.master
+        && !via_devpts
+    {
+        display = None;
     }
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
     let file = OpenFile::with_path(kind, flags & keep | largefile(flags), display);
@@ -1027,7 +1033,7 @@ pub(super) fn open_by_handle_at(
         }
         FileKind::Path(Node::Store(mnt, ino))
     } else {
-        open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, None)?
+        open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, (None, None))?
     };
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
     let file = OpenFile::new(kind, flags & keep | largefile(flags));
@@ -1037,13 +1043,29 @@ pub(super) fn open_by_handle_at(
         .map(|fd| fd as u64)
 }
 
-/// 设备号对应的 PTY 从设备编号（主设备号 136–143）。
+/// 设备号对应的 PTY 从设备编号：主设备号 136，次设备号就是编号（Linux 的 pts 驱动登记了
+/// 136 的全部 2^20 个次设备号）。
 fn pts_index(r: u64) -> Option<u32> {
     let major = ((r >> 8) & 0xfff) as u32;
     let minor = ((r & 0xff) | ((r >> 12) & !0xff)) as u32;
-    (PTS_MAJOR..PTS_MAJOR + 8)
-        .contains(&major)
-        .then(|| ((major - PTS_MAJOR) << 8) + minor)
+    (major == PTS_MAJOR).then_some(minor)
+}
+
+/// 不在 devpts 里的 ptmx 设备节点打开的是哪个 devpts 实例（Linux 的 `devpts_acquire`）：
+/// 节点所在的目录 `dir` 里的 `pts` 挂着的那个（它的挂载和设备号）。没有 `pts` 是 ENOENT，
+/// 它不是 devpts 的根是 ENODEV；不知道节点在哪个目录里（按句柄打开的）时是开机时的那个。
+fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno> {
+    let Some(dir) = dir else {
+        return Ok((crate::tty::BOOT_PTS, crate::vfs::PTS_MOUNT));
+    };
+    let Node::Store(mnt, ino) = dir else {
+        return Err(Errno::ENODEV);
+    };
+    let pts = vfs.store().lookup(*ino, b"pts")?.ok_or(Errno::ENOENT)?;
+    match vfs.mounted(Node::Store(*mnt, pts)) {
+        Node::Pseudo(m, PseudoNode::PtsRoot(fs)) => Ok((fs, m)),
+        _ => Err(Errno::ENODEV),
+    }
 }
 
 /// 有没有进程正在执行仓库里的程序 `ino`（以写方式打开它时 ETXTBSY）。
@@ -1092,7 +1114,7 @@ fn open_store(
     vfs: &Vfs,
     (mnt, ino): (MountId, Ino),
     flags: u32,
-    created: Option<std::fs::File>,
+    (created, beside): (Option<std::fs::File>, Option<&Node>),
 ) -> Result<FileKind, Errno> {
     let store = vfs.store();
     let accmode = flags & oflags::O_ACCMODE;
@@ -1173,9 +1195,16 @@ fn open_store(
         mode::S_IFCHR => match st.rdev {
             // /dev/tty、/dev/console：调用者的控制终端
             r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
-            PTMX_RDEV => tty::open_ptmx(cx.k(), cred.fsuid)?,
+            PTMX_RDEV => {
+                let (fs, m) = devpts_beside(vfs, beside)?;
+                tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
+            }
+            // devpts 之外的终端设备节点：开机时的实例里的
             r => match pts_index(r) {
-                Some(index) => tty::open_slave(cx, index, flags)?,
+                Some(index) => {
+                    let at = (crate::tty::BOOT_PTS, index, crate::vfs::PTS_MOUNT, false);
+                    tty::open_slave(cx, at, flags)?
+                }
                 None => {
                     let dev = dev::open(store, ino)?;
                     let kmsg = match dev {
@@ -1313,23 +1342,25 @@ fn open_pseudo(
         }
     }
     // 设备节点在 nodev 的挂载里打不开（Linux 的 may_open）
-    if matches!(node, PseudoNode::Pts(_) | PseudoNode::PtsPtmx)
+    if matches!(node, PseudoNode::Pts(..) | PseudoNode::PtsPtmx(_))
         && vfs.mount(mnt).is_some_and(|m| m.flags & ms::NODEV != 0)
     {
         return Err(Errno::EACCES);
     }
     // devpts 的终端也过 cgroup 的设备过滤
     let rdev = match node {
-        PseudoNode::Pts(n) => Some(rdev(PTS_MAJOR + (n >> 8), n & 0xff)),
-        PseudoNode::PtsPtmx => Some(PTMX_RDEV),
+        PseudoNode::Pts(_, n) => Some(rdev(PTS_MAJOR, n)),
+        PseudoNode::PtsPtmx(_) => Some(PTMX_RDEV),
         _ => None,
     };
     if let Some(r) = rdev {
         super::bpf::check_device(cx, mode::S_IFCHR, r, device_access(open_mask(flags)))?;
     }
     match node {
-        PseudoNode::Pts(n) => return tty::open_slave(cx, n, flags),
-        PseudoNode::PtsPtmx => return tty::open_ptmx(cx.k(), cred.fsuid),
+        PseudoNode::Pts(fs, n) => return tty::open_slave(cx, (fs, n, mnt, true), flags),
+        PseudoNode::PtsPtmx(fs) => {
+            return tty::open_ptmx(cx.k(), (fs, mnt, true), (cred.fsuid, cred.fsgid));
+        }
         PseudoNode::OpenFd(pid, fd) => return reopen(cx, cred, vfs, pid, fd, flags),
         PseudoNode::OpenExe(pid) => return reopen_exe(cx, cred, vfs, pid, flags),
         _ => {}
@@ -1440,7 +1471,7 @@ fn reopen(
         .map_err(host_errno)?;
         let mnt = f.mnt;
         drop(f);
-        return open_store(cx, cred, vfs, (mnt, ino), flags, Some(new));
+        return open_store(cx, cred, vfs, (mnt, ino), flags, (Some(new), None));
     }
     match &f.kind {
         FileKind::Pipe(end) => Ok(FileKind::Pipe(PipeEnd::open(
@@ -1493,7 +1524,7 @@ fn reopen_exe(
             ))
     }
     .map_err(host_errno)?;
-    open_store(cx, cred, vfs, (mnt, ino), flags, Some(new))
+    open_store(cx, cred, vfs, (mnt, ino), flags, (Some(new), None))
 }
 
 pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
@@ -1998,10 +2029,13 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         return crate::seccomp::ioctl(cx, &f, request, arg);
     }
     let pty = match &file.borrow().kind {
-        FileKind::Pty(end) => Some((end.tty.clone(), (end.master, end.born))),
+        FileKind::Pty(end) => Some((end.tty.clone(), (end.master, end.born), end.mnt)),
         _ => None,
     };
-    if let Some((t, side)) = pty {
+    if let Some((t, side, mnt)) = pty {
+        if request == tty::TIOCGPTPEER {
+            return tty::open_peer(cx, &t, side, mnt, arg as u32);
+        }
         return tty::ioctl(cx, &t, side, request, arg);
     }
     let sock = match &file.borrow().kind {
@@ -3012,8 +3046,8 @@ enum Attrs {
 impl Attrs {
     fn of(cx: &Cx<'_>, node: &Node) -> Result<Attrs, Errno> {
         match node {
-            Node::Pseudo(_, PseudoNode::Pts(_)) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
-            Node::Pseudo(_, PseudoNode::Pts(n)) => pseudo::pty(cx.kr(), *n)
+            Node::Pseudo(_, PseudoNode::Pts(..)) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
+            Node::Pseudo(_, PseudoNode::Pts(fs, n)) => pseudo::pty(cx.kr(), *fs, *n)
                 .map(Attrs::Pts)
                 .ok_or(Errno::ENOENT),
             Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Mq(..))

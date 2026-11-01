@@ -166,6 +166,17 @@ fn new_mount(
     if !vfs.is_dir(&cx.view(&vfs), &target)? {
         return Err(Errno::ENOTDIR);
     }
+    // devpts 的选项（新实例的终端的属主、权限，ptmx 的权限，上限）
+    let devpts = if fs == Fs::Pts {
+        let cred = cx.cred();
+        Some(crate::tty::PtsOptions::parse(
+            data,
+            |u| cred.uid_in(u),
+            |g| cred.gid_in(g),
+        )?)
+    } else {
+        None
+    };
     if fs == Fs::Tmpfs {
         let params = tmpfs_options(data, &cx.cred())?;
         let source = source.unwrap_or_default();
@@ -193,6 +204,14 @@ fn new_mount(
         source.unwrap_or_default(),
         dev,
     );
+    // devpts 每次挂上是一个新的实例（4.7 起）：有自己的一套终端，编号就是新分到的设备号
+    if let Some(opts) = devpts {
+        let dev = vfs.mount(id).map_or(0, |m| m.dev);
+        vfs.set_devpts_options(dev, opts);
+        vfs.update_mount(id, |m| {
+            m.root = Node::Pseudo(id, PseudoNode::PtsRoot(dev));
+        });
+    }
     // mqueue 的挂载留住那个 IPC 命名空间（和里面的队列），与 Linux 的超级块引用着它一样
     if fs == Fs::Mqueue {
         vfs.update_mount(id, |m| m.pin = Some(crate::nsproxy::NsRef::Ipc(ipc)));
@@ -670,8 +689,8 @@ pub(crate) fn collect_namespaces(k: &crate::kernel::Kernel, vfs: &Vfs) {
     }
 }
 
-/// 挂载 `id` 在用：里面挂着别的挂载，或者有进程的根目录、当前目录、打开的文件在里面。
-/// 从设备的打开文件不记得经由哪个 devpts 挂载，不算。
+/// 挂载 `id` 在用：里面挂着别的挂载，或者有进程的根目录、当前目录、打开的文件在里面
+/// （经由 devpts 里的路径打开的终端也算）。
 fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
     !vfs.children(id).is_empty() || in_use(cx.kr()).contains(&id)
 }
@@ -690,6 +709,11 @@ fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
             if let Some(node) = file.borrow().node() {
                 used.insert(node.mnt());
+            }
+            if let crate::fd::FileKind::Pty(end) = &file.borrow().kind
+                && end.pin
+            {
+                used.insert(end.mnt);
             }
         }
     }

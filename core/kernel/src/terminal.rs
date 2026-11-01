@@ -56,14 +56,15 @@ fn host_winsize(fd: i32) -> Option<Winsize> {
 
 /// 新建一个控制台，返回 PTY 编号（`/dev/pts/<编号>`）。
 pub(crate) fn open(k: &mut Kernel, size: Winsize) -> u32 {
-    let index = (0..).find(|i| !k.ptys.contains_key(i)).unwrap();
+    let fs = crate::tty::BOOT_PTS;
+    let index = (0..).find(|i| !k.ptys.contains_key(&(fs, *i))).unwrap();
     let tty = Rc::new(RefCell::new(Tty::new(index)));
     {
         let mut t = tty.borrow_mut();
         t.locked = false;
         t.winsize = size;
     }
-    k.ptys.insert(index, Rc::downgrade(&tty));
+    k.ptys.insert((fs, index), Rc::downgrade(&tty));
     k.consoles.insert(
         index,
         Console {

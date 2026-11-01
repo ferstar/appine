@@ -16,8 +16,7 @@ show() {
         print id[$1], ($2 in id) ? id[$2] : "-", $4, $5, $6, $(i + 1), $(i + 2)
     }' /proc/self/mountinfo
 }
-# 设备号与哪个挂载的相同（新的 procfs 实例有自己的）。不比 devpts：Linux 上新的实例有自己的
-# 设备号和一套终端，appine 的各个挂载共用开机时的那个
+# 设备号与哪个挂载的相同（新的 procfs、devpts 实例有自己的）
 device() {
     d=$(stat -c %d "$1")
     for b in /proc /sys /sys/fs/cgroup /dev/pts /tmp/mnt/proc; do
@@ -40,7 +39,7 @@ $(ls /tmp/mnt/sys/fs/cgroup)
 EOF
 mount -t proc other "/tmp/mnt/sp ace" && echo "space $?"
 show
-for p in /tmp/mnt/proc /tmp/mnt/sys /tmp/mnt/sys/fs/cgroup; do
+for p in /tmp/mnt/proc /tmp/mnt/sys /tmp/mnt/sys/fs/cgroup /tmp/mnt/pts; do
     device $p
 done
 grep -E '^(proc|sysfs|devpts|cgroup|other) /tmp/mnt' /proc/mounts | cut -d ' ' -f 1-3

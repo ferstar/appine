@@ -190,8 +190,9 @@ pub(crate) struct Kernel {
     pub forks: u64,
     /// 本次运行的 `/proc/sys/kernel/random/boot_id`。
     pub boot_id: [u8; 16],
-    /// 所有 PTY，按编号；主设备和从设备都关闭之后条目失效。
-    pub ptys: BTreeMap<u32, Weak<RefCell<Tty>>>,
+    /// 所有 PTY，按所在的 devpts 实例（设备号）和实例里的编号；主设备和从设备都关闭之后
+    /// 条目失效。
+    pub ptys: BTreeMap<(u64, u32), Weak<RefCell<Tty>>>,
     /// 宿主持有主设备的 PTY（[`crate::terminal`]），按 PTY 编号。
     pub consoles: BTreeMap<u32, crate::terminal::Console>,
     /// flock(2) 的锁：每个 inode 上持有锁的打开文件，以及是不是排他锁。打开文件关闭后

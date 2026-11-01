@@ -19,6 +19,94 @@ pub const PTS_MAJOR: u32 = 136;
 
 /// tty 组：devpts 挂载时的 `gid=5`（mountinfo 里也这样写），新的终端都属于它。
 pub const TTY_GID: u32 = 5;
+
+/// 开机时挂在 `/dev/pts` 的 devpts 实例的设备号（[`crate::vfs::Fs::dev`]），也是它的编号。
+pub(crate) const BOOT_PTS: u64 = 0x18;
+/// 一个 devpts 实例最多的终端数（`NR_UNIX98_PTY_MAX`）。
+pub(crate) const PTY_MAX: u32 = 1 << 20;
+
+/// devpts 实例的挂载选项（Linux 的 `pts_mount_opts`）：新终端的属主、属组（没给时是建立
+/// 它的进程的 fsuid、fsgid）和权限位，ptmx 的权限位，终端数的上限。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PtsOptions {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: u32,
+    pub ptmxmode: u32,
+    pub max: u32,
+}
+
+impl PtsOptions {
+    /// 开机时的实例：与 docker 给容器挂的一样（`gid=5,mode=620,ptmxmode=666`）。
+    pub const BOOT: PtsOptions = PtsOptions {
+        uid: None,
+        gid: Some(TTY_GID),
+        mode: 0o620,
+        ptmxmode: 0o666,
+        max: PTY_MAX,
+    };
+
+    /// 解析 mount(2) 的选项（`devpts_parse_param`）：uid、gid 是十进制，在调用者的用户
+    /// 命名空间里要映射得到（`uid_in` 换成内核 ID），mode、ptmxmode 是八进制；`newinstance`
+    /// 从 4.7 起不起作用；别的、格式不对都是 EINVAL。没给的是默认值（`mode=600,ptmxmode=000`）。
+    pub fn parse(
+        data: &[u8],
+        uid_in: impl Fn(u32) -> Option<u32>,
+        gid_in: impl Fn(u32) -> Option<u32>,
+    ) -> Result<PtsOptions, crate::errno::Errno> {
+        use crate::errno::Errno;
+        let mut o = PtsOptions {
+            uid: None,
+            gid: None,
+            mode: 0o600,
+            ptmxmode: 0,
+            max: PTY_MAX,
+        };
+        let num = |v: &[u8], radix: u32| {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s, radix).ok())
+                .ok_or(Errno::EINVAL)
+        };
+        for opt in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
+            let (key, value) = match opt.iter().position(|&b| b == b'=') {
+                Some(i) => (&opt[..i], Some(&opt[i + 1..])),
+                None => (opt, None),
+            };
+            match (key, value) {
+                (b"uid", Some(v)) => o.uid = Some(uid_in(num(v, 10)?).ok_or(Errno::EINVAL)?),
+                (b"gid", Some(v)) => o.gid = Some(gid_in(num(v, 10)?).ok_or(Errno::EINVAL)?),
+                (b"mode", Some(v)) => o.mode = num(v, 8)? & 0o7777,
+                (b"ptmxmode", Some(v)) => o.ptmxmode = num(v, 8)? & 0o7777,
+                (b"max", Some(v)) => {
+                    o.max = num(v, 10)?;
+                    if o.max > PTY_MAX {
+                        return Err(Errno::EINVAL);
+                    }
+                }
+                (b"newinstance", None) => {}
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        Ok(o)
+    }
+
+    /// mountinfo 里的超级块选项（`devpts_show_options`）。
+    pub fn show(&self) -> String {
+        let mut s = String::new();
+        if let Some(u) = self.uid {
+            s += &format!(",uid={u}");
+        }
+        if let Some(g) = self.gid {
+            s += &format!(",gid={g}");
+        }
+        s += &format!(",mode={:03o},ptmxmode={:03o}", self.mode, self.ptmxmode);
+        if self.max < PTY_MAX {
+            s += &format!(",max={}", self.max);
+        }
+        s
+    }
+}
 /// 输入队列的容量（Linux 的 `N_TTY_BUF_SIZE`）。
 pub const INPUT_MAX: usize = 4096;
 /// 输出队列的容量：从设备写满之后阻塞，直到主设备读走。
@@ -306,6 +394,8 @@ impl Winsize {
 pub struct Tty {
     /// `/dev/pts/<index>`。
     pub index: u32,
+    /// 所在的 devpts 实例（它的设备号，[`PtsOptions`]）。
+    pub fs: u64,
     pub termios: Termios,
     pub winsize: Winsize,
     /// 规范模式下正在编辑的一行。
@@ -370,6 +460,7 @@ impl Tty {
     /// 新建一对 PTY，两端都还没有打开。
     pub fn new(index: u32) -> Tty {
         let now = wall_ns();
+        let fs = BOOT_PTS;
         Tty {
             index,
             termios: Termios::default(),
@@ -401,6 +492,7 @@ impl Tty {
             hupped: [false; 2],
             owner: (0, TTY_GID),
             mode: 0o620,
+            fs,
             arrivals: [0; 2],
             atime_ns: now,
             mtime_ns: now,
@@ -886,6 +978,12 @@ pub struct PtyEnd {
     pub tty: Rc<RefCell<Tty>>,
     /// 是不是主设备。
     pub master: bool,
+    /// 经由的 devpts 挂载（终端所在的实例挂在哪里）：从设备的路径（fd 的链接、TIOCGPTPEER
+    /// 打开的）按它算。
+    pub mnt: crate::vfs::MountId,
+    /// 打开文件在那个挂载里（经由 devpts 里的路径、TIOCGPTPEER 打开的）：开着时卸不下它
+    /// （EBUSY）。经由别处的设备节点打开的不算。
+    pub pin: bool,
     /// 打开时这一边被 vhangup 过几次（[`Tty::hung`]）。
     pub born: u32,
 }
@@ -904,7 +1002,20 @@ impl PtyEnd {
             }
             t.vhangups[master as usize]
         };
-        PtyEnd { tty, master, born }
+        PtyEnd {
+            tty,
+            master,
+            mnt: crate::vfs::PTS_MOUNT,
+            pin: false,
+            born,
+        }
+    }
+
+    /// 经由 devpts 挂载 `mnt` 打开的；`pin` 时打开文件就在那个挂载里。
+    pub fn via(mut self, mnt: crate::vfs::MountId, pin: bool) -> PtyEnd {
+        self.mnt = mnt;
+        self.pin = pin;
+        self
     }
 }
 
@@ -963,6 +1074,32 @@ fn is_ctrl(c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// devpts 的选项：默认值、各种写法、错误，mountinfo 里的样子与 Linux 相同。
+    #[test]
+    fn devpts_options() {
+        let id = |x: u32| Some(x);
+        let parse = |d: &[u8]| PtsOptions::parse(d, id, id);
+        let o = parse(b"").unwrap();
+        assert_eq!(o.show(), ",mode=600,ptmxmode=000");
+        let o = parse(b"newinstance,ptmxmode=0666,mode=0620,gid=5").unwrap();
+        assert_eq!(o.show(), ",gid=5,mode=620,ptmxmode=666");
+        let o = parse(b"uid=7,gid=8,max=1").unwrap();
+        assert_eq!((o.uid, o.gid, o.max), (Some(7), Some(8), 1));
+        assert_eq!(o.show(), ",uid=7,gid=8,mode=600,ptmxmode=000,max=1");
+        for bad in [
+            &b"mode=xyz"[..],
+            b"bogus",
+            b"gid=abc",
+            b"max=1048577",
+            b"mode",
+        ] {
+            assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        // 用户命名空间里映射不到的 uid
+        assert!(PtsOptions::parse(b"uid=7", |_| None, id).is_err());
+        assert_eq!(PtsOptions::BOOT.show(), ",gid=5,mode=620,ptmxmode=666");
+    }
 
     fn read_all(t: &mut Tty) -> Vec<u8> {
         let mut buf = [0u8; 256];

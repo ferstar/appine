@@ -110,7 +110,8 @@ static void sleeper(int out)
     double s = now();
     struct timespec ts = {1, 0};
     int r = nanosleep(&ts, NULL);
-    dprintf(out, "nanosleep %d, slept past the thaw %d", r, now() - s >= 1.5);
+    // 不冻结时 1 秒就返回；解冻在 1.5 秒前后，阈值不贴着它
+    dprintf(out, "nanosleep %d, slept until the thaw %d", r, now() - s >= 1.25);
 }
 
 static void poller(int out)

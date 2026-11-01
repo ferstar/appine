@@ -1,6 +1,6 @@
 # M9 之前：cgroup 的设备过滤（eBPF）（2026-11-01）
 
-← [M9 之前：cgroup.freeze（2026-11-01）](165-cgroup-freeze.md) · [索引](../milestones.md)
+← [M9 之前：cgroup.freeze（2026-11-01）](165-cgroup-freeze.md) · [索引](../milestones.md) · [M9 之前：devpts 的实例（2026-11-01）](167-devpts-instances.md) →
 
 cgroup v2 没有 v1 的 `devices.allow`：runc、crun 给每个容器的 cgroup 挂一个 eBPF 程序（`BPF_PROG_TYPE_CGROUP_DEVICE`），容器里打开设备节点、mknod 时内核跑它决定放不放行。[cgroup 树](163-cgroup-tree.md)之后 docker 停在 `bpf_prog_query(BPF_CGROUP_DEVICE) failed: function not implemented`，podman（crun）停在 `bpf create`：runc 不在用户命名空间里、规则里有拒绝时不能跳过这一步，crun 也一样。这一轮做 bpf(2) 的一个子集，只有这一种程序，照 Linux 6.1 的 `kernel/bpf/syscall.c`、`kernel/bpf/cgroup.c`、`kernel/bpf/verifier.c`。
 

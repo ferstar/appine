@@ -58,23 +58,57 @@ const TIOCGPTLCK: u32 = 0x8004_5439;
 /// 经由主设备给从设备的前台进程组发信号（只能是 SIGINT、SIGQUIT、SIGTSTP）。
 const TIOCSIG: u32 = 0x4004_5436;
 
-/// 打开 `/dev/ptmx`：分配一对新的 PTY，返回主设备。从设备属于调用者的 fsuid 和 tty 组。
-pub(crate) fn open_ptmx(k: &mut Kernel, uid: u32) -> Result<FileKind, Errno> {
+/// 在 devpts 实例 `fs`（设备号）里分配一对新的 PTY（Linux 的 `devpts_new_index`、
+/// `devpts_pty_new`）：编号是实例里最小的空着的，到了实例的 `max` 是 ENOSPC；从设备的属主、
+/// 属组、权限位按实例的选项，没给 uid、gid 时是调用者的 fsuid、fsgid。
+pub(crate) fn new_pty(
+    k: &mut Kernel,
+    fs: u64,
+    (fsuid, fsgid): (u32, u32),
+) -> Result<Rc<RefCell<Tty>>, Errno> {
     k.ptys.retain(|_, w| w.strong_count() > 0);
-    let index = (0..).find(|i| !k.ptys.contains_key(i)).unwrap();
+    let opts = k
+        .vfs
+        .as_ref()
+        .map_or(crate::tty::PtsOptions::BOOT, |v| v.devpts_options(fs));
+    let used = k.ptys.range((fs, 0)..=(fs, u32::MAX)).count();
+    if used >= opts.max as usize {
+        return Err(Errno::ENOSPC);
+    }
+    let index = (0..).find(|i| !k.ptys.contains_key(&(fs, *i))).unwrap();
     let tty = Rc::new(RefCell::new(Tty::new(index)));
-    tty.borrow_mut().owner.0 = uid;
-    k.ptys.insert(index, Rc::downgrade(&tty));
-    Ok(FileKind::Pty(PtyEnd::new(tty, true)))
+    {
+        let mut t = tty.borrow_mut();
+        t.fs = fs;
+        t.owner = (opts.uid.unwrap_or(fsuid), opts.gid.unwrap_or(fsgid));
+        t.mode = opts.mode;
+    }
+    k.ptys.insert((fs, index), Rc::downgrade(&tty));
+    Ok(tty)
+}
+
+/// 打开 ptmx：在 devpts 实例 `fs`（经由挂载 `mnt` 找到的）里分配一对新的 PTY，返回主设备。
+/// `pin` 是经由那个挂载里的 ptmx 打开的。
+pub(crate) fn open_ptmx(
+    k: &mut Kernel,
+    (fs, mnt, pin): (u64, crate::vfs::MountId, bool),
+    owner: (u32, u32),
+) -> Result<FileKind, Errno> {
+    let tty = new_pty(k, fs, owner)?;
+    Ok(FileKind::Pty(PtyEnd::new(tty, true).via(mnt, pin)))
 }
 
 /// 打开 `/dev/pts/<n>`。会话组长在没有控制终端时打开它（且没有 `O_NOCTTY`），它就成为
 /// 控制终端，与 Linux 一样。
-pub(crate) fn open_slave(cx: &mut Cx<'_>, index: u32, flags: u32) -> Result<FileKind, Errno> {
+pub(crate) fn open_slave(
+    cx: &mut Cx<'_>,
+    (fs, index, mnt, pin): (u64, u32, crate::vfs::MountId, bool),
+    flags: u32,
+) -> Result<FileKind, Errno> {
     let tty = cx
         .kr()
         .ptys
-        .get(&index)
+        .get(&(fs, index))
         .and_then(Weak::upgrade)
         .ok_or(Errno::ENOENT)?;
     {
@@ -93,7 +127,43 @@ pub(crate) fn open_slave(cx: &mut Cx<'_>, index: u32, flags: u32) -> Result<File
             g.tty_old_pgrp = None;
         }
     }
-    Ok(FileKind::Pty(PtyEnd::new(tty, false)))
+    Ok(FileKind::Pty(PtyEnd::new(tty, false).via(mnt, pin)))
+}
+
+/// 按主设备打开从设备（`TIOCGPTPEER`）。
+pub(crate) const TIOCGPTPEER: u32 = 0x5441;
+
+/// TIOCGPTPEER（Linux 4.13 起的 `ptm_open_peer`）：按主设备打开对应的从设备，经由主设备
+/// 找到的那个 devpts 挂载，不经过路径、不查权限；`flags` 是 open 的标志，O_CLOEXEC 给新的
+/// fd。在从设备上是 EIO。
+pub(crate) fn open_peer(
+    cx: &mut Cx<'_>,
+    tty: &Rc<RefCell<Tty>>,
+    (master, born): (bool, u32),
+    mnt: crate::vfs::MountId,
+    flags: u32,
+) -> SysResult {
+    if !master || tty.borrow().hung(master, born) {
+        return Err(Errno::EIO);
+    }
+    let (fs, index) = {
+        let t = tty.borrow();
+        (t.fs, t.index)
+    };
+    let kind = open_slave(cx, (fs, index, mnt, true), flags)?;
+    let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK;
+    // 路径是那个 devpts 挂载里的 <编号>（fd 的链接、ttyname 用它）
+    let vfs = cx.vfs()?;
+    let node = crate::vfs::Node::Pseudo(mnt, crate::pseudo::PseudoNode::Pts(fs, index));
+    let path = vfs.path_of(&cx.view(&vfs), &cx.root(), &node).ok();
+    let file = crate::fd::OpenFile::with_path(
+        kind,
+        flags & keep | oflags::O_LARGEFILE,
+        path.map(Rc::from),
+    );
+    Ok(cx
+        .fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)? as u64)
 }
 
 /// 打开 `/dev/tty`：调用者的控制终端。
@@ -370,19 +440,19 @@ pub(crate) fn write(
 /// 主设备关掉（Linux 的 `pty_close`，[`hang_up_closed`]）和关闭控制台
 /// （[`crate::terminal::close`]）时调用；已经挂断的什么也不做。
 pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
-    let (index, session, fg) = {
+    let (key, session, fg) = {
         let mut t = tty.borrow_mut();
         if t.hung_up {
             return;
         }
         t.hung_up = true;
-        (t.index, t.session.take(), t.fg.take())
+        ((t.fs, t.index), t.session.take(), t.fg.take())
     };
     if k.ptys
-        .get(&index)
+        .get(&key)
         .is_some_and(|w| std::ptr::eq(w.as_ptr(), Rc::as_ptr(tty)))
     {
-        k.ptys.remove(&index);
+        k.ptys.remove(&key);
     }
     detach(k, tty, session, fg);
 }

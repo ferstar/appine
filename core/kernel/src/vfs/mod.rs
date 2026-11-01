@@ -188,20 +188,18 @@ impl Fs {
         matches!(self, Fs::Proc | Fs::Pts | Fs::Tmpfs)
     }
 
-    /// 新挂上的有自己的设备号：只有 procfs。devpts 的新实例在 Linux 上有自己的一套终端
-    /// （编号各自从 0 开始）和设备号，这里各个挂载看到的仍是同一套终端，设备号也相同：
-    /// 从设备的 fstat 报告的是它，ttyname 要拿它比对 `/dev/pts/<n>` 的 `st_dev`。
+    /// 新挂上的有自己的设备号：procfs、tmpfs，以及 devpts（每个实例有自己的一套终端，
+    /// 设备号就是实例的编号，[`crate::tty::PtsOptions`]）。
     pub(crate) const fn own_dev(self) -> bool {
-        matches!(self, Fs::Proc | Fs::Tmpfs)
+        matches!(self, Fs::Proc | Fs::Tmpfs | Fs::Pts)
     }
 
     /// 超级块的选项（mountinfo 最后一列 `rw` 之后的部分）。
     pub(crate) const fn options(self) -> &'static str {
         match self {
-            Fs::Pts => ",gid=5,mode=620,ptmxmode=000",
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
-            // tmpfs 的按实例（[`Vfs::sb_options`]）
-            Fs::Store | Fs::Tmpfs | Fs::Proc | Fs::Sys | Fs::Nsfs | Fs::Mqueue => "",
+            // tmpfs、devpts 的按实例（[`Vfs::sb_options`]）
+            Fs::Store | Fs::Tmpfs | Fs::Pts | Fs::Proc | Fs::Sys | Fs::Nsfs | Fs::Mqueue => "",
         }
     }
 
@@ -213,7 +211,8 @@ impl Fs {
             match self {
                 Fs::Store | Fs::Tmpfs => return Node::Store(0, ROOT),
                 Fs::Proc | Fs::Nsfs => PseudoNode::ProcRoot,
-                Fs::Pts => PseudoNode::PtsRoot,
+                // 挂上时换成新实例的
+                Fs::Pts => PseudoNode::PtsRoot(crate::tty::BOOT_PTS),
                 Fs::Sys => PseudoNode::SysRoot,
                 // 挂上时换成调用者所在的 cgroup 命名空间的根
                 Fs::Cgroup => PseudoNode::Cgroup(crate::cgroup::ROOT, b""),
@@ -360,6 +359,8 @@ struct Mounts {
     proc_ns: std::collections::HashMap<u64, std::rc::Rc<crate::pidns::PidNs>>,
     /// 各个 IPC 命名空间的 mqueue 实例的设备号（[`Vfs::mq_dev`]），按命名空间的编号。
     mq_dev: std::collections::HashMap<u64, u64>,
+    /// mount(2) 挂上的 devpts 实例的选项，按设备号（开机时的那个不在这里）。
+    devpts: std::collections::HashMap<u64, crate::tty::PtsOptions>,
 }
 
 /// tmpfs 按页记用量，页的大小（guest 的页）。
@@ -649,6 +650,7 @@ impl Vfs {
             tmpfs: Default::default(),
             proc_ns: Default::default(),
             mq_dev: Default::default(),
+            devpts: Default::default(),
         };
         let cached = Cached {
             meta: store.meta().clone(),
@@ -1480,6 +1482,7 @@ impl Vfs {
     /// 挂载的超级块选项（mountinfo 最后一列 `rw` 之后的部分）。
     pub(crate) fn sb_options(&self, m: &Mount) -> String {
         match m.fs {
+            Fs::Pts => self.devpts_options(m.dev).show(),
             Fs::Tmpfs => self
                 .mounts
                 .borrow()
@@ -1488,6 +1491,21 @@ impl Vfs {
                 .map_or_else(String::new, |t| t.params.options()),
             fs => fs.options().to_owned(),
         }
+    }
+
+    /// devpts 实例 `dev` 的选项（开机时的、已经没有挂载的是开机时的那份）。
+    pub(crate) fn devpts_options(&self, dev: u64) -> crate::tty::PtsOptions {
+        self.mounts
+            .borrow()
+            .devpts
+            .get(&dev)
+            .copied()
+            .unwrap_or(crate::tty::PtsOptions::BOOT)
+    }
+
+    /// 记下新挂的 devpts 实例 `dev` 的选项。
+    pub(crate) fn set_devpts_options(&self, dev: u64, opts: crate::tty::PtsOptions) {
+        self.mounts.borrow_mut().devpts.insert(dev, opts);
     }
 
     /// `node` 所在的挂载的标志；不知道是哪个挂载时是 None。
@@ -1753,6 +1771,14 @@ impl Vfs {
                 .map(|m| m.dev)
                 .collect();
             mounts.proc_ns.retain(|dev, _| procs.contains(dev));
+            let pts: std::collections::HashSet<u64> = mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .filter(|m| m.fs == Fs::Pts)
+                .map(|m| m.dev)
+                .collect();
+            mounts.devpts.retain(|dev, _| pts.contains(dev));
             dead.iter()
                 .filter_map(|dev| mounts.tmpfs.remove(dev))
                 .map(|t| t.root)
@@ -2174,7 +2200,10 @@ mod tests {
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &proc).unwrap(), b"/proc");
         // 设备节点和 /dev/pts 由 Vfs::open 补齐
         let pts = r(&root, b"/dev/pts", true).unwrap();
-        assert_eq!(pts, Node::Pseudo(PTS_MOUNT, PseudoNode::PtsRoot));
+        assert_eq!(
+            pts,
+            Node::Pseudo(PTS_MOUNT, PseudoNode::PtsRoot(crate::tty::BOOT_PTS))
+        );
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &pts).unwrap(), b"/dev/pts");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2335,7 +2364,7 @@ mod tests {
         );
         assert_eq!(
             r(&root, &root, b"/usr/bin").unwrap(),
-            Node::Pseudo(s, PseudoNode::PtsRoot)
+            Node::Pseudo(s, PseudoNode::PtsRoot(crate::tty::BOOT_PTS))
         );
         assert_eq!(r(&root, &root, b"/usr/bin/..").unwrap(), usr);
         let ids = |list: Vec<Mount>| list.iter().map(|m| m.id).collect::<Vec<_>>();
