@@ -84,6 +84,18 @@ const FORK_PIECE_MAX: u64 = 1 << 20;
 /// fork 时这么大以内的写过的匿名映射不看哪些页碰过，全部借出（[`Mm::lend`]）。
 const LEND_ALL_MAX: u64 = 16 * PAGE_SIZE;
 
+/// 不超过这么大的映射建立时就建好页表项（[`Mm::map_pages`]）；大的按需建表：guest 第一次
+/// 访问、内核层第一次读写时补上所在的那张叶子表（[`Mm::fault_in`]）。页表随碰过的内存增长，
+/// 不随映射的大小：ASan 映射十几 TB 的影子内存，逐页建表要几十 GB。
+const EAGER_MAX: u64 = 1 << 20;
+
+/// 一张叶子表覆盖的范围（512 页）：按需建表一次补这么多，fork 借页、量驻留内存时按它找
+/// 碰过的地方（[`Mm::touched_windows`]）。
+const LEAF_SPAN: u64 = PAGE_SIZE << 9;
+
+/// [`Mm::touched_windows`] 给出的一段最多这么大，逐页的记录（pagemap、mincore）不会太大。
+const WINDOW_MAX: u64 = 1 << 30;
+
 /// [`Mm::carve`] 切出来的：每个 VMA 的起点 → 那一段宿主内存和它的宿主地址。
 type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
 
@@ -1192,7 +1204,7 @@ impl Mm {
             self.materialize(page, true);
         }
         // 与 Linux 相同，futex 的地址必须可读
-        let host = self.mmu.translate(addr, prot::READ)?;
+        let host = self.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
         Some(match v.file_id {
             Some((dev, ino, offset)) if v.backing == Backing::Shared => crate::futex::Key::File {
@@ -1492,30 +1504,108 @@ impl Mm {
 
     /// 把 VMA 的一段放进页表。`PROT_NONE` 的不放：V8、JVM 预留的大片地址空间逐页写
     /// 页表很占内存（8 GB 要 16 MB），mprotect 加上权限时再放（[`Mm::mprotect`]）。
+    /// 给 VMA 自己的宿主内存 `[host, host + len)` 在 `[start, start + len)` 建页表项，已有的
+    /// 表项（写时复制改过的、mprotect 留下的权限为 0 的）不动。`PROT_NONE` 的不建；大于
+    /// [`EAGER_MAX`] 的也不建，等访问时按需建（[`Mm::fault_in`]），只有文件的可执行映射
+    /// 照样建好：翻译共用时按页表核对 guest 指令字（DBT 的 recheck），没有表项的块要停放、
+    /// 第一次执行时再一页页恢复。它的大小受文件大小限制。
     fn map_pages(
         mmu: &mut Mmu,
         start: u64,
         host: NonNull<u8>,
         len: u64,
         prot: u32,
+        file: bool,
     ) -> Result<(), Errno> {
         if mmu_prot(prot) == 0 || len == 0 {
             return Ok(());
         }
+        if len > EAGER_MAX && !(file && prot & prot::EXEC != 0) {
+            return Ok(());
+        }
         // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
-        if let Err(e) = unsafe { mmu.map(start, host, len, mmu_prot(prot)) } {
+        if let Err(e) = unsafe { mmu.fill_shared(start, host, len, mmu_prot(prot)) } {
             let _ = mmu.unmap(start, len);
             return Err(map_err(e));
         }
         Ok(())
     }
 
-    /// 把一段宿主内存映射到 `[start, start + len)`；调用方保证区间空闲。
+    /// 按需建表（[`EAGER_MAX`]）：guest 访问 `addr` 出错、内核层读写它时调用。这一页还没有
+    /// 表项，所在的 VMA 允许这次访问（`need`）时，把同一张叶子表（2 MB）里属于这个 VMA、
+    /// 还没有表项的页一起建好，返回 true，重新访问即可。文件映射超出文件末尾的页不建
+    /// （[`Mm::fault_past_eof`]）。只要共享借用：内核层读写别的进程的内存（ptrace、
+    /// process_vm_readv）时也会调用，只增加表项，不必刷新 TLB。
+    pub fn fault_in(&self, addr: u64, need: u32) -> bool {
+        let page = addr & !(PAGE_SIZE - 1);
+        let Some((&s, v)) = self.vmas.range(..=page).next_back() else {
+            return false;
+        };
+        let p = mmu_prot(v.prot);
+        let end = s + v.file_len.min(v.len);
+        if page >= end || p == 0 || p & need != need {
+            return false;
+        }
+        if self.mmu.next_present(page, page + PAGE_SIZE) == page {
+            return false;
+        }
+        let lo = (page & !(LEAF_SPAN - 1)).max(s);
+        let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
+        // SAFETY: [lo, hi) 在这个 VMA 有内容的部分里，宿主内存由它持有
+        let host = unsafe { v.host.add((lo - s) as usize) };
+        unsafe { self.mmu.fill_shared(lo, host, hi - lo, p) }.is_ok()
+    }
+
+    /// 私有匿名 VMA `start` 里可能有内容、可能驻留的范围（guest 地址），按地址排好，每段
+    /// 不超过 [`WINDOW_MAX`]：fork 借页（[`Mm::lend`]）、量驻留内存时只看这些，几 TB 的
+    /// 映射里只碰过几页时不必逐页查。
+    ///
+    /// 依据是这条规则：私有匿名内存里有内容的页一定有表项。guest 访问、内核层经由页表读写
+    /// 都会先建表（[`Mm::fault_in`]）；内核层直接写宿主内存（[`Mm::write_kernel`]）、调入
+    /// （[`Mm::populate`]）时也补上；mprotect 成 `PROT_NONE` 时表项留着、权限清零；mremap
+    /// 搬动时表项一起搬（[`Mm::move_range`]）。写时复制的页也算进来（借来的页在
+    /// `PROT_NONE` 的 VMA 里没有表项）。所以给出的是有表项的叶子表（2 MB）连成的几段。
+    fn touched_windows(&self, start: u64) -> Vec<(u64, u64)> {
+        let v = &self.vmas[&start];
+        let end = start + v.len;
+        let cow = self.cow.borrow();
+        let mut lent = cow.lent.range(start..end).copied().peekable();
+        let mut borrowed = cow.borrowed.range(start..end).map(|(&p, _)| p).peekable();
+        // 下一个要看的页：有表项的、写时复制的，取最前面的
+        let mut next = |from: u64| {
+            while lent.next_if(|&p| p < from).is_some() {}
+            while borrowed.next_if(|&p| p < from).is_some() {}
+            let pte = self.mmu.next_present(from, end);
+            pte.min(lent.peek().copied().unwrap_or(end))
+                .min(borrowed.peek().copied().unwrap_or(end))
+        };
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut at = start;
+        while at < end {
+            let page = next(at);
+            if page >= end {
+                break;
+            }
+            let lo = (page & !(LEAF_SPAN - 1)).max(start);
+            let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
+            match out.last_mut() {
+                Some((s, e)) if *e == lo && hi - *s <= WINDOW_MAX => *e = hi,
+                _ => out.push((lo, hi)),
+            }
+            at = hi;
+        }
+        out
+    }
+
+    /// 把一段宿主内存映射到 `[start, start + len)`；调用方保证区间空闲。文件映射的
+    /// `file_len` 是文件末尾之前的字节数（[`Vma::file_len`]），只给这一部分建表项：小文件
+    /// 以可执行权限映射成很大一段时，页表也只有文件那么大。
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
         start: u64,
         len: u64,
+        file_len: u64,
         prot: u32,
         backing: Backing,
         may_write: bool,
@@ -1523,7 +1613,8 @@ impl Mm {
         host: NonNull<u8>,
     ) -> Result<(), Errno> {
         self.room_for(1)?;
-        Self::map_pages(&mut self.mmu, start, host, len, prot)?;
+        let file = backing != Backing::Anonymous;
+        Self::map_pages(&mut self.mmu, start, host, file_len, prot, file)?;
         self.exec_changed |= prot & prot::EXEC != 0;
         self.vmas.insert(
             start,
@@ -1537,7 +1628,7 @@ impl Mm {
                 name: None,
                 ino: 0,
                 host,
-                file_len: len,
+                file_len,
                 cow: false,
                 file_id: None,
                 content: None,
@@ -1577,20 +1668,10 @@ impl Mm {
     /// 把一个完整的 VMA 放到 `start`；调用方保证区间空闲。
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         self.room_for(1)?;
-        Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot)?;
+        let file = v.backing != Backing::Anonymous;
+        Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file)?;
         self.exec_changed |= v.prot & prot::EXEC != 0;
         self.vmas.insert(start, v);
-        Ok(())
-    }
-
-    /// 文件映射超出文件末尾的页从页表里拿掉（[`Vma::file_len`]）。
-    fn trim_to_file(&mut self, start: u64) -> Result<(), Errno> {
-        let v = &self.vmas[&start];
-        if v.file_len < v.len {
-            self.mmu
-                .unmap(start + v.file_len, v.len - v.file_len)
-                .map_err(map_err)?;
-        }
         Ok(())
     }
 
@@ -1608,7 +1689,7 @@ impl Mm {
                 let (from, prot) = (v.file_len, v.prot);
                 // SAFETY: 宿主映射覆盖整个 VMA，[from, extent) 现在有文件内容
                 let host = unsafe { v.host.add(from as usize) };
-                Self::map_pages(&mut self.mmu, s + from, host, extent - from, prot).ok()?;
+                Self::map_pages(&mut self.mmu, s + from, host, extent - from, prot, true).ok()?;
                 self.vmas.get_mut(&s).unwrap().file_len = extent;
                 return Some(false);
             }
@@ -1645,7 +1726,16 @@ impl Mm {
             return Err(Errno::EEXIST);
         }
         let (region, host) = Self::new_anonymous(len, prot & prot::WRITE != 0)?;
-        self.insert(start, len, prot, Backing::Anonymous, true, region, host)
+        self.insert(
+            start,
+            len,
+            len,
+            prot,
+            Backing::Anonymous,
+            true,
+            region,
+            host,
+        )
     }
 
     /// 把从 `start` 开始的映射标记为向下增长（`MAP_GROWSDOWN` 的私有匿名映射）。
@@ -1667,7 +1757,7 @@ impl Mm {
         // SAFETY: 这段宿主内存至少有 len 字节
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
         let rw = prot::READ | prot::WRITE;
-        self.insert(start, len, rw, Backing::Anonymous, true, region, host)?;
+        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)?;
         self.vmas.get_mut(&start).unwrap().growsdown = true;
         self.stack_low = start;
         Ok(())
@@ -1754,7 +1844,7 @@ impl Mm {
         let host = unsafe { NonNull::new_unchecked(v.host.as_ptr().sub(grow as usize)) };
         // 栈的下面一段解除映射之后又长回来：以前写过的内容要变回零
         unsafe { discard_host(host, grow as usize) };
-        if Self::map_pages(&mut self.mmu, page, host, grow, prot).is_err() {
+        if Self::map_pages(&mut self.mmu, page, host, grow, prot, false).is_err() {
             return false;
         }
         self.exec_changed |= prot & prot::EXEC != 0;
@@ -1785,7 +1875,7 @@ impl Mm {
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - grow as usize)) };
         let anon = Backing::Anonymous;
         if self
-            .insert(page, grow, prot, anon, true, region, host)
+            .insert(page, grow, grow, prot, anon, true, region, host)
             .is_err()
         {
             return false;
@@ -1926,15 +2016,13 @@ impl Mm {
             )),
             _ => None,
         };
-        self.insert(start, len, prot, backing, may_write, region, host)?;
+        self.insert(start, len, file_len, prot, backing, may_write, region, host)?;
         let v = self.vmas.get_mut(&start).unwrap();
-        v.file_len = file_len;
         v.file_id = file_id;
         v.content = content;
         v.cow = cached;
         v.file = dup;
         v.noreserve = flags & flags::MAP_NORESERVE != 0;
-        self.trim_to_file(start)?;
         if backing == Backing::Shared && file_id.is_some() && may_write {
             self.note_shared_files(false);
         }
@@ -2202,7 +2290,11 @@ impl Mm {
         let mut moved = Vec::with_capacity(starts.len());
         for s in starts {
             let v = self.vmas.remove(&s).unwrap();
-            self.mmu.unmap(s, v.len).map_err(map_err)?;
+            // 表项一起搬：按需建表的大映射里，有内容的页都有表项（Mm::touched_windows），
+            // 搬过去之后 insert_vma 不动已有的表项。调用方保证两段不重叠
+            self.mmu
+                .move_entries(s, dst + (s - old), v.len)
+                .map_err(map_err)?;
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((s, v.len));
             }
@@ -2244,6 +2336,7 @@ impl Mm {
         let host = mem.region.base;
         self.insert(
             start,
+            len,
             len,
             prot,
             Backing::Shared,
@@ -2440,6 +2533,38 @@ impl Mm {
         Ok(out)
     }
 
+    /// `[addr, addr + len)` 里驻留的 4K 页数，借来的页算驻留（smaps、OOM killer 的记录）。
+    /// 与数 [`Mm::residency`] 的结果相同，但按需建表的大匿名映射只量可能有内容的几段
+    /// （[`Mm::touched_windows`]），不为几 TB 的映射分配逐页的数组。
+    pub fn resident_in(&self, addr: u64, len: u64) -> u64 {
+        let end = addr.saturating_add(len);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let mut total = 0;
+        for (&s, v) in self.vmas.range(first..end) {
+            let (from, to) = (addr.max(s), end.min(s + v.len));
+            if from >= to {
+                continue;
+            }
+            let ranges = if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
+                self.touched_windows(s)
+            } else {
+                vec![(from, to)]
+            };
+            for (lo, hi) in ranges {
+                let (lo, hi) = (lo.max(from), hi.min(to));
+                if lo < hi {
+                    let host = Self::own_page(s, v, lo);
+                    total += appine_hal::resident_pages(host.as_ptr(), (hi - lo) as usize) as u64;
+                }
+            }
+        }
+        total + self.cow.borrow().borrowed.range(addr..end).count() as u64
+    }
+
     /// `[addr, end)` 里与别的地址空间共用的页（写时复制借出的、借来的）：页数，以及按
     /// 共用它的地址空间个数分摊之后的字节数。smaps 把它们算作共享的脏页，Pss 只算分摊的
     /// 一份，与 Linux 按 mapcount 算的一样；只剩一个借用方的孤儿页只属于它，不算。
@@ -2615,14 +2740,14 @@ impl Mm {
             // 只增加权限时 TLB 里的旧表项只是少了权限，未命中时会重新填写，不必刷新
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
             self.dirty |= old & !new != 0;
-            // PROT_NONE 的页不在页表里（[`Mm::map_pages`]）：去掉全部权限时拿掉，从没有
-            // 权限变成有权限时放进去（文件映射只放文件末尾之前的部分）
-            if new == 0 {
-                self.mmu.unmap(s, v.len).map_err(map_err)?;
-            } else if old == 0 {
-                Self::map_pages(&mut self.mmu, s, v.host, v.file_len, prot)?;
-            } else {
-                self.mmu.protect(s, v.len, new).map_err(map_err)?;
+            // 已有的表项改权限；去掉全部权限时表项留着、权限清零（宿主页里可能有内容，
+            // fork 借页、量驻留内存按表项找，见 [`Mm::touched_windows`]）。新建的
+            // PROT_NONE 映射没有表项（[`Mm::map_pages`]），从没有权限变成有权限时补上
+            // （文件映射只补文件末尾之前的部分，大的等访问时按需建）
+            self.mmu.protect(s, v.len, new).map_err(map_err)?;
+            if old == 0 && new != 0 {
+                let file = v.backing != Backing::Anonymous;
+                Self::map_pages(&mut self.mmu, s, v.host, v.file_len, prot, file)?;
             }
             v.prot = prot;
             if prot & prot::WRITE != 0 {
@@ -2760,13 +2885,21 @@ impl Mm {
                 }
                 (region, host)
             };
-            child.insert(start, v.len, v.prot, v.backing, v.may_write, region, host)?;
+            child.insert(
+                start,
+                v.len,
+                v.file_len,
+                v.prot,
+                v.backing,
+                v.may_write,
+                region,
+                host,
+            )?;
             let c = child.vmas.get_mut(&start).unwrap();
             c.may_exec = v.may_exec;
             c.written.set(v.written.get());
             c.name = v.name.clone();
             c.ino = v.ino;
-            c.file_len = v.file_len;
             c.cow = v.cow && share;
             c.file_id = v.file_id;
             c.content = v.content;
@@ -2774,7 +2907,6 @@ impl Mm {
             c.shm = v.shm;
             c.growsdown = v.growsdown;
             c.noreserve = v.noreserve;
-            child.trim_to_file(start)?;
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
@@ -2878,9 +3010,11 @@ impl Mm {
         let (region, host) = Self::new_anonymous(v.len, reserve)?;
         // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
         unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
-        // 超出文件末尾的页仍然不进页表
+        // 原来的表项指向共用的那段，先拿掉（map_pages 不动已有的表项）；超出文件末尾的
+        // 页仍然不进页表
         let (file_len, p) = (v.file_len, v.prot);
-        Self::map_pages(&mut self.mmu, start, host, file_len, p)?;
+        self.mmu.unmap(start, file_len).map_err(map_err)?;
+        Self::map_pages(&mut self.mmu, start, host, file_len, p, true)?;
         let v = self.vmas.get_mut(&start).unwrap();
         let old = std::mem::replace(&mut v.region, region);
         v.host = host;
@@ -3134,6 +3268,12 @@ impl Mm {
                         (to - from) as usize,
                     )
                 };
+                // 表项也建好（按需建表的大映射原来没有）：调入的页量驻留内存时要找得到
+                // （Mm::touched_windows）。已有的表项（写时复制的）不动
+                let (lo, hi) = (from & !(PAGE_SIZE - 1), page_up(to).unwrap_or(to));
+                // SAFETY: [lo, hi) 在这个 VMA 里，宿主内存由它持有
+                let host = unsafe { v.host.add((lo - s) as usize) };
+                let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) };
             }
         }
     }
@@ -3211,13 +3351,22 @@ impl Mm {
         let mut total = self.cow.borrow().borrowed.len() as u64;
         let mut spans = Vec::with_capacity(self.vmas.len());
         let now = std::time::Instant::now();
-        for v in self.vmas.values() {
+        for (&s, v) in &self.vmas {
             let page_cache = match v.backing {
                 Backing::Anonymous if !v.written.get() => continue,
                 Backing::Anonymous => false,
                 Backing::PrivateFile => !v.written.get(),
                 Backing::Shared => true,
             };
+            // 按需建表的大映射只量可能有内容的几段（Mm::touched_windows）：ASan 十几 TB 的
+            // 影子内存逐页 mincore 要几 GB 的结果数组
+            if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
+                for (lo, hi) in self.touched_windows(s) {
+                    let host = Self::own_page(s, v, lo).as_ptr() as usize;
+                    spans.push((host, (hi - lo) as usize));
+                }
+                continue;
+            }
             let span = (v.host.as_ptr() as usize, v.len as usize);
             match v.file_id {
                 Some((dev, ino, offset)) if page_cache => {
@@ -3300,7 +3449,7 @@ impl Mm {
             return false;
         };
         let rw = prot::READ | prot::WRITE;
-        self.insert(start, len, rw, Backing::Anonymous, true, region, host)
+        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)
             .is_ok()
     }
 
@@ -3335,7 +3484,7 @@ impl Mm {
         let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
         // 缩小之后又扩展：以前写过的内容要变回零
         unsafe { discard_host(host, hi) };
-        if Self::map_pages(&mut self.mmu, end, host, grow, rw).is_err() {
+        if Self::map_pages(&mut self.mmu, end, host, grow, rw, false).is_err() {
             return false;
         }
         let v = self.vmas.get_mut(&s).unwrap();
@@ -3361,13 +3510,22 @@ impl Mm {
         })
     }
 
+    /// 内核层经由页表找 guest 地址 `addr` 的宿主指针，要求有 `need` 里的权限；还没有表项
+    /// 时先按需建（[`Mm::fault_in`]）。不处理写时复制（见 [`Mm::for_each_page`]）。
+    pub fn translate(&self, addr: u64, need: u32) -> Option<NonNull<u8>> {
+        self.mmu.translate(addr, need).or_else(|| {
+            self.fault_in(addr, need)
+                .then(|| self.mmu.translate(addr, need))?
+        })
+    }
+
     /// 读取以 NUL 结尾的字符串（不含 NUL），最长 `max` 字节，超出时返回 ENAMETOOLONG。
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let mut out = Vec::new();
         let mut cur = addr;
         loop {
             let chunk = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
-            let host = self.mmu.translate(cur, prot::READ).ok_or(Errno::EFAULT)?;
+            let host = self.translate(cur, prot::READ).ok_or(Errno::EFAULT)?;
             // SAFETY: translate 保证这一页在本次调用期间有效
             let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr(), chunk) };
             if let Some(n) = bytes.iter().position(|&b| b == 0) {
@@ -3428,6 +3586,15 @@ impl Mm {
                     chunk,
                 )
             };
+            // 私有匿名内存里有内容的页要有表项（Mm::touched_windows），PROT_NONE 的权限为 0
+            if v.backing == Backing::Anonymous {
+                let lo = cur & !(PAGE_SIZE - 1);
+                let hi = page_up(cur + chunk as u64).unwrap_or(s + v.len);
+                // SAFETY: [lo, hi) 在这个 VMA 里，宿主内存由它持有
+                let host = unsafe { v.host.add((lo - s) as usize) };
+                unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) }
+                    .map_err(map_err)?;
+            }
             done += chunk;
         }
         Ok(())
@@ -3479,11 +3646,14 @@ impl Mm {
             let chunk = page_left.min(len - done);
             let host = match self.mmu.translate(cur, required_prot) {
                 Some(host) => host,
-                // 写时复制的页：先换成可写的（Mm::cow_break）
-                None if required_prot & prot::WRITE != 0 && self.cow_break(cur) => self
-                    .mmu
-                    .translate(cur, required_prot)
-                    .ok_or(Errno::EFAULT)?,
+                // 写时复制的页：先换成可写的（Mm::cow_break）；还没有表项的页按需建
+                None if required_prot & prot::WRITE != 0 && self.cow_break(cur)
+                    || self.fault_in(cur, required_prot) =>
+                {
+                    self.mmu
+                        .translate(cur, required_prot)
+                        .ok_or(Errno::EFAULT)?
+                }
                 None => return Err(Errno::EFAULT),
             };
             f(host.as_ptr(), done, chunk);
@@ -3548,10 +3718,10 @@ impl Mm {
             unsafe {
                 std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize)
             };
-            if mmu_prot(v.prot) != 0 {
-                // SAFETY: 宿主页属于这个 VMA
-                let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
-            }
+            // PROT_NONE 的也建（权限为 0）：有内容的页要有表项（Mm::touched_windows）；
+            // 原来可能有指向借来的页、权限为 0 的表项，不能留着
+            // SAFETY: 宿主页属于这个 VMA
+            let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
         }
         // 线程的 TLB 里可能还指向借来的页：刷新之后才能还回去，拥有者接着就可能写它
         self.shootdown();
@@ -3703,10 +3873,19 @@ impl Mm {
     fn cow_protect(&self, start: u64, end: u64) {
         let c = self.cow.borrow();
         for &page in c.lent.range(start..end) {
-            if let Some((_, v)) = self.anon_vma(page)
+            if let Some((s, v)) = self.anon_vma(page)
                 && Self::read_only(v) != 0
             {
-                let _ = self.mmu.protect_shared(page, PAGE_SIZE, Self::read_only(v));
+                // 照样建表项，不只是改权限：PROT_NONE 的映射原来可能没有表项
+                // SAFETY: 宿主页属于这个 VMA
+                let _ = unsafe {
+                    self.mmu.map_shared(
+                        page,
+                        Self::own_page(s, v, page),
+                        PAGE_SIZE,
+                        Self::read_only(v),
+                    )
+                };
             }
         }
         for (&page, b) in c.borrowed.range(start..end) {
@@ -3741,53 +3920,72 @@ impl Mm {
     ) -> bool {
         let v = &self.vmas[&start];
         let end = start + v.len;
-        // 宿主从没碰过的页一定是零，子进程用自己的就行。小的映射多半都碰过，不为它们读
-        // pagemap（一次 pread，fork 持锁时间的三成多），全部借出
-        let touched = (v.len > LEND_ALL_MAX)
-            .then(|| appine_hal::touched_pages(v.host.as_ptr(), v.len as usize))
-            .flatten();
+        // 只看可能有内容的几段（Mm::touched_windows）：按需建表的大映射里没碰过的部分没有
+        // 表项，几 TB 的映射也不必逐页看。宿主从没碰过的页一定是零，子进程用自己的就行。
+        // 小的映射多半都碰过，不为它们读 pagemap（一次 pread，fork 持锁时间的三成多），
+        // 全部借出
+        let small = v.len <= LEND_ALL_MAX;
+        let windows = if small {
+            vec![(start, end)]
+        } else {
+            self.touched_windows(start)
+        };
         let ro = Self::read_only(v);
         let cow = self.cow.borrow();
         let mut loans = self.loans.borrow_mut();
-        loans.reserve(
-            touched
-                .as_ref()
-                .map_or(0, |t| t.iter().filter(|&&t| t).count()),
-        );
-        // 自己借来的、已经借出的页按地址顺序和逐页的遍历合并，不必每页查一次
+        // 自己借来的、已经借出的页按地址顺序和逐页的遍历合并，不必每页查一次；它们都在
+        // windows 里
         let mut mine = cow.borrowed.range(start..end).peekable();
         let mut out = cow.lent.range(start..end).peekable();
         let (mut parent_runs, mut child_runs) = (Runs::default(), Runs::default());
         let before = lent.len();
-        for (i, page) in (start..end).step_by(PAGE_SIZE as usize).enumerate() {
-            let (host, region) = if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
-                if let Some(loan) = loans.get_mut(&(b.host.as_ptr() as usize)) {
-                    loan.lend((child.me.clone(), page));
-                }
-                (b.host, b.region.clone())
-            } else if touched.as_ref().is_none_or(|t| t[i]) {
-                let host = Self::own_page(start, v, page);
-                let key = host.as_ptr() as usize;
-                if out.next_if(|&&p| p == page).is_some() {
-                    if let Some(loan) = loans.get_mut(&key) {
+        for (lo, hi) in windows {
+            let touched = (!small)
+                .then(|| {
+                    let host = Self::own_page(start, v, lo);
+                    appine_hal::touched_pages(host.as_ptr(), (hi - lo) as usize)
+                })
+                .flatten();
+            loans.reserve(
+                touched
+                    .as_ref()
+                    .map_or(0, |t| t.iter().filter(|&&t| t).count()),
+            );
+            for (i, page) in (lo..hi).step_by(PAGE_SIZE as usize).enumerate() {
+                let (host, region) = if let Some((_, b)) = mine.next_if(|&(&p, _)| p == page) {
+                    if let Some(loan) = loans.get_mut(&(b.host.as_ptr() as usize)) {
                         loan.lend((child.me.clone(), page));
                     }
+                    (b.host, b.region.clone())
+                } else if touched.as_ref().is_none_or(|t| t[i]) {
+                    let host = Self::own_page(start, v, page);
+                    let key = host.as_ptr() as usize;
+                    if out.next_if(|&&p| p == page).is_some() {
+                        if let Some(loan) = loans.get_mut(&key) {
+                            loan.lend((child.me.clone(), page));
+                        }
+                    } else {
+                        let owner = Some((self.me.clone(), page));
+                        loans.insert(key, Loan::new(owner, (child.me.clone(), page)));
+                        lent.push(page);
+                        parent_runs.push(start, page, host);
+                    }
+                    (host, v.region.clone())
                 } else {
-                    let owner = Some((self.me.clone(), page));
-                    loans.insert(key, Loan::new(owner, (child.me.clone(), page)));
-                    lent.push(page);
-                    parent_runs.push(start, page, host);
-                }
-                (host, v.region.clone())
-            } else {
-                continue;
-            };
-            child_runs.push(start, page, host);
-            borrowed.push((page, Borrowed { host, region }));
+                    continue;
+                };
+                child_runs.push(start, page, host);
+                borrowed.push((page, Borrowed { host, region }));
+            }
         }
         if ro != 0 {
-            for (_, page, _, len) in parent_runs.runs {
-                let _ = self.mmu.protect_shared(page, len, ro);
+            for (_, page, host, len) in parent_runs.runs {
+                // 照样建表项，不只是改权限：不依赖宿主上碰过的页都已经有表项
+                // SAFETY: 宿主页属于这个 VMA
+                let _ = unsafe {
+                    self.mmu
+                        .map_shared(page, NonNull::new_unchecked(host as *mut u8), len, ro)
+                };
             }
             for (_, page, host, len) in child_runs.runs {
                 // SAFETY: 借来的宿主页由 Borrowed::region 持有，记在子进程的 borrowed 里
@@ -4246,6 +4444,19 @@ mod tests {
                 assert_eq!(m.fault_past_eof(base + PAGE_SIZE), None);
             }
         }
+        // 文件的可执行映射一次建好表项，但只建到文件末尾：1 GB 的映射只有两页
+        let exec = mm
+            .mmap(
+                0,
+                1 << 30,
+                prot::READ | prot::EXEC,
+                flags::MAP_PRIVATE,
+                Some((f.as_raw_fd(), 0, false)),
+            )
+            .unwrap();
+        assert!(mm.mmu().translate(exec + PAGE_SIZE, prot::EXEC).is_some());
+        let end = exec + (1 << 30);
+        assert_eq!(mm.mmu().next_present(exec + 2 * PAGE_SIZE, end), end);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4676,6 +4887,85 @@ mod tests {
         let g = grandchild.borrow();
         assert!(g.cow.borrow().borrowed.is_empty() && g.cow.borrow().lent.is_empty());
         assert!(g.loans.borrow().is_empty());
+    }
+
+    #[test]
+    fn large_mappings_build_page_tables_on_demand() {
+        let mm = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_NORESERVE;
+        // 64 GB：逐页建表要 128 MB。起点按叶子表对齐
+        let len = 64 << 30;
+        let fixed = anon | flags::MAP_FIXED;
+        let a = mm.borrow_mut().mmap(1 << 40, len, RW, fixed, None).unwrap();
+        let present = |mm: &Rc<RefCell<Mm>>, from| mm.borrow().mmu().next_present(from, a + len);
+        assert_eq!(present(&mm, a), a + len);
+        // 访问出错时补上同一张叶子表（2 MB）里的页，已经有表项的不再补
+        assert!(mm.borrow().fault_in(a + 5 * PAGE_SIZE + 7, prot::WRITE));
+        assert!(!mm.borrow().fault_in(a + 6 * PAGE_SIZE, prot::READ));
+        assert!(writable(&mm, a + LEAF_SPAN - PAGE_SIZE));
+        assert_eq!(present(&mm, a + LEAF_SPAN), a + len);
+        // 内核层读写也按需建表
+        let far = a + len / 2 + 3 * PAGE_SIZE;
+        poke(&mm, far, b'x');
+        assert_eq!(byte(&mm, far), b'x');
+        assert_eq!(present(&mm, a + LEAF_SPAN), far & !(LEAF_SPAN - 1));
+        // 映射外、没有这个权限的不补
+        assert!(!mm.borrow().fault_in(a + len, prot::READ));
+        assert!(!mm.borrow().fault_in(a, prot::EXEC));
+        // 驻留内存只量有表项的几段
+        poke(&mm, a, b'p');
+        assert!(mm.borrow().resident_pages() < 16);
+        assert!(mm.borrow().resident_in(a, len) <= 2);
+        // fork 只借碰过的页
+        let child = mm.borrow_mut().fork().unwrap();
+        assert_eq!((byte(&child, a), byte(&child, far)), (b'p', b'x'));
+        assert!(child.borrow().cow.borrow().borrowed.len() <= 2 * 512);
+        poke(&child, far, b'c');
+        assert_eq!((byte(&mm, far), byte(&child, far)), (b'x', b'c'));
+        assert_eq!(byte(&child, a + len - 1), 0);
+    }
+
+    #[test]
+    fn written_pages_keep_entries_through_prot_none_mremap_and_kernel_writes() {
+        // 按需建表的大映射里，有内容的页一定有表项：fork 借页只看有表项的几段
+        let mm = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let len = 64 * LEAF_SPAN;
+        let fixed = anon | flags::MAP_FIXED;
+        let a = mm.borrow_mut().mmap(1 << 40, len, RW, fixed, None).unwrap();
+        let (guest, kernel) = (a + 3 * LEAF_SPAN, a + 9 * LEAF_SPAN + 5);
+        poke(&mm, guest, b'g');
+        // 内核层直接写宿主内存（加载程序、PTRACE_POKEDATA）
+        mm.borrow_mut().write_kernel(kernel, b"k").unwrap();
+        // PROT_NONE：表项留着、权限清零，不能访问
+        mm.borrow_mut().mprotect(a, len, 0).unwrap();
+        assert!(mm.borrow().mmu().translate(guest, 0).is_none());
+        assert_eq!(
+            mm.borrow().mmu().next_present(a, a + len),
+            a + 3 * LEAF_SPAN
+        );
+        mm.borrow_mut()
+            .write_kernel(a + 20 * LEAF_SPAN, b"n")
+            .unwrap();
+        let child = mm.borrow_mut().fork().unwrap();
+        for m in [&mm, &child] {
+            m.borrow_mut().mprotect(a, len, RW).unwrap();
+            assert_eq!(byte(m, guest), b'g');
+            assert_eq!(byte(m, kernel), b'k');
+            assert_eq!(byte(m, a + 20 * LEAF_SPAN), b'n');
+        }
+        assert!(!writable(&mm, guest) && !writable(&child, guest));
+        // mremap 搬走：表项一起搬，之后 fork 的子进程照样看得到
+        let dst = 0x1000_0000_0000;
+        let moved = mm
+            .borrow_mut()
+            .mremap(a, len, len, true, Some(dst), None)
+            .unwrap();
+        assert_eq!(mm.borrow().mmu().next_present(a, a + len), a + len);
+        let grandchild = mm.borrow_mut().fork().unwrap();
+        assert_eq!(byte(&grandchild, moved + 3 * LEAF_SPAN), b'g');
+        assert_eq!(byte(&grandchild, moved + 9 * LEAF_SPAN + 5), b'k');
+        assert_eq!(byte(&child, guest), b'g');
     }
 
     #[test]

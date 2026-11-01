@@ -208,13 +208,19 @@ void appine_mmu_free(struct appine_mmu *mmu);
  * 期间保持有效。
  */
 int appine_mmu_map(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot);
+/* 与 appine_mmu_map 相同，但已有表项（包括权限为 0 的）的页保持不变：按需建表 */
+int appine_mmu_fill(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot);
 int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
-/* 只修改已映射页的权限，未映射的页保持不变 */
+/* 只修改已有表项的权限（可以改成 0：宿主页留着，不能访问），没有表项的页保持不变 */
 int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint32_t prot);
+/* 把 [from, from + len) 里已有的表项原样搬到 to 开始的同样位置，原处清空；两段不能重叠 */
+int appine_mmu_move(struct appine_mmu *mmu, uint64_t from, uint64_t to, uint64_t len);
+/* [gva, end) 里第一个有表项（包括权限为 0 的）的页，没有时返回 end */
+uint64_t appine_mmu_next_present(const struct appine_mmu *mmu, uint64_t gva, uint64_t end);
 
 /*
  * 查询一个 guest 地址对应的 host 指针（含页内偏移）。required_prot 中的权限
- * 必须全部具备，否则返回 NULL；传 0 表示只要求已映射。
+ * 必须全部具备，否则返回 NULL；传 0 表示只要求有可以访问的表项（权限为 0 的不算）。
  */
 void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot);
 

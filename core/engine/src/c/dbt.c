@@ -4079,6 +4079,10 @@ static void revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc
         if (!b->parked || b->pc >> APPINE_PAGE_SHIFT != page)
             continue;
         if (!block_matches(d, c->mmu, b, &p, &host)) {
+            /* 页还没有表项（大的映射按需建表）：留着，分发器取不到指令时由 Tier 0 报告
+             * 缺页，内核层补上表项之后再来 */
+            if (!host)
+                break;
             kill_parked(d, b);
             continue;
         }

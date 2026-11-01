@@ -1,7 +1,8 @@
 # fork 之后父子进程的内存互不影响（写时复制）：几个子进程和父进程同时写；多线程的父进程
 # 在别的线程不停写的时候 fork，子进程看到的是某一瞬间的快照；借出的内存解除映射、搬走、
 # 丢弃；子进程结束之后借出的页恢复成各自的权限；smaps 里共用的页；子进程里用锁和条件
-# 变量；一层套一层的 fork；python 的 os.fork；fork 时按合起来的 VMA 估算提交量
+# 变量；一层套一层的 fork；python 的 os.fork；fork 时按合起来的 VMA 估算提交量；只碰了几页的
+# 1 TB MAP_NORESERVE 映射
 set -e
 cd /tmp
 cat > cow.c <<'C'
@@ -421,6 +422,82 @@ int main(void)
 C
 gcc -O2 -o commit commit.c
 ./commit
+# 1 TB 的 MAP_NORESERVE 映射只碰几页（ASan 的影子内存就是这样）：fork 成功，子进程读到
+# 内容、写自己的一份、没碰过的是零；PROT_NONE 再改回来、mremap 搬走之后内容还在，再 fork
+# 也看得到；驻留内存只有碰过的几页。appine 的页表按需建立，fork 借页只看有表项的地方
+# （第 179 轮）；原来 fork 给子进程申请宿主内存时不看 MAP_NORESERVE，超过内存总量就是 ENOMEM
+cat > sparse.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define LEN (1ul << 40)
+static const unsigned long at[] = {0, LEN / 3 + 123, LEN / 2 + (5ul << 20), LEN - 1};
+
+static int check(const char *p)
+{
+    for (int i = 0; i < 4; i++)
+        if (p[at[i]] != 'a' + i)
+            return 0;
+    return 1;
+}
+
+static const char *fork_and_check(char *p)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return strerror(errno);
+    if (pid == 0) {
+        int ok = check(p) && p[LEN / 4] == 0;
+        p[at[1]] = 'z';
+        _exit(ok ? 0 : 1);
+    }
+    int st = -1;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 && check(p) ? "child saw the pages" : "wrong";
+}
+
+static long rss_kb(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "VmRSS: %ld", &kb) == 1)
+            break;
+    fclose(f);
+    return kb;
+}
+
+int main(void)
+{
+    char *p = mmap(NULL, LEN, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        printf("mmap: %s\n", strerror(errno));
+        return 0;
+    }
+    for (int i = 0; i < 4; i++)
+        p[at[i]] = 'a' + i;
+    printf("fork: %s\n", fork_and_check(p));
+    mprotect(p, LEN, PROT_NONE);
+    mprotect(p, LEN, PROT_READ | PROT_WRITE);
+    printf("after PROT_NONE: %s\n", check(p) ? "kept" : "lost");
+    char *dst = mmap(NULL, LEN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    char *q = mremap(p, LEN, LEN, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+    printf("after mremap: %s, fork: %s\n", q == dst && check(q) ? "kept" : "lost",
+           fork_and_check(q));
+    printf("rss under 64 MB: %s\n", rss_kb() < (64 << 10) ? "yes" : "no");
+    return 0;
+}
+C
+gcc -O2 -o sparse sparse.c
+./sparse
 python3 -c '
 import os
 data = bytearray(b"p" * (1 << 22))

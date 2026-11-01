@@ -359,9 +359,7 @@ fn log_killed(k: &Kernel, g: &ThreadGroup, task: Option<&crate::task::Task>) {
         let mm = res.mm.borrow();
         vm = mm.size() / 1024;
         for r in mm.regions() {
-            let pages = mm
-                .residency(r.start, r.end - r.start)
-                .map_or(0, |v| v.iter().filter(|&&p| p).count() as u64);
+            let pages = mm.resident_in(r.start, r.end - r.start);
             match (r.file, r.shared) {
                 (Some(_), _) => file += pages * 4,
                 (None, true) => shmem += pages * 4,

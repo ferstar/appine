@@ -156,6 +156,10 @@ unsafe extern "C" {
     fn appine_mmu_map(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32) -> c_int;
     fn appine_mmu_unmap(mmu: *mut RawMmu, gva: u64, len: u64) -> c_int;
     fn appine_mmu_protect(mmu: *mut RawMmu, gva: u64, len: u64, prot: u32) -> c_int;
+    fn appine_mmu_fill(mmu: *mut RawMmu, gva: u64, host: *mut c_void, len: u64, prot: u32)
+    -> c_int;
+    fn appine_mmu_move(mmu: *mut RawMmu, from: u64, to: u64, len: u64) -> c_int;
+    fn appine_mmu_next_present(mmu: *const RawMmu, gva: u64, end: u64) -> u64;
     fn appine_mmu_translate(mmu: *const RawMmu, gva: u64, required_prot: u32) -> *mut c_void;
 
     fn appine_cpu_new(mmu: *mut RawMmu) -> *mut CpuState;
@@ -288,9 +292,39 @@ impl Mmu {
         map_result(unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) })
     }
 
-    /// 修改已映射页的权限。
+    /// 修改已有表项的权限，可以改成 0（宿主页留着，不能访问）；没有表项的页不变。
     pub fn protect(&mut self, gva: u64, len: u64, prot: u32) -> Result<(), MapError> {
         map_result(unsafe { appine_mmu_protect(self.raw.as_ptr(), gva, len, prot) })
+    }
+
+    /// 把 `[from, from + len)` 里已有的表项原样搬到 `to` 开始的同样位置，原处清空；两段
+    /// 不能重叠。
+    pub fn move_entries(&mut self, from: u64, to: u64, len: u64) -> Result<(), MapError> {
+        map_result(unsafe { appine_mmu_move(self.raw.as_ptr(), from, to, len) })
+    }
+
+    /// 与 [`Mmu::map_shared`] 相同，但已有表项（包括权限为 0 的）的页保持不变：按需建表时
+    /// 补上还没有表项的页，不碰写时复制改过的。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`Mmu::map`]。
+    pub unsafe fn fill_shared(
+        &self,
+        gva: u64,
+        host: NonNull<u8>,
+        len: u64,
+        prot: u32,
+    ) -> Result<(), MapError> {
+        map_result(unsafe {
+            appine_mmu_fill(self.raw.as_ptr(), gva, host.as_ptr().cast(), len, prot)
+        })
+    }
+
+    /// `[gva, end)` 里第一个有表项（包括权限为 0 的）的页；没有时返回 `end`。没有表的
+    /// 地方整段跳过，几 TB 的映射里只碰过几页时也很快。
+    pub fn next_present(&self, gva: u64, end: u64) -> u64 {
+        unsafe { appine_mmu_next_present(self.raw.as_ptr(), gva, end) }
     }
 
     /// 与 [`Mmu::map`] 相同，但只要 `&self`：内核层在写时复制时经由共享借用修改别的地址
@@ -316,7 +350,8 @@ impl Mmu {
         map_result(unsafe { appine_mmu_protect(self.raw.as_ptr(), gva, len, prot) })
     }
 
-    /// 查询 guest 地址对应的 host 指针；`required_prot` 中的权限必须全部具备，传 0 只要求已映射。
+    /// 查询 guest 地址对应的 host 指针；`required_prot` 中的权限必须全部具备，传 0 只要求
+    /// 有可以访问的表项（权限为 0 的不算）。
     pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
         NonNull::new(unsafe { appine_mmu_translate(self.raw.as_ptr(), gva, required_prot) }.cast())
     }

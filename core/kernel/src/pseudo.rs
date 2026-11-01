@@ -2555,8 +2555,7 @@ fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
     let mut s = String::new();
     let mut total = Usage::default();
     for r in &regions {
-        let resident = mm.residency(r.start, r.end - r.start).unwrap_or_default();
-        let rss = resident.iter().filter(|&&p| p).count() as u64 * 4;
+        let rss = mm.resident_in(r.start, r.end - r.start) * 4;
         let mut u = Usage {
             rss,
             locked: if r.locked { rss } else { 0 },

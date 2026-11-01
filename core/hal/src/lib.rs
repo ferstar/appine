@@ -1119,17 +1119,25 @@ fn resident_in_file(fd: i32, first: u64, pages: u64) -> u64 {
     total
 }
 
-/// `[ptr, ptr + len)` 里驻留在内存中的 4K 页数（mincore）。
+/// `[ptr, ptr + len)` 里驻留在内存中的 4K 页数（mincore）。分段量，结果数组不超过 64 KB；
+/// 量不了的段算 0。
 pub fn resident_pages(ptr: *const u8, len: usize) -> usize {
+    const WINDOW_PAGES: usize = 1 << 16;
     let page = page_size();
     let start = ptr as usize & !(page - 1);
     let span = (ptr as usize + len).next_multiple_of(page) - start;
-    let mut vec = vec![0u8; span / page];
-    let rc = unsafe { libc::mincore(start as *mut libc::c_void, span, vec.as_mut_ptr().cast()) };
-    if rc < 0 {
-        return 0;
+    let mut vec = vec![0u8; (span / page).min(WINDOW_PAGES)];
+    let mut host_pages = 0;
+    let mut at = start;
+    while at < start + span {
+        let n = ((start + span - at) / page).min(WINDOW_PAGES);
+        let rc =
+            unsafe { libc::mincore(at as *mut libc::c_void, n * page, vec.as_mut_ptr().cast()) };
+        if rc == 0 {
+            host_pages += vec[..n].iter().filter(|&&b| b & 1 != 0).count();
+        }
+        at += n * page;
     }
-    let host_pages = vec.iter().filter(|&&b| b & 1 != 0).count();
     (host_pages * page / 4096).min(len.div_ceil(4096))
 }
 

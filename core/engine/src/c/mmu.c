@@ -3,6 +3,10 @@
  * 地址空间。中间表项是下一级表的指针，叶子表项是 host 页地址 | 权限位。
  * 只有 TLB 未命中时才会遍历这棵树。
  *
+ * 表项按需建立：内核层只给小的映射预先建好，大的等 guest 第一次访问时一次补一张叶子表
+ * （appine_mmu_fill），所以页表的大小随碰过的内存增长，而不是随映射的大小。遍历一段
+ * 范围时，没有中间表的地方按缺的那一级整段跳过（一项覆盖 2 MB、1 GB 或 512 GB）。
+ *
  * 并发：修改只由内核层在持有 BKL 时进行，而共享同一地址空间的其他线程可能
  * 同时在遍历（TLB 未命中）。所以表项一律用原子操作读写：新建的中间表以
  * release 语义挂上，遍历时以 acquire 语义读取。中间表在 mmu 销毁前不会释放。
@@ -15,11 +19,17 @@
 #define LEVELS MMU_LEVELS
 #define LEVEL_BITS MMU_LEVEL_BITS
 #define LEVEL_ENTRIES (1u << LEVEL_BITS)
+/* 一张叶子表覆盖的字节数 */
+#define LEAF_SPAN ((uint64_t)APPINE_PAGE_SIZE << LEVEL_BITS)
+
+static unsigned level_shift(int level)
+{
+    return APPINE_PAGE_SHIFT + LEVEL_BITS * (LEVELS - 1 - level);
+}
 
 static unsigned level_index(uint64_t gva, int level)
 {
-    unsigned shift = APPINE_PAGE_SHIFT + LEVEL_BITS * (LEVELS - 1 - level);
-    return (unsigned)(gva >> shift) & (LEVEL_ENTRIES - 1);
+    return (unsigned)(gva >> level_shift(level)) & (LEVEL_ENTRIES - 1);
 }
 
 static uintptr_t *new_table(void)
@@ -48,16 +58,24 @@ static void free_table(uintptr_t *table, int level)
     free(table);
 }
 
-/* 返回叶子表项的位置；alloc 为 false 且中间表缺失时返回 NULL */
-static uintptr_t *leaf_slot(struct appine_mmu *mmu, uint64_t gva, bool alloc)
+/*
+ * gva 所在的叶子表。中间表缺失时：alloc 为真就新建；否则返回 NULL，并把 *hole_end 设为
+ * 从 gva 起整段没有表项的范围的末端（按缺失的那一级对齐，不超过 2^48）。alloc 时分配
+ * 失败也返回 NULL
+ */
+static uintptr_t *leaf_table(const struct appine_mmu *mmu, uint64_t gva, bool alloc,
+                             uint64_t *hole_end)
 {
     uintptr_t *table = mmu->root;
     for (int level = 0; level < LEVELS - 1; level++) {
         uintptr_t *slot = &table[level_index(gva, level)];
         uintptr_t next = load_entry(slot);
         if (!next) {
-            if (!alloc)
+            if (!alloc) {
+                unsigned shift = level_shift(level);
+                *hole_end = ((gva >> shift) + 1) << shift;
                 return NULL;
+            }
             uintptr_t *fresh = new_table();
             if (!fresh)
                 return NULL;
@@ -66,15 +84,14 @@ static uintptr_t *leaf_slot(struct appine_mmu *mmu, uint64_t gva, bool alloc)
         }
         table = (uintptr_t *)next;
     }
-    return &table[level_index(gva, LEVELS - 1)];
+    return table;
 }
 
-/* 从 gva + off 到下一张叶子表（512 页）起点的偏移：没有中间表的地方整张跳过，
- * 解除或修改 V8、JVM 预留的大片地址空间时不必逐页查找 */
-static uint64_t next_table(uint64_t gva, uint64_t off)
+/* gva 所在叶子表覆盖范围的末端，不超过 end */
+static uint64_t leaf_end(uint64_t gva, uint64_t end)
 {
-    uint64_t span = (uint64_t)APPINE_PAGE_SIZE << LEVEL_BITS;
-    return (((gva + off) | (span - 1)) + 1) - gva;
+    uint64_t e = (gva | (LEAF_SPAN - 1)) + 1;
+    return e < end ? e : end;
 }
 
 static bool range_ok(uint64_t gva, uint64_t len)
@@ -104,32 +121,48 @@ void appine_mmu_free(struct appine_mmu *mmu)
     free(mmu);
 }
 
-int appine_mmu_map(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot)
+/* map 和 fill：only_empty 时已有表项（包括权限为 0 的）保持不变 */
+static int store_range(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len,
+                       uint32_t prot, bool only_empty)
 {
     uintptr_t h = (uintptr_t)host;
     if (!range_ok(gva, len) || (h & PAGE_MASK) || !h || (prot & ~PTE_PROT_MASK))
         return APPINE_EINVAL;
-    for (uint64_t off = 0; off < len; off += APPINE_PAGE_SIZE) {
-        uintptr_t *slot = leaf_slot(mmu, gva + off, true);
-        if (!slot)
+    uint64_t end = gva + len;
+    for (uint64_t va = gva; va < end;) {
+        uintptr_t *table = leaf_table(mmu, va, true, NULL);
+        if (!table)
             return APPINE_ENOMEM;
-        store_entry(slot, (h + off) | prot);
+        for (uint64_t stop = leaf_end(va, end); va < stop; va += APPINE_PAGE_SIZE) {
+            uintptr_t *slot = &table[level_index(va, LEVELS - 1)];
+            if (!only_empty || !load_entry(slot))
+                store_entry(slot, (h + (va - gva)) | prot);
+        }
     }
     return APPINE_OK;
+}
+
+int appine_mmu_map(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot)
+{
+    return store_range(mmu, gva, host, len, prot, false);
+}
+
+int appine_mmu_fill(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len, uint32_t prot)
+{
+    return store_range(mmu, gva, host, len, prot, true);
 }
 
 int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len)
 {
     if (!range_ok(gva, len))
         return APPINE_EINVAL;
-    for (uint64_t off = 0; off < len;) {
-        uintptr_t *slot = leaf_slot(mmu, gva + off, false);
-        if (!slot) {
-            off = next_table(gva, off);
+    uint64_t end = gva + len;
+    for (uint64_t va = gva; va < end;) {
+        uintptr_t *table = leaf_table(mmu, va, false, &va);
+        if (!table)
             continue;
-        }
-        store_entry(slot, 0);
-        off += APPINE_PAGE_SIZE;
+        for (uint64_t stop = leaf_end(va, end); va < stop; va += APPINE_PAGE_SIZE)
+            store_entry(&table[level_index(va, LEVELS - 1)], 0);
     }
     return APPINE_OK;
 }
@@ -138,18 +171,61 @@ int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint3
 {
     if (!range_ok(gva, len) || (prot & ~PTE_PROT_MASK))
         return APPINE_EINVAL;
-    for (uint64_t off = 0; off < len;) {
-        uintptr_t *slot = leaf_slot(mmu, gva + off, false);
-        if (!slot) {
-            off = next_table(gva, off);
+    uint64_t end = gva + len;
+    for (uint64_t va = gva; va < end;) {
+        uintptr_t *table = leaf_table(mmu, va, false, &va);
+        if (!table)
             continue;
+        for (uint64_t stop = leaf_end(va, end); va < stop; va += APPINE_PAGE_SIZE) {
+            uintptr_t *slot = &table[level_index(va, LEVELS - 1)];
+            uintptr_t old = load_entry(slot);
+            if (old)
+                store_entry(slot, (old & ~(uintptr_t)PTE_PROT_MASK) | prot);
         }
-        uintptr_t old = load_entry(slot);
-        if (old)
-            store_entry(slot, (old & ~(uintptr_t)PTE_PROT_MASK) | prot);
-        off += APPINE_PAGE_SIZE;
     }
     return APPINE_OK;
+}
+
+int appine_mmu_move(struct appine_mmu *mmu, uint64_t from, uint64_t to, uint64_t len)
+{
+    if (!range_ok(from, len) || !range_ok(to, len) || (from < to + len && to < from + len))
+        return APPINE_EINVAL;
+    uint64_t end = from + len;
+    for (uint64_t va = from; va < end;) {
+        uintptr_t *table = leaf_table(mmu, va, false, &va);
+        if (!table)
+            continue;
+        for (uint64_t stop = leaf_end(va, end); va < stop; va += APPINE_PAGE_SIZE) {
+            uintptr_t *slot = &table[level_index(va, LEVELS - 1)];
+            uintptr_t v = load_entry(slot);
+            if (!v)
+                continue;
+            uint64_t dst = to + (va - from), unused;
+            uintptr_t *target = leaf_table(mmu, dst, true, &unused);
+            if (!target)
+                return APPINE_ENOMEM;
+            store_entry(&target[level_index(dst, LEVELS - 1)], v);
+            store_entry(slot, 0);
+        }
+    }
+    return APPINE_OK;
+}
+
+uint64_t appine_mmu_next_present(const struct appine_mmu *mmu, uint64_t gva, uint64_t end)
+{
+    uint64_t limit = UINT64_C(1) << APPINE_VA_BITS;
+    if (end > limit)
+        end = limit;
+    for (uint64_t va = gva & ~(uint64_t)PAGE_MASK; va < end;) {
+        uintptr_t *table = leaf_table(mmu, va, false, &va);
+        if (!table)
+            continue;
+        for (uint64_t stop = leaf_end(va, end); va < stop; va += APPINE_PAGE_SIZE) {
+            if (load_entry(&table[level_index(va, LEVELS - 1)]))
+                return va;
+        }
+    }
+    return end;
 }
 
 uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva)
@@ -169,7 +245,8 @@ uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva)
 void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot)
 {
     uintptr_t pte = appine_mmu_lookup_pte(mmu, gva);
-    if (!pte || (pte & required_prot) != required_prot)
+    /* 权限为 0 的表项（PROT_NONE 的页留着宿主页）不能访问，传 0 时也不算已映射 */
+    if (!(pte & PTE_PROT_MASK) || (pte & required_prot) != required_prot)
         return NULL;
     return (void *)((pte & ~(uintptr_t)PAGE_MASK) + (gva & PAGE_MASK));
 }

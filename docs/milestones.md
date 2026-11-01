@@ -187,6 +187,7 @@
 | [M9 之前：从外面转发进来的连接带上真实的客户端地址](rounds/176-real-client-address.md) | 2026-11-01 | 转发线程接受的外面设备的 TCP 连接按连接分一个 127.254.x.y、绑客户端的端口再连容器，登记下来；容器里 accept、getpeername、`/proc/net` 报告客户端真实的地址（原来是网关），回环地址来的照旧 |
 | [M9 之前：网络命名空间的 sysctl 补齐、UDP 也查有没有人绑](rounds/177-net-sysctls.md) | 2026-11-02 | `/proc/sys/net` 的 `core/`、`ipv4/`、`ipv6/`、`unix/` 下照 Linux 补齐（140 项加开机时的命名空间才有的 5 项，值按命名空间记、只记不起作用），docker 的 `--sysctl`、compose 的 `sysctls:` 能用了；新命名空间里绑了的 UDP socket 也登记，发往没人绑的端口的悄悄丢掉；修了先绑通配地址的 UDP socket connect 时端口变了；podman 的 iptables 驱动普查与原生一致 |
 | [M9 之前：测试提速，以及顺带找到的几个问题](rounds/178-test-speed.md) | 2026-11-02 | 全套从半个多小时降到约 9 分钟：差分测试并发跑（每个通道一份 APFS 克隆的仓库，长的组先开始），两个用例里白等的 100 秒和 10 秒去掉，colima 换成 8 CPU、8 GiB、40 GB 盘，LTP 的仓库放到虚拟机本地的卷上（virtiofs 上八路同时写 SQLite 等锁超时是 EIO）；修了端口映射释放之后对方才读到的回答换不回 guest 端口、`tcp_ehash_entries` 等按内存定的 sysctl 写死；fork 照 Linux 按合起来的 VMA 估算提交量，LTP 的 fork14 不再跑到 150 秒超时 |
+| [M9 之前：页表按需建立，AddressSanitizer 能用了](rounds/179-demand-page-tables.md) | 2026-11-02 | soft-MMU 的页表原来按页建，ASan 一启动映射约 14 TB 的影子内存，一次 mmap 要建约 28 GB 页表，持着 BKL、OOM killer 插不进来，宿主杀掉整个 App；现在 1 MB 以上的映射等访问时一次补一张叶子表，fork 借页、量驻留内存只看有表项的几段（`PROT_NONE` 留着表项、权限清零），ASan、LSan 能用，LTP 的 fork14 通过；顺带修了 fork、mremap 申请宿主内存时漏看 `MAP_NORESERVE`（有大的不计提交量映射的进程 fork 是 ENOMEM） |
 
 ## 测量条件
 

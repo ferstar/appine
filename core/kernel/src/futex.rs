@@ -207,7 +207,7 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     if !addr.is_multiple_of(4) {
         return;
     }
-    let Some(host) = mm.mmu().translate(addr, prot::READ | prot::WRITE) else {
+    let Some(host) = mm.translate(addr, prot::READ | prot::WRITE) else {
         return;
     };
     // SAFETY: 4 字节对齐、可写的 guest 内存，宿主内存由地址空间持有

@@ -1,6 +1,6 @@
 # M9 之前：测试提速，以及顺带找到的几个问题（2026-11-02）
 
-← [M9 之前：网络命名空间的 sysctl 补齐、UDP 也查有没有人绑（2026-11-02）](177-net-sysctls.md) · [索引](../milestones.md)
+← [M9 之前：网络命名空间的 sysctl 补齐、UDP 也查有没有人绑（2026-11-02）](177-net-sysctls.md) · [索引](../milestones.md) · [M9 之前：页表按需建立，AddressSanitizer 能用了（2026-11-02）](179-demand-page-tables.md) →
 
 每轮的全套测试要半个多小时：格式、clippy、单元测试、构建约 2 分钟，差分测试 Tier 0 约 17 分钟、Tier 1 约 8 分钟，LTP 约 5 分钟。上一个提交（343d100）先把 LTP 降到 2.5 分钟（最长的先跑、`LTP_TIMEOUT_MUL`、`LTP_RUNTIME_MUL`，见设计文档 §13.3）。这一轮做剩下的三件：差分测试并发跑、把 colima 虚拟机调大、查 LTP 里最慢的 fork14。三件都顺带找到了问题。
 
@@ -53,7 +53,7 @@
 
 **推迟项**：
 
-- soft-MMU 的页表按页建：映射多大，页表就有多大（每 GB 2 MB），mmap、fork 的开销都随映射的大小线性增长。fork14 那样一直映射到 16 TB 的程序仍然被 OOM 结束，Linux 上没碰过的映射不占页表。要么按需建表（缺页时再填，内核层读写 guest 内存的地方也要能触发），要么大的映射用 2 MB 的块表项（Tier 1 生成的代码在 TLB 未命中时内联走表，要一起改）。真实程序里很少见，不急。
+- soft-MMU 的页表按页建：映射多大，页表就有多大（每 GB 2 MB），mmap、fork 的开销都随映射的大小线性增长。fork14 那样一直映射到 16 TB 的程序仍然被 OOM 结束，Linux 上没碰过的映射不占页表。要么按需建表（缺页时再填，内核层读写 guest 内存的地方也要能触发），要么大的映射用 2 MB 的块表项（Tier 1 生成的代码在 TLB 未命中时内联走表，要一起改）。真实程序里很少见，不急。 → 按需建表了；AddressSanitizer 的影子内存就是这样，一次 mmap 带走整个 App（M9 之前：页表按需建立）
 - 提交量的估算只在 fork 时按合起来的 VMA 做；mmap、brk、mremap、mprotect 仍由宿主按单次申请判断（宿主的 `overcommit_memory` 不是 0 时与 guest 看到的不一样）。`VM_ACCOUNT` 只看现在的权限（Linux 可写过就一直计入）。`vm.overcommit_memory` 只有 0，写不了。
 - 端口映射释放之后只多换 10 秒：更晚才读到的回答报告宿主的端口。
 - CI（Linux）上差分测试仍然一组一组跑：runner 的 docker 存储不一定支持 reflink，每个通道真复制一份仓库要几 GB。

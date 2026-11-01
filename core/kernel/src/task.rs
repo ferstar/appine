@@ -719,6 +719,10 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             if cx.mm().mmu().translate(addr, need).is_some() {
                 return signal::deliver(cx, cpu, false);
             }
+            // 大的映射按需建表：第一次访问时补上表项，重新执行
+            if cx.mm().fault_in(addr, need) {
+                return signal::deliver(cx, cpu, false);
+            }
             let (ec, wnr) = match access {
                 Access::Exec => (EC_IABT_LOW, 0),
                 Access::Read => (EC_DABT_LOW, 0),

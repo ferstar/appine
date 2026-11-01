@@ -297,7 +297,7 @@ soft-MMU 翻译得到的是真实宿主指针，所以原子指令直接作用�
 
 - **每个进程一个 `mm`**（`core/kernel/src/mm.rs`），包含两部分：
   - VMA 表：按起始地址排序的 `BTreeMap`，实现 mmap/mprotect/munmap 语义，并用来生成 `/proc/<pid>/maps`、`smaps`。
-  - 页表（`core/engine/src/c/mmu.c`）：以 guest 虚拟页号为键的 4 级基数树，每级 512 项，覆盖 48 位地址空间；叶子表项是宿主页地址加 R/W/X 权限位。只有 TLB 未命中时，我们自己的 C 代码才会遍历它。
+  - 页表（`core/engine/src/c/mmu.c`）：以 guest 虚拟页号为键的 4 级基数树，每级 512 项，覆盖 48 位地址空间；叶子表项是宿主页地址加 R/W/X 权限位。只有 TLB 未命中时，我们自己的 C 代码才会遍历它。表项按需建立（§5.2），遍历一段范围时没有中间表的地方按缺的那一级整段跳过（一项覆盖 2 MB、1 GB 或 512 GB）。
 - **每个线程一个软件 TLB**：直接映射，4096 项（M7 从 512 项加大），每项 `{读 tag, 读 addend, 写 tag, 写 addend}`。
   - tag 存的是页号取反，0 表示无效，所以清零的内存就是空的 TLB，新线程不必逐项写入，没碰过的页不占内存。
   - 表项填写时记进一张位图，清空时只处理填过的项，所以 munmap 频繁的程序清空 TLB 也不贵。
@@ -314,7 +314,7 @@ cbnz x17, refill
 ldr  x0, [x27, x16]          // 宿主地址 = addend + guest 地址
 ```
 
-- **TLB 未命中**：查基数树（Tier 1 在代码缓存里的回填例程中查，Tier 0 在 C 里查）。查不到，或者权限不符，就交给内核层，由它给 guest 投递 SIGSEGV 或 SIGBUS。
+- **TLB 未命中**：查基数树（Tier 1 在代码缓存里的回填例程中查，Tier 0 在 C 里查）。查不到，或者权限不符，就交给内核层：还没建表的补上表项（§5.2 的按需建表）、写时复制的复制一份，重新执行；否则给 guest 投递 SIGSEGV 或 SIGBUS。
 - **TLB shootdown**：多个线程共享一个 `mm` 时，页表可以在被别的线程遍历的同时修改（表项用原子操作读写，中间表在 `mm` 销毁前不释放）。
   - 解除映射或降低权限之后，修改方递增 `mm` 的代数，打断正在执行 guest 代码的其他线程，等它们退出 guest 代码；每个线程重新进入 guest 代码之前比较代数，变了就刷新自己的 TLB。
   - 只增加权限时不刷新：TLB 里的旧表项只是少了权限，未命中时会重新填写。
@@ -335,8 +335,10 @@ ldr  x0, [x27, x16]          // 宿主地址 = addend + guest 地址
   - 只读的私有映射（程序和库的代码段）有可信版本（§4.2 的"翻译保留"）时，宿主映射由内核里所有地址空间共用（`mm::FileMaps`，最多 128 段）：同一个版本的同一段文件再映射时直接用它，宿主页表还在，不必重新映射、缺页，退出时也不必拆掉。用它的 VMA 与 fork 之后父子共用宿主映射时一样，要写（mprotect 加写权限、加载器清零 .bss 的开头）之前复制一份自己的。宿主上是只读映射，万一漏了复制会直接出错，不会悄悄改了别人的代码。宿主内存紧张时（`Machine::trim_memory`）清空。
   - `MAP_SHARED` 映射和 `read`/`write` 之间天然一致。
 - **共享内存**：进程间的 `MAP_SHARED` 匿名内存，就是让两张页表指向同一个宿主页。System V 共享内存段同理：段持有一段宿主内存，`shmat` 把它映射进地址空间。
-- **提交量**：宿主内存总是可读写，guest 的权限只记在页表里，所以宿主的内存提交量（overcommit 记账）按 Linux 的规则由 guest 的参数决定：只有可写的私有映射计入，`MAP_NORESERVE`、只读和 `PROT_NONE` 的映射用 `MAP_NORESERVE` 向宿主申请（M8）。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，计入的话在内存小的设备上直接失败。fork 时子进程的映射逐个向宿主申请，宿主看到的都是原来那么大的一段，而 Linux 的 `dup_mmap` 按 VMA 估算，相邻、标志相同的映射在 Linux 上已经合成一个：所以 fork 之前按合起来的算一遍（`Mm::commit_too_big`，`vm.overcommit_memory` 是 0 的估算），有一个计入的超过内存和交换区的总量就是 ENOMEM（[测试提速](rounds/178-test-speed.md)）。
-- **`PROT_NONE`** 的页不放进页表，mprotect 加上权限时再放：8 GB 的预留逐页写页表要占 16 MB。页表的解除映射和修改权限遇到没有中间表的地方整段跳过。
+- **提交量**：宿主内存总是可读写，guest 的权限只记在页表里，所以宿主的内存提交量（overcommit 记账）按 Linux 的规则由 guest 的参数决定：只有可写的私有映射计入，`MAP_NORESERVE`、只读和 `PROT_NONE` 的映射用 `MAP_NORESERVE` 向宿主申请（M8）。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，计入的话在内存小的设备上直接失败。fork 时子进程的映射逐个向宿主申请，宿主看到的都是原来那么大的一段，而 Linux 的 `dup_mmap` 按 VMA 估算，相邻、标志相同的映射在 Linux 上已经合成一个：所以 fork 之前按合起来的算一遍（`Mm::commit_too_big`，`vm.overcommit_memory` 是 0 的估算），有一个计入的超过内存和交换区的总量就是 ENOMEM（[测试提速](rounds/178-test-speed.md)）。子进程、mremap 扩展出来的部分、共用的私有文件映射复制的一份向宿主申请时同样照 guest 的参数，`MAP_NORESERVE` 的不计入：原来按"可写就计入"，有大的 `MAP_NORESERVE` 映射（ASan 的影子内存）的进程 fork 是 ENOMEM（[页表按需建立](rounds/179-demand-page-tables.md)）。
+- **按需建表**：1 MB 以内的映射建立时就建好页表项，大的等 guest 第一次访问（或者内核层第一次经由页表读写）时，把所在的那张叶子表（2 MB）里属于这个 VMA、在文件末尾之前、还没有表项的页一起建好，重新执行（`Mm::fault_in`）。页表随碰过的内存增长，不随映射的大小：ASan 映射十几 TB 的影子内存，原来逐页建表要几十 GB，持着 BKL 建、OOM killer 插不进来，宿主杀掉整个 App。文件的可执行映射照旧一次建好：翻译共用时按页表核对 guest 指令字（§4.2），没有表项的块要停放、第一次执行时再一页页恢复。
+  - fork 借页（§5.3）、量驻留内存（`/proc/<pid>/status`、smaps、`ru_maxrss`、OOM killer）只看有表项的叶子表连成的几段，不逐页查宿主。这要求私有匿名内存里有内容的页一定有表项：内核层直接写宿主内存（加载程序、`PTRACE_POKEDATA`）、调入（mlock、`MAP_POPULATE`）之后补上表项，mremap 把表项一起搬走，`PROT_NONE` 留着表项（下一条）。
+- **`PROT_NONE`**：新建的 `PROT_NONE` 映射不放进页表：8 GB 的预留逐页写页表要占 16 MB。mprotect 成 `PROT_NONE` 时表项留着、权限清零，宿主页里的内容还在；改回有权限时留着的改权限，其余的按需建。
 - **`MADV_DONTNEED`** 把私有匿名内存里整页的部分交给宿主的 `madvise` 回收，宿主页比 4K 大时两头不满一页的部分清零。Go、JVM、V8 的 GC 用它归还内存，全部清零反而会让这些页实际占用内存。
 - **超出 EOF 与截短**：
   - 文件映射超出 EOF 的整页不放进页表，访问它们时宿主 mmap 会产生 SIGBUS。guest 访问这些页，得到的是 guest 自己的 SIGBUS（`BUS_ADRERR`）；共享映射的文件后来变长了，就把新的内容映射进来，重新执行那条指令。
@@ -350,12 +352,12 @@ ldr  x0, [x27, x16]          // 宿主地址 = addend + guest 地址
   - 拥有者写、munmap、mremap 搬走、`MADV_DONTNEED` 借出的页之前，先让每个借用方复制自己的一份（要打断借用方正在执行 guest 代码的线程），再恢复写权限。拥有者的地址空间销毁（退出、exec）时页留给借用方（孤儿页，谁也不能再写），借用方持有那段宿主内存；没借出的页交还宿主。
   - 最后一个借用方还回来时，拥有者的页表项马上恢复成所在 VMA 的权限：shell fork 之后子进程马上 exec，父进程不必为此缺页。连续的页接成一段再改页表项，但段不跨 VMA：mprotect 切开的、相邻两次 mmap 的宿主内存也可能相连，权限却不同（[fork 之后还回的页按各自的权限恢复](rounds/63-returned-loans.md)）。缺页时页表项已经被别人改好（等 BKL 的时候借用方还回了页）就重新执行，与 Linux 一样。
   - mprotect 之后这些页仍然不能写；改权限期间先停住别的线程，免得它们在页表项拿到写权限、还没去掉之前写进借出的页。私有内存的 futex 键是宿主地址，所以 futex 落在借来的页上时先复制，否则写时复制之后等在旧键上的线程再也叫不醒。
-  - 宿主从没碰过的页（`/proc/self/pagemap`）一定是零，子进程用自己的。不能用 mincore，它把换出到 zram 的页也报告成"不在"。从来没有可写过（内核也没有写过）的匿名映射整段跳过，不逐页检查（M8：V8 为每块 wasm 内存预留 8 GB）。16 页以内的映射多半都碰过，不读 pagemap，全部借出（读 pagemap 在 fork 的持锁时间里占得不少）。
+  - 宿主从没碰过的页（`/proc/self/pagemap`）一定是零，子进程用自己的。不能用 mincore，它把换出到 zram 的页也报告成"不在"。从来没有可写过（内核也没有写过）的匿名映射整段跳过，不逐页检查（M8：V8 为每块 wasm 内存预留 8 GB）。16 页以内的映射多半都碰过，不读 pagemap，全部借出（读 pagemap 在 fork 的持锁时间里占得不少）。大的映射只读有表项的几段的 pagemap（§5.2 的按需建表），子进程的表项也只建借来的页，其余的按需建：fork 的开销随碰过的内存增长，不随映射的大小。
 - 可写的私有文件映射仍然逐页复制（全零的页跳过）。只读的私有文件映射直接共用宿主映射，mprotect 加写权限之前再复制一份（M4）。共享映射与子进程共用。栈下面预留的宿主内存（§5.4）在子进程里照样预留，子进程的栈接着就地增长。
 
 ### 5.4 guest 地址空间布局
 
-guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主地址空间布局的限制。软件页表的规模只和实际用到的页数有关，所以 V8 那种动辄预留几个 GB 的做法也能满足。
+guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主地址空间布局的限制。软件页表的规模只和碰过的页有关（`PROT_NONE` 的预留不建表，大的映射按需建表，§5.2），所以 V8 那种动辄预留几个 GB 的做法、ASan 十几 TB 的影子内存也能满足。不过每个 guest 映射在宿主上是一段同样大的映射：宿主的用户地址空间只有 39 位（512 GB）的设备上，ASan 的影子内存映射不出来。
 
 - 地址空间是 47 位。主线程栈的顶在 `1 << 47`，位置无关的主程序加载在 `0x5555_5555_0000`（地址空间的 2/3），mmap 自顶向下分配。
 - **主线程栈**与 Linux 一样按需向下增长（`core/kernel/src/mm.rs` 的 `grow_down`）：
@@ -736,7 +738,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 - **调试**：`APPINE_LOG=1` 输出本地调试日志；`APPINE_STRACE=1` 打印每个 syscall 的参数、结果、时间和耗时；`APPINE_PERF_MAP=1` 让 Tier 1 写 `/tmp/perf-<pid>.map` 供 perf 使用；`appine-run --stats` 打印翻译统计。内核层和引擎的 bug 在 debug 构建下默认直接终止宿主进程，`APPINE_ON_BUG=kill` 改成只结束撞上它的 guest 进程（release 构建的默认做法，§12 第 5 条）；debug 构建设置 `APPINE_TEST_HOOKS=1` 时，一个 Linux 编号之外的 syscall（`0xa991`）可以模拟这两种 bug，以及线程开始和退出、进程结束的每一步、定时器线程、宿主调用里的 panic，供端到端测试使用；Android 的 debug 版 App 是 release 构建，靠 `test-hooks` 特性带上它。放开 BKL 时借着内核对象的检查（§6）在 debug 构建、`appine-run` 和 debug 版 App 里都有；`scripts/difftest`、`scripts/ltp`、`scripts/survey` 都看 `appine-run` 的 stderr，内核层报告了内部错误（`appine: internal error`）时差分测试算失败、LTP 记为 `BUG`、普查在那一行标出条数。
 - 测试分为五层：
   1. **指令级 lockstep**：用宿主 CPU 当标准答案。生成随机指令和随机寄存器值，分别原生执行和在解释器/DBT 中执行，逐条比对结果。这同时也是对解码器的 fuzz。被测的 guest 地址和原生一侧的宿主地址相同，同样的内容在两处都有，所以访存用错了 addend（比如取错表项而没有比较 tag）它发现不了，这类错误靠差分测试和真实程序。
-  2. **LTP 的 syscall 测试**：`scripts/build-ltp` 在 `alpine` 容器里原生编译，`scripts/ltp` 每个测试起一个新的 `appine-run`，在本地运行，不在 CI 里。结果每行带耗时，记在 `target/ltp/durations.txt` 里（单独重跑时只更新跑过的），下一次按它最长的先跑，长的测试不在最后拖尾。`LTP_TIMEOUT_MUL=5`：它也乘在 `TST_RETRY_FUNC` 的退避上限上，原来的 20 倍让一直失败的系统调用（bpf 的那几个测试）每个重试 33 秒。`LTP_RUNTIME_MUL=0.1`：跑满规定时长的竞争测试（inotify09、timerfd_settime02 等，fuzzy sync，找的是 Linux 自己的竞争）只跑十分之一。8 路并发全量从约 5 分钟降到 2.5 分钟，结果相同。在 `scripts/dev` 的容器里仓库放在虚拟机本地的 docker 卷上（`/ltp/store`）：macOS 上 `target/` 经由 virtiofs，八路同时写同一个仓库的 SQLite 时等写锁超过 10 秒的操作是 EIO；放在卷上之后全量 1 分钟（[测试提速](rounds/178-test-speed.md)）。fork14 每次多映射 1 GB 再 fork，一直到 16 TB：原来 appine 里 fork 总是成功、子进程的页表越建越大，要 150 秒的超时；fork 按合起来的 VMA 估算提交量之后与原生一样很快就失败，剩下的映射本身（soft-MMU 的页表每 GB 2 MB）两秒左右撞到 App 的内存上限被结束（[测试提速](rounds/178-test-speed.md)）。目前 1552 个里通过 1010 个左右（第 144 轮；上下几个是[已知的偶发失败](milestones.md#已知的偶发失败)），剩下的失败见 [M6 结果](rounds/08-m6.md)和之后几轮。sigtimedwait01、sigwaitinfo01 默认跳过（`-a` 照常跑）：musl 的 sigtimedwait 遇到 EINTR 自己重试，它们的第一项每次都跑满 10 分钟超时，原生的 Alpine 上一样（[兼容性补漏](rounds/17-compat.md)）。原计划中的 musl libc-test 没有接入。
+  2. **LTP 的 syscall 测试**：`scripts/build-ltp` 在 `alpine` 容器里原生编译，`scripts/ltp` 每个测试起一个新的 `appine-run`，在本地运行，不在 CI 里。结果每行带耗时，记在 `target/ltp/durations.txt` 里（单独重跑时只更新跑过的），下一次按它最长的先跑，长的测试不在最后拖尾。`LTP_TIMEOUT_MUL=5`：它也乘在 `TST_RETRY_FUNC` 的退避上限上，原来的 20 倍让一直失败的系统调用（bpf 的那几个测试）每个重试 33 秒。`LTP_RUNTIME_MUL=0.1`：跑满规定时长的竞争测试（inotify09、timerfd_settime02 等，fuzzy sync，找的是 Linux 自己的竞争）只跑十分之一。8 路并发全量从约 5 分钟降到 2.5 分钟，结果相同。在 `scripts/dev` 的容器里仓库放在虚拟机本地的 docker 卷上（`/ltp/store`）：macOS 上 `target/` 经由 virtiofs，八路同时写同一个仓库的 SQLite 时等写锁超过 10 秒的操作是 EIO；放在卷上之后全量 1 分钟（[测试提速](rounds/178-test-speed.md)）。fork14 每次多映射 1 GB 再 fork，一直到 16 TB：原来 appine 里 fork 总是成功、子进程的页表越建越大，要 150 秒的超时；fork 按合起来的 VMA 估算提交量之后与原生一样很快就失败（[测试提速](rounds/178-test-speed.md)），页表按需建立之后映射本身也不占页表，0.6 秒通过（[页表按需建立](rounds/179-demand-page-tables.md)）。目前 1552 个里通过 1010 个左右（第 144 轮；上下几个是[已知的偶发失败](milestones.md#已知的偶发失败)），剩下的失败见 [M6 结果](rounds/08-m6.md)和之后几轮。sigtimedwait01、sigwaitinfo01 默认跳过（`-a` 照常跑）：musl 的 sigtimedwait 遇到 EINTR 自己重试，它们的第一项每次都跑满 10 分钟超时，原生的 Alpine 上一样（[兼容性补漏](rounds/17-compat.md)）。原计划中的 musl libc-test 没有接入。
   3. **端到端场景**：`hosts/cli/tests/rootfs_programs.rs` 里的 busybox、交互式 shell、`apk add`、`git clone` 等用例；从源码编译真实项目（Lua、SQLite）手工测量。`scripts/survey`（[负载普查](rounds/62-workload-survey.md)）在 appine 里跑常见的服务和工具（`tests/survey/`：sshd、tmux、postgres、redis、mariadb、Rust、.NET 等），收集失败和未实现的 syscall；`tests/survey/glibc/` 在 Debian、Ubuntu 的仓库里跑 glibc 的程序（[glibc 发行版的探测](rounds/69-glibc-probe.md)），`tests/survey/suites/` 跑语言自带的测试集和大项目，`tests/survey/ai/` 跑 AI 编程 CLI（模拟服务冒充模型 API，让它们调用工具，[AI 编程 CLI](rounds/103-ai-cli-survey.md)），`-n` 在由仓库导出的原生镜像里跑同样的负载对照（[第二轮普查](rounds/70-survey-suites.md)）；输出要人看，要联网安装约 1 GB 软件包，不在 CI 里。
   4. **差分测试**：同一条命令分别在 appine 和真正的 arm64 Linux 中运行，比对输出；信号测试比对 `ucontext` 的内容。`scripts/difftest`（M7）先在 appine 里把测试仓库的根文件系统打包、导入成 docker 镜像，再把 `tests/diff/` 下的每个脚本分别交给 docker 容器和 `appine-run` 执行，比对输出和退出码（脚本整个作为 `sh -c` 的一个参数，不能超过 128 KB，超过时直接报失败）。`appine-run` 也在容器里运行（macOS 上经由 `scripts/dev`，Linux 宿主上放进一个 Debian 镜像），两边看到同一种网络，路由、接口、地址类的用例才比得了；转储怎么分成数据报、新内核加的 securebits 这类随内核版本变的地方，用例不比。macOS 上默认 4 组同时跑（`-j`，Linux 宿主上默认 1 组，CI 照旧）：各组的脚本都往 guest 的 `/tmp` 里写同名的文件，所以每个并发通道用一份仓库的克隆（APFS 的 clonefile，写时复制），上次耗时长的组先开始；两个执行层各从约 17、8 分钟降到 4 分钟、1 分多钟（[测试提速](rounds/178-test-speed.md)）。
   5. **Android 专项**：用 arm64 Android 模拟器跑 instrumentation 测试（`MachineTest`），覆盖 4K 和 16K 页，包括用测试钩子在 App 进程里模拟内核层和引擎的 bug。GitHub 的 runner 没有 KVM，这一层在本地运行，CI 只构建 APK 并运行 lint。原计划核心库另外提供一个"模拟 Android 限制"的开关，在 Linux 上提前暴露问题，还没有做。
