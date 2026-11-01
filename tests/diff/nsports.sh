@@ -4,7 +4,8 @@
 # 一个端口（监听通配地址、从不 accept，像 podman、docker-proxy 那样）时 A 照样绑得上同一个
 # 端口，反过来也一样，TCP、UDP；连到 A 上没有监听的端口是 ECONNREFUSED（外层的监听不会接走）；
 # 只绑 127.0.0.1、只绑 eth0 地址的服务从别的地址连不上；A 自己的冲突照常是 EADDRINUSE，
-# SO_REUSEPORT 照常可以；/proc/net/tcp 里是 guest 的端口。原生一侧是特权容器。
+# SO_REUSEPORT 照常可以；/proc/net/tcp 里是 guest 的端口；服务回完就退出、之后才读到的
+# 回答，来源照样是 guest 的端口。原生一侧是特权容器。
 exec 2>&1
 cd /tmp
 cat > srv.py <<'PY'
@@ -34,9 +35,11 @@ else:
         s.sendto(f"{data.decode()}: server sees {peer[0]}".encode(), peer)
 PY
 cat > cli.py <<'PY'
-import errno, socket, sys
-# cli.py tcp|udp <地址> <端口> <消息>
+import errno, os, socket, sys, time
+# cli.py tcp|udp <地址> <端口> <消息> [<文件>]：给了文件的，UDP 发出之后等它出现（服务端
+# 已经退出）才读回答
 kind, addr, port, msg = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+late = sys.argv[5] if len(sys.argv) > 5 else None
 fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
 try:
     if kind == "tcp":
@@ -49,6 +52,10 @@ try:
         c = socket.socket(fam, socket.SOCK_DGRAM)
         c.settimeout(5)
         c.sendto(msg.encode(), (addr, port))
+        for _ in range(100 if late else 0):
+            if os.path.exists(late):
+                break
+            time.sleep(0.1)
         data, peer = c.recvfrom(200)
         print(f"{data.decode()}; reply from {peer[0]}:{peer[1]}")
 except OSError as e:
@@ -118,6 +125,12 @@ hold udp 7002
 serve "$A" udp 0.0.0.0 7002 1
 nsenter -t "$B" -n python3 cli.py udp 10.70.0.2 7002 b-to-a-udp
 served
+echo "== UDP: A's server has exited before B reads the reply"
+rm -f /tmp/exited
+serve "$A" udp 0.0.0.0 7012 1
+nsenter -t "$B" -n python3 cli.py udp 10.70.0.2 7012 b-to-a-late /tmp/exited &
+late=$!
+served; touch /tmp/exited; wait $late
 echo "== nothing listening in A"
 hold tcp 7003
 nsenter -t "$B" -n python3 cli.py tcp 10.70.0.2 7003 b-to-a-7003

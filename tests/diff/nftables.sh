@@ -35,9 +35,11 @@ else:
         s.sendto(f"{data.decode()}: server sees {peer[0]}".encode(), peer)
 PY
 cat > cli.py <<'PY'
-import errno, socket, sys
-# cli.py tcp|udp|udpconn <地址> <端口> <消息>
+import errno, os, socket, sys, time
+# cli.py tcp|udp|udpconn <地址> <端口> <消息> [<文件>]：给了文件的，UDP 发出之后等它出现
+# （服务端已经退出）才读回答
 kind, addr, port, msg = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+late = sys.argv[5] if len(sys.argv) > 5 else None
 try:
     if kind == "tcp":
         c = socket.socket()
@@ -57,6 +59,10 @@ try:
             c.send(msg.encode())
         else:
             c.sendto(msg.encode(), (addr, port))
+        for _ in range(100 if late else 0):
+            if os.path.exists(late):
+                break
+            time.sleep(0.1)
         data, peer = c.recvfrom(200)
         print(f"{data.decode()}; reply from {peer[0]}:{peer[1]}")
 except OSError as e:
@@ -153,6 +159,12 @@ python3 /tmp/cli.py udp 10.70.0.1 8080 udp-8080
 serve tcp 127.0.0.1 9001 1
 python3 /tmp/cli.py tcp 127.0.0.1 8081 redirect-8081
 served
+# 服务端回完就退出，客户端之后才读到回答：来源照样是 8080
+rm -f /tmp/exited
+serve udp 10.70.0.1 9002 1
+python3 /tmp/cli.py udp 10.70.0.1 8080 udp-8080-late /tmp/exited &
+late=$!
+served; touch /tmp/exited; wait $late
 python3 /tmp/cli.py tcp 10.70.0.1 8082 accepted-8082
 python3 /tmp/cli.py tcp 10.1.2.3 8080 not-local
 echo "== errors"

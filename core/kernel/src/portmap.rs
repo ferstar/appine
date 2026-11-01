@@ -33,6 +33,12 @@ const MAX_EVENTS: usize = 32;
 /// 60 秒）长。
 pub const STICKY: Duration = Duration::from_secs(120);
 
+/// 映射全部释放之后，宿主端口还换回 guest 端口多久。Linux 在数据包到达时换算，这里在对方
+/// recvfrom、accept 时才换：服务回完一个数据报就关掉 socket（`srv.py` 那样），回答还在
+/// 对方的接收队列里，对方读到时来源照样是 guest 的端口。宿主在这段时间里把这个端口分给
+/// 同一个命名空间里别的、没有映射的 socket 的可能很小（宿主随机选临时端口）。
+pub const LINGER: Duration = Duration::from_secs(10);
+
 /// 登记表的键：网络命名空间（开机时的是 0，别的是 `NetNs` 的地址）、协议、guest 的端口。
 type Key = (usize, i32, u16);
 
@@ -57,8 +63,9 @@ pub struct PortMap {
     /// 0 表示不映射：绑低端口照旧交给宿主（Android 上是 EACCES）。
     pub offset: u16,
     entries: HashMap<Key, Entry>,
-    /// 宿主端口 → guest 端口（同样的键，端口是宿主上的）。
-    by_host: HashMap<Key, u16>,
+    /// 宿主端口 → guest 端口（同样的键，端口是宿主上的），全部释放了的带着释放的时刻
+    /// （[`LINGER`]）。
+    by_host: HashMap<Key, (u16, Option<Instant>)>,
     /// 全部释放了的映射：宿主端口和释放的时刻（[`STICKY`]）。
     released: HashMap<Key, (u16, Instant)>,
     /// 报告过的（guest 端口, 宿主端口）。
@@ -82,9 +89,15 @@ impl Drop for Lease {
         if e.refs == 0 {
             let host = e.host;
             m.entries.remove(&self.key);
-            let (ns, proto, _) = self.key;
-            m.by_host.remove(&(ns, proto, host));
+            let (ns, proto, port) = self.key;
             let now = Instant::now();
+            m.by_host
+                .retain(|_, (_, t)| t.is_none_or(|t| now.duration_since(t) < LINGER));
+            if let Some(v) = m.by_host.get_mut(&(ns, proto, host))
+                && v.0 == port
+            {
+                v.1 = Some(now);
+            }
             m.released
                 .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
             m.released.insert(self.key, (host, now));
@@ -114,9 +127,12 @@ impl PortMap {
         self.entries.get(&(ns, proto, port)).map(|e| e.host)
     }
 
-    /// 宿主端口是映射来的时，guest 看到的端口。
+    /// 宿主端口是映射来的时（包括刚释放的，[`LINGER`]），guest 看到的端口。
     pub fn guest_port(&self, ns: usize, proto: i32, host: u16) -> Option<u16> {
-        self.by_host.get(&(ns, proto, host)).copied()
+        self.by_host
+            .get(&(ns, proto, host))
+            .filter(|(_, t)| t.is_none_or(|t| t.elapsed() < LINGER))
+            .map(|&(g, _)| g)
     }
 
     /// 记下一次在非回环地址上的监听：（guest 端口, 宿主端口）第一次出现时排进事件队列。
@@ -166,7 +182,7 @@ pub fn bind(
         let mut m = map.borrow_mut();
         m.released.remove(&key);
         m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
-        m.by_host.insert((ns, proto, host), port);
+        m.by_host.insert((ns, proto, host), (port, None));
         Lease {
             map: map.clone(),
             key,
@@ -230,7 +246,7 @@ pub fn bind_any(
     let lease = |map: &Rc<RefCell<PortMap>>, host: u16| {
         let mut m = map.borrow_mut();
         m.entries.entry(key).or_insert(Entry { host, refs: 0 }).refs += 1;
-        m.by_host.insert((ns, proto, host), port);
+        m.by_host.insert((ns, proto, host), (port, None));
         Lease {
             map: map.clone(),
             key,
@@ -356,6 +372,7 @@ mod tests {
         // 最后一个租约归还之后登记就没了，再绑重新分配
         drop((a, b));
         assert_eq!(m.borrow().host_port(7, TCP, 8080), None);
+        assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(8080));
         let (h4, _d) = bind_any(
             &m,
             7,
@@ -369,6 +386,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(h4, 43000);
+        // 宿主把刚释放的端口分给了另一个映射：换成新的
+        let (_, _e) = bind_any(&m, 7, TCP, 9090, |_| Ok(()), || Some(41000)).unwrap();
+        assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(9090));
     }
 
     #[test]
@@ -395,6 +415,9 @@ mod tests {
         assert_eq!(m.borrow().host_port(0, TCP, 22), Some(10022));
         drop(b);
         assert_eq!(m.borrow().host_port(0, TCP, 22), None);
+        // 宿主端口还换得回 guest 的端口一会儿（对方还没读到的回答）
+        assert_eq!(m.borrow().guest_port(0, TCP, 10022), Some(22));
+        m.borrow_mut().by_host.get_mut(&(0, TCP, 10022)).unwrap().1 = Some(Instant::now() - LINGER);
         assert_eq!(m.borrow().guest_port(0, TCP, 10022), None);
         // 刚释放的端口再绑仍用原来的宿主端口，被占着（TIME_WAIT）就是 EADDRINUSE，不换
         assert_eq!(
