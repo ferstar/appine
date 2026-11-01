@@ -402,6 +402,7 @@ pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
     ("ipv4/tcp_early_retrans", "3", 0o644, false),
     ("ipv4/tcp_ecn", "2", 0o644, false),
     ("ipv4/tcp_ecn_fallback", "1", 0o644, false),
+    // 按内存算（memory_default），这里的是 4 GB 内存时的
     ("ipv4/tcp_ehash_entries", "-32768", 0o444, false),
     ("ipv4/tcp_fack", "0", 0o644, false),
     ("ipv4/tcp_fastopen", "1", 0o644, false),
@@ -422,6 +423,7 @@ pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
     ("ipv4/tcp_l3mdev_accept", "0", 0o644, false),
     ("ipv4/tcp_limit_output_bytes", "1048576", 0o644, false),
     ("ipv4/tcp_max_reordering", "300", 0o644, false),
+    // 这两项也按内存算
     ("ipv4/tcp_max_syn_backlog", "256", 0o644, false),
     ("ipv4/tcp_max_tw_buckets", "16384", 0o644, false),
     ("ipv4/tcp_migrate_req", "0", 0o644, false),
@@ -507,9 +509,38 @@ pub(crate) fn sysctl(
 
 /// 读 [`SYSCTLS`] 里的一项：写过的值或者默认值。
 pub(crate) fn sysctl_read(conf: &NetConf, path: &'static str) -> String {
-    let dflt = sysctl(path.as_bytes(), true).map_or("", |e| e.1);
-    let v = conf.sysctls.get(path).map_or(dflt, String::as_str);
-    format!("{v}\n")
+    if let Some(v) = conf.sysctls.get(path) {
+        return format!("{v}\n");
+    }
+    let dflt = memory_default(path, appine_hal::memory_info().0);
+    let dflt = dflt
+        .as_deref()
+        .unwrap_or_else(|| sysctl(path.as_bytes(), true).map_or("", |e| e.1));
+    format!("{dflt}\n")
+}
+
+/// 按内存大小定的默认值：TCP 连接表的桶数（[`ehash_entries`]）`cnt`，新的命名空间里
+/// `tcp_ehash_entries` 是 -cnt（与开机时的命名空间共用一张表），`tcp_max_tw_buckets` 是
+/// cnt / 2，`tcp_max_syn_backlog` 是 cnt / 128、至少 128（`tcp_sk_init`）。`total` 是内存
+/// 总量（字节），0 是不知道（用表里 4 GB 时的值）。
+fn memory_default(path: &str, total: u64) -> Option<String> {
+    let cnt = ehash_entries(total)?;
+    match path {
+        "ipv4/tcp_ehash_entries" => Some(format!("-{cnt}")),
+        "ipv4/tcp_max_tw_buckets" => Some((cnt / 2).to_string()),
+        "ipv4/tcp_max_syn_backlog" => Some((cnt / 128).max(128).to_string()),
+        _ => None,
+    }
+}
+
+/// Linux 的 TCP 连接表有多少个桶（`tcp_init` 调 `alloc_large_system_hash`）：内存按 MB 向上
+/// 取整，每 128 KB 一个，取 2 的幂，不超过 512 K 个。内存 4 GB 时是 32768，8 GB 时是 65536。
+fn ehash_entries(total: u64) -> Option<u64> {
+    if total == 0 {
+        return None;
+    }
+    let mb = total.div_ceil(1 << 20);
+    Some(((mb << 20) >> 17).next_power_of_two().min(512 * 1024))
 }
 
 /// 写 [`SYSCTLS`] 里的一项：整数的按默认值的个数，写几个改前几个、多出来的不看
@@ -642,5 +673,23 @@ mod tests {
         assert_eq!(parse_ping_group(b"0 2147483647"), Ok((0, 2_147_483_647)));
         assert_eq!(parse_ping_group(b"5 2"), Ok((1, 0)));
         assert_eq!(show_secret(None), Err(Errno::EIO));
+    }
+
+    /// 按内存定的几项：colima 的 4 GB、8 GB 虚拟机上原生的值，16 GB，封顶。
+    #[test]
+    fn memory_sized_defaults() {
+        let vm4 = 3_999_216 * 1024;
+        let vm8 = 8_307_478_528;
+        assert_eq!(ehash_entries(vm4), Some(32768));
+        assert_eq!(ehash_entries(vm8), Some(65536));
+        assert_eq!(ehash_entries(16 << 30), Some(131072));
+        assert_eq!(ehash_entries(1 << 40), Some(512 * 1024));
+        assert_eq!(ehash_entries(0), None);
+        let d = |p, t| memory_default(p, t).unwrap();
+        assert_eq!(d("ipv4/tcp_ehash_entries", vm8), "-65536");
+        assert_eq!(d("ipv4/tcp_max_syn_backlog", vm8), "512");
+        assert_eq!(d("ipv4/tcp_max_syn_backlog", 1 << 30), "128");
+        assert_eq!(d("ipv4/tcp_max_tw_buckets", vm4), "16384");
+        assert_eq!(memory_default("ipv4/tcp_fin_timeout", vm4), None);
     }
 }
