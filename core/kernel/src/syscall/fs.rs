@@ -2731,10 +2731,11 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
             _ => {
                 writable_dir(&store_vfs, (mnt, dir))?;
                 may_delete(store, &cred, dir, name)?;
-                not_mount_point(&store_vfs, dir, name)?;
+                let gone = not_mount_point(cx, &store_vfs, dir, name)?;
                 let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
                 store.rmdir(dir, name)?;
                 tmpfs_removed(&store_vfs, tmpfs);
+                detach_points(cx, &store_vfs, gone, (dir, name));
             }
         }
         if let Some(ino) = victim {
@@ -2757,10 +2758,11 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
             });
         }
         may_delete(store, &cred, dir, name)?;
-        not_mount_point(&store_vfs, dir, name)?;
+        let gone = not_mount_point(cx, &store_vfs, dir, name)?;
         let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
         store.unlink(dir, name)?;
         tmpfs_removed(&store_vfs, tmpfs);
+        detach_points(cx, &store_vfs, gone, (dir, name));
         if let Some(ino) = victim {
             unlinked_events(cx, store, ino, (dir, name));
             inotify::dir_event(cx.kr(), dir, name, inotify::IN_DELETE, 0);
@@ -2769,12 +2771,22 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
     Ok(())
 }
 
-/// 删除、改名之前：目录 `dir` 里的 `name` 上（经由哪个挂载都算）挂着东西时是 EBUSY
-/// （Linux 的 `is_local_mountpoint`）。
-fn not_mount_point(vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<(), Errno> {
+/// 删除、改名之前：目录 `dir` 里的 `name` 上挂着调用者的命名空间里的挂载时是 EBUSY
+/// （Linux 的 `is_local_mountpoint`）。返回它的 inode，删掉之后用来卸下别的命名空间里挂在
+/// 上面的（[`detach_points`]）。
+fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
     match vfs.store().lookup(dir, name)? {
-        Some(ino) if vfs.is_store_point(ino) => Err(Errno::EBUSY),
-        _ => Ok(()),
+        Some(ino) if vfs.is_store_point((ino, dir, name), cx.mnt_ns()) => Err(Errno::EBUSY),
+        found => Ok(found),
+    }
+}
+
+/// 删掉了目录 `dir` 里的 `name`（原来是 `ino`）：别的命名空间里挂在它上面的挂载卸下
+/// （Linux 的 vfs_rmdir、vfs_unlink、vfs_rename 里的 `detach_mounts`）。
+fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
+    if let Some(ino) = ino {
+        vfs.detach_store_point((ino, dir, name));
+        cx.shared.fast_changed();
     }
 }
 
@@ -2905,8 +2917,8 @@ pub(super) fn renameat2(
         (new_dir, new_name),
         exchange,
     )?;
-    not_mount_point(&vfs, old_dir, old_name)?;
-    not_mount_point(&vfs, new_dir, new_name)?;
+    not_mount_point(cx, &vfs, old_dir, old_name)?;
+    let overwritten = not_mount_point(cx, &vfs, new_dir, new_name)?;
     // 有 inotify 监视时先记下两边的 inode 和它们是不是目录
     let entry = |dir, name| -> Result<Option<(Ino, u32)>, Errno> {
         match vfs.store().lookup(dir, name)? {
@@ -2930,6 +2942,7 @@ pub(super) fn renameat2(
         }
         _ => None,
     };
+    let moving = vfs.store().lookup(old_dir, old_name)?;
     vfs.store().rename(
         old_dir,
         old_name,
@@ -2939,6 +2952,10 @@ pub(super) fn renameat2(
         exchange,
     )?;
     tmpfs_removed(&vfs, replaced);
+    // 覆盖掉的目标上别的命名空间里的挂载卸下
+    if !exchange && overwritten != moving {
+        detach_points(cx, &vfs, overwritten, (new_dir, new_name));
+    }
     // 经由移动的名字打开着的文件跟着改名
     let k = cx.kr();
     let store = vfs.store();

@@ -12,6 +12,7 @@
 //! 别的文件系统与没有编进内核的一样是 ENODEV。
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use super::fs::{AT_FDCWD, lookup_at, start_dir};
 use super::{SysResult, get, read_path};
@@ -542,20 +543,311 @@ fn move_mount(
 ) -> SysResult {
     let source = source.filter(|s| !s.is_empty()).ok_or(Errno::EINVAL)?;
     let src = lookup_at(cx, AT_FDCWD, source, true)?;
+    move_tree(cx, &src, (target, at))
+}
+
+/// 把以 `src` 为根的挂载挪到 `target` 上（Linux 的 `do_move_mount`，`MS_MOVE` 和 move_mount
+/// 共用）：`src` 要是一个挂载的根，挂在调用者的命名空间里，或者是 open_tree 复制出来、还
+/// 没接上的那棵树的根（接上，树进调用者的命名空间）。目标要在调用者的命名空间里，与 `src`
+/// 同是目录或者同不是（EINVAL），不能在要挪的挂载里面（ELOOP）。
+fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) -> SysResult {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
-    check_mnt(cx, &vfs, target.mnt())?;
     // 挂载树的根也挂在（看不到的 rootfs）上，挪它时目标总在它里面，是下面的 ELOOP
-    let id = vfs.mount_root(&src).ok_or(Errno::EINVAL)?;
-    check_mnt(cx, &vfs, id)?;
-    if vfs.is_dir(&view, &src)? != vfs.is_dir(&view, &target)? {
+    let id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
+    let anon = vfs
+        .mount_ns(id)
+        .and_then(|ns| vfs.find_ns(ns))
+        .is_some_and(|ns| ns.anon)
+        && vfs.mount(id).is_some_and(|m| m.point.is_none());
+    if !anon {
+        check_mnt(cx, &vfs, id)?;
+    }
+    check_mnt(cx, &vfs, target.mnt())?;
+    if vfs.is_dir(&view, src)? != vfs.is_dir(&view, &target)? {
         return Err(Errno::EINVAL);
     }
     may_mount_on(&target)?;
-    if vfs.is_under(&view, &target, &src) {
-        return Err(Errno::ELOOP);
+    if anon {
+        vfs.attach_tree(id, (target, at), cx.mnt_ns());
+    } else {
+        if vfs.is_under(&view, &target, src) {
+            return Err(Errno::ELOOP);
+        }
+        vfs.move_mount(id, Some((target, at)));
     }
-    vfs.move_mount(id, Some((target, at)));
+    cx.shared.fast_changed();
+    Ok(0)
+}
+
+// ---- 新的挂载接口（open_tree、move_mount、mount_setattr） ----
+
+const OPEN_TREE_CLONE: u32 = 1;
+const OPEN_TREE_CLOEXEC: u32 = crate::fd::oflags::O_CLOEXEC;
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const AT_NO_AUTOMOUNT: u32 = 0x800;
+const AT_EMPTY_PATH: u32 = 0x1000;
+const AT_RECURSIVE: u32 = 0x8000;
+
+/// move_mount 的标志（`MOVE_MOUNT_*`）。
+mod move_flags {
+    pub const F_SYMLINKS: u32 = 1;
+    pub const F_EMPTY_PATH: u32 = 4;
+    pub const T_SYMLINKS: u32 = 0x10;
+    pub const T_EMPTY_PATH: u32 = 0x40;
+    pub const SET_GROUP: u32 = 0x100;
+    /// 6.1 认识的全部（`MOVE_MOUNT__MASK`）。
+    pub const MASK: u32 = 0x177;
+}
+
+/// 挂载的属性（`MOUNT_ATTR_*`）。
+mod attr {
+    pub const RDONLY: u64 = 1;
+    pub const NOSUID: u64 = 2;
+    pub const NODEV: u64 = 4;
+    pub const NOEXEC: u64 = 8;
+    pub const ATIME: u64 = 0x70;
+    pub const NOATIME: u64 = 0x10;
+    pub const STRICTATIME: u64 = 0x20;
+    pub const NODIRATIME: u64 = 0x80;
+    pub const IDMAP: u64 = 0x10_0000;
+    pub const NOSYMFOLLOW: u64 = 0x20_0000;
+    pub const VALID: u64 =
+        RDONLY | NOSUID | NODEV | NOEXEC | ATIME | NODIRATIME | IDMAP | NOSYMFOLLOW;
+}
+
+/// 新挂载接口的路径参数：从 `dirfd` 起解析 `path`（`empty` 时可以是空的，指 `dirfd` 本身），
+/// 越过挂载点到最上面的挂载。返回节点和找到它的目录项。
+fn walk_at(
+    cx: &Cx<'_>,
+    (dirfd, path): (i32, u64),
+    empty: bool,
+    follow: bool,
+) -> Result<(Node, Option<Dentry>), Errno> {
+    let path = cx.mm().read_cstr(path, super::PATH_MAX - 1)?;
+    let vfs = cx.vfs()?;
+    let (node, at) = if path.is_empty() {
+        if !empty {
+            return Err(Errno::ENOENT);
+        }
+        let node = if dirfd == AT_FDCWD {
+            cx.cwd()
+        } else {
+            cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF)?
+        };
+        (node, None)
+    } else {
+        let start = start_dir(cx, dirfd, &path)?;
+        vfs.walk(
+            &cx.view(&vfs),
+            &cx.cred(),
+            &cx.root(),
+            &start,
+            &path,
+            follow,
+        )?
+    };
+    let top = vfs.mounted(node.clone());
+    let at = at.filter(|_| top == node);
+    Ok((top, at))
+}
+
+/// open_tree(2)（Linux 6.1 的 `open_tree`、`open_detached_copy`）：不带 `OPEN_TREE_CLONE`
+/// 时就是 O_PATH 的 fd；带的要 `CAP_SYS_ADMIN`，在一个匿名的挂载命名空间里 bind 一份那个
+/// 路径（`AT_RECURSIVE` 连同下面的挂载），不挂在任何地方，fd 指向它的根，由 move_mount 接上，
+/// 没接上就关掉的拆掉。源要在调用者的命名空间里挂着（EINVAL）。
+pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
+    let valid = AT_EMPTY_PATH
+        | AT_NO_AUTOMOUNT
+        | AT_RECURSIVE
+        | AT_SYMLINK_NOFOLLOW
+        | OPEN_TREE_CLONE
+        | OPEN_TREE_CLOEXEC;
+    if flags & !valid != 0 || flags & (AT_RECURSIVE | OPEN_TREE_CLONE) == AT_RECURSIVE {
+        return Err(Errno::EINVAL);
+    }
+    let clone = flags & OPEN_TREE_CLONE != 0;
+    if clone && !may_mount(cx) {
+        return Err(Errno::EPERM);
+    }
+    let (node, found) = walk_at(
+        cx,
+        (dirfd, path),
+        flags & AT_EMPTY_PATH != 0,
+        flags & AT_SYMLINK_NOFOLLOW == 0,
+    )?;
+    let o_path = crate::fd::oflags::O_PATH;
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    let file = if clone {
+        check_mnt(cx, &vfs, node.mnt())?;
+        let dir = vfs.is_dir(&view, &node)?;
+        let ns = vfs.anon_ns(cx.t.fs.borrow().mnt_ns.owner.clone());
+        // 挂上之前先记下源里面的挂载（与 bind 一样）
+        let inside = if flags & AT_RECURSIVE != 0 {
+            vfs.mounts()
+        } else {
+            Vec::new()
+        };
+        let id = vfs.clone_mount(&node, found.filter(|_| !dir), ns.id)?;
+        copy_submounts(&vfs, &view, &inside, &node, id);
+        let file = crate::fd::OpenFile::new(crate::fd::FileKind::Path(node.in_mount(id)), o_path);
+        file.borrow_mut().tree = Some(ns);
+        cx.shared.fast_changed();
+        file
+    } else {
+        let path = vfs
+            .found_path(&view, &cx.root(), &node, found.as_ref())
+            .ok()
+            .map(std::rc::Rc::from);
+        crate::fd::OpenFile::with_path(crate::fd::FileKind::Path(node), o_path, path)
+    };
+    let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
+    Ok(cx.fds_mut().install(file, cloexec, 0)? as u64)
+}
+
+/// move_mount(2)（Linux 6.1）：要 `CAP_SYS_ADMIN`；源、目标各自从目录 fd 起解析（`F_EMPTY_PATH`、
+/// `T_EMPTY_PATH` 时可以是 fd 本身，`F_SYMLINKS`、`T_SYMLINKS` 时跟随最后的符号链接），
+/// 挪法与 `MS_MOVE` 相同（[`move_tree`]）。appine 没有共享的挂载，`MOVE_MOUNT_SET_GROUP`
+/// 总是 EINVAL（Linux 上源不是共享的也是）。
+pub(super) fn sys_move_mount(
+    cx: &mut Cx<'_>,
+    from: (i32, u64),
+    to: (i32, u64),
+    flags: u32,
+) -> SysResult {
+    use move_flags::*;
+    if !may_mount(cx) {
+        return Err(Errno::EPERM);
+    }
+    if flags & !MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (src, _) = walk_at(cx, from, flags & F_EMPTY_PATH != 0, flags & F_SYMLINKS != 0)?;
+    let target = walk_at(cx, to, flags & T_EMPTY_PATH != 0, flags & T_SYMLINKS != 0)?;
+    if flags & SET_GROUP != 0 {
+        return Err(Errno::EINVAL);
+    }
+    move_tree(cx, &src, target)
+}
+
+/// mount_setattr(2)（Linux 6.1 的 `mount_setattr`、`build_mount_kattr`）：改挂载（`AT_RECURSIVE`
+/// 时连同下面的）的标志。`struct mount_attr` 至少 32 字节，多给的要是 0；只能改访问时间
+/// 的要同时在 attr_clr 里给出整个 `MOUNT_ATTR__ATIME`。传播类型检查之后不起作用（appine 的
+/// 挂载之间没有传播）。idmapped 挂载（`MOUNT_ATTR_IDMAP`）检查 userns 的 fd 之后是 EINVAL，
+/// 与文件系统不支持它的一样。
+pub(super) fn mount_setattr(
+    cx: &mut Cx<'_>,
+    (dirfd, path): (i32, u64),
+    flags: u32,
+    uattr: u64,
+    size: usize,
+) -> SysResult {
+    if flags & !(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > 4096 {
+        return Err(Errno::E2BIG);
+    }
+    if size < 32 {
+        return Err(Errno::EINVAL);
+    }
+    if !may_mount(cx) {
+        return Err(Errno::EPERM);
+    }
+    let mut raw = vec![0u8; size];
+    cx.mm()
+        .read(crate::uaccess::UserSlice::new(uattr, size), &mut raw)?;
+    if raw[32..].iter().any(|&b| b != 0) {
+        return Err(Errno::E2BIG);
+    }
+    let field = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+    let (set, clr, propagation, userns_fd) = (field(0), field(1), field(2), field(3));
+    if set == 0 && clr == 0 && propagation == 0 {
+        return Ok(0);
+    }
+    if ![0, MS_UNBINDABLE, MS_PRIVATE, MS_SLAVE, MS_SHARED].contains(&propagation)
+        || (set | clr) >> 32 != 0
+        || (set | clr) & !attr::VALID != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    // 访问时间：要改的话 attr_clr 里给出整个 MOUNT_ATTR__ATIME，attr_set 是三种之一
+    let atime = if clr & attr::ATIME != 0 {
+        if clr & attr::ATIME != attr::ATIME {
+            return Err(Errno::EINVAL);
+        }
+        match set & attr::ATIME {
+            0 => Some(ms::RELATIME),
+            attr::NOATIME => Some(ms::NOATIME),
+            attr::STRICTATIME => Some(0),
+            _ => return Err(Errno::EINVAL),
+        }
+    } else if set & attr::ATIME != 0 {
+        return Err(Errno::EINVAL);
+    } else {
+        None
+    };
+    if (set | clr) & attr::IDMAP != 0 {
+        if clr & attr::IDMAP != 0 || userns_fd > i32::MAX as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let file = cx.fds().get(userns_fd as i32).map_err(|_| Errno::EBADF)?;
+        let ns = match &file.borrow().kind {
+            crate::fd::FileKind::Proc {
+                ns: Some(NsRef::User(ns)),
+                ..
+            } => ns.clone(),
+            _ => return Err(Errno::EINVAL),
+        };
+        if Rc::ptr_eq(&ns, &crate::cred::UserNs::init()) {
+            return Err(Errno::EPERM);
+        }
+        return Err(Errno::EINVAL);
+    }
+    let (node, _) = walk_at(
+        cx,
+        (dirfd, path),
+        flags & AT_EMPTY_PATH != 0,
+        flags & AT_SYMLINK_NOFOLLOW == 0,
+    )?;
+    let vfs = cx.vfs()?;
+    let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
+    // 调用者的命名空间里的，或者 open_tree 复制出来还没接上的
+    let anon = vfs
+        .mount_ns(id)
+        .and_then(|ns| vfs.find_ns(ns))
+        .is_some_and(|ns| ns.anon);
+    if !anon {
+        check_mnt(cx, &vfs, id)?;
+    }
+    let bit = |a: u64, m: u64| if set & a != 0 { m } else { 0 };
+    let set_ms = bit(attr::RDONLY, ms::RDONLY)
+        | bit(attr::NOSUID, ms::NOSUID)
+        | bit(attr::NODEV, ms::NODEV)
+        | bit(attr::NOEXEC, ms::NOEXEC)
+        | bit(attr::NODIRATIME, ms::NODIRATIME)
+        | bit(attr::NOSYMFOLLOW, ms::NOSYMFOLLOW);
+    let cleared = |a: u64, m: u64| if clr & a != 0 { m } else { 0 };
+    let clr_ms = cleared(attr::RDONLY, ms::RDONLY)
+        | cleared(attr::NOSUID, ms::NOSUID)
+        | cleared(attr::NODEV, ms::NODEV)
+        | cleared(attr::NOEXEC, ms::NOEXEC)
+        | cleared(attr::NODIRATIME, ms::NODIRATIME)
+        | cleared(attr::NOSYMFOLLOW, ms::NOSYMFOLLOW);
+    let targets = if flags & AT_RECURSIVE != 0 {
+        vfs.subtree(id)
+    } else {
+        vec![id]
+    };
+    for t in targets {
+        vfs.update_mount(t, |m| {
+            m.flags = (m.flags & !clr_ms) | set_ms;
+            if let Some(a) = atime {
+                m.flags = (m.flags & !(ms::RELATIME | ms::NOATIME)) | a;
+            }
+        });
+    }
     cx.shared.fast_changed();
     Ok(0)
 }

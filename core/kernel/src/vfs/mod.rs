@@ -84,6 +84,9 @@ pub(crate) struct MntNs {
     /// 属主：建立它时所在的用户命名空间（挂载要在这里有 `CAP_SYS_ADMIN`，Linux 的
     /// `may_mount`）。
     pub owner: std::rc::Rc<crate::cred::UserNs>,
+    /// 匿名的：open_tree(`OPEN_TREE_CLONE`) 复制出来、还没有接上的那棵树所在的，没有进程在
+    /// 里面，由打开文件持有（[`Vfs::anon_ns`]）。
+    pub anon: bool,
 }
 
 /// tmpfs 里一个 inode 占的页数：普通文件按大小，符号链接的目标有 128 字节以上时一页
@@ -665,6 +668,7 @@ impl Vfs {
             init_ns: std::rc::Rc::new(MntNs {
                 id: INIT_MNT_NS,
                 owner: crate::cred::UserNs::init(),
+                anon: false,
             }),
             namespaces: Default::default(),
         })
@@ -1246,6 +1250,7 @@ impl Vfs {
         let ns = std::rc::Rc::new(MntNs {
             id: new_ns_id(),
             owner,
+            anon: false,
         });
         let mut mounts = self.mounts.borrow_mut();
         let mut old: Vec<Mount> = mounts
@@ -1294,6 +1299,81 @@ impl Vfs {
             .push(std::rc::Rc::downgrade(&ns));
         self.mounts_changed();
         (ns, map)
+    }
+
+    /// 新的匿名挂载命名空间（Linux 的 `alloc_mnt_ns(.., true)`）：放 open_tree 复制出来的树，
+    /// 打开文件持有它；关掉之后没人用了，下一次清理（[`Vfs::collect`]）拆掉里面的挂载。
+    pub(crate) fn anon_ns(&self, owner: std::rc::Rc<crate::cred::UserNs>) -> std::rc::Rc<MntNs> {
+        let ns = std::rc::Rc::new(MntNs {
+            id: new_ns_id(),
+            owner,
+            anon: true,
+        });
+        self.namespaces
+            .borrow_mut()
+            .push(std::rc::Rc::downgrade(&ns));
+        ns
+    }
+
+    /// open_tree(`OPEN_TREE_CLONE`)：在匿名的命名空间 `ns` 里 bind 一份 `src`（它所在的挂载的
+    /// 文件系统、标志、设备号），不挂在任何地方，是那个命名空间的根。`found` 是 bind 文件时找到
+    /// 它的目录和名字。返回新挂载。
+    pub(crate) fn clone_mount(
+        &self,
+        src: &Node,
+        found: Option<Dentry>,
+        ns: u64,
+    ) -> Result<MountId, Errno> {
+        let m = self.mount(src.mnt()).ok_or(Errno::EINVAL)?;
+        let mut mounts = self.mounts.borrow_mut();
+        let id = mounts.next;
+        mounts.next += 1;
+        mounts.list.push(Mount {
+            id,
+            ns,
+            root: src.clone().in_mount(id),
+            point: None,
+            at: None,
+            root_at: found,
+            expiring: false,
+            ..m
+        });
+        drop(mounts);
+        self.mounts_changed();
+        Ok(id)
+    }
+
+    /// move_mount 接上 open_tree 复制出来的树：根挂到 `point` 上，树里的挂载都进命名空间 `to`。
+    pub(crate) fn attach_tree(&self, root: MountId, (point, at): (Node, Option<Dentry>), to: u64) {
+        let mut mounts = self.mounts.borrow_mut();
+        let from = mounts.list.iter().find(|m| m.id == root).map(|m| m.ns);
+        for m in mounts.list.iter_mut().filter(|m| Some(m.ns) == from) {
+            m.ns = to;
+        }
+        if let Some(m) = mounts.list.iter_mut().find(|m| m.id == root) {
+            m.at = at.filter(|_| matches!(point, Node::Store(..)));
+            m.point = Some(point);
+        }
+        drop(mounts);
+        self.mounts_changed();
+    }
+
+    /// 挂载 `id` 和挂在它下面的（一层层往下，mount_setattr 的 `AT_RECURSIVE`）。
+    pub(crate) fn subtree(&self, id: MountId) -> Vec<MountId> {
+        let mounts = self.mounts.borrow();
+        let mut out = vec![id];
+        let mut i = 0;
+        while let Some(&parent) = out.get(i) {
+            out.extend(
+                mounts
+                    .list
+                    .iter()
+                    .filter(|m| m.parent() == Some(parent) && m.id != parent)
+                    .map(|m| m.id),
+            );
+            i += 1;
+        }
+        out
     }
 
     /// 挂载命名空间 `ns` 的根目录（挂载树的根的根，上面挂着东西时是最上面的那个）。
@@ -1349,14 +1429,31 @@ impl Vfs {
             .any(|m| m.point.as_ref() == Some(node))
     }
 
-    /// 仓库里的 `ino` 经由哪个挂载上面挂着东西都算（rmdir、rename、unlink 它是 EBUSY，Linux
-    /// 的 `is_local_mountpoint` 看的是目录项）。
-    pub(crate) fn is_store_point(&self, ino: Ino) -> bool {
+    /// 仓库里目录 `dir` 里的 `name`（inode `ino`）上挂着命名空间 `ns` 里的挂载：rmdir、rename、
+    /// unlink 它是 EBUSY（Linux 的 `is_local_mountpoint`，只看调用者的命名空间）。挂在文件上的
+    /// 按找到它的目录和名字区分硬链接（[`Mount::at`]）。
+    pub(crate) fn is_store_point(&self, (ino, dir, name): (Ino, Ino, &[u8]), ns: u64) -> bool {
         self.mounts
             .borrow()
             .list
             .iter()
-            .any(|m| matches!(m.point, Some(Node::Store(_, i)) if i == ino))
+            .any(|m| m.ns == ns && on_entry(m, (ino, dir, name)))
+    }
+
+    /// 删掉了（rmdir、unlink、被 rename 覆盖）仓库里目录 `dir` 里的 `name`（inode `ino`）：挂在
+    /// 它上面的、别的命名空间里的挂载都卸下（Linux 的 `detach_mounts`）。
+    pub(crate) fn detach_store_point(&self, (ino, dir, name): (Ino, Ino, &[u8])) {
+        let ids: Vec<MountId> = self
+            .mounts
+            .borrow()
+            .list
+            .iter()
+            .filter(|m| on_entry(m, (ino, dir, name)))
+            .map(|m| m.id)
+            .collect();
+        for id in ids {
+            self.remove_mount(id);
+        }
     }
 
     /// `node` 的设备号（stat 的 `st_dev`）：所在的挂载的；不知道是哪个挂载时按开机时的
@@ -1957,6 +2054,14 @@ fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
 /// 目录和其中的一个名字。
 pub(crate) type Dentry = (Node, Vec<u8>);
 
+/// 挂载 `m` 挂在仓库里目录 `dir` 里的 `name`（inode `ino`）上。
+fn on_entry(m: &Mount, (ino, dir, name): (Ino, Ino, &[u8])) -> bool {
+    matches!(m.point, Some(Node::Store(_, i)) if i == ino)
+        && m.at
+            .as_ref()
+            .is_none_or(|(d, n)| d.ino() == Some(dir) && n == name)
+}
+
 /// 词法上规范化一个绝对路径：去掉 `.`、空组件，按 `..` 回退（不跟随符号链接）。
 pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
     let mut comps: Vec<&[u8]> = Vec::new();
@@ -2456,7 +2561,7 @@ mod tests {
         assert_eq!(vfs.mount_root(&inner), None);
         assert!(vfs.is_mount_point(&bin));
         assert!(!vfs.is_mount_point(&Node::Store(id, ino(&bin))));
-        assert!(vfs.is_store_point(ino(&bin)));
+        assert!(vfs.is_store_point((ino(&bin), ino(&usr), b"bin"), INIT_MNT_NS));
         assert_eq!(vfs.dev_of(&inner), ROOT_DEV);
         assert_eq!(vfs.root_path(ps, &vfs.mount(id).unwrap()), b"/usr");
         assert!(vfs.is_under(ps, &inner, &root));

@@ -243,3 +243,16 @@ grep -c ' /tmp/mnt/root/proc ' /proc/self/mountinfo
 umount /tmp/mnt/root/proc /tmp/mnt/root/dev/pts /tmp/mnt/sys/fs/cgroup /tmp/mnt/sys /tmp/mnt/pts /tmp/mnt/proc "/tmp/mnt/sp ace"
 echo "left: $(show | wc -l)"
 rm -rf /tmp/mnt
+
+# 删除别的挂载命名空间里的挂载点：只有自己命名空间里的挂载算 EBUSY（Linux 的
+# is_local_mountpoint），删掉之后别处挂在上面的卸下（detach_mounts）
+mkdir -p /tmp/mp/d /tmp/mp/e
+mount -t tmpfs t /tmp/mp/e
+rmdir /tmp/mp/e 2>&1 | sed 's/^rmdir: //'
+umount /tmp/mp/e
+unshare -m sh -c 'mount -t tmpfs t /tmp/mp/d && touch /tmp/mp/d/x && sleep 1
+    echo "the other namespace: $(grep -c " /tmp/mp/d " /proc/self/mountinfo) mounts, $(ls /tmp/mp 2>&1)"' &
+sleep 0.4
+rmdir /tmp/mp/d && echo "rmdir a mount point of another namespace: ok"
+wait
+rm -rf /tmp/mp

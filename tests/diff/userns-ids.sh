@@ -216,3 +216,33 @@ for q in (q1, q2, q3):
     libc.msgctl(q, IPC_RMID, None)
 os.unlink(SOCK)
 PY
+
+# 用户命名空间里的 root 没有 no_new_privs 也能装 seccomp 过滤器：要的是自己所在的命名空间里的
+# CAP_SYS_ADMIN（Linux 的 seccomp_prepare_filter 用 ns_capable），进了新的用户命名空间之后
+# 开机时的那个里的能力就没有了；开机时的命名空间里的普通用户不行。用 root 建用户命名空间：
+# 原生的 Ubuntu 宿主开着 apparmor_restrict_unprivileged_userns，普通用户建的里面能力被拒绝
+cat > /tmp/sfilter.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(int argc, char **argv)
+{
+    if (argc > 1 && unshare(CLONE_NEWUSER) != 0) {
+        printf("unshare: %s\n", strerror(errno));
+        return 0;
+    }
+    // 没有内核头文件：BPF_RET | BPF_K 返回 SECCOMP_RET_ALLOW，SECCOMP_SET_MODE_FILTER 是 1
+    struct { uint16_t code; uint8_t jt, jf; uint32_t k; } allow = {0x06, 0, 0, 0x7fff0000};
+    struct { unsigned short len; void *filter; } prog = {1, &allow};
+    long r = syscall(SYS_seccomp, 1, 0, &prog);
+    printf("%s: %s\n", argc > 1 ? "in a new user namespace" : "as is", r ? strerror(errno) : "ok");
+    return 0;
+}
+C
+gcc -o /tmp/sfilter /tmp/sfilter.c && su nobody -s /bin/sh -c /tmp/sfilter && /tmp/sfilter userns

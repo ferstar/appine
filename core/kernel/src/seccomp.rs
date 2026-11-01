@@ -1092,8 +1092,11 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     {
+        // 没有 no_new_privs 时要在自己所在的用户命名空间里有 CAP_SYS_ADMIN（Linux 的
+        // seccomp_prepare_filter 用 ns_capable，用户命名空间里的 root 也行）
         let g = cx.t.group.borrow();
-        if !g.no_new_privs && !g.cred.capable(crate::cred::cap::SYS_ADMIN) {
+        let cred = &g.cred;
+        if !g.no_new_privs && !cred.ns_capable(&cred.user_ns, crate::cred::cap::SYS_ADMIN) {
             return Err(Errno::EACCES);
         }
     }

@@ -24,6 +24,7 @@ pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs
         fs.mnt_ns = Rc::new(MntNs {
             id: new_ns_id(),
             owner,
+            anon: false,
         });
         return;
     };

@@ -510,6 +510,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         283 => misc::membarrier(cx, a[0] as i32, a[1] as u32),
         279 => fs::memfd_create(cx, a[0], a[1] as u32),
         280 => bpf::bpf(cx, a[0] as i32, a[1], a[2] as u32),
+        428 => mount::open_tree(cx, a[0] as i32, a[1], a[2] as u32),
+        429 => mount::sys_move_mount(cx, (a[0] as i32, a[1]), (a[2] as i32, a[3]), a[4] as u32),
+        442 => mount::mount_setattr(cx, (a[0] as i32, a[1]), a[2] as u32, a[3], a[4] as usize),
         284 => mem::mlock(cx, a[0], a[1], a[2] as u32, true),
         285 => fs::copy_file_range(
             cx,
