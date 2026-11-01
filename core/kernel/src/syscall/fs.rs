@@ -230,7 +230,7 @@ fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Store(mnt, ino) => Ok((*mnt, *ino)),
         Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
-        Node::Pseudo(_, PseudoNode::MqRoot(_)) => Err(Errno::EPERM),
+        Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Cgroup(..)) => Err(Errno::EPERM),
         Node::Pseudo(..) => Err(Errno::EACCES),
     }
 }
@@ -765,6 +765,12 @@ fn open_path_with(
                         None,
                         Some((dir.clone(), name.to_vec())),
                     );
+                }
+                // cgroup 的目录里建不了文件（没有 create，Linux 的 vfs_create 是 EACCES）
+                if let Node::Pseudo(_, PseudoNode::Cgroup(..)) = dir
+                    && !vfs.readonly(&dir)
+                {
+                    return Err(Errno::EACCES);
                 }
                 let (mnt, dir) = store_dir(&vfs, &dir)?;
                 if let Some(ino) = vfs.store().lookup(dir, name)?
@@ -1330,10 +1336,18 @@ fn open_pseudo(
     if accmode != oflags::O_RDONLY && vfs.readonly(&full) {
         return Err(Errno::EROFS);
     }
-    if accmode != oflags::O_RDONLY && !pseudo::writable(&node) {
+    // cgroup 的文件只按权限位查（root 打得开只读的，写的时候才是 EINVAL）
+    if accmode != oflags::O_RDONLY
+        && !pseudo::writable(&node)
+        && !matches!(node, PseudoNode::Cgroup(..))
+    {
         return Err(Errno::EACCES);
     }
-    let data = pseudo::content(&view, mnt, &node)?;
+    let data = if pseudo::unreadable(&node) {
+        Vec::new()
+    } else {
+        pseudo::content(&view, mnt, &node)?
+    };
     // /proc/kmsg（`kmsg_open`）：打开时按 syslog 的打开查权限，之后的读不再查
     let klog = match node {
         PseudoNode::Global(pseudo::Global::Kmsg) => {
@@ -2432,6 +2446,9 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
 
 pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
+    if let Some(r) = cgroup_mkdir(cx, dirfd, &path) {
+        return r.map(|()| 0);
+    }
     let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
@@ -2538,6 +2555,84 @@ fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Res
     })())
 }
 
+/// 父目录是 cgroup 的目录时：`name` 是那个 cgroup 的编号、它的元数据和最后一个组件。
+fn cgroup_parent<'p>(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Option<(Node, u64, Stat, &'p [u8])> {
+    let start = start_dir(cx, dirfd, path).ok()?;
+    let vfs = cx.vfs().ok()?;
+    let (dir, name) = vfs
+        .resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)
+        .ok()?;
+    let Node::Pseudo(_, PseudoNode::Cgroup(id, b"")) = dir else {
+        return None;
+    };
+    let st = pseudo::stat(&cx.view(&vfs), &PseudoNode::Cgroup(id, b"")).ok()?;
+    Some((dir, id, st, name))
+}
+
+/// 在 cgroup 的目录里 mkdir：建子 cgroup（[`crate::cgroup::Cgroups::mkdir`]）。顺序照 Linux：
+/// `.`、`..` 和已经有的名字是 EEXIST，只读的挂载 EROFS，没有目录的写权限 EACCES。
+fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), Errno>> {
+    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
+    Some((|| {
+        let vfs = cx.vfs()?;
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let cgroups = &cx.kr().cgroups;
+        let exists = cgroups
+            .get(id)
+            .is_some_and(|g| g.children.contains_key(name))
+            || cgroups.files(id).any(|f| f == name);
+        if name == b"." || name == b".." || exists {
+            return Err(Errno::EEXIST);
+        }
+        let cred = cx.cred();
+        cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+        cx.k().cgroups.mkdir(id, name, &cred).map(|_| ())
+    })())
+}
+
+/// 在 cgroup 的目录里 unlink、rmdir：rmdir 删掉子 cgroup（[`crate::cgroup::rmdir`]），文件
+/// 删不了（EPERM，cgroup 的目录没有 unlink）。
+fn cgroup_unlink(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: &[u8],
+    flags: u32,
+) -> Option<Result<(), Errno>> {
+    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
+    let rmdir = flags & AT_REMOVEDIR != 0;
+    Some((|| {
+        match name {
+            b"." if rmdir => return Err(Errno::EINVAL),
+            b".." if rmdir => return Err(Errno::ENOTEMPTY),
+            b"." | b".." => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        let vfs = cx.vfs()?;
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let cgroups = &cx.kr().cgroups;
+        let child = cgroups.get(id).and_then(|g| g.children.get(name).copied());
+        let file = cgroups.files(id).any(|f| f == name);
+        if child.is_none() && !file {
+            return Err(Errno::ENOENT);
+        }
+        cx.cred().permission(&st, MAY_WRITE | MAY_EXEC)?;
+        match (rmdir, child) {
+            (true, Some(c)) => crate::cgroup::rmdir(cx.k(), c),
+            (true, None) => Err(Errno::ENOTDIR),
+            (false, Some(_)) => Err(Errno::EISDIR),
+            (false, None) => Err(Errno::EPERM),
+        }
+    })())
+}
+
 pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(Errno::EINVAL);
@@ -2548,6 +2643,9 @@ pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> Sy
 
 fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), Errno> {
     if let Some(r) = unlink_mq(cx, dirfd, &path, flags) {
+        return r;
+    }
+    if let Some(r) = cgroup_unlink(cx, dirfd, &path, flags) {
         return r;
     }
     let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
@@ -4191,6 +4289,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             node: PseudoNode::NsFile(..),
             ..
         } => return Err(Errno::EINVAL),
+        FileKind::Proc { node, .. } if pseudo::unreadable(node) => return Err(Errno::EINVAL),
         FileKind::Proc { data, .. } => {
             let start = (pos as usize).min(data.len());
             let n = buf.len().min(data.len() - start);
@@ -4374,10 +4473,13 @@ fn write_bytes(
                 FileKind::Proc { node, .. } => Some(node.clone()),
                 _ => None,
             };
+            let mut written = data.len();
             if let Some(node) = proc_node {
                 let cred = cx.cred();
                 let (ns, pid_ns) = (cx.ns(), cx.pid_ns());
-                pseudo::write(cx.k(), &cred, (&ns, &pid_ns), &node, data)?;
+                let tid = cx.tid();
+                pseudo::write(cx.k(), (tid, &cred), (&ns, &pid_ns), &node, data)?;
+                written = pseudo::written(&node, data.len());
             }
             let ino = match file.borrow().kind {
                 FileKind::Regular { ino, .. } => Some(ino),
@@ -4394,7 +4496,7 @@ fn write_bytes(
                 Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
                     appine_hal::pwrite(fd, data, pos)
                 })?,
-                None => local_write(&mut file.borrow_mut(), data, offset)?,
+                None => local_write(&mut file.borrow_mut(), data, offset)?.min(written),
             };
             if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind)
                 && let Ok(meta) = host.metadata()

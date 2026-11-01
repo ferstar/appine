@@ -79,11 +79,11 @@ pub(super) fn new_pid_ns(
     Ok(PidNs::child(parent, owner))
 }
 
-/// 新的 cgroup 命名空间，属于用户命名空间 `owner`（根是调用者所在的 cgroup，也就是唯一的
-/// 那个 "/"）。
-pub(super) fn new_cgroup_ns(owner: Rc<UserNs>) -> Rc<crate::nsproxy::CgroupNs> {
+/// 新的 cgroup 命名空间，属于用户命名空间 `owner`，根是调用者所在的 cgroup `root`。
+pub(super) fn new_cgroup_ns(owner: Rc<UserNs>, root: u64) -> Rc<crate::nsproxy::CgroupNs> {
     Rc::new(crate::nsproxy::CgroupNs {
         id: new_ns_id(),
+        root,
         owner,
     })
 }

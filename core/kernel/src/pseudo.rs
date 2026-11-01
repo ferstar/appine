@@ -588,8 +588,9 @@ pub(crate) enum PseudoNode {
     /// `/sys/class/net/<接口>`（路径为空），或者它下面的目录和文件（路径取值来自
     /// [`NET_FILES`]）；接口按宿主的接口编号记。
     SysNet(u32, &'static [u8]),
-    /// `/sys/fs/cgroup`（名字为空），或者它下面的文件（名字取值来自 [`crate::cgroup::FILES`]）。
-    Cgroup(&'static [u8]),
+    /// cgroup 的目录（名字为空），或者它里面的文件（名字取值来自 [`crate::cgroup::FILES`]）：
+    /// cgroup 的编号和文件名。
+    Cgroup(u64, &'static [u8]),
     /// `/proc/<pid>/ns/<种类>`（含 task 子目录里的）：指向命名空间的魔法链接。
     Ns(Tid, Option<Tid>, NsKind),
     /// `/proc/<pid>/ns/<种类>` 跟随之后得到的命名空间（Linux 的 nsfs 里的文件），按编号。
@@ -682,7 +683,7 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         | PseudoNode::Sys(_)
         | PseudoNode::SysCpu(..)
         | PseudoNode::SysNet(..) => Fs::Sys,
-        PseudoNode::Cgroup(_) => Fs::Cgroup,
+        PseudoNode::Cgroup(..) => Fs::Cgroup,
         PseudoNode::NsFile(..) => Fs::Nsfs,
         PseudoNode::MqRoot(_) | PseudoNode::Mq(..) => Fs::Mqueue,
         _ => Fs::Proc,
@@ -705,7 +706,10 @@ fn parse_num(name: &[u8]) -> Option<i64> {
 pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     if matches!(
         node,
-        PseudoNode::ProcRoot | PseudoNode::SysRoot | PseudoNode::PtsRoot | PseudoNode::Cgroup(b"")
+        PseudoNode::ProcRoot
+            | PseudoNode::SysRoot
+            | PseudoNode::PtsRoot
+            | PseudoNode::Cgroup(crate::cgroup::ROOT, b"")
     ) {
         return 1;
     }
@@ -793,6 +797,14 @@ impl<'a> View<'a> {
     }
 
     /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
+    /// 读者所在的 cgroup 命名空间的根（cgroup 的编号）。
+    pub(crate) fn cgroup_root(&self) -> u64 {
+        self.k
+            .tasks
+            .get(&self.tid)
+            .map_or(crate::cgroup::ROOT, |t| t.ns.borrow().cgroup.root)
+    }
+
     /// 开机以来的纳秒数 `ns` 加上读者所在的 time 命名空间里 boottime 的偏移（Linux 的
     /// `timens_add_boottime_ns`：`/proc/uptime`、进程的启动时间），不小于 0。
     fn with_boot_offset(&self, ns: u64) -> u64 {
@@ -841,7 +853,9 @@ impl Pseudo for View<'_> {
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode> {
         use PseudoNode::*;
         Some(match node {
-            PtsRoot | ProcRoot | SysRoot | Cgroup(b"") | MqRoot(_) => return None,
+            PtsRoot | ProcRoot | SysRoot | MqRoot(_) => return None,
+            // 子 cgroup 的上级是父 cgroup，根没有
+            Cgroup(id, b"") => Cgroup(self.k.cgroups.get(*id)?.parent?, b""),
             Mq(ns, _) => MqRoot(*ns),
             Pts(_) | PtsPtmx => PtsRoot,
             Global(_) | SelfLink | ThreadSelf | Pid(_, None) => ProcRoot,
@@ -855,7 +869,7 @@ impl Pseudo for View<'_> {
             SysNet(n, path) => {
                 tree_parent(&NET_FILES, path).map_or(SysNet(*n, b""), |p| SysNet(*n, p))
             }
-            Cgroup(_) => Cgroup(b""),
+            Cgroup(id, _) => Cgroup(*id, b""),
             Pid(pid, Some(_)) => Entry(*pid, None, self::Entry::Task),
             Entry(pid, tid, _) => Pid(*pid, *tid),
             Net(pid, tid, _) => Entry(*pid, *tid, self::Entry::Net),
@@ -892,8 +906,13 @@ impl Pseudo for View<'_> {
                 .map_or_else(|| n.to_string(), |i| i.name)
                 .into_bytes(),
             SysNet(_, path) => tree_name(path).to_vec(),
-            Cgroup(b"") => b"cgroup".to_vec(),
-            Cgroup(name) => name.to_vec(),
+            Cgroup(crate::cgroup::ROOT, b"") => b"cgroup".to_vec(),
+            Cgroup(id, b"") => self
+                .k
+                .cgroups
+                .get(*id)
+                .map_or_else(|| id.to_string().into_bytes(), |g| g.name.clone()),
+            Cgroup(_, name) => name.to_vec(),
             Pid(pid, None) => self
                 .pid_ns(mnt)
                 .vnr(*pid)
@@ -967,10 +986,16 @@ impl Pseudo for View<'_> {
                 let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                 (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
             }),
-            Cgroup(b"") => crate::cgroup::FILES
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(n, _)| Cgroup(n)),
+            // 子 cgroup，或者这个 cgroup 有的文件
+            Cgroup(id, b"") => self.k.cgroups.get(*id).and_then(|g| {
+                g.children.get(name).map(|&c| Cgroup(c, b"")).or_else(|| {
+                    self.k
+                        .cgroups
+                        .files(*id)
+                        .find(|f| *f == name)
+                        .map(|f| Cgroup(*id, f))
+                })
+            }),
             SysCpu(n, path) => tree_lookup(&CPU_FILES, path, name)
                 .or_else(|| {
                     tree_lookup(&HOST_CPU_FILES, path, name).filter(|p| host_cpu_has(*n, p))
@@ -1020,7 +1045,7 @@ impl Pseudo for View<'_> {
             Mq(..) => mode::S_IFREG,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
             SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
-            Cgroup(b"") => mode::S_IFDIR,
+            Cgroup(_, b"") => mode::S_IFDIR,
             Entry(
                 _,
                 _,
@@ -1306,7 +1331,9 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
         (mode::S_IFDIR, _) if sysfs => 0o755,
-        (_, PseudoNode::Cgroup(name)) if crate::cgroup::FILES.contains(&(name, true)) => 0o644,
+        (_, PseudoNode::Cgroup(_, name)) if !name.is_empty() => {
+            crate::cgroup::file_mode(name).unwrap_or(0o444)
+        }
         (mode::S_IFDIR, _) => 0o555,
         (mode::S_IFLNK, _) => 0o777,
         (_, PseudoNode::Pts(n)) => pty(ps.k, *n).map_or(0o620, |t| t.borrow().mode),
@@ -1384,12 +1411,23 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
             })
         }
         PseudoNode::Pts(n) => pty(k, *n).map_or((0, 0), |t| t.borrow().owner),
+        PseudoNode::Cgroup(id, _) => k.cgroups.get(*id).map_or((0, 0), |g| (g.uid, g.gid)),
         _ => (0, 0),
     }
 }
 
+/// 读不了的文件：cgroup 里只能写的（`cgroup.kill`），与 Linux 一样打开时不查，读是
+/// EINVAL（`cgroup_seqfile_show` 没有读的回调）。
+pub(crate) fn unreadable(node: &PseudoNode) -> bool {
+    matches!(node, PseudoNode::Cgroup(_, name)
+        if crate::cgroup::file_mode(name).is_some_and(|m| m & 0o444 == 0))
+}
+
 /// 可以写入的 procfs 文件。
 pub(crate) fn writable(node: &PseudoNode) -> bool {
+    if let PseudoNode::Cgroup(_, name) = node {
+        return crate::cgroup::file_mode(name).is_some_and(|m| m & 0o200 != 0);
+    }
     matches!(
         node,
         PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
@@ -1436,12 +1474,20 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
 /// 可写的文件接受写入但不起作用。`cred` 是写入者的凭据。
 pub(crate) fn write(
     k: &mut Kernel,
-    cred: &Cred,
+    (tid, cred): (Tid, &Cred),
     (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
     node: &PseudoNode,
     data: &[u8],
 ) -> Result<(), Errno> {
     match node {
+        PseudoNode::Cgroup(id, name) => {
+            let writer = crate::cgroup::Writer {
+                tid,
+                pid_ns,
+                ns_root: ns.cgroup.root,
+            };
+            return crate::cgroup::write(k, &writer, (*id, name), data);
+        }
         PseudoNode::Entry(pid, _, e @ (Entry::UidMap | Entry::GidMap)) => {
             return write_id_map(k, cred, *pid, *e == Entry::GidMap, data);
         }
@@ -1568,11 +1614,11 @@ pub(crate) fn write(
             .next_power_of_two();
     }
     if let PseudoNode::Entry(pid, _, Entry::OomScoreAdj) = node {
-        let value: i32 = std::str::from_utf8(data)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|v| (-1000..=1000).contains(v))
-            .ok_or(Errno::EINVAL)?;
+        let value = kstrto(proc_number(data)?, true)?;
+        if !(-1000..=1000).contains(&value) {
+            return Err(Errno::EINVAL);
+        }
+        let value = value as i32;
         let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
         let mut g = group.borrow_mut();
         // 与 Linux 一样：调到下限以下要求 CAP_SYS_RESOURCE，有它时写的值同时成为新的下限
@@ -1650,19 +1696,53 @@ pub(crate) fn write(
     }
     // 与 Linux 一样按 C 的写法解析（0x 开头是十六进制，0 开头是八进制），只取 9 位
     if let PseudoNode::Entry(pid, _, Entry::CoredumpFilter) = node {
-        let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?.trim();
-        let value = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            u32::from_str_radix(hex, 16)
-        } else if s.len() > 1 && s.starts_with('0') {
-            u32::from_str_radix(&s[1..], 8)
-        } else {
-            s.parse()
-        }
-        .map_err(|_| Errno::EINVAL)?;
+        let value = kstrto(proc_number(data)?, false)?;
         let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
-        group.borrow_mut().coredump_filter = value & 0x1ff;
+        group.borrow_mut().coredump_filter = value as u32 & 0x1ff;
     }
     Ok(())
+}
+
+/// 写 `node` 时写入的字节数：写数字的 `/proc/<pid>` 文件只收 [`proc_number`] 看的那 12 个
+/// 字节（Linux 截短 count 之后返回它），别的都收下。
+pub(crate) fn written(node: &PseudoNode, len: usize) -> usize {
+    match node {
+        PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter) => len.min(12),
+        _ => len,
+    }
+}
+
+/// `/proc/<pid>` 里写数字的文件（oom_score_adj、coredump_filter）的缓冲区：与 Linux 的
+/// `PROC_NUMBUF` 一样只看前 12 个字节、到 NUL 为止（runc 写进来的值结尾带着 NUL），去掉两头
+/// 的空白（`strstrip`）。
+fn proc_number(data: &[u8]) -> Result<&str, Errno> {
+    let data = &data[..data.len().min(12)];
+    let data = data.split(|&b| b == 0).next().unwrap_or(data);
+    Ok(std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?.trim())
+}
+
+/// Linux 的 `kstrtoint`（`signed`）、`kstrtouint` 的基数 0：`0x` 开头是十六进制，`0` 开头是
+/// 八进制，可以有 `+`，有符号的还可以有 `-`。不是数字是 EINVAL，超出 32 位是 ERANGE。
+fn kstrto(s: &str, signed: bool) -> Result<i64, Errno> {
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(rest) if signed => (true, rest),
+        _ => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (digits, radix) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) if h.starts_with(|c: char| c.is_ascii_hexdigit()) => (h, 16),
+        _ if s.len() > 1 && s.starts_with('0') => (&s[1..], 8),
+        _ => (s, 10),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(Errno::EINVAL);
+    }
+    let v = u64::from_str_radix(digits, radix).map_err(|_| Errno::ERANGE)?;
+    match (signed, neg) {
+        (true, true) if v <= 1 << 31 => Ok(-(v as i64)),
+        (true, false) if v <= i32::MAX as u64 => Ok(v as i64),
+        (false, _) if v <= u32::MAX as u64 => Ok(v as i64),
+        _ => Err(Errno::ERANGE),
+    }
 }
 
 /// 目录的内容（不含 `.` 和 `..`）。
@@ -1723,7 +1803,12 @@ pub(crate) fn readdir(
             }
         }
         SysNet(n, path) => nodes.extend(tree_children(&NET_FILES, path).map(|p| SysNet(*n, p))),
-        Cgroup(b"") => nodes.extend(crate::cgroup::FILES.iter().map(|(n, _)| Cgroup(n))),
+        Cgroup(id, b"") => {
+            nodes.extend(ps.k.cgroups.files(*id).map(|f| Cgroup(*id, f)));
+            if let Some(g) = ps.k.cgroups.get(*id) {
+                nodes.extend(g.children.values().map(|&c| Cgroup(c, b"")));
+            }
+        }
         SysCpu(n, path) => {
             nodes.extend(tree_children(&CPU_FILES, path).map(|p| SysCpu(*n, p)));
             nodes.extend(
@@ -2777,7 +2862,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     .to_owned()
             }
             self::Global::Cmdline => "appine\n".to_owned(),
-            self::Global::Cgroups => crate::cgroup::proc_cgroups(),
+            self::Global::Cgroups => crate::cgroup::proc_cgroups(ps.k),
             self::Global::Kmsg => String::new(),
             self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
         },
@@ -2952,7 +3037,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     }
                     s
                 }
-                self::Entry::Cgroup => crate::cgroup::PROC_CGROUP.to_owned(),
+                // 相对读者所在的 cgroup 命名空间的根
+                self::Entry::Cgroup => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    let cgroup = g.borrow().cgroup;
+                    crate::cgroup::proc_cgroup(ps.k, cgroup, ps.cgroup_root())
+                }
                 self::Entry::Cmdline => {
                     return Ok(task.map_or(Vec::new(), |t| guest_bytes(&t, |m| m.args)));
                 }
@@ -3025,7 +3115,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
         SysNet(n, path) => net_file(ps.k, *n, path)?,
-        Cgroup(name) => crate::cgroup::file(ps.k, name).ok_or(Errno::EISDIR)?,
+        // 只能写的（cgroup.kill）读是 EINVAL
+        Cgroup(_, b"") => return Err(Errno::EISDIR),
+        Cgroup(id, name) => crate::cgroup::file(ps.k, *id, name).ok_or(Errno::EINVAL)?,
         // 打开命名空间只为 setns，读不出东西
         NsFile(..) => String::new(),
         _ => return Err(Errno::EINVAL),
@@ -3433,6 +3525,28 @@ fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 写数字的 /proc 文件：到 NUL 为止、只看前 12 个字节，基数 0，超出 32 位是 ERANGE。
+    #[test]
+    fn proc_numbers() {
+        let num = |d: &[u8], signed| kstrto(proc_number(d)?, signed);
+        assert_eq!(num(b"0\0", true), Ok(0));
+        assert_eq!(num(b"-500\0junk", true), Ok(-500));
+        assert_eq!(num(b" 12\n", true), Ok(12));
+        assert_eq!(num(b"+0x1f", false), Ok(31));
+        assert_eq!(num(b"017", false), Ok(15));
+        assert_eq!(num(b"0", false), Ok(0));
+        assert_eq!(num(b"-1", false), Err(Errno::EINVAL));
+        assert_eq!(num(b"-2147483648", true), Ok(-(1 << 31)));
+        assert_eq!(num(b"2147483648", true), Err(Errno::ERANGE));
+        assert_eq!(num(b"4294967296", false), Err(Errno::ERANGE));
+        assert_eq!(num(b"08", false), Err(Errno::EINVAL));
+        assert_eq!(num(b"0x", false), Err(Errno::EINVAL));
+        assert_eq!(num(b"", true), Err(Errno::EINVAL));
+        assert_eq!(num(b"1 2", true), Err(Errno::EINVAL));
+        // 第 13 个字节起不看
+        assert_eq!(num(b"000000000001x", false), Ok(1));
+    }
 
     #[test]
     fn cpu_lists_and_masks_round_trip() {

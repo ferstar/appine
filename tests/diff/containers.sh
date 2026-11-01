@@ -2,7 +2,8 @@
 # 容器运行时（podman、crun、docker、runc）用到的内核接口（docs/rounds/157-container-survey.md
 # 起）：capget 探测版本、开机时的命名空间里拉起已经起着的 lo、合成文件系统根目录的 inode
 # 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统；经由 fd 执行 memfd 和已经删除的文件；
-# time 命名空间（原生一侧要 CAP_SYS_TIME 才能写 timens_offsets，用例不改宿主的时间）
+# time 命名空间（原生一侧要 CAP_SYS_TIME 才能写 timens_offsets，用例不改宿主的时间）；
+# 写数字的 /proc 文件带着结尾的 NUL
 set -e
 cd /tmp
 
@@ -777,3 +778,48 @@ int main(int argc, char **argv)
 }
 C
 gcc -D_GNU_SOURCE -pthread -o timens timens.c && ./timens
+
+# 写数字的 /proc/<pid> 文件（oom_score_adj、coredump_filter）：runc 写 oom_score_adj 的值
+# 结尾带着 NUL（netlink 消息里的字符串），Linux 拷进 12 个字节的缓冲区、到 NUL 为止，按
+# kstrtoint 的基数 0 解析，超出 32 位是 ERANGE
+cat > procnum.c <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static void put(const char *file, const char *what, const char *data, int len)
+{
+    char path[64], buf[32] = "";
+    snprintf(path, sizeof path, "/proc/self/%s", file);
+    int fd = open(path, O_WRONLY);
+    int n = write(fd, data, len);
+    close(fd);
+    fd = open(path, O_RDONLY);
+    read(fd, buf, sizeof buf - 1);
+    close(fd);
+    buf[strcspn(buf, "\n")] = 0;
+    printf("%s %-16s %-24s now %s\n", file, what, n < 0 ? strerror(errno) : n == len ? "ok" : "short", buf);
+}
+
+int main(void)
+{
+    put("oom_score_adj", "nul", "100\0", 4);
+    put("oom_score_adj", "nul then junk", "500\0junk", 8);
+    put("oom_score_adj", "hex", "0x10", 4);
+    put("oom_score_adj", "octal", "010", 3);
+    put("oom_score_adj", "spaces", " 7 \n", 4);
+    put("oom_score_adj", "too big", "1001", 4);
+    put("oom_score_adj", "overflow", "2147483648", 10);
+    put("oom_score_adj", "not a number", "abc", 3);
+    put("oom_score_adj", "13th byte", "0000000000001x", 14);
+    put("oom_score_adj", "empty", "\0", 1);
+    put("coredump_filter", "nul", "0x23\0", 5);
+    put("coredump_filter", "negative", "-1", 2);
+    put("coredump_filter", "overflow", "4294967296", 10);
+    put("coredump_filter", "plus octal", "+017", 4);
+    return 0;
+}
+C
+gcc -o procnum procnum.c && ./procnum

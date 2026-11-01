@@ -129,6 +129,8 @@ struct CloneArgs {
     pidfd: u64,
     /// clone3 指定的新进程在各层 pid 命名空间里的编号，从它所在的那层起往外。
     set_tid: Vec<Tid>,
+    /// clone3 的 `CLONE_INTO_CGROUP`：新进程放进的 cgroup。
+    cgroup: Option<u64>,
 }
 
 pub(super) fn clone(
@@ -154,6 +156,7 @@ pub(super) fn clone(
         ctid,
         pidfd: ptid,
         set_tid: Vec::new(),
+        cgroup: None,
     };
     do_clone(cx, cpu, args)
 }
@@ -193,10 +196,20 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) ->
     if invalid {
         return Err(Errno::EINVAL);
     }
-    // 没有 cgroup
-    if flags & CLONE_INTO_CGROUP != 0 {
-        return Err(Errno::EINVAL);
-    }
+    // CLONE_INTO_CGROUP：cgroup 字段是 cgroup2 目录的 fd（O_PATH 也行），结构体要有这一项
+    let cgroup = if flags & CLONE_INTO_CGROUP != 0 {
+        if size < KNOWN {
+            return Err(Errno::EINVAL);
+        }
+        let file = cx.fds().get(w(10) as i32).map_err(|_| Errno::EBADF)?;
+        let node = file.borrow().node();
+        match node {
+            Some(Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b""))) => Some(id),
+            _ => return Err(Errno::EBADF),
+        }
+    } else {
+        None
+    };
     // 指定各层的 pid（CRIU 用；能不能指定在 Kernel::choose_pid 里看）
     let mut buf = vec![0u8; set_tid_size as usize * 4];
     cx.mm().read(UserSlice::new(set_tid, buf.len()), &mut buf)?;
@@ -220,6 +233,7 @@ pub(super) fn clone3(cx: &mut Cx<'_>, cpu: &mut Cpu, uargs: u64, size: usize) ->
         ctid,
         pidfd,
         set_tid,
+        cgroup,
     };
     do_clone(cx, cpu, args)
 }
@@ -267,6 +281,16 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     // 新的 IPC 命名空间里不能再共用原来的 SEM_UNDO 撤销值
     if both(CLONE_NEWIPC, CLONE_SYSVSEM) {
         return Err(Errno::EINVAL);
+    }
+    // CLONE_INTO_CGROUP（Linux 的 cgroup_css_set_fork）：与写 cgroup.procs 一样检查目的地；
+    // 线程不能单独放进别的 domain cgroup（EOPNOTSUPP）
+    if let Some(dst) = args.cgroup {
+        let src = cx.t.group.borrow().cgroup;
+        let ns_root = cx.ns().cgroup.root;
+        crate::cgroup::may_enter(cx.kr(), src, dst, ns_root)?;
+        if thread && dst != src {
+            return Err(Errno::EOPNOTSUPP);
+        }
     }
     let pid_ns = if flags & CLONE_NEWPID != 0 {
         super::ns::new_pid_ns(&active, &for_children, child_cred.user_ns.clone())?
@@ -363,6 +387,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.exe = parent.exe.clone();
         g.exit_signal = args.exit_signal;
         g.pid_ns = pid_ns.clone();
+        g.cgroup = args.cgroup.unwrap_or(parent.cgroup);
         Rc::new(RefCell::new(g))
     };
 
@@ -423,7 +448,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         ns.net = cx.k().new_net_ns(child_cred_owner.clone())?;
     }
     if flags & CLONE_NEWCGROUP != 0 {
-        ns.cgroup = super::ns::new_cgroup_ns(child_cred_owner.clone());
+        let root = cx.t.group.borrow().cgroup;
+        ns.cgroup = super::ns::new_cgroup_ns(child_cred_owner.clone(), root);
     }
     // time 命名空间（Linux 6.2 起的 copy_namespaces、timens_on_fork）：clone3 的 CLONE_NEWTIME
     // 新建给子进程用的那个；不共用地址空间的子进程进给子进程用的那个，偏移从此不能再改；
@@ -1579,7 +1605,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
             ns.time_for_children = ns.time_for_children.copy(owner.clone());
         }
         if flags & CLONE_NEWCGROUP != 0 {
-            ns.cgroup = super::ns::new_cgroup_ns(owner.clone());
+            let root = cx.t.group.borrow().cgroup;
+            ns.cgroup = super::ns::new_cgroup_ns(owner.clone(), root);
         }
         if flags & CLONE_NEWNET != 0 {
             ns.net = cx.k().new_net_ns(owner.clone())?;

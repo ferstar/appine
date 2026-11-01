@@ -115,11 +115,13 @@ pub(crate) struct IpcNs {
     pub owner: Rc<UserNs>,
 }
 
-/// 一个 cgroup 命名空间。所有进程都在同一个 cgroup "/" 里（[`crate::cgroup`]），从哪个
-/// 命名空间看都是根，所以只有编号和属主。
+/// 一个 cgroup 命名空间：`/proc/<pid>/cgroup` 里的路径、在里面挂的 cgroup2 的根，相对它的根
+/// cgroup（[`crate::cgroup`]）。
 #[derive(Debug)]
 pub(crate) struct CgroupNs {
     pub id: u64,
+    /// 根：建立它的进程当时所在的 cgroup（[`crate::cgroup`] 的编号）。
+    pub root: u64,
     /// 建立它时所在的用户命名空间（setns 的权限检查用）。
     pub owner: Rc<UserNs>,
 }
@@ -234,6 +236,7 @@ impl NsProxy {
             }),
             cgroup: Rc::new(CgroupNs {
                 id: INIT_CGROUP_NS,
+                root: crate::cgroup::ROOT,
                 owner: UserNs::init(),
             }),
             time: time.clone(),

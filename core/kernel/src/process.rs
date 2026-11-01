@@ -319,6 +319,8 @@ pub(crate) struct ThreadGroup {
     pub children: Vec<Tid>,
     /// 所在的 pid 命名空间（线程都在这里）。
     pub pid_ns: Rc<crate::pidns::PidNs>,
+    /// 所在的 cgroup（[`crate::cgroup`] 的编号）：fork 时随父进程，经由 `cgroup.procs` 迁移。
+    pub cgroup: u64,
     /// 按默认方式处理的同步信号被强制投递过：是 pid 命名空间的 1 号进程也照常结束（Linux 的
     /// `force_sig_info_to_task` 去掉 `SIGNAL_UNKILLABLE`）。
     pub killable: bool,
@@ -425,6 +427,7 @@ impl ThreadGroup {
             threads: Vec::new(),
             children: Vec::new(),
             pid_ns: crate::pidns::PidNs::init(),
+            cgroup: crate::cgroup::ROOT,
             killable: false,
             pending: Pending::default(),
             sighand,

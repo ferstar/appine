@@ -171,6 +171,7 @@
 | [M9 之前：mqueue 文件系统](rounds/160-mqueue-fs.md) | 2026-11-01 | `mount -t mqueue` 列出挂上它的进程所在的 IPC 命名空间里的 POSIX 消息队列（每个命名空间一个实例）：建、删、chmod、chown，打开得到 mq 描述符；podman 不再需要临时绕过就能起容器 |
 | [M9 之前：经由 fd 执行 memfd 和已经删除的文件](rounds/161-exec-open-file.md) | 2026-11-01 | fexecve、`/proc/<pid>/fd/<n>` 用打开文件的宿主文件执行；memfd 的 fd 与 Linux 一样不算写者；runc 起容器、`podman build --isolation chroot` 要用 |
 | [M9 之前：time 命名空间](rounds/162-time-namespaces.md) | 2026-11-01 | unshare（clone3）的 `CLONE_NEWTIME`、`/proc/<pid>/timens_offsets`、setns；单调时钟和 boottime 加偏移（含快速路径），绝对时刻的等待减偏移，uptime、sysinfo、启动时间也按它；6.2 起的放宽（线程、vfork 留在原来的，execve 再进）；dockerd、runc 要用 |
+| [M9 之前：cgroup 树：建子 cgroup、迁移进程](rounds/163-cgroup-tree.md) | 2026-11-01 | `/sys/fs/cgroup` 可写：mkdir、rmdir 子 cgroup，经由 `cgroup.procs`、`cgroup.threads`、clone3 的 `CLONE_INTO_CGROUP` 迁移进程，`subtree_control` 的规则，`cgroup.kill`，cgroup 命名空间以所在的 cgroup 为根；限制只按格式记下（下一步起作用）；`oom_score_adj` 照 Linux 解析（runc 写的带 NUL）；dockerd 建得了容器的 cgroup |
 
 ## 测量条件
 

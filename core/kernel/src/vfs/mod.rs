@@ -127,7 +127,7 @@ pub(crate) enum Fs {
     Pts,
     /// sysfs。
     Sys,
-    /// 只读的 cgroup2。
+    /// cgroup2（`crate::cgroup`）。
     Cgroup,
     /// nsfs：命名空间文件（`/proc/<pid>/ns/*` 跟随之后得到的）所在的文件系统。挂不上，只有
     /// bind 挂载出去的命名空间文件在挂载表里。
@@ -215,7 +215,8 @@ impl Fs {
                 Fs::Proc | Fs::Nsfs => PseudoNode::ProcRoot,
                 Fs::Pts => PseudoNode::PtsRoot,
                 Fs::Sys => PseudoNode::SysRoot,
-                Fs::Cgroup => PseudoNode::Cgroup(b""),
+                // 挂上时换成调用者所在的 cgroup 命名空间的根
+                Fs::Cgroup => PseudoNode::Cgroup(crate::cgroup::ROOT, b""),
                 // 挂上时换成调用者所在的 IPC 命名空间的
                 Fs::Mqueue => PseudoNode::MqRoot(crate::nsproxy::INIT_IPC_NS),
             },
@@ -622,7 +623,8 @@ impl Vfs {
                 _ => crate::debug::log(format_args!("no mount point for {fs:?}")),
             }
         }
-        // cgroup2 挂在 sysfs 的 fs/cgroup 上，只读（§8.2）
+        // cgroup2 挂在 sysfs 的 fs/cgroup 上（§8.2），与 Linux 的主机上一样可以写：dockerd、
+        // runc 在里面建容器的 cgroup
         if list.iter().any(|m| m.id == SYS_MOUNT) {
             list.push(Mount {
                 id: CGROUP_MOUNT,
@@ -632,7 +634,7 @@ impl Vfs {
                 point: Some(Node::Pseudo(SYS_MOUNT, crate::pseudo::CGROUP_POINT)),
                 at: None,
                 root_at: None,
-                flags: flags | ms::RDONLY,
+                flags,
                 dev: Fs::Cgroup.dev(),
                 source: b"cgroup".to_vec(),
                 expiring: false,
@@ -1493,11 +1495,9 @@ impl Vfs {
         self.with_mount(node.mnt(), |m| m.flags)
     }
 
-    /// `node` 在只读的挂载里，或者在 cgroup2 里（不论怎么挂的，文件都改不了、建不了子
-    /// cgroup，相当于只读的超级块）：改它是 EROFS。
+    /// `node` 在只读的挂载里：改它是 EROFS。
     pub(crate) fn readonly(&self, node: &Node) -> bool {
-        matches!(node, Node::Pseudo(_, p) if crate::pseudo::fs_of(p) == Fs::Cgroup)
-            || self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)
+        self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)
     }
 
     /// 挂载看到的部分在文件系统里的路径（mountinfo 的第四列：bind 挂载的是哪个目录、文件）。

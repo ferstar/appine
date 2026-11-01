@@ -178,6 +178,11 @@ fn new_mount(
             Node::Pseudo(0, PseudoNode::MqRoot(ipc.id)),
             Some(vfs.mq_dev(ipc.id)),
         ),
+        // cgroup2 的根是调用者所在的 cgroup 命名空间的根（Linux 的 cgroup_get_tree）
+        Fs::Cgroup => (
+            Node::Pseudo(0, PseudoNode::Cgroup(cx.ns().cgroup.root, b"")),
+            Some(fs.dev()),
+        ),
         _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),
     };
     let id = vfs.add_mount(

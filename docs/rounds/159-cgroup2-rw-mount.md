@@ -18,4 +18,4 @@
 
 **推迟项**：
 
-- 可写的挂载里写文件是 EROFS：Linux 上可写的挂载里写 cgroup 文件、建目录照常成功（权限够的话）。等可写的 cgroup。
+- 可写的挂载里写文件是 EROFS：Linux 上可写的挂载里写 cgroup 文件、建目录照常成功（权限够的话）。等可写的 cgroup。→ 已改（M9 之前：cgroup 树：建子 cgroup、迁移进程）

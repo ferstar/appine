@@ -204,6 +204,8 @@ pub(crate) struct Kernel {
     /// 各个 IPC 命名空间里的 System V IPC 对象和 POSIX 消息队列，按命名空间的编号；没有
     /// 线程用了的命名空间丢掉（[`Kernel::collect_ipc`]）。
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
+    /// cgroup 树（[`crate::cgroup`]）。
+    pub cgroups: crate::cgroup::Cgroups,
     /// 新建的网络命名空间（[`crate::nsproxy::NetNs`]）：分配宿主上的回环地址时避开还在用的。
     net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
     /// AF_UNIX socket 绑定的地址。
@@ -310,6 +312,7 @@ impl Kernel {
             locks: crate::locks::Locks::default(),
             init_ns: init_ns.clone(),
             net_nss: Vec::new(),
+            cgroups: Default::default(),
             ipcs: BTreeMap::from([(
                 init_ns.ipc.id,
                 (Rc::downgrade(&init_ns.ipc), crate::ipc::Ipc::default()),

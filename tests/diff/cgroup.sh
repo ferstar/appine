@@ -1,6 +1,8 @@
+# docker-run-options: --privileged
 # cgroup v2 的视图：/proc/<pid>/cgroup、/proc/cgroups、挂载、/sys/fs/cgroup 里文件的权限和
-# 内容，只读，以及 JVM、Node.js 看到的内存上限与 memory.max 一致。原生一侧是 docker 的容器
-# （cgroup 命名空间、没有 --memory），memory.max 等取决于宿主的值只比它们是否自洽
+# 内容，以及 JVM、Node.js 看到的内存上限与 memory.max 一致。原生一侧是 docker 的特权容器
+# （cgroup 命名空间、可写的挂载、没有 --memory），memory.max 等取决于宿主的值只比它们是否
+# 自洽。写和子 cgroup 见 cgroup-tree
 cd /sys/fs/cgroup
 echo "self: $(cat /proc/self/cgroup)"
 echo "shell: $(cat /proc/$$/cgroup)"
@@ -57,13 +59,12 @@ for f in memory.max pids.max; do
 done
 grep -qx $$ cgroup.procs && echo "the shell is in cgroup.procs"
 grep -qx $$ cgroup.threads && echo "the shell is in cgroup.threads"
-# 只读的挂载：写文件、建文件和子 cgroup、删除、改权限都是 EROFS
-echo 1 > cgroup.freeze
+# 可写的挂载（不写根的 cgroup.freeze 这些：原生一侧会冻住整个容器）：只读的文件写不了，
+# 建不了文件、删不了接口文件，子 cgroup 可以建、删
 echo 1 > memory.current
 touch new
-mkdir sub
 rm -f memory.max
-chmod 600 memory.max
+mkdir sub && rmdir sub && echo "mkdir and rmdir sub"
 # 运行时看到的内存上限：memory.max 是 max 时就是物理内存
 limit=$(cat memory.max)
 total=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) * 1024))
@@ -79,7 +80,13 @@ J
 jvm=$(java /tmp/Mem.java)
 if [ "$limit" = max ]; then want=$total; else want=$limit; fi
 [ "$jvm" = "$want" ] && echo "the JVM sees the limit" || echo "the JVM sees $jvm, not $want"
-java -XshowSettings:system -version 2>&1 | grep -E 'Provider|CPU Period|CPU Quota|CPU Shares'
+# 挂载可写时 JVM 只在有 CPU 或内存的限制时当作在容器里（appine 的 memory.max 是 OOM killer
+# 的上限，原生一侧通常没有），在容器里时没有 CPU 配额
+s=$(java -XshowSettings:system -version 2>&1)
+echo "$s" | grep Provider
+if echo "$s" | grep -q 'not containerized'; then jvm=max; else jvm=$limit; fi
+[ "$jvm" = "$limit" ] && echo "the JVM is in a container exactly when there is a limit"
+echo "$s" | grep -E 'CPU (Period|Quota|Shares)' | grep -vE ': (-1|100000us)$'
 node -e '
 const m = require("fs").readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
 const c = process.constrainedMemory();
