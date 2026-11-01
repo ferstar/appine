@@ -1,6 +1,6 @@
 # M9 之前：nftables 的子集和 socket 层的 DNAT（2026-11-01）
 
-← [M9 之前：经由虚拟网卡的连接（2026-11-01）](171-netmap.md) · [索引](../milestones.md)
+← [M9 之前：经由虚拟网卡的连接（2026-11-01）](171-netmap.md) · [索引](../milestones.md) · [M9 之前：发布的端口：PREROUTING 的 DNAT 和宿主上的转发（2026-11-01）](173-port-forwarding.md) →
 
 [容器网络的普查](169-container-network-survey.md)定下的方案 1 的第三步。[上一轮](171-netmap.md)之后，docker 自定义网络里还是不能按名字解析。dockerd 的内置 DNS 在每个容器的网络命名空间里监听 127.0.0.11 上的两个随机端口，再用 iptables 写 nat 规则，把发往 127.0.0.11:53 的转过去。Alpine 的 iptables 是 nftables 后端，走 `NETLINK_NETFILTER`，而 appine 原来没有这个协议（EPROTONOSUPPORT），所以 iptables 失败，容器里的 nslookup 等不到回答。同样的原因，`"iptables": true` 时 dockerd 起不来；podman 用 nftables 驱动时 netavark 调 nft 也失败，容器起不来。这一轮在内核层照 Linux 记下 nftables 的规则集，在 connect、sendto 时执行 OUTPUT 钩子上的 nat 链，DNAT 在 socket 层换目的地址。
 
@@ -77,7 +77,7 @@
   - podman（`firewall_driver = "nftables"`）：原来 netavark 调 nft 取规则集就失败，容器起不来。现在默认网络、容器之间、外层到容器、按名字解析都与原生一致。`-p 8080:80` 经由 127.0.0.1 和经由外层地址都拿到页面，走的是 OUTPUT 上的 DNAT（`fib daddr type local`，再 dnat 到容器）。inet netavark 表里的链与原生相同。
   - 与原生不同的地方：
     - 容器里 ping 外层的网关通了（上一轮的推迟项）。
-    - podman 占着 8080 的那个监听 socket 没有（第 4 步）。
+    - podman 占着 8080 的那个监听 socket 没有（第 4 步）。 → 有，原来是 MPTCP 的没列出来（M9 之前：发布的端口）
     - strace 解不出 netlink 消息的类型（strace 靠 `SOCK_DIAG` 认协议）；写 sysctl 的次数与原生不同（原生容器里 rp_filter 本来就是要写的值）。这两条上一轮就是这样。
   - 两个普查都没有内核层报告的内部错误。
   - podman 的 `-p` 那一节有一次"经由外层地址"是 Connection refused，重跑又拿到了页面。服务端是 `nc -l` 的循环，处理完一个请求要重起 nc；appine 里起进程慢，紧接着的第二个连接可能赶在 nc 起来之前。
@@ -87,7 +87,7 @@
 **推迟项**：
 
 - 只执行 OUTPUT 钩子上的 nat 链。别的钩子上的链只记下、能列出来，不执行：
-  - PREROUTING 的 DNAT：从宿主外面连进来的端口转发，第 4 步。
+  - PREROUTING 的 DNAT：从宿主外面连进来的端口转发，第 4 步。 → 从别的命名空间进来的执行 PREROUTING，从 appine 外面进来的由宿主上的线程转发（M9 之前：发布的端口）
   - POSTROUTING 的 SNAT、MASQUERADE。
   - INPUT、FORWARD 等过滤的链：防火墙的隔离、丢弃规则都不起作用。容器出去总是有 NAT（上一轮的推迟项）。
 - 没有 conntrack：

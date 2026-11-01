@@ -57,7 +57,7 @@
 3. **netfilter 的一个子集**（→ 已做，M9 之前：nftables 的子集和 socket 层的 DNAT；docker 自定义网络按名字解析，`"iptables": true` 的 dockerd 和 podman 的 nftables 驱动都能用了，只执行 OUTPUT 上的 nat 链）：
    - 至少要接受 docker 写进容器命名空间的那几条 nat 规则，并在 socket 层执行：发往 127.0.0.11:53 的换成那个端口，回来的源端口换回 53。这要实现 `NETLINK_NETFILTER` 上 nftables 的消息（表、链、规则的增删查），以及 iptables-nft 用的 `nft_compat` xt 目标（DNAT、SNAT）。
    - 别的规则（隔离、MASQUERADE、raw 表）接受下来、能列出来，但不执行。这一点要写进文档：防火墙的隔离不起作用。
-4. **podman 的端口发布**：只有 nftables 的 hostport DNAT 规则。在方案 1 里，要由 appine 在宿主上监听那个端口、把连接转给容器（相当于内核层里的 docker-proxy）。还要处理 podman 自己占着同一个端口的那个监听 socket。这一项可以放到最后，或者先说明 rootful podman 的 `-p` 不支持。
+4. **podman 的端口发布**（→ 已做，M9 之前：发布的端口：从别的命名空间进来的执行 PREROUTING 的 DNAT，从 appine 外面进来的由宿主上的线程转发；占端口的那个 socket 原来在，只是 MPTCP 的没列出来）：只有 nftables 的 hostport DNAT 规则。在方案 1 里，要由 appine 在宿主上监听那个端口、把连接转给容器（相当于内核层里的 docker-proxy）。还要处理 podman 自己占着同一个端口的那个监听 socket。这一项可以放到最后，或者先说明 rootful podman 的 `-p` 不支持。
 
 ## 推荐的配置
 

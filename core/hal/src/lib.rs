@@ -386,6 +386,12 @@ pub fn ioctl(fd: i32, request: u64, arg: &mut [u8]) -> Result<i32, i32> {
     if rc < 0 { Err(last_errno()) } else { Ok(rc) }
 }
 
+/// 复制一个宿主 fd（close-on-exec）。
+pub fn dup(fd: i32) -> Result<i32, i32> {
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new < 0 { Err(last_errno()) } else { Ok(new) }
+}
+
 /// 从宿主 fd 读取，遇到 `EINTR` 自动重试。
 pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
     loop {

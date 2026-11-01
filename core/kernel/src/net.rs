@@ -87,6 +87,11 @@ pub(crate) struct InetSocket {
     /// nftables 的 OUTPUT nat 换过目的地址的（[`crate::nft`]）：(换成的, guest 给的)，都是
     /// guest 的 sockaddr。从前者收到的数据报报告成来自后者（Linux 由 conntrack 换回）。
     pub nat_back: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 开机时的命名空间里监听着的、PREROUTING 有 DNAT 的端口：从宿主外面连进来的由转发线程
+    /// 转给目的地（[`crate::forward`]）。
+    pub fwd: Option<Box<crate::forward::Handle>>,
+    /// guest 调用过 listen（MPTCP 的宿主 socket 上取不到 `SO_ACCEPTCONN`）。
+    pub listening: bool,
     /// UDP：宿主上绑在 127.a.b.254 上（发给自己的虚拟地址的），端口登记在命名空间的
     /// [`crate::nsproxy::Loopback::self_udp`] 里，关掉时去掉。
     pub self_port: Option<u16>,
@@ -139,6 +144,8 @@ impl InetSocket {
             wide: false,
             vconn: None,
             nat_back: Vec::new(),
+            fwd: None,
+            listening: false,
             self_port: None,
             v6only: false,
             icmp: None,
@@ -180,6 +187,8 @@ const SO_PROTOCOL: i32 = 38;
 pub(crate) const IPPROTO_ICMP: i32 = 1;
 pub(crate) const IPPROTO_TCP: i32 = 6;
 pub(crate) const IPPROTO_UDP: i32 = 17;
+/// MPTCP 的协议号（`socket(2)` 的第三个参数，`SO_PROTOCOL` 报告它）。
+pub(crate) const IPPROTO_MPTCP: i32 = 262;
 const IPPROTO_ICMPV6: i32 = 58;
 const TCP_INFO: i32 = 11;
 /// `/proc/net` 的 st 列（Linux 的 TCP 状态，UDP 也借用其中两个）。
@@ -261,7 +270,10 @@ pub(crate) fn proc_listing(
         let proto = int(appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, 4));
         let listed = inet.family == family
             && match table {
-                Table::Tcp => inet.ty == SOCK_STREAM && proto == Some(IPPROTO_TCP),
+                // MPTCP 的 socket 也列在这里（第一个子流是 TCP socket；Go 1.24 起监听默认用它）
+                Table::Tcp => {
+                    inet.ty == SOCK_STREAM && matches!(proto, Some(IPPROTO_TCP | IPPROTO_MPTCP))
+                }
                 Table::Udp => inet.ty == SOCK_DGRAM && proto == Some(IPPROTO_UDP),
                 Table::Icmp => !inet.raw && inet.ty == SOCK_DGRAM && proto == Some(icmp),
                 Table::Raw => inet.raw,

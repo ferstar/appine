@@ -12,6 +12,7 @@ mod cred;
 mod debug;
 pub mod errno;
 mod fd;
+mod forward;
 mod futex;
 mod ipc;
 mod itimer;

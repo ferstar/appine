@@ -12,7 +12,7 @@
 //!   lookup、按编号的跳转换成名字（`__set0`）。表的句柄是命名空间里的计数器，链、规则、集合
 //!   的由表里的计数器分配；链的 USE 是被跳转引用的次数加上链里的规则数，表的 USE 是链和集合
 //!   的个数。
-//! - 执行（[`Nft::output_nat`]）：connect、sendto 时跑 nat 类型、挂在 OUTPUT 钩子上的链，DNAT
+//! - 执行（[`Nft::nat`]）：connect、sendto 时跑 nat 类型、挂在 OUTPUT 钩子上的链，DNAT
 //!   在 socket 层换目的地址（docker 写进容器的内置 DNS 规则、podman 的端口转发）。别的钩子的、
 //!   过滤的规则只记下、不执行；不认识的表达式当作规则不匹配。
 
@@ -643,7 +643,8 @@ fn valid_name(n: &[u8]) -> Result<(), Fail> {
 }
 
 impl Nft {
-    /// 没有表（不用执行规则）。
+    /// 没有表。
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
@@ -1614,8 +1615,9 @@ const NFT_BREAK: i32 = -2;
 const NFT_RETURN: i32 = -5;
 /// 跳转的深度（`NFT_JUMP_STACK_SIZE`）。
 const JUMP_STACK: usize = 16;
-/// OUTPUT 钩子（`NF_INET_LOCAL_OUT`）。
-const HOOK_LOCAL_OUT: u32 = 3;
+/// PREROUTING、OUTPUT 钩子（`NF_INET_PRE_ROUTING`、`NF_INET_LOCAL_OUT`）。
+pub(crate) const HOOK_PRE_ROUTING: u32 = 0;
+pub(crate) const HOOK_LOCAL_OUT: u32 = 3;
 const RTN_UNICAST: u32 = 1;
 const RTN_LOCAL: u32 = 2;
 const RTN_BROADCAST: u32 = 3;
@@ -1635,11 +1637,23 @@ pub(crate) struct Packet<'a> {
     pub gid: u32,
     /// 地址在这个命名空间里的类型（`RTN_LOCAL` 等，fib 的 addrtype、xt 的 addrtype 用）。
     pub addr_type: &'a dyn Fn(&[u8]) -> u32,
-    /// 出口接口的名字。
+    /// 出口接口的名字（OUTPUT 上；PREROUTING 上还没有路由，是空的）。
     pub oif: &'a dyn Fn() -> Vec<u8>,
+    /// 钩子：[`HOOK_PRE_ROUTING`] 或者 [`HOOK_LOCAL_OUT`]。
+    pub hook: u32,
+    /// 入口接口（PREROUTING 上；OUTPUT 上没有）。
+    pub iif: Option<Iif>,
 }
 
-/// OUTPUT 钩子上 nat 链的结果。
+/// 包进来的接口：编号、名字和它的第一个地址（redirect 换成这个地址，`nf_nat_redirect_ipv4`）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Iif {
+    pub index: u32,
+    pub name: Vec<u8>,
+    pub addr: Vec<u8>,
+}
+
+/// nat 链的结果。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Accept,
@@ -1942,16 +1956,31 @@ impl Eval<'_> {
             0 => self.store_u32(dreg, (self.nh.len() + self.th.len()) as u32),
             1 => self.store(dreg, if v6 { &[0x86, 0xdd] } else { &[0x08, 0x00] }),
             3 => self.store_u32(dreg, self.mark),
-            // OUTPUT 上没有入口接口：编号 0、名字是空的（nft_meta_store_ifname）
-            4 => self.store_u32(dreg, 0),
-            6 => self.store(dreg, &[0; 16]),
-            7 => {
-                let mut n = (self.p.oif)();
+            // OUTPUT 上没有入口接口、PREROUTING 上没有出口接口：编号 0、名字是空的
+            // （nft_meta_store_ifname）
+            4 => self.store_u32(dreg, self.p.iif.as_ref().map_or(0, |i| i.index)),
+            6 => {
+                let mut n = self
+                    .p
+                    .iif
+                    .as_ref()
+                    .map(|i| i.name.clone())
+                    .unwrap_or_default();
                 n.resize(16, 0);
                 self.store(dreg, &n)
             }
-            10 => self.store_u32(dreg, self.p.uid),
-            11 => self.store_u32(dreg, self.p.gid),
+            7 => {
+                let mut n = if self.p.hook == HOOK_LOCAL_OUT {
+                    (self.p.oif)()
+                } else {
+                    Vec::new()
+                };
+                n.resize(16, 0);
+                self.store(dreg, &n)
+            }
+            // PREROUTING 上的包没有 socket（取不到是不匹配）
+            10 if self.p.hook == HOOK_LOCAL_OUT => self.store_u32(dreg, self.p.uid),
+            11 if self.p.hook == HOOK_LOCAL_OUT => self.store_u32(dreg, self.p.gid),
             15 => self.store(dreg, &[if v6 { 10 } else { 2 }]),
             16 => self.store(dreg, &[self.p.proto]),
             // PACKET_HOST
@@ -2055,14 +2084,19 @@ impl Eval<'_> {
             },
             None => None,
         };
-        let lo = if self.p.dst.len() == 4 {
-            vec![127, 0, 0, 1]
-        } else {
-            let mut v = vec![0; 16];
-            v[15] = 1;
-            v
-        };
-        self.set_dnat(Some(lo), port)
+        let to = self.redirect_addr();
+        self.set_dnat(Some(to), port)
+    }
+
+    /// redirect 换成的地址：OUTPUT 上是回环地址，PREROUTING 上是入口接口的地址
+    /// （`nf_nat_redirect_ipv4`；没有地址时不换）。
+    fn redirect_addr(&self) -> Vec<u8> {
+        match &self.p.iif {
+            Some(i) if i.addr.len() == self.p.dst.len() => i.addr.clone(),
+            Some(_) => self.p.dst.to_vec(),
+            None if self.p.dst.len() == 4 => vec![127, 0, 0, 1],
+            None => std::net::Ipv6Addr::LOCALHOST.octets().to_vec(),
+        }
     }
 
     /// xt 目标（iptables-nft 的 `-j DNAT`、`-j REDIRECT`）。别的目标不改目的地址，当作
@@ -2111,12 +2145,8 @@ impl Eval<'_> {
                     return false;
                 };
                 let port = (flags & 2 != 0).then_some(port);
-                let lo = if v4 {
-                    vec![127, 0, 0, 1]
-                } else {
-                    std::net::Ipv6Addr::LOCALHOST.octets().to_vec()
-                };
-                self.set_dnat(Some(lo), port)
+                let to = self.redirect_addr();
+                self.set_dnat(Some(to), port)
             }
             b"MARK" if rev >= 1 => {
                 // xt_mark_tginfo2：mark = (mark & ~mask) ^ value
@@ -2237,9 +2267,21 @@ fn set_find(set: &Set, key: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl Nft {
-    /// 跑 OUTPUT 钩子上的 nat 链（`nf_nat_inet_fn`）：按优先级逐个，有一个做了 DNAT 或者
+    /// 钩子 `hook` 上有没有 nat 类型的基础链（没有就不必合成包）。
+    pub(crate) fn has_nat(&self, hook: u32) -> bool {
+        self.tables.iter().any(|t| {
+            t.flags & 1 == 0
+                && t.chains.iter().any(|c| {
+                    c.base
+                        .as_ref()
+                        .is_some_and(|b| b.hooknum == hook && b.ty == b"nat")
+                })
+        })
+    }
+
+    /// 跑 `p.hook` 钩子上的 nat 链（`nf_nat_inet_fn`）：按优先级逐个，有一个做了 DNAT 或者
     /// 丢弃就停。地址族：IPv4 的包看 ip、inet 的表，IPv6 的看 ip6、inet 的。
-    pub(crate) fn output_nat(&self, p: &Packet<'_>) -> Outcome {
+    pub(crate) fn nat(&self, p: &Packet<'_>) -> Outcome {
         let fam = if p.dst.len() == 4 { 2 } else { 10 };
         let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
         for t in &self.tables {
@@ -2248,7 +2290,7 @@ impl Nft {
             }
             for c in &t.chains {
                 if let Some(b) = &c.base
-                    && b.hooknum == HOOK_LOCAL_OUT
+                    && b.hooknum == p.hook
                     && b.ty == b"nat"
                 {
                     chains.push((t, c, b.priority));
@@ -2541,6 +2583,8 @@ mod tests {
             gid: 0,
             addr_type: local,
             oif: &|| b"lo".to_vec(),
+            hook: HOOK_LOCAL_OUT,
+            iif: None,
         }
     }
 
@@ -2634,15 +2678,12 @@ mod tests {
         let st = ns.nft.borrow();
         let dns = [127, 0, 0, 11];
         assert_eq!(
-            st.output_nat(&packet(17, &dns, 53, &unicast)),
+            st.nat(&packet(17, &dns, 53, &unicast)),
             Outcome::Dnat(dns.to_vec(), Some(40001))
         );
+        assert_eq!(st.nat(&packet(6, &dns, 53, &unicast)), Outcome::Accept);
         assert_eq!(
-            st.output_nat(&packet(6, &dns, 53, &unicast)),
-            Outcome::Accept
-        );
-        assert_eq!(
-            st.output_nat(&packet(17, &[127, 0, 0, 12], 53, &unicast)),
+            st.nat(&packet(17, &[127, 0, 0, 12], 53, &unicast)),
             Outcome::Accept
         );
         drop(st);
@@ -2858,21 +2899,15 @@ mod tests {
         let st = ns.nft.borrow();
         let lo = [127, 0, 0, 1];
         assert_eq!(
-            st.output_nat(&packet(6, &lo, 8080, &local)),
+            st.nat(&packet(6, &lo, 8080, &local)),
             Outcome::Dnat(vec![10, 89, 0, 2], Some(80))
         );
         assert_eq!(
-            st.output_nat(&packet(6, &[10, 1, 2, 3], 8080, &local)),
+            st.nat(&packet(6, &[10, 1, 2, 3], 8080, &local)),
             Outcome::Accept
         );
-        assert_eq!(
-            st.output_nat(&packet(17, &lo, 8080, &local)),
-            Outcome::Accept
-        );
-        assert_eq!(
-            st.output_nat(&packet(6, &lo, 8081, &local)),
-            Outcome::Accept
-        );
+        assert_eq!(st.nat(&packet(17, &lo, 8080, &local)), Outcome::Accept);
+        assert_eq!(st.nat(&packet(6, &lo, 8081, &local)), Outcome::Accept);
         drop(st);
         // 用着的集合删不掉；删掉表，什么也不剩
         let mut p = Vec::new();

@@ -73,7 +73,7 @@ pub(crate) const INIT_BLOCK: u8 = 255;
 const SELF_VIA_VADDR: u8 = 254;
 
 impl World {
-    fn init(&self) -> &Rc<NetNs> {
+    pub(crate) fn init(&self) -> &Rc<NetNs> {
         &self.all[0]
     }
 
@@ -534,7 +534,7 @@ pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<
     Some(with_ipv4(local, src))
 }
 
-/// nftables 的 OUTPUT nat（[`crate::nft::Nft::output_nat`]）：`me` 里协议 `proto`（TCP、UDP）
+/// nftables 的 OUTPUT nat（[`crate::nft::Nft::nat`]）：`me` 里协议 `proto`（TCP、UDP）
 /// 发往 guest 地址 `dst`（sockaddr）的连接、数据报。DNAT 了的返回新的目的地址，规则丢弃时
 /// 是 EPERM。`vaddr` 是 socket 绑的虚拟地址（源地址；没有时按路由选），`sport` 取本端端口。
 pub(crate) fn output_nat(
@@ -546,34 +546,175 @@ pub(crate) fn output_nat(
     uid: u32,
     gid: u32,
 ) -> Result<Option<Vec<u8>>, Errno> {
-    let nft = me.nft.borrow();
-    if nft.is_empty() {
+    if !me.nft.borrow().has_nat(crate::nft::HOOK_LOCAL_OUT) {
         return Ok(None);
     }
-    // IPv4 映射的 IPv6 地址按 IPv4 的包
-    let (ip, v4): (Vec<u8>, bool) = match (family(dst), ipv4_of(dst)) {
-        (Some(AF_INET | AF_INET6), Some(x)) => (x.to_vec(), true),
-        (Some(AF_INET6), None) if dst.len() >= 24 => (dst[8..24].to_vec(), false),
-        _ => return Ok(None),
+    let Some((ip, _)) = nat_ip(dst) else {
+        return Ok(None);
     };
-    let loopback =
-        |a: &[u8]| (a.len() == 4 && a[0] == 127) || a == std::net::Ipv6Addr::LOCALHOST.octets();
-    let local = |a: &[u8]| {
-        loopback(a)
-            || crate::netdev::interfaces(me)
-                .iter()
-                .any(|i| i.addrs.iter().any(|(_, x, _)| x == a))
-    };
-    let src = match (vaddr, v4) {
-        (Some(v), true) => v.to_vec(),
-        _ if loopback(&ip) => ip.clone(),
-        (None, true) => source(me, ip[..4].try_into().unwrap())
+    let src = match vaddr {
+        Some(v) if ip.len() == 4 => v.to_vec(),
+        _ if is_loopback(&ip) => ip.clone(),
+        _ if ip.len() == 4 => source(me, ip[..4].try_into().unwrap())
             .unwrap_or_default()
             .to_vec(),
         _ => vec![0; 16],
     };
-    let src = if src.len() == ip.len() {
-        src
+    let packet = NatPacket {
+        hook: crate::nft::HOOK_LOCAL_OUT,
+        proto,
+        src,
+        sport: sport(),
+        uid,
+        gid,
+        iif: None,
+    };
+    hook_nat(me, &packet, dst)
+}
+
+/// `me` 里发往 guest 地址 `dst` 的连接、数据报（已经换成宿主上的 `m`）进入的别的命名空间：
+/// 目的地在别的命名空间（虚拟地址）；或者经由宿主网络出去、目的地却是开机时的命名空间的
+/// 本机地址（宿主的地址：容器连外层地址上发布的端口），这时进入开机时的那个。那里的
+/// PREROUTING 要执行（[`prerouting_nat`]）。
+pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Option<Rc<NetNs>> {
+    match &m.target {
+        Some(t) if !Rc::ptr_eq(t, me) => Some(t.clone()),
+        Some(_) => None,
+        None => {
+            let init = w.init();
+            if me.host_net.is_none() || !init.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
+                return None;
+            }
+            let ip = ipv4_of(dst)?;
+            crate::netdev::interfaces(init)
+                .iter()
+                .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
+                .then(|| init.clone())
+        }
+    }
+}
+
+/// 从别的命名空间 `from` 进入 `t` 的连接、数据报（目的地是 `t` 的地址，guest 的 sockaddr
+/// `dst`；虚拟地址对谁都一样）经过 `t` 的 PREROUTING nat：DNAT 了的返回 `t` 里看到的新的目的
+/// 地址。源地址是 `from` 发往它时选的，入口接口是 `t` 里面向这个源地址的接口。
+pub(crate) fn prerouting_nat(
+    from: &NetNs,
+    t: &NetNs,
+    proto: u8,
+    sport: u16,
+    dst: &[u8],
+) -> Result<Option<Vec<u8>>, Errno> {
+    if !t.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
+        return Ok(None);
+    }
+    let Some((ip, true)) = nat_ip(dst) else {
+        return Ok(None);
+    };
+    let src = source(from, ip[..4].try_into().unwrap()).unwrap_or_default();
+    let iif = crate::netdev::route_v4(t, src).and_then(|e| {
+        let i = crate::netdev::interfaces(t)
+            .into_iter()
+            .find(|i| i.index == e.index)?;
+        Some(crate::nft::Iif {
+            index: i.index,
+            name: i.name.into_bytes(),
+            addr: crate::netdev::first_v4(t, e.index)
+                .map(|a| a.to_vec())
+                .unwrap_or_default(),
+        })
+    });
+    let packet = NatPacket {
+        hook: crate::nft::HOOK_PRE_ROUTING,
+        proto,
+        src: src.to_vec(),
+        sport,
+        uid: 0,
+        gid: 0,
+        iif: Some(iif.unwrap_or_default()),
+    };
+    hook_nat(t, &packet, dst)
+}
+
+/// 从宿主外面（别的设备、手机上的别的 App）连到开机时的命名空间 `init` 里监听着的
+/// `dst`（guest 的 sockaddr，通配地址换成宿主的一个地址）时 PREROUTING nat 的结果：源地址
+/// 当作 192.0.2.1（TEST-NET-1），入口接口是宿主上第一个有 IPv4 地址、不是回环的接口。
+pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8>> {
+    if !init.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
+        return None;
+    }
+    let ifaces = crate::netdev::interfaces(init);
+    let outer = ifaces.iter().find_map(|i| {
+        let a = i
+            .addrs
+            .iter()
+            .find(|(f, a, _)| *f == AF_INET && a.len() == 4 && a[0] != 127)?;
+        Some((i, a.1.clone()))
+    });
+    let mut dst = dst.to_vec();
+    if ipv4_of(&dst) == Some([0; 4]) {
+        dst = with_ipv4(
+            &dst,
+            outer
+                .as_ref()
+                .map_or([127, 0, 0, 1], |(_, a)| a[..4].try_into().unwrap()),
+        );
+    }
+    let packet = NatPacket {
+        hook: crate::nft::HOOK_PRE_ROUTING,
+        proto,
+        src: vec![192, 0, 2, 1],
+        sport: 40000,
+        uid: 0,
+        gid: 0,
+        iif: Some(
+            outer.map_or_else(Default::default, |(i, a)| crate::nft::Iif {
+                index: i.index,
+                name: i.name.clone().into_bytes(),
+                addr: a,
+            }),
+        ),
+    };
+    hook_nat(init, &packet, &dst).ok().flatten()
+}
+
+/// 合成的包里 socket 以外的部分（[`hook_nat`]）。
+struct NatPacket {
+    hook: u32,
+    proto: u8,
+    src: Vec<u8>,
+    sport: u16,
+    uid: u32,
+    gid: u32,
+    iif: Option<crate::nft::Iif>,
+}
+
+/// sockaddr 里要按哪种包判断：(地址, 是不是 IPv4)。IPv4 映射的 IPv6 地址按 IPv4 的包。
+fn nat_ip(dst: &[u8]) -> Option<(Vec<u8>, bool)> {
+    match (family(dst), ipv4_of(dst)) {
+        (Some(AF_INET | AF_INET6), Some(x)) => Some((x.to_vec(), true)),
+        (Some(AF_INET6), None) if dst.len() >= 24 => Some((dst[8..24].to_vec(), false)),
+        _ => None,
+    }
+}
+
+fn is_loopback(a: &[u8]) -> bool {
+    (a.len() == 4 && a[0] == 127) || a == std::net::Ipv6Addr::LOCALHOST.octets()
+}
+
+/// `ns` 的钩子 `p.hook` 上的 nat（[`crate::nft::Nft::nat`]）：发往 guest 地址 `dst` 的包，
+/// DNAT 了的返回新的目的地址（端口没换的照旧），规则丢弃时是 EPERM。
+fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
+    let Some((ip, v4)) = nat_ip(dst) else {
+        return Ok(None);
+    };
+    let local = |a: &[u8]| {
+        is_loopback(a)
+            || crate::netdev::interfaces(ns)
+                .iter()
+                .any(|i| i.addrs.iter().any(|(_, x, _)| x == a))
+    };
+    let src = if p.src.len() == ip.len() {
+        p.src.clone()
     } else {
         vec![0; ip.len()]
     };
@@ -583,27 +724,30 @@ pub(crate) fn output_nat(
             return b"lo".to_vec();
         }
         let index = v4
-            .then(|| crate::netdev::route_v4(me, ip[..4].try_into().unwrap()))
+            .then(|| crate::netdev::route_v4(ns, ip[..4].try_into().unwrap()))
             .flatten()
             .map(|e| e.index);
-        crate::netdev::interfaces(me)
+        crate::netdev::interfaces(ns)
             .into_iter()
             .find(|i| Some(i.index) == index)
             .map(|i| i.name.into_bytes())
             .unwrap_or_default()
     };
-    let p = crate::nft::Packet {
+    let packet = crate::nft::Packet {
         src: &src,
         dst: &ip,
-        proto,
-        sport: sport(),
+        proto: p.proto,
+        sport: p.sport,
         dport: u16::from_be_bytes([dst[2], dst[3]]),
-        uid,
-        gid,
+        uid: p.uid,
+        gid: p.gid,
         addr_type: &addr_type,
         oif: &oif,
+        hook: p.hook,
+        iif: p.iif.clone(),
     };
-    match nft.output_nat(&p) {
+    let outcome = ns.nft.borrow().nat(&packet);
+    match outcome {
         crate::nft::Outcome::Accept => Ok(None),
         crate::nft::Outcome::Drop => Err(Errno::EPERM),
         crate::nft::Outcome::Dnat(a, port) => {

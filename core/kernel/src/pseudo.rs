@@ -2915,7 +2915,7 @@ fn socket_net(s: &crate::net::Socket) -> u64 {
     net.map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
 }
 
-fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
+pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
     let mut tables = HashSet::new();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
