@@ -92,7 +92,8 @@ pub(crate) mod wake {
     }
 }
 
-/// 释放 BKL 时要叫醒的通道。
+/// 不持 BKL 时请求的唤醒（不该有，留着兜底）：交给下一个放开任何一把 BKL 的线程。正常的
+/// 请求按线程记（[`PENDING`]）。
 static WAKE: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
@@ -102,6 +103,37 @@ thread_local! {
     /// 这个线程持有 BKL。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
     static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 这个线程持有 BKL 期间请求的唤醒：通道（[`wake`]）和对象，放开 BKL 时由同一个线程处理
+    /// （[`Kernel::flush_wakeups`]）。按线程记，不放在全局：同一个宿主进程里可以有几个内核
+    /// （测试、App 换内核、宿主改了仓库时 [`crate::machine::store_changed`] 去拿别的内核的
+    /// BKL），各有各的 BKL 和等待者，放在全局里会被别的内核放锁时取走、清掉，这边的等待者
+    /// 就一直睡着。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static PENDING: std::cell::RefCell<(u32, Vec<wake::Object>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// 记下一次唤醒请求（[`request_wake`] 等）：持有 BKL 时记在这个线程上，否则（不该有）放进
+/// 全局的兜底里。
+fn note_wake(channels: u32, object: Option<wake::Object>) {
+    if HELD.get() {
+        PENDING.with_borrow_mut(|(c, objects)| {
+            *c |= channels;
+            if let Some(o) = object
+                && !objects.contains(&o)
+            {
+                objects.push(o);
+            }
+        });
+        return;
+    }
+    if let Some(o) = object {
+        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if !objects.contains(&o) {
+            objects.push(o);
+        }
+    }
+    WAKE.fetch_or(channels, Ordering::Relaxed);
 }
 
 /// 当前线程持有 BKL。
@@ -120,12 +152,12 @@ pub(crate) fn signal_later(event: &Arc<Event>) {
     });
 }
 
-/// 释放 BKL 时要叫醒的对象（[`request_wake_object`]）。
+/// 不持 BKL 时请求叫醒的对象（[`WAKE`] 的兜底）。
 static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
 
 /// 请求在释放 BKL 时唤醒所有等待中的线程。调用方持有 BKL。
 pub(crate) fn request_wake() {
-    WAKE.fetch_or(wake::ALL, Ordering::Relaxed);
+    note_wake(wake::ALL, None);
 }
 
 /// 文件锁、租约或者打开文件的位置锁放开了、变了：只叫醒关心 [`wake::LOCK`] 的等待者。
@@ -137,7 +169,7 @@ pub(crate) fn request_wake_locks() {
 /// 请求在释放 BKL 时叫醒关心 `channels`（[`wake`]）里任何一个通道的等待者。调用方持有
 /// BKL。
 pub(crate) fn request_wake_on(channels: u32) {
-    WAKE.fetch_or(channels, Ordering::Relaxed);
+    note_wake(channels, None);
 }
 
 /// 只影响对象 `object` 的修改（管道里的数据、eventfd 的计数、PTY 的输入输出、AF_UNIX
@@ -146,11 +178,7 @@ pub(crate) fn request_wake_on(channels: u32) {
 /// 管道读写都把读着别的管道的进程（`$(...)` 外面的 shell、`tail`）叫醒一遍，poll、epoll
 /// 的等待者也被每一次这样的修改叫醒。调用方持有 BKL。
 pub(crate) fn request_wake_object(object: wake::Object) {
-    let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-    if !objects.contains(&object) {
-        objects.push(object);
-    }
-    WAKE.fetch_or(wake::OBJECTS, Ordering::Relaxed);
+    note_wake(wake::OBJECTS, Some(object));
 }
 
 /// 一个正在等待的线程：它的事件、它关心的通道（[`wake`]）和它等的对象（排好序；None
@@ -626,11 +654,16 @@ impl Kernel {
     }
 
     fn flush_wakeups(&self) {
-        let channels = WAKE.swap(0, Ordering::AcqRel);
+        let (mut channels, mut objects) = PENDING.with_borrow_mut(std::mem::take);
+        let stray = WAKE.swap(0, Ordering::AcqRel);
+        if stray != 0 {
+            channels |= stray;
+            let mut more = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
+            objects.append(&mut more);
+        }
         if channels == 0 {
             return;
         }
-        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
         for (event, interest, wanted) in &self.waiters {
             let hit = interest & channels & wake::ALL != 0
                 || interest & wake::FILE != 0
@@ -642,7 +675,6 @@ impl Kernel {
                 signal_later(event);
             }
         }
-        objects.clear();
     }
 }
 
@@ -1176,5 +1208,31 @@ impl Drop for Relock<'_, '_> {
             self.0.k = Some(self.0.shared.lock());
         }
         self.0.task.sleeping.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::Tier;
+
+    /// 同一个宿主进程里的两个内核：A 持锁时请求的唤醒，不会被 B 在这期间放锁时取走
+    /// （[`PENDING`]）。原来放在全局里，B 放锁时清掉了，A 的等待者一直睡着。
+    #[test]
+    fn wakeups_stay_with_their_kernel() {
+        let a = Shared::new(Kernel::new(Tier::Interpreter));
+        let b = Shared::new(Kernel::new(Tier::Interpreter));
+        let event = Arc::new(Event::new().unwrap());
+        a.lock().waiters.push((event.clone(), wake::LOCK, None));
+        // 放锁时可能顺带处理了别的测试不持 BKL 时的请求（全局的兜底），从这里开始算
+        event.clear();
+        let k = a.lock();
+        request_wake_on(wake::LOCK);
+        std::thread::scope(|s| {
+            s.spawn(|| drop(b.lock())).join().unwrap();
+        });
+        assert!(!event.is_signaled());
+        drop(k);
+        assert!(event.is_signaled());
     }
 }
