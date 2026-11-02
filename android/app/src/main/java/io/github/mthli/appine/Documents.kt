@@ -4,6 +4,8 @@ import android.content.Context
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.os.CancellationSignal
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.os.storage.StorageManager
@@ -11,8 +13,12 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
+import android.system.ErrnoException
+import android.system.Os
+import android.util.Log
 import android.webkit.MimeTypeMap
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
 import kotlin.concurrent.read
@@ -27,7 +33,9 @@ import kotlin.concurrent.read
  *
  * 家目录里面可以新建、写、删除、改名、移动（家目录本身只能在里面新建），新建的属于登录账号；
  * 别处（整个系统那个根）只读。按真实路径限制：经由符号链接写到家目录外面去的不行。改了之后
- * 通知"文件"App 刷新那个目录；guest 里的改动它不知道（内核没有告诉 provider）。
+ * 通知"文件"App 刷新那个目录，也告诉运行中的内核，guest 里监视着的程序收到 inotify 事件
+ * （[Native.browseWritten]）。反过来，guest 改了目录项（新建、删除、改名）时服务定时取走
+ * （[Native.takeChangedDirs]），通知"文件"App 刷新那个目录（[dirsChanged]）。
  *
  * 没打开整个系统时，只认家目录里面的文档：以前打开时授予别的 App 的 `/` 的权限，关掉之后也
  * 用不了了；换了登录账号，原来那个家目录也一样。
@@ -111,8 +119,29 @@ class Documents : DocumentsProvider() {
         val path = writable(home, documentId)
         val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
         val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
-        return ParcelFileDescriptor.adoptFd(browse { Native.browseOpenWrite(it, home.path, path, truncate, append) })
+        val opened = ParcelFileDescriptor.adoptFd(browse { Native.browseOpenWrite(it, home.path, path, truncate, append) })
+        // 对方直接写宿主的 object，写了什么、什么时候关，内核都看不到：按 object 的路径重新打开、
+        // 带上关闭的回调，关闭时告诉运行中的内核（guest 里监视着的程序收到 IN_MODIFY、
+        // IN_CLOSE_WRITE）。截断已经做过了
+        return try {
+            val file = File(Os.readlink("/proc/self/fd/${opened.fd}"))
+            val mode = flags and ParcelFileDescriptor.MODE_TRUNCATE.inv()
+            ParcelFileDescriptor.open(file, mode, closer) {
+                runCatching { browse { Native.browseWritten(it, home.path, path) } }
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "cannot watch $documentId for closing", e)
+            ParcelFileDescriptor.dup(opened.fileDescriptor)
+        } catch (e: ErrnoException) {
+            Log.w(TAG, "cannot watch $documentId for closing", e)
+            ParcelFileDescriptor.dup(opened.fileDescriptor)
+        } finally {
+            opened.close()
+        }
     }
+
+    /** 交出去写的文件关闭时的回调在这个线程上（[openDocument]）。 */
+    private val closer: Handler by lazy { Handler(HandlerThread("documents-close").apply { start() }.looper) }
 
     override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
         val context = attached()
@@ -275,6 +304,8 @@ class Documents : DocumentsProvider() {
         const val ROOT_HOME = "home"
         const val ROOT_SYSTEM = "system"
 
+        private const val TAG = "appine"
+
         /** 一次搜索最多给出这么多个。 */
         private const val SEARCH_LIMIT = 200
 
@@ -294,6 +325,13 @@ class Documents : DocumentsProvider() {
         /** 登录账号、仓库、"显示整个系统"变了：让"文件"App 重新读根。 */
         fun rootsChanged(context: Context) {
             context.contentResolver.notifyChange(DocumentsContract.buildRootsUri(authority(context)), null)
+        }
+
+        /** guest 改了这些目录里的东西（[Native.takeChangedDirs]）："文件"App 正在看的话重新列。 */
+        fun dirsChanged(context: Context, dirs: Array<String>) {
+            for (dir in dirs) {
+                context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
+            }
         }
 
         /** 规范的路径：`/` 开头，没有空的、`.`、`..` 组件，不以 `/` 结尾（`/` 本身除外）。不是时是 null。 */

@@ -819,6 +819,65 @@ class MachineTest {
         }
     }
 
+    /**
+     * "文件"App 改的东西交给运行中的内核，guest 里监视着的程序收到 inotify 事件：写的文件在"文件"App
+     * 这一侧关闭时才报（[Documents.openDocument] 带着关闭的回调重新打开 object）。反过来，guest 改过
+     * 目录项的目录由 [Native.takeChangedDirs] 取走，[Documents.dirsChanged] 通知"文件"App 刷新。
+     */
+    @Test
+    fun documentsChangesReachTheKernelAndBack() {
+        val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        val machine = start(1)
+        val dw = "/home/bob/dw"
+        val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir $dw && chown bob:bob $dw"
+        assertEquals(0, sh(machine, setup).second)
+        prefs.edit().putString("login", "bob").putBoolean("system_documents", false).commit()
+        val resolver = context.contentResolver
+        val authority = Documents.authority(context)
+        fun uri(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
+        try {
+            // busybox 的 inotifyd 印成"字母\t目录\t名字"：n 新建，c 修改，r 打开，w 写完关闭，m、y 移出移入，
+            // d 删除。它在自己的控制台上跑，读到它退出（timeout）为止
+            val console = Native.openConsole(machine, 24, 200)
+            val argv = arrayOf("sh", "-c", "timeout 6 inotifyd - $dw")
+            val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+            var out = ""
+            val reader = thread { out = readAll(machine, console) }
+            Thread.sleep(1500)
+            val created = DocumentsContract.createDocument(resolver, uri(dw), "text/plain", "w.txt")!!
+            resolver.openOutputStream(created, "wt")!!.use { it.write("from Files".toByteArray()) }
+            val renamed = DocumentsContract.renameDocument(resolver, created, "v.txt")!!
+            assertTrue(DocumentsContract.deleteDocument(resolver, renamed))
+            Native.waitFor(machine, pid)
+            reader.join(5000)
+            Native.closeConsole(machine, console)
+            val log = out.lines().joinToString("\n") { it.split('\t').let { f -> "${f[0]}\t${f.getOrElse(2) { "" }}" } }
+            val want = listOf("n\tw.txt", "w\tw.txt", "m\tw.txt", "y\tv.txt", "d\tv.txt")
+            assertTrue(out, want.all { log.lines().contains(it) })
+            val lines = log.lines()
+            assertTrue(log, lines.indexOf("w\tw.txt") > lines.indexOf("n\tw.txt"))
+            // guest 改过目录项的目录：第一次取时才开始记，通知之后"文件"App 的观察者收到
+            Native.takeChangedDirs(machine)
+            assertEquals(0, sh(machine, "touch $dw/from-guest").second)
+            val dirs = Native.takeChangedDirs(machine)!!
+            assertTrue(dirs.joinToString(), dw in dirs)
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val observer = object : android.database.ContentObserver(null) {
+                override fun onChange(selfChange: Boolean) = latch.countDown()
+            }
+            resolver.registerContentObserver(DocumentsContract.buildChildDocumentsUri(authority, dw), false, observer)
+            try {
+                Documents.dirsChanged(context, dirs)
+                assertTrue(latch.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            } finally {
+                resolver.unregisterContentObserver(observer)
+            }
+        } finally {
+            prefs.edit().remove("login").remove("system_documents").commit()
+            sh(machine, "deluser --remove-home bob")
+        }
+    }
+
     private fun depth(n: Int): Int = if (n < 0) 0 else depth(n + 1) + 1
 
     /**

@@ -64,6 +64,38 @@ pub enum Stdio {
     Console(u32),
 }
 
+/// 正在运行、用着仓库的内核：宿主另外打开仓库改了东西时（[`crate::browse_changing`]）找到
+/// 它们报 inotify 事件（[`store_changed`]）。仓库目录按规范化的路径比；内核停了弱引用就
+/// 失效，下次登记、查找时清掉。
+static RUNNING: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<Shared>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 宿主改了仓库 `store` 里的 `changes`：交给用着它、正在运行的内核，各自持着 BKL 照对应的
+/// syscall 报 inotify 事件（[`crate::syscall::host_change`]）。
+pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::browse::Change]) {
+    if changes.is_empty() {
+        return;
+    }
+    let dir = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
+    let kernels: Vec<Arc<Shared>> = {
+        let mut running = RUNNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.retain(|(_, w)| w.strong_count() > 0);
+        running
+            .iter()
+            .filter(|(d, _)| *d == dir)
+            .filter_map(|(_, w)| w.upgrade())
+            .collect()
+    };
+    for shared in kernels {
+        let k = shared.lock();
+        for c in changes {
+            crate::syscall::host_change(&k, c);
+        }
+    }
+}
+
 /// 一个 guest 内核实例。析构时结束所有 guest 进程。
 pub struct Machine {
     shared: Arc<Shared>,
@@ -115,6 +147,14 @@ impl Machine {
                 .unwrap_or(crate::portmap::DEFAULT_OFFSET);
             let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
             k.groups.insert(INIT, Rc::new(RefCell::new(init)));
+        }
+        if let Some(dir) = &options.rootfs {
+            let dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            let mut running = RUNNING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            running.retain(|(_, w)| w.strong_count() > 0);
+            running.push((dir, Arc::downgrade(&shared)));
         }
         let timer_shared = shared.clone();
         let timers = std::thread::Builder::new()
@@ -689,6 +729,24 @@ impl Machine {
     pub fn take_kills(&self) -> Vec<crate::KillReport> {
         crate::bug::host_call("Machine::take_kills", || {
             std::mem::take(&mut *self.shared.lock().kills.borrow_mut())
+        })
+        .unwrap_or_default()
+    }
+
+    /// 取走 guest 改过目录项（新建、删除、改名）的目录在仓库里的路径：App 让"文件"App 刷新
+    /// 它们（设计文档 §11.3）。第一次调用时才开始记；删掉了的、tmpfs 里的不给。
+    pub fn take_changed_dirs(&self) -> Vec<Vec<u8>> {
+        crate::bug::host_call("Machine::take_changed_dirs", || {
+            let k = self.shared.lock();
+            let Some(vfs) = &k.vfs else {
+                return Vec::new();
+            };
+            let store = vfs.store();
+            store
+                .take_changed_dirs()
+                .into_iter()
+                .filter_map(|d| crate::vfs::browse::dir_path(store, d).ok())
+                .collect()
         })
         .unwrap_or_default()
     }

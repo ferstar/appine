@@ -32,7 +32,7 @@ mod xattr;
 pub(crate) use aio::{AioContext, released as aio_released};
 pub(crate) use fs::ENTROPY;
 pub(crate) use fs::{create_exclusive, unlink_path, write_at};
-pub(crate) use inotify::{Inotify, Opened, Registry};
+pub(crate) use inotify::{Inotify, Opened, Registry, host_change};
 pub(crate) use lease::Lease;
 pub(crate) use misc::Restart;
 pub(crate) use mount::collect_namespaces;

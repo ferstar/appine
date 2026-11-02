@@ -67,7 +67,7 @@ M9 计划的最后一轮，接着[上一轮](196-documents-read.md)的只读浏�
 
 **推迟项**：
 
-- "文件"App 做的修改不产生 inotify 事件，guest 里监视着的程序（编辑器、构建工具的 watch）不知道。
+- "文件"App 做的修改不产生 inotify 事件，guest 里监视着的程序（编辑器、构建工具的 watch）不知道。→ 已改：交给运行中的内核报事件，写的文件在对方关闭时报 `IN_MODIFY`、`IN_CLOSE_WRITE`（[M9："文件"App 与 guest 双向的通知](201-documents-notify.md)）
 - 不检查 guest 的权限：家目录里属于 root 的文件也能改、删（这台设备的用户在终端里本来就能 `doas`）。
 - 覆盖正在运行的程序不像 guest 里那样是 ETXTBSY。
 - 只能改家目录：要放到别处（`/opt`、`/srv`）得先复制进家目录，再在终端里移过去。

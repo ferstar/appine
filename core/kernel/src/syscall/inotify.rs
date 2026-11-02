@@ -30,6 +30,7 @@ use crate::cred::MAY_READ;
 use crate::errno::Errno;
 use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, request_wake_object, wake};
+use crate::vfs::browse::Change;
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
@@ -515,6 +516,74 @@ pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
             .entry(ino)
             .or_default()
             .extend(open);
+    }
+}
+
+/// 宿主另外打开仓库改了的（"文件"App，[`crate::browse_changing`]）：照对应的 syscall 报
+/// 事件——新建同 mkdirat、openat 的 `O_CREAT`，删除同 unlinkat，移动同 renameat2 的
+/// `RENAME_NOREPLACE`，为写打开同 openat（截断时先 `IN_MODIFY`），关闭时补上对方的写
+/// （`IN_MODIFY`）和 `IN_CLOSE_WRITE`。持有 BKL 时调用。
+pub(crate) fn host_change(k: &Kernel, c: &Change) {
+    let isdir = |d: bool| if d { IN_ISDIR } else { 0 };
+    // 经由移动的名字打开着的文件跟着改名，没有监视时也要（之后的监视用得到）
+    if let Change::Moved { from, to, ino, .. } = c {
+        renamed(k, (from.0, &from.1), (to.0, &to.1), || Some(*ino));
+    }
+    if idle(k) {
+        return;
+    }
+    match c {
+        Change::Created { dir, name, is_dir } => {
+            dir_event(k, *dir, name, IN_CREATE | isdir(*is_dir), 0);
+        }
+        Change::Removed {
+            dir,
+            name,
+            ino,
+            is_dir: true,
+        } => {
+            deleted(k, *ino, *dir, name);
+            dir_event(k, *dir, name, IN_DELETE | IN_ISDIR, 0);
+        }
+        Change::Removed { dir, name, ino, .. } => {
+            path_event(k, *ino, None, IN_ATTRIB);
+            let nlink = k
+                .vfs
+                .as_ref()
+                .and_then(|v| v.store().stat(*ino).ok())
+                .map_or(0, |st| st.nlink);
+            if nlink == 0 {
+                deleted(k, *ino, *dir, name);
+            }
+            dir_event(k, *dir, name, IN_DELETE, 0);
+        }
+        Change::Moved {
+            from,
+            to,
+            ino,
+            is_dir,
+        } => {
+            let cookie = cookie(k);
+            dir_event(k, from.0, &from.1, IN_MOVED_FROM | isdir(*is_dir), cookie);
+            dir_event(k, to.0, &to.1, IN_MOVED_TO | isdir(*is_dir), cookie);
+            path_event(k, *ino, None, IN_MOVE_SELF);
+        }
+        Change::Opened {
+            ino,
+            parent,
+            truncated,
+        } => {
+            let parent = Some((parent.0, parent.1.as_slice()));
+            if *truncated {
+                path_event(k, *ino, parent, IN_MODIFY);
+            }
+            path_event(k, *ino, parent, IN_OPEN);
+        }
+        Change::Written { ino, parent } => {
+            let parent = Some((parent.0, parent.1.as_slice()));
+            path_event(k, *ino, parent, IN_MODIFY);
+            path_event(k, *ino, parent, IN_CLOSE_WRITE);
+        }
     }
 }
 

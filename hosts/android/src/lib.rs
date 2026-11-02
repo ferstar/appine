@@ -371,7 +371,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
     ) else {
         return std::ptr::null_mut();
     };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
+    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
         browse::create(
             s,
             &browse::decode_path(&top),
@@ -379,6 +379,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
             name.as_bytes(),
             directory != 0,
             (uid as u32, gid as u32),
+            changes,
         )
     });
     match r {
@@ -391,6 +392,33 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
             std::ptr::null_mut()
         }
     }
+}
+
+/// [browseOpenWrite] 交出去的文件关闭了：告诉运行中的内核它被写过（guest 里监视着的程序
+/// 收到 `IN_MODIFY`、`IN_CLOSE_WRITE`）。文件这期间不在了也不报错。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseWritten<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    path: JString<'l>,
+) {
+    let (Some(store), Some(top), Some(path)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &path),
+    ) else {
+        return;
+    };
+    let _ = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+        browse::written(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&path),
+            changes,
+        )
+    });
 }
 
 /// 删除文件、符号链接或者整个目录树。
@@ -409,8 +437,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
     ) else {
         return;
     };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
-        browse::remove(s, &browse::decode_path(&top), &browse::decode_path(&path))
+    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+        browse::remove(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&path),
+            changes,
+        )
     });
     if let Err(e) = r {
         not_found(&mut env, "delete", &path, e);
@@ -435,12 +468,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRename<'l>(
     ) else {
         return std::ptr::null_mut();
     };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
+    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
         browse::rename(
             s,
             &browse::decode_path(&top),
             &browse::decode_path(&path),
             name.as_bytes(),
+            changes,
         )
     });
     match r {
@@ -473,12 +507,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseMove<'l>(
     ) else {
         return;
     };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
+    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
         browse::move_to(
             s,
             &browse::decode_path(&top),
             &browse::decode_path(&path),
             &browse::decode_path(&to),
+            changes,
         )
     });
     if let Err(e) = r {
@@ -505,13 +540,14 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
     ) else {
         return -1;
     };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
+    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
         browse::open_write(
             s,
             &browse::decode_path(&top),
             &browse::decode_path(&path),
             truncate != 0,
             append != 0,
+            changes,
         )
     });
     match r {
@@ -694,6 +730,22 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
 
 /// 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 #7）：每一项是
 /// `<进程名>\t<端口>\t<宿主上的端口>`，没有时是空数组。
+/// guest 改过目录项的目录（[`browse::encode_path`] 的写法，就是文档 ID）："文件"App 刷新它们。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jobjectArray {
+    let dirs: Vec<String> = machine(handle)
+        .map(|m| m.take_changed_dirs())
+        .unwrap_or_default()
+        .iter()
+        .map(|d| browse::encode_path(d))
+        .collect();
+    string_array(&mut env, &dirs)
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
     mut env: JNIEnv<'l>,

@@ -1961,3 +1961,79 @@ tty1::respawn:/sbin/getty 38400 tty1
     .unwrap();
     assert!(stdout(&out).ends_with("shutdown\n"), "{}", stdout(&out));
 }
+
+#[test]
+fn files_app_changes_reach_inotify_watchers() {
+    // "文件"App 改的东西（宿主另外打开仓库，appine_kernel::browse_changing）交给运行中的内核，
+    // guest 里监视着的程序照样收到事件：新建、为写打开（截断）、关闭时的写、改名、删除。
+    // busybox 的 inotifyd 把事件印成"字母\t目录\t名字"，字母按事件位的顺序是 acew0rmynd：
+    // c 是 IN_MODIFY，r 是 IN_OPEN，w 是 IN_CLOSE_WRITE，m、y 是移出、移入
+    use appine_kernel::vfs::browse;
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    use std::io::Write;
+    let Some(store) = store() else {
+        return;
+    };
+    let machine = Machine::start(&MachineOptions {
+        tier: Tier::Dbt,
+        rootfs: Some(store.to_path_buf()),
+        memory_limit: None,
+        low_port_offset: None,
+    })
+    .unwrap();
+    let env = [PATH.as_bytes().to_vec()];
+    let id = machine.open_console(24, 200).unwrap();
+    let script = "rm -rf /root/fw; mkdir /root/fw; timeout 4 inotifyd - /root/fw & \
+                  sleep 1; echo ready; wait";
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    let host = {
+        let store = store.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let top = b"/root".as_slice();
+            let s = store.as_path();
+            let ok = |r: Result<(), appine_kernel::errno::Errno>| r.unwrap();
+            ok(appine_kernel::browse_changing(s, |s, c| {
+                browse::create(s, top, b"/root/fw", b"a.txt", false, (0, 0), c).map(drop)
+            }));
+            ok(appine_kernel::browse_changing(s, |s, c| {
+                browse::open_write(s, top, b"/root/fw/a.txt", true, false, c)?
+                    .write_all(b"edited\n")
+                    .map_err(|_| appine_kernel::errno::Errno::EIO)
+            }));
+            ok(appine_kernel::browse_changing(s, |s, c| {
+                browse::written(s, top, b"/root/fw/a.txt", c)
+            }));
+            ok(appine_kernel::browse_changing(s, |s, c| {
+                browse::rename(s, top, b"/root/fw/a.txt", b"b.txt", c)
+            }));
+            ok(appine_kernel::browse_changing(s, |s, c| {
+                browse::remove(s, top, b"/root/fw/b.txt", c)
+            }));
+        })
+    };
+    let out = read_console(&machine, id);
+    host.join().unwrap();
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    let events = out.split_once("ready\n").map(|(_, e)| e).unwrap_or(&out);
+    assert_eq!(
+        events,
+        "n\t/root/fw\ta.txt\nc\t/root/fw\ta.txt\nr\t/root/fw\ta.txt\n\
+         c\t/root/fw\ta.txt\nw\t/root/fw\ta.txt\nm\t/root/fw\ta.txt\ny\t/root/fw\tb.txt\n\
+         d\t/root/fw\tb.txt\n",
+        "{out}"
+    );
+    // 反过来，guest 改过目录项的目录交给 App（"文件"App 刷新它们）：第一次取时才开始记
+    assert!(machine.take_changed_dirs().is_empty());
+    let script = "mkdir /root/fw/d && touch /root/fw/d/f && echo x > /root/fw/d/f";
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine.spawn(b"/bin/sh", &argv, &env, Stdio::Host).unwrap();
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    let mut dirs = machine.take_changed_dirs();
+    dirs.sort();
+    assert_eq!(dirs, [b"/root/fw".to_vec(), b"/root/fw/d".to_vec()]);
+    assert!(machine.take_changed_dirs().is_empty());
+}

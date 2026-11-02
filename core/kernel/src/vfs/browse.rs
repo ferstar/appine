@@ -16,6 +16,41 @@ use crate::errno::Errno;
 /// 跟随符号链接的次数上限，与 Linux 的 `MAXSYMLINKS` 相同。
 const MAX_LINKS: usize = 40;
 
+/// 宿主改了仓库里的什么（[`crate::browse_changing`]）：交给用着同一个仓库、正在运行的内核，
+/// 它照对应的 syscall 报 inotify 事件，guest 里监视着的程序（编辑器、构建工具的 watch）就
+/// 知道"文件"App 改了文件。目录和名字都是仓库里的 inode 和目录项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// 在目录 `dir` 里新建了 `name`。
+    Created {
+        dir: Ino,
+        name: Vec<u8>,
+        is_dir: bool,
+    },
+    /// 删除了目录 `dir` 里的 `name`（原来是 `ino`）。整个目录树是先里后外一项一项删的。
+    Removed {
+        dir: Ino,
+        name: Vec<u8>,
+        ino: Ino,
+        is_dir: bool,
+    },
+    /// `ino` 从 `from` 移到了 `to`（目录和名字），不覆盖。
+    Moved {
+        from: (Ino, Vec<u8>),
+        to: (Ino, Vec<u8>),
+        ino: Ino,
+        is_dir: bool,
+    },
+    /// 普通文件 `ino`（在目录 `parent.0` 里叫 `parent.1`）为写打开，`truncated` 时截断过。
+    Opened {
+        ino: Ino,
+        parent: (Ino, Vec<u8>),
+        truncated: bool,
+    },
+    /// 为写打开的普通文件关闭了：写了些什么（对方直接写宿主的 object，内核看不到每一次写）。
+    Written { ino: Ino, parent: (Ino, Vec<u8>) },
+}
+
 /// 目录里的一项：名字和它（符号链接跟随之后）的元数据。
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -244,6 +279,7 @@ pub fn create(
     name: &[u8],
     directory: bool,
     (uid, gid): (u32, u32),
+    changes: &mut Vec<Change>,
 ) -> Result<Vec<u8>, Errno> {
     check_name(name)?;
     let dir = dir_in(store, top, dir)?;
@@ -260,7 +296,14 @@ pub fn create(
             store.create_file(dir, &name, 0o644, uid, gid).map(drop)
         };
         match r {
-            Ok(()) => return Ok(name),
+            Ok(()) => {
+                changes.push(Change::Created {
+                    dir,
+                    name: name.clone(),
+                    is_dir: directory,
+                });
+                return Ok(name);
+            }
             Err(Errno::EEXIST) => continue,
             Err(e) => return Err(e),
         }
@@ -269,38 +312,88 @@ pub fn create(
 }
 
 /// 删除 `top` 里面的文件、符号链接或者整个目录树（符号链接只删链接）。
-pub fn remove(store: &Store, top: &[u8], path: &[u8]) -> Result<(), Errno> {
+pub fn remove(
+    store: &Store,
+    top: &[u8],
+    path: &[u8],
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
     let (dir, name) = entry_in(store, top, path)?;
-    remove_tree(store, dir, &name)
+    remove_tree(store, dir, &name, changes)
 }
 
-fn remove_tree(store: &Store, dir: Ino, name: &[u8]) -> Result<(), Errno> {
+fn remove_tree(
+    store: &Store,
+    dir: Ino,
+    name: &[u8],
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
     let ino = store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
-    if store.kind(ino)? != mode::S_IFDIR {
-        return store.unlink(dir, name);
+    let is_dir = store.kind(ino)? == mode::S_IFDIR;
+    if is_dir {
+        for e in store.readdir(ino)? {
+            remove_tree(store, ino, &e.name, changes)?;
+        }
+        store.rmdir(dir, name)?;
+    } else {
+        store.unlink(dir, name)?;
     }
-    for e in store.readdir(ino)? {
-        remove_tree(store, ino, &e.name)?;
-    }
-    store.rmdir(dir, name)
+    changes.push(Change::Removed {
+        dir,
+        name: name.to_vec(),
+        ino,
+        is_dir,
+    });
+    Ok(())
+}
+
+/// 把 `ino` 从 `from` 移到 `to`（不覆盖），记下来。
+fn moved(
+    store: &Store,
+    from: (Ino, &[u8]),
+    to: (Ino, &[u8]),
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
+    let ino = store.lookup(from.0, from.1)?.ok_or(Errno::ENOENT)?;
+    let is_dir = store.kind(ino)? == mode::S_IFDIR;
+    store.rename(from.0, from.1, to.0, to.1, true, false)?;
+    changes.push(Change::Moved {
+        from: (from.0, from.1.to_vec()),
+        to: (to.0, to.1.to_vec()),
+        ino,
+        is_dir,
+    });
+    Ok(())
 }
 
 /// 在同一个目录里改名；新的名字已经有了是 EEXIST，不覆盖。
-pub fn rename(store: &Store, top: &[u8], path: &[u8], new_name: &[u8]) -> Result<(), Errno> {
+pub fn rename(
+    store: &Store,
+    top: &[u8],
+    path: &[u8],
+    new_name: &[u8],
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
     check_name(new_name)?;
     let (dir, name) = entry_in(store, top, path)?;
     if name == new_name {
         return Ok(());
     }
-    store.rename(dir, &name, dir, new_name, true, false)
+    moved(store, (dir, &name), (dir, new_name), changes)
 }
 
 /// 移到 `top` 里面的另一个目录 `to`，名字不变；那里已经有了是 EEXIST，目录移进自己里面是
 /// EINVAL。
-pub fn move_to(store: &Store, top: &[u8], path: &[u8], to: &[u8]) -> Result<(), Errno> {
+pub fn move_to(
+    store: &Store,
+    top: &[u8],
+    path: &[u8],
+    to: &[u8],
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
     let (dir, name) = entry_in(store, top, path)?;
     let to = dir_in(store, top, to)?;
-    store.rename(dir, &name, to, &name, true, false)
+    moved(store, (dir, &name), (to, &name), changes)
 }
 
 /// 打开 `top` 里面的普通文件读写（符号链接跟随，指向的文件也要在 `top` 里面），`truncate`
@@ -311,9 +404,39 @@ pub fn open_write(
     path: &[u8],
     truncate: bool,
     append: bool,
+    changes: &mut Vec<Change>,
 ) -> Result<File, Errno> {
+    let (ino, parent) = writable_file(store, top, path)?;
+    let file = store.open_object_append(ino, append)?;
+    if truncate {
+        store.truncate(ino, 0)?;
+    }
+    changes.push(Change::Opened {
+        ino,
+        parent,
+        truncated: truncate,
+    });
+    Ok(file)
+}
+
+/// [`open_write`] 打开的文件关闭了（对方写的是宿主的 object，不经过这里）：记下
+/// [`Change::Written`]。文件这期间被删掉、移走了就不记。
+pub fn written(
+    store: &Store,
+    top: &[u8],
+    path: &[u8],
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
+    let (ino, parent) = writable_file(store, top, path)?;
+    changes.push(Change::Written { ino, parent });
+    Ok(())
+}
+
+/// `top` 里面的普通文件 `path`（符号链接跟随，指向的文件也要在 `top` 里面）：它的 inode，
+/// 以及真实路径上所在的目录和名字。
+fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, Vec<u8>)), Errno> {
     let top = top_of(store, top)?;
-    let (ino, real) = walk(store, path)?;
+    let (ino, mut real) = walk(store, path)?;
     if !real.starts_with(&top) {
         return Err(Errno::EACCES);
     }
@@ -322,11 +445,26 @@ pub fn open_write(
         mode::S_IFDIR => return Err(Errno::EISDIR),
         _ => return Err(Errno::ENOENT),
     }
-    let file = store.open_object_append(ino, append)?;
-    if truncate {
-        store.truncate(ino, 0)?;
+    let name = real.pop().ok_or(Errno::EISDIR)?;
+    let dir = resolve(store, &join(&real))?;
+    Ok((ino, (dir, name)))
+}
+
+/// 目录 `dir` 在仓库里的路径（按各级目录记着的上级和名字往上找）。删掉了的、不挂在根目录
+/// 下面的（tmpfs 的根）是 ENOENT。
+pub fn dir_path(store: &Store, dir: Ino) -> Result<Vec<u8>, Errno> {
+    let mut comps = Vec::new();
+    let mut cur = dir;
+    while cur != ROOT {
+        let up = store.parent(cur)?;
+        if up == cur || comps.len() > 4096 {
+            return Err(Errno::ENOENT);
+        }
+        comps.push(store.name_of(up, cur)?.ok_or(Errno::ENOENT)?);
+        cur = up;
     }
-    Ok(file)
+    comps.reverse();
+    Ok(join(&comps))
 }
 
 /// 组件拼成绝对路径。
@@ -516,6 +654,7 @@ mod tests {
         let (s, dir) = sample("write");
         let top = b"/home/alice";
         let owner = (1000, 1000);
+        let mut c = Vec::new();
         let read = |p: &[u8]| {
             let mut text = String::new();
             open(&s, p).unwrap().read_to_string(&mut text).unwrap();
@@ -523,25 +662,28 @@ mod tests {
         };
         // 名字已经有了时换一个；扩展名留在最后，点开头的名字没有扩展名
         assert_eq!(
-            create(&s, top, top, b"a.txt", false, owner).unwrap(),
+            create(&s, top, top, b"a.txt", false, owner, &mut c).unwrap(),
             b"a.txt"
         );
         assert_eq!(
-            create(&s, top, top, b"a.txt", false, owner).unwrap(),
+            create(&s, top, top, b"a.txt", false, owner, &mut c).unwrap(),
             b"a (1).txt"
         );
         assert_eq!(
-            create(&s, top, top, b"Docs", true, owner).unwrap(),
+            create(&s, top, top, b"Docs", true, owner, &mut c).unwrap(),
             b"Docs (1)"
         );
-        assert_eq!(create(&s, top, top, b".rc", false, owner).unwrap(), b".rc");
         assert_eq!(
-            create(&s, top, top, b".rc", false, owner).unwrap(),
+            create(&s, top, top, b".rc", false, owner, &mut c).unwrap(),
+            b".rc"
+        );
+        assert_eq!(
+            create(&s, top, top, b".rc", false, owner, &mut c).unwrap(),
             b".rc (1)"
         );
         for bad in [b"".as_slice(), b"..", b"x/y", b"nul\0"] {
             assert_eq!(
-                create(&s, top, top, bad, false, owner).unwrap_err(),
+                create(&s, top, top, bad, false, owner, &mut c).unwrap_err(),
                 Errno::EINVAL
             );
         }
@@ -550,62 +692,110 @@ mod tests {
         let st = stat(&s, b"/home/alice/Docs (1)").unwrap();
         assert_eq!((st.uid, st.mode & 0o7777), (1000, 0o755));
         // 写；截断之后再写
-        open_write(&s, top, b"/home/alice/a.txt", false, false)
+        open_write(&s, top, b"/home/alice/a.txt", false, false, &mut c)
             .unwrap()
             .write_all(b"hello")
             .unwrap();
         // 追加：写在末尾
-        open_write(&s, top, b"/home/alice/a.txt", false, true)
+        open_write(&s, top, b"/home/alice/a.txt", false, true, &mut c)
             .unwrap()
             .write_all(b"!")
             .unwrap();
         assert_eq!(read(b"/home/alice/a.txt"), "hello!");
-        open_write(&s, top, b"/home/alice/a.txt", true, false)
+        c.clear();
+        open_write(&s, top, b"/home/alice/a.txt", true, false, &mut c)
             .unwrap()
             .write_all(b"hi")
             .unwrap();
         assert_eq!(read(b"/home/alice/a.txt"), "hi");
+        written(&s, top, b"/home/alice/a.txt", &mut c).unwrap();
+        let a = resolve(&s, b"/home/alice/a.txt").unwrap();
+        let home = resolve(&s, top).unwrap();
+        let parent = (home, b"a.txt".to_vec());
+        assert_eq!(
+            c,
+            [
+                Change::Opened {
+                    ino: a,
+                    parent: parent.clone(),
+                    truncated: true
+                },
+                Change::Written { ino: a, parent }
+            ]
+        );
         // 家目录外面的、经由符号链接走出去的都不行
         assert_eq!(
-            create(&s, top, b"/etc", b"x", false, owner).unwrap_err(),
+            create(&s, top, b"/etc", b"x", false, owner, &mut c).unwrap_err(),
             Errno::EACCES
         );
         let motd = b"/home/alice/motd";
         assert_eq!(
-            open_write(&s, top, motd, true, false).unwrap_err(),
+            open_write(&s, top, motd, true, false, &mut c).unwrap_err(),
             Errno::EACCES
         );
         assert_eq!(read(b"/etc/motd"), "welcome\n");
         assert_eq!(
-            remove(&s, top, b"/home/alice/up/alice").unwrap_err(),
+            remove(&s, top, b"/home/alice/up/alice", &mut c).unwrap_err(),
             Errno::EACCES
         );
-        assert_eq!(remove(&s, top, top).unwrap_err(), Errno::EACCES);
+        assert_eq!(remove(&s, top, top, &mut c).unwrap_err(), Errno::EACCES);
         assert_eq!(
-            move_to(&s, top, b"/home/alice/a.txt", b"/etc").unwrap_err(),
+            move_to(&s, top, b"/home/alice/a.txt", b"/etc", &mut c).unwrap_err(),
             Errno::EACCES
         );
         // 删除符号链接只删链接
-        remove(&s, top, motd).unwrap();
+        remove(&s, top, motd, &mut c).unwrap();
         assert_eq!(stat(&s, motd).unwrap_err(), Errno::ENOENT);
         assert_eq!(read(b"/etc/motd"), "welcome\n");
         // 改名不覆盖
         let a1 = b"/home/alice/a (1).txt";
-        assert_eq!(rename(&s, top, a1, b"a.txt").unwrap_err(), Errno::EEXIST);
-        assert_eq!(rename(&s, top, a1, b"x/y").unwrap_err(), Errno::EINVAL);
-        rename(&s, top, a1, b"b.txt").unwrap();
+        assert_eq!(
+            rename(&s, top, a1, b"a.txt", &mut c).unwrap_err(),
+            Errno::EEXIST
+        );
+        assert_eq!(
+            rename(&s, top, a1, b"x/y", &mut c).unwrap_err(),
+            Errno::EINVAL
+        );
+        rename(&s, top, a1, b"b.txt", &mut c).unwrap();
         assert!(stat(&s, b"/home/alice/b.txt").is_ok());
         // 移动；目录不能移进自己里面
-        move_to(&s, top, b"/home/alice/b.txt", b"/home/alice/Docs").unwrap();
+        move_to(&s, top, b"/home/alice/b.txt", b"/home/alice/Docs", &mut c).unwrap();
         assert!(stat(&s, b"/home/alice/Docs/b.txt").is_ok());
         assert_eq!(
-            move_to(&s, top, b"/home/alice/Docs", b"/home/alice/Docs").unwrap_err(),
+            move_to(&s, top, b"/home/alice/Docs", b"/home/alice/Docs", &mut c).unwrap_err(),
             Errno::EINVAL
         );
         // 删掉整个目录树
-        remove(&s, top, b"/home/alice/Docs").unwrap();
+        c.clear();
+        remove(&s, top, b"/home/alice/Docs", &mut c).unwrap();
         assert_eq!(stat(&s, b"/home/alice/Docs").unwrap_err(), Errno::ENOENT);
-        remove(&s, top, b"/home/alice/fifo").unwrap();
+        // 记下的改动：先里后外
+        let home = resolve(&s, top).unwrap();
+        let Some((
+            Change::Removed {
+                dir: parent,
+                name,
+                ino: docs,
+                is_dir: true,
+            },
+            inside,
+        )) = c.split_last()
+        else {
+            panic!("{c:?}");
+        };
+        assert_eq!((*parent, name.as_slice()), (home, b"Docs".as_slice()));
+        assert!(
+            inside
+                .iter()
+                .any(|x| matches!(x, Change::Removed { name, .. } if name == b"b.txt"))
+        );
+        assert!(
+            inside
+                .iter()
+                .all(|x| matches!(x, Change::Removed { dir, is_dir: false, .. } if dir == docs))
+        );
+        remove(&s, top, b"/home/alice/fifo", &mut c).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

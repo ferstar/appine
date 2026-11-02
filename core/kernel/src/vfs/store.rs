@@ -76,6 +76,9 @@ const WAL_SIZE_LIMIT: i64 = 8 << 20;
 /// 宿主上 object 文件的权限位：只有 App 自己读写，guest 看到的权限记在数据库里。
 const OBJECT_MODE: u32 = 0o600;
 
+/// [`Store::take_changed_dirs`] 两次之间最多记这么多个目录，多了不再记（"文件"App 少刷新几个）。
+const MAX_CHANGED_DIRS: usize = 256;
+
 /// 一次提交里改名覆盖了别的文件的普通文件不超过这么多个时逐个 fdatasync，多了就对整个
 /// 文件系统 syncfs 一次（[`Store::flush_replaced`]）。
 const FLUSH_EACH: usize = 16;
@@ -204,6 +207,8 @@ pub struct Store {
     /// 写事务里改名覆盖了别的文件的普通文件：提交之前让它们的数据落盘
     /// （[`Store::flush_replaced`]）。
     replaced: RefCell<Vec<Ino>>,
+    /// 目录项改过的目录（[`Store::take_changed_dirs`]）；None 时不记。
+    changed_dirs: RefCell<Option<std::collections::BTreeSet<Ino>>>,
     /// 开始推迟提交时调用：叫醒到点提交的线程（[`Store::commit_due`]）。
     waker: RefCell<Option<Box<dyn Fn()>>>,
     /// 删除 object 的后台线程（[`reap`]）。
@@ -949,6 +954,7 @@ impl Store {
             delay: COMMIT_DELAY,
             doomed: RefCell::default(),
             replaced: RefCell::default(),
+            changed_dirs: RefCell::new(None),
             waker: RefCell::new(None),
             fills: RefCell::default(),
         })
@@ -1031,6 +1037,19 @@ impl Store {
     /// 写事务可以推迟提交：没有别的进程在用仓库。
     fn defers(&self) -> bool {
         self.meta.commits.users().load(Ordering::Relaxed) <= 1
+    }
+
+    /// 取走上次以来目录项改过（新建、删除、改名）的目录，第一次调用时开始记（App 让"文件"App
+    /// 刷新它们，设计文档 §11.3）。记的是操作当时的，之后回滚了的也在里面。
+    pub fn take_changed_dirs(&self) -> Vec<Ino> {
+        let mut dirs = self.changed_dirs.borrow_mut();
+        match dirs.as_mut() {
+            Some(set) => std::mem::take(set).into_iter().collect(),
+            None => {
+                *dirs = Some(Default::default());
+                Vec::new()
+            }
+        }
     }
 
     /// 推迟提交时叫醒 `wake`（[`Store::commit_due`]）。
@@ -1573,6 +1592,11 @@ impl Store {
     /// 一样（Python 的 import、Maildir、git 按目录的 mtime 发现变化）。缓存里放新的行：
     /// 路径解析每一级都要读目录的行。
     fn dir_changed(&self, dir: Ino) -> Result<(), Errno> {
+        if let Some(dirs) = self.changed_dirs.borrow_mut().as_mut()
+            && dirs.len() < MAX_CHANGED_DIRS
+        {
+            dirs.insert(dir);
+        }
         let mut st = self.stat_row(dir)?;
         let now = now_ns();
         self.db

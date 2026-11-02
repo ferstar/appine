@@ -104,6 +104,24 @@ pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Re
     .unwrap_or(Err(Errno::EIO))
 }
 
+/// 宿主修改仓库（App 的 DocumentsProvider 新建、删除、改名、移动、写）：与 [`browse`] 一样
+/// 另外打开一次仓库，`f` 把改了什么记进 `changes`（[`vfs::browse::Change`]）。仓库关闭
+/// （提交）之后，把它们交给用着同一个仓库、正在运行的内核，由它报 inotify 事件
+/// （[`machine::store_changed`]）：guest 里监视着的程序知道"文件"App 改了东西。中途出错
+/// 时已经做了的照样交。
+pub fn browse_changing<R>(
+    store: &Path,
+    f: impl FnOnce(&Store, &mut Vec<vfs::browse::Change>) -> Result<R, Errno>,
+) -> Result<R, Errno> {
+    bug::host_call("browse", || {
+        let mut changes = Vec::new();
+        let r = Store::open(store, &[]).and_then(|s| f(&s, &mut changes));
+        machine::store_changed(store, &changes);
+        r
+    })
+    .unwrap_or(Err(Errno::EIO))
+}
+
 /// 把宿主目录 `store` 里的 inode 仓库（连同所在的整个宿主文件系统）写到盘上：导入
 /// rootfs、写好配置之后，改名就位之前（设计文档 §11.4）。不然断电之后仓库在了，里面的
 /// object 却可能还是空的。

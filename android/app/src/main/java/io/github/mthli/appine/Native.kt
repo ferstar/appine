@@ -95,6 +95,10 @@ internal object Native {
     @Throws(IOException::class)
     external fun browseOpenWrite(store: String, top: String, path: String, truncate: Boolean, append: Boolean): Int
 
+    /** [browseOpenWrite] 交出去的文件关闭了：告诉运行中的内核它被写过（guest 里的 inotify）。 */
+    @JvmStatic
+    external fun browseWritten(store: String, top: String, path: String)
+
     /** 启动内核；[tier] 0 是解释器，1 是 DBT。 */
     @JvmStatic
     @Throws(IOException::class)
@@ -161,6 +165,13 @@ internal object Native {
      */
     @JvmStatic
     external fun takeKills(machine: Long): Array<String>?
+
+    /**
+     * 取走 guest 改过目录项（新建、删除、改名）的目录，写法同文档 ID：让"文件"App 刷新它们。第一次
+     * 调用时才开始记。要取 BKL，不在主线程上调用。
+     */
+    @JvmStatic
+    external fun takeChangedDirs(machine: Long): Array<String>?
 
     /** 新建一个控制台（进程内 PTY），返回它的编号。 */
     @JvmStatic

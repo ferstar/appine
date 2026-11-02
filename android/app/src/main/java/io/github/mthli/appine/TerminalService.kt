@@ -106,6 +106,7 @@ class TerminalService : Service() {
      * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
      *   1024 以下的端口在宿主上换了一个，要告诉用户连哪个；
      * - guest 的关机请求（busybox 的 reboot、halt、poweroff）；
+     * - guest 改过的目录：让"文件"App 刷新它们（设计文档 §11.3）；
      * - 没有会话、界面也不在时还有没有 guest 进程：没有了就退出（设计文档 §11.2）。
      */
     private val poll = object : Runnable {
@@ -118,6 +119,7 @@ class TerminalService : Service() {
                     val kills = Native.takeKills(m)
                     val power = Native.takePower(m)
                     val processes = Native.processes(m)
+                    Native.takeChangedDirs(m)?.let { Documents.dirsChanged(this@TerminalService, it) }
                     main.post {
                         if (machine != m) return@post
                         lines?.forEach(::notifyListen)
