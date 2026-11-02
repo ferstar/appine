@@ -1,6 +1,6 @@
 # M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制（2026-11-03）
 
-← [M9：内核 bug 的报告能复制，带着 panic 的位置（2026-11-03）](205-copy-bug-report.md) · [索引](../milestones.md)
+← [M9：内核 bug 的报告能复制，带着 panic 的位置（2026-11-03）](205-copy-bug-report.md) · [索引](../milestones.md) · [M9：内核 bug 的报告带上出错之前的内核日志（2026-11-03）](207-report-kernel-log.md) →
 
 [以指定用户登录](193-login-account.md)那一轮的推迟项：Debian 上普通用户第一次登录时，登录脚本联网装 sudo，`apt-get -qq` 加上 `>/dev/null`，标签页里只有一行 "installing sudo..."，模拟器上几分钟没有动静；按 Ctrl-C 会连登录一起结束。
 

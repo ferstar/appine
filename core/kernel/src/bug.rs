@@ -148,8 +148,10 @@ pub struct KillReport {
 /// 为什么结束。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillReason {
-    /// 内核层、引擎的 bug：报告的那一行（也写进了内核日志）。
-    Bug(String),
+    /// 内核层、引擎的 bug：`report` 是报告的那一行（也写进了内核日志），`log` 是内核日志里
+    /// 它前面的几条和它自己（`dmesg` 的写法，每行一项）：出错之前有没有别的 bug、OOM、guest
+    /// 写的日志，在复制给开发者的报告里就看得到。
+    Bug { report: String, log: Vec<String> },
     /// OOM killer：App 内存的上限（`cgroup` 是 None）或者某个 cgroup 的 `memory.max` 不够了；
     /// 用量和上限是字节。
     OutOfMemory {
@@ -198,8 +200,8 @@ pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
         with_panic(what),
     );
     eprintln!("{report}");
-    log(k, &report);
-    record_kill(k, task.tgid, comm, KillReason::Bug(report));
+    let log = log(k, &report);
+    record_kill(k, task.tgid, comm, KillReason::Bug { report, log });
     task.killed.set(true);
     segv(k, task.tgid);
 }
@@ -216,18 +218,32 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
         with_panic(what),
     );
     eprintln!("{report}");
-    log(k, &report);
-    record_kill(k, tgid, comm, KillReason::Bug(report));
+    let log = log(k, &report);
+    record_kill(k, tgid, comm, KillReason::Bug { report, log });
     segv(k, tgid);
 }
+
+/// 交给 App 的报告带上内核日志里它前面的几条。
+const LOG_BEFORE: u64 = 10;
 
 /// 结束进程的报告也记进内核日志（[`crate::klog`]），guest 里用 `dmesg` 看得到进程为什么
 /// 以 SIGSEGV 结束。Linux 的 oops 用 KERN_EMERG，那是整个内核出了错；这里只结束一个进程，
 /// 与 OOM killer 结束进程一样用 KERN_ERR。报告里的换行（panic 的消息可能有）各成一行。
-fn log(k: &Kernel, report: &str) {
+///
+/// 返回日志里报告前面的 [`LOG_BEFORE`] 条和报告自己（[`crate::klog::Klog::lines_from`]）：
+/// 报告的时间戳和前面几条的放在一起，看得出隔了多久。日志正被借用时（在日志自己的代码里
+/// 出了错）是空的。
+fn log(k: &Kernel, report: &str) -> Vec<String> {
+    let start = k.klog.try_borrow().map(|l| l.upcoming_seq()).ok();
     for line in report.lines() {
         crate::klog::printk(&k.klog, crate::klog::level::ERR, format_args!("{line}"));
     }
+    start
+        .and_then(|start| {
+            let l = k.klog.try_borrow().ok()?;
+            Some(l.lines_from(start.saturating_sub(LOG_BEFORE)))
+        })
+        .unwrap_or_default()
 }
 
 /// 报告一个不能归到某个 guest 进程上的 bug。

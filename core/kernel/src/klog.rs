@@ -200,6 +200,33 @@ impl Klog {
             .filter(move |r| r.seq >= seq)
     }
 
+    /// 接下来记的那条记录的序号（不管最新的一条定稿了没有）。
+    pub fn upcoming_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// 序号不小于 `seq` 的、读得到的记录，像 `dmesg` 那样每行一项，前面加 `[秒.微秒] `（总是
+    /// 带时间，不看 `printk_time`；不管 syslog 清空过没有）。控制字符转义成 `\xNN`，不是
+    /// UTF-8 的字节换成 U+FFFD。内核 bug 的报告带着它们交给 App（[`crate::bug`]）。
+    pub fn lines_from(&self, seq: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in self.readable_from(seq) {
+            let prefix = r.prefix(false, true);
+            for line in r.text.split(|&b| b == b'\n') {
+                let mut s = prefix.clone();
+                for c in String::from_utf8_lossy(line).chars() {
+                    if c.is_control() {
+                        write!(s, "\\x{:02x}", c as u32).unwrap();
+                    } else {
+                        s.push(c);
+                    }
+                }
+                out.push(s);
+            }
+        }
+        out
+    }
+
     /// syslog 上次清空之后的第一条（`/dev/kmsg` 的 `SEEK_DATA`）。
     pub fn clear_seq(&self) -> u64 {
         self.clear_seq
@@ -596,6 +623,27 @@ mod tests {
         };
         let out = Klog::syslog_text(&r, false);
         assert_eq!(out.len(), 3 + 600 + 1);
+    }
+
+    #[test]
+    fn lines_from_are_dmesg_lines_with_escapes() {
+        let mut l = log_with(&[b"old", b"two\nlines", b"tab\there\x1b[0m \xff ok"]);
+        l.printk_time = false;
+        l.clear();
+        l.store(1, 4, b"open");
+        assert_eq!(l.upcoming_seq(), 4);
+        let lines = l.lines_from(1);
+        // 总是带时间，清空过也照样有；没定稿的那条不算
+        let texts: Vec<&str> = lines
+            .iter()
+            .map(|s| {
+                assert!(s.starts_with('[') && s.contains("] "), "{s}");
+                &s[s.find("] ").unwrap() + 2..]
+            })
+            .collect();
+        assert_eq!(texts, ["two", "lines", "tab\\x09here\\x1b[0m \u{fffd} ok"]);
+        assert_eq!(l.lines_from(0).len(), 4);
+        assert!(l.lines_from(l.upcoming_seq()).is_empty());
     }
 
     #[test]

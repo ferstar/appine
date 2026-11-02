@@ -854,7 +854,7 @@ class TerminalService : Service() {
             .setAutoCancel(true)
         if (bug) {
             val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
-                .putExtra(EXTRA_REPORT, bugReport(f[4]))
+                .putExtra(EXTRA_REPORT, bugReport(f[4], f[5]))
                 .putExtra(EXTRA_NOTIFICATION, id)
             val pending = PendingIntent.getService(
                 this, id, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -866,9 +866,10 @@ class TerminalService : Service() {
 
     /**
      * 复制给用户贴到反馈里的报告：App 的版本、设备、发行版和执行层，加上内核层的报告（进程、线程、
-     * 最后的 guest pc，panic 的消息和位置，与 `dmesg` 里的那一行相同）。
+     * 最后的 guest pc，panic 的消息和位置，与 `dmesg` 里的那一行相同），和内核日志里它前面的几条
+     * 和它自己（[log] 以 U+001E 分隔，与 `dmesg` 的写法一样带着时间）。
      */
-    private fun bugReport(report: String): String = buildString {
+    private fun bugReport(report: String, log: String): String = buildString {
         appendLine("appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
         appendLine(
             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
@@ -876,6 +877,10 @@ class TerminalService : Service() {
         )
         appendLine("${Rootfs.installed(this@TerminalService)?.label ?: "unknown distribution"}, Tier $tier")
         append(report)
+        if (log.isNotEmpty()) {
+            append("\n\nKernel log:\n")
+            append(log.split('\u001e').joinToString("\n"))
+        }
     }
 
     /** 通知上的"复制报告"：放进剪贴板，收起那条通知。Android 13 起系统自己提示已复制。 */

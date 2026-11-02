@@ -409,17 +409,44 @@ fn host_calls_survive_kernel_bugs() {
                 "{tier:?}: {k:?}"
             );
             assert!(
-                matches!(&k.reason, KillReason::Bug(r) if r.contains(&format!("pid {}", k.pid))),
+                matches!(&k.reason, KillReason::Bug { report, .. } if report.contains(&format!("pid {}", k.pid))),
                 "{tier:?}: {k:?}"
             );
         }
         // 报告里有 panic 的消息和位置（bug::install_panic_hook），不只是"syscall 里 panic"
         assert!(
-            kills.iter().any(|k| matches!(&k.reason, KillReason::Bug(r) if r.contains(
+            kills.iter().any(|k| matches!(&k.reason, KillReason::Bug { report, .. } if report.contains(
                 "kernel panic in syscall 43409: panic injected by the test hook at core/kernel/src/bug.rs:"
             ))),
             "{tier:?}: {kills:?}"
         );
+        // 报告带着内核日志：`dmesg` 的写法，最后是报告自己，前面是更早的记录（这里是前一个
+        // bug 的报告）
+        let reports: Vec<(&str, &[String])> = kills
+            .iter()
+            .map(|k| match &k.reason {
+                KillReason::Bug { report, log } => (report.as_str(), log.as_slice()),
+                other => panic!("{tier:?}: {other:?}"),
+            })
+            .collect();
+        for (i, (report, log)) in reports.iter().enumerate() {
+            assert!(
+                log.iter().all(|l| l.starts_with('[') && l.contains("] ")),
+                "{tier:?}: {log:?}"
+            );
+            assert!(
+                log.last()
+                    .is_some_and(|l| l.ends_with(report.lines().last().unwrap())),
+                "{tier:?}: {report} {log:?}"
+            );
+            if i > 0 {
+                let before = reports[i - 1].0.lines().next().unwrap();
+                assert!(
+                    log.iter().any(|l| l.ends_with(before)),
+                    "{tier:?}: {before} {log:?}"
+                );
+            }
+        }
         assert!(machine.take_kills().is_empty(), "{tier:?}");
     }
 }

@@ -730,8 +730,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
 }
 
 /// 取走内核层结束了的 guest 进程（内核 bug、引擎故障、OOM killer）：每一项是
-/// `<控制台或 -1>\t<pid>\t<进程名>\t<bug|oom>\t<a>\t<b>\t<c>`，bug 的 a 是报告（换行、制表符
-/// 换成空格），oom 的 a 是 cgroup（App 的上限时是空的）、b 和 c 是用量和上限（字节）。
+/// `<控制台或 -1>\t<pid>\t<进程名>\t<bug|oom>\t<a>\t<b>\t<c>`，bug 的 a 是报告、b 是内核日志的
+/// 最后几行（以 U+001E 分隔），oom 的 a 是 cgroup（App 的上限时是空的）、b 和 c 是用量和上限
+/// （字节）。各项里的换行、制表符、U+001E 换成空格。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     mut env: JNIEnv<'l>,
@@ -743,11 +744,14 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     else {
         return std::ptr::null_mut();
     };
-    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    let clean = |s: &str| s.replace(['\t', '\n', '\r', '\u{1e}'], " ");
     for (i, k) in kills.iter().enumerate() {
         let console = k.console.map_or(-1, i64::from);
         let tail = match &k.reason {
-            appine_kernel::KillReason::Bug(report) => format!("bug\t{}\t\t", clean(report)),
+            appine_kernel::KillReason::Bug { report, log } => {
+                let log: Vec<String> = log.iter().map(|l| clean(l)).collect();
+                format!("bug\t{}\t{}\t", clean(report), log.join("\u{1e}"))
+            }
             appine_kernel::KillReason::OutOfMemory {
                 cgroup,
                 used,

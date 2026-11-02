@@ -215,6 +215,7 @@
 | [M9："文件"App 按内容认出文本文件](rounds/204-text-by-content.md) | 2026-11-03 | 按扩展名猜不出类型的普通文件（`/etc/profile`、`.bashrc`、脚本、`Makefile`）看开头 4 KB：没有 NUL、是合法的 UTF-8 就给 `text/plain`，"文件"App 里点开有编辑器能接（原来是 application/octet-stream，没有 App 能打开）。一次列目录只打开一次仓库，列 1000 个文件多几毫秒 |
 | [M9：内核 bug 的报告能复制，带着 panic 的位置](rounds/205-copy-bug-report.md) | 2026-11-03 | 原来内核日志和交给 App 的报告只说"syscall N 里 panic"，消息和代码位置只打到 stderr（Android 上是 logcat）；现在 panic hook 把它们记在线程上，接进报告。appine 自己的 bug 总是发通知，上面的"复制报告"复制 App 版本、设备、发行版、执行层和这份报告 |
 | [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制](rounds/206-debian-sudo-progress.md) | 2026-11-03 | Debian 上普通用户第一次登录时装 sudo，原来 apt 的输出全扔掉、几分钟没有动静，按 Ctrl-C 连登录一起结束；现在显示 apt 的进度，Ctrl-C 只打断 apt、这次跳过（下一次登录再装），dpkg 那一步 apt 让它另起会话、按了也会装完。顺带查出 util-linux 的 `su -c` 另起会话：Debian 上普通用户的 shell 没有作业控制，按 Ctrl-C 时 su 结束整个会话、标签页就关了（原生一样）；有 `--session-command` 时改用它 |
+| [M9：内核 bug 的报告带上出错之前的内核日志](rounds/207-report-kernel-log.md) | 2026-11-03 | 通知上"复制报告"复制的报告原来只有出错的那一行；现在后面接着内核日志里它前面的 10 条和它自己（`dmesg` 的写法，带时间）：之前的 bug、OOM、guest 写的日志都看得到。`KillReason::Bug` 改成带 `log`，JNI 的空字段放这几行。调用栈没有做：APK 里的 `.so` 去了符号 |
 
 ## 测量条件
 

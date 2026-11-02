@@ -991,7 +991,8 @@ class MachineTest {
     private fun depth(n: Int): Int = if (n < 0) 0 else depth(n + 1) + 1
 
     /**
-     * 内核层结束的进程留下报告给 App（[Native.takeKills]）：控制台、pid、进程名、原因，取走一次就没了。
+     * 内核层结束的进程留下报告给 App（[Native.takeKills]）：控制台、pid、进程名、原因（bug 的还有内核日志的
+     * 最后几条），取走一次就没了。
      * 内核 bug 用测试钩子模拟，OOM 用 cgroup 的 memory.max：awk 拼出 64 MB 的字符串之后接着运行
      * 一会儿（OOM killer 定时量用量，一下子用完就退出的进程发现不了）。
      */
@@ -1002,6 +1003,7 @@ class MachineTest {
         Native.writeFile(store, "/tmp/kernel-panic", elf(GUESTS.getValue("kernel-panic")), 0x1ed, true)
         val machine = start(1)
         assertEquals(0, Native.takeKills(machine)?.size)
+        assertEquals("" to 0, sh(machine, "echo before the bug > /dev/kmsg"))
         assertEquals(-SIGSEGV, run(machine, "/tmp/kernel-panic", "kernel-panic").second)
         val bug = Native.takeKills(machine)!!.single().split('\t')
         assertEquals(listOf("kernel-panic", "bug"), bug.subList(2, 4))
@@ -1009,6 +1011,10 @@ class MachineTest {
         assertTrue(bug[4], bug[4].contains("pid ${bug[1]} (kernel-panic)"))
         // 报告里有 panic 的消息和位置（通知上"复制报告"复制的就是它）
         assertTrue(bug[4], bug[4].contains(": panic injected by the test hook at core/kernel/src/bug.rs:"))
+        // 还有内核日志里它前面的几条（guest 写的那一条）和它自己，带着时间
+        val log = bug[5].split('\u001e')
+        assertTrue(bug[5], log.all { it.startsWith("[") } && log.any { it.endsWith("] before the bug") })
+        assertTrue(bug[5], log.last().endsWith(bug[4]))
         val script = "cd /sys/fs/cgroup && echo +memory > cgroup.subtree_control && mkdir -p oomt && " +
             "echo 16M > oomt/memory.max && " +
             "sh -c 'echo \$\$ > oomt/cgroup.procs; exec awk \"BEGIN { s = \\\"x\\\"; " +
