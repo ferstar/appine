@@ -207,6 +207,7 @@
 | [M9：在"文件"App 里浏览（只读）](rounds/196-documents-read.md) | 2026-11-02 | DocumentsProvider：登录账号的家目录是系统"文件"App 里的一个根，设置里打开之后还有只读的整个 `/`；能列目录、读文件（交出宿主上的 object）、按名字搜索，"复制到…"导出。不经过内核，直接在仓库里按 guest 路径查（新的 `vfs::browse`：符号链接跟随，只给目录和普通文件），每次调用另外打开一次仓库；与内核启动用一把读写锁。文档 ID 是 guest 的绝对路径，只认规范的、在根里面的。写在下一轮 |
 | [M9：在"文件"App 里改家目录](rounds/197-documents-write.md) | 2026-11-02 | DocumentsProvider 能改登录账号的家目录：新建文件和文件夹（属于登录账号，0644/0755，名字有了时换成 `a (1).txt`，按类型补扩展名）、写（截断、追加）、删除整个目录树、改名和移动（不覆盖）；"复制到…"、别的 App 的"保存到"里有 appine。按真实路径限制在家目录里面，经由符号链接出去的不行，删除链接只删链接；整个系统那个根仍只读。运行中的内核马上看得到 |
 | [M9：断电之后仓库不坏](rounds/198-power-loss.md) | 2026-11-03 | 用 dm-flakey 模拟断电，复现了[设置页](rounds/190-settings-default-alpine.md)那一轮"`/bin/sh` 不是 ELF"的样子：改名覆盖的文件（apk 就这样装文件、不调 fsync）全变成 0 字节，fsync 过的也是空的（原生 ext4 一个不坏）。按原生 ext4 的语义补上顺序：改名覆盖的普通文件在提交之前刷（auto_da_alloc）；删除 object 之前 WAL 先落盘；guest 的 fsync、fdatasync、sync、syncfs、`O_SYNC`、`msync(MS_SYNC)` 真的让宿主刷盘（放开 BKL），sync_file_range 交给宿主；导入 rootfs 之后 syncfs 再改名就位。断电 75 次不坏；新建就 fsync 是原生的约两倍，改名覆盖 1000 个多 20 ms |
+| [M9：39 位的宿主地址空间](rounds/199-reserved-mappings.md) | 2026-11-03 | 模拟器的 GKI 内核（4K 页）用户地址空间只有 39 位（512 GB），所有 guest 进程的映射加起来都在 App 这一个宿主进程里。量了常见运行时（node 0.8 GB、加 wasm 9.2 GB、java 2.7 GB、Go 1.2 GB），headless Chromium 的 11 个进程合计 4.7 TB（PartitionAlloc 的池、V8 的沙箱，几乎全是 `PROT_NONE`），`ulimit -v 512G` 下 fork 渲染器失败、一直挂着。从建立起一直是 `PROT_NONE` 的私有匿名映射现在只是预留，变得可以访问、内核要往里写时才给那一段宿主内存：Chromium 在限制下正常，宿主地址空间 4.83 TB → 12.4 GB；速度没有变化。ASan 的影子内存（可写）仍然不行 |
 
 ## 测量条件
 

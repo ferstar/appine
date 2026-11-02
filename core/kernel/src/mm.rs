@@ -54,6 +54,8 @@ pub mod flags {
     pub const MAP_FIXED: u32 = 0x10;
     /// 匿名映射。
     pub const MAP_ANONYMOUS: u32 = 0x20;
+    /// 向下增长。
+    pub const MAP_GROWSDOWN: u32 = 0x0100;
     /// 不计入内存提交量。
     pub const MAP_NORESERVE: u32 = 0x4000;
     /// 固定地址，但不覆盖已有映射。
@@ -107,6 +109,30 @@ struct HostRegion {
     /// 私有匿名内存（[`Mm::new_anonymous`]、[`spare`]）和它计不计入提交量：交还时留着
     /// 复用（[`recycled`]）。
     anonymous: Option<bool>,
+    /// 没有宿主内存（[`HostRegion::reserved`]）。
+    reserved: bool,
+}
+
+/// 预留（[`HostRegion::reserved`]）的 VMA 的"宿主地址"：从这里起按 guest 偏移算，只用来
+/// 算术（拆开 VMA），从不访问。第 55 位是 1，落在宿主内核的那一半里（arm64 的 TBI 只忽略
+/// 最高 8 位），万一被访问也是宿主的段错误，碰不到别的内存。
+const RESERVED_HOST: usize = 0x00f0_0000_0000_0000;
+
+impl HostRegion {
+    /// 私有匿名映射从建立起一直是 `PROT_NONE`、没有内容时，不占宿主内存和宿主地址空间：
+    /// 所有 guest 进程都在同一个宿主进程里，宿主的用户地址空间只有 39 位（512 GB）的设备上
+    /// （4K 页的 GKI 内核都是），Chromium 的每个进程预留几十 GB（PartitionAlloc 的池），
+    /// 渲染器再加 1 TB（V8 的沙箱），加起来放不下。这样的 VMA 没有表项，guest 访问不到；
+    /// 变得可以访问（mprotect）、内核要往里写（ptrace）时才有自己的宿主内存
+    /// （[`Mm::back_reserved`]）。
+    fn reserved() -> Arc<HostRegion> {
+        Arc::new(HostRegion {
+            base: NonNull::new(RESERVED_HOST as *mut u8).unwrap(),
+            len: 0,
+            anonymous: None,
+            reserved: true,
+        })
+    }
 }
 
 // SAFETY: 只是一段宿主地址范围，释放（Drop）时才用到它
@@ -115,6 +141,9 @@ unsafe impl Sync for HostRegion {}
 
 impl Drop for HostRegion {
     fn drop(&mut self) {
+        if self.reserved {
+            return;
+        }
         let (base, len, anonymous) = (self.base, self.len, self.anonymous);
         if let Some(reserve) = anonymous {
             let deferred = UNMAPPED
@@ -362,6 +391,7 @@ pub(crate) mod spare {
                 base,
                 len: host_len,
                 anonymous: Some(false),
+                reserved: false,
             }),
             base,
         ))
@@ -534,6 +564,13 @@ struct Vma {
     dontdump: bool,
     /// `MAP_NORESERVE`：不计入提交量（[`Mm::commit_too_big`]）。
     noreserve: bool,
+}
+
+impl Vma {
+    /// 只是预留，还没有宿主内存（[`HostRegion::reserved`]）。
+    fn reserved(&self) -> bool {
+        self.region.reserved
+    }
 }
 
 /// 最近几个代码代数作废的范围。
@@ -1733,9 +1770,40 @@ impl Mm {
                 base,
                 len: host_len,
                 anonymous: Some(reserve),
+                reserved: false,
             }),
             base,
         ))
+    }
+
+    /// 新的私有匿名映射的宿主内存：`PROT_NONE` 的只是预留，不占宿主的地址空间
+    /// （[`HostRegion::reserved`]），其余同 [`Mm::new_anonymous`]。
+    fn private_anonymous(
+        len: u64,
+        prot: u32,
+        reserve: bool,
+    ) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        if mmu_prot(prot) == 0 {
+            let region = HostRegion::reserved();
+            let host = region.base;
+            return Ok((region, host));
+        }
+        Self::new_anonymous(len, reserve)
+    }
+
+    /// 预留的 VMA `start`（[`HostRegion::reserved`]）换上自己的宿主内存（全零），之后与普通
+    /// 的私有匿名映射一样。它没有表项，不用改页表。预留的往往有几百 GB，调用方先把要用的
+    /// 那一段拆出来。`reserve` 是计不计入宿主的提交量（[`Mm::new_anonymous`]）。
+    fn back_reserved(&mut self, start: u64, reserve: bool) -> Result<(), Errno> {
+        let v = &self.vmas[&start];
+        if !v.reserved() {
+            return Ok(());
+        }
+        let (region, host) = Self::new_anonymous(v.len, reserve)?;
+        let v = self.vmas.get_mut(&start).unwrap();
+        v.region = region;
+        v.host = host;
+        Ok(())
     }
 
     /// 在固定地址建立清零的匿名映射（加载器使用），区间必须空闲。
@@ -1746,7 +1814,7 @@ impl Mm {
         if !self.is_free(start, len) {
             return Err(Errno::EEXIST);
         }
-        let (region, host) = Self::new_anonymous(len, prot & prot::WRITE != 0)?;
+        let (region, host) = Self::private_anonymous(len, prot, prot & prot::WRITE != 0)?;
         self.insert(
             start,
             len,
@@ -1968,7 +2036,12 @@ impl Mm {
             None => {
                 let reserve =
                     prot & prot::WRITE != 0 && (shared || flags & flags::MAP_NORESERVE == 0);
-                let (region, host) = Self::new_anonymous(len, reserve)?;
+                // 向下增长的要在宿主内存里往下长（[`Mm::extend_down`]），不只是预留
+                let (region, host) = if shared || flags & flags::MAP_GROWSDOWN != 0 {
+                    Self::new_anonymous(len, reserve)?
+                } else {
+                    Self::private_anonymous(len, prot, reserve)?
+                };
                 let backing = if shared {
                     Backing::Shared
                 } else {
@@ -2009,6 +2082,7 @@ impl Mm {
                         base: m.base,
                         len: m.len,
                         anonymous: None,
+                        reserved: false,
                     });
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
@@ -2252,6 +2326,7 @@ impl Mm {
                     base: m.base,
                     len: m.len,
                     anonymous: None,
+                    reserved: false,
                 });
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
@@ -2268,12 +2343,17 @@ impl Mm {
                     base: m.base,
                     len: m.len,
                     anonymous: None,
+                    reserved: false,
                 });
                 (region, m.ptr, None, file_extent(fd, file_offset, len))
             }
             _ => {
                 let reserve = template.prot & prot::WRITE != 0 && !template.noreserve;
-                let (region, host) = Self::new_anonymous(len, reserve)?;
+                let (region, host) = if template.reserved() {
+                    Self::private_anonymous(len, 0, false)?
+                } else {
+                    Self::new_anonymous(len, reserve)?
+                };
                 (region, host, None, len)
             }
         };
@@ -2557,6 +2637,11 @@ impl Mm {
         while cursor < end {
             let (&s, v) = self.vmas.range(..=cursor).next_back().unwrap();
             let stop = end.min(s + v.len);
+            if v.reserved() {
+                out.resize(out.len() + ((stop - cursor) / PAGE_SIZE) as usize, false);
+                cursor = stop;
+                continue;
+            }
             // SAFETY: [cursor, stop) 落在这个 VMA 里，宿主内存由它持有
             let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
             out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
@@ -2587,7 +2672,7 @@ impl Mm {
         let mut total = 0;
         for (&s, v) in self.vmas.range(first..end) {
             let (from, to) = (addr.max(s), end.min(s + v.len));
-            if from >= to {
+            if from >= to || v.reserved() {
                 continue;
             }
             let ranges = if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
@@ -2667,8 +2752,13 @@ impl Mm {
         if let Some(f) = &mut tail.file {
             f.1 += head_len;
         }
-        // SAFETY: addr 落在 VMA 内部，偏移不越过宿主映射
-        tail.host = unsafe { tail.host.add(head_len as usize) };
+        // 预留的没有宿主内存，地址只是算出来的（HostRegion::reserved），按整数算
+        tail.host = if tail.reserved() {
+            NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap()
+        } else {
+            // SAFETY: addr 落在 VMA 内部，偏移不越过宿主映射
+            unsafe { tail.host.add(head_len as usize) }
+        };
         let head = self.vmas.get_mut(&s).unwrap();
         head.len = head_len;
         head.file_len = head.file_len.min(head_len);
@@ -2772,6 +2862,18 @@ impl Mm {
                 self.unshare(s)?;
             }
         }
+        // 只是预留的（HostRegion::reserved）变得可以访问：这一段换上宿主内存
+        if mmu_prot(prot) != 0 {
+            let reserved: Vec<(u64, bool)> = self
+                .vmas
+                .range(addr..end)
+                .filter(|(_, v)| v.reserved())
+                .map(|(&s, v)| (s, prot & prot::WRITE != 0 && !v.noreserve))
+                .collect();
+            for (s, reserve) in reserved {
+                self.back_reserved(s, reserve)?;
+            }
+        }
         for (&s, v) in self.vmas.range_mut(addr..end) {
             // 原来可执行的页：不再可执行时翻译要作废；W^X 的 JIT 改写代码之前也先去掉执行权限
             if v.prot & prot::EXEC != 0 && v.prot != prot {
@@ -2817,7 +2919,7 @@ impl Mm {
                 return Err(Errno::ENOMEM);
             }
             let stop = end.min(s + v.len);
-            if v.backing == Backing::Anonymous {
+            if v.backing == Backing::Anonymous && !v.reserved() {
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((cursor, stop - cursor));
                 }
@@ -2874,6 +2976,7 @@ impl Mm {
             .iter()
             .filter(|&(&s, v)| {
                 !v.growsdown
+                    && !v.reserved()
                     && !is_heap(s, v)
                     && v.len <= FORK_PIECE_MAX
                     && match v.backing {
@@ -2888,15 +2991,17 @@ impl Mm {
         // 写过的私有匿名映射写时复制：先映射好子进程自己的（全零的）宿主内存，再借给它
         let mut cow = Vec::new();
         for (&start, v) in self.vmas.iter_mut() {
-            let share = match v.backing {
-                Backing::Shared => true,
-                // 两边都不能写，内容就不会分叉；谁要改成可写，再复制自己的一份
-                Backing::PrivateFile if v.prot & prot::WRITE == 0 => {
-                    v.cow = true;
-                    true
-                }
-                _ => false,
-            };
+            // 只是预留的没有内容，子进程也只是预留（HostRegion::reserved）
+            let share = v.reserved()
+                || match v.backing {
+                    Backing::Shared => true,
+                    // 两边都不能写，内容就不会分叉；谁要改成可写，再复制自己的一份
+                    Backing::PrivateFile if v.prot & prot::WRITE == 0 => {
+                        v.cow = true;
+                        true
+                    }
+                    _ => false,
+                };
             let (region, host) = if share {
                 (v.region.clone(), v.host)
             } else {
@@ -3336,7 +3441,7 @@ impl Mm {
         for (&s, v) in self.vmas.range(first..end) {
             let from = addr.max(s);
             let to = end.min(s + v.len);
-            if from >= to {
+            if from >= to || v.reserved() {
                 continue;
             }
             let bits = if v.backing == Backing::Anonymous {
@@ -3606,6 +3711,25 @@ impl Mm {
             .collect();
         for s in shared {
             self.unshare(s)?;
+        }
+        // 只是预留的（PROT_NONE，跟踪者强制写入）：写到的那几页拆出来换上宿主内存
+        let lo = addr & !(PAGE_SIZE - 1);
+        if self
+            .vmas
+            .range(first..end)
+            .any(|(&s, v)| v.reserved() && s + v.len > lo)
+        {
+            self.split_at(lo);
+            self.split_at(end);
+            let reserved: Vec<u64> = self
+                .vmas
+                .range(lo..end)
+                .filter(|(_, v)| v.reserved())
+                .map(|(&s, _)| s)
+                .collect();
+            for s in reserved {
+                self.back_reserved(s, false)?;
+            }
         }
         let mut done = 0;
         while done < data.len() {
@@ -4623,6 +4747,70 @@ mod tests {
         mm.write_kernel(a, b"k").unwrap();
         mm.munmap(a, 1 << 33).unwrap();
         assert!(mm.mmu().translate(page, 0).is_none());
+    }
+
+    /// 39 位宿主地址空间（HostRegion::reserved）：PROT_NONE 的预留不占宿主内存，只有变得
+    /// 可以访问、内核写过的那几段有；fork、mincore、pagemap、mremap 扩展、丢弃都不碰它。
+    #[test]
+    fn prot_none_reservations_take_no_host_memory() {
+        let mm = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        // V8 的沙箱：1 TB
+        let len = 1 << 40;
+        let a = mm.borrow_mut().mmap(0, len, 0, anon, None).unwrap();
+        let backed = |m: &Rc<RefCell<Mm>>| -> Vec<(u64, u64)> {
+            m.borrow()
+                .vmas
+                .iter()
+                .filter(|(_, v)| !v.reserved())
+                .map(|(&s, v)| (s, v.len))
+                .collect()
+        };
+        assert!(mm.borrow().vmas[&a].reserved());
+        // 中间两页变得可写：只有它们有宿主内存
+        let p = a + (1 << 39);
+        mm.borrow_mut().mprotect(p, 2 * PAGE_SIZE, RW).unwrap();
+        assert_eq!(backed(&mm), [(p, 2 * PAGE_SIZE)]);
+        poke(&mm, p + 1, b'p');
+        assert_eq!(byte(&mm, p + 1), b'p');
+        // 没有内容，不驻留
+        let m = mm.borrow();
+        assert_eq!(m.residency(a, 4 * PAGE_SIZE).unwrap(), [false; 4]);
+        assert_eq!(m.pagemap(a, 2), [0, 0]);
+        assert_eq!(m.resident_in(a, len), 1);
+        drop(m);
+        mm.borrow_mut().discard(a, p - a).unwrap();
+        // 内核往没有权限的页写（PTRACE_POKEDATA）：只有写到的那页换上宿主内存
+        let q = a + 5 * PAGE_SIZE + 3;
+        mm.borrow_mut().write_kernel(q, b"q").unwrap();
+        assert_eq!(
+            backed(&mm),
+            [(a + 5 * PAGE_SIZE, PAGE_SIZE), (p, 2 * PAGE_SIZE)]
+        );
+        // fork：子进程里也只是预留，写过的内容照样看得到
+        let child = mm.borrow_mut().fork().unwrap();
+        assert_eq!(backed(&child).len(), 2);
+        assert_eq!(byte(&child, p + 1), b'p');
+        child
+            .borrow_mut()
+            .mprotect(q & !(PAGE_SIZE - 1), PAGE_SIZE, prot::READ)
+            .unwrap();
+        assert_eq!(byte(&child, q), b'q');
+        // mremap 原地扩大一段预留：接上的也只是预留
+        let r = 1 << 41;
+        let fixed = anon | flags::MAP_FIXED;
+        mm.borrow_mut().mmap(r, PAGE_SIZE, 0, fixed, None).unwrap();
+        assert_eq!(
+            mm.borrow_mut()
+                .mremap(r, PAGE_SIZE, 1 << 30, false, None, None),
+            Ok(r)
+        );
+        assert!(mm.borrow().vmas[&(r + PAGE_SIZE)].reserved());
+        assert_eq!(backed(&mm).len(), 2);
+        mm.borrow_mut().munmap(r, 1 << 30).unwrap();
+        mm.borrow_mut().munmap(a, len).unwrap();
+        assert!(mm.borrow().vmas.is_empty());
+        assert_eq!(byte(&child, p + 1), b'p');
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # M9：断电之后仓库不坏（2026-11-03）
 
-← [M9：在"文件"App 里改家目录（2026-11-02）](197-documents-write.md) · [索引](../milestones.md)
+← [M9：在"文件"App 里改家目录（2026-11-02）](197-documents-write.md) · [索引](../milestones.md) · [M9：39 位的宿主地址空间（2026-11-03）](199-reserved-mappings.md) →
 
 M9 的 App 工作做完之后筛推迟项，排在第一的是[设置页](190-settings-default-alpine.md)那一轮遇到的怪事：4K 模拟器上留着的旧仓库里，`/bin/sh` 读出来不是 ELF，用到 shell 的用例全失败，数据跟着卸载没了，没查。Android 结束 App 是常态，仓库要是因此坏掉，整个环境就用不了了。
 
