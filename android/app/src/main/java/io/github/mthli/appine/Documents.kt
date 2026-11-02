@@ -84,7 +84,8 @@ class Documents : DocumentsProvider() {
         val context = attached()
         val path = visible(context, documentId)
         val meta = browse { Native.browseStat(it, path) }
-        return MatrixCursor(projection ?: DOCUMENT_COLUMNS).also { row(it, path, meta, home(context)) }
+        val texts = sniff(listOf(path to meta))
+        return MatrixCursor(projection ?: DOCUMENT_COLUMNS).also { row(it, path, meta, home(context), texts) }
     }
 
     override fun queryChildDocuments(
@@ -95,12 +96,11 @@ class Documents : DocumentsProvider() {
         val context = attached()
         val dir = visible(context, parentDocumentId)
         val entries = browse { Native.browseList(it, dir) }
+            .map { child(dir, it.substringBefore('\t')) to it.substringAfter('\t') }
         val result = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
         val home = home(context)
-        for (line in entries) {
-            val name = line.substringBefore('\t')
-            row(result, child(dir, name), line.substringAfter('\t'), home)
-        }
+        val texts = sniff(entries)
+        for ((path, meta) in entries) row(result, path, meta, home, texts)
         result.setNotificationUri(
             context.contentResolver,
             DocumentsContract.buildChildDocumentsUri(authority(context), parentDocumentId),
@@ -205,9 +205,10 @@ class Documents : DocumentsProvider() {
         } ?: throw FileNotFoundException("no root $rootId")
         val result = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
         val home = home(context)
-        for (line in browse { Native.browseSearch(it, dir, query, SEARCH_LIMIT) }) {
-            row(result, line.substringBefore('\t'), line.substringAfter('\t'), home)
-        }
+        val found = browse { Native.browseSearch(it, dir, query, SEARCH_LIMIT) }
+            .map { it.substringBefore('\t') to it.substringAfter('\t') }
+        val texts = sniff(found)
+        for ((path, meta) in found) row(result, path, meta, home, texts)
         return result
     }
 
@@ -273,15 +274,34 @@ class Documents : DocumentsProvider() {
         }
     }
 
-    private fun row(cursor: MatrixCursor, path: String, meta: String, home: Home?) {
+    /**
+     * [docs]（路径和元数据）里按扩展名猜不出类型的普通文件，按内容看是文本的那些
+     * （[Native.browseSniff]，一次打开仓库看完）。`/etc/profile`、`.bashrc`、脚本、`Makefile`
+     * 这样就是 text/plain，点开有编辑器能打开。
+     */
+    private fun sniff(docs: List<Pair<String, String>>): Set<String> {
+        val unknown = docs.filter { (path, meta) -> meta.startsWith("f\t") && guessType(displayName(path)) == null }
+            .map { it.first }
+        if (unknown.isEmpty()) return emptySet()
+        val texts = runCatching { browse { Native.browseSniff(it, unknown.toTypedArray()) } }.getOrNull()
+            ?: return emptySet()
+        return unknown.filterIndexed { i, _ -> texts.getOrElse(i) { false } }.toSet()
+    }
+
+    private fun row(cursor: MatrixCursor, path: String, meta: String, home: Home?, texts: Set<String>) {
         val f = meta.split('\t')
         if (f.size < 4) return
         val dir = f[0] == "d"
         val name = displayName(path)
+        val mime = when {
+            dir -> Document.MIME_TYPE_DIR
+            path in texts -> "text/plain"
+            else -> mimeType(name)
+        }
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID, path)
             add(Document.COLUMN_DISPLAY_NAME, name)
-            add(Document.COLUMN_MIME_TYPE, if (dir) Document.MIME_TYPE_DIR else mimeType(name))
+            add(Document.COLUMN_MIME_TYPE, mime)
             add(Document.COLUMN_SIZE, if (dir) null else f[1].toLongOrNull())
             add(Document.COLUMN_LAST_MODIFIED, f[2].toLongOrNull())
             add(Document.COLUMN_FLAGS, flags(path, dir, home?.path))
@@ -384,10 +404,16 @@ class Documents : DocumentsProvider() {
         }
 
         /** 按扩展名猜 MIME 类型，猜不出时是 application/octet-stream。 */
-        fun mimeType(name: String): String {
+        fun mimeType(name: String): String = guessType(name) ?: "application/octet-stream"
+
+        /**
+         * 按扩展名猜 MIME 类型，猜不出（没有扩展名、不认识的扩展名）时是 null。`.bashrc` 这样的点
+         * 文件把点后面的当作扩展名，一般都不认识。
+         */
+        fun guessType(name: String): String? {
             val ext = name.substringAfterLast('.', "").lowercase()
-            if (ext.isEmpty()) return "application/octet-stream"
-            return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+            if (ext.isEmpty()) return null
+            return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
         }
     }
 }

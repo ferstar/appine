@@ -153,6 +153,42 @@ pub fn open(store: &Store, path: &[u8]) -> Result<File, Errno> {
     }
 }
 
+/// [`looks_like_text`] 看文件开头多少字节。
+const SNIFF_BYTES: usize = 4096;
+
+/// 路径指向的普通文件看起来是文本（[`is_text`]）："文件"App 按扩展名猜不出类型时
+/// （`/etc/profile`、`.bashrc`、脚本、`Makefile`）用它，是文本就当作 text/plain，编辑器才
+/// 打得开。目录、打不开的是 false。
+pub fn looks_like_text(store: &Store, path: &[u8]) -> bool {
+    let Ok(file) = open(store, path) else {
+        return false;
+    };
+    let mut head = [0u8; SNIFF_BYTES];
+    let mut n = 0;
+    while n < head.len() {
+        match std::io::Read::read(&mut &file, &mut head[n..]) {
+            Ok(0) => break,
+            Ok(m) => n += m,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    is_text(&head[..n], n < head.len())
+}
+
+/// 文件的开头 `head` 像文本：没有 NUL，是合法的 UTF-8，与 git 判断二进制文件的做法相近
+/// （它只看 NUL）。没读到文件末尾（`whole` 为假）时，最后一个字符可以被截断。空文件也算。
+/// Latin-1 这类别的编码的文本算作不是。
+pub fn is_text(head: &[u8], whole: bool) -> bool {
+    if head.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(head) {
+        Ok(_) => true,
+        Err(e) => !whole && e.error_len().is_none(),
+    }
+}
+
 /// 在目录 `dir` 下面（不含它自己）找名字里有 `query` 的（不分大小写），最多 `limit` 个，
 /// 按广度优先：浅的在前。返回路径（从 `dir` 开始拼）和元数据。不进符号链接指向的目录，
 /// 免得绕圈；最多看 `budget` 项，大目录树里不会一直找下去。
@@ -627,6 +663,43 @@ mod tests {
         let paths: Vec<_> = found.iter().map(|(p, _)| p.as_slice()).collect();
         assert_eq!(paths, [b"/home".as_slice(), b"/etc/motd"]);
         assert!(search(&s, b"/", "notes", 10, 3).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 没有扩展名的文件按内容判断是不是文本："文件"App 据此给 text/plain。
+    #[test]
+    fn text_is_told_by_content() {
+        let (s, dir) = sample("text");
+        let etc = resolve(&s, b"/etc").unwrap();
+        let file = |name: &[u8], data: &[u8]| {
+            s.create_file(etc, name, 0o644, 0, 0)
+                .unwrap()
+                .1
+                .write_all(data)
+                .unwrap();
+        };
+        file(
+            b"profile",
+            b"export PATH=/bin\n# \xe4\xb8\xad\xe6\x96\x87\n",
+        );
+        file(b"empty", b"");
+        file(b"elf", b"\x7fELF\x02\x01\x01\0\0\0");
+        file(b"latin1", b"caf\xe9\n");
+        // 长文件在第 4096 个字节处截断了一个汉字：照样是文本
+        let mut long = vec![b'a'; SNIFF_BYTES - 1];
+        long.extend_from_slice("中文".as_bytes());
+        file(b"long", &long);
+        assert!(looks_like_text(&s, b"/etc/profile"));
+        assert!(looks_like_text(&s, b"/etc/motd"));
+        assert!(looks_like_text(&s, b"/home/alice/motd"), "through a link");
+        assert!(looks_like_text(&s, b"/etc/empty"));
+        assert!(looks_like_text(&s, b"/etc/long"));
+        assert!(!looks_like_text(&s, b"/etc/elf"));
+        assert!(!looks_like_text(&s, b"/etc/latin1"));
+        assert!(!looks_like_text(&s, b"/etc"), "a directory");
+        assert!(!looks_like_text(&s, b"/etc/missing"));
+        // 整个文件只有一个字节截断的字符：不是文本
+        assert!(!is_text("中".as_bytes().get(..2).unwrap(), true));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -57,7 +57,7 @@ Manifest 里的 provider 由 `MANAGE_DOCUMENTS` 权限保护（只有系统的"�
 - 看到的是仓库，不是运行中的 guest 看到的：tmpfs（`/run`、`/dev/shm`）、bind 挂载、容器的 overlay 里的文件看不到。
 - guest 里改了文件，"文件"App 不会自动刷新，要重新进这个目录（内核没有把变化告诉 provider）。→ 新建、删除、改名会刷新了：内核记下目录项改过的目录，服务定时取走、通知"文件"App（[M9："文件"App 与 guest 双向的通知](201-documents-notify.md)）；只改了文件内容（大小、时间变了）的仍不刷新
 - 符号链接都跟随，家目录里指向外面的链接也是：拿到家目录树的授权的 App，经由这样的链接能读到家目录外面的文件（链接是 guest 里的用户自己建的）。
-- 没有扩展名的文本文件（`/etc/profile`、脚本）是 `application/octet-stream`，"文件"App 里点开没有 App 能打开，只能复制出去。没有按内容猜类型。
+- 没有扩展名的文本文件（`/etc/profile`、脚本）是 `application/octet-stream`，"文件"App 里点开没有 App 能打开，只能复制出去。没有按内容猜类型。→ 按扩展名猜不出的看开头 4 KB，文本给 `text/plain`（[M9："文件"App 按内容认出文本文件](204-text-by-content.md)）
 - 没有缩略图：图片只显示图标。
 - 搜索只按名字，不支持"文件"App 的按类型、按时间过滤（根上没有声明 `COLUMN_QUERY_ARGS`）。
 - `Rootfs.access` 只管 provider 和启动内核、删掉仓库；App 里别处另外打开仓库的（设置页列账号、开机后读 `boot.log`）没有持锁，原来就是这样，它们都不在内核启动的同时发生。

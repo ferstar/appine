@@ -22,7 +22,7 @@ use appine_kernel::vfs::browse;
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
+use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, jstring};
 
 /// 抛出 `java.io.IOException`；JNI 调用之后由 Kotlin 看到。
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
@@ -302,6 +302,46 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpen<'l>(
             -1
         }
     }
+}
+
+/// 这些路径指向的普通文件看起来是不是文本（[`browse::looks_like_text`]），一次打开仓库查完。
+/// 只看前 1000 个，之后的都当作不是。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseSniff<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    paths: JObjectArray<'l>,
+) -> jbooleanArray {
+    /// 一次最多看多少个文件：每个要在宿主上打开、读 4 KB，大目录里不能一直看下去。
+    const SNIFF_MAX: usize = 1000;
+    let (Some(store), Some(paths)) = (string(&mut env, &store), strings(&mut env, &paths)) else {
+        return std::ptr::null_mut();
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        Ok(paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let p = browse::decode_path(&String::from_utf8_lossy(p));
+                jboolean::from(i < SNIFF_MAX && browse::looks_like_text(s, &p))
+            })
+            .collect::<Vec<jboolean>>())
+    });
+    let texts = match r {
+        Ok(t) => t,
+        Err(e) => {
+            not_found(&mut env, "open", &store, e);
+            return std::ptr::null_mut();
+        }
+    };
+    let Ok(array) = env.new_boolean_array(texts.len() as jint) else {
+        return std::ptr::null_mut();
+    };
+    if env.set_boolean_array_region(&array, 0, &texts).is_err() {
+        return std::ptr::null_mut();
+    }
+    array.into_raw()
 }
 
 /// 在目录下面按名字找（不分大小写）：每一项是 `<路径>\t<类型>\t…`。

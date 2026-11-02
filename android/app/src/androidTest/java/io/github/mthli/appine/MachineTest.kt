@@ -733,7 +733,8 @@ class MachineTest {
         val machine = start(1)
         val setup = "rm -rf /root/dt && mkdir -p /root/dt/sub && printf hi > /root/dt/a.txt && " +
             "ln -s /etc/alpine-release /root/dt/release && ln -s /nowhere /root/dt/broken && " +
-            "mkfifo /root/dt/fifo && printf x > '/root/dt/100% 中文.txt'"
+            "mkfifo /root/dt/fifo && printf x > '/root/dt/100% 中文.txt' && " +
+            "printf 'export A=1\\n' > /root/dt/.bashrc && printf 'a\\0b' > /root/dt/blob"
         assertEquals(0, sh(machine, setup).second)
         val resolver = context.contentResolver
         val authority = Documents.authority(context)
@@ -753,10 +754,13 @@ class MachineTest {
         try {
             assertEquals(listOf(listOf("home", "/root")), roots())
             assertEquals(
+                // 按扩展名猜不出的按内容：文本是 text/plain（点文件、链接到的版本号），有 NUL 的不是
                 listOf(
+                    listOf("/root/dt/.bashrc", ".bashrc", "text/plain", "11"),
                     listOf("/root/dt/100%25 中文.txt", "100% 中文.txt", "text/plain", "1"),
                     listOf("/root/dt/a.txt", "a.txt", "text/plain", "2"),
-                    listOf("/root/dt/release", "release", "application/octet-stream", null),
+                    listOf("/root/dt/blob", "blob", "application/octet-stream", "3"),
+                    listOf("/root/dt/release", "release", "text/plain", null),
                     listOf("/root/dt/sub", "sub", DocumentsContract.Document.MIME_TYPE_DIR, null),
                 ),
                 rows(DocumentsContract.buildChildDocumentsUri(authority, "/root/dt"), id, name, mime, size)
@@ -766,6 +770,7 @@ class MachineTest {
             assertEquals("x", read("/root/dt/100%25 中文.txt"))
             assertTrue(read("/root/dt/release").startsWith("3."))
             // 家目录外面的、不规范的 ID 都当作不存在（查询返回 null）
+            assertEquals(listOf(listOf("text/plain")), rows(document("/root/dt/release"), mime))
             assertEquals(null, rows(document("/etc/motd"), id))
             assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
             assertEquals(null, rows(document("/root//dt"), id))

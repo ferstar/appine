@@ -60,6 +60,14 @@ internal object Native {
     @Throws(IOException::class)
     external fun browseOpen(store: String, path: String): Int
 
+    /**
+     * 这些路径指向的普通文件看起来是不是文本（开头 4 KB 没有 NUL、是合法的 UTF-8）：按扩展名猜
+     * 不出类型时用（[Documents]）。一次最多看 1000 个，之后的都是 false。
+     */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseSniff(store: String, paths: Array<String>): BooleanArray
+
     /** 在目录 [dir] 下面找名字里有 [query] 的（不分大小写），浅的在前，最多 [limit] 个：`<路径>\t<元数据>`。 */
     @JvmStatic
     @Throws(IOException::class)
