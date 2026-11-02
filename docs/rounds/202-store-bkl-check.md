@@ -1,6 +1,6 @@
 # M9：内核的仓库只在持着它的 BKL 时用（2026-11-03）
 
-← [M9："文件"App 与 guest 双向的通知（2026-11-03）](201-documents-notify.md) · [索引](../milestones.md)
+← [M9："文件"App 与 guest 双向的通知（2026-11-03）](201-documents-notify.md) · [索引](../milestones.md) · [M9：换镜像不丢用户加的源（2026-11-03）](203-mirror-keeps-lines.md) →
 
 [以指定用户登录](193-login-account.md)那一轮，`init_runs_the_inittab` 在全量并发的 `cargo test` 里失败过一次：`poweroff` 让所有进程同时退出时，guest 线程在 rusqlite 的语句缓存里 panic（`cache.rs:142`，`RefCell` 已经被借走）。[进程被结束的提示](195-kill-reports.md)那一轮找到一处可疑的地方：宿主线程开机、关机时不持 BKL 读 `/etc/inittab`，改成了持锁，但没能复现，不能确认就是它，也不知道还有没有别处。
 

@@ -499,7 +499,10 @@ class MachineTest {
         assertFalse(dest.exists() || File(dest.path + ".part").exists())
     }
 
-    /** 设置里手动选的镜像写进源：内核运行着也写得进去，guest 马上看得到；记下是手动选的。 */
+    /**
+     * 设置里手动选的镜像写进源：内核运行着也写得进去，guest 马上看得到；记下是手动选的。只换内置
+     * 镜像的地址，用户加的行（testing、自己的仓库、注释掉的）留着；一处内置的镜像也没有时不动。
+     */
     @Test
     fun manualMirrorIsWritten() {
         val machine = start(1)
@@ -507,13 +510,59 @@ class MachineTest {
         val before = sh(machine, "cat /etc/apk/repositories").first
         val prefs = context.getSharedPreferences("rootfs", android.content.Context.MODE_PRIVATE)
         val saved = prefs.all
+        val (official, tuna, ustc) = distro.mirrors
+        val branch = BuildConfig.ALPINE_BRANCH
         try {
-            Rootfs.setMirror(context, distro, distro.mirrors[2])
+            sh(machine, "echo '@testing http://${official.removePrefix("https://")}/edge/testing' >> /etc/apk/repositories")
+            sh(machine, "echo '#$official/$branch/community' >> /etc/apk/repositories")
+            sh(machine, "echo 'https://packages.example.com/alpine/$branch/main' >> /etc/apk/repositories")
+            assertTrue(Rootfs.setMirror(context, distro, ustc))
             assertTrue(Rootfs.isMirrorManual(context))
-            assertEquals(distro.mirrors[2], Rootfs.mirror(context))
-            val written = sh(machine, "cat /etc/apk/repositories").first
-            assertTrue(written, written.startsWith("${distro.mirrors[2]}/"))
-            assertTrue(written, written.contains("/community\n"))
+            assertEquals(ustc, Rootfs.mirror(context))
+            val bare = ustc.removePrefix("https://")
+            // 原来的源可能已经被 App 测速换过镜像
+            assertEquals(
+                distro.mirrors.fold(before) { text, m -> text.replace(m, ustc) } +
+                    "@testing http://$bare/edge/testing\n#$ustc/$branch/community\n" +
+                    "https://packages.example.com/alpine/$branch/main\n",
+                sh(machine, "cat /etc/apk/repositories").first,
+            )
+            // 再换一次：上次选的也是内置的镜像
+            assertTrue(Rootfs.setMirror(context, distro, tuna))
+            assertTrue(sh(machine, "cat /etc/apk/repositories").first.startsWith("$tuna/$branch/main\n"))
+            // 全换成了列表以外的镜像：不动，记录也不变
+            val custom = "https://mirror.example.org/alpine/$branch/main\n"
+            sh(machine, "printf '$custom' > /etc/apk/repositories")
+            assertFalse(Rootfs.setMirror(context, distro, ustc))
+            assertEquals(custom, sh(machine, "cat /etc/apk/repositories").first)
+            assertEquals(tuna, Rootfs.mirror(context))
+            // 源文件不在了：照导入时那样重写
+            sh(machine, "rm /etc/apk/repositories")
+            assertTrue(Rootfs.setMirror(context, distro, ustc))
+            assertEquals("$ustc/$branch/main\n$ustc/$branch/community\n", sh(machine, "cat /etc/apk/repositories").first)
+            // Debian 的 deb822：只换内置镜像的主机，协议、组件、别人的仓库照旧
+            val debian = """
+                Types: deb
+                URIs: https://deb.debian.org/debian
+                Suites: trixie trixie-updates trixie-backports
+                Components: main contrib non-free
+
+                Types: deb
+                URIs: http://deb.debian.org/debian-security
+                Suites: trixie-security
+                Components: main
+
+                Types: deb
+                URIs: https://download.docker.com/linux/debian
+                Suites: trixie
+                Components: stable
+
+            """.trimIndent()
+            assertEquals(
+                debian.replace("deb.debian.org", "mirrors.aliyun.com"),
+                Rootfs.retarget(Rootfs.Distro.DEBIAN, debian, "mirrors.aliyun.com"),
+            )
+            assertEquals(null, Rootfs.retarget(Rootfs.Distro.DEBIAN, "URIs: http://ftp.cn.debian.org/debian\n", "mirrors.aliyun.com"))
         } finally {
             // 恢复原来的源和记录：别的用例、App 本身都用这个仓库
             Native.writeFile(Rootfs.store(context).path, "/etc/apk/repositories", before.toByteArray(), 420, true)

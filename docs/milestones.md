@@ -211,6 +211,7 @@
 | [M9：发布时放出的源码](rounds/200-release-sources.md) | 2026-11-03 | `scripts/release-sources` 生成随 APK 放出的三份源码：appine 自己（`git archive HEAD`）、`cargo vendor`、Alpine minirootfs 里 GPL 包（alpine-baselayout、apk-tools、busybox、musl、pax-utils）的 aports 目录和上游源码。按 `lib/apk/db/installed` 的 origin 和提交从 GitLab 取子目录，上游源码按 APKBUILD 的 sha512sums 从 Alpine 的 distfiles 镜像取并校验，不执行 APKBUILD。公开仓库还是附书面承诺待定 |
 | [M9："文件"App 与 guest 双向的通知](rounds/201-documents-notify.md) | 2026-11-03 | "文件"App 的修改经由 `browse_changing` 交给用着同一个仓库、运行中的内核（启动时按仓库目录登记），照对应的 syscall 报 inotify 事件：新建、删除、改名移动、为写打开；交出去写的文件按 object 的路径带关闭回调重新打开，对方关闭时报 `IN_MODIFY`、`IN_CLOSE_WRITE`，guest 里的热重载收得到。反过来仓库记下 guest 改过目录项的目录，服务定时取走（`Machine::take_changed_dirs`）通知"文件"App 刷新 |
 | [M9：内核的仓库只在持着它的 BKL 时用](rounds/202-store-bkl-check.md) | 2026-11-03 | 第 193 轮的偶发 panic（rusqlite 语句缓存的 `RefCell` 被借走）是两个线程同时用了一个仓库连接，rusqlite 不让 SQLite 给连接加锁，可能弄坏仓库。检查的构建（调试构建、`borrow-check`）里，交给内核的仓库在不持着那个内核的 BKL 时用连接、元数据缓存就当作内核的 bug（线程局部记下持着哪一把 BKL），不用撞上并发就查得出来；全量测试、差分测试、LTP、仪器测试没有别处这样用，改回第 195 轮之前不持锁读 inittab 时那个用例第一次就失败，确认就是它 |
+| [M9：换镜像不丢用户加的源](rounds/203-mirror-keeps-lines.md) | 2026-11-03 | 设置里选镜像、测速选镜像不再重写整个源文件，只把内置镜像（列表里任何一个，http、https 都算）的地址换成选的那个，协议照旧；用户加的 testing、backports、组件、第三方的源和注释掉的行都留着。源里全是列表以外的镜像时不动，提示手改；源文件不在时照导入时那样重写 |
 
 ## 测量条件
 

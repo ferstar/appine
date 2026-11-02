@@ -36,6 +36,7 @@
     <string name="mirror_auto">Fastest (measured)</string>
     <string name="mirror_measured">%1$s (fastest when measured)</string>
     <string name="mirror_measuring">Measuring the mirrors…</string>
+    <string name="mirror_not_found">No listed mirror in the package sources; edit them by hand.</string>
     <string name="tier_1">Tier 1: translated (default)</string>
     <string name="tier_0">Tier 0: interpreted, tens of times slower; for troubleshooting</string>
     <string name="restart_title">Restart?</string>

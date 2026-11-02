@@ -35,6 +35,7 @@
     <string name="mirror_auto">自动选择最快的</string>
     <string name="mirror_measured">%1$s（测速选出的）</string>
     <string name="mirror_measuring">正在测速…</string>
+    <string name="mirror_not_found">源里没有列表中的镜像，没有改动，请手动修改。</string>
     <string name="tier_1">Tier 1：翻译执行（默认）</string>
     <string name="tier_0">Tier 0：解释执行，慢几十倍，排查问题用</string>
     <string name="restart_title">重启？</string>

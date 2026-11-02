@@ -22,6 +22,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import android.widget.Toast
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import java.util.concurrent.Executors
@@ -510,10 +511,22 @@ class TerminalService : Service() {
         val distro = Rootfs.installed(this) ?: return
         if (machine == 0L || switching != null) return
         worker.execute {
-            runCatching { Rootfs.setMirror(this, distro, mirror) }
+            val written = runCatching { Rootfs.setMirror(this, distro, mirror) }
                 .onFailure { Log.w(TAG, "cannot write the package sources", it) }
-            main.post { settingsChanged() }
+                .getOrDefault(true)
+            main.post {
+                if (!written) mirrorNotFound()
+                settingsChanged()
+            }
         }
+    }
+
+    /**
+     * 源里一处内置的镜像也没有（全换成了列表以外的），设置里选的镜像没有写进去：告诉用户手改。
+     * Android 12 起 toast 最多两行，不写路径。
+     */
+    private fun mirrorNotFound() {
+        Toast.makeText(this, R.string.mirror_not_found, Toast.LENGTH_LONG).show()
     }
 
     /** 设置里选了"自动"：重新测速，写进最快的。 */
@@ -521,8 +534,11 @@ class TerminalService : Service() {
         val distro = Rootfs.installed(this) ?: return
         if (machine == 0L || switching != null || mirrorThread?.isAlive == true) return
         mirrorThread = thread(name = "appine-mirrors") {
-            Rootfs.chooseMirror(this, distro)
-            main.post { settingsChanged() }
+            val written = Rootfs.chooseMirror(this, distro)
+            main.post {
+                if (!written) mirrorNotFound()
+                settingsChanged()
+            }
         }
     }
 

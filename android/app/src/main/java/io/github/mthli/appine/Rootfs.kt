@@ -485,34 +485,66 @@ internal object Rootfs {
     fun isMirrorManual(context: Context): Boolean = prefs(context).getBoolean(KEY_MIRROR_MANUAL, false)
 
     /**
-     * 设置里选了 [mirror]：写进 [distro] 的包管理器的源（用户自己改过的也覆盖），之后不再测速
-     * 换掉它。内核运行着也可以写：仓库的提交计数器变了，内核层的缓存随之作废（设计文档 §8.1）。
+     * 源文件的内容 [text] 里内置镜像（[Distro.mirrors] 里的任何一个，http、https 都算）的地址换成
+     * [mirror]，协议照旧；别的地址（用户自己加的仓库、列表以外的镜像）不动。用户加的行（Alpine 的
+     * testing、Debian 的 backports）、改过的组件都留着，注释掉的行也照换。一处内置的镜像也没有时
+     * 返回 null。
      */
-    @Throws(IOException::class)
-    fun setMirror(context: Context, distro: Distro, mirror: String) = synchronized(this) {
-        val (path, content) = sources(distro, mirror)
-        write(store(context).path, path, content)
-        prefs(context).edit().putString(KEY_MIRROR, mirror).putBoolean(KEY_MIRROR_MANUAL, true).apply()
+    fun retarget(distro: Distro, text: String, mirror: String): String? {
+        val bare = { m: String -> m.substringAfter("://") }
+        val known = distro.mirrors.joinToString("|") { Regex.escape(bare(it)) }
+        val address = Regex("""(https?://)(?:$known)(?=[/\s]|$)""")
+        if (!address.containsMatchIn(text)) return null
+        return address.replace(text) { it.groupValues[1] + bare(mirror) }
     }
 
     /**
-     * 并发给 [distro] 的镜像测速，把最快的写进包管理器的源；全部失败时保持原样。用户在设置里
-     * 选了镜像（测速期间也算）就不动。会阻塞几秒，在后台线程上调用。Debian 的镜像只写主机名，
-     * 测速用 https。
+     * 把 [distro] 的包管理器的源换成 [mirror]（[retarget]）；源文件不在了就按 [sources] 重写。源里
+     * 一处内置的镜像也没有（全换成了列表以外的镜像）时不动，返回 false。内核运行着也可以写：仓库
+     * 的提交计数器变了，内核层的缓存随之作废（设计文档 §8.1）。
      */
-    fun chooseMirror(context: Context, distro: Distro) {
+    @Throws(IOException::class)
+    private fun writeMirror(store: String, distro: Distro, mirror: String): Boolean {
+        val (path, content) = sources(distro, mirror)
+        val old = Native.readFile(store, path) ?: return true.also { write(store, path, content) }
+        val new = retarget(distro, String(old), mirror) ?: return false
+        if (new != String(old)) write(store, path, new)
+        return true
+    }
+
+    /**
+     * 设置里选了 [mirror]：写进 [distro] 的包管理器的源（[writeMirror]），之后不再测速换掉它。源里
+     * 没有内置的镜像、没有改时返回 false。
+     */
+    @Throws(IOException::class)
+    fun setMirror(context: Context, distro: Distro, mirror: String): Boolean = synchronized(this) {
+        if (!writeMirror(store(context).path, distro, mirror)) return false
+        prefs(context).edit().putString(KEY_MIRROR, mirror).putBoolean(KEY_MIRROR_MANUAL, true).apply()
+        return true
+    }
+
+    /**
+     * 并发给 [distro] 的镜像测速，把最快的写进包管理器的源（[writeMirror]）；全部失败时保持原样。
+     * 用户在设置里选了镜像（测速期间也算）就不动。源里没有内置的镜像、没有改时返回 false。会阻塞
+     * 几秒，在后台线程上调用。Debian 的镜像只写主机名，测速用 https。
+     */
+    fun chooseMirror(context: Context, distro: Distro): Boolean {
         prefs(context).edit().putBoolean(KEY_MIRROR_MANUAL, false).apply()
         val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
         val speeds = probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" })
-        val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return
+        val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return true
         Log.i(TAG, "mirror speeds: ${distro.mirrors.zip(speeds)}, using ${best.first}")
         synchronized(this) {
-            if (isMirrorManual(context)) return
-            runCatching {
-                val (path, content) = sources(distro, best.first)
-                write(store(context).path, path, content)
+            if (isMirrorManual(context)) return true
+            val written = runCatching { writeMirror(store(context).path, distro, best.first) }
+                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
+                .getOrDefault(true)
+            if (written) {
                 prefs(context).edit().putString(KEY_MIRROR, best.first).apply()
-            }.onFailure { Log.w(TAG, "cannot write the package sources", it) }
+            } else {
+                Log.i(TAG, "no built-in mirror in the package sources, leaving them alone")
+            }
+            return written
         }
     }
 
