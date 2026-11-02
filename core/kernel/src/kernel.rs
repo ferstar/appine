@@ -271,6 +271,9 @@ pub(crate) struct Kernel {
     pub forward: crate::forward::Forwarder,
     /// 过滤链丢弃的 TCP 连接连去的宿主地址（`syscall::net::blackhole`），第一次用到时建。
     pub blackhole: std::cell::OnceCell<Option<Vec<u8>>>,
+    /// 被 nat 换过目的地址、还没被接受的 TCP 连接原来的目的地址（[`crate::origdst`]，
+    /// `SO_ORIGINAL_DST`）。
+    pub orig_dst: crate::origdst::Table,
     /// 宿主交来的主表路由（[`crate::Machine::set_routes`]，Android 上取自 `LinkProperties`），
     /// None 时读宿主的（[`crate::route`]）。
     pub host_routes: Option<Vec<appine_hal::net::Route>>,
@@ -357,6 +360,7 @@ impl Kernel {
             portmap: Default::default(),
             forward: Default::default(),
             blackhole: Default::default(),
+            orig_dst: Default::default(),
             host_routes: None,
             aio_nr: 0,
             aio_max_nr: 65536,

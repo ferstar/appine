@@ -40,6 +40,7 @@ const SO_TYPE: i32 = 3;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ERROR: i32 = 4;
+const SO_MARK: i32 = 36;
 
 const MSG_PEEK: u32 = 0x2;
 const MSG_TRUNC: u32 = 0x20;
@@ -601,7 +602,7 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, proto, timeout, net, local_map, vaddr) = match &*sock.borrow() {
+    let (host_fd, family, ty, proto, timeout, net, local_map, vaddr, mark) = match &*sock.borrow() {
         Socket::Inet(s) => (
             s.fd,
             s.family,
@@ -611,6 +612,7 @@ fn accept_host(
             s.net.clone(),
             s.local_map,
             s.vaddr,
+            s.mark(),
         ),
         Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
         Socket::Unix(_) => unreachable!("handled by accept4"),
@@ -623,6 +625,25 @@ fn accept_host(
                 new.proto = proto;
                 new.local_map = local_map;
                 new.net = net.clone();
+                // 接受的连接沿用监听的 SO_MARK（inet_csk_clone_lock 的 ir_mark）
+                if mark != 0 {
+                    new.track_mut().mark = mark;
+                }
+                // 发起的一端被 nat 换过目的地址的：领走这个命名空间里看到的原目的地址
+                // （SO_ORIGINAL_DST，crate::origdst）
+                if ty == SOCK_STREAM
+                    && !cx.kr().orig_dst.is_empty()
+                    && let Ok(local) = appine_hal::net::sockname(new.fd, false)
+                    && let (Some(p), Some(l)) = (
+                        crate::origdst::end_of(&peer),
+                        crate::origdst::end_of(&local),
+                    )
+                {
+                    let ns = net.as_ref().map_or(cx.kr().init_ns.net.id, |n| n.id);
+                    if let Some(o) = cx.k().orig_dst.claim((p, l), ns) {
+                        new.track_mut().orig_dst = Some(o);
+                    }
+                }
                 if proto == IPPROTO_TCP && net.is_none() {
                     cx.k().traffic.protocols.tcp_passive_opens += 1;
                 }
@@ -653,7 +674,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     let w = cx.kr().world();
     let init = cx.kr().init_ns.net.clone();
     let cred = cx.cred();
-    let (host_addr, tcp, host_fd) = match &mut *sock.borrow_mut() {
+    let (host_addr, tcp, host_fd, origs) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
             // 本端地址可能变了：流量算在哪个接口上重新认
             s.route = None;
@@ -674,6 +695,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 there,
                 actual,
                 verdict,
+                origs,
             } = route(&w, s, &me, &addr, &cred)?;
             // 过滤链：TCP 被拒绝的马上失败，被丢弃的连到黑洞上等超时（OUTPUT 上的丢弃
             // Linux 也是重传到超时）；UDP 照常连接，之后不带地址的发送不发出去
@@ -697,7 +719,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 } else {
                     hole
                 };
-                (hole, false, s.fd)
+                (hole, false, s.fd, None)
             } else {
                 // 连到新的网络命名空间里：那里没有对得上的监听就是 ECONNREFUSED（宿主上开机时的
                 // 命名空间里监听通配地址的 socket 也盖住这个地址，不能交给宿主去连）
@@ -763,7 +785,8 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 }
                 // 新的网络命名空间里的流量不算进宿主的接口（/proc/net/snmp 也不数）
                 let tcp = s.net.is_none() && s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP;
-                (host_addr, tcp, s.fd)
+                let stream = s.ty == SOCK_STREAM && nat_proto(s) == Some(IPPROTO_TCP as u8);
+                (host_addr, tcp, s.fd, stream.then_some(origs))
             }
         }
         Socket::Netlink(_) => return Ok(0),
@@ -772,6 +795,20 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     let r = appine_hal::net::connect(host_fd, &host_addr);
     if tcp {
         count_connect(cx, &sock, r.err().map(Errno));
+    }
+    // 被 nat 换过目的地址的 TCP 连接按宿主上的四元组记下原目的地址，接受的一端在 accept 时
+    // 领走；没被 nat 的去掉同一个四元组以前留下的（crate::origdst）。阻塞的 connect 也在
+    // 放开 BKL 等待之前记下，对方不会先 accept
+    if let Some(origs) = origs
+        && (r.is_ok() || r == Err(Errno::EINPROGRESS.0))
+        && (!origs.is_empty() || !cx.kr().orig_dst.is_empty())
+        && let Ok(local) = appine_hal::net::sockname(host_fd, false)
+        && let (Some(a), Some(b)) = (
+            crate::origdst::end_of(&local),
+            crate::origdst::end_of(&host_addr),
+        )
+    {
+        cx.k().orig_dst.register((a, b), origs);
     }
     let connected = addr.get(..2) != Some(&[0, 0]);
     if (r.is_ok() || r == Err(Errno::EINPROGRESS.0))
@@ -874,43 +911,7 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
             guest_peer: Some(p),
             ..
         }) if peer => p.clone(),
-        Socket::Inet(s) => {
-            let mut a = appine_hal::net::sockname(s.fd, peer).map_err(Errno)?;
-            // raw socket 的本端"端口"是协议号（Linux 的 inet_create 设的 inet_sport），宿主的
-            // ping socket 报告的是它的编号
-            if s.icmp.is_some() && !peer && a.len() >= 4 {
-                a[2..4].copy_from_slice(&(s.proto as u16).to_be_bytes());
-            }
-            let w = cx.kr().world();
-            let a = unmap_addr(&cx.kr().portmap, &w, s, a, !peer);
-            let me = net_of(cx, s);
-            let other = if peer {
-                None
-            } else {
-                appine_hal::net::sockname(s.fd, true).ok()
-            };
-            if peer && let Some(g) = &s.guest_peer {
-                return write_addr_to(cx, addr, addrlen, g).map(|()| 0);
-            }
-            // 记下了对端的（InetSocket::vconn）：本端是面向对端的那个地址
-            if !peer
-                && s.vconn.is_some()
-                && let Some(g) = s.guest_peer.as_deref()
-                && let Some(local) = crate::netns::local_toward(&me, &a, g)
-            {
-                return write_addr_to(cx, addr, addrlen, &local).map(|()| 0);
-            }
-            let role = if peer {
-                crate::netns::Role::Peer
-            } else {
-                crate::netns::Role::Local {
-                    any: s.any,
-                    vaddr: s.vaddr,
-                    peer: other.as_deref(),
-                }
-            };
-            crate::netns::from_host(&w, &me, &a, role, s.icmp6())
-        }
+        Socket::Inet(s) => inet_name(cx, s, peer)?,
         Socket::Netlink(_) if peer => {
             let mut b = vec![0u8; 12];
             b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
@@ -920,6 +921,45 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
         Socket::Unix(u) => unix::sockname(u, peer)?,
     };
     write_addr_to(cx, addr, addrlen, &value).map(|()| 0)
+}
+
+/// 宿主 socket 的本端（`peer` 时是对端）地址换成 guest 看到的（getsockname、getpeername）。
+fn inet_name(cx: &Cx<'_>, s: &InetSocket, peer: bool) -> Result<Vec<u8>, Errno> {
+    let mut a = appine_hal::net::sockname(s.fd, peer).map_err(Errno)?;
+    // raw socket 的本端"端口"是协议号（Linux 的 inet_create 设的 inet_sport），宿主的
+    // ping socket 报告的是它的编号
+    if s.icmp.is_some() && !peer && a.len() >= 4 {
+        a[2..4].copy_from_slice(&(s.proto as u16).to_be_bytes());
+    }
+    let w = cx.kr().world();
+    let a = unmap_addr(&cx.kr().portmap, &w, s, a, !peer);
+    let me = net_of(cx, s);
+    let other = if peer {
+        None
+    } else {
+        appine_hal::net::sockname(s.fd, true).ok()
+    };
+    if peer && let Some(g) = &s.guest_peer {
+        return Ok(g.clone());
+    }
+    // 记下了对端的（InetSocket::vconn）：本端是面向对端的那个地址
+    if !peer
+        && s.vconn.is_some()
+        && let Some(g) = s.guest_peer.as_deref()
+        && let Some(local) = crate::netns::local_toward(&me, &a, g)
+    {
+        return Ok(local);
+    }
+    let role = if peer {
+        crate::netns::Role::Peer
+    } else {
+        crate::netns::Role::Local {
+            any: s.any,
+            vaddr: s.vaddr,
+            peer: other.as_deref(),
+        }
+    };
+    Ok(crate::netns::from_host(&w, &me, &a, role, s.icmp6()))
 }
 
 pub(super) fn getsockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64) -> SysResult {
@@ -1012,6 +1052,25 @@ pub(super) fn setsockopt(
         appine_hal::net::setsockopt(host_fd, level, name, &host).map_err(Errno)?;
         return Ok(0);
     }
+    // SO_MARK：只记下（InetSocket::mark），本机发出的包在 nftables 里带着它。Linux 要在 socket
+    // 的网络命名空间的属主里有 CAP_NET_RAW 或者 CAP_NET_ADMIN（sk_setsockopt）
+    if (level, name) == (SOL_SOCKET, SO_MARK)
+        && let Socket::Inet(s) = &mut *sock.borrow_mut()
+    {
+        let mark = v.get(..4).ok_or(Errno::EINVAL)?;
+        let owner = net_of(cx, s).owner.clone();
+        let cred = cx.cred();
+        if !cred.ns_capable(&owner, crate::cred::cap::NET_RAW)
+            && !cred.ns_capable(&owner, crate::cred::cap::NET_ADMIN)
+        {
+            return Err(Errno::EPERM);
+        }
+        let mark = u32::from_le_bytes(mark.try_into().unwrap());
+        if mark != 0 || s.track.is_some() {
+            s.track_mut().mark = mark;
+        }
+        return Ok(0);
+    }
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v),
@@ -1060,6 +1119,12 @@ pub(super) fn getsockopt(
         b
     };
     let pid_ns = cx.pid_ns();
+    // SO_ORIGINAL_DST：Linux 只写 sockaddr，optlen 原样写回
+    if let Some(r) = original_dst(cx, &sock, level, name, room) {
+        let out = r?;
+        cx.mm().write(UserSlice::new(value, out.len()), &out)?;
+        return Ok(0);
+    }
     // 宿主替 raw ICMP socket、汇集点看着的 UDP socket 记下的 ICMP 错误 guest 不该看到
     // （crate::rawicmp）
     if (level, name) == (SOL_SOCKET, SO_ERROR)
@@ -1091,6 +1156,8 @@ pub(super) fn getsockopt(
                 }
                 (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
                 (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
+                // SO_MARK：记下的那个（宿主上的是 Android 的 netd 设的）
+                (SOL_SOCKET, SO_MARK) => s.mark().to_le_bytes().to_vec(),
                 // raw ICMP 在宿主上是 ping socket
                 (SOL_SOCKET, SO_TYPE) if s.raw => SOCK_RAW.to_le_bytes().to_vec(),
                 _ => {
@@ -1116,6 +1183,71 @@ pub(super) fn getsockopt(
     let n = room.min(out.len());
     cx.mm().write(UserSlice::new(value, n), &out[..n])?;
     put(cx, len, (n as u32).to_le_bytes()).map(|()| 0)
+}
+
+/// `SO_ORIGINAL_DST`（`SOL_IP`）、`IP6T_SO_ORIGINAL_DST`（`SOL_IPV6`）：照 Linux 的
+/// `getorigdst`、`ipv6_getorigdst`（`nf_conntrack_proto.c`，[`crate::origdst`]），`room` 是 guest
+/// 给的 optlen。None 是交给宿主：不是这个选项、不是 TCP、UDP 的 inet socket，AF_INET 的 socket 上
+/// 的 `SOL_IPV6`（Linux 是 EOPNOTSUPP）。
+///
+/// - 不是 TCP 的是 ENOPROTOOPT，optlen 不够（16、28）是 EINVAL，都在查找之前。
+/// - 连接跟踪按包的协议族分开：IPv4（含 IPv4 映射的地址）的连接只有 `SOL_IP` 找得到，IPv6
+///   的只有 `SOL_IPV6`，另一个是 ENOENT。
+/// - 发起连接的一端（connect 过的）：原方向的原目的地址就是它连的那个（guest 看到的对端），
+///   命名空间里的包经过连接跟踪（[`crate::nft::Nft::tracks`]）才找得到。
+/// - 接受的一端：发起的一端被 nat 换过目的地址的，报告 accept 时领到的；不然经过连接跟踪
+///   时是自己的本端地址（没被 nat 的连接，原目的地址就是它）。
+/// - 没有连接的（监听着的、还没连的）：Linux 拿全零的对端去找，ENOENT。
+fn original_dst(
+    cx: &Cx<'_>,
+    sock: &SocketRef,
+    level: i32,
+    name: i32,
+    room: usize,
+) -> Option<Result<Vec<u8>, Errno>> {
+    const IPPROTO_IP: i32 = 0;
+    const SO_ORIGINAL_DST: i32 = 80;
+    let b = sock.borrow();
+    let Socket::Inet(s) = &*b else {
+        return None;
+    };
+    if name != SO_ORIGINAL_DST || !matches!(level, IPPROTO_IP | IPPROTO_IPV6) || s.icmp.is_some() {
+        return None;
+    }
+    let v6 = level == IPPROTO_IPV6;
+    if v6 && s.family != AF_INET6 {
+        return None;
+    }
+    match nat_proto(s) {
+        Some(p) if p == IPPROTO_TCP as u8 && s.ty == SOCK_STREAM => {}
+        Some(_) => return Some(Err(Errno::ENOPROTOOPT)),
+        None => return None,
+    }
+    if room < if v6 { 28 } else { 16 } {
+        return Some(Err(Errno::EINVAL));
+    }
+    // 协议族按连接的地址：发起的一端看它连的（新命名空间里 AF_INET6 的 socket 的本端是
+    // 127.a.b.1，换回来是 ::1，分不出连的是不是 IPv4 映射的地址），接受的一端看本端
+    let found = (|| {
+        let local = inet_name(cx, s, false).ok()?;
+        let fam_of = s.guest_peer.as_deref().unwrap_or(&local);
+        let tracks = net_of(cx, s)
+            .nft
+            .borrow()
+            .tracks(crate::origdst::is_v6(fam_of));
+        let orig = if let Some(p) = &s.guest_peer {
+            tracks.then(|| p.clone())?
+        } else {
+            appine_hal::net::sockname(s.fd, true).ok()?;
+            match s.track.as_ref().and_then(|t| t.orig_dst.clone()) {
+                Some(o) => o,
+                None if tracks => local,
+                None => return None,
+            }
+        };
+        crate::origdst::encode(&orig, v6).filter(|_| crate::origdst::is_v6(&orig) == v6)
+    })();
+    Some(found.ok_or(Errno::ENOENT))
 }
 
 pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
@@ -1361,6 +1493,7 @@ pub(crate) fn send(
                     there,
                     actual,
                     verdict,
+                    ..
                 } = route(&w, s, &me, addr, &cred)?;
                 // 过滤链丢弃、拒绝了的：OUTPUT 上的是 EPERM（Linux 的 ip_local_out），别处的
                 // 悄悄丢掉
@@ -1631,6 +1764,9 @@ struct Routed {
     actual: Option<Vec<u8>>,
     /// 经过的过滤链的结果，以及是不是在 OUTPUT 上（[`crate::netns::path_filter`]）。
     verdict: (crate::nft::Outcome, bool),
+    /// 被 nat 换过目的地址的命名空间（编号）和那里看到的原目的地址：`me` 里是 guest 给的，
+    /// 进入的别的命名空间里是那里的 PREROUTING 之前的（`SO_ORIGINAL_DST`，[`crate::origdst`]）。
+    origs: Vec<(u64, Vec<u8>)>,
 }
 
 /// connect、sendto 的目的地址 `addr`（guest 的）：先过 `me` 的 OUTPUT nat，换成宿主上的；
@@ -1644,6 +1780,10 @@ fn route(
     cred: &crate::cred::Cred,
 ) -> Result<Routed, Errno> {
     let nat = nat_dest(s, me, addr, cred)?;
+    let mut origs = Vec::new();
+    if nat.is_some() {
+        origs.push((me.id, addr.to_vec()));
+    }
     let dst = nat.clone().unwrap_or_else(|| addr.to_vec());
     let mut m = crate::netns::to_host(w, me, &dst, crate::netns::Use::Reach, s.icmp6())?;
     let mut actual = nat;
@@ -1653,6 +1793,7 @@ fn route(
         && let Some(d2) = crate::netns::prerouting_nat(me, &t, proto, local_port(s), &dst)?
     {
         let m2 = crate::netns::to_host(w, &t, &d2, crate::netns::Use::Reach, s.icmp6())?;
+        origs.push((t.id, dst.clone()));
         there = d2;
         actual = Some(crate::netns::from_host(
             w,
@@ -1689,6 +1830,7 @@ fn route(
                 uid: cred.euid,
                 gid: cred.egid,
                 established,
+                mark: s.mark(),
             };
             crate::netns::path_filter(w, me, m.target.as_ref(), &flow)
         }
@@ -1700,6 +1842,7 @@ fn route(
         there,
         actual,
         verdict,
+        origs,
     })
 }
 
@@ -1776,6 +1919,7 @@ fn nat_dest(
         dst,
         cred.euid,
         cred.egid,
+        s.mark(),
     )
 }
 

@@ -102,7 +102,7 @@
   - DNAT 到另一个地址族（NAT64 那样）。
 - 检查和求值都不全：
   - 表达式只检查名字，不检查参数：Linux 初始化表达式时会拒绝的规则，这里照样收下。xt 扩展的 info 不检查大小。
-  - 只能求值上面列出的表达式。不认识的（exthdr、hash、numgen、rt、socket、osf……）当作规则不匹配。xt 匹配只有 comment、addrtype、tcp、udp，multiport、conntrack、mark 等当作不匹配。 → conntrack、state 认了（M9 之前：过滤链）
+  - 只能求值上面列出的表达式。不认识的（exthdr、hash、numgen、rt、socket、osf……）当作规则不匹配。xt 匹配只有 comment、addrtype、tcp、udp，multiport、conntrack、mark 等当作不匹配。 → conntrack、state 认了（M9 之前：过滤链）；mark、owner 也认了（M9 之前：透明代理）
 - 发给自己的虚拟地址的 UDP：绑在 127.a.b.254 上的 socket 的端口，可能碰巧与 127.a.b.1 上某个 socket 的端口相同（宿主分别分配），这时发往虚拟地址这个端口的数据报都送到前者。
 - 合成的包不全对：
   - 源地址是 socket 绑的虚拟地址，没绑时按路由选。开机时的命名空间里经由宿主网络出去的选不出源地址，用第一个虚拟地址代替。

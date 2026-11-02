@@ -1646,6 +1646,9 @@ pub(crate) struct Packet<'a> {
     /// 连接跟踪的状态（`NF_CT_STATE_BIT`）：新连接的第一个包是 [`CT_NEW`]，已经收到过对方的
     /// UDP 回过去的是 [`CT_ESTABLISHED`]。
     pub ct_state: u32,
+    /// 包一开始的标记（`skb->mark`）：本机发出的是 socket 的 `SO_MARK`，经由 veth 进入别的
+    /// 命名空间时清掉（`skb_scrub_packet`）。
+    pub mark: u32,
 }
 
 pub(crate) const CT_ESTABLISHED: u32 = 2;
@@ -2222,6 +2225,47 @@ impl Eval<'_> {
         };
         match name {
             b"comment" => true,
+            // xt_mark_mtinfo1：mark、mask 和 invert；版本 0 的 xt_mark_info 是两个 unsigned long
+            b"mark" => {
+                let ne64 = |at: usize| {
+                    info.get(at..at + 8)
+                        .map(|x| u64::from_ne_bytes(x.try_into().unwrap()) as u32)
+                };
+                let (want, mask, inv) = if rev == 0 {
+                    (ne64(0), ne64(8), info.get(16))
+                } else {
+                    (ne32(0), ne32(4), info.get(8))
+                };
+                let (Some(want), Some(mask), Some(&inv)) = (want, mask, inv) else {
+                    return false;
+                };
+                ((self.mark & mask) == want) != (inv != 0)
+            }
+            // xt_owner_match_info（xt_owner.c 的 owner_mt）：uid、gid 的范围，match、invert 的
+            // XT_OWNER_UID、GID、SOCKET 位。只有本机发出的包（OUTPUT）有 socket；没有 socket 时
+            // 只在什么都不要求时匹配。附加组（XT_OWNER_SUPPL_GROUPS）不看
+            b"owner" => {
+                let (Some(umin), Some(umax), Some(gmin), Some(gmax)) =
+                    (ne32(0), ne32(4), ne32(8), ne32(12))
+                else {
+                    return false;
+                };
+                let (Some(&want), Some(&inv)) = (info.get(16), info.get(17)) else {
+                    return false;
+                };
+                const UID: u8 = 1;
+                const GID: u8 = 2;
+                const SOCKET: u8 = 4;
+                if self.p.hook != HOOK_LOCAL_OUT {
+                    return want ^ inv == 0;
+                }
+                if want & inv & SOCKET != 0 {
+                    return false;
+                }
+                let uid_ok = (umin..=umax).contains(&self.p.uid) != (inv & UID != 0);
+                let gid_ok = (gmin..=gmax).contains(&self.p.gid) != (inv & GID != 0);
+                (want & UID == 0 || uid_ok) && (want & GID == 0 || gid_ok)
+            }
             // 连接跟踪的状态：xt_conntrack_mtinfo1..3 里 match_flags、invert_flags 在 146、148，
             // state_mask 在 150（版本 1 是一个字节）；只认 XT_CONNTRACK_STATE（和 STATE_ALIAS）
             b"conntrack" => {
@@ -2336,6 +2380,50 @@ impl Nft {
         self.has(hook, false)
     }
 
+    /// 这个命名空间里 IPv4（`v6` 时是 IPv6）的包是不是经过连接跟踪：Linux 只在规则集里有
+    /// 用到它的表达式时才挂上连接跟踪的钩子（`nf_ct_netns_get`，在表达式初始化时调用，表
+    /// 停用了也算），ip、ip6 的表各管各的，inet 的两种都管。空的 nat 链不算（原生对照过）。
+    /// `SO_ORIGINAL_DST` 按它回答没被 nat 的连接（[`crate::origdst`]）。
+    pub(crate) fn tracks(&self, v6: bool) -> bool {
+        /// 初始化时调 `nf_ct_netns_get` 的表达式、xt 目标和匹配。
+        const EXPRS: [&[u8]; 7] = [
+            b"ct",
+            b"nat",
+            b"masq",
+            b"redir",
+            b"connlimit",
+            b"flow_offload",
+            b"synproxy",
+        ];
+        const XT: [&[u8]; 10] = [
+            b"DNAT",
+            b"SNAT",
+            b"MASQUERADE",
+            b"REDIRECT",
+            b"NETMAP",
+            b"CONNMARK",
+            b"CT",
+            b"conntrack",
+            b"state",
+            b"connmark",
+        ];
+        let fam = if v6 { 10 } else { 2 };
+        self.tables
+            .iter()
+            .filter(|t| t.family == fam || t.family == 1)
+            .flat_map(|t| &t.chains)
+            .flat_map(|c| &c.rules)
+            .any(|r| {
+                exprs(&r.exprs).iter().any(|(name, data)| match &name[..] {
+                    b"target" | b"match" => {
+                        let a = crate::route::attrs(data);
+                        get_str(&a, COMPAT_NAME).is_some_and(|n| XT.contains(&n))
+                    }
+                    n => EXPRS.contains(&n),
+                })
+            })
+    }
+
     fn has(&self, hook: u32, nat: bool) -> bool {
         self.tables.iter().any(|t| {
             t.flags & 1 == 0
@@ -2367,7 +2455,7 @@ impl Nft {
         }
         chains.sort_by_key(|(_, _, prio)| *prio);
         let (nh, th) = headers(p);
-        let mut mark = 0;
+        let mut mark = p.mark;
         for (t, c, _) in chains {
             let mut e = Eval {
                 p,
@@ -2412,7 +2500,7 @@ impl Nft {
         }
         chains.sort_by_key(|(_, _, prio)| *prio);
         let (nh, th) = headers(p);
-        let mut mark = 0;
+        let mut mark = p.mark;
         for (t, c, _) in chains {
             let mut e = Eval {
                 p,
@@ -2720,7 +2808,150 @@ mod tests {
             hook: HOOK_LOCAL_OUT,
             iif: None,
             ct_state: CT_NEW,
+            mark: 0,
         }
+    }
+
+    /// 连接跟踪开不开（[`Nft::tracks`]）：空的 nat 链不开；ct、redirect、xt 的 REDIRECT 开，
+    /// ip、ip6 的表各管各的，inet 的两种都管。
+    #[test]
+    fn conntrack_follows_the_rules() {
+        let root = Cred::root();
+        let run = |msgs: &[Vec<u8>]| {
+            let ns = ns();
+            let r = handle(&ns, &root, &batch(msgs), &peer());
+            assert!(errors(&r).iter().all(|&e| e == 0), "{:?}", errors(&r));
+            let n = ns.nft.borrow();
+            (n.tracks(false), n.tracks(true))
+        };
+        let empty = |fam: u8| {
+            vec![
+                table_msg(fam, b"t"),
+                chain_msg(fam, b"t", b"out", Some((3, -100, b"nat"))),
+            ]
+        };
+        assert_eq!(run(&empty(2)), (false, false));
+        let with = |fam: u8, e: Vec<u8>| {
+            let mut m = empty(fam);
+            m.push(rule_msg(fam, b"t", b"out", &[e]));
+            m
+        };
+        let redir = || expr("redir", &[(1, be32(1).to_vec())]);
+        assert_eq!(run(&with(2, redir())), (true, false));
+        assert_eq!(run(&with(10, redir())), (false, true));
+        assert_eq!(run(&with(1, redir())), (true, true));
+        let ct = expr("ct", &[(1, be32(1).to_vec()), (2, be32(0).to_vec())]);
+        assert_eq!(run(&with(2, ct)), (true, false));
+        // 别的表达式不开
+        assert_eq!(run(&with(2, expr("counter", &[]))), (false, false));
+        let xt = |name: &[u8]| {
+            expr(
+                "target",
+                &[(1, cstr(name)), (2, be32(0).to_vec()), (3, vec![0; 20])],
+            )
+        };
+        assert_eq!(run(&with(2, xt(b"REDIRECT"))), (true, false));
+        assert_eq!(run(&with(2, xt(b"LOG"))), (false, false));
+    }
+
+    /// xt 的 mark、owner 匹配（较早的 iptables-nft 的 `-m mark` 走 xt，现在的翻译成 meta
+    /// mark；`-m owner` 一直走 xt）：标记按掩码比，owner 只在本机发出的包上看 uid、gid，没有
+    /// socket 的包只在什么都不要求时匹配（`! --uid-owner` 匹配）。
+    #[test]
+    fn xt_mark_and_owner() {
+        let ns = ns();
+        let root = Cred::root();
+        let dnat_to = |ip: [u8; 4]| {
+            let mut d = vec![0u8; 48];
+            d[..4].copy_from_slice(&3u32.to_ne_bytes());
+            d[4..8].copy_from_slice(&ip);
+            d[20..24].copy_from_slice(&ip);
+            d[36..38].copy_from_slice(&80u16.to_be_bytes());
+            d[38..40].copy_from_slice(&80u16.to_be_bytes());
+            expr(
+                "target",
+                &[(1, cstr(b"DNAT")), (2, be32(2).to_vec()), (3, d)],
+            )
+        };
+        let xt = |name: &[u8], rev: u32, info: Vec<u8>| {
+            expr(
+                "match",
+                &[(1, cstr(name)), (2, be32(rev).to_vec()), (3, info)],
+            )
+        };
+        let mut mark = Vec::new();
+        mark.extend_from_slice(&7u32.to_ne_bytes());
+        mark.extend_from_slice(&0xffu32.to_ne_bytes());
+        mark.extend_from_slice(&[0; 4]);
+        // uid 1000、gid 50..60，match、invert
+        let owner = |want: u8, inv: u8| {
+            let mut o = Vec::new();
+            for v in [1000u32, 1000, 50, 60] {
+                o.extend_from_slice(&v.to_ne_bytes());
+            }
+            o.extend_from_slice(&[want, inv, 0, 0]);
+            o
+        };
+        let r = handle(
+            &ns,
+            &root,
+            &batch(&[
+                table_msg(2, b"nat"),
+                chain_msg(2, b"nat", b"OUTPUT", Some((3, -100, b"nat"))),
+                chain_msg(2, b"nat", b"PREROUTING", Some((0, -100, b"nat"))),
+                rule_msg(
+                    2,
+                    b"nat",
+                    b"OUTPUT",
+                    &[xt(b"mark", 1, mark), dnat_to([10, 0, 0, 1])],
+                ),
+                rule_msg(
+                    2,
+                    b"nat",
+                    b"OUTPUT",
+                    &[xt(b"owner", 1, owner(1, 0)), dnat_to([10, 0, 0, 2])],
+                ),
+                rule_msg(
+                    2,
+                    b"nat",
+                    b"OUTPUT",
+                    &[xt(b"owner", 1, owner(2, 2)), dnat_to([10, 0, 0, 3])],
+                ),
+                rule_msg(
+                    2,
+                    b"nat",
+                    b"PREROUTING",
+                    &[xt(b"owner", 1, owner(1, 0)), dnat_to([10, 0, 0, 4])],
+                ),
+                rule_msg(
+                    2,
+                    b"nat",
+                    b"PREROUTING",
+                    &[xt(b"owner", 1, owner(1, 1)), dnat_to([10, 0, 0, 5])],
+                ),
+            ]),
+            &peer(),
+        );
+        assert!(errors(&r).iter().all(|&e| e == 0), "{:?}", errors(&r));
+        let unicast = |_: &[u8]| RTN_UNICAST;
+        let st = ns.nft.borrow();
+        let dst = [127, 0, 0, 20];
+        let to = |ip: [u8; 4]| Outcome::Dnat(ip.to_vec(), Some(80));
+        let run = |mark: u32, uid: u32, gid: u32, hook: u32| {
+            let mut p = packet(6, &dst, 2290, &unicast);
+            (p.mark, p.uid, p.gid, p.hook) = (mark, uid, gid, hook);
+            st.nat(&p)
+        };
+        // 标记按掩码：0x107 & 0xff 也是 7
+        assert_eq!(run(7, 0, 55, HOOK_LOCAL_OUT), to([10, 0, 0, 1]));
+        assert_eq!(run(0x107, 0, 55, HOOK_LOCAL_OUT), to([10, 0, 0, 1]));
+        // uid 1000 的
+        assert_eq!(run(8, 1000, 55, HOOK_LOCAL_OUT), to([10, 0, 0, 2]));
+        // gid 不在 50..60 里的（取反）
+        assert_eq!(run(0, 0, 61, HOOK_LOCAL_OUT), to([10, 0, 0, 3]));
+        assert_eq!(run(0, 0, 55, HOOK_LOCAL_OUT), Outcome::Accept);
+        // PREROUTING 上没有 socket：--uid-owner 不匹配，! --uid-owner 匹配
+        assert_eq!(run(0, 1000, 55, HOOK_PRE_ROUTING), to([10, 0, 0, 5]));
     }
 
     /// docker 写进容器的内置 DNS 规则（iptables-nft 发的样子，docs/rounds/172-nftables.md）。

@@ -621,7 +621,9 @@ pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<
 
 /// nftables 的 OUTPUT nat（[`crate::nft::Nft::nat`]）：`me` 里协议 `proto`（TCP、UDP）
 /// 发往 guest 地址 `dst`（sockaddr）的连接、数据报。DNAT 了的返回新的目的地址，规则丢弃时
-/// 是 EPERM。`vaddr` 是 socket 绑的虚拟地址（源地址；没有时按路由选），`sport` 取本端端口。
+/// 是 EPERM。`vaddr` 是 socket 绑的虚拟地址（源地址；没有时按路由选），`sport` 取本端端口，
+/// `mark` 是 socket 的 `SO_MARK`。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn output_nat(
     me: &NetNs,
     proto: u8,
@@ -630,6 +632,7 @@ pub(crate) fn output_nat(
     dst: &[u8],
     uid: u32,
     gid: u32,
+    mark: u32,
 ) -> Result<Option<Vec<u8>>, Errno> {
     if !me.nft.borrow().has_nat(crate::nft::HOOK_LOCAL_OUT) {
         return Ok(None);
@@ -654,6 +657,7 @@ pub(crate) fn output_nat(
         gid,
         iif: None,
         ct_state: crate::nft::CT_NEW,
+        mark,
     };
     hook_nat(me, &packet, dst)
 }
@@ -718,6 +722,7 @@ pub(crate) fn prerouting_nat(
         gid: 0,
         iif: Some(iif.unwrap_or_default()),
         ct_state: crate::nft::CT_NEW,
+        mark: 0,
     };
     hook_nat(t, &packet, dst)
 }
@@ -743,6 +748,7 @@ pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8
         gid: 0,
         iif: Some(outer.map(|(i, _)| i).unwrap_or_default()),
         ct_state: crate::nft::CT_NEW,
+        mark: 0,
     };
     hook_nat(init, &packet, &dst).ok().flatten()
 }
@@ -770,6 +776,7 @@ pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there:
         gid: 0,
         iif: Some(iif),
         ct_state: crate::nft::CT_NEW,
+        mark: 0,
     };
     let pass = |o: Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
     let outer = outer_iface(init).map(|(i, _)| i).unwrap_or_default();
@@ -818,6 +825,8 @@ struct NatPacket {
     gid: u32,
     iif: Option<crate::nft::Iif>,
     ct_state: u32,
+    /// 包一开始的标记（[`crate::nft::Packet::mark`]）。
+    mark: u32,
 }
 
 /// sockaddr 里要按哪种包判断：(地址, 是不是 IPv4)。IPv4 映射的 IPv6 地址按 IPv4 的包。
@@ -912,6 +921,7 @@ fn hook_eval(
         hook: p.hook,
         iif: p.iif.clone(),
         ct_state: p.ct_state,
+        mark: p.mark,
     };
     let nft = ns.nft.borrow();
     if filter {
@@ -988,6 +998,9 @@ pub(crate) struct Flow<'a> {
     pub gid: u32,
     /// UDP 回给收到过的对方（连接跟踪的 ESTABLISHED）。
     pub established: bool,
+    /// socket 的 `SO_MARK`：OUTPUT 和经由 lo 回到自己的命名空间的包带着它，经由 veth 进入
+    /// 别的命名空间时清掉。
+    pub mark: u32,
 }
 
 /// `me` 里的 socket 发出的连接、数据报经过的过滤链（docs/rounds/175-filter.md），只看 IPv4：
@@ -1024,7 +1037,7 @@ pub(crate) fn path_filter(
         None if ip[0] == 127 => ip,
         None => source(me, ip).unwrap_or([0; 4]),
     };
-    let packet = |hook: u32, iif: Option<crate::nft::Iif>| NatPacket {
+    let packet = |hook: u32, iif: Option<crate::nft::Iif>, ns: &NetNs| NatPacket {
         hook,
         proto: f.proto,
         src: src.to_vec(),
@@ -1033,11 +1046,16 @@ pub(crate) fn path_filter(
         gid: f.gid,
         iif,
         ct_state,
+        mark: if std::ptr::eq(ns, me.as_ref()) {
+            f.mark
+        } else {
+            0
+        },
     };
     let pass = |o: &Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
     // 1. OUTPUT
     if me.nft.borrow().has_filter(HOOK_LOCAL_OUT) {
-        let o = hook_eval(me, &packet(HOOK_LOCAL_OUT, None), f.dst, None, true);
+        let o = hook_eval(me, &packet(HOOK_LOCAL_OUT, None, me), f.dst, None, true);
         if !pass(&o) {
             return (o, true);
         }
@@ -1089,7 +1107,7 @@ pub(crate) fn path_filter(
         if pre {
             let o = hook_eval(
                 ns,
-                &packet(HOOK_PRE_ROUTING, Some(iif.clone())),
+                &packet(HOOK_PRE_ROUTING, Some(iif.clone()), ns),
                 f.there,
                 None,
                 true,
@@ -1099,7 +1117,7 @@ pub(crate) fn path_filter(
             }
         }
         if this {
-            let o = hook_eval(ns, &packet(hook, Some(iif)), f.there, oif, true);
+            let o = hook_eval(ns, &packet(hook, Some(iif), ns), f.there, oif, true);
             if !pass(&o) {
                 return (o, false);
             }

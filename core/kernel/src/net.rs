@@ -183,11 +183,22 @@ pub(crate) struct Track {
     /// 连接了的 UDP：连的目的地被过滤链丢弃了。不带地址的发送不发出去：0 是悄悄丢掉，别的
     /// 是错误码（OUTPUT 上的丢弃是 EPERM）。
     pub blocked: Option<i32>,
+    /// accept 出来的 TCP 连接：发起的一端被 nat 换过目的地址时，这个命名空间里看到的原目的
+    /// 地址（guest 的 sockaddr，`SO_ORIGINAL_DST` 报告它，[`crate::origdst`]）。
+    pub orig_dst: Option<Vec<u8>>,
+    /// `SO_MARK`：只记在这里，不设到宿主 socket 上（App 在宿主上没有这个权限，Android 的 netd
+    /// 也用宿主上的标记选网络）。本机发出的包在 nftables 里带着它（[`crate::nft::Packet::mark`]）。
+    pub mark: u32,
 }
 
 impl InetSocket {
     pub(crate) fn track_mut(&mut self) -> &mut Track {
         self.track.get_or_insert_with(Default::default)
+    }
+
+    /// `SO_MARK`（[`Track::mark`]）。
+    pub(crate) fn mark(&self) -> u32 {
+        self.track.as_ref().map_or(0, |t| t.mark)
     }
 }
 
