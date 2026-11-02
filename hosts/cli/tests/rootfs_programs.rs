@@ -1475,6 +1475,110 @@ fn cgroup_memory_files_follow_the_oom_killer() {
 }
 
 #[test]
+fn oom_kills_are_reported_to_the_app() {
+    // OOM killer 结束的进程留下报告给 App（take_kills）：控制台的编号，哪个 cgroup 的
+    // memory.max（App 的上限时没有 cgroup），用量和上限。只在 Tier 1 下跑，理由同上。cgroup 里的
+    // awk 拼出 64 MB 的字符串之后接着运行一会儿：OOM killer 定时量用量，一下子用完就退出的进程
+    // 发现不了
+    use appine_kernel::{ExitStatus, KillReason, Machine, MachineOptions, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    let limit = 96 << 20;
+    let machine = Machine::start(&MachineOptions {
+        tier: Tier::Dbt,
+        rootfs: Some(store.to_path_buf()),
+        memory_limit: Some(limit),
+        low_port_offset: None,
+    })
+    .unwrap();
+    let env = [PATH.as_bytes().to_vec()];
+    let id = machine.open_console(24, 80).unwrap();
+    let script = "cd /sys/fs/cgroup; echo +memory > cgroup.subtree_control; mkdir -p oomt; \
+                  echo 16M > oomt/memory.max; \
+                  sh -c 'echo $$ > oomt/cgroup.procs; \
+                      exec awk \"BEGIN { s = \\\"x\\\"; for (i = 0; i < 26; i++) s = s s; \
+                                         for (j = 0; j < 50000000; j++) n++ }\"'; \
+                  echo cgroup $?; \
+                  awk 'BEGIN { s = \"x\"; for (i = 0; i < 27; i++) s = s s; print length(s) }'; \
+                  echo awk $?";
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    let out = read_console(&machine, id);
+    assert!(
+        out.contains("cgroup 137\n") && out.ends_with("awk 137\n"),
+        "{out}"
+    );
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    let kills = machine.take_kills();
+    let [first, awk] = kills.as_slice() else {
+        panic!("{kills:?}");
+    };
+    assert_eq!(
+        (first.comm.as_str(), first.console),
+        ("awk", Some(id)),
+        "{first:?}"
+    );
+    assert!(
+        matches!(&first.reason, KillReason::OutOfMemory { cgroup: Some(c), used, limit }
+            if c == "/oomt" && *limit == 16 << 20 && used > limit),
+        "{first:?}"
+    );
+    assert_eq!(
+        (awk.comm.as_str(), awk.console),
+        ("awk", Some(id)),
+        "{awk:?}"
+    );
+    assert!(
+        matches!(&awk.reason, KillReason::OutOfMemory { cgroup: None, used, limit: l }
+            if *l == limit && used > l),
+        "{awk:?}"
+    );
+    // 不在控制台上的进程（这里是脱离了控制终端的）没有编号
+    let script = "setsid sh -c 'exec awk \"BEGIN { s = \\\"x\\\"; for (i = 0; i < 27; i++) s = s s }\"' \
+                  </dev/null >/dev/null 2>&1; echo $?";
+    let id = machine.open_console(24, 80).unwrap();
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    assert_eq!(read_console(&machine, id), "137\n");
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    let kills = machine.take_kills();
+    assert!(
+        matches!(kills.as_slice(), [k] if k.comm == "awk" && k.console.is_none()),
+        "{kills:?}"
+    );
+    // memory.oom.group：同组的 sleep 一起结束，各一份报告，挑中的 awk 只有一份（Linux 在
+    // 整组结束时把挑中的那个再算一次）。运行脚本的 sh 不在组里，子 shell 进组之后 exec 成 awk
+    let script = "cd /sys/fs/cgroup; mkdir g; echo 16M > g/memory.max; echo 1 > g/memory.oom.group; \
+                  sh -c 'echo $$ > g/cgroup.procs; sleep 30 & \
+                      exec awk \"BEGIN { s = \\\"x\\\"; for (i = 0; i < 26; i++) s = s s; \
+                                         for (j = 0; j < 50000000; j++) n++ }\"'; \
+                  echo group $?";
+    let id = machine.open_console(24, 80).unwrap();
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    let out = read_console(&machine, id);
+    assert!(out.ends_with("group 137\n"), "{out}");
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    let mut comms: Vec<_> = machine
+        .take_kills()
+        .into_iter()
+        .map(|k| (k.comm, k.console))
+        .collect();
+    comms.sort();
+    assert_eq!(
+        comms,
+        [("awk".to_owned(), Some(id)), ("sleep".to_owned(), Some(id))]
+    );
+}
+
+#[test]
 fn code_cache_pages_are_counted_once() {
     // Tier 1 的代码缓存按 W^X 映射两次（写入用、执行用），宿主的 RSS 按映射数页：两个
     // 视图都碰过的页算两次，App 的内存用量（内存上限、LMK 看的）里翻译多算一倍。所以定时器
@@ -1826,6 +1930,28 @@ tty1::respawn:/sbin/getty 38400 tty1
         machine.shutdown(Power::Reboot, Duration::from_secs(10));
         assert_eq!(machine.processes(), 0, "{tier:?}");
     }
+    // 一个命令也没运行（程序都没装）：上次开机的输出照样清掉（第 195 轮，App 从里面找没起来的
+    // 服务）
+    let script = "cp /etc/inittab /tmp/inittab.saved; echo ::sysinit:/sbin/not-installed > /etc/inittab; \
+                  echo ' * ERROR: stale failed to start' > /var/log/boot.log";
+    assert_ok(
+        "1",
+        &command(store, "1", &["/bin/sh", "-c", script])
+            .output()
+            .unwrap(),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .args(["--tier", "1", "--init", "--env", PATH, "--rootfs"])
+        .arg(store)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "wc -c < /var/log/boot.log; mv /tmp/inittab.saved /etc/inittab",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out), "0\n", "{}", stderr(&out));
     let out = command(
         store,
         "1",

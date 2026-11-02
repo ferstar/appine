@@ -481,6 +481,18 @@ impl Machine {
                 self.wait(pid);
             }
         }
+        // 一个命令也没运行（没装 OpenRC）：上次开机的输出不留着，免得被当成这次的（App 从里面
+        // 找没起来的服务）
+        if first {
+            crate::bug::host_call("Machine::boot", || {
+                let k = self.shared.lock();
+                let Some(vfs) = &k.vfs else { return };
+                let log = crate::inittab::LOG.as_bytes();
+                if crate::vfs::read_file(vfs.store(), log).is_ok_and(|t| !t.is_empty()) {
+                    let _ = crate::vfs::write_file(vfs.store(), log, b"", 0o644, true);
+                }
+            });
+        }
     }
 
     /// 关机（busybox init 的 `run_shutdown_and_kill_processes`）：开过机的先依次运行 inittab
@@ -559,12 +571,12 @@ impl Machine {
         })
     }
 
-    /// 读 `/etc/inittab`（跟随符号链接），没有时是空表。
+    /// 读 `/etc/inittab`（跟随符号链接），没有时是空表。持着 BKL 读：关机时 guest 进程还在
+    /// 运行，仓库（SQLite 的连接、各种缓存）只能在 BKL 下用。
     fn inittab(&self) -> Vec<crate::inittab::Entry> {
-        let Some(vfs) = self.shared.lock().vfs.clone() else {
-            return Vec::new();
-        };
         let text = crate::bug::host_call("Machine::inittab", || {
+            let k = self.shared.lock();
+            let vfs = k.vfs.as_ref()?;
             let offline = crate::pseudo::Offline;
             let root = Cred::root();
             match vfs.resolve(
@@ -593,18 +605,21 @@ impl Machine {
     /// 程序是不存在的绝对路径时（比如没装 OpenRC），或者起不来时，返回 None。
     fn run_init_process(&self, process: &[u8], first: bool) -> Option<u32> {
         if let Some(program) = crate::inittab::program(process) {
-            let vfs = self.shared.lock().vfs.clone()?;
+            // 持着 BKL 查：前面的 once 命令可能已经在运行（见 [`Machine::inittab`]）
             let offline = crate::pseudo::Offline;
             let found = crate::bug::host_call("Machine::boot", || {
-                vfs.resolve(
-                    &offline,
-                    &Cred::root(),
-                    &Node::ROOT,
-                    &Node::ROOT,
-                    program,
-                    true,
-                )
-                .is_ok()
+                let k = self.shared.lock();
+                k.vfs.as_ref().is_some_and(|vfs| {
+                    vfs.resolve(
+                        &offline,
+                        &Cred::root(),
+                        &Node::ROOT,
+                        &Node::ROOT,
+                        program,
+                        true,
+                    )
+                    .is_ok()
+                })
             });
             if found != Some(true) {
                 return None;
@@ -665,6 +680,15 @@ impl Machine {
     pub fn take_listens(&self) -> Vec<crate::ListenEvent> {
         crate::bug::host_call("Machine::take_listens", || {
             self.shared.lock().portmap.borrow_mut().take_listens()
+        })
+        .unwrap_or_default()
+    }
+
+    /// 取走内核层结束了的 guest 进程（内核 bug、引擎的宿主故障、OOM killer）：App 在它们的
+    /// 标签页里说明原因，不在标签页里的发通知（设计文档 §11.2）。
+    pub fn take_kills(&self) -> Vec<crate::KillReport> {
+        crate::bug::host_call("Machine::take_kills", || {
+            std::mem::take(&mut *self.shared.lock().kills.borrow_mut())
         })
         .unwrap_or_default()
     }

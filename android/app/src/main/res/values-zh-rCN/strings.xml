@@ -55,7 +55,16 @@
     <string name="login_missing">%1$s（找不到这个账号，新标签页以 root 登录）</string>
     <string name="login_changed">新开的标签页以 %1$s 登录</string>
     <string name="restored_notice">上次会话因 App 被系统终止而结束（标签页保存于 %1$s），之前运行的程序没有恢复。</string>
+    <string name="channel_problems">进程和服务</string>
+    <string name="killed_title">%1$s 被结束了</string>
+    <string name="killed_oom_app">%1$s（pid %2$d）被结束了：App 的内存用到了上限（已用 %3$s，上限 %4$s），OOM killer 挑中了它。</string>
+    <string name="killed_oom_cgroup">%1$s（pid %2$d）被结束了：cgroup %3$s 用到了 memory.max（已用 %4$s，上限 %5$s）。</string>
+    <string name="killed_bug">%1$s（pid %2$d）因为 appine 的内部错误被结束了。这是 appine 的 bug，用 dmesg 可以看到报告。</string>
+    <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>
     <plurals name="sessions_running">
         <item quantity="other">%d 个会话运行中</item>
+    </plurals>
+    <plurals name="boot_failed_title">
+        <item quantity="other">%d 个服务没有起来</item>
     </plurals>
 </resources>

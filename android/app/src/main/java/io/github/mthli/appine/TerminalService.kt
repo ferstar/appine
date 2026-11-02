@@ -25,6 +25,7 @@ import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import java.util.concurrent.Executors
 import java.text.DateFormat
+import java.text.DecimalFormat
 import java.util.Date
 import kotlin.concurrent.thread
 
@@ -112,11 +113,13 @@ class TerminalService : Service() {
             runCatching {
                 worker.execute {
                     val lines = Native.takeListens(m)
+                    val kills = Native.takeKills(m)
                     val power = Native.takePower(m)
                     val processes = Native.processes(m)
                     main.post {
                         if (machine != m) return@post
                         lines?.forEach(::notifyListen)
+                        kills?.forEach(::reportKill)
                         when (power) {
                             Native.POWER_REBOOT -> restart()
                             Native.POWER_HALT, Native.POWER_OFF -> exitAll()
@@ -374,6 +377,9 @@ class TerminalService : Service() {
                             Native.waitFor(it, Native.spawn(it, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
                         }.onFailure { e -> Log.w(TAG, "cannot prefer osclock", e) }
                         Native.boot(it)
+                        // 开机完成：OpenRC 有服务没起来时发通知（输出在 boot.log 里，没人看）
+                        val failed = Rootfs.failedServices(this)
+                        if (failed.isNotEmpty()) main.post { if (machine == it) notifyBootFailures(failed) }
                     }
                     getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
                     watchingNetwork = true
@@ -760,7 +766,71 @@ class TerminalService : Service() {
         val services = NotificationChannel(
             NETWORK_CHANNEL_ID, getString(R.string.channel_network), NotificationManager.IMPORTANCE_DEFAULT,
         )
-        getSystemService(NotificationManager::class.java).createNotificationChannels(listOf(channel, services))
+        val problems = NotificationChannel(
+            PROBLEMS_CHANNEL_ID, getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT,
+        )
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannels(listOf(channel, services, problems))
+    }
+
+    /**
+     * [Native.takeKills] 的一项：内核层结束了一个进程（内核 bug、引擎故障、OOM killer）。它的控制
+     * 终端是某个标签页时在那个标签页里说明原因（shell 只会打印 "Killed"、"Segmentation fault"），
+     * 不在标签页里（后台的服务）、标签页正在全屏程序里或者界面不在时发通知。
+     */
+    private fun reportKill(line: String) {
+        val f = line.split('\t')
+        if (f.size != 7) return
+        val console = f[0].toIntOrNull() ?: return
+        val pid = f[1].toIntOrNull() ?: return
+        val comm = f[2]
+        // memory.max 的 16M 是 16 MiB：用 1024 进制，不然上限显示成 17 MB，看不出超了
+        val size = { bytes: String ->
+            val b = bytes.toLongOrNull() ?: 0
+            if (b >= 1L shl 30) DecimalFormat("0.#").format(b / 1073741824.0) + " GiB"
+            else DecimalFormat("0.#").format(b / 1048576.0) + " MiB"
+        }
+        val text = when (f[3]) {
+            "oom" -> if (f[4].isEmpty()) {
+                getString(R.string.killed_oom_app, comm, pid, size(f[5]), size(f[6]))
+            } else {
+                getString(R.string.killed_oom_cgroup, comm, pid, f[4], size(f[5]), size(f[6]))
+            }
+            else -> getString(R.string.killed_bug, comm, pid)
+        }
+        val session = sessions.firstOrNull { ptys[it]?.console == console && console >= 0 }
+        val shown = session?.showMessage("[appine] $text") == true
+        if (shown && listeners.isNotEmpty()) return
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.killed_title, comm))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(KILL_NOTIFICATION_BASE + pid % 1000, notification)
+    }
+
+    /** 开机时 OpenRC 有服务没起来：发一条通知，说是哪几个、输出在哪里。 */
+    private fun notifyBootFailures(services: List<String>) {
+        val title = resources.getQuantityString(R.plurals.boot_failed_title, services.size, services.size)
+        val text = getString(R.string.boot_failed_text, services.joinToString(", "))
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(BOOT_NOTIFICATION_ID, notification)
     }
 
     /** [Native.takeListens] 的一项：`<进程名>\t<端口>\t<宿主上的端口>`。每个端口一条通知。 */
@@ -853,6 +923,10 @@ class TerminalService : Service() {
         private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
         private const val CHANNEL_ID = "sessions"
         private const val NETWORK_CHANNEL_ID = "network"
+        private const val PROBLEMS_CHANNEL_ID = "problems"
+        /** 开机失败的通知；进程被结束的按 pid 编号（与监听的错开）。 */
+        private const val BOOT_NOTIFICATION_ID = 2
+        private const val KILL_NOTIFICATION_BASE = 3000
         private const val NOTIFICATION_ID = 1
         /** 监听的通知按端口编号，与 [NOTIFICATION_ID] 错开。 */
         private const val LISTEN_NOTIFICATION_BASE = 1000

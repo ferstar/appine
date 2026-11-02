@@ -110,6 +110,44 @@ public final class TerminalSession extends TerminalOutput {
         mRestored = text;
     }
 
+    /**
+     * 在终端里用黄色显示一行 App 的提示（进程被结束的原因这些），在主线程上调用。提示到的时候
+     * shell 多半已经印出了新的提示符，所以插在光标所在的行上面：先换行再回来（在最后一行时让
+     * 屏幕上卷，腾出地方），在光标的行插入提示占的行数，写提示，光标回到原处。提示符和输入了
+     * 一半的命令跟着下移，shell 的行编辑不受影响。模拟器还没建（标签页还没显示过）时攒着，
+     * 建好之后先显示。正在全屏程序（备用屏幕，vim、less 这些）里时不显示、返回 false：写进去会
+     * 弄乱它的画面。
+     */
+    public boolean showMessage(String text) {
+        if (mEmulator == null) {
+            byte[] message = ("\033[33m" + text + "\033[0m\r\n").getBytes(StandardCharsets.UTF_8);
+            byte[] pending = mRestored == null ? new byte[0] : mRestored;
+            byte[] joined = new byte[pending.length + message.length];
+            System.arraycopy(pending, 0, joined, 0, pending.length);
+            System.arraycopy(message, 0, joined, pending.length, message.length);
+            mRestored = joined;
+            return true;
+        }
+        if (mEmulator.isAlternateBufferActive()) return false;
+        int width = 0;
+        for (int i = 0; i < text.length(); ) {
+            int c = text.codePointAt(i);
+            width += Math.max(0, WcWidth.width(c));
+            i += Character.charCount(c);
+        }
+        int rows = Math.min(Math.max(1, (width + mEmulator.mColumns - 1) / mEmulator.mColumns), mEmulator.mRows - 1);
+        StringBuilder s = new StringBuilder();
+        for (int i = 0; i < rows; i++) s.append('\n');
+        s.append("\033[").append(rows).append('A');
+        s.append("\0337\r\033[").append(rows).append('L');
+        s.append("\033[33m").append(text).append("\033[0m");
+        s.append("\0338\033[").append(rows).append('B');
+        byte[] b = s.toString().getBytes(StandardCharsets.UTF_8);
+        mEmulator.append(b, b.length);
+        mClient.onTextChanged(this);
+        return true;
+    }
+
     /** 回看记录的文本（保存标签页用）；模拟器还没建（标签页还没显示过）时是 null。 */
     public String getTranscriptText() {
         return mEmulator == null ? null : mEmulator.getScreen().getTranscriptText();

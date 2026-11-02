@@ -122,3 +122,9 @@ sh -c "echo \$\$ > t/a/cgroup.procs; sleep 0.2; cat /proc/self/cgroup; exec unsh
 su nobody -s /bin/sh -c 'mkdir /sys/fs/cgroup/t/x; echo $$ > /sys/fs/cgroup/t/a/cgroup.procs' 2>&1
 rmdir t/a t/b t 2>&1
 ls -d t 2>&1
+# 合成文件系统里已有的名字：mkdir 是 EEXIST，在目录能不能修改之前（mkdir -p 靠它）
+for d in /sys /sys/fs /sys/fs/cgroup /proc/sys /proc/self /dev/pts; do
+    mkdir $d 2>&1
+done
+mkdir -p /sys/fs/cgroup/t/p/q && echo "mkdir -p ok"
+rmdir /sys/fs/cgroup/t/p/q /sys/fs/cgroup/t/p /sys/fs/cgroup/t

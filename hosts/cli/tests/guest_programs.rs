@@ -298,7 +298,7 @@ fn host_calls_survive_kernel_bugs() {
     // 宿主调用 Machine 的方法时内核层 panic（测试钩子模拟）：只有这次调用失败，控制台上的
     // 调用还挂断那个控制台，Machine 之后照常可用
     use appine_kernel::errno::Errno;
-    use appine_kernel::{ExitStatus, Machine, MachineOptions, RunError, Stdio, Tier};
+    use appine_kernel::{ExitStatus, KillReason, Machine, MachineOptions, RunError, Stdio, Tier};
     use std::os::unix::ffi::OsStrExt;
     if !cfg!(debug_assertions) {
         return;
@@ -386,6 +386,40 @@ fn host_calls_survive_kernel_bugs() {
             "{tier:?}"
         );
         assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+        // 撞上 bug 被结束的进程留下报告给 App（take_kills）：带着控制台的编号，取走一次就没了
+        assert!(machine.take_kills().is_empty(), "{tier:?}");
+        let id = machine.open_console(24, 80).unwrap();
+        let pid = machine
+            .spawn(
+                &path(&program),
+                &[b"bugs".to_vec()],
+                &[],
+                Stdio::Console(id),
+            )
+            .unwrap();
+        let (out, _) = read_all(&machine, id);
+        assert!(out.ends_with("all ok\r\n"), "{tier:?}: {out}");
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+        let kills = machine.take_kills();
+        assert!(kills.len() >= 6, "{tier:?}: {kills:?}");
+        for k in &kills {
+            assert_eq!(
+                (k.comm.as_str(), k.console),
+                ("guest-bugs", Some(id)),
+                "{tier:?}: {k:?}"
+            );
+            assert!(
+                matches!(&k.reason, KillReason::Bug(r) if r.contains(&format!("pid {}", k.pid))),
+                "{tier:?}: {k:?}"
+            );
+        }
+        assert!(
+            kills.iter().any(
+                |k| matches!(&k.reason, KillReason::Bug(r) if r.contains("kernel panic in syscall 43409"))
+            ),
+            "{tier:?}: {kills:?}"
+        );
+        assert!(machine.take_kills().is_empty(), "{tier:?}");
     }
 }
 

@@ -22,6 +22,7 @@
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::OnceLock;
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -73,18 +74,72 @@ pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
     r
 }
 
+/// 内核层结束了一个 guest 进程（App 据此在它的标签页里说明原因，设计文档 §11.2、§12）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillReport {
+    /// 进程号（开机时的 pid 命名空间里的）。
+    pub pid: i32,
+    /// 进程的名字（comm）。
+    pub comm: String,
+    /// 控制终端是 App 的控制台时是它的编号（`Machine::open_console` 返回的）。
+    pub console: Option<u32>,
+    pub reason: KillReason,
+}
+
+/// 为什么结束。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillReason {
+    /// 内核层、引擎的 bug：报告的那一行（也写进了内核日志）。
+    Bug(String),
+    /// OOM killer：App 内存的上限（`cgroup` 是 None）或者某个 cgroup 的 `memory.max` 不够了；
+    /// 用量和上限是字节。
+    OutOfMemory {
+        cgroup: Option<String>,
+        used: u64,
+        limit: u64,
+    },
+}
+
+/// 最多攒这么多份报告，App 没来得及取走时丢掉最早的。
+const MAX_KILLS: usize = 32;
+
+/// 记下结束进程 `tgid` 的报告，等 App 取走。
+pub(crate) fn record_kill(k: &Kernel, tgid: Tid, comm: String, reason: KillReason) {
+    // 撞上 bug 时线程组可能正被借着：借不到就当作没有控制终端，报告照样记下
+    let console = k.groups.get(&tgid).and_then(|g| {
+        let tty = g.try_borrow().ok()?.ctty.clone()?;
+        k.consoles
+            .iter()
+            .find(|(_, c)| Rc::ptr_eq(&c.master.tty, &tty))
+            .map(|(id, _)| *id)
+    });
+    let Ok(mut kills) = k.kills.try_borrow_mut() else {
+        return;
+    };
+    if kills.len() >= MAX_KILLS {
+        kills.remove(0);
+    }
+    kills.push(KillReport {
+        pid: tgid,
+        comm,
+        console,
+        reason,
+    });
+}
+
 /// 结束撞上 bug 的线程所在的进程：报告 `what`，用 SIGSEGV 结束整个线程组。`pc` 是这个
 /// 线程最后一次进入内核时的 guest pc。
 pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
+    let comm = crate::pseudo::comm_str(Some(task), task.tgid);
     let report = format!(
-        "appine: internal error in pid {} ({}), thread {}, last guest pc {pc:#x}: {what}; \
+        "appine: internal error in pid {} ({comm}), thread {}, last guest pc {pc:#x}: {what}; \
          killed the process with SIGSEGV",
         task.tgid,
-        crate::pseudo::comm_str(Some(task), task.tgid),
         task.tid.get(),
     );
     eprintln!("{report}");
     log(k, &report);
+    record_kill(k, task.tgid, comm, KillReason::Bug(report));
     task.killed.set(true);
     segv(k, task.tgid);
 }
@@ -95,12 +150,13 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
         let first = g.borrow().threads.first().copied();
         first.and_then(|t| k.tasks.get(&t).cloned())
     });
+    let comm = crate::pseudo::comm_str(task.as_deref(), tgid);
     let report = format!(
-        "appine: internal error in pid {tgid} ({}): {what}; killed the process with SIGSEGV",
-        crate::pseudo::comm_str(task.as_deref(), tgid),
+        "appine: internal error in pid {tgid} ({comm}): {what}; killed the process with SIGSEGV",
     );
     eprintln!("{report}");
     log(k, &report);
+    record_kill(k, tgid, comm, KillReason::Bug(report));
     segv(k, tgid);
 }
 

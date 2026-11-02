@@ -841,6 +841,12 @@ impl Vfs {
         Ok(self.mounted(child))
     }
 
+    /// 目录 `dir` 里已经有 `name` 了（`.`、`..` 总是有）：在里面新建之前，先于目录能不能
+    /// 修改的检查（Linux 的 `filename_create`）。
+    pub(crate) fn has_child(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> bool {
+        name == b"." || name == b".." || self.lookup(ps, dir, name).is_ok()
+    }
+
     /// 目录的上级目录；挂载的根的上级是挂载点的上级（getdents 的 `..`）。
     pub(crate) fn parent(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
         let mut dir = dir.clone();

@@ -256,6 +256,9 @@ pub(crate) struct Kernel {
     pub threads_max: usize,
     /// App 内存的上限和 OOM killer（[`crate::oom`]）。
     pub oom: crate::oom::Oom,
+    /// 内核层结束了的 guest 进程（内核 bug、引擎的宿主故障、OOM killer），等 App 取走
+    /// （[`crate::Machine::take_kills`]）。
+    pub kills: RefCell<Vec<crate::bug::KillReport>>,
     /// 同一个程序的地址空间共用 Tier 1 翻译的组（[`crate::mm::CodeGroup`]）。
     pub code_groups: crate::mm::CodeGroups,
     /// 平均负载（[`crate::loadavg`]）。
@@ -365,6 +368,7 @@ impl Kernel {
             power: None,
             stopping: false,
             klog: Default::default(),
+            kills: Default::default(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
             threads_max: crate::process::default_threads_max(),

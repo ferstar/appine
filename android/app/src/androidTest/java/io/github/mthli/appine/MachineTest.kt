@@ -202,6 +202,8 @@ class MachineTest {
         val original = sh(probe, "cat /etc/inittab").first.toByteArray()
         Native.stop(probe)
         val inittab = "::sysinit:/bin/sh -c 'echo sysinit > /tmp/inittab-order'\n" +
+            // OpenRC 的服务没起来时这样写（eerror），重复的只算一次
+            "::sysinit:/bin/sh -c 'for s in fake fake other; do echo \" * ERROR: \$s failed to start\"; done'\n" +
             "::once:/bin/sleep 30\n" +
             "::shutdown:/bin/sh -c 'echo shutdown >> /tmp/inittab-order'\n"
         Native.writeFile(store, "/etc/inittab", inittab.toByteArray(), 420, true)
@@ -211,6 +213,7 @@ class MachineTest {
             Native.boot(machine)
             assertTrue(Native.processes(machine) >= 1)
             assertEquals("sysinit\n" to 0, sh(machine, "cat /tmp/inittab-order"))
+            assertEquals(listOf("fake", "other"), Rootfs.failedServices(context))
             assertEquals(Native.POWER_NONE, Native.takePower(machine))
             assertEquals(0, sh(machine, "poweroff").second)
             assertEquals(Native.POWER_OFF, Native.takePower(machine))
@@ -668,6 +671,35 @@ class MachineTest {
     }
 
     private fun depth(n: Int): Int = if (n < 0) 0 else depth(n + 1) + 1
+
+    /**
+     * 内核层结束的进程留下报告给 App（[Native.takeKills]）：控制台、pid、进程名、原因，取走一次就没了。
+     * 内核 bug 用测试钩子模拟，OOM 用 cgroup 的 memory.max：awk 拼出 64 MB 的字符串之后接着运行
+     * 一会儿（OOM killer 定时量用量，一下子用完就退出的进程发现不了）。
+     */
+    @Test
+    fun killsAreReportedToTheApp() {
+        Os.setenv("APPINE_TEST_HOOKS", "1", true)
+        val store = Rootfs.store(context).path
+        Native.writeFile(store, "/tmp/kernel-panic", elf(GUESTS.getValue("kernel-panic")), 0x1ed, true)
+        val machine = start(1)
+        assertEquals(0, Native.takeKills(machine)?.size)
+        assertEquals(-SIGSEGV, run(machine, "/tmp/kernel-panic", "kernel-panic").second)
+        val bug = Native.takeKills(machine)!!.single().split('\t')
+        assertEquals(listOf("kernel-panic", "bug"), bug.subList(2, 4))
+        assertTrue(bug[0], bug[0].toInt() >= 0)
+        assertTrue(bug[4], bug[4].contains("pid ${bug[1]} (kernel-panic)"))
+        val script = "cd /sys/fs/cgroup && echo +memory > cgroup.subtree_control && mkdir -p oomt && " +
+            "echo 16M > oomt/memory.max && " +
+            "sh -c 'echo \$\$ > oomt/cgroup.procs; exec awk \"BEGIN { s = \\\"x\\\"; " +
+            "for (i = 0; i < 26; i++) s = s s; for (j = 0; j < 50000000; j++) n++ }\"'; echo \$?"
+        val (out, code) = sh(machine, script)
+        assertTrue(out, out.endsWith("137\n") && code == 0)
+        val oom = Native.takeKills(machine)!!.single().split('\t')
+        assertEquals(listOf("awk", "oom", "/oomt", "16777216"), oom.subList(2, 5) + oom[6])
+        assertTrue(oom[5], oom[5].toLong() > 16777216)
+        assertEquals(0, Native.takeKills(machine)?.size)
+    }
 
     private companion object {
         const val SIGHUP = 1

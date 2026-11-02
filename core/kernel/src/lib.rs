@@ -54,6 +54,7 @@ pub mod vfs;
 
 pub use appine_engine::DbtStats;
 pub use appine_hal::net::Route as HostRoute;
+pub use bug::{KillReason, KillReport};
 pub use inittab::Power;
 pub use loader::LoadError;
 pub use machine::{Machine, MachineOptions, SHUTDOWN_TIMEOUT, Stdio, run};

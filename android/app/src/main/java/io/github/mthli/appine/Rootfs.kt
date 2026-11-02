@@ -322,6 +322,16 @@ internal object Rootfs {
         Native.writeFile(store(context).path, "/var/cache/appine/doas.apk", data, 420 /* 0644 */, true)
     }
 
+    /**
+     * 这次开机时没有起来的服务：OpenRC 在 `/var/log/boot.log` 里写 ` * ERROR: <服务> failed to
+     * start`（内核每次开机清空这个文件，设计文档 §6）。没有 OpenRC、读不到时是空的。
+     */
+    fun failedServices(context: Context): List<String> {
+        val log = runCatching { Native.readFile(store(context).path, "/var/log/boot.log") }.getOrNull()
+            ?: return emptyList()
+        return Regex("""ERROR: (\S+) failed to start""").findAll(String(log)).map { it.groupValues[1] }.distinct().toList()
+    }
+
     /** `/etc/passwd` 里的一个账号。 */
     data class Account(val name: String, val uid: Int)
 

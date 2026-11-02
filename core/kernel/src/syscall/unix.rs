@@ -8,7 +8,7 @@
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use super::fs::{AT_FDCWD, lookup_at, parent_at};
+use super::fs::{AT_FDCWD, create_parent_at, lookup_at};
 use super::net::{Message, SocketRef, epipe};
 use crate::cell::RefCell;
 use crate::cred::cap;
@@ -157,12 +157,6 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
         Addr::Path(p) => {
             // 与 Linux 相同，在文件系统里建一个 socket 节点；已经存在时失败。路径是 / 或者
             // 以 . 结尾时，它指的是一个已有的目录
-            let (mnt, dir, name) = parent_at(cx, AT_FDCWD, p)?;
-            if name == b"." || name == b".." {
-                return Err(Errno::EADDRINUSE);
-            }
-            let vfs = cx.vfs()?;
-            let cred = cx.cred();
             let in_use = |e: Errno| {
                 if e == Errno::EEXIST {
                     Errno::EADDRINUSE
@@ -170,6 +164,12 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
                     e
                 }
             };
+            let (mnt, dir, name) = create_parent_at(cx, AT_FDCWD, p).map_err(in_use)?;
+            if name == b"." || name == b".." {
+                return Err(Errno::EADDRINUSE);
+            }
+            let vfs = cx.vfs()?;
+            let cred = cx.cred();
             let dir_st = super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
             let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777 & !cx.umask(), false);
             let tmpfs = super::fs::tmpfs_reserve(&vfs, (mnt, dir), 0)?;

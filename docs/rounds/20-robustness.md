@@ -27,7 +27,7 @@
 **推迟项**：
 
 - 引擎故障在 App 进程里的恢复（要经过 ART 的 libsigchain）没有直接测过：Android 上验证了 bionic 下的恢复（模拟器上直接运行引擎测试），以及 App 装上处理函数之后 ART 照常工作；libsigchain 把 ART 不认领的故障转给我们的处理函数，`siglongjmp` 离开它时它没有要恢复的状态（按它的源码）。→ 已补上：App 进程里的 instrumentation 测试（M9 之前：稳健性的收尾）
-- 被结束的进程只在宿主 stderr（Android 上是 logcat）里留下报告，终端里只看到 shell 打印的 "Segmentation fault" 或 "Killed"。App 可以在标签页里提示，留给 M9 的外壳。→ 报告和 OOM killer 结束进程也记进了内核日志，guest 里 `dmesg` 看得到（M9 之前：/dev/kmsg 和内核日志）；App 标签页里的提示仍没有
+- 被结束的进程只在宿主 stderr（Android 上是 logcat）里留下报告，终端里只看到 shell 打印的 "Segmentation fault" 或 "Killed"。App 可以在标签页里提示，留给 M9 的外壳。→ 报告和 OOM killer 结束进程也记进了内核日志，guest 里 `dmesg` 看得到（M9 之前：/dev/kmsg 和内核日志）；App 在标签页里说明原因，不在标签页里的发通知（[M9：进程被结束、服务没起来时提示](195-kill-reports.md)）
 - 内存上限只看 App 自己：系统整体内存紧张时（`onTrimMemory`）还没有接到 OOM killer 上。→ 界面离开 1 分钟之后、收到 `onTrimMemory` 时释放可以重建的缓存（M9 之前：onTrimMemory），没有接到 OOM killer；有前台服务时 Android 14 起收不到 `onTrimMemory`
 - `oom_score_adj` 的写入不检查权限：Linux 不让没有 `CAP_SYS_RESOURCE` 的进程把它调到 `oom_score_adj_min` 以下。→ 已补上（2026-10-26，单独修补）：没有这个能力时调到下限以下返回 EACCES，有它时写的值成为新的下限，fork 继承
 - 线程开始、退出时的 panic 仍然终止宿主进程；定时器线程、`Machine` 方法（JNI 调用）里的 panic 还没有处理。→ 已补上（M9 之前：稳健性的收尾）

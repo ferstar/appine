@@ -56,8 +56,18 @@
     <string name="login_missing">%1$s (not found, so new tabs log in as root)</string>
     <string name="login_changed">New tabs log in as %1$s</string>
     <string name="restored_notice">The previous session ended because Android stopped the app (tabs saved %1$s). Programs that were running were not restored.</string>
+    <string name="channel_problems">Processes and services</string>
+    <string name="killed_title">%1$s was killed</string>
+    <string name="killed_oom_app">%1$s (pid %2$d) was killed: the app\'s memory reached its limit (%3$s of %4$s), and the out-of-memory killer chose it.</string>
+    <string name="killed_oom_cgroup">%1$s (pid %2$d) was killed: cgroup %3$s reached its memory.max (%4$s of %5$s).</string>
+    <string name="killed_bug">%1$s (pid %2$d) was ended by an internal error in appine. This is a bug in appine; dmesg shows the report.</string>
+    <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>
+    </plurals>
+    <plurals name="boot_failed_title">
+        <item quantity="one">%d service did not start</item>
+        <item quantity="other">%d services did not start</item>
     </plurals>
 </resources>

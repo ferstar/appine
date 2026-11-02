@@ -94,6 +94,13 @@ internal object Native {
     @JvmStatic
     external fun takeListens(machine: Long): Array<String>?
 
+    /**
+     * 取走内核层结束了的进程：`<控制台或 -1>\t<pid>\t<进程名>\t<bug|oom>\t<a>\t<b>\t<c>`，bug 的 a
+     * 是报告，oom 的 a 是 cgroup（App 的上限时是空的）、b 和 c 是用量和上限（字节）。
+     */
+    @JvmStatic
+    external fun takeKills(machine: Long): Array<String>?
+
     /** 新建一个控制台（进程内 PTY），返回它的编号。 */
     @JvmStatic
     @Throws(IOException::class)

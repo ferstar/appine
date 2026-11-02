@@ -264,6 +264,8 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
             limit / 1024,
         );
         log_kill(k, &g, task.map(|t| &**t), (domain, used, limit));
+        let comm = crate::pseudo::comm_str(task.map(|t| &**t), g.tgid);
+        crate::bug::record_kill(k, g.tgid, comm, oom_reason(k, domain, used, limit));
     }
     let group = crate::cgroup::oom_group(k, victim.borrow().cgroup, domain);
     kill(k, &victim);
@@ -288,9 +290,24 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
                 let gb = g.borrow();
                 let task = gb.threads.first().and_then(|t| k.tasks.get(t));
                 log_killed(k, &gb, task.map(|t| &**t));
+                // 挑中的那个上面已经报告过了
+                if !Rc::ptr_eq(&g, &victim) {
+                    let comm = crate::pseudo::comm_str(task.map(|t| &**t), gb.tgid);
+                    let reason = oom_reason(k, domain, used, limit);
+                    crate::bug::record_kill(k, gb.tgid, comm, reason);
+                }
             }
             kill(k, &g);
         }
+    }
+}
+
+/// 给 App 的报告（[`crate::bug::KillReport`]）：App 的上限还是哪个 cgroup 的 `memory.max`。
+fn oom_reason(k: &Kernel, domain: u64, used: u64, limit: u64) -> crate::bug::KillReason {
+    crate::bug::KillReason::OutOfMemory {
+        cgroup: (domain != ROOT).then(|| k.cgroups.path(domain, ROOT)),
+        used,
+        limit,
     }
 }
 

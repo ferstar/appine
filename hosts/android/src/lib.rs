@@ -296,6 +296,45 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
     }
 }
 
+/// 取走内核层结束了的 guest 进程（内核 bug、引擎故障、OOM killer）：每一项是
+/// `<控制台或 -1>\t<pid>\t<进程名>\t<bug|oom>\t<a>\t<b>\t<c>`，bug 的 a 是报告（换行、制表符
+/// 换成空格），oom 的 a 是 cgroup（App 的上限时是空的）、b 和 c 是用量和上限（字节）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jobjectArray {
+    let kills = machine(handle).map(|m| m.take_kills()).unwrap_or_default();
+    let Ok(array) = env.new_object_array(kills.len() as jint, "java/lang/String", JObject::null())
+    else {
+        return std::ptr::null_mut();
+    };
+    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    for (i, k) in kills.iter().enumerate() {
+        let console = k.console.map_or(-1, i64::from);
+        let tail = match &k.reason {
+            appine_kernel::KillReason::Bug(report) => format!("bug\t{}\t\t", clean(report)),
+            appine_kernel::KillReason::OutOfMemory {
+                cgroup,
+                used,
+                limit,
+            } => format!(
+                "oom\t{}\t{used}\t{limit}",
+                clean(cgroup.as_deref().unwrap_or(""))
+            ),
+        };
+        let line = format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm));
+        let Ok(s) = env.new_string(line) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_object_array_element(&array, i as jint, s).is_err() {
+            return std::ptr::null_mut();
+        }
+    }
+    array.into_raw()
+}
+
 /// 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 #7）：每一项是
 /// `<进程名>\t<端口>\t<宿主上的端口>`，没有时是空数组。
 #[unsafe(no_mangle)]

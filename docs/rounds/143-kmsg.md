@@ -36,4 +36,4 @@
 - guest 进程因为未处理的 SIGSEGV 等结束时，Linux arm64 记一条 `<名字>[pid]: unhandled exception: …` 和寄存器（`show_unhandled_signals`），这里没有。
 - OOM 的报告没有调用栈、`invoked oom-killer` 那一行和各个进程的表；`pgtables` 总是 0。
 - 没有 `CONFIG_PRINTK_CALLER`、`/sys/module/printk/parameters/time` 这些开关；时间戳总带着。
-- App 的标签页里仍没有"进程被结束"的提示（M9 的外壳）。
+- App 的标签页里仍没有"进程被结束"的提示（M9 的外壳）。→ 已做（[M9：进程被结束、服务没起来时提示](195-kill-reports.md)）

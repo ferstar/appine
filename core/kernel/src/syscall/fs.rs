@@ -271,6 +271,24 @@ pub(super) fn parent_at<'p>(
     Ok((mnt, dir, name))
 }
 
+/// 要新建的名字的父目录（[`parent_at`]）：合成文件系统的目录里名字已经存在时是 EEXIST，
+/// 先于目录不能修改的错误（Linux 的 `filename_create`：`mkdir -p /sys/fs/cgroup/x` 要靠
+/// `mkdir /sys/fs` 是 EEXIST）。
+pub(super) fn create_parent_at<'p>(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Result<(MountId, Ino, &'p [u8]), Errno> {
+    let start = start_dir(cx, dirfd, path)?;
+    let vfs = cx.vfs()?;
+    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
+    if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
+        return Err(Errno::EEXIST);
+    }
+    let (mnt, dir) = store_dir(&vfs, &dir)?;
+    Ok((mnt, dir, name))
+}
+
 /// 要在里面新建、删除的目录：仓库里的；合成文件系统里的不能修改，在只读的挂载里
 /// （比如 cgroup2）是 EROFS。mqueue 文件系统的根目录里只能新建、删除队列（openat、
 /// unlinkat 另外处理），别的（mkdir、mknod、symlink、link、rename）与 Linux 一样是 EPERM：
@@ -2565,7 +2583,7 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     if let Some(r) = cgroup_mkdir(cx, dirfd, &path) {
         return r.map(|()| 0);
     }
-    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = create_parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -2594,7 +2612,7 @@ pub(super) fn mknodat(
     dev: u64,
 ) -> SysResult {
     let path = read_path(cx, path)?;
-    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = create_parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -2861,7 +2879,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
         return Err(Errno::ENOENT);
     }
     let path = read_path(cx, path)?;
-    let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name) = create_parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -2904,6 +2922,9 @@ pub(super) fn linkat(
     let start = start_dir(cx, newdirfd, &newpath)?;
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &newpath)?;
+    if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
+        return Err(Errno::EEXIST);
+    }
     // 合成文件系统是另一个"设备"：跨设备不能建硬链接
     let (Node::Store(src_mnt, src), Node::Store(mnt, dir)) = (src, dir) else {
         return Err(Errno::EXDEV);
@@ -4866,10 +4887,16 @@ pub(super) fn read_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
-    // 终端、管道每次 read 只返回已经就绪的数据，不能为了凑满缓冲区再次阻塞
+    // 终端、管道每次 read 只返回已经就绪的数据，不能为了凑满缓冲区再次阻塞；/dev/zero、
+    // /dev/urandom 与 Linux 一样一次读满（`dd bs=256M` 读到的是整块）
     let fill = matches!(
         file.borrow().kind,
-        FileKind::Regular { .. } | FileKind::Proc { klog: None, .. }
+        FileKind::Regular { .. }
+            | FileKind::Proc { klog: None, .. }
+            | FileKind::Device {
+                dev: Device::Zero | Device::Full | Device::Random,
+                ..
+            }
     );
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;
