@@ -11,7 +11,8 @@ The Gradle project for the Android shell (design doc §3, §9, §11):
   account and the execution tier. Each tab runs `assets/login.sh` as root: it picks the
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),
-  and switches to it with `su -l`. `Native` is the JNI interface to `libappine.so`, which is built from
+  and switches to it with `su` (`--session-command` where su is util-linux's, so that the
+  shell keeps its controlling terminal and job control). `Native` is the JNI interface to `libappine.so`, which is built from
   `hosts/android` with cargo-ndk.
 - `terminal-emulator/`, `terminal-view/`: vendored from Termux (see below).
 

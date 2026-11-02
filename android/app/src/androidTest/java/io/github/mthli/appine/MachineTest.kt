@@ -99,6 +99,44 @@ class MachineTest {
         return out
     }
 
+    /**
+     * 像 [login] 一样运行登录脚本（自动选账号），但一步一步交互：每一步等输出里（上一步等到的地方
+     * 之后）出现 `wait`，最多两分钟，再输入 `send`。返回全部输出。
+     */
+    private fun loginSteps(machine: Long, vararg steps: Pair<String, String>): String {
+        val console = Native.openConsole(machine, 24, 200)
+        val argv = ConsolePty.argv(ConsolePty.script(context), ConsolePty.LOGIN_AUTO, null)
+        val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+        val bytes = ByteArrayOutputStream()
+        val text = { synchronized(bytes) { bytes.toString("UTF-8") } }
+        val reader = thread {
+            val buf = ByteArray(4096)
+            while (true) {
+                val n = Native.read(machine, console, buf)
+                if (n <= 0) break
+                synchronized(bytes) { bytes.write(buf, 0, n) }
+            }
+        }
+        var from = 0
+        for ((wait, send) in steps) {
+            val deadline = System.currentTimeMillis() + 120_000
+            var at = text().indexOf(wait, from)
+            while (at < 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
+                at = text().indexOf(wait, from)
+            }
+            assertTrue("no \"$wait\" in:\n${text()}", at >= 0)
+            from = at + wait.length
+            if (send.isEmpty()) continue
+            val b = send.toByteArray()
+            assertEquals(b.size, Native.write(machine, console, b, 0, b.size))
+        }
+        Native.waitFor(machine, pid)
+        reader.join(5000)
+        Native.closeConsole(machine, console)
+        return text().replace("\r\n", "\n")
+    }
+
     @Test
     fun busyboxRunsUnderBothTiers() {
         for (tier in 0..1) {
@@ -603,7 +641,8 @@ class MachineTest {
 
     /**
      * 下载 Debian 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
-     * apt-get update（它取不到索引时只警告、退出码仍是 0，所以看输出）；再建一个普通用户，自动以它登录时装上 sudo。要联网下载约 50 MB，默认跳过：
+     * apt-get update（它取不到索引时只警告、退出码仍是 0，所以看输出）；再建一个普通用户，自动以它登录：
+     * 装 sudo 时按 Ctrl-C 跳过、shell 里按 Ctrl-C 不结束会话，下一次登录装上 sudo。要联网下载约 50 MB，默认跳过：
      * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`。
      */
     @Test
@@ -623,9 +662,26 @@ class MachineTest {
                 assertTrue(out, out.contains(distro.label.substringBefore(' ')))
                 assertTrue(out, out.contains("shell=/bin/bash\n"))
                 assertTrue(out, out.contains("apt-ok\n"))
-                // 普通用户第一次成为登录账号：加进 sudo 组，联网装上 sudo，没设密码时不问
+                // 普通用户第一次成为登录账号：加进 sudo 组，联网装 sudo。apt-get update 下载时按
+                // Ctrl-C：这次跳过，登录照常。util-linux 的 su 不另起会话，shell 有控制终端和作业
+                // 控制：Ctrl-C 只打断前台的 sleep，不会结束整个会话（原来标签页就关了）
                 assertEquals(0, sh(machine, "useradd -m -s /bin/bash alice").second)
+                val skipped = loginSteps(
+                    machine,
+                    "installing sudo" to "",
+                    "% [" to "\u0003",
+                    "$ " to "tty; echo sl''eeping; sleep 30\n",
+                    "sleeping" to "\u0003",
+                    "$ " to "echo still-here; exit\n",
+                )
+                assertTrue(skipped, skipped.contains("appine: skipped installing sudo"))
+                // 输入的回显里没有这两段（bash 在命令的输出前面先写 \e[?2004l\r，不是换行）
+                assertTrue(skipped, skipped.contains("/dev/pts/"))
+                assertTrue(skipped, skipped.contains("still-here\n"))
+                assertFalse(skipped, skipped.contains("Session terminated"))
+                // 下一次登录装上 sudo（这次显示 apt 的进度），没设密码时不问
                 val admin = login(machine, "id -un; id -nG; sudo -n id -un; exit\n")
+                assertTrue(admin, admin.contains("Setting up sudo"))
                 assertTrue(admin, admin.contains("alice is in the sudo group and can become root with sudo"))
                 assertTrue(admin, becameAdmin(admin, "sudo"))
             } finally {

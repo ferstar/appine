@@ -214,6 +214,7 @@
 | [M9：换镜像不丢用户加的源](rounds/203-mirror-keeps-lines.md) | 2026-11-03 | 设置里选镜像、测速选镜像不再重写整个源文件，只把内置镜像（列表里任何一个，http、https 都算）的地址换成选的那个，协议照旧；用户加的 testing、backports、组件、第三方的源和注释掉的行都留着。源里全是列表以外的镜像时不动，提示手改；源文件不在时照导入时那样重写 |
 | [M9："文件"App 按内容认出文本文件](rounds/204-text-by-content.md) | 2026-11-03 | 按扩展名猜不出类型的普通文件（`/etc/profile`、`.bashrc`、脚本、`Makefile`）看开头 4 KB：没有 NUL、是合法的 UTF-8 就给 `text/plain`，"文件"App 里点开有编辑器能接（原来是 application/octet-stream，没有 App 能打开）。一次列目录只打开一次仓库，列 1000 个文件多几毫秒 |
 | [M9：内核 bug 的报告能复制，带着 panic 的位置](rounds/205-copy-bug-report.md) | 2026-11-03 | 原来内核日志和交给 App 的报告只说"syscall N 里 panic"，消息和代码位置只打到 stderr（Android 上是 logcat）；现在 panic hook 把它们记在线程上，接进报告。appine 自己的 bug 总是发通知，上面的"复制报告"复制 App 版本、设备、发行版、执行层和这份报告 |
+| [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制](rounds/206-debian-sudo-progress.md) | 2026-11-03 | Debian 上普通用户第一次登录时装 sudo，原来 apt 的输出全扔掉、几分钟没有动静，按 Ctrl-C 连登录一起结束；现在显示 apt 的进度，Ctrl-C 只打断 apt、这次跳过（下一次登录再装），dpkg 那一步 apt 让它另起会话、按了也会装完。顺带查出 util-linux 的 `su -c` 另起会话：Debian 上普通用户的 shell 没有作业控制，按 Ctrl-C 时 su 结束整个会话、标签页就关了（原生一样）；有 `--session-command` 时改用它 |
 
 ## 测量条件
 
