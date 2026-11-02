@@ -21,6 +21,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import android.widget.Toast
 import com.termux.terminal.TerminalSession
@@ -665,6 +667,10 @@ class TerminalService : Service() {
             ACTION_EXIT_ALL -> exitAll()
             ACTION_CANCEL_SWITCH -> cancelSwitch()
             ACTION_TOGGLE_KEEP_AWAKE -> setKeepAwake(!keepAwake)
+            ACTION_COPY_REPORT -> copyReport(
+                intent.getStringExtra(EXTRA_REPORT).orEmpty(),
+                intent.getIntExtra(EXTRA_NOTIFICATION, 0),
+            )
         }
         return START_NOT_STICKY
     }
@@ -808,7 +814,8 @@ class TerminalService : Service() {
     /**
      * [Native.takeKills] 的一项：内核层结束了一个进程（内核 bug、引擎故障、OOM killer）。它的控制
      * 终端是某个标签页时在那个标签页里说明原因（shell 只会打印 "Killed"、"Segmentation fault"），
-     * 不在标签页里（后台的服务）、标签页正在全屏程序里或者界面不在时发通知。
+     * 不在标签页里（后台的服务）、标签页正在全屏程序里或者界面不在时发通知。appine 自己的 bug
+     * 总是发通知，上面有"复制报告"（[bugReport]），用户贴到反馈里。
      */
     private fun reportKill(line: String) {
         val f = line.split('\t')
@@ -822,6 +829,7 @@ class TerminalService : Service() {
             if (b >= 1L shl 30) DecimalFormat("0.#").format(b / 1073741824.0) + " GiB"
             else DecimalFormat("0.#").format(b / 1048576.0) + " MiB"
         }
+        val bug = f[3] == "bug"
         val text = when (f[3]) {
             "oom" -> if (f[4].isEmpty()) {
                 getString(R.string.killed_oom_app, comm, pid, size(f[5]), size(f[6]))
@@ -832,19 +840,53 @@ class TerminalService : Service() {
         }
         val session = sessions.firstOrNull { ptys[it]?.console == console && console >= 0 }
         val shown = session?.showMessage("[appine] $text") == true
-        if (shown && listeners.isNotEmpty()) return
+        if (shown && listeners.isNotEmpty() && !bug) return
+        val id = KILL_NOTIFICATION_BASE + pid % 1000
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
+        val builder = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.killed_title, comm))
             .setContentText(text)
             .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(KILL_NOTIFICATION_BASE + pid % 1000, notification)
+        if (bug) {
+            val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
+                .putExtra(EXTRA_REPORT, bugReport(f[4]))
+                .putExtra(EXTRA_NOTIFICATION, id)
+            val pending = PendingIntent.getService(
+                this, id, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            builder.addAction(Notification.Action.Builder(null, getString(R.string.copy_report), pending).build())
+        }
+        getSystemService(NotificationManager::class.java).notify(id, builder.build())
+    }
+
+    /**
+     * 复制给用户贴到反馈里的报告：App 的版本、设备、发行版和执行层，加上内核层的报告（进程、线程、
+     * 最后的 guest pc，panic 的消息和位置，与 `dmesg` 里的那一行相同）。
+     */
+    private fun bugReport(report: String): String = buildString {
+        appendLine("appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
+        appendLine(
+            "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
+                "${Build.SUPPORTED_ABIS.firstOrNull()}, page size ${Os.sysconf(OsConstants._SC_PAGESIZE)}",
+        )
+        appendLine("${Rootfs.installed(this@TerminalService)?.label ?: "unknown distribution"}, Tier $tier")
+        append(report)
+    }
+
+    /** 通知上的"复制报告"：放进剪贴板，收起那条通知。Android 13 起系统自己提示已复制。 */
+    private fun copyReport(report: String, notification: Int) {
+        if (report.isEmpty()) return
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.copy_report), report))
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Toast.makeText(this, R.string.report_copied, Toast.LENGTH_SHORT).show()
+        }
+        getSystemService(NotificationManager::class.java).cancel(notification)
     }
 
     /** 开机时 OpenRC 有服务没起来：发一条通知，说是哪几个、输出在哪里。 */
@@ -966,6 +1008,9 @@ class TerminalService : Service() {
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
         private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"
+        private const val ACTION_COPY_REPORT = "io.github.mthli.appine.COPY_REPORT"
+        private const val EXTRA_REPORT = "report"
+        private const val EXTRA_NOTIFICATION = "notification"
         private const val KEY_KEEP_AWAKE = "keep_awake"
         private const val WAKE_LOCK_TAG = "appine:keep-awake"
         private const val PREFS = "settings"

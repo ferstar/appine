@@ -15,7 +15,7 @@
 //!
 //! 两种情况都像 Linux 的 oops 结束当前任务那样用 SIGSEGV 结束进程（这里是整个线程组），
 //! 并往宿主的 stderr（Android 上转到 logcat）写一份报告；panic 的消息和位置由 panic hook
-//! 先打印。BKL 保护的状态可能只改了一半，但结束了出问题的进程，大部分不一致也随之消失。
+//! 先打印，也写进报告（[`install_panic_hook`]）。BKL 保护的状态可能只改了一半，但结束了出问题的进程，大部分不一致也随之消失。
 //!
 //! debug 构建默认仍然直接终止宿主进程（panic 时 abort，宿主故障按默认动作产生 core
 //! dump），方便开发时就地调试；环境变量 `APPINE_ON_BUG=kill` 或 `abort` 可以覆盖默认值。
@@ -46,6 +46,65 @@ pub(crate) fn contain() -> bool {
         Ok("abort") => false,
         _ => !cfg!(debug_assertions),
     })
+}
+
+thread_local! {
+    /// 这个线程最近一次 panic 的消息和位置（[`install_panic_hook`]），还没写进报告的。
+    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    static LAST_PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// panic 的消息最多写进报告多少字节：`assert_eq!` 的消息带着两边的值，可能很长。
+const PANIC_MESSAGE_MAX: usize = 1000;
+
+/// 装上 panic hook（每个宿主进程一次，原来的照样调用）：记下每个线程最近一次 panic 的消息和
+/// 位置，结束进程、报告 bug 时写进报告（[`kill`]、[`report`]）。报告进内核日志、交给 App，
+/// 用户在 `dmesg` 里、在复制给开发者的报告里就看得到是哪里出的错；原来这些只由默认的 hook
+/// 打印到 stderr（Android 上是 logcat，用户拿不到）。
+pub(crate) fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("(not a string)");
+            let mut end = message.len().min(PANIC_MESSAGE_MAX);
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut text = message[..end].to_owned();
+            if let Some(at) = info.location() {
+                text.push_str(&format!(" at {}:{}", at.file(), at.line()));
+            }
+            // 线程正在退出、线程局部变量已经没了时就不记
+            let _ = LAST_PANIC.try_with(|p| {
+                if let Ok(mut p) = p.try_borrow_mut() {
+                    *p = Some(text);
+                }
+            });
+            previous(info);
+        }));
+    });
+}
+
+/// 取走这个线程最近一次 panic 的消息和位置（[`install_panic_hook`]）。
+fn take_panic() -> Option<String> {
+    LAST_PANIC
+        .try_with(|p| p.try_borrow_mut().ok()?.take())
+        .ok()
+        .flatten()
+}
+
+/// `what` 后面接上这个线程刚才 panic 的消息和位置（有的话）。
+fn with_panic(what: fmt::Arguments<'_>) -> String {
+    match take_panic() {
+        Some(panic) => format!("{what}: {panic}"),
+        None => what.to_string(),
+    }
 }
 
 /// 执行内核代码 `f`，兜住其中的 panic：返回 None，由调用方收拾（结束出问题的进程等）。
@@ -132,10 +191,11 @@ pub(crate) fn record_kill(k: &Kernel, tgid: Tid, comm: String, reason: KillReaso
 pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
     let comm = crate::pseudo::comm_str(Some(task), task.tgid);
     let report = format!(
-        "appine: internal error in pid {} ({comm}), thread {}, last guest pc {pc:#x}: {what}; \
+        "appine: internal error in pid {} ({comm}), thread {}, last guest pc {pc:#x}: {}; \
          killed the process with SIGSEGV",
         task.tgid,
         task.tid.get(),
+        with_panic(what),
     );
     eprintln!("{report}");
     log(k, &report);
@@ -152,7 +212,8 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
     });
     let comm = crate::pseudo::comm_str(task.as_deref(), tgid);
     let report = format!(
-        "appine: internal error in pid {tgid} ({comm}): {what}; killed the process with SIGSEGV",
+        "appine: internal error in pid {tgid} ({comm}): {}; killed the process with SIGSEGV",
+        with_panic(what),
     );
     eprintln!("{report}");
     log(k, &report);
@@ -171,7 +232,7 @@ fn log(k: &Kernel, report: &str) {
 
 /// 报告一个不能归到某个 guest 进程上的 bug。
 pub(crate) fn report(what: fmt::Arguments<'_>) {
-    eprintln!("appine: internal error: {what}");
+    eprintln!("appine: internal error: {}", with_panic(what));
 }
 
 fn segv(k: &Kernel, tgid: Tid) {

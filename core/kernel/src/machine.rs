@@ -118,6 +118,7 @@ impl Machine {
     }
 
     fn start_kernel(options: &MachineOptions) -> Result<Machine, RunError> {
+        crate::bug::install_panic_hook();
         if options.tier == Tier::Dbt && Dbt::new().is_none() {
             return Err(RunError::TierUnavailable);
         }

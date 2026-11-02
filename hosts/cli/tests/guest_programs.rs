@@ -413,10 +413,11 @@ fn host_calls_survive_kernel_bugs() {
                 "{tier:?}: {k:?}"
             );
         }
+        // 报告里有 panic 的消息和位置（bug::install_panic_hook），不只是"syscall 里 panic"
         assert!(
-            kills.iter().any(
-                |k| matches!(&k.reason, KillReason::Bug(r) if r.contains("kernel panic in syscall 43409"))
-            ),
+            kills.iter().any(|k| matches!(&k.reason, KillReason::Bug(r) if r.contains(
+                "kernel panic in syscall 43409: panic injected by the test hook at core/kernel/src/bug.rs:"
+            ))),
             "{tier:?}: {kills:?}"
         );
         assert!(machine.take_kills().is_empty(), "{tier:?}");

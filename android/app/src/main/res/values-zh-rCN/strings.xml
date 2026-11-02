@@ -60,7 +60,9 @@
     <string name="killed_title">%1$s 被结束了</string>
     <string name="killed_oom_app">%1$s（pid %2$d）被结束了：App 的内存用到了上限（已用 %3$s，上限 %4$s），OOM killer 挑中了它。</string>
     <string name="killed_oom_cgroup">%1$s（pid %2$d）被结束了：cgroup %3$s 用到了 memory.max（已用 %4$s，上限 %5$s）。</string>
-    <string name="killed_bug">%1$s（pid %2$d）因为 appine 的内部错误被结束了。这是 appine 的 bug，用 dmesg 可以看到报告。</string>
+    <string name="killed_bug">%1$s（pid %2$d）因为 appine 的内部错误被结束了。这是 appine 的 bug，报告可以在通知里复制，用 dmesg 也看得到。</string>
+    <string name="copy_report">复制报告</string>
+    <string name="report_copied">已复制报告</string>
     <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>
     <string name="settings_system_documents">在"文件"App 里显示整个系统</string>
     <string name="system_documents_summary">除了家目录，"文件"App 里还列出从 / 开始的所有文件，只读。</string>

@@ -951,6 +951,8 @@ class MachineTest {
         assertEquals(listOf("kernel-panic", "bug"), bug.subList(2, 4))
         assertTrue(bug[0], bug[0].toInt() >= 0)
         assertTrue(bug[4], bug[4].contains("pid ${bug[1]} (kernel-panic)"))
+        // 报告里有 panic 的消息和位置（通知上"复制报告"复制的就是它）
+        assertTrue(bug[4], bug[4].contains(": panic injected by the test hook at core/kernel/src/bug.rs:"))
         val script = "cd /sys/fs/cgroup && echo +memory > cgroup.subtree_control && mkdir -p oomt && " +
             "echo 16M > oomt/memory.max && " +
             "sh -c 'echo \$\$ > oomt/cgroup.procs; exec awk \"BEGIN { s = \\\"x\\\"; " +
