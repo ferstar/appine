@@ -31,6 +31,12 @@
   - 实测它有两个问题：rc.conf 里的 `rc_provide` 加到每一个服务上；loopback 本来就是一个真服务，每次开机都报 "loopback is the name of a real and virtual service"。
   - 想再提供 `clock`（busybox 的 syslog `need clock`，于是拉起 hwclock）时，依赖成了环，syslog、crond、nginx 都起不来。
   - 换成 interfaces 之后，networking 照常启动，这些问题都没有了。
+- **用 osclock 提供 clock**：开机之前，先在 guest 里运行一段脚本（`Rootfs.PREFER_OSCLOCK`，经由不带控制台的 `spawn`：JNI 的 `console` 是负数时用 App 的 stdio）。装了 OpenRC（有 `rc-update` 和 `/etc/init.d/osclock`）、hwclock/osclock/swclock 都不在任何运行级别里时，执行 `rc-update -q add osclock boot`。
+  - busybox 的 syslog `need clock`，crond 等又要 logger，所以只要开了常见的服务，OpenRC 就用 hwclock 提供 clock。
+  - hwclock 读不到 RTC（没有 `/dev/rtc0`）、也设不了时间（`settimeofday` 是 EPERM，guest 的时间就是宿主的），开机日志里必然有一个 `[ !! ]`。
+  - osclock 表示时间由操作系统管、什么也不做，正是 appine 的情形。
+  - 用户自己放了哪个时钟服务就不动；没装 OpenRC 时什么也不做。
+  - 不用 `rc_provide="clock"`：它加到每一个服务上，与 syslog 的依赖成环（见下面）。
 - **轮询**：原来每 2 秒取一次监听事件，现在同时取关机请求和进程数（都要取 BKL，在 `worker` 上）：
   - `reboot` → `restart`：结束所有会话，关机，启动一个新的内核。Activity 先显示"正在重启"，新内核起来之后开一个新标签页。
   - `poweroff`、`halt` → `exitAll`。
@@ -71,13 +77,15 @@
   - 重新打开 App，执行 `poweroff`：3 秒内服务退出，`/root/down` 又有了。修上面那个问题之前，22 秒后服务还在，通知是"1 session running"。
   - 杀掉 `sleep`、关掉标签页：5 秒内服务退出（没有 guest 进程了）。
   - 最后恢复了模拟器里的 inittab。
-- 两个 clippy、格式通过；App 的 Kotlin 编译通过。整个 MachineTest（13 个）在模拟器上跑过：只有 `downloadedDistributionsRun` 默认跳过（要联网，没带 `network=true` 时 assumeTrue 不成立），别的都通过。
+- 那段脚本在 OpenRC 的仓库里（`appine-run`）：没有时钟服务时加上 osclock，再跑不变；boot 里有 hwclock、default 里有 swclock 时都不动；没装 OpenRC 的仓库里返回 0、什么也不做。`--init` 开机之后 osclock 是 started，开机日志里没有 `[ !! ]`。
+- 仪器测试新增 `prefersOsclockOverHwclock`：没装 OpenRC 时返回 0；放一个假的 `rc-update` 和 `/etc/init.d/osclock`，它被调用了一次（`-q add osclock boot`）；boot 里有 hwclock 时不调用。
+- 模拟器上新装 App、选 Alpine：`/etc/network/interfaces` 写好了，没有 `/etc/runlevels`（脚本什么也没做），没有错误。
+- 两个 clippy、格式通过；App 的 Kotlin 编译通过。整个 MachineTest（加上上面那个是 14 个）在模拟器上跑过：只有 `downloadedDistributionsRun` 默认跳过（要联网，没带 `network=true` 时 assumeTrue 不成立），别的都通过。
 
 - 手动（OpenRC 的仓库，`appine-run --init`）：只有 lo 的 interfaces 时 crond、sshd、redis、nginx 和测试用的服务都起来了，networking 是 started，开机日志里只剩 hwclock 的 `[ !! ]`。用 `rc_provide="loopback net"` 时也都起来了，但多一行 "real and virtual service" 的报错；再加 `clock` 时 crond、nginx 起不来。
 - 用了 PostgreSQL 的那次：nginx、PostgreSQL、Redis、sshd、crond 都起来了，curl、psql、redis-cli 都通；`appine-run` 退出时它们逐个被 OpenRC 停下（开机、会话、关机一共 3 秒）。
 
 **推迟项**：
 
-- hwclock：busybox 的 syslog `need clock`，OpenRC 用 hwclock 提供 clock。它读不到 RTC、也不能设时间（宿主的时间），开机日志里有一个 `[ !! ]`，不影响别的服务；`rc-update add osclock boot` 可以换掉它。
 - 熄屏之后继续运行要的 `PARTIAL_WAKE_LOCK`（设计文档 §11.2）还没做：在后台跑着的服务熄屏后可能被暂停。
 - 开机的输出只在 `/var/log/boot.log` 里，App 不提示有服务启动失败。

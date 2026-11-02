@@ -90,7 +90,7 @@ internal object Native {
     @Throws(IOException::class)
     external fun openConsole(machine: Long, rows: Int, cols: Int): Int
 
-    /** 以控制台为控制终端启动一个会话组长，返回 pid。 */
+    /** 以控制台为控制终端启动一个会话组长，返回 pid。[console] 是负数时不要控制台（stdio 是 App 的）。 */
     @JvmStatic
     @Throws(IOException::class)
     external fun spawn(machine: Long, console: Int, program: String, argv: Array<String>, envp: Array<String>): Int

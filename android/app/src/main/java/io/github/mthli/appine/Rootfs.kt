@@ -244,6 +244,17 @@ internal object Rootfs {
      * 拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 里的 `rc_provide`：它
      * 加到每一个服务上，再提供 `clock` 就成了环。没装 OpenRC、ifupdown 时这个文件没人读。
      */
+    /**
+     * 每次开机之前在 guest 里运行（`sh -c`）：装了 OpenRC、hwclock/osclock/swclock 都不在任何运行
+     * 级别里时，把 osclock 加进 boot。busybox 的 syslog `need clock`，OpenRC 默认用 hwclock 提供
+     * clock，它读不到 RTC、也设不了宿主的时间，开机日志里总有一个失败；osclock 表示"时间由操作
+     * 系统管"，什么也不做（设计文档 §6）。用户自己放了哪个时钟服务就不动。
+     */
+    const val PREFER_OSCLOCK = "[ -x /sbin/rc-update ] && [ -e /etc/init.d/osclock ] || exit 0; " +
+        "for s in hwclock osclock swclock; do for l in /etc/runlevels/*/\$s; do " +
+        "[ -e \"\$l\" ] || [ -L \"\$l\" ] && exit 0; done; done; " +
+        "exec /sbin/rc-update -q add osclock boot >/dev/null 2>&1"
+
     @Throws(IOException::class)
     fun ensureNetworkConfig(context: Context) = write(
         store(context).path, "/etc/network/interfaces",

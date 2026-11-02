@@ -217,6 +217,34 @@ class MachineTest {
         }
     }
 
+    /**
+     * 开机之前把 osclock 加进 boot（[Rootfs.PREFER_OSCLOCK]）：没装 OpenRC 时什么也不做；用一个
+     * 假的 rc-update 看它什么时候被调用，用户放了别的时钟服务时不调用。同时检查不带控制台的
+     * [Native.spawn]。
+     */
+    @Test
+    fun prefersOsclockOverHwclock() {
+        val machine = start(1)
+        // minirootfs 里没有 OpenRC 的目录：有的话是装过 OpenRC，不动它
+        assumeTrue(sh(machine, "test -e /etc/init.d -o -e /etc/runlevels").second != 0)
+        val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
+        fun prefer() = Native.waitFor(machine, Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
+        assertEquals(0, prefer())
+        val fake = "mkdir -p /etc/init.d /etc/runlevels/boot && touch /etc/init.d/osclock && " +
+            "printf '#!/bin/sh\\necho \"\$*\" >> /tmp/rc-update-args\\n' > /sbin/rc-update && " +
+            "chmod +x /sbin/rc-update && rm -f /tmp/rc-update-args"
+        try {
+            assertEquals(0, sh(machine, fake).second)
+            assertEquals(0, prefer())
+            assertEquals("-q add osclock boot\n" to 0, sh(machine, "cat /tmp/rc-update-args"))
+            assertEquals(0, sh(machine, "rm /tmp/rc-update-args; ln -s /etc/init.d/hwclock /etc/runlevels/boot/hwclock").second)
+            assertEquals(0, prefer())
+            assertEquals(1, sh(machine, "test -e /tmp/rc-update-args").second)
+        } finally {
+            sh(machine, "rm -rf /sbin/rc-update /etc/init.d /etc/runlevels /tmp/rc-update-args")
+        }
+    }
+
     /** 登录 shell 是 /etc/passwd 里 root 的 shell，chsh 改过之后照样；它读 /etc/profile。 */
     @Test
     fun loginShellComesFromPasswd() {

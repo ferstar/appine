@@ -267,7 +267,13 @@ class TerminalService : Service() {
                 result.onSuccess {
                     machine = it
                     // 开机要等 sysinit、wait 的命令（OpenRC 起服务），不占 worker：标签页照常打开
-                    thread(name = "appine-boot") { Native.boot(it) }
+                    thread(name = "appine-boot") {
+                        runCatching {
+                            val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
+                            Native.waitFor(it, Native.spawn(it, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
+                        }.onFailure { e -> Log.w(TAG, "cannot prefer osclock", e) }
+                        Native.boot(it)
+                    }
                     getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
                     watchingNetwork = true
                     main.post(poll)

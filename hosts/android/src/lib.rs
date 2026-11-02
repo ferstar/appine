@@ -336,7 +336,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_spawn<'l>(
     let (Some(argv), Some(envp)) = (strings(&mut env, &argv), strings(&mut env, &envp)) else {
         return -1;
     };
-    let stdio = Stdio::Console(console as u32);
+    // 负数：不要控制台，用宿主的 stdin/stdout/stderr（App 的是 /dev/null 和 logcat）
+    let stdio = u32::try_from(console).map_or(Stdio::Host, Stdio::Console);
     let Some(m) = machine(handle) else {
         throw(&mut env, "the machine is stopped");
         return -1;
