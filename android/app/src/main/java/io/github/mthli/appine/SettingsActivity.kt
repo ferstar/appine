@@ -39,6 +39,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     private var accounts: List<Rootfs.Account> = emptyList()
     private lateinit var tier: Row
     private lateinit var keepAwake: Row
+    private lateinit var systemDocuments: Row
     private lateinit var licenses: Row
 
     private val connection = object : ServiceConnection {
@@ -111,6 +112,9 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         account = Row(R.string.settings_login) { onLogin() }
         tier = Row(R.string.settings_tier) { onTier() }
         keepAwake = Row(R.string.settings_keep_awake, toggle = true) { service?.let { it.setKeepAwake(!it.keepAwake) } }
+        systemDocuments = Row(R.string.settings_system_documents, toggle = true) {
+            service?.let { it.setSystemDocuments(!it.systemDocuments) }
+        }
         // AGPL 第 0、5 条的"适当的法律声明"：版权、不提供担保、许可证，以及看全文的地方
         licenses = Row(R.string.settings_licenses) { startActivity(Intent(this, LicensesActivity::class.java)) }
         licenses.set(getString(R.string.licenses_summary), true)
@@ -134,7 +138,9 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            for (row in listOf(distro, mirror, reset, account, keepAwake, tier, licenses)) addView(row.view)
+            for (row in listOf(distro, mirror, reset, account, keepAwake, systemDocuments, tier, licenses)) {
+                addView(row.view)
+            }
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -225,6 +231,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         account.set(loginSummary(s.login), installed != null && sw == null)
         // 随时可以改：内核没在运行时只是记下，起来之后照这个持有
         keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
+        systemDocuments.set(getString(R.string.system_documents_summary), true, s.systemDocuments)
     }
 
     // ---- 操作 ----

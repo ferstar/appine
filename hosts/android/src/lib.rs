@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 
+use appine_kernel::vfs::browse;
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
@@ -168,6 +169,169 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
         }
     }
 }
+
+// ---- 宿主浏览仓库（DocumentsProvider，设计文档 §11.3）----
+//
+// 路径在 Java 一侧是字符串（文档 ID）：guest 的文件名是任意字节，合法 UTF-8 的部分照原样，
+// `%`、控制字符（列表的每一行用制表符分隔）和不是 UTF-8 的字节写成 `%XX`，能原样换回来。
+// 每一项是 `<类型 d|f>\t<字节数>\t<修改时间（毫秒）>\t<权限位>`，列表、搜索的结果前面再加
+// 名字或路径和一个制表符。出错时抛出 FileNotFoundException（IOException 的子类）。
+
+fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
+    let kind = if st.is_dir() { 'd' } else { 'f' };
+    let perm = st.mode & 0o7777;
+    format!(
+        "{kind}\t{}\t{}\t{perm}",
+        st.size,
+        st.mtime_ns.div_euclid(1_000_000)
+    )
+}
+
+fn not_found(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
+    let _ = env.throw_new(
+        "java/io/FileNotFoundException",
+        format!("cannot {what} {path}: {e}"),
+    );
+}
+
+fn string_array(env: &mut JNIEnv<'_>, items: &[String]) -> jobjectArray {
+    let Ok(array) = env.new_object_array(items.len() as jint, "java/lang/String", JObject::null())
+    else {
+        return std::ptr::null_mut();
+    };
+    for (i, item) in items.iter().enumerate() {
+        let Ok(s) = env.new_string(item) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_object_array_element(&array, i as jint, s).is_err() {
+            return std::ptr::null_mut();
+        }
+    }
+    array.into_raw()
+}
+
+/// 路径（文档 ID）指向的目录或普通文件（符号链接跟随）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseStat<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    path: JString<'l>,
+) -> jstring {
+    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+        return std::ptr::null_mut();
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::stat(s, &browse::decode_path(&path))
+    });
+    match r {
+        Ok(st) => env
+            .new_string(stat_fields(&st))
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            not_found(&mut env, "find", &path, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 列出目录：每一项是 `<名字>\t<类型>\t…`，名字按 [`browse::encode_path`] 写。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseList<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    dir: JString<'l>,
+) -> jobjectArray {
+    let (Some(store), Some(dir)) = (string(&mut env, &store), string(&mut env, &dir)) else {
+        return std::ptr::null_mut();
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::list(s, &browse::decode_path(&dir))
+    });
+    match r {
+        Ok(entries) => {
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|e| format!("{}\t{}", browse::encode_path(&e.name), stat_fields(&e.stat)))
+                .collect();
+            string_array(&mut env, &lines)
+        }
+        Err(e) => {
+            not_found(&mut env, "list", &dir, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 打开普通文件读，返回宿主的 fd（交给 ParcelFileDescriptor.adoptFd，由它关）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpen<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    path: JString<'l>,
+) -> jint {
+    use std::os::fd::IntoRawFd;
+    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+        return -1;
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::open(s, &browse::decode_path(&path))
+    });
+    match r {
+        Ok(file) => file.into_raw_fd(),
+        Err(e) => {
+            not_found(&mut env, "open", &path, e);
+            -1
+        }
+    }
+}
+
+/// 在目录下面按名字找（不分大小写）：每一项是 `<路径>\t<类型>\t…`。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    dir: JString<'l>,
+    query: JString<'l>,
+    limit: jint,
+) -> jobjectArray {
+    let (Some(store), Some(dir), Some(query)) = (
+        string(&mut env, &store),
+        string(&mut env, &dir),
+        string(&mut env, &query),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::search(
+            s,
+            &browse::decode_path(&dir),
+            &query,
+            limit.max(0) as usize,
+            SEARCH_BUDGET,
+        )
+    });
+    match r {
+        Ok(found) => {
+            let lines: Vec<String> = found
+                .iter()
+                .map(|(p, st)| format!("{}\t{}", browse::encode_path(p), stat_fields(st)))
+                .collect();
+            string_array(&mut env, &lines)
+        }
+        Err(e) => {
+            not_found(&mut env, "search", &dir, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 一次搜索最多看这么多项（目录项）：/usr 这样的大目录树里不会一直找下去。
+const SEARCH_BUDGET: usize = 50_000;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(

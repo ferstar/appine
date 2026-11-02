@@ -34,6 +34,32 @@ internal object Native {
     @Throws(IOException::class)
     external fun readFile(store: String, path: String): ByteArray?
 
+    // ---- 宿主浏览仓库（DocumentsProvider，设计文档 §11.3）----
+    // 路径就是文档 ID：guest 的绝对路径，`%`、控制字符和不是 UTF-8 的字节写成 `%XX`。每次调用
+    // 另外打开一次仓库，内核运行着也可以，调用方持 [Rootfs.access] 的读锁。元数据是
+    // `<d|f>\t<字节数>\t<修改时间（毫秒）>\t<权限位>`。只有目录和普通文件（符号链接跟随），
+    // 别的、不在的抛出 FileNotFoundException。
+
+    /** 路径指向的目录或普通文件的元数据。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseStat(store: String, path: String): String
+
+    /** 列出目录：每一项是 `<名字>\t<元数据>`，名字的写法与路径相同。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseList(store: String, dir: String): Array<String>
+
+    /** 打开普通文件读，返回 fd（交给 ParcelFileDescriptor.adoptFd）。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseOpen(store: String, path: String): Int
+
+    /** 在目录 [dir] 下面找名字里有 [query] 的（不分大小写），浅的在前，最多 [limit] 个：`<路径>\t<元数据>`。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseSearch(store: String, dir: String, query: String, limit: Int): Array<String>
+
     /** 启动内核；[tier] 0 是解释器，1 是 DBT。 */
     @JvmStatic
     @Throws(IOException::class)

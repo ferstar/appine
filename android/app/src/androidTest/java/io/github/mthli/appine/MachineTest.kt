@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.net.ConnectivityManager
+import android.provider.DocumentsContract
 import android.system.Os
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -667,6 +668,81 @@ class MachineTest {
             Runtime.getRuntime().gc()
             assertTrue(runCatching { depth(0) }.exceptionOrNull() is StackOverflowError)
             assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+        }
+    }
+
+    /**
+     * 系统"文件"App 看到的（[Documents]）：根是登录账号的家目录，打开"整个系统"之后多一个 `/`；
+     * 列目录跟随符号链接，不列断了的链接和 FIFO；文件能读、不能写；家目录外面的要打开"整个系统"
+     * 才看得到；树的授权不能用 `..` 走出去；按名字搜索。文件是运行着的内核刚写的：另外打开仓库时
+     * 内核先提交，看得到。
+     */
+    @Test
+    fun documentsShowTheHomeDirectory() {
+        val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putString("login", ConsolePty.LOGIN_ROOT).putBoolean("system_documents", false).commit()
+        val machine = start(1)
+        val setup = "rm -rf /root/dt && mkdir -p /root/dt/sub && printf hi > /root/dt/a.txt && " +
+            "ln -s /etc/alpine-release /root/dt/release && ln -s /nowhere /root/dt/broken && " +
+            "mkfifo /root/dt/fifo && printf x > '/root/dt/100% 中文.txt'"
+        assertEquals(0, sh(machine, setup).second)
+        val resolver = context.contentResolver
+        val authority = Documents.authority(context)
+        fun rows(uri: android.net.Uri, vararg columns: String, args: android.os.Bundle? = null): List<List<String?>>? =
+            resolver.query(uri, null, args, null)?.use { c ->
+                val out = mutableListOf<List<String?>>()
+                while (c.moveToNext()) out.add(columns.map { c.getString(c.getColumnIndexOrThrow(it)) })
+                out
+            }
+        val id = DocumentsContract.Document.COLUMN_DOCUMENT_ID
+        val name = DocumentsContract.Document.COLUMN_DISPLAY_NAME
+        val mime = DocumentsContract.Document.COLUMN_MIME_TYPE
+        val size = DocumentsContract.Document.COLUMN_SIZE
+        fun roots() = rows(DocumentsContract.buildRootsUri(authority), DocumentsContract.Root.COLUMN_ROOT_ID, id)
+        fun document(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
+        fun read(doc: String) = resolver.openInputStream(document(doc))!!.use { String(it.readBytes()) }
+        try {
+            assertEquals(listOf(listOf("home", "/root")), roots())
+            assertEquals(
+                listOf(
+                    listOf("/root/dt/100%25 中文.txt", "100% 中文.txt", "text/plain", "1"),
+                    listOf("/root/dt/a.txt", "a.txt", "text/plain", "2"),
+                    listOf("/root/dt/release", "release", "application/octet-stream", null),
+                    listOf("/root/dt/sub", "sub", DocumentsContract.Document.MIME_TYPE_DIR, null),
+                ),
+                rows(DocumentsContract.buildChildDocumentsUri(authority, "/root/dt"), id, name, mime, size)
+                    ?.map { if (it[0] == "/root/dt/release") it.take(3) + listOf(null) else it },
+            )
+            assertEquals("hi", read("/root/dt/a.txt"))
+            assertEquals("x", read("/root/dt/100%25 中文.txt"))
+            assertTrue(read("/root/dt/release").startsWith("3."))
+            assertThrows(Exception::class.java) { resolver.openOutputStream(document("/root/dt/a.txt"))!!.close() }
+            // 家目录外面的、不规范的 ID 都当作不存在（查询返回 null）
+            assertEquals(null, rows(document("/etc/motd"), id))
+            assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
+            assertEquals(null, rows(document("/root//dt"), id))
+            // 树的授权：里面的可以，`..` 走出去的不行
+            val tree = DocumentsContract.buildTreeDocumentUri(authority, "/root/dt")
+            assertEquals(
+                listOf(listOf("/root/dt/sub")),
+                rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/sub"), id),
+            )
+            assertThrows(SecurityException::class.java) {
+                rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/../../etc/motd"), id)
+            }
+            // "文件"App 搜索时名字在参数里
+            val search = DocumentsContract.buildSearchDocumentsUri(authority, Documents.ROOT_HOME, "A.TXT")
+            val args = android.os.Bundle().apply { putString(DocumentsContract.QUERY_ARG_DISPLAY_NAME, "A.TXT") }
+            val found = rows(search, id, args = args)
+            assertEquals(listOf(listOf("/root/dt/a.txt")), found)
+            // 打开"整个系统"
+            prefs.edit().putBoolean("system_documents", true).commit()
+            assertEquals(listOf(listOf("home", "/root"), listOf("system", "/")), roots())
+            assertEquals(listOf(listOf("motd")), rows(document("/etc/motd"), name))
+            assertTrue(rows(DocumentsContract.buildChildDocumentsUri(authority, "/"), name)!!.contains(listOf("etc")))
+        } finally {
+            prefs.edit().remove("login").remove("system_documents").commit()
+            sh(machine, "rm -rf /root/dt")
         }
     }
 

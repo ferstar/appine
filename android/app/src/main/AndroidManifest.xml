@@ -43,6 +43,19 @@
             android:exported="false"
             android:label="@string/settings_licenses" />
 
+        <!-- 设计文档 §11.3：系统"文件"App 里的家目录（和可选的只读整个系统）；只有系统（持有
+             MANAGE_DOCUMENTS 的"文件"App）能直接访问，别的 App 经由用户在里面选的授权 -->
+        <provider
+            android:name=".Documents"
+            android:authorities="${applicationId}.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
         <!-- 设计文档 §11.2：会话运行期间保持一个 specialUse 前台服务 -->
         <service
             android:name=".TerminalService"

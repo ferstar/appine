@@ -632,7 +632,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ### 11.3 共享存储
 
-- **v1：DocumentsProvider**（未实现）。把登录用户的 home 目录注册为系统"文件" App 里的一个根，高级选项可以把整个 `/` 以只读方式暴露。用户在"文件" App 里用"复制到…"即可导入或导出文件。
+- **v1：DocumentsProvider**（`Documents.kt`，读是[第 196 轮](rounds/196-documents-read.md)，写还没有）。把登录账号的家目录注册为系统"文件" App 里的一个根，设置里的开关（默认关）可以把整个 `/` 以只读方式暴露。用户在"文件" App 里用"复制到…"即可导入或导出文件。不经过内核，直接在仓库里按 guest 路径查（`vfs::browse`：符号链接跟随，只给目录和普通文件，挂载看不到），每次调用另外打开一次仓库（内核运行着时它先提交推迟的写事务），文件以只读打开宿主上的 object 交出去。文档 ID 是 guest 的绝对路径（不是 UTF-8 的字节和 `%` 写成 `%XX`）；只认规范的（没有 `.`、`..`、空组件）、在显示着的根里面的 ID。
 - **v1.x：SAF 目录挂载到 `/mnt/<名字>`**。权限位是合成的（目录 0755、文件 0644）；`chmod`/`chown` 静默成功；`symlink`/`link` 返回 `EPERM`；目录列表在内存中缓存；不区分大小写这一点写进文档。
 - 不申请 `MANAGE_EXTERNAL_STORAGE`，Play 不批准终端类 App 使用。
 
@@ -667,7 +667,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 4 | **guest 自己的 OOM killer**：给所有 guest 内存设一个总上限，默认按设备内存的比例计算，可以配置。超出上限时由我们挑选一个 guest 进程杀掉，不让系统 LMK 杀掉整个 App。同时为 `RLIMIT_NPROC` 设置默认值，防止 fork 炸弹 | ✅ `core/kernel/src/oom.rs`。上限量的是整个 App 进程的匿名内存（`/proc/self/status` 的 RssAnon + RssShmem + VmSwap，LMK 看的就是它；Tier 1 代码缓存在写入视图里还没拆掉的页算了两次，扣掉一次，见 §4.2 的 W^X），默认是物理内存的一半，`MachineOptions::memory_limit`、`appine-run --memory-limit` 可以改。guest 碰新的页由宿主内核处理，所以是定时检查：有 guest 线程在运行时每 20 毫秒量一次，超过上限的 3/4 之后每 5 毫秒，全都在等待时停下。超出时按 Linux 的 oom_badness（驻留页数加上按物理内存折算的 `oom_score_adj`）挑一个进程（与 Linux 一样，没有 `CAP_SYS_RESOURCE` 的进程不能把 `oom_score_adj` 调到 `oom_score_adj_min` 以下），用 SIGKILL 结束，记进内核日志（§7.8），等它退完（最多 1 秒）再看下一个。不停分配内存的程序在被发现之前还能多用几十 MB。fork 炸弹由 `threads-max` 和 `RLIMIT_NPROC` 挡住（§6）。上限和用量也以 cgroup v2 的 `memory.max`、`memory.current` 告诉 guest（§8.2），运行时按上限而不是物理内存定堆。guest 自己给子 cgroup 设的 `memory.max` 一起检查：量子树里的进程的驻留内存（mincore，只量设了上限的，间隔至少是耗时的 20 倍），超出时与 Linux 的 memcg OOM 一样从里面挑一个结束。结束的进程 App 会说明是哪个上限不够了（§11.2） |
 | 5 | 内核层以 `panic=unwind` 编译，在 syscall 入口用 `catch_unwind` 兜住 panic，只杀掉当前 guest 进程并生成报告。debug 构建下直接 abort | ✅ `core/kernel/src/bug.rs`。运行循环在每次进入内核的地方（包括不持 BKL 的系统调用）兜住 panic，获取 BKL 时忽略中毒标记；引擎的 bug 走 §7.4 的 `APPINE_EXIT_HOST_FAULT`。两种情况都像 Linux 的 oops 结束当前任务那样，用 SIGSEGV 结束整个进程，并往 stderr（Android 上转到 logcat）写报告，同一份报告也记进内核日志（§7.8，guest 里 `dmesg` 看得到），App 在进程所在的标签页里说明原因或者发通知（§11.2）。BKL 保护的状态可能只改了一半，结束出问题的进程之后大部分不一致也随之消失。运行循环之外的内核代码也兜住：guest 线程开始时、退出的每一步（出错之后其余步骤照做，进程总会结束）、定时器线程处理一个进程的定时器时，都结束那个进程；最后一个线程退出之后结束进程的九步（子进程交给 init、PDEATHSIG、SysV IPC 的清理、释放控制终端、交给跟踪者或父进程、放开它跟踪的进程、孤儿进程组的 SIGHUP/SIGCONT 等）也各自兜住，一步出错只丢掉这一步做的事，进程已经结束，只报告；内存上限的检查、信号驱动的 I/O 分不出进程，出错时关掉这项功能；宿主调用 `Machine` 的方法（Android 上是 JNI 调用）时只让那次调用失败，控制台上的调用还挂断那个控制台。debug 构建默认直接终止宿主进程，`APPINE_ON_BUG=kill`/`abort` 可以覆盖 |
 | | **对 Android 暴露的接口** | |
-| 6 | 只导出启动 Activity 和 DocumentsProvider，不提供供其他 App 执行命令的 intent | ✅ 目前只导出启动 Activity（还没有 DocumentsProvider） |
+| 6 | 只导出启动 Activity 和 DocumentsProvider，不提供供其他 App 执行命令的 intent | ✅ 导出启动 Activity 和 DocumentsProvider（`MANAGE_DOCUMENTS` 保护，只有系统的"文件"App 能直接调用，别的 App 经由用户授予的 URI 权限） |
 | 7 | guest 第一次在非回环地址上 `listen` 某个端口时，发出一条通知 | ✅ 内核攒着事件（`Machine::take_listens`），App 每 2 秒取一次，在"网络服务"渠道里发通知：进程名、端口，低端口换到了宿主上的哪个端口（[低端口映射](rounds/156-low-ports.md)） |
 | 8 | JIT 代码页使用 W^X 双映射 | ✅ M7 |
 

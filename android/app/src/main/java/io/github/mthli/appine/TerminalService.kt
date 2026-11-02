@@ -8,6 +8,7 @@ import android.annotation.SuppressLint
 import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
@@ -28,6 +29,7 @@ import java.text.DateFormat
 import java.text.DecimalFormat
 import java.util.Date
 import kotlin.concurrent.thread
+import kotlin.concurrent.write
 
 /**
  * 持有 guest 内核和所有终端会话的前台服务（设计文档 §11.2）。会话的生命周期挂在服务上，
@@ -329,12 +331,21 @@ class TerminalService : Service() {
      * 新标签页的登录账号（设置里选，设计文档 §11.1）：[ConsolePty.LOGIN_AUTO]、
      * [ConsolePty.LOGIN_ROOT] 或账号名。换了发行版、重置 rootfs 之后回到自动。
      */
-    val login: String
-        get() = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LOGIN, null) ?: ConsolePty.LOGIN_AUTO
+    val login: String get() = login(this)
 
-    /** 设置里选了登录账号：之后新开的标签页用它，开着的不变。 */
+    /** 设置里选了登录账号：之后新开的标签页用它，开着的不变；"文件"App 里的家目录跟着换。 */
     fun setLogin(value: String) {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_LOGIN, value).apply()
+        Documents.rootsChanged(this)
+        settingsChanged()
+    }
+
+    /** "文件"App 里是不是还显示只读的整个系统（设置里的开关，默认关，设计文档 §11.3）。 */
+    val systemDocuments: Boolean get() = showSystemDocuments(this)
+
+    fun setSystemDocuments(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_SYSTEM_DOCUMENTS, on).apply()
+        Documents.rootsChanged(this)
         settingsChanged()
     }
 
@@ -358,12 +369,15 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureLoginTools(this)
                 Rootfs.updateProfile(this)
-                Native.start(Rootfs.store(this).path, tier)
+                // 内核打开仓库时要是唯一的用户（DocumentsProvider 另外打开的不算，见 Rootfs.access）
+                Rootfs.access.write { Native.start(Rootfs.store(this).path, tier) }
             }
             main.post {
                 result.onSuccess {
                     machine = it
                     progress = null
+                    // 仓库可能是刚导入的（第一次运行、换了发行版）
+                    Documents.rootsChanged(this)
                     updateWakeLock()
                     Tabs.markRunning(this)
                     restore?.let { saved -> restoreTabs(saved) }
@@ -939,6 +953,15 @@ class TerminalService : Service() {
         private const val PREFS = "settings"
         private const val KEY_TIER = "tier"
         private const val KEY_LOGIN = "login"
+        private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
+
+        /** 设置里的登录账号（见实例的 [login]）；DocumentsProvider 也要用，不经过服务。 */
+        fun login(context: Context): String =
+            context.getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LOGIN, null) ?: ConsolePty.LOGIN_AUTO
+
+        /** 见实例的 [systemDocuments]。 */
+        fun showSystemDocuments(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_SYSTEM_DOCUMENTS, false)
         private const val TRANSCRIPT_ROWS = 2000
         private const val TRIM_DELAY_MS = 60_000L
         private const val SAVE_MS = 60_000L

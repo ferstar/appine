@@ -204,6 +204,7 @@
 | [M9：以指定用户登录](rounds/193-login-account.md) | 2026-11-02 | 设置里的"登录账号"，默认"自动"：在命令行里 `adduser` 建了普通用户之后，冷启动、新标签页都以最先建的那个登录，没有就是 root。普通用户第一次登录时照 Alpine 的 `setup-user -a` 加进 wheel、离线装上 App 带的 doas（Debian 是 sudo 组、联网装 sudo）；设了密码的提权要输密码，没设的不问。顺带查出并修了 DNS 存根的回答在 `FIONREAD` 里报成 0，Android 上 glibc 一次查 A 和 AAAA 的解析（Debian 的 apt 等）因此一直失败，之前两轮的 `apt-get update` 用例是假的通过 |
 | [M9：被杀之后恢复标签页](rounds/194-restore-tabs.md) | 2026-11-02 | 内核运行期间留着"在运行"的标记，每分钟（以及界面隐藏、内存紧张、开关标签页时）存下每个标签页的登录账号、前台进程组的当前目录（新的 `Machine::console_cwd`）和回看记录；正常退出时删掉。被系统杀掉之后再打开，每个标签页以原来的账号、从原来的目录起新的 shell，先显示原来的回看记录和一行"上次会话因 App 被系统终止而结束"，不恢复进程。登录脚本不再用 `su -l`（它总回家目录），profile 里的 `cd "$HOME"` 去掉了 |
 | [M9：进程被结束、服务没起来时提示](rounds/195-kill-reports.md) | 2026-11-02 | 内核层结束进程（bug、引擎故障、OOM killer）时记下报告（`Machine::take_kills`：pid、进程名、控制台、原因，OOM 的是哪个 cgroup、用量和上限），App 在那个标签页里用黄色说明原因，插在 shell 新的提示符上面、光标回原处；没有控制终端、在全屏程序里或者界面不在时发通知。开机完成后 `/var/log/boot.log` 里有 OpenRC 的 "failed to start" 时发通知。顺带修了：合成文件系统里已有的名字 mkdir 是 EACCES（`mkdir -p /sys/fs/cgroup/x` 失败，Linux 是 EEXIST）、/dev/zero 和 /dev/urandom 一次只读 64 KB、宿主线程不持 BKL 读 inittab（可能是第 193 轮偶发失败的原因）、没有命令运行时上次的 boot.log 不清空 |
+| [M9：在"文件"App 里浏览（只读）](rounds/196-documents-read.md) | 2026-11-02 | DocumentsProvider：登录账号的家目录是系统"文件"App 里的一个根，设置里打开之后还有只读的整个 `/`；能列目录、读文件（交出宿主上的 object）、按名字搜索，"复制到…"导出。不经过内核，直接在仓库里按 guest 路径查（新的 `vfs::browse`：符号链接跟随，只给目录和普通文件），每次调用另外打开一次仓库；与内核启动用一把读写锁。文档 ID 是 guest 的绝对路径，只认规范的、在根里面的。写在下一轮 |
 
 ## 测量条件
 

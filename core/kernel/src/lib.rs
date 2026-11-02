@@ -93,6 +93,17 @@ pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
     .unwrap_or(Err(Errno::EIO))
 }
 
+/// 宿主浏览仓库（App 的 DocumentsProvider，设计文档 §11.3）：另外打开一次仓库，对它调用
+/// `f`（[`vfs::browse`] 里的函数）。内核运行着也可以：另外打开仓库时内核先提交推迟的写事务，
+/// 看到的是最新的；这个连接开着期间内核不再推迟提交，所以每次用完就关，不长期开着。
+pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
+    bug::host_call("browse", || {
+        let store = Store::open(store, &[])?;
+        f(&store)
+    })
+    .unwrap_or(Err(Errno::EIO))
+}
+
 /// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。
 ///
 /// 目录里已经有仓库时返回 `EEXIST`。导入失败时仓库保持为空。

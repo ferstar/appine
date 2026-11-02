@@ -11,6 +11,8 @@ import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.write
 
 /**
  * rootfs 的导入和配置（设计文档 §11.4）：第一次运行时导入 APK 里的 Alpine，设置里可以换成
@@ -169,7 +171,7 @@ internal object Rootfs {
     }
 
     /** 删掉 App 的仓库（换发行版、重置 rootfs）。内核要先停下。 */
-    fun reset(context: Context) {
+    fun reset(context: Context) = access.write {
         File(context.filesDir, "rootfs.tmp").deleteRecursively()
         if (!store(context).deleteRecursively()) Log.w(TAG, "cannot delete all of the rootfs")
     }
@@ -333,25 +335,51 @@ internal object Rootfs {
     }
 
     /** `/etc/passwd` 里的一个账号。 */
-    data class Account(val name: String, val uid: Int)
+    data class Account(val name: String, val uid: Int, val home: String)
 
-    /**
-     * 能作为登录账号的普通用户：UID 1000–65533、有登录 shell（不是 nologin、false），按 UID 排，
-     * 第一个就是"自动"登录的那个。规则与 assets 的 `login.sh` 一样。读不到时是空的。
-     */
-    fun regularAccounts(context: Context): List<Account> {
+    /** `/etc/passwd` 里的账号，读不到时是空的。 */
+    private fun accounts(context: Context): List<Pair<Account, String>> {
         val passwd = runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull()
             ?: return emptyList()
         return String(passwd).lines().mapNotNull { line ->
             val f = line.split(':')
             if (f.size < 7) return@mapNotNull null
-            val shell = f[6]
             val uid = f[2].toIntOrNull() ?: return@mapNotNull null
-            if (shell.isEmpty() || shell.endsWith("/nologin") || shell.endsWith("/false")) return@mapNotNull null
-            if (uid !in 1000..65533) return@mapNotNull null
-            Account(f[0], uid)
-        }.sortedBy { it.uid }
+            Account(f[0], uid, f[5]) to f[6]
+        }
     }
+
+    /**
+     * 能作为登录账号的普通用户：UID 1000–65533、有登录 shell（不是 nologin、false），按 UID 排，
+     * 第一个就是"自动"登录的那个。规则与 assets 的 `login.sh` 一样。读不到时是空的。
+     */
+    fun regularAccounts(context: Context): List<Account> = accounts(context).mapNotNull { (account, shell) ->
+        if (shell.isEmpty() || shell.endsWith("/nologin") || shell.endsWith("/false")) return@mapNotNull null
+        if (account.uid !in 1000..65533) return@mapNotNull null
+        account
+    }.sortedBy { it.uid }
+
+    /**
+     * 设置里的登录账号 [login]（[ConsolePty.LOGIN_AUTO]、[ConsolePty.LOGIN_ROOT] 或账号名）实际是
+     * 哪个账号：规则与 `login.sh` 一样，自动是最先建的普通用户、没有时是 root，指定的账号不在了
+     * 也是 root。读不到 `/etc/passwd` 时是家目录为 `/root` 的 root。
+     */
+    fun loginAccount(context: Context, login: String): Account {
+        val all = accounts(context).map { it.first }
+        val root = all.firstOrNull { it.name == ConsolePty.LOGIN_ROOT } ?: Account(ConsolePty.LOGIN_ROOT, 0, "/root")
+        return when (login) {
+            ConsolePty.LOGIN_AUTO -> regularAccounts(context).firstOrNull() ?: root
+            ConsolePty.LOGIN_ROOT -> root
+            else -> all.firstOrNull { it.name == login } ?: root
+        }
+    }
+
+    /**
+     * 仓库的读写锁。内核打开仓库时要是唯一的用户，才做开机的清理（清空 `/dev/shm`、`/run`，删掉
+     * 上次没来得及提交的 object）；DocumentsProvider 在 binder 线程上随时会另外打开仓库，每次
+     * 持读锁，启动内核、删掉仓库时持写锁。
+     */
+    val access = ReentrantReadWriteLock()
 
     /**
      * `/etc/profile.d/appine.sh`：显示 motd、终端和语言的环境变量、彩色的提示符。从哪个目录开始

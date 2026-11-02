@@ -62,6 +62,10 @@
     <string name="killed_oom_cgroup">%1$s (pid %2$d) was killed: cgroup %3$s reached its memory.max (%4$s of %5$s).</string>
     <string name="killed_bug">%1$s (pid %2$d) was ended by an internal error in appine. This is a bug in appine; dmesg shows the report.</string>
     <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>
+    <string name="settings_system_documents">Show the whole system in Files</string>
+    <string name="system_documents_summary">Besides your home directory, the Files app also lists everything from /, read-only.</string>
+    <string name="documents_home" translatable="false">%1$s · %2$s</string>
+    <string name="documents_system">The whole system (read-only) · %1$s</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>

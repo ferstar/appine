@@ -10,6 +10,7 @@
 //! 整棵树里进行，符号链接最多跟随 40 层；经过的每个仓库目录都要有搜索权限。进程的根目录
 //! 可以被 chroot、pivot_root 换掉：绝对路径从它开始，`..` 不会越过它。
 
+pub mod browse;
 pub mod dev;
 pub mod import;
 pub mod store;
