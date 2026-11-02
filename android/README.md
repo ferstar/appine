@@ -31,8 +31,10 @@ and a 16K-page system image. `downloadedDistributionsRun` downloads Debian
 with `-http-proxy` sends connections to 127.0.0.1 to the proxy too, which breaks
 `downloadsResumeWhereTheyBrokeOff`. Setting the system proxy instead
 (`adb shell settings put global http_proxy 10.0.2.2:<port>`) only affects the app's own
-HTTP downloads and leaves 127.0.0.1 alone; remove it afterwards with
-`adb shell settings delete global http_proxy`.
+HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
+`adb shell settings put global http_proxy :0`. Deleting the setting instead leaves
+`global_http_proxy_host` and `global_http_proxy_port` behind, and the proxy stays in effect
+(with an empty exclusion list, so 127.0.0.1 goes to the proxy too) until the next reboot.
 
 ## Vendored code
 

@@ -622,7 +622,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 前台服务 | 只要还有终端会话或 guest 进程在运行，就保持一个**前台服务**，类型为 `specialUse`。通知栏显示"N 个会话运行中"，没有会话时是"在后台运行"，附带"全部退出"按钮。关掉最后一个标签页只关界面：服务每 2 秒看一次，没有会话、界面不在、也没有 guest 进程了才退出 | ✅ M5（`TerminalService`），留在后台是[第 187 轮](rounds/187-app-init.md) |
 | 开机、关机 | 内核启动之后在单独的线程上按 `/etc/inittab` 开机（§6，Alpine 上是 OpenRC 的服务），不挡标签页。"全部退出"、guest 的 `poweroff`/`halt` 先关机（关机的命令、SIGTERM、最多等 1 秒、SIGKILL），完了才停止服务，这期间通知显示"正在停止服务"；guest 的 `reboot` 关机之后启动一个新的内核、开一个新的标签页。被系统杀掉时来不及关机 | ✅ [第 187 轮](rounds/187-app-init.md) |
 | 生命周期归属 | 所有会话和 guest 内核的生命周期都**挂在 Service 上，不挂在 Activity 上** | ✅ M5 |
-| 熄屏 | 熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启，默认关闭 | M9 |
+| 熄屏 | 熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启（设置页的"熄屏时保持运行"、通知上的"保持唤醒"），默认关闭。开着时内核运行期间一直持有，关机完成、内核停下就放开。App 有前台服务，Doze 里这个锁照样有效、网络也不断（AOSP 只对进程状态在 `BOUND_FOREGROUND_SERVICE` 之后的 App 禁用 partial wake lock、断网），不申请电池优化的豁免 | ✅ [第 191 轮](rounds/191-keep-awake.md) |
 | 内存紧张 | 丢掉可以重建的缓存：池里保留的翻译、共用的只读文件映射、dentry/inode 缓存（`Machine::trim_memory`，运行中的进程用着的不动），并提交推迟的写事务。界面停下（切到别的 App、熄屏）1 分钟之后还没回来就释放，很快切回来时不必重新翻译：Android 14 起不再发 `RUNNING_*` 这些级别，有前台服务的进程连界面隐藏（`UI_HIDDEN`）也收不到（进程状态停在前台服务），只能自己看 Activity 在不在。`onTrimMemory` 的 `RUNNING_LOW`、`RUNNING_CRITICAL`（Android 14 之前）和 `BACKGROUND` 以上立即释放。释放和停止内核在同一个后台线程上按顺序做 | ✅ M9 之前 |
 | 进程被杀 | v1 只恢复标签页布局、每个标签的 cwd 和滚动回看记录，并启动新的 shell，同时明确提示"上次会话因 App 被系统终止而结束"。v1 **不恢复进程** | M9 |
 | 开机自启 | v1 不做 | — |

@@ -40,6 +40,12 @@
     <string name="restart_title">重启？</string>
     <string name="restart_message">所有会话都会结束，然后以新的执行层重新启动。</string>
     <string name="restart">重启</string>
+    <string name="settings_keep_awake">熄屏时保持运行</string>
+    <string name="keep_awake_on">熄屏之后 CPU 不休眠，后台的服务、编译照常运行；更耗电。</string>
+    <string name="keep_awake_off">熄屏之后，系统可能暂停在后台运行的程序。</string>
+    <string name="keep_awake">保持唤醒</string>
+    <string name="allow_sleep">允许休眠</string>
+    <string name="kept_awake">%1$s · 保持唤醒</string>
     <plurals name="sessions_running">
         <item quantity="other">%d 个会话运行中</item>
     </plurals>

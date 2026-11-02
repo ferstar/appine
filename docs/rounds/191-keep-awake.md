@@ -1,0 +1,44 @@
+# M9：熄屏时保持运行（2026-11-02）
+
+← [M9：设置页，默认导入 Alpine（2026-11-02）](190-settings-default-alpine.md) · [索引](../milestones.md)
+
+设计文档 §11.2 的"熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启，默认关闭"，M9 计划里的 wake lock 开关。[App 按 inittab 开机](187-app-init.md)之后，OpenRC 起的服务在没有标签页时也留在后台，熄屏后 CPU 一休眠它们就停住，那一轮把这个记成了推迟项。
+
+## 先查清楚：Doze 里锁还算不算数
+
+Android 的文档说 Doze 时"系统忽略 wake lock"，又在资源限制表里写"运行前台服务的 App：网络不受限制"，两处放在一起看不出前台服务的 App 的 wake lock 在 Doze 里怎么样。如果也被忽略，只加 wake lock 不够，还得引导用户把 App 加进电池优化的豁免名单；直接请求豁免（`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）在 Play 上只许几类 App 用，终端不在其中。
+
+读了 AOSP（main）的源码：
+
+- `PowerManagerService.setWakeLockDisabledStateLocked`：Doze 时只禁用不在豁免名单里、并且进程状态在 `PROCESS_STATE_BOUND_FOREGROUND_SERVICE` 之后的 App 的 partial wake lock。前台服务的进程状态是 `FOREGROUND_SERVICE`，排在它前面，不禁用。
+- `NetworkPolicyManager.isProcStateAllowedWhileIdleOrPowerSaveMode`：Doze、省电模式下按同一个门槛（`FOREGROUND_THRESHOLD_STATE` = `BOUND_FOREGROUND_SERVICE`）放行网络。
+
+appine 只要有内核就有前台服务（`specialUse`），所以只加 `PARTIAL_WAKE_LOCK` 就够了，不申请电池优化的豁免。另一个限制 Low Power Standby（只放行 `BOUND_TOP` 之前的）在手机上默认关着，没有处理。
+
+## 做法
+
+- **开关**：设置页新的一行"熄屏时保持运行"，右边是开关，点整行切换。说明文字随开关变：开着时是"熄屏之后 CPU 不休眠，后台的服务、编译照常运行；更耗电"，关着时是"熄屏之后，系统可能暂停在后台运行的程序"。内核没在运行时也能改，只是记下。开关记在 SharedPreferences 里，默认关。
+- **通知**：多一个按钮，关着时是"保持唤醒"，开着时是"允许休眠"，点了就切换（与 Termux 通知上的 wake lock 按钮一样，不用打开 App）。持有时通知的文字后面加"· 保持唤醒"。下载新的发行版时一共三个按钮（取消下载、这个、全部退出），正好是通知按钮的上限。
+- **何时持有**（`TerminalService.updateWakeLock`）：开关开着，并且内核在运行或者正在关机（`exitAll` 到停止服务之前，OpenRC 停服务时熄屏也不被打断）。内核起来时、`detach`（重启、换发行版、退出）时、关机完成时、开关变化时重新判断；`onDestroy` 一定放开。锁不计数（`setReferenceCounted(false)`），没有超时：lint 的 `WakelockTimeout`、`Wakelock`（同一个方法里没有放开）都标了 `@SuppressLint`，注释写明原因。
+- 清单里加 `android.permission.WAKE_LOCK`（普通权限，不用用户授权）。
+
+## 测试
+
+在 Pixel 4a（API 34）的模拟器上，用 `dumpsys power` 看锁：
+
+- 新装的 App 打开之后没有 appine 的锁（默认关）。
+- 设置里打开：`PARTIAL_WAKE_LOCK 'appine:keep-awake'`，开关和说明文字都变了。
+- 熄屏、`dumpsys battery unplug`、`dumpsys deviceidle force-idle`（`mState=IDLE`）之后，这把锁仍在、没有 `DISABLED` 标记；过了一分钟仍是这样（`ACQ=-1m31s … LONG`）。上面从源码读出的规则在模拟器上成立。
+- 通知上显示"1 session running · kept awake"和"Allow sleep"；点"Allow sleep"放开（`REL`），通知变回"1 session running"、按钮变成"Keep awake"。
+- 通知上点"Keep awake"拿锁，再点"Exit all"：关机完成后放开（`ACQ` 到 `REL` 1.2 秒），服务停了。重新打开 App，内核起来之后自动又拿了锁（开关记住了）。
+- guest 里后台一个每秒写一行的循环：持锁时熄屏、强制 Doze 的 85 秒里写了 85 行；不持锁时 64 秒里也写满了 64 行。模拟器的 CPU 本来就不会休眠，这一项在模拟器上看不出差别，要真机（见推迟项）。
+- 仪器测试（MachineTest）照旧通过（16 个里 15 个，联网的那个默认跳过）。没有新的仪器测试：锁在服务里，要验证的是系统怎么对待它，靠上面的 `dumpsys`。
+- lint 没有新的警告（只剩原来那类 UseKtx 的提示）。只改了 Kotlin 和文档，没有重跑 cargo test、差分测试和 LTP。
+
+测试时碰到的问题：上一轮在这个模拟器上给 App 的下载设过系统代理，用完 `settings delete global http_proxy` 删掉了。这一轮跑仪器测试时，两个用本地 HTTP 服务的用例返回 404：删掉 `http_proxy` 之后，系统由它派生出的 `global_http_proxy_host`、`global_http_proxy_port` 还在，排除列表却空了，连接服务一直按这个代理走到重启，127.0.0.1 的请求也被送去了代理。重启模拟器之后都通过。清掉代理要用 `settings put global http_proxy :0`（试过，马上生效，那个用例也通过）；`android/README.md` 上一轮写的办法改正了。
+
+**推迟项**：
+
+- 只在模拟器上验证了系统怎么对待这把锁；熄屏之后 guest 的程序是不是真的一直在跑、多耗多少电，要真机（模拟器的 CPU 不休眠）。一些厂商的系统（MIUI、ColorOS 等）在 AOSP 之外另有后台管理，前台服务和 wake lock 都可能被它们停掉，没有处理，也没有引导用户去改。
+- Play Console 的 Android vitals 把长时间持有 partial wake lock 算作"过多唤醒锁定"，可能影响 App 在商店里的展示；这里是用户自己打开的，前台服务期间的锁怎么计算没有查。
+- 开着时只要内核在运行就持锁，不看有没有 guest 进程在干活（比如只开着一个空闲的 shell 也不让 CPU 休眠）。

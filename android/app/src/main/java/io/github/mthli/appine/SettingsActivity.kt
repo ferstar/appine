@@ -13,13 +13,14 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 
 /**
- * 设置：发行版、软件源镜像、重置 rootfs、执行层（设计文档 §11.4）。状态都在 [TerminalService]
+ * 设置：发行版、软件源镜像、重置 rootfs、执行层（设计文档 §11.4），熄屏时保持运行（§11.2）。状态都在 [TerminalService]
  * 里，这里只显示和转达；内核没有在运行（启动中、正在换掉仓库）时只能看、不能改。换掉仓库、
  * 重启开始时回到终端，那里显示进度。
  */
@@ -30,6 +31,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     private lateinit var mirror: Row
     private lateinit var reset: Row
     private lateinit var tier: Row
+    private lateinit var keepAwake: Row
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -45,30 +47,48 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /** 一行设置：标题，下面是现在的值或者说明。 */
-    private inner class Row(title: Int, onClick: () -> Unit) {
+    /**
+     * 一行设置：标题，下面是现在的值或者说明；[toggle] 的行右边有开关（点整行切换，开关本身只
+     * 显示）。
+     */
+    private inner class Row(title: Int, toggle: Boolean = false, onClick: () -> Unit) {
         private val summary = TextView(this@SettingsActivity).apply {
             setTextColor(Color.GRAY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         }
 
+        private val switch = if (toggle) {
+            Switch(this@SettingsActivity).apply {
+                isClickable = false
+                isFocusable = false
+            }
+        } else {
+            null
+        }
+
         val view = LinearLayout(this@SettingsActivity).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(20), dp(14), dp(20), dp(14))
-            addView(TextView(this@SettingsActivity).apply {
-                setText(title)
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            })
-            addView(summary)
+            addView(LinearLayout(this@SettingsActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@SettingsActivity).apply {
+                    setText(title)
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                })
+                addView(summary)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            switch?.let { addView(it) }
             val ripple = TypedValue()
             theme.resolveAttribute(android.R.attr.selectableItemBackground, ripple, true)
             setBackgroundResource(ripple.resourceId)
             setOnClickListener { onClick() }
         }
 
-        fun set(text: CharSequence, enabled: Boolean) {
+        fun set(text: CharSequence, enabled: Boolean, checked: Boolean = false) {
             summary.text = text
+            switch?.isChecked = checked
             view.isEnabled = enabled
             view.alpha = if (enabled) 1f else 0.4f
         }
@@ -80,6 +100,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         mirror = Row(R.string.settings_mirror) { onMirror() }
         reset = Row(R.string.settings_reset) { onReset() }
         tier = Row(R.string.settings_tier) { onTier() }
+        keepAwake = Row(R.string.settings_keep_awake, toggle = true) { service?.let { it.setKeepAwake(!it.keepAwake) } }
 
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -100,7 +121,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            for (row in listOf(distro, mirror, reset, tier)) addView(row.view)
+            for (row in listOf(distro, mirror, reset, keepAwake, tier)) addView(row.view)
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -185,6 +206,8 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         // 启动失败时也能重置：仓库坏了只能靠它恢复
         reset.set(getString(R.string.reset_summary, (installed ?: Rootfs.Distro.ALPINE).label), s.canSwitch)
         tier.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
+        // 随时可以改：内核没在运行时只是记下，起来之后照这个持有
+        keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
     }
 
     // ---- 操作 ----

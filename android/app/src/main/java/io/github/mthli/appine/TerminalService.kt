@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.annotation.SuppressLint
 import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -18,6 +19,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -311,6 +313,7 @@ class TerminalService : Service() {
                 result.onSuccess {
                     machine = it
                     progress = null
+                    updateWakeLock()
                     // 开机要等 sysinit、wait 的命令（OpenRC 起服务），不占 worker：标签页照常打开
                     thread(name = "appine-boot") {
                         runCatching {
@@ -458,6 +461,47 @@ class TerminalService : Service() {
         each { it.onSettingsChanged() }
     }
 
+    /** 熄屏时保持运行（设置里、通知里的开关，默认关，设计文档 §11.2）。 */
+    val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
+
+    fun setKeepAwake(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_KEEP_AWAKE, on).apply()
+        updateWakeLock()
+        settingsChanged()
+    }
+
+    /** 熄屏时保持运行时持有的 `PARTIAL_WAKE_LOCK`。 */
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * 按开关和内核的状态持有、放开 `PARTIAL_WAKE_LOCK`：开着、内核在运行或者正在关机（[exitAll]，
+     * 服务停下来之前）时持有，不然熄屏之后 CPU 休眠，guest 的进程跟着停住。
+     *
+     * App 一直有前台服务，Doze 里这个锁照样有效：`PowerManagerService` 只禁用进程状态在
+     * `BOUND_FOREGROUND_SERVICE` 之后的 App 的 partial wake lock，网络也按同一个门槛放行
+     * （`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`），不必申请电池优化的豁免。
+     */
+    // 用户打开的开关：持有到内核停下或者用户关掉，没有固定的时长，也不在同一次调用里放开
+    @SuppressLint("WakelockTimeout", "Wakelock")
+    private fun updateWakeLock() {
+        val want = keepAwake && (machine != 0L || exiting)
+        val held = wakeLock
+        if (want && held == null) {
+            wakeLock = getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        } else if (!want && held != null) {
+            held.release()
+            wakeLock = null
+        } else {
+            return
+        }
+        updateNotification()
+    }
+
     /**
      * 全部退出（通知里的按钮、guest 的 `poweroff`、关掉最后一个标签页之后也没有 guest 进程了）：
      * 先按 inittab 关机（OpenRC 停服务，PostgreSQL 这些不必下次做崩溃恢复），完了才停止服务，
@@ -478,6 +522,7 @@ class TerminalService : Service() {
             if (m != 0L) Native.shutdown(m)
             main.post {
                 exiting = false
+                updateWakeLock()
                 // 关机期间用户又打开了 App：重新启动，不然界面一直停在"正在启动"
                 if (listeners.isNotEmpty()) start(null) else stopSelf()
             }
@@ -509,6 +554,7 @@ class TerminalService : Service() {
             watchingNetwork = false
         }
         machine = 0
+        updateWakeLock()
         main.removeCallbacks(poll)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
@@ -520,6 +566,7 @@ class TerminalService : Service() {
         when (intent?.action) {
             ACTION_EXIT_ALL -> exitAll()
             ACTION_CANCEL_SWITCH -> cancelSwitch()
+            ACTION_TOGGLE_KEEP_AWAKE -> setKeepAwake(!keepAwake)
         }
         return START_NOT_STICKY
     }
@@ -535,6 +582,8 @@ class TerminalService : Service() {
         // 没经过 exitAll 就被停止了：照样关机，尽力而为。要等 guest 线程退出，不在主线程上做
         if (m != 0L) worker.execute { Native.shutdown(m) }
         worker.shutdown()
+        wakeLock?.release()
+        wakeLock = null
         super.onDestroy()
     }
 
@@ -629,12 +678,13 @@ class TerminalService : Service() {
         )
         val n = sessions.size
         val sw = switching
-        val text = when {
+        val state = when {
             exiting -> getString(R.string.stopping)
             machine == 0L && progress != null -> progress
             n == 0 && machine != 0L -> getString(R.string.background_running)
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
+        val text = if (wakeLock != null) getString(R.string.kept_awake, state) else state
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.app_name))
@@ -651,6 +701,14 @@ class TerminalService : Service() {
             builder.setSubText(getString(R.string.downloading, sw.distro.label, sw.done shr 20, sw.total shr 20))
             if (sw.total > 0) builder.setProgress(sw.total.toInt(), sw.done.toInt(), false)
             builder.addAction(Notification.Action.Builder(null, getString(R.string.cancel_download), cancel).build())
+        }
+        if (!exiting) {
+            val toggle = PendingIntent.getService(
+                this, 3, Intent(this, TerminalService::class.java).setAction(ACTION_TOGGLE_KEEP_AWAKE),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            val label = getString(if (keepAwake) R.string.allow_sleep else R.string.keep_awake)
+            builder.addAction(Notification.Action.Builder(null, label, toggle).build())
         }
         return builder
             .addAction(Notification.Action.Builder(null, getString(R.string.exit_all), exit).build())
@@ -680,6 +738,9 @@ class TerminalService : Service() {
         private const val POLL_MS = 2_000L
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
+        private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"
+        private const val KEY_KEEP_AWAKE = "keep_awake"
+        private const val WAKE_LOCK_TAG = "appine:keep-awake"
         private const val PREFS = "settings"
         private const val KEY_TIER = "tier"
         private const val TRANSCRIPT_ROWS = 2000

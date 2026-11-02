@@ -41,6 +41,12 @@
     <string name="restart_title">Restart?</string>
     <string name="restart_message">All sessions end and the system restarts with the new execution tier.</string>
     <string name="restart">Restart</string>
+    <string name="settings_keep_awake">Keep running with the screen off</string>
+    <string name="keep_awake_on">The CPU stays awake, so services and builds keep running after the screen goes off. Uses more battery.</string>
+    <string name="keep_awake_off">After the screen goes off, the system may pause the programs running in the background.</string>
+    <string name="keep_awake">Keep awake</string>
+    <string name="allow_sleep">Allow sleep</string>
+    <string name="kept_awake">%1$s · kept awake</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>
