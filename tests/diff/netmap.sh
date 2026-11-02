@@ -5,7 +5,9 @@
 # A 之间，A 与外层的网关地址之间通不通，两边看到的本端、对端地址，低端口，/proc/net，以及
 # 到不了的错误。原生一侧是特权容器，数据包真的经过 bridge。
 #
-# - 经由默认路由出到容器外面的不比（原生要看宿主的转发和 NAT）。
+# - 经由默认路由出到容器外面的不比（原生要看宿主的转发和 NAT）。只比一个 UDP socket 先后
+#   发往命名空间里的地址和外层的默认网关（容器外面，不会回答）时发不发得出去、命名空间里的
+#   有没有回答（没先 bind 就 sendto 的 socket；原来第一个是命名空间里的就绑了回环地址）。
 # - 直连网段里没有的地址：原生要等 ARP 超时（约 3 秒）才是 EHOSTUNREACH，appine 马上是；
 #   对方的命名空间没了之后原生还有 ARP 缓存，连它的地址要等到超时，这一项不比。
 exec 2>&1
@@ -68,6 +70,24 @@ try:
 except OSError as e:
     print(f"{msg}: {errno.errorcode.get(e.errno, e.errno)}")
 PY
+cat > multi.py <<'PY'
+import errno, select, socket, sys
+# multi.py <名字> <地址:端口>...：一个没绑定的 UDP socket 依次发给它们，再收回答
+name, dests = sys.argv[1], sys.argv[2:]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sends = []
+for i, d in enumerate(dests):
+    host, port = d.rsplit(":", 1)
+    try:
+        s.sendto(f"m{i}".encode(), (host, int(port)))
+        sends.append("ok")
+    except OSError as e:
+        sends.append(errno.errorcode.get(e.errno, e.errno))
+got = []
+while select.select([s], [], [], 1)[0]:
+    got.append(s.recvfrom(200)[0].decode().split(":")[0])
+print(f"{name}: sends {sends}, answered {sorted(got)}")
+PY
 wait_for() { for i in $(seq 100); do [ -f "$1" ] && return; sleep 0.1; done; echo "timeout: $1"; }
 # 在命名空间（pid）里后台起服务，served 等它们结束（不能不带参数地 wait：A、B 的进程也是
 # 子进程）
@@ -129,6 +149,15 @@ nsenter -t "$B" -n python3 cli.py udp 10.50.0.1 5354 b-to-gateway-udp
 serve "$A" udp 0.0.0.0 5355 2
 nsenter -t "$B" -n python3 cli.py udpbind 10.50.0.2 5355 b-bound-any-to-a
 nsenter -t "$B" -n python3 cli.py udpconn 10.50.0.2 5355 b-bound-any-connected-to-a
+served
+
+echo "== one UDP socket, inside and then outside the namespaces"
+outside=$(ip -4 route show default | awk '{print $3; exit}')
+serve $$ udp 0.0.0.0 5356 2
+serve "$A" udp 127.0.0.1 5357 1
+nsenter -t "$A" -n python3 multi.py gateway-then-outside 10.50.0.1:5356 "$outside:5356"
+nsenter -t "$A" -n python3 multi.py outside-then-gateway "$outside:5356" 10.50.0.1:5356
+nsenter -t "$A" -n python3 multi.py loopback-then-outside 127.0.0.1:5357 "$outside:5356"
 served
 
 echo "== low ports"

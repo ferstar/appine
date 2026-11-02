@@ -1525,7 +1525,17 @@ pub(crate) fn send(
                 }
                 let dst = &dst[..];
                 if crate::netns::is_inet(addr) {
-                    ensure_bound(s, m.source.as_deref())?;
+                    // 新命名空间里还没绑定的 UDP socket 第一次发往命名空间里的地址：宿主上也
+                    // 绑通配地址（Socket::wide），下面用 IP_PKTINFO 指定源地址，与先绑了通配
+                    // 地址、端口 0 的（musl 的解析器、Node、Go、Java 这样做）一样。绑在回环地址
+                    // 上的话之后再发往外面就出不去（宿主是 EINVAL）。发给自己的虚拟地址的照旧
+                    // 绑 127.a.b.254：回答按登记的端口送回那里（Loopback::self_udp）
+                    let source = m.source.as_deref().filter(|src| {
+                        s.net.is_none()
+                            || nat_proto(s) != Some(IPPROTO_UDP as u8)
+                            || crate::netns::is_self_source(&me, src)
+                    });
+                    ensure_bound(s, source)?;
                 }
                 key = Some(m.target.as_ref().map_or(0, key_of));
                 if s.wide && m.target.is_some() {

@@ -1,6 +1,6 @@
 # M9 之前：容器连外网也经过外层的 PREROUTING（2026-11-02）
 
-← [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块（2026-11-02）](181-last-member-leaves.md) · [索引](../milestones.md)
+← [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块（2026-11-02）](181-last-member-leaves.md) · [索引](../milestones.md) · [M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面（2026-11-02）](183-udp-wide-first.md) →
 
 [透明代理那一轮](180-original-dst.md)的推迟项：不能在外层命名空间里透明代理容器连外网的流量。Linux 上给 docker、podman 的容器做透明代理，常见的写法是在外层对从 bridge 进来的连接做 REDIRECT：
 
@@ -61,5 +61,5 @@ nft add rule ip px pre iifname "podman0" udp dport 53 redirect to :1053
 **推迟项**：
 
 - 进入外层的只有经由外层网关的 IPv4 连接、数据报，IPv6 的不执行 PREROUTING（与原来一样）。
-- 一个没连接的 UDP socket，先发给被 REDIRECT 到外层的地址（这时给它绑上了回环地址），之后再发往外网的地址就出不去。原来经由网关连外层时就是这样。DNS 的解析器发给几个服务器时用同一个 socket，只有其中一部分被劫持时会碰到。
-- 外层绑通配地址的 UDP socket 只在 `sendto` 带地址时指定源地址。它 connect 到容器之后用 `send` 时，宿主仍选 127.0.0.1：容器看到的来源、它自己 getsockname 报告的本端都是 127.0.0.1，原生是 10.50.0.1（`target/origdst/udpconn2.sh`）。要改的话得像新命名空间里那样不让宿主 socket 真的 connect。
+- 一个没连接的 UDP socket，先发给被 REDIRECT 到外层的地址（这时给它绑上了回环地址），之后再发往外网的地址就出不去。原来经由网关连外层时就是这样。DNS 的解析器发给几个服务器时用同一个 socket，只有其中一部分被劫持时会碰到。 → 先发命名空间里的也在宿主上绑通配地址了；musl 的解析器其实先 bind 了通配地址、端口 0，本来就碰不到，碰到的是不先 bind 就 sendto 的程序（M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面）
+- 外层绑通配地址的 UDP socket 只在 `sendto` 带地址时指定源地址。它 connect 到容器之后用 `send` 时，宿主仍选 127.0.0.1：容器看到的来源、它自己 getsockname 报告的本端都是 127.0.0.1，原生是 10.50.0.1（`target/origdst/udpconn2.sh`）。容器回给 127.0.0.1 的数据报落到它自己的回环上，双向不通。TCP 也一样：外层的 socket 先显式绑通配地址（含 `bind(("", 0))`）再连容器，两边看到的都是 127.0.0.1（`target/origdst/order.sh`），连接本身能用。宿主 socket 已经绑在通配地址上、换不了，要改得换一个宿主 socket（按面向容器的地址和同一个端口重新绑，搬过 guest 设的选项）；连接之前先显式绑本端的程序不多，没做。
