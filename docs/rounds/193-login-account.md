@@ -64,5 +64,5 @@
 - "自动"选 UID 最小的普通用户；有几个时没有办法说"自动选另一个"，只能明确选。设置页列出的只有 UID 1000–65533 的账号，UID 更小的普通账号（比如手动指定的）不在列表里。
 - 免密规则只看 `/etc/shadow` 的密码字段：用别的认证方式（PAM 模块、`!` 锁住但有 SSH 密钥）的账号算"没设密码"，提权不问。
 - 设置页的账号列表在打开设置页时读一次：设置页开着时在终端里建的账号要重新进设置页才看得到。
-- `init_runs_the_inittab`（`hosts/cli/tests/rootfs_programs.rs`）在全量并发的 `cargo test` 里失败过一次：guest 线程在 rusqlite 的语句缓存里 panic（`cache.rs:142`，`RefCell` 已经被借走），时机是 `poweroff` 让所有进程同时退出的时候。说明有两处同时用了同一个仓库连接（两个线程，或者同一个线程重入），单独重跑 5 次都没再出现（那次的 core 文件留在 `target/u/core-init_runs_the_inittab`）。与这一轮的改动无关，原因没查，值得单独查：如果真是两个线程同时用一个连接，后果不只是 panic。→ 找到一处这样的用法：宿主线程开机、关机时不持 BKL 读 `/etc/inittab`，改成持锁，可能就是这次的原因，没能复现确认（[M9：进程被结束、服务没起来时提示](195-kill-reports.md)）
+- `init_runs_the_inittab`（`hosts/cli/tests/rootfs_programs.rs`）在全量并发的 `cargo test` 里失败过一次：guest 线程在 rusqlite 的语句缓存里 panic（`cache.rs:142`，`RefCell` 已经被借走），时机是 `poweroff` 让所有进程同时退出的时候。说明有两处同时用了同一个仓库连接（两个线程，或者同一个线程重入），单独重跑 5 次都没再出现（那次的 core 文件留在 `target/u/core-init_runs_the_inittab`）。与这一轮的改动无关，原因没查，值得单独查：如果真是两个线程同时用一个连接，后果不只是 panic。→ 找到一处这样的用法：宿主线程开机、关机时不持 BKL 读 `/etc/inittab`，改成持锁，可能就是这次的原因，没能复现确认（[M9：进程被结束、服务没起来时提示](195-kill-reports.md)）；之后在检查的构建里让不持着内核的 BKL 用它的仓库直接当作 bug，全量测试、差分测试、LTP、仪器测试都没有别处这样用，改回不持锁读 inittab 时这个用例第一次就失败，确认就是它（[M9：内核的仓库只在持着它的 BKL 时用](202-store-bkl-check.md)）
 - Linux 宿主上 `FIONREAD` 原来也报 0，`appine-run` 里 glibc 的解析却一直正常，差别在哪里没有细查。

@@ -100,9 +100,9 @@ thread_local! {
     /// 持有 BKL 时要触发的事件（[`signal_later`]）。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
     static SIGNALS: std::cell::RefCell<Vec<Arc<Event>>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// 这个线程持有 BKL。
+    /// 这个线程持有的 BKL（[`Shared::id`]），0 是没有。
     #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
-    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// 这个线程持有 BKL 期间请求的唤醒：通道（[`wake`]）和对象，放开 BKL 时由同一个线程处理
     /// （[`Kernel::flush_wakeups`]）。按线程记，不放在全局：同一个宿主进程里可以有几个内核
     /// （测试、App 换内核、宿主改了仓库时 [`crate::machine::store_changed`] 去拿别的内核的
@@ -116,7 +116,7 @@ thread_local! {
 /// 记下一次唤醒请求（[`request_wake`] 等）：持有 BKL 时记在这个线程上，否则（不该有）放进
 /// 全局的兜底里。
 fn note_wake(channels: u32, object: Option<wake::Object>) {
-    if HELD.get() {
+    if HELD.get() != 0 {
         PENDING.with_borrow_mut(|(c, objects)| {
             *c |= channels;
             if let Some(o) = object
@@ -138,6 +138,13 @@ fn note_wake(channels: u32, object: Option<wake::Object>) {
 
 /// 当前线程持有 BKL。
 pub(crate) fn bkl_held() -> bool {
+    HELD.get() != 0
+}
+
+/// 当前线程持有的是哪个内核的 BKL（[`Shared::id`]），0 是没有。只有检查的构建用
+/// （[`crate::vfs::store::Store::guard_with_bkl`]）。
+#[cfg(any(debug_assertions, feature = "borrow-check"))]
+pub(crate) fn bkl_holder() -> usize {
     HELD.get()
 }
 
@@ -715,6 +722,12 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// 区分同一个宿主进程里的几个内核（测试、App 换内核时）：[`bkl_holder`] 用它说持的是
+    /// 哪一把 BKL。取 [`Shared::held`] 的地址，Shared 活着时不变，不会是 0。
+    pub fn id(&self) -> usize {
+        &self.held as *const AtomicBool as usize
+    }
+
     pub fn new(kernel: Kernel) -> Shared {
         Shared {
             kernel: Mutex::new(kernel),
@@ -812,7 +825,7 @@ pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>, &'a AtomicBool);
 impl<'a> Bkl<'a> {
     fn new(guard: MutexGuard<'a, Kernel>, held: &'a AtomicBool) -> Bkl<'a> {
         held.store(true, Ordering::Relaxed);
-        HELD.set(true);
+        HELD.set(held as *const AtomicBool as usize);
         crate::mm::defer_unmaps();
         Bkl(ManuallyDrop::new(guard), held)
     }
@@ -842,7 +855,7 @@ impl Drop for Bkl<'_> {
         self.1.store(false, Ordering::Relaxed);
         // SAFETY: 之后不再使用 self.0
         unsafe { ManuallyDrop::drop(&mut self.0) };
-        HELD.set(false);
+        HELD.set(0);
         crate::task::pool::notify_pending();
         flush_signals();
         crate::mm::release_unmapped();

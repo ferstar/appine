@@ -1,6 +1,6 @@
 # M9："文件"App 与 guest 双向的通知（2026-11-03）
 
-← [M9：发布时放出的源码（2026-11-03）](200-release-sources.md) · [索引](../milestones.md)
+← [M9：发布时放出的源码（2026-11-03）](200-release-sources.md) · [索引](../milestones.md) · [M9：内核的仓库只在持着它的 BKL 时用（2026-11-03）](202-store-bkl-check.md) →
 
 [在"文件"App 里改家目录](197-documents-write.md)之后留下两个方向的缺口：
 

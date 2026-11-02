@@ -138,6 +138,9 @@ impl Machine {
         }
         {
             let mut k = shared.lock();
+            if let Some(vfs) = &vfs {
+                vfs.store().guard_with_bkl(shared.id());
+            }
             k.vfs = vfs;
             k.oom.limit = options
                 .memory_limit
