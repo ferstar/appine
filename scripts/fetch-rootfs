@@ -1,12 +1,18 @@
 #!/bin/sh
 # 下载并校验 Alpine minirootfs（设计文档 §11.4）。版本和 sha256 固定写在这里，
 # 升级时一起修改。用法：scripts/fetch-rootfs [输出目录]，默认 target/rootfs。
+#
+# 下载之后先用 Alpine 的发布密钥（scripts/alpine-ncopa.asc，Natanael Copa，指纹见
+# fingerprint）验签名，再比 sha256：摘要固定在这里，验签是给升级版本时确认新的摘要可信用的。
+# 升级时改 version，sha256 先不动，运行一次：签名有效、摘要不同时会印出新的摘要。没装 gpg
+# 时跳过验签。
 set -eu
 
 version=3.24.3
 sha256=4d3f80afaebd447c5591a63a73bde380a149fe8b2d85488cafabb2ff97551f50
 name=alpine-minirootfs-$version-aarch64.tar.gz
 url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/aarch64/$name
+fingerprint=0482D84022F52DF1C4E7CD43293ACD0907D9495A
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-$root/target/rootfs}
@@ -30,9 +36,37 @@ if [ -f "$file" ] && check "$file"; then
     echo "$file"
     exit 0
 fi
+# 用只含 Alpine 公钥的临时 keyring 验签（gpgv 不碰用户的 keyring，也不要 gpg-agent）。
+# 返回 0 签名有效，1 无效，2 没装 gpg
+verify() {
+    command -v gpg >/dev/null && command -v gpgv >/dev/null || return 2
+    tmp=$(mktemp -d)
+    gpg --dearmor <"$root/scripts/alpine-ncopa.asc" >"$tmp/keyring.gpg"
+    status=1
+    if curl -fsSL --retry 3 -o "$tmp/sig.asc" "$url.asc" &&
+        gpgv --keyring "$tmp/keyring.gpg" --status-fd 1 "$tmp/sig.asc" "$1" 2>/dev/null |
+        grep -q "VALIDSIG $fingerprint"; then
+        status=0
+    fi
+    rm -rf "$tmp"
+    return $status
+}
+
 curl -fsSL --retry 3 -o "$file.part" "$url"
+signed=0
+verify "$file.part" || signed=$?
+if [ $signed = 1 ]; then
+    echo "fetch-rootfs: bad or missing signature for $url" >&2
+    rm -f "$file.part"
+    exit 1
+elif [ $signed = 2 ]; then
+    echo "fetch-rootfs: gpg not found, skipping the signature check (the sha256 is pinned)" >&2
+fi
 if ! check "$file.part"; then
-    echo "fetch-rootfs: sha256 mismatch for $url" >&2
+    echo "fetch-rootfs: sha256 mismatch for $url: got $(digest "$file.part")" >&2
+    if [ $signed = 0 ]; then
+        echo "fetch-rootfs: the signature is valid; when upgrading, set sha256 to the digest above" >&2
+    fi
     rm -f "$file.part"
     exit 1
 fi

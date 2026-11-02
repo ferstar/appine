@@ -200,6 +200,7 @@
 | [M9 之前：rt_sigprocmask 不取 BKL 的尝试和进出分发器的共用计数](rounds/189-sigmask-dbt-running.md) | 2026-11-02 | 试了让 rt_sigprocmask 不取 BKL（屏蔽字改原子的，加挂起信号的提示位图配对）：同时起进程每轮少拿 6 次锁，吞吐不变，没有采用。量单次调用时发现 Tier 1 每次进出分发器都要改同一地址空间共用的计数，8 个线程同时做系统调用（读时钟）每次 844 ns，1 个线程 92 ns；整体清空改为持锁逐个看各线程，进出只写自己的记录，8 个线程降到 155 ns，现有负载上看不出变化。之后讨论了单线程加协程、类似 epoll 的事件循环（委托一次往返空转时 0.1–0.3 µs、睡下时 13–24 µs，事件循环争用时吞吐还低于直接取锁）和按 fork 家族给地址空间加锁（锁的单位必须是家族，fork 的快照现在靠 BKL），都先不做 |
 | [M9：设置页，默认导入 Alpine](rounds/190-settings-default-alpine.md) | 2026-11-02 | 开始做发布前的 App 工作：首次启动直接导入 Alpine，不再让用户选；新的设置页能换发行版（去掉了 Ubuntu，只剩 Alpine 和 Debian）、重置 rootfs、手动选软件源镜像、换执行层。换发行版先在后台下载、校验，这期间原来的系统照常能用，设置页和通知里都能取消，下载失败时原来的系统不动，导入失败退回 Alpine；内核启动失败时也能在设置里重置。Debian 的 tarball 暂时只用 GitHub 这个官方来源 |
 | [M9：熄屏时保持运行](rounds/191-keep-awake.md) | 2026-11-02 | 设置页的"熄屏时保持运行"和通知上的"保持唤醒"按钮，默认关；开着时内核运行期间（含关机）持有 `PARTIAL_WAKE_LOCK`。读 AOSP 源码确认前台服务的 App 在 Doze 里 wake lock 不被禁用、网络不断，所以不申请电池优化的豁免；模拟器上强制 Doze 之后锁仍有效 |
+| [M9：许可证改为 AGPL-3.0-or-later，开源许可页](rounds/192-license.md) | 2026-11-02 | 许可证审计（R3）：vendored 的 Termux 终端库近一半文件是 2016 年后 Termux 的贡献者新写的，按 GPLv3-only 对待；GPLv2 与它、与 Apache-2.0 的库都不兼容，按用户的选择改为 AGPL-3.0-or-later，R3 消失。构建时生成开源许可页（Alpine 各包的许可证和 aports 提交、Android 库、链接进库的 crate 带原许可文件、许可证全文），设置页和 `appine-run --version` 显示法律声明；`fetch-rootfs` 下载时验 Alpine 的 GPG 签名 |
 
 ## 测量条件
 

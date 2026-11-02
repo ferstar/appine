@@ -48,7 +48,20 @@ HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
   thread structure and public methods are unchanged.
 - The Gradle build files are new.
 
-License: the termux-app repository is GPLv3. Its `LICENSE.md` says these two libraries
-use code from jackpal's Android-Terminal-Emulator under Apache 2.0, but does not say what
-license covers the files that Termux added later (such as sixel support). This is risk R3
-in the design doc and must be resolved before a public release.
+License: termux-app is released under the GPL 3.0 only (`licenses/termux-app-LICENSE.md`);
+its statement says these two libraries use code from jackpal's Terminal Emulator for Android
+under the Apache 2.0 (`licenses/jackpal-NOTICE.txt` is that project's NOTICE). About half of
+the vendored files were written by Termux contributors after 2016 and the rest were changed
+by them since, so the libraries are treated as GPL 3.0. appine itself is AGPL 3.0 or later,
+which can be combined with them (section 13 of both licenses), so risk R3 in the design doc
+no longer applies.
+
+## Open source licenses
+
+`NoticesTask` in `app/build.gradle.kts` writes the notices shown under Settings → Open source
+licenses into the assets (`notices/`): appine's AGPL notice, the Termux libraries, the packages
+of the bundled Alpine minirootfs (from its `lib/apk/db/installed`, with the aports commit of
+each), the Android libraries on the runtime classpath, every Rust crate linked into
+`libappine.so` with the license files it ships (only the MIT ones when MIT is one of the
+choices), SQLite, and the full texts in `licenses/`. The build fails when a new Android library
+is not in one of the groups it knows to be Apache 2.0; check its license before adding it.

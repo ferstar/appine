@@ -637,7 +637,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 `android/app/src/main/java/.../Rootfs.kt`、`SettingsActivity.kt`：
 
-1. 第一次运行时直接导入 Alpine Linux，不让用户选。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里。换成 Debian 13 要到设置里（[设置页，默认导入 Alpine](rounds/190-settings-default-alpine.md)）：debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份，固定在一个提交上），选了才下载，长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。它只有 GitHub 一个来源，国内直连很慢，暂不自己托管。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。原计划还要校验官方的 GPG 签名，没有做。Ubuntu 原来也可以选，第 190 轮按决定去掉了。
+1. 第一次运行时直接导入 Alpine Linux，不让用户选。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里。换成 Debian 13 要到设置里（[设置页，默认导入 Alpine](rounds/190-settings-default-alpine.md)）：debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份，固定在一个提交上），选了才下载，长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。它只有 GitHub 一个来源，国内直连很慢，暂不自己托管。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。Alpine 的 tarball 由 `scripts/fetch-rootfs` 在下载时验官方的 GPG 签名（[许可证](rounds/192-license.md)那一轮加的）；App 运行时只比固定的 sha256，不另外验签：摘要写在 App 里，验签不会更可信。Debian 的 debuerreotype 构建没有签名，只比 sha256。Ubuntu 原来也可以选，第 190 轮按决定去掉了。
 2. 以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里（改名之前写到盘上）。
 3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd，切到 `$HOME`）。每次启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的（与 setup-alpine 写的一样）：网络是宿主的，OpenRC 为要网络的服务拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 的 `rc_provide`：它加到每一个服务上，容易成环（[第 187 轮](rounds/187-app-init.md)）。每次开机之前，装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，用 `rc-update add osclock boot` 把 osclock 加进 boot：busybox 的 syslog `need clock`，OpenRC 默认用 hwclock 提供它，而 appine 没有 RTC、也设不了宿主的时间（§7），hwclock 必然失败；osclock 表示时间由操作系统管，正是这样。用户放了哪个时钟服务就不动。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1，App 改成指向 DNS 存根。
 4. 终端标签页以 `/etc/passwd` 里 root 的 shell 登录（`ConsolePty.LOGIN`）：Alpine 是 ash，Debian 是 bash，chsh 改过之后照样。
@@ -749,6 +749,16 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 
 ---
 
+### 13.4 许可证
+
+appine 按 **AGPL-3.0-or-later** 发布（[许可证](rounds/192-license.md)，之前是 MIT）。选它的原因：App 里 vendored 的 Termux 终端库是 GPLv3-only，发布 APK 本来就要按 GPLv3 提供整个 App 的源码；GPLv2 与它、与 Apache-2.0 的代码（jackpal、AndroidX、Kotlin 标准库）都不兼容；AGPLv3 都兼容，而且网络条款覆盖有人拿改过的核心（内核层和引擎）做在线服务（比如代码执行的沙箱）的情形。
+
+- **依赖**：Rust crate 都是宽松许可证，都能选 MIT（双许可的按 MIT 用）；Android 库都是 Apache-2.0；SQLite 是公有领域。都与 AGPLv3 兼容。
+- **声明**：设置里的"开源许可"列出 App 里所有第三方的东西和许可证全文，构建时生成（`NoticesTask`，见 `android/README.md`）：Rust crate 从 `cargo metadata` 找链接进 `libappine.so` 的（不含构建依赖、过程宏），各自发布的许可证文件原样附上；Android 库取运行时的依赖图，不在已知是 Apache-2.0 的组里时构建失败。设置页的这一行、`appine-run --version` 显示 AGPL 第 5 条要的法律声明（版权、不提供担保、许可证）。
+- **APK 里的 Alpine minirootfs**：与 appine 只是放在一起（mere aggregation），不受 appine 的许可证影响；但 busybox、apk-tools、alpine-baselayout、scanelf 是 GPL-2.0-only，musl-utils 有一部分是 GPL-2.0-or-later，发布 APK 时要提供它们的源码。声明里列出每个包的 aports 提交（安装数据库里的 `c:`）；发布时把这些包的源码随 appine 的源码一起放出。设置里下载的 Debian 由用户从 Docker 官方镜像的来源下载，不经 appine 分发。
+- **源码**：GPLv3、AGPLv3 都要求随 APK 提供完整的对应源码（包括静态链接的 crate）。仓库现在是私有的，发布之前要公开（或者附上提供源码的书面承诺）。
+- `scripts/fetch-rootfs` 下载之后用 Alpine 的发布密钥验签名（`scripts/alpine-ncopa.asc`），再比固定的 sha256。
+
 ## 14. 里程碑
 
 ### 14.1 计划
@@ -797,7 +807,7 @@ M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容�
 | fastmem 固定槽位（`host = base + guest`） | 39-bit VA 下进程数受限；4GB 槽位放不下 V8 的 cage；VMA 数量会触顶；guest 页大小被迫等于宿主页大小；宿主进程内没有 CoW 原语 |
 | Tier 0 用纯 C（加 SoftFloat）实现 SIMD&FP 语义 | 几百种指令形式，每种都要逐条对齐硬件的 NaN、舍入和标志位规则，工作量是数万行级别；原生单指令执行在同 ISA 宿主上天然逐位精确（M1a 决定） |
 | 以 dynarmic 为核心 | 页表不区分读写权限；内存回调拿不到精确 guest 状态；code cache 不能跨实例共享；同 ISA 场景下还要绕道 IR；上游仓库已经 404，活跃的 fork 只关心 A32 |
-| QEMU / Unicorn | GPLv2（QEMU 有些文件只许 GPLv2），与 appine 的 AGPLv3 不能结合；QEMU linux-user 的模型是每个 guest 进程对应一个宿主进程 |
+| QEMU / Unicorn | GPLv2（QEMU 有些文件只许 GPLv2），与 appine 的 AGPLv3 和 App 里 GPLv3、Apache-2.0 的代码都不能结合（第 192 轮之前 appine 是 MIT，同样冲突）；QEMU linux-user 的模型是每个 guest 进程对应一个宿主进程 |
 | 单宿主线程 + 绿色线程 / M:N | 前者无法并行，`make -j` 失去意义；后者要同时承担两边的复杂度 |
 | iSH fakefs 式（真实目录树 + 元数据库） | Android 上不能建硬链接；rename/unlink 时目录树与数据库难以保持一致 |
 | 磁盘镜像 + 进程内 ext4 驱动 | 要自己实现日志保证崩溃一致性；容量固定；数据缓存两份；无法共享宿主 page cache |
@@ -817,7 +827,7 @@ M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容�
 |---|---|---|---|
 | R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | 基本达到：gcc 编译 3.2 倍，`go build` 2.6 倍，Maven、Gradle 热构建 3.4–3.6 倍，起进程 1–1.3 倍，文件操作 1.6–1.7 倍；python 的解释循环仍约 4.6 倍，约一半是 TLB 检查；并行编译、并行读文件和原生一样扩展（8 核上 `xargs -P8` 编译 3.5 倍，`-P1` 3.3 倍），几个进程同时起进程不扩展：4 个 2.2–2.6 倍、8 个 4.0–4.3 倍（BKL）。历次测量见 [milestones.md 的 R1 测量记录](milestones.md#r1-的测量记录)，真机待测 | 起进程的路径继续拆 BKL（clone、execve、exit_group、缺页，只对同时起很多短命进程的负载有用）；mmap 改用每个 mm 自己的锁量过不需要（[8 核上的扩展性和 BKL 的交接](rounds/188-bkl-spinners.md)）。剩下的检查多在追指针的读上，代价是"guest 地址 → 算下标 → 取表项 → 读"这条依赖链：同一页反复访问时 CPU 能预测表项的地址，检查几乎不花时间，页一变就多出约 7 个周期；按访存点缓存上次的页、用第一个字节的页做下标、另存一份 addend 数组按下标直接取都试过，真实负载上没有收益：缩短链的排法都多了指令（见[交错访存共用检查](rounds/27-interleaved-checks.md)、[翻译后代码里的访存](rounds/30-translated-access.md)） |
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时（M5 按决定暂不提交） | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
-| R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | 发布前（M9 的许可证审计） | 只保留 jackpal 原版 Apache 2.0 代码，放弃后来新增的功能（如 sixel） |
+| R3 | Termux `terminal-emulator`/`terminal-view` 的许可证。仓库整体是 GPLv3，例外条款只提到 jackpal 的 Apache 2.0 代码，Termux 后来新增的文件归属不明确 | ✅ 已解决（[许可证](rounds/192-license.md)）：查了来源，近一半文件是 2016 年后 Termux 的贡献者新写的，其余也被改过，按 GPLv3 对待；appine 改为 AGPL-3.0-or-later，两者可以结合（各自的第 13 条），见 §13.4 | — |
 | R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | ✅ 已解决：M1a 在 Tier 0 用 CAS 模拟，M7 在 Tier 1 把 STXR 改写成两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 §4.5 | — |
 | R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | ✅ 已关闭（M4）：`apk add` 比原生慢约 7 倍，但只读的 `apk info` 也慢 6.3 倍，瓶颈在引擎而不在事务，见 [M4 结果](rounds/06-m4.md)。引擎变快之后提交成了文件操作的大头，M9 之前改成推迟最多 5 毫秒合并提交（§8.1） | — |
 | R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | ✅ 已解决：M5 在进入、退出翻译代码时保存、恢复 X18，但翻译代码执行期间宿主信号处理函数仍可能用到它；M7 改用宿主 X27 作临时寄存器，guest X27 存放在上下文里，翻译后的代码不再碰 X18，性能差别在误差范围内 | — |

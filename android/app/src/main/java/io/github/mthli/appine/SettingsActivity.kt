@@ -32,6 +32,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     private lateinit var reset: Row
     private lateinit var tier: Row
     private lateinit var keepAwake: Row
+    private lateinit var licenses: Row
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -101,6 +102,9 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         reset = Row(R.string.settings_reset) { onReset() }
         tier = Row(R.string.settings_tier) { onTier() }
         keepAwake = Row(R.string.settings_keep_awake, toggle = true) { service?.let { it.setKeepAwake(!it.keepAwake) } }
+        // AGPL 第 0、5 条的"适当的法律声明"：版权、不提供担保、许可证，以及看全文的地方
+        licenses = Row(R.string.settings_licenses) { startActivity(Intent(this, LicensesActivity::class.java)) }
+        licenses.set(getString(R.string.licenses_summary), true)
 
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -121,7 +125,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            for (row in listOf(distro, mirror, reset, keepAwake, tier)) addView(row.view)
+            for (row in listOf(distro, mirror, reset, keepAwake, tier, licenses)) addView(row.view)
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

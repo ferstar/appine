@@ -47,6 +47,8 @@
     <string name="keep_awake">Keep awake</string>
     <string name="allow_sleep">Allow sleep</string>
     <string name="kept_awake">%1$s · kept awake</string>
+    <string name="settings_licenses">Open source licenses</string>
+    <string name="licenses_summary">appine is free software under the GNU AGPL 3.0 or later, and comes with no warranty. Copyright © 2026 Matthew Lee. Source code: github.com/mthli/appine</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>

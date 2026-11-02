@@ -37,6 +37,12 @@
             android:exported="false"
             android:label="@string/settings" />
 
+        <activity
+            android:name=".LicensesActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:label="@string/settings_licenses" />
+
         <!-- 设计文档 §11.2：会话运行期间保持一个 specialUse 前台服务 -->
         <service
             android:name=".TerminalService"

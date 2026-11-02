@@ -392,6 +392,30 @@ class MachineTest {
     }
 
     /**
+     * 构建时生成的开源许可（设计文档 §13.4）打进了 APK：appine 自己的 AGPL 声明和全文、Termux
+     * 的库、Alpine 里 GPL 的包（带 aports 的提交）、Android 库、链接进库的 crate（不含过程宏）、
+     * 许可证全文；索引里的每个文件都在。
+     */
+    @Test
+    fun noticesCoverTheApp() {
+        val index = context.assets.open("notices/index.tsv").bufferedReader().readLines().map { it.split('\t') }
+        assertTrue(index.all { it.size == 3 })
+        fun text(title: String) = index.first { it[0].startsWith(title) }
+            .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
+        val titles = index.map { it[0] }
+        assertTrue(text("appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
+        assertTrue(text("Termux").contains("GPLv3 only"))
+        val alpine = text("Alpine Linux")
+        assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
+        assertTrue(text("Android libraries").contains("androidx.core:core:"))
+        assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
+        assertTrue(titles.any { it.startsWith("SQLite ") })
+        assertFalse("proc macros are not in the library", titles.any { it.startsWith("syn ") || it.startsWith("thiserror-impl ") })
+        assertTrue(text("GNU General Public License 2.0").contains("Version 2, June 1991"))
+        for (row in index) context.assets.open("notices/${row[2]}").close()
+    }
+
+    /**
      * 下载 Debian 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
      * apt-get update。要联网下载约 50 MB，默认跳过：
      * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`。

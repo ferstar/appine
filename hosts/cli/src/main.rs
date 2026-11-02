@@ -24,6 +24,12 @@ use std::process::ExitCode;
 use appine_kernel::errno::Errno;
 use appine_kernel::{DbtStats, ExitStatus, RunError, RunOptions, Terminal, Tier};
 
+/// `--version` 印的法律声明（AGPL 第 5 条：交互界面要显示版权、不提供担保和许可证）。
+const NOTICE: &str = "Copyright (C) 2026 Matthew Lee
+License AGPLv3+: GNU AGPL version 3 or later <https://gnu.org/licenses/agpl.html>.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.";
+
 const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
        appine-run --rootfs <dir> --import <rootfs.tar.gz>
 
@@ -73,7 +79,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--version" => {
-                println!("appine-run {}", env!("CARGO_PKG_VERSION"));
+                println!("appine-run {}\n{NOTICE}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
             "--stats" => stats = true,
