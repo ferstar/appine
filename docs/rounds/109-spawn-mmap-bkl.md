@@ -54,7 +54,7 @@
 **推迟项**：
 
 - mmap、munmap 仍持 BKL（复用之后每次约 1.3 µs、0.6 µs），R1 的退路（地址空间的操作改用每个 mm 自己的锁）没做。
-- Go、JVM 的大块映射（`go build` 里 mmap 每次约 18 µs，最长 4.5 ms）：软件页表要逐页填进去，Linux 是缺页时才填。
+- Go、JVM 的大块映射（`go build` 里 mmap 每次约 18 µs，最长 4.5 ms）：软件页表要逐页填进去，Linux 是缺页时才填。→ 1 MB 以上的映射改为第一次访问时按 2 MB 补表（M9 之前：页表按需建立），`go build`、Maven 的时间在噪声以内
 - clone 里 `Mm::fork` 约 10 µs（见上），exit_group 约 7 µs，execve 在锁里的部分约 5 µs；4 个同时起进程仍是原生的 2.4 倍多。
 - `go build` 的 openat 每次 10–21 µs，没有拆开看。→ 拆开看了（M9 之前：openat 的开销）：合计只占墙钟的 1.3%，平均数是被新建文件（55 µs，大头是宿主上建 object 和 SQLite）拉高的，没有便宜的改法，没改
 - 被打断的线程取 BKL 看信号（Maven 0.34 秒等锁），见上。
