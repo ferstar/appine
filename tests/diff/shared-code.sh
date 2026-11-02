@@ -6,6 +6,8 @@
 #   rewrite  父子进程先映射同一个文件，一起执行，之后子进程改写了自己那一份
 #   exec     子进程 exec 同一个程序，在同一个地址映射另一个文件
 #   dlopen   几个进程按不同的顺序 dlopen 两个库，同一个地址上是不同的库
+#   alone    子进程在一个地址映射一个文件、执行之后退出，组里只剩父进程，它在同一个地址映射
+#            另一个文件（各自一棵进程树：主进程在的时候组里不止它一个）
 # 文件的 ctime 离现在超过两秒才算可信（才能共用翻译），所以编译、写好文件之后先等一会儿
 set -e
 cd /tmp
@@ -185,8 +187,28 @@ static void case_dlopen(void)
     printf("dlopen: %d %d\n", results[0], results[1]);
 }
 
+/* alone：子进程映射 f1、执行完退出之后，组里只剩开组的父进程，它在同一格映射 f2，离开组时
+ * 留着组里的翻译：那一格里还有子进程翻译的 f1 的块 */
+static void case_alone(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        fn f = map_file("f1", 4);
+        _exit(f ? run(f) : 100);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    fn f = map_file("f2", 4);
+    printf("alone: child %d parent %d\n", WEXITSTATUS(status), f ? run(f) : 100);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "alone")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        case_alone();
+        return 0;
+    }
     if (argc == 3) { /* exec 出来的：在 argv[2] 那一格映射 argv[1] */
         fn f = map_file(argv[1], atoi(argv[2]));
         return f ? run(f) : 100;
@@ -213,4 +235,5 @@ printf '\040\000\200\122\300\003\137\326' > f1
 printf '\100\000\200\122\300\003\137\326' > f2
 truncate -s 4096 f1 f2
 sleep 3
+for i in 1 2 3; do ./shared alone; done
 ./shared

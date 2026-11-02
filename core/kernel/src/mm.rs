@@ -641,18 +641,13 @@ impl CodeGroup {
     /// 什么也不改。重叠的两段一致是说同一个版本的同一个文件，地址减去文件偏移也相同：动态
     /// 链接器先按整个文件的跨度映射，再把后面的段盖上去，同一个库的可执行映射先长后短。
     fn extend(&self, layout: &[appine_engine::DbtSource]) -> bool {
-        let same_file = |r: &appine_engine::DbtSource, s: &appine_engine::DbtSource| {
-            let (ri, si) = (r.id, s.id);
-            (ri[0], ri[1], ri[3], ri[4]) == (si[0], si[1], si[3], si[4])
-                && r.start.wrapping_sub(ri[2]) == s.start.wrapping_sub(si[2])
-        };
         let mut ranges = self.ranges.borrow_mut();
         let mut new = Vec::new();
         for s in layout {
             let mut covered = false;
             for r in ranges.iter() {
                 if r.start < s.start + s.len && s.start < r.start + r.len {
-                    if !same_file(r, s) {
+                    if !Self::same_file(r, s) {
                         return false;
                     }
                     covered |= r.start <= s.start && s.start + s.len <= r.start + r.len;
@@ -667,6 +662,29 @@ impl CodeGroup {
         }
         ranges.extend(new);
         true
+    }
+
+    /// 重叠的两段可信映射是同一个版本的同一个文件，地址减去文件偏移也相同。
+    fn same_file(r: &appine_engine::DbtSource, s: &appine_engine::DbtSource) -> bool {
+        let (ri, si) = (r.id, s.id);
+        (ri[0], ri[1], ri[3], ri[4]) == (si[0], si[1], si[3], si[4])
+            && r.start.wrapping_sub(ri[2]) == s.start.wrapping_sub(si[2])
+    }
+
+    /// `layout` 里与登记的一致的那些映射（重叠的登记都是同一段文件）：组里的实例在那里的块
+    /// 对这个地址空间有效。
+    fn consistent(&self, layout: &[appine_engine::DbtSource]) -> Vec<appine_engine::DbtSource> {
+        let ranges = self.ranges.borrow();
+        layout
+            .iter()
+            .filter(|s| {
+                ranges.iter().all(|r| {
+                    !(r.start < s.start + s.len && s.start < r.start + r.len)
+                        || Self::same_file(r, s)
+                })
+            })
+            .copied()
+            .collect()
     }
 
     /// 成员 `tag` 的全部可执行映射：可信的 `layout` 和私有的 `private`（[`Mm::exec_split`]）。
@@ -1366,8 +1384,11 @@ impl Mm {
         self.code_group = None;
         self.code_tag = 0;
         if group.members.get() == 1 {
-            // 只有它自己：留着原来的翻译，组不再接受新成员
+            // 只有它自己：留着原来的翻译，组不再接受新成员。登记过的映射里有别的成员（已经
+            // 退出、离开了的）翻译的块，它在同一段地址上映射的是别的文件（离开正是因为这个）：
+            // 那里的块作废，只留下与它的映射一致的
             group.closed.set(true);
+            group.space.retire_outside(&group.consistent(&layout));
             return;
         }
         group.members.set(group.members.get() - 1);
@@ -4145,6 +4166,19 @@ mod tests {
         // 有一段冲突时整个 layout 都不登记
         assert!(!group.extend(&[src(0x9000_0000, 0x1000, 9, 0), src(lib, 0x1000, 6, 0)]));
         assert_eq!(count(), 2);
+        // 最后一个成员离开组时留下块的范围：与登记的一致的、没登记过的留下，登记过的地址上
+        // 是别的文件的不留（那里的块是别的成员翻译的）
+        let (same, other, new) = (
+            src(lib, 0x18000, 5, 0),
+            src(lib + 0x30000, 0x1000, 6, 0x30000),
+            src(0x9000_0000, 0x1000, 9, 0),
+        );
+        let kept: Vec<_> = group
+            .consistent(&[same, other, new])
+            .iter()
+            .map(|s| (s.start, s.id[1]))
+            .collect();
+        assert_eq!(kept, [(lib, 5), (0x9000_0000, 9)]);
         // 不相交的新映射登记进来，登记满了就不再接受
         let more: Vec<_> = (0..CodeGroup::MAX_RANGES as u64)
             .map(|i| src(0x1_0000_0000 + i * 0x10000, 0x1000, 100 + i, 0))

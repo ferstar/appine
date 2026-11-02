@@ -1,6 +1,6 @@
 # M9 之前：透明代理：SO_ORIGINAL_DST、SO_MARK 和 owner 匹配（2026-11-02）
 
-← [M9 之前：页表按需建立，AddressSanitizer 能用了（2026-11-02）](179-demand-page-tables.md) · [索引](../milestones.md)
+← [M9 之前：页表按需建立，AddressSanitizer 能用了（2026-11-02）](179-demand-page-tables.md) · [索引](../milestones.md) · [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块（2026-11-02）](181-last-member-leaves.md) →
 
 起因是用户问 ShadowSocks、proxychains 能不能用。在 appine 里实测了 shadowsocks-rust 1.24（Alpine 3.24 没有 shadowsocks-libev）和 proxychains-ng 4.17：
 
@@ -50,4 +50,4 @@
 - 包在 OUTPUT 上被 `meta mark set` 改过的标记不带到之后的钩子上（INPUT 上读到的还是 socket 的），原来就是每条链各算各的。
 - 真正的 MPTCP 连接（两端都是 MPTCP）上 Linux 的 `SO_ORIGINAL_DST` 是 EOPNOTSUPP，appine 当作 TCP 回答。Go 1.24 起监听默认用 MPTCP，但客户端默认不用，接受的连接会退回 TCP，与这里一样。
 - 用 `sendto` 带 `MSG_FASTOPEN` 发起的 TCP 连接原来就不过 nat，这里也不登记。
-- **测试时发现的另一个问题**：跨命名空间那组的探测脚本里，一个 python3 进程偶发 SIGILL：日志总是先报它离开 `/usr/bin/python3.14` 的共用翻译（"an executable mapping differs from theirs"），接着在它自己的一段匿名内存里执行到数据（`undefined instruction 0x00000034`）。触发的条件是同一个程序的几个进程加载的扩展模块不同（服务端 import 了 select，客户端没有），同一个地址上映射的东西不一样。第 178 轮的二进制也有（8 次里 3 次），不是这一轮引入的，像是[同一个程序共用翻译](108-shared-translation.md)离开共用组时没断干净。下一轮查；`origdst` 组里各个角色都先 import 同一组模块，避开它。
+- **测试时发现的另一个问题**：跨命名空间那组的探测脚本里，一个 python3 进程偶发 SIGILL：日志总是先报它离开 `/usr/bin/python3.14` 的共用翻译（"an executable mapping differs from theirs"），接着在它自己的一段匿名内存里执行到数据（`undefined instruction 0x00000034`）。触发的条件是同一个程序的几个进程加载的扩展模块不同（服务端 import 了 select，客户端没有），同一个地址上映射的东西不一样。第 178 轮的二进制也有（8 次里 3 次），不是这一轮引入的，像是[同一个程序共用翻译](108-shared-translation.md)离开共用组时没断干净。下一轮查；`origdst` 组里各个角色都先 import 同一组模块，避开它。 → 是组里最后一个成员离开时留着的翻译里有别的成员翻译的块，修了（M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块）
