@@ -36,6 +36,10 @@ fn cbz_x0(from: u64, to: u64) -> u32 {
     0xb400_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5)
 }
 
+fn cbnz_x0(from: u64, to: u64) -> u32 {
+    0xb500_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5)
+}
+
 fn adr_x30(from: u64, to: u64) -> u32 {
     let off = (to as i64 - from as i64) as u32;
     0x1000_001e | (off & 3) << 29 | ((off >> 2) & 0x7_ffff) << 5
@@ -438,6 +442,88 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
     });
     let result = finished.recv_timeout(std::time::Duration::from_secs(60));
     assert!(result.is_ok(), "翻译表被占满，插入找不到空位");
+}
+
+/// 执行到 svc，被打断（整体清空要别的线程停下）时接着执行。
+fn run_to_svc(dbt: &mut Dbt, cpu: &mut Cpu) {
+    loop {
+        match dbt.run(cpu) {
+            Exit::Svc { imm: 0 } => return,
+            Exit::Kick => {}
+            e => panic!("unexpected exit {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn flushing_waits_for_threads_running_and_entering_the_same_space() {
+    if Dbt::new().is_none() {
+        return;
+    }
+    // 整体清空要等其余线程都停下（park）或者离开翻译后的代码：一半的线程一直在循环里转，
+    // 要打断才停；一半频繁进出。等不到（卡住）算失败。清空之后要求清空的线程先翻译另外
+    // 几段代码，盖掉代码缓存开头的旧翻译：清空时还有线程在执行旧的翻译，就会执行到它们，
+    // 算错或者崩溃。所有线程的代码一样（共用翻译），圈数放在 x0 里
+    const OTHER: u64 = CODE + 0x100;
+    let program = |g: &mut Guest| {
+        g.code(CODE, &[SUB_X0_1, cbnz_x0(CODE + 4, CODE), movz_x0(7), SVC]);
+        for i in 0..16u16 {
+            let at = OTHER + 0x10 * u64::from(i);
+            g.code(at, &[movz_x0(100 + i), ADD_X1_1, SVC]);
+        }
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut dbt = Dbt::new().unwrap();
+        let space = dbt.space().clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|i| {
+                let (space, stop) = (space.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut dbt = Dbt::attach(&space, 0).unwrap();
+                    let mut g = Guest::new();
+                    program(&mut g);
+                    let mut runs = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        g.cpu.state_mut().pc = CODE;
+                        g.cpu.state_mut().x[0] = if i % 2 == 0 { 200_000 } else { 1 };
+                        run_to_svc(&mut dbt, &mut g.cpu);
+                        assert_eq!(g.cpu.state().x[0], 7);
+                        runs += 1;
+                    }
+                    (runs, dbt.stats().flushes)
+                })
+            })
+            .collect();
+        let mut g = Guest::new();
+        program(&mut g);
+        for _ in 0..200 {
+            dbt.flush();
+            for i in 0..16u16 {
+                g.cpu.state_mut().pc = OTHER + 0x10 * u64::from(i);
+                run_to_svc(&mut dbt, &mut g.cpu);
+                assert_eq!(g.cpu.state().x[0], u64::from(100 + i));
+            }
+            g.cpu.state_mut().pc = CODE;
+            g.cpu.state_mut().x[0] = 1;
+            run_to_svc(&mut dbt, &mut g.cpu);
+            assert_eq!(g.cpu.state().x[0], 7);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut flushes = dbt.stats().flushes;
+        for w in workers {
+            let (runs, n) = w.join().unwrap();
+            assert!(runs > 0);
+            flushes += n;
+        }
+        done.send(flushes).unwrap();
+    });
+    let flushes = finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("整体清空等不到别的线程停下，或者有线程出错");
+    // 每次要求清空都恰好清空一次（由先看到的线程做）
+    assert_eq!(flushes, 200);
 }
 
 #[test]

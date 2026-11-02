@@ -294,8 +294,6 @@ struct appine_dbt {
     pthread_cond_t flushed; /* 整体清空结束（或者实例作废） */
     struct appine_dbt_thread *threads; /* 挂着的线程 */
     unsigned nthreads;                 /* 它们的个数（原子读） */
-    unsigned running;  /* 正在 dbt_run 里的线程数（原子） */
-    unsigned parked;   /* 其中停下来等整体清空的（原子） */
     bool flushing;     /* 有线程在等别人停下来整体清空（原子读） */
     bool flush_wanted; /* 要整体清空：调用方要求，或者作废时放不下转发桩（原子读） */
     struct appine_dbt_stats *st; /* 持锁的线程的统计：翻译、作废记在它头上 */
@@ -333,6 +331,7 @@ struct appine_dbt_thread {
     unsigned tag; /* 线程所在的地址空间在组里的标签，0 表示不在组里（TAG_SHIFT） */
     struct appine_dbt_thread *next; /* d->threads 链表，持有 d->lock 时读写 */
     struct appine_cpu *cpu; /* 正在 dbt_run 里运行的 cpu，否则为 NULL（原子）：整体清空时打断它 */
+    bool parked;            /* 停在 park 里等整体清空（持有 d->lock 时读写） */
     uint64_t generation;    /* jc、rs 对应的 d->generation */
     struct slot *jc;        /* 间接分支的跳转缓存，直接映射 */
     bool jc_dirty;
@@ -3878,6 +3877,7 @@ struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d, unsigned tag)
     t->d = d;
     t->tag = tag;
     t->cpu = NULL;
+    t->parked = false;
     t->stats = (struct appine_dbt_stats){0};
     if (t->jc_dirty)
         clear_jump_cache(t);
@@ -4161,12 +4161,21 @@ void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_sou
 }
 
 /* 停下来等别人整体清空完。持有锁，等待期间放开 */
-static void park(struct appine_dbt *d)
+static void park(struct appine_dbt *d, struct appine_dbt_thread *self)
 {
-    __atomic_fetch_add(&d->parked, 1, __ATOMIC_SEQ_CST);
+    self->parked = true;
     while (__atomic_load_n(&d->flushing, __ATOMIC_ACQUIRE) && !d->poisoned)
         pthread_cond_wait(&d->flushed, &d->lock);
-    __atomic_fetch_sub(&d->parked, 1, __ATOMIC_SEQ_CST);
+    self->parked = false;
+}
+
+/* 除了 self 还有在 dbt_run 里、没有停在 park 里的线程。持有锁 */
+static bool others_running(const struct appine_dbt *d, const struct appine_dbt_thread *self)
+{
+    for (const struct appine_dbt_thread *t = d->threads; t; t = t->next)
+        if (t != self && !t->parked && __atomic_load_n(&t->cpu, __ATOMIC_SEQ_CST))
+            return true;
+    return false;
 }
 
 /*
@@ -4174,14 +4183,18 @@ static void park(struct appine_dbt *d)
  * 清空。持有锁进入和返回，等待期间放开锁，别的线程才走得到 park。已经有线程在做时一起
  * 停下等它。
  *
- * 先置 flushing 再看各线程的 cpu，线程那边先登记 cpu、再计入 running、再看 flushing：
- * 要么这里打断得到它，要么它看到 flushing 自己停下。等待时先读 parked 再读 running：
- * 停下的线程在清空结束之前不会离开，这样算出来的"还在跑的"只会多不会少。
+ * 先置 flushing 再看各线程的 cpu，线程那边先登记 cpu、再看 flushing：要么这里打断得到它，
+ * 要么它看到 flushing 自己停下。等的时候持锁逐个看各线程的 cpu 和 parked：parked 只在
+ * 持锁时改，停下的线程在清空结束之前不会离开。
+ *
+ * 原来用两个共用的计数（在 dbt_run 里的、停下的），每次进出 dbt_run 都要原子地改一次：
+ * 同一个地址空间的几个线程频繁进出（每次系统调用都是一次）时，那个缓存行在几个核之间
+ * 来回，8 个线程同时读时钟每次从 94 纳秒变成 844 纳秒。现在进出只写线程自己的 cpu。
  */
 static void flush_world(struct appine_dbt *d, struct appine_dbt_thread *self)
 {
     if (__atomic_load_n(&d->flushing, __ATOMIC_RELAXED)) {
-        park(d);
+        park(d, self);
         return;
     }
     __atomic_store_n(&d->flushing, true, __ATOMIC_SEQ_CST);
@@ -4190,15 +4203,11 @@ static void flush_world(struct appine_dbt *d, struct appine_dbt_thread *self)
         if (t != self && c)
             appine_cpu_kick(c);
     }
-    unlock_dbt(d);
-    for (;;) {
-        unsigned parked = __atomic_load_n(&d->parked, __ATOMIC_SEQ_CST);
-        unsigned running = __atomic_load_n(&d->running, __ATOMIC_SEQ_CST);
-        if (running - parked <= 1)
-            break;
+    while (others_running(d, self)) {
+        unlock_dbt(d);
         sched_yield();
+        lock_dbt(d, &self->stats);
     }
-    lock_dbt(d, &self->stats);
     flush_locked(d);
     __atomic_store_n(&d->flushing, false, __ATOMIC_SEQ_CST);
     pthread_cond_broadcast(&d->flushed);
@@ -4240,7 +4249,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                      __atomic_load_n(&d->flush_wanted, __ATOMIC_SEQ_CST))) {
             lock_dbt(d, &t->stats);
             if (d->flushing)
-                park(d);
+                park(d, t);
             else if (d->flush_wanted)
                 flush_world(d, t);
             unlock_dbt(d);
@@ -4424,9 +4433,8 @@ enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *
     if (UNLIKELY(d->poisoned))
         return appine_cpu_run(c);
     appine_sync_dit(c);
-    /* 先登记 cpu、再计入 running（见 flush_world） */
+    /* 先登记 cpu、再看 flushing（见 flush_world） */
     __atomic_store_n(&t->cpu, c, __ATOMIC_SEQ_CST);
-    __atomic_fetch_add(&d->running, 1, __ATOMIC_SEQ_CST);
     enum appine_exit r = appine_guard_run(dbt_run, t, c);
     if (UNLIKELY(r == APPINE_EXIT_HOST_FAULT)) {
         /* guard 已经放开了持有的锁。停着等清空的线程不能一直等下去 */
@@ -4437,7 +4445,6 @@ enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *
         pthread_mutex_unlock(&d->lock);
         template_clear(false);
     }
-    __atomic_fetch_sub(&d->running, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&t->cpu, NULL, __ATOMIC_RELEASE);
     return r;
 }
