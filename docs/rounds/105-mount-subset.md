@@ -28,7 +28,7 @@
 - 仓库里的目录不能 bind（`mount --rbind /dev`、`--bind /run`、把 `/root` 这类目录共享进 chroot），没有 tmpfs：第二档，仓库的节点也要带上挂载，当前目录、打开文件记的路径、inotify、AF_UNIX 的路径名都要跟着改（[第 69 轮](69-glibc-probe.md)）。chroot 进去之后 `/dev` 里的设备节点要自己复制过去（`cp -a /dev/null …`），`/dev/ptmx` 指向 `pts/ptmx`。 → 仓库里的目录、文件的 bind 已补上（M9 之前：仓库里的目录 bind）；tmpfs 也补上了（M9 之前：tmpfs）
 - `MS_MOVE`、pivot_root、新的挂载接口（fsopen、open_tree、move_mount、mount_setattr 等）都没有，util-linux 的 mount 在 ENOSYS 之后退回 mount(2)。LTP 里它们的测试和要 loop 设备的 mount、umount 测试照旧失败（loop 设备、块设备也没有）。 → `MS_MOVE`、pivot_root 已补上（M9 之前：仓库里的目录 bind）；新的挂载接口、loop 设备仍没有；open_tree、move_mount、mount_setattr 有了（M9 之前：open_tree、move_mount 和 mount_setattr），fsopen 这一组仍没有
 - devpts 的各个挂载共用一套终端：Linux 上新的实例有自己的终端（编号从 0 开始），`/dev/ptmx` 按它旁边的 `pts` 找实例。挂载选项都不看（procfs 的 hidepid、subset，devpts 的 mode、gid、ptmxmode 等），mountinfo 的超级块选项总是开机时的那几个。→ devpts 已经按实例，选项也看了（M9 之前：devpts 的实例）；procfs 的选项仍不看
-- 超级块的标志不分开记：重新挂载只改这一个挂载（Linux 不带 bind 时改的是超级块，挂在别处的同一个实例也跟着变）；cgroup2 只能只读。
+- 超级块的标志不分开记：重新挂载只改这一个挂载（Linux 不带 bind 时改的是超级块，挂在别处的同一个实例也跟着变）；cgroup2 只能只读。→ cgroup2 能可写地挂了（M9 之前：可写地挂 cgroup2）；超级块的标志仍不分开记
 - 传播类型不模拟：shared、slave 设置成功，但挂载之间没有传播，mountinfo 里没有 `shared:N` 这些可选字段。没有挂载命名空间（§6），所有进程看到同一张挂载表。 → 挂载命名空间已补上（M9 之前：挂载命名空间）；传播类型仍不模拟
 - 终端从设备的打开文件不记得经由哪个 devpts 挂载打开的：`/proc/<pid>/fd/<n>` 跟随之后按开机时的那个算，卸下时也不算它在用。→ 已改（M9 之前：devpts 的实例）
 - `MNT_EXPIRE` 的标记在之后有人用过这个挂载时不清掉（Linux 的 `mntput` 清掉）。

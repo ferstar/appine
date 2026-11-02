@@ -61,6 +61,6 @@
 - 只有单播路由，表的编号不大于 255；没有多路径、`onlink`、blackhole 这些；没有自定义规则（`ip rule`）。开机时的命名空间里只能经由虚拟设备加路由，删宿主的路由仍是 EOPNOTSUPP。
 - 新命名空间里的 lo 不能改名（Linux 停用着时可以）；6.1 里启用着的接口不能改名（6.2 起可以）；`promote_secondaries`、`keep_addr_on_down` 只记下（前者不提升，后者关接口时仍去掉地址）。
 - bridge 的参数（STP、VLAN 过滤、组播）只有默认值，`IFLA_INFO_DATA` 接受但不起作用；bridge 的 FDB、端口的参数没有。
-- `/sys/class/net` 按读者的网络命名空间，不是挂载 sysfs 的进程的；`/proc/sys/net` 下只有上面这些，`ipv4/` 下别的（`tcp_*` 等）、`netfilter/`、`unix/` 都没有。 → `core/`、`ipv4/`、`ipv6/`、`unix/` 下的补齐了（只记下值，M9 之前：网络命名空间的 sysctl 补齐）；`netfilter/` 仍没有net 的 sysctl 文件属于 root，不是命名空间属主里的 root（用户命名空间里的 root 写不了）。
+- `/sys/class/net` 按读者的网络命名空间，不是挂载 sysfs 的进程的；`/proc/sys/net` 下只有上面这些，`ipv4/` 下别的（`tcp_*` 等）、`netfilter/`、`unix/` 都没有。 → `core/`、`ipv4/`、`ipv6/`、`unix/` 下的补齐了（只记下值，M9 之前：网络命名空间的 sysctl 补齐）；`netfilter/` 仍没有；net 的 sysctl 文件属于 root，不是命名空间属主里的 root（用户命名空间里的 root 写不了）。
 - `ping_group_range` 只记下，不限制建 ping socket。
 - `RTM_NEWNSID` 仍是 EOPNOTSUPP。

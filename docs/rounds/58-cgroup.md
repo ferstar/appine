@@ -39,6 +39,6 @@
 
 **推迟项**：
 
-- 只有这 37 个文件：没有 memory.stat、memory.numa_stat、memory.reclaim、io.*、hugetlb.*、rdma.*、misc.*、cgroup.kill 和压力（PSI）的文件，`/proc/cgroups` 只列这五个控制器。→ memory.stat 已补上（M9 之前：cgroup 的 memory.stat）；其余仍没有；cgroup.kill 也补上了（M9 之前：cgroup 树：建子 cgroup、迁移进程）
+- 只有这 37 个文件：没有 memory.stat、memory.numa_stat、memory.reclaim、io.*、hugetlb.*、rdma.*、misc.*、cgroup.kill 和压力（PSI）的文件，`/proc/cgroups` 只列这五个控制器。→ memory.stat 已补上（M9 之前：cgroup 的 memory.stat）；cgroup.kill 也补上了（M9 之前：cgroup 树：建子 cgroup、迁移进程）；memory.numa_stat、memory.reclaim、io.*、hugetlb.*、rdma.*、misc.* 和压力（PSI）的文件仍没有，`/proc/cgroups` 仍只列这五个控制器
 - 只读，不能建子 cgroup、迁移进程、设置限制：要按 cgroup 管资源的程序（systemd、容器运行时）用不了，它们本来也在 D 档（§1.2）。→ 能建子 cgroup、迁移进程了，开机时的挂载也改成可写的（M9 之前：cgroup 树：建子 cgroup、迁移进程）；限制只记下，还不起作用
 - `memory.peak` 只是 OOM killer 量的时候（有线程运行时每 20 毫秒）和读 memory.current、memory.peak 时取到的最大值，两次之间的峰值看不到。

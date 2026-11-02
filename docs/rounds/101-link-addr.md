@@ -37,7 +37,7 @@
 
 **推迟项**：
 
-- 链路消息没有 Linux 的另外二十多个属性：`IFLA_MIN_MTU`、`IFLA_MAX_MTU`、GSO、GRO 的参数，`IFLA_MAP`、`IFLA_XDP`，`IFLA_AF_SPEC`（inet、inet6 的设备参数和统计）等。`ip -d link` 少了 minmtu、maxmtu 这些。
+- 链路消息没有 Linux 的另外二十多个属性：`IFLA_MIN_MTU`、`IFLA_MAX_MTU`、GSO、GRO 的参数，`IFLA_MAP`、`IFLA_XDP`，`IFLA_AF_SPEC`（inet、inet6 的设备参数和统计）等。`ip -d link` 少了 minmtu、maxmtu 这些。→ bridge、veth、dummy 的链路消息带 `IFLA_MIN_MTU`、`IFLA_MAX_MTU` 了（M9 之前：有状态的网卡）；宿主接口的仍没有，别的属性也仍没有
 - qdisc、收发队列数是固定的：宿主上实际的 qdisc（手机的 wlan0 多半是 mq 或者 fq_codel）拿不到。
 - 地址都是永久的、创建时刻是 0：分不出 DHCP、SLAAC 得到的有期限的地址（[if_inet6](85-inet6-opath-exit.md) 那一轮的同一条推迟项）；广播地址是按前缀算的，宿主设了别的广播地址时不对。
 - 单条的 `RTM_GETADDR`（IPv6 有）没有做，是 EOPNOTSUPP。

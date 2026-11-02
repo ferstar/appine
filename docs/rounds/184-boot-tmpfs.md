@@ -50,5 +50,5 @@ devfs 现在打印 "Remounting tmpfs on /dev"，按它的选项重新挂载（`n
 
 **推迟项**：
 
-- seedrng 仍然失败：`/dev/urandom` 的 `RNDADDENTROPY` 是 ENOTTY（下一轮）。
+- seedrng 仍然失败：`/dev/urandom` 的 `RNDADDENTROPY` 是 ENOTTY（下一轮）。→ 已补上（M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl）
 - mdev 的 `/proc/sys/kernel/hotplug` 写不了、没有 `/sys/dev`：appine 没有热插拔，不做，文档里说明。

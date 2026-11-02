@@ -26,4 +26,4 @@
 
 **推迟项**：
 
-- 主设备上的 `TIOCGPTPEER`（由主设备直接打开从设备）仍是 ENOTTY：glibc 的 openpty、systemd 在失败时退回按名字打开。
+- 主设备上的 `TIOCGPTPEER`（由主设备直接打开从设备）仍是 ENOTTY：glibc 的 openpty、systemd 在失败时退回按名字打开。→ 已补上（M9 之前：devpts 的实例）
