@@ -8,9 +8,11 @@ rm -rf prot && mkdir prot && chmod 755 prot
 echo hi > prot/target && chmod 644 prot/target
 
 echo "== sysctl"
-for f in fs/protected_symlinks fs/protected_hardlinks kernel/panic kernel/unprivileged_bpf_disabled; do
+for f in fs/protected_symlinks fs/protected_hardlinks kernel/unprivileged_bpf_disabled; do
     echo "$f: $(cat /proc/sys/$f) $(stat -c %a /proc/sys/$f)"
 done
+# kernel.panic 的值是宿主的配置（CI 的 runner 是 -1），只比权限和格式
+echo "kernel/panic: $(stat -c %a /proc/sys/kernel/panic) $(grep -cxE -- '-?[0-9]+' /proc/sys/kernel/panic)"
 su -s /bin/sh nobody -c 'cat /proc/sys/fs/protected_symlinks' 2>&1 | sed 's/^cat: //'
 
 echo "== protected_symlinks"

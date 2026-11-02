@@ -60,7 +60,7 @@
 ## 测试
 
 - 新的差分测试组 `protected`（带 `CAP_SYS_ADMIN`），两个执行层都与原生逐字相同：
-  - 四个 sysctl 的值和权限，nobody 也能读。
+  - 四个 sysctl 的值和权限，nobody 也能读。`kernel.panic` 只比权限、是不是一个整数：它的值是宿主的配置，推送后 CI 的 runner 上是 -1（colima 是 0），第一次推送时这一组因此失败。
   - **protected_symlinks**：
     - root 跟随 /tmp 里 nobody 的链接是 EACCES，`stat -L` 也是。
     - 经由它到目录里的文件（中间的组件）可以，readlink、lstat 可以。
