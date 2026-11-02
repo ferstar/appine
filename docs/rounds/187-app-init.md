@@ -24,10 +24,13 @@
 ### TerminalService
 
 - **开机**：内核启动之后，在单独的线程（`appine-boot`）上 `Native.boot`。OpenRC 起服务要一会儿，不占 `worker`，也不挡标签页。第 184 轮之后 `/run`、`/dev` 已经挂好，OpenRC 不会盖住标签页正在用的东西，标签页不必等开机。
-- **OpenRC 的配置**：启动内核之前，`/etc/rc.conf.d/appine.conf` 不存在时写一个，内容是 `rc_provide="loopback net"`（`Rootfs.ensureOpenRcConfig`）。
-  - 调研时发现，只 `rc-update add nginx` 时，nginx 要 `net`，OpenRC 去拉起 networking；没有 `/etc/network/interfaces` 时它失败，nginx 也起不来。
-  - 网络是宿主的，总是通的，由 appine 提供 `net`、`loopback`。
-  - 已经装好的 rootfs 也会补上，用户改过的不动；没装 OpenRC 时没人读它。
+- **网络的配置**：启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的（`auto lo`、`iface lo inet loopback`，`Rootfs.ensureNetworkConfig`），与 setup-alpine 写的一样。
+  - 调研时发现，只 `rc-update add nginx` 时，nginx 要 `net`，OpenRC 去拉起 networking；没有这个文件时它失败，nginx 也起不来。
+  - 已经装好的 rootfs 也会补上，用户改过的不动；没装 OpenRC、ifupdown 时没人读它。
+  - 一开始用的是 docker 镜像常见的 `/etc/rc.conf.d/appine.conf`：`rc_provide="loopback net"`。
+  - 实测它有两个问题：rc.conf 里的 `rc_provide` 加到每一个服务上；loopback 本来就是一个真服务，每次开机都报 "loopback is the name of a real and virtual service"。
+  - 想再提供 `clock`（busybox 的 syslog `need clock`，于是拉起 hwclock）时，依赖成了环，syslog、crond、nginx 都起不来。
+  - 换成 interfaces 之后，networking 照常启动，这些问题都没有了。
 - **轮询**：原来每 2 秒取一次监听事件，现在同时取关机请求和进程数（都要取 BKL，在 `worker` 上）：
   - `reboot` → `restart`：结束所有会话，关机，启动一个新的内核。Activity 先显示"正在重启"，新内核起来之后开一个新标签页。
   - `poweroff`、`halt` → `exitAll`。
@@ -60,7 +63,7 @@
   - `boot` 之后 `processes` 至少 1，sysinit 运行了。
   - guest 的 `poweroff` 之后 `takePower` 是 `POWER_OFF`，再取是 `POWER_NONE`。
   - `shutdown` 不到 10 秒，之后 `processes` 是 0；下一个内核看到 shutdown 那一行。
-  - `ensureOpenRcConfig` 写的配置在。
+  - `ensureNetworkConfig` 写的 `/etc/network/interfaces` 在。
   - 最后恢复原来的 inittab。
 - 手动（同一个模拟器上的 App，用 `adb shell input` 输入）：在 inittab 里加了 `::once:/bin/sleep 3600` 和 `::shutdown:/bin/touch /root/down`。
   - guest 里 `reboot`：标签页换成新内核上的新会话，`/root/down` 有了（关机的命令运行了），`sleep 3600` 在新内核里运行。
@@ -68,9 +71,13 @@
   - 重新打开 App，执行 `poweroff`：3 秒内服务退出，`/root/down` 又有了。修上面那个问题之前，22 秒后服务还在，通知是"1 session running"。
   - 杀掉 `sleep`、关掉标签页：5 秒内服务退出（没有 guest 进程了）。
   - 最后恢复了模拟器里的 inittab。
-- 两个 clippy、格式通过；App 的 Kotlin 编译通过。
+- 两个 clippy、格式通过；App 的 Kotlin 编译通过。整个 MachineTest（13 个）在模拟器上跑过：只有 `downloadedDistributionsRun` 默认跳过（要联网，没带 `network=true` 时 assumeTrue 不成立），别的都通过。
+
+- 手动（OpenRC 的仓库，`appine-run --init`）：只有 lo 的 interfaces 时 crond、sshd、redis、nginx 和测试用的服务都起来了，networking 是 started，开机日志里只剩 hwclock 的 `[ !! ]`。用 `rc_provide="loopback net"` 时也都起来了，但多一行 "real and virtual service" 的报错；再加 `clock` 时 crond、nginx 起不来。
+- 用了 PostgreSQL 的那次：nginx、PostgreSQL、Redis、sshd、crond 都起来了，curl、psql、redis-cli 都通；`appine-run` 退出时它们逐个被 OpenRC 停下（开机、会话、关机一共 3 秒）。
 
 **推迟项**：
 
+- hwclock：busybox 的 syslog `need clock`，OpenRC 用 hwclock 提供 clock。它读不到 RTC、也不能设时间（宿主的时间），开机日志里有一个 `[ !! ]`，不影响别的服务；`rc-update add osclock boot` 可以换掉它。
 - 熄屏之后继续运行要的 `PARTIAL_WAKE_LOCK`（设计文档 §11.2）还没做：在后台跑着的服务熄屏后可能被暂停。
 - 开机的输出只在 `/var/log/boot.log` 里，App 不提示有服务启动失败。

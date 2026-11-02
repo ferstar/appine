@@ -182,7 +182,7 @@ class MachineTest {
     /**
      * 按 inittab 开机、关机（设计文档 §6、§11.2）：开机之后 once 的命令在跑，guest 的
      * `poweroff` 是关机的请求，[Native.shutdown] 运行关机的命令、结束所有进程、释放句柄。
-     * 启动之前写好 OpenRC 的配置。
+     * 启动之前写好只有回环接口的 /etc/network/interfaces。
      */
     @Test
     fun bootsAndShutsDownByInittab() {
@@ -195,7 +195,7 @@ class MachineTest {
             "::shutdown:/bin/sh -c 'echo shutdown >> /tmp/inittab-order'\n"
         Native.writeFile(store, "/etc/inittab", inittab.toByteArray(), 420, true)
         try {
-            Rootfs.ensureOpenRcConfig(context)
+            Rootfs.ensureNetworkConfig(context)
             val machine = start(1)
             Native.boot(machine)
             assertTrue(Native.processes(machine) >= 1)
@@ -210,7 +210,7 @@ class MachineTest {
             assertEquals(0, Native.processes(machine))
             val after = start(1)
             assertEquals("sysinit\nshutdown\n" to 0, sh(after, "cat /tmp/inittab-order"))
-            assertTrue(sh(after, "cat /etc/rc.conf.d/appine.conf").first.contains("rc_provide=\"loopback net\""))
+            assertTrue(sh(after, "cat /etc/network/interfaces").first.contains("iface lo inet loopback"))
         } finally {
             machines.forEach(Native::stop)
             Native.writeFile(store, "/etc/inittab", original, 420, true)

@@ -239,15 +239,15 @@ internal object Rootfs {
         Native.writeFile(store, path, text.toByteArray(), 420 /* 0644 */, overwrite)
 
     /**
-     * OpenRC 的配置（每次启动内核之前，没有时才写，用户改过的不动）：网络是宿主的，总是通的
-     * （设计文档 §10），由 appine 提供 `net`、`loopback`。不然要网络的服务（nginx 等）去拉起
-     * networking，没有 `/etc/network/interfaces` 时它失败，服务也起不来。没装 OpenRC 时这个
-     * 文件没人读。
+     * 只有回环接口的 `/etc/network/interfaces`（每次启动内核之前，没有时才写，用户改过的不动），
+     * 与 setup-alpine 写的一样。网络是宿主的（设计文档 §10），要网络的服务（nginx 等）由 OpenRC
+     * 拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 里的 `rc_provide`：它
+     * 加到每一个服务上，再提供 `clock` 就成了环。没装 OpenRC、ifupdown 时这个文件没人读。
      */
     @Throws(IOException::class)
-    fun ensureOpenRcConfig(context: Context) = write(
-        store(context).path, "/etc/rc.conf.d/appine.conf",
-        "# appine: the network is the host's and always up\nrc_provide=\"loopback net\"\n",
+    fun ensureNetworkConfig(context: Context) = write(
+        store(context).path, "/etc/network/interfaces",
+        "auto lo\niface lo inet loopback\n",
         overwrite = false,
     )
 

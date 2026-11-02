@@ -260,7 +260,7 @@ class TerminalService : Service() {
                     })
                     mirrorThread = thread(name = "appine-mirrors") { Rootfs.chooseMirror(this, distro) }
                 }
-                Rootfs.ensureOpenRcConfig(this)
+                Rootfs.ensureNetworkConfig(this)
                 Native.start(Rootfs.store(this).path, 1)
             }
             main.post {
