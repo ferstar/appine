@@ -311,6 +311,38 @@ internal object Rootfs {
         overwrite = false,
     )
 
+    /**
+     * Alpine 上把 App 带着的 doas 包放进仓库（`/var/cache/appine/doas.apk`）：普通用户第一次成为
+     * 登录账号时登录脚本离线装它（设计文档 §11.1）。每次启动内核之前写，App 升级之后换成新的。
+     */
+    @Throws(IOException::class)
+    fun ensureLoginTools(context: Context) {
+        if (installed(context) != Distro.ALPINE) return
+        val data = context.assets.open("doas.apk").use { it.readBytes() }
+        Native.writeFile(store(context).path, "/var/cache/appine/doas.apk", data, 420 /* 0644 */, true)
+    }
+
+    /** `/etc/passwd` 里的一个账号。 */
+    data class Account(val name: String, val uid: Int)
+
+    /**
+     * 能作为登录账号的普通用户：UID 1000–65533、有登录 shell（不是 nologin、false），按 UID 排，
+     * 第一个就是"自动"登录的那个。规则与 assets 的 `login.sh` 一样。读不到时是空的。
+     */
+    fun regularAccounts(context: Context): List<Account> {
+        val passwd = runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull()
+            ?: return emptyList()
+        return String(passwd).lines().mapNotNull { line ->
+            val f = line.split(':')
+            if (f.size < 7) return@mapNotNull null
+            val shell = f[6]
+            val uid = f[2].toIntOrNull() ?: return@mapNotNull null
+            if (shell.isEmpty() || shell.endsWith("/nologin") || shell.endsWith("/false")) return@mapNotNull null
+            if (uid !in 1000..65533) return@mapNotNull null
+            Account(f[0], uid)
+        }.sortedBy { it.uid }
+    }
+
     /** 包管理器的源：写在哪个文件里，内容是什么。 */
     private fun sources(distro: Distro, mirror: String): Pair<String, String> = when (distro) {
         Distro.ALPINE -> "/etc/apk/repositories" to

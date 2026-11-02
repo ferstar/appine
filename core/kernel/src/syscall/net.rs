@@ -1448,6 +1448,7 @@ pub(crate) fn send(
                 crate::debug::log(format_args!("DNS stub: query failed: errno {e}"));
                 servfail(&query)
             });
+
         if let Socket::Inet(s) = &mut *sock.borrow_mut() {
             s.answers.push_back(answer);
             s.answered += 1;
@@ -2685,6 +2686,12 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         }
     }
     let host_fd = match &*sock.borrow() {
+        // DNS 存根的回答在我们自己的队列里，先于宿主 socket 收到的读出（recvmsg 也是这样）：
+        // 数据报的 FIONREAD 是下一个数据报的长度。glibc 的解析器按它分配 AAAA 回答的缓冲区
+        Socket::Inet(s) if request == FIONREAD && !s.answers.is_empty() => {
+            let n = s.answers.front().map_or(0, Vec::len) as i32;
+            return put(cx, arg, n.to_le_bytes()).map(|()| 0);
+        }
         Socket::Inet(s) => Some(s.fd),
         Socket::Unix(u) if request == FIONREAD => {
             return put(cx, arg, (u.unread() as i32).to_le_bytes()).map(|()| 0);

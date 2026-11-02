@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Once, PoisonError};
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jint, jlong, jobjectArray};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray};
 
 /// 抛出 `java.io.IOException`；JNI 调用之后由 Kotlin 看到。
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
@@ -141,6 +141,31 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
     let r = appine_kernel::write_file(store.as_ref(), &path, &data, mode as u32, overwrite != 0);
     if let Err(e) = r {
         throw(&mut env, format!("cannot write {path}: {e}"));
+    }
+}
+
+/// 读仓库里的一个普通文件（宿主看配置文件用，比如设置里列出账号）：不存在时返回 null，别的
+/// 错误抛出 IOException。内核运行着也可以读：另外打开仓库时，内核推迟的写事务先提交。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    path: JString<'l>,
+) -> jbyteArray {
+    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+        return std::ptr::null_mut();
+    };
+    match appine_kernel::read_file(store.as_ref(), &path) {
+        Ok(data) => env
+            .byte_array_from_slice(&data)
+            .map(JByteArray::into_raw)
+            .unwrap_or(std::ptr::null_mut()),
+        Err(appine_kernel::errno::Errno::ENOENT) => std::ptr::null_mut(),
+        Err(e) => {
+            throw(&mut env, format!("cannot read {path}: {e}"));
+            std::ptr::null_mut()
+        }
     }
 }
 

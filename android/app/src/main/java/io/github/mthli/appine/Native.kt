@@ -29,6 +29,11 @@ internal object Native {
     @Throws(IOException::class)
     external fun writeFile(store: String, path: String, data: ByteArray, mode: Int, overwrite: Boolean)
 
+    /** 读仓库里的一个普通文件，不存在时是 null；内核运行着也可以读。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun readFile(store: String, path: String): ByteArray?
+
     /** 启动内核；[tier] 0 是解释器，1 是 DBT。 */
     @JvmStatic
     @Throws(IOException::class)

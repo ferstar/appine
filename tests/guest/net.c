@@ -294,6 +294,47 @@ static void test_udp_loopback(void)
     ok("udp loopback");
 }
 
+/*
+ * DNS 存根（127.0.0.53:53）的回答在 appine 自己的队列里：FIONREAD 要报告下一个回答的长度。
+ * glibc 的解析器用 sendmmsg 一次发出 A、AAAA 两个查询，按 FIONREAD 分配第二个回答的缓冲区，
+ * 报告 0 时它收不下 AAAA 的回答，解析失败（Debian 的 apt）。没有外网时存根回答 SERVFAIL，
+ * 也有回答可读，所以这里不看回答的内容，只看长度对得上。
+ */
+static void test_dns_stub_fionread(void)
+{
+    static const unsigned char query[] = {
+        0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,  /* 头：RD，一个问题 */
+        9, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't', 0, /* localhost */
+        0, 1, 0, 1,                                         /* A，IN */
+    };
+    unsigned char q2[sizeof query];
+    memcpy(q2, query, sizeof query);
+    q2[0] = 0x56;
+    q2[sizeof q2 - 3] = 28; /* AAAA */
+    struct sockaddr_in ns = {.sin_family = AF_INET, .sin_port = htons(53)};
+    inet_pton(AF_INET, "127.0.0.53", &ns.sin_addr);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(connect(fd, (struct sockaddr *)&ns, sizeof ns) == 0, "connect to the stub");
+    struct iovec iov[2] = {{(void *)query, sizeof query}, {q2, sizeof q2}};
+    struct mmsghdr msgs[2] = {{.msg_hdr = {.msg_iov = &iov[0], .msg_iovlen = 1}},
+                              {.msg_hdr = {.msg_iov = &iov[1], .msg_iovlen = 1}}};
+    CHECK(sendmmsg(fd, msgs, 2, 0) == 2, "sendmmsg");
+    for (int i = 0; i < 2; i++) {
+        struct pollfd p = {fd, POLLIN, 0};
+        CHECK(poll(&p, 1, 30000) == 1, "answer %d", i);
+        int avail = -1;
+        CHECK(ioctl(fd, FIONREAD, &avail) == 0, "FIONREAD");
+        unsigned char buf[4096];
+        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        CHECK(n >= 12 && avail == n, "answer %d: FIONREAD %d, recv %zd", i, avail, n);
+        CHECK(buf[0] == (i ? 0x56 : 0x12) && buf[1] == 0x34, "answer %d id", i);
+    }
+    int avail = -1;
+    CHECK(ioctl(fd, FIONREAD, &avail) == 0 && avail == 0, "FIONREAD when empty: %d", avail);
+    close(fd);
+    ok("dns stub fionread");
+}
+
 /* getifaddrs 经由 NETLINK_ROUTE 列出接口和地址 */
 static void test_netlink(void)
 {
@@ -401,6 +442,7 @@ int main(void)
     test_unix_listen();
     test_tcp_loopback();
     test_udp_loopback();
+    test_dns_stub_fionread();
     test_netlink();
     test_epoll();
     test_itimer();

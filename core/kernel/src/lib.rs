@@ -83,6 +83,15 @@ pub fn write_file(
     .unwrap_or(Err(Errno::EIO))
 }
 
+/// 读 inode 仓库里的一个普通文件（宿主看配置文件用）；`path` 是 guest 路径。见 [`vfs::read_file`]。
+pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
+    bug::host_call("read_file", || {
+        let store = Store::open(store, &[])?;
+        vfs::read_file(&store, path.as_bytes())
+    })
+    .unwrap_or(Err(Errno::EIO))
+}
+
 /// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。
 ///
 /// 目录里已经有仓库时返回 `EEXIST`。导入失败时仓库保持为空。

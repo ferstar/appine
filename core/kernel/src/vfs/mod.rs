@@ -2177,6 +2177,28 @@ pub fn write_file(
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
 }
 
+/// 读仓库里的一个普通文件（宿主看配置文件用，比如设置里列出 `/etc/passwd` 的账号）：路径里的
+/// 符号链接不跟随（与 [`write_file`] 一样），不存在是 `ENOENT`，不是普通文件是 `EINVAL`。
+pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
+    use std::io::Read;
+    let mut ino = ROOT;
+    for c in split(path) {
+        if store.kind(ino)? != mode::S_IFDIR {
+            return Err(Errno::ENOTDIR);
+        }
+        ino = store.lookup(ino, &c)?.ok_or(Errno::ENOENT)?;
+    }
+    if store.kind(ino)? != mode::S_IFREG {
+        return Err(Errno::EINVAL);
+    }
+    let mut data = Vec::new();
+    store
+        .open_object(ino, false)?
+        .read_to_end(&mut data)
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok(data)
+}
+
 /// 拆分路径组件，去掉空组件和 `.`。
 /// 路径解析的组件：保留 `.`，以 `/` 结尾时再补一个 `.`，这样前面的节点必须是目录，
 /// 最后一个组件是符号链接时也会被跟随（与 Linux 一样）。

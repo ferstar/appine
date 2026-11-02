@@ -1,6 +1,7 @@
 #!/bin/sh
-# 下载并校验 Alpine minirootfs（设计文档 §11.4）。版本和 sha256 固定写在这里，
-# 升级时一起修改。用法：scripts/fetch-rootfs [输出目录]，默认 target/rootfs。
+# 下载并校验 Alpine minirootfs（设计文档 §11.4）和 App 带着的 doas 包（普通用户第一次成为
+# 登录账号时离线装上，§11.1）。版本和 sha256 固定写在这里，升级时一起修改。用法：
+# scripts/fetch-rootfs [输出目录]，默认 target/rootfs。
 #
 # 下载之后先用 Alpine 的发布密钥（scripts/alpine-ncopa.asc，Natanael Copa，指纹见
 # fingerprint）验签名，再比 sha256：摘要固定在这里，验签是给升级版本时确认新的摘要可信用的。
@@ -13,6 +14,11 @@ sha256=4d3f80afaebd447c5591a63a73bde380a149fe8b2d85488cafabb2ff97551f50
 name=alpine-minirootfs-$version-aarch64.tar.gz
 url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/aarch64/$name
 fingerprint=0482D84022F52DF1C4E7CD43293ACD0907D9495A
+
+# doas 用同一个分支的：包本身带着 Alpine 的签名，apk 装的时候用 rootfs 里的公钥验
+doas=doas-6.8.2-r8.apk
+doas_sha256=7d35ce1a0a76de43f7621e2099e45bfd83e6d8cf667db657633ab1f374d05f72
+doas_url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main/aarch64/$doas
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-$root/target/rootfs}
@@ -31,6 +37,19 @@ digest() {
 check() {
     [ "$(digest "$1")" = "$sha256" ]
 }
+
+# doas 包：只比固定的 sha256（签名在包里面，由 apk 验）
+fetch_doas() {
+    [ -f "$out/$doas" ] && [ "$(digest "$out/$doas")" = "$doas_sha256" ] && return 0
+    curl -fsSL --retry 3 -o "$out/$doas.part" "$doas_url"
+    if [ "$(digest "$out/$doas.part")" != "$doas_sha256" ]; then
+        echo "fetch-rootfs: sha256 mismatch for $doas_url: got $(digest "$out/$doas.part")" >&2
+        rm -f "$out/$doas.part"
+        exit 1
+    fi
+    mv "$out/$doas.part" "$out/$doas"
+}
+fetch_doas
 
 if [ -f "$file" ] && check "$file"; then
     echo "$file"

@@ -1,16 +1,24 @@
 package io.github.mthli.appine
 
+import android.content.Context
 import com.termux.terminal.TerminalSession
 import java.io.IOException
 
-/** 一个终端标签页的 PTY：内核里的一个控制台，上面跑一个登录 shell。 */
-internal class ConsolePty(private val machine: Long) : TerminalSession.Pty {
+/**
+ * 一个终端标签页的 PTY：内核里的一个控制台，上面跑一个登录 shell。[login] 是设置里的登录账号
+ * （`auto`、`root` 或账号名），由 assets 里的 `login.sh` 以 root 运行时决定登录谁（设计文档 §11.1）。
+ */
+internal class ConsolePty(
+    private val machine: Long,
+    private val script: String,
+    private val login: String,
+) : TerminalSession.Pty {
     private var console = -1
     private var pid = -1
 
     override fun start(columns: Int, rows: Int): Int {
         console = Native.openConsole(machine, rows, columns)
-        pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", LOGIN), ENVIRONMENT)
+        pid = Native.spawn(machine, console, "/bin/sh", argv(script, login), ENVIRONMENT)
         return pid
     }
 
@@ -34,15 +42,22 @@ internal class ConsolePty(private val machine: Long) : TerminalSession.Pty {
     }
 
     companion object {
+        /** 设置里的登录账号：自动（最先建的普通用户，没有就是 root）。 */
+        const val LOGIN_AUTO = "auto"
+        const val LOGIN_ROOT = "root"
+
+        @Volatile
+        private var cached: String? = null
+
         /**
-         * 以 `/etc/passwd` 里 root 的 shell 作为登录 shell 运行（读 /etc/profile）：Alpine 是 ash，
-         * Debian、Ubuntu 是 bash，chsh 改过之后也照样。找不到时用 /bin/sh。passwd 从 fd 3 读：
-         * 循环的重定向也作用于里面 exec 的 shell，它的 stdin 得是终端。
+         * 登录脚本（assets 的 `login.sh`）：选账号，普通用户第一次成为登录账号时加进管理员组、装好
+         * doas 或 sudo，然后 `su -l` 过去；root 以 `/etc/passwd` 里的 shell 登录（chsh 改过也照样）。
          */
-        const val LOGIN = "while IFS=: read -r name _ _ _ _ _ shell <&3; do " +
-            "if [ \"\$name\" = root ] && [ -x \"\$shell\" ]; then " +
-            "export SHELL=\"\$shell\"; exec \"\$shell\" -l 3<&-; fi; " +
-            "done 3< /etc/passwd; exec /bin/sh -l"
+        fun script(context: Context): String = cached
+            ?: context.assets.open("login.sh").bufferedReader().readText().also { cached = it }
+
+        /** 以 root 运行登录脚本的 argv（`sh -c 脚本 appine-login 账号`）。 */
+        fun argv(script: String, login: String) = arrayOf("sh", "-c", script, "appine-login", login)
 
         val ENVIRONMENT = arrayOf(
             "HOME=/root",

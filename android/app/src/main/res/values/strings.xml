@@ -49,6 +49,12 @@
     <string name="kept_awake">%1$s · kept awake</string>
     <string name="settings_licenses">Open source licenses</string>
     <string name="licenses_summary">appine is free software under the GNU AGPL 3.0 or later, and comes with no warranty. Copyright © 2026 Matthew Lee. Source code: github.com/mthli/appine</string>
+    <string name="settings_login">Login account</string>
+    <string name="login_auto_choice">Automatic (the first regular user, otherwise root)</string>
+    <string name="login_auto_user">Automatic: %1$s (the first regular user)</string>
+    <string name="login_auto_root">Automatic: root. Once you create a user with adduser, new tabs log in as it.</string>
+    <string name="login_missing">%1$s (not found, so new tabs log in as root)</string>
+    <string name="login_changed">New tabs log in as %1$s</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>

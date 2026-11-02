@@ -73,10 +73,14 @@ class MachineTest {
     /** 在新控制台上运行 `sh -c script`，返回输出和退出码。 */
     private fun sh(machine: Long, script: String) = run(machine, "/bin/sh", "sh", "-c", script)
 
-    /** 在新控制台上像终端标签页一样启动登录 shell（[ConsolePty.LOGIN]），输入 [input]，返回输出。 */
-    private fun login(machine: Long, input: String): String {
+    /**
+     * 在新控制台上像终端标签页一样运行登录脚本（[ConsolePty.script]，登录账号是 [account]），输入
+     * [input]，返回输出。
+     */
+    private fun login(machine: Long, input: String, account: String = ConsolePty.LOGIN_AUTO): String {
         val console = Native.openConsole(machine, 24, 200)
-        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", ConsolePty.LOGIN), ConsolePty.ENVIRONMENT)
+        val argv = ConsolePty.argv(ConsolePty.script(context), account)
+        val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
         var out = ""
         val reader = thread { out = readAll(machine, console) }
         val b = input.toByteArray()
@@ -262,6 +266,50 @@ class MachineTest {
         }
     }
 
+    /**
+     * 登录脚本的输出里：`id -un` 是 alice，`id -nG` 里有 [group]，`doas`/`sudo -n id -un` 是 root
+     * （按行比，终端的输出里夹着控制序列和回车）。
+     */
+    private fun becameAdmin(out: String, group: String): Boolean {
+        val lines = out.lines().map { it.trim() }
+        val i = lines.indexOf("alice")
+        return i >= 0 && lines.getOrNull(i + 1)?.split(' ')?.containsAll(listOf("alice", group)) == true &&
+            lines.getOrNull(i + 2) == "root"
+    }
+
+    /**
+     * 登录账号（设计文档 §11.1）：只有 root 时自动登录 root；建了普通用户之后自动以它登录，第一次
+     * 登录时加进 wheel、离线装上 App 带的 doas，没设密码时 doas 不问密码；设了密码之后要问；
+     * 明确选 root 时是 root，选的账号不在了也是 root。最后删掉账号、doas 和留下的记录。
+     */
+    @Test
+    fun loginAccountsAndDoas() {
+        Rootfs.ensureLoginTools(context)
+        val machine = start(1)
+        val show = "id -un; id -nG; doas -n id -un; exit\n"
+        try {
+            assertTrue(login(machine, "id -un; exit\n").contains("\nroot\n"))
+            assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
+            assertEquals(listOf("alice"), Rootfs.regularAccounts(context).map { it.name })
+            val first = login(machine, show)
+            assertTrue(first, first.contains("alice is in the wheel group and can become root with doas"))
+            assertTrue(first, becameAdmin(first, "wheel"))
+            assertEquals(0, sh(machine, "echo alice:secret | chpasswd").second)
+            val withPassword = login(machine, show)
+            assertFalse(withPassword, withPassword.contains("can become root"))
+            assertTrue(withPassword, withPassword.contains("doas: Authentication required"))
+            assertTrue(login(machine, "id -un; exit\n", ConsolePty.LOGIN_ROOT).contains("\nroot\n"))
+            val missing = login(machine, "id -un; exit\n", "bob")
+            assertTrue(missing, missing.contains("there is no user bob") && missing.contains("\nroot\n"))
+        } finally {
+            sh(
+                machine,
+                "deluser --remove-home alice; apk del -q --no-network --repositories-file /dev/null doas; " +
+                    "rm -rf /var/lib/appine /etc/doas.d",
+            )
+        }
+    }
+
     /** 下载的 tarball 按长度和 sha256 校验，对不上时删掉（用 file: 地址代替网络）。 */
     @Test
     fun downloadsAreVerified() {
@@ -417,7 +465,7 @@ class MachineTest {
 
     /**
      * 下载 Debian 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
-     * apt-get update。要联网下载约 50 MB，默认跳过：
+     * apt-get update（它取不到索引时只警告、退出码仍是 0，所以看输出）；再建一个普通用户，自动以它登录时装上 sudo。要联网下载约 50 MB，默认跳过：
      * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`。
      */
     @Test
@@ -432,11 +480,16 @@ class MachineTest {
                 val out = login(
                     machine,
                     "grep PRETTY_NAME /etc/os-release; echo shell=\$SHELL; getent hosts localhost | head -n 1; " +
-                        "apt-get update -qq && echo apt-ok\nexit\n",
+                        "apt-get update 2>&1 | grep -q 'Failed to fetch' || echo apt-ok\nexit\n",
                 )
                 assertTrue(out, out.contains(distro.label.substringBefore(' ')))
                 assertTrue(out, out.contains("shell=/bin/bash\n"))
                 assertTrue(out, out.contains("apt-ok\n"))
+                // 普通用户第一次成为登录账号：加进 sudo 组，联网装上 sudo，没设密码时不问
+                assertEquals(0, sh(machine, "useradd -m -s /bin/bash alice").second)
+                val admin = login(machine, "id -un; id -nG; sudo -n id -un; exit\n")
+                assertTrue(admin, admin.contains("alice is in the sudo group and can become root with sudo"))
+                assertTrue(admin, becameAdmin(admin, "sudo"))
             } finally {
                 Native.stop(machine)
                 store.deleteRecursively()

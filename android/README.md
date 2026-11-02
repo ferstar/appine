@@ -7,8 +7,11 @@ The Gradle project for the Android shell (design doc §3, §9, §11):
   and a row of extra keys. `Rootfs` imports Alpine from the APK assets on first launch,
   picks the fastest mirror, and can replace it with Debian (downloaded and checked
   against a pinned sha256 digest). `SettingsActivity`, opened from the tab bar's menu,
-  switches the distribution, resets the rootfs, chooses the package mirror and the
-  execution tier. `Native` is the JNI interface to `libappine.so`, which is built from
+  switches the distribution, resets the rootfs, chooses the package mirror, the login
+  account and the execution tier. Each tab runs `assets/login.sh` as root: it picks the
+  login account (the first regular user by default), gives a regular user doas or sudo the
+  first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),
+  and switches to it with `su -l`. `Native` is the JNI interface to `libappine.so`, which is built from
   `hosts/android` with cargo-ndk.
 - `terminal-emulator/`, `terminal-view/`: vendored from Termux (see below).
 

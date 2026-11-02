@@ -68,7 +68,7 @@
   - `downloadsCanBeCancelled`：本地的 HTTP 服务发三分之一就停住，进度回调里取消，`fetch` 抛出 `Rootfs.Cancelled`，`.part` 没有留下。
   - `manualMirrorIsWritten`：内核运行着时 `setMirror`，guest 里 `cat /etc/apk/repositories` 马上是新的镜像，记录是手动的；最后恢复源文件和记录。
   - `downloadedDistributionsRun` 只下 Debian 了。
-- Pixel 4a（API 34，4K 页）的模拟器：16 个里 15 个通过，`downloadedDistributionsRun` 照例默认跳过。带 `network=true`、给模拟器设上系统代理单独跑它：下载 Debian、导入、登录 bash、`apt-get update` 通过（20 秒）。
+- Pixel 4a（API 34，4K 页）的模拟器：16 个里 15 个通过，`downloadedDistributionsRun` 照例默认跳过。带 `network=true`、给模拟器设上系统代理单独跑它：下载 Debian、导入、登录 bash、`apt-get update` 通过（20 秒）。→ `apt-get update` 这一项是假的通过：apt 取不到索引时只警告、退出码仍是 0。模拟器上 glibc 一次查 A 和 AAAA 的解析一直失败，第 193 轮查出来是 DNS 存根的回答在 `FIONREAD` 里报成 0，修了（M9：以指定用户登录），用例也改成看输出
 - Qenix 16K（API 37，16K 页）的模拟器：14 个通过，`downloadedDistributionsRun` 跳过，`lowPortsMoveToHighPortsOnTheHost` 失败。失败的是用例开头的前提："App 进程自己绑不了 22 端口"。这个 Android 17 的镜像上 App 自己就能绑：App 进程的 CapEff 是 0，`ip_unprivileged_port_start` 也是 1024，原因没查（见推迟项）。用例的其余部分照样通过：guest 绑 22 换到宿主的 10022，App 进程连得上。这条用例以前只在 API 34 上跑过（[低端口映射](156-low-ports.md)），与这一轮的改动无关。
 - 手动（4K 模拟器上新装的 App，用 `adb shell input` 操作、截图看）：
   - 首次启动直接进 Alpine，第一个标签页里是 Alpine 的欢迎语；设置页显示 Alpine Linux 3.24、测速选出的中科大镜像、Tier 1。16K 模拟器上新装的也一样。

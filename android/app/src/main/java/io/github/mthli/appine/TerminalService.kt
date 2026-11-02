@@ -289,6 +289,19 @@ class TerminalService : Service() {
     /** 执行层（设置里选，设计文档 §4）：1 是 Tier 1，0 是解释器。下次启动内核时生效。 */
     val tier: Int get() = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1)
 
+    /**
+     * 新标签页的登录账号（设置里选，设计文档 §11.1）：[ConsolePty.LOGIN_AUTO]、
+     * [ConsolePty.LOGIN_ROOT] 或账号名。换了发行版、重置 rootfs 之后回到自动。
+     */
+    val login: String
+        get() = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LOGIN, null) ?: ConsolePty.LOGIN_AUTO
+
+    /** 设置里选了登录账号：之后新开的标签页用它，开着的不变。 */
+    fun setLogin(value: String) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_LOGIN, value).apply()
+        settingsChanged()
+    }
+
     /** 启动内核；[distro] 不为 null 时先准备它的 rootfs（仓库要已经删掉了）。 */
     private fun start(distro: Rootfs.Distro?) {
         startError = null
@@ -307,6 +320,7 @@ class TerminalService : Service() {
                     }
                 }
                 Rootfs.ensureNetworkConfig(this)
+                Rootfs.ensureLoginTools(this)
                 Native.start(Rootfs.store(this).path, tier)
             }
             main.post {
@@ -417,6 +431,8 @@ class TerminalService : Service() {
      * 停内核、删文件在 [worker] 上做。
      */
     private fun replace(distro: Rootfs.Distro) {
+        // 原来的账号都随仓库删了
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LOGIN).apply()
         val m = detach()
         startError = null
         preparing(getString(R.string.preparing, distro.label))
@@ -610,7 +626,7 @@ class TerminalService : Service() {
 
     /** 新开一个终端会话（登录 shell）。shell 在第一次知道窗口大小时启动。 */
     fun createSession(): TerminalSession {
-        val session = TerminalSession(ConsolePty(machine), TRANSCRIPT_ROWS, client)
+        val session = TerminalSession(ConsolePty(machine, ConsolePty.script(this), login), TRANSCRIPT_ROWS, client)
         sessions.add(session)
         sessionsChanged()
         return session
@@ -743,6 +759,7 @@ class TerminalService : Service() {
         private const val WAKE_LOCK_TAG = "appine:keep-awake"
         private const val PREFS = "settings"
         private const val KEY_TIER = "tier"
+        private const val KEY_LOGIN = "login"
         private const val TRANSCRIPT_ROWS = 2000
         private const val TRIM_DELAY_MS = 60_000L
     }

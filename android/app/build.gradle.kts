@@ -19,6 +19,11 @@ val rootfsTarball: File? = repoRoot.dir("target/rootfs").asFile
     .listFiles { f -> f.name.matches(Regex("alpine-minirootfs-.*-aarch64\\.tar\\.gz")) }
     ?.maxByOrNull { it.name }
 
+/** App 带着的 doas 包（`scripts/fetch-rootfs` 下载的），普通用户第一次成为登录账号时离线装上。 */
+val doasPackage: File? = repoRoot.dir("target/rootfs").asFile
+    .listFiles { f -> f.name.matches(Regex("doas-.*\\.apk")) }
+    ?.maxByOrNull { it.name }
+
 /** 例如 3.24.3 → v3.24，写进 apk 的仓库地址。 */
 val alpineBranch: String = rootfsTarball
     ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
@@ -113,11 +118,15 @@ abstract class CargoNdkTask : DefaultTask() {
     }
 }
 
-/** 把 rootfs tarball 放进 assets（首次启动时导入，设计文档 §11.4）。 */
+/** 把 rootfs tarball 放进 assets（首次启动时导入，设计文档 §11.4），doas 包也是（§11.1）。 */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
     @get:Optional
     abstract val tarball: RegularFileProperty
+
+    @get:InputFile
+    @get:Optional
+    abstract val doas: RegularFileProperty
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
@@ -130,6 +139,9 @@ abstract class RootfsAssetTask : DefaultTask() {
         out.deleteRecursively()
         out.mkdirs()
         source.copyTo(File(out, "rootfs.tgz"))
+        val doasFile = doas.orNull?.asFile
+            ?: throw GradleException("doas package not found: run scripts/fetch-rootfs first")
+        doasFile.copyTo(File(out, "doas.apk"))
     }
 }
 
@@ -151,6 +163,10 @@ abstract class NoticesTask : DefaultTask() {
     @get:InputFile
     @get:Optional
     abstract val tarball: RegularFileProperty
+
+    @get:InputFile
+    @get:Optional
+    abstract val doas: RegularFileProperty
 
     @get:InputFile
     abstract val cargoLock: RegularFileProperty
@@ -270,6 +286,20 @@ abstract class NoticesTask : DefaultTask() {
             ) + "\n\n",
         )
         for ((p, v, l, o, c) in rows) body.append("$p $v\n    License: $l\n    aports: main/$o at $c\n")
+        doas.orNull?.asFile?.let { apk ->
+            // .PKGINFO 在包的第二段（签名、控制信息、数据三段 gzip 接在一起）
+            val info = tarEntry(apk, ".PKGINFO").orEmpty().lines()
+                .mapNotNull { it.split(" = ", limit = 2).takeIf { kv -> kv.size == 2 } }
+                .associate { (k, v) -> k to v }
+            body.append("\n").append(
+                wrap(
+                    "The app also includes this package, which it installs when a regular user first becomes the " +
+                        "login account:",
+                ),
+            ).append("\n\n")
+            body.append("${info["pkgname"]} ${info["pkgver"]}\n    License: ${info["license"]}\n")
+            body.append("    aports: main/${info["origin"]} at ${info["commit"]}\n")
+        }
         body.append("\n").append(wrap("The full texts of the GPL 2.0, Apache 2.0 and MPL 2.0 are at the end of this list.")).append('\n')
         return Triple("Alpine Linux $version minirootfs", "${rows.size} packages: ${licenses.joinToString(", ")}", body.toString())
     }
@@ -422,6 +452,7 @@ abstract class NoticesTask : DefaultTask() {
 
 val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     rootfsTarball?.let { tarball.set(it) }
+    doasPackage?.let { doas.set(it) }
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
@@ -439,6 +470,7 @@ androidComponents {
             license.set(repoRoot.file("LICENSE"))
             texts.set(layout.projectDirectory.dir("../licenses"))
             rootfsTarball?.let { tarball.set(it) }
+            doasPackage?.let { doas.set(it) }
             cargoLock.set(repoRoot.file("Cargo.lock"))
             workspace.set(repoRoot)
             // 依赖图里的模块（不含 terminal-view 这些工程内的模块），只解析图、不下载

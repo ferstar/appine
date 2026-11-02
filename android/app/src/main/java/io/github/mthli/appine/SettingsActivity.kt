@@ -15,12 +15,15 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import kotlin.concurrent.thread
 
 /**
- * 设置：发行版、软件源镜像、重置 rootfs、执行层（设计文档 §11.4），熄屏时保持运行（§11.2）。状态都在 [TerminalService]
+ * 设置：发行版、软件源镜像、重置 rootfs、执行层（设计文档 §11.4），登录账号（§11.1），熄屏时
+ * 保持运行（§11.2），开源许可（§13.4）。状态都在 [TerminalService]
  * 里，这里只显示和转达；内核没有在运行（启动中、正在换掉仓库）时只能看、不能改。换掉仓库、
  * 重启开始时回到终端，那里显示进度。
  */
@@ -30,6 +33,10 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     private lateinit var distro: Row
     private lateinit var mirror: Row
     private lateinit var reset: Row
+    private lateinit var account: Row
+
+    /** `/etc/passwd` 里的普通用户（[Rootfs.regularAccounts]），每次显示设置页时在后台读。 */
+    private var accounts: List<Rootfs.Account> = emptyList()
     private lateinit var tier: Row
     private lateinit var keepAwake: Row
     private lateinit var licenses: Row
@@ -41,6 +48,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
             s.addListener(this@SettingsActivity)
             render()
             onNotice()
+            loadAccounts()
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -100,6 +108,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         distro = Row(R.string.settings_distro) { onDistro() }
         mirror = Row(R.string.settings_mirror) { onMirror() }
         reset = Row(R.string.settings_reset) { onReset() }
+        account = Row(R.string.settings_login) { onLogin() }
         tier = Row(R.string.settings_tier) { onTier() }
         keepAwake = Row(R.string.settings_keep_awake, toggle = true) { service?.let { it.setKeepAwake(!it.keepAwake) } }
         // AGPL 第 0、5 条的"适当的法律声明"：版权、不提供担保、许可证，以及看全文的地方
@@ -125,7 +134,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            for (row in listOf(distro, mirror, reset, keepAwake, tier, licenses)) addView(row.view)
+            for (row in listOf(distro, mirror, reset, account, keepAwake, tier, licenses)) addView(row.view)
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -161,7 +170,10 @@ class SettingsActivity : Activity(), TerminalService.Listener {
 
     // ---- TerminalService.Listener ----
 
-    override fun onMachineReady(error: String?) = render()
+    override fun onMachineReady(error: String?) {
+        render()
+        loadAccounts()
+    }
 
     override fun onSettingsChanged() = render()
 
@@ -210,6 +222,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         // 启动失败时也能重置：仓库坏了只能靠它恢复
         reset.set(getString(R.string.reset_summary, (installed ?: Rootfs.Distro.ALPINE).label), s.canSwitch)
         tier.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
+        account.set(loginSummary(s.login), installed != null && sw == null)
         // 随时可以改：内核没在运行时只是记下，起来之后照这个持有
         keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
     }
@@ -273,6 +286,44 @@ class SettingsActivity : Activity(), TerminalService.Listener {
             .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, i ->
                 dialog.dismiss()
                 if (i == 0) service?.autoMirror() else service?.setMirror(distro.mirrors[i - 1])
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun loadAccounts() {
+        thread(name = "appine-accounts") {
+            val list = Rootfs.regularAccounts(this)
+            runOnUiThread {
+                accounts = list
+                render()
+            }
+        }
+    }
+
+    private fun loginSummary(login: String): String = when (login) {
+        ConsolePty.LOGIN_AUTO -> accounts.firstOrNull()?.let { getString(R.string.login_auto_user, it.name) }
+            ?: getString(R.string.login_auto_root)
+        ConsolePty.LOGIN_ROOT -> login
+        else -> if (accounts.any { it.name == login }) login else getString(R.string.login_missing, login)
+    }
+
+    /** 选新标签页的登录账号：自动、root、`/etc/passwd` 里的普通用户。 */
+    private fun onLogin() {
+        val s = service ?: return
+        val values = listOf(ConsolePty.LOGIN_AUTO, ConsolePty.LOGIN_ROOT) + accounts.map { it.name }
+        val labels = listOf(getString(R.string.login_auto_choice), ConsolePty.LOGIN_ROOT) + accounts.map { it.name }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.settings_login)
+            .setSingleChoiceItems(labels.toTypedArray(), values.indexOf(s.login)) { dialog, i ->
+                dialog.dismiss()
+                s.setLogin(values[i])
+                val who = if (values[i] == ConsolePty.LOGIN_AUTO) {
+                    accounts.firstOrNull()?.name ?: ConsolePty.LOGIN_ROOT
+                } else {
+                    values[i]
+                }
+                Toast.makeText(this, getString(R.string.login_changed, who), Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()

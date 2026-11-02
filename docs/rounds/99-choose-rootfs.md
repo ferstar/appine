@@ -33,7 +33,7 @@
     - `downloadsAreVerified`：用 `file:` 地址代替网络，摘要、长度不对时删掉并报错；
     - `downloadsResumeWhereTheyBrokeOff`：测试里起一个本地的 HTTP 服务，第一次只发三分之一就断开，第二次按 `Range` 回 206，或者不认 `Range`、回 200。Android 不让 App 走明文 HTTP，debug 版加了一份只允许 127.0.0.1 的网络安全配置（`src/debug/`）。
     - `callsAfterStopAreHarmless`：`stop` 之后的各个调用。
-    - `downloadedDistributionsRun`：真的下载 Debian、Ubuntu，在登录 shell 里看 os-release、`$SHELL`，运行 `apt-get update`。要联网，默认跳过，`-Pandroid.testInstrumentationRunnerArguments.network=true` 时运行。
+    - `downloadedDistributionsRun`：真的下载 Debian、Ubuntu，在登录 shell 里看 os-release、`$SHELL`，运行 `apt-get update`。→ 在 Android 上这一项一直是假的通过：apt 取不到索引时退出码仍是 0，而 glibc 一次查 A 和 AAAA 的解析在 Android 上失败（DNS 存根的回答在 `FIONREAD` 里报成 0，第 193 轮修了，M9：以指定用户登录）；用例改成看输出。`appine-run`（Linux 宿主）上的那次是真的要联网，默认跳过，`-Pandroid.testInstrumentationRunnerArguments.network=true` 时运行。
   - Android 14（4K 页）的模拟器上 11 个都通过。联网的那个是模拟器开着 `-http-proxy`（经由 Mac 上的代理）单独跑的，那样 127.0.0.1 也被转给代理，本地 HTTP 服务的用例不能一起跑。联网的那个第一次在从 GitHub 下载 Debian 时读超时失败，于是加了断点续传；再跑时下到 26.8 MB 断了一次，接着下完，通过。Android 17（16K 页）的模拟器上不联网的 10 个通过。AGP 的结果 XML 把按假设跳过的用例记成 failure，Gradle 的退出码是 0。
   - 变异检验：续传次数改成 0，`downloadsResumeWhereTheyBrokeOff` 以 `unexpected end of stream` 失败。
   - 在模拟器上点了一遍界面：清掉数据后启动弹出选择框；选 Ubuntu，显示测速、下载进度，进入 bash，os-release、resolv.conf 都对；从菜单重置之后再弹出选择框；断网选 Debian，选择框重新弹出并写着无法解析主机名。
