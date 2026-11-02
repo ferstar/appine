@@ -763,8 +763,8 @@ appine 按 **AGPL-3.0-or-later** 发布（[许可证](rounds/192-license.md)，�
 
 - **依赖**：Rust crate 都是宽松许可证，都能选 MIT（双许可的按 MIT 用）；Android 库都是 Apache-2.0；SQLite 是公有领域。都与 AGPLv3 兼容。
 - **声明**：设置里的"开源许可"列出 App 里所有第三方的东西和许可证全文，构建时生成（`NoticesTask`，见 `android/README.md`）：Rust crate 从 `cargo metadata` 找链接进 `libappine.so` 的（不含构建依赖、过程宏），各自发布的许可证文件原样附上；Android 库取运行时的依赖图，不在已知是 Apache-2.0 的组里时构建失败。设置页的这一行、`appine-run --version` 显示 AGPL 第 5 条要的法律声明（版权、不提供担保、许可证）。
-- **APK 里的 Alpine minirootfs**：与 appine 只是放在一起（mere aggregation），不受 appine 的许可证影响；但 busybox、apk-tools、alpine-baselayout、scanelf 是 GPL-2.0-only，musl-utils 有一部分是 GPL-2.0-or-later，发布 APK 时要提供它们的源码。声明里列出每个包的 aports 提交（安装数据库里的 `c:`）；发布时把这些包的源码随 appine 的源码一起放出。设置里下载的 Debian 由用户从 Docker 官方镜像的来源下载，不经 appine 分发。
-- **源码**：GPLv3、AGPLv3 都要求随 APK 提供完整的对应源码（包括静态链接的 crate）。仓库现在是私有的，发布之前要公开（或者附上提供源码的书面承诺）。
+- **APK 里的 Alpine minirootfs**：与 appine 只是放在一起（mere aggregation），不受 appine 的许可证影响；但 busybox、apk-tools、alpine-baselayout、scanelf 是 GPL-2.0-only，musl-utils 有一部分是 GPL-2.0-or-later，发布 APK 时要提供它们的源码。声明里列出每个包的 aports 提交（安装数据库里的 `c:`）；发布时把这些包的源码随 appine 的源码一起放出（`scripts/release-sources` 生成，见下）。设置里下载的 Debian 由用户从 Docker 官方镜像的来源下载，不经 appine 分发。
+- **源码**：GPLv3、AGPLv3 都要求随 APK 提供完整的对应源码（包括静态链接的 crate）。仓库现在是私有的，发布之前要公开（或者附上提供源码的书面承诺）。`scripts/release-sources` 生成发布时一起放出的三份（[发布时放出的源码](rounds/200-release-sources.md)）：appine 自己（`git archive HEAD`，工作区有改动时拒绝）、`cargo vendor`、Alpine minirootfs 的 GPL 包（按 `lib/apk/db/installed` 里的 origin 和 aports 提交，从 GitLab 取 aports 的目录，上游源码从 Alpine 的 distfiles 镜像取，按 APKBUILD 的 sha512sums 校验，不执行 APKBUILD）。
 - `scripts/fetch-rootfs` 下载之后用 Alpine 的发布密钥验签名（`scripts/alpine-ncopa.asc`），再比固定的 sha256。
 
 ## 14. 里程碑
@@ -786,7 +786,7 @@ appine 按 **AGPL-3.0-or-later** 发布（[许可证](rounds/192-license.md)，�
 | **M6 B 档负载** | ✅ | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
 | **M7 Tier 1 正式版** | ✅ | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
-| **M9 发布** | 进行中：App 的工作做完了（[第 190](rounds/190-settings-default-alpine.md)–[197 轮](rounds/197-documents-write.md)），还剩真机验证、发布前的许可证义务（[第 192 轮](rounds/192-license.md)的推迟项）和 Play 提交 | 设置页、被杀后恢复标签页、wake lock 开关、许可证审计、以指定用户登录、进程被结束的提示、DocumentsProvider | Play 正式版上线 |
+| **M9 发布** | 进行中：App 的工作做完了（[第 190](rounds/190-settings-default-alpine.md)–[197 轮](rounds/197-documents-write.md)），还剩真机验证、发布前的许可证义务（[第 192 轮](rounds/192-license.md)的推迟项：要放出的源码由 `scripts/release-sources` 生成，公开仓库还是附书面承诺待定）和 Play 提交 | 设置页、被杀后恢复标签页、wake lock 开关、许可证审计、以指定用户登录、进程被结束的提示、DocumentsProvider | Play 正式版上线 |
 
 M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、按对象唤醒、core dump、cgroup v2 的视图、seccomp，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 

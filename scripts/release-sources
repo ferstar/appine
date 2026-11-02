@@ -1,0 +1,112 @@
+#!/bin/sh
+# 发布 App 时要一起放出的源码（设计文档 §13.4），放在 <输出目录>（默认 target/release-sources）：
+#
+#   scripts/release-sources [输出目录]
+#
+#   appine-<提交>.tar.gz              appine 自己（git archive HEAD，工作区有改动时报错）
+#   appine-<提交>-vendor.tar.gz       cargo vendor：静态链接进 App 的 crate
+#   alpine-<版本>-gpl-sources.tar     APK 里 Alpine minirootfs 的 GPL 包：各自 aports 提交下
+#                                     的目录（APKBUILD、补丁）和上游源码
+#
+# Alpine 那一份：包、版本、许可证、aports 的 origin 和提交取自 tarball 里的
+# lib/apk/db/installed（开源许可页列的也是它们），许可证里有 GPL 的按 origin 去重。aports
+# 的目录从 GitLab 按提交和子目录下载；上游源码是 APKBUILD 的 sha512sums 里列着、目录里
+# 没有的文件，从 Alpine 的 distfiles 镜像按文件名下载，按那里的 SHA-512 校验。不执行
+# APKBUILD（source= 里有变量，执行它等于运行下载来的代码）。
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-$root/target/release-sources}
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+aports=https://gitlab.alpinelinux.org/alpine/aports/-/archive
+distfiles=https://distfiles.alpinelinux.org/distfiles
+
+sha512() {
+    if command -v sha512sum >/dev/null; then
+        sha512sum "$1"
+    else
+        shasum -a 512 "$1"
+    fi | cut -d' ' -f1
+}
+
+# ---- appine 自己 ----
+cd "$root"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "release-sources: the work tree has changes; commit them first" >&2
+    exit 1
+fi
+rev=$(git rev-parse --short=12 HEAD)
+git archive --format=tar.gz --prefix="appine-$rev/" -o "$out/appine-$rev.tar.gz" HEAD
+echo "$out/appine-$rev.tar.gz"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cargo vendor --locked --quiet "$work/vendor" >/dev/null
+tar -czf "$out/appine-$rev-vendor.tar.gz" -C "$work" vendor
+rm -rf "$work/vendor"
+echo "$out/appine-$rev-vendor.tar.gz"
+
+# ---- Alpine minirootfs 里的 GPL 包 ----
+tarball=$("$root/scripts/fetch-rootfs" | tail -n 1)
+version=$(basename "$tarball" | sed -n 's/^alpine-minirootfs-\([0-9.]*\)-.*/\1/p')
+branch=v${version%.*}
+name=alpine-$version-gpl-sources
+dir=$work/$name
+mkdir -p "$dir"
+# 每个包一行：包 版本 origin 提交 许可证
+tar -xzOf "$tarball" lib/apk/db/installed | awk -F: '
+    /^P:/ { p = substr($0, 3) } /^V:/ { v = substr($0, 3) } /^L:/ { l = substr($0, 3) }
+    /^o:/ { o = substr($0, 3) } /^c:/ { c = substr($0, 3) }
+    /^$/ { if (p != "") print p, v, o, c, l; p = "" }
+    END { if (p != "") print p, v, o, c, l }' >"$work/packages"
+grep 'GPL' "$work/packages" >"$work/gpl" || true
+if [ ! -s "$work/gpl" ]; then
+    echo "release-sources: no GPL packages in $tarball?" >&2
+    exit 1
+fi
+{
+    echo "Source code of the GPL-licensed packages in the Alpine Linux $version minirootfs"
+    echo "that the appine app bundles ($(basename "$tarball")). Each directory holds the"
+    echo "package's directory in Alpine's aports repository at the given commit (the"
+    echo "APKBUILD and patches) and the upstream sources that the APKBUILD names, checked"
+    echo "against its sha512sums."
+    echo
+    echo "package version origin aports-commit license"
+    cat "$work/gpl"
+} >"$dir/README"
+
+awk '{ print $3, $4 }' "$work/gpl" | sort -u | while read -r origin commit; do
+    dest=$dir/$origin
+    mkdir -p "$dest"
+    curl -fsSL --retry 3 -o "$work/aports.tar.gz" \
+        "$aports/$commit/aports-$commit.tar.gz?path=main/$origin"
+    tar -xzf "$work/aports.tar.gz" -C "$dest" --strip-components 3
+    rm "$work/aports.tar.gz"
+    [ -f "$dest/APKBUILD" ] || { echo "release-sources: no APKBUILD for main/$origin at $commit" >&2; exit 1; }
+    # sha512sums="<摘要>  <文件>…"：引号可以是单引号或双引号，第一项可以和 sha512sums= 在同一行
+    awk '/^sha512sums=/ { f = 1; sub(/^sha512sums=["'\'']/, "") }
+         f { line = $0; done = sub(/["'\'']$/, "", line); n = split(line, a, " ");
+             if (n == 2) print a[1], a[2]; if (done) exit }' "$dest/APKBUILD" >"$work/sums"
+    [ -s "$work/sums" ] || { echo "release-sources: no sha512sums in main/$origin/APKBUILD" >&2; exit 1; }
+    while read -r want file; do
+        if [ -e "$dest/$file" ]; then
+            got=$(sha512 "$dest/$file")
+        else
+            curl -fsSL --retry 3 -o "$dest/$file" "$distfiles/$branch/$file" ||
+                curl -fsSL --retry 3 -o "$dest/$file" "$distfiles/edge/$file" || {
+                echo "release-sources: $file (main/$origin) is not on $distfiles" >&2
+                exit 1
+            }
+            got=$(sha512 "$dest/$file")
+        fi
+        if [ "$got" != "$want" ]; then
+            echo "release-sources: sha512 mismatch for $file (main/$origin)" >&2
+            exit 1
+        fi
+    done <"$work/sums"
+    echo "main/$origin at $commit: $(wc -l <"$work/sums" | tr -d ' ') files"
+done
+
+tar -cf "$out/$name.tar" -C "$work" "$name"
+echo "$out/$name.tar"
