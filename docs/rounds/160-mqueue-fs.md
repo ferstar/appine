@@ -31,5 +31,5 @@
 - 状态行的 `NOTIFY_PID` 是全局的 pid，Linux 按读者的 pid 命名空间（`pid_vnr`）。原来就是这样。
 - 打开着的队列不算卸载时"还在用"：Linux 上经由挂载打开的文件让 umount 是 EBUSY。
 - 已经存在的队列 `O_TRUNC` 打开，Linux 会把文件大小改成 0（`simple_setattr`），这里仍是 80。
-- mkdir 已经存在的名字，Linux 先是 EEXIST，这里是 EPERM。
+- mkdir 已经存在的名字，Linux 先是 EEXIST，这里是 EPERM。→ 已改：合成文件系统里名字已经存在时先是 EEXIST，mqueue 的根目录也一样（[M9：进程被结束、服务没起来时提示](195-kill-reports.md)）
 - inotify 在 mqueue 文件系统里没有事件。
