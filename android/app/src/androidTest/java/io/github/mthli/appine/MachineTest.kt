@@ -324,14 +324,82 @@ class MachineTest {
     }
 
     /**
-     * 下载 Debian、Ubuntu 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
-     * apt-get update。要联网下载约 80 MB，默认跳过：
+     * 下载中止时（设置里取消换发行版）抛出 [Rootfs.Cancelled]，下了一半的不留。本地的 HTTP 服务
+     * 发三分之一之后停住，等客户端取消、断开。
+     */
+    @Test
+    fun downloadsCanBeCancelled() {
+        val data = ByteArray(300_000) { (it * 7).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
+        val dest = File(context.cacheDir, "download-cancelled.tgz")
+        val server = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+        val sent = java.util.concurrent.CountDownLatch(1)
+        val serving = thread {
+            server.accept().use { c ->
+                val reader = c.getInputStream().bufferedReader()
+                generateSequence { reader.readLine() }.takeWhile { it.isNotEmpty() }.count()
+                val out = c.getOutputStream()
+                out.write("HTTP/1.1 200 OK\r\nContent-Length: ${data.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                out.write(data, 0, data.size / 3)
+                out.flush()
+                sent.countDown()
+                // 停住，等客户端放弃（读到 EOF）
+                runCatching { c.getInputStream().read() }
+            }
+        }
+        var cancelled = false
+        val url = "http://127.0.0.1:${server.localPort}/rootfs.tgz"
+        assertThrows(Rootfs.Cancelled::class.java) {
+            Rootfs.fetch(Rootfs.Download(listOf(url), sha, data.size.toLong()), dest, cancelled = { cancelled }) { done, _ ->
+                if (done >= data.size / 3) {
+                    sent.await()
+                    cancelled = true
+                }
+            }
+        }
+        server.close()
+        serving.join(5000)
+        assertFalse(dest.exists() || File(dest.path + ".part").exists())
+    }
+
+    /** 设置里手动选的镜像写进源：内核运行着也写得进去，guest 马上看得到；记下是手动选的。 */
+    @Test
+    fun manualMirrorIsWritten() {
+        val machine = start(1)
+        val distro = Rootfs.Distro.ALPINE
+        val before = sh(machine, "cat /etc/apk/repositories").first
+        val prefs = context.getSharedPreferences("rootfs", android.content.Context.MODE_PRIVATE)
+        val saved = prefs.all
+        try {
+            Rootfs.setMirror(context, distro, distro.mirrors[2])
+            assertTrue(Rootfs.isMirrorManual(context))
+            assertEquals(distro.mirrors[2], Rootfs.mirror(context))
+            val written = sh(machine, "cat /etc/apk/repositories").first
+            assertTrue(written, written.startsWith("${distro.mirrors[2]}/"))
+            assertTrue(written, written.contains("/community\n"))
+        } finally {
+            // 恢复原来的源和记录：别的用例、App 本身都用这个仓库
+            Native.writeFile(Rootfs.store(context).path, "/etc/apk/repositories", before.toByteArray(), 420, true)
+            prefs.edit().clear().apply {
+                for ((k, v) in saved) {
+                    when (v) {
+                        is String -> putString(k, v)
+                        is Boolean -> putBoolean(k, v)
+                    }
+                }
+            }.commit()
+        }
+    }
+
+    /**
+     * 下载 Debian 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
+     * apt-get update。要联网下载约 50 MB，默认跳过：
      * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`。
      */
     @Test
     fun downloadedDistributionsRun() {
         assumeTrue(InstrumentationRegistry.getArguments().getString("network") == "true")
-        for (distro in listOf(Rootfs.Distro.DEBIAN, Rootfs.Distro.UBUNTU)) {
+        for (distro in listOf(Rootfs.Distro.DEBIAN)) {
             val store = File(context.cacheDir, "store-${distro.name.lowercase()}")
             store.deleteRecursively()
             Rootfs.prepare(context, distro, store = store)

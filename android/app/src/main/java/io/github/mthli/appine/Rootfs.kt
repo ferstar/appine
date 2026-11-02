@@ -1,5 +1,6 @@
 package io.github.mthli.appine
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Log
 import java.io.File
@@ -12,10 +13,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * rootfs 的首次启动流程（设计文档 §11.4）：把用户选的发行版导入 inode 仓库，写入配置文件；
- * 之后在后台给镜像测速，选最快的一个写进包管理器的源。Alpine 的 minirootfs 在 APK 的
- * assets 里；Debian、Ubuntu 的选了才下载，版本和 sha256 固定写在这里，与
- * `scripts/fetch-rootfs` 一样只认摘要对得上的 tarball。
+ * rootfs 的导入和配置（设计文档 §11.4）：第一次运行时导入 APK 里的 Alpine，设置里可以换成
+ * Debian（选了才下载，版本和 sha256 固定写在这里，与 `scripts/fetch-rootfs` 一样只认摘要对得上
+ * 的 tarball）。导入之后写入配置文件，在后台给镜像测速，选最快的一个写进包管理器的源；设置里
+ * 也可以手动选。
  */
 internal object Rootfs {
     private const val TAG = "appine"
@@ -24,7 +25,7 @@ internal object Rootfs {
     data class Download(val urls: List<String>, val sha256: String, val size: Long)
 
     /**
-     * 可以选的发行版。`mirrors` 是内置的镜像列表（测速失败时用第一个），`probe` 是测速时
+     * 可以选的发行版。`mirrors` 是内置的镜像列表（测速失败时用第一个，官方的），`probe` 是测速时
      * 下载开头一部分的文件（相对镜像）。
      */
     enum class Distro(
@@ -45,7 +46,10 @@ internal object Rootfs {
             "${BuildConfig.ALPINE_BRANCH}/main/aarch64/APKINDEX.tar.gz",
         ),
 
-        /** debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份），固定在一个提交上。 */
+        /**
+         * debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份），固定在一个提交上。只有
+         * GitHub 这一个来源，国内直连很慢；没有镜像站带这份构建，暂不自己托管。
+         */
         DEBIAN(
             "Debian 13",
             Download(
@@ -64,28 +68,10 @@ internal object Rootfs {
             ),
             "debian/dists/trixie/InRelease",
         ),
-
-        /** Ubuntu 官方的 ubuntu-base，清华、中科大的镜像上也有同一份。 */
-        UBUNTU(
-            "Ubuntu 24.04",
-            Download(
-                listOf(
-                    "cdimage.ubuntu.com",
-                    "mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage",
-                    "mirrors.ustc.edu.cn/ubuntu-cdimage",
-                ).map { "https://$it/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-arm64.tar.gz" },
-                "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2",
-                29_936_675,
-            ),
-            listOf(
-                "ports.ubuntu.com",
-                "mirrors.tuna.tsinghua.edu.cn",
-                "mirrors.ustc.edu.cn",
-                "mirrors.aliyun.com",
-            ),
-            "ubuntu-ports/dists/noble/InRelease",
-        ),
     }
+
+    /** 镜像的主机名，设置里显示用。 */
+    fun host(mirror: String): String = mirror.substringAfter("://").substringBefore('/')
 
     /** 测速时最多下载的字节数和时间。 */
     private const val PROBE_BYTES = 512 * 1024
@@ -97,6 +83,11 @@ internal object Rootfs {
     /** 一个来源上下载中断之后最多接着下几次。 */
     private const val RESUMES = 5
 
+    /** 记录（SharedPreferences）：装的发行版，写在源里的镜像，镜像是不是用户在设置里选的。 */
+    private const val KEY_DISTRO = "distro"
+    private const val KEY_MIRROR = "mirror"
+    private const val KEY_MIRROR_MANUAL = "mirror_manual"
+
     fun store(context: Context): File = File(context.filesDir, "rootfs")
 
     /** 仓库已经导入并配置好了。 */
@@ -104,12 +95,47 @@ internal object Rootfs {
 
     private fun isReady(store: File) = File(store, "meta.db").exists()
 
+    private fun prefs(context: Context) = context.getSharedPreferences("rootfs", Context.MODE_PRIVATE)
+
+    /**
+     * App 的仓库里装的发行版，还没有仓库时是 null。导入时记下；第 190 轮之前导入的仓库没有记录，
+     * 当作 Alpine（App 还没有发布过，只有开发用的安装上有这样的仓库）。
+     */
+    fun installed(context: Context): Distro? {
+        if (!isReady(context)) return null
+        val name = prefs(context).getString(KEY_DISTRO, null) ?: return Distro.ALPINE
+        return Distro.entries.firstOrNull { it.name == name } ?: Distro.ALPINE
+    }
+
+    /** 中止下载（[download] 的 `cancelled` 返回 true）时抛出。 */
+    class Cancelled : IOException("cancelled")
+
+    private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
+
+    /**
+     * 把 [distro] 要下载的 tarball 下载到缓存目录，缓存里已经有校验过的就不下。下载时 [progress]
+     * 收到已经下载和总共的字节数；[cancelled] 返回 true 时中止，抛出 [Cancelled]。会阻塞，在后台
+     * 线程上调用。
+     */
+    @Throws(IOException::class)
+    fun download(
+        context: Context,
+        distro: Distro,
+        progress: (Long, Long) -> Unit = { _, _ -> },
+        cancelled: () -> Boolean = { false },
+    ) {
+        val download = distro.download ?: return
+        val tarball = tarball(context, distro)
+        if (tarball.length() == download.size && sha256(tarball) == download.sha256) return
+        fetch(download, tarball, cancelled, progress)
+    }
+
     /**
      * 把 [distro] 导入仓库 [store]（默认是 App 用的那个）。先导入到临时目录，完成后再改名，
-     * 中途被杀掉时下次重新来过。要下载的 tarball 校验过之后留在缓存目录里，导入成功才删掉，
-     * 导入失败重来时不必再下载。下载时 [progress] 收到已经下载和总共的字节数。会阻塞，在
-     * 后台线程上调用。
+     * 中途被杀掉时下次重新来过。要下载的 tarball 校验过之后留在缓存目录里（[download]），导入
+     * 成功才删掉，导入失败重来时不必再下载。会阻塞，在后台线程上调用。
      */
+    @SuppressLint("ApplySharedPref") // 记录要在仓库改名到位之前写到盘上
     @Throws(IOException::class)
     fun prepare(
         context: Context,
@@ -120,22 +146,29 @@ internal object Rootfs {
         if (isReady(store)) return
         val tmp = File(store.parentFile, "${store.name}.tmp")
         tmp.deleteRecursively()
-        val download = distro.download
-        val tarball = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
-        if (download == null) {
+        val tarball = tarball(context, distro)
+        if (distro.download == null) {
             context.assets.open("rootfs.tgz").use { input ->
                 tarball.outputStream().use { input.copyTo(it) }
             }
-        } else if (!(tarball.length() == download.size && sha256(tarball) == download.sha256)) {
-            fetch(download, tarball, progress)
+        } else {
+            download(context, distro, progress)
         }
         Native.importRootfs(tmp.path, tarball.path)
         tarball.delete()
         configure(tmp.path, distro)
+        if (store == store(context)) {
+            // 改名之前写到盘上：仓库在了，记录就是它的
+            prefs(context).edit()
+                .putString(KEY_DISTRO, distro.name)
+                .putString(KEY_MIRROR, distro.mirrors[0])
+                .putBoolean(KEY_MIRROR_MANUAL, false)
+                .commit()
+        }
         if (!tmp.renameTo(store)) throw IOException("cannot move the rootfs into place")
     }
 
-    /** 删掉 App 的仓库（重置 rootfs）。内核要先停下。 */
+    /** 删掉 App 的仓库（换发行版、重置 rootfs）。内核要先停下。 */
     fun reset(context: Context) {
         File(context.filesDir, "rootfs.tmp").deleteRecursively()
         if (!store(context).deleteRecursively()) Log.w(TAG, "cannot delete all of the rootfs")
@@ -144,14 +177,23 @@ internal object Rootfs {
     /**
      * 下载 [download] 到 [dest]：有几个来源时先测速，从快的开始试，一个失败了换下一个。
      * 边写边算 sha256，对不上（或者长度不对）时删掉，抛出异常；先写到 `.part`，校验过了才改名。
+     * [cancelled] 返回 true 时不再试别的来源，抛出 [Cancelled]。
      */
     @Throws(IOException::class)
-    fun fetch(download: Download, dest: File, progress: (Long, Long) -> Unit) {
+    fun fetch(
+        download: Download,
+        dest: File,
+        cancelled: () -> Boolean = { false },
+        progress: (Long, Long) -> Unit,
+    ) {
         var error: IOException? = null
         for (url in fastest(download.urls)) {
+            if (cancelled()) throw Cancelled()
             try {
                 Log.i(TAG, "downloading $url")
-                return fetch(url, download, dest, progress)
+                return fetch(url, download, dest, progress, cancelled)
+            } catch (e: Cancelled) {
+                throw e
             } catch (e: IOException) {
                 Log.w(TAG, "cannot download $url", e)
                 error = e
@@ -165,7 +207,13 @@ internal object Rootfs {
      * 算，最多 [RESUMES] 次），服务器不支持断点续传时从头再来。
      */
     @Throws(IOException::class)
-    private fun fetch(url: String, download: Download, dest: File, progress: (Long, Long) -> Unit) {
+    private fun fetch(
+        url: String,
+        download: Download,
+        dest: File,
+        progress: (Long, Long) -> Unit,
+        cancelled: () -> Boolean,
+    ) {
         val part = File(dest.path + ".part")
         var digest = MessageDigest.getInstance("SHA-256")
         var done = 0L
@@ -189,6 +237,7 @@ internal object Rootfs {
                         FileOutputStream(part, done > 0).use { output ->
                             val buf = ByteArray(64 * 1024)
                             while (true) {
+                                if (cancelled()) throw Cancelled()
                                 val n = input.read(buf)
                                 if (n < 0) break
                                 digest.update(buf, 0, n)
@@ -204,7 +253,7 @@ internal object Rootfs {
                     }
                     break
                 } catch (e: IOException) {
-                    if (http == null || done == before || ++resumes > RESUMES) throw e
+                    if (e is Cancelled || http == null || done == before || ++resumes > RESUMES) throw e
                     Log.w(TAG, "download of $url broke off at $done bytes, resuming", e)
                 } finally {
                     http?.disconnect()
@@ -282,21 +331,6 @@ internal object Rootfs {
             Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
 
             """.trimIndent()
-        Distro.UBUNTU -> "/etc/apt/sources.list.d/ubuntu.sources" to
-            """
-            Types: deb
-            URIs: http://$mirror/ubuntu-ports/
-            Suites: noble noble-updates noble-backports
-            Components: main universe restricted multiverse
-            Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-
-            Types: deb
-            URIs: http://$mirror/ubuntu-ports/
-            Suites: noble-security
-            Components: main universe restricted multiverse
-            Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-
-            """.trimIndent()
     }
 
     @Throws(IOException::class)
@@ -307,8 +341,8 @@ internal object Rootfs {
         if (distro == Distro.ALPINE) {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
         } else {
-            // Debian 的没有 hosts，resolv.conf 指向 1.1.1.1；Ubuntu 的两个都是空文件。DNS 要走
-            // 内核层的存根（设计文档 §10），系统的私人 DNS、VPN 才生效
+            // Debian 的没有 hosts，resolv.conf 指向 1.1.1.1。DNS 要走内核层的存根（设计文档
+            // §10），系统的私人 DNS、VPN 才生效
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
@@ -326,7 +360,7 @@ internal object Rootfs {
         )
         val install = when (distro) {
             Distro.ALPINE -> "apk add git python3"
-            else -> "apt update && apt install git python3"
+            Distro.DEBIAN -> "apt update && apt install git python3"
         }
         write(
             store, "/etc/motd",
@@ -339,19 +373,42 @@ internal object Rootfs {
         )
     }
 
+    /** 写在包管理器的源里的镜像（[Distro.mirrors] 的一项）；还没有仓库时是 null。 */
+    fun mirror(context: Context): String? = if (isReady(context)) prefs(context).getString(KEY_MIRROR, null) else null
+
+    /** 镜像是用户在设置里选的（不是测速选的）。 */
+    fun isMirrorManual(context: Context): Boolean = prefs(context).getBoolean(KEY_MIRROR_MANUAL, false)
+
     /**
-     * 并发给 [distro] 的镜像测速，把最快的写进包管理器的源；全部失败时保持原样。会阻塞
-     * 几秒，在后台线程上调用。Debian、Ubuntu 的镜像只写主机名，测速用 https。
+     * 设置里选了 [mirror]：写进 [distro] 的包管理器的源（用户自己改过的也覆盖），之后不再测速
+     * 换掉它。内核运行着也可以写：仓库的提交计数器变了，内核层的缓存随之作废（设计文档 §8.1）。
+     */
+    @Throws(IOException::class)
+    fun setMirror(context: Context, distro: Distro, mirror: String) = synchronized(this) {
+        val (path, content) = sources(distro, mirror)
+        write(store(context).path, path, content)
+        prefs(context).edit().putString(KEY_MIRROR, mirror).putBoolean(KEY_MIRROR_MANUAL, true).apply()
+    }
+
+    /**
+     * 并发给 [distro] 的镜像测速，把最快的写进包管理器的源；全部失败时保持原样。用户在设置里
+     * 选了镜像（测速期间也算）就不动。会阻塞几秒，在后台线程上调用。Debian 的镜像只写主机名，
+     * 测速用 https。
      */
     fun chooseMirror(context: Context, distro: Distro) {
+        prefs(context).edit().putBoolean(KEY_MIRROR_MANUAL, false).apply()
         val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
         val speeds = probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" })
         val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return
         Log.i(TAG, "mirror speeds: ${distro.mirrors.zip(speeds)}, using ${best.first}")
-        runCatching {
-            val (path, content) = sources(distro, best.first)
-            write(store(context).path, path, content)
-        }.onFailure { Log.w(TAG, "cannot write the package sources", it) }
+        synchronized(this) {
+            if (isMirrorManual(context)) return
+            runCatching {
+                val (path, content) = sources(distro, best.first)
+                write(store(context).path, path, content)
+                prefs(context).edit().putString(KEY_MIRROR, best.first).apply()
+            }.onFailure { Log.w(TAG, "cannot write the package sources", it) }
+        }
     }
 
     /** [urls] 按测出的速度从快到慢排好，测不了的按原来的顺序排在后面。只有一个时不测。 */

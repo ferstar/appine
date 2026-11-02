@@ -41,11 +41,11 @@
 
 **推迟项**：
 
-- Debian 的 tarball 只有 GitHub 一个来源，国内直连只有 18 KB/s，47 MB 要下四十多分钟；没有镜像站带 debuerreotype 的构建。可以自己放一份，或者改用清华、中科大的 LXC 镜像（每天构建、旧的几天后删掉，没法固定摘要，而且是 xz，导入只认 gzip）。
-- 版本固定在 App 里：Debian、Ubuntu 出了新的小版本要发新版 App 才换，已经装好的由用户自己 `apt upgrade`。
+- Debian 的 tarball 只有 GitHub 一个来源，国内直连只有 18 KB/s，47 MB 要下四十多分钟；没有镜像站带 debuerreotype 的构建。可以自己放一份，或者改用清华、中科大的 LXC 镜像（每天构建、旧的几天后删掉，没法固定摘要，而且是 xz，导入只认 gzip）。→ 定了暂时只用 GitHub 这个官方来源，不自己托管（M9：设置页，默认导入 Alpine）；换成 Debian 改为先在后台下载，下载期间原来的系统照常能用，慢的问题仍在
+- 版本固定在 App 里：Debian、Ubuntu 出了新的小版本要发新版 App 才换，已经装好的由用户自己 `apt upgrade`。→ Ubuntu 按决定去掉了（M9：设置页，默认导入 Alpine）；Debian 仍是这样
 - 一次只有一个 rootfs，换发行版就丢掉原来的文件；没有导出、导入（§11.4 放到 v1.x），也不能两个发行版同时用、共用文件（那时再回来做 mount）。
-- 下载中途不能取消、回去换一个，只能等它失败或者结束 App。
-- 以后换软件源镜像仍要手改（没有设置界面）。
-- 两个 rootfs 都很小：ip、less、vi、curl 都没有（Ubuntu 有 ps），ubuntu-base 的 dpkg 还不装 man 和 doc。
-- 只有这三个发行版，没有 Fedora、Arch 等。
+- 下载中途不能取消、回去换一个，只能等它失败或者结束 App。→ 换发行版改为先在后台下载，设置页和通知里都能取消，取消、失败时原来的系统不动（M9：设置页，默认导入 Alpine）
+- 以后换软件源镜像仍要手改（没有设置界面）。→ 设置里可以从内置的镜像里选，或者选回自动测速（M9：设置页，默认导入 Alpine）；列表以外的镜像仍要手改
+- 两个 rootfs 都很小：ip、less、vi、curl 都没有（Ubuntu 有 ps），ubuntu-base 的 dpkg 还不装 man 和 doc。→ Ubuntu 去掉了（M9：设置页，默认导入 Alpine）；Debian 的仍然很小
+- 只有这三个发行版，没有 Fedora、Arch 等。→ 按决定去掉了 Ubuntu，只剩 Alpine 和 Debian（M9：设置页，默认导入 Alpine）；仍没有 Fedora、Arch 等
 - 测速仍是估计：5 秒、512 KB 的吞吐量看不出之后会不会被限速，慢但没断的来源不会换。

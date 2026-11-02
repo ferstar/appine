@@ -47,18 +47,16 @@ class MainActivity : Activity(), TerminalService.Listener {
     private var current: TerminalSession? = null
     private var fontSize = 0
 
-    /** 选发行版的对话框；Activity 停下时关掉，回来时服务还在等就再弹出来。 */
-    private var chooser: AlertDialog? = null
-
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val s = (binder as TerminalService.LocalBinder).service
             service = s
-            s.listener = this@MainActivity
+            s.addListener(this@MainActivity)
             when {
-                s.needsDistro -> onNeedDistro(s.installError)
                 s.machine != 0L || s.startError != null -> onMachineReady(s.startError)
+                s.progress != null -> onProgress(s.progress!!)
             }
+            onNotice()
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -132,9 +130,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     override fun onStop() {
-        chooser?.dismiss()
-        chooser = null
-        service?.listener = null
+        service?.removeListener(this)
         unbindService(connection)
         service = null
         super.onStop()
@@ -145,6 +141,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onMachineReady(error: String?) {
         val s = service ?: return
         if (error != null) {
+            terminal.visibility = View.INVISIBLE
+            status.visibility = View.VISIBLE
             status.text = getString(R.string.start_failed, error)
             return
         }
@@ -157,16 +155,19 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    override fun onNeedDistro(error: String?) {
+    override fun onProgress(text: String) {
         terminal.visibility = View.INVISIBLE
         status.visibility = View.VISIBLE
-        status.text = ""
-        showChooser(error)
+        status.text = text
     }
 
-    override fun onProgress(text: String) {
-        status.visibility = View.VISIBLE
-        status.text = text
+    /** 换发行版没有成功（下载失败、导入失败退回了 Alpine）。 */
+    override fun onNotice() {
+        val text = service?.takeNotice() ?: return
+        AlertDialog.Builder(this)
+            .setMessage(text)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     override fun onSessionsChanged() {
@@ -199,63 +200,14 @@ class MainActivity : Activity(), TerminalService.Listener {
         status.setText(R.string.restarting)
     }
 
-    // ---- rootfs ----
-
-    /**
-     * 第一次运行、重置之后选发行版（设计文档 §11.4）；要下载的标出大小。上次准备失败时
-     * 把原因写在标题下面（对话框挡住了中间的状态文字）。
-     */
-    private fun showChooser(error: String?) {
-        if (chooser != null) return
-        val distros = Rootfs.Distro.entries
-        val labels = distros.map { d ->
-            d.download?.let { getString(R.string.distro_download, d.label, it.size shr 20) } ?: d.label
-        }
-        val builder = AlertDialog.Builder(this)
-        if (error == null) {
-            builder.setTitle(R.string.choose_distro)
-        } else {
-            builder.setCustomTitle(TextView(this).apply {
-                text = getString(R.string.choose_distro_after_failure, error)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                setPadding(dp(24), dp(20), dp(24), dp(4))
-            })
-        }
-        chooser = builder
-            .setItems(labels.toTypedArray()) { _, i ->
-                chooser = null
-                status.text = getString(R.string.preparing, distros[i].label)
-                service?.install(distros[i])
-            }
-            .setCancelable(false)
-            .show()
-    }
-
     private fun showMenu(anchor: View) {
-        val s = service ?: return
-        if (s.machine == 0L) return
         PopupMenu(this, anchor).apply {
-            menu.add(R.string.menu_reset).setOnMenuItemClickListener {
-                confirmReset()
+            menu.add(R.string.menu_settings).setOnMenuItemClickListener {
+                startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                 true
             }
             show()
         }
-    }
-
-    private fun confirmReset() {
-        AlertDialog.Builder(this)
-            .setTitle(R.string.reset_title)
-            .setMessage(R.string.reset_message)
-            .setPositiveButton(R.string.reset) { _, _ ->
-                current = null
-                terminal.visibility = View.INVISIBLE
-                status.visibility = View.VISIBLE
-                status.setText(R.string.resetting)
-                service?.reset()
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
     }
 
     // ---- 会话 ----

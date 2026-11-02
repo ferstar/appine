@@ -609,7 +609,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 ### 11.1 凭据与权限
 
 - 按 Linux 的 `struct cred` 实现（`core/kernel/src/cred.rs`）：ruid/euid/suid/fsuid、对应的四个 gid、附加组、umask。凭据放在线程组里（libc 的 setuid 系列本来就会让每个线程都调用一遍）。VFS 做 DAC 权限检查（`generic_permission`、粘滞位、setgid 目录），root 经由能力绕过。 `fs.protected_symlinks`、`fs.protected_hardlinks` 默认打开（与 systemd、Android 设的一样），规则同 Linux 6.1 的 `may_follow_link`、`may_linkat`：粘滞位、所有人可写的目录（/tmp）里，最后一个组件是别人的符号链接、并且链接的属主不是目录的属主时不跟随（EACCES，root 也一样）；不是文件的属主、也没有 `CAP_FOWNER` 时只能硬链接能读写的普通文件，setuid、可执行的 setgid 文件不行（EPERM）。不持 BKL 的路径解析遇到这种链接交给正常的解析（[sysctl 和随机数的 ioctl](rounds/185-protected-links-random.md)）。
-- **默认以 root 登录**。设置里提供"以指定用户登录"（App 还没有设置界面）。
+- **默认以 root 登录**。设置里提供"以指定用户登录"（设置页还没有这一项）。
 - setuid/setgid 位在 execve 时生效（`PR_SET_NO_NEW_PRIVS` 之后、被没有 `CAP_SYS_PTRACE` 的跟踪者跟踪着时得不到新的特权），特权执行设置 `AT_SECURE`。写、截短普通文件时，没有 `CAP_FSETID` 的进程去掉它的 setuid 位和带着组执行位时的 setgid 位，chown 总是去掉（`file_remove_privs`、`chown_common`）。
 - 支持 `chroot`（每个进程记录自己的根目录）。
 - capabilities 按 capabilities(7) 的规则随用户 ID 变化：有效用户 ID 为 0 时拥有边界集内的全部能力，变成非 0 时清空有效集，三个用户 ID 都非 0 时清空允许集，文件系统能力跟着 fsuid；`capset`、`PR_CAPBSET_DROP` 可以缩小。execve 按 Linux 6.1 的 `cap_bprm_creds_from_file` 变换能力：程序文件的能力存在扩展属性 `security.capability` 里（v1、v2、v3，v3 只有 rootid 为 0 的起作用），环境（ambient）能力在执行不带特权的程序时保留下来；securebits 的 `NOROOT`、`NO_SETUID_FIXUP`、`KEEP_CAPS`、`NO_CAP_AMBIENT_RAISE` 和它们的锁与 Linux 相同。设置文件能力要 `CAP_SETFCAP`，写、截短、chown 时去掉（[文件能力](rounds/100-file-caps.md)）。扩展属性的权限按 `xattr_permission` 检查：`trusted.*` 要 `CAP_SYS_ADMIN`，`user.*` 要文件的读写权限，写别的 `security.*` 要 `CAP_SYS_ADMIN`。
@@ -633,18 +633,20 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 - **v1.x：SAF 目录挂载到 `/mnt/<名字>`**。权限位是合成的（目录 0755、文件 0644）；`chmod`/`chown` 静默成功；`symlink`/`link` 返回 `EPERM`；目录列表在内存中缓存；不区分大小写这一点写进文档。
 - 不申请 `MANAGE_EXTERNAL_STORAGE`，Play 不批准终端类 App 使用。
 
-### 11.4 首次启动
+### 11.4 首次启动和设置
 
-`android/app/src/main/java/.../Rootfs.kt`：
+`android/app/src/main/java/.../Rootfs.kt`、`SettingsActivity.kt`：
 
-1. 第一次运行时让用户选发行版：Alpine Linux、Debian 13、Ubuntu 24.04。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里；Debian（debuerreotype 构建的 `debian:trixie`，固定在一个提交上）、Ubuntu（官方的 ubuntu-base，清华、中科大的镜像上有同一份）的选了才下载，版本、长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。原计划还要校验官方的 GPG 签名，没有做。
-2. 以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。
-3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有，Ubuntu 的是空的）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd，切到 `$HOME`）。每次启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的（与 setup-alpine 写的一样）：网络是宿主的，OpenRC 为要网络的服务拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 的 `rc_provide`：它加到每一个服务上，容易成环（[第 187 轮](rounds/187-app-init.md)）。每次开机之前，装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，用 `rc-update add osclock boot` 把 osclock 加进 boot：busybox 的 syslog `need clock`，OpenRC 默认用 hwclock 提供它，而 appine 没有 RTC、也设不了宿主的时间（§7），hwclock 必然失败；osclock 表示时间由操作系统管，正是这样。用户放了哪个时钟服务就不动。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1、Ubuntu 的是空的，App 改成指向 DNS 存根。
-4. 终端标签页以 `/etc/passwd` 里 root 的 shell 登录（`ConsolePty.LOGIN`）：Alpine 是 ash，Debian、Ubuntu 是 bash，chsh 改过之后照样。
+1. 第一次运行时直接导入 Alpine Linux，不让用户选。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里。换成 Debian 13 要到设置里（[设置页，默认导入 Alpine](rounds/190-settings-default-alpine.md)）：debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份，固定在一个提交上），选了才下载，长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。它只有 GitHub 一个来源，国内直连很慢，暂不自己托管。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。原计划还要校验官方的 GPG 签名，没有做。Ubuntu 原来也可以选，第 190 轮按决定去掉了。
+2. 以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里（改名之前写到盘上）。
+3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd，切到 `$HOME`）。每次启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的（与 setup-alpine 写的一样）：网络是宿主的，OpenRC 为要网络的服务拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 的 `rc_provide`：它加到每一个服务上，容易成环（[第 187 轮](rounds/187-app-init.md)）。每次开机之前，装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，用 `rc-update add osclock boot` 把 osclock 加进 boot：busybox 的 syslog `need clock`，OpenRC 默认用 hwclock 提供它，而 appine 没有 RTC、也设不了宿主的时间（§7），hwclock 必然失败；osclock 表示时间由操作系统管，正是这样。用户放了哪个时钟服务就不动。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1，App 改成指向 DNS 存根。
+4. 终端标签页以 `/etc/passwd` 里 root 的 shell 登录（`ConsolePty.LOGIN`）：Alpine 是 ash，Debian 是 bash，chsh 改过之后照样。
 
-- **镜像选择**：每个发行版内置一份镜像列表：官方的（dl-cdn、deb.debian.org、ports.ubuntu.com）、清华、中科大、阿里云。首次启动时在后台并发测速（与下载 tarball 的测速相同），选最快的写入包管理器的源，全部失败时保持官方的。设置里手动更换镜像还没做。
+- **设置页**：标签栏菜单里的"设置"。状态都在 `TerminalService` 里，设置页只显示和转达；有设置页或终端界面在，都算界面可见（不释放缓存、不因为没有会话而退出）。
+- **换发行版、重置 rootfs**：重置是换成装着的那个。确认之后先在后台下载并校验 tarball，这期间原来的系统照常运行，进度显示在设置页和通知里，两处都能取消；下载好了才结束所有会话、停下内核、删掉仓库、导入新的，这时回到终端界面看进度。下载失败时原来的系统不动，告诉用户原因；导入失败（下载已经校验过，多半是空间不够）时退回 APK 里的 Alpine。内核启动失败时也能在设置里重置，坏掉的仓库靠它恢复。取消之后旧的下载线程可能还卡在连接上（最多一个超时），这期间不开始新的下载。一次只有一个 rootfs，换发行版就丢掉原来的文件；rootfs 导出和导入（tar 格式）放到 v1.x。
+- **镜像选择**：每个发行版内置一份镜像列表：官方的（dl-cdn、deb.debian.org）、清华、中科大、阿里云。导入之后在后台并发测速（与下载 tarball 的测速相同），选最快的写入包管理器的源，全部失败时保持官方的。设置里可以手动选一个（覆盖源文件，之后测速不再换掉它），或者选回"自动"重新测速。内核运行着也可以写：仓库的提交计数器让内核层的缓存作废（§8.1）。
+- **执行层**：设置里可以换成 Tier 0（解释器，排查问题用），记下之后重启内核。
 - **升级**：App 更新时不动用户已有的 rootfs。同一分支内由用户自己运行 `apk upgrade`、`apt upgrade`；跨分支升级由用户修改源。
-- **重置 rootfs**：标签栏的菜单里，确认之后结束所有会话和 guest 进程，删掉仓库，重新选发行版（[App 里选 rootfs](rounds/99-choose-rootfs.md)）。一次只有一个 rootfs，换发行版就丢掉原来的文件；rootfs 导出和导入（tar 格式）放到 v1.x。
 
 ---
 
@@ -766,7 +768,7 @@ docs/            设计文档（design.md），各轮的记录（rounds/，索�
 | **M6 B 档负载** | ✅ | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
 | **M7 Tier 1 正式版** | ✅ | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
-| **M9 发布** | 未开始 | 被杀后恢复标签页、wake lock 开关、许可证审计 | Play 正式版上线 |
+| **M9 发布** | 进行中（[第 190 轮](rounds/190-settings-default-alpine.md)起） | 设置页、被杀后恢复标签页、wake lock 开关、许可证审计、以指定用户登录、进程被结束的提示、DocumentsProvider | Play 正式版上线 |
 
 M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、按对象唤醒、core dump、cgroup v2 的视图、seccomp，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 
