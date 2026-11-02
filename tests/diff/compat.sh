@@ -1123,6 +1123,7 @@ awk '{ $7 = "R"; print }' /proc/net/ipv6_route
 # socket，TCP 的 alloc 是整个系统的）
 python3 - <<'PY'
 import socket
+import time
 
 
 def counts():
@@ -1137,7 +1138,22 @@ def counts():
     return out
 
 
-before = counts()
+def settled():
+    """前面用例关掉的 socket 由内核晚一点释放，"sockets used" 会接着往下掉：等它连续 0.1 秒不变
+    （最多 3 秒）再读。原来不等，Linux 宿主上的原生一侧几次里有一次少数两个以上。"""
+    last = counts()
+    stable = 0
+    for _ in range(60):
+        time.sleep(0.05)
+        cur = counts()
+        stable = stable + 1 if cur["sockets used"] == last["sockets used"] else 0
+        last = cur
+        if stable >= 2:
+            break
+    return last
+
+
+before = settled()
 keep = []
 for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
     listener = socket.socket(family)
