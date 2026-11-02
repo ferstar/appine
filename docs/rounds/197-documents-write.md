@@ -1,6 +1,6 @@
 # M9：在"文件"App 里改家目录（2026-11-02）
 
-← [M9：在"文件"App 里浏览（只读）（2026-11-02）](196-documents-read.md) · [索引](../milestones.md)
+← [M9：在"文件"App 里浏览（只读）（2026-11-02）](196-documents-read.md) · [索引](../milestones.md) · [M9：断电之后仓库不坏（2026-11-03）](198-power-loss.md) →
 
 M9 计划的最后一轮，接着[上一轮](196-documents-read.md)的只读浏览，让 DocumentsProvider 能改登录账号的家目录：在"文件"App 里"复制到…"appine、新建文件夹、删除、改名、移动，别的 App 的"保存到"里也能选 appine。整个系统那个根仍然只读。
 

@@ -104,6 +104,15 @@ pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Re
     .unwrap_or(Err(Errno::EIO))
 }
 
+/// 把宿主目录 `store` 里的 inode 仓库（连同所在的整个宿主文件系统）写到盘上：导入
+/// rootfs、写好配置之后，改名就位之前（设计文档 §11.4）。不然断电之后仓库在了，里面的
+/// object 却可能还是空的。
+pub fn sync_store(store: &Path) -> Result<(), Errno> {
+    let dir =
+        std::fs::File::open(store).map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    appine_hal::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)).map_err(Errno)
+}
+
 /// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。
 ///
 /// 目录里已经有仓库时返回 `EEXIST`。导入失败时仓库保持为空。

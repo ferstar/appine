@@ -496,8 +496,13 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
   - mode、uid/gid、xattr、nlink，以及别的 inode 的 mtime、ctime 存在 SQLite 里。目录里新建、删除、改名时，目录的 mtime、ctime 改成当时的时间（Python 的 import、Maildir、git 按目录的 mtime 发现变化）。
 - 硬链接就是多个目录项指向同一个 ino。每个元数据操作（新建、删除、`rename`、改属性）要么全部生效，要么全部不生效。
 - **推迟提交**：一次提交要把改了的页写进 WAL（每页两次 pwrite，加上 WAL 索引的加解锁），约 15 微秒，比操作本身（约 2 微秒）贵得多。所以写事务打开之后最多推迟 5 毫秒提交，期间的每个操作是事务里的一个保存点，出错（或者内核层 panic）时只回滚到它自己的保存点。到点时由下一个操作或者定时器线程提交；guest 的 `fsync`、`fdatasync`、`sync`、`syncfs`，宿主调用 `Machine::sync`、`trim_memory`（Android 的 `onTrimMemory`，§11.2），以及内核实例关闭时立即提交。
-  - App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态。Linux 断电时丢失的更多（ext4 默认每 5 秒提交一次日志）；guest 用 fsync 要求持久的修改不会丢。
+  - App 被杀掉时最多丢失最后几毫秒的元数据修改，仓库仍然是某次提交时的完整状态，宿主的页缓存都在。Linux 断电时丢失的更多（ext4 默认每 5 秒提交一次日志）。
   - 删除最后一个链接时，宿主 object 等提交之后再删：提交之前被杀掉的话，目录项还在，object 也得在。
+  - **断电**（宿主崩溃、手机没电、模拟器被强行关掉）时宿主页缓存里的都丢了：提交只把帧写进 WAL、不刷（`synchronous = NORMAL`），WAL 和 object 由宿主各自写回，先后没有保证。按原生 ext4（data=ordered、auto_da_alloc）的语义补三处顺序（[断电之后仓库不坏](rounds/198-power-loss.md)）：
+    - guest 要求落盘的真的落盘：fsync、fdatasync 先让宿主刷 object，再提交、等 WAL 落盘（`Meta::sync_metadata`，没有新的提交就不刷）；目录只做后者；sync、syncfs 提交之后对整个宿主文件系统 syncfs。`O_DSYNC`、`O_SYNC`（以及 pwritev2 的 `RWF_DSYNC`、`RWF_SYNC`）的写完了刷 object，`msync(MS_SYNC)` 交给宿主的 msync，sync_file_range 交给宿主。刷盘时放开 BKL。
+    - 改名覆盖别的文件的普通文件，在包含这次改名的提交之前先让它的数据落盘（不超过 16 个时逐个 fdatasync，多了 syncfs 一次）：apk 装文件、编辑器存盘都是写临时文件再改名、不调 fsync，原生 ext4 的 auto_da_alloc 在改名时替它们写回；appine 的改名只在数据库里，宿主看不到。这一步在提交里，持着 BKL。截断到 0 再写的情形发生在 object 本身上，宿主的 ext4 自己管。
+    - 删除 object 之前先等删掉它最后一个链接的提交落盘（后台线程先刷 WAL）：不然断电之后数据库回到之前的状态，名字还在，object 却没了。
+    - 新建、没有 fsync 的文件断电之后可能是空的，与原生一样。导入 rootfs、写好配置之后 syncfs 一次才改名就位。
   - **检查点**（把 WAL 写回数据库文件，fsync 两次）由仓库的后台线程用自己的连接做（PASSIVE，不挡写者），不在多半持着 BKL 的提交里：手机上一次 fsync 就是几毫秒到几十毫秒，这期间要进内核的 guest 线程都要等。`sqlite3_wal_hook` 代替 SQLite 默认的自动检查点，每多出 1000 页请后台线程做一次；WAL 只有在全部写回之后开始的写事务里才从头再用，所以 WAL 长过 1000 页、还有没写回的帧时，后台线程在写入停下 100 毫秒之后再写回一次。一直有提交、后台总差最后几帧时，WAL 长到 1 万页由提交的线程就地补上（大部分帧后台已经写回）。WAL 从头再用时截短到 8 MB（`journal_size_limit`）。
   - 新建普通文件的 object 立即建好（guest 马上就要读写）。提交之前被杀掉的话，这些 inode 随事务丢失，object 却留了下来；编号以后会再分配出去，分给目录这类没有 object 的 inode 时它就永远留下了。所以 `lock` 文件里记着还没提交的写事务新分配的 inode 编号范围，下次开机删掉范围里没有 inode 行的 object；新建 object 时已经有同名的就清空接着用。
 - 读写数据直接对宿主 fd 做 `pread`/`pwrite`。两个普通文件之间的 `sendfile`、`copy_file_range` 交给宿主的 `sendfile`（Android 14 之前 App 的 seccomp 不允许 `copy_file_range`，会收到 SIGSYS），数据不经过内核层。
@@ -641,7 +646,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 `android/app/src/main/java/.../Rootfs.kt`、`SettingsActivity.kt`：
 
 1. 第一次运行时直接导入 Alpine Linux，不让用户选。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里。换成 Debian 13 要到设置里（[设置页，默认导入 Alpine](rounds/190-settings-default-alpine.md)）：debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份，固定在一个提交上），选了才下载，长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。它只有 GitHub 一个来源，国内直连很慢，暂不自己托管。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。Alpine 的 tarball 由 `scripts/fetch-rootfs` 在下载时验官方的 GPG 签名（[许可证](rounds/192-license.md)那一轮加的）；App 运行时只比固定的 sha256，不另外验签：摘要写在 App 里，验签不会更可信。Debian 的 debuerreotype 构建没有签名，只比 sha256。Ubuntu 原来也可以选，第 190 轮按决定去掉了。
-2. 以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里（改名之前写到盘上）。
+2. 以流的方式导入 `rootfs.tmp`，完成后（连同第 3 步写的配置）对整个文件系统 syncfs 一次再改名，改名之后让 `files` 目录也落盘（§8.1 的断电）；导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里（改名之前写到盘上）。
 3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd，切到 `$HOME`）。每次启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的（与 setup-alpine 写的一样）：网络是宿主的，OpenRC 为要网络的服务拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 的 `rc_provide`：它加到每一个服务上，容易成环（[第 187 轮](rounds/187-app-init.md)）。每次开机之前，装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，用 `rc-update add osclock boot` 把 osclock 加进 boot：busybox 的 syslog `need clock`，OpenRC 默认用 hwclock 提供它，而 appine 没有 RTC、也设不了宿主的时间（§7），hwclock 必然失败；osclock 表示时间由操作系统管，正是这样。用户放了哪个时钟服务就不动。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1，App 改成指向 DNS 存根。
 4. 终端标签页以 `/etc/passwd` 里 root 的 shell 登录（`ConsolePty.LOGIN`）：Alpine 是 ash，Debian 是 bash，chsh 改过之后照样。
 

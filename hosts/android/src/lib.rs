@@ -123,6 +123,21 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_importRootfs<'l>(
     }
 }
 
+/// 把仓库写到盘上（导入、写好配置之后，改名就位之前）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_syncRootfs<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+) {
+    let Some(store) = string(&mut env, &store) else {
+        return;
+    };
+    if let Err(e) = appine_kernel::sync_store(store.as_ref()) {
+        throw(&mut env, format!("cannot sync the rootfs: {e}"));
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
     mut env: JNIEnv<'l>,

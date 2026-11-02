@@ -2,6 +2,9 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
@@ -167,7 +170,25 @@ internal object Rootfs {
                 .putBoolean(KEY_MIRROR_MANUAL, false)
                 .commit()
         }
+        // 改名之前写到盘上：不然断电之后仓库就位了，里面的文件却可能是空的；改名之后让目录也
+        // 落盘，之后写进仓库的东西不会随着断电回到 rootfs.tmp、被当作没导入完删掉
+        Native.syncRootfs(tmp.path)
         if (!tmp.renameTo(store)) throw IOException("cannot move the rootfs into place")
+        syncDir(store.parentFile!!)
+    }
+
+    /** 让目录 [dir] 里的改名、删除落盘。 */
+    private fun syncDir(dir: File) {
+        try {
+            val fd = Os.open(dir.path, OsConstants.O_RDONLY, 0)
+            try {
+                Os.fsync(fd)
+            } finally {
+                Os.close(fd)
+            }
+        } catch (e: ErrnoException) {
+            Log.w(TAG, "cannot sync ${dir.path}", e)
+        }
     }
 
     /** 删掉 App 的仓库（换发行版、重置 rootfs）。内核要先停下。 */

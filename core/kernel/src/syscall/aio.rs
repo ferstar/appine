@@ -233,7 +233,7 @@ fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<
     // 内核把 aio_key 写成 0（KIOCB_KEY），io_cancel 拿它核对
     put(cx, obj + 8, 0u32.to_le_bytes())?;
     let res = match op {
-        IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => match super::fs::fsync(cx, fd) {
+        IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => match super::fs::fsync(cx, fd, op == IOCB_CMD_FDSYNC) {
             Ok(_) => 0,
             Err(e) => -(e.0 as i64),
         },

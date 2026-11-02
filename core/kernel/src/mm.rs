@@ -2467,6 +2467,26 @@ impl Mm {
             .sum()
     }
 
+    /// `[addr, addr + len)` 里文件的共享映射对应的宿主地址区间，按宿主的页对齐（msync 的
+    /// `MS_SYNC`：宿主映射的就是 object，交给宿主写回）。
+    pub fn shared_file_ranges(&self, addr: u64, len: u64) -> Vec<(usize, usize)> {
+        let end = addr.saturating_add(len);
+        let page = appine_hal::page_size();
+        self.vmas
+            .iter()
+            .filter(|&(&s, v)| {
+                v.backing == Backing::Shared && v.file_id.is_some() && s < end && s + v.len > addr
+            })
+            .map(|(&s, v)| {
+                let from = s.max(addr);
+                let host = v.host.as_ptr() as usize + (from - s) as usize;
+                let start = host & !(page - 1);
+                let stop = (host + ((s + v.len).min(end) - from) as usize).next_multiple_of(page);
+                (start, stop - start)
+            })
+            .collect()
+    }
+
     /// madvise 关心的区间性质：(区间里有没有锁住的页, 是不是全部是私有的匿名内存)。
     /// 区间必须完全已映射。
     pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {

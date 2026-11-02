@@ -127,6 +127,57 @@ pub fn copy_file(
     }
 }
 
+/// 把宿主文件 `fd` 写到盘上：`data_only` 时是 fdatasync（数据和读出数据要的元数据，比如
+/// 长度），否则是 fsync。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn fsync(fd: i32, data_only: bool) -> Result<(), i32> {
+    let r = unsafe {
+        if data_only {
+            libc::fdatasync(fd)
+        } else {
+            libc::fsync(fd)
+        }
+    };
+    if r < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// [`sync_file_range`] 的标志：开始写回（不等）。libc crate 的 Android 部分没有这个常量。
+pub const SYNC_FILE_RANGE_WRITE: u32 = 2;
+
+/// sync_file_range(2)：开始写回、等待宿主文件 `fd` 里一段的脏页（`flags` 是
+/// `SYNC_FILE_RANGE_WAIT_BEFORE`、`WRITE`、`WAIT_AFTER` 的组合），不刷元数据和磁盘缓存。
+/// libc crate 的 Android 部分没有它的绑定（bionic 有），直接按编号调用；arm64 上参数就是
+/// 这个顺序（不是 sync_file_range2）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn sync_file_range(fd: i32, offset: i64, len: i64, flags: u32) -> Result<(), i32> {
+    if unsafe { libc::syscall(libc::SYS_sync_file_range, fd, offset, len, flags) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// 把宿主 fd `fd` 所在的整个文件系统写到盘上（syncfs）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn syncfs(fd: i32) -> Result<(), i32> {
+    if unsafe { libc::syncfs(fd) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// msync(2) 的 `MS_SYNC`：把宿主上 `[addr, addr + len)` 的共享文件映射里改过的页写回文件，
+/// 等写完。`addr` 要按宿主的页对齐。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn msync(addr: usize, len: usize) -> Result<(), i32> {
+    if unsafe { libc::msync(addr as *mut libc::c_void, len, libc::MS_SYNC) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 /// 从宿主 fd 的 `offset` 处读取（pread），遇到 `EINTR` 自动重试。
 pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, i32> {
     loop {

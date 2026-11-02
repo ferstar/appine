@@ -121,7 +121,9 @@ fn main() -> ExitCode {
         let Some(store) = &options.rootfs else {
             return usage_error();
         };
-        return match appine_kernel::import_rootfs(store, &tarball) {
+        let imported = appine_kernel::import_rootfs(store, &tarball)
+            .and_then(|r| appine_kernel::sync_store(store).map(|()| r));
+        return match imported {
             Ok(r) => {
                 eprintln!(
                     "appine-run: imported {} files, {} directories, {} symlinks, {} hard links, {} device nodes",

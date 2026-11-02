@@ -20,6 +20,13 @@
 //! 断电时丢失的更多）。别的 appine 进程也在用仓库时每个操作立即提交。检查点（把 WAL
 //! 写回数据库文件，要 fsync）由后台线程做（[`wal_hook`]），不在多半持着 BKL 的提交里。
 //!
+//! 宿主断电（或者崩溃）时页缓存里的都会丢，盘上的数据库和 object 各自只剩写回了的部分。
+//! 提交只写不刷（`synchronous = NORMAL`），WAL 和 object 由宿主各自写回，先后没有保证。
+//! 要保证的是三件事（[`Meta::sync_metadata`]）：guest 要求落盘（fsync、sync……）的数据和
+//! 元数据真的在盘上；改名覆盖别的文件时，新文件的数据先于这次改名落盘
+//! （[`Store::flush_replaced`]，原生 ext4 的 auto_da_alloc）；删除 object 在删掉它的最后一个
+//! 链接的提交落盘之后（[`reap`]），断电之后数据库回到之前的状态时 object 还在。
+//!
 //! 路径解析和 stat 走内存里的元数据缓存（目录项，包括不存在的名字；inode 行；符号
 //! 链接目标），不逐级查询数据库。自己的写入只去掉受影响的条目。多个 appine 进程可以
 //! 共用一个仓库，所以 `lock` 文件的前 8 字节是所有进程共享映射的计数器：每次提交之后
@@ -68,6 +75,10 @@ const WAL_SIZE_LIMIT: i64 = 8 << 20;
 
 /// 宿主上 object 文件的权限位：只有 App 自己读写，guest 看到的权限记在数据库里。
 const OBJECT_MODE: u32 = 0o600;
+
+/// 一次提交里改名覆盖了别的文件的普通文件不超过这么多个时逐个 fdatasync，多了就对整个
+/// 文件系统 syncfs 一次（[`Store::flush_replaced`]）。
+const FLUSH_EACH: usize = 16;
 
 /// [`Store::set_times`] 设置的时间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +201,9 @@ pub struct Store {
     delay: Duration,
     /// 最后一个链接已经删除、等写事务提交之后再删除的 object。
     doomed: RefCell<Vec<Ino>>,
+    /// 写事务里改名覆盖了别的文件的普通文件：提交之前让它们的数据落盘
+    /// （[`Store::flush_replaced`]）。
+    replaced: RefCell<Vec<Ino>>,
     /// 开始推迟提交时调用：叫醒到点提交的线程（[`Store::commit_due`]）。
     waker: RefCell<Option<Box<dyn Fn()>>>,
     /// 删除 object 的后台线程（[`reap`]）。
@@ -225,6 +239,18 @@ pub(crate) struct Meta {
     objects_dir: OwnedFd,
     /// 等着后台线程删除的 object、要做的检查点（[`reap`]）。
     reaper: Reaper,
+    /// 仓库目录里 `lock` 文件的另一个 fd：syncfs 要普通的 fd，`objects_dir` 是 `O_PATH`。
+    fs: File,
+    /// WAL（`meta.db-wal`）的路径。
+    wal: PathBuf,
+    /// 上一次让 WAL 落盘之前提交计数器的值加一：之后没有新的提交就不必再刷
+    /// （[`Meta::sync_metadata`]）。0 是还没刷过。
+    durable: AtomicU64,
+    /// 让 WAL 落盘、提交之前刷改名覆盖的文件的次数（测试用）。
+    #[cfg(test)]
+    syncs: AtomicU64,
+    #[cfg(test)]
+    flushes: AtomicU64,
 }
 
 /// 提交之后要删除的 object 交给后台线程（[`reap`]）：宿主的 unlink 每个几微秒，还要拿
@@ -298,6 +324,11 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
             let inos = std::mem::take(&mut st.queue);
             st.busy = true;
             drop(st);
+            // 删掉它们最后一个链接的提交先落盘：不然断电之后数据库回到之前的状态，名字还在，
+            // object 却没了。刷的时候新交来的攒着，下一次一起
+            if let Err(e) = meta.sync_metadata() {
+                crate::debug::log(format_args!("inode store: syncing the WAL: {e:?}"));
+            }
             for ino in inos {
                 let _ = remove_object(&meta.objects_dir, ino);
             }
@@ -385,6 +416,36 @@ unsafe extern "C" fn wal_hook(
         unsafe { ffi::sqlite3_wal_checkpoint(db, name) };
     }
     ffi::SQLITE_OK
+}
+
+impl Meta {
+    /// 让已经提交的元数据落盘：提交只把帧写进 WAL，不刷（`synchronous = NORMAL`），这里等
+    /// WAL 写到盘上。检查点写回了的帧在数据库文件里，检查点已经刷过它；WAL 不在了（最后一个
+    /// 连接关闭时写回、删掉）也就没有要刷的。可以放开 BKL 调用。
+    pub(crate) fn sync_metadata(&self) -> Result<(), Errno> {
+        let seen = self.commits.get();
+        if self.durable.load(Ordering::Acquire) > seen {
+            return Ok(());
+        }
+        match File::open(&self.wal) {
+            Ok(f) => f.sync_data().map_err(io_err)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
+        }
+        #[cfg(test)]
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// 把仓库所在的整个宿主文件系统写到盘上（guest 的 sync、syncfs）：object 的数据、WAL
+    /// 和数据库文件一起。可以放开 BKL 调用。
+    pub(crate) fn sync_all(&self) -> Result<(), Errno> {
+        let seen = self.commits.get();
+        appine_hal::syncfs(self.fs.as_raw_fd()).map_err(Errno)?;
+        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        Ok(())
+    }
 }
 
 /// 删除 `objects` 目录里的 object；它已经不在时不算错误。
@@ -710,6 +771,9 @@ impl Store {
                 store.empty_dir(path)?;
             }
             store.remove_detached_dirs()?;
+            // 上次可能是被杀掉的，它最后的提交也许还只在宿主的页缓存里：按数据库直接删 object
+            // 之前先让它们落盘，不然紧接着断电时数据库回到之前，object 却没了（[`reap`]）
+            store.meta.sync_metadata()?;
             store.transaction(|s| s.remove_orphans())?;
             store.commit()?;
         }
@@ -846,6 +910,13 @@ impl Store {
             commits,
             objects_dir,
             reaper: Reaper::default(),
+            fs: lock.try_clone().map_err(io_err)?,
+            wal: dir.join("meta.db-wal"),
+            durable: AtomicU64::new(0),
+            #[cfg(test)]
+            syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            flushes: AtomicU64::new(0),
         });
         let reaper = {
             let (meta, db) = (meta.clone(), dir.join("meta.db"));
@@ -877,6 +948,7 @@ impl Store {
             pending: Cell::new(None),
             delay: COMMIT_DELAY,
             doomed: RefCell::default(),
+            replaced: RefCell::default(),
             waker: RefCell::new(None),
             fills: RefCell::default(),
         })
@@ -977,11 +1049,13 @@ impl Store {
     }
 
     /// 提交推迟的写事务（fsync、sync、关闭时），然后删除等着它的 object。提交失败时
-    /// 推迟的修改全部丢失：数据库回到上次提交时的状态，缓存整个清空。
+    /// 推迟的修改全部丢失：数据库回到上次提交时的状态，缓存整个清空。只写进 WAL，不等它
+    /// 落盘（[`Meta::sync_metadata`]）。
     pub fn commit(&self) -> Result<(), Errno> {
         if self.pending.take().is_none() {
             return Ok(());
         }
+        self.flush_replaced();
         let r = self.exec("COMMIT");
         let doomed = std::mem::take(&mut *self.doomed.borrow_mut());
         if r.is_err() {
@@ -995,9 +1069,9 @@ impl Store {
         let (lo, hi) = self.meta.commits.fresh();
         lo.store(0, Ordering::SeqCst);
         hi.store(0, Ordering::SeqCst);
-        self.reap_later(doomed);
         // 计数器必须在提交之后加：之前加的话，别的进程可能赶在提交完成之前重新读到旧的
-        // 内容，再记成新的计数。计数器在这之前被别人改过，自己的缓存也整体作废
+        // 内容，再记成新的计数。计数器在这之前被别人改过，自己的缓存也整体作废。也要在交给
+        // 后台线程删除之前加：它按计数器判断这次提交落盘了没有（[`Meta::sync_metadata`]）
         self.update(|c| {
             let before = self.meta.commits.bump();
             if before == c.generation {
@@ -1006,7 +1080,50 @@ impl Store {
                 c.clear(before + 1);
             }
         });
+        self.reap_later(doomed);
         Ok(())
+    }
+
+    /// 写事务里改名覆盖了别的文件的普通文件（[`Store::rename`]），在提交之前让它们的数据
+    /// 落盘：提交之后 WAL 随时可能被宿主写回到盘上，那时新文件的内容要已经在盘上，断电之后
+    /// 名字下面才不会是空的或者半截的文件。原生的 ext4 在改名覆盖时做同样的事
+    /// （auto_da_alloc），apk 装文件、编辑器存盘都靠它，不调 fsync；appine 的改名只在数据库
+    /// 里，宿主看不到。几个时逐个 fdatasync（先都开始写回，ext4 上合进一次日志提交），多了
+    /// 就对整个文件系统 syncfs 一次。持着 BKL，刷的时候别的进程要等。刷不了只记下来。
+    fn flush_replaced(&self) {
+        let mut inos = std::mem::take(&mut *self.replaced.borrow_mut());
+        if inos.is_empty() {
+            return;
+        }
+        inos.sort_unstable();
+        inos.dedup();
+        let r = if inos.len() > FLUSH_EACH {
+            appine_hal::syncfs(self.meta.fs.as_raw_fd())
+        } else {
+            // 改名之后又删掉了的打不开，不用管
+            let files: Vec<File> = inos
+                .iter()
+                .filter_map(|&ino| self.open_object(ino, false).ok())
+                .collect();
+            for f in &files {
+                let _ = appine_hal::sync_file_range(
+                    f.as_raw_fd(),
+                    0,
+                    0,
+                    appine_hal::SYNC_FILE_RANGE_WRITE,
+                );
+            }
+            files
+                .iter()
+                .try_for_each(|f| appine_hal::fsync(f.as_raw_fd(), true))
+        };
+        if let Err(e) = r {
+            crate::debug::log(format_args!("inode store: flushing replaced files: {e}"));
+        }
+        #[cfg(test)]
+        self.meta
+            .flushes
+            .fetch_add(inos.len() as u64, Ordering::Relaxed);
     }
 
     /// 改了目录 `dir` 里的名字 `name`：从自己的缓存里去掉受影响的条目。别的进程的缓存
@@ -1149,6 +1266,7 @@ impl Store {
             return;
         }
         if self.reaper.is_none() {
+            let _ = self.meta.sync_metadata();
             for ino in inos {
                 let _ = self.remove_object(ino);
             }
@@ -1919,6 +2037,10 @@ impl Store {
                 } else {
                     s.remove_link(new_dir, new_name, d)?;
                 }
+                // 普通文件改名覆盖了别的文件：提交之前让它的数据落盘
+                if s.stat_row(src)?.kind() == mode::S_IFREG {
+                    s.replaced.borrow_mut().push(src);
+                }
             }
             s.db.prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
                 .and_then(|mut st| st.execute(params![old_dir, old_name]))
@@ -2176,6 +2298,7 @@ mod tests {
             let _ = self.exec("ROLLBACK");
             self.pending.set(None);
             self.doomed.borrow_mut().clear();
+            self.replaced.borrow_mut().clear();
         }
     }
 
@@ -2728,6 +2851,52 @@ mod tests {
         assert!(!object(f).exists());
         // 编号又分配了出来
         assert_eq!(s.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap(), f);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 断电时的顺序（模块文档）：改名覆盖别的文件的普通文件在提交之前刷，改名到新名字、
+    /// 符号链接不刷；删除 object 之前 WAL 先落盘，开机清理时也是；没有新的提交不再刷 WAL。
+    #[test]
+    fn power_loss_ordering() {
+        let (s, dir) = temp_store("ordering");
+        let flushes = || s.meta.flushes.load(Ordering::Relaxed);
+        let syncs = || s.meta.syncs.load(Ordering::Relaxed);
+        let (a, mut fa) = s.create_file(ROOT, b"a", 0o644, 0, 0).unwrap();
+        fa.write_all(b"old").unwrap();
+        let (b, mut fb) = s.create_file(ROOT, b"b.tmp", 0o644, 0, 0).unwrap();
+        fb.write_all(b"new").unwrap();
+        s.rename(ROOT, b"b.tmp", ROOT, b"c", false, false).unwrap();
+        s.symlink(ROOT, b"l", b"c", 0, 0).unwrap();
+        s.rename(ROOT, b"l", ROOT, b"c2", false, false).unwrap();
+        s.commit().unwrap();
+        assert_eq!(flushes(), 0);
+        // 覆盖 a：提交时才刷
+        s.rename(ROOT, b"c", ROOT, b"a", false, false).unwrap();
+        assert_eq!(flushes(), 0);
+        assert_eq!(*s.replaced.borrow(), [b]);
+        // 符号链接覆盖普通文件不刷
+        s.create_file(ROOT, b"d", 0o644, 0, 0).unwrap();
+        s.rename(ROOT, b"c2", ROOT, b"d", false, false).unwrap();
+        s.commit().unwrap();
+        assert_eq!(flushes(), 1);
+        assert!(s.replaced.borrow().is_empty());
+        // 被覆盖的 a 的 object 在 WAL 落盘之后才删
+        s.reaped();
+        assert!(!dir.join("objects").join(a.to_string()).exists());
+        let after_reap = syncs();
+        assert!(after_reap >= 1);
+        // 没有新的提交：不再刷
+        s.meta.sync_metadata().unwrap();
+        assert_eq!(syncs(), after_reap);
+        s.set_mode(b, 0o600).unwrap();
+        s.commit().unwrap();
+        s.meta.sync_metadata().unwrap();
+        assert_eq!(syncs(), after_reap + 1);
+        drop((fa, fb, s));
+        // 开机时按数据库删 object（a 的行还以 nlink = 0 留着）之前也先刷
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }

@@ -24,6 +24,11 @@ internal object Native {
     @Throws(IOException::class)
     external fun importRootfs(store: String, tarball: String)
 
+    /** 把仓库 [store] 写到盘上（连同所在的整个文件系统）：导入、写好配置之后，改名就位之前。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun syncRootfs(store: String)
+
     /** 在仓库里写一个文件；[overwrite] 为 false 时已经存在就不动。 */
     @JvmStatic
     @Throws(IOException::class)

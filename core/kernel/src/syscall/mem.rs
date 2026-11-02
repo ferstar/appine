@@ -306,6 +306,22 @@ pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResu
     if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
         return Err(Errno::EBUSY);
     }
+    // 文件的共享映射就是宿主对 object 的共享映射：MS_SYNC 交给宿主写回，放开 BKL 等。放锁
+    // 期间别的线程拆掉了映射时宿主报 ENOMEM，不管它（数据已经随拆映射交给了宿主的页缓存）
+    if flags & MS_SYNC != 0 {
+        let ranges = cx.mm().shared_file_ranges(addr, len);
+        if !ranges.is_empty() {
+            cx.unlocked(move || {
+                ranges
+                    .into_iter()
+                    .try_for_each(|(a, n)| match appine_hal::msync(a, n) {
+                        Err(libc::ENOMEM) => Ok(()),
+                        r => r,
+                    })
+            })
+            .map_err(Errno)?;
+        }
+    }
     Ok(0)
 }
 

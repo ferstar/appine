@@ -3695,6 +3695,15 @@ pub(super) fn cache_hint(
                 return Err(Errno::EINVAL);
             }
             match &f.kind {
+                // 交给宿主的 object：dpkg 这类先让一批文件开始写回、再逐个 fsync，合成一次
+                // 日志提交。打开文件由 file 保活，放锁期间不碰它
+                FileKind::Regular { file: host, .. } if flags != 0 => {
+                    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
+                    drop(f);
+                    cx.unlocked(|| appine_hal::sync_file_range(fd, offset, len, flags))
+                        .map(|()| 0)
+                        .map_err(Errno)
+                }
                 FileKind::Regular { .. } | FileKind::Directory { .. } => Ok(0),
                 FileKind::Path(_) => Err(Errno::EBADF),
                 _ => Err(Errno::ESPIPE),
@@ -3735,25 +3744,52 @@ pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u
     put(cx, out, b).map(|()| 0)
 }
 
-pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32) -> SysResult {
-    // 仓库的数据直接写在宿主文件里；为了 apk 这类频繁 fsync 的负载，不逐个刷盘。推迟
-    // 提交的元数据修改现在提交，App 随后被杀掉也不会丢失
+/// fsync(2)、fdatasync(2)（`data_only`）：普通文件的数据在宿主的 object 里，让宿主把它刷到
+/// 盘上；元数据（名字、权限……）在仓库的数据库里，提交推迟的写事务，再等 WAL 落盘
+/// （[`durable`]）。刷盘时放开 BKL。
+pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
     let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    match &f.kind {
-        _ if f.flags & oflags::O_PATH != 0 => Err(Errno::EBADF),
-        // 只有普通文件和目录能同步（宿主 fd 交给宿主）
-        FileKind::Regular { .. } | FileKind::Directory { .. } => sync(cx),
-        FileKind::Host(_) => Ok(0),
-        _ => Err(Errno::EINVAL),
+    let host = {
+        let f = file.borrow();
+        match &f.kind {
+            _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
+            // 只有普通文件和目录能同步（宿主 fd 交给宿主）
+            FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
+            FileKind::Directory { .. } => None,
+            FileKind::Host(_) => return Ok(0),
+            _ => return Err(Errno::EINVAL),
+        }
+    };
+    // 打开文件由 file 保活，放锁期间不碰它
+    if let Some(fd) = host {
+        cx.unlocked(|| appine_hal::fsync(fd, data_only))
+            .map_err(Errno)?;
     }
+    durable(cx, false)
 }
 
-/// sync(2)：提交 inode 仓库推迟提交的写事务。
-pub(super) fn sync(cx: &Cx<'_>) -> SysResult {
-    if let Ok(vfs) = cx.vfs() {
-        vfs.store().commit()?;
-    }
+/// sync(2)：提交推迟的写事务，把仓库所在的整个宿主文件系统写到盘上。
+pub(super) fn sync(cx: &mut Cx<'_>) -> SysResult {
+    durable(cx, true)
+}
+
+/// 提交仓库推迟提交的写事务，等它落盘（[`Store::commit`] 只写进 WAL）：`all` 时连同所有
+/// object 的数据对整个宿主文件系统 syncfs，否则只等 WAL。放开 BKL 等。
+fn durable(cx: &mut Cx<'_>, all: bool) -> SysResult {
+    let Ok(vfs) = cx.vfs() else {
+        return Ok(0);
+    };
+    let store = vfs.store();
+    store.commit()?;
+    let meta = store.meta().clone();
+    drop(vfs);
+    cx.unlocked(move || {
+        if all {
+            meta.sync_all()
+        } else {
+            meta.sync_metadata()
+        }
+    })?;
     Ok(0)
 }
 
@@ -4971,7 +5007,35 @@ pub(super) fn write_file(
             Err(e) => return Err(e),
         }
     }
+    if done > 0 {
+        write_sync(cx, file, 0)?;
+    }
     Ok(done as u64)
+}
+
+/// `O_DSYNC`、`O_SYNC` 打开的普通文件，或者 pwritev2 带 `RWF_DSYNC`、`RWF_SYNC`（`rwf`）：
+/// 写完之后像 fdatasync、fsync 一样等它落盘（Linux 的 generic_write_sync）。数据、长度和
+/// 时间都在宿主的 object 里，交给宿主刷，放开 BKL 等；名字不在其列，Linux 上也要另外
+/// fsync 目录。
+fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
+    const O_DSYNC: u32 = 0o10000;
+    const O_SYNC_BIT: u32 = 0o4000000; // __O_SYNC，O_SYNC 是它加上 O_DSYNC
+    const RWF_DSYNC: u32 = 2;
+    const RWF_SYNC: u32 = 4;
+    let (fd, data_only) = {
+        let f = file.borrow();
+        let FileKind::Regular { file: host, .. } = &f.kind else {
+            return Ok(());
+        };
+        if f.flags & O_DSYNC == 0 && rwf & (RWF_DSYNC | RWF_SYNC) == 0 {
+            return Ok(());
+        }
+        let full = f.flags & O_SYNC_BIT != 0 || rwf & RWF_SYNC != 0;
+        (std::os::fd::AsRawFd::as_raw_fd(host), !full)
+    };
+    // 打开文件由 file 保活，放锁期间不碰它
+    cx.unlocked(|| appine_hal::fsync(fd, data_only))
+        .map_err(Errno)
 }
 
 pub(super) fn sendfile(
@@ -5356,9 +5420,9 @@ pub(super) fn pvectored(
     flags: Option<u32>,
     write: bool,
 ) -> SysResult {
-    // RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果；RWF_NOAPPEND（Linux 6.9 起，musl 的 pwrite
-    // 用它）让带偏移的写在 O_APPEND 的文件上也写在给的偏移处；RWF_NOWAIT、RWF_APPEND 不支持，
-    // 与 Linux 一样，不认识的标志都是 EOPNOTSUPP
+    // RWF_HIPRI 不影响结果，RWF_DSYNC、RWF_SYNC 写完等它落盘（[`write_sync`]）；RWF_NOAPPEND
+    // （Linux 6.9 起，musl 的 pwrite 用它）让带偏移的写在 O_APPEND 的文件上也写在给的偏移处；
+    // RWF_NOWAIT、RWF_APPEND 不支持，与 Linux 一样，不认识的标志都是 EOPNOTSUPP
     const RWF_NOAPPEND: u32 = 0x20;
     const RWF_SUPPORTED: u32 = 0x7 | RWF_NOAPPEND;
     let mut offset = match flags {
@@ -5369,5 +5433,10 @@ pub(super) fn pvectored(
     if write && flags.is_none_or(|f| f & RWF_NOAPPEND == 0) {
         offset = append_offset(&cx.fds().get(fd)?, offset)?;
     }
-    vectored(cx, fd, iov, count, offset, write)
+    let n = vectored(cx, fd, iov, count, offset, write)?;
+    if let Some(rwf) = flags.filter(|_| write && n > 0) {
+        let file = cx.fds().get(fd)?;
+        write_sync(cx, &file, rwf)?;
+    }
+    Ok(n)
 }
