@@ -7,7 +7,10 @@
 #   accept 之前就关掉了；
 # - 跨命名空间：开机时的命名空间里一个 bridge，A、B 两个"容器"，B 的 PREROUTING 做
 #   REDIRECT、A 的 OUTPUT 做 DNAT、外层的 PREROUTING 对从 bridge 来的做 REDIRECT；A 的 socket
-#   带着 SO_MARK 经由 veth 进入 B 时标记清掉；
+#   带着 SO_MARK 经由 veth 进入 B 时标记清掉；A 连外网的地址也经过外层的 PREROUTING：被
+#   REDIRECT 到外层的代理（只认本机地址的 `fib daddr type local` 规则不算）、DNAT 到 B（外层的
+#   FORWARD 拒绝的连不上）、UDP 的 53 端口劫持到外层（回答来自原来的目的地）；外层绑通配
+#   地址的 UDP 服务端回答 A 时，来源是外层面向 A 的地址；
 # - SO_MARK：读写、长度、没有权限、UDP、accept 出来的沿用监听的；
 # - iptables 的 owner、mark 匹配在 nat 和 filter 的 OUTPUT 上，nft 的 meta skuid、meta mark；
 # - 一个 Python 写的透明代理：问 SO_ORIGINAL_DST，带着 SO_MARK 连原来的目的地（规则放过有
@@ -324,9 +327,34 @@ def cli(addr, port, name, mark=None):
     c = socket.socket()
     if mark is not None:
         c.setsockopt(socket.SOL_SOCKET, SO_MARK, int(mark))
-    c.connect((addr, int(port)))
+    try:
+        c.connect((addr, int(port)))
+    except OSError as e:
+        print(f"{name}: {err(e)}")
+        return
     c.sendall(name.encode())
     print(c.recv(200).decode(), f"| client orig {orig(c)}")
+
+
+def usrv(port, ready, n):
+    s = socket.socket(V4, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", int(port)))
+    open(ready, "w").close()
+    for _ in range(int(n)):
+        data, peer = s.recvfrom(200)
+        s.sendto(f"{data.decode()}: udp server {port} sees {peer[0]}".encode(), peer)
+
+
+def ucli(addr, port, name):
+    s = socket.socket(V4, socket.SOCK_DGRAM)
+    s.sendto(name.encode(), (addr, int(port)))
+    data, peer = s.recvfrom(200)
+    print(f"{data.decode()} | reply from {peer[0]}:{peer[1]}")
+    c = socket.socket(V4, socket.SOCK_DGRAM)
+    c.connect((addr, int(port)))
+    c.send(f"{name}, connected".encode())
+    data = c.recv(200).decode()
+    print(f"{data} | peer {c.getpeername()[0]}:{c.getpeername()[1]}")
 
 
 cmd = sys.argv[1]
@@ -342,6 +370,10 @@ elif cmd == "srv":
     srv(sys.argv[2:-2], sys.argv[-2], sys.argv[-1])
 elif cmd == "cli":
     cli(*sys.argv[2:])
+elif cmd == "usrv":
+    usrv(*sys.argv[2:])
+elif cmd == "ucli":
+    ucli(*sys.argv[2:])
 PY
 fresh() { unshare -n sh -c "ip link set lo up; python3 /tmp/od.py $*"; }
 
@@ -358,6 +390,8 @@ fresh proxy
 
 echo "== across namespaces"
 wait_for() { for i in $(seq 100); do [ -f "$1" ] && return; sleep 0.1; done; echo "timeout: $1"; }
+# 外层把 DNAT 到 B 的转发过去
+echo 1 > /proc/sys/net/ipv4/ip_forward
 ip link add br0 address 02:00:00:00:50:01 type bridge
 ip addr add 10.50.0.1/24 dev br0
 ip link set br0 up
@@ -391,27 +425,62 @@ table ip t {
   }
 }
 N
+# 外层：从 bridge 来的 2290 REDIRECT 到代理 1083；2292 只有发往本机地址的才到 1083（docker、
+# podman 发布端口的规则这样限定），别的到 1084；2293、2294 DNAT 到 B，FORWARD 拒绝 B 的 1085（B 在那里监听着）；
+# UDP 的 53 劫持到 1053。A 和 B 在同一个网段，DNAT 到 B 的要 masquerade，B 的回答才经过外层
+# 换回来（appine 不执行 POSTROUTING，连接本来就在 socket 层）
 nft -f - <<'N'
 table ip t {
   chain pre {
     type nat hook prerouting priority -100
     iif br0 tcp dport 2290 redirect to :1083
+    fib daddr type local tcp dport 2292 redirect to :1083
+    iif br0 tcp dport 2292 redirect to :1084
+    iif br0 tcp dport 2293 dnat to 10.50.0.3:1082
+    iif br0 tcp dport 2294 dnat to 10.50.0.3:1085
+    iif br0 udp dport 53 redirect to :1053
+  }
+  chain post {
+    type nat hook postrouting priority 100
+    ip saddr 10.50.0.2 ip daddr 10.50.0.3 masquerade
+  }
+  chain fw {
+    type filter hook forward priority 0
+    iif br0 oif br0 tcp dport 1085 reject with tcp reset
   }
 }
 N
-rm -f /tmp/ready-b /tmp/ready-outer
-nsenter -t "$B" -n python3 /tmp/od.py srv 1081 1082 /tmp/ready-b 4 &
+rm -f /tmp/ready-b /tmp/ready-b2 /tmp/ready-outer /tmp/ready-udp
+nsenter -t "$B" -n python3 /tmp/od.py srv 1081 1082 /tmp/ready-b 5 &
 b_srv=$!
-python3 /tmp/od.py srv 1083 /tmp/ready-outer 1 &
+# 连到这里的都应该被外层的 FORWARD 拒绝：用完就停掉
+nsenter -t "$B" -n python3 /tmp/od.py srv 1085 /tmp/ready-b2 2 &
+b_rejected=$!
+python3 /tmp/od.py srv 1083 1084 /tmp/ready-outer 4 &
 outer_srv=$!
 wait_for /tmp/ready-b
+wait_for /tmp/ready-b2
 wait_for /tmp/ready-outer
 nsenter -t "$A" -n python3 /tmp/od.py cli 10.50.0.3 2290 "A to B, PREROUTING redirect"
 nsenter -t "$A" -n python3 /tmp/od.py cli 10.50.0.3 2290 "A to B with mark 7" 7
 nsenter -t "$A" -n python3 /tmp/od.py cli 10.50.0.99 80 "A OUTPUT dnat to B"
 python3 /tmp/od.py cli 10.50.0.3 2290 "outer to B"
 nsenter -t "$A" -n python3 /tmp/od.py cli 10.50.0.1 2290 "A to the outer gateway"
+nsenter -t "$A" -n python3 /tmp/od.py cli 192.0.2.10 2290 "A to an outside address"
+nsenter -t "$A" -n python3 /tmp/od.py cli 10.50.0.1 2292 "A to the gateway, local-only rule"
+nsenter -t "$A" -n python3 /tmp/od.py cli 192.0.2.10 2292 "A to an outside address, local-only rule"
+nsenter -t "$A" -n python3 /tmp/od.py cli 192.0.2.10 2293 "A to an outside address, dnat to B"
+nsenter -t "$A" -n python3 /tmp/od.py cli 192.0.2.10 2294 "A to an outside address, dnat to B, outer FORWARD rejects"
+nsenter -t "$A" -n python3 /tmp/od.py cli 10.50.0.1 2294 "A to the gateway, dnat to B, outer FORWARD rejects"
+kill "$b_rejected"
+wait "$b_rejected" 2>/dev/null
 wait "$b_srv" "$outer_srv"
+python3 /tmp/od.py usrv 1053 /tmp/ready-udp 4 &
+udp_srv=$!
+wait_for /tmp/ready-udp
+nsenter -t "$A" -n python3 /tmp/od.py ucli 10.50.0.1 1053 "A udp to the gateway"
+nsenter -t "$A" -n python3 /tmp/od.py ucli 192.0.2.10 53 "A udp to an outside address"
+wait "$udp_srv"
 kill "$A" "$B"
 wait "$A" "$B" 2>/dev/null
 nft delete table ip t

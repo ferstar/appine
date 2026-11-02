@@ -1637,8 +1637,8 @@ pub(crate) struct Packet<'a> {
     pub gid: u32,
     /// 地址在这个命名空间里的类型（`RTN_LOCAL` 等，fib 的 addrtype、xt 的 addrtype 用）。
     pub addr_type: &'a dyn Fn(&[u8]) -> u32,
-    /// 出口接口的名字（OUTPUT 上；PREROUTING 上还没有路由，是空的）。
-    pub oif: &'a dyn Fn() -> Vec<u8>,
+    /// 出口接口的编号和名字（OUTPUT、FORWARD 上；PREROUTING、INPUT 上还没有，见 [`Eval::meta`]）。
+    pub oif: &'a dyn Fn() -> (u32, Vec<u8>),
     /// 钩子：[`HOOK_PRE_ROUTING`] 或者 [`HOOK_LOCAL_OUT`]。
     pub hook: u32,
     /// 入口接口（PREROUTING、INPUT、FORWARD 上；OUTPUT 上没有）。
@@ -1991,13 +1991,16 @@ impl Eval<'_> {
                 n.resize(16, 0);
                 self.store(dreg, &n)
             }
-            7 => {
-                // PREROUTING、INPUT 上还没有出口接口
-                let mut n = if matches!(self.p.hook, HOOK_PRE_ROUTING | 1) {
-                    Vec::new()
+            // PREROUTING、INPUT 上还没有出口接口
+            5 | 7 => {
+                let (index, mut n) = if matches!(self.p.hook, HOOK_PRE_ROUTING | 1) {
+                    (0, Vec::new())
                 } else {
                     (self.p.oif)()
                 };
+                if key == 5 {
+                    return self.store_u32(dreg, index);
+                }
                 n.resize(16, 0);
                 self.store(dreg, &n)
             }
@@ -2804,7 +2807,7 @@ mod tests {
             uid: 0,
             gid: 0,
             addr_type: local,
-            oif: &|| b"lo".to_vec(),
+            oif: &|| (1, b"lo".to_vec()),
             hook: HOOK_LOCAL_OUT,
             iif: None,
             ct_state: CT_NEW,

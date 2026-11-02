@@ -31,7 +31,7 @@
   - 包和寄存器：包按 socket 合成（IPv4 或 IPv6 头；TCP 头是 SYN，UDP 头照常）。寄存器照 `nft_regs`，`NFT_REG_1..4` 与 `NFT_REG32_00..15` 重叠。
   - 支持的表达式：
     - payload（网络层、传输层的头）、cmp、bitwise（布尔、移位）、range、immediate。
-    - meta：l4proto、nfproto、protocol、mark 的读写、skuid/skgid、oifname；入口接口是空的。
+    - meta：l4proto、nfproto、protocol、mark 的读写、skuid/skgid、oifname；入口接口是空的。 → 出口接口的编号（`oif`，iptables-nft 的 `-o` 翻译成 oifname，手写的 nft 规则常用 `oif`）也认了（M9 之前：容器连外网也经过外层的 PREROUTING）
     - fib 的地址类型：本机地址是命名空间里各个接口上的地址和 127.0.0.0/8。
     - ct：状态总是 NEW，方向总是 ORIGINAL。
     - lookup：精确匹配、区间、映射和判决映射。

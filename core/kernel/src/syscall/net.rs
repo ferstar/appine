@@ -1531,6 +1531,17 @@ pub(crate) fn send(
                 if s.wide && m.target.is_some() {
                     pktinfo = crate::netns::implicit_bind(&me, s.family, false);
                 }
+                // 开机时的命名空间里绑在通配地址上的（UDP 的服务端回答新命名空间里的客户端）：
+                // 宿主选的源地址是 127.0.0.1，对方要看到的是面向它的那个虚拟地址（没绑定的
+                // 由 ensure_bound 绑上了）
+                if s.net.is_none()
+                    && let Some(src) = &m.source
+                    && appine_hal::net::sockname(s.fd, false)
+                        .ok()
+                        .is_some_and(|a| crate::netns::is_any(&a))
+                {
+                    pktinfo = Some(src.clone());
+                }
                 Some(crate::netns::toward_self(&me, dst, m.addr))
             }
         }
@@ -1802,8 +1813,10 @@ fn route(
             crate::netns::Role::Peer,
             s.icmp6(),
         ));
-        // 原来经由宿主网络的没有选源地址：新命名空间里绑它的回环地址，对方才认得出来源
+        // 原来经由宿主网络的没有选源地址：DNAT 到了命名空间里的，新命名空间里绑它的回环地址，
+        // 对方才认得出来源；DNAT 到外面的别的地址时仍不绑，绑了就出不去
         let source = m.source.take().or_else(|| {
+            m2.target.as_ref()?;
             me.host_net
                 .and_then(|_| crate::netns::implicit_bind(me, s.family, s.icmp6()))
         });

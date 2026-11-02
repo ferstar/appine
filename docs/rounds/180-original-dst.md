@@ -45,7 +45,7 @@
 - TPROXY（`IP_TRANSPARENT` 加 mangle 表的 TPROXY 和策略路由）：UDP 的透明代理（`sslocal --udp-redir tproxy`）要它。App 在宿主上没有 `IP_TRANSPARENT` 要的权限，包也不经过 appine 的规则，要模拟得在 socket 层另做一套，没做。TCP 用 REDIRECT 就够了。
 - tun（`/dev/net/tun`）：clash、sing-box 的 TUN 模式和 tun2socks 要它，需要在 appine 里另做一套用户态的 TCP/IP 栈（[容器网络的普查](169-container-network-survey.md)讨论过的方案 3），不做。
 - 从 appine 外面经由转发线程（[发布的端口](173-port-forwarding.md)）连进来、被开机时的命名空间的 PREROUTING DNAT 到同一个命名空间里的监听：转发线程不登记，接受的一端报告的是本端地址，Linux 上是外面连的那个地址。手机上用不到（别的设备的流量不经过 appine 的规则）。
-- 容器经由默认路由出去的连接不经过外层的 PREROUTING（[经由虚拟网卡的连接](171-netmap.md)，原来就是），在外层用 REDIRECT 透明代理容器连外网的流量不行；容器里自己的 OUTPUT 上的规则可以。
+- 容器经由默认路由出去的连接不经过外层的 PREROUTING（[经由虚拟网卡的连接](171-netmap.md)，原来就是），在外层用 REDIRECT 透明代理容器连外网的流量不行；容器里自己的 OUTPUT 上的规则可以。 → 经由外层网关出去的也执行外层的 PREROUTING 了（M9 之前：容器连外网也经过外层的 PREROUTING）
 - owner 匹配和 `meta skuid` 一样用 connect 时的有效 uid、gid，Linux 用的是打开 socket 文件的那个凭据的 fsuid、fsgid，平时相同；附加组（`--suppl-groups`）不看；规则里的 uid 不按网络命名空间的属主换算（容器的用户命名空间里写的规则按内核 uid 比）。
 - 包在 OUTPUT 上被 `meta mark set` 改过的标记不带到之后的钩子上（INPUT 上读到的还是 socket 的），原来就是每条链各算各的。
 - 真正的 MPTCP 连接（两端都是 MPTCP）上 Linux 的 `SO_ORIGINAL_DST` 是 EOPNOTSUPP，appine 当作 TCP 回答。Go 1.24 起监听默认用 MPTCP，但客户端默认不用，接受的连接会退回 TCP，与这里一样。

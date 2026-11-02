@@ -190,6 +190,7 @@
 | [M9 之前：页表按需建立，AddressSanitizer 能用了](rounds/179-demand-page-tables.md) | 2026-11-02 | soft-MMU 的页表原来按页建，ASan 一启动映射约 14 TB 的影子内存，一次 mmap 要建约 28 GB 页表，持着 BKL、OOM killer 插不进来，宿主杀掉整个 App；现在 1 MB 以上的映射等访问时一次补一张叶子表，fork 借页、量驻留内存只看有表项的几段（`PROT_NONE` 留着表项、权限清零），ASan、LSan 能用，LTP 的 fork14 通过；顺带修了 fork、mremap 申请宿主内存时漏看 `MAP_NORESERVE`（有大的不计提交量映射的进程 fork 是 ENOMEM） |
 | [M9 之前：透明代理：SO_ORIGINAL_DST、SO_MARK 和 owner 匹配](rounds/180-original-dst.md) | 2026-11-02 | 实测 ShadowSocks、proxychains：SOCKS5、HTTP、UDP、proxychains 都能用，透明代理（`sslocal --protocol redir` 配 iptables 的 REDIRECT）拿不到原目的地址；现在 connect 时按宿主上的四元组记下被 nat 的连接，accept 时领走，`SO_ORIGINAL_DST` 照原生的语义回答（连接跟踪开不开按规则集判断，ip/ip6/inet 分开，跨命名空间各看各的）；`SO_MARK` 只记在 socket 上、带进 nftables，xt 的 owner、mark 匹配也认，按 uid、标记排除代理自己的连接都能用；测试时发现共用翻译的一个偶发 SIGILL（178 轮就有，下一轮查 → 修了） |
 | [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块](rounds/181-last-member-leaves.md) | 2026-11-02 | 上一轮发现的偶发 SIGILL：同一个程序共用翻译的组里，别的成员退出、离开之后，它们登记的映射和翻译的块还在；最后一个成员因为在登记过的地址上映射了别的文件而离开时留着原来的翻译，执行到了别人翻译的代码（几个 python3 加载的扩展模块不同，客户端执行了服务端的 select 模块的块）；现在离开时作废与它的映射对不上的块，原来的探测脚本 8 次都不再崩 |
+| [M9 之前：容器连外网也经过外层的 PREROUTING](rounds/182-outer-prerouting.md) | 2026-11-02 | 透明代理的推迟项：容器经由外层的网关连外网时也执行外层的 PREROUTING nat，在外层对从 bridge 来的做 REDIRECT 就能透明代理所有容器（sslocal redir 实测），`udp dport 53 redirect` 能劫持容器的 DNS；docker、podman 的端口发布规则按地址类型限定，不受影响；顺带修了外层绑通配地址的 UDP 服务端回答容器时来源是 127.0.0.1（连接了的 socket 收不到）、外层 DNAT 到同一网段的容器时不过外层的 FORWARD、nft 的 `oif` 不认、DNAT 到外面的地址时绑了回环地址出不去 |
 
 ## 测量条件
 

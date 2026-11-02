@@ -662,10 +662,13 @@ pub(crate) fn output_nat(
     hook_nat(me, &packet, dst)
 }
 
-/// `me` 里发往 guest 地址 `dst` 的连接、数据报（已经换成宿主上的 `m`）进入的别的命名空间：
-/// 目的地在别的命名空间（虚拟地址）；或者经由宿主网络出去、目的地却是开机时的命名空间的
-/// 本机地址（宿主的地址：容器连外层地址上发布的端口），这时进入开机时的那个。那里的
-/// PREROUTING 要执行（[`prerouting_nat`]）。
+/// `me` 里发往 guest 地址 `dst` 的连接、数据报（已经换成宿主上的 `m`）进入的别的命名空间，
+/// 那里的 PREROUTING 要执行（[`prerouting_nat`]）：
+/// - 目的地在别的命名空间（虚拟地址）；
+/// - 新命名空间里经由宿主网络出去时进入开机时的命名空间：网关是它的地址（容器经由外层的
+///   bridge 连外网），或者目的地是它的本机地址（宿主的地址：容器连外层地址上发布的端口）。
+///   外层的 PREROUTING 对从 bridge 来的做 REDIRECT、DNAT，就能透明代理、劫持容器连外网的
+///   连接和 DNS。网关在别的命名空间里（路由器那样的"容器"）时不经过谁的 PREROUTING。
 pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Option<Rc<NetNs>> {
     match &m.target {
         Some(t) if !Rc::ptr_eq(t, me) => Some(t.clone()),
@@ -676,12 +679,20 @@ pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Opt
                 return None;
             }
             let ip = ipv4_of(dst)?;
-            crate::netdev::interfaces(init)
-                .iter()
-                .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
-                .then(|| init.clone())
+            let via_init = crate::netdev::route_v4(me, ip)
+                .and_then(|e| <[u8; 4]>::try_from(e.gateway?.as_slice()).ok())
+                .and_then(|gw| w.owner(me, gw))
+                .is_some_and(|o| Rc::ptr_eq(o, init));
+            (via_init || init_local(init, ip)).then(|| init.clone())
         }
     }
+}
+
+/// 开机时的命名空间 `init` 里的本机地址（宿主的接口、lo 和虚拟设备上的）。
+fn init_local(init: &NetNs, ip: [u8; 4]) -> bool {
+    crate::netdev::interfaces(init)
+        .iter()
+        .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
 }
 
 /// 从别的命名空间 `from` 进入 `t` 的连接、数据报（目的地是 `t` 的地址，guest 的 sockaddr
@@ -891,22 +902,25 @@ fn hook_eval(
         vec![0; ip.len()]
     };
     let addr_type = |a: &[u8]| crate::nft::addr_type(a, local);
-    let oif = || -> Vec<u8> {
+    // 出口接口的编号和名字：给了名字的（FORWARD 上）按名字找，本机的是 lo，别的按路由
+    let oif = || -> (u32, Vec<u8>) {
+        let found = |f: &dyn Fn(&appine_hal::net::Interface) -> bool| {
+            crate::netdev::interfaces(ns)
+                .into_iter()
+                .find(|i| f(i))
+                .map(|i| (i.index, i.name.into_bytes()))
+        };
         if let Some(o) = &oif {
-            return o.clone();
+            return found(&|i| i.name.as_bytes() == &o[..]).unwrap_or((0, o.clone()));
         }
         if local(&ip) {
-            return b"lo".to_vec();
+            return found(&|i| i.name == "lo").unwrap_or((1, b"lo".to_vec()));
         }
         let index = v4
             .then(|| crate::netdev::route_v4(ns, ip[..4].try_into().unwrap()))
             .flatten()
             .map(|e| e.index);
-        crate::netdev::interfaces(ns)
-            .into_iter()
-            .find(|i| Some(i.index) == index)
-            .map(|i| i.name.into_bytes())
-            .unwrap_or_default()
+        found(&|i| Some(i.index) == index).unwrap_or_default()
     };
     let packet = crate::nft::Packet {
         src: &src,
@@ -1085,7 +1099,11 @@ pub(crate) fn path_filter(
             steps.push(Step::new(init, HOOK_LOCAL_IN, iif_facing(init, src), None))
         }
         Some(x) => {
-            let direct = crate::netdev::route_v4(me, final_ip).is_some_and(|e| e.gateway.is_none());
+            // 不经由开机时的命名空间的：发往直连网段里 x 的地址（之后 x 的 PREROUTING 可能
+            // 再 DNAT）。发往网关后面的地址、外层的本机地址，在外层的 PREROUTING 上 DNAT 到
+            // x 的（容器连发布的端口、连外网被 DNAT 到别的容器），都经过外层的 FORWARD
+            let direct = crate::netdev::route_v4(me, ip).is_some_and(|e| e.gateway.is_none())
+                && !init_local(init, ip);
             if new_ns && !direct {
                 let oif = iif_facing(init, final_ip).name;
                 steps.push(Step::new(
