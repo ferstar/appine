@@ -984,8 +984,12 @@ fn stop_and_continue_signals() {
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
-        "sleep 5 & p=$!; kill -STOP $p; sleep 0.2; grep State /proc/$p/status; \
-         kill -CONT $p; sleep 0.2; grep State /proc/$p/status; kill $p; wait $p; echo $?",
+        // 状态变过去之前一直看（最多 5 秒）：只等 0.2 秒的话，机器忙时 SIGCONT 之后的进程还没
+        // 回到 nanosleep 里，读到的是 R（CI 上遇到过）
+        "st() { for i in $(seq 50); do s=$(grep State /proc/$p/status); \
+         case \"$s\" in *\"$1\"*) break;; esac; sleep 0.1; done; echo \"$s\"; }; \
+         sleep 30 & p=$!; kill -STOP $p; st stopped; \
+         kill -CONT $p; st sleeping; kill $p; wait $p; echo $?",
     ]) {
         assert_eq!(
             stdout(&out),

@@ -36,7 +36,7 @@
   - 带全部后端时，新的二进制挑中 armv8.2_2，上一轮的二进制挑中 armv8.2_1（ggml 的 `load_backend` 打印），数字与只留 armv8.2_1 的目录相同：差别全部来自宣告 FP16。
   - F16 的权重和注意力（KV cache 默认是 F16）走半精度的向量 FMA，提示处理在 appine 里快 82%，比原生的收益（65%）还大，原因没有细查（可能是没有 FP16 的那条路径访存更多，每次访存在 Tier 1 里都要过 soft-MMU 的检查）。Q4_0 的矩阵乘走 int8 点积，两档没有差别。
   - 相对原生（都用最好的那档）：Qwen F16 的提示 1.64×、生成 1.22×（不宣告 FP16 时 2.98×、1.74×），Q4_0 1.38×、1.21×。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。全量 cargo test 第一次和差分测试同时跑时 `stop_and_continue_signals` 失败过一次（STOP、CONT 之后各只等 0.2 秒就读进程状态），单独跑、空闲时全量跑都通过。LTP 的 syscall 测试 1006 个通过（上次 1006）：epoll_pwait03 由失败变回通过，mmap21_02 这次是 `/dev/shm/ltp_mmap21_2` 的 EEXIST，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
+- cargo test、clippy（含 Android）、两层的全部差分测试通过。全量 cargo test 第一次和差分测试同时跑时 `stop_and_continue_signals` 失败过一次（STOP、CONT 之后各只等 0.2 秒就读进程状态），单独跑、空闲时全量跑都通过。 → 2026-11-02 推送第 180–183 轮之后 CI 上又失败一次（SIGCONT 之后读到 R），改成轮询状态、最多等 5 秒LTP 的 syscall 测试 1006 个通过（上次 1006）：epoll_pwait03 由失败变回通过，mmap21_02 这次是 `/dev/shm/ltp_mmap21_2` 的 EEXIST，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
 
 **推迟项**：
 
