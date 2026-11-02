@@ -673,8 +673,8 @@ class MachineTest {
 
     /**
      * 系统"文件"App 看到的（[Documents]）：根是登录账号的家目录，打开"整个系统"之后多一个 `/`；
-     * 列目录跟随符号链接，不列断了的链接和 FIFO；文件能读、不能写；家目录外面的要打开"整个系统"
-     * 才看得到；树的授权不能用 `..` 走出去；按名字搜索。文件是运行着的内核刚写的：另外打开仓库时
+     * 列目录跟随符号链接，不列断了的链接和 FIFO；文件能读；家目录外面的要打开"整个系统"才看得到，
+     * 也不能写；树的授权不能用 `..` 走出去；按名字搜索。文件是运行着的内核刚写的：另外打开仓库时
      * 内核先提交，看得到。
      */
     @Test
@@ -716,7 +716,6 @@ class MachineTest {
             assertEquals("hi", read("/root/dt/a.txt"))
             assertEquals("x", read("/root/dt/100%25 中文.txt"))
             assertTrue(read("/root/dt/release").startsWith("3."))
-            assertThrows(Exception::class.java) { resolver.openOutputStream(document("/root/dt/a.txt"))!!.close() }
             // 家目录外面的、不规范的 ID 都当作不存在（查询返回 null）
             assertEquals(null, rows(document("/etc/motd"), id))
             assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
@@ -739,10 +738,84 @@ class MachineTest {
             prefs.edit().putBoolean("system_documents", true).commit()
             assertEquals(listOf(listOf("home", "/root"), listOf("system", "/")), roots())
             assertEquals(listOf(listOf("motd")), rows(document("/etc/motd"), name))
+            // 家目录外面的只读
+            assertThrows(Exception::class.java) { resolver.openOutputStream(document("/etc/motd"))!!.close() }
             assertTrue(rows(DocumentsContract.buildChildDocumentsUri(authority, "/"), name)!!.contains(listOf("etc")))
         } finally {
             prefs.edit().remove("login").remove("system_documents").commit()
             sh(machine, "rm -rf /root/dt")
+        }
+    }
+
+    /**
+     * 在"文件"App 里改家目录（[Documents]）：新建（名字有了时换一个、按类型补扩展名）、写、追加、
+     * 截断、改名（不覆盖）、移动、删除整个目录；新建的属于登录账号。运行中的内核马上看得到。家目录
+     * 外面的、经由符号链接走出去的都不行，家目录本身不能删。
+     */
+    @Test
+    fun documentsWriteInTheHomeDirectory() {
+        val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        val machine = start(1)
+        val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir /home/bob/dw && " +
+            "ln -s /etc /home/bob/dw/etc-link && chown -h bob:bob /home/bob/dw /home/bob/dw/etc-link"
+        assertEquals(0, sh(machine, setup).second)
+        prefs.edit().putString("login", "bob").putBoolean("system_documents", false).commit()
+        val resolver = context.contentResolver
+        val authority = Documents.authority(context)
+        fun uri(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
+        fun id(uri: android.net.Uri?) = uri?.let { DocumentsContract.getDocumentId(it) }
+        fun create(dir: String, mime: String, name: String) =
+            id(DocumentsContract.createDocument(resolver, uri(dir), mime, name))
+        fun write(doc: String, mode: String, text: String) =
+            resolver.openOutputStream(uri(doc), mode)!!.use { it.write(text.toByteArray()) }
+        fun flags(doc: String) = resolver.query(uri(doc), null, null, null, null)!!.use {
+            it.moveToFirst()
+            it.getInt(it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_FLAGS))
+        }
+        val dw = "/home/bob/dw"
+        try {
+            assertEquals("$dw/notes.txt", create(dw, "text/plain", "notes"))
+            assertEquals("$dw/notes (1).txt", create(dw, "text/plain", "notes.txt"))
+            assertEquals("$dw/sub", create(dw, DocumentsContract.Document.MIME_TYPE_DIR, "sub"))
+            assertEquals("$dw/a_b", create(dw, "application/octet-stream", "a/b"))
+            write("$dw/notes.txt", "wt", "hello from Files")
+            write("$dw/notes.txt", "wa", " again")
+            assertEquals("hello from Files again" to 0, sh(machine, "cat $dw/notes.txt"))
+            write("$dw/notes (1).txt", "w", "x")
+            write("$dw/notes (1).txt", "wt", "y")
+            assertEquals("y" to 0, sh(machine, "cat '$dw/notes (1).txt'"))
+            val owners = "stat -c '%U %G %a %n' $dw/notes.txt $dw/sub"
+            assertEquals("bob bob 644 $dw/notes.txt\nbob bob 755 $dw/sub\n" to 0, sh(machine, owners))
+            // 文档的标志：家目录里面的能写、删、改名、移动，家目录本身只能在里面新建
+            val home = DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
+            assertEquals(home, flags("/home/bob"))
+            assertTrue(flags("$dw/notes.txt") and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0)
+            assertTrue(flags("$dw/sub") and DocumentsContract.Document.FLAG_SUPPORTS_DELETE != 0)
+            // 改名不覆盖；移动；删除整个目录
+            assertThrows(Exception::class.java) {
+                DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "notes.txt")
+            }
+            val renamed = DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "renamed.txt")
+            assertEquals("$dw/renamed.txt", id(renamed))
+            val moved = DocumentsContract.moveDocument(resolver, renamed!!, uri(dw), uri("$dw/sub"))
+            assertEquals("$dw/sub/renamed.txt", id(moved))
+            assertEquals("y" to 0, sh(machine, "cat $dw/sub/renamed.txt"))
+            assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/sub")))
+            assertEquals(1, sh(machine, "test -e $dw/sub").second)
+            // 家目录外面、经由符号链接走出去的、家目录本身
+            val motd = sh(machine, "cat /etc/motd").first
+            assertThrows(Exception::class.java) { create("/etc", "text/plain", "x") }
+            assertThrows(Exception::class.java) { create("$dw/etc-link", "text/plain", "x") }
+            assertThrows(Exception::class.java) { write("$dw/etc-link/motd", "wt", "gone") }
+            assertThrows(Exception::class.java) { DocumentsContract.deleteDocument(resolver, uri("/home/bob")) }
+            assertEquals(motd to 0, sh(machine, "cat /etc/motd"))
+            assertEquals(1, sh(machine, "test -e /etc/x").second)
+            // 删除符号链接只删链接
+            assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/etc-link")))
+            assertEquals(0, sh(machine, "test ! -e $dw/etc-link && test -d /etc").second)
+        } finally {
+            prefs.edit().remove("login").remove("system_documents").commit()
+            sh(machine, "deluser --remove-home bob")
         }
     }
 

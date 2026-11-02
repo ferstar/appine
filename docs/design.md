@@ -632,7 +632,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 ### 11.3 共享存储
 
-- **v1：DocumentsProvider**（`Documents.kt`，读是[第 196 轮](rounds/196-documents-read.md)，写还没有）。把登录账号的家目录注册为系统"文件" App 里的一个根，设置里的开关（默认关）可以把整个 `/` 以只读方式暴露。用户在"文件" App 里用"复制到…"即可导入或导出文件。不经过内核，直接在仓库里按 guest 路径查（`vfs::browse`：符号链接跟随，只给目录和普通文件，挂载看不到），每次调用另外打开一次仓库（内核运行着时它先提交推迟的写事务），文件以只读打开宿主上的 object 交出去。文档 ID 是 guest 的绝对路径（不是 UTF-8 的字节和 `%` 写成 `%XX`）；只认规范的（没有 `.`、`..`、空组件）、在显示着的根里面的 ID。
+- **v1：DocumentsProvider**（`Documents.kt`，读是[第 196 轮](rounds/196-documents-read.md)，写是[第 197 轮](rounds/197-documents-write.md)）。把登录账号的家目录注册为系统"文件" App 里的一个根，设置里的开关（默认关）可以把整个 `/` 以只读方式暴露。用户在"文件" App 里用"复制到…"即可导入或导出文件。不经过内核，直接在仓库里按 guest 路径查（`vfs::browse`：符号链接跟随，只给目录和普通文件，挂载看不到），每次调用另外打开一次仓库（内核运行着时它先提交推迟的写事务），文件以只读打开宿主上的 object 交出去。文档 ID 是 guest 的绝对路径（不是 UTF-8 的字节和 `%` 写成 `%XX`）；只认规范的（没有 `.`、`..`、空组件）、在显示着的根里面的 ID。家目录里面能新建（属于登录账号，0644/0755，名字有了时换成 `a (1).txt`）、写、删除、改名、移动，按真实路径限制：经由符号链接走到家目录外面的不行；整个 `/` 只读。修改经由仓库的事务和提交计数器，运行中的内核马上看得到。
 - **v1.x：SAF 目录挂载到 `/mnt/<名字>`**。权限位是合成的（目录 0755、文件 0644）；`chmod`/`chown` 静默成功；`symlink`/`link` 返回 `EPERM`；目录列表在内存中缓存；不区分大小写这一点写进文档。
 - 不申请 `MANAGE_EXTERNAL_STORAGE`，Play 不批准终端类 App 使用。
 
@@ -781,7 +781,7 @@ appine 按 **AGPL-3.0-or-later** 发布（[许可证](rounds/192-license.md)，�
 | **M6 B 档负载** | ✅ | 扩大 syscall 覆盖、文件 mmap 共享、LTP 子集、能跑 `./configure` | 在 appine 中从源码编译 Lua 或 SQLite；python3 测试集子集通过 |
 | **M7 Tier 1 正式版** | ✅ | 块链接、跨进程共享翻译缓存、精确异常、LL/SC 处理 | 达到性能目标；lockstep 和差分测试在 Tier 1 下全部通过 |
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
-| **M9 发布** | 进行中（[第 190 轮](rounds/190-settings-default-alpine.md)起） | 设置页、被杀后恢复标签页、wake lock 开关、许可证审计、以指定用户登录、进程被结束的提示、DocumentsProvider | Play 正式版上线 |
+| **M9 发布** | 进行中：App 的工作做完了（[第 190](rounds/190-settings-default-alpine.md)–[197 轮](rounds/197-documents-write.md)），还剩真机验证、发布前的许可证义务（[第 192 轮](rounds/192-license.md)的推迟项）和 Play 提交 | 设置页、被杀后恢复标签页、wake lock 开关、许可证审计、以指定用户登录、进程被结束的提示、DocumentsProvider | Play 正式版上线 |
 
 M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、按对象唤醒、core dump、cgroup v2 的视图、seccomp，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 

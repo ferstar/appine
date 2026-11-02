@@ -335,7 +335,7 @@ internal object Rootfs {
     }
 
     /** `/etc/passwd` 里的一个账号。 */
-    data class Account(val name: String, val uid: Int, val home: String)
+    data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
 
     /** `/etc/passwd` 里的账号，读不到时是空的。 */
     private fun accounts(context: Context): List<Pair<Account, String>> {
@@ -345,7 +345,8 @@ internal object Rootfs {
             val f = line.split(':')
             if (f.size < 7) return@mapNotNull null
             val uid = f[2].toIntOrNull() ?: return@mapNotNull null
-            Account(f[0], uid, f[5]) to f[6]
+            val gid = f[3].toIntOrNull() ?: return@mapNotNull null
+            Account(f[0], uid, gid, f[5]) to f[6]
         }
     }
 
@@ -366,7 +367,7 @@ internal object Rootfs {
      */
     fun loginAccount(context: Context, login: String): Account {
         val all = accounts(context).map { it.first }
-        val root = all.firstOrNull { it.name == ConsolePty.LOGIN_ROOT } ?: Account(ConsolePty.LOGIN_ROOT, 0, "/root")
+        val root = all.firstOrNull { it.name == ConsolePty.LOGIN_ROOT } ?: Account(ConsolePty.LOGIN_ROOT, 0, 0, "/root")
         return when (login) {
             ConsolePty.LOGIN_AUTO -> regularAccounts(context).firstOrNull() ?: root
             ConsolePty.LOGIN_ROOT -> root

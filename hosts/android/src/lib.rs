@@ -330,6 +330,184 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
     }
 }
 
+// 修改：都限制在 `top`（登录账号的家目录）里面，按真实路径算（[`browse`] 的说明）。新的名字
+// 是用户给的，照 UTF-8 原样用，不解 `%XX`；返回的名字按 [`browse::encode_path`] 写。
+
+/// 在目录 [dir] 里新建文件或目录（[directory]），属主是 [uid]、[gid]；名字有了时换一个，
+/// 返回实际用的名字。
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    dir: JString<'l>,
+    name: JString<'l>,
+    directory: jboolean,
+    uid: jint,
+    gid: jint,
+) -> jstring {
+    let (Some(store), Some(top), Some(dir), Some(name)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &dir),
+        string(&mut env, &name),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::create(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&dir),
+            name.as_bytes(),
+            directory != 0,
+            (uid as u32, gid as u32),
+        )
+    });
+    match r {
+        Ok(name) => env
+            .new_string(browse::encode_path(&name))
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            not_found(&mut env, "create in", &dir, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 删除文件、符号链接或者整个目录树。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    path: JString<'l>,
+) {
+    let (Some(store), Some(top), Some(path)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &path),
+    ) else {
+        return;
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::remove(s, &browse::decode_path(&top), &browse::decode_path(&path))
+    });
+    if let Err(e) = r {
+        not_found(&mut env, "delete", &path, e);
+    }
+}
+
+/// 在同一个目录里改名（[name] 是新的名字），不覆盖。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseRename<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    path: JString<'l>,
+    name: JString<'l>,
+) -> jstring {
+    let (Some(store), Some(top), Some(path), Some(name)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &path),
+        string(&mut env, &name),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::rename(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&path),
+            name.as_bytes(),
+        )
+    });
+    match r {
+        Ok(()) => env
+            .new_string(browse::encode_path(name.as_bytes()))
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            not_found(&mut env, "rename", &path, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 移到另一个目录 [to]，名字不变，不覆盖。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseMove<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    path: JString<'l>,
+    to: JString<'l>,
+) {
+    let (Some(store), Some(top), Some(path), Some(to)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &path),
+        string(&mut env, &to),
+    ) else {
+        return;
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::move_to(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&path),
+            &browse::decode_path(&to),
+        )
+    });
+    if let Err(e) = r {
+        not_found(&mut env, "move", &path, e);
+    }
+}
+
+/// 打开普通文件读写（[truncate] 时先截断，[append] 时以 O_APPEND 打开），返回宿主的 fd。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    path: JString<'l>,
+    truncate: jboolean,
+    append: jboolean,
+) -> jint {
+    use std::os::fd::IntoRawFd;
+    let (Some(store), Some(top), Some(path)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &path),
+    ) else {
+        return -1;
+    };
+    let r = appine_kernel::browse(store.as_ref(), |s| {
+        browse::open_write(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&path),
+            truncate != 0,
+            append != 0,
+        )
+    });
+    match r {
+        Ok(file) => file.into_raw_fd(),
+        Err(e) => {
+            not_found(&mut env, "open", &path, e);
+            -1
+        }
+    }
+}
+
 /// 一次搜索最多看这么多项（目录项）：/usr 这样的大目录树里不会一直找下去。
 const SEARCH_BUDGET: usize = 50_000;
 

@@ -1385,6 +1385,12 @@ impl Store {
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
+    /// 打开普通文件的 object 读写，`append` 时以 `O_APPEND` 打开（宿主浏览仓库时写入用）。
+    pub fn open_object_append(&self, ino: Ino, append: bool) -> Result<File, Errno> {
+        let append = if append { libc::O_APPEND } else { 0 };
+        self.object(ino, libc::O_RDWR | append)
+    }
+
     fn new_inode(
         &self,
         mode: u32,

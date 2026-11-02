@@ -60,6 +60,36 @@ internal object Native {
     @Throws(IOException::class)
     external fun browseSearch(store: String, dir: String, query: String, limit: Int): Array<String>
 
+    // 修改都限制在 [top]（登录账号的家目录）里面，按真实路径算：经由符号链接走到外面去的不行。
+    // 新的名字是用户给的，照原样用；返回的名字是路径的写法。
+
+    /** 在目录 [dir] 里新建文件或目录，属主是 [uid]、[gid]；名字有了时换一个（`a (1).txt`），返回实际的名字。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseCreate(
+        store: String, top: String, dir: String, name: String, directory: Boolean, uid: Int, gid: Int,
+    ): String
+
+    /** 删除文件、符号链接（只删链接）或者整个目录树。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseRemove(store: String, top: String, path: String)
+
+    /** 在同一个目录里改名，不覆盖；返回新的名字。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseRename(store: String, top: String, path: String, name: String): String
+
+    /** 移到目录 [to]，名字不变，不覆盖。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseMove(store: String, top: String, path: String, to: String)
+
+    /** 打开普通文件读写，[truncate] 时先截断，[append] 时以 O_APPEND 打开，返回 fd。 */
+    @JvmStatic
+    @Throws(IOException::class)
+    external fun browseOpenWrite(store: String, top: String, path: String, truncate: Boolean, append: Boolean): Int
+
     /** 启动内核；[tier] 0 是解释器，1 是 DBT。 */
     @JvmStatic
     @Throws(IOException::class)
