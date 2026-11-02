@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Once, PoisonError};
 use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
 
 /// 抛出 `java.io.IOException`；JNI 调用之后由 Kotlin 看到。
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
@@ -536,4 +536,21 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
     handle: jlong,
 ) -> jint {
     machine(handle).map_or(0, |m| m.processes() as jint)
+}
+
+/// 控制台前台进程组的当前目录（App 被杀之后恢复标签页用）：取不到时（shell 已经退出、
+/// 句柄无效）返回 null。路径不是 UTF-8 时按 UTF-8 的规则替换。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_consoleCwd<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    console: jint,
+) -> jstring {
+    let Some(path) = machine(handle).and_then(|m| m.console_cwd(console as u32).ok()) else {
+        return std::ptr::null_mut();
+    };
+    env.new_string(String::from_utf8_lossy(&path))
+        .map(JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }

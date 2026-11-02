@@ -202,6 +202,7 @@
 | [M9：熄屏时保持运行](rounds/191-keep-awake.md) | 2026-11-02 | 设置页的"熄屏时保持运行"和通知上的"保持唤醒"按钮，默认关；开着时内核运行期间（含关机）持有 `PARTIAL_WAKE_LOCK`。读 AOSP 源码确认前台服务的 App 在 Doze 里 wake lock 不被禁用、网络不断，所以不申请电池优化的豁免；模拟器上强制 Doze 之后锁仍有效 |
 | [M9：许可证改为 AGPL-3.0-or-later，开源许可页](rounds/192-license.md) | 2026-11-02 | 许可证审计（R3）：vendored 的 Termux 终端库近一半文件是 2016 年后 Termux 的贡献者新写的，按 GPLv3-only 对待；GPLv2 与它、与 Apache-2.0 的库都不兼容，按用户的选择改为 AGPL-3.0-or-later，R3 消失。构建时生成开源许可页（Alpine 各包的许可证和 aports 提交、Android 库、链接进库的 crate 带原许可文件、许可证全文），设置页和 `appine-run --version` 显示法律声明；`fetch-rootfs` 下载时验 Alpine 的 GPG 签名 |
 | [M9：以指定用户登录](rounds/193-login-account.md) | 2026-11-02 | 设置里的"登录账号"，默认"自动"：在命令行里 `adduser` 建了普通用户之后，冷启动、新标签页都以最先建的那个登录，没有就是 root。普通用户第一次登录时照 Alpine 的 `setup-user -a` 加进 wheel、离线装上 App 带的 doas（Debian 是 sudo 组、联网装 sudo）；设了密码的提权要输密码，没设的不问。顺带查出并修了 DNS 存根的回答在 `FIONREAD` 里报成 0，Android 上 glibc 一次查 A 和 AAAA 的解析（Debian 的 apt 等）因此一直失败，之前两轮的 `apt-get update` 用例是假的通过 |
+| [M9：被杀之后恢复标签页](rounds/194-restore-tabs.md) | 2026-11-02 | 内核运行期间留着"在运行"的标记，每分钟（以及界面隐藏、内存紧张、开关标签页时）存下每个标签页的登录账号、前台进程组的当前目录（新的 `Machine::console_cwd`）和回看记录；正常退出时删掉。被系统杀掉之后再打开，每个标签页以原来的账号、从原来的目录起新的 shell，先显示原来的回看记录和一行"上次会话因 App 被系统终止而结束"，不恢复进程。登录脚本不再用 `su -l`（它总回家目录），profile 里的 `cd "$HOME"` 去掉了 |
 
 ## 测量条件
 

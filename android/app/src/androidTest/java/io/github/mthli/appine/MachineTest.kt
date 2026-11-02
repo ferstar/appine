@@ -39,6 +39,8 @@ class MachineTest {
     @Before
     fun prepare() {
         Rootfs.prepare(context, Rootfs.Distro.ALPINE)
+        // 与 App 启动内核之前一样，把以前导入时写的 profile 换成现在的
+        Rootfs.updateProfile(context)
     }
 
     @After
@@ -77,9 +79,14 @@ class MachineTest {
      * 在新控制台上像终端标签页一样运行登录脚本（[ConsolePty.script]，登录账号是 [account]），输入
      * [input]，返回输出。
      */
-    private fun login(machine: Long, input: String, account: String = ConsolePty.LOGIN_AUTO): String {
+    private fun login(
+        machine: Long,
+        input: String,
+        account: String = ConsolePty.LOGIN_AUTO,
+        cwd: String? = null,
+    ): String {
         val console = Native.openConsole(machine, 24, 200)
-        val argv = ConsolePty.argv(ConsolePty.script(context), account)
+        val argv = ConsolePty.argv(ConsolePty.script(context), account, cwd)
         val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
         var out = ""
         val reader = thread { out = readAll(machine, console) }
@@ -264,6 +271,84 @@ class MachineTest {
         } finally {
             sh(machine, "sed -i '1s|:[^:]*\$|:$shell|' /etc/passwd")
         }
+    }
+
+    /**
+     * 恢复的标签页从原来的目录开始（设计文档 §11.2）：root 进得去就进；目录不在了回家目录；普通
+     * 用户以自己的身份进，进不去（/root）回自己的家目录。
+     */
+    @Test
+    fun loginStartsInTheSavedDirectory() {
+        Rootfs.ensureLoginTools(context)
+        val machine = start(1)
+        try {
+            assertTrue(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT, "/etc").contains("\n/etc\n"))
+            assertTrue(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT, "/no/such/dir").contains("\n/root\n"))
+            assertTrue(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT).contains("\n/root\n"))
+            assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
+            assertTrue(login(machine, "pwd; exit\n", "alice", "/usr/share").contains("\n/usr/share\n"))
+            val denied = login(machine, "pwd; exit\n", "alice", "/root")
+            assertTrue(denied, denied.contains("\n/home/alice\n"))
+        } finally {
+            sh(
+                machine,
+                "deluser --remove-home alice; apk del -q --no-network --repositories-file /dev/null doas; " +
+                    "rm -rf /var/lib/appine /etc/doas.d",
+            )
+        }
+    }
+
+    /** 控制台前台进程组的当前目录跟着 shell 的 cd 变；shell 退出之后取不到。 */
+    @Test
+    fun consoleCwdFollowsTheForegroundShell() {
+        val machine = start(1)
+        val console = Native.openConsole(machine, 24, 80)
+        val argv = ConsolePty.argv(ConsolePty.script(context), ConsolePty.LOGIN_ROOT)
+        val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+        val reader = thread { readAll(machine, console) }
+        fun waitFor(want: String?): String? {
+            val deadline = System.currentTimeMillis() + 10_000
+            var cwd = Native.consoleCwd(machine, console)
+            while (cwd != want && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
+                cwd = Native.consoleCwd(machine, console)
+            }
+            return cwd
+        }
+        assertEquals("/root", waitFor("/root"))
+        val cd = "cd /usr/lib\n".toByteArray()
+        Native.write(machine, console, cd, 0, cd.size)
+        assertEquals("/usr/lib", waitFor("/usr/lib"))
+        val exit = "exit\n".toByteArray()
+        Native.write(machine, console, exit, 0, exit.size)
+        Native.waitFor(machine, pid)
+        assertEquals(null, waitFor(null))
+        reader.join(5000)
+        Native.closeConsole(machine, console)
+    }
+
+    /**
+     * 存下的标签页（设计文档 §11.2）：标记还在（被杀）时读回原样，读过一次标记就没了；正常退出
+     * （clear）之后什么也读不到。
+     */
+    @Test
+    fun tabsComeBackOnlyAfterAKill() {
+        Tabs.clear(context)
+        val tabs = listOf(
+            Tabs.Tab("auto", "/etc", "line 1\nline 2"),
+            Tabs.Tab("root", null, ""),
+        )
+        Tabs.markRunning(context)
+        Tabs.save(context, tabs, 1)
+        val saved = Tabs.takeKilled(context)
+        assertEquals(tabs, saved?.tabs)
+        assertEquals(1, saved?.current)
+        assertTrue(saved!!.time > 0)
+        assertEquals(null, Tabs.takeKilled(context))
+        Tabs.markRunning(context)
+        Tabs.save(context, tabs.take(1), 0)
+        Tabs.clear(context)
+        assertEquals(null, Tabs.takeKilled(context))
     }
 
     /**

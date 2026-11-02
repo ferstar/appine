@@ -54,6 +54,7 @@
     <string name="login_auto_root">自动：root。在终端里用 adduser 建了普通用户之后，新标签页就以它登录。</string>
     <string name="login_missing">%1$s（找不到这个账号，新标签页以 root 登录）</string>
     <string name="login_changed">新开的标签页以 %1$s 登录</string>
+    <string name="restored_notice">上次会话因 App 被系统终止而结束（标签页保存于 %1$s），之前运行的程序没有恢复。</string>
     <plurals name="sessions_running">
         <item quantity="other">%d 个会话运行中</item>
     </plurals>

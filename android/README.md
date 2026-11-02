@@ -48,7 +48,9 @@ HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
 - `JNI.java` and the native subprocess code (`src/main/jni`) are removed.
 - `TerminalSession.java` is rewritten: instead of `JNI.createSubprocess` on a host PTY,
   it talks to appine's in-process PTY through the `TerminalSession.Pty` interface. Its
-  thread structure and public methods are unchanged.
+  thread structure and public methods are unchanged. It also takes text to show before
+  the shell starts (`setRestored`) and returns the transcript (`getTranscriptText`), for
+  restoring tabs after the app is killed (`Tabs.kt`).
 - The Gradle build files are new.
 
 License: termux-app is released under the GPL 3.0 only (`licenses/termux-app-LICENSE.md`);

@@ -151,7 +151,8 @@ class MainActivity : Activity(), TerminalService.Listener {
         if (s.sessions.isEmpty()) {
             newSession()
         } else {
-            show(current?.takeIf { it in s.sessions } ?: s.sessions.last())
+            // 被杀之后恢复的标签页：显示原来正在看的那个
+            show(current?.takeIf { it in s.sessions } ?: s.focus?.takeIf { it in s.sessions } ?: s.sessions.last())
         }
     }
 
@@ -220,6 +221,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     private fun show(session: TerminalSession) {
         current = session
+        service?.current = session
         terminal.attachSession(session)
         terminal.onScreenUpdated()
         terminal.requestFocus()

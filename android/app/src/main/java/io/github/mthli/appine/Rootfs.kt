@@ -343,6 +343,30 @@ internal object Rootfs {
         }.sortedBy { it.uid }
     }
 
+    /**
+     * `/etc/profile.d/appine.sh`：显示 motd、终端和语言的环境变量、彩色的提示符。从哪个目录开始
+     * 由 assets 的 `login.sh` 决定（App 被杀之后恢复的标签页从原来的目录开始，设计文档 §11.2）。
+     */
+    private val PROFILE = """
+        cat /etc/motd 2>/dev/null
+        export TERM=xterm-256color
+        export LANG=C.UTF-8
+        export NMAP_UNPRIVILEGED=1
+        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+
+    """.trimIndent()
+
+    /** 第 194 轮之前写的那份：最后还有一行 `cd "$HOME"`，恢复的标签页会被它带回家目录。 */
+    private val OLD_PROFILE = PROFILE.trimEnd('\n') + "\ncd \"${'$'}HOME\" 2>/dev/null\n"
+
+    /** 之前导入的仓库里 App 写的 profile 没被改过的，换成现在的。 */
+    @Throws(IOException::class)
+    fun updateProfile(context: Context) {
+        val path = "/etc/profile.d/appine.sh"
+        val old = runCatching { Native.readFile(store(context).path, path) }.getOrNull() ?: return
+        if (String(old) == OLD_PROFILE) write(store(context).path, path, PROFILE)
+    }
+
     /** 包管理器的源：写在哪个文件里，内容是什么。 */
     private fun sources(distro: Distro, mirror: String): Pair<String, String> = when (distro) {
         Distro.ALPINE -> "/etc/apk/repositories" to
@@ -378,18 +402,7 @@ internal object Rootfs {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
-        write(
-            store, "/etc/profile.d/appine.sh",
-            """
-            cat /etc/motd 2>/dev/null
-            export TERM=xterm-256color
-            export LANG=C.UTF-8
-            export NMAP_UNPRIVILEGED=1
-            PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-            cd "${'$'}HOME" 2>/dev/null
-
-            """.trimIndent(),
-        )
+        write(store, "/etc/profile.d/appine.sh", PROFILE)
         val install = when (distro) {
             Distro.ALPINE -> "apk add git python3"
             Distro.DEBIAN -> "apt update && apt install git python3"

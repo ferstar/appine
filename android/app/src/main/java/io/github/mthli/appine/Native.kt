@@ -65,6 +65,10 @@ internal object Native {
     @JvmStatic
     external fun processes(machine: Long): Int
 
+    /** 控制台前台进程组的当前目录（App 被杀之后恢复标签页用）；shell 已经退出时是 null。 */
+    @JvmStatic
+    external fun consoleCwd(machine: Long, console: Int): String?
+
     const val POWER_NONE = 0
     const val POWER_REBOOT = 1
     const val POWER_HALT = 2

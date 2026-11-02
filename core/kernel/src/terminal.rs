@@ -148,6 +148,30 @@ pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// 控制台前台进程组的当前目录（App 被杀之后恢复标签页用，设计文档 §11.2）：组长的，组长
+/// 已经退出时取组里的任何一个进程；路径按那个进程的根目录算（与它的 `/proc/<pid>/cwd` 一样）。
+/// 没有前台进程组（shell 已经退出）是 ESRCH。
+pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
+    let fg = tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)?;
+    let leader = k.groups.get(&fg).filter(|g| g.borrow().pgid == fg);
+    let group = leader
+        .or_else(|| k.groups.values().find(|g| g.borrow().pgid == fg))
+        .ok_or(Errno::ESRCH)?;
+    let (tgid, tid) = {
+        let g = group.borrow();
+        (g.tgid, *g.threads.first().ok_or(Errno::ESRCH)?)
+    };
+    let task = k.tasks.get(&tid).ok_or(Errno::ESRCH)?;
+    let (root, cwd) = {
+        let res = task.res.borrow();
+        let fs = res.fs.borrow();
+        (fs.root.clone(), fs.cwd.clone())
+    };
+    let vfs = k.vfs.as_ref().ok_or(Errno::ENOENT)?;
+    let view = crate::pseudo::View { k, vfs, tid, tgid };
+    vfs.path_of(&view, &root, &cwd)
+}
+
 /// 窗口大小变了：更新 PTY，给前台进程组发 SIGWINCH。
 pub(crate) fn resize(k: &Kernel, id: u32, w: Winsize) -> Result<(), Errno> {
     let tty = tty_of(k, id)?;

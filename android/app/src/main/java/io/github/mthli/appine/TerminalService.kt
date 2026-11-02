@@ -24,6 +24,8 @@ import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import java.util.concurrent.Executors
+import java.text.DateFormat
+import java.util.Date
 import kotlin.concurrent.thread
 
 /**
@@ -167,6 +169,33 @@ class TerminalService : Service() {
 
     val sessions = mutableListOf<TerminalSession>()
 
+    /** 各个会话的 PTY（存标签页时要它的控制台和登录账号）。 */
+    private val ptys = HashMap<TerminalSession, ConsolePty>()
+
+    /** 恢复出来、还没显示过的会话存下的那份（模拟器还没建，回看记录和目录都还是原来的）。 */
+    private val unshown = HashMap<TerminalSession, Tabs.Tab>()
+
+    /** 上次被系统杀掉时存下的标签页，内核第一次起来之后恢复（设计文档 §11.2）。 */
+    private var restore: Tabs.Saved? = null
+
+    /** 恢复之后该显示的标签页（Activity 取用）。 */
+    var focus: TerminalSession? = null
+        private set
+
+    /** Activity 正在显示的标签页（存标签页时记下是第几个）。 */
+    var current: TerminalSession? = null
+
+    /** 内核运行期间每 [SAVE_MS] 存一次标签页，界面隐藏、内存紧张时马上存。 */
+    private val periodicSave = object : Runnable {
+        override fun run() {
+            saveTabs()
+            main.postDelayed(this, SAVE_MS)
+        }
+    }
+
+    /** 标签页开了、关了：稍等一下再存，接连几次只存一次。 */
+    private val saveSoon = Runnable { saveTabs() }
+
     /**
      * 默认网络的路由交给 guest（设计文档 §10）：Android 10 起 App 读不了宿主的路由表，guest
      * 的 `ip route`、`/proc/net/route` 靠它。回调在系统的线程上，交给 [worker] 按顺序做。
@@ -199,6 +228,8 @@ class TerminalService : Service() {
         if (listeners.isEmpty()) {
             main.removeCallbacks(trimWhenHidden)
             main.postDelayed(trimWhenHidden, TRIM_DELAY_MS)
+            // 界面不在了，App 随时可能被杀：先存一份标签页
+            saveTabs()
         }
     }
 
@@ -282,6 +313,8 @@ class TerminalService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        // 上次没有正常退出：内核起来之后恢复标签页
+        restore = Tabs.takeKilled(this)
         // 第一次运行（或者上次导入没完成）：导入 APK 里的 Alpine，别的发行版在设置里换
         start(if (Rootfs.isReady(this)) null else Rootfs.Distro.ALPINE)
     }
@@ -321,6 +354,7 @@ class TerminalService : Service() {
                 }
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureLoginTools(this)
+                Rootfs.updateProfile(this)
                 Native.start(Rootfs.store(this).path, tier)
             }
             main.post {
@@ -328,6 +362,11 @@ class TerminalService : Service() {
                     machine = it
                     progress = null
                     updateWakeLock()
+                    Tabs.markRunning(this)
+                    restore?.let { saved -> restoreTabs(saved) }
+                    restore = null
+                    main.removeCallbacks(periodicSave)
+                    main.postDelayed(periodicSave, SAVE_MS)
                     // 开机要等 sysinit、wait 的命令（OpenRC 起服务），不占 worker：标签页照常打开
                     thread(name = "appine-boot") {
                         runCatching {
@@ -539,6 +578,8 @@ class TerminalService : Service() {
             main.post {
                 exiting = false
                 updateWakeLock()
+                // 正常退出：下次不恢复标签页
+                Tabs.clear(this)
                 // 关机期间用户又打开了 App：重新启动，不然界面一直停在"正在启动"
                 if (listeners.isNotEmpty()) start(null) else stopSelf()
             }
@@ -572,8 +613,11 @@ class TerminalService : Service() {
         machine = 0
         updateWakeLock()
         main.removeCallbacks(poll)
+        main.removeCallbacks(periodicSave)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
+        ptys.clear()
+        unshown.clear()
         sessionsChanged()
         return m
     }
@@ -590,6 +634,10 @@ class TerminalService : Service() {
     override fun onDestroy() {
         main.removeCallbacks(trimWhenHidden)
         main.removeCallbacks(poll)
+        main.removeCallbacks(periodicSave)
+        main.removeCallbacks(saveSoon)
+        // 服务正常停下（exitAll 之后）：下次不恢复。被杀时不会走到这里
+        Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
@@ -610,7 +658,10 @@ class TerminalService : Service() {
     @Suppress("DEPRECATION") // RUNNING_LOW、RUNNING_CRITICAL 只在 Android 14 之前发
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) trimMemory()
+        if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
+            trimMemory()
+            saveTabs()
+        }
     }
 
     private fun trimMemory() {
@@ -624,10 +675,15 @@ class TerminalService : Service() {
         if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
     }
 
-    /** 新开一个终端会话（登录 shell）。shell 在第一次知道窗口大小时启动。 */
-    fun createSession(): TerminalSession {
-        val session = TerminalSession(ConsolePty(machine, ConsolePty.script(this), login), TRANSCRIPT_ROWS, client)
+    /**
+     * 新开一个终端会话（登录 shell），以 [account] 登录、从 [cwd] 开始（null 是家目录）。shell
+     * 在第一次知道窗口大小时启动。
+     */
+    fun createSession(account: String = login, cwd: String? = null): TerminalSession {
+        val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
+        val session = TerminalSession(pty, TRANSCRIPT_ROWS, client)
         sessions.add(session)
+        ptys[session] = pty
         sessionsChanged()
         return session
     }
@@ -636,12 +692,61 @@ class TerminalService : Service() {
     fun removeSession(session: TerminalSession) {
         session.finishIfRunning()
         sessions.remove(session)
+        ptys.remove(session)
+        unshown.remove(session)
         sessionsChanged()
     }
 
     private fun sessionsChanged() {
         updateNotification()
         each { it.onSessionsChanged() }
+        main.removeCallbacks(saveSoon)
+        if (machine != 0L) main.postDelayed(saveSoon, SAVE_SOON_MS)
+    }
+
+    /**
+     * 恢复上次被杀时的标签页（设计文档 §11.2）：每个起新的 shell，以原来的账号登录、从原来的
+     * 目录开始，先显示原来的回看记录和一行提示。不恢复进程。
+     */
+    private fun restoreTabs(saved: Tabs.Saved) {
+        val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(saved.time))
+        val notice = "\u001b[33m[appine] " + getString(R.string.restored_notice, time) + "\u001b[0m\r\n\r\n"
+        for (tab in saved.tabs) {
+            val session = createSession(tab.login, tab.cwd)
+            val body = tab.transcript.trimEnd().replace("\r\n", "\n").replace("\n", "\r\n")
+            session.setRestored(((if (body.isEmpty()) "" else body + "\r\n") + notice).toByteArray())
+            unshown[session] = tab
+        }
+        focus = sessions.getOrNull(saved.current) ?: sessions.lastOrNull()
+    }
+
+    /**
+     * 存下标签页（[Tabs]）：回看记录在主线程上取（模拟器在主线程上改），前台进程的当前目录要取
+     * BKL，和写文件一起在 [worker] 上做。已经结束的标签页不存。
+     */
+    private fun saveTabs() {
+        val m = machine
+        if (m == 0L) return
+        main.removeCallbacks(saveSoon)
+        val live = sessions.filter { it.isRunning && it in ptys }
+        val snapshot = live.map { s ->
+            val pty = ptys.getValue(s)
+            val text = s.transcriptText
+            // 还没显示过的恢复出来的标签页：shell 还没起，存原来的那份
+            val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
+            Triple(pty, text ?: old?.transcript.orEmpty(), old?.cwd)
+        }
+        val index = live.indexOf(current).coerceAtLeast(0)
+        runCatching {
+            worker.execute {
+                val tabs = snapshot.map { (pty, text, oldCwd) ->
+                    val console = pty.console
+                    val cwd = if (console >= 0) Native.consoleCwd(m, console) else oldCwd
+                    Tabs.Tab(pty.login, cwd, text)
+                }
+                Tabs.save(this, tabs, index)
+            }
+        }
     }
 
     private fun updateNotification() {
@@ -762,5 +867,7 @@ class TerminalService : Service() {
         private const val KEY_LOGIN = "login"
         private const val TRANSCRIPT_ROWS = 2000
         private const val TRIM_DELAY_MS = 60_000L
+        private const val SAVE_MS = 60_000L
+        private const val SAVE_SOON_MS = 2_000L
     }
 }

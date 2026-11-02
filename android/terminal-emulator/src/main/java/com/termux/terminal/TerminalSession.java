@@ -80,6 +80,12 @@ public final class TerminalSession extends TerminalOutput {
     private final Pty mPty;
     private final Integer mTranscriptRows;
 
+    /**
+     * App 被杀之后恢复的标签页：模拟器建好、shell 启动之前先显示的内容（上次的回看记录和提示），
+     * 显示过就丢掉。
+     */
+    private byte[] mRestored;
+
     private static final String LOG_TAG = "TerminalSession";
 
     public TerminalSession(Pty pty, Integer transcriptRows, TerminalSessionClient client) {
@@ -97,6 +103,16 @@ public final class TerminalSession extends TerminalOutput {
 
         if (mEmulator != null)
             mEmulator.updateTerminalSessionClient(client);
+    }
+
+    /** 恢复的标签页：在 shell 的输出之前显示 [text]（终端的字节流，换行要是 \r\n）。 */
+    public void setRestored(byte[] text) {
+        mRestored = text;
+    }
+
+    /** 回看记录的文本（保存标签页用）；模拟器还没建（标签页还没显示过）时是 null。 */
+    public String getTranscriptText() {
+        return mEmulator == null ? null : mEmulator.getScreen().getTranscriptText();
     }
 
     /** Inform the attached pty of the new size and reflow or initialize the emulator. */
@@ -122,6 +138,10 @@ public final class TerminalSession extends TerminalOutput {
      */
     public void initializeEmulator(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
         mEmulator = new TerminalEmulator(this, columns, rows, cellWidthPixels, cellHeightPixels, mTranscriptRows, mClient);
+        if (mRestored != null) {
+            mEmulator.append(mRestored, mRestored.length);
+            mRestored = null;
+        }
 
         try {
             mShellPid = mPty.start(columns, rows);

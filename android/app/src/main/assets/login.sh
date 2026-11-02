@@ -1,6 +1,7 @@
 # appine 终端标签页的登录（设计文档 §11.1）：以 root 运行，$1 是设置里的登录账号：auto、root
 # 或账号名。auto 用最先建的普通用户（UID 1000–65533、有登录 shell 的里 UID 最小的），没有就是
-# root；指定的账号不在了也是 root。
+# root；指定的账号不在了也是 root。$2 是从哪个目录开始（App 被杀之后恢复的标签页，§11.2），
+# 没有、进不去时是账号的家目录。
 #
 # 普通用户第一次成为登录账号时，照 Alpine 的 setup-user -a 把它加进管理员组、装好提权工具：
 # Alpine 是 wheel 组和 doas（App 带着这个包，离线也能装），Debian 是 sudo 组和 sudo（要联网，
@@ -10,6 +11,7 @@
 # 装软件的命令都从 /dev/null 读：用户在提示符出来之前敲的字要留给登录 shell
 set -u
 want=${1:-auto}
+dir=${2:-}
 user=root
 
 # 最先建的普通用户
@@ -46,9 +48,12 @@ root) ;;
 esac
 
 if [ "$user" = root ]; then
+    # 从恢复的目录开始，不然是家目录
+    home=$(field root 6 /etc/passwd)
+    { [ -n "$dir" ] && cd "$dir"; } 2>/dev/null || cd "$home" 2>/dev/null || cd /
     shell=$(field root 7 /etc/passwd)
     [ -x "$shell" ] || shell=/bin/sh
-    export SHELL="$shell"
+    export SHELL="$shell" HOME="$home"
     exec "$shell" -l
 fi
 
@@ -128,4 +133,8 @@ else
     rm -f "$rules"
 fi
 
-exec su -l "$user"
+# 以登录 shell 运行（读 /etc/profile）；su 设好 HOME、SHELL、USER、LOGNAME。不用 su -l：它
+# 总是回家目录。恢复的目录以这个账号的身份进（root 进得去的它不一定进得去），进不去回家目录
+cd /
+q=$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")
+exec su "$user" -c "{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; exec \"\$SHELL\" -l"

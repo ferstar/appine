@@ -6,19 +6,24 @@ import java.io.IOException
 
 /**
  * 一个终端标签页的 PTY：内核里的一个控制台，上面跑一个登录 shell。[login] 是设置里的登录账号
- * （`auto`、`root` 或账号名），由 assets 里的 `login.sh` 以 root 运行时决定登录谁（设计文档 §11.1）。
+ * （`auto`、`root` 或账号名），由 assets 里的 `login.sh` 以 root 运行时决定登录谁（设计文档 §11.1）；
+ * [cwd] 是从哪个目录开始（App 被杀之后恢复的标签页，§11.2），null 是家目录。
  */
 internal class ConsolePty(
     private val machine: Long,
     private val script: String,
-    private val login: String,
+    val login: String,
+    private val cwd: String? = null,
 ) : TerminalSession.Pty {
-    private var console = -1
+    /** 内核里的控制台编号，shell 启动之前是 -1。 */
+    @Volatile
+    var console = -1
+        private set
     private var pid = -1
 
     override fun start(columns: Int, rows: Int): Int {
         console = Native.openConsole(machine, rows, columns)
-        pid = Native.spawn(machine, console, "/bin/sh", argv(script, login), ENVIRONMENT)
+        pid = Native.spawn(machine, console, "/bin/sh", argv(script, login, cwd), ENVIRONMENT)
         return pid
     }
 
@@ -56,8 +61,9 @@ internal class ConsolePty(
         fun script(context: Context): String = cached
             ?: context.assets.open("login.sh").bufferedReader().readText().also { cached = it }
 
-        /** 以 root 运行登录脚本的 argv（`sh -c 脚本 appine-login 账号`）。 */
-        fun argv(script: String, login: String) = arrayOf("sh", "-c", script, "appine-login", login)
+        /** 以 root 运行登录脚本的 argv（`sh -c 脚本 appine-login 账号 目录`）。 */
+        fun argv(script: String, login: String, cwd: String? = null) =
+            arrayOf("sh", "-c", script, "appine-login", login, cwd.orEmpty())
 
         val ENVIRONMENT = arrayOf(
             "HOME=/root",

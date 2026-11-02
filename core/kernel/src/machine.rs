@@ -523,6 +523,14 @@ impl Machine {
         self.kill_all();
     }
 
+    /// 控制台 `id` 前台进程组的当前目录（App 被杀之后恢复标签页时，新的 shell 从这里开始，
+    /// 设计文档 §11.2）。shell 已经退出时是 ESRCH。
+    pub fn console_cwd(&self, id: u32) -> Result<Vec<u8>, Errno> {
+        let k = self.shared.lock();
+        crate::bug::host_call("Machine::console_cwd", || terminal::fg_cwd(&k, id))
+            .unwrap_or(Err(Errno::EIO))
+    }
+
     /// 还在运行的 guest 进程数（不算内置的 init 和僵尸进程）：App 关掉最后一个标签页之后据此
     /// 决定留在后台还是退出（设计文档 §11.2）。
     pub fn processes(&self) -> usize {

@@ -609,7 +609,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 ### 11.1 凭据与权限
 
 - 按 Linux 的 `struct cred` 实现（`core/kernel/src/cred.rs`）：ruid/euid/suid/fsuid、对应的四个 gid、附加组、umask。凭据放在线程组里（libc 的 setuid 系列本来就会让每个线程都调用一遍）。VFS 做 DAC 权限检查（`generic_permission`、粘滞位、setgid 目录），root 经由能力绕过。 `fs.protected_symlinks`、`fs.protected_hardlinks` 默认打开（与 systemd、Android 设的一样），规则同 Linux 6.1 的 `may_follow_link`、`may_linkat`：粘滞位、所有人可写的目录（/tmp）里，最后一个组件是别人的符号链接、并且链接的属主不是目录的属主时不跟随（EACCES，root 也一样）；不是文件的属主、也没有 `CAP_FOWNER` 时只能硬链接能读写的普通文件，setuid、可执行的 setgid 文件不行（EPERM）。不持 BKL 的路径解析遇到这种链接交给正常的解析（[sysctl 和随机数的 ioctl](rounds/185-protected-links-random.md)）。
-- **登录账号**（[以指定用户登录](rounds/193-login-account.md)）：终端标签页由 assets 里的 `login.sh` 以 root 运行，按设置里的"登录账号"决定登录谁，再 `su -l` 过去。默认是"自动"：用最先建的普通用户（UID 1000–65533、有登录 shell 的里 UID 最小的），没有就是 root，像桌面 Linux 一样在命令行里 `adduser` 建了账号之后新标签页就以它登录；也可以明确选 root 或某个账号，选的账号不在了用 root。换发行版、重置 rootfs 之后回到自动。开着的标签页不受影响。
+- **登录账号**（[以指定用户登录](rounds/193-login-account.md)）：终端标签页由 assets 里的 `login.sh` 以 root 运行，按设置里的"登录账号"决定登录谁，再用 `su 账号 -c 'exec "$SHELL" -l'` 切过去（不用 `su -l`：它总是回家目录，恢复的标签页要从原来的目录开始，见 §11.2；目录以那个账号的身份进，进不去回家目录）。默认是"自动"：用最先建的普通用户（UID 1000–65533、有登录 shell 的里 UID 最小的），没有就是 root，像桌面 Linux 一样在命令行里 `adduser` 建了账号之后新标签页就以它登录；也可以明确选 root 或某个账号，选的账号不在了用 root。换发行版、重置 rootfs 之后回到自动。开着的标签页不受影响。
   - 普通用户第一次成为登录账号时，照 Alpine 的 `setup-user -a` 让它能提权：Alpine 加进 wheel 组、写 `permit persist :wheel`、装 doas（App 带着这个 17 KB 的包，离线也能装，`apk add` 之后 world 里记的是 `doas` 而不是那个文件）；Debian 加进 sudo 组、联网装 sudo（装不上时之后每次登录再试）。加过组的记在 `/var/lib/appine/admins`，之后用户自己移出组也不再加回去；工具装上过一次就不再管。
   - 提权的密码：设了密码的照发行版的惯例要输密码；没设的（`adduser -D`）不问。每次登录按当时的密码重写 `/etc/doas.d/30-appine.conf`（或 `/etc/sudoers.d/appine`）里免密的那几行，设了密码之后下一次登录起就要输了。
 - setuid/setgid 位在 execve 时生效（`PR_SET_NO_NEW_PRIVS` 之后、被没有 `CAP_SYS_PTRACE` 的跟踪者跟踪着时得不到新的特权），特权执行设置 `AT_SECURE`。写、截短普通文件时，没有 `CAP_FSETID` 的进程去掉它的 setuid 位和带着组执行位时的 setgid 位，chown 总是去掉（`file_remove_privs`、`chown_common`）。
@@ -626,7 +626,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 | 生命周期归属 | 所有会话和 guest 内核的生命周期都**挂在 Service 上，不挂在 Activity 上** | ✅ M5 |
 | 熄屏 | 熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启（设置页的"熄屏时保持运行"、通知上的"保持唤醒"），默认关闭。开着时内核运行期间一直持有，关机完成、内核停下就放开。App 有前台服务，Doze 里这个锁照样有效、网络也不断（AOSP 只对进程状态在 `BOUND_FOREGROUND_SERVICE` 之后的 App 禁用 partial wake lock、断网），不申请电池优化的豁免 | ✅ [第 191 轮](rounds/191-keep-awake.md) |
 | 内存紧张 | 丢掉可以重建的缓存：池里保留的翻译、共用的只读文件映射、dentry/inode 缓存（`Machine::trim_memory`，运行中的进程用着的不动），并提交推迟的写事务。界面停下（切到别的 App、熄屏）1 分钟之后还没回来就释放，很快切回来时不必重新翻译：Android 14 起不再发 `RUNNING_*` 这些级别，有前台服务的进程连界面隐藏（`UI_HIDDEN`）也收不到（进程状态停在前台服务），只能自己看 Activity 在不在。`onTrimMemory` 的 `RUNNING_LOW`、`RUNNING_CRITICAL`（Android 14 之前）和 `BACKGROUND` 以上立即释放。释放和停止内核在同一个后台线程上按顺序做 | ✅ M9 之前 |
-| 进程被杀 | v1 只恢复标签页布局、每个标签的 cwd 和滚动回看记录，并启动新的 shell，同时明确提示"上次会话因 App 被系统终止而结束"。v1 **不恢复进程** | M9 |
+| 进程被杀 | v1 只恢复标签页布局、每个标签的 cwd 和滚动回看记录，并启动新的 shell，同时明确提示"上次会话因 App 被系统终止而结束"。v1 **不恢复进程**。内核运行期间在 `files/tabs/` 留着"在运行"的标记，每个标签页的登录账号、前台进程组的当前目录（`Machine::console_cwd`）和回看记录每分钟存一次，界面隐藏、内存紧张、开关标签页时也存（内容没变的不重写）；正常退出时连标记一起删掉。服务启动时标记还在就是被杀了（或者崩溃了）：每个标签页以原来的账号起新的 shell，从原来的目录开始（`login.sh` 的第二个参数），先显示原来的回看记录（纯文本，没有颜色）和一行黄色的提示，显示原来正在看的那个 | ✅ [第 194 轮](rounds/194-restore-tabs.md) |
 | 开机自启 | v1 不做 | — |
 
 ### 11.3 共享存储

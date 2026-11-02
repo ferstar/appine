@@ -55,6 +55,7 @@
     <string name="login_auto_root">Automatic: root. Once you create a user with adduser, new tabs log in as it.</string>
     <string name="login_missing">%1$s (not found, so new tabs log in as root)</string>
     <string name="login_changed">New tabs log in as %1$s</string>
+    <string name="restored_notice">The previous session ended because Android stopped the app (tabs saved %1$s). Programs that were running were not restored.</string>
     <plurals name="sessions_running">
         <item quantity="one">%d session running</item>
         <item quantity="other">%d sessions running</item>
