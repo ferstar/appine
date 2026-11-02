@@ -619,7 +619,8 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 | 项目 | 设计 | 现状 |
 |---|---|---|
-| 前台服务 | 只要还有终端会话或 guest 进程在运行，就保持一个**前台服务**，类型为 `specialUse`。通知栏显示"N 个会话运行中"，附带"全部退出"按钮 | ✅ M5（`TerminalService`） |
+| 前台服务 | 只要还有终端会话或 guest 进程在运行，就保持一个**前台服务**，类型为 `specialUse`。通知栏显示"N 个会话运行中"，没有会话时是"在后台运行"，附带"全部退出"按钮。关掉最后一个标签页只关界面：服务每 2 秒看一次，没有会话、界面不在、也没有 guest 进程了才退出 | ✅ M5（`TerminalService`），留在后台是[第 187 轮](rounds/187-app-init.md) |
+| 开机、关机 | 内核启动之后在单独的线程上按 `/etc/inittab` 开机（§6，Alpine 上是 OpenRC 的服务），不挡标签页。"全部退出"、guest 的 `poweroff`/`halt` 先关机（关机的命令、SIGTERM、最多等 1 秒、SIGKILL），完了才停止服务，这期间通知显示"正在停止服务"；guest 的 `reboot` 关机之后启动一个新的内核、开一个新的标签页。被系统杀掉时来不及关机 | ✅ [第 187 轮](rounds/187-app-init.md) |
 | 生命周期归属 | 所有会话和 guest 内核的生命周期都**挂在 Service 上，不挂在 Activity 上** | ✅ M5 |
 | 熄屏 | 熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启，默认关闭 | M9 |
 | 内存紧张 | 丢掉可以重建的缓存：池里保留的翻译、共用的只读文件映射、dentry/inode 缓存（`Machine::trim_memory`，运行中的进程用着的不动），并提交推迟的写事务。界面停下（切到别的 App、熄屏）1 分钟之后还没回来就释放，很快切回来时不必重新翻译：Android 14 起不再发 `RUNNING_*` 这些级别，有前台服务的进程连界面隐藏（`UI_HIDDEN`）也收不到（进程状态停在前台服务），只能自己看 Activity 在不在。`onTrimMemory` 的 `RUNNING_LOW`、`RUNNING_CRITICAL`（Android 14 之前）和 `BACKGROUND` 以上立即释放。释放和停止内核在同一个后台线程上按顺序做 | ✅ M9 之前 |
@@ -638,7 +639,7 @@ guest 地址空间的布局由我们自己的 mmap 实现决定，不受宿主�
 
 1. 第一次运行时让用户选发行版：Alpine Linux、Debian 13、Ubuntu 24.04。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，版本和 sha256 固定写在脚本里；Debian（debuerreotype 构建的 `debian:trixie`，固定在一个提交上）、Ubuntu（官方的 ubuntu-base，清华、中科大的镜像上有同一份）的选了才下载，版本、长度和 sha256 固定写在 `Rootfs.kt` 里，摘要对不上的不用。有几个来源时先测速（各下最多 512 KB、5 秒，按吞吐量比），从快的开始试，一个失败了换下一个；中途超时、断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。原计划还要校验官方的 GPG 签名，没有做。
 2. 以流的方式导入 `rootfs.tmp`，完成后再改名，导入中途被杀时下次重来。
-3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有，Ubuntu 的是空的）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd，切到 `$HOME`）。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1、Ubuntu 的是空的，App 改成指向 DNS 存根。
+3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`（Alpine 已有就不动；Debian 的没有，Ubuntu 的是空的）、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd，切到 `$HOME`）。每次启动内核之前，没有时写一个 OpenRC 的配置 `/etc/rc.conf.d/appine.conf`（`rc_provide="loopback net"`：网络是宿主的，不然要网络的服务去拉起 networking，没有 `/etc/network/interfaces` 时它失败，服务也起不来），用户改过的不动。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的指向 1.1.1.1、Ubuntu 的是空的，App 改成指向 DNS 存根。
 4. 终端标签页以 `/etc/passwd` 里 root 的 shell 登录（`ConsolePty.LOGIN`）：Alpine 是 ash，Debian、Ubuntu 是 bash，chsh 改过之后照样。
 
 - **镜像选择**：每个发行版内置一份镜像列表：官方的（dl-cdn、deb.debian.org、ports.ubuntu.com）、清华、中科大、阿里云。首次启动时在后台并发测速（与下载 tarball 的测速相同），选最快的写入包管理器的源，全部失败时保持官方的。设置里手动更换镜像还没做。

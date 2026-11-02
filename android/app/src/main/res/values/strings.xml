@@ -12,6 +12,9 @@
     <string name="reset_message">All sessions end and every file in the rootfs, /root included, is deleted. Then you choose a distribution again.</string>
     <string name="reset">Reset</string>
     <string name="resetting">Resetting…</string>
+    <string name="restarting">Restarting…</string>
+    <string name="stopping">Stopping services…</string>
+    <string name="background_running">Running in the background</string>
     <string name="start_failed">Cannot start: %1$s</string>
     <string name="channel_sessions">Terminal sessions</string>
     <string name="exit_all">Exit all</string>

@@ -179,6 +179,44 @@ class MachineTest {
         Native.stop(machine)
     }
 
+    /**
+     * 按 inittab 开机、关机（设计文档 §6、§11.2）：开机之后 once 的命令在跑，guest 的
+     * `poweroff` 是关机的请求，[Native.shutdown] 运行关机的命令、结束所有进程、释放句柄。
+     * 启动之前写好 OpenRC 的配置。
+     */
+    @Test
+    fun bootsAndShutsDownByInittab() {
+        val store = Rootfs.store(context).path
+        val probe = start(1)
+        val original = sh(probe, "cat /etc/inittab").first.toByteArray()
+        Native.stop(probe)
+        val inittab = "::sysinit:/bin/sh -c 'echo sysinit > /tmp/inittab-order'\n" +
+            "::once:/bin/sleep 30\n" +
+            "::shutdown:/bin/sh -c 'echo shutdown >> /tmp/inittab-order'\n"
+        Native.writeFile(store, "/etc/inittab", inittab.toByteArray(), 420, true)
+        try {
+            Rootfs.ensureOpenRcConfig(context)
+            val machine = start(1)
+            Native.boot(machine)
+            assertTrue(Native.processes(machine) >= 1)
+            assertEquals("sysinit\n" to 0, sh(machine, "cat /tmp/inittab-order"))
+            assertEquals(Native.POWER_NONE, Native.takePower(machine))
+            assertEquals(0, sh(machine, "poweroff").second)
+            assertEquals(Native.POWER_OFF, Native.takePower(machine))
+            assertEquals(Native.POWER_NONE, Native.takePower(machine))
+            val begin = System.nanoTime()
+            Native.shutdown(machine)
+            assertTrue(System.nanoTime() - begin < 10_000_000_000L)
+            assertEquals(0, Native.processes(machine))
+            val after = start(1)
+            assertEquals("sysinit\nshutdown\n" to 0, sh(after, "cat /tmp/inittab-order"))
+            assertTrue(sh(after, "cat /etc/rc.conf.d/appine.conf").first.contains("rc_provide=\"loopback net\""))
+        } finally {
+            machines.forEach(Native::stop)
+            Native.writeFile(store, "/etc/inittab", original, 420, true)
+        }
+    }
+
     /** 登录 shell 是 /etc/passwd 里 root 的 shell，chsh 改过之后照样；它读 /etc/profile。 */
     @Test
     fun loginShellComesFromPasswd() {

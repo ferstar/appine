@@ -176,8 +176,8 @@ class MainActivity : Activity(), TerminalService.Listener {
             s.sessions.lastOrNull()?.let { show(it) }
         }
         if (s.sessions.isEmpty() && s.machine != 0L) {
-            // 最后一个标签页关掉了：整个应用退出
-            stopService(Intent(this, TerminalService::class.java))
+            // 最后一个标签页关掉了：界面退出。服务还有 guest 进程（OpenRC 起的服务等）时留在
+            // 后台，没有了就自己退出（设计文档 §11.2）
             finish()
             return
         }
@@ -190,6 +190,13 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onExitAll() {
         finish()
+    }
+
+    override fun onRestarting() {
+        current = null
+        terminal.visibility = View.INVISIBLE
+        status.visibility = View.VISIBLE
+        status.setText(R.string.restarting)
     }
 
     // ---- rootfs ----

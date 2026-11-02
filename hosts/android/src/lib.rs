@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 
-use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Stdio, Tier};
+use appine_kernel::{ExitStatus, HostRoute, Machine, MachineOptions, Power, Stdio, Tier};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jint, jlong, jobjectArray};
@@ -458,4 +458,56 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
         ExitStatus::Exited(code) => code,
         ExitStatus::Signaled { signal, .. } => -signal.number(),
     }
+}
+
+/// 按 `/etc/inittab` 开机（设计文档 §6）：阻塞到 sysinit、wait 的命令都结束。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    if let Some(m) = machine(handle) {
+        m.boot();
+    }
+}
+
+/// 关机（[`Machine::shutdown`]）：运行 inittab 里关机的命令，给所有进程 SIGTERM，再结束
+/// 剩下的，然后从表里删掉句柄。关机的命令期间别的调用照常能用。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    if let Some(m) = machine(handle) {
+        m.shutdown(Power::PowerOff, appine_kernel::SHUTDOWN_TIMEOUT);
+    }
+    machines().remove(&handle);
+}
+
+/// 取走 guest 的关机请求（busybox 的 reboot、halt、poweroff）：0 没有，1 重启，2 停机，
+/// 3 关机。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_takePower<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jint {
+    match machine(handle).and_then(|m| m.take_power()) {
+        None => 0,
+        Some(Power::Reboot) => 1,
+        Some(Power::Halt) => 2,
+        Some(Power::PowerOff) => 3,
+    }
+}
+
+/// 还在运行的 guest 进程数（不算 init）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jint {
+    machine(handle).map_or(0, |m| m.processes() as jint)
 }

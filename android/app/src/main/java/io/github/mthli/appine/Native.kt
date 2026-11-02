@@ -38,6 +38,33 @@ internal object Native {
     @JvmStatic
     external fun stop(machine: Long)
 
+    /**
+     * 按 `/etc/inittab` 开机（设计文档 §6，Alpine 上是 OpenRC）：阻塞到 sysinit、wait 的命令都
+     * 结束，输出在 guest 的 `/var/log/boot.log`。不在主线程上调用。
+     */
+    @JvmStatic
+    external fun boot(machine: Long)
+
+    /**
+     * 关机：运行 inittab 里关机的命令（最多 30 秒），给所有进程 SIGTERM、最多等 1 秒，再结束
+     * 剩下的，然后释放句柄。不在主线程上调用。
+     */
+    @JvmStatic
+    external fun shutdown(machine: Long)
+
+    /** 取走 guest 的关机请求（busybox 的 reboot、halt、poweroff）：[POWER_NONE] 等。 */
+    @JvmStatic
+    external fun takePower(machine: Long): Int
+
+    /** 还在运行的 guest 进程数（不算 init）。 */
+    @JvmStatic
+    external fun processes(machine: Long): Int
+
+    const val POWER_NONE = 0
+    const val POWER_REBOOT = 1
+    const val POWER_HALT = 2
+    const val POWER_OFF = 3
+
     /** 丢掉可以重建的缓存（池里保留的翻译等），提交推迟的写事务。要取 BKL，不在主线程上调用。 */
     @JvmStatic
     external fun trimMemory(machine: Long)

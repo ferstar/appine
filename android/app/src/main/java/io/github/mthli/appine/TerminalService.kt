@@ -28,6 +28,10 @@ import kotlin.concurrent.thread
  * 持有 guest 内核和所有终端会话的前台服务（设计文档 §11.2）。会话的生命周期挂在服务上，
  * 不挂在 Activity 上：Activity 关掉之后 shell 照常运行。通知栏显示会话数，并提供
  * "全部退出"。
+ *
+ * 内核启动之后按 `/etc/inittab` 开机（Alpine 上是 OpenRC 的服务），退出时先按它关机
+ * （[exitAll]）。关掉最后一个标签页之后，还有 guest 进程（服务）在跑就留在后台，没有了才
+ * 退出；guest 的 `poweroff`、`halt` 是全部退出，`reboot` 重启内核。
  */
 class TerminalService : Service() {
 
@@ -51,8 +55,11 @@ class TerminalService : Service() {
         /** 会话的屏幕内容变了。 */
         fun onTextChanged(session: TerminalSession)
 
-        /** 用户在通知里选了"全部退出"。 */
+        /** 全部退出：用户在通知里选了"全部退出"，或者 guest 关机了。 */
         fun onExitAll()
+
+        /** guest 要求重启：会话都结束了，内核关机之后重新启动（之后是 [onMachineReady]）。 */
+        fun onRestarting()
     }
 
     inner class LocalBinder : Binder() {
@@ -72,23 +79,38 @@ class TerminalService : Service() {
     private val trimWhenHidden = Runnable { trimMemory() }
 
     /**
-     * guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
-     * 1024 以下的端口在宿主上换了一个，要告诉用户连哪个。内核攒着事件，这里每隔
-     * [LISTEN_POLL_MS] 在 [worker] 上取一次（要取 BKL）。
+     * 每隔 [POLL_MS] 在 [worker] 上问一次内核（要取 BKL）：
+     * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
+     *   1024 以下的端口在宿主上换了一个，要告诉用户连哪个；
+     * - guest 的关机请求（busybox 的 reboot、halt、poweroff）；
+     * - 没有会话、界面也不在时还有没有 guest 进程：没有了就退出（设计文档 §11.2）。
      */
-    private val pollListens = object : Runnable {
+    private val poll = object : Runnable {
         override fun run() {
             val m = machine
             if (m == 0L) return
             runCatching {
                 worker.execute {
                     val lines = Native.takeListens(m)
-                    if (!lines.isNullOrEmpty()) main.post { lines.forEach(::notifyListen) }
+                    val power = Native.takePower(m)
+                    val processes = Native.processes(m)
+                    main.post {
+                        if (machine != m) return@post
+                        lines?.forEach(::notifyListen)
+                        when (power) {
+                            Native.POWER_REBOOT -> restart()
+                            Native.POWER_HALT, Native.POWER_OFF -> exitAll()
+                            else -> if (sessions.isEmpty() && listener == null && processes == 0) exitAll()
+                        }
+                    }
                 }
             }
-            main.postDelayed(this, LISTEN_POLL_MS)
+            main.postDelayed(this, POLL_MS)
         }
     }
+
+    /** 正在关机退出（[exitAll]）。 */
+    private var exiting = false
 
     /** 内核句柄，启动之前是 0。 */
     var machine = 0L
@@ -238,14 +260,17 @@ class TerminalService : Service() {
                     })
                     mirrorThread = thread(name = "appine-mirrors") { Rootfs.chooseMirror(this, distro) }
                 }
+                Rootfs.ensureOpenRcConfig(this)
                 Native.start(Rootfs.store(this).path, 1)
             }
             main.post {
                 result.onSuccess {
                     machine = it
+                    // 开机要等 sysinit、wait 的命令（OpenRC 起服务），不占 worker：标签页照常打开
+                    thread(name = "appine-boot") { Native.boot(it) }
                     getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
                     watchingNetwork = true
-                    main.post(pollListens)
+                    main.post(poll)
                     listener?.onMachineReady(null)
                 }.onFailure {
                     Log.e(TAG, "cannot start", it)
@@ -270,17 +295,7 @@ class TerminalService : Service() {
      */
     fun reset() {
         if (machine == 0L) return
-        if (watchingNetwork) {
-            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-            watchingNetwork = false
-        }
-        val m = machine
-        // 先清掉句柄：会话结束时 Activity 看到内核还在，会以为是最后一个标签页关掉了而退出
-        machine = 0
-        main.removeCallbacks(pollListens)
-        for (s in sessions) s.finishIfRunning()
-        sessions.clear()
-        sessionsChanged()
+        val m = detach()
         worker.execute {
             Native.stop(m)
             mirrorThread?.join()
@@ -292,24 +307,74 @@ class TerminalService : Service() {
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_EXIT_ALL) {
-            listener?.onExitAll()
-            stopSelf()
+    /**
+     * 全部退出（通知里的按钮、guest 的 `poweroff`、关掉最后一个标签页之后也没有 guest 进程了）：
+     * 先按 inittab 关机（OpenRC 停服务，PostgreSQL 这些不必下次做崩溃恢复），完了才停止服务，
+     * 这期间前台服务和通知还在，App 进程不会被当作缓存进程杀掉。
+     */
+    fun exitAll() {
+        if (exiting) return
+        exiting = true
+        // Activity 要到 onStop 才放开，关机可能比它快：先当它已经走了，关机完了还有 listener
+        // 就是用户又打开了 App
+        listener?.onExitAll()
+        listener = null
+        val m = detach()
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
+        worker.execute {
+            if (m != 0L) Native.shutdown(m)
+            main.post {
+                exiting = false
+                // 关机期间用户又打开了 App：重新启动，不然界面一直停在"正在启动"
+                if (listener != null) start(null) else stopSelf()
+            }
         }
+    }
+
+    /** guest 要求重启（busybox 的 `reboot`）：关机，再启动一个新的内核（之后 Activity 开新会话）。 */
+    private fun restart() {
+        if (machine == 0L) return
+        val m = detach()
+        listener?.onRestarting()
+        worker.execute {
+            Native.shutdown(m)
+            main.post { if (!exiting) start(null) }
+        }
+    }
+
+    /**
+     * 不再用当前的内核：不听网络回调、不再轮询，结束所有会话，返回原来的句柄。先清掉句柄：
+     * 会话结束时 Activity 看到内核还在，会以为是最后一个标签页关掉了。
+     */
+    private fun detach(): Long {
+        val m = machine
+        if (watchingNetwork) {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
+            watchingNetwork = false
+        }
+        machine = 0
+        main.removeCallbacks(poll)
+        for (s in sessions) s.finishIfRunning()
+        sessions.clear()
+        sessionsChanged()
+        return m
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_EXIT_ALL) exitAll()
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         main.removeCallbacks(trimWhenHidden)
-        main.removeCallbacks(pollListens)
+        main.removeCallbacks(poll)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
         val m = machine
         machine = 0
-        // 结束所有 guest 进程要等它们的线程退出，不在主线程上做
-        if (m != 0L) worker.execute { Native.stop(m) }
+        // 没经过 exitAll 就被停止了：照样关机，尽力而为。要等 guest 线程退出，不在主线程上做
+        if (m != 0L) worker.execute { Native.shutdown(m) }
         worker.shutdown()
         super.onDestroy()
     }
@@ -400,10 +465,15 @@ class TerminalService : Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         val n = sessions.size
+        val text = when {
+            exiting -> getString(R.string.stopping)
+            n == 0 && machine != 0L -> getString(R.string.background_running)
+            else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
+        }
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText(resources.getQuantityString(R.plurals.sessions_running, n, n))
+            .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null, getString(R.string.exit_all), exit).build())
@@ -430,7 +500,7 @@ class TerminalService : Service() {
         private const val NOTIFICATION_ID = 1
         /** 监听的通知按端口编号，与 [NOTIFICATION_ID] 错开。 */
         private const val LISTEN_NOTIFICATION_BASE = 1000
-        private const val LISTEN_POLL_MS = 2_000L
+        private const val POLL_MS = 2_000L
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val TRANSCRIPT_ROWS = 2000
         private const val TRIM_DELAY_MS = 60_000L
