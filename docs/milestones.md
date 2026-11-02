@@ -196,12 +196,13 @@
 | [M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl](rounds/185-protected-links-random.md) | 2026-11-02 | 支持 OpenRC 的第二轮：补上 00-alpine.conf 写的 `kernel.panic`、`fs.protected_symlinks`/`protected_hardlinks`（默认打开，按 Linux 6.1 的 `may_follow_link`、`may_linkat` 实现：/tmp 里别人的链接 root 也不跟随，不是属主不能硬链接别人的私有文件、setuid 文件等）、`kernel.unprivileged_bpf_disabled`（默认 2，改成 1 之后锁住）；`/dev/urandom` 的 `RNDADDENTROPY` 等按 Linux 的 `random_ioctl`（原来 ENOTTY，seedrng 失败） |
 | [M9 之前：内置的 init 按 inittab 开机、关机](rounds/186-inittab.md) | 2026-11-02 | 支持 OpenRC 的第三轮：宿主要求时（App、`appine-run --init`）内置的 init 执行 `/etc/inittab` 的子集（sysinit、boot/bootwait、默认运行级别的 wait、once；关机时 busybox 的 shutdown 和 sysvinit 的运行级别 0/6），输出写到 `/var/log/boot.log`，没装的程序、respawn 跳过；关机再 SIGTERM、等 1 秒、SIGKILL；开机之后 busybox 的 reboot/halt/poweroff 发给 1 号进程的信号是关机请求（`Machine::take_power`），原来什么也不做 |
 | [M9 之前：App 按 inittab 开机、关机，没有标签页时留在后台](rounds/187-app-init.md) | 2026-11-02 | 支持 OpenRC 的最后一轮：内核启动之后在单独的线程上按 inittab 开机（Alpine 上是 OpenRC），启动前没有 `/etc/network/interfaces` 时写一个只有 lo 的（不然要网络的服务起不来）、装了 OpenRC 时用 osclock 代替必然失败的 hwclock 提供 clock；全部退出、guest 的 poweroff/halt 先关机再停止服务，reboot 重启内核；关掉最后一个标签页只关界面，还有 guest 进程就留在后台（通知"在后台运行"），没有了才退出，与设计文档 §11.2 一致 |
+| [M9 之前：8 核上的扩展性和 BKL 的交接](rounds/188-bkl-spinners.md) | 2026-11-02 | 8 核的虚拟机上补量并行负载：`xargs -P8` 编译只比 `-P1` 的倍数多约 5%，`git grep`、并行 lstat 也和原生一样扩展，按 mm 加锁不做；只有同时起进程不扩展（8 个同时 exec 4.4×，总吞吐只用到一个核）。剖析出锁已经饱和：持锁时间翻倍，只让一个线程自旋时锁有三成时间空着等被叫醒的线程；自己写的 futex 锁、放锁时不叫醒都不如 std 的 Mutex，改成同时最多让宿主 CPU 数一半（1 到 4 个）的线程自旋，8 个同时 exec 快 7%、跑管道快 13%，这时多用 18% 的 CPU，别的负载不变 |
 
 ## 测量条件
 
 各篇的测量没有另外注明时，条件如下：
 
-- **宿主**：Apple Silicon 上 colima 起的 arm64 Linux 虚拟机（4 核）。appine 是 release 构建，用 Tier 1。
+- **宿主**：Apple Silicon 上 colima 起的 arm64 Linux 虚拟机（4 核；[测试提速](rounds/178-test-speed.md)起 8 核）。appine 是 release 构建，用 Tier 1。
 - **原生对照**：同一台虚拟机上的 Alpine 3.24 容器。M8 起是差分测试的仓库导出的 docker 镜像，两边的文件完全相同。[性能剖析](rounds/13-profiling.md)那一轮发现，对照的文件和状态必须完全相同：对照镜像起初没有打包 `/var`，原生一侧的 apk 没有仓库索引要读。
 - **热缓存**：从[性能剖析](rounds/13-profiling.md)起，每个负载在同一个 appine 会话里连跑两次，取第二次（原生一侧同样）。手机上 App 是长期运行的进程，第二次更接近实际。
 - **仓库位置**：从[多线程共用翻译和定向唤醒](rounds/24-shared-translation.md)起，基准仓库放在虚拟机本地的 docker 卷 `appine-bench` 上。之前在 `target/` 里，经由 virtiofs 共享进虚拟机，宿主的每次 open、stat 都跨虚拟机，文件系统、起进程类负载的倍数偏高。从[文件操作的宿主开销](rounds/33-file-ops-host-cost.md)起，原生一侧的文件操作也在同一个卷上（之前在容器自己的 overlay 上）。
@@ -254,3 +255,4 @@ LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几�
 | [点积指令 ASIMDDP](rounds/133-asimddp.md) | `vpxenc` VP9 编码（单线程，360p 60 帧） | 2.2×（不宣告点积时 2.3×） |
 | [SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md) | Python `hashlib.sha512`（32 MiB） | 1.0×（不宣告 SHA512 时 4.1×） |
 | [FP16 和 JSCVT](rounds/141-fp16-jscvt.md) | llama.cpp `llama-bench`（4 线程）：Qwen2.5-0.5B F16 的提示 128、生成 32；Q4_0 的同样两项 | 1.64×、1.22×（不宣告 FP16 时 2.98×、1.74×）；1.38×、1.21× |
+| [8 核上的扩展性和 BKL 的交接](rounds/188-bkl-spinners.md)（虚拟机从[测试提速](rounds/178-test-speed.md)起是 8 核） | Lua 编译 `xargs -P1`、`-P4`、`-P8`；`git grep` 1、4、8 个线程；4、8 个进程同时 fork 后 exec；4、8 个同时跑管道 | 3.3×、3.0–3.3×、3.5×；2.3×、2.0×、1.7×；2.2–2.3×、4.1–4.3×（原来 2.5×、4.4×）；2.5–2.6×、4.0–4.3×（原来 3.0×、4.8×） |

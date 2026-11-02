@@ -647,14 +647,24 @@ impl Kernel {
 /// 的这段时间锁空着。10 到 60 微秒都差不多，更长时自旋的线程反而占了持锁线程的核。
 const BKL_SPIN: std::time::Duration = std::time::Duration::from_micros(30);
 
+/// 同时最多几个等 BKL 的线程自旋（[`Shared::lock`]），其余的直接睡下：宿主 CPU 数的一半，
+/// 1 到 4 个。原来只让一个自旋，8 个核上 8 个进程同时起进程时锁几乎一直有人等，自旋的
+/// 那个一拿到锁，下一次交接就只能叫醒睡着的，叫醒的这段时间锁空着（占了三成的时间）。
+/// 让 4 个自旋，同时 exec 快 7–10%、跑管道快 13%，这时多用 18% 的 CPU；go build、Maven
+/// 不变。再多没有更快，自旋的线程反而要占持锁线程的核。
+fn max_spinners() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
+}
+
 /// 所有 guest 线程共享的内核对象。
 pub(crate) struct Shared {
     kernel: Mutex<Kernel>,
     /// 有线程持有 BKL（只是提示）：等锁的线程自旋时只读它，看起来空了才去抢，不让锁所在
     /// 的缓存行在几个核之间来回。
     held: AtomicBool,
-    /// 有线程在自旋等 BKL：只让一个线程自旋，别的直接睡下，不白占几个核。
-    spinning: AtomicBool,
+    /// 在自旋等 BKL 的线程数：最多 [`max_spinners`] 个，别的直接睡下，不白占几个核。
+    spinning: AtomicU32,
     /// 叫醒定时器线程。
     pub timers: Arc<Event>,
     /// 定时器线程的定期检查（内存上限 [`crate::oom`]、平均负载 [`crate::loadavg`]）停下来了：
@@ -673,7 +683,7 @@ impl Shared {
         Shared {
             kernel: Mutex::new(kernel),
             held: AtomicBool::new(false),
-            spinning: AtomicBool::new(false),
+            spinning: AtomicU32::new(0),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
             checks_idle: AtomicBool::new(false),
             fast: AtomicU64::new(0),
@@ -712,15 +722,17 @@ impl Shared {
     /// 持锁的时间通常只有几微秒（一次 lstat），长的（execve、fork、进程退出）十几到几十
     /// 微秒，先自旋最多 [`BKL_SPIN`]：睡下再被叫醒要几十微秒，释放的一方还要多一次 futex
     /// 唤醒，锁在这期间空着。`git status` 的并行 lstat 原来比单线程还慢。自旋只读
-    /// [`Shared::held`]，看起来空了才去抢。
+    /// [`Shared::held`]，看起来空了才去抢；已经有 [`max_spinners`] 个在自旋时直接睡下。
     pub fn lock(&self) -> Bkl<'_> {
         if let Ok(k) = self.kernel.try_lock() {
             return Bkl::new(k, &self.held);
         }
-        if !self.spinning.swap(true, Ordering::Acquire)
-            && let Some(k) = self.spin()
-        {
-            return k;
+        if self.spinning.fetch_add(1, Ordering::Acquire) < max_spinners() {
+            if let Some(k) = self.spin() {
+                return k;
+            }
+        } else {
+            self.spinning.fetch_sub(1, Ordering::Release);
         }
         Bkl::new(
             self.kernel.lock().unwrap_or_else(PoisonError::into_inner),
@@ -728,7 +740,7 @@ impl Shared {
         )
     }
 
-    /// 自旋等 BKL，最多 [`BKL_SPIN`]；调用方已经置上 [`Shared::spinning`]，这里清掉。
+    /// 自旋等 BKL，最多 [`BKL_SPIN`]；调用方已经把 [`Shared::spinning`] 加了一，这里减掉。
     fn spin(&self) -> Option<Bkl<'_>> {
         let mut deadline = None;
         for i in 0u32.. {
@@ -739,7 +751,7 @@ impl Shared {
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 };
                 if let Some(k) = k {
-                    self.spinning.store(false, Ordering::Release);
+                    self.spinning.fetch_sub(1, Ordering::Release);
                     return Some(Bkl::new(k, &self.held));
                 }
             }
@@ -752,7 +764,7 @@ impl Shared {
                 }
             }
         }
-        self.spinning.store(false, Ordering::Release);
+        self.spinning.fetch_sub(1, Ordering::Release);
         None
     }
 }
