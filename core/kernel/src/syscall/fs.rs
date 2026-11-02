@@ -130,8 +130,57 @@ const TTY_IOCTLS: [(u32, usize, bool); 14] = [
 ];
 const FIONREAD: u32 = 0x541b;
 const RNDGETENTCNT: u32 = 0x8004_5200;
+const RNDADDTOENTCNT: u32 = 0x4004_5201;
+const RNDADDENTROPY: u32 = 0x4008_5203;
+const RNDZAPENTCNT: u32 = 0x5204;
+const RNDCLEARPOOL: u32 = 0x5206;
+const RNDRESEEDCRNG: u32 = 0x5207;
 /// 熵池里的比特数（`/proc/sys/kernel/random/entropy_avail`）。
 pub(crate) const ENTROPY: i32 = 256;
+
+/// `/dev/random`、`/dev/urandom` 的 ioctl（Linux 6.1 的 `random_ioctl`）。随机数取自宿主，
+/// 与 Linux 5.18 起一样熵池总是满的：加进来的数据和熵只检查参数、读一遍，不起作用（seedrng
+/// 开机时用 `RNDADDENTROPY` 把上次存的种子加回去）。改熵池的要开机时的命名空间里的
+/// `CAP_SYS_ADMIN`；不认识的请求是 EINVAL（tty 的请求也是，与 Linux 一样不是 ENOTTY）。
+fn random_ioctl(cx: &mut Cx<'_>, request: u32, arg: u64) -> SysResult {
+    let admin = || {
+        if cx.cred().capable(cap::SYS_ADMIN) {
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    };
+    match request {
+        RNDGETENTCNT => put(cx, arg, ENTROPY.to_le_bytes()).map(|()| 0),
+        RNDADDTOENTCNT => {
+            admin()?;
+            if i32::from_le_bytes(get(cx, arg)?) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
+        // struct rand_pool_info：熵的比特数、数据的字节数，后面是数据；数据要都读得到
+        RNDADDENTROPY => {
+            admin()?;
+            if i32::from_le_bytes(get(cx, arg)?) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            let len = i32::from_le_bytes(get(cx, arg + 4)?);
+            let len = usize::try_from(len).map_err(|_| Errno::EFAULT)?;
+            let mut buf = [0u8; 4096];
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(buf.len());
+                cx.mm()
+                    .read(UserSlice::new(arg + 8 + done as u64, n), &mut buf[..n])?;
+                done += n;
+            }
+            Ok(0)
+        }
+        RNDZAPENTCNT | RNDCLEARPOOL | RNDRESEEDCRNG => admin().map(|()| 0),
+        _ => Err(Errno::EINVAL),
+    }
+}
 const FIONBIO: u32 = 0x5421;
 const FIOASYNC: u32 = 0x5452;
 const FIOSETOWN: u32 = 0x8901;
@@ -2064,13 +2113,10 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             let n = i.borrow().pending() as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
         }
-        // 与 Linux 5.18 起相同，熵池总是满的
         FileKind::Device {
             dev: Device::Random,
             ..
-        } if request == RNDGETENTCNT => {
-            return put(cx, arg, ENTROPY.to_le_bytes()).map(|()| 0);
-        }
+        } => return random_ioctl(cx, request, arg),
         _ => return Err(Errno::ENOTTY),
     };
     let Some(&(_, size, out)) = TTY_IOCTLS.iter().find(|(r, ..)| *r == request) else {
@@ -2871,6 +2917,19 @@ pub(super) fn linkat(
     let dir_st = may_create_name(&vfs, &cred, (mnt, dir), name)?;
     if src_mnt != mnt {
         return Err(Errno::EXDEV);
+    }
+    // fs.protected_hardlinks（Linux 的 may_linkat，在 EXDEV 之后、目录的权限之前）：不是属主、
+    // 也没有 CAP_FOWNER 时，只能链接能读写的普通文件，不能是 setuid 的、可执行的 setgid 的
+    if cx.kr().protected_hardlinks {
+        let st = vfs.store().stat(src)?;
+        let setgid_exec = mode::S_ISGID | 0o010;
+        let safe = st.mode & mode::S_IFMT == mode::S_IFREG
+            && st.mode & mode::S_ISUID == 0
+            && st.mode & setgid_exec != setgid_exec
+            && cred.permission(&st, MAY_READ | MAY_WRITE).is_ok();
+        if !safe && !cred.owns(&st) {
+            return Err(Errno::EPERM);
+        }
     }
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
     // tmpfs 里每个硬链接也占一个 inode（Linux 的 shmem_link）

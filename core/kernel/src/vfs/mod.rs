@@ -312,6 +312,10 @@ pub(crate) trait Pseudo {
     fn magic(&self, _node: &PseudoNode) -> bool {
         false
     }
+    /// `fs.protected_symlinks` 打开着没有（[`Vfs::may_follow_link`]）。
+    fn protected_symlinks(&self) -> bool {
+        false
+    }
 }
 
 /// openat2 的 `struct open_how` 的 `resolve`（Linux 的 `RESOLVE_*`，对应路径解析的
@@ -527,6 +531,15 @@ impl Cached {
                 links += 1;
                 if links > MAX_SYMLINKS {
                     return Some(Err(Errno::ELOOP));
+                }
+                // fs.protected_symlinks 要看凭据（[`Vfs::may_follow_link`]）：粘滞位、所有人
+                // 可写的目录里属主与目录不同的链接交给正常的解析
+                let sticky_shared = mode::S_ISVTX | 0o002;
+                if last
+                    && r.stat(dir)?.mode & sticky_shared == sticky_shared
+                    && r.stat(dir)?.uid != r.stat(node)?.uid
+                {
+                    return None;
                 }
                 let target = r.readlink(node)?;
                 if target.first() == Some(&b'/') {
@@ -896,6 +909,22 @@ impl Vfs {
     }
 
     /// 凭据为 `cred` 的进程能不能在目录 `dir` 里查找。合成文件系统的目录总是可以。
+    /// `fs.protected_symlinks` 打开时能不能跟随目录 `dir` 里的符号链接 `link`（Linux 的
+    /// `may_follow_link`）：粘滞位、所有人可写的目录（/tmp）里别人的链接，只有链接的属主
+    /// 与目录的属主相同时才跟随，root 也一样，否则 EACCES。
+    fn may_follow_link(&self, cred: &Cred, dir: Ino, link: Ino) -> Result<(), Errno> {
+        let link = self.store.stat(link)?;
+        if link.uid == cred.fsuid {
+            return Ok(());
+        }
+        let dir = self.store.stat(dir)?;
+        let sticky_shared = mode::S_ISVTX | 0o002;
+        if dir.mode & sticky_shared != sticky_shared || dir.uid == link.uid {
+            return Ok(());
+        }
+        Err(Errno::EACCES)
+    }
+
     fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
         match dir {
             Node::Store(_, ino) if !cred.searches_all() => {
@@ -1057,6 +1086,14 @@ impl Vfs {
                 links += 1;
                 if links > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
+                }
+                // fs.protected_symlinks 只管最后一个组件（pick_link 的 WALK_TRAILING），在
+                // nosymfollow 之前
+                if last
+                    && ps.protected_symlinks()
+                    && let (Node::Store(_, link), Node::Store(_, parent)) = (&node, &dir)
+                {
+                    self.may_follow_link(cred, *parent, *link)?;
                 }
                 // nosymfollow 的挂载里的符号链接（包括魔法链接）、RESOLVE_NO_SYMLINKS 时的
                 // 任何符号链接都不跟随（Linux 的 pick_link）

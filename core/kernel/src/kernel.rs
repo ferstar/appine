@@ -228,6 +228,16 @@ pub(crate) struct Kernel {
     pub printk: [i32; 4],
     pub saved_console_loglevel: Option<i32>,
     pub dmesg_restrict: bool,
+    /// `/proc/sys/kernel/panic`：只记下，appine 的内核层没有 panic（内核 bug 只结束撞上它的
+    /// 进程）。
+    pub panic: i32,
+    /// `/proc/sys/fs/protected_symlinks`、`protected_hardlinks`（Linux 的 `may_follow_link`、
+    /// `may_linkat`），默认与 systemd、Android 设的一样打开。
+    pub protected_symlinks: bool,
+    pub protected_hardlinks: bool,
+    /// `/proc/sys/kernel/unprivileged_bpf_disabled`：0 时没有能力的进程也能用 bpf(2) 的一部分
+    /// 命令，1 时改不回去，2（默认，`BPF_UNPRIV_DEFAULT_OFF`）时 root 可以改成 0。
+    pub unprivileged_bpf_disabled: u8,
     /// 内核日志的记录（[`crate::klog`]）：`/dev/kmsg` 的打开文件也拿着它。
     pub klog: Rc<RefCell<crate::klog::Klog>>,
     /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
@@ -339,6 +349,10 @@ impl Kernel {
             printk: [7, 4, 1, 7],
             saved_console_loglevel: None,
             dmesg_restrict: false,
+            panic: 0,
+            protected_symlinks: true,
+            protected_hardlinks: true,
+            unprivileged_bpf_disabled: 2,
             klog: Default::default(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,

@@ -273,7 +273,7 @@ const PROC_NET: [&[u8]; 18] = [
 /// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
 /// `sys/net` 下的按读者所在的网络命名空间（与 Linux 一样），`ipv4/conf`、`ipv6/conf` 下的
 /// 目录是 [`PseudoNode::NetConf`]。
-const STATIC: [&[u8]; 86] = [
+const STATIC: [&[u8]; 90] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -296,6 +296,8 @@ const STATIC: [&[u8]; 86] = [
     b"sys/fs/pipe-max-size",
     b"sys/fs/pipe-user-pages-hard",
     b"sys/fs/pipe-user-pages-soft",
+    b"sys/fs/protected_hardlinks",
+    b"sys/fs/protected_symlinks",
     b"sys/kernel/",
     b"sys/kernel/cap_last_cap",
     b"sys/kernel/core_pattern",
@@ -312,6 +314,7 @@ const STATIC: [&[u8]; 86] = [
     b"sys/kernel/ostype",
     b"sys/kernel/overflowgid",
     b"sys/kernel/overflowuid",
+    b"sys/kernel/panic",
     b"sys/kernel/pid_max",
     b"sys/kernel/printk",
     b"sys/kernel/printk_devkmsg",
@@ -330,6 +333,7 @@ const STATIC: [&[u8]; 86] = [
     b"sys/kernel/shmmni",
     b"sys/kernel/tainted",
     b"sys/kernel/threads-max",
+    b"sys/kernel/unprivileged_bpf_disabled",
     b"sys/kernel/version",
     b"sys/net/",
     b"sys/net/core/",
@@ -1318,6 +1322,10 @@ impl Pseudo for View<'_> {
         )
     }
 
+    fn protected_symlinks(&self) -> bool {
+        self.k.protected_symlinks
+    }
+
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
         match node {
             PseudoNode::Ns(pid, tid, k) => {
@@ -1603,6 +1611,10 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/kernel/seccomp/actions_logged"
                     | b"sys/kernel/core_uses_pid"
                     | b"sys/kernel/dmesg_restrict"
+                    | b"sys/kernel/panic"
+                    | b"sys/kernel/unprivileged_bpf_disabled"
+                    | b"sys/fs/protected_hardlinks"
+                    | b"sys/fs/protected_symlinks"
                     | b"sys/kernel/printk"
                     | b"sys/kernel/printk_devkmsg"
                     | b"sys/kernel/msgmax"
@@ -1854,6 +1866,36 @@ pub(crate) fn write(
             .filter(|v| (0..=1).contains(v))
             .ok_or(Errno::EINVAL)?
             == 1;
+    }
+    // 一个 int 的 proc_dointvec_minmax（kernel.panic 是不限范围的 proc_dointvec）
+    let int_in = |range: std::ops::RangeInclusive<i64>| {
+        crate::netconf::parse_int(data)
+            .ok()
+            .filter(|v| range.contains(v))
+            .ok_or(Errno::EINVAL)
+    };
+    match node {
+        PseudoNode::Static(b"sys/kernel/panic") => {
+            k.panic = int_in(i32::MIN as i64..=i32::MAX as i64)? as i32;
+        }
+        PseudoNode::Static(b"sys/fs/protected_symlinks") => {
+            k.protected_symlinks = int_in(0..=1)? == 1
+        }
+        PseudoNode::Static(b"sys/fs/protected_hardlinks") => {
+            k.protected_hardlinks = int_in(0..=1)? == 1;
+        }
+        // bpf_unpriv_handler：要 CAP_SYS_ADMIN，0 到 2，改成 1 之后改不回去（EPERM）
+        PseudoNode::Static(b"sys/kernel/unprivileged_bpf_disabled") => {
+            if !cred.capable(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            let v = int_in(0..=2)? as u8;
+            if k.unprivileged_bpf_disabled == 1 && v != 1 {
+                return Err(Errno::EPERM);
+            }
+            k.unprivileged_bpf_disabled = v;
+        }
+        _ => {}
     }
     // devkmsg_sysctl_set_loglvl：proc_dostring 取到换行或第 9 个字节为止，必须恰好是 on、off、
     // ratelimit 之一再加一个字节（echo 的换行），否则 EINVAL、保持原样
@@ -3249,6 +3291,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             | b"sys/fs/overflowgid" => "65534\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
             b"sys/kernel/dmesg_restrict" => format!("{}\n", ps.k.dmesg_restrict as u8),
+            b"sys/kernel/panic" => format!("{}\n", ps.k.panic),
+            b"sys/kernel/unprivileged_bpf_disabled" => {
+                format!("{}\n", ps.k.unprivileged_bpf_disabled)
+            }
+            b"sys/fs/protected_hardlinks" => format!("{}\n", ps.k.protected_hardlinks as u8),
+            b"sys/fs/protected_symlinks" => format!("{}\n", ps.k.protected_symlinks as u8),
             b"sys/kernel/printk" => {
                 let [a, b, c, d] = ps.k.printk;
                 format!("{a}\t{b}\t{c}\t{d}\n")

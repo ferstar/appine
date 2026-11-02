@@ -1696,3 +1696,32 @@ fn one_machine_runs_several_terminal_sessions() {
         );
     }
 }
+
+/// Alpine 的 sysctl 服务开机时写的几项（`/usr/lib/sysctl.d/00-alpine.conf`）和写入的规则：
+/// 容器里 `/proc/sys` 是只读的，差分测试比不了写入（第 185 轮）。
+#[test]
+fn sysctls_written_at_alpine_boot() {
+    let script = "
+        sysctl -w kernel.panic=120 fs.protected_hardlinks=1 fs.protected_symlinks=0 \
+            kernel.unprivileged_bpf_disabled=1 >/dev/null && echo set
+        cat /proc/sys/kernel/panic /proc/sys/fs/protected_symlinks \
+            /proc/sys/kernel/unprivileged_bpf_disabled
+        echo 0 2>/dev/null > /proc/sys/kernel/unprivileged_bpf_disabled || echo locked
+        echo 2 2>/dev/null > /proc/sys/fs/protected_symlinks || echo range
+        su -s /bin/sh nobody -c 'echo 0 > /proc/sys/kernel/panic' 2>/dev/null || echo nobody
+        link=/tmp/sysctl-link-$$
+        ln -s /etc/hostname $link && chown -h nobody $link
+        cat $link >/dev/null && echo followed
+        echo 1 > /proc/sys/fs/protected_symlinks
+        cat $link 2>&1 >/dev/null | grep -c 'Permission denied'
+        rm $link";
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        assert_ok(tier, &out);
+        assert_eq!(
+            stdout(&out),
+            "set\n120\n0\n1\nlocked\nrange\nnobody\nfollowed\n1\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}

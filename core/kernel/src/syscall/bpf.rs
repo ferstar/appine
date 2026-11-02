@@ -35,6 +35,9 @@ const PROG_FLAGS: u32 = 0x3f;
 const SLEEPABLE: u32 = 0x10;
 /// `BPF_F_QUERY_EFFECTIVE`。
 const QUERY_EFFECTIVE: u32 = 1;
+/// 没有能力的进程也能加载的两种程序（`BPF_PROG_TYPE_SOCKET_FILTER`、`BPF_PROG_TYPE_CGROUP_SKB`）。
+const PROG_TYPE_SOCKET_FILTER: u32 = 1;
+const PROG_TYPE_CGROUP_SKB: u32 = 8;
 /// 日志的级别（`BPF_LOG_MASK`）。
 const LOG_MASK: u32 = 7;
 
@@ -80,8 +83,8 @@ fn bpf_capable(cx: &Cx<'_>) -> bool {
 }
 
 pub(super) fn bpf(cx: &mut Cx<'_>, command: i32, uattr: u64, size: u32) -> SysResult {
-    // kernel.unprivileged_bpf_disabled 默认是 2（BPF_UNPRIV_DEFAULT_OFF）：都要有能力
-    if !bpf_capable(cx) {
+    // kernel.unprivileged_bpf_disabled（默认 2）不是 0 时都要有能力；是 0 时各个命令自己检查
+    if cx.kr().unprivileged_bpf_disabled != 0 && !bpf_capable(cx) {
         return Err(Errno::EPERM);
     }
     let size = tail_zero(cx, uattr, ATTR_SIZE, size as usize)?;
@@ -122,6 +125,11 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     };
     if insn_cnt == 0 || insn_cnt > bpf::MAX_INSNS {
         return Err(Errno::E2BIG);
+    }
+    // 没有能力时只能加载套接字过滤、cgroup skb 程序（这两种 appine 都没有，下面是 EINVAL）
+    if prog_type != PROG_TYPE_SOCKET_FILTER && prog_type != PROG_TYPE_CGROUP_SKB && !bpf_capable(cx)
+    {
+        return Err(Errno::EPERM);
     }
     // 设备程序之外的类型没有；卸载到网卡（prog_ifindex）、睡眠的也不行
     if prog_type != bpf::PROG_TYPE_CGROUP_DEVICE || u32_at(attr, 64) != 0 || flags & SLEEPABLE != 0
@@ -398,6 +406,16 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     set32(&mut info, 52, 0);
     info[64..80].copy_from_slice(&prog.name);
     set32(&mut info, 84, prog.gpl as u32);
+    set32(&mut info, 216, prog.verified);
+    // 没有能力时不给指令和各种记录的个数（bpf_prog_get_info_by_fd 的 goto done）
+    if !bpf_capable(cx) {
+        for off in [16, 20, 104, 108, 144, 148, 168] {
+            set32(&mut info, off, 0);
+        }
+        cx.mm().write(UserSlice::new(uinfo, len), &info[..len])?;
+        super::put(cx, uattr + 4, (len as u32).to_le_bytes())?;
+        return Ok(0);
+    }
     // 指令（没有改写过）、没有 JIT
     let bytes = prog.bytes();
     let (ulen, uinsns) = (u32_at(&info, 20) as usize, u64_at(&info, 32));
