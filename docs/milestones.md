@@ -192,6 +192,7 @@
 | [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块](rounds/181-last-member-leaves.md) | 2026-11-02 | 上一轮发现的偶发 SIGILL：同一个程序共用翻译的组里，别的成员退出、离开之后，它们登记的映射和翻译的块还在；最后一个成员因为在登记过的地址上映射了别的文件而离开时留着原来的翻译，执行到了别人翻译的代码（几个 python3 加载的扩展模块不同，客户端执行了服务端的 select 模块的块）；现在离开时作废与它的映射对不上的块，原来的探测脚本 8 次都不再崩 |
 | [M9 之前：容器连外网也经过外层的 PREROUTING](rounds/182-outer-prerouting.md) | 2026-11-02 | 透明代理的推迟项：容器经由外层的网关连外网时也执行外层的 PREROUTING nat，在外层对从 bridge 来的做 REDIRECT 就能透明代理所有容器（sslocal redir 实测），`udp dport 53 redirect` 能劫持容器的 DNS；docker、podman 的端口发布规则按地址类型限定，不受影响；顺带修了外层绑通配地址的 UDP 服务端回答容器时来源是 127.0.0.1（连接了的 socket 收不到）、外层 DNAT 到同一网段的容器时不过外层的 FORWARD、nft 的 `oif` 不认、DNAT 到外面的地址时绑了回环地址出不去 |
 | [M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面](rounds/183-udp-wide-first.md) | 2026-11-02 | 上一轮的推迟项：没绑定的 UDP socket 第一个数据报发往命名空间里的地址时绑了回环地址，之后再发往外面是 EINVAL；现在与先发往外面时一样在宿主上绑通配地址、按包指定源地址，顺序无关（发给自己的虚拟地址的不变）；实测 musl 的解析器、Node、Go、Java 本来就先绑了通配地址，碰到的是不先 bind 就 sendto 的程序 |
+| [M9 之前：开机时挂好 /dev、/dev/shm、/dev/mqueue 和 /run](rounds/184-boot-tmpfs.md) | 2026-11-02 | 支持 OpenRC 的第一轮：开机时的挂载改成与 systemd、容器运行时的一样，`/dev` 是 tmpfs（标准设备节点建在里面，相当于 devtmpfs），devpts、`/dev/shm` 的 tmpfs、mqueue 挂在里面，`/run` 是 tmpfs（20%、800k 个 inode）；原来 OpenRC 的 `init.sh` 在 `/run` 上再挂一层、devfs 在 `/dev` 上挂空 tmpfs（ptmx、pts、urandom 都没了），现在它们看到已经挂着，只重新挂载 |
 
 ## 测量条件
 

@@ -116,6 +116,14 @@ pub(crate) const SYS_MOUNT: MountId = 4;
 pub(crate) const ANON_MOUNT: MountId = 5;
 /// 开机时挂在 `/sys/fs/cgroup` 上的 cgroup2。
 pub(crate) const CGROUP_MOUNT: MountId = 6;
+/// 开机时挂在 `/dev` 上的 tmpfs（Linux 的 devtmpfs、容器运行时挂的 tmpfs）。
+pub(crate) const DEV_MOUNT: MountId = 7;
+/// 开机时挂在 `/dev/shm` 上的 tmpfs。
+pub(crate) const SHM_MOUNT: MountId = 8;
+/// 开机时挂在 `/dev/mqueue` 上的 mqueue。
+pub(crate) const MQUEUE_MOUNT: MountId = 9;
+/// 开机时挂在 `/run` 上的 tmpfs。
+pub(crate) const RUN_MOUNT: MountId = 10;
 
 /// 文件系统的种类：inode 仓库和几种合成文件系统。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -391,6 +399,18 @@ impl TmpfsParams {
         appine_hal::memory_info().0 / 2 / TMPFS_PAGE
     }
 
+    /// 开机时挂的 tmpfs：根目录的权限是 `perm`、属于 root，大小和 inode 数是默认的。
+    fn boot(perm: u32) -> TmpfsParams {
+        TmpfsParams {
+            perm,
+            uid: 0,
+            gid: 0,
+            blocks: Self::default_limit(),
+            inodes: Self::default_limit(),
+            inode64: true,
+        }
+    }
+
     /// mountinfo 里超级块的选项（`,size=1024k,mode=755,inode64` 这样，Linux 的
     /// `shmem_show_options`）：大小、inode 数不是默认值才写，权限不是 1777、属主属组不是 0
     /// 才写，最后是 `inode64` 或 `inode32`。
@@ -565,10 +585,12 @@ impl<'p> Pending<'p> {
 }
 
 impl Vfs {
-    /// 打开 `dir` 里的 inode 仓库作为根文件系统，补齐标准的设备节点，挂上 procfs、devpts、
-    /// sysfs 和 cgroup2。
-    /// 开机（没有别的进程在用这个仓库）时清空 Linux 上是 tmpfs 的 /dev/shm 和 /run：
-    /// 共享内存、命名信号量和 pid 文件不能留到下次。
+    /// 打开 `dir` 里的 inode 仓库作为根文件系统，补齐标准的设备节点，挂上开机时的文件系统
+    /// （与 systemd、容器运行时挂的一样）：procfs；`/dev` 上的 tmpfs（标准设备节点建在里面，
+    /// [`dev::populate`]）和其中的 devpts、`/dev/shm` 的 tmpfs、mqueue；sysfs 和 cgroup2；
+    /// `/run` 的 tmpfs。
+    /// 开机（没有别的进程在用这个仓库）时还清空仓库里的 /dev/shm 和 /run：以前没有在上面挂
+    /// tmpfs，留下的共享内存、pid 文件不能留着。
     pub fn open(dir: &Path) -> Result<Vfs, Errno> {
         let store = Store::open(dir, &[b"dev/shm", b"run"])?;
         if let Err(e) = dev::ensure_dev_nodes(&store) {
@@ -579,82 +601,119 @@ impl Vfs {
         }
         // 与 Linux 发行版的默认挂载选项相同
         let flags = ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME;
-        let boot = [
-            (PROC_MOUNT, Fs::Proc, &b"proc"[..], flags, &b"proc"[..]),
-            (
-                PTS_MOUNT,
-                Fs::Pts,
-                b"dev/pts",
-                flags & !ms::NODEV,
-                b"devpts",
-            ),
-            (SYS_MOUNT, Fs::Sys, b"sys", flags, b"sysfs"),
-        ];
-        let mut list = vec![Mount {
-            id: ROOT_MOUNT,
-            ns: INIT_MNT_NS,
-            fs: Fs::Store,
-            root: Node::ROOT,
-            point: None,
-            at: None,
-            root_at: None,
-            flags: ROOT_FLAGS,
-            dev: ROOT_DEV,
-            source: b"appine".to_vec(),
-            expiring: false,
-            pin: None,
-        }];
-        for (id, fs, path, flags, source) in boot {
-            let mut ino = Some(ROOT);
-            for name in path.split(|&b| b == b'/') {
-                ino = ino.and_then(|i| store.lookup(i, name).ok().flatten());
-            }
-            match ino {
-                Some(ino) if store.stat(ino)?.is_dir() => list.push(Mount {
-                    id,
-                    ns: INIT_MNT_NS,
-                    fs,
-                    root: fs.root().in_mount(id),
-                    point: Some(Node::Store(ROOT_MOUNT, ino)),
-                    at: None,
-                    root_at: None,
-                    flags,
-                    dev: fs.dev(),
-                    source: source.to_vec(),
-                    expiring: false,
-                    pin: None,
-                }),
-                _ => crate::debug::log(format_args!("no mount point for {fs:?}")),
-            }
-        }
-        // cgroup2 挂在 sysfs 的 fs/cgroup 上（§8.2），与 Linux 的主机上一样可以写：dockerd、
-        // runc 在里面建容器的 cgroup
-        if list.iter().any(|m| m.id == SYS_MOUNT) {
-            list.push(Mount {
-                id: CGROUP_MOUNT,
+        let mut mounts = Mounts {
+            list: vec![Mount {
+                id: ROOT_MOUNT,
                 ns: INIT_MNT_NS,
-                fs: Fs::Cgroup,
-                root: Fs::Cgroup.root().in_mount(CGROUP_MOUNT),
-                point: Some(Node::Pseudo(SYS_MOUNT, crate::pseudo::CGROUP_POINT)),
+                fs: Fs::Store,
+                root: Node::ROOT,
+                point: None,
                 at: None,
                 root_at: None,
-                flags,
-                dev: Fs::Cgroup.dev(),
-                source: b"cgroup".to_vec(),
+                flags: ROOT_FLAGS,
+                dev: ROOT_DEV,
+                source: b"appine".to_vec(),
                 expiring: false,
                 pin: None,
-            });
-        }
-        let mounts = Mounts {
-            list,
+            }],
             detached: Vec::new(),
-            next: CGROUP_MOUNT + 1,
+            next: RUN_MOUNT + 1,
             next_dev: 0x30,
             tmpfs: Default::default(),
             proc_ns: Default::default(),
             mq_dev: Default::default(),
             devpts: Default::default(),
         };
+        // 挂载 `mnt` 里的目录 `dir` 下面名叫 `name` 的目录
+        let subdir = |dir: Option<&Node>, name: &[u8]| -> Option<Node> {
+            let &Node::Store(mnt, dir) = dir? else {
+                return None;
+            };
+            let ino = store.lookup(dir, name).ok().flatten()?;
+            store
+                .stat(ino)
+                .is_ok_and(|st| st.is_dir())
+                .then_some(Node::Store(mnt, ino))
+        };
+        let root = Some(Node::ROOT);
+        let pseudo = |id: MountId, fs: Fs| (fs, fs.root().in_mount(id), fs.dev());
+        mounts.boot(
+            PROC_MOUNT,
+            pseudo(PROC_MOUNT, Fs::Proc),
+            subdir(root.as_ref(), b"proc"),
+            flags,
+            b"proc",
+        );
+        // /dev：tmpfs 建不了时退回仓库里的目录
+        let dev = subdir(root.as_ref(), b"dev").map(|point| {
+            let r = mounts.boot_tmpfs(
+                &store,
+                DEV_MOUNT,
+                point.clone(),
+                ms::NOSUID | ms::RELATIME,
+                b"tmpfs",
+                TmpfsParams::boot(0o755),
+            );
+            match r.and_then(|ino| dev::populate(&store, ino).map(|()| ino)) {
+                Ok(ino) => Node::Store(DEV_MOUNT, ino),
+                Err(e) => {
+                    crate::debug::log(format_args!("cannot mount /dev: {e}"));
+                    mounts.list.retain(|m| m.id != DEV_MOUNT);
+                    point
+                }
+            }
+        });
+        mounts.boot(
+            PTS_MOUNT,
+            pseudo(PTS_MOUNT, Fs::Pts),
+            subdir(dev.as_ref(), b"pts"),
+            flags & !ms::NODEV,
+            b"devpts",
+        );
+        if let Some(point) = subdir(dev.as_ref(), b"shm") {
+            let params = TmpfsParams::boot(0o1777);
+            let flags = ms::NOSUID | ms::NODEV | ms::RELATIME;
+            if let Err(e) = mounts.boot_tmpfs(&store, SHM_MOUNT, point, flags, b"shm", params) {
+                crate::debug::log(format_args!("cannot mount /dev/shm: {e}"));
+            }
+        }
+        mounts.boot(
+            MQUEUE_MOUNT,
+            pseudo(MQUEUE_MOUNT, Fs::Mqueue),
+            subdir(dev.as_ref(), b"mqueue"),
+            flags,
+            b"mqueue",
+        );
+        mounts.boot(
+            SYS_MOUNT,
+            pseudo(SYS_MOUNT, Fs::Sys),
+            subdir(root.as_ref(), b"sys"),
+            flags,
+            b"sysfs",
+        );
+        // cgroup2 挂在 sysfs 的 fs/cgroup 上（§8.2），与 Linux 的主机上一样可以写：dockerd、
+        // runc 在里面建容器的 cgroup
+        if mounts.list.iter().any(|m| m.id == SYS_MOUNT) {
+            mounts.boot(
+                CGROUP_MOUNT,
+                pseudo(CGROUP_MOUNT, Fs::Cgroup),
+                Some(Node::Pseudo(SYS_MOUNT, crate::pseudo::CGROUP_POINT)),
+                flags,
+                b"cgroup",
+            );
+        }
+        // /run：与 systemd、OpenRC 挂的一样，物理内存的 20%、800k 个 inode
+        if let Some(point) = subdir(root.as_ref(), b"run") {
+            let params = TmpfsParams {
+                blocks: appine_hal::memory_info().0 / 5 / TMPFS_PAGE,
+                inodes: 800 << 10,
+                ..TmpfsParams::boot(0o755)
+            };
+            let flags = ms::NOSUID | ms::NODEV | ms::RELATIME;
+            if let Err(e) = mounts.boot_tmpfs(&store, RUN_MOUNT, point, flags, b"tmpfs", params) {
+                crate::debug::log(format_args!("cannot mount /run: {e}"));
+            }
+        }
         let cached = Cached {
             meta: store.meta().clone(),
             mounts: mounts.store_points(),
@@ -1954,6 +2013,57 @@ impl Mount {
 }
 
 impl Mounts {
+    /// 开机时的挂载：文件系统 `fs` 的根 `root`（设备号 `dev`）挂在 `point` 上；没有挂载点
+    /// 时不挂。
+    fn boot(
+        &mut self,
+        id: MountId,
+        (fs, root, dev): (Fs, Node, u64),
+        point: Option<Node>,
+        flags: u64,
+        source: &[u8],
+    ) {
+        let Some(point) = point else {
+            crate::debug::log(format_args!("no mount point for {fs:?}"));
+            return;
+        };
+        self.list.push(Mount {
+            id,
+            ns: INIT_MNT_NS,
+            fs,
+            root,
+            point: Some(point),
+            at: None,
+            root_at: None,
+            flags,
+            dev,
+            source: source.to_vec(),
+            expiring: false,
+            pin: None,
+        });
+    }
+
+    /// 开机时挂的 tmpfs（与 [`Vfs::new_tmpfs`] 相同，只是挂载编号是固定的），返回它的根目录。
+    fn boot_tmpfs(
+        &mut self,
+        store: &Store,
+        id: MountId,
+        point: Node,
+        flags: u64,
+        source: &[u8],
+        params: TmpfsParams,
+    ) -> Result<Ino, Errno> {
+        let root = store.create_detached_dir(params.perm, params.uid, params.gid)?;
+        let dev = self.next_dev;
+        self.next_dev += 1;
+        let fs = (Fs::Tmpfs, Node::Store(id, root), dev);
+        self.boot(id, fs, Some(point), flags, source);
+        // 用量到要用时再数（[`dev::populate`] 在里面建了节点）
+        let used = None;
+        self.tmpfs.insert(dev, Tmpfs { root, params, used });
+        Ok(root)
+    }
+
     /// 仓库里的挂载点，不持 BKL 的解析遇到就交回正常的解析。开机时的根文件系统不是挂载树
     /// 的根时（pivot_root 之后），它的根目录也算：`..` 要经由它的挂载点出去。
     fn store_points(&self) -> Arc<[Ino]> {
@@ -2303,13 +2413,29 @@ mod tests {
         assert_eq!(proc, Node::Pseudo(PROC_MOUNT, PseudoNode::ProcRoot));
         assert_eq!(r(&proc, b"..", true).unwrap(), root);
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &proc).unwrap(), b"/proc");
-        // 设备节点和 /dev/pts 由 Vfs::open 补齐
+        // 设备节点在开机时挂在 /dev 上的 tmpfs 里，/dev/pts 挂在它里面
+        assert!(matches!(
+            r(&root, b"/dev/null", true).unwrap(),
+            Node::Store(DEV_MOUNT, _)
+        ));
+        let dev = r(&root, b"/dev", true).unwrap();
+        assert!(matches!(dev, Node::Store(DEV_MOUNT, _)));
+        assert_eq!(vfs.path_of(ps, &Node::ROOT, &dev).unwrap(), b"/dev");
+        assert_eq!(r(&dev, b"..", true).unwrap(), root);
         let pts = r(&root, b"/dev/pts", true).unwrap();
         assert_eq!(
             pts,
             Node::Pseudo(PTS_MOUNT, PseudoNode::PtsRoot(crate::tty::BOOT_PTS))
         );
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &pts).unwrap(), b"/dev/pts");
+        assert!(matches!(
+            r(&root, b"/run", true).unwrap(),
+            Node::Store(RUN_MOUNT, _)
+        ));
+        assert!(matches!(
+            r(&root, b"/dev/shm/..", true).unwrap(),
+            Node::Store(DEV_MOUNT, _)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2476,7 +2602,11 @@ mod tests {
         assert_eq!(ids(vfs.children(id)), [s]);
         assert_eq!(
             ids(vfs.children(ROOT_MOUNT)),
-            [PROC_MOUNT, PTS_MOUNT, SYS_MOUNT, id, b]
+            [PROC_MOUNT, DEV_MOUNT, SYS_MOUNT, RUN_MOUNT, id, b]
+        );
+        assert_eq!(
+            ids(vfs.children(DEV_MOUNT)),
+            [PTS_MOUNT, SHM_MOUNT, MQUEUE_MOUNT]
         );
         assert_eq!(ids(vfs.children(SYS_MOUNT)), [CGROUP_MOUNT]);
 

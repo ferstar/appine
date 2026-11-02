@@ -256,3 +256,20 @@ sleep 0.4
 rmdir /tmp/mp/d && echo "rmdir a mount point of another namespace: ok"
 wait
 rm -rf /tmp/mp
+
+# 开机时的 /dev 是 tmpfs，devpts、/dev/shm 的 tmpfs、mqueue 挂在它里面（与容器运行时挂的
+# 一样，第 184 轮）。OpenRC 的 devfs 看到 /dev 已经挂着东西，只是照下面这样重新挂载：之后
+# 设备节点、终端都还在。不比挂载的标志（docker 的 /dev 是 strictatime）
+awk '$5 ~ /^\/dev(\/|$)/ { for (i = 7; $i != "-"; i++) {}; print $5, $(i + 1) }' /proc/self/mountinfo | sort
+for d in /dev/pts /dev/shm /dev/mqueue; do
+    parent=$(awk -v d=$d '$5 == d { print $2 }' /proc/self/mountinfo)
+    echo "$d: on /dev: $(awk -v p="$parent" '$1 == p { print ($5 == "/dev") }' /proc/self/mountinfo)"
+done
+mount -t tmpfs -o remount,noexec,nosuid,mode=0755,size=10M dev /dev && echo "remount /dev $?"
+awk '$5 == "/dev" { for (i = 7; $i != "-"; i++) {}; print $(i + 1), $(i + 2), $(i + 3) }' /proc/self/mountinfo
+echo "noexec: $(grep -c ' /dev .*noexec' /proc/self/mountinfo)"
+for n in null zero full random urandom tty ptmx pts/ptmx; do
+    [ -c /dev/$n ] && echo "/dev/$n: a character device"
+done
+python3 -c 'import os; m, s = os.openpty(); print("openpty:", os.ttyname(s).startswith("/dev/pts/"))'
+head -c 8 /dev/urandom | wc -c

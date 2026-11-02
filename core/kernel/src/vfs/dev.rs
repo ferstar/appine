@@ -1,8 +1,9 @@
 //! 字符设备（设计文档 §8）。
 //!
-//! `/dev` 是 inode 仓库里的普通目录，设备节点按 Linux 的设备号建在里面
-//! （[`ensure_dev_nodes`]），打开设备节点时按设备号找到这里的实现；guest 自己
-//! 用 mknod 建的同号节点行为相同。`/dev/pts` 是挂在仓库目录上的 devpts。
+//! 开机时 `/dev` 上挂一个 tmpfs，标准的设备节点按 Linux 的设备号建在里面（[`populate`]，
+//! 相当于 Linux 的 devtmpfs），打开设备节点时按设备号找到这里的实现；guest 自己用 mknod
+//! 建的同号节点行为相同。仓库里的 `/dev` 目录是它的挂载点，里面也补齐同样的节点
+//! （[`ensure_dev_nodes`]，卸下 `/dev` 之后看到的就是它们）。
 
 use crate::errno::Errno;
 use crate::vfs::store::{Ino, ROOT, Store, mode};
@@ -63,11 +64,14 @@ const LINKS: [(&[u8], &[u8]); 4] = [
     (b"stderr", b"/proc/self/fd/2"),
 ];
 
-/// 确保 `/dev` 和其中的标准设备节点，以及 `/proc`、`/sys` 这些挂载点存在（导入
+/// `/dev` 里的标准目录：devpts、`/dev/shm` 的 tmpfs、mqueue 的挂载点。
+const DIRS: [(&[u8], u32); 3] = [(b"pts", 0o755), (b"shm", 0o1777), (b"mqueue", 0o755)];
+
+/// 确保 `/dev` 和其中的标准设备节点，以及 `/proc`、`/sys`、`/run` 这些挂载点存在（导入
 /// rootfs 之后、每次启动时调用）。已经存在的同名项保持不动。
 pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
     store.transaction(|s| {
-        for (name, perm) in [(&b"proc"[..], 0o555), (b"sys", 0o555)] {
+        for (name, perm) in [(&b"proc"[..], 0o555), (b"sys", 0o555), (b"run", 0o755)] {
             if s.lookup(ROOT, name)?.is_none() {
                 s.mkdir(ROOT, name, perm, 0, 0)?;
             }
@@ -79,6 +83,14 @@ pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
         if !s.stat(dev)?.is_dir() {
             return Ok(());
         }
+        populate(s, dev)
+    })
+}
+
+/// 在目录 `dev` 里建好标准的设备节点、符号链接和目录（开机时挂在 `/dev` 上的 tmpfs、
+/// 仓库里的 `/dev`）。已经存在的同名项保持不动。
+pub fn populate(store: &Store, dev: Ino) -> Result<(), Errno> {
+    store.transaction(|s| {
         let missing = |name: &[u8]| -> Result<bool, Errno> { Ok(s.lookup(dev, name)?.is_none()) };
         for (name, rdev_value, perm) in NODES {
             if missing(name)? {
@@ -90,7 +102,7 @@ pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
                 s.symlink(dev, name, target, 0, 0)?;
             }
         }
-        for (name, perm) in [(&b"shm"[..], 0o1777), (b"pts", 0o755)] {
+        for (name, perm) in DIRS {
             if missing(name)? {
                 s.mkdir(dev, name, perm, 0, 0)?;
             }
