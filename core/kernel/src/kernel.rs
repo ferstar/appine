@@ -238,6 +238,14 @@ pub(crate) struct Kernel {
     /// `/proc/sys/kernel/unprivileged_bpf_disabled`：0 时没有能力的进程也能用 bpf(2) 的一部分
     /// 命令，1 时改不回去，2（默认，`BPF_UNPRIV_DEFAULT_OFF`）时 root 可以改成 0。
     pub unprivileged_bpf_disabled: u8,
+    /// 宿主按 inittab 启动了（[`crate::Machine::boot`]）：内置的 init 这时与 busybox 的一样
+    /// 处理 SIGTERM、SIGUSR1、SIGUSR2（[`crate::Power`]），收到的记在 `power` 里，由宿主
+    /// 取走（[`crate::Machine::take_power`]）去关机。
+    pub init_handlers: bool,
+    pub power: Option<crate::Power>,
+    /// 宿主开始关机、结束所有进程了（[`crate::Machine::shutdown`]、`kill_all`）：还在开机的
+    /// [`crate::Machine::boot`] 不再运行后面的命令。
+    pub stopping: bool,
     /// 内核日志的记录（[`crate::klog`]）：`/dev/kmsg` 的打开文件也拿着它。
     pub klog: Rc<RefCell<crate::klog::Klog>>,
     /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
@@ -353,6 +361,9 @@ impl Kernel {
             protected_symlinks: true,
             protected_hardlinks: true,
             unprivileged_bpf_disabled: 2,
+            init_handlers: false,
+            power: None,
+            stopping: false,
             klog: Default::default(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,

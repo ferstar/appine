@@ -36,13 +36,21 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
         (g.pgid, g.sid)
     };
     let cred = cx.cred();
-    // 内置的 init 忽略所有信号；没有权限给它发信号时与 Linux 一样报 EPERM
+    // 内置的 init 忽略别的信号；没有权限给它发信号时与 Linux 一样报 EPERM。宿主按 inittab
+    // 启动了时与 busybox 的 init 一样，SIGTERM、SIGUSR1、SIGUSR2 是重启、停机、关机的请求
+    // （busybox 的 reboot、halt、poweroff），记下来叫醒等着的宿主
     if pid == INIT {
-        return if cred.may_signal(&crate::cred::Cred::root()) {
-            Ok(0)
-        } else {
-            Err(Errno::EPERM)
-        };
+        if !cred.may_signal(&crate::cred::Cred::root()) {
+            return Err(Errno::EPERM);
+        }
+        let k = cx.k();
+        if let Some(power) = sig.and_then(crate::inittab::Power::from_signal)
+            && k.init_handlers
+        {
+            k.power.get_or_insert(power);
+            crate::kernel::request_wake_on(crate::kernel::wake::WATCHED);
+        }
+        return Ok(0);
     }
     // 活着的目标线程组：pid > 0 是一个进程，0 是本进程组，-1 是除 init 和自己以外的
     // 所有进程（自己的 pid 命名空间里看得到、编号大于 1 的），< -1 是进程组 -pid

@@ -44,6 +44,8 @@ impl Signal {
     pub const KILL: Signal = Signal(9);
     /// 用户自定义信号 1。
     pub const USR1: Signal = Signal(10);
+    /// 用户自定义信号 2。
+    pub const USR2: Signal = Signal(12);
     /// 非法内存访问。
     pub const SEGV: Signal = Signal(11);
     /// 管道断开。
@@ -187,6 +189,9 @@ pub struct RunOptions {
     pub memory_limit: Option<u64>,
     /// 低端口映射的偏移，见 [`crate::MachineOptions::low_port_offset`]。
     pub low_port_offset: Option<u16>,
+    /// 先按 inittab 开机（[`crate::Machine::boot`]），第一个进程结束或者 guest 请求关机时
+    /// 再关机（[`crate::Machine::shutdown`]），不直接结束所有进程。
+    pub init: bool,
 }
 
 /// 一次运行的结果。

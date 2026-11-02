@@ -1725,3 +1725,113 @@ fn sysctls_written_at_alpine_boot() {
         );
     }
 }
+
+/// 内置的 init 按 inittab 开机、关机（第 186 轮）：顺序，输出写到 /var/log/boot.log，环境
+/// 变量与 busybox init 的相同，跳过没装的程序和 respawn；开机之后 guest 的 poweroff、
+/// `kill -TERM 1` 是关机、重启的请求，没开机时什么也不做。一个用例里做完：都要改仓库里的
+/// /etc/inittab。
+#[test]
+fn init_runs_the_inittab() {
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Power, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    let inittab = "\
+::sysinit:/bin/sh -c 'echo sysinit $PATH $HOME >> /tmp/inittab-order'
+::sysinit:/bin/echo printed to the log
+::sysinit:/sbin/not-installed sysinit
+::wait:/bin/sh -c 'echo wait >> /tmp/inittab-order'
+::once:/bin/sh -c 'sleep 0.3; echo once >> /tmp/inittab-order'
+tty1::respawn:/sbin/getty 38400 tty1
+::respawn:/bin/sh -c 'echo respawn >> /tmp/inittab-order'
+::shutdown:/bin/sh -c 'echo shutdown >> /tmp/inittab-order'
+";
+    let setup = format!("cat > /etc/inittab <<'EOF'\n{inittab}EOF\nrm -f /tmp/inittab-order");
+    let order = |tier: &str| {
+        let out = command(store, tier, &["/bin/cat", "/tmp/inittab-order"])
+            .output()
+            .unwrap();
+        stdout(&out).to_owned()
+    };
+    for tier in TIERS {
+        let out = command(store, tier, &["/bin/sh", "-c", &setup])
+            .output()
+            .unwrap();
+        assert_ok(tier, &out);
+        let init = |script: &str| {
+            Command::new(env!("CARGO_BIN_EXE_appine-run"))
+                .args(["--tier", tier, "--init", "--env", PATH, "--rootfs"])
+                .arg(store)
+                .args(["--", "/bin/sh", "-c", script])
+                .output()
+                .unwrap()
+        };
+        // 程序在 sysinit、wait 之后启动；结束之后关机
+        let out = init("cat /tmp/inittab-order /var/log/boot.log; sleep 1.5");
+        assert_ok(tier, &out);
+        let booted = "sysinit /sbin:/usr/sbin:/bin:/usr/bin /\nwait\n";
+        assert_eq!(
+            stdout(&out),
+            format!("{booted}printed to the log\n"),
+            "tier {tier}"
+        );
+        assert_eq!(
+            order(tier),
+            format!("{booted}once\nshutdown\n"),
+            "tier {tier}"
+        );
+        // poweroff：关机的命令照常运行，程序被 SIGTERM 结束
+        let start = Instant::now();
+        let out = init("rm /tmp/inittab-order; poweroff; sleep 5; echo not reached");
+        assert_eq!(
+            out.status.code(),
+            Some(128 + 15),
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+        assert!(start.elapsed() < Duration::from_secs(4), "tier {tier}");
+        assert!(order(tier).contains("shutdown\n"), "tier {tier}");
+        // 不带 --init 时 poweroff 什么也不做
+        let out = command(store, tier, &["/bin/sh", "-c", "poweroff; echo still here"])
+            .output()
+            .unwrap();
+        assert_ok(tier, &out);
+        assert_eq!(stdout(&out), "still here\n", "tier {tier}");
+    }
+    // Machine 的接口：App 用 take_power 取走请求、processes 决定留不留在后台
+    for tier in [Tier::Interpreter, Tier::Dbt] {
+        let machine = Machine::start(&MachineOptions {
+            tier,
+            rootfs: Some(store.to_path_buf()),
+            memory_limit: None,
+            low_port_offset: None,
+        })
+        .unwrap();
+        let env = [PATH.as_bytes().to_vec()];
+        let sh = |script: &str| {
+            let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+            let pid = machine.spawn(b"/bin/sh", &argv, &env, Stdio::Host).unwrap();
+            machine.wait(pid)
+        };
+        assert_eq!(sh("kill -TERM 1"), ExitStatus::Exited(0));
+        assert_eq!(machine.take_power(), None, "{tier:?}: not booted");
+        machine.boot();
+        assert!(machine.processes() >= 1, "{tier:?}: the once entry");
+        assert_eq!(
+            sh("rm /tmp/inittab-order; kill -TERM 1"),
+            ExitStatus::Exited(0)
+        );
+        assert_eq!(machine.take_power(), Some(Power::Reboot), "{tier:?}");
+        assert_eq!(machine.take_power(), None, "{tier:?}");
+        machine.shutdown(Power::Reboot, Duration::from_secs(10));
+        assert_eq!(machine.processes(), 0, "{tier:?}");
+    }
+    let out = command(
+        store,
+        "1",
+        &["/bin/sh", "-c", "cat /tmp/inittab-order; rm /etc/inittab"],
+    )
+    .output()
+    .unwrap();
+    assert!(stdout(&out).ends_with("shutdown\n"), "{}", stdout(&out));
+}

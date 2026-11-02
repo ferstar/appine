@@ -10,6 +10,9 @@
 //! 终端切到 raw 模式，按键原样交给 guest 的行规程，^C、^Z 由它变成发给前台进程组的
 //! 信号，窗口大小跟随宿主终端。`--pty` 在没有终端时也这样做（stdin 和 stdout 可以是
 //! 管道，测试用），`--no-pty` 让 guest 直接使用宿主的 stdin/stdout/stderr。
+//!
+//! `--init` 先按 `/etc/inittab` 开机（与 App 一样，Alpine 上运行 OpenRC），程序结束或者
+//! guest 请求关机（busybox 的 reboot、halt、poweroff）时按它关机（设计文档 §6）。
 
 use std::env;
 use std::ffi::OsString;
@@ -36,6 +39,9 @@ const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
   --low-port-offset <n>
                        bind guest ports below 1024 to port + n on the host (then + 2n,
                        + 3n, or any free port); 0 binds them as they are (default: 10000)
+  --init               boot by /etc/inittab first (sysinit, wait, once entries; output in
+                       /var/log/boot.log) and shut down by it when the program exits or
+                       the guest asks to (reboot, halt, poweroff)
   --stats              print Tier 1 statistics to stderr on exit";
 
 fn main() -> ExitCode {
@@ -71,6 +77,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--stats" => stats = true,
+            "--init" => options.init = true,
             "--pty" => pty = Some(true),
             "--no-pty" => pty = Some(false),
             "--tier" => {

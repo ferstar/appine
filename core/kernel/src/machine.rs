@@ -70,6 +70,9 @@ pub struct Machine {
     timers: Option<JoinHandle<()>>,
 }
 
+/// [`run`] 关机时 inittab 里关机的命令一共能用多久（OpenRC 停 PostgreSQL 最多等 15 秒）。
+pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 thread_local! {
     /// 宿主线程在 Machine 的阻塞方法里等待用的事件。
     static EVENT: Arc<Event> = Arc::new(Event::new().expect("cannot create an eventfd"));
@@ -302,15 +305,40 @@ impl Machine {
         &self,
         interest: u32,
         objects: Option<&[wake::Object]>,
-        mut cond: impl FnMut(&mut Kernel) -> Option<T>,
+        cond: impl FnMut(&mut Kernel) -> Option<T>,
     ) -> T {
+        self.wait_deadline(interest, objects, None, cond)
+            .expect("waited without a deadline")
+    }
+
+    /// 与 [`Machine::wait_on`] 相同，到了 `deadline` 还没等到时返回 None。
+    fn wait_until<T>(
+        &self,
+        interest: u32,
+        deadline: Option<std::time::Instant>,
+        cond: impl FnMut(&mut Kernel) -> Option<T>,
+    ) -> Option<T> {
+        self.wait_deadline(interest, None, deadline, cond)
+    }
+
+    fn wait_deadline<T>(
+        &self,
+        interest: u32,
+        objects: Option<&[wake::Object]>,
+        deadline: Option<std::time::Instant>,
+        mut cond: impl FnMut(&mut Kernel) -> Option<T>,
+    ) -> Option<T> {
         EVENT.with(|event| {
             let mut k = self.shared.lock();
             loop {
                 if let Some(v) = cond(&mut k) {
-                    return v;
+                    return Some(v);
                 }
-                let (k2, _) = block_for(&self.shared, k, event, None, &mut [], interest, objects);
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    return None;
+                }
+                let (k2, _) =
+                    block_for(&self.shared, k, event, deadline, &mut [], interest, objects);
                 k = k2;
             }
         })
@@ -414,7 +442,8 @@ impl Machine {
     /// 结束所有 guest 进程，等所有 guest 线程退出。
     pub fn kill_all(&self) {
         crate::bug::host_call("Machine::kill_all", || {
-            let k = self.shared.lock();
+            let mut k = self.shared.lock();
+            k.stopping = true;
             let groups: Vec<_> = k.groups.values().cloned().collect();
             for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
                 signal::group_exit(
@@ -430,6 +459,162 @@ impl Machine {
             }
         });
         self.wait_for(|k| k.tasks.is_empty().then_some(()));
+    }
+
+    /// 按 `/etc/inittab` 开机（[`crate::inittab`]）：依次运行 sysinit、boot、bootwait、默认
+    /// 运行级别的 wait（每个都等它结束）和 once（不等），输出写到 [`crate::inittab::LOG`]。
+    /// 返回时 once 的命令可能还在运行。没有 inittab、没有仓库时什么也不做。之后内置的 init
+    /// 接受 busybox 的 reboot、halt、poweroff 的请求（[`Machine::take_power`]）。
+    pub fn boot(&self) {
+        self.shared.lock().init_handlers = true;
+        let entries = self.inittab();
+        let mut first = true;
+        for (process, wait) in crate::inittab::boot_plan(&entries) {
+            if self.shared.lock().stopping {
+                break;
+            }
+            let Some(pid) = self.run_init_process(&process, first) else {
+                continue;
+            };
+            first = false;
+            if wait {
+                self.wait(pid);
+            }
+        }
+    }
+
+    /// 关机（busybox init 的 `run_shutdown_and_kill_processes`）：开过机的先依次运行 inittab
+    /// 里关机的命令（[`crate::inittab::shutdown_plan`]），然后给所有进程发 SIGTERM，最多等
+    /// 1 秒，再结束剩下的（[`Machine::kill_all`]）。`timeout` 限制关机的命令一共能用多久，
+    /// 到了就不再等。
+    pub fn shutdown(&self, power: crate::Power, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        let init = {
+            let mut k = self.shared.lock();
+            k.stopping = true;
+            k.init_handlers
+        };
+        if init {
+            for process in crate::inittab::shutdown_plan(&self.inittab(), power) {
+                if let Some(pid) = self.run_init_process(&process, false) {
+                    let exited = |k: &mut Kernel| k.watched.get(&(pid as i32)).copied().flatten();
+                    if self
+                        .wait_until(wake::WATCHED, Some(deadline), exited)
+                        .is_none()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        crate::bug::host_call("Machine::shutdown", || {
+            let k = self.shared.lock();
+            let groups: Vec<_> = k.groups.values().cloned().collect();
+            for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
+                let tgid = g.borrow().tgid;
+                let info = crate::signal::SigInfo::kill(crate::signal::code::SI_USER, INIT, 0);
+                signal::send_to_group(&k, tgid, Signal::TERM, info);
+            }
+        });
+        let second = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        self.wait_until(wake::ALL, Some(second), |k| {
+            k.tasks.is_empty().then_some(())
+        });
+        self.kill_all();
+    }
+
+    /// 还在运行的 guest 进程数（不算内置的 init 和僵尸进程）：App 关掉最后一个标签页之后据此
+    /// 决定留在后台还是退出（设计文档 §11.2）。
+    pub fn processes(&self) -> usize {
+        let k = self.shared.lock();
+        k.groups
+            .values()
+            .filter(|g| {
+                let g = g.borrow();
+                g.tgid != INIT && !g.threads.is_empty()
+            })
+            .count()
+    }
+
+    /// 取走 guest 发给内置 init 的关机请求（busybox 的 reboot、halt、poweroff）。只在
+    /// [`Machine::boot`] 之后才有。
+    pub fn take_power(&self) -> Option<crate::Power> {
+        self.shared.lock().power.take()
+    }
+
+    /// 等 [`Machine::spawn`] 启动的进程结束，或者 guest 请求关机（[`Machine::take_power`]，
+    /// 请求不取走）。
+    pub fn wait_or_power(&self, pid: u32) -> Result<ExitStatus, crate::Power> {
+        self.wait_on(wake::WATCHED, |k| match k.watched.get(&(pid as i32)) {
+            Some(Some(status)) => Some(Ok(*status)),
+            _ => k.power.map(Err),
+        })
+    }
+
+    /// 读 `/etc/inittab`（跟随符号链接），没有时是空表。
+    fn inittab(&self) -> Vec<crate::inittab::Entry> {
+        let Some(vfs) = self.shared.lock().vfs.clone() else {
+            return Vec::new();
+        };
+        let text = crate::bug::host_call("Machine::inittab", || {
+            let offline = crate::pseudo::Offline;
+            let root = Cred::root();
+            match vfs.resolve(
+                &offline,
+                &root,
+                &Node::ROOT,
+                &Node::ROOT,
+                b"/etc/inittab",
+                true,
+            ) {
+                Ok(Node::Store(_, ino)) => {
+                    let mut text = Vec::new();
+                    let f = vfs.store().open_object(ino, false).ok()?;
+                    io::Read::read_to_end(&mut &f, &mut text).ok()?;
+                    Some(text)
+                }
+                _ => None,
+            }
+        });
+        text.flatten()
+            .map(|t| crate::inittab::parse(&t))
+            .unwrap_or_default()
+    }
+
+    /// 由 `/bin/sh -c` 运行 inittab 里的命令（[`crate::inittab::script`]），返回 pid。命令的
+    /// 程序是不存在的绝对路径时（比如没装 OpenRC），或者起不来时，返回 None。
+    fn run_init_process(&self, process: &[u8], first: bool) -> Option<u32> {
+        if let Some(program) = crate::inittab::program(process) {
+            let vfs = self.shared.lock().vfs.clone()?;
+            let offline = crate::pseudo::Offline;
+            let found = crate::bug::host_call("Machine::boot", || {
+                vfs.resolve(
+                    &offline,
+                    &Cred::root(),
+                    &Node::ROOT,
+                    &Node::ROOT,
+                    program,
+                    true,
+                )
+                .is_ok()
+            });
+            if found != Some(true) {
+                return None;
+            }
+        }
+        let argv = [
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            crate::inittab::script(process, first),
+        ];
+        let envp: Vec<Vec<u8>> = crate::inittab::ENV.iter().map(|e| e.to_vec()).collect();
+        match self.spawn(b"/bin/sh", &argv, &envp, Stdio::Host) {
+            Ok(pid) => Some(pid),
+            Err(e) => {
+                crate::debug::log(format_args!("cannot run an inittab entry: {e}"));
+                None
+            }
+        }
     }
 
     /// 宿主内存紧张、App 的界面离开了一阵子（设计文档 §11.2）：丢掉可以重建的缓存，即池里
@@ -617,6 +802,9 @@ pub fn run(
         })
         .transpose()?;
     let stdio = console.map_or(Stdio::Host, |(_, id)| Stdio::Console(id));
+    if options.init {
+        machine.boot();
+    }
     let pid = machine.spawn(program.as_bytes(), argv, envp, stdio)?;
     let bridge = console.map(|(term, id)| {
         let shared = machine.shared.clone();
@@ -625,8 +813,16 @@ pub fn run(
             .spawn(move || terminal::bridge(shared, term, id, pid as i32))
             .expect("cannot start the terminal thread")
     });
-    let status = machine.wait(pid);
-    machine.kill_all();
+    let status = if options.init {
+        // 程序结束时是关机；guest 请求了重启也只是关机，结束 appine-run
+        let power = machine.wait_or_power(pid).err();
+        machine.shutdown(power.unwrap_or(crate::Power::PowerOff), SHUTDOWN_TIMEOUT);
+        machine.wait(pid)
+    } else {
+        let status = machine.wait(pid);
+        machine.kill_all();
+        status
+    };
     // 桥接线程把剩下的输出写完才退出
     if let Some(b) = bridge {
         let _ = b.join();

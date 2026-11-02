@@ -194,6 +194,7 @@
 | [M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面](rounds/183-udp-wide-first.md) | 2026-11-02 | 上一轮的推迟项：没绑定的 UDP socket 第一个数据报发往命名空间里的地址时绑了回环地址，之后再发往外面是 EINVAL；现在与先发往外面时一样在宿主上绑通配地址、按包指定源地址，顺序无关（发给自己的虚拟地址的不变）；实测 musl 的解析器、Node、Go、Java 本来就先绑了通配地址，碰到的是不先 bind 就 sendto 的程序 |
 | [M9 之前：开机时挂好 /dev、/dev/shm、/dev/mqueue 和 /run](rounds/184-boot-tmpfs.md) | 2026-11-02 | 支持 OpenRC 的第一轮：开机时的挂载改成与 systemd、容器运行时的一样，`/dev` 是 tmpfs（标准设备节点建在里面，相当于 devtmpfs），devpts、`/dev/shm` 的 tmpfs、mqueue 挂在里面，`/run` 是 tmpfs（20%、800k 个 inode）；原来 OpenRC 的 `init.sh` 在 `/run` 上再挂一层、devfs 在 `/dev` 上挂空 tmpfs（ptmx、pts、urandom 都没了），现在它们看到已经挂着，只重新挂载 |
 | [M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl](rounds/185-protected-links-random.md) | 2026-11-02 | 支持 OpenRC 的第二轮：补上 00-alpine.conf 写的 `kernel.panic`、`fs.protected_symlinks`/`protected_hardlinks`（默认打开，按 Linux 6.1 的 `may_follow_link`、`may_linkat` 实现：/tmp 里别人的链接 root 也不跟随，不是属主不能硬链接别人的私有文件、setuid 文件等）、`kernel.unprivileged_bpf_disabled`（默认 2，改成 1 之后锁住）；`/dev/urandom` 的 `RNDADDENTROPY` 等按 Linux 的 `random_ioctl`（原来 ENOTTY，seedrng 失败） |
+| [M9 之前：内置的 init 按 inittab 开机、关机](rounds/186-inittab.md) | 2026-11-02 | 支持 OpenRC 的第三轮：宿主要求时（App、`appine-run --init`）内置的 init 执行 `/etc/inittab` 的子集（sysinit、boot/bootwait、默认运行级别的 wait、once；关机时 busybox 的 shutdown 和 sysvinit 的运行级别 0/6），输出写到 `/var/log/boot.log`，没装的程序、respawn 跳过；关机再 SIGTERM、等 1 秒、SIGKILL；开机之后 busybox 的 reboot/halt/poweroff 发给 1 号进程的信号是关机请求（`Machine::take_power`），原来什么也不做 |
 
 ## 测量条件
 

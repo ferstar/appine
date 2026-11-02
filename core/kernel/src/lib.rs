@@ -14,6 +14,7 @@ pub mod errno;
 mod fd;
 mod forward;
 mod futex;
+mod inittab;
 mod ipc;
 mod itimer;
 mod kernel;
@@ -53,8 +54,9 @@ pub mod vfs;
 
 pub use appine_engine::DbtStats;
 pub use appine_hal::net::Route as HostRoute;
+pub use inittab::Power;
 pub use loader::LoadError;
-pub use machine::{Machine, MachineOptions, Stdio, run};
+pub use machine::{Machine, MachineOptions, SHUTDOWN_TIMEOUT, Stdio, run};
 pub use portmap::ListenEvent;
 pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier};
 pub use terminal::Terminal;
