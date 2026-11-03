@@ -2,6 +2,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/native.md` for the paired decision history.
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
+> Maintained: 2026-11-03 (targeted verification: `scripts/release-sources` moved into this module)
 
 ## Responsibilities
 
@@ -13,11 +14,12 @@
 - the Gradle build: the native library via cargo-ndk, the rootfs, doas and notice assets,
   per-variant features, SDK levels, packaging;
 - the manifest and debug-only resources;
-- the instrumentation tests (`MachineTest`).
+- the instrumentation tests (`MachineTest`);
+- the source bundles released with the APK (`scripts/release-sources`).
 
 Root: `hosts/android/`, `android/app/src/main/java/io/github/mthli/appine/Native.kt`,
 `android/app/build.gradle.kts` and the other Gradle files, `android/app/src/main/AndroidManifest.xml`,
-`android/app/src/debug/`, `android/app/src/androidTest/`.
+`android/app/src/debug/`, `android/app/src/androidTest/`, `scripts/release-sources`.
 
 Outside the module: the `Machine` API and the store functions (`kernel/process`, `kernel/store`);
 what the app does with them (the other `android/*` modules).
@@ -78,7 +80,17 @@ what the app does with them (the other `android/*` modules).
   property, the documents provider, a handful of normal permissions (no storage permission); the
   debug network security config allows cleartext to 127.0.0.1 only.
 
-**4. Tests**
+**4. Released sources**
+
+- `scripts/release-sources [dir]` (default `target/release-sources`) refuses to run with tracked
+  changes in the work tree and writes `appine-<rev>.tar.gz` (`git archive HEAD`),
+  `appine-<rev>-vendor.tar.gz` (`cargo vendor`) and `alpine-<version>-gpl-sources.tar`: for each
+  GPL origin listed in the bundled minirootfs's `lib/apk/db/installed`, the aports directory at its
+  commit (GitLab archive by subdirectory) plus the upstream files named in the APKBUILD's
+  `sha512sums`, fetched from Alpine's distfiles mirror and checked against those sums; APKBUILDs
+  are never executed.
+
+**5. Tests**
 
 - `MachineTest` runs on emulators with 4 KB and 16 KB pages: boot and shutdown by inittab, consoles,
   login and doas, restore, documents, mirrors, downloads (some opt-in with network), memory trim,
