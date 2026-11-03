@@ -15,7 +15,7 @@
 7. 信号与 ABI，已迁到 [kernel/signal 的 map](../../.claude/maps/kernel/signal.md)（英文）
 8. 文件系统，已迁到 [kernel/store](../../.claude/maps/kernel/store.md)、[kernel/vfs](../../.claude/maps/kernel/vfs.md)、[kernel/procfs](../../.claude/maps/kernel/procfs.md) 的 map（英文）
 9. TTY 与终端，已迁到 [kernel/tty 的 map](../../.claude/maps/kernel/tty.md)（英文），终端界面挪进了 §11.5
-10. [网络](10-network.md)
+10. 网络，已迁到 [kernel/net](../../.claude/maps/kernel/net.md)、[kernel/netns](../../.claude/maps/kernel/netns.md)、[kernel/unix](../../.claude/maps/kernel/unix.md)、[kernel/poll](../../.claude/maps/kernel/poll.md) 的 map（英文）
 11. [用户、权限与 Android 集成](11-android.md)
 12. [威胁模型](12-threat-model.md)
 13. [工程](13-engineering.md)
@@ -42,7 +42,7 @@
 | C 难缠的运行时 | Go 静态二进制、node/V8、JVM | **行为正确，不要求快** |
 | D 不承诺 | 容器、init 系统、内核模块、X11/GUI | — |
 
-A–C 都已达到。D 档里 podman、docker（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 namespace、§10）和 OpenRC（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 PID 1）实际能用；systemd、内核模块、GUI 不做。strace、gdb 可以用（[kernel/signal 的 map](../../.claude/maps/kernel/signal.md)）。
+A–C 都已达到。D 档里 podman、docker（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 namespace、[kernel/netns 的 map](../../.claude/maps/kernel/netns.md)）和 OpenRC（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 PID 1）实际能用；systemd、内核模块、GUI 不做。strace、gdb 可以用（[kernel/signal 的 map](../../.claude/maps/kernel/signal.md)）。
 
 发行版默认是 Alpine，设置里可以换成 Debian 13（§11.4）。glibc 的程序（manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK）不用改内核层就能运行。
 

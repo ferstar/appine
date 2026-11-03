@@ -312,7 +312,7 @@ internal object Rootfs {
 
     /**
      * 只有回环接口的 `/etc/network/interfaces`（每次启动内核之前，没有时才写，用户改过的不动），
-     * 与 setup-alpine 写的一样。网络是宿主的（设计文档 §10），要网络的服务（nginx 等）由 OpenRC
+     * 与 setup-alpine 写的一样。网络是宿主的（kernel/net 的 map），要网络的服务（nginx 等）由 OpenRC
      * 拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 里的 `rc_provide`：它
      * 加到每一个服务上，再提供 `clock` 就成了环。没装 OpenRC、ifupdown 时这个文件没人读。
      */
@@ -457,8 +457,8 @@ internal object Rootfs {
         if (distro == Distro.ALPINE) {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
         } else {
-            // Debian 的没有 hosts，resolv.conf 指向 1.1.1.1。DNS 要走内核层的存根（设计文档
-            // §10），系统的私人 DNS、VPN 才生效
+            // Debian 的没有 hosts，resolv.conf 指向 1.1.1.1。DNS 要走内核层的存根（kernel/net 的
+            // map），系统的私人 DNS、VPN 才生效
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }

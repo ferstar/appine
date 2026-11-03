@@ -207,7 +207,7 @@ class TerminalService : Service() {
     private val saveSoon = Runnable { saveTabs() }
 
     /**
-     * 默认网络的路由交给 guest（设计文档 §10）：Android 10 起 App 读不了宿主的路由表，guest
+     * 默认网络的路由交给 guest（kernel/net 的 map）：Android 10 起 App 读不了宿主的路由表，guest
      * 的 `ip route`、`/proc/net/route` 靠它。回调在系统的线程上，交给 [worker] 按顺序做。
      */
     private val network = object : ConnectivityManager.NetworkCallback() {

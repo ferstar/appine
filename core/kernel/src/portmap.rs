@@ -1,4 +1,4 @@
-//! 1024 以下的端口映射（设计文档 §10）。
+//! 1024 以下的端口映射（kernel/net 的 map）。
 //!
 //! Android 上的 App 没有 `CAP_NET_BIND_SERVICE`，宿主上一般绑不了 1024 以下的端口；guest 里的
 //! root 照样要绑 22、80 这些（sshd、nginx 的默认配置）。guest 的 socket 绑这些端口时，宿主

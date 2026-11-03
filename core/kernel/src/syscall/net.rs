@@ -1,4 +1,4 @@
-//! socket 类 syscall（设计文档 §10）。
+//! socket 类 syscall（kernel/net 的 map）。
 //!
 //! 宿主 socket 是非阻塞的；guest 的阻塞调用在 EAGAIN 时经由 [`Cx::wait`] 等宿主 fd
 //! 就绪，期间释放 BKL，可以被信号打断，并按 `SO_RCVTIMEO`/`SO_SNDTIMEO` 超时。

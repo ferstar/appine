@@ -1,4 +1,4 @@
-//! socket（设计文档 §10）。
+//! socket（kernel/net 的 map）。
 //!
 //! - TCP、UDP 透传：guest 的 socket 持有一个宿主的非阻塞 socket，地址和选项按字节原样
 //!   传递。guest 的 `SOCK_RAW + IPPROTO_ICMP` 换成宿主的 ping socket。

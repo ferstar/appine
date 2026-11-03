@@ -1,4 +1,4 @@
-//! 宿主 socket（设计文档 §10）。
+//! 宿主 socket（kernel/net 的 map）。
 //!
 //! guest 的 TCP/UDP socket 直接对应一个宿主 socket。guest 和宿主都是 arm64 Linux 的
 //! ABI，所以 sockaddr、socket 选项和控制消息的字节布局完全相同，这里按字节原样传递。
@@ -532,7 +532,7 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
     result
 }
 
-/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（设计文档 §10 的 DNS 存根）。
+/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（kernel/net 的 map 里的 DNS 存根）。
 ///
 /// Android 上交给 `android_res_nsend`，私人 DNS、VPN 和按网络分流的设置都会生效；
 /// 其他宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器。会阻塞，调用方不能
@@ -570,7 +570,7 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     Ok(answer)
 }
 
-/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（设计文档 §10 的 DNS 存根）。
+/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（kernel/net 的 map 里的 DNS 存根）。
 ///
 /// Android 上交给 `android_res_nsend`，私人 DNS、VPN 和按网络分流的设置都会生效；
 /// 其他宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器。会阻塞，调用方不能

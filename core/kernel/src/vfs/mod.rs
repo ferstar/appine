@@ -2133,7 +2133,7 @@ impl Mounts {
     }
 }
 
-/// 没有 `/etc/resolv.conf` 时写一个指向 DNS 存根的（设计文档 §10）；已有的保持不动。
+/// 没有 `/etc/resolv.conf` 时写一个指向 DNS 存根的（kernel/net 的 map）；已有的保持不动。
 fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
     let Some(etc) = store.lookup(ROOT, b"etc")? else {
         return Ok(());

@@ -2,6 +2,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/process.md` for the paired decision history.
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
+> Maintained: 2026-11-03 (targeted verification: timeout overflow in the fast path, found during kernel/poll verification)
 
 ## Responsibilities
 
@@ -411,6 +412,12 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ## Confirmed bugs / technical debt
 
+- **Very long sleeps panic:** the fast-path `nanosleep`, relative `clock_nanosleep` and `FUTEX_WAIT`
+  compute `Instant::now() + timeout` for any valid timespec, which overflows and panics for
+  `tv_sec` near `i64::MAX`; the calling process is killed with a kernel-bug report. GNU coreutils'
+  `sleep infinity` (common in containers) passes exactly that through glibc's `clock_nanosleep`.
+  The same pattern appears in other timed waits (ppoll/pselect6/epoll_pwait2, signals, AIO, SysV
+  IPC); Linux saturates such timeouts.
 - **Pid-namespace teardown can hang:** after the namespace init exits, orphans of other members are
   reparented to the held, threadless init, which never reaps them; with a tree two or more levels
   deep inside the namespace, the init's exit is never reported and its parent's `waitpid` blocks

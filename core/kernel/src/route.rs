@@ -1,4 +1,4 @@
-//! 路由表（设计文档 §10）：netlink 的 `RTM_GETROUTE`（`ip route`、`ip route get`）、
+//! 路由表（kernel/net 的 map）：netlink 的 `RTM_GETROUTE`（`ip route`、`ip route get`）、
 //! `RTM_GETRULE`（`ip rule`），`/proc/net/route` 和 `/proc/net/ipv6_route`。
 //!
 //! Android 10 起 App 读不了宿主的 `/proc/net`，targetSdk ≥ 30 也不能 bind `NETLINK_ROUTE`，

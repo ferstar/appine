@@ -707,7 +707,7 @@ impl Machine {
         self.sync();
     }
 
-    /// 宿主的网络变了（设计文档 §10）：主表里的路由换成 `routes`，guest 的 `ip route`、
+    /// 宿主的网络变了（kernel/net 的 map）：主表里的路由换成 `routes`，guest 的 `ip route`、
     /// `/proc/net/route` 等看到的就是它们（[`crate::route`]）。Android 上 App 读不到宿主的
     /// 路由表，由它从默认网络的 `LinkProperties` 取了交进来；None 时改回读宿主的，读不到时
     /// 按接口的地址合成。

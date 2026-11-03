@@ -692,7 +692,7 @@ class MachineTest {
     }
 
     /**
-     * guest 的路由表（设计文档 §10）：App 读不了宿主的 `/proc/net/route`，交来默认网络的
+     * guest 的路由表（kernel/net 的 map）：App 读不了宿主的 `/proc/net/route`，交来默认网络的
      * `LinkProperties` 之前是按接口的地址合成的（默认路由没有网关），交来之后有网关；
      * `ip route get` 的源地址由宿主选。
      */
@@ -718,7 +718,7 @@ class MachineTest {
     }
 
     /**
-     * 宿主不让绑的 1024 以下的端口（设计文档 §10）：App 没有 CAP_NET_BIND_SERVICE，79 也不在
+     * 宿主不让绑的 1024 以下的端口（kernel/net 的 map）：App 没有 CAP_NET_BIND_SERVICE，79 也不在
      * Android 放开的那几个里；guest 的 nc 绑 79 时宿主上换成 10079，guest 里看到的还是 79。App
      * 经由 [Native.takeListens] 知道外部端口（§12 #7 的通知用它），从 App 进程连 10079 收得到
      * guest 发的数据，内核日志记着换到了哪里。

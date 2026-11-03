@@ -1,4 +1,4 @@
-//! guest 的 raw ICMP socket（设计文档 §10）。Android 上 App 没有 `CAP_NET_RAW`，guest 的
+//! guest 的 raw ICMP socket（kernel/net 的 map）。Android 上 App 没有 `CAP_NET_RAW`，guest 的
 //! raw ICMP socket 在宿主上是 ping socket（不需要特权），这里补上两者的差别：
 //!
 //! - **收得到到达的所有 ICMP**：Linux 的 raw ICMP socket 收到发给本机的每个 ICMP 报文，

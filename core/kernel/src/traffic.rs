@@ -1,4 +1,4 @@
-//! 网络接口和协议的流量计数（设计文档 §10）：`/proc/net/dev`、`/sys/class/net/<接口>/statistics/`
+//! 网络接口和协议的流量计数（kernel/net 的 map）：`/proc/net/dev`、`/sys/class/net/<接口>/statistics/`
 //! 和 netlink 的 `IFLA_STATS`、`IFLA_STATS64` 取自接口的计数，`/proc/net/snmp`、`netstat`
 //! 取自协议的计数（[`Protocols`]）。
 //!

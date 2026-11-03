@@ -1,4 +1,4 @@
-//! AF_UNIX socket（设计文档 §10）：完全在进程内模拟，不经过宿主。
+//! AF_UNIX socket（kernel/unix 的 map）：完全在进程内模拟，不经过宿主。
 //!
 //! - 流式（`SOCK_STREAM`）和 `SOCK_SEQPACKET` 的连接是一对单向的 [`Channel`]；数据报
 //!   socket 各有一个接收队列，发送方直接放进对方的队列。

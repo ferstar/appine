@@ -1,4 +1,4 @@
-//! I/O 多路复用（设计文档 §10）：ppoll、pselect6、epoll，以及 eventfd。
+//! I/O 多路复用（kernel/poll 的 map）：ppoll、pselect6、epoll，以及 eventfd。
 //!
 //! 三者共用 [`wait_ready`]：先检查进程内对象（管道、PTY、eventfd……）的就绪状态，
 //! 宿主 fd（宿主 socket、宿主 stdio）用一次不等待的宿主 poll 检查；都没有就绪时，
