@@ -1,4 +1,4 @@
-//! 命名空间（设计文档 §6）：`clone`、`unshare` 新建挂载、用户、pid（`crate::pidns`）、UTS、
+//! 命名空间（kernel/process 的 map）：`clone`、`unshare` 新建挂载、用户、pid（`crate::pidns`）、UTS、
 //! IPC、网络、cgroup 命名空间（`crate::nsproxy`），`/proc/<pid>/ns/*`
 //! （`crate::pseudo::NsKind`），命名空间文件上的 ioctl，经由命名空间文件或者 pidfd 的
 //! setns(2)。打开着的、bind 挂载出去的命名空间文件让命名空间活着（[`NsRef`]）。time 命名空间

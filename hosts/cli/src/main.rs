@@ -12,7 +12,7 @@
 //! 管道，测试用），`--no-pty` 让 guest 直接使用宿主的 stdin/stdout/stderr。
 //!
 //! `--init` 先按 `/etc/inittab` 开机（与 App 一样，Alpine 上运行 OpenRC），程序结束或者
-//! guest 请求关机（busybox 的 reboot、halt、poweroff）时按它关机（设计文档 §6）。
+//! guest 请求关机（busybox 的 reboot、halt、poweroff）时按它关机（kernel/process 的 map）。
 
 use std::env;
 use std::ffi::OsString;

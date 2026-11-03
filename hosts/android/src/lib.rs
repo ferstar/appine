@@ -979,7 +979,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     }
 }
 
-/// 按 `/etc/inittab` 开机（设计文档 §6）：阻塞到 sysinit、wait 的命令都结束。
+/// 按 `/etc/inittab` 开机（kernel/process 的 map）：阻塞到 sysinit、wait 的命令都结束。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
     _: JNIEnv<'l>,

@@ -117,7 +117,7 @@ internal object Native {
     external fun stop(machine: Long)
 
     /**
-     * 按 `/etc/inittab` 开机（设计文档 §6，Alpine 上是 OpenRC）：阻塞到 sysinit、wait 的命令都
+     * 按 `/etc/inittab` 开机（kernel/process 的 map，Alpine 上是 OpenRC）：阻塞到 sysinit、wait 的命令都
      * 结束，输出在 guest 的 `/var/log/boot.log`。不在主线程上调用。
      */
     @JvmStatic

@@ -320,7 +320,7 @@ internal object Rootfs {
      * 每次开机之前在 guest 里运行（`sh -c`）：装了 OpenRC、hwclock/osclock/swclock 都不在任何运行
      * 级别里时，把 osclock 加进 boot。busybox 的 syslog `need clock`，OpenRC 默认用 hwclock 提供
      * clock，它读不到 RTC、也设不了宿主的时间，开机日志里总有一个失败；osclock 表示"时间由操作
-     * 系统管"，什么也不做（设计文档 §6）。用户自己放了哪个时钟服务就不动。
+     * 系统管"，什么也不做（kernel/process 的 map）。用户自己放了哪个时钟服务就不动。
      */
     const val PREFER_OSCLOCK = "[ -x /sbin/rc-update ] && [ -e /etc/init.d/osclock ] || exit 0; " +
         "for s in hwclock osclock swclock; do for l in /etc/runlevels/*/\$s; do " +
@@ -347,7 +347,7 @@ internal object Rootfs {
 
     /**
      * 这次开机时没有起来的服务：OpenRC 在 `/var/log/boot.log` 里写 ` * ERROR: <服务> failed to
-     * start`（内核每次开机清空这个文件，设计文档 §6）。没有 OpenRC、读不到时是空的。
+     * start`（内核每次开机清空这个文件，kernel/process 的 map）。没有 OpenRC、读不到时是空的。
      */
     fun failedServices(context: Context): List<String> {
         val log = runCatching { Native.readFile(store(context).path, "/var/log/boot.log") }.getOrNull()

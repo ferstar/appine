@@ -1,4 +1,4 @@
-//! 内核层的全局状态、大内核锁和统一的等待机制（设计文档 §6）。
+//! 内核层的全局状态、大内核锁和统一的等待机制（kernel/process 的 map）。
 //!
 //! 所有 guest 线程共享一个 [`Kernel`]，由一把大内核锁（BKL）保护：处理 syscall
 //! 和投递信号时持有，执行 guest 代码时不持有，等待之前释放。内核对象之间用
@@ -41,7 +41,7 @@ use crate::vfs::{Node, Vfs};
 /// 线程 ID；线程组 ID（pid）就是组里第一个线程的 tid。
 pub(crate) type Tid = i32;
 
-/// 内核层内置的 init（设计文档 §6）：只负责收养孤儿进程、回收僵尸进程。
+/// 内核层内置的 init（kernel/process 的 map）：只负责收养孤儿进程、回收僵尸进程。
 pub(crate) const INIT: Tid = 1;
 
 /// 最大的 tid，与 Linux 64 位上 `pid_max` 的上限相同。

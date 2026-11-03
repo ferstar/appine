@@ -16,7 +16,7 @@
 | 流量计数 | 内核层自己数 guest 的 socket 收发的载荷（`core/kernel/src/traffic.rs`），`/proc/net/dev`、sysfs 的 `statistics/`、netlink 和 `/proc/net/snmp` 报告同样的数：Android 上 App 读不到宿主的计数，宿主的计数里也有别的 App 的流量。接口按 socket 的本端地址认 |
 | tun/VpnService | v1 不做 |
 
-**网络命名空间**（`crate::netns`，§6）：开机时的那个就是宿主的网络。数据包不经过任何虚拟设备，一切在 socket 层换算：
+**网络命名空间**（`crate::netns`，[kernel/process 的 map](../../.claude/maps/kernel/process.md)）：开机时的那个就是宿主的网络。数据包不经过任何虚拟设备，一切在 socket 层换算：
 
 - 新建的里面一开始只有 lo。socket 仍是宿主 socket，地址在边界上换算：guest 的 127.0.0.x 是宿主上给这个命名空间的 127.a.b.x，没有绑定的 socket 在 connect、sendto、listen 之前先绑到 127.a.b.1。
 - **虚拟网卡**（`core/kernel/src/netdev.rs`）：bridge、veth、dummy 的建删改、地址、路由、接口的 sysctl 照 Linux 6.1 按命名空间记，netlink、ioctl、`/proc`、`/sys` 都看得到。虚拟地址在 socket 层换成宿主上的回环地址；connect、sendto 按目的地址找到它所在的命名空间，经由默认路由出去的交给宿主网络，反过来按"谁在看"换回。
@@ -24,13 +24,13 @@
 - **端口**：新命名空间里显式绑的端口在宿主上另选（外层占着同一个端口时也绑得上），监听登记在命名空间里，连过去没有对得上的就是 ECONNREFUSED。
 - **从外面连进来**：开机时的命名空间里被 PREROUTING DNAT 的监听交给宿主上的转发线程（`core/kernel/src/forward.rs`），从 appine 外面连进来的转给 DNAT 的目的地（podman、docker 的 `-p`），容器里看到的是客户端真实的地址。
 
-**I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作，宿主 fd 和进程内对象统一在 §6 的等待机制里处理。
+**I/O 多路复用**：每个 guest file 对象实现一个 `poll` 操作，宿主 fd 和进程内对象统一在 [kernel/process 的 map](../../.claude/maps/kernel/process.md) 的等待机制里处理。
 
-- **epoll** 在进程内实现，等待时把关注的宿主 fd 和线程自己的唤醒事件放进同一次宿主 `poll`，关注的进程内文件登记它们的唤醒对象（§6）。没有用宿主 epoll 实现 guest 的 epoll，fd 很多时再换。
+- **epoll** 在进程内实现，等待时把关注的宿主 fd 和线程自己的唤醒事件放进同一次宿主 `poll`，关注的进程内文件登记它们的唤醒对象（[kernel/process 的 map](../../.claude/maps/kernel/process.md)）。没有用宿主 epoll 实现 guest 的 epoll，fd 很多时再换。
 - **`EPOLLET`**：与 Linux 一样，某一位从未就绪变成就绪，或者那个方向又来了事件时触发，即使本来就已经就绪（tokio、Go 的 netpoller 靠这一条）。
   - 进程内的对象每来一次事件记一次"数据代数"，与 Linux 唤醒等待队列的时机对应。
   - 宿主 socket 上的数据不经过内核层：有边沿触发的关注时，给它建一个只关注它的、边沿触发的宿主 epoll，宿主每来一次数据它就可读一次。
   - 程序在一个方向上用完数据之后，这个方向上次报告过的位作废；等待时不等报告过、仍然就绪的位，免得宿主 poll 立刻返回、变成忙等。
   - 嵌套的 epoll：内层的数据代数是各个关注来过事件的次数之和，外层边沿触发时按它再触发。
 - **`EPOLLEXCLUSIVE`**：一个边沿只报告给一个 epoll。等待者不自己等独占关注的文件，登记在这个文件的独占门上，由定时器线程替它们看，只叫醒排在最前面的一个。
-- **信号驱动的 I/O**（`O_ASYNC`、`F_SETOWN`、`F_SETSIG`）：由定时器线程检查（§6），与 `EPOLLET` 用同一个数据代数。
+- **信号驱动的 I/O**（`O_ASYNC`、`F_SETOWN`、`F_SETSIG`）：由定时器线程检查（[kernel/process 的 map](../../.claude/maps/kernel/process.md)），与 `EPOLLET` 用同一个数据代数。

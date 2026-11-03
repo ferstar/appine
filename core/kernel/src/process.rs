@@ -1,4 +1,4 @@
-//! guest 进程（线程组）（设计文档 §6）。宿主启动的进程都是内置 init（pid 1）的子进程
+//! guest 进程（线程组）（kernel/process 的 map）。宿主启动的进程都是内置 init（pid 1）的子进程
 //! （[`crate::Machine`]）。
 
 use std::fmt;

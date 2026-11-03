@@ -230,7 +230,7 @@ class MachineTest {
     }
 
     /**
-     * 按 inittab 开机、关机（设计文档 §6、§11.2）：开机之后 once 的命令在跑，guest 的
+     * 按 inittab 开机、关机（kernel/process 的 map、设计文档 §11.2）：开机之后 once 的命令在跑，guest 的
      * `poweroff` 是关机的请求，[Native.shutdown] 运行关机的命令、结束所有进程、释放句柄。
      * 启动之前写好只有回环接口的 /etc/network/interfaces。
      */

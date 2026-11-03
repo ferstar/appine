@@ -1,4 +1,4 @@
-//! ELF 加载器（设计文档 §6.1）。
+//! ELF 加载器（kernel/process 的 map）。
 //!
 //! 支持静态链接（`ET_EXEC`）和位置无关（`ET_DYN`）的 aarch64 程序。带
 //! `PT_INTERP` 的程序同时加载解释器（Alpine 上是 `ld-musl`），从解释器的入口

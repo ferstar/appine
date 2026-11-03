@@ -11,7 +11,7 @@
 3. [总体架构](#3-总体架构)
 4. CPU 引擎，已迁到 [engine 的 map](../../.claude/maps/engine.md)（英文）
 5. 内存：轻量用户态 soft-MMU，已迁到 [kernel/mm 的 map](../../.claude/maps/kernel/mm.md)（英文）
-6. [进程、线程与调度](06-process.md)
+6. 进程、线程与调度，已迁到 [kernel/process 的 map](../../.claude/maps/kernel/process.md)（英文）
 7. [信号与 ABI](07-signals.md)
 8. [文件系统](08-filesystem.md)
 9. [TTY 与终端](09-tty.md)
@@ -42,7 +42,7 @@
 | C 难缠的运行时 | Go 静态二进制、node/V8、JVM | **行为正确，不要求快** |
 | D 不承诺 | 容器、init 系统、内核模块、X11/GUI | — |
 
-A–C 都已达到。D 档里 podman、docker（§6 的 namespace、§10）和 OpenRC（§6 的 PID 1）实际能用；systemd、内核模块、GUI 不做。strace、gdb 可以用（§7.6）。
+A–C 都已达到。D 档里 podman、docker（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 namespace、§10）和 OpenRC（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 PID 1）实际能用；systemd、内核模块、GUI 不做。strace、gdb 可以用（§7.6）。
 
 发行版默认是 Alpine，设置里可以换成 Debian 13（§11.4）。glibc 的程序（manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK）不用改内核层就能运行。
 

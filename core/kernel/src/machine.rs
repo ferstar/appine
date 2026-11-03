@@ -1,4 +1,4 @@
-//! 宿主眼中的 guest 内核（设计文档 §6、§11.2）。
+//! 宿主眼中的 guest 内核（kernel/process 的 map、设计文档 §11.2）。
 //!
 //! [`Machine`] 持有一个内核实例：可以先后启动多个进程（[`Machine::spawn`]），每个进程
 //! 可以有自己的控制台（宿主持有主设备的进程内 PTY，[`Machine::open_console`]）。Android

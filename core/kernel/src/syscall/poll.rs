@@ -2,7 +2,7 @@
 //!
 //! 三者共用 [`wait_ready`]：先检查进程内对象（管道、PTY、eventfd……）的就绪状态，
 //! 宿主 fd（宿主 socket、宿主 stdio）用一次不等待的宿主 poll 检查；都没有就绪时，
-//! 把宿主 fd 和自己的唤醒事件放在一起等（§6 的统一等待机制）。epoll 在进程内实现，
+//! 把宿主 fd 和自己的唤醒事件放在一起等（kernel/process 的 map 里的统一等待机制）。epoll 在进程内实现，
 //! 默认水平触发。
 //!
 //! `EPOLLET`：Linux 每次唤醒文件的等待队列（来了数据、新的连接、eventfd 被写、timerfd
@@ -29,7 +29,7 @@
 //! 而是排在它的独占门上（[`ExGate`]），新的边沿只叫醒排在最前面的一个。
 //!
 //! 等待时登记关注的进程内对象（[`wake_objects`]）：只影响别的对象的修改（另一个管道的
-//! 读写、别的 eventfd、别的 AF_UNIX 连接……）不叫醒它（§6）。
+//! 读写、别的 eventfd、别的 AF_UNIX 连接……）不叫醒它（kernel/process 的 map）。
 
 use std::cell::Cell;
 use std::rc::{Rc, Weak};

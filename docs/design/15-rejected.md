@@ -19,4 +19,4 @@
 | 处处假装 root（proot `-0` 式） | postgres、测试集、sshd 权限分离等场景会出问题 |
 | 全部用 C 实现 | 内核层是代码量的大头，内存安全的收益最大 |
 | 实现 io_uring | 用的人很少：Android 用 seccomp 不让 App 使用 io_uring，手机上的程序本来就要有退路；Go、Java、Python、Rust 标准库、tokio 都不用，Node.js 的 libuv 从 1.48 起默认不用。只做一部分比 ENOSYS 更危险：程序探测到能用就不走退路了。它还要求内核的等待机制多一种"不等待"模式，以后每个 syscall 都要考虑它 |
-| 把持 BKL 的部分交给专门的线程（协程、事件循环） | 只是换一种方式串行，不争用时每个系统调用多一次跨线程的往返（§6） |
+| 把持 BKL 的部分交给专门的线程（协程、事件循环） | 只是换一种方式串行，不争用时每个系统调用多一次跨线程的往返（[kernel/process 的 map](../../.claude/maps/kernel/process.md)） |

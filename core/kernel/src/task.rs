@@ -1,4 +1,4 @@
-//! guest 线程（Linux 的 task）与它的运行循环（设计文档 §6）。
+//! guest 线程（Linux 的 task）与它的运行循环（kernel/process 的 map）。
 //!
 //! 每个 guest 线程对应一个宿主线程（1:1）。运行循环在不持有 BKL 的情况下执行
 //! guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL 进入内核；少数系统调用不必

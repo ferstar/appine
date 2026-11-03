@@ -12,7 +12,7 @@
 
 - 一个最小但真实的 ELF 镜像（`core/kernel/src/vdso.rs`，运行时按字节拼出），通过 `AT_SYSINFO_EHDR` 交给 guest。只有一页，导出 `LINUX_2.6.39` 版本的符号，每个进程映射一份私有拷贝（调试器可以在里面下断点）。
 - `__kernel_rt_sigreturn` **必须恰好是 `mov x8, #139; svc #0` 这两条指令**，libgcc 的 unwinder 靠逐字节匹配它们来识别信号帧。
-- 时间函数只写成 `svc` 存根，进内核之后不取 BKL（§6）。v1.x 的快速路径（未实现）：guest 代码直接读 `CNTVCT_EL0`，配合一个由我们更新的 vvar 页。
+- 时间函数只写成 `svc` 存根，进内核之后不取 BKL（[kernel/process 的 map](../../.claude/maps/kernel/process.md)）。v1.x 的快速路径（未实现）：guest 代码直接读 `CNTVCT_EL0`，配合一个由我们更新的 vvar 页。
 
 ## 7.3 投递精度
 
@@ -34,7 +34,7 @@
 - **越过 EOF 的 SIGBUS**：都事先避开了（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)），仓库的 object 文件只有 appine 自己会改。
 - **引擎的 bug**（`core/engine/src/c/guard.c`）：引擎装了 SIGSEGV、SIGBUS、SIGILL 的处理函数。引擎运行期间出了故障，处理函数 `siglongjmp` 回运行函数，由它返回 `APPINE_EXIT_HOST_FAULT`，内核层只结束这个 guest 进程（§12 第 5 条）。为此运行期间引擎不调用 malloc、不回调内核层，拿到的锁都登记下来，跳回之后释放；用过的 Tier 1 实例直接释放，翻译模板整体丢弃。App 进程里 ART 的处理函数不认领的故障才交给我们。
 - 其余的故障先往 stderr 写一行报告，再交给原来的处理函数（Android 上是 debuggerd）。
-- 打断 guest 线程不用宿主信号：kick 只是置位 pending 标志（§7.3），等待中的线程经由 eventfd 唤醒（§6）。
+- 打断 guest 线程不用宿主信号：kick 只是置位 pending 标志（§7.3），等待中的线程经由 eventfd 唤醒（[kernel/process 的 map](../../.claude/maps/kernel/process.md)）。
 
 ## 7.5 auxv 与内核版本
 
@@ -47,8 +47,8 @@
 
 照 Linux 6.1 实现，strace（含 `--seccomp-bpf`）、gdb、delve、lldb、valgrind 能用。与 Linux 不同或者 appine 自己的地方：
 
-- 被跟踪的是线程，跟踪者记的是进程：Linux 只接受跟踪者线程自己发的请求，appine 放宽到跟踪者进程里的任何线程。没有 Yama 的限制。跟踪 pid 1 是 ESRCH（内置的 init 不是 guest 进程，§6）。
-- 停在系统调用上时把寄存器存一份，跟踪者读写的是这一份，继续时写回。PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径（§6 的快速路径不走），vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
+- 被跟踪的是线程，跟踪者记的是进程：Linux 只接受跟踪者线程自己发的请求，appine 放宽到跟踪者进程里的任何线程。没有 Yama 的限制。跟踪 pid 1 是 ESRCH（内置的 init 不是 guest 进程，[kernel/process 的 map](../../.claude/maps/kernel/process.md)）。
+- 停在系统调用上时把寄存器存一份，跟踪者读写的是这一份，继续时写回。PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的快速路径不走），vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
 - regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`；没有 SVE、PAC、MTE、SME 的。
 - 单步由解释器执行一条指令（`appine_cpu_step`）。
 - 改写被跟踪进程的内存（POKETEXT、`/proc/<pid>/mem`）照 `FOLL_FORCE`：没有写权限的私有映射先复制一份再写。写过的地方作废翻译（[engine 的 map](../../.claude/maps/engine.md)），写过的映射不再算作可信的来源。

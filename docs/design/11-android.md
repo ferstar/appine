@@ -10,14 +10,14 @@
 - setuid/setgid 位在 execve 时生效（`PR_SET_NO_NEW_PRIVS` 之后、被没有 `CAP_SYS_PTRACE` 的跟踪者跟踪着时得不到新的特权），特权执行设置 `AT_SECURE`。写、截短普通文件时，没有 `CAP_FSETID` 的进程去掉它的 setuid 位和带着组执行位时的 setgid 位，chown 总是去掉（`file_remove_privs`、`chown_common`）。
 - 支持 `chroot`（每个进程记录自己的根目录）。
 - capabilities 按 capabilities(7) 的规则随用户 ID 变化：有效用户 ID 为 0 时拥有边界集内的全部能力，变成非 0 时清空有效集，三个用户 ID 都非 0 时清空允许集，文件系统能力跟着 fsuid；`capset`、`PR_CAPBSET_DROP` 可以缩小。execve 按 Linux 6.1 的 `cap_bprm_creds_from_file` 变换能力：程序文件的能力存在扩展属性 `security.capability` 里（v1、v2、v3，v3 只有 rootid 为 0 的起作用），环境能力在执行不带特权的程序时保留下来；securebits 和它们的锁与 Linux 相同。设置文件能力要 `CAP_SETFCAP`，写、截短、chown 时去掉。扩展属性的权限按 `xattr_permission` 检查：`trusted.*` 要 `CAP_SYS_ADMIN`，`user.*` 要文件的读写权限，写别的 `security.*` 要 `CAP_SYS_ADMIN`。
-- guest 自己安装 seccomp 过滤器（`core/kernel/src/seccomp.rs`）：严格模式和 cBPF 过滤器，程序的检查、动作和优先级与 Linux 6.1 相同，在系统调用的入口（PTRACE_SYSCALL 的入口停住之后）由解释器执行。过滤器属于线程，clone、fork 继承，execve 保留，可以 TSYNC；支持 `PTRACE_EVENT_SECCOMP` 和通知 fd（USER_NOTIF、ADDFD）。与 Linux 一样按编号缓存过滤器总是放行的编号（`seccomp_cache`），这些系统调用不再运行程序，照常走不持 BKL 的快速路径（§6）。
+- guest 自己安装 seccomp 过滤器（`core/kernel/src/seccomp.rs`）：严格模式和 cBPF 过滤器，程序的检查、动作和优先级与 Linux 6.1 相同，在系统调用的入口（PTRACE_SYSCALL 的入口停住之后）由解释器执行。过滤器属于线程，clone、fork 继承，execve 保留，可以 TSYNC；支持 `PTRACE_EVENT_SECCOMP` 和通知 fd（USER_NOTIF、ADDFD）。与 Linux 一样按编号缓存过滤器总是放行的编号（`seccomp_cache`），这些系统调用不再运行程序，照常走不持 BKL 的快速路径（[kernel/process 的 map](../../.claude/maps/kernel/process.md)）。
 
 ## 11.2 生命周期
 
 | 项目 | 做法 |
 |---|---|
 | 前台服务 | 只要还有终端会话或 guest 进程在运行，就保持一个**前台服务**（`TerminalService`），类型为 `specialUse`。通知栏显示"N 个会话运行中"，没有会话时是"在后台运行"，附带"全部退出"按钮。关掉最后一个标签页只关界面：服务每 2 秒看一次，没有会话、界面不在、也没有 guest 进程了才退出 |
-| 开机、关机 | 内核启动之后在单独的线程上按 `/etc/inittab` 开机（§6，Alpine 上是 OpenRC 的服务），不挡标签页。"全部退出"、guest 的 `poweroff`/`halt` 先关机，完了才停止服务，这期间通知显示"正在停止服务"；guest 的 `reboot` 关机之后启动一个新的内核、开一个新的标签页。被系统杀掉时来不及关机 |
+| 开机、关机 | 内核启动之后在单独的线程上按 `/etc/inittab` 开机（[kernel/process 的 map](../../.claude/maps/kernel/process.md)，Alpine 上是 OpenRC 的服务），不挡标签页。"全部退出"、guest 的 `poweroff`/`halt` 先关机，完了才停止服务，这期间通知显示"正在停止服务"；guest 的 `reboot` 关机之后启动一个新的内核、开一个新的标签页。被系统杀掉时来不及关机 |
 | 生命周期归属 | 所有会话和 guest 内核的生命周期都**挂在 Service 上，不挂在 Activity 上** |
 | 熄屏 | 熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启（设置页的"熄屏时保持运行"、通知上的"保持唤醒"），默认关闭。开着时内核运行期间一直持有。App 有前台服务，Doze 里这个锁照样有效、网络也不断（AOSP 只对进程状态在 `BOUND_FOREGROUND_SERVICE` 之后的 App 禁用），不申请电池优化的豁免 |
 | 内存紧张 | 丢掉可以重建的缓存：池里保留的翻译、共用的只读文件映射、dentry/inode 缓存（`Machine::trim_memory`），并提交推迟的写事务。界面停下 1 分钟之后还没回来就释放：Android 14 起有前台服务的进程连 `UI_HIDDEN` 也收不到，只能自己看 Activity 在不在。`onTrimMemory` 的 `RUNNING_LOW`、`RUNNING_CRITICAL`（Android 14 之前）和 `BACKGROUND` 以上立即释放 |

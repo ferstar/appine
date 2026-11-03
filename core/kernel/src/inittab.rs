@@ -1,4 +1,4 @@
-//! 内置 init 执行 `/etc/inittab` 的一个子集（设计文档 §6）：开机时的 `sysinit`、`boot`、
+//! 内置 init 执行 `/etc/inittab` 的一个子集（kernel/process 的 map）：开机时的 `sysinit`、`boot`、
 //! `bootwait`、`wait`、`once`，关机时的 `shutdown`（busybox 的格式）和 0、6 运行级别的
 //! `wait`、`once`（sysvinit 的格式）。Alpine 的 inittab 由这几步运行 OpenRC，Debian 的
 //! sysvinit-core 运行 `/etc/init.d/rc`。没有终端，`respawn`、`askfirst`（getty）不运行：

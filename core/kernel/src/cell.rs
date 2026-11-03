@@ -1,4 +1,4 @@
-//! 内核对象用的 `RefCell`（设计文档 §6）：与标准库的相同，调试构建和打开 `borrow-check`
+//! 内核对象用的 `RefCell`（kernel/process 的 map）：与标准库的相同，调试构建和打开 `borrow-check`
 //! 特性的构建里另外数着每个线程借着几个。
 //!
 //! 内核对象由 BKL 保护，放开 BKL（等待、[`Cx::unlocked`](crate::kernel::Cx::unlocked)）
