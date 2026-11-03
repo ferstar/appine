@@ -1,25 +1,33 @@
-//! seccomp（kernel/cred 的 map）：线程在系统调用的入口按自己的 seccomp 模式检查这个系统调用。
+//! seccomp (the kernel/cred map): at syscall entry a thread checks the syscall against its own
+//! seccomp mode.
 //!
-//! - 严格模式（`SECCOMP_MODE_STRICT`）只允许 read、write、exit、rt_sigreturn，别的系统调用
-//!   让线程以 SIGKILL 结束（Linux 的 `do_exit(SIGKILL)`，只结束这个线程）。
-//! - 过滤模式（`SECCOMP_MODE_FILTER`）在 `struct seccomp_data` 上运行线程的过滤器链里的每一个
-//!   cBPF 程序（从最新装的开始），取动作最严格的结果（[`run_filters`]）：结束进程或线程、
-//!   SIGSYS（TRAP）、返回错误码、交给跟踪者（`PTRACE_EVENT_SECCOMP`）、交给通知 fd 那头的
-//!   监管进程（USER_NOTIF）、记一笔再执行、执行。
+//! - Strict mode (`SECCOMP_MODE_STRICT`) allows only read, write, exit and rt_sigreturn; any other
+//!   syscall ends the thread with SIGKILL (Linux's `do_exit(SIGKILL)`, which ends only this
+//!   thread).
+//! - Filter mode (`SECCOMP_MODE_FILTER`) runs every cBPF program in the thread's filter chain on a
+//!   `struct seccomp_data` (newest first) and takes the result with the strictest action
+//!   ([`run_filters`]): kill the process or thread, SIGSYS (TRAP), return an error code, hand to
+//!   the tracer (`PTRACE_EVENT_SECCOMP`), hand to the supervisor at the other end of the
+//!   notification fd (USER_NOTIF), log and run, run.
 //!
-//! 与 Linux 一样，过滤器属于线程：clone、fork 继承，execve 保留，`SECCOMP_FILTER_FLAG_TSYNC`
-//! 同步给同一线程组的其他线程。fork 之后的进程共用祖先的过滤器，过滤器连成一棵树，每个
-//! 线程看到的是从自己最新的那个往上的一条链（[`Chain`]）。检查在 PTRACE_SYSCALL 的入口停住
-//! 之后（arm64 的 `syscall_trace_enter`），vDSO 里读时钟的存根不检查：Linux 上它们不进内核。
+//! As on Linux, filters belong to threads: clone and fork inherit them, execve keeps them, and
+//! `SECCOMP_FILTER_FLAG_TSYNC` syncs them to the other threads of the thread group. Processes
+//! after fork share their ancestors' filters, so filters form a tree, and each thread sees one
+//! chain going up from its own newest filter ([`Chain`]). The check comes after the PTRACE_SYSCALL
+//! entry stop (arm64's `syscall_trace_enter`); the clock-reading stubs in the vDSO are not
+//! checked: on Linux they do not enter the kernel.
 //!
-//! 程序的检查与 Linux 相同：先按 cBPF 的规则（`bpf_check_classic`），再按 seccomp 的
-//! （`seccomp_check_filter`，只能读 `seccomp_data` 里对齐的字，不能读包）。执行用一个简单
-//! 的解释器，结果与 Linux 的 JIT 相同：移位按 32 取模，除以 0 时程序返回 0。
+//! Programs are checked as on Linux: first by the cBPF rules (`bpf_check_classic`), then by
+//! seccomp's (`seccomp_check_filter`: only aligned words of `seccomp_data` may be read, no packet
+//! reads). Execution uses a simple interpreter with the same results as Linux's JIT: shifts are
+//! taken modulo 32, and division by 0 makes the program return 0.
 //!
-//! 与 Linux 一样按编号缓存（`seccomp_cache`）：装过滤器时把程序当作只知道编号和架构来模拟
-//! 一遍（[`const_allow`]），对哪些编号总是返回 ALLOW 记在位图里，与上一个过滤器的位图按位与。
-//! 这些系统调用不再运行链上的程序。线程把位图另存一份原子的（[`publish`]），不持 BKL 的
-//! 快速路径（`syscall::fast`）对这些编号照常走。
+//! As on Linux, results are cached by number (`seccomp_cache`): when a filter is installed, the
+//! program is simulated knowing only the number and the architecture ([`const_allow`]); the
+//! numbers it always returns ALLOW for are recorded in a bitmap, ANDed with the previous filter's
+//! bitmap. These syscalls no longer run the programs on the chain. Threads keep an atomic copy of
+//! the bitmap ([`publish`]), so the no-BKL fast path (`syscall::fast`) handles these numbers as
+//! usual.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -38,16 +46,18 @@ use crate::signal::{self, InfoFields, SigInfo};
 use crate::task::Task;
 use crate::uaccess::UserSlice;
 
-/// seccomp 的模式（`/proc/<pid>/status` 的 `Seccomp`、PR_GET_SECCOMP）。
+/// seccomp modes (`Seccomp` in `/proc/<pid>/status`, PR_GET_SECCOMP).
 pub(crate) mod mode {
     pub const DISABLED: u32 = 0;
     pub const STRICT: u32 = 1;
     pub const FILTER: u32 = 2;
-    /// 过滤器要求结束这个线程之后（Linux 的 `SECCOMP_MODE_DEAD`）：再进内核就以 SIGKILL 结束。
+    /// After a filter asked for this thread to be killed (Linux's `SECCOMP_MODE_DEAD`): entering
+    /// the kernel again ends it with SIGKILL.
     pub const DEAD: u32 = 3;
 }
 
-/// 过滤器的返回值：高 16 位是动作，低 16 位是附带的数据。动作按有符号数比较，越小越严格。
+/// A filter's return value: the high 16 bits are the action, the low 16 bits the attached data.
+/// Actions compare as signed numbers, and smaller is stricter.
 mod ret {
     pub const KILL_PROCESS: u32 = 0x8000_0000;
     pub const KILL_THREAD: u32 = 0;
@@ -61,11 +71,12 @@ mod ret {
     pub const DATA: u32 = 0xffff;
 }
 
-/// `SECCOMP_FILTER_FLAG_*`。
+/// `SECCOMP_FILTER_FLAG_*`.
 mod flag {
     pub const TSYNC: u32 = 1;
     pub const LOG: u32 = 2;
-    /// 不要预测执行的缓解措施（宿主上的，appine 管不了）：只检查。
+    /// Do not apply the speculative-execution mitigations (on the host, out of appine's control):
+    /// only checked.
     pub const SPEC_ALLOW: u32 = 4;
     pub const NEW_LISTENER: u32 = 8;
     pub const TSYNC_ESRCH: u32 = 16;
@@ -74,49 +85,51 @@ mod flag {
         TSYNC | LOG | SPEC_ALLOW | NEW_LISTENER | TSYNC_ESRCH | WAIT_KILLABLE_RECV;
 }
 
-/// seccomp(2) 的操作。
+/// seccomp(2) operations.
 const SET_MODE_STRICT: u32 = 0;
 const SET_MODE_FILTER: u32 = 1;
 const GET_ACTION_AVAIL: u32 = 2;
 const GET_NOTIF_SIZES: u32 = 3;
 
-/// `seccomp_data.arch`、SIGSYS 的 `si_arch`。
+/// `seccomp_data.arch` and SIGSYS's `si_arch`.
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
-/// 一个程序最多的指令数（`BPF_MAXINSNS`）。
+/// The most instructions one program may have (`BPF_MAXINSNS`).
 const MAX_INSNS: usize = 4096;
-/// 一条链上转换成 eBPF 后的指令数加上旧过滤器各 4 条的额外开销（Linux 的
-/// `MAX_INSNS_PER_PATH`）。arm64 Linux 先把 cBPF 转成 eBPF，再检查这个上限。
+/// The instruction count of a chain after conversion to eBPF, plus an overhead of 4 for each older
+/// filter (Linux's `MAX_INSNS_PER_PATH`). arm64 Linux converts cBPF to eBPF first and then checks
+/// this limit.
 const MAX_INSNS_PER_PATH: usize = (1 << 18) / 8;
-/// `struct seccomp_data` 的大小。
+/// The size of `struct seccomp_data`.
 const DATA_SIZE: usize = 64;
-/// 按编号缓存的位图覆盖多少个编号（Linux 是 arm64 的系统调用个数，这里取 512，appine 实现的
-/// 编号都在里面），以及它有几个字。
+/// How many numbers the per-number cache bitmap covers (on Linux, the number of arm64 syscalls;
+/// 512 here, which covers every number appine implements), and how many words it has.
 const CACHED_NRS: usize = 512;
 pub(crate) const CACHE_WORDS: usize = CACHED_NRS / 64;
-/// SIGSYS 的 `si_code`。
+/// SIGSYS's `si_code`.
 const SYS_SECCOMP: i32 = 1;
-/// ERRNO 的数据最大是 `MAX_ERRNO`。
+/// The data of ERRNO is at most `MAX_ERRNO`.
 const MAX_ERRNO: u32 = 4095;
-/// 严格模式允许的系统调用：read、write、exit、rt_sigreturn。
+/// Syscalls strict mode allows: read, write, exit, rt_sigreturn.
 const STRICT_ALLOWED: [u64; 4] = [63, 64, 93, 139];
-/// `seccomp_notif_resp.flags`：让系统调用照常执行。
+/// `seccomp_notif_resp.flags`: let the syscall run as usual.
 const USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 
-/// 通知 fd 的 ioctl。
+/// ioctls of the notification fd.
 const IOCTL_NOTIF_RECV: u32 = 0xc050_2100;
 const IOCTL_NOTIF_SEND: u32 = 0xc018_2101;
 const IOCTL_NOTIF_ID_VALID: u32 = 0x4008_2102;
-/// 最早定义时方向写错了的 ID_VALID，Linux 仍然认。
+/// ID_VALID as first defined, with the wrong direction; Linux still accepts it.
 const IOCTL_NOTIF_ID_VALID_WRONG_DIR: u32 = 0x8008_2102;
-/// ADDFD 的长度可以变（结构体以后可能加长），比较时去掉方向和长度。
+/// ADDFD's size can vary (the struct may grow later), so the direction and size are masked off
+/// when comparing.
 const IOCTL_NOTIF_ADDFD: u32 = 0x4018_2103;
 const IOC_DIR_SIZE_MASK: u32 = 0xc000_0000 | 0x3fff_0000;
-/// `struct seccomp_notif_addfd` 最初的长度。
+/// The original size of `struct seccomp_notif_addfd`.
 const ADDFD_SIZE_VER0: usize = 24;
 const ADDFD_FLAG_SETFD: u32 = 1;
 const ADDFD_FLAG_SEND: u32 = 2;
 
-/// cBPF 的操作码。
+/// cBPF opcodes.
 mod bpf {
     pub const LD: u16 = 0x00;
     pub const LDX: u16 = 0x01;
@@ -158,20 +171,21 @@ mod bpf {
 
     pub const K: u16 = 0x00;
     pub const X: u16 = 0x08;
-    /// `BPF_RET | BPF_A`。
+    /// `BPF_RET | BPF_A`.
     pub const A: u16 = 0x10;
 
     pub const TAX: u16 = 0x00;
     pub const TXA: u16 = 0x80;
 
-    /// 草稿内存的格数。
+    /// Number of scratch memory slots.
     pub const MEMWORDS: u32 = 16;
 
-    /// seccomp 把读 `seccomp_data` 的 `LD | W | ABS` 改写成的操作码（Linux 也这样借用它）。
+    /// The opcode seccomp rewrites `LD | W | ABS` reads of `seccomp_data` into (Linux borrows it
+    /// the same way).
     pub const LOAD_DATA: u16 = LDX | W | ABS;
 }
 
-/// 一条 cBPF 指令（`struct sock_filter`）。
+/// One cBPF instruction (`struct sock_filter`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Insn {
     code: u16,
@@ -191,7 +205,7 @@ impl Insn {
     }
 }
 
-/// cBPF 认得的操作码（Linux 的 `chk_code_allowed`）。
+/// Opcodes cBPF recognizes (Linux's `chk_code_allowed`).
 fn classic_code(code: u16) -> bool {
     use bpf::*;
     matches!(
@@ -233,14 +247,15 @@ fn classic_code(code: u16) -> bool {
         || conditional(code)
 }
 
-/// 条件跳转。
+/// Conditional jumps.
 fn conditional(code: u16) -> bool {
     use bpf::*;
     code & 0x07 == JMP && code & 0xf0 != JA && code & 0xf0 <= JSET
 }
 
-/// 按 cBPF 的规则检查程序（Linux 的 `bpf_check_classic`）：操作码认得，除以常数 0、移位
-/// 超过 31、草稿内存越界、跳出程序都不行，最后一条是返回，草稿内存先写后读。
+/// Checks a program by the cBPF rules (Linux's `bpf_check_classic`): opcodes are recognized;
+/// division by constant 0, shifts beyond 31, out-of-bounds scratch memory and jumps out of the
+/// program are refused; the last instruction is a return; scratch memory is written before read.
 fn check_classic(prog: &[Insn]) -> Result<(), Errno> {
     use bpf::*;
     let n = prog.len();
@@ -266,8 +281,9 @@ fn check_classic(prog: &[Insn]) -> Result<(), Errno> {
     check_load_and_stores(prog)
 }
 
-/// 草稿内存在每条路径上都先写后读（Linux 的 `check_load_and_stores`）：跳转把到达时已经
-/// 写过的格子传给目标，跳转之后的下一条只能从别处跳来。
+/// Scratch memory is written before it is read on every path (Linux's `check_load_and_stores`):
+/// a jump passes the slots already written on arrival to its target, and the instruction after a
+/// jump can only be reached by jumping from elsewhere.
 fn check_load_and_stores(prog: &[Insn]) -> Result<(), Errno> {
     use bpf::*;
     let mut masks = vec![u16::MAX; prog.len()];
@@ -296,8 +312,9 @@ fn check_load_and_stores(prog: &[Insn]) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 按 seccomp 的规则检查并改写程序（Linux 的 `seccomp_check_filter`）：读数据只能读
-/// `seccomp_data` 里按 4 字节对齐的字，读长度变成常数 64，别的读包的指令和取模不行。
+/// Checks and rewrites a program by seccomp's rules (Linux's `seccomp_check_filter`): data reads
+/// may only read 4-byte-aligned words of `seccomp_data`, length reads become the constant 64, and
+/// other packet-reading instructions and modulo are refused.
 fn check_seccomp(prog: &mut [Insn]) -> Result<(), Errno> {
     use bpf::*;
     for i in prog {
@@ -316,25 +333,26 @@ fn check_seccomp(prog: &mut [Insn]) -> Result<(), Errno> {
                 i.code = LDX | IMM;
                 i.k = DATA_SIZE as u32;
             }
-            0x06 | 0x16 // RET K、RET A
-            | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c // ADD、SUB、MUL、DIV
-            | 0x54 | 0x5c | 0x44 | 0x4c | 0xa4 | 0xac // AND、OR、XOR
-            | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 // LSH、RSH、NEG
-            | 0x00 | 0x01 // LD IMM、LDX IMM
-            | 0x07 | 0x87 // TAX、TXA
-            | 0x60 | 0x61 | 0x02 | 0x03 // LD MEM、LDX MEM、ST、STX
-            | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d | 0x25 | 0x2d | 0x45 | 0x4d => {} // 跳转
+            0x06 | 0x16 // RET K, RET A
+            | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c // ADD, SUB, MUL, DIV
+            | 0x54 | 0x5c | 0x44 | 0x4c | 0xa4 | 0xac // AND, OR, XOR
+            | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 // LSH, RSH, NEG
+            | 0x00 | 0x01 // LD IMM, LDX IMM
+            | 0x07 | 0x87 // TAX, TXA
+            | 0x60 | 0x61 | 0x02 | 0x03 // LD MEM, LDX MEM, ST, STX
+            | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d | 0x25 | 0x2d | 0x45 | 0x4d => {} // jumps
             _ => return Err(Errno::EINVAL),
         }
     }
     Ok(())
 }
 
-/// Linux `bpf_convert_filter` 转换后的长度，用于过滤器链的容量检查。这里仍解释执行
-/// cBPF，只计转换后的长度；seccomp 已排除了包访问和取模指令。
+/// The length after Linux's `bpf_convert_filter`, used for the filter chain's capacity check.
+/// cBPF is still interpreted here, and only the converted length is counted; seccomp has already
+/// excluded packet access and modulo instructions.
 fn converted_len(prog: &[Insn]) -> usize {
     use bpf::*;
-    // 清零 A、X 并保存上下文指针。
+    // Clear A and X and save the context pointer.
     3 + prog
         .iter()
         .map(|i| match i.code {
@@ -350,7 +368,7 @@ fn converted_len(prog: &[Insn]) -> usize {
         .sum::<usize>()
 }
 
-/// 在 `data`（`struct seccomp_data`）上运行检查过的程序，返回它的返回值。
+/// Runs a checked program on `data` (a `struct seccomp_data`) and returns its return value.
 fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
     use bpf::*;
     let (mut a, mut x) = (0u32, 0u32);
@@ -380,7 +398,7 @@ fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
                 ADD => a = a.wrapping_add(src),
                 SUB => a = a.wrapping_sub(src),
                 MUL => a = a.wrapping_mul(src),
-                // 除以 0（只可能是 X）时 cBPF 程序返回 0
+                // On division by 0 (only possible with X) a cBPF program returns 0
                 DIV if src == 0 => return 0,
                 DIV => a /= src,
                 OR => a |= src,
@@ -389,7 +407,7 @@ fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
                 LSH => a = a.wrapping_shl(src),
                 RSH => a = a.wrapping_shr(src),
                 NEG => a = a.wrapping_neg(),
-                _ => unreachable!("取模过不了检查"),
+                _ => unreachable!("modulo cannot pass the checks"),
             },
             c => {
                 let taken = match c & 0xf0 {
@@ -404,9 +422,11 @@ fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
     }
 }
 
-/// 只知道编号 `nr` 和架构时，程序是不是一定返回 ALLOW（Linux 的 `seccomp_is_const_allow`）：
-/// 只读编号和架构，只有与常数比较的跳转、无条件跳转和与常数按位与。读别的数据、用别的指令的
-/// 都不算，返回值要正好是 ALLOW（带数据的不算）。
+/// Whether the program always returns ALLOW when only the number `nr` and the architecture are
+/// known (Linux's `seccomp_is_const_allow`): it may read only the number and the architecture and
+/// use only jumps comparing with constants, unconditional jumps and ANDs with constants. Reading
+/// other data or using other instructions does not count, and the return value must be exactly
+/// ALLOW (with data it does not count).
 fn const_allow(prog: &[Insn], nr: u32) -> bool {
     use bpf::*;
     let mut a = 0u32;
@@ -437,8 +457,9 @@ fn const_allow(prog: &[Insn], nr: u32) -> bool {
     false
 }
 
-/// 新过滤器的位图（Linux 的 `seccomp_cache_prepare_bitmap`）：上一个过滤器的位图里有（没有
-/// 上一个时是所有编号）、这个程序也总是返回 ALLOW 的编号。
+/// The bitmap of a new filter (Linux's `seccomp_cache_prepare_bitmap`): the numbers in the
+/// previous filter's bitmap (every number when there is none) that this program also always
+/// returns ALLOW for.
 fn cache(prog: &[Insn], prev: Option<&[u64; CACHE_WORDS]>) -> [u64; CACHE_WORDS] {
     let mut allow = prev.copied().unwrap_or([u64::MAX; CACHE_WORDS]);
     for nr in 0..CACHED_NRS {
@@ -450,12 +471,13 @@ fn cache(prog: &[Insn], prev: Option<&[u64; CACHE_WORDS]>) -> [u64; CACHE_WORDS]
     allow
 }
 
-/// 位图（每个字由 `word` 给出）里有没有编号 `nr`。
+/// Whether number `nr` is in the bitmap (each word given by `word`).
 fn cached(word: impl Fn(usize) -> u64, nr: u64) -> bool {
     nr < CACHED_NRS as u64 && word(nr as usize / 64) >> (nr % 64) & 1 != 0
 }
 
-/// `struct seccomp_data`：编号、架构、svc 之后的 pc 和六个参数（第一个是原来的 x0）。
+/// `struct seccomp_data`: the number, the architecture, the pc after svc and the six arguments
+/// (the first is the original x0).
 fn seccomp_data(nr: i32, pc: u64, args: [u64; 6]) -> [u8; DATA_SIZE] {
     let mut d = [0u8; DATA_SIZE];
     d[..4].copy_from_slice(&nr.to_le_bytes());
@@ -467,52 +489,55 @@ fn seccomp_data(nr: i32, pc: u64, args: [u64; 6]) -> [u8; DATA_SIZE] {
     d
 }
 
-/// 一个装好的过滤器（Linux 的 `struct seccomp_filter`），装好之后不再变（通知 fd 那一头
-/// 和用户数除外）。
+/// An installed filter (Linux's `struct seccomp_filter`), unchanged once installed (except for the
+/// notification fd's end and the user count).
 pub(crate) struct Filter {
-    /// 检查、改写过的程序。
+    /// The checked and rewritten program.
     prog: Box<[Insn]>,
-    /// Linux 转换成 eBPF 后的长度（链容量计数用）。
+    /// The length after Linux's conversion to eBPF (for counting chain capacity).
     converted_len: usize,
-    /// 按编号缓存（Linux 的 `seccomp_cache`）：这条链（这个过滤器和它往上的）对哪些编号总是
-    /// 返回 ALLOW（[`cache`]）。
+    /// Per-number cache (Linux's `seccomp_cache`): the numbers this chain (this filter and those
+    /// above it) always returns ALLOW for ([`cache`]).
     allow: [u64; CACHE_WORDS],
-    /// 原样的程序（PTRACE_SECCOMP_GET_FILTER 读的）。
+    /// The program as given (what PTRACE_SECCOMP_GET_FILTER reads).
     orig: Box<[u8]>,
-    /// `SECCOMP_FILTER_FLAG_LOG`：除了 ALLOW 以外的动作都记一笔。
+    /// `SECCOMP_FILTER_FLAG_LOG`: log every action except ALLOW.
     log: bool,
-    /// `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`：通知被取走之后，等回答时只被致命信号打断。
+    /// `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`: after the notification is received, waiting for
+    /// the answer is interrupted only by fatal signals.
     wait_killable_recv: bool,
-    /// 装它时线程原来的过滤器。
+    /// The thread's previous filter when this one was installed.
     prev: Option<Rc<Filter>>,
-    /// 直接用着它的线程，加上以它为 `prev` 的、还有用户的过滤器（Linux 的 `users`）：降到 0
-    /// 之后通知 fd 报告 POLLHUP。
+    /// The threads using it directly, plus the filters with it as `prev` that still have users
+    /// (Linux's `users`): once this drops to 0, the notification fd reports POLLHUP.
     users: Cell<usize>,
-    /// `SECCOMP_FILTER_FLAG_NEW_LISTENER` 时通知 fd 那一头的状态；没有通知 fd、或者它关闭了
-    /// 时是 None，这时 USER_NOTIF 的系统调用返回 ENOSYS。
+    /// The state of the notification fd's end with `SECCOMP_FILTER_FLAG_NEW_LISTENER`; None when
+    /// there is no notification fd or it was closed, and then USER_NOTIF syscalls return ENOSYS.
     notif: RefCell<Option<Notif>>,
 }
 
 impl Filter {
-    /// 通知 fd 的唤醒对象：来了通知、通知被取走、没有用户了。
+    /// The wake object of the notification fd: a notification arrives, a notification is
+    /// received, no users are left.
     fn object(&self) -> wake::Object {
         wake::of(&self.notif)
     }
 
-    /// 这条链对编号 `nr` 总是返回 ALLOW。
+    /// This chain always returns ALLOW for number `nr`.
     fn always_allows(&self, nr: u64) -> bool {
         cached(|i| self.allow[i], nr)
     }
 
-    /// 从自己往上的一条链。
+    /// The chain going up from this filter.
     fn chain(&self) -> impl Iterator<Item = &Filter> {
         std::iter::successors(Some(self), |f| f.prev.as_deref())
     }
 }
 
-/// 线程用着的过滤器链，[`Chain::filter`] 是最新装的那个。持有它算作那个过滤器的一个用户：
-/// 复制时加一，丢掉时减一，减到 0 的过滤器不再是它的 `prev` 的用户，依次往上（Linux 的
-/// `__seccomp_filter_orphan`）。
+/// The filter chain a thread uses; [`Chain::filter`] is the newest one installed. Holding it
+/// counts as one user of that filter: copying adds one, dropping subtracts one, and a filter that
+/// drops to 0 is no longer a user of its `prev`, and so on upwards (Linux's
+/// `__seccomp_filter_orphan`).
 pub(crate) struct Chain(Option<Rc<Filter>>);
 
 impl Chain {
@@ -522,7 +547,8 @@ impl Chain {
             .expect("a chain holds a filter until it is dropped")
     }
 
-    /// 交出过滤器，不减它的用户数：它成为新过滤器的 `prev`，这个用户转给了新过滤器。
+    /// Hands over the filter without decreasing its user count: it becomes the new filter's
+    /// `prev`, and this user is transferred to the new filter.
     fn into_filter(mut self) -> Rc<Filter> {
         self.0
             .take()
@@ -557,17 +583,18 @@ impl Drop for Chain {
     }
 }
 
-/// 线程的 seccomp 状态（[`Task::seccomp`]），只在持有 BKL 时访问。clone、fork 时复制。
+/// A thread's seccomp state ([`Task::seccomp`]), accessed only while holding the BKL. Copied on
+/// clone and fork.
 #[derive(Clone, Default)]
 pub(crate) struct Seccomp {
-    /// [`mode`]。
+    /// [`mode`].
     pub mode: u32,
-    /// 过滤模式时的过滤器链。
+    /// The filter chain in filter mode.
     chain: Option<Chain>,
 }
 
 impl Seccomp {
-    /// 链上的过滤器个数（`/proc/<pid>/status` 的 `Seccomp_filters`）。
+    /// The number of filters on the chain (`Seccomp_filters` in `/proc/<pid>/status`).
     pub fn filters(&self) -> usize {
         self.chain
             .as_ref()
@@ -575,34 +602,37 @@ impl Seccomp {
     }
 }
 
-/// 通知 fd 那一头（Linux 的 `struct notification`）。
+/// The notification fd's end (Linux's `struct notification`).
 struct Notif {
     next_id: u64,
-    /// 还没被 RECV 取走的通知个数（Linux 的信号量）。发通知的线程被打断、拿掉了自己的
-    /// 通知时不减，下一次 RECV 因此可能是 ENOENT，与 Linux 相同。
+    /// The number of notifications not yet taken by RECV (Linux's semaphore). It is not decreased
+    /// when a sending thread is interrupted and withdraws its notification, so the next RECV may
+    /// be ENOENT, as on Linux.
     requests: u64,
-    /// 正在等回答的通知，按先后。
+    /// Notifications waiting for an answer, in order.
     list: Vec<Rc<RefCell<Knotif>>>,
-    /// 读、写两个方向来过几次事件（`EPOLLET` 的数据代数）：新通知和没有用户了算读的
-    /// 方向，通知被取走算写的方向。
+    /// How many events have arrived in the read and write directions (the data generation for
+    /// `EPOLLET`): new notifications and running out of users count for reading, a notification
+    /// being received counts for writing.
     arrivals: [u64; 2],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// 还没被 RECV 取走。
+    /// Not yet taken by RECV.
     Init,
-    /// 取走了，等回答。
+    /// Received, waiting for the answer.
     Sent,
-    /// 回答了（或者通知 fd 关闭了）。
+    /// Answered (or the notification fd was closed).
     Replied,
 }
 
-/// 一个通知（Linux 的 `struct seccomp_knotif`）：发出它的线程等着它被回答。
+/// One notification (Linux's `struct seccomp_knotif`): the thread that sent it waits for it to be
+/// answered.
 struct Knotif {
     id: u64,
     tid: Tid,
-    /// 发出它的线程的事件：回答时叫醒它。
+    /// The sending thread's event: woken when answered.
     event: Arc<Event>,
     state: State,
     data: [u8; DATA_SIZE],
@@ -611,13 +641,14 @@ struct Knotif {
     flags: u32,
 }
 
-/// 通知 fd 的打开文件里的东西（[`FileKind::SeccompNotify`]）：最后一个引用关闭时，等着
-/// 回答的通知都得到 ENOSYS，之后 USER_NOTIF 的系统调用也是 ENOSYS（Linux 的
-/// `seccomp_notify_detach`）。
+/// What the notification fd's open file holds ([`FileKind::SeccompNotify`]): when the last
+/// reference is closed, the notifications waiting for answers all get ENOSYS, and later
+/// USER_NOTIF syscalls are ENOSYS too (Linux's `seccomp_notify_detach`).
 pub(crate) struct Listener(Rc<Filter>);
 
 impl Listener {
-    /// 通知所属的过滤器。ioctl 拿它的 Rc，等通知时不借着打开文件（`syscall::fs::ioctl`）。
+    /// The filter the notifications belong to. ioctl takes its Rc, so waiting for notifications
+    /// does not borrow the open file (`syscall::fs::ioctl`).
     pub(crate) fn filter(&self) -> Rc<Filter> {
         self.0.clone()
     }
@@ -641,9 +672,10 @@ impl Drop for Listener {
 }
 
 impl Listener {
-    /// 就绪的事件：有没取走的通知可读，有取走了等回答的可写，没有用户了是 POLLHUP。
+    /// Ready events: readable when a notification is waiting to be received, writable when one
+    /// received is waiting for an answer, POLLHUP when no users are left.
     pub fn readiness(&self) -> i16 {
-        // poll(2) 的事件位
+        // poll(2) event bits
         const POLLIN: i16 = 0x001;
         const POLLOUT: i16 = 0x004;
         const POLLHUP: i16 = 0x010;
@@ -665,7 +697,7 @@ impl Listener {
         ev
     }
 
-    /// 读、写两个方向来过几次事件（[`Notif::arrivals`]）。
+    /// How many events have arrived in the read and write directions ([`Notif::arrivals`]).
     pub fn arrivals(&self) -> [u64; 2] {
         self.0
             .notif
@@ -674,30 +706,31 @@ impl Listener {
             .map_or([0, 0], |n| n.arrivals)
     }
 
-    /// 唤醒对象（[`Filter::object`]）。
+    /// The wake object ([`Filter::object`]).
     pub fn object(&self) -> wake::Object {
         self.0.object()
     }
 }
 
-/// 系统调用入口的检查结果。
+/// The result of the check at syscall entry.
 pub(crate) enum Verdict {
-    /// 照常执行编号是这个的系统调用（跟踪者可能改了编号）。
+    /// Run the syscall with this number as usual (the tracer may have changed the number).
     Run(u64),
-    /// 不执行，x0 已经是返回值（或者已经挂起了 SIGSYS）。
+    /// Do not run it; x0 already holds the return value (or SIGSYS is already pending).
     Skip,
-    /// 线程结束了。
+    /// The thread has exited.
     Exit,
 }
 
-/// 系统调用的入口（在 PTRACE_SYSCALL 的入口停住之后）：按线程的 seccomp 模式检查编号
-/// 为 `nr` 的系统调用。
+/// Syscall entry (after the PTRACE_SYSCALL entry stop): checks syscall number `nr` against the
+/// thread's seccomp mode.
 pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
     let (mode, top) = {
         let s = cx.task.seccomp.borrow();
         (s.mode, s.chain.as_ref().map(|c| c.filter().clone()))
     };
-    // PTRACE_O_SUSPEND_SECCOMP（checkpoint/restore 用）；vDSO 里读时钟的存根在 Linux 上不进内核
+    // PTRACE_O_SUSPEND_SECCOMP (used by checkpoint/restore); the clock-reading stubs in the vDSO
+    // do not enter the kernel on Linux
     let suspended = {
         let t = cx.task.trace.borrow();
         t.tracer.is_some() && t.options & crate::ptrace::opt::SUSPEND_SECCOMP != 0
@@ -714,12 +747,13 @@ pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
             publish(cx.task);
             exit_thread(cx, cpu, Signal::KILL)
         }
-        // 已经被要求结束的线程又进了内核（Linux 也不应该走到这里）
+        // A thread already told to die entered the kernel again (Linux should not get here
+        // either)
         _ => exit_thread(cx, cpu, Signal::KILL),
     }
 }
 
-/// 只结束这个线程，结束方式是被信号 `sig` 终止（Linux 的 `do_exit(sig)`）。
+/// Ends only this thread, as if terminated by signal `sig` (Linux's `do_exit(sig)`).
 fn exit_thread(cx: &mut Cx<'_>, cpu: &mut Cpu, sig: Signal) -> Verdict {
     let status = ExitStatus::Signaled {
         signal: sig,
@@ -735,7 +769,7 @@ fn exit_thread(cx: &mut Cx<'_>, cpu: &mut Cpu, sig: Signal) -> Verdict {
     Verdict::Exit
 }
 
-/// SIGSYS 的 siginfo：`si_errno` 是过滤器给的数据，`si_call_addr` 是 svc 之后的 pc。
+/// SIGSYS's siginfo: `si_errno` is the data the filter gave, `si_call_addr` the pc after svc.
 fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
     SigInfo {
         code: SYS_SECCOMP,
@@ -749,10 +783,12 @@ fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
     }
 }
 
-/// 过滤模式：在链上运行过滤器，执行结果的动作（Linux 的 `__seccomp_filter`）。`recheck`
-/// 是跟踪者处理过 TRACE 之后的重新检查：这次 TRACE 当作允许。
+/// Filter mode: runs the filters on the chain and carries out the resulting action (Linux's
+/// `__seccomp_filter`). `recheck` is the re-check after the tracer has handled TRACE: this time
+/// TRACE counts as allow.
 fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bool) -> Verdict {
-    // 缓存说总是 ALLOW 的不运行程序（Linux 的 seccomp_cache_check_allow）
+    // Numbers the cache says are always ALLOW do not run the programs (Linux's
+    // seccomp_cache_check_allow)
     if top.always_allows(nr) {
         return Verdict::Run(nr);
     }
@@ -763,7 +799,7 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
     };
     let (r, matched) = run_filters(top, &data);
     let (action, value) = (r & ret::ACTION_FULL, r & ret::DATA);
-    // 不执行这个系统调用：过滤器设了 SECCOMP_FILTER_FLAG_LOG 的才记
+    // The syscall is not run: logged only when the filter set SECCOMP_FILTER_FLAG_LOG
     let requested = matched.as_ref().is_some_and(|m| m.log);
     let skip = |cx: &Cx<'_>| {
         log(cx, nr, 0, action, requested);
@@ -775,7 +811,7 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
             skip(cx)
         }
         ret::TRAP => {
-            // 处理函数看到的是原来的寄存器
+            // The handler sees the original registers
             cpu.state_mut().x[0] = cpu.state().orig_x0;
             signal::force(cx, Signal::SYS, sigsys(cpu, nr, value));
             skip(cx)
@@ -791,7 +827,7 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
                 cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
                 return skip(cx);
             }
-            // 跟踪者可以改编号（-1 是跳过）和参数，之后重新检查
+            // The tracer may change the number (-1 skips) and the arguments; check again after
             let Some(nr) = crate::ptrace::seccomp_stop(cx, cpu, nr, value) else {
                 return Verdict::Exit;
             };
@@ -810,8 +846,9 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
             Verdict::Run(nr)
         }
         ret::ALLOW => Verdict::Run(nr),
-        // KILL_PROCESS、KILL_THREAD 和不认得的动作：结束。只剩这一个线程时与结束进程一样，
-        // 投递不能处理、不能被跟踪者拦下的 SIGSYS，写 core
+        // KILL_PROCESS, KILL_THREAD and unknown actions: terminate. With only this thread left it
+        // is the same as killing the process: deliver a SIGSYS that cannot be handled or stopped
+        // by a tracer, and write a core
         _ => {
             log(cx, nr, Signal::SYS.number(), action, true);
             cx.task.seccomp.borrow_mut().mode = mode::DEAD;
@@ -827,8 +864,9 @@ fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bo
     }
 }
 
-/// 运行链上的每一个过滤器，取动作最严格的（按有符号数最小的，同样严格时取最新的）结果，
-/// 以及给出它的过滤器（Linux 的 `seccomp_run_filters`）。
+/// Runs every filter on the chain and takes the result with the strictest action (the smallest
+/// as a signed number, the newest among equally strict ones), along with the filter that gave it
+/// (Linux's `seccomp_run_filters`).
 fn run_filters(top: &Rc<Filter>, data: &[u8; DATA_SIZE]) -> (u32, Option<Rc<Filter>>) {
     let action = |r: u32| (r & ret::ACTION_FULL) as i32;
     let mut best = (ret::ALLOW, None);
@@ -843,9 +881,10 @@ fn run_filters(top: &Rc<Filter>, data: &[u8; DATA_SIZE]) -> (u32, Option<Rc<Filt
     best
 }
 
-/// USER_NOTIF：给通知 fd 那头发一个通知，等它回答（Linux 的 `seccomp_do_user_notification`）。
-/// 没有通知 fd 时返回 ENOSYS。被信号打断时返回 ERESTARTSYS，重新执行时再发一个新的通知；
-/// 设了 `WAIT_KILLABLE_RECV` 的，通知被取走之后只被致命信号打断。
+/// USER_NOTIF: sends a notification to the notification fd's end and waits for its answer
+/// (Linux's `seccomp_do_user_notification`). Returns ENOSYS without a notification fd. Returns
+/// ERESTARTSYS when interrupted by a signal, and sends a new notification when restarted; with
+/// `WAIT_KILLABLE_RECV`, once the notification is received only fatal signals interrupt.
 fn notify(
     cx: &mut Cx<'_>,
     cpu: &mut Cpu,
@@ -913,8 +952,9 @@ fn notify(
     }
 }
 
-/// 记一笔（Linux 发 audit 记录，这里写调试日志）：结束、LOG 总记，TRAP、ERRNO、TRACE、
-/// USER_NOTIF 只在过滤器设了 `SECCOMP_FILTER_FLAG_LOG` 时记，都要在 `actions_logged` 里。
+/// Logs (Linux emits an audit record, here the debug log is written): kills and LOG are always
+/// logged, TRAP, ERRNO, TRACE and USER_NOTIF only when the filter set `SECCOMP_FILTER_FLAG_LOG`,
+/// and all of them must be in `actions_logged`.
 fn log(cx: &Cx<'_>, nr: u64, sig: i32, action: u32, requested: bool) {
     let (bit, always) = match action {
         ret::ALLOW => return,
@@ -935,7 +975,7 @@ fn log(cx: &Cx<'_>, nr: u64, sig: i32, action: u32, requested: bool) {
     }
 }
 
-/// `/proc/sys/kernel/seccomp/actions_logged` 的位（Linux 的 `SECCOMP_LOG_*`）。
+/// Bits of `/proc/sys/kernel/seccomp/actions_logged` (Linux's `SECCOMP_LOG_*`).
 pub(crate) mod logged {
     pub const KILL_PROCESS: u32 = 1;
     pub const KILL_THREAD: u32 = 2;
@@ -945,11 +985,11 @@ pub(crate) mod logged {
     pub const LOG: u32 = 32;
     pub const ALLOW: u32 = 64;
     pub const USER_NOTIF: u32 = 128;
-    /// 默认记除了 ALLOW 以外的所有动作。
+    /// By default every action except ALLOW is logged.
     pub const DEFAULT: u32 = KILL_PROCESS | KILL_THREAD | TRAP | ERRNO | USER_NOTIF | TRACE | LOG;
 }
 
-/// 动作的名字，按 `actions_avail` 的顺序。
+/// Action names, in `actions_avail` order.
 const NAMES: [(&str, u32); 8] = [
     ("kill_process", logged::KILL_PROCESS),
     ("kill_thread", logged::KILL_THREAD),
@@ -961,13 +1001,13 @@ const NAMES: [(&str, u32); 8] = [
     ("allow", logged::ALLOW),
 ];
 
-/// `/proc/sys/kernel/seccomp/actions_avail`。
+/// `/proc/sys/kernel/seccomp/actions_avail`.
 pub(crate) fn actions_avail() -> String {
     let names: Vec<_> = NAMES.iter().map(|(n, _)| *n).collect();
     format!("{}\n", names.join(" "))
 }
 
-/// `/proc/sys/kernel/seccomp/actions_logged`。
+/// `/proc/sys/kernel/seccomp/actions_logged`.
 pub(crate) fn actions_logged(k: &Kernel) -> String {
     let names: Vec<_> = NAMES
         .iter()
@@ -977,8 +1017,8 @@ pub(crate) fn actions_logged(k: &Kernel) -> String {
     format!("{}\n", names.join(" "))
 }
 
-/// 写 `actions_logged`：空格分开的名字（读到换行或者空的名字为止），不能有 allow，要求
-/// `CAP_SYS_ADMIN`（Linux 的 `write_actions_logged`）。
+/// Writes `actions_logged`: space-separated names (up to a newline or an empty name), allow is
+/// not permitted, and `CAP_SYS_ADMIN` is required (Linux's `write_actions_logged`).
 pub(crate) fn set_actions_logged(
     k: &mut Kernel,
     cred: &crate::cred::Cred,
@@ -1006,7 +1046,7 @@ pub(crate) fn set_actions_logged(
     Ok(())
 }
 
-/// seccomp(2)。
+/// seccomp(2).
 pub(crate) fn seccomp(cx: &mut Cx<'_>, op: u32, flags: u32, args: u64) -> Result<u64, Errno> {
     match op {
         SET_MODE_STRICT if flags != 0 || args != 0 => Err(Errno::EINVAL),
@@ -1029,7 +1069,7 @@ pub(crate) fn seccomp(cx: &mut Cx<'_>, op: u32, flags: u32, args: u64) -> Result
         }
         GET_NOTIF_SIZES if flags != 0 => Err(Errno::EINVAL),
         GET_NOTIF_SIZES => {
-            // seccomp_notif、seccomp_notif_resp、seccomp_data 的大小
+            // Sizes of seccomp_notif, seccomp_notif_resp, seccomp_data
             let mut b = [0u8; 6];
             b[..2].copy_from_slice(&80u16.to_le_bytes());
             b[2..4].copy_from_slice(&24u16.to_le_bytes());
@@ -1041,7 +1081,7 @@ pub(crate) fn seccomp(cx: &mut Cx<'_>, op: u32, flags: u32, args: u64) -> Result
     }
 }
 
-/// prctl(PR_SET_SECCOMP)：没有标志；严格模式不看 `filter`。
+/// prctl(PR_SET_SECCOMP): no flags; strict mode ignores `filter`.
 pub(crate) fn prctl_set(cx: &mut Cx<'_>, mode: u64, filter: u64) -> Result<u64, Errno> {
     match mode {
         1 => set_strict(cx),
@@ -1056,7 +1096,7 @@ fn get<const N: usize>(cx: &Cx<'_>, addr: u64) -> Result<[u8; N], Errno> {
     Ok(b)
 }
 
-/// 进入严格模式。已经是过滤模式的不能改。
+/// Enters strict mode. A thread already in filter mode cannot switch.
 fn set_strict(cx: &mut Cx<'_>) -> Result<u64, Errno> {
     let mut s = cx.task.seccomp.borrow_mut();
     if s.mode != mode::DISABLED && s.mode != mode::STRICT {
@@ -1068,15 +1108,17 @@ fn set_strict(cx: &mut Cx<'_>) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// 装一个过滤器（Linux 的 `seccomp_set_mode_filter`）：检查标志和程序，要求
-/// `no_new_privs` 或者 `CAP_SYS_ADMIN`；`NEW_LISTENER` 时返回通知 fd，链上已经有通知 fd 时是
-/// EBUSY；`TSYNC` 时同一线程组的其他线程都要能同步过来，否则返回第一个不能的线程的 tid
-/// （`TSYNC_ESRCH` 时是 ESRCH）。
+/// Installs a filter (Linux's `seccomp_set_mode_filter`): checks the flags and the program, and
+/// requires `no_new_privs` or `CAP_SYS_ADMIN`; with `NEW_LISTENER` returns the notification fd,
+/// EBUSY when the chain already has one; with `TSYNC` the other threads of the thread group must
+/// all be able to sync, otherwise returns the tid of the first that cannot (ESRCH with
+/// `TSYNC_ESRCH`).
 fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     if flags & !flag::MASK != 0 {
         return Err(Errno::EINVAL);
     }
-    // 两个都设时，成功返回的 fd 和失败返回的 tid 分不开，除非不要 tid
+    // With both set, an fd returned on success and a tid returned on failure cannot be told
+    // apart, unless the tid is not wanted
     if flags & flag::TSYNC != 0 && flags & flag::NEW_LISTENER != 0 && flags & flag::TSYNC_ESRCH == 0
     {
         return Err(Errno::EINVAL);
@@ -1084,7 +1126,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     if flags & flag::WAIT_KILLABLE_RECV != 0 && flags & flag::NEW_LISTENER == 0 {
         return Err(Errno::EINVAL);
     }
-    // struct sock_fprog：长度和指令的地址
+    // struct sock_fprog: the length and the address of the instructions
     let b: [u8; 16] = get(cx, args)?;
     let len = u16::from_le_bytes([b[0], b[1]]) as usize;
     let addr = u64::from_le_bytes(b[8..].try_into().unwrap());
@@ -1092,8 +1134,8 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     {
-        // 没有 no_new_privs 时要在自己所在的用户命名空间里有 CAP_SYS_ADMIN（Linux 的
-        // seccomp_prepare_filter 用 ns_capable，用户命名空间里的 root 也行）
+        // Without no_new_privs, CAP_SYS_ADMIN is needed in our own user namespace (Linux's
+        // seccomp_prepare_filter uses ns_capable, so root in a user namespace is enough)
         let g = cx.t.group.borrow();
         let cred = &g.cred;
         if !g.no_new_privs && !cred.ns_capable(&cred.user_ns, crate::cred::cap::SYS_ADMIN) {
@@ -1109,7 +1151,8 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     check_classic(&prog)?;
     check_seccomp(&mut prog)?;
 
-    // 通知 fd 的位子先找好：装上过滤器之后就不会失败（Linux 先 get_unused_fd_flags）
+    // Find the notification fd's slot first: nothing can fail once the filter is installed (Linux
+    // does get_unused_fd_flags first)
     let listener = flags & flag::NEW_LISTENER != 0;
     let fd = if listener {
         Some(cx.fds().free_slot(0)?)
@@ -1140,7 +1183,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     if total > MAX_INSNS_PER_PATH {
         return Err(Errno::ENOMEM);
     }
-    // TSYNC：其他线程要么没有 seccomp，要么用的过滤器是自己现在的这条链上的
+    // TSYNC: every other thread either has no seccomp or uses a filter on our current chain
     let others: Vec<Rc<Task>> = {
         let g = cx.t.group.borrow();
         let me = cx.tid();
@@ -1197,7 +1240,7 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
             {
                 let mut s = t.seccomp.borrow_mut();
                 s.mode = mode::FILTER;
-                // 换下来的那条在 drop 时减掉它的用户数
+                // The replaced chain decreases its user count when it is dropped
                 s.chain = Some(chain.clone());
             }
             publish(t);
@@ -1219,8 +1262,9 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     }
 }
 
-/// 线程的 seccomp 变了（装了过滤器、TSYNC、clone、要结束它）：更新不持 BKL 时看的
-/// [`Task::seccomp_on`] 和放行位图 [`Task::seccomp_allow`]。只有过滤模式有位图。
+/// A thread's seccomp changed (a filter installed, TSYNC, clone, being killed): updates
+/// [`Task::seccomp_on`] and the allow bitmap [`Task::seccomp_allow`], which are read without the
+/// BKL. Only filter mode has a bitmap.
 pub(crate) fn publish(task: &Task) {
     let s = task.seccomp.borrow();
     let allow = match (s.mode, &s.chain) {
@@ -1234,21 +1278,23 @@ pub(crate) fn publish(task: &Task) {
         .store(s.mode != mode::DISABLED, Ordering::Relaxed);
 }
 
-/// 不持 BKL 时：线程的过滤器对编号 `nr` 总是返回 ALLOW（[`publish`] 的位图）。别的线程 TSYNC
-/// 时可能正在改它，读到的旧位是同步之前那条链的（新链只会更严），相当于这个系统调用发生在
-/// 同步之前。
+/// Without the BKL: the thread's filters always return ALLOW for number `nr` (the bitmap from
+/// [`publish`]). Another thread doing TSYNC may be changing it; a stale bit read belongs to the
+/// chain before the sync (the new chain can only be stricter), as if this syscall happened before
+/// the sync.
 pub(crate) fn always_allowed(task: &Task, nr: u64) -> bool {
     cached(|i| task.seccomp_allow[i].load(Ordering::Relaxed), nr)
 }
 
-/// 通知的 id 从一个随机数开始（与 Linux 一样，让监管进程不能猜别的通知）。
+/// Notification ids start from a random number (as on Linux, so supervisors cannot guess other
+/// notifications).
 fn random_id() -> u64 {
     let mut b = [0u8; 8];
     let _ = appine_hal::fill_random(&mut b);
     u64::from_le_bytes(b)
 }
 
-/// 通知 fd 的 ioctl。
+/// ioctls of the notification fd.
 pub(crate) fn ioctl(cx: &mut Cx<'_>, f: &Filter, request: u32, arg: u64) -> Result<u64, Errno> {
     match request {
         IOCTL_NOTIF_RECV => recv(cx, f, arg),
@@ -1276,8 +1322,9 @@ fn find(f: &Filter, id: u64) -> Option<Rc<RefCell<Knotif>>> {
         .cloned()
 }
 
-/// SECCOMP_IOCTL_NOTIF_RECV：等一个还没被取走的通知，取走它（`struct seccomp_notif` 要
-/// 先清零）。与 6.1 一样，被信号打断是 EINTR，fd 设了 O_NONBLOCK 也照样等。
+/// SECCOMP_IOCTL_NOTIF_RECV: waits for a notification not yet received and takes it (`struct
+/// seccomp_notif` must be zeroed first). As in 6.1, interruption by a signal is EINTR, and it
+/// waits even when the fd has O_NONBLOCK set.
 fn recv(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
     let mut b = [0u8; 80];
     cx.mm().read(UserSlice::new(arg, b.len()), &mut b)?;
@@ -1304,7 +1351,7 @@ fn recv(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
             }
         };
         match got {
-            // 发出它的线程被打断、拿掉了它
+            // The thread that sent it was interrupted and withdrew it
             Some(None) => return Err(Errno::ENOENT),
             Some(Some(k)) => break k,
             None => {
@@ -1325,7 +1372,8 @@ fn recv(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
     b[8..12].copy_from_slice(&tid.to_le_bytes());
     b[16..].copy_from_slice(&data);
     if cx.mm().write(UserSlice::new(arg, b.len()), &b).is_err() {
-        // 写不回去：通知放回去，发出它的线程不至于一直等（只等致命信号的叫醒它重新看）
+        // Cannot write it back: put the notification back so the thread that sent it does not
+        // wait forever (one waiting only for fatal signals is woken to look again)
         let mut slot = f.notif.borrow_mut();
         if let Some(n) = slot.as_mut()
             && n.list.iter().any(|k| Rc::ptr_eq(k, &knotif))
@@ -1344,7 +1392,7 @@ fn recv(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// SECCOMP_IOCTL_NOTIF_SEND：回答一个取走了的通知（`struct seccomp_notif_resp`）。
+/// SECCOMP_IOCTL_NOTIF_SEND: answers a received notification (`struct seccomp_notif_resp`).
 fn send(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
     let b: [u8; 24] = get(cx, arg)?;
     let id = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -1358,7 +1406,7 @@ fn send(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
     }
     let knotif = find(f, id).ok_or(Errno::ENOENT)?;
     let mut k = knotif.borrow_mut();
-    // 只能回答一次
+    // Only one answer
     if k.state != State::Sent {
         return Err(Errno::EINPROGRESS);
     }
@@ -1370,16 +1418,18 @@ fn send(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
-/// SECCOMP_IOCTL_NOTIF_ADDFD：把自己的 fd `srcfd` 装进发出通知的线程的 fd 表（`SETFD` 时
-/// 装在 `newfd` 上，像 dup2），返回那边的 fd；`SEND` 时同时用它回答通知。Linux 由那个线程
-/// 自己去装；这里持有 BKL 直接装，效果相同，它被打断的那一刻也不会失败（Linux 返回 ESRCH）。
+/// SECCOMP_IOCTL_NOTIF_ADDFD: installs our fd `srcfd` into the fd table of the thread that sent
+/// the notification (at `newfd` with `SETFD`, like dup2) and returns the fd on that side; with
+/// `SEND` it also answers the notification with it. On Linux that thread installs it itself;
+/// here it is installed directly while holding the BKL, with the same effect, and it cannot fail
+/// at the moment that thread is interrupted (Linux returns ESRCH).
 fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errno> {
     if !(ADDFD_SIZE_VER0..appine_engine::PAGE_SIZE as usize).contains(&size) {
         return Err(Errno::EINVAL);
     }
     let mut b = vec![0u8; size];
     cx.mm().read(UserSlice::new(arg, size), &mut b)?;
-    // 比现在的结构体长的部分要是零（copy_struct_from_user）
+    // The part beyond the current struct must be zero (copy_struct_from_user)
     if b[ADDFD_SIZE_VER0..].iter().any(|&c| c != 0) {
         return Err(Errno::E2BIG);
     }
@@ -1427,8 +1477,9 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
     Ok(fd as u64)
 }
 
-/// PTRACE_SECCOMP_GET_FILTER：被跟踪的线程的第 `index` 个过滤器（0 是最早装的）的原样的
-/// 程序，写到 `data`（为 0 时只返回指令数）。跟踪者要有 `CAP_SYS_ADMIN`、自己没有 seccomp。
+/// PTRACE_SECCOMP_GET_FILTER: the original program of the tracee's filter number `index` (0 is
+/// the first installed), written to `data` (when it is 0, only the instruction count is
+/// returned). The tracer needs `CAP_SYS_ADMIN` and must have no seccomp itself.
 pub(crate) fn get_filter(cx: &Cx<'_>, task: &Task, index: u64, data: u64) -> Result<u64, Errno> {
     let f = nth_filter(cx, task, index)?;
     if data != 0 {
@@ -1437,8 +1488,9 @@ pub(crate) fn get_filter(cx: &Cx<'_>, task: &Task, index: u64, data: u64) -> Res
     Ok((f.orig.len() / 8) as u64)
 }
 
-/// PTRACE_SECCOMP_GET_METADATA：`data` 是 `struct seccomp_metadata`，跟踪者给出
-/// `filter_off`，得到那个过滤器的标志（只有 `SECCOMP_FILTER_FLAG_LOG`）。返回写了多少字节。
+/// PTRACE_SECCOMP_GET_METADATA: `data` is a `struct seccomp_metadata`; the tracer gives
+/// `filter_off` and gets that filter's flags (only `SECCOMP_FILTER_FLAG_LOG`). Returns the number
+/// of bytes written.
 pub(crate) fn get_metadata(cx: &Cx<'_>, task: &Task, size: u64, data: u64) -> Result<u64, Errno> {
     privileged_tracer(cx)?;
     let size = size.min(16) as usize;
@@ -1477,7 +1529,7 @@ fn nth_filter(cx: &Cx<'_>, task: &Task, index: u64) -> Result<Rc<Filter>, Errno>
         .ok()
         .filter(|&i| i < all.len())
         .ok_or(Errno::ENOENT)?;
-    // 链从最新的开始，下标从最早的开始
+    // The chain starts from the newest, indexes from the oldest
     let mut f = top.clone();
     for _ in 0..all.len() - 1 - i {
         let prev = f.prev.clone().expect("the chain is that long");
@@ -1486,8 +1538,9 @@ fn nth_filter(cx: &Cx<'_>, task: &Task, index: u64) -> Result<Rc<Filter>, Errno>
     Ok(f)
 }
 
-/// 线程结束了：不是主线程的马上放下过滤器链；主线程的交给线程组，进程被回收时才放下（Linux
-/// 在 `release_task` 时放下，僵尸进程仍是用户，通知 fd 那时才 POLLHUP）。
+/// A thread has exited: a non-main thread drops its filter chain at once; the main thread's is
+/// handed to the thread group and dropped only when the process is reaped (Linux drops it in
+/// `release_task`; a zombie is still a user, and the notification fd reports POLLHUP only then).
 pub(crate) fn exited(task: &Task, group: &mut crate::process::ThreadGroup) {
     let chain = task.seccomp.borrow_mut().chain.take();
     if task.tid.get() == group.tgid {
@@ -1514,7 +1567,7 @@ mod tests {
         use bpf::*;
         let ret = insn(RET | K, 0, 0, ret::ALLOW);
         assert!(prepared(vec![ret]).is_ok());
-        // 读编号、按 4 对齐、不越过 seccomp_data
+        // Reading the number: aligned to 4, not beyond seccomp_data
         assert!(prepared(vec![insn(LD | W | ABS, 0, 0, 0), ret]).is_ok());
         assert_eq!(
             prepared(vec![insn(LD | W | ABS, 0, 0, 2), ret]),
@@ -1524,7 +1577,7 @@ mod tests {
             prepared(vec![insn(LD | W | ABS, 0, 0, 64), ret]),
             Err(Errno::EINVAL)
         );
-        // 读半字、取模是 cBPF 认得、seccomp 不认的
+        // Half-word reads and modulo are recognized by cBPF but not by seccomp
         assert_eq!(
             prepared(vec![insn(LD | H | ABS, 0, 0, 0), ret]),
             Err(Errno::EINVAL)
@@ -1533,7 +1586,8 @@ mod tests {
             prepared(vec![insn(ALU | MOD | K, 0, 0, 3), ret]),
             Err(Errno::EINVAL)
         );
-        // 最后一条不是返回、跳出程序、除以常数 0、移位太多
+        // Last instruction not a return, jumping out of the program, division by constant 0,
+        // shifting too far
         assert_eq!(prepared(vec![insn(LD | IMM, 0, 0, 1)]), Err(Errno::EINVAL));
         assert_eq!(
             prepared(vec![insn(JMP | JA, 0, 0, 1), ret]),
@@ -1551,7 +1605,8 @@ mod tests {
             prepared(vec![insn(ALU | LSH | K, 0, 0, 32), ret]),
             Err(Errno::EINVAL)
         );
-        // 草稿内存先写后读：只在一条分支上写过的不能在汇合之后读
+        // Scratch memory written before read: a slot written on only one branch cannot be read
+        // after the join
         let partial = vec![
             insn(JMP | JEQ | K, 0, 1, 0),
             insn(ST, 0, 0, 3),
@@ -1566,7 +1621,7 @@ mod tests {
             ret,
         ];
         assert!(prepared(both).is_ok());
-        // 长度变成 seccomp_data 的大小
+        // The length becomes the size of seccomp_data
         let len = prepared(vec![insn(LD | W | LEN, 0, 0, 0), insn(RET | A, 0, 0, 0)]).unwrap();
         assert_eq!(run(&len, &[0; DATA_SIZE]), 64);
     }
@@ -1575,7 +1630,7 @@ mod tests {
     fn programs_run_like_the_jit() {
         use bpf::*;
         let data = seccomp_data(39, 0x1000, [7, 0, 0, 0, 0, 0]);
-        // 编号是 39 时返回 ERRNO|3，否则 ALLOW
+        // Returns ERRNO|3 when the number is 39, otherwise ALLOW
         let prog = prepared(vec![
             insn(LD | W | ABS, 0, 0, 0),
             insn(JMP | JEQ | K, 0, 1, 39),
@@ -1584,12 +1639,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(run(&prog, &data), ret::ERRNO | 3);
-        // 第一个参数的低 32 位、架构
+        // The low 32 bits of the first argument, the architecture
         let arg = prepared(vec![insn(LD | W | ABS, 0, 0, 16), insn(RET | A, 0, 0, 0)]).unwrap();
         assert_eq!(run(&arg, &data), 7);
         let arch = prepared(vec![insn(LD | W | ABS, 0, 0, 4), insn(RET | A, 0, 0, 0)]).unwrap();
         assert_eq!(run(&arch, &data), AUDIT_ARCH_AARCH64);
-        // 除以 X 为 0 时返回 0（KILL_THREAD），移位按 32 取模
+        // Division by X = 0 returns 0 (KILL_THREAD); shifts are taken modulo 32
         let div = prepared(vec![
             insn(LD | IMM, 0, 0, 10),
             insn(ALU | DIV | X, 0, 0, 0),
@@ -1611,7 +1666,7 @@ mod tests {
     fn the_cache_keeps_only_constant_allows() {
         use bpf::*;
         let allowed = |allow: &[u64; CACHE_WORDS], nr: u64| cached(|i| allow[i], nr);
-        // 先看架构，再按编号：98 返回 ERRNO，400 及以上 TRAP，别的 ALLOW
+        // Architecture first, then by number: 98 returns ERRNO, 400 and above TRAP, others ALLOW
         let by_nr = prepared(vec![
             insn(LD | W | ABS, 0, 0, 4),
             insn(JMP | JEQ | K, 1, 0, AUDIT_ARCH_AARCH64),
@@ -1627,7 +1682,8 @@ mod tests {
         let c = cache(&by_nr, None);
         assert!(allowed(&c, 0) && allowed(&c, 97) && allowed(&c, 399));
         assert!(!allowed(&c, 98) && !allowed(&c, 400) && !allowed(&c, 511));
-        // 编号以外的数据（这里是第一个参数）不是常数：98 要运行程序，别的仍是常数
+        // Data other than the number (here the first argument) is not constant: 98 must run the
+        // program, the others are still constant
         let by_arg = prepared(vec![
             insn(LD | W | ABS, 0, 0, 0),
             insn(JMP | JEQ | K, 0, 2, 98),
@@ -1639,7 +1695,7 @@ mod tests {
         .unwrap();
         let c = cache(&by_arg, None);
         assert!(!allowed(&c, 98) && allowed(&c, 99));
-        // 按位与之后比较、无条件跳转
+        // Comparing after an AND, unconditional jumps
         let masked = prepared(vec![
             insn(LD | W | ABS, 0, 0, 0),
             insn(ALU | AND | K, 0, 0, 0xf),
@@ -1651,7 +1707,7 @@ mod tests {
         .unwrap();
         let c = cache(&masked, None);
         assert!(!allowed(&c, 3) && !allowed(&c, 19) && allowed(&c, 4));
-        // 返回值要正好是 ALLOW；RET A、别的指令都不算
+        // The return value must be exactly ALLOW; RET A and other instructions do not count
         let data = prepared(vec![insn(RET | K, 0, 0, ret::ALLOW | 1)]).unwrap();
         assert!(!allowed(&cache(&data, None), 0));
         let ret_a = prepared(vec![
@@ -1660,11 +1716,11 @@ mod tests {
         ])
         .unwrap();
         assert!(!allowed(&cache(&ret_a, None), 0));
-        // 新的过滤器总是放行，也不放开上一个不放行的
+        // The new filter always allows, yet does not open up what the previous one does not allow
         let all = prepared(vec![insn(RET | K, 0, 0, ret::ALLOW)]).unwrap();
         let c = cache(&all, Some(&cache(&by_nr, None)));
         assert!(!allowed(&c, 98) && allowed(&c, 97));
-        // 位图之外的编号、负数都要运行程序
+        // Numbers outside the bitmap and negative ones must run the program
         assert!(
             !allowed(&cache(&all, None), CACHED_NRS as u64)
                 && !allowed(&cache(&all, None), u64::MAX)

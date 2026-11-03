@@ -1,39 +1,41 @@
-//! 凭据类 syscall：用户和组 ID、附加组、能力（规则见 [`crate::cred`]）。ID 按调用者的用户
-//! 命名空间换算：读到的是映射之后的（映射不到是 65534），传进来的映射不到是 EINVAL。
+//! Credential syscalls: user and group IDs, supplementary groups, capabilities (rules in
+//! [`crate::cred`]). IDs are translated through the caller's user namespace: reads return the
+//! mapped ones (65534 when unmapped), and an unmapped ID passed in is EINVAL.
 
 use super::{SysResult, get, put};
 use crate::cred::{Cred, NGROUPS_MAX};
 use crate::errno::Errno;
 use crate::kernel::Cx;
 
-/// capget、capset 的版本：v1 只有低 32 位，v2、v3 是两组 32 位。
+/// Versions for capget and capset: v1 has only the low 32 bits, v2 and v3 have two 32-bit sets.
 const CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
-/// 不修改的 ID 参数（-1）是 `None`。
+/// An ID argument meaning "unchanged" (-1) is `None`.
 fn id_arg(id: u64) -> Option<u32> {
     (id as u32 != u32::MAX).then_some(id as u32)
 }
 
-/// 用户 ID 参数换成内核 ID：-1 是 `None`，映射不到是 EINVAL（`make_kuid` 之后的
-/// `uid_valid`）。
+/// Converts a user ID argument to a kernel ID: -1 is `None`, unmapped is EINVAL (`uid_valid`
+/// after `make_kuid`).
 fn uid_arg(cx: &Cx<'_>, id: u64) -> Result<Option<u32>, Errno> {
     id_arg(id)
         .map(|id| cx.cred().uid_in(id).ok_or(Errno::EINVAL))
         .transpose()
 }
 
-/// 组 ID 参数换成内核 ID，规则同 [`uid_arg`]。
+/// Converts a group ID argument to a kernel ID, with the same rules as [`uid_arg`].
 fn gid_arg(cx: &Cx<'_>, id: u64) -> Result<Option<u32>, Errno> {
     id_arg(id)
         .map(|id| cx.cred().gid_in(id).ok_or(Errno::EINVAL))
         .transpose()
 }
 
-/// 修改当前进程的凭据：`f` 失败时凭据保持不变。与 Linux 的 `commit_creds` 一样，有效、
-/// 文件系统的用户或组变了，或者得到了新的能力，进程不再可以 dump（`/proc/<pid>` 里的文件
-/// 随之属于 root），父进程退出时也不再给它发信号。
+/// Modifies the current process's credentials: if `f` fails, the credentials stay unchanged. As
+/// with Linux's `commit_creds`, when the effective or filesystem user or group changes, or new
+/// capabilities are gained, the process is no longer dumpable (the files in `/proc/<pid>` then
+/// belong to root), and it no longer gets a signal when its parent exits.
 fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Result<T, Errno> {
     let mut cred = cx.cred();
     let old = cred.clone();
@@ -42,8 +44,8 @@ fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Resu
     let mut g = cx.t.group.borrow_mut();
     if ids(&cred) != ids(&old) || cred.cap_permitted & !old.cap_permitted != 0 {
         g.dumpable = false;
-        // 凭据按进程记，所有线程的一起变了：Linux 上 libc 让每个线程各自 commit_creds，
-        // 各自的 pdeath_signal 都清掉
+        // Credentials are kept per process, so all threads changed together: on Linux libc has
+        // each thread commit_creds separately, clearing each one's pdeath_signal
         for t in &g.threads {
             if let Some(t) = cx.kr().tasks.get(t) {
                 t.pdeathsig.set(0);
@@ -96,7 +98,7 @@ pub(super) fn setresgid(cx: &mut Cx<'_>, r: u64, e: u64, s: u64) -> SysResult {
     update(cx, |c| c.setresgid(r, e, s)).map(|()| 0)
 }
 
-/// getresuid、getresgid：三个 ID 分别写到三个地址。
+/// getresuid, getresgid: the three IDs are written to three addresses.
 pub(super) fn getres(cx: &mut Cx<'_>, gid: bool, addrs: [u64; 3]) -> SysResult {
     let c = cx.cred();
     let ids = if gid {
@@ -110,7 +112,8 @@ pub(super) fn getres(cx: &mut Cx<'_>, gid: bool, addrs: [u64; 3]) -> SysResult {
     Ok(0)
 }
 
-/// setfsuid：映射不到的 ID 与不允许的一样静默忽略，返回原来的 fsuid（映射之后的）。
+/// setfsuid: an unmapped ID is silently ignored like a disallowed one; returns the old fsuid
+/// (mapped).
 pub(super) fn setfsuid(cx: &mut Cx<'_>, uid: u64) -> SysResult {
     let uid = uid_arg(cx, uid).ok().flatten();
     update(cx, |c| {
@@ -156,8 +159,8 @@ pub(super) fn setgroups(cx: &mut Cx<'_>, size: i32, list: u64) -> SysResult {
     update(cx, |c| c.setgroups(groups)).map(|()| 0)
 }
 
-/// capget、capset 的头部：检查版本（不认识时写回内核的版本并返回 EINVAL），返回
-/// 数据的组数和 pid。
+/// Header of capget and capset: checks the version (when unknown, writes back the kernel's
+/// version and returns EINVAL), and returns the number of data sets and the pid.
 fn cap_header(cx: &Cx<'_>, hdr: u64) -> Result<(usize, i32), Errno> {
     let h: [u8; 8] = get(cx, hdr)?;
     let version = u32::from_le_bytes(h[..4].try_into().unwrap());
@@ -174,8 +177,9 @@ fn cap_header(cx: &Cx<'_>, hdr: u64) -> Result<(usize, i32), Errno> {
 
 pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
     let header = cap_header(cx, hdr);
-    // 数据指针为空时只是探测版本：不认识的版本写回内核的版本之后也返回 0，pid 不看
-    // （Linux 的 capget；moby/sys/capability 这样取版本，podman、runc 都用它）
+    // A null data pointer only probes the version: an unknown version also returns 0 after the
+    // kernel's version is written back, and the pid is ignored (Linux's capget;
+    // moby/sys/capability gets the version this way, and podman and runc both use it)
     if data == 0 {
         return match header {
             Ok(_) | Err(Errno::EINVAL) => Ok(0),
