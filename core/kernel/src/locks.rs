@@ -1,10 +1,11 @@
-//! fcntl(2) 的记录锁：传统的 POSIX 锁和 OFD 锁（open file description lock）。
+//! fcntl(2) record locks: traditional POSIX locks and OFD locks (open file description locks).
 //!
-//! 锁按 inode 记录，每把锁有一个持有者：POSIX 锁属于 fd 表（同一个进程的所有线程
-//! 共用），关闭这个 fd 表里任何一个指向该文件的 fd 都会释放它在该文件上的所有锁；
-//! OFD 锁属于打开文件，最后一个引用关闭时释放。持有者用弱引用记录，持有者消失
-//! （进程退出、打开文件析构）后锁自动失效。同一个持有者的锁互不重叠，相邻的同类
-//! 锁合并，与 Linux 相同。
+//! Locks are recorded by inode, and each lock has one owner: a POSIX lock belongs to an fd table
+//! (shared by all threads of one process), and closing any fd in that table that refers to the
+//! file releases all of the table's locks on the file; an OFD lock belongs to an open file and is
+//! released when its last reference is closed. Owners are recorded as weak references, so locks
+//! lapse by themselves once their owner is gone (process exit, open file dropped). Locks of one
+//! owner never overlap, and adjacent locks of the same type are merged, as on Linux.
 
 use std::rc::{Rc, Weak};
 
@@ -13,12 +14,12 @@ use crate::fd::{FdTable, FileRef, OpenFile};
 use crate::kernel::{Kernel, Tid, request_wake_locks};
 use crate::vfs::store::Ino;
 
-/// 锁的持有者。
+/// The owner of a lock.
 #[derive(Clone)]
 pub(crate) enum Owner {
-    /// 传统的 POSIX 锁：属于 fd 表。
+    /// Traditional POSIX lock: belongs to an fd table.
     Posix(Weak<RefCell<FdTable>>),
-    /// OFD 锁：属于打开文件。
+    /// OFD lock: belongs to an open file.
     Ofd(Weak<RefCell<OpenFile>>),
 }
 
@@ -39,15 +40,15 @@ impl Owner {
     }
 }
 
-/// 一把锁，覆盖 `[start, end)`；`end` 为 `u64::MAX` 表示到文件末尾以及之后。
+/// A lock covering `[start, end)`; an `end` of `u64::MAX` means to the end of the file and beyond.
 #[derive(Clone)]
 pub(crate) struct Lock {
     pub owner: Owner,
-    /// 加锁的进程（F_GETLK 报告的 `l_pid`）；OFD 锁是 -1。
+    /// The process that took the lock (the `l_pid` F_GETLK reports); -1 for OFD locks.
     pub pid: Tid,
     pub start: u64,
     pub end: u64,
-    /// 写锁（排他）；否则是读锁（共享）。
+    /// Write lock (exclusive); otherwise a read lock (shared).
     pub write: bool,
 }
 
@@ -56,7 +57,7 @@ impl Lock {
         self.start < end && start < self.end
     }
 
-    /// 和持有者不同、类型不相容的请求冲突。
+    /// Conflicts with a request from a different owner with an incompatible type.
     fn conflicts(&self, req: &Lock) -> bool {
         !self.owner.same(&req.owner)
             && (self.write || req.write)
@@ -64,29 +65,30 @@ impl Lock {
     }
 }
 
-/// 一次加锁请求在等待的东西（死锁检测用）。
+/// What a lock request is waiting for (for deadlock detection).
 pub(crate) struct Waiter {
     pub ino: Ino,
     pub req: Lock,
 }
 
-/// 所有 inode 上的记录锁。
+/// Record locks on all inodes.
 #[derive(Default)]
 pub(crate) struct Locks {
     by_ino: std::collections::BTreeMap<Ino, Vec<Lock>>,
-    /// 正在 F_SETLKW 里等待的 POSIX 锁请求。
+    /// POSIX lock requests waiting in F_SETLKW.
     waiters: Vec<Waiter>,
 }
 
 impl Locks {
-    /// 和请求冲突的第一把锁（按起点排序）。
+    /// The first lock (in order of start) that conflicts with the request.
     pub fn conflict(&mut self, ino: Ino, req: &Lock) -> Option<Lock> {
         let locks = self.by_ino.get_mut(&ino)?;
         locks.retain(|l| l.owner.alive());
         locks.iter().find(|l| l.conflicts(req)).cloned()
     }
 
-    /// 设置（或者在 `write` 为 None 时解除）`req` 范围里的锁。调用方已经确认没有冲突。
+    /// Sets (or, when `write` is None, removes) the locks in `req`'s range. The caller has already
+    /// made sure there is no conflict.
     pub fn set(&mut self, ino: Ino, req: Lock, unlock: bool) {
         let locks = self.by_ino.entry(ino).or_default();
         let (mut start, mut end) = (req.start, req.end);
@@ -96,7 +98,7 @@ impl Locks {
                 kept.push(l);
                 continue;
             }
-            // 同类、重叠或相邻的锁并进新锁
+            // Locks of the same type that overlap or are adjacent merge into the new lock
             if !unlock && l.write == req.write && l.start <= end && start <= l.end {
                 start = start.min(l.start);
                 end = end.max(l.end);
@@ -106,7 +108,7 @@ impl Locks {
                 kept.push(l);
                 continue;
             }
-            // 类型不同或者解锁：只留下请求范围以外的部分
+            // Different type, or unlocking: keep only the parts outside the requested range
             if l.start < req.start {
                 kept.push(Lock {
                     end: req.start,
@@ -132,8 +134,9 @@ impl Locks {
         request_wake_locks();
     }
 
-    /// 等待 `req` 会不会死锁：沿着"等待的请求被谁的锁挡住"一路找下去，回到自己就是
-    /// 死锁（`posix_locks_deadlock`）。只检查 POSIX 锁。
+    /// Whether waiting for `req` would deadlock: follow "whose lock blocks the waiting request"
+    /// along the chain; coming back to ourselves is a deadlock (`posix_locks_deadlock`). Checks
+    /// POSIX locks only.
     pub fn deadlock(&mut self, ino: Ino, req: &Lock) -> bool {
         let Owner::Posix(_) = req.owner else {
             return false;
@@ -158,7 +161,7 @@ impl Locks {
         false
     }
 
-    /// 记下（`Some`）或者清除一个持有者在 F_SETLKW 里的等待。
+    /// Records (`Some`) or clears an owner's wait in F_SETLKW.
     pub fn set_waiting(&mut self, owner: &Owner, wait: Option<Waiter>) {
         self.waiters
             .retain(|w| !w.req.owner.same(owner) && w.req.owner.alive());
@@ -167,7 +170,7 @@ impl Locks {
         }
     }
 
-    /// 关闭了 fd 表 `fds` 里的这些文件：释放这个 fd 表在这些文件上的 POSIX 锁。
+    /// These files in fd table `fds` were closed: release this fd table's POSIX locks on them.
     pub fn closed(&mut self, fds: &Rc<RefCell<FdTable>>, files: &[FileRef]) {
         let owner = Owner::Posix(Rc::downgrade(fds));
         for file in files {
@@ -188,7 +191,7 @@ impl Locks {
     }
 }
 
-/// 关闭 fd 之后调用：释放当前进程在这些文件上的 POSIX 锁。
+/// Called after fds are closed: releases the current process's POSIX locks on these files.
 pub(crate) fn closed(k: &mut Kernel, fds: &Rc<RefCell<FdTable>>, files: &[FileRef]) {
     if !files.is_empty() {
         k.locks.closed(fds, files);
@@ -229,22 +232,22 @@ mod tests {
         let (oa, ob) = (owner(&a), owner(&b));
         let mut l = Locks::default();
         l.set(1, lock(&oa, 0, 100, true), false);
-        // 中间改成读锁：拆成三段
+        // Turn the middle into a read lock: split into three pieces
         l.set(1, lock(&oa, 40, 60, false), false);
         assert_eq!(
             ranges(&l, 1),
             vec![(0, 40, true), (40, 60, false), (60, 100, true)]
         );
-        // 别的持有者：读锁和读锁不冲突，和写锁冲突
+        // Another owner: a read lock does not conflict with read locks but does with write locks
         assert!(l.conflict(1, &lock(&ob, 45, 50, false)).is_none());
         assert_eq!(l.conflict(1, &lock(&ob, 30, 50, false)).unwrap().start, 0);
-        // 相邻的同类锁合并
+        // Adjacent locks of the same type merge
         l.set(1, lock(&oa, 40, 60, true), false);
         assert_eq!(ranges(&l, 1), vec![(0, 100, true)]);
-        // 解锁中间一段
+        // Unlock a piece in the middle
         l.set(1, lock(&oa, 10, 20, false), true);
         assert_eq!(ranges(&l, 1), vec![(0, 10, true), (20, 100, true)]);
-        // 持有者消失，锁随之失效
+        // The owner goes away, and its locks lapse with it
         drop(a);
         assert!(l.conflict(1, &lock(&ob, 0, u64::MAX, true)).is_none());
     }
@@ -272,7 +275,7 @@ mod tests {
         let mut l = Locks::default();
         l.set(1, lock(&oa, 0, 10, true), false);
         l.set(1, lock(&ob, 10, 20, true), false);
-        // a 在等 b 的锁；b 再去等 a 的锁就是死锁
+        // a is waiting for b's lock; b then waiting for a's lock is a deadlock
         let wait = lock(&oa, 10, 20, true);
         assert!(!l.deadlock(1, &wait));
         l.set_waiting(&oa, Some(Waiter { ino: 1, req: wait }));

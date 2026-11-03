@@ -1,8 +1,8 @@
-//! 打开文件与 fd 表。
+//! Open files and fd tables.
 //!
-//! 一个打开文件（Linux 的 `struct file`）记录文件位置和状态标志，可以被多个
-//! fd 共享（dup、fork）；close-on-exec 标志属于 fd 本身。打开文件和 fd 表都
-//! 只在持有 BKL 时访问（[`crate::kernel`]）。
+//! An open file (Linux's `struct file`) records the file position and status flags and can be
+//! shared by several fds (dup, fork); the close-on-exec flag belongs to the fd itself. Open files
+//! and fd tables are accessed only while holding the BKL ([`crate::kernel`]).
 
 use std::fs::File;
 use std::rc::Rc;
@@ -17,188 +17,202 @@ use crate::vfs::Node;
 use crate::vfs::dev::Device;
 use crate::vfs::store::{DirEntry, Ino};
 
-/// 每个进程最多能打开的 fd 数（`/proc/sys/fs/nr_open`，`RLIMIT_NOFILE` 的上限），与 Linux
-/// 的默认值相同。
+/// The most fds a process can open (`/proc/sys/fs/nr_open`, the upper bound of `RLIMIT_NOFILE`),
+/// the same as Linux's default.
 pub const MAX_FDS: usize = 1 << 20;
 
-/// 新进程的 `RLIMIT_NOFILE`：软限制 1024、硬限制 4096，与 Linux 内核的默认值相同。Go 在
-/// 启动时把软限制提到硬限制。
+/// `RLIMIT_NOFILE` of a new process: soft limit 1024, hard limit 4096, the same as the Linux
+/// kernel's defaults. Go raises the soft limit to the hard limit at startup.
 pub const DEFAULT_NOFILE: (usize, usize) = (1024, 4096);
 
-/// open(2) 的标志位（arm64 的取值）。
+/// open(2) flag bits (arm64 values).
 pub mod oflags {
-    /// 访问模式掩码。
+    /// Access mode mask.
     pub const O_ACCMODE: u32 = 0o3;
-    /// 只读。
+    /// Read-only.
     pub const O_RDONLY: u32 = 0o0;
-    /// 只写。
+    /// Write-only.
     pub const O_WRONLY: u32 = 0o1;
-    /// 读写。
+    /// Read-write.
     pub const O_RDWR: u32 = 0o2;
-    /// 不存在时创建。
+    /// Create if missing.
     pub const O_CREAT: u32 = 0o100;
-    /// 与 `O_CREAT` 合用：已存在时失败。
+    /// With `O_CREAT`: fail if it exists.
     pub const O_EXCL: u32 = 0o200;
-    /// 不让终端成为控制终端。
+    /// Do not make a terminal the controlling terminal.
     pub const O_NOCTTY: u32 = 0o400;
-    /// 截断。
+    /// Truncate.
     pub const O_TRUNC: u32 = 0o1000;
-    /// 追加写。
+    /// Append.
     pub const O_APPEND: u32 = 0o2000;
-    /// 非阻塞。
+    /// Nonblocking.
     pub const O_NONBLOCK: u32 = 0o4000;
-    /// 信号驱动的 I/O：就绪时给属主发信号（`syscall::poll` 的 fasync）。
+    /// Signal-driven I/O: signal the owner on readiness (`syscall::poll`'s fasync).
     pub const O_ASYNC: u32 = 0o20000;
-    /// 直接 I/O（只记录）。
+    /// Direct I/O (only recorded).
     pub const O_DIRECT: u32 = 0o200000;
-    /// 必须是目录。
+    /// Must be a directory.
     pub const O_DIRECTORY: u32 = 0o40000;
-    /// 不跟随最后一个组件的符号链接。
+    /// Do not follow a symlink in the last component.
     pub const O_NOFOLLOW: u32 = 0o100000;
-    /// 大文件（64 位上恒为真）。
+    /// Large file (always true on 64-bit).
     pub const O_LARGEFILE: u32 = 0o400000;
-    /// 不更新访问时间（只有属主或者有 `CAP_FOWNER` 的进程能用）。
+    /// Do not update the access time (only for the owner or a process with `CAP_FOWNER`).
     pub const O_NOATIME: u32 = 0o1000000;
-    /// exec 时关闭。
+    /// Close on exec.
     pub const O_CLOEXEC: u32 = 0o2000000;
-    /// 只取路径。
+    /// Path only.
     pub const O_PATH: u32 = 0o10000000;
-    /// fcntl(F_SETFL) 能修改的标志。
+    /// The flags fcntl(F_SETFL) can change.
     pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_ASYNC | O_DIRECT | O_NOATIME;
 }
 
-/// 打开文件的种类。
+/// The kind of an open file.
 pub enum FileKind {
-    /// 宿主 fd，`appine-run` 把宿主的 stdin/stdout/stderr 原样交给 guest。
+    /// A host fd: `appine-run` hands the host's stdin/stdout/stderr to the guest as they are.
     Host(i32),
-    /// inode 仓库里的普通文件。
+    /// A regular file in the inode store.
     Regular {
-        /// inode。
+        /// The inode.
         ino: Ino,
-        /// 宿主 object 文件。
+        /// The host object file.
         file: File,
     },
-    /// 目录。目录项在第一次 getdents 时取一份快照，lseek 到 0 时丢弃。
+    /// A directory. Its entries are snapshotted on the first getdents and dropped on an lseek to
+    /// 0.
     Directory {
-        /// 目录节点（仓库里的，或者合成文件系统里的）。
+        /// The directory node (in the store or in a synthetic filesystem).
         node: Node,
-        /// 目录项快照（含 `.` 和 `..`）。
+        /// Snapshot of the entries (including `.` and `..`).
         entries: Option<Vec<DirEntry>>,
-        /// `/proc/<pid>`：打开时的那个进程（当作 pidfd 用）。
+        /// `/proc/<pid>`: the process at open time (used as a pidfd).
         process: Option<std::rc::Weak<RefCell<crate::process::ThreadGroup>>>,
     },
-    /// `O_PATH` 打开的文件：只能作为 `*at` 的起点或 fstat 的对象。
+    /// A file opened with `O_PATH`: usable only as the starting point of `*at` calls or as the
+    /// object of fstat.
     Path(Node),
-    /// 管道的一端。
+    /// One end of a pipe.
     Pipe(PipeEnd),
-    /// 字符设备（`/dev/null` 等），`ino` 是仓库里的设备节点。
+    /// A character device (`/dev/null` and so on); `ino` is the device node in the store.
     Device {
-        /// inode。
+        /// The inode.
         ino: Ino,
-        /// 设备。
+        /// The device.
         dev: Device,
-        /// `/dev/kmsg` 的读位置和写的限速（[`Device::Kmsg`] 才有）。
+        /// The read position and write rate limit of `/dev/kmsg` (only for [`Device::Kmsg`]).
         kmsg: Option<Box<crate::klog::KmsgFile>>,
     },
-    /// PTY 的主设备或从设备。
+    /// The master or slave side of a PTY.
     Pty(PtyEnd),
-    /// socket。
+    /// A socket.
     Socket(crate::syscall::SocketRef),
-    /// epoll 实例。
+    /// An epoll instance.
     Epoll(Rc<RefCell<crate::syscall::Epoll>>),
-    /// eventfd：一个 64 位计数器。
+    /// eventfd: a 64-bit counter.
     EventFd(Rc<RefCell<EventFd>>),
-    /// timerfd：一个定时器，到期的次数由 read 取走。
+    /// timerfd: a timer whose expiration count read takes.
     TimerFd(Rc<RefCell<TimerFd>>),
-    /// signalfd：read 取走调用者挂起的、在掩码里的信号。
+    /// signalfd: read takes the caller's pending signals that are in the mask.
     SignalFd(Rc<RefCell<SignalFd>>),
-    /// inotify 实例：read 取走排队的文件系统事件。
+    /// An inotify instance: read takes the queued filesystem events.
     Inotify(Rc<RefCell<crate::syscall::Inotify>>),
-    /// pidfd：指向一个进程，进程结束时变为可读。
+    /// pidfd: refers to a process and becomes readable when the process ends.
     Pidfd(Pidfd),
-    /// POSIX 消息队列。
+    /// A POSIX message queue.
     MessageQueue(Rc<RefCell<crate::syscall::MessageQueue>>),
-    /// seccomp 的通知 fd（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）。
+    /// A seccomp notification fd (`SECCOMP_FILTER_FLAG_NEW_LISTENER`).
     SeccompNotify(crate::seccomp::Listener),
-    /// eBPF 程序（[`crate::bpf`]）。
+    /// An eBPF program ([`crate::bpf`]).
     Bpf(std::rc::Rc<crate::bpf::Prog>),
-    /// procfs、sysfs、cgroup2 的文件：打开时生成的内容，从偏移 0 再读时重新生成。
+    /// A procfs, sysfs or cgroup2 file: content generated at open, regenerated when read again
+    /// from offset 0.
     Proc {
-        /// 经由的挂载。
+        /// The mount it was reached through.
         mnt: crate::vfs::MountId,
-        /// 节点。
+        /// The node.
         node: PseudoNode,
-        /// 内容。
+        /// The content.
         data: Vec<u8>,
-        /// `data` 是打开时刚生成的，还没有读过、写过：第一次从 0 读时不用再生成。
+        /// `data` was just generated at open and has not been read or written yet: the first
+        /// read from 0 need not regenerate it.
         fresh: bool,
-        /// `/proc/<pid>/mem`：打开时那个进程的地址空间。与 Linux 一样，进程 execve 之后
-        /// 读写的仍是它（已经释放时读到 EOF），不是新程序的。
+        /// `/proc/<pid>/mem`: the address space of that process at open time. As on Linux, after
+        /// the process execs, reads and writes still go to it (EOF once it has been freed), not
+        /// to the new program's.
         mm: Option<std::rc::Weak<RefCell<crate::mm::Mm>>>,
-        /// 命名空间文件（nsfs）：打开着就让那个命名空间活着，setns、`NS_GET_*` 用它。
+        /// A namespace file (nsfs): keeps that namespace alive while open; used by setns and
+        /// `NS_GET_*`.
         ns: Option<crate::nsproxy::NsRef>,
-        /// `/proc/kmsg`：内核日志（poll 要看它）。
+        /// `/proc/kmsg`: the kernel log (poll needs to look at it).
         klog: Option<Rc<RefCell<crate::klog::Klog>>>,
     },
 }
 
-/// 一个打开文件。
+/// An open file.
 pub struct OpenFile {
-    /// 种类。
+    /// The kind.
     pub kind: FileKind,
-    /// 访问模式和状态标志（不含 `O_CLOEXEC`）。
+    /// Access mode and status flags (without `O_CLOEXEC`).
     pub flags: u32,
-    /// 文件位置；目录是下一个目录项的下标。
+    /// File position; for a directory, the index of the next entry.
     pub pos: u64,
-    /// `/proc/<pid>/fd/<n>` 显示的路径（打开时的绝对路径）。
+    /// The path `/proc/<pid>/fd/<n>` shows (the absolute path at open time).
     pub path: Option<Rc<[u8]>>,
-    /// 经由路径打开时最后经过的目录和名字：经由 `/proc/<pid>/fd/<n>` 把它当挂载点时
-    /// （bubblewrap 这样挂），挂载记下它（[`crate::vfs::Mount::at`]）。
+    /// The last directory and name passed through when opened by path: when it is used as a
+    /// mount point through `/proc/<pid>/fd/<n>` (bubblewrap mounts this way), the mount records
+    /// it ([`crate::vfs::Mount::at`]).
     pub dentry: Option<crate::vfs::Dentry>,
-    /// 仓库里的普通文件、设备节点和 FIFO 是经由哪个挂载打开的（[`OpenFile::node`]）：
-    /// 只读、noexec 这些标志按它算。目录和 `O_PATH` 的节点本来就带着挂载。
+    /// The mount through which a store regular file, device node or FIFO was opened
+    /// ([`OpenFile::node`]): flags such as read-only and noexec are taken from it. Directory and
+    /// `O_PATH` nodes carry their mount already.
     pub mnt: crate::vfs::MountId,
-    /// `F_SETOWN_EX` 的 (类型, pid) 和 `F_SETSIG` 的信号：`O_ASYNC` 时就绪发给谁、发
-    /// 什么信号（0 是 SIGIO），文件租约被打破时也发给它们。
+    /// `F_SETOWN_EX`'s (type, pid) and `F_SETSIG`'s signal: with `O_ASYNC`, whom to signal on
+    /// readiness and with which signal (0 is SIGIO); they are also signalled when a file lease is
+    /// broken.
     pub owner: (i32, i32),
     pub sig: i32,
-    /// 程序在这个打开文件上读、写两个方向各用完数据的次数：epoll 的 `EPOLLET` 据此
-    /// 知道程序已经用完了上一次报告的事件（`syscall::poll::drained`）。
+    /// How many times the program has used up the data in each direction, read and write, on this
+    /// open file: from this, epoll's `EPOLLET` knows the program has used up the last reported
+    /// event (`syscall::poll::drained`).
     pub drained: [u64; 2],
-    /// 读到数据的次数：设置了 `O_ASYNC` 时读过之后仍然可读，就当作可能来了新数据，再
-    /// 通知一次（`syscall::poll` 的 fasync）。
+    /// Number of reads that got data: with `O_ASYNC` set, if it is still readable after a read,
+    /// new data may have arrived, so notify once more (`syscall::poll`'s fasync).
     pub reads: u64,
-    /// `EPOLLEXCLUSIVE` 的关注报告过的边沿（`syscall::poll` 的数据代数）和报告它的 epoll：
-    /// 同一个边沿别的 epoll 不再报告（Linux 只叫醒一个等待者）。
+    /// The edge an `EPOLLEXCLUSIVE` interest reported (`syscall::poll`'s data generation) and the
+    /// epoll that reported it: other epolls do not report the same edge again (Linux wakes only one
+    /// waiter).
     pub exclusive_claim: std::cell::Cell<Option<([u64; 4], usize)>>,
-    /// 宿主 fd 上新到的事件：有边沿触发或者 `EPOLLEXCLUSIVE` 的关注时才建立
-    /// （`syscall::poll`）。
+    /// Newly arrived events on a host fd: set up only when there is an edge-triggered or
+    /// `EPOLLEXCLUSIVE` interest (`syscall::poll`).
     pub host_edges: Option<HostEdges>,
-    /// 打开的仓库文件：inotify 按 fd 的事件报给打开时经过的目录，最后一个引用释放时
-    /// 报告 `IN_CLOSE_*`。
+    /// An open store file: inotify reports fd-based events to the directory the open went
+    /// through, and reports `IN_CLOSE_*` when the last reference is released.
     pub watch: Option<crate::syscall::Opened>,
-    /// 用文件位置的一次读写正在不持 BKL 地进行（相当于 Linux 的 f_pos_lock，见
-    /// `syscall::fs` 的 `unlocked_io`）：0 没有，1 有，2 有并且还有线程在等它。
+    /// A read or write using the file position is in progress without the BKL (the equivalent
+    /// of Linux's f_pos_lock; see `unlocked_io` in `syscall::fs`): 0 none, 1 one, 2 one and other
+    /// threads are waiting for it.
     pub pos_busy: u8,
-    /// 加过 flock、OFD 锁或者租约：它们以打开文件为持有者，关闭时随之释放，等锁的线程
-    /// 要重新检查。
+    /// Has taken a flock, OFD lock or lease: those have the open file as owner and are released
+    /// with it on close, so threads waiting for locks must check again.
     pub holds_locks: bool,
-    /// open_tree(`OPEN_TREE_CLONE`) 复制出来的树所在的匿名挂载命名空间：没接上之前由这个
-    /// 打开文件持有，关掉之后树就拆掉（Linux 的 `FMODE_NEED_UNMOUNT`）。
+    /// The anonymous mount namespace holding a tree copied by open_tree(`OPEN_TREE_CLONE`): held
+    /// by this open file until attached; once it is closed the tree is torn down (Linux's
+    /// `FMODE_NEED_UNMOUNT`).
     pub tree: Option<Rc<crate::vfs::MntNs>>,
-    /// 不是经由 open 建的（memfd_create，Linux 的 `alloc_file_pseudo`）：不算文件的写者，
-    /// 执行它不是 ETXTBSY；经由 `/proc/<pid>/fd/<n>` 重新打开的照常算。也不经由挂载，
-    /// noexec、nosuid 不适用。
+    /// Not created through open (memfd_create, Linux's `alloc_file_pseudo`): not counted as a
+    /// writer of the file, so executing it is not ETXTBSY; a reopen through
+    /// `/proc/<pid>/fd/<n>` counts as usual. It also goes through no mount, so noexec and nosuid
+    /// do not apply.
     pub pseudo: bool,
 }
 
 impl OpenFile {
-    /// 新建打开文件。
+    /// Creates an open file.
     pub fn new(kind: FileKind, flags: u32) -> FileRef {
         Self::with_path(kind, flags, None)
     }
 
-    /// 新建打开文件，并记下打开时的绝对路径。
+    /// Creates an open file and records the absolute path at open time.
     pub fn with_path(kind: FileKind, flags: u32, path: Option<Rc<[u8]>>) -> FileRef {
         Rc::new(RefCell::new(OpenFile {
             kind,
@@ -221,17 +235,17 @@ impl OpenFile {
         }))
     }
 
-    /// 是否可读。
+    /// Whether it is readable.
     pub fn readable(&self) -> bool {
         self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_WRONLY
     }
 
-    /// 是否可写。
+    /// Whether it is writable.
     pub fn writable(&self) -> bool {
         self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_RDONLY
     }
 
-    /// 对应的文件系统节点（宿主 fd、匿名管道和 PTY 没有）。
+    /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).
     pub fn node(&self) -> Option<Node> {
         match &self.kind {
             FileKind::Pipe(end) => end.pipe.borrow().fifo.map(|ino| Node::Store(self.mnt, ino)),
@@ -255,26 +269,30 @@ impl OpenFile {
         }
     }
 
-    /// 仓库里的 inode（chmod、chown 等只对它们有意义）。
+    /// The inode in the store (chmod, chown and the like only make sense for these).
     pub fn ino(&self) -> Option<Ino> {
         self.node()?.ino()
     }
 
-    /// 是否以非阻塞方式打开。
+    /// Whether it was opened nonblocking.
     pub fn nonblocking(&self) -> bool {
         self.flags & oflags::O_NONBLOCK != 0
     }
 }
 
 impl Drop for OpenFile {
-    /// 最后一个引用消失：持有的 flock、OFD 锁、租约随之释放，等锁的线程要重新检查
-    /// （[`wake::LOCK`](crate::kernel::wake::LOCK)）；宿主 socket 的 fd 要关掉了，在 poll、
-    /// epoll、阻塞的收发里等着它的线程的宿主 poll 还拿着它（宿主 socket 要等它们放手才
-    /// 真正关闭），只叫醒登记了这个 socket 的等待者。别的文件关闭时不必叫醒谁：管道、
-    /// PTY、AF_UNIX socket 的另一方由 `PipeEnd`、`PtyEnd`、`UnixSocket` 叫醒（只叫醒等这个
-    /// 管道、PTY、连接的），epoll、eventfd、inotify、消息队列这类对象关闭时没有线程在等它
-    /// （阻塞在上面的收发拿着打开文件，与 Linux 一样不因别人关闭 fd 而醒）。shell 每次
-    /// exec、退出都要关好几个文件，原来每关一个都把读着管道的进程叫醒一遍。
+    /// The last reference goes away: the flocks, OFD locks and leases it holds are released with
+    /// it, so threads waiting for locks must check again
+    /// ([`wake::LOCK`](crate::kernel::wake::LOCK)); a host socket's fd is about to be closed, and
+    /// the host polls of threads waiting for it in poll, epoll or blocking sends and receives
+    /// still hold it (the host socket is really closed only once they let go), so only the waiters
+    /// registered for this socket are woken. Closing
+    /// other files need not wake anyone: the other side of a pipe, PTY or AF_UNIX socket is woken
+    /// by `PipeEnd`, `PtyEnd` or `UnixSocket` (only those waiting for that pipe, PTY or
+    /// connection), and no thread waits for objects such as epoll, eventfd, inotify and message
+    /// queues when they are closed (blocked sends and receives on them hold the open file and, as
+    /// on Linux, do not wake because someone else closed the fd). A shell closes several files on
+    /// every exec and exit, and each close used to wake the processes reading pipes.
     fn drop(&mut self) {
         match &self.kind {
             FileKind::Socket(s)
@@ -292,18 +310,21 @@ impl Drop for OpenFile {
     }
 }
 
-/// signalfd 的状态。与 Linux 一样不属于哪个线程：poll、epoll 和读看的都是调用的线程和
-/// 它的线程组挂起的信号（[`crate::task::current`]），fork 出来的进程看自己的。
+/// signalfd state. As on Linux it belongs to no thread: poll, epoll and read all look at the
+/// signals pending for the calling thread and its thread group ([`crate::task::current`]), and a
+/// forked process sees its own.
 pub struct SignalFd {
-    /// 关注的信号（不含 SIGKILL、SIGSTOP）。
+    /// The signals of interest (excluding SIGKILL and SIGSTOP).
     pub mask: u64,
-    /// 创建它的线程组：不在 guest 线程上检查它时（定时器线程替信号驱动的 I/O、独占门
-    /// 检查）只看这个线程组挂起的信号。
+    /// The thread group that created it: when it is checked off a guest thread (the timer thread
+    /// on behalf of signal-driven I/O and exclusive gates), only this thread group's pending
+    /// signals are looked at.
     pub group: std::rc::Weak<RefCell<crate::process::ThreadGroup>>,
 }
 
 impl SignalFd {
-    /// 调用的线程和它的线程组；不在 guest 线程上时是创建它的线程组。
+    /// The calling thread and its thread group; off a guest thread, the thread group that created
+    /// it.
     fn pending(
         &self,
     ) -> (
@@ -316,14 +337,15 @@ impl SignalFd {
         }
     }
 
-    /// 调用的线程和它的线程组一共挂起过几次信号（`syscall::poll` 的数据代数）。
+    /// How many signals have become pending in total for the calling thread and its thread group
+    /// (`syscall::poll`'s data generation).
     pub fn arrivals(&self) -> u64 {
         let (task, group) = self.pending();
         let group = group.map_or(0, |g| g.borrow().pending.arrivals());
         group + task.map_or(0, |t| t.pending.borrow().arrivals())
     }
 
-    /// 有没有调用的线程读得走的信号（poll）。
+    /// Whether there is a signal the calling thread can read (poll).
     pub fn ready(&self) -> bool {
         let (task, group) = self.pending();
         let group = group.map_or(0, |g| g.borrow().pending.set());
@@ -332,14 +354,15 @@ impl SignalFd {
     }
 }
 
-/// pidfd 指向的进程。拿的是弱引用：pid 分给了别的进程之后，它仍然指向原来那个。
+/// The process a pidfd refers to. It holds a weak reference: after the pid is given to another
+/// process, it still refers to the original one.
 pub struct Pidfd {
     pub tgid: crate::kernel::Tid,
     pub group: std::rc::Weak<RefCell<crate::process::ThreadGroup>>,
 }
 
 impl Pidfd {
-    /// 进程还没有被回收时返回它的线程组（可能是僵尸进程）。
+    /// Returns the process's thread group if it has not been reaped yet (it may be a zombie).
     pub fn group(
         &self,
         k: &crate::kernel::Kernel,
@@ -351,7 +374,7 @@ impl Pidfd {
             .then_some(g)
     }
 
-    /// 所有线程都已退出（poll 可读）。
+    /// All threads have exited (poll readable).
     pub fn exited(&self) -> bool {
         self.group
             .upgrade()
@@ -359,31 +382,31 @@ impl Pidfd {
     }
 }
 
-/// timerfd 的状态。
+/// timerfd state.
 pub struct TimerFd {
-    /// 时钟（`CLOCK_REALTIME` 等）：设置绝对时间时按它换算。
+    /// The clock (`CLOCK_REALTIME` and so on): absolute times are converted with it when set.
     pub clock: i32,
-    /// 下一次到期的时刻（宿主的单调时钟）；None 表示没有启动。
+    /// The time of the next expiration (host monotonic clock); None means not armed.
     pub deadline: Option<Instant>,
-    /// 到期之后重新计时的间隔，0 表示只触发一次。
+    /// The interval to rearm with after expiring; 0 means firing only once.
     pub interval: Duration,
-    /// 已经到期、还没有被读走的次数。
+    /// Expirations that have happened and not been read yet.
     pub expirations: u64,
-    /// 一共到期过几次（不因为读走而减少）：epoll 的 `EPOLLET` 每次到期都触发。
+    /// Total expirations (not reduced by reads): epoll's `EPOLLET` fires on every expiration.
     pub fired: u64,
-    /// 上一次 timerfd_settime 的 flags（`/proc/<pid>/fdinfo`）。
+    /// The flags of the last timerfd_settime (`/proc/<pid>/fdinfo`).
     pub settime_flags: u32,
 }
 
 impl TimerFd {
-    /// 离下一次到期还有多久，没有启动时是 0（timerfd_gettime 的 `it_value`）。
+    /// How long until the next expiration, 0 when not armed (timerfd_gettime's `it_value`).
     pub fn remaining(&mut self, now: Instant) -> Duration {
         self.update(now);
         self.deadline
             .map_or(Duration::ZERO, |d| d.saturating_duration_since(now))
     }
 
-    /// `/proc/<pid>/fdinfo` 里 timerfd 特有的几行。
+    /// The timerfd-specific lines in `/proc/<pid>/fdinfo`.
     pub fn fdinfo(&mut self) -> String {
         let left = self.remaining(Instant::now());
         format!(
@@ -398,7 +421,7 @@ impl TimerFd {
         )
     }
 
-    /// 把 `now` 之前到期的次数记进 `expirations`。
+    /// Adds the expirations before `now` to `expirations`.
     pub fn update(&mut self, now: Instant) {
         let Some(d) = self.deadline.filter(|&d| d <= now) else {
             return;
@@ -415,29 +438,30 @@ impl TimerFd {
     }
 }
 
-/// eventfd 的状态。
+/// eventfd state.
 pub struct EventFd {
-    /// 计数器。
+    /// The counter.
     pub count: u64,
-    /// `EFD_SEMAPHORE`：每次读只减 1。
+    /// `EFD_SEMAPHORE`: each read only subtracts 1.
     pub semaphore: bool,
-    /// 写入、读出的次数：与 Linux 一样，每次写都让读的一方的 `EPOLLET` 再触发一次（mio
-    /// 的唤醒器就靠它，从来不读走计数），每次读都让写的一方再触发一次。
+    /// Number of writes and reads: as on Linux, every write makes the reading side's `EPOLLET`
+    /// fire again (mio's waker relies on this and never reads the count away), and every read
+    /// makes the writing side's fire again.
     pub writes: u64,
     pub reads: u64,
 }
 
-/// 宿主 fd 上新到的事件（[`appine_hal::Edges`]）累计的次数。
+/// Accumulated counts of newly arrived events on a host fd ([`appine_hal::Edges`]).
 pub struct HostEdges {
     edges: appine_hal::Edges,
     counts: std::cell::Cell<[u64; 2]>,
-    /// 宿主 epoll 上可能有还没取走的事件：最近一次和宿主 fd 一起 poll 时它可读
-    /// （[`HostEdges::polled`]）。
+    /// The host epoll may have events not yet taken: it was readable the last time it was polled
+    /// together with the host fd ([`HostEdges::polled`]).
     unread: std::cell::Cell<bool>,
 }
 
 impl HostEdges {
-    /// 开始记录宿主 fd `fd` 上新到的事件。
+    /// Starts recording newly arrived events on host fd `fd`.
     pub fn new(fd: i32) -> Result<HostEdges, i32> {
         Ok(HostEdges {
             edges: appine_hal::Edges::new(fd)?,
@@ -446,7 +470,7 @@ impl HostEdges {
         })
     }
 
-    /// 到现在为止读、写两个方向各到过几次事件。
+    /// How many events have arrived so far in each direction, read and write.
     pub fn counts(&self) -> [u64; 2] {
         self.unread.set(false);
         let (r, w) = self.edges.take();
@@ -456,8 +480,9 @@ impl HostEdges {
         now
     }
 
-    /// 与 [`HostEdges::counts`] 相同，但刚刚和宿主 fd 一起 poll 过（[`HostEdges::polled`]）：
-    /// 那时宿主 epoll 不可读就不必再问宿主，每次检查少一次系统调用。
+    /// The same as [`HostEdges::counts`], but just after polling together with the host fd
+    /// ([`HostEdges::polled`]): if the host epoll was not readable then, there is no need to ask
+    /// the host again, saving one system call per check.
     pub fn counts_polled(&self) -> [u64; 2] {
         if self.unread.get() {
             self.counts()
@@ -466,18 +491,19 @@ impl HostEdges {
         }
     }
 
-    /// 和宿主 fd 一起 poll 了宿主 epoll 的 fd，得到 `revents`。
+    /// The host epoll's fd was polled together with the host fd, giving `revents`.
     pub fn polled(&self, revents: i16) {
         self.unread.set(self.unread.get() || revents != 0);
     }
 
-    /// 有新事件时可读的宿主 fd，等待时放进宿主 poll。
+    /// The host fd that is readable when there are new events, put into the host poll while
+    /// waiting.
     pub fn fd(&self) -> i32 {
         self.edges.fd()
     }
 }
 
-/// 打开文件的共享引用。
+/// A shared reference to an open file.
 pub type FileRef = Rc<RefCell<OpenFile>>;
 
 #[derive(Clone)]
@@ -486,12 +512,12 @@ struct Slot {
     cloexec: bool,
 }
 
-/// 一个进程的 fd 表。
+/// A process's fd table.
 pub struct FdTable {
     slots: Vec<Option<Slot>>,
-    /// 新的 fd 必须小于它（`RLIMIT_NOFILE` 的软限制，由 prlimit 同步过来）。
+    /// New fds must be below this (the soft limit of `RLIMIT_NOFILE`, synced from prlimit).
     pub limit: usize,
-    /// 加过 POSIX 记录锁（锁属于 fd 表，见 `crate::locks`）。
+    /// Has taken POSIX record locks (the locks belong to the fd table, see `crate::locks`).
     pub holds_locks: bool,
 }
 
@@ -506,7 +532,8 @@ impl Default for FdTable {
 }
 
 impl Clone for FdTable {
-    /// fork、`CLONE_FILES` 之外的 clone、unshare：POSIX 锁属于原来的 fd 表，不随之复制。
+    /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
+    /// and are not copied with it.
     fn clone(&self) -> Self {
         FdTable {
             slots: self.slots.clone(),
@@ -517,15 +544,16 @@ impl Clone for FdTable {
 }
 
 impl FdTable {
-    /// 空表。
+    /// An empty table.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 0/1/2 分别是宿主的 stdin/stdout/stderr。
+    /// 0/1/2 are the host's stdin/stdout/stderr respectively.
     pub fn with_host_stdio() -> Self {
         let mut t = Self::new();
-        // 与原来一样带着 O_LARGEFILE：宿主那边多半是 open 打开的终端、文件
+        // With O_LARGEFILE as the originals have it: on the host side these are most likely
+        // terminals or files opened with open
         for (fd, flags) in [
             (0, oflags::O_RDONLY | oflags::O_LARGEFILE),
             (1, oflags::O_WRONLY | oflags::O_LARGEFILE),
@@ -537,7 +565,7 @@ impl FdTable {
         t
     }
 
-    /// 取出 fd 对应的打开文件。
+    /// Gets the open file for an fd.
     pub fn get(&self, fd: i32) -> Result<FileRef, Errno> {
         usize::try_from(fd)
             .ok()
@@ -547,7 +575,7 @@ impl FdTable {
             .ok_or(Errno::EBADF)
     }
 
-    /// 不小于 `min` 的最小空闲 fd。
+    /// The lowest free fd not below `min`.
     pub fn free_slot(&self, min: usize) -> Result<i32, Errno> {
         (min..self.limit)
             .find(|&i| self.slots.get(i).is_none_or(Option::is_none))
@@ -555,14 +583,14 @@ impl FdTable {
             .ok_or(Errno::EMFILE)
     }
 
-    /// 放到不小于 `min` 的最小空闲 fd 上。
+    /// Installs at the lowest free fd not below `min`.
     pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
         let fd = self.free_slot(min)?;
         self.install_at(fd, file, cloexec)?;
         Ok(fd)
     }
 
-    /// 放到指定的 fd 上，返回被替换掉的原来的文件（dup2/dup3）。
+    /// Installs at the given fd, returning the file it replaced (dup2/dup3).
     pub fn install_at(
         &mut self,
         fd: i32,
@@ -580,7 +608,7 @@ impl FdTable {
         Ok(old.map(|s| s.file))
     }
 
-    /// 关闭 fd，返回关闭的文件。
+    /// Closes an fd, returning the closed file.
     pub fn close(&mut self, fd: i32) -> Result<FileRef, Errno> {
         let slot = usize::try_from(fd)
             .ok()
@@ -589,7 +617,7 @@ impl FdTable {
         slot.take().map(|s| s.file).ok_or(Errno::EBADF)
     }
 
-    /// 所有打开着的 fd，从小到大。
+    /// All open fds, in increasing order.
     pub fn open_fds(&self) -> Vec<i32> {
         self.slots
             .iter()
@@ -599,7 +627,7 @@ impl FdTable {
             .collect()
     }
 
-    /// execve：关闭所有带 close-on-exec 标志的 fd，返回关闭的文件。
+    /// execve: closes every fd with the close-on-exec flag, returning the closed files.
     pub fn close_on_exec(&mut self) -> Vec<FileRef> {
         let mut closed = Vec::new();
         for slot in &mut self.slots {
@@ -610,8 +638,8 @@ impl FdTable {
         closed
     }
 
-    /// close_range(2)：关闭（或只标记 close-on-exec）`[first, last]` 里的 fd，返回
-    /// 关闭的文件。
+    /// close_range(2): closes (or only marks close-on-exec) the fds in `[first, last]`, returning
+    /// the closed files.
     pub fn close_range(&mut self, first: usize, last: usize, cloexec_only: bool) -> Vec<FileRef> {
         let mut closed = Vec::new();
         let end = last.saturating_add(1).min(self.slots.len());
@@ -624,12 +652,12 @@ impl FdTable {
         closed
     }
 
-    /// 读取 close-on-exec 标志。
+    /// Reads the close-on-exec flag.
     pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
         self.slot(fd).map(|s| s.cloexec)
     }
 
-    /// 设置 close-on-exec 标志。
+    /// Sets the close-on-exec flag.
     pub fn set_cloexec(&mut self, fd: i32, cloexec: bool) -> Result<(), Errno> {
         let i = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         let slot = self
@@ -651,8 +679,9 @@ impl FdTable {
 }
 
 impl Drop for FdTable {
-    /// fd 表消失（进程退出）：它持有的记录锁随之失效，等锁的线程要重新检查。没加过锁的
-    /// 不必：原来每个进程退出都把所有读着管道、在 poll 里等着的线程叫醒一遍。
+    /// The fd table goes away (process exit): the record locks it holds lapse with it, so threads
+    /// waiting for locks must check again. Not needed if it never took a lock: every process exit
+    /// used to wake all threads reading pipes or waiting in poll.
     fn drop(&mut self) {
         if self.holds_locks {
             crate::kernel::request_wake_locks();
@@ -675,15 +704,16 @@ mod tests {
         assert_eq!(t.install(f.clone(), false, 10), Ok(10));
         assert_eq!(t.close(7).err(), Some(Errno::EBADF));
         assert_eq!(t.get(-1).err(), Some(Errno::EBADF));
-        // 新的 fd 不能超过 RLIMIT_NOFILE
+        // New fds cannot exceed RLIMIT_NOFILE
         t.limit = 11;
         for fd in [4, 5, 6, 7, 8, 9] {
             assert_eq!(t.install(f.clone(), false, 0), Ok(fd));
         }
         assert_eq!(t.install(f.clone(), false, 0), Err(Errno::EMFILE));
-        // 起点超出上限也是没有空位（F_DUPFD 的 EINVAL 由调用方检查）
+        // A starting point beyond the limit also means no free slot (the caller checks F_DUPFD's
+        // EINVAL)
         assert_eq!(t.install(f.clone(), false, 11), Err(Errno::EMFILE));
-        // dup 出来的 fd 共享同一个打开文件
+        // fds created by dup share one open file
         f.borrow_mut().pos = 5;
         assert_eq!(t.get(10).unwrap().borrow().pos, 5);
     }

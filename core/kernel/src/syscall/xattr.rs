@@ -1,10 +1,12 @@
-//! 扩展属性：setxattr、getxattr、listxattr、removexattr，以及按符号链接本身（`l`）
-//! 和按 fd（`f`）的变体。
+//! Extended attributes: setxattr, getxattr, listxattr, removexattr, and the variants that act on
+//! the symlink itself (`l`) and on an fd (`f`).
 //!
-//! 扩展属性存在 inode 仓库的数据库里（kernel/vfs 的 map）。合成文件系统（/proc、/dev/pts）
-//! 的节点没有扩展属性，管道、socket 等不在文件系统里的文件不支持。权限按 Linux 的
-//! `xattr_permission` 和 commoncap 的钩子检查（[`permission`]）；程序文件的能力
-//! `security.capability` 写的时候检查格式，读的时候按 [`FileCaps::xattr_for_reader`] 转换。
+//! Extended attributes live in the inode store's database (the kernel/vfs map). Nodes of
+//! synthetic filesystems (/proc, /dev/pts) have no extended attributes, and files not in a
+//! filesystem, such as pipes and sockets, do not support them. Permissions are checked as in
+//! Linux's `xattr_permission` and commoncap's hooks ([`permission`]); program file capabilities,
+//! `security.capability`, are format-checked on write and converted on read by
+//! [`FileCaps::xattr_for_reader`].
 
 use super::fs::{AT_FDCWD, attrib_at, attrib_fd, lookup_at};
 use super::{SysResult, inotify, read_path};
@@ -18,22 +20,22 @@ use crate::vfs::store::{Ino, Stat, mode};
 
 const XATTR_CREATE: u32 = 1;
 const XATTR_REPLACE: u32 = 2;
-/// 名字的最大长度。
+/// Maximum name length.
 const XATTR_NAME_MAX: usize = 255;
-/// 值的最大长度。
+/// Maximum value length.
 const XATTR_SIZE_MAX: usize = 65536;
-/// 名字必须带其中一个命名空间前缀。
+/// Names must carry one of these namespace prefixes.
 const NAMESPACES: [&[u8]; 4] = [b"security.", b"system.", b"trusted.", b"user."];
 
-/// 操作的对象。
+/// The object operated on.
 #[derive(Clone, Copy)]
 pub(super) enum Target {
-    /// 路径，以及是否跟随最后一个符号链接。
+    /// A path, and whether to follow the last symlink.
     Path(u64, bool),
     Fd(i32),
 }
 
-/// 找到对象的节点；不在文件系统里的文件返回 EOPNOTSUPP。
+/// Finds the object's node; EOPNOTSUPP for files not in a filesystem.
 fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
     match target {
         Target::Path(path, follow) => {
@@ -51,12 +53,13 @@ fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
     }
 }
 
-/// 仓库里的 inode；合成文件系统的节点返回 `pseudo`。
+/// The inode in the store; `pseudo` for nodes of synthetic filesystems.
 fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
     node.ino().ok_or(pseudo)
 }
 
-/// 要改扩展属性的 inode：只读的挂载里是 EROFS（Linux 的 `mnt_want_write`，在别的检查之前）。
+/// The inode whose extended attributes are about to change: EROFS on a read-only mount (Linux's
+/// `mnt_want_write`, before the other checks).
 fn writable_ino(cx: &Cx<'_>, node: Node) -> Result<Ino, Errno> {
     if cx.vfs()?.readonly(&node) {
         return Err(Errno::EROFS);
@@ -81,13 +84,15 @@ fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     Ok(name)
 }
 
-/// 读（`write` 为 false）或者写名为 `name` 的扩展属性的权限：
+/// Permission to read (`write` false) or write the extended attribute named `name`:
 ///
-/// - `trusted.*` 要 `CAP_SYS_ADMIN`，没有时写是 EPERM，读是 ENODATA（看不到它们）；
-/// - `user.*` 只能在普通文件和目录上（不然写是 EPERM，读是 ENODATA），粘滞位目录上只有
-///   属主能写，读写都要有文件本身的读写权限；
-/// - `security.*` 写要 `CAP_SYS_ADMIN`（`security.capability` 由调用方检查 `CAP_SETFCAP`），
-///   读不限；`system.*` 不限。
+/// - `trusted.*` needs `CAP_SYS_ADMIN`; without it writes are EPERM and reads ENODATA (they are
+///   invisible);
+/// - `user.*` only on regular files and directories (otherwise writes are EPERM and reads
+///   ENODATA); on a sticky directory only the owner may write; reads and writes need read and
+///   write permission, respectively, on the file itself;
+/// - `security.*` writes need `CAP_SYS_ADMIN` (the caller checks `CAP_SETFCAP` for
+///   `security.capability`), reads are unrestricted; `system.*` is unrestricted.
 fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Errno> {
     let cred = cx.cred();
     let hidden = if write { Errno::EPERM } else { Errno::ENODATA };
@@ -118,7 +123,8 @@ fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Er
     Ok(())
 }
 
-/// 把结果写回 guest：`size` 为 0 时只返回长度，缓冲区不够时返回 ERANGE。
+/// Writes the result back to the guest: with `size` 0 only the length is returned, and ERANGE if
+/// the buffer is too small.
 fn reply(cx: &Cx<'_>, buf: u64, size: usize, data: &[u8]) -> SysResult {
     if size == 0 {
         return Ok(data.len() as u64);
@@ -150,8 +156,8 @@ pub(super) fn setxattr(
     let ino = writable_ino(cx, node_of(cx, target)?)?;
     let vfs = cx.vfs()?;
     let store = vfs.store();
-    // 程序文件的能力：只接受 v2、v3，要有 CAP_SETFCAP（cap_convert_nscap，在别的检查之前；
-    // 长度为 0 时 Linux 不检查）
+    // Program file capabilities: only v2 and v3 are accepted, and CAP_SETFCAP is needed
+    // (cap_convert_nscap, before the other checks; Linux does not check when the length is 0)
     if name == XATTR_NAME_CAPS && size > 0 {
         if !FileCaps::valid_xattr(&v) {
             return Err(Errno::EINVAL);
@@ -172,7 +178,7 @@ pub(super) fn setxattr(
     Ok(0)
 }
 
-/// 改了扩展属性：报告 inotify 的 IN_ATTRIB。
+/// An extended attribute changed: report inotify's IN_ATTRIB.
 fn attrib(cx: &Cx<'_>, target: Target, ino: Ino) {
     match target {
         Target::Path(path, follow) if inotify::active(cx.kr()) => {
@@ -208,7 +214,7 @@ pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize)
         Node::Store(_, ino) => cx.vfs()?.store().list_xattr(ino)?,
         Node::Pseudo(..) => Vec::new(),
     };
-    // 与 Linux 的 trusted 处理函数一样，没有 CAP_SYS_ADMIN 时不列出 trusted.*
+    // As in Linux's trusted handler, trusted.* is not listed without CAP_SYS_ADMIN
     let trusted = cx.cred().capable(cap::SYS_ADMIN);
     let mut out = Vec::new();
     for n in names
@@ -226,7 +232,7 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     let ino = writable_ino(cx, node_of(cx, target)?)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
-    // 去掉程序文件的能力要 CAP_SETFCAP（cap_inode_removexattr）
+    // Removing program file capabilities needs CAP_SETFCAP (cap_inode_removexattr)
     if name == XATTR_NAME_CAPS && !cx.cred().capable(cap::SETFCAP) {
         return Err(Errno::EPERM);
     }

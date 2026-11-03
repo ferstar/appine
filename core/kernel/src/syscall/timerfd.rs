@@ -1,8 +1,10 @@
-//! timerfd：timerfd_create、timerfd_settime、timerfd_gettime，以及对它的 read。
+//! timerfd: timerfd_create, timerfd_settime, timerfd_gettime, and reads from it.
 //!
-//! 到期时刻按宿主的单调时钟记录，读取和 poll 时把已经到期的次数算出来；等待的线程把
-//! 最早的到期时刻当作超时（[`super::poll`]）。设置绝对时间时按定时器的时钟换算。
-//! `TFD_TIMER_CANCEL_ON_SET` 接受但不起作用：guest 改不了宿主的时间。
+//! Expiration times are recorded on the host's monotonic clock, and reads and poll compute the
+//! number of expirations already passed; waiting threads use the earliest expiration time as
+//! their timeout ([`super::poll`]). Absolute times are converted using the timer's clock when set.
+//! `TFD_TIMER_CANCEL_ON_SET` is accepted but has no effect: the guest cannot change the host's
+//! time.
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -61,7 +63,7 @@ fn timer_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<TimerFd>>, Errno> {
     }
 }
 
-/// 读 `struct timespec`：秒为负或者纳秒超出范围时返回 EINVAL。
+/// Reads a `struct timespec`: EINVAL if the seconds are negative or the nanoseconds out of range.
 fn timespec(b: &[u8]) -> Result<Duration, Errno> {
     let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap());
@@ -71,7 +73,8 @@ fn timespec(b: &[u8]) -> Result<Duration, Errno> {
     Ok(Duration::new(sec as u64, nsec as u32))
 }
 
-/// `struct itimerspec`：间隔和离下一次到期还有多久（没有启动时都是 0）。
+/// `struct itimerspec`: the interval and how long until the next expiration (both 0 when not
+/// armed).
 fn current(t: &mut TimerFd) -> [u8; 32] {
     let left = t.remaining(Instant::now());
     let mut b = [0u8; 32];
@@ -106,7 +109,7 @@ pub(super) fn timerfd_settime(
     t.deadline = if value.is_zero() {
         None
     } else if flags & TFD_TIMER_ABSTIME != 0 {
-        // 闹钟类时钟和对应的普通时钟读数相同
+        // An alarm clock reads the same as its ordinary counterpart
         let clock = match t.clock {
             CLOCK_REALTIME_ALARM => CLOCK_REALTIME,
             CLOCK_BOOTTIME_ALARM => CLOCK_BOOTTIME,
@@ -116,7 +119,7 @@ pub(super) fn timerfd_settime(
     } else {
         Some(Instant::now() + value)
     };
-    // 别的线程可能正带着原来的到期时刻等它（epoll_wait、read）
+    // Other threads may be waiting on it with the old expiration time (epoll_wait, read)
     request_wake_object(wake::of(&timer));
     Ok(0)
 }
@@ -127,7 +130,7 @@ pub(super) fn timerfd_gettime(cx: &mut Cx<'_>, fd: i32, cur: u64) -> SysResult {
     put(cx, cur, b).map(|()| 0)
 }
 
-/// 读出到期的次数（8 字节），还没到期时等待。
+/// Reads the number of expirations (8 bytes), waiting if none has happened yet.
 pub(super) fn read(
     cx: &mut Cx<'_>,
     timer: &Rc<RefCell<TimerFd>>,

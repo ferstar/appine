@@ -1,25 +1,29 @@
-//! inotify：inotify_init1、inotify_add_watch、inotify_rm_watch，以及对它的 read。
+//! inotify: inotify_init1, inotify_add_watch, inotify_rm_watch, and reads from it.
 //!
-//! 所有文件系统修改都经过内核层，事件由各个 syscall 在改完仓库之后报告，位置和顺序与
-//! Linux 的 fsnotify 钩子相同。监视按仓库的 inode 登记在 [`Registry`] 里；没有任何监视
-//! 时，每个事件只多一次判空。
+//! Every filesystem change goes through the kernel layer, and each syscall reports its events
+//! after changing the store, at the same places and in the same order as Linux's fsnotify hooks.
+//! Watches are registered in [`Registry`] by store inode; with no watches at all, each event costs
+//! only one emptiness check.
 //!
-//! - 文件上的事件同时报给它所在目录的监视（带名字）。按路径操作时，有监视才再解析一次
-//!   路径找出目录（[`watched_parent`]）。按 fd 操作（读写、截断、关闭）时用打开时经过的
-//!   目录和名字：每个打开的仓库文件带一个 [`Opened`] 记着它们，相当于 Linux 打开文件
-//!   引用的目录项。rename 移动目录项时一起改（[`renamed`]）；删除之后不变，与 Linux
-//!   一样仍然报给原来的目录。
-//! - `IN_CLOSE_*` 在打开文件的最后一个引用释放时报告（[`Opened`] 析构），与 Linux 的
-//!   fput 相同。
-//! - `IN_DELETE_SELF` 在最后一个链接删除时报告；还有经由被删除的那个名字打开着的文件
-//!   时，等它们都关闭再报告（[`deleted`]），与 Linux 在目录项最后一个引用释放时报告
-//!   相同。
-//! - 目录上的事件带 `IN_ISDIR`；`IN_DELETE_SELF`、`IN_MOVE_SELF` 不带，inotify 一直
-//!   如此（Linux 为兼容老程序特意去掉）。
-//! - 合成文件系统（procfs、devpts）上可以建监视，但不会有事件。
-//! - 与 Linux 相同：与队尾未读事件完全相同的事件合并；排队 `max_queued_events` 个事件
-//!   之后丢弃新的，并排一个 `IN_Q_OVERFLOW`。每个用户（有效 uid）的实例数和监视数受
-//!   `max_user_instances`、`max_user_watches` 限制，超过时分别是 EMFILE、ENOSPC。
+//! - Events on a file are also reported to the watches of its directory (with the name). For
+//!   path-based operations, the path is resolved a second time to find the directory only when
+//!   there are watches ([`watched_parent`]). For fd-based operations (reads, writes, truncation,
+//!   close) the directory and name the open went through are used: every open store file carries
+//!   an [`Opened`] recording them, the equivalent of the dentry a Linux open file references. They
+//!   are updated when rename moves the dentry ([`renamed`]); after deletion they stay unchanged
+//!   and, as on Linux, events still go to the original directory.
+//! - `IN_CLOSE_*` is reported when the last reference to the open file is released ([`Opened`]
+//!   dropped), the same as Linux's fput.
+//! - `IN_DELETE_SELF` is reported when the last link is removed; while files opened through the
+//!   removed name are still open, it is reported after they have all closed ([`deleted`]), the
+//!   same as Linux reporting it when the last reference to the dentry is released.
+//! - Events on directories carry `IN_ISDIR`; `IN_DELETE_SELF` and `IN_MOVE_SELF` do not, as
+//!   inotify always has (Linux leaves it out deliberately for compatibility with old programs).
+//! - Watches can be added on synthetic filesystems (procfs, devpts), but never get events.
+//! - As on Linux: an event identical to the unread event at the tail of the queue is merged; once
+//!   `max_queued_events` events are queued, new ones are dropped and one `IN_Q_OVERFLOW` is
+//!   queued. Each user's (effective uid's) instances and watches are limited by
+//!   `max_user_instances` and `max_user_watches`; going over is EMFILE and ENOSPC respectively.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::{Rc, Weak};
@@ -56,14 +60,14 @@ const IN_MASK_CREATE: u32 = 0x1000_0000;
 const IN_MASK_ADD: u32 = 0x2000_0000;
 pub(crate) const IN_ISDIR: u32 = 0x4000_0000;
 const IN_ONESHOT: u32 = 0x8000_0000;
-/// 只报给对象自己、不报给所在目录的事件。
+/// Events reported only to the object itself, not to its directory.
 const SELF_EVENTS: u32 = IN_DELETE_SELF | IN_MOVE_SELF;
 
-/// 一个实例里最多排队的事件数（`max_queued_events` 的默认值）。
+/// The most events queued in one instance (the default of `max_queued_events`).
 const MAX_QUEUED: usize = 16384;
-/// 一个用户最多的实例数（`max_user_instances` 的默认值）。
+/// The most instances per user (the default of `max_user_instances`).
 const MAX_INSTANCES: usize = 128;
-/// 一个用户最多的监视数（`max_user_watches` 的默认值）。
+/// The most watches per user (the default of `max_user_watches`).
 const MAX_WATCHES: usize = 1 << 20;
 
 struct Watch {
@@ -80,7 +84,8 @@ struct Event {
 }
 
 impl Event {
-    /// read 给出的长度：16 字节的 `struct inotify_event`，名字补 NUL 到 16 字节的倍数。
+    /// The length read gives: a 16-byte `struct inotify_event`, with the name padded with NULs
+    /// to a multiple of 16 bytes.
     fn len(&self) -> usize {
         16 + if self.name.is_empty() {
             0
@@ -90,22 +95,23 @@ impl Event {
     }
 }
 
-/// 一个 inotify 实例。
+/// An inotify instance.
 pub struct Inotify {
     watches: BTreeMap<i32, Watch>,
     last_wd: i32,
     queue: VecDeque<Event>,
-    /// 队列里的事件一共多长（FIONREAD）。
+    /// Total length of the queued events (FIONREAD).
     bytes: usize,
-    /// 队列里有 `IN_Q_OVERFLOW`。
+    /// The queue holds an `IN_Q_OVERFLOW`.
     overflowed: bool,
-    /// 排进队列的事件数（`EPOLLET` 每排进一个都触发）。
+    /// Number of events queued (`EPOLLET` fires for each one queued).
     queued: u64,
-    /// 最多排队的事件数：与 Linux 一样取创建时的 `max_queued_events`。
+    /// The most events to queue: as on Linux, `max_queued_events` at creation time.
     max_queued: usize,
-    /// 创建者的有效 uid：实例和监视算在这个用户名下。
+    /// The creator's effective uid: instances and watches are charged to this user.
     uid: u32,
-    /// 登记了监视的 [`Registry`]：实例关闭时从里面去掉自己的监视。
+    /// The [`Registry`] the watches are registered in: when the instance is closed it removes its
+    /// watches from it.
     registry: Weak<RefCell<Registry>>,
 }
 
@@ -140,7 +146,8 @@ impl Drop for Inotify {
             if let Node::Store(_, ino) = w.node
                 && let Some(list) = r.by_ino.get_mut(&ino)
             {
-                // 正在析构的实例已经没有强引用，指向它的弱引用都失效了
+                // An instance being dropped has no strong references left, so all weak
+                // references to it are dead
                 list.retain(|(weak, _)| weak.strong_count() > 0);
                 if list.is_empty() {
                     r.by_ino.remove(&ino);
@@ -151,28 +158,29 @@ impl Drop for Inotify {
 }
 
 impl Inotify {
-    /// 有没有事件可读。
+    /// Whether there are events to read.
     pub fn ready(&self) -> bool {
         !self.queue.is_empty()
     }
 
-    /// 一共排进过几个事件。
+    /// How many events have been queued in total.
     pub fn queued(&self) -> u64 {
         self.queued
     }
 
-    /// 可读的字节数。
+    /// The number of readable bytes.
     pub fn pending(&self) -> usize {
         self.bytes
     }
 
-    /// `/proc/<pid>/fdinfo/<fd>` 里每个监视一行，格式与 Linux 相同。仓库里的文件带上
-    /// name_to_handle_at 给出的句柄。
+    /// One line per watch in `/proc/<pid>/fdinfo/<fd>`, in the same format as Linux. Files in the
+    /// store carry the handle name_to_handle_at gives.
     pub fn fdinfo(&self) -> String {
         let mut out = String::new();
         for (wd, w) in &self.watches {
             let (ino, sdev) = match &w.node {
-                // 内核内部的设备号编码：(主 << 20) | 次，仓库是 8:1，procfs 是 0:4
+                // The kernel's internal device number encoding: (major << 20) | minor; the store is
+                // 8:1, procfs 0:4
                 Node::Store(_, ino) => (*ino, 0x80_0001),
                 Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
             };
@@ -223,24 +231,25 @@ impl Inotify {
     }
 }
 
-/// 监视某个 inode 的实例和 wd。
+/// An instance and wd watching some inode.
 type Watcher = (Weak<RefCell<Inotify>>, i32);
 
-/// 所有监视，按被监视的 inode。
+/// All watches, by watched inode.
 pub struct Registry {
-    /// 每个 inode 上的 (实例, wd)。实例关闭之后弱引用失效，下次碰到时清掉。
+    /// The (instance, wd) pairs on each inode. The weak references die once the instance is
+    /// closed and are cleared the next time they are come across.
     by_ino: HashMap<Ino, Vec<Watcher>>,
     last_cookie: u32,
-    /// 监视所在的仓库：`IN_EXCL_UNLINK` 要查子项还有没有链接。
+    /// The store the watches are in: `IN_EXCL_UNLINK` must check whether a child still has links.
     vfs: Weak<Vfs>,
-    /// 每个用户（有效 uid）的实例数和监视数。
+    /// Instance and watch counts per user (effective uid).
     users: HashMap<u32, (usize, usize)>,
-    /// `/proc/sys/fs/inotify/` 下的三个限制。
+    /// The three limits under `/proc/sys/fs/inotify/`.
     pub max_queued: usize,
     pub max_instances: usize,
     pub max_watches: usize,
-    /// 最后一个链接已经删除，但还有经由那个名字打开着的文件的 inode：这些文件都关闭
-    /// 之后报告 `IN_DELETE_SELF`。
+    /// Inodes whose last link has been removed but that still have files open through that name:
+    /// `IN_DELETE_SELF` is reported once those files have all closed.
     doomed: HashMap<Ino, Vec<Weak<RefCell<OpenFile>>>>,
 }
 
@@ -260,9 +269,10 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// 把事件交给 `ino` 上关心它的监视；返回有没有排进事件（排进事件的实例请求唤醒，见
-    /// `Inotify::push`）。`child` 是目录收到子项
-    /// 自己的事件时那个子项：带 `IN_EXCL_UNLINK` 的监视不要已经删除的子项的事件。
+    /// Hands an event to the watches on `ino` that want it; returns whether any event was queued
+    /// (instances that queue an event request a wakeup, see `Inotify::push`). `child` is the
+    /// child when a directory gets a child's own event: watches with `IN_EXCL_UNLINK` do not want
+    /// events of children that have been deleted.
     fn deliver(
         &mut self,
         ino: Ino,
@@ -300,7 +310,8 @@ impl Registry {
                 inotify.push(*wd, mask, cookie, name);
                 queued = true;
             }
-            // 对象没了，或者一次性的监视已经报告过：去掉监视，报告 IN_IGNORED
+            // The object is gone, or a one-shot watch has already reported: remove the watch and
+            // report IN_IGNORED
             if mask & IN_DELETE_SELF != 0 || wanted && wmask & IN_ONESHOT != 0 {
                 inotify.watches.remove(wd);
                 inotify.push(*wd, IN_IGNORED, 0, b"");
@@ -319,19 +330,19 @@ impl Registry {
         queued
     }
 
-    /// 用户 `uid` 少了一个监视。
+    /// User `uid` has one watch fewer.
     fn uncharge(&mut self, uid: u32) {
         let user = self.users.entry(uid).or_default();
         user.1 = user.1.saturating_sub(1);
     }
 
-    /// 打开文件关闭了：它是经由已经删除的名字打开的最后一个文件时报告
-    /// `IN_DELETE_SELF`。
+    /// An open file was closed: if it was the last file opened through a deleted name, report
+    /// `IN_DELETE_SELF`.
     fn closed(&mut self, ino: Ino) {
         let Some(list) = self.doomed.get_mut(&ino) else {
             return;
         };
-        // 正在析构的打开文件已经没有强引用
+        // An open file being dropped has no strong references left
         list.retain(|f| f.strong_count() > 0);
         if list.is_empty() {
             self.doomed.remove(&ino);
@@ -339,8 +350,9 @@ impl Registry {
         }
     }
 
-    /// `ino` 自己的事件：先报给所在目录 `parent` 的监视（带名字），再报给它自己的。
-    /// 放进了事件的实例各自请求唤醒（`Inotify::push`）。
+    /// An event of `ino` itself: reported first to the watches of its directory `parent` (with
+    /// the name), then to its own. Each instance that got an event requests a wakeup
+    /// (`Inotify::push`).
     fn notify(&mut self, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
         if let Some((dir, name)) = parent
             && mask & SELF_EVENTS == 0
@@ -351,8 +363,8 @@ impl Registry {
     }
 }
 
-/// 打开的仓库文件带着它：按 fd 的事件据此报给所在的目录，最后一个引用释放时报告
-/// `IN_CLOSE_WRITE` 或 `IN_CLOSE_NOWRITE`。
+/// Carried by an open store file: fd-based events are reported to its directory through it, and
+/// `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE` is reported when the last reference is released.
 pub struct Opened {
     registry: Weak<RefCell<Registry>>,
     ino: Ino,
@@ -373,24 +385,26 @@ impl Drop for Opened {
     }
 }
 
-/// 有没有任何监视（没有时不必为事件做任何事）。
+/// Whether there are any watches (with none, nothing needs doing for events).
 fn idle(k: &Kernel) -> bool {
     k.inotify.borrow().by_ino.is_empty()
 }
 
-/// 有监视：调用方据此决定要不要为报告事件多查一次仓库。
+/// There are watches: callers use this to decide whether to query the store once more to report
+/// an event.
 pub(crate) fn active(k: &Kernel) -> bool {
     !idle(k)
 }
 
-/// 按路径操作的对象 `ino` 自己的事件；`parent` 是它所在的目录和名字。
+/// An event of the object `ino` itself in a path-based operation; `parent` is its directory and
+/// name.
 pub(crate) fn path_event(k: &Kernel, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
     if !idle(k) {
         k.inotify.borrow_mut().notify(ino, parent, mask);
     }
 }
 
-/// 按 fd 操作的打开文件上的事件。
+/// An event on an open file in an fd-based operation.
 pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
     if idle(k) {
         return;
@@ -411,7 +425,7 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
     k.inotify.borrow_mut().notify(ino, parent, mask);
 }
 
-/// 目录 `dir` 里名为 `name` 的子项被创建、删除、移入或移出。
+/// A child named `name` in directory `dir` was created, deleted, moved in or moved out.
 pub(crate) fn dir_event(k: &Kernel, dir: Ino, name: &[u8], mask: u32, cookie: u32) {
     if !idle(k) {
         k.inotify
@@ -420,14 +434,15 @@ pub(crate) fn dir_event(k: &Kernel, dir: Ino, name: &[u8], mask: u32, cookie: u3
     }
 }
 
-/// rename 的两个事件共用的 cookie。
+/// The cookie shared by the two events of a rename.
 pub(crate) fn cookie(k: &Kernel) -> u32 {
     let mut r = k.inotify.borrow_mut();
     r.last_cookie = r.last_cookie.wrapping_add(1);
     r.last_cookie
 }
 
-/// 新打开的仓库文件要带的 [`Opened`]。`parent` 是打开时经过的目录和名字。
+/// The [`Opened`] a newly opened store file carries. `parent` is the directory and name the open
+/// went through.
 pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -> Option<Opened> {
     let ino = match &f.kind {
         FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => *ino,
@@ -455,8 +470,9 @@ pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -
     })
 }
 
-/// rename 把目录项 `from` 移到了 `to`：经由它打开的文件，之后按 fd 的事件报给新的目录
-/// 和名字（Linux 的 d_move）。`moved` 查出被移动的对象：同名的已经删除的文件不跟着改。
+/// rename moved dentry `from` to `to`: files opened through it report later fd-based events to
+/// the new directory and name (Linux's d_move). `moved` finds the object that was moved: deleted
+/// files with the same name are not updated.
 pub(crate) fn renamed(
     k: &Kernel,
     from: (Ino, &[u8]),
@@ -488,8 +504,8 @@ pub(crate) fn renamed(
     }
 }
 
-/// `ino` 在目录 `dir` 里的最后一个链接 `name` 删除了：报告 `IN_DELETE_SELF`。还有经由
-/// 这个名字打开着的文件时，等它们都关闭再报告。
+/// The last link `name` of `ino` in directory `dir` was removed: report `IN_DELETE_SELF`. While
+/// files opened through this name are still open, it is reported after they have all closed.
 pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
     if !k.inotify.borrow().by_ino.contains_key(&ino) {
         return;
@@ -519,13 +535,16 @@ pub(crate) fn deleted(k: &Kernel, ino: Ino, dir: Ino, name: &[u8]) {
     }
 }
 
-/// 宿主另外打开仓库改了的（"文件"App，[`crate::browse_changing`]）：照对应的 syscall 报
-/// 事件——新建同 mkdirat、openat 的 `O_CREAT`，删除同 unlinkat，移动同 renameat2 的
-/// `RENAME_NOREPLACE`，为写打开同 openat（截断时先 `IN_MODIFY`），关闭时补上对方的写
-/// （`IN_MODIFY`）和 `IN_CLOSE_WRITE`。持有 BKL 时调用。
+/// Changes the host made through its own connection to the store (the Files app,
+/// [`crate::browse_changing`]): events are reported as the corresponding syscalls report them —
+/// creation as mkdirat or openat's `O_CREAT`, removal as unlinkat, moves as renameat2's
+/// `RENAME_NOREPLACE`, opening for write as openat (`IN_MODIFY` first when truncating), and on
+/// close the other side's writes (`IN_MODIFY`) and `IN_CLOSE_WRITE` are added. Called with the BKL
+/// held.
 pub(crate) fn host_change(k: &Kernel, c: &Change) {
     let isdir = |d: bool| if d { IN_ISDIR } else { 0 };
-    // 经由移动的名字打开着的文件跟着改名，没有监视时也要（之后的监视用得到）
+    // Files open through the moved name follow the rename, even with no watches (later watches
+    // need it)
     if let Change::Moved { from, to, ino, .. } = c {
         renamed(k, (from.0, &from.1), (to.0, &to.1), || Some(*ino));
     }
@@ -587,7 +606,8 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
     }
 }
 
-/// 按路径操作时对象所在的目录和名字（报给目录的监视用）。没有任何监视时不解析。
+/// The directory and name of the object of a path-based operation (for the directory's watches).
+/// Not resolved when there are no watches at all.
 pub(crate) fn watched_parent(
     cx: &Cx<'_>,
     dirfd: i32,
@@ -624,7 +644,8 @@ pub(super) fn inotify_init1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
     inotify.uid = uid;
     inotify.registry = Rc::downgrade(&registry);
     drop(r);
-    // 装不进 fd 表时实例在这里析构，计数随之退回
+    // If it does not fit in the fd table the instance is dropped here, and the counts are
+    // returned with it
     let file = OpenFile::new(
         FileKind::Inotify(Rc::new(RefCell::new(inotify))),
         oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
@@ -658,7 +679,7 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     }
     let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
     let mut i = inotify.borrow_mut();
-    // 同一个对象上已经有监视：改掉它的掩码（IN_MASK_ADD 时合并）
+    // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
     if let Some((&wd, w)) = i.watches.iter_mut().find(|(_, w)| w.node == node) {
         if mask & IN_MASK_CREATE != 0 {
             return Err(Errno::EEXIST);
@@ -714,7 +735,8 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     Ok(0)
 }
 
-/// 读出排队的事件：放得下几个就给几个，第一个都放不下时 EINVAL；没有事件时阻塞。
+/// Reads the queued events: as many as fit, EINVAL if not even the first fits; blocks when there
+/// are none.
 pub(super) fn read(
     cx: &mut Cx<'_>,
     inotify: &Rc<RefCell<Inotify>>,
@@ -796,7 +818,7 @@ mod tests {
         let dir = watch(&mut r, &i, 1, IN_MODIFY | IN_CREATE);
         let file = watch(&mut r, &i, 2, IN_MODIFY | IN_DELETE_SELF);
         r.notify(2, Some((1, b"f")), IN_MODIFY);
-        // 只和队尾的事件比较：完全相同的才合并
+        // Compared only with the event at the tail: only identical ones merge
         r.notify(2, None, IN_MODIFY);
         r.notify(2, Some((1, b"f")), IN_ATTRIB);
         r.notify(2, Some((1, b"f")), IN_DELETE_SELF);
@@ -809,7 +831,7 @@ mod tests {
                 (file, IN_IGNORED, vec![]),
             ]
         );
-        // 文件的监视随 IN_DELETE_SELF 去掉，目录的还在
+        // The file's watch goes away with IN_DELETE_SELF; the directory's stays
         assert!(!r.by_ino.contains_key(&2));
         assert!(r.deliver(1, IN_CREATE | IN_ISDIR, 0, b"d", None));
         assert_eq!(events(&i), vec![(dir, IN_CREATE | IN_ISDIR, b"d".to_vec())]);

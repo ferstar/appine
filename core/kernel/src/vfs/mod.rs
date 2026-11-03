@@ -1,14 +1,17 @@
-//! 虚拟文件系统（kernel/vfs 的 map）。
+//! The virtual filesystem (the kernel/vfs map).
 //!
-//! 根文件系统是 inode 仓库，`/dev` 里的设备节点也存在仓库里（[`dev`]）。procfs、
-//! devpts、sysfs 和 cgroup2 是合成文件系统：它们的内容来自内核状态，由内核层经由
-//! [`Pseudo`] 提供。开机时挂在 `/proc`、`/dev/pts`、`/sys`、`/sys/fs/cgroup` 上，之后
-//! 可以用 mount(2) 挂到别的目录上；仓库里的和合成文件系统里的目录、文件都可以 bind 挂载
-//! （[`Mount`]）。tmpfs 是仓库里不挂在根目录下面的一棵树（[`Vfs::new_tmpfs`]），最后一个
-//! 挂载没了时删掉。节点带着它所在的挂载（Linux 的 `struct path`），`..` 和
-//! getcwd 经由挂载点回到上一层，挂载的标志（只读、noexec 等）按经由的挂载算。路径解析在
-//! 整棵树里进行，符号链接最多跟随 40 层；经过的每个仓库目录都要有搜索权限。进程的根目录
-//! 可以被 chroot、pivot_root 换掉：绝对路径从它开始，`..` 不会越过它。
+//! The root filesystem is the inode store, and the device nodes in `/dev` live in the store too
+//! ([`dev`]). procfs, devpts, sysfs and cgroup2 are synthetic filesystems: their content comes
+//! from kernel state and is provided by the kernel layer through [`Pseudo`]. At boot they are
+//! mounted on `/proc`, `/dev/pts`, `/sys` and `/sys/fs/cgroup`, and later mount(2) can mount
+//! them on other directories; directories and files both in the store and in synthetic
+//! filesystems can be bind-mounted ([`Mount`]). A tmpfs is a tree in the store that does not hang
+//! under the root directory ([`Vfs::new_tmpfs`]), deleted when its last mount goes. Nodes carry
+//! the mount they are in (Linux's `struct path`); `..` and getcwd go back up through mount
+//! points, and mount flags (read-only, noexec and so on) follow the mount reached through. Path
+//! resolution runs over the whole tree and follows at most 40 levels of symlinks; every store
+//! directory passed needs search permission. A process's root can be replaced by chroot and
+//! pivot_root: absolute paths start from it, and `..` never goes past it.
 
 pub mod browse;
 pub mod dev;
@@ -25,33 +28,34 @@ use crate::errno::Errno;
 pub(crate) use crate::pseudo::PseudoNode;
 use store::{Ino, ROOT, Stat, Store, mode};
 
-/// 跟随符号链接的最大次数，与 Linux 的 MAXSYMLINKS 一致。
+/// Maximum number of symlinks followed, the same as Linux's MAXSYMLINKS.
 pub(crate) const MAX_SYMLINKS: u32 = 40;
-/// 路径组件的最大长度（`NAME_MAX`）。
+/// Maximum length of a path component (`NAME_MAX`).
 const NAME_MAX: usize = 255;
 
-/// 文件系统树里的一个节点和经由的挂载（Linux 的 `struct path`）：同一个目录挂在（bind 到）
-/// 两处时是两个节点，`..` 各自回到自己的挂载点。
+/// A node in the filesystem tree plus the mount it was reached through (Linux's `struct path`):
+/// one directory mounted (bound) in two places is two nodes, and `..` from each goes back to its
+/// own mount point.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Node {
-    /// inode 仓库里的 inode。
+    /// An inode in the inode store.
     Store(MountId, Ino),
-    /// 合成文件系统里的节点。
+    /// A node in a synthetic filesystem.
     Pseudo(MountId, PseudoNode),
 }
 
 impl Node {
-    /// 开机时的根目录。
+    /// The root directory at boot.
     pub const ROOT: Node = Node::Store(ROOT_MOUNT, ROOT);
 
-    /// 经由的挂载。
+    /// The mount reached through.
     pub(crate) fn mnt(&self) -> MountId {
         match self {
             Node::Store(id, _) | Node::Pseudo(id, _) => *id,
         }
     }
 
-    /// 仓库里的 inode；合成文件系统里的节点是 None。
+    /// The store inode; None for nodes in synthetic filesystems.
     pub(crate) fn ino(&self) -> Option<Ino> {
         match self {
             Node::Store(_, ino) => Some(*ino),
@@ -59,7 +63,7 @@ impl Node {
         }
     }
 
-    /// 同一个文件经由挂载 `id` 时的节点。
+    /// The node of the same file reached through mount `id`.
     pub(crate) fn in_mount(self, id: MountId) -> Node {
         match self {
             Node::Store(_, ino) => Node::Store(id, ino),
@@ -68,30 +72,32 @@ impl Node {
     }
 }
 
-/// 挂载的编号（mountinfo 的第一列、fdinfo 的 `mnt_id`）：所有挂载命名空间统一编号。
+/// Mount id (the first column of mountinfo, `mnt_id` in fdinfo), numbered across all mount
+/// namespaces together.
 pub(crate) type MountId = u32;
 
-/// 开机时的挂载命名空间的编号（`/proc/<pid>/ns/mnt` 里的 inode 号，与 Linux 常见的相同）。
-/// 开机时的 IPC 命名空间的 mqueue 文件系统的设备号（0:19）。
+/// Id of the boot mount namespace (the inode number in `/proc/<pid>/ns/mnt`, the same as is
+/// common on Linux).
+/// Device number of the mqueue filesystem of the boot IPC namespace (0:19).
 pub(crate) const MQUEUE_DEV: u64 = 0x13;
 pub(crate) const INIT_MNT_NS: u64 = 4_026_531_841;
 
-/// 挂载命名空间（Linux 的 `struct mnt_namespace`）：只有编号，每个挂载记着它属于哪个
-/// 命名空间（[`Mount::ns`]）。进程的 `FsContext` 持有它；最后一个引用没了之后，下一次
-/// 清理（[`Vfs::collect`]）时卸下它的所有挂载。
+/// A mount namespace (Linux's `struct mnt_namespace`): only an id; each mount records which
+/// namespace it belongs to ([`Mount::ns`]). A process's `FsContext` holds it; after the last
+/// reference goes, the next cleanup ([`Vfs::collect`]) detaches all its mounts.
 #[derive(Debug)]
 pub(crate) struct MntNs {
     pub id: u64,
-    /// 属主：建立它时所在的用户命名空间（挂载要在这里有 `CAP_SYS_ADMIN`，Linux 的
-    /// `may_mount`）。
+    /// Owner: the user namespace it was created in (mounting needs `CAP_SYS_ADMIN` there,
+    /// Linux's `may_mount`).
     pub owner: std::rc::Rc<crate::cred::UserNs>,
-    /// 匿名的：open_tree(`OPEN_TREE_CLONE`) 复制出来、还没有接上的那棵树所在的，没有进程在
-    /// 里面，由打开文件持有（[`Vfs::anon_ns`]）。
+    /// Anonymous: the namespace of a tree copied by open_tree(`OPEN_TREE_CLONE`) and not yet
+    /// attached; no process is in it, and it is held by an open file ([`Vfs::anon_ns`]).
     pub anon: bool,
 }
 
-/// tmpfs 里一个 inode 占的页数：普通文件按大小，符号链接的目标有 128 字节以上时一页
-/// （Linux 的 `SHORT_SYMLINK_LEN`，短的放在 inode 里），别的不占。
+/// Pages one inode takes in tmpfs: regular files by size, symlinks one page when the target is
+/// 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`; short ones live in the inode), others none.
 pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
     match st.kind() {
         mode::S_IFREG => st.size.div_ceil(TMPFS_PAGE),
@@ -100,57 +106,59 @@ pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
     }
 }
 
-/// 分配新的命名空间编号（Linux 的 `proc_alloc_inum`，各种命名空间共用）。
+/// Allocates a new namespace id (Linux's `proc_alloc_inum`, shared by all kinds of namespace).
 pub(crate) fn new_ns_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4_026_532_160);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
-/// 根文件系统（inode 仓库）。
+/// The root filesystem (the inode store).
 pub(crate) const ROOT_MOUNT: MountId = 1;
-/// 开机时挂在 `/proc` 上的 procfs。
+/// The procfs mounted on `/proc` at boot.
 pub(crate) const PROC_MOUNT: MountId = 2;
-/// 开机时挂在 `/dev/pts` 上的 devpts。
+/// The devpts mounted on `/dev/pts` at boot.
 pub(crate) const PTS_MOUNT: MountId = 3;
-/// 开机时挂在 `/sys` 上的 sysfs。
+/// The sysfs mounted on `/sys` at boot.
 pub(crate) const SYS_MOUNT: MountId = 4;
-/// 不在任何文件系统里的打开文件（管道、socket 等）在 fdinfo 里的 `mnt_id`。
+/// `mnt_id` in fdinfo of open files that are in no filesystem (pipes, sockets and so on).
 pub(crate) const ANON_MOUNT: MountId = 5;
-/// 开机时挂在 `/sys/fs/cgroup` 上的 cgroup2。
+/// The cgroup2 mounted on `/sys/fs/cgroup` at boot.
 pub(crate) const CGROUP_MOUNT: MountId = 6;
-/// 开机时挂在 `/dev` 上的 tmpfs（Linux 的 devtmpfs、容器运行时挂的 tmpfs）。
+/// The tmpfs mounted on `/dev` at boot (Linux's devtmpfs, the tmpfs container runtimes mount).
 pub(crate) const DEV_MOUNT: MountId = 7;
-/// 开机时挂在 `/dev/shm` 上的 tmpfs。
+/// The tmpfs mounted on `/dev/shm` at boot.
 pub(crate) const SHM_MOUNT: MountId = 8;
-/// 开机时挂在 `/dev/mqueue` 上的 mqueue。
+/// The mqueue mounted on `/dev/mqueue` at boot.
 pub(crate) const MQUEUE_MOUNT: MountId = 9;
-/// 开机时挂在 `/run` 上的 tmpfs。
+/// The tmpfs mounted on `/run` at boot.
 pub(crate) const RUN_MOUNT: MountId = 10;
 
-/// 文件系统的种类：inode 仓库和几种合成文件系统。
+/// Kinds of filesystem: the inode store and several synthetic filesystems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Fs {
-    /// inode 仓库（根文件系统）。
+    /// The inode store (the root filesystem).
     Store,
-    /// tmpfs：仓库里不挂在根目录下面的一棵树（[`Vfs::new_tmpfs`]）。
+    /// tmpfs: a tree in the store that does not hang under the root directory
+    /// ([`Vfs::new_tmpfs`]).
     Tmpfs,
-    /// procfs。
+    /// procfs.
     Proc,
-    /// devpts。
+    /// devpts.
     Pts,
-    /// sysfs。
+    /// sysfs.
     Sys,
-    /// cgroup2（`crate::cgroup`）。
+    /// cgroup2 (`crate::cgroup`).
     Cgroup,
-    /// nsfs：命名空间文件（`/proc/<pid>/ns/*` 跟随之后得到的）所在的文件系统。挂不上，只有
-    /// bind 挂载出去的命名空间文件在挂载表里。
+    /// nsfs: the filesystem namespace files (what following `/proc/<pid>/ns/*` gives) are in. It
+    /// cannot be mounted; only namespace files bind-mounted elsewhere are in the mount table.
     Nsfs,
-    /// mqueue：挂上它的进程所在的 IPC 命名空间里的 POSIX 消息队列（`crate::syscall::mqueue`）。
-    /// 每个命名空间一个实例（Linux 的 `get_tree_keyed`），挂载留住那个命名空间。
+    /// mqueue: the POSIX message queues (`crate::syscall::mqueue`) of the IPC namespace of the
+    /// process that mounts it. One instance per namespace (Linux's `get_tree_keyed`); the mount
+    /// keeps that namespace alive.
     Mqueue,
 }
 
 impl Fs {
-    /// mount(2) 能新挂上的文件系统类型（与 `/proc/filesystems` 里的名字相同）。
+    /// Filesystem types mount(2) can newly mount (the same names as in `/proc/filesystems`).
     pub(crate) fn from_type(name: &[u8]) -> Option<Fs> {
         match name {
             b"proc" => Some(Fs::Proc),
@@ -163,7 +171,7 @@ impl Fs {
         }
     }
 
-    /// 文件系统类型的名字。
+    /// Name of the filesystem type.
     pub(crate) const fn type_name(self) -> &'static str {
         match self {
             Fs::Store => "ext4",
@@ -177,65 +185,70 @@ impl Fs {
         }
     }
 
-    /// 开机时挂上的实例的设备号（stat 的 `st_dev`、mountinfo 的第三列）。
+    /// Device number of the instance mounted at boot (stat's `st_dev`, the third column of
+    /// mountinfo).
     pub(crate) const fn dev(self) -> u64 {
         match self {
             Fs::Store => ROOT_DEV,
-            // 没有开机时的实例，每次挂上另外分配
+            // No boot instance; allocated separately on each mount
             Fs::Tmpfs => 0,
             Fs::Proc => 0x17,
             Fs::Pts => 0x18,
             Fs::Sys => 0x16,
             Fs::Cgroup => 0x1a,
-            // 与 Linux 一样
+            // As on Linux
             Fs::Nsfs => 0x4,
-            // 开机时的 IPC 命名空间的；别的命名空间的另外分配（[`Vfs::mq_dev`]）
+            // The boot IPC namespace's; other namespaces' are allocated separately
+            // ([`Vfs::mq_dev`])
             Fs::Mqueue => MQUEUE_DEV,
         }
     }
 
-    /// 每次挂载是一个新的实例（Linux 5.8 起的 procfs、4.7 起的 devpts）：同一处可以再挂
-    /// 一个。sysfs、cgroup2 在同一个命名空间里只有一个实例，同一个挂载的根上再挂是 EBUSY。
+    /// Every mount is a new instance (procfs since Linux 5.8, devpts since 4.7): another one can
+    /// be mounted at the same place. sysfs and cgroup2 have only one instance per namespace, and
+    /// mounting again on the root of the same mount is EBUSY.
     pub(crate) const fn new_instance(self) -> bool {
         matches!(self, Fs::Proc | Fs::Pts | Fs::Tmpfs)
     }
 
-    /// 新挂上的有自己的设备号：procfs、tmpfs，以及 devpts（每个实例有自己的一套终端，
-    /// 设备号就是实例的编号，[`crate::tty::PtsOptions`]）。
+    /// Newly mounted instances have their own device numbers: procfs, tmpfs, and devpts (each
+    /// instance has its own set of terminals, and the device number is the instance number,
+    /// [`crate::tty::PtsOptions`]).
     pub(crate) const fn own_dev(self) -> bool {
         matches!(self, Fs::Proc | Fs::Tmpfs | Fs::Pts)
     }
 
-    /// 超级块的选项（mountinfo 最后一列 `rw` 之后的部分）。
+    /// Superblock options (the part after `rw` in the last column of mountinfo).
     pub(crate) const fn options(self) -> &'static str {
         match self {
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
-            // tmpfs、devpts 的按实例（[`Vfs::sb_options`]）
+            // Per instance for tmpfs and devpts ([`Vfs::sb_options`])
             Fs::Store | Fs::Tmpfs | Fs::Pts | Fs::Proc | Fs::Sys | Fs::Nsfs | Fs::Mqueue => "",
         }
     }
 
-    /// 文件系统的根目录（挂载编号是 0，挂上时换成新挂载的）。tmpfs 的根是挂上时新建的
-    /// 目录（[`Vfs::new_tmpfs`]），nsfs 挂不上，都不用这个。
+    /// The filesystem's root directory (mount id 0, replaced by the new mount's when mounted).
+    /// tmpfs's root is a directory created at mount time ([`Vfs::new_tmpfs`]) and nsfs cannot
+    /// be mounted; neither uses this.
     pub(crate) fn root(self) -> Node {
         Node::Pseudo(
             0,
             match self {
                 Fs::Store | Fs::Tmpfs => return Node::Store(0, ROOT),
                 Fs::Proc | Fs::Nsfs => PseudoNode::ProcRoot,
-                // 挂上时换成新实例的
+                // Replaced by the new instance's when mounted
                 Fs::Pts => PseudoNode::PtsRoot(crate::tty::BOOT_PTS),
                 Fs::Sys => PseudoNode::SysRoot,
-                // 挂上时换成调用者所在的 cgroup 命名空间的根
+                // Replaced by the root of the caller's cgroup namespace when mounted
                 Fs::Cgroup => PseudoNode::Cgroup(crate::cgroup::ROOT, b""),
-                // 挂上时换成调用者所在的 IPC 命名空间的
+                // Replaced by the caller's IPC namespace's when mounted
                 Fs::Mqueue => PseudoNode::MqRoot(crate::nsproxy::INIT_IPC_NS),
             },
         )
     }
 }
 
-/// 挂载的标志：与 mount(2) 的 `MS_*` 取值相同。
+/// Mount flags: the same values as mount(2)'s `MS_*`.
 pub(crate) mod ms {
     pub const RDONLY: u64 = 1;
     pub const NOSUID: u64 = 2;
@@ -245,166 +258,182 @@ pub(crate) mod ms {
     pub const NOATIME: u64 = 0x400;
     pub const NODIRATIME: u64 = 0x800;
     pub const RELATIME: u64 = 1 << 21;
-    /// 记在挂载上的（Linux 的 `MNT_*` 对应的那些）。
+    /// Those kept on the mount (the ones matching Linux's `MNT_*`).
     pub const PER_MOUNT: u64 =
         RDONLY | NOSUID | NODEV | NOEXEC | NOSYMFOLLOW | NOATIME | NODIRATIME | RELATIME;
 }
 
-/// 根文件系统的挂载标志：`rw,relatime`。
+/// Mount flags of the root filesystem: `rw,relatime`.
 pub(crate) const ROOT_FLAGS: u64 = ms::RELATIME;
-/// 根文件系统（inode 仓库）对外报告的设备号（8:1）。
+/// Device number the root filesystem (the inode store) reports (8:1).
 pub(crate) const ROOT_DEV: u64 = 0x801;
 
-/// 一个挂载（Linux 的 `struct mount`）：文件系统 `fs` 里的 `root` 出现在 `point` 上。
+/// A mount (Linux's `struct mount`): `root` in filesystem `fs` appears at `point`.
 #[derive(Debug, Clone)]
 pub(crate) struct Mount {
     pub id: MountId,
-    /// 所属的挂载命名空间（[`MntNs::id`]）。
+    /// The mount namespace it belongs to ([`MntNs::id`]).
     pub ns: u64,
     pub fs: Fs,
-    /// 挂载看到的部分的根（经由这个挂载的节点）：文件系统的根目录，bind 挂载时是被 bind
-    /// 的那个目录或文件。
+    /// Root of the part the mount sees (a node reached through this mount): the filesystem's
+    /// root directory, or for a bind mount the directory or file that was bound.
     pub root: Node,
-    /// 挂载点：别的挂载里的目录（bind 挂载文件时是文件）。挂载树的根（开机时是仓库，
-    /// pivot_root 之后是换上来的那个）和卸下了的挂载没有，Linux 上前者挂在看不到的
-    /// rootfs 上。
+    /// Mount point: a directory in another mount (a file when a file is bind-mounted). The root
+    /// of the mount tree (the store at boot, the one swapped in after pivot_root) and detached
+    /// mounts have none; on Linux the former is mounted on the invisible rootfs.
     pub point: Option<Node>,
-    /// 挂载点是仓库里的文件时，它所在的目录和名字：文件可能有几个链接，没有唯一的上级
-    /// 目录，路径要按挂上时的这个算。
+    /// When the mount point is a file in the store, its directory and name: a file can have
+    /// several links and no unique parent directory, so the path is computed from this one,
+    /// recorded at mount time.
     pub at: Option<Dentry>,
-    /// bind 挂载仓库里的文件时，找到它的目录和名字（mountinfo 的第四列按它算）。
+    /// When a file in the store is bind-mounted, the directory and name it was found at (the
+    /// fourth column of mountinfo is computed from it).
     pub root_at: Option<Dentry>,
-    /// [`ms`] 里的标志。
+    /// Flags from [`ms`].
     pub flags: u64,
-    /// 实例的设备号（[`Fs::own_dev`]）。
+    /// Device number of the instance ([`Fs::own_dev`]).
     pub dev: u64,
-    /// mount(2) 的 source（mountinfo 的第十列）。
+    /// mount(2)'s source (the tenth column of mountinfo).
     pub source: Vec<u8>,
-    /// `umount2(MNT_EXPIRE)` 标记过：再来一次就卸下。
+    /// Marked by `umount2(MNT_EXPIRE)`: detached the next time.
     pub expiring: bool,
-    /// bind 挂载出去的命名空间文件（[`Fs::Nsfs`]）：它让那个命名空间活着。
+    /// A namespace file bind-mounted elsewhere ([`Fs::Nsfs`]): it keeps that namespace alive.
     pub pin: Option<crate::nsproxy::NsRef>,
 }
 
-/// 合成文件系统的目录结构（内核层实现，内容来自内核状态）。
+/// Directory structure of a synthetic filesystem (implemented by the kernel layer, with content
+/// from kernel state).
 pub(crate) trait Pseudo {
-    /// 上级目录；根目录返回 None。
+    /// Parent directory; None for the root.
     fn parent(&self, node: &PseudoNode) -> Option<PseudoNode>;
-    /// 节点在上级目录里的名字。`mnt` 是节点所在的挂载：procfs 里的 pid 按挂载的实例的
-    /// pid 命名空间算。
+    /// The node's name in its parent directory. `mnt` is the mount the node is in: pids in
+    /// procfs follow the pid namespace of the mount's instance.
     fn name(&self, mnt: MountId, node: &PseudoNode) -> Vec<u8>;
-    /// 在目录里查找。
+    /// Looks up in a directory.
     fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno>;
-    /// 文件类型位（`S_IFMT` 部分）。
+    /// File type bits (the `S_IFMT` part).
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno>;
-    /// 符号链接的内容。
+    /// Contents of a symlink.
     fn readlink(&self, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno>;
-    /// "魔法链接"（`/proc/<pid>/fd/<n>` 等）跟随之后直接得到的节点，不按内容解析；不是魔法
-    /// 链接时是 None，不许跟随时是错误（EACCES）。`mnt` 是链接所在的挂载。
+    /// The node a "magic link" (`/proc/<pid>/fd/<n>` and the like) leads to directly when
+    /// followed, without resolving its contents; None when it is not a magic link, an error
+    /// (EACCES) when following is not allowed. `mnt` is the mount the link is in.
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>>;
-    /// 魔法链接指向的打开文件是经由哪个目录里的哪个名字打开的（不是目录的文件没有唯一
-    /// 的上级目录，挂载点是它时 mountinfo 的路径按这个算）。
+    /// Through which name in which directory the open file a magic link points at was opened (a
+    /// file that is not a directory has no unique parent directory; when it is a mount point,
+    /// mountinfo's path is computed from this).
     fn follow_dentry(&self, _node: &PseudoNode) -> Option<Dentry> {
         None
     }
-    /// 是不是 Linux 的魔法链接（`nd_jump_link`）：openat2 的 `RESOLVE_NO_MAGICLINKS` 和
-    /// 有作用域的解析不跟随它们。包括 [`Pseudo::follow`] 直接跳过去的，也包括这里按内容
-    /// 解析、Linux 上直接跳过去的（`/proc/<pid>/exe`）。
+    /// Whether this is a Linux magic link (`nd_jump_link`): openat2's `RESOLVE_NO_MAGICLINKS`
+    /// and scoped resolution do not follow them. Includes those [`Pseudo::follow`] jumps to
+    /// directly, and also those resolved here by content that Linux jumps to directly
+    /// (`/proc/<pid>/exe`).
     fn magic(&self, _node: &PseudoNode) -> bool {
         false
     }
-    /// `fs.protected_symlinks` 打开着没有（[`Vfs::may_follow_link`]）。
+    /// Whether `fs.protected_symlinks` is on ([`Vfs::may_follow_link`]).
     fn protected_symlinks(&self) -> bool {
         false
     }
 }
 
-/// openat2 的 `struct open_how` 的 `resolve`（Linux 的 `RESOLVE_*`，对应路径解析的
-/// `LOOKUP_NO_XDEV` 这些）。
+/// The `resolve` of openat2's `struct open_how` (Linux's `RESOLVE_*`, matching path
+/// resolution's `LOOKUP_NO_XDEV` and the like).
 pub(crate) mod resolve {
-    /// 不跨挂载（含 bind 挂载）：经由挂载点进出、`..` 越过挂载的根、跳到别的挂载上的
-    /// 绝对路径的符号链接、魔法链接都是 EXDEV。
+    /// No crossing mounts (bind mounts included): going in or out through mount points, `..`
+    /// past a mount's root, symlinks to absolute paths that jump to another mount, and magic
+    /// links are all EXDEV.
     pub const NO_XDEV: u64 = 0x01;
-    /// 不跟随魔法链接（ELOOP）。
+    /// Do not follow magic links (ELOOP).
     pub const NO_MAGICLINKS: u64 = 0x02;
-    /// 不跟随任何符号链接（ELOOP）。
+    /// Do not follow any symlink (ELOOP).
     pub const NO_SYMLINKS: u64 = 0x04;
-    /// 不越出起点：绝对路径、绝对路径的符号链接、在起点上的 `..`、魔法链接都是 EXDEV。
+    /// Do not leave the start: absolute paths, symlinks to absolute paths, `..` at the start and
+    /// magic links are all EXDEV.
     pub const BENEATH: u64 = 0x08;
-    /// 把起点当作根目录：绝对路径和绝对路径的符号链接从起点算，在起点上的 `..` 不动；
-    /// 魔法链接是 EXDEV。
+    /// Treat the start as the root directory: absolute paths and symlinks to absolute paths
+    /// count from the start, and `..` at the start stays put; magic links are EXDEV.
     pub const IN_ROOT: u64 = 0x10;
-    /// 只用缓存里的（不会阻塞的）解析。
+    /// Resolve only from the cache (without blocking).
     pub const CACHED: u64 = 0x20;
     pub const ALL: u64 = 0x3f;
-    /// 有作用域（`LOOKUP_IS_SCOPED`）：根目录是起点。
+    /// Scoped (`LOOKUP_IS_SCOPED`): the root is the start.
     pub const SCOPED: u64 = BENEATH | IN_ROOT;
 }
 
-/// 一个虚拟文件系统实例。
+/// A virtual filesystem instance.
 pub struct Vfs {
     store: Store,
-    /// 挂载表：开机时的几个和后来 mount(2) 挂上的，按挂上的先后。
+    /// The mount table: the boot ones and those mount(2) mounted later, in mount order.
     mounts: RefCell<Mounts>,
-    /// 挂载表变了就重新生成。
+    /// Regenerated whenever the mount table changes.
     cached: RefCell<Cached>,
-    /// 最近执行过的程序文件（[`Vfs::executable`]）。
+    /// Recently executed program files ([`Vfs::executable`]).
     executables: crate::loader::ExeCache,
-    /// 开机时的挂载命名空间。
+    /// The boot mount namespace.
     init_ns: std::rc::Rc<MntNs>,
-    /// 后来建的挂载命名空间：引用都没了的，清理时卸下它的挂载。
+    /// Mount namespaces created later: once all references to one are gone, cleanup detaches
+    /// its mounts.
     namespaces: RefCell<Vec<std::rc::Weak<MntNs>>>,
 }
 
 struct Mounts {
-    /// 挂在树上的挂载，按挂上的先后（mountinfo 的顺序）；第一个是挂载树的根，pivot_root
-    /// 之后不是了也不挪。
+    /// Attached mounts, in mount order (the mountinfo order); the first is the root of the mount
+    /// tree, and it is not moved even when that is no longer true after pivot_root.
     list: Vec<Mount>,
-    /// 卸下了、还有进程的根目录、当前目录或者打开的文件在里面的挂载（`MNT_DETACH`）：它们
-    /// 的节点照常能用，挂载的根没有上级（[`Vfs::collect`] 去掉没人用的）。
+    /// Detached mounts (`MNT_DETACH`) that still have a process's root, current directory or
+    /// open files in them: their nodes keep working, and the mount's root has no parent
+    /// ([`Vfs::collect`] removes the unused ones).
     detached: Vec<Mount>,
-    /// 下一个挂载的编号。卸下的编号不再使用：卸下之后还开着的文件、当前目录仍然带着原来的
-    /// 编号，不能算到新的挂载上。
+    /// The id of the next mount. Ids of detached mounts are never reused: files still open and
+    /// current directories after the detach keep the old id, which must not count toward a new
+    /// mount.
     next: MountId,
-    /// 下一个新实例的设备号（0:48 起，避开 [`Fs::dev`] 和管道、socket 等用的）。
+    /// Device number of the next new instance (from 0:48, avoiding [`Fs::dev`] and those pipes,
+    /// sockets and so on use).
     next_dev: u64,
-    /// tmpfs 的实例，按设备号（bind 挂载与源共用设备号）。
+    /// tmpfs instances, by device number (bind mounts share their source's device number).
     tmpfs: std::collections::HashMap<u64, Tmpfs>,
-    /// mount(2) 挂上的 procfs 实例的 pid 命名空间（挂载的进程所在的），按设备号；开机时
-    /// 的那个和没有记的是开机时的 pid 命名空间。
+    /// The pid namespace (the mounting process's) of each procfs instance mounted by mount(2),
+    /// by device number; the boot one and those not recorded use the boot pid namespace.
     proc_ns: std::collections::HashMap<u64, std::rc::Rc<crate::pidns::PidNs>>,
-    /// 各个 IPC 命名空间的 mqueue 实例的设备号（[`Vfs::mq_dev`]），按命名空间的编号。
+    /// Device numbers of each IPC namespace's mqueue instance ([`Vfs::mq_dev`]), by namespace
+    /// id.
     mq_dev: std::collections::HashMap<u64, u64>,
-    /// mount(2) 挂上的 devpts 实例的选项，按设备号（开机时的那个不在这里）。
+    /// Options of devpts instances mounted by mount(2), by device number (the boot one is not
+    /// here).
     devpts: std::collections::HashMap<u64, crate::tty::PtsOptions>,
 }
 
-/// tmpfs 按页记用量，页的大小（guest 的页）。
+/// tmpfs accounts usage in pages; the page size (guest pages).
 pub(crate) const TMPFS_PAGE: u64 = 4096;
 
-/// tmpfs 的超级块参数（Linux 的 `shmem_sb_info` 里的这几项）：挂上时由 mount(2) 的选项
-/// 定下，重新挂载可以改大小、inode 数和 inode32/64。
+/// tmpfs superblock parameters (these fields of Linux's `shmem_sb_info`): set by mount(2)'s
+/// options at mount time; a remount can change the size, the inode count and inode32/64.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TmpfsParams {
-    /// 根目录的权限、属主、属组（只在挂上时用）。
+    /// Permissions, owner and group of the root directory (used only at mount time).
     pub perm: u32,
     pub uid: u32,
     pub gid: u32,
-    /// 最多的页数、inode 数，0 是不限（`size=0`、`nr_inodes=0`）。
+    /// Maximum pages and inodes; 0 is unlimited (`size=0`, `nr_inodes=0`).
     pub blocks: u64,
     pub inodes: u64,
-    /// `inode64`（默认）或者 `inode32`。
+    /// `inode64` (the default) or `inode32`.
     pub inode64: bool,
 }
 
 impl TmpfsParams {
-    /// 默认的页数和 inode 数：物理内存的一半（Linux 的 `shmem_default_max_blocks`、
-    /// `shmem_default_max_inodes`，没有高端内存时两者相同）。
+    /// Default page and inode counts: half of physical memory (Linux's
+    /// `shmem_default_max_blocks` and `shmem_default_max_inodes`, which are equal without high
+    /// memory).
     pub fn default_limit() -> u64 {
         appine_hal::memory_info().0 / 2 / TMPFS_PAGE
     }
 
-    /// 开机时挂的 tmpfs：根目录的权限是 `perm`、属于 root，大小和 inode 数是默认的。
+    /// A tmpfs mounted at boot: the root directory has permissions `perm` and belongs to root,
+    /// and the size and inode count are the defaults.
     fn boot(perm: u32) -> TmpfsParams {
         TmpfsParams {
             perm,
@@ -416,9 +445,10 @@ impl TmpfsParams {
         }
     }
 
-    /// mountinfo 里超级块的选项（`,size=1024k,mode=755,inode64` 这样，Linux 的
-    /// `shmem_show_options`）：大小、inode 数不是默认值才写，权限不是 1777、属主属组不是 0
-    /// 才写，最后是 `inode64` 或 `inode32`。
+    /// Superblock options in mountinfo (like `,size=1024k,mode=755,inode64`, Linux's
+    /// `shmem_show_options`): size and inode count are written only when not the defaults, the
+    /// permissions only when not 1777 and owner and group only when not 0, and last comes
+    /// `inode64` or `inode32`.
     pub fn options(&self) -> String {
         let default = Self::default_limit();
         let mut s = String::new();
@@ -442,34 +472,37 @@ impl TmpfsParams {
     }
 }
 
-/// tmpfs 的一个实例（Linux 的超级块）：挂上时在仓库里新建一个不挂在根目录下面的目录
-/// （[`Store::create_detached_dir`]），挂载和 bind 挂载都没了时连同里面的一起删掉。数据
-/// 照常存在宿主的文件里，不占 App 的内存。用量与 Linux 一样按页数和 inode 数限制
-/// （[`Vfs::tmpfs_usage`]）。
+/// A tmpfs instance (Linux's superblock): at mount time a directory not hanging under the root
+/// is created in the store ([`Store::create_detached_dir`]), and when its mounts and bind mounts
+/// are all gone it is deleted with everything in it. Data is stored in host files as usual and
+/// takes no app memory. Usage is limited by page and inode counts as on Linux
+/// ([`Vfs::tmpfs_usage`]).
 pub(crate) struct Tmpfs {
-    /// 根目录。
+    /// The root directory.
     pub root: Ino,
     pub params: TmpfsParams,
-    /// 记下的用量（页数、inode 数），新建、删除、写、截短时跟着改，statfs 时现数一遍
-    /// （[`Vfs::count_tmpfs`]）；None 时下次要用时数。
+    /// Recorded usage (pages, inodes), updated on create, delete, write and truncate, and counted
+    /// afresh at statfs ([`Vfs::count_tmpfs`]); None means count it the next time it is needed.
     used: Option<(u64, u64)>,
 }
 
-/// 不持 BKL 解析路径要用的部分（`syscall::fast`）：仓库的元数据缓存和挂载点。
+/// What no-BKL path resolution needs (`syscall::fast`): the store's metadata cache and the mount
+/// points.
 #[derive(Clone)]
 pub(crate) struct Cached {
     meta: Arc<store::Meta>,
     mounts: Arc<[Ino]>,
-    /// 根文件系统的挂载（[`ROOT_MOUNT`]）还挂在树上、没有 nosymfollow：根目录、当前目录在
-    /// 它里面的线程才能不持 BKL 解析。
+    /// The root filesystem's mount ([`ROOT_MOUNT`]) is still attached and not nosymfollow: only
+    /// threads whose root and current directory are in it can resolve without the BKL.
     pub(crate) usable: bool,
 }
 
 impl Cached {
-    /// 只用元数据缓存解析路径并取得元数据：相当于凭据有 `CAP_DAC_READ_SEARCH`（不检查
-    /// 搜索权限）时的 [`Vfs::resolve`] 加上 [`Store::stat`]。`root`、`cwd` 是仓库里的
-    /// 目录。路径进入合成文件系统，或者要用的东西不在缓存里时返回 None，调用方改为持有
-    /// BKL 正常解析（顺带填进缓存）。
+    /// Resolves a path and gets its metadata using only the metadata cache: equivalent to
+    /// [`Vfs::resolve`] with credentials that have `CAP_DAC_READ_SEARCH` (no search permission
+    /// check) plus [`Store::stat`]. `root` and `cwd` are store directories. Returns None when the
+    /// path enters a synthetic filesystem or something needed is not in the cache; the caller
+    /// then resolves normally holding the BKL (filling the cache along the way).
     pub(crate) fn stat(
         &self,
         root: Ino,
@@ -484,7 +517,7 @@ impl Cached {
         }
     }
 
-    /// 与 [`Vfs::walk_in`] 一一对应。
+    /// Corresponds one to one with [`Vfs::walk_in`].
     fn walk(
         &self,
         r: &store::Reader<'_>,
@@ -497,7 +530,8 @@ impl Cached {
             return Some(Err(Errno::ENOENT));
         }
         let mut dir = if path[0] == b'/' { root } else { cwd };
-        // 还没处理的组件，栈顶是下一个；不分配内存，放不下时交给正常的解析
+        // Components not yet handled, with the next one on top of the stack; allocates no
+        // memory, and leaves it to normal resolution when they do not fit
         let mut pending = Pending::default();
         pending.push(path)?;
         let mut links = 0;
@@ -516,7 +550,8 @@ impl Cached {
                 if dir != root {
                     dir = r.parent(dir)?;
                 }
-                // 上级目录上挂着东西（当前目录在挂载点下面、后来才挂上的）
+                // Something is mounted on the parent directory (the current directory is under
+                // a mount point mounted later)
                 if self.mounts.contains(&dir) {
                     return None;
                 }
@@ -533,8 +568,9 @@ impl Cached {
                 if links > MAX_SYMLINKS {
                     return Some(Err(Errno::ELOOP));
                 }
-                // fs.protected_symlinks 要看凭据（[`Vfs::may_follow_link`]）：粘滞位、所有人
-                // 可写的目录里属主与目录不同的链接交给正常的解析
+                // fs.protected_symlinks depends on the credentials ([`Vfs::may_follow_link`]):
+                // links in sticky, world-writable directories whose owner differs from the
+                // directory's are left to normal resolution
                 let sticky_shared = mode::S_ISVTX | 0o002;
                 if last
                     && r.stat(dir)?.mode & sticky_shared == sticky_shared
@@ -555,7 +591,8 @@ impl Cached {
     }
 }
 
-/// [`Cached::walk`] 还没处理的路径组件（[`components`] 的结果倒过来放）。
+/// Path components [`Cached::walk`] has not handled yet (the result of [`components`] in
+/// reverse).
 struct Pending<'p> {
     comps: [&'p [u8]; 64],
     len: usize,
@@ -571,7 +608,7 @@ impl Default for Pending<'_> {
 }
 
 impl<'p> Pending<'p> {
-    /// 把 `path` 的组件放到最前面；放不下时返回 None。
+    /// Puts `path`'s components at the front; returns None when they do not fit.
     fn push(&mut self, path: &'p [u8]) -> Option<()> {
         if path.ends_with(b"/") {
             self.push_one(b".")?;
@@ -599,12 +636,14 @@ impl<'p> Pending<'p> {
 }
 
 impl Vfs {
-    /// 打开 `dir` 里的 inode 仓库作为根文件系统，补齐标准的设备节点，挂上开机时的文件系统
-    /// （与 systemd、容器运行时挂的一样）：procfs；`/dev` 上的 tmpfs（标准设备节点建在里面，
-    /// [`dev::populate`]）和其中的 devpts、`/dev/shm` 的 tmpfs、mqueue；sysfs 和 cgroup2；
-    /// `/run` 的 tmpfs。
-    /// 开机（没有别的进程在用这个仓库）时还清空仓库里的 /dev/shm 和 /run：以前没有在上面挂
-    /// tmpfs，留下的共享内存、pid 文件不能留着。
+    /// Opens the inode store in `dir` as the root filesystem, adds the standard device nodes,
+    /// and mounts the boot filesystems (the same as systemd and container runtimes mount):
+    /// procfs; a tmpfs on `/dev` (the standard device nodes are created in it,
+    /// [`dev::populate`]) with devpts, the `/dev/shm` tmpfs and mqueue in it; sysfs and cgroup2;
+    /// the `/run` tmpfs.
+    /// At boot (when no other process is using this store) it also empties /dev/shm and /run in
+    /// the store: no tmpfs used to be mounted on them, and the shared memory and pid files left
+    /// there must not stay.
     pub fn open(dir: &Path) -> Result<Vfs, Errno> {
         let store = Store::open(dir, &[b"dev/shm", b"run"])?;
         if let Err(e) = dev::ensure_dev_nodes(&store) {
@@ -613,7 +652,7 @@ impl Vfs {
         if let Err(e) = ensure_resolv_conf(&store) {
             crate::debug::log(format_args!("cannot create /etc/resolv.conf: {e}"));
         }
-        // 与 Linux 发行版的默认挂载选项相同
+        // The same as Linux distributions' default mount options
         let flags = ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME;
         let mut mounts = Mounts {
             list: vec![Mount {
@@ -638,7 +677,7 @@ impl Vfs {
             mq_dev: Default::default(),
             devpts: Default::default(),
         };
-        // 挂载 `mnt` 里的目录 `dir` 下面名叫 `name` 的目录
+        // The directory named `name` under directory `dir` in mount `mnt`
         let subdir = |dir: Option<&Node>, name: &[u8]| -> Option<Node> {
             let &Node::Store(mnt, dir) = dir? else {
                 return None;
@@ -658,7 +697,7 @@ impl Vfs {
             flags,
             b"proc",
         );
-        // /dev：tmpfs 建不了时退回仓库里的目录
+        // /dev: falls back to the store directory when the tmpfs cannot be created
         let dev = subdir(root.as_ref(), b"dev").map(|point| {
             let r = mounts.boot_tmpfs(
                 &store,
@@ -705,8 +744,8 @@ impl Vfs {
             flags,
             b"sysfs",
         );
-        // cgroup2 挂在 sysfs 的 fs/cgroup 上（kernel/vfs 的 map），与 Linux 的主机上一样可以写：dockerd、
-        // runc 在里面建容器的 cgroup
+        // cgroup2 is mounted on sysfs's fs/cgroup (the kernel/vfs map) and is writable as on a
+        // Linux host: dockerd and runc create the containers' cgroups in it
         if mounts.list.iter().any(|m| m.id == SYS_MOUNT) {
             mounts.boot(
                 CGROUP_MOUNT,
@@ -716,7 +755,7 @@ impl Vfs {
                 b"cgroup",
             );
         }
-        // /run：与 systemd、OpenRC 挂的一样，物理内存的 20%、800k 个 inode
+        // /run: as systemd and OpenRC mount it, 20% of physical memory and 800k inodes
         if let Some(point) = subdir(root.as_ref(), b"run") {
             let params = TmpfsParams {
                 blocks: appine_hal::memory_info().0 / 5 / TMPFS_PAGE,
@@ -747,31 +786,33 @@ impl Vfs {
         })
     }
 
-    /// 打开仓库里的普通文件 `ino` 作为要执行的文件（[`crate::loader::ExeCache`]）。
+    /// Opens the regular file `ino` in the store as a file to execute
+    /// ([`crate::loader::ExeCache`]).
     pub(crate) fn executable(&self, ino: Ino) -> Result<crate::loader::Executable, Errno> {
         self.executables
             .open(ino, || self.store.open_object(ino, false))
     }
 
-    /// 丢掉记着的程序文件（宿主内存紧张时）。
+    /// Drops the recorded program files (when host memory is tight).
     pub(crate) fn trim(&self) {
         self.executables.clear();
     }
 
-    /// 底层的 inode 仓库。
+    /// The underlying inode store.
     pub fn store(&self) -> &Store {
         &self.store
     }
 
-    /// 不持 BKL 解析路径要用的部分。挂载表变了之后（[`Shared::fast_changed`]）要重新取。
+    /// What no-BKL path resolution needs. Must be fetched again after the mount table changes
+    /// ([`Shared::fast_changed`]).
     ///
     /// [`Shared::fast_changed`]: crate::kernel::Shared::fast_changed
     pub(crate) fn cached(&self) -> Cached {
         self.cached.borrow().clone()
     }
 
-    /// 节点上挂着东西时换成挂在上面的挂载的根；几个挂载叠在一起时一直换到最上面的
-    /// （Linux 的 `follow_mount`）。
+    /// When something is mounted on the node, replaces it with the root of the mount on it; with
+    /// several mounts stacked, keeps going up to the topmost one (Linux's `follow_mount`).
     pub(crate) fn mounted(&self, node: Node) -> Node {
         let mounts = self.mounts.borrow();
         let mut node = node;
@@ -786,7 +827,7 @@ impl Vfs {
         node
     }
 
-    /// 对编号为 `id` 的挂载（挂在树上的或者卸下了的）做 `f`。
+    /// Runs `f` on the mount with id `id` (attached or detached).
     fn with_mount<T>(&self, id: MountId, f: impl FnOnce(&Mount) -> T) -> Option<T> {
         let mounts = self.mounts.borrow();
         mounts
@@ -797,18 +838,19 @@ impl Vfs {
             .map(f)
     }
 
-    /// `node` 是它所在的挂载的根（挂在树上的和卸下了的都算）。
+    /// `node` is the root of the mount it is in (attached and detached ones both count).
     fn is_mount_root(&self, node: &Node) -> bool {
         self.with_mount(node.mnt(), |m| m.root == *node)
             .unwrap_or(false)
     }
 
-    /// `node` 是一个挂载的根时，那个挂载的挂载点。
+    /// When `node` is the root of a mount, that mount's mount point.
     fn point_of(&self, node: &Node) -> Option<Node> {
         self.root_point(node).map(|(point, _)| point)
     }
 
-    /// `node` 是一个挂在树上、有挂载点的挂载的根时，挂载点和 [`Mount::at`]。
+    /// When `node` is the root of an attached mount with a mount point, the mount point and
+    /// [`Mount::at`].
     fn root_point(&self, node: &Node) -> Option<(Node, Option<Dentry>)> {
         let mounts = self.mounts.borrow();
         let m = mounts.list.iter().find(|m| m.id == node.mnt())?;
@@ -818,7 +860,7 @@ impl Vfs {
         Some((m.point.clone()?, m.at.clone()))
     }
 
-    /// 节点的文件类型位。
+    /// The node's file type bits.
     pub(crate) fn kind(&self, ps: &dyn Pseudo, node: &Node) -> Result<u32, Errno> {
         match node {
             Node::Store(_, ino) => self.store.kind(*ino),
@@ -826,12 +868,12 @@ impl Vfs {
         }
     }
 
-    /// 是不是目录。
+    /// Whether it is a directory.
     pub(crate) fn is_dir(&self, ps: &dyn Pseudo, node: &Node) -> Result<bool, Errno> {
         Ok(self.kind(ps, node)? == mode::S_IFDIR)
     }
 
-    /// 在目录里查找一个名字（不是 `.` 或 `..`）。
+    /// Looks up a name (not `.` or `..`) in a directory.
     fn lookup(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> Result<Node, Errno> {
         let child = match dir {
             Node::Store(id, ino) => {
@@ -842,13 +884,14 @@ impl Vfs {
         Ok(self.mounted(child))
     }
 
-    /// 目录 `dir` 里已经有 `name` 了（`.`、`..` 总是有）：在里面新建之前，先于目录能不能
-    /// 修改的检查（Linux 的 `filename_create`）。
+    /// Directory `dir` already has `name` (`.` and `..` always exist): before creating in it,
+    /// ahead of the check whether the directory can be modified (Linux's `filename_create`).
     pub(crate) fn has_child(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> bool {
         name == b"." || name == b".." || self.lookup(ps, dir, name).is_ok()
     }
 
-    /// 目录的上级目录；挂载的根的上级是挂载点的上级（getdents 的 `..`）。
+    /// The directory's parent; the parent of a mount's root is the mount point's parent
+    /// (getdents's `..`).
     pub(crate) fn parent(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
         let mut dir = dir.clone();
         while let Some(point) = self.point_of(&dir) {
@@ -857,8 +900,9 @@ impl Vfs {
         self.parent_in_fs(ps, &dir)
     }
 
-    /// 同一个挂载里的上级目录。挂载的根没有上级，是它自己：挂载树的根、卸下了的挂载
-    /// （`MNT_DETACH`）的根，bind 挂载里看不到被 bind 的目录外面。
+    /// The parent directory within the same mount. A mount's root has no parent and is its own:
+    /// the root of the mount tree and the root of a detached mount (`MNT_DETACH`), and inside a
+    /// bind mount nothing outside the bound directory is visible.
     fn parent_in_fs(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
         if self.is_mount_root(dir) {
             return Ok(dir.clone());
@@ -869,8 +913,9 @@ impl Vfs {
         })
     }
 
-    /// 路径里的 `..`（Linux 的 `follow_dotdot`）：在根目录上不动；在挂载的根上先回到挂载点
-    /// （叠着的挂载一层层回去），再取上级，上级上挂着东西时进到挂在上面的挂载。
+    /// `..` in a path (Linux's `follow_dotdot`): stays put at the root directory; at a mount's
+    /// root it first goes back to the mount point (one level at a time through stacked mounts),
+    /// then takes the parent, and enters the mount on the parent when something is mounted there.
     fn dotdot(&self, ps: &dyn Pseudo, root: &Node, mut dir: Node) -> Result<Node, Errno> {
         loop {
             if dir == *root {
@@ -885,8 +930,8 @@ impl Vfs {
         Ok(self.mounted(up))
     }
 
-    /// `node` 是 `top` 或者在它下面：经由挂载点往上找（Linux 的 `is_path_reachable`）。挂在
-    /// 文件上的挂载经由挂上时的目录。
+    /// `node` is `top` or below it: searched upwards through mount points (Linux's
+    /// `is_path_reachable`). Mounts on files go through the directory recorded at mount time.
     pub(crate) fn is_under(&self, ps: &dyn Pseudo, node: &Node, top: &Node) -> bool {
         let mut cur = node.clone();
         loop {
@@ -907,7 +952,7 @@ impl Vfs {
         }
     }
 
-    /// 符号链接的内容。
+    /// Contents of a symlink.
     pub(crate) fn readlink(&self, ps: &dyn Pseudo, node: &Node) -> Result<Vec<u8>, Errno> {
         match node {
             Node::Store(_, ino) => self.store.readlink(*ino),
@@ -915,10 +960,12 @@ impl Vfs {
         }
     }
 
-    /// 凭据为 `cred` 的进程能不能在目录 `dir` 里查找。合成文件系统的目录总是可以。
-    /// `fs.protected_symlinks` 打开时能不能跟随目录 `dir` 里的符号链接 `link`（Linux 的
-    /// `may_follow_link`）：粘滞位、所有人可写的目录（/tmp）里别人的链接，只有链接的属主
-    /// 与目录的属主相同时才跟随，root 也一样，否则 EACCES。
+    /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
+    /// synthetic filesystems always can.
+    /// Whether, with `fs.protected_symlinks` on, symlink `link` in directory `dir` may be
+    /// followed (Linux's `may_follow_link`): someone else's link in a sticky, world-writable
+    /// directory (/tmp) is followed only when the link's owner is the directory's owner, for root
+    /// too; otherwise EACCES.
     fn may_follow_link(&self, cred: &Cred, dir: Ino, link: Ino) -> Result<(), Errno> {
         let link = self.store.stat(link)?;
         if link.uid == cred.fsuid {
@@ -941,8 +988,8 @@ impl Vfs {
         }
     }
 
-    /// 以凭据 `cred`、根目录 `root` 解析路径。`follow` 为 false 时不跟随最后一个组件的
-    /// 符号链接（lstat、readlink 等）。
+    /// Resolves a path with credentials `cred` and root directory `root`. With `follow` false a
+    /// symlink in the last component is not followed (lstat, readlink and so on).
     pub(crate) fn resolve(
         &self,
         ps: &dyn Pseudo,
@@ -956,7 +1003,8 @@ impl Vfs {
             .map(|(node, _)| node)
     }
 
-    /// 路径指向的文件的绝对路径，符号链接全部解析（[`found_path`](Self::found_path)）。
+    /// The absolute path of the file a path points at, with all symlinks resolved
+    /// ([`found_path`](Self::found_path)).
     #[cfg(test)]
     pub(crate) fn real_path(
         &self,
@@ -970,9 +1018,10 @@ impl Vfs {
         self.found_path(ps, root, &node, found.as_ref())
     }
 
-    /// [`walk`](Self::walk) 找到的 `node` 的绝对路径，按最后找到它的目录和名字 `found`
-    /// 算，符号链接全部解析（`/proc/<pid>/exe`，与 Linux 的 `d_path` 相同）。经由
-    /// `/proc/<pid>/fd/<n>` 到达、不知道名字的文件报 ENOENT。
+    /// The absolute path of the `node` [`walk`](Self::walk) found, computed from the directory
+    /// and name `found` where it was last found, with all symlinks resolved (`/proc/<pid>/exe`,
+    /// as with Linux's `d_path`). A file reached through `/proc/<pid>/fd/<n>`, whose name is
+    /// unknown, reports ENOENT.
     pub(crate) fn found_path(
         &self,
         ps: &dyn Pseudo,
@@ -994,8 +1043,9 @@ impl Vfs {
         }
     }
 
-    /// [`resolve`](Self::resolve)，另外返回最后找到结果的目录和名字；结果是经由 `.`、
-    /// `..`、根目录或者合成文件系统的链接得到的时候没有。
+    /// [`resolve`](Self::resolve), also returning the directory and name where the result was
+    /// last found; there are none when the result came through `.`, `..`, the root directory or
+    /// a link in a synthetic filesystem.
     pub(crate) fn walk(
         &self,
         ps: &dyn Pseudo,
@@ -1008,8 +1058,8 @@ impl Vfs {
         self.walk_resolve(ps, cred, root, cwd, path, follow, 0)
     }
 
-    /// [`walk`](Self::walk)，带着 openat2 的限制（[`resolve`]）。有作用域时
-    /// （`BENEATH`、`IN_ROOT`）`root` 是起点。
+    /// [`walk`](Self::walk) with openat2's restrictions ([`resolve`]). With a scope (`BENEATH`,
+    /// `IN_ROOT`) `root` is the start.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn walk_resolve(
         &self,
@@ -1039,8 +1089,8 @@ impl Vfs {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
-        // 开头的 / 跳到根目录（path_init 的 nd_jump_root）：BENEATH 不许；IN_ROOT 的根就是
-        // 起点；NO_XDEV 只管解析途中的跳转
+        // A leading / jumps to the root (path_init's nd_jump_root): not allowed under BENEATH;
+        // under IN_ROOT the root is the start; NO_XDEV only governs jumps during resolution
         let mut dir = if path[0] == b'/' {
             if flags & resolve::BENEATH != 0 {
                 return Err(Errno::EXDEV);
@@ -1049,9 +1099,10 @@ impl Vfs {
         } else {
             cwd.clone()
         };
-        // Linux 的 nd->root 取过了没有：绝对路径、有作用域时一开始就取，否则到第一个 `..`
-        // 或者第一次跳到根目录时才取。NO_XDEV 时还没取就跳到根目录（绝对路径的符号链接）
-        // 总是 EXDEV：nd_jump_root 拿当前的挂载与空的 nd->root.mnt 比
+        // Whether Linux's nd->root has been taken: absolute paths and scoped resolution take it
+        // at the start, otherwise it is taken at the first `..` or the first jump to the root.
+        // Under NO_XDEV a jump to the root (a symlink to an absolute path) before it is taken is
+        // always EXDEV: nd_jump_root compares the current mount with the empty nd->root.mnt
         let mut root_set = path[0] == b'/' || flags & resolve::SCOPED != 0;
         let mut found = None;
         let mut pending = components(path);
@@ -1061,7 +1112,8 @@ impl Vfs {
             if comp.len() > NAME_MAX {
                 return Err(Errno::ENAMETOOLONG);
             }
-            // 每个组件（包括 . 和 ..）之前的节点都必须是目录：file/. 和 file/ 是 ENOTDIR
+            // The node before every component (including . and ..) must be a directory: file/.
+            // and file/ are ENOTDIR
             if !self.is_dir(ps, &dir)? {
                 return Err(Errno::ENOTDIR);
             }
@@ -1070,8 +1122,9 @@ impl Vfs {
                 continue;
             }
             if comp == b".." {
-                // 在起点上（follow_dotdot 的 in_root）：BENEATH 越不出去；越过挂载的根、
-                // 回到挂着东西的目录（进到那个挂载里）是跨挂载
+                // At the start (follow_dotdot's in_root): BENEATH cannot get out; going past a
+                // mount's root, or back to a directory with something mounted on it (entering
+                // that mount), crosses mounts
                 if dir == *root && flags & resolve::BENEATH != 0 {
                     return Err(Errno::EXDEV);
                 }
@@ -1085,7 +1138,7 @@ impl Vfs {
                 continue;
             }
             let node = self.lookup(ps, &dir, &comp)?;
-            // 名字上挂着东西：进到那个挂载里（traverse_mounts）
+            // Something is mounted on the name: enter that mount (traverse_mounts)
             if flags & resolve::NO_XDEV != 0 && node.mnt() != dir.mnt() {
                 return Err(Errno::EXDEV);
             }
@@ -1094,16 +1147,16 @@ impl Vfs {
                 if links > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
                 }
-                // fs.protected_symlinks 只管最后一个组件（pick_link 的 WALK_TRAILING），在
-                // nosymfollow 之前
+                // fs.protected_symlinks applies only to the last component (pick_link's
+                // WALK_TRAILING), before nosymfollow
                 if last
                     && ps.protected_symlinks()
                     && let (Node::Store(_, link), Node::Store(_, parent)) = (&node, &dir)
                 {
                     self.may_follow_link(cred, *parent, *link)?;
                 }
-                // nosymfollow 的挂载里的符号链接（包括魔法链接）、RESOLVE_NO_SYMLINKS 时的
-                // 任何符号链接都不跟随（Linux 的 pick_link）
+                // Symlinks (magic links included) in a nosymfollow mount, and any symlink under
+                // RESOLVE_NO_SYMLINKS, are not followed (Linux's pick_link)
                 if flags & resolve::NO_SYMLINKS != 0
                     || self
                         .mount_flags(&node)
@@ -1111,7 +1164,8 @@ impl Vfs {
                 {
                     return Err(Errno::ELOOP);
                 }
-                // 魔法链接（nd_jump_link）：先查能不能看那个进程，再看限制
+                // Magic links (nd_jump_link): first check whether that process may be viewed,
+                // then the restrictions
                 let magic = matches!(&node, Node::Pseudo(_, p) if ps.magic(p));
                 let jump = match &node {
                     Node::Pseudo(id, p) => ps.follow(*id, p).transpose()?,
@@ -1137,8 +1191,9 @@ impl Vfs {
                     continue;
                 }
                 let target = self.readlink(ps, &node)?;
-                // 绝对路径的符号链接（nd_jump_root）：BENEATH 不许，NO_XDEV 时根目录要已经
-                // 取过、与链接所在的目录在同一个挂载里
+                // Symlinks to absolute paths (nd_jump_root): not allowed under BENEATH; under
+                // NO_XDEV the root must already have been taken and be in the same mount as the
+                // link's directory
                 if target.first() == Some(&b'/') {
                     if flags & resolve::BENEATH != 0
                         || (flags & resolve::NO_XDEV != 0 && (!root_set || dir.mnt() != root.mnt()))
@@ -1159,9 +1214,11 @@ impl Vfs {
         Ok((dir, found))
     }
 
-    /// 解析路径的父目录，返回父目录和最后一个组件（去掉结尾的 `/`）。
+    /// Resolves the parent directory of a path, returning the parent and the last component
+    /// (with trailing `/` removed).
     ///
-    /// 最后一个组件可能是 `.` 或 `..`，由调用方决定怎么处理；路径是 `/` 时返回 `(ROOT, ".")`。
+    /// The last component may be `.` or `..`, for the caller to handle; for the path `/` it
+    /// returns `(ROOT, ".")`.
     pub(crate) fn resolve_parent<'p>(
         &self,
         ps: &dyn Pseudo,
@@ -1173,7 +1230,7 @@ impl Vfs {
         self.resolve_parent_with(ps, cred, root, cwd, path, 0)
     }
 
-    /// [`resolve_parent`](Self::resolve_parent)，带着 openat2 的限制（[`resolve`]）。
+    /// [`resolve_parent`](Self::resolve_parent) with openat2's restrictions ([`resolve`]).
     pub(crate) fn resolve_parent_with<'p>(
         &self,
         ps: &dyn Pseudo,
@@ -1211,9 +1268,11 @@ impl Vfs {
         Ok((dir, name))
     }
 
-    /// 目录相对根目录 `root` 的绝对路径（Linux 的 `d_path`：`/proc/<pid>/cwd`、打开文件记的
-    /// 路径）。不在 `root` 下面的目录与 Linux 一样不加标记，得到从仓库的根算起的路径，卸下了的
-    /// 挂载里的从那个挂载的根算起；要知道到不到得了用 [`reach`](Self::reach)。
+    /// The absolute path of a directory relative to root `root` (Linux's `d_path`:
+    /// `/proc/<pid>/cwd`, the path recorded for open files). A directory not under `root` gets
+    /// no mark, as on Linux, and the path counts from the store's root; in a detached mount it
+    /// counts from that mount's root. Use [`reach`](Self::reach) to know whether it is
+    /// reachable.
     pub(crate) fn path_of(
         &self,
         ps: &dyn Pseudo,
@@ -1223,8 +1282,8 @@ impl Vfs {
         self.reach(ps, root, dir).map(|(path, _)| path)
     }
 
-    /// [`path_of`](Self::path_of)，另外返回是不是从 `root` 到得了：到不了时 getcwd 以
-    /// `(unreachable)` 开头，mountinfo 不列。
+    /// [`path_of`](Self::path_of), also returning whether it is reachable from `root`: when it
+    /// is not, getcwd starts with `(unreachable)` and mountinfo does not list it.
     pub(crate) fn reach(
         &self,
         ps: &dyn Pseudo,
@@ -1240,7 +1299,8 @@ impl Vfs {
             }
             if let Some((point, at)) = self.root_point(&cur) {
                 match at {
-                    // 挂在文件上的：经由挂上时的目录和名字
+                    // Mounted on a file: through the directory and name recorded at mount
+                    // time
                     Some((dir, name)) => {
                         names.push(name);
                         cur = dir;
@@ -1249,25 +1309,25 @@ impl Vfs {
                 }
                 continue;
             }
-            // 挂载树的根、卸下了的挂载的根
+            // The root of the mount tree, or the root of a detached mount
             if self.is_mount_root(&cur) {
                 reached = false;
                 break;
             }
             match cur {
-                // 改了名、不在挂载看到的部分里了
+                // Renamed and no longer in the part the mount sees
                 Node::Store(_, ROOT) => {
                     reached = false;
                     break;
                 }
                 Node::Store(id, ino) => {
                     let parent = self.store.parent(ino)?;
-                    // tmpfs 的根：上级是它自己
+                    // The root of a tmpfs: its parent is itself
                     if parent == ino {
                         reached = false;
                         break;
                     }
-                    // 已被删除的目录找不到名字，与 Linux 一样报 ENOENT
+                    // A deleted directory has no name to find; ENOENT as on Linux
                     names.push(self.store.name_of(parent, ino)?.ok_or(Errno::ENOENT)?);
                     cur = Node::Store(id, parent);
                 }
@@ -1276,7 +1336,7 @@ impl Vfs {
                         names.push(ps.name(id, &p));
                         cur = Node::Pseudo(id, up);
                     }
-                    // 卸下了的挂载（MNT_DETACH）的根
+                    // The root of a detached mount (MNT_DETACH)
                     None => {
                         reached = false;
                         break;
@@ -1295,27 +1355,27 @@ impl Vfs {
         Ok((out, reached))
     }
 
-    // ---- 挂载表（mount(2)、umount2(2)、pivot_root(2)、mountinfo）----
+    // ---- Mount table (mount(2), umount2(2), pivot_root(2), mountinfo) ----
 
-    /// 挂在树上的挂载，按挂上的先后。第一个是开机时的根文件系统（[`ROOT_MOUNT`]），
-    /// pivot_root 之后它可能挂在别处、卸下了。
+    /// Attached mounts, in mount order. The first is the boot root filesystem ([`ROOT_MOUNT`]),
+    /// which after pivot_root may be mounted elsewhere or detached.
     pub(crate) fn mounts(&self) -> Vec<Mount> {
         self.mounts.borrow().list.clone()
     }
 
-    /// 挂载命名空间 `ns` 里挂在树上的挂载，按挂上的先后（mountinfo）。
+    /// Attached mounts in mount namespace `ns`, in mount order (mountinfo).
     pub(crate) fn mounts_in(&self, ns: u64) -> Vec<Mount> {
         let mounts = self.mounts.borrow();
         mounts.list.iter().filter(|m| m.ns == ns).cloned().collect()
     }
 
-    /// 开机时的挂载命名空间。
+    /// The boot mount namespace.
     pub(crate) fn init_ns(&self) -> std::rc::Rc<MntNs> {
         self.init_ns.clone()
     }
 
-    /// bind 挂载出去的、编号为 `id` 的命名空间文件留着的命名空间（[`Mount::pin`]，卸下了
-    /// 还有人用的挂载里的也算）。
+    /// The namespace kept by the namespace file with id `id` bind-mounted elsewhere
+    /// ([`Mount::pin`]; those in detached mounts still in use count too).
     pub(crate) fn pinned_ns(&self, id: u64) -> Option<crate::nsproxy::NsRef> {
         let mounts = self.mounts.borrow();
         mounts
@@ -1327,7 +1387,8 @@ impl Vfs {
             .cloned()
     }
 
-    /// 编号为 `id`、还有人用的挂载命名空间（进程在里面，或者有命名空间文件留着它）。
+    /// The mount namespace with id `id` that is still in use (a process is in it, or a
+    /// namespace file keeps it).
     pub(crate) fn find_ns(&self, id: u64) -> Option<std::rc::Rc<MntNs>> {
         if id == INIT_MNT_NS {
             return Some(self.init_ns.clone());
@@ -1339,9 +1400,10 @@ impl Vfs {
             .find(|ns| ns.id == id)
     }
 
-    /// 复制挂载命名空间 `from` 里挂在树上的所有挂载，成为属于用户命名空间 `owner` 的新的
-    /// 命名空间（Linux 的 `copy_mnt_ns`）。返回新的命名空间和旧挂载编号到新挂载编号的对照：调用方据此把进程的
-    /// 根目录、当前目录换到新的挂载上。
+    /// Copies all attached mounts of mount namespace `from` into a new namespace owned by user
+    /// namespace `owner` (Linux's `copy_mnt_ns`). Returns the new namespace and a map from old
+    /// mount ids to new ones, which the caller uses to move processes' root and current
+    /// directories onto the new mounts.
     pub(crate) fn copy_ns(
         &self,
         from: u64,
@@ -1362,8 +1424,9 @@ impl Vfs {
             .filter(|m| m.ns == from)
             .cloned()
             .collect();
-        // bind 出去的挂载命名空间文件和挂在它上面的不复制（Linux 的 copy_tree 不带
-        // CL_COPY_MNT_NS_FILE）：新的命名空间比它新，留着它可能成环
+        // A mount namespace file bound elsewhere and the mounts on it are not copied (Linux's
+        // copy_tree without CL_COPY_MNT_NS_FILE): the new namespace is newer than it, and
+        // keeping it could form a cycle
         let mut skip = std::collections::HashSet::new();
         while let Some(m) = old.iter().find(|m| {
             !skip.contains(&m.id)
@@ -1373,7 +1436,8 @@ impl Vfs {
             skip.insert(m.id);
         }
         old.retain(|m| !skip.contains(&m.id));
-        // 先分配编号再复制：MS_MOVE、pivot_root 之后挂载点所在的挂载可能比它后挂上
+        // Allocate the ids before copying: after MS_MOVE or pivot_root, the mount a mount point
+        // is in may have been mounted later than it
         let mut map = std::collections::HashMap::new();
         for m in &old {
             map.insert(m.id, mounts.next);
@@ -1404,8 +1468,9 @@ impl Vfs {
         (ns, map)
     }
 
-    /// 新的匿名挂载命名空间（Linux 的 `alloc_mnt_ns(.., true)`）：放 open_tree 复制出来的树，
-    /// 打开文件持有它；关掉之后没人用了，下一次清理（[`Vfs::collect`]）拆掉里面的挂载。
+    /// A new anonymous mount namespace (Linux's `alloc_mnt_ns(.., true)`): holds a tree copied
+    /// by open_tree and is held by an open file; once that is closed and nothing uses it, the
+    /// next cleanup ([`Vfs::collect`]) tears down its mounts.
     pub(crate) fn anon_ns(&self, owner: std::rc::Rc<crate::cred::UserNs>) -> std::rc::Rc<MntNs> {
         let ns = std::rc::Rc::new(MntNs {
             id: new_ns_id(),
@@ -1418,9 +1483,10 @@ impl Vfs {
         ns
     }
 
-    /// open_tree(`OPEN_TREE_CLONE`)：在匿名的命名空间 `ns` 里 bind 一份 `src`（它所在的挂载的
-    /// 文件系统、标志、设备号），不挂在任何地方，是那个命名空间的根。`found` 是 bind 文件时找到
-    /// 它的目录和名字。返回新挂载。
+    /// open_tree(`OPEN_TREE_CLONE`): binds a copy of `src` (with the filesystem, flags and
+    /// device number of the mount it is in) in anonymous namespace `ns`, mounted nowhere, as
+    /// that namespace's root. `found` is the directory and name where a bound file was found.
+    /// Returns the new mount.
     pub(crate) fn clone_mount(
         &self,
         src: &Node,
@@ -1446,7 +1512,8 @@ impl Vfs {
         Ok(id)
     }
 
-    /// move_mount 接上 open_tree 复制出来的树：根挂到 `point` 上，树里的挂载都进命名空间 `to`。
+    /// move_mount attaching a tree copied by open_tree: the root is mounted on `point`, and all
+    /// mounts in the tree move into namespace `to`.
     pub(crate) fn attach_tree(&self, root: MountId, (point, at): (Node, Option<Dentry>), to: u64) {
         let mut mounts = self.mounts.borrow_mut();
         let from = mounts.list.iter().find(|m| m.id == root).map(|m| m.ns);
@@ -1461,7 +1528,8 @@ impl Vfs {
         self.mounts_changed();
     }
 
-    /// 挂载 `id` 和挂在它下面的（一层层往下，mount_setattr 的 `AT_RECURSIVE`）。
+    /// Mount `id` and the mounts below it (level by level downwards, mount_setattr's
+    /// `AT_RECURSIVE`).
     pub(crate) fn subtree(&self, id: MountId) -> Vec<MountId> {
         let mounts = self.mounts.borrow();
         let mut out = vec![id];
@@ -1479,7 +1547,8 @@ impl Vfs {
         out
     }
 
-    /// 挂载命名空间 `ns` 的根目录（挂载树的根的根，上面挂着东西时是最上面的那个）。
+    /// The root directory of mount namespace `ns` (the root of the mount tree's root, or the
+    /// topmost mount on it when something is mounted there).
     pub(crate) fn ns_root(&self, ns: u64) -> Option<Node> {
         let root = {
             let mounts = self.mounts.borrow();
@@ -1492,13 +1561,14 @@ impl Vfs {
         Some(self.mounted(root))
     }
 
-    /// 挂载 `id` 所属的命名空间；卸下了的是 None（Linux 的 `check_mnt`）。
+    /// The namespace mount `id` belongs to; None for detached ones (Linux's `check_mnt`).
     pub(crate) fn mount_ns(&self, id: MountId) -> Option<u64> {
         let mounts = self.mounts.borrow();
         mounts.list.iter().find(|m| m.id == id).map(|m| m.ns)
     }
 
-    /// 有挂载命名空间的引用都没了，挂载还没卸下：清理时要处理。
+    /// Some mount namespace has no references left while its mounts are not yet detached:
+    /// cleanup must handle it.
     pub(crate) fn has_dead_ns(&self) -> bool {
         self.namespaces
             .borrow()
@@ -1506,7 +1576,7 @@ impl Vfs {
             .any(|w| w.strong_count() == 0)
     }
 
-    /// 编号为 `id`、挂在树上的挂载；卸下了的是 None。
+    /// The attached mount with id `id`; None for detached ones.
     pub(crate) fn mount(&self, id: MountId) -> Option<Mount> {
         self.mounts
             .borrow()
@@ -1516,13 +1586,13 @@ impl Vfs {
             .cloned()
     }
 
-    /// `node` 是一个挂在树上的挂载的根时，那个挂载的编号。
+    /// When `node` is the root of an attached mount, that mount's id.
     pub(crate) fn mount_root(&self, node: &Node) -> Option<MountId> {
         let mounts = self.mounts.borrow();
         mounts.list.iter().find(|m| m.root == *node).map(|m| m.id)
     }
 
-    /// 有挂载挂在 `node` 上。
+    /// Some mount is mounted on `node`.
     #[cfg(test)]
     fn is_mount_point(&self, node: &Node) -> bool {
         self.mounts
@@ -1532,9 +1602,10 @@ impl Vfs {
             .any(|m| m.point.as_ref() == Some(node))
     }
 
-    /// 仓库里目录 `dir` 里的 `name`（inode `ino`）上挂着命名空间 `ns` 里的挂载：rmdir、rename、
-    /// unlink 它是 EBUSY（Linux 的 `is_local_mountpoint`，只看调用者的命名空间）。挂在文件上的
-    /// 按找到它的目录和名字区分硬链接（[`Mount::at`]）。
+    /// A mount of namespace `ns` is on `name` (inode `ino`) in store directory `dir`: rmdir,
+    /// rename or unlink of it is EBUSY (Linux's `is_local_mountpoint`, which looks only at the
+    /// caller's namespace). Mounts on files tell hard links apart by the directory and name
+    /// where the file was found ([`Mount::at`]).
     pub(crate) fn is_store_point(&self, (ino, dir, name): (Ino, Ino, &[u8]), ns: u64) -> bool {
         self.mounts
             .borrow()
@@ -1543,8 +1614,8 @@ impl Vfs {
             .any(|m| m.ns == ns && on_entry(m, (ino, dir, name)))
     }
 
-    /// 删掉了（rmdir、unlink、被 rename 覆盖）仓库里目录 `dir` 里的 `name`（inode `ino`）：挂在
-    /// 它上面的、别的命名空间里的挂载都卸下（Linux 的 `detach_mounts`）。
+    /// `name` (inode `ino`) in store directory `dir` was deleted (rmdir, unlink, overwritten by
+    /// rename): all mounts on it in other namespaces are detached (Linux's `detach_mounts`).
     pub(crate) fn detach_store_point(&self, (ino, dir, name): (Ino, Ino, &[u8])) {
         let ids: Vec<MountId> = self
             .mounts
@@ -1559,8 +1630,8 @@ impl Vfs {
         }
     }
 
-    /// `node` 的设备号（stat 的 `st_dev`）：所在的挂载的；不知道是哪个挂载时按开机时的
-    /// 实例算。
+    /// The device number of `node` (stat's `st_dev`): that of the mount it is in; when the mount
+    /// is unknown, that of the boot instance.
     pub(crate) fn dev_of(&self, node: &Node) -> u64 {
         self.with_mount(node.mnt(), |m| m.dev)
             .unwrap_or_else(|| match node {
@@ -1569,7 +1640,7 @@ impl Vfs {
             })
     }
 
-    /// `node` 所在的文件系统的种类。
+    /// The kind of filesystem `node` is in.
     pub(crate) fn fs_of(&self, node: &Node) -> Fs {
         self.with_mount(node.mnt(), |m| m.fs)
             .unwrap_or_else(|| match node {
@@ -1578,16 +1649,19 @@ impl Vfs {
             })
     }
 
-    /// `node` 在 tmpfs 里时，那个实例的设备号（[`Vfs::tmpfs_usage`] 等用它）。
+    /// When `node` is in tmpfs, that instance's device number (used by [`Vfs::tmpfs_usage`] and
+    /// others).
     pub(crate) fn tmpfs_dev(&self, node: &Node) -> Option<u64> {
         (self.fs_of(node) == Fs::Tmpfs).then(|| self.dev_of(node))
     }
 
-    /// tmpfs 实例 `dev` 的参数和用量（页数、inode 数）。用量与 Linux 的 tmpfs 一样算：根目录
-    /// 和每个名字各占一个 inode（硬链接也是，Linux 的 `shmem_link` 每个链接另占一个），
-    /// 普通文件按页数（与 appine 的 `st_blocks` 一样当作没有空洞），长的符号链接一页。
-    /// `fresh` 时重新数一遍（statfs、重新挂载：直接改仓库的、共享映射里写的这些不经过
-    /// 记账的改动也算进去），否则用记下的，没记下时才数。
+    /// Parameters and usage (pages, inodes) of tmpfs instance `dev`. Usage is counted as in
+    /// Linux's tmpfs: the root directory and every name take one inode each (hard links too;
+    /// Linux's `shmem_link` takes another for each link), regular files by page count (treated
+    /// as having no holes, like appine's `st_blocks`), long symlinks one page. With `fresh` it
+    /// recounts (statfs, remount: changes that bypass the accounting, such as direct changes to
+    /// the store or writes through shared mappings, are included too); otherwise it uses the
+    /// recorded usage and counts only when none is recorded.
     pub(crate) fn tmpfs_usage(
         &self,
         dev: u64,
@@ -1611,9 +1685,9 @@ impl Vfs {
         Ok((params, pages, inodes))
     }
 
-    /// 在 tmpfs 实例 `dev` 里再用 `pages` 页、`inodes` 个 inode 放不放得下（Linux 的
-    /// `shmem_reserve_inode`、`shmem_inode_acct_block`）：放不下是 ENOSPC。放得下时由调用方
-    /// 做完之后记账（[`Vfs::tmpfs_charge`]）。
+    /// Whether `pages` more pages and `inodes` more inodes fit in tmpfs instance `dev` (Linux's
+    /// `shmem_reserve_inode`, `shmem_inode_acct_block`): ENOSPC when they do not. When they fit,
+    /// the caller accounts after it is done ([`Vfs::tmpfs_charge`]).
     pub(crate) fn tmpfs_check(&self, dev: u64, pages: u64, inodes: u64) -> Result<(), Errno> {
         let (p, used_pages, used_inodes) = self.tmpfs_usage(dev, false)?;
         let over = |max: u64, used: u64, more: u64| max != 0 && more > 0 && used + more > max;
@@ -1623,14 +1697,15 @@ impl Vfs {
         Ok(())
     }
 
-    /// tmpfs 实例 `dev` 里一个文件还能用多少页：本来有 `own` 页，加上没用掉的。不限时是 None。
+    /// How many pages a file in tmpfs instance `dev` can still use: the `own` pages it already
+    /// has plus those not used up. None when unlimited.
     pub(crate) fn tmpfs_room(&self, dev: u64, own: u64) -> Result<Option<u64>, Errno> {
         let (p, used, _) = self.tmpfs_usage(dev, false)?;
         Ok((p.blocks != 0).then(|| (p.blocks + own).saturating_sub(used)))
     }
 
-    /// 记下 tmpfs 实例 `dev` 的用量变了（新建、删除、写、截短之后）。还没数过时什么也不做，
-    /// 要用时再数。
+    /// Records that the usage of tmpfs instance `dev` changed (after create, delete, write,
+    /// truncate). Does nothing when it has not been counted yet; it is counted when needed.
     pub(crate) fn tmpfs_charge(&self, dev: u64, pages: i64, inodes: i64) {
         if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev)
             && let Some((p, i)) = &mut t.used
@@ -1640,8 +1715,8 @@ impl Vfs {
         }
     }
 
-    /// 重新挂载时改 tmpfs 实例 `dev` 的参数：`f` 拿到参数和现在的用量（页数、inode 数），
-    /// 出错时什么也不改。
+    /// Changes the parameters of tmpfs instance `dev` on remount: `f` gets the parameters and
+    /// the current usage (pages, inodes); on error nothing changes.
     pub(crate) fn tmpfs_reconfigure(
         &self,
         dev: u64,
@@ -1655,8 +1730,9 @@ impl Vfs {
         Ok(())
     }
 
-    /// 数一遍以 `root` 为根的 tmpfs 的用量（页数、inode 数，见 [`Vfs::tmpfs_usage`]）。
-    /// 删掉之后还开着的文件不算（Linux 关掉时才释放）。
+    /// Counts the usage of the tmpfs rooted at `root` (pages, inodes; see
+    /// [`Vfs::tmpfs_usage`]). Files still open after deletion do not count (Linux frees them
+    /// only at close).
     fn count_tmpfs(&self, root: Ino) -> Result<(u64, u64), Errno> {
         let (mut pages, mut inodes) = (0, 1);
         let mut seen = std::collections::HashSet::new();
@@ -1679,7 +1755,7 @@ impl Vfs {
         Ok((pages, inodes))
     }
 
-    /// 挂载的超级块选项（mountinfo 最后一列 `rw` 之后的部分）。
+    /// The mount's superblock options (the part after `rw` in the last column of mountinfo).
     pub(crate) fn sb_options(&self, m: &Mount) -> String {
         match m.fs {
             Fs::Pts => self.devpts_options(m.dev).show(),
@@ -1693,7 +1769,8 @@ impl Vfs {
         }
     }
 
-    /// devpts 实例 `dev` 的选项（开机时的、已经没有挂载的是开机时的那份）。
+    /// Options of devpts instance `dev` (the boot instance, and one with no mount left, get the
+    /// boot options).
     pub(crate) fn devpts_options(&self, dev: u64) -> crate::tty::PtsOptions {
         self.mounts
             .borrow()
@@ -1703,22 +1780,23 @@ impl Vfs {
             .unwrap_or(crate::tty::PtsOptions::BOOT)
     }
 
-    /// 记下新挂的 devpts 实例 `dev` 的选项。
+    /// Records the options of newly mounted devpts instance `dev`.
     pub(crate) fn set_devpts_options(&self, dev: u64, opts: crate::tty::PtsOptions) {
         self.mounts.borrow_mut().devpts.insert(dev, opts);
     }
 
-    /// `node` 所在的挂载的标志；不知道是哪个挂载时是 None。
+    /// Flags of the mount `node` is in; None when the mount is unknown.
     pub(crate) fn mount_flags(&self, node: &Node) -> Option<u64> {
         self.with_mount(node.mnt(), |m| m.flags)
     }
 
-    /// `node` 在只读的挂载里：改它是 EROFS。
+    /// `node` is in a read-only mount: changing it is EROFS.
     pub(crate) fn readonly(&self, node: &Node) -> bool {
         self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)
     }
 
-    /// 挂载看到的部分在文件系统里的路径（mountinfo 的第四列：bind 挂载的是哪个目录、文件）。
+    /// The path in the filesystem of the part the mount sees (the fourth column of mountinfo:
+    /// which directory or file a bind mount bound).
     pub(crate) fn root_path(&self, ps: &dyn Pseudo, m: &Mount) -> Vec<u8> {
         match &m.root_at {
             Some((dir, name)) => {
@@ -1733,8 +1811,8 @@ impl Vfs {
         }
     }
 
-    /// 目录在它的文件系统里的路径。命名空间文件是 `net:[编号]` 这样（Linux 的 nsfs 的
-    /// `d_dname`），前面没有 `/`。
+    /// The directory's path in its filesystem. Namespace files look like `net:[number]` (Linux
+    /// nsfs's `d_dname`), with no leading `/`.
     fn fs_path(&self, ps: &dyn Pseudo, node: &Node) -> Vec<u8> {
         let mut names = Vec::new();
         match node {
@@ -1770,9 +1848,10 @@ impl Vfs {
             .collect()
     }
 
-    /// 把文件系统 `fs` 里的 `root`（[`Fs::root`] 或者经由别的挂载的节点）挂到 `point` 上，
-    /// 返回新挂载的编号。`dev` 是 None 时另外分配一个设备号（[`Fs::own_dev`]）；bind 挂载
-    /// 用源的。`point` 是仓库里的文件时，`at` 是找到它的目录和名字（[`Mount::at`]）。
+    /// Mounts `root` in filesystem `fs` ([`Fs::root`], or a node reached through another mount)
+    /// on `point`, returning the new mount's id. With `dev` None a device number is allocated
+    /// ([`Fs::own_dev`]); bind mounts use the source's. When `point` is a file in the store,
+    /// `at` is the directory and name where it was found ([`Mount::at`]).
     pub(crate) fn add_mount(
         &self,
         fs: Fs,
@@ -1790,7 +1869,7 @@ impl Vfs {
             mounts.next_dev - 1
         });
         let at = at.filter(|_| matches!(point, Node::Store(..)));
-        // 新挂载属于挂载点所在的挂载的命名空间
+        // The new mount belongs to the namespace of the mount its mount point is in
         let ns = mounts
             .list
             .iter()
@@ -1816,7 +1895,8 @@ impl Vfs {
         id
     }
 
-    /// 挂载 `id` 是 procfs 的实例时，挂上它的进程所在的 pid 命名空间（开机时的是 None）。
+    /// When mount `id` is a procfs instance, the pid namespace of the process that mounted it
+    /// (None for the boot one).
     pub(crate) fn proc_pid_ns(&self, id: MountId) -> Option<std::rc::Rc<crate::pidns::PidNs>> {
         let mounts = self.mounts.borrow();
         let m = mounts
@@ -1827,8 +1907,9 @@ impl Vfs {
         mounts.proc_ns.get(&m.dev).cloned()
     }
 
-    /// IPC 命名空间 `ns` 的 mqueue 实例的设备号（mqueue 文件系统里的节点和 mq_open 得到的
-    /// fd 都报告它）：开机时的命名空间是 [`MQUEUE_DEV`]，别的第一次用到时分配。
+    /// Device number of the mqueue instance of IPC namespace `ns` (reported by nodes in the
+    /// mqueue filesystem and by fds from mq_open): [`MQUEUE_DEV`] for the boot namespace,
+    /// others allocated on first use.
     pub(crate) fn mq_dev(&self, ns: u64) -> u64 {
         if ns == crate::nsproxy::INIT_IPC_NS {
             return MQUEUE_DEV;
@@ -1843,7 +1924,7 @@ impl Vfs {
         dev
     }
 
-    /// 新的 procfs 实例 `id` 属于 pid 命名空间 `ns`。
+    /// New procfs instance `id` belongs to pid namespace `ns`.
     pub(crate) fn set_proc_pid_ns(&self, id: MountId, ns: std::rc::Rc<crate::pidns::PidNs>) {
         let mut mounts = self.mounts.borrow_mut();
         if let Some(dev) = mounts.list.iter().find(|m| m.id == id).map(|m| m.dev) {
@@ -1851,7 +1932,8 @@ impl Vfs {
         }
     }
 
-    /// 挂上一个新的 tmpfs 实例（根目录由这里新建），返回新挂载的编号。
+    /// Mounts a new tmpfs instance (whose root directory is created here), returning the new
+    /// mount's id.
     pub(crate) fn new_tmpfs(
         &self,
         point: (Node, Option<Dentry>),
@@ -1870,14 +1952,14 @@ impl Vfs {
             Tmpfs {
                 root,
                 params,
-                // 只有根目录
+                // Only the root directory
                 used: Some((0, 1)),
             },
         );
         Ok(id)
     }
 
-    /// 直接挂在挂载 `id` 里的挂载，按挂上的先后。
+    /// Mounts mounted directly in mount `id`, in mount order.
     pub(crate) fn children(&self, id: MountId) -> Vec<Mount> {
         self.mounts
             .borrow()
@@ -1888,13 +1970,14 @@ impl Vfs {
             .collect()
     }
 
-    /// 卸下挂载 `id` 和挂在它里面的所有挂载（Linux 的 `umount_tree`）：它们都不再挂在
-    /// 别的挂载上，各自的根没有上级。
+    /// Detaches mount `id` and all mounts inside it (Linux's `umount_tree`): none of them is
+    /// mounted on another mount any more, and each one's root has no parent.
     pub(crate) fn remove_mount(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
         let mut gone = vec![id];
         let mut i = 0;
-        // MS_MOVE、pivot_root 之后挂载不一定挂在比它先挂上的挂载里，一层层找
+        // After MS_MOVE or pivot_root a mount is not necessarily inside a mount mounted before
+        // it; search level by level
         while let Some(&parent) = gone.get(i) {
             let inside = mounts.list.iter().filter(|m| m.parent() == Some(parent));
             gone.extend(inside.map(|m| m.id).collect::<Vec<_>>());
@@ -1912,10 +1995,11 @@ impl Vfs {
         self.mounts_changed();
     }
 
-    /// 丢掉卸下了的、`in_use` 里没有的挂载（进程的根目录、当前目录和打开的文件都不在里面）。
-    /// 哪个挂载都不再看得到的 tmpfs 实例连同里面的文件一起删掉。
+    /// Drops detached mounts not in `in_use` (no process's root or current directory and no
+    /// open file is in them). tmpfs instances no mount can see any more are deleted with their
+    /// files.
     pub(crate) fn collect(&self, in_use: &std::collections::HashSet<MountId>) {
-        // 没人用的挂载命名空间：它的挂载都卸下
+        // Mount namespaces nobody uses: all their mounts are detached
         self.namespaces
             .borrow_mut()
             .retain(|w| w.strong_count() > 0);
@@ -1989,14 +2073,15 @@ impl Vfs {
                 crate::debug::log(format_args!("cannot remove tmpfs {root}: {e}"));
             }
         }
-        // 丢掉的挂载里有 bind 出去的挂载命名空间文件：那个命名空间可能也没人用了
+        // The dropped mounts included a mount namespace file bound elsewhere: that namespace may
+        // now be unused too
         if self.has_dead_ns() {
             self.collect(in_use);
         }
     }
 
-    /// 把挂在树上的挂载 `id` 改挂到 `point` 上（`MS_MOVE`、pivot_root）；None 是挂成挂载树
-    /// 的根。
+    /// Moves attached mount `id` onto `point` (`MS_MOVE`, pivot_root); None makes it the root
+    /// of the mount tree.
     pub(crate) fn move_mount(&self, id: MountId, point: Option<(Node, Option<Dentry>)>) {
         if let Some(m) = self
             .mounts
@@ -2016,12 +2101,13 @@ impl Vfs {
         self.mounts_changed();
     }
 
-    /// 记下 bind 挂载的文件是在哪个目录里、叫什么名字找到的（[`Mount::root_at`]）。
+    /// Records in which directory and under which name a bind-mounted file was found
+    /// ([`Mount::root_at`]).
     pub(crate) fn set_root_at(&self, id: MountId, at: Option<Dentry>) {
         self.update_mount(id, |m| m.root_at = at);
     }
 
-    /// 改挂载 `id` 的标志、MNT_EXPIRE 的标记。
+    /// Changes the flags and the MNT_EXPIRE mark of mount `id`.
     pub(crate) fn update_mount(&self, id: MountId, f: impl FnOnce(&mut Mount)) {
         if let Some(m) = self
             .mounts
@@ -2036,8 +2122,9 @@ impl Vfs {
         self.mounts_changed();
     }
 
-    /// 挂载表变了：不持 BKL 解析路径用的挂载点跟着换（调用方另外让各线程重新取，
-    /// [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)）。
+    /// The mount table changed: the mount points used by no-BKL path resolution are replaced to
+    /// match (the caller separately makes each thread fetch them again,
+    /// [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)).
     fn mounts_changed(&self) {
         let (points, usable) = {
             let mounts = self.mounts.borrow();
@@ -2050,15 +2137,16 @@ impl Vfs {
 }
 
 impl Mount {
-    /// 挂载点所在的挂载（mountinfo 的第二列）；挂载树的根、卸下了的没有。
+    /// The mount the mount point is in (the second column of mountinfo); the root of the mount
+    /// tree and detached mounts have none.
     pub(crate) fn parent(&self) -> Option<MountId> {
         self.point.as_ref().map(Node::mnt)
     }
 }
 
 impl Mounts {
-    /// 开机时的挂载：文件系统 `fs` 的根 `root`（设备号 `dev`）挂在 `point` 上；没有挂载点
-    /// 时不挂。
+    /// A boot mount: root `root` of filesystem `fs` (device number `dev`) mounted on `point`;
+    /// not mounted when there is no mount point.
     fn boot(
         &mut self,
         id: MountId,
@@ -2087,7 +2175,8 @@ impl Mounts {
         });
     }
 
-    /// 开机时挂的 tmpfs（与 [`Vfs::new_tmpfs`] 相同，只是挂载编号是固定的），返回它的根目录。
+    /// A tmpfs mounted at boot (the same as [`Vfs::new_tmpfs`], except that the mount id is
+    /// fixed); returns its root directory.
     fn boot_tmpfs(
         &mut self,
         store: &Store,
@@ -2102,14 +2191,15 @@ impl Mounts {
         self.next_dev += 1;
         let fs = (Fs::Tmpfs, Node::Store(id, root), dev);
         self.boot(id, fs, Some(point), flags, source);
-        // 用量到要用时再数（[`dev::populate`] 在里面建了节点）
+        // Usage is counted when needed ([`dev::populate`] created nodes in it)
         let used = None;
         self.tmpfs.insert(dev, Tmpfs { root, params, used });
         Ok(root)
     }
 
-    /// 仓库里的挂载点，不持 BKL 的解析遇到就交回正常的解析。开机时的根文件系统不是挂载树
-    /// 的根时（pivot_root 之后），它的根目录也算：`..` 要经由它的挂载点出去。
+    /// Mount points in the store; no-BKL resolution hands back to normal resolution when it
+    /// meets one. When the boot root filesystem is not the root of the mount tree (after
+    /// pivot_root), its root directory counts too: `..` has to leave through its mount point.
     fn store_points(&self) -> Arc<[Ino]> {
         let top = self
             .list
@@ -2125,7 +2215,8 @@ impl Mounts {
             .collect()
     }
 
-    /// 开机时的根文件系统还挂在树上、没有 nosymfollow：不持 BKL 的解析只在它里面走。
+    /// The boot root filesystem is still attached and not nosymfollow: no-BKL resolution walks
+    /// only inside it.
     fn fast_usable(&self) -> bool {
         self.list
             .iter()
@@ -2133,7 +2224,8 @@ impl Mounts {
     }
 }
 
-/// 没有 `/etc/resolv.conf` 时写一个指向 DNS 存根的（kernel/net 的 map）；已有的保持不动。
+/// When there is no `/etc/resolv.conf`, writes one pointing at the DNS stub (the kernel/net
+/// map); an existing one is left alone.
 fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
     let Some(etc) = store.lookup(ROOT, b"etc")? else {
         return Ok(());
@@ -2150,9 +2242,10 @@ fn ensure_resolv_conf(store: &Store) -> Result<(), Errno> {
     )
 }
 
-/// 在仓库里写一个普通文件（宿主准备配置文件用）：父目录不存在时一并建好（0755），
-/// 路径里的符号链接不跟随。文件已经存在时，`overwrite` 为 false 就保持不动，否则
-/// 替换内容（权限位不变）。
+/// Writes a regular file in the store (for the host to prepare configuration files): missing
+/// parent directories are created too (0755), and symlinks in the path are not followed. When
+/// the file already exists, it is left alone if `overwrite` is false, otherwise its contents
+/// are replaced (permission bits unchanged).
 pub fn write_file(
     store: &Store,
     path: &[u8],
@@ -2184,8 +2277,9 @@ pub fn write_file(
         .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
 }
 
-/// 读仓库里的一个普通文件（宿主看配置文件用，比如设置里列出 `/etc/passwd` 的账号）：路径里的
-/// 符号链接不跟随（与 [`write_file`] 一样），不存在是 `ENOENT`，不是普通文件是 `EINVAL`。
+/// Reads a regular file in the store (for the host to look at configuration files, such as the
+/// accounts in `/etc/passwd` listed in settings): symlinks in the path are not followed (as in
+/// [`write_file`]); a missing file is `ENOENT`, and one that is not a regular file `EINVAL`.
 pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
     use std::io::Read;
     let mut ino = ROOT;
@@ -2206,9 +2300,10 @@ pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
     Ok(data)
 }
 
-/// 拆分路径组件，去掉空组件和 `.`。
-/// 路径解析的组件：保留 `.`，以 `/` 结尾时再补一个 `.`，这样前面的节点必须是目录，
-/// 最后一个组件是符号链接时也会被跟随（与 Linux 一样）。
+/// Splits path components, dropping empty components and `.`.
+/// Components for path resolution: `.` is kept, and with a trailing `/` one more `.` is added,
+/// so the preceding node must be a directory and a symlink in the last component is followed
+/// too (as on Linux).
 fn components(path: &[u8]) -> VecDeque<Vec<u8>> {
     let mut comps: VecDeque<Vec<u8>> = path
         .split(|&b| b == b'/')
@@ -2227,10 +2322,10 @@ fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
         .map(<[u8]>::to_vec)
 }
 
-/// 目录和其中的一个名字。
+/// A directory and one name in it.
 pub(crate) type Dentry = (Node, Vec<u8>);
 
-/// 挂载 `m` 挂在仓库里目录 `dir` 里的 `name`（inode `ino`）上。
+/// Mount `m` is mounted on `name` (inode `ino`) in store directory `dir`.
 fn on_entry(m: &Mount, (ino, dir, name): (Ino, Ino, &[u8])) -> bool {
     matches!(m.point, Some(Node::Store(_, i)) if i == ino)
         && m.at
@@ -2238,7 +2333,8 @@ fn on_entry(m: &Mount, (ino, dir, name): (Ino, Ino, &[u8])) -> bool {
             .is_none_or(|(d, n)| d.ino() == Some(dir) && n == name)
 }
 
-/// 词法上规范化一个绝对路径：去掉 `.`、空组件，按 `..` 回退（不跟随符号链接）。
+/// Normalizes an absolute path lexically: drops `.` and empty components, and steps back for
+/// `..` (without following symlinks).
 pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
     let mut comps: Vec<&[u8]> = Vec::new();
     for c in path.split(|&b| b == b'/') {
@@ -2265,7 +2361,8 @@ pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// 合成文件系统都只有空的根目录，procfs 里另有 `sys/kernel/` 两层目录。
+    /// The synthetic filesystems all have only an empty root directory; procfs also has the two
+    /// directory levels `sys/kernel/`.
     struct Empty;
 
     const SYS: PseudoNode = PseudoNode::Static(b"sys/");
@@ -2324,8 +2421,8 @@ mod tests {
 
     #[test]
     fn openat2_resolve_flags_limit_the_walk() {
-        // sample 里：/usr/bin/env -> /bin/busybox，/usr/bin/rel -> ../../bin/busybox，
-        // /bindir -> bin；/proc 挂着 procfs
+        // In sample: /usr/bin/env -> /bin/busybox, /usr/bin/rel -> ../../bin/busybox,
+        // /bindir -> bin; procfs is mounted on /proc
         let (vfs, dir) = sample("openat2");
         let ps = &Empty;
         let cred = &Cred::root();
@@ -2337,7 +2434,7 @@ mod tests {
         let busybox = vfs
             .resolve(ps, cred, &root, &root, b"/bin/busybox", true)
             .unwrap();
-        // 有作用域时根目录是起点
+        // With a scope the root is the start
         let scoped = |start: &Node, p: &[u8], flags| {
             vfs.walk_resolve(ps, cred, start, start, p, true, flags)
                 .map(|(n, _)| n)
@@ -2347,7 +2444,8 @@ mod tests {
                 .map(|(n, _)| n)
         };
         use resolve::*;
-        // BENEATH：绝对路径、越出起点的 ..、绝对路径的符号链接、越出起点的相对链接都是 EXDEV
+        // BENEATH: absolute paths, .. leaving the start, symlinks to absolute paths and relative
+        // links leaving the start are all EXDEV
         assert_eq!(scoped(&usr, b"bin", BENEATH), Ok(ubin.clone()));
         assert_eq!(scoped(&usr, b"bin/..", BENEATH), Ok(usr.clone()));
         assert_eq!(scoped(&usr, b"..", BENEATH), Err(Errno::EXDEV));
@@ -2355,12 +2453,14 @@ mod tests {
         assert_eq!(scoped(&usr, b"bin/env", BENEATH), Err(Errno::EXDEV));
         assert_eq!(scoped(&usr, b"bin/rel", BENEATH), Err(Errno::EXDEV));
         assert_eq!(scoped(&root, b"usr/bin/rel", BENEATH), Ok(busybox.clone()));
-        // IN_ROOT：起点当作根目录，.. 停在起点，绝对路径从起点算
+        // IN_ROOT: the start is treated as the root, .. stops at the start, and absolute paths
+        // count from the start
         assert_eq!(scoped(&usr, b"..", IN_ROOT), Ok(usr.clone()));
         assert_eq!(scoped(&usr, b"/bin", IN_ROOT), Ok(ubin.clone()));
         assert_eq!(scoped(&usr, b"../../bin", IN_ROOT), Ok(ubin.clone()));
         assert_eq!(scoped(&usr, b"bin/env", IN_ROOT), Err(Errno::ENOENT));
-        // NO_SYMLINKS：途中和最后的符号链接都是 ELOOP，不跟随最后一个时照常
+        // NO_SYMLINKS: symlinks along the way and at the end are ELOOP; not following the last
+        // one works as usual
         assert_eq!(
             plain(&root, b"/bindir/busybox", NO_SYMLINKS),
             Err(Errno::ELOOP)
@@ -2373,14 +2473,15 @@ mod tests {
             vfs.walk_resolve(ps, cred, &root, &root, b"/usr/bin/env", false, NO_SYMLINKS)
                 .is_ok()
         );
-        // NO_XDEV：进出挂载是 EXDEV；还没取过根目录时跳到根目录也是
+        // NO_XDEV: entering or leaving mounts is EXDEV; so is jumping to the root before the
+        // root has been taken
         assert_eq!(plain(&root, b"/proc", NO_XDEV), Err(Errno::EXDEV));
         assert_eq!(plain(&root, b"/usr/bin/env", NO_XDEV), Ok(busybox.clone()));
         assert_eq!(plain(&ubin, b"env", NO_XDEV), Err(Errno::EXDEV));
         assert_eq!(plain(&ubin, b"../bin/env", NO_XDEV), Ok(busybox.clone()));
         let proc = plain(&root, b"/proc", 0).unwrap();
         assert_eq!(plain(&proc, b"..", NO_XDEV), Err(Errno::EXDEV));
-        // 新建时的父目录也受限制
+        // The parent directory for creation is restricted too
         assert_eq!(
             vfs.resolve_parent_with(ps, cred, &usr, &usr, b"/x", BENEATH),
             Err(Errno::EXDEV)
@@ -2419,7 +2520,8 @@ mod tests {
         assert_eq!(r(&root, b"/missing", true), Err(Errno::ENOENT));
         assert_eq!(r(&root, b"/bin/busybox/x", true), Err(Errno::ENOTDIR));
         assert_eq!(r(&root, b"/bin/busybox/", true), Err(Errno::ENOTDIR));
-        // . 和 .. 之前也必须是目录；符号链接的目标以 / 结尾时同样要求是目录
+        // There must also be a directory before . and ..; a symlink target ending in / likewise
+        // requires a directory
         assert_eq!(r(&root, b"/bin/busybox/.", true), Err(Errno::ENOTDIR));
         assert_eq!(r(&root, b"/bin/busybox/..", true), Err(Errno::ENOTDIR));
         assert_eq!(r(&root, b"/slash", true), Err(Errno::ENOTDIR));
@@ -2457,7 +2559,7 @@ mod tests {
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &ubin).unwrap(), b"/usr/bin");
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &root).unwrap(), b"/");
 
-        // 解析完符号链接之后的路径（/proc/<pid>/exe）
+        // The path after resolving symlinks (/proc/<pid>/exe)
         let real = |cwd: &Node, p: &[u8]| vfs.real_path(ps, cred, &Node::ROOT, cwd, p);
         for p in [
             &b"/usr/bin/env"[..],
@@ -2474,12 +2576,14 @@ mod tests {
         assert_eq!(real(&root, b"/").unwrap(), b"/");
         assert_eq!(real(&root, b"/missing"), Err(Errno::ENOENT));
 
-        // /proc 是挂载点：进去是合成文件系统的根，`..` 回到仓库的根目录
+        // /proc is a mount point: going in reaches the synthetic filesystem's root, and `..`
+        // returns to the store's root directory
         let proc = r(&root, b"/proc", true).unwrap();
         assert_eq!(proc, Node::Pseudo(PROC_MOUNT, PseudoNode::ProcRoot));
         assert_eq!(r(&proc, b"..", true).unwrap(), root);
         assert_eq!(vfs.path_of(ps, &Node::ROOT, &proc).unwrap(), b"/proc");
-        // 设备节点在开机时挂在 /dev 上的 tmpfs 里，/dev/pts 挂在它里面
+        // Device nodes are in the tmpfs mounted on /dev at boot, and /dev/pts is mounted inside
+        // it
         assert!(matches!(
             r(&root, b"/dev/null", true).unwrap(),
             Node::Store(DEV_MOUNT, _)
@@ -2553,7 +2657,8 @@ mod tests {
                             Node::Store(_, ino) => vfs.store().stat(ino),
                             Node::Pseudo(..) => unreachable!(),
                         });
-                    // 正常解析把要用的都填进了缓存，之后只用缓存也得到同样的结果
+                    // Normal resolution filled everything needed into the cache; afterwards the
+                    // cache alone gives the same result
                     assert_eq!(
                         cached.stat(ROOT, cwd, p, follow),
                         Some(full),
@@ -2563,12 +2668,12 @@ mod tests {
                 }
             }
         }
-        // 合成文件系统交给正常解析
+        // Synthetic filesystems are left to normal resolution
         assert_eq!(cached.stat(ROOT, ROOT, b"/proc", true), None);
         assert_eq!(cached.stat(ROOT, ROOT, b"/dev/pts/0", true), None);
-        // 没解析过的名字也交给正常解析
+        // Names never resolved are also left to normal resolution
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin/sh", true), None);
-        // 改了之后不会用到旧的条目
+        // After a change the old entry is not used
         let bin = match vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/bin", true) {
             Ok(Node::Store(_, ino)) => ino,
             other => panic!("{other:?}"),
@@ -2591,7 +2696,8 @@ mod tests {
         let bin = r(&root, &root, b"/bin").unwrap();
         let proc = r(&root, &root, b"/proc").unwrap();
 
-        // /usr/bin 上挂一个 procfs：进去是它的根，路径经由挂载点，`..` 回到 /usr
+        // Mount a procfs on /usr/bin: going in reaches its root, paths go through the mount
+        // point, and `..` returns to /usr
         let id = vfs.add_mount(
             Fs::Proc,
             Fs::Proc.root(),
@@ -2610,11 +2716,12 @@ mod tests {
         );
         assert_eq!(r(&root, &kernel, b"../../..").unwrap(), usr);
         assert_eq!(vfs.parent(ps, &top).unwrap(), usr);
-        // 开机时的 /proc 里同一个目录是另一个节点，`..` 回到 /proc
+        // The same directory in the boot /proc is another node, and `..` returns to /proc
         let proc_sys = r(&root, &root, b"/proc/sys").unwrap();
         assert_eq!(proc_sys, Node::Pseudo(PROC_MOUNT, SYS));
         assert_eq!(r(&root, &proc_sys, b"..").unwrap(), proc);
-        // 根目录换成 /usr：路径相对它，`..` 不越过它，根目录以外的不可达
+        // The root changed to /usr: paths are relative to it, `..` does not go past it, and
+        // anything outside the root is unreachable
         assert_eq!(vfs.path_of(ps, &usr, &kernel).unwrap(), b"/bin/sys/kernel");
         assert_eq!(r(&usr, &kernel, b"../../../../..").unwrap(), usr);
         assert_eq!(r(&usr, &usr, b"/bin/sys").unwrap(), Node::Pseudo(id, SYS));
@@ -2627,7 +2734,8 @@ mod tests {
             (b"/bin/sys/kernel".to_vec(), true)
         );
 
-        // bind 挂载 procfs 里的 sys/：看到的是那个目录，`..` 回到挂载点的上级
+        // Bind-mount sys/ in procfs: what is seen is that directory, and `..` returns to the
+        // mount point's parent
         let b = vfs.add_mount(
             Fs::Proc,
             Node::Pseudo(0, SYS),
@@ -2645,12 +2753,13 @@ mod tests {
         assert_eq!(vfs.mount_root(&bound), None);
         assert_eq!(vfs.mount_root(&root), Some(ROOT_MOUNT));
         assert_eq!(vfs.mount_root(&usr), None);
-        // 新的实例有自己的设备号，bind 挂载用源的
+        // The new instance has its own device number; bind mounts use the source's
         assert_eq!(vfs.dev_of(&proc_sys), Fs::Proc.dev());
         assert_ne!(vfs.dev_of(&kernel), Fs::Proc.dev());
         assert_eq!(vfs.dev_of(&bound), Fs::Proc.dev());
 
-        // 叠在上面的挂载：最上面的那个可见，`..` 一层层回到挂载点
+        // Stacked mounts: the topmost one is visible, and `..` goes back level by level to the
+        // mount point
         let s = vfs.add_mount(
             Fs::Pts,
             Fs::Pts.root(),
@@ -2676,7 +2785,8 @@ mod tests {
         );
         assert_eq!(ids(vfs.children(SYS_MOUNT)), [CGROUP_MOUNT]);
 
-        // 不持 BKL 的解析把挂载点交给正常解析，当前目录的上级是挂载点时也是
+        // No-BKL resolution hands mount points to normal resolution, also when the current
+        // directory's parent is a mount point
         let cached = vfs.cached();
         let ino = |n: &Node| match n {
             Node::Store(_, i) => *i,
@@ -2691,8 +2801,9 @@ mod tests {
         );
         assert_eq!(cached.stat(ROOT, lib, b"..", true), None);
 
-        // 卸下 id 和叠在上面的：又看到仓库里的目录。还在里面的节点留在卸下了的挂载里，
-        // 它的根没有上级，路径不可达
+        // Detach id and what is stacked on it: the store directory is visible again. Nodes
+        // still inside stay in the detached mount, whose root has no parent, and their paths
+        // are unreachable
         vfs.remove_mount(id);
         assert_eq!(r(&root, &root, b"/usr/bin").unwrap(), ubin);
         assert!(vfs.mount(s).is_none());
@@ -2709,7 +2820,7 @@ mod tests {
             vfs.cached().stat(ROOT, lib, b"..", true),
             Some(vfs.store().stat(ino(&ubin)))
         );
-        // 卸下的编号不再使用
+        // Ids of detached mounts are not reused
         assert!(vfs.add_mount(Fs::Sys, Fs::Sys.root(), (usr, None), 0, Vec::new(), None) > s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2727,7 +2838,8 @@ mod tests {
         let busybox = r(&root, &root, b"/bin/busybox").unwrap();
         let ino = |n: &Node| n.ino().unwrap();
 
-        // /usr bind 到 /bin 上：进去是经由新挂载的 /usr，`..` 回到挂载点的上级，路径经由挂载点
+        // /usr bound onto /bin: going in reaches /usr through the new mount, `..` returns to
+        // the mount point's parent, and paths go through the mount point
         let id = vfs.add_mount(
             Fs::Store,
             usr.clone(),
@@ -2746,8 +2858,9 @@ mod tests {
         assert_eq!(r(&root, &inner, b"..").unwrap(), top);
         assert_eq!(r(&root, &inner, b"../..").unwrap(), root);
         assert_eq!(vfs.parent(ps, &top).unwrap(), root);
-        // 经由挂载的符号链接按挂载的路径解析：/bin/bin/rel 是 ../../bin/busybox，到了挂载的
-        // 根之后回到仓库的根，再进 /bin 就又是这个挂载
+        // Symlinks reached through the mount resolve along the mount's paths: /bin/bin/rel is
+        // ../../bin/busybox, which after reaching the mount's root goes back to the store's
+        // root, and entering /bin from there is this mount again
         assert_eq!(
             r(&root, &root, b"/bin/bin/rel"),
             Err(Errno::ENOENT),
@@ -2763,19 +2876,20 @@ mod tests {
         assert!(vfs.is_under(ps, &inner, &root));
         assert!(vfs.is_under(ps, &inner, &top));
         assert!(!vfs.is_under(ps, &inner, &usr));
-        // 根目录换成挂载里的目录：`..` 不越过它，外面的到不了
+        // The root changed to a directory inside the mount: `..` does not go past it, and
+        // nothing outside can be reached
         assert_eq!(r(&inner, &inner, b"/..").unwrap(), inner);
         assert_eq!(
             vfs.reach(ps, &inner, &top).unwrap(),
             (b"/bin".to_vec(), false)
         );
 
-        // 只读：标志按经由的挂载算
+        // Read-only: flags follow the mount reached through
         vfs.update_mount(id, |m| m.flags |= ms::RDONLY);
         assert!(vfs.readonly(&inner));
         assert!(!vfs.readonly(&ubin));
 
-        // 文件 bind 到文件上：路径按挂上时的目录和名字
+        // A file bound onto a file: the path follows the directory and name at mount time
         let (f, at) = vfs
             .walk(ps, cred, &root, &root, b"/usr/bin/env", false)
             .unwrap();
@@ -2797,14 +2911,15 @@ mod tests {
             (b"/usr/bin/env".to_vec(), true)
         );
 
-        // 改挂到 /proc 上：/bin 又是原来的目录
+        // Moved onto /proc: /bin is the original directory again
         let proc_top = r(&root, &root, b"/proc").unwrap();
         vfs.move_mount(id, Some((proc_top.clone(), None)));
         assert_eq!(r(&root, &root, b"/bin").unwrap(), bin);
         assert_eq!(r(&root, &root, b"/proc/bin").unwrap(), inner);
         assert_eq!(vfs.path_of(ps, &root, &inner).unwrap(), b"/proc/bin");
 
-        // 卸下：里面的节点照常能用，挂载的根没有上级、到不了根目录；没人用了就丢掉记录
+        // Detached: nodes inside keep working, and the mount's root has no parent and cannot
+        // reach the root directory; the record is dropped once nobody uses it
         vfs.remove_mount(id);
         assert_eq!(r(&root, &root, b"/proc").unwrap(), proc_top);
         assert_eq!(r(&root, &inner, b"../../..").unwrap(), top);
@@ -2845,14 +2960,14 @@ mod tests {
         let root = top.ino().unwrap();
         let sub = vfs.store().mkdir(root, b"sub", 0o755, 0, 0).unwrap();
         let (f, _) = vfs.store().create_file(sub, b"f", 0o644, 0, 0).unwrap();
-        // tmpfs 的根上面是挂载点；里面的路径经由它
+        // Above the tmpfs root is the mount point; paths inside go through it
         assert_eq!(r(b"/usr/sub/..").unwrap(), top);
         assert_eq!(r(b"/usr/..").unwrap(), Node::ROOT);
         assert_eq!(
             vfs.path_of(ps, &Node::ROOT, &Node::Store(a, sub)).unwrap(),
             b"/usr/sub"
         );
-        // bind 出去的子目录让它活着
+        // A subdirectory bound elsewhere keeps it alive
         let b = vfs.add_mount(
             Fs::Tmpfs,
             Node::Store(a, sub),
@@ -2866,7 +2981,7 @@ mod tests {
         vfs.collect(&std::collections::HashSet::new());
         assert_eq!(vfs.store().stat(f).unwrap().nlink, 1);
         assert_eq!(r(b"/bin/f").unwrap(), Node::Store(b, f));
-        // 都没了：连同里面的一起删掉
+        // All gone: deleted together with everything inside
         vfs.remove_mount(b);
         vfs.collect(&std::collections::HashSet::new());
         assert_eq!(vfs.store().stat(f).unwrap().nlink, 0);
@@ -2883,7 +2998,8 @@ mod tests {
             .resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true)
             .unwrap();
         let before = vfs.mounts_in(INIT_MNT_NS);
-        // 复制出来的命名空间：挂载一一对应，编号是新的，挂载点、根目录跟着换
+        // The copied namespace: mounts correspond one to one with new ids, and mount points and
+        // root directories follow
         let (ns, map) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
         let copied = vfs.mounts_in(ns.id);
         assert_eq!(copied.len(), before.len());
@@ -2893,7 +3009,7 @@ mod tests {
         let proc = vfs.resolve(ps, cred, &root, &root, b"/proc", true).unwrap();
         assert_eq!(proc, Node::Pseudo(map[&PROC_MOUNT], PseudoNode::ProcRoot));
         assert_eq!(vfs.mount_ns(proc.mnt()), Some(ns.id));
-        // 新命名空间里挂的 tmpfs 只在那边
+        // A tmpfs mounted in the new namespace is only there
         let point = vfs.resolve(ps, cred, &root, &root, b"/usr", true).unwrap();
         let params = TmpfsParams {
             perm: 0o1777,
@@ -2910,7 +3026,7 @@ mod tests {
             vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, b"/usr", true),
             Ok(usr)
         );
-        // 没人用了：清理时卸下它的挂载，tmpfs 随之删掉
+        // No longer used: cleanup detaches its mounts, and the tmpfs is deleted with them
         assert!(!vfs.has_dead_ns());
         drop(ns);
         assert!(vfs.has_dead_ns());
@@ -2931,7 +3047,7 @@ mod tests {
             Some((Node::ROOT, b"pin".to_vec())),
         );
         let before = vfs.mounts_in(INIT_MNT_NS).len();
-        // 新的挂载命名空间 A 的文件 bind 到开机时的命名空间里
+        // A file of new mount namespace A bound into the boot namespace
         let (a, _) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
         let a_id = a.id;
         let file = Node::Pseudo(
@@ -2941,17 +3057,18 @@ mod tests {
         let fs = Fs::Nsfs;
         let id = vfs.add_mount(fs, file, point, 0, b"nsfs".to_vec(), Some(fs.dev()));
         vfs.update_mount(id, |m| m.pin = Some(crate::nsproxy::NsRef::Mnt(a.clone())));
-        // 复制开机时的命名空间时不带它（不然 A 经由复制出来的挂载留着自己）
+        // Copying the boot namespace leaves it out (otherwise A would keep itself alive through
+        // the copied mount)
         let (c, _) = vfs.copy_ns(INIT_MNT_NS, crate::cred::UserNs::init());
         let copied = vfs.mounts_in(c.id);
         assert_eq!(copied.len(), before);
         assert!(copied.iter().all(|m| m.pin.is_none()));
-        // A 里没有进程了：挂载留着它
+        // No processes left in A: the mount keeps it
         drop(a);
         assert!(!vfs.has_dead_ns());
         assert!(vfs.find_ns(a_id).is_some());
         assert_eq!(vfs.pinned_ns(a_id).map(|r| r.id()), Some(a_id));
-        // 卸下之后清理：A 连同它的挂载一起没了
+        // Cleanup after detaching: A is gone with its mounts
         vfs.remove_mount(id);
         vfs.collect(&std::collections::HashSet::new());
         assert!(vfs.find_ns(a_id).is_none());
@@ -2985,28 +3102,33 @@ mod tests {
             let (_, pages, inodes) = vfs.tmpfs_usage(dev, fresh).unwrap();
             (pages, inodes)
         };
-        // 只有根目录
+        // Only the root directory
         assert_eq!(usage(true), (0, 1));
-        // 目录、两页的文件和它的另一个链接、长的符号链接：每个名字一个 inode，页按文件算一次
+        // A directory, a two-page file and another link to it, and a long symlink: one inode per
+        // name, and pages counted once per file
         let sub = vfs.store().mkdir(root, b"sub", 0o755, 0, 0).unwrap();
         let (f, file) = vfs.store().create_file(sub, b"f", 0o644, 0, 0).unwrap();
         file.set_len(5000).unwrap();
         vfs.store().link(root, b"g", f).unwrap();
         vfs.store().symlink(root, b"s", &[b'x'; 200], 0, 0).unwrap();
-        assert_eq!(usage(false), (0, 1), "直接改仓库不记账");
+        assert_eq!(
+            usage(false),
+            (0, 1),
+            "changing the store directly is not accounted"
+        );
         assert_eq!(usage(true), (3, 5));
         assert_eq!(vfs.tmpfs_check(dev, 0, 1), Err(Errno::ENOSPC));
         assert_eq!(vfs.tmpfs_check(dev, 2, 0), Err(Errno::ENOSPC));
         assert_eq!(vfs.tmpfs_check(dev, 1, 0), Ok(()));
-        // f 本来有两页，加上没用掉的一页
+        // f had two pages, plus the one page not used up
         assert_eq!(vfs.tmpfs_room(dev, 2), Ok(Some(3)));
         vfs.tmpfs_charge(dev, 1, 0);
         assert_eq!(usage(false), (4, 5));
         assert_eq!(vfs.tmpfs_room(dev, 2), Ok(Some(2)));
-        // 现数一遍：记下的跟着改
+        // Counted afresh: the recorded usage follows
         assert_eq!(usage(true), (3, 5));
         assert_eq!(usage(false), (3, 5));
-        // 重新挂载：不能小于用量
+        // Remount: cannot go below the usage
         let shrink = |blocks| {
             vfs.tmpfs_reconfigure(dev, |p, pages, _| {
                 if blocks < pages {

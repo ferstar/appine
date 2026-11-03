@@ -1,10 +1,12 @@
-//! 文件租约（`F_SETLEASE`、`F_GETLEASE`）。
+//! File leases (`F_SETLEASE`, `F_GETLEASE`).
 //!
-//! 租约挂在打开文件上，按 inode 登记在 [`Kernel::leases`](crate::kernel::Kernel)。别的打开
-//! 文件要以冲突的方式打开或者截短这个 inode 时，租约被打破：持有者收到信号（SIGIO，
-//! 或者 `F_SETSIG` 设置的信号），打开的一方等它降级或者放弃，最多等
-//! `/proc/sys/fs/lease-break-time` 秒，到时强制降级。写方式打开与所有租约冲突（要降到
-//! 没有），读方式打开只与写租约冲突（降到读租约）。
+//! A lease hangs off an open file and is registered by inode in
+//! [`Kernel::leases`](crate::kernel::Kernel). When another open file is about to open this inode in
+//! a conflicting way or truncate it, the lease is broken: the holder gets a signal (SIGIO, or the
+//! signal set by `F_SETSIG`), and the opener waits for it to downgrade or give up the lease, for at
+//! most `/proc/sys/fs/lease-break-time` seconds, after which it is downgraded by force. Opening for
+//! write conflicts with every lease (they must go down to none); opening for read conflicts only
+//! with write leases (they go down to read leases).
 
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -21,14 +23,14 @@ pub(super) const F_RDLCK: i16 = 0;
 pub(super) const F_WRLCK: i16 = 1;
 pub(super) const F_UNLCK: i16 = 2;
 
-/// 一个租约。
+/// A lease.
 pub(crate) struct Lease {
     file: Weak<crate::cell::RefCell<OpenFile>>,
-    /// 设置租约时用的 fd：`F_SETSIG` 的信号把它放在 si_fd 里。
+    /// The fd used to set the lease: an `F_SETSIG` signal puts it in si_fd.
     fd: i32,
-    /// `F_RDLCK` 或 `F_WRLCK`。
+    /// `F_RDLCK` or `F_WRLCK`.
     ty: i16,
-    /// 正在被打破：要降成的类型（`F_RDLCK` 或 `F_UNLCK`）和最后期限。
+    /// Being broken: the type to downgrade to (`F_RDLCK` or `F_UNLCK`) and the deadline.
     breaking: Option<(i16, Instant)>,
 }
 
@@ -38,7 +40,7 @@ impl Lease {
     }
 }
 
-/// 普通文件的 inode。
+/// The inode of a regular file.
 fn ino_of(f: &OpenFile) -> Option<Ino> {
     match f.kind {
         FileKind::Regular { ino, .. } => Some(ino),
@@ -46,7 +48,8 @@ fn ino_of(f: &OpenFile) -> Option<Ino> {
     }
 }
 
-/// 除了 `except` 之外，`ino` 有多少个以读、以写方式打开的打开文件（不分进程）。
+/// How many open files, other than `except`, have `ino` open for reading and for writing (across
+/// all processes).
 fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
     let mut files: Vec<FileRef> = Vec::new();
     for f in k.open_files() {
@@ -64,7 +67,7 @@ fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
     (mine.len() - writers, writers)
 }
 
-/// 去掉已经关闭的打开文件的租约。
+/// Drops the leases of open files that have been closed.
 fn prune(k: &mut Kernel, ino: Ino) {
     if let Some(list) = k.leases.get_mut(&ino) {
         list.retain(|l| l.file.strong_count() > 0);
@@ -74,7 +77,7 @@ fn prune(k: &mut Kernel, ino: Ino) {
     }
 }
 
-/// fcntl(`F_SETLEASE`)。
+/// fcntl(`F_SETLEASE`).
 pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<(), Errno> {
     let (ino, writable) = {
         let f = file.borrow();
@@ -83,7 +86,7 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
     if !matches!(arg, F_RDLCK | F_WRLCK | F_UNLCK) {
         return Err(Errno::EINVAL);
     }
-    // 只有文件的属主（或者有 CAP_LEASE）能设置租约
+    // Only the file's owner (or a holder of CAP_LEASE) may set a lease
     let st = cx.vfs()?.store().stat_open(
         ino,
         match &file.borrow().kind {
@@ -108,10 +111,11 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
     }
     let others = list.iter().filter(|l| !l.is(file)).count();
     let (readers, writers) = opens(cx.kr(), ino, file);
-    // 读租约：自己不能是可写的，也不能有别人以写方式打开着；写租约：除了自己没有别的
-    // 打开，也没有别的租约
-    // 正在被写方式的打开打破时不能降成读租约：Linux 上打开的一方这时已经拿到了写
-    // 权限，算作"有人以写方式打开着"
+    // Read lease: this file must not be writable, and nobody else may have it open for writing;
+    // write lease: no other opens besides this one, and no other leases
+    // While being broken by an open for writing it cannot be downgraded to a read lease: on Linux
+    // the opener already has write access by then, which counts as "someone has it open for
+    // writing"
     let breaking_to_none = mine.is_some_and(|i| {
         cx.kr().leases[&ino][i]
             .breaking
@@ -135,7 +139,8 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
     let k = cx.k();
     let list = k.leases.get_mut(&ino).unwrap();
     match mine {
-        // 改类型：降级（比如正在被读方式打开打破的写租约降成读租约）就算完成了打破
+        // Changing the type: a downgrade (e.g. a write lease being broken by an open for reading
+        // going down to a read lease) completes the break
         Some(i) => {
             list[i].ty = arg;
             list[i].fd = fd;
@@ -154,12 +159,12 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
             });
         }
     }
-    // 与 Linux 一样，打破时的信号发给设置租约的进程
+    // As on Linux, the signal for a break goes to the process that set the lease
     file.borrow_mut().owner = (1, tgid);
     Ok(())
 }
 
-/// fcntl(`F_GETLEASE`)：正在被打破时是要降成的类型。
+/// fcntl(`F_GETLEASE`): while being broken, the type it is to be downgraded to.
 pub(super) fn get(cx: &mut Cx<'_>, file: &FileRef) -> i16 {
     let Some(ino) = ino_of(&file.borrow()) else {
         return F_UNLCK;
@@ -172,9 +177,10 @@ pub(super) fn get(cx: &mut Cx<'_>, file: &FileRef) -> i16 {
         .map_or(F_UNLCK, |l| l.breaking.map_or(l.ty, |(target, _)| target))
 }
 
-/// 要以写（`write`）或者读的方式打开或截短 `ino`：打破冲突的租约，等持有者让步。
-/// `own` 是截短时自己的打开文件，它的租约不算冲突。`nonblock` 时只通知持有者，返回
-/// EWOULDBLOCK（EAGAIN）。
+/// About to open or truncate `ino` for writing (`write`) or reading: breaks the conflicting leases
+/// and waits for the holders to give way. `own` is our own open file when truncating, whose lease
+/// does not count as a conflict. With `nonblock`, only notifies the holders and returns
+/// EWOULDBLOCK (EAGAIN).
 pub(super) fn break_leases(
     cx: &mut Cx<'_>,
     ino: Ino,
@@ -196,7 +202,7 @@ pub(super) fn break_leases(
     if !conflicts(cx.kr()) {
         return Ok(());
     }
-    // 通知还没有在打破的持有者
+    // Notify the holders that are not being broken yet
     let secs = cx.kr().lease_break_time;
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut notify = Vec::new();
@@ -225,7 +231,7 @@ pub(super) fn break_leases(
         let Some(signo) = Signal::new(if sig == 0 { 29 } else { sig }) else {
             continue;
         };
-        // POLL_MSG，si_band 是 POLLIN | POLLRDNORM | POLLMSG
+        // POLL_MSG, si_band is POLLIN | POLLRDNORM | POLLMSG
         let info = if sig == 0 {
             SigInfo::kernel()
         } else {
@@ -245,7 +251,7 @@ pub(super) fn break_leases(
         if !conflicts(cx.kr()) {
             return Ok(());
         }
-        // 到期的强制降级
+        // Forced downgrades once the deadline has passed
         let now = Instant::now();
         let mut next = None::<Instant>;
         if let Some(list) = cx.k().leases.get_mut(&ino) {
@@ -272,7 +278,7 @@ pub(super) fn break_leases(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        // 持有者降级、放弃租约或者关闭文件时请求 wake::LOCK
+        // Holders request wake::LOCK when they downgrade, give up the lease or close the file
         cx.wait_on(next, &mut [], wake::LOCK)?;
     }
 }

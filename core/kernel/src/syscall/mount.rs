@@ -1,15 +1,17 @@
-//! mount(2)、umount2(2)、pivot_root(2)（kernel/vfs 的 map）。
+//! mount(2), umount2(2), pivot_root(2) (the kernel/vfs map).
 //!
-//! 合成文件系统（procfs、sysfs、devpts、cgroup2）可以挂到任意目录上；仓库里的和合成文件
-//! 系统里的目录、文件都可以 bind 挂载（`MS_REC` 带上挂在里面的挂载），命名空间文件也可以
-//! （nsfs，挂载留住那个命名空间），挂载的标志、重新
-//! 挂载、`MS_MOVE`、卸下（`MNT_DETACH`、`MNT_EXPIRE`）、pivot_root 和各种错误按 Linux 6.1
-//! 的 `path_mount`、`path_umount`、`pivot_root`。传播类型可以设置，但不模拟：挂载之间没有
-//! 传播，都相当于 private。挂载要在调用者的挂载命名空间里（Linux 的 `check_mnt`），别的
-//! 命名空间里的（经由 `/proc/<pid>/root` 看到的）是 EINVAL。tmpfs 是仓库里不挂在根目录下面
-//! 的一棵树（`Vfs::new_tmpfs`）。mqueue 列出挂上它的进程所在的 IPC 命名空间里的 POSIX
-//! 消息队列（`syscall::mqueue`）。
-//! 别的文件系统与没有编进内核的一样是 ENODEV。
+//! Synthetic filesystems (procfs, sysfs, devpts, cgroup2) can be mounted on any directory;
+//! directories and files both in the store and in synthetic filesystems can be bind-mounted
+//! (`MS_REC` brings the mounts inside along), and so can namespace files (nsfs; the mount keeps
+//! that namespace alive). Mount flags, remounting, `MS_MOVE`, unmounting (`MNT_DETACH`,
+//! `MNT_EXPIRE`), pivot_root and the various errors follow Linux 6.1's `path_mount`,
+//! `path_umount` and `pivot_root`. Propagation types can be set but are not emulated: there is no
+//! propagation between mounts, and all behave as private. Mounts must be in the caller's mount
+//! namespace (Linux's `check_mnt`); those in other namespaces (seen through `/proc/<pid>/root`)
+//! are EINVAL. A tmpfs is a tree in the store that does not hang under the root directory
+//! (`Vfs::new_tmpfs`). mqueue lists the POSIX message queues in the IPC namespace of the process
+//! that mounted it (`syscall::mqueue`).
+//! Other filesystems are ENODEV, the same as ones not built into the kernel.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -37,7 +39,7 @@ const MS_NOUSER: u64 = 1 << 31;
 const MS_MGC_MSK: u64 = 0xffff_0000;
 const MS_MGC_VAL: u64 = 0xc0ed_0000;
 const MS_PROPAGATION: u64 = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
-/// 访问时间的几个标志：重新挂载时一个也没给就保持原来的。
+/// The access-time flags: when a remount gives none of them, the old ones are kept.
 const ATIME: u64 = ms::NOATIME | ms::NODIRATIME | ms::RELATIME;
 
 const MNT_FORCE: u32 = 1;
@@ -53,11 +55,13 @@ pub(super) fn mount(
     flags: u64,
     data: u64,
 ) -> SysResult {
-    // 与 Linux 的 ksys_mount 一样：先复制参数、解析挂载点，再看标志和权限。data 里的选项
-    // （devpts 的 mode、gid，proc 的 hidepid 等）不看，只要求能读
+    // As in Linux's ksys_mount: copy the arguments and resolve the mount point first, then look
+    // at the flags and permissions. Options in data (devpts's mode and gid, proc's hidepid and so
+    // on) are not looked at, only required to be readable
     let fstype = optional_str(cx, fstype)?;
     let source = optional_str(cx, source)?;
-    // 选项只有 tmpfs 看；Linux 复制最多一页，读不了第一个字节是 EFAULT
+    // Only tmpfs looks at the options; Linux copies at most one page, and EFAULT if the first byte
+    // cannot be read
     let data = if data != 0 {
         get::<1>(cx, data)?;
         cx.mm().read_cstr(data, 4096).unwrap_or_default()
@@ -75,8 +79,8 @@ pub(super) fn mount(
             &target,
             true,
         )?;
-        // 挂载点上已经挂着东西时挂在最上面的那个上（Linux 的 lock_mount）：`.`、当前目录
-        // 这类不经过查找的路径也一样
+        // When something is already mounted on the mount point, mount on the topmost one (Linux's
+        // lock_mount): the same for paths that involve no lookup, such as `.` and the cwd
         let top = vfs.mounted(node.clone());
         let at = at.filter(|_| top == node);
         (top, at, node)
@@ -91,7 +95,7 @@ pub(super) fn mount(
     if !may_mount(cx) {
         return Err(Errno::EPERM);
     }
-    // 挂载的标志，默认 relatime
+    // Mount flags, relatime by default
     let mut mnt = flags & ms::PER_MOUNT & !ms::RELATIME;
     if flags & ms::NOATIME == 0 {
         mnt |= ms::RELATIME;
@@ -99,7 +103,8 @@ pub(super) fn mount(
     if flags & MS_STRICTATIME != 0 {
         mnt &= !(ms::RELATIME | ms::NOATIME);
     }
-    // remount 不往上找：经由魔法链接给出的被盖住的节点不是挂载的根（EINVAL）
+    // remount does not climb up: a covered node reached through a magic link is not a mount root
+    // (EINVAL)
     if flags & MS_REMOUNT != 0 {
         let keep_atime = flags & (ATIME | MS_STRICTATIME) == 0;
         let data = (flags & MS_BIND == 0).then_some(&data[..]);
@@ -117,7 +122,7 @@ pub(super) fn mount(
     new_mount(cx, fstype, source, (node, at), mnt, &data)
 }
 
-/// mount(2) 的字符串参数，空指针是 None。
+/// A string argument of mount(2); None for a null pointer.
 fn optional_str(cx: &Cx<'_>, addr: u64) -> Result<Option<Vec<u8>>, Errno> {
     if addr == 0 {
         return Ok(None);
@@ -125,7 +130,7 @@ fn optional_str(cx: &Cx<'_>, addr: u64) -> Result<Option<Vec<u8>>, Errno> {
     read_path(cx, addr).map(Some)
 }
 
-/// 挂上一个新的文件系统（Linux 的 `do_new_mount`）。
+/// Mounts a new filesystem (Linux's `do_new_mount`).
 fn new_mount(
     cx: &mut Cx<'_>,
     fstype: Option<Vec<u8>>,
@@ -140,19 +145,20 @@ fn new_mount(
         crate::debug::log(format_args!("mount: no filesystem type {name}"));
         return Err(Errno::ENODEV);
     };
-    // mqueue 挂上的是调用者所在的 IPC 命名空间的实例，要在它的属主里有 CAP_SYS_ADMIN
-    // （Linux 的 mqueue_init_fs_context 把 fc->user_ns 换成它的，再 mount_capable）
+    // mqueue mounts the instance of the caller's IPC namespace, which needs CAP_SYS_ADMIN in the
+    // namespace's owner (Linux's mqueue_init_fs_context replaces fc->user_ns with that owner, then
+    // calls mount_capable)
     let ipc = cx.ns().ipc;
     if fs == Fs::Mqueue && !cx.cred().ns_capable(&ipc.owner, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    // cgroup2 可以不带只读挂上（crun 给容器挂 /sys/fs/cgroup 时就这样），只是里面的文件改不了
-    // （[`Vfs::readonly`]）
+    // cgroup2 can be mounted without read-only (crun does so when mounting /sys/fs/cgroup for a
+    // container); only its files cannot be changed ([`Vfs::readonly`])
     let vfs = cx.vfs()?;
     may_mount_on(&target)?;
     check_mnt(cx, &vfs, target.mnt())?;
-    // 只有一个实例的文件系统不能再挂在它自己的挂载的根上（Linux 的 do_add_mount）；mqueue
-    // 是每个 IPC 命名空间一个实例
+    // A filesystem with a single instance cannot be mounted again on the root of its own mount
+    // (Linux's do_add_mount); mqueue has one instance per IPC namespace
     let same_instance = |m: &Mount| {
         m.fs == fs
             && (fs != Fs::Mqueue
@@ -167,7 +173,8 @@ fn new_mount(
     if !vfs.is_dir(&cx.view(&vfs), &target)? {
         return Err(Errno::ENOTDIR);
     }
-    // devpts 的选项（新实例的终端的属主、权限，ptmx 的权限，上限）
+    // devpts options (owner and permissions of the new instance's terminals, ptmx permissions,
+    // the maximum)
     let devpts = if fs == Fs::Pts {
         let cred = cx.cred();
         Some(crate::tty::PtsOptions::parse(
@@ -190,7 +197,8 @@ fn new_mount(
             Node::Pseudo(0, PseudoNode::MqRoot(ipc.id)),
             Some(vfs.mq_dev(ipc.id)),
         ),
-        // cgroup2 的根是调用者所在的 cgroup 命名空间的根（Linux 的 cgroup_get_tree）
+        // The root of cgroup2 is the root of the caller's cgroup namespace (Linux's
+        // cgroup_get_tree)
         Fs::Cgroup => (
             Node::Pseudo(0, PseudoNode::Cgroup(cx.ns().cgroup.root, b"")),
             Some(fs.dev()),
@@ -205,7 +213,8 @@ fn new_mount(
         source.unwrap_or_default(),
         dev,
     );
-    // devpts 每次挂上是一个新的实例（4.7 起）：有自己的一套终端，编号就是新分到的设备号
+    // Every devpts mount is a new instance (since 4.7) with its own set of terminals, numbered by
+    // the newly allocated device number
     if let Some(opts) = devpts {
         let dev = vfs.mount(id).map_or(0, |m| m.dev);
         vfs.set_devpts_options(dev, opts);
@@ -213,11 +222,12 @@ fn new_mount(
             m.root = Node::Pseudo(id, PseudoNode::PtsRoot(dev));
         });
     }
-    // mqueue 的挂载留住那个 IPC 命名空间（和里面的队列），与 Linux 的超级块引用着它一样
+    // An mqueue mount keeps that IPC namespace (and its queues) alive, just as Linux's superblock
+    // references it
     if fs == Fs::Mqueue {
         vfs.update_mount(id, |m| m.pin = Some(crate::nsproxy::NsRef::Ipc(ipc)));
     }
-    // procfs 里的 pid 按挂上它的进程所在的 pid 命名空间算
+    // Pids in procfs are counted in the pid namespace of the process that mounted it
     let pid_ns = cx.pid_ns();
     if fs == Fs::Proc && pid_ns.level > 0 {
         vfs.set_proc_pid_ns(id, pid_ns);
@@ -226,14 +236,14 @@ fn new_mount(
     Ok(0)
 }
 
-/// tmpfs 的挂载选项里给了的那些（Linux 6.1 的 `shmem_parse_one` 解析出来的
-/// `shmem_options`）。不认识的选项是 EINVAL。
+/// The tmpfs mount options that were given (the `shmem_options` parsed by Linux 6.1's
+/// `shmem_parse_one`). Unknown options are EINVAL.
 #[derive(Default)]
 struct TmpfsOptions {
     perm: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
-    /// 页数、inode 数（0 是不限）。
+    /// Number of pages and of inodes (0 is unlimited).
     blocks: Option<u64>,
     inodes: Option<u64>,
     inode64: Option<bool>,
@@ -284,7 +294,8 @@ fn parse_tmpfs(data: &[u8]) -> Result<TmpfsOptions, Errno> {
                 Some(b"never" | b"always" | b"within_size" | b"advise" | b"deny" | b"force"),
             ) => {}
             (b"mpol", Some(_)) => {}
-            // 通用的超级块标志（`vfs_parse_sb_flag`），mount(8) 本来就会换成 MS_* 标志
+            // Generic superblock flags (`vfs_parse_sb_flag`); mount(8) turns them into MS_* flags
+            // anyway
             (
                 b"ro" | b"rw" | b"sync" | b"async" | b"dirsync" | b"mand" | b"nomand" | b"lazytime"
                 | b"nolazytime" | b"posixacl" | b"noposixacl" | b"silent" | b"loud",
@@ -300,8 +311,9 @@ fn parse_tmpfs(data: &[u8]) -> Result<TmpfsOptions, Errno> {
     Ok(o)
 }
 
-/// 新挂的 tmpfs 的参数：没给的用默认值（权限 1777，属主、属组是挂载的进程的 fsuid、
-/// fsgid，大小和 inode 数是物理内存的一半，inode64）。
+/// The parameters of a newly mounted tmpfs: defaults for what is not given (permissions 1777,
+/// owner and group the mounting process's fsuid and fsgid, size and inode count half of physical
+/// memory, inode64).
 fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, Errno> {
     let o = parse_tmpfs(data)?;
     let default = TmpfsParams::default_limit();
@@ -315,9 +327,10 @@ fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, E
     })
 }
 
-/// 重新挂载 tmpfs 时改它的超级块（Linux 6.1 的 `shmem_reconfigure`）：给了非 0 的
-/// `size=`、`nr_inodes=` 时，原来不限的不能改成限制、不能小于已经用掉的（都是 EINVAL）；
-/// 给了的大小、inode 数（0 是改成不限）和 inode32/64 照改；`mode=`、`uid=`、`gid=` 不变。
+/// Changes a tmpfs's superblock on remount (Linux 6.1's `shmem_reconfigure`): when a nonzero
+/// `size=` or `nr_inodes=` is given, an unlimited value cannot become limited and a limit cannot
+/// go below what is already used (both EINVAL); the given size and inode count (0 makes it
+/// unlimited) and inode32/64 are applied as given; `mode=`, `uid=` and `gid=` stay unchanged.
 fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
     let o = parse_tmpfs(data)?;
     vfs.tmpfs_reconfigure(dev, |p, pages, inodes| {
@@ -338,13 +351,14 @@ fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
     })
 }
 
-/// 无符号数，前缀与 C 的 `strtoull(…, 0)` 相同（`0x` 十六进制、`0` 八进制）。
+/// An unsigned number, with the same prefixes as C's `strtoull(…, 0)` (`0x` hexadecimal, `0`
+/// octal).
 fn parse_num(s: &[u8]) -> Option<u64> {
     let (n, rest) = leading_num(s)?;
     rest.is_empty().then_some(n)
 }
 
-/// 开头的无符号数和剩下的部分。
+/// The leading unsigned number and the rest.
 fn leading_num(s: &[u8]) -> Option<(u64, &[u8])> {
     let (radix, digits) = match s {
         [b'0', b'x' | b'X', rest @ ..] => (16, rest),
@@ -364,7 +378,8 @@ fn leading_num(s: &[u8]) -> Option<(u64, &[u8])> {
     Some((n, &digits[end..]))
 }
 
-/// Linux 的 `memparse`：数后面可以跟 K、M、G、T、P、E（不分大小写）。返回剩下的部分。
+/// Linux's `memparse`: the number may be followed by K, M, G, T, P or E (case-insensitive).
+/// Returns the rest.
 fn memparse(s: &[u8]) -> Result<(u64, &[u8]), Errno> {
     let (n, rest) = leading_num(s).ok_or(Errno::EINVAL)?;
     let shift = match rest.first().map(u8::to_ascii_uppercase) {
@@ -379,8 +394,8 @@ fn memparse(s: &[u8]) -> Result<(u64, &[u8]), Errno> {
     Ok((n.saturating_mul(1 << shift), &rest[1..]))
 }
 
-/// bind 挂载（Linux 的 `do_loopback`）：新挂载看到源的那个目录或文件，标志、设备号与源
-/// 所在的挂载相同。
+/// Bind mount (Linux's `do_loopback`): the new mount sees the source directory or file, with the
+/// flags and device number of the mount the source is in.
 fn bind(
     cx: &mut Cx<'_>,
     source: Option<&[u8]>,
@@ -400,11 +415,12 @@ fn bind(
     if dir != vfs.is_dir(&view, &target)? {
         return Err(Errno::ENOTDIR);
     }
-    // 卸下了的、别的命名空间里的不能 bind（Linux 的 check_mnt）
+    // Unmounted mounts and mounts in other namespaces cannot be bound (Linux's check_mnt)
     check_mnt(cx, &vfs, src.mnt())?;
     check_mnt(cx, &vfs, target.mnt())?;
     let m = vfs.mount(src.mnt()).ok_or(Errno::EINVAL)?;
-    // 挂上之前先记下源里面的挂载：目标在源里面时不会把新挂载自己也复制一遍
+    // Note the mounts inside the source before mounting: if the target is inside the source, the
+    // new mount is not copied into itself
     let inside = if recursive { vfs.mounts() } else { Vec::new() };
     let id = vfs.add_mount(
         m.fs,
@@ -422,10 +438,11 @@ fn bind(
     Ok(0)
 }
 
-/// bind 挂载命名空间文件（`ip netns add` 这样留住命名空间）：挂载持有那个命名空间
-/// （[`Mount::pin`]），在 nsfs 里，标志只有 rw。与 Linux 的 do_loopback 一样，经由别的挂载
-/// 命名空间里的路径找到的也行；挂载命名空间的文件只能挂进比它旧的命名空间（`mnt_ns_loop`：
-/// 不然命名空间可能经由挂载留着自己）。
+/// Bind-mounts a namespace file (how `ip netns add` keeps a namespace alive): the mount holds
+/// that namespace ([`Mount::pin`]), lives in nsfs, and has only the rw flag. As in Linux's
+/// do_loopback, a file found through a path in another mount namespace also works; a mount
+/// namespace's file can only be mounted into a namespace older than it (`mnt_ns_loop`: otherwise
+/// a namespace could keep itself alive through a mount).
 fn bind_ns(
     cx: &mut Cx<'_>,
     vfs: &Vfs,
@@ -450,9 +467,10 @@ fn bind_ns(
     Ok(0)
 }
 
-/// 挂载点不能是 ENOENT 的那些（Linux 的 `lock_mount`）：经由 `/proc/<pid>/fd/<n>`、`exe` 到了
-/// 已经删除的文件、管道这类没有名字的打开文件；`/proc/<pid>/fd`、`fdinfo` 里的项本身（经由
-/// 指向它的 `O_PATH` fd 到达，Linux 6.12 起不能当挂载点，LTP 的 mount08）。
+/// Mount points that must be ENOENT (Linux's `lock_mount`): nameless open files such as deleted
+/// files and pipes reached through `/proc/<pid>/fd/<n>` or `exe`; the entries in `/proc/<pid>/fd`
+/// and `fdinfo` themselves (reached through an `O_PATH` fd pointing at them; not usable as mount
+/// points since Linux 6.12, LTP's mount08).
 fn may_mount_on(target: &Node) -> Result<(), Errno> {
     match target {
         Node::Pseudo(
@@ -466,14 +484,14 @@ fn may_mount_on(target: &Node) -> Result<(), Errno> {
     }
 }
 
-/// 把 `root` 所在的挂载里、`root` 下面的挂载（`snapshot` 里的）照样挂到挂载 `to` 里
-/// （Linux 的 `copy_tree`）。
+/// Mounts the mounts below `root` in the mount `root` is in (those in `snapshot`) the same way
+/// into mount `to` (Linux's `copy_tree`).
 fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, to: MountId) {
     for c in snapshot.iter().filter(|c| c.parent() == Some(root.mnt())) {
         let Some(point) = &c.point else {
             continue;
         };
-        // 挂在文件上的经由挂上时的目录往上找
+        // A mount on a file searches upwards from the directory it was mounted through
         let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
         if point != root && !vfs.is_under(ps, from, root) {
             continue;
@@ -493,9 +511,10 @@ fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, t
     }
 }
 
-/// 重新挂载：改挂载的标志（Linux 不带 `MS_BIND` 时还改超级块的，超级块在几个挂载之间
-/// 共用，这里只改这一个挂载）。不带 `MS_BIND` 时 `data` 是选项：tmpfs 照它改超级块的
-/// 大小、inode 数（[`remount_tmpfs`]）。
+/// Remount: changes the mount's flags (without `MS_BIND` Linux also changes the superblock's,
+/// which is shared between several mounts; here only this one mount changes). Without `MS_BIND`
+/// `data` holds options: tmpfs changes its superblock's size and inode count accordingly
+/// ([`remount_tmpfs`]).
 fn remount(
     cx: &mut Cx<'_>,
     target: &Node,
@@ -507,7 +526,8 @@ fn remount(
     let id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
     check_mnt(cx, &vfs, id)?;
     let m = vfs.mount(id).ok_or(Errno::EINVAL)?;
-    // 不带 MS_BIND 时还改超级块：tmpfs 的大小、inode 数，出错时挂载的标志也不改
+    // Without MS_BIND the superblock changes too: a tmpfs's size and inode count; on error the
+    // mount's flags do not change either
     if let Some(data) = data
         && m.fs == Fs::Tmpfs
     {
@@ -519,12 +539,13 @@ fn remount(
         flags
     };
     vfs.update_mount(id, |m| m.flags = flags);
-    // 根文件系统改成 nosymfollow 时不能再不持 BKL 地解析
+    // Once the root filesystem becomes nosymfollow, resolution without the BKL is no longer
+    // possible
     cx.shared.fast_changed();
     Ok(0)
 }
 
-/// 改传播类型（Linux 的 `do_change_type`）：只检查参数。
+/// Changes the propagation type (Linux's `do_change_type`): only checks the arguments.
 fn change_type(cx: &mut Cx<'_>, target: &Node, flags: u64) -> SysResult {
     cx.vfs()?.mount_root(target).ok_or(Errno::EINVAL)?;
     let kind = flags & !(MS_REC | MS_SILENT);
@@ -534,8 +555,9 @@ fn change_type(cx: &mut Cx<'_>, target: &Node, flags: u64) -> SysResult {
     Ok(0)
 }
 
-/// `MS_MOVE`（Linux 的 `do_move_mount`）：把挂载 `source` 连同挂在它里面的改挂到 `target`
-/// 上。源要是一个挂载的根，不能是挂载树的根，目标不能在它里面。
+/// `MS_MOVE` (Linux's `do_move_mount`): moves mount `source`, with the mounts inside it, onto
+/// `target`. The source must be the root of a mount and not the root of a mount tree, and the
+/// target must not be inside it.
 fn move_mount(
     cx: &mut Cx<'_>,
     source: Option<&[u8]>,
@@ -546,14 +568,16 @@ fn move_mount(
     move_tree(cx, &src, (target, at))
 }
 
-/// 把以 `src` 为根的挂载挪到 `target` 上（Linux 的 `do_move_mount`，`MS_MOVE` 和 move_mount
-/// 共用）：`src` 要是一个挂载的根，挂在调用者的命名空间里，或者是 open_tree 复制出来、还
-/// 没接上的那棵树的根（接上，树进调用者的命名空间）。目标要在调用者的命名空间里，与 `src`
-/// 同是目录或者同不是（EINVAL），不能在要挪的挂载里面（ELOOP）。
+/// Moves the mount rooted at `src` onto `target` (Linux's `do_move_mount`, shared by `MS_MOVE` and
+/// move_mount): `src` must be the root of a mount attached in the caller's namespace, or the root
+/// of a tree copied by open_tree and not yet attached (it is attached, and the tree enters the
+/// caller's namespace). The target must be in the caller's namespace, must be a directory if and
+/// only if `src` is (EINVAL), and must not be inside the mount being moved (ELOOP).
 fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) -> SysResult {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
-    // 挂载树的根也挂在（看不到的 rootfs）上，挪它时目标总在它里面，是下面的 ELOOP
+    // The root of a mount tree is also mounted (on the invisible rootfs); when it is moved the
+    // target is always inside it, which is the ELOOP below
     let id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
     let anon = vfs
         .mount_ns(id)
@@ -580,7 +604,7 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     Ok(0)
 }
 
-// ---- 新的挂载接口（open_tree、move_mount、mount_setattr） ----
+// ---- The new mount API (open_tree, move_mount, mount_setattr) ----
 
 const OPEN_TREE_CLONE: u32 = 1;
 const OPEN_TREE_CLOEXEC: u32 = crate::fd::oflags::O_CLOEXEC;
@@ -589,18 +613,18 @@ const AT_NO_AUTOMOUNT: u32 = 0x800;
 const AT_EMPTY_PATH: u32 = 0x1000;
 const AT_RECURSIVE: u32 = 0x8000;
 
-/// move_mount 的标志（`MOVE_MOUNT_*`）。
+/// move_mount flags (`MOVE_MOUNT_*`).
 mod move_flags {
     pub const F_SYMLINKS: u32 = 1;
     pub const F_EMPTY_PATH: u32 = 4;
     pub const T_SYMLINKS: u32 = 0x10;
     pub const T_EMPTY_PATH: u32 = 0x40;
     pub const SET_GROUP: u32 = 0x100;
-    /// 6.1 认识的全部（`MOVE_MOUNT__MASK`）。
+    /// All that 6.1 knows (`MOVE_MOUNT__MASK`).
     pub const MASK: u32 = 0x177;
 }
 
-/// 挂载的属性（`MOUNT_ATTR_*`）。
+/// Mount attributes (`MOUNT_ATTR_*`).
 mod attr {
     pub const RDONLY: u64 = 1;
     pub const NOSUID: u64 = 2;
@@ -616,8 +640,9 @@ mod attr {
         RDONLY | NOSUID | NODEV | NOEXEC | ATIME | NODIRATIME | IDMAP | NOSYMFOLLOW;
 }
 
-/// 新挂载接口的路径参数：从 `dirfd` 起解析 `path`（`empty` 时可以是空的，指 `dirfd` 本身），
-/// 越过挂载点到最上面的挂载。返回节点和找到它的目录项。
+/// A path argument of the new mount API: resolves `path` from `dirfd` (with `empty` it may be
+/// empty, meaning `dirfd` itself), past mount points to the topmost mount. Returns the node and
+/// the dentry it was found at.
 fn walk_at(
     cx: &Cx<'_>,
     (dirfd, path): (i32, u64),
@@ -652,10 +677,11 @@ fn walk_at(
     Ok((top, at))
 }
 
-/// open_tree(2)（Linux 6.1 的 `open_tree`、`open_detached_copy`）：不带 `OPEN_TREE_CLONE`
-/// 时就是 O_PATH 的 fd；带的要 `CAP_SYS_ADMIN`，在一个匿名的挂载命名空间里 bind 一份那个
-/// 路径（`AT_RECURSIVE` 连同下面的挂载），不挂在任何地方，fd 指向它的根，由 move_mount 接上，
-/// 没接上就关掉的拆掉。源要在调用者的命名空间里挂着（EINVAL）。
+/// open_tree(2) (Linux 6.1's `open_tree`, `open_detached_copy`): without `OPEN_TREE_CLONE` it is
+/// just an O_PATH fd; with it, it needs `CAP_SYS_ADMIN` and bind-mounts a copy of that path
+/// (with the mounts below it under `AT_RECURSIVE`) in an anonymous mount namespace, mounted
+/// nowhere; the fd points at its root, move_mount attaches it, and it is torn down if closed
+/// without being attached. The source must be mounted in the caller's namespace (EINVAL).
 pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
     let valid = AT_EMPTY_PATH
         | AT_NO_AUTOMOUNT
@@ -683,7 +709,7 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
         check_mnt(cx, &vfs, node.mnt())?;
         let dir = vfs.is_dir(&view, &node)?;
         let ns = vfs.anon_ns(cx.t.fs.borrow().mnt_ns.owner.clone());
-        // 挂上之前先记下源里面的挂载（与 bind 一样）
+        // Note the mounts inside the source before mounting (as in bind)
         let inside = if flags & AT_RECURSIVE != 0 {
             vfs.mounts()
         } else {
@@ -706,10 +732,11 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
     Ok(cx.fds_mut().install(file, cloexec, 0)? as u64)
 }
 
-/// move_mount(2)（Linux 6.1）：要 `CAP_SYS_ADMIN`；源、目标各自从目录 fd 起解析（`F_EMPTY_PATH`、
-/// `T_EMPTY_PATH` 时可以是 fd 本身，`F_SYMLINKS`、`T_SYMLINKS` 时跟随最后的符号链接），
-/// 挪法与 `MS_MOVE` 相同（[`move_tree`]）。appine 没有共享的挂载，`MOVE_MOUNT_SET_GROUP`
-/// 总是 EINVAL（Linux 上源不是共享的也是）。
+/// move_mount(2) (Linux 6.1): needs `CAP_SYS_ADMIN`; source and target are each resolved from a
+/// directory fd (with `F_EMPTY_PATH`/`T_EMPTY_PATH` they may be the fd itself, with
+/// `F_SYMLINKS`/`T_SYMLINKS` the last symlink is followed), and the move works as `MS_MOVE`
+/// ([`move_tree`]). appine has no shared mounts, so `MOVE_MOUNT_SET_GROUP` is always EINVAL (as
+/// it is on Linux when the source is not shared).
 pub(super) fn sys_move_mount(
     cx: &mut Cx<'_>,
     from: (i32, u64),
@@ -731,11 +758,13 @@ pub(super) fn sys_move_mount(
     move_tree(cx, &src, target)
 }
 
-/// mount_setattr(2)（Linux 6.1 的 `mount_setattr`、`build_mount_kattr`）：改挂载（`AT_RECURSIVE`
-/// 时连同下面的）的标志。`struct mount_attr` 至少 32 字节，多给的要是 0；只能改访问时间
-/// 的要同时在 attr_clr 里给出整个 `MOUNT_ATTR__ATIME`。传播类型检查之后不起作用（appine 的
-/// 挂载之间没有传播）。idmapped 挂载（`MOUNT_ATTR_IDMAP`）检查 userns 的 fd 之后是 EINVAL，
-/// 与文件系统不支持它的一样。
+/// mount_setattr(2) (Linux 6.1's `mount_setattr`, `build_mount_kattr`): changes the flags of a
+/// mount (with those below it under `AT_RECURSIVE`). `struct mount_attr` is at least 32 bytes,
+/// and anything beyond must be 0; changing the access time requires giving the whole
+/// `MOUNT_ATTR__ATIME` in attr_clr as well. Propagation types have no effect after being checked
+/// (appine's mounts do not propagate to each other). Idmapped mounts (`MOUNT_ATTR_IDMAP`) are
+/// EINVAL after the userns fd is checked, the same as for a filesystem that does not support
+/// them.
 pub(super) fn mount_setattr(
     cx: &mut Cx<'_>,
     (dirfd, path): (i32, u64),
@@ -772,7 +801,8 @@ pub(super) fn mount_setattr(
     {
         return Err(Errno::EINVAL);
     }
-    // 访问时间：要改的话 attr_clr 里给出整个 MOUNT_ATTR__ATIME，attr_set 是三种之一
+    // Access time: to change it, attr_clr gives the whole MOUNT_ATTR__ATIME and attr_set one of
+    // the three
     let atime = if clr & attr::ATIME != 0 {
         if clr & attr::ATIME != attr::ATIME {
             return Err(Errno::EINVAL);
@@ -813,7 +843,7 @@ pub(super) fn mount_setattr(
     )?;
     let vfs = cx.vfs()?;
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
-    // 调用者的命名空间里的，或者 open_tree 复制出来还没接上的
+    // In the caller's namespace, or copied by open_tree and not yet attached
     let anon = vfs
         .mount_ns(id)
         .and_then(|ns| vfs.find_ns(ns))
@@ -852,9 +882,9 @@ pub(super) fn mount_setattr(
     Ok(0)
 }
 
-/// pivot_root(2)（Linux 6.1 的 `pivot_root`）：`new_root` 的挂载换到调用者的根目录所在的
-/// 挂载的位置，原来的根挂到 `put_old` 上；根目录、当前目录是原来的根目录的进程都换成
-/// `new_root`（`chroot_fs_refs`）。
+/// pivot_root(2) (Linux 6.1's `pivot_root`): the mount of `new_root` takes the place of the mount
+/// the caller's root directory is in, and the old root is mounted on `put_old`; processes whose
+/// root directory or cwd was the old root directory switch to `new_root` (`chroot_fs_refs`).
 pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysResult {
     if !may_mount(cx) {
         return Err(Errno::EPERM);
@@ -871,7 +901,7 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
             return Err(Errno::ENOTDIR);
         }
     }
-    // put_old 上挂着东西时挂在最上面的那个上（lock_mount）
+    // When something is mounted on put_old, use the topmost one (lock_mount)
     let old = vfs.mounted(old);
     check_mnt(cx, &vfs, new.mnt())?;
     check_mnt(cx, &vfs, root.mnt())?;
@@ -879,7 +909,7 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     let (Some(new_mnt), Some(root_mnt)) = (vfs.mount(new.mnt()), vfs.mount(root.mnt())) else {
         return Err(Errno::EINVAL);
     };
-    // 已经删除的目录（d_unlinked）
+    // Deleted directories (d_unlinked)
     for node in [&new, &old] {
         if let Node::Store(_, ino) = node
             && vfs.store().stat(*ino)?.nlink == 0
@@ -890,7 +920,8 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     if new_mnt.id == root_mnt.id || old.mnt() == root_mnt.id {
         return Err(Errno::EBUSY);
     }
-    // 根目录、new_root 都要是挂载的根，put_old 要在 new_root 下面，new_root 要在根目录下面
+    // The root directory and new_root must both be mount roots, put_old must be below new_root,
+    // and new_root must be below the root directory
     if root_mnt.root != root
         || new_mnt.root != new
         || !vfs.is_under(&view, &old, &new)
@@ -925,7 +956,7 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         return Err(Errno::EPERM);
     }
     let vfs = cx.vfs()?;
-    // `.`、当前目录这类路径也卸挂在上面的（LOOKUP_MOUNTPOINT）
+    // Paths such as `.` and the cwd also unmount what is mounted on them (LOOKUP_MOUNTPOINT)
     let node = vfs.mounted(node);
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
     check_mnt(cx, &vfs, id)?;
@@ -938,15 +969,16 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
         if busy(cx, &vfs, id) {
             return Err(Errno::EBUSY);
         }
-        // 第一次只标记，没有人用过它的话下一次才卸下。Linux 在有人用过之后去掉标记，
-        // 这里不去掉
+        // The first time only marks it; if nobody has used it, the next time unmounts it. Linux
+        // removes the mark once somebody has used it; here it is not removed
         if !vfs.mount(id).is_some_and(|m| m.expiring) {
             vfs.update_mount(id, |m| m.expiring = true);
             return Err(Errno::EAGAIN);
         }
     }
-    // 挂载树的根卸不下；调用者的根目录所在的挂载只能 MNT_DETACH（Linux 不带它时把根文件
-    // 系统重新挂成只读）
+    // The root of a mount tree cannot be unmounted; the mount the caller's root directory is in
+    // can only be unmounted with MNT_DETACH (without it, Linux remounts the root filesystem
+    // read-only)
     if vfs.mount(id).is_some_and(|m| m.point.is_none()) {
         return Err(if detach { Errno::EINVAL } else { Errno::EBUSY });
     }
@@ -959,14 +991,15 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     Ok(0)
 }
 
-/// 能不能动挂载（Linux 的 `may_mount`）：在挂载命名空间的属主（用户命名空间）里有
-/// `CAP_SYS_ADMIN`。
+/// Whether mounts may be changed (Linux's `may_mount`): `CAP_SYS_ADMIN` in the owner (a user
+/// namespace) of the mount namespace.
 fn may_mount(cx: &Cx<'_>) -> bool {
     let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
     cx.cred().ns_capable(&owner, cap::SYS_ADMIN)
 }
 
-/// 挂载 `id` 挂在树上、在调用者的挂载命名空间里（Linux 的 `check_mnt`），否则 EINVAL。
+/// Mount `id` is attached to the tree and in the caller's mount namespace (Linux's `check_mnt`);
+/// otherwise EINVAL.
 fn check_mnt(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> Result<(), Errno> {
     match vfs.mount_ns(id) {
         Some(ns) if ns == cx.mnt_ns() => Ok(()),
@@ -974,20 +1007,21 @@ fn check_mnt(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> Result<(), Errno> {
     }
 }
 
-/// 有挂载命名空间没人用了（最后一个用它的进程退出了）：卸下它的挂载，丢掉没人用的。
+/// Some mount namespace is no longer used (the last process using it exited): unmount its mounts
+/// and drop those nobody uses.
 pub(crate) fn collect_namespaces(k: &crate::kernel::Kernel, vfs: &Vfs) {
     if vfs.has_dead_ns() {
         vfs.collect(&in_use(k));
     }
 }
 
-/// 挂载 `id` 在用：里面挂着别的挂载，或者有进程的根目录、当前目录、打开的文件在里面
-/// （经由 devpts 里的路径打开的终端也算）。
+/// Mount `id` is in use: other mounts are mounted inside it, or a process's root directory, cwd
+/// or open file is in it (terminals opened through paths in devpts count too).
 fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
     !vfs.children(id).is_empty() || in_use(cx.kr()).contains(&id)
 }
 
-/// 进程的根目录、当前目录和打开的文件所在的挂载。
+/// The mounts that processes' root directories, cwds and open files are in.
 fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
     let mut used = HashSet::new();
     for task in k.tasks.values() {

@@ -1,35 +1,37 @@
-//! 字符设备（kernel/vfs 的 map）。
+//! Character devices (the kernel/vfs map).
 //!
-//! 开机时 `/dev` 上挂一个 tmpfs，标准的设备节点按 Linux 的设备号建在里面（[`populate`]，
-//! 相当于 Linux 的 devtmpfs），打开设备节点时按设备号找到这里的实现；guest 自己用 mknod
-//! 建的同号节点行为相同。仓库里的 `/dev` 目录是它的挂载点，里面也补齐同样的节点
-//! （[`ensure_dev_nodes`]，卸下 `/dev` 之后看到的就是它们）。
+//! At boot a tmpfs is mounted on `/dev` and the standard device nodes are created in it with
+//! Linux's device numbers ([`populate`], the equivalent of Linux's devtmpfs); opening a device
+//! node finds the implementation here by device number, and nodes with the same numbers that the
+//! guest creates with mknod behave the same. The store's `/dev` directory is its mount point and
+//! gets the same nodes too ([`ensure_dev_nodes`]; they are what is seen after `/dev` is
+//! unmounted).
 
 use crate::errno::Errno;
 use crate::vfs::store::{Ino, ROOT, Store, mode};
 
-/// 进程内实现的字符设备。
+/// Character devices implemented in-process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
-    /// `/dev/null`：读到 EOF，写入全部丢弃。
+    /// `/dev/null`: reads return EOF, writes are all discarded.
     Null,
-    /// `/dev/zero`：读到零，写入全部丢弃。
+    /// `/dev/zero`: reads return zeros, writes are all discarded.
     Zero,
-    /// `/dev/full`：读到零，写入失败（ENOSPC）。
+    /// `/dev/full`: reads return zeros, writes fail (ENOSPC).
     Full,
-    /// `/dev/random`、`/dev/urandom`：宿主的随机数。
+    /// `/dev/random`, `/dev/urandom`: the host's random numbers.
     Random,
-    /// `/dev/kmsg`：内核日志（[`crate::klog`]），每个打开文件有自己的读位置。
+    /// `/dev/kmsg`: the kernel log ([`crate::klog`]); each open file has its own read position.
     Kmsg,
 }
 
-/// Linux 的设备号编码（`new_encode_dev`）。
+/// Linux's device number encoding (`new_encode_dev`).
 pub const fn rdev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 
 impl Device {
-    /// 按设备号查找；没有实现的设备返回 ENXIO。
+    /// Looks up by device number; ENXIO for devices that are not implemented.
     pub fn from_rdev(rdev_value: u64) -> Result<Device, Errno> {
         match rdev_value {
             v if v == rdev(1, 3) => Ok(Device::Null),
@@ -42,8 +44,8 @@ impl Device {
     }
 }
 
-/// `/dev` 里的标准节点：名字、设备号、权限。终端设备（tty、console、ptmx）由
-/// syscall 层按设备号接到 PTY 上。
+/// The standard nodes in `/dev`: name, device number, permissions. Terminal devices (tty,
+/// console, ptmx) are connected to PTYs by the syscall layer by device number.
 const NODES: [(&[u8], u64, u32); 9] = [
     (b"null", rdev(1, 3), 0o666),
     (b"zero", rdev(1, 5), 0o666),
@@ -56,7 +58,7 @@ const NODES: [(&[u8], u64, u32); 9] = [
     (b"ptmx", rdev(5, 2), 0o666),
 ];
 
-/// `/dev` 里的标准符号链接，都指向 procfs。
+/// The standard symlinks in `/dev`, all pointing into procfs.
 const LINKS: [(&[u8], &[u8]); 4] = [
     (b"fd", b"/proc/self/fd"),
     (b"stdin", b"/proc/self/fd/0"),
@@ -64,11 +66,13 @@ const LINKS: [(&[u8], &[u8]); 4] = [
     (b"stderr", b"/proc/self/fd/2"),
 ];
 
-/// `/dev` 里的标准目录：devpts、`/dev/shm` 的 tmpfs、mqueue 的挂载点。
+/// The standard directories in `/dev`: the mount points of devpts, the `/dev/shm` tmpfs and
+/// mqueue.
 const DIRS: [(&[u8], u32); 3] = [(b"pts", 0o755), (b"shm", 0o1777), (b"mqueue", 0o755)];
 
-/// 确保 `/dev` 和其中的标准设备节点，以及 `/proc`、`/sys`、`/run` 这些挂载点存在（导入
-/// rootfs 之后、每次启动时调用）。已经存在的同名项保持不动。
+/// Ensures that `/dev` and the standard device nodes in it exist, along with the mount points
+/// `/proc`, `/sys` and `/run` (called after importing a rootfs and at every boot). Existing
+/// entries with the same names are left alone.
 pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
     store.transaction(|s| {
         for (name, perm) in [(&b"proc"[..], 0o555), (b"sys", 0o555), (b"run", 0o755)] {
@@ -87,8 +91,9 @@ pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
     })
 }
 
-/// 在目录 `dev` 里建好标准的设备节点、符号链接和目录（开机时挂在 `/dev` 上的 tmpfs、
-/// 仓库里的 `/dev`）。已经存在的同名项保持不动。
+/// Creates the standard device nodes, symlinks and directories in directory `dev` (the tmpfs
+/// mounted on `/dev` at boot, and the store's `/dev`). Existing entries with the same names are
+/// left alone.
 pub fn populate(store: &Store, dev: Ino) -> Result<(), Errno> {
     store.transaction(|s| {
         let missing = |name: &[u8]| -> Result<bool, Errno> { Ok(s.lookup(dev, name)?.is_none()) };
@@ -111,7 +116,7 @@ pub fn populate(store: &Store, dev: Ino) -> Result<(), Errno> {
     })
 }
 
-/// 设备节点的 inode 对应的设备。
+/// The device for a device node's inode.
 pub fn open(store: &Store, ino: Ino) -> Result<Device, Errno> {
     Device::from_rdev(store.stat(ino)?.rdev)
 }

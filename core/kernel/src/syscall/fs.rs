@@ -1,8 +1,9 @@
-//! 文件与目录类 syscall。
+//! File and directory syscalls.
 //!
-//! 读写分两层：`read_bytes`/`write_bytes` 对一个打开文件做一次宿主缓冲区上的操作，
-//! `read_file`/`write_file` 负责和 guest 内存之间的拷贝。宿主 fd 和管道可能阻塞，
-//! 阻塞期间释放 BKL，并且不持有任何打开文件的借用（别的线程可能在用同一个打开文件）。
+//! Reads and writes have two layers: `read_bytes`/`write_bytes` do one operation on an open file
+//! with a host buffer, and `read_file`/`write_file` copy to and from guest memory. Host fds and
+//! pipes may block; while blocked they release the BKL and hold no borrow of any open file (other
+//! threads may be using the same open file).
 
 use std::os::unix::fs::FileExt;
 use std::rc::{Rc, Weak};
@@ -62,7 +63,7 @@ const F_ADD_SEALS: u32 = 1033;
 const F_GET_SEALS: u32 = 1034;
 const FD_CLOEXEC: u64 = 1;
 
-/// memfd 的封印。
+/// memfd seals.
 const F_SEAL_SEAL: u32 = 0x1;
 const F_SEAL_SHRINK: u32 = 0x2;
 const F_SEAL_GROW: u32 = 0x4;
@@ -89,16 +90,16 @@ const UTIME_OMIT: i64 = (1 << 30) - 2;
 const CLOSE_RANGE_UNSHARE: u32 = 2;
 const CLOSE_RANGE_CLOEXEC: u32 = 4;
 
-/// readv/writev 最多接受的 iovec 个数（`UIO_MAXIOV`）。
+/// The most iovecs readv/writev accept (`UIO_MAXIOV`).
 const UIO_MAXIOV: usize = 1024;
 
 pub(super) use crate::vfs::ROOT_DEV;
-/// 管道报告的设备号（Linux 上 pipefs 是一个匿名设备）。
+/// Device number pipes report (on Linux pipefs is an anonymous device).
 const PIPE_DEV: u64 = 0xd;
-/// socket、anon_inode（epoll、eventfd）报告的设备号。
+/// Device number sockets and anon_inodes (epoll, eventfd) report.
 const SOCK_DEV: u64 = 0x8;
 const ANON_DEV: u64 = 0xe;
-/// statfs 报告的文件系统类型。
+/// Filesystem types statfs reports.
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const MQUEUE_MAGIC: u64 = 0x1980_0202;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
@@ -108,10 +109,11 @@ const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
-/// PTY 主设备的设备号（`/dev/ptmx`）。
+/// Device number of the PTY master device (`/dev/ptmx`).
 const PTMX_RDEV: u64 = rdev(5, 2);
 
-/// 可以透传给宿主终端的 ioctl：编号、参数大小、是否是输出参数。
+/// ioctls that can be passed through to the host terminal: number, argument size, whether the
+/// argument is an output.
 const TTY_IOCTLS: [(u32, usize, bool); 14] = [
     (0x5401, 36, true),       // TCGETS
     (0x5402, 36, false),      // TCSETS
@@ -135,13 +137,15 @@ const RNDADDENTROPY: u32 = 0x4008_5203;
 const RNDZAPENTCNT: u32 = 0x5204;
 const RNDCLEARPOOL: u32 = 0x5206;
 const RNDRESEEDCRNG: u32 = 0x5207;
-/// 熵池里的比特数（`/proc/sys/kernel/random/entropy_avail`）。
+/// Number of bits in the entropy pool (`/proc/sys/kernel/random/entropy_avail`).
 pub(crate) const ENTROPY: i32 = 256;
 
-/// `/dev/random`、`/dev/urandom` 的 ioctl（Linux 6.1 的 `random_ioctl`）。随机数取自宿主，
-/// 与 Linux 5.18 起一样熵池总是满的：加进来的数据和熵只检查参数、读一遍，不起作用（seedrng
-/// 开机时用 `RNDADDENTROPY` 把上次存的种子加回去）。改熵池的要开机时的命名空间里的
-/// `CAP_SYS_ADMIN`；不认识的请求是 EINVAL（tty 的请求也是，与 Linux 一样不是 ENOTTY）。
+/// ioctls of `/dev/random` and `/dev/urandom` (Linux 6.1's `random_ioctl`). Random numbers come
+/// from the host, and as on Linux since 5.18 the entropy pool is always full: added data and
+/// entropy only have their arguments checked and are read once, with no effect (seedrng adds the
+/// seed saved last time back with `RNDADDENTROPY` at boot). Changing the entropy pool needs
+/// `CAP_SYS_ADMIN` in the initial namespace; unknown requests are EINVAL (tty requests too, not
+/// ENOTTY, as on Linux).
 fn random_ioctl(cx: &mut Cx<'_>, request: u32, arg: u64) -> SysResult {
     let admin = || {
         if cx.cred().capable(cap::SYS_ADMIN) {
@@ -159,7 +163,8 @@ fn random_ioctl(cx: &mut Cx<'_>, request: u32, arg: u64) -> SysResult {
             }
             Ok(0)
         }
-        // struct rand_pool_info：熵的比特数、数据的字节数，后面是数据；数据要都读得到
+        // struct rand_pool_info: entropy bit count, data byte count, then the data; all of the
+        // data must be readable
         RNDADDENTROPY => {
             admin()?;
             if i32::from_le_bytes(get(cx, arg)?) < 0 {
@@ -199,9 +204,10 @@ fn host_errno(e: std::io::Error) -> Errno {
     Errno(e.raw_os_error().unwrap_or(Errno::EIO.0))
 }
 
-// ---- 路径 ----
+// ---- Paths ----
 
-/// `*at` 系列的起点目录。路径为空时直接 ENOENT（不看 dirfd），与 Linux 相同。
+/// Start directory of the `*at` family. An empty path is ENOENT at once (dirfd is not looked
+/// at), as on Linux.
 pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
@@ -221,12 +227,12 @@ pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Er
     Ok(node)
 }
 
-/// 解析 `*at` 系列的路径参数。
+/// Resolves the path argument of the `*at` family.
 pub(super) fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
     resolve_at(cx, &cx.cred(), dirfd, path, follow)
 }
 
-/// 以凭据 `cred` 解析 `*at` 系列的路径参数。
+/// Resolves the path argument of the `*at` family with credentials `cred`.
 fn resolve_at(
     cx: &Cx<'_>,
     cred: &Cred,
@@ -239,7 +245,8 @@ fn resolve_at(
     vfs.resolve(&cx.view(&vfs), cred, &cx.root(), &start, path, follow)
 }
 
-/// `*at` 系列里"路径为空时作用于 dirfd 本身"（`AT_EMPTY_PATH`）的公共部分。
+/// The common part of "an empty path acts on dirfd itself" (`AT_EMPTY_PATH`) in the `*at`
+/// family.
 fn lookup_at_or_fd(
     cx: &Cx<'_>,
     cred: &Cred,
@@ -257,8 +264,9 @@ fn lookup_at_or_fd(
     resolve_at(cx, cred, dirfd, path, follow)
 }
 
-/// 解析要新建或删除的路径：返回父目录经由的挂载、父目录和最后一个组件。只有仓库里的
-/// 目录可以修改；挂载是不是只读的由调用方按 Linux 的顺序检查。
+/// Resolves a path to create or delete: returns the mount the parent directory was reached
+/// through, the parent directory and the last component. Only directories in the store can be
+/// modified; whether the mount is read-only is checked by the caller in Linux's order.
 pub(super) fn parent_at<'p>(
     cx: &Cx<'_>,
     dirfd: i32,
@@ -271,9 +279,10 @@ pub(super) fn parent_at<'p>(
     Ok((mnt, dir, name))
 }
 
-/// 要新建的名字的父目录（[`parent_at`]）：合成文件系统的目录里名字已经存在时是 EEXIST，
-/// 先于目录不能修改的错误（Linux 的 `filename_create`：`mkdir -p /sys/fs/cgroup/x` 要靠
-/// `mkdir /sys/fs` 是 EEXIST）。
+/// The parent directory of a name to create ([`parent_at`]): in a directory of a synthetic
+/// filesystem an existing name is EEXIST, ahead of the error that the directory cannot be
+/// modified (Linux's `filename_create`: `mkdir -p /sys/fs/cgroup/x` relies on `mkdir /sys/fs`
+/// being EEXIST).
 pub(super) fn create_parent_at<'p>(
     cx: &Cx<'_>,
     dirfd: i32,
@@ -289,10 +298,11 @@ pub(super) fn create_parent_at<'p>(
     Ok((mnt, dir, name))
 }
 
-/// 要在里面新建、删除的目录：仓库里的；合成文件系统里的不能修改，在只读的挂载里
-/// （比如 cgroup2）是 EROFS。mqueue 文件系统的根目录里只能新建、删除队列（openat、
-/// unlinkat 另外处理），别的（mkdir、mknod、symlink、link、rename）与 Linux 一样是 EPERM：
-/// 它的目录没有这些操作。
+/// The directory to create or delete in: one in the store. Those in synthetic filesystems cannot
+/// be modified, and are EROFS in a read-only mount (such as cgroup2). In the root directory of the
+/// mqueue filesystem only queues can be created and deleted (openat and unlinkat handle them
+/// separately); everything else (mkdir, mknod, symlink, link, rename) is EPERM as on Linux: its
+/// directory has no such operations.
 fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Store(mnt, ino) => Ok((*mnt, *ino)),
@@ -302,15 +312,17 @@ fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     }
 }
 
-/// IPC 命名空间 `ns` 的 mqueue 文件系统里 inode 编号是 `ino` 的队列：删掉了的是 ENOENT。
+/// The queue with inode number `ino` in the mqueue filesystem of IPC namespace `ns`; a deleted
+/// one is ENOENT.
 fn mq_queue(cx: &Cx<'_>, ns: u64, ino: u64) -> Result<Rc<RefCell<super::MessageQueue>>, Errno> {
     super::mqueue::find(cx.kr().ipc(ns), ino)
         .map(|(_, q)| q.clone())
         .ok_or(Errno::ENOENT)
 }
 
-/// 在目录 `dir` 里新建 `name` 之前对名字和挂载的检查（Linux 的 `filename_create`）：要能
-/// 在目录里查找，名字不存在，然后才是只读的挂载（EROFS）。返回目录的元数据。
+/// Checks on the name and the mount before creating `name` in directory `dir` (Linux's
+/// `filename_create`): the directory must be searchable and the name must not exist, and only
+/// then comes the read-only mount (EROFS). Returns the directory's metadata.
 fn may_create_name(
     vfs: &Vfs,
     cred: &Cred,
@@ -329,8 +341,8 @@ fn may_create_name(
     Ok(st)
 }
 
-/// 在目录 `dir` 里新建 `name` 之前的检查（`may_create`）：[`may_create_name`]，再要求
-/// 目录可写。返回目录的元数据。
+/// Checks before creating `name` in directory `dir` (`may_create`): [`may_create_name`], then the
+/// directory must be writable. Returns the directory's metadata.
 pub(super) fn may_create(
     vfs: &Vfs,
     cred: &Cred,
@@ -342,7 +354,8 @@ pub(super) fn may_create(
     Ok(st)
 }
 
-/// 删除、改名之前：只读的挂载里是 EROFS（Linux 的 `mnt_want_write`，在查找名字之前）。
+/// Before deleting or renaming: EROFS in a read-only mount (Linux's `mnt_want_write`, before the
+/// name is looked up).
 fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
     if vfs.readonly(&Node::Store(mnt, dir)) {
         return Err(Errno::EROFS);
@@ -350,8 +363,8 @@ fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 要新建的不是目录、名字却以 `/` 结尾：已经存在时是 EEXIST，否则 ENOENT（与 Linux
-/// 的 `filename_create` 一样）。
+/// What is being created is not a directory but its name ends in `/`: EEXIST when it exists,
+/// otherwise ENOENT (as in Linux's `filename_create`).
 fn reject_trailing_slash(store: &Store, dir: Ino, name: &[u8], path: &[u8]) -> Result<(), Errno> {
     if !path.ends_with(b"/") {
         return Ok(());
@@ -362,7 +375,8 @@ fn reject_trailing_slash(store: &Store, dir: Ino, name: &[u8], path: &[u8]) -> R
     })
 }
 
-/// 删除或者移走目录 `dir` 里的 `name` 之前的检查（`may_delete`），返回它的元数据。
+/// Checks before deleting `name` in directory `dir` or moving it away (`may_delete`); returns its
+/// metadata.
 fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
     let dir_st = store.stat(dir)?;
     cred.permission(&dir_st, MAY_EXEC)?;
@@ -371,8 +385,8 @@ fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat,
     Ok(victim)
 }
 
-/// fchmod、fchown 等作用的打开文件在仓库里的 inode：`O_PATH` 打开的文件不行，只读的
-/// 挂载里是 EROFS（Linux 的 `mnt_want_write_file`）。
+/// The store inode of the open file that fchmod, fchown and the like act on: not for files
+/// opened with `O_PATH`, and EROFS in a read-only mount (Linux's `mnt_want_write_file`).
 fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
@@ -387,8 +401,8 @@ fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
     Ok(ino)
 }
 
-/// 要修改的仓库里的 inode：只读的挂载里（包括总是只读的 cgroup2）是 EROFS，合成文件系统
-/// 里别的节点不能修改。
+/// The store inode to modify: EROFS in a read-only mount (including cgroup2, which is always
+/// read-only); other nodes in synthetic filesystems cannot be modified.
 fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
     if cx.vfs()?.readonly(node) {
         return Err(Errno::EROFS);
@@ -396,10 +410,11 @@ fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
     node.ino().ok_or(Errno::EACCES)
 }
 
-/// 打开时记下的绝对路径（`/proc/<pid>/fd/<n>`、maps）：与 Linux 的 `d_path` 一样解析完
-/// 符号链接，按最后找到文件的目录和名字 `found` 算。valgrind 按 `/proc/self/fd` 里的名字
-/// 带着 `O_NOFOLLOW` 重新打开 Debian 的 `/lib/ld-linux-aarch64.so.1`（最后一级是链接）。
-/// 经由 `/proc/<pid>/fd/<n>` 这种链接到达、不知道名字的文件按词法规范化的路径。
+/// The absolute path recorded at open (`/proc/<pid>/fd/<n>`, maps): as with Linux's `d_path`,
+/// symlinks are fully resolved, and it is computed from the directory and name `found` where the
+/// file was last found. valgrind reopens Debian's `/lib/ld-linux-aarch64.so.1` (whose last
+/// component is a link) by its name in `/proc/self/fd`, with `O_NOFOLLOW`. A file reached through
+/// a link like `/proc/<pid>/fd/<n>`, whose name is unknown, gets the lexically normalized path.
 fn display_path(
     cx: &Cx<'_>,
     vfs: &Vfs,
@@ -431,7 +446,7 @@ fn split_ns(ns: i64) -> (u64, u64) {
     )
 }
 
-/// 按 asm-generic 的 `struct stat`（128 字节）编码。
+/// Encodes as asm-generic's `struct stat` (128 bytes).
 pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     let mut b = [0u8; 128];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
@@ -445,7 +460,7 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     put(24, &st.uid.to_le_bytes());
     put(28, &st.gid.to_le_bytes());
     put(32, &st.rdev.to_le_bytes());
-    // 仓库里的目录没有数据，按 ext4 的习惯报告一个块
+    // Directories in the store have no data; report one block, following ext4's habit
     let size = if st.is_dir() && dev == ROOT_DEV {
         4096
     } else {
@@ -453,9 +468,10 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     };
     put(48, &size.to_le_bytes());
     put(56, &4096u32.to_le_bytes());
-    // sysfs 的文件报告一页的大小，但不占块。短的符号链接存在 inode 里、不占块：ext4 是目标
-    // 短于 60 字节（`ext4_symlink`，连同结尾的 NUL 放得进 `i_data`），tmpfs 这类别的是 128
-    // 字节以内（`shmem_symlink` 的 `SHORT_SYMLINK_LEN`）
+    // sysfs files report a size of one page but take no blocks. Short symlinks live in the inode
+    // and take no blocks: on ext4 targets shorter than 60 bytes (`ext4_symlink`; with the
+    // trailing NUL they fit in `i_data`), on others such as tmpfs within 128 bytes
+    // (`shmem_symlink`'s `SHORT_SYMLINK_LEN`)
     let inline = if dev == ROOT_DEV { 60 } else { 128 };
     let blocks = if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
         0
@@ -472,8 +488,9 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     b
 }
 
-/// fstat 会报告的 (st_dev, st_ino)，不必查仓库就能知道的部分（epoll 的 fdinfo）。合成
-/// 节点的设备号按开机时的实例算（后来挂上的 procfs、devpts 实例另有设备号，[`Vfs::dev_of`]）。
+/// The (st_dev, st_ino) fstat would report, the part known without querying the store (epoll's
+/// fdinfo). Device numbers of synthetic nodes are those of the boot instances (procfs and devpts
+/// instances mounted later have their own device numbers, [`Vfs::dev_of`]).
 pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
     match (&f.kind, f.node()) {
         (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
@@ -484,22 +501,22 @@ pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
     }
 }
 
-/// 文件系统节点的元数据。
+/// Metadata of a filesystem node.
 fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
     match node {
         Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
-        // 命名空间在 nsfs 里
+        // Namespaces are in nsfs
         Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
             Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
         }
-        // 魔法链接指向的打开文件：报告那个文件本身
+        // The open file a magic link points at: report that file itself
         Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
             let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
             file_stat(cx, &file)
         }
-        // 已经删除的程序文件
+        // A deleted program file
         Node::Pseudo(_, PseudoNode::OpenExe(pid)) => {
             let exe = exe_file(cx, *pid)?;
             let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
@@ -512,8 +529,8 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     }
 }
 
-/// 宿主 fd 的元数据。
-// st_* 字段的类型在不同宿主上宽度不同
+/// Metadata of a host fd.
+// The st_* fields have different widths on different hosts
 #[allow(clippy::unnecessary_cast)]
 fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
     let s = appine_hal::fstat(fd).map_err(Errno)?;
@@ -571,7 +588,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
             0,
             SOCK_DEV,
         )),
-        // anon_inode：没有文件类型位
+        // anon_inode: no file type bits
         FileKind::Epoll(_)
         | FileKind::EventFd(_)
         | FileKind::TimerFd(_)
@@ -580,7 +597,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
         | FileKind::Pidfd(_)
         | FileKind::SeccompNotify(_)
         | FileKind::Bpf(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
-        // 设备号是队列所在的 IPC 命名空间的 mqueue 文件系统的
+        // The device number is that of the mqueue filesystem of the queue's IPC namespace
         FileKind::MessageQueue(q) => {
             let q = q.borrow();
             Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)))
@@ -599,7 +616,8 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
                 ctime_ns: t.ctime_ns,
                 ..Stat::default()
             };
-            // 设备号是终端所在的 devpts 实例的（ttyname 拿它比对 /dev/pts/<n> 的）
+            // The device number is that of the devpts instance the terminal is in (ttyname
+            // compares it with that of /dev/pts/<n>)
             Ok(encode_stat(&st, t.fs))
         }
         FileKind::Regular { ino, file } => {
@@ -615,7 +633,7 @@ fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
     }
 }
 
-// ---- 打开、关闭、复制 ----
+// ---- Opening, closing, duplicating ----
 
 pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
@@ -625,13 +643,14 @@ pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u
         .map(|fd| fd as u64)
 }
 
-/// openat2（Linux 6.1 的 `fs/open.c`）：`struct open_how` 的 flags、mode、resolve。与 openat
-/// 不同，不认识的标志、不该有的 mode 都是 EINVAL，路径解析带着 `resolve` 的限制
-/// （[`crate::vfs::resolve`]）。
+/// openat2 (Linux 6.1's `fs/open.c`): the flags, mode and resolve of `struct open_how`. Unlike
+/// openat, unknown flags and a mode that should not be there are EINVAL, and path resolution
+/// carries the `resolve` restrictions ([`crate::vfs::resolve`]).
 pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: usize) -> SysResult {
     use crate::vfs::resolve;
     const OPEN_HOW_SIZE_VER0: usize = 24;
-    /// `FMODE_NONOTIFY`：用户态不该给，与 `O_CLOEXEC` 一起去掉、不算错。
+    /// `FMODE_NONOTIFY`: user space should not pass it; it is removed along with `O_CLOEXEC`
+    /// and is not an error.
     const FMODE_NONOTIFY: u64 = 0x400_0000;
     const O_SYNC_BIT: u64 = 0o4000000; // __O_SYNC
     const O_DSYNC: u64 = 0o10000;
@@ -663,7 +682,8 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     if size > 4096 {
         return Err(Errno::E2BIG);
     }
-    // copy_struct_from_user：比 24 字节长的部分必须全是 0（以后的版本加的字段）
+    // copy_struct_from_user: anything past 24 bytes must be all zero (fields added by later
+    // versions)
     let mut raw = vec![0u8; size];
     cx.mm().read(UserSlice::new(how, size), &mut raw)?;
     if raw[OPEN_HOW_SIZE_VER0..].iter().any(|&b| b != 0) {
@@ -671,11 +691,11 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     }
     let field = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
     let (mut flags, mode, res) = (field(0), field(1), field(2));
-    // O_LARGEFILE 只给不是 O_PATH 的
+    // O_LARGEFILE is added only without O_PATH
     if flags & oflags::O_PATH as u64 == 0 {
         flags |= oflags::O_LARGEFILE as u64;
     }
-    // build_open_flags 的检查，按它的顺序
+    // The checks of build_open_flags, in its order
     let f = flags & !(oflags::O_CLOEXEC as u64 | FMODE_NONOTIFY);
     if f & !VALID_OPEN_FLAGS != 0 || res & !resolve::ALL != 0 {
         return Err(Errno::EINVAL);
@@ -687,7 +707,7 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     if (will_create && mode & !0o7777 != 0) || (!will_create && mode != 0) {
         return Err(Errno::EINVAL);
     }
-    // O_TMPFILE 必须带着 O_DIRECTORY、不带 O_CREAT，还要能写
+    // O_TMPFILE must come with O_DIRECTORY and without O_CREAT, and must be writable
     let o_tmpfile = O_TMPFILE_BIT | oflags::O_DIRECTORY as u64;
     if f & O_TMPFILE_BIT != 0
         && (f & (o_tmpfile | oflags::O_CREAT as u64) != o_tmpfile
@@ -698,8 +718,9 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     if f & oflags::O_PATH as u64 != 0 && f & !O_PATH_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
-    // RESOLVE_CACHED：新建、截断、O_TMPFILE（它含 O_DIRECTORY，所以 O_DIRECTORY 也算）的
-    // 不试；别的照常解析，appine 的解析不等宿主的 I/O 以外的东西
+    // RESOLVE_CACHED: creation, truncation and O_TMPFILE (which includes O_DIRECTORY, so
+    // O_DIRECTORY counts too) are not tried; everything else resolves as usual, since appine's
+    // resolution waits for nothing but host I/O
     let busy = (oflags::O_TRUNC | oflags::O_CREAT | oflags::O_DIRECTORY) as u64 | O_TMPFILE_BIT;
     if res & resolve::CACHED != 0 && f & busy != 0 {
         return Err(Errno::EAGAIN);
@@ -712,8 +733,9 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
         .map(|fd| fd as u64)
 }
 
-/// openat2 的起点和根目录（path_init）。有作用域（`BENEATH`、`IN_ROOT`）时根目录就是起点；
-/// `IN_ROOT` 的绝对路径也从 dirfd 起；别的绝对路径不看 dirfd（`BENEATH` 的由解析报 EXDEV）。
+/// Start and root directory of openat2 (path_init). With a scope (`BENEATH`, `IN_ROOT`) the root
+/// is the start; absolute `IN_ROOT` paths also start at dirfd; other absolute paths ignore dirfd
+/// (resolution reports EXDEV for `BENEATH` ones).
 fn openat2_start(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u64) -> Result<(Node, Node), Errno> {
     use crate::vfs::resolve;
     if path.is_empty() {
@@ -742,19 +764,20 @@ fn openat2_start(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u64) -> Result<(No
     Ok((start, root))
 }
 
-/// 内核自己新建一个文件（core dump）：相对当前目录，已经存在时是 EEXIST，不跟随符号
-/// 链接，只写打开。
+/// The kernel creates a file itself (core dump): relative to the current directory, EEXIST when
+/// it already exists, symlinks not followed, opened write-only.
 pub(crate) fn create_exclusive(cx: &mut Cx<'_>, path: &[u8], perm: u32) -> Result<FileRef, Errno> {
     let flags = oflags::O_CREAT | oflags::O_EXCL | oflags::O_NOFOLLOW | oflags::O_WRONLY;
     open_path(cx, AT_FDCWD, path.to_vec(), flags, perm)
 }
 
-/// 内核自己删除一个文件（core dump 之前删掉同名的旧文件），相对当前目录。
+/// The kernel deletes a file itself (the old file of the same name before a core dump), relative
+/// to the current directory.
 pub(crate) fn unlink_path(cx: &mut Cx<'_>, path: &[u8]) -> Result<(), Errno> {
     unlink(cx, AT_FDCWD, path.to_vec(), 0)
 }
 
-/// 内核自己在 `offset` 处写打开文件（core dump），与 pwrite 相同。
+/// The kernel writes an open file itself at `offset` (core dump), as pwrite does.
 pub(crate) fn write_at(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -764,7 +787,7 @@ pub(crate) fn write_at(
     write_bytes(cx, file, data, Some(offset))
 }
 
-/// openat 打开（或者新建）`path`，还没有放进 fd 表。
+/// Opens (or creates) `path` for openat, not yet put in the fd table.
 fn open_path(
     cx: &mut Cx<'_>,
     dirfd: i32,
@@ -775,7 +798,7 @@ fn open_path(
     open_path_with(cx, dirfd, path, flags, perm, 0)
 }
 
-/// [`open_path`]，路径解析带着 openat2 的限制（[`crate::vfs::resolve`]）。
+/// [`open_path`], with path resolution carrying openat2's restrictions ([`crate::vfs::resolve`]).
 fn open_path_with(
     cx: &mut Cx<'_>,
     dirfd: i32,
@@ -797,14 +820,16 @@ fn open_path_with(
     let cred = cx.cred();
 
     let resolved = vfs.walk_resolve(&cx.view(&vfs), &cred, &root, &start, &path, follow, res);
-    // mqueue 文件系统里新建了队列（不再检查打开的权限，与仓库里新建的文件一样）
+    // A queue was created in the mqueue filesystem (open permission is not checked again, as for
+    // files just created in the store)
     let mut mq_created = false;
-    // parent 是最后经过的目录和名字，报告 inotify 事件用
+    // parent is the last directory and name passed through, for reporting inotify events
     let (node, created, parent) = match resolved {
         Ok(_) if excl => return Err(Errno::EEXIST),
         Ok((node, found)) => (node, None, found),
         Err(e) if e == Errno::ENOENT && create => {
-            // 最后一个组件是悬空的符号链接时，与 Linux 一样沿着它新建目标文件
+            // When the last component is a dangling symlink, follow it and create the target
+            // file, as on Linux
             let mut root_set = path.first() == Some(&b'/')
                 || res & resolve::SCOPED != 0
                 || path.split(|&b| b == b'/').any(|c| c == b"..");
@@ -816,7 +841,8 @@ fn open_path_with(
                 if path.ends_with(b"/") || name == b"." || name == b".." {
                     return Err(Errno::EISDIR);
                 }
-                // mqueue 文件系统里新建的是消息队列（Linux 的 mqueue_create），属性是默认的
+                // In the mqueue filesystem a message queue is created (Linux's mqueue_create),
+                // with default attributes
                 if let Node::Pseudo(mnt, PseudoNode::MqRoot(ns)) = dir {
                     if vfs.readonly(&dir) {
                         return Err(Errno::EROFS);
@@ -835,7 +861,8 @@ fn open_path_with(
                         Some((dir.clone(), name.to_vec())),
                     );
                 }
-                // cgroup 的目录里建不了文件（没有 create，Linux 的 vfs_create 是 EACCES）
+                // Files cannot be created in cgroup directories (they have no create; Linux's
+                // vfs_create is EACCES)
                 if let Node::Pseudo(_, PseudoNode::Cgroup(..)) = dir
                     && !vfs.readonly(&dir)
                 {
@@ -850,8 +877,9 @@ fn open_path_with(
                     if links > crate::vfs::MAX_SYMLINKS {
                         return Err(Errno::ELOOP);
                     }
-                    // 与 walk 里一样（pick_link、nd_jump_root）：RESOLVE_NO_SYMLINKS、nosymfollow
-                    // 的挂载不跟随；绝对路径的目标在 NO_XDEV 时要与根目录在同一个挂载里
+                    // As in walk (pick_link, nd_jump_root): RESOLVE_NO_SYMLINKS and nosymfollow
+                    // mounts do not follow; under NO_XDEV an absolute target must be in the same
+                    // mount as the root
                     if res & resolve::NO_SYMLINKS != 0
                         || vfs
                             .mount_flags(&Node::Store(mnt, ino))
@@ -860,8 +888,9 @@ fn open_path_with(
                         return Err(Errno::ELOOP);
                     }
                     path = vfs.store().readlink(ino)?;
-                    // 解析时取过根目录没有：近似地按原来的路径看（绝对路径、有作用域、
-                    // 有 `..`，或者这里已经跳过一次），前面的符号链接里的不算
+                    // Whether resolution has taken the root: approximated from the original path
+                    // (absolute, scoped, containing `..`, or a jump already made here); those in
+                    // earlier symlinks do not count
                     if path.first() == Some(&b'/')
                         && res & resolve::NO_XDEV != 0
                         && (!root_set || mnt != root.mnt())
@@ -888,8 +917,8 @@ fn open_path_with(
     };
 
     let mut display = display_path(cx, &vfs, &start, &path, &node, parent.as_ref());
-    // 命名空间在 `/proc/<pid>/fd/<n>` 里是 `mnt:[编号]` 这样；经由 bind 挂载出去的命名空间
-    // 文件打开的是挂载点的路径（Linux 的 d_path）
+    // A namespace shows as `mnt:[number]` and the like in `/proc/<pid>/fd/<n>`; a namespace file
+    // bind-mounted elsewhere opens as the mount point's path (Linux's d_path)
     if let Node::Pseudo(mnt, p @ PseudoNode::NsFile(..)) = &node
         && vfs.mount(*mnt).is_none_or(|m| m.fs != Fs::Nsfs)
     {
@@ -898,7 +927,7 @@ fn open_path_with(
     let was_created = created.is_some();
     let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
     let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
-    // 仓库里的文件记下经由的挂载（[`OpenFile::mnt`]）
+    // Files in the store record the mount they were reached through ([`OpenFile::mnt`])
     let store_mnt = node.ino().map(|_| node.mnt());
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
@@ -908,8 +937,9 @@ fn open_path_with(
     } else {
         match node {
             Node::Store(mnt, ino) => {
-                // 刚建好的文件本来就是空的，不截断：ext4 把截断到 0 之后又写过的文件当成
-                // 整个替换，关闭时立即开始回写，比写本身还慢
+                // A just-created file is already empty, so it is not truncated: ext4 treats a
+                // file written after truncation to 0 as a whole replacement and starts writeback
+                // right at close, which is slower than the write itself
                 let flags = if was_created {
                     flags & !oflags::O_TRUNC
                 } else {
@@ -924,8 +954,9 @@ fn open_path_with(
             Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
         }
     };
-    // /dev/tty 这样的设备节点打开的是具体的某个从设备：路径是它在 devpts 里的（fd 的链接
-    // 按经由的挂载算）；主设备、经由 devpts 打开的从设备照常是打开的路径
+    // A device node like /dev/tty opens a specific slave: its path is the one in devpts (fd links
+    // are computed by the mount reached through); the master, and slaves opened through devpts,
+    // keep the opened path as usual
     if let FileKind::Pty(end) = &kind
         && !end.master
         && !via_devpts
@@ -944,8 +975,9 @@ fn open_path_with(
     Ok(file)
 }
 
-/// open、openat2、open_by_handle_at 打开的文件带 `O_LARGEFILE`（64 位上 Linux 总是加上，
-/// `O_PATH` 时去掉），F_GETFL、fdinfo 看得到；管道、socket 这些别的系统调用建的文件没有。
+/// Files opened by open, openat2 and open_by_handle_at carry `O_LARGEFILE` (on 64-bit Linux
+/// always adds it, and drops it with `O_PATH`), visible in F_GETFL and fdinfo; files created by
+/// other syscalls, such as pipes and sockets, do not have it.
 fn largefile(flags: u32) -> u32 {
     if flags & oflags::O_PATH != 0 {
         0
@@ -954,8 +986,8 @@ fn largefile(flags: u32) -> u32 {
     }
 }
 
-/// open 的 inotify 事件，顺序与 Linux 相同：新建（报给目录）、`O_TRUNC` 截断、打开。
-/// 给打开文件挂上 [`inotify::Opened`]。
+/// inotify events of open, in the same order as Linux: create (reported to the directory),
+/// truncation by `O_TRUNC`, open. Attaches an [`inotify::Opened`] to the open file.
 fn open_events(
     cx: &Cx<'_>,
     file: &FileRef,
@@ -1000,15 +1032,17 @@ fn open_notify(
     inotify::path_event(k, ino, parent, inotify::IN_OPEN | dir);
 }
 
-/// 文件句柄（`struct file_handle`）里的类型和长度：句柄就是仓库里的 inode 编号。
+/// Type and length in a file handle (`struct file_handle`): the handle is the store inode
+/// number.
 const FILE_HANDLE_TYPE: i32 = 1;
 const FILE_HANDLE_BYTES: u32 = 8;
-/// 放不下句柄时写回的类型（Linux 的 `FILEID_INVALID`）。
+/// Type written back when the handle does not fit (Linux's `FILEID_INVALID`).
 const FILEID_INVALID: i32 = 255;
 const MAX_HANDLE_SZ: u32 = 128;
 const AT_HANDLE_FID: u32 = 0x200;
 
-/// name_to_handle_at：仓库里的文件的句柄是它的 inode 编号；合成文件系统不支持句柄。
+/// name_to_handle_at: the handle of a file in the store is its inode number; synthetic
+/// filesystems do not support handles.
 pub(super) fn name_to_handle_at(
     cx: &mut Cx<'_>,
     dirfd: i32,
@@ -1037,8 +1071,9 @@ pub(super) fn name_to_handle_at(
     if room > MAX_HANDLE_SZ {
         return Err(Errno::EINVAL);
     }
-    // 放不下时只写回句柄头（需要的长度、FILEID_INVALID），返回 EOVERFLOW。两种情况都写
-    // mount_id，它或者句柄写不进去时是 EFAULT（Linux 的 do_sys_name_to_handle）
+    // When it does not fit, only the handle header (the needed length, FILEID_INVALID) is
+    // written back and the result is EOVERFLOW. Both cases write mount_id, and failing to write
+    // it or the handle is EFAULT (Linux's do_sys_name_to_handle)
     let mut b = FILE_HANDLE_BYTES.to_le_bytes().to_vec();
     let ret = if room < FILE_HANDLE_BYTES {
         b.extend_from_slice(&FILEID_INVALID.to_le_bytes());
@@ -1053,7 +1088,7 @@ pub(super) fn name_to_handle_at(
     ret
 }
 
-/// open_by_handle_at：按 inode 编号打开，要求 `CAP_DAC_READ_SEARCH`。
+/// open_by_handle_at: opens by inode number; requires `CAP_DAC_READ_SEARCH`.
 pub(super) fn open_by_handle_at(
     cx: &mut Cx<'_>,
     mount_fd: i32,
@@ -1063,7 +1098,8 @@ pub(super) fn open_by_handle_at(
     if !cx.cred().capable(cap::DAC_READ_SEARCH) {
         return Err(Errno::EPERM);
     }
-    // 与 Linux 的 handle_to_path 一样先读句柄头、查长度，再读整个句柄，最后才看 mount_fd
+    // As in Linux's handle_to_path, read the handle header and check its length first, then the
+    // whole handle, and look at mount_fd only last
     let header: [u8; 8] = get(cx, handle)?;
     let bytes = u32::from_le_bytes(header[..4].try_into().unwrap());
     if bytes == 0 || bytes > MAX_HANDLE_SZ {
@@ -1073,8 +1109,9 @@ pub(super) fn open_by_handle_at(
     let mut f_handle = vec![0u8; bytes as usize];
     cx.mm()
         .read(UserSlice::new(handle + 8, f_handle.len()), &mut f_handle)?;
-    // 文件经由 mount_fd 所在的挂载打开。句柄只在仓库里解得开：mount_fd 在管道、socket、
-    // 合成文件系统上时，与 Linux 上这些文件系统没有 export_operations 一样是 ESTALE
+    // The file is opened through the mount mount_fd is in. Handles decode only in the store: when
+    // mount_fd is on a pipe, a socket or a synthetic filesystem it is ESTALE, as on Linux where
+    // these filesystems have no export_operations
     let node = if mount_fd == AT_FDCWD {
         Some(cx.cwd())
     } else {
@@ -1089,7 +1126,7 @@ pub(super) fn open_by_handle_at(
         _ => return Err(Errno::ESTALE),
     };
     let vfs = cx.vfs()?;
-    // 文件已经删除（或者句柄不是这里发的）：ESTALE
+    // The file has been deleted (or the handle was not issued here): ESTALE
     let st = match vfs.store().stat(ino) {
         Ok(st) if st.nlink > 0 => st,
         _ => return Err(Errno::ESTALE),
@@ -1110,17 +1147,18 @@ pub(super) fn open_by_handle_at(
         .map(|fd| fd as u64)
 }
 
-/// 设备号对应的 PTY 从设备编号：主设备号 136，次设备号就是编号（Linux 的 pts 驱动登记了
-/// 136 的全部 2^20 个次设备号）。
+/// The PTY slave index of a device number: major 136, and the minor is the index (Linux's pts
+/// driver registers all 2^20 minors of 136).
 fn pts_index(r: u64) -> Option<u32> {
     let major = ((r >> 8) & 0xfff) as u32;
     let minor = ((r & 0xff) | ((r >> 12) & !0xff)) as u32;
     (major == PTS_MAJOR).then_some(minor)
 }
 
-/// 不在 devpts 里的 ptmx 设备节点打开的是哪个 devpts 实例（Linux 的 `devpts_acquire`）：
-/// 节点所在的目录 `dir` 里的 `pts` 挂着的那个（它的挂载和设备号）。没有 `pts` 是 ENOENT，
-/// 它不是 devpts 的根是 ENODEV；不知道节点在哪个目录里（按句柄打开的）时是开机时的那个。
+/// Which devpts instance a ptmx device node outside devpts opens (Linux's `devpts_acquire`): the
+/// one mounted on `pts` in the node's directory `dir` (its mount and device number). No `pts` is
+/// ENOENT, and a `pts` that is not a devpts root is ENODEV; when the node's directory is unknown
+/// (opened by handle) it is the boot one.
 fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno> {
     let Some(dir) = dir else {
         return Ok((crate::tty::BOOT_PTS, crate::vfs::PTS_MOUNT));
@@ -1135,7 +1173,8 @@ fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno>
     }
 }
 
-/// 有没有进程正在执行仓库里的程序 `ino`（以写方式打开它时 ETXTBSY）。
+/// Whether some process is executing the program `ino` in the store (opening it for write is
+/// ETXTBSY).
 pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
     cx.kr()
         .tasks
@@ -1143,8 +1182,8 @@ pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
         .any(|t| t.res.borrow().mm.borrow().exe == Some(ino))
 }
 
-/// 有没有以写方式打开着的 `ino`（执行它时 ETXTBSY）。
-/// memfd_create 得到的 fd 不算（[`OpenFile::pseudo`]）。
+/// Whether `ino` is open for write (executing it is ETXTBSY).
+/// fds from memfd_create do not count ([`OpenFile::pseudo`]).
 pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
     cx.kr().open_files().iter().any(|f| {
         let f = f.borrow();
@@ -1152,7 +1191,7 @@ pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
     })
 }
 
-/// 访问权限（`MAY_*`）换成设备过滤的访问（`BPF_DEVCG_ACC_*`）。
+/// Turns access permissions (`MAY_*`) into device-filter access (`BPF_DEVCG_ACC_*`).
 fn device_access(mask: u32) -> u32 {
     let mut access = 0;
     if mask & MAY_WRITE != 0 {
@@ -1164,7 +1203,7 @@ fn device_access(mask: u32) -> u32 {
     access
 }
 
-/// open 要求的访问权限（`MAY_*`）。
+/// The access permissions open requires (`MAY_*`).
 fn open_mask(flags: u32) -> u32 {
     match flags & oflags::O_ACCMODE {
         oflags::O_RDONLY => MAY_READ,
@@ -1173,8 +1212,8 @@ fn open_mask(flags: u32) -> u32 {
     }
 }
 
-/// 打开经由挂载 `mnt` 的仓库里的 inode。刚刚由这次 open 新建的文件（`created`）不检查
-/// 权限。
+/// Opens a store inode reached through mount `mnt`. A file just created by this open
+/// (`created`) gets no permission check.
 fn open_store(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1185,7 +1224,8 @@ fn open_store(
 ) -> Result<FileKind, Errno> {
     let store = vfs.store();
     let accmode = flags & oflags::O_ACCMODE;
-    // 只用到类型、权限、属主和设备号，不必向宿主 stat object
+    // Only the type, permissions, owner and device number are used; no need to stat the object on
+    // the host
     let st = store.attrs(ino)?;
     if created.is_none() {
         let mnt_flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
@@ -1196,29 +1236,31 @@ fn open_store(
             mode::S_IFDIR if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 => {
                 return Err(Errno::EISDIR);
             }
-            // 截断：只读的挂载里先是 EROFS（Linux 的 do_open 在 may_open 之前）
+            // Truncation: EROFS comes first in a read-only mount (Linux's do_open, before
+            // may_open)
             mode::S_IFREG if flags & oflags::O_TRUNC != 0 => {
                 if readonly {
                     return Err(Errno::EROFS);
                 }
                 mask |= MAY_WRITE;
             }
-            // nodev 的挂载里的设备节点打不开（may_open_dev）
+            // Device nodes in a nodev mount cannot be opened (may_open_dev)
             mode::S_IFCHR | mode::S_IFBLK if mnt_flags & ms::NODEV != 0 => {
                 return Err(Errno::EACCES);
             }
             _ => {}
         }
         cred.permission(&st, mask)?;
-        // 设备节点再过 cgroup 的设备过滤（Linux 的 devcgroup_inode_permission）
+        // Device nodes then go through the cgroup device filter (Linux's
+        // devcgroup_inode_permission)
         if matches!(st.kind(), mode::S_IFCHR | mode::S_IFBLK) && st.rdev != 0 {
             super::bpf::check_device(cx, st.kind(), st.rdev, device_access(mask))?;
         }
         if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
             return Err(Errno::EPERM);
         }
-        // 只读的挂载里写方式打开普通文件是 EROFS；设备、FIFO 照常（do_dentry_open 不管
-        // special_file）
+        // Opening a regular file for write in a read-only mount is EROFS; devices and FIFOs as
+        // usual (do_dentry_open leaves special_file alone)
         if readonly && st.kind() == mode::S_IFREG && accmode != oflags::O_RDONLY {
             return Err(Errno::EROFS);
         }
@@ -1241,7 +1283,8 @@ fn open_store(
             if write && created.is_none() && executing(cx, ino) {
                 return Err(Errno::ETXTBSY);
             }
-            // 别人的租约：写方式打开与所有租约冲突，读方式只与写租约冲突
+            // Leases of others: opening for write conflicts with every lease, opening for read
+            // only with write leases
             if created.is_none() {
                 let nonblock = flags & oflags::O_NONBLOCK != 0;
                 super::lease::break_leases(cx, ino, write, nonblock, None)?;
@@ -1260,13 +1303,13 @@ fn open_store(
             FileKind::Regular { ino, file }
         }
         mode::S_IFCHR => match st.rdev {
-            // /dev/tty、/dev/console：调用者的控制终端
+            // /dev/tty, /dev/console: the caller's controlling terminal
             r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
             PTMX_RDEV => {
                 let (fs, m) = devpts_beside(vfs, beside)?;
                 tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
             }
-            // devpts 之外的终端设备节点：开机时的实例里的
+            // Terminal device nodes outside devpts: those in the boot instance
             r => match pts_index(r) {
                 Some(index) => {
                     let at = (crate::tty::BOOT_PTS, index, crate::vfs::PTS_MOUNT, false);
@@ -1283,13 +1326,14 @@ fn open_store(
             },
         },
         mode::S_IFIFO => open_fifo(cx, ino, flags)?,
-        // 块设备、socket 文件不能打开（socket 文件用 connect）
+        // Block devices and socket files cannot be opened (socket files use connect)
         _ => return Err(Errno::ENXIO),
     })
 }
 
-/// 打开 `/dev/kmsg`（`devkmsg_open`）：`printk_devkmsg` 为 `off` 时谁都打不开；读方式打开
-/// 按 syslog 的读全部查权限（`dmesg_restrict`），只写不查。读的位置从最老的一条开始。
+/// Opens `/dev/kmsg` (`devkmsg_open`): when `printk_devkmsg` is `off` nobody can open it; a read
+/// open checks permission as syslog's read-all does (`dmesg_restrict`), and a write-only open is
+/// not checked. Reading starts at the oldest record.
 fn open_kmsg(cx: &mut Cx<'_>, accmode: u32) -> Result<Box<crate::klog::KmsgFile>, Errno> {
     let log = cx.kr().klog.clone();
     if log.borrow().devkmsg == crate::klog::Devkmsg::Off {
@@ -1301,8 +1345,9 @@ fn open_kmsg(cx: &mut Cx<'_>, accmode: u32) -> Result<Box<crate::klog::KmsgFile>
     Ok(Box::new(crate::klog::KmsgFile::new(log)))
 }
 
-/// 打开命名管道（FIFO）：同一个 inode 的所有打开共用一个管道。与 Linux 相同，只读打开
-/// 等到有写者，只写打开等到有读者（`O_NONBLOCK` 时没有读者就返回 ENXIO），读写打开不等。
+/// Opens a named pipe (FIFO): all opens of one inode share one pipe. As on Linux, a read-only
+/// open waits until there is a writer, a write-only open waits until there is a reader (with
+/// `O_NONBLOCK` it returns ENXIO when there is no reader), and a read-write open does not wait.
 fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
     let nonblock = flags & oflags::O_NONBLOCK != 0;
@@ -1334,7 +1379,8 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
         end.hup_after = Some(before);
     }
     if read != write && !nonblock {
-        // 等对端打开：对端来过就行，哪怕已经关掉
+        // Wait for the other end to open: it is enough that it came, even if it has closed
+        // already
         loop {
             {
                 let p = pipe.borrow();
@@ -1352,9 +1398,10 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
     Ok(FileKind::Pipe(end))
 }
 
-/// 打开合成文件系统里的节点。
-/// 打开 mqueue 文件系统里的队列：得到的 fd 与 mq_open 的一样（Linux 上就是同一种文件），
-/// mq_timedsend 这些照样能用。刚新建的不再检查权限。
+/// Opens a node in a synthetic filesystem.
+/// Opens a queue in the mqueue filesystem: the resulting fd is the same as mq_open's (on Linux it
+/// is the same kind of file), and mq_timedsend and the like work on it. A just-created one is not
+/// checked for permission again.
 fn open_mq(
     cx: &Cx<'_>,
     cred: &Cred,
@@ -1384,9 +1431,10 @@ fn open_pseudo(
     if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
         cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
     }
-    // /proc/<pid>/mem 与 ptrace 一样要求能跟踪那个进程（PTRACE_MODE_ATTACH），auxv、environ、
-    // maps、smaps、pagemap 要求能以只读方式跟踪（PTRACE_MODE_READ，规则相同）：同一个用户
-    // 的进程不可 dump 时也打不开
+    // /proc/<pid>/mem requires being able to trace that process, as ptrace does
+    // (PTRACE_MODE_ATTACH); auxv, environ, maps, smaps and pagemap require being able to trace it
+    // read-only (PTRACE_MODE_READ, same rules): even for a process of the same user they cannot
+    // be opened when it is not dumpable
     let mut mm = None;
     if let PseudoNode::Entry(
         pid,
@@ -1408,13 +1456,13 @@ fn open_pseudo(
             mm = Some(Rc::downgrade(&pseudo::process_mm(cx.kr(), pid)?));
         }
     }
-    // 设备节点在 nodev 的挂载里打不开（Linux 的 may_open）
+    // Device nodes cannot be opened in a nodev mount (Linux's may_open)
     if matches!(node, PseudoNode::Pts(..) | PseudoNode::PtsPtmx(_))
         && vfs.mount(mnt).is_some_and(|m| m.flags & ms::NODEV != 0)
     {
         return Err(Errno::EACCES);
     }
-    // devpts 的终端也过 cgroup 的设备过滤
+    // devpts terminals also go through the cgroup device filter
     let rdev = match node {
         PseudoNode::Pts(_, n) => Some(rdev(PTS_MAJOR, n)),
         PseudoNode::PtsPtmx(_) => Some(PTMX_RDEV),
@@ -1433,7 +1481,7 @@ fn open_pseudo(
         _ => {}
     }
     let view = cx.view(vfs);
-    // O_NOFOLLOW 时停在了符号链接（比如 /proc/self/fd/<n>）上
+    // With O_NOFOLLOW it stopped at a symlink (such as /proc/self/fd/<n>)
     if Pseudo::kind(&view, &node)? == mode::S_IFLNK {
         return Err(Errno::ELOOP);
     }
@@ -1442,8 +1490,9 @@ fn open_pseudo(
         if accmode != oflags::O_RDONLY {
             return Err(Errno::EISDIR);
         }
-        // /proc/<pid> 记住是哪个进程：Linux 的打开文件引用着 struct pid，进程回收之后
-        // 当作 pidfd 用是 ESRCH，即使 pid 已经给了新进程
+        // /proc/<pid> remembers which process it is: Linux's open file references a struct pid,
+        // so after the process is reaped, using it as a pidfd is ESRCH even if the pid has been
+        // given to a new process
         let process = match node {
             PseudoNode::Pid(pid, None) => cx.kr().groups.get(&pid).map(Rc::downgrade),
             _ => None,
@@ -1460,15 +1509,16 @@ fn open_pseudo(
     if accmode != oflags::O_RDONLY && vfs.readonly(&full) {
         return Err(Errno::EROFS);
     }
-    // cgroup 的文件只按权限位查（root 打得开只读的，写的时候才是 EINVAL）
+    // cgroup files are checked only by permission bits (root can open read-only ones; writing is
+    // what gets EINVAL)
     if accmode != oflags::O_RDONLY
         && !pseudo::writable(&node)
         && !matches!(node, PseudoNode::Cgroup(..))
     {
         return Err(Errno::EACCES);
     }
-    // 网络的 sysctl 读的时候才出错（没有设过的 stable_secret 是 EIO，Linux 的
-    // proc_sys_call_handler）：打开时先放空的，第一次读重新生成
+    // Network sysctls fail only when read (an unset stable_secret is EIO, Linux's
+    // proc_sys_call_handler): open starts with empty contents and the first read regenerates them
     let mut fresh = true;
     let data = if pseudo::unreadable(&node) {
         Vec::new()
@@ -1481,7 +1531,8 @@ fn open_pseudo(
             r => r?,
         }
     };
-    // /proc/kmsg（`kmsg_open`）：打开时按 syslog 的打开查权限，之后的读不再查
+    // /proc/kmsg (`kmsg_open`): open checks permission as syslog's open does, and later reads do
+    // not check again
     let klog = match node {
         PseudoNode::Global(pseudo::Global::Kmsg) => {
             super::misc::do_syslog(cx, super::misc::syslog_action::OPEN, 0, 0, true)?;
@@ -1489,7 +1540,7 @@ fn open_pseudo(
         }
         _ => None,
     };
-    // 命名空间文件拿着那个命名空间
+    // A namespace file holds that namespace
     let ns = match node {
         PseudoNode::NsFile(kind, id) => {
             Some(super::ns::find(cx.kr(), Some(vfs), kind, id).ok_or(Errno::ENOENT)?)
@@ -1507,9 +1558,10 @@ fn open_pseudo(
     })
 }
 
-/// 经由 `/proc/<pid>/fd/<n>` 重新打开一个没有路径的文件：管道得到同一个管道的
-/// 一端，宿主 fd 得到同一个宿主 fd，已经删除的普通文件（memfd、删除之后还开着的）
-/// 经由宿主的 `/proc/self/fd` 打开同一个宿主文件（仓库里的 object 已经删了）。
+/// Reopens a file without a path through `/proc/<pid>/fd/<n>`: a pipe gives an end of the same
+/// pipe, a host fd the same host fd, and a deleted regular file (memfd, or one still open after
+/// deletion) opens the same host file through the host's `/proc/self/fd` (the object in the
+/// store is already deleted).
 fn reopen(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1530,9 +1582,10 @@ fn reopen(
         if truncate && accmode != oflags::O_RDONLY {
             check_seals(cx, &f, false, |_| 0)?;
         }
-        // 宿主 fd 总是可读的，原来以写方式打开时也可写：够用就复制一份（读写都按位置
-        // 进行，偏移由各自的打开文件记着）。不够用时经由宿主的 /proc/self/fd 重新打开，
-        // 被删除的文件在 virtiofs 这类文件系统上打不开
+        // The host fd is always readable, and also writable when originally opened for write: if
+        // that suffices, duplicate it (reads and writes are positional, with offsets kept by each
+        // open file). Otherwise reopen it through the host's /proc/self/fd; deleted files cannot
+        // be opened that way on filesystems like virtiofs
         let new = if accmode == oflags::O_RDONLY || f.writable() {
             host.try_clone()
         } else {
@@ -1560,15 +1613,16 @@ fn reopen(
     }
 }
 
-/// 进程 `pid` 正在执行的程序文件（`/proc/<pid>/exe`）。
+/// The program file process `pid` is executing (`/proc/<pid>/exe`).
 pub(super) fn exe_file(cx: &Cx<'_>, pid: i32) -> Result<Rc<crate::process::ExeFile>, Errno> {
     let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ENOENT)?;
     group.borrow().exe.clone().ok_or(Errno::ENOENT)
 }
 
-/// 经由 `/proc/<pid>/exe` 打开已经删除的程序文件（[`PseudoNode::OpenExe`]）：复制记着的
-/// 宿主文件，与 [`reopen`] 打开已经删除的普通文件一样。还在执行的程序不能以写方式打开
-/// （ETXTBSY），权限先查（Linux 在 may_open 之后才 get_write_access）。
+/// Opens a deleted program file through `/proc/<pid>/exe` ([`PseudoNode::OpenExe`]): duplicates
+/// the recorded host file, as [`reopen`] does for deleted regular files. A program still being
+/// executed cannot be opened for write (ETXTBSY); permission is checked first (Linux calls
+/// get_write_access only after may_open).
 fn reopen_exe(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1604,7 +1658,8 @@ fn reopen_exe(
 }
 
 pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
-    // 先从表里拿出来再释放：关闭管道的最后一端会唤醒另一端
+    // Take it out of the table first, then release it: closing the last end of a pipe wakes the
+    // other end
     let r = cx.fds_mut().close(fd);
     let file = r?;
     let fds = cx.t.fds.clone();
@@ -1650,7 +1705,7 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
     Ok(new as u64)
 }
 
-/// 新管道的容量：与 Linux 一样不超过 pipe-max-size，有 `CAP_SYS_RESOURCE` 时除外。
+/// Capacity of a new pipe: as on Linux, at most pipe-max-size, except with `CAP_SYS_RESOURCE`.
 fn pipe_capacity(cx: &Cx<'_>) -> usize {
     if cx.cred().capable(cap::SYS_RESOURCE) {
         PIPE_CAPACITY
@@ -1670,7 +1725,8 @@ pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     let r = OpenFile::new(FileKind::Pipe(r), oflags::O_RDONLY | status);
     let w = OpenFile::new(FileKind::Pipe(w), oflags::O_WRONLY | status);
     let rfd = cx.fds_mut().install(r, cloexec, 0)?;
-    // 先结束对 fd 表的借用：失败时还要再借一次，关掉读端
+    // End the borrow of the fd table first: on failure it must be borrowed again to close the
+    // read end
     let installed = cx.fds_mut().install(w, cloexec, 0);
     let wfd = match installed {
         Ok(fd) => fd,
@@ -1694,7 +1750,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     let file = cx.fds().get(fd)?;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            // 起点不小于 RLIMIT_NOFILE 是 EINVAL，没有空位才是 EMFILE
+            // A start not below RLIMIT_NOFILE is EINVAL; only having no free slot is EMFILE
             let min = usize::try_from(arg as i32)
                 .ok()
                 .filter(|&m| m < cx.fds().limit)
@@ -1774,8 +1830,8 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if cmd == F_GETPIPE_SZ {
                 return Ok(p.capacity as u64);
             }
-            // 按页向上取整到 2 的幂；超过 pipe-max-size 要求 CAP_SYS_RESOURCE，
-            // 不能小于已经缓冲的数据
+            // Round up by pages to a power of two; exceeding pipe-max-size requires
+            // CAP_SYS_RESOURCE, and it cannot be smaller than the data already buffered
             let size = (arg as u32 as usize)
                 .max(PIPE_BUF)
                 .checked_next_power_of_two()
@@ -1791,7 +1847,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             request_wake_object(crate::pipe::object(&end.pipe));
             Ok(size as u64)
         }
-        // 只有 memfd 能加封印
+        // Only memfds can have seals added
         F_ADD_SEALS | F_GET_SEALS => {
             let f = file.borrow();
             let FileKind::Regular { ino, .. } = f.kind else {
@@ -1808,7 +1864,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if !f.writable() || *seals & F_SEAL_SEAL != 0 {
                 return Err(Errno::EPERM);
             }
-            // 还有可写的共享映射时不能封印写入
+            // Writes cannot be sealed while writable shared mappings exist
             if add & F_SEAL_WRITE != 0 && writably_mapped(cx, &f) {
                 return Err(Errno::EBUSY);
             }
@@ -1819,7 +1875,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     }
 }
 
-/// fcntl 的记录锁命令（[`crate::locks`]）：`arg` 指向 `struct flock`。
+/// fcntl's record-lock commands ([`crate::locks`]): `arg` points at a `struct flock`.
 fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult {
     let mut b: [u8; 32] = get(cx, arg)?;
     let half = |off: usize| i16::from_le_bytes(b[off..off + 2].try_into().unwrap());
@@ -1847,7 +1903,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             return Err(Errno::EBADF);
         }
         let Some(ino) = f.ino() else {
-            // 不在仓库里的文件（管道、socket）：别的进程看不到它们的锁
+            // Files not in the store (pipes, sockets): other processes cannot see their locks
             if getlk {
                 b[..2].copy_from_slice(&F_UNLCK.to_le_bytes());
                 put(cx, arg, b)?;
@@ -1867,7 +1923,8 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             .ok()
             .and_then(|b| b.checked_add(l_start))
             .ok_or(Errno::EOVERFLOW)?;
-        // l_len 为 0 表示到文件末尾以及之后，负数表示 [start + l_len, start)
+        // An l_len of 0 means to the end of the file and beyond, a negative one
+        // [start + l_len, start)
         let (start, end) = match l_len {
             0 => (start, i64::MAX),
             n if n > 0 => (start, start.checked_add(n).ok_or(Errno::EOVERFLOW)?),
@@ -1898,7 +1955,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
         write,
     };
     if getlk {
-        // 没有冲突时只把 l_type 改成 F_UNLCK，其余字段不变
+        // With no conflict only l_type is changed to F_UNLCK; the other fields stay
         match cx.k().locks.conflict(ino, &req) {
             None => b[..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
             Some(l) => {
@@ -1912,7 +1969,8 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
                 b[2..4].copy_from_slice(&(SEEK_SET as i16).to_le_bytes());
                 b[8..16].copy_from_slice(&l.start.to_le_bytes());
                 b[16..24].copy_from_slice(&len.to_le_bytes());
-                // OFD 锁是 -1，别的是调用者看到的编号（Linux 的 locks_translate_pid）
+                // -1 for OFD locks, otherwise the number the caller sees (Linux's
+                // locks_translate_pid)
                 let pid = if l.pid > 0 { cx.pid_out(l.pid) } else { l.pid };
                 b[24..28].copy_from_slice(&pid.to_le_bytes());
             }
@@ -1944,13 +2002,13 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             cx.k().locks.set_waiting(&req.owner, None);
             return Err(Errno::ERESTARTSYS);
         }
-        // 持有锁的一方解锁、关闭文件或者退出时会请求唤醒
+        // The holder requests a wakeup when it unlocks, closes the file or exits
         cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
     }
 }
 
-/// 封印禁止的写入（write、pwrite）和长度变化（ftruncate）返回 EPERM。`grow_to` 是
-/// 写入或截断之后的长度。
+/// Writes (write, pwrite) and length changes (ftruncate) forbidden by seals return EPERM.
+/// `grow_to` is the length after the write or truncation.
 fn check_seals(
     cx: &Cx<'_>,
     f: &OpenFile,
@@ -1979,7 +2037,7 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
     const MFD_ALLOW_SEALING: u32 = 0x2;
     const MFD_NOEXEC_SEAL: u32 = 0x8;
     const MFD_EXEC: u32 = 0x10;
-    // 不支持 MFD_HUGETLB
+    // MFD_HUGETLB is not supported
     if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -2040,19 +2098,20 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             }
             return Ok(0);
         }
-        // 与 Linux 一样在看文件类型之前处理（do_vfs_ioctl）
+        // Handled before the file type is looked at, as on Linux (do_vfs_ioctl)
         FICLONE | FICLONERANGE => {
             let src = if request == FICLONE {
                 arg as i32
             } else {
-                // struct file_clone_range 的第一项是源 fd（s64）
+                // The first field of struct file_clone_range is the source fd (s64)
                 let b: [u8; 32] = get(cx, arg)?;
                 i64::from_le_bytes(b[..8].try_into().unwrap()) as i32
             };
             return clone_range(&io_file(cx, src)?, &file);
         }
         FIDEDUPERANGE => {
-            // struct file_dedupe_range 的头：两个 u64，dest_count（u16）和两个保留项
+            // Header of struct file_dedupe_range: two u64s, dest_count (u16) and two reserved
+            // fields
             let b: [u8; 24] = get(cx, arg)?;
             if b[18..24].iter().any(|&x| x != 0) {
                 return Err(Errno::EINVAL);
@@ -2063,7 +2122,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
                 _ => Err(Errno::EINVAL),
             };
         }
-        // socket 的属主（与 F_SETOWN、F_GETOWN 相同，负数是进程组）
+        // Socket owner (as with F_SETOWN and F_GETOWN; negative is a process group)
         FIOSETOWN | SIOCSPGRP | FIOGETOWN | SIOCGPGRP
             if matches!(file.borrow().kind, FileKind::Socket(_)) =>
         {
@@ -2095,8 +2154,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
     if let Some((mnt, kind, r)) = ns {
         return super::ns::ioctl(cx, mnt, kind, &r, request, arg);
     }
-    // 取出要用的对象再放开打开文件的借用：NOTIF_RECV 会等，等的时候别的线程可能要改这个
-    // 打开文件（fcntl、FIONBIO）
+    // Take out the object needed, then release the borrow of the open file: NOTIF_RECV waits,
+    // and while it waits other threads may want to change this open file (fcntl, FIONBIO)
     let notify = match &file.borrow().kind {
         FileKind::SeccompNotify(l) => Some(l.filter()),
         _ => None,
@@ -2151,8 +2210,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
     Ok(rc as u64)
 }
 
-/// ioctl 和 FICLONE 的源 fd 对应的打开文件：与 Linux 的 `fdget` 一样不接受 `O_PATH` 打开的
-/// （EBADF）。
+/// The open file of an ioctl fd or FICLONE's source fd: as with Linux's `fdget`, files opened
+/// with `O_PATH` are not accepted (EBADF).
 fn io_file(cx: &Cx<'_>, fd: i32) -> Result<FileRef, Errno> {
     let file = cx.fds().get(fd)?;
     if file.borrow().flags & oflags::O_PATH != 0 {
@@ -2161,10 +2220,11 @@ fn io_file(cx: &Cx<'_>, fd: i32) -> Result<FileRef, Errno> {
     Ok(file)
 }
 
-/// FICLONE、FICLONERANGE：按 Linux 的顺序检查（`ioctl_file_clone`、`generic_file_rw_checks`），
-/// 最后和宿主上的 ext4、f2fs 一样不支持 reflink（EOPNOTSUPP），程序退回普通的复制
-/// （Python 3.14 的 `pathlib.Path.copy`、`cp --reflink=auto`）。仓库之外的文件和仓库里的
-/// 不在同一个挂载点（EXDEV）。
+/// FICLONE, FICLONERANGE: checked in Linux's order (`ioctl_file_clone`,
+/// `generic_file_rw_checks`), and in the end, like ext4 and f2fs on the host, reflink is not
+/// supported (EOPNOTSUPP), so programs fall back to an ordinary copy (Python 3.14's
+/// `pathlib.Path.copy`, `cp --reflink=auto`). Files outside the store are not on the same mount
+/// point as those in it (EXDEV).
 fn clone_range(src: &FileRef, dst: &FileRef) -> SysResult {
     let (src, dst) = (src.borrow(), dst.borrow());
     let in_store = |f: &OpenFile| {
@@ -2188,7 +2248,7 @@ fn clone_range(src: &FileRef, dst: &FileRef) -> SysResult {
     Err(Errno::EOPNOTSUPP)
 }
 
-// ---- 元数据 ----
+// ---- Metadata ----
 
 pub(super) fn faccessat(
     cx: &mut Cx<'_>,
@@ -2201,7 +2261,8 @@ pub(super) fn faccessat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    // 默认用真实用户 ID 检查（包括路径上的搜索权限），AT_EACCESS 时用有效用户 ID
+    // By default checks use the real user ID (including search permission along the path), and
+    // with AT_EACCESS the effective user ID
     let cred = if flags & AT_EACCESS != 0 {
         cx.cred()
     } else {
@@ -2226,9 +2287,10 @@ pub(super) fn faccessat(
         gid: word(28),
         ..Stat::default()
     };
-    // R_OK、W_OK、X_OK 与 MAY_READ、MAY_WRITE、MAY_EXEC 的取值相同
+    // R_OK, W_OK, X_OK have the same values as MAY_READ, MAY_WRITE, MAY_EXEC
     cred.permission(&st, amode)?;
-    // 只读的挂载里的普通文件、目录、符号链接问能不能写是 EROFS（在权限之后）
+    // Asking whether a regular file, directory or symlink in a read-only mount can be written is
+    // EROFS (after the permission check)
     let special = !matches!(
         st.mode & mode::S_IFMT,
         mode::S_IFREG | mode::S_IFDIR | mode::S_IFLNK
@@ -2250,8 +2312,8 @@ pub(super) fn fchdir(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     set_cwd(cx, node)
 }
 
-/// chroot：目标必须是可以搜索的目录，要求 `CAP_SYS_CHROOT`。当前目录不变（可能在
-/// 新的根目录外面，与 Linux 相同）。
+/// chroot: the target must be a searchable directory; requires `CAP_SYS_CHROOT`. The current
+/// directory is unchanged (it may be outside the new root, as on Linux).
 pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
     let path = read_path(cx, path)?;
     let node = lookup_at(cx, AT_FDCWD, &path, true)?;
@@ -2271,7 +2333,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
     Ok(0)
 }
 
-/// chdir、fchdir：目标必须是可以搜索的目录。
+/// chdir, fchdir: the target must be a searchable directory.
 fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
     let vfs = cx.vfs()?;
     if !vfs.is_dir(&cx.view(&vfs), &node)? {
@@ -2288,7 +2350,8 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
 pub(super) fn getcwd(cx: &mut Cx<'_>, buf: u64, size: u64) -> SysResult {
     let vfs = cx.vfs()?;
     let (path, reached) = vfs.reach(&cx.view(&vfs), &cx.root(), &cx.cwd())?;
-    // 与 Linux 一样，当前目录不在根目录下面时以 (unreachable) 开头（musl、glibc 当作 ENOENT）
+    // As on Linux, when the current directory is not under the root the path starts with
+    // (unreachable) (musl and glibc treat it as ENOENT)
     let mut path = if reached {
         path
     } else {
@@ -2313,8 +2376,9 @@ pub(super) fn readlinkat(
         return Err(Errno::EINVAL);
     }
     let path = read_path(cx, path)?;
-    // 路径为空时读 dirfd 本身（以 O_PATH | O_NOFOLLOW 打开的符号链接），`AT_FDCWD` 是当前
-    // 目录；它不是符号链接时是 ENOENT（Linux 的 do_readlinkat：`empty ? -ENOENT : -EINVAL`）
+    // An empty path reads dirfd itself (a symlink opened with O_PATH | O_NOFOLLOW), and
+    // `AT_FDCWD` is the current directory; when it is not a symlink it is ENOENT (Linux's
+    // do_readlinkat: `empty ? -ENOENT : -EINVAL`)
     let empty = path.is_empty();
     let node = if !empty {
         lookup_at(cx, dirfd, &path, false)?
@@ -2346,7 +2410,7 @@ pub(super) fn newfstatat(
     put(cx, buf, st).map(|()| 0)
 }
 
-/// newfstatat 的 `flags` 检查。
+/// The `flags` check of newfstatat.
 pub(super) fn newfstatat_flags(flags: u32) -> Result<(), Errno> {
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
@@ -2354,12 +2418,13 @@ pub(super) fn newfstatat_flags(flags: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// newfstatat、statx 共用：`*at` 风格地找到对象，返回 `struct stat`。
+/// Shared by newfstatat and statx: finds the object `*at`-style and returns its `struct stat`.
 fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
     stat_at_kernel(cx, dirfd, path, flags).map(|st| owner_out(cx, st))
 }
 
-/// stat 结果里的属主、属组换成调用者的用户命名空间里的（映射不到是 65534）。
+/// Turns the owner and group in a stat result into those in the caller's user namespace (65534
+/// when they do not map).
 fn owner_out(cx: &Cx<'_>, mut st: [u8; 128]) -> [u8; 128] {
     let cred = cx.cred();
     if cred.user_ns.level > 0 {
@@ -2372,12 +2437,13 @@ fn owner_out(cx: &Cx<'_>, mut st: [u8; 128]) -> [u8; 128] {
     st
 }
 
-/// [`stat_at`]，属主、属组是内核 ID。
+/// [`stat_at`], with the owner and group as kernel IDs.
 fn stat_at_kernel(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         file_stat(cx, &cx.fds().get(dirfd)?)
     } else {
-        // 解析和取属性共用一个读事务（只在缓存没命中时才真正开始）
+        // Resolution and fetching the attributes share one read transaction (which really starts
+        // only on a cache miss)
         let vfs = cx.vfs()?;
         vfs.store().snapshot(|_| {
             let cred = cx.cred();
@@ -2408,7 +2474,7 @@ pub(super) fn statx(
     put(cx, buf, encode_statx(&st)).map(|()| 0)
 }
 
-/// statx 的 `flags` 和 `mask` 检查，返回 [`stat_at`] 用的 flags。
+/// The `flags` and `mask` checks of statx; returns the flags for [`stat_at`].
 pub(super) fn statx_flags(flags: u32, mask: u32) -> Result<u32, Errno> {
     const AT_NO_AUTOMOUNT: u32 = 0x800;
     const AT_STATX_SYNC_TYPE: u32 = 0x6000;
@@ -2422,13 +2488,13 @@ pub(super) fn statx_flags(flags: u32, mask: u32) -> Result<u32, Errno> {
     Ok(flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
 }
 
-/// 由 `struct stat` 得到 `struct statx`：总是给出全部基本字段（`STATX_BASIC_STATS`），
-/// 没有创建时间。
+/// Builds a `struct statx` from a `struct stat`: always gives all the basic fields
+/// (`STATX_BASIC_STATS`), with no creation time.
 pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
     const STATX_BASIC_STATS: u32 = 0x7ff;
     let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap());
-    // glibc、musl 的 major()/minor()
+    // glibc's and musl's major()/minor()
     let major = |d: u64| (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32;
     let minor = |d: u64| ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
     let mut b = [0u8; 256];
@@ -2442,7 +2508,7 @@ pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
     put(32, &u64_at(8).to_le_bytes()); // ino
     put(40, &u64_at(48).to_le_bytes()); // size
     put(48, &u64_at(64).to_le_bytes()); // blocks
-    // atime、ctime、mtime：秒和纳秒（statx_timestamp 是 i64 + u32 + 保留）
+    // atime, ctime, mtime: seconds and nanoseconds (statx_timestamp is i64 + u32 + reserved)
     for (dst, src) in [(64, 72), (96, 104), (112, 88)] {
         put(dst, &u64_at(src).to_le_bytes());
         put(dst + 8, &(u64_at(src + 8) as u32).to_le_bytes());
@@ -2461,7 +2527,7 @@ pub(super) fn fstat(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
 }
 
 fn encode_statfs(magic: u64, s: &appine_hal::FsStats, flags: u64) -> [u8; 120] {
-    // asm-generic 的 struct statfs（64 位）
+    // asm-generic's struct statfs (64-bit)
     let mut b = [0u8; 120];
     let words = [
         magic,
@@ -2482,12 +2548,12 @@ fn encode_statfs(magic: u64, s: &appine_hal::FsStats, flags: u64) -> [u8; 120] {
     b
 }
 
-/// statfs 的 `f_flags`（Linux 的 `calculate_f_flags`）：挂载的标志加上 `ST_VALID`。
+/// statfs's `f_flags` (Linux's `calculate_f_flags`): the mount's flags plus `ST_VALID`.
 fn statfs_flags(flags: u64) -> u64 {
     const ST_VALID: u64 = 0x20;
     const ST_RELATIME: u64 = 0x1000;
     const ST_NOSYMFOLLOW: u64 = 0x2000;
-    // RDONLY、NOSUID、NODEV、NOEXEC、NOATIME、NODIRATIME 的取值与 MS_* 相同
+    // RDONLY, NOSUID, NODEV, NOEXEC, NOATIME, NODIRATIME have the same values as MS_*
     let same = ms::RDONLY | ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::NOATIME | ms::NODIRATIME;
     let mut f = ST_VALID | (flags & same);
     if flags & ms::RELATIME != 0 {
@@ -2499,7 +2565,7 @@ fn statfs_flags(flags: u64) -> u64 {
     f
 }
 
-/// 节点所在文件系统的 statfs。
+/// statfs of the filesystem a node is in.
 fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     let empty = appine_hal::FsStats {
         block_size: 4096,
@@ -2507,7 +2573,8 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     };
     let vfs = cx.vfs()?;
     let flags = vfs.mount_flags(node).unwrap_or(0);
-    // tmpfs 按页数、inode 数（Linux 的 shmem_statfs）：不限的那一项都是 0；用量现数一遍
+    // tmpfs reports by pages and inodes (Linux's shmem_statfs): an unlimited item is all 0s;
+    // usage is counted afresh
     if let Some(dev) = vfs.tmpfs_dev(node) {
         let (p, pages, inodes) = vfs.tmpfs_usage(dev, true)?;
         let free = p.blocks.saturating_sub(pages);
@@ -2553,7 +2620,7 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
         let f = file.borrow();
         (matches!(f.kind, FileKind::Pipe(_)), f.node())
     };
-    // 消息队列的 fd 在 mqueue 文件系统里
+    // Message queue fds are in the mqueue filesystem
     if matches!(file.borrow().kind, FileKind::MessageQueue(_)) {
         let empty = appine_hal::FsStats {
             block_size: 4096,
@@ -2576,7 +2643,7 @@ pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
     put(cx, buf, b).map(|()| 0)
 }
 
-// ---- 修改命名空间 ----
+// ---- Changing the namespace ----
 
 pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
@@ -2626,7 +2693,8 @@ pub(super) fn mknodat(
     let cred = cx.cred();
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
-    // whiteout（字符设备 0:0）不要 CAP_MKNOD，也不过设备过滤（Linux 的 vfs_mknod）
+    // A whiteout (character device 0:0) needs no CAP_MKNOD and does not go through the device
+    // filter (Linux's vfs_mknod)
     let whiteout = kind == mode::S_IFCHR && dev & 0xffff_ffff == 0;
     if matches!(kind, mode::S_IFCHR | mode::S_IFBLK) && !whiteout {
         if !cred.capable(cap::MKNOD) {
@@ -2647,9 +2715,10 @@ pub(super) fn mknodat(
     Ok(0)
 }
 
-/// 删除 mqueue 文件系统里的队列（与 mq_unlink 一样）：父目录是 mqueue 的根目录时返回
-/// Some。顺序照 Linux 的 do_unlinkat、do_rmdir：`.`、`..`，只读的挂载，找不到，unlink 以
-/// `/` 结尾的名字，目录的写权限，粘滞位（EPERM），rmdir 的 ENOTDIR。
+/// Deletes a queue in the mqueue filesystem (as mq_unlink does): returns Some when the parent
+/// directory is the mqueue root directory. The order follows Linux's do_unlinkat and do_rmdir:
+/// `.` and `..`, the read-only mount, not found, unlink of a name ending in `/`, write permission
+/// on the directory, the sticky bit (EPERM), rmdir's ENOTDIR.
 fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Result<(), Errno>> {
     let start = start_dir(cx, dirfd, path).ok()?;
     let vfs = cx.vfs().ok()?;
@@ -2675,14 +2744,14 @@ fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Res
         if !ipc.mqueues.contains_key(name) {
             return Err(Errno::ENOENT);
         }
-        // unlink 以 / 结尾的名字在 may_delete 之前就是 ENOTDIR
+        // unlink of a name ending in / is ENOTDIR before may_delete
         if !rmdir && path.ends_with(b"/") {
             return Err(Errno::ENOTDIR);
         }
         let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
         cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
         if rmdir {
-            // rmdir 先查粘滞位（may_delete），队列不是目录
+            // rmdir checks the sticky bit first (may_delete); a queue is not a directory
             let q = ipc.mqueues[name].borrow().stat();
             let dir_uid = ipc.mq_dir.borrow().uid;
             if cred.fsuid != q.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&q, cap::FOWNER) {
@@ -2694,7 +2763,8 @@ fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Res
     })())
 }
 
-/// 父目录是 cgroup 的目录时：`name` 是那个 cgroup 的编号、它的元数据和最后一个组件。
+/// When the parent directory is a cgroup directory: `name` is that cgroup's id, its metadata
+/// and the last component.
 fn cgroup_parent<'p>(
     cx: &Cx<'_>,
     dirfd: i32,
@@ -2712,8 +2782,9 @@ fn cgroup_parent<'p>(
     Some((dir, id, st, name))
 }
 
-/// 在 cgroup 的目录里 mkdir：建子 cgroup（[`crate::cgroup::Cgroups::mkdir`]）。顺序照 Linux：
-/// `.`、`..` 和已经有的名字是 EEXIST，只读的挂载 EROFS，没有目录的写权限 EACCES。
+/// mkdir in a cgroup directory: creates a child cgroup ([`crate::cgroup::Cgroups::mkdir`]). The
+/// order follows Linux: `.`, `..` and existing names are EEXIST, a read-only mount EROFS, no
+/// write permission on the directory EACCES.
 fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), Errno>> {
     let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
     Some((|| {
@@ -2735,8 +2806,9 @@ fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), E
     })())
 }
 
-/// 在 cgroup 的目录里 unlink、rmdir：rmdir 删掉子 cgroup（[`crate::cgroup::rmdir`]），文件
-/// 删不了（EPERM，cgroup 的目录没有 unlink）。
+/// unlink and rmdir in a cgroup directory: rmdir removes a child cgroup
+/// ([`crate::cgroup::rmdir`]); files cannot be deleted (EPERM, cgroup directories have no
+/// unlink).
 fn cgroup_unlink(
     cx: &mut Cx<'_>,
     dirfd: i32,
@@ -2791,7 +2863,7 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
     let store_vfs = cx.vfs()?;
     let store = store_vfs.store();
     let cred = cx.cred();
-    // 有 inotify 监视时先记下要删除的 inode
+    // With inotify watches, note the inode to delete first
     let victim = match name {
         b"." | b".." => None,
         _ if inotify::active(cx.kr()) => store.lookup(dir, name)?,
@@ -2821,7 +2893,8 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
             return Err(Errno::EISDIR);
         }
         writable_dir(&store_vfs, (mnt, dir))?;
-        // 以 / 结尾的名字只能是目录：是目录时 EISDIR，否则 ENOTDIR
+        // A name ending in / can only be a directory: EISDIR when it is a directory, otherwise
+        // ENOTDIR
         if path.ends_with(b"/") {
             let ino = store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
             return Err(if store.stat(ino)?.is_dir() {
@@ -2844,9 +2917,9 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
     Ok(())
 }
 
-/// 删除、改名之前：目录 `dir` 里的 `name` 上挂着调用者的命名空间里的挂载时是 EBUSY
-/// （Linux 的 `is_local_mountpoint`）。返回它的 inode，删掉之后用来卸下别的命名空间里挂在
-/// 上面的（[`detach_points`]）。
+/// Before deleting or renaming: EBUSY when a mount of the caller's namespace is on `name` in
+/// directory `dir` (Linux's `is_local_mountpoint`). Returns its inode, used after the deletion
+/// to detach the mounts on it in other namespaces ([`detach_points`]).
 fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
     match vfs.store().lookup(dir, name)? {
         Some(ino) if vfs.is_store_point((ino, dir, name), cx.mnt_ns()) => Err(Errno::EBUSY),
@@ -2854,8 +2927,8 @@ fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Opti
     }
 }
 
-/// 删掉了目录 `dir` 里的 `name`（原来是 `ino`）：别的命名空间里挂在它上面的挂载卸下
-/// （Linux 的 vfs_rmdir、vfs_unlink、vfs_rename 里的 `detach_mounts`）。
+/// `name` in directory `dir` (formerly `ino`) has been deleted: the mounts on it in other
+/// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename).
 fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
     if let Some(ino) = ino {
         vfs.detach_store_point((ino, dir, name));
@@ -2863,8 +2936,9 @@ fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[
     }
 }
 
-/// 去掉了文件 `ino` 的链接 `name`（unlink、被 rename 覆盖）：链接数变了（IN_ATTRIB），
-/// 最后一个链接也没了时 IN_DELETE_SELF。这两个事件只报给文件自己。
+/// Link `name` of file `ino` was removed (unlink, overwritten by rename): the link count changed
+/// (IN_ATTRIB), and IN_DELETE_SELF when the last link is gone too. Both events are reported only
+/// to the file itself.
 fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8])) {
     let k = cx.kr();
     inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
@@ -2888,7 +2962,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
-    // 长的符号链接在 tmpfs 里另占一页（Linux 的 SHORT_SYMLINK_LEN）
+    // A long symlink takes an extra page in tmpfs (Linux's SHORT_SYMLINK_LEN)
     let pages = u64::from(target.len() >= 128);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), pages)?;
     vfs.store().symlink(dir, name, &target, uid, gid)?;
@@ -2925,7 +2999,7 @@ pub(super) fn linkat(
     if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
         return Err(Errno::EEXIST);
     }
-    // 合成文件系统是另一个"设备"：跨设备不能建硬链接
+    // A synthetic filesystem is another "device": hard links cannot cross devices
     let (Node::Store(src_mnt, src), Node::Store(mnt, dir)) = (src, dir) else {
         return Err(Errno::EXDEV);
     };
@@ -2933,14 +3007,16 @@ pub(super) fn linkat(
         return Err(Errno::EEXIST);
     }
     reject_trailing_slash(vfs.store(), dir, name, &newpath)?;
-    // 两边经由不同的挂载（同一个文件系统 bind 到两处也是）是 EXDEV，在名字已经存在、
-    // 只读的挂载之后，在目录可写之前（Linux 的 do_linkat）
+    // Two sides reached through different mounts (even one filesystem bound in two places) are
+    // EXDEV, after the existing name and the read-only mount and before the directory being
+    // writable (Linux's do_linkat)
     let dir_st = may_create_name(&vfs, &cred, (mnt, dir), name)?;
     if src_mnt != mnt {
         return Err(Errno::EXDEV);
     }
-    // fs.protected_hardlinks（Linux 的 may_linkat，在 EXDEV 之后、目录的权限之前）：不是属主、
-    // 也没有 CAP_FOWNER 时，只能链接能读写的普通文件，不能是 setuid 的、可执行的 setgid 的
+    // fs.protected_hardlinks (Linux's may_linkat, after EXDEV and before the directory's
+    // permission): without being the owner or having CAP_FOWNER, only readable and writable
+    // regular files can be linked, and not setuid ones or executable setgid ones
     if cx.kr().protected_hardlinks {
         let st = vfs.store().stat(src)?;
         let setgid_exec = mode::S_ISGID | 0o010;
@@ -2953,7 +3029,7 @@ pub(super) fn linkat(
         }
     }
     cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-    // tmpfs 里每个硬链接也占一个 inode（Linux 的 shmem_link）
+    // In tmpfs every hard link also takes an inode (Linux's shmem_link)
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
     vfs.store().link(dir, name, src)?;
     tmpfs_created(&vfs, tmpfs, 0);
@@ -2979,7 +3055,8 @@ pub(super) fn renameat2(
     let newpath = read_path(cx, newpath)?;
     let (old_mnt, old_dir, old_name) = parent_at(cx, olddirfd, &oldpath)?;
     let (new_mnt, new_dir, new_name) = parent_at(cx, newdirfd, &newpath)?;
-    // 两边经由不同的挂载是 EXDEV，然后才看 `.`、`..` 和只读的挂载（Linux 的 do_renameat2）
+    // Two sides reached through different mounts are EXDEV, and only then come `.`, `..` and
+    // the read-only mount (Linux's do_renameat2)
     if old_mnt != new_mnt {
         return Err(Errno::EXDEV);
     }
@@ -2991,7 +3068,7 @@ pub(super) fn renameat2(
     }
     let vfs = cx.vfs()?;
     writable_dir(&vfs, (old_mnt, old_dir))?;
-    // 任何一边以 / 结尾，被移动的就必须是目录
+    // If either side ends in /, what is moved must be a directory
     if (oldpath.ends_with(b"/") || newpath.ends_with(b"/"))
         && let Some(src) = vfs.store().lookup(old_dir, old_name)?
         && !vfs.store().attrs(src)?.is_dir()
@@ -3008,7 +3085,7 @@ pub(super) fn renameat2(
     )?;
     not_mount_point(cx, &vfs, old_dir, old_name)?;
     let overwritten = not_mount_point(cx, &vfs, new_dir, new_name)?;
-    // 有 inotify 监视时先记下两边的 inode 和它们是不是目录
+    // With inotify watches, note both sides' inodes and whether they are directories first
     let entry = |dir, name| -> Result<Option<(Ino, u32)>, Errno> {
         match vfs.store().lookup(dir, name)? {
             Some(ino) if vfs.store().attrs(ino)?.is_dir() => Ok(Some((ino, inotify::IN_ISDIR))),
@@ -3021,7 +3098,8 @@ pub(super) fn renameat2(
     } else {
         (None, None)
     };
-    // 覆盖掉的名字在 tmpfs 里空出来（改名成自己的另一个硬链接什么也不做）
+    // An overwritten name is freed in tmpfs (renaming to another hard link of itself does
+    // nothing)
     let replaced = match exchange {
         false
             if vfs.store().lookup(old_dir, old_name)?
@@ -3041,11 +3119,11 @@ pub(super) fn renameat2(
         exchange,
     )?;
     tmpfs_removed(&vfs, replaced);
-    // 覆盖掉的目标上别的命名空间里的挂载卸下
+    // Detach the mounts of other namespaces on the overwritten target
     if !exchange && overwritten != moving {
         detach_points(cx, &vfs, overwritten, (new_dir, new_name));
     }
-    // 经由移动的名字打开着的文件跟着改名
+    // Files open through the moved name follow the rename
     let k = cx.kr();
     let store = vfs.store();
     let lookup = |dir, name| move || store.lookup(dir, name).ok().flatten();
@@ -3063,7 +3141,7 @@ pub(super) fn renameat2(
             lookup(old_dir, old_name),
         );
     }
-    // 顺序与 Linux 的 fsnotify_move 相同；交换时另一边再移动一次
+    // Order as in Linux's fsnotify_move; for an exchange the other side moves once more
     let moved = |isdir: u32, from: (Ino, &[u8]), to: (Ino, &[u8])| {
         let cookie = inotify::cookie(k);
         inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
@@ -3091,8 +3169,8 @@ pub(super) fn renameat2(
     Ok(0)
 }
 
-/// rename 之前的检查：两边的目录都要可写并遵守粘滞位；目录换了上级时，它自己也要
-/// 可写（要修改它的 `..`）。
+/// Checks before rename: both directories must be writable and obey the sticky bit; when a
+/// directory changes parent, it must itself be writable too (its `..` is modified).
 fn may_rename(
     store: &Store,
     cred: &Cred,
@@ -3134,18 +3212,20 @@ pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
     Ok(0)
 }
 
-/// chmod、chown、utimensat 作用的对象：仓库里的 inode，或者 `/dev/pts/<n>`（属主、权限和
-/// 时间记在终端上，与 Linux 的 devpts 一样）。合成文件系统里别的节点不能修改。
+/// What chmod, chown and utimensat act on: a store inode, or `/dev/pts/<n>` (owner, permissions
+/// and times are kept on the terminal, as with Linux's devpts). Other nodes in synthetic
+/// filesystems cannot be modified.
 enum Attrs {
     Store(Ino),
     Pts(Rc<RefCell<Tty>>),
-    /// socket、匿名管道的 fd：Linux 上改的是 sockfs、pipefs 里它们自己的 inode，属主是
-    /// 创建它的进程（libuv 的 `uv_pipe_chmod` 先 fchmod socket 的 fd）。这里当作调用者
-    /// 的，改了不记下来，fstat 报告的属主和权限照旧是合成的。
+    /// An fd of a socket or anonymous pipe: on Linux this changes their own inode in sockfs or
+    /// pipefs, owned by the process that created it (libuv's `uv_pipe_chmod` fchmods the
+    /// socket's fd first). Here it is treated as the caller's, the change is not recorded, and
+    /// the owner and permissions fstat reports stay synthetic.
     Anon,
-    /// POSIX 消息队列：mqueue 文件系统里的文件，或者 mq_open 得到的 fd。
+    /// A POSIX message queue: a file in the mqueue filesystem, or an fd from mq_open.
     Mq(Rc<RefCell<super::MessageQueue>>),
-    /// IPC 命名空间（编号）的 mqueue 文件系统的根目录。
+    /// The root directory of the mqueue filesystem of an IPC namespace (its id).
     MqDir(u64),
 }
 
@@ -3167,7 +3247,7 @@ impl Attrs {
         }
     }
 
-    /// 打开的文件：终端的从设备，或者仓库里的文件（`O_PATH` 打开的不行）。
+    /// An open file: a terminal slave, or a file in the store (not one opened with `O_PATH`).
     fn of_fd(cx: &Cx<'_>, fd: i32) -> Result<Attrs, Errno> {
         let file = cx.fds().get(fd)?;
         let f = file.borrow();
@@ -3214,7 +3294,7 @@ impl Attrs {
     }
 }
 
-/// 按路径改了元数据：报告 IN_ATTRIB（也报给所在的目录）。
+/// Metadata changed by path: report IN_ATTRIB (also to the containing directory).
 pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool) {
     if inotify::active(cx.kr()) {
         let parent = inotify::watched_parent(cx, dirfd, path, follow);
@@ -3227,15 +3307,15 @@ pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: 
     }
 }
 
-/// 按 fd 改了元数据：报告 IN_ATTRIB。
+/// Metadata changed by fd: report IN_ATTRIB.
 pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
     if let Ok(file) = cx.fds().get(fd) {
         inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ATTRIB);
     }
 }
 
-/// 只有属主（或者有 `CAP_FOWNER`）能修改权限位；不在文件属组里的调用者不能设置
-/// setgid 位（没有 `CAP_FSETID` 时静默去掉）。
+/// Only the owner (or a holder of `CAP_FOWNER`) can change permission bits; a caller not in the
+/// file's group cannot set the setgid bit (silently dropped without `CAP_FSETID`).
 fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
     let st = target.stat(cx)?;
     let cred = cx.cred();
@@ -3300,8 +3380,9 @@ pub(super) fn fchown(cx: &mut Cx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult 
     Ok(0)
 }
 
-/// 没有 `CAP_CHOWN` 时，属主只能把属组改成自己所在的组，不能修改属主。ID 是调用者的用户
-/// 命名空间里的，映射不到是 EINVAL；`CAP_CHOWN` 要文件原来的属主、属组在里面有映射。
+/// Without `CAP_CHOWN`, the owner can only change the group to one it is in, and cannot change
+/// the owner. IDs are in the caller's user namespace, and unmapped ones are EINVAL; `CAP_CHOWN`
+/// requires the file's current owner and group to be mapped there.
 fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
     let cred = cx.cred();
     let uid = owner_arg(uid)
@@ -3346,7 +3427,7 @@ pub(super) fn utimensat(
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
     }
-    // path 为 NULL 时作用于 dirfd 本身（futimens）
+    // A NULL path acts on dirfd itself (futimens)
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let (target, path) = if path == 0 {
         if dirfd == AT_FDCWD {
@@ -3358,7 +3439,8 @@ pub(super) fn utimensat(
         let node = lookup_at_or_fd(cx, &cx.cred(), dirfd, &path, flags, follow)?;
         (Attrs::of(cx, &node)?, path)
     };
-    // times[0] 是 atime，times[1] 是 mtime。现在的时间由仓库取（普通文件交给宿主）
+    // times[0] is atime and times[1] is mtime. The current time is taken by the store (for
+    // regular files it is left to the host)
     let (atime, mtime, explicit) = if times == 0 {
         (Some(FileTime::Now), Some(FileTime::Now), false)
     } else {
@@ -3382,7 +3464,8 @@ pub(super) fn utimensat(
         };
         (time(word(0), word(1)), time(word(2), word(3)), explicit)
     };
-    // 设成指定的时间只有属主可以，设成现在的时间有写权限也可以
+    // Only the owner can set given times; write permission also allows setting the current
+    // time
     let st = target.stat(cx)?;
     let cred = cx.cred();
     if !cred.owns(&st) {
@@ -3393,7 +3476,7 @@ pub(super) fn utimensat(
     }
     let ino = match target {
         Attrs::Store(ino) => ino,
-        // 终端的时间记在终端上（与 Linux 的 devpts 一样可以改）
+        // A terminal's times are kept on the terminal (changeable, as with Linux's devpts)
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
             let now = crate::tty::wall_ns();
@@ -3407,7 +3490,7 @@ pub(super) fn utimensat(
             return Ok(0);
         }
         Attrs::Anon => return Ok(0),
-        // 消息队列和 mqueue 的根目录的时间记在内核层里
+        // Times of message queues and the mqueue root directory are kept in the kernel layer
         Attrs::Mq(q) => {
             let now = crate::tty::wall_ns();
             let ns = |time: FileTime| match time {
@@ -3431,7 +3514,8 @@ pub(super) fn utimensat(
             return Ok(0);
         }
     };
-    // 按 fd 设置的普通文件经由打开的 object 设置：删除之后仍然打开着的文件也能用
+    // Regular files set by fd are set through the open object, which also works for files still
+    // open after deletion
     let open = match (path.is_empty(), dirfd) {
         (true, fd) if fd != AT_FDCWD => Some(cx.fds().get(fd)?),
         _ => None,
@@ -3512,10 +3596,10 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     }
 }
 
-/// 文件变短之后调用：所有地址空间里映射它的页，超出新末尾的从页表里拿掉
-/// （[`crate::mm::Mm::file_truncated`]）。当前进程的地址空间在 syscall 结束时同步，
-/// 别的进程的在这里同步。
-/// 有没有哪个地址空间以可写的共享映射映射着这个打开的文件。
+/// Called after a file gets shorter: in every address space, pages mapping it beyond the new end
+/// are removed from the page tables ([`crate::mm::Mm::file_truncated`]). The current process's
+/// address space syncs at the end of the syscall; other processes' sync here.
+/// Whether some address space maps this open file with a writable shared mapping.
 fn writably_mapped(cx: &Cx<'_>, f: &OpenFile) -> bool {
     use std::os::unix::fs::MetadataExt;
     let FileKind::Regular { file, .. } = &f.kind else {
@@ -3566,7 +3650,7 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     if len == 0 {
         return Err(Errno::EINVAL);
     }
-    // 超过最大的文件长度（i64::MAX）
+    // Beyond the largest file length (i64::MAX)
     let end = offset
         .checked_add(len)
         .filter(|&e| e <= i64::MAX as u64)
@@ -3584,7 +3668,8 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     };
     let size = host.metadata().map_err(host_errno)?.len();
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
-    // 仓库的 object 是宿主上的普通文件：预留空间就是把文件加长；打洞和清零写入 0
+    // A store object is a regular file on the host: reserving space means lengthening the file;
+    // punching holes and zeroing write zeros
     let zero = match mode & !FALLOC_FL_KEEP_SIZE {
         0 => false,
         FALLOC_FL_PUNCH_HOLE if keep => true,
@@ -3595,7 +3680,8 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         check_fsize(cx, end)?;
     }
     check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
-    // tmpfs 里要分到这一段的页（Linux 的 shmem_fallocate），打洞不用；不过记账只按大小
+    // In tmpfs this range must get its pages (Linux's shmem_fallocate), except for punching
+    // holes; the accounting is by size only, though
     let vfs = cx.vfs()?;
     let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, ino), host)?;
     if let Some((dev, own)) = tmpfs
@@ -3630,7 +3716,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     const LOCK_NB: u32 = 4;
     const LOCK_UN: u32 = 8;
     let file = cx.fds().get(fd)?;
-    // 不在仓库里的文件（管道、socket）没有可以共享的锁：总是成功
+    // Files not in the store (pipes, sockets) have no lock to share: always succeeds
     let Some(ino) = file.borrow().ino() else {
         return Ok(0);
     };
@@ -3650,13 +3736,13 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     loop {
         let locks = cx.k().flocks.entry(ino).or_default();
         locks.retain(|(f, _)| f.strong_count() > 0);
-        // 同一个打开文件再次加锁是转换锁的类型
+        // Locking the same open file again converts the lock type
         let conflict = locks
             .iter()
             .any(|(f, ex)| !f.ptr_eq(&me) && (exclusive || *ex));
         if !conflict {
-            // 转换锁的类型时先放开原来的（与 Linux 一样）：排他锁降成共享锁，等共享锁的
-            // 一方就可以拿到了
+            // When converting the lock type, release the old one first (as on Linux): when an
+            // exclusive lock becomes shared, those waiting for a shared lock can take it
             let before = locks.len();
             locks.retain(|(f, _)| !f.ptr_eq(&me));
             if locks.len() != before {
@@ -3672,13 +3758,15 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        // 持有锁的文件解锁、转换或关闭（OpenFile 析构）时会请求唤醒
+        // The file holding the lock requests a wakeup when it unlocks, converts or closes
+        // (OpenFile's destructor)
         cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
     }
 }
 
-/// sync_file_range、readahead、syncfs：只检查参数（数据直接写在宿主文件里，读取
-/// 也由宿主缓存）。`kind` 区分三者：0 是 sync_file_range，1 是 readahead，2 是 syncfs。
+/// sync_file_range, readahead, syncfs: only check arguments (data is written straight into the
+/// host file, and reads are cached by the host too). `kind` tells the three apart: 0 is
+/// sync_file_range, 1 readahead, 2 syncfs.
 pub(super) fn cache_hint(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -3695,8 +3783,9 @@ pub(super) fn cache_hint(
                 return Err(Errno::EINVAL);
             }
             match &f.kind {
-                // 交给宿主的 object：dpkg 这类先让一批文件开始写回、再逐个 fsync，合成一次
-                // 日志提交。打开文件由 file 保活，放锁期间不碰它
+                // Handed to the host object: tools like dpkg first start writeback for a batch of
+                // files and then fsync them one by one, merged into one journal commit. The open
+                // file is kept alive by file and not touched while the BKL is released
                 FileKind::Regular { file: host, .. } if flags != 0 => {
                     let fd = std::os::fd::AsRawFd::as_raw_fd(host);
                     drop(f);
@@ -3718,8 +3807,9 @@ pub(super) fn cache_hint(
     }
 }
 
-/// cachestat（Linux 6.5）：文件在页缓存里的状况。仓库里的文件看宿主文件的页缓存
-/// （[`appine_hal::cachestat`]，只有在缓存里的页数），其余的文件没有页缓存，全是 0。
+/// cachestat (Linux 6.5): the state of a file in the page cache. Files in the store look at the
+/// host file's page cache ([`appine_hal::cachestat`], only the number of pages in the cache);
+/// other files have no page cache and get all 0s.
 pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u32) -> SysResult {
     let file = cx.fds().get(fd)?;
     if matches!(file.borrow().kind, FileKind::Path(_)) {
@@ -3744,23 +3834,24 @@ pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u
     put(cx, out, b).map(|()| 0)
 }
 
-/// fsync(2)、fdatasync(2)（`data_only`）：普通文件的数据在宿主的 object 里，让宿主把它刷到
-/// 盘上；元数据（名字、权限……）在仓库的数据库里，提交推迟的写事务，再等 WAL 落盘
-/// （[`durable`]）。刷盘时放开 BKL。
+/// fsync(2), fdatasync(2) (`data_only`): a regular file's data is in its host object, so the host
+/// is asked to flush it to disk; metadata (names, permissions...) is in the store's database, so
+/// the deferred write transaction is committed and then the WAL is awaited on disk
+/// ([`durable`]). The BKL is released while flushing.
 pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
     let file = cx.fds().get(fd)?;
     let host = {
         let f = file.borrow();
         match &f.kind {
             _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
-            // 只有普通文件和目录能同步（宿主 fd 交给宿主）
+            // Only regular files and directories can be synced (host fds are left to the host)
             FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
             FileKind::Directory { .. } => None,
             FileKind::Host(_) => return Ok(0),
             _ => return Err(Errno::EINVAL),
         }
     };
-    // 打开文件由 file 保活，放锁期间不碰它
+    // The open file is kept alive by file and not touched while the BKL is released
     if let Some(fd) = host {
         cx.unlocked(|| appine_hal::fsync(fd, data_only))
             .map_err(Errno)?;
@@ -3768,13 +3859,16 @@ pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
     durable(cx, false)
 }
 
-/// sync(2)：提交推迟的写事务，把仓库所在的整个宿主文件系统写到盘上。
+/// sync(2): commits the deferred write transaction and writes the whole host filesystem holding
+/// the store to disk.
 pub(super) fn sync(cx: &mut Cx<'_>) -> SysResult {
     durable(cx, true)
 }
 
-/// 提交仓库推迟提交的写事务，等它落盘（[`Store::commit`] 只写进 WAL）：`all` 时连同所有
-/// object 的数据对整个宿主文件系统 syncfs，否则只等 WAL。放开 BKL 等。
+/// Commits the store's deferred write transaction and waits for it to reach disk
+/// ([`Store::commit`] only writes into the WAL): with `all`, syncfs the whole host filesystem
+/// together with the data of all objects, otherwise wait only for the WAL. Waits with the BKL
+/// released.
 fn durable(cx: &mut Cx<'_>, all: bool) -> SysResult {
     let Ok(vfs) = cx.vfs() else {
         return Ok(0);
@@ -3793,7 +3887,7 @@ fn durable(cx: &mut Cx<'_>, all: bool) -> SysResult {
     Ok(0)
 }
 
-// ---- 目录 ----
+// ---- Directories ----
 
 pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> SysResult {
     let file = cx.fds().get(fd)?;
@@ -3832,7 +3926,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
     let mut out = Vec::new();
     let mut next = *pos as usize;
     while let Some(e) = list.get(next) {
-        // struct linux_dirent64：d_ino、d_off、d_reclen、d_type、d_name，按 8 字节对齐
+        // struct linux_dirent64: d_ino, d_off, d_reclen, d_type, d_name, aligned to 8 bytes
         let reclen = (19 + e.name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > count {
             break;
@@ -3841,7 +3935,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         out.extend_from_slice(&e.ino.to_le_bytes());
         out.extend_from_slice(&(next as u64 + 1).to_le_bytes());
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
-        out.push((e.mode >> 12) as u8 & 0xf); // DT_* 就是 S_IFMT >> 12
+        out.push((e.mode >> 12) as u8 & 0xf); // DT_* is just S_IFMT >> 12
         out.extend_from_slice(&e.name);
         out.resize(start + reclen, 0);
         next += 1;
@@ -3885,9 +3979,9 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             SEEK_END => q.borrow().status().len() as i64,
             _ => return Err(Errno::EINVAL),
         },
-        // /dev/kmsg 按记录定位（`devkmsg_llseek`）：只能是偏移 0，SEEK_SET 到最老的一条，
-        // SEEK_DATA 到 syslog 上次清空之后的第一条（`dmesg -c` 之后），SEEK_END 到下一条；
-        // 文件位置不变，返回 0
+        // /dev/kmsg seeks by record (`devkmsg_llseek`): the offset can only be 0; SEEK_SET goes
+        // to the oldest record, SEEK_DATA to the first one after syslog last cleared (after
+        // `dmesg -c`), SEEK_END to the next one; the file position is unchanged and 0 is returned
         FileKind::Device {
             kmsg: Some(user), ..
         } => {
@@ -3903,7 +3997,7 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             };
             return Ok(0);
         }
-        // 与 Linux 的 /dev/null 等一样，seek 总是成功并停在 0
+        // As with Linux's /dev/null and the like, seek always succeeds and stays at 0
         FileKind::Device { .. } => return Ok(0),
         FileKind::Directory { entries, .. } => {
             let new = match whence {
@@ -3945,27 +4039,29 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
     Ok(new as u64)
 }
 
-// ---- 读写 ----
+// ---- Reading and writing ----
 
-/// 一次读写要走的路径，在不持有打开文件借用的情况下进行。
+/// The route one read or write takes, carried out without holding a borrow of the open file.
 enum IoPath {
     Host(i32),
     Pipe(Rc<RefCell<Pipe>>),
-    /// 终端，打开文件是不是主设备、打开时挂断过几次（[`crate::tty::PtyEnd::born`]）。
+    /// A terminal, whether the open file is the master, and how many hangups it had seen when
+    /// opened ([`crate::tty::PtyEnd::born`]).
     Pty(Rc<RefCell<Tty>>, (bool, u32)),
     Socket(SocketRef),
     EventFd(Rc<RefCell<EventFd>>),
     TimerFd(Rc<RefCell<TimerFd>>),
     SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
     Inotify(Rc<RefCell<super::Inotify>>),
-    /// `/proc/<pid>/pagemap`：按读的位置现算。
+    /// `/proc/<pid>/pagemap`: computed on the fly from the read position.
     Pagemap(Tid),
-    /// `/proc/<pid>/mem`：位置就是地址。
-    /// `/proc/<pid>/mem` 打开时的地址空间，已经释放时是 None。
+    /// `/proc/<pid>/mem`: the position is the address.
+    /// The address space of `/proc/<pid>/mem` at open, None when it has been released.
     Mem(Option<Rc<RefCell<crate::mm::Mm>>>),
-    /// `/dev/kmsg`：按记录读写，读的位置在打开文件里（[`crate::klog::KmsgFile`]）。
+    /// `/dev/kmsg`: read and written by record, with the read position in the open file
+    /// ([`crate::klog::KmsgFile`]).
     Kmsg,
-    /// `/proc/kmsg`：syslog 的读。
+    /// `/proc/kmsg`: syslog's read.
     ProcKmsg(Rc<RefCell<crate::klog::Klog>>),
     Local,
 }
@@ -3997,7 +4093,8 @@ fn io_path(f: &OpenFile) -> IoPath {
     }
 }
 
-/// 能不能按位置读写（AIO 对不能定位的文件不管偏移）。
+/// Whether the file can be read and written by position (AIO ignores the offset for files that
+/// cannot seek).
 pub(super) fn seekable(f: &OpenFile) -> bool {
     matches!(
         io_path(f),
@@ -4005,11 +4102,12 @@ pub(super) fn seekable(f: &OpenFile) -> bool {
     )
 }
 
-/// 读写走哪条路径。带偏移的读写（pread、pwritev）遇到不能定位的文件是 ESPIPE：与
-/// Linux 一样先于打开方式检查（只读打开的管道 pwrite 也是 ESPIPE），`O_PATH` 除外。
+/// Which route a read or write takes. Reads and writes with an offset (pread, pwritev) on a file
+/// that cannot seek are ESPIPE: as on Linux this comes before the open-mode check (pwrite on a
+/// pipe opened read-only is also ESPIPE), except for `O_PATH`.
 fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     let path = io_path(f);
-    // /dev/kmsg、/proc/kmsg 的 pread、pwrite 不看偏移，与 read、write 一样
+    // pread and pwrite of /dev/kmsg and /proc/kmsg ignore the offset, like read and write
     let seekable = matches!(
         path,
         IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Kmsg | IoPath::ProcKmsg(_)
@@ -4020,9 +4118,10 @@ fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     Ok(path)
 }
 
-/// 等宿主 fd（`appine-run` 交给 guest 的宿主 stdio）可读或可写；非阻塞时不等。只等宿主
-/// fd 本身，不登记任何对象：进程内没有修改会让它就绪，原来系统里每一次管道、PTY 的读写
-/// 都把阻塞在宿主 stdin 上的线程叫醒一遍。
+/// Waits until a host fd (the host stdio `appine-run` gives the guest) is readable or writable;
+/// does not wait when nonblocking. Waits only on the host fd itself and registers no object:
+/// nothing in the process can make it ready, and previously every pipe or PTY read or write in
+/// the system woke the threads blocked on host stdin once.
 fn wait_host(cx: &mut Cx<'_>, fd: i32, events: i16, nonblock: bool) -> Result<(), Errno> {
     let mut pfd = [(fd, events, 0)];
     loop {
@@ -4077,7 +4176,7 @@ fn pipe_read(
     }
 }
 
-/// 等管道里有数据：返回 false 表示写端已经全部关闭（EOF）。
+/// Waits for data in the pipe: returns false when all write ends are closed (EOF).
 fn pipe_wait_data(
     cx: &mut Cx<'_>,
     pipe: &Rc<RefCell<Pipe>>,
@@ -4103,7 +4202,7 @@ fn pipe_wait_data(
     }
 }
 
-/// 打开文件是管道时返回管道，以及它是不是读端。
+/// When the open file is a pipe, returns the pipe and whether it is the read end.
 fn pipe_of(file: &FileRef) -> Option<(Rc<RefCell<Pipe>>, bool)> {
     match &file.borrow().kind {
         FileKind::Pipe(end) => Some((end.pipe.clone(), end.read)),
@@ -4113,8 +4212,9 @@ fn pipe_of(file: &FileRef) -> Option<(Rc<RefCell<Pipe>>, bool)> {
 
 const SPLICE_F_NONBLOCK: u32 = 2;
 
-/// splice：在管道和另一个文件（或两个管道）之间搬数据。经由宿主缓冲区复制，不是零拷贝；
-/// 从管道取数据时先复制、写成功之后才从管道里去掉，写失败时数据不会丢。
+/// splice: moves data between a pipe and another file (or two pipes). Copies through a host
+/// buffer, not zero-copy; data taken from a pipe is copied first and removed from the pipe only
+/// after the write succeeds, so a failed write loses no data.
 pub(super) fn splice(
     cx: &mut Cx<'_>,
     fd_in: i32,
@@ -4130,7 +4230,8 @@ pub(super) fn splice(
         return Err(Errno::EBADF);
     }
     let (in_pipe, out_pipe) = (pipe_of(&input), pipe_of(&output));
-    // 目录、eventfd、epoll 这类对象不支持 splice（Linux 的 splice_read、splice_write）
+    // Objects such as directories, eventfd and epoll do not support splice (Linux's splice_read,
+    // splice_write)
     let splices = |f: &FileRef| {
         matches!(
             f.borrow().kind,
@@ -4181,13 +4282,13 @@ pub(super) fn splice(
         n
     } else {
         let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
-        // 与 Linux 相同，没有连接的 socket 不能 splice 出数据：EINVAL
+        // As on Linux, an unconnected socket cannot splice out data: EINVAL
         let got = match read_bytes(cx, &input, &mut buf, src) {
             Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
             r => r?,
         };
         let n = write_bytes(cx, &output, &buf[..got], None)?;
-        // 没写完的部分退回输入文件
+        // The unwritten part goes back to the input file
         if src.is_none() && n < got {
             input.borrow_mut().pos -= (got - n) as u64;
         }
@@ -4202,7 +4303,7 @@ pub(super) fn splice(
     Ok(wrote as u64)
 }
 
-/// tee：把一个管道里的数据复制到另一个管道，不从源管道里取走。
+/// tee: copies the data in one pipe to another without taking it from the source pipe.
 pub(super) fn tee(cx: &mut Cx<'_>, fd_in: i32, fd_out: i32, len: usize, flags: u32) -> SysResult {
     let input = cx.fds().get(fd_in)?;
     let output = cx.fds().get(fd_out)?;
@@ -4225,8 +4326,9 @@ pub(super) fn tee(cx: &mut Cx<'_>, fd_in: i32, fd_out: i32, len: usize, flags: u
     write_bytes(cx, &output, &data, None).map(|n| n as u64)
 }
 
-/// vmsplice：管道的读端相当于 readv；写端等到有空间，然后写进放得下的部分就返回
-/// （与 Linux 相同，不等全部写完）。
+/// vmsplice: on a pipe's read end it is like readv; on the write end it waits for space, then
+/// writes the part that fits and returns (as on Linux, without waiting for everything to be
+/// written).
 pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: u32) -> SysResult {
     let file = cx.fds().get(fd)?;
     let Some((pipe, read)) = pipe_of(&file) else {
@@ -4275,7 +4377,7 @@ pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: 
     Ok(data.len() as u64)
 }
 
-/// 写端没有读者了：EPIPE，并给当前线程发 SIGPIPE。
+/// The write end has no readers left: EPIPE, and SIGPIPE to the current thread.
 fn broken_pipe(cx: &mut Cx<'_>) -> Errno {
     let task = cx.task.clone();
     signal::send_to_task(cx.kr(), &task, Signal::PIPE, SigInfo::kernel());
@@ -4298,12 +4400,13 @@ fn pipe_write(
                 return if done > 0 { Ok(done) } else { Err(e) };
             }
             let want = data.len() - done;
-            // 不超过 PIPE_BUF 的写入必须一次写完，不能和别人的写入交错
+            // Writes up to PIPE_BUF must complete at once and not interleave with other writes
             let space = p.space();
             if (data.len() <= PIPE_BUF && space >= want) || (data.len() > PIPE_BUF && space > 0) {
                 let n = want.min(space);
-                // 读端只在管道空着时等，poll 也只在空着时报告不可读；不空时只有边沿触发
-                // 的 epoll 要知道又来了数据
+                // Readers wait only while the pipe is empty, and poll reports it unreadable only
+                // while empty; when it is not empty only edge-triggered epoll needs to know that
+                // more data came
                 if p.buf.is_empty() {
                     request_wake_object(crate::pipe::object(pipe));
                 } else {
@@ -4314,8 +4417,9 @@ fn pipe_write(
                 done += n;
                 true
             } else {
-                // 要等读端腾出空间：小写入要一次写完的空间；大写入等到至少能写一页，
-                // 免得读端每读一点就叫醒一次
+                // Wait for the reader to make room: a small write needs room for all of it at
+                // once; a large write waits until at least a page fits, so it is not woken every
+                // time the reader reads a little
                 p.want_space(if data.len() <= PIPE_BUF {
                     want
                 } else {
@@ -4342,9 +4446,11 @@ fn pipe_write(
     }
 }
 
-/// `/dev/kmsg` 的读（`devkmsg_read`）：一次读一条记录（[`crate::klog::Klog::ext_text`]），
-/// 没有新的记录时等（非阻塞时 EAGAIN）。要读的那条已经被挤掉时是 EPIPE，位置跳到最老的
-/// 一条；缓冲区放不下这条是 EINVAL，这条也算读过了，与 Linux 相同。
+/// Read of `/dev/kmsg` (`devkmsg_read`): reads one record at a time
+/// ([`crate::klog::Klog::ext_text`]), waiting when there is no new record (EAGAIN when
+/// nonblocking). When the record to read has been pushed out it is EPIPE and the position jumps
+/// to the oldest record; a buffer too small for the record is EINVAL and the record counts as
+/// read, as on Linux.
 fn kmsg_read(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4386,9 +4492,9 @@ fn kmsg_read(
     }
 }
 
-/// `/dev/kmsg` 的写（`devkmsg_write`）：一次写是一条记录（[`crate::klog::KmsgFile::write`]），
-/// 超过 `LOG_LINE_MAX` 是 EINVAL；没有前缀时的级别是 `/proc/sys/kernel/printk` 的默认
-/// 消息级别。
+/// Write of `/dev/kmsg` (`devkmsg_write`): one write is one record
+/// ([`crate::klog::KmsgFile::write`]), and more than `LOG_LINE_MAX` is EINVAL; without a prefix
+/// the level is the default message level of `/proc/sys/kernel/printk`.
 fn kmsg_write(cx: &mut Cx<'_>, file: &FileRef, data: &[u8]) -> Result<usize, Errno> {
     if data.len() > crate::klog::LOG_LINE_MAX {
         return Err(Errno::EINVAL);
@@ -4403,8 +4509,8 @@ fn kmsg_write(cx: &mut Cx<'_>, file: &FileRef, data: &[u8]) -> Result<usize, Err
     Ok(data.len())
 }
 
-/// `/proc/kmsg` 的读（`kmsg_read`）：syslog 的读，与 syslog(2) 共用读的位置，读走就没了；
-/// 非阻塞时没有未读的记录是 EAGAIN。
+/// Read of `/proc/kmsg` (`kmsg_read`): syslog's read, sharing the read position with syslog(2);
+/// what is read is gone. Nonblocking with no unread record is EAGAIN.
 fn proc_kmsg_read(
     cx: &mut Cx<'_>,
     log: &Rc<RefCell<crate::klog::Klog>>,
@@ -4428,8 +4534,9 @@ fn proc_kmsg_read(
     Ok(text.len())
 }
 
-/// 仓库里的文件和设备：不会阻塞，直接在持有借用时完成。
-/// 普通文件的宿主 fd：读写它时可以放开 BKL（[`unlocked_io`]）。
+/// Files in the store and devices: never block, done directly while holding the borrow.
+/// The host fd of a regular file: the BKL can be released while reading or writing it
+/// ([`unlocked_io`]).
 fn regular_fd(f: &OpenFile) -> Option<i32> {
     match &f.kind {
         FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
@@ -4437,11 +4544,13 @@ fn regular_fd(f: &OpenFile) -> Option<i32> {
     }
 }
 
-/// 不持 BKL 读写普通文件：冷数据的宿主 pread/pwrite 要等闪存（百微秒到毫秒），持锁时
-/// 所有进程的系统调用都得跟着等。`offset` 为 None 时用文件位置，同一个打开文件同时只有
-/// 一次这样的读写（Linux 的 f_pos_lock），别的等它做完。`io` 在放开 BKL 时以宿主 fd 和
-/// 位置调用，不能访问任何内核对象；打开文件由调用方手里的 `file` 保活，放锁期间不碰它的
-/// 引用计数和借用。
+/// Reads or writes a regular file without the BKL: a host pread/pwrite of cold data waits on
+/// flash (hundreds of microseconds to milliseconds), and while the lock is held every process's
+/// syscalls would have to wait too. With `offset` None the file position is used, and an open
+/// file has only one such read or write at a time (Linux's f_pos_lock); others wait for it to
+/// finish. `io` is called with the host fd and position while the BKL is released, and must not
+/// touch any kernel object; the open file is kept alive by the caller's `file`, whose reference
+/// count and borrows are not touched while the BKL is released.
 fn unlocked_io(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4477,9 +4586,11 @@ fn unlocked_io(
     r.map_err(Errno)
 }
 
-/// 与 Linux 的 seq_file 一样（`seq_read_iter` 在偏移 0 时从头再来），从偏移 0 读 procfs、
-/// sysfs、cgroup2 的文件时重新生成内容：一直开着、seek 回 0 再读的程序（procps，runc 写了
-/// `cgroup.freeze` 再读回来确认）读到的是现在的。打开时刚生成、还没有读写过的不再生成。
+/// As with Linux's seq_file (`seq_read_iter` starts over at offset 0), reading a procfs, sysfs or
+/// cgroup2 file from offset 0 regenerates the content: programs that keep it open and seek back
+/// to 0 to read again (procps; runc writes `cgroup.freeze` and reads it back to confirm) read the
+/// current content. Content just generated at open and not yet read or written is not
+/// regenerated.
 fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Result<(), Errno> {
     let (mnt, node) = {
         let mut f = file.borrow_mut();
@@ -4525,7 +4636,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             }
             Device::Kmsg => return Err(Errno::EBADF),
         },
-        // 命名空间（nsfs）读不了
+        // Namespaces (nsfs) cannot be read
         FileKind::Proc {
             node: PseudoNode::NsFile(..),
             ..
@@ -4537,7 +4648,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
             buf[..n].copy_from_slice(&data[start..start + n]);
             n
         }
-        // 消息队列读到的是状态行
+        // A message queue reads as its status line
         FileKind::MessageQueue(q) => {
             let data = q.borrow().status();
             let start = (pos as usize).min(data.len());
@@ -4581,9 +4692,9 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
             Device::Full => Err(Errno::ENOSPC),
             _ => Ok(data.len()),
         },
-        // 可写的 procfs 文件：内容由 pseudo::write 处理过了
+        // Writable procfs files: the content was already handled by pseudo::write
         FileKind::Proc { .. } => Ok(data.len()),
-        // 没有 write 操作的匿名 inode
+        // Anonymous inodes without a write operation
         FileKind::Epoll(_)
         | FileKind::Pidfd(_)
         | FileKind::MessageQueue(_)
@@ -4593,7 +4704,8 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
     }
 }
 
-/// 从打开文件做一次读，读进宿主缓冲区。`offset` 为 None 时使用并推进文件位置。
+/// Does one read from an open file into a host buffer. With `offset` None the file position is
+/// used and advanced.
 fn read_bytes(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4661,7 +4773,8 @@ fn read_bytes(
     }
 }
 
-/// 向打开文件做一次写。`offset` 为 None 时使用并推进文件位置，`O_APPEND` 时先移到文件末尾。
+/// Does one write to an open file. With `offset` None the file position is used and advanced,
+/// and with `O_APPEND` it first moves to the end of the file.
 fn write_bytes(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4690,7 +4803,7 @@ fn write_bytes(
             Err(Errno::EINVAL)
         }
         IoPath::Kmsg => kmsg_write(cx, file, data),
-        // 只读打开（没有 proc_write）
+        // Opened read-only (no proc_write)
         IoPath::ProcKmsg(_) => Err(Errno::EBADF),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
@@ -4728,7 +4841,8 @@ fn write_bytes(
                 if let FileKind::Proc { fresh, .. } = &mut file.borrow_mut().kind {
                     *fresh = false;
                 }
-                // 改了 cgroup 的内存上限：叫醒定时器线程马上量一次
+                // The cgroup memory limit changed: wake the timer thread to measure once right
+                // away
                 if let PseudoNode::Cgroup(_, b"memory.max") = node {
                     cx.k().oom.recheck();
                     crate::kernel::signal_later(&cx.shared.timers);
@@ -4741,8 +4855,9 @@ fn write_bytes(
             if let Some(ino) = ino.filter(|_| !data.is_empty()) {
                 remove_privs(cx, ino)?;
             }
-            // 普通文件不持 BKL 写；O_APPEND 的仍持锁做（包括带偏移的写，[`append_offset`]），
-            // 几个进程同时追加时不会互相覆盖
+            // Regular files are written without the BKL; O_APPEND ones are still written with
+            // the lock held (including writes with an offset, [`append_offset`]), so several
+            // processes appending at once do not overwrite each other
             let regular =
                 regular_fd(&file.borrow()).filter(|_| file.borrow().flags & oflags::O_APPEND == 0);
             let n = match regular {
@@ -4764,15 +4879,17 @@ fn write_bytes(
     }
 }
 
-/// 写、截短普通文件 `ino` 之前去掉它的特权（[`Store::remove_privs`]）：setuid、setgid 位在
-/// 调用者没有 `CAP_FSETID` 时去掉，文件能力总是去掉。
+/// Removes the privileges of regular file `ino` before writing or truncating it
+/// ([`Store::remove_privs`]): the setuid and setgid bits are removed when the caller lacks
+/// `CAP_FSETID`, and file capabilities are always removed.
 fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
     let keep_setid = cx.t.group.borrow().cred.capable(cap::FSETID);
     cx.vfs()?.store().remove_privs(ino, keep_setid)
 }
 
-/// `RLIMIT_FSIZE`：普通文件写到超过限制的位置时只写到限制为止；一个字节都写不了时
-/// 给当前线程发 SIGXFSZ 并返回 EFBIG。返回允许写的字节数。
+/// `RLIMIT_FSIZE`: a write to a regular file past the limit writes only up to the limit; when
+/// not a single byte can be written, sends SIGXFSZ to the current thread and returns EFBIG.
+/// Returns the number of bytes allowed.
 fn fsize_allowed(
     cx: &Cx<'_>,
     f: &OpenFile,
@@ -4797,9 +4914,11 @@ fn fsize_allowed(
     Ok(len.min((limit - pos) as usize))
 }
 
-/// 写 tmpfs 里的普通文件：写到实例满了为止（Linux 的 `shmem_write_begin` 一页页地要，
-/// 要不到时已经写了的照样返回），一页也写不了时 ENOSPC；写在原来的大小以内的不受限制。
-/// 返回允许写的字节数，和写完之后记账要的设备号、写之前的页数（[`tmpfs_resized`]）。
+/// Writing a regular file in tmpfs: writes until the instance is full (Linux's
+/// `shmem_write_begin` asks page by page and returns what was already written when it cannot get
+/// one), ENOSPC when not even a page can be written; writes within the original size are not
+/// limited. Returns the number of bytes allowed, plus the device number and the page count
+/// before the write that the accounting needs afterwards ([`tmpfs_resized`]).
 fn tmpfs_write_room(
     cx: &Cx<'_>,
     f: &OpenFile,
@@ -4831,8 +4950,9 @@ fn tmpfs_write_room(
     ))
 }
 
-/// `node`（普通文件，宿主上是 `host`）在 tmpfs 里时，那个实例的设备号和文件现在的页数：
-/// 改大小之后交给 [`tmpfs_resized`] 记账。
+/// When `node` (a regular file, `host` on the host) is in tmpfs, that instance's device number
+/// and the file's current page count: after the size changes, they go to [`tmpfs_resized`] for
+/// accounting.
 fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<(u64, u64)>, Errno> {
     let Some(dev) = vfs.tmpfs_dev(node) else {
         return Ok(None);
@@ -4841,7 +4961,8 @@ fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<(u6
     Ok(Some((dev, size.div_ceil(TMPFS_PAGE))))
 }
 
-/// tmpfs 里的普通文件改成了 `size` 字节：按页数的差记账（[`tmpfs_size`] 记下的是原来的）。
+/// A regular file in tmpfs became `size` bytes: accounts the difference in pages
+/// ([`tmpfs_size`] recorded the old count).
 fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, size: u64) {
     if let Some((dev, own)) = tmpfs {
         let pages = size.div_ceil(TMPFS_PAGE) as i64 - own as i64;
@@ -4849,9 +4970,10 @@ fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, size: u64) {
     }
 }
 
-/// 在目录 `dir`（经由的挂载和 inode）里新建一个名字（新的 inode，或者硬链接）之前：在 tmpfs
-/// 里时看放不放得下，放不下是 ENOSPC（Linux 的 `shmem_reserve_inode`；`pages` 是长的符号
-/// 链接要的一页）。返回实例的设备号，建好之后交给 [`tmpfs_created`]。
+/// Before creating a name (a new inode, or a hard link) in directory `dir` (the mount reached
+/// through and the inode): in tmpfs, checks whether it fits, ENOSPC when it does not (Linux's
+/// `shmem_reserve_inode`; `pages` is the page a long symlink needs). Returns the instance's
+/// device number, handed to [`tmpfs_created`] once created.
 pub(super) fn tmpfs_reserve(
     vfs: &Vfs,
     (mnt, dir): (MountId, Ino),
@@ -4864,16 +4986,17 @@ pub(super) fn tmpfs_reserve(
     Ok(Some(dev))
 }
 
-/// 建好了 [`tmpfs_reserve`] 放得下的名字：记账。
+/// A name [`tmpfs_reserve`] found room for has been created: accounts it.
 pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
     if let Some(dev) = dev {
         vfs.tmpfs_charge(dev, pages as i64, 1);
     }
 }
 
-/// 删掉目录 `dir` 里的 `name`（unlink、rmdir、被 rename 覆盖）之前：在 tmpfs 里时记下它
-/// 占的，名字一个 inode，删的是最后一个链接时还有它的页（Linux 等最后一次关掉才释放，这里
-/// 删掉时就释放）。删掉之后交给 [`tmpfs_removed`]。
+/// Before deleting `name` in directory `dir` (unlink, rmdir, overwritten by rename): in tmpfs,
+/// records what it takes: one inode for the name, plus its pages when the last link is deleted
+/// (Linux frees them only at the last close; here they are freed at deletion). Handed to
+/// [`tmpfs_removed`] after the deletion.
 fn tmpfs_victim(
     vfs: &Vfs,
     (mnt, dir): (MountId, Ino),
@@ -4894,20 +5017,20 @@ fn tmpfs_victim(
     Ok(Some((dev, pages)))
 }
 
-/// 删掉了 [`tmpfs_victim`] 记下的名字：记账。
+/// The name [`tmpfs_victim`] recorded has been deleted: accounts it.
 fn tmpfs_removed(vfs: &Vfs, victim: Option<(u64, u64)>) {
     if let Some((dev, pages)) = victim {
         vfs.tmpfs_charge(dev, -(pages as i64), -1);
     }
 }
 
-/// 超过 `RLIMIT_FSIZE`：发 SIGXFSZ，返回 EFBIG。
+/// Over `RLIMIT_FSIZE`: sends SIGXFSZ and returns EFBIG.
 fn file_too_big(cx: &Cx<'_>) -> Errno {
     signal::send_to_task(cx.kr(), cx.task, Signal::XFSZ, SigInfo::kernel());
     Errno::EFBIG
 }
 
-/// 截断、预留空间之后的长度不能超过 `RLIMIT_FSIZE`。
+/// The length after truncation or reserving space must not exceed `RLIMIT_FSIZE`.
 fn check_fsize(cx: &Cx<'_>, len: u64) -> Result<(), Errno> {
     if len > cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0 {
         return Err(file_too_big(cx));
@@ -4915,7 +5038,7 @@ fn check_fsize(cx: &Cx<'_>, len: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 从打开文件读到 guest 缓冲区（read、pread、readv）。
+/// Reads from an open file into a guest buffer (read, pread, readv).
 pub(super) fn read_file(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4923,8 +5046,9 @@ pub(super) fn read_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
-    // 终端、管道每次 read 只返回已经就绪的数据，不能为了凑满缓冲区再次阻塞；/dev/zero、
-    // /dev/urandom 与 Linux 一样一次读满（`dd bs=256M` 读到的是整块）
+    // Each read of a terminal or pipe returns only data already ready and must not block again
+    // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
+    // (`dd bs=256M` reads whole blocks)
     let fill = matches!(
         file.borrow().kind,
         FileKind::Regular { .. }
@@ -4945,7 +5069,7 @@ pub(super) fn read_file(
         };
         if k > 0 {
             file.borrow_mut().reads += 1;
-            // 信号驱动的 I/O 由定时器线程检查（check_fasync）：只叫醒它
+            // Signal-driven I/O is checked by the timer thread (check_fasync): just wake it
             if file.borrow().flags & oflags::O_ASYNC != 0 {
                 crate::kernel::signal_later(&cx.shared.timers);
             }
@@ -4954,7 +5078,8 @@ pub(super) fn read_file(
             UserSlice::new(buf.wrapping_add(done as u64), k),
             &chunk[..k],
         ) {
-            // 数据已经读走：与 Linux 一样，已拷贝一部分时返回部分长度
+            // The data has already been consumed: as on Linux, return the partial length when
+            // part of it was copied
             if done == 0 {
                 return Err(e);
             }
@@ -4968,7 +5093,7 @@ pub(super) fn read_file(
     Ok(done as u64)
 }
 
-/// 把 guest 缓冲区写进打开文件（write、pwrite、writev）。
+/// Writes a guest buffer into an open file (write, pwrite, writev).
 pub(super) fn write_file(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -4976,12 +5101,12 @@ pub(super) fn write_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
-    // 缓冲区读不了之前先报 ESPIPE、EBADF
+    // ESPIPE and EBADF are reported before an unreadable buffer
     positional(&file.borrow(), offset)?;
     if !file.borrow().writable() {
         return Err(Errno::EBADF);
     }
-    // write(2) 不跳过长度 0 的写：/dev/kmsg 因此记一条空记录
+    // write(2) does not skip zero-length writes: /dev/kmsg therefore logs an empty record
     if len == 0 && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
         return kmsg_write(cx, file, &[]).map(|n| n as u64);
     }
@@ -5002,7 +5127,7 @@ pub(super) fn write_file(
                     break;
                 }
             }
-            // 已经写出一部分时，像 Linux 一样返回已写的字节数
+            // When part was already written, return the bytes written, as Linux does
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         }
@@ -5013,13 +5138,14 @@ pub(super) fn write_file(
     Ok(done as u64)
 }
 
-/// `O_DSYNC`、`O_SYNC` 打开的普通文件，或者 pwritev2 带 `RWF_DSYNC`、`RWF_SYNC`（`rwf`）：
-/// 写完之后像 fdatasync、fsync 一样等它落盘（Linux 的 generic_write_sync）。数据、长度和
-/// 时间都在宿主的 object 里，交给宿主刷，放开 BKL 等；名字不在其列，Linux 上也要另外
-/// fsync 目录。
+/// Regular files opened with `O_DSYNC` or `O_SYNC`, or pwritev2 with `RWF_DSYNC` or `RWF_SYNC`
+/// (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do (Linux's
+/// generic_write_sync). Data, length and times are all in the host object, so the host flushes
+/// them, waited for with the BKL released; names are not among them, and on Linux the directory
+/// also needs a separate fsync.
 fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
     const O_DSYNC: u32 = 0o10000;
-    const O_SYNC_BIT: u32 = 0o4000000; // __O_SYNC，O_SYNC 是它加上 O_DSYNC
+    const O_SYNC_BIT: u32 = 0o4000000; // __O_SYNC; O_SYNC is it plus O_DSYNC
     const RWF_DSYNC: u32 = 2;
     const RWF_SYNC: u32 = 4;
     let (fd, data_only) = {
@@ -5033,7 +5159,7 @@ fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
         let full = f.flags & O_SYNC_BIT != 0 || rwf & RWF_SYNC != 0;
         (std::os::fd::AsRawFd::as_raw_fd(host), !full)
     };
-    // 打开文件由 file 保活，放锁期间不碰它
+    // The open file is kept alive by file and not touched while the BKL is released
     cx.unlocked(|| appine_hal::fsync(fd, data_only))
         .map_err(Errno)
 }
@@ -5087,7 +5213,7 @@ pub(super) fn sendfile(
                 return Err(e);
             }
         };
-        // 没写出去的部分要还给输入端
+        // The part not written out goes back to the input
         match &mut off {
             Some(o) => *o += wrote as u64,
             None => input.borrow_mut().pos -= (got - wrote) as u64,
@@ -5103,11 +5229,14 @@ pub(super) fn sendfile(
     Ok(done as u64)
 }
 
-/// sendfile、copy_file_range 在两个普通文件之间拷贝时交给宿主内核（[`appine_hal::copy_file`]）：
-/// 数据不经过内核层，也只要一次宿主调用，不持 BKL。`src`、`dst` 为 None 时用并推进文件
-/// 位置；输出 fd 的宿主位置也要用，所以总是像 [`unlocked_io`] 那样占住输出的位置，等的
-/// 时候两个都不占，免得两个方向的拷贝互相等。不适用时（不是两个不同的普通文件、追加写、
-/// 有封印、宿主不支持）返回 None，由调用方逐块读写。
+/// When sendfile and copy_file_range copy between two regular files, the copy is left to the
+/// host kernel ([`appine_hal::copy_file`]): the data does not pass through the kernel layer, and
+/// it takes only one host call, without the BKL. With `src`/`dst` None the file positions are
+/// used and advanced; the output fd's host position is also used, so the output's position is
+/// always taken as [`unlocked_io`] does, and while waiting neither is taken, so copies in the
+/// two directions do not wait for each other. When it does not apply (not two different regular
+/// files, appending writes, seals, unsupported by the host) returns None, and the caller reads
+/// and writes block by block.
 fn copy_regular(
     cx: &mut Cx<'_>,
     input: &FileRef,
@@ -5123,7 +5252,8 @@ fn copy_regular(
         }
         (regular_fd(&i)?, regular_fd(&o)?, o.ino()?)
     };
-    // 封印要逐块检查；tmpfs 要逐块记账、写满了停下（write_bytes）
+    // Seals must be checked block by block; tmpfs must be accounted block by block and stop when
+    // full (write_bytes)
     let in_tmpfs = cx.vfs().is_ok_and(|v| {
         v.tmpfs_dev(&Node::Store(output.borrow().mnt, ino))
             .is_some()
@@ -5175,7 +5305,8 @@ fn copy_regular(
         request_wake_locks();
     }
     match r.map_err(Errno) {
-        // 宿主不支持这一对文件：调用方逐块读写
+        // The host does not support this pair of files: the caller reads and writes block by
+        // block
         Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP | Errno::EXDEV) => None,
         Err(e) => Some(Err(e)),
         Ok(n) => {
@@ -5188,8 +5319,9 @@ fn copy_regular(
     }
 }
 
-/// copy_file_range：在两个普通文件之间拷贝，不经过 guest 内存。偏移指针为空时使用并
-/// 推进文件位置，否则使用并更新指针指向的偏移。
+/// copy_file_range: copies between two regular files without passing through guest memory. A
+/// null offset pointer uses and advances the file position; otherwise the offset it points at
+/// is used and updated.
 pub(super) fn copy_file_range(
     cx: &mut Cx<'_>,
     fd_in: i32,
@@ -5228,7 +5360,7 @@ pub(super) fn copy_file_range(
     let (mut src, mut dst) = (read_off(off_in)?, read_off(off_out)?);
     let same = input.borrow().ino() == output.borrow().ino();
     if same {
-        // 同一个文件里的两段不能重叠
+        // Two ranges in the same file must not overlap
         let s = src.unwrap_or(input.borrow().pos);
         let d = dst.unwrap_or(output.borrow().pos);
         if s < d + len as u64 && d < s + len as u64 {
@@ -5276,7 +5408,7 @@ pub(super) fn copy_file_range(
     Ok(done as u64)
 }
 
-/// posix_fadvise：只影响性能，检查参数之后忽略。
+/// posix_fadvise: affects only performance; ignored after the arguments are checked.
 pub(super) fn fadvise64(cx: &mut Cx<'_>, fd: i32, len: i64, advice: i32) -> SysResult {
     let file = cx.fds().get(fd)?;
     if matches!(file.borrow().kind, FileKind::Pipe(_) | FileKind::Socket(_)) {
@@ -5313,9 +5445,10 @@ pub(super) fn pwrite(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64
     write_file(cx, &file, buf, len, offset)
 }
 
-/// 带偏移的写在 `O_APPEND` 的普通文件上照样写到末尾，文件位置不变（Linux 的
-/// generic_write_checks，pwrite(2) 的 BUGS 一节），只有 pwritev2 的 `RWF_NOAPPEND` 写在给的
-/// 偏移处。这样的写持着 BKL 做（[`write_bytes`]），与别的追加不会写到同一个位置。
+/// A write with an offset on an `O_APPEND` regular file still writes at the end, leaving the
+/// file position unchanged (Linux's generic_write_checks, the BUGS section of pwrite(2)); only
+/// pwritev2's `RWF_NOAPPEND` writes at the given offset. Such writes are done with the BKL held
+/// ([`write_bytes`]), so they never write at the same place as other appends.
 fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
     let f = file.borrow();
     match &f.kind {
@@ -5326,7 +5459,7 @@ fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Err
     }
 }
 
-/// 读取 iovec 数组。
+/// Reads an iovec array.
 fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errno> {
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);
@@ -5346,8 +5479,8 @@ fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errn
     Ok(out)
 }
 
-/// readv、writev 和带偏移的变体：按顺序处理每个 iovec，遇到不完整的一段就停下。
-/// `offset` 为 None 时使用并推进文件位置。
+/// readv, writev and their positional variants: handle each iovec in order, stopping at an
+/// incomplete one. With `offset` None the file position is used and advanced.
 pub(super) fn vectored(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -5357,14 +5490,14 @@ pub(super) fn vectored(
     write: bool,
 ) -> SysResult {
     let file = cx.fds().get(fd)?;
-    // /dev/kmsg 的 write_iter：整个 writev 是一条记录（systemd 这样写日志）
+    // /dev/kmsg's write_iter: the whole writev is one record (systemd logs this way)
     if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
         let vecs = iovecs(cx, iov, count)?;
         let total: usize = vecs.iter().map(|&(_, len)| len).sum();
         if !file.borrow().writable() {
             return Err(Errno::EBADF);
         }
-        // writev 总长为 0 时不调用文件的写（do_iter_write）
+        // A writev with total length 0 does not call the file's write (do_iter_write)
         if total == 0 {
             return Ok(0);
         }
@@ -5410,7 +5543,8 @@ pub(super) fn writev(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysRes
     vectored(cx, fd, iov, count, None, true)
 }
 
-/// preadv、pwritev；`flags` 不为 None 时是 preadv2、pwritev2，偏移为 -1 表示使用文件位置。
+/// preadv, pwritev; with `flags` not None, preadv2 and pwritev2, where an offset of -1 means the
+/// file position.
 pub(super) fn pvectored(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -5420,9 +5554,10 @@ pub(super) fn pvectored(
     flags: Option<u32>,
     write: bool,
 ) -> SysResult {
-    // RWF_HIPRI 不影响结果，RWF_DSYNC、RWF_SYNC 写完等它落盘（[`write_sync`]）；RWF_NOAPPEND
-    // （Linux 6.9 起，musl 的 pwrite 用它）让带偏移的写在 O_APPEND 的文件上也写在给的偏移处；
-    // RWF_NOWAIT、RWF_APPEND 不支持，与 Linux 一样，不认识的标志都是 EOPNOTSUPP
+    // RWF_HIPRI does not affect the result; RWF_DSYNC and RWF_SYNC wait for the write to reach
+    // disk ([`write_sync`]); RWF_NOAPPEND (since Linux 6.9, used by musl's pwrite) makes a write
+    // with an offset on an O_APPEND file also write at the given offset; RWF_NOWAIT and
+    // RWF_APPEND are not supported, and as on Linux every unknown flag is EOPNOTSUPP
     const RWF_NOAPPEND: u32 = 0x20;
     const RWF_SUPPORTED: u32 = 0x7 | RWF_NOAPPEND;
     let mut offset = match flags {
