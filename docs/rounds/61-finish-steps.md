@@ -19,11 +19,8 @@
   - 原来的 `finish_group_after_bug` 删掉了：它做的就是现在的第 7 步和末尾的唤醒。`task.rs` 外面那层兜底只剩读进程状态的几行。
 - **测试钩子**：syscall `0xa991` 新增第 7 种，这个进程结束时第 n 步 panic（`bug::trap_finish`，没有测试钩子的构建里什么也不做）。
 - **测试**：
-  - 新的 rootfs 测试 `each_step_of_finishing_a_process_survives_kernel_bugs`（`tests/guest/finish.c`，要有控制终端，拷进仓库里运行）。结束的进程 v 是会话组长、有控制终端，退出之前留下：AIO 上下文和用 SEM_UNDO 加过的信号量；前台进程组里的子进程 a，登记了 PDEATHSIG，被 v 用 SEIZE 跟踪；自己一个进程组、停住的子进程 s。
-  - 第 0（不出错）到第 9 步出错各跑一遍。对出错的那一步之外的每一件事都要检查：父进程回收 v、退出码不变；aio-nr 和信号量恢复；a 收到控制终端的 SIGHUP 和 PDEATHSIG，父进程是 1，`TracerPid` 是 0；s 收到 SIGHUP 之后继续运行；stderr 里有九步的报告。该做的没做、卡住时由 SIGALRM 结束测试。
-  - 变异检验：一步出错时跳过后面所有步骤（原来的做法）时，第 1 步出错之后就卡住；第 6 步出错时不退回交给父进程的话，父进程等不到 v。
-  - cargo test（198 个）、clippy（Android 一侧打开和不打开 `test-hooks` 各一遍）、两层的 20 组差分测试通过。LTP 的 syscall 测试 955 个通过（上次 958）：多出来的失败 epoll_pwait03、futex_wait05、select02 都是检查睡眠精度的[偶发项](../milestones.md#已知的偶发失败)，用上一轮的二进制在同一时刻交替重跑两次，两边都失败（futex_wait 睡得太久）。
-- **性能**：正常路径上多了九次 `catch_unwind`（不 panic 时没有开销）和九次 `bug::trap_finish`（release 构建里是空函数）。和上一轮的二进制交替运行 5 轮、取最短（`target/mem/spawnab61.sh`，含 appine-run 的启动）：shell 起 600 个进程（`ls`、`cat | wc` 循环 200 次）264 → 262 毫秒，2000 个子 shell（fork 之后退出、wait）590 → 593 毫秒，都在噪声之内。
+  - 新的 rootfs 测试 `each_step_of_finishing_a_process_survives_kernel_bugs`（`tests/guest/finish.c`，要有控制终端）：结束的进程是会话组长，退出之前留下 AIO 上下文、SEM_UNDO 的信号量、登记了 PDEATHSIG 并被它跟踪的前台子进程、自己一个进程组的停住的子进程；不出错和第 1 到第 9 步出错各跑一遍，检查出错的那一步之外的每一件事都做了。该做的没做、卡住时由 SIGALRM 结束测试。
+- **性能**：正常路径上多了九次 `catch_unwind`（不 panic 时没有开销）和九次 `bug::trap_finish`（release 构建里是空函数），起进程的开销在噪声范围内。
 
 **推迟项**：
 

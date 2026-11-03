@@ -39,23 +39,11 @@
   | pread | 226 / 246 / 248 | 427 / 440 / 630 |
 
   装了过滤器之后，快速路径上的系统调用改走持 BKL 的路径：futex 唤醒慢一倍，fstatat 慢四成。vDSO 里读时钟虽然不检查，也一样进了持 BKL 的路径。解释器每条指令约 4.5 纳秒，而 libseccomp 生成的过滤器是一串线性比较，像 docker 默认规则那样放行几百个系统调用的，每次系统调用要运行几百条。
-- **测试**：新的差分测试 `seccomp`（第 20 组）比对：
-  - `GET_NOTIF_SIZES`、`GET_ACTION_AVAIL`、`actions_avail`、`actions_logged`，status 里的三行；
-  - 严格模式：read、write、exit 可以，getpid、exit_group、prctl 被结束；
-  - 程序的检查：没有 `no_new_privs`、空的、4097 条、各种不合法的程序和标志组合，七种程序（RET K、RET A、除以 X、JSET、大常数和两种分支的 JEQ）各能装多少条；
-  - 各种动作：按参数过滤、同样严格时取最新的数据、TRAP 的 siginfo 和改 x0、SIGSYS 被屏蔽或忽略时的 TRAP、别的线程里的 KILL_PROCESS、KILL_THREAD（只有一个线程、主线程被结束之后另一个线程 exit）；
-  - 快速路径上的 futex、nanosleep、clock_nanosleep、clock_gettime、clock_getres、gettimeofday、newfstatat、statx 被过滤，经由 vDSO 的 clock_gettime 不被过滤；
-  - 继承（fork 之后 exec）和 TSYNC（另一个线程的链分叉之后失败、`TSYNC_ESRCH`）；
-  - ptrace：`PTRACE_EVENT_SECCOMP` 的事件消息和 `OP_SECCOMP`、改编号、跳过并给返回值、PTRACE_SYSCALL 时入口、seccomp、出口三次停止的顺序、PTRACE_CONT 到 seccomp 的停止再改用 PTRACE_SYSCALL 时出口的停止（照常执行的和跳过的）、跟踪者关掉选项之后 ENOSYS、没有 `CAP_SYS_ADMIN` 时的 `SUSPEND_SECCOMP` 和 `GET_FILTER`；
-  - 通知 fd：RECV、SEND、ID_VALID、poll，回答值、错误码、CONTINUE，被信号打断之后重发，回收之后 POLLHUP，`WAIT_KILLABLE_RECV`，关闭通知 fd；
-  - ADDFD：不存在的 id、不认得的标志、没有 SETFD 时给 newfd、O_CLOEXEC 以外的 newfd_flags、坏的 srcfd、更短和更长的结构体（多出的部分不是零时 E2BIG），装进去的 fd 能用，SETFD 换掉已有的 fd 并带 O_CLOEXEC、SEND 同时回答，对方的 `RLIMIT_NOFILE` 之外 SETFD 是 EBADF、装满之后 EMFILE；
-  - `strace -f --seccomp-bpf` 跟踪 shell 起的两个进程的 openat、close。
+- **测试**：新的差分测试 `seccomp` 比对：报告可用动作和状态的接口，严格模式，程序的检查和一条链的容量，各种动作，快速路径上的系统调用被过滤、经由 vDSO 的 clock_gettime 不被过滤，继承和 TSYNC，ptrace（`PTRACE_EVENT_SECCOMP`、改编号和跳过、出口的停止），通知 fd 和 ADDFD，`strace -f --seccomp-bpf`。
 
-  动作那一节把 `RLIMIT_CORE` 设成 1，两边都不写 core：`core_pattern` 是管道时（CI 的 Ubuntu 宿主上是 apport）Linux 不管限制是不是 0 都交给它，只有 1 不交，写文件时不到一页也不写。原来设成 0，CI 上原生一侧的 SIGSYS 都带着 core。docker 里的 root 没有 `CAP_SYS_ADMIN`，测试开头两边都先去掉它，所以要特权的成功路径（`GET_FILTER`、写 `actions_logged`、`SUSPEND_SECCOMP`）没有比对。快速路径、ADDFD、改用 PTRACE_SYSCALL 和 strace 这几节是审查时补的：原来过滤的都是本来就持 BKL 的系统调用，快速路径漏看 `seccomp_on` 时过滤器被绕过也查不出。审查时还用一个临时用例比对过几处，两层都与原生一致，没有放进差分测试（要写 core，原生一侧写不写取决于宿主的 `core_pattern`，见[core dump](43-coredump.md)那一篇）：主线程退出之后剩下的唯一线程触发 KILL_THREAD 时按结束进程处理、写 core，TRAP 时 SIGSYS 被忽略也写 core，线程各自退出时进程的退出码是最后一个线程的，`Seccomp_filters` 跟着 fork。
+  动作那一节把 `RLIMIT_CORE` 设成 1，两边都不写 core：`core_pattern` 是管道时（CI 的 Ubuntu 宿主上是 apport）Linux 不管限制是不是 0 都交给它，只有 1 不交，写文件时不到一页也不写。docker 里的 root 没有 `CAP_SYS_ADMIN`，测试开头两边都先去掉它，所以要特权的成功路径（`GET_FILTER`、写 `actions_logged`、`SUSPEND_SECCOMP`）没有比对。快速路径、ADDFD、改用 PTRACE_SYSCALL 和 strace 这几节是审查时补的：原来过滤的都是本来就持 BKL 的系统调用，快速路径漏看 `seccomp_on` 时过滤器被绕过也查不出。要写 core 的几处（只剩一个线程时的 KILL_THREAD、SIGSYS 被忽略时的 TRAP、进程的退出码、`Seccomp_filters` 跟着 fork）只用临时用例比对过，两层都与原生一致，没有放进差分测试（原生一侧写不写取决于宿主的 `core_pattern`，见[core dump](43-coredump.md)那一篇）。
 
-  单元测试新增程序的检查和执行。变异检验：快速路径不看 `seccomp_on` 时，那 8 个系统调用都绕过了过滤器，`seccomp` 只有快速路径一节不同（补测之前查不出）；ADDFD 不设 O_CLOEXEC 时 SETFD 那一行不同；修改出口的停止之前的二进制上，改用 PTRACE_SYSCALL 那一节和 strace 那一段不同。cargo test（196 个）、clippy、两层的 20 组差分测试通过（改出口的停止之后重跑了两层的 seccomp、ptrace 和 Tier 1 的 gdb）。
-
-  LTP 的 syscall 测试 958 个通过（上一轮 957）：`scripts/ltp` 给测试看的内核配置加上 `CONFIG_SECCOMP`、`CONFIG_SECCOMP_FILTER`，原来因此跳过的 seccomp01 通过（18 项），prctl02 照常通过，这两个是 LTP 里仅有的看这两项配置的测试。全量是改出口的停止之前跑的（957 个，与上一轮相同），那处修改只影响有 seccomp 的线程，之后重跑了这两个。nanosleep01 这次通过，shmctl01 这次失败，都是[偶发项](../milestones.md#已知的偶发失败)。
+  单元测试新增程序的检查和执行。LTP：`scripts/ltp` 给测试看的内核配置加上 `CONFIG_SECCOMP`、`CONFIG_SECCOMP_FILTER`，原来因此跳过的 seccomp01 通过，prctl02 照常通过，这两个是 LTP 里仅有的看这两项配置的测试。
 
 **推迟项**：
 

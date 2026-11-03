@@ -9,10 +9,9 @@
 - **改动**：`Runs` 记下每段所在的 VMA，只在同一个 VMA 里接段；`repossess` 按那个 VMA 的权限恢复。fork 时借出（`Mm::lend`）本来就逐个 VMA 处理，只是跟着改了接口。
 - **怎么找到的**：core 文件显示崩在 musl 的 `__funcs_on_exit` 里，读的那一页是 malloc 早先 mmap 的。`APPINE_STRACE` 里 rustc 自己没有再碰过那一页。于是给 engine 的 `Mmu` 的 map、unmap、protect 临时加上监视：碰到指定的页时打印调用栈。打出来的是子进程 execve 销毁地址空间时，经由 `Mm::drop` 进入父进程的 `repossess`，执行了 `protect 0x7fffbf7e2000+0xf000 prot=0`。监视的代码查完就撤掉了。
 - **测试**：
-  - 差分测试 `fork` 新增一节：一次 mmap 用 mprotect 切成保护页、可写、只读三段；另一次 mmap 切成可写、只读两段；再像信号栈那样，一段开头是没写过的保护页的映射，接在上一段的下面。写过之后 fork，子进程退出，父进程逐页试读写（SIGSEGV 处理函数 siglongjmp 回来），结果与原生相同。上一轮的二进制上，只读的页可写，最后那种排法下后面所有的页都不能访问。
-  - 单元测试 `returned_loans_restore_each_vma_its_own_protection`：保护页、可写、只读三个 VMA 写过之后 fork，子进程的地址空间销毁之后，父进程的三页各是各的权限。接段时不看 VMA 的话它失败。
-  - rustc 的 release 编译连续 10 次：之前 10 次都崩，现在都成功；普查的 `rust` 负载通过。
-  - cargo test（199 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 955 个通过（与[进程结束的每一步分别兜住](61-finish-steps.md)那一轮相同）：epoll_pwait03、select02 这次通过，getrusage03 这次跳过，pselect01_64 这次失败，都是检查睡眠精度或者要求空闲内存的[偶发项](../milestones.md#已知的偶发失败)；pselect01_64 用上一轮的二进制在同一时刻交替重跑 3 次，两边都失败（pselect 睡得太久）。
+  - 差分测试 `fork` 新增一节：几次 mmap 用 mprotect 切成权限不同的几段（包括像信号栈那样开头是保护页、接在上一段下面的），写过之后 fork，子进程退出，父进程逐页试读写，结果与原生相同。
+  - 单元测试 `returned_loans_restore_each_vma_its_own_protection`：几个权限不同的 VMA 在子进程还页之后各是各的权限。
+  - rustc 的 release 编译连续 10 次都成功（之前每次都崩），普查的 `rust` 负载通过。
 - **性能**：只是接段时多比较一次 VMA 的起点，段只在 VMA 的边界多断开，fork 和还页的开销不变，没有另外量。
 
 **推迟项**：无。

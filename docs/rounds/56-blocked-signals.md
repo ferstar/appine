@@ -9,23 +9,8 @@
 
 - **信号的通道**（`wake::SIGNAL`）：被屏蔽的信号挂起时只请求这个通道。听它的只有三类：sigtimedwait；signalfd 的阻塞读（另外登记 signalfd 自己，改掩码时请求它）；poll、epoll（包括嵌套的 epoll，以及外层边沿触发、只等新事件的 epoll）关注了 signalfd 的等待者，与关注了 pidfd 才听子进程的通道一样。没有被屏蔽的信号照旧直接叫醒挑中的线程。
 - 仍请求所有通道的：SIGCONT 让停住的进程继续、SysV IPC、AIO 完成、关闭控制台。
-- **效果**：见上表。标准基准与上一轮的二进制交替各跑两次，都在噪声范围内：shell 0.23–0.24 秒对 0.23–0.24 秒，gcc 2.21–2.22 对 2.25–2.42，python 1.33–1.35 对 1.35–1.64，go build 6.01–6.02 对 6.01–6.13，Maven、Gradle 的热构建 5.83–5.89、1.35–1.39 对 5.81–5.86、1.33–1.38（前面是这一轮；上一轮的 2.42、1.64 都出在第一次）。
-- **测试**：差分测试 `wakeups` 的空闲部分，别的进程的动作加了两项：给自己发被屏蔽的 SIGUSR1 再用 sigwaitinfo 取走 200 次，屏蔽着 SIGCHLD 起子进程 30 次。
-
-  叫醒部分加了 8 项：
-  - sigtimedwait 分别被另一个进程的 kill、本进程另一个线程的 pthread_kill（发给线程、被它屏蔽）、POSIX 定时器的信号、子进程退出的 SIGCHLD 叫醒；
-  - 另一个进程 kill 之后，signalfd 的阻塞读、epoll、嵌套的 epoll 醒来；
-  - 外层以边沿触发关注内层 epoll，内层关注 signalfd，已经报告过一次之后又来了一个信号，再报告一次。
-
-  父进程先屏蔽这些信号，让子进程继承，免得父进程发来的信号赶在子进程屏蔽之前到达。
-
-  变异检验：
-  - 上一轮的二进制上，12 个空闲的进程都被叫醒；
-  - sigtimedwait 和 signalfd 的读不听信号的通道、只等新事件的嵌套 epoll 不看 signalfd：四项 sigtimedwait、signalfd 的读、边沿那一项等不到；
-  - poll、epoll 有 signalfd 时也不听：epoll 的三项等不到；
-  - 发给线程、被它屏蔽的信号不请求：pthread_kill 那一项等不到；
-  - 被所有线程屏蔽的进程信号不请求：其余七项等不到。
-  - cargo test（193 个）、clippy、Android clippy、两层的 18 组差分测试通过。LTP 的 syscall 测试 958 个通过（上一轮 957），多出的 shmctl01 是[偶发项](../milestones.md#已知的偶发失败)。
+- **效果**：见上表。标准基准都在噪声范围内。
+- **测试**：差分测试 `wakeups` 的空闲部分，别的进程的动作加了给自己发被屏蔽的 SIGUSR1 再用 sigwaitinfo 取走、屏蔽着 SIGCHLD 起子进程；叫醒部分加了 8 项：sigtimedwait 被各种来源的信号叫醒，signalfd 的阻塞读、epoll、嵌套的 epoll 醒来，外层边沿触发关注的内层 epoll 又来了信号再报告一次。父进程先屏蔽这些信号，让子进程继承，免得父进程发来的信号赶在子进程屏蔽之前到达。
 
 **推迟项**：
 

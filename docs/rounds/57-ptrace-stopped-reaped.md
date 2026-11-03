@@ -15,14 +15,8 @@
 
   现在 `ptrace::group_finished` 在这种情况下推迟交给父进程：进程是僵尸，记下 `exit_tracer`，父进程的 wait 跳过它。跟踪者 wait 取走（WNOWAIT 不算）或者退出时，再交给父进程（`process::tracer_released`）。父进程先退出了的话，这个僵尸进程交给 init，跟踪者取走之后由 init 回收。跟踪者 wait 取走整个进程的结束时，也与 Linux 一样报告它的资源用量（原来是 0）。
 - **测试**：差分测试 `ptrace` 新增两段。
-  - 子进程在自己的进程组里 raise(SIGTSTP)，父进程用 WUNTRACED 取走停止事件之后跟踪它。ATTACH 时先看到 SIGTSTP 的 group-stop（GETSIGINFO 是 EINVAL），再看到 SIGSTOP，不投递它，子进程照常执行到退出。SEIZE 时是 `PTRACE_EVENT_STOP`、siginfo 的 signo 是 SIGTSTP，PTRACE_LISTEN、SIGCONT 之后再报告一次，然后是 SIGCONT 的信号投递停止。
-  - 祖父进程跟踪孙进程（Yama 也允许祖先跟踪），孙进程退出。跟踪者用 waitid 的 WNOWAIT 看到它结束时，父进程 WNOHANG 得到 0、SIGCHLD 没有挂起；跟踪者取走之后，父进程阻塞的 waitpid 才返回，SIGCHLD 挂起。另一个祖父进程看到孙进程结束、没取走就退出了，父进程阻塞的 waitpid 随之返回。
-
-  变异检验：
-  - 上一轮的二进制上，两段的每一项都与原生不同：报告 SIGSTOP；父进程先回收了，跟踪者退出之后父进程的 waitpid 是 ECHILD；
-  - 只记停止信号、不改投递循环：ATTACH 那一项先看到 SIGSTOP、后看到 SIGTSTP。
-
-  cargo test（193 个）、clippy、Android clippy、两层的 18 组差分测试通过。LTP 的 syscall 测试 957 个通过（上一轮 958），少的 getrusage03 这次跳过了，是[偶发项](../milestones.md#已知的偶发失败)（全量并发时可用内存不够）。
+  - 父进程取走停止事件之后跟踪停住的子进程，ATTACH、SEIZE 时报告的信号和顺序。
+  - 祖父进程跟踪孙进程（Yama 也允许祖先跟踪），跟踪者取走之前、之后和没取走就退出时，父进程的 wait 和 SIGCHLD。
 
 **推迟项**：
 

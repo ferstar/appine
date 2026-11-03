@@ -6,7 +6,7 @@
 - **sigsuspend 里的屏蔽字**：记下的推迟项是"GETSIGMASK 不报告 sigsuspend 临时换掉的屏蔽字"，量下来正相反：Linux 在 `TIF_RESTORE_SIGMASK` 时读的是 `saved_sigmask`，也就是原来的屏蔽字，appine 读的是临时的。PTRACE_SETSIGMASK 在 Linux 上还会清掉这个标记（`clear_tsk_restore_sigmask`），帧里保存的、处理函数返回后恢复的就是跟踪者设的，appine 原来仍恢复原来的。`saved_sigmask` 从线程私有的 TaskState 挪到 `Task` 上（`Cell`），跟踪者能读能清，GETSIGMASK、SETSIGMASK 照 Linux 改。
 - **`/proc/<pid>/mem` 跨 execve**：原来按 pid 每次读写现找地址空间，进程 execve 之后旧的 fd 读写的是新程序。Linux 打开时拿住那个 mm，execve 之后它没有用户了，读写得到 EOF。现在打开时记下地址空间的弱引用（`FileKind::Proc::mm`），释放了就是 EOF；重新打开拿到新的。
 - **打开时要能跟踪**：原来只有 mem 检查（`PTRACE_MODE_ATTACH`），auxv 不检查。Linux 的 auxv、environ、maps、smaps、smaps_rollup、pagemap 都在打开时要求能以只读方式跟踪（`proc_mem_open`，`PTRACE_MODE_READ`），同一个用户、不可 dump（`PR_SET_DUMPABLE` 为 0、setuid 程序）的进程打不开；原生上量了 auxv、environ、mem、maps 都是 EACCES，appine 原来 auxv、environ、maps 都能打开。现在这几项一起检查，规则与 ptrace 的相同。
-- **测试**：差分测试 `ptrace` 新增两段：带着信号单步（停在处理函数入口、`si_code` 5，再单步到第二条），sigsuspend 里停住时 GETSIGMASK 读到原来的屏蔽字、SETSIGMASK 之后处理函数返回时屏蔽字是跟踪者设的；子进程 execve 之后旧的 mem fd 读到 EOF、重新打开可以，同一个用户、不可 dump 的进程的 auxv、environ、mem、maps 打不开。变异检验：改动之前的二进制上两段都失败。cargo test（186 个）、clippy、Android clippy、两层的 17 组差分测试通过。LTP 的 syscall 测试 957 个通过（与上一轮相同），shmctl01 这次失败、times03 这次通过，都是[偶发项](../milestones.md#已知的偶发失败)。
+- **测试**：差分测试 `ptrace` 新增两段：带着信号单步、sigsuspend 里的 GETSIGMASK 和 SETSIGMASK；execve 之后旧的 mem fd，不可 dump 的进程的 auxv、environ、mem、maps 打不开。
 
 **推迟项**：
 

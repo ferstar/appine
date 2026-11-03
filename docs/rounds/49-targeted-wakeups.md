@@ -8,10 +8,9 @@
 - **关闭文件不再广播**：原来关闭 PTY、epoll、inotify、signalfd、pidfd、AF_UNIX socket 都请求文件类的唤醒，现在只有宿主 socket、POSIX 消息队列和加过 flock、OFD 锁、租约的文件还这样，PTY、AF_UNIX socket 的另一方由 `PtyEnd`、`UnixSocket` 按对象叫醒。fd 表析构（进程退出）原来总是广播，让等记录锁的线程重新检查，现在只在加过 POSIX 记录锁时才广播（`FdTable::holds_locks`，fork 出来的表不继承）：原来每个进程退出都把所有读着管道、停在 poll 里的线程叫醒一遍。
 - **`timerfd_settime` 不叫醒等它的线程**（bug）：另一个线程或者进程正带着原来的到期时刻（或者没有到期时刻）在 epoll_wait、read 里等这个 timerfd 时，新设的时刻不生效，要等别的修改顺带叫醒它。原来那个广播多，几乎总会被顺带叫醒，没被发现；改成按对象之后就必须请求。现在请求 timerfd 的对象。
 - **AIO 的 resfd**：请求完成时给 eventfd 的计数加一，原来没有算作一次到达，`EPOLLET` 的关注不再触发（[epoll 的边沿](42-epoll-edges.md)漏掉的一处），现在算。
-- **效果**：上面的测量，空等的进程被叫醒 0 次，socketpair 的来回 31–32 微秒、管道 32–33 微秒，与没有空等的进程时（30–33 微秒）相同。标准基准（shell、git、gcc、python、apk、go build、Maven 和 Gradle 的热构建）与上一轮的二进制交替各跑两次，都在噪声范围内（go build 6.26–6.31 秒对 6.16–6.23 秒）：这些负载里没有空等着的 poll、epoll 进程。
-- **测试**：新的差分测试组 `wakeups`（第 18 组）。一半是空闲的等待者：8 个进程分别在 epoll（eventfd、timerfd）、poll（管道、AF_UNIX 数据报）和阻塞的读（AF_UNIX 流、PTY、eventfd、inotify）里等自己的对象，其间别的进程用管道、socketpair、eventfd、PTY 来回读写，起、结束 30 个进程，反复 epoll_ctl、timerfd_settime，在被别的 inotify 实例监视的目录里建、删文件，空闲的进程的自愿上下文切换次数都不变（原生如此）。另一半是 20 种真正的事件叫醒另一个进程里等着的线程：AF_UNIX 流的 poll、read、写满之后的 send、对方 shutdown、对方关闭，数据报的 poll、read，accept，backlog 满时的 connect，PTY 从设备的 read、主设备的 poll，eventfd 的 read 和 epoll，inotify 的 poll 和 read，timerfd 在等待开始之后才设置时的 read 和 epoll，poll 一个 epoll 时往里加就绪的文件，管道的 poll，pidfd 的 poll；2 秒之内醒来才算（原生约 0.1 秒）。变异检验：上一轮的二进制上 8 个空闲的进程都被叫醒，timerfd 的两项要到 3 秒的 SIGALRM 才醒；只让 poll 不登记 AF_UNIX socket 的对象，三项 AF_UNIX 的 poll 超时。单元测试新增 epoll（含嵌套的 epoll、eventfd、AF_UNIX socket）等待时登记的对象。
-  - cargo test（190 个）、clippy、Android clippy、两层的 18 组差分测试通过。LTP 的 syscall 测试 956 个通过（上一轮 957）：futex_wait05 这次失败，单独重跑 3 次都失败，上一轮的二进制同样失败，量到睡 1 毫秒要 1.6 毫秒，是虚拟机这时的计时延迟（[偶发项](../milestones.md#已知的偶发失败)）。
-  - 全量运行之后补上：边沿触发的关注报告过挂断之后，等待时不再等它的宿主 fd，但仍登记它的对象（PTY 重新打开从设备之后还会来事件）。补完重跑了 cargo test 和两层的 `epoll`、`wakeups` 组。
+- **效果**：上面的测量，空等的进程被叫醒 0 次，socketpair 的来回 31–32 微秒、管道 32–33 微秒，与没有空等的进程时（30–33 微秒）相同。标准基准（shell、git、gcc、python、apk、go build、Maven 和 Gradle 的热构建）都在噪声范围内：这些负载里没有空等着的 poll、epoll 进程。
+- **测试**：新的差分测试组 `wakeups`。一半是空闲的等待者：8 个进程在 epoll、poll 和阻塞的读里等自己的对象，其间别的进程读写各种文件、起结束进程、epoll_ctl、timerfd_settime、建删被监视的文件，空闲的进程的自愿上下文切换次数都不变（原生如此）。另一半是 20 种真正的事件叫醒另一个进程里等着的线程，2 秒之内醒来才算。单元测试新增 epoll 等待时登记的对象。
+  - 全量运行之后补上：边沿触发的关注报告过挂断之后，等待时不再等它的宿主 fd，但仍登记它的对象（PTY 重新打开从设备之后还会来事件）。
 
 **推迟项**：
 

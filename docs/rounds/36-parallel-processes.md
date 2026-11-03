@@ -24,7 +24,7 @@
 
 剩下的差距主要是 BKL 本身：现在每起一个进程持锁约 63 微秒（clone 17、execve 3 次合计 14、exit_group 3 次合计 10、缺页等 8），4 个同时跑时锁有六成时间有人拿着；clone 复制地址空间要几次宿主 mmap，同样要等 mmap_lock。再往下要拆 BKL（比如地址空间的操作改用每个 mm 自己的锁），不是小改动。
 
-- **测试**：cargo test（174 个）、clippy 和 Android clippy、两层的 14 组差分测试都通过。LTP 的 syscall 测试全量并发时 943 个通过（上一轮 944），getrusage01–04 都通过。唯一的不同是[偶发项](../milestones.md#已知的偶发失败) shmctl01（HEAD 的二进制单独跑 8 次也失败 3 次）；中间一次全量运行 futex_wait05 也失败过。
+- **测试**：没有新增用例。
 
 **推迟项**：
 

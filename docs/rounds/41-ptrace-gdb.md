@@ -12,8 +12,8 @@
 - **`/proc/<pid>/task/<tid>/`** 下补上与进程相同的项（maps、smaps、mem、auxv、cmdline、environ、statm、mounts、mountinfo、cwd、exe、root）：gdb 读线程的 maps 和 mem。
 - **硬件断点和观察点**：`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 仍然报告 0 个槽，gdb 用软件的：断点写 brk，观察点每条指令单步之后比较。
 - gdb 下断点、run、bt、print、next、finish、软件观察点、stepi、`x/i`、`catch syscall`、多线程程序的断点和 `info threads`，输出与原生 Linux 一致（差分测试，两个执行层）。另外在 appine 上试过（没有和原生对比）：`gdb -p` 挂到阻塞在系统调用里的 sleep、取 bt 再 detach，sleep 照常结束；python 收到 SIGSEGV 时 gdb 停下并给出栈。
-- **性能**：上一轮的二进制和这一轮的交替跑，shell 起进程 5 次的总和 0.88–0.91 秒对 0.86–0.89 秒，`git status`、python 循环不变。
-- **测试**：新的差分测试 `gdb`：一个循环程序上的断点、单步、看变量、软件观察点、stepi，先执行过（已经翻译）再下的断点，多线程程序上的断点，`catch syscall writev`（musl 的 stdio 用的是 writev）；加载地址、pid 归一化，两边都用软件观察点（`set can-use-hw-watchpoints 0`，原生有硬件观察点）。差分测试 `ptrace` 新增：PTRACE_POKETEXT 在已经翻译过的函数上写 brk，命中之后恢复原来的指令再单步四条，经由 `/proc/<pid>/mem` 读写断点，单步 svc，对只读的共享映射强制写入是 EIO，auxv 的 `AT_ENTRY`、`AT_PAGESZ`。变异检验：去掉强制写入之后的翻译作废，两组都失败（先执行过的函数上的断点不起作用）；最初的用例只在代码还没执行过时下断点，抓不到这个变异，所以加了"先执行过"的场景。guest 测试 `posix.c` 的 ptrace 一项新增单步。用 Ubuntu 24.04 的 gcc 13 按 build.rs 的参数编译引擎（-O3、-Werror）。cargo test（178 个）、clippy、Android clippy、两层的 16 组差分测试通过。LTP 的 syscall 测试 952 个通过（上一轮 950），变化的 futex_wait05、getrusage03、shmctl01（这次通过）和 mmap21_02（这次失败）都是[偶发项](../milestones.md#已知的偶发失败)。mmap21_02 这次的日志查出了原因：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 _02 是同一个程序，在各自的 appine-run 里都是 pid 2，并发运行时共用仓库的 `/dev/shm`，一个删掉了另一个的文件；单独重跑 5 次都通过。
+- **性能**：shell 起进程、`git status`、python 循环的开销在噪声范围内。
+- **测试**：新的差分测试 `gdb`：断点、单步、看变量、软件观察点、stepi、多线程程序上的断点、`catch syscall`；加载地址、pid 归一化，两边都用软件观察点（`set can-use-hw-watchpoints 0`，原生有硬件观察点）。差分测试 `ptrace` 新增 PTRACE_POKETEXT 写断点、经由 `/proc/<pid>/mem` 读写断点、单步 svc、对只读的共享映射强制写入、auxv。最初的用例只在代码还没执行过时下断点，变异检验（去掉强制写入之后的翻译作废）抓不到，所以加了先执行过（已经翻译）再下断点的场景。guest 测试 `posix.c` 的 ptrace 一项新增单步。
 
 **推迟项**：
 

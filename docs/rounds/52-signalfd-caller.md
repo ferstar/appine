@@ -11,8 +11,7 @@
 
 - **调用者**：guest 线程在自己的宿主线程上一直执行到结束，线程开始时在线程局部记下它和它的线程组（`task::current`，弱引用；系统调用里 `Task::state` 已经被借走，拿不到线程组）。signalfd 的就绪状态和数据代数（`EPOLLET`）改为看调用的线程和它的线程组，不再记创建它的线程。不在 guest 线程上检查时（定时器线程替信号驱动的 I/O、`EPOLLEXCLUSIVE` 的独占门检查）只看创建它的线程组。
 - **唤醒不用改**：发给线程的、被屏蔽的信号原来就叫醒所有等待者，各个 poll、epoll 醒来之后按自己重新判断。
-- **测试**：差分测试 `compat` 新增一段：两个线程都屏蔽 SIGUSR1、SIGUSR2，线程 A 建 signalfd，线程 B 有自己的 epoll 关注它。发给 A 的信号只有 A 的 poll 报告、只有 A 读得到，B 的 poll、epoll 不报告、读到 EAGAIN；发给 B 的反过来；发给进程的两个线程都看得到，B 读走之后都不报告；B 阻塞在 poll 里时给它发信号，它醒来报告可读；fork 出来的子进程 poll 继承来的 signalfd，等到父进程发给它的信号；创建 signalfd 的线程退出之后，发给主线程的信号主线程 poll 得到、读得到。变异检验：上一轮的二进制上 5 行与原生不同（发给 A、发给 B、B 阻塞在 poll 里、fork 的子进程、创建者退出）。LTP 的 signalfd01、signalfd02、signalfd4_01、signalfd4_02（单线程）照常通过。
-  - cargo test（192 个）、clippy、Android clippy、两层的 18 组差分测试通过。LTP 的 syscall 测试 956 个通过（上一轮 957）：nanosleep01 这次失败，单独重跑 3 次都失败，上一轮的二进制同样失败，量到睡 1 毫秒要 1.6 毫秒，是虚拟机这时的计时延迟（[偶发项](../milestones.md#已知的偶发失败)）。
+- **测试**：差分测试 `compat` 新增一段：两个线程各自 poll、epoll 和读同一个 signalfd，发给其中一个线程、发给进程的信号，阻塞在 poll 里时被叫醒，fork 出来的子进程 poll 继承来的 signalfd，创建 signalfd 的线程退出之后。
 
 **推迟项**：
 

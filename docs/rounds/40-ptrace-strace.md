@@ -17,8 +17,8 @@ ptrace 原来一律返回 EPERM，gdb、strace 都不能用（[M6](08-m6.md)、[
 - **process_vm_readv、process_vm_writev**：权限与 PTRACE_ATTACH 相同（`PTRACE_MODE_ATTACH_REALCREDS`）。远端按页拷贝，碰到不能访问的页就停在那里，返回已经拷了多少，一字节也没拷时是 EFAULT。strace 用它读字符串参数。
 - **信号的重启**：跟踪者改了 pc 时不再按"重新执行"把它改回去，与 Linux 的 `do_signal` 一样。
 - 真实负载上的 strace（Tier 1）：`strace -f` 跟踪 python 的线程、`go version`、`node -e`，`strace -c`、`strace -p` 挂到运行中的 sleep 上（显示 `restart_syscall(<... resuming interrupted nanosleep ...>)`）、`-e inject=getpid:retval=7`、`-k` 打印调用栈，都正常。
-- **性能**：没有被跟踪时，系统调用只多看一次跟踪状态。上一轮的二进制和这一轮的交替跑 4 轮，shell 起进程（0.18 秒）、`git status`（0.02–0.03 秒）、python 循环（1.30–1.32 秒）都看不出差别。
-- **测试**：新的差分测试 `ptrace`：一个 C 写的跟踪器逐项检查系统调用的停止（GET_SYSCALL_INFO 的各种长度、x7、改返回值、跳过系统调用、改了返回值就 PTRACE_DETACH）、exec 事件和 SIGTRAP、SEIZE 和 INTERRUPT、fork 跟进孙进程和它们的 `PTRACE_EVENT_EXIT`、group-stop（SEIZE 和 LISTEN，ATTACH 时没有 siginfo）、被忽略的信号、线程（`PTRACE_O_TRACECLONE`）、`PTRACE_O_EXITKILL`、process_vm_readv/writev 和 PEEKDATA、各种错误码；再用 strace 跟踪 cat、处理信号的程序和 `sh -c`（`-ff` 每个进程一个文件，地址、pid 归一化之后比）。跟踪器设了 60 秒的 alarm，等不到该来的停止时失败而不是卡住。变异检验：去掉"被跟踪的线程不丢弃被忽略的信号"，SEIZE 的 group-stop 在 SIGCONT 之后等不到信号投递停止；改用以前的二进制时整组失败。差分测试的仓库加装 strace 和 gdb（`scripts/difftest` 的软件包、README）。guest 测试 `posix.c` 新增 ptrace：信号投递停止、系统调用的停止、改返回值、process_vm_readv。cargo test（178 个）、clippy、Android clippy、两层的 15 组差分测试通过。LTP 的 syscall 测试 950 个通过（上一轮 942），新通过 process_vm_readv01–03、process_vm_writev01–02、ptrace01、03、05、06；ptrace04、07–10 只测 x86（arm64 的原生 Linux 上也跳过），ptrace11 要跟踪 pid 1（见推迟项）。futex_wait05 这次失败、getrusage03 跳过，都是[偶发项](../milestones.md#已知的偶发失败)：futex_wait05 单独重跑时上一轮的二进制在同一时刻也失败。
+- **性能**：没有被跟踪时，系统调用只多看一次跟踪状态，开销在噪声范围内。
+- **测试**：新的差分测试 `ptrace`：一个 C 写的跟踪器逐项检查系统调用的停止、各种事件、SEIZE 和 group-stop、被忽略的信号、线程、`PTRACE_O_EXITKILL`、process_vm_readv/writev 和 PEEKDATA、错误码；再用 strace 跟踪几个程序，地址、pid 归一化之后比。跟踪器设了 60 秒的 alarm，等不到该来的停止时失败而不是卡住。差分测试的仓库加装 strace 和 gdb。guest 测试 `posix.c` 新增 ptrace 一项。LTP 新通过 process_vm_readv01–03、process_vm_writev01–02、ptrace01、03、05、06；ptrace04、07–10 只测 x86（arm64 的原生 Linux 上也跳过），ptrace11 要跟踪 pid 1（见推迟项）。
 
 **推迟项**：
 

@@ -25,7 +25,7 @@ vDSO 的时间函数只是 svc 存根（§7.2），Go 的 nanotime、JVM 的 `Sy
 
 （这一节最初记的 `go build` 对比用的基线二进制是更早的 883ea95，混进了上一轮翻译池的变化；上表是按提交前后重新编的基线、与下一步一起交替量的。）
 
-- **测试**：guest 测试程序 `posix.c` 新增时钟一项：单调时钟不倒退、`gettimeofday` 和 `CLOCK_REALTIME` 一致、出错的时钟 id 和指针（交给持锁的路径报错）；自己的 CPU 时钟两种写法读的是同一个，进程的不比它少；在新线程里看另一个空转的线程的时钟，它的涨到 50 毫秒时自己的几乎不动（变异检验：把别的线程的时钟当成自己的，这一项超时失败）。cargo test（174 个）、clippy、两层的 14 组差分测试通过。LTP 的 syscall 测试 942 个通过（上一轮 943），差别都是[偶发项](../milestones.md#已知的偶发失败)：futex_wait05 失败，shmctl01 通过。
+- **测试**：guest 测试程序 `posix.c` 新增时钟一项：单调时钟、`gettimeofday` 和 `CLOCK_REALTIME`、出错的参数，自己的 CPU 时钟的两种写法，以及在新线程里看另一个空转的线程的时钟。
 
 ## futex 和睡眠不取 BKL
 
@@ -47,7 +47,7 @@ vDSO 的时间函数只是 svc 存根（§7.2），Go 的 nanotime、JVM 的 `Sy
 
 一对线程时 BKL 本来就没有争抢，来回的时间是宿主线程睡下、被叫醒的延迟。`go build`、Maven 的关键路径上等锁不多，变化不大。
 
-- **测试**：guest 测试程序 `threads.c` 新增 futex 和 nanosleep 一项：futex 等待被信号打断返回 EINTR，超时、值不对、被另一个线程唤醒；nanosleep 被信号打断时剩下的是真正剩下的（变异检验：不交接到期时刻时剩下 999 毫秒，失败）。差分测试 `c-programs` 新增共享文件映射里跨进程的 futex：父子进程各自映射同一个 memfd，宿主地址不同（变异检验：把它当成私有内存时父进程叫不醒，与原生的输出不同）。cargo test（174 个）、clippy、两层的 14 组差分测试通过。LTP 的 syscall 测试 942 个通过，与上一步完全相同。
+- **测试**：guest 测试程序 `threads.c` 新增 futex 和 nanosleep 一项：被信号打断、超时、值不对、被另一个线程唤醒，nanosleep 被打断时剩下的时间。差分测试 `c-programs` 新增共享文件映射里跨进程的 futex（父子进程各自映射同一个 memfd，宿主地址不同）。
 
 ## 试过没有采用：被打断的线程不进内核
 

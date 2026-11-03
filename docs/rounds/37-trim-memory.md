@@ -7,4 +7,4 @@
 - **在哪个线程上做**：释放要取 BKL、提交仓库，不放在主线程上。它和停止内核放在同一个单线程的 executor 上按顺序做（原来停止在临时线程上），停止之后不会再有释放的调用用到已经释放的句柄。JNI 新增 `Native.trimMemory`。
 - `Machine::trim_memory` 里内核层的部分包进 `host_call`：内核层在这里 panic 时那次调用失败，不穿过 JNI 让 App 进程 abort。
 
-- **测试**：MachineTest 新增"释放缓存时正在运行的进程不受影响，之后照常起新进程"（一边跑循环一边释放 5 次）；4K（API 34）和 16K（API 37）的模拟器上 5 个测试都通过。4K 模拟器上装好 debug 版 App（内核层的日志打开）：`am send-trim-memory` 发 `RUNNING_LOW` 立即释放；按 HOME、20 秒后切回来，不释放；按 HOME 等 70 秒，释放；App 一直照常运行，日志里没有错误（看内核层日志里的 "trimming memory"）。cargo test（174 个）、clippy 和 Android clippy 通过。
+- **测试**：MachineTest 新增"释放缓存时正在运行的进程不受影响，之后照常起新进程"，4K（API 34）和 16K（API 37）的模拟器上都通过。4K 模拟器上用 debug 版 App 看内核层日志里的 "trimming memory"：`am send-trim-memory` 发 `RUNNING_LOW` 立即释放，切出去不到 1 分钟就回来不释放，超过 1 分钟释放。

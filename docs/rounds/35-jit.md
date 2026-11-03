@@ -22,7 +22,7 @@
 
 node（V8）这边没有这个问题：一次计算负载只作废一两百个块，耗时与原生相同。剩下的主要是 libjvm、JIT 代码本身在翻译后执行的开销。
 
-- **测试**：引擎测试新增"作废范围里内容没变的块保留"；cargo test（174 个）、clippy 和 Android clippy、两层的 14 组差分测试（java、node、go 组都有 JIT）、clang 编译的引擎测试、10 万轮 lockstep 都通过。LTP 的 syscall 测试全量并发时 944 个通过（上一轮 942）：偶发的 futex_wait05、shmctl01 这次都通过，没有新的失败。
+- **测试**：引擎测试新增"作废范围里内容没变的块保留"；差分测试的 java、node、go 组都用到 JIT。
 
 **推迟项**：
 

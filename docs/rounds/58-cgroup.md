@@ -25,15 +25,9 @@
   | Node.js 的 V8 堆上限 | 2.09 GiB | 1.05 GiB |
 
   之前 Node.js 的堆上限比 guest 能用的还大。`java -XshowSettings:system` 报告 `Provider: cgroupv2`，Memory Limit 是上限，`process.constrainedMemory()` 也是。
-- **测试**：新的差分测试 `cgroup`（第 19 组），比对：
-  - `/proc/<pid>/cgroup`、`/proc/cgroups`（只比列出的控制器都在层级 0 上、有 cpu：新内核不列没有 v1 支持的 cpuset、memory，CI 的 runner 内核版本不一）、挂载的那一行和 statfs；
-  - 与宿主无关的文件的权限和内容，取决于宿主的文件（memory.max、pids.max、用量、pid）的权限和格式。CI 的宿主内核比 6.1 新：cgroup.stat、memory.events、cpu.stat 多了项（`nr_subsys_*`、`sock_throttled`、`nice_usec`），`memory.peak` 可写（6.12 起），容器的 `pids.max` 有限制。这些只比 6.1 就有的部分；
-  - 写、建、删、改权限都是 EROFS；
-  - JVM（`OperatingSystemMXBean.getTotalMemorySize`）、Node.js（`process.constrainedMemory`）看到的上限与 `memory.max` 一致：原生一侧 docker 没有设 `--memory`，`memory.max` 是 max，两者都是物理内存。
+- **测试**：新的差分测试 `cgroup`：`/proc/<pid>/cgroup`、`/proc/cgroups`、挂载的那一行和 statfs，各个文件的权限和内容，写、建、删、改权限都是 EROFS，JVM、Node.js 看到的上限与 `memory.max` 一致。CI 的宿主内核比 6.1 新、版本不一，只比 6.1 就有的部分（`/proc/cgroups` 列出的控制器，cgroup.stat、memory.events、cpu.stat 的项，6.12 起可写的 `memory.peak`）；取决于宿主的文件只比权限和格式；原生一侧 docker 没有设 `--memory`，`memory.max` 是 max。
 
-  rootfs 测试新增 `cgroup_memory_files_follow_the_oom_killer`：`--memory-limit none` 时 `memory.max` 是 max；128M 时是 134217728，awk 吃内存被结束之后 `memory.events` 的三项都变了，`memory.peak` 超过上限。
-
-  变异检验：上一轮的二进制上 `cgroup` 整组都不同；`memory.max` 没接到上限的话，rootfs 测试失败（差分测试只比自洽，查不出）。cargo test（194 个）、clippy、Android clippy、两层的 19 组差分测试通过。LTP 的 syscall 测试 957 个通过（与上一轮相同）：getrusage03 这次通过，nanosleep01 这次失败，都是[偶发项](../milestones.md#已知的偶发失败)，nanosleep01 单独重跑时上一轮的二进制在同一时刻也失败。
+  rootfs 测试新增 `cgroup_memory_files_follow_the_oom_killer`：`memory.max` 跟着 `--memory-limit`，吃内存被结束之后 `memory.events`、`memory.peak` 跟着变。差分测试只比自洽，`memory.max` 没接到上限查不出，要靠它。
 
 **推迟项**：
 

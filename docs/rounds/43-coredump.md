@@ -11,8 +11,8 @@
   - 与 Linux 的 `dump_emit` 一样，写出的字节（空洞不算）到了 `RLIMIT_CORE` 就截断，截断了也算写了（Linux 在开始写之前就记下 `has_dumped`）：waitpid01 把限制设得比 core 小，原来按 EFBIG 整个不写，它仍然失败。
 - **报告**：写成了的进程 `ExitStatus::Signaled` 带 `core_dumped`，wait 的状态带 `WCOREDUMP`（0x80），SIGCHLD 和 waitid 的 `si_code` 是 `CLD_DUMPED`。
 - **`MADV_DONTDUMP`、`MADV_DODUMP`**：原来接受但不起作用，现在记在 VMA 上（fork 继承），core 里不写，smaps 的 VmFlags 带 `dd`。
-- **与原生对照**：一个三线程的程序在嵌套调用里写空指针（`target/mem/coredump/compare.sh`），本地 colima 宿主的 `core_pattern` 是 `core`，原生和 appine 各生成 core，gdb 读出的 `bt`、`info threads`、全局变量、堆上的结构体、浮点数、`info frame`、`$_siginfo` 的信号和地址，以及 abort 的调用栈都一致（地址和 LWP 号归一化之后）。
-- **测试**：rootfs 测试新增两项：busybox 的 shell 里 SIGSEGV 留下 ELF core（`ET_CORE`、aarch64）、限制为 0 时不写、`core_pattern` 的 `%e`、`%s`、`coredump_filter` 的默认值；`tests/guest/coredump.c`（musl-gcc 静态编译，拷进仓库运行）检查多线程进程的 core：程序头、写了的映射里的内容、`MADV_DONTDUMP` 的映射不写、两个线程的 `NT_PRSTATUS` 和 `NT_PRFPREG`、`NT_PRPSINFO`、`NT_SIGINFO`、`NT_AUXV`、`NT_FILE`，`core_pattern` 的 `%p`，限制不到一页时不写、一页时截断了也带 `WCOREDUMP`，以及 waitid 的 `CLD_DUMPED` 与 `WCOREDUMP` 一致。单元测试新增 note 的对齐和程序头的位置。差分测试没有加：原生一侧在 docker 里，core 写到哪里取决于宿主内核的 `core_pattern`，CI 的 Ubuntu 宿主上是 apport 的管道，容器里改不了。变异检验：让 `dump_regions` 不管 `MADV_DONTDUMP`，`coredump.c` 失败。cargo test（184 个）、clippy、Android clippy、两层的 17 组差分测试通过（Tier 0 在加 `MADV_DONTDUMP` 之后重跑了 compat、edge-cases、fork、signals）。LTP 的 syscall 测试 955 个通过（上一轮 951）：新通过的 abort01、kill11、waitid10、waitpid01，以及原来跳过的 madvise08（检查 `MADV_DONTDUMP` 的内存不进 core 文件）；getrusage03 这次通过，futex_wait05 和 mmap21_02 这次失败，都是[偶发项](../milestones.md#已知的偶发失败)。
+- **与原生对照**：一个三线程的程序在嵌套调用里写空指针（`target/mem/coredump/compare.sh`），本地 colima 宿主的 `core_pattern` 是 `core`，原生和 appine 各生成 core，gdb 读出的调用栈、线程、变量、`$_siginfo` 都一致（地址和 LWP 号归一化之后）。
+- **测试**：rootfs 测试新增两项：busybox 的 shell 里留下 core、`core_pattern` 和 `coredump_filter`；`tests/guest/coredump.c` 检查多线程进程的 core 文件的内容、`RLIMIT_CORE` 的截断和 wait 报告的状态。单元测试新增 note 的对齐和程序头的位置。差分测试没有加：原生一侧在 docker 里，core 写到哪里取决于宿主内核的 `core_pattern`，CI 的 Ubuntu 宿主上是 apport 的管道，容器里改不了。LTP 新通过 abort01、kill11、waitid10、waitpid01，以及原来跳过的 madvise08（检查 `MADV_DONTDUMP` 的内存不进 core 文件）。
 - **性能**：热路径上只多了线程退出时看一眼线程组在不在写 core、信号投递时先做重启的准备再看线程是否被结束，没有单独测量。
 
 **推迟项**：
