@@ -1,15 +1,18 @@
-//! eBPF 的一个子集（kernel/procfs 的 map）：cgroup 的设备过滤程序（`BPF_PROG_TYPE_CGROUP_DEVICE`）。
+//! A subset of eBPF (the kernel/procfs map): cgroup device filter programs
+//! (`BPF_PROG_TYPE_CGROUP_DEVICE`).
 //!
-//! cgroup v2 没有 v1 的 `devices.allow`，runc、crun 给每个容器的 cgroup 挂一个 eBPF 程序，
-//! 进程打开设备节点、mknod 时内核用它决定放不放行。这里只有这一种程序：校验器
-//! （[`verify`]）照 Linux 6.1 的 `do_check` 检查程序、错误码与它相同，解释器（[`run`]）
-//! 执行；挂在 cgroup 上（[`crate::cgroup`]），打开设备、mknod 时跑那个 cgroup 的有效程序
-//! （[`check_device`]）。
+//! cgroup v2 has no v1 `devices.allow`; runc and crun attach an eBPF program to each container's
+//! cgroup, and the kernel uses it to decide whether to allow a process to open a device node or
+//! mknod. This is the only program type here: the verifier ([`verify`]) checks programs as Linux
+//! 6.1's `do_check` does, with the same error codes, and the interpreter ([`run`]) executes them;
+//! they are attached to cgroups ([`crate::cgroup`]), and opening a device or mknod runs the
+//! effective programs of that cgroup ([`check_device`]).
 //!
-//! 校验器比 Linux 的简单：只许向前跳转（没有循环，一定会结束），不分路径，汇合处的寄存器
-//! 类型不同就当作没有初始化；标量只记无符号的范围，够判断返回值是不是 0 或 1。没有 map、
-//! BPF 之间的调用、原子操作，栈里只放标量。runc、crun 生成的程序只用到 ALU、条件跳转和读
-//! 上下文。
+//! The verifier is simpler than Linux's: only forward jumps are allowed (no loops, so programs
+//! always terminate), paths are not told apart, and a register whose types differ where paths
+//! join counts as uninitialized; scalars track only an unsigned range, enough to decide whether
+//! the return value is 0 or 1. No maps, BPF-to-BPF calls or atomics, and the stack holds only
+//! scalars. The programs runc and crun generate use only ALU, conditional jumps and context reads.
 
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
@@ -17,32 +20,33 @@ use std::rc::{Rc, Weak};
 use crate::errno::Errno;
 use crate::kernel::Kernel;
 
-/// `BPF_PROG_TYPE_CGROUP_DEVICE`。
+/// `BPF_PROG_TYPE_CGROUP_DEVICE`.
 pub(crate) const PROG_TYPE_CGROUP_DEVICE: u32 = 15;
-/// `BPF_CGROUP_DEVICE`（挂的类型）。
+/// `BPF_CGROUP_DEVICE` (the attach type).
 pub(crate) const ATTACH_CGROUP_DEVICE: u32 = 6;
-/// 挂的标志：子 cgroup 可以挂自己的（覆盖它），可以挂多个，替换其中一个。
+/// Attach flags: child cgroups may attach their own (overriding it), several may be attached, one
+/// of them is replaced.
 pub(crate) const ALLOW_OVERRIDE: u32 = 1;
 pub(crate) const ALLOW_MULTI: u32 = 2;
 pub(crate) const REPLACE: u32 = 4;
-/// 一个 cgroup 最多挂的程序数（`BPF_CGROUP_MAX_PROGS`）。
+/// The most programs one cgroup can have attached (`BPF_CGROUP_MAX_PROGS`).
 pub(crate) const MAX_PROGS: usize = 64;
 
-/// 设备的类型和访问（`BPF_DEVCG_DEV_*`、`BPF_DEVCG_ACC_*`）。
+/// Device types and accesses (`BPF_DEVCG_DEV_*`, `BPF_DEVCG_ACC_*`).
 pub(crate) const DEV_BLOCK: u32 = 1;
 pub(crate) const DEV_CHAR: u32 = 2;
 pub(crate) const ACC_MKNOD: u32 = 1;
 pub(crate) const ACC_READ: u32 = 2;
 pub(crate) const ACC_WRITE: u32 = 4;
 
-/// 程序最多的指令数（特权的，`BPF_COMPLEXITY_LIMIT_INSNS`）。
+/// The most instructions a program may have (privileged, `BPF_COMPLEXITY_LIMIT_INSNS`).
 pub(crate) const MAX_INSNS: usize = 1_000_000;
-/// 栈的大小。
+/// Stack size.
 const STACK: i64 = 512;
-/// `struct bpf_cgroup_dev_ctx` 的大小：access_type、major、minor。
+/// The size of `struct bpf_cgroup_dev_ctx`: access_type, major, minor.
 const CTX_SIZE: i64 = 12;
 
-/// 一条指令（`struct bpf_insn`）。
+/// One instruction (`struct bpf_insn`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Insn {
     pub code: u8,
@@ -73,32 +77,32 @@ impl Insn {
     }
 }
 
-/// 一个加载了的程序。打开的 fd、挂着它的 cgroup 各持有一份；[`Registry`] 按编号记着
-/// （`BPF_PROG_GET_FD_BY_ID`）。
+/// A loaded program. Open fds and the cgroups it is attached to each hold a reference; the
+/// [`Registry`] records it by id (`BPF_PROG_GET_FD_BY_ID`).
 pub(crate) struct Prog {
     pub id: u32,
     pub insns: Vec<Insn>,
     pub name: [u8; 16],
-    /// 指令的 SHA-1 的前 8 个字节（Linux 的 `bpf_prog_calc_tag`）。
+    /// The first 8 bytes of the SHA-1 of the instructions (Linux's `bpf_prog_calc_tag`).
     pub tag: [u8; 8],
-    /// 许可证与 GPL 兼容。
+    /// The license is GPL-compatible.
     pub gpl: bool,
-    /// 加载的时刻（开机以来的纳秒）。
+    /// Load time (nanoseconds since boot).
     pub load_time: u64,
-    /// 加载者的真实 uid（内核 ID）。
+    /// The loader's real uid (a kernel ID).
     pub uid: u32,
-    /// 校验器处理的指令数。
+    /// Number of instructions the verifier processed.
     pub verified: u32,
 }
 
 impl Prog {
-    /// 原样的字节（`xlated_prog_insns`：这里不改写指令）。
+    /// The bytes as given (`xlated_prog_insns`: instructions are not rewritten here).
     pub fn bytes(&self) -> Vec<u8> {
         self.insns.iter().flat_map(|i| i.encode()).collect()
     }
 }
 
-/// 程序的编号表。编号从 1 起递增，不重复使用。
+/// The program id table. Ids count up from 1 and are never reused.
 #[derive(Default)]
 pub(crate) struct Registry {
     progs: BTreeMap<u32, Weak<Prog>>,
@@ -106,7 +110,7 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    /// 下一个编号。
+    /// The next id.
     pub fn next_id(&mut self) -> u32 {
         self.progs.retain(|_, p| p.strong_count() > 0);
         self.next += 1;
@@ -122,7 +126,7 @@ impl Registry {
     }
 }
 
-/// 许可证与 GPL 兼容（Linux 的 `license_is_gpl_compatible`）。
+/// The license is GPL-compatible (Linux's `license_is_gpl_compatible`).
 pub(crate) fn gpl_compatible(license: &[u8]) -> bool {
     matches!(
         license,
@@ -135,7 +139,7 @@ pub(crate) fn gpl_compatible(license: &[u8]) -> bool {
     )
 }
 
-/// 校验器拒绝程序：错误码和写进日志的说明。
+/// The verifier rejects a program: the error code and the explanation written to the log.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Reject {
     pub errno: Errno,
@@ -146,16 +150,16 @@ fn reject<T>(errno: Errno, msg: String) -> Result<T, Reject> {
     Err(Reject { errno, msg })
 }
 
-/// 寄存器的类型（校验器用）。
+/// Register types (for the verifier).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ty {
-    /// 没有初始化，或者汇合的几条路径上不同。
+    /// Not initialized, or different on the paths that join.
     Uninit,
-    /// 标量，值在 [min, max] 里（无符号）。
+    /// A scalar with a value in [min, max] (unsigned).
     Scalar { min: u64, max: u64 },
-    /// 上下文的指针，加了 `off`。
+    /// A context pointer plus `off`.
     Ctx { off: i64 },
-    /// 栈的指针：相对栈顶（r10）的偏移。
+    /// A stack pointer: an offset from the stack top (r10).
     Stack { off: i64 },
 }
 
@@ -198,7 +202,7 @@ impl Ty {
 
 type Regs = [Ty; 11];
 
-/// 指令的类别、操作、来源（`BPF_CLASS` 等）。
+/// Instruction classes, operations and sources (`BPF_CLASS` and so on).
 mod op {
     pub const LD: u8 = 0x00;
     pub const LDX: u8 = 0x01;
@@ -219,7 +223,7 @@ mod op {
     pub const END: u8 = 0xd0;
 }
 
-/// 访存的字节数（`BPF_SIZE`）。
+/// Bytes accessed (`BPF_SIZE`).
 fn size_of(code: u8) -> i64 {
     match code & 0x18 {
         0x00 => 4,
@@ -229,12 +233,12 @@ fn size_of(code: u8) -> i64 {
     }
 }
 
-/// 设备程序能用的 helper（Linux 6.1 的 `cgroup_dev_func_proto` 里不要 map 的）：
-/// ktime_get_ns、get_prandom_u32、get_smp_processor_id、get_current_uid_gid、
-/// get_numa_node_id、get_current_cgroup_id、ktime_get_boot_ns。
+/// Helpers device programs may use (those in Linux 6.1's `cgroup_dev_func_proto` that need no
+/// map): ktime_get_ns, get_prandom_u32, get_smp_processor_id, get_current_uid_gid,
+/// get_numa_node_id, get_current_cgroup_id, ktime_get_boot_ns.
 const HELPERS: [i32; 7] = [5, 7, 8, 15, 42, 80, 125];
 
-/// 这条指令是不是跳转（JA 和条件跳转），是的话目标是哪条。
+/// Whether this instruction is a jump (JA and conditional jumps), and if so, its target.
 fn jump_target(pc: usize, i: &Insn) -> Option<i64> {
     let class = i.code & 7;
     let o = i.code & 0xf0;
@@ -242,11 +246,11 @@ fn jump_target(pc: usize, i: &Insn) -> Option<i64> {
     is_jump.then(|| pc as i64 + i.off as i64 + 1)
 }
 
-/// 校验程序（Linux 的 `bpf_check`：先看控制流，再按程序的顺序检查每条指令）。返回处理的
-/// 指令数。
+/// Verifies a program (Linux's `bpf_check`: first the control flow, then each instruction in
+/// program order). Returns the number of instructions processed.
 pub(crate) fn verify(insns: &[Insn]) -> Result<u32, Reject> {
     let n = insns.len();
-    // LD_IMM64 占两条，第二条不是指令
+    // LD_IMM64 takes two slots, and the second one is not an instruction
     let mut second = vec![false; n];
     let mut pc = 0;
     while pc < n {
@@ -265,8 +269,9 @@ pub(crate) fn verify(insns: &[Insn]) -> Result<u32, Reject> {
             pc += 1;
         }
     }
-    // 控制流（check_subprogs、check_cfg）：跳转不出界、不跳进 LD_IMM64 的后一半、不往回跳，
-    // 最后一条之后不能接着执行，每条都要走得到
+    // Control flow (check_subprogs, check_cfg): jumps stay in bounds, never land in the second
+    // half of an LD_IMM64 and never go backwards; execution must not run past the last
+    // instruction, and every instruction must be reachable
     let mut reachable = vec![false; n];
     reachable[0] = true;
     for pc in 0..n {
@@ -304,7 +309,7 @@ pub(crate) fn verify(insns: &[Insn]) -> Result<u32, Reject> {
     if let Some(pc) = (0..n).find(|&pc| !second[pc] && !reachable[pc]) {
         return reject(Errno::EINVAL, format!("unreachable insn {pc}"));
     }
-    // 按顺序检查（do_check）：每条指令的状态是走到它的各条路径的汇合
+    // Check in order (do_check): each instruction's state is the join of the paths reaching it
     let mut states: Vec<Option<Regs>> = vec![None; n];
     let mut init = [Ty::Uninit; 11];
     init[1] = Ty::Ctx { off: 0 };
@@ -315,7 +320,7 @@ pub(crate) fn verify(insns: &[Insn]) -> Result<u32, Reject> {
         if second[pc] {
             continue;
         }
-        // 已知的条件跳过了的指令（死代码）不检查
+        // Instructions skipped by known conditions (dead code) are not checked
         let Some(mut r) = states[pc] else {
             continue;
         };
@@ -461,7 +466,7 @@ fn alu(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
     if !x && matches!(o, 0x60 | 0x70 | 0xc0) && !(0..bits).contains(&i.imm) {
         return reject(Errno::EINVAL, format!("invalid shift {}", i.imm));
     }
-    // 指针只能加减常数（64 位）
+    // Pointers may only add or subtract constants (64-bit)
     if dst.is_pointer() || src.is_pointer() {
         if !is64 {
             return reject(
@@ -495,13 +500,13 @@ fn alu(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
             if a == b && c == d {
                 constant(alu_value(o, is64, a, c))
             } else if o == 0x50 {
-                // and：不超过两边的上限
+                // and: no more than either side's upper bound
                 Ty::Scalar {
                     min: 0,
                     max: b.min(d).min(mask),
                 }
             } else if o == 0x70 && c == d && b <= mask {
-                // 右移常数位
+                // Right shift by a constant
                 Ty::Scalar {
                     min: a >> c,
                     max: b >> c,
@@ -515,8 +520,9 @@ fn alu(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
     write_reg(r, i.dst, t)
 }
 
-/// ALU 的运算（`___bpf_prog_run` 的 ALU 部分）：32 位的在低 32 位上做、高位清零；移位数
-/// 按位宽取模；除以 0 得 0，对 0 取模不变。
+/// ALU operations (the ALU part of `___bpf_prog_run`): 32-bit ones work on the low 32 bits and
+/// clear the high bits; shift amounts are taken modulo the width; division by 0 gives 0, and
+/// modulo 0 leaves the value unchanged.
 fn alu_value(o: u8, is64: bool, a: u64, b: u64) -> u64 {
     if is64 {
         match o {
@@ -556,13 +562,13 @@ fn alu_value(o: u8, is64: bool, a: u64, b: u64) -> u64 {
     }
 }
 
-/// 访问上下文（Linux 的 `cgroup_dev_is_valid_access`）：只读；不出界、按大小对齐；
-/// access_type 可以读一部分，major、minor 只能整个读。
+/// Context access (Linux's `cgroup_dev_is_valid_access`): read-only; in bounds and aligned to the
+/// size; access_type may be read in part, major and minor only whole.
 fn ctx_access(off: i64, size: i64) -> bool {
     off >= 0 && off + size <= CTX_SIZE && off % size == 0 && (size == 4 || off < 4)
 }
 
-/// 栈的访问：在 [-512, 0) 里、按大小对齐。
+/// Stack access: within [-512, 0) and aligned to the size.
 fn stack_access(off: i64, size: i64, write: bool) -> Result<(), Reject> {
     if off < -STACK || off + size > 0 {
         let what = if write { "write to" } else { "read from" };
@@ -611,7 +617,8 @@ fn ldx(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
                 ),
             );
         }
-        // 特权的程序可以读没有写过的栈（allow_uninit_stack），读到的是不知道的值
+        // Privileged programs may read stack that was never written (allow_uninit_stack), and get
+        // an unknown value
         Ty::Stack { off } => stack_access(off + i.off as i64, size, false)?,
         _ => {
             return reject(
@@ -652,7 +659,8 @@ fn store(r: &Regs, i: &Insn) -> Result<(), Reject> {
     }
 }
 
-/// 跳转类的指令：返回后继和各自的寄存器（条件跳转按条件收窄标量的范围）。
+/// Jump instructions: returns the successors with their registers (conditional jumps narrow
+/// scalar ranges by the condition).
 fn jmp(mut r: Regs, pc: usize, i: &Insn) -> Result<Vec<(usize, Regs)>, Reject> {
     let jmp32 = i.code & 7 == op::JMP32;
     let x = i.code & op::X != 0;
@@ -674,7 +682,7 @@ fn jmp(mut r: Regs, pc: usize, i: &Insn) -> Result<Vec<(usize, Regs)>, Reject> {
             if !HELPERS.contains(&i.imm) {
                 return reject(Errno::EINVAL, format!("invalid func unknown#{}", i.imm));
             }
-            // 调用之后 r1–r5 不能再读，r0 是返回值
+            // After a call r1–r5 can no longer be read, and r0 is the return value
             r[1..=5].fill(Ty::Uninit);
             r[0] = UNKNOWN;
             return Ok(vec![(pc + 1, r)]);
@@ -683,7 +691,7 @@ fn jmp(mut r: Regs, pc: usize, i: &Insn) -> Result<Vec<(usize, Regs)>, Reject> {
             if x || i.src != 0 || i.imm != 0 || i.off != 0 || i.dst != 0 {
                 return reject(Errno::EINVAL, "BPF_EXIT uses reserved fields".into());
             }
-            // 返回值只能是 0 或 1（check_return_code）
+            // The return value can only be 0 or 1 (check_return_code)
             return match read_reg(&r, 0)? {
                 Ty::Scalar { max, .. } if max <= 1 => Ok(Vec::new()),
                 Ty::Scalar { min, max } => reject(
@@ -709,7 +717,8 @@ fn jmp(mut r: Regs, pc: usize, i: &Insn) -> Result<Vec<(usize, Regs)>, Reject> {
         read_reg(&r, i.src)?;
     }
     let target = (pc as i64 + i.off as i64 + 1) as usize;
-    // 与常数比较（无符号的那几种）时收窄标量的范围；收窄成空的那一边走不到
+    // Comparisons with a constant (the unsigned kinds) narrow the scalar's range; a side narrowed
+    // to empty is unreachable
     let mut taken = r;
     let mut fall = r;
     let mut take = true;
@@ -763,20 +772,21 @@ fn jmp(mut r: Regs, pc: usize, i: &Insn) -> Result<Vec<(usize, Regs)>, Reject> {
     Ok(out)
 }
 
-/// 跑程序时调用者的信息（helper 用）。
+/// The caller's information while a program runs (for helpers).
 pub(crate) struct Env {
     pub uid: u32,
     pub gid: u32,
     pub cgroup: u64,
 }
 
-/// 上下文和栈在解释器里的"地址"：指针只能由它们加减常数得到（校验器保证），访存按落在
-/// 哪一段找到上下文或者栈。
+/// The "addresses" of the context and the stack in the interpreter: pointers can only be derived
+/// from them by adding or subtracting constants (the verifier guarantees this), and a memory
+/// access finds the context or the stack by which range it falls in.
 const CTX_BASE: u64 = 0x1000_0000_0000_0000;
 const STACK_TOP: u64 = 0x2000_0000_0000_0000;
 
-/// 解释执行校验过的程序（Linux 的 `___bpf_prog_run`），`ctx` 是 access_type、major、minor。
-/// 返回 r0。
+/// Interprets a verified program (Linux's `___bpf_prog_run`); `ctx` is access_type, major, minor.
+/// Returns r0.
 pub(crate) fn run(prog: &Prog, ctx: [u32; 3], env: &Env) -> u64 {
     let mut reg = [0u64; 11];
     reg[1] = CTX_BASE;
@@ -788,7 +798,7 @@ pub(crate) fn run(prog: &Prog, ctx: [u32; 3], env: &Env) -> u64 {
     }
     let insns = &prog.insns;
     let mut pc = 0;
-    // 只往前跳，指令数就是步数的上限
+    // Jumps only go forward, so the instruction count bounds the number of steps
     for _ in 0..insns.len() {
         let Some(&i) = insns.get(pc) else {
             return 0;
@@ -811,7 +821,7 @@ pub(crate) fn run(prog: &Prog, ctx: [u32; 3], env: &Env) -> u64 {
                 reg[d] = match o {
                     op::END => {
                         let v = reg[d];
-                        // to_le 在小端上只截断，to_be 交换字节
+                        // to_le only truncates on little endian; to_be swaps bytes
                         match (x, i.imm) {
                             (false, 16) => v & 0xffff,
                             (false, 32) => v & 0xffff_ffff,
@@ -901,7 +911,7 @@ pub(crate) fn run(prog: &Prog, ctx: [u32; 3], env: &Env) -> u64 {
     0
 }
 
-/// 访存落在上下文或者栈里时返回那几个字节。
+/// Returns those bytes when the access falls in the context or the stack.
 fn memory<'a>(ctx: &'a [u8], stack: &'a [u8], addr: u64, size: usize) -> Option<&'a [u8]> {
     if let Some(off) = addr.checked_sub(CTX_BASE)
         && off < CTX_SIZE as u64
@@ -912,7 +922,7 @@ fn memory<'a>(ctx: &'a [u8], stack: &'a [u8], addr: u64, size: usize) -> Option<
     stack.get(start..start.checked_add(size)?)
 }
 
-/// helper（[`HELPERS`]）。
+/// Helpers ([`HELPERS`]).
 fn helper(id: i32, env: &Env) -> u64 {
     match id {
         // CLOCK_MONOTONIC
@@ -929,9 +939,10 @@ fn helper(id: i32, env: &Env) -> u64 {
     }
 }
 
-/// 进程打开设备节点、mknod 之前（Linux 的 `devcgroup_check_permission`）：跑它所在的
-/// cgroup 的有效程序，有一个不放行（返回值的最低位是 0）就是 EPERM。`dev_type` 是
-/// [`DEV_CHAR`] 或 [`DEV_BLOCK`]，`access` 是 [`ACC_MKNOD`] 等的组合。
+/// Before a process opens a device node or calls mknod (Linux's `devcgroup_check_permission`):
+/// runs the effective programs of its cgroup; if any one denies (the lowest bit of its return
+/// value is 0), the result is EPERM. `dev_type` is [`DEV_CHAR`] or [`DEV_BLOCK`], and `access` is
+/// a combination of [`ACC_MKNOD`] and the others.
 pub(crate) fn check_device(
     k: &Kernel,
     env: &Env,
@@ -947,7 +958,7 @@ pub(crate) fn check_device(
     }
 }
 
-/// SHA-1（FIPS 180-1），程序的 tag 用。
+/// SHA-1 (FIPS 180-1), for program tags.
 pub(crate) fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
     let mut msg = data.to_vec();
@@ -1009,7 +1020,7 @@ mod tests {
         }
     }
 
-    /// runc 这样的程序：字符设备 1:3 什么都行，1:5 不能写。
+    /// A program like runc's: character device 1:3 allows anything, 1:5 cannot be written.
     fn device_prog() -> Vec<Insn> {
         vec![
             insn(0x61, 2, 1, 0, 0),
@@ -1105,7 +1116,7 @@ mod tests {
             errno(vec![mov1, insn(0x37, 0, 0, 0, 0), exit]),
             Some(Errno::EINVAL)
         );
-        // 跳过了 r0 = 2 的那一边：范围收窄之后返回值仍是 0 或 1
+        // The side setting r0 = 2 is skipped: after narrowing, the return value is still 0 or 1
         assert_eq!(
             errno(vec![
                 insn(0x61, 0, 1, 4, 0),
@@ -1131,7 +1142,7 @@ mod tests {
         ];
         assert!(verify(&insns).is_ok());
         assert_eq!(run(&prog(insns), [0; 3], &ENV), 1);
-        // 调用之后 r1 不能再读
+        // After a call r1 can no longer be read
         let bad = vec![
             insn(0x85, 0, 0, 0, 7),
             insn(0x61, 0, 1, 0, 0),

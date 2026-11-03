@@ -1,30 +1,36 @@
-//! cgroup v2（kernel/procfs 的 map）：`/sys/fs/cgroup` 里的一棵 cgroup 树。
+//! cgroup v2 (the kernel/procfs map): a cgroup tree in `/sys/fs/cgroup`.
 //!
-//! 起初是为了让运行时知道 App 的内存上限：JVM 的默认堆是物理内存的 1/4，Node.js 按物理内存
-//! 给 V8 定堆的上限，而 guest 能用的只有 OOM killer 的上限（默认物理内存的一半，
-//! [`crate::oom`]），几个运行时一起用满就会被结束。它们在容器里改按 cgroup 的 `memory.max`
-//! 算：JVM 的容器支持（UseContainerSupport），Node.js 经由 libuv 的
-//! `uv_get_constrained_memory`。
+//! It started as a way to tell runtimes the app's memory limit: the JVM's default heap is 1/4 of
+//! physical memory and Node.js sets V8's heap limit from physical memory, but the guest can only
+//! use up to the OOM killer's limit (half of physical memory by default, [`crate::oom`]), so
+//! several runtimes using it all up get killed. In containers they compute from the cgroup's
+//! `memory.max` instead: the JVM's container support (UseContainerSupport), and Node.js through
+//! libuv's `uv_get_constrained_memory`.
 //!
-//! 根 cgroup 看起来与 docker 用 cgroup 命名空间的容器的根一样，控制器 cpuset、cpu、memory、
-//! pids 都开着，也只能写 `cgroup.procs`、`cgroup.threads`、`cgroup.subtree_control`（但它是
-//! 真正的根，有进程时也能开控制器）：
+//! The root cgroup looks like the root of a docker container using a cgroup namespace, with the
+//! cpuset, cpu, memory and pids controllers all on, and only `cgroup.procs`, `cgroup.threads` and
+//! `cgroup.subtree_control` writable (but it is the real root, so controllers can be enabled even
+//! with processes in it):
 //!
-//! - `memory.max` 是 OOM killer 的上限，`memory.current` 是它量的 App 的内存（宿主的匿名内存，
-//!   换出到 zram 的也算在里面，所以 `memory.swap.max` 是 0），`memory.stat` 把它分成匿名内存和
-//!   共享内存，`memory.events` 记着超出上限和结束进程的次数；
-//! - 没有 CPU 配额和权重：`cpu.max` 是 `max 100000`，cpuset 是 guest 看到的所有 CPU；
-//! - `pids.current` 是 guest 的任务数（含僵尸进程），`pids.max` 不限（限制在 threads-max 和
-//!   `RLIMIT_NPROC`）。
+//! - `memory.max` is the OOM killer's limit and `memory.current` the app memory it measures (the
+//!   host's anonymous memory, including what is swapped out to zram, so `memory.swap.max` is 0);
+//!   `memory.stat` splits it into anonymous and shared memory, and `memory.events` counts limit
+//!   overruns and kills;
+//! - no CPU quota or weight: `cpu.max` is `max 100000`, and the cpuset is every CPU the guest sees;
+//! - `pids.current` is the guest's task count (zombie processes included), `pids.max` is unlimited
+//!   (the limits are threads-max and `RLIMIT_NPROC`).
 //!
-//! 下面可以建子 cgroup（dockerd、runc、crun、systemd 这样管容器和服务），进程经由
-//! `cgroup.procs` 迁移、fork 时随父进程，`/proc/<pid>/cgroup` 是相对读者的 cgroup 命名空间的
-//! 根的路径。子 cgroup 的控制器按父 cgroup 的 `cgroup.subtree_control`，规则与 Linux 6.1 相同
-//! （没有内部进程、在用的不能关）。限制按 Linux 的格式检查后记下来，读出来是写进去的值：
-//! `pids.max` 挡住 fork 和建线程（[`pids_charge`]），`memory.max` 由 OOM killer 定时检查
-//! （[`crate::oom`]），别的（`memory.high`、`cpu.max`、`cpuset.cpus`……）不起作用；
-//! `cgroup.freeze` 冻结子树里的进程（线程在返回 guest 之前停下，等待中的系统调用与被
-//! 信号打断一样返回、解冻后重新执行）；`cgroup.kill` 结束整棵子树里的进程。
+//! Child cgroups can be created below it (as dockerd, runc, crun and systemd do to manage
+//! containers and services); processes migrate through `cgroup.procs` and follow their parent on
+//! fork, and `/proc/<pid>/cgroup` is the path relative to the root of the reader's cgroup
+//! namespace. A child cgroup's controllers follow its parent's `cgroup.subtree_control`, with the
+//! same rules as Linux 6.1 (no internal processes, controllers in use cannot be disabled). Limits
+//! are checked in Linux's format and recorded, and read back as written: `pids.max` stops fork
+//! and thread creation ([`pids_charge`]), `memory.max` is checked periodically by the OOM killer
+//! ([`crate::oom`]), and the others (`memory.high`, `cpu.max`, `cpuset.cpus`...) have no effect;
+//! `cgroup.freeze` freezes the processes in the subtree (threads stop before returning to the
+//! guest, and waiting syscalls return as if interrupted by a signal and restart after thaw);
+//! `cgroup.kill` kills the processes in the whole subtree.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -39,11 +45,12 @@ use crate::kernel::{INIT, Kernel, Tid};
 use crate::oom::Events;
 use crate::process::ThreadGroup;
 
-/// 根 cgroup 的编号（也是它的 inode 号，与 Linux 一样是 1）。
+/// The root cgroup's id (also its inode number, 1 as on Linux).
 pub(crate) const ROOT: u64 = 1;
 
-/// Linux 的 cgroup v2 控制器（按 ssid 的顺序）和 appine 有没有：`cgroup.controllers` 按这个
-/// 顺序列出，`subtree_control` 写别的名字是 EINVAL，写没有的是 ENOENT。
+/// Linux's cgroup v2 controllers (in ssid order) and whether appine has them: `cgroup.controllers`
+/// lists them in this order; writing any other name to `subtree_control` is EINVAL, and writing
+/// one appine lacks is ENOENT.
 const CONTROLLERS: [(&str, bool); 8] = [
     ("cpuset", true),
     ("cpu", true),
@@ -55,14 +62,14 @@ const CONTROLLERS: [(&str, bool); 8] = [
     ("misc", false),
 ];
 
-/// appine 有的控制器（[`CONTROLLERS`] 里的位）。
+/// The controllers appine has (bits in [`CONTROLLERS`]).
 const AVAILABLE: u32 = 1 | 1 << 1 | 1 << MEMORY | 1 << PIDS;
-/// memory、pids 控制器在 [`CONTROLLERS`] 里的位置。
+/// The positions of the memory and pids controllers in [`CONTROLLERS`].
 const MEMORY: usize = 3;
 const PIDS: usize = 5;
 
-/// cgroup 目录里的文件：名字、权限位、属于哪个控制器（None 是核心文件，每个 cgroup 都有）。
-/// 按名字排好（readdir 的顺序）。
+/// The files in a cgroup directory: name, permission bits, and which controller they belong to
+/// (None is a core file that every cgroup has). Sorted by name (the readdir order).
 pub(crate) const FILES: [(&[u8], u32, Option<usize>); 39] = [
     (b"cgroup.controllers", 0o444, None),
     (b"cgroup.events", 0o444, None),
@@ -105,39 +112,47 @@ pub(crate) const FILES: [(&[u8], u32, Option<usize>); 39] = [
     (b"pids.max", 0o644, Some(5)),
 ];
 
-/// 文件 `name` 的权限位；不是 cgroup 的文件时是 None。
+/// The permission bits of file `name`; None when it is not a cgroup file.
 pub(crate) fn file_mode(name: &[u8]) -> Option<u32> {
     FILES.iter().find(|f| f.0 == name).map(|f| f.1)
 }
 
-/// 一个 cgroup。
+/// One cgroup.
 pub(crate) struct Cgroup {
-    /// 在上级目录里的名字（根是空的）。
+    /// Name in the parent directory (empty for the root).
     pub name: Vec<u8>,
     pub parent: Option<u64>,
-    /// 子 cgroup：名字 → 编号。
+    /// Child cgroups: name → id.
     pub children: BTreeMap<Vec<u8>, u64>,
-    /// `cgroup.subtree_control`：给子 cgroup 开的控制器（[`CONTROLLERS`] 里的位）。
+    /// `cgroup.subtree_control`: the controllers enabled for child cgroups (bits in
+    /// [`CONTROLLERS`]).
     pub subtree_control: u32,
-    /// 目录和文件的属主（建立它的进程的 fsuid、fsgid，Linux 的 `cgroup_kn_set_ugid`）。
+    /// Owner of the directory and its files (the fsuid and fsgid of the process that created it,
+    /// Linux's `cgroup_kn_set_ugid`).
     pub uid: u32,
     pub gid: u32,
-    /// 写过的接口文件（限制这些）的值，按 Linux 显示的格式；没写过的显示默认值。
+    /// Values of the interface files written (the limits), in the format Linux shows; files not
+    /// written show their defaults.
     pub values: BTreeMap<&'static [u8], String>,
-    /// 因为 pids 的上限没能 fork 的次数（`pids.events` 的 max，记在 fork 的 cgroup 或者离它
-    /// 最近的开了 pids 的祖先上，与 Linux 6.1 一样不往上加）。
+    /// Number of forks that failed because of the pids limit (the max of `pids.events`, recorded
+    /// on the forking cgroup or on its nearest ancestor with pids enabled, not propagated upwards,
+    /// as in Linux 6.1).
     pub pids_events: u64,
-    /// `memory.events`：这里和下面的 cgroup 超出上限、要结束进程、结束了进程的次数。
+    /// `memory.events`: the number of times this cgroup and those below it exceeded their limit,
+    /// needed to kill a process, and killed one.
     pub mem_events: Events,
-    /// `memory.events.local`：只算这个 cgroup 自己的。
+    /// `memory.events.local`: counting only this cgroup's own.
     pub mem_events_local: Events,
-    /// `memory.peak`：量到过的子树的最大用量（字节）。根的是 OOM killer 量的。
+    /// `memory.peak`: the largest subtree usage measured (bytes). The root's is measured by the
+    /// OOM killer.
     pub mem_peak: Cell<u64>,
-    /// `cgroup.freeze`：这个 cgroup 自己要求冻结（祖先的也冻结它，[`Cgroups::freezing`]）。
+    /// `cgroup.freeze`: this cgroup itself asks to be frozen (an ancestor's also freezes it,
+    /// [`Cgroups::freezing`]).
     pub freeze: bool,
-    /// 挂着的设备过滤程序（[`crate::bpf`]），按挂上的先后。
+    /// The attached device filter programs ([`crate::bpf`]), in attach order.
     pub device_progs: Vec<Rc<crate::bpf::Prog>>,
-    /// 挂它们时的标志（`BPF_F_ALLOW_OVERRIDE`、`BPF_F_ALLOW_MULTI`）；都取下之后是 0。
+    /// The flags they were attached with (`BPF_F_ALLOW_OVERRIDE`, `BPF_F_ALLOW_MULTI`); 0 after
+    /// all are detached.
     pub device_flags: u32,
 }
 
@@ -162,7 +177,7 @@ impl Cgroup {
     }
 }
 
-/// 所有的 cgroup，按编号。编号不重复使用。
+/// All cgroups, by id. Ids are never reused.
 pub(crate) struct Cgroups {
     pub map: BTreeMap<u64, Cgroup>,
     next: u64,
@@ -183,31 +198,33 @@ impl Cgroups {
         self.map.get(&id)
     }
 
-    /// `id` 和它的祖先，从它自己开始。
+    /// `id` and its ancestors, starting with itself.
     fn ancestors(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
         std::iter::successors(Some(id), |&c| self.map.get(&c).and_then(|g| g.parent))
     }
 
-    /// `id` 或者它的祖先要求冻结（`cgroup.freeze`）：里面的进程要停下。
+    /// `id` or one of its ancestors asks to be frozen (`cgroup.freeze`): the processes in it must
+    /// stop.
     pub fn freezing(&self, id: u64) -> bool {
         self.ancestors(id)
             .any(|c| self.map.get(&c).is_some_and(|g| g.freeze))
     }
 
-    /// `id` 在 `top` 下面（或者就是它）。
+    /// `id` is below `top` (or is `top` itself).
     pub fn is_within(&self, id: u64, top: u64) -> bool {
         self.ancestors(id).any(|c| c == top)
     }
 
-    /// `id` 下面的 cgroup（不含它自己）的个数。
+    /// The number of cgroups below `id` (not counting itself).
     fn descendants(&self, id: u64) -> usize {
         self.map.get(&id).map_or(0, |g| {
             g.children.values().map(|&c| 1 + self.descendants(c)).sum()
         })
     }
 
-    /// `id` 的路径，相对 `root`（cgroup 命名空间的根）；不在它下面时像 Linux 的
-    /// `kernfs_path_from_node` 那样先用 `..` 回到共同的祖先。
+    /// The path of `id` relative to `root` (the cgroup namespace's root); when it is not below
+    /// it, the path first goes up with `..` to the common ancestor, like Linux's
+    /// `kernfs_path_from_node`.
     pub fn path(&self, id: u64, root: u64) -> String {
         let up: Vec<u64> = self.ancestors(root).collect();
         let mut down = Vec::new();
@@ -233,8 +250,8 @@ impl Cgroups {
         format!("/{}", parts.join("/"))
     }
 
-    /// cgroup `id` 开着的控制器（`cgroup.controllers`）：根的都开着，别的是父 cgroup 的
-    /// `subtree_control`。
+    /// The controllers enabled in cgroup `id` (`cgroup.controllers`): all of them at the root,
+    /// otherwise the parent cgroup's `subtree_control`.
     fn controllers(&self, id: u64) -> u32 {
         match self.map.get(&id).and_then(|g| g.parent) {
             None => AVAILABLE,
@@ -242,7 +259,7 @@ impl Cgroups {
         }
     }
 
-    /// cgroup `id` 目录里有的文件：核心文件，加上开着的控制器的。
+    /// The files in cgroup `id`'s directory: the core files plus those of the enabled controllers.
     pub fn files(&self, id: u64) -> impl Iterator<Item = &'static [u8]> + '_ {
         let on = self.controllers(id);
         FILES
@@ -251,9 +268,9 @@ impl Cgroups {
             .map(|f| f.0)
     }
 
-    /// 在 `parent` 下面建子 cgroup `name`（Linux 的 `cgroup_mkdir`），属主是 `cred` 的
-    /// fsuid、fsgid。已经有同名的是 EEXIST；名字里有换行是 EINVAL；超出祖先的
-    /// `cgroup.max.depth`、`cgroup.max.descendants` 是 EAGAIN。
+    /// Creates child cgroup `name` under `parent` (Linux's `cgroup_mkdir`), owned by `cred`'s
+    /// fsuid and fsgid. An existing name is EEXIST; a newline in the name is EINVAL; exceeding an
+    /// ancestor's `cgroup.max.depth` or `cgroup.max.descendants` is EAGAIN.
     pub fn mkdir(&mut self, parent: u64, name: &[u8], cred: &Cred) -> Result<u64, Errno> {
         let p = self.map.get(&parent).ok_or(Errno::ENOENT)?;
         if p.children.contains_key(name) || self.files(parent).any(|f| f == name) {
@@ -262,7 +279,8 @@ impl Cgroups {
         if name.contains(&b'\n') {
             return Err(Errno::EINVAL);
         }
-        // 每个祖先 a：新 cgroup 在它下面的深度、它下面的 cgroup 数都不能超过它的上限
+        // For each ancestor a: the new cgroup's depth below it and the number of cgroups below it
+        // must not exceed its limits
         for (depth, a) in self.ancestors(parent).enumerate() {
             let limit = |key: &[u8]| {
                 self.map[&a]
@@ -291,8 +309,8 @@ impl Cgroups {
     }
 }
 
-/// 删除 cgroup `id`（Linux 的 `cgroup_rmdir`）：还有进程在里面、还有子 cgroup 时是 EBUSY，
-/// 根删不了（EBUSY）。
+/// Removes cgroup `id` (Linux's `cgroup_rmdir`): EBUSY while it still has processes or child
+/// cgroups; the root cannot be removed (EBUSY).
 pub(crate) fn rmdir(k: &mut Kernel, id: u64) -> Result<(), Errno> {
     let g = k.cgroups.map.get(&id).ok_or(Errno::ENOENT)?;
     let Some(parent) = g.parent else {
@@ -309,7 +327,7 @@ pub(crate) fn rmdir(k: &mut Kernel, id: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 还活着（有线程）的进程所在的 cgroup。
+/// The cgroups of processes still alive (with threads).
 fn members(k: &Kernel) -> impl Iterator<Item = (Tid, u64)> + '_ {
     k.groups.iter().filter_map(|(&tgid, g)| {
         let g = g.borrow();
@@ -317,23 +335,25 @@ fn members(k: &Kernel) -> impl Iterator<Item = (Tid, u64)> + '_ {
     })
 }
 
-/// 进程 `tgid` 所在的 cgroup。
+/// The cgroup of process `tgid`.
 fn group_cgroup(k: &Kernel, tgid: Tid) -> Option<u64> {
     k.groups.get(&tgid).map(|g| g.borrow().cgroup)
 }
 
-/// cgroup `id` 或者它下面有活着的进程（`cgroup.events` 的 populated）。
+/// Cgroup `id` or one below it has live processes (`populated` in `cgroup.events`).
 fn populated(k: &Kernel, id: u64) -> bool {
     members(k).any(|(_, c)| k.cgroups.is_within(c, id))
 }
 
-/// `/proc/<pid>/cgroup`：进程所在的 cgroup，相对读者的 cgroup 命名空间的根 `root`。
+/// `/proc/<pid>/cgroup`: the process's cgroup, relative to the root `root` of the reader's cgroup
+/// namespace.
 pub(crate) fn proc_cgroup(k: &Kernel, cgroup: u64, root: u64) -> String {
     format!("0::{}\n", k.cgroups.path(cgroup, root))
 }
 
-/// `/proc/cgroups`：cgroup v2 下各个控制器的层级都是 0（JVM 据此认出 cgroup v2），
-/// num_cgroups 是 cgroup 的个数。cpuacct 在 v2 里并进了 cpu，仍然列出。
+/// `/proc/cgroups`: under cgroup v2 every controller's hierarchy is 0 (the JVM uses this to
+/// recognize cgroup v2), and num_cgroups is the number of cgroups. cpuacct is merged into cpu in
+/// v2 but still listed.
 pub(crate) fn proc_cgroups(k: &Kernel) -> String {
     let mut s = String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n");
     let n = k.cgroups.map.len();
@@ -343,7 +363,7 @@ pub(crate) fn proc_cgroups(k: &Kernel) -> String {
     s
 }
 
-/// 控制器的位掩码按 [`CONTROLLERS`] 的顺序列出名字，以空格分开。
+/// Lists the names in a controller bitmask in [`CONTROLLERS`] order, separated by spaces.
 fn names(mask: u32) -> String {
     let names: Vec<&str> = CONTROLLERS
         .iter()
@@ -354,7 +374,7 @@ fn names(mask: u32) -> String {
     names.join(" ")
 }
 
-/// cgroup `id` 里的 `<name>` 的内容；不是它的文件时是 None。
+/// The contents of `<name>` in cgroup `id`; None when it is not one of its files.
 pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
     let g = k.cgroups.get(id)?;
     if !k.cgroups.files(id).any(|f| f == name) {
@@ -369,7 +389,7 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
         }
     };
     let cpus = appine_hal::host_cpus().len();
-    // 子树里的进程、线程
+    // Processes and threads in the subtree
     let in_tree = |c: u64| k.cgroups.is_within(c, id);
     let procs = || members(k).filter(|&(_, c)| c == id).map(|(t, _)| t);
     let tasks = || {
@@ -382,7 +402,8 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
     }
     let s = match name {
         b"cgroup.controllers" => names(k.cgroups.controllers(id)),
-        // 控制器的列表只在列出了名字时才换行（Linux 的 cgroup_print_ss_mask）
+        // A controller list ends with a newline only when it lists names (Linux's
+        // cgroup_print_ss_mask)
         b"cgroup.subtree_control" if g.subtree_control == 0 => return Some(String::new()),
         b"cgroup.subtree_control" => names(g.subtree_control),
         b"cgroup.type" => "domain".to_owned(),
@@ -432,7 +453,8 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
         b"cpuset.cpus.effective" if cpus > 1 => format!("0-{}", cpus - 1),
         b"cpuset.cpus.effective" | b"cpuset.mems.effective" => "0".to_owned(),
         b"cpuset.cpus.partition" => "member".to_owned(),
-        // 根的内存是 OOM killer 量的整个 App 的；子 cgroup 的是里面的进程的驻留内存之和
+        // The root's memory is the whole app's, measured by the OOM killer; a child cgroup's is
+        // the sum of its processes' resident memory
         b"memory.current" if root => k.oom.measure().to_string(),
         b"memory.peak" if root => {
             k.oom.measure();
@@ -458,13 +480,13 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
         b"memory.swap.events" => "high 0\nmax 0\nfail 0".to_owned(),
         b"pids.current" => pids_current(k, id).to_string(),
         b"pids.events" => format!("max {}", g.pids_events),
-        // 只能写的（cgroup.kill）
+        // Write-only ones (cgroup.kill)
         _ => return None,
     };
     Some(s + "\n")
 }
 
-/// `memory.events` 的内容（low、high 总是 0：没有回收）。
+/// The contents of `memory.events` (low and high are always 0: there is no reclaim).
 fn events(e: &Events) -> String {
     format!(
         "low 0\nhigh 0\nmax {}\noom {}\noom_kill {}\noom_group_kill {}",
@@ -472,8 +494,9 @@ fn events(e: &Events) -> String {
     )
 }
 
-/// cgroup `id` 子树里的任务数（`pids.current`）：与 Linux 一样到回收为止都算，进程的
-/// 活着的线程，主线程退出了（僵尸进程、主线程先退出的进程）的再加 1。
+/// The number of tasks in cgroup `id`'s subtree (`pids.current`): as on Linux, tasks count until
+/// they are reaped: a process's live threads, plus 1 when its main thread has exited (zombie
+/// processes, processes whose main thread exited first).
 fn pids_current(k: &Kernel, id: u64) -> usize {
     k.groups
         .iter()
@@ -484,9 +507,10 @@ fn pids_current(k: &Kernel, id: u64) -> usize {
         .sum()
 }
 
-/// fork 出一个任务放进 cgroup `dst` 之前（Linux 的 `pids_can_fork`）：它和每个开了 pids 的
-/// 祖先的任务数都不能超过 `pids.max`，超过是 EAGAIN，记进离它最近的开了 pids 的 cgroup 的
-/// `pids.events`，第一次时写一条内核日志。
+/// Before a forked task is placed into cgroup `dst` (Linux's `pids_can_fork`): the task count of
+/// it and of every ancestor with pids enabled must not exceed `pids.max`; exceeding it is EAGAIN,
+/// recorded in the `pids.events` of the nearest cgroup with pids enabled, with a kernel log
+/// message the first time.
 pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
     let enabled = |c: u64| k.cgroups.controllers(c) & 1 << PIDS != 0;
     let Some(css) = k.cgroups.ancestors(dst).find(|&c| enabled(c)) else {
@@ -514,8 +538,8 @@ pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
     Err(Errno::EAGAIN)
 }
 
-/// 设了 `memory.max` 的 cgroup（开着 memory 控制器的）和上限（字节）。根的上限是 OOM killer
-/// 的，不在这里。
+/// The cgroups with `memory.max` set (and the memory controller enabled) and their limits
+/// (bytes). The root's limit is the OOM killer's and is not included here.
 pub(crate) fn memory_limits(k: &Kernel) -> Vec<(u64, u64)> {
     k.cgroups
         .map
@@ -525,7 +549,7 @@ pub(crate) fn memory_limits(k: &Kernel) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// 量 cgroup `id` 的内存用量（字节），顺便记下峰值。
+/// Measures cgroup `id`'s memory usage (bytes), recording the peak on the way.
 pub(crate) fn measure_memory(k: &Kernel, id: u64) -> u64 {
     let used = subtree_rss(k, id);
     if let Some(g) = k.cgroups.get(id) {
@@ -534,8 +558,8 @@ pub(crate) fn measure_memory(k: &Kernel, id: u64) -> u64 {
     used
 }
 
-/// 记一次内存事件（Linux 的 `memcg_memory_event`）：`id` 自己的 `memory.events.local`，
-/// 它和祖先的 `memory.events`。
+/// Records a memory event (Linux's `memcg_memory_event`): in `id`'s own `memory.events.local`
+/// and in the `memory.events` of it and its ancestors.
 pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
     let chain: Vec<u64> = k.cgroups.ancestors(id).collect();
     for c in chain {
@@ -548,8 +572,8 @@ pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
     }
 }
 
-/// 进程 `victim` 所在的 cgroup 到 OOM 的范围 `domain` 之间、设了 `memory.oom.group` 的最上面
-/// 那个（Linux 的 `mem_cgroup_get_oom_group`）：要连同它里面的进程一起结束。
+/// The topmost cgroup with `memory.oom.group` set between process `victim`'s cgroup and the OOM
+/// domain `domain` (Linux's `mem_cgroup_get_oom_group`): the processes in it are killed together.
 pub(crate) fn oom_group(k: &Kernel, victim: u64, domain: u64) -> Option<u64> {
     if !k.cgroups.is_within(victim, domain) {
         return None;
@@ -567,7 +591,8 @@ pub(crate) fn oom_group(k: &Kernel, victim: u64, domain: u64) -> Option<u64> {
     group
 }
 
-/// cgroup `id` 子树里的进程的驻留内存之和（字节）：子 cgroup 的 `memory.current`。
+/// The sum of the resident memory of the processes in cgroup `id`'s subtree (bytes): a child
+/// cgroup's `memory.current`.
 fn subtree_rss(k: &Kernel, id: u64) -> u64 {
     members(k)
         .filter(|&(_, c)| k.cgroups.is_within(c, id))
@@ -580,29 +605,31 @@ fn subtree_rss(k: &Kernel, id: u64) -> u64 {
         .sum()
 }
 
-/// 子 cgroup 的 `memory.stat`：只知道驻留内存，都算匿名内存。
+/// A child cgroup's `memory.stat`: only resident memory is known, and all of it counts as
+/// anonymous memory.
 fn child_memory_stat(rss: u64) -> String {
     memory_stat_with(rss, 0)
 }
 
-/// 写的进程：线程、所在的 pid 命名空间（cgroup.procs 里的编号按它，0 是它自己）、所在的
-/// cgroup 命名空间的根。
+/// The writing process: its thread, its pid namespace (ids in cgroup.procs are in it, and 0 is
+/// itself) and the root of its cgroup namespace.
 pub(crate) struct Writer<'a> {
     pub tid: Tid,
     pub pid_ns: &'a crate::pidns::PidNs,
     pub ns_root: u64,
 }
 
-/// 写 cgroup `id` 里的 `<name>`（Linux 6.1 的 `cgroup_file_write` 和各个 cftype 的 `write`）。
+/// Writes `<name>` in cgroup `id` (Linux 6.1's `cgroup_file_write` and each cftype's `write`).
 pub(crate) fn write(
     k: &mut Kernel,
     w: &Writer<'_>,
     (id, name): (u64, &[u8]),
     data: &[u8],
 ) -> Result<(), Errno> {
-    // 命名空间的根上只能写 cgroup.procs、cgroup.threads、cgroup.subtree_control，别的是 EPERM
-    // （nsdelegate）。appine 的根看起来是容器的根，也照这条：写它的 memory.max 这些不改变
-    // OOM killer 的上限，与容器里一样不让写
+    // On a namespace root only cgroup.procs, cgroup.threads and cgroup.subtree_control may be
+    // written, anything else is EPERM (nsdelegate). appine's root looks like a container's root
+    // and follows this too: writing its memory.max and the like would not change the OOM
+    // killer's limit, so as in a container it is not allowed
     if (id == w.ns_root || id == ROOT)
         && !matches!(
             name,
@@ -611,7 +638,7 @@ pub(crate) fn write(
     {
         return Err(Errno::EPERM);
     }
-    // 没有写的回调的（只读的文件）
+    // Files with no write callback (read-only files)
     if file_mode(name).is_none_or(|m| m & 0o200 == 0) {
         return Err(Errno::EINVAL);
     }
@@ -628,7 +655,7 @@ pub(crate) fn write(
             migrate(k, tid, (id, w.ns_root), name == b"cgroup.procs")
         }
         b"cgroup.subtree_control" => subtree_control(k, id, text),
-        // 整数，不是 1 是 ERANGE（Linux 的 cgroup_kill_write）
+        // An integer; anything other than 1 is ERANGE (Linux's cgroup_kill_write)
         b"cgroup.kill" => match word.parse::<i32>().map_err(|_| Errno::EINVAL)? {
             1 => {
                 kill(k, id);
@@ -636,7 +663,7 @@ pub(crate) fn write(
             }
             _ => Err(Errno::ERANGE),
         },
-        // 0 或 1，别的整数是 ERANGE（Linux 的 cgroup_freeze_write）
+        // 0 or 1; any other integer is ERANGE (Linux's cgroup_freeze_write)
         b"cgroup.freeze" => {
             let freeze = match word.parse::<i32>().map_err(|_| Errno::EINVAL)? {
                 0 => false,
@@ -664,8 +691,8 @@ pub(crate) fn write(
             let g = k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?;
             let key = FILES.iter().find(|f| f.0 == name).ok_or(Errno::EINVAL)?.0;
             g.values.insert(key, value);
-            // 调低 memory.max：已经超出时马上结束一个进程（Linux 的 memory_max_write 回收
-            // 不了时 OOM，不记 max 事件）
+            // Lowering memory.max: when usage is already over it, kill a process at once (Linux's
+            // memory_max_write OOMs when it cannot reclaim, without recording a max event)
             if let Some(max) = g.values[key]
                 .parse::<u64>()
                 .ok()
@@ -681,12 +708,12 @@ pub(crate) fn write(
     }
 }
 
-/// 限制这些接口文件写进来的值，检查之后换成读出来的格式（Linux 的 page_counter_memparse、
-/// cpu_max_write 这些）。
+/// Checks the values written to the limit interface files and converts them to the format read
+/// back (Linux's page_counter_memparse, cpu_max_write and the like).
 fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
     const PAGE: u64 = 4096;
     let int = |s: &str| s.parse::<i64>().map_err(|_| Errno::EINVAL);
-    // memparse：K、M、G、T 这些后缀
+    // memparse: suffixes such as K, M, G, T
     let bytes = |s: &str| -> Result<u64, Errno> {
         let (num, shift) = match s.char_indices().last() {
             Some((i, c)) if c.is_ascii_alphabetic() => {
@@ -727,11 +754,11 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
         },
         b"pids.max" if word == "max" => "max".to_owned(),
         b"pids.max" => match int(word)? {
-            // PID_MAX_LIMIT（2^22）也行（Linux 的 PIDS_MAX 是它加 1）
+            // PID_MAX_LIMIT (2^22) is accepted too (Linux's PIDS_MAX is that plus 1)
             v if (0..=1 << 22).contains(&v) => v.to_string(),
             _ => return Err(Errno::EINVAL),
         },
-        // 负数是 ERANGE（Linux 的 cgroup_max_depth_write）
+        // Negative numbers are ERANGE (Linux's cgroup_max_depth_write)
         b"cgroup.max.depth" | b"cgroup.max.descendants" if word == "max" => "max".to_owned(),
         b"cgroup.max.depth" | b"cgroup.max.descendants" => match word.parse::<i32>() {
             Ok(v) if v >= 0 => v.to_string(),
@@ -750,7 +777,8 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
             v if v >= 0 => v.to_string(),
             _ => return Err(Errno::EINVAL),
         },
-        // `$MAX $PERIOD`，MAX 是 max 或者微秒数，PERIOD 可以省略（不变）
+        // `$MAX $PERIOD`: MAX is max or a number of microseconds, PERIOD may be omitted
+        // (unchanged)
         b"cpu.max" => {
             let mut it = word.split_ascii_whitespace();
             let quota = it.next().ok_or(Errno::EINVAL)?;
@@ -789,16 +817,17 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
             "root" | "isolated" => return Err(Errno::EINVAL),
             _ => return Err(Errno::EINVAL),
         },
-        // 没有写的接口（cgroup.controllers、memory.current 这些）
+        // Interfaces that cannot be written (cgroup.controllers, memory.current and the like)
         _ => return Err(Errno::EINVAL),
     })
 }
 
-/// 把线程 `tid` 所在的进程（`procs`）或者线程迁移到 cgroup `dst`（Linux 的
-/// `__cgroup_procs_write`、`cgroup_attach_permissions`）：进程不存在是 ESRCH；原来的和目的地
-/// 要都在写的进程的 cgroup 命名空间的根 `ns_root` 下面（ENOENT）；目的地开了控制器（不是根）
-/// 时不能有进程（EBUSY）；domain cgroup 之间单独迁移线程是 EOPNOTSUPP。写 `cgroup.procs`
-/// 要的写权限由打开文件时检查。
+/// Migrates the process of thread `tid` (`procs`) or the thread itself to cgroup `dst` (Linux's
+/// `__cgroup_procs_write`, `cgroup_attach_permissions`): a missing process is ESRCH; the source
+/// and the destination must both be under the root `ns_root` of the writer's cgroup namespace
+/// (ENOENT); a destination with controllers enabled (other than the root) cannot have processes
+/// (EBUSY); migrating a single thread between domain cgroups is EOPNOTSUPP. The write permission
+/// that writing `cgroup.procs` needs is checked when the file is opened.
 fn migrate(k: &mut Kernel, tid: Tid, (dst, ns_root): (u64, u64), procs: bool) -> Result<(), Errno> {
     let tgid = k.tasks.get(&tid).ok_or(Errno::ESRCH)?.tgid;
     if tgid == INIT {
@@ -821,13 +850,15 @@ fn migrate(k: &mut Kernel, tid: Tid, (dst, ns_root): (u64, u64), procs: bool) ->
         return Err(Errno::EBUSY);
     }
     g.borrow_mut().cgroup = dst;
-    // 迁移进冻结的 cgroup 就停下，迁移出来就接着运行（Linux 的 cgroup_freezer_migrate_task）
+    // Migrating into a frozen cgroup stops the process, and migrating out lets it run on (Linux's
+    // cgroup_freezer_migrate_task)
     refreeze(k, &g);
     Ok(())
 }
 
-/// 进程 `group` 按它所在的 cgroup 该不该冻结（[`Cgroups::freezing`]）：变了时叫醒它的
-/// 线程，让它们在返回 guest 之前停下或者离开那里（[`crate::signal::deliver`]）。
+/// Whether process `group` should be frozen according to its cgroup ([`Cgroups::freezing`]): when
+/// that changes, wakes its threads so that they stop before returning to the guest, or leave that
+/// stop ([`crate::signal::deliver`]).
 fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     let freezing = k.cgroups.freezing(group.borrow().cgroup);
     let mut g = group.borrow_mut();
@@ -840,8 +871,9 @@ fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     }
 }
 
-/// cgroup `id` 里的进程打开设备时要跑的程序（Linux 的 `compute_effective_progs`）：从它
-/// 自己往上，自己的都算；已经有了之后，祖先的只在它带 `BPF_F_ALLOW_MULTI` 挂的时候算。
+/// The programs to run when a process in cgroup `id` opens a device (Linux's
+/// `compute_effective_progs`): going up from the cgroup itself, its own programs all count; once
+/// there are some, an ancestor's count only when it attached them with `BPF_F_ALLOW_MULTI`.
 pub(crate) fn effective_device_progs(k: &Kernel, id: u64) -> Vec<Rc<crate::bpf::Prog>> {
     let mut progs: Vec<Rc<crate::bpf::Prog>> = Vec::new();
     for c in k.cgroups.ancestors(id) {
@@ -856,8 +888,9 @@ pub(crate) fn effective_device_progs(k: &Kernel, id: u64) -> Vec<Rc<crate::bpf::
     progs
 }
 
-/// 能不能在 cgroup `id` 上挂程序（Linux 的 `hierarchy_allows_attach`）：往上找到第一个挂了
-/// 程序的祖先，它带 `ALLOW_MULTI` 或者 `ALLOW_OVERRIDE` 挂的才行。
+/// Whether programs may be attached to cgroup `id` (Linux's `hierarchy_allows_attach`): going
+/// up, the first ancestor with programs attached must have attached them with `ALLOW_MULTI` or
+/// `ALLOW_OVERRIDE`.
 pub(crate) fn hierarchy_allows_attach(k: &Kernel, id: u64) -> bool {
     for c in k.cgroups.ancestors(id).skip(1) {
         let Some(g) = k.cgroups.get(c) else {
@@ -873,8 +906,8 @@ pub(crate) fn hierarchy_allows_attach(k: &Kernel, id: u64) -> bool {
     true
 }
 
-/// `cgroup.events` 的 frozen：要求冻结，子树里的线程也都停下了（要退出的不算）。空的
-/// cgroup 要求冻结就是冻结的。
+/// `frozen` in `cgroup.events`: freezing is requested and the threads in the subtree have all
+/// stopped too (exiting ones do not count). An empty cgroup that is asked to freeze is frozen.
 fn frozen(k: &Kernel, id: u64) -> bool {
     k.cgroups.freezing(id)
         && k.tasks.values().all(|t| {
@@ -885,9 +918,10 @@ fn frozen(k: &Kernel, id: u64) -> bool {
         })
 }
 
-/// 写 `cgroup.subtree_control`（Linux 的 `cgroup_subtree_control_write`）：`+名字`、`-名字`，
-/// 以空白分开。不认识的控制器、没有 `+`/`-` 是 EINVAL；要开的不在 `cgroup.controllers` 里是
-/// ENOENT；不是根、里面有进程时不能开（EBUSY）；子 cgroup 还开着的不能关（EBUSY）。
+/// Writes `cgroup.subtree_control` (Linux's `cgroup_subtree_control_write`): `+name` and `-name`,
+/// separated by whitespace. An unknown controller or a missing `+`/`-` is EINVAL; enabling one not
+/// in `cgroup.controllers` is ENOENT; controllers cannot be enabled in a non-root cgroup that has
+/// processes (EBUSY); one a child cgroup still has enabled cannot be disabled (EBUSY).
 fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     let (mut enable, mut disable) = (0u32, 0u32);
     for tok in text.split_ascii_whitespace() {
@@ -931,7 +965,8 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     }
     let g = k.cgroups.map.get_mut(&id).unwrap();
     g.subtree_control = (g.subtree_control | enable) & !disable;
-    // 关掉的控制器在子 cgroup 里的状态（Linux 的 css）丢掉，再开时是默认值
+    // The disabled controller's state in child cgroups (Linux's css) is dropped, and is back to
+    // the defaults when enabled again
     for c in children {
         let Some(child) = k.cgroups.map.get_mut(&c) else {
             continue;
@@ -955,7 +990,7 @@ fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     Ok(())
 }
 
-/// `cgroup.kill`：给子树里的进程都发 SIGKILL（Linux 的 `cgroup_kill`）。
+/// `cgroup.kill`: sends SIGKILL to every process in the subtree (Linux's `cgroup_kill`).
 fn kill(k: &mut Kernel, id: u64) {
     let victims: Vec<Tid> = members(k)
         .filter(|&(_, c)| k.cgroups.is_within(c, id))
@@ -971,9 +1006,10 @@ fn kill(k: &mut Kernel, id: u64) {
     }
 }
 
-/// 能不能把从 cgroup `src` 里 fork 出来的子进程放进 cgroup `dst`（clone3 的
-/// `CLONE_INTO_CGROUP`，Linux 的 `cgroup_css_set_fork`）：已经删了是 ENODEV；两个都要在调用者的
-/// cgroup 命名空间的根 `ns_root` 下面（ENOENT）；开了控制器（不是根）的不能有进程（EBUSY）。
+/// Whether a child forked from cgroup `src` may be placed into cgroup `dst` (clone3's
+/// `CLONE_INTO_CGROUP`, Linux's `cgroup_css_set_fork`): an already removed one is ENODEV; both
+/// must be under the root `ns_root` of the caller's cgroup namespace (ENOENT); one with
+/// controllers enabled (other than the root) cannot have processes (EBUSY).
 pub(crate) fn may_enter(k: &Kernel, src: u64, dst: u64, ns_root: u64) -> Result<(), Errno> {
     let g = k.cgroups.get(dst).ok_or(Errno::ENODEV)?;
     if !k.cgroups.is_within(src, ns_root) || !k.cgroups.is_within(dst, ns_root) {
@@ -985,17 +1021,18 @@ pub(crate) fn may_enter(k: &Kernel, src: u64, dst: u64, ns_root: u64) -> Result<
     Ok(())
 }
 
-/// `memory.stat`，按 Linux 6.1 的 `memory_stat_format`（有 swap 和透明大页、没有 zswap 的
-/// 配置），单位是字节。只量得到宿主进程的匿名内存（与 `memory.current` 相同）：私有的和换出的
-/// 算 anon，共享的算 shmem（Linux 的 file 包括 shmem），都在 active_anon 里；没有可以回收的
-/// 页缓存，inactive_file 是 0。.NET 的 GC 按 `memory.current` 减去 inactive_file 算用量，没有
-/// 这个文件就只看自己进程的 RSS。
+/// `memory.stat`, following Linux 6.1's `memory_stat_format` (for a configuration with swap and
+/// transparent huge pages but no zswap), in bytes. Only the host process's anonymous memory can be
+/// measured (the same as `memory.current`): private and swapped-out memory counts as anon, shared
+/// as shmem (Linux's file includes shmem), all in active_anon; there is no reclaimable page cache,
+/// so inactive_file is 0. .NET's GC computes usage as `memory.current` minus inactive_file, and
+/// without this file looks only at its own process's RSS.
 fn memory_stat() -> String {
     let u = crate::oom::app_memory().unwrap_or_default();
     memory_stat_with(u.anon + u.swap, u.shmem)
 }
 
-/// [`memory_stat`] 的格式：匿名内存 `anon`、共享内存 `shmem`（字节）。
+/// The format of [`memory_stat`]: anonymous memory `anon` and shared memory `shmem` (bytes).
 fn memory_stat_with(anon: u64, shmem: u64) -> String {
     let mut s = String::new();
     let mut put = |name: &str, v: u64| writeln!(s, "{name} {v}").unwrap();
@@ -1063,7 +1100,7 @@ fn memory_stat_with(anon: u64, shmem: u64) -> String {
     s
 }
 
-/// 每行一个编号，从小到大。
+/// One id per line, in increasing order.
 fn list(ids: impl Iterator<Item = crate::kernel::Tid>) -> String {
     let mut ids: Vec<_> = ids.collect();
     ids.sort_unstable();
@@ -1075,8 +1112,9 @@ fn list(ids: impl Iterator<Item = crate::kernel::Tid>) -> String {
 mod tests {
     use super::*;
 
-    /// 建子 cgroup：重名（含这个 cgroup 有的接口文件）是 EEXIST，换行是 EINVAL；子 cgroup
-    /// 的文件按父 cgroup 的 subtree_control；路径相对命名空间的根，不在下面时先用 `..`。
+    /// Creating child cgroups: duplicate names (including this cgroup's interface files) are
+    /// EEXIST, newlines EINVAL; a child cgroup's files follow its parent's subtree_control; paths
+    /// are relative to the namespace root, starting with `..` when not below it.
     #[test]
     fn tree_and_paths() {
         let mut c = Cgroups::default();
@@ -1085,7 +1123,7 @@ mod tests {
         assert_eq!(c.mkdir(ROOT, b"t", &cred), Err(Errno::EEXIST));
         assert_eq!(c.mkdir(ROOT, b"cgroup.procs", &cred), Err(Errno::EEXIST));
         assert_eq!(c.mkdir(ROOT, b"a\nb", &cred), Err(Errno::EINVAL));
-        // t 没开 memory，可以建叫 memory.max 的子 cgroup
+        // t has no memory enabled, so a child cgroup named memory.max can be created
         assert!(!c.files(t).any(|f| f == b"memory.max"));
         assert!(c.mkdir(t, b"memory.max", &cred).is_ok());
         c.map.get_mut(&ROOT).unwrap().subtree_control = 1 << 3;
@@ -1101,7 +1139,7 @@ mod tests {
         assert_eq!(c.descendants(ROOT), 4);
     }
 
-    /// 祖先的 cgroup.max.depth、cgroup.max.descendants 限制新建的（EAGAIN）。
+    /// An ancestor's cgroup.max.depth and cgroup.max.descendants limit new cgroups (EAGAIN).
     #[test]
     fn depth_and_descendant_limits() {
         let mut c = Cgroups::default();
@@ -1121,7 +1159,7 @@ mod tests {
         assert_eq!(c.mkdir(t, b"b", &cred), Err(Errno::EAGAIN));
     }
 
-    /// 接口文件的值按 Linux 的格式检查、换算。
+    /// Interface file values are checked and converted in Linux's format.
     #[test]
     fn values() {
         assert_eq!(parse_value(b"memory.max", "1M").unwrap(), "1048576");

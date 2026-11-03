@@ -1,9 +1,10 @@
-//! 合成文件系统（kernel/procfs 的 map）：procfs、devpts、sysfs（CPU 的拓扑、网络接口）和
-//! cgroup2，开机时挂在 `/proc`、`/dev/pts`、`/sys`、`/sys/fs/cgroup` 上。
+//! Synthetic filesystems (the kernel/procfs map): procfs, devpts, sysfs (CPU topology, network
+//! interfaces) and cgroup2, mounted at boot on `/proc`, `/dev/pts`, `/sys` and `/sys/fs/cgroup`.
 //!
-//! 节点是 [`PseudoNode`]，目录结构经由 [`View`]（持有 BKL 时对内核状态的只读视图）
-//! 实现 [`Pseudo`]。procfs 的文件在打开时生成一份完整的内容（[`content`]），
-//! 之后的读都在这份快照上进行，与 Linux 的 seq_file 一次读完时的效果相同。
+//! Nodes are [`PseudoNode`]s, and the directory structure implements [`Pseudo`] through [`View`]
+//! (a read-only view of kernel state taken while holding the BKL). A procfs file generates its
+//! complete contents when opened ([`content`]), and later reads all work on that snapshot, with
+//! the same effect as a Linux seq_file read in one go.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -33,7 +34,7 @@ use crate::vfs::dev::rdev;
 use crate::vfs::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::vfs::{Fs, MountId, Node, Pseudo, Vfs};
 
-/// `/proc` 下的全局文件。
+/// Global files under `/proc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Global {
     Cpuinfo,
@@ -44,13 +45,14 @@ pub(crate) enum Global {
     Version,
     Filesystems,
     Cmdline,
-    /// 指向 `self/mounts` 的符号链接。
+    /// A symlink to `self/mounts`.
     Mounts,
-    /// 指向 `self/net` 的符号链接。
+    /// A symlink to `self/net`.
     Net,
-    /// cgroup 的控制器（[`crate::cgroup`]）。
+    /// cgroup controllers ([`crate::cgroup`]).
     Cgroups,
-    /// syslog 的读（[`crate::klog`]）：内容不在打开时生成，读的时候取。
+    /// syslog reading ([`crate::klog`]): the contents are not generated at open but taken at read
+    /// time.
     Kmsg,
 }
 
@@ -69,7 +71,7 @@ const GLOBALS: [(&[u8], Global); 12] = [
     (b"kmsg", Global::Kmsg),
 ];
 
-/// `/proc/<pid>` 下的项。
+/// Entries under `/proc/<pid>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Entry {
     Auxv,
@@ -80,7 +82,8 @@ pub(crate) enum Entry {
     Comm,
     Environ,
     Limits,
-    /// 线程建的子进程（只在 `task/<tid>/` 下，Linux 的 `CONFIG_PROC_CHILDREN`）。
+    /// Child processes the thread created (only under `task/<tid>/`, Linux's
+    /// `CONFIG_PROC_CHILDREN`).
     Children,
     Maps,
     Mem,
@@ -95,26 +98,27 @@ pub(crate) enum Entry {
     Fd,
     FdInfo,
     Task,
-    /// 网络命名空间的文件（[`PROC_NET`]），所有进程都在同一个命名空间里。
+    /// Files of the network namespace ([`PROC_NET`]); all processes are in the same namespace.
     Net,
     OomScoreAdj,
     CoredumpFilter,
-    /// 所在的 cgroup（[`crate::cgroup`]）。
+    /// The cgroup it is in ([`crate::cgroup`]).
     Cgroup,
-    /// 命名空间的目录（[`NsKind`]）。
+    /// The namespace directory ([`NsKind`]).
     Ns,
-    /// 用户命名空间的 ID 映射（user_namespaces(7)）：`uid_map`、`gid_map`、`projid_map`，
-    /// 以及 `setgroups`。
+    /// The user namespace's ID maps (user_namespaces(7)): `uid_map`, `gid_map`, `projid_map`,
+    /// and `setgroups`.
     UidMap,
     GidMap,
     ProjidMap,
     Setgroups,
-    /// 给子进程用的 time 命名空间的偏移（[`crate::nsproxy::TimeNs`]），只在 `/proc/<pid>` 下。
+    /// The time namespace offsets for children ([`crate::nsproxy::TimeNs`]), only under
+    /// `/proc/<pid>`.
     TimensOffsets,
 }
 
-/// 命名空间的种类（`/proc/<pid>/ns` 里的项）。只有挂载命名空间可以新建，别的都是开机时的
-/// 那个。
+/// Namespace kinds (the entries in `/proc/<pid>/ns`). Only mount namespaces can be created; all
+/// the others are the boot-time one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NsKind {
     Cgroup,
@@ -130,7 +134,7 @@ pub(crate) enum NsKind {
 }
 
 impl NsKind {
-    /// 按名字排好的（`/proc/<pid>/ns` 的列表）。
+    /// Sorted by name (the listing of `/proc/<pid>/ns`).
     pub(crate) const ALL: [NsKind; 10] = [
         NsKind::Cgroup,
         NsKind::Ipc,
@@ -144,7 +148,7 @@ impl NsKind {
         NsKind::Uts,
     ];
 
-    /// `/proc/<pid>/ns` 里的名字。
+    /// The name in `/proc/<pid>/ns`.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             NsKind::Cgroup => "cgroup",
@@ -160,7 +164,7 @@ impl NsKind {
         }
     }
 
-    /// 链接内容里的类型（`*_for_children` 与对应的相同）。
+    /// The type in the link contents (`*_for_children` is the same as its counterpart).
     pub(crate) const fn type_name(self) -> &'static str {
         match self {
             NsKind::PidForChildren => "pid",
@@ -169,7 +173,7 @@ impl NsKind {
         }
     }
 
-    /// setns 的 `nstype`（`CLONE_NEW*`）。
+    /// setns's `nstype` (`CLONE_NEW*`).
     pub(crate) const fn clone_flag(self) -> u64 {
         match self {
             NsKind::Cgroup => 0x0200_0000,
@@ -183,10 +187,10 @@ impl NsKind {
         }
     }
 
-    /// 线程 `task` 的这种命名空间的编号（inode 号）：挂载命名空间的按它的 `FsContext`，
-    /// 用户命名空间的按它的凭据，pid 命名空间的按它的进程和线程，UTS、IPC 的按它的
-    /// [`crate::nsproxy::NsProxy`]，别的是开机时的那个（与 Linux 常见的编号相同）。没有时
-    /// （ENOENT）是 None。
+    /// The id (inode number) of this kind of namespace of thread `task`: for mount namespaces by
+    /// its `FsContext`, for user namespaces by its credentials, for pid namespaces by its process
+    /// and thread, for UTS and IPC by its [`crate::nsproxy::NsProxy`], and the boot-time one for
+    /// the others (with the ids Linux commonly uses). None when there is none (ENOENT).
     pub(crate) fn id_of(self, k: &Kernel, task: &Task) -> Option<u64> {
         let group = k.groups.get(&task.tgid);
         Some(match self {
@@ -196,8 +200,8 @@ impl NsKind {
             NsKind::Ipc => task.ns.borrow().ipc.id,
             NsKind::Net => task.ns.borrow().net.id,
             NsKind::Pid => k.pid_ns_of(task.tgid).id,
-            // unshare 了、还没有建子进程时没有（Linux 的 pidns_for_children_get 看
-            // child_reaper）
+            // None after unshare until a child is created (Linux's pidns_for_children_get looks
+            // at child_reaper)
             NsKind::PidForChildren => {
                 let ns = task.pid_ns_children.borrow().clone();
                 let ns = ns.unwrap_or_else(|| k.pid_ns_of(task.tgid));
@@ -248,7 +252,7 @@ const ENTRIES: [(&[u8], Entry); 32] = [
     (b"timens_offsets", Entry::TimensOffsets),
 ];
 
-/// `/proc/<pid>/net` 下的文件。与 Linux 一样，`/proc/net` 是指向 `self/net` 的链接。
+/// The files under `/proc/<pid>/net`. As on Linux, `/proc/net` is a link to `self/net`.
 const PROC_NET: [&[u8]; 18] = [
     b"arp",
     b"dev",
@@ -270,9 +274,10 @@ const PROC_NET: [&[u8]; 18] = [
     b"unix",
 ];
 
-/// `/proc/sys`、`/proc/sysvipc` 下固定的目录和文件（相对 `/proc` 的路径，目录以 `/` 结尾）。
-/// `sys/net` 下的按读者所在的网络命名空间（与 Linux 一样），`ipv4/conf`、`ipv6/conf` 下的
-/// 目录是 [`PseudoNode::NetConf`]。
+/// The fixed directories and files under `/proc/sys` and `/proc/sysvipc` (paths relative to
+/// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
+/// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
+/// [`PseudoNode::NetConf`].
 const STATIC: [&[u8]; 90] = [
     b"sys/",
     b"sys/fs/",
@@ -366,9 +371,10 @@ const STATIC: [&[u8]; 90] = [
     b"sysvipc/shm",
 ];
 
-/// `/sys` 下固定的目录和文件（相对 `/sys` 的路径，目录以 `/` 结尾）。CPU 的拓扑：busybox
-/// 的 `nproc --all`、lscpu、glibc 的 get_nprocs 读它们，各个 `cpu<n>` 是
-/// [`PseudoNode::SysCpu`]；网络接口（btop 读流量计数），各个接口是 [`PseudoNode::SysNet`]。
+/// The fixed directories and files under `/sys` (paths relative to `/sys`, directories ending in
+/// `/`). CPU topology: busybox's `nproc --all`, lscpu and glibc's get_nprocs read them, and each
+/// `cpu<n>` is a [`PseudoNode::SysCpu`]; network interfaces (btop reads the traffic counters),
+/// each interface a [`PseudoNode::SysNet`].
 const SYS_STATIC: [&[u8]; 11] = [
     b"class/",
     b"class/net/",
@@ -383,12 +389,12 @@ const SYS_STATIC: [&[u8]; 11] = [
     b"fs/cgroup/",
 ];
 
-/// `/sys/class/net`：各个接口在它下面。
+/// `/sys/class/net`: the interfaces are under it.
 const SYS_NET_DIR: &[u8] = b"class/net/";
 
-/// `/sys/class/net/<接口>` 下的目录和文件（相对接口目录的路径），取值见 [`net_file`]。
-/// Linux 上的接口目录是指向 `/sys/devices` 下面的符号链接，这里是目录：宿主上的设备路径
-/// 拿不到。
+/// The directories and files under `/sys/class/net/<interface>` (paths relative to the interface
+/// directory), with values from [`net_file`]. On Linux the interface directories are symlinks into
+/// `/sys/devices`; here they are directories: the device paths on the host are not available.
 const NET_FILES: [&[u8]; 36] = [
     b"addr_len",
     b"address",
@@ -428,8 +434,9 @@ const NET_FILES: [&[u8]; 36] = [
     b"statistics/tx_window_errors",
 ];
 
-/// bridge 的 `/sys/class/net/<接口>` 下另有的（`brif/<端口>` 是 [`PseudoNode::SysBrif`]）。
-/// dockerd 读 `bridge/stp_state` 和端口的 `state`，等端口进入转发状态。
+/// The extra ones under a bridge's `/sys/class/net/<interface>` (`brif/<port>` is a
+/// [`PseudoNode::SysBrif`]). dockerd reads `bridge/stp_state` and the ports' `state`, waiting for
+/// the ports to reach the forwarding state.
 const BRIDGE_FILES: [&[u8]; 10] = [
     b"bridge/",
     b"bridge/ageing_time",
@@ -443,7 +450,7 @@ const BRIDGE_FILES: [&[u8]; 10] = [
     b"brif/",
 ];
 
-/// bridge 的端口的 `/sys/class/net/<接口>` 下另有的。
+/// The extra ones under a bridge port's `/sys/class/net/<interface>`.
 const PORT_FILES: [&[u8]; 4] = [
     b"brport/",
     b"brport/path_cost",
@@ -451,10 +458,11 @@ const PORT_FILES: [&[u8]; 4] = [
     b"brport/state",
 ];
 
-/// `/sys/devices/system/cpu`：各个 `cpu<n>` 在它下面。
+/// `/sys/devices/system/cpu`: each `cpu<n>` is under it.
 const SYS_CPU_DIR: &[u8] = b"devices/system/cpu/";
 
-/// `/sys/devices/system/cpu/cpu<n>` 下的目录和文件（相对 `cpu<n>` 的路径）。
+/// The directories and files under `/sys/devices/system/cpu/cpu<n>` (paths relative to
+/// `cpu<n>`).
 const CPU_FILES: [&[u8]; 19] = [
     b"online",
     b"regs/",
@@ -477,10 +485,12 @@ const CPU_FILES: [&[u8]; 19] = [
     b"topology/thread_siblings_list",
 ];
 
-/// `/sys/devices/system/cpu/cpu<n>` 下照搬宿主的目录和文件：缓存（`cache/`）和频率
-/// （`cpufreq/`）。宿主对应的 CPU 有才有（[`host_cpu_has`]），内容也是宿主的，里面的 CPU
-/// 编号换成 guest 的。lscpu、hwloc、OpenBLAS 读缓存的大小，Node.js 的 `os.cpus()` 读
-/// `cpufreq/scaling_cur_freq`；没有 cpufreq 的宿主（虚拟机）上它们也没有，与 Linux 一样。
+/// The directories and files under `/sys/devices/system/cpu/cpu<n>` copied from the host: caches
+/// (`cache/`) and frequencies (`cpufreq/`). They exist only when the corresponding host CPU has
+/// them ([`host_cpu_has`]); the contents are the host's too, with the CPU numbers inside changed
+/// to the guest's. lscpu, hwloc and OpenBLAS read the cache sizes, and Node.js's `os.cpus()`
+/// reads `cpufreq/scaling_cur_freq`; on hosts without cpufreq (virtual machines) they are absent,
+/// as on Linux.
 const HOST_CPU_FILES: [&[u8]; 68] = [
     b"cache/",
     b"cache/index0/",
@@ -552,8 +562,8 @@ const HOST_CPU_FILES: [&[u8]; 68] = [
     b"cpufreq/scaling_setspeed",
 ];
 
-/// 固定的目录树（[`STATIC`] 这样相对树根的路径，目录以 `/` 结尾）里，目录 `dir`（树根是
-/// 空的）下名为 `name` 的项。
+/// The entry named `name` under directory `dir` (empty for the tree root) in a fixed directory
+/// tree (paths relative to the tree root like [`STATIC`], directories ending in `/`).
 fn tree_lookup(tree: &[&'static [u8]], dir: &[u8], name: &[u8]) -> Option<&'static [u8]> {
     tree.iter().copied().find(|p| {
         let p = p.strip_suffix(b"/").unwrap_or(p);
@@ -561,7 +571,7 @@ fn tree_lookup(tree: &[&'static [u8]], dir: &[u8], name: &[u8]) -> Option<&'stat
     })
 }
 
-/// 固定的目录树里目录 `dir` 下直接的项。
+/// The direct entries under directory `dir` in a fixed directory tree.
 fn tree_children<'t>(
     tree: &'t [&'static [u8]],
     dir: &'t [u8],
@@ -572,93 +582,97 @@ fn tree_children<'t>(
     })
 }
 
-/// 固定的目录树里的上级目录；直接在树根下的是 None。
+/// The parent directory in a fixed directory tree; None directly under the tree root.
 fn tree_parent(tree: &[&'static [u8]], path: &[u8]) -> Option<&'static [u8]> {
     let p = path.strip_suffix(b"/").unwrap_or(path);
     let i = p.iter().rposition(|&b| b == b'/')?;
     tree.iter().copied().find(|q| *q == &p[..=i])
 }
 
-/// 路径的最后一个组件。
+/// The last component of a path.
 fn tree_name(path: &[u8]) -> &[u8] {
     let p = path.strip_suffix(b"/").unwrap_or(path);
     &p[p.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..]
 }
 
-/// 合成文件系统里的一个节点。
+/// A node in a synthetic filesystem.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PseudoNode {
-    /// devpts 实例（它的设备号，[`crate::tty::PtsOptions`]）的根目录，`/dev/pts`。
+    /// The root directory of a devpts instance (its device number, [`crate::tty::PtsOptions`]),
+    /// `/dev/pts`.
     PtsRoot(u64),
-    /// 实例里的终端，`/dev/pts/<n>`。
+    /// A terminal in the instance, `/dev/pts/<n>`.
     Pts(u64, u32),
-    /// 实例里的 ptmx，`/dev/pts/ptmx`。
+    /// The instance's ptmx, `/dev/pts/ptmx`.
     PtsPtmx(u64),
-    /// `/proc`。
+    /// `/proc`.
     ProcRoot,
-    /// `/proc` 下的全局文件。
+    /// A global file under `/proc`.
     Global(Global),
-    /// `/proc/self`。
+    /// `/proc/self`.
     SelfLink,
-    /// `/proc/thread-self`。
+    /// `/proc/thread-self`.
     ThreadSelf,
-    /// `/proc/sys`、`/proc/sysvipc` 下的目录或文件，取值来自 [`STATIC`]。
+    /// A directory or file under `/proc/sys` or `/proc/sysvipc`, with values from [`STATIC`].
     Static(&'static [u8]),
-    /// `/proc/<pid>`；第二项是 `Some(tid)` 时是 `/proc/<pid>/task/<tid>`。
+    /// `/proc/<pid>`; with `Some(tid)` as the second item it is `/proc/<pid>/task/<tid>`.
     Pid(Tid, Option<Tid>),
-    /// `/proc/<pid>/<项>`（含 task 子目录里的）。
+    /// `/proc/<pid>/<entry>` (including those in the task subdirectories).
     Entry(Tid, Option<Tid>, Entry),
-    /// `/proc/<pid>/net/<名字>`（含 task 子目录里的），名字取值来自 [`PROC_NET`]。
+    /// `/proc/<pid>/net/<name>` (including those in the task subdirectories), with names from
+    /// [`PROC_NET`].
     Net(Tid, Option<Tid>, &'static [u8]),
-    /// `/proc/<pid>/fd/<n>`。
+    /// `/proc/<pid>/fd/<n>`.
     Fd(Tid, i32),
-    /// `/proc/<pid>/fd/<n>` 跟随之后得到的那个打开文件（不在仓库里的那些：管道、宿主 fd）。
+    /// The open file reached by following `/proc/<pid>/fd/<n>` (for those not in the store:
+    /// pipes, host fds).
     OpenFd(Tid, i32),
-    /// `/proc/<pid>/exe` 跟随之后得到的程序文件，已经删除、没法按 inode 打开时
-    /// （[`crate::process::ExeFile`]）。
+    /// The program file reached by following `/proc/<pid>/exe`, when it has been deleted and
+    /// cannot be opened by inode ([`crate::process::ExeFile`]).
     OpenExe(Tid),
-    /// `/proc/<pid>/fdinfo/<n>`。
+    /// `/proc/<pid>/fdinfo/<n>`.
     FdInfo(Tid, i32),
-    /// `/sys`。
+    /// `/sys`.
     SysRoot,
-    /// `/sys` 下的目录或文件，取值来自 [`SYS_STATIC`]。
+    /// A directory or file under `/sys`, with values from [`SYS_STATIC`].
     Sys(&'static [u8]),
-    /// `/sys/devices/system/cpu/cpu<n>`（路径为空），或者它下面的目录和文件（路径取值来自
-    /// [`CPU_FILES`]）。
+    /// `/sys/devices/system/cpu/cpu<n>` (empty path), or a directory or file under it (paths from
+    /// [`CPU_FILES`]).
     SysCpu(u32, &'static [u8]),
-    /// `/sys/class/net/<接口>`（路径为空），或者它下面的目录和文件（路径取值来自
-    /// [`NET_FILES`]）；接口按宿主的接口编号记。
+    /// `/sys/class/net/<interface>` (empty path), or a directory or file under it (paths from
+    /// [`NET_FILES`]); interfaces are recorded by their host interface index.
     SysNet(u32, &'static [u8]),
-    /// `/sys/class/net/<bridge>/brif/<端口>`：指向 `../../<端口>/brport` 的链接（bridge 和
-    /// 端口的接口编号）。
+    /// `/sys/class/net/<bridge>/brif/<port>`: a link to `../../<port>/brport` (the interface
+    /// indexes of the bridge and the port).
     SysBrif(u32, u32),
-    /// cgroup 的目录（名字为空），或者它里面的文件（名字取值来自 [`crate::cgroup::FILES`]）：
-    /// cgroup 的编号和文件名。
+    /// A cgroup directory (empty name), or a file in it (names from [`crate::cgroup::FILES`]): the
+    /// cgroup id and the file name.
     Cgroup(u64, &'static [u8]),
-    /// `/proc/<pid>/ns/<种类>`（含 task 子目录里的）：指向命名空间的魔法链接。
+    /// `/proc/<pid>/ns/<kind>` (including those in the task subdirectories): a magic link to a
+    /// namespace.
     Ns(Tid, Option<Tid>, NsKind),
-    /// `/proc/<pid>/ns/<种类>` 跟随之后得到的命名空间（Linux 的 nsfs 里的文件），按编号。
+    /// The namespace reached by following `/proc/<pid>/ns/<kind>` (a file in Linux's nsfs), by id.
     NsFile(NsKind, u64),
-    /// mqueue 文件系统的根目录：IPC 命名空间（编号）的 POSIX 消息队列
-    /// （[`crate::syscall::MessageQueue`]）。
+    /// The root directory of an mqueue filesystem: the POSIX message queues of an IPC namespace
+    /// (by id) ([`crate::syscall::MessageQueue`]).
     MqRoot(u64),
-    /// mqueue 文件系统里的一个队列：IPC 命名空间和队列的 inode 编号。
+    /// A queue in an mqueue filesystem: the IPC namespace and the queue's inode number.
     Mq(u64, u64),
-    /// `/proc/sys/net/ipv4/conf/<目录>`（第一项是 false）或者 `ipv6/conf/<目录>`（名字为空），
-    /// 或者它下面的一项（名字取值来自 [`crate::netconf`] 的表）；按读者所在的网络命名空间
-    /// （[`crate::netdev::conf_read`]）。
+    /// `/proc/sys/net/ipv4/conf/<dir>` (first item false) or `ipv6/conf/<dir>` (empty name), or an
+    /// entry under it (names from the [`crate::netconf`] tables); follows the reader's network
+    /// namespace ([`crate::netdev::conf_read`]).
     NetConf(bool, crate::netdev::ConfDir, &'static [u8]),
-    /// `/proc/sys/net/` 下的一项 sysctl（[`crate::netconf::SYSCTLS`] 里的，路径如
-    /// `ipv4/tcp_keepalive_time`），按读者所在的网络命名空间。
+    /// A sysctl under `/proc/sys/net/` (one in [`crate::netconf::SYSCTLS`], with paths like
+    /// `ipv4/tcp_keepalive_time`), following the reader's network namespace.
     NetSysctl(&'static str),
 }
 
-/// `ipv4/conf`、`ipv6/conf` 的目录。
+/// The `ipv4/conf` and `ipv6/conf` directories.
 const NET_CONF4: &[u8] = b"sys/net/ipv4/conf/";
 const NET_CONF6: &[u8] = b"sys/net/ipv6/conf/";
 
-/// `/proc/<pid>/task/<tid>` 里的项：线程自己的，以及与进程相同的（调试器读线程的 maps、
-/// mem）。
+/// The entries in `/proc/<pid>/task/<tid>`: the thread's own, and those the same as the
+/// process's (debuggers read a thread's maps and mem).
 const TASK_ENTRIES: [Entry; 27] = [
     Entry::Stat,
     Entry::Status,
@@ -689,8 +703,8 @@ const TASK_ENTRIES: [Entry; 27] = [
     Entry::Setgroups,
 ];
 
-/// `/proc/<pid>`（`tid` 是 None）或者 `/proc/<pid>/task/<tid>` 里有没有 `e` 这一项：
-/// `children` 只在后者里。
+/// Whether `/proc/<pid>` (`tid` is None) or `/proc/<pid>/task/<tid>` has entry `e`: `children`
+/// is only in the latter.
 fn in_pid_dir(tid: Option<Tid>, e: &Entry) -> bool {
     match tid {
         None => *e != Entry::Children,
@@ -698,7 +712,8 @@ fn in_pid_dir(tid: Option<Tid>, e: &Entry) -> bool {
     }
 }
 
-/// 持有 BKL 时对内核状态的只读视图，`tid`/`tgid` 是 `self` 指向的线程。
+/// A read-only view of kernel state taken while holding the BKL; `tid`/`tgid` is the thread
+/// `self` points to.
 pub(crate) struct View<'a> {
     pub k: &'a Kernel,
     pub vfs: &'a Vfs,
@@ -706,7 +721,8 @@ pub(crate) struct View<'a> {
     pub tgid: Tid,
 }
 
-/// 内核还没有启动时（解析第一个程序的路径）用的视图：合成文件系统只有空的根目录。
+/// The view used before the kernel has started (resolving the first program's path): the
+/// synthetic filesystems have only empty root directories.
 pub(crate) struct Offline;
 
 impl Pseudo for Offline {
@@ -730,7 +746,7 @@ impl Pseudo for Offline {
     }
 }
 
-/// 节点所在的文件系统。
+/// The filesystem a node belongs to.
 pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     match node {
         PseudoNode::PtsRoot(_) | PseudoNode::Pts(..) | PseudoNode::PtsPtmx(_) => Fs::Pts,
@@ -746,7 +762,7 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
     }
 }
 
-/// sysfs 里 cgroup2 的挂载点 `fs/cgroup`（没有挂东西时是空目录）。
+/// The cgroup2 mount point `fs/cgroup` in sysfs (an empty directory when nothing is mounted).
 pub(crate) const CGROUP_POINT: PseudoNode = PseudoNode::Sys(b"fs/cgroup/");
 
 fn parse_num(name: &[u8]) -> Option<i64> {
@@ -756,10 +772,11 @@ fn parse_num(name: &[u8]) -> Option<i64> {
     std::str::from_utf8(name).ok()?.parse().ok()
 }
 
-/// 合成节点的 inode 编号：对节点取哈希（同一次运行里稳定），避开 0。各个文件系统的根目录
-/// 与 Linux 一样是 1（procfs 的 `PROC_ROOT_INO`、kernfs 的根、devpts 的根）：runc 打开
-/// `/proc` 之后检查它（pathrs-lite 的 `verifyProcRoot`），不是 1 就当作被换掉的 procfs。
-/// devpts 里的也照 Linux：ptmx 是 2，终端 n 是 n + 3。
+/// The inode number of a synthetic node: a hash of the node (stable within one run), avoiding 0.
+/// Each filesystem's root directory is 1, as on Linux (procfs's `PROC_ROOT_INO`, the kernfs root,
+/// the devpts root): runc checks it after opening `/proc` (pathrs-lite's `verifyProcRoot`) and
+/// treats anything other than 1 as a replaced procfs. devpts follows Linux too: ptmx is 2, and
+/// terminal n is n + 3.
 pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     if matches!(
         node,
@@ -775,7 +792,7 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
         PseudoNode::Pts(_, n) => return *n as u64 + 3,
         _ => {}
     }
-    // 队列按它自己的编号（mq_open 得到的 fd 的 fstat 也是它）
+    // A queue uses its own number (it is also what fstat on an fd from mq_open shows)
     if let PseudoNode::Mq(_, ino) = node {
         return *ino;
     }
@@ -784,11 +801,12 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     h.finish() | 1
 }
 
-/// stat 和 readdir 给出的 inode：`/proc/<pid>` 和它下面的项还取决于是哪个进程，与 Linux
-/// 一样，pid 被新进程重新使用之后 inode 不同。
+/// The inode given by stat and readdir: for `/proc/<pid>` and the entries under it it also
+/// depends on which process it is, so as on Linux the inode differs after a new process reuses
+/// the pid.
 pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
     let pid = match node {
-        // 命名空间的 inode 号就是它的编号
+        // A namespace's inode number is its id
         PseudoNode::NsFile(_, id) => return *id,
         PseudoNode::Pid(pid, _)
         | PseudoNode::Entry(pid, ..)
@@ -809,7 +827,8 @@ pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
 }
 
 impl<'a> View<'a> {
-    /// 读者（`self` 指向的线程）的根目录：procfs 里的路径相对它显示。
+    /// The reader's root directory (the thread `self` points to): paths in procfs are shown
+    /// relative to it.
     fn root(&self) -> Node {
         self.k
             .tasks
@@ -821,7 +840,8 @@ impl<'a> View<'a> {
         self.k.groups.get(&pid).cloned()
     }
 
-    /// 线程组的代表线程（主线程，它已退出时是任意一个活着的线程）。
+    /// The thread group's representative thread (the main thread, or any live thread once it has
+    /// exited).
     fn leader(&self, pid: Tid) -> Option<Rc<Task>> {
         let g = self.group(pid)?;
         let threads = g.borrow().threads.clone();
@@ -832,14 +852,14 @@ impl<'a> View<'a> {
             .and_then(|t| self.k.tasks.get(t).cloned())
     }
 
-    /// 挂载 `mnt`（procfs 的一个实例）的 pid 命名空间：目录名、链接和文件里的 pid 按它
-    /// 算（Linux 的 `proc_pid_ns`）。
+    /// The pid namespace of mount `mnt` (an instance of procfs): pids in directory names, links
+    /// and files are counted in it (Linux's `proc_pid_ns`).
     pub(crate) fn pid_ns(&self, mnt: MountId) -> Rc<PidNs> {
         self.vfs.proc_pid_ns(mnt).unwrap_or_else(PidNs::init)
     }
 
-    /// 读者所在的 pid 命名空间里最后分配的编号（`ns_last_pid`、`loadavg`，Linux 按读者的
-    /// 命名空间，不按挂载的）。
+    /// The last number allocated in the reader's pid namespace (`ns_last_pid`, `loadavg`; Linux
+    /// uses the reader's namespace, not the mount's).
     fn last_pid(&self) -> Tid {
         let ns = self.k.pid_ns_of(self.tgid);
         if ns.level == 0 {
@@ -849,8 +869,8 @@ impl<'a> View<'a> {
         }
     }
 
-    /// 读者（`self` 指向的线程）所在的 UTS、IPC 命名空间：`/proc/sys/kernel/hostname`、
-    /// System V IPC 的限制和 `/proc/sysvipc` 按它。
+    /// The reader's UTS and IPC namespaces (of the thread `self` points to):
+    /// `/proc/sys/kernel/hostname`, the System V IPC limits and `/proc/sysvipc` follow them.
     pub(crate) fn ns(&self) -> crate::nsproxy::NsProxy {
         self.k
             .tasks
@@ -858,15 +878,18 @@ impl<'a> View<'a> {
             .map_or_else(|| self.k.init_ns.clone(), |t| t.ns.borrow().clone())
     }
 
-    /// 读者（`self` 指向的进程）的凭据：procfs 里的 ID 按它的用户命名空间换算。
-    /// 读者所在网络命名空间里编号为 `index` 的接口（宿主的或者 lo，和虚拟设备）。
+    /// The reader's credentials (of the process `self` points to): IDs in procfs are translated
+    /// through its user namespace.
+    /// The interface with index `index` in the reader's network namespace (the host's or lo, and
+    /// virtual devices).
     fn interface(&self, index: u32) -> Option<appine_hal::net::Interface> {
         crate::netdev::interfaces(&self.ns().net)
             .into_iter()
             .find(|i| i.index == index)
     }
 
-    /// 读者所在网络命名空间里编号为 `index` 的接口是不是 bridge、是不是 bridge 的端口。
+    /// Whether the interface with index `index` in the reader's network namespace is a bridge,
+    /// and whether it is a bridge port.
     fn bridge_roles(&self, index: u32) -> (bool, bool) {
         crate::netdev::views(&self.ns().net)
             .into_iter()
@@ -876,7 +899,8 @@ impl<'a> View<'a> {
             })
     }
 
-    /// `/proc/sys/net/ipv*/conf` 下的目录还在（接口没有删掉）。
+    /// The directory under `/proc/sys/net/ipv*/conf` still exists (the interface was not
+    /// removed).
     fn conf_dir_exists(&self, dir: crate::netdev::ConfDir) -> bool {
         match dir {
             crate::netdev::ConfDir::Dev(i) => self.interface(i).is_some(),
@@ -884,7 +908,7 @@ impl<'a> View<'a> {
         }
     }
 
-    /// 读者所在的 cgroup 命名空间的根（cgroup 的编号）。
+    /// The root of the reader's cgroup namespace (a cgroup id).
     pub(crate) fn cgroup_root(&self) -> u64 {
         self.k
             .tasks
@@ -892,8 +916,8 @@ impl<'a> View<'a> {
             .map_or(crate::cgroup::ROOT, |t| t.ns.borrow().cgroup.root)
     }
 
-    /// 开机以来的纳秒数 `ns` 加上读者所在的 time 命名空间里 boottime 的偏移（Linux 的
-    /// `timens_add_boottime_ns`：`/proc/uptime`、进程的启动时间），不小于 0。
+    /// Nanoseconds since boot `ns` plus the boottime offset of the reader's time namespace
+    /// (Linux's `timens_add_boottime_ns`: `/proc/uptime`, process start times), no less than 0.
     fn with_boot_offset(&self, ns: u64) -> u64 {
         let offset = self
             .k
@@ -908,7 +932,7 @@ impl<'a> View<'a> {
             .map_or_else(Cred::root, |g| g.borrow().cred.clone())
     }
 
-    /// `/proc/<pid>/task/<tid>` 用指定的线程，否则用代表线程。
+    /// `/proc/<pid>/task/<tid>` uses the given thread, otherwise the representative thread.
     fn task(&self, pid: Tid, tid: Option<Tid>) -> Option<Rc<Task>> {
         match tid {
             Some(t) => self.k.tasks.get(&t).cloned().filter(|t| t.tgid == pid),
@@ -924,7 +948,7 @@ impl<'a> View<'a> {
         }
     }
 
-    /// 某个进程的打开文件。
+    /// An open file of some process.
     pub(crate) fn open_file(&self, pid: Tid, fd: i32) -> Option<crate::fd::FileRef> {
         let task = self.leader(pid)?;
         let res = task.res.borrow();
@@ -941,7 +965,7 @@ impl Pseudo for View<'_> {
         use PseudoNode::*;
         Some(match node {
             PtsRoot(_) | ProcRoot | SysRoot | MqRoot(_) => return None,
-            // 子 cgroup 的上级是父 cgroup，根没有
+            // A child cgroup's parent is its parent cgroup; the root has none
             Cgroup(id, b"") => Cgroup(self.k.cgroups.get(*id)?.parent?, b""),
             Mq(ns, _) => MqRoot(*ns),
             Pts(fs, _) | PtsPtmx(fs) => PtsRoot(*fs),
@@ -1042,7 +1066,7 @@ impl Pseudo for View<'_> {
 
     fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
         use PseudoNode::*;
-        // 名字里的 pid 是挂载的 pid 命名空间里的编号
+        // The pid in the name is a number in the mount's pid namespace
         let global = |name: &[u8]| {
             let n = Tid::try_from(parse_num(name)?).ok()?;
             self.pid_ns(mnt).find(n)
@@ -1108,7 +1132,7 @@ impl Pseudo for View<'_> {
                 let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                 (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
             }),
-            // 子 cgroup，或者这个 cgroup 有的文件
+            // A child cgroup, or a file this cgroup has
             Cgroup(id, b"") => self.k.cgroups.get(*id).and_then(|g| {
                 g.children.get(name).map(|&c| Cgroup(c, b"")).or_else(|| {
                     self.k
@@ -1144,7 +1168,8 @@ impl Pseudo for View<'_> {
                     .map(|(_, e)| Entry(*pid, *tid, *e))
                     .filter(|_| self.pid_exists(*pid, *tid))
             }
-            // 线程目录里的 fd、fdinfo 也是进程的打开文件（fd 表按进程记）
+            // fd and fdinfo in a thread directory are the process's open files too (the fd table
+            // is kept per process)
             Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => parse_num(name)
                 .map(|fd| fd as i32)
                 .filter(|&fd| self.open_file(*pid, fd).is_some())
@@ -1220,7 +1245,7 @@ impl Pseudo for View<'_> {
 
     fn readlink(&self, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
         use PseudoNode::*;
-        // 读者在挂载的 pid 命名空间里看不到时没有 self、thread-self（ENOENT）
+        // Readers not visible in the mount's pid namespace have no self or thread-self (ENOENT)
         let ns = || self.pid_ns(mnt);
         match node {
             SelfLink => Ok(ns()
@@ -1246,8 +1271,9 @@ impl Pseudo for View<'_> {
                 let root = task.res.borrow().fs.borrow().root.clone();
                 self.vfs.path_of(self, &self.root(), &root)
             }
-            // 与 root、cwd 一样要能看那个进程（Linux 的 proc_pid_readlink、proc_pid_get_link
-            // 都先 proc_fd_access_allowed）。程序文件删除之后与 fd 一样带 ` (deleted)`
+            // As with root and cwd, the reader must be able to see that process (Linux's
+            // proc_pid_readlink and proc_pid_get_link both check proc_fd_access_allowed first).
+            // After the program file is deleted it gets ` (deleted)`, as with fds
             Entry(pid, _, self::Entry::Exe) => {
                 let g = self.group(*pid).ok_or(Errno::ENOENT)?;
                 if !self.may_read(*pid) {
@@ -1302,7 +1328,8 @@ impl Pseudo for View<'_> {
         };
         let file = self.open_file(*pid, *fd)?;
         let f = file.borrow();
-        // 只有不是目录的文件要它（目录的路径按上级目录算）
+        // Only files that are not directories want it (a directory's path is derived from its
+        // parent)
         let dir = match &f.kind {
             FileKind::Path(n) => self.vfs.is_dir(self, n).unwrap_or(true),
             FileKind::Directory { .. } => true,
@@ -1311,8 +1338,9 @@ impl Pseudo for View<'_> {
         f.dentry.clone().filter(|_| !dir)
     }
 
-    /// `/proc/<pid>/fd/<n>`、`ns/*`、`root`、`cwd`、`exe`（Linux 的 proc_pid_get_link、
-    /// proc_ns_get_link 都经由 nd_jump_link）。`/proc/self`、`thread-self` 是普通的链接。
+    /// `/proc/<pid>/fd/<n>`, `ns/*`, `root`, `cwd`, `exe` (Linux's proc_pid_get_link and
+    /// proc_ns_get_link both go through nd_jump_link). `/proc/self` and `thread-self` are ordinary
+    /// links.
     fn magic(&self, node: &PseudoNode) -> bool {
         matches!(
             node,
@@ -1338,8 +1366,9 @@ impl Pseudo for View<'_> {
                 };
                 return Some(Ok(Node::Pseudo(mnt, PseudoNode::NsFile(*k, id))));
             }
-            // 根目录、当前目录直接指到那个进程的节点（Linux 的 proc_root_link、
-            // proc_cwd_link）：经由它们能进到别的挂载命名空间、chroot 的外面
+            // The root and current directories point straight at that process's nodes (Linux's
+            // proc_root_link, proc_cwd_link): through them one can get into other mount
+            // namespaces and outside a chroot
             PseudoNode::Entry(pid, tid, e @ (Entry::Root | Entry::Cwd)) => {
                 let task = self.task(*pid, *tid)?;
                 if !self.may_read(*pid) {
@@ -1352,9 +1381,10 @@ impl Pseudo for View<'_> {
                     _ => fs.cwd.clone(),
                 }));
             }
-            // 程序文件本身（Linux 的 proc_exe_link）：改了名、被删除、被换掉之后仍是原来
-            // 那个。删除了的仓库里的 object 也删了，经由记着的宿主文件打开（OpenExe）。没有
-            // 仓库（开发用的宿主文件）时按读出来的路径跟随
+            // The program file itself (Linux's proc_exe_link): still the original after being
+            // renamed, deleted or replaced. A deleted one's object in the store is deleted too,
+            // so it is opened through the recorded host file (OpenExe). Without a store (host
+            // files for development) it is followed by the path read back
             PseudoNode::Entry(pid, _, Entry::Exe) => {
                 let g = self.group(*pid)?;
                 if !self.may_read(*pid) {
@@ -1378,8 +1408,8 @@ impl Pseudo for View<'_> {
 }
 
 impl View<'_> {
-    /// 读者能不能看进程 `pid` 的根目录、当前目录、程序文件、命名空间（Linux 的
-    /// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`）。
+    /// Whether the reader may look at the root directory, current directory, program file and
+    /// namespaces of process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`).
     fn may_read(&self, pid: Tid) -> bool {
         pid == self.tgid
             || self.group(pid).is_some_and(|g| {
@@ -1388,7 +1418,7 @@ impl View<'_> {
             })
     }
 
-    /// `/proc/<pid>/fd/<n>` 跟随之后的节点（[`Pseudo::follow`]）。
+    /// The node reached by following `/proc/<pid>/fd/<n>` ([`Pseudo::follow`]).
     fn follow_fd(&self, mnt: MountId, node: &PseudoNode) -> Option<Node> {
         let PseudoNode::Fd(pid, fd) = node else {
             return None;
@@ -1396,8 +1426,8 @@ impl View<'_> {
         let file = self.open_file(*pid, *fd)?;
         let f = file.borrow();
         Some(match &f.kind {
-            // 已经删除的文件没法按 inode 重新打开（仓库里的 object 已经删了）：指向打开文件
-            // 本身，重新打开时复制宿主文件
+            // A deleted file cannot be reopened by inode (its object in the store is already
+            // deleted): point at the open file itself, and copy the host file on reopen
             FileKind::Regular { ino, file }
                 if self
                     .vfs
@@ -1412,7 +1442,7 @@ impl View<'_> {
             }
             FileKind::Directory { node, .. } | FileKind::Path(node) => node.clone(),
             FileKind::Proc { mnt, node, .. } => Node::Pseudo(*mnt, node.clone()),
-            // 从设备：经由的 devpts 挂载里的路径
+            // A slave device: its path in the devpts mount it was opened through
             FileKind::Pty(end) if !end.master => {
                 let t = end.tty.borrow();
                 Node::Pseudo(end.mnt, PseudoNode::Pts(t.fs, t.index))
@@ -1422,11 +1452,13 @@ impl View<'_> {
     }
 }
 
-/// 与 Linux 的 `d_path` 一样，已经删除的文件（仍然打开着、映射着）在路径后面加上
-/// ` (deleted)`：`/proc/<pid>/fd/<n>`、maps、smaps。仓库里删掉最后一个名字之后 inode 的行
-/// 以 nlink = 0 留到下次独占打开仓库时，所以按 nlink 判断。Linux 看的是打开时那个名字，
-/// 别的硬链接还在、只删了这个名字时也加，这里不加。apt 升级时 dpkg 用 rename 换掉旧的库，
-/// needrestart 按 maps 里的 ` (deleted)` 找出要重启的进程。
+/// As with Linux's `d_path`, deleted files (still open or mapped) get ` (deleted)` appended to
+/// their path: `/proc/<pid>/fd/<n>`, maps, smaps. After the last name is removed in the store,
+/// the inode's row stays with nlink = 0 until the store is next opened exclusively, so the check
+/// uses nlink. Linux looks at the name used at open and also appends it when only that name was
+/// removed while other hard links remain; here it does not. When apt upgrades, dpkg replaces old
+/// libraries with rename, and needrestart finds the processes to restart by the ` (deleted)` in
+/// maps.
 fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
     const DELETED: &[u8] = b" (deleted)";
     if !name.ends_with(DELETED) && store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
@@ -1435,7 +1467,7 @@ fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
     name
 }
 
-/// `/proc/<pid>/fd/<n>` 显示的目标：路径，或者 `pipe:[ino]` 这种描述。
+/// The target `/proc/<pid>/fd/<n>` shows: a path, or a description like `pipe:[ino]`.
 pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
     if let Some(p) = &f.path {
         return p.to_vec();
@@ -1463,9 +1495,9 @@ pub(crate) fn describe(f: &OpenFile) -> Vec<u8> {
     }
 }
 
-/// 合成节点的元数据。
+/// The metadata of a synthetic node.
 pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
-    // mqueue 文件系统：属主、权限、时间记在队列和命名空间里
+    // mqueue filesystem: owners, permissions and times are kept on the queues and the namespace
     match node {
         PseudoNode::MqRoot(ns) => {
             let (_, ipc) = ps.k.ipcs.get(ns).ok_or(Errno::ENOENT)?;
@@ -1490,7 +1522,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (mode::S_IFDIR, _) => 0o555,
         (mode::S_IFLNK, _) => 0o777,
         (_, PseudoNode::Pts(fs, n)) => pty(ps.k, *fs, *n).map_or(0o620, |t| t.borrow().mode),
-        // ptmx 的权限位按实例的 ptmxmode
+        // ptmx's permission bits follow the instance's ptmxmode
         (_, PseudoNode::PtsPtmx(fs)) => {
             ps.k.vfs
                 .as_ref()
@@ -1520,8 +1552,9 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     };
     let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
     let (uid, gid) = owner_of(ps.k, node);
-    // 与 Linux 的 proc_task_getattr 一样，task 目录的链接数加上线程数：Chromium 的沙箱按它
-    // 判断自己是不是单线程，zygote fork 之前检查它至少是 3，不是就崩溃
+    // As in Linux's proc_task_getattr, the task directory's link count adds the number of
+    // threads: Chromium's sandbox uses it to tell whether it is single-threaded, and the zygote
+    // checks before fork that it is at least 3, crashing otherwise
     let nlink = match node {
         PseudoNode::Entry(pid, None, Entry::Task) => {
             2 + ps
@@ -1538,7 +1571,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         uid,
         gid,
         rdev: rdev_value,
-        // sysfs 的文件与 Linux 一样报告一页
+        // sysfs files report one page, as on Linux
         size: if sysfs && kind == mode::S_IFREG {
             4096
         } else {
@@ -1550,16 +1583,17 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     })
 }
 
-/// `/dev/pts/<n>` 的终端，已经关掉的是 None。
+/// The terminal of `/dev/pts/<n>`; None once it is closed.
 pub(crate) fn pty(k: &Kernel, fs: u64, n: u32) -> Option<Rc<RefCell<Tty>>> {
     k.ptys.get(&(fs, n)).and_then(std::rc::Weak::upgrade)
 }
 
-/// 节点的属主和属组：`/proc/<pid>` 下是进程的有效用户 ID 和组 ID，`/dev/pts/<n>`
-/// 记在终端上（[`Tty::owner`]），其余是 root。
+/// A node's owner and group: under `/proc/<pid>` the process's effective user and group IDs, for
+/// `/dev/pts/<n>` what is recorded on the terminal ([`Tty::owner`]), and root for the rest.
 fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     match node {
-        // 不可 dump 的进程的文件属于它的用户命名空间里的 root（Linux 的 task_dump_owner）
+        // Files of a non-dumpable process belong to root in its user namespace (Linux's
+        // task_dump_owner)
         PseudoNode::Pid(pid, _) | PseudoNode::Entry(pid, ..) | PseudoNode::Fd(pid, _) => {
             k.groups.get(pid).map_or((0, 0), |g| {
                 let g = g.borrow();
@@ -1577,14 +1611,14 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     }
 }
 
-/// 读不了的文件：cgroup 里只能写的（`cgroup.kill`），与 Linux 一样打开时不查，读是
-/// EINVAL（`cgroup_seqfile_show` 没有读的回调）。
+/// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
+/// checked at open, and reading is EINVAL (`cgroup_seqfile_show` has no read callback).
 pub(crate) fn unreadable(node: &PseudoNode) -> bool {
     matches!(node, PseudoNode::Cgroup(_, name)
         if crate::cgroup::file_mode(name).is_some_and(|m| m & 0o444 == 0))
 }
 
-/// 可以写入的 procfs 文件。
+/// The procfs files that can be written.
 pub(crate) fn writable(node: &PseudoNode) -> bool {
     if let PseudoNode::Cgroup(_, name) = node {
         return crate::cgroup::file_mode(name).is_some_and(|m| m & 0o200 != 0);
@@ -1646,8 +1680,9 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     ) || matches!(node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"))
 }
 
-/// 写 procfs 文件：`oom_score_adj`、主机名、域名和 System V IPC 的限制记下新值，其余
-/// 可写的文件接受写入但不起作用。`cred` 是写入者的凭据。
+/// Writes a procfs file: `oom_score_adj`, the host name, the domain name and the System V IPC
+/// limits record the new value, and the other writable files accept writes without effect.
+/// `cred` is the writer's credentials.
 pub(crate) fn write(
     k: &mut Kernel,
     (tid, cred): (Tid, &Cred),
@@ -1671,7 +1706,7 @@ pub(crate) fn write(
         PseudoNode::Entry(pid, None, Entry::TimensOffsets) => {
             return write_timens_offsets(k, cred, *pid, data);
         }
-        // 网络命名空间的 sysctl：写入者所在的那个（crate::netconf）
+        // Network namespace sysctls: the writer's namespace (crate::netconf)
         PseudoNode::NetConf(v6, dir, name) => {
             return crate::netdev::conf_write(&ns.net, *v6, *dir, name, data);
         }
@@ -1748,7 +1783,7 @@ pub(crate) fn write(
             .filter(|&v: &u64| v > 0)
             .ok_or(Errno::EINVAL)?;
     }
-    // 与 Linux 一样在 0 到 INT_MAX 之间；只记下，不实际限制
+    // Between 0 and INT_MAX, as on Linux; only recorded, with no actual limit
     if let PseudoNode::Static(path) = node
         && path.starts_with(b"sys/user/max_")
     {
@@ -1768,7 +1803,7 @@ pub(crate) fn write(
     if let PseudoNode::Static(path) = node
         && let Some(name) = path.strip_prefix(b"sys/fs/inotify/")
     {
-        // 与 Linux 一样不接受负数
+        // Negative numbers are not accepted, as on Linux
         let n: usize = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -1781,8 +1816,8 @@ pub(crate) fn write(
             _ => r.max_watches = n,
         }
     }
-    // 与 Linux 一样在 0 到 pid_max 之间（checkpoint/restore 用它让新进程拿到指定的 pid），
-    // 改的是写入者所在的 pid 命名空间的
+    // Between 0 and pid_max, as on Linux (checkpoint/restore uses it to give a new process a
+    // chosen pid); it changes the writer's pid namespace
     if let PseudoNode::Static(b"sys/kernel/ns_last_pid") = node {
         let pid: i32 = std::str::from_utf8(data)
             .ok()
@@ -1795,7 +1830,8 @@ pub(crate) fn write(
             pid_ns.set_last_pid(pid);
         }
     }
-    // 与 Linux 一样在 MIN_THREADS 到 FUTEX_TID_MASK 之间；已经设置的 RLIMIT_NPROC 不变
+    // Between MIN_THREADS and FUTEX_TID_MASK, as on Linux; RLIMIT_NPROC values already set are
+    // unchanged
     if let PseudoNode::Static(b"sys/kernel/threads-max") = node {
         k.threads_max = std::str::from_utf8(data)
             .ok()
@@ -1809,7 +1845,7 @@ pub(crate) fn write(
             .and_then(|s| s.trim().parse().ok())
             .ok_or(Errno::EINVAL)?;
     }
-    // fd 表的容量固定：nr_open 可以调小，不能超过它
+    // The fd table's capacity is fixed: nr_open can be lowered but cannot exceed it
     if let PseudoNode::Static(b"sys/fs/nr_open") = node {
         k.nr_open = std::str::from_utf8(data)
             .ok()
@@ -1817,7 +1853,7 @@ pub(crate) fn write(
             .filter(|n| (64..=crate::fd::MAX_FDS).contains(n))
             .ok_or(Errno::EINVAL)?;
     }
-    // 与 Linux 一样按页向上取整到 2 的幂，超过 2^31 是 EINVAL
+    // As on Linux, rounded up to a power of two in pages; above 2^31 is EINVAL
     if let PseudoNode::Static(b"sys/fs/pipe-max-size") = node {
         let size: u64 = std::str::from_utf8(data)
             .ok()
@@ -1836,7 +1872,8 @@ pub(crate) fn write(
         let value = value as i32;
         let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
         let mut g = group.borrow_mut();
-        // 与 Linux 一样：调到下限以下要求 CAP_SYS_RESOURCE，有它时写的值同时成为新的下限
+        // As on Linux: going below the minimum needs CAP_SYS_RESOURCE, and with it the value
+        // written also becomes the new minimum
         let privileged = cred.capable(cap::SYS_RESOURCE);
         if value < g.oom_score_adj_min && !privileged {
             return Err(Errno::EACCES);
@@ -1849,13 +1886,15 @@ pub(crate) fn write(
     if let PseudoNode::Static(b"sys/kernel/seccomp/actions_logged") = node {
         crate::seccomp::set_actions_logged(k, cred, data)?;
     }
-    // 与 Linux 的 proc_dostring 一样，长了截断（core_pattern 最长 127 个字节）
+    // As with Linux's proc_dostring, an over-long value is truncated (core_pattern is at most
+    // 127 bytes)
     if let PseudoNode::Static(b"sys/kernel/core_pattern") = node {
         let pattern = data.strip_suffix(b"\n").unwrap_or(data);
         let len = pattern.len().min(crate::coredump::PATTERN_MAX - 1);
         k.core_pattern = pattern[..len].to_vec();
     }
-    // proc_dointvec_minmax_sysadmin：写要开机时的命名空间里的 CAP_SYS_ADMIN，只能是 0、1
+    // proc_dointvec_minmax_sysadmin: writing needs CAP_SYS_ADMIN in the boot-time namespace, and
+    // only 0 or 1
     if let PseudoNode::Static(b"sys/kernel/dmesg_restrict") = node {
         if !cred.capable(cap::SYS_ADMIN) {
             return Err(Errno::EPERM);
@@ -1867,7 +1906,7 @@ pub(crate) fn write(
             .ok_or(Errno::EINVAL)?
             == 1;
     }
-    // 一个 int 的 proc_dointvec_minmax（kernel.panic 是不限范围的 proc_dointvec）
+    // proc_dointvec_minmax for one int (kernel.panic is a proc_dointvec with no range)
     let int_in = |range: std::ops::RangeInclusive<i64>| {
         crate::netconf::parse_int(data)
             .ok()
@@ -1884,7 +1923,8 @@ pub(crate) fn write(
         PseudoNode::Static(b"sys/fs/protected_hardlinks") => {
             k.protected_hardlinks = int_in(0..=1)? == 1;
         }
-        // bpf_unpriv_handler：要 CAP_SYS_ADMIN，0 到 2，改成 1 之后改不回去（EPERM）
+        // bpf_unpriv_handler: needs CAP_SYS_ADMIN, 0 to 2, and once set to 1 it cannot be changed
+        // back (EPERM)
         PseudoNode::Static(b"sys/kernel/unprivileged_bpf_disabled") => {
             if !cred.capable(cap::SYS_ADMIN) {
                 return Err(Errno::EPERM);
@@ -1897,8 +1937,9 @@ pub(crate) fn write(
         }
         _ => {}
     }
-    // devkmsg_sysctl_set_loglvl：proc_dostring 取到换行或第 9 个字节为止，必须恰好是 on、off、
-    // ratelimit 之一再加一个字节（echo 的换行），否则 EINVAL、保持原样
+    // devkmsg_sysctl_set_loglvl: proc_dostring takes up to a newline or the 9th byte; the write
+    // must be exactly one of on, off, ratelimit plus one byte (echo's newline), otherwise EINVAL
+    // and unchanged
     if let PseudoNode::Static(b"sys/kernel/printk_devkmsg") = node {
         let value = &data[..data.len().min(9)];
         let value = &value[..value
@@ -1919,7 +1960,8 @@ pub(crate) fn write(
         }
         k.klog.borrow_mut().devkmsg = mode;
     }
-    // proc_dointvec：按顺序写前几个，最多四个；第一个就不是数时 EINVAL
+    // proc_dointvec: writes the first few in order, at most four; EINVAL when the first is not a
+    // number
     if let PseudoNode::Static(b"sys/kernel/printk") = node {
         let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
         let values: Vec<i32> = text
@@ -1939,7 +1981,8 @@ pub(crate) fn write(
             .ok_or(Errno::EINVAL)?;
         k.core_uses_pid = v != 0;
     }
-    // 与 Linux 一样按 C 的写法解析（0x 开头是十六进制，0 开头是八进制），只取 9 位
+    // Parsed the C way, as on Linux (0x prefix is hexadecimal, 0 prefix octal), keeping only 9
+    // bits
     if let PseudoNode::Entry(pid, _, Entry::CoredumpFilter) = node {
         let value = kstrto(proc_number(data)?, false)?;
         let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
@@ -1948,8 +1991,9 @@ pub(crate) fn write(
     Ok(())
 }
 
-/// 写 `node` 时写入的字节数：写数字的 `/proc/<pid>` 文件只收 [`proc_number`] 看的那 12 个
-/// 字节（Linux 截短 count 之后返回它），别的都收下。
+/// The number of bytes a write to `node` consumes: `/proc/<pid>` files taking numbers accept only
+/// the 12 bytes [`proc_number`] looks at (Linux truncates count and returns it), everything else
+/// accepts all.
 pub(crate) fn written(node: &PseudoNode, len: usize) -> usize {
     match node {
         PseudoNode::Entry(_, _, Entry::OomScoreAdj | Entry::CoredumpFilter) => len.min(12),
@@ -1957,17 +2001,18 @@ pub(crate) fn written(node: &PseudoNode, len: usize) -> usize {
     }
 }
 
-/// `/proc/<pid>` 里写数字的文件（oom_score_adj、coredump_filter）的缓冲区：与 Linux 的
-/// `PROC_NUMBUF` 一样只看前 12 个字节、到 NUL 为止（runc 写进来的值结尾带着 NUL），去掉两头
-/// 的空白（`strstrip`）。
+/// The buffer of the number-taking files in `/proc/<pid>` (oom_score_adj, coredump_filter): as
+/// with Linux's `PROC_NUMBUF`, only the first 12 bytes up to a NUL are looked at (values runc
+/// writes end in a NUL), with whitespace stripped from both ends (`strstrip`).
 fn proc_number(data: &[u8]) -> Result<&str, Errno> {
     let data = &data[..data.len().min(12)];
     let data = data.split(|&b| b == 0).next().unwrap_or(data);
     Ok(std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?.trim())
 }
 
-/// Linux 的 `kstrtoint`（`signed`）、`kstrtouint` 的基数 0：`0x` 开头是十六进制，`0` 开头是
-/// 八进制，可以有 `+`，有符号的还可以有 `-`。不是数字是 EINVAL，超出 32 位是 ERANGE。
+/// Base 0 of Linux's `kstrtoint` (`signed`) and `kstrtouint`: a `0x` prefix is hexadecimal, a `0`
+/// prefix octal, `+` is allowed, and signed ones also allow `-`. Non-numbers are EINVAL, values
+/// beyond 32 bits ERANGE.
 fn kstrto(s: &str, signed: bool) -> Result<i64, Errno> {
     let (neg, s) = match s.strip_prefix('-') {
         Some(rest) if signed => (true, rest),
@@ -1990,7 +2035,7 @@ fn kstrto(s: &str, signed: bool) -> Result<i64, Errno> {
     }
 }
 
-/// 目录的内容（不含 `.` 和 `..`）。
+/// The contents of a directory (without `.` and `..`).
 pub(crate) fn readdir(
     ps: &View<'_>,
     mnt: MountId,
@@ -2023,7 +2068,7 @@ pub(crate) fn readdir(
             nodes.extend([SelfLink, ThreadSelf]);
             nodes.extend(tree_children(&STATIC, b"").map(Static));
             nodes.extend(GLOBALS.iter().map(|(_, g)| Global(*g)));
-            // 挂载的 pid 命名空间里看得到的进程，按那里的编号排
+            // Processes visible in the mount's pid namespace, sorted by their numbers there
             let mut pids: Vec<(Tid, Tid)> =
                 ps.k.groups
                     .keys()
@@ -2042,7 +2087,7 @@ pub(crate) fn readdir(
         }
         Static(path) => {
             nodes.extend(tree_children(&STATIC, path).map(Static));
-            // /proc/sys/net/core、ipv4、ipv6、unix 下的 sysctl
+            // The sysctls under /proc/sys/net/core, ipv4, ipv6 and unix
             if let Some(dir) = path.strip_prefix(b"sys/net/") {
                 let init = ps.ns().net.host_net.is_none();
                 nodes.extend(
@@ -2147,16 +2192,16 @@ pub(crate) fn readdir(
         .collect()
 }
 
-// ---- 文件内容 ----
+// ---- File contents ----
 
-/// 时钟滴答（`sysconf(_SC_CLK_TCK)`）。
+/// Clock ticks (`sysconf(_SC_CLK_TCK)`).
 const HZ: u64 = crate::loader::CLOCK_TICKS;
 
 fn ticks(ns: u64) -> u64 {
     ns / (1_000_000_000 / HZ)
 }
 
-/// 开机以来的纳秒数（CLOCK_BOOTTIME）。
+/// Nanoseconds since boot (CLOCK_BOOTTIME).
 pub(crate) fn uptime_ns() -> u64 {
     appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME)
         .map(|(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
@@ -2167,13 +2212,14 @@ fn cpus() -> usize {
     appine_hal::host_cpus().len()
 }
 
-/// 线程组的 CPU 时间（纳秒）：活着的线程加上已经退出的线程。
-/// 进程状态的字母：R 正在执行 guest 代码，S 在内核里或等待，T 停止，Z 僵尸。
+/// The thread group's CPU time (nanoseconds): live threads plus threads that have exited.
+/// The process state letter: R running guest code, S in the kernel or waiting, T stopped, Z
+/// zombie.
 fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static str) {
     if g.zombie.is_some() {
         return ('Z', "zombie");
     }
-    // 停在 ptrace-stop 里（PTRACE_LISTEN 时也是，与 Linux 一样）
+    // Stopped in a ptrace-stop (also under PTRACE_LISTEN, as on Linux)
     if let Some(t) = ps.task(g.tgid, tid)
         && t.trace.borrow().stop.is_some()
     {
@@ -2182,9 +2228,10 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static
     if g.stopped {
         return ('T', "stopped");
     }
-    // 与 Linux 相同，进程的状态是主线程（主线程已退出时是代表线程）的状态：在内核里
-    // 等待是 S，其余（执行 guest 代码、处理 syscall、刚创建还没运行、被叫醒了还没跑起来）
-    // 都是 R
+    // As on Linux, the process's state is the main thread's (the representative thread's once
+    // the main thread has exited): waiting in the kernel is S, and everything else (running
+    // guest code, handling a syscall, just created and not yet run, woken but not yet running)
+    // is R
     if ps.task(g.tgid, tid).is_some_and(|t| t.asleep()) {
         ('S', "sleeping")
     } else {
@@ -2192,7 +2239,7 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static
     }
 }
 
-/// guest 内存里的一段（cmdline、environ），读不到时为空。
+/// A range of guest memory (cmdline, environ); empty when it cannot be read.
 fn guest_bytes(task: &Task, range: fn(&crate::mm::Mm) -> (u64, u64)) -> Vec<u8> {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
@@ -2219,7 +2266,7 @@ pub(crate) fn comm_str(task: Option<&Task>, pid: Tid) -> String {
     }
 }
 
-/// 信号处理方式的位图：(忽略, 捕获)。
+/// Signal disposition bitmaps: (ignored, caught).
 fn sig_dispositions(g: &ThreadGroup) -> (u64, u64) {
     let sh = g.sighand.borrow();
     let (mut ign, mut cgt) = (0, 0);
@@ -2234,7 +2281,7 @@ fn sig_dispositions(g: &ThreadGroup) -> (u64, u64) {
     (ign, cgt)
 }
 
-/// 地址空间的 (总大小, 驻留页数)。
+/// An address space's (total size, resident pages).
 fn mem_of(task: Option<&Task>) -> (u64, u64) {
     let Some(t) = task else {
         return (0, 0);
@@ -2244,7 +2291,8 @@ fn mem_of(task: Option<&Task>) -> (u64, u64) {
     (mm.size(), mm.resident_pages())
 }
 
-/// 控制终端的设备号和前台进程组（在 pid 命名空间 `ns` 里的编号）。
+/// The controlling terminal's device number and foreground process group (its number in pid
+/// namespace `ns`).
 fn ctty_info(ns: &PidNs, g: &ThreadGroup) -> (u64, i64) {
     match &g.ctty {
         Some(tty) => {
@@ -2342,7 +2390,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
         tracer.map_or(0, v)
     )
     .unwrap();
-    // ID 按读者的用户命名空间换算（Linux 的 seq_user_ns）
+    // IDs are translated through the reader's user namespace (Linux's seq_user_ns)
     let c = &g.cred;
     let r = ps.reader();
     let u = |k: u32| r.uid_out(k);
@@ -2367,7 +2415,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     .unwrap();
     let groups: Vec<String> = c.groups.iter().map(|&g| gi(g).to_string()).collect();
     writeln!(s, "FDSize:\t{fdsize}\nGroups:\t{}", groups.join(" ")).unwrap();
-    // 从挂载的 pid 命名空间到进程所在的那个，每层一列
+    // One column per level, from the mount's pid namespace down to the process's own
     let levels = g.pid_ns.levels_from(ns.level);
     let col = |p: Tid| -> String {
         levels
@@ -2393,7 +2441,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
         writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
         let hwm = g.maxrss_kb.max(rss * 4);
         writeln!(s, "VmHWM:\t{hwm:>8} kB\nVmRSS:\t{:>8} kB", rss * 4).unwrap();
-        // 不区分数据段、栈和代码；没有交换
+        // Data, stack and code are not told apart; no swap
         writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", 0).unwrap();
         writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
         writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
@@ -2428,7 +2476,8 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     )
     .unwrap();
     writeln!(s, "Cpus_allowed_list:\t0-{}", cpus() - 1).unwrap();
-    // 宿主线程睡下（等待）一次是一次自愿切换：没被叫醒的线程不会变
+    // Each time a host thread goes to sleep (waits) is one voluntary switch: a thread that has
+    // not been woken does not change
     let (vol, nonvol) = task.as_ref().map_or((0, 0), |t| {
         let (v, n) = appine_hal::thread_ctxt_switches(t.host_tid.get()).unwrap_or((0, 0));
         let (bv, bn) = t.ctxt_base.get();
@@ -2442,7 +2491,8 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     Ok(s)
 }
 
-/// `/proc/<pid>/limits` 各行的名字和单位，按资源编号排列（Linux 的 `lnames`）。
+/// The names and units of the lines of `/proc/<pid>/limits`, in resource-number order (Linux's
+/// `lnames`).
 const LIMIT_NAMES: [(&str, &str); crate::process::RLIM_NLIMITS] = [
     ("Max cpu time", "seconds"),
     ("Max file size", "bytes"),
@@ -2462,8 +2512,8 @@ const LIMIT_NAMES: [(&str, &str); crate::process::RLIM_NLIMITS] = [
     ("Max realtime timeout", "us"),
 ];
 
-/// `/proc/<pid>/limits`：与 Linux 的 `proc_pid_limits` 格式相同，没有单位的行末尾也留着
-/// 硬限制后面的空格。
+/// `/proc/<pid>/limits`: the same format as Linux's `proc_pid_limits`; lines without a unit still
+/// keep the spaces after the hard limit at the end.
 fn limits(rlimits: &[(u64, u64); crate::process::RLIM_NLIMITS]) -> String {
     let value = |v: u64| match v {
         u64::MAX => "unlimited".to_owned(),
@@ -2489,7 +2539,8 @@ fn maps(store: &Store, task: &Task) -> String {
     mm.regions().iter().map(|r| map_line(store, r)).collect()
 }
 
-/// maps 的一行。与 Linux 一样，没有名字的行末尾也有一个空格，名字从第 74 列开始。
+/// One line of maps. As on Linux, lines without a name also end in a space, and the name starts
+/// at column 74.
 fn map_line(store: &Store, r: &Region) -> String {
     let perms = format!(
         "{}{}{}{}",
@@ -2498,7 +2549,8 @@ fn map_line(store: &Store, r: &Region) -> String {
         if r.prot & 4 != 0 { 'x' } else { '-' },
         if r.shared { 's' } else { 'p' },
     );
-    // 文件映射的设备号是根文件系统的 8:1（与 stat 的 st_dev 相同）
+    // The device number of file mappings is the root filesystem's 8:1 (the same as stat's
+    // st_dev)
     let (offset, dev, ino) = match r.file {
         Some((offset, ino)) => (offset, "08:01", ino),
         None => (0, "00:00", 0),
@@ -2519,16 +2571,18 @@ fn map_line(store: &Store, r: &Region) -> String {
     }
 }
 
-/// smaps 的计数，单位 kB。宿主看不出哪些页被写过：匿名内存的驻留页都算脏页，文件映射的
-/// 都算干净页。匿名内存里 fork 之后和别的地址空间共用的页（写时复制）算共享的，Pss 按
-/// 共用的个数分摊（[`crate::mm::Mm::cow_shared`]），其余都算私有的。
+/// smaps counts, in kB. The host cannot tell which pages have been written: resident pages of
+/// anonymous memory all count as dirty, and those of file mappings as clean. Pages of anonymous
+/// memory shared with other address spaces after fork (copy-on-write) count as shared, with Pss
+/// divided by the number of sharers ([`crate::mm::Mm::cow_shared`]); everything else counts as
+/// private.
 #[derive(Default)]
 struct Usage {
     rss: u64,
     anon: u64,
-    /// `anon` 里和别的地址空间共用的。
+    /// The part of `anon` shared with other address spaces.
     shared: u64,
-    /// `shared` 分摊之后的字节数。
+    /// The bytes of `shared` after dividing.
     shared_pss: u64,
     file: u64,
     shmem: u64,
@@ -2546,14 +2600,15 @@ impl Usage {
         self.locked += o.locked;
     }
 
-    /// Linux 的 `__show_smap`：标签占 16 列，数字占 8 列。Pss 与 Linux 一样先按字节累加，
-    /// 最后才换成 kB。
+    /// Linux's `__show_smap`: labels take 16 columns and numbers 8. As on Linux, Pss is summed in
+    /// bytes first and converted to kB only at the end.
     fn write(&self, s: &mut String, rollup: bool) {
         let private = self.anon - self.shared;
         let pss_anon = private * 1024 + self.shared_pss;
         let pss_shmem = self.shmem * 1024;
         let dirty = private + self.shmem;
-        // Private_Hugetlb 的标签多一列，数字少一列，总宽度不变
+        // The Private_Hugetlb label takes one more column and the number one less, keeping the
+        // total width
         let mut put = |label: &str, kb: u64| {
             let w = 24 - label.len().max(16);
             writeln!(s, "{label:<16}{kb:>w$} kB").unwrap()
@@ -2588,8 +2643,8 @@ impl Usage {
     }
 }
 
-/// `/proc/<pid>/smaps`，或者 `rollup` 时的 `smaps_rollup`（所有映射的合计）。驻留的页
-/// 按宿主内存算（mincore）。
+/// `/proc/<pid>/smaps`, or `smaps_rollup` with `rollup` (the total over all mappings). Resident
+/// pages are counted in host memory (mincore).
 fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
     let res = task.res.borrow();
     let mm = res.mm.borrow();
@@ -2609,7 +2664,8 @@ fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
             (None, false) => {
                 let (pages, pss) = mm.cow_shared(r.start, r.end);
                 u.anon = rss;
-                // 借出的页一般都驻留；换出到 zram 的不算驻留，也就不算共用的
+                // Lent pages are usually resident; those swapped out to zram are not resident,
+                // and so not shared either
                 u.shared = (pages * 4).min(rss);
                 u.shared_pss = pss.min(u.shared * 1024);
             }
@@ -2638,7 +2694,7 @@ fn smaps(store: &Store, task: &Task, rollup: bool) -> String {
     s
 }
 
-/// smaps 的 VmFlags 行，按 Linux 的标志位顺序。
+/// The VmFlags line of smaps, in Linux's flag-bit order.
 fn vm_flags(r: &Region) -> String {
     let flags = [
         (r.prot & 1 != 0, "rd"),
@@ -2651,7 +2707,7 @@ fn vm_flags(r: &Region) -> String {
         (r.shared, "ms"),
         (r.name.as_deref() == Some(b"[stack]"), "gd"),
         (r.locked, "lo"),
-        // 计入提交量：可写的私有匿名映射
+        // Commit-accounted: writable private anonymous mappings
         (r.file.is_none() && !r.shared && r.prot & 2 != 0, "ac"),
         (r.dontdump, "dd"),
     ];
@@ -2666,7 +2722,8 @@ fn vm_flags(r: &Region) -> String {
     s
 }
 
-/// 读 `/proc/<pid>/pagemap`：每页 8 字节，位置和长度都要是 8 的整数倍。
+/// Reads `/proc/<pid>/pagemap`: 8 bytes per page; the position and length must both be
+/// multiples of 8.
 pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
     if !pos.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
         return Err(Errno::EINVAL);
@@ -2677,7 +2734,7 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
         .and_then(|g| g.borrow().threads.first().copied())
         .and_then(|t| k.tasks.get(&t).cloned())
         .ok_or(Errno::ESRCH)?;
-    // 用户地址空间是 48 位
+    // The user address space is 48 bits
     let pages_total = 1u64 << (48 - 12);
     let first = pos / 8;
     let n = (buf.len() as u64 / 8).min(pages_total.saturating_sub(first)) as usize;
@@ -2688,7 +2745,7 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
     Ok(n * 8)
 }
 
-/// 进程 `pid` 的地址空间。
+/// The address space of process `pid`.
 pub(crate) fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno> {
     let task = k
         .groups
@@ -2700,8 +2757,9 @@ pub(crate) fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::M
     Ok(mm)
 }
 
-/// 读 `/proc/<pid>/mem`（`mm` 是打开时的地址空间，已经释放时读到 EOF）：位置就是地址。
-/// 按页读，碰到不能读的页停下；一字节也没读到时是 EIO（Linux 的 `mem_rw`）。
+/// Reads `/proc/<pid>/mem` (`mm` is the address space at open; once it is released reads get
+/// EOF): the position is the address. Reads page by page and stops at a page that cannot be read;
+/// when not a single byte was read, it is EIO (Linux's `mem_rw`).
 pub(crate) fn read_mem(
     mm: Option<Rc<RefCell<crate::mm::Mm>>>,
     buf: &mut [u8],
@@ -2731,8 +2789,8 @@ pub(crate) fn read_mem(
     Ok(done)
 }
 
-/// 写 `/proc/<pid>/mem`：与 PTRACE_POKETEXT 一样强制写入（[`Mm::write_force`]），按页
-/// 写，碰到不能写的页停下。`current` 是写入的线程。
+/// Writes `/proc/<pid>/mem`: a forced write like PTRACE_POKETEXT ([`Mm::write_force`]), page by
+/// page, stopping at a page that cannot be written. `current` is the writing thread.
 ///
 /// [`Mm::write_force`]: crate::mm::Mm::write_force
 pub(crate) fn write_mem(
@@ -2765,10 +2823,11 @@ pub(crate) fn write_mem(
     Ok(done)
 }
 
-/// `/proc/<pid>/mounts`（`info` 为 false）或 `mountinfo`：与 Linux 的 `show_vfsmnt`、
-/// `show_mountinfo` 一样列出那个进程的挂载命名空间 `ns` 里的挂载，按挂上的先后，挂载点相对
-/// 它的根目录 `root`，根目录以外的不列（chroot 进去之后看不到外面的挂载，包括根文件系统）。
-/// 挂载编号与 fdinfo 的 `mnt_id`、设备号与 stat 的 `st_dev` 一致。
+/// `/proc/<pid>/mounts` (`info` false) or `mountinfo`: as with Linux's `show_vfsmnt` and
+/// `show_mountinfo`, lists the mounts in that process's mount namespace `ns` in mount order, with
+/// mount points relative to its root directory `root`; those outside the root directory are not
+/// listed (after chroot the mounts outside are invisible, the root filesystem included). Mount ids
+/// match fdinfo's `mnt_id`, and device numbers match stat's `st_dev`.
 fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
     let visible = |node: &Node| match ps.vfs.reach(ps, root, node) {
         Ok((path, true)) => Some(path),
@@ -2781,7 +2840,8 @@ fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
         };
         MountLine {
             id: m.id,
-            // 挂载树的根挂在看不到的 rootfs 上（Linux 上它的编号不在列表里），写 0
+            // The root of the mount tree sits on the invisible rootfs (on Linux its id is not in
+            // the list), so write 0
             parent: m.parent().unwrap_or(0),
             dev: m.dev,
             fs_root: ps.vfs.root_path(ps, &m),
@@ -2800,18 +2860,18 @@ fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
     out
 }
 
-/// mounts、mountinfo 里的一行。
+/// One line of mounts or mountinfo.
 struct MountLine<'a> {
     id: crate::vfs::MountId,
     parent: crate::vfs::MountId,
     dev: u64,
-    /// 挂载看到的部分在文件系统里的路径。
+    /// The path within the filesystem of the part the mount sees.
     fs_root: Vec<u8>,
     point: Vec<u8>,
     flags: u64,
     fstype: &'static str,
     source: &'a [u8],
-    /// 超级块的选项（[`crate::vfs::Vfs::sb_options`]）。
+    /// Superblock options ([`crate::vfs::Vfs::sb_options`]).
     options: String,
 }
 
@@ -2838,7 +2898,7 @@ impl MountLine<'_> {
     }
 }
 
-/// 挂载的选项（mountinfo 的第六列，Linux 的 `show_mnt_opts`）。
+/// Mount options (the sixth column of mountinfo, Linux's `show_mnt_opts`).
 fn mount_options(flags: u64) -> String {
     use crate::vfs::ms;
     let mut s = String::from(if flags & ms::RDONLY != 0 { "ro" } else { "rw" });
@@ -2858,7 +2918,7 @@ fn mount_options(flags: u64) -> String {
     s
 }
 
-/// 与 Linux 的 `mangle` 一样，把空格、制表符、换行和反斜杠写成八进制的转义。
+/// As with Linux's `mangle`, writes spaces, tabs, newlines and backslashes as octal escapes.
 fn mangle(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for &b in s {
@@ -2870,14 +2930,14 @@ fn mangle(s: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `/proc/cpuinfo` 里 HWCAP 各位的名字（Linux 6.1 的 `hwcap_str`），按位的顺序。
+/// The names of the HWCAP bits in `/proc/cpuinfo` (Linux 6.1's `hwcap_str`), in bit order.
 const HWCAP_NAMES: [&str; 30] = [
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
     "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
     "asimddp", "sha512", "sve", "asimdfhm", "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb",
 ];
 
-/// 同上，HWCAP2 各位的名字，排在 HWCAP 的后面。
+/// Likewise, the names of the HWCAP2 bits, which come after HWCAP's.
 const HWCAP2_NAMES: [&str; 15] = [
     "dcpodp",
     "sve2",
@@ -2921,8 +2981,9 @@ fn cpuinfo() -> String {
     s
 }
 
-/// `/proc/meminfo`：照搬宿主的（与 docker 的容器一样），guest 能用的上限另见 cgroup 的
-/// `memory.max`。原来按 sysinfo 算，`MemAvailable` 就是 `MemFree`，页缓存都算作已用。
+/// `/proc/meminfo`: copied from the host (as in a docker container); for the limit the guest can
+/// use, see the cgroup's `memory.max`. It used to be computed from sysinfo, with `MemAvailable`
+/// equal to `MemFree` and all page cache counted as used.
 fn meminfo() -> String {
     let m = appine_hal::host_meminfo();
     let mut s = String::new();
@@ -2984,9 +3045,9 @@ fn global_stat(ps: &View<'_>) -> String {
     s
 }
 
-/// 所有打开着的 socket（同一个只算一次）和打开它的进程的 fsuid，按 inode 排列。
-/// 只在 SCM_RIGHTS 消息里、或者等着 accept 的 socket 不算。
-/// socket 所在的网络命名空间的编号。
+/// All open sockets (each counted once) and the fsuid of the process that opened them, sorted by
+/// inode. Sockets that are only in SCM_RIGHTS messages or waiting to be accepted do not count.
+/// The id of the network namespace a socket is in.
 fn socket_net(s: &crate::net::Socket) -> u64 {
     use crate::net::Socket;
     let net = match s {
@@ -3019,7 +3080,7 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
             }
         }
     }
-    // 只在 SCM_RIGHTS 消息里的
+    // Those only in SCM_RIGHTS messages
     for s in crate::unix::inflight_sockets(k) {
         if seen.insert(Rc::as_ptr(&s)) {
             out.push((s, 0));
@@ -3029,14 +3090,14 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
     out
 }
 
-/// socket 的 inode 号（fstat、`/proc/<pid>/fd` 的 `socket:[n]`）。
+/// A socket's inode number (fstat, the `socket:[n]` of `/proc/<pid>/fd`).
 pub(crate) fn socket_ino(s: &SocketRef) -> u64 {
     Rc::as_ptr(s) as u64 >> 4
 }
 
-/// `/proc/net/dev`：宿主的接口，计数是 guest 自己收发的流量（[`crate::traffic`]），格式与
-/// Linux 的 `dev_seq_printf_stats` 相同。
-/// `/proc/net/dev`：接口 `ifaces` 的流量计数（`counted` 为假时都是 0）。
+/// `/proc/net/dev`: the host's interfaces, with counters for the guest's own traffic
+/// ([`crate::traffic`]), in the same format as Linux's `dev_seq_printf_stats`.
+/// `/proc/net/dev`: the traffic counters of interfaces `ifaces` (all 0 when `counted` is false).
 fn net_dev(k: &Kernel, ifaces: &[appine_hal::net::Interface], counted: bool) -> String {
     let mut s = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
@@ -3076,10 +3137,11 @@ fn net_dev(k: &Kernel, ifaces: &[appine_hal::net::Interface], counted: bool) -> 
     s
 }
 
-/// `/proc/net/if_inet6`：宿主接口上的 IPv6 地址，格式与 Linux 的 `if6_seq_show` 相同。
-/// OpenJDK 靠它判断有没有 IPv6（`IPv6_supported`），没有这个文件或者是空的就整个关掉
-/// IPv6。scope 按 Linux 的 `ipv6_addr_scope` 从地址看；标志与 netlink 的回答一样都是
-/// `IFA_F_PERMANENT`（getifaddrs 分不出临时地址）。
+/// `/proc/net/if_inet6`: the IPv6 addresses on the host's interfaces, in the same format as
+/// Linux's `if6_seq_show`. OpenJDK uses it to decide whether IPv6 exists (`IPv6_supported`), and
+/// turns IPv6 off entirely when the file is missing or empty. The scope comes from the address,
+/// as in Linux's `ipv6_addr_scope`; the flags are `IFA_F_PERMANENT`, as in the netlink replies
+/// (getifaddrs cannot tell temporary addresses apart).
 fn net_if_inet6(ifaces: &[appine_hal::net::Interface]) -> String {
     let mut s = String::new();
     for i in ifaces {
@@ -3122,7 +3184,7 @@ pub(crate) fn format_uuid(b: &[u8; 16]) -> String {
     )
 }
 
-/// 打开 procfs 文件时生成的内容。
+/// The contents generated when a procfs file is opened.
 pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<Vec<u8>, Errno> {
     use PseudoNode::*;
     let ns = ps.pid_ns(mnt);
@@ -3131,12 +3193,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             self::Global::Cpuinfo => cpuinfo(),
             self::Global::Meminfo => meminfo(),
             self::Global::Stat => global_stat(ps),
-            // 与 Linux 的 uptime_proc_show 一样截断到百分之一秒（四舍五入的话 x.996 秒会写成
-            // 下一秒，比随后 sysinfo 报告的还大）
+            // Truncated to hundredths of a second, as in Linux's uptime_proc_show (rounding would
+            // write x.996 seconds as the next second, more than sysinfo reports right after)
             self::Global::Uptime => {
                 let hundredths =
                     |ns: u64| format!("{}.{:02}", ns / 1_000_000_000, ns / 10_000_000 % 100);
-                // 空闲时间不受 time 命名空间影响（Linux 的 uptime_proc_show）
+                // Idle time is not affected by the time namespace (Linux's uptime_proc_show)
                 let idle = uptime_ns() * cpus() as u64;
                 let up = ps.with_boot_offset(uptime_ns());
                 format!("{} {}\n", hundredths(up), hundredths(idle))
@@ -3154,16 +3216,17 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             self::Global::Kmsg => String::new(),
             self::Global::Mounts | self::Global::Net => return Err(Errno::EINVAL),
         },
-        // 那个进程所在的网络命名空间的：接口是宿主的（新建的里面是 lo）加上虚拟设备
-        // （crate::netdev），socket 只列建在里面的；新建的里面流量和协议的计数都是 0
-        // （crate::netns）
+        // Those of the network namespace that process is in: the interfaces are the host's (lo in
+        // a new one) plus virtual devices (crate::netdev), and only sockets created in it are
+        // listed; in a new one the traffic and protocol counters are all 0 (crate::netns)
         Net(pid, tid, name) => {
             let full = ps
                 .task(*pid, *tid)
                 .map_or_else(|| ps.k.init_ns.net.clone(), |t| t.ns.borrow().net.clone());
             let net = Some(full.clone()).filter(|n| n.host_net.is_some());
             let id = net.as_ref().map_or(crate::nsproxy::INIT_NET_NS, |n| n.id);
-            // uid 列按读者的用户命名空间换算（Linux 的 seq_user_ns）
+            // The uid column is translated through the reader's user namespace (Linux's
+            // seq_user_ns)
             let reader = ps.reader();
             let socks: Vec<(SocketRef, u32)> = sockets(ps.k)
                 .into_iter()
@@ -3283,8 +3346,8 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
-            // 映射不到的用户、组 ID 显示成的 ID（Linux 的默认值，bubblewrap 启动时读它）。
-            // 不能改
+            // The ID unmapped user and group IDs are shown as (Linux's default; bubblewrap reads
+            // it at startup). Cannot be changed
             b"sys/kernel/overflowuid"
             | b"sys/kernel/overflowgid"
             | b"sys/fs/overflowuid"
@@ -3302,8 +3365,8 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 format!("{a}\t{b}\t{c}\t{d}\n")
             }
             b"sys/kernel/printk_devkmsg" => format!("{}\n", ps.k.klog.borrow().devkmsg.name()),
-            // 每个用户能建的各种命名空间个数的上限：与 Linux 的默认值一样是 threads-max 的
-            // 一半，只读，不实际限制
+            // Per-user limits on the number of namespaces of each kind: half of threads-max, as
+            // in Linux's defaults; read-only, with no actual limit
             p if p.starts_with(b"sys/user/max_") => {
                 let v = ps.k.max_namespaces.get(p).copied();
                 format!("{}\n", v.unwrap_or(ps.k.threads_max as u64 / 2))
@@ -3327,8 +3390,8 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
                 }
                 self::Entry::Comm => format!("{}\n", comm_str(task.as_deref(), *pid)),
-                // 线程建的、还没有被回收的子进程，每个后面一个空格，没有换行（Linux 的
-                // children_seq_show）
+                // The thread's child processes not yet reaped, each followed by a space, with no
+                // newline (Linux's children_seq_show)
                 self::Entry::Children => {
                     let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
                     let me = tid.unwrap_or(*pid);
@@ -3345,7 +3408,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     }
                     s
                 }
-                // 相对读者所在的 cgroup 命名空间的根
+                // Relative to the root of the reader's cgroup namespace
                 self::Entry::Cgroup => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     let cgroup = g.borrow().cgroup;
@@ -3368,7 +3431,8 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 self::Entry::SmapsRollup => {
                     task.map_or(String::new(), |t| smaps(ps.vfs.store(), &t, true))
                 }
-                // 二进制，按读写的位置现算（`read_pagemap`、`read_mem`、`write_mem`）
+                // Binary, computed from the read or write position (`read_pagemap`, `read_mem`,
+                // `write_mem`)
                 self::Entry::Pagemap | self::Entry::Mem => String::new(),
                 self::Entry::Auxv => {
                     let auxv =
@@ -3387,7 +3451,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
                     format!("{}\n", g.borrow().oom_score_adj)
                 }
-                // Linux 的 proc_timens_show_offsets：给子进程用的那个
+                // Linux's proc_timens_show_offsets: the one for children
                 self::Entry::TimensOffsets => {
                     let t = ps.k.tasks.get(pid).ok_or(Errno::ESRCH)?;
                     let [mono, boot] = t.ns.borrow().time_for_children.offsets.get();
@@ -3427,19 +3491,21 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             crate::netdev::conf_read(&ps.ns().net, *v6, *dir, name)?
         }
         NetSysctl(path) => crate::netconf::sysctl_read(&ps.ns().net.devs.borrow().conf, path),
-        // 只能写的（cgroup.kill）读是 EINVAL
+        // Write-only ones (cgroup.kill) are EINVAL to read
         Cgroup(_, b"") => return Err(Errno::EISDIR),
         Cgroup(id, name) => crate::cgroup::file(ps.k, *id, name).ok_or(Errno::EINVAL)?,
-        // 打开命名空间只为 setns，读不出东西
+        // A namespace is opened only for setns; nothing can be read
         NsFile(..) => String::new(),
         _ => return Err(Errno::EINVAL),
     };
     Ok(s.into_bytes())
 }
 
-/// `/proc/<pid>/uid_map`、`gid_map`、`projid_map`（Linux 的 `uid_m_show`）：每段
-/// "命名空间里的起点 上一层的起点 个数"，各占 10 列。第二列按读者的命名空间换算；读者就在
-/// 这个命名空间里时按上一层的。映射不到写 4294967295。projid_map 只有开机时的命名空间有。
+/// `/proc/<pid>/uid_map`, `gid_map`, `projid_map` (Linux's `uid_m_show`): each extent is "first ID
+/// in the namespace, first ID in the parent, count", 10 columns each. The second column is
+/// translated through the reader's namespace; when the reader is in this namespace itself,
+/// through the parent's. Unmapped values are written as 4294967295. Only the boot-time namespace
+/// has a projid_map.
 fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
     let lower = match &ns.parent {
         Some(parent) if reader.user_ns.id == ns.id => parent.clone(),
@@ -3460,11 +3526,13 @@ fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
         .collect()
 }
 
-/// 写 `/proc/<pid>/uid_map`、`gid_map`（Linux 的 `map_write`）：只能写一次（EPERM），写的
-/// 进程要在那个用户命名空间里有 `CAP_SYS_ADMIN`（EPERM），内容不对是 EINVAL；然后看
-/// `new_idmap_permitted`：建立者把自己的有效 ID 映射成一段一个（gid_map 要先把 setgroups
-/// 写成 deny），或者在上一层命名空间里有 `CAP_SETUID`/`CAP_SETGID`，否则 EPERM。第二列在
-/// 上一层里映射不到也是 EPERM。Linux 按打开文件的凭据检查前两条，这里按写的进程的。
+/// Writes `/proc/<pid>/uid_map` or `gid_map` (Linux's `map_write`): it can be written only once
+/// (EPERM), the writing process needs `CAP_SYS_ADMIN` in that user namespace (EPERM), and bad
+/// contents are EINVAL; then `new_idmap_permitted`: the creator maps its own effective ID as one
+/// extent of one (for gid_map, setgroups must first be written as deny), or has
+/// `CAP_SETUID`/`CAP_SETGID` in the parent namespace; otherwise EPERM. A second column unmapped
+/// in the parent is EPERM too. Linux checks the first two with the open file's credentials; here
+/// the writing process's are used.
 fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> Result<(), Errno> {
     let g = k.groups.get(&pid).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
@@ -3498,11 +3566,12 @@ fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> 
     Ok(())
 }
 
-/// 写 `/proc/<pid>/timens_offsets`（Linux 6.1 的 `timens_offsets_write`、
-/// `proc_timens_set_offset`）：一两行 `<时钟> <秒> <纳秒>`，时钟是 `monotonic`、`boottime` 或者
-/// 它们的编号 1、7。写进那个进程给子进程用的 time 命名空间：要在它的属主里有 `CAP_SYS_TIME`
-/// （EPERM，Linux 按打开文件时的凭据，这里按写的进程的），加上偏移之后的时钟要在
-/// [0, KTIME_SEC_MAX / 2] 里（ERANGE），已经有进程进去过是 EACCES。
+/// Writes `/proc/<pid>/timens_offsets` (Linux 6.1's `timens_offsets_write`,
+/// `proc_timens_set_offset`): one or two lines of `<clock> <seconds> <nanoseconds>`, where the
+/// clock is `monotonic`, `boottime` or their numbers 1 and 7. Writes into the time namespace that
+/// process uses for children: needs `CAP_SYS_TIME` in its owner (EPERM; Linux uses the
+/// credentials at open, here the writing process's), the clocks with the offsets added must be
+/// within [0, KTIME_SEC_MAX / 2] (ERANGE), and once a process has entered it is EACCES.
 fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
     const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
     if data.len() >= 4096 {
@@ -3558,9 +3627,9 @@ fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Resul
     Ok(())
 }
 
-/// 写 `/proc/<pid>/setgroups`（Linux 的 `proc_setgroups_write`）："allow" 或 "deny"，后面
-/// 只能有空白（EINVAL）；要在那个用户命名空间里有 `CAP_SYS_ADMIN`。禁止了之后不能再允许，
-/// gid_map 写过之后不能禁止（EPERM）。
+/// Writes `/proc/<pid>/setgroups` (Linux's `proc_setgroups_write`): "allow" or "deny", followed
+/// only by whitespace (EINVAL); needs `CAP_SYS_ADMIN` in that user namespace. Once denied it
+/// cannot be allowed again, and it cannot be denied after gid_map has been written (EPERM).
 fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
     let g = k.groups.get(&pid).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
@@ -3590,11 +3659,11 @@ fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(
     Ok(())
 }
 
-/// `/sys/class/net/<接口>` 下的文件，接口按读者所在网络命名空间里的编号（与 Linux 不同：
-/// Linux 看的是挂载 sysfs 的那个进程所在的）。接口的类型与 netlink 的回答一样只分回环和
-/// 以太网；`flags` 与 Linux 一样是 `dev->flags`，不含 `IFF_RUNNING` 这些按状态算出来的位。
-/// 虚拟设备（[`crate::netdev`]）的 `iflink` 是 veth 的对端，`operstate` 可以是
-/// lowerlayerdown。
+/// The files under `/sys/class/net/<interface>`, with interfaces numbered as in the reader's
+/// network namespace (unlike Linux, which looks at the namespace of the process that mounted
+/// sysfs). As in the netlink replies, interface types are only loopback and Ethernet; `flags` is
+/// `dev->flags` as on Linux, without state-derived bits such as `IFF_RUNNING`. For virtual devices
+/// ([`crate::netdev`]) `iflink` is the veth peer, and `operstate` can be lowerlayerdown.
 fn net_file(
     k: &Kernel,
     ns: &crate::nsproxy::NetNs,
@@ -3604,7 +3673,7 @@ fn net_file(
     const IFF_UP: u32 = 0x1;
     const IFF_LOOPBACK: u32 = 0x8;
     const IFF_RUNNING: u32 = 0x40;
-    // IFF_RUNNING、IFF_LOWER_UP、IFF_DORMANT、IFF_ECHO（dev_get_flags 才加上它们）
+    // IFF_RUNNING, IFF_LOWER_UP, IFF_DORMANT, IFF_ECHO (only dev_get_flags adds them)
     const STATE_FLAGS: u32 = 0x40 | 0x1_0000 | 0x2_0000 | 0x4_0000;
     let virt = crate::netdev::views(ns)
         .into_iter()
@@ -3633,7 +3702,7 @@ fn net_file(
             .to_owned(),
             b"tx_queue_len" => format!("{}\n", v.txqlen),
             b"type" => "1\n".to_owned(),
-            // bridge 的参数都是默认值，STP 关着（crate::netdev::bridge_info）
+            // Bridge parameters are all defaults, with STP off (crate::netdev::bridge_info)
             b"bridge/ageing_time" => "30000\n".to_owned(),
             b"bridge/forward_delay" => "1500\n".to_owned(),
             b"bridge/hello_time" => "200\n".to_owned(),
@@ -3651,7 +3720,8 @@ fn net_file(
             _ => return Err(Errno::EISDIR),
         });
     }
-    // 接口没了：Linux 上目录随之消失，已经打开的文件读出 ENODEV
+    // The interface is gone: on Linux the directory disappears with it, and files already open
+    // read ENODEV
     let i = crate::netdev::base(ns)
         .into_iter()
         .find(|i| i.index == index)
@@ -3666,7 +3736,7 @@ fn net_file(
         b"addr_len" => "6\n".to_owned(),
         b"address" => mac(i.mac.unwrap_or([0; 6])),
         b"broadcast" => mac(if loopback { [0; 6] } else { [0xff; 6] }),
-        // Linux 上停用的接口读 carrier 是 EINVAL
+        // On Linux reading carrier of a down interface is EINVAL
         b"carrier" if i.flags & IFF_UP == 0 => return Err(Errno::EINVAL),
         b"carrier" => format!("{}\n", u8::from(i.flags & IFF_RUNNING != 0)),
         b"flags" => format!("{:#x}\n", i.flags & !STATE_FLAGS),
@@ -3692,8 +3762,8 @@ fn net_file(
     })
 }
 
-/// `/sys/devices/system/cpu/cpu<n>` 下的文件。CPU 都一样（`/proc/cpuinfo` 也是），各自是
-/// 一个核，没有超线程，都在一个封装里。
+/// The files under `/sys/devices/system/cpu/cpu<n>`. All CPUs are the same (in `/proc/cpuinfo`
+/// too), each its own core, with no hyperthreading, all in one package.
 fn cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
     let all = 0..cpus();
     let me = n..n + 1;
@@ -3717,19 +3787,20 @@ fn cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
     })
 }
 
-/// 宿主上对应 guest CPU `n` 的那个 CPU。
+/// The host CPU corresponding to guest CPU `n`.
 fn host_cpu(n: u32) -> Option<usize> {
     appine_hal::host_cpus().get(n as usize).copied()
 }
 
-/// [`HOST_CPU_FILES`] 里的 `path`（相对 `cpu<n>`，目录以 `/` 结尾）宿主对应的 CPU 有没有。
+/// Whether the host CPU corresponding to `n` has `path` from [`HOST_CPU_FILES`] (relative to
+/// `cpu<n>`, directories ending in `/`).
 fn host_cpu_has(n: u32, path: &[u8]) -> bool {
     let rel = String::from_utf8_lossy(path.strip_suffix(b"/").unwrap_or(path)).into_owned();
     host_cpu(n).is_some_and(|h| appine_hal::cpu_sysfs(h, &rel).is_some())
 }
 
-/// 照搬宿主的缓存、频率文件：CPU 列表和掩码里宿主的 CPU 编号换成 guest 的（guest 用不了的
-/// CPU 去掉）。
+/// Cache and frequency files copied from the host: host CPU numbers in CPU lists and masks are
+/// changed to the guest's (CPUs the guest cannot use are removed).
 fn host_cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
     let rel = String::from_utf8_lossy(path).into_owned();
     let raw = host_cpu(n as u32)
@@ -3757,7 +3828,7 @@ fn host_cpu_file(n: usize, path: &[u8]) -> Result<String, Errno> {
     })
 }
 
-/// CPU 列表（`0-3,5`）里的 CPU。
+/// The CPUs in a CPU list (`0-3,5`).
 fn parse_cpu_list(s: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for part in s.split(',').filter(|p| !p.is_empty()) {
@@ -3769,7 +3840,7 @@ fn parse_cpu_list(s: &str) -> Vec<usize> {
     out
 }
 
-/// CPU 掩码（十六进制，每 32 位一组用逗号隔开，高位在前）里的 CPU。
+/// The CPUs in a CPU mask (hexadecimal, comma-separated groups of 32 bits, high first).
 fn parse_cpu_mask(s: &str) -> Vec<usize> {
     let words: Vec<u32> = s
         .split(',')
@@ -3782,7 +3853,7 @@ fn parse_cpu_mask(s: &str) -> Vec<usize> {
     out
 }
 
-/// 按 CPU 列表的写法（[`cpu_list`]，`0-1,3`）写出一组 CPU（从小到大）。
+/// Writes a set of CPUs (in increasing order) in CPU list form ([`cpu_list`], `0-1,3`).
 fn cpu_list_of(cpus: &[usize]) -> String {
     let mut parts = Vec::new();
     let mut i = 0;
@@ -3801,7 +3872,7 @@ fn cpu_list_of(cpus: &[usize]) -> String {
     format!("{}\n", parts.join(","))
 }
 
-/// 按 CPU 掩码的写法（[`cpu_mask`]）写出一组 CPU。
+/// Writes a set of CPUs in CPU mask form ([`cpu_mask`]).
 fn cpu_mask_of(cpus: &[usize]) -> String {
     let bits = self::cpus();
     let groups = bits.div_ceil(32);
@@ -3825,19 +3896,19 @@ fn cpu_mask_of(cpus: &[usize]) -> String {
     s
 }
 
-/// CPU 列表的写法（`%*pbl`）：`0-3`，只有一个时是 `2`。
+/// CPU list form (`%*pbl`): `0-3`, or `2` when there is only one.
 fn cpu_list(set: Range<usize>) -> String {
     cpu_list_of(&set.collect::<Vec<_>>())
 }
 
-/// CPU 掩码的写法（`%*pb`）：十六进制，每 32 位一组，用逗号隔开，最高的一组补零到写得下
-/// CPU 总数的位数（4 个 CPU 时是 `f`，8 个时 cpu0 是 `01`）。
+/// CPU mask form (`%*pb`): hexadecimal, comma-separated groups of 32 bits, with the highest group
+/// zero-padded to enough digits for the total CPU count (`f` for 4 CPUs; with 8, cpu0 is `01`).
 fn cpu_mask(set: Range<usize>) -> String {
     cpu_mask_of(&set.collect::<Vec<_>>())
 }
 
-/// `/proc/<pid>/fdinfo/<n>`：位置、标志（加上 close-on-exec；open 打开的带着
-/// `O_LARGEFILE`）、挂载编号、inode，以及 eventfd、inotify 的附加行。
+/// `/proc/<pid>/fdinfo/<n>`: position, flags (plus close-on-exec; files opened with open carry
+/// `O_LARGEFILE`), mount id, inode, and the extra lines of eventfd and inotify.
 fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
     let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();
@@ -3859,7 +3930,8 @@ fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno>
     match &f.kind {
         FileKind::EventFd(e) => s += &format!("eventfd-count: {:16x}\n", e.borrow().count),
         FileKind::Inotify(i) => s += &i.borrow().fdinfo(),
-        // 挂载的 pid 命名空间里的编号（看不到时是 0），NSpid 接着列出更下层的
+        // The number in the mount's pid namespace (0 when not visible); NSpid goes on to list the
+        // lower levels
         FileKind::Pidfd(p) => {
             let nr = if p.exited() {
                 -1
@@ -3887,7 +3959,8 @@ fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno>
 mod tests {
     use super::*;
 
-    /// 写数字的 /proc 文件：到 NUL 为止、只看前 12 个字节，基数 0，超出 32 位是 ERANGE。
+    /// Number-taking /proc files: up to a NUL, only the first 12 bytes, base 0, beyond 32 bits is
+    /// ERANGE.
     #[test]
     fn proc_numbers() {
         let num = |d: &[u8], signed| kstrto(proc_number(d)?, signed);
@@ -3905,7 +3978,7 @@ mod tests {
         assert_eq!(num(b"0x", false), Err(Errno::EINVAL));
         assert_eq!(num(b"", true), Err(Errno::EINVAL));
         assert_eq!(num(b"1 2", true), Err(Errno::EINVAL));
-        // 第 13 个字节起不看
+        // Bytes from the 13th on are ignored
         assert_eq!(num(b"000000000001x", false), Ok(1));
     }
 

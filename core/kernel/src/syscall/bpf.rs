@@ -1,6 +1,7 @@
-//! bpf(2) 的子集（[`crate::bpf`]）：加载 cgroup 的设备过滤程序，挂到 cgroup 上、取下、查询，
-//! 按编号取 fd，取程序的信息。照 Linux 6.1 的 `kernel/bpf/syscall.c`、`kernel/bpf/cgroup.c`。
-//! 别的命令和程序类型（map、socket 过滤、跟踪……）是 EINVAL，与没有编进内核的一样。
+//! A subset of bpf(2) ([`crate::bpf`]): load cgroup device filter programs, attach them to
+//! cgroups, detach and query them, get an fd by id, and get a program's info. As in Linux 6.1's
+//! `kernel/bpf/syscall.c` and `kernel/bpf/cgroup.c`. Other commands and program types (maps,
+//! socket filters, tracing...) are EINVAL, as when they are not built into the kernel.
 
 use std::rc::Rc;
 
@@ -14,7 +15,7 @@ use crate::pseudo::PseudoNode;
 use crate::uaccess::UserSlice;
 use crate::vfs::Node;
 
-/// 命令（`enum bpf_cmd`）。
+/// Commands (`enum bpf_cmd`).
 mod cmd {
     pub const PROG_LOAD: i32 = 5;
     pub const PROG_ATTACH: i32 = 8;
@@ -24,21 +25,22 @@ mod cmd {
     pub const PROG_QUERY: i32 = 16;
 }
 
-/// Linux 6.1 的 `union bpf_attr` 的大小（最大的是 `BPF_PROG_LOAD` 的那一份）。
+/// The size of Linux 6.1's `union bpf_attr` (the largest member is the one for `BPF_PROG_LOAD`).
 const ATTR_SIZE: usize = 144;
-/// `struct bpf_prog_info` 的大小（6.1）。
+/// The size of `struct bpf_prog_info` (6.1).
 const INFO_SIZE: usize = 232;
 const PAGE_SIZE: usize = 4096;
-/// 加载的程序标志（`BPF_F_STRICT_ALIGNMENT` 到 `BPF_F_XDP_HAS_FRAGS`）。
+/// Program load flags (`BPF_F_STRICT_ALIGNMENT` to `BPF_F_XDP_HAS_FRAGS`).
 const PROG_FLAGS: u32 = 0x3f;
-/// `BPF_F_SLEEPABLE`：设备程序不能睡。
+/// `BPF_F_SLEEPABLE`: device programs cannot sleep.
 const SLEEPABLE: u32 = 0x10;
-/// `BPF_F_QUERY_EFFECTIVE`。
+/// `BPF_F_QUERY_EFFECTIVE`.
 const QUERY_EFFECTIVE: u32 = 1;
-/// 没有能力的进程也能加载的两种程序（`BPF_PROG_TYPE_SOCKET_FILTER`、`BPF_PROG_TYPE_CGROUP_SKB`）。
+/// The two program types that processes without capabilities may also load
+/// (`BPF_PROG_TYPE_SOCKET_FILTER`, `BPF_PROG_TYPE_CGROUP_SKB`).
 const PROG_TYPE_SOCKET_FILTER: u32 = 1;
 const PROG_TYPE_CGROUP_SKB: u32 = 8;
-/// 日志的级别（`BPF_LOG_MASK`）。
+/// Log levels (`BPF_LOG_MASK`).
 const LOG_MASK: u32 = 7;
 
 fn u32_at(a: &[u8], off: usize) -> u32 {
@@ -49,7 +51,7 @@ fn u64_at(a: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a[off..off + 8].try_into().unwrap())
 }
 
-/// `CHECK_ATTR`：这个命令用到的最后一个字段之后都要是 0。
+/// `CHECK_ATTR`: everything after the last field this command uses must be 0.
 fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
     if attr[end..].iter().any(|&b| b != 0) {
         return Err(Errno::EINVAL);
@@ -57,8 +59,8 @@ fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
     Ok(())
 }
 
-/// guest 给的结构体比内核的长时，多出来的部分要是 0（`bpf_check_uarg_tail_zero`）；超过
-/// 一页是 E2BIG。返回要读的长度。
+/// When the guest's struct is longer than the kernel's, the extra part must be 0
+/// (`bpf_check_uarg_tail_zero`); more than one page is E2BIG. Returns the length to read.
 fn tail_zero(cx: &Cx<'_>, addr: u64, expected: usize, actual: usize) -> Result<usize, Errno> {
     if actual > PAGE_SIZE {
         return Err(Errno::E2BIG);
@@ -76,14 +78,15 @@ fn tail_zero(cx: &Cx<'_>, addr: u64, expected: usize, actual: usize) -> Result<u
     Ok(actual.min(expected))
 }
 
-/// `bpf_capable()`：开机时的用户命名空间里的 `CAP_BPF` 或 `CAP_SYS_ADMIN`。
+/// `bpf_capable()`: `CAP_BPF` or `CAP_SYS_ADMIN` in the boot-time user namespace.
 fn bpf_capable(cx: &Cx<'_>) -> bool {
     let cred = cx.cred();
     cred.capable(cap::BPF) || cred.capable(cap::SYS_ADMIN)
 }
 
 pub(super) fn bpf(cx: &mut Cx<'_>, command: i32, uattr: u64, size: u32) -> SysResult {
-    // kernel.unprivileged_bpf_disabled（默认 2）不是 0 时都要有能力；是 0 时各个命令自己检查
+    // When kernel.unprivileged_bpf_disabled (default 2) is not 0, every command needs a
+    // capability; when it is 0, each command checks on its own
     if cx.kr().unprivileged_bpf_disabled != 0 && !bpf_capable(cx) {
         return Err(Errno::EPERM);
     }
@@ -102,9 +105,9 @@ pub(super) fn bpf(cx: &mut Cx<'_>, command: i32, uattr: u64, size: u32) -> SysRe
     }
 }
 
-/// BPF_PROG_LOAD（Linux 的 `bpf_prog_load`）。
+/// BPF_PROG_LOAD (Linux's `bpf_prog_load`).
 fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
-    // 最后一个字段是 core_relo_rec_size
+    // The last field is core_relo_rec_size
     check_attr(attr, 140)?;
     let prog_type = u32_at(attr, 0);
     let insn_cnt = u32_at(attr, 4) as usize;
@@ -112,7 +115,7 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     if flags & !PROG_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
-    // 许可证：最多 127 个字节
+    // License: at most 127 bytes
     let license = match cx.mm().read_cstr(u64_at(attr, 16), 127) {
         Ok(l) => l,
         Err(Errno::ENAMETOOLONG) => {
@@ -126,12 +129,14 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     if insn_cnt == 0 || insn_cnt > bpf::MAX_INSNS {
         return Err(Errno::E2BIG);
     }
-    // 没有能力时只能加载套接字过滤、cgroup skb 程序（这两种 appine 都没有，下面是 EINVAL）
+    // Without capabilities only socket filter and cgroup skb programs may be loaded (appine has
+    // neither, so they are EINVAL below)
     if prog_type != PROG_TYPE_SOCKET_FILTER && prog_type != PROG_TYPE_CGROUP_SKB && !bpf_capable(cx)
     {
         return Err(Errno::EPERM);
     }
-    // 设备程序之外的类型没有；卸载到网卡（prog_ifindex）、睡眠的也不行
+    // No types other than device programs; offloading to a NIC (prog_ifindex) and sleepable ones
+    // are not allowed either
     if prog_type != bpf::PROG_TYPE_CGROUP_DEVICE || u32_at(attr, 64) != 0 || flags & SLEEPABLE != 0
     {
         return Err(Errno::EINVAL);
@@ -140,7 +145,7 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     cx.mm()
         .read(UserSlice::new(u64_at(attr, 8), raw.len()), &mut raw)?;
     let insns: Vec<Insn> = raw.chunks_exact(8).map(Insn::decode).collect();
-    // 名字：NUL 结尾，只有字母、数字、`_`、`.`（bpf_obj_name_cpy）
+    // Name: NUL-terminated, only letters, digits, `_` and `.` (bpf_obj_name_cpy)
     let mut name = [0u8; 16];
     name.copy_from_slice(&attr[48..64]);
     let len = name.iter().position(|&b| b == 0).ok_or(Errno::EINVAL)?;
@@ -150,7 +155,7 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     {
         return Err(Errno::EINVAL);
     }
-    // 校验器的日志：给了就要合理（bpf_verifier_log_attr_valid）
+    // Verifier log: if given, it must be sane (bpf_verifier_log_attr_valid)
     let (log_level, log_size, log_buf) = (u32_at(attr, 24), u32_at(attr, 28), u64_at(attr, 32));
     if (log_level != 0 || log_buf != 0 || log_size != 0)
         && (!(128..=u32::MAX >> 2).contains(&log_size)
@@ -189,13 +194,13 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     install(cx, prog)
 }
 
-/// 新的 fd 都是 close-on-exec 的（`bpf_prog_new_fd`）。
+/// New fds are all close-on-exec (`bpf_prog_new_fd`).
 fn install(cx: &mut Cx<'_>, prog: Rc<Prog>) -> SysResult {
     let file = OpenFile::new(FileKind::Bpf(prog), oflags::O_RDWR);
     Ok(cx.fds_mut().install(file, true, 0)? as u64)
 }
 
-/// fd 上的程序（`bpf_prog_get_type`）：fd 不存在是 EBADF，不是程序是 EINVAL。
+/// The program on an fd (`bpf_prog_get_type`): a missing fd is EBADF, a non-program EINVAL.
 fn prog_of_fd(cx: &Cx<'_>, fd: u32) -> Result<Rc<Prog>, Errno> {
     let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
     let prog = match &file.borrow().kind {
@@ -205,7 +210,8 @@ fn prog_of_fd(cx: &Cx<'_>, fd: u32) -> Result<Rc<Prog>, Errno> {
     Ok(prog)
 }
 
-/// fd 打开的 cgroup2 目录（`cgroup_get_from_fd`，O_PATH 的也行），不是的是 EBADF。
+/// The cgroup2 directory an fd has open (`cgroup_get_from_fd`, O_PATH ones too); anything else
+/// is EBADF.
 fn cgroup_of_fd(cx: &Cx<'_>, fd: u32) -> Result<u64, Errno> {
     let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
     let node = file.borrow().node();
@@ -217,9 +223,9 @@ fn cgroup_of_fd(cx: &Cx<'_>, fd: u32) -> Result<u64, Errno> {
     }
 }
 
-/// BPF_PROG_ATTACH（`bpf_prog_attach`、`__cgroup_bpf_attach`）。
+/// BPF_PROG_ATTACH (`bpf_prog_attach`, `__cgroup_bpf_attach`).
 fn prog_attach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
-    // 最后一个字段是 replace_bpf_fd
+    // The last field is replace_bpf_fd
     check_attr(attr, 20)?;
     let flags = u32_at(attr, 12);
     if flags & !(bpf::ALLOW_OVERRIDE | bpf::ALLOW_MULTI | bpf::REPLACE) != 0 {
@@ -236,7 +242,7 @@ fn prog_attach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     } else {
         None
     };
-    // 不能同时带 OVERRIDE 和 MULTI；REPLACE 要带 MULTI
+    // OVERRIDE and MULTI cannot be combined; REPLACE needs MULTI
     if (flags & bpf::ALLOW_OVERRIDE != 0 && multi) || (flags & bpf::REPLACE != 0 && !multi) {
         return Err(Errno::EINVAL);
     }
@@ -246,14 +252,15 @@ fn prog_attach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     }
     let g = k.cgroups.map.get_mut(&id).ok_or(Errno::EBADF)?;
     let saved = flags & (bpf::ALLOW_OVERRIDE | bpf::ALLOW_MULTI);
-    // 已经挂着的与这次的标志不同
+    // The programs already attached have different flags from this one
     if !g.device_progs.is_empty() && g.device_flags != saved {
         return Err(Errno::EPERM);
     }
     if g.device_progs.len() >= bpf::MAX_PROGS {
         return Err(Errno::E2BIG);
     }
-    // find_attach_entry：不带 MULTI 的换掉原来那个；带的不能重复挂，替换的要已经挂着
+    // find_attach_entry: without MULTI, the existing one is replaced; with it, the same program
+    // cannot be attached twice, and the one being replaced must already be attached
     let slot = if !multi {
         (!g.device_progs.is_empty()).then_some(0)
     } else {
@@ -282,10 +289,10 @@ fn prog_attach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     Ok(0)
 }
 
-/// BPF_PROG_DETACH（`__cgroup_bpf_detach`）：fd 不是程序时当作没给；带 MULTI 挂的要给出
-/// 挂着的那个，不带的取下唯一的那个。
+/// BPF_PROG_DETACH (`__cgroup_bpf_detach`): an fd that is not a program counts as not given;
+/// programs attached with MULTI must name the attached one, otherwise the only one is detached.
 fn prog_detach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
-    // 最后一个字段是 attach_type
+    // The last field is attach_type
     check_attr(attr, 12)?;
     if u32_at(attr, 8) != bpf::ATTACH_CGROUP_DEVICE {
         return Err(Errno::EINVAL);
@@ -312,13 +319,14 @@ fn prog_detach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     Ok(0)
 }
 
-/// BPF_PROG_QUERY（`bpf_prog_query`、`__cgroup_bpf_query`）：要 `CAP_NET_ADMIN`。写回
-/// attach_flags（只查有效的时候是 0）和程序数；给的地方不够时只写得下的那些，返回 ENOSPC。
+/// BPF_PROG_QUERY (`bpf_prog_query`, `__cgroup_bpf_query`): needs `CAP_NET_ADMIN`. Writes back
+/// attach_flags (0 when querying only effective ones) and the program count; when the space given
+/// is too small, writes only the ones that fit and returns ENOSPC.
 fn prog_query(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     if !cx.cred().capable(cap::NET_ADMIN) {
         return Err(Errno::EPERM);
     }
-    // 最后一个字段是 prog_attach_flags
+    // The last field is prog_attach_flags
     check_attr(attr, 40)?;
     let query_flags = u32_at(attr, 8);
     if query_flags & !QUERY_EFFECTIVE != 0 || u32_at(attr, 4) != bpf::ATTACH_CGROUP_DEVICE {
@@ -356,9 +364,9 @@ fn prog_query(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     Ok(0)
 }
 
-/// BPF_PROG_GET_FD_BY_ID：要 `CAP_SYS_ADMIN`，没有这个编号的程序是 ENOENT。
+/// BPF_PROG_GET_FD_BY_ID: needs `CAP_SYS_ADMIN`; no program with this id is ENOENT.
 fn prog_get_fd_by_id(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
-    // 最后一个字段是 prog_id
+    // The last field is prog_id
     check_attr(attr, 4)?;
     if !cx.cred().capable(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
@@ -367,11 +375,11 @@ fn prog_get_fd_by_id(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     install(cx, prog)
 }
 
-/// BPF_OBJ_GET_INFO_BY_FD（`bpf_prog_get_info_by_fd`）：先读 guest 给的 `bpf_prog_info`
-/// （里面有放指令、tag 的地方和长度），填好再写回同样的长度。没有这个 fd 是 EBADFD，
-/// 不是程序是 EINVAL。
+/// BPF_OBJ_GET_INFO_BY_FD (`bpf_prog_get_info_by_fd`): first reads the guest's `bpf_prog_info`
+/// (which holds the places and lengths for instructions and tags), fills it in and writes back
+/// the same length. A missing fd is EBADFD, a non-program EINVAL.
 fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
-    // 最后一个字段是 info.info
+    // The last field is info.info
     check_attr(attr, 16)?;
     let file = cx
         .fds()
@@ -391,7 +399,7 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     let set64 = |info: &mut [u8; INFO_SIZE], off: usize, v: u64| {
         info[off..off + 8].copy_from_slice(&v.to_le_bytes());
     };
-    // 记录的大小给了就要对
+    // Record sizes, if given, must be right
     let rec = |nr: usize, size: usize, want: u32| {
         (u32_at(&info, nr) != 0 || u32_at(&info, size) != 0) && u32_at(&info, size) != want
     };
@@ -407,7 +415,8 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     info[64..80].copy_from_slice(&prog.name);
     set32(&mut info, 84, prog.gpl as u32);
     set32(&mut info, 216, prog.verified);
-    // 没有能力时不给指令和各种记录的个数（bpf_prog_get_info_by_fd 的 goto done）
+    // Without capabilities, no instructions and no record counts (the goto done in
+    // bpf_prog_get_info_by_fd)
     if !bpf_capable(cx) {
         for off in [16, 20, 104, 108, 144, 148, 168] {
             set32(&mut info, off, 0);
@@ -416,7 +425,7 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
         super::put(cx, uattr + 4, (len as u32).to_le_bytes())?;
         return Ok(0);
     }
-    // 指令（没有改写过）、没有 JIT
+    // Instructions (not rewritten), no JIT
     let bytes = prog.bytes();
     let (ulen, uinsns) = (u32_at(&info, 20) as usize, u64_at(&info, 32));
     set32(&mut info, 20, bytes.len() as u32);
@@ -433,7 +442,7 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     set32(&mut info, 132, 8);
     set32(&mut info, 172, 16);
     set32(&mut info, 176, 8);
-    // 只有一个函数：一个 tag
+    // Only one function: one tag
     let (ntags, utags) = (u32_at(&info, 180), u64_at(&info, 184));
     set32(&mut info, 180, 1);
     if ntags != 0 {
@@ -445,8 +454,8 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     Ok(0)
 }
 
-/// 打开设备节点、mknod 之前跑调用者所在的 cgroup 的设备过滤程序（[`bpf::check_device`]）。
-/// `kind` 是 `S_IFCHR` 或 `S_IFBLK`，`rdev` 是 Linux 的编码。
+/// Runs the device filter programs of the caller's cgroup before opening a device node or mknod
+/// ([`bpf::check_device`]). `kind` is `S_IFCHR` or `S_IFBLK`, `rdev` is in Linux's encoding.
 pub(crate) fn check_device(cx: &Cx<'_>, kind: u32, rdev: u64, access: u32) -> Result<(), Errno> {
     let dev_type = if kind == crate::vfs::store::mode::S_IFBLK {
         bpf::DEV_BLOCK
