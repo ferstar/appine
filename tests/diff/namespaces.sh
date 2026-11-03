@@ -1151,7 +1151,8 @@ def netns():
     print("new ns", os.readlink("/proc/self/ns/net") != me)
     print("interfaces", socket.if_nameindex(), "lo", socket.if_nametoindex("lo"),
           "eth0", err(socket.if_nametoindex, "eth0"))
-    # lo down: the wildcard address can be bound, 127.0.0.1 can neither be bound nor reached
+    # lo down: the wildcard address and 127.0.0.1 can be bound, but neither 127.0.0.1 nor ::1 can
+    # be reached
     print("down: bind any", err(tcp().bind, ("0.0.0.0", 0)), "bind lo", err(tcp().bind, ("127.0.0.1", 0)),
           "connect", err(tcp().connect, ("127.0.0.1", 9)), "v6", err(tcp(socket.AF_INET6).connect, ("::1", 9)))
     r, w = os.pipe()

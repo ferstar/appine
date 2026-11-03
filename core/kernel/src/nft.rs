@@ -18,10 +18,13 @@
 //!   rules and sets from a counter in the table; a chain's USE is the number of jumps referring
 //!   to it plus the number of rules in it, and a table's USE is the number of its chains and
 //!   sets.
-//! - Execution ([`Nft::nat`]): connect and sendto run the nat-type chains on the OUTPUT hook, and
-//!   DNAT replaces the destination address in the socket layer (the built-in DNS rules docker
-//!   writes into containers, podman's port forwarding). Rules on other hooks and filter rules are
-//!   only recorded, not executed; unknown expressions count as the rule not matching.
+//! - Execution ([`Nft::nat`], [`Nft::filter`]; when and where is decided in [`crate::netns`]):
+//!   connect and sendto run the nat-type chains on OUTPUT, then on the PREROUTING of a namespace
+//!   the connection enters (IPv4), and DNAT replaces the destination address in the socket layer
+//!   (the built-in DNS rules docker writes into containers, podman's port forwarding); filter
+//!   chains run on OUTPUT and along the path on PREROUTING, INPUT and FORWARD (IPv4). POSTROUTING
+//!   and arp, bridge and netdev tables are only recorded, not executed; unknown expressions count
+//!   as the rule not matching.
 
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
@@ -1672,7 +1675,8 @@ pub(crate) struct Packet<'a> {
     /// Index and name of the output interface (on OUTPUT and FORWARD; not yet known on
     /// PREROUTING and INPUT, see [`Eval::meta`]).
     pub oif: &'a dyn Fn() -> (u32, Vec<u8>),
-    /// Hook: [`HOOK_PRE_ROUTING`] or [`HOOK_LOCAL_OUT`].
+    /// Hook: [`HOOK_PRE_ROUTING`], INPUT (1), FORWARD (2) or [`HOOK_LOCAL_OUT`] (POSTROUTING is
+    /// never evaluated).
     pub hook: u32,
     /// Input interface (on PREROUTING, INPUT and FORWARD; none on OUTPUT).
     pub iif: Option<Iif>,
@@ -1838,8 +1842,8 @@ impl Eval<'_> {
             b"meta" => self.meta(u(1), u(2), get(&a, 3).map(|_| u(3))),
             b"ct" => match (get(&a, 4), u(2)) {
                 (Some(_), _) => true,
-                // Everything sent is the first packet of a new connection: state NEW, direction
-                // ORIGINAL
+                // State: NEW, or ESTABLISHED for UDP sent back to a peer it received from
+                // (Packet::ct_state); direction ORIGINAL; status and mark 0
                 (None, 0) => self.store_u32(u(1), self.p.ct_state),
                 (None, 1) => self.store(u(1), &[0]),
                 (None, 2 | 3) => self.store_u32(u(1), 0),
@@ -2252,7 +2256,8 @@ impl Eval<'_> {
         }
     }
 
-    /// xt matches: comment, addrtype, tcp, udp; others count as not matching.
+    /// xt matches: comment, mark, owner, conntrack, state, addrtype, tcp, udp; others count as not
+    /// matching.
     fn xt_match(&mut self, a: &[(u16, &[u8])]) -> bool {
         let (Some(name), Some(info)) = (get_str(a, 1), get(a, 3)) else {
             return false;
@@ -2604,7 +2609,8 @@ fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
 fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
     let mut stack: Vec<(&Chain, usize)> = Vec::new();
     let (mut chain, mut next) = (base, 0usize);
-    // Guards against accidental loops (Linux already rejects them at commit, see check_loops)
+    // Guards against accidental loops (Table::check_verdict already rejects jumps that loop when
+    // a rule is added, as Linux does)
     let mut budget = 100_000;
     loop {
         if next >= chain.rules.len() {

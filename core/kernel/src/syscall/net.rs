@@ -147,7 +147,6 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             // ICMP emulated with a ping socket on the host needs no privilege, so without this
             // check ordinary users could create one too, and busybox's ping would not fall back
             // to a ping socket
-            // The guest's raw ICMP socket becomes an unprivileged ping socket
             let icmp = matches!(
                 (domain, protocol),
                 (AF_INET, IPPROTO_ICMP) | (AF_INET6, IPPROTO_ICMPV6)
@@ -163,6 +162,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             {
                 return Err(Errno::EPERM);
             }
+            // The guest's raw ICMP socket becomes an unprivileged ping socket
             let host_ty = if base == SOCK_RAW && icmp {
                 SOCK_DGRAM
             } else {
@@ -1776,7 +1776,6 @@ fn with_pktinfo(control: &[u8], src: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Two IPv4 or IPv6 addresses have the same protocol family, port and address.
 /// When a connection from outside the host reaches `s` in the boot namespace (a TCP listen, or a
 /// UDP socket with a bound port), where PREROUTING nat sends it: the destination on the host (a
 /// container's loopback address, with low ports switched to the mapped ones), and the source
@@ -2038,6 +2037,8 @@ fn nat_dest(
     )
 }
 
+/// Whether two IPv4 or IPv6 socket addresses have the same protocol family, port and address
+/// (for IPv6 also the flow info; the scope id is not compared).
 fn same_endpoint(a: &[u8], b: &[u8]) -> bool {
     let n = match a.get(..2).map(|f| u16::from_le_bytes([f[0], f[1]]) as i32) {
         Some(AF_INET) => 8,

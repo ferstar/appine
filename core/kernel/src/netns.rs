@@ -1,12 +1,15 @@
-//! New network namespaces ([`NetNs`]): they contain only the loopback interface lo.
+//! New network namespaces ([`NetNs`]): each starts with only the loopback interface lo (virtual
+//! devices are in [`crate::netdev`]).
 //!
 //! Sockets stay host sockets, and addresses are translated at the syscall boundary: the guest's
 //! 127.0.0.x is the host's 127.a.b.x given to this namespace, and binding the wildcard address
 //! binds 127.a.b.1; AF_INET6 ::1 and :: are the IPv4-mapped ::ffff:127.a.b.1 (host sockets do not
-//! set `IPV6_V6ONLY`). Other addresses cannot be bound (EADDRNOTAVAIL) or reached (ENETUNREACH),
-//! and the same holds for 127.0.0.1 while lo is down or has no address. A socket that connects,
-//! sends or listens without being bound is first bound to 127.a.b.1, so that the host does not
-//! bind it to all interfaces instead.
+//! set `IPV6_V6ONLY`). As seen on Linux, 127.0.0.x can be bound even while lo is down or has no
+//! address, but is reachable only while lo is up with an address covering it. Virtual addresses
+//! and routed destinations are translated as [`to_host`] describes; other addresses cannot be
+//! bound (EADDRNOTAVAIL) or reached (ENETUNREACH). A socket that connects, sends or listens
+//! without being bound is first bound to 127.a.b.1, so that the host does not bind it to all
+//! interfaces instead.
 //!
 //! lo's configuration is read and written through netlink (`RTM_NEWADDR`, `RTM_DELADDR`,
 //! `RTM_NEWLINK`) and interface ioctls, which is how bubblewrap brings lo up.
@@ -530,10 +533,10 @@ pub(crate) fn from_host(
     }
 }
 
-/// Whether a TCP socket ([`crate::nsproxy::Listener`]) in new network namespace `t` is listening
-/// on guest address `dst` (a sockaddr, as seen in `t`): a wildcard listener accepts IPv4 and IPv6
-/// (an AF_INET one only IPv4, one with `IPV6_V6ONLY` set only IPv6), and one bound to an address
-/// accepts only what is sent to it.
+/// Whether a TCP socket (with `udp`, a bound UDP socket; [`crate::nsproxy::Listener`]) in new
+/// network namespace `t` is listening on guest address `dst` (a sockaddr, as seen in `t`): a
+/// wildcard listener accepts IPv4 and IPv6 (an AF_INET one only IPv4, one with `IPV6_V6ONLY` set
+/// only IPv6), and one bound to an address accepts only what is sent to it.
 pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
     let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
         return true;
@@ -1699,8 +1702,8 @@ mod tests {
     #[test]
     fn loopback_addresses_map_to_the_namespace_range() {
         let ns = Rc::new(ns());
-        // lo still down: the wildcard address can be bound, 127.0.0.1 can be neither bound nor
-        // reached, and outside addresses are never reachable
+        // lo still down: the wildcard address and 127.0.0.1 can be bound, but neither 127.0.0.1
+        // nor ::1 can be reached; outside addresses are never reachable
         assert_eq!(
             th(&ns, &v4([0; 4], 80), Use::Bind, false).unwrap(),
             v4([127, 1, 2, 1], 80)

@@ -6,8 +6,8 @@
 //!   message sent to the machine, and traceroute sends probes on one socket and receives the
 //!   time-exceeded and unreachable messages on another raw socket; the host's ping socket receives
 //!   only its own echo replies. So there is an aggregation point ([`Tap`]) per network namespace:
-//!   the ping sockets behind raw sockets, and UDP sockets that set a TTL and are not connected
-//!   (traceroute's probes, [`before_send`]), have `IP_RECVERR` enabled on the host. The messages
+//!   the ping sockets behind raw sockets, and UDP sockets that set a TTL, connected or not
+//!   (traceroute's probes, [`before_io`]), have `IP_RECVERR` enabled on the host. The messages
 //!   they receive and the ICMP errors in their error queues are taken off by the aggregation point
 //!   ([`dispatch`]); errors are reassembled into whole ICMP error messages (quoting the original IP
 //!   header and the start of the message) and given to the queue of every raw socket of the same
@@ -98,8 +98,9 @@ pub(crate) struct RawIcmp {
     /// The guest itself enabled `IP_RECVTTL`, `IP_PKTINFO` (IPv4).
     recvttl: bool,
     pktinfo: bool,
-    /// `IP_RECVERR`, `IPV6_RECVERR` as set by the guest itself: only recorded (deferred), always
-    /// enabled on the host.
+    /// `IP_RECVERR`, `IPV6_RECVERR` as set by the guest itself (always enabled on the host): when
+    /// set, ICMP errors also go into the socket's error queue and every one is reported
+    /// ([`dispatch`]).
     recverr: bool,
     /// The value of `IPV6_CHECKSUM`; -1 means not computed.
     checksum: i32,
@@ -482,7 +483,7 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
         // On sockets without IP_RECVERR, Linux reports only hard errors and only to connected
         // ones (harderr in __udp4_lib_err, raw_err, ping_err), and the error must match the
         // connection: a UDP socket's host connection may have been changed to receive errors
-        // (syscall::net::send), so the comparison here is against the peer the guest connected to
+        // (syscall::net::send), so the comparison here is against the peer the guest connected to.
         // A raw socket whose guest enabled IP_RECVERR itself: errors also go into its error queue,
         // and every one is reported (raw_err)
         let (peer, recverr) = match &*sock.borrow() {
@@ -646,8 +647,8 @@ pub(crate) fn take(tap: &Rc<RefCell<Tap>>, key: usize, peek: bool) -> Option<Ite
     Some(it)
 }
 
-/// Takes one entry from the error queue of a raw socket (wake object `key`); the error to report
-/// becomes the next entry's (Linux's `sock_dequeue_err_skb`), or 0 when there is none left.
+/// Takes one entry from the error queue of raw socket `sock`; the error to report becomes the
+/// next entry's (Linux's `sock_dequeue_err_skb`), or 0 when there is none left.
 pub(crate) fn take_err(tap: &Rc<RefCell<Tap>>, sock: &RefCell<Socket>) -> Option<ErrItem> {
     let key = wake::of(sock);
     let mut t = tap.borrow_mut();

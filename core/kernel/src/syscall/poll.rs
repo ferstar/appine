@@ -1,10 +1,11 @@
 //! I/O multiplexing (the kernel/poll map): ppoll, pselect6 and epoll, plus eventfd.
 //!
-//! All three share [`wait_ready`]: the readiness of in-process objects (pipes, PTYs, eventfds...)
-//! is checked first, and host fds (host sockets, host stdio) are checked with one non-waiting
-//! host poll; when nothing is ready, the host fds are waited on together with the thread's own
-//! wake event (the unified wait mechanism in the kernel/process map). epoll is implemented
-//! in-process and is level-triggered by default.
+//! ppoll and pselect6 share [`wait_ready`], and epoll_pwait scans its interests the same way
+//! ([`Epoll::ready`], [`Waits`]): the readiness of in-process objects (pipes, PTYs, eventfds...)
+//! is checked first, and each host fd (host sockets, host stdio) with a non-waiting host poll;
+//! when nothing is ready, the host fds are waited on together with the thread's own wake event
+//! (the unified wait mechanism in the kernel/process map). epoll is implemented in-process and is
+//! level-triggered by default.
 //!
 //! `EPOLLET`: every time Linux wakes a file's wait queue (data arrives, a new connection, an
 //! eventfd is written, a timerfd expires...), edge-triggered interests report once more, even

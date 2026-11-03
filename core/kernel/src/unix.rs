@@ -7,8 +7,9 @@
 //! - Addresses: a path address creates a socket node in the inode store and is looked up by inode;
 //!   abstract addresses (`sun_path` starting with NUL) exist only in [`Names`].
 //! - `SCM_RIGHTS` passes the open files themselves, installed into the receiving process's fd
-//!   table on receipt. `SO_PEERCRED` and `SCM_CREDENTIALS` give the peer's pid and effective user
-//!   ID and group ID.
+//!   table on receipt. `SO_PEERCRED` gives the peer's pid and effective user ID and group ID;
+//!   `SCM_CREDENTIALS` gives the sender's pid and real user ID and group ID, unless the sender
+//!   declared others.
 //! - Sockets that refer to each other only through in-flight `SCM_RIGHTS` messages form `Rc`
 //!   cycles (open file → socket → receive queue → message → open file) that the program can no
 //!   longer reach. As with Linux's unix_gc, such sockets are found after a unix socket is closed
@@ -48,7 +49,8 @@ pub struct Ucred {
 }
 
 impl Ucred {
-    /// The process with pid `pid` and effective user ID and group ID `uid` and `gid`.
+    /// The process with pid `pid` (global) and user ID and group ID `uid` and `gid` (kernel IDs:
+    /// the effective ones for `SO_PEERCRED`, the real or declared ones for `SCM_CREDENTIALS`).
     pub fn of(pid: i32, uid: u32, gid: u32) -> Ucred {
         Ucred { pid, uid, gid }
     }

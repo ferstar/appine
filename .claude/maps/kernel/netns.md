@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/netns.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; binding 127.0.0.1 with lo down matches native Linux in the namespaces differential test)
 
 ## Responsibilities
 
@@ -300,11 +302,10 @@ structure (`kernel/procfs`); host sockets (`hal`).
   `DELTABLE` ignores `NLM_F_NONREC`; chains used only from verdict maps can be deleted (their jumps
   then drop); no `NLM_F_ECHO` and no monitor notifications; set-element dumps are one unbounded
   message.
-- **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8);
-  127.0.0.1 is bindable while lo is down (Linux likely refuses); IPv6 on virtual devices is
-  unusable and on-link IPv6 is handed to the host; `hostmap` entries are never freed and collide
-  once 65534 are used; PREROUTING filter chains see the post-DNAT destination at every priority;
-  POSTROUTING, SNAT and MASQUERADE do nothing.
+- **Smaller deviations:** only 127.0.0.0/24 works as loopback in a namespace (Linux: 127/8); IPv6 on
+  virtual devices is unusable and on-link IPv6 is handed to the host; `hostmap` entries are never
+  freed and collide once 65534 are used; PREROUTING filter chains see the post-DNAT destination at
+  every priority; POSTROUTING, SNAT and MASQUERADE do nothing.
 
 ## Open questions
 
@@ -316,7 +317,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
 ## To verify
 
 - That `nft flush ruleset` sends a family-0 `DELTABLE` (libnftables behaviour) and so fails here.
-- Linux 6.1's results for binding 127.0.0.1 with lo down, `NLM_F_NONREC` on `DELTABLE`, and
-  generation bumps for no-op batches (taken from knowledge, not a source checkout).
+- Linux 6.1's results for `NLM_F_NONREC` on `DELTABLE` and generation bumps for no-op batches (taken
+  from knowledge, not a source checkout).
 - How docker (with and without docker-proxy) and podman listeners interact with the dual-stack
   forwarding gap on a real device.
