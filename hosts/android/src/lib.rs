@@ -773,7 +773,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     array.into_raw()
 }
 
-/// 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 #7）：每一项是
+/// 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 第 7 条）：每一项是
 /// `<进程名>\t<端口>\t<宿主上的端口>`，没有时是空数组。
 /// guest 改过目录项的目录（[`browse::encode_path`] 的写法，就是文档 ID）："文件"App 刷新它们。
 #[unsafe(no_mangle)]

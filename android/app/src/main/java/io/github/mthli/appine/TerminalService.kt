@@ -106,7 +106,7 @@ class TerminalService : Service() {
 
     /**
      * 每隔 [POLL_MS] 在 [worker] 上问一次内核（要取 BKL）：
-     * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
+     * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 第 7 条）：别的设备连得上它，
      *   宿主不让绑的 1024 以下的端口换了一个，要告诉用户连哪个；
      * - guest 的关机请求（busybox 的 reboot、halt、poweroff）；
      * - guest 改过的目录：让"文件"App 刷新它们（android/documents 的 map）；

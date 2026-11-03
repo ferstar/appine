@@ -50,7 +50,7 @@ struct Entry {
     refs: u32,
 }
 
-/// guest 第一次在非回环地址上监听一个端口（设计文档 §12 #7）。
+/// guest 第一次在非回环地址上监听一个端口（设计文档 §12 第 7 条）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenEvent {
     /// 监听的进程的名字（comm）。

@@ -48,7 +48,7 @@ pub struct MachineOptions {
     /// 宿主路径读取，guest 也看不到任何文件系统。
     pub rootfs: Option<PathBuf>,
     /// App 进程匿名内存的上限（字节）：超出时结束一个 guest 进程，免得 Android 的 LMK
-    /// 杀掉整个 App（设计文档 §12）。None 时取宿主物理内存的一半，`u64::MAX` 表示不限制。
+    /// 杀掉整个 App（设计文档 §12 第 4 条）。None 时取宿主物理内存的一半，`u64::MAX` 表示不限制。
     pub memory_limit: Option<u64>,
     /// 1024 以下的端口在宿主上换成的端口的偏移（[`crate::portmap`]）：None 是默认的 10000，
     /// 0 表示不映射（Android 上绑多数低端口是 EACCES）。
@@ -726,7 +726,7 @@ impl Machine {
         });
     }
 
-    /// 取走 guest 在非回环地址上第一次监听的端口（设计文档 §12 #7）：App 据此发通知，
+    /// 取走 guest 在非回环地址上第一次监听的端口（设计文档 §12 第 7 条）：App 据此发通知，
     /// 告诉用户别的设备连哪个端口（低端口映射到了别处，[`crate::portmap`]）。
     pub fn take_listens(&self) -> Vec<crate::ListenEvent> {
         crate::bug::host_call("Machine::take_listens", || {

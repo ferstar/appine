@@ -1,4 +1,4 @@
-//! 宿主侧的故障兜底（`install_fault_guard`，engine 的 map、设计文档 §12）：引擎访问了不该访问的
+//! 宿主侧的故障兜底（`install_fault_guard`，engine 的 map、设计文档 §12 第 5 条）：引擎访问了不该访问的
 //! 宿主内存时，两个执行层都返回 `Exit::HostFault`，之后照常运行。用页表里一个指向
 //! `PROT_NONE` 宿主页的表项模拟引擎的 bug（内核层不会这样建页表）。宿主不是 aarch64
 //! Linux（含 Android）时没有原生桩和 Tier 1，整个文件不参与编译。

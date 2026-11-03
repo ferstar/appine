@@ -720,7 +720,7 @@ class MachineTest {
     /**
      * 宿主不让绑的 1024 以下的端口（kernel/net 的 map）：App 没有 CAP_NET_BIND_SERVICE，79 也不在
      * Android 放开的那几个里；guest 的 nc 绑 79 时宿主上换成 10079，guest 里看到的还是 79。App
-     * 经由 [Native.takeListens] 知道外部端口（§12 #7 的通知用它），从 App 进程连 10079 收得到
+     * 经由 [Native.takeListens] 知道外部端口（§12 第 7 条的通知用它），从 App 进程连 10079 收得到
      * guest 发的数据，内核日志记着换到了哪里。
      */
     @Test

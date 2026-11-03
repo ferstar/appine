@@ -105,7 +105,7 @@ static inline void sync_icache(void *start, void *end)
 }
 
 /*
- * 分配一块存放生成代码的内存（Tier 1 的代码缓存、原生指令桩），按 W^X 映射（§12）：
+ * 分配一块存放生成代码的内存（Tier 1 的代码缓存、原生指令桩），按 W^X 映射（§12 第 8 条）：
  * 同一段共享内存映射两次，执行用返回的地址，写入用它加上 *rw_delta。宿主不允许
  * 双映射时退回 RWX，*rw_delta 为 0。失败时返回 NULL。只在 aarch64 Linux 上可用。
  */

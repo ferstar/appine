@@ -560,7 +560,7 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
             }
             // 开机时的命名空间里的监听：PREROUTING 有 DNAT 时转发外面来的连接（crate::forward）
             forward_socket(cx.kr(), s);
-            // 别的设备连得到的监听（设计文档 §12 #7）：App 发通知，告诉用户连宿主上的哪个端口
+            // 别的设备连得到的监听（设计文档 §12 第 7 条）：App 发通知，告诉用户连宿主上的哪个端口
             if let Ok(local) = appine_hal::net::sockname(s.fd, false)
                 && let (Some(ip), Some(host)) = (ip_of(&local), port_of(&local))
                 && !ip.is_loopback()
