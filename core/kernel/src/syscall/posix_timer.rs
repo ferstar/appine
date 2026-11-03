@@ -1,8 +1,9 @@
-//! POSIX 定时器：timer_create、timer_settime、timer_gettime、timer_getoverrun、
-//! timer_delete（计时和到期见 [`crate::itimer`]）。
+//! POSIX timers: timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete
+//! (timing and expiry in [`crate::itimer`]).
 //!
-//! 定时器属于进程，id 从 0 开始取最小的空闲值；fork 不继承，execve 时删除。musl 的
-//! `SIGEV_THREAD` 在用户态实现，内核看到的是 `SIGEV_THREAD_ID`。
+//! Timers belong to the process, and an id takes the lowest free value starting from 0; they are
+//! not inherited across fork and are deleted on execve. musl implements `SIGEV_THREAD` in user
+//! space; the kernel sees `SIGEV_THREAD_ID`.
 
 use std::time::Duration;
 
@@ -28,16 +29,16 @@ const SIGEV_THREAD: i32 = 2;
 const SIGEV_THREAD_ID: i32 = 4;
 
 const TIMER_ABSTIME: u32 = 1;
-/// 一个进程最多的定时器个数。
+/// The most timers one process may have.
 const MAX_TIMERS: usize = 4096;
-/// 唤醒闹钟的时钟要求的能力（`CAP_WAKE_ALARM`）。
+/// The capability the wake-alarm clocks require (`CAP_WAKE_ALARM`).
 const CAP_WAKE_ALARM: u32 = 35;
 
-/// 时钟 id 对应的计时方式。
+/// The way of keeping time that a clock id stands for.
 fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
     Ok(match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => Clock::Wall(clockid),
-        // 唤醒闹钟：宿主的 App 不能唤醒设备，按普通的时钟计时
+        // Wake alarms: the host app cannot wake the device, so they are timed as ordinary clocks
         CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
             if !cx.cred().capable(CAP_WAKE_ALARM) {
                 return Err(Errno::EPERM);
@@ -50,7 +51,7 @@ fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
         }
         CLOCK_PROCESS_CPUTIME_ID => Clock::Process(cx.tgid()),
         CLOCK_THREAD_CPUTIME_ID => Clock::Thread(cx.tid()),
-        // clock_getcpuclockid 编码的时钟：(~pid << 3) | 类型，第 2 位表示线程
+        // Clocks encoded by clock_getcpuclockid: (~pid << 3) | type, bit 2 meaning a thread
         c if c < 0 && c & 3 != 3 => {
             let thread = c & 4 != 0;
             let pid = match !(c >> 3) {
@@ -67,7 +68,7 @@ fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
                 Clock::Process(pid)
             }
         }
-        // CLOCK_MONOTONIC_RAW 和粗粒度的时钟不能用来做定时器
+        // CLOCK_MONOTONIC_RAW and the coarse clocks cannot be used for timers
         4..=6 => return Err(Errno::EOPNOTSUPP),
         _ => return Err(Errno::EINVAL),
     })
@@ -75,7 +76,7 @@ fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
 
 pub(super) fn timer_create(cx: &mut Cx<'_>, clockid: i32, sevp: u64, idp: u64) -> SysResult {
     let clock = clock_of(cx, clockid)?;
-    // 没有 sigevent 时按 SIGEV_SIGNAL、SIGALRM，sigev_value 是定时器 id
+    // Without a sigevent: SIGEV_SIGNAL, SIGALRM, and sigev_value is the timer id
     let (value, signo, notify, tid) = if sevp == 0 {
         (None, Signal::ALRM.number(), SIGEV_SIGNAL, 0)
     } else {
@@ -93,7 +94,7 @@ pub(super) fn timer_create(cx: &mut Cx<'_>, clockid: i32, sevp: u64, idp: u64) -
         SIGEV_SIGNAL | SIGEV_THREAD | SIGEV_THREAD_ID => {
             let sig = Signal::new(signo).ok_or(Errno::EINVAL)?;
             let target = if notify == SIGEV_THREAD_ID {
-                // 目标线程必须在同一个进程里
+                // The target thread must be in the same process
                 let tid = cx.pid_in(tid);
                 match cx.kr().tasks.get(&tid) {
                     Some(t) if t.tgid == cx.tgid() => Some(tid),
@@ -130,10 +131,10 @@ pub(super) fn timer_create(cx: &mut Cx<'_>, clockid: i32, sevp: u64, idp: u64) -
     Ok(0)
 }
 
-/// `struct itimerspec`：间隔和离下一次到期还有多久（没有启动时都是 0）。
+/// `struct itimerspec`: the interval and how long until the next expiry (both 0 when not armed).
 fn encode_itimerspec(t: &PosixTimer, left: Option<Duration>) -> [u8; 32] {
     let left = left.unwrap_or(Duration::ZERO);
-    // 还没到期的定时器至少报告 1 纳秒，与 Linux 相同
+    // A timer that has not expired yet reports at least 1 nanosecond, as on Linux
     let left = if t.deadline.is_some() {
         left.max(Duration::from_nanos(1))
     } else {
@@ -188,7 +189,7 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
     t.interval = interval;
     t.overrun = 0;
     cx.t.group.borrow_mut().posix_timers.insert(id, t);
-    // 让定时器线程重新计算等待时间（只叫醒它）
+    // Make the timer thread recompute how long to wait (waking only it)
     crate::kernel::signal_later(&cx.shared.timers);
     Ok(0)
 }

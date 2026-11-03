@@ -16,9 +16,10 @@ rusqlite.workspace = true
 tar.workspace = true
 
 [features]
-# 测试钩子（src/bug.rs）在 release 构建里也编进去：Android 的 debug 版 App 用它在 App 进程里
-# 模拟内核层和引擎的 bug。debug 构建总是有测试钩子
+# Test hooks (src/bug.rs), compiled into release builds too: the Android debug app uses them to
+# simulate kernel-layer and engine bugs inside the app process. Debug builds always have test hooks
 test-hooks = []
-# 放开 BKL 时检查没有借着内核对象（src/cell.rs）的发布构建：appine-run 默认打开，app/build.gradle.kts
-# 给 debug 版 App 打开。debug 构建总是检查
+# Release builds that check no kernel object (src/cell.rs) is borrowed when the BKL is released: on
+# by default in appine-run, and app/build.gradle.kts turns it on for the debug app. Debug builds
+# always check
 borrow-check = []

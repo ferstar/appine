@@ -1,11 +1,14 @@
-//! System V IPC（svipc(7)）：消息队列、信号量集和共享内存段的内核对象。
+//! System V IPC (svipc(7)): the kernel objects for message queues, semaphore sets and shared
+//! memory segments.
 //!
-//! 三类对象各有一张表。id 是 `序号 * 32768 + 下标`，与 Linux 相同：下标重新分配出去
-//! 之后，旧的 id 不再有效。权限按 `ipc_perm` 检查（有效用户 ID，`CAP_IPC_OWNER` 可以
-//! 越过）。共享内存段是一段宿主内存（[`SharedMemory`]），shmat 把它映射进地址空间；
-//! 所有 guest 进程都在同一个宿主进程里，看到的就是同一段内存。段被 shmat 了几次不
-//! 单独记录，而是数各个地址空间里的映射，所以 fork、execve 和进程退出不需要额外处理。
-//! syscall 见 `syscall::ipc`。
+//! Each of the three kinds of object has a table. An id is `sequence * 32768 + index`, as on
+//! Linux: once an index is allocated again, the old id is no longer valid. Permissions are checked
+//! by `ipc_perm` (effective user ID; `CAP_IPC_OWNER` can bypass them). A shared memory segment is
+//! a piece of host memory ([`SharedMemory`]) that shmat maps into the address space; all guest
+//! processes are in the same host process, so they see the same memory. How many times a segment
+//! is attached is not recorded separately; the mappings in the address spaces are counted
+//! instead, so fork, execve and process exit need no extra handling. For the syscalls see
+//! `syscall::ipc`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -19,30 +22,32 @@ pub(crate) const IPC_PRIVATE: i32 = 0;
 pub(crate) const IPC_CREAT: i32 = 0o1000;
 pub(crate) const IPC_EXCL: i32 = 0o2000;
 pub(crate) const IPC_NOWAIT: i32 = 0o4000;
-/// 共享内存段已被 IPC_RMID，等最后一个映射消失（记在 mode 里）。
+/// The shared memory segment has been IPC_RMID'd and waits for its last mapping to go away
+/// (recorded in mode).
 pub(crate) const SHM_DEST: u32 = 0o1000;
-/// 共享内存段被 SHM_LOCK 锁住（记在 mode 里）。
+/// The shared memory segment is locked by SHM_LOCK (recorded in mode).
 pub(crate) const SHM_LOCKED: u32 = 0o2000;
-/// semop 的 `SEM_UNDO`：进程退出时撤销这次操作。
+/// semop's `SEM_UNDO`: this operation is undone when the process exits.
 pub(crate) const SEM_UNDO: i16 = 0x1000;
 
-/// 下标的个数（`IPCMNI`）。
+/// The number of indexes (`IPCMNI`).
 const IPCMNI: i32 = 32768;
 
-/// 固定的限制，与 Linux 相同。
+/// Fixed limits, as on Linux.
 pub(crate) mod limits {
     pub const SEMVMX: i32 = 32767;
     pub const SEMAEM: i32 = 32767;
     pub const SHMMIN: u64 = 1;
 }
 
-/// 可以经由 `/proc/sys/kernel` 修改的限制（`msgmax`、`sem` 等），默认值与 Linux 相同。
+/// Limits that can be changed through `/proc/sys/kernel` (`msgmax`, `sem`, etc.), with defaults as
+/// on Linux.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Tunables {
     pub msgmax: u64,
     pub msgmnb: u64,
     pub msgmni: u64,
-    /// `sem`：semmsl、semmns、semopm、semmni。
+    /// `sem`: semmsl, semmns, semopm, semmni.
     pub sem: [u64; 4],
     pub shmmax: u64,
     pub shmall: u64,
@@ -64,7 +69,7 @@ impl Default for Tunables {
 }
 
 impl Tunables {
-    /// `/proc/sys/kernel/<name>` 的内容；不是这里的文件时返回 None。
+    /// The contents of `/proc/sys/kernel/<name>`; returns None for a file that is not one of these.
     pub fn read(&self, name: &[u8]) -> Option<String> {
         Some(match name {
             b"msgmax" => format!("{}\n", self.msgmax),
@@ -81,7 +86,8 @@ impl Tunables {
         })
     }
 
-    /// 写 `/proc/sys/kernel/<name>`：值不是非负整数，或者 `*mni` 超过 IPCMNI 时 EINVAL。
+    /// Writes `/proc/sys/kernel/<name>`: EINVAL when the value is not a non-negative integer, or
+    /// when a `*mni` exceeds IPCMNI.
     pub fn write(&mut self, name: &[u8], data: &[u8]) -> Result<(), Errno> {
         let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
         let nums: Vec<u64> = text
@@ -119,12 +125,12 @@ impl Tunables {
     }
 }
 
-/// 当前的 CLOCK_REALTIME 秒数（`*_stime` 等时间戳）。
+/// Current CLOCK_REALTIME seconds (for timestamps such as `*_stime`).
 pub(crate) fn now() -> i64 {
     appine_hal::clock_gettime(0).map_or(0, |(s, _)| s)
 }
 
-/// `struct ipc_perm`。
+/// `struct ipc_perm`.
 #[derive(Clone, Debug)]
 pub(crate) struct Perm {
     pub key: i32,
@@ -132,13 +138,14 @@ pub(crate) struct Perm {
     pub gid: u32,
     pub cuid: u32,
     pub cgid: u32,
-    /// 权限位（低 9 位）和对象自己的标志位（`SHM_DEST` 等）。
+    /// Permission bits (the low 9 bits) and the object's own flag bits (`SHM_DEST` etc.).
     pub mode: u32,
     pub seq: u16,
 }
 
 impl Perm {
-    /// `ipcperms`：`flag` 是要求的权限（`S_IRUGO`、`S_IWUGO` 或者 msgget 等的权限位）。
+    /// `ipcperms`: `flag` is the permission required (`S_IRUGO`, `S_IWUGO`, or the permission bits
+    /// of msgget and the like).
     pub fn check(&self, cred: &Cred, flag: u32) -> Result<(), Errno> {
         let want = (flag >> 6 | flag >> 3 | flag) & 7;
         let granted = if cred.euid == self.cuid || cred.euid == self.uid {
@@ -154,7 +161,7 @@ impl Perm {
         Ok(())
     }
 
-    /// IPC_SET、IPC_RMID：创建者、属主，或者有 `CAP_SYS_ADMIN`。
+    /// IPC_SET, IPC_RMID: the creator, the owner, or a holder of `CAP_SYS_ADMIN`.
     pub fn may_change(&self, cred: &Cred) -> Result<(), Errno> {
         if cred.euid == self.cuid || cred.euid == self.uid || cred.capable(cap::SYS_ADMIN) {
             Ok(())
@@ -163,8 +170,8 @@ impl Perm {
         }
     }
 
-    /// 按 asm-generic 的 `struct ipc64_perm`（48 字节）编码，ID 按调用者 `cred` 的用户命名空间
-    /// 换算（Linux 的 `kernel_to_ipc64_perm`）。
+    /// Encodes as asm-generic's `struct ipc64_perm` (48 bytes), with IDs translated into the user
+    /// namespace of the caller's `cred` (Linux's `kernel_to_ipc64_perm`).
     pub fn encode(&self, cred: &Cred) -> [u8; 48] {
         let mut b = [0u8; 48];
         for (i, v) in [
@@ -184,8 +191,9 @@ impl Perm {
         b
     }
 
-    /// IPC_SET：从 `struct ipc64_perm` 取属主、属组和权限位。属主、属组按调用者 `cred` 的用户
-    /// 命名空间换成内核 ID，没有映射是 EINVAL（Linux 的 `ipc_update_perm`）。
+    /// IPC_SET: takes the owner, group and permission bits from a `struct ipc64_perm`. Owner and
+    /// group are translated into kernel IDs through the user namespace of the caller's `cred`, and
+    /// an unmapped one is EINVAL (Linux's `ipc_update_perm`).
     pub fn set(&mut self, b: &[u8], cred: &Cred) -> Result<(), Errno> {
         let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
         let (Some(uid), Some(gid)) = (cred.uid_in(word(4)), cred.gid_in(word(8))) else {
@@ -198,10 +206,10 @@ impl Perm {
     }
 }
 
-/// 一类 IPC 对象的表。
+/// The table of one kind of IPC object.
 pub(crate) struct Table<T> {
     slots: Vec<Option<(Perm, T)>>,
-    /// 每个下标下一次分配时用的序号。
+    /// The sequence number each index uses at its next allocation.
     seqs: Vec<u16>,
 }
 
@@ -219,7 +227,8 @@ impl<T> Table<T> {
         (id >= 0).then_some(((id % IPCMNI) as usize, (id / IPCMNI) as u16))
     }
 
-    /// id 对应的对象；不存在（包括已经删除、下标被重新分配）时 EINVAL。
+    /// The object for an id; EINVAL when there is none (including when it was removed or its index
+    /// allocated again).
     pub fn get(&self, id: i32) -> Result<&(Perm, T), Errno> {
         let (i, seq) = Self::index_of(id).ok_or(Errno::EINVAL)?;
         self.slots
@@ -238,7 +247,7 @@ impl<T> Table<T> {
             .ok_or(Errno::EINVAL)
     }
 
-    /// 按下标找（`*_STAT` 命令），返回完整的 id。
+    /// Looks up by index (the `*_STAT` commands), returning the full id.
     pub fn by_index(&self, index: i32) -> Result<(i32, &(Perm, T)), Errno> {
         let slot = usize::try_from(index)
             .ok()
@@ -248,7 +257,7 @@ impl<T> Table<T> {
         Ok((slot.0.seq as i32 * IPCMNI + index, slot))
     }
 
-    /// 用到的最大下标（`IPC_INFO` 等的返回值）。
+    /// The highest index in use (the return value of `IPC_INFO` and the like).
     pub fn max_index(&self) -> i32 {
         self.slots.iter().rposition(Option::is_some).unwrap_or(0) as i32
     }
@@ -270,7 +279,7 @@ impl<T> Table<T> {
             None => return Err(Errno::ENOSPC),
         };
         perm.seq = self.seqs[i];
-        // 序号要能放进 id：(序号 * 32768 + 下标) 不能溢出 i32
+        // The sequence number must fit in an id: (sequence * 32768 + index) must not overflow i32
         self.seqs[i] = (self.seqs[i] + 1) % (i32::MAX / IPCMNI) as u16;
         let id = perm.seq as i32 * IPCMNI + i as i32;
         self.slots[i] = Some((perm, obj));
@@ -284,7 +293,7 @@ impl<T> Table<T> {
         self.slots[i].take()
     }
 
-    /// 所有对象：(id, 权限, 对象)。
+    /// All objects: (id, permissions, object).
     pub fn iter(&self) -> impl Iterator<Item = (i32, &Perm, &T)> {
         self.slots.iter().enumerate().filter_map(|(i, s)| {
             s.as_ref()
@@ -296,8 +305,9 @@ impl<T> Table<T> {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    /// msgget、semget、shmget 的公共部分：按 key 找已有的对象（`existing` 做对象自己的
-    /// 检查），或者新建一个（`create`）；最多同时存在 `max` 个（`msgmni` 等）。
+    /// The common part of msgget, semget and shmget: finds an existing object by key (`existing`
+    /// does the object's own checks), or creates a new one (`create`); at most `max` (`msgmni`
+    /// etc.) exist at once.
     pub fn get_or_create(
         &mut self,
         key: i32,
@@ -338,29 +348,29 @@ impl<T> Table<T> {
     }
 }
 
-/// 消息队列里的一条消息。
+/// One message in a message queue.
 pub(crate) struct Msg {
     pub mtype: i64,
     pub text: Vec<u8>,
 }
 
-/// 消息队列。
+/// A message queue.
 pub(crate) struct MsgQueue {
     pub msgs: VecDeque<Msg>,
-    /// 队列容量（字节）。
+    /// Queue capacity (bytes).
     pub qbytes: u64,
-    /// 队列里消息的总字节数。
+    /// Total bytes of the messages in the queue.
     pub cbytes: u64,
     pub stime: i64,
     pub rtime: i64,
     pub ctime: i64,
-    /// 最后一次 msgsnd、msgrcv 的进程。
+    /// The processes of the last msgsnd and msgrcv.
     pub lspid: Tid,
     pub lrpid: Tid,
 }
 
 impl MsgQueue {
-    /// 新的队列，容量是 `msgmnb`。
+    /// A new queue, with capacity `msgmnb`.
     pub fn new(qbytes: u64) -> MsgQueue {
         MsgQueue {
             msgs: VecDeque::new(),
@@ -374,13 +384,14 @@ impl MsgQueue {
         }
     }
 
-    /// 还能不能放下一条 `len` 字节的消息（`msg_fits_queue`）。
+    /// Whether a message of `len` bytes still fits (`msg_fits_queue`).
     pub fn fits(&self, len: usize) -> bool {
         self.cbytes + len as u64 <= self.qbytes && (self.msgs.len() as u64) < self.qbytes
     }
 
-    /// msgrcv 选中的消息：`mtype` 为 0 是第一条；大于 0 是第一条类型等于它的（`except`
-    /// 时是不等于它的）；小于 0 是类型不超过 `-mtype` 的消息里类型最小的第一条。
+    /// The message msgrcv selects: for `mtype` 0, the first one; greater than 0, the first whose
+    /// type equals it (with `except`, does not equal it); less than 0, among the messages whose
+    /// type is at most `-mtype`, the first one with the lowest type.
     pub fn select(&self, mtype: i64, except: bool) -> Option<usize> {
         match mtype {
             0 => (!self.msgs.is_empty()).then_some(0),
@@ -396,19 +407,19 @@ impl MsgQueue {
     }
 }
 
-/// 信号量集。
+/// A semaphore set.
 pub(crate) struct SemSet {
     pub vals: Vec<i32>,
-    /// 最后一次操作每个信号量的进程。
+    /// The process that last operated on each semaphore.
     pub pids: Vec<Tid>,
-    /// 在等每个信号量变大（semncnt）、变成 0（semzcnt）的线程数。
+    /// The number of threads waiting for each semaphore to grow (semncnt) or become 0 (semzcnt).
     pub ncnt: Vec<u32>,
     pub zcnt: Vec<u32>,
     pub otime: i64,
     pub ctime: i64,
 }
 
-/// semop 的一个操作（`struct sembuf`）。
+/// One semop operation (`struct sembuf`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SemOp {
     pub num: u16,
@@ -428,9 +439,10 @@ impl SemSet {
         }
     }
 
-    /// 尝试原子地完成所有操作（`perform_atomic_semop`）：全部完成返回 `Ok(None)`；
-    /// 有一个要等待时什么都不改，返回它的下标；结果超出范围时 ERANGE。`undo` 是这个
-    /// 进程对这个信号量集的撤销值，带 `SEM_UNDO` 的操作同时更新它。
+    /// Tries to complete all operations atomically (`perform_atomic_semop`): returns `Ok(None)`
+    /// when all are done; when one has to wait, changes nothing and returns its index; ERANGE when
+    /// a result is out of range. `undo` is this process's undo values for this semaphore set,
+    /// updated at the same time by operations with `SEM_UNDO`.
     pub fn apply(
         &mut self,
         ops: &[SemOp],
@@ -469,43 +481,44 @@ impl SemSet {
     }
 }
 
-/// 共享内存段。
+/// A shared memory segment.
 pub(crate) struct ShmSeg {
     pub mem: SharedMemory,
-    /// shmget 时的字节数（映射按页向上取整）。
+    /// The size in bytes at shmget (mappings round it up to pages).
     pub size: u64,
     pub atime: i64,
     pub dtime: i64,
     pub ctime: i64,
-    /// 创建者和最后一次 shmat、shmdt 的进程。
+    /// The creator, and the process of the last shmat or shmdt.
     pub cpid: Tid,
     pub lpid: Tid,
 }
 
-/// 一个共享内存段：所在的 IPC 命名空间的编号和段的 id（各个命名空间的 id 各自编号）。
+/// A shared memory segment: the number of the IPC namespace it is in and the segment's id (each
+/// namespace numbers its ids separately).
 pub(crate) type ShmKey = (u64, i32);
 
-/// 一个 IPC 命名空间里的所有对象（[`crate::nsproxy::IpcNs`]）：System V IPC 对象和 POSIX
-/// 消息队列，以及它们的限制。
+/// All objects in an IPC namespace ([`crate::nsproxy::IpcNs`]): System V IPC objects and POSIX
+/// message queues, and their limits.
 #[derive(Default)]
 pub(crate) struct Ipc {
     pub msg: Table<MsgQueue>,
     pub sem: Table<SemSet>,
     pub shm: Table<ShmSeg>,
-    /// SEM_UNDO 的撤销值：(进程, 信号量集) → 每个信号量的值。
+    /// SEM_UNDO undo values: (process, semaphore set) → a value per semaphore.
     pub undo: BTreeMap<(Tid, i32), Vec<i32>>,
     pub tunables: Tunables,
-    /// POSIX 消息队列，按名字（`syscall::mqueue`）。
+    /// POSIX message queues, by name (`syscall::mqueue`).
     pub mqueues: BTreeMap<Vec<u8>, Rc<crate::cell::RefCell<crate::syscall::MessageQueue>>>,
-    /// `/proc/sys/fs/mqueue/*`。
+    /// `/proc/sys/fs/mqueue/*`.
     pub mq_limits: crate::syscall::MqLimits,
-    /// mqueue 文件系统的根目录的属主和时间。
+    /// The owner and times of the mqueue filesystem's root directory.
     pub mq_dir: crate::cell::RefCell<crate::syscall::MqDir>,
 }
 
 impl Ipc {
-    /// 信号量的值被 SETVAL、SETALL 直接设置：所有进程对它的撤销值清零。`num` 为 None
-    /// 时是整个集合。
+    /// A semaphore's value was set directly by SETVAL or SETALL: every process's undo value for it
+    /// is cleared. `num` None means the whole set.
     pub fn clear_undo(&mut self, id: i32, num: Option<usize>) {
         for ((_, sid), adj) in self.undo.iter_mut() {
             if *sid == id {
@@ -521,13 +534,14 @@ impl Ipc {
         }
     }
 
-    /// 删除信号量集：同时丢掉它的撤销值。
+    /// Removes a semaphore set, dropping its undo values too.
     pub fn remove_sem(&mut self, id: i32) {
         self.sem.remove(id);
         self.undo.retain(|&(_, sid), _| sid != id);
     }
 
-    /// 进程退出：按 SEM_UNDO 的撤销值调整信号量（结果限制在 0 到 SEMVMX 之间）。
+    /// Process exit: adjusts semaphores by the SEM_UNDO undo values (results clamped between 0 and
+    /// SEMVMX).
     pub fn exit(&mut self, tgid: Tid) {
         let mine: Vec<(i32, Vec<i32>)> = self
             .undo
@@ -550,7 +564,8 @@ impl Ipc {
     }
 }
 
-/// 共享内存段被 shmat 的次数：数所有地址空间里的映射（每个地址空间只数一次）。
+/// How many times a shared memory segment is attached: counts the mappings in all address spaces
+/// (each address space counted only once).
 pub(crate) fn nattch(k: &Kernel, id: ShmKey) -> u64 {
     let mut seen: Vec<*const crate::cell::RefCell<crate::mm::Mm>> = Vec::new();
     let mut n = 0;
@@ -565,7 +580,8 @@ pub(crate) fn nattch(k: &Kernel, id: ShmKey) -> u64 {
     n
 }
 
-/// 释放已经标记删除、不再有映射的共享内存段（各个 IPC 命名空间里的）。
+/// Frees shared memory segments marked for removal that have no mappings left (in every IPC
+/// namespace).
 pub(crate) fn reap_shm(k: &mut Kernel) {
     let doomed: Vec<ShmKey> = k
         .ipcs
@@ -584,15 +600,15 @@ pub(crate) fn reap_shm(k: &mut Kernel) {
     }
 }
 
-/// 进程退出：各个 IPC 命名空间里它的 SEM_UNDO 的撤销值（[`Ipc::exit`]）。
+/// Process exit: its SEM_UNDO undo values in every IPC namespace ([`Ipc::exit`]).
 pub(crate) fn exit(k: &mut Kernel, tgid: Tid) {
     for (_, ipc) in k.ipcs.values_mut() {
         ipc.exit(tgid);
     }
 }
 
-/// IPC 命名空间 `ns` 的 `/proc/sysvipc/{msg,sem,shm}` 的内容，属主、属组按读者 `reader` 的用户
-/// 命名空间换算（Linux 的 `seq_user_ns`）。
+/// The contents of `/proc/sysvipc/{msg,sem,shm}` for IPC namespace `ns`, with owners and groups
+/// translated into the user namespace of the reader `reader` (Linux's `seq_user_ns`).
 pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> String {
     use std::fmt::Write;
     let ipc = k.ipc(ns);
@@ -692,7 +708,7 @@ mod tests {
             t.get_or_create(7, 0, &root, 4, |_| Ok(()), || Ok(())),
             Ok(b)
         );
-        // 别的用户：没有读权限
+        // Another user: no read permission
         assert_eq!(
             t.get_or_create(7, 0o400, &user(1000), 4, |_| Ok(()), || Ok(())),
             Err(Errno::EACCES)
@@ -745,7 +761,7 @@ mod tests {
             flg: SEM_UNDO,
         };
         assert_eq!(set.apply(&[up(0, 2), up(1, 1)], &mut undo, 10), Ok(None));
-        // 第二个操作要等：第一个也不生效
+        // The second operation has to wait: the first takes no effect either
         assert_eq!(
             set.apply(&[up(0, -1), up(1, -2)], &mut undo, 10),
             Ok(Some(1))

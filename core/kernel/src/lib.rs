@@ -1,7 +1,9 @@
-//! appine 内核层：在进程内实现 Linux 用户态 ABI（设计文档 §3 和各模块的 map）。
+//! The appine kernel layer: the Linux user-space ABI implemented in-process (design doc §3 and
+//! each module's map).
 //!
-//! 每个 guest 线程对应一个宿主线程，内核层由一把大内核锁保护；宿主经由 [`Machine`]
-//! 启动进程、开控制台（Android 的终端标签页、`appine-run`）。根文件系统是 inode 仓库。
+//! Every guest thread runs on its own host thread, and the kernel layer is protected by one big
+//! kernel lock; through [`Machine`] the host starts processes and opens consoles (the Android
+//! terminal tabs, `appine-run`). The root filesystem is the inode store.
 
 mod bpf;
 mod bug;
@@ -68,8 +70,8 @@ use errno::Errno;
 use vfs::import::ImportReport;
 use vfs::store::Store;
 
-/// 在 inode 仓库里写一个文件（宿主准备配置文件用，比如首次启动时的
-/// `/etc/profile.d/appine.sh`）；`path` 是 guest 路径。见 [`vfs::write_file`]。
+/// Writes a file in the inode store (for the host to prepare configuration files, such as
+/// `/etc/profile.d/appine.sh` on first start); `path` is a guest path. See [`vfs::write_file`].
 pub fn write_file(
     store: &Path,
     path: &str,
@@ -84,7 +86,8 @@ pub fn write_file(
     .unwrap_or(Err(Errno::EIO))
 }
 
-/// 读 inode 仓库里的一个普通文件（宿主看配置文件用）；`path` 是 guest 路径。见 [`vfs::read_file`]。
+/// Reads a regular file in the inode store (for the host to read configuration files); `path` is
+/// a guest path. See [`vfs::read_file`].
 pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
     bug::host_call("read_file", || {
         let store = Store::open(store, &[])?;
@@ -93,9 +96,11 @@ pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
     .unwrap_or(Err(Errno::EIO))
 }
 
-/// 宿主浏览仓库（App 的 DocumentsProvider，android/documents 的 map）：另外打开一次仓库，对它调用
-/// `f`（[`vfs::browse`] 里的函数）。内核运行着也可以：另外打开仓库时内核先提交推迟的写事务，
-/// 看到的是最新的；这个连接开着期间内核不再推迟提交，所以每次用完就关，不长期开着。
+/// The host browses the store (the app's DocumentsProvider, the android/documents map): opens the
+/// store a second time and calls `f` on it (the functions in [`vfs::browse`]). This works while the
+/// kernel is running too: when the store is opened separately the kernel first commits its deferred
+/// write transaction, so what is seen is up to date; while this connection is open the kernel no
+/// longer defers commits, so it is closed after every use rather than kept open.
 pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
     bug::host_call("browse", || {
         let store = Store::open(store, &[])?;
@@ -104,11 +109,12 @@ pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Re
     .unwrap_or(Err(Errno::EIO))
 }
 
-/// 宿主修改仓库（App 的 DocumentsProvider 新建、删除、改名、移动、写）：与 [`browse`] 一样
-/// 另外打开一次仓库，`f` 把改了什么记进 `changes`（[`vfs::browse::Change`]）。仓库关闭
-/// （提交）之后，把它们交给用着同一个仓库、正在运行的内核，由它报 inotify 事件
-/// （[`machine::store_changed`]）：guest 里监视着的程序知道"文件"App 改了东西。中途出错
-/// 时已经做了的照样交。
+/// The host modifies the store (the app's DocumentsProvider creating, deleting, renaming, moving,
+/// writing): opens the store a second time like [`browse`], and `f` records what it changed in
+/// `changes` ([`vfs::browse::Change`]). After the store is closed (committed), they are handed to
+/// the running kernel that uses the same store, which reports inotify events
+/// ([`machine::store_changed`]): programs watching in the guest learn that the Files app changed
+/// something. On an error midway, what was already done is handed over all the same.
 pub fn browse_changing<R>(
     store: &Path,
     f: impl FnOnce(&Store, &mut Vec<vfs::browse::Change>) -> Result<R, Errno>,
@@ -122,18 +128,21 @@ pub fn browse_changing<R>(
     .unwrap_or(Err(Errno::EIO))
 }
 
-/// 把宿主目录 `store` 里的 inode 仓库（连同所在的整个宿主文件系统）写到盘上：导入
-/// rootfs、写好配置之后，改名就位之前（android/setup 的 map）。不然断电之后仓库在了，里面的
-/// object 却可能还是空的。
+/// Writes the inode store in host directory `store` (along with the whole host filesystem it is on)
+/// to disk: after importing the rootfs and writing the configuration, before renaming it into place
+/// (the android/setup map). Otherwise after a power loss the store could be there while its objects
+/// are still empty.
 pub fn sync_store(store: &Path) -> Result<(), Errno> {
     let dir =
         std::fs::File::open(store).map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
     appine_hal::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)).map_err(Errno)
 }
 
-/// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（android/setup 的 map）。
+/// Creates a new inode store in host directory `store` and imports a rootfs tar.gz into it (the
+/// android/setup map).
 ///
-/// 目录里已经有仓库时返回 `EEXIST`。导入失败时仓库保持为空。
+/// Returns `EEXIST` when the directory already holds a store. If the import fails the store stays
+/// empty.
 pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno> {
     bug::host_call("import_rootfs", || {
         let file = std::fs::File::open(tarball)

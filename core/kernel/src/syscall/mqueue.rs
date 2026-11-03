@@ -1,14 +1,16 @@
-//! POSIX 消息队列：mq_open、mq_unlink、mq_timedsend、mq_timedreceive、mq_notify、
-//! mq_getsetattr。
+//! POSIX message queues: mq_open, mq_unlink, mq_timedsend, mq_timedreceive, mq_notify,
+//! mq_getsetattr.
 //!
-//! 队列按名字登记在所在的 IPC 命名空间里（[`crate::ipc::Ipc::mqueues`]），打开得到一个可以 poll
-//! 的 fd（有消息时可读，没满时可写），read 它得到与 Linux 相同的状态行。mqueue 文件系统
-//! （`mount -t mqueue`，`crate::pseudo` 的 `MqRoot`、`Mq`）把同一张表列成目录：在里面
-//! open(O_CREAT) 新建、unlink 删除、chmod、chown 的都是这些队列，打开得到的 fd 与 mq_open 的
-//! 一样。消息按优先级
-//! 排列，同一优先级先进先出。mq_notify 在空队列来了消息、又没有人在等着接收时通知一次：
-//! 发信号，或者把登记时给的 32 字节 cookie 送到 netlink socket（musl 的 `SIGEV_THREAD`
-//! 就是这样实现的）。上限按 `/proc/sys/fs/mqueue/*`。
+//! Queues are registered by name in their IPC namespace ([`crate::ipc::Ipc::mqueues`]); opening one
+//! gives an fd that can be polled (readable when there are messages, writable when not full), and
+//! reading it gives the same status line as on Linux. The mqueue filesystem (`mount -t mqueue`,
+//! `MqRoot` and `Mq` in `crate::pseudo`) lists the same table as a directory: open(O_CREAT) there
+//! creates these queues, unlink removes them, chmod and chown change them, and opening one gives
+//! the same fd as mq_open. Messages are ordered by priority, first in first out within a priority.
+//! mq_notify notifies once when a message arrives in an empty queue and nobody is waiting to
+//! receive it: it sends a signal, or delivers the 32-byte cookie given at registration to a
+//! netlink socket (which is how musl implements `SIGEV_THREAD`). Limits follow
+//! `/proc/sys/fs/mqueue/*`.
 
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
@@ -27,9 +29,9 @@ use crate::signal::{self, InfoFields, SigInfo};
 use crate::uaccess::UserSlice;
 use crate::vfs::store::{Stat, mode};
 
-/// 优先级的上限（不含）。
+/// Upper bound of priorities (exclusive).
 const MQ_PRIO_MAX: u32 = 32768;
-/// 有 `CAP_SYS_RESOURCE` 时的上限（Linux 的 HARD_MSGMAX、HARD_MSGSIZEMAX）。
+/// The limits with `CAP_SYS_RESOURCE` (Linux's HARD_MSGMAX, HARD_MSGSIZEMAX).
 const HARD_MSGMAX: u64 = 65536;
 const HARD_MSGSIZEMAX: u64 = 16 << 20;
 const NAME_MAX: usize = 255;
@@ -37,12 +39,12 @@ const NAME_MAX: usize = 255;
 const SIGEV_SIGNAL: i32 = 0;
 const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD: i32 = 2;
-/// 消息队列通知的 si_code。
+/// The si_code of message queue notifications.
 const SI_MESGQ: i32 = -3;
-/// netlink 通知 cookie 的最后一个字节。
+/// The last byte of a netlink notification cookie.
 const NOTIFY_WOKENUP: u8 = 1;
 
-/// `/proc/sys/fs/mqueue/*`。
+/// `/proc/sys/fs/mqueue/*`.
 pub(crate) struct Limits {
     pub queues_max: u64,
     pub msg_max: u64,
@@ -64,7 +66,7 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// `/proc/sys/fs/mqueue/<name>` 的值。
+    /// The value of `/proc/sys/fs/mqueue/<name>`.
     pub fn get(&self, name: &[u8]) -> Option<u64> {
         Some(match name {
             b"queues_max" => self.queues_max,
@@ -76,7 +78,7 @@ impl Limits {
         })
     }
 
-    /// 写 `/proc/sys/fs/mqueue/<name>`。
+    /// Writes `/proc/sys/fs/mqueue/<name>`.
     pub fn slot(&mut self, name: &[u8]) -> Option<&mut u64> {
         Some(match name {
             b"queues_max" => &mut self.queues_max,
@@ -89,18 +91,18 @@ impl Limits {
     }
 }
 
-/// mq_notify 的登记。
+/// An mq_notify registration.
 enum Notify {
     Signal {
         tgid: Tid,
         sig: Signal,
         value: u64,
     },
-    /// 什么也不做，只是占住通知（`SIGEV_NONE`）。
+    /// Does nothing, only holding the notification (`SIGEV_NONE`).
     None {
         tgid: Tid,
     },
-    /// 把 cookie 送到 netlink socket（`SIGEV_THREAD`）。
+    /// Delivers the cookie to a netlink socket (`SIGEV_THREAD`).
     Socket {
         tgid: Tid,
         sock: Weak<RefCell<Socket>>,
@@ -118,16 +120,17 @@ impl Notify {
     }
 }
 
-/// 队列的 inode 编号（Linux 的 `get_next_ino`），所有命名空间一起编号。
+/// Queue inode numbers (Linux's `get_next_ino`), numbered across all namespaces together.
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 
-/// mqueue 文件系统里一个目录项的大小、一个队列文件的大小（Linux 的 DIRENT_SIZE、
-/// FILENT_SIZE）：根目录报告 2 + 队列数个目录项。
+/// The size of one directory entry and of one queue file in the mqueue filesystem (Linux's
+/// DIRENT_SIZE, FILENT_SIZE): the root directory reports 2 + the number of queues entries.
 const DIRENT_SIZE: u64 = 20;
 const FILENT_SIZE: u64 = 80;
 
-/// 一个 IPC 命名空间里 mqueue 文件系统的根目录：属主是建立命名空间的进程（开机时的是
-/// root），权限 01777，时间在新建、删除队列时更新。可以 chmod、chown。
+/// The root directory of the mqueue filesystem in one IPC namespace: owned by the process that set
+/// up the namespace (root for the one at boot), mode 01777, its times updated when queues are
+/// created or removed. It can be chmod'ed and chown'ed.
 pub(crate) struct MqDir {
     pub uid: u32,
     pub gid: u32,
@@ -150,7 +153,7 @@ impl MqDir {
         }
     }
 
-    /// stat：`queues` 是里面的队列数。
+    /// stat: `queues` is the number of queues in it.
     pub fn stat(&self, queues: usize) -> Stat {
         Stat {
             ino: 0,
@@ -172,7 +175,8 @@ impl MqDir {
     }
 }
 
-/// 命名空间里 inode 编号是 `ino` 的队列和它的名字（mqueue 文件系统里的节点）。
+/// The queue whose inode number is `ino` in the namespace, and its name (a node in the mqueue
+/// filesystem).
 pub(crate) fn find(ipc: &crate::ipc::Ipc, ino: u64) -> Option<(&[u8], &Rc<RefCell<MessageQueue>>)> {
     ipc.mqueues
         .iter()
@@ -186,11 +190,11 @@ impl Default for MqDir {
     }
 }
 
-/// 一个消息队列。
+/// A message queue.
 pub struct MessageQueue {
-    /// inode 编号：mqueue 文件系统里的节点按它找队列。
+    /// Inode number: nodes in the mqueue filesystem find their queue by it.
     pub ino: u64,
-    /// 所在的 IPC 命名空间的编号（fstat 的设备号按它）。
+    /// The number of the IPC namespace it is in (fstat's device number follows it).
     pub ns: u64,
     uid: u32,
     gid: u32,
@@ -200,23 +204,23 @@ pub struct MessageQueue {
     ctime_ns: i64,
     maxmsg: usize,
     msgsize: usize,
-    /// (优先级, 内容)，优先级高的在前，同一优先级先来的在前。
+    /// (priority, contents), higher priorities first, and within a priority earlier arrivals first.
     messages: VecDeque<(u32, Vec<u8>)>,
     notify: Option<Notify>,
-    /// 正在等着接收的线程数：有人在等时不发通知。
+    /// The number of threads waiting to receive: no notification is sent while someone is waiting.
     receivers: usize,
-    /// 发送、接收的消息数：与 Linux 一样，每次都让对方的 `EPOLLET` 再触发一次。
+    /// Messages sent and received: as on Linux, each one fires the other side's `EPOLLET` again.
     sent: u64,
     received: u64,
 }
 
 impl MessageQueue {
-    /// 发送、接收过的消息数（`syscall::poll` 的数据代数）。
+    /// Messages sent and received so far (`syscall::poll`'s data generation).
     pub fn arrivals(&self) -> [u64; 2] {
         [self.sent, self.received]
     }
 
-    /// poll 的就绪事件。
+    /// poll readiness events.
     pub fn readiness(&self) -> i16 {
         const POLLIN: i16 = 0x001;
         const POLLOUT: i16 = 0x004;
@@ -232,7 +236,7 @@ impl MessageQueue {
         ev
     }
 
-    /// read 读到的状态行，与 Linux 的 mqueue 文件系统相同。
+    /// The status line read returns, the same as Linux's mqueue filesystem.
     pub fn status(&self) -> Vec<u8> {
         let qsize: usize = self.messages.iter().map(|(_, m)| m.len()).sum();
         let (notify, signo, pid) = match &self.notify {
@@ -245,7 +249,7 @@ impl MessageQueue {
             .into_bytes()
     }
 
-    /// fstat：mqueue 文件系统里的普通文件。
+    /// fstat: a regular file in the mqueue filesystem.
     pub fn stat(&self) -> Stat {
         Stat {
             ino: self.ino,
@@ -261,25 +265,26 @@ impl MessageQueue {
         }
     }
 
-    /// 读了状态行、登记或取消通知、改了标志：atime、ctime 是现在。
+    /// The status line was read, a notification registered or cancelled, or the flags changed:
+    /// atime and ctime are now.
     pub fn touch_read(&mut self) {
         let now = crate::tty::wall_ns();
         (self.atime_ns, self.ctime_ns) = (now, now);
     }
 
-    /// 发送、接收了一条消息：三个时间都是现在。
+    /// A message was sent or received: all three times are now.
     fn touch_all(&mut self) {
         let now = crate::tty::wall_ns();
         (self.atime_ns, self.mtime_ns, self.ctime_ns) = (now, now, now);
     }
 
-    /// chmod：只改权限位（文件类型、setuid 这些没有）。
+    /// chmod: changes only the permission bits (there is no file type, setuid and the like).
     pub fn set_mode(&mut self, perm: u32) {
         self.mode = perm & 0o7777;
         self.ctime_ns = crate::tty::wall_ns();
     }
 
-    /// chown：None 的不改。
+    /// chown: the ones that are None are left unchanged.
     pub fn set_owner(&mut self, uid: Option<u32>, gid: Option<u32>) {
         if let Some(uid) = uid {
             self.uid = uid;
@@ -290,7 +295,7 @@ impl MessageQueue {
         self.ctime_ns = crate::tty::wall_ns();
     }
 
-    /// utimensat：None 的不改，ctime 是现在。
+    /// utimensat: the ones that are None are left unchanged; ctime is now.
     pub fn set_times(&mut self, atime: Option<i64>, mtime: Option<i64>) {
         if let Some(t) = atime {
             self.atime_ns = t;
@@ -302,10 +307,12 @@ impl MessageQueue {
     }
 }
 
-/// 在 IPC 命名空间 `ns`（对象是 `ipc`）里新建队列 `name`（Linux 的 `mqueue_create_attr`）：
-/// 属主是调用者的 fsuid、fsgid，`perm` 已经去掉了 umask；`size` 是 (消息数, 消息长度) 的上限，
-/// None 时用 `msg_default`、`msgsize_default`。队列数到了 `queues_max` 时没有
-/// `CAP_SYS_RESOURCE` 是 ENOSPC。还没有登记进名字表（mq_open 装好 fd 之后才登记）。
+/// Creates queue `name` in IPC namespace `ns` (whose objects are `ipc`) (Linux's
+/// `mqueue_create_attr`): owned by the caller's fsuid and fsgid, and `perm` has the umask removed
+/// already; `size` is the limit of (message count, message length), with `msg_default` and
+/// `msgsize_default` when None. When the queue count has reached `queues_max`, it is ENOSPC without
+/// `CAP_SYS_RESOURCE`. Not registered in the name table yet (mq_open registers it only after
+/// installing the fd).
 pub(crate) fn new_queue(
     ipc: &crate::ipc::Ipc,
     ns: u64,
@@ -338,15 +345,16 @@ pub(crate) fn new_queue(
     })))
 }
 
-/// 把新建的队列登记进名字表，根目录的时间随之更新。
+/// Registers a newly created queue in the name table, updating the root directory's times with it.
 pub(crate) fn insert_queue(ipc: &mut crate::ipc::Ipc, name: Vec<u8>, q: Rc<RefCell<MessageQueue>>) {
     ipc.mqueues.entry(name).or_insert(q);
     ipc.mq_dir.borrow_mut().touch();
 }
 
-/// 删除队列 `name`（mq_unlink 和 mqueue 文件系统里的 unlink，都是 Linux 的 `vfs_unlink`）：
-/// 根目录有粘滞位，要是队列或根目录的属主，或者对队列有 `CAP_FOWNER`，否则 EPERM（libc 的
-/// mq_unlink 把它换成 EACCES）。
+/// Removes queue `name` (mq_unlink, and unlink in the mqueue filesystem, both Linux's
+/// `vfs_unlink`): the root directory has the sticky bit, so the caller must own the queue or the
+/// root directory, or have `CAP_FOWNER` over the queue; otherwise EPERM (libc's mq_unlink turns
+/// that into EACCES).
 pub(crate) fn remove_queue(
     ipc: &mut crate::ipc::Ipc,
     cred: &Cred,
@@ -363,7 +371,8 @@ pub(crate) fn remove_queue(
     Ok(())
 }
 
-/// 名字去掉开头的 `/`（musl 已经去掉了），检查长度和字符。
+/// Strips the leading `/` from the name (musl has already stripped it) and checks length and
+/// characters.
 fn queue_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     let name = cx.mm().read_cstr(addr, 4096)?;
     let name = name.strip_prefix(b"/").unwrap_or(&name).to_vec();
@@ -432,7 +441,7 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
         accmode | (flags & oflags::O_NONBLOCK),
         Some(path),
     );
-    // 与 Linux 一样总是 close-on-exec；fd 用完时（EMFILE）不留下新建的队列
+    // Always close-on-exec, as on Linux; when out of fds (EMFILE) the new queue is not left behind
     let fd = cx.fds_mut().install(file, true, 0)?;
     insert_queue(cx.ipc_mut(), name, queue);
     Ok(fd as u64)
@@ -445,7 +454,7 @@ pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
     Ok(0)
 }
 
-/// mq fd 对应的队列和打开文件的访问方式。
+/// The queue of an mq fd, and the open file's access mode.
 fn queue_of(cx: &Cx<'_>, fd: i32) -> Result<(Rc<RefCell<MessageQueue>>, u32), Errno> {
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
@@ -455,7 +464,7 @@ fn queue_of(cx: &Cx<'_>, fd: i32) -> Result<(Rc<RefCell<MessageQueue>>, u32), Er
     }
 }
 
-/// 绝对超时（`CLOCK_REALTIME`）；0 表示一直等。
+/// Absolute timeout (`CLOCK_REALTIME`); 0 means wait forever.
 fn deadline(cx: &Cx<'_>, timeout: u64) -> Result<Option<Instant>, Errno> {
     if timeout == 0 {
         return Ok(None);
@@ -498,7 +507,7 @@ pub(super) fn mq_timedsend(
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
-        // 收走消息时请求这个队列
+        // Taking a message requests a wake for this queue
         cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(&q)])?;
     }
     let notify = {
@@ -512,7 +521,8 @@ pub(super) fn mq_timedsend(
         q.messages.insert(at, (prio, data));
         q.sent += 1;
         q.touch_all();
-        // 空队列来了消息、又没有人在等着接收：通知一次，登记随之取消
+        // A message arrived in an empty queue and nobody is waiting to receive it: notify once, and
+        // the registration is cancelled with it
         if was_empty && q.receivers == 0 {
             q.notify.take()
         } else {
@@ -521,8 +531,9 @@ pub(super) fn mq_timedsend(
     };
     match notify {
         Some(Notify::Signal { tgid, sig, value }) => {
-            // si_pid、si_uid 是登记通知的进程看到的（Linux 的 __do_notify 用登记时的用户命名
-            // 空间，这里用它现在的），之后与别的信号一样当作发送者发的再换算一次
+            // si_pid and si_uid are as the registering process sees them (Linux's __do_notify
+            // uses the user namespace at registration; here its current one is used), and after
+            // that, like any other signal, they are translated once more as sent by the sender
             let cred = cx.cred();
             let uid = cx
                 .kr()
@@ -556,7 +567,8 @@ pub(super) fn mq_timedsend(
         }
         _ => {}
     }
-    // 只叫醒等这个队列的（poll、epoll、阻塞的接收）：原来叫醒所有等待者
+    // Wake only those waiting for this queue (poll, epoll, blocking receives): this used to wake
+    // all waiters
     request_wake_object(wake::of(&q));
     Ok(0)
 }
@@ -595,7 +607,7 @@ pub(super) fn mq_timedreceive(
             return Err(Errno::EINTR);
         }
         q.borrow_mut().receivers += 1;
-        // 来了消息时请求这个队列
+        // A message arriving requests a wake for this queue
         let r = cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(&q)]);
         q.borrow_mut().receivers -= 1;
         r?;
@@ -609,7 +621,7 @@ pub(super) fn mq_timedreceive(
 }
 
 pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
-    // 与 Linux 一样先检查通知方式，再看 fd
+    // As on Linux, check the notification method first, then the fd
     let sev = if sev != 0 {
         let b: [u8; 64] = get(cx, sev)?;
         let how = i32::from_le_bytes(b[12..16].try_into().unwrap());
@@ -626,7 +638,7 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
     let (q, _) = queue_of(cx, fd)?;
     let tgid = cx.tgid();
     let Some(b) = sev else {
-        // 取消自己的登记
+        // Cancel one's own registration
         let mut q = q.borrow_mut();
         if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
             q.notify = None;
@@ -644,7 +656,7 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
             sig: Signal::new(signo).ok_or(Errno::EINVAL)?,
             value,
         },
-        // sigev_signo 是 netlink socket 的 fd，sigev_value 指向 32 字节的 cookie
+        // sigev_signo is the netlink socket's fd, and sigev_value points at the 32-byte cookie
         SIGEV_THREAD => {
             let file = cx.fds().get(signo)?;
             let sock = match &file.borrow().kind {
@@ -660,7 +672,7 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
         _ => return Err(Errno::EINVAL),
     };
     let mut q = q.borrow_mut();
-    // 一个队列只能有一个进程登记；登记者已经退出的不算
+    // A queue can have only one registered process; a registrant that has exited does not count
     if let Some(n) = &q.notify
         && cx
             .kr()

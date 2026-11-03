@@ -1,8 +1,8 @@
-//! syscall 分发（kernel/signal 的 map）。
+//! Syscall dispatch (the kernel/signal map).
 //!
-//! 编号和参数布局按 aarch64 Linux（asm-generic）。未实现的 syscall 一律返回
-//! `-ENOSYS`，绝不崩溃，并记录一条本地调试日志。处理函数在持有 BKL 时运行，
-//! 需要等待的会经由 [`Cx::wait`] 暂时释放它。
+//! Numbers and argument layouts follow aarch64 Linux (asm-generic). Unimplemented syscalls always
+//! return `-ENOSYS`, never crash, and record a local debug log line. Handlers run holding the BKL;
+//! those that need to wait release it temporarily through [`Cx::wait`].
 
 mod aio;
 mod bpf;
@@ -54,42 +54,48 @@ use crate::process::ExitStatus;
 use crate::signal;
 use crate::uaccess::UserSlice;
 
-/// 处理完一次进入内核之后，运行循环该怎么继续。
+/// How the run loop should continue after handling one entry into the kernel.
 pub(crate) enum Flow {
-    /// 继续执行 guest。
+    /// Continue running the guest.
     Continue,
-    /// execve 换了地址空间和程序：刷新翻译缓存后继续。
+    /// execve replaced the address space and the program: flush the translation cache, then
+    /// continue.
     Exec,
-    /// 线程退出。
+    /// The thread exits.
     Exit,
 }
 
-/// syscall 的返回值：成功时是写回 x0 的值。
+/// A syscall's return value: on success, the value written back to x0.
 type SysResult = Result<u64, Errno>;
 
-/// 单次在 guest 与宿主之间拷贝的最大字节数，避免按 guest 给的长度一次性分配内存。
+/// The most bytes copied between guest and host at once, so as not to allocate memory in one go
+/// by a length the guest gives.
 const IO_CHUNK: usize = 64 * 1024;
 
-/// sendfile、copy_file_range 一次最多拷这么多，与 Linux 的 `MAX_RW_COUNT` 相同。
+/// The most sendfile and copy_file_range copy at once, the same as Linux's `MAX_RW_COUNT`.
 const MAX_COPY: usize = 0x7fff_f000;
 
-/// 路径参数的最大长度（含 NUL），与 Linux 的 `PATH_MAX` 相同。
+/// Maximum length of a path argument (including the NUL), the same as Linux's `PATH_MAX`.
 const PATH_MAX: usize = 4096;
 
-/// restart_syscall 的编号：没有处理函数的信号打断 `ERESTART_RESTARTBLOCK` 的 syscall 之后，
-/// 重新执行的 svc 改成它（[`crate::signal::deliver`]）。
+/// The number of restart_syscall: after a signal without a handler interrupts an
+/// `ERESTART_RESTARTBLOCK` syscall, the re-executed svc is changed to it
+/// ([`crate::signal::deliver`]).
 pub(crate) const NR_RESTART_SYSCALL: u64 = 128;
 
-/// 编号 -1：跟踪者在入口把编号改成它时跳过这个系统调用（Linux 的 `NO_SYSCALL`）。
+/// Number -1: when the tracer changes the number to it at entry, this system call is skipped
+/// (Linux's `NO_SYSCALL`).
 const NO_SYSCALL: u64 = u64::MAX;
 
-/// pid 命名空间里看不到的进程换成的编号：各处的查找找不到它，按各自的规矩报 ESRCH、
-/// ECHILD 等（比 `PID_MAX` 大）。
+/// The number a process invisible in the pid namespace is translated to: lookups everywhere fail
+/// to find it and report ESRCH, ECHILD etc. by their own rules (it is larger than `PID_MAX`).
 pub(crate) const NO_PID: Tid = 0x3fff_ffff;
 
-/// 在 pid 命名空间 `ns` 里调用 `nr`：参数里的 pid、tid、进程组号换成全局编号（Linux 的
-/// `find_vpid`），看不到的换成 [`NO_PID`]。0、-1 这些特殊值不变，负数的进程组号取反换。
-/// 在结构体里的（capget、`F_SETOWN_EX`、`TIOCSPGRP`、`SCM_CREDENTIALS`）各自换。
+/// Calling `nr` in pid namespace `ns`: pids, tids and process group IDs in the arguments are
+/// translated to global numbers (Linux's `find_vpid`), and invisible ones to [`NO_PID`]. Special
+/// values such as 0 and -1 are unchanged, and a negative process group ID is translated negated.
+/// Those inside structs (capget, `F_SETOWN_EX`, `TIOCSPGRP`, `SCM_CREDENTIALS`) are each
+/// translated on their own.
 fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
     let global = |v: u64| -> u64 {
         let p = v as i32;
@@ -101,8 +107,8 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
         }) as u32 as u64
     };
     let idx: &[usize] = match nr {
-        // process_vm_readv/writev、get_robust_list、sched_*、kill、tkill、rt_sigqueueinfo、
-        // getpgid、getsid、prlimit64、wait4、sched_setattr/getattr、pidfd_open
+        // process_vm_readv/writev, get_robust_list, sched_*, kill, tkill, rt_sigqueueinfo,
+        // getpgid, getsid, prlimit64, wait4, sched_setattr/getattr, pidfd_open
         270
         | 271
         | 100
@@ -118,14 +124,14 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
         | 274
         | 275
         | 434 => &[0],
-        // ptrace（第一个参数是请求）
+        // ptrace (the first argument is the request)
         117 => &[1],
-        // tgkill、rt_tgsigqueueinfo、setpgid、kcmp
+        // tgkill, rt_tgsigqueueinfo, setpgid, kcmp
         131 | 240 | 154 | 272 => &[0, 1],
-        // waitid(P_PID 或 P_PGID)、setpriority/getpriority(PRIO_PROCESS 或 PRIO_PGRP)
+        // waitid(P_PID or P_PGID), setpriority/getpriority(PRIO_PROCESS or PRIO_PGRP)
         95 if matches!(a[0], 1 | 2) => &[1],
         140 | 141 if matches!(a[0], 0 | 1) => &[1],
-        // ioprio_set/ioprio_get(IOPRIO_WHO_PROCESS 或 IOPRIO_WHO_PGRP)
+        // ioprio_set/ioprio_get(IOPRIO_WHO_PROCESS or IOPRIO_WHO_PGRP)
         30 | 31 if matches!(a[0], 1 | 2) => &[1],
         // fcntl(F_SETOWN)
         25 if a[1] == 8 => &[2],
@@ -136,15 +142,17 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
     }
 }
 
-/// 按 aarch64 Linux 的约定处理一次 `svc #0`：x8 是编号，x0–x5 是参数，返回值写回 x0。
+/// Handles one `svc #0` by the aarch64 Linux convention: x8 is the number, x0–x5 the arguments,
+/// and the return value is written back to x0.
 pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     let state = cpu.state_mut();
     state.orig_x0 = state.x[0];
     let mut nr = state.x[8];
     cx.grow_stack_to(state.sp);
-    // PTRACE_SYSCALL：入口停下，跟踪者可能改了编号（NT_ARM_SYSTEM_CALL）和参数。编号改成
-    // -1 时跳过这个系统调用，x0 是跟踪者设好的返回值；程序自己用 -1 时与 Linux 一样是
-    // ENOSYS（crate::ptrace）
+    // PTRACE_SYSCALL: stop at entry, where the tracer may change the number (NT_ARM_SYSTEM_CALL)
+    // and the arguments. When the number is changed to -1 this system call is skipped, and x0 is
+    // the return value the tracer set; when the program itself uses -1 it is ENOSYS, as on Linux
+    // (crate::ptrace)
     let watched = crate::ptrace::syscall_start(cx, cpu, nr);
     let traced = watched == Some(true);
     let filtered = cx.task.seccomp_on.load(Ordering::Relaxed);
@@ -157,8 +165,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             None => return Flow::Exit,
         }
     }
-    // seccomp：与 arm64 Linux 一样在入口停住之后检查，跟踪者要跳过的（-1）也检查。不执行
-    // 的，x0 已经是返回值（crate::seccomp）
+    // seccomp: checked after the entry stop, as on arm64 Linux, including calls the tracer wants
+    // skipped (-1). For calls not executed, x0 is already the return value (crate::seccomp)
     if filtered {
         match crate::seccomp::check(cx, cpu, nr) {
             crate::seccomp::Verdict::Run(n) => nr = n,
@@ -166,10 +174,12 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             crate::seccomp::Verdict::Exit => return Flow::Exit,
         }
     }
-    // 出口停不停与 arm64 Linux 一样看出口时的跟踪状态（syscall_trace_exit 重新读标志）：
-    // 跟踪者在系统调用中途停住时（PTRACE_EVENT_SECCOMP，fork、clone 的 PTRACE_EVENT_*）
-    // 改用 PTRACE_SYSCALL 继续的，出口也停，入口没停过也一样（strace --seccomp-bpf 这样
-    // 拿返回值）。vDSO 里读时钟的存根在 Linux 上不进内核，有 seccomp 时也没有出口的停止
+    // Whether to stop at exit depends, as on arm64 Linux, on the tracing state at exit
+    // (syscall_trace_exit rereads the flags): when, at a stop in the middle of the system call
+    // (PTRACE_EVENT_SECCOMP, the PTRACE_EVENT_* of fork and clone), the tracer switches to
+    // continuing with PTRACE_SYSCALL, it stops at exit too, even if it never stopped at entry (this
+    // is how strace --seccomp-bpf gets return values). The vDSO's clock-reading stubs do not enter
+    // the kernel on Linux, so with seccomp there is no exit stop for them either
     let exit_stop =
         watched.is_some() || (filtered && !crate::vdso::clock_stub(cx, cpu.state().pc, nr));
     if (traced || filtered) && nr == NO_SYSCALL {
@@ -179,7 +189,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         return signal::deliver(cx, cpu, true);
     }
     let mut a: [u64; 6] = cpu.state().x[..6].try_into().unwrap();
-    // 在新的 pid 命名空间里：参数里的 pid 换成全局编号，返回的 pid 换回来
+    // In a new pid namespace: pids in the arguments are translated to global numbers, and pids
+    // returned are translated back
     let pid_ns = {
         let g = cx.t.group.borrow();
         (g.pid_ns.level > 0).then(|| g.pid_ns.clone())
@@ -191,8 +202,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     use xattr::Target::{Fd, Path};
 
     let result = match nr {
-        // 不返回，或者自己设置全部寄存器。被跟踪时退出之前可能停下来报告
-        // （PTRACE_EVENT_EXIT），execve 之后要报告 exec 和系统调用的出口
+        // These do not return, or set all registers themselves. When traced they may stop to
+        // report before exiting (PTRACE_EVENT_EXIT), and after execve the exec and the system
+        // call exit must be reported
         93 => {
             let flow = proc::exit(cx, a[0] as i32);
             crate::ptrace::exit(cx, cpu, ExitStatus::Exited(a[0] as i32 & 0xff));
@@ -312,7 +324,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         66 => fs::writev(cx, a[0] as i32, a[1], a[2] as usize),
         67 => fs::pread(cx, a[0] as i32, a[1], a[2] as usize, a[3] as i64),
         68 => fs::pwrite(cx, a[0] as i32, a[1], a[2] as usize, a[3] as i64),
-        // 64 位上 pos_h 不参与偏移（Linux 的 pos_from_hilo）
+        // On 64-bit, pos_h does not take part in the offset (Linux's pos_from_hilo)
         69 | 70 => fs::pvectored(
             cx,
             a[0] as i32,
@@ -418,7 +430,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         166 => misc::umask(cx, a[0] as u32),
         167 => misc::prctl(cx, a[0] as i32, [a[1], a[2], a[3], a[4]]),
         169 => misc::gettimeofday(cx, a[0], a[1]),
-        170 => Err(Errno::EPERM), // settimeofday：guest 不能改宿主的时间
+        170 => Err(Errno::EPERM), // settimeofday: the guest cannot change the host's time
         171 => misc::adjtimex(cx, None, a[0]),
         172 => Ok(cx.tgid() as u64),                // getpid
         173 => Ok(cx.t.group.borrow().ppid as u64), // getppid
@@ -559,8 +571,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             Err(Errno::ENOSYS)
         }
     };
-    // set_tid_address、getpgid、getsid、setsid、getpid、getppid、gettid 返回的 pid，
-    // fcntl(F_GETOWN) 返回的 pid 或者负的进程组号（wait4 的在回收之前换好了）
+    // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
+    // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated
+    // before reaping)
     let result = match &pid_ns {
         Some(ns) if matches!(nr, 96 | 155 | 156 | 157 | 172 | 173 | 178) => {
             result.map(|v| ns.vnr(v as Tid).unwrap_or(0) as u64)
@@ -572,9 +585,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         }),
         _ => result,
     };
-    // fd 上的读写返回 EAGAIN，或者 read、write、recvfrom、sendto 没有读写满要求的长度：
-    // 程序在这个方向上用完了 EPOLLET 上次报告的事件（poll::drained）。表里是 (参数下标,
-    // 方向)：sendfile 写 a[0]、读 a[1]，splice 和 tee 读 a[0]、写 a[2]
+    // A read or write on an fd returned EAGAIN, or read, write, recvfrom or sendto did not
+    // transfer the full length asked for: the program has used up, in this direction, the event
+    // EPOLLET last reported (poll::drained). The table holds (argument index, direction):
+    // sendfile writes a[0] and reads a[1], splice and tee read a[0] and write a[2]
     let dirs: &[(usize, usize)] = match nr {
         63 | 65 | 202 | 207 | 212 | 242 | 243 => &[(0, 0)],
         64 | 66 | 206 | 211 | 269 => &[(0, 1)],
@@ -596,20 +610,23 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         Ok(v) => v,
         Err(errno) => errno.to_syscall_return(),
     };
-    // 解除了映射或改了权限：其他共享地址空间的线程要先刷新 TLB，才能释放宿主内存
+    // Mappings were removed or permissions changed: other threads sharing the address space must
+    // flush their TLBs first before the host memory can be freed
     let sync = cx.task.sync.clone();
     cx.mm_mut().sync(&sync);
-    // PTRACE_SYSCALL：出口停下，跟踪者看到返回值；单步执行的 svc 在这里报告
+    // PTRACE_SYSCALL: stop at exit, where the tracer sees the return value; a single-stepped svc is
+    // reported here
     if exit_stop && !crate::ptrace::syscall_exit(cx, cpu) {
         return Flow::Exit;
     }
     crate::ptrace::syscall_stepped(cx);
-    // 返回用户态之前处理挂起的信号和 syscall 重启，与 Linux 一样
+    // Handle pending signals and syscall restarts before returning to user space, as on Linux
     signal::deliver(cx, cpu, true)
 }
 
-/// execve 成功了（`old_tid` 是之前的 tid）：被跟踪时报告 exec（`PTRACE_EVENT_EXEC` 或者
-/// SIGTRAP）和系统调用的出口，执行新程序的第一条指令之前投递信号。
+/// execve succeeded (`old_tid` is the tid before): when traced, reports the exec
+/// (`PTRACE_EVENT_EXEC` or SIGTRAP) and the system call exit, and delivers signals before the
+/// first instruction of the new program runs.
 fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flow {
     crate::ptrace::exec_hw_flush(cx, cpu);
     if !crate::ptrace::traced(cx.task) {
@@ -626,24 +643,24 @@ fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flo
 
 pub(crate) use proc::{interp_label, label_image};
 
-/// 读取 guest 的路径参数。
+/// Reads a guest path argument.
 fn read_path(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     cx.mm().read_cstr(addr, PATH_MAX - 1)
 }
 
-/// 写一个整数类型到 guest 内存。
+/// Writes an integer type to guest memory.
 fn put<const N: usize>(cx: &Cx<'_>, addr: u64, bytes: [u8; N]) -> Result<(), Errno> {
     cx.mm().write(UserSlice::new(addr, N), &bytes)
 }
 
-/// 从 guest 内存读一个定长字节数组。
+/// Reads a fixed-length byte array from guest memory.
 fn get<const N: usize>(cx: &Cx<'_>, addr: u64) -> Result<[u8; N], Errno> {
     let mut b = [0u8; N];
     cx.mm().read(UserSlice::new(addr, N), &mut b)?;
     Ok(b)
 }
 
-/// 读取 `struct timespec`，秒或纳秒超出范围时返回 EINVAL。
+/// Reads a `struct timespec`; returns EINVAL when the seconds or nanoseconds are out of range.
 fn read_timespec(cx: &Cx<'_>, addr: u64) -> Result<std::time::Duration, Errno> {
     let b: [u8; 16] = get(cx, addr)?;
     let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
@@ -654,7 +671,7 @@ fn read_timespec(cx: &Cx<'_>, addr: u64) -> Result<std::time::Duration, Errno> {
     Ok(std::time::Duration::new(sec as u64, nsec as u32))
 }
 
-/// 写一对 64 位整数（timespec、timeval、rlimit）。
+/// Writes a pair of 64-bit integers (timespec, timeval, rlimit).
 fn write_pair(cx: &Cx<'_>, addr: u64, a: i64, b: i64) -> Result<(), Errno> {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&a.to_le_bytes());

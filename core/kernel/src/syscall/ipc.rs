@@ -1,9 +1,11 @@
-//! System V IPC 的 syscall：msgget 系列、semget 系列、shmget 系列（对象见 [`crate::ipc`]）。
+//! System V IPC syscalls: the msgget family, the semget family and the shmget family (for the
+//! objects see [`crate::ipc`]).
 //!
-//! 结构体按 asm-generic 的 64 位布局（`msqid64_ds` 等）。musl 在 cmd 里带上 `IPC_64`，
-//! 与 Linux 一样直接去掉。等待（msgsnd 时队列满、msgrcv 没有消息、semop 不能立即完成）
-//! 走统一的等待机制：每次修改都请求唤醒，等待者重新检查；等待期间对象被删除时返回
-//! EIDRM。
+//! Structs follow asm-generic's 64-bit layout (`msqid64_ds` etc.). musl adds `IPC_64` to cmd, and
+//! as on Linux it is simply dropped. Waits (msgsnd on a full queue, msgrcv with no message, a
+//! semop that cannot complete at once) go through the unified wait mechanism: every change
+//! requests a wake and waiters check again; when the object is removed during the wait, EIDRM is
+//! returned.
 
 use appine_engine::{PAGE_SIZE, prot};
 
@@ -53,11 +55,11 @@ const SHM_RND: i32 = 0o20000;
 const SHM_REMAP: i32 = 0o40000;
 const SHM_EXEC: i32 = 0o100000;
 
-/// 读、写权限（`S_IRUGO`、`S_IWUGO`）。
+/// Read and write permissions (`S_IRUGO`, `S_IWUGO`).
 const READ: u32 = 0o444;
 const WRITE: u32 = 0o222;
 
-/// 一串整数按小端拼起来（编码 `*_ds`、`*info`）。
+/// Concatenates a list of integers in little-endian (to encode `*_ds`, `*info`).
 fn words(out: &mut [u8], at: usize, values: &[u64], width: usize) {
     for (i, v) in values.iter().enumerate() {
         let off = at + i * width;
@@ -65,7 +67,8 @@ fn words(out: &mut [u8], at: usize, values: &[u64], width: usize) {
     }
 }
 
-/// `*_STAT` 和 `IPC_STAT`：按下标或者 id 找对象，`any` 时不检查读权限。返回 id。
+/// `*_STAT` and `IPC_STAT`: finds the object by index or by id, without checking read permission
+/// when `any`. Returns the id.
 fn stat_target<'t, T>(
     table: &'t crate::ipc::Table<T>,
     cred: &Cred,
@@ -84,7 +87,7 @@ fn stat_target<'t, T>(
     Ok((id, entry))
 }
 
-// ---- 消息队列 ----
+// ---- Message queues ----
 
 pub(super) fn msgget(cx: &mut Cx<'_>, key: i32, flags: i32) -> SysResult {
     let cred = cx.cred();
@@ -155,7 +158,7 @@ pub(super) fn msgrcv(
         .ok()
         .filter(|_| id >= 0)
         .ok_or(Errno::EINVAL)?;
-    // MSG_COPY 要求 CONFIG_CHECKPOINT_RESTORE
+    // MSG_COPY requires CONFIG_CHECKPOINT_RESTORE
     if flags & MSG_COPY != 0 {
         return Err(Errno::ENOSYS);
     }
@@ -195,8 +198,8 @@ pub(super) fn msgrcv(
     Ok(n as u64)
 }
 
-/// `struct msqid64_ds`（120 字节）。
-/// `pid` 把记下的 pid 换成调用者看到的。
+/// `struct msqid64_ds` (120 bytes).
+/// `pid` translates a recorded pid into the one the caller sees.
 fn encode_msqid(perm: &Perm, cred: &Cred, q: &MsgQueue, pid: impl Fn(Tid) -> Tid) -> [u8; 120] {
     let mut b = [0u8; 120];
     b[..48].copy_from_slice(&perm.encode(cred));
@@ -231,7 +234,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
                 let bytes = t.iter().map(|(_, _, q)| q.cbytes).sum();
                 (t.len() as u64, msgs, bytes)
             };
-            // struct msginfo：7 个 int 和一个 unsigned short
+            // struct msginfo: 7 ints and an unsigned short
             let mut b = [0u8; 32];
             words(
                 &mut b,
@@ -278,7 +281,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
     }
 }
 
-// ---- 信号量 ----
+// ---- Semaphores ----
 
 pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysResult {
     let [semmsl, _, _, semmni] = cx.ipc().tunables.sem;
@@ -312,7 +315,7 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
         .map(|id| id as u64)
 }
 
-/// `struct semid64_ds`（88 字节）。
+/// `struct semid64_ds` (88 bytes).
 fn encode_semid(perm: &Perm, cred: &Cred, s: &SemSet) -> [u8; 88] {
     let mut b = [0u8; 88];
     b[..48].copy_from_slice(&perm.encode(cred));
@@ -339,7 +342,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
                 let sems = t.iter().map(|(_, _, s)| s.vals.len() as u64).sum();
                 (t.len() as u64, sems)
             };
-            // struct seminfo：10 个 int
+            // struct seminfo: 10 ints
             let mut b = [0u8; 40];
             words(
                 &mut b,
@@ -515,10 +518,10 @@ pub(super) fn semtimedop(
             return Err(Errno::EAGAIN);
         }
         if cx.interrupted() {
-            // semop 不会被 SA_RESTART 重启
+            // semop is not restarted by SA_RESTART
             return Err(Errno::EINTR);
         }
-        // 等待期间计入 semncnt 或者 semzcnt
+        // While waiting, count in semncnt or semzcnt
         let (num, zero) = (ops[i].num as usize, ops[i].op == 0);
         let ns = cx.task.ns.borrow().ipc.id;
         let count = |k: &mut Kernel, d: i32| {
@@ -539,7 +542,7 @@ pub(super) fn semtimedop(
     }
 }
 
-// ---- 共享内存 ----
+// ---- Shared memory ----
 
 pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysResult {
     let cred = cx.cred();
@@ -564,8 +567,9 @@ pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysRes
                 if !(limits::SHMMIN..=t.shmmax).contains(&size) {
                     return Err(Errno::EINVAL);
                 }
-                // 没有大页，与没有编进 hugetlbfs 的 Linux 一样是 EINVAL（newseg 里的
-                // hstate_sizelog 是 NULL）。原来当作普通的段建出来
+                // No huge pages: EINVAL, as on a Linux without hugetlbfs compiled in
+                // (hstate_sizelog in newseg is NULL). This used to be created as an ordinary
+                // segment
                 if flags & SHM_HUGETLB != 0 {
                     return Err(Errno::EINVAL);
                 }
@@ -632,7 +636,7 @@ pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
-    // 段所在的命名空间是 shmat 时的（之后可能 unshare 过）
+    // The segment's namespace is the one at shmat time (there may have been an unshare since)
     let (ns, id) = cx.mm_mut().detach_shm(addr)?;
     let tgid = cx.tgid();
     let k = cx.k();
@@ -646,8 +650,8 @@ pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
     Ok(0)
 }
 
-/// `struct shmid64_ds`（112 字节）。
-/// `pid` 把记下的 pid 换成调用者看到的。
+/// `struct shmid64_ds` (112 bytes).
+/// `pid` translates a recorded pid into the one the caller sees.
 fn encode_shmid(
     perm: &Perm,
     cred: &Cred,
@@ -674,7 +678,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
     reap_shm(cx.k());
     match cmd {
         IPC_INFO => {
-            // struct shminfo64：9 个 unsigned long
+            // struct shminfo64: 9 unsigned longs
             let t = cx.ipc().tunables;
             let mut b = [0u8; 72];
             words(
@@ -690,7 +694,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
         SHM_INFO => {
             let t = &cx.ipc().shm;
             let pages: u64 = t.iter().map(|(_, _, s)| s.mem.len() / PAGE_SIZE).sum();
-            // struct shm_info：used_ids，然后 shm_tot、shm_rss、shm_swp 等（unsigned long）
+            // struct shm_info: used_ids, then shm_tot, shm_rss, shm_swp etc. (unsigned long)
             let mut b = [0u8; 48];
             words(&mut b, 0, &[t.len() as u64], 4);
             words(&mut b, 8, &[pages, pages], 8);
@@ -726,7 +730,8 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             let ns = cx.task.ns.borrow().ipc.id;
             let k = cx.k();
             k.ipc(ns).shm.get(id)?.0.may_change(&cred)?;
-            // 还有映射时先标记，key 变成私有，最后一个映射消失之后再释放
+            // While mappings remain, mark it first, the key becomes private, and free it after the
+            // last mapping goes away
             let attached = nattch(k, (ns, id));
             let (perm, _) = k.ipc_mut(ns).shm.get_mut(id)?;
             perm.mode |= SHM_DEST;

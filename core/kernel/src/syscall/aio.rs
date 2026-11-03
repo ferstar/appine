@@ -1,10 +1,11 @@
-//! Linux 原生 AIO：io_setup、io_destroy、io_submit、io_cancel、io_getevents、
-//! io_pgetevents。
+//! Linux native AIO: io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents.
 //!
-//! 请求在 io_submit 里同步执行，完成事件放进上下文的队列，由 io_getevents 取走；只有
-//! `IOCB_CMD_POLL` 在 fd 还没就绪时挂起，等 io_getevents 时再检查。上下文属于线程组：
-//! fork 出来的子进程没有，execve 时清掉。上下文 id 是 guest 里一页只读内存的地址：
-//! libaio 会读那里的环形缓冲区头部，魔数不对就总是走 syscall。
+//! Requests run synchronously in io_submit, and completion events go into the context's queue,
+//! where io_getevents takes them; only `IOCB_CMD_POLL` stays pending while the fd is not ready,
+//! and is checked again when io_getevents waits. Contexts belong to the thread group: a forked
+//! child has none, and they are cleared on execve. A context id is the address of a page of
+//! read-only memory in the guest: libaio reads the ring buffer header there, and when the magic
+//! number is wrong it always goes through the syscall.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -27,14 +28,14 @@ const IOCB_CMD_FDSYNC: u16 = 3;
 const IOCB_CMD_POLL: u16 = 5;
 const IOCB_CMD_PREADV: u16 = 7;
 const IOCB_CMD_PWRITEV: u16 = 8;
-/// 完成时通知 `aio_resfd` 这个 eventfd。
+/// On completion, notify the eventfd `aio_resfd`.
 const IOCB_FLAG_RESFD: u32 = 1;
-/// `aio_rw_flags`：RWF_HIPRI、RWF_DSYNC、RWF_SYNC 不影响结果。
+/// `aio_rw_flags`: RWF_HIPRI, RWF_DSYNC and RWF_SYNC do not affect the result.
 const RWF_NOWAIT: u32 = 0x8;
 const RWF_APPEND: u32 = 0x10;
 const RWF_KNOWN: u32 = 0x1 | 0x2 | 0x4 | RWF_NOWAIT | RWF_APPEND;
 
-/// 一个等着 fd 就绪的 `IOCB_CMD_POLL`。
+/// An `IOCB_CMD_POLL` waiting for its fd to be ready.
 struct PendingPoll {
     data: u64,
     obj: u64,
@@ -43,14 +44,14 @@ struct PendingPoll {
     resfd: Option<i32>,
 }
 
-/// 一个 AIO 上下文。
+/// An AIO context.
 pub(crate) struct AioContext {
-    /// io_setup 的 `nr_events`：已经完成、还没取走的事件和挂起的请求加起来的上限。
+    /// io_setup's `nr_events`: the limit on completed events not yet taken plus pending requests.
     max: usize,
-    /// 完成事件（`struct io_event`）。
+    /// Completion events (`struct io_event`).
     events: VecDeque<[u8; 32]>,
     polls: Vec<PendingPoll>,
-    /// 已经 io_destroy：正在 io_getevents 里等的线程醒来之后返回（Linux 的 `ctx->dead`）。
+    /// io_destroy'ed: threads waiting in io_getevents return after waking (Linux's `ctx->dead`).
     dead: bool,
 }
 
@@ -82,7 +83,7 @@ pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
     if cur != 0 || nr == 0 || nr > 0x1000_0000 / 32 {
         return Err(Errno::EINVAL);
     }
-    // 与 Linux 一样按 nr 的两倍计入 aio-nr
+    // As on Linux, twice nr counts towards aio-nr
     let cost = u64::from(nr) * 2;
     if cx.kr().aio_nr + cost > cx.kr().aio_max_nr {
         return Err(Errno::EAGAIN);
@@ -107,8 +108,9 @@ pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
     Ok(0)
 }
 
-/// 销毁上下文：挂起的 poll 取消掉（不产生完成事件），正在 io_getevents 里等它的线程醒来
-/// 之后返回，与 Linux 的 `kill_ioctx` 一样。mariadb 关闭时靠这一点结束等事件的线程。
+/// Destroys a context: pending polls are cancelled (producing no completion events), and threads
+/// waiting for it in io_getevents return after waking, as with Linux's `kill_ioctx`. mariadb
+/// relies on this to end its event-waiting threads at shutdown.
 pub(super) fn io_destroy(cx: &mut Cx<'_>, ctx: u64) -> SysResult {
     let c =
         cx.t.group
@@ -127,7 +129,7 @@ pub(super) fn io_destroy(cx: &mut Cx<'_>, ctx: u64) -> SysResult {
     Ok(0)
 }
 
-/// 上下文不再使用（io_destroy、execve、进程退出）：从 aio-nr 里扣掉。
+/// A context is no longer used (io_destroy, execve, process exit): subtract it from aio-nr.
 pub(crate) fn released(
     k: &mut crate::kernel::Kernel,
     contexts: impl IntoIterator<Item = (u64, Rc<RefCell<AioContext>>)>,
@@ -137,7 +139,7 @@ pub(crate) fn released(
     }
 }
 
-/// 完成时通知 eventfd（`IOCB_FLAG_RESFD`）：计数加一。
+/// On completion, notifies the eventfd (`IOCB_FLAG_RESFD`): its count goes up by one.
 fn notify_resfd(cx: &mut Cx<'_>, fd: Option<i32>) {
     let Some(fd) = fd else {
         return;
@@ -147,13 +149,13 @@ fn notify_resfd(cx: &mut Cx<'_>, fd: Option<i32>) {
     {
         let mut e = e.borrow_mut();
         e.count = e.count.saturating_add(1).min(u64::MAX - 1);
-        // 与 eventfd 的写一样算一次到达（EPOLLET 再触发）
+        // Counts as one arrival, like a write to the eventfd (EPOLLET fires again)
         e.writes += 1;
     }
     request_wake();
 }
 
-/// 执行一个读写请求，返回 io_event 的 res（负数是 errno）。
+/// Runs a read or write request, returning the io_event's res (negative is an errno).
 fn read_write(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -162,7 +164,7 @@ fn read_write(
     (buf, len, offset): (u64, u64, i64),
     rw_flags: u32,
 ) -> i64 {
-    // 不能定位的文件（管道、socket）不管偏移；RWF_NOWAIT 时不等
+    // Files that cannot seek (pipes, sockets) ignore the offset; with RWF_NOWAIT, do not wait
     let at = super::fs::seekable(&file.borrow()).then_some(offset as u64);
     let saved = file.borrow().flags;
     let mut f = saved;
@@ -180,7 +182,8 @@ fn read_write(
         IOCB_CMD_PREADV => super::fs::vectored(cx, fd, buf, len, at, false),
         _ => super::fs::vectored(cx, fd, buf, len, at, true),
     };
-    // 只还原临时加上的两个标志：请求执行期间别的线程可能改了别的标志
+    // Restore only the two flags added temporarily: other threads may have changed other flags
+    // while the request ran
     let temp = oflags::O_NONBLOCK | oflags::O_APPEND;
     let restored = (file.borrow().flags & !temp) | (saved & temp);
     file.borrow_mut().flags = restored;
@@ -190,7 +193,8 @@ fn read_write(
     }
 }
 
-/// 提交一个请求：读写和 fsync 当场完成，poll 没就绪时挂起。
+/// Submits one request: reads, writes and fsync complete on the spot, and a poll that is not ready
+/// stays pending.
 fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<(), Errno> {
     let b: [u8; 64] = get(cx, obj)?;
     let u64_at = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
@@ -230,7 +234,7 @@ fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<
     if !c.borrow().room() {
         return Err(Errno::EAGAIN);
     }
-    // 内核把 aio_key 写成 0（KIOCB_KEY），io_cancel 拿它核对
+    // The kernel writes aio_key as 0 (KIOCB_KEY), and io_cancel checks against it
     put(cx, obj + 8, 0u32.to_le_bytes())?;
     let res = match op {
         IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => match super::fs::fsync(cx, fd, op == IOCB_CMD_FDSYNC) {
@@ -292,8 +296,8 @@ pub(super) fn io_cancel(cx: &mut Cx<'_>, ctx: u64, iocb: u64, _result: u64) -> S
     if key != 0 {
         return Err(Errno::EINVAL);
     }
-    // 只有挂起的 poll 能取消：完成事件照样放进队列（就绪的事件为空），与 Linux 一样
-    // 返回 EINPROGRESS
+    // Only a pending poll can be cancelled: its completion event still goes into the queue (with
+    // no ready events), and EINPROGRESS is returned, as on Linux
     let mut c = c.borrow_mut();
     let i = c
         .polls
@@ -306,7 +310,7 @@ pub(super) fn io_cancel(cx: &mut Cx<'_>, ctx: u64, iocb: u64, _result: u64) -> S
     Err(Errno::EINPROGRESS)
 }
 
-/// 挂起的 poll 里已经就绪的完成掉。
+/// Completes the pending polls that have become ready.
 fn complete_polls(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>) {
     let mut done = Vec::new();
     {
@@ -355,8 +359,8 @@ pub(super) fn io_getevents(
         if have >= min_nr.max(1) || min_nr == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
             break Ok(());
         }
-        // 等的时候上下文被销毁了：已经完成的事件照样取走，一个也没有就是 EINVAL（Linux 的
-        // aio_read_events）
+        // The context was destroyed while waiting: events already completed are taken all the
+        // same, and when there are none it is EINVAL (Linux's aio_read_events)
         if c.borrow().dead {
             break if have > 0 { Ok(()) } else { Err(Errno::EINVAL) };
         }
@@ -378,7 +382,7 @@ pub(super) fn io_getevents(
     Ok(take as u64)
 }
 
-/// io_pgetevents 的最后一个参数：`struct { const sigset_t *sigmask; size_t sigsetsize; }`。
+/// The last argument of io_pgetevents: `struct { const sigset_t *sigmask; size_t sigsetsize; }`.
 pub(super) fn sigmask_arg(cx: &Cx<'_>, usig: u64) -> Result<Option<(u64, usize)>, Errno> {
     if usig == 0 {
         return Ok(None);

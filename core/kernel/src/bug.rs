@@ -1,24 +1,33 @@
-//! 内核层和引擎自己的 bug（engine 的 map、设计文档 §12 第 5 条）。
+//! Bugs of the kernel layer and the engine themselves (the engine map, design doc §12 item 5).
 //!
-//! 一个 guest 程序撞上这样的 bug 时，只结束这个 guest 进程，App 里别的会话照常运行：
+//! When a guest program hits such a bug, only that guest process is ended, and the other sessions
+//! in the app keep running:
 //!
-//! - 内核层 panic：用 [`catch`] 兜住，之后获取 BKL 时忽略它的中毒标记
-//!   （[`crate::kernel::Shared::lock`]）。兜住的地方和出错时结束的是：
-//!   - guest 线程每次进入内核、线程开始、线程退出的每一步：这个线程所在的进程；
-//!   - 进程结束（最后一个线程退出之后，[`crate::process::finish_group`]）的每一步：进程
-//!     已经结束了，只报告，接着做下一步；
-//!   - 定时器线程处理一个进程的定时器：那个进程；内存上限的检查、信号驱动的 I/O 分不出
-//!     是哪个进程的，出错时关掉这项功能；
-//!   - 宿主调用 [`crate::Machine`] 的方法和本库别的公开函数（[`host_call`]）：调用返回
-//!     错误，出错的是一个控制台上的调用时挂断那个控制台。
-//! - 引擎让宿主收到 SIGSEGV、SIGBUS、SIGILL：引擎返回 [`Exit::HostFault`](appine_engine::Exit)。
+//! - A kernel-layer panic: caught with [`catch`], after which taking the BKL ignores its poison
+//!   flag ([`crate::kernel::Shared::lock`]). Where it is caught, and what is ended on an error:
+//!   - every entry of a guest thread into the kernel, thread start, and each step of thread exit:
+//!     the process the thread belongs to;
+//!   - each step of process finish (after the last thread exits,
+//!     [`crate::process::finish_group`]): the process has already ended, so it is only reported
+//!     and the next step goes on;
+//!   - the timer thread handling one process's timers: that process; the memory-limit check and
+//!     signal-driven I/O cannot tell which process they are for, so on an error that feature is
+//!     turned off;
+//!   - the host calling [`crate::Machine`] methods and the library's other public functions
+//!     ([`host_call`]): the call returns an error, and when the failing call is on a console, that
+//!     console is hung up.
+//! - The engine makes the host receive SIGSEGV, SIGBUS or SIGILL: the engine returns
+//!   [`Exit::HostFault`](appine_engine::Exit).
 //!
-//! 两种情况都像 Linux 的 oops 结束当前任务那样用 SIGSEGV 结束进程（这里是整个线程组），
-//! 并往宿主的 stderr（Android 上转到 logcat）写一份报告；panic 的消息和位置由 panic hook
-//! 先打印，也写进报告（[`install_panic_hook`]）。BKL 保护的状态可能只改了一半，但结束了出问题的进程，大部分不一致也随之消失。
+//! In both cases the process (here the whole thread group) is ended with SIGSEGV, as Linux's oops
+//! ends the current task, and a report is written to the host's stderr (logcat on Android); the
+//! panic's message and location are printed first by the panic hook, and also go into the report
+//! ([`install_panic_hook`]). The state the BKL protects may be only half changed, but with the
+//! faulty process ended, most inconsistencies go away with it.
 //!
-//! debug 构建默认仍然直接终止宿主进程（panic 时 abort，宿主故障按默认动作产生 core
-//! dump），方便开发时就地调试；环境变量 `APPINE_ON_BUG=kill` 或 `abort` 可以覆盖默认值。
+//! Debug builds still terminate the host process directly by default (abort on panic; host
+//! faults produce a core dump by the default action), for debugging on the spot during
+//! development; the environment variable `APPINE_ON_BUG=kill` or `abort` overrides the default.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -38,7 +47,7 @@ use crate::kernel::{Kernel, Tid};
 use crate::process::{ExitStatus, Signal};
 use crate::task::Task;
 
-/// 撞上 bug 时只结束 guest 进程，而不是终止宿主进程。
+/// Hitting a bug ends only the guest process, instead of terminating the host process.
 pub(crate) fn contain() -> bool {
     static CONTAIN: OnceLock<bool> = OnceLock::new();
     *CONTAIN.get_or_init(|| match std::env::var("APPINE_ON_BUG").as_deref() {
@@ -49,18 +58,22 @@ pub(crate) fn contain() -> bool {
 }
 
 thread_local! {
-    /// 这个线程最近一次 panic 的消息和位置（[`install_panic_hook`]），还没写进报告的。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// This thread's latest panic message and location ([`install_panic_hook`]), not yet written
+    /// into a report.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; a false positive on Android
     static LAST_PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// panic 的消息最多写进报告多少字节：`assert_eq!` 的消息带着两边的值，可能很长。
+/// The most bytes of a panic message written into a report: an `assert_eq!` message carries the
+/// values of both sides and can be long.
 const PANIC_MESSAGE_MAX: usize = 1000;
 
-/// 装上 panic hook（每个宿主进程一次，原来的照样调用）：记下每个线程最近一次 panic 的消息和
-/// 位置，结束进程、报告 bug 时写进报告（[`kill`]、[`report`]）。报告进内核日志、交给 App，
-/// 用户在 `dmesg` 里、在复制给开发者的报告里就看得到是哪里出的错；原来这些只由默认的 hook
-/// 打印到 stderr（Android 上是 logcat，用户拿不到）。
+/// Installs the panic hook (once per host process, still calling the original hook): records each
+/// thread's latest panic message and location, which go into the report when a process is ended
+/// or a bug reported ([`kill`], [`report`]). The report goes into the kernel log and to the app, so
+/// the user can see where the error happened in `dmesg` and in the report copied for developers;
+/// before, these were only printed to stderr by the default hook (logcat on Android, out of the
+/// user's reach).
 pub(crate) fn install_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -80,7 +93,7 @@ pub(crate) fn install_panic_hook() {
             if let Some(at) = info.location() {
                 text.push_str(&format!(" at {}:{}", at.file(), at.line()));
             }
-            // 线程正在退出、线程局部变量已经没了时就不记
+            // Do not record when the thread is exiting and its thread-locals are already gone
             let _ = LAST_PANIC.try_with(|p| {
                 if let Ok(mut p) = p.try_borrow_mut() {
                     *p = Some(text);
@@ -91,7 +104,7 @@ pub(crate) fn install_panic_hook() {
     });
 }
 
-/// 取走这个线程最近一次 panic 的消息和位置（[`install_panic_hook`]）。
+/// Takes this thread's latest panic message and location ([`install_panic_hook`]).
 fn take_panic() -> Option<String> {
     LAST_PANIC
         .try_with(|p| p.try_borrow_mut().ok()?.take())
@@ -99,7 +112,7 @@ fn take_panic() -> Option<String> {
         .flatten()
 }
 
-/// `what` 后面接上这个线程刚才 panic 的消息和位置（有的话）。
+/// `what` followed by the message and location of the panic this thread just had (if any).
 fn with_panic(what: fmt::Arguments<'_>) -> String {
     match take_panic() {
         Some(panic) => format!("{what}: {panic}"),
@@ -107,8 +120,9 @@ fn with_panic(what: fmt::Arguments<'_>) -> String {
     }
 }
 
-/// 执行内核代码 `f`，兜住其中的 panic：返回 None，由调用方收拾（结束出问题的进程等）。
-/// 不兜（[`contain`]）时直接终止宿主进程。panic 的消息和位置已经由 panic hook 打印。
+/// Runs kernel code `f`, catching panics in it: returns None, leaving the cleanup to the caller
+/// (ending the faulty process, etc.). When not containing ([`contain`]) it terminates the host
+/// process directly. The panic's message and location have already been printed by the panic hook.
 pub(crate) fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
     match std::panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(r) => Some(r),
@@ -120,8 +134,9 @@ pub(crate) fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
     }
 }
 
-/// 执行宿主调用（[`crate::Machine`] 的方法和本库别的公开函数）`what` 里的内核代码：内核层
-/// panic 时报告，返回 None，由调用方返回错误。
+/// Runs the kernel code in host call `what` (a [`crate::Machine`] method or another public
+/// function of this library): on a kernel-layer panic it reports and returns None, and the caller
+/// returns an error.
 pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
     let r = catch(|| {
         trap(Trap::HostCall, HOST);
@@ -133,27 +148,30 @@ pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
     r
 }
 
-/// 内核层结束了一个 guest 进程（App 据此在它的标签页里说明原因，android/service 的 map、设计文档 §12 第 5 条）。
+/// The kernel layer ended a guest process (the app uses this to explain why in its tab; the
+/// android/service map, design doc §12 item 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillReport {
-    /// 进程号（开机时的 pid 命名空间里的）。
+    /// Process ID (in the pid namespace created at boot).
     pub pid: i32,
-    /// 进程的名字（comm）。
+    /// The process's name (comm).
     pub comm: String,
-    /// 控制终端是 App 的控制台时是它的编号（`Machine::open_console` 返回的）。
+    /// When the controlling terminal is one of the app's consoles, its number (as returned by
+    /// `Machine::open_console`).
     pub console: Option<u32>,
     pub reason: KillReason,
 }
 
-/// 为什么结束。
+/// Why it was ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillReason {
-    /// 内核层、引擎的 bug：`report` 是报告的那一行（也写进了内核日志），`log` 是内核日志里
-    /// 它前面的几条和它自己（`dmesg` 的写法，每行一项）：出错之前有没有别的 bug、OOM、guest
-    /// 写的日志，在复制给开发者的报告里就看得到。
+    /// A kernel-layer or engine bug: `report` is the report line (also written to the kernel log),
+    /// and `log` is the few records before it in the kernel log plus itself (as `dmesg` writes
+    /// them, one per line): whether there were other bugs, OOMs or guest-written logs before the
+    /// error can then be seen in the report copied for developers.
     Bug { report: String, log: Vec<String> },
-    /// OOM killer：App 内存的上限（`cgroup` 是 None）或者某个 cgroup 的 `memory.max` 不够了；
-    /// 用量和上限是字节。
+    /// OOM killer: the app's memory limit (`cgroup` is None) or some cgroup's `memory.max` was not
+    /// enough; usage and limit are in bytes.
     OutOfMemory {
         cgroup: Option<String>,
         used: u64,
@@ -161,12 +179,13 @@ pub enum KillReason {
     },
 }
 
-/// 最多攒这么多份报告，App 没来得及取走时丢掉最早的。
+/// The most reports kept; the oldest is dropped when the app has not taken them in time.
 const MAX_KILLS: usize = 32;
 
-/// 记下结束进程 `tgid` 的报告，等 App 取走。
+/// Records the report of ending process `tgid`, for the app to take.
 pub(crate) fn record_kill(k: &Kernel, tgid: Tid, comm: String, reason: KillReason) {
-    // 撞上 bug 时线程组可能正被借着：借不到就当作没有控制终端，报告照样记下
+    // On hitting a bug the thread group may be borrowed: if it cannot be borrowed, take it to have
+    // no controlling terminal, and record the report all the same
     let console = k.groups.get(&tgid).and_then(|g| {
         let tty = g.try_borrow().ok()?.ctty.clone()?;
         k.consoles
@@ -188,8 +207,8 @@ pub(crate) fn record_kill(k: &Kernel, tgid: Tid, comm: String, reason: KillReaso
     });
 }
 
-/// 结束撞上 bug 的线程所在的进程：报告 `what`，用 SIGSEGV 结束整个线程组。`pc` 是这个
-/// 线程最后一次进入内核时的 guest pc。
+/// Ends the process of the thread that hit a bug: reports `what` and ends the whole thread group
+/// with SIGSEGV. `pc` is the guest pc at this thread's last entry into the kernel.
 pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
     let comm = crate::pseudo::comm_str(Some(task), task.tgid);
     let report = format!(
@@ -206,7 +225,7 @@ pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
     segv(k, task.tgid);
 }
 
-/// 结束进程 `tgid`：bug 不是在它自己的线程上撞上的（定时器线程）。
+/// Ends process `tgid`: the bug was not hit on one of its own threads (the timer thread).
 pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
     let task = k.groups.get(&tgid).and_then(|g| {
         let first = g.borrow().threads.first().copied();
@@ -223,16 +242,19 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
     segv(k, tgid);
 }
 
-/// 交给 App 的报告带上内核日志里它前面的几条。
+/// The report handed to the app carries this many records before it in the kernel log.
 const LOG_BEFORE: u64 = 10;
 
-/// 结束进程的报告也记进内核日志（[`crate::klog`]），guest 里用 `dmesg` 看得到进程为什么
-/// 以 SIGSEGV 结束。Linux 的 oops 用 KERN_EMERG，那是整个内核出了错；这里只结束一个进程，
-/// 与 OOM killer 结束进程一样用 KERN_ERR。报告里的换行（panic 的消息可能有）各成一行。
+/// The report of ending a process also goes into the kernel log ([`crate::klog`]), so `dmesg` in
+/// the guest shows why the process ended with SIGSEGV. Linux's oops uses KERN_EMERG, since the
+/// whole kernel went wrong; here only one process is ended, so KERN_ERR is used, as when the OOM
+/// killer ends a process. Newlines in the report (a panic message may have some) each start a line
+/// of their own.
 ///
-/// 返回日志里报告前面的 [`LOG_BEFORE`] 条和报告自己（[`crate::klog::Klog::lines_from`]）：
-/// 报告的时间戳和前面几条的放在一起，看得出隔了多久。日志正被借用时（在日志自己的代码里
-/// 出了错）是空的。
+/// Returns the [`LOG_BEFORE`] records before the report in the log plus the report itself
+/// ([`crate::klog::Klog::lines_from`]): the report's timestamp sits with those of the records
+/// before it, showing how much time passed. Empty when the log is borrowed (an error in the log's
+/// own code).
 fn log(k: &Kernel, report: &str) -> Vec<String> {
     let start = k.klog.try_borrow().map(|l| l.upcoming_seq()).ok();
     for line in report.lines() {
@@ -246,7 +268,7 @@ fn log(k: &Kernel, report: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 报告一个不能归到某个 guest 进程上的 bug。
+/// Reports a bug that cannot be attributed to a guest process.
 pub(crate) fn report(what: fmt::Arguments<'_>) {
     eprintln!("appine: internal error: {}", with_panic(what));
 }
@@ -263,39 +285,41 @@ fn segv(k: &Kernel, tgid: Tid) {
     }
 }
 
-/// 测试钩子可以布下 bug 的地方（[`trap`]）。
+/// Places where the test hooks can plant bugs ([`trap`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Trap {
-    /// 线程开始运行时：布给一个进程（pid），它下一个开始的线程 panic。
+    /// When a thread starts running: planted for a process (pid), whose next thread to start
+    /// panics.
     Start,
-    /// 线程退出时：布给一个线程（tid）。
+    /// When a thread exits: planted for a thread (tid).
     Exit,
-    /// 定时器线程处理一个进程（pid）的定时器时。
+    /// When the timer thread handles the timers of a process (pid).
     Timers,
-    /// 宿主下一次调用 [`crate::Machine`] 的方法（只读一张表的除外）或本库别的公开函数时。
+    /// The next time the host calls a [`crate::Machine`] method (except those that only read a
+    /// table) or another public function of this library.
     HostCall,
-    /// 进程结束（[`crate::process::finish_group`]）的一步：布给一个进程（pid），哪一步记在
-    /// `FINISH_STEP` 里。
+    /// A step of process finish ([`crate::process::finish_group`]): planted for a process (pid),
+    /// with the step recorded in `FINISH_STEP`.
     Finish,
-    /// 线程下一次不持 BKL 的系统调用（`syscall::fast`）：布给一个线程（tid）。
+    /// The thread's next no-BKL system call (`syscall::fast`): planted for a thread (tid).
     Fast,
-    /// 在 futex 上等待（已经登记成等待者之后）：布给一个进程（pid）。
+    /// Waiting on a futex (after registering as a waiter): planted for a process (pid).
     FutexWait,
 }
 
-/// 测试钩子布下的 bug：每个 [`Trap`] 上布给的 tid 或 pid，0 表示没有。
+/// Bugs planted by the test hooks: the tid or pid planted for on each [`Trap`], 0 for none.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 static ARMED: [AtomicI32; 7] = [const { AtomicI32::new(0) }; 7];
 
-/// [`Trap::Finish`] 布在第几步（从 1 开始）。
+/// The step [`Trap::Finish`] is planted on (counting from 1).
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 static FINISH_STEP: AtomicU32 = AtomicU32::new(0);
 
-/// 宿主调用不属于任何 guest 进程，布给它时用这个编号。
+/// Host calls belong to no guest process; this number is used when planting for them.
 pub(crate) const HOST: Tid = -1;
 
-/// 测试钩子在 `at` 上为 `id`（tid、pid 或 [`HOST`]）布下了 bug 时 panic，只触发一次。
-/// 没有测试钩子的构建里什么也不做。
+/// Panics, once only, when a test hook has planted a bug on `at` for `id` (a tid, a pid or
+/// [`HOST`]). Does nothing in builds without test hooks.
 #[inline]
 pub(crate) fn trap(at: Trap, id: Tid) {
     #[cfg(any(debug_assertions, feature = "test-hooks"))]
@@ -313,7 +337,8 @@ pub(crate) fn trap(at: Trap, id: Tid) {
     let _ = (at, id);
 }
 
-/// 进程 `tgid` 结束的第 `step` 步：测试钩子在这一步为它布下了 bug 时 panic，只触发一次。
+/// Step `step` of process `tgid`'s finish: panics, once only, when a test hook has planted a bug on
+/// this step for it.
 #[inline]
 pub(crate) fn trap_finish(tgid: Tid, step: u32) {
     #[cfg(any(debug_assertions, feature = "test-hooks"))]
@@ -325,26 +350,28 @@ pub(crate) fn trap_finish(tgid: Tid, step: u32) {
     trap(Trap::Finish, tgid);
 }
 
-/// 测试钩子的 syscall 编号，远在 Linux 的编号之外。只在 debug 构建和打开了 `test-hooks`
-/// 特性的构建（Android 的 debug 版 App）里存在，并且要设置 `APPINE_TEST_HOOKS=1`。
-/// 端到端测试用它模拟内核层和引擎的 bug。
+/// The test hook's syscall number, far outside Linux's numbers. Exists only in debug builds and in
+/// builds with the `test-hooks` feature (the Android debug app), and requires `APPINE_TEST_HOOKS=1`
+/// to be set. End-to-end tests use it to simulate kernel-layer and engine bugs.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 
-/// 测试钩子，`what` 是：
+/// Test hooks; `what` is:
 ///
-/// 1. 内核层马上 panic；
-/// 2. 让 `addr` 所在的页在页表里指向一个不能访问的宿主页，guest 下次访问它时引擎在宿主上
-///    出错，就像翻译错了访存指令；
-/// 3. 调用的线程退出时 panic；
-/// 4. 这个进程下一个开始运行的线程 panic；
-/// 5. 定时器线程下次处理这个进程的定时器时 panic；
-/// 6. 宿主下一次调用 Machine 的方法时 panic；
-/// 7. 这个进程结束时（[`crate::process::finish_group`]）第 `addr` 步 panic；
-/// 8. 放开 BKL 时（[`Cx::unlocked`]）马上 panic。展开到这里时必须已经重新拿到 BKL，否则
-///    终止宿主进程：外层丢掉的 `Rc` 会和别的线程同时改计数；
-/// 9. 调用的线程下一次不持 BKL 的系统调用（`syscall::fast`）panic；
-/// 10. 这个进程下一次在 futex 上等待时，登记成等待者之后 panic。
+/// 1. panic in the kernel layer at once;
+/// 2. make the page holding `addr` point in the page table at an inaccessible host page, so the
+///    next guest access to it makes the engine fault on the host, as if a memory access
+///    instruction were mistranslated;
+/// 3. panic when the calling thread exits;
+/// 4. the next thread of this process to start running panics;
+/// 5. panic the next time the timer thread handles this process's timers;
+/// 6. panic the next time the host calls a Machine method;
+/// 7. panic at step `addr` when this process finishes ([`crate::process::finish_group`]);
+/// 8. panic right after releasing the BKL ([`Cx::unlocked`]). By the time unwinding gets here
+///    the BKL must have been taken again, otherwise the host process is terminated: an `Rc`
+///    dropped by the outer frames would change its count at the same time as other threads;
+/// 9. the calling thread's next no-BKL system call (`syscall::fast`) panics;
+/// 10. panic the next time this process waits on a futex, after registering as a waiter.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -370,7 +397,7 @@ pub(crate) fn test_hook(
         }
         6 => {
             arm(Trap::HostCall, HOST);
-            // 让在 Machine 的方法里等着的宿主线程重新检查
+            // Make host threads waiting in Machine methods check again
             crate::kernel::request_wake();
         }
         7 if addr != 0 => {
