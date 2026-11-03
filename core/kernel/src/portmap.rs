@@ -1,23 +1,28 @@
-//! 1024 以下的端口映射（kernel/net 的 map）。
+//! Port mapping below 1024 (the kernel/net map).
 //!
-//! Android 上的 App 没有 `CAP_NET_BIND_SERVICE`，宿主上一般绑不了 1024 以下的端口；guest 里的
-//! root 照样要绑 22、80 这些（sshd、nginx 的默认配置）。guest 的 socket 绑这些端口时，宿主
-//! 让绑原来的端口就绑原来的：2026 年 5 月起的 Google Play 系统更新（Android 13 以上、内核
-//! 5.15 以上）让 App 绑得了 TCP 的 20–23、80、443、445、515、631 和 UDP 的 319、320、443，
-//! 开发用的宿主以 root 运行、在容器里时也都绑得了。宿主不让（EACCES）或者被手机上别的 App
-//! 占着（EADDRINUSE）时，宿主 socket 绑到另一个端口上，guest 一侧看不出来：getsockname、
-//! getpeername、accept、recvfrom、`/proc/net` 报告的都是原来的端口，连本机的这个端口时换成
-//! 宿主上的。别的设备、手机上别的 App 要连宿主上的端口，App 第一次看到在非回环地址上监听时
-//! 发通知告诉用户（[`PortMap::take_listens`]）。
+//! Apps on Android have no `CAP_NET_BIND_SERVICE` and generally cannot bind ports below 1024 on
+//! the host; root in the guest still wants to bind 22, 80 and the like (the default configuration
+//! of sshd and nginx). When a guest socket binds such a port and the host lets it bind the original
+//! port, it binds the original port: Google Play system updates since May 2026 (Android 13 and
+//! later, kernel 5.15 and later) let apps bind TCP 20–23, 80, 443, 445, 515, 631 and UDP 319, 320,
+//! 443, and development hosts running as root or in a container can bind them too. When the host
+//! refuses (EACCES) or another app on the phone holds the port (EADDRINUSE), the host socket binds
+//! another port, and the guest side cannot tell: getsockname, getpeername, accept, recvfrom and
+//! `/proc/net` all report the original port, and connecting to this port on the local machine is
+//! switched to the host's port. Other devices and other apps on the phone have to connect to the
+//! port on the host; the first time the app sees a listen on a non-loopback address it notifies
+//! the user ([`PortMap::take_listens`]).
 //!
-//! 原来的端口之后依次试 `端口 + 偏移`、`端口 + 2 × 偏移`、`端口 + 3 × 偏移`（不超过 65535），
-//! 都被占了就让宿主分配一个。后三位始终是原来的端口（偏移是 10000 时 22 是 10022、20022、
-//! 30022），一眼认得出来，也不会占掉别的端口的位置。一个（网络命名空间、协议、端口）只要
-//! 还有 socket 绑着，就一直用同一个宿主端口（`SO_REUSEPORT`、IPv4 和 IPv6 分开绑），guest
-//! 自己的冲突照常是 EADDRINUSE；同一个端口的 TCP 和 UDP 尽量用同一个宿主端口（DNS 的 53）。
-//! 全部关掉之后 [`STICKY`] 之内再绑，仍先用原来的宿主端口、绑不上就是 EADDRINUSE：TCP 连接
-//! 关掉之后宿主端口处在 TIME_WAIT，Linux 上不带 `SO_REUSEADDR` 再绑也是 EADDRINUSE，不能
-//! 把它当作别的程序占着、换到别的端口去。
+//! After the original port it tries `port + offset`, `port + 2 × offset`, `port + 3 × offset` in
+//! turn (up to 65535), and when all are taken lets the host assign one. The last three digits are
+//! always the original port (with offset 10000, 22 becomes 10022, 20022, 30022), recognizable at a
+//! glance and never taking another port's place. As long as any socket binds a (network namespace,
+//! protocol, port), it keeps the same host port (`SO_REUSEPORT`, IPv4 and IPv6 bound separately),
+//! and the guest's own conflicts are EADDRINUSE as usual; TCP and UDP on the same port use the same
+//! host port when possible (DNS's 53). A bind within [`STICKY`] after all of them closed still
+//! tries the original host port first and is EADDRINUSE when that fails: after a TCP connection
+//! closes its host port is in TIME_WAIT, and on Linux binding again without `SO_REUSEADDR` is
+//! EADDRINUSE too, so it must not be taken as held by another program and moved to another port.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -26,23 +31,27 @@ use std::time::{Duration, Instant};
 use crate::cell::RefCell;
 use crate::errno::Errno;
 
-/// 默认的偏移。
+/// The default offset.
 pub const DEFAULT_OFFSET: u16 = 10000;
 
-/// 最多攒着多少个还没被 App 取走的监听事件（appine-run 不取）。
+/// The most listen events kept that the app has not taken yet (appine-run does not take them).
 const MAX_EVENTS: usize = 32;
 
-/// 映射全部释放之后多久之内再绑仍用原来的宿主端口：比 TIME_WAIT（Linux、Android 都是
-/// 60 秒）长。
+/// How long after a mapping is fully released a new bind still uses the original host port:
+/// longer than TIME_WAIT (60 seconds on both Linux and Android).
 pub const STICKY: Duration = Duration::from_secs(120);
 
-/// 映射全部释放之后，宿主端口还换回 guest 端口多久。Linux 在数据包到达时换算，这里在对方
-/// recvfrom、accept 时才换：服务回完一个数据报就关掉 socket（`srv.py` 那样），回答还在
-/// 对方的接收队列里，对方读到时来源照样是 guest 的端口。宿主在这段时间里把这个端口分给
-/// 同一个命名空间里别的、没有映射的 socket 的可能很小（宿主随机选临时端口）。
+/// How long after a mapping is fully released the host port is still translated back to the guest
+/// port. Linux translates when a packet arrives, here it happens only when the other side calls
+/// recvfrom or accept: when a service closes its socket right after answering a datagram (as
+/// `srv.py` does), the answer is still in the other side's receive queue, and when the other side
+/// reads it the source is still the guest's port. The chance that the host gives this port to
+/// another, unmapped socket in the same namespace during that time is small (the host picks
+/// ephemeral ports at random).
 pub const LINGER: Duration = Duration::from_secs(10);
 
-/// 登记表的键：网络命名空间（开机时的是 0，别的是 `NetNs` 的地址）、协议、guest 的端口。
+/// The key of the registry: network namespace (0 for the boot one, otherwise the `NetNs`'s
+/// address), protocol, guest port.
 type Key = (usize, i32, u16);
 
 struct Entry {
@@ -50,36 +59,39 @@ struct Entry {
     refs: u32,
 }
 
-/// guest 第一次在非回环地址上监听一个端口（设计文档 §12 第 7 条）。
+/// The guest listens on a port on a non-loopback address for the first time (design doc §12
+/// item 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenEvent {
-    /// 监听的进程的名字（comm）。
+    /// The name (comm) of the listening process.
     pub comm: String,
-    /// guest 看到的端口。
+    /// The port the guest sees.
     pub port: u16,
-    /// 宿主上的端口：别的设备连它（没有映射时与 `port` 相同）。
+    /// The port on the host: other devices connect to it (the same as `port` without a mapping).
     pub host_port: u16,
 }
 
-/// 端口映射的登记表，整个内核一份（[`crate::kernel::Kernel::portmap`]）。
+/// The port-mapping registry, one for the whole kernel ([`crate::kernel::Kernel::portmap`]).
 pub struct PortMap {
-    /// 0 表示不映射：绑低端口照旧交给宿主（Android 上多半是 EACCES）。
+    /// 0 means no mapping: binding low ports is left to the host as before (mostly EACCES on
+    /// Android).
     pub offset: u16,
-    /// 宿主让绑原来的端口时也换一个（[`crate::MachineOptions::always_map_low_ports`]）：在
-    /// 绑得了低端口的宿主上测映射。
+    /// Map even when the host allows the original port
+    /// ([`crate::MachineOptions::always_map_low_ports`]): to test mapping on hosts that can bind
+    /// low ports.
     pub always_map: bool,
     entries: HashMap<Key, Entry>,
-    /// 宿主端口 → guest 端口（同样的键，端口是宿主上的），全部释放了的带着释放的时刻
-    /// （[`LINGER`]）。
+    /// Host port → guest port (the same key, with the port on the host); fully released ones carry
+    /// the release time ([`LINGER`]).
     by_host: HashMap<Key, (u16, Option<Instant>)>,
-    /// 全部释放了的映射：宿主端口和释放的时刻（[`STICKY`]）。
+    /// Fully released mappings: the host port and the release time ([`STICKY`]).
     released: HashMap<Key, (u16, Instant)>,
-    /// 报告过的（guest 端口, 宿主端口）。
+    /// (guest port, host port) pairs already reported.
     reported: HashSet<(u16, u16)>,
     events: VecDeque<ListenEvent>,
 }
 
-/// 一个 socket 绑着的映射：析构时归还（最后一个归还的去掉登记）。
+/// A mapping a socket holds bound: returned on drop (the last return removes the registration).
 pub struct Lease {
     map: Rc<RefCell<PortMap>>,
     key: Key,
@@ -124,17 +136,19 @@ impl PortMap {
         }
     }
 
-    /// 这个端口要不要映射。
+    /// Whether this port is mapped.
     pub fn maps(&self, port: u16) -> bool {
         self.offset != 0 && (1..1024).contains(&port)
     }
 
-    /// 已经映射了的 guest 端口在宿主上是哪个（连本机的这个端口时换成它）。
+    /// Which host port an already mapped guest port is (connecting to this port on the local
+    /// machine is switched to it).
     pub fn host_port(&self, ns: usize, proto: i32, port: u16) -> Option<u16> {
         self.entries.get(&(ns, proto, port)).map(|e| e.host)
     }
 
-    /// 宿主端口是映射来的时（包括刚释放的，[`LINGER`]），guest 看到的端口。
+    /// When a host port comes from a mapping (including just released ones, [`LINGER`]), the port
+    /// the guest sees.
     pub fn guest_port(&self, ns: usize, proto: i32, host: u16) -> Option<u16> {
         self.by_host
             .get(&(ns, proto, host))
@@ -142,7 +156,8 @@ impl PortMap {
             .map(|&(g, _)| g)
     }
 
-    /// 记下一次在非回环地址上的监听：（guest 端口, 宿主端口）第一次出现时排进事件队列。
+    /// Records a listen on a non-loopback address: queues an event the first time a (guest port,
+    /// host port) appears.
     pub fn listened(&mut self, comm: String, port: u16, host_port: u16) {
         if self.reported.insert((port, host_port)) && self.events.len() < MAX_EVENTS {
             self.events.push_back(ListenEvent {
@@ -153,7 +168,7 @@ impl PortMap {
         }
     }
 
-    /// 取走攒着的监听事件。
+    /// Takes the queued listen events.
     pub fn take_listens(&mut self) -> Vec<ListenEvent> {
         self.events.drain(..).collect()
     }
@@ -165,11 +180,13 @@ impl Default for PortMap {
     }
 }
 
-/// 把 guest 的端口 `port` 绑到宿主上：`bind` 按给的宿主端口绑（0 是让宿主分配），返回
-/// 宿主 errno；`bound_port` 读出宿主实际绑到的端口。返回宿主端口（绑得了原来的端口时就是
-/// `port`）和租约，以及这个映射是不是新建的（新建、换了端口的写一条内核日志）。绑得了原来
-/// 的端口时也登记：同一个端口再绑、刚释放（TIME_WAIT）时仍用它，冲突照常是 EADDRINUSE，
-/// 不会被当作宿主不让、换到别的端口去。
+/// Binds the guest port `port` on the host: `bind` binds the given host port (0 lets the host
+/// assign one) and returns the host errno; `bound_port` reads the port the host actually bound.
+/// Returns the host port (`port` itself when the original port could be bound) and the lease, and
+/// whether this mapping is new (new ones whose port changed write a kernel log line). Binding
+/// the original port is registered too: binding the same port again, or just after release
+/// (TIME_WAIT), still uses it, and conflicts are EADDRINUSE as usual rather than being taken as
+/// the host refusing and moved to another port.
 pub fn bind(
     map: &Rc<RefCell<PortMap>>,
     ns: usize,
@@ -180,7 +197,7 @@ pub fn bind(
 ) -> Result<(u16, Lease, bool), Errno> {
     let key = (ns, proto, port);
     let existing = map.borrow().host_port(ns, proto, port).or_else(|| {
-        // 刚释放的：仍用原来的宿主端口（STICKY）
+        // Just released: still the original host port (STICKY)
         let m = map.borrow();
         m.released
             .get(&key)
@@ -197,7 +214,8 @@ pub fn bind(
             key,
         }
     };
-    // 已经有 socket 绑着这个端口、刚释放过：用同一个宿主端口，冲突就是 guest 自己的
+    // A socket already binds this port, or it was just released: use the same host port, and a
+    // conflict is the guest's own
     if let Some(host) = existing {
         bind(host).map_err(Errno)?;
         return Ok((host, lease(map, host), false));
@@ -207,11 +225,11 @@ pub fn bind(
         (u32::from(m.offset), m.always_map)
     };
     let mut candidates = Vec::new();
-    // 宿主让绑原来的端口就绑原来的
+    // When the host allows the original port, bind the original port
     if !always_map {
         candidates.push(port);
     }
-    // 同一个端口的另一个协议已经映射了：再试它的宿主端口
+    // The other protocol on the same port is already mapped: try its host port next
     let other = if proto == crate::net::IPPROTO_TCP {
         crate::net::IPPROTO_UDP
     } else {
@@ -239,9 +257,11 @@ pub fn bind(
                 };
                 return Ok((host, lease(map, host), true));
             }
-            // 被 guest 以外的程序占着（或者 guest 直接绑了这个高端口）：换下一个
+            // Held by a program outside the guest (or the guest bound this high port directly):
+            // try the next one
             Err(e) if e == Errno::EADDRINUSE.0 && h != 0 => {}
-            // 原来的端口宿主不让绑（Android 上不在放开的那几个里）：换一个
+            // The host refuses the original port (on Android, not one of the opened few): try
+            // another
             Err(e) if e == Errno::EACCES.0 && h == port => {}
             Err(e) => return Err(Errno(e)),
         }
@@ -249,11 +269,13 @@ pub fn bind(
     Err(Errno::EADDRINUSE)
 }
 
-/// 新的网络命名空间里显式绑的端口（[`bind`] 是开机时的命名空间里的低端口）：宿主上一律另选
-/// 一个（让宿主分配），不占宿主上的这个端口，开机时的命名空间、手机上别的 App 照样绑得了
-/// 它（宿主上别人绑了通配地址时，绑这个命名空间的回环地址本来也会冲突）。同一个命名空间里
-/// 已经有 socket 绑着这个端口时用同一个宿主端口，冲突就是 guest 自己的（EADDRINUSE、
-/// `SO_REUSEPORT`）。没有 [`STICKY`]：宿主端口别人不会去连，换一个就是。
+/// A port bound explicitly in a new network namespace ([`bind`] is for low ports in the boot
+/// namespace): the host always picks another one (host-assigned), so this port on the host is not
+/// taken, and the boot namespace and other apps on the phone can still bind it (when someone else
+/// on the host binds the wildcard address, binding this namespace's loopback address would conflict
+/// anyway). When a socket in the same namespace already binds this port, the same host port is
+/// used, and a conflict is the guest's own (EADDRINUSE, `SO_REUSEPORT`). No [`STICKY`]: nobody
+/// else connects to the host port, so just take another.
 pub fn bind_any(
     map: &Rc<RefCell<PortMap>>,
     ns: usize,
@@ -293,7 +315,8 @@ mod tests {
         Rc::new(RefCell::new(PortMap::new()))
     }
 
-    /// 不让绑低端口的宿主（Android 上不在放开的那几个里的端口）：`busy` 里的被别人占着。
+    /// A host that refuses low ports (on Android, ports not among the opened few): those in `busy`
+    /// are held by others.
     fn refusing(busy: &[u16]) -> impl FnMut(u16) -> Result<(), i32> + '_ {
         move |p| {
             if (1..1024).contains(&p) {
@@ -330,7 +353,7 @@ mod tests {
         .unwrap();
         assert_eq!(h, 45678);
         assert_eq!(m.borrow().guest_port(0, TCP, 45678), Some(80));
-        // 别的错误不往下试：换过的端口也是 EACCES 时不再换
+        // Other errors stop the search: when a moved-to port is also EACCES, no further move
         assert_eq!(
             bind(&m, 0, TCP, 23, |_| Err(Errno::EACCES.0), || None).err(),
             Some(Errno::EACCES)
@@ -341,8 +364,9 @@ mod tests {
         );
     }
 
-    /// 宿主让绑原来的端口（放开了的、以 root 运行的）：绑原来的，也登记，再绑、刚释放时仍用
-    /// 它；被别的程序占着、只有一个协议放开了时才换。
+    /// The host allows the original port (opened, or running as root): bind the original, register
+    /// it too, and use it again on rebinding and just after release; move only when another
+    /// program holds it or only one protocol is opened.
     #[test]
     fn the_real_port_when_the_host_allows_it() {
         let m = map();
@@ -350,20 +374,22 @@ mod tests {
         assert_eq!((h, new), (22, true));
         assert_eq!(m.borrow().host_port(0, TCP, 22), Some(22));
         assert_eq!(m.borrow().guest_port(0, TCP, 22), Some(22));
-        // 同一个端口的第二个 socket：guest 自己的冲突照常报告，不换
+        // A second socket on the same port: the guest's own conflict is reported as usual, no move
         assert_eq!(
             bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
         );
         let (h, b, new) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
         assert_eq!((h, new), (22, false));
-        // 关掉之后宿主端口在 TIME_WAIT：照 Linux 是 EADDRINUSE，不当作别人占着
+        // After closing, the host port is in TIME_WAIT: EADDRINUSE as on Linux, not taken as held
+        // by someone else
         drop((a, b));
         assert_eq!(
             bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
         );
-        // 只放开了 TCP 的端口：UDP 不让绑原来的，也不让绑 TCP 的那个（同一个），换一个
+        // A port opened only for TCP: UDP may bind neither the original nor TCP's port (the same
+        // one), so it moves to another
         let (_, _c, _) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
         let mut tried = Vec::new();
         let (h, _d, _) = bind(
@@ -379,7 +405,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((h, tried), (10022, vec![22, 10022]));
-        // 原来的端口被手机上别的 App 占着：换一个
+        // Another app on the phone holds the original port: move to another
         let (h, _e, _) = bind(
             &m,
             0,
@@ -396,7 +422,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(h, 10080);
-        // 不让绑的低端口（DNS 的 53）：UDP 先试原来的，再试 TCP 换到的
+        // A refused low port (DNS's 53): UDP tries the original first, then the port TCP moved to
         let (_, _f, _) = bind(&m, 0, TCP, 53, refusing(&[10053]), || None).unwrap();
         let mut tried = Vec::new();
         let (h, _g, _) = bind(
@@ -412,14 +438,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!((h, tried), (20053, vec![53, 20053]));
-        // 总是映射：宿主让绑也换
+        // Always map: move even when the host allows the port
         m.borrow_mut().always_map = true;
         let (h, _h, _) = bind(&m, 0, TCP, 443, |_| Ok(()), || None).unwrap();
         assert_eq!(h, 10443);
     }
 
-    /// 新命名空间里的端口：宿主分配；同一个命名空间里再绑用同一个宿主端口（冲突交给宿主），
-    /// 别的命名空间的同一个端口另外分配，全部释放之后再绑不必用原来的。
+    /// Ports in a new namespace: the host assigns them; binding again in the same namespace uses
+    /// the same host port (conflicts left to the host), the same port in another namespace gets
+    /// its own, and binding after full release need not reuse the original.
     #[test]
     fn namespace_ports_let_the_host_choose() {
         let m = map();
@@ -439,7 +466,8 @@ mod tests {
         assert_eq!((h, tried), (41000, vec![0]));
         assert_eq!(m.borrow().host_port(7, TCP, 8080), Some(41000));
         assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(8080));
-        // 同一个命名空间：同一个宿主端口，宿主说冲突就是 EADDRINUSE
+        // Same namespace: the same host port, and when the host reports a conflict it is
+        // EADDRINUSE
         let r = bind_any(
             &m,
             7,
@@ -454,7 +482,7 @@ mod tests {
         assert_eq!(r.err(), Some(Errno::EADDRINUSE));
         let (h2, b) = bind_any(&m, 7, TCP, 8080, |_| Ok(()), || None).unwrap();
         assert_eq!(h2, 41000);
-        // 别的命名空间、开机时的命名空间的同一个端口互不相干
+        // The same port in another namespace and in the boot namespace are unrelated
         let (h3, _c) = bind_any(
             &m,
             9,
@@ -469,7 +497,8 @@ mod tests {
         .unwrap();
         assert_eq!(h3, 42000);
         assert_eq!(m.borrow().host_port(0, TCP, 8080), None);
-        // 最后一个租约归还之后登记就没了，再绑重新分配
+        // After the last lease is returned the registration is gone, and binding again assigns
+        // anew
         drop((a, b));
         assert_eq!(m.borrow().host_port(7, TCP, 8080), None);
         assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(8080));
@@ -486,7 +515,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(h4, 43000);
-        // 宿主把刚释放的端口分给了另一个映射：换成新的
+        // The host gave the just released port to another mapping: switch to the new one
         let (_, _e) = bind_any(&m, 7, TCP, 9090, |_| Ok(()), || Some(41000)).unwrap();
         assert_eq!(m.borrow().guest_port(7, TCP, 41000), Some(9090));
     }
@@ -497,7 +526,8 @@ mod tests {
         m.borrow_mut().always_map = true;
         let (h, a, _) = bind(&m, 0, TCP, 22, |_| Ok(()), || None).unwrap();
         assert_eq!(h, 10022);
-        // 第二个 socket（SO_REUSEPORT、另一个地址族）用同一个宿主端口，冲突照常报告
+        // A second socket (SO_REUSEPORT, the other address family) uses the same host port, and
+        // conflicts are reported as usual
         let (h2, b, new) = bind(
             &m,
             0,
@@ -516,11 +546,13 @@ mod tests {
         assert_eq!(m.borrow().host_port(0, TCP, 22), Some(10022));
         drop(b);
         assert_eq!(m.borrow().host_port(0, TCP, 22), None);
-        // 宿主端口还换得回 guest 的端口一会儿（对方还没读到的回答）
+        // The host port still translates back to the guest port for a while (answers the other
+        // side has not read yet)
         assert_eq!(m.borrow().guest_port(0, TCP, 10022), Some(22));
         m.borrow_mut().by_host.get_mut(&(0, TCP, 10022)).unwrap().1 = Some(Instant::now() - LINGER);
         assert_eq!(m.borrow().guest_port(0, TCP, 10022), None);
-        // 刚释放的端口再绑仍用原来的宿主端口，被占着（TIME_WAIT）就是 EADDRINUSE，不换
+        // Rebinding a just released port still uses the original host port; when it is held
+        // (TIME_WAIT) it is EADDRINUSE, no move
         assert_eq!(
             bind(&m, 0, TCP, 22, |_| Err(Errno::EADDRINUSE.0), || None).err(),
             Some(Errno::EADDRINUSE)
@@ -536,7 +568,7 @@ mod tests {
         .unwrap();
         assert_eq!(h, 10022);
         drop(again);
-        // 命名空间、协议各自独立；UDP 先试 TCP 的宿主端口
+        // Namespaces and protocols are independent; UDP tries TCP's host port first
         let (_, _c, _) = bind(
             &m,
             0,

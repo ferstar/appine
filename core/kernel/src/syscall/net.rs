@@ -1,7 +1,8 @@
-//! socket 类 syscall（kernel/net 的 map）。
+//! Socket syscalls (the kernel/net map).
 //!
-//! 宿主 socket 是非阻塞的；guest 的阻塞调用在 EAGAIN 时经由 [`Cx::wait`] 等宿主 fd
-//! 就绪，期间释放 BKL，可以被信号打断，并按 `SO_RCVTIMEO`/`SO_SNDTIMEO` 超时。
+//! Host sockets are nonblocking; on EAGAIN a blocking guest call waits for the host fd to become
+//! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and
+//! times out according to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ use crate::process::Signal;
 use crate::signal::{self, SigInfo};
 use crate::uaccess::UserSlice;
 
-/// socket 和它所在的打开文件。
+/// A socket and the open file it is in.
 pub(crate) type SocketRef = Rc<RefCell<Socket>>;
 
 const SOCK_TYPE_MASK: u32 = 0xf;
@@ -54,12 +55,12 @@ const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
 const POLLERR: i16 = 0x008;
 
-/// sockaddr 的最大长度（`sockaddr_storage`）。
+/// The largest sockaddr length (`sockaddr_storage`).
 const SOCKADDR_MAX: usize = 128;
-/// 一次收发的最大字节数。
+/// The most bytes per send or receive.
 const MSG_MAX: usize = 1 << 20;
 
-/// fd 对应的 socket；不是 socket 时返回 ENOTSOCK。
+/// The socket of an fd; ENOTSOCK when it is not a socket.
 fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(SocketRef, bool), Errno> {
     let file = cx.fds().get(fd)?;
     let f = file.borrow();
@@ -70,12 +71,12 @@ fn socket_of(cx: &Cx<'_>, fd: i32) -> Result<(SocketRef, bool), Errno> {
     }
 }
 
-/// AF_UNIX socket 要等待或者用到 socket 本身的操作交给 [`unix`]。
+/// AF_UNIX operations that wait or need the socket itself are handed to [`unix`].
 fn is_unix(sock: &SocketRef) -> bool {
     matches!(&*sock.borrow(), Socket::Unix(_))
 }
 
-/// 读取 guest 给出的 sockaddr。
+/// Reads a sockaddr given by the guest.
 fn read_addr(cx: &Cx<'_>, addr: u64, len: u32) -> Result<Vec<u8>, Errno> {
     let len = len as usize;
     if len > SOCKADDR_MAX {
@@ -86,8 +87,9 @@ fn read_addr(cx: &Cx<'_>, addr: u64, len: u32) -> Result<Vec<u8>, Errno> {
     Ok(b)
 }
 
-/// 把地址写回 guest：`addrlen` 指向缓冲区长度，写回实际长度（缓冲区不够时截断）。
-/// accept、recvfrom 的 `addr` 可以为 NULL，表示不要地址。
+/// Writes an address back to the guest: `addrlen` points at the buffer length, and the actual
+/// length is written back (truncated when the buffer is too small). accept's and recvfrom's
+/// `addr` may be NULL, meaning no address is wanted.
 fn write_addr(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
     if addr == 0 || addrlen == 0 {
         return Ok(());
@@ -95,7 +97,7 @@ fn write_addr(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), 
     write_addr_to(cx, addr, addrlen, value)
 }
 
-/// getsockname、getpeername：`addrlen` 必须有效，长度为负时 EINVAL。
+/// getsockname, getpeername: `addrlen` must be valid, and a negative length is EINVAL.
 fn write_addr_to(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
     let room = usize::try_from(i32::from_le_bytes(get(cx, addrlen)?)).map_err(|_| Errno::EINVAL)?;
     let n = room.min(value.len());
@@ -103,9 +105,10 @@ fn write_addr_to(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(
     put(cx, addrlen, (value.len() as u32).to_le_bytes())
 }
 
-/// 等宿主 socket `sock`（宿主 fd 是 `fd`）就绪：非阻塞时直接 EAGAIN，超时时返回
-/// `timeout_err`。只登记这个 socket（[`wake_objects`]）：别的文件上的修改不叫醒它，
-/// 原来系统里每一次管道、PTY 的读写都把阻塞在 recv 里的线程叫醒一遍。
+/// Waits for host socket `sock` (host fd `fd`) to become ready: EAGAIN at once when nonblocking,
+/// `timeout_err` on timeout. Only this socket is registered ([`wake_objects`]): changes on other
+/// files do not wake it, whereas before, every pipe or PTY read and write in the system woke the
+/// threads blocked in recv once each.
 fn wait_host(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
@@ -133,24 +136,27 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
         return Err(Errno::EINVAL);
     }
     let base = (ty & SOCK_TYPE_MASK) as i32;
-    // 建在新的网络命名空间里的 socket 记下它（crate::netns）
+    // A socket created in a new network namespace records it (crate::netns)
     let net = cx.task.ns.borrow().net.clone();
     let owner = net.owner.clone();
     let net = net.host_net.is_some().then_some(net);
     let sock = match domain {
         AF_INET | AF_INET6 => {
-            // raw socket 要在网络命名空间的属主里有 CAP_NET_RAW（Linux 的 inet_create：协议号
-            // 不对的先报告，交给宿主）。宿主上用 ping socket 模拟的 raw ICMP 不需要特权，不
-            // 查的话普通用户也建得出来，busybox 的 ping 就不会退回 ping socket
-            // guest 的 raw ICMP socket 换成不需要特权的 ping socket
+            // A raw socket needs CAP_NET_RAW over the network namespace's owner (Linux's
+            // inet_create: a wrong protocol number is reported first, left to the host). The raw
+            // ICMP emulated with a ping socket on the host needs no privilege, so without this
+            // check ordinary users could create one too, and busybox's ping would not fall back
+            // to a ping socket
+            // The guest's raw ICMP socket becomes an unprivileged ping socket
             let icmp = matches!(
                 (domain, protocol),
                 (AF_INET, IPPROTO_ICMP) | (AF_INET6, IPPROTO_ICMPV6)
             );
-            // 别的 raw socket 与 Android 上的 App 一样建不了：宿主有 CAP_NET_RAW 时（开发用的
-            // Linux 宿主）也不交给它，不然发出去的报文引起的 ICMP 到不了模拟的 raw ICMP
-            // socket，mtr 这类用 raw socket 发、raw ICMP socket 收的程序就两头对不上（它们
-            // 遇到 EPERM 会退回 ping socket）
+            // Other raw sockets cannot be created, as for apps on Android: even when the host has
+            // CAP_NET_RAW (a Linux host for development) they are not handed to it, since
+            // otherwise the ICMP caused by the packets they send would not reach the emulated raw
+            // ICMP sockets, and programs like mtr that send on a raw socket and receive on a raw
+            // ICMP socket would not match up (on EPERM they fall back to ping sockets)
             if base == SOCK_RAW
                 && (1..256).contains(&protocol)
                 && (!icmp || !cx.cred().ns_capable(&owner, crate::cred::cap::NET_RAW))
@@ -166,13 +172,15 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             let mut s = InetSocket::new(fd, domain, host_ty);
             s.raw = base == SOCK_RAW;
             if s.raw {
-                // 宿主上替它打开 IP_RECVERR 等（crate::rawicmp），收到的都经由汇集点
+                // Enable IP_RECVERR and the like on the host for it (crate::rawicmp); everything
+                // received goes through the aggregation point
                 for &(level, name) in crate::rawicmp::RawIcmp::host_options(domain) {
                     let _ = appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes());
                 }
                 let tap = crate::rawicmp::tap_for(cx.k(), &net)?;
                 s.icmp = Some(crate::rawicmp::RawIcmp::new(domain, tap));
-                // 定时器线程替 poll、epoll 的等待者看着汇集点：可能是新建的，叫醒它
+                // The timer thread watches aggregation points for waiters in poll and epoll: this
+                // one may be new, so wake it
                 crate::kernel::signal_later(&cx.shared.timers);
             }
             if protocol != 0 {
@@ -182,11 +190,13 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             Socket::Inet(s)
         }
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
-            // NETLINK_ROUTE 回答接口和地址的查询，NETLINK_GENERIC 只有 nlctrl 一个族
-            // （Linux 上总是有它），NETLINK_NETFILTER 是 nftables 的子集（crate::nft）；NETLINK_KOBJECT_UEVENT 只用来听热插拔事件（mdev、udev），
-            // 这里不会有。别的协议与 Linux 上没有编进内核的子系统一样是 EPROTONOSUPPORT：
-            // 原来照样建出来、收到请求也不回答，libaudit 等 ACK 等 40 秒之后失败，PAM 因此
-            // 拒绝登录（Debian 的 sshd、login）
+            // NETLINK_ROUTE answers queries for interfaces and addresses, NETLINK_GENERIC has
+            // only the nlctrl family (which Linux always has), NETLINK_NETFILTER is a subset of
+            // nftables (crate::nft); NETLINK_KOBJECT_UEVENT is only for listening to hotplug
+            // events (mdev, udev), and there are none here. Other protocols are
+            // EPROTONOSUPPORT, as for subsystems not built into a Linux kernel: before, they were
+            // created anyway and never answered requests, so libaudit waited 40 seconds for an
+            // ACK and failed, and PAM then refused logins (Debian's sshd, login)
             if !matches!(
                 protocol,
                 NETLINK_ROUTE | NETLINK_GENERIC | NETLINK_KOBJECT_UEVENT | NETLINK_NETFILTER
@@ -220,11 +230,13 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
     install(cx, sock, ty).map(|fd| fd as u64)
 }
 
-/// 还没有绑定的宿主 socket 在 connect、sendto、listen 之前先绑到 `source`
-/// （[`crate::netns::Mapped::source`]）：新的网络命名空间里是它的回环地址（Linux 自动绑定时
-/// 绑的是命名空间里的通配地址，宿主上绑通配地址就到了所有接口上），交给宿主网络的
-/// （`source` 是 None）由宿主替它绑；开机时的命名空间里连别的命名空间时是面向对方的虚拟
-/// 地址在宿主上的那个，对方看到的对端才对。
+/// Before connect, sendto or listen, an unbound host socket is first bound to `source`
+/// ([`crate::netns::Mapped::source`]): in a new network namespace this is its loopback address
+/// (Linux's autobind binds the namespace's wildcard address, and binding the wildcard address on
+/// the host would reach every interface); for traffic handed to the host network (`source` is
+/// None) the host binds it; in the boot namespace, when connecting to another namespace, it is
+/// the host-side address of the virtual address facing the other side, so the peer the other side
+/// sees is right.
 fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> {
     if let Some(net) = s.net.clone() {
         if !s.bound {
@@ -233,7 +245,8 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
                     appine_hal::net::bind(s.fd, addr).map_err(Errno)?;
                     s.any = true;
                     register_udp(s);
-                    // 发给自己的虚拟地址的 UDP socket：登记端口，回答才送得到（crate::netns）
+                    // A UDP socket sending to its own virtual address: register the port so that
+                    // answers can be delivered (crate::netns)
                     if s.ty == SOCK_DGRAM
                         && crate::netns::is_self_source(&net, addr)
                         && let Some(p) = appine_hal::net::sockname(s.fd, false)
@@ -245,7 +258,7 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
                         s.self_port = Some(p);
                     }
                 }
-                // 交给宿主网络的：宿主替它绑通配地址
+                // Handed to the host network: the host binds it to the wildcard address
                 None => s.wide = true,
             }
             s.bound = true;
@@ -256,14 +269,16 @@ fn ensure_bound(s: &mut InetSocket, source: Option<&[u8]>) -> Result<(), Errno> 
             .is_some_and(|a| port_of(&a) == Some(0) && crate::netns::is_any(&a))
         && appine_hal::net::bind(s.fd, addr).is_ok()
     {
-        // guest 看来是自动绑定的通配地址（连接之前 getsockname 报告它）
+        // To the guest it is an autobound wildcard address (getsockname reports it before
+        // connecting)
         s.any = true;
     }
     Ok(())
 }
 
-/// 新的网络命名空间里绑了的 UDP socket 登记在命名空间里（[`crate::netns::listening`]）：
-/// 发往那里的数据报按它判断有没有人收。显式绑的、发送之前替它绑的都算。
+/// UDP sockets bound in a new network namespace are registered in the namespace
+/// ([`crate::netns::listening`]): datagrams sent there use it to decide whether anyone receives
+/// them. Both explicit binds and binds made on its behalf before sending count.
 fn register_udp(s: &mut InetSocket) {
     let Some(net) = s.net.clone() else {
         return;
@@ -295,12 +310,12 @@ fn register_udp(s: &mut InetSocket) {
     s.listener = Some(crate::netns::add_listener(&net, &at));
 }
 
-/// 这个 socket 所在的网络命名空间（开机时的记作 None）。
+/// The network namespace this socket is in (the boot one is recorded as None).
 fn net_of(cx: &Cx<'_>, s: &InetSocket) -> Rc<crate::nsproxy::NetNs> {
     s.net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone())
 }
 
-/// 低端口映射的登记表里网络命名空间的键（[`ns_key`]）。
+/// The key of a network namespace in the low-port mapping registry ([`ns_key`]).
 fn key_of(n: &Rc<crate::nsproxy::NetNs>) -> usize {
     if n.host_net.is_none() {
         0
@@ -309,7 +324,7 @@ fn key_of(n: &Rc<crate::nsproxy::NetNs>) -> usize {
     }
 }
 
-/// 把 socket 放进 fd 表；`flags` 里可以有 `SOCK_NONBLOCK`、`SOCK_CLOEXEC`。
+/// Puts a socket into the fd table; `flags` may include `SOCK_NONBLOCK`, `SOCK_CLOEXEC`.
 fn install(cx: &mut Cx<'_>, sock: SocketRef, flags: u32) -> Result<i32, Errno> {
     let file = OpenFile::new(
         FileKind::Socket(sock),
@@ -330,12 +345,13 @@ pub(super) fn socketpair(
     }
     match domain {
         AF_UNIX => {}
-        // 和 Linux 一样先按普通的 socket 检查类型和协议，再报告不支持 socketpair
+        // As on Linux, first check the type and protocol as for an ordinary socket, then report
+        // that socketpair is not supported
         AF_INET | AF_INET6 => {
             let ok = match (ty & SOCK_TYPE_MASK) as i32 {
                 SOCK_STREAM => matches!(protocol, 0 | IPPROTO_TCP | IPPROTO_MPTCP),
                 SOCK_DGRAM => matches!(protocol, 0 | IPPROTO_UDP | IPPROTO_ICMP | IPPROTO_UDPLITE),
-                // raw socket 不能用协议 0
+                // Raw sockets cannot use protocol 0
                 SOCK_RAW => protocol != 0,
                 _ => false,
             };
@@ -371,14 +387,16 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
     }
-    // 新的网络命名空间里先换成宿主的地址（不是本地地址时 EADDRNOTAVAIL）
+    // In a new network namespace, translate to the host address first (EADDRNOTAVAIL when it is
+    // not a local address)
     let (net, icmp6, raw) = match &*sock.borrow() {
         Socket::Inet(s) => (s.net.clone(), s.icmp6(), s.icmp.is_some()),
         _ => (None, false, false),
     };
-    // raw socket 没有端口（Linux 的 raw_bind 不看它）。宿主的 ping socket 却把它当作 echo 的
-    // 编号：busybox 的 traceroute 把收的 socket 绑到发的 socket 的地址上（getsockname 拿到
-    // 的，带着端口），两个就共用一个编号，回答到了另一个上
+    // Raw sockets have no port (Linux's raw_bind ignores it). The host's ping socket, however,
+    // takes it as the echo number: busybox's traceroute binds the receiving socket to the sending
+    // socket's address (got from getsockname, with the port), so the two would share one number
+    // and replies would arrive on the other one
     let mut addr = addr;
     if raw && addr.len() >= 4 {
         addr[2..4].fill(0);
@@ -386,8 +404,9 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     let w = cx.kr().world();
     let me = net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
     let mapped = crate::netns::to_host(&w, &me, &addr, crate::netns::Use::Bind, icmp6)?;
-    // 新的网络命名空间里数据报 socket 绑通配地址、端口 0（busybox 的 ping、Java 的
-    // DatagramSocket 这样做）：宿主上也绑通配地址，不然发不到外面（Socket::wide）
+    // In a new network namespace a datagram socket binding the wildcard address with port 0
+    // (busybox's ping and Java's DatagramSocket do this): bind the wildcard address on the host
+    // too, otherwise it cannot send to the outside (Socket::wide)
     let wide = net.is_some()
         && !icmp6
         && !raw
@@ -399,8 +418,8 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     } else {
         mapped.addr
     };
-    // ip_unprivileged_port_start（默认 1024）以下的端口要求网络命名空间的属主里的
-    // CAP_NET_BIND_SERVICE（Linux 的 inet_port_requires_bind_service）
+    // Ports below ip_unprivileged_port_start (1024 by default) require CAP_NET_BIND_SERVICE over
+    // the network namespace's owner (Linux's inet_port_requires_bind_service)
     let family = addr
         .get(..2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]) as i32);
@@ -419,14 +438,17 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         }
     }
     let map = cx.k().portmap.clone();
-    // 新的命名空间里新映射了低端口：转发到它的目的地址要重新算（crate::forward）
+    // A low port newly mapped in a new namespace: forwarding to its destination address must be
+    // recomputed (crate::forward)
     let mut remap = false;
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
-            // 流量算在哪个接口上重新认（connect 也一样）
+            // Identify again which interface the traffic counts on (connect does the same)
             s.route = None;
-            // 1024 以下的端口宿主不让绑原来的就换一个（crate::portmap）；新的网络命名空间里
-            // 显式绑的端口都换（宿主上不占这个端口，外层和别的命名空间照样绑得了）
+            // Ports below 1024 move to another one when the host does not let the original be
+            // bound (crate::portmap); ports bound explicitly in a new network namespace always
+            // move (so the port is not taken on the host, and the outer namespace and other
+            // namespaces can still bind it)
             let own = s.net.is_some() && !wide;
             match port_of(&host_addr)
                 .filter(|&p| mappable(s) && p != 0 && (own || map.borrow().maps(p)))
@@ -493,7 +515,8 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                 s.wide = wide;
                 register_udp(s);
             }
-            // 开机时的命名空间里绑了端口的 UDP socket：PREROUTING 有 DNAT 时转发外面来的
+            // A UDP socket with a bound port in the boot namespace: when PREROUTING has a DNAT,
+            // forward what comes from outside
             if s.ty == SOCK_DGRAM {
                 forward_socket(cx.kr(), s);
             }
@@ -535,7 +558,8 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
             ensure_bound(s, src.as_deref())?;
             appine_hal::net::listen(s.fd, backlog).map_err(Errno)?;
             s.listening = true;
-            // 新的网络命名空间里的 TCP 监听登记在命名空间里：连过来时按它判断（crate::netns）
+            // TCP listens in a new network namespace are registered in the namespace: incoming
+            // connections are judged by it (crate::netns)
             if let Some(net) = &s.net
                 && s.listener.is_none()
                 && map_proto(s) == IPPROTO_TCP
@@ -558,9 +582,11 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
                 };
                 s.listener = Some(crate::netns::add_listener(net, &at));
             }
-            // 开机时的命名空间里的监听：PREROUTING 有 DNAT 时转发外面来的连接（crate::forward）
+            // A listen in the boot namespace: when PREROUTING has a DNAT, forward connections from
+            // outside (crate::forward)
             forward_socket(cx.kr(), s);
-            // 别的设备连得到的监听（设计文档 §12 第 7 条）：App 发通知，告诉用户连宿主上的哪个端口
+            // A listen other devices can reach (design doc §12 item 7): the app notifies the user
+            // which port on the host to connect to
             if let Ok(local) = appine_hal::net::sockname(s.fd, false)
                 && let (Some(ip), Some(host)) = (ip_of(&local), port_of(&local))
                 && !ip.is_loopback()
@@ -596,7 +622,7 @@ pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: 
     Ok(fd as u64)
 }
 
-/// 从宿主 socket 接受一个连接：返回新的 socket 和对方的地址。
+/// Accepts a connection on the host socket: returns the new socket and the peer's address.
 fn accept_host(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
@@ -625,12 +651,13 @@ fn accept_host(
                 new.proto = proto;
                 new.local_map = local_map;
                 new.net = net.clone();
-                // 接受的连接沿用监听的 SO_MARK（inet_csk_clone_lock 的 ir_mark）
+                // The accepted connection inherits the listener's SO_MARK (ir_mark in
+                // inet_csk_clone_lock)
                 if mark != 0 {
                     new.track_mut().mark = mark;
                 }
-                // 发起的一端被 nat 换过目的地址的：领走这个命名空间里看到的原目的地址
-                // （SO_ORIGINAL_DST，crate::origdst）
+                // When nat rewrote the destination of the initiating end: claim the original
+                // destination seen in this namespace (SO_ORIGINAL_DST, crate::origdst)
                 if ty == SOCK_STREAM
                     && !cx.kr().orig_dst.is_empty()
                     && let Ok(local) = appine_hal::net::sockname(new.fd, false)
@@ -676,18 +703,21 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     let cred = cx.cred();
     let (host_addr, tcp, host_fd, origs) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
-            // 本端地址可能变了：流量算在哪个接口上重新认
+            // The local address may have changed: identify again which interface the traffic
+            // counts on
             s.route = None;
-            // UDP 连到 DNS 存根：只记下来，之后的 send 由存根处理（新的网络命名空间里没有它）
+            // UDP connecting to the DNS stub: only record it, and later sends are handled by the
+            // stub (it does not exist in new network namespaces)
             if s.net.is_none() && s.ty == SOCK_DGRAM {
                 s.stub_peer = is_stub(&addr);
                 if s.stub_peer {
                     return Ok(0);
                 }
             }
-            // 地址换成宿主上的（crate::netns），没绑定的先绑上。nftables 的 OUTPUT nat
-            // （crate::nft）先换目的地址：guest 看到的对端仍是它连的，收到的数据报的来源
-            // 换回来
+            // Translate the address to the host's (crate::netns), binding first if unbound.
+            // nftables' OUTPUT nat (crate::nft) rewrites the destination first: the peer the
+            // guest sees is still the one it connected to, and the source of received datagrams
+            // is translated back
             let me = s.net.clone().unwrap_or_else(|| init.clone());
             let Routed {
                 m,
@@ -697,8 +727,10 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 verdict,
                 origs,
             } = route(&w, s, &me, &addr, &cred)?;
-            // 过滤链：TCP 被拒绝的马上失败，被丢弃的连到黑洞上等超时（OUTPUT 上的丢弃
-            // Linux 也是重传到超时）；UDP 照常连接，之后不带地址的发送不发出去
+            // Filter chains: a rejected TCP connection fails at once, a dropped one connects to
+            // a blackhole and waits for the timeout (a drop on OUTPUT also retransmits until
+            // timeout on Linux); UDP connects as usual, and later sends without an address are
+            // not sent
             let blocked = !matches!(
                 verdict.0,
                 crate::nft::Outcome::Accept | crate::nft::Outcome::Dnat(..)
@@ -721,8 +753,9 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 };
                 (hole, false, s.fd, None)
             } else {
-                // 连到新的网络命名空间里：那里没有对得上的监听就是 ECONNREFUSED（宿主上开机时的
-                // 命名空间里监听通配地址的 socket 也盖住这个地址，不能交给宿主去连）
+                // Connecting into a new network namespace: ECONNREFUSED when there is no matching
+                // listener there (a socket listening on the wildcard address in the boot namespace
+                // on the host also covers this address, so it cannot be left to the host)
                 if s.ty == SOCK_STREAM
                     && let Some(t) = &m.target
                     && t.host_net.is_some()
@@ -740,9 +773,11 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 if crate::netns::is_inet(&addr) {
                     ensure_bound(s, m.source.as_deref())?;
                 }
-                // getpeername 报告连的那个地址（宿主上的对端换不回来时也对，比如连自己的地址）
+                // getpeername reports the address connected to (right even when the host-side peer
+                // cannot be translated back, such as when connecting to its own address)
                 s.guest_peer = crate::netns::is_inet(&addr).then(|| addr.clone());
-                // 本机上映射了的低端口换成宿主上的（crate::portmap），按目的地所在的命名空间
+                // Mapped low ports on the local machine become the host's (crate::portmap), by the
+                // namespace the destination is in
                 let key = m.target.as_ref().map_or(0, key_of);
                 let to = if s.ty == SOCK_DGRAM {
                     crate::netns::toward_self(&me, dst, m.addr)
@@ -751,12 +786,14 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 };
                 let (host_addr, pm) = map_dest(&map, s, to, key);
                 s.peer_map = pm;
-                // 宿主上绑在通配地址上的数据报 socket 连到映射的目的地：宿主 socket 不连接，
-                // 这里记下对端（InetSocket::vconn）；原来宿主上连着的先断开
+                // A datagram socket bound to the wildcard address on the host connects to a mapped
+                // destination: the host socket is not connected and the peer is recorded here
+                // (InetSocket::vconn); a previous host-side connection is undone first
                 let was = s.vconn.take();
                 if s.wide && s.ty == SOCK_DGRAM && m.target.is_some() {
-                    // 宿主上真连着才断开；断开会放掉内核分的端口（绑的是端口 0 时，
-                    // udp_disconnect），绑回原来的，getsockname 和登记的端口才不变
+                    // Disconnect only when really connected on the host; disconnecting releases
+                    // the port the kernel assigned (when bound to port 0, udp_disconnect), so bind
+                    // the original one back, keeping getsockname and the registered port unchanged
                     if was.is_none() && appine_hal::net::sockname(s.fd, true).is_ok() {
                         let old = appine_hal::net::sockname(s.fd, false).ok();
                         let _ = appine_hal::net::connect(s.fd, &[0u8; 16]);
@@ -779,11 +816,13 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                     s.peer = None;
                     return Ok(0);
                 }
-                // 连接了的 UDP 的目的地被过滤链丢弃：OUTPUT 上的发送时是 EPERM，别处的悄悄丢掉
+                // The destination of a connected UDP socket is dropped by a filter chain: sends
+                // get EPERM on OUTPUT and are silently dropped elsewhere
                 if blocked {
                     s.track_mut().blocked = Some(if verdict.1 { Errno::EPERM.0 } else { 0 });
                 }
-                // 新的网络命名空间里的流量不算进宿主的接口（/proc/net/snmp 也不数）
+                // Traffic in new network namespaces is not counted on the host's interfaces (nor
+                // in /proc/net/snmp)
                 let tcp = s.net.is_none() && s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP;
                 let stream = s.ty == SOCK_STREAM && nat_proto(s) == Some(IPPROTO_TCP as u8);
                 (host_addr, tcp, s.fd, stream.then_some(origs))
@@ -796,9 +835,10 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     if tcp {
         count_connect(cx, &sock, r.err().map(Errno));
     }
-    // 被 nat 换过目的地址的 TCP 连接按宿主上的四元组记下原目的地址，接受的一端在 accept 时
-    // 领走；没被 nat 的去掉同一个四元组以前留下的（crate::origdst）。阻塞的 connect 也在
-    // 放开 BKL 等待之前记下，对方不会先 accept
+    // TCP connections whose destination nat rewrote record the original destination by their
+    // 4-tuple on the host, for the accepting end to claim at accept; ones without nat remove
+    // earlier records for the same 4-tuple (crate::origdst). A blocking connect also records it
+    // before releasing the BKL to wait, so the other side cannot accept first
     if let Some(origs) = origs
         && (r.is_ok() || r == Err(Errno::EINPROGRESS.0))
         && (!origs.is_empty() || !cx.kr().orig_dst.is_empty())
@@ -818,7 +858,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     }
     match r {
         Ok(()) => {
-            // 数据报 socket 记下对端，AF_UNSPEC 是断开
+            // A datagram socket records the peer; AF_UNSPEC disconnects
             if let Socket::Inet(s) = &mut *sock.borrow_mut()
                 && s.ty != SOCK_STREAM
             {
@@ -829,7 +869,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
         Err(e) if e == Errno::EINPROGRESS.0 && !nonblock => {}
         Err(e) => return Err(Errno(e)),
     }
-    // 阻塞的 connect：等连接完成，再取连接的结果
+    // Blocking connect: wait for the connection to complete, then fetch its result
     loop {
         let mut pfd = [(host_fd, POLLOUT, 0)];
         appine_hal::poll(&mut pfd, Some(Duration::ZERO)).map_err(Errno)?;
@@ -843,9 +883,9 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     }
     let err = appine_hal::net::getsockopt(host_fd, SOL_SOCKET, SO_ERROR, 4).map_err(Errno)?;
     match i32::from_le_bytes(err[..4].try_into().unwrap()) {
-        // 宿主 socket 在套接字层还是"正在连接"，再 connect 一次才变成"已连接"：不然
-        // guest 之后再 connect 会成功，而 Linux 上阻塞的 connect 返回之后再 connect 是
-        // EISCONN
+        // At the socket layer the host socket is still "connecting", and becomes "connected"
+        // only after connecting once more: otherwise a later connect by the guest would succeed,
+        // whereas on Linux connecting again after a blocking connect returned is EISCONN
         0 => {
             let _ = appine_hal::net::connect(host_fd, &host_addr);
             if let Socket::Inet(s) = &mut *sock.borrow_mut() {
@@ -862,11 +902,12 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     }
 }
 
-/// TCP 主动连接的计数（`/proc/net/snmp` 的 ActiveOpens、AttemptFails，[`crate::traffic`]）：
-/// 宿主发出了 SYN（connect 成功、正在连接、被拒绝或者超时）时数一次 ActiveOpens，之后
-/// 看到这次连接失败时数一次 AttemptFails。`err` 是这一次 connect 或者阻塞等到的结果。
-/// 非阻塞的连接失败了、guest 只从 poll 和 SO_ERROR 得知时，只数得到 SO_ERROR 是
-/// ECONNREFUSED 的（[`getsockopt`]）。
+/// Counts active TCP connections (`/proc/net/snmp`'s ActiveOpens, AttemptFails,
+/// [`crate::traffic`]): ActiveOpens is counted once when the host sent a SYN (connect succeeded,
+/// is in progress, was refused or timed out), and AttemptFails once when this connection is later
+/// seen to fail. `err` is the result of this connect or of the blocking wait. When a nonblocking
+/// connection fails and the guest learns it only from poll and SO_ERROR, only an SO_ERROR of
+/// ECONNREFUSED can be counted ([`getsockopt`]).
 fn count_connect(cx: &mut Cx<'_>, sock: &SocketRef, err: Option<Errno>) {
     let Socket::Inet(s) = &mut *sock.borrow_mut() else {
         return;
@@ -879,14 +920,15 @@ fn count_connect(cx: &mut Cx<'_>, sock: &SocketRef, err: Option<Errno>) {
                 s.opening = true;
             }
         }
-        // 前一次 connect 发出的 SYN 失败了（非阻塞时再 connect 一次得到的）
+        // The SYN sent by an earlier connect failed (as found by connecting again when
+        // nonblocking)
         Some(Errno::ECONNREFUSED | Errno::ETIMEDOUT | Errno::EHOSTUNREACH | Errno::ENETUNREACH)
             if s.opening =>
         {
             p.tcp_attempt_fails += 1;
             s.opening = false;
         }
-        // 这一次发出的 SYN 马上就失败了
+        // The SYN sent this time failed at once
         Some(Errno::ECONNREFUSED | Errno::ETIMEDOUT) => {
             p.tcp_active_opens += 1;
             p.tcp_attempt_fails += 1;
@@ -899,13 +941,14 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
     let (sock, _) = socket_of(cx, fd)?;
     let value = match &*sock.borrow() {
         Socket::Inet(s) if peer && s.stub_peer => stub_addr(s.family),
-        // 汇集点看着的 UDP socket 的宿主连接可能改过（[`send`]），对端报告 guest 连的
+        // The host connection of a UDP socket the aggregation point watches may have been changed
+        // ([`send`]), so the peer reported is the one the guest connected to
         Socket::Inet(InetSocket {
             udp_tap: Some(_),
             peer: Some(p),
             ..
         }) if peer => p.clone(),
-        // 记下了对端的（InetSocket::vconn）：宿主 socket 没有连接
+        // The peer is recorded (InetSocket::vconn): the host socket is not connected
         Socket::Inet(InetSocket {
             vconn: Some(_),
             guest_peer: Some(p),
@@ -923,11 +966,12 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
     write_addr_to(cx, addr, addrlen, &value).map(|()| 0)
 }
 
-/// 宿主 socket 的本端（`peer` 时是对端）地址换成 guest 看到的（getsockname、getpeername）。
+/// The host socket's local (or with `peer`, peer) address as the guest sees it (getsockname,
+/// getpeername).
 fn inet_name(cx: &Cx<'_>, s: &InetSocket, peer: bool) -> Result<Vec<u8>, Errno> {
     let mut a = appine_hal::net::sockname(s.fd, peer).map_err(Errno)?;
-    // raw socket 的本端"端口"是协议号（Linux 的 inet_create 设的 inet_sport），宿主的
-    // ping socket 报告的是它的编号
+    // A raw socket's local "port" is the protocol number (inet_sport, set by Linux's
+    // inet_create), while the host's ping socket reports its number
     if s.icmp.is_some() && !peer && a.len() >= 4 {
         a[2..4].copy_from_slice(&(s.proto as u16).to_be_bytes());
     }
@@ -942,7 +986,7 @@ fn inet_name(cx: &Cx<'_>, s: &InetSocket, peer: bool) -> Result<Vec<u8>, Errno> 
     if peer && let Some(g) = &s.guest_peer {
         return Ok(g.clone());
     }
-    // 记下了对端的（InetSocket::vconn）：本端是面向对端的那个地址
+    // The peer is recorded (InetSocket::vconn): the local end is the address facing the peer
     if !peer
         && s.vconn.is_some()
         && let Some(g) = s.guest_peer.as_deref()
@@ -993,8 +1037,9 @@ pub(super) fn setsockopt(
     let len = (len as usize).min(256);
     let mut v = vec![0u8; len];
     cx.mm().read(UserSlice::new(value, len), &mut v)?;
-    // 不受上限约束的 SO_*BUFFORCE 要求 CAP_NET_ADMIN，App 在宿主上没有：有这个能力的
-    // guest 进程退回到普通的 SO_*BUF（受宿主的上限约束）
+    // SO_*BUFFORCE, which ignore the limits, require CAP_NET_ADMIN, which the app does not have
+    // on the host: guest processes with this capability fall back to the plain SO_*BUF (limited
+    // by the host)
     let name = match (level, name) {
         (SOL_SOCKET, SO_SNDBUFFORCE | SO_RCVBUFFORCE)
             if !cx.cred().capable(crate::cred::cap::NET_ADMIN) =>
@@ -1005,14 +1050,16 @@ pub(super) fn setsockopt(
         (SOL_SOCKET, SO_RCVBUFFORCE) => SO_RCVBUF,
         _ => name,
     };
-    // raw ICMP 自己的选项（crate::rawicmp::RawIcmp）
+    // Raw ICMP's own options (crate::rawicmp::RawIcmp)
     if let Socket::Inet(InetSocket { icmp: Some(r), .. }) = &mut *sock.borrow_mut()
         && let Some(res) = r.setsockopt(level, name, &v)
     {
         return res.map(|()| 0).map_err(Errno);
     }
-    // UDP：记下设过 TTL、自己打开的 IP_RECVERR（crate::rawicmp）。汇集点看着它时宿主上的
-    // IP_RECVERR 总是开着：guest 关掉它只记下来，打开它之后不再看着，宿主上的就是 guest 的
+    // UDP: record that a TTL was set and IP_RECVERR enabled by the guest itself (crate::rawicmp).
+    // While the aggregation point watches the socket, IP_RECVERR on the host is always on: the
+    // guest turning it off is only recorded, and after it turns it on the socket is no longer
+    // watched and the host's setting is the guest's
     let udp = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => crate::rawicmp::udp_setsockopt(s, level, name, &v),
         _ => None,
@@ -1025,9 +1072,10 @@ pub(super) fn setsockopt(
         Some(false) => return Ok(0),
         None => {}
     }
-    // 经典 BPF 过滤器（SO_ATTACH_FILTER、SO_ATTACH_REUSEPORT_CBPF）：struct sock_fprog 里指向
-    // 指令的指针换成宿主上的（dockerd 在 -p 的监听 socket 上装丢包的过滤器）。指令数是 0 或者
-    // 超过 BPF_MAXINSNS 是 EINVAL，指令的检查交给宿主
+    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF): the pointer to the
+    // instructions in struct sock_fprog is replaced with one on the host (dockerd installs a
+    // drop-everything filter on -p listening sockets). An instruction count of 0 or above
+    // BPF_MAXINSNS is EINVAL; checking the instructions is left to the host
     const SO_ATTACH_FILTER: i32 = 26;
     const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
     let inet_fd = match &*sock.borrow() {
@@ -1052,8 +1100,9 @@ pub(super) fn setsockopt(
         appine_hal::net::setsockopt(host_fd, level, name, &host).map_err(Errno)?;
         return Ok(0);
     }
-    // SO_MARK：只记下（InetSocket::mark），本机发出的包在 nftables 里带着它。Linux 要在 socket
-    // 的网络命名空间的属主里有 CAP_NET_RAW 或者 CAP_NET_ADMIN（sk_setsockopt）
+    // SO_MARK: only recorded (InetSocket::mark); packets sent by this machine carry it in
+    // nftables. Linux requires CAP_NET_RAW or CAP_NET_ADMIN over the owner of the socket's
+    // network namespace (sk_setsockopt)
     if (level, name) == (SOL_SOCKET, SO_MARK)
         && let Socket::Inet(s) = &mut *sock.borrow_mut()
     {
@@ -1075,18 +1124,19 @@ pub(super) fn setsockopt(
         Socket::Inet(s) => match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v),
             (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v),
-            // 新的网络命名空间里宿主 socket 要用 IPv4 映射的地址：只记下来
+            // In a new network namespace the host socket must use IPv4-mapped addresses: only
+            // record it
             (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
                 let on = v.get(..4).ok_or(Errno::EINVAL)?;
                 s.v6only = i32::from_le_bytes(on.try_into().unwrap()) != 0;
             }
             _ => appine_hal::net::setsockopt(s.fd, level, name, &v).map_err(Errno)?,
         },
-        // 别的选项（缓冲区大小、组播等）都接受，但不起作用
+        // Other options (buffer sizes, multicast and so on) are all accepted but have no effect
         Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => {
             s.rcvtimeo = timeval(&v)
         }
-        // SOL_NETLINK 的 NETLINK_CAP_ACK、NETLINK_EXT_ACK
+        // SOL_NETLINK's NETLINK_CAP_ACK, NETLINK_EXT_ACK
         Socket::Netlink(s) if level == 270 && (name == 10 || name == 11) => {
             let on = v.get(..4).ok_or(Errno::EINVAL)?;
             let on = i32::from_le_bytes(on.try_into().unwrap()) != 0;
@@ -1119,14 +1169,14 @@ pub(super) fn getsockopt(
         b
     };
     let pid_ns = cx.pid_ns();
-    // SO_ORIGINAL_DST：Linux 只写 sockaddr，optlen 原样写回
+    // SO_ORIGINAL_DST: Linux writes only the sockaddr and writes optlen back unchanged
     if let Some(r) = original_dst(cx, &sock, level, name, room) {
         let out = r?;
         cx.mm().write(UserSlice::new(value, out.len()), &out)?;
         return Ok(0);
     }
-    // 宿主替 raw ICMP socket、汇集点看着的 UDP socket 记下的 ICMP 错误 guest 不该看到
-    // （crate::rawicmp）
+    // The ICMP errors the host recorded for raw ICMP sockets and for UDP sockets the aggregation
+    // point watches must not be seen by the guest (crate::rawicmp)
     if (level, name) == (SOL_SOCKET, SO_ERROR)
         && let Some(t) = crate::rawicmp::before_io(cx.kr(), &sock)
     {
@@ -1136,8 +1186,9 @@ pub(super) fn getsockopt(
         };
         take_errors(cx, &t, fd);
     }
-    // raw ICMP 自己的选项（crate::rawicmp::RawIcmp），汇集点看着的 UDP socket 的 IP_RECVERR，
-    // 汇集点替它记下的要报告的错误
+    // Raw ICMP's own options (crate::rawicmp::RawIcmp), IP_RECVERR of UDP sockets the
+    // aggregation point watches, and the error to report that the aggregation point recorded for
+    // them
     let raw = match &*sock.borrow() {
         Socket::Inet(s) if (level, name) == (SOL_SOCKET, SO_ERROR) && s.icmp_err.get() != 0 => {
             Some(Ok(s.icmp_err.replace(0).to_le_bytes().to_vec()))
@@ -1156,9 +1207,9 @@ pub(super) fn getsockopt(
                 }
                 (SOL_SOCKET, SO_RCVTIMEO) => encode_tv(s.rcvtimeo),
                 (SOL_SOCKET, SO_SNDTIMEO) => encode_tv(s.sndtimeo),
-                // SO_MARK：记下的那个（宿主上的是 Android 的 netd 设的）
+                // SO_MARK: the recorded one (the one on the host is set by Android's netd)
                 (SOL_SOCKET, SO_MARK) => s.mark().to_le_bytes().to_vec(),
-                // raw ICMP 在宿主上是 ping socket
+                // Raw ICMP is a ping socket on the host
                 (SOL_SOCKET, SO_TYPE) if s.raw => SOCK_RAW.to_le_bytes().to_vec(),
                 _ => {
                     appine_hal::net::getsockopt(s.fd, level, name, room.min(256)).map_err(Errno)?
@@ -1171,7 +1222,8 @@ pub(super) fn getsockopt(
             Socket::Unix(u) => unix::getsockopt(u, level, name, &pid_ns, &cx.cred())?,
         }
     };
-    // 非阻塞的 TCP 连接被拒绝：guest 从这里得知（宿主读一次就清掉，不会数两次）
+    // A nonblocking TCP connection was refused: the guest learns it here (the host clears it once
+    // read, so it is never counted twice)
     if (level, name) == (SOL_SOCKET, SO_ERROR)
         && out.get(..4) == Some(&Errno::ECONNREFUSED.0.to_le_bytes())
     {
@@ -1185,19 +1237,23 @@ pub(super) fn getsockopt(
     put(cx, len, (n as u32).to_le_bytes()).map(|()| 0)
 }
 
-/// `SO_ORIGINAL_DST`（`SOL_IP`）、`IP6T_SO_ORIGINAL_DST`（`SOL_IPV6`）：照 Linux 的
-/// `getorigdst`、`ipv6_getorigdst`（`nf_conntrack_proto.c`，[`crate::origdst`]），`room` 是 guest
-/// 给的 optlen。None 是交给宿主：不是这个选项、不是 TCP、UDP 的 inet socket，AF_INET 的 socket 上
-/// 的 `SOL_IPV6`（Linux 是 EOPNOTSUPP）。
+/// `SO_ORIGINAL_DST` (`SOL_IP`), `IP6T_SO_ORIGINAL_DST` (`SOL_IPV6`): as in Linux's `getorigdst`,
+/// `ipv6_getorigdst` (`nf_conntrack_proto.c`, [`crate::origdst`]); `room` is the optlen the guest
+/// gave. None means left to the host: other options, inet sockets that are neither TCP nor UDP,
+/// and `SOL_IPV6` on an AF_INET socket (EOPNOTSUPP on Linux).
 ///
-/// - 不是 TCP 的是 ENOPROTOOPT，optlen 不够（16、28）是 EINVAL，都在查找之前。
-/// - 连接跟踪按包的协议族分开：IPv4（含 IPv4 映射的地址）的连接只有 `SOL_IP` 找得到，IPv6
-///   的只有 `SOL_IPV6`，另一个是 ENOENT。
-/// - 发起连接的一端（connect 过的）：原方向的原目的地址就是它连的那个（guest 看到的对端），
-///   命名空间里的包经过连接跟踪（[`crate::nft::Nft::tracks`]）才找得到。
-/// - 接受的一端：发起的一端被 nat 换过目的地址的，报告 accept 时领到的；不然经过连接跟踪
-///   时是自己的本端地址（没被 nat 的连接，原目的地址就是它）。
-/// - 没有连接的（监听着的、还没连的）：Linux 拿全零的对端去找，ENOENT。
+/// - Non-TCP is ENOPROTOOPT, an optlen too small (16, 28) is EINVAL, both before the lookup.
+/// - Connection tracking keeps packets apart by protocol family: IPv4 connections (IPv4-mapped
+///   addresses included) are found only with `SOL_IP`, IPv6 ones only with `SOL_IPV6`, and the
+///   other one is ENOENT.
+/// - The initiating end (one that called connect): the original destination of the original
+///   direction is the one it connected to (the peer the guest sees), found only when the
+///   namespace's packets go through connection tracking ([`crate::nft::Nft::tracks`]).
+/// - The accepting end: when nat rewrote the initiating end's destination, the one claimed at
+///   accept is reported; otherwise, when going through connection tracking, its own local address
+///   (for a connection without nat, that is the original destination).
+/// - Unconnected ones (listening, not yet connected): Linux looks up with an all-zero peer,
+///   ENOENT.
 fn original_dst(
     cx: &Cx<'_>,
     sock: &SocketRef,
@@ -1226,8 +1282,10 @@ fn original_dst(
     if room < if v6 { 28 } else { 16 } {
         return Some(Err(Errno::EINVAL));
     }
-    // 协议族按连接的地址：发起的一端看它连的（新命名空间里 AF_INET6 的 socket 的本端是
-    // 127.a.b.1，换回来是 ::1，分不出连的是不是 IPv4 映射的地址），接受的一端看本端
+    // The protocol family follows the connection's address: the initiating end looks at what it
+    // connected to (in a new namespace the local end of an AF_INET6 socket is 127.a.b.1, which
+    // translates back to ::1, so whether it connected to an IPv4-mapped address cannot be told),
+    // the accepting end at its local end
     let found = (|| {
         let local = inet_name(cx, s, false).ok()?;
         let fam_of = s.guest_peer.as_deref().unwrap_or(&local);
@@ -1260,34 +1318,38 @@ pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
     Ok(0)
 }
 
-/// netlink 的回答用的宿主信息：接口取自宿主，流量计数和宿主交来的路由取自内核。
-/// 新的网络命名空间里只有它的 lo（[`crate::netns`]），流量不计。
+/// Host information for netlink answers: interfaces come from the host, traffic counters and the
+/// routes the host handed over come from the kernel. In a new network namespace there is only its
+/// lo ([`crate::netns`]), and traffic is not counted.
 struct KernelHost<'a> {
     k: &'a crate::kernel::Kernel,
     cred: crate::cred::Cred,
     net: Option<Rc<crate::nsproxy::NetNs>>,
-    /// 发请求的进程的 pid 命名空间和 fd 表（RTM_GETNSID 的 NETNSA_PID、NETNSA_FD）。
+    /// The requesting process's pid namespace and fd table (RTM_GETNSID's NETNSA_PID,
+    /// NETNSA_FD).
     pid_ns: Rc<crate::pidns::PidNs>,
     fds: Rc<crate::cell::RefCell<crate::fd::FdTable>>,
-    /// 发请求的进程在它的 pid 命名空间里的编号和名字（NFT_MSG_NEWGEN 的 PROC_PID、PROC_NAME）。
+    /// The requesting process's number in its pid namespace and its name (NFT_MSG_NEWGEN's
+    /// PROC_PID, PROC_NAME).
     proc_pid: u32,
     comm: [u8; 16],
 }
 
 impl KernelHost<'_> {
-    /// 这个 socket 所在的网络命名空间（开机时的那个记作 None）。
+    /// The network namespace this socket is in (the boot one is recorded as None).
     fn ns(&self) -> Rc<crate::nsproxy::NetNs> {
         self.net
             .clone()
             .unwrap_or_else(|| self.k.init_ns.net.clone())
     }
 
-    /// 按进程（`by_pid`）或者命名空间文件找网络命名空间：进程要还没退出（Linux 的
-    /// get_net_ns_by_pid，ESRCH），fd 要是网络命名空间的文件（get_net_ns_by_fd，EINVAL）。
+    /// Finds a network namespace by process (`by_pid`) or by namespace file: the process must not
+    /// have exited yet (Linux's get_net_ns_by_pid, ESRCH), and the fd must be a network namespace
+    /// file (get_net_ns_by_fd, EINVAL).
     fn net_of(&self, by_pid: bool, value: u32) -> Result<Rc<crate::nsproxy::NetNs>, Errno> {
         if by_pid {
             let tid = self.pid_ns.find(value as i32).ok_or(Errno::ESRCH)?;
-            // 虚拟的 1 号进程（没有 Task）在开机时的命名空间里
+            // The virtual process 1 (with no Task) is in the boot namespace
             if tid == crate::kernel::INIT && !self.k.tasks.contains_key(&tid) {
                 return Ok(self.k.init_ns.net.clone());
             }
@@ -1369,7 +1431,7 @@ impl crate::net::Host for KernelHost<'_> {
     }
 
     fn configure(&self, req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
-        // IFLA_NET_NS_PID（19）是进程，IFLA_NET_NS_FD（28）是命名空间文件
+        // IFLA_NET_NS_PID (19) is a process, IFLA_NET_NS_FD (28) a namespace file
         let resolve = |attr: u16, value: u32| self.net_of(attr == 19, value);
         crate::netdev::request(&self.ns(), &self.cred, req, &resolve)
     }
@@ -1392,7 +1454,7 @@ impl crate::net::Host for KernelHost<'_> {
     }
 }
 
-/// 发送一条消息（send、sendto、sendmsg、write 共用）。
+/// Sends one message (shared by send, sendto, sendmsg, write).
 pub(crate) fn send(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
@@ -1426,7 +1488,8 @@ pub(crate) fn send(
                 proc_pid: cx.pid_ns().vnr(cx.task.tgid).unwrap_or(0) as u32,
                 comm: cx.task.comm.get(),
             };
-            // 开机时的命名空间里的 nftables 规则集改了：重新看要转发哪些端口
+            // The nftables ruleset of the boot namespace changed: look again at which ports to
+            // forward
             let init = &cx.kr().init_ns.net;
             let before = (s.net.is_none() && s.protocol == NETLINK_NETFILTER)
                 .then(|| init.nft.borrow().generation);
@@ -1440,7 +1503,8 @@ pub(crate) fn send(
         Socket::Unix(_) => unreachable!("handled above"),
     };
     if to_stub {
-        // DNS 存根：释放 BKL 交给宿主解析，回答放进这个 socket 的队列
+        // DNS stub: release the BKL and let the host resolve it, and queue the answer on this
+        // socket
         let query = data.to_vec();
         let answer = cx
             .unlocked(|| appine_hal::net::dns_query(&query))
@@ -1456,15 +1520,18 @@ pub(crate) fn send(
         request_wake_object(wake::of(sock));
         return Ok(data.len());
     }
-    // 目的地址换成宿主的（crate::netns：到不了时 ENETUNREACH），没绑定的先绑上；记下
-    // 目的地所在的命名空间（低端口映射按它的）
+    // Translate the destination address to the host's (crate::netns: ENETUNREACH when
+    // unreachable), binding first if unbound; record the namespace the destination is in (low
+    // port mapping follows it)
     let w = cx.kr().world();
     let init = cx.kr().init_ns.net.clone();
     let cred = cx.cred();
     let mut key = None;
-    // 绑在宿主通配地址上的 socket 发往映射的目的地：指定源地址（Socket::wide）
+    // A socket bound to the host's wildcard address sending to a mapped destination: specify the
+    // source address (Socket::wide)
     let mut pktinfo = None;
-    // 连接了的 UDP 的目的地被过滤链丢弃了（connect 时记下的）
+    // The destination of a connected UDP socket was dropped by a filter chain (recorded at
+    // connect)
     if addr.is_empty()
         && let Socket::Inet(s) = &*sock.borrow()
         && s.ty != SOCK_STREAM
@@ -1487,7 +1554,8 @@ pub(crate) fn send(
                 ensure_bound(s, src.as_deref())?;
                 Some(Vec::new())
             } else {
-                // nftables 的 nat 换了目的地址的：记下，回来的数据报的来源换回去
+                // nftables nat rewrote the destination: record it, so the source of datagrams
+                // coming back is translated back
                 let Routed {
                     m,
                     dst,
@@ -1496,15 +1564,16 @@ pub(crate) fn send(
                     verdict,
                     ..
                 } = route(&w, s, &me, addr, &cred)?;
-                // 过滤链丢弃、拒绝了的：OUTPUT 上的是 EPERM（Linux 的 ip_local_out），别处的
-                // 悄悄丢掉
+                // Dropped or rejected by a filter chain: EPERM on OUTPUT (Linux's ip_local_out),
+                // silently dropped elsewhere
                 match verdict {
                     (crate::nft::Outcome::Accept | crate::nft::Outcome::Dnat(..), _) => {}
                     (_, true) => return Err(Errno::EPERM),
                     (_, false) => return Ok(data.len()),
                 }
-                // 发往新的网络命名空间里没人绑的端口（或者只绑了别的地址）：Linux 上丢掉，
-                // 不能交给宿主（外层绑通配地址的 UDP socket 会收到）
+                // Sending to a port nobody binds in a new network namespace (or bound only to
+                // other addresses): dropped on Linux, and it cannot be left to the host (a UDP
+                // socket bound to the wildcard address outside would receive it)
                 if nat_proto(s) == Some(IPPROTO_UDP as u8)
                     && let Some(t) = &m.target
                     && t.host_net.is_some()
@@ -1526,11 +1595,14 @@ pub(crate) fn send(
                 }
                 let dst = &dst[..];
                 if crate::netns::is_inet(addr) {
-                    // 新命名空间里还没绑定的 UDP socket 第一次发往命名空间里的地址：宿主上也
-                    // 绑通配地址（Socket::wide），下面用 IP_PKTINFO 指定源地址，与先绑了通配
-                    // 地址、端口 0 的（musl 的解析器、Node、Go、Java 这样做）一样。绑在回环地址
-                    // 上的话之后再发往外面就出不去（宿主是 EINVAL）。发给自己的虚拟地址的照旧
-                    // 绑 127.a.b.254：回答按登记的端口送回那里（Loopback::self_udp）
+                    // An unbound UDP socket in a new namespace sending to an address in the
+                    // namespace for the first time: bind the wildcard address on the host too
+                    // (Socket::wide), with IP_PKTINFO specifying the source address below, the
+                    // same as one that bound the wildcard address with port 0 first (musl's
+                    // resolver, Node, Go and Java do so). Bound to the loopback address, it could
+                    // not send to the outside later (the host gives EINVAL). Sockets sending to
+                    // their own virtual address still bind 127.a.b.254: answers are delivered
+                    // back there by the registered port (Loopback::self_udp)
                     let source = m.source.as_deref().filter(|src| {
                         s.net.is_none()
                             || nat_proto(s) != Some(IPPROTO_UDP as u8)
@@ -1542,9 +1614,10 @@ pub(crate) fn send(
                 if s.wide && m.target.is_some() {
                     pktinfo = crate::netns::implicit_bind(&me, s.family, false);
                 }
-                // 开机时的命名空间里绑在通配地址上的（UDP 的服务端回答新命名空间里的客户端）：
-                // 宿主选的源地址是 127.0.0.1，对方要看到的是面向它的那个虚拟地址（没绑定的
-                // 由 ensure_bound 绑上了）
+                // Bound to the wildcard address in the boot namespace (a UDP server answering a
+                // client in a new namespace): the source address the host chooses is 127.0.0.1,
+                // and the other side must see the virtual address facing it (an unbound one was
+                // bound by ensure_bound)
                 if s.net.is_none()
                     && let Some(src) = &m.source
                     && appine_hal::net::sockname(s.fd, false)
@@ -1559,14 +1632,15 @@ pub(crate) fn send(
         _ => None,
     };
     let addr = host_addr.as_deref().unwrap_or(addr);
-    // TCP 不看给的地址（MSG_FASTOPEN 除外，Linux 的 tcp_sendmsg_locked），这里也不交给宿主：
-    // 宿主的 LSM 可能按地址族检查它（Ubuntu 24.04 的 AppArmor 拒绝 AF_UNSPEC，EAFNOSUPPORT）
+    // TCP ignores the given address (except with MSG_FASTOPEN, Linux's tcp_sendmsg_locked), so
+    // it is not passed to the host here either: the host's LSM may check it by address family
+    // (Ubuntu 24.04's AppArmor rejects AF_UNSPEC with EAFNOSUPPORT)
     let addr = if ty == SOCK_STREAM && flags & MSG_FASTOPEN == 0 {
         &[][..]
     } else {
         addr
     };
-    // 发往本机上映射了的低端口：换成宿主上的（crate::portmap）
+    // Sending to a mapped low port on the local machine: switch to the host's (crate::portmap)
     let mapped = match &*sock.borrow() {
         Socket::Inet(s) if !addr.is_empty() => {
             let k = key.unwrap_or_else(|| ns_key(s));
@@ -1576,17 +1650,19 @@ pub(crate) fn send(
         _ => None,
     };
     let addr = mapped.as_deref().unwrap_or(addr);
-    // raw ICMP socket、交给汇集点看着的 UDP socket（crate::rawicmp）：宿主替它记下的 ICMP
-    // 错误会让发送失败，先取走；因为它失败了也取走再试一次
+    // Raw ICMP sockets and UDP sockets handed to the aggregation point (crate::rawicmp): ICMP
+    // errors the host recorded for them would make the send fail, so take them off first; when
+    // the send fails because of one, take it off too and try again
     let tap = crate::rawicmp::before_io(cx.kr(), sock);
     if let Some(t) = &tap {
         take_errors(cx, t, host_fd);
         if let Some(e) = crate::rawicmp::take_error(sock) {
             return Err(e);
         }
-        // 已连接的 UDP socket 发往别的地址（busybox 的 traceroute 连上目的地址之后每个探测包
-        // 换一个端口）：宿主只把与 socket 的连接对得上的报文引起的错误交给它，先改连到这个
-        // 地址。guest 看到的对端仍是它连的（getpeername）
+        // A connected UDP socket sending to another address (busybox's traceroute connects to
+        // the destination and then changes the port for every probe): the host only hands it
+        // errors caused by packets that match the socket's connection, so connect it to this
+        // address first. The peer the guest sees is still the one it connected to (getpeername)
         let connected_udp = matches!(&*sock.borrow(),
             Socket::Inet(s) if s.icmp.is_none() && s.peer.is_some());
         if connected_udp && !addr.is_empty() {
@@ -1614,7 +1690,7 @@ pub(crate) fn send(
             Ok(n) => {
                 done += n;
                 sent_datagram = ty != SOCK_STREAM;
-                // 流式 socket 的阻塞发送要把数据全部发出去
+                // A blocking send on a stream socket must send all the data
                 if ty != SOCK_STREAM || done == data.len() || nonblock {
                     break Ok(done);
                 }
@@ -1645,7 +1721,8 @@ pub(crate) fn send(
     if done > 0 || sent_datagram {
         account(cx, sock, false, done, addr);
     }
-    // 宿主自动绑定的（新命名空间里第一次发往外面的）：这时才知道端口，登记它
+    // Bound automatically by the host (on the first send to the outside in a new namespace): only
+    // now is the port known, so register it
     if sent_datagram
         && let Socket::Inet(s) = &mut *sock.borrow_mut()
         && s.listener.is_none()
@@ -1655,13 +1732,13 @@ pub(crate) fn send(
     r
 }
 
-/// 在控制消息 `control` 后面加一个指定源地址 `src`（sockaddr）的 `IP_PKTINFO`
-/// （`IPV6_PKTINFO`，IPv4 映射的地址），guest 自己给了的不加。
+/// Appends to control messages `control` an `IP_PKTINFO` (`IPV6_PKTINFO`, for IPv4-mapped
+/// addresses) specifying source address `src` (a sockaddr), unless the guest gave one itself.
 fn with_pktinfo(control: &[u8], src: &[u8]) -> Vec<u8> {
     const IPPROTO_IP: i32 = 0;
     const IP_PKTINFO: i32 = 8;
     const IPV6_PKTINFO: i32 = 50;
-    // struct cmsghdr：cmsg_len（size_t）、cmsg_level、cmsg_type，内容按 8 字节对齐
+    // struct cmsghdr: cmsg_len (size_t), cmsg_level, cmsg_type, with the data aligned to 8 bytes
     let mut off = 0;
     while off + 16 <= control.len() {
         let len = u64::from_le_bytes(control[off..off + 8].try_into().unwrap()) as usize;
@@ -1678,12 +1755,12 @@ fn with_pktinfo(control: &[u8], src: &[u8]) -> Vec<u8> {
         off += len.next_multiple_of(8);
     }
     let (level, ty, data) = if u16::from_le_bytes([src[0], src[1]]) as i32 == AF_INET6 {
-        // struct in6_pktinfo：地址、接口编号
+        // struct in6_pktinfo: address, interface index
         let mut d = src[8..24].to_vec();
         d.extend_from_slice(&0i32.to_le_bytes());
         (IPPROTO_IPV6, IPV6_PKTINFO, d)
     } else {
-        // struct in_pktinfo：接口编号、ipi_spec_dst（源地址）、ipi_addr
+        // struct in_pktinfo: interface index, ipi_spec_dst (the source address), ipi_addr
         let mut d = 0i32.to_le_bytes().to_vec();
         d.extend_from_slice(&src[4..8]);
         d.extend_from_slice(&[0; 4]);
@@ -1699,10 +1776,11 @@ fn with_pktinfo(control: &[u8], src: &[u8]) -> Vec<u8> {
     out
 }
 
-/// 两个 IPv4、IPv6 地址的协议族、端口和地址都相同。
-/// 从宿主外面连到开机时的命名空间里的 `s`（TCP 的监听、绑了端口的 UDP）时，PREROUTING
-/// 的 nat 把它转到哪里：宿主上的目的地（容器的回环地址，低端口换成映射的），以及连过去时
-/// 绑的源地址（开机时的命名空间面向它的地址）。
+/// Two IPv4 or IPv6 addresses have the same protocol family, port and address.
+/// When a connection from outside the host reaches `s` in the boot namespace (a TCP listen, or a
+/// UDP socket with a bound port), where PREROUTING nat sends it: the destination on the host (a
+/// container's loopback address, with low ports switched to the mapped ones), and the source
+/// address bound when connecting there (the boot namespace's address facing it).
 fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::forward::Target> {
     if s.net.is_some() || s.raw || s.icmp.is_some() {
         return None;
@@ -1721,7 +1799,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     if !udp && !s.listening {
         return None;
     }
-    // 规则里是 guest 的端口
+    // The rules hold the guest's port
     if let Some((g, h)) = s.local_map
         && h == host_port
     {
@@ -1731,7 +1809,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     let dst = crate::netns::external_nat(init, proto as u8, &local)?;
     let w = k.world();
     let m = crate::netns::to_host(&w, init, &dst, crate::netns::Use::Reach, false).ok()?;
-    // 过滤链（FORWARD 等）丢弃、拒绝的不转发
+    // Not forwarded when dropped or rejected by filter chains (FORWARD and so on)
     if !crate::netns::external_filter(init, m.target.as_deref(), proto as u8, &dst) {
         return None;
     }
@@ -1750,18 +1828,18 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     })
 }
 
-/// 按现在的规则决定 `s` 要不要转发、转到哪里（[`crate::forward`]）。
+/// Decides by the current rules whether `s` is forwarded and where to ([`crate::forward`]).
 fn forward_socket(k: &crate::kernel::Kernel, s: &mut InetSocket) {
     let want = forward_target(k, s);
     if want.as_ref() == s.fwd.as_ref().map(|h| &h.target) {
         return;
     }
-    // 先交新的再丢旧的：中间没有空档
+    // Hand over the new one before dropping the old: no gap in between
     let new = want.and_then(|t| k.forward.add(s.fd, t).ok()).map(Box::new);
     s.fwd = new;
 }
 
-/// 开机时的命名空间里的 nftables 规则集改了之后，重新看所有 socket。
+/// After the nftables ruleset of the boot namespace changes, looks at all sockets again.
 fn forward_all(k: &crate::kernel::Kernel) {
     for (sock, _) in crate::pseudo::sockets(k) {
         if let Ok(mut b) = sock.try_borrow_mut()
@@ -1773,27 +1851,33 @@ fn forward_all(k: &crate::kernel::Kernel) {
     }
 }
 
-/// [`route`] 的结果。
+/// The result of [`route`].
 struct Routed {
-    /// 宿主上的目的地（[`crate::netns::to_host`]），源地址按 `me` 这边选。
+    /// The destination on the host ([`crate::netns::to_host`]), with the source address chosen
+    /// on `me`'s side.
     m: crate::netns::Mapped,
-    /// OUTPUT nat 之后的目的地（`me` 里看到的）。
+    /// The destination after OUTPUT nat (as seen in `me`).
     dst: Vec<u8>,
-    /// 最后的目的地在它所在的命名空间（`m.target`）里看到的样子（PREROUTING nat 之后）。
+    /// How the final destination looks in its namespace (`m.target`) (after PREROUTING nat).
     there: Vec<u8>,
-    /// nat 换过目的地时，`me` 里看到的实际的目的地：从它回来的数据报报告成来自 guest 给的
-    /// 地址（[`crate::net::Track::nat_back`]）。
+    /// When nat rewrote the destination, the actual destination as seen in `me`: datagrams coming
+    /// back from it are reported as coming from the address the guest gave
+    /// ([`crate::net::Track::nat_back`]).
     actual: Option<Vec<u8>>,
-    /// 经过的过滤链的结果，以及是不是在 OUTPUT 上（[`crate::netns::path_filter`]）。
+    /// The result of the filter chains passed, and whether it was on OUTPUT
+    /// ([`crate::netns::path_filter`]).
     verdict: (crate::nft::Outcome, bool),
-    /// 被 nat 换过目的地址的命名空间（编号）和那里看到的原目的地址：`me` 里是 guest 给的，
-    /// 进入的别的命名空间里是那里的 PREROUTING 之前的（`SO_ORIGINAL_DST`，[`crate::origdst`]）。
+    /// The namespaces (by number) where nat rewrote the destination, and the original destination
+    /// seen there: in `me` it is the one the guest gave, in other namespaces entered it is the one
+    /// before their PREROUTING (`SO_ORIGINAL_DST`, [`crate::origdst`]).
     origs: Vec<(u64, Vec<u8>)>,
 }
 
-/// connect、sendto 的目的地址 `addr`（guest 的）：先过 `me` 的 OUTPUT nat，换成宿主上的；
-/// 进入别的命名空间的（[`crate::netns::entering`]）再过那里的 PREROUTING nat，按那个命名空间
-/// 换成宿主上的（容器经由网关、外层地址连发布的端口）。
+/// The destination address `addr` (the guest's) of connect or sendto: it first goes through `me`'s
+/// OUTPUT nat and is translated to the host's; when it enters another namespace
+/// ([`crate::netns::entering`]) it also goes through that namespace's PREROUTING nat and is
+/// translated to the host's by that namespace (containers connecting to published ports through
+/// the gateway or the outer address).
 fn route(
     w: &crate::netns::World,
     s: &InetSocket,
@@ -1824,8 +1908,10 @@ fn route(
             crate::netns::Role::Peer,
             s.icmp6(),
         ));
-        // 原来经由宿主网络的没有选源地址：DNAT 到了命名空间里的，新命名空间里绑它的回环地址，
-        // 对方才认得出来源；DNAT 到外面的别的地址时仍不绑，绑了就出不去
+        // Going through the host network originally, no source address was chosen: when DNAT
+        // leads into a namespace, a new namespace binds its loopback address so the other side
+        // recognizes the source; when DNAT leads to another address outside it still does not
+        // bind, since bound it could not get out
         let source = m.source.take().or_else(|| {
             m2.target.as_ref()?;
             me.host_net
@@ -1838,7 +1924,8 @@ fn route(
             vaddr: m.vaddr,
         };
     }
-    // 经过的过滤链（crate::netns::path_filter）：UDP 回给收到过的对方是 ESTABLISHED 的
+    // The filter chains passed (crate::netns::path_filter): UDP sending back to peers it received
+    // from is ESTABLISHED
     let verdict = match nat_proto(s) {
         Some(proto) => {
             let established = proto == IPPROTO_UDP as u8
@@ -1870,9 +1957,11 @@ fn route(
     })
 }
 
-/// 过滤链丢弃的 TCP 连接连到的宿主地址：一个接受队列已经满了、从不 accept 的宿主监听，再来
-/// 的 SYN 宿主悄悄丢掉，连接照 Linux 的重传超时失败（ETIMEDOUT），guest 设的超时照样起作用。
-/// 每个内核一个，取不到时是 None（这时 connect 马上是 ETIMEDOUT）。
+/// The host address that TCP connections dropped by filter chains connect to: a host listener
+/// whose accept queue is already full and that never accepts, so the host silently drops further
+/// SYNs, the connection fails after Linux's retransmission timeout (ETIMEDOUT), and timeouts the
+/// guest set still take effect. One per kernel; None when unavailable (connect is then ETIMEDOUT
+/// at once).
 fn blackhole(k: &crate::kernel::Kernel) -> Option<Vec<u8>> {
     k.blackhole
         .get_or_init(|| {
@@ -1882,7 +1971,8 @@ fn blackhole(k: &crate::kernel::Kernel) -> Option<Vec<u8>> {
             appine_hal::net::bind(l, &lo).ok()?;
             appine_hal::net::listen(l, 0).ok()?;
             let addr = appine_hal::net::sockname(l, false).ok()?;
-            // 填满接受队列：连到一个连不上为止（backlog 0 也可能先放进一两个）
+            // Fill the accept queue: connect until one fails (even with backlog 0 one or two may
+            // get in first)
             let connects = |wait: Duration| -> Option<(i32, bool)> {
                 let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).ok()?;
                 let _ = appine_hal::net::connect(c, &addr);
@@ -1895,7 +1985,7 @@ fn blackhole(k: &crate::kernel::Kernel) -> Option<Vec<u8>> {
                 let (c, done) = connects(Duration::from_millis(200))?;
                 if !done {
                     appine_hal::net::close(c);
-                    // 监听和填进去的连接一直留着
+                    // The listener and the connections filled in stay forever
                     return Some(addr);
                 }
             }
@@ -1904,7 +1994,7 @@ fn blackhole(k: &crate::kernel::Kernel) -> Option<Vec<u8>> {
         .clone()
 }
 
-/// 要过 nftables 的 nat 的 socket 的协议：TCP（含 MPTCP）、UDP。
+/// The protocol of a socket that goes through nftables nat: TCP (MPTCP included), UDP.
 fn nat_proto(s: &InetSocket) -> Option<u8> {
     match (s.ty, s.proto) {
         (SOCK_STREAM, 0 | IPPROTO_TCP | IPPROTO_MPTCP) => Some(IPPROTO_TCP as u8),
@@ -1913,7 +2003,7 @@ fn nat_proto(s: &InetSocket) -> Option<u8> {
     }
 }
 
-/// 宿主 socket 的本端端口（还没绑定时是 0）。
+/// The host socket's local port (0 while unbound).
 fn local_port(s: &InetSocket) -> u16 {
     appine_hal::net::sockname(s.fd, false)
         .ok()
@@ -1921,11 +2011,12 @@ fn local_port(s: &InetSocket) -> u16 {
         .unwrap_or(0)
 }
 
-/// 一个未连接的数据报 socket 记下的 DNAT（[`crate::net::Track::nat_back`]）、收到过的对方
-/// （[`crate::net::Track::seen`]）各最多这么多个。
+/// The most DNATs ([`crate::net::Track::nat_back`]) and peers received from
+/// ([`crate::net::Track::seen`]) an unconnected datagram socket records, each.
 const NAT_BACK_MAX: usize = 16;
 
-/// nftables 的 OUTPUT nat（[`crate::netns::output_nat`]）换过的目的地址；TCP、UDP 以外的不看。
+/// The destination address rewritten by nftables' OUTPUT nat ([`crate::netns::output_nat`]);
+/// protocols other than TCP and UDP are ignored.
 fn nat_dest(
     s: &InetSocket,
     me: &crate::nsproxy::NetNs,
@@ -1956,15 +2047,16 @@ fn same_endpoint(a: &[u8], b: &[u8]) -> bool {
     a.get(..n).is_some() && a.get(..n) == b.get(..n)
 }
 
-/// 取走宿主记在 `fd` 上的 ICMP 错误（分给 raw socket，[`crate::rawicmp::dispatch`]）。
+/// Takes the ICMP errors the host recorded on `fd` (given to raw sockets,
+/// [`crate::rawicmp::dispatch`]).
 fn take_errors(cx: &mut Cx<'_>, tap: &Rc<RefCell<crate::rawicmp::Tap>>, fd: i32) {
     let arrivals = crate::rawicmp::dispatch(tap, Some(fd));
     crate::rawicmp::account(cx.k(), arrivals);
 }
 
-/// 记下宿主 socket 上收发的流量（[`crate::traffic`]）。
+/// Records the traffic sent and received on a host socket ([`crate::traffic`]).
 fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8]) {
-    // 新的网络命名空间里的流量不算进宿主的接口
+    // Traffic in new network namespaces is not counted on the host's interfaces
     if let Socket::Inet(s) = &mut *sock.borrow_mut()
         && s.net.is_none()
     {
@@ -1972,7 +2064,7 @@ fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8
     }
 }
 
-/// sockaddr（AF_INET、AF_INET6）里的端口。
+/// The port in a sockaddr (AF_INET, AF_INET6).
 fn port_of(addr: &[u8]) -> Option<u16> {
     let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
     match family {
@@ -1985,12 +2077,13 @@ fn set_port(addr: &mut [u8], port: u16) {
     addr[2..4].copy_from_slice(&port.to_be_bytes());
 }
 
-/// 映射了的低端口在这个 socket 上起作用（[`crate::portmap`]）：TCP、UDP，不是 raw socket。
+/// Mapped low ports apply to this socket ([`crate::portmap`]): TCP, UDP, not raw sockets.
 fn mappable(s: &InetSocket) -> bool {
     !s.raw && matches!(map_proto(s), IPPROTO_TCP | IPPROTO_UDP)
 }
 
-/// 低端口映射的登记表里的协议：MPTCP 的端口与 TCP 的是同一些（Go 1.24 起监听默认用 MPTCP）。
+/// The protocol in the low-port mapping registry: MPTCP's ports are the same as TCP's (Go 1.24 and
+/// later listen with MPTCP by default).
 fn map_proto(s: &InetSocket) -> i32 {
     if s.proto == IPPROTO_MPTCP {
         IPPROTO_TCP
@@ -1999,12 +2092,12 @@ fn map_proto(s: &InetSocket) -> i32 {
     }
 }
 
-/// 登记表里的网络命名空间：开机时的是 0。
+/// The network namespace in the registry: the boot one is 0.
 fn ns_key(s: &InetSocket) -> usize {
     s.net.as_ref().map_or(0, |n| Rc::as_ptr(n) as usize)
 }
 
-/// sockaddr 里的 IP（IPv4 映射的 IPv6 地址取 IPv4 的那部分）。
+/// The IP in a sockaddr (the IPv4 part of an IPv4-mapped IPv6 address).
 fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     let family = i32::from(u16::from_le_bytes([*addr.first()?, *addr.get(1)?]));
@@ -2020,7 +2113,8 @@ fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
     }
 }
 
-/// 宿主地址是本机的：回环、通配地址，或者宿主接口上的（连自己的 wlan0 地址）。
+/// The host address is local: loopback, the wildcard address, or one on a host interface
+/// (connecting to its own wlan0 address).
 fn is_local(addr: &[u8]) -> bool {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     let Some(ip) = ip_of(addr) else {
@@ -2041,10 +2135,12 @@ fn is_local(addr: &[u8]) -> bool {
     })
 }
 
-/// 要连、要发往宿主地址 `addr`：本机上映射了的低端口换成宿主端口（[`crate::portmap`]），
-/// 按目的地所在的网络命名空间（`key`，[`key_of`]）的登记。返回换过的地址和 (guest 端口,
-/// 宿主端口)。guest 里没有程序绑着这个端口时不换：手机上别的 App 恰好占着宿主端口时连
-/// 过去就错了，应该与原来一样连不上。
+/// Connecting or sending to host address `addr`: a mapped low port on the local machine becomes
+/// the host port ([`crate::portmap`]), by the registration of the network namespace the
+/// destination is in (`key`, [`key_of`]). Returns the rewritten address and (guest port, host
+/// port). Not rewritten when no program in the guest binds this port: if another app on the
+/// phone happens to hold the host port, connecting there would be wrong, and it should fail to
+/// connect as before.
 fn map_dest(
     map: &crate::cell::RefCell<crate::portmap::PortMap>,
     s: &InetSocket,
@@ -2058,7 +2154,8 @@ fn map_dest(
         if !mappable(s) {
             return (addr, None);
         }
-        // 低端口和新命名空间里显式绑的端口才有登记，没有登记的不换
+        // Only low ports and ports bound explicitly in new namespaces are registered; unregistered
+        // ones are not rewritten
         map.borrow().host_port(key, map_proto(s), port)
     };
     match host {
@@ -2070,9 +2167,11 @@ fn map_dest(
     }
 }
 
-/// 宿主给的本端（`local`）或者对端地址里，映射来的宿主端口换回 guest 的：本端按 socket
-/// 绑的映射；对端先按 connect 时记下的，再看是不是本机上映射来的（UDP 的来源、accept 到的
-/// 对端用低端口绑定过），按对端地址所在的网络命名空间（[`crate::netns::owner_of_host`]）。
+/// In a local (`local`) or peer address given by the host, a mapped host port is translated back
+/// to the guest's: the local end by the socket's bound mapping; the peer first by what was
+/// recorded at connect, then by whether it was mapped on the local machine (the source of UDP, or
+/// an accepted peer bound with a low port), by the network namespace the peer address is in
+/// ([`crate::netns::owner_of_host`]).
 pub(crate) fn unmap_addr(
     map: &crate::cell::RefCell<crate::portmap::PortMap>,
     w: &crate::netns::World,
@@ -2084,7 +2183,7 @@ pub(crate) fn unmap_addr(
         return addr;
     };
     let known = if local { s.local_map } else { s.peer_map };
-    // 从外面转发进来的连接的来源不是映射来的端口（crate::forward）
+    // The source of a connection forwarded in from outside is not a mapped port (crate::forward)
     let outside = ip_of(&addr).is_some_and(|ip| match ip {
         std::net::IpAddr::V4(v) => v.octets()[..2] == [127, crate::forward::OUTSIDE_BLOCK],
         std::net::IpAddr::V6(_) => false,
@@ -2106,7 +2205,7 @@ pub(crate) fn unmap_addr(
     addr
 }
 
-/// 宿主上的本端 IPv4 地址换成 guest 看到的（[`crate::netns`]）。
+/// The local IPv4 address on the host as the guest sees it ([`crate::netns`]).
 fn local_addr(
     w: &crate::netns::World,
     me: &crate::nsproxy::NetNs,
@@ -2125,7 +2224,7 @@ fn local_addr(
     g.get(4..8).and_then(|b| b.try_into().ok()).unwrap_or(a)
 }
 
-/// 对方已经关闭：除非带着 `MSG_NOSIGNAL`，给当前线程发 SIGPIPE。
+/// The other side has closed: sends SIGPIPE to the current thread unless `MSG_NOSIGNAL` is set.
 pub(super) fn epipe(cx: &mut Cx<'_>, flags: u32) -> Errno {
     if flags & MSG_NOSIGNAL == 0 {
         let task = cx.task.clone();
@@ -2134,17 +2233,17 @@ pub(super) fn epipe(cx: &mut Cx<'_>, flags: u32) -> Errno {
     Errno::EPIPE
 }
 
-/// 收到的一条消息。
+/// One received message.
 pub(crate) struct Message {
     pub data: Vec<u8>,
-    /// 消息的完整长度（`MSG_TRUNC` 时可能大于 `data`）。
+    /// The full length of the message (may exceed `data` with `MSG_TRUNC`).
     pub len: usize,
     pub addr: Vec<u8>,
     pub control: Vec<u8>,
     pub flags: u32,
 }
 
-/// 接收一条消息（recv、recvfrom、recvmsg、read 共用），最多 `max` 字节。
+/// Receives one message (shared by recv, recvfrom, recvmsg, read), at most `max` bytes.
 pub(crate) fn recv(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
@@ -2157,9 +2256,10 @@ pub(crate) fn recv(
     if is_unix(sock) {
         return unix::recv(cx, sock, nonblock, max, control_len, flags);
     }
-    // 读错误队列（MSG_ERRQUEUE）从不等待：没有排队的错误时 EAGAIN
+    // Reading the error queue (MSG_ERRQUEUE) never waits: EAGAIN when no errors are queued
     let nonblock = nonblock || flags & (MSG_DONTWAIT | MSG_ERRQUEUE) != 0;
-    // raw ICMP socket 收到的报文都经由汇集点（crate::rawicmp）
+    // Every message a raw ICMP socket receives goes through the aggregation point
+    // (crate::rawicmp)
     let raw = match &*sock.borrow() {
         Socket::Inet(InetSocket { icmp: Some(r), .. }) => Some(r.tap.clone()),
         _ => None,
@@ -2167,7 +2267,7 @@ pub(crate) fn recv(
     if let Some(tap) = raw {
         return raw_recv(cx, sock, &tap, nonblock, max, control_len, flags);
     }
-    // 进程内产生的数据报：DNS 存根的回答、netlink 的回答
+    // Datagrams produced in process: DNS stub answers, netlink answers
     let local = |q: &mut std::collections::VecDeque<Vec<u8>>, addr: Vec<u8>| {
         let d = if flags & MSG_PEEK != 0 {
             q.front().cloned()
@@ -2183,7 +2283,7 @@ pub(crate) fn recv(
             flags: if d.len() > n { MSG_TRUNC } else { 0 },
         })
     };
-    // netlink 等回答的期限（SO_RCVTIMEO），第一次没有回答可读时定下
+    // The deadline for netlink answers (SO_RCVTIMEO), set the first time no answer can be read
     let mut netlink_deadline = None;
     let (host_fd, ty, timeout) = loop {
         let host = match &mut *sock.borrow_mut() {
@@ -2211,7 +2311,8 @@ pub(crate) fn recv(
         };
         match host {
             Some(h) => break h,
-            // netlink 没有回答可读：等到被信号打断或者 SO_RCVTIMEO 到期（原来不看它，一直等）
+            // No netlink answer to read: wait until interrupted by a signal or until SO_RCVTIMEO
+            // expires (before, it was ignored and the wait was forever)
             None => {
                 let deadline = netlink_deadline.flatten();
                 if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
@@ -2224,8 +2325,9 @@ pub(crate) fn recv(
             }
         }
     };
-    // 交给汇集点看着的 UDP socket：宿主替它记下的 ICMP 错误会让接收失败，先取走；因为它
-    // 失败了也取走再试一次
+    // A UDP socket handed to the aggregation point: ICMP errors the host recorded for it would
+    // make the receive fail, so take them off first; when the receive fails because of one, take
+    // it off too and try again
     let tap = crate::rawicmp::before_io(cx.kr(), sock);
     if let Some(t) = &tap {
         take_errors(cx, t, host_fd);
@@ -2239,13 +2341,14 @@ pub(crate) fn recv(
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut buf = vec![0u8; max];
     let mut got = 0;
-    // 偷看的数据之后还会再读到，错误队列里不是收到的流量
+    // Peeked data will be read again later, and the error queue is not received traffic
     let counted = flags & (MSG_PEEK | MSG_ERRQUEUE) == 0;
     loop {
         let host_flags = flags & !(MSG_DONTWAIT | MSG_WAITALL);
         match appine_hal::net::recvmsg(host_fd, &mut buf[got..], control_len, host_flags as i32) {
             Ok(r) => {
-                // 记下了对端的（InetSocket::vconn）：不是来自它的丢掉（偷看到的也要取走）
+                // The peer is recorded (InetSocket::vconn): datagrams not from it are dropped
+                // (peeked ones must be taken off too)
                 let foreign = matches!(&*sock.borrow(),
                     Socket::Inet(s) if s.vconn.as_ref().is_some_and(|v| !same_endpoint(v, &r.addr)));
                 if foreign {
@@ -2267,7 +2370,8 @@ pub(crate) fn recv(
                 }
                 let addr = match &*sock.borrow() {
                     Socket::Inet(s) if !r.addr.is_empty() => {
-                        // 来自本机上映射了的低端口：报告 guest 的端口（crate::portmap）
+                        // From a mapped low port on the local machine: report the guest's port
+                        // (crate::portmap)
                         let w = cx.kr().world();
                         let a = unmap_addr(&cx.kr().portmap, &w, s, r.addr, false);
                         let me = net_of(cx, s);
@@ -2281,7 +2385,7 @@ pub(crate) fn recv(
                                 s.icmp6(),
                             ),
                         };
-                        // 来自 DNAT 换成的目的地：报告 guest 发往的那个
+                        // From the destination DNAT rewrote to: report the one the guest sent to
                         match s
                             .track
                             .as_ref()
@@ -2293,7 +2397,8 @@ pub(crate) fn recv(
                     }
                     _ => r.addr,
                 };
-                // UDP：记下收到过的对方，回给它们的是 ESTABLISHED 的（过滤链）
+                // UDP: record the peers received from; sending back to them is ESTABLISHED
+                // (filter chains)
                 if let Socket::Inet(s) = &mut *sock.borrow_mut()
                     && s.ty == SOCK_DGRAM
                     && s.icmp.is_none()
@@ -2319,7 +2424,8 @@ pub(crate) fn recv(
                 });
             }
             Err(e) if e == Errno::EAGAIN.0 => {
-                // 有 DNS 存根的回答进来也要醒：它们不经过宿主 socket
+                // Also wake up when DNS stub answers come in: they do not go through the host
+                // socket
                 if let Socket::Inet(s) = &mut *sock.borrow_mut()
                     && let Some(m) = local(&mut s.answers, stub_addr(s.family))
                 {
@@ -2351,8 +2457,9 @@ pub(crate) fn recv(
     }
 }
 
-/// raw ICMP socket 的接收：报文在汇集点里它自己的队列中（[`crate::rawicmp`]），先取下
-/// 宿主上已经到了的，没有就连同汇集点的宿主 fd 一起等。
+/// Receiving on a raw ICMP socket: the messages are in its own queue in the aggregation point
+/// ([`crate::rawicmp`]); first take off what has already arrived on the host, and when there is
+/// nothing, wait together with the aggregation point's host fd.
 fn raw_recv(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
@@ -2362,7 +2469,8 @@ fn raw_recv(
     control_len: usize,
     flags: u32,
 ) -> Result<Message, Errno> {
-    // 错误队列：guest 打开了 IP_RECVERR 时汇集点放进来的（从不等待）
+    // The error queue: what the aggregation point put in when the guest enabled IP_RECVERR (never
+    // waits)
     if flags & MSG_ERRQUEUE != 0 {
         let arrivals = crate::rawicmp::dispatch(tap, None);
         crate::rawicmp::account(cx.k(), arrivals);
@@ -2493,11 +2601,11 @@ pub(super) fn recvfrom(
     } as u64)
 }
 
-/// guest 的 `struct msghdr`。
+/// The guest's `struct msghdr`.
 struct MsgHdr {
     name: u64,
     namelen: u32,
-    /// (基址, 长度)。
+    /// (base, length).
     iovecs: Vec<(u64, usize)>,
     control: u64,
     controllen: usize,
@@ -2560,13 +2668,14 @@ pub(super) fn sendmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     send(cx, &sock, nonblock, &data, &addr, &cmsg, flags).map(|n| n as u64)
 }
 
-/// `struct mmsghdr` 的大小：msghdr 后面跟着 msg_len。
+/// The size of `struct mmsghdr`: a msghdr followed by msg_len.
 const MMSGHDR_SIZE: u64 = 64;
-/// sendmmsg、recvmmsg 一次最多处理的消息个数（`UIO_MAXIOV`）。
+/// The most messages sendmmsg and recvmmsg handle at once (`UIO_MAXIOV`).
 const MMSG_MAX: u32 = 1024;
 const MSG_WAITFORONE: u32 = 0x1_0000;
 
-/// sendmmsg：逐个 sendmsg。第一个就失败时返回错误，否则返回发出的个数。
+/// sendmmsg: sendmsg one by one. Returns the error when the first one fails, otherwise the number
+/// sent.
 pub(super) fn sendmmsg(cx: &mut Cx<'_>, fd: i32, vec: u64, vlen: u32, flags: u32) -> SysResult {
     let mut done = 0;
     for i in 0..vlen.min(MMSG_MAX) as u64 {
@@ -2581,8 +2690,8 @@ pub(super) fn sendmmsg(cx: &mut Cx<'_>, fd: i32, vec: u64, vlen: u32, flags: u32
     Ok(done)
 }
 
-/// recvmmsg：逐个 recvmsg。`MSG_WAITFORONE` 时收到第一个之后不再等待；超时只在
-/// 每收到一个之后检查，与 Linux 相同。
+/// recvmmsg: recvmsg one by one. With `MSG_WAITFORONE` it no longer waits after the first is
+/// received; the timeout is checked only after each one received, as on Linux.
 pub(super) fn recvmmsg(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -2623,7 +2732,7 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     } = read_msghdr(cx, msg)?;
     let total: usize = iovecs.iter().map(|v| v.1).sum();
     let m = recv(cx, &sock, nonblock, total, controllen.min(4096), flags)?;
-    // 数据按顺序分散到各个 iovec
+    // Scatter the data over the iovecs in order
     let mut off = 0;
     for (base, len) in iovecs {
         let n = len.min(m.data.len() - off);
@@ -2634,7 +2743,7 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
             .write(UserSlice::new(base, n), &m.data[off..off + n])?;
         off += n;
     }
-    // msg_namelen、msg_controllen、msg_flags 写回 msghdr
+    // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
     if name != 0 {
         let n = (namelen as usize).min(m.addr.len());
         cx.mm().write(UserSlice::new(name, n), &m.addr[..n])?;
@@ -2645,7 +2754,7 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         cx.mm().write(UserSlice::new(control, n), &m.control[..n])?;
     }
     put(cx, msg + 40, (n as u64).to_le_bytes())?;
-    // 与 Linux 一样，msg_flags 里回显调用方给的 MSG_CMSG_CLOEXEC
+    // As on Linux, msg_flags echoes the MSG_CMSG_CLOEXEC the caller gave
     const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
     put(
         cx,
@@ -2659,11 +2768,11 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     } as u64)
 }
 
-/// socket 的 ioctl：FIONREAD，以及接口信息（`SIOCGIF*`）。
+/// Socket ioctls: FIONREAD, and interface information (`SIOCGIF*`).
 pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
     const FIONREAD: u32 = 0x541b;
     const SIOCATMARK: u32 = 0x8905;
-    // 新的网络命名空间里的 socket：接口类 ioctl 只看到它的 lo（crate::netns）
+    // A socket in a new network namespace: interface ioctls see only its lo (crate::netns)
     let net = match &*sock.borrow() {
         Socket::Inet(s) => s.net.clone(),
         Socket::Netlink(s) => s.net.clone(),
@@ -2674,7 +2783,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
     {
         return netns_ioctl(cx, &ns, request, arg);
     }
-    // 开机时的命名空间里的虚拟设备（crate::netdev）：按名字、编号认出来的不交给宿主
+    // Virtual devices in the boot namespace (crate::netdev): those recognized by name or index are
+    // not handed to the host
     if (0x8910..0x8960).contains(&request)
         && request != 0x8912
         && let Ok(mut ifr) = get::<40>(cx, arg)
@@ -2686,8 +2796,9 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         }
     }
     let host_fd = match &*sock.borrow() {
-        // DNS 存根的回答在我们自己的队列里，先于宿主 socket 收到的读出（recvmsg 也是这样）：
-        // 数据报的 FIONREAD 是下一个数据报的长度。glibc 的解析器按它分配 AAAA 回答的缓冲区
+        // DNS stub answers are in our own queue and are read before what the host socket
+        // received (recvmsg does the same): a datagram's FIONREAD is the length of the next
+        // datagram. glibc's resolver sizes the buffer for the AAAA answer by it
         Socket::Inet(s) if request == FIONREAD && !s.answers.is_empty() => {
             let n = s.answers.front().map_or(0, Vec::len) as i32;
             return put(cx, arg, n.to_le_bytes()).map(|()| 0);
@@ -2699,7 +2810,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         Socket::Netlink(_) | Socket::Unix(_) => None,
     };
     match (request, host_fd) {
-        // 先问宿主（UDP 是 EINVAL），再写回 guest（地址不对是 EFAULT）
+        // Ask the host first (EINVAL for UDP), then write back to the guest (EFAULT for a bad
+        // address)
         (SIOCATMARK, Some(fd)) => {
             let mut b = [0u8; 4];
             appine_hal::ioctl(fd, request as u64, &mut b).map_err(Errno)?;
@@ -2712,8 +2824,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         }
         (FIONREAD, None) => Err(Errno::ENOTTY),
         (_, Some(fd)) => interface_ioctl(cx, fd, request, arg),
-        // 与 Linux 的 dev_ioctl 一样，接口类 ioctl 不管 socket 的地址族（musl 的
-        // if_nametoindex 用的就是 AF_UNIX socket）：借一个临时的宿主 socket
+        // As with Linux's dev_ioctl, interface ioctls do not care about the socket's address
+        // family (musl's if_nametoindex uses an AF_UNIX socket): borrow a temporary host socket
         (_, None) => {
             let fd = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).map_err(Errno)?;
             let r = interface_ioctl(cx, fd, request, arg);
@@ -2723,7 +2835,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
     }
 }
 
-/// 新的网络命名空间里的接口 ioctl：虚拟设备（[`crate::netdev`]）和 lo。
+/// Interface ioctls in a new network namespace: virtual devices ([`crate::netdev`]) and lo.
 fn netns_ioctl(
     cx: &mut Cx<'_>,
     ns: &Rc<crate::nsproxy::NetNs>,
@@ -2737,7 +2849,8 @@ fn netns_ioctl(
         let buf = u64::from_le_bytes(conf[8..].try_into().unwrap());
         let mut all = crate::netns::ifconf(ns);
         all.extend(crate::netdev::ifconf(ns));
-        // 缓冲区为空时只报告要多大；否则放得下几个整项写几个
+        // With an empty buffer only report how large it must be; otherwise write as many whole
+        // entries as fit
         let n = if buf == 0 {
             all.len()
         } else {
@@ -2757,7 +2870,7 @@ fn netns_ioctl(
             r?;
             put(cx, arg, ifr).map(|()| 0)
         }
-        // 别的修改（地址、MTU 等）不支持
+        // Other changes (address, MTU and so on) are not supported
         None if matches!(
             request,
             0x8916 | 0x8918 | 0x891a | 0x891c | 0x8923 | 0x8924 | 0x8943
@@ -2769,7 +2882,7 @@ fn netns_ioctl(
     }
 }
 
-/// 接口信息的 ioctl，透传给宿主 socket `host_fd`。
+/// Interface information ioctls, passed through to host socket `host_fd`.
 fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> SysResult {
     const SIOCGIFCONF: u32 = 0x8912;
     const SIOCGIFFLAGS: u32 = 0x8913;
@@ -2777,8 +2890,8 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
     const IFF_LOOPBACK: u16 = 0x8;
     const ARPHRD_ETHER: u16 = 1;
     const ARPHRD_LOOPBACK: u16 = 772;
-    // struct ifreq（40 字节）进、ifreq 出：SIOCGIFNAME、FLAGS、ADDR、DSTADDR、BRDADDR、
-    // NETMASK、MTU、HWADDR、INDEX、TXQLEN
+    // struct ifreq (40 bytes) in, ifreq out: SIOCGIFNAME, FLAGS, ADDR, DSTADDR, BRDADDR,
+    // NETMASK, MTU, HWADDR, INDEX, TXQLEN
     const IFREQ_GETTERS: [u32; 10] = [
         0x8910, 0x8913, 0x8915, 0x8917, 0x8919, 0x891b, 0x8921, 0x8927, 0x8933, 0x8942,
     ];
@@ -2787,7 +2900,8 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
             let mut b: [u8; 40] = get(cx, arg)?;
             appine_hal::ioctl(host_fd, r as u64, &mut b).map_err(Errno)?;
             if r == SIOCGIFHWADDR && b[16..18] == [0, 0] {
-                // Android 不让 App 读硬件地址，地址族也是 0：按接口是不是回环补上
+                // Android does not let apps read hardware addresses, and the address family is 0
+                // too: fill in according to whether the interface is loopback
                 let mut flags = b;
                 appine_hal::ioctl(host_fd, SIOCGIFFLAGS as u64, &mut flags).map_err(Errno)?;
                 let loopback = u16::from_le_bytes([flags[16], flags[17]]) & IFF_LOOPBACK != 0;
@@ -2800,14 +2914,16 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
             }
             put(cx, arg, b).map(|()| 0)
         }
-        // 修改接口（SIOCSIFFLAGS、ADDR、MTU 等）：App 改不了宿主的接口，与没有
-        // CAP_NET_ADMIN 时一样是 EPERM，先读参数（地址不对是 EFAULT）
+        // Changing interfaces (SIOCSIFFLAGS, ADDR, MTU and so on): the app cannot change the
+        // host's interfaces, so it is EPERM, as without CAP_NET_ADMIN, after reading the argument
+        // first (EFAULT for a bad address)
         0x8914 | 0x8916 | 0x8918 | 0x891a | 0x891c | 0x8922 | 0x8923 | 0x8924 | 0x8943 => {
             let _: [u8; 40] = get(cx, arg)?;
             Err(Errno::EPERM)
         }
         SIOCGIFCONF => {
-            // struct ifconf：长度和指向 guest 缓冲区的指针，换成宿主缓冲区
+            // struct ifconf: the length and the pointer to the guest buffer, replaced with a host
+            // buffer
             let conf: [u8; 16] = get(cx, arg)?;
             let len = i32::from_le_bytes(conf[..4].try_into().unwrap()).clamp(0, 1 << 16) as usize;
             let guest_buf = u64::from_le_bytes(conf[8..].try_into().unwrap());
@@ -2822,7 +2938,7 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
             req[8..].copy_from_slice(&ptr.to_le_bytes());
             appine_hal::ioctl(host_fd, SIOCGIFCONF as u64, &mut req).map_err(Errno)?;
             let got = i32::from_le_bytes(req[..4].try_into().unwrap()).max(0) as usize;
-            // 开机时的命名空间里的虚拟设备接在宿主的后面
+            // Virtual devices in the boot namespace come after the host's
             let extra = crate::netdev::ifconf(&cx.kr().init_ns.net);
             if guest_buf == 0 {
                 return put(cx, arg, ((got + extra.len()) as i32).to_le_bytes()).map(|()| 0);
@@ -2839,8 +2955,9 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
     }
 }
 
-/// 进程内的数据来过几次：[读方向, 写方向]（`syscall::poll` 的数据代数）。宿主 socket
-/// 上的数据不经过内核层，由 [`crate::fd::HostEdges`] 记录。
+/// How many times in-process data has arrived: [read direction, write direction]
+/// (`syscall::poll`'s data generations). Data on host sockets does not go through the kernel
+/// layer and is recorded by [`crate::fd::HostEdges`].
 pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
     match sock {
         Socket::Inet(InetSocket { icmp: Some(r), .. }) => {
@@ -2852,9 +2969,10 @@ pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
     }
 }
 
-/// ppoll、epoll 等 socket 时登记的唤醒对象（`poll::wake_objects`）：AF_UNIX 的 channel；
-/// 宿主 socket 和 netlink 是 socket 自己。宿主 socket 上的数据由宿主 poll 等，关闭它
-/// （等它的线程的宿主 poll 要放手）、DNS 存根和 netlink 的回答请求它。
+/// The wake objects ppoll and epoll register when waiting on a socket (`poll::wake_objects`): the
+/// channels for AF_UNIX; the socket itself for host sockets and netlink. Data on host sockets is
+/// waited for by the host poll; closing the socket (the host poll of threads waiting on it must
+/// let go), DNS stub answers and netlink answers request a wake of it.
 pub(crate) fn wake_objects(sock: &RefCell<Socket>, out: &mut Vec<wake::Object>) {
     match &*sock.borrow() {
         Socket::Unix(u) => u.wake_objects(out),
@@ -2862,12 +2980,13 @@ pub(crate) fn wake_objects(sock: &RefCell<Socket>, out: &mut Vec<wake::Object>) 
     }
 }
 
-/// ppoll、epoll 用的就绪状态：(已经知道的事件, 需要问宿主的 fd)。
+/// The readiness for ppoll and epoll: (events already known, the fd to ask the host about).
 pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
     const POLLRDNORM: i16 = 0x040;
     const POLLWRNORM: i16 = 0x100;
     match sock {
-        // raw ICMP socket 收到的在汇集点的队列里（crate::rawicmp），由定时器线程取下来
+        // What a raw ICMP socket receives is in the aggregation point's queue (crate::rawicmp),
+        // taken off by the timer thread
         Socket::Inet(s @ InetSocket { icmp: Some(r), .. }) => {
             let key = wake::of_value(sock);
             let ready = crate::rawicmp::queued(&r.tap, key).0;
@@ -2876,8 +2995,9 @@ pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
             let err = if errors { POLLERR } else { 0 };
             (read | err | POLLOUT | POLLWRNORM, None)
         }
-        // 汇集点看着的 UDP socket：宿主替它记下的 ICMP 错误让宿主 poll 报告 POLLERR，先取走，
-        // 要报告给 guest 的另外记着
+        // A UDP socket the aggregation point watches: the ICMP errors the host recorded for it
+        // make the host poll report POLLERR, so take them off first; the one to report to the
+        // guest is kept separately
         Socket::Inet(s) if s.udp_tap.is_some() => {
             if let Some(t) = &s.udp_tap {
                 let _ = crate::rawicmp::dispatch(t, Some(s.fd));

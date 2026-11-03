@@ -1,13 +1,15 @@
-//! `SO_ORIGINAL_DST`（docs/rounds/180-original-dst.md）：透明代理（iptables 的 REDIRECT 配上
-//! `sslocal --protocol redir`、redsocks、clash 的 redir-port 这类）在接受的连接上问它原来要连
-//! 哪里。Linux 由连接跟踪回答（`nf_conntrack_proto.c` 的 `getorigdst`、`ipv6_getorigdst`）。
+//! `SO_ORIGINAL_DST` (docs/rounds/180-original-dst.md): transparent proxies (iptables REDIRECT
+//! paired with `sslocal --protocol redir`, redsocks, clash's redir-port and the like) ask it, on an
+//! accepted connection, where the connection originally wanted to go. Linux answers it from
+//! connection tracking (`getorigdst` and `ipv6_getorigdst` in `nf_conntrack_proto.c`).
 //!
-//! appine 没有连接跟踪：nat 在 connect 时由 socket 层做（[`crate::nft`]，
-//! `syscall::net::route`），宿主上的连接连的就是 nat 之后的地址。所以 connect 时把被 nat 换过
-//! 目的地址的 TCP 连接按宿主上的四元组记在这里（[`Table::register`]），接受连接的一端在 accept
-//! 时按同一个四元组领走自己的命名空间里看到的原目的地址（[`Table::claim`]），之后记在 socket
-//! 上（[`crate::net::Track::orig_dst`]）。客户端在 accept 之前就关掉了也照样领得到（Linux 的
-//! 连接跟踪条目也还在）。
+//! appine has no connection tracking: nat is done by the socket layer at connect time
+//! ([`crate::nft`], `syscall::net::route`), and the connection on the host goes to the address
+//! after nat. So at connect time, TCP connections whose destination nat rewrote are recorded here
+//! by their 4-tuple on the host ([`Table::register`]); at accept time the accepting end claims, by
+//! the same 4-tuple, the original destination seen in its own namespace ([`Table::claim`]), which
+//! is then kept on the socket ([`crate::net::Track::orig_dst`]). It can still be claimed when the
+//! client closed before the accept (Linux's connection-tracking entry is still there too).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -15,10 +17,11 @@ use std::time::{Duration, Instant};
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
-/// 宿主上的一端：IPv6 地址（IPv4 的写成 IPv4 映射的，两种 socket 连起来也对得上）和端口。
+/// One end on the host: an IPv6 address (IPv4 ones are written IPv4-mapped, so the two kinds of
+/// socket still match up when connected to each other) and a port.
 pub(crate) type End = ([u8; 16], u16);
 
-/// 宿主的 sockaddr 换成 [`End`]；不是 IPv4、IPv6 的是 None。
+/// Converts a host sockaddr into an [`End`]; None for anything other than IPv4 or IPv6.
 pub(crate) fn end_of(addr: &[u8]) -> Option<End> {
     let family = u16::from_le_bytes([*addr.first()?, *addr.get(1)?]);
     let port = u16::from_be_bytes([*addr.get(2)?, *addr.get(3)?]);
@@ -34,35 +37,38 @@ pub(crate) fn end_of(addr: &[u8]) -> Option<End> {
     Some((ip, port))
 }
 
-/// 还没被领走的记录最多留这么久（Linux 连接跟踪里 SYN_SENT、TIME_WAIT 的超时都是 120 秒），
-/// 最多这么多条（满了丢最早的）。连到 appine 外面的监听（手机上别的 App）的永远没人领。
+/// Records not yet claimed are kept at most this long (Linux connection tracking's timeouts for
+/// SYN_SENT and TIME_WAIT are both 120 seconds), and at most this many (when full the oldest is
+/// dropped). Connections to listeners outside appine (other apps on the phone) are never claimed.
 const KEEP: Duration = Duration::from_secs(120);
 const MAX: usize = 4096;
 
-/// 被 nat 的 TCP 连接，按 (客户端在宿主上的本端, 宿主上连的目的地) 记。
+/// TCP connections that went through nat, keyed by (the client's local end on the host, the
+/// destination connected to on the host).
 #[derive(Default)]
 pub(crate) struct Table {
     entries: HashMap<(End, End), Entry>,
-    /// 上次清掉过期记录的时刻：最多每秒一次。
+    /// When expired records were last pruned: at most once a second.
     pruned: Option<Instant>,
 }
 
 struct Entry {
-    /// 各个网络命名空间（[`crate::nsproxy::NetNs::id`]）里看到的原目的地址（guest 的
-    /// sockaddr）：发起连接的命名空间里是 OUTPUT nat 之前的，进入的别的命名空间里是那里的
-    /// PREROUTING nat 之前的。
+    /// The original destination (a guest sockaddr) seen in each network namespace
+    /// ([`crate::nsproxy::NetNs::id`]): in the namespace that made the connection it is the one
+    /// before OUTPUT nat, in other namespaces it entered the one before their PREROUTING nat.
     origs: Vec<(u64, Vec<u8>)>,
     born: Instant,
 }
 
 impl Table {
-    /// 没有记录：connect、accept 不必再取宿主上的地址。
+    /// No records: connect and accept need not fetch the addresses on the host.
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// connect 发出了连接（宿主上 `key` 这个四元组）：`origs` 是被 nat 换过目的地址的命名空间
-    /// 和那里看到的原目的地址，空的是没有被 nat，这时去掉同一个四元组以前留下的记录。
+    /// connect made a connection (the 4-tuple `key` on the host): `origs` are the namespaces where
+    /// nat rewrote the destination and the original destination seen there; empty means no nat, in
+    /// which case records earlier left for the same 4-tuple are removed.
     pub(crate) fn register(&mut self, key: (End, End), origs: Vec<(u64, Vec<u8>)>) {
         if origs.is_empty() {
             if !self.entries.is_empty() {
@@ -92,8 +98,9 @@ impl Table {
         self.entries.insert(key, Entry { origs, born: now });
     }
 
-    /// accept 出来的连接（宿主上的对端、本端是 `key`）在命名空间 `ns` 里：领走那里看到的原
-    /// 目的地址。整条记录都去掉（一个连接只有一个接受的一端）。
+    /// A connection from accept (whose peer and local end on the host are `key`) in namespace
+    /// `ns`: claims the original destination seen there. The whole record is removed (a connection
+    /// has only one accepting end).
     pub(crate) fn claim(&mut self, key: (End, End), ns: u64) -> Option<Vec<u8>> {
         if self.entries.is_empty() {
             return None;
@@ -106,9 +113,10 @@ impl Table {
     }
 }
 
-/// `getsockopt` 的回答：guest 的 sockaddr `addr` 写成 `sockaddr_in`（`SOL_IP`，16 字节，
-/// IPv4 映射的地址取出 IPv4 的）或者 `sockaddr_in6`（`SOL_IPV6`，28 字节；流标签、
-/// scope id 是 0：appine 不支持设流标签，链路本地地址到不了别的命名空间）。
+/// The `getsockopt` answer: the guest sockaddr `addr` written as a `sockaddr_in` (`SOL_IP`, 16
+/// bytes, the IPv4 address taken out of an IPv4-mapped one) or a `sockaddr_in6` (`SOL_IPV6`, 28
+/// bytes; flow label and scope id are 0: appine does not support setting flow labels, and
+/// link-local addresses cannot reach other namespaces).
 pub(crate) fn encode(addr: &[u8], v6: bool) -> Option<Vec<u8>> {
     let (ip, port) = end_of(addr)?;
     let port = port.to_be_bytes();
@@ -130,8 +138,8 @@ pub(crate) fn encode(addr: &[u8], v6: bool) -> Option<Vec<u8>> {
     }
 }
 
-/// guest 的 sockaddr 是不是 IPv6 的连接（不是 IPv4、也不是 IPv4 映射的地址）：连接跟踪按
-/// 包的协议族分开。
+/// Whether the guest sockaddr is an IPv6 connection (neither IPv4 nor an IPv4-mapped address):
+/// connection tracking keeps packets apart by protocol family.
 pub(crate) fn is_v6(addr: &[u8]) -> bool {
     end_of(addr).is_some_and(|(ip, _)| ip[..12] != [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff])
 }
@@ -185,16 +193,16 @@ mod tests {
         );
         let orig = v4([127, 0, 0, 2], 2290);
         t.register(key, vec![(1, orig.clone()), (7, v4([10, 0, 0, 2], 80))]);
-        // 别的四元组领不到
+        // Other 4-tuples cannot claim it
         let other = (key.1, key.0);
         assert_eq!(t.claim(other, 1), None);
         assert_eq!(t.claim(key, 1), Some(orig.clone()));
         assert_eq!(t.claim(key, 1), None);
-        // 不是记下的命名空间：领不到，记录也去掉
+        // Not the recorded namespace: nothing to claim, and the record is removed too
         t.register(key, vec![(1, orig.clone())]);
         assert_eq!(t.claim(key, 2), None);
         assert_eq!(t.claim(key, 1), None);
-        // 同一个四元组后来没被 nat 的连接盖掉旧的
+        // A later connection on the same 4-tuple without nat replaces the old record
         t.register(key, vec![(1, orig)]);
         t.register(key, Vec::new());
         assert_eq!(t.claim(key, 1), None);

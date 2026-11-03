@@ -1,17 +1,24 @@
-//! 网络接口和协议的流量计数（kernel/net 的 map）：`/proc/net/dev`、`/sys/class/net/<接口>/statistics/`
-//! 和 netlink 的 `IFLA_STATS`、`IFLA_STATS64` 取自接口的计数，`/proc/net/snmp`、`netstat`
-//! 取自协议的计数（[`Protocols`]）。
+//! Traffic counters for network interfaces and protocols (the kernel/net map): `/proc/net/dev`,
+//! `/sys/class/net/<interface>/statistics/` and netlink's `IFLA_STATS` and `IFLA_STATS64` come
+//! from the interface counters, `/proc/net/snmp` and `netstat` from the protocol counters
+//! ([`Protocols`]).
 //!
-//! Android 上 App 读不到宿主的计数（`/proc/net` 和 netlink 的 `RTM_GETLINK` 都被拦住），
-//! 宿主的计数里也还有 App 自己和别的 App 的流量。guest 的 TCP、UDP、ping socket 都经过内核层
-//! 收发，这里自己数：和容器里看到的是自己网络命名空间里的流量一样，只有 guest 的。
+//! On Android the app cannot read the host's counters (`/proc/net` and netlink's `RTM_GETLINK`
+//! are both blocked), and the host's counters also include the traffic of the app itself and of
+//! other apps. The guest's TCP, UDP and ping sockets all send and receive through the kernel
+//! layer, so they are counted here: only the guest's traffic, just as a container sees the traffic
+//! of its own network namespace.
 //!
-//! - 只数载荷，不含协议头、ACK 和重传；流式 socket 的包数按接口的 MTU 减去 IPv4、TCP 头和
-//!   时间戳选项估计，数据报一个算一个。
-//! - 接口按 socket 的本端地址认：那是宿主选路的结果，第一次收发时取一次（getsockname），记在
-//!   socket 上，bind、connect 时重新认。本端是通配地址（没有 connect 的 UDP、ping）时也记下，
-//!   之后每一次按这一次的对端认：回环地址算回环接口，别的算默认接口。
-//! - DNS 存根的查询和回答不经过宿主 socket，不算；AF_UNIX 不是网络接口上的流量。
+//! - Only payload is counted, without protocol headers, ACKs and retransmissions; packet counts of
+//!   stream sockets are estimated from the interface's MTU minus the IPv4 and TCP headers and the
+//!   timestamp option, and each datagram counts as one.
+//! - The interface is identified by the socket's local address: that is the result of the host's
+//!   routing, taken once at the first send or receive (getsockname), kept on the socket, and
+//!   identified again on bind and connect. When the local end is a wildcard address (UDP without
+//!   connect, ping) that is recorded too, and afterwards every call is identified by that call's
+//!   peer: loopback addresses count on the loopback interface, others on the default interface.
+//! - DNS stub queries and answers do not go through host sockets and are not counted; AF_UNIX is
+//!   not traffic on a network interface.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -21,7 +28,7 @@ use crate::net::{
     AF_INET, AF_INET6, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, InetSocket, SOCK_DGRAM, SOCK_STREAM,
 };
 
-/// 一个接口的计数。
+/// The counters of one interface.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct IfStats {
     pub rx_bytes: u64,
@@ -30,11 +37,13 @@ pub(crate) struct IfStats {
     pub tx_packets: u64,
 }
 
-/// 协议的计数（`/proc/net/snmp`、`netstat`，[`crate::net::proc_snmp`]）。与接口的计数一样
-/// 只数 guest 经由内核层收发的载荷，包数（IP 的包、TCP 的段）是估计的，握手、ACK、重传
-/// 都不算。IP、UDP、ICMP 的只数 IPv4（IPv6 socket 上 IPv4 映射的地址也算），TCP 的不分
-/// 地址族，与 Linux 一样。ICMP 只有 ping socket 自己的回显请求和回答，回环地址上答复
-/// 请求的是宿主，不算。
+/// Protocol counters (`/proc/net/snmp`, `netstat`, [`crate::net::proc_snmp`]). Like the interface
+/// counters they count only the payload the guest sends and receives through the kernel layer;
+/// packet counts (IP packets, TCP segments) are estimates, and handshakes, ACKs and
+/// retransmissions are not counted. IP, UDP and ICMP count only IPv4 (IPv4-mapped addresses on
+/// IPv6 sockets included), TCP does not distinguish address families, as on Linux. ICMP covers
+/// only the ping sockets' own echo requests and replies; on loopback addresses it is the host that
+/// answers the requests, and that is not counted.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct Protocols {
     pub ip_in_packets: u64,
@@ -43,9 +52,10 @@ pub(crate) struct Protocols {
     pub ip_out_octets: u64,
     pub icmp_in_echo_replies: u64,
     pub icmp_out_echoes: u64,
-    /// 宿主发出了 SYN 的 connect（`syscall::net::count_connect`）。
+    /// Connects for which the host sent a SYN (`syscall::net::count_connect`).
     pub tcp_active_opens: u64,
-    /// accept 到的连接。Linux 在握手完成时数，还没有被 accept 的这里看不到。
+    /// Connections accepted. Linux counts them when the handshake completes; ones not yet accepted
+    /// are not seen here.
     pub tcp_passive_opens: u64,
     pub tcp_attempt_fails: u64,
     pub tcp_in_segs: u64,
@@ -54,39 +64,45 @@ pub(crate) struct Protocols {
     pub udp_out_datagrams: u64,
 }
 
-/// socket 认定的接口和估计包数用的 MSS，记在 [`InetSocket`] 上。`iface` 为 None 时本端是
-/// 通配地址，每一次按对端认。
+/// The interface a socket is identified with and the MSS for estimating packet counts, kept on
+/// [`InetSocket`]. When `iface` is None the local end is a wildcard address and every call is
+/// identified by its peer.
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
     pub iface: Option<Rc<str>>,
     pub mss: u32,
-    /// 本端地址是 IPv4 的（IPv4 映射的也算）。本端是 IPv6 的通配地址时，每一次按对端认。
+    /// The local address is IPv4 (IPv4-mapped included). When the local end is the IPv6 wildcard
+    /// address, every call is identified by its peer.
     pub v4: bool,
 }
 
-/// 地址表过了这么久再用时重新取：网络切换之后，新的 socket 认得出新的接口。
+/// The address table is fetched again when it is used after this long: after a network switch,
+/// new sockets recognize the new interfaces.
 const TABLE_TTL: Duration = Duration::from_secs(5);
-/// 本端地址不在表里时（网络刚变）重新取表，但两次之间至少隔这么久。
+/// When a local address is not in the table (the network just changed) the table is fetched again,
+/// but at least this long apart.
 const MISS_REFRESH: Duration = Duration::from_secs(1);
-/// MTU 里 IPv4、TCP 头和时间戳选项占的字节：剩下的是 MSS。
+/// The bytes of an MTU taken by the IPv4 and TCP headers and the timestamp option: the rest is the
+/// MSS.
 const TCP_OVERHEAD: u32 = 52;
 
 const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
 
-/// 宿主接口的地址表。
+/// The address table of the host's interfaces.
 struct Table {
     at: Instant,
-    /// (地址, 接口名, MSS)：IPv4 是 4 字节，IPv6 是 16 字节。
+    /// (address, interface name, MSS): 4 bytes for IPv4, 16 bytes for IPv6.
     addrs: Vec<(Vec<u8>, Rc<str>, u32)>,
-    /// 回环接口。
+    /// The loopback interface.
     lo: Rc<str>,
-    /// 默认接口：发往公网时宿主选的本端地址所在的接口。
+    /// The default interface: the interface of the local address the host chooses for sending to
+    /// the internet.
     default: Rc<str>,
 }
 
 impl Table {
-    /// 接口 `name` 上的 MSS；它没有地址时按以太网的 MTU。
+    /// The MSS on interface `name`; with no address on it, by Ethernet's MTU.
     fn mss_of(&self, name: &str) -> u32 {
         self.addrs
             .iter()
@@ -102,7 +118,7 @@ impl Table {
     }
 }
 
-/// 各接口的计数，在 [`crate::kernel::Kernel`] 里，按接口名记。
+/// Per-interface counters, in [`crate::kernel::Kernel`], keyed by interface name.
 #[derive(Default)]
 pub(crate) struct Traffic {
     stats: BTreeMap<Rc<str>, IfStats>,
@@ -111,13 +127,13 @@ pub(crate) struct Traffic {
 }
 
 impl Traffic {
-    /// 接口 `name` 的计数。
+    /// The counters of interface `name`.
     pub fn get(&self, name: &str) -> IfStats {
         self.stats.get(name).copied().unwrap_or_default()
     }
 
-    /// 记下 socket `s` 收到（`rx`）或者发出的 `bytes` 字节。`peer` 是这一次的对端地址
-    /// （sendto 的目标、recvfrom 的来源，sockaddr 的字节），可能为空。
+    /// Records `bytes` bytes received (`rx`) or sent by socket `s`. `peer` is this call's peer
+    /// address (the sendto target or the recvfrom source, as sockaddr bytes), and may be empty.
     pub fn account(&mut self, s: &mut InetSocket, rx: bool, bytes: usize, peer: &[u8]) {
         if bytes == 0 && s.ty == SOCK_STREAM {
             return;
@@ -167,7 +183,8 @@ impl Traffic {
         }
     }
 
-    /// socket `s` 这一次的流量算在哪个接口上，和那个接口上 TCP 的 MSS（模块文档）。
+    /// Which interface this call's traffic of socket `s` counts on, and the TCP MSS on that
+    /// interface (module docs).
     fn route(&mut self, s: &mut InetSocket, peer: &[u8]) -> (Rc<str>, u32) {
         if s.route.is_none() {
             let local = appine_hal::net::sockname(s.fd, false)
@@ -187,7 +204,8 @@ impl Traffic {
                     mss: 0,
                     v4: ip.len() == 4,
                 }),
-                // 取不到本端地址：这一次按对端认，下一次再取
+                // The local address is unavailable: identify this call by its peer and try again
+                // next time
                 None => None,
             };
         }
@@ -207,7 +225,7 @@ impl Traffic {
         }
     }
 
-    /// 本端地址 `ip` 所在的接口和那里的 MSS。
+    /// The interface of local address `ip` and the MSS there.
     fn iface_of(&mut self, ip: &[u8]) -> (Rc<str>, u32) {
         if let Some(n) = self.table().lookup(ip) {
             return n;
@@ -226,7 +244,7 @@ impl Traffic {
         })
     }
 
-    /// 地址表，过期了先重新取。
+    /// The address table, fetched again first if it has expired.
     fn table(&mut self) -> &Table {
         if self
             .table
@@ -279,8 +297,8 @@ impl Traffic {
     }
 }
 
-/// 宿主发往公网时选的本端地址（[`appine_hal::net::source_for`]），没有这个地址族的路由时
-/// 是 None。
+/// The local address the host chooses for sending to the internet
+/// ([`appine_hal::net::source_for`]), or None when there is no route for this address family.
 pub(crate) fn outgoing_source(family: i32) -> Option<Vec<u8>> {
     let dst: &[u8] = if family == AF_INET {
         &[8, 8, 8, 8]
@@ -292,7 +310,8 @@ pub(crate) fn outgoing_source(family: i32) -> Option<Vec<u8>> {
     appine_hal::net::source_for(dst).ok()
 }
 
-/// sockaddr 里的 IP 地址：IPv4 是 4 字节，IPv6 是 16 字节，IPv4 映射的 IPv6 地址按 IPv4。
+/// The IP address in a sockaddr: 4 bytes for IPv4, 16 bytes for IPv6, and an IPv4-mapped IPv6
+/// address as IPv4.
 fn ip_of(addr: &[u8]) -> Option<Vec<u8>> {
     let family = u16::from_ne_bytes(addr.get(..2)?.try_into().ok()?) as i32;
     match family {
@@ -343,7 +362,8 @@ mod tests {
         assert_eq!(ip_of(&[1, 0, b'/', 0]), None);
     }
 
-    /// 回环上的 TCP 连接：两端都算在回环接口上，字节数是载荷，包数按 MSS 估计。
+    /// TCP connections on loopback: both ends count on the loopback interface, bytes are payload,
+    /// and packet counts are estimated from the MSS.
     #[test]
     fn loopback_connections_count_on_the_loopback_interface() {
         use std::net::{TcpListener, TcpStream};
@@ -362,7 +382,7 @@ mod tests {
         let route = a.route.clone().unwrap();
         let mss = route.mss as u64;
         assert_eq!(route.iface.as_deref(), Some(&*lo));
-        // 回环的 MTU 65536 减去协议头
+        // Loopback's MTU 65536 minus the protocol headers
         assert_eq!(mss, 65536 - 52);
         let st = t.get(&lo);
         assert_eq!((st.tx_bytes, st.rx_bytes), (100_000, 100_000));
@@ -373,7 +393,8 @@ mod tests {
         );
     }
 
-    /// 没有 connect 的 UDP：本端是通配地址，记下这一点，每一次按对端认接口。
+    /// UDP without connect: the local end is a wildcard address; this is recorded and every call
+    /// identifies the interface by its peer.
     #[test]
     fn unconnected_datagrams_count_by_peer() {
         let fd = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();

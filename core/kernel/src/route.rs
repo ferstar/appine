@@ -1,23 +1,32 @@
-//! 路由表（kernel/net 的 map）：netlink 的 `RTM_GETROUTE`（`ip route`、`ip route get`）、
-//! `RTM_GETRULE`（`ip rule`），`/proc/net/route` 和 `/proc/net/ipv6_route`。
+//! The routing table (the kernel/net map): netlink's `RTM_GETROUTE` (`ip route`, `ip route get`)
+//! and `RTM_GETRULE` (`ip rule`), `/proc/net/route` and `/proc/net/ipv6_route`.
 //!
-//! Android 10 起 App 读不了宿主的 `/proc/net`，targetSdk ≥ 30 也不能 bind `NETLINK_ROUTE`，
-//! 宿主的路由表不能直接转给 guest。这里按 Linux 没有自定义规则时的样子拼出两张表：
+//! Since Android 10 apps cannot read the host's `/proc/net`, and with targetSdk ≥ 30 they cannot
+//! bind `NETLINK_ROUTE` either, so the host's routing table cannot be passed to the guest directly.
+//! Instead two tables are assembled here the way Linux has them without custom rules:
 //!
-//! - 主表（main）：宿主的路由。Android 上由 App 从默认网络的 `LinkProperties` 取，交给
-//!   [`crate::Machine::set_routes`]；别的宿主上读宿主的（[`appine_hal::net::routes`]）。都
-//!   没有时按接口的地址合成：每个地址所在的网段一条，再加一条走默认接口（宿主发往公网时
-//!   选的本端地址所在的接口）、没有网关的默认路由。没有网关、正好是接口上某个地址所在网段
-//!   的路由与 Linux 一样算内核加的（proto kernel，IPv4 还带首选源地址），别的算 boot。
-//! - 本地表（local）：按接口的地址合成，与 Linux 的 `fib_add_ifaddr`、addrconf 加的相同：
-//!   IPv4 每个地址一条 local、一条网段的广播（回环接口上网段本身也是 local），IPv6 每个
-//!   地址一条 local，每个有 IPv6 地址的非回环接口一条 `ff00::/8` 的多播。
+//! - The main table: the host's routes. On Android the app takes them from the default network's
+//!   `LinkProperties` and hands them to [`crate::Machine::set_routes`]; on other hosts the host's
+//!   own are read ([`appine_hal::net::routes`]). When neither exists they are synthesized from
+//!   the interface addresses: one per subnet of each address, plus a default route without a
+//!   gateway through the default interface (the interface of the local address the host chooses
+//!   for sending to the internet). Routes without a gateway that are exactly the subnet of an
+//!   address on the interface count as added by the kernel, as on Linux (proto kernel, with a
+//!   preferred source address for IPv4); the others count as boot.
+//! - The local table: synthesized from the interface addresses, the same as what Linux's
+//!   `fib_add_ifaddr` and addrconf add: for IPv4, one local entry per address and one broadcast
+//!   entry for the subnet (on the loopback interface the subnet itself is local too); for IPv6, one
+//!   local entry per address, and one `ff00::/8` multicast entry per non-loopback interface with an
+//!   IPv6 address.
 //!
-//! 条目的顺序与 Linux 转储的顺序相同：IPv4 按目标地址从小到大、同一地址前缀长的在前（fib
-//! trie 的叶子），IPv6 按 fib6 树的后序（分叉处 0 在前，子网在包含它的网段之前）；主表在
-//! 本地表之前。`ip route get` 的源地址由宿主选（[`appine_hal::net::source_for`]），出口接口是
-//! 那个地址所在的接口，网关按主表里的最长前缀匹配；目标是本机地址时是 local，走回环接口。
-//! 规则只有 Linux 默认的几条。
+//! Entries are in the same order as Linux's dumps: IPv4 by destination address ascending, longer
+//! prefixes first for the same address (the leaves of the fib trie); IPv6 in the post-order of the
+//! fib6 tree (0 first at a fork, a subnet before the subnet containing it); the main table before
+//! the local table. For `ip route get` the host chooses the source address
+//! ([`appine_hal::net::source_for`]), the output interface is the interface of that address, and
+//! the gateway comes from the longest prefix match in the main table; when the destination is a
+//! local address it is local, through the loopback interface. The rules are only Linux's default
+//! ones.
 
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -49,26 +58,27 @@ const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
 const RTA_PREF: u16 = 20;
 const RTA_UID: u16 = 25;
-/// rtm_flags：`ip route get` 的回答是路由缓存里的条目；要的是匹配到的那条路由本身。
+/// rtm_flags: `ip route get`'s answer is an entry in the route cache; the matched route itself is
+/// what is asked for.
 const RTM_F_CLONED: u32 = 0x200;
 const RTM_F_FIB_MATCH: u32 = 0x2000;
-/// 路由缓存条目的 rt_flags（`ip route get` 的 `cache <local>` 等）。
+/// rt_flags of route-cache entries (`ip route get`'s `cache <local>` and so on).
 const RTCF_BROADCAST: u32 = 0x1000_0000;
 const RTCF_MULTICAST: u32 = 0x2000_0000;
 const RTCF_LOCAL: u32 = 0x8000_0000;
 const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
-/// IPv6 路由的默认度量：内核按地址加的网段，和没有指定度量的路由（Linux 的
-/// `IP6_RT_PRIO_ADDRCONF`、`IP6_RT_PRIO_USER`）。
+/// Default metrics of IPv6 routes: subnets the kernel adds for addresses, and routes without a
+/// specified metric (Linux's `IP6_RT_PRIO_ADDRCONF`, `IP6_RT_PRIO_USER`).
 const IP6_METRIC_ADDRCONF: u32 = 256;
 const IP6_METRIC_USER: u32 = 1024;
 
-/// 路由表里的一条路由。
+/// One route in the routing table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub family: i32,
     pub table: u8,
-    /// `RTN_*`。
+    /// `RTN_*`.
     pub ty: u8,
     pub proto: u8,
     pub scope: u8,
@@ -79,14 +89,16 @@ pub(crate) struct Entry {
     pub iface: String,
     pub index: u32,
     pub metric: u32,
-    /// rtm_flags：下一跳的接口没有载波时是 `RTNH_F_LINKDOWN`（虚拟设备上的路由）。
+    /// rtm_flags: `RTNH_F_LINKDOWN` when the next hop's interface has no carrier (routes on virtual
+    /// devices).
     pub flags: u32,
-    /// 宿主的路由（开机时的命名空间里宿主的接口上的）：`ip route get` 的源地址由宿主选。
-    /// 虚拟设备（[`crate::netdev`]）、新的命名空间里的是 false。
+    /// A host route (on the host's interfaces in the boot namespace): for `ip route get` the host
+    /// chooses the source address. False for virtual devices ([`crate::netdev`]) and in new
+    /// namespaces.
     pub host: bool,
 }
 
-/// `addr` 的前 `prefix` 位，其余清零。
+/// The first `prefix` bits of `addr`, with the rest cleared.
 pub(crate) fn network(addr: &[u8], prefix: u8) -> Vec<u8> {
     addr.iter()
         .enumerate()
@@ -101,7 +113,7 @@ pub(crate) fn network(addr: &[u8], prefix: u8) -> Vec<u8> {
         .collect()
 }
 
-/// IPv4 网段的广播地址：前 `prefix` 位之后全是 1。
+/// The broadcast address of an IPv4 subnet: all ones after the first `prefix` bits.
 fn broadcast(addr: &[u8], prefix: u8) -> Vec<u8> {
     let mask = u32::MAX.checked_shr(prefix as u32).unwrap_or(0);
     (u32::from_be_bytes(addr.try_into().unwrap()) | mask)
@@ -113,7 +125,7 @@ fn bit(addr: &[u8], n: usize) -> u8 {
     (addr[n / 8] >> (7 - n % 8)) & 1
 }
 
-/// 同一张表里两条路由在 Linux 转储里的先后（模块文档）。
+/// The order of two routes of the same table in Linux's dumps (module docs).
 fn order(a: &Entry, b: &Entry) -> Ordering {
     if a.family == AF_INET {
         let key = |e: &Entry| u32::from_be_bytes(e.dst[..4].try_into().unwrap());
@@ -126,12 +138,13 @@ fn order(a: &Entry, b: &Entry) -> Ordering {
         .unwrap_or_else(|| b.prefix.cmp(&a.prefix))
 }
 
-/// 宿主发往公网时走的接口（[`crate::traffic`] 的默认接口），没有这个地址族的路由时是 None。
+/// The interface the host uses for sending to the internet ([`crate::traffic`]'s default
+/// interface), or None when there is no route for this address family.
 fn default_iface(ifaces: &[Interface], family: i32) -> Option<&Interface> {
     owner(ifaces, &crate::traffic::outgoing_source(family)?)
 }
 
-/// 地址 `ip` 所在的接口。
+/// The interface that has address `ip`.
 fn owner<'a>(ifaces: &'a [Interface], ip: &[u8]) -> Option<&'a Interface> {
     ifaces
         .iter()
@@ -142,8 +155,9 @@ fn up(ifaces: &[Interface]) -> impl Iterator<Item = &Interface> {
     ifaces.iter().filter(|i| i.flags & IFF_UP != 0)
 }
 
-/// 主表和本地表的所有路由，按 Linux 转储的顺序：IPv4 的主表、本地表，IPv6 的主表、本地表。
-/// `host` 是宿主主表里的路由（模块文档），None 时按接口的地址合成。
+/// All routes of the main and local tables, in Linux's dump order: IPv4 main and local, then IPv6
+/// main and local. `host` is the routes of the host's main table (module docs); when it is None
+/// they are synthesized from the interface addresses.
 pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entry> {
     let entry = |family, table, ty, i: &Interface| Entry {
         family,
@@ -166,7 +180,7 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
         Some(routes) => {
             for r in routes {
                 let i = ifaces.iter().find(|i| i.name == r.iface);
-                // 接口上的地址所在的网段：内核按地址加的
+                // The subnet of an address on the interface: added by the kernel for the address
                 let addr = i.filter(|_| r.gateway.is_none()).and_then(|i| {
                     i.addrs.iter().find(|(f, a, p)| {
                         *f == r.family && *p == r.prefix && network(a, *p) == r.dst
@@ -282,7 +296,8 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
                 .cloned()
                 .collect();
             part.sort_by(order);
-            // 同一个接口上同一网段的两个地址：网段和广播只有一条
+            // Two addresses in the same subnet on the same interface: only one subnet and one
+            // broadcast entry
             part.dedup_by(|a, b| {
                 (a.ty, &a.dst, a.prefix, a.index) == (b.ty, &b.dst, b.prefix, b.index)
             });
@@ -292,8 +307,9 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
     all
 }
 
-/// 把两组路由（各自按 Linux 的顺序）合在一起：按地址族（IPv4 在前）、表的编号、表里的
-/// 顺序（[`order`]）排，同样的保持原来的先后（`a` 的在 `b` 的前面）。
+/// Merges two sets of routes (each in Linux's order): sorted by address family (IPv4 first),
+/// table number and order within the table ([`order`]), keeping equal ones in their original
+/// order (`a`'s before `b`'s).
 pub(crate) fn merge(a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
     let mut all = a;
     all.extend(b);
@@ -307,7 +323,8 @@ pub(crate) fn merge(a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
     all
 }
 
-/// 宿主主表里的路由：宿主交来的（[`crate::Machine::set_routes`]），没有时读宿主的。
+/// The routes of the host's main table: the ones the host handed over
+/// ([`crate::Machine::set_routes`]), otherwise the host's own read directly.
 pub(crate) fn host_routes(k: &crate::kernel::Kernel) -> Option<Vec<Route>> {
     k.host_routes.clone().or_else(appine_hal::net::routes)
 }
@@ -318,7 +335,7 @@ fn put(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
     crate::net::attr(b, ty, data);
 }
 
-/// struct rtmsg：family、dst_len、src_len、tos、table、protocol、scope、type、flags。
+/// struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags.
 #[allow(clippy::too_many_arguments)]
 fn rtmsg(
     family: i32,
@@ -335,15 +352,15 @@ fn rtmsg(
     p
 }
 
-/// struct rta_cacheinfo：clntref、lastuse、expires、error、used、id、ts、tsage。`ip route get`
-/// 的回答里 clntref 是缓存条目的引用数，取 Linux 上常见的 2。
+/// struct rta_cacheinfo: clntref, lastuse, expires, error, used, id, ts, tsage. In the answer of
+/// `ip route get` clntref is the cache entry's reference count, set to 2, the usual value on Linux.
 fn cacheinfo(clntref: u32) -> [u8; 32] {
     let mut c = [0u8; 32];
     c[..4].copy_from_slice(&clntref.to_le_bytes());
     c
 }
 
-/// 转储里的一条路由（Linux 的 `fib_dump_info`、`rt6_fill_node`）。
+/// One route in a dump (Linux's `fib_dump_info`, `rt6_fill_node`).
 pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
     let mut p = rtmsg(
         e.family, e.prefix, 0, e.table, e.proto, e.scope, e.ty, e.flags,
@@ -373,7 +390,7 @@ pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
     p
 }
 
-/// 消息里的属性：(类型, 内容)。
+/// The attributes in a message: (type, payload).
 pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
     let mut out = Vec::new();
     while b.len() >= 4 {
@@ -387,16 +404,19 @@ pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
     out
 }
 
-/// `entries` 里包含 `ip` 的最长前缀的路由，一样长的取度量最小的（同样的取先出现的）。
+/// The route in `entries` with the longest prefix containing `ip`; among equally long ones the
+/// lowest metric (among equal ones the first).
 fn longest_match<'a>(entries: impl Iterator<Item = &'a Entry>, ip: &[u8]) -> Option<&'a Entry> {
     entries
         .filter(|e| e.dst.len() == ip.len() && network(ip, e.prefix) == e.dst)
         .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
 }
 
-/// 没有首选源地址时的源地址（`inet_select_addr`，IPv6 粗略地照 `ipv6_dev_get_saddr`）：出口
-/// 接口上与网关（没有时是目标）同一网段的地址，再是它上面别的地址，再是别的接口上的；
-/// 不取链路本地地址，除非出口接口上只有它。
+/// The source address when there is no preferred source (`inet_select_addr`, with IPv6 roughly
+/// following `ipv6_dev_get_saddr`): an address on the output interface in the same subnet as the
+/// gateway (the destination when there is none), then another address on it, then one on another
+/// interface; link-local addresses are not taken unless they are the only ones on the output
+/// interface.
 fn select_source(ifaces: &[Interface], route: &Entry, dst: &[u8]) -> Option<Vec<u8>> {
     let toward = route.gateway.as_deref().unwrap_or(dst);
     let family = route.family;
@@ -430,12 +450,15 @@ fn select_source(ifaces: &[Interface], route: &Entry, dst: &[u8]) -> Option<Vec<
     others.or_else(|| out.and_then(|o| of(o).into_iter().next().map(|(a, _)| a)))
 }
 
-/// `ip route get`：回答 `RTM_GETROUTE` 的单条查询 `req`（整条消息，rtmsg 之后是属性），`uid`
-/// 是发请求的进程的用户 ID。返回回答的内容（RTM_NEWROUTE）或者错误码。
+/// `ip route get`: answers the single `RTM_GETROUTE` query `req` (the whole message, attributes
+/// after the rtmsg); `uid` is the user ID of the requesting process. Returns the answer's content
+/// (RTM_NEWROUTE) or an error number.
 ///
-/// 主表里最长前缀匹配到的是虚拟设备上的路由（[`crate::netdev`]），或者不在开机时的命名空间
-/// 里（`host_ok` 是 false）时，按这个命名空间的表选：出口是那条路由的接口，源地址是它的
-/// 首选源地址，没有时取出口接口上的地址（`inet_select_addr`）。
+/// When the longest prefix match in the main table is a route on a virtual device
+/// ([`crate::netdev`]), or this is not the boot namespace (`host_ok` is false), the choice follows
+/// this namespace's table: the output is that route's interface, and the source address
+/// is its preferred source, or when there is none an address on the output interface
+/// (`inet_select_addr`).
 pub(crate) fn get(
     req: &[u8],
     entries: &[Entry],
@@ -458,7 +481,7 @@ pub(crate) fn get(
         match ty {
             RTA_DST if data.len() == len => dst = data.to_vec(),
             RTA_SRC if data.len() == len => src = Some(data.to_vec()),
-            // 模拟收到数据包时的路由（`iif`）没有做
+            // Routing as for a received packet (`iif`) is not implemented
             RTA_IIF => return Err(EOPNOTSUPP),
             _ => {}
         }
@@ -467,11 +490,12 @@ pub(crate) fn get(
     let local_hit = longest_match(of_family().filter(|e| e.table == RT_TABLE_LOCAL), &dst)
         .filter(|e| e.ty != RTN_MULTICAST || family == AF_INET);
     let lo = ifaces.iter().find(|i| i.flags & IFF_LOOPBACK != 0);
-    // 匹配到的路由、出口接口、源地址、缓存条目的 rt_flags
+    // The matched route, output interface, source address, and the cache entry's rt_flags
     let (route, oif, saddr, rt_flags) = match local_hit {
         Some(e) if e.ty == RTN_LOCAL => {
-            // 本机地址：走回环接口，源地址是本地路由的首选源地址（这个地址本身；secondary
-            // 是同一网段的 primary，127.0.0.0/8 里别的地址是回环的）
+            // A local address: through the loopback interface, with the local route's preferred
+            // source as the source (the address itself; for a secondary, the primary of the same
+            // subnet; for other addresses in 127.0.0.0/8, the loopback one)
             let saddr = e
                 .prefsrc
                 .clone()
@@ -519,8 +543,9 @@ pub(crate) fn get(
                 &dst,
             )
             .or_else(|| longest_match(of_family().filter(|e| e.table == RT_TABLE_MAIN), &dst));
-            // 宿主选得出源地址就有路可走：主表里没有对应的路由时（Android 的 464xlat：
-            // LinkProperties 不含叠加链路的路由），当作经由那个地址所在的接口、没有网关
+            // If the host can choose a source address there is a way out: when the main table has
+            // no matching route (Android's 464xlat: LinkProperties omits the stacked link's
+            // routes), treat it as through that address's interface, without a gateway
             let route = match (matched, out) {
                 (Some(r), _) => r.clone(),
                 (None, Some(i)) => Entry {
@@ -545,7 +570,8 @@ pub(crate) fn get(
                 },
                 (None, None) => return Err(ENETUNREACH),
             };
-            // 组播：本机总在 all-hosts 组（224.0.0.1）里，别的组看不出加入了没有
+            // Multicast: this machine is always in the all-hosts group (224.0.0.1); for other
+            // groups whether it joined cannot be told
             let rt_flags = match dst[..] {
                 [224, 0, 0, 1] if family == AF_INET => RTCF_MULTICAST | RTCF_LOCAL,
                 [b, ..] if family == AF_INET && b & 0xf0 == 0xe0 => RTCF_MULTICAST,
@@ -567,7 +593,8 @@ pub(crate) fn get(
             _ => RTN_UNICAST,
         };
         let src_len = if src.is_some() { 32 } else { 0 };
-        // 没有自定义规则时本地表并在主表里，查到的路由都算主表的
+        // Without custom rules the local table is merged into the main table, so every route found
+        // counts as the main table's
         p = rtmsg(
             family,
             32,
@@ -625,11 +652,12 @@ const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 const FRA_TABLE: u16 = 15;
 const FRA_PROTOCOL: u16 = 21;
 const FR_ACT_TO_TBL: u8 = 1;
-/// 多播路由的规则所属的地址族（`RTNL_FAMILY_IPMR`、`RTNL_FAMILY_IP6MR`）。
+/// The address families of the multicast routing rules (`RTNL_FAMILY_IPMR`, `RTNL_FAMILY_IP6MR`).
 const RTNL_FAMILY_IPMR: i32 = 128;
 const RTNL_FAMILY_IP6MR: i32 = 129;
 
-/// `ip rule`：地址族 `family`（0 是全部）的默认规则，与 Linux 没有自定义规则时相同。
+/// `ip rule`: the default rules of address family `family` (0 for all), the same as Linux without
+/// custom rules.
 pub(crate) fn rule_messages(family: i32) -> Vec<Vec<u8>> {
     let rules: [(i32, u8, u32); 7] = [
         (AF_INET, RT_TABLE_LOCAL, 0),
@@ -644,7 +672,7 @@ pub(crate) fn rule_messages(family: i32) -> Vec<Vec<u8>> {
         .iter()
         .filter(|(f, ..)| family == 0 || *f == family)
         .map(|&(f, table, pref)| {
-            // struct fib_rule_hdr：family、dst_len、src_len、tos、table、res1、res2、action、flags
+            // struct fib_rule_hdr: family, dst_len, src_len, tos, table, res1, res2, action, flags
             let mut p = vec![f as u8, 0, 0, 0, table, 0, 0, FR_ACT_TO_TBL, 0, 0, 0, 0];
             put(&mut p, FRA_TABLE, &u32::from(table).to_le_bytes());
             put(&mut p, FRA_SUPPRESS_PREFIXLEN, &(-1i32).to_le_bytes());
@@ -659,8 +687,9 @@ pub(crate) fn rule_messages(family: i32) -> Vec<Vec<u8>> {
 
 // ---- /proc/net ----
 
-/// `/proc/net/route`：主表里 IPv4 的单播路由（Linux 的 `fib_route_seq_show`），地址按内存
-/// 里的字节当成小端打印，每行补空格到 127 个字符。
+/// `/proc/net/route`: the IPv4 unicast routes of the main table (Linux's `fib_route_seq_show`),
+/// with addresses printed as their in-memory bytes read as little-endian, and each line padded
+/// with spaces to 127 characters.
 pub(crate) fn proc_route(entries: &[Entry]) -> String {
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
@@ -694,8 +723,9 @@ pub(crate) fn proc_route(entries: &[Entry]) -> String {
     lines.iter().map(|l| format!("{l:<127}\n")).collect()
 }
 
-/// `/proc/net/ipv6_route`：IPv6 的各张表（Linux 的 `ipv6_route_native_seq_show`），每张表
-/// 最后是树根上的空路由（没有 `::/0` 的路由时）。引用数没有意义，都写 1。
+/// `/proc/net/ipv6_route`: the IPv6 tables (Linux's `ipv6_route_native_seq_show`); each table ends
+/// with the null route at the tree root (when there is no `::/0` route). Reference counts mean
+/// nothing, so they are all 1.
 pub(crate) fn proc_ipv6_route(entries: &[Entry]) -> String {
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
@@ -755,7 +785,8 @@ mod tests {
         }
     }
 
-    /// docker 容器里的两个接口：lo 和 172.17.0.2/16 的 eth0，eth0 上还有一个链路本地地址。
+    /// The two interfaces in a docker container: lo and eth0 with 172.17.0.2/16, and eth0 also has
+    /// a link-local address.
     fn container() -> Vec<Interface> {
         let mut one = vec![0; 16];
         one[15] = 1;
@@ -829,8 +860,9 @@ mod tests {
         )
     }
 
-    /// 宿主给出主表时：内核加的网段带上首选源地址，本地表按地址合成，顺序与 docker 容器里
-    /// 转储的相同。
+    /// When the host provides the main table: the subnets added by the kernel carry the preferred
+    /// source address, the local table is synthesized from the addresses, and the order is the
+    /// same as a dump in a docker container.
     #[test]
     fn builds_both_tables_in_dump_order() {
         let t: Vec<String> = tables(&container(), Some(host_routes()))
@@ -855,8 +887,9 @@ mod tests {
         );
     }
 
-    /// 宿主没有给出路由时，网段按接口的地址合成；默认路由取决于宿主的网络，这里不看。
-    /// 每个有 IPv6 地址的接口各有一条多播路由。
+    /// When the host provides no routes, the subnets are synthesized from the interface addresses;
+    /// the default route depends on the host's network and is not checked here. Each interface
+    /// with an IPv6 address has its own multicast route.
     #[test]
     fn synthesizes_connected_routes() {
         let mut ifaces = container();
@@ -928,7 +961,8 @@ mod tests {
         );
     }
 
-    /// `/proc/net/route` 和 `/proc/net/ipv6_route` 的格式与 docker 容器里的相同。
+    /// The format of `/proc/net/route` and `/proc/net/ipv6_route` is the same as in a docker
+    /// container.
     #[test]
     fn formats_proc_files() {
         let t = tables(&container(), Some(host_routes()));
@@ -953,7 +987,7 @@ mod tests {
         assert_eq!(lines[5], lines[1]);
     }
 
-    /// `ip route get` 的单条查询：rtmsg 之后是 RTA_DST。
+    /// A single `ip route get` query: RTA_DST after the rtmsg.
     fn request(family: i32, dst: &[u8], flags: u32) -> Vec<u8> {
         let mut p = rtmsg(family, dst.len() as u8 * 8, 0, 0, 0, 0, 0, flags);
         put(&mut p, RTA_DST, dst);
@@ -964,7 +998,8 @@ mod tests {
     fn answers_local_destinations_like_linux() {
         let ifaces = container();
         let t = tables(&ifaces, Some(host_routes()));
-        // 本机地址：表是主表（并在一起了），类型 local，走 lo，标志 RTCF_LOCAL | RTM_F_CLONED
+        // A local address: the table is main (merged), type local, through lo, flags RTCF_LOCAL |
+        // RTM_F_CLONED
         let r = get(&request(AF_INET, &[172, 17, 0, 2], 0), &t, &ifaces, 0, true).unwrap();
         assert_eq!(r[..12], [2, 32, 0, 0, 254, 0, 0, 2, 0, 2, 0, 0x80]);
         let a: Vec<(u16, Vec<u8>)> = attrs(&r[12..])
@@ -985,10 +1020,10 @@ mod tests {
         );
         assert_eq!(a[2].1, 1u32.to_le_bytes());
         assert_eq!(a[3].1, [172, 17, 0, 2]);
-        // 回环网段里别的地址：源地址是回环的地址
+        // Another address in the loopback subnet: the source address is the loopback one
         let r = get(&request(AF_INET, &[127, 0, 0, 9], 0), &t, &ifaces, 0, true).unwrap();
         assert!(attrs(&r[12..]).contains(&(RTA_PREFSRC, &[127, 0, 0, 1][..])));
-        // 网段的广播
+        // The subnet's broadcast
         let r = get(
             &request(AF_INET, &[172, 17, 255, 255], 0),
             &t,
@@ -998,7 +1033,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r[7], RTN_BROADCAST);
-        // IPv6 的 ::1：本地表，带上 RTA_SRC ::、度量和优先级
+        // IPv6 ::1: the local table, with RTA_SRC ::, metric and priority
         let mut one = [0u8; 16];
         one[15] = 1;
         let r = get(&request(AF_INET6, &one, 0), &t, &ifaces, 0, true).unwrap();
@@ -1017,7 +1052,7 @@ mod tests {
                 RTA_PREF
             ]
         );
-        // 要匹配到的路由本身
+        // The matched route itself
         let r = get(
             &request(AF_INET, &[172, 17, 0, 2], RTM_F_FIB_MATCH),
             &t,
@@ -1027,7 +1062,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, route_message(&t[5]));
-        // 主表里没有路由、宿主选得出源地址（这里由请求给出）：经由源地址所在的接口
+        // No route in the main table, and the host can choose a source address (given by the
+        // request here): through the interface of the source address
         let mut req = request(AF_INET, &[1, 1, 1, 1], 0);
         let mut from = Vec::new();
         put(&mut from, RTA_SRC, &[172, 17, 0, 2]);
@@ -1042,7 +1078,7 @@ mod tests {
             !a.iter()
                 .any(|(t, _)| *t == RTA_GATEWAY || *t == RTA_PREFSRC)
         );
-        // 模拟收到数据包没有做
+        // Routing as for a received packet is not implemented
         let mut req = request(AF_INET, &[1, 1, 1, 1], 0);
         let mut iif = Vec::new();
         put(&mut iif, RTA_IIF, &2u32.to_le_bytes());
@@ -1057,7 +1093,7 @@ mod tests {
         let v4 = rule_messages(AF_INET);
         assert_eq!(v4.len(), 3);
         assert_eq!(v4[0][..12], [2, 0, 0, 0, 255, 0, 0, 1, 0, 0, 0, 0]);
-        // 优先级为 0 的不带 FRA_PRIORITY
+        // Rules with priority 0 carry no FRA_PRIORITY
         assert_eq!(v4[0].len(), 12 + 8 + 8 + 8);
         assert_eq!(v4[1].len(), 12 + 8 + 8 + 8 + 8);
         assert_eq!(rule_messages(AF_INET6).len(), 2);

@@ -1,26 +1,37 @@
-//! guest 的 raw ICMP socket（kernel/net 的 map）。Android 上 App 没有 `CAP_NET_RAW`，guest 的
-//! raw ICMP socket 在宿主上是 ping socket（不需要特权），这里补上两者的差别：
+//! The guest's raw ICMP sockets (the kernel/net map). Apps on Android have no `CAP_NET_RAW`, so a
+//! guest raw ICMP socket is a ping socket on the host (which needs no privilege), and the
+//! differences between the two are made up for here:
 //!
-//! - **收得到到达的所有 ICMP**：Linux 的 raw ICMP socket 收到发给本机的每个 ICMP 报文，
-//!   traceroute 用一个 socket 发探测包、另一个 raw socket 收超时和不可达的报文；宿主的
-//!   ping socket 只收得到自己的 echo 回答。这里按网络命名空间建一个汇集点（[`Tap`]）：
-//!   raw socket 背后的 ping socket，以及设过 TTL、没有连接的 UDP socket（traceroute 的
-//!   探测包，[`before_send`]），在宿主上打开 `IP_RECVERR`。它们收到的报文和错误队列里的
-//!   ICMP 错误由汇集点取下来（[`dispatch`]），错误拼回完整的 ICMP 错误报文（引用原来的
-//!   IP 头和报文的开头），分给同一个命名空间、同一个协议族的每个 raw socket 的队列。raw
-//!   socket 收的时候自己先取一遍，poll、epoll 的等待者由定时器线程看着汇集点
-//!   （[`check_taps`]）。
-//! - **echo 的 id**：ping socket 发出 echo 请求时把 id 换成自己的编号，回答里也是；raw
-//!   socket 原样发出，程序（busybox 的 ping 用 pid）按自己的 id 认回答。记下 guest 最后
-//!   发出的 id，收到的 echo 回答、错误报文里引用的 echo 请求都换回它，校验和跟着更新。
-//! - **IPv4 的 IP 头**：raw socket 收到的数据带 IP 头，这里拼一个 20 字节的头（[`present`]）：
-//!   TTL 和目的地址取自宿主的 `IP_TTL`、`IP_PKTINFO` 控制消息（宿主上总是打开，guest 自己
-//!   没打开的不交给它），TOS、IP 的 id 和标志都是 0。IPv6 的 raw socket 本来就不带 IP 头。
-//! - **raw socket 才有的选项**：`ICMP_FILTER`、`ICMPV6_FILTER` 在分发时过滤；
-//!   `IPV6_CHECKSUM`（ICMPv6 的默认是 2）只记下来，宿主的 ping socket 总是算校验和。
+//! - **Receiving every ICMP message that arrives**: a raw ICMP socket on Linux receives every ICMP
+//!   message sent to the machine, and traceroute sends probes on one socket and receives the
+//!   time-exceeded and unreachable messages on another raw socket; the host's ping socket receives
+//!   only its own echo replies. So there is an aggregation point ([`Tap`]) per network namespace:
+//!   the ping sockets behind raw sockets, and UDP sockets that set a TTL and are not connected
+//!   (traceroute's probes, [`before_send`]), have `IP_RECVERR` enabled on the host. The messages
+//!   they receive and the ICMP errors in their error queues are taken off by the aggregation point
+//!   ([`dispatch`]); errors are reassembled into whole ICMP error messages (quoting the original IP
+//!   header and the start of the message) and given to the queue of every raw socket of the same
+//!   namespace and protocol family. A raw socket takes them off once itself when it receives, and
+//!   for waiters in poll and epoll the timer thread watches the aggregation points
+//!   ([`check_taps`]).
+//! - **The echo id**: a ping socket replaces the id with its own number when sending an echo
+//!   request, and the replies carry that number too; a raw socket sends it unchanged, and programs
+//!   (busybox's ping uses the pid) recognize replies by their own id. The id the guest sent last
+//!   is recorded, and received echo replies and the echo requests quoted in error messages get it
+//!   back, with the checksum updated along with it.
+//! - **The IPv4 IP header**: data received on a raw socket includes the IP header, so a 20-byte
+//!   header is assembled here ([`present`]): TTL and destination address come from the host's
+//!   `IP_TTL` and `IP_PKTINFO` control messages (always enabled on the host, and not passed to the
+//!   guest when it has not enabled them itself); TOS, the IP id and the flags are all 0. IPv6 raw
+//!   sockets carry no IP header anyway.
+//! - **Options only raw sockets have**: `ICMP_FILTER` and `ICMPV6_FILTER` filter at dispatch;
+//!   `IPV6_CHECKSUM` (2 by default for ICMPv6) is only recorded, since the host's ping socket
+//!   always computes the checksum.
 //!
-//! 替 guest 在宿主上打开的 `IP_RECVERR` 有副作用：宿主把收到的 ICMP 错误记在 socket 上，
-//! 下一次收发因此失败。这些 socket 收发之前先取走错误，因为它失败了也取走再试一次。
+//! The `IP_RECVERR` enabled on the host for the guest has a side effect: the host records received
+//! ICMP errors on the socket, so the next send or receive fails because of them. These sockets
+//! take the errors off before sending and receiving, and when a call fails because of one, take it
+//! off too and try again.
 //!
 //! [`present`]: RawIcmp::present
 
@@ -47,7 +58,7 @@ const IP_RECVTTL: i32 = 12;
 const IPV6_UNICAST_HOPS: i32 = 16;
 const IPV6_RECVERR: i32 = 25;
 const IPV6_HOPLIMIT: i32 = 52;
-/// `ICMP_FILTER`（SOL_RAW）、`ICMPV6_FILTER`（SOL_ICMPV6）。
+/// `ICMP_FILTER` (SOL_RAW), `ICMPV6_FILTER` (SOL_ICMPV6).
 const ICMP_FILTER: i32 = 1;
 const IPV6_CHECKSUM: i32 = 7;
 const ICMP_ECHOREPLY: u8 = 0;
@@ -65,30 +76,34 @@ const SO_EE_ORIGIN_ICMP6: u8 = 3;
 const MSG_DONTWAIT: i32 = 0x40;
 const MSG_ERRQUEUE: i32 = 0x2000;
 const MSG_CTRUNC: u32 = 0x08;
-/// 宿主 `struct cmsghdr` 的长度（arm64 Linux：`size_t cmsg_len` 加两个 int）。
+/// The length of the host's `struct cmsghdr` (arm64 Linux: `size_t cmsg_len` plus two ints).
 const CMSG_HDR: usize = 16;
-/// 一个 ICMP 报文最长的长度（IP 的总长度是 16 位）。
+/// The longest an ICMP message can be (the IP total length is 16 bits).
 const PACKET_MAX: usize = 1 << 16;
-/// 每个 raw socket 排队的字节数上限（Linux 默认的 `rmem_default`），放不下的丢掉。
+/// The most bytes queued per raw socket (Linux's default `rmem_default`); what does not fit is
+/// dropped.
 const QUEUE_MAX: usize = 212_992;
-/// 宿主收发时可能留着的控制消息的空间。
+/// Room for control messages the host may leave when sending and receiving.
 const CONTROL_ROOM: usize = 512;
 
-/// guest 的 raw ICMP socket 自己的状态：选项、最后发出的 echo 的 id、它的汇集点。
+/// The guest raw ICMP socket's own state: options, the id of the last echo sent, and its
+/// aggregation point.
 pub(crate) struct RawIcmp {
     family: i32,
-    /// guest 最后发出的 echo 请求的 id（网络字节序）。
+    /// The id of the last echo request the guest sent (network byte order).
     id: Option<[u8; 2]>,
-    /// 过滤器，置位的类型丢掉（Linux 按 u32 数组存，IPv4 只用第一个）。
+    /// The filter; types whose bit is set are dropped (Linux stores it as a u32 array, and IPv4
+    /// uses only the first).
     filter: [u8; 32],
-    /// guest 自己打开了 `IP_RECVTTL`、`IP_PKTINFO`（IPv4）。
+    /// The guest itself enabled `IP_RECVTTL`, `IP_PKTINFO` (IPv4).
     recvttl: bool,
     pktinfo: bool,
-    /// guest 自己设的 `IP_RECVERR`、`IPV6_RECVERR`：只记下来（推迟项），宿主上总是打开。
+    /// `IP_RECVERR`, `IPV6_RECVERR` as set by the guest itself: only recorded (deferred), always
+    /// enabled on the host.
     recverr: bool,
-    /// `IPV6_CHECKSUM` 的值，-1 是不算。
+    /// The value of `IPV6_CHECKSUM`; -1 means not computed.
     checksum: i32,
-    /// 收到的报文都经由它，也在那里排队。
+    /// Every received message goes through it and is queued there.
     pub tap: Rc<RefCell<Tap>>,
 }
 
@@ -106,7 +121,7 @@ impl RawIcmp {
         }
     }
 
-    /// 宿主的 ping socket 上要替 guest 打开的选项。
+    /// The options to enable on the host's ping socket for the guest.
     pub fn host_options(family: i32) -> &'static [(i32, i32)] {
         match family {
             AF_INET => &[
@@ -122,14 +137,14 @@ impl RawIcmp {
         echo_types(self.family)
     }
 
-    /// guest 发出一个报文：是 echo 请求时记下它的 id。
+    /// The guest sends a message: when it is an echo request, record its id.
     pub fn sent(&mut self, data: &[u8]) {
         if data.len() >= 8 && data[0] == self.echo().0 {
             self.id = Some([data[4], data[5]]);
         }
     }
 
-    /// 类型 `ty` 的报文能不能通过过滤器。
+    /// Whether a message of type `ty` passes the filter.
     fn passes(&self, ty: u8) -> bool {
         let word = |i: usize| u32::from_le_bytes(self.filter[4 * i..4 * i + 4].try_into().unwrap());
         !match self.family {
@@ -138,7 +153,7 @@ impl RawIcmp {
         }
     }
 
-    /// raw socket 自己的选项。不归这里管的返回 None（交给宿主）。
+    /// The raw socket's own options. Returns None for those not handled here (left to the host).
     pub fn setsockopt(&mut self, level: i32, name: i32, v: &[u8]) -> Option<Result<(), i32>> {
         const EINVAL: i32 = 22;
         const ENOPROTOOPT: i32 = 92;
@@ -148,8 +163,8 @@ impl RawIcmp {
             _ => i32::from_le_bytes(v[..4].try_into().unwrap()),
         };
         Some(match (self.family, level, name) {
-            // Linux 的 raw_seticmpfilter、rawv6_seticmpfilter：最多拷过滤器那么长，短的只盖住
-            // 前面一部分
+            // Linux's raw_seticmpfilter, rawv6_seticmpfilter: copy at most the filter's length,
+            // and a short value covers only the front part
             (AF_INET, SOL_RAW, ICMP_FILTER) | (AF_INET6, SOL_ICMPV6, ICMP_FILTER) => {
                 let n = v.len().min(if self.family == AF_INET { 4 } else { 32 });
                 self.filter[..n].copy_from_slice(&v[..n]);
@@ -168,7 +183,8 @@ impl RawIcmp {
                 self.recverr = int() != 0;
                 Ok(())
             }
-            // RFC 3542 不让在 IPPROTO_IPV6 一级给 ICMPv6 设它（Linux 的 do_rawv6_setsockopt）
+            // RFC 3542 forbids setting it for ICMPv6 at the IPPROTO_IPV6 level (Linux's
+            // do_rawv6_setsockopt)
             (AF_INET6, SOL_IPV6, IPV6_CHECKSUM) => Err(EINVAL),
             (AF_INET6, SOL_RAW, IPV6_CHECKSUM) => {
                 if v.len() < 4 {
@@ -187,7 +203,7 @@ impl RawIcmp {
         })
     }
 
-    /// raw socket 自己的选项的值。不归这里管的返回 None。
+    /// The values of the raw socket's own options. Returns None for those not handled here.
     pub fn getsockopt(&self, level: i32, name: i32) -> Option<Result<Vec<u8>, i32>> {
         const ENOPROTOOPT: i32 = 92;
         let int = |b: bool| (b as i32).to_le_bytes().to_vec();
@@ -204,9 +220,10 @@ impl RawIcmp {
         }))
     }
 
-    /// 队列里的报文 `it` 交给这个 socket（`key` 是它的唤醒对象）时的样子：IPv4 的前面拼上
-    /// IP 头，控制消息按它自己的选项给。`src` 是已经换算成 guest 的对端地址，`local` 把
-    /// 宿主上的本端地址换成 guest 的。返回数据和控制消息。
+    /// What the queued message `it` looks like when given to this socket (`key` is its wake
+    /// object): for IPv4 an IP header is prepended, and control messages follow its own options.
+    /// `src` is the peer address already translated for the guest, and `local` maps a local
+    /// address on the host to the guest's. Returns the data and the control messages.
     pub fn present(
         &self,
         it: &Item,
@@ -214,15 +231,17 @@ impl RawIcmp {
         src: &[u8],
         local: impl Fn([u8; 4]) -> [u8; 4],
     ) -> (Vec<u8>, Vec<u8>) {
-        // 别的 socket 收到的报文上的控制消息是按那个 socket 的选项给的，不交给这一个
+        // Control messages on a message another socket received follow that socket's options and
+        // are not given to this one
         let other: &[u8] = if it.origin == key { &it.other } else { &[] };
         if self.family != AF_INET {
             return (it.icmp.clone(), other.to_vec());
         }
         let ttl = it.ttl.unwrap_or(64);
-        // struct in_pktinfo：ipi_addr 是 IP 头里的目的地址。ping socket 不填
-        // ipi_spec_dst，raw socket 填回答时用的本端地址（Linux 的 fib_compute_spec_dst：
-        // 发给本机单播地址的就是这个地址）
+        // struct in_pktinfo: ipi_addr is the destination address in the IP header. A ping
+        // socket does not fill in ipi_spec_dst; a raw socket fills in the local address used for
+        // replies (Linux's fib_compute_spec_dst: for messages to a local unicast address it is
+        // that address)
         let pktinfo = it.pktinfo.map(|p| {
             let addr = local(p[8..12].try_into().unwrap());
             let spec = match p[4..8] {
@@ -234,8 +253,8 @@ impl RawIcmp {
             out[8..12].copy_from_slice(&addr);
             out
         });
-        // Linux 的顺序：时间戳这些 socket 一级的在前，接着是 ip_cmsg_recv 的 PKTINFO、TTL，
-        // 再是别的 IP 一级的
+        // Linux's order: socket-level ones such as timestamps first, then ip_cmsg_recv's PKTINFO
+        // and TTL, then other IP-level ones
         let mut control = Vec::new();
         for (level, _, whole, _) in cmsgs(other) {
             if level == SOL_SOCKET {
@@ -273,8 +292,8 @@ impl RawIcmp {
 }
 
 impl RawIcmp {
-    /// 错误队列里的一条交给 guest 时的控制消息：宿主替它打开的 `IP_TTL`、`IP_PKTINFO`
-    /// 它自己没打开的去掉。
+    /// The control messages for an error-queue entry given to the guest: `IP_TTL` and
+    /// `IP_PKTINFO` enabled on the host for it are removed when it has not enabled them itself.
     pub fn err_control(&self, e: &ErrItem) -> Vec<u8> {
         let mut out = Vec::new();
         for (level, ty, whole, _) in cmsgs(&e.control) {
@@ -298,69 +317,70 @@ fn echo_types(family: i32) -> (u8, u8) {
     }
 }
 
-/// 一个网络命名空间里 ICMP 的汇集点（见模块的说明）。
+/// The ICMP aggregation point of one network namespace (see the module docs).
 pub(crate) struct Tap {
-    /// 来源的宿主 fd：有报文、有错误时它可读。
+    /// The host fds of the sources: readable when there are messages or errors.
     watch: Watch,
-    /// 所在的网络命名空间，None 是开机时的。
+    /// Its network namespace; None is the boot one.
     net: Option<Rc<NetNs>>,
     sources: Vec<Source>,
     receivers: Vec<Receiver>,
 }
 
-/// 汇集点取报文的宿主 socket。
+/// A host socket the aggregation point takes messages from.
 struct Source {
     fd: i32,
     sock: Weak<RefCell<Socket>>,
     family: i32,
-    /// UDP socket：只取错误队列。
+    /// A UDP socket: only its error queue is taken.
     udp: bool,
-    /// 它的唤醒对象（raw socket 认得出哪些是自己收到的）。
+    /// Its wake object (so raw sockets can tell which messages they received themselves).
     key: usize,
 }
 
-/// 一个 raw socket 的队列。
+/// The queue of one raw socket.
 struct Receiver {
     key: usize,
     sock: Weak<RefCell<Socket>>,
     family: i32,
     queue: VecDeque<Item>,
     bytes: usize,
-    /// 放进队列的报文数（`EPOLLET` 每来一个都触发）。
+    /// The number of messages put in the queue (`EPOLLET` triggers on each).
     arrivals: u64,
-    /// guest 打开了 `IP_RECVERR` 时它的错误队列（`MSG_ERRQUEUE`）。
+    /// Its error queue (`MSG_ERRQUEUE`) when the guest enabled `IP_RECVERR`.
     errors: VecDeque<ErrItem>,
 }
 
-/// raw socket 的错误队列里的一条：与 Linux 的 `ip_recv_error` 交出的一样，数据是原来的
-/// 报文（换回了 guest 的 id），对端是原来的目的地址，控制消息里有 `IP_RECVERR`。
+/// One entry in a raw socket's error queue: the same as what Linux's `ip_recv_error` hands out,
+/// the data is the original message (with the guest's id restored), the peer is the original
+/// destination address, and the control messages include `IP_RECVERR`.
 pub(crate) struct ErrItem {
     pub data: Vec<u8>,
-    /// 宿主上的地址。
+    /// The address on the host.
     pub addr: Vec<u8>,
-    /// 宿主给的控制消息。
+    /// The control messages the host gave.
     control: Vec<u8>,
     errno: i32,
 }
 
-/// 收到的一个 ICMP 报文（IPv4 的不带 IP 头）。
+/// One received ICMP message (without the IP header for IPv4).
 #[derive(Clone)]
 pub(crate) struct Item {
     pub icmp: Vec<u8>,
-    /// 对端（宿主上的）地址：报文的来源、错误的报告者。
+    /// The peer (host) address: the source of a message, the reporter of an error.
     pub src: Vec<u8>,
-    /// IP 头里的 TTL（IPv6 是 hop limit），宿主给了的话。
+    /// The TTL in the IP header (hop limit for IPv6), if the host gave it.
     ttl: Option<u8>,
-    /// IPv4 的 `struct in_pktinfo`，宿主给了的话。
+    /// The IPv4 `struct in_pktinfo`, if the host gave it.
     pktinfo: Option<[u8; 12]>,
-    /// 宿主给的别的控制消息（来源 socket 的选项要的）。
+    /// Other control messages the host gave (wanted by the source socket's options).
     other: Vec<u8>,
-    /// 来源 socket 的唤醒对象。
+    /// The wake object of the source socket.
     origin: usize,
 }
 
-/// 汇集点从 raw socket 背后的 ping socket 上收下的一个报文：流量要算在那个 socket 上
-/// （[`account`]）。
+/// A message the aggregation point took from the ping socket behind a raw socket: its traffic is
+/// counted on that socket ([`account`]).
 pub(crate) struct Arrival {
     sock: Rc<RefCell<Socket>>,
     bytes: usize,
@@ -368,13 +388,13 @@ pub(crate) struct Arrival {
 }
 
 impl Tap {
-    /// 汇集点的宿主 fd：来源上有东西可取时可读。
+    /// The aggregation point's host fd: readable when a source has something to take.
     pub fn fd(&self) -> i32 {
         self.watch.fd()
     }
 
     fn add_source(&mut self, sock: &Rc<RefCell<Socket>>, fd: i32, family: i32, udp: bool) {
-        // 只看 UDP socket 的出错（错误队列），不看它收到的数据
+        // Watch only the UDP socket's errors (the error queue), not the data it receives
         if self.watch.add(fd, !udp).is_ok() {
             self.sources.push(Source {
                 fd,
@@ -397,7 +417,7 @@ impl Tap {
     }
 }
 
-/// 网络命名空间 `net` 的汇集点，还没有就建一个。
+/// The aggregation point of network namespace `net`, created if there is none yet.
 pub(crate) fn tap_for(k: &mut Kernel, net: &Option<Rc<NetNs>>) -> Result<Rc<RefCell<Tap>>, Errno> {
     k.icmp_taps.retain(|t| t.strong_count() > 0);
     if let Some(t) = find_tap(k, net) {
@@ -424,8 +444,8 @@ fn find_tap(k: &Kernel, net: &Option<Rc<NetNs>>) -> Option<Rc<RefCell<Tap>>> {
         })
 }
 
-/// 新建的 raw socket `sock`（宿主 fd 是 `fd`）登记到它的汇集点：它的 ping socket 是
-/// 来源，它自己有一个队列。
+/// Registers a new raw socket `sock` (host fd `fd`) with its aggregation point: its ping socket is
+/// a source, and it has a queue of its own.
 pub(crate) fn register(tap: &Rc<RefCell<Tap>>, sock: &Rc<RefCell<Socket>>, fd: i32, family: i32) {
     let mut t = tap.borrow_mut();
     t.add_source(sock, fd, family, false);
@@ -440,9 +460,10 @@ pub(crate) fn register(tap: &Rc<RefCell<Tap>>, sock: &Rc<RefCell<Socket>>, fd: i
     });
 }
 
-/// 取下来源上已经到了的报文和错误，分给各个 raw socket 的队列。`only` 是只取这一个宿主
-/// fd（收发之前清掉它上面的错误）。调用方不能借着任何 socket。返回从 ping socket 上收下
-/// 的报文，流量要记下来（[`account`]）。
+/// Takes the messages and errors already arrived at the sources and gives them to the queues of
+/// the raw sockets. `only` takes only from this one host fd (clearing its errors before a send or
+/// receive). The caller must not be borrowing any socket. Returns the messages taken from ping
+/// sockets, whose traffic is to be recorded ([`account`]).
 pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival> {
     let sources: Vec<_> = {
         let mut t = tap.borrow_mut();
@@ -458,11 +479,12 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
     let mut arrivals = Vec::new();
     let mut buf = vec![0u8; PACKET_MAX];
     for (fd, sock, family, udp, key) in sources {
-        // 没有打开 IP_RECVERR 的 socket 上，Linux 只把硬错误报告给已经连接的
-        // （__udp4_lib_err、raw_err、ping_err 的 harderr），而且错误要与连接对得上：UDP 的
-        // 宿主连接可能为了收到错误改过（syscall::net::send），这里按 guest 连的对端比
-        // raw socket 的 guest 自己打开了 IP_RECVERR：错误另外进它的错误队列，每个都报告
-        // （raw_err）
+        // On sockets without IP_RECVERR, Linux reports only hard errors and only to connected
+        // ones (harderr in __udp4_lib_err, raw_err, ping_err), and the error must match the
+        // connection: a UDP socket's host connection may have been changed to receive errors
+        // (syscall::net::send), so the comparison here is against the peer the guest connected to
+        // A raw socket whose guest enabled IP_RECVERR itself: errors also go into its error queue,
+        // and every one is reported (raw_err)
         let (peer, recverr) = match &*sock.borrow() {
             Socket::Inet(s) => {
                 let recverr = s.icmp.as_ref().is_some_and(|r| r.recverr);
@@ -484,7 +506,8 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
             let Some((it, errno, original)) = it else {
                 continue;
             };
-            // 只为与连接的对端比较：别的命名空间的地址不换（这里拿不到内核），只换自己的回环段
+            // Only for comparing with the connected peer: addresses of other namespaces are not
+            // translated (the kernel is not available here), only its own loopback range
             let dst = match &net {
                 Some(ns) => {
                     let w = crate::netns::World {
@@ -540,9 +563,10 @@ pub(crate) fn dispatch(tap: &Rc<RefCell<Tap>>, only: Option<i32>) -> Vec<Arrival
     arrivals
 }
 
-/// 宿主上各个 raw socket 的 ping socket 的编号（echo 的 id）和 guest 最后发出的 id。回答、
-/// 错误不一定到发出它的那个 ping socket 上：guest 可能把收的 socket 绑到发的 socket 的
-/// 地址上（busybox 的 traceroute），宿主按编号找 socket，找到的是先绑上的那个。
+/// The numbers (echo ids) of the ping sockets of the raw sockets on the host, and the ids the guest
+/// sent last. Replies and errors do not necessarily reach the ping socket that sent the request:
+/// the guest may bind the receiving socket to the sending socket's address (busybox's
+/// traceroute), and the host finds the socket by number, which finds the one bound first.
 fn guest_ids(tap: &Rc<RefCell<Tap>>) -> Vec<([u8; 2], [u8; 2])> {
     let socks: Vec<_> = tap
         .borrow()
@@ -567,7 +591,8 @@ fn guest_ids(tap: &Rc<RefCell<Tap>>) -> Vec<([u8; 2], [u8; 2])> {
         .collect()
 }
 
-/// 把报文放进同一个协议族、过滤器放得过的 raw socket 的队列，叫醒等它们的线程。
+/// Puts messages into the queues of raw sockets of the same protocol family whose filters let them
+/// through, and wakes the threads waiting on them.
 fn deliver(tap: &Rc<RefCell<Tap>>, items: Vec<(i32, Item)>) {
     if items.is_empty() {
         return;
@@ -608,7 +633,8 @@ fn deliver(tap: &Rc<RefCell<Tap>>, items: Vec<(i32, Item)>) {
     }
 }
 
-/// 从 raw socket（唤醒对象 `key`）的队列里取一个报文，`peek` 时不取走。
+/// Takes a message from the queue of a raw socket (wake object `key`), without removing it when
+/// `peek`.
 pub(crate) fn take(tap: &Rc<RefCell<Tap>>, key: usize, peek: bool) -> Option<Item> {
     let mut t = tap.borrow_mut();
     let r = t.receivers.iter_mut().find(|r| r.key == key)?;
@@ -620,8 +646,8 @@ pub(crate) fn take(tap: &Rc<RefCell<Tap>>, key: usize, peek: bool) -> Option<Ite
     Some(it)
 }
 
-/// 从 raw socket（唤醒对象 `key`）的错误队列里取一条；要报告的错误换成下一条的（Linux 的
-/// `sock_dequeue_err_skb`），没有了是 0。
+/// Takes one entry from the error queue of a raw socket (wake object `key`); the error to report
+/// becomes the next entry's (Linux's `sock_dequeue_err_skb`), or 0 when there is none left.
 pub(crate) fn take_err(tap: &Rc<RefCell<Tap>>, sock: &RefCell<Socket>) -> Option<ErrItem> {
     let key = wake::of(sock);
     let mut t = tap.borrow_mut();
@@ -633,7 +659,7 @@ pub(crate) fn take_err(tap: &Rc<RefCell<Tap>>, sock: &RefCell<Socket>) -> Option
     Some(e)
 }
 
-/// raw socket（唤醒对象 `key`）的错误队列里有没有东西。
+/// Whether the error queue of a raw socket (wake object `key`) has anything in it.
 pub(crate) fn has_errors(tap: &RefCell<Tap>, key: usize) -> bool {
     let t = tap.borrow();
     t.receivers
@@ -641,7 +667,8 @@ pub(crate) fn has_errors(tap: &RefCell<Tap>, key: usize) -> bool {
         .any(|r| r.key == key && !r.errors.is_empty())
 }
 
-/// raw socket（唤醒对象 `key`）的队列：(有没有报文, 放进去过的报文数)。
+/// The queue of a raw socket (wake object `key`): (whether it has messages, the number of messages
+/// ever put in).
 pub(crate) fn queued(tap: &RefCell<Tap>, key: usize) -> (bool, u64) {
     let t = tap.borrow();
     t.receivers
@@ -650,7 +677,8 @@ pub(crate) fn queued(tap: &RefCell<Tap>, key: usize) -> (bool, u64) {
         .map_or((false, 0), |r| (!r.queue.is_empty(), r.arrivals))
 }
 
-/// 把汇集点收下的 ping socket 上的报文记进流量（[`crate::traffic`]）。
+/// Records the messages the aggregation point took from ping sockets in the traffic counters
+/// ([`crate::traffic`]).
 pub(crate) fn account(k: &mut Kernel, arrivals: Vec<Arrival>) {
     for a in arrivals {
         if let Socket::Inet(s) = &mut *a.sock.borrow_mut()
@@ -661,7 +689,8 @@ pub(crate) fn account(k: &mut Kernel, arrivals: Vec<Arrival>) {
     }
 }
 
-/// 定时器线程：替 poll、epoll 的等待者取下各个汇集点上到了的东西。返回要一起等的宿主 fd。
+/// The timer thread: takes what has arrived at each aggregation point on behalf of waiters in poll
+/// and epoll. Returns the host fds to wait on along with the rest.
 pub(crate) fn check_taps(k: &mut Kernel) -> Vec<(i32, i16, i16)> {
     const POLLIN: i16 = 1;
     k.icmp_taps.retain(|t| t.strong_count() > 0);
@@ -675,8 +704,9 @@ pub(crate) fn check_taps(k: &mut Kernel) -> Vec<(i32, i16, i16)> {
     host
 }
 
-/// 宿主上替 guest 打开的 `IP_RECVERR` 让收发得到的错误（`icmp_err_convert`、
-/// `icmpv6_err_convert` 的结果）：得到它们时先取走错误再试一次。
+/// The errors that sends and receives get because of the `IP_RECVERR` enabled on the host for the
+/// guest (the results of `icmp_err_convert`, `icmpv6_err_convert`): on getting one, take the
+/// errors off first and try again.
 pub(crate) fn from_icmp(e: i32) -> bool {
     const EHOSTDOWN: i32 = 112;
     const ENONET: i32 = 64;
@@ -695,10 +725,12 @@ pub(crate) fn from_icmp(e: i32) -> bool {
         || [EHOSTDOWN, ENONET, EPROTO].contains(&e)
 }
 
-/// 宿主 socket `sock` 就要收发：raw socket 返回它的汇集点；UDP socket 设过 TTL、guest
-/// 没有自己打开 `IP_RECVERR`，命名空间里又有同一个协议族的 raw socket 时，
-/// 交给汇集点看着（在宿主上打开 `IP_RECVERR`），返回汇集点。返回 Some 时，收发之前要先
-/// 取走这个 socket 上的错误（[`dispatch`] 只取它）。
+/// Host socket `sock` is about to send or receive: a raw socket returns its aggregation point; a
+/// UDP socket that set a TTL, whose guest has not enabled `IP_RECVERR` itself, in a namespace that
+/// also has a raw socket of the same protocol family, is handed to the aggregation point to watch
+/// (enabling `IP_RECVERR` on the host), and the aggregation point is returned. When Some is
+/// returned, the errors on this socket must be taken off before the send or receive ([`dispatch`]
+/// taking only from it).
 pub(crate) fn before_io(k: &Kernel, sock: &Rc<RefCell<Socket>>) -> Option<Rc<RefCell<Tap>>> {
     let (fd, family, tapped, wanted) = match &*sock.borrow() {
         Socket::Inet(InetSocket { icmp: Some(r), .. }) => return Some(r.tap.clone()),
@@ -714,7 +746,7 @@ pub(crate) fn before_io(k: &Kernel, sock: &Rc<RefCell<Socket>>) -> Option<Rc<Ref
         if t.borrow_mut().has_receivers(family) {
             return Some(t);
         }
-        // raw socket 都关了
+        // All raw sockets are closed
         untap(sock);
         return None;
     }
@@ -742,8 +774,9 @@ fn recverr_option(family: i32) -> (i32, i32) {
     }
 }
 
-/// 汇集点不再看 UDP socket `sock`（guest 自己要 `IP_RECVERR`、raw socket 都关了）：已经到了的错误先分出去，宿主上的 `IP_RECVERR` 恢复成 guest 设的。调用方不能借着
-/// 任何 socket。
+/// The aggregation point stops watching UDP socket `sock` (the guest wants `IP_RECVERR` itself,
+/// or all raw sockets are closed): errors already arrived are dispatched first, and `IP_RECVERR`
+/// on the host is restored to what the guest set. The caller must not be borrowing any socket.
 pub(crate) fn untap(sock: &Rc<RefCell<Socket>>) {
     let (tap, fd, family, guest) = match &*sock.borrow() {
         Socket::Inet(s) => match &s.udp_tap {
@@ -761,8 +794,9 @@ pub(crate) fn untap(sock: &Rc<RefCell<Socket>>) {
     }
 }
 
-/// UDP socket 的选项：记下 guest 设过 TTL、自己打开的 `IP_RECVERR`。返回 Some 时不交给
-/// 宿主（汇集点看着它时，宿主上的 `IP_RECVERR` 总是开着），值是 guest 要的结果。
+/// UDP socket options: records that the guest set a TTL, or enabled `IP_RECVERR` itself. When
+/// Some is returned the option is not passed to the host (while the aggregation point watches the
+/// socket, `IP_RECVERR` on the host is always on), and the value is the result the guest wants.
 pub(crate) fn udp_setsockopt(s: &mut InetSocket, level: i32, name: i32, v: &[u8]) -> Option<bool> {
     if s.ty != SOCK_DGRAM || s.proto != IPPROTO_UDP {
         return None;
@@ -779,14 +813,16 @@ pub(crate) fn udp_setsockopt(s: &mut InetSocket, level: i32, name: i32, v: &[u8]
         }
         (SOL_IP, IP_RECVERR) | (SOL_IPV6, IPV6_RECVERR) => {
             s.guest_recverr = on;
-            // 看着时 guest 关掉它：只记下来；打开它：之后不再看着（[`untap`]）
+            // The guest turns it off while watched: only recorded; turning it on: no longer
+            // watched afterwards ([`untap`])
             s.udp_tap.as_ref().map(|_| on)
         }
         _ => None,
     }
 }
 
-/// UDP socket 的选项的值：汇集点看着它时 `IP_RECVERR` 报告 guest 设的。
+/// UDP socket option values: while the aggregation point watches it, `IP_RECVERR` reports what the
+/// guest set.
 pub(crate) fn udp_getsockopt(s: &InetSocket, level: i32, name: i32) -> Option<Vec<u8>> {
     match (level, name) {
         (SOL_IP, IP_RECVERR) | (SOL_IPV6, IPV6_RECVERR) if s.udp_tap.is_some() => {
@@ -796,8 +832,9 @@ pub(crate) fn udp_getsockopt(s: &InetSocket, level: i32, name: i32) -> Option<Ve
     }
 }
 
-/// ping socket 收到的报文：IPv4 的把宿主替 guest 打开的 `IP_TTL`、`IP_PKTINFO` 拿出来，
-/// 交给 guest 时按它自己的选项再给（[`RawIcmp::present`]）。
+/// A message received on a ping socket: for IPv4, takes out the `IP_TTL` and `IP_PKTINFO` the host
+/// enabled for the guest, to be given again by the guest's own options when handed to it
+/// ([`RawIcmp::present`]).
 fn data_item(family: i32, icmp: Vec<u8>, src: Vec<u8>, control: &[u8], key: usize) -> Item {
     let mut it = Item {
         icmp,
@@ -822,20 +859,23 @@ fn int_cmsg(data: &[u8]) -> Option<u8> {
         .map(|b| i32::from_le_bytes(*b) as u8)
 }
 
-/// 错误队列里的一条（`struct sock_extended_err` 和报告者的地址），不是 ICMP 报告的返回 None。
+/// One error-queue entry (`struct sock_extended_err` and the reporter's address); None when it was
+/// not reported by ICMP.
 fn extended_err(control: &[u8], level: i32, name: i32, origin: u8) -> Option<(&[u8], &[u8])> {
     let (_, _, _, data) = cmsgs(control).find(|&(l, t, _, _)| (l, t) == (level, name))?;
     (data.len() >= 16 && data[4] == origin).then(|| (&data[..16], &data[16..]))
 }
 
-/// 本端地址、原来的目的地址里的端口（网络字节序），取不到的是 0。
+/// The ports (network byte order) in the local address and the original destination address, 0
+/// when unavailable.
 fn ports(local: &[u8], dst: &[u8]) -> ([u8; 2], [u8; 2]) {
     let port = |a: &[u8]| a.get(2..4).map_or([0; 2], |p| [p[0], p[1]]);
     (port(local), port(dst))
 }
 
-/// 被引用的原来的报文：ICMP 的 echo 请求换回 guest 的 id；UDP 的补上 UDP 头（错误队列里只
-/// 给载荷，端口取自本端地址和原来的目的地址）。
+/// The quoted original message: an ICMP echo request gets the guest's id back; for UDP a UDP
+/// header is added (the error queue gives only the payload; the ports come from the local address
+/// and the original destination address).
 fn quoted(
     udp: bool,
     ids: &[([u8; 2], [u8; 2])],
@@ -861,9 +901,11 @@ fn quoted(
     }
 }
 
-/// IPv4 的错误队列里的一条拼回 ICMP 错误报文：类型、代码、附带的值（需要分片时的 MTU、
-/// 参数错误的位置），引用原来的 IP 头（本端是源地址、错误队列给的地址是目的地址，TTL
-/// 记作 1）和原来报文的开头。报告者是对端地址。
+/// Reassembles an IPv4 error-queue entry into an ICMP error message: type, code, the attached
+/// value (the MTU when fragmentation is needed, the position of a parameter problem), quoting the
+/// original IP header (the local end is the source address, the address the error queue gives is
+/// the destination, TTL recorded as 1) and the start of the original message. The reporter is the
+/// peer address.
 fn error_v4(
     fd: i32,
     udp: bool,
@@ -884,8 +926,9 @@ fn error_v4(
     );
     it.other.clear();
     let local = appine_hal::net::sockname(fd, false).unwrap_or_default();
-    // 原来的报文的源地址：错误报文的目的地址（IP_PKTINFO），或者本端地址；本端是通配地址
-    // （没有连接的 UDP socket）时按路由取
+    // The source address of the original message: the destination address of the error message
+    // (IP_PKTINFO), or the local address; when the local end is a wildcard address (an unconnected
+    // UDP socket) it is taken from routing
     let ours: [u8; 4] = match it.pktinfo {
         Some(p) => p[8..12].try_into().unwrap(),
         None => local.get(4..8).map_or([0; 4], |a| a.try_into().unwrap()),
@@ -933,8 +976,8 @@ fn error_v4(
     ))
 }
 
-/// IPv6 的错误队列里的一条拼回 ICMPv6 错误报文（与 [`error_v4`] 相同，引用的是 IPv6 头，
-/// 校验和带伪头部：报告者到本端）。
+/// Reassembles an IPv6 error-queue entry into an ICMPv6 error message (the same as [`error_v4`],
+/// quoting an IPv6 header; the checksum includes the pseudo-header: reporter to local end).
 fn error_v6(
     fd: i32,
     udp: bool,
@@ -1002,8 +1045,9 @@ fn error_v6(
     ))
 }
 
-/// Linux 报告给没有打开 `IP_RECVERR` 的已连接 socket 的 ICMP 错误（`icmp_err_convert`、
-/// `icmpv6_err_convert` 里 fatal 的，加上需要分片、参数错误）；超时之类的软错误不报告。
+/// The ICMP errors Linux reports to connected sockets without `IP_RECVERR` (the fatal ones in
+/// `icmp_err_convert`, `icmpv6_err_convert`, plus fragmentation needed and parameter problems);
+/// soft errors such as time exceeded are not reported.
 fn hard(family: i32, ty: u8, code: u8) -> bool {
     match family {
         AF_INET => match ty {
@@ -1019,8 +1063,9 @@ fn hard(family: i32, ty: u8, code: u8) -> bool {
     }
 }
 
-/// 出错的报文的目的地址 `dst` 就是 socket 连的对端 `peer`：协议族、地址相同，UDP 的端口
-/// 也相同（raw socket 没有端口）。
+/// The destination address `dst` of the failed message is the peer `peer` the socket is connected
+/// to: same protocol family and address, and for UDP also the same port (raw sockets have no
+/// ports).
 fn same_peer(peer: &[u8], dst: &[u8], udp: bool) -> bool {
     let range = match peer
         .get(..2)
@@ -1036,7 +1081,8 @@ fn same_peer(peer: &[u8], dst: &[u8], udp: bool) -> bool {
         && (!udp || peer.get(2..4) == dst.get(2..4))
 }
 
-/// 汇集点替 `sock` 记下的要报告给 guest 的 ICMP 错误：取走它（Linux 的 `sock_error`）。
+/// The ICMP error the aggregation point recorded for `sock` to report to the guest: takes it
+/// (Linux's `sock_error`).
 pub(crate) fn take_error(sock: &RefCell<Socket>) -> Option<Errno> {
     match &*sock.borrow() {
         Socket::Inet(s) => Some(Errno(s.icmp_err.replace(0))).filter(|e| e.0 != 0),
@@ -1044,8 +1090,8 @@ pub(crate) fn take_error(sock: &RefCell<Socket>) -> Option<Errno> {
     }
 }
 
-/// echo 报文的 id 是宿主上某个 ping socket 的编号时，换成 guest 从那个 socket 发出的 id
-/// （[`guest_ids`]），校验和跟着增量更新。
+/// When the id of an echo message is the number of a ping socket on the host, replaces it with the
+/// id the guest sent from that socket ([`guest_ids`]), updating the checksum incrementally.
 fn restore_id(icmp: &mut [u8], ids: &[([u8; 2], [u8; 2])]) {
     if icmp.len() >= 6
         && let Some(&(_, id)) = ids.iter().find(|(host, _)| icmp[4..6] == *host)
@@ -1056,7 +1102,7 @@ fn restore_id(icmp: &mut [u8], ids: &[([u8; 2], [u8; 2])]) {
     }
 }
 
-/// 网际校验和（RFC 1071），网络字节序。
+/// The internet checksum (RFC 1071), in network byte order.
 fn checksum(b: &[u8]) -> [u8; 2] {
     let mut acc: u32 = b
         .chunks(2)
@@ -1068,8 +1114,8 @@ fn checksum(b: &[u8]) -> [u8; 2] {
     (!(acc as u16)).to_be_bytes()
 }
 
-/// 校验和覆盖的一个 16 位字从 `old` 改成 `new` 之后的校验和（RFC 1624 的式 3）：不用知道
-/// 别的内容（ICMPv6 的伪头部）。
+/// The checksum after one 16-bit word it covers changes from `old` to `new` (equation 3 of RFC
+/// 1624): the rest of the content (ICMPv6's pseudo-header) need not be known.
 fn csum_replace(sum: [u8; 2], old: [u8; 2], new: [u8; 2]) -> [u8; 2] {
     let mut acc = !u16::from_be_bytes(sum) as u32
         + !u16::from_be_bytes(old) as u32
@@ -1080,7 +1126,7 @@ fn csum_replace(sum: [u8; 2], old: [u8; 2], new: [u8; 2]) -> [u8; 2] {
     (!(acc as u16)).to_be_bytes()
 }
 
-/// 一条控制消息（连同对齐的空白）。
+/// One control message (with its alignment padding).
 fn cmsg(level: i32, ty: i32, data: &[u8]) -> Vec<u8> {
     let mut c = ((CMSG_HDR + data.len()) as u64).to_le_bytes().to_vec();
     c.extend_from_slice(&level.to_le_bytes());
@@ -1090,7 +1136,8 @@ fn cmsg(level: i32, ty: i32, data: &[u8]) -> Vec<u8> {
     c
 }
 
-/// 逐条取宿主的控制消息：(level, type, 整条连同对齐的空白, 数据)。
+/// Iterates over the host's control messages: (level, type, the whole message with its alignment
+/// padding, data).
 fn cmsgs(control: &[u8]) -> impl Iterator<Item = (i32, i32, &[u8], &[u8])> {
     let mut off = 0;
     std::iter::from_fn(move || {
@@ -1109,8 +1156,9 @@ fn cmsgs(control: &[u8]) -> impl Iterator<Item = (i32, i32, &[u8], &[u8])> {
     })
 }
 
-/// 控制消息放进 guest 给的 `room` 字节（Linux 的 `put_cmsg`）：放不下的那一条截短
-/// （`cmsg_len` 写成剩下的长度），之后的不再放，返回的标志带 `MSG_CTRUNC`。
+/// Fits control messages into the `room` bytes the guest gave (Linux's `put_cmsg`): the one that
+/// does not fit is cut short (`cmsg_len` written as the remaining length), the ones after it are
+/// left out, and the returned flags include `MSG_CTRUNC`.
 pub(crate) fn fit_control(control: &[u8], room: usize) -> (Vec<u8>, u32) {
     let mut out = Vec::new();
     let mut flags = 0;
@@ -1154,7 +1202,7 @@ mod tests {
         a
     }
 
-    /// echo 报文：类型、id（宿主的编号 0x0597）、序号 7，56 字节的载荷。
+    /// An echo message: type, id (the host's number 0x0597), sequence 7, 56 bytes of payload.
     fn echo(ty: u8) -> Vec<u8> {
         let mut e = vec![ty, 0, 0, 0, 0x05, 0x97, 0, 7];
         e.extend(8u8..64);
@@ -1170,13 +1218,17 @@ mod tests {
         let mut reply = echo(ICMP_ECHOREPLY);
         restore_id(&mut reply, &IDS);
         assert_eq!(reply[4..6], [0x12, 0x34]);
-        assert_eq!(checksum(&reply), [0, 0], "校验和跟着改了");
+        assert_eq!(
+            checksum(&reply),
+            [0, 0],
+            "the checksum is updated along with it"
+        );
         let mut other = echo(ICMP_ECHOREPLY);
         restore_id(&mut other, &[([9, 9], [1, 1])]);
         assert_eq!(
             other,
             echo(ICMP_ECHOREPLY),
-            "不是宿主上 raw socket 的编号就不换"
+            "ids that are not the number of a raw socket on the host are not replaced"
         );
 
         let mut control = cmsg(SOL_IP, IP_PKTINFO, &[1, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 2]);
@@ -1198,14 +1250,15 @@ mod tests {
         assert_eq!(packet[12..20], [10, 0, 0, 1, 10, 0, 0, 2]);
         assert_eq!(checksum(&packet[..20]), [0, 0]);
         assert_eq!(packet[20..], reply);
-        // 没打开 IP_RECVTTL：只给 PKTINFO，ipi_spec_dst 填上目的地址
+        // IP_RECVTTL not enabled: only PKTINFO, with ipi_spec_dst filled in with the destination
+        // address
         assert_eq!(kept.len(), 32);
         assert_eq!(
             kept[CMSG_HDR + 4..CMSG_HDR + 12],
             [10, 0, 0, 2, 10, 0, 0, 2]
         );
 
-        // 过滤器挡掉 echo 回答
+        // The filter blocks echo replies
         assert!(r.passes(ICMP_ECHOREPLY));
         r.setsockopt(SOL_RAW, ICMP_FILTER, &1u32.to_le_bytes())
             .unwrap()
@@ -1216,7 +1269,7 @@ mod tests {
 
     #[test]
     fn errors_become_whole_icmp_messages() {
-        // 10.0.0.254 报告超时，引用的是 guest 发往 1.1.1.1 的 echo 请求
+        // 10.0.0.254 reports time exceeded, quoting the echo request the guest sent to 1.1.1.1
         let mut ee = 113u32.to_le_bytes().to_vec();
         ee.extend([SO_EE_ORIGIN_ICMP, 11, 0, 0]);
         ee.extend([0; 8]);
@@ -1240,14 +1293,15 @@ mod tests {
         assert_eq!(inner[12..20], [172, 17, 0, 2, 1, 1, 1, 1]);
         assert_eq!(checksum(inner), [0, 0]);
         assert_eq!(icmp[28..], original);
-        // 超时是软错误，端口不可达是硬错误
+        // Time exceeded is a soft error, port unreachable a hard one
         assert!(!hard(AF_INET, 11, 0));
         assert!(hard(AF_INET, ICMP_DEST_UNREACH, 3));
         assert!(!hard(AF_INET, ICMP_DEST_UNREACH, 1));
         assert!(hard(AF_INET6, 1, 4));
         assert!(!hard(AF_INET6, 3, 0));
 
-        // UDP 的：错误队列里只有载荷，补上 UDP 头（目的端口取自原来的目的地址）
+        // UDP: the error queue holds only the payload, and a UDP header is added (the destination
+        // port comes from the original destination address)
         let r = received(sockaddr_in([127, 0, 0, 1], 33434), r.control.clone());
         let (it, ..) = error_v4(-1, true, &[], 3, b"abcd", &r).unwrap();
         let udp = &it.icmp[28..];
@@ -1255,7 +1309,7 @@ mod tests {
         assert_eq!(udp[2..6], [0x82, 0x9a, 0, 12]);
         assert_eq!(&udp[8..], b"abcd");
 
-        // 不是 ICMP 报告的错误（本机的）不要
+        // Errors not reported by ICMP (local ones) are skipped
         let mut local = ee.clone();
         local[4] = 1;
         let r = received(
@@ -1269,7 +1323,8 @@ mod tests {
     fn control_messages_are_cut_like_put_cmsg() {
         let mut control = cmsg(SOL_IP, IP_PKTINFO, &[0; 12]);
         control.extend(cmsg(SOL_IP, IP_TTL, &64i32.to_le_bytes()));
-        // 放不下：第一条整条，第二条截到剩下的长度；最后一条的对齐空白可以不要
+        // Does not fit: the first whole, the second cut to the remaining length; the last one's
+        // alignment padding may be left out
         let (fit, flags) = fit_control(&control, 32 + 18);
         assert_eq!(flags, MSG_CTRUNC);
         assert_eq!(fit.len(), 50);

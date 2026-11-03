@@ -1,13 +1,16 @@
-//! socket（kernel/net 的 map）。
+//! Sockets (the kernel/net map).
 //!
-//! - TCP、UDP 透传：guest 的 socket 持有一个宿主的非阻塞 socket，地址和选项按字节原样
-//!   传递。guest 的 `SOCK_RAW + IPPROTO_ICMP` 换成宿主的 ping socket。
-//! - DNS 存根：guest 的 `/etc/resolv.conf` 指向 `127.0.0.53`。发往 `127.0.0.53:53` 的
-//!   UDP 数据报不经过宿主网络，而是交给宿主的解析器（[`appine_hal::net::dns_query`]），
-//!   回答放进这个 socket 自己的队列，像是从 `127.0.0.53:53` 收到的。
-//! - `NETLINK_ROUTE`：在进程内回答接口、地址、路由和规则的查询（getifaddrs、`ip addr`、
-//!   `ip route`、`ip rule`，路由见 [`crate::route`]）；邻居表总是空的。
-//! - AF_UNIX：完全在进程内模拟（[`crate::unix`]）。
+//! - TCP and UDP passthrough: a guest socket holds a nonblocking host socket, and addresses and
+//!   options are passed through byte for byte. The guest's `SOCK_RAW + IPPROTO_ICMP` becomes a
+//!   host ping socket.
+//! - DNS stub: the guest's `/etc/resolv.conf` points at `127.0.0.53`. UDP datagrams sent to
+//!   `127.0.0.53:53` do not go through the host network but to the host's resolver
+//!   ([`appine_hal::net::dns_query`]), and the answer is put into this socket's own queue, as if
+//!   received from `127.0.0.53:53`.
+//! - `NETLINK_ROUTE`: queries for interfaces, addresses, routes and rules are answered in process
+//!   (getifaddrs, `ip addr`, `ip route`, `ip rule`; routes are in [`crate::route`]); the neighbour
+//!   table is always empty.
+//! - AF_UNIX: emulated entirely in process ([`crate::unix`]).
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -18,103 +21,118 @@ use appine_hal::net::{Interface, Route};
 
 use crate::traffic::IfStats;
 
-/// 地址族。
+/// Address families.
 pub const AF_UNIX: i32 = 1;
 pub const AF_INET: i32 = 2;
 pub const AF_INET6: i32 = 10;
 pub const AF_NETLINK: i32 = 16;
 
-/// socket 类型（不含 `SOCK_NONBLOCK`、`SOCK_CLOEXEC`）。
+/// Socket types (without `SOCK_NONBLOCK`, `SOCK_CLOEXEC`).
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 pub const SOCK_RAW: i32 = 3;
 
-/// 一个 guest socket。
+/// A guest socket.
 pub(crate) enum Socket {
     Inet(InetSocket),
     Netlink(NetlinkSocket),
     Unix(crate::unix::UnixSocket),
 }
 
-/// 经由宿主 socket 实现的 TCP、UDP、ping socket。
+/// TCP, UDP and ping sockets implemented with host sockets.
 pub(crate) struct InetSocket {
-    /// 宿主 fd（非阻塞），随这个对象一起关闭。
+    /// The host fd (nonblocking), closed together with this object.
     pub fd: i32,
     pub family: i32,
-    /// 宿主 socket 的类型。
+    /// The type of the host socket.
     pub ty: i32,
-    /// 协议号：guest 建 socket 时给的，给的是 0 时按类型取默认的 TCP、UDP。
+    /// The protocol number: the one the guest gave when creating the socket, or the default TCP or
+    /// UDP for the type when it gave 0.
     pub proto: i32,
-    /// guest 建的是 `SOCK_RAW`：raw ICMP 在宿主上是 ping socket，`SO_TYPE` 和
-    /// `/proc/net/raw` 按 guest 建的报告。
+    /// The guest created a `SOCK_RAW`: raw ICMP is a ping socket on the host, and `SO_TYPE` and
+    /// `/proc/net/raw` report what the guest created.
     pub raw: bool,
-    /// 数据报 socket 用 connect 连上的对端。ping 和 raw socket 没有对端端口，宿主的
-    /// getpeername 不给出对端（Linux 的 inet_getname），`/proc/net` 要用这个。
+    /// The peer a datagram socket connected to with connect. Ping and raw sockets have no peer
+    /// port, and the host's getpeername does not give the peer (Linux's inet_getname), so
+    /// `/proc/net` needs this.
     pub peer: Option<Vec<u8>>,
-    /// 用 connect 连到了 DNS 存根（宿主 socket 本身没有连接）。
+    /// Connected to the DNS stub with connect (the host socket itself is not connected).
     pub stub_peer: bool,
-    /// DNS 存根的回答，等 guest 读走。
+    /// DNS stub answers waiting for the guest to read them.
     pub answers: VecDeque<Vec<u8>>,
-    /// 放进 `answers` 的回答数（`EPOLLET` 每来一个都触发）。
+    /// The number of answers put into `answers` (`EPOLLET` triggers on each).
     pub answered: u64,
-    /// `SO_RCVTIMEO`、`SO_SNDTIMEO`：阻塞由我们模拟，所以超时也由我们处理。
+    /// `SO_RCVTIMEO`, `SO_SNDTIMEO`: we emulate blocking, so we also handle the timeouts.
     pub rcvtimeo: Option<Duration>,
     pub sndtimeo: Option<Duration>,
-    /// 流量算在哪个接口上（[`crate::traffic`]），本端地址定下来之后才有。
+    /// Which interface the traffic counts on ([`crate::traffic`]), only once the local address is
+    /// settled.
     pub route: Option<crate::traffic::Route>,
-    /// TCP 发起的连接已经数进了 ActiveOpens、还没有数过它失败（[`crate::traffic::Protocols`]）。
+    /// A TCP connection this socket initiated has been counted in ActiveOpens and its failure not
+    /// yet counted ([`crate::traffic::Protocols`]).
     pub opening: bool,
-    /// 建在新的网络命名空间里：地址要换算（[`crate::netns`]）；None 是宿主的网络。
+    /// Created in a new network namespace: addresses need translating ([`crate::netns`]); None is
+    /// the host's network.
     pub net: Option<Rc<crate::nsproxy::NetNs>>,
-    /// 新的网络命名空间里：宿主 socket 已经绑定了（guest 绑的，或者 connect、sendto、
-    /// listen 之前替它绑的）。
+    /// In a new network namespace: the host socket is already bound (by the guest, or on its
+    /// behalf before connect, sendto or listen).
     pub bound: bool,
-    /// 新的网络命名空间里：本端是通配地址、还没有连接（getsockname 报告通配地址）。
+    /// In a new network namespace: the local end is a wildcard address and not yet connected
+    /// (getsockname reports the wildcard address).
     pub any: bool,
-    /// 新的网络命名空间里：绑在自己的虚拟地址上（宿主上与通配地址一样是 127.a.b.1，
-    /// getsockname 报告它，[`crate::netns`]）。
+    /// In a new network namespace: bound to its own virtual address (on the host it is 127.a.b.1,
+    /// the same as the wildcard address; getsockname reports it, [`crate::netns`]).
     pub vaddr: Option<[u8; 4]>,
-    /// connect 给的对端（guest 的地址）：getpeername 报告它。
+    /// The peer given to connect (a guest address): getpeername reports it.
     pub guest_peer: Option<Vec<u8>>,
-    /// 新的网络命名空间里宿主 socket 绑在通配地址上（数据报 socket 显式绑通配地址、端口
-    /// 为 0 的，第一次发往宿主网络时由宿主自动绑定的）：发得到外面。发往映射的目的地时
-    /// 用 `IP_PKTINFO` 把源地址指定成这个命名空间的回环地址（[`crate::netns`]）。
+    /// In a new network namespace the host socket is bound to the wildcard address (a datagram
+    /// socket that explicitly bound the wildcard address with port 0, or that the host bound
+    /// automatically on its first send to the host network): it can reach the outside. When
+    /// sending to a mapped destination, `IP_PKTINFO` sets the source address to this namespace's
+    /// loopback address ([`crate::netns`]).
     pub wide: bool,
-    /// `wide` 的数据报 socket 连到了映射的目的地（宿主上的地址）：宿主 socket 不连接（连了
-    /// 本端就定成宿主选的 127.0.0.1，回到这个命名空间的回环地址的数据报对不上），不带地址的
-    /// 发送发往它，收到的只要来自它的（Linux 已连接的 UDP）。
+    /// A `wide` datagram socket connected to a mapped destination (an address on the host): the
+    /// host socket is not connected (connecting would fix the local end at the 127.0.0.1 the host
+    /// chooses, and datagrams coming back to this namespace's loopback address would not match);
+    /// sends without an address go to it, and only datagrams from it are received (as with a
+    /// connected UDP socket on Linux).
     pub vconn: Option<Vec<u8>>,
-    /// nftables 的 nat、过滤要记下的（[`Track`]），用到时才分配。
+    /// What nftables nat and filtering need to record ([`Track`]), allocated only when used.
     pub track: Option<Box<Track>>,
-    /// 开机时的命名空间里监听着的、PREROUTING 有 DNAT 的端口：从宿主外面连进来的由转发线程
-    /// 转给目的地（[`crate::forward`]）。
+    /// A port listening in the boot namespace that has a DNAT in PREROUTING: connections from
+    /// outside the host are passed to the destination by the forwarding thread
+    /// ([`crate::forward`]).
     pub fwd: Option<Box<crate::forward::Handle>>,
-    /// guest 调用过 listen（MPTCP 的宿主 socket 上取不到 `SO_ACCEPTCONN`）。
+    /// The guest called listen (`SO_ACCEPTCONN` is not available on MPTCP host sockets).
     pub listening: bool,
-    /// 新的网络命名空间里的监听登记在命名空间里的编号（[`crate::nsproxy::Listener`]），
-    /// 关掉时去掉。
+    /// The number under which a listen in a new network namespace is registered in the namespace
+    /// ([`crate::nsproxy::Listener`]), removed on close.
     pub listener: Option<std::num::NonZeroU64>,
-    /// UDP：宿主上绑在 127.a.b.254 上（发给自己的虚拟地址的），端口登记在命名空间的
-    /// [`crate::nsproxy::Loopback::self_udp`] 里，关掉时去掉。
+    /// UDP: bound on the host to 127.a.b.254 (for datagrams sent to its own virtual address), with
+    /// the port registered in the namespace's [`crate::nsproxy::Loopback::self_udp`], removed on
+    /// close.
     pub self_port: Option<u16>,
-    /// 新的网络命名空间里的 `IPV6_V6ONLY`：宿主 socket 要用 IPv4 映射的地址，不设它。
+    /// `IPV6_V6ONLY` in a new network namespace: the host socket must use IPv4-mapped addresses,
+    /// so it is not set there.
     pub v6only: bool,
-    /// guest 建的是 raw ICMP socket：收到的报文经由汇集点，改成 raw socket 上的样子
-    /// （[`crate::rawicmp`]）。
+    /// The guest created a raw ICMP socket: received messages go through the aggregation point
+    /// and are reshaped as on a raw socket ([`crate::rawicmp`]).
     pub icmp: Option<crate::rawicmp::RawIcmp>,
-    /// UDP：guest 设过 `IP_TTL`、`IPV6_UNICAST_HOPS`（traceroute 的探测包），自己打开了
-    /// `IP_RECVERR`、`IPV6_RECVERR`，以及看着它的错误的汇集点（[`crate::rawicmp::before_io`]）。
+    /// UDP: the guest set `IP_TTL`, `IPV6_UNICAST_HOPS` (traceroute's probes), enabled
+    /// `IP_RECVERR`, `IPV6_RECVERR` itself, and the aggregation point watching its errors
+    /// ([`crate::rawicmp::before_io`]).
     pub ttl_set: bool,
     pub guest_recverr: bool,
     pub udp_tap: Option<Rc<crate::cell::RefCell<crate::rawicmp::Tap>>>,
-    /// 汇集点替这个 socket 取走了宿主上的 ICMP 错误，按 Linux 的规矩要报告给 guest 的那个
-    /// （errno，0 是没有）：下一次收发、`SO_ERROR` 取走它（Linux 的 `sk_err`）。
+    /// The ICMP error that the aggregation point took off the host on this socket's behalf and that
+    /// Linux's rules say to report to the guest (an errno, 0 for none): the next send or receive,
+    /// or `SO_ERROR`, takes it (Linux's `sk_err`).
     pub icmp_err: std::cell::Cell<i32>,
-    /// 绑的是映射了的低端口（[`crate::portmap`]）：租约，以及 (guest 端口, 宿主端口)。
-    /// accept 出来的连接只有后者（本端是监听的那个端口）。
+    /// Bound to a mapped low port ([`crate::portmap`]): the lease, and (guest port, host port).
+    /// Connections from accept have only the latter (the local end is the listening port).
     pub lease: Option<crate::portmap::Lease>,
     pub local_map: Option<(u16, u16)>,
-    /// 连到了本机上映射了的低端口：(guest 端口, 宿主端口)。
+    /// Connected to a mapped low port on the local machine: (guest port, host port).
     pub peer_map: Option<(u16, u16)>,
 }
 
@@ -164,30 +182,34 @@ impl InetSocket {
 }
 
 impl InetSocket {
-    /// ICMPv6 的 socket（ping socket，或者模拟 raw socket 的那个）：在新的网络命名空间里
-    /// 用不了 IPv4 映射的地址（[`crate::netns::to_host`]）。
+    /// An ICMPv6 socket (a ping socket, or the one emulating a raw socket): IPv4-mapped addresses
+    /// cannot be used in a new network namespace ([`crate::netns::to_host`]).
     pub fn icmp6(&self) -> bool {
         self.family == AF_INET6 && self.proto == IPPROTO_ICMPV6
     }
 }
 
-/// 一个 socket 上 Linux 由连接跟踪记着的东西（[`crate::nft`]，docs/rounds/175-filter.md）。
+/// What Linux keeps in connection tracking for a socket ([`crate::nft`],
+/// docs/rounds/175-filter.md).
 #[derive(Debug, Default)]
 pub(crate) struct Track {
-    /// nat 换过目的地址的：(换成的, guest 给的)，都是 guest 的 sockaddr。从前者收到的数据报
-    /// 报告成来自后者。
+    /// Destinations nat rewrote: (rewritten to, given by the guest), both guest sockaddrs.
+    /// Datagrams received from the former are reported as coming from the latter.
     pub nat_back: Vec<(Vec<u8>, Vec<u8>)>,
-    /// UDP：收到过数据报的对方（guest 的 sockaddr）。回给它们的是 ESTABLISHED 的，过滤链里
-    /// `ct state established` 的规则认它们。
+    /// UDP: peers that datagrams were received from (guest sockaddrs). Sending back to them is
+    /// ESTABLISHED, and `ct state established` rules in the filter chains recognize them.
     pub seen: Vec<Vec<u8>>,
-    /// 连接了的 UDP：连的目的地被过滤链丢弃了。不带地址的发送不发出去：0 是悄悄丢掉，别的
-    /// 是错误码（OUTPUT 上的丢弃是 EPERM）。
+    /// Connected UDP: the destination connected to was dropped by a filter chain. Sends without an
+    /// address are not sent: 0 means silently dropped, anything else is an error number (a drop
+    /// on OUTPUT is EPERM).
     pub blocked: Option<i32>,
-    /// accept 出来的 TCP 连接：发起的一端被 nat 换过目的地址时，这个命名空间里看到的原目的
-    /// 地址（guest 的 sockaddr，`SO_ORIGINAL_DST` 报告它，[`crate::origdst`]）。
+    /// A TCP connection from accept: when nat rewrote the destination of the initiating end, the
+    /// original destination seen in this namespace (a guest sockaddr, reported by
+    /// `SO_ORIGINAL_DST`, [`crate::origdst`]).
     pub orig_dst: Option<Vec<u8>>,
-    /// `SO_MARK`：只记在这里，不设到宿主 socket 上（App 在宿主上没有这个权限，Android 的 netd
-    /// 也用宿主上的标记选网络）。本机发出的包在 nftables 里带着它（[`crate::nft::Packet::mark`]）。
+    /// `SO_MARK`: only recorded here, not set on the host socket (the app has no permission for it
+    /// on the host, and Android's netd also uses marks on the host to choose networks). Packets
+    /// sent by this machine carry it in nftables ([`crate::nft::Packet::mark`]).
     pub mark: u32,
 }
 
@@ -196,7 +218,7 @@ impl InetSocket {
         self.track.get_or_insert_with(Default::default)
     }
 
-    /// `SO_MARK`（[`Track::mark`]）。
+    /// `SO_MARK` ([`Track::mark`]).
     pub(crate) fn mark(&self) -> u32 {
         self.track.as_ref().map_or(0, |t| t.mark)
     }
@@ -226,17 +248,17 @@ const SO_PROTOCOL: i32 = 38;
 pub(crate) const IPPROTO_ICMP: i32 = 1;
 pub(crate) const IPPROTO_TCP: i32 = 6;
 pub(crate) const IPPROTO_UDP: i32 = 17;
-/// MPTCP 的协议号（`socket(2)` 的第三个参数，`SO_PROTOCOL` 报告它）。
+/// The protocol number of MPTCP (the third argument of `socket(2)`, reported by `SO_PROTOCOL`).
 pub(crate) const IPPROTO_MPTCP: i32 = 262;
 const IPPROTO_ICMPV6: i32 = 58;
 const TCP_INFO: i32 = 11;
-/// `/proc/net` 的 st 列（Linux 的 TCP 状态，UDP 也借用其中两个）。
+/// The st column of `/proc/net` (Linux's TCP states; UDP borrows two of them too).
 const TCP_ESTABLISHED: u8 = 1;
 const TCP_CLOSE: u8 = 7;
 const TCP_LISTEN: u8 = 10;
 
-/// `/proc/net` 格式的地址：IPv4 是一个 32 位字，IPv6 是四个，按内存里的字节当成小端
-/// 打印（与 arm64 上的 Linux 相同）；端口按数值。
+/// An address in `/proc/net` format: IPv4 is one 32-bit word and IPv6 four, printed as their
+/// in-memory bytes read as little-endian (the same as Linux on arm64); the port as a number.
 fn proc_addr(addr: Option<&[u8]>, v6: bool, port: Option<u16>) -> String {
     let addr = addr.unwrap_or_default();
     let port = port.unwrap_or_else(|| {
@@ -256,21 +278,22 @@ fn proc_addr(addr: Option<&[u8]>, v6: bool, port: Option<u16>) -> String {
     s
 }
 
-/// `/proc/net` 下列出 socket 的表。
+/// The tables under `/proc/net` that list sockets.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Table {
     Tcp,
     Udp,
-    /// ping socket（`icmp`、`icmp6`）。
+    /// Ping sockets (`icmp`, `icmp6`).
     Icmp,
-    /// raw socket（`raw`、`raw6`）。
+    /// Raw sockets (`raw`, `raw6`).
     Raw,
 }
 
-/// `/proc/net/{tcp,udp,icmp,raw}` 和对应的 IPv6 文件：`family` 的这一种 socket。地址和
-/// TCP 状态从宿主 socket 查，队列长度和计时器都是 0。与 Linux 一样，ping 和 raw socket
-/// 的对端端口总是 0，raw socket 的本端端口是协议号；IPv4 的 tcp、udp、icmp 每行补空格
-/// 到固定宽度，raw 和 IPv6 的不补。
+/// `/proc/net/{tcp,udp,icmp,raw}` and the matching IPv6 files: this kind of socket of `family`.
+/// Addresses and TCP state are queried from the host socket; queue lengths and timers are all 0.
+/// As on Linux, the peer port of ping and raw sockets is always 0 and the local port of raw
+/// sockets is the protocol number; IPv4 tcp, udp and icmp lines are padded with spaces to a fixed
+/// width, raw and IPv6 lines are not.
 pub(crate) fn proc_listing(
     sockets: &[(crate::syscall::SocketRef, u32)],
     family: i32,
@@ -309,7 +332,8 @@ pub(crate) fn proc_listing(
         let proto = int(appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, 4));
         let listed = inet.family == family
             && match table {
-                // MPTCP 的 socket 也列在这里（第一个子流是 TCP socket；Go 1.24 起监听默认用它）
+                // MPTCP sockets are listed here too (the first subflow is a TCP socket; Go 1.24
+                // and later listen with it by default)
                 Table::Tcp => {
                     inet.ty == SOCK_STREAM && matches!(proto, Some(IPPROTO_TCP | IPPROTO_MPTCP))
                 }
@@ -320,7 +344,8 @@ pub(crate) fn proc_listing(
         if !listed {
             continue;
         }
-        // 地址换成 guest 看到的（crate::netns），映射了的低端口报告 guest 的（crate::portmap）
+        // Addresses as the guest sees them (crate::netns), and mapped low ports reported as the
+        // guest's (crate::portmap)
         let me = inet.net.clone().unwrap_or_else(|| w.all[0].clone());
         let unmap =
             |a: Vec<u8>, local: bool| crate::syscall::unmap_addr(portmap, w, inet, a, local);
@@ -375,11 +400,12 @@ pub(crate) fn proc_listing(
     lines.iter().map(|l| format!("{l:<width$}\n")).collect()
 }
 
-/// `/proc/net/sockstat`、`sockstat6`（`v6`）：guest 的 socket 各有多少（Linux 的
-/// `sockstat_seq_show`）。TCP 的 inuse 数监听着、连接着（不是 CLOSE）的，alloc 数所有 TCP
-/// socket（两个地址族一起，Linux 上是整个系统的）；UDP 数绑定了端口的，raw 数所有的，
-/// ping socket 不显示。宿主内核里已经关掉、还在 TIME_WAIT 或者孤儿状态的连接这里看不到，
-/// 占用的内存页数也不知道，都是 0。
+/// `/proc/net/sockstat`, `sockstat6` (`v6`): how many guest sockets of each kind there are
+/// (Linux's `sockstat_seq_show`). TCP inuse counts those listening or connected (not CLOSE),
+/// alloc counts all TCP sockets (both address families together; on Linux it is system-wide);
+/// UDP counts those with a bound port, raw counts all, and ping sockets are not shown.
+/// Connections already closed in the host kernel but still in TIME_WAIT or orphaned are not seen
+/// here, and the number of memory pages used is not known either; both are 0.
 pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -> String {
     let int = |b: Result<Vec<u8>, i32>| {
         b.ok()
@@ -435,7 +461,7 @@ pub(crate) fn sockstat(sockets: &[(crate::syscall::SocketRef, u32)], v6: bool) -
     }
 }
 
-/// `/proc/net/snmp` 里 TCP 的字段（Linux 6.1 的 `snmp4_tcp_list`）。
+/// The TCP fields in `/proc/net/snmp` (Linux 6.1's `snmp4_tcp_list`).
 const SNMP_TCP: [&str; 15] = [
     "RtoAlgorithm",
     "RtoMin",
@@ -454,7 +480,7 @@ const SNMP_TCP: [&str; 15] = [
     "InCsumErrors",
 ];
 
-/// UDP、UDP-Lite 的字段（`snmp4_udp_list`）。
+/// The UDP and UDP-Lite fields (`snmp4_udp_list`).
 const SNMP_UDP: [&str; 9] = [
     "InDatagrams",
     "NoPorts",
@@ -467,7 +493,7 @@ const SNMP_UDP: [&str; 9] = [
     "MemErrors",
 ];
 
-/// IP 的字段（`snmp4_ipstats_list`），前面还有 Forwarding、DefaultTTL。
+/// The IP fields (`snmp4_ipstats_list`), preceded by Forwarding and DefaultTTL.
 const SNMP_IP: [&str; 17] = [
     "InReceives",
     "InHdrErrors",
@@ -488,7 +514,7 @@ const SNMP_IP: [&str; 17] = [
     "FragCreates",
 ];
 
-/// ICMP 按类型的字段和类型号（`icmpmibmap`），收、发各一组。
+/// The per-type ICMP fields and type numbers (`icmpmibmap`), one set each for in and out.
 const SNMP_ICMP: [(&str, u8); 11] = [
     ("DestUnreachs", 3),
     ("TimeExcds", 11),
@@ -505,10 +531,12 @@ const SNMP_ICMP: [(&str, u8); 11] = [
 const ICMP_ECHOREPLY: u8 = 0;
 const ICMP_ECHO: u8 = 8;
 
-/// `/proc/net/snmp`（Linux 6.1 的 `snmp_seq_show`）：IPv4 的 IP、ICMP 和 TCP、UDP 的计数，
-/// 每一组一行字段名、一行数值。计数取自 [`crate::traffic::Protocols`]，CurrEstab 是现在
-/// ESTABLISHED 的 TCP socket 数；不转发（没有 `ip_forward`），TTL 是默认的 64，RTO 的
-/// 几项与 Linux 的初值相同，内核层看不到的错误、重传、复位、分片都是 0。
+/// `/proc/net/snmp` (Linux 6.1's `snmp_seq_show`): IPv4 counters for IP and ICMP, and for TCP and
+/// UDP, each group as one line of field names and one line of values. The counters come from
+/// [`crate::traffic::Protocols`], and CurrEstab is the number of TCP sockets now ESTABLISHED; no
+/// forwarding (there is no `ip_forward`), the TTL is the default 64, the RTO items are Linux's
+/// initial values, and errors, retransmissions, resets and fragments the kernel layer cannot see
+/// are all 0.
 pub(crate) fn proc_snmp(
     sockets: &[(crate::syscall::SocketRef, u32)],
     p: &crate::traffic::Protocols,
@@ -570,7 +598,7 @@ pub(crate) fn proc_snmp(
     }
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     out += &line("Icmp", &names, &nums(&icmp));
-    // 只列出不为 0 的类型：先收后发，各按类型号
+    // List only types that are not 0: in before out, each by type number
     let msgs: Vec<(String, u64)> = [(ICMP_ECHOREPLY, true), (ICMP_ECHO, false)]
         .into_iter()
         .map(|(ty, rx)| {
@@ -608,7 +636,7 @@ pub(crate) fn proc_snmp(
     out
 }
 
-/// `/proc/net/netstat` 里 TcpExt 的字段（Linux 6.1 的 `snmp4_net_list`）。
+/// The TcpExt fields in `/proc/net/netstat` (Linux 6.1's `snmp4_net_list`).
 const NETSTAT_TCP: &str = "SyncookiesSent SyncookiesRecv SyncookiesFailed EmbryonicRsts \
 PruneCalled RcvPruned OfoPruned OutOfWindowIcmps LockDroppedIcmps ArpFilter TW TWRecycled \
 TWKilled PAWSActive PAWSEstab DelayedACKs DelayedACKLocked DelayedACKLost ListenOverflows \
@@ -635,12 +663,12 @@ TCPMTUPSuccess TCPDelivered TCPDeliveredCE TCPAckCompressed TCPZeroWindowDrop TC
 TCPWqueueTooBig TCPFastOpenPassiveAltKey TcpTimeoutRehash TcpDuplicateDataRehash \
 TCPDSACKRecvSegs TCPDSACKIgnoredDubious TCPMigrateReqSuccess TCPMigrateReqFailure";
 
-/// IpExt 的字段（`snmp4_ipextstats_list`）。
+/// The IpExt fields (`snmp4_ipextstats_list`).
 const NETSTAT_IP: &str = "InNoRoutes InTruncatedPkts InMcastPkts OutMcastPkts InBcastPkts \
 OutBcastPkts InOctets OutOctets InMcastOctets OutMcastOctets InBcastOctets OutBcastOctets \
 InCsumErrors InNoECTPkts InECT1Pkts InECT0Pkts InCEPkts ReasmOverlaps";
 
-/// MPTcpExt 的字段（`mptcp_snmp_list`）。
+/// The MPTcpExt fields (`mptcp_snmp_list`).
 const NETSTAT_MPTCP: &str = "MPCapableSYNRX MPCapableSYNTX MPCapableSYNACKRX MPCapableACKRX \
 MPCapableFallbackACK MPCapableFallbackSYNACK MPFallbackTokenInit MPTCPRetrans \
 MPJoinNoTokenFound MPJoinSynRx MPJoinSynAckRx MPJoinSynAckHMacFailure MPJoinAckRx \
@@ -651,8 +679,9 @@ MismatchPortAckRx RmAddr RmAddrDrop RmSubflow MPPrioTx MPPrioRx MPFailTx MPFailR
 MPFastcloseTx MPFastcloseRx MPRstTx MPRstRx RcvPruned SubflowStale SubflowRecover \
 SndWndShared RcvWndShared RcvWndConflictUpdate RcvWndConflict";
 
-/// `/proc/net/netstat`（`netstat_seq_show`）：TCP、MPTCP 的扩展计数内核层都看不到，是 0；
-/// IpExt 里收发的字节数是 IPv4 的载荷（Linux 的含 IP 头），收到的包都当作不带 ECN 标记。
+/// `/proc/net/netstat` (`netstat_seq_show`): the kernel layer sees none of the TCP and MPTCP
+/// extended counters, which are 0; IpExt's byte counts in and out are IPv4 payload (Linux's
+/// include the IP header), and every received packet is taken as having no ECN mark.
 pub(crate) fn proc_netstat(p: &crate::traffic::Protocols) -> String {
     let group = |name: &str, fields: &str, values: &dyn Fn(&str) -> u64| {
         let values: Vec<String> = fields.split(' ').map(|f| values(f).to_string()).collect();
@@ -668,36 +697,38 @@ pub(crate) fn proc_netstat(p: &crate::traffic::Protocols) -> String {
         + &group("MPTcpExt", NETSTAT_MPTCP, &|_| 0)
 }
 
-/// `/proc/net/arp`：邻居表总是空的（与 `RTM_GETNEIGH` 一样），只有表头。
+/// `/proc/net/arp`: the neighbour table is always empty (as with `RTM_GETNEIGH`), only the header.
 pub(crate) const PROC_ARP: &str =
     "IP address       HW type     Flags       HW address            Mask     Device\n";
 
-/// 进程内模拟的 netlink socket。只有 `NETLINK_ROUTE` 回答查询；`NETLINK_KOBJECT_UEVENT`
-/// 的 socket 什么也收不到（mdev 监听的 uevent），别的协议建不了（`syscall::net::socket`）。
+/// A netlink socket emulated in process. Only `NETLINK_ROUTE` answers queries; a
+/// `NETLINK_KOBJECT_UEVENT` socket never receives anything (the uevents mdev listens for), and
+/// other protocols cannot be created (`syscall::net::socket`).
 pub(crate) struct NetlinkSocket {
     pub protocol: i32,
-    /// `nl_pid`：bind 时分配。
+    /// `nl_pid`: assigned on bind.
     pub pid: u32,
-    /// 等 guest 读走的回答，每一项是一个数据报。
+    /// Answers waiting for the guest to read them, one datagram per item.
     pub queue: VecDeque<Vec<u8>>,
-    /// 放进 `queue` 的数据报数（`EPOLLET` 每来一个都触发）。
+    /// The number of datagrams put into `queue` (`EPOLLET` triggers on each).
     pub arrivals: u64,
-    /// `SO_RCVTIMEO`：没有回答可读时最多等多久。
+    /// `SO_RCVTIMEO`: how long to wait at most when there is no answer to read.
     pub rcvtimeo: Option<Duration>,
-    /// 建在新的网络命名空间里时是它（回答它的 lo、配置 lo）。
+    /// The new network namespace it was created in, if any (its lo is answered and configured).
     pub net: Option<Rc<crate::nsproxy::NetNs>>,
-    /// `NETLINK_EXT_ACK`：出错的确认附上 extack 的消息（iproute2 打印成 `Error: ….`）。
+    /// `NETLINK_EXT_ACK`: error acks carry the extack message (iproute2 prints it as
+    /// `Error: ….`).
     pub ext_ack: bool,
-    /// `NETLINK_CAP_ACK`：出错的确认只附上请求的消息头。
+    /// `NETLINK_CAP_ACK`: error acks carry only the request's message header.
     pub cap_ack: bool,
 }
 
-// ---- DNS 存根 ----
+// ---- DNS stub ----
 
-/// DNS 存根的 IPv4 地址 127.0.0.53。
+/// The IPv4 address of the DNS stub, 127.0.0.53.
 const STUB_V4: [u8; 4] = [127, 0, 0, 53];
 
-/// 是不是发往 DNS 存根（`127.0.0.53:53`，或者它的 IPv4 映射的 IPv6 地址）的地址。
+/// Whether an address is that of the DNS stub (`127.0.0.53:53`, or its IPv4-mapped IPv6 address).
 pub fn is_stub(addr: &[u8]) -> bool {
     if addr.len() < 8 || addr[2..4] != 53u16.to_be_bytes() {
         return false;
@@ -711,7 +742,7 @@ pub fn is_stub(addr: &[u8]) -> bool {
     }
 }
 
-/// DNS 存根的 sockaddr，按 socket 的地址族编码。
+/// The DNS stub's sockaddr, encoded for the socket's address family.
 pub fn stub_addr(family: i32) -> Vec<u8> {
     use std::net::{Ipv4Addr, SocketAddr};
     let v4 = Ipv4Addr::from(STUB_V4);
@@ -723,8 +754,9 @@ pub fn stub_addr(family: i32) -> Vec<u8> {
     appine_hal::net::sockaddr(addr)
 }
 
-/// 解析失败时给 guest 的回答：原样带回查询，置上 QR、RA 位，RCODE 为 SERVFAIL，
-/// 让解析器立即失败而不是等到超时。
+/// The answer given to the guest when resolution fails: the query brought back as is, with the
+/// QR and RA bits set and RCODE SERVFAIL, so the resolver fails at once instead of waiting for a
+/// timeout.
 pub fn servfail(query: &[u8]) -> Vec<u8> {
     let mut r = query.to_vec();
     if r.len() >= 4 {
@@ -754,9 +786,9 @@ const RTM_GETRULE: u16 = 34;
 const RTM_NEWNSID: u16 = 88;
 const RTM_GETNSID: u16 = 90;
 const NETNSA_NSID: u16 = 1;
-/// RTM_GETNSID 按进程找网络命名空间（[`Host::peer_net`]）。
+/// RTM_GETNSID looks up a network namespace by process ([`Host::peer_net`]).
 pub(crate) const NETNSA_PID: u16 = 2;
-/// RTM_GETNSID 按命名空间文件找网络命名空间。
+/// RTM_GETNSID looks up a network namespace by namespace file.
 pub(crate) const NETNSA_FD: u16 = 3;
 const NETNSA_TARGET_NSID: u16 = 4;
 const IFLA_ADDRESS: u16 = 1;
@@ -777,9 +809,10 @@ const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-/// 转储的一个数据报最多多大：接口多时分成几个（musl 的 if_nameindex 等用 8 KiB 的缓冲区）。
+/// The largest datagram of a dump: split into several when there are many interfaces (musl's
+/// if_nameindex and others use an 8 KiB buffer).
 const DUMP_CHUNK: usize = 8192;
-/// `IF_OPER_*`（RFC 2863 的接口状态）。
+/// `IF_OPER_*` (RFC 2863 interface states).
 const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_DOWN: u8 = 2;
 const IF_OPER_UP: u8 = 6;
@@ -790,7 +823,8 @@ const IFA_BROADCAST: u16 = 4;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
 const IFA_PROTO: u16 = 11;
-/// 地址是内核加的：回环接口的 `::1`、自动配置的链路本地地址（`IFAPROT_KERNEL_*`）。
+/// Addresses added by the kernel: the loopback interface's `::1` and autoconfigured link-local
+/// addresses (`IFAPROT_KERNEL_*`).
 const IFAPROT_KERNEL_LO: u8 = 1;
 const IFAPROT_KERNEL_LL: u8 = 3;
 const ARPHRD_ETHER: u16 = 1;
@@ -802,15 +836,15 @@ const IFF_RUNNING: u32 = 0x40;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_HOST: u8 = 254;
-/// 地址不会过期（不是 DHCP、SLAAC 得到的临时地址）。
+/// The address never expires (not a temporary address from DHCP or SLAAC).
 const IFA_F_PERMANENT: u8 = 0x80;
-/// NETLINK_ROUTE 的协议号。
+/// The protocol number of NETLINK_ROUTE.
 pub const NETLINK_ROUTE: i32 = 0;
-/// NETLINK_KOBJECT_UEVENT 的协议号：内核发出的热插拔事件。
+/// The protocol number of NETLINK_KOBJECT_UEVENT: hotplug events sent by the kernel.
 pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
-/// NETLINK_GENERIC 的协议号。
+/// The protocol number of NETLINK_GENERIC.
 pub const NETLINK_GENERIC: i32 = 16;
-/// NETLINK_NETFILTER 的协议号（nftables，[`crate::nft`]）。
+/// The protocol number of NETLINK_NETFILTER (nftables, [`crate::nft`]).
 pub const NETLINK_NETFILTER: i32 = 12;
 
 fn align4(b: &mut Vec<u8>) {
@@ -824,7 +858,7 @@ pub(crate) fn attr(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
     align4(b);
 }
 
-/// 一条 netlink 消息：消息头加上内容。
+/// A netlink message: the message header plus the payload.
 pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
     let mut b = Vec::with_capacity(16 + payload.len());
     b.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
@@ -837,14 +871,15 @@ pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -
     b
 }
 
-/// 对请求 `req`（整条消息）的确认或者错误（Linux 的 `netlink_ack`）：成功时只附上请求的
-/// 消息头、带 `NLM_F_CAPPED`，出错时附上整条请求（没有设 `NETLINK_CAP_ACK`）。
+/// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
+/// the request's message header is attached, with `NLM_F_CAPPED`; on error the whole request is
+/// attached (`NETLINK_CAP_ACK` not set).
 fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
     ack_ext(req, err, pid, None, false)
 }
 
-/// 同 [`ack`]，另外按 `NETLINK_EXT_ACK` 附上 extack 的消息（`NLMSGERR_ATTR_MSG`，带
-/// `NLM_F_ACK_TLVS`），`cap` 是设了 `NETLINK_CAP_ACK`。
+/// Like [`ack`], also attaching the extack message per `NETLINK_EXT_ACK` (`NLMSGERR_ATTR_MSG`,
+/// with `NLM_F_ACK_TLVS`); `cap` means `NETLINK_CAP_ACK` is set.
 pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
     const NLM_F_ACK_TLVS: u16 = 0x200;
     const NLMSGERR_ATTR_MSG: u16 = 1;
@@ -867,8 +902,8 @@ pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bo
     message(NLMSG_ERROR, flags, seq, pid, &p)
 }
 
-/// 网络命名空间里的一个接口（netlink 的转储用）：宿主的（或者新的命名空间里的 lo），或者
-/// 虚拟设备（[`crate::netdev`]，带着对端所在命名空间的编号）。
+/// An interface in a network namespace (for netlink dumps): the host's (or lo in a new namespace),
+/// or a virtual device ([`crate::netdev`], with the number of the namespace its peer is in).
 pub(crate) enum Link {
     Host(Interface),
     Virt(crate::netdev::View, Option<i32>),
@@ -890,8 +925,9 @@ impl Link {
     }
 }
 
-/// 接口的状态（`IFLA_OPERSTATE`）：与 `/sys/class/net/<接口>/operstate` 一样，回环接口是
-/// unknown（Linux 的回环驱动不设置它），启用并且连着的是 up，别的是 down。
+/// The interface's state (`IFLA_OPERSTATE`): as with `/sys/class/net/<interface>/operstate`, the
+/// loopback interface is unknown (Linux's loopback driver does not set it), one that is up and
+/// connected is up, and the others are down.
 pub(crate) fn operstate(i: &Interface) -> u8 {
     if i.flags & IFF_LOOPBACK != 0 && i.flags & IFF_UP != 0 {
         IF_OPER_UNKNOWN
@@ -902,13 +938,14 @@ pub(crate) fn operstate(i: &Interface) -> u8 {
     }
 }
 
-/// 一个接口的 `RTM_NEWLINK`（Linux 的 `rtnl_fill_ifinfo`，属性的顺序相同）：`ip link` 用到
-/// 的和程序常读的几项，`IFLA_AF_SPEC` 这些设备参数没有。发送队列长度 `txqlen` 取自宿主，
-/// 取不到时是 Linux 的默认值 1000；guest 的数据包交给宿主 socket，接口上没有自己的排队
-/// 规则，qdisc 都是 noqueue。
+/// One interface's `RTM_NEWLINK` (Linux's `rtnl_fill_ifinfo`, attributes in the same order): the
+/// items `ip link` uses and programs commonly read; device parameters such as `IFLA_AF_SPEC` are
+/// missing. The transmit queue length `txqlen` comes from the host, or Linux's default 1000 when
+/// unavailable; guest packets are handed to host sockets and the interface has no queueing
+/// discipline of its own, so qdisc is always noqueue.
 fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
     let loopback = i.flags & IFF_LOOPBACK != 0;
-    // struct ifinfomsg：family、pad、type、index、flags、change
+    // struct ifinfomsg: family, pad, type, index, flags, change
     let mut p = vec![0u8, 0];
     let ty = if loopback {
         ARPHRD_LOOPBACK
@@ -935,7 +972,7 @@ fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
         IFLA_CARRIER,
         &[u8::from(i.flags & IFF_RUNNING != 0)],
     );
-    // 新的网络命名空间里还没起来的 lo 还没有 qdisc（crate::netns）
+    // lo in a new network namespace that is not up yet has no qdisc yet (crate::netns)
     let qdisc: &[u8] = if i.flags & (IFF_LOOPBACK | IFF_UP) == IFF_LOOPBACK {
         b"noop\0"
     } else {
@@ -947,8 +984,9 @@ fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
     attr(&mut p, IFLA_ADDRESS, &mac);
     let bcast = if loopback { [0; 6] } else { [0xff; 6] };
     attr(&mut p, IFLA_BROADCAST, &bcast);
-    // 流量计数（crate::traffic）：struct rtnl_link_stats64 在 Linux 6.1 是 25 个 u64，
-    // rtnl_link_stats 是 24 个 u32；前四项依次是收、发的包数和收、发的字节数，别的都是 0
+    // Traffic counters (crate::traffic): struct rtnl_link_stats64 is 25 u64s in Linux 6.1, and
+    // rtnl_link_stats 24 u32s; the first four are packets in, packets out, bytes in and bytes
+    // out, and everything else is 0
     let head = [st.rx_packets, st.tx_packets, st.rx_bytes, st.tx_bytes];
     let field = |n: usize| head.get(n).copied().unwrap_or(0);
     let stats64: Vec<u8> = (0..25).flat_map(|n| field(n).to_le_bytes()).collect();
@@ -960,8 +998,9 @@ fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
     p
 }
 
-/// IPv4 地址 `addr`/`prefix` 的广播地址：接口支持广播、网段里不止两个地址时是网段最后
-/// 一个地址（DHCP 和 `ip addr add ... brd +` 设的就是它），与本地表里的广播路由一致。
+/// The broadcast address of IPv4 address `addr`/`prefix`: when the interface supports broadcast
+/// and the subnet has more than two addresses, the subnet's last address (what DHCP and
+/// `ip addr add ... brd +` set), consistent with the broadcast route in the local table.
 fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
     if i.flags & IFF_BROADCAST == 0 || prefix >= 31 {
         return None;
@@ -970,11 +1009,11 @@ fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
     Some((ip | u32::MAX >> prefix).to_be_bytes())
 }
 
-/// 一个接口上的 `RTM_NEWADDR`（Linux 的 `inet_fill_ifaddr`、`inet6_fill_ifaddr`，属性的顺序
-/// 相同）。地址都当作不会过期的（`IFA_F_PERMANENT`，`ip addr` 显示 forever），创建和更新
-/// 的时刻不知道，是 0。
+/// The `RTM_NEWADDR`s on one interface (Linux's `inet_fill_ifaddr`, `inet6_fill_ifaddr`,
+/// attributes in the same order). Addresses are all taken as never expiring (`IFA_F_PERMANENT`,
+/// `ip addr` shows forever); their creation and update times are not known and are 0.
 fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
-    // struct ifa_cacheinfo：preferred、valid（全 1 是永久）、cstamp、tstamp
+    // struct ifa_cacheinfo: preferred, valid (all ones is permanent), cstamp, tstamp
     let mut cacheinfo = [0xffu8; 16];
     cacheinfo[8..].fill(0);
     i.addrs
@@ -989,7 +1028,7 @@ fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
             } else {
                 RT_SCOPE_UNIVERSE
             };
-            // struct ifaddrmsg：family、prefixlen、flags、scope、index
+            // struct ifaddrmsg: family, prefixlen, flags, scope, index
             let mut p = vec![*f as u8, *prefix, IFA_F_PERMANENT, scope];
             p.extend_from_slice(&i.index.to_le_bytes());
             let flags = u32::from(IFA_F_PERMANENT).to_le_bytes();
@@ -1020,15 +1059,17 @@ fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
 
 // ---- NETLINK_GENERIC ----
 //
-// 只有 Linux 总会有的 nlctrl 一个族（GENL_ID_CTRL）。nl80211、ethtool、wireguard、TASKSTATS
-// 这些子系统都没有，查它们得到 ENOENT，与没有编进它们的 Linux 一样：iw、ethtool、wg、iotop
-// 照它报错或者退回别的做法（原来 socket 就是 EPROTONOSUPPORT，有的程序不预期它）。回答的
-// 内容、错误码和错误消息里附上的请求与 Linux 6.8 逐字节相同（差分测试）。
+// Only the nlctrl family that Linux always has (GENL_ID_CTRL). Subsystems such as nl80211,
+// ethtool, wireguard and TASKSTATS are absent, and querying them gives ENOENT, as on a Linux
+// without them built in: iw, ethtool, wg and iotop report it or fall back to other approaches
+// (before, socket itself gave EPROTONOSUPPORT, which some programs do not expect). The answers'
+// content, error numbers and the requests attached to error messages are byte-identical to Linux
+// 6.8 (differential test).
 
 const GENL_ID_CTRL: u16 = 0x10;
-/// 小于它的消息类型是 netlink 自己的控制消息（`NLMSG_NOOP` 等）。
+/// Message types below this are netlink's own control messages (`NLMSG_NOOP` and so on).
 const NLMSG_MIN_TYPE: u16 = 0x10;
-/// 确认消息只附上请求的消息头。
+/// The ack carries only the request's message header.
 const NLM_F_CAPPED: u16 = 0x100;
 const CTRL_CMD_NEWFAMILY: u8 = 1;
 const CTRL_CMD_GETFAMILY: u8 = 3;
@@ -1054,8 +1095,9 @@ const EEXIST: i32 = 17;
 const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 
-/// nlctrl 的 `CTRL_CMD_NEWFAMILY`：genlmsghdr 和属性，与 Linux 6.8 的 `ctrl_fill_info` 相同
-/// （6.2 起 nlctrl 的命令各有自己的策略，族的 maxattr 是 0）。
+/// nlctrl's `CTRL_CMD_NEWFAMILY`: the genlmsghdr and attributes, the same as Linux 6.8's
+/// `ctrl_fill_info` (since 6.2 each nlctrl command has its own policy, and the family's maxattr
+/// is 0).
 fn nlctrl_family() -> Vec<u8> {
     let mut p = vec![CTRL_CMD_NEWFAMILY, 2, 0, 0];
     attr(&mut p, CTRL_ATTR_FAMILY_NAME, b"nlctrl\0");
@@ -1091,9 +1133,9 @@ fn nlctrl_family() -> Vec<u8> {
     p
 }
 
-/// 请求 `req`（消息头之后是 genlmsghdr 和属性）指的族是不是 nlctrl：按 `CTRL_ATTR_FAMILY_ID`
-/// 或者 `CTRL_ATTR_FAMILY_NAME` 找（Linux 的 `ctrl_getfamily`），两个都没有是 EINVAL，找不到
-/// 是 ENOENT。
+/// Whether request `req` (genlmsghdr and attributes after the message header) refers to the
+/// nlctrl family: looked up by `CTRL_ATTR_FAMILY_ID` or `CTRL_ATTR_FAMILY_NAME` (Linux's
+/// `ctrl_getfamily`); EINVAL when neither is present, ENOENT when not found.
 fn names_nlctrl(req: &[u8]) -> Result<(), i32> {
     let (mut id, mut name) = (None, None);
     let mut b = req.get(20..).unwrap_or_default();
@@ -1121,16 +1163,17 @@ fn names_nlctrl(req: &[u8]) -> Result<(), i32> {
     }
 }
 
-/// 回答 `NETLINK_GENERIC` 上的一条请求 `req`（整条消息），`pid` 是这个 socket 的 `nl_pid`。
-/// 返回各个数据报：与 Linux 一样，回答和确认各是一个（`genlmsg_reply`、`netlink_ack`），
-/// 程序读一次只拿到回答。
+/// Answers one request `req` (the whole message) on `NETLINK_GENERIC`; `pid` is this socket's
+/// `nl_pid`. Returns the datagrams: as on Linux, the answer and the ack are one each
+/// (`genlmsg_reply`, `netlink_ack`), so a program reading once gets only the answer.
 fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
     let ty = u16::from_le_bytes([req[4], req[5]]);
     let flags = u16::from_le_bytes([req[6], req[7]]);
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
     let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, pid, payload);
     let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-    // Linux 的 netlink_rcv_skb：不是请求的、控制消息只在要确认时确认
+    // Linux's netlink_rcv_skb: non-requests and control messages are acked only when an ack is
+    // asked for
     let r = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
         Ok(None)
     } else if ty != GENL_ID_CTRL {
@@ -1139,7 +1182,7 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
         Err(EINVAL)
     } else {
         match req[16] {
-            // 转储很小，与 Linux 一样 NLMSG_DONE 跟在同一个数据报里
+            // The dump is small, and as on Linux NLMSG_DONE follows in the same datagram
             CTRL_CMD_GETFAMILY if dump => {
                 let mut out = reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family());
                 out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
@@ -1148,13 +1191,15 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
             CTRL_CMD_GETFAMILY => {
                 names_nlctrl(req).map(|()| Some(reply(GENL_ID_CTRL, 0, &nlctrl_family())))
             }
-            // 策略的转储没有做：只认得出要的族不存在
+            // Policy dumps are not implemented: it can only tell that the requested family does not
+            // exist
             CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
             _ => Err(EOPNOTSUPP),
         }
     };
     match r {
-        // 转储之后不另外确认（Linux 的 netlink_dump_start 让 netlink_rcv_skb 跳过确认）
+        // No separate ack after a dump (Linux's netlink_dump_start makes netlink_rcv_skb skip the
+        // ack)
         Ok(answer) => {
             let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
             if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
@@ -1166,13 +1211,15 @@ fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
     }
 }
 
-/// 开机时的网络命名空间里修改宿主接口的请求（`RTM_NEWLINK`、`RTM_SETLINK`，Linux 的
-/// `rtnl_setlink`、`__rtnl_newlink`）。App 改不了宿主的接口，只接受什么也不改的：标志按
-/// `rtnl_dev_combine_flags` 合起来之后，`__dev_change_flags` 改得了的那些位与现在的相同，
-/// 带着的名字、MTU 也与现在的相同。dockerd 给容器的默认网络沙箱拉起本来就起着的 lo 就是
-/// 这样（`loopbackUp`）。真要改什么的仍是 EOPNOTSUPP，新建接口（`NLM_F_CREATE`，veth、
-/// bridge 这些）也是。`net_admin`：有没有 `CAP_NET_ADMIN`（没有时 EPERM，Linux 在解析
-/// 之前就查）。None：不是这两种请求。
+/// Requests in the boot network namespace that change a host interface (`RTM_NEWLINK`,
+/// `RTM_SETLINK`; Linux's `rtnl_setlink`, `__rtnl_newlink`). The app cannot change the host's
+/// interfaces, so only requests that change nothing are accepted: after the flags are combined by
+/// `rtnl_dev_combine_flags`, the bits `__dev_change_flags` can change are the same as now, and the
+/// name and MTU carried are also the same as now. That is what dockerd does when it brings up the
+/// already-up lo for a container's default network sandbox (`loopbackUp`). Anything that really
+/// changes something is still EOPNOTSUPP, and so is creating an interface (`NLM_F_CREATE`, veth,
+/// bridge and the like). `net_admin`: whether there is `CAP_NET_ADMIN` (EPERM without it; Linux
+/// checks before parsing). None: neither of these two requests.
 pub(crate) fn configure_host_link(
     ifaces: &[Interface],
     net_admin: bool,
@@ -1183,7 +1230,8 @@ pub(crate) fn configure_host_link(
     const NLM_F_EXCL: u16 = 0x200;
     const NLM_F_CREATE: u16 = 0x400;
     const ENODEV: i32 = 19;
-    // __dev_change_flags 按请求改的位（IFF_UP、IFF_PROMISC、IFF_ALLMULTI 另外处理，也算）
+    // The bits __dev_change_flags changes on request (IFF_UP, IFF_PROMISC, IFF_ALLMULTI are
+    // handled separately, and count too)
     const CHANGEABLE: u32 =
         0x1 | 0x4 | 0x20 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
     let ty = u16::from_le_bytes([req[4], req[5]]);
@@ -1194,7 +1242,7 @@ pub(crate) fn configure_host_link(
         return Some(EPERM);
     }
     let flags = u16::from_le_bytes([req[6], req[7]]);
-    // struct ifinfomsg：地址族、类型、编号、标志、要改的标志
+    // struct ifinfomsg: address family, type, index, flags, flags to change
     let Some(m) = req.get(16..32) else {
         return Some(EINVAL);
     };
@@ -1210,8 +1258,8 @@ pub(crate) fn configure_host_link(
     if newlink && index < 0 {
         return Some(EINVAL);
     }
-    // 按编号找，编号不是正数时按名字找；都没给时 RTM_SETLINK 是 EINVAL，RTM_NEWLINK 当作
-    // 没找到
+    // Look up by index, or by name when the index is not positive; when neither is given
+    // RTM_SETLINK is EINVAL and RTM_NEWLINK counts as not found
     if !newlink && index <= 0 && name.is_none() {
         return Some(EINVAL);
     }
@@ -1223,7 +1271,8 @@ pub(crate) fn configure_host_link(
         }
     });
     let Some(dev) = found else {
-        // 要新建的话 appine 建不了（Linux 没有那种接口的驱动时也是 EOPNOTSUPP）
+        // appine cannot create one when asked to (Linux also gives EOPNOTSUPP when it has no
+        // driver for that kind of interface)
         return Some(if newlink && flags & NLM_F_CREATE != 0 {
             EOPNOTSUPP
         } else {
@@ -1241,8 +1290,8 @@ pub(crate) fn configure_host_link(
         IFLA_MTU => d.get(..4) == Some(&dev.mtu.to_le_bytes()[..]),
         _ => false,
     });
-    // ifi_change 是 0 时整个 ifi_flags 都算要的（Linux 的"bugwards compatibility"），两个
-    // 都是 0 时不改标志
+    // When ifi_change is 0 the whole ifi_flags counts as wanted (Linux's "bugwards
+    // compatibility"); when both are 0 the flags are not changed
     let wanted = if change != 0 {
         (ifi_flags & change) | (dev.flags & !change)
     } else {
@@ -1252,46 +1301,48 @@ pub(crate) fn configure_host_link(
     Some(if same && flags_same { 0 } else { EOPNOTSUPP })
 }
 
-/// netlink 的回答要用到的宿主信息（测试里换成固定的）。
+/// Host information that netlink answers need (replaced with fixed values in tests).
 pub(crate) trait Host {
-    /// 宿主的网络接口。
+    /// The host's network interfaces.
     fn interfaces(&self) -> Vec<Interface>;
-    /// 接口的流量计数（[`crate::traffic`]）。
+    /// The traffic counters of an interface ([`crate::traffic`]).
     fn stats(&self, name: &str) -> IfStats;
-    /// 宿主主表里的路由，None 时按接口的地址合成（[`crate::route`]）。
+    /// The routes of the host's main table; when None they are synthesized from the interface
+    /// addresses ([`crate::route`]).
     fn routes(&self) -> Option<Vec<Route>>;
-    /// 接口的发送队列长度（`IFLA_TXQLEN`），取不到时是 None。
+    /// The interface's transmit queue length (`IFLA_TXQLEN`), None when unavailable.
     fn tx_queue_len(&self, name: &str) -> Option<u32>;
-    /// 发请求的进程的用户 ID（`ip route get` 回答里的 RTA_UID）。
+    /// The user ID of the requesting process (RTA_UID in the `ip route get` answer).
     fn uid(&self) -> u32;
-    /// 修改接口、地址、路由的请求（[`crate::netdev::request`]）：None 是不处理，Some 里是
-    /// 结果。
+    /// Requests that change interfaces, addresses or routes ([`crate::netdev::request`]): None
+    /// means not handled, Some holds the result.
     fn configure(&self, _req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
         None
     }
-    /// RTM_GETNSID 要找的网络命名空间：`attr` 是 [`NETNSA_PID`]（进程）或者 [`NETNSA_FD`]
-    /// （命名空间文件），`value` 是它的值。找得到时是这个命名空间给它分配的编号（没有分配
-    /// 是 None），不然是错误码。
+    /// The network namespace RTM_GETNSID looks for: `attr` is [`NETNSA_PID`] (a process) or
+    /// [`NETNSA_FD`] (a namespace file), and `value` its value. When found, the number this
+    /// namespace assigned to it (None when unassigned); otherwise an error number.
     fn peer_net(&self, _attr: u16, _value: u32) -> Result<Option<i32>, i32> {
         Ok(None)
     }
-    /// 所有的接口：宿主的（或者 lo）和虚拟设备，按编号。
+    /// All interfaces: the host's (or lo) and virtual devices, by index.
     fn links(&self) -> Vec<Link> {
         self.interfaces().into_iter().map(Link::Host).collect()
     }
-    /// 路由表（[`crate::route::tables`]，含虚拟设备上的）。
+    /// The routing tables ([`crate::route::tables`], including those on virtual devices).
     fn tables(&self) -> Vec<Route2> {
         crate::route::tables(&self.interfaces(), self.routes())
     }
-    /// 所有接口（含虚拟设备）的地址，`ip route get` 用。
+    /// The addresses of all interfaces (virtual devices included), for `ip route get`.
     fn all_interfaces(&self) -> Vec<Interface> {
         self.interfaces()
     }
-    /// 是开机时的命名空间：`ip route get` 可以让宿主选源地址。
+    /// This is the boot namespace: `ip route get` may let the host choose the source address.
     fn init_net(&self) -> bool {
         true
     }
-    /// `NETLINK_NETFILTER` 上的一个数据报（[`crate::nft::handle`]），返回各个回答的数据报。
+    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns the answer
+    /// datagrams.
     fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
         Vec::new()
     }
@@ -1313,9 +1364,10 @@ impl NetlinkSocket {
         }
     }
 
-    /// 处理 guest 发来的一个数据报（可能含多条请求），把回答放进队列。
+    /// Handles one datagram from the guest (which may hold several requests) and queues the
+    /// answers.
     pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
-        // nftables 的批跨几条消息，整个数据报一起处理
+        // An nftables batch spans several messages, so the whole datagram is handled together
         if self.protocol == NETLINK_NETFILTER {
             let peer = crate::nft::Peer {
                 pid: self.pid,
@@ -1353,7 +1405,7 @@ impl NetlinkSocket {
         }
     }
 
-    /// 回答 `NETLINK_ROUTE` 上的一条请求 `req`（整条消息），返回各个数据报。
+    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning the datagrams.
     fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
         let ty = u16::from_le_bytes([req[4], req[5]]);
         let flags = u16::from_le_bytes([req[6], req[7]]);
@@ -1380,9 +1432,10 @@ impl NetlinkSocket {
             Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
         };
         match ty {
-            // 与 Linux 一样，接口是一个数据报（太大时分成几个）；地址每个地址族一个
-            // （AF_UNSPEC 时先是 IPv4），NLMSG_DONE 另是一个。按 IFLA_MASTER、IFLA_LINKINFO
-            // 的种类过滤时消息带 NLM_F_DUMP_FILTERED（Linux 的 rtnl_dump_ifinfo）
+            // As on Linux, the interfaces are one datagram (split into several when too large);
+            // the addresses one per address family (IPv4 first for AF_UNSPEC), and NLMSG_DONE
+            // another one. When filtering by IFLA_MASTER or IFLA_LINKINFO's kind, the messages
+            // carry NLM_F_DUMP_FILTERED (Linux's rtnl_dump_ifinfo)
             RTM_GETLINK if dump => {
                 const NLM_F_DUMP_FILTERED: u16 = 0x20;
                 let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
@@ -1452,7 +1505,8 @@ impl NetlinkSocket {
                 out.push(done());
                 out
             }
-            // `ip link show <接口>`：按 ifi_index 或者 IFLA_IFNAME 找（Linux 的 rtnl_getlink）
+            // `ip link show <interface>`: looked up by ifi_index or IFLA_IFNAME (Linux's
+            // rtnl_getlink)
             RTM_GETLINK => {
                 const ENODEV: i32 = 19;
                 let index = req
@@ -1481,7 +1535,8 @@ impl NetlinkSocket {
                 }
                 out
             }
-            // 与 Linux 一样，每个地址族的路由是一个数据报，NLMSG_DONE 另是一个
+            // As on Linux, the routes of each address family are one datagram, and NLMSG_DONE
+            // another one
             RTM_GETROUTE if dump => {
                 let entries = host.tables();
                 let mut out = Vec::new();
@@ -1514,7 +1569,7 @@ impl NetlinkSocket {
                     Err(e) => vec![ack(req, e, self.pid)],
                 }
             }
-            // 规则一个数据报装得下，NLMSG_DONE 另是一个
+            // The rules fit in one datagram, and NLMSG_DONE is another one
             RTM_GETRULE if dump => {
                 const EAFNOSUPPORT: i32 = 97;
                 let rules = crate::route::rule_messages(family);
@@ -1527,10 +1582,11 @@ impl NetlinkSocket {
                     .collect();
                 vec![d, done()]
             }
-            // 网络命名空间的编号（`ip netns list`）：只在转储 veth 时给对端所在的命名空间分配
-            // （IFLA_LINK_NETNSID，Linux 的 peernet2id_alloc），RTM_NEWNSID 是 EOPNOTSUPP；
-            // 找得到对方时回答分配了的编号，没有分配是 -1（NETNSA_NSID_NOT_ASSIGNED），按编号
-            // 找的都找不到。顺序与 Linux 的 rtnl_net_getid 相同
+            // Network namespace numbers (`ip netns list`): assigned to the namespace of the peer
+            // only when dumping veths (IFLA_LINK_NETNSID, Linux's peernet2id_alloc), and
+            // RTM_NEWNSID is EOPNOTSUPP; when the other namespace is found the assigned number is
+            // answered, -1 when unassigned (NETNSA_NSID_NOT_ASSIGNED), and lookups by number never
+            // find anything. The order is the same as Linux's rtnl_net_getid
             RTM_GETNSID => {
                 let attrs = crate::route::attrs(req.get(20..).unwrap_or_default());
                 let get = |t| {
@@ -1565,10 +1621,12 @@ impl NetlinkSocket {
                     Err(e) => vec![ack(req, e, self.pid)],
                 }
             }
-            // 邻居表（ARP、NDP）：Android 上 App 看不到宿主的，总是空的
+            // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
+            // always empty
             RTM_GETNEIGH if dump => vec![done()],
             RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
-            // 不支持的请求：EOPNOTSUPP；控制消息只在要确认时确认
+            // Unsupported requests: EOPNOTSUPP; control messages are acked only when an ack is
+            // asked for
             _ if flags & NLM_F_REQUEST != 0 => {
                 if ty < NLMSG_MIN_TYPE {
                     if flags & NLM_F_ACK != 0 {
@@ -1584,7 +1642,7 @@ impl NetlinkSocket {
         }
     }
 
-    /// 这个 socket 的 `sockaddr_nl`。
+    /// This socket's `sockaddr_nl`.
     pub fn sockaddr(&self) -> Vec<u8> {
         let mut b = vec![0u8; 12];
         b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
@@ -1611,7 +1669,7 @@ mod tests {
         }
     }
 
-    /// 消息里的属性：类型 → 内容。
+    /// The attributes in a message: type → payload.
     fn attributes(mut b: &[u8]) -> std::collections::BTreeMap<u16, Vec<u8>> {
         let mut out = std::collections::BTreeMap::new();
         while b.len() >= 4 {
@@ -1623,7 +1681,8 @@ mod tests {
         out
     }
 
-    /// 固定的宿主：只有 lo，`stats` 是它的流量计数，宿主给出的路由是 `routes`。
+    /// A fixed host: only lo, `stats` is its traffic counters, and the routes the host gives are
+    /// `routes`.
     struct Fake {
         stats: IfStats,
         routes: Option<Vec<Route>>,
@@ -1661,7 +1720,8 @@ mod tests {
         routes: Some(Vec::new()),
     };
 
-    /// 按 musl 的 `__rtnetlink_enumerate` 解析回答：返回 (消息类型, 消息内容) 直到 DONE。
+    /// Parses an answer as musl's `__rtnetlink_enumerate` does: returns (message type, message
+    /// payload) up to DONE.
     fn parse(datagram: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let mut out = Vec::new();
         let mut off = 0;
@@ -1699,7 +1759,7 @@ mod tests {
                 routes: None,
             },
         );
-        // 接口、NLMSG_DONE、IPv4 地址、NLMSG_DONE 各是一个数据报
+        // Interfaces, NLMSG_DONE, IPv4 addresses, NLMSG_DONE are one datagram each
         let datagrams: Vec<_> = s.queue.drain(..).map(|d| parse(&d)).collect();
         let types: Vec<Vec<u16>> = datagrams
             .iter()
@@ -1717,7 +1777,7 @@ mod tests {
         let links = &datagrams[0];
         assert!(links[0].1.windows(3).any(|w| w == b"lo\0"));
         assert!(links[0].1.windows(3).any(|w| w == b"lo\0"));
-        // IFLA_STATS 截成 32 位，IFLA_STATS64 是完整的
+        // IFLA_STATS is truncated to 32 bits, IFLA_STATS64 is complete
         let attrs = attributes(&links[0].1[16..]);
         let u32s = |n: usize| -> Vec<u32> {
             attrs[&IFLA_STATS][..n * 4]
@@ -1732,7 +1792,8 @@ mod tests {
         assert_eq!(attrs[&IFLA_OPERSTATE], [IF_OPER_UNKNOWN]);
         assert_eq!(attrs[&IFLA_QDISC], b"noqueue\0");
         assert_eq!(attrs[&IFLA_TXQLEN], 1000u32.to_le_bytes());
-        // 只要 IPv4 地址：回环接口没有广播地址，地址是永久的
+        // Only IPv4 addresses: the loopback interface has no broadcast address, and the address
+        // is permanent
         let addrs = &datagrams[2];
         assert_eq!(
             addrs[0].1[..4],
@@ -1743,7 +1804,7 @@ mod tests {
         assert!(!a.contains_key(&IFA_BROADCAST));
         assert_eq!(a[&IFA_FLAGS], u32::from(IFA_F_PERMANENT).to_le_bytes());
         assert_eq!(a[&IFA_CACHEINFO][..8], [0xff; 8]);
-        // 单条查询：按编号、按名字；查不到是 ENODEV，没有条件是 EINVAL
+        // Single queries: by index, by name; ENODEV when not found, EINVAL without criteria
         let get = |index: i32, name: Option<&[u8]>| {
             let mut p = vec![0u8, 0, 0, 0];
             p.extend_from_slice(&index.to_le_bytes());
@@ -1767,8 +1828,9 @@ mod tests {
         assert_eq!(errno(ask(get(0, None))), -22);
     }
 
-    /// 路由、规则的转储：每个地址族一个数据报，NLMSG_DONE 另是一个；邻居表是空的；不支持的
-    /// 请求的错误附上整条请求，确认只附上消息头。
+    /// Route and rule dumps: one datagram per address family, and NLMSG_DONE another one; the
+    /// neighbour table is empty; errors for unsupported requests attach the whole request, and
+    /// acks attach only the message header.
     #[test]
     fn dumps_routes_rules_and_neighbours() {
         let mut s = NetlinkSocket::new(NETLINK_ROUTE);
@@ -1786,7 +1848,7 @@ mod tests {
                 &[family as u8, 0, 0, 0],
             )
         };
-        // lo 上：IPv4 的本地表三条，IPv6 的 ::1 一条
+        // On lo: three IPv4 local-table entries, and one for IPv6's ::1
         let r = ask(&dump(RTM_GETROUTE, 0));
         let counts: Vec<(usize, u16)> = r.iter().map(|d| (d.len(), d[0].0)).collect();
         assert_eq!(
@@ -1800,7 +1862,7 @@ mod tests {
         let r = ask(&dump(RTM_GETNEIGH, 0));
         assert_eq!(r.len(), 1);
         assert_eq!(r[0][0].0, NLMSG_DONE);
-        // 不支持的请求
+        // An unsupported request
         let req = message(
             RTM_NEWROUTE,
             NLM_F_REQUEST,
@@ -1812,7 +1874,7 @@ mod tests {
         assert_eq!(r[0][0].0, NLMSG_ERROR);
         assert_eq!(r[0][0].1[..4], (-95i32).to_le_bytes());
         assert_eq!(&r[0][0].1[4..], &req[..]);
-        // 要确认的 NLMSG_NOOP
+        // NLMSG_NOOP asking for an ack
         let r = ask(&message(1, NLM_F_REQUEST | NLM_F_ACK, 9, 0, &[]));
         assert_eq!(r[0][0].1.len(), 4 + 16);
         assert_eq!(r[0][0].1[..4], 0i32.to_le_bytes());
@@ -1830,13 +1892,15 @@ mod tests {
             s.handle(&message(RTM_GETNSID, NLM_F_REQUEST, 5, 0, &p), &NOTHING);
             s.queue.drain(..).flat_map(|d| parse(&d)).collect()
         };
-        // 找得到对方：回答 -1（没有分配编号），与 `ip netns list` 在 Linux 上看到的一样
+        // The other namespace is found: the answer is -1 (no number assigned), the same as what
+        // `ip netns list` sees on Linux
         let r = ask(&[(NETNSA_FD, &3u32.to_le_bytes())]);
         let mut want = vec![0u8; 4];
         attr(&mut want, NETNSA_NSID, &(-1i32).to_le_bytes());
         assert_eq!(r, [(RTM_NEWNSID, want)]);
         assert_eq!(ask(&[(NETNSA_PID, &1u32.to_le_bytes())]).len(), 1);
-        // 按编号找的都找不到；什么也没给是 EINVAL；要按编号换算成别的命名空间里的也是
+        // Lookups by number never find anything; giving nothing is EINVAL; so is asking for the
+        // number translated into another namespace
         let errno = |r: Vec<(u16, Vec<u8>)>| i32::from_le_bytes(r[0].1[..4].try_into().unwrap());
         assert_eq!(errno(ask(&[(NETNSA_NSID, &0i32.to_le_bytes())])), -ENOENT);
         assert_eq!(errno(ask(&[])), -EINVAL);
@@ -1847,7 +1911,7 @@ mod tests {
         assert_eq!(errno(ask(&target)), -EINVAL);
     }
 
-    /// 一条 NETLINK_GENERIC 请求：genlmsghdr 之后是属性。
+    /// A NETLINK_GENERIC request: attributes after the genlmsghdr.
     fn genl(ty: u16, flags: u16, cmd: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
         let mut p = vec![cmd, 1, 0, 0];
         for (t, d) in attrs {
@@ -1860,12 +1924,13 @@ mod tests {
     fn generic_netlink_has_only_nlctrl() {
         let mut s = NetlinkSocket::new(NETLINK_GENERIC);
         s.pid = 42;
-        // 回答的各个数据报，每个解析成消息
+        // The answer's datagrams, each parsed into messages
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
             s.queue.drain(..).map(|d| parse(&d)).collect()
         };
-        // 按名字查 nlctrl，要确认：回答和确认是两个数据报，确认只附上请求的消息头
+        // Query nlctrl by name, asking for an ack: the answer and the ack are two datagrams, and
+        // the ack attaches only the request's message header
         let name: &[u8] = b"nlctrl\0";
         let r = ask(&genl(
             GENL_ID_CTRL,
@@ -1886,7 +1951,7 @@ mod tests {
         assert_eq!(*ty, NLMSG_ERROR);
         assert_eq!(ack.len(), 4 + 16);
         assert_eq!(ack[..4], 0i32.to_le_bytes());
-        // 按编号查也一样
+        // The same by number
         let id = GENL_ID_CTRL.to_le_bytes();
         let r = ask(&genl(
             GENL_ID_CTRL,
@@ -1896,7 +1961,7 @@ mod tests {
         ));
         assert_eq!(r.len(), 1);
         assert_eq!(r[0][0].0, GENL_ID_CTRL);
-        // 出错时附上整条请求
+        // On error the whole request is attached
         let unknown: &[u8] = b"nl80211\0";
         let cases: [(Vec<u8>, i32); 5] = [
             (
@@ -1929,7 +1994,8 @@ mod tests {
             assert_eq!(e[..4], err.to_le_bytes());
             assert_eq!(&e[4..], &req[..]);
         }
-        // 转储只有 nlctrl，NLMSG_DONE 在同一个数据报里，之后不另外确认
+        // The dump has only nlctrl, NLMSG_DONE is in the same datagram, and no separate ack
+        // follows
         let r = ask(&genl(
             GENL_ID_CTRL,
             NLM_F_DUMP | NLM_F_ACK,
@@ -1951,13 +2017,14 @@ mod tests {
         assert_eq!(fail[..4], [0x12, 0x34, 0x81, 0x82]);
     }
 
-    /// 开机时的命名空间里改宿主的接口：什么也不改的成功，要改的 EOPNOTSUPP，错误码的顺序
-    /// 照 Linux 6.1 的 rtnl_setlink、__rtnl_newlink。
+    /// Changing host interfaces in the boot namespace: requests that change nothing succeed, ones
+    /// that change something are EOPNOTSUPP, and the order of error numbers is as in Linux 6.1's
+    /// rtnl_setlink, __rtnl_newlink.
     #[test]
     fn host_links_accept_requests_that_change_nothing() {
         const SET: u16 = 19;
         const UP: u32 = 0x1;
-        // 消息：头、ifinfomsg（编号、标志、要改的标志），后面是属性
+        // The message: header, ifinfomsg (index, flags, flags to change), then attributes
         let msg = |ty: u16, flags: u16, index: i32, ifi: (u32, u32), attrs: &[(u16, &[u8])]| {
             let mut m = vec![0u8; 32];
             m[4..6].copy_from_slice(&ty.to_le_bytes());
@@ -1976,7 +2043,8 @@ mod tests {
         let ask = |m: Vec<u8>| configure_host_link(&ifaces, true, &m);
         let lo_name: &[u8] = b"lo\0";
         let mtu = 65536u32.to_le_bytes();
-        // 已经起着的 lo：按编号、按名字、两种消息、标志都是 0、整个 ifi_flags（ifi_change 0）
+        // lo, already up: by index, by name, both messages, flags all 0, the whole ifi_flags
+        // (ifi_change 0)
         assert_eq!(ask(msg(RTM_NEWLINK, 0, 1, (UP, UP), &[])), Some(0));
         assert_eq!(ask(msg(SET, 0, 1, (UP, UP), &[])), Some(0));
         assert_eq!(
@@ -1989,7 +2057,8 @@ mod tests {
             ask(msg(RTM_NEWLINK, 0x400, 1, (UP, UP), &[(IFLA_MTU, &mtu)])),
             Some(0)
         );
-        // 要改的：关掉、混杂模式、别的 MTU、改名、别的属性
+        // Ones that change something: down, promiscuous mode, another MTU, rename, other
+        // attributes
         assert_eq!(ask(msg(RTM_NEWLINK, 0, 1, (0, UP), &[])), Some(EOPNOTSUPP));
         assert_eq!(
             ask(msg(RTM_NEWLINK, 0, 1, (0x100, 0x100), &[])),
@@ -2013,7 +2082,7 @@ mod tests {
             ask(msg(SET, 0, 1, (0, 0), &[(IFLA_TXQLEN, &[0; 4])])),
             Some(EOPNOTSUPP)
         );
-        // 找不到、新建、EXCL、REPLACE、编号和名字都没给
+        // Not found, create, EXCL, REPLACE, neither index nor name given
         assert_eq!(ask(msg(RTM_NEWLINK, 0, 9, (UP, UP), &[])), Some(19));
         assert_eq!(
             ask(msg(SET, 0, 0, (UP, UP), &[(IFLA_IFNAME, b"eth9\0")])),
@@ -2037,7 +2106,7 @@ mod tests {
         assert_eq!(ask(msg(RTM_NEWLINK, 0, 0, (UP, UP), &[])), Some(19));
         assert_eq!(ask(msg(SET, 0, 0, (UP, UP), &[])), Some(EINVAL));
         assert_eq!(ask(msg(RTM_NEWLINK, 0, -1, (UP, UP), &[])), Some(EINVAL));
-        // 没有 CAP_NET_ADMIN 时先是 EPERM；别的消息不归它管
+        // Without CAP_NET_ADMIN it is EPERM first; other messages are not its business
         assert_eq!(
             configure_host_link(&ifaces, false, &msg(RTM_NEWLINK, 0, 9, (0, 0), &[])),
             Some(EPERM)
