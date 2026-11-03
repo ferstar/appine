@@ -1,6 +1,7 @@
-//! Tier 1 在地址空间换了之后保留翻译、逐块核对 guest 指令字（`Dbt::recheck`，以及从
-//! 池里拿到的实例），函数返回的预测（影子返回栈），跨页的访存，以及硬件观察点。宿主不是
-//! aarch64 Linux 时没有 Tier 1，测试直接通过。
+//! Tier 1 keeping translations after the address space changes and checking guest instruction
+//! words block by block (`Dbt::recheck`, and instances taken from the pool), function return
+//! prediction (the shadow return stack), cross-page accesses, and hardware watchpoints. When the
+//! host is not aarch64 Linux there is no Tier 1 and the tests pass trivially.
 
 use std::ptr::NonNull;
 
@@ -12,10 +13,10 @@ use appine_engine::{
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
 
-/// 两页代码，`CODE` 和紧挨着的下一页；`STACK` 往下是一页栈。
+/// Two pages of code, `CODE` and the page right after it; below `STACK` is one page of stack.
 const CODE: u64 = 0x40_0000;
 const STACK: u64 = 0x80_0000;
-/// [`Guest::with_data`] 映射的数据页从这里开始，见那里的说明。
+/// The data pages mapped by [`Guest::with_data`] start here; see the description there.
 const DATA: u64 = 0x100_0000;
 
 const SVC: u32 = 0xd400_0001;
@@ -54,7 +55,7 @@ fn b(from: u64, to: u64) -> u32 {
 }
 
 struct Guest {
-    // 析构顺序：cpu → mmu → pages
+    // Drop order: cpu → mmu → pages
     cpu: Cpu,
     mmu: Mmu,
     pages: Box<[Page]>,
@@ -65,10 +66,11 @@ impl Guest {
         Self::with_pages(3)
     }
 
-    /// 在 [`Guest::new`] 之外再映射 6 页数据，第 i 页的每个字节都是 `i * 16` 加上页内
-    /// 偏移的低 4 位：
-    /// `DATA`、`DATA + 1 页` 的宿主页相邻；`+ 2 页`、`+ 3 页` 的宿主页前后颠倒；
-    /// `+ 4 页` 可读写，`+ 5 页` 只读，`+ 6 页` 没有映射。
+    /// Maps 6 data pages in addition to [`Guest::new`]; every byte of page i is `i * 16` plus the
+    /// low 4 bits of its offset in the page:
+    /// the host pages of `DATA` and `DATA + 1 page` are adjacent; those of `+ 2 pages` and
+    /// `+ 3 pages` are in reverse order;
+    /// `+ 4 pages` is read-write, `+ 5 pages` read-only, and `+ 6 pages` unmapped.
     fn with_data() -> Self {
         let mut g = Self::with_pages(9);
         for (i, page) in g.pages[3..].iter_mut().enumerate() {
@@ -116,13 +118,13 @@ impl Guest {
         Guest { cpu, mmu, pages }
     }
 
-    /// 数据第 `page` 页、页内偏移 `off` 处的 8 个字节（不跨页）。
+    /// The 8 bytes at offset `off` of data page `page` (not crossing pages).
     fn data(&self, page: usize, off: usize) -> u64 {
         let host = [3, 4, 6, 5, 7, 8][page];
         u64::from_le_bytes(self.pages[host].0[off..off + 8].try_into().unwrap())
     }
 
-    /// 把指令写到 `addr`（只支持本测试映射的两页）。
+    /// Writes instructions to `addr` (only the two pages this test maps are supported).
     fn code(&mut self, addr: u64, insns: &[u32]) {
         let off = (addr - CODE) as usize;
         for (i, insn) in insns.iter().enumerate() {
@@ -131,12 +133,12 @@ impl Guest {
         }
     }
 
-    /// 从 `CODE` 开始执行到 svc，返回 x0。
+    /// Runs from `CODE` to an svc and returns x0.
     fn run(&mut self, dbt: &mut Dbt) -> u64 {
         self.run_at(dbt, CODE)
     }
 
-    /// 从 `pc` 开始执行到 svc，返回 x0。
+    /// Runs from `pc` to an svc and returns x0.
     fn run_at(&mut self, dbt: &mut Dbt, pc: u64) -> u64 {
         let _ = &self.mmu;
         self.cpu.state_mut().pc = pc;
@@ -153,11 +155,11 @@ fn recheck_after_exec_runs_the_new_code() {
     let mut g = Guest::new();
     g.code(CODE, &[movz_x0(1), SVC]);
     assert_eq!(g.run(&mut dbt), 1);
-    // 同一个地址换成了另一个程序（exec），核对之后执行的是新代码
+    // The same address now holds another program (exec); after the check, the new code runs
     g.code(CODE, &[movz_x0(2), SVC]);
     dbt.recheck();
     assert_eq!(g.run(&mut dbt), 2);
-    // 代码没变时核对之后照样可用，不用重新翻译
+    // When the code has not changed it is still usable after the check, without retranslation
     let blocks = dbt.stats().blocks;
     dbt.recheck();
     assert_eq!(g.run(&mut dbt), 2);
@@ -172,7 +174,8 @@ fn pooled_instances_are_checked_before_use() {
     let mut g = Guest::new();
     g.code(CODE, &[movz_x0(3), SVC]);
     assert_eq!(g.run(&mut dbt), 3);
-    // 实例回到池里，下一个线程拿到它时这里已经是别的代码
+    // The instance goes back to the pool; when the next thread takes it, this holds different
+    // code
     drop(dbt);
     g.code(CODE, &[movz_x0(4), SVC]);
     let mut dbt = Dbt::new().unwrap();
@@ -181,7 +184,7 @@ fn pooled_instances_are_checked_before_use() {
 
 #[test]
 fn pooled_instances_keep_translations_of_the_same_program() {
-    // 别的测试不用这个键；池里同一个键的实例只会还给它
+    // No other test uses this key; a pooled instance with the same key is only given back to it
     const KEY: u64 = 0x5eed_0001;
     let Some(space) = DbtSpace::new(KEY, DbtRegs::Default) else {
         return;
@@ -191,20 +194,22 @@ fn pooled_instances_keep_translations_of_the_same_program() {
     let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 7);
     drop((dbt, space));
-    // 同一个程序再运行：拿回留下的翻译，核对之后直接用，不再翻译
+    // The same program runs again: it takes back the translations left behind and, after the
+    // check, uses them directly without translating again
     let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
     let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 7);
     assert_eq!(dbt.stats().blocks, 0);
     drop((dbt, space));
-    // 这期间代码变了：核对时作废，重新翻译
+    // The code changed in the meantime: invalidated by the check and translated again
     g.code(CODE, &[movz_x0(8), SVC]);
     let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
     let mut dbt = Dbt::attach(&space, 0).unwrap();
     assert_eq!(g.run(&mut dbt), 8);
     assert_eq!(dbt.stats().blocks, 1);
     drop((dbt, space));
-    // 宿主内存紧张时丢掉池里保留的翻译：再运行要重新翻译（或者拷贝模板）
+    // Dropping the translations kept in the pool when host memory is tight: running again has to
+    // translate again (or copy templates)
     appine_engine::trim_dbt_pool();
     let space = DbtSpace::new(KEY, DbtRegs::Default).unwrap();
     let mut dbt = Dbt::attach(&space, 0).unwrap();
@@ -218,7 +223,8 @@ fn both_register_sets_run_the_same_code() {
         return;
     }
     let mut g = Guest::new();
-    // x0 = x1 + … + x30，再改两个各组占用的寄存器，经由栈把 x25 复制到 x26
+    // x0 = x1 + … + x30, then change two registers each set takes, and copy x25 to x26 through
+    // the stack
     let mut code: Vec<u32> = (1..=30).map(|n| 0x8b00_0000 | n << 16).collect(); // add x0, x0, xn
     code.extend([
         0x9100_0610, // add x16, x16, #1
@@ -229,7 +235,8 @@ fn both_register_sets_run_the_same_code() {
     ]);
     g.code(CODE, &code);
     let sum: u64 = (1..=30).map(|n| n * 0x101).sum();
-    // 两组交替：同一个 pc 的翻译模板按寄存器分配区分，池里空的实例换一组时重新生成例程
+    // The two sets alternate: translation templates for the same pc are told apart by register
+    // assignment, and an empty pooled instance regenerates its routines when the set changes
     for regs in [DbtRegs::Default, DbtRegs::Go, DbtRegs::Default, DbtRegs::Go] {
         let mut dbt = Dbt::with_regs(regs).unwrap();
         let s = g.cpu.state_mut();
@@ -246,7 +253,8 @@ fn both_register_sets_run_the_same_code() {
         );
         assert_eq!(s.sp, STACK);
     }
-    // Go 的程序常用的 x16、x26–x28 在 Go 的一组里不用改写，x21–x25 要改写
+    // x16 and x26–x28, which Go programs use heavily, need no rewriting with the Go set, while
+    // x21–x25 do
     let other = CODE + 0x200;
     g.code(
         other,
@@ -276,8 +284,9 @@ fn branches_to_unaligned_addresses_fault() {
     let Some(mut dbt) = Dbt::new() else {
         return;
     };
-    // 第 0 页放一个块，作废之后它在翻译表里留下墓碑（pc 字段是未对齐的 1），位置就是查 1 时
-    // 开始找的地方；第 1 页是三种间接跳转
+    // Page 0 holds a block that, once invalidated, leaves a tombstone in the translation table
+    // (its pc field is the unaligned 1), placed exactly where a lookup of 1 starts searching;
+    // page 1 holds the three kinds of indirect branch
     let mut pages: Box<[Page]> = (0..2).map(|_| Page([0; 4096])).collect();
     let mut mmu = Mmu::new();
     let base = NonNull::new(pages.as_mut_ptr().cast::<u8>()).unwrap();
@@ -300,8 +309,9 @@ fn branches_to_unaligned_addresses_fault() {
             s.x[1] = target;
             s.x[30] = target;
             s.pc = at;
-            // 与 Linux 一样在跳过去之后、取指时报告对齐错误，pc 是目标；原来跳到 1 时进入跳转
-            // 缓存的空项（code 是 NULL）或者墓碑那个作废了的块
+            // As on Linux, the alignment fault is reported after the branch, at instruction
+            // fetch, with pc being the target; previously a branch to 1 entered the jump cache's
+            // empty entry (code is NULL) or the invalidated block of that tombstone
             let fault = Exit::Fault {
                 addr: target,
                 access: Access::Exec,
@@ -316,8 +326,9 @@ fn branches_to_unaligned_addresses_fault() {
 
 #[test]
 fn members_share_file_code_and_keep_jit_code_apart() {
-    // 两个地址空间共用一个实例：第一页是登记过的文件（共用），第二页各是各的 JIT 代码。共用的块
-    // 直接调用第二页：第一个成员链接过去之后，第二个成员照样要执行到自己的代码
+    // Two address spaces share one instance: the first page is a registered file (shared), and
+    // the second page is each one's own JIT code. A shared block calls the second page directly:
+    // after the first member links it, the second member must still reach its own code
     let Some(space) = DbtSpace::new(0, DbtRegs::Default) else {
         return;
     };
@@ -342,9 +353,11 @@ fn members_share_file_code_and_keep_jit_code_apart() {
             assert_eq!(g.run(dbt), n as u64 + 1, "round {round}");
         }
     }
-    // 第二个成员只翻译了自己的 JIT 代码，第一页的两个块用第一个成员翻译的
+    // The second member translated only its own JIT code; the two blocks of the first page are
+    // the ones the first member translated
     assert_eq!(members[1].1.stats().blocks, 1);
-    // pc 超出 48 位时不会查到带标签的块：第二个成员跳到"第一个成员的标签 | JIT 代码的地址"
+    // A pc beyond 48 bits never finds a tagged block: the second member branches to "the first
+    // member's tag | the JIT code's address"
     let (g, dbt) = &mut members[1];
     let forged = jit | u64::from(tags[0]) << 48;
     g.code(CODE + 8, &[0xd61f_0020]); // br x1
@@ -366,7 +379,8 @@ fn invalidation_keeps_blocks_whose_code_did_not_change() {
     g.code(other, &[movz_x0(8), SVC]);
     assert_eq!(g.run(&mut dbt), 7);
     assert_eq!(g.run_at(&mut dbt, other), 8);
-    // JIT 只改了同一页里的一处、按页 ic ivau：只有改了的块作废、重新翻译
+    // The JIT changed only one place in the same page, with a per-page ic ivau: only the changed
+    // block is invalidated and translated again
     g.code(other, &[movz_x0(9), SVC]);
     let before = dbt.stats();
     dbt.invalidate(&g.cpu, CODE, PAGE_SIZE);
@@ -387,7 +401,8 @@ fn recheck_retires_only_blocks_that_changed() {
     g.code(CODE, &[b(CODE, second)]);
     g.code(second, &[movz_x0(5), SVC]);
     assert_eq!(g.run(&mut dbt), 5);
-    // 只改第二页：第一页的块和它到第二页的链接保留，第二页的块作废后重新翻译
+    // Change only the second page: the first page's block and its link to the second page are
+    // kept, and the second page's block is invalidated and translated again
     g.code(second, &[movz_x0(6), SVC]);
     let before = dbt.stats();
     dbt.recheck();
@@ -402,7 +417,8 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
     if Dbt::new().is_none() {
         return;
     }
-    // 表里没有空位时插入一直找下去：在另一个线程里跑，超时算失败
+    // With no empty slot in the table an insertion keeps searching forever: run it in another
+    // thread, and a timeout counts as failure
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut dbt = Dbt::new().unwrap();
@@ -416,18 +432,20 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
             id: [1, 0, 0, 0, 0],
         };
         let host = NonNull::new(g.pages[1].0.as_mut_ptr()).unwrap();
-        // 最小的表 4096 项：每一轮漏掉一个墓碑的话，几千轮就占满了
+        // The smallest table has 4096 entries: leaking one tombstone per round would fill it in a
+        // few thousand rounds
         for _ in 0..5000 {
             assert_eq!(g.run(&mut dbt), 1);
             assert_eq!(g.run_at(&mut dbt, second), 2);
-            // 换了地址空间（exec 了同一个程序），第二页还没映射：那里的块停放
+            // The address space changed (exec of the same program) and the second page is not
+            // mapped yet: the blocks there are parked
             dbt.space().set_sources(&[source]);
             dbt.recheck();
             dbt.space().trust(&[]);
             g.mmu.unmap(second, PAGE_SIZE).unwrap();
             g.cpu.tlb_flush();
             assert_eq!(g.run(&mut dbt), 1);
-            // 映射回来，第一次执行到时恢复，不重新翻译
+            // Mapped back: restored the first time it is executed, without retranslation
             unsafe {
                 g.mmu
                     .map(second, host, PAGE_SIZE, prot::READ | prot::EXEC)
@@ -441,10 +459,13 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
         done.send(()).unwrap();
     });
     let result = finished.recv_timeout(std::time::Duration::from_secs(60));
-    assert!(result.is_ok(), "翻译表被占满，插入找不到空位");
+    assert!(
+        result.is_ok(),
+        "translation table full: an insertion found no empty slot"
+    );
 }
 
-/// 执行到 svc，被打断（整体清空要别的线程停下）时接着执行。
+/// Runs to an svc, continuing when interrupted (a full flush needs the other threads to stop).
 fn run_to_svc(dbt: &mut Dbt, cpu: &mut Cpu) {
     loop {
         match dbt.run(cpu) {
@@ -460,10 +481,13 @@ fn flushing_waits_for_threads_running_and_entering_the_same_space() {
     if Dbt::new().is_none() {
         return;
     }
-    // 整体清空要等其余线程都停下（park）或者离开翻译后的代码：一半的线程一直在循环里转，
-    // 要打断才停；一半频繁进出。等不到（卡住）算失败。清空之后要求清空的线程先翻译另外
-    // 几段代码，盖掉代码缓存开头的旧翻译：清空时还有线程在执行旧的翻译，就会执行到它们，
-    // 算错或者崩溃。所有线程的代码一样（共用翻译），圈数放在 x0 里
+    // A full flush has to wait until every other thread has stopped (parked) or left translated
+    // code: half the threads keep spinning in a loop and stop only when kicked; half enter and
+    // leave frequently. Never getting there (hanging) counts as failure. After the flush, the
+    // thread that requested it first translates a few other pieces of code, overwriting the old
+    // translations at the start of the code cache: if a thread were still running old
+    // translations during the flush, it would run into them and compute wrong results or crash.
+    // All threads run the same code (shared translations), with the loop count in x0
     const OTHER: u64 = CODE + 0x100;
     let program = |g: &mut Guest| {
         g.code(CODE, &[SUB_X0_1, cbnz_x0(CODE + 4, CODE), movz_x0(7), SVC]);
@@ -521,8 +545,8 @@ fn flushing_waits_for_threads_running_and_entering_the_same_space() {
     });
     let flushes = finished
         .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("整体清空等不到别的线程停下，或者有线程出错");
-    // 每次要求清空都恰好清空一次（由先看到的线程做）
+        .expect("a full flush kept waiting for the other threads to stop, or a thread failed");
+    // Every flush request results in exactly one flush (done by the thread that sees it first)
     assert_eq!(flushes, 200);
 }
 
@@ -535,11 +559,12 @@ fn returns_follow_x30_even_when_the_prediction_is_wrong() {
     let f = CODE + 0x100;
     let other = CODE + 0x200;
     g.code(CODE, &[bl(CODE, f), movz_x0(7), SVC]);
-    // 普通的调用和返回：返回到调用之后
+    // An ordinary call and return: returns to just after the call
     g.code(f, &[RET]);
     assert_eq!(g.run(&mut dbt), 7);
     assert_eq!(g.run(&mut dbt), 7);
-    // 被调函数改了 x30（longjmp 那样）：影子栈顶对不上，按 x30 返回
+    // The callee changed x30 (as longjmp does): the shadow stack top does not match, so return by
+    // x30
     g.code(f, &[adr_x30(f, other), RET]);
     g.code(other, &[movz_x0(9), SVC]);
     dbt.invalidate(&g.cpu, f, 4);
@@ -552,7 +577,8 @@ fn returning_to_the_empty_entry_marker_is_still_checked() {
         return;
     };
     let mut g = Guest::new();
-    // 影子栈的空项记的 guest 地址是 1：x30 等于它时照样按 x30 返回，得到 pc 对齐错误
+    // An empty shadow-stack entry records guest address 1: when x30 equals it, return still goes
+    // by x30, giving a pc alignment fault
     g.code(CODE, &[0xd280_003e, RET]); // movz x30, #1; ret
     g.cpu.state_mut().pc = CODE;
     assert!(matches!(
@@ -572,8 +598,9 @@ fn deep_recursion_wraps_the_shadow_stack() {
     };
     let mut g = Guest::new();
     let f = CODE + 0x100;
-    // main: x0 = 200; bl f; svc。f 递归 x0 层，每层返回时 x1 加一：超过影子栈的 64 项之后
-    // 栈底的项被覆盖，更深的返回只能按 x30 查找，结果必须一样
+    // main: x0 = 200; bl f; svc. f recurses x0 levels deep, and x1 is incremented on each return:
+    // past the shadow stack's 64 entries the bottom entries are overwritten and deeper returns
+    // can only be looked up by x30, with the same result
     g.code(CODE, &[movz_x0(200), bl(CODE + 4, f), SVC]);
     let done = f + 6 * 4;
     g.code(
@@ -596,12 +623,14 @@ fn deep_recursion_wraps_the_shadow_stack() {
     }
 }
 
-/// 数据第 `page` 页的第一个字节的地址减去 `before`：从这里开始的访问跨到第 `page` 页。
+/// The address of the first byte of data page `page` minus `before`: an access starting here
+/// crosses into page `page`.
 fn before_page(page: u64, before: u64) -> u64 {
     DATA + page * PAGE_SIZE - before
 }
 
-/// 跨页访问的预期值：第 `page - 1` 页末尾的 `before` 个字节接着第 `page` 页开头的字节。
+/// The expected value of a cross-page access: the last `before` bytes of page `page - 1` followed
+/// by the first bytes of page `page`.
 fn crossing(g: &Guest, page: usize, before: usize) -> u64 {
     let lo = g.data(page - 1, 4096 - 8) >> (8 * (8 - before));
     let hi = g.data(page, 0) << (8 * before);
@@ -615,7 +644,8 @@ fn cross_page_accesses_stay_in_translated_code() {
     };
     let mut g = Guest::with_data();
     g.code(CODE, &[LDR_X0_X2, STR_X3_X4, LDP_X5_X6_X7, SVC]);
-    // 宿主页相邻：第一次两页都不在 TLB 里，先填进去；第二次只比对表项。都不退给 Tier 0
+    // Adjacent host pages: the first time neither page is in the TLB and both are filled in; the
+    // second time only the entries are compared. Neither falls back to Tier 0
     for round in 0..2u64 {
         let value = 0x1122_3344_5566_7788 + round;
         let s = g.cpu.state_mut();
@@ -643,7 +673,8 @@ fn cross_page_accesses_to_scattered_host_pages_use_tier0() {
     let mut g = Guest::with_data();
     g.code(CODE, &[LDR_X0_X2, SVC]);
     g.cpu.state_mut().x[2] = before_page(3, 4);
-    // 宿主上紧接着第 2 页的是第 3 页之前的那一页，必须按页表分别访问
+    // On the host, page 2 is followed by the page before page 3, so each page must be accessed
+    // through the page table separately
     assert_eq!(g.run(&mut dbt), crossing(&g, 3, 4));
     assert_eq!(dbt.stats().exits_interp, 1);
 }
@@ -654,7 +685,8 @@ fn cross_page_faults_are_precise() {
         return;
     };
     let mut g = Guest::with_data();
-    // 写跨进只读的一页、读跨进没有映射的一页：报告在第二页，第一页不能被写
+    // A write crossing into a read-only page, a read crossing into an unmapped page: reported at
+    // the second page, and the first page must not be written
     let cases = [
         (STR_X3_X4, 4, before_page(5, 4), DATA + 5 * PAGE_SIZE),
         (LDR_X0_X2, 2, before_page(6, 4), DATA + 6 * PAGE_SIZE),
@@ -678,14 +710,16 @@ fn cross_page_faults_are_precise() {
 
 const LDR_X1_X2_8: u32 = 0xf940_0441; // ldr x1, [x2, #8]
 
-// 下面几个测试检查是否分组。实例可能来自池子，带着别的测试记下的"这里不再分组"
-// （按 pc），所以每个测试的代码放在自己的地址上。
+// The following tests check whether accesses are grouped. An instance may come from the pool,
+// carrying "no more grouping here" marks (by pc) recorded by other tests, so each test puts its
+// code at its own address.
 
 #[test]
 fn exits_beyond_48_bits_keep_the_whole_pc() {
-    // 退出桩把 guest pc 和退出原因放在同一个数据字里（低 48 位、高 16 位），跳转目标算出来
-    // 超出 48 位时换一种桩。地址空间最后一页的代码执行到页尾、落到 2^48：取指故障报告的
-    // 是完整的地址，不能截成 0
+    // An exit stub keeps the guest pc and the exit reason in one data word (low 48 bits, high 16
+    // bits); when the computed branch target is beyond 48 bits a different stub is used. Code in
+    // the last page of the address space runs to the end of the page and falls to 2^48: the
+    // instruction fetch fault reports the full address, which must not be truncated to 0
     let Some(mut dbt) = Dbt::new() else {
         return;
     };
@@ -715,7 +749,8 @@ fn accesses_with_the_same_base_share_one_check() {
         return;
     };
     let mut g = Guest::new();
-    // 函数的序言和尾声，夹着改写被占用寄存器的指令：一共 6 条访存，只检查一次
+    // A function prologue and epilogue around instructions that rewrite stolen registers: 6
+    // memory accesses in all, checked only once
     let f = CODE + 0x100;
     g.code(
         f,
@@ -754,8 +789,9 @@ fn shared_checks_across_scattered_host_pages_are_undone() {
     let mut g = Guest::with_data();
     let f = CODE + 0x200;
     g.code(f, &[LDR_X0_X2, LDR_X1_X2_8, SVC]);
-    // 两条访问各自都不跨页，合起来跨到宿主上不相邻的下一页：退给 Tier 0，第二次之后
-    // 这个块不再分组
+    // Each of the two accesses stays within a page, but together they cross into the next page,
+    // which is not adjacent on the host: falls back to Tier 0, and from the second time on this
+    // block is no longer grouped
     for (ungrouped, interp) in [(0, 1), (1, 2), (1, 2)] {
         g.cpu.state_mut().x[2] = before_page(3, 8);
         g.run_at(&mut dbt, f);
@@ -764,7 +800,8 @@ fn shared_checks_across_scattered_host_pages_are_undone() {
         let s = dbt.stats();
         assert_eq!((s.ungrouped, s.exits_interp), (ungrouped, interp));
     }
-    // 别处同样的代码访问宿主上相邻的两页，照样共用一次检查
+    // The same code elsewhere, accessing two pages that are adjacent on the host, still shares
+    // one check
     let f = CODE + 0x300;
     g.code(f, &[LDR_X0_X2, LDR_X1_X2_8, SVC]);
     g.cpu.state_mut().x[2] = before_page(1, 8);
@@ -780,7 +817,8 @@ fn shared_checks_cover_accesses_behind_branches() {
         return;
     };
     let mut g = Guest::with_data();
-    // 第二条加载在条件分支之后，要访问的下一页没有映射；x0 是 0 时它不会执行
+    // The second load comes after a conditional branch, and the next page it accesses is not
+    // mapped; when x0 is 0 it does not execute
     let f = CODE + 0x400;
     g.code(f, &[LDR_X0_X2, cbz_x0(f + 4, f + 12), LDR_X1_X2_8, SVC]);
     g.pages[8].0[4096 - 8..].fill(0);
@@ -794,7 +832,7 @@ fn shared_checks_cover_accesses_behind_branches() {
     }
 }
 
-/// 从 `pc` 开始执行到 svc 或者出错。
+/// Runs from `pc` to an svc or a fault.
 fn go(g: &mut Guest, dbt: &mut Dbt, pc: u64) -> Exit {
     g.cpu.state_mut().pc = pc;
     dbt.run(&mut g.cpu)
@@ -814,8 +852,8 @@ fn watchpoints_send_only_watched_pages_to_tier0() {
         .state_mut()
         .set_hw_debug(&[], &[(watched, watched + 8, WATCH_STORE)]);
     let interp = |dbt: &Dbt| dbt.stats().exits_interp;
-    // 读被写观察的页、写别的页：第一次没命中 TLB 由 Tier 0 执行并填表，之后都在翻译后的
-    // 代码里
+    // Read the write-watched page and write another page: the first time misses the TLB and is
+    // executed by Tier 0, which fills the table; after that everything stays in translated code
     let s = g.cpu.state_mut();
     (s.x[2], s.x[3], s.x[4]) = (page + 0x108, 5, DATA + 0x10);
     for _ in 0..2 {
@@ -825,14 +863,15 @@ fn watchpoints_send_only_watched_pages_to_tier0() {
     assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
     assert_eq!(interp(&dbt), before);
     assert_eq!(g.cpu.state().x[0], g.data(4, 0x108));
-    // 写被观察的页上没被观察的字节：每次都由 Tier 0 执行
+    // Writing bytes of the watched page that are not watched: executed by Tier 0 every time
     g.cpu.state_mut().x[4] = page + 0x108;
     for i in 1..=2 {
         assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
         assert_eq!(interp(&dbt), before + i);
     }
     assert_eq!(g.data(4, 0x108), 5);
-    // 写被观察的字节：停在这条指令上，没有写，前一条读已经执行
+    // Writing the watched bytes: stops at this instruction without writing; the preceding read
+    // has already executed
     let old = g.data(4, 0x100);
     let s = g.cpu.state_mut();
     (s.x[0], s.x[4]) = (0, watched + 4);
@@ -845,7 +884,7 @@ fn watchpoints_send_only_watched_pages_to_tier0() {
     assert_eq!(g.cpu.state().pc, f + 4);
     assert_eq!(g.cpu.state().x[0], g.data(4, 0x108));
     assert_eq!(g.data(4, 0x100), old);
-    // 读观察点：读的一半也不进 TLB
+    // Read watchpoint: the read half does not enter the TLB either
     g.cpu
         .state_mut()
         .set_hw_debug(&[], &[(watched, watched + 8, WATCH_LOAD)]);
@@ -858,7 +897,7 @@ fn watchpoints_send_only_watched_pages_to_tier0() {
     };
     assert_eq!(go(&mut g, &mut dbt, f), hit);
     assert_eq!(g.cpu.state().pc, f);
-    // 去掉之后整页又在翻译后的代码里
+    // After removing it, the whole page is in translated code again
     g.cpu.state_mut().set_hw_debug(&[], &[]);
     g.cpu.state_mut().x[4] = page + 0x100;
     assert_eq!(go(&mut g, &mut dbt, f), Exit::Svc { imm: 0 });
@@ -874,7 +913,8 @@ fn watchpoints_stop_inside_shared_checks_and_atomics() {
         return;
     };
     let mut g = Guest::with_data();
-    // 函数序言里共用一次检查的几条写栈：停在写被观察的那个槽的指令上，之前的已经执行
+    // Several stack writes in a function prologue sharing one check: stops at the instruction
+    // writing the watched slot, with the earlier ones already executed
     let f = CODE + 0x600;
     g.code(
         f,
@@ -904,13 +944,14 @@ fn watchpoints_stop_inside_shared_checks_and_atomics() {
         u64::from_le_bytes(stack[4096 - 48..4096 - 40].try_into().unwrap()),
         0x2929
     );
-    // 不是这一组不能共用检查：不记下"这里不再分组"
+    // Not a case of the group being unable to share a check: "no more grouping here" is not
+    // recorded
     assert_eq!(dbt.stats().ungrouped, 0);
     g.cpu.state_mut().set_hw_debug(&[], &[]);
     assert_eq!(dbt.run(&mut g.cpu), Exit::Svc { imm: 0 });
     assert_eq!(g.cpu.state().sp, STACK);
 
-    // 原子的读改写算读：读观察点也要停
+    // An atomic read-modify-write counts as a read: a read watchpoint must stop it too
     let f = CODE + 0x700;
     g.code(f, &[0xf825_00e6, SVC]); // ldadd x5, x6, [x7]
     let at = DATA + 4 * PAGE_SIZE + 0x200;

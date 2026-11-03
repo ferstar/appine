@@ -1,4 +1,4 @@
-//! soft-MMU 页表（mmu.c）的单元测试：按需建表用到的几个操作。
+//! Unit tests for the soft-MMU page table (mmu.c): the operations on-demand filling uses.
 
 use std::ptr::NonNull;
 
@@ -8,7 +8,7 @@ use appine_engine::{Mmu, PAGE_SIZE, prot};
 struct Page([u8; 4096]);
 
 const RW: u32 = prot::READ | prot::WRITE;
-/// 一张叶子表覆盖的范围。
+/// The range one leaf table covers.
 const LEAF: u64 = PAGE_SIZE << 9;
 
 fn pages(n: usize) -> Box<[Page]> {
@@ -24,7 +24,8 @@ fn fill_only_adds_missing_entries() {
     let mut mem = pages(4);
     let mmu = Mmu::new();
     let a = 0x10_0000;
-    // 第 1 页先映射到别处、第 2 页留着权限为 0 的表项（写时复制、PROT_NONE 留下的）
+    // Page 1 is first mapped elsewhere, and page 2 keeps an entry with permission 0 (as left by
+    // copy-on-write or PROT_NONE)
     unsafe {
         mmu.map_shared(a + PAGE_SIZE, host(&mut mem, 3), PAGE_SIZE, prot::READ)
             .unwrap();
@@ -36,7 +37,8 @@ fn fill_only_adds_missing_entries() {
     assert_eq!(mmu.translate(a, prot::WRITE), Some(host(&mut mem, 0)));
     assert_eq!(mmu.translate(a + PAGE_SIZE, 0), Some(host(&mut mem, 3)));
     assert!(mmu.translate(a + PAGE_SIZE, prot::WRITE).is_none());
-    // 权限为 0 的表项不能访问，传 0 时也不算已映射；改回有权限就又能用
+    // An entry with permission 0 cannot be accessed and does not count as mapped even when 0 is
+    // passed; restoring a permission makes it usable again
     assert!(mmu.translate(a + 2 * PAGE_SIZE, 0).is_none());
     assert_eq!(
         mmu.next_present(a + 2 * PAGE_SIZE, a + LEAF),
@@ -61,7 +63,8 @@ fn ranges_skip_missing_tables_at_every_level() {
         mmu.map(hi, host(&mut mem, 1), PAGE_SIZE, prot::READ)
             .unwrap();
     }
-    // 整个地址空间里只有两页：查找、解除映射、改权限都跳过没有表的地方
+    // Only two pages in the whole address space: lookup, unmap and protect all skip the places
+    // without tables
     assert_eq!(mmu.next_present(0, top), lo);
     assert_eq!(mmu.next_present(lo + PAGE_SIZE, top), hi);
     assert_eq!(mmu.next_present(hi + PAGE_SIZE, top), top);
@@ -79,7 +82,7 @@ fn move_carries_entries_and_their_permissions() {
     let (from, to) = (LEAF - PAGE_SIZE, 0x40_0000_0000);
     unsafe {
         mmu.map(from, host(&mut mem, 0), PAGE_SIZE, RW).unwrap();
-        // 跨叶子表；中间一页没有表项，第三页权限为 0
+        // Crossing leaf tables; the middle page has no entry, and the third page has permission 0
         mmu.map(from + 2 * PAGE_SIZE, host(&mut mem, 1), PAGE_SIZE, 0)
             .unwrap();
     }
@@ -94,6 +97,6 @@ fn move_carries_entries_and_their_permissions() {
         to + 2 * PAGE_SIZE
     );
     assert!(mmu.translate(to + 2 * PAGE_SIZE, 0).is_none());
-    // 重叠的两段不行
+    // Two overlapping ranges are not allowed
     assert!(mmu.move_entries(to, to + PAGE_SIZE, 2 * PAGE_SIZE).is_err());
 }

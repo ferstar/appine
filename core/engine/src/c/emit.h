@@ -1,6 +1,7 @@
 /*
- * 宿主 aarch64 指令编码器：Tier 1（dbt.c）和 Tier 0 的原生指令桩（native.c）共用。
- * 每个函数返回一条指令的 32 位编码；立即数的范围和对齐由调用方保证。
+ * Host aarch64 instruction encoder, shared by Tier 1 (dbt.c) and Tier 0's native instruction stubs
+ * (native.c). Each function returns the 32-bit encoding of one instruction; the caller guarantees
+ * the range and alignment of immediates.
  */
 #ifndef APPINE_ENGINE_EMIT_H
 #define APPINE_ENGINE_EMIT_H
@@ -14,7 +15,7 @@ static inline uint32_t enc_ldr_x(unsigned rt, unsigned rn, size_t off)
     return 0xf9400000u | (uint32_t)(off / 8) << 10 | rn << 5 | rt;
 }
 
-/* LDUR Xt, [Xn, #off]：偏移不按 8 对齐（-256..255） */
+/* LDUR Xt, [Xn, #off]: offset not aligned to 8 (-256..255) */
 static inline uint32_t enc_ldur_x(unsigned rt, unsigned rn, int off)
 {
     return 0xf8400000u | ((uint32_t)off & 0x1ff) << 12 | rn << 5 | rt;
@@ -35,7 +36,7 @@ static inline uint32_t enc_str_w(unsigned rt, unsigned rn, size_t off)
     return 0xb9000000u | (uint32_t)(off / 4) << 10 | rn << 5 | rt;
 }
 
-/* LDRB/LDRH/LDR Wt/LDR Xt, [Xn]（size = log2 字节数） */
+/* LDRB/LDRH/LDR Wt/LDR Xt, [Xn] (size = log2 of the byte count) */
 static inline uint32_t enc_ldr_size(unsigned size, unsigned rt, unsigned rn)
 {
     return 0x39400000u | size << 30 | rn << 5 | rt;
@@ -121,7 +122,7 @@ static inline uint32_t enc_and_low(unsigned rd, unsigned rn, unsigned bits)
     return 0x92400000u | (bits - 1) << 10 | rn << 5 | rd;
 }
 
-/* AND Xd, Xn, #掩码：连续 `ones` 个 1，循环右移 `ror` 位 */
+/* AND Xd, Xn, #mask: `ones` consecutive ones, rotated right by `ror` bits */
 static inline uint32_t enc_and_ror(unsigned rd, unsigned rn, unsigned ones, unsigned ror)
 {
     return 0x92400000u | ror << 16 | (ones - 1) << 10 | rn << 5 | rd;
@@ -148,13 +149,13 @@ static inline uint32_t enc_eor_lsr(unsigned rd, unsigned rn, unsigned rm, unsign
     return 0xca000000u | (amount ? 1u << 22 : 0) | rm << 16 | amount << 10 | rn << 5 | rd;
 }
 
-/* EON Xd, Xn, Xm, LSR #amount（Xn ^ ~(Xm >> amount)） */
+/* EON Xd, Xn, Xm, LSR #amount (Xn ^ ~(Xm >> amount)) */
 static inline uint32_t enc_eon_lsr(unsigned rd, unsigned rn, unsigned rm, unsigned amount)
 {
     return 0xca200000u | (amount ? 1u << 22 : 0) | rm << 16 | amount << 10 | rn << 5 | rd;
 }
 
-/* BIC Xd, Xn, Xm（Xn & ~Xm） */
+/* BIC Xd, Xn, Xm (Xn & ~Xm) */
 static inline uint32_t enc_bic_reg(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x8a200000u | rm << 16 | rn << 5 | rd;
@@ -185,13 +186,13 @@ static inline uint32_t enc_bl(intptr_t off)
     return 0x94000000u | ((uint32_t)(off >> 2) & 0x3ffffff);
 }
 
-/* RET Xn：宿主按返回地址栈预测目标 */
+/* RET Xn: the host predicts the target with its return address stack */
 static inline uint32_t enc_ret_reg(unsigned rn)
 {
     return 0xd65f0000u | rn << 5;
 }
 
-/* BFXIL Xd, Xn, #0, #width：把 Xn 的低 width 位放进 Xd，其余位不变 */
+/* BFXIL Xd, Xn, #0, #width: put the low width bits of Xn into Xd, other bits unchanged */
 static inline uint32_t enc_bfxil_low(unsigned rd, unsigned rn, unsigned width)
 {
     return 0xb3400000u | (width - 1) << 10 | rn << 5 | rd;
@@ -233,7 +234,7 @@ static inline uint32_t enc_ldr_x_index(unsigned rt, unsigned rn, unsigned rm)
     return 0xf8607800u | rm << 16 | rn << 5 | rt;
 }
 
-/* AND Xd, Xn, #~((1 << bits) - 1)：清掉低 bits 位，1 ≤ bits ≤ 63 */
+/* AND Xd, Xn, #~((1 << bits) - 1): clear the low bits bits, 1 ≤ bits ≤ 63 */
 static inline uint32_t enc_and_clear_low(unsigned rd, unsigned rn, unsigned bits)
 {
     return 0x92400000u | (64 - bits) << 16 | (63 - bits) << 10 | rn << 5 | rd;
@@ -255,13 +256,13 @@ static inline uint32_t enc_orr_lsl(unsigned rd, unsigned rn, unsigned rm, unsign
     return 0xaa000000u | rm << 16 | amount << 10 | rn << 5 | rd;
 }
 
-/* LSR Xd, Xn, Xm（LSRV） */
+/* LSR Xd, Xn, Xm (LSRV) */
 static inline uint32_t enc_lsrv(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x9ac02400u | rm << 16 | rn << 5 | rd;
 }
 
-/* MUL Xd, Xn, Xm（MADD Xd, Xn, Xm, XZR） */
+/* MUL Xd, Xn, Xm (MADD Xd, Xn, Xm, XZR) */
 static inline uint32_t enc_mul(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x9b007c00u | rm << 16 | rn << 5 | rd;
@@ -273,15 +274,15 @@ static inline uint32_t enc_and_reg(unsigned rd, unsigned rn, unsigned rm)
     return 0x8a000000u | rm << 16 | rn << 5 | rd;
 }
 
-/* LSL Xd, Xn, Xm（LSLV） */
+/* LSL Xd, Xn, Xm (LSLV) */
 static inline uint32_t enc_lslv(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x9ac02000u | rm << 16 | rn << 5 | rd;
 }
 
-/* ---- SIMD&FP 与系统寄存器 ---- */
+/* ---- SIMD&FP and system registers ---- */
 
-/* LDP/STP Qt1, Qt2, [Xn, #off]（off 为 16 的倍数，范围 ±1008） */
+/* LDP/STP Qt1, Qt2, [Xn, #off] (off a multiple of 16, range ±1008) */
 static inline uint32_t enc_ldp_q(unsigned rt, unsigned rt2, unsigned rn, int off)
 {
     return 0xad400000u | ((uint32_t)(off / 16) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
@@ -292,7 +293,7 @@ static inline uint32_t enc_stp_q(unsigned rt, unsigned rt2, unsigned rn, int off
     return 0xad000000u | ((uint32_t)(off / 16) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;
 }
 
-/* LDP/STP Dt1, Dt2：保存和恢复宿主的被调用者保存寄存器 d8–d15 */
+/* LDP/STP Dt1, Dt2: save and restore the host's callee-saved registers d8–d15 */
 static inline uint32_t enc_stp_d_pre(unsigned rt, unsigned rt2, unsigned rn, int off)
 {
     return 0x6d800000u | ((uint32_t)(off / 8) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt;

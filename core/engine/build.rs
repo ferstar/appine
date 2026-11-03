@@ -1,4 +1,4 @@
-//! 编译 C 引擎（设计文档 §13.1：引擎用 C17 + aarch64 汇编）。
+//! Compiles the C engine (design doc §13.1: the engine is C17 + aarch64 assembly).
 
 fn main() {
     let sources = [
@@ -29,7 +29,8 @@ fn main() {
         .warnings_into_errors(true)
         .compile("appine_engine");
 
-    // 供依赖方的 C 代码引用头文件：环境变量 DEP_APPINE_ENGINE_INCLUDE
+    // Lets dependents' C code include the headers: the environment variable
+    // DEP_APPINE_ENGINE_INCLUDE
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let include = std::path::Path::new(&manifest_dir).join("include");
     println!("cargo::metadata=include={}", include.display());

@@ -1,11 +1,11 @@
-//! 原生执行端（oracle.c / oracle.S）的 Rust 封装。
+//! Rust wrapper for the native side (oracle.c / oracle.S).
 
 use std::ffi::c_int;
 use std::ptr::NonNull;
 
 use crate::State;
 
-/// 数据区大小：两页，访存类用例只能访问这里。
+/// Size of the data area: two pages, the only memory access cases may touch.
 pub const DATA_BYTES: usize = 8192;
 
 #[repr(C)]
@@ -27,41 +27,42 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// 一个可以反复执行被测指令的 JIT 页，加上两页数据区。
+/// A JIT page that can run the tested instructions repeatedly, plus a two-page data area.
 pub(crate) struct Oracle {
     raw: NonNull<RawOracle>,
 }
 
 impl Oracle {
-    /// 申请 JIT 页和数据区，并安装信号处理函数。
+    /// Allocates the JIT page and data area, and installs the signal handlers.
     pub(crate) fn new() -> Option<Self> {
         NonNull::new(unsafe { lockstep_oracle_new() }).map(|raw| Oracle { raw })
     }
 
-    /// 第一条被测指令所在的地址，即硬件执行时的 PC。
+    /// The address of the first tested instruction, i.e. the PC when the hardware runs it.
     pub(crate) fn slot_addr(&self) -> u64 {
         unsafe { lockstep_oracle_slot(self.raw.as_ptr()) }
     }
 
-    /// 被测指令所在的那个 4K 页的内容。
+    /// The contents of the 4K page holding the tested instructions.
     pub(crate) fn slot_page(&self) -> &[u8] {
         let page = unsafe { lockstep_oracle_page(self.raw.as_ptr()) };
         let offset = (self.slot_addr() & !0xfff) - page as u64;
         unsafe { std::slice::from_raw_parts(page.add(offset as usize), 4096) }
     }
 
-    /// 数据区的地址。
+    /// The data area's address.
     pub(crate) fn data_addr(&self) -> u64 {
         unsafe { lockstep_oracle_data(self.raw.as_ptr()) as u64 }
     }
 
-    /// 数据区的内容。
+    /// The data area's contents.
     pub(crate) fn data(&mut self) -> &mut [u8] {
         let p = unsafe { lockstep_oracle_data(self.raw.as_ptr()) };
         unsafe { std::slice::from_raw_parts_mut(p, DATA_BYTES) }
     }
 
-    /// 在硬件上执行 `insns`。成功时返回 `Ok`，触发信号时返回信号编号。
+    /// Runs `insns` on the hardware. Returns `Ok` on success and the signal number when a signal
+    /// is raised.
     pub(crate) fn run(&mut self, insns: &[u32], state: &mut State) -> Result<(), i32> {
         let rc = unsafe {
             lockstep_oracle_run(self.raw.as_ptr(), insns.as_ptr(), insns.len() as u32, state)

@@ -1,7 +1,8 @@
-//! appine 引擎（C 实现）的 Rust 绑定。
+//! Rust bindings for the appine engine (implemented in C).
 //!
-//! 引擎负责执行 guest 指令和 soft-MMU 快速路径（engine 和 kernel/mm 的 map）。内核层用
-//! [`Cpu::run`] 驱动执行，再根据返回的 [`Exit`] 处理 syscall、异常等事件。
+//! The engine executes guest instructions and the soft-MMU fast path (the engine and kernel/mm
+//! maps). The kernel layer drives execution with [`Cpu::run`] and then handles syscalls,
+//! exceptions and other events according to the returned [`Exit`].
 
 use std::ffi::{c_int, c_uint, c_void};
 use std::fmt;
@@ -9,22 +10,22 @@ use std::mem::offset_of;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-/// guest 页大小，固定 4K（kernel/mm 的 map）。
+/// Guest page size, fixed at 4K (the kernel/mm map).
 pub const PAGE_SIZE: u64 = 4096;
-/// guest 虚拟地址位数。
+/// Number of guest virtual address bits.
 pub const VA_BITS: u32 = 48;
-/// 每个 CPU 的软件数据 TLB 项数。
+/// Number of software data TLB entries per CPU.
 pub const TLB_ENTRIES: usize = 4096;
-/// 每个 CPU 的软件取指 TLB 项数。
+/// Number of software instruction-fetch TLB entries per CPU.
 pub const ITLB_ENTRIES: usize = 512;
 
-/// 页权限，取值与 Linux 的 `PROT_*` 一致。
+/// Page permissions, with the same values as Linux's `PROT_*`.
 pub mod prot {
-    /// 可读。
+    /// Readable.
     pub const READ: u32 = 1;
-    /// 可写。
+    /// Writable.
     pub const WRITE: u32 = 2;
-    /// 可执行。
+    /// Executable.
     pub const EXEC: u32 = 4;
 }
 
@@ -49,24 +50,24 @@ struct ItlbEntry {
     addend: u64,
 }
 
-/// guest CPU 状态，逐字段镜像 C 的 `struct appine_cpu`。
+/// Guest CPU state, mirroring C's `struct appine_cpu` field by field.
 #[repr(C)]
 pub struct CpuState {
-    /// 通用寄存器 X0–X30。
+    /// General registers X0–X30.
     pub x: [u64; 31],
-    /// 栈指针。
+    /// Stack pointer.
     pub sp: u64,
-    /// 程序计数器。
+    /// Program counter.
     pub pc: u64,
-    /// 条件标志，只使用 bit 31..28。
+    /// Condition flags; only bits 31..28 are used.
     pub nzcv: u64,
-    /// 浮点控制寄存器。
+    /// Floating-point control register.
     pub fpcr: u64,
-    /// 浮点状态寄存器。
+    /// Floating-point status register.
     pub fpsr: u64,
-    /// 用户态线程指针。
+    /// User-mode thread pointer.
     pub tpidr_el0: u64,
-    /// syscall 重启时用来恢复的原始 X0，由内核层维护。
+    /// The original X0 restored when a syscall restarts, maintained by the kernel layer.
     pub orig_x0: u64,
     fault_addr: u64,
     fault_access: u32,
@@ -83,31 +84,32 @@ pub struct CpuState {
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
     dbt_rs: *mut c_void,
-    /// Tier 1 里 `ic ivau` 记下、还没交出来作废的页（0 表示没有）。引擎在 dsb、isb 时以
-    /// [`Exit::InvalidateCode`] 交出，因为别的原因退出时由调用方取走并作废。
+    /// The page recorded by `ic ivau` in Tier 1 and not yet handed out for invalidation (0 means
+    /// none). The engine hands it out as [`Exit::InvalidateCode`] at dsb and isb; on exits for
+    /// other reasons the caller collects and invalidates it.
     pub ivau_page: u64,
     dbt_groups: [u64; 4],
     tlb: [TlbEntry; TLB_ENTRIES],
     itlb: [ItlbEntry; ITLB_ENTRIES],
-    /// V0–V31，每个寄存器低 64 位在前。
+    /// V0–V31, the low 64 bits of each register first.
     pub v: [[u64; 2]; 32],
     tlb_used: [u64; TLB_ENTRIES / 64],
     nbrk: u32,
     nwatch: u32,
-    /// PSTATE.DIT（0 或 1），信号帧、ptrace 里是 pstate 的第 24 位。
+    /// PSTATE.DIT (0 or 1); bit 24 of pstate in signal frames and ptrace.
     pub dit: u32,
     reserved: u32,
     brk: [u64; HW_SLOTS],
     watch: [WatchSlot; HW_SLOTS],
 }
 
-/// 硬件断点、观察点各最多几个（C 的 `APPINE_HW_SLOTS`）。
+/// Maximum number of hardware breakpoints, and of watchpoints (C's `APPINE_HW_SLOTS`).
 pub const HW_SLOTS: usize = 16;
-/// 观察点的种类：读、写（可以合用）。
+/// Watchpoint kinds: read and write (can be combined).
 pub const WATCH_LOAD: u32 = 1;
 pub const WATCH_STORE: u32 = 2;
 
-/// C 的 `struct appine_watch`。
+/// C's `struct appine_watch`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq)]
 struct WatchSlot {
@@ -118,11 +120,13 @@ struct WatchSlot {
 }
 
 impl CpuState {
-    /// 设置硬件断点（指令地址）和观察点（起点、终点、[`WATCH_LOAD`]/[`WATCH_STORE`]），各
-    /// 最多 [`HW_SLOTS`] 个。只有解释器检查它们（[`Cpu::run`]、[`Cpu::step`]）：命中时以
-    /// [`FaultKind::HwBreakpoint`]、[`FaultKind::Watchpoint`] 退出，指令没有执行。有断点的
-    /// 线程只能用解释器执行（[`CpuState::hw_breakpoints_active`]）；有观察点时被观察的页
-    /// 不进 TLB，Tier 1 访问它们时交给解释器执行那一条指令，所以观察的范围变了要清空 TLB。
+    /// Sets hardware breakpoints (instruction addresses) and watchpoints (start, end,
+    /// [`WATCH_LOAD`]/[`WATCH_STORE`]), at most [`HW_SLOTS`] of each. Only the interpreter checks
+    /// them ([`Cpu::run`], [`Cpu::step`]): a hit exits with [`FaultKind::HwBreakpoint`] or
+    /// [`FaultKind::Watchpoint`], and the instruction has not executed. A thread with breakpoints
+    /// can only run under the interpreter ([`CpuState::hw_breakpoints_active`]); with watchpoints,
+    /// watched pages stay out of the TLB and Tier 1 hands an access to them to the interpreter for
+    /// that one instruction, so the TLB must be flushed when the watched ranges change.
     pub fn set_hw_debug(&mut self, breakpoints: &[u64], watchpoints: &[(u64, u64, u32)]) {
         assert!(breakpoints.len() <= HW_SLOTS && watchpoints.len() <= HW_SLOTS);
         let before = (self.nwatch, self.watch);
@@ -138,13 +142,14 @@ impl CpuState {
         self.nbrk = breakpoints.len() as u32;
         self.nwatch = watchpoints.len() as u32;
         let n = self.nwatch as usize;
-        // 跟踪者每次让线程继续都重新设置一遍，没变时不清
+        // The tracer sets them again every time it resumes the thread; do not flush when unchanged
         if before.0 != self.nwatch || before.1[..n] != self.watch[..n] {
             unsafe { appine_cpu_tlb_flush(self) }
         }
     }
 
-    /// 设置了硬件断点：这个线程只能用解释器执行（Tier 1 不在每条指令之前比较 pc）。
+    /// Hardware breakpoints are set: this thread can only run under the interpreter (Tier 1 does
+    /// not compare pc before every instruction).
     pub fn hw_breakpoints_active(&self) -> bool {
         self.nbrk != 0
     }
@@ -227,12 +232,13 @@ struct RawHostFault {
     pc: u64,
 }
 
-/// 修改页表时的参数错误或内存不足。
+/// Invalid argument or out of memory while modifying the page table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapError {
-    /// 地址或长度未按 4K 对齐、越过 48 位地址空间，或权限位非法。
+    /// Address or length not 4K-aligned, beyond the 48-bit address space, or invalid permission
+    /// bits.
     InvalidArgument,
-    /// 分配页表失败。
+    /// Failed to allocate a page table.
     OutOfMemory,
 }
 
@@ -255,13 +261,13 @@ fn map_result(rc: c_int) -> Result<(), MapError> {
     }
 }
 
-/// 一个 guest 地址空间的软件页表（kernel/mm 的 map）。
+/// The software page table of one guest address space (the kernel/mm map).
 pub struct Mmu {
     raw: NonNull<RawMmu>,
 }
 
 impl Mmu {
-    /// 创建空页表。
+    /// Creates an empty page table.
     pub fn new() -> Self {
         let raw = unsafe { appine_mmu_new() };
         Mmu {
@@ -269,12 +275,12 @@ impl Mmu {
         }
     }
 
-    /// 把 guest `[gva, gva + len)` 映射到 host `[host, host + len)`，覆盖已有映射。
+    /// Maps guest `[gva, gva + len)` to host `[host, host + len)`, replacing existing mappings.
     ///
     /// # Safety
     ///
-    /// `host` 指向的 `len` 字节必须可读写，并在映射存续期间（直到 unmap、
-    /// 被覆盖或 `Mmu` 销毁）保持有效。
+    /// The `len` bytes at `host` must be readable and writable, and stay valid while the mapping
+    /// exists (until unmap, until it is replaced, or until the `Mmu` is destroyed).
     pub unsafe fn map(
         &mut self,
         gva: u64,
@@ -287,28 +293,30 @@ impl Mmu {
         })
     }
 
-    /// 解除 `[gva, gva + len)` 的映射。
+    /// Unmaps `[gva, gva + len)`.
     pub fn unmap(&mut self, gva: u64, len: u64) -> Result<(), MapError> {
         map_result(unsafe { appine_mmu_unmap(self.raw.as_ptr(), gva, len) })
     }
 
-    /// 修改已有表项的权限，可以改成 0（宿主页留着，不能访问）；没有表项的页不变。
+    /// Changes the permissions of existing entries, possibly to 0 (the host page is kept but
+    /// cannot be accessed); pages without entries are unchanged.
     pub fn protect(&mut self, gva: u64, len: u64, prot: u32) -> Result<(), MapError> {
         map_result(unsafe { appine_mmu_protect(self.raw.as_ptr(), gva, len, prot) })
     }
 
-    /// 把 `[from, from + len)` 里已有的表项原样搬到 `to` 开始的同样位置，原处清空；两段
-    /// 不能重叠。
+    /// Moves the existing entries in `[from, from + len)` unchanged to the same positions starting
+    /// at `to`, clearing the originals; the two ranges must not overlap.
     pub fn move_entries(&mut self, from: u64, to: u64, len: u64) -> Result<(), MapError> {
         map_result(unsafe { appine_mmu_move(self.raw.as_ptr(), from, to, len) })
     }
 
-    /// 与 [`Mmu::map_shared`] 相同，但已有表项（包括权限为 0 的）的页保持不变：按需建表时
-    /// 补上还没有表项的页，不碰写时复制改过的。
+    /// Same as [`Mmu::map_shared`], but pages with existing entries (including ones with
+    /// permission 0) stay unchanged: on-demand filling fills pages that have no entry yet and
+    /// leaves the ones copy-on-write has changed alone.
     ///
     /// # Safety
     ///
-    /// 同 [`Mmu::map`]。
+    /// Same as [`Mmu::map`].
     pub unsafe fn fill_shared(
         &self,
         gva: u64,
@@ -321,18 +329,21 @@ impl Mmu {
         })
     }
 
-    /// `[gva, end)` 里第一个有表项（包括权限为 0 的）的页；没有时返回 `end`。没有表的
-    /// 地方整段跳过，几 TB 的映射里只碰过几页时也很快。
+    /// The first page in `[gva, end)` with an entry (including ones with permission 0); `end` if
+    /// there is none. Spans without tables are skipped whole, so it is fast even when only a few
+    /// pages of a multi-TB mapping were touched.
     pub fn next_present(&self, gva: u64, end: u64) -> u64 {
         unsafe { appine_mmu_next_present(self.raw.as_ptr(), gva, end) }
     }
 
-    /// 与 [`Mmu::map`] 相同，但只要 `&self`：内核层在写时复制时经由共享借用修改别的地址
-    /// 空间的页表。`Mmu` 不能跨线程共享，修改仍然是串行的；别的线程照样可以同时遍历。
+    /// Same as [`Mmu::map`], but needs only `&self`: during copy-on-write the kernel layer modifies
+    /// another address space's page table through a shared borrow. `Mmu` cannot be shared across
+    /// threads, so modifications are still serial; other threads may still walk it at the same
+    /// time.
     ///
     /// # Safety
     ///
-    /// 同 [`Mmu::map`]。
+    /// Same as [`Mmu::map`].
     pub unsafe fn map_shared(
         &self,
         gva: u64,
@@ -345,13 +356,14 @@ impl Mmu {
         })
     }
 
-    /// 与 [`Mmu::protect`] 相同，但只要 `&self`（见 [`Mmu::map_shared`]）。
+    /// Same as [`Mmu::protect`], but needs only `&self` (see [`Mmu::map_shared`]).
     pub fn protect_shared(&self, gva: u64, len: u64, prot: u32) -> Result<(), MapError> {
         map_result(unsafe { appine_mmu_protect(self.raw.as_ptr(), gva, len, prot) })
     }
 
-    /// 查询 guest 地址对应的 host 指针；`required_prot` 中的权限必须全部具备，传 0 只要求
-    /// 有可以访问的表项（权限为 0 的不算）。
+    /// Looks up the host pointer for a guest address; every permission in `required_prot` must be
+    /// present, and passing 0 only requires an accessible entry (ones with permission 0 do not
+    /// count).
     pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
         NonNull::new(unsafe { appine_mmu_translate(self.raw.as_ptr(), gva, required_prot) }.cast())
     }
@@ -369,120 +381,127 @@ impl Drop for Mmu {
     }
 }
 
-/// 访存类型。
+/// Memory access type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// 数据读。
+    /// Data read.
     Read,
-    /// 数据写。
+    /// Data write.
     Write,
-    /// 取指。
+    /// Instruction fetch.
     Exec,
 }
 
-/// 访存失败的类别。
+/// Kind of memory access failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultKind {
-    /// 未映射或权限不符，对应 SIGSEGV。
+    /// Unmapped or wrong permissions; corresponds to SIGSEGV.
     Page,
-    /// PC 或者要求对齐的数据访问（独占访问、原子操作）未对齐，对应 SIGBUS。
+    /// The PC, or a data access that requires alignment (exclusive access, atomics), is
+    /// misaligned; corresponds to SIGBUS.
     Alignment,
-    /// 以 SP 为基址访存时 SP 未对齐（`addr` 是 SP），对应 SIGBUS。
+    /// SP misaligned on an SP-based memory access (`addr` is SP); corresponds to SIGBUS.
     StackAlignment,
-    /// 访存命中了硬件观察点（`addr` 是访问的起点），对应 SIGTRAP；指令没有执行。
+    /// The access hit a hardware watchpoint (`addr` is the start of the access); corresponds to
+    /// SIGTRAP; the instruction has not executed.
     Watchpoint,
-    /// pc 命中了硬件断点（`addr` 是 pc），对应 SIGTRAP。
+    /// The pc hit a hardware breakpoint (`addr` is the pc); corresponds to SIGTRAP.
     HwBreakpoint,
 }
 
-/// [`Cpu::run`] 返回的退出原因：需要内核层介入的事件。
+/// Exit reasons returned by [`Cpu::run`]: events that need the kernel layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
-    /// `svc #imm`；pc 已指向下一条指令。
+    /// `svc #imm`; pc already points at the next instruction.
     Svc {
-        /// svc 的立即数，Linux 只使用 0。
+        /// The svc immediate; Linux only uses 0.
         imm: u16,
     },
-    /// 未定义或不在白名单内的指令；pc 指向该指令。
+    /// An undefined instruction, or one outside the whitelist; pc points at the instruction.
     Undefined {
-        /// 指令编码。
+        /// Instruction encoding.
         insn: u32,
     },
-    /// `brk #imm`；pc 指向该指令。
+    /// `brk #imm`; pc points at the instruction.
     Breakpoint {
-        /// brk 的立即数。
+        /// The brk immediate.
         imm: u16,
     },
-    /// 访存失败；pc 指向出错指令，该指令没有产生副作用。
+    /// Memory access failure; pc points at the faulting instruction, which had no side effects.
     Fault {
-        /// 出错的 guest 地址（已去掉 TBI tag）。
+        /// The faulting guest address (TBI tag removed).
         addr: u64,
-        /// 访存类型。
+        /// Memory access type.
         access: Access,
-        /// 失败类别。
+        /// Failure kind.
         kind: FaultKind,
     },
-    /// 被其他线程 kick 打断。
+    /// Interrupted by a kick from another thread.
     Kick,
-    /// `ic ivau`：guest 修改了 `addr` 处的代码；pc 已指向下一条指令。共用这个地址空间的
-    /// 每个 [`Dbt`] 都要作废这里的翻译。
+    /// `ic ivau`: the guest modified the code at `addr`; pc already points at the next
+    /// instruction. Every [`Dbt`] sharing this address space must invalidate its translations
+    /// there.
     InvalidateCode {
-        /// 指令的地址操作数（已去掉 TBI tag）。
+        /// The instruction's address operand (TBI tag removed).
         addr: u64,
     },
-    /// 引擎自己的 bug 让宿主收到了故障信号（只在 [`install_fault_guard`] 之后出现）：guest
-    /// 状态不可信，应当结束这个 guest 进程。用过的 [`Dbt`] 已经作废，析构时直接释放。
+    /// A bug in the engine itself made the host receive a fault signal (only after
+    /// [`install_fault_guard`]): guest state cannot be trusted and this guest process should be
+    /// ended. The [`Dbt`] that was in use is already poisoned and is released directly when
+    /// dropped.
     HostFault {
-        /// 宿主收到的信号：SIGSEGV、SIGBUS 或 SIGILL。
+        /// The signal the host received: SIGSEGV, SIGBUS or SIGILL.
         signal: i32,
-        /// 宿主的 `si_code`。
+        /// The host's `si_code`.
         code: i32,
-        /// 宿主的 `si_addr`。
+        /// The host's `si_addr`.
         addr: u64,
-        /// 出错的宿主指令。
+        /// The faulting host instruction.
         pc: u64,
     },
 }
 
-/// 一个 guest 硬件线程。
+/// A guest hardware thread.
 ///
-/// `Cpu` 持有它所绑定的 [`Mmu`] 的裸指针，调用方必须保证 `Mmu` 比 `Cpu`
-/// 活得久；修改 `Mmu` 的映射之后，必须调用 [`Cpu::tlb_flush`]。
+/// `Cpu` holds a raw pointer to the [`Mmu`] it is bound to, and the caller must ensure that the
+/// `Mmu` outlives the `Cpu`; after changing the `Mmu`'s mappings, [`Cpu::tlb_flush`] must be
+/// called.
 pub struct Cpu {
-    /// 由 `appine_cpu_new` 分配（mmap），`Drop` 时释放。
+    /// Allocated (mmap) by `appine_cpu_new`, released on `Drop`.
     state: NonNull<CpuState>,
 }
 
-// SAFETY: 同一时刻只有一个线程运行一个 Cpu（`&mut self`），但它可以在线程之间移交；
-// 它指向的 Mmu 由调用方保证存活，并且页表本身允许并发遍历
+// SAFETY: only one thread runs a Cpu at a time (`&mut self`), but it can be handed over between
+// threads; the caller keeps the Mmu it points to alive, and the page table itself allows
+// concurrent walks
 unsafe impl Send for Cpu {}
 
-/// 从其他线程打断一个 [`Cpu`] 的句柄（[`Cpu::kicker`]）。
+/// A handle for interrupting a [`Cpu`] from other threads ([`Cpu::kicker`]).
 #[derive(Clone, Copy)]
 pub struct Kicker(NonNull<CpuState>);
 
-// SAFETY: kick 只对 CpuState 的 pending 字段做原子写
+// SAFETY: kick only does an atomic write to the CpuState's pending field
 unsafe impl Send for Kicker {}
 unsafe impl Sync for Kicker {}
 
 impl Kicker {
-    /// 让对应的 Cpu 在下一个指令边界（Tier 1 是下一个块入口）返回 [`Exit::Kick`]；
-    /// 它当前不在运行时，下一次运行会立即返回。
+    /// Makes the corresponding Cpu return [`Exit::Kick`] at the next instruction boundary (the
+    /// next block entry in Tier 1); if it is not running now, its next run returns immediately.
     ///
     /// # Safety
     ///
-    /// 创建这个句柄的 Cpu 必须仍然存活。
+    /// The Cpu that created this handle must still be alive.
     pub unsafe fn kick(&self) {
         unsafe { appine_cpu_kick(self.0.as_ptr()) }
     }
 }
 
 impl Cpu {
-    /// 创建一个所有寄存器为 0、绑定到 `mmu` 的 CPU。
+    /// Creates a CPU with all registers 0, bound to `mmu`.
     ///
     /// # Safety
     ///
-    /// `mmu` 必须比返回的 `Cpu` 活得久。
+    /// `mmu` must outlive the returned `Cpu`.
     pub unsafe fn new(mmu: &Mmu) -> Self {
         let state =
             NonNull::new(unsafe { appine_cpu_new(mmu.raw.as_ptr()) }).unwrap_or_else(|| {
@@ -491,62 +510,66 @@ impl Cpu {
         Cpu { state }
     }
 
-    /// 清零全部状态并改为绑定 `mmu`（execve 使用），[`Kicker`] 仍然有效。
+    /// Clears all state and rebinds to `mmu` (used by execve); the [`Kicker`] stays valid.
     ///
     /// # Safety
     ///
-    /// `mmu` 必须比这个 `Cpu` 活得久。
+    /// `mmu` must outlive this `Cpu`.
     pub unsafe fn reset(&mut self, mmu: &Mmu) {
         unsafe { appine_cpu_init(self.state.as_ptr(), mmu.raw.as_ptr()) }
     }
 
-    /// 打断这个 Cpu 的句柄。
+    /// A handle for interrupting this Cpu.
     pub fn kicker(&self) -> Kicker {
         Kicker(self.state)
     }
 
-    /// guest 寄存器。
+    /// Guest registers.
     pub fn state(&self) -> &CpuState {
-        // SAFETY: state 在 Cpu 存活期间有效，借用规则由 &self 保证
+        // SAFETY: state is valid while the Cpu is alive, and &self enforces the borrow rules
         unsafe { self.state.as_ref() }
     }
 
-    /// 可修改的 guest 寄存器。
+    /// Mutable guest registers.
     pub fn state_mut(&mut self) -> &mut CpuState {
-        // SAFETY: 同上，&mut self 保证独占
+        // SAFETY: as above; &mut self guarantees exclusive access
         unsafe { self.state.as_mut() }
     }
 
-    /// 按绑定的页表查询 guest 地址对应的 host 指针（[`Mmu::translate`]）；没有绑定页表时
-    /// 返回 None。页表允许在别的线程修改它时遍历；指针指向的内存的有效期由调用方保证。
+    /// Looks up the host pointer for a guest address through the bound page table
+    /// ([`Mmu::translate`]); returns None when no page table is bound. The page table may be
+    /// walked while another thread modifies it; the caller guarantees how long the memory the
+    /// pointer refers to stays valid.
     pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
         let mmu = self.state().mmu;
         if mmu.is_null() {
             return None;
         }
-        // SAFETY: 绑定的 mmu 比 Cpu 活得久（Cpu::new、Cpu::reset）
+        // SAFETY: the bound mmu outlives the Cpu (Cpu::new, Cpu::reset)
         NonNull::new(unsafe { appine_mmu_translate(mmu, gva, required_prot) }.cast())
     }
 
-    /// 让软件 TLB 全部失效。
+    /// Invalidates the whole software TLB.
     pub fn tlb_flush(&mut self) {
         unsafe { appine_cpu_tlb_flush(self.state.as_ptr()) }
     }
 
-    /// 从当前 pc 开始执行，直到需要内核层介入。
+    /// Executes from the current pc until the kernel layer is needed.
     pub fn run(&mut self) -> Exit {
         let rc = unsafe { appine_cpu_run(self.state.as_ptr()) };
         self.decode_exit(rc)
             .expect("appine_cpu_run returned EXIT_NONE")
     }
 
-    /// 在当前 pc 处执行给定的一条指令（不经取指）。正常完成时返回 `None`。
+    /// Executes the given instruction at the current pc (without fetching). Returns `None` when
+    /// it completes normally.
     pub fn exec_insn(&mut self, insn: u32) -> Option<Exit> {
         let rc = unsafe { appine_cpu_exec_insn(self.state.as_ptr(), insn) };
         self.decode_exit(rc)
     }
 
-    /// 用解释器执行 pc 处的一条指令（ptrace 的单步），不理会 kick。正常完成时返回 `None`。
+    /// Executes the instruction at pc under the interpreter (ptrace single-step), ignoring kicks.
+    /// Returns `None` when it completes normally.
     pub fn step(&mut self) -> Option<Exit> {
         let rc = unsafe { appine_cpu_step(self.state.as_ptr()) };
         self.decode_exit(rc)
@@ -601,71 +624,77 @@ impl Drop for Cpu {
     }
 }
 
-/// Tier 1 的翻译与运行统计（engine 的 map）。
+/// Tier 1 translation and run statistics (the engine map).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DbtStats {
-    /// 翻译的块数。
+    /// Blocks translated.
     pub blocks: u64,
-    /// 翻译的 guest 指令数。
+    /// Guest instructions translated.
     pub insns: u64,
-    /// 原样拷贝的指令数。
+    /// Instructions copied verbatim.
     pub insns_copied: u64,
-    /// 涉及被占用寄存器或 SP、改写后执行的指令数。
+    /// Instructions rewritten before execution because they involve a stolen register or SP.
     pub insns_remapped: u64,
-    /// 改写成内联 TLB 快速路径的访存指令数。
+    /// Memory access instructions rewritten into the inline TLB fast path.
     pub insns_memory: u64,
-    /// 交给 Tier 0 执行的指令数（静态计数）。
+    /// Instructions handed to Tier 0 (static count).
     pub insns_fallback: u64,
-    /// 因块链接退出到分发器的次数（每个链接点只发生一次）。
+    /// Exits to the dispatcher for block linking (once per link point).
     pub exits_chain: u64,
-    /// 间接分支未命中跳转缓存的次数。
+    /// Indirect branches that missed the jump cache.
     pub exits_lookup: u64,
-    /// 交给 Tier 0 执行一条指令的次数（回填 TLB 失败、SP 未对齐、不支持的指令等）。
+    /// Times one instruction was handed to Tier 0 (TLB refill failure, misaligned SP, unsupported
+    /// instruction, and so on).
     pub exits_interp: u64,
-    /// 因 syscall 退出的次数。
+    /// Exits for syscalls.
     pub exits_svc: u64,
-    /// 因 kick 退出的次数。
+    /// Exits for kicks.
     pub exits_kick: u64,
-    /// 代码缓存被清空的次数。
+    /// Times the code cache was flushed.
     pub flushes: u64,
-    /// 被 [`Dbt::invalidate`] 作废的块数。
+    /// Blocks invalidated by [`Dbt::invalidate`].
     pub invalidated: u64,
-    /// `blocks` 中直接拷贝翻译模板（其他实例翻译过的同一段代码）得到的块数。
+    /// Blocks among `blocks` obtained by copying a translation template directly (the same code
+    /// translated by another instance).
     pub blocks_shared: u64,
-    /// `insns_memory` 中和同一块里前面以同一寄存器为基址的访存共用一次 TLB 检查的条数。
+    /// Accesses among `insns_memory` that share one TLB check with an earlier access in the same
+    /// block based on the same register.
     pub insns_grouped: u64,
-    /// 共用的检查没通过、作废之后按不分组重新翻译的次数。
+    /// Times a shared check failed and the block was invalidated and retranslated without
+    /// grouping.
     pub ungrouped: u64,
 }
 
-/// Tier 1 翻译后的代码自己占用哪几个宿主寄存器（与它们同号的 guest 寄存器改存在
-/// [`CpuState`] 里，引用它们的指令要多读写一次）。只影响速度。
+/// Which host registers Tier 1's translated code takes for itself (the guest registers with the
+/// same numbers are kept in [`CpuState`] instead, and instructions referring to them need an
+/// extra load or store). Only affects speed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DbtRegs {
-    /// x16、x17、x26–x28：编译器生成的代码里用得少。
+    /// x16, x17, x26–x28: rarely used in compiler-generated code.
     #[default]
     Default,
-    /// x21–x25：Go 的程序常用 x16、x26–x28（栈检查、闭包上下文、汇编器的临时寄存器、
-    /// 当前的 goroutine），几乎不用这几个。
+    /// x21–x25: Go programs use x16 and x26–x28 heavily (stack checks, closure context, the
+    /// assembler's temporary register, the current goroutine) and these hardly at all.
     Go,
 }
 
-/// 一个地址空间的 Tier 1 翻译（代码缓存、翻译表），这个地址空间里的所有线程共用：每个
-/// 线程经由 [`Dbt::attach`] 得到自己的 [`Dbt`]。最后一个 [`Dbt`] 和这里的引用都没了之后
-/// 放回池里，翻译不多时保留下来，下一个使用者运行之前逐块核对。
+/// The Tier 1 translations of one address space (code cache, translation table), shared by all
+/// threads in that address space: each thread gets its own [`Dbt`] through [`Dbt::attach`]. Once
+/// the last [`Dbt`] and the references here are gone, it goes back to the pool; when there are
+/// not many translations they are kept, and checked block by block before the next user runs.
 pub struct DbtSpace {
     raw: NonNull<RawDbt>,
     key: u64,
 }
 
-// SAFETY: C 侧用自己的锁保护共享的部分（dbt.c 的 struct appine_dbt）
+// SAFETY: the C side protects the shared parts with its own lock (dbt.c's struct appine_dbt)
 unsafe impl Send for DbtSpace {}
 unsafe impl Sync for DbtSpace {}
 
-/// 翻译所在的一段映射（[`DbtSpace::set_sources`]）：guest 地址范围，和能断定内容相同的
-/// 身份（文件和它的版本）。
+/// A mapping that translations come from ([`DbtSpace::set_sources`]): a guest address range, and
+/// an identity (the file and its version) from which identical content can be concluded.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DbtSource {
@@ -675,45 +704,50 @@ pub struct DbtSource {
 }
 
 impl DbtSpace {
-    /// [`DbtSpace::set_sources`] 最多记下几段。
+    /// The most ranges [`DbtSpace::set_sources`] records.
     pub const SOURCES: usize = 64;
 
-    /// 创建（或者从池里取出）一个实例；宿主不是 aarch64 Linux 时返回 `None`。`key` 区分
-    /// 程序（0 表示不区分）：池里有同一个键、同一种 `regs` 留下的翻译时优先拿回它，用完
-    /// 放回池里时也按它记下。
+    /// Creates an instance (or takes one from the pool); returns `None` when the host is not
+    /// aarch64 Linux. `key` distinguishes programs (0 means no distinction): when the pool holds
+    /// translations left with the same key and the same `regs`, those are taken back first, and
+    /// the instance is also recorded under it when it goes back to the pool.
     pub fn new(key: u64, regs: DbtRegs) -> Option<Arc<Self>> {
         NonNull::new(unsafe { appine_dbt_new(key, regs) })
             .map(|raw| Arc::new(DbtSpace { raw, key }))
     }
 
-    /// 地址空间不再使用了（翻译要放回池里）：记下翻译所在的映射，最多 [`Self::SOURCES`]
-    /// 段。调用方保证身份相同的映射内容相同。
+    /// The address space is no longer in use (the translations go back to the pool): records the
+    /// mappings the translations come from, at most [`Self::SOURCES`] ranges. The caller
+    /// guarantees that mappings with the same identity have the same content.
     pub fn set_sources(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_set_sources(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 
-    /// 从池里拿到的翻译在新的地址空间第一次运行之前：新地址空间里与记下的
-    /// （[`Self::set_sources`]）完全相同的映射里的块不必逐块核对。
+    /// Before translations taken from the pool first run in a new address space: blocks in
+    /// mappings of the new address space that are exactly the same as the recorded ones
+    /// ([`Self::set_sources`]) need not be checked block by block.
     pub fn trust(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_trust(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 
-    /// 作废 guest pc 不在这几段映射里的块（含停放着的），只对某个地址空间有效的（带标签的，
-    /// 见 [`DbtSpace::share`]）除外：要由几个地址空间共用之前，去掉只对原来那个地址空间有效的
-    /// 翻译。别的线程可以正在运行。
+    /// Retires blocks whose guest pc is not in these mappings (parked ones included), except
+    /// those valid only for one address space (tagged, see [`DbtSpace::share`]): before several
+    /// address spaces share it, drops the translations valid only for the original address
+    /// space. Other threads may be running.
     pub fn retire_outside(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_retire_outside(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 
-    /// 几个地址空间共用这个实例时，它们一致地映射着的可信文件映射（每次给出全部，只增不减）：
-    /// 这些映射里的块所有地址空间共用，别处的块（JIT 生成的代码）只给翻译它的地址空间用，
-    /// 按 [`Dbt::attach`] 时给的标签区分。
+    /// When several address spaces share this instance, the trusted file mappings they all map
+    /// identically (all of them given every time, only growing): blocks in these mappings are
+    /// shared by all address spaces, and blocks elsewhere (JIT-generated code) are only for the
+    /// address space that translated them, told apart by the tag given at [`Dbt::attach`].
     pub fn share(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_share(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 
-    /// 给共用这个实例的一个地址空间分配标签（实例回到池里之前不重复）；用完了（6 万多个）返回
-    /// `None`。
+    /// Allocates a tag for one address space sharing this instance (not repeated until the
+    /// instance goes back to the pool); returns `None` when they run out (60-some thousand).
     pub fn new_tag(&self) -> Option<u16> {
         match unsafe { appine_dbt_new_tag(self.raw.as_ptr()) } {
             0 => None,
@@ -722,60 +756,64 @@ impl DbtSpace {
     }
 }
 
-/// 释放池里保留的 Tier 1 翻译：没有人在用，宿主内存紧张时（Android 的 `onTrimMemory`）
-/// 可以丢掉，下次运行同一个程序时重新拷贝模板。
+/// Releases the Tier 1 translations kept in the pool: nobody is using them, so they can be
+/// dropped when host memory is tight (Android's `onTrimMemory`), and the next run of the same
+/// program copies the templates again.
 pub fn trim_dbt_pool() {
     unsafe { appine_dbt_trim() }
 }
 
-/// 拆掉 Tier 1 的代码缓存在可写视图里写过的页（内容留着）。代码缓存按 W^X 映射两次，
-/// 宿主的 RSS 按映射数页，两个视图都碰过的页算两次；之后再写只是重新缺页。要定期调用：
-/// 内核层的定时器线程每秒一次。
+/// Unmaps the pages of Tier 1's code cache that were written through the writable view (content
+/// kept). The code cache is mapped twice for W^X, the host's RSS counts pages per mapping, and
+/// pages touched through both views count twice; writing again later only faults them back in.
+/// Must be called periodically: the kernel layer's timer thread does it once a second.
 pub fn unmap_written_code() {
     unsafe { appine_dbt_unmap_written() }
 }
 
-/// 可写视图里写过、还没拆掉的页（[`unmap_written_code`]）一共多少字节：它们在宿主的
-/// RSS 里算了两次。
+/// How many bytes in total were written through the writable view and not yet unmapped
+/// ([`unmap_written_code`]): they count twice in the host's RSS.
 pub fn written_code_bytes() -> u64 {
     unsafe { appine_dbt_written_bytes() }
 }
 
 impl Drop for DbtSpace {
     fn drop(&mut self) {
-        // 挂着的 Dbt 都持有 Arc，走到这里时它们都已经解挂
+        // Every attached Dbt holds an Arc, so by the time we get here they are all detached
         unsafe { appine_dbt_free(self.raw.as_ptr(), self.key) }
     }
 }
 
-/// Tier 1：同 ISA 直通式 DBT 里一个线程的部分（跳转缓存、影子返回栈、统计），挂在一个
-/// [`DbtSpace`] 上。
+/// Tier 1: one thread's part of a same-ISA pass-through DBT (jump cache, shadow return stack,
+/// statistics), attached to a [`DbtSpace`].
 ///
-/// 翻译结果不会自己失效：guest 用 `ic ivau` 声明修改了代码（[`Exit::InvalidateCode`]），
-/// 或者可执行的映射被拆除、改了权限之后，必须调用 [`Dbt::invalidate`] 或
-/// [`Dbt::flush`]（经由挂在同一个 [`DbtSpace`] 上的任意一个线程调用一次）。只支持
-/// aarch64 Linux 宿主。
+/// Translations never invalidate themselves: after the guest declares modified code with
+/// `ic ivau` ([`Exit::InvalidateCode`]), or after an executable mapping is torn down or changes
+/// permissions, [`Dbt::invalidate`] or [`Dbt::flush`] must be called (once, through any one
+/// thread attached to the same [`DbtSpace`]). Only aarch64 Linux hosts are supported.
 pub struct Dbt {
     raw: NonNull<RawDbtThread>,
     space: Arc<DbtSpace>,
 }
 
-// SAFETY: 线程的部分只由持有这个 Dbt 的线程使用，共享的部分由 C 侧加锁
+// SAFETY: the thread's part is used only by the thread holding this Dbt; the C side locks the
+// shared part
 unsafe impl Send for Dbt {}
 
 impl Dbt {
-    /// 创建一个只有这个线程用的实例；宿主不是 aarch64 Linux 时返回 `None`。
+    /// Creates an instance used only by this thread; returns `None` when the host is not aarch64
+    /// Linux.
     pub fn new() -> Option<Self> {
         Self::with_regs(DbtRegs::Default)
     }
 
-    /// 同 [`Dbt::new`]，翻译后的代码占用 `regs` 这一组寄存器。
+    /// Same as [`Dbt::new`], with the translated code taking the `regs` set of registers.
     pub fn with_regs(regs: DbtRegs) -> Option<Self> {
         Self::attach(&DbtSpace::new(0, regs)?, 0)
     }
 
-    /// 挂到 `space` 上。`tag` 是线程所在的地址空间的标签（[`DbtSpace::new_tag`]），实例不由几个
-    /// 地址空间共用时是 0。
+    /// Attaches to `space`. `tag` is the tag of the thread's address space
+    /// ([`DbtSpace::new_tag`]), 0 when the instance is not shared by several address spaces.
     pub fn attach(space: &Arc<DbtSpace>, tag: u16) -> Option<Self> {
         NonNull::new(unsafe { appine_dbt_attach(space.raw.as_ptr(), tag.into()) }).map(|raw| Dbt {
             raw,
@@ -783,36 +821,42 @@ impl Dbt {
         })
     }
 
-    /// 挂着的实例。
+    /// The attached instance.
     pub fn space(&self) -> &Arc<DbtSpace> {
         &self.space
     }
 
-    /// 与 [`Cpu::run`] 语义相同，但在翻译后的代码里执行。
+    /// Same semantics as [`Cpu::run`], but executes in translated code.
     pub fn run(&mut self, cpu: &mut Cpu) -> Exit {
         let rc = unsafe { appine_dbt_run(self.raw.as_ptr(), cpu.state.as_ptr()) };
         cpu.decode_exit(rc)
             .expect("appine_dbt_run returned EXIT_NONE")
     }
 
-    /// 丢弃全部翻译：要等所有线程离开翻译后的代码，由下一次 [`Dbt::run`] 完成。
+    /// Discards all translations: this has to wait until every thread has left translated code,
+    /// and is completed by the next [`Dbt::run`].
     pub fn flush(&mut self) {
         unsafe { appine_dbt_flush(self.raw.as_ptr()) }
     }
 
-    /// 要换一个地址空间运行（exec 之后）：保留翻译，下次运行之前逐块核对 guest 指令字，
-    /// 对不上的作废，大部分对不上时整体清空。比 [`Dbt::flush`] 之后重新拷贝翻译模板便宜。
+    /// About to run in a different address space (after exec): keeps the translations and,
+    /// before the next run, checks the guest instruction words block by block, invalidating the
+    /// ones that do not match, and clearing everything when most do not match. Cheaper than
+    /// copying the translation templates again after [`Dbt::flush`].
     pub fn recheck(&mut self) {
         unsafe { appine_dbt_recheck(self.raw.as_ptr()) }
     }
 
-    /// 作废 `[start, start + len)` 覆盖的各页里开始的块中，guest 指令字和 `cpu` 的地址空间
-    /// 里现在的不同的（翻译只取决于 pc 和指令字）；放不下时等同于 [`Dbt::flush`]。
+    /// Invalidates, among the blocks starting in the pages covered by `[start, start + len)`,
+    /// those whose guest instruction words differ from the current ones in `cpu`'s address space
+    /// (a translation depends only on the pc and the instruction words); when there is no room,
+    /// it is the same as [`Dbt::flush`].
     pub fn invalidate(&mut self, cpu: &Cpu, start: u64, len: u64) {
         unsafe { appine_dbt_invalidate(self.raw.as_ptr(), cpu.state.as_ptr(), start, len) }
     }
 
-    /// 这个线程的统计：它退出的次数，以及它做的翻译、作废。
+    /// This thread's statistics: how many times it exited, and the translations and
+    /// invalidations it did.
     pub fn stats(&self) -> DbtStats {
         let mut stats = DbtStats::default();
         unsafe { appine_dbt_get_stats(self.raw.as_ptr(), &mut stats) };
@@ -826,96 +870,99 @@ impl Drop for Dbt {
     }
 }
 
-/// 装上宿主侧的故障兜底（engine 的 map、设计文档 §12 第 5 条），可以重复调用：之后 [`Cpu::run`]、
-/// [`Dbt::run`] 运行期间宿主收到的 SIGSEGV、SIGBUS、SIGILL 变成 [`Exit::HostFault`]，
-/// 只影响当时运行的那个 guest；其余的故障先往 stderr 写一行报告，再交给原来的处理方式
-/// （Android 上 debuggerd 据此生成 tombstone）。
+/// Installs the host-side fault guard (the engine map, design doc §12 item 5); may be called
+/// repeatedly. Afterwards, SIGSEGV, SIGBUS and SIGILL received by the host while [`Cpu::run`] or
+/// [`Dbt::run`] runs become [`Exit::HostFault`] and affect only the guest running at the time;
+/// other faults first write a one-line report to stderr and are then passed to the original
+/// handling (on Android, debuggerd produces a tombstone from it).
 pub fn install_fault_guard() {
     unsafe { appine_fault_guard_install() }
 }
 
-/// 宣告给 guest 的 `AT_HWCAP`：宿主支持 ∩ Tier 0 已实现 ∩ 白名单（engine 的 map）。
+/// The `AT_HWCAP` advertised to the guest: host support ∩ implemented by Tier 0 ∩ the whitelist
+/// (the engine map).
 pub fn guest_hwcap() -> u64 {
     unsafe { appine_guest_hwcap() }
 }
 
-/// 宣告给 guest 的 `AT_HWCAP2`，规则与 [`guest_hwcap`] 相同。
+/// The `AT_HWCAP2` advertised to the guest, by the same rule as [`guest_hwcap`].
 pub fn guest_hwcap2() -> u64 {
     unsafe { appine_guest_hwcap2() }
 }
 
-/// guest 读到的 `MIDR_EL1`（`/proc/cpuinfo` 用）；宿主不允许读 ID 寄存器时为 0。
+/// The `MIDR_EL1` the guest reads (used by `/proc/cpuinfo`); 0 when the host does not allow
+/// reading ID registers.
 pub fn guest_midr() -> u64 {
     unsafe { appine_guest_midr() }
 }
 
-/// HWCAP 位，取值与 Linux 的 `HWCAP_*` 一致。
+/// HWCAP bits, with the same values as Linux's `HWCAP_*`.
 pub mod hwcap {
-    /// 浮点。
+    /// Floating point.
     pub const FP: u64 = 1 << 0;
-    /// Advanced SIMD。
+    /// Advanced SIMD.
     pub const ASIMD: u64 = 1 << 1;
-    /// AES 指令。
+    /// AES instructions.
     pub const AES: u64 = 1 << 3;
-    /// PMULL 的 1Q 形式。
+    /// The 1Q form of PMULL.
     pub const PMULL: u64 = 1 << 4;
-    /// SHA1 指令。
+    /// SHA1 instructions.
     pub const SHA1: u64 = 1 << 5;
-    /// SHA256 指令。
+    /// SHA256 instructions.
     pub const SHA2: u64 = 1 << 6;
-    /// CRC32 指令。
+    /// CRC32 instructions.
     pub const CRC32: u64 = 1 << 7;
-    /// LSE 原子指令。
+    /// LSE atomic instructions.
     pub const ATOMICS: u64 = 1 << 8;
-    /// 标量的半精度浮点运算（FP16）。
+    /// Scalar half-precision floating point (FP16).
     pub const FPHP: u64 = 1 << 9;
-    /// Advanced SIMD 的半精度浮点运算（FP16）。
+    /// Advanced SIMD half-precision floating point (FP16).
     pub const ASIMDHP: u64 = 1 << 10;
-    /// EL0 可以读取 ID 寄存器。
+    /// EL0 may read ID registers.
     pub const CPUID: u64 = 1 << 11;
-    /// RDM：SQRDMLAH、SQRDMLSH。
+    /// RDM: SQRDMLAH, SQRDMLSH.
     pub const ASIMDRDM: u64 = 1 << 12;
-    /// FJCVTZS（JavaScript 语义的双精度转 int32）。
+    /// FJCVTZS (double to int32 with JavaScript semantics).
     pub const JSCVT: u64 = 1 << 13;
-    /// FCMA：复数的乘加和加法（FCMLA、FCADD）。
+    /// FCMA: complex multiply-add and add (FCMLA, FCADD).
     pub const FCMA: u64 = 1 << 14;
-    /// RCpc 的 load-acquire（LDAPR、LDAPRB、LDAPRH）。
+    /// RCpc load-acquire (LDAPR, LDAPRB, LDAPRH).
     pub const LRCPC: u64 = 1 << 15;
-    /// DC CVAP（清到持久化点）。
+    /// DC CVAP (clean to the point of persistence).
     pub const DCPOP: u64 = 1 << 16;
-    /// SHA3 指令（EOR3、RAX1、XAR、BCAX）。
+    /// SHA3 instructions (EOR3, RAX1, XAR, BCAX).
     pub const SHA3: u64 = 1 << 17;
-    /// Advanced SIMD 的点积指令（SDOT、UDOT）。
+    /// Advanced SIMD dot product instructions (SDOT, UDOT).
     pub const ASIMDDP: u64 = 1 << 20;
-    /// SHA512 指令。
+    /// SHA512 instructions.
     pub const SHA512: u64 = 1 << 21;
-    /// FHM：半精度乘、加到单精度（FMLAL、FMLSL）。
+    /// FHM: half-precision multiply, accumulating into single precision (FMLAL, FMLSL).
     pub const ASIMDFHM: u64 = 1 << 23;
-    /// DIT：PSTATE 里的"数据无关的执行时间"（MSR、MRS DIT）。
+    /// DIT: "data independent timing" in PSTATE (MSR, MRS DIT).
     pub const DIT: u64 = 1 << 24;
-    /// LRCPC2：带偏移的 LDAPUR、STLUR 这些。
+    /// LRCPC2: LDAPUR, STLUR and the like, with an offset.
     pub const ILRCPC: u64 = 1 << 26;
-    /// FlagM：CFINV、RMIF、SETF8、SETF16。
+    /// FlagM: CFINV, RMIF, SETF8, SETF16.
     pub const FLAGM: u64 = 1 << 27;
-    /// 推测执行屏障 SB。
+    /// The speculation barrier SB.
     pub const SB: u64 = 1 << 29;
 }
 
-/// `AT_HWCAP2` 的位，取值与 Linux 的 `HWCAP2_*` 一致。
+/// `AT_HWCAP2` bits, with the same values as Linux's `HWCAP2_*`.
 pub mod hwcap2 {
-    /// DC CVADP（清到深持久化点）。
+    /// DC CVADP (clean to the point of deep persistence).
     pub const DCPODP: u64 = 1 << 0;
-    /// FlagM2：AXFLAG、XAFLAG。
+    /// FlagM2: AXFLAG, XAFLAG.
     pub const FLAGM2: u64 = 1 << 7;
-    /// FRINTTS：FRINT32Z、FRINT32X、FRINT64Z、FRINT64X。
+    /// FRINTTS: FRINT32Z, FRINT32X, FRINT64Z, FRINT64X.
     pub const FRINT: u64 = 1 << 8;
-    /// int8 矩阵乘（SMMLA、UMMLA、USMMLA、USDOT、SUDOT）。
+    /// int8 matrix multiply (SMMLA, UMMLA, USMMLA, USDOT, SUDOT).
     pub const I8MM: u64 = 1 << 13;
-    /// BFloat16（BFDOT、BFMMLA、BFMLALB/T、BFCVT、BFCVTN）。
+    /// BFloat16 (BFDOT, BFMMLA, BFMLALB/T, BFCVT, BFCVTN).
     pub const BF16: u64 = 1 << 14;
 }
 
-/// 校验 [`CpuState`] 与 C 结构体的布局是否一致。
+/// Checks whether [`CpuState`]'s layout matches the C struct.
 pub fn layout_matches() -> bool {
     unsafe {
         appine_cpu_layout_check(

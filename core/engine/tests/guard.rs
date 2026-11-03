@@ -1,7 +1,9 @@
-//! 宿主侧的故障兜底（`install_fault_guard`，engine 的 map、设计文档 §12 第 5 条）：引擎访问了不该访问的
-//! 宿主内存时，两个执行层都返回 `Exit::HostFault`，之后照常运行。用页表里一个指向
-//! `PROT_NONE` 宿主页的表项模拟引擎的 bug（内核层不会这样建页表）。宿主不是 aarch64
-//! Linux（含 Android）时没有原生桩和 Tier 1，整个文件不参与编译。
+//! The host-side fault guard (`install_fault_guard`, the engine map, design doc §12 item 5): when
+//! the engine accesses host memory it should not, both execution tiers return `Exit::HostFault`
+//! and then keep running as usual. A page-table entry pointing at a `PROT_NONE` host page
+//! simulates the engine bug (the kernel layer never builds page tables like that). When the host
+//! is not aarch64 Linux (Android included) there are no native stubs and no Tier 1, and the whole
+//! file is not compiled.
 #![cfg(all(
     any(target_os = "linux", target_os = "android"),
     target_arch = "aarch64"
@@ -15,9 +17,9 @@ use appine_engine::{Cpu, Dbt, Exit, Mmu, PAGE_SIZE, hwcap, prot};
 struct Page([u8; 4096]);
 
 const CODE: u64 = 0x40_0000;
-/// 可以正常读写的一页。
+/// A page that can be read and written normally.
 const DATA: u64 = 0x50_0000;
-/// 页表说可以读写、宿主那边却是 `PROT_NONE` 的一页。
+/// A page the page table says is read-write, but which is `PROT_NONE` on the host side.
 const BROKEN: u64 = 0x60_0000;
 
 const SVC: u32 = 0xd400_0001;
@@ -28,7 +30,7 @@ const LDADD_X4_X5_X6: u32 = 0xf824_00c5; // ldadd x4, x5, [x6]
 const SIGSEGV: i32 = 11;
 
 struct Guest {
-    // 析构顺序：cpu → mmu → pages、broken
+    // Drop order: cpu → mmu → pages, broken
     cpu: Cpu,
     mmu: Mmu,
     pages: Box<[Page]>,
@@ -103,7 +105,7 @@ fn interpreter_survives_a_host_fault() {
     g.cpu.state_mut().x[1] = BROKEN;
     let exit = g.cpu.run();
     g.assert_host_fault(exit);
-    // 之后照常运行
+    // Then it keeps running as usual
     g.code(&[LDR_X0_X1, SVC]);
     g.pages[1].0[..8].copy_from_slice(&42u64.to_le_bytes());
     g.cpu.state_mut().x[1] = DATA;
@@ -121,7 +123,8 @@ fn translator_survives_a_host_fault() {
     g.cpu.state_mut().x[1] = BROKEN;
     let exit = dbt.run(&mut g.cpu);
     g.assert_host_fault(exit);
-    // 出过故障的实例直接释放，不回到池里；新的实例照常运行同一段代码
+    // An instance that hit a fault is released directly and does not go back to the pool; a new
+    // instance runs the same code as usual
     drop(dbt);
     let mut dbt = Dbt::new().unwrap();
     g.code(&[LDR_X0_X1, SVC]);
@@ -137,8 +140,9 @@ fn locks_held_at_the_fault_are_released() {
         return;
     }
     let mut g = Guest::new();
-    // Tier 0 在读锁里执行原生桩：桩访问出错时这把锁要释放，否则下面生成新桩要拿写锁，
-    // 同一个线程会卡死
+    // Tier 0 runs native stubs under the read lock: when a stub's access faults this lock must be
+    // released, otherwise generating a new stub below needs the write lock and the same thread
+    // would hang
     g.code(&[LDADD_X2_X3_X1, SVC]);
     g.cpu.state_mut().x[1] = BROKEN;
     let exit = g.cpu.run();

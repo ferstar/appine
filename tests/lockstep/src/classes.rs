@@ -1,43 +1,48 @@
-//! 随机测试用例生成器。
+//! Random test case generator.
 //!
-//! 每个类别按编码格式随机填充字段，并避开会读写 SP 或改变控制流的编码，因为
-//! 这些指令在原生跳板里无法安全执行。访存类用例只访问数据区：生成器给出基址
-//! 寄存器相对数据区起点的偏移，由运行器换算成真实地址。PAC/BTI 等 hint 被有意
-//! 实现为 NOP（engine 的 map），与硬件不同，所以也不在这里测。
+//! Each class fills the fields of an encoding format at random and avoids encodings that read or
+//! write SP or change control flow, because those instructions cannot run safely in the native
+//! trampoline. Memory access cases only access the data area: the generator gives the base
+//! register's offset from the start of the data area, and the runner converts it to a real
+//! address. Hints such as PAC/BTI are deliberately implemented as NOPs (the engine map), unlike
+//! hardware, so they are not tested here either.
 
 use appine_engine::{hwcap, hwcap2};
 
 use crate::rng::Rng;
 
-/// [`Class::requires`] 里 `AT_HWCAP2` 的位放在高 32 位（`AT_HWCAP` 只用到第 31 位）。
+/// In [`Class::requires`], `AT_HWCAP2` bits go in the high 32 bits (`AT_HWCAP` only uses up to
+/// bit 31).
 pub const HWCAP2_I8MM: u64 = hwcap2::I8MM << 32;
-/// 同上，`HWCAP2_BF16`。
+/// As above, `HWCAP2_BF16`.
 pub const HWCAP2_BF16: u64 = hwcap2::BF16 << 32;
-/// 同上，`HWCAP2_FLAGM2`。
+/// As above, `HWCAP2_FLAGM2`.
 pub const HWCAP2_FLAGM2: u64 = hwcap2::FLAGM2 << 32;
-/// 同上，`HWCAP2_FRINT`。
+/// As above, `HWCAP2_FRINT`.
 pub const HWCAP2_FRINT: u64 = hwcap2::FRINT << 32;
-/// 同上，`HWCAP2_DCPODP`。
+/// As above, `HWCAP2_DCPODP`.
 pub const HWCAP2_DCPODP: u64 = hwcap2::DCPODP << 32;
 
-/// guest 的 `AT_HWCAP` 和左移 32 位的 `AT_HWCAP2`，与 [`Class::requires`] 比较。
+/// The guest's `AT_HWCAP` and its `AT_HWCAP2` shifted left by 32, compared with
+/// [`Class::requires`].
 pub fn guest_caps() -> u64 {
     appine_engine::guest_hwcap() | appine_engine::guest_hwcap2() << 32
 }
 
-/// 数据区大小（两页），与原生执行端一致。
+/// Size of the data area (two pages), the same as on the native side.
 pub const DATA_BYTES: u64 = 8192;
 
-/// 一个测试用例：最多 4 条指令，以及对部分寄存器的初始设定。
+/// One test case: at most 4 instructions, plus initial settings for some registers.
 #[derive(Debug, Clone, Default)]
 pub struct Case {
-    /// 依次执行的指令。
+    /// Instructions executed in order.
     pub insns: Vec<u32>,
-    /// 设为"数据区起点 + 偏移"的寄存器。
+    /// Registers set to "start of data area + offset".
     pub pointers: Vec<(u32, i64)>,
-    /// 设为指定值的寄存器。
+    /// Registers set to given values.
     pub values: Vec<(u32, u64)>,
-    /// 设为数据区某个偏移处 8 字节内容的寄存器（用来构造会成功的 CAS）。
+    /// Registers set to the 8 bytes at some offset in the data area (to build a CAS that
+    /// succeeds).
     pub loads: Vec<(u32, u64)>,
 }
 
@@ -50,39 +55,42 @@ impl Case {
     }
 }
 
-/// 生成器需要知道的运行环境。
+/// What the generator needs to know about the environment.
 pub struct Env {
-    /// 第一条被测指令在它所在 4K 页内的偏移。
+    /// Offset of the first tested instruction within its 4K page.
     pub slot_offset: u64,
 }
 
-/// 用例的生成方式。
+/// How a case is generated.
 #[derive(Clone, Copy)]
 pub enum Gen {
-    /// 单条不访存的指令。
+    /// A single instruction that does not access memory.
     Insn(fn(&mut Rng) -> u32),
-    /// 完整的用例。
+    /// A complete case.
     Case(fn(&mut Rng, &Env) -> Case),
 }
 
-/// 一个用例类别。
+/// A case class.
 pub struct Class {
-    /// 类别名，可用 `--class` 单独运行。
+    /// Class name; `--class` runs it alone.
     pub name: &'static str,
-    /// 为 true 时，硬件能执行的编码解释器也必须能执行；为 false（模糊类别）时，
-    /// 允许解释器比硬件更严格，把白名单外的编码当作未定义指令。
+    /// When true, encodings the hardware can execute must also be executable by the interpreter;
+    /// when false (fuzz classes), the interpreter may be stricter than the hardware and treat
+    /// encodings outside the whitelist as undefined instructions.
     pub strict: bool,
-    /// 硬件可能偶发地给出不同结果（独占访问会被中断清掉标记），不一致时重跑硬件。
+    /// The hardware may occasionally give different results (an interrupt clears the mark of an
+    /// exclusive access); on a mismatch the hardware is rerun.
     pub flaky: bool,
-    /// 迭代次数是基准次数的几倍。
+    /// Multiple of the base iteration count.
     pub weight: u64,
-    /// 只有 guest 特性集合包含这些 HWCAP 位时才运行（HWCAP2 的见 [`HWCAP2_I8MM`]）。
+    /// Runs only when the guest feature set contains these HWCAP bits (for HWCAP2 see
+    /// [`HWCAP2_I8MM`]).
     pub requires: u64,
-    /// 生成方式。
+    /// How cases are generated.
     pub generate: Gen,
 }
 
-/// 全部类别。
+/// All classes.
 pub const CLASSES: &[Class] = &[
     strict("pc_rel", pc_rel),
     strict("add_sub_imm", add_sub_imm),
@@ -179,12 +187,12 @@ const fn case(name: &'static str, generate: fn(&mut Rng, &Env) -> Case, requires
     }
 }
 
-/// 任意寄存器编号；31 在这些编码里是 XZR。
+/// Any register number; 31 is XZR in these encodings.
 fn reg(g: &mut Rng) -> u32 {
     g.bits(5)
 }
 
-/// 不是 31 的寄存器编号，用于 31 表示 SP 的字段。
+/// A register number other than 31, for fields where 31 means SP.
 fn reg_not_sp(g: &mut Rng) -> u32 {
     g.below(31)
 }
@@ -346,7 +354,7 @@ fn cond_select(g: &mut Rng) -> u32 {
         | reg(g)
 }
 
-// sf 0 0 11010110 Rm opcode Rn Rd：UDIV/SDIV/LSLV/LSRV/ASRV/RORV
+// sf 0 0 11010110 Rm opcode Rn Rd: UDIV/SDIV/LSLV/LSRV/ASRV/RORV
 fn dp_2src(g: &mut Rng) -> u32 {
     (g.bit() << 31)
         | (0b11010110 << 21)
@@ -356,7 +364,7 @@ fn dp_2src(g: &mut Rng) -> u32 {
         | reg(g)
 }
 
-// sf 1 0 11010110 00000 opcode Rn Rd：RBIT/REV16/REV32/REV/CLZ/CLS
+// sf 1 0 11010110 00000 opcode Rn Rd: RBIT/REV16/REV32/REV/CLZ/CLS
 fn dp_1src(g: &mut Rng) -> u32 {
     let sf = g.bit();
     let opcode = if sf == 1 {
@@ -369,7 +377,7 @@ fn dp_1src(g: &mut Rng) -> u32 {
 
 // sf 00 11011 op31 Rm o0 Ra Rn Rd
 fn dp_3src(g: &mut Rng) -> u32 {
-    // (只允许 64 位, op31, o0, Ra 必须是 31)
+    // (64-bit only, op31, o0, Ra must be 31)
     const FORMS: &[(bool, u32, u32, bool)] = &[
         (false, 0, 0, false), // MADD
         (false, 0, 1, false), // MSUB
@@ -403,21 +411,21 @@ fn nzcv_move(g: &mut Rng) -> u32 {
     base | reg(g)
 }
 
-/// 在整个数据处理（立即数、寄存器）编码空间里随机取样，只排除 Rd/Rn 为 31 的编码
-/// ——这两个字段在部分指令里表示 SP。
+/// Samples at random across the whole data processing (immediate, register) encoding space,
+/// excluding only encodings with Rd/Rn = 31, since those two fields mean SP in some instructions.
 fn fuzz_dp(g: &mut Rng) -> u32 {
     let mut insn = g.next_u64() as u32;
     insn = if g.bit() == 1 {
-        (insn & !(0b111 << 26)) | (0b100 << 26) // bits 28:26 = 100：立即数
+        (insn & !(0b111 << 26)) | (0b100 << 26) // bits 28:26 = 100: immediate
     } else {
-        (insn & !(0b111 << 25)) | (0b101 << 25) // bits 27:25 = 101：寄存器
+        (insn & !(0b111 << 25)) | (0b101 << 25) // bits 27:25 = 101: register
     };
     let rd = reg_not_sp(g);
     let rn = reg_not_sp(g);
     (insn & !0x3ff) | (rn << 5) | rd
 }
 
-/// 0–30 中不在 `avoid` 里的寄存器。
+/// A register in 0–30 that is not in `avoid`.
 fn reg_except(g: &mut Rng, avoid: &[u32]) -> u32 {
     loop {
         let r = g.below(31);
@@ -427,7 +435,7 @@ fn reg_except(g: &mut Rng, avoid: &[u32]) -> u32 {
     }
 }
 
-/// 0–31 中不在 `avoid` 里的寄存器；31 在这些编码里是 ZR。
+/// A register in 0–31 that is not in `avoid`; 31 is ZR in these encodings.
 fn reg_or_zr(g: &mut Rng, avoid: &[u32]) -> u32 {
     loop {
         let r = g.bits(5);
@@ -437,7 +445,8 @@ fn reg_or_zr(g: &mut Rng, avoid: &[u32]) -> u32 {
     }
 }
 
-/// 一次访问 `len` 字节的目标偏移，按 `align` 对齐，保证落在数据区内（可以跨页）。
+/// Target offset of a `len`-byte access, aligned to `align`, guaranteed to fall inside the data
+/// area (it may cross pages).
 fn target(g: &mut Rng, len: u64, align: u64) -> i64 {
     let slots = (DATA_BYTES - len) / align + 1;
     (g.below(slots as u32) as u64 * align) as i64
@@ -447,7 +456,7 @@ fn signed(g: &mut Rng, bits: u32) -> i64 {
     g.bits(bits) as i64 - (1 << (bits - 1))
 }
 
-/// 整数 LDR/STR/LDRS*：无符号偏移、非缩放、前变址、后变址、寄存器偏移。
+/// Integer LDR/STR/LDRS*: unsigned offset, unscaled, pre-index, post-index, register offset.
 fn int_ldst(g: &mut Rng, _: &Env) -> Case {
     const OPCS: [&[u32]; 4] = [&[0, 1, 2, 3], &[0, 1, 2, 3], &[0, 1, 2], &[0, 1]];
     let size = g.bits(2);
@@ -457,7 +466,8 @@ fn int_ldst(g: &mut Rng, _: &Env) -> Case {
     single_reg(g, 0x3800_0000, size, opc, size, rn, rt, 1 << size)
 }
 
-/// 单寄存器访存的公共部分；`base` 是 V = 0 或 1 的编码基值，`scale` 是 log2 字节数。
+/// The common part of single-register accesses; `base` is the encoding base value for V = 0 or 1,
+/// and `scale` is log2 of the byte count.
 #[allow(clippy::too_many_arguments)]
 fn single_reg(
     g: &mut Rng,
@@ -504,12 +514,14 @@ fn single_reg(
     c
 }
 
-/// 以同一个寄存器为基址的 2–4 条访存（Tier 1 让它们共用一次 TLB 检查）：整数和
-/// SIMD&FP 的单寄存器、成对访问，带回写，中间可以有按常数加减基址的 ADD/SUB，最后
-/// 一条可以是把基址覆盖掉的加载。覆盖的范围可以跨页。
+/// 2–4 accesses based on the same register (Tier 1 makes them share one TLB check): integer and
+/// SIMD&FP single-register and pair accesses, with writeback; ADD/SUB adjusting the base by a
+/// constant may come in between, and the last one may be a load that overwrites the base. The
+/// covered range may cross pages.
 fn same_base(g: &mut Rng, _: &Env) -> Case {
     let rn = reg_except(g, &[]);
-    /* 基址离数据区两头都足够远：每条指令最多移动基址 512 字节、偏移最多 512 字节 */
+    /* The base is far enough from both ends of the data area: each instruction moves the base by
+     * at most 512 bytes, and offsets are at most 512 bytes */
     let start = 2560 + g.below(DATA_BYTES as u32 - 2 * 2560 - 16) as i64;
     let mut c = Case {
         pointers: vec![(rn, start)],
@@ -519,7 +531,8 @@ fn same_base(g: &mut Rng, _: &Env) -> Case {
         let rt = reg_or_zr(g, &[rn]);
         let insn = match g.below(6) {
             0 => {
-                /* LDR/STR Wt|Xt 无符号偏移；加载时偶尔覆盖基址，之后不再用它 */
+                /* LDR/STR Wt|Xt unsigned offset; a load occasionally overwrites the base, which
+                 * is not used afterwards */
                 let size = 2 + g.bit();
                 let load = g.bit();
                 let rt = if load == 1 && g.below(4) == 0 { rn } else { rt };
@@ -531,7 +544,7 @@ fn same_base(g: &mut Rng, _: &Env) -> Case {
                 insn
             }
             1 => {
-                /* LDUR/STUR、后变址、前变址，各种大小 */
+                /* LDUR/STUR, post-index, pre-index, all sizes */
                 let op = g.pick(&[0, 1, 3]);
                 g.bits(2) << 30
                     | 0x3800_0000
@@ -542,7 +555,7 @@ fn same_base(g: &mut Rng, _: &Env) -> Case {
                     | rt
             }
             2 => {
-                /* LDP/STP Xt：后变址、有符号偏移、前变址 */
+                /* LDP/STP Xt: post-index, signed offset, pre-index */
                 let load = g.bit();
                 let rt2 = if load == 1 {
                     reg_or_zr(g, &[rn, rt])
@@ -559,11 +572,11 @@ fn same_base(g: &mut Rng, _: &Env) -> Case {
                     | rt
             }
             3 => {
-                /* LDR/STR Qt 无符号偏移 */
+                /* LDR/STR Qt unsigned offset */
                 0x3d80_0000 | g.bit() << 22 | g.below(32) << 10 | rn << 5 | g.bits(5)
             }
             4 => {
-                /* LDP/STP Dt 有符号偏移 */
+                /* LDP/STP Dt signed offset */
                 let load = g.bit();
                 let rt = g.bits(5);
                 let rt2 = loop {
@@ -590,9 +603,10 @@ fn same_base(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// 两个基址交错的访存（Tier 1 让同一基址的共用一次检查，中间夹着别的访存时组员从槽里
-/// 取回宿主基址），中间还可能夹一条用三个被占用寄存器的运算（翻译时要用 T2）。两个基址
-/// 指向的范围可以重叠。
+/// Accesses on two interleaved bases (Tier 1 makes those on the same base share one check; when
+/// other accesses come in between, members take the host base back from a slot), possibly with an
+/// operation using three stolen registers in between (translating it needs T2). The ranges the
+/// two bases point to may overlap.
 fn interleaved(g: &mut Rng, _: &Env) -> Case {
     let a = reg_except(g, &[]);
     let b = reg_except(g, &[a]);
@@ -607,7 +621,7 @@ fn interleaved(g: &mut Rng, _: &Env) -> Case {
             b'a' => access_on(g, a, &[a, b]),
             b'b' => access_on(g, b, &[a, b]),
             _ => {
-                /* ADD Xd, Xn, Xm：三个被占用的寄存器，不写两个基址 */
+                /* ADD Xd, Xn, Xm: three stolen registers, not writing either base */
                 let stolen = [16, 17, 18, 26, 27, 28];
                 let pick = |g: &mut Rng, used: &[u32]| loop {
                     let r = g.pick(&stolen);
@@ -626,8 +640,8 @@ fn interleaved(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// 以 `rn` 为基址的一条访存（same_base 的几种形式），不写 `keep` 里的寄存器（回写基址
-/// 除外）。
+/// One access based on `rn` (the forms of same_base), not writing the registers in `keep`
+/// (except for base writeback).
 fn access_on(g: &mut Rng, rn: u32, keep: &[u32]) -> u32 {
     let rt = reg_or_zr(g, keep);
     match g.below(5) {
@@ -667,12 +681,13 @@ fn access_on(g: &mut Rng, rn: u32, keep: &[u32]) -> u32 {
     }
 }
 
-/// 整数 LDP/STP/LDPSW/LDNP/STNP。
+/// Integer LDP/STP/LDPSW/LDNP/STNP.
 fn int_pair(g: &mut Rng, _: &Env) -> Case {
     let opc = g.pick(&[0, 1, 2]);
     let load = if opc == 1 { 1 } else { g.bit() };
     let n = if opc == 2 { 8 } else { 4 };
-    let idx = g.bits(2); /* opc = 01 且 idx = 00（LDNPSW）是未分配编码，两边都应拒绝 */
+    /* opc = 01 with idx = 00 (LDNPSW) is unallocated, and both sides should reject it */
+    let idx = g.bits(2);
     let rn = reg_except(g, &[]);
     let rt = reg_or_zr(g, &[rn]);
     let rt2 = if load == 1 {
@@ -714,8 +729,9 @@ fn pair(
     }
 }
 
-/// LDR (literal)：整数和 SIMD&FP 两种，目标在被测指令所在的 4K 页内。
-/// 解释器一侧在第 5 个字放的是 svc，与硬件不同，目标要避开它。
+/// LDR (literal): both integer and SIMD&FP, with the target in the tested instruction's 4K page.
+/// The interpreter side puts an svc in the 5th word, unlike the hardware, so the target must
+/// avoid it.
 fn literal(g: &mut Rng, env: &Env) -> Case {
     let simd = g.bit() == 1;
     let opc = g.below(3);
@@ -736,22 +752,24 @@ fn literal(g: &mut Rng, env: &Env) -> Case {
     Case::one((opc << 30) | base | ((imm19 as u32 & 0x7ffff) << 5) | g.bits(5))
 }
 
-/// 以 ADRP 算出的基址（可能再加一个立即数）读被测指令所在的页：Tier 1 翻译时就知道
-/// 地址，表项的位置是常数（dbt.c 的 konst）。中间可能夹一条改掉基址的指令（MOV、或者读
-/// 进基址本身），之后的访问不能再当作已知地址。
+/// Reads the tested instruction's page through a base computed by ADRP (possibly plus an
+/// immediate): Tier 1 knows the address at translation time, and the entry's position is a
+/// constant (dbt.c's konst). An instruction that changes the base (MOV, or a load into the base
+/// itself) may come in between, after which accesses may no longer be treated as known
+/// addresses.
 fn pc_page(g: &mut Rng, env: &Env) -> Case {
     let rn = reg_except(g, &[]);
     let mut c = Case::default();
-    c.insns.push(0x9000_0000 | rn); // ADRP Xn, 本页
+    c.insns.push(0x9000_0000 | rn); // ADRP Xn, this page
     let mut base = 0i64;
     if g.bit() == 1 {
-        let k = g.below(500) as i64 * 8; // 后面至少还有几个 16 字节的位置
+        let k = g.below(500) as i64 * 8; // leaves at least a few 16-byte positions after it
         c.insns.push(0x9100_0000 | (k as u32) << 10 | rn << 5 | rn); // ADD Xn, Xn, #k
         base = k;
     }
     let svc = env.slot_offset as i64 + 16;
-    // 访问 n 字节：LDR X/W/H/B、LDP X、LDR Q，偏移按 n 对齐、不超过 `max`（LDP 的立即数
-    // 只有 7 位），落在本页、不碰 SVC
+    // An n-byte access: LDR X/W/H/B, LDP X, LDR Q, with the offset aligned to n and at most `max`
+    // (LDP's immediate has only 7 bits), inside this page and not touching the SVC
     let pick = |g: &mut Rng, base: i64, n: i64, max: i64| loop {
         let off = g.below(((4096 - base - n) / n).min(max / n) as u32 + 1) as i64 * n;
         let t = base + off;
@@ -785,7 +803,7 @@ fn pc_page(g: &mut Rng, env: &Env) -> Case {
     };
     match g.below(4) {
         0 => {
-            // MOV Xn, Xm：基址改指向数据区，不再是已知值
+            // MOV Xn, Xm: the base now points into the data area and is no longer a known value
             let rm = reg_except(g, &[rn]);
             c.pointers.push((rm, 0));
             c.insns.push(0xaa00_03e0 | rm << 16 | rn);
@@ -794,7 +812,7 @@ fn pc_page(g: &mut Rng, env: &Env) -> Case {
                 .push(0xf940_0000 | ((off / 8) as u32) << 10 | rn << 5 | g.bits(5));
         }
         1 => {
-            // 读进基址本身（LDR Xn, [Xn, #off]）
+            // A load into the base itself (LDR Xn, [Xn, #off])
             let off = pick(g, base, 8, 4095 * 8);
             c.insns
                 .push(0xf940_0000 | ((off / 8) as u32) << 10 | rn << 5 | rn);
@@ -809,7 +827,7 @@ fn pc_page(g: &mut Rng, env: &Env) -> Case {
     c
 }
 
-/// SIMD&FP 单寄存器 LDR/STR（B/H/S/D/Q）。
+/// SIMD&FP single-register LDR/STR (B/H/S/D/Q).
 fn simd_ldst(g: &mut Rng, _: &Env) -> Case {
     const FORMS: [(u32, u32); 10] = [
         (0, 0),
@@ -830,7 +848,7 @@ fn simd_ldst(g: &mut Rng, _: &Env) -> Case {
     single_reg(g, 0x3c00_0000, size, opc, scale, rn, rt, 1 << scale)
 }
 
-/// SIMD&FP LDP/STP/LDNP/STNP（S/D/Q）。
+/// SIMD&FP LDP/STP/LDNP/STNP (S/D/Q).
 fn simd_pair(g: &mut Rng, _: &Env) -> Case {
     let opc = g.below(3);
     let load = g.bit();
@@ -844,7 +862,8 @@ fn simd_pair(g: &mut Rng, _: &Env) -> Case {
     pair(g, 0x2c00_0000, opc, load, idx, 4 << opc, rn, rt, rt2)
 }
 
-/// 后变址形式：Rm = 31 表示按传输的字节数，否则加上一个通用寄存器。
+/// Post-index form: Rm = 31 means by the number of bytes transferred, otherwise a general
+/// register is added.
 fn post_index(g: &mut Rng, c: &mut Case, rn: u32) -> u32 {
     if g.bit() == 1 {
         return 31;
@@ -854,7 +873,7 @@ fn post_index(g: &mut Rng, c: &mut Case, rn: u32) -> u32 {
     rm
 }
 
-/// LD1–LD4/ST1–ST4（多个结构），含后变址。
+/// LD1–LD4/ST1–ST4 (multiple structures), with post-index.
 fn simd_struct(g: &mut Rng, _: &Env) -> Case {
     const FORMS: [(u32, u64, u64); 7] = [
         (0x0, 1, 4),
@@ -886,7 +905,7 @@ fn simd_struct(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// LD1–LD4/ST1–ST4（单个结构）和 LD1R–LD4R，含后变址。
+/// LD1–LD4/ST1–ST4 (single structure) and LD1R–LD4R, with post-index.
 fn simd_lane(g: &mut Rng, _: &Env) -> Case {
     let selem = g.below(4) + 1;
     let kind = g.below(5);
@@ -932,7 +951,7 @@ fn simd_lane(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// MRS/MSR FPCR、FPSR；写入的值只含 ARMv8.0 定义的位。
+/// MRS/MSR FPCR, FPSR; the written values contain only bits defined by ARMv8.0.
 fn fp_sysreg(g: &mut Rng, _: &Env) -> Case {
     let rt = g.bits(5);
     let mut c = Case::default();
@@ -952,7 +971,7 @@ fn fp_sysreg(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// 独占访问：LDXR+STXR、LDXP+STXP、CLREX+STXR（必然失败）、LDAR/STLR。
+/// Exclusive accesses: LDXR+STXR, LDXP+STXP, CLREX+STXR (always fails), LDAR/STLR.
 fn exclusive(g: &mut Rng, _: &Env) -> Case {
     let rn = reg_except(g, &[]);
     let (acquire, release) = (g.bit(), g.bit());
@@ -1012,7 +1031,8 @@ fn exclusive(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// LSE：LD<op>、SWP、CAS、CASP。CAS 有一半概率让比较值等于内存值，这样会真正写入。
+/// LSE: LD<op>, SWP, CAS, CASP. Half of the time CAS gets a compare value equal to the memory
+/// value, so that it really writes.
 fn lse(g: &mut Rng, _: &Env) -> Case {
     let rn = reg_except(g, &[]);
     let (a, r) = (g.bit(), g.bit());
@@ -1080,7 +1100,8 @@ fn lse(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// LDAPR、LDAPRB、LDAPRH（32、64 位），基址指向数据区里对齐的地方。
+/// LDAPR, LDAPRB, LDAPRH (32 and 64 bits), with the base pointing at an aligned place in the data
+/// area.
 fn lrcpc(g: &mut Rng, _: &Env) -> Case {
     let rn = reg_except(g, &[]);
     let size = g.bits(2);
@@ -1091,12 +1112,13 @@ fn lrcpc(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// LRCPC2 的 STLUR*、LDAPUR*、LDAPURS*：基址加 9 位偏移指向数据区里对齐的地方。
+/// LRCPC2's STLUR*, LDAPUR*, LDAPURS*: the base plus a 9-bit offset points at an aligned place in
+/// the data area.
 fn lrcpc2(g: &mut Rng, _: &Env) -> Case {
     let rn = reg_except(g, &[]);
     let size = g.bits(2);
     let bytes = 1u32 << size;
-    // size 11 没有带符号扩展的读，size 10 没有扩展到 32 位的
+    // size 11 has no sign-extending load, size 10 none extending to 32 bits
     let opc = match size {
         3 => g.below(2),
         2 => g.below(3),
@@ -1117,7 +1139,7 @@ fn lrcpc2(g: &mut Rng, _: &Env) -> Case {
     c
 }
 
-/// CRC32B/H/W/X、CRC32CB/H/W/X。
+/// CRC32B/H/W/X, CRC32CB/H/W/X.
 fn crc32(g: &mut Rng, _: &Env) -> Case {
     let sz = g.bits(2);
     let sf = (sz == 3) as u32;
@@ -1132,9 +1154,10 @@ fn crc32(g: &mut Rng, _: &Env) -> Case {
     )
 }
 
-/// 整个 SIMD&FP 数据处理编码空间（bits 27:25 = 111）。白名单本身由 LLVM 对照
-/// 检查（whitelist.rs），这里检查被执行的指令的语义和寄存器搬运。
-/// SDOT、UDOT 的向量形式和按元素形式（2S、4S）。
+/// The whole SIMD&FP data processing encoding space (bits 27:25 = 111). The whitelist itself is
+/// checked against LLVM (whitelist.rs); this checks the semantics and register moves of the
+/// executed instructions.
+/// SDOT, UDOT in vector and by-element forms (2S, 4S).
 fn dotprod(g: &mut Rng, _: &Env) -> Case {
     let q_u = (g.bit() << 30) | (g.bit() << 29);
     let rm = reg(g);
@@ -1142,12 +1165,12 @@ fn dotprod(g: &mut Rng, _: &Env) -> Case {
     Case::one(if g.bit() == 1 {
         0x0e80_9400 | q_u | (rm << 16) | rn_rd
     } else {
-        // 按元素：H:L 选 Vm 的第几个 32 位元素，M:Rm 是完整的寄存器号
+        // By element: H:L selects which 32-bit element of Vm, M:Rm is the full register number
         0x0f80_e000 | q_u | (g.bit() << 21) | (rm << 16) | (g.bit() << 11) | rn_rd
     })
 }
 
-/// SHA3 的 EOR3、BCAX、XAR、RAX1，SHA512 的 SHA512H、SHA512H2、SHA512SU0、SHA512SU1。
+/// SHA3's EOR3, BCAX, XAR, RAX1; SHA512's SHA512H, SHA512H2, SHA512SU0, SHA512SU1.
 fn sha3_sha512(g: &mut Rng, _: &Env) -> Case {
     let rn_rd = (reg(g) << 5) | reg(g);
     let rm = reg(g) << 16;
@@ -1157,12 +1180,13 @@ fn sha3_sha512(g: &mut Rng, _: &Env) -> Case {
         2 => 0xce80_0000 | rm | (g.bits(6) << 10) | rn_rd, // XAR
         3 => 0xce60_8c00 | rm | rn_rd,                  // RAX1
         4 => 0xcec0_8000 | rn_rd,                       // SHA512SU0
-        // SHA512H、SHA512H2、SHA512SU1
+        // SHA512H, SHA512H2, SHA512SU1
         k => 0xce60_8000 | ((k - 5) << 10) | rm | rn_rd,
     })
 }
 
-/// I8MM：SMMLA、UMMLA、USMMLA（只有 128 位）、USDOT 的向量形式，USDOT、SUDOT 的按元素形式。
+/// I8MM: SMMLA, UMMLA, USMMLA (128-bit only), the vector form of USDOT, and the by-element forms
+/// of USDOT and SUDOT.
 fn i8mm(g: &mut Rng, _: &Env) -> Case {
     let q = g.bit() << 30;
     let rn_rd = (reg(g) << 5) | reg(g);
@@ -1178,10 +1202,13 @@ fn i8mm(g: &mut Rng, _: &Env) -> Case {
     })
 }
 
-/// FP16：向量和标量的三寄存器、两寄存器杂项，按元素，跨元素，标量浮点的各组（算术、
-/// 乘加、比较、条件选择、与整数互转、FMOV），向量的 FMOV 立即数。按表只挑有定义的编码。
+/// FP16: vector and scalar three-register and two-register miscellaneous, by element, across
+/// elements, the scalar floating-point groups (arithmetic, multiply-add, compare, conditional
+/// select, conversion to and from integers, FMOV), and vector FMOV immediate. Only encodings
+/// that are defined are picked, by table.
 fn fp16(g: &mut Rng, _: &Env) -> Case {
-    // (U, a, opcode) 的位表，与 simd.c 的相同：三寄存器 opcode 0–7，杂项 opcode 0x0c–0x1f
+    // Bit tables over (U, a, opcode), the same as simd.c's: three-register opcode 0–7,
+    // miscellaneous opcode 0x0c–0x1f
     const THREE: [[u32; 2]; 2] = [[0xdf, 0xc7], [0xfd, 0x75]];
     const SCALAR_THREE: [[u32; 2]; 2] = [[0x98, 0x80], [0x30, 0x34]];
     const MISC: [[u32; 2]; 2] = [[0x3f00_0000, 0x2f00_f000], [0x3f00_0000, 0xae00_b000]];
@@ -1211,31 +1238,31 @@ fn fp16(g: &mut Rng, _: &Env) -> Case {
             let f = pick(g, &SCALAR_MISC, 5);
             0x5e78_0800 | (f & !31) | ((f & 31) << 12) | rn | rd
         }
-        // FMLA、FMLS、FMUL、FMULX（按元素）：H:L:M 选元素，Rm 只有 4 位
+        // FMLA, FMLS, FMUL, FMULX (by element): H:L:M selects the element, Rm has only 4 bits
         5 => {
             let op = [0x0f00_1000, 0x0f00_5000, 0x0f00_9000, 0x2f00_9000][g.bits(2) as usize];
             let lane = (g.bit() << 11) | (g.bit() << 21) | (g.bit() << 20);
             op | q | lane | ((reg(g) & 15) << 16) | rn | rd
         }
-        // FMAXNMV、FMAXV、FMINNMV、FMINV（opcode 0x0c、0x0f）
+        // FMAXNMV, FMAXV, FMINNMV, FMINV (opcode 0x0c, 0x0f)
         6 => 0x0e30_c800 | q | (g.bit() << 23) | (g.bit() * 0x3000) | rn | rd,
-        // 标量的 FMUL、FDIV、FADD、FSUB、FMAX、FMIN、FMAXNM、FMINNM、FNMUL
+        // Scalar FMUL, FDIV, FADD, FSUB, FMAX, FMIN, FMAXNM, FMINNM, FNMUL
         7 | 8 => 0x1ee0_0800 | rm | ((g.next_u64() % 9) as u32) << 12 | rn | rd,
-        // FMADD、FMSUB、FNMADD、FNMSUB
+        // FMADD, FMSUB, FNMADD, FNMSUB
         9 => 0x1fc0_0000 | (g.bit() << 21) | rm | (g.bit() << 15) | (reg(g) << 10) | rn | rd,
-        // FCMP、FCMPE（和 0 比）、FCCMP、FCSEL
+        // FCMP, FCMPE (against 0), FCCMP, FCSEL
         10 => {
             let opc = g.bits(2);
             0x1ee0_2000 | if opc & 1 == 1 { 0 } else { rm } | rn | (opc << 3)
         }
         11 => 0x1ee0_0400 | rm | (g.bits(4) << 12) | rn | (g.bit() << 4) | g.bits(4),
         12 => 0x1ee0_0c00 | rm | (g.bits(4) << 12) | rn | rd,
-        // FMOV、FABS、FNEG、FSQRT、FCVT（到单、双精度）、FRINT*
+        // FMOV, FABS, FNEG, FSQRT, FCVT (to single, double precision), FRINT*
         13 => {
             let op = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 14, 15][(g.next_u64() % 13) as usize];
             0x1ee0_4000 | (op << 15) | rn | rd
         }
-        // 与 W/X 互转：FCVT*S/U、SCVTF/UCVTF、FMOV
+        // Conversion to and from W/X: FCVT*S/U, SCVTF/UCVTF, FMOV
         14 => {
             let (rmode, op) = [
                 (0, 0),
@@ -1251,22 +1278,24 @@ fn fp16(g: &mut Rng, _: &Env) -> Case {
             ][(g.next_u64() % 10) as usize];
             (g.bit() << 31) | 0x1ee0_0000 | (rmode << 19) | (op << 16) | rn | rd
         }
-        // 向量的 FMOV 立即数（半精度）
+        // Vector FMOV immediate (half precision)
         _ => 0x0f00_fc00 | q | (g.bits(3) << 16) | (g.bits(5) << 5) | rd,
     })
 }
 
-/// FJCVTZS：输入是随机的双精度位型（含 NaN、无穷、超出范围的），比对 W 和 NZCV。
+/// FJCVTZS: the input is a random double-precision bit pattern (including NaNs, infinities and
+/// out-of-range values); W and NZCV are compared.
 fn jscvt(g: &mut Rng, _: &Env) -> Case {
     Case::one(0x1e7e_0000 | (reg(g) << 5) | reg(g))
 }
 
-/// RDM：SQRDMLAH、SQRDMLSH 的向量、标量形式和按元素形式（H、S 两种元素）。
+/// RDM: SQRDMLAH, SQRDMLSH in vector, scalar and by-element forms (H and S elements).
 fn rdm(g: &mut Rng, _: &Env) -> Case {
     let size = (1 + g.bit()) << 22;
-    let sub = g.bit(); // 0 是 SQRDMLAH，1 是 SQRDMLSH
+    let sub = g.bit(); // 0 is SQRDMLAH, 1 is SQRDMLSH
     let (rn_rd, rm) = ((reg(g) << 5) | reg(g), reg(g) << 16);
-    // 按元素：H 元素时 H:L:M 选元素、Rm 只有 4 位；S 元素时 H:L 选元素、M:Rm 是寄存器号
+    // By element: for H elements H:L:M selects the element and Rm has only 4 bits; for S elements
+    // H:L selects the element and M:Rm is the register number
     let lane = (g.bit() << 21) | (g.bit() << 20) | ((reg(g) & 15) << 16) | (g.bit() << 11);
     Case::one(match g.bits(2) {
         0 => 0x2e00_8400 | (g.bit() << 30) | size | rm | (sub << 11) | rn_rd,
@@ -1276,7 +1305,8 @@ fn rdm(g: &mut Rng, _: &Env) -> Case {
     })
 }
 
-/// FCMA：FCMLA（向量、按元素，四种旋转）、FCADD（90、270）。半精度、单精度、双精度（只有 128 位）。
+/// FCMA: FCMLA (vector, by element, four rotations), FCADD (90, 270). Half, single and double
+/// precision (128-bit only).
 fn fcma(g: &mut Rng, _: &Env) -> Case {
     let (rn_rd, rm) = ((reg(g) << 5) | reg(g), reg(g) << 16);
     let size = 1 + (g.next_u64() % 3) as u32;
@@ -1284,7 +1314,8 @@ fn fcma(g: &mut Rng, _: &Env) -> Case {
     Case::one(match g.bits(2) {
         0 | 1 => 0x2e00_c400 | (q << 30) | (size << 22) | rm | (g.bits(2) << 11) | rn_rd,
         2 => 0x2e00_e400 | (q << 30) | (size << 22) | rm | (g.bit() << 12) | rn_rd,
-        // 按元素：半精度按 H:L 选一对（64 位时 H = 0），单精度按 H 选（只有 128 位，L = 0）
+        // By element: half precision selects a pair by H:L (H = 0 for 64 bits), single precision
+        // by H (128-bit only, L = 0)
         _ => {
             let half = g.bit() == 1;
             let q = if half { g.bit() } else { 1 };
@@ -1303,7 +1334,8 @@ fn fcma(g: &mut Rng, _: &Env) -> Case {
     })
 }
 
-/// FHM：FMLAL、FMLSL、FMLAL2、FMLSL2 的向量和按元素形式（H:L:M 选元素，Rm 只有 4 位）。
+/// FHM: FMLAL, FMLSL, FMLAL2, FMLSL2 in vector and by-element forms (H:L:M selects the element,
+/// Rm has only 4 bits).
 fn fhm(g: &mut Rng, _: &Env) -> Case {
     let q = g.bit() << 30;
     let rn_rd = (reg(g) << 5) | reg(g);
@@ -1320,25 +1352,26 @@ fn fhm(g: &mut Rng, _: &Env) -> Case {
     })
 }
 
-/// BF16：BFDOT、BFMLALB/T（向量和按元素）、BFMMLA、BFCVT、BFCVTN/BFCVTN2。
+/// BF16: BFDOT, BFMLALB/T (vector and by element), BFMMLA, BFCVT, BFCVTN/BFCVTN2.
 fn bf16(g: &mut Rng, _: &Env) -> Case {
     let q = g.bit() << 30;
     let (rn_rd, rm) = ((reg(g) << 5) | reg(g), reg(g) << 16);
-    // BFDOT 按 H:L 选一对、M:Rm 是寄存器号；BFMLAL 按 H:L:M 选元素、Rm 只有 4 位
+    // BFDOT selects a pair by H:L and M:Rm is the register number; BFMLAL selects the element by
+    // H:L:M and Rm has only 4 bits
     let (l, m, h) = (g.bit() << 21, g.bit() << 20, g.bit() << 11);
     Case::one(match g.bits(3) {
         0 => 0x2e40_fc00 | q | rm | rn_rd,         // BFDOT
         1 => 0x6e40_ec00 | rm | rn_rd,             // BFMMLA
-        2 => 0x2ec0_fc00 | q | rm | rn_rd,         // BFMLALB、BFMLALT
+        2 => 0x2ec0_fc00 | q | rm | rn_rd,         // BFMLALB, BFMLALT
         3 => 0x0f40_f000 | q | l | rm | h | rn_rd, // BFDOT (by element)
         4 => 0x0fc0_f000 | q | l | m | (rm & 0xf_0000) | h | rn_rd, // BFMLALB/T (by element)
         5 => 0x1e63_4000 | rn_rd,                  // BFCVT
-        _ => 0x0ea1_6800 | q | rn_rd,              // BFCVTN、BFCVTN2
+        _ => 0x0ea1_6800 | q | rn_rd,              // BFCVTN, BFCVTN2
     })
 }
 
-/// FRINTTS：FRINT32Z/X、FRINT64Z/X 的标量（单、双精度）和向量形式（2S、4S、2D）。X 的形式按
-/// 随机的 FPCR.RMode 舍入。
+/// FRINTTS: FRINT32Z/X, FRINT64Z/X in scalar (single, double precision) and vector forms (2S, 4S,
+/// 2D). The X forms round by a random FPCR.RMode.
 fn frint(g: &mut Rng, _: &Env) -> Case {
     let (rn_rd, op) = ((reg(g) << 5) | reg(g), g.bits(2));
     Case::one(if g.bit() == 1 {
@@ -1351,7 +1384,7 @@ fn frint(g: &mut Rng, _: &Env) -> Case {
     })
 }
 
-/// FlagM：CFINV、RMIF（随机的移位和掩码）、SETF8、SETF16；NZCV 的初值是随机的。
+/// FlagM: CFINV, RMIF (random shift and mask), SETF8, SETF16; NZCV starts out random.
 fn flagm(g: &mut Rng, _: &Env) -> Case {
     Case::one(match g.bits(2) {
         0 => 0xd500_401f,
@@ -1360,17 +1393,17 @@ fn flagm(g: &mut Rng, _: &Env) -> Case {
     })
 }
 
-/// FlagM2：XAFLAG、AXFLAG。
+/// FlagM2: XAFLAG, AXFLAG.
 fn flagm2(g: &mut Rng, _: &Env) -> Case {
     Case::one(0xd500_401f | ((1 + g.bit()) << 5))
 }
 
-/// SB（推测执行屏障）。
+/// SB (speculation barrier).
 fn sb(_: &mut Rng, _: &Env) -> Case {
     Case::one(0xd503_30ff)
 }
 
-/// DC CVAP、DC CVADP：地址指向数据区里任意字节。
+/// DC CVAP, DC CVADP: the address points at any byte in the data area.
 fn dc_persist(g: &mut Rng, insn: u32) -> Case {
     let rt = reg_except(g, &[]);
     let mut c = Case::one(insn | rt);
@@ -1386,8 +1419,8 @@ fn dcpodp(g: &mut Rng, _: &Env) -> Case {
     dc_persist(g, 0xd50b_7d20)
 }
 
-/// DIT：先用 MSR DIT, #imm（任意 CRm）或者 MSR DIT, Xn（随机值）设，再用 MRS 读回；原生
-/// 一侧上一个用例留下的 DIT 不影响结果。
+/// DIT: first set with MSR DIT, #imm (any CRm) or MSR DIT, Xn (random value), then read back with
+/// MRS; DIT left by the previous case on the native side does not affect the result.
 fn dit(g: &mut Rng, _: &Env) -> Case {
     let (rt, rn) = (reg(g), reg(g));
     let set = if g.bit() == 1 {

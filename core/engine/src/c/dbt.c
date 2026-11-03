@@ -1,30 +1,38 @@
 /*
- * Tier 1：同 ISA 直通式 DBT（engine 的 map：`.claude/maps/engine.md`）。
+ * Tier 1: a same-ISA pass-through DBT (the engine map: `.claude/maps/engine.md`).
  *
- * 翻译后的代码运行期间的寄存器约定（这里是默认的一组，Go 的程序另用一组，见 struct regs）：
- *   - guest X0–X15、X19–X25、X29、X30 放在同号的宿主寄存器里，guest SP 放在宿主 X26；
- *   - 宿主 X28 指向 struct appine_cpu，宿主 X16、X17、X27 是临时寄存器；
- *   - 宿主 X18 是平台寄存器（Android 上是 bionic 给每个线程设的影子调用栈指针），
- *     翻译后的代码不碰它：宿主的信号处理函数随时可能用到它；
- *   - guest X16、X17、X18、X26、X27、X28 存放在 cpu 结构体里（"被占用的寄存器"），
- *     引用它们的指令改写后执行。SP 出现在 17% 的指令里（函数的序言、尾声），X26 在
- *     编译器生成的代码里是用得最少的被调用者保存寄存器（gcc 的 cc1 里不到 SP 的十分之一），
- *     所以把宿主 X26 让给 SP。宿主寄存器只在翻译后的代码之间约定，与宿主的调用约定无关：
- *     翻译后的代码不调用宿主的函数，进入例程保存了全部被调用者保存的寄存器；
- *   - guest NZCV 就是宿主 NZCV，所以插入的代码一律不改动条件标志；
- *   - guest V0–V31、FPCR、FPSR 就是宿主的 V0–V31、FPCR、FPSR，SIMD&FP 数据处理
- *     指令原样执行。
+ * Register convention while translated code runs (this is the default set; Go programs use
+ * another set, see struct regs):
+ *   - guest X0–X15, X19–X25, X29 and X30 live in the same-numbered host registers, and guest SP
+ *     lives in host X26;
+ *   - host X28 points to struct appine_cpu; host X16, X17 and X27 are temporaries;
+ *   - host X18 is the platform register (on Android, the shadow call stack pointer bionic sets up
+ *     for each thread), and translated code does not touch it: the host's signal handlers may use
+ *     it at any time;
+ *   - guest X16, X17, X18, X26, X27 and X28 are kept in the cpu struct ("stolen registers"), and
+ *     instructions that reference them are rewritten before they run. SP appears in 17% of
+ *     instructions (function prologues and epilogues), and X26 is the least used callee-saved
+ *     register in compiler-generated code (less than a tenth of SP in gcc's cc1), so host X26 is
+ *     given to SP. The host registers are a convention only among pieces of translated code and
+ *     have nothing to do with the host calling convention: translated code calls no host
+ *     functions, and the enter routine saves all callee-saved registers;
+ *   - guest NZCV is host NZCV, so inserted code never changes the condition flags;
+ *   - guest V0–V31, FPCR and FPSR are the host's V0–V31, FPCR and FPSR, and SIMD&FP
+ *     data-processing instructions run verbatim.
  *
- * 访存指令改写成内联的 TLB 快速路径；TLB 未命中、跨页时进入回填例程，回填失败
- * （未映射、没有权限等）和 SP 未对齐时退出到分发器，由 Tier 0 执行这一条指令
- * （此时指令还没有产生任何副作用）。直接
- * 分支通过块链接直接跳转，间接分支先查跳转缓存。函数调用压影子返回栈，RET 先看
- * 栈顶（emit_call）。Tier 0 不认识的指令同样
- * 交给 Tier 0，保证两层的白名单完全一致（engine 的 map）。
+ * Memory-access instructions are rewritten into the inline TLB fast path; a TLB miss or a
+ * cross-page access enters the refill routine, and a failed refill (unmapped, no permission and so
+ * on) or a misaligned SP exits to the dispatcher, where Tier 0 executes this one instruction (at
+ * that point the instruction has had no side effect at all). Direct branches jump directly through
+ * block links; indirect branches first look up the jump cache. Function calls push the shadow
+ * return stack, and RET looks at the top of the stack first (emit_call). Instructions Tier 0 does
+ * not recognize are likewise handed to Tier 0, which keeps the two tiers' whitelists exactly the
+ * same (the engine map).
  *
- * 翻译结果不会自己失效，见 appine_dbt_invalidate()。代码缓存按 W^X 双映射。
+ * Translations never invalidate themselves; see appine_dbt_invalidate(). The code cache is
+ * double-mapped W^X.
  */
-#define _GNU_SOURCE /* -std=c17 下 madvise、mremap 及其标志需要它 */
+#define _GNU_SOURCE /* needed for madvise, mremap and their flags under -std=c17 */
 #include <stddef.h>
 #include <stdlib.h>
 
@@ -45,40 +53,47 @@
 #define BIT(x, n) ((unsigned)(((x) >> (n)) & 1u))
 #define FIELD(x, hi, lo) ((unsigned)(((x) >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1)))
 
-/* 一个地址空间的所有线程共用，JIT 负载要放得下十几万个活着的块。块跳往缓存开头的例程、
- * 块之间的链接都是一条 b，偏移范围是 ±128 MB，所以不能更大 */
+/* Shared by all threads of an address space; JIT workloads need room for more than a hundred
+ * thousand live blocks. A block's jumps to the routines at the start of the cache and the links
+ * between blocks are each one b, whose range is ±128 MB, so it cannot be larger */
 #define CODE_CACHE_BYTES (UINT64_C(128) << 20)
 #define MAX_BLOCK_INSNS 64
-_Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "b 的偏移范围");
-/* 单条 guest 指令最多展开成约 40 条宿主指令，再加上退出桩 */
+_Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "the offset range of b");
+/* One guest instruction expands to at most about 40 host instructions, plus exit stubs */
 #define MAX_BLOCK_WORDS (MAX_BLOCK_INSNS * 64)
 #define MAX_STUBS (MAX_BLOCK_INSNS * 2 + 4)
 #define MAX_FIXUPS (MAX_BLOCK_INSNS * 4 + 4)
-/* 翻译表从 2^12 项开始，装到四分之三时加倍，最多 2^19 项：表按哈希散开，短命进程的
- * 几百个块要是放进最大的表，每个块都会碰到一页新的内存。一个地址空间的所有线程共用
- * 一张表，JIT 负载（JVM）活着的块有十几万个 */
+/* The translation table starts at 2^12 entries, doubles when three quarters full, and has at most
+ * 2^19 entries: the table is spread by hash, so if a short-lived process's few hundred blocks were
+ * put in the largest table, every block would touch a new page of memory. All threads of an
+ * address space share one table, and JIT workloads (the JVM) have more than a hundred thousand
+ * live blocks */
 #define TABLE_MIN_BITS 12
 #define TABLE_BITS 19
 #define TABLE_SIZE (1u << TABLE_BITS)
 #define TABLE_LIMIT (TABLE_SIZE / 4 * 3)
 #define JC_BITS 12
 #define JC_SIZE (1u << JC_BITS)
-/* 翻译表里墓碑的键：未对齐，查表时先排除未对齐的 pc（table_find_for、emit_lookup），所以
- * 不会被查到。跳转缓存的空项另用 jc_empty */
+/* Key of a tombstone in the translation table: misaligned, and lookups exclude misaligned pcs
+ * first (table_find_for, emit_lookup), so it is never found. Empty jump-cache entries use jc_empty
+ * instead */
 #define JC_EMPTY UINT64_C(1)
-/* 进入例程的栈帧：x19–x30、宿主 FPCR、d8–d15 */
+/* Stack frame of the enter routine: x19–x30, host FPCR, d8–d15 */
 #define FRAME_BYTES 176
 
 /*
- * 宿主寄存器：CTX 指向 struct appine_cpu，T0、T1、T2 是临时寄存器，SP_HOST 存放 guest SP。
- * 一个实例用哪一组在创建时选定（appine_dbt_new），例程、翻译、模板都按它生成，所以这几个
- * 名字只能用在有 `x`（struct xlate *）的地方。与它们同号的 guest 寄存器和 X18 是被占用的
- * 寄存器（is_stolen）。
+ * Host registers: CTX points to struct appine_cpu, T0, T1 and T2 are temporaries, and SP_HOST
+ * holds the guest SP. Which set an instance uses is chosen at creation (appine_dbt_new), and
+ * routines, translations and templates are all generated for it, so these names can only be used
+ * where there is an `x` (struct xlate *). The same-numbered guest registers and X18 are the stolen
+ * registers (is_stolen).
  *
- * Go 的编译器把 X28 当作当前 goroutine（g）、X27 当作汇编器的临时寄存器、X26 当作闭包的
- * 上下文，函数序言的栈检查用 X16：原生的 `go build` 里 compile 有 15.5% 的执行时间落在用到
- * 默认一组被占用寄存器的指令上（gcc 的 cc1 是 5.2%），而 X19–X25 合计不到 1.5%（寄存器分配
- * 从低号用起）。所以 Go 的程序改占 X21–X25（engine 的 map）。
+ * The Go compiler uses X28 as the current goroutine (g), X27 as the assembler's temporary and X26
+ * as the closure context, and the stack check in function prologues uses X16: in a native
+ * `go build`, compile spends 15.5% of its execution time on instructions that use the default
+ * set's stolen registers (5.2% for gcc's cc1), while X19–X25 together account for less than 1.5%
+ * (register allocation starts from the low numbers). So Go programs steal X21–X25 instead (the
+ * engine map).
  */
 struct regs {
     unsigned ctx, t0, t1, t2, sp;
@@ -92,43 +107,48 @@ static const struct regs reg_sets[] = {
 #define T1 (x->d->r->t1)
 #define T2 (x->d->r->t2)
 #define SP_HOST (x->d->r->sp)
-#define REG_SP 32 /* 伪寄存器编号：guest SP */
+#define REG_SP 32 /* pseudo register number: guest SP */
 
-/* 退出原因（从翻译后的代码返回分发器）。R_CHAIN_FWD 是前向的直接跳转，链接时
- * 跳过目标块入口的 kick 检查：块的起始地址沿前向边严格递增，所以任何循环里至少
- * 有一条边会经过检查。R_UNGROUP 是共用检查的一组访存没通过检查（见 plan_group），
- * 和 R_INTERP 一样由 Tier 0 执行这一条指令 */
+/* Exit reasons (returning from translated code to the dispatcher). R_CHAIN_FWD is a forward
+ * direct branch, which when linked skips the kick check at the target block's entry: block start
+ * addresses strictly increase along forward edges, so every loop has at least one edge that passes
+ * a check. R_UNGROUP is a group of accesses sharing one check that failed it (see plan_group);
+ * as with R_INTERP, Tier 0 executes this one instruction */
 enum { R_CHAIN = 1, R_CHAIN_FWD, R_LOOKUP, R_INTERP, R_SVC, R_KICK, R_UNGROUP };
 
-/* 退出桩之外的另一种桩：TLB 未命中时进入回填例程，回填失败再退出（R_INTERP 或 R_UNGROUP） */
+/* The other kind of stub besides exit stubs: on a TLB miss it enters the refill routine and exits
+ * only if the refill fails (R_INTERP or R_UNGROUP) */
 #define STUB_REFILL 0
 
-/* 一个桩最多占的字数：链接桩 5 个字（pc 放不进 48 位时 6 个），退出桩 4 个（5 个），回填桩
- * 5 个 */
+/* The most words one stub takes: a link stub takes 5 words (6 when the pc does not fit in 48
+ * bits), an exit stub 4 (5), a refill stub 5 */
 #define MAX_STUB_WORDS 6
 
-/* 退出桩的数据字里 pc 占低 48 位，高 16 位是退出原因（emit_link_stub） */
+/* In an exit stub's data word the pc takes the low 48 bits, and the high 16 bits are the exit
+ * reason (emit_link_stub) */
 #define PACKED_PC_BITS 48
 
-/* 回填桩里的信息字（emit_refill_stub）：低 12 位是字节数减一（共用检查的一组访存最多覆盖
- * GROUP_SPAN 再加一次访问），接着 3 位是回填失败时的退出原因，高 17 位是访问本身相对信息字
- * 的字数（有符号） */
+/* The info word in a refill stub (emit_refill_stub): the low 12 bits are the byte count minus one
+ * (a group of accesses sharing a check covers at most GROUP_SPAN plus one more access), the next
+ * 3 bits are the exit reason if the refill fails, and the high 17 bits are the distance in words
+ * of the access itself from the info word (signed) */
 #define REFILL_REASON_SHIFT 12
 #define REFILL_RESUME_SHIFT 15
-_Static_assert(MAX_BLOCK_WORDS < 1u << (31 - REFILL_RESUME_SHIFT), "访问相对信息字的字数要放进信息字");
+_Static_assert(MAX_BLOCK_WORDS < 1u << (31 - REFILL_RESUME_SHIFT), "the access's distance in words from the info word must fit in it");
 
-/* 块入口的 kick 检查占的字数 */
+/* Words taken by the kick check at a block's entry */
 #define ENTRY_CHECK_WORDS 2
 
-/* 退出原因的低 3 位是 R_*；链接桩在高位带上跳到它的条件分支相对桩的字数（0 表示没有），
- * 共用的块（TAG_SHIFT）的链接桩再带上 LINK_SHARED：只能链接到共用的块 */
+/* The low 3 bits of an exit reason are R_*; a link stub carries in the high bits the distance in
+ * words from the conditional branch that jumps to it to the stub (0 means none), and link stubs of
+ * shared blocks (TAG_SHIFT) also carry LINK_SHARED: they can only link to shared blocks */
 #define REASON_BITS 3
 #define REASON_MASK ((1u << REASON_BITS) - 1)
 #define BRANCH_MASK (MAX_BLOCK_WORDS - 1)
 #define LINK_SHARED (1u << 15)
-_Static_assert(R_UNGROUP <= REASON_MASK, "退出原因放在低 3 位");
+_Static_assert(R_UNGROUP <= REASON_MASK, "the exit reason goes in the low 3 bits");
 _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON_BITS <= LINK_SHARED,
-               "条件分支到桩的距离和 LINK_SHARED 要放进 movz 的立即数");
+               "the conditional branch's distance to the stub and LINK_SHARED must fit in a movz immediate");
 
 #define SYSREG_NZCV 0xda10
 #define SYSREG_TPIDR_EL0 0xde82
@@ -136,18 +156,18 @@ _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON
 #define SYSREG_CNTFRQ_EL0 0xdf00
 #define SYSREG_CNTVCT_EL0 0xdf02
 
-/* DC ZVA 的块大小，与 Tier 0 报告的 DCZID_EL0 一致 */
+/* Block size of DC ZVA, matching the DCZID_EL0 that Tier 0 reports */
 #define DCZ_BLOCK 64
 #define DCZID_VALUE 4
 
 #define TLB_BITS 12
 #define TLB_OFF offsetof(struct appine_cpu, tlb)
-_Static_assert(APPINE_TLB_ENTRIES == 1u << TLB_BITS, "TLB 下标在生成的代码里固定为 12 位");
-_Static_assert(sizeof(struct appine_tlb_entry) == 32, "TLB 表项在生成的代码里按 32 字节寻址");
-_Static_assert(TLB_OFF % 16 == 0 && TLB_OFF + 16 <= 504, "TLB 必须能被 ldp 的 7 位缩放立即数寻址");
-_Static_assert(offsetof(struct appine_cpu, dbt_rs) < TLB_OFF, "dbt_rs 也用 ldr/str 直接读写");
+_Static_assert(APPINE_TLB_ENTRIES == 1u << TLB_BITS, "the TLB index is fixed at 12 bits in generated code");
+_Static_assert(sizeof(struct appine_tlb_entry) == 32, "generated code addresses TLB entries as 32 bytes each");
+_Static_assert(TLB_OFF % 16 == 0 && TLB_OFF + 16 <= 504, "the TLB must be addressable by ldp's 7-bit scaled immediate");
+_Static_assert(offsetof(struct appine_cpu, dbt_rs) < TLB_OFF, "dbt_rs is also read and written directly with ldr/str");
 _Static_assert(offsetof(struct appine_cpu, dbt_jump_cache) < TLB_OFF,
-               "生成的代码用 ldr/str 直接读写的字段必须位于 TLB 之前");
+               "fields that generated code reads and writes directly with ldr/str must precede the TLB");
 
 struct slot {
     uint64_t pc;
@@ -155,57 +175,68 @@ struct slot {
 };
 
 /*
- * 翻译表：guest pc → 翻译结果，开放寻址。分发器不持锁查表（table_lookup），所以：插入只用
- * 空位（先写 pc、再写 code），作废只把 pc 改成墓碑——读到旧 code 的线程进入的是作废块的
- * 入口，它跳往转发桩，按原来的 pc 退出；墓碑不复用，扩容或原样重建时去掉。换表之后等
- * 正在查旧表的线程查完才释放它（table_publish）。
+ * Translation table: guest pc → translation, open addressing. The dispatcher looks it up without
+ * the lock (table_lookup), so: insertion only uses empty slots (pc written first, then code), and
+ * invalidation only changes the pc into a tombstone — a thread that read the old code enters the
+ * invalidated block's entry, which jumps to the forwarding stub and exits with the original pc;
+ * tombstones are not reused and are removed when the table grows or is rebuilt at the same size.
+ * After the table is replaced, the old one is freed only once the threads looking it up have
+ * finished (table_publish).
  */
 struct table {
     unsigned bits;
-    unsigned shift; /* 64 - bits：下标是 pc 的哈希右移这么多位 */
+    unsigned shift; /* 64 - bits: the index is the pc's hash shifted right by this many bits */
     uint64_t mask;  /* 2^bits - 1 */
     struct slot slots[];
 };
 #define GOLDEN UINT64_C(0x9e3779b97f4a7c15)
 
 /*
- * 影子返回栈：每项是 (guest 返回地址, 宿主落点)，64 项的环形缓冲按自身大小对齐，压栈、
- * 弹栈只改栈顶指针的低 RS_SHIFT 位（bfxil，不碰条件标志）。
+ * Shadow return stack: each entry is (guest return address, host landing pad); the 64-entry ring
+ * buffer is aligned to its own size, so push and pop change only the low RS_SHIFT bits of the top
+ * pointer (bfxil, which does not touch the condition flags).
  */
 #define RS_SHIFT 10
 #define RS_ENTRIES ((1u << RS_SHIFT) / 16)
 
 /*
- * 同一个程序的几个地址空间共用一个实例时（内核层的 CodeGroup），组里登记过的可信文件映射
- * （appine_dbt_share）里的块对所有成员都有效，按 pc 放进翻译表；别处的块（JIT 生成的、写过
- * 的代码）只对翻译它的成员有效，表里的键是 pc | 成员的标签 << TAG_SHIFT。guest 的 pc 只有
- * 48 位，更高的不会有块（查表之前先排除），所以两种键不会相同。两种键都按 pc 散列，一次线性
- * 探测同时找共用的和这个成员私有的：分两次找的话，JIT 代码每次没命中跳转缓存都要多一次缓存
- * 未命中。共用的块不链接到私有的块（LINK_SHARED）。标签由实例分配（appine_dbt_new_tag），实例
- * 回到池里时去掉私有的块（drop_private），标签从头分配。标签 0 表示不在组里，所有的块都按 pc
- * 放。
+ * When several address spaces of the same program share one instance (the kernel layer's
+ * CodeGroup), blocks in the trusted file mappings registered with the group (appine_dbt_share) are
+ * valid for every member and go into the translation table by pc; blocks elsewhere (JIT-generated
+ * or written code) are valid only for the member that translated them, and their key in the table
+ * is pc | the member's tag << TAG_SHIFT. A guest pc has only 48 bits and there are no blocks above
+ * that (excluded before the lookup), so the two kinds of key never coincide. Both kinds are hashed
+ * by pc, and one linear probe finds both the shared blocks and this member's private ones: with
+ * two separate probes, JIT code would take one more cache miss on every jump-cache miss. Shared
+ * blocks do not link to private blocks (LINK_SHARED). Tags are allocated by the instance
+ * (appine_dbt_new_tag); when the instance returns to the pool its private blocks are removed
+ * (drop_private) and tags are allocated from the start again. Tag 0 means not in a group, and all
+ * blocks are keyed by pc.
  */
 #define TAG_SHIFT APPINE_VA_BITS
 #define TAG_MAX 0xffffu
 #define PC_MASK ((UINT64_C(1) << TAG_SHIFT) - 1)
 
-/* 作废翻译时按 guest 页找到其中开始的块（appine_dbt_invalidate） */
+/* When invalidating translations, find the blocks that start in a guest page by that page
+ * (appine_dbt_invalidate) */
 #define PAGE_BUCKET_BITS 14
-#define INVALIDATE_MAX_PAGES 256 /* 超过这么多页就逐个看所有的块 */
+#define INVALIDATE_MAX_PAGES 256 /* beyond this many pages, look at every block in turn */
 
 struct block {
     uint64_t pc;
-    uint32_t *code;  /* 已作废时为 NULL */
-    uint32_t next;   /* 同一个桶里的上一个块（下标加 1），0 表示没有 */
-    uint32_t words;  /* 翻译时的 guest 指令字在 words 里的位置（recheck 用） */
-    uint8_t nguest;  /* guest 指令条数 */
-    uint8_t parked;  /* 停放着（revive）：入口像作废块一样跳往转发桩，代码还在 */
-    uint16_t tag;    /* 私有的块所属成员的标签，共用的是 0（TAG_SHIFT） */
-    uint32_t first;  /* 停放时被改写的那条入口检查之后的指令 */
+    uint32_t *code;  /* NULL once invalidated */
+    uint32_t next;   /* previous block in the same bucket (index plus 1), 0 if none */
+    uint32_t words;  /* where the guest words at translation time sit in words (for recheck) */
+    uint8_t nguest;  /* number of guest instructions */
+    /* Parked (revive): the entry jumps to the forwarding stub like an invalidated block's, and the
+     * code is still there */
+    uint8_t parked;
+    uint16_t tag;    /* tag of the member owning a private block; 0 for shared ones (TAG_SHIFT) */
+    uint32_t first;  /* the instruction after the entry check, which is rewritten when parked */
 };
-_Static_assert(MAX_BLOCK_INSNS <= UINT8_MAX, "struct block 的 nguest");
+_Static_assert(MAX_BLOCK_INSNS <= UINT8_MAX, "nguest of struct block");
 
-/* 块在翻译表里的键 */
+/* A block's key in the translation table */
 static uint64_t tagged(uint64_t pc, unsigned tag)
 {
     return pc | (uint64_t)tag << TAG_SHIFT;
@@ -216,97 +247,113 @@ static uint64_t block_key(const struct block *b)
     return tagged(b->pc, b->tag);
 }
 
-/* 一组访存第二次没通过共用的检查之后，组长的 pc 记在这里，重新翻译时它和后面同一个
- * 块里的访存都不再当组长；记满了从最早的开始覆盖。第一次失败只记进 strikes（按 pc
- * 直接映射） */
+/* After a group of accesses fails the shared check a second time, the leader's pc is recorded
+ * here, and on retranslation neither it nor the accesses after it in the same block lead a group
+ * any more; when full, the oldest entries are overwritten first. A first failure is only recorded
+ * in strikes (direct-mapped by pc) */
 #define NOGROUP_MAX 64
 #define STRIKES 64
 
-/* 每个块的 guest 指令字最多占多少字（按块数上限和每块的指令数上限） */
+/* The most words the guest instruction words of all blocks can take (from the block count limit
+ * and the per-block instruction limit) */
 #define WORDS_LIMIT ((size_t)TABLE_LIMIT * MAX_BLOCK_INSNS)
-/* 放回池里时最多保留多少个块：核对比重新拷贝模板、链接便宜得多（node 一次启动约 5 万个
- * 块），再多的多半是 JIT 生成的代码，下次多半对不上 */
+/* The most blocks kept when returning to the pool: checking is much cheaper than copying templates
+ * and linking again (one node startup has about 50,000 blocks); beyond that they are mostly
+ * JIT-generated code that will most likely not match next time */
 #define KEEP_MAX_BLOCKS 131072
 
 /*
- * 一个地址空间的翻译（代码缓存、翻译表、各种记录），这个地址空间里的所有线程共用
- * （appine_dbt_attach）：多线程的程序（Go 的编译器、JVM）原来每个线程各翻译一遍同样的
- * 代码，翻译、拷贝模板、链接和同步指令缓存都要做好几遍，代码缓存也各占一份。
+ * The translations of one address space (code cache, translation table, various records), shared
+ * by all threads in that address space (appine_dbt_attach): multi-threaded programs (the Go
+ * compiler, the JVM) used to translate the same code once per thread, doing translation, template
+ * copying, linking and instruction-cache syncing several times over, each with its own code cache.
  *
- * 除了分发器查翻译表，读写都持有 lock。整体清空要等所有线程离开翻译后的代码：发起的
- * 线程打断其他线程，等它们都停在分发器里（parked）或者离开 dbt_run，见 flush_world。
+ * Apart from the dispatcher's table lookups, all reads and writes hold lock. A full flush must wait
+ * for all threads to leave translated code: the initiating thread kicks the other threads and waits
+ * until each has stopped in the dispatcher (parked) or left dbt_run; see flush_world.
  */
 struct appine_dbt {
-    const struct regs *r; /* 宿主寄存器的分配（reg_sets 里的一组），例程和翻译都按它生成 */
-    uint32_t *cache;    /* 执行用的地址；所有代码指针都指向这里 */
-    intptr_t rw_delta;  /* 写入用的别名减去执行用的地址；直接映射成 RWX 时为 0 */
-    struct written *written; /* 可写别名里写过的页（note_written）；RWX 时为 NULL */
-    /* 所有实例（活着的、池里的）串成的表 pool.all，appine_dbt_unmap_written 遍历它。持有
-     * pool.lock 时读写；不在表里时 prev_instance 为 NULL */
+    /* Host register assignment (one set in reg_sets); routines and translations are all generated
+     * for it */
+    const struct regs *r;
+    uint32_t *cache;    /* address for execution; every code pointer points here */
+    intptr_t rw_delta;  /* writable alias minus execution address; 0 when mapped directly as RWX */
+    struct written *written; /* pages written in the writable alias (note_written); NULL for RWX */
+    /* The list pool.all linking all instances (live and pooled), walked by
+     * appine_dbt_unmap_written. Read and written while holding pool.lock; prev_instance is NULL
+     * when not in the list */
     struct appine_dbt *next_instance, **prev_instance;
     size_t cache_words;
     size_t used_words;
     size_t routine_words;
     uint32_t *enter;
     uint32_t *exit;
-    uint32_t *exit_stub; /* 退出桩跳往的入口（emit_link_stub），接着就是 exit */
-    uint32_t *exit_full; /* 同上，pc 放不进 48 位的 */
-    uint32_t *refill[2]; /* TLB 回填例程：读、写 */
-    uint32_t *lookup;    /* 跳转缓存没命中时查翻译表的例程（emit_lookup） */
-    uint32_t *rs_miss;   /* 影子返回栈空项的落点：按 guest x30 查找 */
-    struct table *table; /* 不持锁读取时用 __atomic_load_n */
-    uint32_t *table_used; /* 按插入顺序记下用过的位置，最多 TABLE_LIMIT 个 */
+    uint32_t *exit_stub; /* entry exit stubs jump to (emit_link_stub), followed directly by exit */
+    uint32_t *exit_full; /* same, for pcs that do not fit in 48 bits */
+    uint32_t *refill[2]; /* TLB refill routines: read, write */
+    uint32_t *lookup;    /* routine that looks up the table on a jump-cache miss (emit_lookup) */
+    uint32_t *rs_miss;   /* landing pad of empty shadow return stack entries: looks up guest x30 */
+    struct table *table; /* read with __atomic_load_n when not holding the lock */
+    uint32_t *table_used; /* slots used, in insertion order, at most TABLE_LIMIT of them */
     size_t table_count;
-    size_t table_occupied; /* 表里不空的位置：有效的块和墓碑 */
-    size_t table_dead;     /* 其中的墓碑 */
-    struct block *blocks; /* 与 table_used 一一对应，按翻译顺序记录 */
-    size_t blocks_dead;   /* 其中已经作废的 */
-    size_t nparked;       /* 其中停放着的（revive） */
-    uint32_t *words;      /* 各块翻译时的 guest 指令字，按需映射 */
+    size_t table_occupied; /* non-empty slots in the table: live blocks and tombstones */
+    size_t table_dead;     /* the tombstones among them */
+    struct block *blocks; /* one-to-one with table_used, recorded in translation order */
+    size_t blocks_dead;   /* those already invalidated */
+    size_t nparked;       /* those parked (revive) */
+    uint32_t *words;      /* blocks' guest instruction words at translation, mapped on demand */
     size_t words_used;
-    /* 换了地址空间（exec、fork 之后从池里取出），下次运行之前要核对 */
+    /* Address space changed (taken from the pool after exec or fork); check before the next run */
     bool stale;
-    /* 放回池里之前记下的、翻译所在的映射（appine_dbt_set_sources） */
+    /* The mappings the translations are in, recorded before returning to the pool
+     * (appine_dbt_set_sources) */
     struct appine_dbt_source sources[APPINE_DBT_SOURCES];
     unsigned nsources;
-    /* 下一次核对时不必看的范围 [start, end)（appine_dbt_trust） */
+    /* Ranges [start, end) the next check need not look at (appine_dbt_trust) */
     uint64_t trusted[APPINE_DBT_SOURCES][2];
     unsigned ntrusted;
-    /* 上一个使用者的文件映射 [start, end)：核对时其中还没映射的块停放起来（recheck） */
+    /* The previous user's file mappings [start, end): blocks in them that are not mapped yet are
+     * parked during the check (recheck) */
     uint64_t parkable[APPINE_DBT_SOURCES][2];
     unsigned nparkable;
-    /* 运行时宿主出了故障（APPINE_EXIT_HOST_FAULT）：各张表可能只改了一半，不再使用 */
+    /* A host fault occurred while running (APPINE_EXIT_HOST_FAULT): the tables may be only half
+     * updated, so they are no longer used */
     bool poisoned;
-    uint32_t *page_head;  /* guest 页的哈希 → blocks 里的链表头（下标加 1） */
-    uint32_t *page_parked; /* 同一个哈希：停放着的块数，查表失败时不持锁看一眼（revive） */
-    /* 组里登记过的映射（appine_dbt_share），按起点排好、不重叠；不持锁读。换下来的旧数组挂在
-     * 新的 older 上，等实例回到池里时再释放 */
+    uint32_t *page_head;  /* hash of a guest page → list head in blocks (index plus 1) */
+    uint32_t *page_parked; /* same hash: parked count, read lock-free if a lookup fails (revive) */
+    /* The group's registered mappings (appine_dbt_share), sorted by start and non-overlapping;
+     * read without the lock. A replaced old array hangs off the new one's older and is freed when
+     * the instance returns to the pool */
     struct shared_ranges *shared;
-    unsigned next_tag; /* 下一个可以分配的标签（appine_dbt_new_tag） */
+    unsigned next_tag; /* next tag that can be allocated (appine_dbt_new_tag) */
     uint64_t nogroup[NOGROUP_MAX];
     unsigned nogroup_count;
     uint64_t strikes[STRIKES];
-    /* 每次 flush 加一：作废尚未回填的链接，线程据此清空自己的跳转缓存和影子返回栈 */
+    /* Incremented on every flush: invalidates links not yet patched, and threads use it to clear
+     * their own jump cache and shadow return stack */
     uint64_t generation;
-    size_t high_words; /* 代码缓存用到过的最大字数 */
+    size_t high_words; /* the most code-cache words ever used */
 
     pthread_mutex_t lock;
-    pthread_cond_t flushed; /* 整体清空结束（或者实例作废） */
-    struct appine_dbt_thread *threads; /* 挂着的线程 */
-    unsigned nthreads;                 /* 它们的个数（原子读） */
-    bool flushing;     /* 有线程在等别人停下来整体清空（原子读） */
-    bool flush_wanted; /* 要整体清空：调用方要求，或者作废时放不下转发桩（原子读） */
-    struct appine_dbt_stats *st; /* 持锁的线程的统计：翻译、作废记在它头上 */
+    pthread_cond_t flushed; /* a full flush has finished (or the instance was poisoned) */
+    struct appine_dbt_thread *threads; /* attached threads */
+    unsigned nthreads;                 /* their number (read atomically) */
+    bool flushing;     /* a thread waits for the others to stop for a full flush (atomic read) */
+    /* A full flush is wanted: the caller asked for one, or a forwarding stub did not fit when
+     * invalidating (read atomically) */
+    bool flush_wanted;
+    /* Statistics of the lock holder: translations and invalidations are charged to it */
+    struct appine_dbt_stats *st;
 };
 
-/* 登记过的映射：[r[i][0], r[i][1])，按起点排好、不重叠 */
+/* Registered mappings: [r[i][0], r[i][1]), sorted by start and non-overlapping */
 struct shared_ranges {
     struct shared_ranges *older;
     unsigned n;
     uint64_t r[][2];
 };
 
-/* pc 在不在登记过的映射里（不持锁） */
+/* Whether pc is in a registered mapping (without the lock) */
 static bool in_shared(const struct appine_dbt *d, uint64_t pc)
 {
     const struct shared_ranges *s = __atomic_load_n(&d->shared, __ATOMIC_ACQUIRE);
@@ -325,41 +372,44 @@ static bool in_shared(const struct appine_dbt *d, uint64_t pc)
     return false;
 }
 
-/* 一个线程在某个地址空间里运行用的部分：跳转缓存、影子返回栈和统计 */
+/* The part a thread uses to run in an address space: jump cache, shadow return stack and
+ * statistics */
 struct appine_dbt_thread {
     struct appine_dbt *d;
-    unsigned tag; /* 线程所在的地址空间在组里的标签，0 表示不在组里（TAG_SHIFT） */
-    struct appine_dbt_thread *next; /* d->threads 链表，持有 d->lock 时读写 */
-    struct appine_cpu *cpu; /* 正在 dbt_run 里运行的 cpu，否则为 NULL（原子）：整体清空时打断它 */
-    bool parked;            /* 停在 park 里等整体清空（持有 d->lock 时读写） */
-    uint64_t generation;    /* jc、rs 对应的 d->generation */
-    struct slot *jc;        /* 间接分支的跳转缓存，直接映射 */
+    unsigned tag; /* the group tag of the thread's address space, 0 if not in a group (TAG_SHIFT) */
+    struct appine_dbt_thread *next; /* d->threads list, read and written holding d->lock */
+    struct appine_cpu *cpu; /* cpu running in dbt_run or NULL (atomic): a full flush kicks it */
+    bool parked;            /* stopped in park for a full flush (accessed holding d->lock) */
+    uint64_t generation;    /* the d->generation that jc and rs correspond to */
+    struct slot *jc;        /* jump cache for indirect branches, direct-mapped */
     bool jc_dirty;
-    uint64_t (*rs)[2]; /* 影子返回栈 */
+    uint64_t (*rs)[2]; /* shadow return stack */
     struct appine_dbt_stats stats;
-    /* 不持锁翻译用的工作区（prepare）：翻译过程、生成的代码和结果 */
+    /* Workspace for translating without the lock (prepare): the translation in progress, the
+     * generated code and the result */
     struct xlate *xlate;
     uint32_t *scratch;
     struct appine_cpu *probe;
-    uint64_t *defined; /* tier0_defined 的结果，按指令字缓存（DEFINED_CACHE 项） */
+    uint64_t *defined; /* results of tier0_defined, per instruction word (DEFINED_CACHE entries) */
     struct prep *prep;
 };
 
-/* ---- 发射器 ---- */
+/* ---- Emitter ---- */
 
 enum fixup_kind { FIX_IMM19, FIX_IMM14 };
 
 struct stub {
-    unsigned reason; /* R_* 或 STUB_REFILL；R_LOOKUP 的目标 pc 已经在 T0 里 */
+    unsigned reason; /* R_* or STUB_REFILL; for R_LOOKUP the target pc is already in T0 */
     uint64_t pc;
     uint32_t *addr;
-    /* 回填桩：回填成功后接着执行的位置（TLB 检查之后的访问）、访问的字节数和方向，
-     * 失败时的退出原因 */
+    /* Refill stubs: where execution continues after a successful refill (the access after the TLB
+     * check), the byte count and direction of the access, and the exit reason on failure */
     uint32_t *resume;
     unsigned bytes;
     bool write;
     unsigned fail;
-    /* 跳到这个桩的分支个数和其中一个的位置（发射桩时填写） */
+    /* The number of branches jumping to this stub and the position of one of them (filled in when
+     * emitting stubs) */
     unsigned sites;
     const uint32_t *branch;
 };
@@ -371,77 +421,87 @@ struct fixup {
 };
 
 /*
- * 块的一个直接跳转出口（链接桩）：桩相对块开头的字数、唯一跳到它的条件分支相对块开头的
- * 字数（没有时为 NO_BRANCH）和目标 pc。建块时目标已经翻译过就直接链接（link_block），
- * 省掉第一次走到这里时退出到分发器、再单独同步一次指令缓存（ic ivau 之后的 dsb 要等
- * 作废广播完成，一次约 0.1 微秒）
+ * One direct-branch exit of a block (a link stub): the stub's offset in words from the block
+ * start, the offset in words from the block start of the only conditional branch that jumps to it
+ * (NO_BRANCH if none), and the target pc. If the target is already translated when the block is
+ * built, it is linked right away (link_block), saving the exit to the dispatcher the first time
+ * execution gets here and a separate instruction-cache sync (the dsb after ic ivau waits for the
+ * invalidation broadcast to complete, about 0.1 microseconds each time)
  */
 struct link {
-    uint32_t stub; /* LINK_FWD：前向，跳过目标块入口的 kick 检查 */
+    uint32_t stub; /* LINK_FWD: forward, skips the kick check at the target block's entry */
     uint32_t branch;
     uint64_t pc;
 };
 #define LINK_FWD (UINT32_C(1) << 31)
 #define NO_BRANCH UINT32_MAX
 
-/* 跳往例程的 b：拷贝翻译模板时要按新位置重新计算偏移 */
+/* A b to a routine: its offset must be recomputed for the new position when a translation
+ * template is copied */
 enum { TO_EXIT, TO_REFILL_READ, TO_REFILL_WRITE, TO_LOOKUP, TO_EXIT_FULL };
 
-/* 一组共用检查的访存最多覆盖多少字节、最多几条；同时最多几组（plan_group） */
+/* The most bytes and the most accesses one group of accesses sharing a check may cover, and the
+ * most groups at once (plan_group) */
 #define GROUP_SPAN 512
 #define GROUP_MAX 16
 #define GROUP_SLOTS 4
-_Static_assert(sizeof(((struct appine_cpu *)0)->dbt_groups) == GROUP_SLOTS * 8, "每组一个槽");
+_Static_assert(sizeof(((struct appine_cpu *)0)->dbt_groups) == GROUP_SLOTS * 8, "one slot per group");
 #define MAX_RELOCS (MAX_STUBS * 2 + 4)
 
 struct xlate {
     struct appine_dbt *d;
     uint32_t *buf;
-    intptr_t wdelta; /* 写入地址减去 buf：翻译进线程的暂存区时为 0，直接写代码缓存时是 rw_delta */
-    struct appine_dbt_stats *st; /* 翻译的统计记在谁头上 */
-    struct appine_cpu *probe;    /* 用来询问 Tier 0 是否认识某条指令 */
-    uint64_t *defined;           /* 它的回答，按指令字缓存 */
+    /* Write address minus buf: 0 when translating into the thread's scratch area, rw_delta when
+     * writing the code cache directly */
+    intptr_t wdelta;
+    struct appine_dbt_stats *st; /* whom the translation statistics are charged to */
+    struct appine_cpu *probe;    /* used to ask Tier 0 whether it recognizes an instruction */
+    uint64_t *defined;           /* its answers, cached per instruction word */
     size_t n;
     struct stub stubs[MAX_STUBS];
     unsigned nstubs;
     struct fixup fixups[MAX_FIXUPS];
     unsigned nfixups;
-    uint32_t relocs[MAX_RELOCS]; /* 下标 << 3 | TO_* */
+    uint32_t relocs[MAX_RELOCS]; /* index << 3 | TO_* */
     unsigned nrelocs;
-    /* 正在翻译的块：起始 pc、guest 指令字、当前指令的下标、块最多能有几条指令 */
+    /* The block being translated: start pc, guest instruction words, index of the current
+     * instruction, and the most instructions the block may have */
     uint64_t pc;
     const uint32_t *guest;
     unsigned idx, limit;
-    /* 本块按 pc 放进翻译表（TAG_SHIFT），链接桩带上 LINK_SHARED */
+    /* This block goes into the translation table by pc (TAG_SHIFT), and its link stubs carry
+     * LINK_SHARED */
     bool shared;
-    /* 本块里 SP 已经检查过对齐，之后只按 16 的倍数改过 */
+    /* SP's alignment was already checked in this block, and SP has since changed only by
+     * multiples of 16 */
     bool sp_aligned;
-    /* 本块里值在翻译时已知的通用寄存器（ADR/ADRP 设下的，和在它上面加的立即数），第
-     * r 位对应 Xr，值在 kval 里（konst_update） */
+    /* General registers in this block whose values are known at translation time (set by
+     * ADR/ADRP, plus immediates added to them); bit r stands for Xr, and the values are in kval
+     * (konst_update) */
     uint32_t konst;
     uint64_t kval[31];
-    /* 共用检查的几组访存（plan_group）：还没翻译的组员。组的宿主基址在 T2 里，或者暂存
-     * 在 cpu 的 dbt_groups[组的下标] 里 */
+    /* Groups of accesses sharing a check (plan_group): the members not translated yet. A group's
+     * host base is in T2, or spilled to the cpu's dbt_groups[group index] */
     struct group {
         unsigned n, next;
         unsigned idx[GROUP_MAX];
-        int32_t off[GROUP_MAX]; /* 相对组长执行之前的基址 */
-        bool reload[GROUP_MAX]; /* 之前有指令用过 T2：先从槽里取回宿主基址 */
-        int32_t lo;             /* 整组覆盖的范围，也相对这个基址 */
+        int32_t off[GROUP_MAX]; /* relative to the base before the leader executes */
+        bool reload[GROUP_MAX]; /* T2 used earlier: get the host base back from the slot first */
+        int32_t lo;             /* range the whole group covers, also relative to that base */
         unsigned bytes;
         bool write;
-        bool spill; /* 有组员要取回：组长把宿主基址存进槽里 */
+        bool spill; /* some member reloads: the leader stores the host base in the slot */
     } groups[GROUP_SLOTS];
-    int t2_group; /* T2 现在是哪一组的宿主基址，-1 表示都不是 */
+    int t2_group; /* which group's host base T2 holds now, -1 for none */
 };
 
-/* 代码的写入地址（W^X 双映射的可写别名） */
+/* Write address of code (the writable alias of the W^X double mapping) */
 static uint32_t *rw(const struct appine_dbt *d, const uint32_t *p)
 {
     return (uint32_t *)((uintptr_t)p + (uintptr_t)d->rw_delta);
 }
 
-/* 宿主的页大小（4K、16K）：madvise 的范围要按它对齐 */
+/* Host page size (4K, 16K): madvise ranges must be aligned to it */
 static size_t host_page_size(void)
 {
     static size_t cached;
@@ -454,21 +514,25 @@ static size_t host_page_size(void)
 }
 
 /*
- * 宿主的 RSS 按映射数页：代码缓存的同一页经由写入、执行两个视图都碰过就算两次，
- * RssShmem、LMK 看的 RSS 和内存上限量的用量里代码缓存都多算了一倍。所以记下可写视图里
- * 写过的页，内核层的定时器线程每秒拆一次它们的页表项（appine_dbt_unmap_written）：共享
- * 内存上的 MADV_DONTNEED 只拆映射、内容留着，下次写时再缺一次页。按时间拆而不按量拆：
- * JIT 负载每秒要往几千个不同的页里回填链接、作废块，按量拆（每攒 256 KB 拆一次）时这些
- * 页一次次重新缺页，Maven 慢了 3%。不持锁回填链接的线程也写，位图和计数都是原子的；
- * 多记、漏记一页只影响拆的时机。
+ * The host's RSS counts pages per mapping: a code-cache page touched through both the write and
+ * the execute view counts twice, so the code cache is counted double in RssShmem, in the RSS the
+ * LMK looks at and in the usage the memory limit measures. So the pages written in the writable
+ * view are recorded, and the kernel layer's timer thread drops their page-table entries once a
+ * second (appine_dbt_unmap_written): MADV_DONTNEED on shared memory only removes the mapping and
+ * keeps the content, and the next write faults once more. Dropping is by time, not by amount: JIT
+ * workloads patch links and invalidate blocks in thousands of different pages per second, and
+ * when dropping by amount (once every 256 KB accumulated) those pages faulted again and again and
+ * Maven was 3% slower. Threads patching links without the lock also write, so the bitmap and the
+ * count are atomic; recording one page too many or too few only affects when dropping happens.
  */
 struct written {
-    unsigned pages; /* bits 里置位的页数（原子） */
-    bool dropping;  /* 有线程正在拆（原子） */
-    uint64_t bits[CODE_CACHE_BYTES / 4096 / 64]; /* 可写视图里写过、还没拆的宿主页 */
+    unsigned pages; /* number of pages set in bits (atomic) */
+    bool dropping;  /* a thread is dropping them (atomic) */
+    /* Host pages written in the writable view and not dropped yet */
+    uint64_t bits[CODE_CACHE_BYTES / 4096 / 64];
 };
 
-/* 拆掉可写视图里记下的页 */
+/* Drop the pages recorded in the writable view */
 static void drop_written(const struct appine_dbt *d)
 {
     struct written *w = d->written;
@@ -494,7 +558,7 @@ static void drop_written(const struct appine_dbt *d)
     __atomic_store_n(&w->dropping, false, __ATOMIC_RELEASE);
 }
 
-/* 经由可写视图写过 [start, end)（执行用的地址） */
+/* [start, end) (execution addresses) was written through the writable view */
 static void note_written(const struct appine_dbt *d, const void *start, const void *end)
 {
     struct written *w = d->written;
@@ -511,7 +575,7 @@ static void note_written(const struct appine_dbt *d, const void *start, const vo
     }
 }
 
-/* 写入几段代码之后让取指看到它们 */
+/* Make instruction fetch see several pieces of code after they are written */
 static void sync_written(const struct appine_dbt *d, void *const *start, void *const *end, unsigned n)
 {
     sync_code_ranges(start, end, n, d->rw_delta);
@@ -519,7 +583,7 @@ static void sync_written(const struct appine_dbt *d, void *const *start, void *c
         note_written(d, start[i], end[i]);
 }
 
-/* 写入 [start, end) 之后让取指看到新代码 */
+/* Make instruction fetch see the new code after [start, end) is written */
 static void sync_range(const struct appine_dbt *d, const uint32_t *start, const uint32_t *end)
 {
     void *s = (void *)start, *e = (void *)end;
@@ -527,10 +591,13 @@ static void sync_range(const struct appine_dbt *d, const uint32_t *start, const 
 }
 
 /*
- * 链接点改写之后不等它生效：改写的线程接着直接进入目标块，用不着新指令；别的线程（和
- * 它自己以后）在看到新指令之前执行的是旧指令，跳往退出例程，由分发器照样找到目标块，
- * 结果一样。缓存维护照做，新指令迟早被看到，只是不等 dsb、不做 isb：java 启动时每个块
- * 要链接一两次，每次完整同步都要等作废广播完成，占了启动时间的两成。
+ * Do not wait for a rewritten link point to take effect: the rewriting thread goes on directly
+ * into the target block and does not need the new instruction; other threads (and this one later)
+ * execute the old instruction until they see the new one, jump to the exit routine, and the
+ * dispatcher finds the target block just the same, with the same result. Cache maintenance is
+ * still done and the new instruction is seen sooner or later, only without waiting for the dsb or
+ * doing an isb: at java startup each block is linked once or twice, and a full sync each time
+ * waits for the invalidation broadcast to complete, which took a fifth of the startup time.
  */
 static void publish_link(const struct appine_dbt *d, uint32_t *site, uint32_t *branch)
 {
@@ -542,7 +609,7 @@ static void publish_link(const struct appine_dbt *d, uint32_t *site, uint32_t *b
         note_written(d, branch, branch + 1);
 }
 
-/* 攒着一起同步的几段代码（sync_code_ranges） */
+/* Pieces of code collected to be synced together (sync_code_ranges) */
 struct syncs {
     void *start[3], *end[3];
     unsigned n;
@@ -588,12 +655,12 @@ static uint32_t *routine(const struct appine_dbt *d, unsigned to)
     }
 }
 
-/* 跳往例程的 b：TO_EXIT 是桩用的退出入口（exit_stub，见 emit_link_stub） */
+/* A b to a routine: TO_EXIT is the exit entry used by stubs (exit_stub, see emit_link_stub) */
 static void emit_to_routine(struct xlate *x, unsigned to)
 {
     if (x->nrelocs < MAX_RELOCS)
         x->relocs[x->nrelocs] = (uint32_t)x->n << 3 | to;
-    x->nrelocs++; /* 溢出由 prepare() 检查 */
+    x->nrelocs++; /* overflow is checked by prepare() */
     emit(x, enc_b((intptr_t)routine(x->d, to) - (intptr_t)here(x)));
 }
 
@@ -613,7 +680,7 @@ static void emit_mov_const(struct xlate *x, unsigned rd, uint64_t v)
     }
 }
 
-/* rd = rn + imm，不改动条件标志；要求 |imm| < 2^24，rn 不能是 31 */
+/* rd = rn + imm, without changing the condition flags; requires |imm| < 2^24; rn cannot be 31 */
 static void emit_add_const(struct xlate *x, unsigned rd, unsigned rn, int64_t imm)
 {
     if (imm == 0) {
@@ -633,7 +700,7 @@ static void emit_add_const(struct xlate *x, unsigned rd, unsigned rn, int64_t im
         emit(x, sub ? enc_sub_imm(rd, src, lo, 0) : enc_add_imm(rd, src, lo, 0));
 }
 
-/* guest Xr 是不是被占用的寄存器 */
+/* Whether guest Xr is a stolen register */
 static bool stolen_in(const struct regs *regs, unsigned r)
 {
     return r == 18 || r == regs->ctx || r == regs->t0 || r == regs->t1 || r == regs->t2 || r == regs->sp;
@@ -655,25 +722,30 @@ static void emit_store_guest(struct xlate *x, unsigned host, unsigned guest)
     emit(x, enc_str_x(host, CTX, guest_off(guest)));
 }
 
-/* ---- 退出桩 ---- */
+/* ---- Exit stubs ---- */
 
 /*
- * 退出桩给退出例程的是 T0 = guest pc、T1 = 回填位置、T2 = 退出原因（emit_routines）。guest pc
- * 是 48 位的地址，拼成立即数要三四条 mov，所以和退出原因一起放在桩末尾的两个数据字里
- * （原因在高 16 位），由例程的桩入口（exit_stub）读出来：
+ * Exit stubs hand the exit routine T0 = guest pc, T1 = patch site, T2 = exit reason
+ * (emit_routines). The guest pc is a 48-bit address that would take three or four movs to build
+ * as an immediate, so it is kept together with the exit reason in the two data words at the end
+ * of the stub (the reason in the high 16 bits), and read by the routine's stub entry (exit_stub):
  *
- *     [b 4]   adr T1, 0   b exit_stub   .quad 原因 << 48 | pc
+ *     [b 4]   adr T1, 0   b exit_stub   .quad reason << 48 | pc
  *
- * 链接桩的第一条指令是跳到下一条的 b，链接时它被改写成直接跳往目标块的 b：别的线程
- * 可能正在执行它，b 改成 b 是架构允许并发修改的（ARM ARM 的 CMODX 规则）。例程把 T1 减 4
- * 交给分发器：链接桩的是它的回填位置，别的桩的分发器不看。branch 是唯一跳到这个桩的
- * 条件分支，链接时目标在它的偏移范围内就让它直接跳过去（只在没有别的线程时，见 dbt_run）。
- * 跳转目标算出来超出 48 位时（guest 跳过去只会出错）原因另用 movz 交给 exit_full。
+ * The first instruction of a link stub is a b to the next instruction, and linking rewrites it
+ * into a b straight to the target block: other threads may be executing it, and changing a b into
+ * a b is a concurrent modification the architecture allows (the CMODX rules of the ARM ARM). The
+ * routine hands T1 minus 4 to the dispatcher: for a link stub that is its patch site; for other
+ * stubs the dispatcher does not look at it. branch is the only conditional branch that jumps to
+ * this stub, and when linking, if the target is within its offset range it is made to jump there
+ * directly (only when there are no other threads, see dbt_run). When the computed branch target is
+ * beyond 48 bits (the guest jumping there can only fault), the reason is passed separately with a
+ * movz to exit_full.
  */
 static void emit_link_stub(struct xlate *x, unsigned reason, uint64_t pc, const uint32_t *branch)
 {
     unsigned delta = branch ? (unsigned)(here(x) - branch) : 0;
-    if (reason == R_LOOKUP) { /* 目标 pc 已经在 T0 里：先在翻译后的代码里查表 */
+    if (reason == R_LOOKUP) { /* target pc already in T0: look it up in translated code first */
         emit_to_routine(x, TO_LOOKUP);
         return;
     }
@@ -699,7 +771,7 @@ static void emit_exit_stub(struct xlate *x, unsigned reason, uint64_t pc)
     emit_link_stub(x, reason, pc, NULL);
 }
 
-/* 发射一条条件跳转（偏移待回填），目标是一个退出桩 */
+/* Emit a conditional branch (offset patched later) whose target is an exit stub */
 static void emit_to_stub(struct xlate *x, uint32_t insn, enum fixup_kind kind, unsigned reason, uint64_t pc)
 {
     unsigned i;
@@ -710,23 +782,24 @@ static void emit_to_stub(struct xlate *x, uint32_t insn, enum fixup_kind kind, u
     if (i == x->nstubs) {
         if (x->nstubs < MAX_STUBS)
             x->stubs[i] = (struct stub){.reason = reason, .pc = pc};
-        x->nstubs++; /* 溢出由 prepare() 检查 */
+        x->nstubs++; /* overflow is checked by prepare() */
     }
     if (x->nfixups < MAX_FIXUPS)
         x->fixups[x->nfixups++] = (struct fixup){here(x), kind, i};
     else
-        x->nfixups++; /* 记录溢出，prepare() 会检查 */
+        x->nfixups++; /* record the overflow; prepare() checks it */
     emit(x, insn);
 }
 
-/* pc 处的指令直接跳往 target */
+/* The instruction at pc jumps directly to target */
 static unsigned chain_reason(uint64_t pc, uint64_t target)
 {
     return target > pc ? R_CHAIN_FWD : R_CHAIN;
 }
 
-/* TLB 未命中时跳往回填桩：每条访存指令一个，不和别的桩合并。回填成功后从紧接着的
- * 指令（访问本身）继续 */
+/* Branch to the refill stub on a TLB miss: one per memory-access instruction, not merged with
+ * other stubs. After a successful refill, execution continues at the next instruction (the access
+ * itself) */
 static void emit_to_refill(struct xlate *x, uint64_t pc, unsigned bytes, bool write, unsigned fail)
 {
     if (x->nstubs < MAX_STUBS)
@@ -739,20 +812,22 @@ static void emit_to_refill(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
     if (x->nfixups < MAX_FIXUPS)
         x->fixups[x->nfixups] = (struct fixup){here(x), FIX_IMM19, x->nstubs};
     x->nstubs++;
-    x->nfixups++; /* 溢出由 prepare() 检查 */
+    x->nfixups++; /* overflow is checked by prepare() */
     emit(x, enc_cbnz_x(T1));
 }
 
 /*
- * 回填桩：T1 指向信息字，进入回填例程；信息字后面是这条指令的 guest pc。例程成功时 T2 =
- * addend，跳回访问本身；失败时按信息字里的原因带着 pc 退出，由 Tier 0 执行这条指令。
+ * Refill stub: T1 points to the info word and the refill routine is entered; the info word is
+ * followed by this instruction's guest pc. On success the routine sets T2 = addend and jumps back
+ * to the access itself; on failure it exits with the pc and the reason in the info word, and
+ * Tier 0 executes this instruction.
  *
- *     adr T1, 8   b 回填例程   .word 信息   .quad pc
+ *     adr T1, 8   b <refill routine>   .word info   .quad pc
  */
 static void emit_refill_stub(struct xlate *x, const struct stub *s)
 {
     if (s->bytes > 1u << REFILL_REASON_SHIFT || s->fail >> (REFILL_RESUME_SHIFT - REFILL_REASON_SHIFT))
-        abort(); /* 信息字放不下：属于引擎 bug */
+        abort(); /* the info word cannot hold it: an engine bug */
     emit(x, enc_adr(T1, 8));
     emit_to_routine(x, s->write ? TO_REFILL_WRITE : TO_REFILL_READ);
     intptr_t resume = s->resume - here(x);
@@ -768,7 +843,7 @@ static bool fallback(struct xlate *x, uint64_t pc)
     return false;
 }
 
-/* 回填 b/cbz/cbnz/tbz/tbnz 的偏移 */
+/* Patch the offset of a b/cbz/cbnz/tbz/tbnz */
 static void patch_branch(intptr_t wdelta, uint32_t *site, const uint32_t *target)
 {
     uint32_t off = (uint32_t)(target - site), *w = (uint32_t *)((uintptr_t)site + (uintptr_t)wdelta);
@@ -780,20 +855,21 @@ static void patch_branch(intptr_t wdelta, uint32_t *site, const uint32_t *target
         *w |= (off & 0x7ffff) << 5;
 }
 
-/* 块内的局部跳转；溢出的块不会被使用（prepare() 会检查），只是不能写出界 */
+/* A local branch within the block; an overflowed block is never used (prepare() checks), it just
+ * must not write out of bounds */
 static void patch_local(struct xlate *x, uint32_t *site, const uint32_t *target)
 {
     if (site < x->buf + MAX_BLOCK_WORDS)
         patch_branch(x->wdelta, site, target);
 }
 
-/* ---- 数据处理：原样拷贝或改写被占用的寄存器 ---- */
+/* ---- Data processing: copy verbatim or rewrite stolen registers ---- */
 
 struct operands {
     unsigned n;
-    unsigned pos[4]; /* 字段的起始位 */
-    bool sp[4];      /* 31 是否表示 SP */
-    bool writes_rd;  /* pos[0] == 0 的 Rd 字段会被写 */
+    unsigned pos[4]; /* start bit of the field */
+    bool sp[4];      /* whether 31 means SP */
+    bool writes_rd;  /* the Rd field at pos[0] == 0 is written */
 };
 
 static void add_operand(struct operands *o, unsigned pos, bool sp)
@@ -803,25 +879,26 @@ static void add_operand(struct operands *o, unsigned pos, bool sp)
     o->n++;
 }
 
-/* 列出数据处理指令的寄存器字段；Tier 0 已经确认过编码合法 */
+/* List the register fields of a data-processing instruction; Tier 0 has already confirmed that the
+ * encoding is valid */
 static bool dp_operands(uint32_t insn, struct operands *o)
 {
     o->n = 0;
     o->writes_rd = true;
-    if (FIELD(insn, 28, 26) == 4) { /* 立即数 */
+    if (FIELD(insn, 28, 26) == 4) { /* immediate */
         switch (FIELD(insn, 25, 23)) {
         case 2: /* ADD/SUB (immediate) */
             add_operand(o, 0, !BIT(insn, 29));
             add_operand(o, 5, true);
             return true;
-        case 4: /* 逻辑运算 (immediate) */
+        case 4: /* logical (immediate) */
             add_operand(o, 0, FIELD(insn, 30, 29) != 3);
             add_operand(o, 5, false);
             return true;
         case 5: /* MOVN/MOVZ/MOVK */
             add_operand(o, 0, false);
             return true;
-        case 6: /* 位域 */
+        case 6: /* bitfield */
             add_operand(o, 0, false);
             add_operand(o, 5, false);
             return true;
@@ -844,18 +921,18 @@ static bool dp_operands(uint32_t insn, struct operands *o)
     }
     switch (op2) {
     case 0: /* ADC/SBC */
-        if (FIELD(insn, 15, 10)) { /* RMIF、SETF8、SETF16（FlagM）：只读 Rn，只写标志 */
+        if (FIELD(insn, 15, 10)) { /* RMIF, SETF8, SETF16 (FlagM): only read Rn, only write flags */
             o->writes_rd = false;
             add_operand(o, 5, false);
             return true;
         }
         /* fallthrough */
-    case 4: /* CSEL 系列 */
+    case 4: /* the CSEL family */
         add_operand(o, 0, false);
         add_operand(o, 5, false);
         add_operand(o, 16, false);
         return true;
-    case 2: /* CCMP/CCMN：没有 Rd，bits 4:0 是 nzcv */
+    case 2: /* CCMP/CCMN: no Rd, bits 4:0 are nzcv */
         o->writes_rd = false;
         add_operand(o, 5, false);
         if (!BIT(insn, 11))
@@ -878,7 +955,8 @@ static bool dp_operands(uint32_t insn, struct operands *o)
     }
 }
 
-/* 被占用的 guest 寄存器换成临时寄存器：先从 cpu 结构体读入，执行后写回 Rd */
+/* Replace stolen guest registers with temporaries: load them from the cpu struct first, and write
+ * Rd back after execution */
 static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands *o)
 {
     const unsigned pool[3] = {T0, T1, T2};
@@ -888,7 +966,7 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
     bool renamed = false;
     for (unsigned i = 0; i < o->n; i++) {
         unsigned r = (insn >> o->pos[i]) & 31;
-        if (r == 31 && o->sp[i]) { /* SP 就在宿主寄存器里，换个编号即可 */
+        if (r == 31 && o->sp[i]) { /* SP is already in a host register; just change the number */
             out = (out & ~(31u << o->pos[i])) | SP_HOST << o->pos[i];
             renamed = true;
             continue;
@@ -917,7 +995,7 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
         return true;
     }
     if (nmap == 3)
-        x->t2_group = -1; /* 之后的组员从槽里取回宿主基址（plan_group） */
+        x->t2_group = -1; /* later members get the host base back from the slot (plan_group) */
     for (unsigned k = 0; k < nmap; k++)
         emit_load_guest(x, pool[k], guest[k]);
     emit(x, out);
@@ -927,7 +1005,7 @@ static bool emit_operands(struct xlate *x, uint32_t insn, const struct operands 
     return true;
 }
 
-/* ADR/ADRP：结果是编译期常量 */
+/* ADR/ADRP: the result is a compile-time constant */
 static void emit_pcrel(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     unsigned rd = insn & 31;
@@ -945,21 +1023,21 @@ static void emit_pcrel(struct xlate *x, uint32_t insn, uint64_t pc)
     }
 }
 
-/* ---- 访存：内联 TLB 快速路径 ---- */
+/* ---- Memory access: the inline TLB fast path ---- */
 
 enum mem_mode { M_OFFSET, M_PRE, M_POST, M_REG, M_LITERAL };
 
 struct memop {
     enum mem_mode mode;
     bool load, pair, prefetch;
-    bool simd;      /* Rt/Rt2 是 SIMD&FP 寄存器 */
-    bool structure; /* LD1–LD4/ST1–ST4：final 只缺 Rn */
-    bool wb_reg;    /* 回写时加 Xm 而不是 imm */
-    unsigned size;  /* 单个元素的 log2 字节数 */
-    unsigned bytes; /* structure 时一共访问的字节数 */
+    bool simd;      /* Rt/Rt2 are SIMD&FP registers */
+    bool structure; /* LD1–LD4/ST1–ST4: final lacks only Rn */
+    bool wb_reg;    /* writeback adds Xm instead of imm */
+    unsigned size;  /* log2 of one element's byte count */
+    unsigned bytes; /* total bytes accessed, for structure */
     unsigned rt, rt2, rn, rm, option, shift;
-    int64_t imm;    /* M_LITERAL 时是绝对地址 */
-    uint32_t final; /* 最终访存指令的模板，寄存器字段为 0 */
+    int64_t imm;    /* the absolute address for M_LITERAL */
+    uint32_t final; /* template of the final access instruction, with register fields 0 */
 };
 
 static bool decode_memop(uint32_t insn, uint64_t pc, struct memop *m)
@@ -968,7 +1046,7 @@ static bool decode_memop(uint32_t insn, uint64_t pc, struct memop *m)
     *m = (struct memop){.rt = insn & 31, .rn = FIELD(insn, 9, 5), .size = size};
     if (BIT(insn, 26))
         return false;
-    if ((insn & 0x3b000000) == 0x18000000) { /* LDR (literal)，bits 31:30 是 opc */
+    if ((insn & 0x3b000000) == 0x18000000) { /* LDR (literal), bits 31:30 are opc */
         static const unsigned sizes[3] = {2, 3, 2}, opcs[3] = {1, 1, 2};
         m->mode = M_LITERAL;
         m->imm = (int64_t)(pc + (uint64_t)(((int64_t)((uint64_t)FIELD(insn, 23, 5) << 45) >> 45) * 4));
@@ -989,7 +1067,7 @@ static bool decode_memop(uint32_t insn, uint64_t pc, struct memop *m)
         m->size = size == 2 ? 3 : 2;
         m->imm = ((int64_t)((uint64_t)FIELD(insn, 21, 15) << 57) >> 57) * (1 << m->size);
         m->mode = idx == 1 ? M_POST : idx == 3 ? M_PRE : M_OFFSET;
-        m->final = (insn & 0xc0400000) | 0x29000000; /* 有符号偏移形式，偏移为 0 */
+        m->final = (insn & 0xc0400000) | 0x29000000; /* signed-offset form, offset 0 */
         return true;
     }
     if (BIT(insn, 29) != 1 || FIELD(insn, 28, 27) != 3)
@@ -1018,11 +1096,12 @@ static bool decode_memop(uint32_t insn, uint64_t pc, struct memop *m)
     return false;
 }
 
-/* LD1–LD4/ST1–ST4 一共访问的字节数；Tier 0 已经确认过编码合法 */
+/* Total bytes accessed by LD1–LD4/ST1–ST4; Tier 0 has already confirmed that the encoding is
+ * valid */
 static unsigned structure_bytes(uint32_t insn)
 {
     unsigned q = BIT(insn, 30), opcode = FIELD(insn, 15, 12), size = FIELD(insn, 11, 10);
-    if (!BIT(insn, 24)) { /* 多个结构：opcode 对应 rpt × selem 个寄存器 */
+    if (!BIT(insn, 24)) { /* multiple structures: opcode maps to rpt × selem registers */
         static const uint8_t regs[16] = {[0x0] = 4, [0x2] = 4, [0x4] = 3, [0x6] = 3,
                                          [0x7] = 1, [0x8] = 2, [0xa] = 2};
         return regs[opcode] * (q ? 16u : 8u);
@@ -1035,7 +1114,7 @@ static unsigned structure_bytes(uint32_t insn)
     return selem << scale;
 }
 
-/* SIMD&FP 访存（bit 26 为 1）：和 Tier 0 的 appine_simd_ldst 译码一致 */
+/* SIMD&FP memory access (bit 26 set): decoded the same way as Tier 0's appine_simd_ldst */
 static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
 {
     unsigned size = FIELD(insn, 31, 30), opc = FIELD(insn, 23, 22);
@@ -1050,11 +1129,11 @@ static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
             m->wb_reg = m->rm != 31;
             m->imm = m->bytes;
         }
-        /* 改成不带回写的形式，Rn 换成宿主地址 */
+        /* Change to the form without writeback, with Rn replaced by the host address */
         m->final = insn & ~(1u << 23 | 31u << 16 | 31u << 5);
         return true;
     }
-    if ((insn & 0x3f000000) == 0x1c000000) { /* LDR (literal)：bits 31:30 是 opc */
+    if ((insn & 0x3f000000) == 0x1c000000) { /* LDR (literal): bits 31:30 are opc */
         m->mode = M_LITERAL;
         m->imm = (int64_t)(pc + (uint64_t)(((int64_t)((uint64_t)FIELD(insn, 23, 5) << 45) >> 45) * 4));
         m->load = true;
@@ -1071,10 +1150,10 @@ static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
         m->size = 2 + size;
         m->imm = ((int64_t)((uint64_t)FIELD(insn, 21, 15) << 57) >> 57) * (1 << m->size);
         m->mode = idx == 1 ? M_POST : idx == 3 ? M_PRE : M_OFFSET;
-        m->final = (insn & 0xc0400000) | 0x2d000000; /* 有符号偏移形式，偏移为 0 */
+        m->final = (insn & 0xc0400000) | 0x2d000000; /* signed-offset form, offset 0 */
         return true;
     }
-    /* 单个寄存器：size = 00 且 opc = 1x 是 128 位的 Q 寄存器 */
+    /* Single register: size = 00 with opc = 1x is the 128-bit Q register */
     m->load = opc & 1;
     m->size = (size == 0 && (opc & 2)) ? 4 : size;
     m->final = enc_ldst_regoff(size, opc, 0, 0, 0) | 1u << 26;
@@ -1100,12 +1179,14 @@ static bool decode_simd_memop(uint32_t insn, uint64_t pc, struct memop *m)
 }
 
 /*
- * T0 = guest 地址时查 TLB，命中后 T2 = addend。取最后一个字节所在页的表项，和
- * 第一个字节所在页比较：TLB 直接映射，跨页时第一页的页号不可能出现在下一页的
- * 表项里，所以这一次比较同时排除了跨页访问。未命中和跨页时进入回填例程，回填失败
- * 时以 `fail` 退出。`in_granule` 表示访问落在一个对齐的 16 字节里，不可能跨页，
- * 可以直接用第一个字节的页。`last_ready` 表示调用方已经把最后一个字节的地址算进了
- * T1（[`emit_address_imm`]）。
+ * Look up the TLB with T0 = guest address; on a hit T2 = addend. Take the entry of the page of
+ * the last byte and compare it with the page of the first byte: the TLB is direct-mapped, so for
+ * a cross-page access the first page's page number cannot appear in the next page's entry, and
+ * this one comparison also rules out cross-page accesses. A miss or a cross-page access enters the
+ * refill routine, and a failed refill exits with `fail`. `in_granule` means the access lies within
+ * one aligned 16 bytes and cannot cross a page, so the first byte's page can be used directly.
+ * `last_ready` means the caller has already computed the last byte's address into T1
+ * ([`emit_address_imm`]).
  */
 static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool write, bool in_granule,
                            bool last_ready, unsigned fail)
@@ -1121,13 +1202,15 @@ static void emit_tlb_check(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
     emit(x, enc_ubfx(T1, last, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(T1, CTX, T1, 5));
     emit(x, enc_ldp_x(T1, T2, T1, (int)TLB_OFF + (write ? 16 : 0)));
-    emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag 是页号取反 */
+    emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag is the inverted page number */
     emit_to_refill(x, pc, bytes, write, fail);
 }
 
 /*
- * 访问的 guest 地址在翻译时已知（`addr`，T0 里也是它，访问不跨页）：表项的位置是常数，
- * 取表项不必等 T0 算出来（全局变量：ADRP 之后的访存，T0 要等 ADRP 换成的几条 movk）。
+ * The access's guest address is known at translation time (`addr`, also in T0, and the access
+ * does not cross a page): the entry's position is a constant, so loading the entry need not wait
+ * for T0 to be computed (global variables: for an access after ADRP, T0 waits for the few movks
+ * ADRP was turned into).
  */
 static void emit_tlb_check_known(struct xlate *x, uint64_t pc, uint64_t addr, unsigned bytes, bool write,
                                  unsigned fail)
@@ -1136,7 +1219,7 @@ static void emit_tlb_check_known(struct xlate *x, uint64_t pc, uint64_t addr, un
     uint64_t off = TLB_OFF + ((addr >> APPINE_PAGE_SHIFT) & (APPINE_TLB_ENTRIES - 1)) * 32 + (write ? 16 : 0);
     int64_t lo = (int64_t)(off & 0xfff);
     uint64_t hi = off - (uint64_t)lo;
-    if (lo > 504 && lo >= 4096 - 512) { /* ldp 的偏移是 -512..504 */
+    if (lo > 504 && lo >= 4096 - 512) { /* ldp offsets are -512..504 */
         hi += 4096;
         lo -= 4096;
     }
@@ -1151,12 +1234,12 @@ static void emit_tlb_check_known(struct xlate *x, uint64_t pc, uint64_t addr, un
         lo = 0;
     }
     emit(x, enc_ldp_x(T1, T2, b, (int)lo));
-    emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag 是页号取反 */
+    emit(x, enc_eon_lsr(T1, T1, T0, APPINE_PAGE_SHIFT)); /* tag is the inverted page number */
     emit_to_refill(x, pc, bytes, write, fail);
 }
 
-/* 以已知值的寄存器 `rn` 为基址、偏移 `imm` 访问 `bytes` 字节时的 guest 地址；寄存器的值
- * 不知道或者访问跨页时返回 false */
+/* The guest address of a `bytes`-byte access at offset `imm` from register `rn`, whose value is
+ * known; returns false if the register's value is not known or the access crosses a page */
 static bool known_address(const struct xlate *x, unsigned rn, int64_t imm, unsigned bytes, uint64_t *addr)
 {
     if (rn > 30 || !(x->konst >> rn & 1))
@@ -1166,9 +1249,10 @@ static bool known_address(const struct xlate *x, unsigned rn, int64_t imm, unsig
 }
 
 /*
- * T0 = base + imm。要取最后一个字节的页时，T1 = base + imm + bytes - 1 不经过 T0、直接
- * 从基址算：TLB 的下标不必等 T0 算出来，访存的依赖链上少一步（追指针的读每次都走完
- * 整条链），指令数不变。返回 T1 是否已经算好。
+ * T0 = base + imm. When the last byte's page is needed, T1 = base + imm + bytes - 1 is computed
+ * straight from the base, not through T0: the TLB index need not wait for T0, which takes one
+ * step off the access's dependency chain (pointer-chasing loads go through the whole chain every
+ * time), with the same instruction count. Returns whether T1 has been computed.
  */
 static bool emit_address_imm(struct xlate *x, unsigned base, int64_t imm, unsigned bytes, bool in_granule)
 {
@@ -1180,13 +1264,14 @@ static bool emit_address_imm(struct xlate *x, unsigned base, int64_t imm, unsign
     return fold;
 }
 
-/* 访存的字节数 */
+/* Byte count of an access */
 static unsigned memop_bytes(const struct memop *m)
 {
     return m->structure ? m->bytes : (m->pair ? 2u : 1u) << m->size;
 }
 
-/* 以 SP 为基址访存之前检查 SP 的对齐；本块里已经检查过、之后只按 16 的倍数改过时不用 */
+/* Check SP's alignment before an SP-based access; not needed if it was already checked in this
+ * block and SP has since changed only by multiples of 16 */
 static void emit_sp_check(struct xlate *x, uint64_t pc)
 {
     if (x->sp_aligned)
@@ -1196,7 +1281,7 @@ static void emit_sp_check(struct xlate *x, uint64_t pc)
     x->sp_aligned = true;
 }
 
-/* SP 改了 `delta` 之后是否仍然对齐 */
+/* Whether SP is still aligned after it changes by `delta` */
 static void sp_moved(struct xlate *x, int64_t delta)
 {
     if (delta & 15)
@@ -1215,7 +1300,7 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
         return;
     }
 
-    /* 1. guest 地址 → T0 */
+    /* 1. guest address → T0 */
     bool in_granule = false, last_ready = false, known = false;
     uint64_t addr = 0;
     if (m->mode == M_LITERAL) {
@@ -1224,7 +1309,7 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
         known = ((addr ^ (addr + memop_bytes(m) - 1)) >> APPINE_PAGE_SHIFT) == 0;
     } else {
         unsigned base = rn == REG_SP ? SP_HOST : rn;
-        if (rn == REG_SP) { /* SP 必须 16 字节对齐 */
+        if (rn == REG_SP) { /* SP must be 16-byte aligned */
             emit_sp_check(x, pc);
             int64_t off = m->mode == M_POST ? 0 : m->imm;
             in_granule = m->mode != M_REG && (off & 15) + memop_bytes(m) <= 16;
@@ -1261,7 +1346,7 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
     else
         emit_tlb_check(x, pc, memop_bytes(m), !m->load, in_granule, last_ready, R_INTERP);
 
-    /* 3. 访问宿主内存 */
+    /* 3. Access host memory */
     if (m->structure) {
         emit(x, enc_add_lsl(T2, T2, T0, 0));
         emit(x, m->final | T2 << 5);
@@ -1294,7 +1379,7 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
         }
     }
 
-    /* 4. 基址回写 */
+    /* 4. Base writeback */
     if (m->mode == M_PRE || m->mode == M_POST) {
         unsigned inc = m->rm, dst = rn == REG_SP ? SP_HOST : is_stolen(rn) ? T0 : rn;
         if (m->wb_reg && is_stolen(inc)) {
@@ -1315,32 +1400,40 @@ static void emit_memop(struct xlate *x, const struct memop *m, uint64_t pc)
     x->st->insns_memory++;
 }
 
-/* ---- 共用一次 TLB 检查的一组访存 ---- */
+/* ---- A group of accesses sharing one TLB check ---- */
 
 /*
- * 同一个块里以同一个寄存器为基址的几条访存（函数的序言和尾声、结构体的几个字段）
- * 共用一次检查：组长检查整组覆盖的范围，之后 T2 = 基址在组长执行之前的值对应的宿主
- * 地址，组员直接用 [T2, #偏移] 访问。组员之间只能有不写基址（按常数加减的除外，记下
- * 累计的偏移）的指令和条件分支，SP 只能按 16 的倍数改变（组长的对齐检查对组员也成立）。
+ * Several accesses in the same block based on the same register (function prologues and
+ * epilogues, several fields of a struct) share one check: the leader checks the range the whole
+ * group covers, after which T2 = the host address for the base's value before the leader
+ * executes, and members access [T2, #offset] directly. Between members there may only be
+ * instructions that do not write the base (except adding or subtracting a constant, whose
+ * accumulated offset is recorded) and conditional branches, and SP may only change by multiples
+ * of 16 (the leader's alignment check then also holds for the members).
  *
- * 组员之间可以夹着别的访存（别的组、不分组的）和用到 T2 的指令：组长把宿主基址存进
- * cpu 的 dbt_groups[槽]，它们之后的组员先取回来。槽的地址是常数，可以早早取出，组员的
- * 访问不必等 TLB 查表：python 的解释循环里栈帧、代码对象这几个基址的访存互相交错，原来
- * 一个块里十几次检查一次也省不下。一个块执行期间映射不会变（只会回填 TLB），宿主基址
- * 在基址改变之前一直有效。同时最多 GROUP_SLOTS 组。
+ * Other accesses (of other groups, or ungrouped) and instructions that use T2 may sit between
+ * members: the leader stores the host base in the cpu's dbt_groups[slot], and the members after
+ * them reload it first. The slot's address is a constant and can be loaded early, so members'
+ * accesses need not wait for a TLB lookup: in python's interpreter loop, accesses on the stack
+ * frame and code object bases interleave, and previously not one of a dozen or so checks in a
+ * block could be saved. Mappings do not change while a block executes (the TLB is only refilled),
+ * so the host base stays valid until the base changes. At most GROUP_SLOTS groups at once.
  *
- * 跨页时回填例程按两页处理，宿主地址不连续时检查失败。条件分支后面的组员不一定会
- * 执行，覆盖的范围里也可能有它们访问不到的页，所以检查失败时以 R_UNGROUP 退出，由
- * Tier 0 执行组长；同一个组长第二次失败时作废这个块，重新翻译时不再分组（ungroup）。
+ * Across pages the refill routine handles both pages, and the check fails if the host addresses
+ * are not contiguous. Members after a conditional branch do not necessarily execute, and the
+ * covered range may also include pages they cannot access, so a failed check exits with
+ * R_UNGROUP and Tier 0 executes the leader; the second failure of the same leader invalidates this
+ * block, and on retranslation it is no longer grouped (ungroup).
  */
 
 static bool is_atomic(uint32_t insn);
 
-/* 组员的访问指令：宿主地址 = Rn + off，Rn、Rt 字段为 0。立即数放不下时返回 false */
+/* A member's access instruction: host address = Rn + off, with the Rn and Rt fields 0. Returns
+ * false if the immediate does not fit */
 static bool member_insn(const struct memop *m, int64_t off, uint32_t *out)
 {
     unsigned sz = m->size;
-    if (m->structure) { /* LD1–LD4/ST1–ST4 没有偏移 */
+    if (m->structure) { /* LD1–LD4/ST1–ST4 have no offset */
         *out = m->final;
         return off == 0;
     }
@@ -1350,8 +1443,8 @@ static bool member_insn(const struct memop *m, int64_t off, uint32_t *out)
         *out = m->final | ((uint32_t)(off >> sz) & 0x7f) << 15;
         return true;
     }
-    uint32_t common = m->final & 0xc4c00000; /* size、V、opc */
-    if (off >= 0 && !(off & ((1 << sz) - 1)) && off >> sz < 4096) { /* 无符号偏移 */
+    uint32_t common = m->final & 0xc4c00000; /* size, V, opc */
+    if (off >= 0 && !(off & ((1 << sz) - 1)) && off >> sz < 4096) { /* unsigned offset */
         *out = common | 0x39000000 | (uint32_t)(off >> sz) << 10;
         return true;
     }
@@ -1362,7 +1455,8 @@ static bool member_insn(const struct memop *m, int64_t off, uint32_t *out)
     return false;
 }
 
-/* 立即数放不下时借来放宿主地址的寄存器：被占用的 Rt 用 T1（成对时用 T0、T1） */
+/* The register borrowed for the host address when the immediate does not fit: a stolen Rt uses T1
+ * (T0 and T1 for a pair) */
 static unsigned member_scratch(const struct xlate *x, const struct memop *m)
 {
     return m->pair && !m->simd && is_stolen(m->rt) ? T1 : T0;
@@ -1376,8 +1470,9 @@ static bool member_fits(const struct xlate *x, const struct memop *m, int64_t of
     return !(m->pair && !m->simd && is_stolen(m->rt) && is_stolen(m->rt2));
 }
 
-/* pc 处的访存能不能当组长：记下的组长和它后面一个块的长度以内都不能，它原来的组员
- * 多半也会因为同样的原因通不过检查 */
+/* Whether the access at pc may lead a group: a recorded leader and anything within one block's
+ * length after it may not, since its former members would most likely fail the check for the same
+ * reason */
 static bool nogroup(const struct appine_dbt *d, uint64_t pc)
 {
     unsigned n = d->nogroup_count < NOGROUP_MAX ? d->nogroup_count : NOGROUP_MAX;
@@ -1389,14 +1484,15 @@ static bool nogroup(const struct appine_dbt *d, uint64_t pc)
 }
 
 /*
- * 不写基址、不结束块的指令可以夹在组员之间：返回 1，用到 T2 时返回 2，否则返回 0。按常数
- * 加减基址的 ADD/SUB（立即数）把改变量记进 `delta`。
+ * Instructions that do not write the base and do not end the block may sit between members:
+ * returns 1, or 2 if it uses T2, otherwise 0. An ADD/SUB (immediate) that adds a constant to or
+ * subtracts one from the base records the change in `delta`.
  */
 static int keeps_group(const struct xlate *x, uint32_t insn, unsigned rn, int64_t *delta)
 {
     unsigned top = FIELD(insn, 28, 25), stolen[3], nstolen = 0;
     struct operands o = {.n = 0};
-    if ((top & 7) == 7) { /* SIMD&FP 数据处理：只有通用寄存器操作数要看 */
+    if ((top & 7) == 7) { /* SIMD&FP data processing: only general-register operands matter */
         struct native_desc nd;
         if (!appine_simd_dp_decode(insn, &nd))
             return false;
@@ -1406,7 +1502,7 @@ static int keeps_group(const struct xlate *x, uint32_t insn, unsigned rn, int64_
                 return false;
         }
     } else if (top == 0x8 || top == 0x9 || top == 0x5 || top == 0xd) {
-        if (FIELD(insn, 28, 24) == 0x10) /* ADR/ADRP：被占用的 Rd 只用 T0 */
+        if (FIELD(insn, 28, 24) == 0x10) /* ADR/ADRP: a stolen Rd only uses T0 */
             return (insn & 31) != rn || rn == 31;
         if (!dp_operands(insn, &o))
             return false;
@@ -1424,9 +1520,9 @@ static int keeps_group(const struct xlate *x, uint32_t insn, unsigned rn, int64_
                (insn & 0x7e000000) == 0x34000000 || /* CBZ/CBNZ */
                (insn & 0x7e000000) == 0x36000000 || /* TBZ/TBNZ */
                (insn & 0xfffff01f) == 0xd503201f || /* HINT */
-               (insn & 0xfffff01f) == 0xd503301f;   /* 屏障、CLREX */
+               (insn & 0xfffff01f) == 0xd503301f;   /* barriers, CLREX */
     }
-    /* 被占用的寄存器依次换成 T0、T1、T2（emit_operands）：三个就用到了 T2 */
+    /* Stolen registers are replaced by T0, T1, T2 in turn (emit_operands): three of them use T2 */
     for (unsigned i = 0; i < o.n; i++) {
         unsigned r = (insn >> o.pos[i]) & 31, k;
         if ((r == 31 && o.sp[i]) || !is_stolen(r))
@@ -1440,14 +1536,16 @@ static int keeps_group(const struct xlate *x, uint32_t insn, unsigned rn, int64_
     return 1;
 }
 
-/* 访存 `m` 执行时基址比组长执行之前多 `delta`：访问范围的起点（相对组长之前的基址） */
+/* When access `m` executes, the base is `delta` more than before the leader executed: the start
+ * of the access range (relative to the base before the leader) */
 static int64_t member_start(const struct memop *m, int64_t delta)
 {
     return delta + (m->mode == M_POST ? 0 : m->imm);
 }
 
-/* 从访存 `lead`（块里的第 x->idx 条）开始往后找同一基址的组员；至少有一个组员时在一个
- * 空闲的槽里填好这一组，返回槽的下标，否则返回 -1 */
+/* Starting from access `lead` (instruction x->idx of the block), look ahead for members with the
+ * same base; if there is at least one member, fill in this group in a free slot and return the
+ * slot's index, otherwise return -1 */
 static int plan_group(struct xlate *x, const struct memop *lead)
 {
     int slot = -1;
@@ -1476,7 +1574,7 @@ static int plan_group(struct xlate *x, const struct memop *lead)
     if (lead->mode != M_OFFSET)
         delta = lead->imm;
     bool overwritten = lead->load && !lead->simd && (lead->rt == rn || (lead->pair && lead->rt2 == rn));
-    bool clobbered = false; /* 上一个组员之后有指令用了 T2 */
+    bool clobbered = false; /* an instruction used T2 after the previous member */
     for (unsigned j = x->idx + 1; !overwritten && j < x->limit && g->n < GROUP_MAX; j++) {
         uint32_t insn = x->guest[j];
         unsigned top = FIELD(insn, 28, 25);
@@ -1491,10 +1589,11 @@ static int plan_group(struct xlate *x, const struct memop *lead)
         uint64_t pc = x->pc + 4ull * j;
         if (is_atomic(insn) || !(BIT(insn, 26) ? decode_simd_memop(insn, pc, &m) : decode_memop(insn, pc, &m)))
             break;
-        if (m.prefetch) /* 不生成代码 */
+        if (m.prefetch) /* generates no code */
             continue;
         if (m.rn != rn) {
-            /* 别的基址的访存要用 T2；读进来的值改写了基址就到此为止 */
+            /* An access on another base uses T2; stop here if the loaded value overwrites the
+             * base */
             if (m.load && !m.simd && (m.rt == rn || (m.pair && m.rt2 == rn)))
                 break;
             clobbered = true;
@@ -1526,14 +1625,14 @@ static int plan_group(struct xlate *x, const struct memop *lead)
         g->n = 0;
         return -1;
     }
-    g->next = g->n; /* 组长的检查发射之后才开始 */
+    g->next = g->n; /* starts only after the leader's check is emitted */
     g->lo = (int32_t)lo;
     g->bytes = (unsigned)(hi - lo);
     g->write = write;
     return slot;
 }
 
-/* 组员（包括组长）的访问：宿主地址 = T2 + off，然后回写基址 */
+/* A member's (including the leader's) access: host address = T2 + off, then base writeback */
 static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
 {
     unsigned rn = m->rn == 31 ? REG_SP : m->rn, base = rn == REG_SP ? SP_HOST : rn, addr = T2;
@@ -1586,8 +1685,8 @@ static void emit_member(struct xlate *x, const struct memop *m, int64_t off)
     x->st->insns_memory++;
 }
 
-/* 组长：检查整组覆盖的范围，T2 = 基址的宿主地址（有组员要取回时存进槽里），再做组长
- * 自己的访问 */
+/* The leader: check the range the whole group covers, T2 = the base's host address (stored in
+ * the slot when some member reloads it), then do the leader's own access */
 static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, int slot)
 {
     struct group *g = &x->groups[slot];
@@ -1611,12 +1710,13 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, i
     emit_member(x, lead, g->off[0]);
 }
 
-/* ---- 独占访问、acquire/release、LSE 原子操作（engine 的 map） ---- */
+/* ---- Exclusive accesses, acquire/release, LSE atomics (the engine map) ---- */
 
 /*
- * 原子访问的地址，与 Tier 0 的 atomic_target 相同：要求自然对齐（所以不会跨页），
- * 以 SP 为基址时 SP 要 16 字节对齐，不满足时交给 Tier 0 报告对齐错误。结束时
- * T0 = guest 地址，T2 = 宿主地址。
+ * Address of an atomic access, the same as Tier 0's atomic_target: natural alignment is required
+ * (so it never crosses a page), and with SP as the base SP must be 16-byte aligned; otherwise
+ * Tier 0 is left to report the alignment fault. Afterwards T0 = guest address and T2 = host
+ * address.
  */
 static void emit_atomic_address_off(struct xlate *x, unsigned rn, int64_t off, unsigned bytes,
                                     bool write, uint64_t pc)
@@ -1629,7 +1729,7 @@ static void emit_atomic_address_off(struct xlate *x, unsigned rn, int64_t off, u
     } else {
         emit(x, enc_mov(T0, rn));
     }
-    if (off) /* LRCPC2 的 9 位偏移，放得进 12 位立即数 */
+    if (off) /* LRCPC2's 9-bit offset, which fits in a 12-bit immediate */
         emit(x, off < 0 ? enc_sub_imm(T0, T0, (uint32_t)-off, 0) : enc_add_imm(T0, T0, (uint32_t)off, 0));
     if (bytes > 1) {
         emit(x, enc_and_low(T1, T0, (unsigned)__builtin_ctz(bytes)));
@@ -1650,7 +1750,7 @@ struct atomic_operand {
     bool in, out;
 };
 
-/* 在宿主地址 T2 上原样执行：被占用的寄存器操作数换成 T0、T1 */
+/* Execute verbatim on host address T2: stolen register operands are replaced by T0 and T1 */
 static void emit_on_host_address(struct xlate *x, uint32_t insn, const struct atomic_operand *ops,
                                  unsigned n)
 {
@@ -1672,7 +1772,7 @@ static void emit_on_host_address(struct xlate *x, uint32_t insn, const struct at
     }
 }
 
-/* 写 STXR 的状态：0 成功，1 失败 */
+/* Write STXR's status: 0 for success, 1 for failure */
 static void emit_status(struct xlate *x, unsigned rs, unsigned v)
 {
     if (rs == 31)
@@ -1684,9 +1784,11 @@ static void emit_status(struct xlate *x, unsigned rs, unsigned v)
 }
 
 /*
- * LDXR/STXR 改写成比较并交换（与 Tier 0 相同）：LDXR 记下地址、长度和读到的值；
- * STXR 先确认独占标记是同一地址、同一长度，再在宿主地址上用 ldaxr/stlxr 做 CAS，
- * 两条指令之间只有寄存器运算，宿主的独占监视器不会被我们自己的访存清掉。
+ * LDXR/STXR are rewritten into a compare-and-swap (the same as Tier 0): LDXR records the address,
+ * the size and the value it read; STXR first confirms that the exclusive marker is for the same
+ * address and the same size, then does a CAS on the host address with ldaxr/stlxr. Between the two
+ * instructions there is only register arithmetic, so the host's exclusive monitor is not cleared
+ * by our own memory accesses.
  */
 static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
 {
@@ -1710,12 +1812,14 @@ static bool translate_exclusive(struct xlate *x, uint32_t insn, uint64_t pc)
 
     emit_atomic_address(x, rn, bytes, true, pc);
     /*
-     * 要写的值在被占用的寄存器里（libgcc 的 outline atomics 都这样写：Alpine 上它们不
-     * 认 LSE，总是走 LL/SC 的循环）：CAS 循环里 T0、T1、T2 都有用处，借一个这条指令
-     * 没用到的 guest 寄存器放它。借来的寄存器先存进 cpu 结构体里它自己的位置（翻译后的
-     * 代码运行期间那里没有用），用完恢复；中间不会退出，宿主故障也不从 ucontext 恢复
-     * guest 状态（guard.c），所以没有人看得到它被借走。原来整条交给 Tier 0，node 启动时
-     * 每次要退出一万多次。
+     * The value to store is in a stolen register (libgcc's outline atomics all write it this way:
+     * on Alpine they do not recognize LSE and always take the LL/SC loop): T0, T1 and T2 are all
+     * in use in the CAS loop, so a guest register this instruction does not use is borrowed to
+     * hold it. The borrowed register is first saved into its own slot in the cpu struct (unused
+     * while translated code runs) and restored afterwards; nothing exits in between, and a host
+     * fault does not restore guest state from the ucontext either (guard.c), so nobody can see
+     * that it was borrowed. Previously the whole instruction went to Tier 0, exiting more than ten
+     * thousand times on every node startup.
      */
     unsigned v = rt, borrow = 0;
     if (is_stolen(rt)) {
@@ -1765,11 +1869,13 @@ static bool is_atomic(uint32_t insn)
            (insn & 0x3f200c00) == 0x19000000;
 }
 
-/* 编码已由 tier0_defined 确认合法；返回 false 时还没有发射任何指令 */
+/* The encoding has been confirmed valid by tier0_defined; when false is returned, no instruction
+ * has been emitted yet */
 static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     unsigned size = FIELD(insn, 31, 30), rn = FIELD(insn, 9, 5);
-    /* LRCPC2 的 LDAPUR*、STLUR*：检查基址加偏移，在宿主地址上去掉偏移原样执行 */
+    /* LRCPC2's LDAPUR* and STLUR*: check base plus offset, and execute verbatim on the host
+     * address with the offset removed */
     if ((insn & 0x3f200c00) == 0x19000000) {
         bool load = FIELD(insn, 23, 22) != 0;
         int64_t off = (int64_t)((uint64_t)FIELD(insn, 20, 12) << 55) >> 55;
@@ -1782,7 +1888,7 @@ static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
         unsigned o2 = BIT(insn, 23), o1 = BIT(insn, 21);
         if (!o2 && !o1)
             return translate_exclusive(x, insn, pc);
-        if (!o2) { /* LDXP/STXP（size ≥ 2）留给 Tier 0；CASP 的两对寄存器不能被占用 */
+        if (!o2) { /* LDXP/STXP (size ≥ 2) go to Tier 0; neither CASP register pair may be stolen */
             unsigned rs = FIELD(insn, 20, 16), rt = insn & 31;
             if (size >= 2 || is_stolen(rs) || is_stolen(rs + 1) || is_stolen(rt) || is_stolen(rt + 1))
                 return false;
@@ -1797,29 +1903,31 @@ static bool translate_atomic(struct xlate *x, uint32_t insn, uint64_t pc)
             emit_on_host_address(x, insn, &rt, 1);
             return true;
         }
-        /* CAS：Rs 既是比较值也接收旧值 */
+        /* CAS: Rs is the compare value and also receives the old value */
         struct atomic_operand ops[2] = {{16, true, true}, {0, true, false}};
         emit_atomic_address(x, rn, 1u << size, true, pc);
         emit_on_host_address(x, insn, ops, 2);
         return true;
     }
-    /* LDAPR（LRCPC，Tier 0 确认过宿主有它）：与 LDAR 一样在宿主地址上原样执行，Rs 不是操作数 */
+    /* LDAPR (LRCPC; Tier 0 has confirmed the host has it): executed verbatim on the host address
+     * like LDAR; Rs is not an operand */
     if ((insn & 0x3ffffc00) == 0x38bfc000) {
         struct atomic_operand rt = {0, false, true};
         emit_atomic_address(x, rn, 1u << size, false, pc);
         emit_on_host_address(x, insn, &rt, 1);
         return true;
     }
-    /* LD<op>、SWP */
+    /* LD<op>, SWP */
     struct atomic_operand ops[2] = {{16, true, false}, {0, false, true}};
     emit_atomic_address(x, rn, 1u << size, true, pc);
     emit_on_host_address(x, insn, ops, 2);
     return true;
 }
 
-/* ---- 分支与系统指令 ---- */
-/* FlagM、FlagM2 的五条：RMIF、SETF8/SETF16、CFINV、XAFLAG、AXFLAG。都只改 NZCV，guest 的 NZCV
- * 在翻译后的代码里就是宿主的（宣告了它们说明宿主有），原样执行 */
+/* ---- Branches and system instructions ---- */
+/* The five FlagM and FlagM2 instructions: RMIF, SETF8/SETF16, CFINV, XAFLAG, AXFLAG. They all
+ * change only NZCV, and in translated code the guest's NZCV is the host's (advertising them means
+ * the host has them), so they run verbatim */
 static bool is_flagm(uint32_t insn)
 {
     return (insn & 0xffe07c10) == 0xba000400 || (insn & 0xffffbc1f) == 0x3a00080d ||
@@ -1833,27 +1941,32 @@ static int64_t sext(uint64_t v, unsigned bits)
 }
 
 /*
- * 函数调用（BL、BLR）：宿主 bl 跳过紧随其后的"落点"，宿主的返回地址栈因此记下落点；
- * 落点是链接到 guest 返回地址处的块的链接桩。bl 的目标把 (guest 返回地址, 落点) 压进
- * 影子返回栈，把 guest x30 设成返回地址。调用方接着发射跳往被调函数的代码（T0 不变）。
+ * Function calls (BL, BLR): a host bl skips the "landing pad" right after it, so the host's
+ * return address stack records the landing pad; the landing pad is a link stub linked to the
+ * block at the guest return address. The bl's target pushes (guest return address, landing pad)
+ * onto the shadow return stack and sets guest x30 to the return address. The caller then emits
+ * the code that jumps to the callee (T0 unchanged).
  *
- * RET 看到栈顶的 guest 地址等于 x30，就弹栈并用宿主 ret 跳回落点，由宿主的返回地址栈
- * 预测；不等时（longjmp、信号处理函数、协程切换）照常查跳转缓存。栈里的每一项都跳往
- * 继续执行它记的 guest 地址的代码（空项跳往 rs_miss），所以 guest 把 x30 设成什么都不会
- * 跳错。
+ * When RET sees that the guest address at the top of the stack equals x30, it pops and jumps
+ * back to the landing pad with a host ret, predicted by the host's return address stack; when
+ * they differ (longjmp, signal handlers, coroutine switches) it looks up the jump cache as usual.
+ * Every entry in the stack jumps to code that continues at the guest address it records (empty
+ * entries jump to rs_miss), so whatever the guest sets x30 to, it never jumps to the wrong
+ * place.
  */
 static void emit_call(struct xlate *x, uint64_t pc)
 {
     size_t rs = offsetof(struct appine_cpu, dbt_rs);
     uint32_t *site = here(x);
     emit(x, enc_bl(0));
-    emit_exit_stub(x, R_CHAIN, pc + 4); /* 落点 */
+    emit_exit_stub(x, R_CHAIN, pc + 4); /* landing pad */
     patch_local(x, site, here(x));
     emit(x, enc_ldr_x(T1, CTX, rs));
     emit(x, enc_add_imm(T2, T1, 16, 0));
     emit(x, enc_bfxil_low(T1, T2, RS_SHIFT));
     emit(x, enc_str_x(T1, CTX, rs));
-    /* 宿主 x30 是落点，guest 返回地址在它末尾的数据字里（emit_link_stub） */
+    /* Host x30 is the landing pad, and the guest return address is in the data words at its end
+     * (emit_link_stub) */
     if ((pc + 4) >> PACKED_PC_BITS == 0) {
         emit(x, enc_ldur_x(T2, 30, 12));
         emit(x, enc_and_low(T2, T2, PACKED_PC_BITS));
@@ -1864,7 +1977,8 @@ static void emit_call(struct xlate *x, uint64_t pc)
     emit(x, enc_mov(30, T2));
 }
 
-/* RET：栈顶匹配时弹栈并跳回落点，不匹配时落到后面的跳转缓存查找 */
+/* RET: when the top of the stack matches, pop and jump back to the landing pad; otherwise fall
+ * through to the jump-cache lookup after it */
 static void emit_predicted_return(struct xlate *x)
 {
     size_t rs = offsetof(struct appine_cpu, dbt_rs);
@@ -1880,7 +1994,7 @@ static void emit_predicted_return(struct xlate *x)
     patch_local(x, miss, here(x));
 }
 
-/* 把条件分支的寄存器操作数换成可直接读取的宿主寄存器 */
+/* Replace a conditional branch's register operand with a directly readable host register */
 static uint32_t branch_operand(struct xlate *x, uint32_t insn)
 {
     unsigned rt = insn & 31;
@@ -1901,10 +2015,10 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     if ((insn & 0xff000010) == 0x54000000 || (insn & 0x7e000000) == 0x34000000) { /* B.cond/CBZ/CBNZ */
         uint64_t target = pc + (uint64_t)(sext(FIELD(insn, 23, 5), 19) * 4);
-        /* B.cond 的 bits 4:0 是条件码，原样保留；CBZ/CBNZ 的是寄存器 */
+        /* Bits 4:0 of B.cond are the condition code, kept as is; CBZ/CBNZ's are a register */
         uint32_t base = BIT(insn, 30) ? insn : branch_operand(x, insn);
         emit_to_stub(x, base & ~(0x7ffffu << 5), FIX_IMM19, chain_reason(pc, target), target);
-        return true; /* 不跳转的一侧接着翻译，跳转的一侧是侧出口 */
+        return true; /* the not-taken side is translated next; the taken side is a side exit */
     }
     if ((insn & 0x7e000000) == 0x36000000) { /* TBZ/TBNZ */
         uint64_t target = pc + (uint64_t)(sext(FIELD(insn, 18, 5), 14) * 4);
@@ -1916,21 +2030,23 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         emit_exit_stub(x, R_SVC, pc + 4);
         return false;
     }
-    if ((insn & 0xfffff01f) == 0xd503201f) /* HINT：与 Tier 0 一样当作 NOP */
+    if ((insn & 0xfffff01f) == 0xd503201f) /* HINT: a NOP, as in Tier 0 */
         return true;
-    if (is_flagm(insn)) { /* CFINV、XAFLAG、AXFLAG：白名单已由 Tier 0 确认 */
+    if (is_flagm(insn)) { /* CFINV, XAFLAG, AXFLAG: whitelist already confirmed by Tier 0 */
         emit(x, insn);
         x->st->insns_copied++;
         return true;
     }
-    if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障（含 SB）：白名单已由 Tier 0 确认 */
-        if (FIELD(insn, 7, 5) == 2) { /* CLREX：清掉 guest 的独占标记 */
+    /* Barriers (including SB): the whitelist has already been confirmed by Tier 0 */
+    if ((insn & 0xfffff01f) == 0xd503301f) {
+        if (FIELD(insn, 7, 5) == 2) { /* CLREX: clear the guest's exclusive marker */
             emit(x, enc_str_w(31, CTX, offsetof(struct appine_cpu, excl_size)));
             x->st->insns_remapped++;
             return true;
         }
         unsigned op2 = FIELD(insn, 7, 5);
-        if (op2 == 4 || op2 == 6) { /* DSB、ISB：先把 ic ivau 记下的页交出去（见 dbt_run） */
+        /* DSB, ISB: first hand over the page recorded by ic ivau (see dbt_run) */
+        if (op2 == 4 || op2 == 6) {
             emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
             emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
         }
@@ -1943,7 +2059,9 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         unsigned rt = insn & 31;
         switch (FIELD(insn, 20, 5)) {
         case SYSREG_NZCV:
-        case SYSREG_CNTFRQ_EL0: /* 计时器只读，写入已被 tier0_defined 拒绝；原样在宿主上读 */
+        /* Timers are read-only, and writes have already been rejected by tier0_defined; read
+         * as is on the host */
+        case SYSREG_CNTFRQ_EL0:
         case SYSREG_CNTVCT_EL0: {
             struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read};
             return emit_operands(x, insn, &o) || fallback(x, pc);
@@ -1965,7 +2083,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             x->st->insns_remapped++;
             return true;
         }
-        case SYSREG_DCZID_EL0: /* 只读，写入已被 tier0_defined 拒绝 */
+        case SYSREG_DCZID_EL0: /* read-only, writes already rejected by tier0_defined */
             if (rt != 31) {
                 unsigned h = is_stolen(rt) ? T0 : rt;
                 emit(x, enc_movz(h, DCZID_VALUE, 0));
@@ -1978,7 +2096,8 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             return fallback(x, pc);
         }
     }
-    if ((insn & 0xffffffe0) == 0xd50b7420) { /* DC ZVA：清零地址所在的整块，块总在一页之内 */
+    /* DC ZVA: zero the whole block containing the address; a block is always within one page */
+    if ((insn & 0xffffffe0) == 0xd50b7420) {
         unsigned rt = insn & 31;
         if (rt == 31)
             emit(x, enc_movz(T0, 0, 0));
@@ -1987,7 +2106,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         else
             emit(x, enc_mov(T0, rt));
         emit(x, enc_and_clear_low(T0, T0, 6));
-        _Static_assert(DCZ_BLOCK == 64, "DC ZVA 的块大小");
+        _Static_assert(DCZ_BLOCK == 64, "the block size of DC ZVA");
         emit_tlb_check(x, pc, DCZ_BLOCK, true, false, false, R_INTERP);
         emit(x, enc_add_lsl(T2, T2, T0, 0));
         for (int off = 0; off < DCZ_BLOCK; off += 16)
@@ -1996,10 +2115,12 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         return true;
     }
     /*
-     * DC CVAC、DC CVAU、DC CIVAC、DC CVAP、DC CVADP、IC IVAU：与 Tier 0 一样只按读访问检查
-     * 地址（DC CVAP、CVADP 的特性已由 Tier 0 确认）。ic ivau 不再每条都退出：记下所在的页
-     * （JIT 刷新缓存时一页要执行几十条），等 dsb、isb 时一次交给调用方作废翻译；已经记着
-     * 另一页时由 Tier 0 执行这一条，退出时两页一起作废。
+     * DC CVAC, DC CVAU, DC CIVAC, DC CVAP, DC CVADP, IC IVAU: as in Tier 0, the address is only
+     * checked for read access (the DC CVAP and CVADP features have been confirmed by Tier 0).
+     * ic ivau no longer exits on every instruction: it records its page (a JIT flushing its cache
+     * executes dozens of them per page), which is handed to the caller at dsb or isb to invalidate
+     * the translations in one go; when another page is already recorded, Tier 0 executes this
+     * one, and both pages are invalidated at the exit.
      */
     uint32_t cmo = insn & 0xffffffe0;
     if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520 ||
@@ -2016,7 +2137,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             emit(x, enc_and_clear_low(T0, T0, APPINE_PAGE_SHIFT));
             emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, ivau_page)));
             emit(x, enc_eor_lsr(T2, T1, T0, 0));
-            emit(x, enc_cbz_x(T2) | 3u << 5); /* 同一页：跳过下面两条 */
+            emit(x, enc_cbz_x(T2) | 3u << 5); /* same page: skip the next two instructions */
             emit_to_stub(x, enc_cbnz_x(T1), FIX_IMM19, R_INTERP, pc);
             emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
         }
@@ -2025,7 +2146,8 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     }
     uint32_t reg_branch = insn & 0xfffffc1f;
     if (reg_branch == 0xd61f0000 || reg_branch == 0xd63f0000 || reg_branch == 0xd65f0000) {
-        unsigned rn = FIELD(insn, 9, 5); /* BR/BLR/RET：目标先放进 T0，再查跳转缓存 */
+        /* BR/BLR/RET: put the target in T0 first, then look up the jump cache */
+        unsigned rn = FIELD(insn, 9, 5);
         if (reg_branch == 0xd65f0000 && rn == 30)
             emit_predicted_return(x);
         if (rn == 31)
@@ -2049,9 +2171,11 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
 }
 
 /*
- * 询问 Tier 0 是否认识这条指令（两层的白名单必须一致，见 engine 的 map）。回答只取决于指令字，按它
- * 缓存在 `cache` 里（直接映射，每项是 1 << 40 | 指令字 << 1 | 回答）：Tier 0 要把指令
- * 执行一遍才知道，java 启动时翻译的每条指令都问一次，占了两个百分点。
+ * Ask Tier 0 whether it recognizes this instruction (the two tiers' whitelists must agree, see
+ * the engine map). The answer depends only on the instruction word and is cached by it in `cache`
+ * (direct-mapped, each entry is 1 << 40 | instruction word << 1 | answer): Tier 0 has to execute
+ * the instruction to find out, and asking once for every instruction translated at java startup
+ * took two percentage points.
  */
 #define DEFINED_CACHE 4096
 static bool tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t insn, uint64_t pc)
@@ -2067,9 +2191,9 @@ static bool tier0_defined(struct appine_cpu *probe, uint64_t *cache, uint32_t in
 }
 
 /*
- * SIMD&FP 数据处理：白名单判定与 Tier 0 共用 appine_simd_dp_decode。V 寄存器
- * 不需要改写，只有通用寄存器操作数可能是被占用的寄存器。不经过 tier0_defined，
- * 免得为每条指令生成一个原生桩。
+ * SIMD&FP data processing: the whitelist decision shares appine_simd_dp_decode with Tier 0. V
+ * registers need no rewriting; only general-register operands may be stolen registers. It does
+ * not go through tier0_defined, to avoid generating a native stub for every instruction.
  */
 static bool translate_simd_dp(struct xlate *x, uint32_t insn)
 {
@@ -2086,19 +2210,20 @@ static bool translate_simd_dp(struct xlate *x, uint32_t insn)
     return emit_operands(x, insn, &o);
 }
 
-/* 翻译一条指令；返回 false 表示块到此结束 */
+/* Translate one instruction; returning false means the block ends here */
 static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc);
 
 
 /*
- * 这条指令之后哪些寄存器的值已知（xlate.konst）：ADR/ADRP 设下常数，在已知值上加立即数
- * 仍然已知，其余可能写通用寄存器的指令让它们失效。拿不准的一律当作全都写了。
+ * Which registers have known values after this instruction (xlate.konst): ADR/ADRP set constants,
+ * adding an immediate to a known value keeps it known, and other instructions that may write
+ * general registers invalidate them. Anything uncertain is treated as writing all of them.
  */
 static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
 {
     unsigned rd = insn & 31, rn = FIELD(insn, 9, 5);
     uint32_t kill = 1u << rd;
-    if (is_flagm(insn)) /* 只写标志 */
+    if (is_flagm(insn)) /* writes only flags */
         return;
     if (FIELD(insn, 28, 24) == 0x10) { /* ADR/ADRP */
         uint64_t imm = ((uint64_t)FIELD(insn, 23, 5) << 2) | FIELD(insn, 30, 29);
@@ -2110,7 +2235,7 @@ static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
         return;
     }
     if ((insn & 0xff800000) == 0x91000000 && rd != 31 && rn != 31 && (x->konst >> rn & 1)) {
-        /* ADD Xd, Xn, #imm{, lsl #12}（不设标志） */
+        /* ADD Xd, Xn, #imm{, lsl #12} (does not set flags) */
         x->kval[rd] = x->kval[rn] + ((uint64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0));
         x->konst |= 1u << rd;
         return;
@@ -2121,14 +2246,14 @@ static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
     case 0x5:
     case 0xd:
     case 0x7:
-    case 0xf: /* 数据处理（SIMD 的也可能写通用寄存器，如 UMOV） */
+    case 0xf: /* data processing (SIMD ones may also write general registers, e.g. UMOV) */
         break;
     case 0x4:
     case 0x6:
     case 0xc:
     case 0xe: {
         struct memop m;
-        if (is_atomic(insn)) { /* Rt、Rs，成对的再加一个 */
+        if (is_atomic(insn)) { /* Rt, Rs, plus one more for pairs */
             unsigned rs = FIELD(insn, 20, 16);
             kill |= 3u << rd | 3u << rs;
             break;
@@ -2148,7 +2273,8 @@ static void konst_update(struct xlate *x, uint32_t insn, uint64_t pc)
         break;
     }
     default:
-        /* 条件分支、CBZ、TBZ、HINT、屏障不写寄存器；其余（MRS、BL 等）拿不准 */
+        /* Conditional branches, CBZ, TBZ, HINT and barriers write no registers; the rest (MRS,
+         * BL and so on) are uncertain */
         if ((insn & 0xff000010) == 0x54000000 || (insn & 0x7e000000) == 0x34000000 ||
             (insn & 0x7e000000) == 0x36000000 || (insn & 0xfffff01f) == 0xd503201f ||
             (insn & 0xfffff01f) == 0xd503301f)
@@ -2186,7 +2312,7 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
         struct operands o;
         if (!dp_operands(insn, &o) || !emit_operands(x, insn, &o))
             return fallback(x, pc);
-        if (o.writes_rd && o.sp[0] && (insn & 31) == 31) { /* 写了 SP */
+        if (o.writes_rd && o.sp[0] && (insn & 31) == 31) { /* wrote SP */
             uint32_t op = insn & 0xff800000;
             if ((op == 0x91000000 || op == 0xd1000000) && FIELD(insn, 9, 5) == 31)
                 sp_moved(x, (int64_t)FIELD(insn, 21, 10) << (BIT(insn, 22) ? 12 : 0));
@@ -2215,7 +2341,7 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
                 emit(x, enc_ldr_x(T2, CTX, off));
                 x->t2_group = i;
             } else if (x->t2_group != i) {
-                abort(); /* plan_group 保证没标 reload 的组员之前没有指令用过 T2 */
+                abort(); /* plan_group ensures nothing used T2 before a member not marked reload */
             }
             emit_member(x, &m, g->off[g->next++]);
             x->st->insns_grouped++;
@@ -2232,16 +2358,17 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
     }
 }
 
-/* ---- 翻译表与代码缓存 ---- */
+/* ---- Translation table and code cache ---- */
 
-/* 把条件分支直接指向目标块；超出它的偏移范围时不改（仍然经由桩跳转），返回 false。
- * 不同步指令缓存 */
+/* Point a conditional branch directly at the target block; if that is out of its offset range,
+ * leave it unchanged (it still goes through the stub) and return false.
+ * Does not sync the instruction cache */
 static bool relink_word(const struct appine_dbt *d, uint32_t *site, const uint32_t *target)
 {
-    /* 读执行用的地址：在可写别名上读缺页时，宿主会顺带映射附近的十几页（fault-around），
-     * 它们没有记在 struct written 里 */
+    /* Read through the execution address: a read fault on the writable alias makes the host also
+     * map a dozen or so nearby pages (fault-around), which are not recorded in struct written */
     uint32_t insn = *site;
-    bool test = (insn & 0x7e000000) == 0x36000000; /* TBZ/TBNZ：14 位偏移，其余 19 位 */
+    bool test = (insn & 0x7e000000) == 0x36000000; /* TBZ/TBNZ: 14-bit offset, others 19 bits */
     intptr_t off = target - site, limit = (intptr_t)1 << (test ? 13 : 18);
     if (off < -limit || off >= limit)
         return false;
@@ -2251,9 +2378,11 @@ static bool relink_word(const struct appine_dbt *d, uint32_t *site, const uint32
 }
 
 /*
- * 实例和它的几张表都用 mmap 分配，保证是按需提交的清零页：每个地址空间一个实例、每个
- * 线程一份跳转缓存，表按最大的规模分配，大部分页从来不碰。calloc 不一定这样（glibc 释放过同样大的块
- * 之后会调高 mmap 的阈值，改从堆里分配并逐字节清零）。
+ * The instance and its tables are allocated with mmap, which guarantees zeroed pages committed on
+ * demand: one instance per address space, one jump cache per thread, and the tables are allocated
+ * at their largest size, with most pages never touched. calloc does not necessarily do this (glibc
+ * raises the mmap threshold after a block of the same size has been freed, and then allocates from
+ * the heap and zeroes byte by byte).
  */
 static void *zalloc(size_t bytes)
 {
@@ -2261,7 +2390,7 @@ static void *zalloc(size_t bytes)
     return p == MAP_FAILED ? NULL : p;
 }
 
-/* zalloc 得到的内存从头起 `bytes` 字节交还宿主，之后读到的是 0 */
+/* Return the first `bytes` bytes of memory from zalloc to the host; later reads see 0 */
 static void release_pages(void *p, size_t bytes)
 {
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
@@ -2277,7 +2406,8 @@ static void zfree(void *p, size_t bytes)
 
 #define TABLE_BYTES(bits) (sizeof(struct table) + (sizeof(struct slot) << (bits)))
 
-/* 键的下标：带标签的键按它的 pc 散列，和同一个 pc 的共用块在同一串里（TAG_SHIFT） */
+/* Index of a key: a tagged key is hashed by its pc, in the same probe sequence as the shared block
+ * of the same pc (TAG_SHIFT) */
 static size_t table_index(const struct table *t, uint64_t key)
 {
     return (size_t)((((key & PC_MASK) >> 2) * GOLDEN) >> t->shift);
@@ -2288,7 +2418,7 @@ static size_t table_mask(const struct table *t)
     return (size_t)t->mask;
 }
 
-/* 分配一张 2^bits 项的空表 */
+/* Allocate an empty table of 2^bits entries */
 static struct table *table_new(unsigned bits)
 {
     struct table *t = zalloc(TABLE_BYTES(bits));
@@ -2301,10 +2431,12 @@ static struct table *table_new(unsigned bits)
 }
 
 /*
- * 在 t 里找标签为 `tag` 的成员（不在组里的是 0）在 pc 处执行的块：共用的或者它私有的
- * （TAG_SHIFT），`*found` 是找到的块的标签；两种都有时（登记范围长大之前翻译的私有块）哪个
- * 都对。持有锁时直接调用；不持锁时经由 table_lookup。未对齐、超出 48 位的 pc 没有块（Tier 0
- * 报告错误），也不能拿去和墓碑的 JC_EMPTY、别的成员的键比
+ * Find in t the block executed at pc by the member with tag `tag` (0 when not in a group): a
+ * shared one or one private to it (TAG_SHIFT), with `*found` set to the found block's tag; when
+ * both exist (private blocks translated before the registered range grew), either is correct.
+ * Called directly while holding the lock; without the lock, through table_lookup. Misaligned pcs
+ * and pcs beyond 48 bits have no blocks (Tier 0 reports the fault), and must not be compared with
+ * the tombstones' JC_EMPTY or other members' keys either
  */
 static uint32_t *table_find_for(const struct table *t, uint64_t pc, unsigned tag, unsigned *found)
 {
@@ -2313,7 +2445,8 @@ static uint32_t *table_find_for(const struct table *t, uint64_t pc, unsigned tag
         return NULL;
     uint64_t mine = tagged(pc, tag);
     for (size_t i = table_index(t, pc);; i = (i + 1) & table_mask(t)) {
-        /* 插入时先写键再写 code：读到 code 不为空，键就是对应的那个 */
+        /* Insertion writes the key before code: once code reads non-NULL, the key is the matching
+         * one */
         uint32_t *code = __atomic_load_n(&t->slots[i].code, __ATOMIC_ACQUIRE);
         if (!code)
             return NULL;
@@ -2326,8 +2459,8 @@ static uint32_t *table_find_for(const struct table *t, uint64_t pc, unsigned tag
 }
 
 /*
- * 分发器和查表例程（emit_lookup）不持锁查表：cpu 的 dbt_lookup_seq 为奇数期间，换下来的
- * 旧表不会被释放（table_publish）
+ * The dispatcher and the lookup routine (emit_lookup) look up the table without the lock: while
+ * the cpu's dbt_lookup_seq is odd, a replaced old table is not freed (table_publish)
  */
 static uint32_t *table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64_t pc, unsigned *found)
 {
@@ -2337,12 +2470,14 @@ static uint32_t *table_lookup(struct appine_dbt *d, struct appine_cpu *c, uint64
     return code;
 }
 
-/* 换上新表，等正在查旧表的线程查完再释放旧表。持有锁 */
+/* Install the new table, and free the old one once the threads looking it up have finished. Lock
+ * held */
 static void table_publish(struct appine_dbt *d, struct table *table)
 {
     struct table *old = d->table;
     __atomic_store_n(&d->table, table, __ATOMIC_SEQ_CST);
-    /* 不在 dbt_run 里的线程不会查表；之后进来的先登记 cpu、再读 table，读到的是新表 */
+    /* Threads not in dbt_run do not look up the table; those entering later register their cpu
+     * before reading table, so they read the new table */
     for (struct appine_dbt_thread *t = d->threads; t; t = t->next) {
         struct appine_cpu *c = __atomic_load_n(&t->cpu, __ATOMIC_SEQ_CST);
         if (!c)
@@ -2355,9 +2490,11 @@ static void table_publish(struct appine_dbt *d, struct table *table)
 }
 
 /*
- * 刚建好、还没同步指令缓存的块（起始 pc 为 `pc`，私有的块是成员 `tag` 的）：目标已经翻译过的
- * 出口直接链接，和分发器里第一次走到时的链接（dbt_run 的 R_CHAIN）一样。共用的块只链接到
- * 共用的块（TAG_SHIFT）。改动随整个块一起同步。持有锁
+ * A block just built whose instruction cache is not synced yet (start pc `pc`; a private block
+ * belongs to member `tag`): exits whose target is already translated are linked directly, the
+ * same as the linking the dispatcher does the first time an exit is taken (R_CHAIN in dbt_run).
+ * Shared blocks only link to shared blocks (TAG_SHIFT). The changes are synced together with the
+ * whole block. Lock held
  */
 static void link_block(const struct appine_dbt *d, uint32_t *code, uint64_t pc, unsigned tag,
                        const struct link *links, unsigned n)
@@ -2382,11 +2519,13 @@ static unsigned page_bucket(uint64_t page)
     return (unsigned)((page * UINT64_C(0x9e3779b97f4a7c15)) >> (64 - PAGE_BUCKET_BITS));
 }
 
-/* table_used 里的特殊值：这个块已经作废，重建表时没有放进去 */
+/* Special value in table_used: this block is invalidated and was not put in when the table was
+ * rebuilt */
 #define SLOT_NONE UINT32_MAX
 
-/* 把有效的块按原来的插入顺序放进一个 2^bits 项的新表，作废的块（墓碑）不再放进去，
- * table_used 和 blocks 的下标保持对应；分配失败时返回 false，原来的表不变。持有锁 */
+/* Put the live blocks into a new table of 2^bits entries in their original insertion order,
+ * leaving out invalidated blocks (tombstones), with table_used and blocks keeping matching
+ * indices; returns false if allocation fails, leaving the original table unchanged. Lock held */
 static void table_rebuild(struct appine_dbt *d, struct table *table);
 
 static bool table_resize(struct appine_dbt *d, unsigned bits)
@@ -2398,7 +2537,7 @@ static bool table_resize(struct appine_dbt *d, unsigned bits)
     return true;
 }
 
-/* 按 blocks 填好新分配的 table 并换上（table_resize） */
+/* Fill the newly allocated table from blocks and install it (table_resize) */
 static void table_rebuild(struct appine_dbt *d, struct table *table)
 {
     size_t occupied = 0;
@@ -2420,7 +2559,8 @@ static void table_rebuild(struct appine_dbt *d, struct table *table)
     table_publish(d, table);
 }
 
-/* pc 不在表里时才插入（私有的块是成员 `tag` 的），只用空位（见 struct table）。持有锁 */
+/* Insert only when pc is not in the table (a private block belongs to member `tag`), using only
+ * empty slots (see struct table). Lock held */
 static void table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32_t *code,
                          const uint32_t *guest, uint32_t nguest)
 {
@@ -2441,8 +2581,9 @@ static void table_insert(struct appine_dbt *d, uint64_t pc, unsigned tag, uint32
 }
 
 /*
- * 从翻译表里删掉键为 `key` 的块，留一个永远不会命中的墓碑。各线程跳转缓存里的旧项不用删：
- * 它们指向作废块的入口，那里跳往转发桩。持有锁
+ * Remove the block with key `key` from the translation table, leaving a tombstone that never
+ * hits. Old entries in the threads' jump caches need not be removed: they point to the
+ * invalidated block's entry, which jumps to the forwarding stub. Lock held
  */
 static void table_remove(struct appine_dbt *d, uint64_t key)
 {
@@ -2457,9 +2598,10 @@ static void table_remove(struct appine_dbt *d, uint64_t key)
 }
 
 /*
- * 跳转缓存第 i 项是空项时的 pc：未对齐，而且按它算出的下标不是 i，所以 guest 跳到哪里都不会
- * 命中空项（翻译后的代码命中就直接跳往 code，空项的是 NULL）。都用同一个未对齐的值的话，跳到
- * 这个地址时就命中它的下标那一项
+ * The pc of jump-cache entry i when it is empty: misaligned, and the index computed from it is
+ * not i, so wherever the guest jumps it never hits an empty entry (translated code jumps straight
+ * to code on a hit, and an empty entry's code is NULL). If they all used the same misaligned
+ * value, a jump to that address would hit the entry at its index
  */
 static uint64_t jc_empty(unsigned i)
 {
@@ -2473,16 +2615,18 @@ static void clear_jump_cache(struct appine_dbt_thread *t)
     t->jc_dirty = false;
 }
 
-/* 影子返回栈全部换成空项：落点所在的代码就要被覆盖了 */
+/* Replace the whole shadow return stack with empty entries: the code holding the landing pads is
+ * about to be overwritten */
 static void rs_reset(struct appine_dbt_thread *t)
 {
     for (unsigned i = 0; i < RS_ENTRIES; i++) {
-        t->rs[i][0] = 1; /* 未对齐，不会是 RET 的目标；万一匹配，rs_miss 也照样查找 */
+        t->rs[i][0] = 1; /* misaligned, never a RET target; if matched, rs_miss still looks up */
         t->rs[i][1] = (uint64_t)(uintptr_t)t->d->rs_miss;
     }
 }
 
-/* 代码缓存整体清空过（generation 变了）：线程自己的跳转缓存和影子返回栈指向旧代码 */
+/* The code cache has been fully flushed (generation changed): the thread's own jump cache and
+ * shadow return stack point to old code */
 static void thread_catch_up(struct appine_dbt_thread *t)
 {
     uint64_t g = __atomic_load_n(&t->d->generation, __ATOMIC_ACQUIRE);
@@ -2495,9 +2639,11 @@ static void thread_catch_up(struct appine_dbt_thread *t)
 }
 
 /*
- * blocks 记满了，但大半是作废的块（JIT 反复改写、重新翻译同一处代码）：去掉它们的记录，
- * 再原样重建翻译表去掉墓碑，不必整体清空。作废块的代码还留在代码缓存里，它们的入口仍然
- * 跳往转发桩。持有锁；分配新表失败时返回 false
+ * blocks is full, but mostly with invalidated blocks (a JIT repeatedly rewriting and
+ * retranslating the same code): remove their records, then rebuild the translation table at the
+ * same size to remove the tombstones, with no full flush needed. The invalidated blocks' code stays
+ * in the code cache, and their entries still jump to the forwarding stubs. Lock held; returns
+ * false if allocating the new table fails
  */
 static bool compact_blocks(struct appine_dbt *d)
 {
@@ -2526,8 +2672,9 @@ static bool compact_blocks(struct appine_dbt *d)
 }
 
 /*
- * 丢弃全部翻译。持有锁，并且没有别的线程在翻译后的代码里或者不持锁地查表：它们都停在
- * 分发器里，或者不在 dbt_run 里（flush_world）。
+ * Discard all translations. Lock held, and no other thread is in translated code or looking up
+ * the table without the lock: they have all stopped in the dispatcher, or are not in dbt_run
+ * (flush_world).
  */
 static void flush_locked(struct appine_dbt *d)
 {
@@ -2551,14 +2698,18 @@ static void flush_locked(struct appine_dbt *d)
 }
 
 /*
- * 让作废的块不再被执行：入口（kick 检查之前和之后两处）改成跳往一个转发桩。转发桩
- * 以 R_CHAIN 退出，回填位置就是旧入口，所以重新翻译之后旧入口直接跳往新的块，
- * 别的块链接到旧入口的跳转不用找出来改写。别的线程可能正在执行这个块：它照样执行到
- * 块尾，和硬件上别的核在上下文同步之前还可能执行旧指令一样。
+ * Keep invalidated blocks from being executed: the entry (two places, before and after the kick
+ * check) is changed to jump to a forwarding stub. The forwarding stub exits with R_CHAIN and the
+ * old entry as the patch site, so after retranslation the old entry jumps directly to the new
+ * block, and branches of other blocks linked to the old entry need not be found and rewritten.
+ * Another thread may be executing this block: it still runs to the end of the block, just as on
+ * hardware another core may still execute old instructions before a context synchronization.
  *
- * 转发桩要先同步好，入口才能跳过去；每次同步都要等指令缓存的作废广播完成，所以一批块
- * 一起做：retire_add 写好转发桩，retire_flush 同步所有转发桩、改所有入口、再同步一次。
- * 持有锁
+ * The forwarding stubs must be synced before the entries can jump to them, and every sync waits
+ * for the instruction cache's invalidation broadcast to complete, so blocks are done in batches:
+ * retire_add writes the forwarding stub, and retire_flush syncs all forwarding stubs, changes all
+ * entries, then syncs once more.
+ * Lock held
  */
 #define RETIRE_BATCH 32
 
@@ -2605,7 +2756,7 @@ static void retire_flush(struct appine_dbt *d, struct retire_batch *r)
     r->n = 0;
 }
 
-/* 作废停放着的块：它的入口本来就跳往转发桩 */
+/* Invalidate a parked block: its entry already jumps to the forwarding stub */
 static void kill_parked(struct appine_dbt *d, struct block *b)
 {
     b->parked = 0;
@@ -2616,8 +2767,9 @@ static void kill_parked(struct appine_dbt *d, struct block *b)
     d->st->invalidated++;
 }
 
-/* 作废 b：先写好它的转发桩（每个占 16 个字），入口等 retire_flush 一起改。`park` 时只是
- * 停放（revive）。代码缓存放不下转发桩时返回 false */
+/* Invalidate b: write its forwarding stub first (16 words each), and leave the entry for
+ * retire_flush to change together with the others. With `park` it is only parked (revive).
+ * Returns false if the code cache has no room for the forwarding stub */
 static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct block *b, bool park)
 {
     if (r->n == RETIRE_BATCH)
@@ -2631,7 +2783,7 @@ static bool retire_add(struct appine_dbt *d, struct retire_batch *r, struct bloc
     emit(x, enc_movz(T2, R_CHAIN | (b->tag ? 0 : LINK_SHARED), 0));
     emit(x, enc_b((intptr_t)d->exit - (intptr_t)here(x)));
     while (x->n < 16)
-        emit(x, enc_b(4)); /* 补齐，转发桩按 16 个字排列 */
+        emit(x, enc_b(4)); /* padding: forwarding stubs are laid out every 16 words */
     d->used_words += x->n;
     if (!r->n)
         r->fwd_start = x->buf;
@@ -2644,13 +2796,17 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
                           const struct block *b, uint64_t *page, const uint32_t **host);
 
 /*
- * 作废 [start, start + len) 覆盖的各页里开始的块；放不下转发桩或者范围太大时改为请求
- * 整体清空，由下一次进入分发器的线程完成。给了 `mmu` 时只作废 guest 指令字和现在不同的块
- * （翻译只取决于 pc 和指令字，字面量也是运行时才读）：JIT 改写一处代码只 ic ivau 一两行，
- * 而 ic ivau 是按页记下的，同一页里别的方法的块照样能用。HotSpot 不停地改写内联缓存和
- * 方法入口，原来每次都把整页的块作废、重新翻译，Maven 每次构建要作废 31 万个块。拆掉映射、
- * 去掉执行权限之后这一页找不到可执行的映射，照样全部作废。停放着的块不用管，恢复时本来
- * 就要核对。持有锁
+ * Invalidate the blocks that start in the pages covered by [start, start + len); if a forwarding
+ * stub does not fit or the range is too large, request a full flush instead, done by the next
+ * thread to enter the dispatcher. With `mmu`, only blocks whose guest instruction words differ
+ * from the current ones are invalidated (a translation depends only on the pc and the instruction
+ * words; literals are also read only at run time): a JIT rewriting one piece of code issues
+ * ic ivau for only a line or two, while ic ivau is recorded per page, so blocks of other methods
+ * in the same page remain usable. HotSpot keeps rewriting inline caches and method entries, and
+ * previously the whole page's blocks were invalidated and retranslated each time, 310,000 blocks
+ * per Maven build. After an unmap or the removal of exec permission the page has no executable
+ * mapping, and all its blocks are invalidated as before. Parked blocks are left alone: they are
+ * checked anyway when revived. Lock held
  */
 static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu, uint64_t start,
                               uint64_t len)
@@ -2660,10 +2816,11 @@ static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu
     uint64_t end = start + len - 1, first = start >> APPINE_PAGE_SHIFT, last = end >> APPINE_PAGE_SHIFT;
     if (end < start)
         last = UINT64_MAX >> APPINE_PAGE_SHIFT;
-    /* 范围很大（拆掉一个库）：逐个看所有的块，比整体清空便宜，别的线程也不必重新翻译。
-     * 块不跨页，按页比较 */
+    /* A very large range (unmapping a library): look at every block in turn, which is cheaper
+     * than a full flush, and other threads need not retranslate either. Blocks do not cross pages,
+     * so compare page by page */
     struct retire_batch r = {.n = 0};
-    uint64_t seen = 1; /* 未对齐，不会与任何页相同 */
+    uint64_t seen = 1; /* misaligned, never equal to any page */
     const uint32_t *host = NULL;
     if (end < start || last - first >= INVALIDATE_MAX_PAGES) {
         for (size_t i = 0; i < d->table_count; i++) {
@@ -2706,9 +2863,11 @@ full:
 }
 
 /*
- * 组长 `pc` 没通过共用的检查。第一次只记下来：栈还没长到那里这类情况，Tier 0 执行
- * 组员时就会解决。第二次记进 nogroup，作废包含它的块（块不跨页，都在它那一页的桶里），
- * 重新翻译时不再分组。持有锁
+ * Leader `pc` failed the shared check. The first time it is only recorded: cases such as the
+ * stack not having grown that far yet are resolved once Tier 0 executes the members. The second
+ * time it goes into nogroup and the blocks containing it are invalidated (blocks do not cross
+ * pages, so they are all in its page's bucket), and on retranslation it is no longer grouped.
+ * Lock held
  */
 static void ungroup(struct appine_dbt *d, uint64_t pc)
 {
@@ -2736,46 +2895,55 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
     retire_flush(d, &r);
 }
 
-/* ---- 翻译模板：所有实例共享（engine 的 map） ---- */
+/* ---- Translation templates: shared by all instances (the engine map) ---- */
 
 /*
- * 一个块的翻译只取决于它的 guest pc 和翻译过的指令字（以及全局的特性集合、实例的
- * 寄存器分配），与进程、映射无关。每翻译一个块就把结果存成模板；别的实例（另一个线程、
- * fork 出来的子进程、又一次 exec 的同一个程序）要翻译同一个 pc 时，先比对模板记下的指令字和
- * 自己内存里的是否相同，相同就把模板拷进自己的代码缓存，只重新计算跳往例程的几条
- * b。块之间的链接在各自的拷贝里回填，所以不同进程在同一地址映射了不同的代码也
- * 互不影响。模板区写满时整体丢弃，因为实例只拷贝模板、从不引用它。
+ * A block's translation depends only on its guest pc and the instruction words it translated
+ * (plus the global feature set and the instance's register assignment), not on the process or
+ * the mappings. Every translated block is stored as a template; when another instance (another
+ * thread, a forked child, the same program exec'd again) translates the same pc, it first
+ * compares the instruction words recorded in the template with those in its own memory, and if
+ * they match it copies the template into its own code cache, recomputing only the few b
+ * instructions that jump to routines. Links between blocks are patched in each copy, so different
+ * processes mapping different code at the same address do not affect each other. When the
+ * template arena is full it is discarded entirely, since instances only copy templates and never
+ * reference them.
  *
- * 所有进程的所有线程都在用模板，一把锁时 go build 这样并发起编译进程的负载有一成时间
- * 花在锁上，所以按桶分片加锁；分配模板区另用一把只持有片刻的锁，整体丢弃时持有全部的
- * 锁（先分片、后分配，与存模板时的顺序相同）。
+ * All threads of all processes use the templates, and with a single lock, workloads such as go
+ * build that start compiler processes concurrently spent a tenth of their time on the lock, so
+ * locking is sharded by bucket; allocating from the template arena uses another lock held only
+ * briefly, and discarding everything holds all the locks (shards first, then allocation, the same
+ * order as when storing a template).
  */
 #define TEMPLATE_BYTES (UINT64_C(32) << 20)
 #define TEMPLATE_BUCKET_BITS 16
 #define TEMPLATE_SHARDS 64
-/* 同一个 pc 最多保留几个版本：JIT 反复改写同一处代码时只留最新的几个 */
+/* The most versions kept for one pc: when a JIT repeatedly rewrites the same code, only the newest
+ * few are kept */
 #define TEMPLATES_PER_PC 4
 
 struct template {
     struct template *next;
     uint64_t pc;
-    uint64_t key; /* 翻译时用到的分组记录（nogroup_key） */
+    uint64_t key; /* grouping records used during translation (nogroup_key) */
     const struct regs *r;
-    bool shared; /* 共用的块（链接桩带着 LINK_SHARED） */
+    bool shared; /* a shared block (its link stubs carry LINK_SHARED) */
     uint32_t nguest, nhost, nrelocs, nlinks;
-    uint32_t copied, remapped, memory, fallback, grouped; /* 统计，拷贝时累加 */
-    uint32_t words[]; /* guest 指令字、宿主指令字、重定位、链接（每个 4 个字，见 struct link） */
+    uint32_t copied, remapped, memory, fallback, grouped; /* statistics, added up when copied */
+    /* Guest instruction words, host instruction words, relocations, links (4 words each, see
+     * struct link) */
+    uint32_t words[];
 };
 
 static struct {
     struct {
         pthread_mutex_t lock;
-        char pad[64 - sizeof(pthread_mutex_t) % 64]; /* 各占一个缓存行 */
-    } shards[TEMPLATE_SHARDS]; /* 第 i 片管下标模 TEMPLATE_SHARDS 等于 i 的桶 */
+        char pad[64 - sizeof(pthread_mutex_t) % 64]; /* one cache line each */
+    } shards[TEMPLATE_SHARDS]; /* shard i covers buckets whose index mod TEMPLATE_SHARDS is i */
     pthread_mutex_t arena_lock;
-    uint8_t *arena; /* 第一次使用时映射，写满时清空 */
+    uint8_t *arena; /* mapped on first use, cleared when full */
     size_t used;
-    bool full; /* 写满了，等存模板的线程放开分片锁之后清空 */
+    bool full; /* full: cleared after the threads storing templates release their shard locks */
     struct template *buckets[1u << TEMPLATE_BUCKET_BITS];
 } templates = {
     .shards = {[0 ... TEMPLATE_SHARDS - 1] = {.lock = PTHREAD_MUTEX_INITIALIZER}},
@@ -2792,7 +2960,7 @@ static struct template **template_bucket(uint64_t pc)
     return &templates.buckets[template_index(pc)];
 }
 
-/* pc 所在的桶的锁，同时向 guard 登记 */
+/* The lock of pc's bucket, also registered with the guard */
 static pthread_mutex_t *template_lock(uint64_t pc)
 {
     pthread_mutex_t *lock = &templates.shards[template_index(pc) % TEMPLATE_SHARDS].lock;
@@ -2808,8 +2976,9 @@ static void template_unlock(pthread_mutex_t *lock)
 }
 
 /*
- * 从 pc 开始的块翻译时会用到的分组记录（ungroup 记下的、影响到这一页里 pc 之后的
- * 组长）：实例记下的不同，翻译出来的块也可能不同，翻译模板按它区分版本。没有时为 0。
+ * The grouping records that translating the block starting at pc uses (those recorded by ungroup
+ * that affect leaders after pc in this page): if the instance's records differ, the translated
+ * block may differ too, so translation templates are versioned by it. 0 if there are none.
  */
 static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
 {
@@ -2823,7 +2992,7 @@ static uint64_t nogroup_key(const struct appine_dbt *d, uint64_t pc)
     return key;
 }
 
-/* 调用方持有 pc 所在的分片的锁 */
+/* The caller holds the lock of pc's shard */
 static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
                                       bool shared)
 {
@@ -2836,15 +3005,17 @@ static struct template *template_find(uint64_t pc, const uint32_t *guest, uint64
 }
 
 /*
- * 准备好、还没装进代码缓存的块（prepare 不持锁翻译，install 持锁装进去）：生成的宿主指令
- * 在线程的暂存区里，跳往例程的 b 的位置记在 relocs，出口记在 links。
+ * A block that is prepared but not yet installed in the code cache (prepare translates without
+ * the lock, install puts it in with the lock held): the generated host instructions are in the
+ * thread's scratch area, the positions of the b instructions to routines are in relocs, and the
+ * exits are in links.
  */
 struct prep {
     uint64_t pc;
-    unsigned tag; /* 私有的块：所属成员的标签（TAG_SHIFT） */
-    const uint32_t *guest; /* guest 指令字在宿主内存里的位置：装进去之前再比对一次 */
+    unsigned tag; /* private block: tag of the member it belongs to (TAG_SHIFT) */
+    const uint32_t *guest; /* host location of the guest words: compared again before installing */
     uint32_t nguest;
-    uint32_t words[MAX_BLOCK_INSNS]; /* 翻译时读到的 guest 指令字 */
+    uint32_t words[MAX_BLOCK_INSNS]; /* guest instruction words read at translation */
     const uint32_t *host;
     uint32_t nhost;
     uint32_t relocs[MAX_RELOCS];
@@ -2853,7 +3024,8 @@ struct prep {
     unsigned nlinks;
 };
 
-/* 有和 `guest`（翻译时读到的指令字）相同的模板时，拷进线程的暂存区记在 p 里 */
+/* If there is a template matching `guest` (the instruction words read at translation), copy it
+ * into the thread's scratch area and record it in p */
 static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, const struct regs *r,
                            bool shared, struct prep *p, uint32_t *scratch, struct appine_dbt_stats *st)
 {
@@ -2883,7 +3055,8 @@ static bool template_fetch(uint64_t pc, const uint32_t *guest, uint64_t key, con
     return t != NULL;
 }
 
-/* 从模板区分配 `bytes` 字节；写满时返回 NULL，并标记等着清空。调用方持有某个分片的锁 */
+/* Allocate `bytes` bytes from the template arena; when full, return NULL and mark it to be
+ * cleared. The caller holds one of the shard locks */
 static void *template_alloc(size_t bytes)
 {
     void *p = NULL;
@@ -2902,8 +3075,9 @@ static void *template_alloc(size_t bytes)
     return p;
 }
 
-/* 丢弃所有翻译模板：模板区写满了（`if_full`，别的线程已经清空过时不再清空），或者宿主
- * 出了故障（坏掉的可能是模板本身） */
+/* Discard all translation templates: the template arena is full (`if_full`; not cleared again if
+ * another thread already cleared it), or a host fault occurred (the templates themselves may be
+ * what is broken) */
 static void template_clear(bool if_full)
 {
     for (unsigned i = 0; i < TEMPLATE_SHARDS; i++)
@@ -2919,7 +3093,7 @@ static void template_clear(bool if_full)
         pthread_mutex_unlock(&templates.shards[i].lock);
 }
 
-/* 把刚翻译好、还没有回填过链接的块存成模板 */
+/* Store a just-translated block whose links have not been patched yet as a template */
 static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, uint64_t key,
                            const struct xlate *x, const struct appine_dbt_stats *before,
                            const struct link *links, unsigned nlinks)
@@ -2958,8 +3132,9 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
         struct template **b = template_bucket(pc);
         t->next = *b;
         *b = t;
-        /* 新的在前面：同一个 pc 超出上限的旧版本（不分寄存器分配）从链上摘掉（空间等模板区
-         * 清空时回收） */
+        /* Newest first: old versions of the same pc beyond the limit (regardless of register
+         * assignment) are unlinked from the chain (their space is reclaimed when the template
+         * arena is cleared) */
         unsigned versions = 0;
         for (struct template **p = &t->next; *p;) {
             if ((*p)->pc == pc && ++versions >= TEMPLATES_PER_PC)
@@ -2974,9 +3149,9 @@ static void template_store(uint64_t pc, const uint32_t *guest, uint32_t nguest, 
 }
 
 /*
- * 剖析用：环境变量 APPINE_PERF_MAP 存在时，把每个块在代码缓存里的位置写进
- * /tmp/perf-<pid>.map，perf report 据此把样本记到 guest pc 上（g_<pc>）。没有这个
- * 变量时只多一次判断。
+ * For profiling: when the environment variable APPINE_PERF_MAP is set, write each block's
+ * location in the code cache to /tmp/perf-<pid>.map, which perf report uses to attribute samples
+ * to guest pcs (g_<pc>). Without the variable it costs only one extra check.
  */
 static void perf_map(const void *code, size_t bytes, uint64_t pc)
 {
@@ -3003,12 +3178,14 @@ static void perf_map(const void *code, size_t bytes, uint64_t pc)
     pthread_mutex_unlock(&lock);
 }
 
-/* install 的返回值：代码缓存或者翻译表满了，要先整体清空（flush_world）；翻译之后 guest
- * 代码被改写过，要重新翻译 */
+/* Return values of install: the code cache or the translation table is full and a full flush
+ * (flush_world) is needed first; the guest code was rewritten after translation and must be
+ * retranslated */
 #define NEED_FLUSH ((uint32_t *)(uintptr_t)1)
 #define STALE ((uint32_t *)(uintptr_t)2)
 
-/* install 建好、还没放进翻译表的块：同步了指令缓存之后才能放进去，别的线程不持锁查表 */
+/* A block built by install but not yet put in the translation table: it can only be put in after
+ * the instruction cache is synced, since other threads look up the table without the lock */
 struct fresh {
     uint64_t pc;
     unsigned tag;
@@ -3018,15 +3195,18 @@ struct fresh {
 };
 
 /*
- * 不持锁：把 pc 开始的块翻译进线程的暂存区（或者拷贝模板），结果记在 t->prep。翻译耗时
- * 最长，持锁翻译时 JVM 的主线程常常要等编译线程。guest 指令字先拷一份再翻译，装进去之前
- * 拿它和内存里的比对（install）。取不到指令时返回 false。
+ * Without the lock: translate the block starting at pc into the thread's scratch area (or copy a
+ * template), recording the result in t->prep. Translation takes the longest, and when translating
+ * under the lock the JVM's main thread often had to wait for the compiler threads. The guest
+ * instruction words are copied first and then translated, and the copy is compared with memory
+ * before installing (install). Returns false if the instructions cannot be fetched.
  */
 static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t pc)
 {
     struct appine_dbt *d = t->d;
     struct prep *p = t->prep;
-    /* 块不跨页（遇到页边界就结束），整页的权限相同 */
+    /* A block does not cross a page (it ends at a page boundary), and the whole page has the same
+     * permissions */
     const uint32_t *page = NULL;
     if (!(pc & 3))
         page = appine_mmu_translate(c->mmu, pc & ~PAGE_MASK, APPINE_PROT_EXEC);
@@ -3036,13 +3216,15 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     if (limit > MAX_BLOCK_INSNS)
         limit = MAX_BLOCK_INSNS;
     p->pc = pc;
-    /* 组里的成员在登记过的映射以外翻译的块只对它自己有效（TAG_SHIFT） */
+    /* Blocks a group member translates outside the registered mappings are valid only for that
+     * member (TAG_SHIFT) */
     p->tag = t->tag && !in_shared(d, pc) ? t->tag : 0;
     p->guest = page + (pc & PAGE_MASK) / 4;
     memcpy(p->words, p->guest, limit * 4);
     p->nlinks = 0;
     const uint32_t *guest = p->words;
-    /* 不持锁读分组记录：读到旧的只影响分组，检查没通过时会再撤销（ungroup） */
+    /* Read the grouping records without the lock: reading stale ones only affects grouping, which
+     * is undone again when a check fails (ungroup) */
     uint64_t key = d->nogroup_count ? nogroup_key(d, pc) : 0;
     t->stats.blocks++;
     if (template_fetch(pc, guest, key, d->r, !p->tag, p, t->scratch, &t->stats))
@@ -3070,10 +3252,10 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
         x->groups[i].n = x->groups[i].next = 0;
     x->t2_group = -1;
 
-    /* 块入口检查 kick，保证链接起来的循环也能被打断 */
+    /* Check for a kick at the block entry, so that linked loops can be kicked too */
     emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, pending)));
     emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_KICK, pc);
-    _Static_assert(ENTRY_CHECK_WORDS == 2, "块入口检查的长度");
+    _Static_assert(ENTRY_CHECK_WORDS == 2, "the length of the block entry check");
 
     uint32_t nguest = 0;
     for (;; nguest++) {
@@ -3090,7 +3272,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
         }
     }
 
-    /* 上界估计错误属于引擎 bug：在写出界之前就停下 */
+    /* A wrong upper-bound estimate is an engine bug: stop before writing out of bounds */
     if (x->nstubs > MAX_STUBS || x->nfixups > MAX_FIXUPS ||
         x->n + (size_t)x->nstubs * MAX_STUB_WORDS > MAX_BLOCK_WORDS)
         abort();
@@ -3136,16 +3318,20 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
 }
 
 /*
- * 持锁：把准备好的块（prepare）装进代码缓存，链接已经翻译过的出口。新代码的范围记进
- * `sync`，块记进 `f`，由调用方同步指令缓存之后放进翻译表（table_insert）。
+ * With the lock held: install a prepared block (prepare) in the code cache and link the exits
+ * that are already translated. The new code's range is recorded in `sync` and the block in `f`,
+ * and the caller puts it in the translation table (table_insert) after syncing the instruction
+ * cache.
  */
 static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct syncs *sync, struct fresh *f)
 {
-    /* 翻译期间别的线程改写了这段代码（它作废时这个块还不在表里）：重新翻译 */
+    /* Another thread rewrote this code during translation (this block was not in the table yet
+     * when it invalidated): retranslate */
     if (memcmp(p->guest, p->words, p->nguest * 4) != 0)
         return STALE;
-    /* 表里有四分之三不空时，墓碑占一半以上就原样重建，否则加倍；blocks 记满时去掉作废块
-     * 的记录，作废的不多就整体清空 */
+    /* When three quarters of the table are non-empty, rebuild it at the same size if tombstones
+     * are at least half, otherwise double it; when blocks is full, remove the invalidated blocks'
+     * records, or do a full flush if few are invalidated */
     if (d->table_count == TABLE_LIMIT &&
         (d->blocks_dead * 8 < d->table_count || !compact_blocks(d)))
         return NEED_FLUSH;
@@ -3172,7 +3358,8 @@ static uint32_t *install(struct appine_dbt *d, const struct prep *p, struct sync
     return code;
 }
 
-/* 回填例程失败时跳往的位置，最后统一回填：三次填表各 MMU_LEVELS 处，另有三处 */
+/* Branches to the refill routine's failure path, all patched at the end: MMU_LEVELS for each of
+ * the three fills, plus three more */
 struct refill_fails {
     uint32_t *site[3 * MMU_LEVELS + 3];
     unsigned n;
@@ -3185,17 +3372,19 @@ static void emit_to_fail(struct xlate *x, struct refill_fails *f, uint32_t insn)
 }
 
 /*
- * 按 mmu.c 的结构遍历页表，把地址 `a`（T0 或 x3）所在的页填进 TLB：读写两半的 tag
- * 按叶子表项的权限分别填写，和 Tier 0 的 appine_tlb_fill 一样同时记下 tlb_used。
- * 未映射或没有这次访问要的权限时跳往失败。结束时 x2 = addend；用掉 x0、x1、x4、T2，
- * 保留 x3、T0、T1。
+ * Walk the page table with mmu.c's structure and fill the page containing address `a` (T0 or x3)
+ * into the TLB: the tags of the read and write halves are filled separately according to the leaf
+ * entry's permissions, and tlb_used is recorded at the same time, as in Tier 0's appine_tlb_fill.
+ * Jumps to failure if unmapped or lacking the permission this access needs. Afterwards
+ * x2 = addend; uses up x0, x1, x4 and T2, and preserves x3, T0 and T1.
  */
 static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fails *f)
 {
     size_t used = offsetof(struct appine_cpu, tlb_used);
     emit(x, enc_ldr_x(0, CTX, offsetof(struct appine_cpu, mmu)));
     emit(x, enc_ldr_x(0, 0, offsetof(struct appine_mmu, root)));
-    /* 中间表项是下一级表的地址；按地址依赖读取，和 mmu.c 的 acquire 读取一样有序 */
+    /* An intermediate entry is the address of the next level's table; loads through the address
+     * dependency are ordered just like mmu.c's acquire loads */
     for (unsigned level = 0; level < MMU_LEVELS; level++) {
         emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + MMU_LEVEL_BITS * (MMU_LEVELS - 1 - level),
                          MMU_LEVEL_BITS));
@@ -3203,23 +3392,24 @@ static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fai
         if (level < MMU_LEVELS - 1)
             emit_to_fail(x, f, enc_cbz_x(0));
     }
-    /* 叶子表项 = 宿主页地址 | 权限位；未映射的是 0，权限检查一并排除 */
+    /* Leaf entry = host page address | permission bits; an unmapped one is 0, which the permission
+     * check rules out as well */
     emit_to_fail(x, f, enc_tbz(0, write ? 1 : 0));
-    _Static_assert(APPINE_PROT_READ == 1 && APPINE_PROT_WRITE == 2, "权限位的位置");
+    _Static_assert(APPINE_PROT_READ == 1 && APPINE_PROT_WRITE == 2, "the positions of the permission bits");
     emit(x, enc_and_clear_low(1, a, APPINE_PAGE_SHIFT));
     emit(x, enc_and_clear_low(2, 0, APPINE_PAGE_SHIFT));
     emit(x, enc_sub_reg(2, 2, 1)); /* addend */
-    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT)); /* 页号 */
+    emit(x, enc_ubfx(4, a, APPINE_PAGE_SHIFT, 64 - APPINE_PAGE_SHIFT)); /* page number */
     emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT, TLB_BITS));
     emit(x, enc_add_lsl(1, CTX, 1, 5));
     for (unsigned half = 0; half < 2; half++) {
-        /* 有权限时 tag = (0 - 1) & ~页号，否则 0 & ~页号 = TLB_INVALID */
+        /* tag = (0 - 1) & ~page number with the permission, else 0 & ~page number = TLB_INVALID */
         emit(x, enc_ubfx(T2, 0, half, 1));
         emit(x, enc_sub_reg(T2, 31, T2));
         emit(x, enc_bic_reg(T2, T2, 4));
         emit(x, enc_stp_x(T2, 2, 1, (int)(TLB_OFF + 16 * half)));
     }
-    /* tlb_used[下标 / 64] |= 1 << (下标 % 64) */
+    /* tlb_used[index / 64] |= 1 << (index % 64) */
     emit(x, enc_ubfx(1, a, APPINE_PAGE_SHIFT + 6, TLB_BITS - 6));
     emit(x, enc_add_lsl(1, CTX, 1, 3));
     emit_add_const(x, 1, 1, (int64_t)(used & ~(size_t)0xfff));
@@ -3231,8 +3421,8 @@ static void emit_fill(struct xlate *x, unsigned a, bool write, struct refill_fai
     emit(x, enc_str_x(T2, 1, used & 0xfff));
 }
 
-/* 在 TLB 里查地址 `a` 所在的页：命中时 `addend` 寄存器 = addend，否则跳往 `miss`
- * （偏移待回填）；用掉 x0 */
+/* Look up the page of address `a` in the TLB: on a hit the `addend` register = addend, otherwise
+ * jump to `miss` (offset patched later); uses up x0 */
 static uint32_t *emit_probe(struct xlate *x, unsigned a, unsigned addend, bool write)
 {
     emit(x, enc_ubfx(0, a, APPINE_PAGE_SHIFT, TLB_BITS));
@@ -3245,18 +3435,22 @@ static uint32_t *emit_probe(struct xlate *x, unsigned a, unsigned addend, bool w
 }
 
 /*
- * TLB 回填例程：TLB 未命中或者访问跨页时，在翻译后的代码里处理，不必退出到分发器。
- * 入口：T0 = guest 地址，T1 指向回填桩的信息字（emit_refill_stub）。成功时 T2 = addend，
- * 回到访问本身；失败时按信息字里的原因退出。
+ * TLB refill routine: a TLB miss or a cross-page access is handled in translated code, without
+ * exiting to the dispatcher. Entry: T0 = guest address, T1 points to the refill stub's info word
+ * (emit_refill_stub). On success T2 = addend and it returns to the access itself; on failure it
+ * exits with the reason in the info word.
  *
- * 不跨页时按页表填好表项。跨页时两页都要有这次访问的权限，宿主地址也要连续（两页
- * 的 addend 相同；同一次宿主映射里的页都是这样），这时整个访问照样在宿主上一次完成：
- * 两页都在 TLB 里时只比对两个表项，不在的先填进去。栈帧跨页的函数每次调用都会这样
- * 访问，所以不能退给 Tier 0。地址带标签、超出地址空间、未映射、没有权限或者宿主地址
- * 不连续时失败。
+ * Without a page crossing, the entry is filled from the page table. Across pages both pages must
+ * have the permission this access needs and the host addresses must be contiguous (both pages
+ * have the same addend; all pages in one host mapping do), and then the whole access is still
+ * done on the host in one go: when both pages are in the TLB only the two entries are compared,
+ * and a page that is not is filled first. A function whose stack frame crosses a page accesses it
+ * this way on every call, so this cannot fall back to Tier 0. Fails if the address is tagged,
+ * beyond the address space, unmapped or lacks the permission, or if the host addresses are not
+ * contiguous.
  *
- * 借用 cpu 结构体里 x0–x4 的位置暂存宿主 x0–x4：翻译后的代码运行期间这些位置
- * 不保存 guest 的值，退出例程会重新写入。
+ * Borrows the x0–x4 slots in the cpu struct to save host x0–x4: while translated code runs these
+ * slots do not hold the guest's values, and the exit routine writes them again.
  */
 static uint32_t *emit_refill(struct xlate *x, bool write)
 {
@@ -3267,16 +3461,18 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_stp_x(0, 1, CTX, (int)x0));
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
     emit(x, enc_str_x(4, CTX, x0 + 32));
-    /* 有观察点（ptrace 设置的）时不按页表填：被观察的页不能进 TLB。交给 Tier 0 执行这一条，
-     * 它检查观察点，并按 appine_tlb_fill 的规则填表，没被观察的页之后照常命中 */
+    /* With watchpoints (set by ptrace), do not fill from the page table: watched pages must not
+     * enter the TLB. Tier 0 executes this instruction instead; it checks the watchpoints and fills
+     * the TLB by appine_tlb_fill's rules, so unwatched pages hit as usual afterwards */
     size_t nwatch = offsetof(struct appine_cpu, nwatch);
     emit_add_const(x, 0, CTX, (int64_t)(nwatch & ~(size_t)0xfff));
     emit(x, enc_ldr_w(0, 0, nwatch & 0xfff));
     emit_to_fail(x, &f, enc_cbnz_x(0));
     emit(x, enc_ldr_w(3, T1, 0));
     emit(x, enc_ubfx(3, 3, 0, REFILL_REASON_SHIFT));
-    emit(x, enc_add_lsl(3, T0, 3, 0)); /* 最后一个字节 */
-    /* 两头的高位都要是 0：只看 x3 会漏掉加上字节数之后绕回来的地址 */
+    emit(x, enc_add_lsl(3, T0, 3, 0)); /* last byte */
+    /* The high bits of both ends must be 0: looking only at x3 would miss an address that wraps
+     * around after adding the byte count */
     emit(x, enc_orr_reg(0, T0, 3));
     emit(x, enc_ubfx(0, 0, APPINE_VA_BITS, 64 - APPINE_VA_BITS));
     emit_to_fail(x, &f, enc_cbnz_x(0));
@@ -3296,7 +3492,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     emit(x, enc_ldr_x(4, CTX, x0 + 32));
     emit(x, enc_br(T1));
 
-    /* 跨页：x1、x2 = 两页的 addend */
+    /* Cross-page: x1, x2 = the two pages' addends */
     uint32_t *probe = here(x);
     patch_branch(x->wdelta, cross, probe);
     uint32_t *miss[2];
@@ -3324,7 +3520,7 @@ static uint32_t *emit_refill(struct xlate *x, bool write)
     return entry;
 }
 
-/* 把 cpu 的 dbt_lookup_seq 加一（用掉 x1、x2），见 table_lookup */
+/* Increment the cpu's dbt_lookup_seq (uses up x1 and x2); see table_lookup */
 static void emit_seq_step(struct xlate *x)
 {
     size_t seq = offsetof(struct appine_cpu, dbt_lookup_seq);
@@ -3335,10 +3531,12 @@ static void emit_seq_step(struct xlate *x)
 }
 
 /*
- * 跳转缓存没命中时的查表例程：T0 = guest pc。像 table_lookup 一样不持锁查这个地址空间
- * 共用的翻译表，查到了填进线程的跳转缓存再跳过去，查不到才退出到分发器翻译（R_LOOKUP）。
- * 原来每次没命中都要退出、保存和恢复全部寄存器，JIT 负载一次 Maven 构建有六百多万次。
- * 借用 cpu 结构体里 x0–x3 的位置暂存宿主 x0–x3，见 emit_refill。
+ * Lookup routine for jump-cache misses: T0 = guest pc. Like table_lookup it looks up this address
+ * space's shared translation table without the lock; if found, it fills the thread's jump cache
+ * and jumps there, and only if not found does it exit to the dispatcher to translate (R_LOOKUP).
+ * Previously every miss exited and saved and restored all registers, more than six million times
+ * in one Maven build for JIT workloads. Borrows the x0–x3 slots in the cpu struct to save host
+ * x0–x3; see emit_refill.
  */
 static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
 {
@@ -3346,13 +3544,15 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     uint32_t *entry = here(x);
     emit(x, enc_stp_x(0, 1, CTX, (int)x0));
     emit(x, enc_stp_x(2, 3, CTX, (int)x0 + 16));
-    /* 序号改成奇数之后再读表：stlr 与随后的 ldar 之间有序 */
+    /* Read the table only after the sequence number has become odd: an stlr and a later ldar are
+     * ordered */
     emit_seq_step(x);
-    /* 未对齐、超出 48 位的 pc 交给分发器，见 table_find_for */
+    /* Misaligned pcs and pcs beyond 48 bits go to the dispatcher; see table_find_for */
     emit(x, enc_and_ror(2, T0, 2 + 64 - TAG_SHIFT, 64 - TAG_SHIFT));
     uint32_t *invalid = here(x);
     emit(x, enc_cbnz_x(2));
-    /* x1 = 这个成员的标签 << TAG_SHIFT：表项的键异或 pc 等于 0 是共用的块，等于 x1 是它私有的 */
+    /* x1 = this member's tag << TAG_SHIFT: an entry whose key XOR pc is 0 is a shared block, and
+     * one where it equals x1 is this member's private block */
     emit(x, enc_ldr_w(1, CTX, offsetof(struct appine_cpu, dbt_tag)));
     emit(x, enc_orr_lsl(1, 31, 1, TAG_SHIFT));
     emit_mov_const(x, 0, (uint64_t)(uintptr_t)&d->table);
@@ -3364,7 +3564,7 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     emit_mov_const(x, T2, GOLDEN);
     emit(x, enc_mul(T1, T1, T2));
     emit(x, enc_lsrv(T1, T1, 2));
-    /* 线性探测：x2 = 表项的键，T2 = code */
+    /* Linear probing: x2 = the entry's key, T2 = code */
     uint32_t *loop = here(x);
     emit(x, enc_add_lsl(T2, 0, T1, 4));
     emit(x, enc_ldp_x(2, T2, T2, 0));
@@ -3403,8 +3603,8 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     return entry;
 }
 
-/* 放在同号宿主寄存器里的 guest 寄存器与 cpu 结构体（`base` 指向 x[0]）之间读写：相邻的
- * 两个用一条 ldp/stp */
+/* Move the guest registers kept in same-numbered host registers to or from the cpu struct (`base`
+ * points to x[0]): two adjacent ones use one ldp/stp */
 static void move_guest_regs(struct xlate *x, unsigned base, bool store)
 {
     for (unsigned r = 0; r < 31; r++) {
@@ -3419,15 +3619,16 @@ static void move_guest_regs(struct xlate *x, unsigned base, bool store)
     }
 }
 
-/* 进入与退出例程：放在代码缓存开头，所有退出桩都能用一条 b 到达 */
+/* The enter and exit routines: placed at the start of the code cache, so that every exit stub can
+ * reach them with one b */
 static void emit_routines(struct appine_dbt *d)
 {
     struct xlate routines = {.d = d, .buf = d->cache, .wdelta = d->rw_delta, .st = d->st}, *x = &routines;
     size_t x0 = offsetof(struct appine_cpu, x), v0 = offsetof(struct appine_cpu, v);
 
-    /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code)：保存被调用者保存的寄存器
-     * （含 d8–d15）和宿主 FPCR。栈帧布局：x29/x30、x27–x19 的五对、空着的 8 字节、
-     * 宿主 FPCR（+104）、d8–d15（+112） */
+    /* uint64_t enter(struct appine_cpu *cpu, uint32_t *code): save the callee-saved registers
+     * (including d8–d15) and the host FPCR. Frame layout: x29/x30, the five pairs of x27–x19, 8
+     * unused bytes, host FPCR (+104), d8–d15 (+112) */
     d->enter = here(x);
     emit(x, enc_stp_x_pre(29, 30, 31, -FRAME_BYTES));
     emit(x, enc_stp_x(27, 28, 31, 16));
@@ -3441,7 +3642,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(x, enc_str_x(T1, 31, 104));
     emit(x, enc_mov(CTX, 0));
     emit(x, enc_mov(T0, 1));
-    /* guest 的 FP 状态在翻译后的代码里一直放在宿主寄存器里（engine 的 map） */
+    /* The guest's FP state stays in host registers throughout translated code (the engine map) */
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
     emit(x, enc_msr_fpcr(T1));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));
@@ -3456,7 +3657,8 @@ static void emit_routines(struct appine_dbt *d)
     emit(x, enc_ldr_x(SP_HOST, CTX, offsetof(struct appine_cpu, sp)));
     emit(x, enc_br(T0));
 
-    /* 桩用的两个入口：T1 指向桩里的 adr，pc 在桩末尾的数据字里（emit_link_stub） */
+    /* The two entries used by stubs: T1 points to the adr in the stub, and the pc is in the data
+     * words at the end of the stub (emit_link_stub) */
     d->exit_full = here(x);
     emit(x, enc_ldur_x(T0, T1, 12));
     uint32_t *join = here(x);
@@ -3467,7 +3669,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(x, enc_and_low(T0, T0, PACKED_PC_BITS));
     patch_branch(x->wdelta, join, here(x));
     emit(x, enc_sub_imm(T1, T1, 4, 0));
-    /* 退出：T0 = guest pc，T1 = 回填位置（只有链接桩的有用），T2 = 原因 */
+    /* Exit: T0 = guest pc, T1 = patch site (meaningful only for link stubs), T2 = reason */
     d->exit = here(x);
     emit(x, enc_str_x(T0, CTX, offsetof(struct appine_cpu, pc)));
     emit(x, enc_str_x(T1, CTX, offsetof(struct appine_cpu, dbt_site)));
@@ -3499,7 +3701,8 @@ static void emit_routines(struct appine_dbt *d)
     d->refill[1] = emit_refill(x, true);
     d->lookup = emit_lookup(x, d);
 
-    /* 影子返回栈空项的落点：像间接跳转没命中跳转缓存那样，按 guest x30 查找 */
+    /* Landing pad of empty shadow return stack entries: look up by guest x30, as for an indirect
+     * branch that misses the jump cache */
     d->rs_miss = here(x);
     emit(x, enc_mov(T0, 30));
     emit(x, enc_b((intptr_t)d->lookup - (intptr_t)here(x)));
@@ -3509,35 +3712,41 @@ static void emit_routines(struct appine_dbt *d)
 }
 
 /*
- * 不再使用的实例（它的地址空间没了）放进一个小池子，给新的地址空间复用：短命进程不必每次
- * 都重新映射代码缓存和各张表，再在第一次写入每一页时缺页。翻译不多时保留下来，按程序
- * （调用方给的键，内核层用可执行文件的 inode）区分：同一个程序再运行时（shell 脚本里反复
- * exec 的 busybox、go build 的一个个 compile、一次次 `node -e`）拿回它留下的翻译，核对之后
- * 接着用（寄存器分配也要相同）；没有同键的就拿一个空的或者新建，不去清空别的程序留下的。几个进程同时跑同一个
- * 程序时各占一个实例，池子要放得下它们。池里保留的代码总量有上限，超出时先去掉最久没用的。
- * 清空了的实例把代码缓存用过的部分标成 MADV_FREE，宿主内存紧张时可以直接回收（之后再写入
- * 只是重新缺页）。线程的部分（跳转缓存、影子返回栈）另有一个池子。
+ * Instances no longer in use (their address space is gone) go into a small pool for new address
+ * spaces to reuse: short-lived processes then need not map the code cache and the tables anew
+ * each time and then fault on the first write to every page. Instances with few translations are
+ * kept, distinguished by program (a key the caller gives; the kernel layer uses the executable's
+ * inode): when the same program runs again (busybox exec'd over and over by a shell script, go
+ * build's compiles one after another, repeated `node -e`), it takes back the translations it
+ * left and keeps using them after checking them (the register assignment must also be the same);
+ * without one of the same key it takes an empty one or creates one, rather than clearing what
+ * other programs left. When several processes run the same program at once each takes an
+ * instance, so the pool must have room for them. The total code kept in the pool is capped, and
+ * when the cap is exceeded the least recently used go first. An emptied instance marks the used
+ * part of its code cache MADV_FREE, so the host can reclaim it directly under memory pressure (a
+ * later write just faults again). The thread parts (jump cache, shadow return stack) have a pool
+ * of their own.
  */
 #define POOL_SIZE 16
-#define POOL_KEEP_WORDS ((size_t)(64u << 20) / 4) /* 池里保留的代码最多 64 MB */
+#define POOL_KEEP_WORDS ((size_t)(64u << 20) / 4) /* at most 64 MB of code kept in the pool */
 #define THREAD_POOL_SIZE 8
 
 static struct {
     pthread_mutex_t lock;
     struct pooled {
         struct appine_dbt *d;
-        uint64_t key;  /* 保留着哪个程序的翻译；0 表示已经清空 */
-        uint64_t when; /* 放进来的先后，去掉最久没用的 */
+        uint64_t key;  /* which program's translations are kept; 0 if emptied */
+        uint64_t when; /* order of arrival, to remove the least recently used */
     } free[POOL_SIZE];
     unsigned n;
     uint64_t clock;
-    size_t kept_words; /* 池里保留着的代码 */
+    size_t kept_words; /* code kept in the pool */
     struct appine_dbt_thread *threads[THREAD_POOL_SIZE];
     unsigned nthreads;
-    struct appine_dbt *all; /* 所有实例 */
+    struct appine_dbt *all; /* all instances */
 } pool = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
-/* 从池里取出第 i 个。持有池的锁 */
+/* Take entry i out of the pool. Pool lock held */
 static struct appine_dbt *pool_take(unsigned i)
 {
     struct appine_dbt *d = pool.free[i].d;
@@ -3547,7 +3756,7 @@ static struct appine_dbt *pool_take(unsigned i)
     return d;
 }
 
-/* 换下来的登记范围（appine_dbt_share）全部释放；没有线程在用这个实例 */
+/* Free all the replaced registered ranges (appine_dbt_share); no thread is using this instance */
 static void drop_shared(struct appine_dbt *d)
 {
     for (struct shared_ranges *s = d->shared, *older; s; s = older) {
@@ -3582,7 +3791,8 @@ static void release(struct appine_dbt *d)
     zfree(d, sizeof(*d));
 }
 
-/* 没有线程挂着的实例自己的统计（从池里取出、放回池里时的清空和核对） */
+/* Statistics of an instance itself while no threads are attached (flushing and checking when it
+ * is taken out of or put back into the pool) */
 static struct appine_dbt_stats spare_stats;
 
 struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
@@ -3599,7 +3809,7 @@ struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
     }
     struct appine_dbt *d = best >= 0 ? pool_take((unsigned)best) : NULL;
     pthread_mutex_unlock(&pool.lock);
-    if (d && d->r != r) { /* 空的实例：例程按这一组寄存器重新生成 */
+    if (d && d->r != r) { /* an empty instance: regenerate the routines for this register set */
         d->r = r;
         emit_routines(d);
     }
@@ -3641,8 +3851,10 @@ struct appine_dbt *appine_dbt_new(uint64_t key, enum appine_dbt_regs regs)
 }
 
 /*
- * 放回池里、保留翻译时去掉成员私有的块，标签就可以从头分配。只有同一个成员的私有块链接到
- * 它们（共用的块不链接到私有的块），也没有线程挂着，所以不用转发桩
+ * When returning to the pool with translations kept, remove the members' private blocks, so tags
+ * can be allocated from the start again. Only private blocks of the same member link to them
+ * (shared blocks do not link to private blocks), and no threads are attached, so no forwarding
+ * stubs are needed
  */
 static void drop_private(struct appine_dbt *d)
 {
@@ -3660,7 +3872,7 @@ static void drop_private(struct appine_dbt *d)
     }
 }
 
-/* 放回池里：没有线程挂着，所以可以直接清空 */
+/* Put back into the pool: no threads are attached, so it can be flushed directly */
 void appine_dbt_free(struct appine_dbt *d, uint64_t key)
 {
     if (!d)
@@ -3671,11 +3883,13 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
     }
     d->st = &spare_stats;
     size_t words = d->used_words - d->routine_words;
-    /* 块不多时保留翻译：下一个同一程序的使用者运行之前核对一遍（recheck），比逐块拷贝模板、
-     * 重新链接、同步指令缓存便宜得多 */
+    /* Keep the translations when there are not many blocks: checking them once before the next
+     * user running the same program runs (recheck) is much cheaper than copying templates block by
+     * block, relinking and syncing the instruction cache */
     bool keep = key && d->table_count <= KEEP_MAX_BLOCKS && words <= POOL_KEEP_WORDS && !d->flush_wanted;
-    /* 超过池里一半的大实例（JVM 一次就有四五十 MB）只在不挤掉别人时保留：否则跑一次 java
-     * 就把 node、python 这些常用程序留下的翻译全挤掉了 */
+    /* A large instance using more than half of the pool (one JVM run takes 40–50 MB) is kept only
+     * if it does not push others out: otherwise one java run would push out all the translations
+     * left by frequently used programs such as node and python */
     if (keep && words > POOL_KEEP_WORDS / 2) {
         pthread_mutex_lock(&pool.lock);
         keep = pool.kept_words + words <= POOL_KEEP_WORDS;
@@ -3690,15 +3904,18 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         words = 0;
         size_t nblocks = d->table_count, nguest = d->words_used;
         flush_locked(d);
-        if (d->table->bits > TABLE_MIN_BITS) /* 下一个使用者多半是个短命进程 */
+        if (d->table->bits > TABLE_MIN_BITS) /* next user is most likely a short-lived process */
             table_resize(d, TABLE_MIN_BITS);
-        /* 块的记录和指令字按上限预先映射，用过的部分一直占着内存：也交还 */
+        /* Block records and instruction words are mapped in advance at their limits, and the used
+         * parts keep occupying memory: return them too */
         release_pages(d->blocks, nblocks * sizeof(*d->blocks));
         release_pages(d->table_used, nblocks * sizeof(*d->table_used));
         release_pages(d->words, nguest * sizeof(*d->words));
         /*
-         * 进入/退出例程所在的页保留，其余用过的部分交给宿主回收：私有映射用 MADV_FREE，
-         * 内存紧张时才回收；双映射的共享内存不支持它，只能用 MADV_REMOVE 立即释放
+         * Keep the pages holding the enter/exit routines, and hand the rest of the used part to
+         * the host to reclaim: private mappings use MADV_FREE, reclaimed only under memory
+         * pressure; double-mapped shared memory does not support it and can only be freed at once
+         * with MADV_REMOVE
          */
         uintptr_t page = host_page_size();
         uintptr_t start = ((uintptr_t)rw(d, d->cache + d->routine_words) + page - 1) & ~(page - 1);
@@ -3706,16 +3923,16 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         if (end > start)
             madvise((void *)start, end - start, d->rw_delta ? MADV_REMOVE : MADV_FREE);
         d->high_words = 0;
-        drop_written(d); /* 例程所在的页、记下的页数 */
+        drop_written(d); /* the routines' pages, and the recorded page count */
     }
-    d->next_tag = 1; /* 带标签的块都去掉了 */
-    /* 腾出地方：池满了，或者保留的代码超出上限。先去掉空的（重建它们很便宜），再去掉
-     * 最久没用的 */
+    d->next_tag = 1; /* all tagged blocks have been removed */
+    /* Make room: the pool is full, or the kept code exceeds the limit. Remove empty ones first
+     * (rebuilding them is cheap), then the least recently used */
     struct appine_dbt *evicted[POOL_SIZE];
     unsigned nevicted = 0;
     pthread_mutex_lock(&pool.lock);
     while (pool.n && (pool.n == POOL_SIZE || pool.kept_words + words > POOL_KEEP_WORDS)) {
-        /* 腾代码的地方时去掉空的没有用 */
+        /* When making room for code, removing empty ones does not help */
         bool need_code = pool.kept_words + words > POOL_KEEP_WORDS;
         int victim = -1;
         for (unsigned i = 0; i < pool.n; i++) {
@@ -3741,7 +3958,8 @@ void appine_dbt_free(struct appine_dbt *d, uint64_t key)
         release(evicted[i]);
 }
 
-/* 拆掉所有实例的代码缓存在可写视图里写过的页（struct written 前面的说明） */
+/* Drop the pages written in the writable view of every instance's code cache (see the comment
+ * before struct written) */
 void appine_dbt_unmap_written(void)
 {
     pthread_mutex_lock(&pool.lock);
@@ -3750,7 +3968,8 @@ void appine_dbt_unmap_written(void)
     pthread_mutex_unlock(&pool.lock);
 }
 
-/* 可写视图里写过、还没拆的页一共多少字节：它们在宿主的 RSS 里算了两次 */
+/* Total bytes of the pages written in the writable view and not dropped yet: they count twice in
+ * the host's RSS */
 uint64_t appine_dbt_written_bytes(void)
 {
     uint64_t pages = 0;
@@ -3762,7 +3981,8 @@ uint64_t appine_dbt_written_bytes(void)
     return pages * host_page_size();
 }
 
-/* 释放池里所有的实例（App 内存紧张时，保留的翻译可以重建） */
+/* Release every instance in the pool (when the app is short of memory; kept translations can be
+ * rebuilt) */
 void appine_dbt_trim(void)
 {
     struct appine_dbt *evicted[POOL_SIZE];
@@ -3787,8 +4007,10 @@ static void release_thread(struct appine_dbt_thread *t)
     zfree(t, sizeof(*t));
 }
 
-/* 取得 d 的锁，记下这次的翻译、作废算在谁头上。持锁的时间都很短（装一个块、作废一批块），
- * 先自旋一会儿，免得睡下再被叫醒（虚拟机里一次要几十微秒） */
+/* Take d's lock, recording whom this round's translations and invalidations are charged to. The
+ * lock is always held only briefly (installing a block, invalidating a batch of blocks), so spin
+ * for a while first rather than sleep and be woken again (tens of microseconds each time in a
+ * virtual machine) */
 static void lock_dbt(struct appine_dbt *d, struct appine_dbt_stats *st)
 {
     unsigned spin = 0;
@@ -3826,14 +4048,14 @@ static int range_cmp(const void *a, const void *b)
 void appine_dbt_share(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
 {
     struct shared_ranges *r = malloc(sizeof(*r) + n * sizeof(r->r[0]));
-    if (!r) /* 照旧用原来的：不在里面的块都当作私有的，只是共用得少 */
+    if (!r) /* keep the old ranges: blocks outside them count as private, only less is shared */
         return;
     for (size_t i = 0; i < n; i++) {
         r->r[i][0] = s[i].start;
         r->r[i][1] = s[i].start + s[i].len;
     }
     qsort(r->r, n, sizeof(r->r[0]), range_cmp);
-    unsigned m = 0; /* 重叠、相接的合并成一段 */
+    unsigned m = 0; /* merge overlapping and adjacent ones into one range */
     for (size_t i = 0; i < n; i++) {
         if (m && r->r[i][0] <= r->r[m - 1][1]) {
             if (r->r[i][1] > r->r[m - 1][1])
@@ -3861,10 +4083,10 @@ struct appine_dbt_thread *appine_dbt_attach(struct appine_dbt *d, unsigned tag)
         if (!t)
             return NULL;
         t->jc = zalloc(JC_SIZE * sizeof(*t->jc));
-        t->rs = zalloc(APPINE_PAGE_SIZE); /* 按页对齐，也就按 1 KB 对齐 */
+        t->rs = zalloc(APPINE_PAGE_SIZE); /* page-aligned, and so also 1 KB-aligned */
         t->xlate = malloc(sizeof(*t->xlate));
         t->scratch = zalloc(MAX_BLOCK_WORDS * sizeof(*t->scratch));
-        t->probe = zalloc(sizeof(*t->probe)); /* TLB 占一百多 KB，用不到的页不占内存 */
+        t->probe = zalloc(sizeof(*t->probe)); /* TLB is over 100 KB; unused pages take no memory */
         t->defined = zalloc(DEFINED_CACHE * sizeof(*t->defined));
         t->prep = malloc(sizeof(*t->prep));
         if (!t->jc || !t->rs || !t->xlate || !t->scratch || !t->probe || !t->defined || !t->prep) {
@@ -3934,8 +4156,8 @@ void appine_dbt_invalidate(struct appine_dbt_thread *t, const struct appine_cpu 
     unlock_dbt(t->d);
 }
 
-/* 块翻译时的 guest 指令字和现在 `mmu` 里同一地址的是否相同；`page`/`host` 记着上一次
- * 查到的页 */
+/* Whether a block's guest instruction words at translation equal those at the same address in
+ * `mmu` now; `page`/`host` remember the page looked up last time */
 static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *mmu,
                           const struct block *b, uint64_t *page, const uint32_t **host)
 {
@@ -3948,12 +4170,16 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
 }
 
 /*
- * 实例换了地址空间之后、第一次运行之前：逐块核对 guest 指令字，对不上的作废。和拷贝
- * 翻译模板时的核对是同一件事，只是一次做完，省掉逐块拷贝、重新链接和同步指令缓存。
- * 大部分都对不上时（exec 了别的程序）请求整体清空。持有锁
+ * After an instance changes address space and before its first run: check the guest instruction
+ * words block by block and invalidate those that do not match. It is the same check as when
+ * copying a translation template, only done all at once, saving the per-block copying, relinking
+ * and instruction-cache syncing. When most do not match (another program was exec'd), request a
+ * full flush. Lock held
  */
-/* 块整个落在上一个使用者的某段文件映射里（appine_dbt_trust 记下）：它的页还没映射时值得
- * 停放，以后多半映射回同样的内容；匿名内存里的（JIT 生成的代码）下一次多半对不上 */
+/* The block lies entirely within one of the previous user's file mappings (recorded by
+ * appine_dbt_trust): while its page is not mapped yet it is worth parking, since the same content
+ * will most likely be mapped back later; blocks in anonymous memory (JIT-generated code) will
+ * most likely not match next time */
 static bool block_parkable(const struct appine_dbt *d, const struct block *b)
 {
     for (unsigned i = 0; i < d->nparkable; i++) {
@@ -3963,7 +4189,7 @@ static bool block_parkable(const struct appine_dbt *d, const struct block *b)
     return false;
 }
 
-/* 块整个落在 appine_dbt_trust 给出的范围里 */
+/* The block lies entirely within a range given by appine_dbt_trust */
 static bool block_trusted(const struct appine_dbt *d, const struct block *b)
 {
     for (unsigned i = 0; i < d->ntrusted; i++) {
@@ -3977,7 +4203,7 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
 {
     d->stale = false;
     size_t live = 0, bad = 0, unmapped = 0;
-    uint64_t page = 1; /* 未对齐，不会与任何页相同 */
+    uint64_t page = 1; /* misaligned, never equal to any page */
     const uint32_t *host = NULL;
     for (size_t i = 0; i < d->table_count; i++) {
         const struct block *b = &d->blocks[i];
@@ -3995,9 +4221,10 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
         d->flush_wanted = true;
         return;
     }
-    /* 所在的页还没有映射的块（共享库要等动态链接器加载，这时只有程序和动态链接器）停放
-     * 起来，第一次执行到时再核对（revive）：原来都作废了，node 每次启动要从模板重新拷贝
-     * 六七千个块 */
+    /* Blocks whose page is not mapped yet (shared libraries wait for the dynamic linker to load
+     * them; at this point there are only the program and the dynamic linker) are parked and
+     * checked the first time they are executed (revive): previously they were all invalidated,
+     * and every node startup copied six or seven thousand blocks from templates again */
     page = 1;
     struct retire_batch r = {.n = 0};
     for (size_t i = 0; (bad || unmapped) && i < d->table_count; i++) {
@@ -4020,10 +4247,14 @@ static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
 }
 
 /*
- * 停放的块重新放进翻译表（revive）。停放时留下的墓碑还在（这之后没有重建过表）就原样
- * 恢复：代码没变，不持锁查表的线程读到恢复前后的哪一种都对。插到别的空位的话，没有
- * 记录再指向那个墓碑，整体清空（flush_locked 只清 table_used 记下的位置）之后它还占着
- * 位置却不再计数，反复停放、恢复、清空，表就被占满，插入和查表都找不到空位。持有锁
+ * Put a parked block back into the translation table (revive). If the tombstone left when it was
+ * parked is still there (the table has not been rebuilt since), restore it in place: the code has
+ * not changed, so a thread looking up the table without the lock is right whichever of the before
+ * and after states it reads. If it were inserted into another empty slot, no record would point
+ * to that tombstone any more, and after a full flush (flush_locked only clears the slots recorded
+ * in table_used) it would still occupy its slot without being counted; with repeated parking,
+ * reviving and flushing, the table would fill up, and neither insertion nor lookup would find an
+ * empty slot. Lock held
  */
 static void table_relink(struct appine_dbt *d, size_t k)
 {
@@ -4045,13 +4276,18 @@ static void table_relink(struct appine_dbt *d, size_t k)
 }
 
 /*
- * 分发器没查到 pc，而它有停放着的块（recheck）：把同一页里停放着的块一起核对，guest 指令字
- * 和现在的相同的恢复入口、放回表里，不必重新翻译或者拷贝模板；对不上的作废。一页一起做：
- * 每个停放的块第一次执行到时都要经由转发桩退出到这里，一个一个恢复时光是这些退出就把
- * 省下的时间用掉了。指向停放块的链接一直跳往它的入口，停放期间经由转发桩退出到这里，
- * 所以没有核对过的代码不会被执行。表太满时不恢复，由正常的翻译路径扩表。持有锁
+ * The dispatcher did not find pc, and its page has parked blocks (recheck): check the parked
+ * blocks of the same page together; those whose guest instruction words match the current ones
+ * get their entries restored and go back into the table, with no retranslation or template copy
+ * needed; those that do not match are invalidated. A page at a time: each parked block exits here
+ * through the forwarding stub the first time it is executed, and when reviving them one by one,
+ * those exits alone would use up the time saved. Links to a parked block always jump to its
+ * entry, which while parked exits here through the forwarding stub, so code that has not been
+ * checked is never executed. When the table is too full nothing is revived, and the normal
+ * translation path grows the table. Lock held
  */
-/* 恢复的这一批先同步、再放进表里，别的线程才可能跳过去 */
+/* Sync the revived batch first, then put it into the table; only then can other threads jump
+ * there */
 static void revive_flush(struct appine_dbt *d, const uint32_t *idx, unsigned n)
 {
     if (!n)
@@ -4072,15 +4308,17 @@ static void revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc
     const uint32_t *host = NULL;
     uint32_t idx[RETIRE_BATCH];
     unsigned n = 0;
-    /* 入口检查的第一条对所有块都一样（prepare），不必另外记 */
+    /* The first instruction of the entry check is the same for every block (prepare), so it need
+     * not be recorded separately */
     uint32_t check = enc_ldr_x(d->r->t0, d->r->ctx, offsetof(struct appine_cpu, pending));
     for (uint32_t i = d->page_head[page_bucket(page)]; i; i = d->blocks[i - 1].next) {
         struct block *b = &d->blocks[i - 1];
         if (!b->parked || b->pc >> APPINE_PAGE_SHIFT != page)
             continue;
         if (!block_matches(d, c->mmu, b, &p, &host)) {
-            /* 页还没有表项（大的映射按需建表）：留着，分发器取不到指令时由 Tier 0 报告
-             * 缺页，内核层补上表项之后再来 */
+            /* The page has no entry yet (large mappings fill entries on demand): keep it; when
+             * the dispatcher cannot fetch the instruction, Tier 0 reports the page fault, and it
+             * comes back after the kernel layer fills in the entry */
             if (!host)
                 break;
             kill_parked(d, b);
@@ -4105,7 +4343,7 @@ static void revive(struct appine_dbt *d, const struct appine_cpu *c, uint64_t pc
 void appine_dbt_set_sources(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
 {
     pthread_mutex_lock(&d->lock);
-    /* 记不下的不记：没记下的映射里的块照常核对 */
+    /* What does not fit is not recorded: blocks in unrecorded mappings are checked as usual */
     d->nsources = n < APPINE_DBT_SOURCES ? (unsigned)n : APPINE_DBT_SOURCES;
     memcpy(d->sources, s, d->nsources * sizeof(*s));
     pthread_mutex_unlock(&d->lock);
@@ -4125,7 +4363,8 @@ void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, s
             }
         }
     }
-    /* 记下的只用一次：这个地址空间不再使用时重新记。全部记作可以停放的范围（recheck） */
+    /* What was recorded is used only once: it is recorded again when this address space stops
+     * being used. All of it is recorded as parkable ranges (recheck) */
     for (unsigned j = 0; j < d->nsources; j++) {
         d->parkable[j][0] = d->sources[j].start;
         d->parkable[j][1] = d->sources[j].start + d->sources[j].len;
@@ -4138,11 +4377,11 @@ void appine_dbt_trust(struct appine_dbt *d, const struct appine_dbt_source *s, s
 void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_source *s, size_t n)
 {
     pthread_mutex_lock(&d->lock);
-    d->st = &spare_stats; /* 上一个持锁的线程可能已经解挂 */
+    d->st = &spare_stats; /* the previous thread holding the lock may have detached already */
     struct retire_batch r = {.n = 0};
     for (size_t i = 0; i < d->table_count; i++) {
         struct block *b = &d->blocks[i];
-        if (!b->code || b->tag) /* 私有的块只有它的成员查得到 */
+        if (!b->code || b->tag) /* private blocks are found only by their member */
             continue;
         bool inside = false;
         for (size_t j = 0; j < n && !inside; j++)
@@ -4160,7 +4399,7 @@ void appine_dbt_retire_outside(struct appine_dbt *d, const struct appine_dbt_sou
     pthread_mutex_unlock(&d->lock);
 }
 
-/* 停下来等别人整体清空完。持有锁，等待期间放开 */
+/* Stop and wait for another thread to finish a full flush. Lock held, released while waiting */
 static void park(struct appine_dbt *d, struct appine_dbt_thread *self)
 {
     self->parked = true;
@@ -4169,7 +4408,7 @@ static void park(struct appine_dbt *d, struct appine_dbt_thread *self)
     self->parked = false;
 }
 
-/* 除了 self 还有在 dbt_run 里、没有停在 park 里的线程。持有锁 */
+/* Whether a thread other than self is in dbt_run and not stopped in park. Lock held */
 static bool others_running(const struct appine_dbt *d, const struct appine_dbt_thread *self)
 {
     for (const struct appine_dbt_thread *t = d->threads; t; t = t->next)
@@ -4179,17 +4418,21 @@ static bool others_running(const struct appine_dbt *d, const struct appine_dbt_t
 }
 
 /*
- * 整体清空：打断其他在 dbt_run 里的线程，等它们都停下来（park）或者离开 dbt_run，再
- * 清空。持有锁进入和返回，等待期间放开锁，别的线程才走得到 park。已经有线程在做时一起
- * 停下等它。
+ * Full flush: kick the other threads in dbt_run, wait until they have all stopped (park) or left
+ * dbt_run, then flush. Entered and returned with the lock held; the lock is released while
+ * waiting so that other threads can reach park. If a thread is already doing it, stop along with
+ * the others and wait for it.
  *
- * 先置 flushing 再看各线程的 cpu，线程那边先登记 cpu、再看 flushing：要么这里打断得到它，
- * 要么它看到 flushing 自己停下。等的时候持锁逐个看各线程的 cpu 和 parked：parked 只在
- * 持锁时改，停下的线程在清空结束之前不会离开。
+ * flushing is set before looking at each thread's cpu, and a thread registers its cpu before
+ * looking at flushing: either this side kicks it, or it sees flushing and stops by itself. While
+ * waiting, each thread's cpu and parked are checked with the lock held: parked only changes under
+ * the lock, and a stopped thread does not leave before the flush ends.
  *
- * 原来用两个共用的计数（在 dbt_run 里的、停下的），每次进出 dbt_run 都要原子地改一次：
- * 同一个地址空间的几个线程频繁进出（每次系统调用都是一次）时，那个缓存行在几个核之间
- * 来回，8 个线程同时读时钟每次从 94 纳秒变成 844 纳秒。现在进出只写线程自己的 cpu。
+ * Previously two shared counters (threads in dbt_run, stopped threads) were changed atomically on
+ * every entry into and exit from dbt_run: when several threads of one address space entered and
+ * left often (every system call is one), that cache line bounced between cores, and with 8
+ * threads reading the clock at the same time each read went from 94 ns to 844 ns. Now entry and
+ * exit only write the thread's own cpu.
  */
 static void flush_world(struct appine_dbt *d, struct appine_dbt_thread *self)
 {
@@ -4213,7 +4456,8 @@ static void flush_world(struct appine_dbt *d, struct appine_dbt_thread *self)
     pthread_cond_broadcast(&d->flushed);
 }
 
-/* guest 改了 `addr` 所在那一页的代码（ic ivau）：作废其中指令字变了的块 */
+/* The guest changed code in the page containing `addr` (ic ivau): invalidate the blocks in it
+ * whose instruction words changed */
 static void code_changed(struct appine_dbt_thread *t, const struct appine_cpu *c, uint64_t addr)
 {
     lock_dbt(t->d, &t->stats);
@@ -4240,11 +4484,11 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
     }
     c->dbt_jump_cache = t->jc;
     c->dbt_tag = t->tag;
-    t->jc_dirty = true; /* 查表例程会往里填 */
+    t->jc_dirty = true; /* the lookup routine fills it */
     if (((uintptr_t)c->dbt_rs & ~(uintptr_t)((1u << RS_SHIFT) - 1)) != (uintptr_t)t->rs)
         c->dbt_rs = t->rs;
     for (;;) {
-        /* 有人要整体清空：一起停下，或者自己来做 */
+        /* Someone wants a full flush: stop along with the others, or do it ourselves */
         if (UNLIKELY(__atomic_load_n(&d->flushing, __ATOMIC_SEQ_CST) ||
                      __atomic_load_n(&d->flush_wanted, __ATOMIC_SEQ_CST))) {
             lock_dbt(d, &t->stats);
@@ -4260,7 +4504,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             __atomic_exchange_n(&c->pending, 0, __ATOMIC_ACQUIRE))
             return APPINE_EXIT_KICK;
 
-        unsigned found; /* 找到的块的标签：共用的块不链接到私有的块（LINK_SHARED） */
+        /* Tag of the found block: shared blocks do not link to private blocks (LINK_SHARED) */
+        unsigned found;
         uint32_t *code = table_lookup(d, c, c->pc, &found);
         if (!code && __atomic_load_n(&d->page_parked[page_bucket(c->pc >> APPINE_PAGE_SHIFT)],
                                      __ATOMIC_RELAXED)) {
@@ -4275,7 +4520,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             unlock_dbt(d);
         }
         if (!code) {
-            /* 不持锁翻译，持锁装进去 */
+            /* Translate without the lock, install with it */
             bool fetched = prepare(t, c, c->pc);
             lock_dbt(d, &t->stats);
             if (__atomic_load_n(&d->flushing, __ATOMIC_RELAXED) || d->flush_wanted) {
@@ -4284,10 +4529,11 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             }
             struct syncs sync = {.n = 0};
             struct fresh f = {.code = NULL};
-            /* 只有这一个线程时，新块和链接点一起同步一次；否则新块先同步、放进表里，
-             * 别的线程才可能跳过去 */
+            /* When this is the only thread, sync the new block and the link point together once;
+             * otherwise sync the new block first and put it in the table, only after which other
+             * threads can jump there */
             bool alone = d->threads == t && !t->next;
-            /* 别的线程可能刚装进去同一个块 */
+            /* Another thread may have just installed the same block */
             code = table_find_for(d->table, c->pc, t->tag, &found);
             if (!code && fetched) {
                 code = install(d, t->prep, &sync, &f);
@@ -4307,14 +4553,16 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
                     table_insert(d, f.pc, f.tag, f.code, f.guest, f.nguest);
                 }
             }
-            /* 持锁时表里只有有效的块：回填的目标不会是作废块（它的入口跳往自己） */
+            /* While the lock is held the table has only live blocks: the patch target is never an
+             * invalidated block (whose entry jumps to itself) */
             uint32_t *target = code && patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (code && patch_site && patch_generation == d->generation && target != patch_site &&
                 !(patch_shared && found)) {
                 *rw(d, patch_site) = enc_b((intptr_t)target - (intptr_t)patch_site);
-                /* 条件分支不在 CMODX 允许并发修改的指令里：有别的线程时不改它 */
+                /* Conditional branches are not among the instructions CMODX allows to be modified
+                 * concurrently: do not change it when there are other threads */
                 bool branch = patch_branch_site && alone && relink_word(d, patch_branch_site, target);
-                if (sync.n) { /* 新块反正要同步，链接点一起 */
+                if (sync.n) { /* the new block is synced anyway, so the link point goes with it */
                     sync_add(&sync, patch_site, patch_site + 1);
                     if (branch)
                         sync_add(&sync, patch_branch_site, patch_branch_site + 1);
@@ -4329,21 +4577,24 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             patch_site = NULL;
         } else if (patch_site) {
             /*
-             * 目标已经翻译过：不持锁回填链接。b 改成 b 可以并发修改；整体清空要等这个线程
-             * 停下，不会同时发生。不持锁查到的可能是刚被作废的块，它不会是回填位置本身以外
-             * 的东西：作废块的入口跳往转发桩，转发桩照样退出到这里
+             * The target is already translated: patch the link without the lock. Changing a b
+             * into a b may be done concurrently; a full flush waits for this thread to stop, so
+             * it cannot happen at the same time. The lock-free lookup may have found a block that
+             * was just invalidated, which cannot be anything other than the patch site itself: an
+             * invalidated block's entry jumps to the forwarding stub, which still exits to here
              */
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
                 target != patch_site && !(patch_shared && found)) {
                 uint32_t b = enc_b((intptr_t)target - (intptr_t)patch_site);
-                /* 读执行用的地址，见 relink_word */
+                /* Read through the execution address; see relink_word */
                 bool again = __atomic_load_n(patch_site, __ATOMIC_RELAXED) == b;
                 __atomic_store_n(rw(d, patch_site), b, __ATOMIC_RELAXED);
                 bool branch = patch_branch_site && __atomic_load_n(&d->nthreads, __ATOMIC_RELAXED) == 1 &&
                               relink_word(d, patch_branch_site, target);
                 if (again) {
-                    /* 已经改过、这个线程却还执行了旧指令：完整同步一次 */
+                    /* Already changed, yet this thread still executed the old instruction: do
+                     * one full sync */
                     struct syncs sync = {.n = 0};
                     sync_add(&sync, patch_site, patch_site + 1);
                     if (branch)
@@ -4355,7 +4606,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             }
             patch_site = NULL;
         }
-        if (!code) { /* 无法取指：让 Tier 0 报告精确的 fault */
+        if (!code) { /* cannot fetch: let Tier 0 report the precise fault */
             enum appine_exit r = appine_interp_step(c);
             if (r != APPINE_EXIT_NONE)
                 return r;
@@ -4385,7 +4636,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             fill_jump_cache = true;
             break;
         case R_UNGROUP:
-            /* 有观察点时回填总是失败（emit_refill），不是这一组访存不能共用检查 */
+            /* With watchpoints the refill always fails (emit_refill), which does not mean this
+             * group of accesses cannot share a check */
             if (!c->nwatch) {
                 lock_dbt(d, &t->stats);
                 ungroup(d, c->pc);
@@ -4396,11 +4648,15 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
             t->stats.exits_interp++;
             enum appine_exit r = appine_interp_step(c);
             /*
-             * ic ivau 记下的页（dsb、isb 时；或者 Tier 0 执行了记到另一页的 ic ivau）：翻译由
-             * 这个地址空间的线程共用，就地按内容作废一次就行，不必退出到调用方。作废块的入口
-             * 跳往转发桩，别的线程下次进入它们时就会看到（硬件上它们在上下文同步之前同样可能
-             * 还执行旧指令）。HotSpot 每改一处代码就 ic ivau、dsb 一次，Maven 一次构建 8 万次，
-             * 原来每次都要退出、取 BKL、记日志，回来再作废
+             * The page recorded by ic ivau (at dsb or isb, or when Tier 0 executed an ic ivau on a
+             * page other than the recorded one): the translations are shared by this address
+             * space's threads, so invalidating once in place by content is enough, without
+             * exiting to the caller. The invalidated blocks' entries jump to the forwarding
+             * stubs, and other threads see that the next time they enter them (on hardware they
+             * may likewise still execute old instructions before a context synchronization).
+             * HotSpot does an ic ivau and a dsb for every code change, 80,000 times per Maven
+             * build, and previously each one exited, took the BKL, logged, and came back to
+             * invalidate
              */
             if (r == APPINE_EXIT_CODE) {
                 code_changed(t, c, c->fault_addr);
@@ -4417,7 +4673,7 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
         case R_SVC:
             t->stats.exits_svc++;
             c->exit_info = 0;
-            c->excl_size = 0; /* 与 Tier 0 一样：异常返回清掉独占标记 */
+            c->excl_size = 0; /* as in Tier 0: an exception return clears the exclusive marker */
             return APPINE_EXIT_SVC;
         default:
             t->stats.exits_kick++;
@@ -4429,15 +4685,17 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
 enum appine_exit appine_dbt_run(struct appine_dbt_thread *t, struct appine_cpu *c)
 {
     struct appine_dbt *d = t->d;
-    /* 宿主故障作废了这个实例：其余线程用 Tier 0 跑到进程被结束 */
+    /* A host fault poisoned this instance: the remaining threads run in Tier 0 until the process
+     * is killed */
     if (UNLIKELY(d->poisoned))
         return appine_cpu_run(c);
     appine_sync_dit(c);
-    /* 先登记 cpu、再看 flushing（见 flush_world） */
+    /* Register the cpu first, then look at flushing (see flush_world) */
     __atomic_store_n(&t->cpu, c, __ATOMIC_SEQ_CST);
     enum appine_exit r = appine_guard_run(dbt_run, t, c);
     if (UNLIKELY(r == APPINE_EXIT_HOST_FAULT)) {
-        /* guard 已经放开了持有的锁。停着等清空的线程不能一直等下去 */
+        /* The guard has already released the locks held. Threads stopped waiting for a flush
+         * must not wait forever */
         pthread_mutex_lock(&d->lock);
         d->poisoned = true;
         __atomic_store_n(&d->flushing, false, __ATOMIC_SEQ_CST);

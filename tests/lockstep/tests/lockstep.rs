@@ -1,7 +1,8 @@
-//! `cargo test` 里的 lockstep：每个类别默认 20000 条指令，种子每次随机。
+//! lockstep within `cargo test`: 20000 instructions per class by default, with a random seed
+//! each time.
 //!
-//! 环境变量 `APPINE_LOCKSTEP_ITERS` 和 `APPINE_LOCKSTEP_SEED` 可以覆盖默认值；
-//! 失败信息里带有复现命令。
+//! The environment variables `APPINE_LOCKSTEP_ITERS` and `APPINE_LOCKSTEP_SEED` override the
+//! defaults; failure messages include a command to reproduce.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

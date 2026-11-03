@@ -1,4 +1,4 @@
-/* 引擎内部共享的辅助函数：soft-MMU 快速路径与 guest 访存。 */
+/* Helpers shared inside the engine: the soft-MMU fast path and guest memory access. */
 #ifndef APPINE_ENGINE_INTERNAL_H
 #define APPINE_ENGINE_INTERNAL_H
 
@@ -8,28 +8,32 @@
 
 #include "appine/engine.h"
 
-#define TLB_INVALID 0 /* TLB 的 tag 是 ~页号，页号不可能全为 1 */
+#define TLB_INVALID 0 /* a TLB tag is ~page number, and a page number cannot be all ones */
 #define PAGE_MASK (APPINE_PAGE_SIZE - 1)
 
-/* 页表叶子表项 = host 页地址 | 权限位；host 页 4K 对齐，低 12 位空闲 */
+/* Leaf page-table entry = host page address | permission bits; host pages are 4K-aligned, so the
+ * low 12 bits are free */
 #define PTE_PROT_MASK UINT64_C(0x7)
 
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 /*
- * 写入代码之后让取指看到新代码，与 compiler-rt 的 __clear_cache 在 aarch64 上的做法相同。
- * 不用 __builtin___clear_cache：Rust 链接 Android 的动态库时不带 compiler-rt，那个符号
- * 在加载时找不到。代码经由另一个地址写入时（W^X 双映射），数据缓存按写入的地址
- * start + write_delta 清理，指令缓存按执行的地址 start 作废。
+ * Make instruction fetch see new code after it is written, the same way compiler-rt's
+ * __clear_cache does on aarch64. __builtin___clear_cache is not used: when Rust links the Android
+ * shared library it does not include compiler-rt, and that symbol is not found at load time. When
+ * code is written through another address (W^X double mapping), the data cache is cleaned by the
+ * written address start + write_delta and the instruction cache is invalidated by the executed
+ * address start.
  */
 #if defined(__aarch64__) && defined(__linux__)
-/* 宿主的 CTR_EL0。只读一次：有些内核为了绕过勘误会让 EL0 读 CTR_EL0 陷入内核 */
+/* The host's CTR_EL0. Read only once: some kernels make EL0 reads of CTR_EL0 trap into the kernel
+ * to work around errata */
 static inline uint64_t host_ctr(void)
 {
     static uint64_t cached;
     uint64_t ctr = __atomic_load_n(&cached, __ATOMIC_RELAXED);
-    if (!ctr) { /* bit 31 恒为 1，0 表示还没读过 */
+    if (!ctr) { /* bit 31 is always 1, so 0 means not read yet */
         __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
         __atomic_store_n(&cached, ctr, __ATOMIC_RELAXED);
     }
@@ -42,7 +46,7 @@ static inline void sync_code_ranges(void *const *start, void *const *end, unsign
 {
 #if defined(__aarch64__) && defined(__linux__)
     uint64_t ctr = host_ctr(), addr;
-    /* CTR_EL0.IDC：数据缓存不需要清到统一点 */
+    /* CTR_EL0.IDC: the data cache need not be cleaned to the point of unification */
     if (!((ctr >> 28) & 1)) {
         uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
         for (unsigned i = 0; i < n; i++)
@@ -51,14 +55,15 @@ static inline void sync_code_ranges(void *const *start, void *const *end, unsign
                 __asm__ volatile("dc cvau, %0" ::"r"(addr + (uint64_t)write_delta) : "memory");
     }
     __asm__ volatile("dsb ish" ::: "memory");
-    /* CTR_EL0.DIC：指令缓存不需要作废 */
+    /* CTR_EL0.DIC: the instruction cache need not be invalidated */
     if (!((ctr >> 29) & 1)) {
         uint64_t line = UINT64_C(4) << (ctr & 15);
         for (unsigned i = 0; i < n; i++)
             for (addr = (uint64_t)(uintptr_t)start[i] & ~(line - 1); addr < (uint64_t)(uintptr_t)end[i];
                  addr += line)
                 __asm__ volatile("ic ivau, %0" ::"r"(addr) : "memory");
-        /* 这次 dsb 要等作废广播完成，比作废本身贵得多：几段代码合在一起同步，只等一次 */
+        /* This dsb waits for the invalidation broadcast to complete, which costs much more than
+         * the invalidation itself: several code ranges are synced together so it waits only once */
         __asm__ volatile("dsb ish" ::: "memory");
     }
     __asm__ volatile("isb" ::: "memory");
@@ -70,9 +75,11 @@ static inline void sync_code_ranges(void *const *start, void *const *end, unsign
 }
 
 /*
- * 只做缓存维护、不等它完成也不做上下文同步（sync_code_ranges 去掉 dsb、isb）：用于改写
- * 链接点这种"旧指令照样正确、新指令迟一点被看到也没关系"的地方。维护操作总会完成，
- * 之后取指迟早看到新指令；在那之前执行的还是旧指令。
+ * Only do the cache maintenance, without waiting for it to complete and without context
+ * synchronization (sync_code_ranges without the dsb and isb): for places such as rewriting link
+ * points, where "the old instruction is still correct and it does not matter if the new one is
+ * seen a little later". The maintenance always completes, after which instruction fetch sees the
+ * new instruction sooner or later; until then the old instruction still executes.
  */
 static inline void publish_code_lazily(void *start, void *end, intptr_t write_delta)
 {
@@ -105,14 +112,15 @@ static inline void sync_icache(void *start, void *end)
 }
 
 /*
- * 分配一块存放生成代码的内存（Tier 1 的代码缓存、原生指令桩），按 W^X 映射（§12 第 8 条）：
- * 同一段共享内存映射两次，执行用返回的地址，写入用它加上 *rw_delta。宿主不允许
- * 双映射时退回 RWX，*rw_delta 为 0。失败时返回 NULL。只在 aarch64 Linux 上可用。
+ * Allocate memory for generated code (Tier 1's code cache, native instruction stubs), mapped W^X
+ * (§12 item 8): the same shared memory is mapped twice; execution uses the returned address and
+ * writing uses it plus *rw_delta. If the host does not allow double mapping, fall back to RWX with
+ * *rw_delta 0. Returns NULL on failure. Available only on aarch64 Linux.
  */
 uint32_t *appine_map_code(size_t bytes, intptr_t *rw_delta);
 void appine_unmap_code(uint32_t *code, size_t bytes, intptr_t rw_delta);
 
-/* soft-MMU 页表（mmu.c）：Tier 1 的 TLB 回填例程也按这个结构遍历 */
+/* soft-MMU page table (mmu.c): Tier 1's TLB refill routine also walks this structure */
 #define MMU_LEVELS 4
 #define MMU_LEVEL_BITS 9
 
@@ -120,13 +128,13 @@ struct appine_mmu {
     uintptr_t *root;
 };
 
-/* 返回 gva 所在页的叶子表项，未映射时返回 0 */
+/* Return the leaf entry of gva's page, or 0 if it is not mapped */
 uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva);
 
-/* TLB 未命中：查页表并填充 TLB，失败返回 NULL */
+/* TLB miss: look up the page table and fill the TLB; returns NULL on failure */
 void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access);
 
-/* Linux 对 EL0 开启了 TBI：数据访问忽略地址的高 8 位 */
+/* Linux enables TBI for EL0: data accesses ignore the top 8 bits of the address */
 static inline uint64_t untag(uint64_t va)
 {
     return va & UINT64_C(0x00ffffffffffffff);
@@ -162,8 +170,10 @@ static inline bool raise_fault(struct appine_cpu *cpu, uint64_t va, uint32_t acc
 }
 
 /*
- * 访问 [va, va + n) 命中了硬件观察点（type 是 APPINE_WATCH_* 的组合，读改写两种都算）。
- * 页表检查之后、产生副作用之前调用：与硬件一样，转换错误优先，命中时指令不执行。
+ * The access [va, va + n) hits a hardware watchpoint (type is a combination of APPINE_WATCH_*; a
+ * read-modify-write counts as both). Called after the page-table check and before any side
+ * effect: as on hardware, translation faults take priority, and on a hit the instruction is not
+ * executed.
  */
 static inline bool watch_hit(const struct appine_cpu *cpu, uint64_t va, uint64_t n, uint32_t type)
 {
@@ -178,8 +188,9 @@ static inline bool watch_hit(const struct appine_cpu *cpu, uint64_t va, uint64_t
 }
 
 /*
- * 读写 guest 内存（n ≤ 16）。跨页访问会先确认两页都可访问，再拷贝。
- * 失败时记录 fault 并返回 false，不产生任何副作用。
+ * Read and write guest memory (n ≤ 16). A cross-page access first confirms that both pages are
+ * accessible, then copies.
+ * On failure, record the fault and return false, without any side effect.
  */
 static inline bool mem_read(struct appine_cpu *cpu, uint64_t va, void *out, unsigned n)
 {
@@ -229,54 +240,56 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
     return true;
 }
 
-/* 执行一条已经取到的指令 */
-/* ---- 宿主故障兜底（guard.c）---- */
+/* Execute an instruction that has already been fetched */
+/* ---- Host fault guard (guard.c) ---- */
 
 /*
- * 上着保险运行 fn(ctx, cpu)：期间宿主的 SIGSEGV、SIGBUS、SIGILL 让它返回
- * APPINE_EXIT_HOST_FAULT（appine_fault_guard_install() 之后才生效）。fn 不能调用 malloc，
- * 拿到的锁都要登记。
+ * Run fn(ctx, cpu) under the guard: meanwhile a host SIGSEGV, SIGBUS or SIGILL makes it return
+ * APPINE_EXIT_HOST_FAULT (effective only after appine_fault_guard_install()). fn must not call
+ * malloc, and every lock it takes must be registered.
  */
 enum appine_exit appine_guard_run(enum appine_exit (*fn)(void *, struct appine_cpu *), void *ctx,
                                   struct appine_cpu *cpu);
 
-/* 刚拿到一把锁（rw 为真时是 pthread_rwlock_t，否则是 pthread_mutex_t）：保险期间出了故障
- * 时由 appine_guard_run() 释放 */
+/* Just took a lock (a pthread_rwlock_t when rw is true, otherwise a pthread_mutex_t): released by
+ * appine_guard_run() if a fault occurs under the guard */
 void appine_guard_hold(void *lock, bool rw);
 
-/* 马上要释放最近登记的那把锁 */
+/* About to release the most recently registered lock */
 void appine_guard_drop(void);
 
-/* ---- CPU 特性（features.c）---- */
+/* ---- CPU features (features.c) ---- */
 
-/* guest 特性集合是否包含 hwcap 里的全部位 */
+/* Whether the guest feature set contains all bits in hwcap */
 bool appine_has(uint64_t hwcap);
 
-/* 同上，AT_HWCAP2 的位 */
+/* Same, for AT_HWCAP2 bits */
 bool appine_has2(uint64_t hwcap2);
-/* 宿主线程的 PSTATE.DIT 跟着 guest 的（cpu.c） */
+/* Make the host thread's PSTATE.DIT follow the guest's (cpu.c) */
 void appine_sync_dit(struct appine_cpu *cpu);
 
-/* EL0 读取 ID 寄存器空间时的值；key 是 MRS 编码的 bits 20:5，不在该空间时返回 false */
+/* The value EL0 reads from the ID register space; key is bits 20:5 of the MRS encoding; returns
+ * false outside that space */
 bool appine_id_register(unsigned key, uint64_t *value);
 
-/* ---- 原生指令桩（native.c）---- */
+/* ---- Native instruction stubs (native.c) ---- */
 
 /*
- * 原生桩在宿主 CPU 上执行一条 guest 指令（engine 的 map）：通用寄存器字段被
- * 换成宿主临时寄存器，执行前从 cpu 结构体读入、执行后写回。fp 为真时还会
- * 载入并写回 V0–V31、FPCR、FPSR 和 NZCV。
+ * A native stub executes one guest instruction on the host CPU (the engine map): general-register
+ * fields are replaced with host temporaries, loaded from the cpu struct before execution and
+ * written back after it. When fp is true it also loads and writes back V0–V31, FPCR, FPSR and
+ * NZCV.
  */
 struct native_operand {
-    uint8_t pos;   /* 寄存器字段的起始位 */
-    uint8_t pair;  /* 字段表示一对相邻寄存器（CASP） */
-    uint8_t load;  /* 执行前读入 guest 值 */
-    uint8_t store; /* 执行后写回 */
+    uint8_t pos;   /* start bit of the register field */
+    uint8_t pair;  /* the field names a pair of adjacent registers (CASP) */
+    uint8_t load;  /* load the guest value before execution */
+    uint8_t store; /* write back after execution */
 };
 
 struct native_desc {
     uint8_t fp;
-    uint8_t addr_pos; /* 地址寄存器字段的起始位，NATIVE_NO_ADDR 表示没有 */
+    uint8_t addr_pos; /* start bit of the address register field, NATIVE_NO_ADDR if none */
     uint8_t n;
     struct native_operand gpr[3];
 };
@@ -288,26 +301,29 @@ typedef void (*native_fn)(struct appine_cpu *cpu, void *host_addr);
 bool appine_native_available(void);
 
 /*
- * 取得（必要时生成）insn 的原生桩并执行；原生桩不可用时返回 false。同一条
- * insn 的 desc 必须总是相同。可以从多个线程同时调用。
+ * Get (generating it if needed) the native stub for insn and execute it; returns false when
+ * native stubs are unavailable. desc must always be the same for the same insn. May be called from
+ * several threads at once.
  */
 bool appine_native_exec(uint32_t insn, const struct native_desc *desc, struct appine_cpu *cpu,
                         void *host_addr);
 
-/* ---- SIMD&FP（simd.c）与原子访存（atomic.c）---- */
+/* ---- SIMD&FP (simd.c) and atomic memory access (atomic.c) ---- */
 
-/* SIMD&FP 数据处理指令是否在白名单内；是则填好原生桩的描述 */
+/* Whether a SIMD&FP data-processing instruction is in the whitelist; if so, fill in the native
+ * stub's description */
 bool appine_simd_dp_decode(uint32_t insn, struct native_desc *desc);
 
-/* SIMD&FP 访存（bit 26 为 1 的 load/store 编码） */
+/* SIMD&FP memory access (load/store encodings with bit 26 set) */
 enum appine_exit appine_simd_ldst(struct appine_cpu *cpu, uint32_t insn);
 
-/* 独占访问、acquire/release、LSE 原子操作；编码不属于这些类别时返回 UNDEF */
+/* Exclusive accesses, acquire/release and LSE atomics; returns UNDEF when the encoding is not in
+ * these classes */
 enum appine_exit appine_atomic_exec(struct appine_cpu *cpu, uint32_t insn);
 
 enum appine_exit appine_interp_exec(struct appine_cpu *cpu, uint32_t insn);
 
-/* 从 cpu->pc 取指并执行一条指令（Tier 0 的单步） */
+/* Fetch from cpu->pc and execute one instruction (Tier 0's single step) */
 enum appine_exit appine_interp_step(struct appine_cpu *cpu);
 
 #endif /* APPINE_ENGINE_INTERNAL_H */

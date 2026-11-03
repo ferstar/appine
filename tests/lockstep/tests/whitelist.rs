@@ -1,7 +1,8 @@
-//! Tier 0 的指令白名单与 LLVM 反汇编器逐条对照（engine 的 map）。
+//! Tier 0's instruction whitelist compared one by one with the LLVM disassembler (the engine
+//! map).
 //!
-//! 需要 Linux aarch64 宿主和 llvm-mc（`APPINE_LLVM_MC` 或 PATH 中的 llvm-mc），
-//! 缺少任何一个时跳过。样本数可以用 `APPINE_WHITELIST_SAMPLES` 调整。
+//! Needs a Linux aarch64 host and llvm-mc (`APPINE_LLVM_MC` or llvm-mc in PATH); skipped when
+//! either is missing. The number of samples can be adjusted with `APPINE_WHITELIST_SAMPLES`.
 
 #[cfg(lockstep_native)]
 #[test]

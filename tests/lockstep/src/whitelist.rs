@@ -1,9 +1,9 @@
-//! 白名单对照（engine 的 map）：Tier 0 认为能执行的编码，必须恰好是 LLVM 在
-//! 我们所宣告的特性下能解码的编码。
+//! Whitelist cross-check (the engine map): the encodings Tier 0 considers executable must be
+//! exactly the encodings LLVM can decode with the features we advertise.
 //!
-//! lockstep 用硬件检查语义，但硬件分不清一条编码属于 ARMv8.0 基础集还是我们
-//! 没有宣告的扩展（比如 FP16）。LLVM 的反汇编器只解码启用了的特性，正好补上
-//! 这一块。
+//! lockstep checks semantics with the hardware, but the hardware cannot tell whether an encoding
+//! belongs to the ARMv8.0 base set or to an extension we do not advertise (FP16, for example).
+//! LLVM's disassembler only decodes enabled features, which fills exactly that gap.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -14,19 +14,19 @@ use appine_engine::{Cpu, Exit, Mmu, hwcap, hwcap2};
 
 use crate::rng::Rng;
 
-/// 一个被抽样的编码空间。
+/// A sampled encoding space.
 pub struct Space {
-    /// 名字。
+    /// Name.
     pub name: &'static str,
-    /// 固定为 1 或 0 的位。
+    /// Bits fixed at 1 or 0.
     pub mask: u32,
-    /// 这些位的取值。
+    /// The values of those bits.
     pub value: u32,
-    /// guest 特性集合有这些 HWCAP 位时这个空间里才有能执行的编码。
+    /// The space has executable encodings only when the guest feature set has these HWCAP bits.
     pub requires: u64,
 }
 
-/// 全部抽样空间。
+/// All sampled spaces.
 pub const SPACES: &[Space] = &[
     Space {
         name: "simd_fp_dp",
@@ -37,7 +37,7 @@ pub const SPACES: &[Space] = &[
     Space {
         name: "simd_ldst",
         mask: 0x0e00_0000,
-        value: 0x0c00_0000, // bits 27:25 = 110：bit 26 = 1 的访存
+        value: 0x0c00_0000, // bits 27:25 = 110: memory accesses with bit 26 = 1
         requires: 0,
     },
     Space {
@@ -61,33 +61,33 @@ pub const SPACES: &[Space] = &[
     Space {
         name: "adc_flags",
         mask: 0x1fe0_0000,
-        value: 0x1a00_0000, // ADC、SBC 和 FlagM 的 RMIF、SETF8、SETF16
+        value: 0x1a00_0000, // ADC, SBC and FlagM's RMIF, SETF8, SETF16
         requires: 0,
     },
     Space {
         name: "rcpc_unscaled",
         mask: 0x3f20_0c00,
-        value: 0x1900_0000, // LRCPC2 的 LDAPUR*、STLUR*
+        value: 0x1900_0000, // LRCPC2's LDAPUR*, STLUR*
         requires: hwcap::ILRCPC,
     },
 ];
 
-/// 一处分歧。
+/// One disagreement.
 #[derive(Debug, Clone)]
 pub struct Disagreement {
-    /// 编码空间。
+    /// Encoding space.
     pub space: &'static str,
-    /// 指令编码。
+    /// Instruction encoding.
     pub insn: u32,
-    /// Tier 0 是否认为能执行。
+    /// Whether Tier 0 considers it executable.
     pub tier0: bool,
-    /// LLVM 是否能解码（在宣告的特性下）。
+    /// Whether LLVM can decode it (with the advertised features).
     pub llvm: bool,
-    /// LLVM 打开全部特性时的反汇编，用来辨认是哪条指令。
+    /// LLVM's disassembly with all features enabled, to identify the instruction.
     pub text: String,
 }
 
-/// 找到可用的 llvm-mc：环境变量 `APPINE_LLVM_MC`，否则在 PATH 里找。
+/// Finds a usable llvm-mc: the environment variable `APPINE_LLVM_MC`, otherwise from PATH.
 pub fn find_llvm_mc() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("APPINE_LLVM_MC") {
         return Some(PathBuf::from(p));
@@ -107,10 +107,11 @@ pub fn find_llvm_mc() -> Option<PathBuf> {
     })
 }
 
-/// guest 特性集合对应的 LLVM `-mattr`。
+/// The LLVM `-mattr` for a guest feature set.
 fn mattr(caps: u64, caps2: u64) -> String {
     let flag = |on: bool, name: &str| format!("{}{name}", if on { '+' } else { '-' });
-    // LLVM 的 fullfp16 同时管标量和向量的半精度，guest 也总是一起宣告
+    // LLVM's fullfp16 covers both scalar and vector half precision, and the guest always
+    // advertises them together too
     let mut attrs = vec![flag(caps & hwcap::FPHP != 0, "fullfp16")];
     attrs.push(flag(caps & hwcap::FP != 0, "fp-armv8"));
     attrs.push(flag(caps & hwcap::ASIMD != 0, "neon"));
@@ -119,7 +120,7 @@ fn mattr(caps: u64, caps2: u64) -> String {
     attrs.push(flag(caps & hwcap::CRC32 != 0, "crc"));
     attrs.push(flag(caps & hwcap::ATOMICS != 0, "lse"));
     attrs.push(flag(caps & hwcap::ASIMDDP != 0, "dotprod"));
-    // LLVM 的 sha3 同时管 SHA3 和 SHA512，guest 也总是一起宣告
+    // LLVM's sha3 covers both SHA3 and SHA512, and the guest always advertises them together too
     attrs.push(flag(caps & hwcap::SHA3 != 0, "sha3"));
     attrs.push(flag(caps2 & hwcap2::I8MM != 0, "i8mm"));
     attrs.push(flag(caps & hwcap::LRCPC != 0, "rcpc"));
@@ -136,7 +137,8 @@ fn mattr(caps: u64, caps2: u64) -> String {
     attrs.join(",")
 }
 
-/// 用 llvm-mc 反汇编一批编码，返回每条是否合法以及反汇编文本。
+/// Disassembles a batch of encodings with llvm-mc, returning whether each is valid and its
+/// disassembly text.
 fn disassemble(llvm_mc: &Path, insns: &[u32], mattr: &str, dir: &Path) -> Vec<(bool, String)> {
     let input = dir.join(format!("whitelist-{}.txt", std::process::id()));
     let mut text = String::new();
@@ -182,20 +184,22 @@ fn disassemble(llvm_mc: &Path, insns: &[u32], mattr: &str, dir: &Path) -> Vec<(b
         .collect()
 }
 
-/// 一个编码空间的抽样统计。
+/// Sampling statistics of one encoding space.
 #[derive(Debug, Clone)]
 pub struct SpaceReport {
-    /// 编码空间。
+    /// Encoding space.
     pub space: &'static str,
-    /// 样本数。
+    /// Number of samples.
     pub samples: usize,
-    /// Tier 0 认为能执行的样本数。
+    /// Number of samples Tier 0 considers executable.
     pub defined: usize,
-    /// guest 有这个空间要的特性（没有时空间里不该有能执行的编码）。
+    /// The guest has the features this space needs (without them the space should have no
+    /// executable encodings).
     pub available: bool,
 }
 
-/// 抽样比对 Tier 0 与 LLVM。返回各空间的统计和分歧列表（最多 `limit` 条）。
+/// Compares Tier 0 with LLVM by sampling. Returns each space's statistics and the list of
+/// disagreements (at most `limit`).
 pub fn check(
     llvm_mc: &Path,
     samples: usize,
@@ -206,7 +210,7 @@ pub fn check(
     let caps2 = appine_engine::guest_hwcap2();
     let dir = std::env::temp_dir();
     let mmu = Mmu::new();
-    // SAFETY: mmu 比 cpu 先声明、后析构
+    // SAFETY: mmu is declared before cpu and dropped after it
     let mut cpu = unsafe { Cpu::new(&mmu) };
     let mut found = Vec::new();
     let mut reports = Vec::new();
@@ -236,7 +240,8 @@ pub fn check(
         if disagree.is_empty() {
             continue;
         }
-        // 用全部特性再反汇编一次，辨认分歧的编码是哪条指令
+        // Disassemble again with all features, to identify which instruction a disagreeing
+        // encoding is
         let codes: Vec<u32> = disagree.iter().map(|d| d.0).collect();
         let full = disassemble(llvm_mc, &codes, "+all", &dir);
         for ((insn, tier0, llvm), (_, text)) in disagree.into_iter().zip(full) {

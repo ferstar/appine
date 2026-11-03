@@ -1,8 +1,9 @@
-// lockstep 的原生执行跳板。
+// lockstep's native execution trampoline.
 //
-// 整段代码会被拷贝进一个 JIT 页，被测指令（最多 4 条）写在 lockstep_tramp_slot
-// 处，所以这里只能用位置无关、不引用外部符号的指令。被测指令不能读写 SP，
-// 寄存器的保存与恢复全部经由栈完成。
+// The whole code is copied into a JIT page, with the tested instructions (at most 4) written at
+// lockstep_tramp_slot, so only position-independent instructions that reference no external
+// symbols can be used here. The tested instructions must not read or write SP, and all register
+// saving and restoring goes through the stack.
 //
 //   void tramp(struct lockstep_state *st);
 //
@@ -26,7 +27,7 @@ lockstep_tramp_start:
     stp     d12, d13, [sp, #-16]!
     stp     d14, d15, [sp, #-16]!
     mrs     x1, fpcr
-    stp     x0, x1, [sp, #-16]!         // st 和宿主 FPCR
+    stp     x0, x1, [sp, #-16]!         // st and the host FPCR
 
     ldr     x1, [x0, #768]
     msr     fpcr, x1
@@ -69,7 +70,7 @@ lockstep_tramp_start:
     ldp     x0, x1, [x0]
 
 lockstep_tramp_slot:
-    nop                                 // 被测指令，最多 4 条
+    nop                                 // tested instructions, at most 4
     nop
     nop
     nop
@@ -100,7 +101,7 @@ lockstep_tramp_slot:
     add     x1, x1, #8
     cmp     x1, #256
     b.ne    1b
-    add     x1, x0, #256                // V 寄存器此时还没被动过
+    add     x1, x0, #256                // the V registers have not been touched yet
     stp     q0, q1, [x1, #0]
     stp     q2, q3, [x1, #32]
     stp     q4, q5, [x1, #64]
@@ -124,7 +125,7 @@ lockstep_tramp_slot:
 
     add     sp, sp, #256
     ldp     x0, x1, [sp], #16
-    msr     fpcr, x1                    // 恢复宿主 FPCR
+    msr     fpcr, x1                    // restore the host FPCR
     ldp     d14, d15, [sp], #16
     ldp     d12, d13, [sp], #16
     ldp     d10, d11, [sp], #16

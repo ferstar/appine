@@ -1,13 +1,15 @@
 /*
- * 独占访问、acquire/release 与 LSE 原子操作（engine 的 map）。
+ * Exclusive accesses, acquire/release and LSE atomics (the engine map).
  *
- * LDXR/STXR 不能交给宿主原样执行：两条指令之间我们自己的代码会访问内存，
- * 宿主的独占监视器随时可能被清掉，导致 STXR 永远失败。这里改用"比较并交换"
- * 模拟：LDXR 记下地址、长度和读到的值，STXR 在宿主地址上做 CAS，只有内存值
- * 仍等于记下的值才成功（与 QEMU 的做法相同，允许 ABA）。
+ * LDXR/STXR cannot be handed to the host as they are: our own code accesses memory between the
+ * two instructions, and the host's exclusive monitor may be cleared at any time, so STXR could
+ * fail forever. Instead they are emulated with compare-and-swap: LDXR records the address, size
+ * and loaded value, and STXR does a CAS on the host address, succeeding only if the memory value
+ * still equals the recorded one (the same approach as QEMU, ABA allowed).
  *
- * LSE 原子指令（LDADD、SWP、CAS、CASP 等）本身就是单条指令，交给原生桩在
- * 翻译后的宿主地址上执行，语义和内存序与硬件完全一致。
+ * LSE atomic instructions (LDADD, SWP, CAS, CASP and so on) are single instructions themselves,
+ * and run as native stubs on the translated host address, with semantics and memory ordering
+ * exactly as on the hardware.
  */
 #include "internal.h"
 
@@ -38,9 +40,10 @@ static uint64_t get_x(const struct appine_cpu *c, unsigned r)
 }
 
 /*
- * 取得一次对齐访问的宿主地址。这类指令要求自然对齐，否则是对齐错误；对齐的
- * 访问不会跨页。access 为写时同时要求可读。watch 是这次访问算作哪种硬件观察点
- * （APPINE_WATCH_*，读改写两种都算）。
+ * Gets the host address of an aligned access. These instructions require natural alignment,
+ * otherwise it is an alignment fault; an aligned access never crosses a page. When access is
+ * write, read permission is also required. watch is which kind of hardware watchpoint this
+ * access counts as (APPINE_WATCH_*; a read-modify-write counts as both).
  */
 static void *atomic_target_off(struct appine_cpu *c, unsigned rn, int64_t off, unsigned bytes,
                                uint32_t access, uint32_t watch)
@@ -84,7 +87,8 @@ static void load_atomic(const void *p, unsigned bytes, bool acquire, uint64_t ou
     case 8: out[0] = __atomic_load_n((const uint64_t *)p, order); break;
     default: {
 #ifdef __aarch64__
-        /* 16 字节：用一对独占加载保证单次拷贝原子性，读完立即清掉宿主监视器 */
+        /* 16 bytes: a pair of exclusive loads guarantees single-copy atomicity, and the host
+         * monitor is cleared right after the read */
         uint64_t lo, hi;
         __asm__ volatile("ldaxp %0, %1, [%2]\n\tclrex" : "=&r"(lo), "=&r"(hi) : "r"(p) : "memory");
         out[0] = lo;
@@ -148,7 +152,7 @@ static bool cas(void *p, unsigned bytes, const uint64_t expected[2], const uint6
     }
 }
 
-/* LDXR/LDAXR/LDXP/LDAXP、STXR/STLXR/STXP/STLXP */
+/* LDXR/LDAXR/LDXP/LDAXP, STXR/STLXR/STXP/STLXP */
 static enum appine_exit exclusive(struct appine_cpu *c, uint32_t insn, bool pair)
 {
     unsigned size = FIELD(insn, 31, 30), load = BIT(insn, 22), ordered = BIT(insn, 15);
@@ -222,7 +226,8 @@ static enum appine_exit acquire_release(struct appine_cpu *c, uint32_t insn)
     return next(c);
 }
 
-/* LDAPR、LDAPRB、LDAPRH（LRCPC）：照 LDAR 读，acquire 比 RCpc 更强，架构允许 */
+/* LDAPR, LDAPRB, LDAPRH (LRCPC): read as LDAR does; acquire is stronger than RCpc, which the
+ * architecture allows */
 static enum appine_exit load_acquire_rcpc(struct appine_cpu *c, uint32_t insn)
 {
     unsigned bytes = 1u << FIELD(insn, 31, 30), rt = insn & 31;
@@ -236,8 +241,9 @@ static enum appine_exit load_acquire_rcpc(struct appine_cpu *c, uint32_t insn)
 }
 
 /*
- * LRCPC2 的 STLUR*、LDAPUR*、LDAPURS*：基址加 9 位有符号偏移，照 STLR、LDAR 读写（要对齐）。
- * opc 是 00 写、01 读后补零、10 读后按符号扩展到 64 位、11 扩展到 32 位
+ * LRCPC2's STLUR*, LDAPUR*, LDAPURS*: base plus a 9-bit signed offset, written and read as STLR
+ * and LDAR do (alignment required). opc is 00 store, 01 load with zero extension, 10 load with
+ * sign extension to 64 bits, 11 extension to 32 bits
  */
 static enum appine_exit rcpc_unscaled(struct appine_cpu *c, uint32_t insn)
 {
@@ -264,7 +270,7 @@ static enum appine_exit rcpc_unscaled(struct appine_cpu *c, uint32_t insn)
     return next(c);
 }
 
-/* 在翻译后的宿主地址上原样执行一条 LSE 指令 */
+/* Executes one LSE instruction as is on the translated host address */
 static enum appine_exit native_atomic(struct appine_cpu *c, uint32_t insn, unsigned bytes,
                                       const struct native_desc *d)
 {
@@ -282,11 +288,12 @@ enum appine_exit appine_atomic_exec(struct appine_cpu *c, uint32_t insn)
     bool lse = appine_has(APPINE_HWCAP_ATOMICS);
     unsigned size = FIELD(insn, 31, 30);
 
-    if ((insn & 0x3f000000) == 0x08000000) { /* 独占访问、acquire/release、CAS、CASP */
+    if ((insn & 0x3f000000) == 0x08000000) { /* exclusives, acquire/release, CAS, CASP */
         unsigned o2 = BIT(insn, 23), o1 = BIT(insn, 21), o0 = BIT(insn, 15);
         /*
-         * 架构规定"应当全为 1"的字段（SBO）：独占访问和 LDAR/STLR 忽略它们；
-         * CAS/CASP 的 Rt2 必须全为 1，否则是未分配的编码。与 LLVM 的解码一致。
+         * Fields the architecture says "should be one" (SBO): exclusive accesses and LDAR/STLR
+         * ignore them; CAS/CASP need Rt2 all ones, otherwise the encoding is unallocated. This
+         * matches LLVM's decoding.
          */
         bool rt2_ones = FIELD(insn, 14, 10) == 31;
         if (!o2 && !o1)
@@ -294,7 +301,7 @@ enum appine_exit appine_atomic_exec(struct appine_cpu *c, uint32_t insn)
         if (!o2 && o1) {
             if (size >= 2)
                 return exclusive(c, insn, true);
-            /* CASP：Rs、Rt 都必须是偶数编号的寄存器对 */
+            /* CASP: Rs and Rt must both be even-numbered register pairs */
             unsigned rs = FIELD(insn, 20, 16), rt = insn & 31;
             if (!lse || (rs & 1) || (rt & 1) || !rt2_ones)
                 return undef(c, insn);
@@ -303,29 +310,31 @@ enum appine_exit appine_atomic_exec(struct appine_cpu *c, uint32_t insn)
             d.gpr[1] = (struct native_operand){.pos = 0, .pair = 1, .load = 1};
             return native_atomic(c, insn, 8u << size, &d);
         }
-        if (o2 && !o1) /* LDAR/STLR；o0 = 0 的 LDLAR/STLLR 属于 LOR 扩展 */
+        if (o2 && !o1) /* LDAR/STLR; LDLAR/STLLR with o0 = 0 belong to the LOR extension */
             return o0 ? acquire_release(c, insn) : undef(c, insn);
         if (!lse || !rt2_ones)
             return undef(c, insn);
-        struct native_desc d = {.addr_pos = 5, .n = 2}; /* CAS：Rs 既是比较值也接收旧值 */
+        /* CAS: Rs is both the compare value and where the old value is returned */
+        struct native_desc d = {.addr_pos = 5, .n = 2};
         d.gpr[0] = (struct native_operand){.pos = 16, .load = 1, .store = 1};
         d.gpr[1] = (struct native_operand){.pos = 0, .load = 1};
         return native_atomic(c, insn, 1u << size, &d);
     }
 
-    /* size 11 没有带符号扩展的读，size 10 没有扩展到 32 位的 */
+    /* size 11 has no sign-extending load, size 10 none extending to 32 bits */
     if ((insn & 0x3f200c00) == 0x19000000) {
         unsigned opc = FIELD(insn, 23, 22);
         if (!appine_has(APPINE_HWCAP_ILRCPC) || (size == 3 && opc >= 2) || (size == 2 && opc == 3))
             return undef(c, insn);
         return rcpc_unscaled(c, insn);
     }
-    /* LDAPR 在 LSE 那一组里：A = 1、R = 0、Rs 全是 1（LLVM 认的只有这一种）、o3 = 1、opc = 100 */
+    /* LDAPR is in the LSE group: A = 1, R = 0, Rs all ones (the only form LLVM accepts), o3 = 1,
+     * opc = 100 */
     if ((insn & 0x3ffffc00) == 0x38bfc000)
         return appine_has(APPINE_HWCAP_LRCPC) ? load_acquire_rcpc(c, insn) : undef(c, insn);
-    if ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26)) { /* LD<op>、SWP */
+    if ((insn & 0x3f200c00) == 0x38200000 && !BIT(insn, 26)) { /* LD<op>, SWP */
         unsigned o3 = BIT(insn, 15), opc = FIELD(insn, 14, 12);
-        if (!lse || (o3 && opc != 0)) /* o3 = 1 且 opc ≠ 0 的另外几种未定义 */
+        if (!lse || (o3 && opc != 0)) /* the other forms with o3 = 1 and opc ≠ 0 are undefined */
             return undef(c, insn);
         struct native_desc d = {.addr_pos = 5, .n = 2};
         d.gpr[0] = (struct native_operand){.pos = 16, .load = 1};

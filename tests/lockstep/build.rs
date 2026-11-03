@@ -1,4 +1,5 @@
-//! 原生执行端只能在 Linux aarch64 宿主上编译；其他宿主上 lockstep 测试自动跳过。
+//! The native side can only be compiled on Linux aarch64 hosts; on other hosts the lockstep tests
+//! are skipped automatically.
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(lockstep_native)");

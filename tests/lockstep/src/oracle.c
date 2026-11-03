@@ -1,10 +1,11 @@
 /*
- * lockstep 的原生执行端：在宿主 CPU 上执行被测指令（最多 4 条），作为解释器的
- * 标准答案（设计文档 §13.3）。只支持 Linux aarch64 宿主。
+ * lockstep's native side: runs the tested instructions (at most 4) on the host CPU as the
+ * reference answer for the interpreter (design doc §13.3). Only Linux aarch64 hosts are
+ * supported.
  *
- * 被测指令如果在硬件上触发信号（多数是 SIGILL），信号处理函数会 siglongjmp
- * 回 lockstep_oracle_run()，并把信号编号作为返回值。访存类的被测指令只能访问
- * lockstep_oracle_data() 返回的两页数据区。
+ * If a tested instruction raises a signal on the hardware (mostly SIGILL), the signal handler
+ * siglongjmps back to lockstep_oracle_run() and returns the signal number. Tested memory access
+ * instructions may only access the two-page data area returned by lockstep_oracle_data().
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -27,7 +28,7 @@ struct lockstep_state {
 #define SLOTS 4
 #define DATA_BYTES 8192
 
-_Static_assert(sizeof(struct lockstep_state) == 784, "布局要与 oracle.S 一致");
+_Static_assert(sizeof(struct lockstep_state) == 784, "the layout must match oracle.S");
 
 extern const uint8_t lockstep_tramp_start[], lockstep_tramp_slot[], lockstep_tramp_end[];
 
@@ -54,7 +55,8 @@ static void on_signal(int sig, siginfo_t *info, void *ucontext)
         caught = sig;
         siglongjmp(*active_jmp, 1);
     }
-    /* 不是被测指令触发的：恢复原来的处理方式，返回后出错指令会再次触发它 */
+    /* Not raised by a tested instruction: restore the original handling; after returning, the
+     * faulting instruction raises it again */
     for (size_t i = 0; i < NSIGNALS; i++) {
         if (caught_signals[i] == sig)
             sigaction(sig, &previous_actions[i], NULL);
@@ -114,7 +116,8 @@ uint64_t lockstep_oracle_slot(const struct lockstep_oracle *oracle)
     return (uint64_t)(uintptr_t)(oracle->page + oracle->slot_offset);
 }
 
-/* 跳板所在页的内容（只读视图），供解释器一侧复制，以便 LDR (literal) 读到相同的字节 */
+/* The contents of the trampoline's page (a read-only view), for the interpreter side to copy so
+ * that LDR (literal) reads the same bytes */
 const uint8_t *lockstep_oracle_page(const struct lockstep_oracle *oracle)
 {
     return oracle->page;
@@ -125,8 +128,8 @@ uint8_t *lockstep_oracle_data(const struct lockstep_oracle *oracle)
     return oracle->data;
 }
 
-/* 执行 n 条指令（不足 4 条的用 NOP 补齐）。返回 0 表示正常执行，正数是触发的
- * 信号编号，-1 表示参数错误或宿主调用失败 */
+/* Runs n instructions (padded with NOPs to 4). Returns 0 for normal execution, a positive signal
+ * number when one was raised, and -1 for invalid arguments or a failed host call */
 int lockstep_oracle_run(struct lockstep_oracle *oracle, const uint32_t *insns, unsigned n,
                         struct lockstep_state *st)
 {

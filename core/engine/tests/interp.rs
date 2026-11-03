@@ -1,7 +1,9 @@
-//! 解释器的单元测试：访存、分支、系统指令和 soft-MMU。
+//! Unit tests for the interpreter: memory accesses, branches, system instructions and the
+//! soft-MMU.
 //!
-//! 数据处理指令由 lockstep 对照硬件测试（tests/lockstep）；M0 的 lockstep
-//! 不能执行访存和控制流指令，所以它们在这里用固定编码测试。编码取自 GNU as。
+//! Data processing instructions are tested against hardware by lockstep (tests/lockstep); M0's
+//! lockstep cannot execute memory access and control flow instructions, so they are tested here
+//! with fixed encodings. The encodings come from GNU as.
 
 use std::ptr::NonNull;
 
@@ -10,13 +12,13 @@ use appine_engine::{Access, Cpu, Exit, FaultKind, Mmu, PAGE_SIZE, hwcap, hwcap2,
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
 
-/// 两个可读写的数据页映射在 `DATA`，另有一页只读映射在 `RODATA`。
+/// Two read-write data pages are mapped at `DATA`, and one read-only page at `RODATA`.
 const DATA: u64 = 0x10000;
 const RODATA: u64 = 0x20000;
 const CODE: u64 = 0x40_0000;
 
 struct Guest {
-    // 析构顺序：cpu → mmu → pages
+    // Drop order: cpu → mmu → pages
     cpu: Cpu,
     mmu: Mmu,
     pages: Box<[Page]>,
@@ -41,7 +43,7 @@ impl Guest {
         g
     }
 
-    /// guest 地址对应的宿主字节（只支持本测试映射的页）。
+    /// The host bytes for a guest address (only the pages this test maps are supported).
     fn bytes(&mut self, addr: u64) -> &mut [u8] {
         let (page, off) = match addr {
             a if (DATA..DATA + 2 * PAGE_SIZE).contains(&a) => {
@@ -74,7 +76,7 @@ impl Guest {
         self.cpu.state().pc
     }
 
-    /// 执行一条指令，要求正常完成，并且 pc 前进 4。
+    /// Executes one instruction, requiring it to complete normally and pc to advance by 4.
     fn step(&mut self, insn: u32) {
         let pc = self.pc();
         assert_eq!(self.cpu.exec_insn(insn), None, "insn {insn:#010x}");
@@ -173,7 +175,7 @@ fn access_crossing_a_page_boundary() {
 #[test]
 fn faults_have_no_side_effects() {
     let mut g = Guest::new();
-    // 第二页未映射：整条指令失败，x0 不变
+    // The second page is unmapped: the whole instruction fails and x0 is unchanged
     g.set_x(0, 0x5555);
     g.set_x(1, DATA + 2 * PAGE_SIZE + 1);
     assert_eq!(
@@ -187,7 +189,7 @@ fn faults_have_no_side_effects() {
     assert_eq!(g.x(0), 0x5555);
     assert_eq!(g.pc(), CODE);
 
-    // 前变址写失败时基址寄存器不回写
+    // When a pre-index store fails, the base register is not written back
     g.set_x(1, 0x5008);
     assert!(matches!(
         g.cpu.exec_insn(0xf81f8c22), // str x2, [x1, #-8]!
@@ -199,7 +201,7 @@ fn faults_have_no_side_effects() {
     ));
     assert_eq!(g.x(1), 0x5008);
 
-    // 只读页不可写
+    // A read-only page cannot be written
     g.set_x(1, RODATA);
     assert!(matches!(
         g.cpu.exec_insn(0x79000422), // strh w2, [x1, #2]
@@ -227,7 +229,7 @@ fn sp_based_access_must_be_aligned() {
             ..
         })
     ));
-    g.step(0xf98003e0); // prfm pldl1keep, [sp]：预取不检查对齐
+    g.step(0xf98003e0); // prfm pldl1keep, [sp]: prefetch does not check alignment
     g.cpu.state_mut().sp = DATA + 16;
     g.put_u64(DATA + 16, 9);
     g.step(0xf94003e0);
@@ -247,27 +249,28 @@ fn data_accesses_ignore_the_top_byte() {
 fn unimplemented_encodings_are_undefined() {
     let mut g = Guest::new();
     for insn in [
-        0x1ee84020, // 半精度的 frint32z 未定义
-        0xd50331ff, // CRm 不是 0 的 sb 未定义
-        0xd500411f, // CRm 不是 0 的 cfinv 未定义
-        0xd503413f, // msr ssbs, #1：SSBS 不宣告
-        0xce62c020, // sm3partw1 v0.4s, v1.4s, v2.4s：SM3 不在白名单内
-        0xcec08420, // sm4e v0.4s, v1.4s：SM4 不在白名单内
-        0x6e02fc20, // size 00 的 bfdot：BF16 只有 size 01、11
-        0x2ec2f420, // 双精度的 fcadd 只有 128 位的形式
-        0x6e02cc20, // size 00 的 fcmla 未定义
-        0x4f42e020, // 按元素的 sdot 要 32 位的元素（size = 01 未定义）
-        0xd9800020, // size 11、opc 10：没有扩展到 64 位的 LDAPURS
-        0xb8a0c020, // Rs 不全是 1 的 ldapr（LLVM 不认）
+        0x1ee84020, // half-precision frint32z is undefined
+        0xd50331ff, // sb with nonzero CRm is undefined
+        0xd500411f, // cfinv with nonzero CRm is undefined
+        0xd503413f, // msr ssbs, #1: SSBS is not advertised
+        0xce62c020, // sm3partw1 v0.4s, v1.4s, v2.4s: SM3 is not in the whitelist
+        0xcec08420, // sm4e v0.4s, v1.4s: SM4 is not in the whitelist
+        0x6e02fc20, // bfdot with size 00: BF16 only has size 01 and 11
+        0x2ec2f420, // double-precision fcadd only has the 128-bit form
+        0x6e02cc20, // fcmla with size 00 is undefined
+        0x4f42e020, // by-element sdot needs 32-bit elements (size = 01 is undefined)
+        0xd9800020, // size 11, opc 10: there is no LDAPURS extending to 64 bits
+        0xb8a0c020, // ldapr with Rs not all ones (LLVM rejects it)
         0x00000000, // udf #0
-        0xd51bd060, // msr tpidrro_el0, x0：EL0 不可写
+        0xd51bd060, // msr tpidrro_el0, x0: EL0 cannot write it
     ] {
         assert_eq!(g.cpu.exec_insn(insn), Some(Exit::Undefined { insn }));
         assert_eq!(g.pc(), CODE);
     }
 }
 
-/// SIMD&FP 和原生桩只在 aarch64 Linux 宿主上可用（HWCAP 会如实反映，见 engine 的 map）。
+/// SIMD&FP and native stubs are available only on aarch64 Linux hosts (HWCAP reflects this
+/// faithfully; see the engine map).
 fn has_simd() -> bool {
     let need = hwcap::FP | hwcap::ASIMD;
     appine_engine::guest_hwcap() & need == need
@@ -280,7 +283,7 @@ fn exclusive_store_succeeds_only_after_a_matching_load() {
     g.set_x(1, DATA);
     g.set_x(3, 9);
     g.set_x(2, 7);
-    g.step(0xc8027c23); // stxr w2, x3, [x1]：没有独占标记，失败
+    g.step(0xc8027c23); // stxr w2, x3, [x1]: no exclusive mark, fails
     assert_eq!((g.x(2), g.get_u64(DATA)), (1, 5));
 
     g.step(0xc85f7c20); // ldxr x0, [x1]
@@ -290,10 +293,10 @@ fn exclusive_store_succeeds_only_after_a_matching_load() {
 
     g.step(0xc85f7c20); // ldxr x0, [x1]
     g.step(0xd5033f5f); // clrex
-    g.step(0xc8027c23); // stxr w2, x3, [x1]：标记已被清除
+    g.step(0xc8027c23); // stxr w2, x3, [x1]: the mark has been cleared
     assert_eq!(g.x(2), 1);
 
-    g.set_x(1, DATA + 4); // 未对齐：对齐错误
+    g.set_x(1, DATA + 4); // misaligned: alignment fault
     assert!(matches!(
         g.cpu.exec_insn(0xc85f7c20),
         Some(Exit::Fault {
@@ -345,12 +348,12 @@ fn id_registers_match_hwcap() {
         _ => 0,
     };
     assert_eq!((isar0 >> 52) & 0xf, ts);
-    // FlagM2、DPB2 只在前一级上宣告
+    // FlagM2 and DPB2 are advertised only on top of the previous level
     assert!(caps2 & hwcap2::FLAGM2 == 0 || caps & hwcap::FLAGM != 0);
     assert!(caps2 & hwcap2::DCPODP == 0 || caps & hwcap::DCPOP != 0);
-    // FHM 只和 FP16 一起宣告
+    // FHM is advertised only together with FP16
     assert!(caps & hwcap::ASIMDFHM == 0 || caps & hwcap::FPHP != 0);
-    // SHA3、SHA512 只一起宣告
+    // SHA3 and SHA512 are advertised only together
     assert_eq!(caps & hwcap::SHA3 != 0, caps & hwcap::SHA512 != 0);
     g.step(0xd5380620); // mrs x0, id_aa64isar1_el1
     let i8mm = appine_engine::guest_hwcap2() & hwcap2::I8MM != 0;
@@ -373,7 +376,8 @@ fn id_registers_match_hwcap() {
     assert_eq!(g.x(0) & 0xf, dpb);
     assert_eq!(caps2 & hwcap2::FRINT != 0, (g.x(0) >> 32) & 0xf == 1);
     assert_eq!(caps & hwcap::SB != 0, (g.x(0) >> 36) & 0xf == 1);
-    // ID_AA64PFR0_EL1 的 FP、AdvSIMD：带半精度时是 1；两者只一起宣告
+    // FP and AdvSIMD of ID_AA64PFR0_EL1: 1 when half precision is included; the two are
+    // advertised only together
     g.step(0xd5380400); // mrs x0, id_aa64pfr0_el1
     let (fp, simd) = ((g.x(0) >> 16) & 0xf, (g.x(0) >> 20) & 0xf);
     if caps & hwcap::FP != 0 {
@@ -404,11 +408,11 @@ fn ldapr_follows_the_feature_set() {
     g.set_x(1, DATA + 1);
     g.step(0x38bfc023); // ldaprb w3, [x1]
     assert_eq!(g.x(3), 0x77);
-    // 只读的页上也能读
+    // Readable on a read-only page as well
     g.set_x(1, RODATA);
     g.step(0xb8bfc024); // ldapr w4, [x1]
     assert_eq!(g.x(4), g.get_u64(RODATA) & 0xffff_ffff);
-    // 与 LDAR 一样要对齐
+    // Requires alignment, like LDAR
     g.set_x(1, DATA + 1);
     assert!(matches!(
         g.cpu.exec_insn(0xb8bfc020),
@@ -435,14 +439,14 @@ fn lrcpc2_follows_the_feature_set() {
     g.step(ldapur);
     assert_eq!(g.x(0), 0x8899_aabb);
     g.set_x(1, DATA + 8);
-    g.step(0x199fd022); // ldapursb x2, [x1, #-3]：第 5 个字节 0xaa 按符号扩展到 64 位
+    g.step(0x199fd022); // ldapursb x2, [x1, #-3]: the 5th byte 0xaa sign-extended to 64 bits
     assert_eq!(g.x(2), 0xffff_ffff_ffff_ffaa);
-    g.step(0x19dfd023); // ldapursb w3, [x1, #-3]：扩展到 32 位
+    g.step(0x19dfd023); // ldapursb w3, [x1, #-3]: extended to 32 bits
     assert_eq!(g.x(3), 0xffff_ffaa);
     g.set_x(4, 0x1234_5678_9abc_def0);
     g.step(0xd9000024); // stlur x4, [x1]
     assert_eq!(g.get_u64(DATA + 8), 0x1234_5678_9abc_def0);
-    // 与 LDAR 一样要对齐
+    // Requires alignment, like LDAR
     g.set_x(1, DATA + 1);
     assert!(matches!(
         g.cpu.exec_insn(ldapur),
@@ -484,7 +488,8 @@ fn sha3_and_i8mm_follow_the_feature_set() {
         );
         return;
     }
-    // 2x8 乘 8x2：v4 的两行是 1..=8 和全 -1，v5 的两列是全 1 和 0、1、0、1……
+    // 2x8 times 8x2: the two rows of v4 are 1..=8 and all -1, the two columns of v5 are all 1 and
+    // 0, 1, 0, 1, ...
     let row0: Vec<u8> = (1..=8).collect();
     let s = g.cpu.state_mut();
     s.v[3] = [100, 0];
@@ -513,7 +518,8 @@ fn dot_product_follows_the_feature_set() {
         assert_eq!(g.cpu.exec_insn(sdot), Some(Exit::Undefined { insn: sdot }));
         return;
     }
-    // v1 的字节是 -1、2、-3、4……，v2 全是 3：每组四个之和是 -3 + 6 - 9 + 12 = 6
+    // The bytes of v1 are -1, 2, -3, 4, ..., v2 is all 3: each group of four sums to
+    // -3 + 6 - 9 + 12 = 6
     let a: Vec<u8> = (1..=16i8)
         .map(|i| if i % 2 == 1 { -i } else { i } as u8)
         .collect();
@@ -535,7 +541,7 @@ fn dot_product_follows_the_feature_set() {
         ]
     };
     assert_eq!(lanes(g.cpu.state().v[0]), [16, 26, 36, 46]);
-    // udot v3.4s, v1.16b, v2.4b[1]：v2 的第 1 个 32 位元素是 3、3、3、3，按无符号算
+    // udot v3.4s, v1.16b, v2.4b[1]: the 32-bit element 1 of v2 is 3, 3, 3, 3, taken as unsigned
     g.step(0x6fa2e023);
     let sum = |k: usize| {
         a[4 * k..4 * k + 4]
@@ -561,14 +567,14 @@ fn half_precision_follows_the_feature_set() {
         }
         return;
     }
-    // 1.0 + 2.0 = 3.0（0x3c00 + 0x4000 = 0x4200），标量写清掉高位
+    // 1.0 + 2.0 = 3.0 (0x3c00 + 0x4000 = 0x4200); a scalar write clears the high part
     let s = g.cpu.state_mut();
     s.v[0] = [u64::MAX; 2];
     s.v[1] = [0x3c00, 0];
     s.v[2] = [0x4000, 0];
     g.step(fadd);
     assert_eq!(g.cpu.state().v[0], [0x4200, 0]);
-    // 每个半精度元素 1.0 + 1.5 × 2.0 = 4.0（0x4400）
+    // Each half-precision element: 1.0 + 1.5 × 2.0 = 4.0 (0x4400)
     let s = g.cpu.state_mut();
     s.v[0] = [0x3c00_3c00_3c00_3c00; 2];
     s.v[1] = [0x3e00_3e00_3e00_3e00; 2];
@@ -579,9 +585,11 @@ fn half_precision_follows_the_feature_set() {
     assert_eq!(g.cpu.state().v[0], [0x3c00_3c00_3c00_3c00; 2]);
 }
 
-/// RDM、FCMA、FHM、BF16 各挑一两条：宣告了才能执行，结果与架构的定义相同。
-/// FlagM、FlagM2、SB、DPB、DPB2：不宣告时未定义；宣告时 NZCV 按 ARM ARM 的伪代码变化，
-/// SB 什么也不做，DC CVAP、CVADP 只按读访问检查地址。
+/// One or two instructions each from RDM, FCMA, FHM, BF16: executable only when advertised, with
+/// results as the architecture defines them.
+/// FlagM, FlagM2, SB, DPB, DPB2: undefined when not advertised; when advertised, NZCV changes as
+/// in the ARM ARM pseudocode, SB does nothing, and DC CVAP and CVADP only check the address for
+/// read access.
 #[test]
 fn flagm_sb_dpb_follow_the_feature_set() {
     let mut g = Guest::new();
@@ -615,7 +623,8 @@ fn flagm_sb_dpb_follow_the_feature_set() {
                 }
             }
             0xba02040a => {
-                // 0xa0 循环右移 4 位，低 4 位 1010：mask 1010 选中 N、C，Z、V 不变
+                // 0xa0 rotated right by 4, low 4 bits 1010: mask 1010 selects N and C; Z and V
+                // are unchanged
                 g.set_x(0, 0xa0);
                 g.cpu.state_mut().nzcv = nzcv(0, 1, 0, 1);
                 g.step(insn);
@@ -676,8 +685,8 @@ fn flagm_sb_dpb_follow_the_feature_set() {
     }
 }
 
-/// DIT：MSR DIT, #imm 与硬件一样取 CRm 的最低位，MSR、MRS DIT 只有第 24 位；不宣告时
-/// 都是未定义指令。
+/// DIT: MSR DIT, #imm takes the lowest bit of CRm as the hardware does, and MSR and MRS DIT have
+/// only bit 24; when not advertised they are all undefined instructions.
 #[test]
 fn dit_follows_the_feature_set() {
     let mut g = Guest::new();
@@ -690,11 +699,11 @@ fn dit_follows_the_feature_set() {
         }
         return;
     }
-    // 宿主线程的 DIT 跟着 guest 的（appine_sync_dit）
+    // The host thread's DIT follows the guest's (appine_sync_dit)
     #[cfg(target_arch = "aarch64")]
     let host = || {
         let v: u64;
-        // SAFETY: mrs x0, dit（宣告了 DIT 说明宿主有它）
+        // SAFETY: mrs x0, dit (DIT being advertised means the host has it)
         unsafe { std::arch::asm!(".inst 0xd53b42a0", out("x0") v) };
         v >> 24
     };
@@ -719,8 +728,9 @@ fn dit_follows_the_feature_set() {
     assert_eq!(host(), 0);
 }
 
-/// FRINTTS：舍入成整数值，超出 32、64 位整数范围的和 NaN 得到最小的那个整数，并且置
-/// FPSR.IOC。运算由宿主执行，这里核对白名单和寄存器的去向。
+/// FRINTTS: rounds to an integral value; values outside the 32- or 64-bit integer range and NaN
+/// give the most negative integer and set FPSR.IOC. The host does the computation; this checks
+/// the whitelist and where the registers go.
 #[test]
 fn frintts_follows_the_feature_set() {
     if !has_simd() {
@@ -787,7 +797,8 @@ fn rdm_fcma_fhm_bf16_follow_the_feature_set() {
         }
         let s = g.cpu.state_mut();
         match insn {
-            // 0.5 × 0.5 加到 Q15 的累加值上：d + 0x2000，上半部分饱和到 0x7fff
+            // 0.5 × 0.5 accumulated into a Q15 value: d + 0x2000, the upper half saturating to
+            // 0x7fff
             0x6e428420 => {
                 s.v[0] = [0x1000_1000_1000_1000, 0x7000_7000_7000_7000];
                 s.v[1] = [0x4000_4000_4000_4000; 2];
@@ -798,19 +809,21 @@ fn rdm_fcma_fhm_bf16_follow_the_feature_set() {
                 s.v[1] = [1f64.to_bits(), 2f64.to_bits()];
                 s.v[2] = [3f64.to_bits(), 4f64.to_bits()];
             }
-            // (1 + 2^-10)² 在单精度里累加：1 + 2^-9 + 2^-20，半精度表示不了最后一项
+            // (1 + 2^-10)² accumulated in single precision: 1 + 2^-9 + 2^-20, whose last term
+            // half precision cannot represent
             0x4e22ec20 => {
                 s.v[0] = [0; 2];
                 s.v[1] = [0x3c01_3c01_3c01_3c01, u64::MAX];
                 s.v[2] = [0x3c01_3c01_3c01_3c01, u64::MAX];
             }
-            // 每个单精度元素 1.0 + 2 × 3 + 2 × 3 = 13.0
+            // Each single-precision element: 1.0 + 2 × 3 + 2 × 3 = 13.0
             0x6e42fc20 => {
                 s.v[0] = [0x3f80_0000_3f80_0000; 2];
                 s.v[1] = [0x4000_4000_4000_4000; 2];
                 s.v[2] = [0x4040_4040_4040_4040; 2];
             }
-            // 0x3f818000 正好在 0x3f81 和 0x3f82 中间，舍入到偶数；标量写清掉高位
+            // 0x3f818000 is exactly halfway between 0x3f81 and 0x3f82 and rounds to even; a
+            // scalar write clears the high part
             _ => {
                 s.v[0] = [u64::MAX; 2];
                 s.v[1] = [0x3f81_8000, 0];
@@ -842,7 +855,7 @@ fn javascript_conversion_follows_the_feature_set() {
         );
         return;
     }
-    // 按 JavaScript 的 ToInt32 取模 2^32；精确时只有 Z 置位
+    // Modulo 2^32 as JavaScript's ToInt32 does; only Z is set when exact
     for (d, w, z) in [
         (3.0f64, 3u64, true),
         (4294967301.0, 5, false),
@@ -881,7 +894,7 @@ fn branches() {
     assert_eq!(g.pc(), pc + 8);
 
     g.cpu.state_mut().nzcv = 0;
-    g.step(0x54000040); // b.eq .+8：Z=0，不跳
+    g.step(0x54000040); // b.eq .+8: Z=0, not taken
     g.cpu.state_mut().nzcv = 1 << 30;
     let pc = g.pc();
     assert_eq!(g.cpu.exec_insn(0x54000040), None);
@@ -909,7 +922,7 @@ fn exceptions_hints_and_system_registers() {
 
     g.step(0xd503201f); // nop
     g.set_x(30, 0x4000_1000);
-    g.step(0xd503233f); // paciasp：按 engine 的 map 当作 NOP
+    g.step(0xd503233f); // paciasp: treated as NOP per the engine map
     assert_eq!(g.x(30), 0x4000_1000);
     g.step(0xd5033bbf); // dmb ish
 
@@ -921,7 +934,7 @@ fn exceptions_hints_and_system_registers() {
     g.step(0xd53bd060); // mrs x0, tpidrro_el0
     assert_eq!(g.x(0), 0);
 
-    g.step(0xd53b00e5); // mrs x5, dczid_el0：64 字节块，允许 DC ZVA
+    g.step(0xd53b00e5); // mrs x5, dczid_el0: 64-byte blocks, DC ZVA allowed
     assert_eq!(g.x(5), 4);
     g.bytes(DATA + 0x80)[..0x100].fill(0xaa);
     g.set_x(3, DATA + 0xc5);
@@ -947,7 +960,7 @@ fn run_fetches_through_the_tlb() {
     assert_eq!(g.cpu.run(), Exit::Svc { imm: 0 });
     assert_eq!(g.x(0), 42);
 
-    // pc 未对齐
+    // Misaligned pc
     g.cpu.state_mut().pc = CODE + 2;
     assert!(matches!(
         g.cpu.run(),
@@ -957,7 +970,7 @@ fn run_fetches_through_the_tlb() {
         }
     ));
 
-    // 数据页不可执行
+    // Data pages are not executable
     g.cpu.state_mut().pc = DATA;
     assert_eq!(
         g.cpu.run(),
@@ -968,7 +981,7 @@ fn run_fetches_through_the_tlb() {
         }
     );
 
-    // 解除映射并刷新 TLB 之后，取指失败
+    // After unmapping and flushing the TLB, instruction fetch fails
     g.mmu.unmap(CODE, PAGE_SIZE).unwrap();
     g.cpu.tlb_flush();
     g.cpu.state_mut().pc = CODE;

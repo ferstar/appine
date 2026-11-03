@@ -1,5 +1,5 @@
-/* CPU 生命周期、软件 TLB 和 Tier 0 解释器的主循环。 */
-#define _DEFAULT_SOURCE /* -std=c17 下 MAP_ANONYMOUS 需要它 */
+/* CPU lifecycle, the software TLB and the main loop of the Tier 0 interpreter. */
+#define _DEFAULT_SOURCE /* needed for MAP_ANONYMOUS under -std=c17 */
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -8,12 +8,14 @@
 #include "internal.h"
 
 /*
- * 直接用 mmap：malloc 的实现可能从堆里分配并逐字节清零（glibc 释放过同样大的块之后
- * 会调高 mmap 的阈值），那样每个线程的 TLB 都会整块占用内存
+ * Use mmap directly: the malloc implementation may allocate from the heap and zero byte by byte
+ * (glibc raises the mmap threshold after a block of the same size has been freed), and then every
+ * thread's TLB would occupy memory in full
  */
 /*
- * 释放的 cpu 留几个给下一个线程：shell 每起一个进程就要一个，新映射一段、TLB 用到的页
- * 逐页缺页、退出时拆掉，比 appine_cpu_init 只清填过的项贵得多
+ * Keep a few freed cpus for the next thread: a shell needs one for every process it starts, and
+ * mapping a new region, faulting in the TLB's pages one by one and tearing it down at exit costs
+ * much more than appine_cpu_init clearing only the filled entries
  */
 #define SPARE_CPUS 8
 static struct {
@@ -52,7 +54,8 @@ void appine_cpu_free(struct appine_cpu *cpu)
 
 void appine_cpu_init(struct appine_cpu *cpu, struct appine_mmu *mmu)
 {
-    /* 数据 TLB 只清掉填过的项：新分配的 cpu 是清零的内存，没碰过的页不必写 */
+    /* Clear only the filled entries of the data TLB: a newly allocated cpu is zeroed memory, and
+     * untouched pages need not be written */
     memset(cpu, 0, offsetof(struct appine_cpu, tlb));
     memset(cpu->v, 0, sizeof(cpu->v));
     cpu->nbrk = cpu->nwatch = 0;
@@ -61,7 +64,8 @@ void appine_cpu_init(struct appine_cpu *cpu, struct appine_mmu *mmu)
     appine_cpu_tlb_flush(cpu);
 }
 
-/* 数据 TLB 有 4096 项，进程频繁 mmap/munmap 时每次都整体清空太贵，只清填充过的项 */
+/* The data TLB has 4096 entries; clearing all of it each time is too expensive when a process
+ * mmaps/munmaps often, so only the filled entries are cleared */
 void appine_cpu_tlb_flush(struct appine_cpu *cpu)
 {
     for (unsigned w = 0; w < APPINE_TLB_ENTRIES / 64; w++) {
@@ -72,10 +76,10 @@ void appine_cpu_tlb_flush(struct appine_cpu *cpu)
         cpu->tlb_used[w] = 0;
     }
     memset(cpu->itlb, 0, sizeof(cpu->itlb));
-    _Static_assert(TLB_INVALID == 0, "清零的表项就是无效的");
+    _Static_assert(TLB_INVALID == 0, "a zeroed entry is an invalid one");
 }
 
-/* 第 vpn 页上的观察点的种类（APPINE_WATCH_*） */
+/* Kinds of the watchpoints on page vpn (APPINE_WATCH_*) */
 static uint32_t watched_page(const struct appine_cpu *cpu, uint64_t vpn)
 {
     uint32_t type = 0;
@@ -106,9 +110,11 @@ void *appine_tlb_fill(struct appine_cpu *cpu, uint64_t va, uint32_t access)
         cpu->itlb[vpn & (APPINE_ITLB_ENTRIES - 1)] = (struct appine_itlb_entry){~vpn, addend};
     } else {
         /*
-         * 有观察点的页不填进去：Tier 1 的访问没命中，退给 Tier 0 检查观察点（Tier 0 不管
-         * 命中与否都检查）。读的一半只看读观察点；写的一半在页上有任何观察点时都不填，
-         * 因为 Tier 1 的原子读改写、独占访问也用写的一半
+         * Pages with watchpoints are not filled in: Tier 1's access misses and falls back to
+         * Tier 0, which checks watchpoints (Tier 0 checks them whether or not it hits). The read
+         * half only looks at read watchpoints; the write half is not filled when the page has any
+         * watchpoint, because Tier 1's atomic read-modify-writes and exclusive accesses also use
+         * the write half
          */
         uint32_t watched = UNLIKELY(cpu->nwatch) ? watched_page(cpu, vpn) : 0;
         unsigned idx = (unsigned)(vpn & (APPINE_TLB_ENTRIES - 1));
@@ -127,7 +133,8 @@ static enum appine_exit cpu_run(void *ctx, struct appine_cpu *cpu)
 {
     (void)ctx;
     for (;;) {
-        /* 先用普通读做快速判断，确实有请求时再原子交换清零，不会吞掉并发到达的 kick */
+        /* Check quickly with a plain load first, and clear with an atomic exchange only when there
+         * really is a request, so a concurrently arriving kick is not swallowed */
         if (UNLIKELY(__atomic_load_n(&cpu->pending, __ATOMIC_RELAXED)) &&
             __atomic_exchange_n(&cpu->pending, 0, __ATOMIC_ACQUIRE))
             return APPINE_EXIT_KICK;
@@ -143,15 +150,17 @@ enum appine_exit appine_cpu_run(struct appine_cpu *cpu)
     return appine_guard_run(cpu_run, NULL, cpu);
 }
 
-/* 宿主线程现在的 PSTATE.DIT：-1 是不知道（新线程从创建它的线程继承） */
+/* The host thread's current PSTATE.DIT: -1 is unknown (a new thread inherits it from the thread
+ * that created it) */
 static __thread int host_dit = -1;
 
 /*
- * 让宿主线程的 DIT 与 guest 的一样（一个宿主线程只跑一个 guest 线程）：Tier 1 原样执行的
- * 数据处理指令这样也有数据无关的执行时间。guest 的 DIT 也会在 MSR 之外变（sigreturn、
- * ptrace、execve），所以每次进入 guest 代码时比较一次。宿主没有 DIT 时不会宣告它，
- * guest 的 DIT 总是 0。Tier 1 翻译时用来问 Tier 0 认不认识指令的探测用 cpu 没有 mmu，
- * 它执行的 MSR DIT 不碰宿主。
+ * Make the host thread's DIT match the guest's (one host thread runs only one guest thread): this
+ * way the data-processing instructions Tier 1 executes verbatim also have data-independent timing.
+ * The guest's DIT also changes outside MSR (sigreturn, ptrace, execve), so it is compared on every
+ * entry into guest code. When the host has no DIT it is not advertised and the guest's DIT is
+ * always 0. The probe cpu that Tier 1 uses during translation to ask Tier 0 whether it recognizes
+ * an instruction has no mmu, and the MSR DIT it executes does not touch the host.
  */
 void appine_sync_dit(struct appine_cpu *cpu)
 {
@@ -169,7 +178,7 @@ void appine_sync_dit(struct appine_cpu *cpu)
 #endif
 }
 
-/* pc 命中了硬件断点（只有 ptrace 设置了断点的线程才有） */
+/* pc hits a hardware breakpoint (only threads with breakpoints set by ptrace have any) */
 static bool brk_hit(const struct appine_cpu *cpu, uint64_t pc)
 {
     for (unsigned i = 0; i < cpu->nbrk; i++)
@@ -185,7 +194,7 @@ enum appine_exit appine_interp_step(struct appine_cpu *cpu)
         raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_ALIGN);
         return APPINE_EXIT_FAULT;
     }
-    /* 与硬件一样在执行这条指令之前 */
+    /* As on hardware, before executing this instruction */
     if (UNLIKELY(cpu->nbrk) && brk_hit(cpu, pc)) {
         raise_fault(cpu, pc, APPINE_ACCESS_EXEC, APPINE_FAULT_BREAK);
         return APPINE_EXIT_FAULT;

@@ -1,4 +1,4 @@
-//! 长时间运行 lockstep：
+//! Long-running lockstep:
 //!
 //! ```text
 //! appine-lockstep [--iterations N] [--seed S] [--class NAME]

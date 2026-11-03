@@ -1,15 +1,15 @@
 /*
- * Tier 0 解释器（engine 的 map）。
+ * The Tier 0 interpreter (the engine map).
  *
- * 覆盖范围：整数数据处理（立即数、寄存器，含 FlagM 的 RMIF、SETF）、CRC32、分支、
- * svc/brk、hint 与屏障（含 SB）、CFINV/XAFLAG/AXFLAG、MSR DIT、
- * NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR/DIT 与 ID 寄存器、整数 load/store
- * （立即数、寄存器偏移、literal、pair）。SIMD&FP 在 simd.c，独占访问与原子
- * 操作在 atomic.c。其余编码一律按未定义指令上报，与 engine 的 map 里的白名单原则一致：
- * 没实现的就不执行。
+ * Coverage: integer data processing (immediate, register, including FlagM's RMIF and SETF),
+ * CRC32, branches, svc/brk, hints and barriers (including SB), CFINV/XAFLAG/AXFLAG, MSR DIT,
+ * NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR/DIT and the ID registers, integer load/store (immediate,
+ * register offset, literal, pair). SIMD&FP is in simd.c, exclusive accesses and atomics in
+ * atomic.c. Every other encoding is reported as an undefined instruction, following the
+ * whitelist principle in the engine map: what is not implemented is not executed.
  *
- * 约定：执行函数返回 APPINE_EXIT_NONE 表示继续；出错时 pc 保持不变，并且
- * 不写回任何寄存器。
+ * Convention: an execution function returns APPINE_EXIT_NONE to continue; on error, pc stays
+ * unchanged and no register is written back.
  */
 #include "internal.h"
 
@@ -19,7 +19,7 @@
 #define NZCV(n, z, c, v)                                                                           \
     (((uint64_t)(n) << 31) | ((uint64_t)(z) << 30) | ((uint64_t)(c) << 29) | ((uint64_t)(v) << 28))
 
-/* 系统寄存器编码：bits 20:5 = op0<1>:op0<0>:op1:CRn:CRm:op2 */
+/* System register encoding: bits 20:5 = op0<1>:op0<0>:op1:CRn:CRm:op2 */
 #define SYSREG(op0, op1, crn, crm, op2)                                                            \
     (((op0) << 14) | ((op1) << 11) | ((crn) << 7) | ((crm) << 3) | (op2))
 #define SYSREG_NZCV SYSREG(3, 3, 4, 2, 0)
@@ -34,23 +34,24 @@
 #define SYSREG_DIT SYSREG(3, 3, 4, 2, 5)
 
 /*
- * guest 读到的 CTR_EL0：64 字节的缓存行，PIPT 指令缓存。DIC = IDC = 0，即修改代码
- * 之后必须执行 dc cvau 和 ic ivau：Tier 1 靠 ic ivau 知道哪些翻译要作废。
+ * The CTR_EL0 the guest reads: 64-byte cache lines, PIPT instruction cache. DIC = IDC = 0, so
+ * after modifying code dc cvau and ic ivau must be executed: Tier 1 relies on ic ivau to know
+ * which translations to invalidate.
  */
 #define CTR_VALUE UINT64_C(0x8444c004)
 
-/* DC ZVA 清零的块大小：DCZID_EL0.BS = 4，即 2^4 个字，与常见的 arm64 核心一致 */
+/* Block size zeroed by DC ZVA: DCZID_EL0.BS = 4, i.e. 2^4 words, as on common arm64 cores */
 #define DCZ_BLOCK 64
 
-/* FPCR 中 AArch64 用户态可写的位：AHP、DN、FZ、RMode；有 FP16 时还有 FZ16 */
+/* FPCR bits writable from AArch64 user mode: AHP, DN, FZ, RMode; with FP16 also FZ16 */
 #define FPCR_MASK UINT64_C(0x07c00000)
 #define FPCR_FZ16 (UINT64_C(1) << 19)
-/* FPSR 中的累积异常位：QC、IDC、IXC、UFC、OFC、DZC、IOC */
+/* Cumulative exception bits in FPSR: QC, IDC, IXC, UFC, OFC, DZC, IOC */
 #define FPSR_MASK UINT64_C(0x0800009f)
 
 typedef struct appine_cpu cpu_t;
 
-/* ---- 通用辅助 ---- */
+/* ---- General helpers ---- */
 
 static inline int64_t sext(uint64_t v, unsigned bits)
 {
@@ -62,13 +63,13 @@ static inline uint64_t ones(unsigned n)
     return n >= 64 ? ~UINT64_C(0) : (UINT64_C(1) << n) - 1;
 }
 
-/* 按数据宽度截断：32 位操作的结果零扩展写回 */
+/* Truncates to the data width: results of 32-bit operations are zero-extended when written back */
 static inline uint64_t narrow(uint64_t v, bool sf)
 {
     return sf ? v : (uint32_t)v;
 }
 
-/* 寄存器 31 在多数编码里是 XZR，在少数编码里是 SP */
+/* Register 31 is XZR in most encodings and SP in a few */
 static inline uint64_t rx(const cpu_t *c, unsigned r)
 {
     return r == 31 ? 0 : c->x[r];
@@ -105,7 +106,7 @@ static inline enum appine_exit undef(cpu_t *c, uint32_t insn)
     return APPINE_EXIT_UNDEF;
 }
 
-/* 以 SP 为基址的访存要求 SP 16 字节对齐（Linux 打开了 SCTLR_EL1.SA0） */
+/* SP-based accesses require SP to be 16-byte aligned (Linux enables SCTLR_EL1.SA0) */
 static inline bool sp_aligned(cpu_t *c, unsigned rn, uint32_t access)
 {
     if (rn == 31 && (c->sp & 15))
@@ -154,7 +155,7 @@ static bool cond_holds(uint64_t nzcv, unsigned cond)
     return r;
 }
 
-/* 在 size 位宽内循环右移 */
+/* Rotates right within size bits */
 static inline uint64_t ror(uint64_t v, unsigned amount, unsigned size)
 {
     if (amount == 0)
@@ -162,7 +163,7 @@ static inline uint64_t ror(uint64_t v, unsigned amount, unsigned size)
     return ((v >> amount) | (v << (size - amount))) & ones(size);
 }
 
-/* shift_type：0 LSL、1 LSR、2 ASR、3 ROR；要求 amount < 数据宽度 */
+/* shift_type: 0 LSL, 1 LSR, 2 ASR, 3 ROR; requires amount < the data width */
 static uint64_t shift_reg(uint64_t v, unsigned type, unsigned amount, bool sf)
 {
     unsigned size = sf ? 64 : 32;
@@ -193,7 +194,7 @@ static uint64_t extend_reg(uint64_t v, unsigned option, unsigned shift, bool sf)
     return narrow(r << shift, sf);
 }
 
-/* ARM ARM 的 DecodeBitMasks()；编码保留时返回 false */
+/* The ARM ARM's DecodeBitMasks(); returns false for reserved encodings */
 static bool decode_bit_masks(unsigned n, unsigned imms, unsigned immr, bool immediate,
                              unsigned size, uint64_t *wmask, uint64_t *tmask)
 {
@@ -229,7 +230,7 @@ static uint64_t rbit64(uint64_t v)
     return __builtin_bswap64(v);
 }
 
-/* ---- 数据处理：立即数 ---- */
+/* ---- Data processing: immediate ---- */
 
 static enum appine_exit dp_imm(cpu_t *c, uint32_t insn)
 {
@@ -328,14 +329,14 @@ static enum appine_exit dp_imm(cpu_t *c, uint32_t insn)
         wx(c, rd, r);
         return next(c);
     }
-    default: /* 带 tag 的加减（MTE）、min/max（CSSC）：不在白名单内 */
+    default: /* add/subtract with tag (MTE), min/max (CSSC): not in the whitelist */
         return undef(c, insn);
     }
 }
 
-/* ---- 数据处理：寄存器 ---- */
+/* ---- Data processing: register ---- */
 
-/* CRC32 系列交给原生桩执行 */
+/* The CRC32 family runs as native stubs */
 static enum appine_exit crc32(cpu_t *c, uint32_t insn)
 {
     struct native_desc d = {.addr_pos = NATIVE_NO_ADDR, .n = 3};
@@ -348,10 +349,13 @@ static enum appine_exit crc32(cpu_t *c, uint32_t insn)
 }
 
 /*
- * FlagM 里按寄存器设标志的两条（ADC 所在的组里 bits 15:10 不为 0 的编码）：
- *   RMIF Xn, #shift, #mask：把 Xn 循环右移 shift 位，低 4 位里 mask 选中的位分别写进 N、Z、C、V；
- *   SETF8/SETF16 Wn：N 是第 7（15）位，Z 是低 8（16）位全为 0，V 是第 8（16）位与第 7（15）
- *   位的异或，C 不变（把有符号的 8、16 位运算的结果换成标志）。
+ * The two FlagM instructions that set flags from a register (encodings in ADC's group with bits
+ * 15:10 nonzero):
+ *   RMIF Xn, #shift, #mask: rotates Xn right by shift bits and writes the bits of the low 4 that
+ *   mask selects into N, Z, C, V respectively;
+ *   SETF8/SETF16 Wn: N is bit 7 (15), Z is whether the low 8 (16) bits are all 0, V is bit 8 (16)
+ *   XOR bit 7 (15), and C is unchanged (turning the result of a signed 8- or 16-bit operation
+ *   into flags).
  */
 static enum appine_exit flags_from_reg(cpu_t *c, uint32_t insn)
 {
@@ -365,7 +369,7 @@ static enum appine_exit flags_from_reg(cpu_t *c, uint32_t insn)
         c->nzcv = (c->nzcv & ~sel) | ((r & 15) << 28 & sel);
         return next(c);
     }
-    if ((insn & 0xffffbc1f) == 0x3a00080d) { /* SETF8、SETF16 */
+    if ((insn & 0xffffbc1f) == 0x3a00080d) { /* SETF8, SETF16 */
         unsigned top = BIT(insn, 14) ? 15 : 7;
         uint64_t low = n & ((UINT64_C(2) << top) - 1);
         unsigned neg = (n >> top) & 1, ovf = ((n >> (top + 1)) ^ (n >> top)) & 1;
@@ -384,7 +388,7 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
 
     if (!BIT(insn, 28)) {
         unsigned imm6 = FIELD(insn, 15, 10), shift = FIELD(insn, 23, 22);
-        if (!(op2 & 8)) { /* 逻辑运算（移位寄存器） */
+        if (!(op2 & 8)) { /* logical (shifted register) */
             unsigned opc = FIELD(insn, 30, 29);
             if (!sf && imm6 >= 32)
                 return undef(c, insn);
@@ -403,12 +407,12 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
             return next(c);
         }
         uint64_t m, n, r;
-        if (!(op2 & 1)) { /* 加减（移位寄存器） */
+        if (!(op2 & 1)) { /* add/subtract (shifted register) */
             if (shift == 3 || (!sf && imm6 >= 32))
                 return undef(c, insn);
             m = shift_reg(rx(c, rm), shift, imm6, sf);
             n = rx(c, rn);
-        } else { /* 加减（扩展寄存器） */
+        } else { /* add/subtract (extended register) */
             unsigned imm3 = FIELD(insn, 12, 10);
             if (shift != 0 || imm3 > 4)
                 return undef(c, insn);
@@ -442,7 +446,7 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
         wx(c, rd, r);
         return next(c);
     }
-    case 2: { /* CCMN/CCMP（寄存器、立即数） */
+    case 2: { /* CCMN/CCMP (register, immediate) */
         if (!BIT(insn, 29) || BIT(insn, 10) || BIT(insn, 4))
             return undef(c, insn);
         if (cond_holds(c->nzcv, FIELD(insn, 15, 12))) {
@@ -482,13 +486,13 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
         unsigned opcode = FIELD(insn, 15, 10);
         unsigned size = sf ? 64 : 32;
         uint64_t n = narrow(rx(c, rn), sf), r;
-        if (!BIT(insn, 30)) { /* 2 源操作数 */
+        if (!BIT(insn, 30)) { /* 2 source operands */
             uint64_t m = narrow(rx(c, rm), sf);
             switch (opcode) {
             case 2: /* UDIV */
                 r = m ? n / m : 0;
                 break;
-            case 3: /* SDIV：除零得 0，最小值 / -1 回绕 */
+            case 3: /* SDIV: division by zero gives 0, minimum / -1 wraps around */
                 if (m == 0)
                     r = 0;
                 else if (sf)
@@ -513,16 +517,16 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
             case 0x14:
             case 0x15:
             case 0x16:
-            case 0x17: /* CRC32B/H/W/X、CRC32CB/H/W/X：X 形式要求 sf = 1 */
+            case 0x17: /* CRC32B/H/W/X, CRC32CB/H/W/X: the X forms require sf = 1 */
                 if (!appine_has(APPINE_HWCAP_CRC32) || sf != ((opcode & 3) == 3))
                     return undef(c, insn);
                 return crc32(c, insn);
-            default: /* PACGA、MTE、CSSC：不在白名单内 */
+            default: /* PACGA, MTE, CSSC: not in the whitelist */
                 return undef(c, insn);
             }
-        } else { /* 1 源操作数 */
+        } else { /* 1 source operand */
             if (rm != 0)
-                return undef(c, insn); /* PAC 系列等 */
+                return undef(c, insn); /* the PAC family and others */
             switch (opcode) {
             case 0: /* RBIT */
                 r = sf ? rbit64(n) : rbit64(n) >> 32;
@@ -532,12 +536,12 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
                               ((n >> 8) & UINT64_C(0x00ff00ff00ff00ff)),
                           sf);
                 break;
-            case 2: /* sf=1：REV32；sf=0：REV */
+            case 2: /* sf=1: REV32; sf=0: REV */
                 r = sf ? ((uint64_t)__builtin_bswap32((uint32_t)(n >> 32)) << 32) |
                              __builtin_bswap32((uint32_t)n)
                        : __builtin_bswap32((uint32_t)n);
                 break;
-            case 3: /* REV（64 位） */
+            case 3: /* REV (64-bit) */
                 if (!sf)
                     return undef(c, insn);
                 r = __builtin_bswap64(n);
@@ -545,7 +549,7 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
             case 4: /* CLZ */
                 r = n == 0 ? size : (sf ? (unsigned)__builtin_clzll(n) : (unsigned)__builtin_clz((uint32_t)n));
                 break;
-            case 5: { /* CLS：最高位之后与它相同的位数 */
+            case 5: { /* CLS: number of bits after the top bit that equal it */
                 uint64_t y = ((n >> 1) ^ n) & ones(size - 1);
                 r = y == 0 ? size - 1 : (unsigned)__builtin_clzll(y) - (64 - size) - 1;
                 break;
@@ -561,7 +565,7 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
         break;
     }
 
-    if (op2 & 8) { /* 3 源操作数 */
+    if (op2 & 8) { /* 3 source operands */
         unsigned op31 = FIELD(insn, 23, 21), o0 = BIT(insn, 15), ra = FIELD(insn, 14, 10);
         uint64_t n = rx(c, rn), m = rx(c, rm), a = rx(c, ra), r;
         if (FIELD(insn, 30, 29))
@@ -603,7 +607,7 @@ static enum appine_exit dp_reg(cpu_t *c, uint32_t insn)
     return undef(c, insn);
 }
 
-/* ---- 分支、异常生成与系统指令 ---- */
+/* ---- Branches, exception generation and system instructions ---- */
 
 static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
 {
@@ -635,7 +639,7 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         else
             c->tpidr_el0 = v;
         return next(c);
-    case SYSREG_DIT: /* 只有第 24 位 */
+    case SYSREG_DIT: /* only bit 24 */
         if (!appine_has(APPINE_HWCAP_DIT))
             return undef(c, insn);
         if (read) {
@@ -645,12 +649,12 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
             appine_sync_dit(c);
         }
         return next(c);
-    case SYSREG_TPIDRRO_EL0: /* Linux 用户态总是读到 0，EL0 不可写 */
+    case SYSREG_TPIDRRO_EL0: /* Linux user mode always reads 0, and EL0 cannot write it */
         if (!read)
             return undef(c, insn);
         wx(c, rt, 0);
         return next(c);
-    case SYSREG_DCZID_EL0: /* DZP = 0：允许 DC ZVA */
+    case SYSREG_DCZID_EL0: /* DZP = 0: DC ZVA allowed */
         if (!read)
             return undef(c, insn);
         wx(c, rt, 4);
@@ -661,8 +665,8 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         wx(c, rt, CTR_VALUE);
         return next(c);
 #ifdef __aarch64__
-    /* 通用计时器：Linux 允许 EL0 读虚拟计数器和频率（Go 和 V8 会用），直接读宿主的，
-     * 与 guest 的 clock_gettime 用的是同一个计数器 */
+    /* Generic timer: Linux lets EL0 read the virtual counter and frequency (Go and V8 use them);
+     * read the host's directly, the same counter the guest's clock_gettime uses */
     case SYSREG_CNTFRQ_EL0:
         if (!read)
             return undef(c, insn);
@@ -677,7 +681,7 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         return next(c);
 #endif
     default: {
-        uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（engine 的 map） */
+        uint64_t id; /* the ID register space, consistent with HWCAP (the engine map) */
         if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(FIELD(insn, 20, 5), &id)) {
             wx(c, rt, id);
             return next(c);
@@ -688,10 +692,11 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
 }
 
 /*
- * MSR（立即数）里只改 NZCV 的三条（op1 = 0、CRm = 0，op2 选哪一条）：
- *   CFINV（FlagM）：C 取反；
- *   XAFLAG（FlagM2）：浮点比较的"外部格式"换成 Arm 的 NZCV；
- *   AXFLAG（FlagM2）：反过来，无序（V）并进 Z、清掉 C，N、V 清零。
+ * The three MSR (immediate) instructions that only change NZCV (op1 = 0, CRm = 0, op2 selects
+ * which):
+ *   CFINV (FlagM): inverts C;
+ *   XAFLAG (FlagM2): converts the "external format" of a floating-point compare into Arm's NZCV;
+ *   AXFLAG (FlagM2): the reverse: merges unordered (V) into Z, clears C, and zeroes N and V.
  */
 static enum appine_exit flags_convert(cpu_t *c, uint32_t insn)
 {
@@ -743,7 +748,7 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         c->pc += take ? (uint64_t)(sext(FIELD(insn, 23, 5), 19) * 4) : 4;
         return APPINE_EXIT_NONE;
     }
-    if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC：异常返回会清掉独占标记 */
+    if ((insn & 0xffe0001f) == 0xd4000001) { /* SVC: exception return clears the exclusive mark */
         c->exit_info = FIELD(insn, 20, 5);
         c->excl_size = 0;
         c->pc += 4;
@@ -753,9 +758,10 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         c->exit_info = FIELD(insn, 20, 5);
         return APPINE_EXIT_BRK;
     }
-    if ((insn & 0xfffff01f) == 0xd503201f) /* HINT：NOP、YIELD、PAC/BTI 系列一律当 NOP（engine 的 map） */
+    /* HINT: NOP, YIELD and the PAC/BTI family are all treated as NOP (the engine map) */
+    if ((insn & 0xfffff01f) == 0xd503201f)
         return next(c);
-    if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障 */
+    if ((insn & 0xfffff01f) == 0xd503301f) { /* barriers */
         switch (FIELD(insn, 7, 5)) {
         case 2: /* CLREX */
             c->excl_size = 0;
@@ -766,26 +772,29 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         case 5: /* DMB */
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
             return next(c);
-        case 7: /* SB：推测执行的屏障，解释执行时没有要挡住的 */
+        case 7: /* SB: a speculation barrier; under interpretation there is nothing to hold back */
             if (FIELD(insn, 11, 8) || !appine_has(APPINE_HWCAP_SB))
                 return undef(c, insn);
             return next(c);
-        default: /* DSB nXS 等不在白名单内 */
+        default: /* DSB nXS and others are not in the whitelist */
             return undef(c, insn);
         }
     }
-    if ((insn & 0xffffff1f) == 0xd500401f) /* MSR（立即数）的 PSTATE.NZCV：CFINV、XAFLAG、AXFLAG */
+    /* MSR (immediate) to PSTATE.NZCV: CFINV, XAFLAG, AXFLAG */
+    if ((insn & 0xffffff1f) == 0xd500401f)
         return flags_convert(c, insn);
-    if ((insn & 0xfffff0ff) == 0xd503405f) { /* MSR DIT, #imm：与硬件一样取 CRm 的最低位 */
+    /* MSR DIT, #imm: takes the lowest bit of CRm, as the hardware does */
+    if ((insn & 0xfffff0ff) == 0xd503405f) {
         if (!appine_has(APPINE_HWCAP_DIT))
             return undef(c, insn);
         c->dit = BIT(insn, 8);
         appine_sync_dit(c);
         return next(c);
     }
-    if ((insn & 0xffd00000) == 0xd5100000) /* MRS / MSR（寄存器） */
+    if ((insn & 0xffd00000) == 0xd5100000) /* MRS / MSR (register) */
         return sysreg_move(c, insn);
-    if ((insn & 0xffffffe0) == 0xd50b7420) { /* DC ZVA：把地址所在的整块清零，块总在一页之内 */
+    /* DC ZVA: zeroes the whole block containing the address; a block is always within one page */
+    if ((insn & 0xffffffe0) == 0xd50b7420) {
         uint64_t va = untag(rx(c, insn & 31)) & ~(uint64_t)(DCZ_BLOCK - 1);
         void *p = tlb_lookup(c, va, APPINE_ACCESS_WRITE);
         if (!p) {
@@ -800,9 +809,10 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         return next(c);
     }
     /*
-     * DC CVAC、DC CVAU、DC CIVAC、IC IVAU，以及 DC CVAP（DPB）、DC CVADP（DPB2）：guest 内存
-     * 就是宿主内存，不需要维护缓存，只按读访问检查地址（宿主内存也不是持久化内存）。ic ivau
-     * 表示 guest 修改了这里的代码，交给调用方作废翻译。
+     * DC CVAC, DC CVAU, DC CIVAC, IC IVAU, and DC CVAP (DPB), DC CVADP (DPB2): guest memory is
+     * host memory, so no cache maintenance is needed; the address is only checked for read access
+     * (host memory is not persistent memory either). ic ivau means the guest modified the code
+     * here, and is handed to the caller to invalidate translations.
      */
     uint32_t cmo = insn & 0xffffffe0;
     if ((cmo == 0xd50b7c20 && !appine_has(APPINE_HWCAP_DCPOP)) ||
@@ -833,7 +843,7 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
     return undef(c, insn);
 }
 
-/* ---- 整数 load/store ---- */
+/* ---- Integer load/store ---- */
 
 enum ldst_kind { K_STORE, K_LOAD, K_LOAD_S64, K_LOAD_S32, K_PRFM, K_UNDEF };
 
@@ -847,7 +857,7 @@ static enum ldst_kind ldst_kind(unsigned size, unsigned opc)
     }
 }
 
-/* 执行一次单寄存器访问；失败时不修改 Rt */
+/* Performs one single-register access; on failure Rt is not modified */
 static bool ldst_access(cpu_t *c, enum ldst_kind kind, unsigned size, uint64_t addr, unsigned rt)
 {
     unsigned n = 1u << size;
@@ -874,12 +884,12 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
     if (BIT(insn, 26))
         return appine_simd_ldst(c, insn);
 
-    if ((insn & 0x3b000000) == 0x39000000) { /* 无符号偏移 */
+    if ((insn & 0x3b000000) == 0x39000000) { /* unsigned offset */
         enum ldst_kind kind = ldst_kind(size, opc);
         if (kind == K_UNDEF)
             return undef(c, insn);
         if (kind == K_PRFM)
-            return next(c); /* 预取只是提示：不访问内存，也不检查对齐 */
+            return next(c); /* prefetch is only a hint: no memory access, no alignment check */
         if (!sp_aligned(c, rn, kind == K_STORE ? APPINE_ACCESS_WRITE : APPINE_ACCESS_READ))
             return APPINE_EXIT_FAULT;
         uint64_t addr = rx_sp(c, rn) + ((uint64_t)FIELD(insn, 21, 10) << size);
@@ -887,13 +897,14 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
             return APPINE_EXIT_FAULT;
         return next(c);
     }
-    if ((insn & 0x3b200000) == 0x38000000) { /* 9 位立即数：非缩放、后变址、非特权、前变址 */
+    /* 9-bit immediate: unscaled, post-index, unprivileged, pre-index */
+    if ((insn & 0x3b200000) == 0x38000000) {
         enum ldst_kind kind = ldst_kind(size, opc);
         unsigned op = FIELD(insn, 11, 10);
         if (kind == K_UNDEF || (kind == K_PRFM && op != 0))
             return undef(c, insn);
         if (kind == K_PRFM)
-            return next(c); /* 预取只是提示：不访问内存，也不检查对齐 */
+            return next(c); /* prefetch is only a hint: no memory access, no alignment check */
         if (!sp_aligned(c, rn, kind == K_STORE ? APPINE_ACCESS_WRITE : APPINE_ACCESS_READ))
             return APPINE_EXIT_FAULT;
         uint64_t base = rx_sp(c, rn);
@@ -905,13 +916,13 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
             wx_sp(c, rn, base + off);
         return next(c);
     }
-    if ((insn & 0x3b200c00) == 0x38200800) { /* 寄存器偏移 */
+    if ((insn & 0x3b200c00) == 0x38200800) { /* register offset */
         enum ldst_kind kind = ldst_kind(size, opc);
         unsigned option = FIELD(insn, 15, 13);
         if (kind == K_UNDEF || !(option & 2))
             return undef(c, insn);
         if (kind == K_PRFM)
-            return next(c); /* 预取只是提示：不访问内存，也不检查对齐 */
+            return next(c); /* prefetch is only a hint: no memory access, no alignment check */
         if (!sp_aligned(c, rn, kind == K_STORE ? APPINE_ACCESS_WRITE : APPINE_ACCESS_READ))
             return APPINE_EXIT_FAULT;
         uint64_t off = extend_reg(rx(c, FIELD(insn, 20, 16)), option, BIT(insn, 12) ? size : 0, true);
@@ -922,7 +933,7 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
     if ((insn & 0x3b000000) == 0x18000000) { /* LDR (literal) */
         uint64_t addr = c->pc + (uint64_t)(sext(FIELD(insn, 23, 5), 19) * 4);
         bool ok;
-        switch (size) { /* 这里 bits 31:30 是 opc */
+        switch (size) { /* here bits 31:30 are opc */
         case 0: ok = ldst_access(c, K_LOAD, 2, addr, rt); break;
         case 1: ok = ldst_access(c, K_LOAD, 3, addr, rt); break;
         case 2: ok = ldst_access(c, K_LOAD_S64, 2, addr, rt); break;
@@ -932,10 +943,11 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
             return APPINE_EXIT_FAULT;
         return next(c);
     }
-    if ((insn & 0x3a000000) == 0x28000000) { /* LDP/STP/LDPSW，含 LDNP/STNP */
+    if ((insn & 0x3a000000) == 0x28000000) { /* LDP/STP/LDPSW, including LDNP/STNP */
         unsigned pair_opc = size, idx = FIELD(insn, 24, 23), load = BIT(insn, 22);
         unsigned rt2 = FIELD(insn, 14, 10);
-        /* opc = 01 只有 LDPSW：STGP（MTE）不在白名单内，也不存在 no-allocate 形式 */
+        /* opc = 01 is only LDPSW: STGP (MTE) is not in the whitelist, and there is no
+         * no-allocate form */
         if (pair_opc == 3 || (pair_opc == 1 && (!load || idx == 0)))
             return undef(c, insn);
         unsigned scale = pair_opc == 2 ? 3 : 2, n = 1u << scale;
@@ -968,10 +980,10 @@ static enum appine_exit ldst(cpu_t *c, uint32_t insn)
             wx_sp(c, rn, base + off);
         return next(c);
     }
-    return appine_atomic_exec(c, insn); /* 独占、acquire/release、LSE 原子操作 */
+    return appine_atomic_exec(c, insn); /* exclusives, acquire/release, LSE atomics */
 }
 
-/* ---- SIMD&FP 数据处理：白名单判定后交给原生桩 ---- */
+/* ---- SIMD&FP data processing: handed to native stubs after the whitelist decision ---- */
 
 static enum appine_exit simd_dp(cpu_t *c, uint32_t insn)
 {
@@ -983,7 +995,7 @@ static enum appine_exit simd_dp(cpu_t *c, uint32_t insn)
     return next(c);
 }
 
-/* ---- 顶层译码 ---- */
+/* ---- Top-level decode ---- */
 
 enum appine_exit appine_interp_exec(cpu_t *c, uint32_t insn)
 {
@@ -1000,7 +1012,7 @@ enum appine_exit appine_interp_exec(cpu_t *c, uint32_t insn)
     case 0xe: return ldst(c, insn);
     case 0x7:
     case 0xf: return simd_dp(c, insn);
-    default: /* 保留空间（含 UDF）、SVE、未分配 */
+    default: /* reserved space (including UDF), SVE, unallocated */
         return undef(c, insn);
     }
 }

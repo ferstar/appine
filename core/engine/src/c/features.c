@@ -1,8 +1,9 @@
 /*
- * guest 可见的 CPU 特性（engine 的 map）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
- * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
- * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16/
- * FRINTTS/FlagM/FlagM2/SB/DPB/DPB2/DIT 等可选指令是否合法。
+ * Guest-visible CPU features (the engine map): host support ∩ implemented by Tier 0 ∩ the
+ * whitelist. HWCAP, the ID registers and /proc/cpuinfo are all generated from this one set, and
+ * the decoders also use it to decide whether optional instructions such as
+ * AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16/
+ * FRINTTS/FlagM/FlagM2/SB/DPB/DPB2/DIT are valid.
  */
 #include <pthread.h>
 
@@ -13,7 +14,8 @@
 #define HOST_IS_AARCH64_LINUX 1
 #endif
 
-/* Tier 0 实现了的特性。FP、ASIMD 和这些可选扩展都依赖原生指令桩 */
+/* Features Tier 0 implements. FP, ASIMD and these optional extensions all depend on native
+ * instruction stubs */
 #define IMPLEMENTED                                                                                \
     (APPINE_HWCAP_FP | APPINE_HWCAP_ASIMD | APPINE_HWCAP_AES | APPINE_HWCAP_PMULL |                \
      APPINE_HWCAP_SHA1 | APPINE_HWCAP_SHA2 | APPINE_HWCAP_CRC32 | APPINE_HWCAP_ATOMICS |          \
@@ -22,17 +24,20 @@
      APPINE_HWCAP_ASIMDRDM | APPINE_HWCAP_FCMA | APPINE_HWCAP_ASIMDFHM)
 #define IMPLEMENTED2 (APPINE_HWCAP2_I8MM | APPINE_HWCAP2_BF16 | APPINE_HWCAP2_FRINT)
 
-/* 不用原生指令桩的：FlagM、FlagM2 由解释器算标志位，SB 和 DC CVAP、DC CVADP 在解释器里不需要
- * 做什么，DIT 记在 cpu 里；Tier 1 原样拷贝 CFINV、AXFLAG、XAFLAG、RMIF、SETF 和 SB，宿主线程的
- * DIT 跟着 guest 的（appine_sync_dit），所以宿主也要有 */
+/* The ones not using native instruction stubs: for FlagM and FlagM2 the interpreter computes the
+ * flags, SB and DC CVAP, DC CVADP need no work in the interpreter, and DIT is kept in the cpu;
+ * Tier 1 copies CFINV, AXFLAG, XAFLAG, RMIF, SETF and SB verbatim, and the host thread's DIT
+ * follows the guest's (appine_sync_dit), so the host must have them too */
 #define INTEGER (APPINE_HWCAP_FLAGM | APPINE_HWCAP_SB | APPINE_HWCAP_DCPOP | APPINE_HWCAP_DIT)
 #define INTEGER2 (APPINE_HWCAP2_FLAGM2 | APPINE_HWCAP2_DCPODP)
 
-/* SHA3、SHA512 只一起宣告，还要有 SHA2：LLVM 的 sha3 特性同时管这两组，白名单的核对分不开，
- * 实际的 CPU 也总是一起实现 */
+/* SHA3 and SHA512 are advertised only together, and also need SHA2: LLVM's sha3 feature covers
+ * both groups, so the whitelist check cannot tell them apart, and real CPUs always implement them
+ * together as well */
 #define SHA3_SET (APPINE_HWCAP_SHA2 | APPINE_HWCAP_SHA3 | APPINE_HWCAP_SHA512)
 
-/* 标量和向量的半精度只一起宣告：白名单按一个开关判定，LLVM 的 fullfp16 也是一个特性 */
+/* Scalar and vector half precision are advertised only together: the whitelist decides by one
+ * switch, and LLVM's fullfp16 is also one feature */
 #define FP16_SET (APPINE_HWCAP_FPHP | APPINE_HWCAP_ASIMDHP)
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -41,28 +46,31 @@ static uint64_t host_midr;
 
 static void detect(void)
 {
-    /* ID 寄存器由我们自己模拟（engine 的 map），与宿主无关 */
+    /* We emulate the ID registers ourselves (the engine map), independently of the host */
     guest_hwcap = APPINE_HWCAP_CPUID;
 #ifdef HOST_IS_AARCH64_LINUX
     uint64_t host = getauxval(AT_HWCAP);
-    /* 没有 FP 和 ASIMD 的宿主不支持任何 SIMD&FP 指令；原生桩不可用时同样如此 */
+    /* A host without FP and ASIMD supports no SIMD&FP instructions; the same holds when native
+     * stubs are unavailable */
     if ((host & APPINE_HWCAP_FP) && (host & APPINE_HWCAP_ASIMD) && appine_native_available()) {
         guest_hwcap |= host & IMPLEMENTED;
         if ((guest_hwcap & SHA3_SET) != SHA3_SET)
             guest_hwcap &= ~(APPINE_HWCAP_SHA3 | APPINE_HWCAP_SHA512);
         if ((guest_hwcap & FP16_SET) != FP16_SET)
             guest_hwcap &= ~FP16_SET;
-        /* FHM 的源操作数是半精度，架构上要求有 FP16（LLVM 的 fp16fml 也隐含 fullfp16） */
+        /* FHM's source operands are half precision, so the architecture requires FP16 (LLVM's
+         * fp16fml also implies fullfp16) */
         if (!(guest_hwcap & APPINE_HWCAP_FPHP))
             guest_hwcap &= ~APPINE_HWCAP_ASIMDFHM;
-        /* LRCPC2 包含 LRCPC（ID 寄存器里是同一个字段） */
+        /* LRCPC2 includes LRCPC (they are the same field in the ID register) */
         if (!(guest_hwcap & APPINE_HWCAP_LRCPC))
             guest_hwcap &= ~APPINE_HWCAP_ILRCPC;
         guest_hwcap2 = getauxval(AT_HWCAP2) & IMPLEMENTED2;
     }
     guest_hwcap |= host & INTEGER;
     guest_hwcap2 |= getauxval(AT_HWCAP2) & INTEGER2;
-    /* FlagM2、DPB2 都是在前一级上加的（ID 寄存器里是同一个字段的 2） */
+    /* FlagM2 and DPB2 are both added on top of the previous level (value 2 of the same field in
+     * the ID register) */
     if (!(guest_hwcap & APPINE_HWCAP_FLAGM))
         guest_hwcap2 &= ~APPINE_HWCAP2_FLAGM2;
     if (!(guest_hwcap & APPINE_HWCAP_DCPOP))
@@ -101,9 +109,9 @@ bool appine_has2(uint64_t hwcap2)
 }
 
 /*
- * EL0 读取 ID 寄存器空间（op0=3, op1=0, CRn=0）时返回的值，与 Linux 在用户态
- * 模拟的行为一致：MIDR 原样返回，MPIDR 只有 bit 31，其余只暴露与 HWCAP 对应
- * 的字段。key 是 MRS 编码的 bits 20:5。
+ * The values returned when EL0 reads the ID register space (op0=3, op1=0, CRn=0), consistent
+ * with what Linux emulates for user mode: MIDR is returned as is, MPIDR has only bit 31, and the
+ * rest expose only the fields corresponding to HWCAP. key is bits 20:5 of the MRS encoding.
  */
 bool appine_id_register(unsigned key, uint64_t *value)
 {
@@ -119,8 +127,8 @@ bool appine_id_register(unsigned key, uint64_t *value)
         else if (op2 == 5)
             v = UINT64_C(1) << 31; /* MPIDR_EL1 */
     } else if (crm == 4 && op2 == 0) { /* ID_AA64PFR0_EL1 */
-        v = 1 | 1 << 4;                /* EL0、EL1 只支持 AArch64 */
-        /* FP、AdvSIMD：0 是基础集，1 是带半精度，f 是没有 */
+        v = 1 | 1 << 4;                /* EL0 and EL1 support AArch64 only */
+        /* FP, AdvSIMD: 0 is the base set, 1 includes half precision, f is absent */
         if (!(h & APPINE_HWCAP_FP))
             v |= UINT64_C(0xf) << 16;
         else if (h & APPINE_HWCAP_FPHP)

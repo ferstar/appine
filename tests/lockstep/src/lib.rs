@@ -1,9 +1,11 @@
-//! 指令级 lockstep 测试（设计文档 §13.3 第 1 层）：宿主 CPU 就是标准答案。
+//! Instruction-level lockstep tests (design doc §13.3, layer 1): the host CPU is the reference
+//! answer.
 //!
-//! 每个随机用例（最多 4 条指令、随机的寄存器和 FP 状态、随机的数据区内容）分别
-//! 在硬件、Tier 0 和 Tier 1（两种寄存器分配各一次，见 `DbtRegs`）上执行一次，逐项比对
-//! X0–X30、NZCV、V0–V31、FPCR、FPSR、PC、SP 和数据区。原生执行端只能在 Linux aarch64 宿主上编译，其他宿主上
-//! [`AVAILABLE`] 为 false。
+//! Each random case (at most 4 instructions, random registers and FP state, random data area
+//! contents) runs once each on the hardware, in Tier 0 and in Tier 1 (once with each of the two
+//! register assignments, see `DbtRegs`), comparing X0–X30, NZCV, V0–V31, FPCR, FPSR, PC, SP and
+//! the data area item by item. The native side can only be compiled on Linux aarch64 hosts; on
+//! other hosts [`AVAILABLE`] is false.
 
 pub mod classes;
 #[cfg(lockstep_native)]
@@ -14,82 +16,86 @@ pub mod whitelist;
 
 use std::fmt;
 
-/// 当前宿主能否运行 lockstep。
+/// Whether the current host can run lockstep.
 pub const AVAILABLE: bool = cfg!(lockstep_native);
 
-/// 被测指令执行前后的状态，布局与 oracle.c 的 `struct lockstep_state` 一致。
+/// The state before and after the tested instructions run, with the same layout as oracle.c's
+/// `struct lockstep_state`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct State {
-    /// X0–X30。
+    /// X0–X30.
     pub x: [u64; 31],
-    /// 条件标志，bit 31..28。
+    /// Condition flags, bits 31..28.
     pub nzcv: u64,
-    /// V0–V31，低 64 位在前。
+    /// V0–V31, low 64 bits first.
     pub v: [[u64; 2]; 32],
-    /// 浮点控制寄存器。
+    /// Floating-point control register.
     pub fpcr: u64,
-    /// 浮点状态寄存器。
+    /// Floating-point status register.
     pub fpsr: u64,
 }
 
-/// 一次运行的参数。
+/// Parameters of one run.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// 每个类别生成多少个用例（再乘以类别的权重）。
+    /// How many cases each class generates (multiplied by the class's weight).
     pub iterations: u64,
-    /// 随机种子；同一个种子总是生成同样的测试序列。
+    /// Random seed; the same seed always generates the same test sequence.
     pub seed: u64,
-    /// 只运行这个类别。
+    /// Run only this class.
     pub class: Option<String>,
 }
 
-/// 一个类别的统计结果。
+/// Statistics for one class.
 #[derive(Debug, Clone)]
 pub struct ClassReport {
-    /// 类别名。
+    /// Class name.
     pub name: &'static str,
-    /// 硬件和两层解释器都执行且结果一致的次数。
+    /// Times the hardware and both interpreter tiers executed with matching results.
     pub executed: u64,
-    /// 三方都判定为未定义指令的次数。
+    /// Times all three judged the instruction undefined.
     pub both_undefined: u64,
-    /// 硬件能执行、解释器按白名单拒绝的次数（只出现在模糊类别）。
+    /// Times the hardware could execute and the interpreter rejected by the whitelist (only in
+    /// fuzz classes).
     pub stricter: u64,
-    /// Tier 1 退回 Tier 0 执行单条指令的次数（回填 TLB 失败或者没有翻译的指令）。
+    /// Times Tier 1 fell back to Tier 0 for a single instruction (TLB refill failure or an
+    /// untranslated instruction).
     pub tier1_fallback: u64,
-    /// Tier 1 翻译出的、和前面同一基址的访存共用一次 TLB 检查的访存条数。
+    /// Accesses translated by Tier 1 that share one TLB check with an earlier access on the same
+    /// base.
     pub tier1_grouped: u64,
-    /// guest 特性集合缺少该类别需要的特性，没有运行。
+    /// The guest feature set lacks a feature the class needs, so it did not run.
     pub skipped: bool,
 }
 
-/// 一方执行后的结果。
+/// The result after one side executes.
 #[derive(Debug, Clone)]
 pub struct Outcome {
-    /// 寄存器状态。
+    /// Register state.
     pub state: State,
-    /// 数据区内容。
+    /// Data area contents.
     pub data: Vec<u8>,
 }
 
-/// 第一处不一致。
+/// The first mismatch.
 #[derive(Debug, Clone)]
 pub struct Mismatch {
-    /// 类别名。
+    /// Class name.
     pub class: &'static str,
-    /// 被测指令。
+    /// The tested instructions.
     pub insns: Vec<u32>,
-    /// 本次运行的种子。
+    /// This run's seed.
     pub seed: u64,
-    /// 类别内的序号。
+    /// Sequence number within the class.
     pub iteration: u64,
-    /// 不一致的原因。
+    /// Reason for the mismatch.
     pub reason: String,
-    /// 执行前的状态。
+    /// State before execution.
     pub before: State,
-    /// 硬件执行后的结果。
+    /// Result after the hardware executes.
     pub hardware: Option<Outcome>,
-    /// 出现分歧的那一层解释器执行后的结果。
+    /// Result after the interpreter tier that diverged executes.
     pub interpreter: Option<Outcome>,
 }
 
@@ -161,13 +167,14 @@ impl fmt::Display for Mismatch {
     }
 }
 
-/// 运行 lockstep，返回各类别的统计；遇到第一处不一致时返回它。
+/// Runs lockstep and returns the statistics of each class; returns the first mismatch when one
+/// is found.
 #[cfg(lockstep_native)]
 pub fn run(config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
     runner::run(config)
 }
 
-/// 当前宿主不支持 lockstep（[`AVAILABLE`] 为 false），调用会 panic。
+/// The current host does not support lockstep ([`AVAILABLE`] is false); calling this panics.
 #[cfg(not(lockstep_native))]
 pub fn run(_config: &Config) -> Result<Vec<ClassReport>, Box<Mismatch>> {
     panic!("lockstep needs a Linux aarch64 host")
@@ -184,21 +191,25 @@ mod runner {
     use crate::native::Oracle;
     use crate::rng::Rng;
 
-    /// 解释器执行前把 SP 设成这个值；被测指令不应该改动它。
+    /// SP is set to this value before the interpreter runs; the tested instructions should not
+    /// change it.
     const SP_SENTINEL: u64 = 0x0000_7fff_dead_bef0;
     const NOP: u32 = 0xd503_201f;
     const SVC: u32 = 0xd400_0001;
-    /// 独占访问的用例在硬件上可能偶发失败，不一致时最多重跑这么多次。
+    /// Exclusive access cases may occasionally fail on hardware; on a mismatch, rerun at most this
+    /// many times.
     const FLAKY_RETRIES: usize = 8;
 
-    /// 让各个类别的随机序列互不相关，同时可以单独复现。
+    /// Makes the random sequences of the classes independent of each other while each can still
+    /// be reproduced alone.
     fn class_seed(seed: u64, name: &str) -> u64 {
         name.bytes().fold(seed ^ 0xcbf2_9ce4_8422_2325, |h, b| {
             (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
         })
     }
 
-    /// 偏向边界值的通用寄存器取值，提高标志位和溢出路径的覆盖率。
+    /// General register values biased towards boundary values, to cover more flag and overflow
+    /// paths.
     fn random_value(g: &mut Rng) -> u64 {
         const SPECIAL: &[u64] = &[
             0,
@@ -227,7 +238,8 @@ mod runner {
         }
     }
 
-    /// 偏向浮点特殊值的 64 位向量通道：一个双精度数，或者两个单精度数。
+    /// A 64-bit vector lane biased towards floating-point special values: one double, or two
+    /// singles.
     fn random_lane(g: &mut Rng) -> u64 {
         const F64: &[u64] = &[
             0,
@@ -239,10 +251,10 @@ mod runner {
             0xfff0_0000_0000_0000, // -inf
             0x7ff8_0000_0000_0000, // qNaN
             0x7ff4_0000_0000_0001, // sNaN
-            0x0000_0000_0000_0001, // 最小的非规格化数
-            0x000f_ffff_ffff_ffff, // 最大的非规格化数
-            0x0010_0000_0000_0000, // 最小的规格化数
-            0x7fef_ffff_ffff_ffff, // 最大的有限数
+            0x0000_0000_0000_0001, // smallest subnormal
+            0x000f_ffff_ffff_ffff, // largest subnormal
+            0x0010_0000_0000_0000, // smallest normal
+            0x7fef_ffff_ffff_ffff, // largest finite
             0x41e0_0000_0000_0000, // 2^31
             0x43e0_0000_0000_0000, // 2^63
         ];
@@ -283,17 +295,18 @@ mod runner {
             x,
             nzcv: (g.bits(4) as u64) << 28,
             v,
-            fpcr: g.next_u64() & 0x07c0_0000, // AHP、DN、FZ、RMode
-            fpsr: g.next_u64() & 0x0800_009f, // QC 和累积异常位
+            fpcr: g.next_u64() & 0x07c0_0000, // AHP, DN, FZ, RMode
+            fpsr: g.next_u64() & 0x0800_009f, // QC and the cumulative exception bits
         }
     }
 
     #[repr(C, align(4096))]
     struct Page([u8; 4096]);
 
-    /// 解释器一侧的执行环境：被测指令所在的代码页和数据区，映射在与硬件相同的 guest 地址上。
+    /// The interpreter side's execution environment: the tested instructions' code page and the
+    /// data area, mapped at the same guest addresses as on the hardware.
     struct Machine {
-        // 析构顺序：dbt → cpu → mmu → 页
+        // Drop order: dbt → cpu → mmu → pages
         dbt: Option<Dbt>,
         cpu: Cpu,
         _mmu: Mmu,
@@ -303,21 +316,21 @@ mod runner {
     }
 
     impl Machine {
-        /// `tier1` 是 Tier 1 用的寄存器分配，没有时用 Tier 0。
+        /// `tier1` is the register assignment for Tier 1; without one, Tier 0 is used.
         fn new(slot: u64, data_va: u64, tier1: Option<DbtRegs>) -> Self {
             let mut code = Box::new(Page([0; 4096]));
             let mut data = Box::new([Page([0; 4096]), Page([0; 4096])]);
             let mut mmu = Mmu::new();
             let code_host = NonNull::from(&mut code.0).cast::<u8>();
             let data_host = NonNull::from(&mut *data).cast::<u8>();
-            // SAFETY: 两块内存都由 Machine 持有，比 mmu 活得久
+            // SAFETY: Machine owns both pieces of memory, which outlive mmu
             unsafe {
                 mmu.map(slot & !0xfff, code_host, 4096, prot::READ | prot::EXEC)
                     .unwrap();
                 mmu.map(data_va, data_host, DATA_BYTES, prot::READ | prot::WRITE)
                     .unwrap();
             }
-            // SAFETY: mmu 由 Machine 持有，比 cpu 活得久
+            // SAFETY: Machine owns mmu, which outlives cpu
             let cpu = unsafe { Cpu::new(&mmu) };
             let dbt =
                 tier1.map(|regs| Dbt::with_regs(regs).expect("tier 1 is unavailable on this host"));
@@ -332,13 +345,14 @@ mod runner {
         }
 
         fn data(&self) -> &[u8] {
-            // SAFETY: 两页在数组里连续存放
+            // SAFETY: the two pages are stored contiguously in the array
             unsafe {
                 std::slice::from_raw_parts(self.data.as_ptr().cast::<u8>(), DATA_BYTES as usize)
             }
         }
 
-        /// 与硬件相同地布置代码页和数据区，执行到第 5 个字处的 svc 为止。
+        /// Lays out the code page and data area as on the hardware, and runs up to the svc at the
+        /// 5th word.
         fn run(
             &mut self,
             page: &[u8],
@@ -353,7 +367,7 @@ mod runner {
                 self.code.0[off + 4 * k..off + 4 * k + 4].copy_from_slice(&insn.to_le_bytes());
             }
             self.code.0[off + 16..off + 20].copy_from_slice(&SVC.to_le_bytes());
-            // SAFETY: 两页在数组里连续存放
+            // SAFETY: the two pages are stored contiguously in the array
             let dst = unsafe {
                 std::slice::from_raw_parts_mut(
                     self.data.as_mut_ptr().cast::<u8>(),
@@ -482,7 +496,8 @@ mod runner {
                 }
             }
             for &(r, off) in &case.loads {
-                // 靠近数据区末尾时不足 8 字节，高位补 0（指令只用到低位）
+                // Near the end of the data area there are fewer than 8 bytes; the high part is
+                // filled with 0 (the instruction only uses the low part)
                 let mut bytes = [0u8; 8];
                 let end = (off as usize + 8).min(data.len());
                 bytes[..end - off as usize].copy_from_slice(&data[off as usize..end]);
@@ -540,7 +555,8 @@ mod runner {
                     }
                 };
                 let mut result = verdict(&hw);
-                // 独占访问在硬件上可能被中断清掉标记，重跑几次看能否得到相同结果
+                // On hardware an interrupt may clear the mark of an exclusive access; rerun a few
+                // times to see whether the same result comes out
                 let mut retries = 0;
                 while result.is_err() && class.flaky && retries < FLAKY_RETRIES {
                     hw = run_hardware(&mut h.oracle, &case.insns, &before, &data);
