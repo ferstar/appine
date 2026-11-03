@@ -1,35 +1,45 @@
-//! I/O 多路复用（kernel/poll 的 map）：ppoll、pselect6、epoll，以及 eventfd。
+//! I/O multiplexing (the kernel/poll map): ppoll, pselect6 and epoll, plus eventfd.
 //!
-//! 三者共用 [`wait_ready`]：先检查进程内对象（管道、PTY、eventfd……）的就绪状态，
-//! 宿主 fd（宿主 socket、宿主 stdio）用一次不等待的宿主 poll 检查；都没有就绪时，
-//! 把宿主 fd 和自己的唤醒事件放在一起等（kernel/process 的 map 里的统一等待机制）。epoll 在进程内实现，
-//! 默认水平触发。
+//! All three share [`wait_ready`]: the readiness of in-process objects (pipes, PTYs, eventfds...)
+//! is checked first, and host fds (host sockets, host stdio) are checked with one non-waiting
+//! host poll; when nothing is ready, the host fds are waited on together with the thread's own
+//! wake event (the unified wait mechanism in the kernel/process map). epoll is implemented
+//! in-process and is level-triggered by default.
 //!
-//! `EPOLLET`：Linux 每次唤醒文件的等待队列（来了数据、新的连接、eventfd 被写、timerfd
-//! 到期……）都让边沿触发的关注再报告一次，即使文件本来就已经就绪；mio（tokio）的唤醒器
-//! 就靠这一点，它从来不读走 eventfd 的计数。这里按"数据代数"判断（[`arrivals`]）：
-//! 进程内的对象每来一次事件记一次；宿主 socket 上的数据不经过内核层，由一个只关注它的
-//! 边沿触发的宿主 epoll 记录（[`HostEdges`]，有边沿触发的关注时才建立）。某一位从未
-//! 就绪变成就绪，或者那个方向又来了事件时触发，触发时与 Linux 一样报告当前全部就绪的
-//! 位。程序在一个方向上用完数据（读写得到 EAGAIN，或者没有读写满要求的长度，见
-//! [`drained`]）之后，这个方向上次报告过的位也全部忘掉：建不了 [`HostEdges`] 时（宿主
-//! 上的普通文件）只能靠它，而且读到 EAGAIN 和新数据到达之间没有调用 epoll_wait 时
-//! （Go 的 netpoller 就会这样）也不会丢事件。
+//! `EPOLLET`: every time Linux wakes a file's wait queue (data arrives, a new connection, an
+//! eventfd is written, a timerfd expires...), edge-triggered interests report once more, even
+//! when the file was already ready; mio's (tokio's) waker relies on this, and it never reads the
+//! eventfd's count away. Here this is decided by "data generations" ([`arrivals`]): in-process
+//! objects count every event; data on host sockets does not pass through the kernel layer and is
+//! recorded by an edge-triggered host epoll that watches only that socket ([`HostEdges`], set up
+//! only when there are edge-triggered interests). An interest fires when a bit goes from not
+//! ready to ready, or when another event arrives in that direction, and when it fires it reports
+//! all bits currently ready, as on Linux. After the program uses up the data in one direction (a
+//! read or write gets EAGAIN, or reads or writes less than the requested length, see
+//! [`drained`]), all bits last reported in that direction are forgotten as well: where no
+//! [`HostEdges`] can be set up (regular files on the host) this is the only thing to rely on, and
+//! it also loses no events when epoll_wait is not called between reading EAGAIN and new data
+//! arriving (as Go's netpoller does).
 //!
-//! 等待时，边沿触发的关注不等报告过、仍然就绪的位：宿主 poll 会立刻返回，epoll_wait
-//! 就变成反复释放、获取 BKL 的忙等，把其他线程饿死。所以改为等宿主 fd 上的新事件
-//! （[`HostEdges`] 的 fd），进程内的对象来了数据（管道不空时只叫醒这些等待者，见
-//! [`arrived`]）、程序用完数据时叫醒这些 epoll_wait 重新计算
-//! （[`Kernel::edge_waiters`](crate::kernel::Kernel)）。
+//! While waiting, edge-triggered interests do not wait for bits that were reported and are still
+//! ready: the host poll would return at once, and epoll_wait would become a busy loop that
+//! releases and takes the BKL over and over, starving other threads. So they wait for new events
+//! on the host fds instead (the [`HostEdges`] fd), and these epoll_waits are woken to recompute
+//! when data arrives at an in-process object (for a non-empty pipe only these waiters are woken,
+//! see [`arrived`]) or the program uses up the data
+//! ([`Kernel::edge_waiters`](crate::kernel::Kernel)).
 //!
-//! `EPOLLEXCLUSIVE`：Linux 每次唤醒只叫醒一个独占的等待者。这里一个边沿（数据代数）
-//! 只报告给一个 epoll（[`OpenFile::exclusive_claim`]）：水平触发的关注由报告过它的
-//! epoll 接着报告，别的 epoll 等下一个边沿，所以几个进程各用一个 epoll 等同一个监听
-//! socket 时，一个新连接只让一个进程从 epoll_wait 返回。等待的线程不自己等这个文件，
-//! 而是排在它的独占门上（[`ExGate`]），新的边沿只叫醒排在最前面的一个。
+//! `EPOLLEXCLUSIVE`: Linux wakes only one exclusive waiter per wakeup. Here one edge (data
+//! generation) is reported to only one epoll ([`OpenFile::exclusive_claim`]): for a
+//! level-triggered interest, the epoll that reported the edge keeps reporting it, and other epolls
+//! wait for the next edge, so when several processes each wait on the same listening socket with
+//! their own epoll, a new connection makes only one process return from epoll_wait. Waiting
+//! threads do not wait on the file themselves but queue on its exclusive gate ([`ExGate`]), and a
+//! new edge wakes only the first one in the queue.
 //!
-//! 等待时登记关注的进程内对象（[`wake_objects`]）：只影响别的对象的修改（另一个管道的
-//! 读写、别的 eventfd、别的 AF_UNIX 连接……）不叫醒它（kernel/process 的 map）。
+//! While waiting, the in-process objects of interest are registered ([`wake_objects`]): changes
+//! that affect only other objects (reads and writes of another pipe, another eventfd, another
+//! AF_UNIX connection...) do not wake the waiter (the kernel/process map).
 
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
@@ -56,13 +66,13 @@ const POLLNVAL: i16 = 0x020;
 const POLLRDNORM: i16 = 0x040;
 const POLLWRNORM: i16 = 0x100;
 
-/// 写方向的就绪位，其余的都算读方向。
+/// Readiness bits of the write direction; all others count as the read direction.
 const WRITE_BITS: u32 = (POLLOUT | POLLWRNORM) as u32 | 0x200; // POLLWRBAND
 
-/// 嵌套 epoll 的最大深度，与 Linux 的 `EP_MAX_NESTS` 相同。
+/// Maximum depth of nested epolls, the same as Linux's `EP_MAX_NESTS`.
 const MAX_NESTS: u32 = 4;
 
-/// 一个打开文件现在的就绪状态：(已经知道的事件, 需要问宿主的 fd)。
+/// The current readiness of an open file: (events already known, host fd to ask).
 fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
     match &f.kind {
         FileKind::Host(fd) => (0, Some(*fd)),
@@ -135,13 +145,13 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             (if ready.is_empty() { 0 } else { POLLIN }, None)
         }
         FileKind::Epoll(_) => (0, None),
-        // 6.9 起进程被回收之后还有 POLLHUP；这里与 6.1 相同
+        // Since 6.9 there is also POLLHUP after the process is reaped; here it is the same as 6.1
         FileKind::Pidfd(p) => (if p.exited() { POLLIN | POLLRDNORM } else { 0 }, None),
         FileKind::MessageQueue(q) => (q.borrow().readiness(), None),
         FileKind::SeccompNotify(l) => (l.readiness(), None),
         FileKind::Path(_) => (POLLNVAL, None),
-        // /dev/kmsg（`devkmsg_poll`）：有没读的记录时可读，要读的那条已经被挤掉时还有
-        // POLLERR、POLLPRI；从来不报告可写
+        // /dev/kmsg (`devkmsg_poll`): readable while there are unread records, with POLLERR and
+        // POLLPRI as well when the record to be read has been pushed out; never reports writable
         FileKind::Device {
             kmsg: Some(user), ..
         } => {
@@ -155,7 +165,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             };
             (ev, None)
         }
-        // /proc/kmsg（`kmsg_poll`）：syslog 还有没读的记录时可读
+        // /proc/kmsg (`kmsg_poll`): readable while syslog has unread records
         FileKind::Proc {
             klog: Some(log), ..
         } => (
@@ -170,8 +180,9 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
     }
 }
 
-/// AIO 的 `IOCB_CMD_POLL`：现在就绪的、关心的事件（加上总会报告的 POLLERR、POLLHUP）。
-/// `all` 时有关心的事件就绪就报告全部就绪的位：Linux 挂起之后被唤醒完成的请求就是这样。
+/// AIO's `IOCB_CMD_POLL`: the events of interest that are ready now (plus POLLERR and POLLHUP,
+/// which are always reported). With `all`, when any event of interest is ready, all ready bits
+/// are reported: that is how Linux completes a request that was queued and then woken.
 pub(super) fn poll_once(f: &OpenFile, events: i16, all: bool) -> i16 {
     let wanted = poll_now(f, events, 0);
     if all && wanted != 0 {
@@ -181,21 +192,22 @@ pub(super) fn poll_once(f: &OpenFile, events: i16, all: bool) -> i16 {
     }
 }
 
-/// 打开文件上读、写两个方向各来过几次事件：进程内的对象每次来数据（管道、socket 的
-/// 写入，eventfd 的写，timerfd 到期，新的连接……）都记一次，与 Linux 每次唤醒等待队列
-/// 对应；宿主 fd 上的由 [`HostEdges`] 记录，没有建立它时是 0。`EPOLLET` 据此在已经就绪
-/// 时又来了数据的情况下再触发一次。
+/// How many events have arrived on an open file in each of the read and write directions:
+/// in-process objects count every arrival of data (writes to pipes and sockets, eventfd writes,
+/// timerfd expirations, new connections...), matching each time Linux wakes the wait queue;
+/// those on host fds are recorded by [`HostEdges`], and are 0 when it is not set up. `EPOLLET`
+/// uses this to fire once more when data arrives while the file is already ready.
 fn arrivals(f: &OpenFile) -> [u64; 2] {
     arrivals_with(f, HostEdges::counts, 0)
 }
 
-/// 与 [`arrivals`] 相同，但宿主 fd 刚刚经过 [`poll_now`]，宿主 epoll 那时不可读就不必
-/// 再问宿主。
+/// The same as [`arrivals`], but the host fd has just been through [`poll_now`]: if the host epoll
+/// was not readable then, the host need not be asked again.
 fn arrivals_polled(f: &OpenFile) -> [u64; 2] {
     arrivals_with(f, HostEdges::counts_polled, 0)
 }
 
-/// `depth` 是嵌套的 epoll 的层数（[`epoll_arrivals`]）。
+/// `depth` is the number of levels of nested epolls ([`epoll_arrivals`]).
 fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> [u64; 2] {
     let local = match &f.kind {
         FileKind::Epoll(ep) => [epoll_arrivals(&ep.borrow(), depth), 0],
@@ -227,14 +239,17 @@ fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> 
     [local[0] + host[0], local[1] + host[1]]
 }
 
-/// epoll 实例里来过的事件：Linux 的 `ep_poll_callback` 每次被唤醒（关注的文件在关注的
-/// 方向上来了事件）都唤醒等这个 epoll 的 `poll_wait`，外面套着它的 epoll 的边沿触发的
-/// 关注因此再触发一次。这里是各个关注从加入起在关注的方向上来过事件的次数之和，加上
-/// 去掉了的关注原来的份额和加入、修改时已经就绪的次数（[`Epoll::base`]），只增不减。
+/// Events that have arrived in an epoll instance: every time Linux's `ep_poll_callback` is woken
+/// (a watched file gets an event in a watched direction) it wakes the `poll_wait` waiting on this
+/// epoll, so an edge-triggered interest of an epoll containing it fires once more. Here it is the
+/// sum of the events each interest has seen in its watched directions since it was added, plus
+/// the former shares of removed interests and the number of times interests were already ready
+/// when added or modified ([`Epoll::base`]); it only grows.
 fn epoll_arrivals(ep: &Epoll, depth: u32) -> u64 {
     let mut total = ep.base.get();
     for int in &ep.interests {
-        // 停用的（EPOLLONESHOT 报告过）不唤醒，份额停在原来的值
+        // Disarmed interests (reported with EPOLLONESHOT) do not wake; their share stays at its
+        // old value
         if int.armed
             && depth < MAX_NESTS
             && let Some(file) = int.file.upgrade()
@@ -247,32 +262,34 @@ fn epoll_arrivals(ep: &Epoll, depth: u32) -> u64 {
     total
 }
 
-/// 关注 `events` 的方向上，文件 `f` 来过事件的次数（读写两个方向分开算，与 Linux 按唤醒的
-/// 事件过滤一样）。
+/// How many events have arrived on file `f` in the directions of `events` (the read and write
+/// directions counted separately, as Linux filters by the woken events).
 fn interest_arrivals(events: u32, f: &OpenFile, depth: u32) -> u64 {
     directional(events, arrivals_with(f, HostEdges::counts, depth))
 }
 
-/// 两个方向的事件次数里，`events` 关注的方向上的。
+/// Of the event counts of the two directions, those in the directions `events` watches.
 fn directional(events: u32, a: [u64; 2]) -> u64 {
     let read = events & !WRITE_BITS & 0xffff != 0;
     let write = events & WRITE_BITS != 0;
     (if read { a[0] } else { 0 }) + (if write { a[1] } else { 0 })
 }
 
-/// 打开文件现在的"数据代数"：读、写方向用完数据的次数和来过事件的次数。代数不变就
-/// 还是同一个边沿（`EPOLLEXCLUSIVE`）。
+/// The current "data generation" of an open file: how many times the data was used up and how
+/// many events have arrived, in the read and write directions. While the generation is
+/// unchanged it is still the same edge (`EPOLLEXCLUSIVE`).
 fn edge(f: &OpenFile) -> [u64; 4] {
     let a = arrivals(f);
     [f.drained[0], f.drained[1], a[0], a[1]]
 }
 
-/// 打开文件背后的宿主 fd（宿主 stdio、TCP/UDP socket）。
+/// The host fd behind an open file (host stdio, TCP/UDP sockets).
 fn host_fd(f: &OpenFile) -> Option<i32> {
     match &f.kind {
         FileKind::Host(fd) => Some(*fd),
         FileKind::Socket(s) => match &*s.borrow() {
-            // raw ICMP socket 收到的报文在汇集点的队列里（crate::rawicmp），不看宿主 fd
+            // Messages received by a raw ICMP socket are in the tap's queue (crate::rawicmp);
+            // the host fd is not looked at
             crate::net::Socket::Inet(i) if i.icmp.is_none() => Some(i.fd),
             _ => None,
         },
@@ -280,9 +297,10 @@ fn host_fd(f: &OpenFile) -> Option<i32> {
     }
 }
 
-/// `EPOLLEXCLUSIVE` 的关注 `int`（属于地址为 `owner` 的 epoll）现在的边沿已经被别的
-/// epoll 报告过了：Linux 每次唤醒只叫醒一个独占的等待者，没轮到的不报告。边沿触发的
-/// 关注自己报告过的也不再报告（与没有 `EPOLLEXCLUSIVE` 时一样）。
+/// The current edge of `EPOLLEXCLUSIVE` interest `int` (of the epoll at address `owner`) has
+/// already been reported by another epoll: Linux wakes only one exclusive waiter per wakeup, and
+/// those whose turn it is not do not report. An edge-triggered interest also does not report
+/// again what it has reported itself (as without `EPOLLEXCLUSIVE`).
 fn claimed(int: &Interest, f: &OpenFile, owner: usize) -> bool {
     int.events & EPOLLEXCLUSIVE != 0
         && f.exclusive_claim.get().is_some_and(|(edge_then, by)| {
@@ -290,12 +308,13 @@ fn claimed(int: &Interest, f: &OpenFile, owner: usize) -> bool {
         })
 }
 
-/// 立即检查一个文件就绪的事件（宿主 fd 用一次不等待的 poll），只保留 `wanted` 和
-/// 总会报告的 POLLERR、POLLHUP、POLLNVAL。
+/// Checks a file's ready events immediately (one non-waiting poll for a host fd), keeping only
+/// `wanted` and POLLERR, POLLHUP and POLLNVAL, which are always reported.
 fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
     let (mut ev, host) = readiness(f, depth);
     if let Some(fd) = host {
-        // 记录新事件的宿主 epoll 一起问：不可读时 arrivals_polled 不必再问
+        // Ask the host epoll that records new events at the same time: when it is not readable,
+        // arrivals_polled need not ask again
         let edges = f.host_edges.as_ref();
         let mut p = [
             (fd, wanted, 0),
@@ -312,11 +331,13 @@ fn poll_now(f: &OpenFile, wanted: i16, depth: u32) -> i16 {
     ev & (wanted | POLLERR | POLLHUP | POLLNVAL)
 }
 
-/// 等打开文件 `f` 的就绪状态变化时要登记的唤醒对象（[`wake::of`]）。改变进程内对象
-/// 就绪状态的修改要么请求唤醒这里列出的对象之一，要么请求一个通道（挂起的信号请求
-/// [`wake::SIGNAL`]，pidfd 的子进程请求 [`wake::CHILD`]，关注了它们才听）；宿主 fd 上的
-/// 数据由宿主 poll 等，宿主 socket 列出它自己（关闭、DNS 存根的回答）。signalfd 只列出
-/// 它自己（改掩码），epoll 只列出它自己（epoll_ctl），里面的关注由 [`Waits`] 逐个加上。
+/// The wake objects to register when waiting for the readiness of open file `f` to change
+/// ([`wake::of`]). A change to the readiness of an in-process object either requests a wakeup of
+/// one of the objects listed here, or requests a channel (a pending signal requests
+/// [`wake::SIGNAL`], a pidfd's child requests [`wake::CHILD`]; only waiters interested in them
+/// listen); data on host fds is waited for by the host poll, and a host socket lists itself
+/// (closing, answers of the DNS stub). A signalfd lists only itself (mask changes), and an epoll
+/// lists only itself (epoll_ctl); the interests inside it are added one by one by [`Waits`].
 fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
     match &f.kind {
         FileKind::Pipe(end) => out.push(crate::pipe::object(&end.pipe)),
@@ -339,23 +360,26 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
     }
 }
 
-/// 等待时要一起等的东西：宿主 fd，以及最早的 timerfd 到期时刻（含嵌套 epoll 里的）。
+/// What to wait for together: host fds, and the earliest timerfd expiration (including those in
+/// nested epolls).
 #[derive(Default)]
 struct Waits {
     host: Vec<(i32, i16, i16)>,
-    /// 进程内对象的唤醒对象（[`wake_objects`]）。
+    /// Wake objects of in-process objects ([`wake_objects`]).
     objects: Vec<wake::Object>,
-    /// 有 pidfd：子进程状态的变化（[`wake::CHILD`]）也要叫醒它。别的文件都不关心这个
-    /// 通道，原来每个进程结束都把所有 poll、epoll 的等待者叫醒一遍。
+    /// There is a pidfd: changes in child state ([`wake::CHILD`]) must wake it too. No other file
+    /// cares about this channel; before, every process exit woke all poll and epoll waiters.
     pidfd: bool,
-    /// 有 signalfd：被屏蔽的信号挂起（[`wake::SIGNAL`]）也要叫醒它。
+    /// There is a signalfd: a blocked signal becoming pending ([`wake::SIGNAL`]) must wake it too.
     signalfd: bool,
     timer: Option<Instant>,
-    /// 有边沿触发的关注少等了报告过的位。
+    /// Some edge-triggered interest left out bits it has reported from the wait.
     edge: bool,
-    /// 有要靠内核叫醒的进程内对象（管道、eventfd、AF_UNIX……）：要登记在文件类的唤醒里。
+    /// There are in-process objects that rely on the kernel to wake them (pipes, eventfds,
+    /// AF_UNIX...): register on the FILE wake channel.
     files: bool,
-    /// `EPOLLEXCLUSIVE` 关注的文件：不自己等，登记在它们的独占门上（[`ExGate`]）。
+    /// Files of `EPOLLEXCLUSIVE` interests: not waited on directly, but registered on their
+    /// exclusive gates ([`ExGate`]).
     gated: Vec<FileRef>,
 }
 
@@ -373,8 +397,10 @@ impl Waits {
                     self.timer = Some(self.timer.map_or(d, |e| e.min(d)));
                 }
             }
-            // 只等新事件（外层边沿触发的关注报告过它可读）：等它里面的宿主 socket 新到的
-            // 数据和定时器，进程内的对象来了事件时内核叫醒边沿触发的等待者
+            // Wait only for new events (an outer edge-triggered interest has reported it
+            // readable): wait for newly arrived data on the host sockets inside it and for
+            // timers; when events arrive at in-process objects the kernel wakes edge-triggered
+            // waiters
             (FileKind::Epoll(ep), None) if depth < MAX_NESTS && wanted & POLLIN == 0 => {
                 self.edge = true;
                 self.add_epoll_edges(&ep.borrow(), depth + 1);
@@ -386,8 +412,9 @@ impl Waits {
         }
     }
 
-    /// 嵌套的 epoll 里只等新事件：各个关注的宿主 fd 新到的数据（[`HostEdges`]，外层以边沿
-    /// 触发关注它时建立，[`mark_edge_watched`]）、timerfd 的到期，再往里嵌套的照此。
+    /// In a nested epoll, waits only for new events: newly arrived data on each interest's host fd
+    /// ([`HostEdges`], set up when an outer epoll watches it edge-triggered,
+    /// [`mark_edge_watched`]), timerfd expirations, and the same for epolls nested further in.
     fn add_epoll_edges(&mut self, ep: &Epoll, depth: u32) {
         self.files = true;
         for int in ep.interests.iter().filter(|i| i.armed) {
@@ -415,17 +442,20 @@ impl Waits {
         }
     }
 
-    /// 一个 epoll 活着、没有停用的关注。边沿触发的关注不等报告过、仍然就绪的位，独占
-    /// 的关注不等轮到了别的 epoll 的边沿，改为等宿主 fd 上的新事件（见模块文档）；
-    /// 报告过 POLLHUP、POLLERR 的不等宿主 fd 本身，因为宿主 poll 总会报告这两位。
+    /// The live, armed interests of an epoll. Edge-triggered interests do not wait for bits that
+    /// were reported and are still ready, and exclusive interests do not wait for an edge that
+    /// went to another epoll; they wait for new events on the host fds instead (see the module
+    /// docs); those that reported POLLHUP or POLLERR do not wait on the host fd itself, because
+    /// the host poll always reports these two bits.
     fn add_epoll(&mut self, ep: &Epoll, depth: u32) {
         for int in ep.interests.iter().filter(|i| i.armed) {
             let Some(file) = int.file.upgrade() else {
                 continue;
             };
-            // 独占的关注：不自己等它（宿主 poll 会把所有等它的线程都叫醒），由独占门在新的
-            // 边沿上只叫醒一个等待者。宿主 fd 上新到的数据要从 HostEdges 看，建不了的仍然
-            // 自己等
+            // Exclusive interests: not waited on directly (the host poll would wake every thread
+            // waiting on it); the exclusive gate wakes only one waiter on a new edge. Newly
+            // arrived data on a host fd must be seen through HostEdges; where that cannot be set
+            // up, the thread still waits on the file itself
             let gate = {
                 let f = file.borrow();
                 int.events & EPOLLEXCLUSIVE != 0
@@ -438,7 +468,8 @@ impl Waits {
             let mut wanted = int.events as i16;
             let seen = int.seen.get() as i16;
             let f = file.borrow();
-            // 宿主 fd 上新到的数据只能从 HostEdges 的宿主 epoll 看到：等它
+            // Newly arrived data on a host fd can be seen only through HostEdges' host epoll:
+            // wait on it
             let mut edges = false;
             let mut hung_up = false;
             if int.events & EPOLLET != 0 && seen != 0 {
@@ -447,7 +478,8 @@ impl Waits {
                 hung_up = seen & (POLLHUP | POLLERR) != 0;
                 wanted &= !seen;
             }
-            // 自己等的独占关注（见上）：现在的边沿轮到了别的 epoll 时，现在就绪的位不等
+            // An exclusive interest waited on directly (see above): when the current edge went to
+            // another epoll, do not wait for the bits ready now
             if claimed(int, &f, ep as *const Epoll as usize) {
                 self.edge = true;
                 wanted &= !poll_now(&f, wanted, depth);
@@ -458,14 +490,15 @@ impl Waits {
             if !hung_up {
                 self.add(&f, wanted, depth);
             } else {
-                // 不等宿主 fd 本身，但进程内的对象之后还可能来事件（PTY 重新打开了从设备）
+                // Not waiting on the host fd itself, but in-process objects may still get events
+                // later (a PTY whose slave is reopened)
                 self.files = true;
                 wake_objects(&f, &mut self.objects);
             }
         }
     }
 
-    /// 等到 `deadline`、某个宿主 fd 就绪、timerfd 到期或者被唤醒。
+    /// Waits until `deadline`, until some host fd is ready or a timerfd expires, or until woken.
     fn wait(mut self, cx: &mut Cx<'_>, deadline: Option<Instant>) -> Result<(), Errno> {
         let until = match (deadline, self.timer) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -478,8 +511,9 @@ impl Waits {
         if !self.gated.is_empty() {
             gate_enter(cx, &self.gated, &event);
         }
-        // 只等独占的关注时不登记在文件类的唤醒里：独占门、信号、epoll_ctl 都直接叫醒它，
-        // 别的文件上的修改不必叫醒它
+        // When waiting only for exclusive interests, do not register on the FILE channel: the
+        // exclusive gates, signals and epoll_ctl all wake the thread directly, and changes to
+        // other files need not wake it
         let only_gated = !self.files && self.host.is_empty() && !self.gated.is_empty();
         let interest = if only_gated {
             0
@@ -499,22 +533,23 @@ impl Waits {
     }
 }
 
-/// `EPOLLEXCLUSIVE` 关注的一个文件上等着的线程（Linux 的等待队列里独占的那些项）。
-/// 等待者不自己等这个文件（宿主 poll、文件类的广播都会把所有等它的线程叫醒），而是登记在
-/// 这里，由定时器线程替它们看（[`check_exclusive`]）：数据代数变了、文件就绪、这个边沿还
-/// 没被哪个 epoll 报告过时，只叫醒排在最前面的一个，与 Linux 每次唤醒只叫醒一个独占的
-/// 等待者一样。
+/// Threads waiting on a file of `EPOLLEXCLUSIVE` interests (the exclusive entries in a Linux wait
+/// queue). Waiters do not wait on the file themselves (the host poll and FILE-channel broadcasts
+/// would wake every thread waiting on it); they register here, and the timer thread watches the
+/// file for them ([`check_exclusive`]): when the data generation has changed, the file is ready
+/// and this edge has not been reported by any epoll, only the first in the queue is woken, as
+/// Linux wakes only one exclusive waiter per wakeup.
 pub(crate) struct ExGate {
     file: Weak<RefCell<OpenFile>>,
-    /// 等着的线程，先来的在前。
+    /// Waiting threads, earliest first.
     sleepers: Vec<Arc<appine_hal::Event>>,
-    /// 上次检查时文件的数据代数（[`edge`]）。
+    /// The file's data generation at the last check ([`edge`]).
     last: [u64; 4],
 }
 
 impl ExGate {
-    /// 看一眼文件 `f`：数据代数变了、文件就绪、这个边沿还没被哪个 epoll 报告过时，取出
-    /// 排在最前面的等待者（要叫醒它）。
+    /// Looks at file `f`: when the data generation has changed, the file is ready and this edge
+    /// has not been reported by any epoll, takes out the first waiter in the queue (to be woken).
     fn next_waiter(&mut self, f: &OpenFile) -> Option<Arc<appine_hal::Event>> {
         let now = edge(f);
         if now == self.last || self.sleepers.is_empty() {
@@ -526,7 +561,7 @@ impl ExGate {
         (ready && !claimed).then(|| self.sleepers.remove(0))
     }
 
-    /// 叫醒所有等着的线程（检查出错时，宁可多叫醒）。
+    /// Wakes all waiting threads (when a check fails, better to wake too many).
     pub(crate) fn wake_all(&self) {
         for e in &self.sleepers {
             crate::kernel::signal_later(e);
@@ -534,8 +569,8 @@ impl ExGate {
     }
 }
 
-/// 等待之前：在 `files` 各自的独占门上登记 `event`。门是新建的时叫醒定时器线程，让它
-/// 开始看这个文件。
+/// Before waiting: registers `event` on the exclusive gate of each of `files`. When a gate is
+/// new, wakes the timer thread so that it starts watching that file.
 fn gate_enter(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>) {
     let mut created = false;
     for file in files {
@@ -561,7 +596,8 @@ fn gate_enter(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>
     }
 }
 
-/// 等待之后：从 `files` 的独占门上去掉 `event`（被叫醒的已经去掉了）。
+/// After waiting: removes `event` from the exclusive gates of `files` (a woken one has already
+/// been removed).
 fn gate_leave(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>) {
     for g in cx.k().ex_gates.iter_mut() {
         if files.iter().any(|f| g.file.as_ptr() == Rc::as_ptr(f)) {
@@ -570,9 +606,10 @@ fn gate_leave(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>
     }
 }
 
-/// 定时器线程替 `EPOLLEXCLUSIVE` 的等待者看文件（[`ExGate`]）：任何修改都会叫醒定时器
-/// 线程（有独占门时它登记在所有通道上），宿主 socket 上新到的数据从它的 [`HostEdges`]
-/// 看，返回这些宿主 fd 让定时器线程一起等。没有等待者、文件已经关闭的门去掉。
+/// The timer thread watches files for `EPOLLEXCLUSIVE` waiters ([`ExGate`]): every change wakes
+/// the timer thread (it registers on all channels while there are exclusive gates), newly arrived
+/// data on host sockets is seen through their [`HostEdges`], and these host fds are returned for
+/// the timer thread to wait on as well. Gates with no waiters or whose file is closed are removed.
 pub(crate) fn check_exclusive(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)> {
     let mut host = Vec::new();
     k.ex_gates.retain_mut(|g| {
@@ -591,46 +628,52 @@ pub(crate) fn check_exclusive(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i
     host
 }
 
-/// 程序在 `file` 的一个方向（0 读，1 写）上用完了数据：读写返回 EAGAIN，或者没有读写
-/// 满要求的长度（tokio 这类运行时据此认为数据已经读完、不再读到 EAGAIN）。边沿触发的
-/// 关注之后重新报告这个方向上的事件，等待中少等了这些事件的 epoll_wait 被叫醒重新计算。
+/// The program used up the data in one direction of `file` (0 read, 1 write): a read or write
+/// returned EAGAIN, or read or wrote less than the requested length (runtimes like tokio take
+/// that to mean the data is all read and stop reading until EAGAIN). Edge-triggered interests
+/// then report events in this direction again, and epoll_waits that left these events out while
+/// waiting are woken to recompute.
 pub(super) fn drained(cx: &mut Cx<'_>, file: &FileRef, dir: usize) {
     file.borrow_mut().drained[dir] += 1;
     for event in &cx.k().edge_waiters {
         crate::kernel::signal_later(event);
     }
-    // 信号驱动的 I/O 也按用完数据重新开始计算，见 check_fasync：只叫醒定时器线程
+    // Signal-driven I/O also starts over when data is used up, see check_fasync: only wake the
+    // timer thread
     if file.borrow().flags & oflags::O_ASYNC != 0 {
         crate::kernel::signal_later(&cx.shared.timers);
     }
 }
 
-/// 一个已经就绪的进程内对象又来了数据，而写入的一方没有请求唤醒（管道不空时）：叫醒
-/// 边沿触发、少等了这些事件的 epoll_wait 重新计算。
+/// An in-process object that was already ready got more data, and the writer did not request a
+/// wakeup (a non-empty pipe): wakes the edge-triggered epoll_waits that left these events out, to
+/// recompute.
 pub(super) fn arrived(cx: &mut Cx<'_>) {
     for event in &cx.k().edge_waiters {
         crate::kernel::signal_later(event);
     }
 }
 
-// ---- 信号驱动的 I/O ----
+// ---- Signal-driven I/O ----
 
-/// 一个设置了 `O_ASYNC` 的打开文件（Linux 的 fasync）。
+/// An open file with `O_ASYNC` set (Linux's fasync).
 pub(crate) struct Fasync {
     file: Weak<RefCell<OpenFile>>,
-    /// 设置 `O_ASYNC` 时用的 fd：`F_SETSIG` 的信号把它放在 si_fd 里。
+    /// The fd used when setting `O_ASYNC`: an `F_SETSIG` signal puts it in si_fd.
     fd: i32,
-    /// 上次检查时就绪的事件。
+    /// Events ready at the last check.
     last: i16,
-    /// 上次检查时打开文件的 [`OpenFile::drained`]、[`OpenFile::reads`] 和 [`arrivals`]。
+    /// The open file's [`OpenFile::drained`], [`OpenFile::reads`] and [`arrivals`] at the last
+    /// check.
     drained: [u64; 2],
     reads: u64,
     arrivals: [u64; 2],
 }
 
-/// 打开文件刚刚设置了 `O_ASYNC`：登记它。已经就绪的事件不发信号，与 Linux 一样。
-/// 叫醒定时器线程：原来没有 `O_ASYNC` 的文件时它只听"其余"通道，要等它因为别的事
-/// 醒来才开始检查这个文件。
+/// An open file has just had `O_ASYNC` set: registers it. Events already ready are not
+/// signalled, as on Linux. Wakes the timer thread: while there was no file with `O_ASYNC` it
+/// listened only on the "other" channel, and would start checking this file only after waking
+/// up for something else.
 pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
     let k = cx.k();
     k.fasync.retain(|e| e.file.strong_count() > 0);
@@ -649,9 +692,10 @@ pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
     crate::kernel::signal_later(&cx.shared.timers);
 }
 
-/// 检查设置了 `O_ASYNC` 的文件，新出现的就绪事件给属主发信号。返回等待时要一起 poll
-/// 的宿主 fd 和事件：宿主 socket 上的数据不经过内核，没有人会请求唤醒。定时器线程每次
-/// 醒来调用；任何可能让文件就绪的修改都会叫醒它。
+/// Checks the files with `O_ASYNC` set and signals the owner about newly ready events. Returns
+/// the host fds and events to poll while waiting: data on host sockets does not pass through the
+/// kernel, so nobody would request a wakeup. Called every time the timer thread wakes; every
+/// change that might make a file ready wakes it.
 pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)> {
     const POLL_IN: i32 = 1;
     const POLL_OUT: i32 = 2;
@@ -670,10 +714,12 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
         if f.flags & oflags::O_ASYNC == 0 {
             return false;
         }
-        // 程序在一个方向上用完了数据，或者这个方向又来了事件：这个方向重新算作没有
-        // 就绪，仍然就绪的话再通知，Linux 每来一次数据都通知。读过数据之后仍然可读也再
-        // 通知一次：宿主 socket 上看不到新到的数据（没有 HostEdges 时），两次检查之间
-        // 可能读空了又来了新数据
+        // The program used up the data in one direction, or another event arrived in that
+        // direction: the direction counts as not ready again and is notified again if still
+        // ready, since Linux notifies on every arrival of data. Still being readable after data
+        // was read is notified once more too: newly arrived data on host sockets cannot be seen
+        // (without HostEdges), and between two checks the data may have been read empty and new
+        // data arrived
         let came = arrivals(&f);
         if f.drained[0] != e.drained[0] || f.reads != e.reads || came[0] != e.arrivals[0] {
             e.last &= !(POLLIN | POLLRDNORM);
@@ -695,7 +741,7 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
             }
         }
         for (bit, code, band) in [
-            // Linux 的 band_table
+            // Linux's band_table
             (POLLIN, POLL_IN, POLLIN | POLLRDNORM),
             (POLLOUT, POLL_OUT, POLLOUT | POLLWRNORM | 0x200),
             (POLLERR, POLL_ERR, POLLERR),
@@ -711,7 +757,8 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
         let Some(signo) = crate::process::Signal::new(if sig == 0 { 29 } else { sig }) else {
             continue;
         };
-        // F_SETSIG 设置了信号时带上事件和 fd，默认的 SIGIO 不带
+        // When F_SETSIG has set a signal, include the events and the fd; the default SIGIO does
+        // not
         let info = if sig == 0 {
             signal::SigInfo::kernel()
         } else {
@@ -729,7 +776,7 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
     host
 }
 
-/// 给 `F_SETOWN_EX` 记下的属主发信号；没有属主（pid 为 0）时不发。
+/// Sends a signal to the owner recorded by `F_SETOWN_EX`; none when there is no owner (pid 0).
 pub(crate) fn send_to_owner(
     k: &crate::kernel::Kernel,
     ty: i32,
@@ -753,8 +800,8 @@ pub(crate) fn send_to_owner(
     }
 }
 
-/// 等到 `items` 里至少一个文件就绪、超时或者被信号打断，返回每一项就绪的事件。
-/// `None` 表示无效的 fd，报告 POLLNVAL。
+/// Waits until at least one file in `items` is ready, a timeout, or an interruption by a signal,
+/// and returns the ready events of each item. `None` means an invalid fd, reported as POLLNVAL.
 fn wait_ready(
     cx: &mut Cx<'_>,
     items: &[(Option<FileRef>, i16)],
@@ -784,7 +831,8 @@ fn wait_ready(
     }
 }
 
-/// 换上 guest 给的临时屏蔽字；被信号打断时由信号投递恢复，否则由 [`restore_mask`] 恢复。
+/// Installs the temporary signal mask given by the guest; when interrupted by a signal, signal
+/// delivery restores it, otherwise [`restore_mask`] does.
 pub(super) fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Result<(), Errno> {
     if sigmask == 0 {
         return Ok(());
@@ -799,7 +847,8 @@ pub(super) fn set_temp_mask(cx: &mut Cx<'_>, sigmask: u64, size: usize) -> Resul
 }
 
 pub(super) fn restore_mask<T>(cx: &mut Cx<'_>, r: &Result<T, Errno>) {
-    // epoll_pwait 被打断是 EINTR（Linux 的 restore_saved_sigmask_unless(error == -EINTR)）
+    // An interrupted epoll_pwait returns EINTR (Linux's
+    // restore_saved_sigmask_unless(error == -EINTR))
     let interrupted = matches!(r, Err(e) if *e == Errno::ERESTARTNOHAND || *e == Errno::EINTR);
     if !interrupted && let Some(saved) = cx.task.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
@@ -826,7 +875,7 @@ pub(super) fn ppoll(
     };
     let mut raw = vec![0u8; nfds * 8];
     cx.mm().read(UserSlice::new(fds, raw.len()), &mut raw)?;
-    // struct pollfd：fd、events、revents；负的 fd 被忽略
+    // struct pollfd: fd, events, revents; negative fds are ignored
     let items: Vec<(Option<FileRef>, i16, bool)> = raw
         .chunks_exact(8)
         .map(|e| {
@@ -867,7 +916,7 @@ pub(super) fn pselect6(
         return Err(Errno::EINVAL);
     }
     let words = (nfds as usize).div_ceil(64);
-    // 读、写、异常三个 fd_set
+    // The three fd_sets: read, write and except
     let mut bits = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
     for (set, &addr) in bits.iter_mut().zip(&sets) {
         if addr == 0 {
@@ -905,7 +954,7 @@ pub(super) fn pselect6(
             (Some(Instant::now() + t), t.is_zero())
         }
     };
-    // 第六个参数指向 { const sigset_t *ss; size_t ss_len; }
+    // The sixth argument points to { const sigset_t *ss; size_t ss_len; }
     if sigdata != 0 {
         let d: [u8; 16] = get(cx, sigdata)?;
         let ss = u64::from_le_bytes(d[..8].try_into().unwrap());
@@ -939,10 +988,11 @@ pub(super) fn pselect6(
     Ok(n)
 }
 
-/// 与 Linux 的 `poll_select_finish` 一样，把剩下的时间写回 guest 给的 `timeout`（给了、不是
-/// 0 时，`deadline` 是它的到期时刻），被信号打断时也写：重新执行时就按剩下的时间等，停止
-/// 又继续、cgroup 冻结又解冻之后不会从头再等。写不了时被打断改成 EINTR（不能重新执行），
-/// 做完了的照样返回。
+/// As Linux's `poll_select_finish` does, writes the remaining time back to the guest's `timeout`
+/// (when given and not 0; `deadline` is when it expires), also when interrupted by a signal: a
+/// restart then waits only for the remaining time, and after a stop and continue or a cgroup
+/// freeze and thaw it does not wait from the beginning again. When it cannot be written, an
+/// interruption becomes EINTR (no restart), and a completed call returns as usual.
 fn write_back_timeout<T>(
     cx: &mut Cx<'_>,
     timeout: u64,
@@ -972,29 +1022,31 @@ const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
 const EPOLLONESHOT: u32 = 1 << 30;
 const EPOLLET: u32 = 1 << 31;
-/// 多个 epoll 等同一个 fd 时只唤醒其中一个（见模块文档）。
+/// Wakes only one of several epolls waiting on the same fd (see the module docs).
 const EPOLLEXCLUSIVE: u32 = 1 << 28;
 const EPOLLWAKEUP: u32 = 1 << 29;
-/// 能和 `EPOLLEXCLUSIVE` 一起用的位（Linux 的 `EPOLLEXCLUSIVE_OK_BITS`）。
+/// Bits usable together with `EPOLLEXCLUSIVE` (Linux's `EPOLLEXCLUSIVE_OK_BITS`).
 const EXCLUSIVE_OK: u32 =
     (POLLIN | POLLOUT | POLLERR | POLLHUP) as u32 | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
 
-/// epoll 关注的一个文件。
+/// A file watched by an epoll.
 struct Interest {
     fd: i32,
-    /// 打开文件关闭之后，关注自动失效（与 Linux 一样不阻止它关闭）。
+    /// After the open file is closed, the interest becomes void automatically (as on Linux, it
+    /// does not keep the file from closing).
     file: Weak<RefCell<OpenFile>>,
     events: u32,
     data: u64,
-    /// `EPOLLONESHOT` 报告过一次之后停用，直到 `EPOLL_CTL_MOD`。
+    /// `EPOLLONESHOT`: disarmed after one report, until `EPOLL_CTL_MOD`.
     armed: bool,
-    /// `EPOLLET`：上次报告时就绪的位里现在仍然就绪的那些。出现不在其中的就绪位才触发。
+    /// `EPOLLET`: the bits ready at the last report that are still ready now. Fires only when a
+    /// ready bit not among them appears.
     seen: Cell<u32>,
-    /// `EPOLLET`：上次检查时打开文件的 [`OpenFile::drained`] 和 [`arrivals`]。
+    /// `EPOLLET`: the open file's [`OpenFile::drained`] and [`arrivals`] at the last check.
     drained: Cell<[u64; 2]>,
     arrivals: Cell<[u64; 2]>,
-    /// 加入时文件在关注的方向上来过事件的次数，和此后来过的次数（这个 epoll 被嵌套时的
-    /// 数据代数，[`epoll_arrivals`]）。
+    /// The number of events the file had seen in the watched directions when added, and the
+    /// number seen since (this epoll's data generation when nested, [`epoll_arrivals`]).
     origin: u64,
     share: Cell<u64>,
 }
@@ -1017,32 +1069,35 @@ impl Interest {
     }
 }
 
-/// 一个 epoll 实例。
+/// An epoll instance.
 #[derive(Default)]
 pub(crate) struct Epoll {
     interests: Vec<Interest>,
-    /// 下一次从哪个关注开始检查：与 Linux 把报告过的放到就绪链表末尾一样，就绪的比
-    /// maxevents 多时轮流报告。
+    /// Which interest to start checking from next time: as Linux moves reported entries to the
+    /// end of the ready list, interests take turns being reported when more are ready than
+    /// maxevents.
     cursor: usize,
-    /// 去掉了的关注原来的份额，加上加入、修改关注时它已经就绪的次数（[`epoll_arrivals`]）。
+    /// Former shares of removed interests, plus the number of times an interest was already
+    /// ready when added or modified ([`epoll_arrivals`]).
     base: Cell<u64>,
-    /// 有别的 epoll 以边沿触发关注这个 epoll：它关注的宿主 fd 也要记录新到的数据
-    /// （[`mark_edge_watched`]）。
+    /// Another epoll watches this epoll edge-triggered: the host fds it watches must record newly
+    /// arrived data too ([`mark_edge_watched`]).
     edge_watched: Cell<bool>,
-    /// 正在 epoll_wait 里等着的线程：epoll_ctl 改了关注时直接叫醒它们（只等独占关注的
-    /// 线程不在文件类的唤醒里）。
+    /// Threads waiting in epoll_wait: epoll_ctl wakes them directly when it changes the interests
+    /// (threads waiting only on exclusive interests are not on the FILE channel).
     waiters: Vec<Arc<appine_hal::Event>>,
 }
 
 impl Epoll {
-    /// 去掉第 `i` 个关注，份额记进 `base`，嵌套时的数据代数不会变少。
+    /// Removes interest `i`, adding its share to `base`, so the data generation when nested never
+    /// decreases.
     fn remove(&mut self, i: usize) -> Interest {
         let int = self.interests.remove(i);
         self.base.set(self.base.get() + int.share.get());
         int
     }
 
-    /// 去掉文件已经关闭了的关注。
+    /// Removes interests whose file has been closed.
     fn prune(&mut self) {
         let mut i = 0;
         while i < self.interests.len() {
@@ -1054,7 +1109,8 @@ impl Epoll {
         }
     }
 
-    /// 关注里 fd 为 `fd` 的第 `nth` 个（从 0 数）的打开文件（kcmp 的 `KCMP_EPOLL_TFD`）。
+    /// The open file of the `nth` interest (counting from 0) with fd `fd` (kcmp's
+    /// `KCMP_EPOLL_TFD`).
     pub(crate) fn target(&self, fd: i32, nth: usize) -> Option<FileRef> {
         self.interests
             .iter()
@@ -1063,8 +1119,8 @@ impl Epoll {
             .nth(nth)
     }
 
-    /// `/proc/<pid>/fdinfo` 里每个关注一行。与 Linux 一样，关注的事件总是带着
-    /// EPOLLERR 和 EPOLLHUP。
+    /// One line per interest in `/proc/<pid>/fdinfo`. As on Linux, the watched events always
+    /// include EPOLLERR and EPOLLHUP.
     pub(crate) fn fdinfo(&self) -> String {
         let mut s = String::new();
         for int in &self.interests {
@@ -1082,8 +1138,9 @@ impl Epoll {
         s
     }
 
-    /// 立即检查哪些关注就绪，最多 `max` 个：(下标, 事件)。只检查，不消耗边沿触发的
-    /// 事件（报告之后由 [`Epoll::reported`] 记下）。
+    /// Checks immediately which interests are ready, at most `max`: (index, events). Only checks,
+    /// without consuming edge-triggered events (they are recorded by [`Epoll::reported`] after
+    /// being reported).
     fn ready(&self, depth: u32, max: usize) -> Vec<(usize, u32)> {
         let mut out = Vec::new();
         let n = self.interests.len();
@@ -1097,14 +1154,15 @@ impl Epoll {
                 continue;
             };
             let f = file.borrow();
-            // 独占的关注：这个边沿已经轮到了别的 epoll，当作没有就绪
+            // Exclusive interest: this edge has gone to another epoll, so treat it as not ready
             if claimed(int, &f, self as *const Epoll as usize) {
                 continue;
             }
             let ev = poll_now(&f, int.events as i16, depth) as u16 as u32;
             if int.events & EPOLLET != 0 {
-                // 程序在某个方向上用完了数据，或者这个方向又来了事件：这个方向上次报告的
-                // 事件作废，仍然就绪的话再报告一次
+                // The program used up the data in some direction, or another event arrived in
+                // that direction: the events last reported in this direction are void, and are
+                // reported again if still ready
                 let drained = f.drained;
                 let last = int.drained.replace(drained);
                 let came = arrivals_polled(&f);
@@ -1116,7 +1174,8 @@ impl Epoll {
                 if drained[1] != last[1] || came[1] != before[1] {
                     seen &= !WRITE_BITS;
                 }
-                // 不再就绪的位忘掉，下次重新就绪时才能再触发
+                // Forget bits no longer ready, so they can fire again the next time they become
+                // ready
                 seen &= ev;
                 int.seen.set(seen);
                 if ev & !seen == 0 {
@@ -1130,7 +1189,7 @@ impl Epoll {
         out
     }
 
-    /// 关注 `i` 的事件 `ev` 已经报告给 guest。
+    /// Events `ev` of interest `i` have been reported to the guest.
     fn reported(&mut self, i: usize, ev: u32) {
         let owner = self as *const Epoll as usize;
         let int = &mut self.interests[i];
@@ -1138,7 +1197,8 @@ impl Epoll {
         if int.events & EPOLLONESHOT != 0 {
             int.armed = false;
         }
-        // 独占的关注：这个边沿归这个 epoll，别的 epoll 等下一个边沿
+        // Exclusive interest: this edge belongs to this epoll; other epolls wait for the next
+        // edge
         if int.events & EPOLLEXCLUSIVE != 0
             && let Some(file) = int.file.upgrade()
         {
@@ -1162,8 +1222,9 @@ pub(super) fn epoll_create1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
         .map(|fd| fd as u64)
 }
 
-/// `file` 里面嵌套了几层 epoll（不是 epoll 时是 0，只关注普通对象的 epoll 是 1）；
-/// 其中能到达 `target`（会成环）或者嵌套太深时返回 None。
+/// How many levels of epoll are nested in `file` (0 when it is not an epoll, 1 for an epoll that
+/// watches only ordinary objects); None when `target` can be reached from it (which would make a
+/// loop) or the nesting is too deep.
 fn nesting(file: &FileRef, target: &Rc<RefCell<Epoll>>, level: u32) -> Option<u32> {
     let FileKind::Epoll(ep) = &file.borrow().kind else {
         return Some(0);
@@ -1198,7 +1259,8 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     if Rc::ptr_eq(&epf, &file) {
         return Err(Errno::EINVAL);
     }
-    // 普通文件、目录和 /dev/null 这类设备不支持 poll，Linux 不允许把它们加进 epoll
+    // Regular files, directories and devices like /dev/null do not support poll, and Linux does
+    // not allow adding them to an epoll
     if matches!(
         file.borrow().kind,
         FileKind::Regular { .. }
@@ -1211,7 +1273,7 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     ) {
         return Err(Errno::EPERM);
     }
-    // 加入另一个 epoll：不能成环，嵌套不能超过 EP_MAX_NESTS 层
+    // Adding another epoll: no loops, and nesting no deeper than EP_MAX_NESTS levels
     if op == EPOLL_CTL_ADD && nesting(&file, &ep, 0).is_none_or(|d| d > MAX_NESTS) {
         return Err(Errno::ELOOP);
     }
@@ -1224,7 +1286,8 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
             u64::from_le_bytes(b[8..].try_into().unwrap()),
         )
     };
-    // 与 Linux 相同：EPOLLEXCLUSIVE 只能在加入时用，不能用于 epoll，也不能配别的标志
+    // As on Linux: EPOLLEXCLUSIVE can be used only when adding, not on epolls, and not with other
+    // flags
     if events & EPOLLEXCLUSIVE != 0
         && (op == EPOLL_CTL_MOD
             || op == EPOLL_CTL_ADD
@@ -1237,16 +1300,17 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         if events & (EPOLLET | EPOLLEXCLUSIVE) != 0 || ep.borrow().edge_watched.get() {
             watch_host_edges(&file);
         }
-        // 以边沿触发关注另一个 epoll，或者往被这样关注着的 epoll 里加 epoll：里面的宿主
-        // fd 也要记录新到的数据
+        // Watching another epoll edge-triggered, or adding an epoll to an epoll watched that
+        // way: the host fds inside must record newly arrived data too
         if let FileKind::Epoll(inner) = &file.borrow().kind
             && (events & EPOLLET != 0 || ep.borrow().edge_watched.get())
         {
             mark_edge_watched(inner, 0);
         }
     }
-    // 加入、修改时已经就绪：与 Linux 一样唤醒外面等它的 epoll（嵌套时的数据代数加一）。
-    // 只有外面以边沿触发等它时才用得上，不必每次都问宿主
+    // Already ready when added or modified: as on Linux, wake the outer epolls waiting on it (the
+    // data generation when nested goes up by one). This matters only when an outer epoll waits
+    // on it edge-triggered, so the host need not be asked every time
     let ready_now = op != EPOLL_CTL_DEL
         && ep.borrow().edge_watched.get()
         && poll_now(&file.borrow(), events as i16, 0) != 0;
@@ -1256,8 +1320,8 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
         .interests
         .iter()
         .position(|i| i.fd == fd && i.file.as_ptr() == Rc::as_ptr(&file));
-    // 别的线程可能正在 epoll_wait：叫醒它们按新的关注重新等。外面套着它的 epoll、poll 等
-    // 的是它的唤醒对象（下面的 request_wake_object）
+    // Other threads may be in epoll_wait: wake them to wait again with the new interests. Epolls
+    // and polls wrapping this one wait on its wake object (request_wake_object below)
     for w in &ep.waiters {
         crate::kernel::signal_later(w);
     }
@@ -1269,11 +1333,12 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
             request_wake_object(key);
             Ok(0)
         }
-        // 带 EPOLLEXCLUSIVE 加入的不能修改
+        // An interest added with EPOLLEXCLUSIVE cannot be modified
         (EPOLL_CTL_MOD, Some(i)) if ep.interests[i].events & EPOLLEXCLUSIVE != 0 => {
             Err(Errno::EINVAL)
         }
-        // 与 Linux 相同，修改之后重新判断：已经就绪的会再报告一次
+        // As on Linux, readiness is judged again after a modification: if already ready, it is
+        // reported once more
         (EPOLL_CTL_MOD, Some(i)) => {
             let old =
                 std::mem::replace(&mut ep.interests[i], Interest::new(fd, &file, events, data));
@@ -1291,9 +1356,10 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     }
 }
 
-/// 有 epoll 以边沿触发关注 `ep`（`depth` 是往里嵌套的层数）：它和它里面嵌套的 epoll 关注
-/// 的宿主 fd 都建立 [`HostEdges`]，之后加进来的也是（[`Epoll::edge_watched`]）。已有的关注
-/// 的数据代数重新取一次起点，刚建立的记录不算新事件。
+/// An epoll watches `ep` edge-triggered (`depth` is the nesting level going inward): sets up
+/// [`HostEdges`] for the host fds watched by it and by the epolls nested inside it, and for those
+/// added later too ([`Epoll::edge_watched`]). The data generations of existing interests take a
+/// new starting point, so the newly set-up records do not count as new events.
 fn mark_edge_watched(ep: &Rc<RefCell<Epoll>>, depth: u32) {
     if depth >= MAX_NESTS {
         return;
@@ -1314,8 +1380,10 @@ fn mark_edge_watched(ep: &Rc<RefCell<Epoll>>, depth: u32) {
     }
 }
 
-/// 边沿触发、独占的关注要知道宿主 fd 上新到的数据：第一次时建立 [`HostEdges`]。宿主
-/// 不让 epoll 的 fd（宿主上的普通文件）建不了，仍然只看程序有没有用完数据。
+/// Edge-triggered and exclusive interests need to know about newly arrived data on host fds:
+/// sets up [`HostEdges`] the first time. It cannot be set up for fds the host does not allow in
+/// an epoll (regular files on the host), which still depend only on whether the program has used
+/// up the data.
 fn watch_host_edges(file: &FileRef) {
     let mut f = file.borrow_mut();
     if f.host_edges.is_some() {
@@ -1342,9 +1410,10 @@ pub(super) fn epoll_pwait(
     if maxevents <= 0 || maxevents > i32::MAX / 16 {
         return Err(Errno::EINVAL);
     }
-    // 打开文件只借这一句：`let … else` 绑定借用出来的引用时，借用一直活到函数结束，等的
-    // 时候别的线程改这个打开文件（fcntl、FIONBIO）就会 panic。epf 本身留到最后，等的时候
-    // fd 被关掉也保活
+    // Borrow the open file for this statement only: when `let … else` binds a reference
+    // borrowed from it, the borrow lives until the end of the function, and another thread
+    // changing this open file while we wait (fcntl, FIONBIO) would panic. epf itself is kept
+    // until the end, so it stays alive if the fd is closed while waiting
     let epf = cx.fds().get(epfd)?;
     let ep = match &epf.borrow().kind {
         FileKind::Epoll(ep) => ep.clone(),
@@ -1356,8 +1425,8 @@ pub(super) fn epoll_pwait(
         if !ready.is_empty() || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(ready);
         }
-        // 与 Linux 的 ep_poll 一样是 EINTR，不重新执行：没有处理函数的信号（停止之后又继续）、
-        // cgroup 冻结之后解冻也是 EINTR（signal(7)）
+        // EINTR as in Linux's ep_poll, never restarted: a signal with no handler (stopped and
+        // then continued) and thawing after a cgroup freeze are EINTR too (signal(7))
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
@@ -1385,12 +1454,12 @@ pub(super) fn epoll_pwait(
     Ok(ready.len() as u64)
 }
 
-/// epoll_pwait 的超时：毫秒，负数表示一直等。
+/// epoll_pwait's timeout: milliseconds; negative means wait forever.
 pub(super) fn deadline_ms(timeout: i32) -> Option<Instant> {
     (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64))
 }
 
-/// epoll_pwait2 的超时：`struct timespec`，NULL 表示一直等。
+/// epoll_pwait2's timeout: a `struct timespec`; NULL means wait forever.
 pub(super) fn deadline_ts(cx: &Cx<'_>, timeout: u64) -> Result<Option<Instant>, Errno> {
     if timeout == 0 {
         return Ok(None);
@@ -1421,7 +1490,7 @@ pub(super) fn eventfd2(cx: &mut Cx<'_>, initval: u32, flags: u32) -> SysResult {
         .map(|fd| fd as u64)
 }
 
-/// eventfd 的读：取走计数（semaphore 模式下取 1），计数为 0 时阻塞。
+/// eventfd read: takes the count (1 in semaphore mode), blocking while the count is 0.
 pub(super) fn eventfd_read(
     cx: &mut Cx<'_>,
     efd: &Rc<RefCell<EventFd>>,
@@ -1453,7 +1522,7 @@ pub(super) fn eventfd_read(
     }
 }
 
-/// eventfd 的写：加到计数上，会溢出时阻塞。
+/// eventfd write: adds to the count, blocking when it would overflow.
 pub(super) fn eventfd_write(
     cx: &mut Cx<'_>,
     efd: &Rc<RefCell<EventFd>>,
@@ -1504,31 +1573,33 @@ mod tests {
         let mut ep = Epoll::default();
         ep.interests
             .push(Interest::new(3, &file, both | EPOLLET, 0));
-        // 一开始可写：报告一次之后，没有变化就不再报告
+        // Writable from the start: after one report, no more reports without a change
         assert_eq!(ep.ready(0, 8), vec![(0, POLLOUT as u32)]);
         ep.reported(0, POLLOUT as u32);
         assert!(ep.ready(0, 8).is_empty());
-        // 变得可读：报告当前全部就绪的位
+        // Becoming readable: report all bits currently ready
         efd.borrow_mut().count = 1;
         assert_eq!(ep.ready(0, 8), vec![(0, both)]);
-        // 只检查（嵌套 epoll）不消耗事件
+        // Only checking (nested epoll) does not consume the events
         assert_eq!(ep.ready(0, 8), vec![(0, both)]);
         ep.reported(0, both);
         assert!(ep.ready(0, 8).is_empty());
-        // 读空之后再写入：重新触发
+        // Written again after being read empty: fires again
         efd.borrow_mut().count = 0;
         assert!(ep.ready(0, 8).is_empty());
         efd.borrow_mut().count = 5;
         assert_eq!(ep.ready(0, 8), vec![(0, both)]);
         ep.reported(0, both);
-        // 读空、得到 EAGAIN、又来了数据，其间没有调用 epoll_wait：也要重新触发
+        // Read empty, got EAGAIN and more data arrived, with no epoll_wait in between: must fire
+        // again too
         efd.borrow_mut().count = 0;
         file.borrow_mut().drained[0] += 1;
         efd.borrow_mut().count = 2;
         assert_eq!(ep.ready(0, 8), vec![(0, both)]);
         ep.reported(0, both);
         assert!(ep.ready(0, 8).is_empty());
-        // 写方向用完只重新报告写方向的位，等待时不等报告过、仍然就绪的位
+        // Using up the write direction re-reports only the write direction's bits; while
+        // waiting, bits that were reported and are still ready are not waited for
         file.borrow_mut().drained[1] += 1;
         assert_eq!(ep.ready(0, 8), vec![(0, both)]);
         ep.reported(0, both);
@@ -1559,16 +1630,17 @@ mod tests {
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
         ep.reported(0, POLLIN as u32);
         assert!(ep.ready(0, 8).is_empty());
-        // 计数没有读走又写了一次（mio 的唤醒器）：再报告一次
+        // The count was not read away and another write came (mio's waker): report once more
         write(1);
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
         ep.reported(0, POLLIN as u32);
         assert!(ep.ready(0, 8).is_empty());
-        // 等待时不等仍然就绪的位，但要被叫醒（边沿触发的等待者）
+        // While waiting, still-ready bits are not waited for, but the waiter must be woken (an
+        // edge-triggered waiter)
         let mut waits = Waits::default();
         waits.add_epoll(&ep, 0);
         assert!(waits.edge);
-        // 写零也算一次（Linux 照样唤醒）
+        // Writing zero counts too (Linux wakes as usual)
         write(0);
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
     }
@@ -1607,8 +1679,8 @@ mod tests {
         }
         let mut waits = Waits::default();
         waits.add_epoll(&outer, 0);
-        // 嵌套的 epoll 自己（epoll_ctl）和它关注的文件，AF_UNIX socket 的接收队列和连接的
-        // 两个方向
+        // The nested epoll itself (epoll_ctl) and the files it watches, the AF_UNIX socket's
+        // receive queue and both directions of the connection
         let mut want = vec![wake::of(&inner), wake::of(&e1), wake::of(&e2)];
         want.extend(&unix_objects);
         assert_eq!(unix_objects.len(), 3);
@@ -1627,7 +1699,8 @@ mod tests {
             reads: 0,
         }));
         let file = OpenFile::new(FileKind::EventFd(efd.clone()), oflags::O_RDWR);
-        // 内层水平触发关注 eventfd，外层边沿触发关注内层
+        // The inner epoll watches an eventfd level-triggered, the outer one watches the inner
+        // edge-triggered
         let mut inner = Epoll::default();
         inner
             .interests
@@ -1650,11 +1723,11 @@ mod tests {
         assert_eq!(outer.ready(0, 8), vec![(0, POLLIN as u32)]);
         outer.reported(0, POLLIN as u32);
         assert!(outer.ready(0, 8).is_empty());
-        // 内层仍然就绪，又来了一次：外层再报告
+        // The inner one is still ready and another event came: the outer one reports again
         write();
         assert_eq!(outer.ready(0, 8), vec![(0, POLLIN as u32)]);
         outer.reported(0, POLLIN as u32);
-        // 内层去掉关注不算新事件
+        // Removing an interest from the inner one does not count as a new event
         if let FileKind::Epoll(ep) = &inner.borrow().kind {
             ep.borrow_mut().remove(0);
         }
@@ -1685,20 +1758,22 @@ mod tests {
         write();
         assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
         a.reported(0, POLLIN as u32);
-        // 水平触发：报告过的 epoll 只要仍然就绪就接着报告，别的 epoll 等下一个边沿
+        // Level-triggered: the epoll that reported keeps reporting while it is still ready, and
+        // other epolls wait for the next edge
         assert!(b.ready(0, 8).is_empty());
         assert_eq!(a.ready(0, 8), vec![(0, POLLIN as u32)]);
-        // 等待时不自己等独占关注的文件，登记在它的独占门上（定时器线程只叫醒一个）
+        // While waiting, the file of an exclusive interest is not waited on directly but
+        // registered on its exclusive gate (the timer thread wakes only one)
         let mut waits = Waits::default();
         waits.add_epoll(&b, 0);
         assert_eq!(waits.gated.len(), 1);
         assert!(waits.host.is_empty() && !waits.files);
-        // 又来了数据：轮到先检查的那个
+        // More data arrived: it goes to the one that checks first
         write();
         assert_eq!(b.ready(0, 8), vec![(0, POLLIN as u32)]);
         b.reported(0, POLLIN as u32);
         assert!(a.ready(0, 8).is_empty());
-        // 读空之后再来：仍然只报告给一个
+        // More arrives after being read empty: still reported to only one
         efd.borrow_mut().count = 0;
         file.borrow_mut().drained[0] += 1;
         assert!(a.ready(0, 8).is_empty() && b.ready(0, 8).is_empty());
@@ -1730,19 +1805,19 @@ mod tests {
             e.count += 1;
             e.writes += 1;
         };
-        // 没有新的边沿：谁也不叫醒
+        // No new edge: nobody is woken
         assert!(gate.next_waiter(&file.borrow()).is_none());
-        // 一个新的边沿只叫醒排在最前面的一个，同一个边沿不再叫醒别的
+        // A new edge wakes only the first in the queue, and the same edge wakes no other
         write();
         let w = gate.next_waiter(&file.borrow()).unwrap();
         assert!(Arc::ptr_eq(&w, &sleepers[0]));
         assert!(gate.next_waiter(&file.borrow()).is_none());
-        // 已经被某个 epoll 报告过的边沿不叫醒
+        // An edge already reported by some epoll wakes nobody
         write();
         let now = edge(&file.borrow());
         file.borrow().exclusive_claim.set(Some((now, 1)));
         assert!(gate.next_waiter(&file.borrow()).is_none());
-        // 下一个边沿轮到第二个
+        // The next edge goes to the second
         write();
         let w = gate.next_waiter(&file.borrow()).unwrap();
         assert!(Arc::ptr_eq(&w, &sleepers[1]));
@@ -1767,7 +1842,7 @@ mod tests {
         assert_eq!(ep.ready(0, 8), vec![(0, POLLIN as u32)]);
         ep.reported(0, POLLIN as u32);
         assert!(ep.ready(0, 8).is_empty());
-        // 文件关闭之后关注自动失效
+        // After the file is closed, the interest becomes void automatically
         ep.interests[0].armed = true;
         drop(file);
         assert!(ep.ready(0, 8).is_empty() && ep.interests[0].file.upgrade().is_none());
