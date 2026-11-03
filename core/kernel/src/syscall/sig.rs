@@ -1,4 +1,4 @@
-//! 信号类 syscall：kill 系列、sigaction、屏蔽字、sigsuspend、sigaltstack。
+//! Signal syscalls: the kill family, sigaction, signal masks, sigsuspend, sigaltstack.
 
 use std::rc::{Rc, Weak};
 use std::time::Instant;
@@ -17,10 +17,10 @@ use crate::vfs::Node;
 const SIG_BLOCK: u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
-/// guest 的 sigset_t 在内核 ABI 里的大小（64 个信号）。
+/// Size of the guest's sigset_t in the kernel ABI (64 signals).
 const SIGSET_SIZE: usize = 8;
 
-/// 信号编号参数：0 只检查目标是否存在。
+/// A signal number argument: 0 only checks that the target exists.
 fn signal_arg(sig: i32) -> Result<Option<Signal>, Errno> {
     if sig == 0 {
         return Ok(None);
@@ -36,9 +36,10 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
         (g.pgid, g.sid)
     };
     let cred = cx.cred();
-    // 内置的 init 忽略别的信号；没有权限给它发信号时与 Linux 一样报 EPERM。宿主按 inittab
-    // 启动了时与 busybox 的 init 一样，SIGTERM、SIGUSR1、SIGUSR2 是重启、停机、关机的请求
-    // （busybox 的 reboot、halt、poweroff），记下来叫醒等着的宿主
+    // The built-in init ignores other signals; without permission to signal it, the result is
+    // EPERM as on Linux. When the host started it from inittab, SIGTERM, SIGUSR1 and SIGUSR2 are
+    // requests to reboot, halt and power off, as with busybox's init (busybox's reboot, halt,
+    // poweroff): record the request and wake the waiting host
     if pid == INIT {
         if !cred.may_signal(&crate::cred::Cred::root()) {
             return Err(Errno::EPERM);
@@ -52,8 +53,9 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
         }
         return Ok(0);
     }
-    // 活着的目标线程组：pid > 0 是一个进程，0 是本进程组，-1 是除 init 和自己以外的
-    // 所有进程（自己的 pid 命名空间里看得到、编号大于 1 的），< -1 是进程组 -pid
+    // Live target thread groups: pid > 0 is one process, 0 is this process group, -1 is every
+    // process except init and ourselves (those visible in our pid namespace with ids above 1),
+    // < -1 is process group -pid
     let ns = cx.pid_ns();
     let targets: Vec<Tid> = cx
         .kr()
@@ -73,7 +75,7 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     if targets.is_empty() {
         return Err(Errno::ESRCH);
     }
-    // 没有权限的目标跳过；一个也发不出去时报 EPERM（pid 为 -1 时不报）
+    // Targets without permission are skipped; if none can be signalled, EPERM (except for pid -1)
     let allowed: Vec<Tid> = targets
         .into_iter()
         .filter(|&t| may_kill(cx, &cred, my_sid, t, sig))
@@ -92,8 +94,8 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     Ok(0)
 }
 
-/// 能不能给进程 `tgid` 发信号 `sig`（`check_kill_permission`）：凭据允许，或者是同一个
-/// 进程，或者是发给同一个会话的 SIGCONT。
+/// Whether process `tgid` may be sent signal `sig` (`check_kill_permission`): the credentials
+/// allow it, or it is the same process, or it is SIGCONT sent within the same session.
 fn may_kill(cx: &Cx<'_>, cred: &Cred, sid: Tid, tgid: Tid, sig: Option<Signal>) -> bool {
     let Some(target) = cx.kr().groups.get(&tgid) else {
         return false;
@@ -113,7 +115,8 @@ pub(super) fn tgkill(cx: &mut Cx<'_>, tgid: i32, tid: i32, sig: i32) -> SysResul
     kill_thread(cx, Some(tgid), tid, sig)
 }
 
-/// 给一个线程发信号；`tgid` 为 None 时不检查它属于哪个线程组（tkill）。
+/// Sends a signal to one thread; with `tgid` None, does not check which thread group it belongs
+/// to (tkill).
 fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysResult {
     if tid <= 0 {
         return Err(Errno::EINVAL);
@@ -129,7 +132,8 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
         return Err(Errno::EPERM);
     }
     if let Some(sig) = sig {
-        // tkill 的 si_code 不是 SI_USER：实时信号排不上队时与 sigqueue 一样是 EAGAIN
+        // tkill's si_code is not SI_USER: when a real-time signal cannot be queued, EAGAIN as
+        // with sigqueue
         if !signal::can_queue(cx.kr(), task.tgid, sig) {
             return Err(Errno::EAGAIN);
         }
@@ -142,7 +146,7 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
     Ok(0)
 }
 
-/// 调用者给出的 siginfo（rt_sigqueueinfo、pidfd_send_signal）。
+/// The siginfo given by the caller (rt_sigqueueinfo, pidfd_send_signal).
 fn queue_info(b: &[u8; 128]) -> SigInfo {
     let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     SigInfo {
@@ -156,8 +160,8 @@ fn queue_info(b: &[u8; 128]) -> SigInfo {
     }
 }
 
-/// pidfd_send_signal：pidfd 也可以是打开的 `/proc/<pid>` 目录。`uinfo` 为空时与 kill
-/// 相同，否则与 rt_sigqueueinfo 相同（si_signo 必须等于 `sig`）。
+/// pidfd_send_signal: the pidfd may also be an open `/proc/<pid>` directory. With `uinfo` null it
+/// is the same as kill, otherwise the same as rt_sigqueueinfo (si_signo must equal `sig`).
 pub(super) fn pidfd_send_signal(
     cx: &mut Cx<'_>,
     pidfd: i32,
@@ -171,7 +175,7 @@ pub(super) fn pidfd_send_signal(
     let file = cx.fds().get(pidfd)?;
     let tgid = match &file.borrow().kind {
         FileKind::Pidfd(p) => p.group(cx.kr()).map(|_| p.tgid).ok_or(Errno::ESRCH)?,
-        // 打开的那个进程已经回收了：pid 可能已经给了新进程
+        // The process that was opened has been reaped: the pid may already belong to a new one
         FileKind::Directory {
             node: Node::Pseudo(_, PseudoNode::Pid(pid, None)),
             process,
@@ -220,16 +224,16 @@ pub(super) fn pidfd_send_signal(
     if uinfo != 0 && info.code != code::SI_USER && !signal::can_queue(cx.kr(), tgid, sig) {
         return Err(Errno::EAGAIN);
     }
-    // 内置的 init 忽略所有信号
+    // The built-in init ignores all signals
     if tgid != INIT {
         signal::send_to_group(cx.kr(), tgid, sig, info);
     }
     Ok(0)
 }
 
-/// rt_sigqueueinfo、rt_tgsigqueueinfo（`tid` 为 None 时发给整个进程）：siginfo 由调用者
-/// 给出。不能冒充内核或 kill 发出的信号（si_code 不小于 0 或者是 SI_TKILL），除非发给
-/// 自己。
+/// rt_sigqueueinfo and rt_tgsigqueueinfo (with `tid` None, sent to the whole process): the
+/// siginfo is given by the caller. It may not impersonate signals sent by the kernel or by kill
+/// (si_code not below 0, or SI_TKILL), unless sent to oneself.
 pub(super) fn sigqueueinfo(
     cx: &mut Cx<'_>,
     tgid: i32,
@@ -247,12 +251,13 @@ pub(super) fn sigqueueinfo(
     let sig = signal_arg(sig)?;
     let cred = cx.cred();
     let sid = cx.t.group.borrow().sid;
-    // rt_sigqueueinfo 的 pid 也可以是进程里任何一个线程的 tid
+    // rt_sigqueueinfo's pid may also be the tid of any thread in the process
     let tgid = match tid {
         None => cx.kr().tasks.get(&tgid).map_or(tgid, |t| t.tgid),
         Some(_) => tgid,
     };
-    // 实时信号排不上队：返回 EAGAIN，而不是像 kill 那样丢掉 siginfo
+    // A real-time signal that cannot be queued returns EAGAIN, rather than dropping the siginfo
+    // as kill does
     let full = |cx: &Cx<'_>| {
         sig.is_some_and(|s| code != code::SI_USER && !signal::can_queue(cx.kr(), tgid, s))
     };
@@ -298,7 +303,8 @@ pub(super) fn sigqueueinfo(
     Ok(0)
 }
 
-/// signalfd4：`fd` 为 -1 时新建，否则修改已有 signalfd 的掩码。
+/// signalfd4: creates a new one when `fd` is -1, otherwise changes the mask of an existing
+/// signalfd.
 pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags: u32) -> SysResult {
     use crate::fd::{FileKind, OpenFile, SignalFd, oflags};
     if size != SIGSET_SIZE || flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
@@ -311,7 +317,7 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
             return Err(Errno::EINVAL);
         };
         s.borrow_mut().mask = set;
-        // 等这个 signalfd 的线程按新的掩码重新检查（poll 登记了它）
+        // Threads waiting on this signalfd recheck with the new mask (poll registered it)
         crate::kernel::request_wake_object(crate::kernel::wake::of(s));
         return Ok(fd as u64);
     }
@@ -328,8 +334,8 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
         .map(|fd| fd as u64)
 }
 
-/// 读 signalfd：取走调用者挂起的、在掩码里的信号，每个编码成 128 字节的
-/// `struct signalfd_siginfo`。一个都没有时阻塞（非阻塞时 EAGAIN）。
+/// Reads a signalfd: takes the caller's pending signals that are in the mask, each encoded as a
+/// 128-byte `struct signalfd_siginfo`. Blocks when there are none (EAGAIN when nonblocking).
 pub(super) fn signalfd_read(
     cx: &mut Cx<'_>,
     s: &std::rc::Rc<crate::cell::RefCell<crate::fd::SignalFd>>,
@@ -358,12 +364,13 @@ pub(super) fn signalfd_read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
-        // 被屏蔽的信号挂起时请求 wake::SIGNAL，改掩码时请求这个 signalfd
+        // A blocked signal becoming pending requests wake::SIGNAL; changing the mask requests
+        // this signalfd
         cx.wait_objects(None, &mut [], wake::FILE | wake::SIGNAL, &[wake::of(s)])?;
     }
 }
 
-/// `struct signalfd_siginfo`（128 字节）。
+/// `struct signalfd_siginfo` (128 bytes).
 fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
     use signal::InfoFields;
     let mut b = [0u8; 128];
@@ -412,7 +419,7 @@ fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
             put32(96, arch);
             b[88..96].copy_from_slice(&call_addr.to_le_bytes());
         }
-        // 跟踪者给的：多数 si_code 的开头是发送者的 pid 和 uid
+        // Given by a tracer: most si_codes start with the sender's pid and uid
         InfoFields::Raw(rest) => {
             put32(12, u32::from_le_bytes(rest[..4].try_into().unwrap()));
             put32(16, u32::from_le_bytes(rest[4..8].try_into().unwrap()));
@@ -453,7 +460,8 @@ pub(super) fn rt_sigaction(
         None
     };
     let sighand = cx.t.group.borrow().sighand.clone();
-    // seccomp 要结束进程时强制的默认处理不能再改（Linux 的 SA_IMMUTABLE）
+    // The default action forced when seccomp kills the process cannot be changed again (Linux's
+    // SA_IMMUTABLE)
     if sighand.borrow().get(sig).immutable {
         return Err(Errno::EINVAL);
     }
@@ -470,7 +478,8 @@ pub(super) fn rt_sigaction(
     }
     if let Some(new) = new {
         sighand.borrow_mut().set(sig, new);
-        // 改成忽略之后，已经挂起的同一信号被丢弃（线程组和每个线程上的）
+        // Once changed to ignored, pending instances of the same signal are discarded (on the
+        // thread group and on every thread)
         if sighand.borrow().ignores(sig) {
             let threads = {
                 let mut g = cx.t.group.borrow_mut();
@@ -536,7 +545,8 @@ pub(super) fn rt_sigsuspend(cx: &mut Cx<'_>, set: u64, size: usize) -> SysResult
         return Err(Errno::EINVAL);
     }
     let mask = u64::from_le_bytes(get(cx, set)?);
-    // 投递信号时帧里保存原来的屏蔽字，处理函数返回后恢复（signal::deliver）
+    // On delivery the frame saves the original mask, restored when the handler returns
+    // (signal::deliver)
     cx.task.saved_sigmask.set(Some(cx.task.sigmask.get()));
     cx.task.sigmask.set(mask & !UNBLOCKABLE);
     while !cx.interrupted() {
@@ -550,9 +560,10 @@ pub(super) fn rt_sigsuspend(cx: &mut Cx<'_>, set: u64, size: usize) -> SysResult
     Err(Errno::ERESTARTNOHAND)
 }
 
-/// rt_sigtimedwait（sigwait、sigwaitinfo、sigtimedwait）：等 `set` 里的信号挂起，不经过
-/// 处理函数直接取走它。`set` 里的信号通常被调用方屏蔽着；别的信号打断等待时返回 EINTR，
-/// 与 Linux 相同，这个 syscall 不会被重新执行。
+/// rt_sigtimedwait (sigwait, sigwaitinfo, sigtimedwait): waits for a signal in `set` to become
+/// pending and takes it directly, without a handler. Signals in `set` are usually blocked by the
+/// caller; when another signal interrupts the wait it returns EINTR, and as on Linux this syscall
+/// is never restarted.
 pub(super) fn rt_sigtimedwait(
     cx: &mut Cx<'_>,
     set: u64,
@@ -581,7 +592,8 @@ pub(super) fn rt_sigtimedwait(
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
-        // 被屏蔽的信号挂起时请求 wake::SIGNAL；没有屏蔽的直接叫醒这个线程
+        // A blocked signal becoming pending requests wake::SIGNAL; an unblocked one wakes this
+        // thread directly
         cx.wait_on(deadline, &mut [], wake::SIGNAL)?;
     }
 }

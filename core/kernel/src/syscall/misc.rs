@@ -1,4 +1,4 @@
-//! futex、时间、资源限制等杂项 syscall。
+//! Miscellaneous syscalls: futex, time, resource limits and so on.
 
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ const FUTEX_CMP_REQUEUE: u32 = 4;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
-/// 去掉 `FUTEX_PRIVATE_FLAG`、`FUTEX_CLOCK_REALTIME` 之后的命令位。
+/// The command bits after removing `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`.
 const FUTEX_CMD_MASK: u32 = 0x7f;
 
 const TIMER_ABSTIME: u32 = 1;
@@ -59,18 +59,19 @@ const PR_SET_CHILD_SUBREAPER: i32 = 36;
 const PR_GET_CHILD_SUBREAPER: i32 = 37;
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 const PR_GET_NO_NEW_PRIVS: i32 = 39;
-/// 最大的 capability 编号（`CAP_CHECKPOINT_RESTORE`）。
+/// The highest capability number (`CAP_CHECKPOINT_RESTORE`).
 const CAP_LAST_CAP: u64 = 40;
 
 const GRND_NONBLOCK: u32 = 1;
 const GRND_RANDOM: u32 = 2;
 const GRND_INSECURE: u32 = 4;
 
-/// `uname -r` 报告的内核版本，即 ABI 契约（kernel/signal 的 map）。
+/// The kernel version `uname -r` reports, that is, the ABI contract (the kernel/signal map).
 const RELEASE: &[u8] = b"6.1.0-appine";
 
-/// 把 `clock` 上的绝对时间换算成等待的截止时刻。已经过去的时间换算成过去的时刻：
-/// 周期性的定时器要按它算错过了几个周期。早到单调时钟表示不了时就是现在。
+/// Converts an absolute time on `clock` into a wait deadline. A time already past becomes an
+/// instant in the past: periodic timers count missed periods from it. A time too early for the
+/// monotonic clock to represent becomes now.
 pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
     let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
     let now = Duration::new(sec.max(0) as u64, nsec as u32);
@@ -81,19 +82,21 @@ pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, 
     })
 }
 
-/// time 命名空间里时钟 `clock` 上的绝对时刻 `abs` 换成等待的截止时刻：先减去偏移
-/// （Linux 的 `timens_ktime_to_host`，早于偏移的当作已经过去），再按宿主的时钟算。
+/// Converts the absolute time `abs` on clock `clock` in the time namespace into a wait deadline:
+/// first subtracts the offset (Linux's `timens_ktime_to_host`; times before the offset count as
+/// already past), then computes on the host's clock.
 pub(super) fn deadline_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<Instant, Errno> {
     deadline_from_clock(clock, to_host_clock(cx.time_offset(clock), abs))
 }
 
-/// 加上偏移 `offset` 的时刻 `abs` 在宿主时钟上是多少：减去偏移，不早于 0。
+/// What time `abs`, which includes offset `offset`, is on the host clock: the offset subtracted,
+/// not before 0.
 pub(super) fn to_host_clock(offset: i64, abs: Duration) -> Duration {
     let ns = abs.as_nanos() as i128 - offset as i128;
     Duration::from_nanos(ns.clamp(0, u64::MAX as i128) as u64)
 }
 
-/// 宿主时钟的读数 (秒, 纳秒) 加上 time 命名空间的偏移 `offset`（纳秒）。
+/// A host clock reading (sec, nsec) plus the time namespace offset `offset` (in nanoseconds).
 pub(super) fn add_offset((sec, nsec): (i64, i64), offset: i64) -> (i64, i64) {
     if offset == 0 {
         return (sec, nsec);
@@ -105,7 +108,7 @@ pub(super) fn add_offset((sec, nsec): (i64, i64), offset: i64) -> (i64, i64) {
     )
 }
 
-/// futex 的键：翻译后的宿主地址。
+/// The futex key: the translated host address.
 fn futex_key(cx: &Cx<'_>, uaddr: u64) -> Result<Key, Errno> {
     if !uaddr.is_multiple_of(4) {
         return Err(Errno::EINVAL);
@@ -129,8 +132,9 @@ pub(super) fn futex(
             if bitset == 0 {
                 return Err(Errno::EINVAL);
             }
-            // FUTEX_WAIT 的超时是相对的（CLOCK_MONOTONIC），WAIT_BITSET 的是绝对的。不持 BKL
-            // 的路径（syscall::fast）已经睡过一阵的，按它算好的到期时刻
+            // FUTEX_WAIT's timeout is relative (CLOCK_MONOTONIC), WAIT_BITSET's is absolute. If
+            // the no-BKL path (syscall::fast) has already slept for a while, use the deadline it
+            // computed
             let early = cx.t.fast_sleep.take();
             let deadline = match timeout {
                 0 => None,
@@ -159,7 +163,7 @@ pub(super) fn futex(
             Ok(cx.shared.futexes().wake(key, val, bitset) as u64)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-            // 唤醒和移动的个数是 int，负数是 EINVAL
+            // The wake and requeue counts are ints; negative values are EINVAL
             if (val as i32) < 0 || (timeout as u32 as i32) < 0 {
                 return Err(Errno::EINVAL);
             }
@@ -169,7 +173,7 @@ pub(super) fn futex(
             if cmd == FUTEX_CMP_REQUEUE && u32::from_le_bytes(get(cx, uaddr)?) != val3 {
                 return Err(Errno::EAGAIN);
             }
-            // 第四个参数在 REQUEUE 里是要移动的个数，不是超时
+            // In REQUEUE the fourth argument is the number to requeue, not a timeout
             let n = futexes.requeue(key, val, key2, timeout as u32);
             Ok(n as u64)
         }
@@ -177,10 +181,11 @@ pub(super) fn futex(
     }
 }
 
-/// futex 等待（Linux 的 `futex_wait`）：`*uaddr` 是 `val` 时等到被唤醒、`deadline` 或者被
-/// 打断。被打断时没有超时的是 ERESTARTSYS；有超时的记下到期时刻，返回
-/// ERESTART_RESTARTBLOCK：没有处理函数时由 restart_syscall 接着等到原来的时刻（停止又继续、
-/// cgroup 冻结又解冻之后不从头再等），有处理函数时是 EINTR（即使有 SA_RESTART）。
+/// A futex wait (Linux's `futex_wait`): while `*uaddr` is `val`, waits until woken, `deadline`, or
+/// interrupted. When interrupted without a timeout the result is ERESTARTSYS; with a timeout it
+/// records the deadline and returns ERESTART_RESTARTBLOCK: without a handler, restart_syscall
+/// goes on waiting until the original deadline (after a stop and continue, or a cgroup freeze and
+/// thaw, the wait does not start over), and with a handler it is EINTR (even with SA_RESTART).
 fn futex_wait(
     cx: &mut Cx<'_>,
     (uaddr, val, bitset): (u64, u32, u32),
@@ -188,7 +193,8 @@ fn futex_wait(
 ) -> SysResult {
     let key = futex_key(cx, uaddr)?;
     let shared = cx.shared;
-    // 不持 BKL 的唤醒（syscall::fast）也取 futex 的锁：检查值和登记之间不会漏掉
+    // No-BKL wakes (syscall::fast) also take the futex lock, so nothing is missed between
+    // checking the value and registering
     let id = {
         let mut futexes = shared.futexes();
         if u32::from_le_bytes(get(cx, uaddr)?) != val {
@@ -214,8 +220,8 @@ fn futex_wait(
             cx.wait_alone(deadline).err()
         };
         if let Some(e) = err {
-            // 原来放开 futex 的锁之后才移除：这中间不持 BKL 的唤醒（syscall::fast）
-            // 取走了它的话，唤醒丢了，它却返回错误
+            // It used to be removed only after releasing the futex lock: if a no-BKL wake
+            // (syscall::fast) took it in between, the wake was lost while it returned an error
             return match waiting.leave() {
                 Some(_) => Ok(0),
                 None => {
@@ -234,14 +240,15 @@ fn futex_wait(
     }
 }
 
-/// `struct futex_waitv` 的 flags：32 位的 futex，以及只在本进程内有效（我们不区分）。
+/// Flags of `struct futex_waitv`: a 32-bit futex, and valid only within this process (we do not
+/// tell them apart).
 const FUTEX_32: u32 = 2;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
-/// futex_waitv 一次最多等的 futex 个数。
+/// The most futexes futex_waitv waits on at once.
 const FUTEX_WAITV_MAX: u32 = 128;
 
-/// futex_waitv(2)：同时等多个 futex，任何一个被唤醒就返回它的下标。超时是 `clock`
-/// 上的绝对时间。
+/// futex_waitv(2): waits on several futexes at once and returns the index of whichever is woken.
+/// The timeout is an absolute time on `clock`.
 pub(super) fn futex_waitv(
     cx: &mut Cx<'_>,
     waiters: u64,
@@ -272,7 +279,7 @@ pub(super) fn futex_waitv(
         }
         keys.push((futex_key(cx, uaddr)?, uaddr, val));
     }
-    // 持有 futex 的锁：检查值和登记之间不会有人唤醒
+    // Holding the futex lock, so nobody can wake between checking the values and registering
     let shared = cx.shared;
     let ids: Vec<u64> = {
         let mut futexes = shared.futexes();
@@ -307,14 +314,15 @@ pub(super) fn futex_waitv(
             break Err(e);
         }
     };
-    // 与 Linux 的 futex_unqueue_multiple 一样，超时、被信号打断时刚好被唤醒的算唤醒
+    // As with Linux's futex_unqueue_multiple, a wake that lands just as the wait times out or is
+    // interrupted by a signal counts as a wake
     match (waiting.leave(), r) {
         (Some(i), Err(_)) => Ok(i as u64),
         (_, r) => r,
     }
 }
 
-/// 睡到 `deadline`，被信号打断时返回剩余时间。
+/// Sleeps until `deadline`; returns the remaining time when interrupted by a signal.
 fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
     loop {
         let now = Instant::now();
@@ -333,9 +341,9 @@ pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
     sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem)
 }
 
-/// 睡到 `deadline`。被信号打断时把剩下的时长写进 `rem`（不为 0 时），并记下到期时刻：
-/// 没有处理函数打断时（比如停止之后又继续）由 restart_syscall 接着睡，而不是按原来的
-/// 时长重新睡一遍。
+/// Sleeps until `deadline`. When interrupted by a signal, writes the remaining time to `rem` (if
+/// not 0) and records the deadline: when no handler interrupts (for example a stop followed by a
+/// continue), restart_syscall goes on sleeping instead of sleeping the original duration again.
 fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
     match sleep_until(cx, deadline) {
         Ok(()) => Ok(0),
@@ -349,11 +357,13 @@ fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
     }
 }
 
-/// 被打断、没有处理函数时由 restart_syscall 接着做的（Linux 的 `restart_block`）。
+/// What restart_syscall continues after an interruption without a handler (Linux's
+/// `restart_block`).
 pub(crate) enum Restart {
-    /// nanosleep、clock_nanosleep：到期时刻和 `rem` 的地址。
+    /// nanosleep, clock_nanosleep: the deadline and the address of `rem`.
     Sleep { deadline: Instant, rem: u64 },
-    /// 有超时的 futex 等待（`futex_wait_restart`）：照原来的参数接着等到原来的到期时刻。
+    /// A futex wait with a timeout (`futex_wait_restart`): goes on waiting with the original
+    /// arguments until the original deadline.
     Futex {
         uaddr: u64,
         val: u32,
@@ -362,8 +372,8 @@ pub(crate) enum Restart {
     },
 }
 
-/// restart_syscall：接着做被打断的 nanosleep、futex 等待。与 Linux 相同，没有可以接着做的
-/// 时返回 EINTR。
+/// restart_syscall: continues an interrupted nanosleep or futex wait. As on Linux, returns EINTR
+/// when there is nothing to continue.
 pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
     match cx.t.restart.take() {
         Some(Restart::Sleep { deadline, rem }) => sleep_rest(cx, deadline, rem),
@@ -377,7 +387,7 @@ pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
     }
 }
 
-/// 读 `struct itimerval`：(间隔, 第一次到期前的时长)。
+/// Reads a `struct itimerval`: (interval, time until the first expiry).
 fn read_itimerval(cx: &Cx<'_>, addr: u64) -> Result<(Duration, Duration), Errno> {
     let b: [u8; 32] = get(cx, addr)?;
     let tv = |o: usize| {
@@ -391,10 +401,10 @@ fn read_itimerval(cx: &Cx<'_>, addr: u64) -> Result<(Duration, Duration), Errno>
     Ok((tv(0)?, tv(16)?))
 }
 
-/// 写 `struct itimerval`：间隔和离下一次到期还有多久。
+/// Writes a `struct itimerval`: the interval and the time left until the next expiry.
 fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<(Duration, Duration)>) -> Result<(), Errno> {
     let (interval, left) = match t {
-        // 与 Linux 相同，还没到期的定时器至少报告 1 微秒
+        // As on Linux, a timer that has not expired yet reports at least 1 microsecond
         Some((interval, left)) => (interval, left.max(Duration::from_micros(1))),
         None => (Duration::ZERO, Duration::ZERO),
     };
@@ -409,7 +419,8 @@ fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<(Duration, Duration)>) -> R
 const ITIMER_VIRTUAL: i32 = 1;
 const ITIMER_PROF: i32 = 2;
 
-/// 定时器的当前值：(间隔, 离下一次到期还有多久)，没有启动时是 None。
+/// The timer's current value: (interval, time left until the next expiry), or None when it is not
+/// armed.
 fn itimer_value(cx: &Cx<'_>, which: i32) -> Option<(Duration, Duration)> {
     let g = cx.t.group.borrow();
     if which == ITIMER_REAL {
@@ -439,7 +450,7 @@ pub(super) fn getitimer(cx: &mut Cx<'_>, which: i32, curr: u64) -> SysResult {
 
 pub(super) fn setitimer(cx: &mut Cx<'_>, which: i32, new: u64, old: u64) -> SysResult {
     check_itimer(which)?;
-    // 与 Linux 相同，new 为空时当作解除
+    // As on Linux, a null new value means disarm
     let (interval, value) = if new == 0 {
         (Duration::ZERO, Duration::ZERO)
     } else {
@@ -462,7 +473,7 @@ pub(super) fn setitimer(cx: &mut Cx<'_>, which: i32, new: u64, old: u64) -> SysR
                 interval: interval.as_nanos() as u64,
             });
     }
-    // 让定时器线程重新计算等待时间。只叫醒它：原来叫醒所有等待者
+    // Make the timer thread recompute its wait. Wake only it: this used to wake all waiters
     crate::kernel::signal_later(&cx.shared.timers);
     Ok(0)
 }
@@ -476,13 +487,13 @@ pub(super) fn clock_nanosleep(
 ) -> SysResult {
     let early = cx.t.fast_sleep.take();
     match clock {
-        // 线程 CPU 时钟、原始单调时钟和粗粒度时钟不能用来睡眠
+        // Thread CPU clocks, the raw monotonic clock and the coarse clocks cannot be slept on
         CLOCK_THREAD_CPUTIME_ID | 4..=6 => return Err(Errno::EOPNOTSUPP),
         c if c < 0 && c & 4 != 0 => return Err(Errno::EINVAL),
         _ => {}
     }
     let t = read_timespec(cx, req)?;
-    // 进程 CPU 时钟：按 CPU 时间换算成大约的墙上时间（每 10 毫秒检查一次）
+    // Process CPU clocks: CPU time converted to approximate wall time (checked every 10 ms)
     if let Some(cpu) = cpu_clock(cx, clock) {
         let now = cpu?;
         let target = if flags & TIMER_ABSTIME != 0 {
@@ -501,7 +512,7 @@ pub(super) fn clock_nanosleep(
         appine_hal::clock_gettime(clock).map_err(Errno)?;
         return sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem);
     }
-    // 绝对时刻：重新执行同样的参数就是接着睡
+    // An absolute time: re-executing with the same arguments simply continues the sleep
     match sleep_until(cx, deadline_in_ns(cx, clock, t)?) {
         Ok(()) => Ok(0),
         Err(_) => Err(Errno::ERESTARTNOHAND),
@@ -511,14 +522,15 @@ pub(super) fn clock_nanosleep(
 const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 
-/// guest 进程或线程的 CPU 时钟用掉的纳秒数；`clock` 不是 CPU 时钟时返回 None。负数的
-/// 时钟 id 是 `clock_getcpuclockid`/`pthread_getcpuclockid` 编码出来的（Linux 的
-/// `MAKE_PROCESS_CPUCLOCK`）：`(~pid << 3) | 类型`，第 2 位表示线程，pid 0 表示自己。
+/// Nanoseconds used on the CPU clock of a guest process or thread; None when `clock` is not a CPU
+/// clock. Negative clock ids are encoded by `clock_getcpuclockid`/`pthread_getcpuclockid`
+/// (Linux's `MAKE_PROCESS_CPUCLOCK`): `(~pid << 3) | type`, where bit 2 means a thread and pid 0
+/// means ourselves.
 fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
     let (pid, thread) = match clock {
         CLOCK_PROCESS_CPUTIME_ID => (0, false),
         CLOCK_THREAD_CPUTIME_ID => (0, true),
-        // 类型 3 不是 CPU 时钟（低 3 位为 3 是 fd 编码的动态时钟）
+        // Type 3 is not a CPU clock (low 3 bits of 3 are a dynamic clock encoded from an fd)
         c if c < 0 && c & 3 == 3 => return Some(Err(Errno::EINVAL)),
         c if c < 0 => (!(c >> 3), c & 4 != 0),
         _ => return None,
@@ -547,7 +559,7 @@ pub(super) fn clock_gettime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
             let ns = ns?;
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
-        // 单调时钟、boottime 加上 time 命名空间的偏移
+        // Monotonic and boottime clocks get the time namespace offset added
         None => add_offset(
             appine_hal::clock_gettime(clock).map_err(Errno)?,
             cx.time_offset(clock),
@@ -567,8 +579,8 @@ pub(super) fn clock_getres(cx: &mut Cx<'_>, clock: i32, res: u64) -> SysResult {
     Ok(0)
 }
 
-/// clock_settime：guest 不能改宿主的时间。可以设置的时钟（`CLOCK_REALTIME`）返回
-/// EPERM，与没有 `CAP_SYS_TIME` 时相同；其余的时钟本来就不能设置。
+/// clock_settime: the guest cannot change the host's time. The settable clock (`CLOCK_REALTIME`)
+/// returns EPERM, as without `CAP_SYS_TIME`; the other clocks cannot be set in any case.
 pub(super) fn clock_settime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
     read_timespec(cx, tp)?;
     match clock {
@@ -577,18 +589,20 @@ pub(super) fn clock_settime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
     }
 }
 
-/// adjtimex（`clock` 为 None）和 clock_adjtime：只回答查询，宿主时钟的 NTP 状态由
-/// [`appine_hal::adjtimex_query`] 给出。要改时钟、NTP 参数的一律是 EPERM，与
-/// clock_settime 一样当作没有 `CAP_SYS_TIME`（`timekeeping_validate_timex`）。adjtimex
-/// 无论成败都把结构体写回去，clock_adjtime 只在成功时写回，与 Linux 相同。
+/// adjtimex (`clock` None) and clock_adjtime: only queries are answered, with the host clock's
+/// NTP state from [`appine_hal::adjtimex_query`]. Anything that would change the clock or NTP
+/// parameters is EPERM, treated as lacking `CAP_SYS_TIME` as with clock_settime
+/// (`timekeeping_validate_timex`). adjtimex writes the structure back whether it succeeds or
+/// fails, clock_adjtime only on success, as on Linux.
 pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResult {
     const ADJ_FREQUENCY: u32 = 0x0002;
     const ADJ_SETOFFSET: u32 = 0x0100;
-    // 内核里的定义（用户态头文件的 ADJ_OFFSET_SINGLESHOT 是 0x8001，带着 ADJ_ADJTIME）
+    // The definition inside the kernel (the user-space header's ADJ_OFFSET_SINGLESHOT is 0x8001,
+    // with ADJ_ADJTIME)
     const ADJ_OFFSET_SINGLESHOT: u32 = 0x0001;
     const ADJ_OFFSET_READONLY: u32 = 0x2000;
     const ADJ_ADJTIME: u32 = 0x8000;
-    /// `PPM_SCALE`：NSEC_PER_USEC << (NTP_SCALE_SHIFT - SHIFT_USEC)。
+    /// `PPM_SCALE`: NSEC_PER_USEC << (NTP_SCALE_SHIFT - SHIFT_USEC).
     const PPM_SCALE: i64 = 1000 << 16;
     const CLOCKFD: i32 = 3;
     const CLOCK_SGI_CYCLE: i32 = 10;
@@ -598,8 +612,8 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
     let modes = u32::from_le_bytes(tx[..4].try_into().unwrap());
     let freq = i64::from_le_bytes(tx[16..24].try_into().unwrap());
     let result = (|| {
-        // do_clock_adjtime：只有 CLOCK_REALTIME 能调；fd 编码的动态时钟要是 PTP 这类设备
-        // 的 fd，appine 里没有
+        // do_clock_adjtime: only CLOCK_REALTIME can be adjusted; an fd-encoded dynamic clock
+        // would need the fd of a device such as PTP, which appine does not have
         match clock {
             None | Some(CLOCK_REALTIME) => {}
             Some(c) if c < 0 && c & 7 == CLOCKFD => return Err(Errno::EINVAL),
@@ -608,8 +622,9 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
             Some(c) if c > CLOCK_TAI => return Err(Errno::EINVAL),
             Some(_) => return Err(Errno::EOPNOTSUPP),
         }
-        // ADJ_ADJTIME 要带 ADJ_OFFSET_SINGLESHOT，再带 ADJ_OFFSET_READONLY 的（adjtime(3)
-        // 查剩下的调整量）是查询；不是 ADJ_ADJTIME 时 modes 不为 0 的都要改东西
+        // ADJ_ADJTIME must come with ADJ_OFFSET_SINGLESHOT, and with ADJ_OFFSET_READONLY as well
+        // (adjtime(3) querying the remaining adjustment) it is a query; without ADJ_ADJTIME, any
+        // nonzero modes changes something
         let query_adjtime = modes & ADJ_ADJTIME != 0;
         if query_adjtime {
             if modes & ADJ_OFFSET_SINGLESHOT == 0 {
@@ -630,7 +645,7 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
             return Err(Errno::EINVAL);
         }
         let (state, host) = appine_hal::adjtimex_query(query_adjtime).map_err(Errno)?;
-        // __do_adjtimex 填所有有名字的字段，modes 和填充不动
+        // __do_adjtimex fills every named field, leaving modes and the padding alone
         for range in [8..44, 48..116, 120..164] {
             tx[range.clone()].copy_from_slice(&host[range]);
         }
@@ -642,7 +657,7 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
     result
 }
 
-/// syslog(2)（klogctl），内容见 [`crate::klog`]。
+/// syslog(2) (klogctl); for the contents see [`crate::klog`].
 pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResult {
     do_syslog(cx, kind, buf, len, false)
 }
@@ -658,10 +673,11 @@ pub(crate) mod syslog_action {
     pub const SIZE_BUFFER: i32 = 10;
 }
 
-/// 权限（`check_syslog_permissions`），先于参数检查：`dmesg_restrict` 为 0 时谁都能读全部
-/// 和问缓冲区大小，别的动作（和 `dmesg_restrict` 为 1 时的所有动作）要开机时的命名空间里的
-/// `CAP_SYSLOG`；只有 `CAP_SYS_ADMIN` 也行，但第一次时记一条警告。`/proc/kmsg` 打开时查过
-/// 了，之后的读不再查（`from_proc`）。`/dev/kmsg` 读方式打开时按读全部查。
+/// Permissions (`check_syslog_permissions`), checked before the arguments: with `dmesg_restrict`
+/// 0 anyone may read all and ask for the buffer size; other actions (and every action with
+/// `dmesg_restrict` 1) need `CAP_SYSLOG` in the boot namespace; `CAP_SYS_ADMIN` alone also works,
+/// but the first time a warning is logged. `/proc/kmsg` was checked when opened, so later reads
+/// are not checked again (`from_proc`). Opening `/dev/kmsg` for reading is checked as read-all.
 pub(crate) fn check_syslog_permissions(cx: &Cx<'_>, kind: i32, from_proc: bool) -> SysResult {
     use syslog_action::*;
     if from_proc && kind != OPEN {
@@ -694,11 +710,12 @@ pub(crate) fn check_syslog_permissions(cx: &Cx<'_>, kind: i32, from_proc: bool) 
     Ok(0)
 }
 
-/// syslog(2) 和 `/proc/kmsg`（`from_proc`）的各个动作（`do_syslog`）：读（2）等到有记录、
-/// 读走（与 `/proc/kmsg` 共用位置），读全部（3）、读后清空（4）不改变读的位置，清空（5）只
-/// 影响读全部，未读的字节数（9，`/proc/kmsg` 用它时是记录数），缓冲区大小（10）。打开、
-/// 关闭没有作用。控制台的开关和级别（6、7、8）照常记下（`/proc/sys/kernel/printk`），只是
-/// 没有控制台可打印。
+/// The actions of syslog(2) and `/proc/kmsg` (`from_proc`) (`do_syslog`): read (2) waits until
+/// there is a record and takes it (sharing the position with `/proc/kmsg`); read-all (3) and
+/// read-clear (4) do not change the read position; clear (5) affects only read-all; the unread
+/// byte count (9; the record count when `/proc/kmsg` uses it); the buffer size (10). Open and close
+/// have no effect. Console on/off and the console level (6, 7, 8) are recorded as usual
+/// (`/proc/sys/kernel/printk`), there is just no console to print to.
 pub(crate) fn do_syslog(
     cx: &mut Cx<'_>,
     kind: i32,
@@ -707,7 +724,7 @@ pub(crate) fn do_syslog(
     from_proc: bool,
 ) -> SysResult {
     use syslog_action::*;
-    /// arm64 的 `TASK_SIZE_MAX`（48 位地址）：`access_ok` 只看地址范围。
+    /// arm64's `TASK_SIZE_MAX` (48-bit addresses): `access_ok` looks only at the address range.
     const TASK_SIZE_MAX: u64 = 1 << 48;
 
     check_syslog_permissions(cx, kind, from_proc)?;
@@ -753,7 +770,7 @@ pub(crate) fn do_syslog(
             log.borrow_mut().clear();
             Ok(0)
         }
-        // 关掉控制台：存下现在的级别（还没存过时），换成最低级别
+        // Console off: save the current level (if not saved yet) and switch to the minimum level
         6 => {
             let k = cx.k();
             let level = k.printk[0];
@@ -768,7 +785,8 @@ pub(crate) fn do_syslog(
             }
             Ok(0)
         }
-        // 设控制台级别（1–8，不低于最低级别），同时重新打开控制台
+        // Set the console level (1–8, not below the minimum level), which also turns the console
+        // back on
         8 => {
             if !(1..=8).contains(&len) {
                 return Err(Errno::EINVAL);
@@ -797,7 +815,7 @@ pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
 
 pub(super) fn times(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     let ticks = crate::loader::CLOCK_TICKS;
-    // struct tms：自己和已回收的子进程的用户态、内核态 CPU 时间
+    // struct tms: user and system CPU time of the process itself and of its reaped children
     if buf != 0 {
         let to_ticks = |ns: u64| ns / (1_000_000_000 / ticks);
         let g = cx.t.group.borrow();
@@ -810,7 +828,7 @@ pub(super) fn times(cx: &mut Cx<'_>, buf: u64) -> SysResult {
         }
         put(cx, buf, b)?;
     }
-    // 返回值是开机以来的时钟滴答数
+    // The return value is the number of clock ticks since boot
     let (sec, nsec) = appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME).map_err(Errno)?;
     Ok(sec as u64 * ticks + nsec as u64 / (1_000_000_000 / ticks))
 }
@@ -824,7 +842,7 @@ pub(super) fn getrusage(cx: &mut Cx<'_>, who: i32, usage: u64) -> SysResult {
     }
     let group = cx.t.group.clone();
     let mut g = group.borrow_mut();
-    // 与 Linux 一样，RUSAGE_THREAD 的 ru_maxrss 也是整个进程的
+    // As on Linux, ru_maxrss for RUSAGE_THREAD is also the whole process's
     if who != RUSAGE_CHILDREN {
         g.sample_rss_throttled(&cx.mm());
     }
@@ -865,7 +883,8 @@ pub(super) fn uname(cx: &mut Cx<'_>, buf: u64) -> SysResult {
         .map(|()| 0)
 }
 
-/// reboot：不能重启宿主，只接受 Ctrl-Alt-Del 的开关；其余合法的命令 EPERM。
+/// reboot: the host cannot be rebooted; only the Ctrl-Alt-Del switch is accepted, and the other
+/// valid commands are EPERM.
 pub(super) fn reboot(cx: &mut Cx<'_>, magic1: u32, magic2: u32, cmd: u32) -> SysResult {
     const CAP_SYS_BOOT: u32 = 22;
     const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
@@ -893,8 +912,8 @@ pub(super) fn reboot(cx: &mut Cx<'_>, magic1: u32, magic2: u32, cmd: u32) -> Sys
     }
 }
 
-/// sethostname、setdomainname：改的是所在的 UTS 命名空间的，要在它的属主里有
-/// `CAP_SYS_ADMIN`。
+/// sethostname, setdomainname: change the names of the UTS namespace the caller is in, which
+/// requires `CAP_SYS_ADMIN` in its owner.
 pub(super) fn set_uts_name(cx: &mut Cx<'_>, name: u64, len: i64, domain: bool) -> SysResult {
     let uts = cx.task.ns.borrow().uts.clone();
     if !cx.cred().ns_capable(&uts.owner, cap::SYS_ADMIN) {
@@ -920,7 +939,7 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
         cx.t.group.clone()
     } else {
         let g = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
-        // 别人的进程：它的用户 ID、组 ID 都要等于调用者的真实 ID
+        // Another user's process: its user and group IDs must all equal the caller's real IDs
         let t = g.borrow().cred.clone();
         let same = [t.ruid, t.euid, t.suid].iter().all(|&u| u == cred.ruid)
             && [t.rgid, t.egid, t.sgid].iter().all(|&g| g == cred.rgid);
@@ -940,7 +959,7 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
         if cur > max {
             return Err(Errno::EINVAL);
         }
-        // fd 表的容量是固定的；提高硬限制要求 CAP_SYS_RESOURCE
+        // The fd table's capacity is fixed; raising the hard limit requires CAP_SYS_RESOURCE
         if resource == RLIMIT_NOFILE && max > cx.kr().nr_open as u64
             || max > slot.1 && !cred.capable(cap::SYS_RESOURCE)
         {
@@ -955,7 +974,7 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
     }
     if let Some(v) = new {
         group.borrow_mut().rlimits[resource as usize] = v;
-        // fd 表按 RLIMIT_NOFILE 的软限制分配新的 fd
+        // The fd table allocates new fds by the soft limit of RLIMIT_NOFILE
         if resource == RLIMIT_NOFILE {
             let k = cx.kr();
             for tid in &group.borrow().threads {
@@ -977,7 +996,7 @@ pub(super) fn umask(cx: &mut Cx<'_>, mask: u32) -> SysResult {
 
 pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
     let arg = args[0];
-    // 与 Linux 一样，用不到的参数必须是 0
+    // As on Linux, unused arguments must be 0
     let unused = |from: usize| {
         if args[from..].iter().all(|&a| a == 0) {
             Ok(())
@@ -987,7 +1006,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
     };
     match option {
         PR_SET_NAME => {
-            // 名字可以不以 NUL 结尾，最多取 15 字节
+            // The name need not be NUL-terminated; at most 15 bytes are taken
             let raw = match cx.mm().read_cstr(arg, 15) {
                 Ok(name) => name,
                 Err(e) if e == Errno::ENAMETOOLONG => get::<15>(cx, arg)?.to_vec(),
@@ -1010,7 +1029,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             let sig = cx.task.pdeathsig.get();
             put(cx, arg, sig.to_le_bytes()).map(|()| 0)
         }
-        // 与 Linux 一样不检查别的参数，非 0 都算设上
+        // As on Linux the other arguments are not checked; any nonzero value counts as set
         PR_SET_CHILD_SUBREAPER => {
             cx.t.group.borrow_mut().child_subreaper = arg != 0;
             Ok(0)
@@ -1058,7 +1077,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             cx.t.group.borrow_mut().cred.cap_bounding &= !(1 << arg);
             Ok(0)
         }
-        // 环境能力（capabilities(7)）
+        // Ambient capabilities (capabilities(7))
         PR_CAP_AMBIENT => match arg {
             PR_CAP_AMBIENT_CLEAR_ALL => {
                 unused(1)?;
@@ -1082,7 +1101,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             }
             _ => Err(Errno::EINVAL),
         },
-        // 只记录；0 表示恢复默认值
+        // Only recorded; 0 means restore the default
         PR_SET_TIMERSLACK => {
             let (_, default) = cx.task.timerslack.get();
             cx.task
@@ -1091,7 +1110,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             Ok(0)
         }
         PR_GET_TIMERSLACK => Ok(cx.task.timerslack.get().0),
-        // 只有统计计时
+        // Only statistical timing
         PR_SET_TIMING if arg == PR_TIMING_STATISTICAL => Ok(0),
         PR_GET_TIMING => Ok(PR_TIMING_STATISTICAL),
         PR_SET_THP_DISABLE => {
@@ -1103,7 +1122,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
             unused(0)?;
             Ok(cx.t.group.borrow().thp_disable as u64)
         }
-        // guest 看不到推测执行的缓解措施
+        // The guest sees no speculative-execution mitigations
         PR_GET_SPECULATION_CTRL => {
             unused(1)?;
             match arg {
@@ -1115,7 +1134,7 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
     }
 }
 
-/// personality(2)：0xffffffff 只查询。
+/// personality(2): 0xffffffff only queries.
 pub(super) fn personality(cx: &mut Cx<'_>, persona: u32) -> SysResult {
     let mut g = cx.t.group.borrow_mut();
     let old = g.personality;
@@ -1125,7 +1144,8 @@ pub(super) fn personality(cx: &mut Cx<'_>, persona: u32) -> SysResult {
     Ok(old as u64)
 }
 
-/// getcpu(2)：报告亲和性里的第一个 CPU（线程由宿主调度，不知道它实际在哪个 CPU 上）。
+/// getcpu(2): reports the first CPU in the affinity mask (threads are scheduled by the host, so
+/// the CPU they actually run on is unknown).
 pub(super) fn getcpu(cx: &mut Cx<'_>, cpu: u64, node: u64) -> SysResult {
     let first = cx.task.affinity.get().trailing_zeros().min(63);
     if cpu != 0 {
@@ -1138,7 +1158,7 @@ pub(super) fn getcpu(cx: &mut Cx<'_>, cpu: u64, node: u64) -> SysResult {
 }
 
 pub(super) fn set_robust_list(cx: &mut Cx<'_>, head: u64, len: u64) -> SysResult {
-    // struct robust_list_head 的大小
+    // Size of struct robust_list_head
     if len != 24 {
         return Err(Errno::EINVAL);
     }
@@ -1150,14 +1170,14 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
     let (h, l) = if pid == 0 {
         cx.task.robust_list.get()
     } else if pid == crate::kernel::INIT {
-        // 内置的 init 属于 root，没有 robust 链表
+        // The built-in init belongs to root and has no robust list
         if cx.cred().ruid != 0 && !cx.cred().capable(cap::SYS_PTRACE) {
             return Err(Errno::EPERM);
         }
         (0, 0)
     } else {
         let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
-        // 和 ptrace 一样：只能看同一个用户的线程
+        // As with ptrace: only threads of the same user can be inspected
         let target = cx
             .kr()
             .groups
@@ -1176,15 +1196,16 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
 }
 
 pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
-    // 与 Linux 的 do_sysinfo 一样有零头就进一秒
+    // As with Linux's do_sysinfo, a fraction of a second rounds up to a whole second
     let (secs, ns) = appine_hal::clock_gettime(appine_hal::CLOCK_BOOTTIME).map_err(Errno)?;
-    // 加上 time 命名空间里 boottime 的偏移（Linux 的 timens_add_boottime）
+    // Add the time namespace's boottime offset (Linux's timens_add_boottime)
     let (secs, ns) = add_offset((secs, ns), cx.time_offset(appine_hal::CLOCK_BOOTTIME));
     let uptime = secs + i64::from(ns != 0);
     let m = appine_hal::host_meminfo();
     let procs = cx.kr().tasks.len().min(u16::MAX as usize) as u16;
-    // struct sysinfo（64 位）：uptime、loads[3]、totalram、freeram、sharedram、bufferram、
-    // totalswap、freeswap、procs、totalhigh、freehigh、mem_unit；与 /proc/meminfo 一样照搬宿主的
+    // struct sysinfo (64-bit): uptime, loads[3], totalram, freeram, sharedram, bufferram,
+    // totalswap, freeswap, procs, totalhigh, freehigh, mem_unit; copied from the host as
+    // /proc/meminfo is
     let mut b = [0u8; 112];
     b[..8].copy_from_slice(&uptime.to_le_bytes());
     for (i, load) in crate::loadavg::sysinfo_loads(cx.kr()).iter().enumerate() {
@@ -1208,10 +1229,11 @@ pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
     put(cx, buf, b).map(|()| 0)
 }
 
-/// membarrier(2)。共用地址空间的其他线程被打断、离开 guest 代码，就相当于在它们身上
-/// 执行了一次完整的内存屏障和上下文同步（V8 改写代码之后用 `SYNC_CORE` 的形式）。
-/// 全局的命令也只作用于本进程：其他进程和它共享的只有共享映射，appine 的所有 guest
-/// 线程都在一个宿主进程里，这里再加一个宿主的内存屏障。
+/// membarrier(2). Kicking the other threads that share the address space out of guest code amounts
+/// to a full memory barrier and context synchronization on them (V8 uses the `SYNC_CORE` form
+/// after rewriting code). Global commands also act only on this process: other processes share
+/// only shared mappings with it, and all of appine's guest threads are in one host process, so a
+/// host memory barrier is added here as well.
 pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
     const QUERY: i32 = 0;
     const GLOBAL: i32 = 1;
@@ -1241,7 +1263,7 @@ pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
             Ok(0)
         }
         GLOBAL | GLOBAL_EXPEDITED | PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {
-            // 私有的命令要求先登记，与 Linux 一样
+            // Private commands require registering first, as on Linux
             if (cmd == PRIVATE_EXPEDITED && registered & REGISTER_PRIVATE_EXPEDITED == 0)
                 || (cmd == PRIVATE_EXPEDITED_SYNC_CORE
                     && registered & REGISTER_PRIVATE_EXPEDITED_SYNC_CORE == 0)
@@ -1286,7 +1308,8 @@ pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> Sy
 mod tests {
     use super::*;
 
-    /// time 命名空间的换算：读数加上偏移（借位、负的偏移），绝对时刻减去偏移、不早于 0。
+    /// Time namespace conversions: readings plus offsets (borrows, negative offsets), absolute
+    /// times minus offsets, not before 0.
     #[test]
     fn time_namespace_conversions() {
         assert_eq!(

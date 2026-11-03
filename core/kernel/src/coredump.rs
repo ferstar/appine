@@ -1,17 +1,20 @@
-//! core dump（Linux 的 `do_coredump`、`elf_core_dump`，kernel/signal 的 map）。
+//! Core dumps (Linux's `do_coredump` and `elf_core_dump`, the kernel/signal map).
 //!
-//! 默认动作是生成 core 的信号（[`dumps_core`]）结束进程时，先结束其他线程并等它们
-//! 退出：线程退出时把自己的寄存器留在线程组里（[`ThreadCore`]，`task::exit`）。然后按
-//! `/proc/sys/kernel/core_pattern` 在进程的当前目录里写一个 ELF core 文件：每个映射一个
-//! `PT_LOAD`（写多少见 [`Mm::dump_regions`]），一个 `PT_NOTE` 里是每个线程的寄存器
-//! （`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS` 等）和进程的 `NT_PRPSINFO`、
-//! `NT_SIGINFO`、`NT_AUXV`、`NT_FILE`，与 arm64 Linux 写的相同，gdb 可以事后分析。
+//! When a signal whose default action produces a core ([`dumps_core`]) ends a process, the other
+//! threads are ended first and waited for: an exiting thread leaves its registers in the thread
+//! group ([`ThreadCore`], `task::exit`). Then an ELF core file is written in the process's current
+//! directory according to `/proc/sys/kernel/core_pattern`: one `PT_LOAD` per mapping (how much is
+//! written, see [`Mm::dump_regions`]), and one `PT_NOTE` holding each thread's registers
+//! (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_TLS` and so on) and the process's `NT_PRPSINFO`,
+//! `NT_SIGINFO`, `NT_AUXV` and `NT_FILE`, the same as arm64 Linux writes, so gdb can analyse it
+//! afterwards.
 //!
-//! 与 Linux 一样，`RLIMIT_CORE` 小于一页、进程不可 dump（`PR_SET_DUMPABLE`、setuid
-//! 程序）时不写；写出的字节（空洞不算）到了 `RLIMIT_CORE` 就截断。管道形式的
-//! `core_pattern`（`|程序`）不支持，不写。建成了 core 文件的进程（截断了也算，与 Linux
-//! 的 `has_dumped` 一样），wait 的状态带 `WCOREDUMP`，SIGCHLD、waitid 的 `si_code` 是
-//! `CLD_DUMPED`。
+//! As on Linux, nothing is written when `RLIMIT_CORE` is less than a page or the process is not
+//! dumpable (`PR_SET_DUMPABLE`, setuid programs); once the bytes written (holes not counted)
+//! reach `RLIMIT_CORE`, the file is truncated. A pipe `core_pattern` (`|program`) is not
+//! supported and nothing is written. For a process whose core file was created (truncated ones
+//! count too, as with Linux's `has_dumped`), the wait status has `WCOREDUMP`, and the `si_code` of
+//! SIGCHLD and waitid is `CLD_DUMPED`.
 
 use crate::errno::Errno;
 use crate::fd::FileRef;
@@ -23,29 +26,30 @@ use crate::signal::SigInfo;
 use crate::task::Task;
 use appine_engine::{CpuState, PAGE_SIZE, prot};
 
-/// `core_pattern` 的最大长度（Linux 的 `CORENAME_MAX_SIZE`）。
+/// Maximum length of `core_pattern` (Linux's `CORENAME_MAX_SIZE`).
 pub(crate) const PATTERN_MAX: usize = 128;
 
-/// 默认动作是生成 core 的信号（Linux 的 `SIG_KERNEL_COREDUMP_MASK`）：SIGQUIT、
-/// SIGILL、SIGTRAP、SIGABRT、SIGBUS、SIGFPE、SIGSEGV、SIGXCPU、SIGXFSZ、SIGSYS。
+/// Signals whose default action produces a core (Linux's `SIG_KERNEL_COREDUMP_MASK`): SIGQUIT,
+/// SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ, SIGSYS.
 pub(crate) fn dumps_core(sig: Signal) -> bool {
     matches!(sig.number(), 3..=8 | 11 | 24 | 25 | 31)
 }
 
-/// 一个线程留给 core 文件的状态（Linux 的 `elf_thread_core_info`）。
+/// The state a thread leaves for the core file (Linux's `elf_thread_core_info`).
 pub(crate) struct ThreadCore {
     tid: Tid,
     regs: Regs,
-    /// 跟踪者设置的硬件断点和观察点（`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`）。
+    /// Hardware breakpoints and watchpoints set by the tracer (`NT_ARM_HW_BREAK`,
+    /// `NT_ARM_HW_WATCH`).
     hw: HwDebug,
-    /// 线程自己挂起的信号和屏蔽字。
+    /// The thread's own pending signals and signal mask.
     pending: u64,
     blocked: u64,
     cpu: CpuTime,
 }
 
 impl ThreadCore {
-    /// 线程 `task` 现在的状态，`state` 是它的寄存器。
+    /// The current state of thread `task`, with `state` as its registers.
     pub(crate) fn of(task: &Task, state: &CpuState) -> ThreadCore {
         ThreadCore {
             tid: task.tid.get(),
@@ -58,14 +62,15 @@ impl ThreadCore {
     }
 }
 
-/// 致命信号 `sig`（附带 `info`）正在结束调用者的线程组：写 core 文件。调用方已经让
-/// 线程组退出（`signal::group_exit`），这里等其他线程退出、留下寄存器，再写。返回是否
-/// 写成了。
+/// The fatal signal `sig` (with `info`) is ending the caller's thread group: writes the core
+/// file. The caller has already made the thread group exit (`signal::group_exit`); this waits for
+/// the other threads to exit and leave their registers, then writes. Returns whether it was
+/// written.
 pub(crate) fn dump(cx: &mut Cx<'_>, state: &CpuState, sig: Signal, info: &SigInfo) -> bool {
     let group = cx.t.group.clone();
     {
         let g = group.borrow();
-        // 与 Linux 一样，限制小于 ELF 的最小 core（一页）时不写
+        // As on Linux, nothing is written when the limit is below ELF's minimum core (one page)
         if g.rlimits[RLIMIT_CORE as usize].0 < PAGE_SIZE || !g.dumpable {
             return false;
         }
@@ -77,7 +82,7 @@ pub(crate) fn dump(cx: &mut Cx<'_>, state: &CpuState, sig: Signal, info: &SigInf
         ));
         return false;
     }
-    // 等其他线程退出，它们退出时把寄存器留在 group.core 里
+    // Wait for the other threads to exit; on exit they leave their registers in group.core
     group.borrow_mut().core = Some(Vec::new());
     while group.borrow().threads.len() > 1 {
         let _ = cx.wait_on(None, &mut [], wake::EXITED);
@@ -99,7 +104,7 @@ pub(crate) fn dump(cx: &mut Cx<'_>, state: &CpuState, sig: Signal, info: &SigInf
     }
 }
 
-/// 按 `core_pattern` 展开 core 文件的名字（Linux 的 `format_corename`）。
+/// Expands the core file name from `core_pattern` (Linux's `format_corename`).
 fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
     let k = cx.kr();
     let g = cx.t.group.borrow();
@@ -116,7 +121,8 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
             Some(s) => s,
             None => break,
         };
-        // %p、%i 是进程自己的 pid 命名空间里的编号，%P、%I 是开机时的命名空间里的
+        // %p and %i are the ids in the process's own pid namespace, %P and %I those in the boot
+        // namespace
         let vnr = |id: Tid| g.pid_ns.vnr(id).unwrap_or(0).to_string();
         let text = match spec {
             b'%' => "%".to_owned(),
@@ -141,7 +147,7 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
                 String::from_utf8_lossy(&cx.task.ns.borrow().uts.hostname.borrow()).into_owned()
             }
             b'e' => {
-                // 名字里的 / 换成 !（Linux 的 cn_esc_printf）
+                // A / in the name becomes ! (Linux's cn_esc_printf)
                 let comm = cx.task.comm.get();
                 let len = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
                 String::from_utf8_lossy(&comm[..len]).replace('/', "!")
@@ -153,7 +159,7 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
                 .unwrap_or_default(),
             b'c' => g.rlimits[RLIMIT_CORE as usize].0.to_string(),
             b'd' => (!g.dumpable as u32).to_string(),
-            // 不认识的说明符：与 Linux 一样什么也不输出
+            // Unknown specifiers: output nothing, as on Linux
             _ => String::new(),
         };
         out.extend_from_slice(text.as_bytes());
@@ -165,9 +171,10 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
     out
 }
 
-/// 在进程的当前目录（名字是绝对路径时按它）写 core 文件。与 Linux 一样先删掉同名的
-/// 文件，再以 0600 新建（`O_EXCL | O_NOFOLLOW`）；建成了就算写了，写到 `RLIMIT_CORE`
-/// 或者写出错时截断。
+/// Writes the core file in the process's current directory (or at the name if it is an absolute
+/// path). As on Linux, a file with the same name is unlinked first, then a new one is created with
+/// 0600 (`O_EXCL | O_NOFOLLOW`); once created it counts as written, and it is truncated when the
+/// writes reach `RLIMIT_CORE` or fail.
 fn write(
     cx: &mut Cx<'_>,
     name: &[u8],
@@ -198,7 +205,7 @@ fn write(
     let mut offset = data_offset;
     let mut page = vec![0u8; PAGE_SIZE as usize];
     for r in regions.iter().filter(|r| r.size > 0) {
-        // 匿名内存、共享内存里没碰过的页留空洞（Linux 的 FOLL_DUMP）
+        // Untouched pages of anonymous and shared memory are left as holes (Linux's FOLL_DUMP)
         let resident = if r.sparse {
             mm.borrow().residency(r.start, r.size).ok()
         } else {
@@ -217,20 +224,20 @@ fn write(
             offset += PAGE_SIZE;
         }
     }
-    // 最后是空洞时文件也要有完整的长度
+    // When it ends in a hole, the file still needs its full length
     if w.end < offset {
         w.put(cx, offset - 1, &[0]);
     }
     Ok(())
 }
 
-/// 往 core 文件写。与 Linux 的 `dump_emit` 一样，写出的字节（空洞不算）超过
-/// `RLIMIT_CORE`、或者写出错之后不再写。
+/// Writes to the core file. As with Linux's `dump_emit`, writing stops once the bytes written
+/// (holes not counted) exceed `RLIMIT_CORE`, or after a write error.
 struct CoreWriter {
     file: FileRef,
     limit: u64,
     written: u64,
-    /// 写到的最远位置。
+    /// The farthest position written.
     end: u64,
     stopped: bool,
 }
@@ -277,7 +284,8 @@ const NT_ARM_HW_BREAK: u32 = 0x402;
 const NT_ARM_HW_WATCH: u32 = 0x403;
 const NT_ARM_SYSTEM_CALL: u32 = 0x404;
 
-/// ELF 头和程序头，以及第一个映射的内容在文件里的位置（按页对齐，Linux 的 `dataoff`）。
+/// The ELF header and program headers, and the file position of the first mapping's contents
+/// (page-aligned, Linux's `dataoff`).
 fn elf_header(regions: &[DumpRegion], notes: &[u8]) -> (Vec<u8>, u64) {
     let segs = regions.len() + 1;
     let phnum = if segs >= PN_XNUM as usize {
@@ -285,7 +293,8 @@ fn elf_header(regions: &[DumpRegion], notes: &[u8]) -> (Vec<u8>, u64) {
     } else {
         segs as u16
     };
-    // 程序头超过 65535 个时，真正的个数放在第 0 个节头的 sh_info 里（Linux 的 PN_XNUM）
+    // With more than 65535 program headers, the real count goes in sh_info of section header 0
+    // (Linux's PN_XNUM)
     let extnum = phnum == PN_XNUM;
     let notes_at = EHDR_SIZE + PHDR_SIZE * segs as u64;
     let shdr_at = notes_at + notes.len() as u64;
@@ -350,7 +359,7 @@ fn elf_header(regions: &[DumpRegion], notes: &[u8]) -> (Vec<u8>, u64) {
     }
     b.extend_from_slice(notes);
     if extnum {
-        // 节头：只有 sh_info 有用（真正的程序头个数）
+        // Section header: only sh_info matters (the real program header count)
         let mut sh = [0u8; 64];
         sh[44..48].copy_from_slice(&(segs as u32).to_le_bytes());
         b.extend_from_slice(&sh);
@@ -358,7 +367,7 @@ fn elf_header(regions: &[DumpRegion], notes: &[u8]) -> (Vec<u8>, u64) {
     (b, data_offset)
 }
 
-/// 一个 note：名字和内容各按 4 字节对齐。
+/// One note: the name and the contents are each aligned to 4 bytes.
 fn note(out: &mut Vec<u8>, name: &str, ty: u32, desc: &[u8]) {
     out.extend_from_slice(&(name.len() as u32 + 1).to_le_bytes());
     out.extend_from_slice(&(desc.len() as u32).to_le_bytes());
@@ -370,9 +379,9 @@ fn note(out: &mut Vec<u8>, name: &str, ty: u32, desc: &[u8]) {
     out.resize(out.len().next_multiple_of(4), 0);
 }
 
-/// 所有 note，顺序与 Linux 的 `write_note_info` 相同：每个线程先是 `NT_PRSTATUS`，第一个
-/// 线程（产生信号的那个）之后接着进程的 `NT_PRPSINFO`、`NT_SIGINFO`、`NT_AUXV`、
-/// `NT_FILE`，然后是这个线程别的寄存器组。
+/// All notes, in the order of Linux's `write_note_info`: for each thread `NT_PRSTATUS` first;
+/// after the first thread (the one that raised the signal) come the process's `NT_PRPSINFO`,
+/// `NT_SIGINFO`, `NT_AUXV` and `NT_FILE`, then that thread's other register sets.
 fn notes(
     cx: &Cx<'_>,
     mm: &Mm,
@@ -382,7 +391,8 @@ fn notes(
     info: &SigInfo,
 ) -> Vec<u8> {
     let g = cx.t.group.borrow();
-    // 进程的 CPU 时间：退出了的线程已经加进 g.cpu，产生信号的线程还没有
+    // The process's CPU time: exited threads are already added to g.cpu, the thread that raised
+    // the signal is not yet
     let process_cpu = g.cpu + threads[0].cpu;
     let mut out = Vec::new();
     for (i, t) in threads.iter().enumerate() {
@@ -399,7 +409,8 @@ fn notes(
             note(&mut out, "CORE", NT_AUXV, &auxv);
             note(&mut out, "CORE", NT_FILE, &files(regions));
         }
-        // 别的寄存器组与 PTRACE_GETREGSET 读到的相同；不在系统调用里，编号是 -1
+        // The other register sets are the same as PTRACE_GETREGSET reads; not in a syscall, so
+        // the number is -1
         for (name, nt) in [
             ("CORE", NT_PRFPREG),
             ("LINUX", NT_ARM_TLS),
@@ -421,15 +432,16 @@ fn timeval(ns: u64) -> [u8; 16] {
     b
 }
 
-/// `struct elf_prstatus`（arm64，392 字节）。与 Linux 一样，线程组的主线程报告整个进程
-/// 的 CPU 时间（`process_cpu`），别的线程报告自己的。
+/// `struct elf_prstatus` (arm64, 392 bytes). As on Linux, the thread group's main thread reports
+/// the whole process's CPU time (`process_cpu`), other threads their own.
 fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) -> Vec<u8> {
     let mut b = vec![0u8; 392];
     b[..4].copy_from_slice(&sig.number().to_le_bytes());
     b[12..14].copy_from_slice(&(sig.number() as u16).to_le_bytes());
     b[16..24].copy_from_slice(&t.pending.to_le_bytes());
     b[24..32].copy_from_slice(&t.blocked.to_le_bytes());
-    // pid 是进程自己的 pid 命名空间里的编号（Linux 的 fill_prstatus 用 task_pid_vnr）
+    // pids are the ids in the process's own pid namespace (Linux's fill_prstatus uses
+    // task_pid_vnr)
     for (i, &v) in [t.tid, g.ppid, g.pgid, g.sid].iter().enumerate() {
         let v = g.pid_ns.vnr(v).unwrap_or(0);
         b[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
@@ -440,7 +452,7 @@ fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) 
     b[80..96].copy_from_slice(&timeval(g.child_cpu.user_ns()));
     b[96..112].copy_from_slice(&timeval(g.child_cpu.sys_ns));
     let r = &t.regs;
-    // user_pt_regs：x0–x30、sp、pc、pstate
+    // user_pt_regs: x0–x30, sp, pc, pstate
     for (i, v) in r.x.iter().chain(&[r.sp, r.pc, r.pstate]).enumerate() {
         b[112 + i * 8..120 + i * 8].copy_from_slice(&v.to_le_bytes());
     }
@@ -448,8 +460,8 @@ fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) 
     b
 }
 
-/// `struct elf_prpsinfo`（arm64，136 字节）：状态、凭据、pid、comm 和命令行的前 79 个
-/// 字节（参数之间的 NUL 换成空格）。
+/// `struct elf_prpsinfo` (arm64, 136 bytes): state, credentials, pids, comm and the first 79
+/// bytes of the command line (NULs between arguments replaced by spaces).
 fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
     const PF_FORKNOEXEC: u64 = 0x40;
     const PF_DUMPCORE: u64 = 0x200;
@@ -459,7 +471,8 @@ fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
     b[3] = cx.task.nice.get() as i8 as u8;
     let flags = PF_DUMPCORE | PF_SIGNALED | if g.execed { 0 } else { PF_FORKNOEXEC };
     b[8..16].copy_from_slice(&flags.to_le_bytes());
-    // 真实用户 ID、组 ID 在进程自己的用户命名空间里的值（Linux 的 fill_psinfo）
+    // The real user and group IDs as seen in the process's own user namespace (Linux's
+    // fill_psinfo)
     b[16..20].copy_from_slice(&g.cred.uid_out(g.cred.ruid).to_le_bytes());
     b[20..24].copy_from_slice(&g.cred.gid_out(g.cred.rgid).to_le_bytes());
     for (i, &v) in [g.tgid, g.ppid, g.pgid, g.sid].iter().enumerate() {
@@ -482,8 +495,8 @@ fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
     b
 }
 
-/// `NT_FILE`：文件映射的个数、页大小、每个的 (起点, 终点, 以页计的文件偏移)，然后是
-/// 各自的路径。
+/// `NT_FILE`: the number of file mappings, the page size, (start, end, file offset in pages) for
+/// each, then their paths.
 fn files(regions: &[DumpRegion]) -> Vec<u8> {
     let mapped: Vec<_> = regions
         .iter()
@@ -512,7 +525,7 @@ mod tests {
     fn notes_are_padded_to_four_bytes() {
         let mut out = Vec::new();
         note(&mut out, "CORE", NT_ARM_SYSTEM_CALL, &[1, 2, 3]);
-        // namesz 5、descsz 3、类型，"CORE\0" 补到 8，内容补到 4
+        // namesz 5, descsz 3, type, "CORE\0" padded to 8, contents padded to 4
         assert_eq!(out.len(), 12 + 8 + 4);
         assert_eq!(&out[..4], &5u32.to_le_bytes());
         assert_eq!(&out[4..8], &3u32.to_le_bytes());
@@ -548,7 +561,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([h[56], h[57]]), 3);
         assert_eq!(data, PAGE_SIZE);
         assert_eq!(h.len() as u64, 64 + 3 * 56 + 100);
-        // 第二个 PT_LOAD 紧接着第一个的内容，标志是 RW
+        // The second PT_LOAD follows the first one's contents directly, with flags RW
         let ph = |i: usize, off: usize| {
             let at = 64 + i * 56 + off;
             u64::from_le_bytes(h[at..at + 8].try_into().unwrap())

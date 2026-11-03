@@ -1,21 +1,23 @@
-//! vDSO（kernel/signal 的 map）：一个最小但真实的 ELF 共享对象，在运行时按字节拼出来。
+//! vDSO (the kernel/signal map): a minimal but real ELF shared object, assembled byte by byte at
+//! run time.
 //!
-//! 导出 `LINUX_2.6.39` 版本的四个符号，与 arm64 Linux 相同：
+//! It exports four symbols of version `LINUX_2.6.39`, as on arm64 Linux:
 //!
-//! - `__kernel_rt_sigreturn` 恰好是 `mov x8, #139; svc #0`，前面有一条 nop
-//!   （libgcc 的 unwinder 靠逐字节匹配这两条指令识别信号帧，Linux 的 vDSO 也在它
-//!   前面放了一条 nop）；
-//! - `__kernel_clock_gettime`、`__kernel_gettimeofday`、`__kernel_clock_getres`
-//!   在 v1 里是 svc 存根。
+//! - `__kernel_rt_sigreturn` is exactly `mov x8, #139; svc #0`, preceded by a nop (libgcc's
+//!   unwinder recognises signal frames by matching these two instructions byte for byte, and
+//!   Linux's vDSO also puts a nop in front of it);
+//! - `__kernel_clock_gettime`, `__kernel_gettimeofday` and `__kernel_clock_getres` are svc stubs
+//!   in v1.
 //!
-//! 动态段提供 `DT_HASH`、`DT_SYMTAB`、`DT_STRTAB`、`DT_VERSYM`、`DT_VERDEF`，
-//! 满足 musl、glibc 和 Go runtime 的 vDSO 解析器。每个进程映射一份私有拷贝。
+//! The dynamic segment provides `DT_HASH`, `DT_SYMTAB`, `DT_STRTAB`, `DT_VERSYM` and `DT_VERDEF`,
+//! which satisfies the vDSO parsers of musl, glibc and the Go runtime. Each process maps a private
+//! copy.
 
 use std::sync::OnceLock;
 
 use appine_engine::PAGE_SIZE;
 
-/// 拼好的镜像和其中 sigreturn 跳板的偏移。
+/// The assembled image and the offset of its sigreturn trampoline.
 struct Image {
     bytes: Vec<u8>,
     sigreturn: u64,
@@ -28,12 +30,12 @@ const NOP: u32 = 0xd503_201f;
 const SVC0: u32 = 0xd400_0001;
 const RET: u32 = 0xd65f_03c0;
 
-/// `movz x8, #nr`。
+/// `movz x8, #nr`.
 const fn mov_x8(nr: u32) -> u32 {
     0xd280_0008 | (nr << 5)
 }
 
-/// System V ABI 的 ELF 哈希。
+/// The System V ABI ELF hash.
 fn elf_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 0;
     for &c in name {
@@ -64,7 +66,7 @@ fn align(b: &mut Vec<u8>, to: usize) {
 }
 
 fn build() -> Image {
-    // 代码：sigreturn 前面的 nop 不属于任何符号
+    // Code: the nop before sigreturn belongs to no symbol
     let functions: [(&[u8], &[u32]); 4] = [
         (b"__kernel_rt_sigreturn", &[mov_x8(139), SVC0]),
         (b"__kernel_clock_gettime", &[mov_x8(113), SVC0, RET]),
@@ -73,7 +75,7 @@ fn build() -> Image {
     ];
     let nsyms = functions.len() + 1;
 
-    // 字符串表
+    // String table
     let mut strtab = vec![0u8];
     let mut add_str = |s: &[u8]| {
         let off = strtab.len() as u32;
@@ -85,12 +87,12 @@ fn build() -> Image {
     let version_name = add_str(VERSION);
     let soname = add_str(SONAME);
 
-    // 固定的头部：ELF 头、两个程序头（PT_LOAD、PT_DYNAMIC）
+    // Fixed header: the ELF header and two program headers (PT_LOAD, PT_DYNAMIC)
     const EHDR: usize = 64;
     const PHDR: usize = 56;
     let mut b = vec![0u8; EHDR + 2 * PHDR];
 
-    // .hash：一个桶，所有符号串成一条链
+    // .hash: one bucket, with all symbols on one chain
     let hash = b.len();
     put32(&mut b, 1);
     put32(&mut b, nsyms as u32);
@@ -100,19 +102,19 @@ fn build() -> Image {
         put32(&mut b, next as u32);
     }
 
-    // .dynsym：先占位，代码的地址最后填
+    // .dynsym: placeholders first; the code addresses are filled in last
     align(&mut b, 8);
     let symtab = b.len();
     b.resize(symtab + nsyms * 24, 0);
 
-    // .gnu.version：符号 0 是局部的，其余都属于版本 2（LINUX_2.6.39）
+    // .gnu.version: symbol 0 is local, all others belong to version 2 (LINUX_2.6.39)
     let versym = b.len();
     put16(&mut b, 0);
     for _ in &functions {
         put16(&mut b, 2);
     }
 
-    // .gnu.version_d：版本 1 是 soname（VER_FLG_BASE），版本 2 是 LINUX_2.6.39
+    // .gnu.version_d: version 1 is the soname (VER_FLG_BASE), version 2 is LINUX_2.6.39
     align(&mut b, 8);
     let verdef = b.len();
     for (ndx, flags, name, last) in [
@@ -124,7 +126,7 @@ fn build() -> Image {
         put16(&mut b, ndx);
         put16(&mut b, 1); // vd_cnt
         put32(&mut b, elf_hash(name.0));
-        put32(&mut b, 20); // vd_aux：紧跟在 Verdef 后面
+        put32(&mut b, 20); // vd_aux: right after the Verdef
         put32(&mut b, if last { 0 } else { 28 }); // vd_next
         put32(&mut b, name.1); // vda_name
         put32(&mut b, 0); // vda_next
@@ -166,21 +168,21 @@ fn build() -> Image {
     let size = b.len() as u64;
     assert!(size <= PAGE_SIZE, "vDSO does not fit in one page");
 
-    // 回填符号表
+    // Fill in the symbol table
     for (i, (&name, &(value, len))) in name_offs.iter().zip(&addrs).enumerate() {
         let at = symtab + (i + 1) * 24;
         let mut sym = Vec::with_capacity(24);
         put32(&mut sym, name);
         sym.push((1 << 4) | 2); // STB_GLOBAL, STT_FUNC
         sym.push(0);
-        // 没有节头表；解析器只要求 st_shndx 不是 SHN_UNDEF
+        // No section header table; parsers only require st_shndx not to be SHN_UNDEF
         put16(&mut sym, 1);
         put64(&mut sym, value);
         put64(&mut sym, len);
         b[at..at + 24].copy_from_slice(&sym);
     }
 
-    // ELF 头
+    // ELF header
     let mut h = Vec::with_capacity(EHDR + 2 * PHDR);
     h.extend_from_slice(b"\x7fELF\x02\x01\x01");
     h.resize(16, 0);
@@ -197,7 +199,7 @@ fn build() -> Image {
     put16(&mut h, 64); // e_shentsize
     put16(&mut h, 0); // e_shnum
     put16(&mut h, 0); // e_shstrndx
-    // PT_LOAD：整个镜像，可读可执行
+    // PT_LOAD: the whole image, readable and executable
     put32(&mut h, 1);
     put32(&mut h, 5);
     for v in [0, 0, 0, size, size, PAGE_SIZE] {
@@ -225,23 +227,25 @@ fn get() -> &'static Image {
     IMAGE.get_or_init(build)
 }
 
-/// vDSO 的镜像（不超过一页）。
+/// The vDSO image (at most one page).
 pub fn image() -> &'static [u8] {
     &get().bytes
 }
 
-/// `__kernel_rt_sigreturn` 相对 vDSO 起点的偏移。
+/// Offset of `__kernel_rt_sigreturn` from the start of the vDSO.
 pub fn sigreturn_offset() -> u64 {
     get().sigreturn
 }
 
-/// svc 之后的 pc 是 `pc`、编号是 `nr` 的系统调用来自 vDSO 里读时钟的存根（clock_gettime、
-/// clock_getres、gettimeofday）：Linux 上它们不进内核，跟踪者看不到，seccomp 也不检查。
+/// Whether the syscall with number `nr`, whose pc after the svc is `pc`, comes from a vDSO clock
+/// stub (clock_gettime, clock_getres, gettimeofday): on Linux these do not enter the kernel, so
+/// tracers do not see them and seccomp does not check them.
 pub(crate) fn clock_stub(cx: &crate::kernel::Cx<'_>, pc: u64, nr: u64) -> bool {
     clock_stub_at(cx.mm().vdso, pc, nr)
 }
 
-/// 与 [`clock_stub`] 相同，vDSO 映射在 `vdso`（不持 BKL 时用记下的地址）。
+/// Same as [`clock_stub`], with the vDSO mapped at `vdso` (the recorded address, used without the
+/// BKL).
 pub(crate) fn clock_stub_at(vdso: u64, pc: u64, nr: u64) -> bool {
     let svc = pc.wrapping_sub(4);
     vdso != 0 && (vdso..vdso + image().len() as u64).contains(&svc) && matches!(nr, 113 | 114 | 169)
@@ -268,7 +272,7 @@ mod tests {
         &b[off..off + end]
     }
 
-    /// 按 musl `__vdsosym` 的做法查找符号（src/internal/vdso.c）。
+    /// Looks up a symbol the way musl's `__vdsosym` does (src/internal/vdso.c).
     fn musl_lookup(b: &[u8], vername: &[u8], name: &[u8]) -> Option<u64> {
         let phoff = u64_at(b, 32) as usize;
         let mut dynv = None;

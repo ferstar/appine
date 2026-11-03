@@ -1,5 +1,5 @@
-//! ptrace(2) 里跟踪者的一方，以及 process_vm_readv、process_vm_writev（kernel/signal 的 map）。
-//! 被跟踪的一方在 [`crate::ptrace`]。
+//! The tracer side of ptrace(2), plus process_vm_readv and process_vm_writev (the kernel/signal
+//! map). The tracee side is in [`crate::ptrace`].
 
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -45,7 +45,7 @@ const SECCOMP_GET_FILTER: i64 = 0x420c;
 const SECCOMP_GET_METADATA: i64 = 0x420d;
 const GET_SYSCALL_INFO: i64 = 0x420e;
 
-/// regset 的类型（`NT_*`）。
+/// Regset types (`NT_*`).
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
 const NT_ARM_TLS: u64 = 0x401;
@@ -53,9 +53,9 @@ const NT_ARM_HW_BREAK: u64 = 0x402;
 const NT_ARM_HW_WATCH: u64 = 0x403;
 const NT_ARM_SYSTEM_CALL: u64 = 0x404;
 
-/// `AUDIT_ARCH_AARCH64`（PTRACE_GET_SYSCALL_INFO 的 arch）。
+/// `AUDIT_ARCH_AARCH64` (the arch of PTRACE_GET_SYSCALL_INFO).
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
-/// 调试架构（`ID_AA64DFR0_EL1.DebugVer`）是 ARMv8。
+/// The debug architecture (`ID_AA64DFR0_EL1.DebugVer`) is ARMv8.
 const DEBUG_ARCH_V8: u32 = 6;
 
 pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u64) -> SysResult {
@@ -65,8 +65,8 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
         _ => {}
     }
     let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
-    // 只能对自己跟踪的线程发请求；除了 PTRACE_KILL、PTRACE_INTERRUPT，它还得停在
-    // ptrace-stop 里（Linux 的 ptrace_check_attach）
+    // Requests may only be made to threads we trace; except for PTRACE_KILL and PTRACE_INTERRUPT,
+    // the thread must also be in a ptrace-stop (Linux's ptrace_check_attach)
     {
         let t = task.trace.borrow();
         if t.tracer != Some(cx.tgid()) || !(matches!(request, KILL | INTERRUPT) || t.stopped()) {
@@ -76,7 +76,8 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
     match request {
         PEEKTEXT | PEEKDATA => peek(cx, &task, addr, data),
         POKETEXT | POKEDATA => {
-            // 与 Linux 的 FOLL_FORCE 一样可以写没有写权限的私有映射：下断点
+            // As with Linux's FOLL_FORCE, private mappings without write permission can be
+            // written: setting breakpoints
             let mm = task.res.borrow().mm.clone();
             mm.borrow_mut()
                 .write_force(addr, &data.to_le_bytes(), &cx.task.sync)
@@ -128,8 +129,9 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             if !t.seized {
                 return Err(Errno::EIO);
             }
-            // 在运行的线程马上进内核，在等待的从系统调用里出来（signal::interrupted），
-            // 停着的在继续之后停；PTRACE_LISTEN 的马上重新报告
+            // A running thread enters the kernel at once, a waiting one leaves its syscall
+            // (signal::interrupted), a stopped one stops after it resumes; one in PTRACE_LISTEN
+            // reports again at once
             t.trap = true;
             drop(t);
             signal::wake(&task);
@@ -142,7 +144,7 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             }
             t.listening = true;
             drop(t);
-            // 停下来之后 group-stop 已经结束了的话，马上重新报告
+            // If the group-stop has already ended since it stopped, report again at once
             crate::kernel::signal_later(&task.event);
             Ok(0)
         }
@@ -150,8 +152,9 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
             if addr != 8 {
                 return Err(Errno::EINVAL);
             }
-            // 与 Linux 一样：sigsuspend、ppoll 换掉了屏蔽字时读到的是原来的那个；设置之后不再
-            // 恢复原来的（clear_tsk_restore_sigmask），处理函数返回后是跟踪者设的
+            // As on Linux: when sigsuspend or ppoll swapped the mask, the original one is read;
+            // after a set the original is no longer restored (clear_tsk_restore_sigmask), so after
+            // the handler returns the mask is the one the tracer set
             if request == GETSIGMASK {
                 let mask = task.saved_sigmask.get().unwrap_or(task.sigmask.get());
                 put(cx, data, mask.to_le_bytes()).map(|()| 0)
@@ -165,12 +168,13 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
         GET_SYSCALL_INFO => syscall_info(cx, &task, addr, data),
         SECCOMP_GET_FILTER => crate::seccomp::get_filter(cx, &task, addr, data),
         SECCOMP_GET_METADATA => crate::seccomp::get_metadata(cx, &task, addr, data),
-        // PEEKUSR、POKEUSR、GETREGS 这些在 arm64 上本来就没有
+        // PEEKUSR, POKEUSR, GETREGS and the like never existed on arm64
         _ => Err(Errno::EIO),
     }
 }
 
-/// PTRACE_TRACEME：由父进程跟踪。父进程是内置的 init 时没有谁能跟踪它。
+/// PTRACE_TRACEME: be traced by the parent. Nobody can trace it when the parent is the built-in
+/// init.
 fn traceme(cx: &mut Cx<'_>) -> SysResult {
     let ppid = cx.t.group.borrow().ppid;
     if ppid == INIT || !cx.kr().groups.contains_key(&ppid) {
@@ -189,8 +193,8 @@ fn traceme(cx: &mut Cx<'_>) -> SysResult {
     Ok(0)
 }
 
-/// `PTRACE_O_SUSPEND_SECCOMP`（checkpoint/restore 用）：要求 `CAP_SYS_ADMIN`，跟踪者自己
-/// 没有 seccomp、也没有被这样跟踪着（Linux 的 `check_ptrace_options`）。
+/// `PTRACE_O_SUSPEND_SECCOMP` (for checkpoint/restore): requires `CAP_SYS_ADMIN`, and that the
+/// tracer itself has no seccomp and is not traced this way (Linux's `check_ptrace_options`).
 fn check_options(cx: &Cx<'_>, options: u32) -> Result<(), Errno> {
     if options & opt::SUSPEND_SECCOMP != 0 {
         let suspended = {
@@ -207,11 +211,11 @@ fn check_options(cx: &Cx<'_>, options: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// PTRACE_ATTACH、PTRACE_SEIZE（`options` 在 `data` 里）。ATTACH 给线程发一个 SIGSTOP，
-/// SEIZE 不打扰它。
+/// PTRACE_ATTACH and PTRACE_SEIZE (`options` in `data`). ATTACH sends the thread a SIGSTOP, SEIZE
+/// leaves it undisturbed.
 fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysResult {
     let options = if seize {
-        // 与 Linux 一样，SEIZE 不认得的选项是 EIO，SETOPTIONS 的是 EINVAL
+        // As on Linux, options unknown to SEIZE are EIO, those unknown to SETOPTIONS EINVAL
         if addr != 0 || data & !(opt::MASK as u64) != 0 {
             return Err(Errno::EIO);
         }
@@ -245,8 +249,9 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
             options,
             ..Trace::default()
         };
-        // 线程组已经被停住了：马上作为 group-stop 停下来报告（Linux 的 JOBCTL_TRAP_STOP），
-        // 报告的是停住它的信号，父进程取走了停止事件也一样
+        // The thread group is already stopped: stop and report at once as a group-stop (Linux's
+        // JOBCTL_TRAP_STOP), reporting the signal that stopped it, even if the parent has
+        // already taken the stop event
         let g = group.borrow();
         if g.stopped {
             t.group_stop = Some(g.stop_signal);
@@ -255,13 +260,13 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
     if !seize {
         signal::send_to_task(cx.kr(), &task, Signal::STOP, SigInfo::kernel());
     }
-    // 在 group-stop 里等着的线程要改为停在 ptrace-stop 里
+    // A thread waiting in a group-stop must switch to waiting in a ptrace-stop
     signal::wake(&task);
     Ok(0)
 }
 
-/// PTRACE_CONT、PTRACE_SYSCALL、PTRACE_SINGLESTEP：让停着的线程继续，`data` 是要注入的
-/// 信号。
+/// PTRACE_CONT, PTRACE_SYSCALL, PTRACE_SINGLESTEP: resume a stopped thread, with `data` as the
+/// signal to inject.
 fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
     if data > Signal::MAX as u64 {
         return Err(Errno::EIO);
@@ -277,12 +282,12 @@ fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
     if mode != Mode::Step {
         task.step_again.store(false, Ordering::Relaxed);
     }
-    // 它停在内核里，只等自己的事件，不必打断
+    // It is stopped in the kernel waiting only for its own event, so no kick is needed
     crate::kernel::signal_later(&task.event);
     Ok(0)
 }
 
-/// PTRACE_PEEKTEXT、PTRACE_PEEKDATA：读被跟踪进程的一个字，写到 `data`。
+/// PTRACE_PEEKTEXT, PTRACE_PEEKDATA: reads one word of the tracee and writes it to `data`.
 fn peek(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
     let mm = task.res.borrow().mm.clone();
     let mut word = [0u8; 8];
@@ -292,23 +297,23 @@ fn peek(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
     put(cx, data, word).map(|()| 0)
 }
 
-/// regset 的（元素大小，元素个数）。
+/// A regset's (element size, element count).
 fn regset_shape(nt: u64) -> Result<(usize, usize), Errno> {
     Ok(match nt {
-        // user_pt_regs：x0–x30、sp、pc、pstate
+        // user_pt_regs: x0–x30, sp, pc, pstate
         NT_PRSTATUS => (8, 34),
-        // user_fpsimd_state：v0–v31、fpsr、fpcr、两个保留的字
+        // user_fpsimd_state: v0–v31, fpsr, fpcr, two reserved words
         NT_PRFPREG => (4, 132),
         NT_ARM_TLS => (8, 1),
-        // user_hwdebug_state：dbg_info、一个空字、16 组（地址、控制、空字）
+        // user_hwdebug_state: dbg_info, a pad word, 16 sets of (address, control, pad)
         NT_ARM_HW_BREAK | NT_ARM_HW_WATCH => (4, 66),
         NT_ARM_SYSTEM_CALL => (4, 1),
-        // 没有 SVE、PAC、MTE、SME
+        // No SVE, PAC, MTE, SME
         _ => return Err(Errno::EINVAL),
     })
 }
 
-/// regset 的内容。
+/// A regset's contents.
 pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32, hw: &HwDebug) -> Vec<u8> {
     let mut b = Vec::new();
     match nt {
@@ -328,7 +333,8 @@ pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32, hw: &HwDebug) -> 
         }
         NT_ARM_TLS => b.extend_from_slice(&r.tpidr.to_le_bytes()),
         NT_ARM_HW_BREAK | NT_ARM_HW_WATCH => {
-            // dbg_info：调试架构和槽数，然后是 16 组（地址、控制字、空字）
+            // dbg_info: the debug architecture and slot count, then 16 sets of (address, control
+            // word, pad)
             let (slots, n) = if nt == NT_ARM_HW_BREAK {
                 (&hw.brk, BRK_SLOTS)
             } else {
@@ -347,7 +353,7 @@ pub(crate) fn encode_regset(nt: u64, r: &Regs, syscallno: i32, hw: &HwDebug) -> 
     b
 }
 
-/// 跟踪者写来的 regset 内容。
+/// Regset contents written by the tracer.
 fn decode_regset(
     nt: u64,
     b: &[u8],
@@ -384,7 +390,8 @@ fn decode_regset(
             for (i, slot) in slots.iter_mut().enumerate() {
                 let addr = u64_at(1 + 2 * i);
                 let ctrl = u32_at(16 + 16 * i);
-                // 超出槽数的只能是零（Linux 建不出断点，ENOSPC）
+                // Beyond the slot count only zeros are allowed (Linux cannot create the
+                // breakpoint, ENOSPC)
                 *slot = if i >= n {
                     if (addr, ctrl) != (0, 0) {
                         return Err(Errno::ENOSPC);
@@ -405,11 +412,12 @@ fn decode_regset(
     Ok(())
 }
 
-/// 一组硬件断点或观察点（`watch`）的地址和控制字，按 Linux 检查并规范化
-/// （`ptrace_hbp_fill_attr_ctrl`、`hw_breakpoint_arch_parse`）：停用的原样记下；启用的
-/// 字节选择（BAS）必须是连续的一段，观察点的种类是读、写或者两者，断点只能是 4 字节；
-/// 起点是地址加上 BAS 的偏移，再按 8 字节（断点按 4 字节）对齐、把偏移挪回 BAS，
-/// 特权级记成 EL0。
+/// The address and control word of one hardware breakpoint or watchpoint (`watch`), checked and
+/// normalized as Linux does (`ptrace_hbp_fill_attr_ctrl`, `hw_breakpoint_arch_parse`): disabled
+/// ones are recorded as they are; for enabled ones the byte select (BAS) must be one contiguous
+/// run, a watchpoint's kind is read, write or both, and a breakpoint can only be 4 bytes; the start
+/// is the address plus the BAS offset, aligned to 8 bytes (4 for breakpoints) with the offset moved
+/// back into BAS, and the privilege level is recorded as EL0.
 fn hw_slot(watch: bool, addr: u64, ctrl: u32) -> Result<(u64, u32), Errno> {
     const EL0: u32 = 2 << 1;
     if ctrl & 1 == 0 {
@@ -439,8 +447,9 @@ fn hw_slot(watch: bool, addr: u64, ctrl: u32) -> Result<(u64, u32), Errno> {
     }
 }
 
-/// PTRACE_GETREGSET、PTRACE_SETREGSET：`data` 指向 iovec，长度可以比 regset 短（只读写
-/// 前面的部分），读写了多少写回 iovec 的长度。
+/// PTRACE_GETREGSET, PTRACE_SETREGSET: `data` points at an iovec whose length may be shorter than
+/// the regset (only the front part is read or written); the amount read or written is written
+/// back as the iovec's length.
 fn regset(cx: &mut Cx<'_>, task: &Task, set: bool, nt: u64, iov: u64) -> SysResult {
     let b: [u8; 16] = get(cx, iov)?;
     let base = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -472,9 +481,9 @@ fn regset(cx: &mut Cx<'_>, task: &Task, set: bool, nt: u64, iov: u64) -> SysResu
     put(cx, iov + 8, (len as u64).to_le_bytes()).map(|()| 0)
 }
 
-/// PTRACE_GET_SYSCALL_INFO：`size` 是缓冲区的长度。系统调用的入口和出口（要
-/// `PTRACE_O_TRACESYSGOOD`）给出编号和参数、返回值，别的停住只有前面的公共部分。返回
-/// 完整的长度。
+/// PTRACE_GET_SYSCALL_INFO: `size` is the buffer length. Syscall entry and exit (which need
+/// `PTRACE_O_TRACESYSGOOD`) give the number and arguments, or the return value; other stops only
+/// the common part at the front. Returns the full length.
 fn syscall_info(cx: &mut Cx<'_>, task: &Task, size: u64, data: u64) -> SysResult {
     const OP_ENTRY: u8 = 1;
     const OP_EXIT: u8 = 2;
@@ -499,7 +508,7 @@ fn syscall_info(cx: &mut Cx<'_>, task: &Task, size: u64, data: u64) -> SysResult
             }
         };
         match t.message {
-            // seccomp 的 TRACE：编号和参数，加上过滤器给的数据
+            // seccomp's TRACE: the number and arguments, plus the data from the filter
             data if seccomp => {
                 b[0] = OP_SECCOMP;
                 entry(&mut b);
@@ -526,7 +535,7 @@ fn syscall_info(cx: &mut Cx<'_>, task: &Task, size: u64, data: u64) -> SysResult
     Ok(actual)
 }
 
-/// 读 `count` 个 iovec。
+/// Reads `count` iovecs.
 fn iovecs(cx: &Cx<'_>, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
     let mut b = vec![0u8; count as usize * 16];
     cx.mm().read(UserSlice::new(addr, b.len()), &mut b)?;
@@ -544,9 +553,10 @@ fn iovecs(cx: &Cx<'_>, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> 
     Ok(out)
 }
 
-/// process_vm_readv（`write` 时是 process_vm_writev）：在自己的 `local` 和进程 `pid` 的
-/// `remote` 之间拷贝，权限与 PTRACE_ATTACH 相同。远端按页拷贝，碰到不能访问的页就停在
-/// 那里，返回已经拷了多少（一字节也没拷时是 EFAULT）。
+/// process_vm_readv (process_vm_writev with `write`): copies between our own `local` and the
+/// `remote` of process `pid`, with the same permissions as PTRACE_ATTACH. The remote side is
+/// copied page by page, stopping at the first inaccessible page and returning how much was copied
+/// (EFAULT if not a single byte was).
 pub(super) fn process_vm(
     cx: &mut Cx<'_>,
     pid: i32,
@@ -625,9 +635,10 @@ mod tests {
     fn hw_slots_are_checked_and_normalized_like_linux() {
         const EL0: u32 = 2 << 1;
         let watch = |bas: u32, ty: u32| bas << 5 | ty << 3 | EL0 | 1;
-        // 停用的原样记下，不检查
+        // Disabled ones are recorded as they are, unchecked
         assert_eq!(hw_slot(true, 0x1234, 0x40), Ok((0x1234, 0x40)));
-        // 地址里的偏移和 BAS 里的偏移是一回事：都规范化成按 8 对齐的地址
+        // An offset in the address and an offset in BAS are the same thing: both are normalized
+        // to an 8-aligned address
         assert_eq!(
             hw_slot(true, 0x1000, watch(0xf0, 2)),
             Ok((0x1000, watch(0xf0, 2)))
@@ -640,12 +651,12 @@ mod tests {
             hw_slot(true, 0x1003, watch(0x01, 1)),
             Ok((0x1000, watch(0x08, 1)))
         );
-        // 越过 8 字节、BAS 不连续或为零、种类是执行：EINVAL
+        // Crossing 8 bytes, BAS not contiguous or zero, kind is execute: EINVAL
         assert_eq!(hw_slot(true, 0x1006, watch(0x0f, 2)), Err(Errno::EINVAL));
         assert_eq!(hw_slot(true, 0x1000, watch(0x05, 2)), Err(Errno::EINVAL));
         assert_eq!(hw_slot(true, 0x1000, watch(0, 2)), Err(Errno::EINVAL));
         assert_eq!(hw_slot(true, 0x1000, watch(0xff, 0)), Err(Errno::EINVAL));
-        // 断点只能是执行、4 字节，地址按 4 对齐
+        // Breakpoints can only be execute, 4 bytes, with the address aligned to 4
         assert_eq!(
             hw_slot(false, 0x2000, watch(0x0f, 0)),
             Ok((0x2000, watch(0x0f, 0)))

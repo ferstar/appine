@@ -1,23 +1,28 @@
-//! ptrace 里被跟踪的一方（kernel/signal 的 map）：停在 ptrace-stop 里，等跟踪者读写它的寄存器和
-//! 内存，再让它继续。跟踪者一方的请求在 `syscall::ptrace`。
+//! The tracee side of ptrace (the kernel/signal map): stopping in a ptrace-stop, waiting for the
+//! tracer to read and write its registers and memory, then resuming. The tracer side's requests
+//! are in `syscall::ptrace`.
 //!
-//! 被跟踪的是线程，跟踪者记的是进程（tgid）。Linux 只接受跟踪者线程自己发的请求，wait
-//! 则线程组里的哪个线程都可以；appine 不记 fork 的是哪个线程（PTRACE_TRACEME 的跟踪者是
-//! 父进程），所以放宽到跟踪者进程里的任何线程。
+//! Tracees are threads, and the tracer is recorded as a process (tgid). Linux accepts requests
+//! only from the tracer thread itself, while any thread in the thread group may wait; appine does
+//! not record which thread forked (the tracer of PTRACE_TRACEME is the parent process), so this is
+//! relaxed to any thread in the tracer process.
 //!
-//! 被跟踪的线程在这些地方停下来，由 [`stop`] 通知跟踪者：
+//! A tracee stops at these points, and [`stop`] notifies the tracer:
 //!
-//! - 投递信号之前（信号投递停止，[`signal_stop`]）：跟踪者可以换掉信号、改它的 siginfo，
-//!   或者不投递；
-//! - 线程组被停止信号停住时（group-stop，[`group_stop`]）。被跟踪的线程不在 group-stop 里
-//!   一直停着，跟踪者让它继续它就继续执行，即使线程组仍然停着，与 Linux 一样；
-//! - PTRACE_SYSCALL 让它继续之后，系统调用的入口和出口（[`syscall_entry`]、
-//!   [`syscall_exit`]）；
-//! - `PTRACE_EVENT_*`（[`event`]）：fork、vfork、clone、exec、vfork 结束、退出，以及
-//!   PTRACE_INTERRUPT 和 PTRACE_SEIZE 跟进来的新线程的 `PTRACE_EVENT_STOP`（[`trap`]）。
+//! - before a signal is delivered (signal-delivery stop, [`signal_stop`]): the tracer can replace
+//!   the signal, change its siginfo, or not deliver it;
+//! - when the thread group is stopped by a stop signal (group-stop, [`group_stop`]). A tracee does
+//!   not stay stopped in the group-stop: when the tracer resumes it, it runs even though the
+//!   thread group is still stopped, as on Linux;
+//! - after PTRACE_SYSCALL resumes it, at syscall entry and exit ([`syscall_entry`],
+//!   [`syscall_exit`]);
+//! - `PTRACE_EVENT_*` ([`event`]): fork, vfork, clone, exec, vfork done, exit, plus the
+//!   `PTRACE_EVENT_STOP` of PTRACE_INTERRUPT and of new threads auto-attached under PTRACE_SEIZE
+//!   ([`trap`]).
 //!
-//! 停住时把寄存器存一份在 [`Trace::regs`]，跟踪者读写的是这一份，继续时写回 Cpu。停住期间
-//! 不处理信号，只有 SIGKILL 让它离开（Linux 的 TASK_TRACED）。
+//! On a stop the registers are saved in [`Trace::regs`]; the tracer reads and writes that copy,
+//! and it is written back to the Cpu on resume. While stopped, no signals are handled; only
+//! SIGKILL makes it leave (Linux's TASK_TRACED).
 
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -30,7 +35,7 @@ use crate::process::{ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, SigAction, SigInfo, code, sa};
 use crate::task::Task;
 
-/// `PTRACE_EVENT_*`。
+/// `PTRACE_EVENT_*`.
 pub(crate) mod event {
     pub const FORK: u32 = 1;
     pub const VFORK: u32 = 2;
@@ -42,58 +47,60 @@ pub(crate) mod event {
     pub const STOP: u32 = 128;
 }
 
-/// `PTRACE_O_*`。`PTRACE_EVENT_x` 对应的选项是 `1 << x`。
+/// `PTRACE_O_*`. The option for `PTRACE_EVENT_x` is `1 << x`.
 pub(crate) mod opt {
     pub const TRACESYSGOOD: u32 = 1;
     pub const EXITKILL: u32 = 1 << 20;
     pub const SUSPEND_SECCOMP: u32 = 1 << 21;
-    /// 认得的选项（Linux 的 `PTRACE_O_MASK`）。
+    /// Known options (Linux's `PTRACE_O_MASK`).
     pub const MASK: u32 = 0xff | EXITKILL | SUSPEND_SECCOMP;
 }
 
-/// PTRACE_GETEVENTMSG 在系统调用入口、出口停住时的值。
+/// The values of PTRACE_GETEVENTMSG at syscall entry and exit stops.
 pub(crate) const EVENTMSG_SYSCALL_ENTRY: u64 = 1;
 pub(crate) const EVENTMSG_SYSCALL_EXIT: u64 = 2;
 
-/// 停住的原因。
+/// Why the thread stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stop {
-    /// 投递信号之前。
+    /// Before a signal is delivered.
     Signal(Signal),
-    /// group-stop（不是 PTRACE_SEIZE 跟踪的；SEIZE 的报告成 `PTRACE_EVENT_STOP`）。
+    /// A group-stop (not traced with PTRACE_SEIZE; under SEIZE it is reported as
+    /// `PTRACE_EVENT_STOP`).
     Group(Signal),
-    /// 系统调用的入口（true）或出口。
+    /// Syscall entry (true) or exit.
     Syscall(bool),
-    /// `PTRACE_EVENT_*` 和 WSTOPSIG：`PTRACE_EVENT_STOP` 的是 SIGTRAP 或者停止信号，其余
-    /// 的是 SIGTRAP。
+    /// `PTRACE_EVENT_*` and WSTOPSIG: for `PTRACE_EVENT_STOP` SIGTRAP or the stop signal, for the
+    /// rest SIGTRAP.
     Event(u32, Signal),
 }
 
-/// 跟踪者让线程怎样继续。
+/// How the tracer resumes the thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Mode {
-    /// PTRACE_CONT：一直执行到下一次停下。
+    /// PTRACE_CONT: run until the next stop.
     #[default]
     Cont,
-    /// PTRACE_SYSCALL：在系统调用的入口和出口停下。
+    /// PTRACE_SYSCALL: stop at syscall entry and exit.
     Syscall,
-    /// PTRACE_SINGLESTEP：执行一条指令就停下（[`step_done`]）。
+    /// PTRACE_SINGLESTEP: stop after executing one instruction ([`step_done`]).
     Step,
 }
 
-/// 停住时的寄存器。跟踪者读写这一份，继续时写回 Cpu。
+/// The registers at a stop. The tracer reads and writes this copy, which is written back to the
+/// Cpu on resume.
 #[derive(Clone)]
 pub(crate) struct Regs {
     pub x: [u64; 31],
     pub sp: u64,
     pub pc: u64,
-    /// NZCV 和 DIT（第 24 位），[`pstate_of`]。
+    /// NZCV and DIT (bit 24), [`pstate_of`].
     pub pstate: u64,
     pub fpcr: u64,
     pub fpsr: u64,
     pub tpidr: u64,
     pub v: [[u64; 2]; 32],
-    /// 系统调用的原始 x0（PTRACE_GET_SYSCALL_INFO 报告的第一个参数），只读。
+    /// The syscall's original x0 (the first argument PTRACE_GET_SYSCALL_INFO reports), read-only.
     pub orig_x0: u64,
 }
 
@@ -124,80 +131,91 @@ impl Regs {
     }
 }
 
-/// pstate 里的 NZCV。
+/// NZCV in pstate.
 const PSTATE_NZCV: u64 = 0xf000_0000;
-/// pstate 里的 DIT。
+/// DIT in pstate.
 const PSTATE_DIT: u64 = 1 << 24;
 
-/// guest 看得到的 pstate（信号帧、ptrace 的寄存器集、core dump）：NZCV 和 DIT，别的位
-/// 总是 0（EL0t、AArch64）。
+/// The pstate the guest sees (signal frames, ptrace register sets, core dumps): NZCV and DIT, with
+/// all other bits always 0 (EL0t, AArch64).
 pub(crate) fn pstate_of(s: &CpuState) -> u64 {
     (s.nzcv & PSTATE_NZCV) | (u64::from(s.dit) << 24)
 }
 
-/// 信号帧、跟踪者给的 pstate 里 guest 能改的位：NZCV，宣告了 DIT 时还有 DIT（Linux 的
-/// `valid_native_regs` 只清掉 RES0 的位，DIT 照恢复；没有 DIT 的硬件上这一位不起作用）。
+/// The bits of a pstate from a signal frame or from the tracer that the guest may change: NZCV,
+/// plus DIT when DIT is advertised (Linux's `valid_native_regs` only clears the RES0 bits and
+/// restores DIT as given; on hardware without DIT the bit has no effect).
 pub(crate) fn user_pstate(pstate: u64) -> u64 {
     let dit = appine_engine::guest_hwcap() & appine_engine::hwcap::DIT != 0;
     pstate & (PSTATE_NZCV | if dit { PSTATE_DIT } else { 0 })
 }
 
-/// 按 pstate 恢复 NZCV 和 DIT（[`user_pstate`]）。
+/// Restores NZCV and DIT from a pstate ([`user_pstate`]).
 pub(crate) fn set_pstate(s: &mut CpuState, pstate: u64) {
     let p = user_pstate(pstate);
     s.nzcv = p & PSTATE_NZCV;
     s.dit = u32::from(p & PSTATE_DIT != 0);
 }
 
-/// 线程的 ptrace 状态（[`Task::trace`]），只在持有 BKL 时访问。
+/// A thread's ptrace state ([`Task::trace`]), accessed only while holding the BKL.
 #[derive(Default)]
 pub(crate) struct Trace {
-    /// 跟踪者进程；None 表示没有被跟踪。
+    /// The tracer process; None means not traced.
     pub tracer: Option<Tid>,
-    /// 建立跟踪时跟踪者有 `CAP_SYS_PTRACE`（Linux 的 `ptracer_cred`）：没有时被跟踪的进程
-    /// execve setuid 程序、带文件能力的程序时得不到新的特权。
+    /// The tracer had `CAP_SYS_PTRACE` when tracing began (Linux's `ptracer_cred`): without it, a
+    /// tracee that execve's a setuid program or a program with file capabilities gains no new
+    /// privileges.
     pub privileged: bool,
-    /// PTRACE_SEIZE 跟踪的：group-stop 和 PTRACE_INTERRUPT 报告成 `PTRACE_EVENT_STOP`，
-    /// 跟进来的新线程开始时也是；不会因为 execve 收到 SIGTRAP。
+    /// Traced with PTRACE_SEIZE: group-stops and PTRACE_INTERRUPT are reported as
+    /// `PTRACE_EVENT_STOP`, and so is the start of an auto-attached new thread; execve does not
+    /// send it SIGTRAP.
     pub seized: bool,
-    /// PTRACE_SETOPTIONS 的选项。
+    /// The options of PTRACE_SETOPTIONS.
     pub options: u32,
-    /// 继续之后怎样执行。
+    /// How to run after resuming.
     pub mode: Mode,
-    /// 停住的原因；None 表示在运行。
+    /// Why it stopped; None means running.
     pub stop: Option<Stop>,
-    /// 这次停住已经被跟踪者的 wait 取走。
+    /// This stop has already been taken by the tracer's wait.
     pub reported: bool,
-    /// 跟踪者让它继续了：要注入的信号（0 表示不注入）。
+    /// The tracer resumed it: the signal to inject (0 means none).
     pub resume: Option<i32>,
-    /// PTRACE_LISTEN：仍然停着，但 group-stop 结束或者来了 PTRACE_INTERRUPT 时重新报告一次。
+    /// PTRACE_LISTEN: still stopped, but reported once more when the group-stop ends or a
+    /// PTRACE_INTERRUPT arrives.
     pub listening: bool,
-    /// 要停一次 `PTRACE_EVENT_STOP`（PTRACE_INTERRUPT、SEIZE 跟进来的新线程）。
+    /// Stop once at `PTRACE_EVENT_STOP` (PTRACE_INTERRUPT, a new thread auto-attached under
+    /// SEIZE).
     pub trap: bool,
-    /// 要参加的 group-stop 的停止信号：线程组被停住时置上，停下来之后清掉。
+    /// The stop signal of the group-stop to join: set when the thread group is stopped, cleared
+    /// once the thread has stopped.
     pub group_stop: Option<Signal>,
-    /// 停住时的寄存器。
+    /// The registers at the stop.
     pub regs: Option<Box<Regs>>,
-    /// 停住时的 siginfo（Linux 的 `last_siginfo`），按 `siginfo_t` 编码；不是 SEIZE 的
-    /// group-stop 没有，PTRACE_GETSIGINFO 是 EINVAL。
+    /// The siginfo of the stop (Linux's `last_siginfo`), encoded as `siginfo_t`; a group-stop not
+    /// under SEIZE has none, and PTRACE_GETSIGINFO is EINVAL.
     pub siginfo: Option<[u8; 128]>,
-    /// PTRACE_GETEVENTMSG。
+    /// PTRACE_GETEVENTMSG.
     pub message: u64,
-    /// 系统调用的编号：入口停住时跟踪者可以改（`NT_ARM_SYSTEM_CALL`），改成 -1 时跳过。
+    /// The syscall number: the tracer may change it at an entry stop (`NT_ARM_SYSTEM_CALL`); -1
+    /// skips the syscall.
     pub syscallno: i32,
-    /// 跟踪者设置的硬件断点和观察点；`hw_changed` 时继续之后交给 CPU。
+    /// Hardware breakpoints and watchpoints set by the tracer; when `hw_changed`, handed to the
+    /// CPU on resume.
     pub hw: HwDebug,
     pub hw_changed: bool,
 }
 
-/// 硬件断点、观察点的槽数，与常见的 Cortex-A 核相同（`ID_AA64DFR0_EL1` 的 BRPs、WRPs）。
+/// Number of hardware breakpoint and watchpoint slots, the same as common Cortex-A cores (BRPs
+/// and WRPs of `ID_AA64DFR0_EL1`).
 pub(crate) const BRK_SLOTS: usize = 6;
 pub(crate) const WATCH_SLOTS: usize = 4;
 
-/// 硬件断点、观察点（`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 的 16 组地址和控制字，前
-/// [`BRK_SLOTS`]、[`WATCH_SLOTS`] 组有用）。启用的已经按 Linux 规范化：观察点的地址按 8
-/// 字节对齐，偏移挪进字节选择（BAS），特权级是 EL0（`syscall::ptrace`）。与 Linux 一样
-/// 属于线程：fork、clone 出来的线程没有，execve 时清掉，PTRACE_DETACH 不清。
+/// Hardware breakpoints and watchpoints (the 16 sets of address and control word of
+/// `NT_ARM_HW_BREAK` and `NT_ARM_HW_WATCH`, of which the first [`BRK_SLOTS`] and [`WATCH_SLOTS`]
+/// are used). Enabled ones are already normalized as Linux does: watchpoint addresses aligned to
+/// 8 bytes, with the offset moved into the byte select (BAS), and privilege level EL0
+/// (`syscall::ptrace`). As on Linux they belong to the thread: threads created by fork and clone
+/// have none, execve clears them, PTRACE_DETACH does not.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HwDebug {
     pub brk: [(u64, u32); 16],
@@ -205,8 +223,9 @@ pub(crate) struct HwDebug {
 }
 
 impl HwDebug {
-    /// 交给引擎（`CpuState::set_hw_debug`）：启用的断点的地址，启用的观察点的
-    /// [起点, 终点) 和种类（控制字的 LSC 位就是引擎的 `WATCH_LOAD`、`WATCH_STORE`）。
+    /// Hands them to the engine (`CpuState::set_hw_debug`): the addresses of enabled breakpoints,
+    /// and the [start, end) and kind of enabled watchpoints (the control word's LSC bits are the
+    /// engine's `WATCH_LOAD` and `WATCH_STORE`).
     pub fn apply(&self, s: &mut CpuState) {
         s.set_hw_debug(&self.breakpoints(), &self.watchpoints());
     }
@@ -233,8 +252,8 @@ impl HwDebug {
 }
 
 impl Trace {
-    /// 停住时报告给跟踪者的状态（Linux 的 `exit_code`）：wait4 的状态字是它左移 8 位再
-    /// 或上 0x7f，waitid 的 `si_status` 就是它。
+    /// The status reported to the tracer on a stop (Linux's `exit_code`): the wait4 status word is
+    /// it shifted left by 8 and ORed with 0x7f, and waitid's `si_status` is it.
     pub fn exit_code(&self) -> Option<i32> {
         let trap = Signal::TRAP.number();
         Some(match self.stop? {
@@ -245,31 +264,31 @@ impl Trace {
         })
     }
 
-    /// 跟踪者打开了事件 `e`。
+    /// The tracer has enabled event `e`.
     pub fn enabled(&self, e: u32) -> bool {
         self.tracer.is_some() && self.options & (1 << e) != 0
     }
 
-    /// 停在 ptrace-stop 里，而且不是 PTRACE_LISTEN：跟踪者可以对它发请求。
+    /// In a ptrace-stop and not in PTRACE_LISTEN: the tracer can send it requests.
     pub fn stopped(&self) -> bool {
         self.stop.is_some() && !self.listening
     }
 }
 
-/// 线程被跟踪着。
+/// The thread is traced.
 pub(crate) fn traced(task: &Task) -> bool {
     task.trace.borrow().tracer.is_some()
 }
 
-/// 跟踪者发出的 siginfo：用 kill 发信号时那样带上发送者（Linux 的 `ptrace_do_notify`
-/// 填的是被跟踪的线程自己）。
+/// The siginfo sent by the tracer: carries a sender as a kill would (what Linux's
+/// `ptrace_do_notify` fills in is the tracee thread itself).
 fn notify_info(signo: Signal, si_code: i32, pid: Tid, uid: u32) -> [u8; 128] {
     SigInfo::kill(si_code, pid, uid).encode(signo)
 }
 
-/// 停在 ptrace-stop 里：通知跟踪者，等它让线程继续。返回跟踪者要注入的信号（0 表示
-/// 没有）；线程被结束（SIGKILL）时返回 None。`info` 是这次停住的 siginfo，`message` 是
-/// PTRACE_GETEVENTMSG 的值。
+/// Stops in a ptrace-stop: notifies the tracer and waits for it to resume the thread. Returns the
+/// signal the tracer injects (0 means none); None when the thread is killed (SIGKILL). `info` is
+/// the siginfo of this stop and `message` the value of PTRACE_GETEVENTMSG.
 pub(crate) fn stop(
     cx: &mut Cx<'_>,
     cpu: &mut Cpu,
@@ -302,15 +321,16 @@ pub(crate) fn stop(
             if let Some(sig) = t.resume.take() {
                 break Some(sig);
             }
-            // 跟踪者没有取走这次停住就退出了：要投递的信号照常投递（[`detach`]）
+            // The tracer exited without taking this stop: the signal to be delivered is delivered
+            // as usual ([`detach`])
             if t.tracer.is_none() {
                 break Some(match t.stop {
                     Some(Stop::Signal(sig)) => sig.number(),
                     _ => 0,
                 });
             }
-            // PTRACE_LISTEN 之后 group-stop 结束了（SIGCONT），或者来了 PTRACE_INTERRUPT：
-            // 重新报告一次 PTRACE_EVENT_STOP
+            // After PTRACE_LISTEN the group-stop ended (SIGCONT), or a PTRACE_INTERRUPT arrived:
+            // report PTRACE_EVENT_STOP once more
             if t.listening && (t.trap || !group_stopped) {
                 let sig = match t.stop {
                     Some(Stop::Event(_, sig)) if group_stopped => sig,
@@ -341,7 +361,7 @@ pub(crate) fn stop(
     if let Some(regs) = regs {
         regs.restore(cpu.state_mut());
     }
-    // 跟踪者改了硬件断点、观察点（PTRACE_SETREGSET）
+    // The tracer changed hardware breakpoints or watchpoints (PTRACE_SETREGSET)
     let hw = {
         let mut t = cx.task.trace.borrow_mut();
         std::mem::take(&mut t.hw_changed).then_some(t.hw)
@@ -352,7 +372,8 @@ pub(crate) fn stop(
     resumed
 }
 
-/// execve：与 Linux 的 `flush_ptrace_hw_breakpoint` 一样清掉硬件断点和观察点。
+/// execve: clears hardware breakpoints and watchpoints, as Linux's `flush_ptrace_hw_breakpoint`
+/// does.
 pub(crate) fn exec_hw_flush(cx: &Cx<'_>, cpu: &mut Cpu) {
     let mut t = cx.task.trace.borrow_mut();
     if t.hw != HwDebug::default() {
@@ -362,8 +383,8 @@ pub(crate) fn exec_hw_flush(cx: &Cx<'_>, cpu: &mut Cpu) {
     }
 }
 
-/// 通知跟踪者线程停住了：叫醒它的 wait；它没有忽略 SIGCHLD、也没有设 SA_NOCLDSTOP 时
-/// 发 SIGCHLD（`CLD_TRAPPED`，group-stop 是 `CLD_STOPPED`）。
+/// Notifies the tracer that the thread stopped: wakes its wait, and sends SIGCHLD (`CLD_TRAPPED`,
+/// or `CLD_STOPPED` for a group-stop) unless it ignores SIGCHLD or has set SA_NOCLDSTOP.
 fn notify(k: &Kernel, task: &Task) {
     let (tracer, why, exit_code) = {
         let t = task.trace.borrow();
@@ -394,8 +415,9 @@ fn notify(k: &Kernel, task: &Task) {
     signal::send_to_group(k, tracer, Signal::CHLD, info);
 }
 
-/// 投递信号 `sig` 之前（信号投递停止）。返回跟踪者让投递的信号和它的 siginfo，跟踪者
-/// 不让投递时返回 `Ok(None)`，线程被结束时返回 `Err(())`。
+/// Before signal `sig` is delivered (signal-delivery stop). Returns the signal the tracer lets
+/// through and its siginfo, `Ok(None)` when the tracer suppresses delivery, and `Err(())` when the
+/// thread is killed.
 pub(crate) fn signal_stop(
     cx: &mut Cx<'_>,
     cpu: &mut Cpu,
@@ -410,25 +432,25 @@ pub(crate) fn signal_stop(
     let Some(new) = Signal::new(data) else {
         return Ok(None);
     };
-    // PTRACE_SETSIGINFO 改过的 siginfo（Linux 的 ptrace_signal）
+    // The siginfo as changed by PTRACE_SETSIGINFO (Linux's ptrace_signal)
     let now = cx.task.trace.borrow_mut().siginfo.take().unwrap_or(raw);
     let signo = i32::from_le_bytes(now[..4].try_into().unwrap());
     let info = if new.number() != signo {
-        // 换了信号又没有给 siginfo：当作跟踪者用 kill 发的
+        // The signal was replaced without a siginfo: treat it as sent by the tracer with kill
         let tracer = cx.task.trace.borrow().tracer.unwrap_or(0);
         let uid = cx
             .kr()
             .groups
             .get(&tracer)
             .map_or(0, |g| g.borrow().cred.ruid);
-        // Linux 的 ptrace_signal：跟踪者的真实用户 ID 在被跟踪者的命名空间里的值
+        // Linux's ptrace_signal: the tracer's real user ID as seen in the tracee's namespace
         SigInfo::kill(code::SI_USER, cx.pid_out(tracer), cx.cred().uid_out(uid))
     } else if now == raw {
         info
     } else {
         SigInfo::from_raw(&now)
     };
-    // 换成的信号被屏蔽着：重新挂起，解除屏蔽之后再投递
+    // The replacement signal is blocked: queue it again, to be delivered once unblocked
     if cx.task.sigmask.get() & new.bit() != 0 {
         signal::send_to_task(cx.kr(), cx.task, new, info);
         return Ok(None);
@@ -436,8 +458,9 @@ pub(crate) fn signal_stop(
     Ok(Some((new, info)))
 }
 
-/// 参加 group-stop（线程组被停止信号停住了）：停在 ptrace-stop 里报告给跟踪者。没有
-/// 要参加的 group-stop 时什么也不做。线程被结束时返回 false。
+/// Joins a group-stop (the thread group was stopped by a stop signal): stops in a ptrace-stop and
+/// reports to the tracer. Does nothing when there is no group-stop to join. Returns false when
+/// the thread is killed.
 pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     let (sig, seized) = {
         let mut t = cx.task.trace.borrow_mut();
@@ -461,8 +484,9 @@ pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     stop(cx, cpu, why, info, 0).is_some()
 }
 
-/// PTRACE_INTERRUPT、SEIZE 跟进来的新线程：停一次 `PTRACE_EVENT_STOP`。没有要停的时
-/// 什么也不做。线程被结束时返回 false。
+/// PTRACE_INTERRUPT, or a new thread auto-attached under SEIZE: stops once at
+/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due. Returns false when the thread is
+/// killed.
 pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     {
         let mut t = cx.task.trace.borrow_mut();
@@ -481,9 +505,10 @@ pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
 }
 
-/// 单步时信号的处理函数刚设置好（还没执行第一条指令）：与 Linux 的 `ptrace_notify(SIGTRAP)`
-/// 一样停一次，跟踪者看到的 siginfo 是 SIGTRAP、`si_code` 也是 SIGTRAP、发送者是线程
-/// 自己。停住时的信号不投递。线程被结束时返回 false。
+/// While single-stepping, a signal handler has just been set up (its first instruction not yet
+/// executed): stops once, as Linux's `ptrace_notify(SIGTRAP)` does; the tracer sees a siginfo of
+/// SIGTRAP whose `si_code` is also SIGTRAP and whose sender is the thread itself. The signal of
+/// this stop is not delivered. Returns false when the thread is killed.
 pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     if !traced(cx.task) {
         return true;
@@ -498,16 +523,18 @@ pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     stop(cx, cpu, Stop::Event(0, sig), Some(info), 0).is_some()
 }
 
-/// PTRACE_SINGLESTEP 让线程执行完了一条指令（不是 svc）：与 arm64 Linux 的单步异常一样
-/// 投递 SIGTRAP（`TRAP_TRACE`，地址是下一条指令），停在信号投递停止里报告给跟踪者。
+/// PTRACE_SINGLESTEP made the thread execute one instruction (not an svc): as with arm64 Linux's
+/// single-step exception, delivers SIGTRAP (`TRAP_TRACE`, with the address of the next
+/// instruction) and reports to the tracer in a signal-delivery stop.
 pub(crate) fn step_done(cx: &mut Cx<'_>, cpu: &Cpu) {
     let info = SigInfo::fault(code::TRAP_TRACE, cpu.state().pc, 0);
     signal::force(cx, Signal::TRAP, info);
 }
 
-/// 单步执行的是 svc：系统调用做完之后报告。与 arm64 Linux 一样，这次的 SIGTRAP 是
-/// `SI_USER`，没有发送者；硬件的单步状态还挂着，下一次 PTRACE_SINGLESTEP 不执行指令，
-/// 在原地再报告一次 `TRAP_TRACE`（`Task::step_again`）。
+/// The single-stepped instruction was an svc: reports after the syscall completes. As on arm64
+/// Linux, this SIGTRAP is `SI_USER` with no sender; the hardware single-step state is still
+/// pending, so the next PTRACE_SINGLESTEP executes no instruction and reports `TRAP_TRACE` again
+/// in place (`Task::step_again`).
 pub(crate) fn syscall_stepped(cx: &mut Cx<'_>) {
     if cx.task.stepping.load(Ordering::Relaxed) {
         signal::force(cx, Signal::TRAP, SigInfo::kill(code::SI_USER, 0, 0));
@@ -515,18 +542,21 @@ pub(crate) fn syscall_stepped(cx: &mut Cx<'_>) {
     }
 }
 
-/// 系统调用停住时跟踪者注入的信号：与 Linux 一样当作内核发给自己的新信号。
+/// A signal the tracer injects at a syscall stop: treated, as on Linux, as a new signal the
+/// kernel sends to the thread itself.
 fn inject(cx: &Cx<'_>, data: i32) {
     if let Some(sig) = Signal::new(data) {
         signal::send_to_task(cx.kr(), cx.task, sig, SigInfo::kernel());
     }
 }
 
-/// 系统调用（编号 `nr`）的入口。没有跟踪者，或者是 vDSO 里读时钟的存根（Linux 上它们不进
-/// 内核，跟踪者看不到）时返回 None。否则与 Linux 的 `regs->syscallno` 一样记下编号：
-/// PTRACE_SYSCALL 之外的方式继续时，中途的事件停住（`PTRACE_EVENT_FORK` 等）和之后改用
-/// PTRACE_SYSCALL 的出口停住，`NT_ARM_SYSTEM_CALL` 也读到这个系统调用的；返回
-/// PTRACE_SYSCALL 要不要在入口停下。出口停不停由 [`syscall_exit`] 按那时的状态再看。
+/// The entry of a syscall (number `nr`). Returns None when there is no tracer, or when it is a
+/// vDSO clock stub (on Linux these do not enter the kernel, so tracers do not see them).
+/// Otherwise records the number, as Linux's `regs->syscallno` does: when resumed other than by
+/// PTRACE_SYSCALL, event stops along the way (`PTRACE_EVENT_FORK` and so on), exit stops after a
+/// later switch to PTRACE_SYSCALL, and `NT_ARM_SYSTEM_CALL` also read this syscall's number;
+/// returns whether PTRACE_SYSCALL stops at the entry. Whether to stop at the exit is decided
+/// again by [`syscall_exit`] from the state at that time.
 pub(crate) fn syscall_start(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> Option<bool> {
     if !traced(cx.task) || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
         return None;
@@ -536,8 +566,9 @@ pub(crate) fn syscall_start(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> Option<bool> {
     Some(t.mode == Mode::Syscall)
 }
 
-/// PTRACE_SYSCALL 让线程继续之后，这个系统调用（编号 `nr`）要不要在入口和出口停下。vDSO
-/// 里读时钟的存根不算：Linux 上它们不进内核，跟踪者看不到。
+/// Whether this syscall (number `nr`) stops at entry and exit after PTRACE_SYSCALL resumed the
+/// thread. vDSO clock stubs do not count: on Linux they do not enter the kernel, so tracers do
+/// not see them.
 pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
     {
         let t = cx.task.trace.borrow();
@@ -548,8 +579,8 @@ pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
     !crate::vdso::clock_stub(cx, cpu.state().pc, nr)
 }
 
-/// 系统调用的停住：与 arm64 Linux 一样，停住期间 x7 是 0（入口）或 1（出口），跟踪者
-/// 看不到也改不了它原来的值。线程被结束时返回 false。
+/// A syscall stop: as on arm64 Linux, x7 is 0 (entry) or 1 (exit) during the stop, and the tracer
+/// can neither see nor change its original value. Returns false when the thread is killed.
 fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
     let options = cx.task.trace.borrow().options;
     let sig = Signal::TRAP;
@@ -582,29 +613,31 @@ fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
     }
 }
 
-/// 系统调用入口停下（编号已经由 [`syscall_start`] 记下）。返回跟踪者改过之后的编号（-1
-/// 是跳过这个系统调用）；线程被结束时返回 None。
+/// Stops at syscall entry (the number was recorded by [`syscall_start`]). Returns the number as
+/// changed by the tracer (-1 skips this syscall); None when the thread is killed.
 pub(crate) fn syscall_entry(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Option<u64> {
     syscall_stop(cx, cpu, true).then(|| cx.task.trace.borrow().syscallno as i64 as u64)
 }
 
-/// 系统调用出口停下（这时是 PTRACE_SYSCALL 让线程继续的话，与 arm64 Linux 的
-/// `syscall_trace_exit` 一样重新看，入口停没停过都一样）。线程被结束时返回 false。
+/// Stops at syscall exit (if the thread has by then been resumed with PTRACE_SYSCALL; rechecked
+/// as arm64 Linux's `syscall_trace_exit` does, whether or not it stopped at entry). Returns false
+/// when the thread is killed.
 pub(crate) fn syscall_exit(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
     let nr = cx.task.trace.borrow().syscallno as i64 as u64;
     !syscall_traced(cx, cpu, nr) || syscall_stop(cx, cpu, false)
 }
 
-/// seccomp 的过滤器返回 TRACE（数据是 `data`）：停一次 `PTRACE_EVENT_SECCOMP`，跟踪者
-/// 可以改编号（`NT_ARM_SYSTEM_CALL`，-1 是跳过）和寄存器。返回之后的编号；线程被结束时
-/// 返回 None。
+/// A seccomp filter returned TRACE (with data `data`): stops once at `PTRACE_EVENT_SECCOMP`, and
+/// the tracer may change the number (`NT_ARM_SYSTEM_CALL`, -1 skips) and the registers. Returns
+/// the resulting number; None when the thread is killed.
 pub(crate) fn seccomp_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64, data: u32) -> Option<u64> {
     cx.task.trace.borrow_mut().syscallno = nr as i32;
     event(cx, cpu, event::SECCOMP, u64::from(data))
         .then(|| cx.task.trace.borrow().syscallno as i64 as u64)
 }
 
-/// `PTRACE_EVENT_*` 停下（跟踪者打开了这个事件时）。线程被结束时返回 false。
+/// Stops at a `PTRACE_EVENT_*` (when the tracer has enabled the event). Returns false when the
+/// thread is killed.
 pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> bool {
     if !cx.task.trace.borrow().enabled(e) {
         return true;
@@ -620,7 +653,8 @@ pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> boo
     stop(cx, cpu, Stop::Event(e, sig), Some(info), message).is_some()
 }
 
-/// 线程 `tid` 在跟踪着自己的进程看来的编号（`ptrace_event_pid`），没有跟踪者时是自己看到的。
+/// The id of thread `tid` as seen by the process tracing it (`ptrace_event_pid`), or as seen by
+/// itself when there is no tracer.
 pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
     match cx.task.trace.borrow().tracer {
         Some(tracer) => cx.kr().pid_seen_by(tracer, tid),
@@ -628,8 +662,9 @@ pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
     }
 }
 
-/// execve 成功之后：`PTRACE_EVENT_EXEC`（消息是 execve 之前的 tid），没有打开这个事件、
-/// 又不是 SEIZE 跟踪的给自己发 SIGTRAP。线程被结束时返回 false。
+/// After a successful execve: `PTRACE_EVENT_EXEC` (the message is the tid before the execve); if
+/// the event is not enabled and the tracee is not under SEIZE, sends itself SIGTRAP. Returns false
+/// when the thread is killed.
 pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
     let (traced, seized, enabled) = {
         let t = cx.task.trace.borrow();
@@ -651,9 +686,10 @@ pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
     true
 }
 
-/// 线程要退出了（exit、exit_group、致命信号的默认动作）：`PTRACE_EVENT_EXIT`，消息是
-/// wait 的状态字。exit_group 已经要求所有线程退出，包括自己；调用者自己仍然停下来报告，
-/// 停住期间被 SIGKILL 结束时不再等。
+/// The thread is about to exit (exit, exit_group, a fatal signal's default action):
+/// `PTRACE_EVENT_EXIT`, with the wait status word as the message. exit_group has already asked
+/// every thread to exit, including the caller; the caller still stops and reports, and stops
+/// waiting if killed by SIGKILL during the stop.
 pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
     cx.task.begin_exit(cx.kr(), &cx.t.group, status);
     if !cx.task.trace.borrow().enabled(event::EXIT) {
@@ -665,10 +701,11 @@ pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
     }
 }
 
-/// clone 出来的线程 `child`（`flags`、`exit_signal` 是 clone 的参数）要不要被跟踪：父
-/// 线程被跟踪、打开了对应的事件（或者用了 `CLONE_PTRACE`）、没有 `CLONE_UNTRACED` 时，
-/// 新线程由同一个跟踪者跟踪，执行第一条指令之前先停下来（不是 SEIZE 的挂一个 SIGSTOP）。
-/// 返回父线程要报告的事件。
+/// Whether a thread `child` created by clone (`flags` and `exit_signal` are clone's arguments) is
+/// traced: when the parent thread is traced, the matching event is enabled (or `CLONE_PTRACE` was
+/// used) and there is no `CLONE_UNTRACED`, the new thread is traced by the same tracer and stops
+/// before executing its first instruction (with a pending SIGSTOP when not under SEIZE). Returns
+/// the event the parent thread reports.
 pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -> Option<u32> {
     const CLONE_VFORK: u64 = 0x4000;
     const CLONE_PTRACE: u64 = 0x2000;
@@ -701,17 +738,19 @@ pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -
             child.pending.borrow_mut().add(Signal::STOP, stop, false);
         }
     }
-    // SAFETY: 新线程的 Cpu 还在，调用方持有 BKL
+    // SAFETY: the new thread's Cpu still exists, and the caller holds the BKL
     unsafe { child.sync.kicker.kick() };
     report
 }
 
-/// 跟踪者不再跟踪 `task`（PTRACE_DETACH、跟踪者退出）：停着的让它继续，写回跟踪者改过的
-/// 寄存器。`sig` 是 PTRACE_DETACH 要投递的信号；跟踪者退出时是 None：这次停住已经被 wait
-/// 取走的，信号投递停止里的信号丢掉（Linux 的 `wait_task_stopped` 取走时把 `exit_code`
-/// 清成 0，ptrace(2) 说的照常投递只在还没取走时成立），没取走的照常投递（[`stop`]）。
-/// delve attach 之后不 detach 就退出，原来进程被 attach 的 SIGSTOP 停住。线程组被停住时
-/// 它回到 group-stop 里。
+/// The tracer stops tracing `task` (PTRACE_DETACH, tracer exit): a stopped thread is resumed, and
+/// the registers the tracer changed are written back. `sig` is the signal PTRACE_DETACH delivers;
+/// it is None when the tracer exited: if this stop has already been taken by wait, the signal of a
+/// signal-delivery stop is dropped (Linux's `wait_task_stopped` clears `exit_code` to 0 when
+/// taking it; the delivery as usual that ptrace(2) describes holds only while it is not yet
+/// taken); if not taken, it is delivered as usual ([`stop`]). When delve exits after attaching
+/// without detaching, the process stays stopped by the attach's SIGSTOP. When the thread group is
+/// stopped, the thread returns to the group-stop.
 pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     {
         let mut t = task.trace.borrow_mut();
@@ -728,7 +767,8 @@ pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     signal::wake(task);
 }
 
-/// 跟踪者 `tgid` 退出了：设了 `PTRACE_O_EXITKILL` 的被跟踪线程被结束，其余的不再被跟踪。
+/// Tracer `tgid` has exited: tracees that set `PTRACE_O_EXITKILL` are killed, the rest are no
+/// longer traced.
 pub(crate) fn tracer_exited(k: &mut Kernel, tgid: Tid) {
     let tracees: Vec<_> = k
         .tasks
@@ -742,7 +782,8 @@ pub(crate) fn tracer_exited(k: &mut Kernel, tgid: Tid) {
         }
         detach(&task, None);
     }
-    // 还没取走的结束：被跟踪的进程交给父进程（Linux 的 `__ptrace_detach`）
+    // Ends not yet taken: the traced processes are handed to their parents (Linux's
+    // `__ptrace_detach`)
     let (gone, kept) = std::mem::take(&mut k.trace_exits)
         .into_iter()
         .partition(|e| e.tracer == tgid);
@@ -758,24 +799,27 @@ pub(crate) fn tracer_exited(k: &mut Kernel, tgid: Tid) {
     }
 }
 
-/// 被跟踪的线程退出了，等跟踪者 wait 取走（[`Kernel::trace_exits`]）。
+/// A traced thread has exited, waiting for the tracer's wait to take it ([`Kernel::trace_exits`]).
 pub(crate) struct TraceExit {
     pub tracer: Tid,
     pub pid: Tid,
-    /// 跟踪者看到的 pid（报告时算好：wait 取走时线程的编号可能已经不在了）。
+    /// The pid as the tracer sees it (computed when reported: by the time wait takes it, the
+    /// thread's id may no longer exist).
     pub seen: Tid,
-    /// 退出时所在的进程组（wait 按进程组等）。
+    /// The process group at exit (wait can wait by process group).
     pub pgid: Tid,
     pub status: ExitStatus,
-    /// 是整个进程的结束：跟踪者取走之后进程才交给父进程（[`group_finished`]）。
+    /// The end of the whole process: the process goes to the parent only after the tracer takes
+    /// it ([`group_finished`]).
     pub process: bool,
-    /// 退出时的凭据：SIGCHLD 和 waitid 的 si_uid 是它的真实用户 ID。
+    /// The credentials at exit: the si_uid of SIGCHLD and waitid is their real user ID.
     pub cred: crate::cred::Cred,
 }
 
-/// 被跟踪的线程 `task` 退出了（已经从 `kernel.tasks` 里拿掉）：不是主线程的单独报告给
-/// 跟踪者；主线程记下跟踪者，等整个进程结束时再报告（[`group_finished`]）。`status` 是
-/// 线程自己结束的方式。
+/// Traced thread `task` has exited (already removed from `kernel.tasks`): a thread that is not the
+/// main thread is reported to the tracer on its own; the main thread records the tracer and is
+/// reported when the whole process ends ([`group_finished`]). `status` is how the thread itself
+/// ended.
 pub(crate) fn tracee_exited(
     k: &mut Kernel,
     task: &Task,
@@ -803,9 +847,10 @@ pub(crate) fn tracee_exited(
     report_exit(k, exit);
 }
 
-/// 进程 `group` 结束了：主线程被父进程以外的进程跟踪着时，与 Linux 一样先只报告给跟踪者
-/// （发 SIGCHLD），它在 wait 里取走之后（[`released`]）或者自己退出时，才交给父进程。
-/// 这样推迟了时返回 true。父进程本身就是跟踪者时由普通的 wait 报告。
+/// Process `group` has ended: when its main thread is traced by a process other than its parent,
+/// as on Linux it is first reported only to the tracer (with SIGCHLD), and handed to the parent
+/// only after the tracer takes it in wait ([`released`]) or exits itself. Returns true when
+/// deferred this way. When the parent itself is the tracer, the ordinary wait reports it.
 pub(crate) fn group_finished(
     k: &mut Kernel,
     group: &Rc<RefCell<ThreadGroup>>,
@@ -835,7 +880,8 @@ pub(crate) fn group_finished(
     true
 }
 
-/// 跟踪者取走了被跟踪的线程的结束 `e`（或者没取走就退出了）：整个进程的结束交给父进程。
+/// The tracer has taken the end `e` of a traced thread (or exited without taking it): the end of
+/// the whole process is handed to the parent.
 pub(crate) fn released(k: &mut Kernel, e: &TraceExit) {
     if !e.process {
         return;
@@ -871,7 +917,8 @@ mod tests {
     #[test]
     fn hw_debug_ranges_come_from_the_byte_selects() {
         let mut hw = HwDebug::default();
-        // 8 字节对齐的地址，BAS 选第 4–7 个字节，读写都算；停用的和超出槽数的不算
+        // An 8-byte-aligned address, BAS selecting bytes 4–7, both reads and writes; disabled
+        // ones and ones beyond the slot count do not count
         hw.watch[0] = (0x1000, 0xf0 << 5 | 3 << 3 | 4 | 1);
         hw.watch[1] = (0x2000, 0x01 << 5 | 2 << 3 | 4);
         hw.watch[WATCH_SLOTS] = (0x3000, 0x01 << 5 | 2 << 3 | 4 | 1);
