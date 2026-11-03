@@ -915,7 +915,8 @@ impl<'a> View<'a> {
     }
 
     /// Nanoseconds since boot `ns` plus the boottime offset of the reader's time namespace
-    /// (Linux's `timens_add_boottime_ns`: `/proc/uptime`, process start times), no less than 0.
+    /// (Linux's `timens_add_boottime_ns`: `/proc/uptime`, process start times; `/proc/stat`'s
+    /// `btime` subtracts it), no less than 0.
     fn with_boot_offset(&self, ns: u64) -> u64 {
         let offset = self
             .k
@@ -3022,8 +3023,13 @@ fn global_stat(ps: &View<'_>) -> String {
             .values()
             .filter(|t| t.sync.in_guest.load(std::sync::atomic::Ordering::Relaxed))
             .count();
-    let (now, _) = appine_hal::clock_gettime(0).unwrap_or((0, 0));
-    let btime = now as u64 - uptime_ns() / 1_000_000_000;
+    // Linux's getboottime64 (realtime minus boottime, subtracted in nanoseconds) moved back by the
+    // reader's time-namespace boottime offset (timens_sub_boottime), so btime plus a start time
+    // from /proc/<pid>/stat is the wall-clock start in any namespace (ps -o lstart). Truncating
+    // both clocks to seconds before subtracting made btime alternate between two seconds.
+    let now =
+        appine_hal::clock_gettime(0).map_or(0, |(s, ns)| s as i128 * 1_000_000_000 + ns as i128);
+    let btime = ((now - ps.with_boot_offset(uptime_ns()) as i128) / 1_000_000_000).max(0);
     let mut s = String::new();
     writeln!(s, "cpu  {user} 0 {system} {idle} 0 0 0 0 0 0").unwrap();
     for i in 0..n {

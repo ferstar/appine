@@ -2,7 +2,7 @@
 # not exceed 128 KB): raw ICMP sockets, PR_SET_CHILD_SUBREAPER, positional writes on O_APPEND
 # files, readlink with an empty path, O_LARGEFILE in F_GETFL, /proc/<pid>/task/<tid>/children,
 # PR_SET_PDEATHSIG and __WNOTHREAD, short symlinks, /proc/<pid>/exe pointing at the program file
-# itself, DIT across signals, fork, execve and ptrace
+# itself, DIT across signals, fork, execve and ptrace, a fixed btime in /proc/stat
 set -e
 cd /tmp
 # raw ICMP sockets (appine emulates them with ping sockets on the host): data received on IPv4
@@ -1495,3 +1495,52 @@ int main(int argc, char **argv)
 }
 C
 gcc -O1 -march=armv8.4-a -pthread -o ditstate ditstate.c && ./ditstate
+
+# /proc/stat's btime is fixed while the clock is not set (Linux: realtime minus boottime in
+# nanoseconds, then whole seconds), so ps -o lstart (btime plus the start time in
+# /proc/<pid>/stat) does not change between reads; reads over more than a second sweep the
+# fraction of the uptime, which made appine's value alternate between two seconds
+cat > btime.c <<'C'
+#include <stdio.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static unsigned long long btime(void)
+{
+    char line[256];
+    unsigned long long b = 0;
+    FILE *f = fopen("/proc/stat", "r");
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "btime %llu", &b) == 1)
+            break;
+    fclose(f);
+    return b;
+}
+
+int main(void)
+{
+    unsigned long long first = btime(), start = 0;
+    int changed = 0;
+    for (int i = 0; i < 60; i++) {
+        changed += btime() != first;
+        usleep(20000);
+    }
+    printf("btime changed in %d of 60 reads\n", changed);
+    fflush(stdout);
+    // A new child, whose start time is now (the shell may exec this program as its last command)
+    if (fork() == 0) {
+        time_t started = time(NULL);
+        FILE *f = fopen("/proc/self/stat", "r");
+        fscanf(f, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &start);
+        fclose(f);
+        long long lstart = btime() + start / sysconf(_SC_CLK_TCK);
+        printf("btime + start time near the real start: %d\n", started - lstart >= 0 && started - lstart <= 2);
+        fflush(stdout);
+        _exit(0);
+    }
+    wait(NULL);
+    return 0;
+}
+C
+gcc -O1 -o btime btime.c && ./btime

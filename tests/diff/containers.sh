@@ -574,10 +574,10 @@ gcc -D_GNU_SOURCE -o fdexec fdexec.c && ./fdexec
 # unshare(CLONE_NEWTIME) creates only the one for children, with the offsets copied and set
 # through /proc/<pid>/timens_offsets, which can no longer be changed once a forked child has
 # entered it; the monotonic clock, boottime, /proc/uptime, sysinfo and start times the child sees
-# all include the offset, and waits for absolute times are converted by the offset; setns into
-# it; threads and vfork stay in the original one and enter the new one after execve (since Linux
-# 6.2). Only whether things differ by the offset and whether they are the same namespace is
-# compared, not the exact times
+# all include the offset (/proc/stat's btime moves back by it), and waits for absolute times are
+# converted by the offset; setns into it; threads and vfork stay in the original one and enter the
+# new one after execve (since Linux 6.2). Only whether things differ by the offset and whether
+# they are the same namespace is compared, not the exact times
 cat > timens.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
@@ -613,6 +613,18 @@ static double uptime(void)
     fscanf(f, "%lf", &u);
     fclose(f);
     return u;
+}
+
+static unsigned long long btime(void)
+{
+    char line[256];
+    unsigned long long b = 0;
+    FILE *f = fopen("/proc/stat", "r");
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "btime %llu", &b) == 1)
+            break;
+    fclose(f);
+    return b;
 }
 
 static ino_t ns_ino(const char *path)
@@ -689,6 +701,7 @@ int main(int argc, char **argv)
     waitpid(c, NULL, 0);
 
     double m0 = now(CLOCK_MONOTONIC), b0 = now(CLOCK_BOOTTIME), r0 = now(CLOCK_REALTIME), u0 = uptime();
+    unsigned long long bt0 = btime();
     struct sysinfo si0;
     sysinfo(&si0);
     int ready[2];
@@ -711,6 +724,12 @@ int main(int argc, char **argv)
         fscanf(f, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &start);
         fclose(f);
         printf("start time near uptime: %d\n", near(start / (double)sysconf(_SC_CLK_TCK), uptime()));
+        // btime moves back by the offset (whole seconds of boot time minus 3600.5), so btime plus
+        // the start time is still the wall-clock start (ps -o lstart)
+        unsigned long long bt = btime();
+        printf("btime -3600.5: %d\n", bt0 - bt == 3600 || bt0 - bt == 3601);
+        double lag = now(CLOCK_REALTIME) - (double)(bt + start / sysconf(_SC_CLK_TCK));
+        printf("btime + start time near realtime: %d\n", lag > -1 && lag < 3);
         // Waits for absolute times are converted by the offset, and do not wait an extra day
         struct timespec t;
         clock_gettime(CLOCK_MONOTONIC, &t);
