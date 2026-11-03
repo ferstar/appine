@@ -1,9 +1,10 @@
-//! 宿主抽象层（设计文档 §3）：把宿主系统的差异挡在内核层之外。
+//! Host abstraction layer (design doc §3): keeps host system differences out of the kernel layer.
 //!
-//! 生产宿主是 Android（bionic），开发宿主是 Linux（glibc），两者都是 Linux
-//! 内核，所以这里只有一套实现。返回给内核层的错误码是宿主的 errno，在 Linux
-//! 宿主上与 guest 的编号一致，可以原样交给 guest。其他宿主（比如 macOS）
-//! 只保证能编译，不在支持范围内（设计文档 §13.3）。
+//! The production host is Android (bionic) and the development host is Linux (glibc); both run
+//! the Linux kernel, so there is only one implementation here. The error codes returned to the
+//! kernel layer are host errnos, which on Linux hosts match the guest's numbering and can be
+//! passed to the guest unchanged. Other hosts (macOS, for example) are only guaranteed to
+//! compile and are not supported (design doc §13.3).
 
 pub mod net;
 
@@ -11,8 +12,9 @@ use std::io;
 use std::ptr::NonNull;
 use std::time::Duration;
 
-/// 申请 `len` 字节、清零、可读写的匿名宿主内存。`reserve` 为 false 时不计入宿主的
-/// 内存提交量（`MAP_NORESERVE`），超量使用时在访问时失败，而不是现在失败。
+/// Allocates `len` bytes of zeroed, readable and writable anonymous host memory. With `reserve`
+/// false it is not counted in the host's memory commit (`MAP_NORESERVE`), so overcommitting fails
+/// on access rather than now.
 pub fn map_anonymous(len: usize, reserve: bool) -> Result<NonNull<u8>, i32> {
     let noreserve = if reserve { 0 } else { libc::MAP_NORESERVE };
     let ptr = unsafe {
@@ -31,7 +33,8 @@ pub fn map_anonymous(len: usize, reserve: bool) -> Result<NonNull<u8>, i32> {
     Ok(NonNull::new(ptr.cast()).expect("mmap returned NULL"))
 }
 
-/// 申请 `len` 字节不能访问（`PROT_NONE`）的宿主地址空间：访问它时宿主收到 SIGSEGV。
+/// Allocates `len` bytes of inaccessible (`PROT_NONE`) host address space: accessing it raises
+/// SIGSEGV on the host.
 pub fn map_inaccessible(len: usize) -> Result<NonNull<u8>, i32> {
     let ptr = unsafe {
         libc::mmap(
@@ -49,21 +52,23 @@ pub fn map_inaccessible(len: usize) -> Result<NonNull<u8>, i32> {
     Ok(NonNull::new(ptr.cast()).expect("mmap returned NULL"))
 }
 
-/// 释放 [`map_anonymous`] 申请的内存。
+/// Releases memory allocated by [`map_anonymous`].
 ///
 /// # Safety
 ///
-/// `ptr` 和 `len` 必须与某次 [`map_anonymous`] 的返回值和参数一致，并且之后
-/// 不再访问这段内存。
+/// `ptr` and `len` must match the return value and argument of some [`map_anonymous`] call, and
+/// the memory must not be accessed afterwards.
 pub unsafe fn unmap(ptr: NonNull<u8>, len: usize) {
     unsafe { libc::munmap(ptr.as_ptr().cast(), len) };
 }
 
-/// 丢弃一段私有匿名内存的内容（`MADV_DONTNEED`）：宿主回收这些页，之后读到的是零。
+/// Discards the contents of a piece of private anonymous memory (`MADV_DONTNEED`): the host
+/// reclaims the pages, and later reads return zeros.
 ///
 /// # Safety
 ///
-/// `ptr` 和 `len` 按宿主页对齐，落在 [`map_anonymous`] 申请、还没有释放的内存里。
+/// `ptr` and `len` are aligned to host pages and lie within memory allocated by
+/// [`map_anonymous`] and not yet released.
 pub unsafe fn discard(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
     if unsafe { libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_DONTNEED) } != 0 {
         return Err(last_errno());
@@ -71,7 +76,7 @@ pub unsafe fn discard(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// 向宿主 fd 写入，遇到 `EINTR` 自动重试。
+/// Writes to a host fd, retrying automatically on `EINTR`.
 pub fn write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
     loop {
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
@@ -85,7 +90,7 @@ pub fn write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
     }
 }
 
-/// 在宿主 fd 的 `offset` 处写入（pwrite），遇到 `EINTR` 自动重试。
+/// Writes at `offset` of a host fd (pwrite), retrying automatically on `EINTR`.
 pub fn pwrite(fd: i32, buf: &[u8], offset: u64) -> Result<usize, i32> {
     loop {
         let n = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset as libc::off_t) };
@@ -99,10 +104,12 @@ pub fn pwrite(fd: i32, buf: &[u8], offset: u64) -> Result<usize, i32> {
     }
 }
 
-/// 把宿主文件 `fd_in` 从 `off_in` 开始的最多 `len` 字节拷到 `fd_out` 的 `off_out` 处，
-/// 数据不经过用户态，返回拷贝的字节数。用 sendfile：Android 14 之前 App 的 seccomp 不允许
-/// copy_file_range（会收到 SIGSYS）。sendfile 写在输出 fd 的位置上，所以先把它移到
-/// `off_out`，调用方要保证这期间没有别人用这个 fd 的位置。遇到 `EINTR` 自动重试。
+/// Copies up to `len` bytes of host file `fd_in` starting at `off_in` to `off_out` of `fd_out`
+/// without the data passing through user space, and returns the number of bytes copied. Uses
+/// sendfile: before Android 14 the app's seccomp does not allow copy_file_range (it gets
+/// SIGSYS). sendfile writes at the output fd's position, so that is moved to `off_out` first, and
+/// the caller must ensure nobody else uses this fd's position meanwhile. Retries automatically on
+/// `EINTR`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn copy_file(
     fd_in: i32,
@@ -127,8 +134,8 @@ pub fn copy_file(
     }
 }
 
-/// 把宿主文件 `fd` 写到盘上：`data_only` 时是 fdatasync（数据和读出数据要的元数据，比如
-/// 长度），否则是 fsync。
+/// Writes host file `fd` to disk: fdatasync with `data_only` (the data and the metadata needed to
+/// read it back, such as the length), otherwise fsync.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fsync(fd: i32, data_only: bool) -> Result<(), i32> {
     let r = unsafe {
@@ -144,13 +151,15 @@ pub fn fsync(fd: i32, data_only: bool) -> Result<(), i32> {
     Ok(())
 }
 
-/// [`sync_file_range`] 的标志：开始写回（不等）。libc crate 的 Android 部分没有这个常量。
+/// Flag for [`sync_file_range`]: start writeback (without waiting). The Android part of the libc
+/// crate lacks this constant.
 pub const SYNC_FILE_RANGE_WRITE: u32 = 2;
 
-/// sync_file_range(2)：开始写回、等待宿主文件 `fd` 里一段的脏页（`flags` 是
-/// `SYNC_FILE_RANGE_WAIT_BEFORE`、`WRITE`、`WAIT_AFTER` 的组合），不刷元数据和磁盘缓存。
-/// libc crate 的 Android 部分没有它的绑定（bionic 有），直接按编号调用；arm64 上参数就是
-/// 这个顺序（不是 sync_file_range2）。
+/// sync_file_range(2): starts writeback of, and waits for, the dirty pages in a range of host file
+/// `fd` (`flags` is a combination of `SYNC_FILE_RANGE_WAIT_BEFORE`, `WRITE` and `WAIT_AFTER`),
+/// without flushing metadata or the disk cache. The Android part of the libc crate has no binding
+/// for it (bionic does), so it is called by number; on arm64 the arguments are in this order (it
+/// is not sync_file_range2).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn sync_file_range(fd: i32, offset: i64, len: i64, flags: u32) -> Result<(), i32> {
     if unsafe { libc::syscall(libc::SYS_sync_file_range, fd, offset, len, flags) } < 0 {
@@ -159,7 +168,7 @@ pub fn sync_file_range(fd: i32, offset: i64, len: i64, flags: u32) -> Result<(),
     Ok(())
 }
 
-/// 把宿主 fd `fd` 所在的整个文件系统写到盘上（syncfs）。
+/// Writes the whole filesystem holding host fd `fd` to disk (syncfs).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn syncfs(fd: i32) -> Result<(), i32> {
     if unsafe { libc::syncfs(fd) } < 0 {
@@ -168,8 +177,9 @@ pub fn syncfs(fd: i32) -> Result<(), i32> {
     Ok(())
 }
 
-/// msync(2) 的 `MS_SYNC`：把宿主上 `[addr, addr + len)` 的共享文件映射里改过的页写回文件，
-/// 等写完。`addr` 要按宿主的页对齐。
+/// msync(2) with `MS_SYNC`: writes the modified pages of the shared file mappings in
+/// `[addr, addr + len)` on the host back to their files and waits for completion. `addr` must be
+/// aligned to the host page.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn msync(addr: usize, len: usize) -> Result<(), i32> {
     if unsafe { libc::msync(addr as *mut libc::c_void, len, libc::MS_SYNC) } < 0 {
@@ -178,7 +188,7 @@ pub fn msync(addr: usize, len: usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// 从宿主 fd 的 `offset` 处读取（pread），遇到 `EINTR` 自动重试。
+/// Reads at `offset` of a host fd (pread), retrying automatically on `EINTR`.
 pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, i32> {
     loop {
         let n = unsafe {
@@ -205,24 +215,25 @@ fn last_errno() -> i32 {
         .unwrap_or(libc::EIO)
 }
 
-/// 宿主页大小。
+/// Host page size.
 pub fn page_size() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
-/// 一段宿主文件映射：`ptr` 指向请求的文件偏移处，`base`/`len` 是实际映射的范围，
-/// 释放时传给 [`unmap`]。
+/// A host file mapping: `ptr` points at the requested file offset, and `base`/`len` are the range
+/// actually mapped, passed to [`unmap`] on release.
 pub struct FileMapping {
-    /// 请求的文件偏移在宿主内存中的位置。
+    /// Where the requested file offset is in host memory.
     pub ptr: NonNull<u8>,
-    /// 实际映射的起点（按宿主页对齐）。
+    /// Start of the actual mapping (aligned to the host page).
     pub base: NonNull<u8>,
-    /// 实际映射的长度。
+    /// Length of the actual mapping.
     pub len: usize,
 }
 
-/// 映射宿主文件 `fd` 的 `[offset, offset + len)`。宿主页可能比 guest 的 4K 页大，
-/// 所以起点向下对齐到宿主页。`shared` 为 false 时是写时复制的私有映射。
+/// Maps `[offset, offset + len)` of host file `fd`. Host pages may be larger than the guest's 4K
+/// pages, so the start is aligned down to a host page. With `shared` false it is a copy-on-write
+/// private mapping.
 pub fn map_file(
     fd: i32,
     offset: u64,
@@ -243,7 +254,8 @@ pub fn map_file(
     map_file_with(fd, offset, len, prot, flags)
 }
 
-/// 只读的私有映射：好几个地址空间共用、谁也不能写的（[`map_file`]）。
+/// A read-only private mapping: shared by several address spaces and writable by none
+/// ([`map_file`]).
 pub fn map_file_read_only(fd: i32, offset: u64, len: usize) -> Result<FileMapping, i32> {
     map_file_with(fd, offset, len, libc::PROT_READ, libc::MAP_PRIVATE)
 }
@@ -280,7 +292,7 @@ fn map_file_with(
     })
 }
 
-/// 用宿主的随机源填满 `buf`。
+/// Fills `buf` from the host's random source.
 pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")
@@ -288,9 +300,9 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
         .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
-/// flock(2)：`exclusive` 时取排他锁，否则取共享锁；`wait` 为 false 时拿不到就立即返回
-/// `EWOULDBLOCK`。同一个 fd 上已有的锁会被转换。（标准库的 `File::lock` 在 Android 上
-/// 没有实现。）
+/// flock(2): takes an exclusive lock with `exclusive`, otherwise a shared one; with `wait` false
+/// it returns `EWOULDBLOCK` at once when the lock is unavailable. An existing lock on the same fd
+/// is converted. (The standard library's `File::lock` is not implemented on Android.)
 pub fn flock(fd: i32, exclusive: bool, wait: bool) -> Result<(), i32> {
     let mut op = if exclusive {
         libc::LOCK_EX
@@ -311,7 +323,7 @@ pub fn flock(fd: i32, exclusive: bool, wait: bool) -> Result<(), i32> {
     }
 }
 
-/// 读取宿主 fd 的元数据。
+/// Reads a host fd's metadata.
 pub fn fstat(fd: i32) -> Result<libc::stat, i32> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } < 0 {
@@ -320,7 +332,7 @@ pub fn fstat(fd: i32) -> Result<libc::stat, i32> {
     Ok(st)
 }
 
-/// 打开一个宿主目录，只用来作 [`stat_at`] 的起点（`O_PATH`）。
+/// Opens a host directory used only as the starting point for [`stat_at`] (`O_PATH`).
 pub fn open_dir(path: &std::path::Path) -> Result<std::os::fd::OwnedFd, i32> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -337,8 +349,8 @@ pub fn open_dir(path: &std::path::Path) -> Result<std::os::fd::OwnedFd, i32> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-/// 打开目录 `dir` 里名为 `name` 的文件（openat，总是带 `O_CLOEXEC`），新建时权限是
-/// `mode`（再去掉 umask）。
+/// Opens the file named `name` in directory `dir` (openat, always with `O_CLOEXEC`); a new file
+/// gets permissions `mode` (minus the umask).
 pub fn open_at(
     dir: i32,
     name: &std::ffi::CStr,
@@ -360,7 +372,7 @@ pub fn open_at(
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// utimensat 的时间参数：(秒, 纳秒)，None 表示不改。
+/// The time argument of utimensat: (seconds, nanoseconds), None meaning unchanged.
 fn utime_spec(atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> [libc::timespec; 2] {
     let ts = |t: Option<(i64, i64)>| match t {
         Some((sec, nsec)) => libc::timespec {
@@ -375,11 +387,13 @@ fn utime_spec(atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> [libc::ti
     [ts(atime), ts(mtime)]
 }
 
-/// [`set_times_at`]、[`set_times_fd`] 的时间取这个值时，由宿主取现在的时间（UTIME_NOW）。
+/// When a time for [`set_times_at`] or [`set_times_fd`] takes this value, the host uses the
+/// current time (UTIME_NOW).
 pub const TIME_NOW: (i64, i64) = (0, libc::UTIME_NOW);
 
-/// 设置目录 `dir` 里名为 `name` 的文件的访问时间和修改时间（utimensat，跟随符号链接），
-/// 时间是 (秒, 纳秒)，None 表示不改，[`TIME_NOW`] 表示现在。
+/// Sets the access and modification times of the file named `name` in directory `dir`
+/// (utimensat, following symlinks); times are (seconds, nanoseconds), None meaning unchanged and
+/// [`TIME_NOW`] meaning now.
 pub fn set_times_at(
     dir: i32,
     name: &std::ffi::CStr,
@@ -393,7 +407,8 @@ pub fn set_times_at(
     Ok(())
 }
 
-/// 设置打开的文件 `fd` 的访问时间和修改时间（futimens），参数与 [`set_times_at`] 相同。
+/// Sets the access and modification times of open file `fd` (futimens), with the same arguments
+/// as [`set_times_at`].
 pub fn set_times_fd(
     fd: i32,
     atime: Option<(i64, i64)>,
@@ -406,7 +421,8 @@ pub fn set_times_fd(
     Ok(())
 }
 
-/// 修改目录 `dir` 里名为 `name` 的文件的权限位（fchmodat，跟随符号链接）。
+/// Changes the permission bits of the file named `name` in directory `dir` (fchmodat, following
+/// symlinks).
 pub fn chmod_at(dir: i32, name: &std::ffi::CStr, mode: u32) -> Result<(), i32> {
     if unsafe { libc::fchmodat(dir, name.as_ptr(), mode as libc::mode_t, 0) } < 0 {
         return Err(last_errno());
@@ -414,7 +430,7 @@ pub fn chmod_at(dir: i32, name: &std::ffi::CStr, mode: u32) -> Result<(), i32> {
     Ok(())
 }
 
-/// 删除目录 `dir` 里名为 `name` 的文件（unlinkat）。
+/// Removes the file named `name` in directory `dir` (unlinkat).
 pub fn unlink_at(dir: i32, name: &std::ffi::CStr) -> Result<(), i32> {
     if unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } < 0 {
         return Err(last_errno());
@@ -422,7 +438,7 @@ pub fn unlink_at(dir: i32, name: &std::ffi::CStr) -> Result<(), i32> {
     Ok(())
 }
 
-/// 读取目录 `dir` 里名为 `name` 的文件的元数据（跟随符号链接）。
+/// Reads the metadata of the file named `name` in directory `dir` (following symlinks).
 pub fn stat_at(dir: i32, name: &std::ffi::CStr) -> Result<libc::stat, i32> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, 0) } < 0 {
@@ -431,19 +447,20 @@ pub fn stat_at(dir: i32, name: &std::ffi::CStr) -> Result<libc::stat, i32> {
     Ok(st)
 }
 
-/// 对宿主 fd 发 ioctl，`arg` 作为参数缓冲区（由调用方保证足够大）。
+/// Issues an ioctl on a host fd with `arg` as the argument buffer (the caller ensures it is large
+/// enough).
 pub fn ioctl(fd: i32, request: u64, arg: &mut [u8]) -> Result<i32, i32> {
     let rc = unsafe { libc::ioctl(fd, request as _, arg.as_mut_ptr()) };
     if rc < 0 { Err(last_errno()) } else { Ok(rc) }
 }
 
-/// 复制一个宿主 fd（close-on-exec）。
+/// Duplicates a host fd (close-on-exec).
 pub fn dup(fd: i32) -> Result<i32, i32> {
     let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if new < 0 { Err(last_errno()) } else { Ok(new) }
 }
 
-/// 从宿主 fd 读取，遇到 `EINTR` 自动重试。
+/// Reads from a host fd, retrying automatically on `EINTR`.
 pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
@@ -457,7 +474,7 @@ pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
     }
 }
 
-/// 调整宿主 fd 的文件位置。
+/// Moves a host fd's file position.
 pub fn lseek(fd: i32, offset: i64, whence: i32) -> Result<u64, i32> {
     let rc = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
     if rc < 0 {
@@ -467,16 +484,16 @@ pub fn lseek(fd: i32, offset: i64, whence: i32) -> Result<u64, i32> {
     }
 }
 
-/// Linux 的 `CLOCK_BOOTTIME`。
+/// Linux's `CLOCK_BOOTTIME`.
 pub const CLOCK_BOOTTIME: i32 = 7;
 
-// time_t、long 在 32 位宿主上是 32 位，这里的转换在 64 位宿主上是恒等的
+// time_t and long are 32 bits on 32-bit hosts; on 64-bit hosts these conversions are identities
 #[allow(clippy::unnecessary_cast)]
 fn timespec_pair(ts: &libc::timespec) -> (i64, i64) {
     (ts.tv_sec as i64, ts.tv_nsec as i64)
 }
 
-/// 读取宿主时钟，时钟编号按 Linux 的定义：(秒, 纳秒)。
+/// Reads a host clock, with clock ids as defined by Linux: (seconds, nanoseconds).
 pub fn clock_gettime(clock: i32) -> Result<(i64, i64), i32> {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_gettime(clock as libc::clockid_t, &mut ts) } < 0 {
@@ -485,7 +502,7 @@ pub fn clock_gettime(clock: i32) -> Result<(i64, i64), i32> {
     Ok(timespec_pair(&ts))
 }
 
-/// 宿主时钟的精度：(秒, 纳秒)。
+/// The resolution of a host clock: (seconds, nanoseconds).
 pub fn clock_getres(clock: i32) -> Result<(i64, i64), i32> {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_getres(clock as libc::clockid_t, &mut ts) } < 0 {
@@ -494,15 +511,17 @@ pub fn clock_getres(clock: i32) -> Result<(i64, i64), i32> {
     Ok(timespec_pair(&ts))
 }
 
-/// 把宿主进程的 fd 软限制提高到硬限制，返回新的软限制。所有 guest 进程共用宿主的
-/// fd：每个打开的仓库文件、socket 都占一个，默认的 1024 很快就会用完。
-#[allow(clippy::unnecessary_cast)] // rlim_t 在 32 位宿主上是 32 位
+/// Raises the host process's soft fd limit to the hard limit and returns the new soft limit. All
+/// guest processes share the host's fds: every open store file and socket takes one, and the
+/// default 1024 is soon used up.
+#[allow(clippy::unnecessary_cast)] // rlim_t is 32 bits on 32-bit hosts
 pub fn raise_fd_limit() -> u64 {
     let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } < 0 {
         return 0;
     }
-    // macOS 上硬限制可能是无穷大，但 setrlimit 不接受超过 OPEN_MAX（10240）
+    // On macOS the hard limit may be infinite, but setrlimit accepts no more than OPEN_MAX
+    // (10240)
     #[cfg(target_os = "macos")]
     let hard = rl.rlim_max.min(10240);
     #[cfg(not(target_os = "macos"))]
@@ -516,8 +535,8 @@ pub fn raise_fd_limit() -> u64 {
     rl.rlim_cur as u64
 }
 
-/// 宿主进程的 fd 软限制。
-#[allow(clippy::unnecessary_cast)] // rlim_t 在 32 位宿主上是 32 位
+/// The host process's soft fd limit.
+#[allow(clippy::unnecessary_cast)] // rlim_t is 32 bits on 32-bit hosts
 pub fn fd_limit() -> u64 {
     let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } < 0 {
@@ -530,26 +549,28 @@ pub fn fd_limit() -> u64 {
     }
 }
 
-/// 宿主进程用掉的匿名内存（字节），分项：`/proc/self/status` 的 RssAnon、RssShmem、VmSwap，
-/// 换出到 swap（Android 的 zram）的也算；文件页可以回收，不算。
+/// Anonymous memory used by the host process (bytes), itemized: RssAnon, RssShmem and VmSwap from
+/// `/proc/self/status`, counting what is swapped out (zram on Android); file pages can be
+/// reclaimed and do not count.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryUsage {
-    /// RssAnon：驻留的私有匿名内存。没有 RssAnon 的老内核（4.5 之前）是 VmRSS。
+    /// RssAnon: resident private anonymous memory. On old kernels without RssAnon (before 4.5)
+    /// it is VmRSS.
     pub anon: u64,
-    /// RssShmem：驻留的共享匿名内存（memfd、`MAP_SHARED|MAP_ANONYMOUS`）。
+    /// RssShmem: resident shared anonymous memory (memfd, `MAP_SHARED|MAP_ANONYMOUS`).
     pub shmem: u64,
-    /// VmSwap：换出去的。
+    /// VmSwap: what is swapped out.
     pub swap: u64,
 }
 
-/// 宿主进程的匿名内存（[`MemoryUsage`]）。读不了时返回 None。
+/// The host process's anonymous memory ([`MemoryUsage`]). Returns None when it cannot be read.
 pub fn memory_usage() -> Option<MemoryUsage> {
     use std::os::unix::fs::FileExt;
     static STATUS: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
     let status = STATUS
         .get_or_init(|| std::fs::File::open("/proc/self/status").ok())
         .as_ref()?;
-    // 从头读时内核重新生成整个文件
+    // Reading from the start makes the kernel regenerate the whole file
     let mut buf = [0u8; 4096];
     let n = status.read_at(&mut buf, 0).ok()?;
     let field = |name: &[u8]| -> Option<u64> {
@@ -570,9 +591,9 @@ pub fn memory_usage() -> Option<MemoryUsage> {
     })
 }
 
-/// 宿主的物理内存总量和空闲量（字节）。
+/// The host's total and free physical memory (bytes).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(clippy::unnecessary_cast)] // unsigned long 在 32 位宿主上是 32 位
+#[allow(clippy::unnecessary_cast)] // unsigned long is 32 bits on 32-bit hosts
 pub fn memory_info() -> (u64, u64) {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     if unsafe { libc::sysinfo(&mut info) } < 0 {
@@ -582,17 +603,17 @@ pub fn memory_info() -> (u64, u64) {
     (info.totalram as u64 * unit, info.freeram as u64 * unit)
 }
 
-/// 宿主的物理内存总量和空闲量（字节）。
+/// The host's total and free physical memory (bytes).
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn memory_info() -> (u64, u64) {
     let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
     ((pages.max(0) as u64) * page_size() as u64, 0)
 }
 
-/// 宿主的物理内存和交换区的总量（字节）：Linux 估算提交量（`vm.overcommit_memory` 是 0）
-/// 时一次申请的上限。读不到时是 0。
+/// The host's total physical memory plus swap (bytes): the limit on a single allocation when
+/// Linux estimates the commit (`vm.overcommit_memory` is 0). 0 when it cannot be read.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(clippy::unnecessary_cast)] // unsigned long 在 32 位宿主上是 32 位
+#[allow(clippy::unnecessary_cast)] // unsigned long is 32 bits on 32-bit hosts
 pub fn ram_and_swap() -> u64 {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     if unsafe { libc::sysinfo(&mut info) } < 0 {
@@ -602,14 +623,14 @@ pub fn ram_and_swap() -> u64 {
     (info.totalram as u64 + info.totalswap as u64) * unit
 }
 
-/// 宿主的物理内存和交换区的总量（字节）。
+/// The host's total physical memory plus swap (bytes).
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn ram_and_swap() -> u64 {
     memory_info().0
 }
 
-/// 宿主 `/proc/meminfo` 的几项（字节），guest 的 `/proc/meminfo` 和 sysinfo 照搬它们，与
-/// docker 的容器看到的一样。
+/// Some fields of the host's `/proc/meminfo` (bytes); the guest's `/proc/meminfo` and sysinfo
+/// copy them, the same as what a docker container sees.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemInfo {
     pub total: u64,
@@ -630,10 +651,11 @@ pub struct MemInfo {
     pub sreclaimable: u64,
 }
 
-/// 宿主的内存状况：读 `/proc/meminfo`。读不了时（宿主不让读）只有 sysinfo 给得出的几项，
-/// 可用量按空闲加缓冲区估计。
+/// The host's memory state, read from `/proc/meminfo`. When it cannot be read (the host does not
+/// allow it), only the few fields sysinfo can give, with the available amount estimated as free
+/// plus buffers.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[allow(clippy::unnecessary_cast)] // unsigned long 在 32 位宿主上是 32 位
+#[allow(clippy::unnecessary_cast)] // unsigned long is 32 bits on 32-bit hosts
 pub fn host_meminfo() -> MemInfo {
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         let field = |name: &str| {
@@ -684,7 +706,7 @@ pub fn host_meminfo() -> MemInfo {
     }
 }
 
-/// 宿主的内存状况：只知道物理内存的总量。
+/// The host's memory state: only the total physical memory is known.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn host_meminfo() -> MemInfo {
     MemInfo {
@@ -693,8 +715,9 @@ pub fn host_meminfo() -> MemInfo {
     }
 }
 
-/// 在宿主 fd 上等待事件：`fds` 的每一项是 (fd, events, revents)，`timeout` 为 None 时一直等。
-/// 返回就绪的 fd 数；被宿主信号打断时返回 `EINTR`。
+/// Waits for events on host fds: each item of `fds` is (fd, events, revents), and a `timeout` of
+/// None waits forever. Returns the number of ready fds; returns `EINTR` when interrupted by a host
+/// signal.
 pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<usize, i32> {
     let mut raw: Vec<libc::pollfd> = fds
         .iter()
@@ -735,22 +758,24 @@ fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
-    // 向上取整到毫秒，避免把很短的等待变成忙等
+    // Round up to milliseconds so very short waits do not become busy waiting
     let ms = timeout.map_or(-1, |t| {
         t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
     });
     unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, ms) }
 }
 
-/// 宿主 fd 上新发生的事件：一个边沿触发的宿主 epoll，只关注这一个 fd。宿主 poll 只能
-/// 看到 fd 现在就不就绪，看不到已经可读时又来了数据；宿主 epoll 的边沿触发每来一次
-/// 数据（每次唤醒）都报告一次，正好是 guest 的 `EPOLLET` 要的。
+/// New events on a host fd: an edge-triggered host epoll watching only this one fd. A host poll
+/// can only see whether the fd is ready now, not that more data arrived while it was already
+/// readable; the host epoll's edge triggering reports once each time data arrives (each wakeup),
+/// which is exactly what the guest's `EPOLLET` needs.
 pub struct Edges {
     epfd: std::os::fd::OwnedFd,
 }
 
 impl Edges {
-    /// 开始记录 `fd` 上的事件。刚建立时 fd 已经就绪的话，第一次 [`Edges::take`] 就会报告。
+    /// Starts recording events on `fd`. If the fd is already ready when this is created, the first
+    /// [`Edges::take`] reports it.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn new(fd: i32) -> Result<Edges, i32> {
         use std::os::fd::FromRawFd;
@@ -774,13 +799,15 @@ impl Edges {
         Err(libc::ENOSYS)
     }
 
-    /// 宿主 epoll 本身的 fd：有新事件时可读，可以放进 [`poll`] 里等。
+    /// The fd of the host epoll itself: readable when there are new events, and can be waited on
+    /// in [`poll`].
     pub fn fd(&self) -> i32 {
         use std::os::fd::AsRawFd;
         self.epfd.as_raw_fd()
     }
 
-    /// 取走上次以来发生的事件：(读方向, 写方向) 有没有新的。出错、挂断算读方向。
+    /// Takes the events since the last call: whether there are new ones in the (read, write)
+    /// directions. Errors and hangups count as the read direction.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn take(&self) -> (bool, bool) {
         let mut ev = libc::epoll_event { events: 0, u64: 0 };
@@ -797,7 +824,8 @@ impl Edges {
     }
 }
 
-/// 一组宿主 fd：其中有就绪的（水平触发）时它本身可读，可以放进 [`poll`] 里一起等。
+/// A set of host fds: it is readable itself when any of them is ready (level-triggered), and can
+/// be waited on together in [`poll`].
 pub struct Watch {
     epfd: std::os::fd::OwnedFd,
 }
@@ -820,7 +848,8 @@ impl Watch {
         Err(libc::ENOSYS)
     }
 
-    /// 开始看 `fd`：`readable` 时看它可读，否则只看出错和挂断（总会报告的两种）。
+    /// Starts watching `fd`: for readability with `readable`, otherwise only for errors and hangups
+    /// (the two that are always reported).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn add(&self, fd: i32, readable: bool) -> Result<(), i32> {
         let mut ev = libc::epoll_event {
@@ -838,7 +867,7 @@ impl Watch {
         Err(libc::ENOSYS)
     }
 
-    /// 不再看 `fd`（关闭了的 fd 宿主自己会去掉）。
+    /// Stops watching `fd` (the host removes closed fds by itself).
     pub fn remove(&self, fd: i32) {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         unsafe {
@@ -848,14 +877,15 @@ impl Watch {
         let _ = fd;
     }
 
-    /// 宿主 epoll 本身的 fd。
+    /// The fd of the host epoll itself.
     pub fn fd(&self) -> i32 {
         use std::os::fd::AsRawFd;
         self.epfd.as_raw_fd()
     }
 }
 
-/// 当前线程的 CPU 时间时钟，其他线程也可以用 [`clock_gettime`] 读它（线程退出后失效）。
+/// The current thread's CPU-time clock; other threads can read it with [`clock_gettime`] too
+/// (invalid after the thread exits).
 pub fn thread_cpu_clock() -> Option<i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -868,9 +898,9 @@ pub fn thread_cpu_clock() -> Option<i32> {
     }
 }
 
-/// 宿主 CPU `cpu` 的 sysfs 目录（`/sys/devices/system/cpu/cpu<n>`）下的 `path`：是文件时
-/// 返回内容，是目录时返回空的内容；没有或者读不了（Android 的 SELinux 可能不让 App 读
-/// cpufreq）时返回 None。
+/// `path` under host CPU `cpu`'s sysfs directory (`/sys/devices/system/cpu/cpu<n>`): returns the
+/// contents for a file and empty contents for a directory; None when it is missing or cannot be
+/// read (Android's SELinux may not let the app read cpufreq).
 pub fn cpu_sysfs(cpu: usize, path: &str) -> Option<Vec<u8>> {
     let full = format!("/sys/devices/system/cpu/cpu{cpu}/{path}");
     let meta = std::fs::metadata(&full).ok()?;
@@ -880,13 +910,13 @@ pub fn cpu_sysfs(cpu: usize, path: &str) -> Option<Vec<u8>> {
     std::fs::read(&full).ok()
 }
 
-/// 本进程可以用的宿主 CPU 的编号（最多 64 个），第一次调用时的快照：guest 看到的 CPU
-/// `i` 是其中第 `i` 个。之后宿主线程的亲和性被改了（guest 的 sched_setaffinity）也不
-/// 影响它。
+/// The numbers of the host CPUs this process may use (at most 64), a snapshot taken at the first
+/// call: the guest's CPU `i` is the `i`-th of them. Later changes to host threads' affinity (the
+/// guest's sched_setaffinity) do not affect it.
 pub fn host_cpus() -> &'static [usize] {
     static CPUS: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
     CPUS.get_or_init(|| {
-        // 也考虑了 cgroup 的 CPU 配额
+        // Also takes the cgroup's CPU quota into account
         let n = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(64);
@@ -894,7 +924,7 @@ pub fn host_cpus() -> &'static [usize] {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-                // CPU_SETSIZE 在 Linux 上是 i32，在 Android 上是 usize
+                // CPU_SETSIZE is i32 on Linux and usize on Android
                 #[allow(clippy::unnecessary_cast)]
                 let cpus: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
                     .filter(|&i| libc::CPU_ISSET(i, &set))
@@ -909,8 +939,8 @@ pub fn host_cpus() -> &'static [usize] {
     })
 }
 
-/// 把本进程的宿主线程 `tid` 限制在 [`host_cpus`] 里由 `mask` 选出的 CPU 上（第 `i` 位是
-/// 第 `i` 个）。失败时保持原样。
+/// Restricts host thread `tid` of this process to the CPUs of [`host_cpus`] selected by `mask`
+/// (bit `i` is the `i`-th). Left unchanged on failure.
 pub fn set_thread_affinity(tid: i32, mask: u64) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
@@ -926,19 +956,21 @@ pub fn set_thread_affinity(tid: i32, mask: u64) {
     let _ = (tid, mask);
 }
 
-/// 设置本进程的宿主线程 `tid` 的 nice 值。失败时（没有权限提高优先级）保持原样。
+/// Sets the nice value of host thread `tid` of this process. Left unchanged on failure (no
+/// permission to raise priority).
 pub fn set_thread_nice(tid: i32, nice: i32) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
-        // Linux 上 PRIO_PROCESS 作用于单个线程
+        // On Linux PRIO_PROCESS applies to a single thread
         libc::setpriority(libc::PRIO_PROCESS as _, tid as libc::id_t, nice);
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = (tid, nice);
 }
 
-/// 设置宿主线程 `tid` 的 IO 优先级（`ioprio_set(IOPRIO_WHO_PROCESS, tid, ioprio)`，值按
-/// Linux 的编码：类别在第 13–15 位）。Android 的应用 seccomp 放行它。没有权限时保持原样。
+/// Sets the IO priority of host thread `tid` (`ioprio_set(IOPRIO_WHO_PROCESS, tid, ioprio)`, with
+/// the value in Linux's encoding: the class in bits 13–15). Android's app seccomp allows it. Left
+/// unchanged without permission.
 pub fn set_thread_ioprio(tid: i32, ioprio: u16) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
@@ -954,7 +986,7 @@ pub fn set_thread_ioprio(tid: i32, ioprio: u16) {
     let _ = (tid, ioprio);
 }
 
-/// 宿主线程 `tid` 的 IO 优先级（`ioprio_get(IOPRIO_WHO_PROCESS, tid)`）。
+/// The IO priority of host thread `tid` (`ioprio_get(IOPRIO_WHO_PROCESS, tid)`).
 pub fn thread_ioprio(tid: i32) -> Option<u16> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -975,16 +1007,19 @@ pub fn thread_ioprio(tid: i32) -> Option<u16> {
     }
 }
 
-/// `struct __kernel_timex` 的大小（arm64、x86_64 的 Linux 相同）。
+/// The size of `struct __kernel_timex` (the same on arm64 and x86_64 Linux).
 pub const TIMEX_SIZE: usize = 208;
 
-/// 宿主时钟的 NTP 状态（只读的 adjtimex）：返回 adjtimex 的返回值（时钟状态，比如
-/// `TIME_OK`、`TIME_ERROR`）和填好的 `struct __kernel_timex`。`adjtime` 为真时按
-/// `ADJ_OFFSET_SS_READ` 查询（offset 是 adjtime(3) 剩下的调整量），否则按 modes = 0。
+/// The NTP state of the host clock (a read-only adjtimex): returns adjtimex's return value (the
+/// clock state, such as `TIME_OK` or `TIME_ERROR`) and the filled-in `struct __kernel_timex`. With
+/// `adjtime` true it queries with `ADJ_OFFSET_SS_READ` (offset is the adjustment adjtime(3) has
+/// left), otherwise with modes = 0.
 ///
-/// Android 的应用 seccomp 不让调 adjtimex（`SECCOMP_BLOCKLIST_APP.TXT`，调了整个 App
-/// 收到 SIGSYS），按 Android 上内核的实际状态合成：Android 用 settimeofday 校时、不运行
-/// 内核的 NTP 调整，时钟一直是未同步（`STA_UNSYNC`），各项是 `ntp_clear` 之后的初值。
+/// Android's app seccomp forbids adjtimex (`SECCOMP_BLOCKLIST_APP.TXT`; calling it gets the whole
+/// app SIGSYS), so the result is synthesized from the kernel's actual state on Android: Android
+/// sets the time with settimeofday and does not run the kernel's NTP adjustment, so the clock is
+/// always unsynchronized (`STA_UNSYNC`), and the fields have their initial values after
+/// `ntp_clear`.
 pub fn adjtimex_query(adjtime: bool) -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
     let mut buf = [0u8; TIMEX_SIZE];
     #[cfg(target_os = "linux")]
@@ -1005,9 +1040,10 @@ pub fn adjtimex_query(adjtime: bool) -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
     }
 }
 
-/// 没有运行内核 NTP 调整的时钟的状态（`ntp_clear` 之后的初值）：`STA_UNSYNC`，误差是
-/// `NTP_PHASE_LIMIT`，time_constant = 2，precision 1，tolerance 为 `MAXFREQ_SCALED /
-/// PPM_SCALE`（500 ppm 左移 16 位），tick 是 1000000 / USER_HZ，返回 `TIME_ERROR`。
+/// The state of a clock without the kernel's NTP adjustment running (the initial values after
+/// `ntp_clear`): `STA_UNSYNC`, error `NTP_PHASE_LIMIT`, time_constant = 2, precision 1, tolerance
+/// `MAXFREQ_SCALED / PPM_SCALE` (500 ppm shifted left by 16), tick 1000000 / USER_HZ, returning
+/// `TIME_ERROR`.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn unsynchronized_timex() -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
     const TIME_ERROR: i32 = 5;
@@ -1020,13 +1056,13 @@ fn unsynchronized_timex() -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
     put(64, 500 << 16); // tolerance
     let (sec, nsec) = clock_gettime(0)?; // CLOCK_REALTIME
     put(72, sec);
-    put(80, nsec / 1000); // 没有 STA_NANO：微秒
+    put(80, nsec / 1000); // no STA_NANO: microseconds
     put(88, 10_000); // tick
     buf[40..44].copy_from_slice(&0x40i32.to_le_bytes()); // status = STA_UNSYNC
     Ok((TIME_ERROR, buf))
 }
 
-/// 当前宿主线程的 tid。
+/// The current host thread's tid.
 pub fn gettid() -> i32 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -1038,11 +1074,12 @@ pub fn gettid() -> i32 {
     }
 }
 
-/// 调用线程到现在在宿主内核里花的时间（`getrusage(RUSAGE_THREAD)` 的 stime）。
+/// Time the calling thread has spent in the host kernel so far (the stime of
+/// `getrusage(RUSAGE_THREAD)`).
 pub fn thread_system_ns_self() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // Linux 的 UAPI 常量；libc crate 在 Android 上没有定义它
+        // Linux's UAPI constant; the libc crate does not define it on Android
         const RUSAGE_THREAD: libc::c_int = 1;
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
@@ -1057,8 +1094,8 @@ pub fn thread_system_ns_self() -> u64 {
     }
 }
 
-/// 设置调用线程的名字（`/proc/self/task/<tid>/comm`，调试器里看到的），超过 15 字节的
-/// 部分截掉。
+/// Sets the calling thread's name (`/proc/self/task/<tid>/comm`, what debuggers show), truncated
+/// beyond 15 bytes.
 pub fn set_thread_name(name: &str) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -1071,19 +1108,23 @@ pub fn set_thread_name(name: &str) {
     let _ = name;
 }
 
-/// 本进程的宿主线程 `tid` 在宿主内核里花的时间（`/proc/self/task/<tid>/stat` 的
-/// stime，精度是一个时钟滴答）。线程已经退出或者读不了时返回 None。
+/// Time host thread `tid` of this process has spent in the host kernel (the stime of
+/// `/proc/self/task/<tid>/stat`, with a resolution of one clock tick). Returns None when the
+/// thread has exited or the file cannot be read.
 pub fn thread_system_ns(tid: i32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
-    // 第 2 列是括号里的线程名，可能含空格；之后从第 3 列（状态）数起，stime 是第 15 列
+    // Column 2 is the thread name in parentheses and may contain spaces; counting from column 3
+    // (the state) after it, stime is column 15
     let rest = &stat[stat.rfind(')')? + 1..];
     let ticks: u64 = rest.split_ascii_whitespace().nth(12)?.parse().ok()?;
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
     Some(ticks * (1_000_000_000 / hz))
 }
 
-/// 调用线程的（自愿, 非自愿）上下文切换次数，与 [`thread_ctxt_switches`] 是同样的计数，
-/// 但只要一次 getrusage：线程开始时持着 BKL 取基数，读 `/proc` 的 status 每次要十来微秒。
+/// The calling thread's (voluntary, involuntary) context switch counts, the same counts as
+/// [`thread_ctxt_switches`] but with a single getrusage: the baseline is taken while holding the
+/// BKL when a thread starts, and reading the `/proc` status takes about ten microseconds each
+/// time.
 pub fn thread_ctxt_switches_self() -> Option<(u64, u64)> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -1098,7 +1139,8 @@ pub fn thread_ctxt_switches_self() -> Option<(u64, u64)> {
     }
 }
 
-/// 本进程的宿主线程 `tid` 自愿、非自愿的上下文切换次数（`/proc/self/task/<tid>/status`）。
+/// The voluntary and involuntary context switch counts of host thread `tid` of this process
+/// (`/proc/self/task/<tid>/status`).
 pub fn thread_ctxt_switches(tid: i32) -> Option<(u64, u64)> {
     let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
     let field = |name: &str| {
@@ -1113,30 +1155,34 @@ pub fn thread_ctxt_switches(tid: i32) -> Option<(u64, u64)> {
     ))
 }
 
-/// 把 `[ptr, ptr + len)` 的页调进内存：每个宿主页读一个字节。匿名内存没写过的页映射到
-/// 零页，不额外占内存。
+/// Brings the pages of `[ptr, ptr + len)` into memory by reading one byte from each host page.
+/// Never-written pages of anonymous memory map to the zero page and take no extra memory.
 ///
 /// # Safety
 ///
-/// `[ptr, ptr + len)` 是可读的内存，读它不会产生 SIGBUS（文件映射不能超出文件末尾）。
+/// `[ptr, ptr + len)` is readable memory, and reading it cannot raise SIGBUS (file mappings must
+/// not extend past the end of the file).
 pub unsafe fn populate(ptr: *const u8, len: usize) {
     let page = page_size();
     let mut at = ptr as usize & !(page - 1);
     let end = ptr as usize + len;
     while at < end {
-        // SAFETY: 由调用方保证；读的是 at 和 ptr 中较大的那个，在区间里
+        // SAFETY: guaranteed by the caller; the read is at the larger of at and ptr, which is in
+        // the range
         unsafe { std::ptr::read_volatile(at.max(ptr as usize) as *const u8) };
         at += page;
     }
 }
 
-/// 宿主文件 `fd` 在 `[off, off + len)`（`len` 为 0 时到文件末尾）里的页缓存状况，按 4K
-/// 页计（`struct cachestat` 的五项）。在缓存里的页数用 mincore 查：文件映射的 mincore
-/// 查的就是页缓存，不依赖宿主内核的版本和文件系统（宿主的 cachestat 要 6.5，在
-/// overlayfs 上也数不到底层文件的页）。脏页、写回、逐出几项宿主不给，是 0。
+/// The page cache state of host file `fd` in `[off, off + len)` (to the end of the file when `len`
+/// is 0), counted in 4K pages (the five fields of `struct cachestat`). Cached pages are counted
+/// with mincore: mincore on a file mapping queries the page cache itself, independent of the host
+/// kernel version and filesystem (the host's cachestat needs 6.5, and on overlayfs it cannot count
+/// the underlying file's pages either). The host does not provide the dirty, writeback and
+/// evicted fields, so they are 0.
 pub fn cachestat(fd: i32, off: u64, len: u64) -> Result<[u64; 5], i32> {
     let size = fstat(fd)?.st_size as u64;
-    // 范围里、文件末尾之内的 4K 页
+    // 4K pages in the range and within the end of the file
     let first = off / 4096;
     let last = match len {
         0 => u64::MAX,
@@ -1151,8 +1197,9 @@ pub fn cachestat(fd: i32, off: u64, len: u64) -> Result<[u64; 5], i32> {
     Ok([resident_in_file(fd, first, pages), 0, 0, 0, 0])
 }
 
-/// 文件 `fd` 从第 `first` 个 4K 页起的 `pages` 页里有几页在宿主的页缓存里。分段映射，
-/// 大文件也不占太多地址空间；映射不了（比如只写打开的）的部分当作不在。
+/// How many of the `pages` pages of file `fd` from 4K page `first` on are in the host's page
+/// cache. Mapped in chunks so large files do not take too much address space; parts that cannot be
+/// mapped (for example when opened write-only) count as not cached.
 fn resident_in_file(fd: i32, first: u64, pages: u64) -> u64 {
     const WINDOW: u64 = 1 << 16;
     let mut total = 0;
@@ -1170,8 +1217,8 @@ fn resident_in_file(fd: i32, first: u64, pages: u64) -> u64 {
     total
 }
 
-/// `[ptr, ptr + len)` 里驻留在内存中的 4K 页数（mincore）。分段量，结果数组不超过 64 KB；
-/// 量不了的段算 0。
+/// The number of 4K pages of `[ptr, ptr + len)` resident in memory (mincore). Measured in chunks
+/// so the result array never exceeds 64 KB; chunks that cannot be measured count as 0.
 pub fn resident_pages(ptr: *const u8, len: usize) -> usize {
     const WINDOW_PAGES: usize = 1 << 16;
     let page = page_size();
@@ -1192,8 +1239,8 @@ pub fn resident_pages(ptr: *const u8, len: usize) -> usize {
     (host_pages * page / 4096).min(len.div_ceil(4096))
 }
 
-/// `[ptr, ptr + len)` 里每个 4K 页是否在宿主内存里（mincore）；宿主页更大时，同一个
-/// 宿主页里的 4K 页结果相同。出错时全部报告为不在。
+/// Whether each 4K page of `[ptr, ptr + len)` is in host memory (mincore); when host pages are
+/// larger, the 4K pages within one host page share a result. On error all are reported as absent.
 pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
     let page = page_size();
     let start = ptr as usize & !(page - 1);
@@ -1205,9 +1252,10 @@ pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
         .collect()
 }
 
-/// `[ptr, ptr + len)` 里每个 4K 页有没有被碰过（`/proc/self/pagemap` 的"在内存里"或
-/// "已换出"位）；宿主页更大时，同一个宿主页里的 4K 页结果相同。读不了 pagemap 时
-/// 返回 None。不能用 mincore：换出到 swap（Android 的 zram）的页它也报告"不在"。
+/// Whether each 4K page of `[ptr, ptr + len)` has been touched (the "present" or "swapped" bit of
+/// `/proc/self/pagemap`); when host pages are larger, the 4K pages within one host page share a
+/// result. Returns None when pagemap cannot be read. mincore cannot be used: it reports pages
+/// swapped out (zram on Android) as "absent" too.
 pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
     use std::os::unix::fs::FileExt;
     static PAGEMAP: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
@@ -1231,25 +1279,25 @@ pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
     )
 }
 
-/// 一个宿主文件系统的容量（statvfs）。
+/// The capacity of a host filesystem (statvfs).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStats {
-    /// 块大小。
+    /// Block size.
     pub block_size: u64,
-    /// 总块数。
+    /// Total blocks.
     pub blocks: u64,
-    /// 空闲块数。
+    /// Free blocks.
     pub free: u64,
-    /// 非特权用户可用的块数。
+    /// Blocks available to unprivileged users.
     pub available: u64,
-    /// inode 总数。
+    /// Total inodes.
     pub files: u64,
-    /// 空闲 inode 数。
+    /// Free inodes.
     pub files_free: u64,
 }
 
-/// 读取 `path` 所在宿主文件系统的容量。
-#[allow(clippy::unnecessary_cast)] // fsblkcnt_t 等类型在不同宿主上宽度不同
+/// Reads the capacity of the host filesystem holding `path`.
+#[allow(clippy::unnecessary_cast)] // fsblkcnt_t and similar types differ in width across hosts
 pub fn statvfs(path: &std::path::Path) -> Result<FsStats, i32> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
@@ -1272,25 +1320,26 @@ pub fn statvfs(path: &std::path::Path) -> Result<FsStats, i32> {
     })
 }
 
-/// 读空一个非阻塞 fd 里现有的数据（通知用的管道）。
+/// Drains the data currently in a nonblocking fd (a notification pipe).
 pub fn drain(fd: i32) {
     let mut buf = [0u8; 64];
     while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }
 
-/// fd 是不是终端。
+/// Whether the fd is a terminal.
 pub fn isatty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-/// 把宿主终端切到 raw 模式，析构时恢复原来的设置。
+/// Switches the host terminal to raw mode, restoring the old settings on drop.
 pub struct RawMode {
     fd: i32,
     saved: libc::termios,
 }
 
 impl RawMode {
-    /// 切换 `fd` 所在的终端：关掉回显、行编辑和信号，让每个按键原样到达。
+    /// Switches the terminal of `fd`: turns off echo, line editing and signals so each keystroke
+    /// arrives as is.
     pub fn enter(fd: i32) -> Result<RawMode, i32> {
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut t) } < 0 {
@@ -1316,12 +1365,14 @@ static WINCH_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::ne
 extern "C" fn on_sigwinch(_: libc::c_int) {
     let fd = WINCH_FD.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 {
-        // 只调用 async-signal-safe 的 write；管道满了说明已经有通知在等着
+        // Call only the async-signal-safe write; a full pipe means a notification is already
+        // waiting
         unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
     }
 }
 
-/// 宿主收到 SIGWINCH（终端窗口大小改变）时变为可读的 fd（非阻塞），只能调用一次。
+/// An fd (nonblocking) that becomes readable when the host receives SIGWINCH (terminal window
+/// size change); can be called only once.
 pub fn sigwinch_notifier() -> Result<i32, i32> {
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
@@ -1343,16 +1394,16 @@ pub fn sigwinch_notifier() -> Result<i32, i32> {
     Ok(fds[0])
 }
 
-/// 跨线程唤醒用的事件：Linux 上是 eventfd，其他宿主上用管道代替。
+/// An event for waking across threads: an eventfd on Linux, replaced by a pipe on other hosts.
 ///
-/// [`Event::signal`] 之后，它的 fd 变为可读，直到 [`Event::clear`]。
+/// After [`Event::signal`], its fd is readable until [`Event::clear`].
 pub struct Event {
     read: i32,
     write: i32,
 }
 
 impl Event {
-    /// 新建一个未触发的事件。
+    /// Creates an event that is not signalled.
     pub fn new() -> Result<Event, i32> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -1384,26 +1435,27 @@ impl Event {
         }
     }
 
-    /// 用来 poll 的 fd（等待 `POLLIN`）。
+    /// The fd to poll (waiting for `POLLIN`).
     pub fn fd(&self) -> i32 {
         self.read
     }
 
-    /// 触发事件，可以从任意线程调用。
+    /// Signals the event; can be called from any thread.
     pub fn signal(&self) {
         let one = 1u64.to_ne_bytes();
-        // 计数器已满（eventfd）或管道已满时写入失败，但事件本来就处于触发状态
+        // The write fails when the counter is full (eventfd) or the pipe is full, but then the
+        // event is already signalled
         unsafe { libc::write(self.write, one.as_ptr().cast(), one.len()) };
     }
 
-    /// 事件是否处于触发状态（不清除它）。
+    /// Whether the event is signalled (without clearing it).
     pub fn is_signaled(&self) -> bool {
         const POLLIN: i16 = 1;
         let mut fds = [(self.read, POLLIN, 0)];
         matches!(poll(&mut fds, Some(Duration::ZERO)), Ok(n) if n > 0)
     }
 
-    /// 清除触发状态。
+    /// Clears the signalled state.
     pub fn clear(&self) {
         let mut buf = [0u8; 64];
         while unsafe { libc::read(self.read, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
@@ -1429,10 +1481,12 @@ mod tests {
 
     #[test]
     fn synthesized_clock_state_matches_a_kernel_without_ntp() {
-        // Android 上合成的（unsynchronized_timex）与宿主内核的只读查询在不随 NTP 状态变的
-        // 字段（precision、tolerance）上相同；合成的是未同步、TIME_ERROR，时间是现在。tick
-        // 不比：chrony 这类守护进程频率偏差大时用 ADJ_TICK 改它（CI 的 runner 上见过 9999），
-        // 合成的是 USER_HZ 100 的 10000，宿主的只要在内核允许的 ±10% 里
+        // What Android synthesizes (unsynchronized_timex) matches the host kernel's read-only
+        // query in the fields that do not change with NTP state (precision, tolerance); the
+        // synthesized one is unsynchronized, TIME_ERROR, with the current time. tick is not
+        // compared: daemons like chrony change it with ADJ_TICK when the frequency error is large
+        // (9999 has been seen on a CI runner); the synthesized one is 10000 for USER_HZ 100, and
+        // the host's only has to be within the ±10% the kernel allows
         let field = |b: &[u8; TIMEX_SIZE], off: usize| {
             i64::from_le_bytes(b[off..off + 8].try_into().unwrap())
         };
@@ -1479,7 +1533,8 @@ mod tests {
             .unwrap();
         f.write_all(&[7u8; 3 * 4096 + 100]).unwrap();
         let fd = f.as_raw_fd();
-        // 刚写的页都在页缓存里；范围超出文件末尾的部分不算
+        // Freshly written pages are all in the page cache; the part of a range beyond the end of
+        // the file does not count
         assert_eq!(cachestat(fd, 0, 0).unwrap()[0], 4);
         assert_eq!(cachestat(fd, 4096, 4096).unwrap()[0], 1);
         assert_eq!(cachestat(fd, 1 << 20, 0).unwrap(), [0; 5]);

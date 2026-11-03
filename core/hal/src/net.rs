@@ -1,14 +1,15 @@
-//! 宿主 socket（kernel/net 的 map）。
+//! Host sockets (the kernel/net map).
 //!
-//! guest 的 TCP/UDP socket 直接对应一个宿主 socket。guest 和宿主都是 arm64 Linux 的
-//! ABI，所以 sockaddr、socket 选项和控制消息的字节布局完全相同，这里按字节原样传递。
-//! 宿主 socket 一律是非阻塞的，阻塞语义由内核层在统一的等待机制里模拟。
+//! A guest TCP/UDP socket maps directly to a host socket. Guest and host both use the arm64 Linux
+//! ABI, so the byte layouts of sockaddrs, socket options and control messages are identical, and
+//! they are passed through byte for byte here. Host sockets are always nonblocking; blocking
+//! semantics are emulated by the kernel layer in its common waiting mechanism.
 
 use std::time::Duration;
 
 use super::last_errno;
 
-/// 新建非阻塞、close-on-exec 的宿主 socket。
+/// Creates a nonblocking, close-on-exec host socket.
 pub fn socket(domain: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let fd = unsafe {
@@ -23,7 +24,7 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
     if fd < 0 { Err(last_errno()) } else { Ok(fd) }
 }
 
-/// 没有 `SOCK_NONBLOCK`、accept4 的宿主：创建之后再设成非阻塞、close-on-exec。
+/// Hosts without `SOCK_NONBLOCK` and accept4: set nonblocking and close-on-exec after creation.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn set_flags(fd: i32) -> i32 {
     if fd >= 0 {
@@ -35,7 +36,7 @@ fn set_flags(fd: i32) -> i32 {
     fd
 }
 
-/// 关闭宿主 fd。
+/// Closes a host fd.
 pub fn close(fd: i32) {
     unsafe { libc::close(fd) };
 }
@@ -44,22 +45,22 @@ fn check(rc: libc::c_int) -> Result<(), i32> {
     if rc < 0 { Err(last_errno()) } else { Ok(()) }
 }
 
-/// bind(2)。
+/// bind(2).
 pub fn bind(fd: i32, addr: &[u8]) -> Result<(), i32> {
     check(unsafe { libc::bind(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t) })
 }
 
-/// connect(2)。非阻塞 socket 上返回 `EINPROGRESS` 表示连接正在进行。
+/// connect(2). On a nonblocking socket `EINPROGRESS` means the connection is in progress.
 pub fn connect(fd: i32, addr: &[u8]) -> Result<(), i32> {
     check(unsafe { libc::connect(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t) })
 }
 
-/// listen(2)。
+/// listen(2).
 pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
     check(unsafe { libc::listen(fd, backlog) })
 }
 
-/// accept4(2)：新的 socket 同样是非阻塞、close-on-exec 的。返回 (fd, 对端地址)。
+/// accept4(2): the new socket is nonblocking and close-on-exec too. Returns (fd, peer address).
 pub fn accept(fd: i32) -> Result<(i32, Vec<u8>), i32> {
     let mut addr = [0u8; 128];
     let mut len = addr.len() as libc::socklen_t;
@@ -80,7 +81,7 @@ pub fn accept(fd: i32) -> Result<(i32, Vec<u8>), i32> {
     Ok((new, addr[..len as usize].to_vec()))
 }
 
-/// getsockname(2) 或 getpeername(2)。
+/// getsockname(2) or getpeername(2).
 pub fn sockname(fd: i32, peer: bool) -> Result<Vec<u8>, i32> {
     let mut addr = [0u8; 128];
     let mut len = addr.len() as libc::socklen_t;
@@ -95,7 +96,7 @@ pub fn sockname(fd: i32, peer: bool) -> Result<Vec<u8>, i32> {
     Ok(addr[..len as usize].to_vec())
 }
 
-/// setsockopt(2)。
+/// setsockopt(2).
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i32> {
     check(unsafe {
         libc::setsockopt(
@@ -108,7 +109,7 @@ pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i3
     })
 }
 
-/// getsockopt(2)：最多取 `len` 字节。
+/// getsockopt(2): takes at most `len` bytes.
 pub fn getsockopt(fd: i32, level: i32, name: i32, len: usize) -> Result<Vec<u8>, i32> {
     let mut buf = vec![0u8; len];
     let mut l = len as libc::socklen_t;
@@ -117,13 +118,13 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, len: usize) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-/// shutdown(2)。
+/// shutdown(2).
 pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
     check(unsafe { libc::shutdown(fd, how) })
 }
 
-/// sendmsg(2)：`addr` 为空时发给已连接的对端。总是带上 `MSG_NOSIGNAL`，连接断开时
-/// 返回 EPIPE 而不是让宿主收到 SIGPIPE。
+/// sendmsg(2): an empty `addr` sends to the connected peer. Always adds `MSG_NOSIGNAL`, so a
+/// broken connection returns EPIPE instead of the host receiving SIGPIPE.
 pub fn sendmsg(
     fd: i32,
     data: &[u8],
@@ -154,19 +155,20 @@ pub fn sendmsg(
     }
 }
 
-/// recvmsg(2) 的结果。
+/// The result of recvmsg(2).
 pub struct Received {
-    /// 数据长度（`MSG_TRUNC` 时可能大于缓冲区）。
+    /// Data length (may exceed the buffer with `MSG_TRUNC`).
     pub len: usize,
-    /// 对端地址。
+    /// Peer address.
     pub addr: Vec<u8>,
-    /// 控制消息。
+    /// Control messages.
     pub control: Vec<u8>,
-    /// `msg_flags`。
+    /// `msg_flags`.
     pub flags: i32,
 }
 
-/// recvmsg(2)：数据读进 `buf`，控制消息最多取 `control_len` 字节。
+/// recvmsg(2): reads the data into `buf` and takes at most `control_len` bytes of control
+/// messages.
 pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Result<Received, i32> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
@@ -187,7 +189,7 @@ pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Resul
     if n < 0 {
         return Err(last_errno());
     }
-    // msg_controllen 在 Linux 上是 size_t，在 macOS 上是 socklen_t
+    // msg_controllen is size_t on Linux and socklen_t on macOS
     #[allow(clippy::unnecessary_cast)]
     control.truncate(msg.msg_controllen as usize);
     Ok(Received {
@@ -198,20 +200,20 @@ pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Resul
     })
 }
 
-/// 宿主上的一个网络接口（netlink 模拟用）。
+/// A network interface on the host (for the netlink emulation).
 #[derive(Debug, Clone, Default)]
 pub struct Interface {
-    /// 名字。
+    /// Name.
     pub name: String,
-    /// 接口编号。
+    /// Interface index.
     pub index: u32,
-    /// `IFF_*` 标志。
+    /// `IFF_*` flags.
     pub flags: u32,
-    /// MTU。
+    /// MTU.
     pub mtu: u32,
-    /// 硬件地址。
+    /// Hardware address.
     pub mac: Option<[u8; 6]>,
-    /// 地址：(地址族, 地址, 前缀长度)。
+    /// Addresses: (address family, address, prefix length).
     pub addrs: Vec<(i32, Vec<u8>, u8)>,
 }
 
@@ -219,7 +221,7 @@ fn prefix_len(mask: &[u8]) -> u8 {
     mask.iter().map(|b| b.count_ones() as u8).sum()
 }
 
-/// 宿主的网络接口（getifaddrs）。
+/// The host's network interfaces (getifaddrs).
 pub fn interfaces() -> Vec<Interface> {
     let mut list: Vec<Interface> = Vec::new();
     let mut ifa: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -289,25 +291,26 @@ pub fn interfaces() -> Vec<Interface> {
     list
 }
 
-/// 宿主路由表（主表）里的一条路由（路由表的模拟用）。
+/// One route in the host routing table (the main table), for the routing table emulation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
-    /// `AF_INET` 或 `AF_INET6`。
+    /// `AF_INET` or `AF_INET6`.
     pub family: i32,
-    /// 目标网段：IPv4 是 4 字节，IPv6 是 16 字节。
+    /// Destination network: 4 bytes for IPv4, 16 bytes for IPv6.
     pub dst: Vec<u8>,
-    /// 前缀长度。
+    /// Prefix length.
     pub prefix: u8,
-    /// 网关；直接相连的网段没有。
+    /// Gateway; directly connected networks have none.
     pub gateway: Option<Vec<u8>>,
-    /// 出口接口的名字。
+    /// Name of the outgoing interface.
     pub iface: String,
-    /// 度量（`ip route` 的 metric）。
+    /// Metric (the metric of `ip route`).
     pub metric: u32,
 }
 
-/// 宿主上接口 `name` 的发送队列长度（`/sys/class/net/<接口>/tx_queue_len`）；读不到时
-/// （Android 上 App 可能读不了 sysfs 的这些文件）是 None。
+/// The transmit queue length of interface `name` on the host
+/// (`/sys/class/net/<interface>/tx_queue_len`); None when it cannot be read (on Android the app
+/// may be unable to read these sysfs files).
 pub fn tx_queue_len(name: &str) -> Option<u32> {
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         return None;
@@ -319,12 +322,13 @@ pub fn tx_queue_len(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// 宿主主表里的单播路由：读宿主的 `/proc/net/route`、`/proc/net/ipv6_route`。读不到时
-/// （Android 10 起 App 读不了 `/proc/net`，macOS 没有这两个文件）是 None。
+/// Unicast routes in the host's main table, read from the host's `/proc/net/route` and
+/// `/proc/net/ipv6_route`. None when they cannot be read (since Android 10 apps cannot read
+/// `/proc/net`, and macOS has neither file).
 pub fn routes() -> Option<Vec<Route>> {
     let v4 = std::fs::read_to_string("/proc/net/route").ok()?;
     let mut out = parse_route(&v4);
-    // 没有 IPv6 的宿主上没有这个文件
+    // Hosts without IPv6 lack this file
     if let Ok(v6) = std::fs::read_to_string("/proc/net/ipv6_route") {
         out.extend(parse_ipv6_route(&v6));
     }
@@ -337,8 +341,8 @@ const RTF_ANYCAST: u32 = 0x10_0000;
 const RTF_CACHE: u32 = 0x100_0000;
 const RTF_LOCAL: u32 = 0x8000_0000;
 
-/// `/proc/net/route`（Linux 的 `fib_route_seq_show`）：只有主表，地址是按小端打印的
-/// 32 位字。不可达等拒绝的路由不要。
+/// `/proc/net/route` (Linux's `fib_route_seq_show`): only the main table, with addresses printed
+/// as little-endian 32-bit words. Unreachable and other reject routes are dropped.
 fn parse_route(text: &str) -> Vec<Route> {
     let hex = |s: &str| u32::from_str_radix(s, 16).ok();
     text.lines()
@@ -365,8 +369,9 @@ fn parse_route(text: &str) -> Vec<Route> {
         .collect()
 }
 
-/// `/proc/net/ipv6_route`（Linux 的 `ipv6_route_native_seq_show`）：所有表都在里面，只要
-/// 主表里那种单播路由，本地表的地址、多播、任播、缓存和拒绝的路由（各表的空路由）不要。
+/// `/proc/net/ipv6_route` (Linux's `ipv6_route_native_seq_show`): every table is in it; only
+/// unicast routes of the kind in the main table are kept, and local-table addresses, multicast,
+/// anycast, cache and reject routes (each table's null routes) are dropped.
 fn parse_ipv6_route(text: &str) -> Vec<Route> {
     let addr = |s: &str| -> Option<Vec<u8>> {
         (s.len() == 32)
@@ -397,8 +402,9 @@ fn parse_ipv6_route(text: &str) -> Vec<Route> {
         .collect()
 }
 
-/// 宿主发往 `dst`（IPv4 4 字节、IPv6 16 字节）时选的本端地址：对它 connect 一个 UDP
-/// socket，不发出数据报。没有路由时是 connect 的错误（ENETUNREACH 等）。
+/// The local address the host chooses when sending to `dst` (4 bytes for IPv4, 16 for IPv6):
+/// connects a UDP socket to it without sending a datagram. Without a route, it is connect's error
+/// (ENETUNREACH and the like).
 pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
     let ip: std::net::IpAddr = match dst.len() {
         4 => <[u8; 4]>::try_from(dst).unwrap().into(),
@@ -422,7 +428,7 @@ pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
     })
 }
 
-/// 宿主 `/etc/resolv.conf` 里的名字服务器（sockaddr 的字节）。
+/// The name servers in the host's `/etc/resolv.conf` (as sockaddr bytes).
 #[cfg(not(target_os = "android"))]
 fn nameservers() -> Vec<Vec<u8>> {
     let Ok(conf) = std::fs::read_to_string("/etc/resolv.conf") else {
@@ -436,7 +442,7 @@ fn nameservers() -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// `SocketAddr` 编码成 sockaddr 的字节。
+/// Encodes a `SocketAddr` as sockaddr bytes.
 pub fn sockaddr(addr: std::net::SocketAddr) -> Vec<u8> {
     match addr {
         std::net::SocketAddr::V4(a) => {
@@ -457,7 +463,7 @@ pub fn sockaddr(addr: std::net::SocketAddr) -> Vec<u8> {
     }
 }
 
-/// 等一个 fd 就绪，超时返回 `ETIMEDOUT`。
+/// Waits for an fd to become ready; a timeout returns `ETIMEDOUT`.
 #[cfg(not(target_os = "android"))]
 fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
     let mut fds = [(fd, events, 0)];
@@ -467,7 +473,7 @@ fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
     }
 }
 
-/// 经由 UDP 向一个名字服务器查询，回答被截断（TC 位）时改用 TCP。
+/// Queries one name server over UDP, switching to TCP when the answer is truncated (the TC bit).
 #[cfg(not(target_os = "android"))]
 fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
     const TIMEOUT: Duration = Duration::from_secs(3);
@@ -480,7 +486,7 @@ fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
         loop {
             wait_fd(fd, libc::POLLIN, TIMEOUT)?;
             let r = recvmsg(fd, &mut buf, 0, 0)?;
-            // 只接受与查询 ID 相同的回答
+            // Accept only answers with the same ID as the query
             if r.len >= 12 && buf[..2] == query[..2] {
                 buf.truncate(r.len);
                 return Ok(buf);
@@ -532,11 +538,12 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
     result
 }
 
-/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（kernel/net 的 map 里的 DNS 存根）。
+/// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
+/// stub in the kernel/net map).
 ///
-/// Android 上交给 `android_res_nsend`，私人 DNS、VPN 和按网络分流的设置都会生效；
-/// 其他宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器。会阻塞，调用方不能
-/// 持有锁。
+/// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
+/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
+/// in turn. It blocks, so the caller must not hold locks.
 #[cfg(target_os = "android")]
 pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     #[link(name = "android")]
@@ -545,7 +552,7 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
         fn android_res_nresult(fd: i32, rcode: *mut i32, answer: *mut u8, len: usize) -> i32;
         fn android_res_cancel(fd: i32);
     }
-    /// `NETWORK_UNSPECIFIED`：系统的默认网络。
+    /// `NETWORK_UNSPECIFIED`: the system's default network.
     const DEFAULT_NETWORK: u64 = 0;
     if query.len() < 12 {
         return Err(libc::EINVAL);
@@ -554,7 +561,8 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     if fd < 0 {
         return Err(-fd);
     }
-    // 系统解析器自己会重试和超时，这里只防止它永远不回答
+    // The system resolver retries and times out on its own; this only guards against it never
+    // answering
     let mut pfd = [(fd, libc::POLLIN, 0)];
     if !matches!(super::poll(&mut pfd, Some(Duration::from_secs(30))), Ok(1)) {
         unsafe { android_res_cancel(fd) };
@@ -570,11 +578,12 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     Ok(answer)
 }
 
-/// 把一个 DNS 查询（报文）交给宿主解析，返回回答的报文（kernel/net 的 map 里的 DNS 存根）。
+/// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
+/// stub in the kernel/net map).
 ///
-/// Android 上交给 `android_res_nsend`，私人 DNS、VPN 和按网络分流的设置都会生效；
-/// 其他宿主上依次询问宿主 `/etc/resolv.conf` 里的名字服务器。会阻塞，调用方不能
-/// 持有锁。
+/// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
+/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
+/// in turn. It blocks, so the caller must not hold locks.
 #[cfg(not(target_os = "android"))]
 pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     if query.len() < 12 {
@@ -594,7 +603,8 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
 mod tests {
     use super::*;
 
-    /// docker 容器里的 `/proc/net/route`、`/proc/net/ipv6_route`：只要主表的单播路由。
+    /// `/proc/net/route` and `/proc/net/ipv6_route` in a docker container: only the main table's
+    /// unicast routes are kept.
     #[test]
     fn parses_the_host_routing_tables() {
         let v4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
