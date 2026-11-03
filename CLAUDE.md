@@ -1,3 +1,8 @@
+## Language
+
+- Write code comments, doc comments and developer-facing messages (assertions, panics, logs, script output) in English, using the terms of the module's map.
+- `docs/rounds/` stays in Chinese; user-facing Android strings are localized in `res/values*/strings.xml`.
+
 ## Knowledge Loop Conventions
 
 ### Before editing code
