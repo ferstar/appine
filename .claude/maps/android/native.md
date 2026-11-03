@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-03 (targeted verification: `scripts/release-sources` moved into this module)
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -121,9 +121,8 @@ what the app does with them (the other `android/*` modules).
   statement drops the removed `Arc` before the guard; when it is the last reference, the store sync
   and thread joins block every other JNI call (including main-thread console calls). `stop` avoids
   this on purpose.
-- **Panics outside the kernel's wrapped calls abort the app** (see the list above), although the
-  crate's doc says panics never cross JNI; for example `setRoutes`' route parsing slices bytes
-  without an ASCII check.
+- **Panics outside the kernel's wrapped calls abort the app** (see the list above); for example
+  `setRoutes`' route parsing slices bytes without an ASCII check.
 - The release build is signed with the debug key and not minified; the Alpine tarball is picked by
   the lexically greatest file name (3.9 sorts after 3.10), with the checksum checked only in
   `scripts/fetch-rootfs`.

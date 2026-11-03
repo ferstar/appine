@@ -1113,7 +1113,7 @@ class TerminalService : Service() {
         private const val PROBLEMS_CHANNEL_ID = "problems"
         /**
          * The boot failure notification; notifications of ended processes are numbered by pid
-         * (offset from the listen ones).
+         * (offset from the listen ones, but a listen on port 2000–2999 gets the same id as a kill).
          */
         private const val BOOT_NOTIFICATION_ID = 2
         private const val KILL_NOTIFICATION_BASE = 3000

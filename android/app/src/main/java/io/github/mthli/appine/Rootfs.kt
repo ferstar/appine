@@ -331,15 +331,6 @@ internal object Rootfs {
         Native.writeFile(store, path, text.toByteArray(), 420 /* 0644 */, overwrite)
 
     /**
-     * An `/etc/network/interfaces` with only the loopback interface (written before every kernel
-     * start, only when missing; one the user changed is left alone), the same as setup-alpine
-     * writes. The network is the host's (the kernel/net map); services that need the network (nginx
-     * and so on) have OpenRC bring up networking, which fails without this file, and then the
-     * services do not start either. `rc_provide` in rc.conf is not used: it is added to every
-     * service, and providing `clock` as well makes a cycle. Without OpenRC and ifupdown nobody
-     * reads this file.
-     */
-    /**
      * Run in the guest before every boot (`sh -c`): when OpenRC is installed and none of
      * hwclock/osclock/swclock is in any runlevel, adds osclock to boot. busybox's syslog does
      * `need clock`, and OpenRC provides clock with hwclock by default, which cannot read an RTC or
@@ -352,6 +343,15 @@ internal object Rootfs {
         "[ -e \"\$l\" ] || [ -L \"\$l\" ] && exit 0; done; done; " +
         "exec /sbin/rc-update -q add osclock boot >/dev/null 2>&1"
 
+    /**
+     * An `/etc/network/interfaces` with only the loopback interface (written before every kernel
+     * start, only when missing; one the user changed is left alone), the same as setup-alpine
+     * writes. The network is the host's (the kernel/net map); services that need the network (nginx
+     * and so on) have OpenRC bring up networking, which fails without this file, and then the
+     * services do not start either. `rc_provide` in rc.conf is not used: it is added to every
+     * service, and providing `clock` as well makes a cycle. Without OpenRC and ifupdown nobody
+     * reads this file.
+     */
     @Throws(IOException::class)
     fun ensureNetworkConfig(context: Context) = write(
         store(context).path, "/etc/network/interfaces",

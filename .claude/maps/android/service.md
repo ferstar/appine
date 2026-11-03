@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/service.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -173,7 +175,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - **Finished tabs keep the service alive.** A shell that exits while the UI is away leaves its ✕
   session in `sessions`, so the exit rule never fires; its exit also does not trigger a save.
 - **Notification ids collide.** Listens use 1000 + guest port and kills 3000 + pid % 1000, so ports
-  2000–2999 clash with kill notifications (the comment claims they are apart), and a later kill with
+  2000–2999 clash with kill notifications, and a later kill with
   the same pid % 1000 replaces an earlier bug notification and its "copy report".
 - **Kill messages can go unseen.** With Settings open, or another tab in front, an OOM message goes
   only to its tab and no notification is posted.

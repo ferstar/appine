@@ -9,9 +9,11 @@
 //! the table, and later calls with the handle (such as `closeConsole`, cleaned up only after the
 //! session ends) do not find it and treat the console as closed.
 //! Errors throw `java.io.IOException`. Blocking calls (reading a console, waiting for a process to
-//! end) are made by Kotlin on background threads. Kernel-layer bugs (panics) are caught inside the
-//! [`Machine`] methods and become errors of these calls; they do not cross the JNI boundary and
-//! abort the app process.
+//! end) are made by Kotlin on background threads. Kernel-layer bugs (panics) are meant to be caught
+//! inside the [`Machine`] methods and become errors of these calls, so that they do not cross the
+//! JNI boundary and abort the app process. Only the methods that wrap their work in the kernel's
+//! `host_call` do so: a panic in an unwrapped one (such as [`Machine::wait`] or the wait loops of
+//! console reads) or in this crate's own code still aborts the app.
 //!
 //! Compiled only for Android; on other hosts it is an empty library.
 #![cfg(target_os = "android")]
@@ -796,11 +798,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     array.into_raw()
 }
 
-/// Takes the ports the guest listened on for the first time on a non-loopback address (design doc
-/// §12 item 7): each entry is `<process name>\t<port>\t<host port>`; an empty array when there are
-/// none.
-/// Directories whose entries the guest changed (written as by [`browse::encode_path`], that is,
-/// document IDs): the Files app refreshes them.
+/// Takes the directories whose entries the guest changed (written as by [`browse::encode_path`],
+/// that is, document IDs): the Files app refreshes them.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
     mut env: JNIEnv<'l>,
@@ -816,6 +815,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
     string_array(&mut env, &dirs)
 }
 
+/// Takes the ports the guest listened on for the first time on a non-loopback address (design doc
+/// §12 item 7): each entry is `<process name>\t<port>\t<host port>`; an empty array when there are
+/// none.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
     mut env: JNIEnv<'l>,

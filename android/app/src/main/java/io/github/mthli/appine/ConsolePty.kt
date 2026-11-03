@@ -61,8 +61,10 @@ internal class ConsolePty(
 
         /**
          * The login script (the assets' `login.sh`): chooses the account; when a regular user first
-         * becomes the login account, adds it to the admin group and installs doas or sudo, then
-         * `su -l` to it; root logs in with the shell in `/etc/passwd` (also after chsh changed it).
+         * becomes the login account, adds it to the admin group and installs doas or sudo. A
+         * regular user is switched to with `su` (`--session-command` when offered, else `-c`)
+         * running `exec "$SHELL" -l` in the start directory or home; root logs in with the shell in
+         * `/etc/passwd` (also after chsh changed it).
          */
         fun script(context: Context): String = cached
             ?: context.assets.open("login.sh").bufferedReader().readText().also { cached = it }
