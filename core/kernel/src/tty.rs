@@ -1,11 +1,14 @@
-//! 进程内的 PTY 与行规程（kernel/tty 的 map）。
+//! In-process PTYs and the line discipline (the kernel/tty map).
 //!
-//! 一个 [`Tty`] 就是一对 PTY 的全部状态：从设备的 termios、窗口大小、输入队列
-//! （规范模式下按行组织）、输出队列，以及作业控制需要的会话和前台进程组。主设备
-//! 写入的是"键盘输入"，经过行规程处理（ICRNL、回显、行编辑、ISIG）进入输入队列；
-//! 从设备写入的数据经过输出处理（ONLCR）进入输出队列，由主设备读走。
+//! One [`Tty`] is the whole state of a PTY pair: the slave's termios, the window size, the input
+//! queue (organized by lines in canonical mode), the output queue, and the session and foreground
+//! process group job control needs. What the master writes is "keyboard input", which goes
+//! through the line discipline (ICRNL, echo, line editing, ISIG) into the input queue; data the
+//! slave writes goes through output processing (ONLCR) into the output queue, from which the
+//! master reads it.
 //!
-//! 这里只有纯数据结构和行规程；阻塞、信号和作业控制的检查在 syscall 层完成。
+//! Only plain data structures and the line discipline live here; blocking, signals and job
+//! control checks are done in the syscall layer.
 
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
@@ -14,19 +17,22 @@ use crate::cell::RefCell;
 use crate::kernel::{Tid, request_wake_object, wake};
 use crate::process::Signal;
 
-/// PTY 从设备的主设备号（`/dev/pts/<n>`）。
+/// The major number of PTY slaves (`/dev/pts/<n>`).
 pub const PTS_MAJOR: u32 = 136;
 
-/// tty 组：devpts 挂载时的 `gid=5`（mountinfo 里也这样写），新的终端都属于它。
+/// The tty group: `gid=5` when devpts is mounted (also written so in mountinfo); every new
+/// terminal belongs to it.
 pub const TTY_GID: u32 = 5;
 
-/// 开机时挂在 `/dev/pts` 的 devpts 实例的设备号（[`crate::vfs::Fs::dev`]），也是它的编号。
+/// The device number of the devpts instance mounted at `/dev/pts` at boot
+/// ([`crate::vfs::Fs::dev`]), which is also its id.
 pub(crate) const BOOT_PTS: u64 = 0x18;
-/// 一个 devpts 实例最多的终端数（`NR_UNIX98_PTY_MAX`）。
+/// The most terminals one devpts instance can have (`NR_UNIX98_PTY_MAX`).
 pub(crate) const PTY_MAX: u32 = 1 << 20;
 
-/// devpts 实例的挂载选项（Linux 的 `pts_mount_opts`）：新终端的属主、属组（没给时是建立
-/// 它的进程的 fsuid、fsgid）和权限位，ptmx 的权限位，终端数的上限。
+/// Mount options of a devpts instance (Linux's `pts_mount_opts`): the owner and group of new
+/// terminals (when not given, the fsuid and fsgid of the process creating it) and their mode, the
+/// mode of ptmx, and the limit on the number of terminals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PtsOptions {
     pub uid: Option<u32>,
@@ -37,7 +43,8 @@ pub(crate) struct PtsOptions {
 }
 
 impl PtsOptions {
-    /// 开机时的实例：与 docker 给容器挂的一样（`gid=5,mode=620,ptmxmode=666`）。
+    /// The boot instance: the same as docker mounts for containers
+    /// (`gid=5,mode=620,ptmxmode=666`).
     pub const BOOT: PtsOptions = PtsOptions {
         uid: None,
         gid: Some(TTY_GID),
@@ -46,9 +53,10 @@ impl PtsOptions {
         max: PTY_MAX,
     };
 
-    /// 解析 mount(2) 的选项（`devpts_parse_param`）：uid、gid 是十进制，在调用者的用户
-    /// 命名空间里要映射得到（`uid_in` 换成内核 ID），mode、ptmxmode 是八进制；`newinstance`
-    /// 从 4.7 起不起作用；别的、格式不对都是 EINVAL。没给的是默认值（`mode=600,ptmxmode=000`）。
+    /// Parses mount(2) options (`devpts_parse_param`): uid and gid are decimal and must be
+    /// mappable in the caller's user namespace (`uid_in` converts to kernel IDs), mode and
+    /// ptmxmode are octal; `newinstance` has had no effect since 4.7; anything else, or a bad
+    /// format, is EINVAL. Options not given take the defaults (`mode=600,ptmxmode=000`).
     pub fn parse(
         data: &[u8],
         uid_in: impl Fn(u32) -> Option<u32>,
@@ -91,7 +99,7 @@ impl PtsOptions {
         Ok(o)
     }
 
-    /// mountinfo 里的超级块选项（`devpts_show_options`）。
+    /// The superblock options in mountinfo (`devpts_show_options`).
     pub fn show(&self) -> String {
         let mut s = String::new();
         if let Some(u) = self.uid {
@@ -107,103 +115,106 @@ impl PtsOptions {
         s
     }
 }
-/// 输入队列的容量（Linux 的 `N_TTY_BUF_SIZE`）。
+/// The input queue capacity (Linux's `N_TTY_BUF_SIZE`).
 pub const INPUT_MAX: usize = 4096;
-/// 输出队列的容量：从设备写满之后阻塞，直到主设备读走。
+/// The output queue capacity: once the slave has filled it, writes block until the master reads.
 pub const OUTPUT_MAX: usize = 64 * 1024;
 
-/// termios 的标志位（asm-generic 的取值）。
+/// termios flag bits (asm-generic values).
 pub mod flags {
-    /// 去掉第 8 位。
+    /// Strip the 8th bit.
     pub const ISTRIP: u32 = 0o40;
-    /// NL 转成 CR。
+    /// Translate NL to CR.
     pub const INLCR: u32 = 0o100;
-    /// 忽略 CR。
+    /// Ignore CR.
     pub const IGNCR: u32 = 0o200;
-    /// CR 转成 NL。
+    /// Translate CR to NL.
     pub const ICRNL: u32 = 0o400;
-    /// ^S/^Q 流控。
+    /// ^S/^Q flow control.
     pub const IXON: u32 = 0o2000;
-    /// 任意字符都能恢复被 ^S 停止的输出。
+    /// Any character restarts output stopped by ^S.
     pub const IXANY: u32 = 0o4000;
-    /// 输入是 UTF-8（退格按字符删除）。
+    /// Input is UTF-8 (erase deletes by character).
     pub const IUTF8: u32 = 0o40000;
 
-    /// 输出处理。
+    /// Output processing.
     pub const OPOST: u32 = 0o1;
-    /// 输出时 NL 转成 CR NL。
+    /// Translate NL to CR NL on output.
     pub const ONLCR: u32 = 0o4;
-    /// 输出时 CR 转成 NL。
+    /// Translate CR to NL on output.
     pub const OCRNL: u32 = 0o10;
 
-    /// 字符宽度的几位。
+    /// The character size bits.
     pub const CSIZE: u32 = 0o60;
-    /// 8 位字符。
+    /// 8-bit characters.
     pub const CS8: u32 = 0o60;
-    /// 允许接收。
+    /// Enable the receiver.
     pub const CREAD: u32 = 0o200;
-    /// 奇偶校验。
+    /// Parity.
     pub const PARENB: u32 = 0o400;
-    /// 输出速率的几位：低 4 位是 B0–B38400，加上 `CBAUDEX` 是 B57600 起的 15 档。
+    /// The output speed bits: the low 4 bits are B0–B38400, and with `CBAUDEX` 15 more steps from
+    /// B57600.
     pub const CBAUD: u32 = 0o10017;
-    /// `CBAUD` 里的扩展位。
+    /// The extension bit within `CBAUD`.
     pub const CBAUDEX: u32 = 0o10000;
-    /// 只有 `CBAUDEX` 时表示速率另写在 `c_ospeed`（输入速率的几位里是 `c_ispeed`）。
+    /// `CBAUDEX` alone means the speed is given separately in `c_ospeed` (in `c_ispeed` for the
+    /// input speed bits).
     pub const BOTHER: u32 = 0o10000;
-    /// 输入速率在 `CBAUD` 左移这么多位的地方（`CIBAUD`），0 表示与输出相同。
+    /// The input speed is at `CBAUD` shifted left by this many bits (`CIBAUD`); 0 means the same as
+    /// the output.
     pub const IBSHIFT: u32 = 16;
-    /// 地址位（RS-485），只能经由驱动改。
+    /// The address bit (RS-485), changeable only through the driver.
     pub const ADDRB: u32 = 0o4000000000;
-    /// 波特率 38400。
+    /// Baud rate 38400.
     pub const B38400: u32 = 0o17;
 
-    /// INTR、QUIT、SUSP 产生信号。
+    /// INTR, QUIT and SUSP generate signals.
     pub const ISIG: u32 = 0o1;
-    /// 规范模式（行编辑）。
+    /// Canonical mode (line editing).
     pub const ICANON: u32 = 0o2;
-    /// 回显。
+    /// Echo.
     pub const ECHO: u32 = 0o10;
-    /// ERASE 回显成退格。
+    /// ERASE echoes as backspace.
     pub const ECHOE: u32 = 0o20;
-    /// KILL 之后回显换行。
+    /// Echo a newline after KILL.
     pub const ECHOK: u32 = 0o40;
-    /// 关闭 ECHO 时仍然回显 NL。
+    /// Echo NL even when ECHO is off.
     pub const ECHONL: u32 = 0o100;
-    /// 产生信号时不清空队列。
+    /// Do not flush the queues when generating signals.
     pub const NOFLSH: u32 = 0o200;
-    /// 后台进程写终端时产生 SIGTTOU。
+    /// Background processes writing the terminal get SIGTTOU.
     pub const TOSTOP: u32 = 0o400;
-    /// 控制字符回显成 `^X`。
+    /// Echo control characters as `^X`.
     pub const ECHOCTL: u32 = 0o1000;
-    /// KILL 逐个字符擦掉整行。
+    /// KILL erases the whole line character by character.
     pub const ECHOKE: u32 = 0o4000;
-    /// 扩展功能（LNEXT、WERASE、REPRINT）。
+    /// Extended functions (LNEXT, WERASE, REPRINT).
     pub const IEXTEN: u32 = 0o100000;
-    /// 行编辑由外部（主设备那边）做。
+    /// Line editing is done externally (on the master side).
     pub const EXTPROC: u32 = 0o200000;
 }
 
-/// 包模式（TIOCPKT）下主设备读到的状态字节（`TIOCPKT_*`）。
+/// The status bytes the master reads in packet mode (TIOCPKT) (`TIOCPKT_*`).
 pub mod pkt {
-    /// 后面是数据。
+    /// Data follows.
     pub const DATA: u8 = 0;
-    /// 从设备的输入被清空了。
+    /// The slave's input was flushed.
     pub const FLUSHREAD: u8 = 1;
-    /// 从设备的输出被清空了。
+    /// The slave's output was flushed.
     pub const FLUSHWRITE: u8 = 2;
-    /// 从设备的输出被停住了（^S、TCOOFF）。
+    /// The slave's output was stopped (^S, TCOOFF).
     pub const STOP: u8 = 4;
-    /// 恢复了。
+    /// Restarted.
     pub const START: u8 = 8;
-    /// 不再是 ^S/^Q 流控。
+    /// No longer ^S/^Q flow control.
     pub const NOSTOP: u8 = 16;
-    /// 改成了 ^S/^Q 流控。
+    /// Changed to ^S/^Q flow control.
     pub const DOSTOP: u8 = 32;
-    /// 设置了 EXTPROC 时 termios 变了。
+    /// termios changed while EXTPROC is set.
     pub const IOCTL: u8 = 64;
 }
 
-/// `c_cc` 的下标。
+/// Indices into `c_cc`.
 pub mod cc {
     pub const VINTR: usize = 0;
     pub const VQUIT: usize = 1;
@@ -220,15 +231,16 @@ pub mod cc {
     pub const VWERASE: usize = 14;
     pub const VLNEXT: usize = 15;
     pub const VEOL2: usize = 16;
-    /// `c_cc` 的长度（asm-generic 的 `NCCS`）。
+    /// The length of `c_cc` (asm-generic's `NCCS`).
     pub const NCCS: usize = 19;
 }
 
 use cc::*;
 use flags::*;
 
-/// 内核的 `ktermios`，即 asm-generic 的 `struct termios2`（44 字节）：`struct termios`
-/// （36 字节，TCGETS、TCSETS 用）后面接着输入、输出速率（TCGETS2、TCSETS2 用）。
+/// The kernel's `ktermios`, that is asm-generic's `struct termios2` (44 bytes): `struct termios`
+/// (36 bytes, used by TCGETS and TCSETS) followed by the input and output speeds (used by TCGETS2
+/// and TCSETS2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Termios {
     pub iflag: u32,
@@ -241,15 +253,15 @@ pub struct Termios {
     pub ospeed: u32,
 }
 
-/// `CBAUD` 各档的速率（Linux 的 `baud_table`，不是 sparc 的那份）：B0–B38400，之后是
-/// `CBAUDEX` 加 1–15。
+/// The speeds of the `CBAUD` steps (Linux's `baud_table`, not the sparc one): B0–B38400, then
+/// `CBAUDEX` plus 1–15.
 const BAUD_TABLE: [u32; 31] = [
     0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
     115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
     3000000, 3500000, 4000000,
 ];
 
-/// 一组 `CBAUD` 位对应的速率；`BOTHER` 时是 `other`。
+/// The speed for a set of `CBAUD` bits; `other` for `BOTHER`.
 fn baud(cbaud: u32, other: u32) -> u32 {
     if cbaud == BOTHER {
         return other;
@@ -263,7 +275,7 @@ fn baud(cbaud: u32, other: u32) -> u32 {
 }
 
 impl Default for Termios {
-    /// PTY 从设备的初始设置，与 Linux 的 `tty_std_termios` 相同。
+    /// The initial settings of a PTY slave, the same as Linux's `tty_std_termios`.
     fn default() -> Self {
         let mut c = [0u8; NCCS];
         c[..17].copy_from_slice(
@@ -283,7 +295,7 @@ impl Default for Termios {
 }
 
 impl Termios {
-    /// 编码成 guest 的 `struct termios2`；前 36 字节就是 `struct termios`。
+    /// Encodes as the guest's `struct termios2`; the first 36 bytes are `struct termios`.
     pub fn encode(&self) -> [u8; 44] {
         let mut b = [0u8; 44];
         for (i, v) in [self.iflag, self.oflag, self.cflag, self.lflag]
@@ -299,7 +311,7 @@ impl Termios {
         b
     }
 
-    /// 从 guest 的 `struct termios2` 解码。
+    /// Decodes from the guest's `struct termios2`.
     pub fn decode(b: &[u8; 44]) -> Termios {
         let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let mut c = [0u8; NCCS];
@@ -316,9 +328,10 @@ impl Termios {
         }
     }
 
-    /// 按 `CBAUD`、`CIBAUD` 填好两个速率（Linux 的 `set_termios` 在设置之前做的，
-    /// `tty_termios_baud_rate`、`tty_termios_input_baud_rate`）：用老的 `Bxxx` 写法设置时
-    /// 速率字段也总是可用的，`BOTHER` 时沿用字段里的值。输入速率的几位是 0 时与输出相同。
+    /// Fills in both speeds from `CBAUD` and `CIBAUD` (what Linux's `set_termios` does before
+    /// applying the settings, `tty_termios_baud_rate`, `tty_termios_input_baud_rate`): the speed
+    /// fields are always usable even when set the old `Bxxx` way, and with `BOTHER` the values in
+    /// the fields are kept. When the input speed bits are 0 it is the same as the output.
     pub fn load_speeds(&mut self) {
         let ospeed = baud(self.cflag & CBAUD, self.ospeed);
         let input = (self.cflag >> IBSHIFT) & CBAUD;
@@ -338,13 +351,13 @@ impl Termios {
         self.iflag & f != 0
     }
 
-    /// `c` 是不是某个特殊字符（`_POSIX_VDISABLE` 即 0 表示禁用）。
+    /// Whether `c` is a given special character (`_POSIX_VDISABLE`, i.e. 0, means disabled).
     fn is(&self, c: u8, which: usize) -> bool {
         self.cc[which] != 0 && self.cc[which] == c
     }
 }
 
-/// 窗口大小（`struct winsize`）。
+/// The window size (`struct winsize`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Winsize {
     pub rows: u16,
@@ -354,7 +367,7 @@ pub struct Winsize {
 }
 
 impl Default for Winsize {
-    /// 不知道宿主终端的大小时控制台用的 24×80。
+    /// The 24×80 the console uses when the host terminal's size is unknown.
     fn default() -> Self {
         Winsize {
             rows: 24,
@@ -366,7 +379,7 @@ impl Default for Winsize {
 }
 
 impl Winsize {
-    /// 编码成 guest 的 `struct winsize`。
+    /// Encodes as the guest's `struct winsize`.
     pub fn encode(&self) -> [u8; 8] {
         let mut b = [0u8; 8];
         for (i, v) in [self.rows, self.cols, self.xpixel, self.ypixel]
@@ -378,7 +391,7 @@ impl Winsize {
         b
     }
 
-    /// 从 guest 的 `struct winsize` 解码。
+    /// Decodes from the guest's `struct winsize`.
     pub fn decode(b: &[u8; 8]) -> Winsize {
         let h = |i: usize| u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]);
         Winsize {
@@ -390,81 +403,91 @@ impl Winsize {
     }
 }
 
-/// 一对 PTY。
+/// A PTY pair.
 pub struct Tty {
-    /// `/dev/pts/<index>`。
+    /// `/dev/pts/<index>`.
     pub index: u32,
-    /// 所在的 devpts 实例（它的设备号，[`PtsOptions`]）。
+    /// The devpts instance it is in (its device number, [`PtsOptions`]).
     pub fs: u64,
     pub termios: Termios,
     pub winsize: Winsize,
-    /// 规范模式下正在编辑的一行。
+    /// The line being edited in canonical mode.
     editing: Vec<u8>,
-    /// 规范模式下已经完成、可以读走的行；空行表示 EOF（行首的 ^D）。
+    /// Lines completed in canonical mode and ready to be read; an empty line means EOF (^D at the
+    /// start of a line).
     lines: VecDeque<Vec<u8>>,
-    /// 非规范模式下可以读走的字节。
+    /// Bytes ready to be read in non-canonical mode.
     raw: VecDeque<u8>,
-    /// 等主设备读走的输出。
+    /// Output waiting for the master to read it.
     output: VecDeque<u8>,
-    /// 下一个字符按字面输入（LNEXT）。
+    /// The next character is entered literally (LNEXT).
     lnext: bool,
-    /// 从设备的输出被停住（^S 或 TCOOFF，Linux 的 `flow.stopped`）时，停住之前写出的、
-    /// 主设备照样能读走的字节数。停住期间从设备的写阻塞；之后的回显留到恢复时才给主设备
-    /// （Linux 把它们留在回显缓冲区里）。
+    /// While the slave's output is stopped (^S or TCOOFF, Linux's `flow.stopped`), the number of
+    /// bytes written before the stop that the master can still read. While stopped, slave writes
+    /// block; later echoes reach the master only when output restarts (Linux keeps them in the
+    /// echo buffer).
     held_from: Option<usize>,
-    /// 输出是被 TCOOFF 停住的：^Q 恢复不了，要 TCOON（Linux 的 `flow.tco_stopped`）。
+    /// The output was stopped by TCOOFF: ^Q cannot restart it, TCOON is needed (Linux's
+    /// `flow.tco_stopped`).
     tco_stopped: bool,
-    /// 主设备的输出被 TCOOFF 停住：主设备的写等到 TCOON。主设备的 termios 没有 IXON，
-    /// 只有 TCXONC 能停住它。
+    /// The master's output is stopped by TCOOFF: master writes wait until TCOON. The master's
+    /// termios has no IXON, so only TCXONC can stop it.
     pub master_stopped: bool,
-    /// 主设备在包模式（TIOCPKT）：每次读先给一个状态字节（[`pkt`]），之后是数据。
+    /// The master is in packet mode (TIOCPKT): each read first returns a status byte ([`pkt`]),
+    /// then data.
     pub packet: bool,
-    /// 包模式下还没读走的状态（Linux 记在从设备的 `ctrl.pktstatus`）。
+    /// Status not yet read in packet mode (Linux records it in the slave's `ctrl.pktstatus`).
     pub pktstatus: u8,
-    /// 以它为控制终端的会话。
+    /// The session that has it as controlling terminal.
     pub session: Option<Tid>,
-    /// 前台进程组。
+    /// The foreground process group.
     pub fg: Option<Tid>,
-    /// 打开着的主设备、从设备个数。
+    /// The numbers of open masters and slaves.
     pub masters: usize,
     pub slaves: usize,
-    /// 从设备打开过、现在全部关掉了（Linux 的 `TTY_OTHER_CLOSED`）：主设备的读是 EIO，poll
-    /// 带 POLLHUP；重新打开从设备时清掉。从来没打开过时不算，主设备的读照常阻塞。
+    /// The slave has been opened and now all its ends are closed (Linux's `TTY_OTHER_CLOSED`):
+    /// master reads are EIO and poll includes POLLHUP; cleared when a slave is opened again. A
+    /// slave never opened does not count, and master reads block as usual.
     pub slave_closed: bool,
-    /// 从设备是否还没有解锁（unlockpt）。
+    /// Whether the slave is still locked (unlockpt).
     pub locked: bool,
-    /// 主设备都关掉了，已经挂断（`syscall::tty::hang_up`）：打开着的从设备读返回 0，写和
-    /// ioctl 是 EIO，poll 总是就绪，带着 POLLERR、POLLHUP（Linux 的 `hung_up_tty_fops`）。
+    /// All masters are closed and it has been hung up (`syscall::tty::hang_up`): open slaves
+    /// read 0, writes and ioctls are EIO, and poll is always ready with POLLERR and POLLHUP
+    /// (Linux's `hung_up_tty_fops`).
     pub hung_up: bool,
-    /// 从设备、主设备这一边被 vhangup、TIOCVHANGUP 挂断过几次（`syscall::tty::vhangup`）：
-    /// 在那之前打开的文件都挂断了（[`Tty::hung`]），之后打开的照常能用。
+    /// How many times the slave and master sides were hung up by vhangup or TIOCVHANGUP
+    /// (`syscall::tty::vhangup`): files opened before that are hung up ([`Tty::hung`]), those
+    /// opened later work as usual.
     pub vhangups: [u32; 2],
-    /// 这一边挂断之后还没有重新打开过（Linux 的 `TTY_HUPPED`）：再挂断什么也不做。
+    /// This side has not been reopened since its hangup (Linux's `TTY_HUPPED`): hanging it up
+    /// again does nothing.
     pub hupped: [bool; 2],
-    /// `/dev/pts/<index>` 的属主、属组和权限位：与 Linux 按挂载选项 `gid=5,mode=620` 的
-    /// devpts 一样，属主是打开主设备的进程的 fsuid，属组是 tty，权限 0620；chown、chmod
-    /// 可以修改，记到终端关掉为止。
+    /// The owner, group and mode of `/dev/pts/<index>`: as with Linux devpts mounted with
+    /// `gid=5,mode=620`, the owner is the fsuid of the process that opened the master, the group
+    /// is tty and the mode 0620; chown and chmod can change them, and the change lasts until the
+    /// terminal is closed.
     pub owner: (u32, u32),
     pub mode: u32,
-    /// 输入（从设备读的）、输出（主设备读的）各来过几次数据：与 Linux 一样，每来一次
-    /// 都让读的一方的 `EPOLLET` 再触发一次。
+    /// How many times data arrived for input (read by the slave) and output (read by the master):
+    /// as on Linux, each arrival makes the reader's `EPOLLET` fire again.
     pub arrivals: [u64; 2],
-    /// `/dev/pts/<index>` 的访问、修改、状态改变时间（纳秒）：w、who 的空闲时间看访问
-    /// 时间（[`Tty::touch`]）。
+    /// The access, modification and status change times of `/dev/pts/<index>` (nanoseconds): the
+    /// idle time of w and who comes from the access time ([`Tty::touch`]).
     pub atime_ns: i64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
 }
 
 impl Tty {
-    /// 新建一对 PTY，两端都还没有打开。
+    /// Creates a PTY pair with neither end open yet.
     pub fn new(index: u32) -> Tty {
         let now = wall_ns();
         let fs = BOOT_PTS;
         Tty {
             index,
             termios: Termios::default(),
-            // 与 Linux 新分配的终端一样全是 0；控制台建好之后另外设（`terminal::open`）
+            // All 0, as for a terminal newly allocated by Linux; the console sets it separately
+            // once created (`terminal::open`)
             winsize: Winsize {
                 rows: 0,
                 cols: 0,
@@ -500,8 +523,9 @@ impl Tty {
         }
     }
 
-    /// 从设备读到了数据（`mtime` 为 false）或者写出了数据：与 Linux 6.1 的 `tty_update_time`
-    /// 一样只改秒，并且只在和原来相差 8 秒以上时才改，精确的时刻会泄露别人敲键盘的节奏。
+    /// The slave read data (`mtime` false) or wrote data: as with Linux 6.1's `tty_update_time`,
+    /// only the seconds change, and only when they differ from the old value by 8 seconds or more;
+    /// the exact moment would leak the rhythm of someone's typing.
     pub fn touch(&mut self, mtime: bool) {
         let sec = wall_ns().div_euclid(NS);
         let t = if mtime {
@@ -514,12 +538,13 @@ impl Tty {
         }
     }
 
-    /// 修改了属主、权限或者时间（chmod、chown、utimensat）：状态改变时间是现在。
+    /// The owner, mode or times were changed (chmod, chown, utimensat): the status change time
+    /// is now.
     pub fn changed(&mut self) {
         self.ctime_ns = wall_ns();
     }
 
-    /// 是不是规范模式（ICANON）。
+    /// Whether in canonical mode (ICANON).
     pub fn canonical(&self) -> bool {
         self.termios.l(ICANON)
     }
@@ -528,8 +553,9 @@ impl Tty {
         self.editing.len() + self.lines.iter().map(Vec::len).sum::<usize>() + self.raw.len()
     }
 
-    /// 输入队列还能接收多少字节（主设备的写入据此阻塞）。规范模式下这一行已经写满时
-    /// 仍然接收：多出来的字符被丢弃，只有行结束符有效，避免永远等不到换行。
+    /// How many more bytes the input queue can take (master writes block by this). In canonical
+    /// mode it still accepts input when the line is already full: the extra characters are dropped
+    /// and only line terminators take effect, so it never waits forever for a newline.
     pub fn input_room(&self) -> usize {
         if self.master_stopped {
             return 0;
@@ -542,7 +568,7 @@ impl Tty {
         }
     }
 
-    /// 从设备现在有没有可读的数据（规范模式下要有完整的一行）。
+    /// Whether the slave has data to read now (in canonical mode a complete line is needed).
     pub fn readable(&self) -> bool {
         if self.canonical() {
             !self.lines.is_empty()
@@ -551,12 +577,13 @@ impl Tty {
         }
     }
 
-    /// 非规范模式下已经到达的字节数（VMIN 用）。
+    /// The number of bytes that have arrived in non-canonical mode (for VMIN).
     pub fn raw_len(&self) -> usize {
         self.raw.len()
     }
 
-    /// 从设备的一次读：规范模式下最多一行，EOF 时返回 0。没有数据时返回 None。
+    /// One slave read: at most one line in canonical mode, returning 0 at EOF. Returns None when
+    /// there is no data.
     pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
         if self.canonical() {
             let line = self.lines.front_mut()?;
@@ -579,7 +606,7 @@ impl Tty {
         }
     }
 
-    /// 输入队列里可读的字节数（FIONREAD）。
+    /// The number of readable bytes in the input queue (FIONREAD).
     pub fn input_len(&self) -> usize {
         if self.canonical() {
             self.lines.iter().map(Vec::len).sum()
@@ -588,12 +615,13 @@ impl Tty {
         }
     }
 
-    /// 输出队列里的字节数（TIOCOUTQ）。
+    /// The number of bytes in the output queue (TIOCOUTQ).
     pub fn output_len(&self) -> usize {
         self.output.len()
     }
 
-    /// 输出队列还能接收多少字节：输出被停住时不接收（Linux 的 `pty_write_room`）。
+    /// How many more bytes the output queue can take: none while output is stopped (Linux's
+    /// `pty_write_room`).
     pub fn output_room(&self) -> usize {
         if self.held_from.is_some() {
             return 0;
@@ -601,13 +629,13 @@ impl Tty {
         OUTPUT_MAX.saturating_sub(self.output.len())
     }
 
-    /// 主设备现在能读走的字节数（[`Tty::held_from`]）。
+    /// The number of bytes the master can read now ([`Tty::held_from`]).
     fn visible(&self) -> usize {
         self.held_from
             .map_or(self.output.len(), |v| v.min(self.output.len()))
     }
 
-    /// 主设备的一次读：取走输出。
+    /// One master read: takes output.
     pub fn take_output(&mut self, max: usize) -> Vec<u8> {
         let n = max.min(self.visible());
         if let Some(v) = self.held_from.as_mut() {
@@ -616,13 +644,13 @@ impl Tty {
         self.output.drain(..n).collect()
     }
 
-    /// 主设备有没有可读的输出。
+    /// Whether the master has output to read.
     pub fn has_output(&self) -> bool {
         self.visible() > 0
     }
 
-    /// 包模式下记下状态 `set`、去掉 `clear`，主设备的读者随之可读（Linux 只在主设备
-    /// 是包模式时才记）。
+    /// In packet mode, records status `set` and removes `clear`, which makes the master's readers
+    /// ready (Linux records it only when the master is in packet mode).
     fn report(&mut self, set: u8, clear: u8) {
         if self.packet {
             self.pktstatus = self.pktstatus & !clear | set;
@@ -630,8 +658,8 @@ impl Tty {
         }
     }
 
-    /// 包模式下报告从设备这一边的清空（Linux 的 `n_tty_packet_mode_flush` 是输入，
-    /// `pty_flush_buffer` 是输出）。主设备那边的清空不报告。
+    /// In packet mode, reports a flush on the slave side (Linux's `n_tty_packet_mode_flush` for
+    /// input, `pty_flush_buffer` for output). Flushes on the master side are not reported.
     pub fn report_flush(&mut self, input: bool, output: bool) {
         let set = if input { pkt::FLUSHREAD } else { 0 } | if output { pkt::FLUSHWRITE } else { 0 };
         if set != 0 {
@@ -639,7 +667,7 @@ impl Tty {
         }
     }
 
-    /// 包模式下主设备的一次读要给的状态字节，取走它。
+    /// The status byte one master read returns in packet mode; takes it.
     pub fn take_pktstatus(&mut self) -> Option<u8> {
         if self.packet && self.pktstatus != 0 {
             Some(std::mem::take(&mut self.pktstatus))
@@ -648,7 +676,7 @@ impl Tty {
         }
     }
 
-    /// 停住从设备的输出（^S，Linux 的 `__stop_tty`，`pty_stop` 报告 STOP）。
+    /// Stops the slave's output (^S, Linux's `__stop_tty`; `pty_stop` reports STOP).
     fn stop(&mut self) {
         if self.held_from.is_none() {
             self.held_from = Some(self.output.len());
@@ -656,15 +684,15 @@ impl Tty {
         }
     }
 
-    /// 恢复从设备的输出（^Q、IXANY、产生信号时，Linux 的 `start_tty`，`pty_start` 报告
-    /// START）：TCOOFF 停住的不管。
+    /// Restarts the slave's output (^Q, IXANY, when generating signals; Linux's `start_tty`,
+    /// `pty_start` reports START): output stopped by TCOOFF is left alone.
     fn start(&mut self) {
         if !self.tco_stopped && self.held_from.take().is_some() {
             self.report(pkt::START, pkt::STOP);
         }
     }
 
-    /// 从设备上的 TCOOFF。
+    /// TCOOFF on the slave.
     pub fn stop_output(&mut self) {
         if !self.tco_stopped {
             self.tco_stopped = true;
@@ -672,7 +700,7 @@ impl Tty {
         }
     }
 
-    /// 从设备上的 TCOON：^S 停住的也一起恢复。
+    /// TCOON on the slave: output stopped by ^S restarts too.
     pub fn start_output(&mut self) {
         if self.tco_stopped {
             self.tco_stopped = false;
@@ -680,8 +708,8 @@ impl Tty {
         }
     }
 
-    /// 从设备上的 TCIOFF、TCION：把 STOP、START 字符发给主设备，不受输出停住的限制，
-    /// 排在暂存的回显前面（Linux 的 `tty_send_xchar`）。
+    /// TCIOFF and TCION on the slave: sends the STOP or START character to the master, regardless
+    /// of stopped output, ahead of the held echoes (Linux's `tty_send_xchar`).
     pub fn send_xchar(&mut self, c: u8) {
         let at = self.visible();
         self.output.insert(at, c);
@@ -691,13 +719,14 @@ impl Tty {
         self.arrivals[1] += 1;
     }
 
-    /// 在这一边第 `born` 次 vhangup 之后打开的文件（主设备是 `master`）已经挂断：从设备在
-    /// 主设备都关掉之后，两边在打开之后又被 vhangup、TIOCVHANGUP 挂断过时。
+    /// Whether a file opened after this side's `born`-th vhangup (on the master when `master`) has
+    /// been hung up: for the slave once all masters have closed, and for either side when it was
+    /// hung up again by vhangup or TIOCVHANGUP after the open.
     pub fn hung(&self, master: bool, born: u32) -> bool {
         (!master && self.hung_up) || self.vhangups[master as usize] != born
     }
 
-    /// 清空输入队列（TCIFLUSH、产生信号时）。
+    /// Flushes the input queue (TCIFLUSH, when generating signals).
     pub fn flush_input(&mut self) {
         self.editing.clear();
         self.lines.clear();
@@ -705,7 +734,7 @@ impl Tty {
         self.lnext = false;
     }
 
-    /// 清空输出队列（TCOFLUSH）。
+    /// Flushes the output queue (TCOFLUSH).
     pub fn flush_output(&mut self) {
         self.output.clear();
         if let Some(v) = self.held_from.as_mut() {
@@ -713,12 +742,14 @@ impl Tty {
         }
     }
 
-    /// 修改 termios。地址位不变（Linux 的 `tty_set_termios`），PTY 总是 8 位、不校验、
-    /// 允许接收（`pty_set_termios`）。规范模式开关时，在两种队列之间搬运已有的输入。
+    /// Changes termios. The address bit stays (Linux's `tty_set_termios`), and a PTY is always 8
+    /// bits, without parity, with the receiver enabled (`pty_set_termios`). When canonical mode is
+    /// switched on or off, input already queued is moved between the two queues.
     pub fn set_termios(&mut self, mut t: Termios) {
         t.cflag ^= (t.cflag ^ self.termios.cflag) & ADDRB;
         t.cflag = t.cflag & !(CSIZE | PARENB) | CS8 | CREAD;
-        // 包模式下报告 ^S/^Q 流控的开关，EXTPROC 时报告 termios 变了（`pty_set_termios`）
+        // In packet mode report ^S/^Q flow control being switched, and with EXTPROC report that
+        // termios changed (`pty_set_termios`)
         let flow = |t: &Termios| t.i(IXON) && t.cc[VSTOP] == 0o23 && t.cc[VSTART] == 0o21;
         let (old_flow, new_flow) = (flow(&self.termios), flow(&t));
         let extproc = (self.termios.lflag | t.lflag) & EXTPROC != 0;
@@ -742,7 +773,7 @@ impl Tty {
         }
     }
 
-    /// 从设备的写入：经过输出处理放进输出队列。
+    /// A slave write: goes through output processing into the output queue.
     pub fn write_output(&mut self, data: &[u8]) {
         for &c in data {
             self.put_output(c);
@@ -765,7 +796,7 @@ impl Tty {
         self.output.push_back(c);
     }
 
-    /// 回显一个字符：ECHOCTL 时控制字符显示成 `^X`。
+    /// Echoes a character: with ECHOCTL, control characters show as `^X`.
     fn echo(&mut self, c: u8) {
         if !self.termios.l(ECHO) {
             return;
@@ -777,7 +808,7 @@ impl Tty {
         }
     }
 
-    /// 擦掉屏幕上的一个字符（ECHOE）。控制字符回显时占两列。
+    /// Erases one character on the screen (ECHOE). Echoed control characters take two columns.
     fn echo_erase(&mut self, erased: &[u8]) {
         if !self.termios.l(ECHO) {
             return;
@@ -797,10 +828,11 @@ impl Tty {
         }
     }
 
-    /// 从正在编辑的行尾去掉一个字符（UTF-8 时去掉整个字符），返回去掉的字节。
+    /// Removes one character from the end of the line being edited (a whole character with
+    /// UTF-8) and returns the removed bytes.
     fn pop_char(&mut self) -> Option<Vec<u8>> {
         let mut erased = vec![self.editing.pop()?];
-        // UTF-8 的后续字节是 10xxxxxx：一直删到首字节为止
+        // UTF-8 continuation bytes are 10xxxxxx: keep deleting until the leading byte
         if self.termios.i(IUTF8) {
             while erased[0] & 0xc0 == 0x80 {
                 match self.editing.pop() {
@@ -812,8 +844,8 @@ impl Tty {
         Some(erased)
     }
 
-    /// 主设备的写入（来自终端的输入），返回要发给前台进程组的信号。
-    /// 调用方保证 `data` 不超过 [`Tty::input_room`]。
+    /// A master write (input from the terminal); returns the signals to send to the foreground
+    /// process group. The caller guarantees `data` does not exceed [`Tty::input_room`].
     pub fn write_input(&mut self, data: &[u8]) -> Vec<Signal> {
         let mut signals = Vec::new();
         let echoed = self.output.len();
@@ -900,7 +932,8 @@ impl Tty {
                 return None;
             }
             if t.l(IEXTEN) && t.is(c, VWERASE) {
-                // 先跳过行尾的空白，再删到下一个空白
+                // First skip whitespace at the end of the line, then delete up to the next
+                // whitespace
                 while self.editing.last().is_some_and(|b| b.is_ascii_whitespace()) {
                     let e = self.pop_char().unwrap();
                     self.echo_erase(&e);
@@ -939,7 +972,8 @@ impl Tty {
                 return None;
             }
             if t.is(c, VEOF) {
-                // 行首的 EOF 让读者读到 0；行中间的 EOF 把已有的内容交给读者
+                // EOF at the start of a line makes the reader read 0; EOF in the middle of a line
+                // hands what is there to the reader
                 let line = std::mem::take(&mut self.editing);
                 self.lines.push_back(line);
                 return None;
@@ -959,7 +993,8 @@ impl Tty {
         None
     }
 
-    /// 普通字符：规范模式下加进正在编辑的行（满了就丢弃），否则直接可读。
+    /// An ordinary character: in canonical mode it is added to the line being edited (dropped
+    /// when the line is full), otherwise it is readable at once.
     fn receive(&mut self, c: u8) {
         if self.canonical() {
             if self.editing.len() < INPUT_MAX - 1 {
@@ -973,18 +1008,19 @@ impl Tty {
     }
 }
 
-/// PTY 的一端，由一个打开文件持有；打开和关闭时维护两端的计数。
+/// One end of a PTY, held by an open file; opening and closing maintain the counts of both ends.
 pub struct PtyEnd {
     pub tty: Rc<RefCell<Tty>>,
-    /// 是不是主设备。
+    /// Whether this is the master.
     pub master: bool,
-    /// 经由的 devpts 挂载（终端所在的实例挂在哪里）：从设备的路径（fd 的链接、TIOCGPTPEER
-    /// 打开的）按它算。
+    /// The devpts mount it was opened through (where the terminal's instance is mounted): the
+    /// slave's path (the fd's link, what TIOCGPTPEER opens) is computed from it.
     pub mnt: crate::vfs::MountId,
-    /// 打开文件在那个挂载里（经由 devpts 里的路径、TIOCGPTPEER 打开的）：开着时卸不下它
-    /// （EBUSY）。经由别处的设备节点打开的不算。
+    /// The open file is in that mount (opened through a path in devpts, or by TIOCGPTPEER): while
+    /// it is open, the mount cannot be unmounted (EBUSY). Opening through a device node elsewhere
+    /// does not count.
     pub pin: bool,
-    /// 打开时这一边被 vhangup 过几次（[`Tty::hung`]）。
+    /// How many times this side had been vhangup'd at open ([`Tty::hung`]).
     pub born: u32,
 }
 
@@ -997,7 +1033,7 @@ impl PtyEnd {
             } else {
                 t.slaves += 1;
                 t.slave_closed = false;
-                // 重新打开之后又能挂断了（Linux 的 tty_open 清掉 TTY_HUPPED）
+                // After a reopen it can be hung up again (Linux's tty_open clears TTY_HUPPED)
                 t.hupped[0] = false;
             }
             t.vhangups[master as usize]
@@ -1011,7 +1047,7 @@ impl PtyEnd {
         }
     }
 
-    /// 经由 devpts 挂载 `mnt` 打开的；`pin` 时打开文件就在那个挂载里。
+    /// Opened through devpts mount `mnt`; with `pin`, the open file is in that mount.
     pub fn via(mut self, mnt: crate::vfs::MountId, pin: bool) -> PtyEnd {
         self.mnt = mnt;
         self.pin = pin;
@@ -1034,21 +1070,22 @@ impl Drop for PtyEnd {
         if closed {
             CLOSED.with_borrow_mut(|c| c.push(Rc::downgrade(&self.tty)));
         }
-        // 另一端要看到挂断
+        // The other end must see the hangup
         request_wake_object(wake::of(&self.tty));
     }
 }
 
 thread_local! {
-    /// 主设备都关掉了、还没有挂断的终端。关闭打开文件是在 Drop 里，拿不到内核，由放开
-    /// BKL 的线程在放开之前挂断（[`take_closed`]）。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// Terminals whose masters are all closed but which are not hung up yet. Open files are
+    /// closed in Drop, which cannot reach the kernel, so the thread releasing the BKL hangs them
+    /// up before releasing it ([`take_closed`]).
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy false positive
     static CLOSED: std::cell::RefCell<Vec<Weak<RefCell<Tty>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// 取走这个线程关掉了最后一个主设备、还没有挂断的终端（[`PtyEnd`] 记下的），由
-/// `syscall::tty::hang_up_closed` 挂断。
+/// Takes the terminals whose last master this thread closed and which are not hung up yet
+/// (recorded by [`PtyEnd`]), for `syscall::tty::hang_up_closed` to hang up.
 pub(crate) fn take_closed() -> Vec<Rc<RefCell<Tty>>> {
     if CLOSED.with_borrow(Vec::is_empty) {
         return Vec::new();
@@ -1057,10 +1094,10 @@ pub(crate) fn take_closed() -> Vec<Rc<RefCell<Tty>>> {
     closed.iter().filter_map(Weak::upgrade).collect()
 }
 
-/// 回显时显示成 `^X` 的控制字符：除 TAB、NL 之外的 C0 控制字符和 DEL。
+/// The control characters echoed as `^X`: the C0 control characters except TAB and NL, and DEL.
 const NS: i64 = 1_000_000_000;
 
-/// 现在的墙上时间（纳秒）。
+/// The current wall-clock time (nanoseconds).
 pub(crate) fn wall_ns() -> i64 {
     appine_hal::clock_gettime(0)
         .map(|(s, ns)| s * NS + ns)
@@ -1075,7 +1112,8 @@ fn is_ctrl(c: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// devpts 的选项：默认值、各种写法、错误，mountinfo 里的样子与 Linux 相同。
+    /// devpts options: defaults, the various spellings, errors, and the mountinfo form, as on
+    /// Linux.
     #[test]
     fn devpts_options() {
         let id = |x: u32| Some(x);
@@ -1096,7 +1134,7 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }
-        // 用户命名空间里映射不到的 uid
+        // A uid unmappable in the user namespace
         assert!(PtsOptions::parse(b"uid=7", |_| None, id).is_err());
         assert_eq!(PtsOptions::BOOT.show(), ",gid=5,mode=620,ptmxmode=666");
     }
@@ -1117,12 +1155,12 @@ mod tests {
             t.take_output(1024),
             b"helo\x08 \x08lo wor\x08 \x08\x08 \x08\x08 \x08world\r\n"
         );
-        // 行首 ^D 是 EOF，行中间的 ^D 交出已有的内容
+        // ^D at the start of a line is EOF, ^D in the middle of a line hands over what is there
         t.write_input(b"ab\x04\x04");
         assert_eq!(read_all(&mut t), b"ab");
         assert_eq!(t.read(&mut [0; 8]), Some(0));
         assert!(!t.readable());
-        // ^U 擦掉整行，^V 让下一个字符按字面输入
+        // ^U erases the whole line, ^V makes the next character literal
         t.write_input(b"junk\x15\x16\x03\n");
         assert_eq!(read_all(&mut t), b"\x03\n");
     }
@@ -1137,7 +1175,7 @@ mod tests {
         assert_eq!(t.write_input(b"\x1a\x1c"), vec![Signal::TSTP, Signal::QUIT]);
         t.write_input(b"x\n");
         assert_eq!(read_all(&mut t), b"x\n");
-        // 关掉 ISIG 之后 ^C 就是普通字符
+        // With ISIG off, ^C is an ordinary character
         let mut raw = t.termios;
         raw.lflag &= !(ISIG | ICANON | ECHO);
         t.set_termios(raw);
@@ -1175,12 +1213,12 @@ mod tests {
     fn reads_and_writes_touch_the_times_every_8_seconds() {
         let mut t = Tty::new(0);
         let sec = wall_ns().div_euclid(NS);
-        // 很久以前的时间：改成现在的秒，纳秒不变
+        // A time long ago: changed to the current second, nanoseconds unchanged
         t.atime_ns = 100 * NS + 123;
         t.touch(false);
         assert!((t.atime_ns.div_euclid(NS) - sec).abs() <= 1);
         assert_eq!(t.atime_ns.rem_euclid(NS), 123);
-        // 同一个 8 秒里不改
+        // Unchanged within the same 8 seconds
         t.mtime_ns = (sec & !7) * NS + 456;
         let before = t.mtime_ns;
         if wall_ns().div_euclid(NS) & !7 == sec & !7 {
@@ -1194,7 +1232,8 @@ mod tests {
         let mut t = Tty::new(0);
         t.write_output(b"ab");
         t.write_input(b"\x13");
-        // 停住之前写出的照样能读，从设备不能再写，之后的回显留到恢复
+        // What was written before the stop can still be read, the slave cannot write any more,
+        // and later echoes wait until restart
         assert_eq!(t.output_room(), 0);
         assert_eq!(t.take_output(1), b"a");
         t.write_input(b"x");
@@ -1203,7 +1242,8 @@ mod tests {
         t.write_input(b"\x11");
         assert!(t.output_room() > 0);
         assert_eq!(t.take_output(16), b"x");
-        // TCOOFF 停住的 ^Q 恢复不了，要 TCOON；TCIOFF 发的字符不受停住的限制
+        // ^Q cannot restart output stopped by TCOOFF, TCOON is needed; characters sent by TCIOFF
+        // are not held by the stop
         t.stop_output();
         t.write_input(b"\x11");
         assert_eq!(t.output_room(), 0);
@@ -1228,11 +1268,11 @@ mod tests {
         let mut t = Termios::default();
         t.load_speeds();
         assert_eq!((t.ispeed, t.ospeed), (38400, 38400));
-        // B115200（CBAUDEX 加 2）输出、B1200 输入
+        // B115200 (CBAUDEX plus 2) output, B1200 input
         t.cflag = t.cflag & !CBAUD & !(CBAUD << IBSHIFT) | 0o10002 | (0o11 << IBSHIFT);
         t.load_speeds();
         assert_eq!((t.ispeed, t.ospeed), (1200, 115200));
-        // BOTHER 用字段里的速率；B0 时也是 0
+        // BOTHER uses the speed in the field; with B0 it is 0 too
         t.cflag = t.cflag & !CBAUD & !(CBAUD << IBSHIFT) | BOTHER | (BOTHER << IBSHIFT);
         (t.ispeed, t.ospeed) = (12345, 54321);
         t.load_speeds();

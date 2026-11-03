@@ -1,7 +1,8 @@
-//! PTY 的打开、读写和 ioctl，以及终端的作业控制（kernel/tty 的 map）。
+//! Opening, reading, writing and ioctls of PTYs, plus terminal job control (the kernel/tty map).
 //!
-//! 行规程在 [`crate::tty`] 里；这里负责阻塞和唤醒、会话与控制终端，以及后台进程组
-//! 读写终端时的 SIGTTIN/SIGTTOU。
+//! The line discipline is in [`crate::tty`]; this module handles blocking and waking, sessions
+//! and controlling terminals, and SIGTTIN/SIGTTOU when a background process group reads or writes
+//! the terminal.
 
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ const TCGETS: u32 = 0x5401;
 const TCSETS: u32 = 0x5402;
 const TCSETSW: u32 = 0x5403;
 const TCSETSF: u32 = 0x5404;
-/// 老式的 `struct termio`：标志只有低 16 位，控制字符只有 8 个。
+/// The old `struct termio`: only the low 16 bits of the flags and only 8 control characters.
 const TCGETA: u32 = 0x5405;
 const TCSETA: u32 = 0x5406;
 const TCSETAW: u32 = 0x5407;
@@ -44,23 +45,26 @@ const TIOCGETD: u32 = 0x5424;
 const TCSBRKP: u32 = 0x5425;
 const TIOCGSID: u32 = 0x5429;
 const TIOCVHANGUP: u32 = 0x5437;
-/// `struct termios2`：多了输入、输出速率（glibc 2.42 起 tcgetattr、tcsetattr 只用这几个）。
+/// `struct termios2`: adds input and output speeds (since glibc 2.42, tcgetattr and tcsetattr use
+/// only these).
 const TCGETS2: u32 = 0x802c_542a;
 const TCSETS2: u32 = 0x402c_542b;
 const TCSETSW2: u32 = 0x402c_542c;
 const TCSETSF2: u32 = 0x402c_542d;
-/// 主设备的包模式：设置、查询（[`crate::tty::pkt`]）。
+/// Packet mode of the master: set and query ([`crate::tty::pkt`]).
 const TIOCPKT: u32 = 0x5420;
 const TIOCGPKT: u32 = 0x8004_5438;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 const TIOCGPTLCK: u32 = 0x8004_5439;
-/// 经由主设备给从设备的前台进程组发信号（只能是 SIGINT、SIGQUIT、SIGTSTP）。
+/// Sends a signal through the master to the slave's foreground process group (only SIGINT,
+/// SIGQUIT, SIGTSTP).
 const TIOCSIG: u32 = 0x4004_5436;
 
-/// 在 devpts 实例 `fs`（设备号）里分配一对新的 PTY（Linux 的 `devpts_new_index`、
-/// `devpts_pty_new`）：编号是实例里最小的空着的，到了实例的 `max` 是 ENOSPC；从设备的属主、
-/// 属组、权限位按实例的选项，没给 uid、gid 时是调用者的 fsuid、fsgid。
+/// Allocates a new PTY pair in devpts instance `fs` (a device number) (Linux's
+/// `devpts_new_index`, `devpts_pty_new`): the index is the lowest free one in the instance, and
+/// reaching the instance's `max` is ENOSPC; the slave's owner, group and mode follow the
+/// instance's options, and without uid or gid options they are the caller's fsuid and fsgid.
 pub(crate) fn new_pty(
     k: &mut Kernel,
     fs: u64,
@@ -87,8 +91,8 @@ pub(crate) fn new_pty(
     Ok(tty)
 }
 
-/// 打开 ptmx：在 devpts 实例 `fs`（经由挂载 `mnt` 找到的）里分配一对新的 PTY，返回主设备。
-/// `pin` 是经由那个挂载里的 ptmx 打开的。
+/// Opens ptmx: allocates a new PTY pair in devpts instance `fs` (found through mount `mnt`) and
+/// returns the master. `pin`: it was opened through the ptmx in that mount.
 pub(crate) fn open_ptmx(
     k: &mut Kernel,
     (fs, mnt, pin): (u64, crate::vfs::MountId, bool),
@@ -98,8 +102,8 @@ pub(crate) fn open_ptmx(
     Ok(FileKind::Pty(PtyEnd::new(tty, true).via(mnt, pin)))
 }
 
-/// 打开 `/dev/pts/<n>`。会话组长在没有控制终端时打开它（且没有 `O_NOCTTY`），它就成为
-/// 控制终端，与 Linux 一样。
+/// Opens `/dev/pts/<n>`. When a session leader without a controlling terminal opens it (without
+/// `O_NOCTTY`), it becomes the controlling terminal, as on Linux.
 pub(crate) fn open_slave(
     cx: &mut Cx<'_>,
     (fs, index, mnt, pin): (u64, u32, crate::vfs::MountId, bool),
@@ -130,12 +134,12 @@ pub(crate) fn open_slave(
     Ok(FileKind::Pty(PtyEnd::new(tty, false).via(mnt, pin)))
 }
 
-/// 按主设备打开从设备（`TIOCGPTPEER`）。
+/// Opens the slave through the master (`TIOCGPTPEER`).
 pub(crate) const TIOCGPTPEER: u32 = 0x5441;
 
-/// TIOCGPTPEER（Linux 4.13 起的 `ptm_open_peer`）：按主设备打开对应的从设备，经由主设备
-/// 找到的那个 devpts 挂载，不经过路径、不查权限；`flags` 是 open 的标志，O_CLOEXEC 给新的
-/// fd。在从设备上是 EIO。
+/// TIOCGPTPEER (Linux's `ptm_open_peer`, since 4.13): opens the slave matching the master,
+/// through the devpts mount the master was found in, without a path lookup and without permission
+/// checks; `flags` are open flags, and O_CLOEXEC applies to the new fd. EIO on a slave.
 pub(crate) fn open_peer(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -152,7 +156,7 @@ pub(crate) fn open_peer(
     };
     let kind = open_slave(cx, (fs, index, mnt, true), flags)?;
     let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK;
-    // 路径是那个 devpts 挂载里的 <编号>（fd 的链接、ttyname 用它）
+    // The path is <number> in that devpts mount (used by the fd's link and ttyname)
     let vfs = cx.vfs()?;
     let node = crate::vfs::Node::Pseudo(mnt, crate::pseudo::PseudoNode::Pts(fs, index));
     let path = vfs.path_of(&cx.view(&vfs), &cx.root(), &node).ok();
@@ -166,14 +170,16 @@ pub(crate) fn open_peer(
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)? as u64)
 }
 
-/// 打开 `/dev/tty`：调用者的控制终端。
+/// Opens `/dev/tty`: the caller's controlling terminal.
 pub(crate) fn open_ctty(cx: &mut Cx<'_>) -> Result<FileKind, Errno> {
     let tty = cx.t.group.borrow().ctty.clone().ok_or(Errno::ENXIO)?;
     Ok(FileKind::Pty(PtyEnd::new(tty, false)))
 }
 
-/// 后台进程组访问控制终端（`sig` 是 SIGTTIN 或 SIGTTOU）：按 Linux 的 `tty_check_change`，
-/// 给自己的进程组发信号并让 syscall 重启；信号被忽略或屏蔽时，读返回 EIO，写和修改设置照常进行。
+/// A background process group accessing its controlling terminal (`sig` is SIGTTIN or SIGTTOU):
+/// following Linux's `tty_check_change`, signals its own process group and makes the syscall
+/// restart; when the signal is ignored or blocked, reads return EIO while writes and setting
+/// changes proceed as usual.
 fn check_background(cx: &mut Cx<'_>, tty: &Rc<RefCell<Tty>>, sig: Signal) -> Result<(), Errno> {
     let (pgid, is_ctty) = {
         let g = cx.t.group.borrow();
@@ -199,14 +205,16 @@ fn check_background(cx: &mut Cx<'_>, tty: &Rc<RefCell<Tty>>, sig: Signal) -> Res
     Err(Errno::ERESTARTSYS)
 }
 
-/// 给终端的前台进程组发信号（行规程产生的 SIGINT 等、窗口大小改变）。
+/// Sends a signal to the terminal's foreground process group (SIGINT and the like from the line
+/// discipline, window size changes).
 pub(crate) fn signal_fg(k: &Kernel, tty: &Rc<RefCell<Tty>>, sig: Signal) {
     if let Some(fg) = tty.borrow().fg {
         signal::send_to_pgrp(k, fg, sig, SigInfo::kernel());
     }
 }
 
-/// 从设备的读：规范模式下读一行；非规范模式按 VMIN/VTIME。`born` 见 [`Tty::hung`]。
+/// A slave read: one line in canonical mode; by VMIN/VTIME in non-canonical mode. For `born` see
+/// [`Tty::hung`].
 fn slave_read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -245,7 +253,8 @@ fn slave_read(
                 if vmin == 0 && (vtime.is_zero() || expired) {
                     return Ok(0);
                 }
-                // VTIME：VMIN 为 0 时从开始读算起，否则从收到第一个字节算起
+                // VTIME: with VMIN 0 it counts from the start of the read, otherwise from the
+                // first byte received
                 if !vtime.is_zero() && deadline.is_none() && (vmin == 0 || avail > 0) {
                     deadline = Some(Instant::now() + vtime);
                 }
@@ -264,7 +273,8 @@ fn slave_read(
     }
 }
 
-/// 从设备的写：经过输出处理，输出队列满时等主设备读走。
+/// A slave write: goes through output processing, and waits for the master to read when the
+/// output queue is full.
 fn slave_write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -307,9 +317,10 @@ fn slave_write(
     }
 }
 
-/// 主设备的读：取走输出。从设备打开过又全部关闭之后返回 EIO，主设备这一边被 TIOCVHANGUP
-/// 挂断了是 0。包模式下（Linux 的 `n_tty_read`）有状态时只读到那一个状态字节，否则数据
-/// 前面加一个 `TIOCPKT_DATA`（也占读的长度）。
+/// A master read: takes output. Returns EIO once the slave has been opened and then all its ends
+/// closed, and 0 when the master side was hung up by TIOCVHANGUP. In packet mode (Linux's
+/// `n_tty_read`), when there is a status only that one status byte is read; otherwise the data is
+/// preceded by a `TIOCPKT_DATA` (which also counts toward the read length).
 fn master_read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -354,7 +365,8 @@ fn master_read(
     }
 }
 
-/// 主设备的写：作为终端输入交给行规程，产生的信号发给前台进程组。
+/// A master write: hands the bytes to the line discipline as terminal input and sends the
+/// resulting signals to the foreground process group.
 fn master_write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -395,7 +407,7 @@ fn master_write(
     }
 }
 
-/// PTY 的一次读。`born` 是打开文件的 [`PtyEnd::born`]。
+/// One read of a PTY. `born` is the open file's [`PtyEnd::born`].
 pub(crate) fn read(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -414,7 +426,7 @@ pub(crate) fn read(
     }
 }
 
-/// PTY 的一次写。`born` 是打开文件的 [`PtyEnd::born`]。
+/// One write of a PTY. `born` is the open file's [`PtyEnd::born`].
 pub(crate) fn write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -433,12 +445,14 @@ pub(crate) fn write(
     }
 }
 
-/// 挂断终端（Linux 的 `__tty_hangup`）：会话组长收到 SIGHUP 和 SIGCONT，并且记下前台
-/// 进程组，等它退出时再发给它们（`process::release_ctty`）；会话里以它为控制终端的进程都
-/// 失去控制终端，打开着的从设备从此读到 EOF、写入失败（[`Tty::hung_up`]）。
-/// `/dev/pts/<n>` 随之消失，编号可以给新的终端（Linux 的 `devpts_pty_kill`）。最后一个
-/// 主设备关掉（Linux 的 `pty_close`，[`hang_up_closed`]）和关闭控制台
-/// （[`crate::terminal::close`]）时调用；已经挂断的什么也不做。
+/// Hangs up a terminal (Linux's `__tty_hangup`): the session leader receives SIGHUP and SIGCONT,
+/// and the foreground process group is recorded so that they are sent to it when the leader exits
+/// (`process::release_ctty`); the processes in the session that have it as controlling terminal
+/// lose it, and open slaves read EOF and fail writes from then on ([`Tty::hung_up`]).
+/// `/dev/pts/<n>` disappears with it and the index can go to a new terminal (Linux's
+/// `devpts_pty_kill`). Called when the last master is closed (Linux's `pty_close`,
+/// [`hang_up_closed`]) and when a console is closed ([`crate::terminal::close`]); does nothing
+/// for a terminal already hung up.
 pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
     let (key, session, fg) = {
         let mut t = tty.borrow_mut();
@@ -457,12 +471,14 @@ pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
     detach(k, tty, session, fg);
 }
 
-/// 挂断终端的一边（Linux 的 `tty_vhangup`，vhangup(2)、TIOCVHANGUP）：这一边打开着的文件
-/// 都挂断（[`Tty::hung`]），没读的输入丢掉（行规程的缓冲区随之清空）。从设备这一边还与
-/// [`hang_up`] 一样给会话组长发信号、让会话失去控制终端；与关掉主设备不同，
-/// `/dev/pts/<n>` 还在，重新打开就照常能用（login、agetty 靠这个赶走终端上留下的进程）。
-/// 主设备那边没有会话，只挂断主设备的文件、丢掉从设备还没被读走的输出。挂断之后还没有
-/// 重新打开过的什么也不做（Linux 的 `TTY_HUPPED`）。
+/// Hangs up one side of a terminal (Linux's `tty_vhangup`, vhangup(2), TIOCVHANGUP): every file
+/// open on this side is hung up ([`Tty::hung`]) and unread input is discarded (the line
+/// discipline's buffers are cleared with it). The slave side also signals the session leader and
+/// detaches the session from the controlling terminal, as [`hang_up`] does; unlike closing the
+/// master, `/dev/pts/<n>` stays and works again when reopened (login and agetty rely on this to
+/// chase leftover processes off the terminal). The master side has no session: only the master's
+/// files are hung up and the slave's output that has not been read yet is discarded. Does nothing
+/// when the side has not been reopened since its hangup (Linux's `TTY_HUPPED`).
 pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
     let side = master as usize;
     let session = {
@@ -476,7 +492,8 @@ pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
             t.flush_output();
             None
         } else {
-            // Linux 的 tty_ldisc_hangup 清空从设备的输入，之后 __tty_hangup 丢掉包模式的状态
+            // Linux's tty_ldisc_hangup flushes the slave's input, then __tty_hangup discards the
+            // packet-mode status
             t.flush_input();
             t.pktstatus = 0;
             Some((t.session.take(), t.fg.take()))
@@ -488,9 +505,10 @@ pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
     }
 }
 
-/// 挂断时的会话部分（Linux 的 `tty_signal_session_leader`）：以它为控制终端的进程都失去
-/// 控制终端，会话组长收到 SIGHUP 和 SIGCONT，并且记下前台进程组 `fg`，等它退出时再发给
-/// 它们（`process::release_ctty`）。叫醒等这个终端的线程。
+/// The session part of a hangup (Linux's `tty_signal_session_leader`): the processes that have it
+/// as controlling terminal lose it, the session leader receives SIGHUP and SIGCONT, and the
+/// foreground process group `fg` is recorded so that they are sent to it when the leader exits
+/// (`process::release_ctty`). Wakes the threads waiting on this terminal.
 fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Option<Tid>) {
     for g in k.groups.values() {
         let mut g = g.borrow_mut();
@@ -499,7 +517,8 @@ fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Opti
         }
     }
     if let Some(leader) = session {
-        // 组长退出时没有控制终端了，给这时的前台进程组发 SIGHUP（Linux 的 tty_old_pgrp）
+        // When the leader exits it has no controlling terminal any more, so SIGHUP goes to the
+        // foreground process group of this moment (Linux's tty_old_pgrp)
         if let Some(g) = k.groups.get(&leader) {
             g.borrow_mut().tty_old_pgrp = fg;
         }
@@ -509,9 +528,10 @@ fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Opti
     request_wake_object(wake::of(tty));
 }
 
-/// vhangup(2)：挂断调用者的控制终端（[`vhangup`]），没有控制终端时什么也不做。要
-/// `CAP_SYS_TTY_CONFIG`（Linux 的 capable()，只看开机时的用户命名空间）。调用者是会话组长
-/// 时自己也收到 SIGHUP、SIGCONT（login 先忽略 SIGHUP）。
+/// vhangup(2): hangs up the caller's controlling terminal ([`vhangup`]); does nothing without a
+/// controlling terminal. Requires `CAP_SYS_TTY_CONFIG` (Linux's capable(), which looks only at the
+/// boot user namespace). A caller that is the session leader also receives SIGHUP and SIGCONT
+/// itself (login ignores SIGHUP first).
 pub(super) fn vhangup_ctty(cx: &mut Cx<'_>) -> SysResult {
     if !cx.cred().capable(cap::SYS_TTY_CONFIG) {
         return Err(Errno::EPERM);
@@ -523,15 +543,15 @@ pub(super) fn vhangup_ctty(cx: &mut Cx<'_>) -> SysResult {
     Ok(0)
 }
 
-/// 挂断这个线程关掉了最后一个主设备的终端（[`crate::tty::take_closed`]）。放开 BKL 之前
-/// 调用（[`crate::kernel::Bkl`]）。
+/// Hangs up the terminals whose last master this thread closed ([`crate::tty::take_closed`]).
+/// Called before releasing the BKL ([`crate::kernel::Bkl`]).
 pub(crate) fn hang_up_closed(k: &mut Kernel) {
     for tty in crate::tty::take_closed() {
         hang_up(k, &tty);
     }
 }
 
-/// ppoll 的就绪状态。`born` 是打开文件的 [`PtyEnd::born`]。
+/// Readiness for ppoll. `born` is the open file's [`PtyEnd::born`].
 pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
     const POLLIN: i16 = 0x001;
     const POLLOUT: i16 = 0x004;
@@ -570,7 +590,7 @@ pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
     ev
 }
 
-/// 这个终端是不是调用者的控制终端。
+/// Whether this terminal is the caller's controlling terminal.
 fn is_ctty(cx: &Cx<'_>, tty: &Rc<RefCell<Tty>>) -> bool {
     cx.t.group
         .borrow()
@@ -579,7 +599,7 @@ fn is_ctty(cx: &Cx<'_>, tty: &Rc<RefCell<Tty>>) -> bool {
         .is_some_and(|c| Rc::ptr_eq(c, tty))
 }
 
-/// PTY 的 ioctl。`born` 是打开文件的 [`PtyEnd::born`]。
+/// The ioctls of a PTY. `born` is the open file's [`PtyEnd::born`].
 pub(crate) fn ioctl(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -613,8 +633,9 @@ pub(crate) fn ioctl(
             if !master {
                 check_background(cx, tty, Signal::TTOU)?;
             }
-            // 在原来的设置上换掉给出的部分（Linux 的 set_termios）：termio 只换标志的低
-            // 16 位和前 8 个控制字符，termios 不换速率字段
+            // Replace the given part of the existing settings (Linux's set_termios): termio
+            // replaces only the low 16 bits of the flags and the first 8 control characters,
+            // termios leaves the speed fields alone
             let mut t = tty.borrow().termios.encode();
             match request {
                 TCSETA | TCSETAW | TCSETAF => {
@@ -633,7 +654,7 @@ pub(crate) fn ioctl(
             t.load_speeds();
             let mut tt = tty.borrow_mut();
             if matches!(request, TCSETSF | TCSETAF | TCSETSF2) {
-                // 两边都是清空从设备的输入（Linux 在 real_tty 上 set_termios）
+                // Both sides flush the slave's input (Linux does set_termios on real_tty)
                 tt.flush_input();
                 tt.report_flush(true, false);
             }
@@ -657,9 +678,10 @@ pub(crate) fn ioctl(
                 2 => (true, true),
                 _ => return Err(Errno::EINVAL),
             };
-            // 主设备和从设备是一对 tty，主设备的输入就是从设备的输出。主设备的 TCOFLUSH 在
-            // Linux 上只清掉还没交给从设备行规程的数据（pty_flush_buffer），这里写进来就
-            // 交给了，没有可清的
+            // Master and slave are a pair of ttys, and the master's input is the slave's output.
+            // On Linux the master's TCOFLUSH only clears data not yet handed to the slave's line
+            // discipline (pty_flush_buffer); here a write hands it over at once, so there is
+            // nothing to clear
             let mut t = tty.borrow_mut();
             if master {
                 if input {
@@ -686,7 +708,8 @@ pub(crate) fn ioctl(
                     (1, false) => t.start_output(),
                     (0, true) => t.master_stopped = true,
                     (1, true) => t.master_stopped = false,
-                    // TCIOFF、TCION：发 STOP、START 字符（禁用的不发）。主设备发的是从设备的输入
+                    // TCIOFF, TCION: send the STOP or START character (not when disabled). What
+                    // the master sends is input to the slave
                     (2 | 3, _) => {
                         let c = t.termios.cc[if arg == 2 { cc::VSTOP } else { cc::VSTART }];
                         if c != 0 && master {
@@ -737,7 +760,7 @@ pub(crate) fn ioctl(
         TIOCGPTLCK if master => {
             put(cx, arg, (tty.borrow().locked as i32).to_le_bytes()).map(|()| 0)
         }
-        // 打开包模式时丢掉以前的状态（Linux 的 pty_set_pktmode）
+        // Enabling packet mode discards the earlier status (Linux's pty_set_pktmode)
         TIOCPKT if master => {
             let on = i32::from_le_bytes(get(cx, arg)?) != 0;
             let mut t = tty.borrow_mut();
@@ -748,7 +771,8 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TIOCGPKT if master => put(cx, arg, (tty.borrow().packet as i32).to_le_bytes()).map(|()| 0),
-        // Linux 的 pty_signal：发给从设备的前台进程组，与按键产生的一样是内核发的
+        // Linux's pty_signal: sent to the slave's foreground process group, by the kernel, as
+        // signals from keystrokes are
         TIOCSIG if master => {
             let sig = match arg {
                 2 => Signal::INT,
@@ -788,7 +812,7 @@ pub(crate) fn ioctl(
             tty.borrow_mut().fg = Some(pgid);
             Ok(0)
         }
-        // Linux 的 tty_ioctl 用 capable()：只看开机时的用户命名空间
+        // Linux's tty_ioctl uses capable(): only the boot user namespace counts
         TIOCVHANGUP => {
             if !cx.cred().capable(cap::SYS_ADMIN) {
                 return Err(Errno::EPERM);
@@ -814,7 +838,8 @@ pub(crate) fn ioctl(
             if sid != tgid || has_ctty {
                 return Err(Errno::EPERM);
             }
-            // 已经是别的会话的控制终端：只有 arg 为 1 时（root）才能抢过来
+            // Already the controlling terminal of another session: it can be taken over only with
+            // arg 1 (root)
             if let Some(other) = tty.borrow().session {
                 if arg != 1 {
                     return Err(Errno::EPERM);
@@ -845,7 +870,8 @@ pub(crate) fn ioctl(
                 (g.sid, g.tgid)
             };
             if sid == tgid {
-                // 会话组长放弃控制终端：整个会话都失去它，前台进程组收到 SIGHUP
+                // The session leader gives up its controlling terminal: the whole session loses
+                // it, and the foreground process group receives SIGHUP
                 let fg = {
                     let mut t = tty.borrow_mut();
                     t.session = None;

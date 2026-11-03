@@ -1,11 +1,13 @@
-//! 宿主一侧的控制台：宿主持有的进程内 PTY 主设备（kernel/tty 的 map）。
+//! The host-side console: an in-process PTY master held by the host (the kernel/tty map).
 //!
-//! [`crate::Machine`] 为每个终端会话开一个控制台，会话组长以它的从设备为 stdin/stdout/
-//! stderr 和控制终端。宿主写入的字节经过行规程（^C 变成发给前台进程组的 SIGINT），
-//! guest 的输出由宿主取走。宿主线程不是 guest 线程，但和它们一样只在持有 BKL 时访问
-//! 内核对象，等待也走同一套机制：guest 写终端时请求唤醒，等输出的宿主线程就会醒来。
+//! [`crate::Machine`] opens a console for each terminal session, and the session leader uses its
+//! slave as stdin/stdout/stderr and controlling terminal. Bytes the host writes go through the
+//! line discipline (^C becomes SIGINT sent to the foreground process group), and the host takes
+//! the guest's output. Host threads are not guest threads, but like them they access kernel
+//! objects only while holding the BKL, and they wait through the same mechanism: a guest write to
+//! the terminal requests a wake, and a host thread waiting for output wakes up.
 //!
-//! `appine-run` 用 [`bridge`] 把宿主终端接到控制台上。
+//! `appine-run` uses [`bridge`] to connect the host terminal to a console.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,32 +22,35 @@ use crate::process::Signal;
 use crate::signal::{self, SigInfo};
 use crate::tty::{PtyEnd, Tty, Winsize};
 
-/// 接到宿主上的终端（[`RunOptions::terminal`](crate::RunOptions::terminal)）。
+/// A terminal attached to the host ([`RunOptions::terminal`](crate::RunOptions::terminal)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Terminal {
-    /// 读取键盘输入的宿主 fd。
+    /// Host fd that keyboard input is read from.
     pub input: i32,
-    /// 写出终端输出的宿主 fd。
+    /// Host fd that terminal output is written to.
     pub output: i32,
-    /// 跟随它的窗口大小的宿主终端（TIOCGWINSZ）；没有时窗口大小是 24×80。
+    /// Host terminal whose window size is followed (TIOCGWINSZ); without one the window size is
+    /// 24×80.
     pub size: Option<i32>,
-    /// 窗口大小改变时变为可读的宿主 fd（比如 SIGWINCH 处理函数写的管道）。
+    /// Host fd that becomes readable when the window size changes (for example a pipe written by
+    /// a SIGWINCH handler).
     pub resize: Option<i32>,
 }
 
-/// 一个控制台。
+/// A console.
 pub(crate) struct Console {
-    /// PTY 的主设备。
+    /// The PTY master.
     pub master: PtyEnd,
-    /// 已经有进程以它为控制终端：此后所有从设备都关闭就是会话结束。
+    /// A process already has it as controlling terminal: from then on, all slaves being closed
+    /// means the session has ended.
     pub attached: bool,
 }
 
 const POLLIN: i16 = 1;
-/// 一次从宿主读多少输入。
+/// How much input to read from the host at a time.
 const READ_CHUNK: usize = 4096;
 
-/// 宿主终端的窗口大小。
+/// The host terminal's window size.
 fn host_winsize(fd: i32) -> Option<Winsize> {
     const TIOCGWINSZ: u64 = 0x5413;
     let mut b = [0u8; 8];
@@ -54,7 +59,7 @@ fn host_winsize(fd: i32) -> Option<Winsize> {
     (w.rows > 0 && w.cols > 0).then_some(w)
 }
 
-/// 新建一个控制台，返回 PTY 编号（`/dev/pts/<编号>`）。
+/// Creates a console and returns its PTY number (`/dev/pts/<number>`).
 pub(crate) fn open(k: &mut Kernel, size: Winsize) -> u32 {
     let fs = crate::tty::BOOT_PTS;
     let index = (0..).find(|i| !k.ptys.contains_key(&(fs, *i))).unwrap();
@@ -75,8 +80,8 @@ pub(crate) fn open(k: &mut Kernel, size: Winsize) -> u32 {
     index
 }
 
-/// 让 `leader` 成为控制台的会话组长：返回从设备的打开文件和 PTY。控制台已经属于
-/// 一个会话时返回 EBUSY。
+/// Makes `leader` the console's session leader: returns the slave's open file and the PTY.
+/// Returns EBUSY when the console already belongs to a session.
 pub(crate) fn attach(
     k: &mut Kernel,
     id: u32,
@@ -109,19 +114,20 @@ fn tty_of(k: &Kernel, id: u32) -> Result<Rc<RefCell<Tty>>, Errno> {
         .ok_or(Errno::ENOENT)
 }
 
-/// 等控制台 `id` 的输出、输入队列的空间时登记的唤醒对象：它的 PTY。关闭控制台请求
-/// 整个通道的唤醒。控制台不存在时是 None。
+/// The wake objects to register when waiting for console `id`'s output or for room in its input
+/// queue: its PTY. Closing a console requests a wake of the whole channel. None when the console
+/// does not exist.
 pub(crate) fn wake_objects(k: &Kernel, id: u32) -> Option<Vec<wake::Object>> {
     tty_of(k, id).ok().map(|t| vec![wake::of(&t)])
 }
 
-/// 取走最多 `max` 字节的输出。没有输出时返回 None；会话已经结束（所有从设备都关闭了）
-/// 并且输出已经取完时返回空的 Vec。
+/// Takes up to `max` bytes of output. Returns None when there is no output; returns an empty Vec
+/// when the session has ended (all slaves closed) and all output has been taken.
 pub(crate) fn take_output(k: &Kernel, id: u32, max: usize) -> Result<Option<Vec<u8>>, Errno> {
     let tty = tty_of(k, id)?;
     let out = tty.borrow_mut().take_output(max);
     if !out.is_empty() {
-        // 输出队列空出来了，等着写终端的线程可以继续
+        // The output queue has room again, so threads waiting to write the terminal can go on
         request_wake_object(wake::of(&tty));
         return Ok(Some(out));
     }
@@ -129,12 +135,13 @@ pub(crate) fn take_output(k: &Kernel, id: u32, max: usize) -> Result<Option<Vec<
     Ok(ended.then(Vec::new))
 }
 
-/// 输入队列还能放下多少字节。
+/// How many more bytes the input queue can hold.
 pub(crate) fn input_room(k: &Kernel, id: u32) -> Result<usize, Errno> {
     Ok(tty_of(k, id)?.borrow().input_room())
 }
 
-/// 宿主的输入交给行规程，产生的信号发给前台进程组。
+/// Hands host input to the line discipline and sends the resulting signals to the foreground
+/// process group.
 pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
     let tty = tty_of(k, id)?;
     let signals = tty.borrow_mut().write_input(data);
@@ -148,9 +155,10 @@ pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 控制台前台进程组的当前目录（App 被杀之后恢复标签页用，android/service 的 map）：组长的，组长
-/// 已经退出时取组里的任何一个进程；路径按那个进程的根目录算（与它的 `/proc/<pid>/cwd` 一样）。
-/// 没有前台进程组（shell 已经退出）是 ESRCH。
+/// The current directory of the console's foreground process group (for restoring tabs after the
+/// app is killed, the android/service map): the leader's, or any process in the group's once the
+/// leader has exited; the path is relative to that process's root (as its `/proc/<pid>/cwd` is).
+/// ESRCH when there is no foreground process group (the shell has exited).
 pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
     let fg = tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)?;
     let leader = k.groups.get(&fg).filter(|g| g.borrow().pgid == fg);
@@ -172,7 +180,7 @@ pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
     vfs.path_of(&view, &root, &cwd)
 }
 
-/// 窗口大小变了：更新 PTY，给前台进程组发 SIGWINCH。
+/// The window size changed: updates the PTY and sends SIGWINCH to the foreground process group.
 pub(crate) fn resize(k: &Kernel, id: u32, w: Winsize) -> Result<(), Errno> {
     let tty = tty_of(k, id)?;
     let (changed, fg) = {
@@ -185,8 +193,8 @@ pub(crate) fn resize(k: &Kernel, id: u32, w: Winsize) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 关闭控制台：与 Linux 挂断终端时一样，给会话组长发 SIGHUP 和 SIGCONT。从设备之后
-/// 读到 EOF、写入失败。
+/// Closes a console: as when Linux hangs up a terminal, sends SIGHUP and SIGCONT to the session
+/// leader. Afterwards the slave reads EOF and writes fail.
 pub(crate) fn close(k: &mut Kernel, id: u32) -> Result<(), Errno> {
     let console = k.consoles.remove(&id).ok_or(Errno::ENOENT)?;
     let tty = console.master.tty.clone();
@@ -196,23 +204,25 @@ pub(crate) fn close(k: &mut Kernel, id: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 宿主的输入结束之后交给程序的 EOF（[`send_eof`]）。
+/// The EOF handed to the program after the host's input ends ([`send_eof`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Eof {
-    /// 输入还没结束。
+    /// Input has not ended yet.
     Open,
-    /// 输入结束了，等程序读完已经送进去的输入。
+    /// Input has ended; waiting for the program to read the input already sent in.
     Pending,
-    /// 在规范模式下送了：VEOF 是行尾的 EOF 标记。
+    /// Sent in canonical mode: VEOF is the EOF marker at the end of a line.
     Canonical,
     Sent,
 }
 
-/// 宿主的输入结束之后，与 util-linux 的 script 一样往控制台的输入里送一个 VEOF（^D）：
-/// 规范模式下行首的 VEOF 让 read 返回 0，shell、cat 这类读到 EOF 就结束的程序随之退出；
-/// 不是规范模式时程序收到这个字符（shell 的行编辑当作 EOF）。与 script 一样等程序把已经
-/// 送进去的输入读完再送；还没读完时返回 None，程序读走输入时控制台的 PTY 叫醒桥接线程。
-/// 送了时返回送的时候是不是规范模式。VEOF 被禁用时什么也不送。
+/// After the host's input ends, sends a VEOF (^D) into the console's input, as util-linux's
+/// script does: in canonical mode a VEOF at the start of a line makes read return 0, so programs
+/// that end at EOF, such as a shell or cat, exit; outside canonical mode the program receives the
+/// character (a shell's line editor treats it as EOF). As script does, it waits until the program
+/// has read the input already sent in; while that is unread it returns None, and the console's PTY
+/// wakes the bridge thread when the program reads input. Once sent, returns whether it was sent in
+/// canonical mode. Sends nothing when VEOF is disabled.
 fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
     let Ok(tty) = tty_of(k, id) else {
         return Some(false);
@@ -230,9 +240,11 @@ fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
     Some(canonical)
 }
 
-/// 在规范模式下送出的 EOF 之后的一步：程序没读到它就切到了非规范模式（shell 读完一行切回
-/// 规范模式执行命令，桥接线程这时送了 VEOF，回到提示符时行编辑又切到非规范模式），EOF 标记
-/// 就没了（Linux 上变成一个 NUL 字节，script 有同样的问题），这时再送一次，这次是字符。
+/// The step after an EOF sent in canonical mode: if the program switched to non-canonical mode
+/// before reading it (a shell switches back to canonical mode to run a command after reading a
+/// line, the bridge thread sends VEOF then, and back at the prompt the line editor switches to
+/// non-canonical mode again), the EOF marker is lost (on Linux it becomes a NUL byte; script has
+/// the same problem), so it is sent once more, this time as a character.
 fn eof_after(k: &Kernel, id: u32, eof: Eof) -> Eof {
     match eof {
         Eof::Pending => match send_eof(k, id) {
@@ -250,7 +262,7 @@ fn eof_after(k: &Kernel, id: u32, eof: Eof) -> Eof {
     }
 }
 
-/// 把数据全部写到宿主 fd；宿主那边已经关闭时丢弃。
+/// Writes all the data to the host fd; drops it when the host side has closed.
 fn write_all(fd: i32, mut data: &[u8]) {
     while !data.is_empty() {
         match appine_hal::write(fd, data) {
@@ -260,13 +272,13 @@ fn write_all(fd: i32, mut data: &[u8]) {
     }
 }
 
-/// 宿主终端当前的窗口大小；不是终端时是 24×80。
+/// The host terminal's current window size; 24×80 when it is not a terminal.
 pub(crate) fn initial_size(term: &Terminal) -> Winsize {
     term.size.and_then(host_winsize).unwrap_or_default()
 }
 
-/// `appine-run` 的桥接线程：把宿主终端接到控制台 `id` 上，直到进程 `pid` 结束、所有
-/// guest 线程退出并且输出写完为止。
+/// The bridge thread of `appine-run`: connects the host terminal to console `id` until process
+/// `pid` ends, all guest threads have exited and the output has been written.
 pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
     let event = Arc::new(Event::new().expect("cannot create an eventfd for the terminal"));
     let mut eof = Eof::Open;
@@ -280,7 +292,7 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
                 k = shared.lock();
                 continue;
             }
-            // 控制台已经关闭，或者所有从设备都关闭了并且输出取完了
+            // The console has closed, or all slaves have closed and the output has been taken
             Err(_) | Ok(Some(_)) => break,
             Ok(None) => {}
         }
@@ -319,8 +331,8 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
                     Ok(n) if n > 0 => {
                         let _ = feed(&k, id, &buf[..n]);
                     }
-                    // 宿主的输入结束了（stdin 是管道或者文件）：不再读，等程序读完已经送进去
-                    // 的输入之后交给它一个 EOF
+                    // The host's input has ended (stdin is a pipe or file): stop reading, and once
+                    // the program has read the input already sent in, hand it an EOF
                     _ => eof = Eof::Pending,
                 }
             } else {
