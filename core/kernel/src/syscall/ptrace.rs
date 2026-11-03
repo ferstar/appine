@@ -1,4 +1,4 @@
-//! ptrace(2) 里跟踪者的一方，以及 process_vm_readv、process_vm_writev（设计文档 §7.6）。
+//! ptrace(2) 里跟踪者的一方，以及 process_vm_readv、process_vm_writev（kernel/signal 的 map）。
 //! 被跟踪的一方在 [`crate::ptrace`]。
 
 use std::rc::Rc;

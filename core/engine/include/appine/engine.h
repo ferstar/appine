@@ -106,7 +106,7 @@ struct appine_cpu {
     uint64_t fpcr;
     uint64_t fpsr;
     uint64_t tpidr_el0;
-    uint64_t orig_x0; /* syscall 重启时恢复 x0（设计文档 §7.3），由内核层维护 */
+    uint64_t orig_x0; /* syscall 重启时恢复 x0（kernel/signal 的 map），由内核层维护 */
     uint64_t fault_addr;
     uint32_t fault_access; /* enum appine_access */
     uint32_t fault_kind;   /* enum appine_fault_kind */
@@ -249,7 +249,7 @@ enum appine_exit appine_cpu_step(struct appine_cpu *cpu);
 /* 可从任意线程调用：让 appine_cpu_run() 在下一个指令边界返回 APPINE_EXIT_KICK */
 void appine_cpu_kick(struct appine_cpu *cpu);
 
-/* ---- 宿主侧的故障兜底（设计文档 §7.4、§12）---- */
+/* ---- 宿主侧的故障兜底（engine 的 map、设计文档 §12）---- */
 
 /* 宿主收到的故障信号（APPINE_EXIT_HOST_FAULT） */
 struct appine_host_fault {

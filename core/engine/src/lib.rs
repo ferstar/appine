@@ -826,7 +826,7 @@ impl Drop for Dbt {
     }
 }
 
-/// 装上宿主侧的故障兜底（设计文档 §7.4、§12），可以重复调用：之后 [`Cpu::run`]、
+/// 装上宿主侧的故障兜底（engine 的 map、设计文档 §12），可以重复调用：之后 [`Cpu::run`]、
 /// [`Dbt::run`] 运行期间宿主收到的 SIGSEGV、SIGBUS、SIGILL 变成 [`Exit::HostFault`]，
 /// 只影响当时运行的那个 guest；其余的故障先往 stderr 写一行报告，再交给原来的处理方式
 /// （Android 上 debuggerd 据此生成 tombstone）。

@@ -1,4 +1,4 @@
-//! ptrace 里被跟踪的一方（设计文档 §7.6）：停在 ptrace-stop 里，等跟踪者读写它的寄存器和
+//! ptrace 里被跟踪的一方（kernel/signal 的 map）：停在 ptrace-stop 里，等跟踪者读写它的寄存器和
 //! 内存，再让它继续。跟踪者一方的请求在 `syscall::ptrace`。
 //!
 //! 被跟踪的是线程，跟踪者记的是进程（tgid）。Linux 只接受跟踪者线程自己发的请求，wait

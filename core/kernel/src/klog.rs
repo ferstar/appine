@@ -1,4 +1,4 @@
-//! 内核日志（设计文档 §7.8）：Linux 6.1 的 printk 环形缓冲区。
+//! 内核日志（kernel/signal 的 map）：Linux 6.1 的 printk 环形缓冲区。
 //!
 //! 记录由内核层自己（OOM killer 结束进程、内部错误结束进程，见 [`printk`]）和 guest 写
 //! `/dev/kmsg` 产生。读的有三种，与 Linux 相同：

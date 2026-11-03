@@ -1,5 +1,5 @@
 /*
- * 内核层和引擎的 bug 只结束撞上它的 guest 进程（设计文档 §7.4、§12 第 5 条）。bug 用
+ * 内核层和引擎的 bug 只结束撞上它的 guest 进程（engine 的 map、设计文档 §12 第 5 条）。bug 用
  * debug 构建的测试钩子模拟：appine-run 要设置 APPINE_TEST_HOOKS=1 和 APPINE_ON_BUG=kill。
  * 每种 bug 都在子进程里触发，父进程检查子进程被 SIGSEGV 结束，自己照常运行。
  * 已经确定了整个进程的退出状态时，退出清理中的 bug 不再覆盖它。

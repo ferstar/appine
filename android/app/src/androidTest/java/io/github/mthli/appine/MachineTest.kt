@@ -774,7 +774,7 @@ class MachineTest {
     }
 
     /**
-     * 内核层和引擎的 bug 只结束撞上它的 guest 进程（设计文档 §7.4、§12 第 5 条），用 debug 版 App 的
+     * 内核层和引擎的 bug 只结束撞上它的 guest 进程（engine 的 map、设计文档 §12 第 5 条），用 debug 版 App 的
      * 测试钩子模拟。在 App 进程里，引擎在宿主上出错时 SIGSEGV 先经过 ART 的 libsigchain：ART 不认领，
      * 才交给引擎的处理函数，由它 siglongjmp 回去。宿主调用（JNI）里内核层 panic 时，那次调用失败，
      * 控制台被挂断。之后 ART 和 Machine 都照常工作。

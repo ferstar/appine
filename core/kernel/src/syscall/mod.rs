@@ -1,4 +1,4 @@
-//! syscall 分发（设计文档 §7.5）。
+//! syscall 分发（kernel/signal 的 map）。
 //!
 //! 编号和参数布局按 aarch64 Linux（asm-generic）。未实现的 syscall 一律返回
 //! `-ENOSYS`，绝不崩溃，并记录一条本地调试日志。处理函数在持有 BKL 时运行，

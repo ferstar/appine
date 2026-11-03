@@ -66,7 +66,7 @@ const GRND_NONBLOCK: u32 = 1;
 const GRND_RANDOM: u32 = 2;
 const GRND_INSECURE: u32 = 4;
 
-/// `uname -r` 报告的内核版本，即 ABI 契约（设计文档 §7.5）。
+/// `uname -r` 报告的内核版本，即 ABI 契约（kernel/signal 的 map）。
 const RELEASE: &[u8] = b"6.1.0-appine";
 
 /// 把 `clock` 上的绝对时间换算成等待的截止时刻。已经过去的时间换算成过去的时刻：

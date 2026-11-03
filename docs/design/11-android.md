@@ -43,7 +43,7 @@
 2. 以流的方式导入 `rootfs.tmp`，完成后（连同第 3 步写的配置）对整个文件系统 syncfs 一次再改名，改名之后让 `files` 目录也落盘（§8.1 的断电）；导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里。
 3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd）。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的改成指向 DNS 存根。
    - 每次启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的：网络是宿主的，OpenRC 为要网络的服务拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 的 `rc_provide`：它加到每一个服务上，容易成环。
-   - 装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，把 osclock 加进 boot：OpenRC 默认用 hwclock 提供 `clock`，而 appine 没有 RTC、也设不了宿主的时间（§7.5），hwclock 必然失败。用户放了哪个时钟服务就不动。
+   - 装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，把 osclock 加进 boot：OpenRC 默认用 hwclock 提供 `clock`，而 appine 没有 RTC、也设不了宿主的时间（[kernel/signal 的 map](../../.claude/maps/kernel/signal.md)），hwclock 必然失败。用户放了哪个时钟服务就不动。
 4. 终端标签页经由 `login.sh` 登录（§11.1 的登录账号），shell 取 `/etc/passwd` 里那个账号的：Alpine 是 ash，Debian 是 bash，chsh 改过之后照样。
 
 - **设置页**：标签栏菜单里的"设置"。状态都在 `TerminalService` 里，设置页只显示和转达；有设置页或终端界面在，都算界面可见。

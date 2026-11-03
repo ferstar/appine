@@ -1,4 +1,4 @@
-//! 本地调试日志（设计文档 §7.5、§12）：设置环境变量 `APPINE_LOG=1` 后输出到宿主 stderr。
+//! 本地调试日志（kernel/signal 的 map、设计文档 §12）：设置环境变量 `APPINE_LOG=1` 后输出到宿主 stderr。
 //! `APPINE_STRACE=1` 时另外打印每个返回的 syscall（编号、参数和结果），类似 strace；
 //! 每行开头是返回时距离启动的秒数，末尾是 syscall 本身用的毫秒数。
 

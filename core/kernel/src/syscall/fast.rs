@@ -7,7 +7,7 @@
 //! 它顺带把要用的东西填进缓存。
 //!
 //! 读时钟（`clock_gettime`、`gettimeofday`）也在这里：vDSO 的时间函数只是 svc 存根
-//! （§7.2），Go 的 nanotime、JVM 的 `System.nanoTime` 每次都进内核。go build 一次 218
+//! （kernel/signal 的 map），Go 的 nanotime、JVM 的 `System.nanoTime` 每次都进内核。go build 一次 218
 //! 万次，几个线程排队等 BKL 一共等了 2.5 秒。宿主的时钟和线程自己的 CPU 时钟不用内核里
 //! 的状态；进程的、别的线程的 CPU 时钟交给持有 BKL 的路径。
 //!

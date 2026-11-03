@@ -1,4 +1,4 @@
-//! core dump（Linux 的 `do_coredump`、`elf_core_dump`，设计文档 §7.7）。
+//! core dump（Linux 的 `do_coredump`、`elf_core_dump`，kernel/signal 的 map）。
 //!
 //! 默认动作是生成 core 的信号（[`dumps_core`]）结束进程时，先结束其他线程并等它们
 //! 退出：线程退出时把自己的寄存器留在线程组里（[`ThreadCore`]，`task::exit`）。然后按

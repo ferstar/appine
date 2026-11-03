@@ -459,7 +459,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     }
     // time 命名空间（Linux 6.2 起的 copy_namespaces、timens_on_fork）：clone3 的 CLONE_NEWTIME
     // 新建给子进程用的那个；不共用地址空间的子进程进给子进程用的那个，偏移从此不能再改；
-    // 线程、vfork 留在父线程的里，execve 换了地址空间时再进（6.1 是 EINVAL，见设计文档 §7.5）
+    // 线程、vfork 留在父线程的里，execve 换了地址空间时再进（6.1 是 EINVAL，见kernel/signal 的 map）
     if flags & CLONE_NEWTIME != 0 {
         ns.time_for_children = ns.time_for_children.copy(child_cred_owner.clone());
     }

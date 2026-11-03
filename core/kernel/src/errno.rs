@@ -131,7 +131,7 @@ impl Errno {
     /// 连接正在进行。
     pub const EINPROGRESS: Errno = Errno(115);
 
-    // 以下是内核内部使用的 syscall 重启码（设计文档 §7.3），返回用户态之前一定会被
+    // 以下是内核内部使用的 syscall 重启码（kernel/signal 的 map），返回用户态之前一定会被
     // 换成重新执行 syscall 或者 EINTR，guest 永远看不到它们。
 
     /// 被信号打断：处理函数带 `SA_RESTART` 时重新执行，否则返回 EINTR。
