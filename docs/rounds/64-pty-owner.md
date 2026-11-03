@@ -17,7 +17,7 @@
 
 - 差分测试 `compat` 新增终端的属主和权限：新终端的属主和属组，root 和普通用户按路径、按 fd 的 chown、chmod。
 - 普查的 `sshd`、`sshtools`：root 和普通用户的 `ssh -tt`、mosh 都能用。sshd 的 `-E` 是追加的，`sshtools.sh` 启动之前先删旧日志，免得上次的失败留在里面。
-- LTP 的 exit_group01 这次以 SIGABRT 失败，日志在重跑时被覆盖了，之后反复单独跑都通过，原因没查明，记进[偶发项](../milestones.md#已知的偶发失败)。
+- LTP 的 exit_group01 这次以 SIGABRT 失败，日志在重跑时被覆盖了，之后反复单独跑都通过，原因没查明，记进[偶发项](../milestones.md#known-flaky-tests)。
 
 ## 推迟项
 

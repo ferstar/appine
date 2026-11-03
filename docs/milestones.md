@@ -1,280 +1,280 @@
-# appine 里程碑记录
+# appine milestone records
 
-每一轮（里程碑，以及 M8 之后、M9 之前的各轮补强）的结论、测量、实现要点和推迟项各记一篇，按完成顺序编号放在 [rounds/](rounds/) 里。这一页是索引，另记着各轮共用的[测量条件](#测量条件)、[已知的偶发失败](#已知的偶发失败)和 [R1 的测量记录](#r1-的测量记录)。里程碑的计划和排序依据见[设计文档](design/14-milestones.md) §14。
+Each round (the milestones, and the hardening rounds after M8 and before M9) gets one file with its conclusions, measurements, implementation notes and deferred items, numbered in order of completion under [rounds/](rounds/). The rounds are written in Chinese. This page is the index; it also records the [measurement conditions](#measurement-conditions) the rounds share, the [known flaky tests](#known-flaky-tests) and the [R1 measurements](#r1-measurements). The milestone plan and the reasons for its order are in §14 of the [design doc](design/14-milestones.md).
 
-- 各篇是当时的记录。后来改动过的做法以设计文档第 1–13 节和 `.claude/maps/` 里各模块的 map 为准（已迁过去的节从设计文档删掉了：§4 CPU 引擎 → [engine](../.claude/maps/engine.md)，§5 内存 → [kernel/mm](../.claude/maps/kernel/mm.md)，§6 进程 → [kernel/process](../.claude/maps/kernel/process.md)，§7 信号与 ABI → [kernel/signal](../.claude/maps/kernel/signal.md)，§8 文件系统 → [kernel/store](../.claude/maps/kernel/store.md)、[kernel/vfs](../.claude/maps/kernel/vfs.md)、[kernel/procfs](../.claude/maps/kernel/procfs.md)，§9 TTY 与终端 → [kernel/tty](../.claude/maps/kernel/tty.md)，§10 网络 → [kernel/net](../.claude/maps/kernel/net.md)、[kernel/netns](../.claude/maps/kernel/netns.md)、[kernel/unix](../.claude/maps/kernel/unix.md)、[kernel/poll](../.claude/maps/kernel/poll.md)）。设计文档只写现在的做法：和 Linux 一样的地方一句带过，只写 appine 自己的机制和与 Linux 不同的地方；改动的经过、测量和出处写在各篇里，不写进设计文档。
-- 推迟项（以及正文里写着留到以后的事）后面用"→"注明后来在哪一轮补上、试过不做，或者只做了一部分；只做了一部分的写明还剩什么。没有"→"的就是还没做。M3b–M8 的"改动和推迟项"里标着"（修改 §x）"的是对设计的改动，不是推迟项。一轮做了以前推迟的事，要回到原来那一篇补上"→"。
-- 文中的 §x 指写那一轮时设计文档的章节（迁到 map 的节以对应的 map 为准）；R1–R6、A1–A3 是设计文档 §16 的风险编号。
-- 新的一轮：在 `rounds/` 里接着编号新建一篇，在下表加一行（要点一句话，写标题没说的结果或数字）；有新的倍数时在 R1 的测量记录里加一行。
-- 各篇的结构：开头是导语，不加标题，写起因和结论；之后依次是「做法」「结果」「测试」「推迟项」四节（`##`），没有的省掉（M3b–M8 的最后一节叫「改动和推迟项」）。调查、实验的小节照内容起名（如「原因」「时间花在哪里」「试过没有采用：……」），放在「做法」前面。节里的子主题用 `- **标签**：` 列表项，大块的用 `###`。
-- 各篇的测试只写测了哪些方面、测试中发现的问题和以后用得上的坑；逐条的用例、变异检验、cargo test、clippy、LTP 的例行结果不写。
+- Each file is a record of its time. Where an approach changed later, sections 1–13 of the design doc and the module maps in `.claude/maps/` are authoritative (migrated sections were removed from the design doc: §4 CPU engine → [engine](../.claude/maps/engine.md), §5 memory → [kernel/mm](../.claude/maps/kernel/mm.md), §6 processes → [kernel/process](../.claude/maps/kernel/process.md), §7 signals and ABI → [kernel/signal](../.claude/maps/kernel/signal.md), §8 file system → [kernel/store](../.claude/maps/kernel/store.md), [kernel/vfs](../.claude/maps/kernel/vfs.md), [kernel/procfs](../.claude/maps/kernel/procfs.md), §9 TTY and terminal → [kernel/tty](../.claude/maps/kernel/tty.md), §10 networking → [kernel/net](../.claude/maps/kernel/net.md), [kernel/netns](../.claude/maps/kernel/netns.md), [kernel/unix](../.claude/maps/kernel/unix.md), [kernel/poll](../.claude/maps/kernel/poll.md)). The design doc describes only the current approach: what matches Linux gets one sentence, and only appine's own mechanisms and its differences from Linux are spelled out; how changes came about, measurements and sources go in the rounds, not in the design doc.
+- A deferred item (or anything the text leaves for later) is followed by "→" naming the round that later did it, tried it and dropped it, or did only part of it; a partly done item says what remains. An item without "→" has not been done. In the "改动和推迟项" (changes and deferred items) sections of M3b–M8, entries marked "（修改 §x）" (changes §x) are design changes, not deferred items. When a round does something deferred earlier, go back to the original file and add the "→".
+- §x in a round means the design doc section as it was when the round was written (for sections migrated to maps, the corresponding map is authoritative); R1–R6 and A1–A3 are the risk numbers in §16 of the design doc.
+- A new round: create the next numbered file in `rounds/` and add a row to the table below (one sentence of key points, giving results or numbers the title doesn't); when there is a new ratio, add a row to the R1 measurements.
+- Structure of each file: an untitled lead paragraph with the motivation and the conclusion, then the four `##` sections 「做法」 (approach), 「结果」 (results), 「测试」 (tests) and 「推迟项」 (deferred items), leaving out any that would be empty (in M3b–M8 the last section is called 「改动和推迟项」). Investigation and experiment sections are named after their content (such as 「原因」 cause, 「时间花在哪里」 where the time goes, 「试过没有采用：……」 tried and not adopted: …) and go before 「做法」. Subtopics within a section are `- **标签**：` list items; large blocks use `###`.
+- The tests section of each file records only which aspects were tested, the problems found while testing, and pitfalls worth knowing later; it leaves out individual cases, mutation checks, and the routine results of cargo test, clippy and LTP.
 
-| 一轮 | 日期 | 要点 |
+| Round | Date | Key points |
 |---|---|---|
-| [M2 结果](rounds/01-m2.md) | 2026-10-24 | 原型 Tier 1 的整数基准几何平均 1.85×，Neoverse N2 上 2.37× |
-| [M1a 结果](rounds/02-m1a.md) | 2026-10-24 | SIMD&FP、LL/SC、LSE；lockstep 扩展成三方比对 |
-| [M1b 结果](rounds/03-m1b.md) | 2026-10-24 | busybox 经由 `ld-musl` 跑通；`gzip` 4.75× |
-| [M3a 结果](rounds/04-m3a.md) | 2026-10-24 | 多进程、多线程、BKL、信号帧、vDSO |
-| [M3b 结果](rounds/05-m3b.md) | 2026-10-24 | 进程内 PTY、作业控制、procfs |
-| [M4 结果](rounds/06-m4.md) | 2026-10-24 | 网络、DNS 存根、AF_UNIX；`apk add`、`git clone` 能用；R5 关闭 |
-| [M5 结果](rounds/07-m5.md) | 2026-10-24 | Android App；4K、16K 页模拟器通过 |
-| [M6 结果](rounds/08-m6.md) | 2026-10-25 | 编译 Lua、SQLite 约 10×；凭据、记录锁、IPC、定时器；LTP 849 |
-| [M7 结果](rounds/09-m7.md) | 2026-10-25 | Tier 1 正式版（SIMD、4096 项 TLB、W^X）；编译 4.7–6.1× |
-| [M8 结果](rounds/10-m8.md) | 2026-10-25 | Go、Node.js 行为正确；LTP 856 |
-| [M8 补测：JVM](rounds/11-m8-jvm.md) | 2026-10-25 | OpenJDK 21/25、Maven、Gradle 能用；补上 inotify |
-| [M9 之前：稳定性和内存](rounds/12-stability-memory.md) | 2026-10-25 | 截短已映射的文件、`PROT_NONE` 不进页表、robust futex |
-| [M9 之前：性能剖析](rounds/13-profiling.md) | 2026-10-25 | 元数据缓存、fork 只看碰过的页；`git status` 19× → 6× |
-| [M9 之前：起进程的翻译开销](rounds/14-spawn-translation.md) | 2026-10-25 | 翻译跨 exec 保留；shell 起进程 9× → 6.3× |
-| [M9 之前：栈指针常驻寄存器和返回预测](rounds/15-sp-return-prediction.md) | 2026-10-25 | SP 常驻 X26、影子返回栈；gcc 快 10% |
-| [M9 之前：futex 定向唤醒](rounds/16-futex-targeted-wake.md) | 2026-10-25 | FUTEX_WAKE 只通知被唤醒的线程；Gradle 热构建 6.1 → 4.8 秒 |
-| [M9 之前：兼容性补漏](rounds/17-compat.md) | 2026-10-25 | maps 命名、实时信号排队、pidfd、`execveat`；LTP 889 |
-| [M9 之前：剩下的小缺口](rounds/18-small-gaps.md) | 2026-10-25 | `/dev/shm` 开机清空、smaps/pagemap、unshare；LTP 905 |
-| [M9 之前：推迟项](rounds/19-deferred.md) | 2026-10-25 | `O_ASYNC`、租约、POSIX 消息队列、AIO；io_uring 不做 |
-| [M9 之前：稳健性](rounds/20-robustness.md) | 2026-10-25 | 内核 bug 只结束一个进程；App 内存上限和 OOM killer |
-| [M9 之前：稳健性的收尾](rounds/21-robustness-finish.md) | 2026-10-25 | 线程起停、定时器线程、JNI 里的 panic；libsigchain 下的恢复 |
-| [M9 之前：栈的大小上限](rounds/22-stack-limit.md) | 2026-10-26 | 主线程栈按需增长，受 `RLIMIT_STACK` 限制 |
-| [M9 之前：访存检查和翻译表](rounds/23-tlb-checks.md) | 2026-10-26 | 同一基址共用 TLB 检查、跨页不退出；gcc 3.6× |
-| [M9 之前：多线程共用翻译和定向唤醒](rounds/24-shared-translation.md) | 2026-10-26 | 测量改用本地卷；`go build` 5.4× → 3.2×，Maven 8.5× → 4.4× |
-| [M9 之前：不持 BKL 的 stat](rounds/25-stat-without-bkl.md) | 2026-10-26 | 并行 lstat 的 `git status` 24 → 13 毫秒 |
-| [M9 之前：fork 写时复制](rounds/26-fork-cow.md) | 2026-10-26 | 写过 100 MB 的进程 fork 21 → 2.3 毫秒 |
-| [M9 之前：交错访存共用检查](rounds/27-interleaved-checks.md) | 2026-10-26 | python 循环 0.82 → 0.75 秒；另两个实验没有收益 |
-| [M9 之前：起进程的宿主开销](rounds/28-spawn-host-cost.md) | 2026-10-26 | fork 后 exec 221 → 163 微秒（原生 154） |
-| [M9 之前：BKL 的等待和持锁](rounds/29-bkl-wait-hold.md) | 2026-10-26 | 等锁时先自旋；4 个进程同时起进程的吞吐高 4 成 |
-| [M9 之前：翻译后代码里的访存](rounds/30-translated-access.md) | 2026-10-26 | TLB 检查占 gcc 32%、python 56%；python 循环 −4% |
-| [M9 之前：超级块的实验](rounds/31-superblocks.md) | 2026-10-26 | 调用、前向跳转之后接着翻译，gcc 反而慢，没有采用 |
-| [M9 之前：别的负载和文件操作](rounds/32-workloads-file-ops.md) | 2026-10-26 | 各类负载的倍数；仓库合并提交，`cp -r` 再 `rm -rf` 2.8× → 1.6× |
-| [M9 之前：文件操作的宿主开销](rounds/33-file-ops-host-cost.md) | 2026-10-26 | 后台删 object、sendfile 交给宿主；`tar x` 2.3× → 1.7× |
-| [M9 之前：node 启动](rounds/34-node-startup.md) | 2026-10-26 | outline atomics 在 Tier 1 里做；`node -e 0` 快 12% |
-| [M9 之前：JIT 负载](rounds/35-jit.md) | 2026-10-26 | 代码按内容作废；Maven 6.7 → 6.2 秒 |
-| [M9 之前：多进程并行](rounds/36-parallel-processes.md) | 2026-10-26 | 翻译池放 16 个实例；并行 exec、管道快约两成 |
-| [M9 之前：onTrimMemory](rounds/37-trim-memory.md) | 2026-10-26 | 界面离开或内存紧张时释放可以重建的缓存 |
-| [M9 之前：拆 BKL](rounds/38-split-bkl.md) | 2026-10-26 | 读时钟、futex、nanosleep 不取 BKL |
-| [M9 之前：平均负载、sysfs 和 limits](rounds/39-loadavg-sysfs.md) | 2026-10-27 | 平均负载取样、CPU 拓扑的 sysfs、`/proc/<pid>/limits` |
-| [M9 之前：ptrace 的第一步，strace](rounds/40-ptrace-strace.md) | 2026-10-27 | 系统调用、信号、事件的停止和 regset；strace 能用 |
-| [M9 之前：ptrace 的第二步，gdb](rounds/41-ptrace-gdb.md) | 2026-10-27 | 断点、单步、软件观察点、`catch syscall` 与原生一致 |
-| [M9 之前：epoll 的边沿](rounds/42-epoll-edges.md) | 2026-10-27 | `EPOLLET` 照 Linux 的时机再触发，tokio 程序不再卡住 |
-| [M9 之前：core dump](rounds/43-coredump.md) | 2026-10-27 | 按 `core_pattern` 写 ELF core，gdb 能事后分析 |
-| [M9 之前：硬件断点和观察点](rounds/44-hw-watchpoints.md) | 2026-10-27 | 6 个断点、4 个观察点，由解释器检查 |
-| [M9 之前：ptrace 和 procfs 的细节](rounds/45-ptrace-procfs.md) | 2026-10-27 | 单步进信号处理函数、sigsuspend 里的屏蔽字、`/proc/<pid>/mem` |
-| [M9 之前：mremap 和 sysfs](rounds/46-mremap-sysfs.md) | 2026-10-27 | mremap 扩展私有文件映射；sysfs 的 `cache/`、`cpufreq/` |
-| [M9 之前：嵌套 epoll 的边沿](rounds/47-nested-epoll.md) | 2026-10-27 | 内层每来一次事件，边沿触发的外层都再触发 |
-| [M9 之前：独占的唤醒](rounds/48-exclusive-wakeup.md) | 2026-10-27 | 一个边沿只叫醒一个 `EPOLLEXCLUSIVE` 的等待者 |
-| [M9 之前：按对象唤醒](rounds/49-targeted-wakeups.md) | 2026-10-27 | poll、epoll 和阻塞的读写只被它们等的对象叫醒 |
-| [M9 之前：Tier 1 里的观察点](rounds/50-watchpoints-tier1.md) | 2026-10-27 | 只有被观察的页交给解释器；gdb 的 `watch` 10.8 → 0.45 秒 |
-| [M9 之前：起进程和设定时器不再叫醒所有人](rounds/51-spawn-timer-wakeups.md) | 2026-10-27 | vfork、定时器、signalfd 只叫醒相关的线程 |
-| [M9 之前：signalfd 看调用的线程](rounds/52-signalfd-caller.md) | 2026-10-27 | poll、epoll 与读一样看调用的线程，不看创建它的 |
-| [M9 之前：锁和宿主 socket 只叫醒等它们的线程](rounds/53-locks-host-sockets.md) | 2026-10-27 | 有空等的进程时 flock 一次 10 → 0.2 微秒 |
-| [M9 之前：消息队列和信号驱动的 I/O 不再叫醒所有人](rounds/54-mqueue-fasync.md) | 2026-10-27 | 消息队列按对象唤醒；`O_ASYNC` 只叫醒定时器线程 |
-| [M9 之前：宿主 stdio 上的阻塞读只等宿主 fd](rounds/55-host-stdio.md) | 2026-10-27 | 只影响 `appine-run`，App 里没有这种文件 |
-| [M9 之前：被屏蔽的信号只叫醒等它的线程](rounds/56-blocked-signals.md) | 2026-10-27 | 只叫醒 sigtimedwait、signalfd 的等待者 |
-| [M9 之前：跟踪停住的进程、跟踪者先取走结束](rounds/57-ptrace-stopped-reaped.md) | 2026-10-27 | group-stop、ATTACH 的报告顺序；跟踪者先取走结束 |
-| [M9 之前：cgroup v2 的视图](rounds/58-cgroup.md) | 2026-10-27 | 只读的视图；JVM、Node.js 按 `memory.max` 定堆 |
-| [M9 之前：seccomp](rounds/59-seccomp.md) | 2026-10-28 | 严格模式、cBPF 过滤器、通知 fd；`strace --seccomp-bpf` 能用 |
-| [M9 之前：seccomp 的缓存和快速路径](rounds/60-seccomp-cache.md) | 2026-10-28 | 总是放行的编号不运行程序；futex 唤醒 313 → 60 纳秒 |
-| [M9 之前：进程结束的每一步分别兜住](rounds/61-finish-steps.md) | 2026-10-28 | 九步各自兜住内核 bug，不再留下永远停着的进程 |
-| [M9 之前：负载普查](rounds/62-workload-survey.md) | 2026-10-28 | 20 多种服务和工具多数正常，找到 6 个问题 |
-| [M9 之前：fork 之后还回的页按各自的权限恢复](rounds/63-returned-loans.md) | 2026-10-28 | 恢复权限不跨映射，rustc 退出时不再崩溃 |
-| [M9 之前：终端的属主和权限](rounds/64-pty-owner.md) | 2026-10-28 | sshd 能把终端交给用户，`ssh -t`、mosh 能用 |
-| [M9 之前：smaps 里共用的页](rounds/65-smaps-shared.md) | 2026-10-28 | redis、valkey 的写时复制检查通过，能启动 |
-| [M9 之前：io_destroy 叫醒等事件的线程](rounds/66-aio-destroy.md) | 2026-10-28 | mariadb 的 install-db 和关闭不再卡住 |
-| [M9 之前：cgroup 的 memory.stat](rounds/67-memory-stat.md) | 2026-10-28 | .NET 的 GC 按整个 App 的用量算内存负载 |
-| [M9 之前：/proc/meminfo 照搬宿主的](rounds/68-meminfo.md) | 2026-10-28 | free、htop 显示的可用内存与原生相同 |
-| [M9 之前：glibc 发行版的探测](rounds/69-glibc-probe.md) | 2026-10-28 | Debian 13、Ubuntu 24.04 的 rootfs 不改内核层就能用 |
-| [M9 之前：第二轮普查，语言的测试集和大项目](rounds/70-survey-suites.md) | 2026-10-28 | 语言的测试集和大项目对照原生，找到 6 个问题 |
-| [M9 之前：线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md) | 2026-10-28 | 修了线程频繁起停时宿主的堆被破坏 |
-| [M9 之前：翻译表里漏掉的墓碑](rounds/72-table-tombstones.md) | 2026-10-28 | 修了翻译表被占满、进程连 SIGKILL 都结束不了 |
-| [M9 之前：目录和文件的时间戳](rounds/73-timestamps.md) | 2026-10-28 | Python 能 import 后来新建的模块 |
-| [M9 之前：FICLONE 返回 EOPNOTSUPP](rounds/74-ficlone.md) | 2026-10-28 | Python 3.14 的 `Path.copy()` 能用 |
-| [M9 之前：PTY 的 TCFLSH 和 TCXONC](rounds/75-pty-flow.md) | 2026-10-28 | CPython 的 test_termios、test_ioctl 不再卡住 |
-| [M9 之前：FIFO 在写端来之前不报 POLLHUP](rounds/76-fifo-pollhup.md) | 2026-10-28 | Ruby 的 test_require 全部通过 |
-| [M9 之前：删除的目录里不能新建，socket 可以 fchmod](rounds/77-dead-dir-socket-fchmod.md) | 2026-10-28 | Node 的 test-fs-mkdir 等两个测试通过 |
-| [M9 之前：网络信息的缺口](rounds/78-net-info-gaps.md) | 2026-10-28 | 只补文档：路由表、流量计数、`if_inet6` 的缺口 |
-| [M9 之前：终端的访问时间和修改时间](rounds/79-pty-times.md) | 2026-10-28 | w、who 的空闲时间有意义了 |
-| [M9 之前：CPU 时间不倒退](rounds/80-cpu-times.md) | 2026-10-28 | 照 `cputime_adjust`，times03 不再偶发失败 |
-| [M9 之前：被叫醒的进程在 /proc 里是 R](rounds/81-woken-state.md) | 2026-10-28 | shmctl01 不再失败 |
-| [M9 之前：测试自己的竞争和丢掉的现场](rounds/82-test-races.md) | 2026-10-28 | 作业控制用例的竞争；测试失败时保留现场 |
-| [M9 之前：没有实现的 netlink 协议建不了](rounds/83-netlink-protocols.md) | 2026-10-28 | 走 PAM 的 sshd、su、login 不再失败 |
-| [M9 之前：补测待查的几项](rounds/84-debt-checks.md) | 2026-10-28 | 只补测：几项待查的失败与原生一致 |
-| [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口](rounds/85-inet6-opath-exit.md) | 2026-10-28 | JVM 不再关掉 IPv6；fork 事件之后停在系统调用出口 |
-| [M9 之前：排查在 BKL 外改 Rc 的计数](rounds/86-rc-outside-bkl.md) | 2026-10-28 | 放开 BKL 期间 panic 时先拿回锁再展开 |
-| [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件](rounds/87-fast-panic-held-borrows.md) | 2026-10-29 | 不持锁的系统调用里的 bug 只结束那个进程 |
-| [M9 之前：futex 等待者的清理，放开 BKL 时检查借用](rounds/88-futex-cleanup-borrow-check.md) | 2026-10-29 | 等待者由守卫离开队列，不再丢唤醒 |
-| [M9 之前：测试用的发布构建也检查借用](rounds/89-release-borrow-check.md) | 2026-10-29 | 差分测试、LTP、普查认出内核层报告的内部错误 |
-| [M9 之前：网络接口的流量计数](rounds/90-interface-counters.md) | 2026-10-29 | `/proc/net/dev`、sysfs、netlink 报告同样的数 |
-| [M9 之前：NETLINK_GENERIC 只有 nlctrl](rounds/91-generic-netlink.md) | 2026-10-29 | 回答与 Linux 6.8 逐字节相同 |
-| [M9 之前：调试器、valgrind 和 headless Chromium](rounds/92-debuggers-valgrind-chromium.md) | 2026-10-29 | 找到内核层的 3 个问题，修好之后与原生相同 |
-| [M9 之前：`/proc/<pid>/fd` 和 maps 里的路径解析符号链接](rounds/93-fd-paths-resolve-symlinks.md) | 2026-10-29 | valgrind 能重新打开 Debian 的 ld.so |
-| [M9 之前：`/proc/<pid>/task` 的链接数](rounds/94-task-dir-links.md) | 2026-10-29 | Chromium 的 zygote 不再一启动就崩溃 |
-| [M9 之前：跟踪者退出时丢掉已经取走的信号](rounds/95-tracer-exit-drops-signal.md) | 2026-10-29 | delve attach 之后读到 EOF 退出，进程不再停住 |
-| [M9 之前：`/proc/<pid>/net`](rounds/96-proc-pid-net.md) | 2026-10-29 | `/proc/net` 改成指向 `self/net` 的链接 |
-| [M9 之前：已经删除的文件带 ` (deleted)`](rounds/97-deleted-suffix.md) | 2026-10-29 | needrestart 按它找出还在用旧库的进程 |
-| [M9 之前：路由表](rounds/98-routes.md) | 2026-10-29 | 主表取自宿主；`ip route` 等与 Linux 逐字节相同 |
-| [M9 之前：App 里选 rootfs](rounds/99-choose-rootfs.md) | 2026-10-29 | Alpine、Debian、Ubuntu 可选，可以重置 |
-| [M9 之前：文件能力](rounds/100-file-caps.md) | 2026-10-29 | 照 Linux 6.1 算文件能力、环境能力；扩展属性检查权限 |
-| [M9 之前：接口和地址的 netlink 消息](rounds/101-link-addr.md) | 2026-10-29 | `ip addr`、`ip link` 显示 `brd`、`state UP` |
-| [M9 之前：`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md) | 2026-10-29 | `ss -s` 能用；`appine-run --pty` 输入结束时送 VEOF |
-| [M9 之前：AI 编程 CLI](rounds/103-ai-cli-survey.md) | 2026-10-29 | Claude Code、Codex、Gemini CLI 与原生相同，沙箱建不了 |
-| [M9 之前：关掉主设备时挂断从设备](rounds/104-pty-hangup.md) | 2026-10-29 | 照 `tty_vhangup` 挂断，`tmux kill-server` 之后不留进程 |
-| [M9 之前：mount 的子集](rounds/105-mount-subset.md) | 2026-10-29 | procfs 等挂到任意目录、bind；chroot 进 Debian 之后 ps 能用 |
-| [M9 之前：代码缓存只算一次](rounds/106-code-cache-rss.md) | 2026-10-30 | 20 个空闲 python3 的 App 用量 321 → 218 MB |
-| [M9 之前：翻译代码的密度](rounds/107-code-density.md) | 2026-10-30 | 每条 guest 指令约 8 → 6 个宿主字；Maven、Gradle 快 3–5% |
-| [M9 之前：同一个程序共用翻译](rounds/108-shared-translation.md) | 2026-10-30 | 20 个空闲 python3 193 → 84 MB；shell 起进程快三成 |
-| [M9 之前：起进程和 mmap 的持锁时间](rounds/109-spawn-mmap-bkl.md) | 2026-10-30 | 4 个同时 exec 快约一成 |
-| [M9 之前：openat 的开销](rounds/110-openat-cost.md) | 2026-10-30 | 没有便宜的改法，没改代码 |
-| [M9 之前：检查点挪到后台](rounds/111-background-checkpoint.md) | 2026-10-30 | 解包时持锁的提交最长 8.4 → 0.6 ms |
-| [M9 之前：宿主内存的接缝](rounds/112-host-seams.md) | 2026-10-30 | 完全不拆组也只快 1.4%，没改代码 |
-| [M9 之前：Go 换一组被占用的寄存器](rounds/113-go-registers.md) | 2026-10-30 | `go build` 快 3–5% |
-| [M9 之前：跳到未对齐的地址](rounds/114-unaligned-branch.md) | 2026-10-30 | 照 Linux 是 SIGBUS，原来以内部错误结束 |
-| [M9 之前：有 JIT 代码的进程也共用翻译](rounds/115-shared-with-jit.md) | 2026-10-30 | 4 个空闲 node 的 App 用量 190 → 119 MB |
-| [M9 之前：仓库里的目录 bind](rounds/116-store-binds.md) | 2026-10-30 | bubblewrap 的第一轮：仓库里的目录、文件可以 bind |
-| [M9 之前：tmpfs](rounds/117-tmpfs.md) | 2026-10-30 | bubblewrap 的第二轮 |
-| [M9 之前：挂载命名空间](rounds/118-mount-namespaces.md) | 2026-10-30 | bubblewrap 的第三轮 |
-| [M9 之前：用户命名空间](rounds/119-user-namespaces.md) | 2026-10-30 | bubblewrap 的第四轮 |
-| [M9 之前：pid 命名空间](rounds/120-pid-namespaces.md) | 2026-10-30 | bubblewrap 的第五轮 |
-| [M9 之前：UTS 和 IPC 命名空间](rounds/121-uts-ipc-namespaces.md) | 2026-10-30 | bubblewrap 的第六轮 |
-| [M9 之前：网络命名空间](rounds/122-net-namespaces.md) | 2026-10-30 | bubblewrap 的第七轮 |
-| [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱](rounds/123-bwrap.md) | 2026-10-30 | Codex、Claude Code 的沙箱能用了 |
-| [M9 之前：V8 和 HotSpot 的寄存器](rounds/124-v8-hotspot-registers.md) | 2026-10-30 | 只有文档：量过之后不换寄存器 |
-| [M9 之前：raw ICMP 的模拟](rounds/125-raw-icmp.md) | 2026-10-30 | busybox 的 `ping`、`ping6` 能用 |
-| [M9 之前：PR_SET_CHILD_SUBREAPER](rounds/126-child-subreaper.md) | 2026-10-31 | tini、s6 这类进程管理程序用它 |
-| [M9 之前：LTP 剩下的小差异](rounds/127-ltp-leftovers.md) | 2026-10-31 | 多数是 musl 的行为，改了 6 处 |
-| [M9 之前：traceroute 和 mtr](rounds/128-traceroute.md) | 2026-10-31 | 每个网络命名空间一个 ICMP 汇集点；traceroute、mtr 能用 |
-| [M9 之前：命名空间文件留住命名空间](rounds/129-namespace-files.md) | 2026-10-31 | `ip netns`、`nsenter` 能用 |
-| [M9 之前：vhangup](rounds/130-vhangup.md) | 2026-10-31 | 照 `tty_vhangup` 挂断，节点留着、重新打开照常能用 |
-| [M9 之前：tmpfs 的用量和限制](rounds/131-tmpfs-usage.md) | 2026-10-31 | statfs 报告用量，放不下、写满了是 ENOSPC |
-| [M9 之前：setns 经由 pidfd](rounds/132-setns-pidfd.md) | 2026-10-31 | `nsenter -t` 原来每次都失败，现在能用 |
-| [M9 之前：点积指令 ASIMDDP](rounds/133-asimddp.md) | 2026-10-31 | VP9 编码快 4.5% |
-| [M9 之前：task 目录的 children](rounds/134-task-children.md) | 2026-10-31 | 子进程记着父线程，线程退出时转给别的线程 |
-| [M9 之前：SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md) | 2026-10-31 | OpenSSL 的 SHA-512 快 4.1 倍 |
-| [M9 之前：LRCPC](rounds/136-lrcpc.md) | 2026-10-31 | §4.4 的 v1.x 特性都做完了 |
-| [M9 之前：PDEATHSIG 和 __WNOTHREAD](rounds/137-pdeathsig-wnothread.md) | 2026-10-31 | 建立它的线程一退出就发；`__WNOTHREAD` 只等自己建的 |
-| [M9 之前：LRCPC2](rounds/138-lrcpc2.md) | 2026-10-31 | 带偏移的 LDAPUR、STLUR 等 |
-| [M9 之前：未实现的系统调用](rounds/139-unimplemented-syscalls.md) | 2026-10-31 | 只有文档：补记返回 ENOSYS 的编号 |
-| [M9 之前：ioprio、syslog 和 adjtimex](rounds/140-ioprio-syslog-adjtimex.md) | 2026-10-31 | `ionice` 能用；syslog(2)、adjtimex 回答查询 |
-| [M9 之前：FP16 和 JSCVT](rounds/141-fp16-jscvt.md) | 2026-10-31 | llama.cpp 的 F16 模型快 44–82% |
-| [M9 之前：RDM、FCMA、FHM 和 BF16](rounds/142-rdm-fcma-fhm-bf16.md) | 2026-10-31 | `gcc -mcpu=native` 用上它们；BF16 点积快 1.5 倍 |
-| [M9 之前：/dev/kmsg 和内核日志](rounds/143-kmsg.md) | 2026-10-31 | guest 里 `dmesg` 看得到 OOM 和内部错误 |
-| [M9 之前：openat2](rounds/144-openat2.md) | 2026-10-31 | 新版 GNU tar 离不开它 |
-| [M9 之前：termios2](rounds/145-termios2.md) | 2026-10-31 | Ubuntu 26.04 里的终端认得出了 |
-| [M9 之前：PTY 的包模式](rounds/146-pty-packet-mode.md) | 2026-10-31 | GNU screen 能用 |
-| [M9 之前：/proc/<pid>/exe 的跟踪权限](rounds/147-proc-exe-access.md) | 2026-10-31 | 别的用户的、不可 dump 的进程是 EACCES |
-| [M9 之前：用户命名空间里的 ID 换算](rounds/148-userns-ids.md) | 2026-10-31 | `SO_PEERCRED`、si_uid、IPC 的属主等按命名空间换算 |
-| [M9 之前：Ubuntu 26.04 的普查](rounds/149-ubuntu26-survey.md) | 2026-10-31 | apt 装了 238 个包，找到三处问题 |
-| [M9 之前：新分配的 PTY](rounds/150-new-pty-state.md) | 2026-11-01 | 从设备没打开过时主设备不 EIO；窗口大小从 0×0 开始 |
-| [M9 之前：短的符号链接不占块](rounds/151-short-symlink-blocks.md) | 2026-11-01 | `ls -l` 的 total 与原生相同 |
-| [M9 之前：nmap 以 root 运行](rounds/152-nmap-unprivileged.md) | 2026-11-01 | App 设 `NMAP_UNPRIVILEGED=1`，改用 connect 扫描 |
-| [M9 之前：/proc/<pid>/exe 指向程序文件本身](rounds/153-exe-file.md) | 2026-11-01 | 删了、换了之后经由它打开的仍是原来的文件 |
-| [M9 之前：FRINTTS、FlagM、SB 和 DPB](rounds/154-frintts-flagm-sb-dpb.md) | 2026-11-01 | `gcc -mcpu=native` 与原生相同 |
-| [M9 之前：DIT](rounds/155-dit.md) | 2026-11-01 | 信号、ptrace、fork 都带着，execve 清零 |
-| [M9 之前：低端口映射和监听通知](rounds/156-low-ports.md) | 2026-11-01 | 宿主上换成 +10000，看到监听时发通知 |
-| [M9 之前：podman 和 docker 的普查](rounds/157-container-survey.md) | 2026-11-01 | podman 的常用功能与原生相同；找到 12 个问题 |
-| [M9 之前：容器运行时碰到的四处小问题](rounds/158-container-small-fixes.md) | 2026-11-01 | capget、`RTM_NEWLINK`、合成根目录的 inode、线程目录的 fd |
-| [M9 之前：可写地挂 cgroup2](rounds/159-cgroup2-rw-mount.md) | 2026-11-01 | crun 给容器这样挂，里面照旧改不了 |
-| [M9 之前：mqueue 文件系统](rounds/160-mqueue-fs.md) | 2026-11-01 | podman 不再需要临时绕过就能起容器 |
-| [M9 之前：经由 fd 执行 memfd 和已经删除的文件](rounds/161-exec-open-file.md) | 2026-11-01 | runc 起容器、`podman build --isolation chroot` 要用 |
-| [M9 之前：time 命名空间](rounds/162-time-namespaces.md) | 2026-11-01 | dockerd、runc 要用 |
-| [M9 之前：cgroup 树：建子 cgroup、迁移进程](rounds/163-cgroup-tree.md) | 2026-11-01 | dockerd 建得了容器的 cgroup |
-| [M9 之前：cgroup 的 pids.max 和 memory.max 起作用](rounds/164-cgroup-limits.md) | 2026-11-01 | fork 按 `pids.max` 检查，OOM killer 按 cgroup 挑 |
-| [M9 之前：cgroup.freeze](rounds/165-cgroup-freeze.md) | 2026-11-01 | 冻结的进程停在返回 guest 之前 |
-| [M9 之前：cgroup 的设备过滤（eBPF）](rounds/166-bpf-devices.md) | 2026-11-01 | docker、podman 不用 `--cgroups disabled` 也能跑容器 |
-| [M9 之前：devpts 的实例](rounds/167-devpts-instances.md) | 2026-11-01 | 容器里只看得到自己的终端 |
-| [M9 之前：open_tree、move_mount 和 mount_setattr](rounds/168-open-tree.md) | 2026-11-01 | podman `--uidmap` 的容器起得来了 |
-| [M9 之前：容器网络的普查](rounds/169-container-network-survey.md) | 2026-11-01 | 两家都卡在建 bridge；定下地址映射方案的四步 |
-| [M9 之前：有状态的网卡](rounds/170-netdev.md) | 2026-11-01 | 地址映射的第一步：docker、podman 的 bridge 网络建得起来 |
-| [M9 之前：经由虚拟网卡的连接](rounds/171-netmap.md) | 2026-11-01 | 地址映射的第二步：容器之间、docker 的 `-p` 都通了 |
-| [M9 之前：nftables 的子集和 socket 层的 DNAT](rounds/172-nftables.md) | 2026-11-01 | 地址映射的第三步：docker 自定义网络、podman 的 nftables 驱动能用 |
-| [M9 之前：发布的端口：PREROUTING 的 DNAT 和宿主上的转发](rounds/173-port-forwarding.md) | 2026-11-01 | 地址映射的第四步：从外面也连得到发布的端口 |
-| [M9 之前：各个网络命名空间的端口互不相干](rounds/174-namespace-ports.md) | 2026-11-01 | 内外同端口的 `-p 8080:8080` 起得来了 |
-| [M9 之前：过滤链](rounds/175-filter.md) | 2026-11-01 | docker 网络之间的隔离与原生一致 |
-| [M9 之前：从外面转发进来的连接带上真实的客户端地址](rounds/176-real-client-address.md) | 2026-11-01 | 容器里看到外面设备的真实地址，原来是网关 |
-| [M9 之前：网络命名空间的 sysctl 补齐、UDP 也查有没有人绑](rounds/177-net-sysctls.md) | 2026-11-02 | docker 的 `--sysctl` 能用；新命名空间里的 UDP 也登记 |
-| [M9 之前：测试提速，以及顺带找到的几个问题](rounds/178-test-speed.md) | 2026-11-02 | 全套从半个多小时降到约 9 分钟 |
-| [M9 之前：页表按需建立，AddressSanitizer 能用了](rounds/179-demand-page-tables.md) | 2026-11-02 | 大映射等访问时才建页表；ASan、LSan 能用 |
-| [M9 之前：透明代理：SO_ORIGINAL_DST、SO_MARK 和 owner 匹配](rounds/180-original-dst.md) | 2026-11-02 | 透明代理（`sslocal --protocol redir`）能用 |
-| [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块](rounds/181-last-member-leaves.md) | 2026-11-02 | 修了共用翻译的偶发 SIGILL |
-| [M9 之前：容器连外网也经过外层的 PREROUTING](rounds/182-outer-prerouting.md) | 2026-11-02 | 在外层 REDIRECT 就能透明代理所有容器 |
-| [M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面](rounds/183-udp-wide-first.md) | 2026-11-02 | 不先 bind 就 sendto 的程序发往哪里都行 |
-| [M9 之前：开机时挂好 /dev、/dev/shm、/dev/mqueue 和 /run](rounds/184-boot-tmpfs.md) | 2026-11-02 | 支持 OpenRC 的第一轮 |
-| [M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl](rounds/185-protected-links-random.md) | 2026-11-02 | 支持 OpenRC 的第二轮 |
-| [M9 之前：内置的 init 按 inittab 开机、关机](rounds/186-inittab.md) | 2026-11-02 | 支持 OpenRC 的第三轮 |
-| [M9 之前：App 按 inittab 开机、关机，没有标签页时留在后台](rounds/187-app-init.md) | 2026-11-02 | 支持 OpenRC 的最后一轮 |
-| [M9 之前：8 核上的扩展性和 BKL 的交接](rounds/188-bkl-spinners.md) | 2026-11-02 | 只有同时起进程不扩展；放宽到 4 个自旋者快 7–13% |
-| [M9 之前：rt_sigprocmask 不取 BKL 的尝试和进出分发器的共用计数](rounds/189-sigmask-dbt-running.md) | 2026-11-02 | rt_sigprocmask 免锁没有采用；8 个线程读时钟 844 → 155 ns |
-| [M9：设置页，默认导入 Alpine](rounds/190-settings-default-alpine.md) | 2026-11-02 | 换发行版、重置、选镜像、换执行层 |
-| [M9：熄屏时保持运行](rounds/191-keep-awake.md) | 2026-11-02 | 持 `PARTIAL_WAKE_LOCK`，不申请电池优化的豁免 |
-| [M9：许可证改为 AGPL-3.0-or-later，开源许可页](rounds/192-license.md) | 2026-11-02 | Termux 终端库按 GPLv3-only 对待，R3 消失 |
-| [M9：以指定用户登录](rounds/193-login-account.md) | 2026-11-02 | 默认以最先建的普通用户登录；修了 DNS 存根的 `FIONREAD` |
-| [M9：被杀之后恢复标签页](rounds/194-restore-tabs.md) | 2026-11-02 | 以原来的账号、目录起新的 shell，显示原来的回看记录 |
-| [M9：进程被结束、服务没起来时提示](rounds/195-kill-reports.md) | 2026-11-02 | 在标签页或通知里说明原因 |
-| [M9：在"文件"App 里浏览（只读）](rounds/196-documents-read.md) | 2026-11-02 | DocumentsProvider，不经过内核直接读仓库 |
-| [M9：在"文件"App 里改家目录](rounds/197-documents-write.md) | 2026-11-02 | 新建、写、删、改名，限在家目录里 |
-| [M9：断电之后仓库不坏](rounds/198-power-loss.md) | 2026-11-03 | 照 ext4 补上刷盘的顺序；dm-flakey 断电 75 次不坏 |
-| [M9：39 位的宿主地址空间](rounds/199-reserved-mappings.md) | 2026-11-03 | `PROT_NONE` 的预留不占宿主地址空间；Chromium 4.83 TB → 12.4 GB |
-| [M9：发布时放出的源码](rounds/200-release-sources.md) | 2026-11-03 | `scripts/release-sources` 生成三份源码 |
-| [M9："文件"App 与 guest 双向的通知](rounds/201-documents-notify.md) | 2026-11-03 | guest 收得到 inotify 事件，"文件"App 会刷新 |
-| [M9：内核的仓库只在持着它的 BKL 时用](rounds/202-store-bkl-check.md) | 2026-11-03 | 第 193 轮那次偶发 panic 的原因 |
-| [M9：换镜像不丢用户加的源](rounds/203-mirror-keeps-lines.md) | 2026-11-03 | 只换内置镜像的地址，别的行都留着 |
-| [M9："文件"App 按内容认出文本文件](rounds/204-text-by-content.md) | 2026-11-03 | 没有 NUL、是合法 UTF-8 的给 `text/plain` |
-| [M9：内核 bug 的报告能复制，带着 panic 的位置](rounds/205-copy-bug-report.md) | 2026-11-03 | panic 的消息和代码位置接进报告 |
-| [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制](rounds/206-debian-sudo-progress.md) | 2026-11-03 | Ctrl-C 只跳过这一次；修了 `su -c` 另起会话 |
-| [M9：内核 bug 的报告带上出错之前的内核日志](rounds/207-report-kernel-log.md) | 2026-11-03 | 报告带上出错之前的 10 条日志 |
-| [M9：宿主让绑的低端口就绑原来的](rounds/208-low-ports-direct.md) | 2026-11-03 | Play 系统更新放开了 22、80、443 等端口 |
+| [M2 results](rounds/01-m2.md) | 2026-10-24 | Geometric mean of the prototype Tier 1 on the integer benchmarks 1.85×, 2.37× on Neoverse N2 |
+| [M1a results](rounds/02-m1a.md) | 2026-10-24 | SIMD&FP, LL/SC, LSE; lockstep extended to a three-way comparison |
+| [M1b results](rounds/03-m1b.md) | 2026-10-24 | busybox runs through `ld-musl`; `gzip` 4.75× |
+| [M3a results](rounds/04-m3a.md) | 2026-10-24 | Multiple processes and threads, the BKL, signal frames, vDSO |
+| [M3b results](rounds/05-m3b.md) | 2026-10-24 | In-process PTY, job control, procfs |
+| [M4 results](rounds/06-m4.md) | 2026-10-24 | Networking, DNS stub, AF_UNIX; `apk add` and `git clone` work; R5 closed |
+| [M5 results](rounds/07-m5.md) | 2026-10-24 | Android app; passes on 4K and 16K page emulators |
+| [M6 results](rounds/08-m6.md) | 2026-10-25 | Building Lua and SQLite about 10×; credentials, record locks, IPC, timers; LTP 849 |
+| [M7 results](rounds/09-m7.md) | 2026-10-25 | Production Tier 1 (SIMD, 4096-entry TLB, W^X); builds 4.7–6.1× |
+| [M8 results](rounds/10-m8.md) | 2026-10-25 | Go and Node.js behave correctly; LTP 856 |
+| [M8 follow-up: JVM](rounds/11-m8-jvm.md) | 2026-10-25 | OpenJDK 21/25, Maven and Gradle work; inotify added |
+| [Pre-M9: stability and memory](rounds/12-stability-memory.md) | 2026-10-25 | Truncating mapped files, `PROT_NONE` kept out of page tables, robust futex |
+| [Pre-M9: profiling](rounds/13-profiling.md) | 2026-10-25 | Metadata cache, fork looks only at touched pages; `git status` 19× → 6× |
+| [Pre-M9: the translation cost of spawning processes](rounds/14-spawn-translation.md) | 2026-10-25 | Translations kept across exec; shell spawning 9× → 6.3× |
+| [Pre-M9: the stack pointer in a register and return prediction](rounds/15-sp-return-prediction.md) | 2026-10-25 | SP pinned in X26, shadow return stack; gcc 10% faster |
+| [Pre-M9: targeted futex wakeups](rounds/16-futex-targeted-wake.md) | 2026-10-25 | FUTEX_WAKE notifies only the threads it wakes; Gradle warm build 6.1 → 4.8 s |
+| [Pre-M9: compatibility gaps](rounds/17-compat.md) | 2026-10-25 | maps naming, real-time signal queuing, pidfd, `execveat`; LTP 889 |
+| [Pre-M9: the remaining small gaps](rounds/18-small-gaps.md) | 2026-10-25 | `/dev/shm` cleared at boot, smaps/pagemap, unshare; LTP 905 |
+| [Pre-M9: deferred items](rounds/19-deferred.md) | 2026-10-25 | `O_ASYNC`, leases, POSIX message queues, AIO; no io_uring |
+| [Pre-M9: robustness](rounds/20-robustness.md) | 2026-10-25 | A kernel bug ends only one process; app memory limit and OOM killer |
+| [Pre-M9: finishing robustness](rounds/21-robustness-finish.md) | 2026-10-25 | Panics at thread start and exit, in the timer thread and in JNI; recovery under libsigchain |
+| [Pre-M9: the stack size limit](rounds/22-stack-limit.md) | 2026-10-26 | The main thread's stack grows on demand, limited by `RLIMIT_STACK` |
+| [Pre-M9: memory-access checks and the translation table](rounds/23-tlb-checks.md) | 2026-10-26 | Accesses off the same base share one TLB check, crossing a page no longer exits; gcc 3.6× |
+| [Pre-M9: translations shared between threads and targeted wakeups](rounds/24-shared-translation.md) | 2026-10-26 | Measurements move to a local volume; `go build` 5.4× → 3.2×, Maven 8.5× → 4.4× |
+| [Pre-M9: stat without the BKL](rounds/25-stat-without-bkl.md) | 2026-10-26 | `git status` with parallel lstat 24 → 13 ms |
+| [Pre-M9: copy-on-write fork](rounds/26-fork-cow.md) | 2026-10-26 | fork of a process that wrote 100 MB 21 → 2.3 ms |
+| [Pre-M9: shared checks for interleaved accesses](rounds/27-interleaved-checks.md) | 2026-10-26 | python loop 0.82 → 0.75 s; two other experiments gained nothing |
+| [Pre-M9: the host cost of spawning processes](rounds/28-spawn-host-cost.md) | 2026-10-26 | fork then exec 221 → 163 µs (native 154) |
+| [Pre-M9: waiting for and holding the BKL](rounds/29-bkl-wait-hold.md) | 2026-10-26 | Spin before waiting for the lock; throughput of 4 processes spawning at once up 40% |
+| [Pre-M9: memory accesses in translated code](rounds/30-translated-access.md) | 2026-10-26 | TLB checks are 32% of gcc and 56% of python; python loop −4% |
+| [Pre-M9: the superblock experiment](rounds/31-superblocks.md) | 2026-10-26 | Translating on past calls and forward jumps made gcc slower; not adopted |
+| [Pre-M9: other workloads and file operations](rounds/32-workloads-file-ops.md) | 2026-10-26 | Ratios for various workloads; batched store commits, `cp -r` then `rm -rf` 2.8× → 1.6× |
+| [Pre-M9: the host cost of file operations](rounds/33-file-ops-host-cost.md) | 2026-10-26 | Objects deleted in the background, sendfile handed to the host; `tar x` 2.3× → 1.7× |
+| [Pre-M9: node startup](rounds/34-node-startup.md) | 2026-10-26 | Outline atomics handled inside Tier 1; `node -e 0` 12% faster |
+| [Pre-M9: JIT workloads](rounds/35-jit.md) | 2026-10-26 | Code invalidated by content; Maven 6.7 → 6.2 s |
+| [Pre-M9: parallel processes](rounds/36-parallel-processes.md) | 2026-10-26 | The translation pool holds 16 instances; parallel exec and pipes about 20% faster |
+| [Pre-M9: onTrimMemory](rounds/37-trim-memory.md) | 2026-10-26 | Rebuildable caches released when the UI goes away or memory is tight |
+| [Pre-M9: splitting the BKL](rounds/38-split-bkl.md) | 2026-10-26 | Clock reads, futex and nanosleep do not take the BKL |
+| [Pre-M9: load average, sysfs and limits](rounds/39-loadavg-sysfs.md) | 2026-10-27 | Load average sampling, CPU topology in sysfs, `/proc/<pid>/limits` |
+| [Pre-M9: ptrace step one, strace](rounds/40-ptrace-strace.md) | 2026-10-27 | Syscall, signal and event stops and regsets; strace works |
+| [Pre-M9: ptrace step two, gdb](rounds/41-ptrace-gdb.md) | 2026-10-27 | Breakpoints, single-stepping, software watchpoints and `catch syscall` match native |
+| [Pre-M9: epoll edges](rounds/42-epoll-edges.md) | 2026-10-27 | `EPOLLET` re-triggers when Linux does; tokio programs no longer hang |
+| [Pre-M9: core dumps](rounds/43-coredump.md) | 2026-10-27 | ELF cores written per `core_pattern`; gdb can analyze them afterwards |
+| [Pre-M9: hardware breakpoints and watchpoints](rounds/44-hw-watchpoints.md) | 2026-10-27 | 6 breakpoints and 4 watchpoints, checked by the interpreter |
+| [Pre-M9: ptrace and procfs details](rounds/45-ptrace-procfs.md) | 2026-10-27 | Single-stepping into signal handlers, the mask inside sigsuspend, `/proc/<pid>/mem` |
+| [Pre-M9: mremap and sysfs](rounds/46-mremap-sysfs.md) | 2026-10-27 | mremap grows private file mappings; sysfs `cache/` and `cpufreq/` |
+| [Pre-M9: nested epoll edges](rounds/47-nested-epoll.md) | 2026-10-27 | Every event on the inner instance re-triggers an edge-triggered outer one |
+| [Pre-M9: exclusive wakeups](rounds/48-exclusive-wakeup.md) | 2026-10-27 | One edge wakes only one `EPOLLEXCLUSIVE` waiter |
+| [Pre-M9: per-object wakeups](rounds/49-targeted-wakeups.md) | 2026-10-27 | poll, epoll and blocking reads and writes are woken only by the objects they wait on |
+| [Pre-M9: watchpoints in Tier 1](rounds/50-watchpoints-tier1.md) | 2026-10-27 | Only watched pages go to the interpreter; gdb `watch` 10.8 → 0.45 s |
+| [Pre-M9: spawning and setting timers no longer wake everyone](rounds/51-spawn-timer-wakeups.md) | 2026-10-27 | vfork, timers and signalfd wake only the threads concerned |
+| [Pre-M9: signalfd looks at the calling thread](rounds/52-signalfd-caller.md) | 2026-10-27 | poll and epoll look at the calling thread, as read does, not at the creating one |
+| [Pre-M9: locks and host sockets wake only their waiters](rounds/53-locks-host-sockets.md) | 2026-10-27 | With other processes sitting in waits, one flock 10 → 0.2 µs |
+| [Pre-M9: message queues and signal-driven I/O no longer wake everyone](rounds/54-mqueue-fasync.md) | 2026-10-27 | Message queues wake per object; `O_ASYNC` wakes only the timer thread |
+| [Pre-M9: blocking reads on host stdio wait only on the host fd](rounds/55-host-stdio.md) | 2026-10-27 | Affects only `appine-run`; the app has no such files |
+| [Pre-M9: blocked signals wake only their waiters](rounds/56-blocked-signals.md) | 2026-10-27 | Wake only sigtimedwait and signalfd waiters |
+| [Pre-M9: tracing stopped processes, the tracer reaping first](rounds/57-ptrace-stopped-reaped.md) | 2026-10-27 | Report order of group-stop and ATTACH; the tracer reaps the exit first |
+| [Pre-M9: a cgroup v2 view](rounds/58-cgroup.md) | 2026-10-27 | A read-only view; the JVM and Node.js size their heaps by `memory.max` |
+| [Pre-M9: seccomp](rounds/59-seccomp.md) | 2026-10-28 | Strict mode, cBPF filters, notification fds; `strace --seccomp-bpf` works |
+| [Pre-M9: the seccomp cache and fast path](rounds/60-seccomp-cache.md) | 2026-10-28 | Always-allowed numbers skip running the program; futex wake 313 → 60 ns |
+| [Pre-M9: each step of process exit caught separately](rounds/61-finish-steps.md) | 2026-10-28 | Each of the nine steps catches kernel bugs on its own; no more processes stuck forever |
+| [Pre-M9: workload survey](rounds/62-workload-survey.md) | 2026-10-28 | Most of 20-odd services and tools work; 6 problems found |
+| [Pre-M9: pages returned after fork get their own permissions back](rounds/63-returned-loans.md) | 2026-10-28 | Restoring permissions no longer crosses mappings; rustc no longer crashes on exit |
+| [Pre-M9: terminal owner and permissions](rounds/64-pty-owner.md) | 2026-10-28 | sshd can hand the terminal to the user; `ssh -t` and mosh work |
+| [Pre-M9: shared pages in smaps](rounds/65-smaps-shared.md) | 2026-10-28 | redis and valkey pass their copy-on-write check and start |
+| [Pre-M9: io_destroy wakes threads waiting for events](rounds/66-aio-destroy.md) | 2026-10-28 | mariadb's install-db and shutdown no longer hang |
+| [Pre-M9: cgroup memory.stat](rounds/67-memory-stat.md) | 2026-10-28 | .NET's GC computes memory load from the whole app's usage |
+| [Pre-M9: /proc/meminfo copied from the host](rounds/68-meminfo.md) | 2026-10-28 | Available memory in free and htop matches native |
+| [Pre-M9: probing glibc distributions](rounds/69-glibc-probe.md) | 2026-10-28 | Debian 13 and Ubuntu 24.04 rootfs work without kernel-layer changes |
+| [Pre-M9: the second survey, language test suites and large projects](rounds/70-survey-suites.md) | 2026-10-28 | Language test suites and large projects compared with native; 6 problems found |
+| [Pre-M9: dropping weak references outside the BKL on thread exit](rounds/71-thread-exit-race.md) | 2026-10-28 | Fixed host heap corruption when threads start and exit often |
+| [Pre-M9: tombstones missed in the translation table](rounds/72-table-tombstones.md) | 2026-10-28 | Fixed a full translation table leaving a process unkillable even by SIGKILL |
+| [Pre-M9: directory and file timestamps](rounds/73-timestamps.md) | 2026-10-28 | Python can import modules created later |
+| [Pre-M9: FICLONE returns EOPNOTSUPP](rounds/74-ficlone.md) | 2026-10-28 | Python 3.14's `Path.copy()` works |
+| [Pre-M9: PTY TCFLSH and TCXONC](rounds/75-pty-flow.md) | 2026-10-28 | CPython's test_termios and test_ioctl no longer hang |
+| [Pre-M9: a FIFO reports no POLLHUP before a writer arrives](rounds/76-fifo-pollhup.md) | 2026-10-28 | Ruby's test_require passes in full |
+| [Pre-M9: nothing can be created in a deleted directory, sockets can be fchmod'ed](rounds/77-dead-dir-socket-fchmod.md) | 2026-10-28 | Node's test-fs-mkdir and one other test pass |
+| [Pre-M9: gaps in network information](rounds/78-net-info-gaps.md) | 2026-10-28 | Docs only: the gaps in routes, traffic counters and `if_inet6` |
+| [Pre-M9: terminal access and modification times](rounds/79-pty-times.md) | 2026-10-28 | Idle times in w and who mean something now |
+| [Pre-M9: CPU time never goes backwards](rounds/80-cpu-times.md) | 2026-10-28 | Follows `cputime_adjust`; times03 no longer fails intermittently |
+| [Pre-M9: a woken process is R in /proc](rounds/81-woken-state.md) | 2026-10-28 | shmctl01 no longer fails |
+| [Pre-M9: the tests' own races and lost evidence](rounds/82-test-races.md) | 2026-10-28 | A race in the job-control case; evidence kept when a test fails |
+| [Pre-M9: unimplemented netlink protocols cannot be created](rounds/83-netlink-protocols.md) | 2026-10-28 | sshd, su and login through PAM no longer fail |
+| [Pre-M9: re-testing the open questions](rounds/84-debt-checks.md) | 2026-10-28 | Tests only: several pending failures match native |
+| [Pre-M9: if_inet6, ioctl on O_PATH, and the exit after a stop midway](rounds/85-inet6-opath-exit.md) | 2026-10-28 | The JVM no longer turns IPv6 off; a fork event is followed by a stop at syscall exit |
+| [Pre-M9: hunting Rc count changes outside the BKL](rounds/86-rc-outside-bkl.md) | 2026-10-28 | A panic while the BKL is released takes the lock back before unwinding |
+| [Pre-M9: panics caught in syscalls without the BKL, no open-file borrows held while waiting](rounds/87-fast-panic-held-borrows.md) | 2026-10-29 | A bug in a syscall that does not take the lock ends only that process |
+| [Pre-M9: cleaning up futex waiters, borrows checked when releasing the BKL](rounds/88-futex-cleanup-borrow-check.md) | 2026-10-29 | Waiters leave the queue through a guard; no more lost wakeups |
+| [Pre-M9: release builds for testing check borrows too](rounds/89-release-borrow-check.md) | 2026-10-29 | The differential tests, LTP and the survey recognize internal errors reported by the kernel layer |
+| [Pre-M9: network interface traffic counters](rounds/90-interface-counters.md) | 2026-10-29 | `/proc/net/dev`, sysfs and netlink report the same numbers |
+| [Pre-M9: NETLINK_GENERIC with only nlctrl](rounds/91-generic-netlink.md) | 2026-10-29 | Replies byte-for-byte identical to Linux 6.8 |
+| [Pre-M9: debuggers, valgrind and headless Chromium](rounds/92-debuggers-valgrind-chromium.md) | 2026-10-29 | 3 kernel-layer problems found; matches native after the fixes |
+| [Pre-M9: paths in `/proc/<pid>/fd` and maps resolve symlinks](rounds/93-fd-paths-resolve-symlinks.md) | 2026-10-29 | valgrind can reopen Debian's ld.so |
+| [Pre-M9: the link count of `/proc/<pid>/task`](rounds/94-task-dir-links.md) | 2026-10-29 | Chromium's zygote no longer crashes at startup |
+| [Pre-M9: signals a tracer had already taken were lost when it exited](rounds/95-tracer-exit-drops-signal.md) | 2026-10-29 | delve reads EOF and exits after attaching, and the process no longer stays stopped |
+| [Pre-M9: `/proc/<pid>/net`](rounds/96-proc-pid-net.md) | 2026-10-29 | `/proc/net` becomes a link to `self/net` |
+| [Pre-M9: deleted files carry ` (deleted)`](rounds/97-deleted-suffix.md) | 2026-10-29 | needrestart uses it to find processes still using old libraries |
+| [Pre-M9: routing tables](rounds/98-routes.md) | 2026-10-29 | The main table comes from the host; `ip route` and others byte-for-byte identical to Linux |
+| [Pre-M9: choosing a rootfs in the app](rounds/99-choose-rootfs.md) | 2026-10-29 | Alpine, Debian and Ubuntu to choose from, and a reset |
+| [Pre-M9: file capabilities](rounds/100-file-caps.md) | 2026-10-29 | File and ambient capabilities computed as in Linux 6.1; permission checks on extended attributes |
+| [Pre-M9: netlink messages for links and addresses](rounds/101-link-addr.md) | 2026-10-29 | `ip addr` and `ip link` show `brd` and `state UP` |
+| [Pre-M9: `/proc/net/snmp` and EOF at the end of input](rounds/102-snmp-pty-eof.md) | 2026-10-29 | `ss -s` works; `appine-run --pty` sends VEOF at the end of input |
+| [Pre-M9: AI coding CLIs](rounds/103-ai-cli-survey.md) | 2026-10-29 | Claude Code, Codex and Gemini CLI match native; their sandboxes cannot be set up |
+| [Pre-M9: closing the master hangs up the slave](rounds/104-pty-hangup.md) | 2026-10-29 | Hangs up as `tty_vhangup` does; no processes left after `tmux kill-server` |
+| [Pre-M9: a subset of mount](rounds/105-mount-subset.md) | 2026-10-29 | procfs and others mountable anywhere, bind mounts; ps works after chroot into Debian |
+| [Pre-M9: counting the code cache once](rounds/106-code-cache-rss.md) | 2026-10-30 | App usage with 20 idle python3 321 → 218 MB |
+| [Pre-M9: density of translated code](rounds/107-code-density.md) | 2026-10-30 | About 8 → 6 host words per guest instruction; Maven and Gradle 3–5% faster |
+| [Pre-M9: one program shares its translations](rounds/108-shared-translation.md) | 2026-10-30 | 20 idle python3 193 → 84 MB; shell spawning 30% faster |
+| [Pre-M9: lock hold time of spawning and mmap](rounds/109-spawn-mmap-bkl.md) | 2026-10-30 | 4 concurrent execs about 10% faster |
+| [Pre-M9: the cost of openat](rounds/110-openat-cost.md) | 2026-10-30 | No cheap fix; no code changed |
+| [Pre-M9: checkpoints moved to the background](rounds/111-background-checkpoint.md) | 2026-10-30 | Longest commit under the lock while unpacking 8.4 → 0.6 ms |
+| [Pre-M9: host memory seams](rounds/112-host-seams.md) | 2026-10-30 | Even with no group split at all it is only 1.4% faster; no code changed |
+| [Pre-M9: Go gets a different set of reserved registers](rounds/113-go-registers.md) | 2026-10-30 | `go build` 3–5% faster |
+| [Pre-M9: branching to an unaligned address](rounds/114-unaligned-branch.md) | 2026-10-30 | SIGBUS as on Linux; it used to end with an internal error |
+| [Pre-M9: processes with JIT code share translations too](rounds/115-shared-with-jit.md) | 2026-10-30 | App usage with 4 idle node 190 → 119 MB |
+| [Pre-M9: bind mounts of directories in the store](rounds/116-store-binds.md) | 2026-10-30 | bubblewrap round one: directories and files in the store can be bind-mounted |
+| [Pre-M9: tmpfs](rounds/117-tmpfs.md) | 2026-10-30 | bubblewrap round two |
+| [Pre-M9: mount namespaces](rounds/118-mount-namespaces.md) | 2026-10-30 | bubblewrap round three |
+| [Pre-M9: user namespaces](rounds/119-user-namespaces.md) | 2026-10-30 | bubblewrap round four |
+| [Pre-M9: pid namespaces](rounds/120-pid-namespaces.md) | 2026-10-30 | bubblewrap round five |
+| [Pre-M9: UTS and IPC namespaces](rounds/121-uts-ipc-namespaces.md) | 2026-10-30 | bubblewrap round six |
+| [Pre-M9: network namespaces](rounds/122-net-namespaces.md) | 2026-10-30 | bubblewrap round seven |
+| [Pre-M9: bubblewrap and the AI coding CLI sandboxes](rounds/123-bwrap.md) | 2026-10-30 | The Codex and Claude Code sandboxes work |
+| [Pre-M9: V8 and HotSpot registers](rounds/124-v8-hotspot-registers.md) | 2026-10-30 | Docs only: after measuring, the registers stay as they are |
+| [Pre-M9: emulating raw ICMP](rounds/125-raw-icmp.md) | 2026-10-30 | busybox `ping` and `ping6` work |
+| [Pre-M9: PR_SET_CHILD_SUBREAPER](rounds/126-child-subreaper.md) | 2026-10-31 | Used by process supervisors such as tini and s6 |
+| [Pre-M9: LTP's remaining small differences](rounds/127-ltp-leftovers.md) | 2026-10-31 | Mostly musl behavior; 6 places changed |
+| [Pre-M9: traceroute and mtr](rounds/128-traceroute.md) | 2026-10-31 | One ICMP tap per network namespace; traceroute and mtr work |
+| [Pre-M9: namespace files keep namespaces alive](rounds/129-namespace-files.md) | 2026-10-31 | `ip netns` and `nsenter` work |
+| [Pre-M9: vhangup](rounds/130-vhangup.md) | 2026-10-31 | Hangs up as `tty_vhangup` does; the node stays, and reopening works as usual |
+| [Pre-M9: tmpfs usage and limits](rounds/131-tmpfs-usage.md) | 2026-10-31 | statfs reports usage; ENOSPC when something does not fit or the tmpfs is full |
+| [Pre-M9: setns through a pidfd](rounds/132-setns-pidfd.md) | 2026-10-31 | `nsenter -t` used to fail every time and now works |
+| [Pre-M9: the ASIMDDP dot product instructions](rounds/133-asimddp.md) | 2026-10-31 | VP9 encoding 4.5% faster |
+| [Pre-M9: children in task directories](rounds/134-task-children.md) | 2026-10-31 | A child remembers its parent thread and moves to another thread when that one exits |
+| [Pre-M9: SHA3, SHA512 and I8MM](rounds/135-sha3-sha512-i8mm.md) | 2026-10-31 | OpenSSL's SHA-512 4.1× faster |
+| [Pre-M9: LRCPC](rounds/136-lrcpc.md) | 2026-10-31 | All the v1.x features of §4.4 are done |
+| [Pre-M9: PDEATHSIG and __WNOTHREAD](rounds/137-pdeathsig-wnothread.md) | 2026-10-31 | Sent as soon as the thread that set it exits; `__WNOTHREAD` waits only for the thread's own children |
+| [Pre-M9: LRCPC2](rounds/138-lrcpc2.md) | 2026-10-31 | LDAPUR, STLUR and the other forms with offsets |
+| [Pre-M9: unimplemented syscalls](rounds/139-unimplemented-syscalls.md) | 2026-10-31 | Docs only: records the numbers that return ENOSYS |
+| [Pre-M9: ioprio, syslog and adjtimex](rounds/140-ioprio-syslog-adjtimex.md) | 2026-10-31 | `ionice` works; syslog(2) and adjtimex answer queries |
+| [Pre-M9: FP16 and JSCVT](rounds/141-fp16-jscvt.md) | 2026-10-31 | llama.cpp F16 models 44–82% faster |
+| [Pre-M9: RDM, FCMA, FHM and BF16](rounds/142-rdm-fcma-fhm-bf16.md) | 2026-10-31 | `gcc -mcpu=native` uses them; BF16 dot product 1.5× faster |
+| [Pre-M9: /dev/kmsg and the kernel log](rounds/143-kmsg.md) | 2026-10-31 | `dmesg` in the guest shows OOM kills and internal errors |
+| [Pre-M9: openat2](rounds/144-openat2.md) | 2026-10-31 | New versions of GNU tar cannot do without it |
+| [Pre-M9: termios2](rounds/145-termios2.md) | 2026-10-31 | Ubuntu 26.04 recognizes the terminal |
+| [Pre-M9: PTY packet mode](rounds/146-pty-packet-mode.md) | 2026-10-31 | GNU screen works |
+| [Pre-M9: ptrace access checks for /proc/<pid>/exe](rounds/147-proc-exe-access.md) | 2026-10-31 | EACCES for other users' processes and non-dumpable ones |
+| [Pre-M9: ID mapping in user namespaces](rounds/148-userns-ids.md) | 2026-10-31 | `SO_PEERCRED`, si_uid, IPC owners and the like are mapped per namespace |
+| [Pre-M9: the Ubuntu 26.04 survey](rounds/149-ubuntu26-survey.md) | 2026-10-31 | apt installed 238 packages; three problems found |
+| [Pre-M9: newly allocated PTYs](rounds/150-new-pty-state.md) | 2026-11-01 | The master does not EIO before the slave has ever been opened; the window size starts at 0×0 |
+| [Pre-M9: short symlinks take no blocks](rounds/151-short-symlink-blocks.md) | 2026-11-01 | The total in `ls -l` matches native |
+| [Pre-M9: nmap running as root](rounds/152-nmap-unprivileged.md) | 2026-11-01 | The app sets `NMAP_UNPRIVILEGED=1`, so nmap uses connect scans |
+| [Pre-M9: /proc/<pid>/exe points at the program file itself](rounds/153-exe-file.md) | 2026-11-01 | After deletion or replacement, opening through it still gets the original file |
+| [Pre-M9: FRINTTS, FlagM, SB and DPB](rounds/154-frintts-flagm-sb-dpb.md) | 2026-11-01 | `gcc -mcpu=native` matches native |
+| [Pre-M9: DIT](rounds/155-dit.md) | 2026-11-01 | Carried through signals, ptrace and fork; cleared by execve |
+| [Pre-M9: low port mapping and listen notifications](rounds/156-low-ports.md) | 2026-11-01 | Moved to +10000 on the host; a notification when a listen is seen |
+| [Pre-M9: the podman and docker survey](rounds/157-container-survey.md) | 2026-11-01 | podman's common features match native; 12 problems found |
+| [Pre-M9: four small problems container runtimes ran into](rounds/158-container-small-fixes.md) | 2026-11-01 | capget, `RTM_NEWLINK`, the synthetic root directory's inode, fds in thread directories |
+| [Pre-M9: mounting cgroup2 writable](rounds/159-cgroup2-rw-mount.md) | 2026-11-01 | crun mounts it this way for containers; it still cannot be changed from inside |
+| [Pre-M9: the mqueue file system](rounds/160-mqueue-fs.md) | 2026-11-01 | podman starts containers without a temporary workaround |
+| [Pre-M9: executing memfds and deleted files through an fd](rounds/161-exec-open-file.md) | 2026-11-01 | Needed by runc to start containers and by `podman build --isolation chroot` |
+| [Pre-M9: time namespaces](rounds/162-time-namespaces.md) | 2026-11-01 | Needed by dockerd and runc |
+| [Pre-M9: the cgroup tree: creating child cgroups, migrating processes](rounds/163-cgroup-tree.md) | 2026-11-01 | dockerd can create the containers' cgroups |
+| [Pre-M9: cgroup pids.max and memory.max take effect](rounds/164-cgroup-limits.md) | 2026-11-01 | fork checks `pids.max`; the OOM killer picks by cgroup |
+| [Pre-M9: cgroup.freeze](rounds/165-cgroup-freeze.md) | 2026-11-01 | Frozen processes stop before returning to the guest |
+| [Pre-M9: cgroup device filtering (eBPF)](rounds/166-bpf-devices.md) | 2026-11-01 | docker and podman run containers without `--cgroups disabled` |
+| [Pre-M9: devpts instances](rounds/167-devpts-instances.md) | 2026-11-01 | A container sees only its own terminals |
+| [Pre-M9: open_tree, move_mount and mount_setattr](rounds/168-open-tree.md) | 2026-11-01 | podman containers with `--uidmap` start |
+| [Pre-M9: the container network survey](rounds/169-container-network-survey.md) | 2026-11-01 | Both get stuck creating a bridge; the four steps of the address-mapping plan are set |
+| [Pre-M9: stateful network devices](rounds/170-netdev.md) | 2026-11-01 | Address mapping step one: docker and podman bridge networks come up |
+| [Pre-M9: connections through virtual NICs](rounds/171-netmap.md) | 2026-11-01 | Address mapping step two: container-to-container traffic and docker `-p` work |
+| [Pre-M9: an nftables subset and DNAT in the socket layer](rounds/172-nftables.md) | 2026-11-01 | Address mapping step three: docker custom networks and podman's nftables driver work |
+| [Pre-M9: published ports: PREROUTING DNAT and forwarding on the host](rounds/173-port-forwarding.md) | 2026-11-01 | Address mapping step four: published ports are reachable from outside |
+| [Pre-M9: each network namespace has its own ports](rounds/174-namespace-ports.md) | 2026-11-01 | `-p 8080:8080`, with the same port inside and out, starts |
+| [Pre-M9: filter chains](rounds/175-filter.md) | 2026-11-01 | Isolation between docker networks matches native |
+| [Pre-M9: connections forwarded from outside carry the real client address](rounds/176-real-client-address.md) | 2026-11-01 | Containers see the outside device's real address instead of the gateway's |
+| [Pre-M9: completing the network namespace sysctls, UDP also checks whether anyone is bound](rounds/177-net-sysctls.md) | 2026-11-02 | docker `--sysctl` works; UDP in new namespaces is registered too |
+| [Pre-M9: faster tests, and a few problems found along the way](rounds/178-test-speed.md) | 2026-11-02 | The full suite down from over half an hour to about 9 minutes |
+| [Pre-M9: page tables built on demand, AddressSanitizer works](rounds/179-demand-page-tables.md) | 2026-11-02 | Large mappings get page tables only when accessed; ASan and LSan work |
+| [Pre-M9: transparent proxies: SO_ORIGINAL_DST, SO_MARK and owner matching](rounds/180-original-dst.md) | 2026-11-02 | Transparent proxying (`sslocal --protocol redir`) works |
+| [Pre-M9: when the last member leaves a shared-translation group, blocks others left behind are invalidated](rounds/181-last-member-leaves.md) | 2026-11-02 | Fixed the intermittent SIGILL with shared translations |
+| [Pre-M9: container traffic to the outside also goes through the outer PREROUTING](rounds/182-outer-prerouting.md) | 2026-11-02 | A REDIRECT in the outer layer transparently proxies all containers |
+| [Pre-M9: unbound UDP sockets in a new namespace send inside the namespace first, then outside](rounds/183-udp-wide-first.md) | 2026-11-02 | Programs that sendto without binding first can reach any destination |
+| [Pre-M9: /dev, /dev/shm, /dev/mqueue and /run mounted at boot](rounds/184-boot-tmpfs.md) | 2026-11-02 | OpenRC support, round one |
+| [Pre-M9: the sysctls Alpine writes at boot, protected_symlinks/hardlinks and the random ioctls](rounds/185-protected-links-random.md) | 2026-11-02 | OpenRC support, round two |
+| [Pre-M9: the built-in init boots and shuts down per inittab](rounds/186-inittab.md) | 2026-11-02 | OpenRC support, round three |
+| [Pre-M9: the app boots and shuts down per inittab and stays in the background with no tabs open](rounds/187-app-init.md) | 2026-11-02 | OpenRC support, last round |
+| [Pre-M9: scaling on 8 cores and BKL handoff](rounds/188-bkl-spinners.md) | 2026-11-02 | Only concurrent spawning fails to scale; allowing up to 4 spinners is 7–13% faster |
+| [Pre-M9: trying rt_sigprocmask without the BKL, and the shared counter for entering and leaving the dispatcher](rounds/189-sigmask-dbt-running.md) | 2026-11-02 | rt_sigprocmask without the lock not adopted; 8 threads reading the clock 844 → 155 ns |
+| [M9: settings page, Alpine imported by default](rounds/190-settings-default-alpine.md) | 2026-11-02 | Switching distributions, reset, choosing a mirror, changing the execution tier |
+| [M9: keep running with the screen off](rounds/191-keep-awake.md) | 2026-11-02 | Holds a `PARTIAL_WAKE_LOCK`; does not ask for a battery optimization exemption |
+| [M9: license changed to AGPL-3.0-or-later, open source licenses page](rounds/192-license.md) | 2026-11-02 | The Termux terminal libraries treated as GPLv3-only; R3 goes away |
+| [M9: logging in as a chosen user](rounds/193-login-account.md) | 2026-11-02 | Logs in as the first regular user created by default; fixed `FIONREAD` on the DNS stub |
+| [M9: restoring tabs after being killed](rounds/194-restore-tabs.md) | 2026-11-02 | A new shell starts with the same account and directory and shows the old scrollback |
+| [M9: notices when a process is ended or the service fails to start](rounds/195-kill-reports.md) | 2026-11-02 | The reason is shown in the tab or a notification |
+| [M9: browsing in the Files app (read-only)](rounds/196-documents-read.md) | 2026-11-02 | A DocumentsProvider that reads the store directly, bypassing the kernel |
+| [M9: editing the home directory in the Files app](rounds/197-documents-write.md) | 2026-11-02 | Create, write, delete and rename, confined to the home directory |
+| [M9: the store survives power loss](rounds/198-power-loss.md) | 2026-11-03 | Flush ordering added following ext4; 75 dm-flakey power cuts without damage |
+| [M9: the 39-bit host address space](rounds/199-reserved-mappings.md) | 2026-11-03 | `PROT_NONE` reservations take no host address space; Chromium 4.83 TB → 12.4 GB |
+| [M9: the source released with the app](rounds/200-release-sources.md) | 2026-11-03 | `scripts/release-sources` produces three source archives |
+| [M9: two-way notifications between the Files app and the guest](rounds/201-documents-notify.md) | 2026-11-03 | The guest receives inotify events, and the Files app refreshes |
+| [M9: the kernel's store is used only while holding its BKL](rounds/202-store-bkl-check.md) | 2026-11-03 | The cause of the intermittent panic in round 193 |
+| [M9: switching mirrors keeps the sources users added](rounds/203-mirror-keeps-lines.md) | 2026-11-03 | Only the built-in mirror's address changes; every other line stays |
+| [M9: the Files app recognizes text files by content](rounds/204-text-by-content.md) | 2026-11-03 | Files with no NUL that are valid UTF-8 get `text/plain` |
+| [M9: kernel bug reports can be copied and carry the panic location](rounds/205-copy-bug-report.md) | 2026-11-03 | The panic message and code location go into the report |
+| [M9: installing sudo on Debian shows progress and can be skipped, regular users' shells have job control](rounds/206-debian-sudo-progress.md) | 2026-11-03 | Ctrl-C skips just this once; fixed `su -c` starting a new session |
+| [M9: kernel bug reports carry the kernel log from before the error](rounds/207-report-kernel-log.md) | 2026-11-03 | Reports include the last 10 log entries before the error |
+| [M9: binding the original low port when the host allows it](rounds/208-low-ports-direct.md) | 2026-11-03 | A Play system update opened up ports such as 22, 80 and 443 |
 
-## 测量条件
+## Measurement conditions
 
-各篇的测量没有另外注明时，条件如下：
+Unless a file says otherwise, its measurements were taken under these conditions:
 
-- **宿主**：Apple Silicon 上 colima 起的 arm64 Linux 虚拟机（4 核；[测试提速](rounds/178-test-speed.md)起 8 核）。appine 是 release 构建，用 Tier 1。
-- **原生对照**：同一台虚拟机上的 Alpine 3.24 容器。M8 起是差分测试的仓库导出的 docker 镜像，两边的文件完全相同。[性能剖析](rounds/13-profiling.md)那一轮发现，对照的文件和状态必须完全相同：对照镜像起初没有打包 `/var`，原生一侧的 apk 没有仓库索引要读。
-- **热缓存**：从[性能剖析](rounds/13-profiling.md)起，每个负载在同一个 appine 会话里连跑两次，取第二次（原生一侧同样）。手机上 App 是长期运行的进程，第二次更接近实际。
-- **仓库位置**：从[多线程共用翻译和定向唤醒](rounds/24-shared-translation.md)起，基准仓库放在虚拟机本地的 docker 卷 `appine-bench` 上。之前在 `target/` 里，经由 virtiofs 共享进虚拟机，宿主的每次 open、stat 都跨虚拟机，文件系统、起进程类负载的倍数偏高。从[文件操作的宿主开销](rounds/33-file-ops-host-cost.md)起，原生一侧的文件操作也在同一个卷上（之前在容器自己的 overlay 上）。
-- **A/B**："之前"或"HEAD"一列是这一轮开始时的二进制，与改动之后的二进制在同一个会话里交替运行几轮（`target/mem/ab.sh` 等脚本），给出区间。
-- **Neoverse N2**：GitHub 的 `ubuntu-24.04-arm` runner（Azure Cobalt 100，2 vCPU），CI 的性能探针在那里运行。它的核心比 Apple Silicon 窄，更接近手机的大核和中核。
+- **Host**: an arm64 Linux VM run by colima on Apple Silicon (4 cores; 8 cores from [faster tests](rounds/178-test-speed.md) on). appine is a release build running Tier 1.
+- **Native baseline**: an Alpine 3.24 container on the same VM. From M8 on it is a docker image exported from the differential tests' store, so both sides have exactly the same files. The [profiling](rounds/13-profiling.md) round found that the baseline needs exactly the same files and state: the baseline image at first did not pack `/var`, so native apk had no repository index to read.
+- **Warm cache**: from [profiling](rounds/13-profiling.md) on, each workload runs twice in the same appine session and the second run counts (likewise on the native side). On a phone the app is a long-running process, so the second run is closer to real use.
+- **Store location**: from [translations shared between threads and targeted wakeups](rounds/24-shared-translation.md) on, the benchmark store lives on the VM-local docker volume `appine-bench`. Before that it was in `target/`, shared into the VM over virtiofs, so every host open and stat crossed the VM boundary and the ratios of file-system and process-spawning workloads came out too high. From [the host cost of file operations](rounds/33-file-ops-host-cost.md) on, native file operations run on the same volume as well (before, on the container's own overlay).
+- **A/B**: the "before" or "HEAD" column is the binary from the start of the round, alternated with the changed binary over several runs in the same session (`target/mem/ab.sh` and similar scripts), giving a range.
+- **Neoverse N2**: GitHub's `ubuntu-24.04-arm` runner (Azure Cobalt 100, 2 vCPUs), where CI's performance probe runs. Its cores are narrower than Apple Silicon's and closer to the big and mid cores of phones.
 
-## 已知的偶发失败
+## Known flaky tests
 
-LTP 的 syscall 测试全量并发运行（`scripts/ltp -j 8`）时，下面几项时好时坏，与当时的改动无关：每次都用上一轮的二进制在同一时刻重跑过，或者单独重跑过。各篇里只记它们这次通过还是失败。
+When the LTP syscall tests run in full in parallel (`scripts/ltp -j 8`), the following tests pass and fail intermittently, unrelated to the change at hand: each time they were rerun at the same moment with the previous round's binary, or rerun on their own. The rounds only record whether they passed or failed that time.
 
-| 测试 | 原因 |
+| Test | Cause |
 |---|---|
-| futex_wait05、epoll_pwait03、epoll_wait02、clock_nanosleep02、nanosleep01、select02、pselect01、pselect01_64、poll02、prctl09 | 检查睡眠的超时精度，睡 1 毫秒量出 1.3–1.6 毫秒就失败，取决于虚拟机当时的计时延迟（M7 起）；[独占的唤醒](rounds/48-exclusive-wakeup.md)那一轮遇到过虚拟机里原生的 nanosleep 1 毫秒也要 1.5 毫秒，这几项连续失败，旧的二进制也一样；[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮虚拟机空闲时原生的平均 1.58 毫秒，其中 7 项新旧二进制都失败；[路由表](rounds/98-routes.md)那一轮 select02 单独跑也失败，原生 1 毫秒睡眠的中位数 1.59 毫秒 |
-| getrusage03 | 要求可用内存至少 512 MB，全量并发时不够就跳过，单独运行通过 |
-| nice05 | 比较两个 nice 值不同的线程用掉的 CPU 时间，appine 不按 nice 分配 CPU 时差值的正负是随机的（M8 起）；[推迟项](rounds/19-deferred.md)那一轮把 nice 交给宿主线程之后通过 |
-| exit_group01 | [终端的属主和权限](rounds/64-pty-owner.md)那一轮全量并发运行时以退出码 134（SIGABRT）失败一次，日志在重跑时被覆盖了（[测试自己的竞争和丢掉的现场](rounds/82-test-races.md)那一轮起 `scripts/ltp` 保留上一次的日志）；单独跑 8 次、在另外 7 路 LTP 测试的负载下顺序跑 30 次都通过，原因没查。多半是[线程退出时在 BKL 外丢掉弱引用](rounds/71-thread-exit-race.md)那一轮修的竞争：宿主的堆被破坏时 glibc 以 SIGABRT 结束 appine-run |
-| mmap21_01、mmap21_02 | [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)那一轮清理时 unlink `/dev/shm` 下的文件得到 EIO；单独重跑 3 次、与 `/dev/shm`、mmap、文件操作有关的 162 个测试 16 路并发重跑 3 次都没有再出现，10 月 24 日的基线里也有过一次（LTP 的仓库放在 virtiofs 上）。[ptrace 的第二步](rounds/41-ptrace-gdb.md)那一轮的日志是 `unlink(/dev/shm/ltp_mmap21_2)` 得到 ENOENT：LTP 的库把结果放在 `/dev/shm/ltp_<程序名>_<pid>`，mmap21_01 和 mmap21_02 是同一个程序，每个 appine-run 里的第一个进程都是 pid 2，并发运行时两个用例共用仓库的 `/dev/shm`、用同一个文件，一个删掉了另一个的。这是并发跑 LTP 的方式造成的，不是内核的问题；[`/proc/net/snmp` 和输入结束时的 EOF](rounds/102-snmp-pty-eof.md)那一轮是 `open` 这个文件得到 EEXIST，同一个原因；[低端口映射](rounds/156-low-ports.md)那一轮是 mmap21_01 失败（unlink 得到 ENOENT），同一个原因 |
+| futex_wait05, epoll_pwait03, epoll_wait02, clock_nanosleep02, nanosleep01, select02, pselect01, pselect01_64, poll02, prctl09 | They check sleep timeout precision and fail when a 1 ms sleep measures 1.3–1.6 ms, depending on the VM's timer latency at the time (since M7); in [exclusive wakeups](rounds/48-exclusive-wakeup.md) a native 1 ms nanosleep in the VM also took 1.5 ms and these failed run after run, with the old binary too; in [dropping weak references outside the BKL on thread exit](rounds/71-thread-exit-race.md) native averaged 1.58 ms with the VM idle and 7 of them failed with both the old and the new binary; in [routing tables](rounds/98-routes.md) select02 failed even on its own, with a native 1 ms sleep median of 1.59 ms |
+| getrusage03 | Needs at least 512 MB of available memory; skipped when a full parallel run leaves too little, passes on its own |
+| nice05 | Compares the CPU time of two threads with different nice values; appine did not allocate CPU by nice, so the sign of the difference was random (since M8); passes since [deferred items](rounds/19-deferred.md) handed nice to the host threads |
+| exit_group01 | In [terminal owner and permissions](rounds/64-pty-owner.md) it failed once with exit code 134 (SIGABRT) in a full parallel run, and the rerun overwrote the log (since [the tests' own races and lost evidence](rounds/82-test-races.md), `scripts/ltp` keeps the previous log); it passed 8 runs on its own and 30 sequential runs under the load of 7 other LTP lanes; the cause was not investigated. Most likely it is the race fixed in [dropping weak references outside the BKL on thread exit](rounds/71-thread-exit-race.md): glibc ends appine-run with SIGABRT when the host heap is corrupted |
+| mmap21_01, mmap21_02 | In [the host cost of file operations](rounds/33-file-ops-host-cost.md) the cleanup got EIO unlinking a file under `/dev/shm`; it did not recur in 3 reruns on their own or in 3 reruns of the 162 tests related to `/dev/shm`, mmap and file operations at 16-way parallelism, and the October 24 baseline had one occurrence too (with the LTP store on virtiofs). In [ptrace step two](rounds/41-ptrace-gdb.md) the log showed `unlink(/dev/shm/ltp_mmap21_2)` getting ENOENT: LTP's library keeps results in `/dev/shm/ltp_<program name>_<pid>`; mmap21_01 and mmap21_02 are the same program, and the first process in every appine-run is pid 2, so when they run in parallel the two cases share the store's `/dev/shm` and the same file, and one deletes the other's. This comes from how LTP is run in parallel, not from the kernel; in [`/proc/net/snmp` and EOF at the end of input](rounds/102-snmp-pty-eof.md) `open` of this file got EEXIST, for the same reason; in [low port mapping](rounds/156-low-ports.md) mmap21_01 failed (unlink got ENOENT), for the same reason |
 
 
-## R1 的测量记录
+## R1 measurements
 
-相对原生的倍数，条件见[测量条件](#测量条件)，详见对应的一篇。
+Ratios relative to native, under the [measurement conditions](#measurement-conditions); details in the corresponding file.
 
-| 时间点 | 负载 | 倍数 |
+| Point | Workload | Ratio |
 |---|---|---|
-| [M2](rounds/01-m2.md) | 整数基准程序的几何平均 | 1.85×；Neoverse N2 上 2.37× |
-| [M1b](rounds/03-m1b.md) | busybox `sha256sum`、`gzip -c` | 1.51×、4.75× |
-| [M6](rounds/08-m6.md) | 编译 Lua、SQLite | 约 10×，主要是 Tier 1 还不翻译的 SIMD 退回 Tier 0 |
-| [M7](rounds/09-m7.md) | 编译 `lvm.c`、SQLite `make`、Lua `make linux`；Neoverse N2 上的性能探针 | 4.8×、4.7×、6.1×；2.25× |
-| [M8](rounds/10-m8.md) | node 里 JIT 生成的代码；`go build` 冷编译 | 1.9×；8.7×（单线程 5.6×，多线程扩展性差） |
-| [M8 补测：JVM](rounds/11-m8-jvm.md) | 测试程序；Maven 热构建；Gradle 热构建 | 4–5×；11×；14×（跳转缓存未命中、JIT 代码打补丁） |
-| [性能剖析](rounds/13-profiling.md)、[翻译保留](rounds/14-spawn-translation.md) | `git status`；shell 起进程 | 6×；6.3× |
-| [SP 常驻寄存器和返回预测](rounds/15-sp-return-prediction.md) | gcc 编译 `lvm.c`；python | 3.9×；6.2× |
-| [futex 定向唤醒](rounds/16-futex-targeted-wake.md) | Gradle 热构建 | 9× |
-| [访存检查和翻译表](rounds/23-tlb-checks.md) | gcc 编译 `lvm.c`；python；Maven、Gradle 热构建；`go build` 冷编译 | 3.6×；4.9×；9.4×、5.6×；6.5× |
-| [多线程共用翻译和定向唤醒](rounds/24-shared-translation.md)（仓库改放虚拟机本地卷，以上各行都在 virtiofs 上测，文件系统、起进程类的倍数偏高） | gcc；python；Maven、Gradle 热构建；`go build` 冷编译；shell 起进程；`git status`；`node -e 0` | 3.4×；4.3×；4.4×、4.0×；3.2×；2.2×；1.1×（并行 lstat 2.3×）；2.9× |
-| [不持 BKL 的 stat](rounds/25-stat-without-bkl.md) | 并行 lstat 的 `git status` | 1.3–1.4× |
-| [fork 写时复制](rounds/26-fork-cow.md) | fork、子进程退出、等待（进程写过 0、10、100 MB） | 1.25×、2.2×、3.8×（原来 1.6×、18×、35×） |
-| [起进程的宿主开销](rounds/28-spawn-host-cost.md) | fork 后 exec、vfork 后 exec、`posix_spawn`；`sh -c 'cat \| wc'`；shell 起进程 | 1.05×、1.15×、1.2×；1.4×；1.4×（原来 1.45×、1.6×、1.6×；2.2×；1.8×） |
-| [BKL 的等待和持锁](rounds/29-bkl-wait-hold.md) | 4 个进程同时 fork 后 exec（总吞吐）；`sh -c 'cat \| wc'`；shell 起进程 | 2.7×（原来 3.7×）；1.15×；1.3× |
-| [翻译后代码里的访存](rounds/30-translated-access.md) | gcc 编译 `lvm.c`；python 循环 | 3.2×；4.6× |
-| [别的负载和文件操作](rounds/32-workloads-file-ops.md) | 这一轮开始时：`find`、`du`；`tar` 只读；`grep -r`；`gzip`；sqlite 内存库 / 文件库；`awk`、lua 循环；node 启动 / 计算；java 启动 / 计算。这一轮之后：`cp -r` 再 `rm -rf` | 约 1×；1.4×；3.0×；2.0×；3.8× / 2.7×；2.8×、2.0×；3.1× / 2.6×；4.0× / 2.8×。1.6×（原来 2.4×） |
-| [文件操作的宿主开销](rounds/33-file-ops-host-cost.md)（原生对照改在同一个卷上） | `cp -r` 再 `rm -rf`；`tar x` 再 `rm -rf` | 1.6×；1.7×（原来 2.0×、2.3×） |
-| [node 启动](rounds/34-node-startup.md) | `node -e 0` 热启动；outline atomics 的原子操作循环 | 2.2×；1.2×（原来 6×） |
-| [JIT 负载](rounds/35-jit.md) | Maven、Gradle 热构建 | 3.6×、3.4× |
-| [多进程并行](rounds/36-parallel-processes.md) | 4 个进程同时 exec；4 个同时跑管道 | 2.5×；3.1×（原来 3.1×、4×） |
-| [拆 BKL](rounds/38-split-bkl.md) | `go build` 冷编译 | 2.8× |
-| [同一个程序共用翻译](rounds/108-shared-translation.md) | shell 起进程 | 1.13×（原来 1.6×） |
-| [Go 换一组被占用的寄存器](rounds/113-go-registers.md) | `go build` 冷编译 | 2.6×（默认的一组 2.7×） |
-| [点积指令 ASIMDDP](rounds/133-asimddp.md) | `vpxenc` VP9 编码（单线程，360p 60 帧） | 2.2×（不宣告点积时 2.3×） |
-| [SHA3、SHA512 和 I8MM](rounds/135-sha3-sha512-i8mm.md) | Python `hashlib.sha512`（32 MiB） | 1.0×（不宣告 SHA512 时 4.1×） |
-| [FP16 和 JSCVT](rounds/141-fp16-jscvt.md) | llama.cpp `llama-bench`（4 线程）：Qwen2.5-0.5B F16 的提示 128、生成 32；Q4_0 的同样两项 | 1.64×、1.22×（不宣告 FP16 时 2.98×、1.74×）；1.38×、1.21× |
-| [8 核上的扩展性和 BKL 的交接](rounds/188-bkl-spinners.md)（虚拟机从[测试提速](rounds/178-test-speed.md)起是 8 核） | Lua 编译 `xargs -P1`、`-P4`、`-P8`；`git grep` 1、4、8 个线程；4、8 个进程同时 fork 后 exec；4、8 个同时跑管道 | 3.3×、3.0–3.3×、3.5×；2.3×、2.0×、1.7×；2.2–2.3×、4.1–4.3×（原来 2.5×、4.4×）；2.5–2.6×、4.0–4.3×（原来 3.0×、4.8×） |
+| [M2](rounds/01-m2.md) | Geometric mean of the integer benchmarks | 1.85×; 2.37× on Neoverse N2 |
+| [M1b](rounds/03-m1b.md) | busybox `sha256sum`, `gzip -c` | 1.51×, 4.75× |
+| [M6](rounds/08-m6.md) | Building Lua, SQLite | About 10×, mostly SIMD that Tier 1 did not translate yet falling back to Tier 0 |
+| [M7](rounds/09-m7.md) | Building `lvm.c`, SQLite `make`, Lua `make linux`; the performance probe on Neoverse N2 | 4.8×, 4.7×, 6.1×; 2.25× |
+| [M8](rounds/10-m8.md) | JIT-generated code in node; `go build` cold build | 1.9×; 8.7× (5.6× single-threaded, poor multithreaded scaling) |
+| [M8 follow-up: JVM](rounds/11-m8-jvm.md) | Test programs; Maven warm build; Gradle warm build | 4–5×; 11×; 14× (jump cache misses, patching of JIT code) |
+| [Profiling](rounds/13-profiling.md), [keeping translations](rounds/14-spawn-translation.md) | `git status`; shell spawning | 6×; 6.3× |
+| [SP in a register and return prediction](rounds/15-sp-return-prediction.md) | gcc building `lvm.c`; python | 3.9×; 6.2× |
+| [Targeted futex wakeups](rounds/16-futex-targeted-wake.md) | Gradle warm build | 9× |
+| [Memory-access checks and the translation table](rounds/23-tlb-checks.md) | gcc building `lvm.c`; python; Maven, Gradle warm builds; `go build` cold build | 3.6×; 4.9×; 9.4×, 5.6×; 6.5× |
+| [Translations shared between threads and targeted wakeups](rounds/24-shared-translation.md) (the store moved to a VM-local volume; every row above was measured on virtiofs, with file-system and spawning ratios too high) | gcc; python; Maven, Gradle warm builds; `go build` cold build; shell spawning; `git status`; `node -e 0` | 3.4×; 4.3×; 4.4×, 4.0×; 3.2×; 2.2×; 1.1× (parallel lstat 2.3×); 2.9× |
+| [stat without the BKL](rounds/25-stat-without-bkl.md) | `git status` with parallel lstat | 1.3–1.4× |
+| [Copy-on-write fork](rounds/26-fork-cow.md) | fork, child exit, wait (process having written 0, 10, 100 MB) | 1.25×, 2.2×, 3.8× (was 1.6×, 18×, 35×) |
+| [The host cost of spawning processes](rounds/28-spawn-host-cost.md) | fork then exec, vfork then exec, `posix_spawn`; `sh -c 'cat \| wc'`; shell spawning | 1.05×, 1.15×, 1.2×; 1.4×; 1.4× (was 1.45×, 1.6×, 1.6×; 2.2×; 1.8×) |
+| [Waiting for and holding the BKL](rounds/29-bkl-wait-hold.md) | 4 processes doing fork then exec at once (total throughput); `sh -c 'cat \| wc'`; shell spawning | 2.7× (was 3.7×); 1.15×; 1.3× |
+| [Memory accesses in translated code](rounds/30-translated-access.md) | gcc building `lvm.c`; python loop | 3.2×; 4.6× |
+| [Other workloads and file operations](rounds/32-workloads-file-ops.md) | At the start of the round: `find`, `du`; read-only `tar`; `grep -r`; `gzip`; sqlite in-memory / file database; `awk`, lua loops; node startup / compute; java startup / compute. After the round: `cp -r` then `rm -rf` | About 1×; 1.4×; 3.0×; 2.0×; 3.8× / 2.7×; 2.8×, 2.0×; 3.1× / 2.6×; 4.0× / 2.8×. 1.6× (was 2.4×) |
+| [The host cost of file operations](rounds/33-file-ops-host-cost.md) (native baseline moved to the same volume) | `cp -r` then `rm -rf`; `tar x` then `rm -rf` | 1.6×; 1.7× (was 2.0×, 2.3×) |
+| [Node startup](rounds/34-node-startup.md) | `node -e 0` warm start; a loop of outline-atomics atomic operations | 2.2×; 1.2× (was 6×) |
+| [JIT workloads](rounds/35-jit.md) | Maven, Gradle warm builds | 3.6×, 3.4× |
+| [Parallel processes](rounds/36-parallel-processes.md) | 4 processes exec at once; 4 pipelines at once | 2.5×; 3.1× (was 3.1×, 4×) |
+| [Splitting the BKL](rounds/38-split-bkl.md) | `go build` cold build | 2.8× |
+| [One program shares its translations](rounds/108-shared-translation.md) | Shell spawning | 1.13× (was 1.6×) |
+| [Go gets a different set of reserved registers](rounds/113-go-registers.md) | `go build` cold build | 2.6× (2.7× with the default set) |
+| [The ASIMDDP dot product instructions](rounds/133-asimddp.md) | `vpxenc` VP9 encoding (single-threaded, 360p, 60 frames) | 2.2× (2.3× without advertising dot product) |
+| [SHA3, SHA512 and I8MM](rounds/135-sha3-sha512-i8mm.md) | Python `hashlib.sha512` (32 MiB) | 1.0× (4.1× without advertising SHA512) |
+| [FP16 and JSCVT](rounds/141-fp16-jscvt.md) | llama.cpp `llama-bench` (4 threads): Qwen2.5-0.5B F16 prompt 128 and generation 32; the same two for Q4_0 | 1.64×, 1.22× (2.98×, 1.74× without advertising FP16); 1.38×, 1.21× |
+| [Scaling on 8 cores and BKL handoff](rounds/188-bkl-spinners.md) (the VM has 8 cores since [faster tests](rounds/178-test-speed.md)) | Building Lua with `xargs -P1`, `-P4`, `-P8`; `git grep` with 1, 4, 8 threads; 4 and 8 processes doing fork then exec at once; 4 and 8 pipelines at once | 3.3×, 3.0–3.3×, 3.5×; 2.3×, 2.0×, 1.7×; 2.2–2.3×, 4.1–4.3× (was 2.5×, 4.4×); 2.5–2.6×, 4.0–4.3× (was 3.0×, 4.8×) |

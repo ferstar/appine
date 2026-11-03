@@ -1,33 +1,33 @@
-# 12. 威胁模型
+# 12. Threat model
 
-和 iSH、Termux 一样，appine **不是安全沙箱**：不承诺在 guest 内部不同 uid 之间，以及 guest 和宿主 App 之间，提供安全边界。下面的要求跨小节连续编号。
+Like iSH and Termux, appine is **not a security sandbox**: it promises no security boundary between different uids inside the guest, nor between the guest and the host app. The requirements below are numbered continuously across subsections.
 
-## 12.1 硬性工程不变量
+## 12.1 Hard engineering invariants
 
-1. **guest 只能通过自己的页表访问内存**：DBT 只原样拷贝白名单内的指令，所有访存指令都必须改写（[engine 的 map](../../.claude/maps/engine.md)）。
-2. **内核层不把 guest 指针当作宿主指针**：syscall 参数里的地址一律是 `u64` 或 `UserSlice`（`core/kernel/src/uaccess.rs`），只能经由 `Mm` 读写。
-3. **宿主路径永远不由 guest 输入拼出来**：宿主侧只出现 `objects/<数字>` 形式的路径，symlink 只存在于数据库里（[kernel/store 的 map](../../.claude/maps/kernel/store.md)）。因此"恶意 tar 包借 symlink 逃逸"这类问题在结构上不可能发生。
+1. **The guest can reach memory only through its own page tables**: the DBT copies only whitelisted instructions verbatim, and every memory-access instruction must be rewritten ([engine map](../../.claude/maps/engine.md)).
+2. **The kernel layer never treats a guest pointer as a host pointer**: addresses in syscall arguments are always `u64` or `UserSlice` (`core/kernel/src/uaccess.rs`) and can only be read or written through `Mm`.
+3. **Host paths are never built from guest input**: only paths of the form `objects/<number>` appear on the host side, and symlinks exist only in the database ([kernel/store map](../../.claude/maps/kernel/store.md)). Problems like "a malicious tarball escaping through a symlink" are therefore structurally impossible.
 
-## 12.2 稳健性
+## 12.2 Robustness
 
-4. **guest 自己的 OOM killer**：给所有 guest 内存设一个总上限，超出上限时由 appine 挑一个 guest 进程杀掉，不让系统 LMK 杀掉整个 App。实现在 `core/kernel/src/oom.rs`。
-   - **上限**：量的是整个 App 进程的匿名内存（RssAnon + RssShmem + VmSwap，LMK 看的就是它），Tier 1 代码缓存在写入视图里还没拆掉的页扣掉一次（[engine 的 map](../../.claude/maps/engine.md) 的 W^X）。默认是物理内存的一半，`MachineOptions::memory_limit` 可以改。
-   - **检查**：guest 碰新的页由宿主内核处理，所以是定时检查：有 guest 线程在运行时每 20 毫秒量一次，超过上限的 3/4 之后每 5 毫秒。
-   - **超出时**：按 Linux 的 oom_badness 挑一个进程用 SIGKILL 结束，记进内核日志（[kernel/signal 的 map](../../.claude/maps/kernel/signal.md)），等它退完（最多 1 秒）再看下一个。
-   - **cgroup**：上限和用量也以 `memory.max`、`memory.current` 告诉 guest（[kernel/procfs 的 map](../../.claude/maps/kernel/procfs.md)）；guest 给子 cgroup 设的 `memory.max` 一起检查。
-   - **fork 炸弹**：由 `threads-max` 和 `RLIMIT_NPROC` 的默认值挡住（[kernel/process 的 map](../../.claude/maps/kernel/process.md)）。
-5. **内核层和引擎的 bug 只结束撞上它的 guest 进程**：内核层以 `panic=unwind` 编译，兜住 panic 之后结束当前 guest 进程并生成报告。实现在 `core/kernel/src/bug.rs`。
-   - **运行循环**：每次进入内核的地方（包括不持 BKL 的系统调用）用 `catch_unwind` 兜住 panic，获取 BKL 时忽略中毒标记；引擎的 bug 走 [engine 的 map](../../.claude/maps/engine.md) 的 `APPINE_EXIT_HOST_FAULT`。
-   - **结束和报告**：两种情况都像 Linux 的 oops 一样用 SIGSEGV 结束整个进程，往 stderr（Android 上是 logcat）写报告（带 panic 的消息和位置），同一份报告也记进内核日志，App 说明原因（[android/service 的 map](../../.claude/maps/android/service.md)）。
-   - **运行循环之外**：线程开始时、退出的每一步、定时器线程处理一个进程的定时器时出错，结束那个进程；进程结束的九步各自兜住，一步出错只丢掉这一步做的事；内存上限的检查、信号驱动的 I/O 出错时关掉这项功能；宿主调用 `Machine` 的方法（JNI）时只让那次调用失败。
-   - **debug 构建**：默认直接终止宿主进程，`APPINE_ON_BUG=kill`/`abort` 可以覆盖。
+4. **The guest's own OOM killer**: all guest memory has a total limit; when it is exceeded, appine picks one guest process to kill, instead of letting the system LMK kill the whole app. Implemented in `core/kernel/src/oom.rs`.
+   - **Limit**: what is measured is the anonymous memory of the whole app process (RssAnon + RssShmem + VmSwap, which is what LMK looks at), minus one copy of the Tier 1 code-cache pages that are still mapped in the write view (W^X in the [engine map](../../.claude/maps/engine.md)). The default is half of physical memory; `MachineOptions::memory_limit` changes it.
+   - **Checking**: new pages the guest touches are handled by the host kernel, so the check is periodic: every 20 ms while any guest thread is running, and every 5 ms once usage passes 3/4 of the limit.
+   - **When exceeded**: one process, picked by Linux's oom_badness, is ended with SIGKILL and recorded in the kernel log ([kernel/signal map](../../.claude/maps/kernel/signal.md)); appine waits for it to finish exiting (up to 1 second) before looking again.
+   - **cgroup**: the limit and the usage are also shown to the guest as `memory.max` and `memory.current` ([kernel/procfs map](../../.claude/maps/kernel/procfs.md)); a `memory.max` the guest sets on a child cgroup is checked too.
+   - **Fork bombs**: stopped by the default `threads-max` and `RLIMIT_NPROC` ([kernel/process map](../../.claude/maps/kernel/process.md)).
+5. **A bug in the kernel layer or the engine ends only the guest process that hit it**: the kernel layer is compiled with `panic=unwind`; after catching a panic it ends the current guest process and produces a report. Implemented in `core/kernel/src/bug.rs`.
+   - **Run loop**: every entry into the kernel (including syscalls that do not hold the BKL) catches panics with `catch_unwind`, and acquiring the BKL ignores the poison flag; engine bugs go through `APPINE_EXIT_HOST_FAULT` in the [engine map](../../.claude/maps/engine.md).
+   - **Ending and reporting**: in both cases the whole process is ended with SIGSEGV, like a Linux oops, and a report (with the panic message and location) is written to stderr (logcat on Android); the same report goes into the kernel log, and the app explains what happened ([android/service map](../../.claude/maps/android/service.md)).
+   - **Outside the run loop**: an error at thread start, in any step of exit, or while the timer thread handles one process's timers ends that process; each of the nine steps of process teardown is caught separately, so an error in one step loses only what that step does; an error in the memory-limit check or in signal-driven I/O turns that feature off; a host call into a `Machine` method (JNI) fails only that call.
+   - **Debug builds**: abort the host process outright by default; `APPINE_ON_BUG=kill`/`abort` overrides this.
 
-## 12.3 对 Android 暴露的接口
+## 12.3 Interfaces exposed to Android
 
-6. **只导出启动 Activity 和 DocumentsProvider**：不提供供其他 App 执行命令的 intent。DocumentsProvider 由 `MANAGE_DOCUMENTS` 保护，只有系统的"文件"App 能直接调用，别的 App 经由用户授予的 URI 权限。
-7. **guest 第一次在非回环地址上 `listen` 某个端口时发一条通知**：内核攒着事件（`Machine::take_listens`），App 每 2 秒取一次，在"网络服务"渠道里发通知：进程名、端口，低端口换到了宿主上的哪个端口（[kernel/net 的 map](../../.claude/maps/kernel/net.md)）。
-8. **JIT 代码页使用 W^X 双映射**（[engine 的 map](../../.claude/maps/engine.md)）。
+6. **Only the launcher Activity and the DocumentsProvider are exported**: there is no intent that lets other apps run commands. The DocumentsProvider is protected by `MANAGE_DOCUMENTS`, so only the system Files app can call it directly; other apps go through URI permissions the user grants.
+7. **A notification the first time the guest `listen`s on a port on a non-loopback address**: the kernel queues the events (`Machine::take_listens`), and the app takes them every 2 seconds and posts a notification in the "Network services" channel with the process name, the port, and the host port a low port was moved to ([kernel/net map](../../.claude/maps/kernel/net.md)).
+8. **JIT code pages use a W^X double mapping** ([engine map](../../.claude/maps/engine.md)).
 
-## 12.4 信任链与隐私
+## 12.4 Trust chain and privacy
 
-`apk` 用 rootfs 中自带的 Alpine 公钥验证每个软件包的签名，所以更换镜像不会削弱信任。调试日志只保存在本地；如果以后加入遥测，必须由用户主动开启，并同步更新 Play 的数据安全表单。
+`apk` verifies every package's signature with the Alpine public keys shipped in the rootfs, so switching mirrors does not weaken trust. Debug logs stay local; if telemetry is ever added, it must be opt-in, and Play's Data safety form must be updated with it.

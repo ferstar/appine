@@ -1,13 +1,13 @@
-# 16. 风险与待验证的假设
+# 16. Risks and assumptions to validate
 
-| # | 风险或假设 | 验证情况 | 退路 |
+| # | Risk or assumption | Status | Fallback |
 |---|---|---|---|
-| R1 | soft-MMU + 直通式 DBT 能达到 3–5 倍以内 | 基本达到：gcc 编译 3.2 倍，`go build` 2.6 倍，Maven、Gradle 热构建 3.4–3.6 倍，起进程 1–1.3 倍，文件操作 1.6–1.7 倍；python 的解释循环仍约 4.6 倍，约一半是 TLB 检查。并行编译、并行读文件和原生一样扩展；几个进程同时起进程不扩展（BKL），8 个同时 4 倍多。历次测量见 [milestones.md 的 R1 测量记录](../milestones.md#r1-的测量记录)，真机待测 | 起进程的路径继续拆 BKL（只对同时起很多短命进程的负载有用）。剩下的 TLB 检查多在追指针的读上，代价是"算下标 → 取表项 → 读"这条依赖链；缩短链的几种排法都多了指令，试过没有收益 |
-| R2 | `specialUse` 前台服务能通过 Play 审核 | 待验证：提交 Play 时才知道 | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
-| R3 | Termux `terminal-emulator`/`terminal-view` 的许可证 | ✅ 已解决：按 GPLv3 对待，appine 改为 AGPL-3.0-or-later，两者可以结合，见 §13.4 | — |
-| R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | ✅ 已解决：两层都用比较并交换的语义，Tier 1 的 STXR 是两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 [engine 的 map](../../.claude/maps/engine.md) | — |
-| R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | ✅ 已关闭：瓶颈在引擎而不在事务；引擎变快之后改成推迟最多 5 毫秒合并提交（[kernel/store 的 map](../../.claude/maps/kernel/store.md)） | — |
-| R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | ✅ 已解决：不用，翻译后的代码不碰 X18，临时寄存器改用 X27（[engine 的 map](../../.claude/maps/engine.md)） | — |
-| A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | ✅ 已证实：Go 在 arm64 上 `_SA_RESTORER = 0`，信号处理函数经由 vDSO 的 `__kernel_rt_sigreturn` 返回 | — |
-| A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | ✅ 已证实：模拟器的 GKI 内核是这样（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)） | — |
-| A3 | dynarmic 内存回调拿不到精确 guest 状态（根据接口签名推断） | 未验证，只影响 §15 否决 dynarmic 的论证 | — |
+| R1 | soft-MMU + a same-ISA DBT can stay within 3–5× | Mostly met: gcc builds 3.2×, `go build` 2.6×, Maven and Gradle warm builds 3.4–3.6×, spawning processes 1–1.3×, file operations 1.6–1.7×; python's interpreter loop is still about 4.6×, about half of it TLB checks. Parallel builds and parallel file reads scale like native; several processes spawning processes at once do not scale (BKL), and 8 at once are over 4×. Measurement history in the [R1 measurements in milestones.md](../milestones.md#r1-measurements); not yet measured on a real device | Keep splitting the BKL on the process-spawn path (it only helps workloads that spawn many short-lived processes at once). The remaining TLB checks are mostly on pointer-chasing loads, where the cost is the "compute index → load entry → load" dependency chain; the orderings tried that shorten the chain all added instructions and gained nothing |
+| R2 | The `specialUse` foreground service passes Play review | To be validated: only known at Play submission | Prepare the explanation "runs command-line tasks the user starts"; fall back to a time-limited type and tell the user in the UI |
+| R3 | The license of Termux `terminal-emulator`/`terminal-view` | ✅ Resolved: treated as GPLv3, and appine moved to AGPL-3.0-or-later, so the two can be combined; see §13.4 | — |
+| R4 | Handling LL/SC sequences in the DBT (exclusive monitor livelock) | ✅ Resolved: both tiers use compare-and-swap semantics, and Tier 1's STXR is an `ldaxr`/`stlxr` loop with no memory access between the two instructions; see the [engine map](../../.claude/maps/engine.md) | — |
+| R5 | `apk add` speed with one SQLite transaction per metadata operation | ✅ Closed: the bottleneck was the engine, not the transactions; once the engine got faster, commits were deferred by up to 5 ms and batched ([kernel/store map](../../.claude/maps/kernel/store.md)) | — |
+| R6 | Whether Tier 1 can use the host's X18 as a scratch register on Android | ✅ Resolved: it does not; translated code never touches X18 and uses X27 as the scratch register instead ([engine map](../../.claude/maps/engine.md)) | — |
+| A1 | Go on linux/arm64 does not set `SA_RESTORER` and relies on the sigreturn trampoline in the vDSO | ✅ Confirmed: Go on arm64 has `_SA_RESTORER = 0`, and signal handlers return through the vDSO's `__kernel_rt_sigreturn` | — |
+| A2 | Android GKI commonly uses 4K pages + a 39-bit VA | ✅ Confirmed: the emulator's GKI kernel does ([kernel/mm map](../../.claude/maps/kernel/mm.md)) | — |
+| A3 | dynarmic's memory callbacks cannot get precise guest state (inferred from the interface signatures) | Not validated; it only affects the argument for rejecting dynarmic in §15 | — |

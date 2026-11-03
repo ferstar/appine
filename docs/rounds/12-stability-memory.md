@@ -14,4 +14,4 @@
 
 ## 测试
 
-差分测试新增 `edge-cases`（别的进程截短映射着的文件、`MADV_DONTNEED`、`PROT_NONE` 预留、nanosleep 的重启、进程间 robust 锁、`EPOLLEXCLUSIVE`），两个执行层下都和原生一致。单元测试新增截短、`PROT_NONE` 不进页表、`MADV_DONTNEED`。LTP 多出来的 futex_wake05、nice05 是[偶发项](../milestones.md#已知的偶发失败)。→ futex_wake05 不是偶发项：它检查对未映射、`PROT_NONE`、被截短的文件映射的地址做 futex 时返回 EFAULT，这一轮之前每次都失败，从这一轮起每次都通过，是这一轮修好的（M9 之前：CPU 时间不倒退）
+差分测试新增 `edge-cases`（别的进程截短映射着的文件、`MADV_DONTNEED`、`PROT_NONE` 预留、nanosleep 的重启、进程间 robust 锁、`EPOLLEXCLUSIVE`），两个执行层下都和原生一致。单元测试新增截短、`PROT_NONE` 不进页表、`MADV_DONTNEED`。LTP 多出来的 futex_wake05、nice05 是[偶发项](../milestones.md#known-flaky-tests)。→ futex_wake05 不是偶发项：它检查对未映射、`PROT_NONE`、被截短的文件映射的地址做 futex 时返回 EFAULT，这一轮之前每次都失败，从这一轮起每次都通过，是这一轮修好的（M9 之前：CPU 时间不倒退）
