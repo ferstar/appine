@@ -1,31 +1,39 @@
-//! guest 地址空间（kernel/mm 的 map：`.claude/maps/kernel/mm.md`）：VMA 表加 soft-MMU 页表。
+//! Guest address spaces (the kernel/mm map: `.claude/maps/kernel/mm.md`): a VMA table plus a
+//! soft-MMU page table.
 //!
-//! 每个 VMA 指向一段宿主内存（匿名映射或文件映射），多个 VMA 可以共享同一段
-//! （munmap/mprotect 切开之后，或者 fork 之后的共享映射）。宿主内存在最后一个
-//! 引用它的 VMA 消失时才释放。文件映射直接用宿主 `mmap(objects/<ino>)`。
+//! Every VMA points at a piece of host memory (an anonymous or a file mapping), and several VMAs
+//! can share one piece (after munmap/mprotect splits them, or shared mappings after fork). Host
+//! memory is released only when the last VMA referring to it goes away. File mappings use a host
+//! `mmap(objects/<ino>)` directly.
 //!
-//! 一个地址空间可以被多个线程同时使用（线程、vfork）。拆除映射或降低权限之后，
-//! 其他线程的 TLB 里可能还留着旧的翻译，所以要先做一次 TLB shootdown（[`Mm::sync`]）：
-//! 递增代数，打断正在执行 guest 代码的线程并等它们退出，它们重新进入 guest
-//! 代码之前看到新的代数，会刷新自己的 TLB。被解除映射的宿主内存要等 shootdown
-//! 完成之后才释放，所以 guest 的数据竞争不会访问到已释放的内存。
+//! An address space can be used by several threads at once (threads, vfork). After a mapping is
+//! torn down or its permissions are lowered, other threads' TLBs may still hold stale
+//! translations, so a TLB shootdown comes first ([`Mm::sync`]): bump the generation, kick the
+//! threads running guest code and wait for them to leave; before re-entering guest code they see
+//! the new generation and flush their own TLBs. Unmapped host memory is released only after the
+//! shootdown completes, so guest data races never reach freed memory.
 //!
-//! Tier 1 的翻译按同样的方式作废：可执行的映射被拆除、改了权限，或者 guest 用
-//! `ic ivau` 声明修改了代码，这些范围记进 [`CodeLog`] 并递增代码代数；每个线程
-//! 按自己错过的范围逐页作废翻译。
+//! Tier 1 translations are invalidated the same way: when an executable mapping is torn down or
+//! changes permissions, or the guest declares modified code with `ic ivau`, the ranges go into
+//! [`CodeLog`] and the code generation is bumped; each thread invalidates translations page by
+//! page over the ranges it missed.
 //!
-//! fork 时私有匿名内存写时复制（kernel/mm 的 map），其余的私有映射拷贝一份，共享映射与
-//! 子进程共用。写时复制按页进行：fork 时写过的页不复制，父子进程的页表都指向父进程的
-//! 宿主页、去掉写权限。宿主页在它的 VMA 里的一方是拥有者，它把页借出；别的地址空间借用。
-//! - 借用方要写时复制一份到自己 VMA 里对应的位置（[`Mm::materialize`]）。
-//! - 拥有者要写、解除映射、搬走或者丢弃借出的页之前，先让每个借用方复制自己的一份
-//!   （[`Mm::recall`]）。
-//! - 拥有者的地址空间销毁时页留给借用方（孤儿页，谁也不能再写），它持有那段宿主内存。
-//! - 最后一个借用方还回来时，拥有者的页表项马上恢复写权限：shell fork 之后子进程马上
-//!   exec，父进程不必为此缺页。
+//! On fork, private anonymous memory is copy-on-write (the kernel/mm map), other private mappings
+//! are copied, and shared mappings are shared with the child. Copy-on-write is per page: pages
+//! written before fork are not copied; the page tables of parent and child both point at the
+//! parent's host page, without write permission. The side whose VMA holds the host page is its
+//! owner and lends it; other address spaces borrow it.
+//! - A borrower copies the page into the matching place in its own VMA on write
+//!   ([`Mm::materialize`]).
+//! - Before the owner writes, unmaps, moves or discards a lent page, every borrower copies its own
+//!   first ([`Mm::recall`]).
+//! - When the owner's address space is destroyed, the page stays with the borrowers (an orphan
+//!   page that nobody may write again), which hold that host memory.
+//! - When the last borrower returns a page, the owner's entries get write permission back at once:
+//!   a shell's child execs right after fork, so the parent need not take a fault for it.
 //!
-//! 页表项改指别处之前，使用这个地址空间的线程要先刷新 TLB（[`Mm::shootdown`]）；只是
-//! 恢复写权限不必。
+//! Before a page-table entry is re-pointed, the threads using this address space must flush their
+//! TLBs ([`Mm::shootdown`]); merely restoring write permission needs no flush.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -44,87 +52,99 @@ use crate::loader::{STACK_SIZE, STACK_TOP};
 use crate::task::TaskSync;
 use crate::uaccess::UserSlice;
 
-/// mmap 的 flags（guest ABI）。
+/// mmap flags (guest ABI).
 pub mod flags {
-    /// 共享映射。
+    /// Shared mapping.
     pub const MAP_SHARED: u32 = 0x01;
-    /// 私有映射。
+    /// Private mapping.
     pub const MAP_PRIVATE: u32 = 0x02;
-    /// 固定地址，覆盖已有映射。
+    /// Fixed address, replacing existing mappings.
     pub const MAP_FIXED: u32 = 0x10;
-    /// 匿名映射。
+    /// Anonymous mapping.
     pub const MAP_ANONYMOUS: u32 = 0x20;
-    /// 向下增长。
+    /// Grows downwards.
     pub const MAP_GROWSDOWN: u32 = 0x0100;
-    /// 不计入内存提交量。
+    /// Not counted in the memory commit.
     pub const MAP_NORESERVE: u32 = 0x4000;
-    /// 固定地址，但不覆盖已有映射。
+    /// Fixed address, but never replacing existing mappings.
     pub const MAP_FIXED_NOREPLACE: u32 = 0x10_0000;
 }
 
-/// 栈顶和 mmap 分配区上界之间至少留的间隔：默认的栈大小上限再加 1 GiB。Linux 是
-/// 128 MB 加上栈的随机偏移（arm64 上最多约 1 GB）。
+/// Minimum gap between the stack top and the upper bound of the mmap area: the default stack size
+/// limit plus 1 GiB. Linux uses 128 MB plus the stack's random offset (up to about 1 GB on arm64).
 const MIN_GAP: u64 = STACK_SIZE + (1 << 30);
-/// 这个间隔的上限，与 Linux 的 `MAX_GAP` 相同。
+/// Upper bound of that gap, the same as Linux's `MAX_GAP`.
 const MAX_GAP: u64 = STACK_TOP / 6 * 5;
-/// 最低可分配地址，与 Linux 的 mmap_min_addr 默认值相同。
+/// Lowest allocatable address, the same as Linux's default mmap_min_addr.
 const MMAP_MIN: u64 = 0x10000;
-/// 向下增长的映射与下面的映射之间至少要留的间隔（Linux 的 `stack_guard_gap`，256 页）。
+/// Minimum gap between a grows-down mapping and the mapping below it (Linux's `stack_guard_gap`,
+/// 256 pages).
 const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
-/// `/proc/sys/vm/max_map_count`：一个地址空间最多有多少个 VMA。每个 VMA 是一个宿主
-/// 映射，而宿主的映射数（Android 上也是 65530）是整个 App 进程共用的。
+/// `/proc/sys/vm/max_map_count`: the most VMAs one address space may have. Every VMA is a host
+/// mapping, and the host's mapping count (also 65530 on Android) is shared by the whole app
+/// process.
 pub(crate) static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
 
-/// 堆（brk）第一次扩展时预留的宿主地址空间：之后的扩展只是加长同一个 VMA。不碰的部分
-/// 不占内存（`MAP_NORESERVE`）；超出的部分照旧单独映射。
+/// Host address space reserved when the heap (brk) first grows: later growth only lengthens the
+/// same VMA. The untouched part takes no memory (`MAP_NORESERVE`); growth beyond it is mapped
+/// separately as before.
 const HEAP_RESERVE: u64 = 256 << 20;
 
-/// fork 时子进程这么大以内的映射切自同一段宿主内存（[`Mm::fork`]）。这样的映射解除
-/// 映射之后，宿主内存要等那一段全都不用了才交还，所以只给小的。
+/// On fork, child mappings up to this size are carved from one piece of host memory
+/// ([`Mm::fork`]). After such a mapping is unmapped its host memory is returned only once the
+/// whole piece is unused, so only small mappings get one.
 const FORK_PIECE_MAX: u64 = 1 << 20;
 
-/// fork 时这么大以内的写过的匿名映射不看哪些页碰过，全部借出（[`Mm::lend`]）。
+/// On fork, written anonymous mappings up to this size lend every page without checking which
+/// pages were touched ([`Mm::lend`]).
 const LEND_ALL_MAX: u64 = 16 * PAGE_SIZE;
 
-/// 不超过这么大的映射建立时就建好页表项（[`Mm::map_pages`]）；大的按需建表：guest 第一次
-/// 访问、内核层第一次读写时补上所在的那张叶子表（[`Mm::fault_in`]）。页表随碰过的内存增长，
-/// 不随映射的大小：ASan 映射十几 TB 的影子内存，逐页建表要几十 GB。
+/// Mappings up to this size get their page-table entries when they are created
+/// ([`Mm::map_pages`]); larger ones get them on demand: the guest's first access or the kernel
+/// layer's first read or write fills in the leaf table around it ([`Mm::fault_in`]). Page tables
+/// then grow with the memory touched rather than with the mapping size: ASan maps more than ten
+/// TB of shadow memory, and building its entries page by page would take tens of GB.
 const EAGER_MAX: u64 = 1 << 20;
 
-/// 一张叶子表覆盖的范围（512 页）：按需建表一次补这么多，fork 借页、量驻留内存时按它找
-/// 碰过的地方（[`Mm::touched_windows`]）。
+/// The range one leaf table covers (512 pages): on-demand filling fills this much at once, and
+/// fork's lending and resident-memory measurement look for touched places in units of it
+/// ([`Mm::touched_windows`]).
 const LEAF_SPAN: u64 = PAGE_SIZE << 9;
 
-/// [`Mm::touched_windows`] 给出的一段最多这么大，逐页的记录（pagemap、mincore）不会太大。
+/// The largest span [`Mm::touched_windows`] reports, so per-page records (pagemap, mincore) stay
+/// small.
 const WINDOW_MAX: u64 = 1 << 30;
 
-/// [`Mm::carve`] 切出来的：每个 VMA 的起点 → 那一段宿主内存和它的宿主地址。
+/// What [`Mm::carve`] carves: each VMA's start → its piece of host memory and its host address.
 type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
 
-/// 一段由 [`Mm`] 持有的宿主内存。用 Arc 共享：只读文件映射的宿主映射所有地址空间共用
-/// （[`FileMaps`]），execve 不持 BKL 建新的地址空间时也会拿到它。
+/// A piece of host memory held by an [`Mm`]. Shared through `Arc`: the host mappings of read-only
+/// file mappings are shared by all address spaces ([`FileMaps`]), and execve also gets them while
+/// building a new address space without the BKL.
 struct HostRegion {
     base: NonNull<u8>,
     len: usize,
-    /// 私有匿名内存（[`Mm::new_anonymous`]、[`spare`]）和它计不计入提交量：交还时留着
-    /// 复用（[`recycled`]）。
+    /// Private anonymous memory ([`Mm::new_anonymous`], [`spare`]) and whether it is
+    /// commit-accounted: kept for reuse when returned ([`recycled`]).
     anonymous: Option<bool>,
-    /// 没有宿主内存（[`HostRegion::reserved`]）。
+    /// No host memory ([`HostRegion::reserved`]).
     reserved: bool,
 }
 
-/// 预留（[`HostRegion::reserved`]）的 VMA 的"宿主地址"：从这里起按 guest 偏移算，只用来
-/// 算术（拆开 VMA），从不访问。第 55 位是 1，落在宿主内核的那一半里（arm64 的 TBI 只忽略
-/// 最高 8 位），万一被访问也是宿主的段错误，碰不到别的内存。
+/// The "host address" of a reserved ([`HostRegion::reserved`]) VMA: guest offsets are counted from
+/// here only for arithmetic (splitting VMAs), never for access. Bit 55 is set, so it falls in the
+/// host kernel's half (arm64 TBI ignores only the top 8 bits), and an access by mistake is a host
+/// segmentation fault that cannot reach other memory.
 const RESERVED_HOST: usize = 0x00f0_0000_0000_0000;
 
 impl HostRegion {
-    /// 私有匿名映射从建立起一直是 `PROT_NONE`、没有内容时，不占宿主内存和宿主地址空间：
-    /// 所有 guest 进程都在同一个宿主进程里，宿主的用户地址空间只有 39 位（512 GB）的设备上
-    /// （4K 页的 GKI 内核都是），Chromium 的每个进程预留几十 GB（PartitionAlloc 的池），
-    /// 渲染器再加 1 TB（V8 的沙箱），加起来放不下。这样的 VMA 没有表项，guest 访问不到；
-    /// 变得可以访问（mprotect）、内核要往里写（ptrace）时才有自己的宿主内存
-    /// （[`Mm::back_reserved`]）。
+    /// A private anonymous mapping that has been `PROT_NONE` and empty since it was created takes
+    /// neither host memory nor host address space. All guest processes live in one host process,
+    /// and on devices whose host user address space is only 39 bits (512 GB; every 4K-page GKI
+    /// kernel) each Chromium process reserves tens of GB (PartitionAlloc's pools) and a renderer 1
+    /// TB more (V8's sandbox), which together do not fit. Such a VMA has no entries, so the guest
+    /// cannot reach it; it gets its own host memory only when it becomes accessible (mprotect) or
+    /// the kernel writes into it (ptrace) ([`Mm::back_reserved`]).
     fn reserved() -> Arc<HostRegion> {
         Arc::new(HostRegion {
             base: NonNull::new(RESERVED_HOST as *mut u8).unwrap(),
@@ -135,7 +155,7 @@ impl HostRegion {
     }
 }
 
-// SAFETY: 只是一段宿主地址范围，释放（Drop）时才用到它
+// SAFETY: it is only a host address range, used only when it is released (Drop)
 unsafe impl Send for HostRegion {}
 unsafe impl Sync for HostRegion {}
 
@@ -151,7 +171,8 @@ impl Drop for HostRegion {
             if deferred.is_some() {
                 UNMAPPING.fetch_add(len, Ordering::Relaxed);
             } else {
-                // SAFETY: 这段私有匿名宿主内存归这个 HostRegion，已经没有人用它
+                // SAFETY: this private anonymous host memory belongs to this HostRegion and is no
+                // longer used by anyone
                 unsafe { recycled::put(base, len, reserve) }
             }
             return;
@@ -161,36 +182,39 @@ impl Drop for HostRegion {
         if deferred.is_some() {
             UNMAPPING.fetch_add(len, Ordering::Relaxed);
         } else {
-            // SAFETY: 这段宿主内存归这个 HostRegion，已经没有人用它
+            // SAFETY: this host memory belongs to this HostRegion and is no longer used by anyone
             unsafe { appine_hal::unmap(base, len) }
         }
     }
 }
 
-/// 交还之后留着复用的私有匿名宿主内存（[`HostRegion::anonymous`]）。所有 guest 进程都在
-/// 同一个宿主进程里，宿主的 mmap、munmap 都要拿这一个进程的 mmap_lock 写锁（原生的每个
-/// 进程各有一把）：musl 的 malloc 和 gcc 的垃圾回收器反复 mmap、munmap 同样大小的块，
-/// `xargs -P4` 编译 Lua 时有十几万次，每次持着 BKL 等宿主的 mmap。交还时只丢弃内容
-/// （`MADV_DONTNEED`，只拿读锁），下一次申请同样大小、同样计不计入提交量的直接用。
+/// Private anonymous host memory kept for reuse after it is returned ([`HostRegion::anonymous`]).
+/// All guest processes live in one host process, and every host mmap and munmap takes that one
+/// process's mmap_lock for write (natively each process has its own): musl's malloc and gcc's
+/// garbage collector map and unmap blocks of the same sizes over and over, more than a hundred
+/// thousand times when `xargs -P4` compiles Lua, each time waiting on the host mmap while holding
+/// the BKL. Returning only discards the contents (`MADV_DONTNEED`, which takes the lock only for
+/// read), and the next request of the same size and the same commit accounting takes it directly.
 mod recycled {
     use std::collections::HashMap;
     use std::ptr::NonNull;
     use std::sync::Mutex;
 
-    /// 留着的宿主地址空间最多这么大：页已经还给宿主，只占地址空间和一点页表。
+    /// The most host address space kept: the pages have gone back to the host, so it costs only
+    /// address space and a little page table.
     const MAX_BYTES: usize = 256 << 20;
-    /// 每种大小最多留几段。
+    /// The most ranges kept per size.
     const MAX_EACH: usize = 32;
 
     struct Cache {
-        /// (长度, 计不计入提交量) → 起点。
+        /// (length, commit-accounted) → starts.
         free: HashMap<(usize, bool), Vec<usize>>,
         bytes: usize,
     }
 
     static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
-    /// 拿一段留着的、内容是零的私有匿名宿主内存。
+    /// Takes a kept piece of private anonymous host memory whose contents are zero.
     pub(super) fn take(len: usize, reserve: bool) -> Option<NonNull<u8>> {
         let mut cache = CACHE
             .lock()
@@ -201,11 +225,12 @@ mod recycled {
         NonNull::new(base as *mut u8)
     }
 
-    /// 交还一段私有匿名宿主内存：丢弃内容，留着复用，留不下时交还宿主。
+    /// Returns a piece of private anonymous host memory: discards its contents and keeps it for
+    /// reuse, or returns it to the host when it cannot be kept.
     ///
     /// # Safety
     ///
-    /// 这段宿主内存由 [`appine_hal::map_anonymous`] 申请，已经没有人用它。
+    /// The host memory was allocated by [`appine_hal::map_anonymous`] and nobody uses it any more.
     pub(super) unsafe fn put(base: NonNull<u8>, len: usize, reserve: bool) {
         {
             let mut cache = CACHE
@@ -217,7 +242,8 @@ mod recycled {
             });
             let list = c.free.entry((len, reserve)).or_default();
             if c.bytes + len <= MAX_BYTES && list.len() < MAX_EACH {
-                // SAFETY: 由调用方保证；丢弃之后读到的是零，与新映射的一样
+                // SAFETY: guaranteed by the caller; after discarding it reads as zero, like a new
+                // mapping
                 if unsafe { appine_hal::discard(base, len) }.is_ok() {
                     list.push(base.as_ptr() as usize);
                     c.bytes += len;
@@ -225,44 +251,49 @@ mod recycled {
                 }
             }
         }
-        // SAFETY: 由调用方保证
+        // SAFETY: guaranteed by the caller
         unsafe { appine_hal::unmap(base, len) }
     }
 }
 
-/// 持有 BKL 时释放、等放开之后再交还的东西。
+/// Things freed while holding the BKL and returned after it is released.
 #[derive(Default)]
 struct Unmapped {
-    /// 宿主内存：(起点, 长度)。
+    /// Host memory: (start, length).
     regions: Vec<(NonNull<u8>, usize)>,
-    /// 留着复用的私有匿名宿主内存（[`recycled`]）：(起点, 长度, 计不计入提交量)。
+    /// Private anonymous host memory kept for reuse ([`recycled`]): (start, length,
+    /// commit-accounted).
     anonymous: Vec<(NonNull<u8>, usize, bool)>,
-    /// 销毁的地址空间的页表：逐个释放中间表要好几微秒。
+    /// Page tables of destroyed address spaces: freeing the intermediate tables one by one takes
+    /// several microseconds.
     mmus: Vec<Mmu>,
 }
 
 thread_local! {
-    /// 持有 BKL 时释放的宿主内存，放开 BKL 之后才交还宿主（[`release_unmapped`]）；
-    /// 不持有 BKL 时是 None，当场交还。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// Host memory freed while holding the BKL, returned to the host only after the BKL is released
+    /// ([`release_unmapped`]); None when the BKL is not held, which returns it on the spot.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static UNMAPPED: std::cell::RefCell<Option<Unmapped>> = const { std::cell::RefCell::new(None) };
 }
 
-/// 驻留内存的一次取样（[`Mm::rss_plan`]）。
+/// One sample of resident memory ([`Mm::rss_plan`]).
 struct RssPlan {
-    /// 不用 mincore 就知道的 4K 页数：借来的页、缓存着的文件映射。
+    /// 4K pages known without mincore: borrowed pages and cached file mappings.
     fixed: u64,
-    /// 要 mincore 的宿主范围，按起点排好。
+    /// Host ranges to mincore, sorted by start.
     spans: Vec<(usize, usize)>,
 }
 
 impl RssPlan {
-    /// 要量的几段合计不超过这么多页时不量，按全部驻留算（[`RssPlan::estimate`]）。
+    /// When the spans to measure total at most this many pages they are not measured but counted as
+    /// fully resident ([`RssPlan::estimate`]).
     const SMALL: usize = 256;
 
-    /// 驻留页数的峰值用的估计：要 mincore 的几段合计不超过 1 MB 时按全部驻留算，最多
-    /// 多算 1 MB。`/bin/true` 这样的短命进程退出时要量 8 段、合计 45 页，量出来 12 页，
-    /// 却要持着 BKL 做 4 次 mincore（还要等宿主的 mmap_lock）。分配了大量内存的照常量。
+    /// Estimate used for the peak resident page count: when the spans to mincore total at most 1
+    /// MB, count them as fully resident, overcounting by at most 1 MB. A short-lived process like
+    /// `/bin/true` would measure 8 spans totalling 45 pages at exit and find 12, yet take 4 mincore
+    /// calls while holding the BKL (and wait for the host mmap_lock). Processes that allocated a
+    /// lot of memory are measured as usual.
     fn estimate(&self) -> u64 {
         let pages: usize = self.spans.iter().map(|&(_, len)| len.div_ceil(4096)).sum();
         if pages <= Self::SMALL {
@@ -272,7 +303,7 @@ impl RssPlan {
         }
     }
 
-    /// 驻留的 4K 页数。宿主上首尾相接的合起来一次 mincore。
+    /// Resident 4K pages. Spans that are contiguous on the host are merged into one mincore.
     fn measure(&self) -> u64 {
         let mut total = self.fixed;
         let mut rest = &self.spans[..];
@@ -292,14 +323,14 @@ impl RssPlan {
     }
 }
 
-/// 文件映射驻留的页数的缓存（[`Mm::resident_pages`]），键是 (设备号, inode, 文件偏移,
-/// 长度)。
+/// Cache of the resident page counts of file mappings ([`Mm::resident_pages`]), keyed by (device,
+/// inode, file offset, length).
 struct FileResidency;
 
 impl FileResidency {
-    /// 缓存的结果用多久：page cache 里一个文件的页变化得很慢。
+    /// How long a cached result is used: a file's pages in the page cache change slowly.
     const TTL: std::time::Duration = std::time::Duration::from_secs(1);
-    /// 最多缓存几段，满了就清空。
+    /// The most spans cached; the cache is cleared when it is full.
     const MAX: usize = 1024;
 
     fn get(
@@ -327,10 +358,12 @@ impl FileResidency {
     }
 }
 
-/// fork 时要用的匿名宿主内存（堆和栈预留的地址空间、小映射切出来的那一段）预先映射
-/// 好几段，fork 持有 BKL 时直接拿来用。同一个程序反复 fork 时要的长度总是那几个，用掉
-/// 一段就在放开 BKL 之后补上（[`refill`](spare::refill)）：宿主的 mmap 原来占 fork
-/// 持锁时间的四成，四个进程同时起进程时总吞吐还不如一个。
+/// Several pieces of the anonymous host memory fork needs (the address space reserved for the heap
+/// and the stack, the pieces small mappings are carved from) are mapped in advance, and fork takes
+/// them directly while holding the BKL. A program forking repeatedly always wants the same few
+/// lengths, and a used piece is replaced after the BKL is released ([`refill`](spare::refill)):
+/// host mmap used to take 40% of fork's hold time, and four processes spawning at once had less
+/// total throughput than one.
 pub(crate) mod spare {
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex, PoisonError};
@@ -338,15 +371,15 @@ pub(crate) mod spare {
     use super::HostRegion;
     use crate::errno::Errno;
 
-    /// 每个长度最多留几段。
+    /// The most pieces kept per length.
     const PER_LEN: usize = 2;
-    /// 最多记几种长度。
+    /// The most lengths remembered.
     const LENS: usize = 8;
 
     struct Spares {
-        /// (长度, 起点)：`MAP_NORESERVE`、没碰过的匿名宿主内存。
+        /// (length, start): `MAP_NORESERVE` anonymous host memory, never touched.
         maps: Vec<(usize, usize)>,
-        /// 要补上的长度，最近用到的在后面。
+        /// Lengths to replace, most recently used last.
         wanted: Vec<usize>,
     }
 
@@ -355,8 +388,8 @@ pub(crate) mod spare {
         wanted: Vec::new(),
     });
 
-    /// `len` 字节不计入提交量（`MAP_NORESERVE`）、清零的匿名宿主内存：有预先映射好的就
-    /// 拿来用，没有就当场映射。
+    /// `len` bytes of zeroed anonymous host memory, not commit-accounted (`MAP_NORESERVE`): a piece
+    /// mapped in advance if there is one, otherwise mapped on the spot.
     pub(super) fn anonymous(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let found = {
@@ -365,10 +398,10 @@ pub(crate) mod spare {
             s.wanted.push(host_len);
             if s.wanted.len() > LENS {
                 let old = s.wanted.remove(0);
-                // 不再要的长度留着的也交还
+                // Also return the pieces kept for a length no longer wanted
                 s.maps.retain(|&(l, base)| {
                     if l == old {
-                        // SAFETY: 预先映射的、没人用过的宿主内存
+                        // SAFETY: host memory mapped in advance and never used
                         unsafe { appine_hal::unmap(NonNull::new(base as *mut u8).unwrap(), l) };
                     }
                     l != old
@@ -397,7 +430,7 @@ pub(crate) mod spare {
         ))
     }
 
-    /// 补上用掉的。放开 BKL 之后调用。
+    /// Replaces the pieces used. Called after the BKL is released.
     pub(crate) fn refill() {
         loop {
             let need = {
@@ -418,26 +451,30 @@ pub(crate) mod spare {
                 s.maps.push((len, base.as_ptr() as usize));
             } else {
                 drop(s);
-                // SAFETY: 刚刚映射、没人用过
+                // SAFETY: just mapped and never used
                 unsafe { appine_hal::unmap(base, len) };
             }
         }
     }
 }
 
-/// 释放了、还没交还宿主的字节数：OOM killer 等它们交还了再量。
+/// Bytes freed but not yet returned to the host: the OOM killer waits for them to be returned
+/// before it measures.
 pub(crate) static UNMAPPING: AtomicUsize = AtomicUsize::new(0);
 
-/// 开始持有 BKL：之后释放的宿主内存等放开 BKL 再交还（[`release_unmapped`]）。
+/// Starts holding the BKL: host memory freed from now on is returned after the BKL is released
+/// ([`release_unmapped`]).
 pub(crate) fn defer_unmaps() {
     UNMAPPED.with_borrow_mut(|u| {
         u.get_or_insert_with(Unmapped::default);
     });
 }
 
-/// 放开了 BKL：把持有期间释放的宿主内存交还宿主。进程退出、execve 时一次有十几二十个
-/// 映射，宿主拆页表、刷 TLB 要几十微秒，不必让等 BKL 的线程（等着回收它的 shell、管道
-/// 另一头的进程）跟着等。首尾相接的一起交还，少刷几次 TLB。
+/// The BKL was released: return the host memory freed while it was held. Process exit and execve
+/// free ten or twenty mappings at once, and the host takes tens of microseconds to tear down page
+/// tables and flush TLBs; threads waiting for the BKL (the shell waiting to reap it, the process
+/// at the other end of a pipe) need not wait for that too. Contiguous pieces are returned
+/// together, saving TLB flushes.
 pub(crate) fn release_unmapped() {
     let Some(Unmapped {
         regions: mut list,
@@ -447,11 +484,12 @@ pub(crate) fn release_unmapped() {
     else {
         return;
     };
-    // 先释放页表，再交还它指向的宿主内存
+    // Free the page tables first, then return the host memory they point at
     drop(mmus);
     let reused: usize = anonymous.iter().map(|&(_, len, _)| len).sum();
     for (base, len, reserve) in anonymous {
-        // SAFETY: 释放 HostRegion 时记下的私有匿名宿主内存，已经没有人用它
+        // SAFETY: private anonymous host memory recorded when its HostRegion was dropped, and no
+        // longer used by anyone
         unsafe { recycled::put(base, len, reserve) };
     }
     UNMAPPING.fetch_sub(reused, Ordering::Release);
@@ -462,8 +500,9 @@ pub(crate) fn release_unmapped() {
     let total: usize = list.iter().map(|&(_, len)| len).sum();
     let mut run = list[0];
     for &(base, len) in &list[1..] {
-        // SAFETY: 两段都是交还的宿主内存；前一段在宿主上正好到 base 为止（宿主页比 4K
-        // 大时长度向上取整，接不上的不会凑巧相等）
+        // SAFETY: both are returned host memory; on the host the previous piece ends exactly at
+        // base (when host pages are larger than 4K the length rounds up, and pieces that do not
+        // adjoin cannot be equal by chance)
         if unsafe { run.0.add(run.1) } == base {
             run.1 += len;
         } else {
@@ -475,44 +514,44 @@ pub(crate) fn release_unmapped() {
     UNMAPPING.fetch_sub(total, Ordering::Release);
 }
 
-/// 一段可以映射进多个地址空间的宿主内存（System V 共享内存段）。
+/// Host memory that can be mapped into several address spaces (a System V shared memory segment).
 #[derive(Clone)]
 pub(crate) struct SharedMemory {
     region: Arc<HostRegion>,
 }
 
 impl SharedMemory {
-    /// 新建一段清零的内存，长度按页向上取整。
+    /// Creates zeroed memory, its length rounded up to a page.
     pub fn new(len: u64) -> Result<SharedMemory, Errno> {
         let len = page_up(len).ok_or(Errno::ENOMEM)?;
         let (region, _) = Mm::new_anonymous(len, true)?;
         Ok(SharedMemory { region })
     }
 
-    /// 长度（页的整数倍）。
+    /// Length (a multiple of the page size).
     pub fn len(&self) -> u64 {
         self.region.len as u64
     }
 }
 
-/// 映射的来源。
+/// Where a mapping's contents come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backing {
-    /// 私有的匿名内存。
+    /// Private anonymous memory.
     Anonymous,
-    /// 文件的私有映射（写时复制）。
+    /// Private file mapping (copy-on-write).
     PrivateFile,
-    /// 共享映射（文件或匿名）：fork 之后父子进程共用同一段宿主内存。
+    /// Shared mapping (file or anonymous): after fork, parent and child share the same host memory.
     Shared,
 }
 
-/// mremap(`MREMAP_DONTUNMAP`) 之后，原来的地址上要重新映射文件的一段：它原来是私有
-/// 文件映射，Linux 上那里的页之后从文件重新读进来。
+/// A piece of a file to map again at the old address after mremap(`MREMAP_DONTUNMAP`): it was a
+/// private file mapping, and on Linux its pages are read from the file again afterwards.
 pub struct Refill {
     pub start: u64,
     pub len: u64,
     pub prot: u32,
-    /// 映射的文件在仓库里的 inode（0 表示不知道）和这一段对应的文件偏移。
+    /// The mapped file's inode in the store (0 if unknown) and the file offset of this piece.
     pub ino: u64,
     pub offset: u64,
     pub name: Option<Rc<[u8]>>,
@@ -523,67 +562,76 @@ struct Vma {
     len: u64,
     prot: u32,
     backing: Backing,
-    /// 能否获得写权限：只读打开的文件的共享映射不能（宿主映射本身就是只读的）。
+    /// Whether write permission can be granted: not for a shared mapping of a file opened read-only
+    /// (the host mapping itself is read-only).
     may_write: bool,
-    /// 能否获得执行权限：noexec 的挂载里的文件的映射不能（Linux 的 `VM_MAYEXEC`）。
+    /// Whether execute permission can be granted: not for a mapping of a file on a noexec mount
+    /// (Linux's `VM_MAYEXEC`).
     may_exec: bool,
-    /// 持有宿主内存的引用：最后一个引用它的 VMA 消失时释放。
+    /// A reference to the host memory, released when the last VMA referring to it goes away.
     region: Arc<HostRegion>,
-    /// `/proc/<pid>/maps` 里显示的名字（映射的文件、程序）和文件的 inode。
+    /// The name shown in `/proc/<pid>/maps` (the mapped file or program) and the file's inode.
     name: Option<Rc<[u8]>>,
     ino: u64,
-    /// 这个 VMA 的起点对应的宿主地址。
+    /// The host address of this VMA's start.
     host: NonNull<u8>,
-    /// 从起点算起有文件内容的字节数（按 4K 向上取整），匿名映射等于 `len`。文件映射
-    /// 超出文件末尾的部分一碰宿主就会发 SIGBUS：它们不进页表，guest 访问时得到
-    /// SIGBUS（[`Mm::fault_past_eof`]），fork 复制时也不读它们。
+    /// Bytes from the start that have file contents (rounded up to 4K); equal to `len` for
+    /// anonymous mappings. The host raises SIGBUS as soon as the part of a file mapping past the
+    /// end of the file is touched: that part is kept out of the page table, guest accesses get
+    /// SIGBUS ([`Mm::fault_past_eof`]), and fork does not read it when copying.
     file_len: u64,
-    /// 只读的私有文件映射在 fork 之后和别的地址空间共用宿主映射；要改成可写之前，
-    /// 先复制一份自己的（[`Mm::mprotect`]）。
+    /// After fork a read-only private file mapping shares its host mapping with other address
+    /// spaces; before it becomes writable it copies its own first ([`Mm::mprotect`]).
     cow: bool,
-    /// 文件映射：宿主文件的 (设备号, inode) 和起点对应的文件偏移。共享映射拿它作 futex
-    /// 的键；文件被截短时据此找到映射它的页（[`Mm::file_truncated`]）。
+    /// File mappings: the host file's (device, inode) and the file offset of the start. Shared
+    /// mappings use it as the futex key; when the file is truncated it finds the pages that map it
+    /// ([`Mm::file_truncated`]).
     file_id: Option<(u64, u64, u64)>,
-    /// 私有文件映射：映射时文件内容的版本（[`content::version`]），没有可信的版本时是
-    /// None。没写过的映射里是这个版本的文件内容（[`Mm::code_sources`]）。
+    /// Private file mappings: the version of the file contents when mapped
+    /// ([`content::version`]), None when there is no trusted version. A mapping never written
+    /// holds the file contents of this version ([`Mm::code_sources`]).
     content: Option<(u64, u64)>,
-    /// 文件的共享映射：复制出来的宿主 fd 和起点对应的文件偏移（mremap 扩展映射时
-    /// 接着映射文件后面的内容）。
+    /// Shared file mappings: the duplicated host fd and the file offset of the start (when mremap
+    /// grows the mapping it goes on to map the rest of the file).
     file: Option<(Rc<OwnedFd>, u64)>,
-    /// shmat 映射的共享内存段：段（所在的 IPC 命名空间和 id）和这次 shmat 的起点（切开
-    /// 之后不变）。
+    /// A shared memory segment mapped by shmat: the segment (its IPC namespace and id) and the
+    /// start of this shmat (unchanged after splitting).
     shm: Option<(crate::ipc::ShmKey, u64)>,
-    /// mlock 锁住了（只记录，宿主内存不会被换出到 guest 能察觉的地方）。
+    /// Locked by mlock (only recorded; host memory is never swapped out anywhere the guest could
+    /// notice).
     locked: bool,
-    /// 匿名映射可写过，或者内核写过（加载器）。没写过的内容全是零，fork 时不用复制：
-    /// V8 为 wasm 预留的 8 GB `PROT_NONE` 逐页检查一遍要一秒。
+    /// The anonymous mapping has been writable, or the kernel wrote into it (the loader). Contents
+    /// never written are all zero and fork need not copy them: checking V8's 8 GB `PROT_NONE`
+    /// wasm reservation page by page takes a second.
     written: Cell<bool>,
-    /// `MAP_GROWSDOWN`：访问它下面的地址时向下增长（[`Mm::grow_down`]）。
+    /// `MAP_GROWSDOWN`: grows downwards when an address below it is accessed ([`Mm::grow_down`]).
     growsdown: bool,
-    /// `MADV_DONTDUMP`：core 文件里不写它的内容（[`Mm::dump_regions`]），fork 继承。
+    /// `MADV_DONTDUMP`: its contents are left out of core files ([`Mm::dump_regions`]); fork
+    /// inherits it.
     dontdump: bool,
-    /// `MAP_NORESERVE`：不计入提交量（[`Mm::commit_too_big`]）。
+    /// `MAP_NORESERVE`: not counted in the commit ([`Mm::commit_too_big`]).
     noreserve: bool,
 }
 
 impl Vma {
-    /// 只是预留，还没有宿主内存（[`HostRegion::reserved`]）。
+    /// Only reserved, with no host memory yet ([`HostRegion::reserved`]).
     fn reserved(&self) -> bool {
         self.region.reserved
     }
 }
 
-/// 最近几个代码代数作废的范围。
+/// Ranges invalidated in the last few code generations.
 #[derive(Default)]
 pub struct CodeLog {
-    /// (代码代数, 起点, 长度)，代数递增。
+    /// (code generation, start, length), in increasing generation order.
     entries: VecDeque<(u64, u64, u64)>,
 }
 
 impl CodeLog {
-    /// 保留的代数个数；落后更多的线程整体清空翻译缓存。JVM 每装一个编译好的方法就
-    /// `ic ivau` 一串缓存行，只留 64 个时，睡一会儿的 GC、编译线程醒来几乎都要整体
-    /// 清空：Maven 构建清空 2400 次，用户态 CPU 时间多 30%。
+    /// Number of generations kept; threads further behind flush the whole translation cache. The
+    /// JVM issues `ic ivau` over a run of cache lines for every compiled method it installs, and
+    /// with only 64 kept, GC and compiler threads waking from a short sleep almost always had to
+    /// flush everything: a Maven build flushed 2400 times and used 30% more user CPU time.
     const GENERATIONS: u64 = 4096;
 
     fn push(&mut self, generation: u64, ranges: &[(u64, u64)]) {
@@ -598,12 +646,14 @@ impl CodeLog {
         }
     }
 
-    /// 代数 `seen` 之后、直到 `now` 作废的范围；记录已经不全时返回 None。
+    /// Ranges invalidated after generation `seen` up to `now`; None when the log no longer covers
+    /// them.
     pub fn since(&self, seen: u64, now: u64) -> Option<Vec<(u64, u64)>> {
         if self.entries.front().is_none_or(|e| e.0 > seen + 1) {
             return None;
         }
-        // 代数递增：二分找到起点，只看错过的那几条（JVM 下整个记录有上万条）
+        // Generations increase: binary-search the start and look only at the entries missed (the
+        // whole log has tens of thousands of entries under the JVM)
         let first = self.entries.partition_point(|e| e.0 <= seen);
         Some(
             self.entries
@@ -615,68 +665,80 @@ impl CodeLog {
     }
 }
 
-/// 使用者在重新进入 guest 代码之前检查的代数（[`Mm::sync`]）。
+/// Generations users check before re-entering guest code ([`Mm::sync`]).
 pub struct Generations {
-    /// TLB shootdown 的代数。
+    /// TLB shootdown generation.
     pub tlb: Arc<AtomicU64>,
-    /// 代码的代数：变化之后按 `log` 作废 Tier 1 的翻译。
+    /// Code generation: when it changes, Tier 1 translations are invalidated according to `log`.
     pub code: Arc<AtomicU64>,
-    /// 每个代码代数作废的范围。
+    /// Ranges invalidated in each code generation.
     pub log: Arc<Mutex<CodeLog>>,
-    /// 换了 Tier 1 的翻译（离开了共用的组，[`CodeGroup`]）：使用者重新进入 guest 代码之前
-    /// 换用新的。
+    /// The Tier 1 translations were replaced (the address space left its shared group,
+    /// [`CodeGroup`]): users switch to the new ones before re-entering guest code.
     pub space: Arc<AtomicU64>,
 }
 
-/// 一个地址空间的 Tier 1 翻译，这个地址空间里的线程共用（[`Mm::code_space`]）。
+/// An address space's Tier 1 translations, shared by the threads of that address space
+/// ([`Mm::code_space`]).
 pub struct CodeSpace {
     pub space: Arc<appine_engine::DbtSpace>,
-    /// 这个地址空间在共用翻译的组里的标签（[`CodeGroup`]），不在组里时是 0。
+    /// This address space's tag in its translation-sharing group ([`CodeGroup`]); 0 outside a
+    /// group.
     pub tag: u16,
-    /// 已经按代码失效的记录作废到的代码代数：第一个看到新代数的线程作废一次就够了。
+    /// The code generation up to which the code-change log has been applied: the first thread to
+    /// see a new generation invalidates once for all.
     pub seen: Mutex<u64>,
 }
 
-/// 同一个程序的几个地址空间共用的 Tier 1 翻译（[`Mm::code_space`]）。每个进程各一份
-/// 翻译时，并行编译的四个 cc1 各占 35–40 MB 代码缓存，20 个空闲的 python3 各 4 MB。
+/// Tier 1 translations shared by several address spaces of the same program
+/// ([`Mm::code_space`]). With one set per process, four cc1 compiling in parallel took 35–40 MB of
+/// code cache each, and 20 idle python3 processes 4 MB each.
 ///
-/// 翻译只取决于 pc 和指令字，所以几个地址空间在同样的地址映射着同样的代码时，块对它们
-/// 都有效。成员可信的可执行映射（没写过、有版本的私有文件映射，和 vDSO）要与组里登记的
-/// 一致：同一段地址只能是同一个版本的同一段文件（appine 没有 ASLR，同一个程序的进程映射
-/// 在同样的地址）。登记过的映射里的块所有成员共用；别的可执行内存（JIT 生成的、写过的代码）
-/// 是成员私有的：引擎按成员的标签把那里的块分开（[`appine_engine::DbtSpace::share`]），
-/// 私有的范围不能压着登记过的，登记的也不能压着别的成员私有的（[`CodeGroup::admit`]）。
-/// node 的进程各有各的 JIT 代码，V8 的解释器、内置函数和 ICU 这些在 node 程序文件里的代码
-/// 照样共用。每次系统调用之后核对（[`Mm::sync`]）：不满足的成员离开组，换用自己的翻译；只剩
-/// 它一个时组就关掉，它留着原来的翻译。所以别的成员不会执行到只对它有效的块。成员拆掉自己的
-/// 映射时照常作废，别的成员只是要重新翻译。
+/// A translation depends only on the pc and the instruction words, so when several address spaces
+/// map the same code at the same addresses, the blocks are valid for all of them. A member's
+/// trusted executable mappings (private file mappings never written that have a version, and the
+/// vDSO) must agree with what the group has registered: one address range can only be the same
+/// piece of the same version of a file (appine has no ASLR, so processes of the same program map
+/// at the same addresses). Blocks in registered mappings are shared by all members; other
+/// executable memory (JIT output, code that was written) is private to a member: the engine keeps
+/// blocks there apart by member tag ([`appine_engine::DbtSpace::share`]), private ranges may not
+/// overlap registered ones, and registered ones may not overlap ranges private to other members
+/// ([`CodeGroup::admit`]). Each node process has its own JIT code, while V8's interpreter, its
+/// builtins and ICU, which live in the node program file, are still shared. The check runs after
+/// every syscall ([`Mm::sync`]): a member that no longer fits leaves the group and switches to
+/// translations of its own; when it is the only member left the group is closed and it keeps the
+/// existing translations. So no other member ever runs a block valid only for it. A member that
+/// unmaps its own mappings invalidates as usual, and other members only have to translate again.
 ///
-/// 只在持有 BKL 时访问。
+/// Accessed only while holding the BKL.
 pub struct CodeGroup {
-    /// 程序（可执行文件的 inode，与池的键相同）。
+    /// The program (the executable's inode, the same as the pool key).
     key: u64,
     space: Arc<appine_engine::DbtSpace>,
     members: Cell<usize>,
-    /// 成员映射过的可执行映射，同一段地址只登记一个身份（[`CodeGroup::extend`]）。
+    /// Executable mappings members have mapped; one identity is registered per address range
+    /// ([`CodeGroup::extend`]).
     ranges: RefCell<Vec<appine_engine::DbtSource>>,
-    /// 成员私有的可执行内存 `(标签, 起点, 终点)`（[`CodeGroup::admit`]）。
+    /// Executable memory private to a member, `(tag, start, end)` ([`CodeGroup::admit`]).
     claims: RefCell<Vec<(u16, u64, u64)>>,
-    /// 不再接受新成员。
+    /// No longer accepts new members.
     closed: Cell<bool>,
-    /// 有过不止一个成员：作废过登记范围以外的块。
+    /// Has had more than one member: blocks outside the registered ranges have been invalidated.
     shared: Cell<bool>,
 }
 
-/// 内核里可以加入的组（[`CodeGroup`]），在 Kernel 里。
+/// The groups ([`CodeGroup`]) that can be joined, kept in Kernel.
 pub type CodeGroups = RefCell<Vec<Weak<CodeGroup>>>;
 
 impl CodeGroup {
-    /// 最多登记几段映射（python 加载的扩展模块一个一段）。
+    /// The most mappings registered (python's extension modules take one each).
     const MAX_RANGES: usize = 256;
 
-    /// 登记 `layout`（一个地址空间全部的可执行映射）：与登记的冲突、登记不下时返回 false，
-    /// 什么也不改。重叠的两段一致是说同一个版本的同一个文件，地址减去文件偏移也相同：动态
-    /// 链接器先按整个文件的跨度映射，再把后面的段盖上去，同一个库的可执行映射先长后短。
+    /// Registers `layout` (all of an address space's executable mappings): returns false and
+    /// changes nothing if it conflicts with what is registered or does not fit. Two overlapping
+    /// pieces agree when they are the same version of the same file with the same address minus
+    /// file offset: the dynamic linker first maps the span of the whole file and then maps the
+    /// later segments over it, so a library's executable mappings come long first, then short.
     fn extend(&self, layout: &[appine_engine::DbtSource]) -> bool {
         let mut ranges = self.ranges.borrow_mut();
         let mut new = Vec::new();
@@ -701,15 +763,16 @@ impl CodeGroup {
         true
     }
 
-    /// 重叠的两段可信映射是同一个版本的同一个文件，地址减去文件偏移也相同。
+    /// Two overlapping trusted mappings are the same version of the same file with the same
+    /// address minus file offset.
     fn same_file(r: &appine_engine::DbtSource, s: &appine_engine::DbtSource) -> bool {
         let (ri, si) = (r.id, s.id);
         (ri[0], ri[1], ri[3], ri[4]) == (si[0], si[1], si[3], si[4])
             && r.start.wrapping_sub(ri[2]) == s.start.wrapping_sub(si[2])
     }
 
-    /// `layout` 里与登记的一致的那些映射（重叠的登记都是同一段文件）：组里的实例在那里的块
-    /// 对这个地址空间有效。
+    /// The mappings in `layout` that agree with what is registered (every overlapping registration
+    /// is the same piece of file): the group's blocks there are valid for this address space.
     fn consistent(&self, layout: &[appine_engine::DbtSource]) -> Vec<appine_engine::DbtSource> {
         let ranges = self.ranges.borrow();
         layout
@@ -724,9 +787,11 @@ impl CodeGroup {
             .collect()
     }
 
-    /// 成员 `tag` 的全部可执行映射：可信的 `layout` 和私有的 `private`（[`Mm::exec_split`]）。
-    /// layout 要与登记的一致（[`CodeGroup::extend`]）、不压着别的成员私有的范围，private 不压着
-    /// 登记过的：满足时登记 layout、换上这个成员私有的范围，返回 true，否则什么也不改。
+    /// All executable mappings of member `tag`: the trusted `layout` and the private `private`
+    /// ([`Mm::exec_split`]). layout must agree with what is registered ([`CodeGroup::extend`])
+    /// and not overlap ranges private to other members, and private must not overlap registered
+    /// ranges: if so, registers layout, installs this member's private ranges and returns true;
+    /// otherwise changes nothing.
     fn admit(&self, tag: u16, layout: &[appine_engine::DbtSource], private: &[(u64, u64)]) -> bool {
         let overlap = |start: u64, end: u64, s: u64, e: u64| start < e && s < end;
         let ranges = self.ranges.borrow();
@@ -758,16 +823,18 @@ impl CodeGroup {
     }
 }
 
-/// 地址空间的句柄（[`Mm::into_shared`]）：写时复制时同一个 fork 家族的地址空间经由它
-/// 找到对方。
+/// A handle to an address space ([`Mm::into_shared`]): during copy-on-write the address spaces of
+/// one fork family find each other through it.
 type MmRef = Weak<RefCell<Mm>>;
 
-/// 一个借出的宿主页。
+/// A lent host page.
 struct Loan {
-    /// 拥有者和页在它那里的 guest 地址；拥有者的地址空间销毁之后是 None（孤儿页）。
+    /// The owner and the page's guest address there; None after the owner's address space is
+    /// destroyed (an orphan page).
     owner: Option<(MmRef, u64)>,
-    /// 借用方和页在它那里的 guest 地址。通常只有一个（fork 出来的子进程），它不另外分配：
-    /// 大进程 fork 时每页都有一条记录。
+    /// The borrowers and the page's guest address in each. There is usually only one (the forked
+    /// child), stored without a separate allocation: a big process's fork makes a record for every
+    /// page.
     first: Option<(MmRef, u64)>,
     others: Vec<(MmRef, u64)>,
 }
@@ -788,7 +855,7 @@ impl Loan {
         }
     }
 
-    /// 去掉借用方 `mm`（页在它那里的地址是 `page`），返回还有没有别的借用方。
+    /// Removes borrower `mm` (where the page is at `page`); returns whether other borrowers remain.
     fn give_back(&mut self, mm: &MmRef, page: u64) -> bool {
         let it = |(m, a): &(MmRef, u64)| *a == page && m.ptr_eq(mm);
         if self.first.as_ref().is_some_and(it) {
@@ -803,14 +870,16 @@ impl Loan {
         self.first.into_iter().chain(self.others)
     }
 
-    /// 映射着这一页的地址空间个数（Linux 的 mapcount）：拥有者（还在的话）和借用方。
+    /// Number of address spaces mapping this page (Linux's mapcount): the owner (if still there)
+    /// and the borrowers.
     fn users(&self) -> usize {
         usize::from(self.owner.is_some()) + usize::from(self.first.is_some()) + self.others.len()
     }
 }
 
-/// 宿主页地址的哈希：按页对齐的地址去掉低位再乘一个奇数常数就足够分散。默认的 SipHash
-/// 在大进程 fork 时占一成多。
+/// Hash of host page addresses: dropping the low bits of a page-aligned address and multiplying
+/// by an odd constant spreads them well enough. The default SipHash took over 10% of a big
+/// process's fork.
 #[derive(Default, Clone, Copy)]
 struct PageHasher(u64);
 
@@ -830,12 +899,13 @@ impl std::hash::Hasher for PageHasher {
     }
 }
 
-/// 同一个 fork 家族共用的借出记录，键是宿主页的地址。
+/// The loan records shared by one fork family, keyed by host page address.
 type Loans = Rc<RefCell<HashMap<usize, Loan, std::hash::BuildHasherDefault<PageHasher>>>>;
 
-/// 页表里连续的一段：所在 VMA 的起点、guest 地址、宿主地址、长度。逐页改页表项之前先
-/// 接成段。段不跨 VMA：mprotect 切开的几个 VMA、相邻的两次 mmap 的宿主内存也可能相连，
-/// 而它们的权限不同。
+/// A contiguous run in the page table: the start of its VMA, the guest address, the host address
+/// and the length. Pages are joined into runs before their entries are changed page by page. Runs
+/// never cross VMAs: the VMAs an mprotect split off, or the host memory of two adjacent mmaps, may
+/// be contiguous while their permissions differ.
 #[derive(Default)]
 struct Runs {
     runs: Vec<(u64, u64, usize, u64)>,
@@ -856,112 +926,126 @@ impl Runs {
     }
 }
 
-/// 借来的页。
+/// A borrowed page.
 struct Borrowed {
     host: NonNull<u8>,
-    /// 持有那段宿主内存：拥有者解除映射、销毁之后它也不会释放。
+    /// Holds that host memory, so it is not released when the owner unmaps it or is destroyed.
     region: Arc<HostRegion>,
 }
 
-/// 一个地址空间里写时复制的页（guest 地址）。只在私有匿名映射里。
+/// The copy-on-write pages of an address space (guest addresses). Only in private anonymous
+/// mappings.
 #[derive(Default)]
 struct Cow {
-    /// 借出的页：页表项没有写权限。
+    /// Lent pages: their entries have no write permission.
     lent: BTreeSet<u64>,
-    /// 借来的页：页表项指向拥有者的宿主页，没有写权限。
+    /// Borrowed pages: their entries point at the owner's host page, without write permission.
     borrowed: BTreeMap<u64, Borrowed>,
 }
 
-/// 一个 guest 进程的地址空间。
+/// The address space of a guest process.
 pub struct Mm {
-    // 先销毁页表，再释放它指向的宿主内存（Drop 里先放开页表，字段再按声明顺序析构）。
+    // Destroy the page table before releasing the host memory it points at (Drop releases the
+    // page table first, then the fields are dropped in declaration order).
     mmu: ManuallyDrop<Mmu>,
     vmas: BTreeMap<u64, Vma>,
-    /// 已经解除映射、等 shootdown 完成后才能释放的宿主内存。
+    /// Host memory already unmapped, which may be released only after the shootdown completes.
     graveyard: Vec<Arc<HostRegion>>,
     brk_start: u64,
     brk: u64,
     dirty: bool,
-    /// 可执行的映射被拆除、改了权限或者内容的范围：这些地方的翻译要作废。
+    /// Ranges where an executable mapping was torn down or changed permissions or contents: the
+    /// translations there must be invalidated.
     code_ranges: Vec<(u64, u64)>,
-    /// 可以写的共享文件映射所在的范围（[`Mm::shared_files`]）。
+    /// Ranges of writable shared file mappings ([`Mm::shared_files`]).
     shared_files: Arc<RwLock<Vec<(u64, u64)>>>,
-    /// shootdown 的代数：变化之后，使用者重新进入 guest 代码之前刷新 TLB。
+    /// Shootdown generation: when it changes, users flush their TLBs before re-entering guest code.
     generation: Arc<AtomicU64>,
-    /// 代码的代数：变化之后，使用者按 `code_log` 作废 Tier 1 的翻译。数据页的变化（gcc
-    /// 的垃圾回收器、malloc 频繁地 mmap/munmap）不影响已经翻译的代码，不改这个代数。
+    /// Code generation: when it changes, users invalidate Tier 1 translations according to
+    /// `code_log`. Changes to data pages (gcc's garbage collector and malloc mmap and munmap
+    /// often) do not affect code already translated and leave this generation alone.
     code_generation: Arc<AtomicU64>,
     code_log: Arc<Mutex<CodeLog>>,
-    /// 正在使用这个地址空间的线程。
+    /// Threads using this address space.
     users: Vec<Arc<TaskSync>>,
-    /// Tier 1 的翻译，第一个线程开始运行时创建（[`Mm::code_space`]）。
+    /// Tier 1 translations, created when the first thread starts running ([`Mm::code_space`]).
     code_space: Option<Arc<CodeSpace>>,
-    /// 共用翻译的组（[`CodeGroup`]）和在里面的标签。
+    /// The translation-sharing group ([`CodeGroup`]) and the tag in it.
     code_group: Option<Rc<CodeGroup>>,
     code_tag: u16,
-    /// 离开过组（或者一开始就不能加入）：不再加入。
+    /// Has left a group (or could not join one in the first place): never joins again.
     unshareable: bool,
-    /// 可执行映射有了变化，下一次 [`Mm::sync`] 时与组里登记的核对。
+    /// The executable mappings changed; checked against the group's registration at the next
+    /// [`Mm::sync`].
     exec_changed: bool,
-    /// 换了 Tier 1 的翻译时加一（[`Generations::space`]）。
+    /// Incremented when the Tier 1 translations are replaced ([`Generations::space`]).
     space_generation: Arc<AtomicU64>,
-    /// membarrier(2) 登记过的命令（`MEMBARRIER_CMD_REGISTER_*`）。
+    /// Commands registered with membarrier(2) (`MEMBARRIER_CMD_REGISTER_*`).
     pub membarrier: i32,
-    /// `mlockall(MCL_FUTURE)`：以后的映射也锁住。
+    /// `mlockall(MCL_FUTURE)`: future mappings are locked too.
     pub lock_future: bool,
-    /// 同时带了 `MCL_ONFAULT`：以后的映射锁住但不预先调进内存。
+    /// `MCL_ONFAULT` was given as well: future mappings are locked but not populated in advance.
     pub lock_onfault: bool,
-    /// 正在执行的程序文件在仓库里的 inode（ETXTBSY）。
+    /// The store inode of the program file being executed (ETXTBSY).
     pub exe: Option<u64>,
-    /// Tier 1 翻译这个程序时占用哪一组寄存器，execve 时按程序定（Go 的另用一组）。
+    /// Which register set Tier 1 uses when translating this program, chosen per program at
+    /// execve (Go gets a different one).
     pub dbt_regs: appine_engine::DbtRegs,
-    /// vDSO 的加载地址（信号处理函数默认返回到其中的 sigreturn 跳板）。
+    /// Load address of the vDSO (signal handlers return to the sigreturn trampoline in it by
+    /// default).
     pub vdso: u64,
-    /// 初始栈上 argv 字符串的范围（`/proc/<pid>/cmdline`）。
+    /// Range of the argv strings on the initial stack (`/proc/<pid>/cmdline`).
     pub args: (u64, u64),
-    /// 初始栈上 envp 字符串的范围（`/proc/<pid>/environ`）。
+    /// Range of the envp strings on the initial stack (`/proc/<pid>/environ`).
     pub env: (u64, u64),
-    /// 初始栈上的 auxv（键值对，以 `AT_NULL` 结尾），`/proc/<pid>/auxv` 用这一份。
+    /// The auxv on the initial stack (key-value pairs ending in `AT_NULL`); `/proc/<pid>/auxv`
+    /// uses this copy.
     pub auxv: Rc<[u64]>,
-    /// mmap 分配区的上界（不含），按 execve 时的 `RLIMIT_STACK` 定下（[`Mm::set_layout`]）。
+    /// Upper bound (exclusive) of the mmap area, set from `RLIMIT_STACK` at execve
+    /// ([`Mm::set_layout`]).
     mmap_top: u64,
-    /// 初始的栈指针（Linux 的 `start_stack`）：`/proc/<pid>/maps` 把包含它的栈标成
-    /// `[stack]`。
+    /// The initial stack pointer (Linux's `start_stack`): `/proc/<pid>/maps` labels the stack
+    /// containing it `[stack]`.
     start_stack: u64,
-    /// 主线程栈目前的底部；还没有栈时是 0。
+    /// The current bottom of the main thread's stack; 0 while there is no stack.
     stack_low: u64,
-    /// 写时复制的页和同一个 fork 家族共用的借出记录（模块文档）。只在持有 BKL 时访问，
-    /// 也会经由别的地址空间的共享借用修改，所以放在 RefCell 里。
+    /// Copy-on-write pages and the loan records shared by one fork family (module docs). Accessed
+    /// only while holding the BKL, but also modified through shared borrows from other address
+    /// spaces, hence the RefCell.
     cow: RefCell<Cow>,
     loans: Loans,
-    /// 自己的句柄，借出页时记下（[`Mm::into_shared`]）。
+    /// Its own handle, recorded when lending pages ([`Mm::into_shared`]).
     me: MmRef,
-    /// 只读文件映射的宿主映射，所有地址空间共用（[`FileMaps`]）。
+    /// Host mappings of read-only file mappings, shared by all address spaces ([`FileMaps`]).
     files: FileMaps,
 }
 
-/// 只读私有文件映射（程序和库的代码段）的宿主映射，内核里的所有地址空间共用：同一个
-/// 版本（[`content::version`]）的同一段文件再映射时直接用它，宿主页表还在，不必重新映射、
-/// 缺页，退出时也不必拆掉（shell 每起一个进程，程序和动态链接器的代码段各一次）。用它的
-/// VMA 与 fork 之后父子共用宿主内存时一样标记为 `cow`，要写之前复制一份自己的。宿主上是
-/// 只读映射，万一有地方忘了复制就直接出错，不会悄悄改了别人的代码。
+/// Host mappings of read-only private file mappings (the code segments of programs and libraries),
+/// shared by all address spaces in the kernel: mapping the same piece of the same version
+/// ([`content::version`]) of a file again reuses one directly, with its host page tables intact,
+/// so there is no re-mapping or page fault, and no teardown at exit (once each for the program's
+/// and the dynamic linker's code segments every time the shell spawns a process). VMAs using one
+/// are marked `cow`, like parent and child sharing host memory after fork, and copy their own
+/// before writing. On the host it is a read-only mapping, so a place that forgets to copy fails
+/// outright instead of silently changing someone else's code.
 #[derive(Clone, Default)]
 pub(crate) struct FileMaps(Arc<Mutex<Vec<FileMap>>>);
 
 struct FileMap {
-    /// (设备号, inode, 文件偏移, 长度, ctime, 大小)。
+    /// (device, inode, file offset, length, ctime, size).
     key: [u64; 6],
     region: Arc<HostRegion>,
     host: NonNull<u8>,
-    /// 最近一次用到的序号，满了时去掉最久没用的。
+    /// Sequence number of the most recent use; when full, the least recently used is dropped.
     used: u64,
 }
 
-// SAFETY: host 指向 region 持有的宿主内存
+// SAFETY: host points into host memory that region holds
 unsafe impl Send for FileMap {}
 
 impl FileMaps {
-    /// 最多保留几段。只占宿主地址空间，页是 page cache 里的，宿主内存紧张时可以回收。
+    /// The most pieces kept. They take only host address space; the pages are in the page cache
+    /// and can be reclaimed when host memory is short.
     const MAX: usize = 128;
 
     fn get(&self, key: &[u64; 6]) -> Option<(Arc<HostRegion>, NonNull<u8>)> {
@@ -994,7 +1078,8 @@ impl FileMaps {
         });
     }
 
-    /// 全部丢掉（宿主内存紧张时）。还在用的映射由用它的 VMA 持有，不受影响。
+    /// Drops everything (when host memory is short). Mappings still in use are held by the VMAs
+    /// using them and are unaffected.
     pub fn clear(&self) {
         self.0
             .lock()
@@ -1003,48 +1088,49 @@ impl FileMaps {
     }
 }
 
-/// `/proc/<pid>/maps` 的一行。
+/// One line of `/proc/<pid>/maps`.
 pub struct Region {
     pub start: u64,
     pub end: u64,
     pub prot: u32,
     pub shared: bool,
     pub name: Option<Rc<[u8]>>,
-    /// 文件映射：起点对应的文件偏移和文件的 inode。
+    /// File mappings: the file offset of the start and the file's inode.
     pub file: Option<(u64, u64)>,
-    /// mlock 锁住了。
+    /// Locked by mlock.
     pub locked: bool,
-    /// 能获得写权限（smaps 的 `mw`）。
+    /// Write permission can be granted (smaps `mw`).
     pub may_write: bool,
-    /// 能获得执行权限（smaps 的 `me`）。
+    /// Execute permission can be granted (smaps `me`).
     pub may_exec: bool,
-    /// `MADV_DONTDUMP`（smaps 的 `dd`）。
+    /// `MADV_DONTDUMP` (smaps `dd`).
     pub dontdump: bool,
 }
 
-/// core dump 里的一个映射（[`Mm::dump_regions`]）。
+/// One mapping in a core dump ([`Mm::dump_regions`]).
 pub struct DumpRegion {
     pub start: u64,
     pub end: u64,
     pub prot: u32,
-    /// 从起点算起写进 core 文件的字节数。
+    /// Bytes from the start written to the core file.
     pub size: u64,
-    /// 没有驻留在宿主内存里的页从来没碰过（匿名、共享内存），写成空洞；私有文件映射
-    /// 没碰过的页是文件的内容，要读出来。
+    /// Pages not resident in host memory were never touched (anonymous, shared memory) and are
+    /// written as holes; untouched pages of private file mappings are file contents and must be
+    /// read.
     pub sparse: bool,
-    /// 文件映射：起点对应的文件偏移和路径（`NT_FILE`）。
+    /// File mappings: the file offset of the start and the path (`NT_FILE`).
     pub file: Option<(u64, Rc<[u8]>)>,
 }
 
-/// `/proc/<pid>/coredump_filter` 的位（Linux 的 `MMF_DUMP_*`），默认是
-/// [`dump_filter::DEFAULT`]。
+/// Bits of `/proc/<pid>/coredump_filter` (Linux's `MMF_DUMP_*`); the default is
+/// [`dump_filter::DEFAULT`].
 pub mod dump_filter {
     pub const ANON_PRIVATE: u32 = 1;
     pub const ANON_SHARED: u32 = 2;
     pub const MAPPED_PRIVATE: u32 = 4;
     pub const MAPPED_SHARED: u32 = 8;
     pub const ELF_HEADERS: u32 = 16;
-    /// 匿名的私有、共享映射，ELF 文件头，私有的大页。
+    /// Private and shared anonymous mappings, ELF headers, private huge pages.
     pub const DEFAULT: u32 = 0x33;
 }
 
@@ -1052,7 +1138,8 @@ fn page_up(v: u64) -> Option<u64> {
     v.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1))
 }
 
-/// guest 权限对应的页表权限：arm64 没有只写页，可写意味着可读。
+/// The page-table permission for a guest permission: arm64 has no write-only pages, so writable
+/// implies readable.
 fn mmu_prot(p: u32) -> u32 {
     let mut r = p & (prot::READ | prot::WRITE | prot::EXEC);
     if r & prot::WRITE != 0 {
@@ -1061,12 +1148,12 @@ fn mmu_prot(p: u32) -> u32 {
     r
 }
 
-/// 文件从 `offset` 起还有内容的字节数，按页向上取整，不超过 `len`。
+/// Bytes of the file that still have contents from `offset`, rounded up to a page, at most `len`.
 fn file_extent(fd: i32, offset: u64, len: u64) -> u64 {
     extent(appine_hal::fstat(fd).map_or(0, |s| s.st_size), offset, len)
 }
 
-/// 大小为 `size` 的文件从 `offset` 起还有内容的字节数（[`file_extent`]）。
+/// Bytes of a file of size `size` that still have contents from `offset` ([`file_extent`]).
 fn extent(size: i64, offset: u64, len: u64) -> u64 {
     (size.max(0) as u64)
         .saturating_sub(offset)
@@ -1074,21 +1161,23 @@ fn extent(size: i64, offset: u64, len: u64) -> u64 {
         .min(len)
 }
 
-/// 宿主文件内容的版本（[`content::version`]），没有可信的版本时是 None。
+/// The version of a host file's contents ([`content::version`]), None when there is no trusted
+/// version.
 pub(crate) fn content_version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
     content::version(st, dev, ino)
 }
 
-/// 判断两段文件映射的内容是否相同（[`Mm::code_sources`]）。
+/// Telling whether two file mappings have the same contents ([`Mm::code_sources`]).
 mod content {
     use std::collections::HashSet;
     use std::sync::Mutex;
 
-    /// 有过可写共享映射的宿主文件 (设备号, inode)：经由共享映射写进去的内容不一定改
-    /// ctime（页一直是脏的就不再经过 page_mkwrite），这样的文件不再相信 ctime。
+    /// Host files (device, inode) that have had a writable shared mapping: contents written through
+    /// a shared mapping do not necessarily change ctime (a page that stays dirty no longer goes
+    /// through page_mkwrite), so ctime is no longer trusted for such files.
     static WRITABLY_SHARED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
 
-    /// 文件 (`dev`, `ino`) 有了可写的共享映射。
+    /// File (`dev`, `ino`) got a writable shared mapping.
     pub(super) fn writably_shared(dev: u64, ino: u64) {
         let mut set = WRITABLY_SHARED
             .lock()
@@ -1096,10 +1185,12 @@ mod content {
         set.get_or_insert_with(HashSet::new).insert((dev, ino));
     }
 
-    /// 宿主文件内容的版本：ctime（纳秒）和大小。内容的每一次修改（write、truncate、
-    /// fallocate……）宿主都会把 ctime 改成当时的时间，utimensat 也改不回去，所以两次量到
-    /// 的版本相同，之间就没有改过。宿主的时间戳取自粗粒度的时钟，ctime 离现在太近时，
-    /// 之后紧接着的修改可能得到同一个 ctime，这时不给版本；有过可写共享映射的文件也不给。
+    /// The version of a host file's contents: ctime (nanoseconds) and size. Every change to the
+    /// contents (write, truncate, fallocate…) sets ctime to the current time on the host, and
+    /// utimensat cannot set it back, so two equal versions mean no change in between. Host
+    /// timestamps come from a coarse clock, and when ctime is too close to now a change right
+    /// after may get the same ctime, so no version is given then; nor for files that have had a
+    /// writable shared mapping.
     #[allow(clippy::unnecessary_cast)]
     pub(super) fn version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
         const RACY_NS: i128 = 2_000_000_000;
@@ -1121,18 +1212,19 @@ mod content {
     }
 }
 
-/// 丢弃一段私有匿名宿主内存的内容：整页交给宿主回收，宿主页比 4K 大时两头不满一页
-/// 的部分清零。原来全部清零，Go、JVM、V8 的 GC 归还内存时反而把这些页都碰了一遍。
+/// Discards the contents of private anonymous host memory: whole pages go back to the host, and
+/// when host pages are larger than 4K the partial pages at both ends are zeroed. It used to zero
+/// everything, so the GCs of Go, the JVM and V8 touched every page they were giving back.
 ///
 /// # Safety
 ///
-/// `[ptr, ptr + len)` 是 [`Mm`] 持有的、私有的匿名宿主内存。
+/// `[ptr, ptr + len)` is private anonymous host memory held by an [`Mm`].
 unsafe fn discard_host(ptr: NonNull<u8>, len: usize) {
     let page = appine_hal::page_size();
     let addr = ptr.as_ptr() as usize;
     let head = (addr.next_multiple_of(page) - addr).min(len);
     let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
-    // SAFETY: 偏移都在 [0, len] 里；[head, tail) 按宿主页对齐
+    // SAFETY: all offsets are in [0, len]; [head, tail) is aligned to host pages
     unsafe {
         if head < tail && appine_hal::discard(ptr.add(head), tail - head).is_ok() {
             std::ptr::write_bytes(ptr.as_ptr(), 0, head);
@@ -1151,7 +1243,7 @@ fn map_err(e: MapError) -> Errno {
 }
 
 impl Mm {
-    /// 创建空地址空间。
+    /// Creates an empty address space.
     pub fn new() -> Self {
         Mm {
             mmu: ManuallyDrop::new(Mmu::new()),
@@ -1191,13 +1283,14 @@ impl Mm {
         }
     }
 
-    /// 与别的地址空间共用只读文件映射（[`FileMaps`]）。
+    /// Shares read-only file mappings with other address spaces ([`FileMaps`]).
     pub fn share_files(&mut self, files: &FileMaps) {
         self.files = files.clone();
     }
 
-    /// 放进 `Rc<RefCell<..>>`（`TaskState` 持有的形式），记下自己的句柄：借用方还回最后
-    /// 一个借用时经由它让拥有者恢复写权限。
+    /// Puts it into an `Rc<RefCell<..>>` (the form `TaskState` holds) and records its own handle:
+    /// when a borrower returns the last borrow, it lets the owner restore write permission through
+    /// it.
     pub fn into_shared(self) -> Rc<RefCell<Mm>> {
         Rc::new_cyclic(|me| {
             let mut mm = self;
@@ -1206,10 +1299,11 @@ impl Mm {
         })
     }
 
-    /// 按栈大小的上限 `stack_limit`（execve 时的 `RLIMIT_STACK`）定下 mmap 分配区的
-    /// 上界，与 Linux 的 `mmap_base` 一样给栈留出这么大的间隔，再加上
-    /// [`STACK_GUARD_GAP`]，并限制在 [`MIN_GAP`] 和 [`MAX_GAP`] 之间。不限时，Linux
-    /// 改为自底向上分配（legacy 布局），这里仍然自顶向下，间隔取 [`MAX_GAP`]。
+    /// Sets the upper bound of the mmap area from the stack size limit `stack_limit` (the
+    /// `RLIMIT_STACK` at execve): like Linux's `mmap_base`, it leaves a gap that large for the
+    /// stack plus [`STACK_GUARD_GAP`], clamped between [`MIN_GAP`] and [`MAX_GAP`]. When the limit
+    /// is unlimited Linux switches to bottom-up allocation (the legacy layout); here allocation
+    /// stays top-down with a gap of [`MAX_GAP`].
     pub fn set_layout(&mut self, stack_limit: u64) {
         let gap = stack_limit
             .saturating_add(STACK_GUARD_GAP)
@@ -1217,23 +1311,25 @@ impl Mm {
         self.mmap_top = (STACK_TOP - gap) & !(PAGE_SIZE - 1);
     }
 
-    /// 该地址空间的软件页表。
+    /// This address space's software page table.
     pub fn mmu(&self) -> &Mmu {
         &self.mmu
     }
 
-    /// 可以写（现在可写，或者以后可以 mprotect 成可写）的共享文件映射所在的范围：那里的
-    /// futex 以文件和偏移为键（[`Mm::futex_key`]），按宿主地址算键的不持 BKL 的 futex
-    /// （`syscall::fast`，它只处理可写的页）要避开。只读打开的文件的共享映射不算：Go 的
-    /// 工具链用它读文件，又在每个进程里可写地共享映射一个遥测计数文件，所以按范围记。
-    /// 新建、搬动这种映射之后重新统计（[`Mm::note_shared_files`]）；拆掉的不必马上去掉，
-    /// 只是那里的 futex 走持锁的路径。
+    /// Ranges of shared file mappings that can be written (writable now, or can be mprotected
+    /// writable later): futexes there are keyed by file and offset ([`Mm::futex_key`]), so the
+    /// no-BKL futex keyed by host address (`syscall::fast`, which handles only writable pages)
+    /// must avoid them. Shared mappings of files opened read-only do not count: Go's toolchain
+    /// reads files through them and also maps a telemetry counter file shared and writable in
+    /// every process, hence tracking by range. Recounted after such a mapping is created or moved
+    /// ([`Mm::note_shared_files`]); torn-down ones need not be removed at once, it only means
+    /// futexes there take the locked path.
     pub fn shared_files(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
         self.shared_files.clone()
     }
 
-    /// 按现在的映射重新统计 [`Mm::shared_files`]。`moved` 时只在有这种映射时才统计
-    /// （mremap 之后：搬动、扩展的可能是它们）。
+    /// Recounts [`Mm::shared_files`] from the current mappings. With `moved`, only when such
+    /// mappings exist (after mremap: the ones moved or grown may be among them).
     pub fn note_shared_files(&self, moved: bool) {
         let mut ranges = self
             .shared_files
@@ -1250,15 +1346,16 @@ impl Mm {
             .collect();
     }
 
-    /// `addr` 处 futex 的键；没有映射时返回 None。
+    /// The key of the futex at `addr`; None when nothing is mapped there.
     pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
-        // 私有内存的键是宿主地址：借来的页先换成自己的，否则写时复制之后键就变了，等在
-        // 旧键上的线程再也叫不醒；也不会和拥有者那边的键相同
+        // The key of private memory is its host address: a borrowed page is first replaced by our
+        // own, or the key would change after copy-on-write and threads waiting on the old key
+        // could never be woken; this also keeps it from matching the key on the owner's side
         let page = addr & !(PAGE_SIZE - 1);
         if self.cow.borrow().borrowed.contains_key(&page) {
             self.materialize(page, true);
         }
-        // 与 Linux 相同，futex 的地址必须可读
+        // As on Linux, the futex address must be readable
         let host = self.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
         Some(match v.file_id {
@@ -1271,16 +1368,18 @@ impl Mm {
         })
     }
 
-    /// 这个地址空间的 Tier 1 翻译，没有时创建；宿主不支持 Tier 1 时返回 None。同一个程序
-    /// 的别的地址空间映射得一致时与它们共用（[`CodeGroup`]）；否则优先拿回池里同一个程序
-    /// （按可执行文件的 inode）留下的翻译，它在第一次运行之前逐块核对。
+    /// This address space's Tier 1 translations, created if missing; None when the host does not
+    /// support Tier 1. Shared with other address spaces of the same program that map consistently
+    /// ([`CodeGroup`]); otherwise the translations the same program (by executable inode) left in
+    /// the pool are preferred, and they are checked block by block before their first run.
     pub fn code_space(&mut self, groups: &CodeGroups) -> Option<Arc<CodeSpace>> {
         if self.code_space.is_none() {
             let space = match self.join_group(groups) {
                 Some(space) => space,
                 None => {
                     let space = appine_engine::DbtSpace::new(self.exe.unwrap_or(0), self.dbt_regs)?;
-                    // 从池里拿到上一个使用者留下的翻译时，同一个版本的程序文件里的块不必再核对
+                    // With translations a previous user left in the pool, blocks in program files
+                    // of the same version need no further check
                     space.trust(&self.code_sources());
                     self.found_group(groups, &space);
                     space
@@ -1295,7 +1394,7 @@ impl Mm {
         self.code_space.clone()
     }
 
-    /// 加入同一个程序的、映射一致的组，返回它的翻译。
+    /// Joins a consistently mapped group of the same program and returns its translations.
     fn join_group(&mut self, groups: &CodeGroups) -> Option<Arc<appine_engine::DbtSpace>> {
         let key = self.exe.filter(|_| !self.unshareable)?;
         let (layout, private) = self.exec_split();
@@ -1307,7 +1406,7 @@ impl Mm {
             .collect();
         for group in candidates {
             let Some(tag) = group.space.new_tag() else {
-                // 标签用完了：不再接受新成员，之后的进程另开一组
+                // Out of tags: accept no new members; later processes start another group
                 group.closed.set(true);
                 continue;
             };
@@ -1315,7 +1414,8 @@ impl Mm {
                 continue;
             }
             group.members.set(group.members.get() + 1);
-            // 原来只有一个成员：它从池里拿到的翻译可能还有只对它有效的块（上一个使用者留下的）
+            // There was only one member: the translations it took from the pool may still hold
+            // blocks valid only for it (left by the previous user)
             if !group.shared.replace(true) {
                 group.space.retire_outside(&group.ranges.borrow());
             }
@@ -1327,7 +1427,8 @@ impl Mm {
         None
     }
 
-    /// 刚创建了自己的翻译：开一个组，等同一个程序的别的地址空间来加入。
+    /// Just created its own translations: opens a group for other address spaces of the same
+    /// program to join.
     fn found_group(&mut self, groups: &CodeGroups, space: &Arc<appine_engine::DbtSpace>) {
         let Some(key) = self.exe.filter(|_| !self.unshareable) else {
             return;
@@ -1357,11 +1458,13 @@ impl Mm {
         self.code_tag = tag;
     }
 
-    /// 一个可执行的映射能不能和别的地址空间共用翻译：能时返回它的身份。可信的是没写过、
-    /// 有版本的私有文件映射，和没被改过的 vDSO（每个进程的都一样）。
+    /// Whether an executable mapping can share translations with other address spaces: if so,
+    /// returns its identity. Trusted are private file mappings that were never written and have a
+    /// version, and an unmodified vDSO (the same in every process).
     fn exec_source(&self, start: u64, v: &Vma) -> Option<appine_engine::DbtSource> {
         if start == self.vdso && v.backing == Backing::Anonymous {
-            // 经由页表读：fork 出来的子进程的页借自父进程，它自己的宿主内存还是零
+            // Read through the page table: a forked child's pages are borrowed from the parent and
+            // its own host memory is still zero
             let image = crate::vdso::image();
             let mut bytes = vec![0; image.len()];
             let read = self.read(UserSlice::new(start, image.len()), &mut bytes);
@@ -1382,8 +1485,8 @@ impl Mm {
         })
     }
 
-    /// 全部可执行映射：可信的身份（[`Mm::exec_source`]），和其余的范围 `[起点, 终点)`（JIT
-    /// 生成的、写过的代码，相接的合并成一段）。
+    /// All executable mappings: the trusted identities ([`Mm::exec_source`]) and the remaining
+    /// ranges `[start, end)` (JIT output, code that was written; adjacent ones merged).
     fn exec_split(&self) -> (Vec<appine_engine::DbtSource>, Vec<(u64, u64)>) {
         let (mut trusted, mut private) = (Vec::new(), Vec::<(u64, u64)>::new());
         for (&start, v) in self.vmas.iter().filter(|(_, v)| v.prot & prot::EXEC != 0) {
@@ -1398,7 +1501,8 @@ impl Mm {
         (trusted, private)
     }
 
-    /// 可执行映射变了之后与组里登记的核对（[`CodeGroup`]），不一致时离开组。
+    /// Checks against the group's registration after the executable mappings changed
+    /// ([`CodeGroup`]); leaves the group when they disagree.
     fn check_code_group(&mut self) {
         if !std::mem::take(&mut self.exec_changed) {
             return;
@@ -1421,25 +1525,30 @@ impl Mm {
         self.code_group = None;
         self.code_tag = 0;
         if group.members.get() == 1 {
-            // 只有它自己：留着原来的翻译，组不再接受新成员。登记过的映射里有别的成员（已经
-            // 退出、离开了的）翻译的块，它在同一段地址上映射的是别的文件（离开正是因为这个）：
-            // 那里的块作废，只留下与它的映射一致的
+            // Only itself: keep the existing translations and accept no new members. The
+            // registered mappings hold blocks translated by other members (who exited or left),
+            // and at the same addresses it maps different files (that is exactly why it leaves):
+            // invalidate those blocks and keep only the ones consistent with its mappings
             group.closed.set(true);
             group.space.retire_outside(&group.consistent(&layout));
             return;
         }
         group.members.set(group.members.get() - 1);
-        // 换用自己的翻译。别的线程可能正在执行组里的翻译，打断它们（[`Mm::sync`] 的
-        // shootdown），重新进入 guest 代码之前看到新的代数就换过来
+        // Switch to translations of its own. Other threads may be running the group's translations:
+        // kick them (the shootdown of [`Mm::sync`]); they see the new generation and switch before
+        // re-entering guest code
         self.code_space = None;
         self.space_generation.fetch_add(1, Ordering::SeqCst);
         self.dirty = true;
     }
 
-    /// 内容由文件和版本就能确定的可执行映射（[`appine_engine::DbtSource`]）：没写过、
-    /// 有可信版本（[`content::version`]）的私有文件映射。翻译放回池里之前记下它们，下一个
-    /// 使用者的同一段映射是同一个版本的同一段文件时，里面的块不必逐块核对（核对要把程序
-    /// 和动态链接器的代码段每一页都读一遍，shell 每起一个进程都要做）。
+    /// Executable mappings whose contents are determined by the file and version
+    /// ([`appine_engine::DbtSource`]): private file mappings never written that have a trusted
+    /// version ([`content::version`]). They are recorded before the translations go back to the
+    /// pool, and when the next user's mapping at the same place is the same piece of the same
+    /// version of the file, the blocks in it need no block-by-block check (which reads every
+    /// page of the program's and the dynamic linker's code segments, every time the shell spawns
+    /// a process).
     fn code_sources(&self) -> Vec<appine_engine::DbtSource> {
         self.vmas
             .iter()
@@ -1458,7 +1567,7 @@ impl Mm {
             .collect()
     }
 
-    /// shootdown 的代数、代码的代数和代码失效的记录（[`Mm::sync`]）。
+    /// The shootdown generation, the code generation and the code-change log ([`Mm::sync`]).
     pub fn generations(&self) -> Generations {
         Generations {
             tlb: self.generation.clone(),
@@ -1468,31 +1577,33 @@ impl Mm {
         }
     }
 
-    /// guest 修改了 `[start, start + len)` 里的代码（`ic ivau`），在下一次 [`Mm::sync`]
-    /// 时作废这里的翻译。
+    /// The guest modified the code in `[start, start + len)` (`ic ivau`); the translations there
+    /// are invalidated at the next [`Mm::sync`].
     pub fn invalidate_code(&mut self, start: u64, len: u64) {
         self.code_ranges.push((start, len));
     }
 
-    /// 登记一个开始使用这个地址空间的线程。
+    /// Registers a thread that starts using this address space.
     pub fn add_user(&mut self, user: Arc<TaskSync>) {
         self.users.push(user);
     }
 
-    /// 注销一个不再使用这个地址空间的线程（退出或 execve）。
+    /// Unregisters a thread that no longer uses this address space (exit or execve).
     pub fn remove_user(&mut self, user: &Arc<TaskSync>) {
         self.users.retain(|u| !Arc::ptr_eq(u, user));
     }
 
-    /// 是否还有别的线程在使用这个地址空间。
+    /// Whether other threads still use this address space.
     pub fn shared_with_others(&self) -> bool {
         self.users.len() > 1
     }
 
-    /// 如果有映射被拆除或降低了权限，做一次 TLB shootdown，然后释放被解除映射的宿主内存；
-    /// 只有代码要作废时只记下范围、改代数。
+    /// If mappings were torn down or lost permissions, does a TLB shootdown and then releases the
+    /// unmapped host memory; when only code must be invalidated, it only records the ranges and
+    /// bumps the generation.
     ///
-    /// 调用方持有 BKL；`current` 是调用线程，它自己在重新进入 guest 代码之前刷新。
+    /// The caller holds the BKL; `current` is the calling thread, which flushes by itself before
+    /// re-entering guest code.
     pub fn sync(&mut self, current: &Arc<TaskSync>) {
         self.check_code_group();
         let code = std::mem::take(&mut self.code_ranges);
@@ -1500,19 +1611,23 @@ impl Mm {
         if !dirty && code.is_empty() {
             return;
         }
-        // 先记下范围、再改代数：读到新代数的使用者一定能找到对应的范围。SeqCst 与使用者
-        // 那边"先标记在执行 guest 代码、再读代数"配对：要么它读到新的代数，要么这里看到
-        // 它正在执行，等它被打断后退出
+        // Record the ranges before bumping the generation: a user that reads the new generation
+        // is sure to find its ranges. SeqCst pairs with the user's "mark running guest code, then
+        // read the generation": either it reads the new generation, or this side sees it running
+        // and waits until it has been kicked and left
         if !code.is_empty() {
             let generation = self.code_generation.load(Ordering::Relaxed) + 1;
             self.code_log.lock().unwrap().push(generation, &code);
             self.code_generation.store(generation, Ordering::SeqCst);
         }
         if !dirty && self.graveyard.is_empty() {
-            // 只有代码变了（JIT 的 ic ivau）：翻译由这个地址空间的线程共用，改代码的线程
-            // 重新进入 guest 代码之前作废一次，作废块的入口就跳往转发桩了，其他使用者不必
-            // 打断。在那之前它们可能还执行旧的翻译，与硬件上别的核在上下文同步之前可能还执行
-            // 旧指令一样。要等的是 membarrier 的 SYNC_CORE（它调用 quiesce）
+            // Only code changed (a JIT's ic ivau): the translations are shared by this address
+            // space's threads, and the thread that changed the code invalidates once before
+            // re-entering guest code, after which the invalidated blocks' entries jump to the
+            // forwarding stub, so other users need not be kicked. Until then they may still run
+            // the old translations, just as other cores on hardware may still run old
+            // instructions before context synchronization. Waiting is what membarrier's SYNC_CORE
+            // (which calls quiesce) is for
             return;
         }
         if dirty {
@@ -1522,13 +1637,13 @@ impl Mm {
         self.graveyard.clear();
     }
 
-    /// 打断其他正在执行 guest 代码的使用者，等它们全部退出。它们接下来要获取 BKL，
-    /// 而调用方正持有 BKL，所以在调用方释放 BKL 之前，这个地址空间里不会再执行
-    /// guest 代码（fork 据此复制出一致的内存快照）。
+    /// Kicks the other users running guest code and waits until all have left. They next take the
+    /// BKL, which the caller holds, so no guest code runs in this address space until the caller
+    /// releases the BKL (fork relies on this for a consistent snapshot of memory).
     pub fn quiesce(&self, current: &Arc<TaskSync>) {
         let others = self.users.iter().filter(|u| !Arc::ptr_eq(u, current));
         for user in others.clone() {
-            // SAFETY: 线程在销毁自己的 Cpu 之前（持有 BKL）从 users 里注销
+            // SAFETY: a thread unregisters from users (holding the BKL) before destroying its Cpu
             unsafe { user.kicker.kick() };
         }
         for user in others {
@@ -1538,16 +1653,16 @@ impl Mm {
         }
     }
 
-    /// `[start, start + len)` 是否完全空闲。
+    /// Whether `[start, start + len)` is entirely free.
     fn is_free(&self, start: u64, len: u64) -> bool {
-        // 起点在区间终点之前的最后一个 VMA 不能伸进区间
+        // The last VMA starting before the end of the range must not reach into the range
         self.vmas
             .range(..start + len)
             .next_back()
             .is_none_or(|(&s, v)| s + v.len <= start)
     }
 
-    /// 自顶向下找一段长度为 `len` 的空闲区间。
+    /// Finds a free range of length `len`, top down.
     pub fn find_free(&self, len: u64) -> Option<u64> {
         let mut top = self.mmap_top;
         for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
@@ -1560,13 +1675,17 @@ impl Mm {
         (top >= MMAP_MIN + len).then(|| top - len)
     }
 
-    /// 把 VMA 的一段放进页表。`PROT_NONE` 的不放：V8、JVM 预留的大片地址空间逐页写
-    /// 页表很占内存（8 GB 要 16 MB），mprotect 加上权限时再放（[`Mm::mprotect`]）。
-    /// 给 VMA 自己的宿主内存 `[host, host + len)` 在 `[start, start + len)` 建页表项，已有的
-    /// 表项（写时复制改过的、mprotect 留下的权限为 0 的）不动。`PROT_NONE` 的不建；大于
-    /// [`EAGER_MAX`] 的也不建，等访问时按需建（[`Mm::fault_in`]），只有文件的可执行映射
-    /// 照样建好：翻译共用时按页表核对 guest 指令字（DBT 的 recheck），没有表项的块要停放、
-    /// 第一次执行时再一页页恢复。它的大小受文件大小限制。
+    /// Puts part of a VMA into the page table. `PROT_NONE` is left out: writing entries page by
+    /// page for the large address ranges V8 and the JVM reserve takes a lot of memory (16 MB for
+    /// 8 GB), so they are added when mprotect grants permissions ([`Mm::mprotect`]).
+    /// Builds entries for the VMA's own host memory `[host, host + len)` at
+    /// `[start, start + len)`, leaving existing entries alone (those changed by copy-on-write, or
+    /// kept by mprotect with permission 0). `PROT_NONE` gets none; neither does anything over
+    /// [`EAGER_MAX`], which is filled on demand at access ([`Mm::fault_in`]), except executable
+    /// file mappings, which are built anyway: when translations are shared, guest instruction
+    /// words are checked against the page table (the DBT's recheck), and blocks without entries
+    /// must be parked and restored page by page on first execution. Their size is bounded by the
+    /// file size.
     fn map_pages(
         mmu: &mut Mmu,
         start: u64,
@@ -1581,7 +1700,8 @@ impl Mm {
         if len > EAGER_MAX && !(file && prot & prot::EXEC != 0) {
             return Ok(());
         }
-        // SAFETY: 宿主内存由 VMA 持有，生命周期不短于页表里的映射
+        // SAFETY: the VMA holds the host memory, which lives at least as long as the mapping in
+        // the page table
         if let Err(e) = unsafe { mmu.fill_shared(start, host, len, mmu_prot(prot)) } {
             let _ = mmu.unmap(start, len);
             return Err(map_err(e));
@@ -1589,11 +1709,13 @@ impl Mm {
         Ok(())
     }
 
-    /// 按需建表（[`EAGER_MAX`]）：guest 访问 `addr` 出错、内核层读写它时调用。这一页还没有
-    /// 表项，所在的 VMA 允许这次访问（`need`）时，把同一张叶子表（2 MB）里属于这个 VMA、
-    /// 还没有表项的页一起建好，返回 true，重新访问即可。文件映射超出文件末尾的页不建
-    /// （[`Mm::fault_past_eof`]）。只要共享借用：内核层读写别的进程的内存（ptrace、
-    /// process_vm_readv）时也会调用，只增加表项，不必刷新 TLB。
+    /// On-demand filling ([`EAGER_MAX`]): called when a guest access to `addr` faults, or when the
+    /// kernel layer reads or writes it. If the page has no entry yet and its VMA allows the access
+    /// (`need`), builds the entries of every page in the same leaf table (2 MB) that belongs to
+    /// this VMA and has none yet, and returns true; retrying the access then works. Pages of a
+    /// file mapping past the end of the file get none ([`Mm::fault_past_eof`]). Needs only a
+    /// shared borrow: it is also called when the kernel layer reads or writes another process's
+    /// memory (ptrace, process_vm_readv), and it only adds entries, so no TLB flush is needed.
     pub fn fault_in(&self, addr: u64, need: u32) -> bool {
         let page = addr & !(PAGE_SIZE - 1);
         let Some((&s, v)) = self.vmas.range(..=page).next_back() else {
@@ -1609,27 +1731,31 @@ impl Mm {
         }
         let lo = (page & !(LEAF_SPAN - 1)).max(s);
         let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
-        // SAFETY: [lo, hi) 在这个 VMA 有内容的部分里，宿主内存由它持有
+        // SAFETY: [lo, hi) is inside the part of this VMA with contents, and it holds the host
+        // memory
         let host = unsafe { v.host.add((lo - s) as usize) };
         unsafe { self.mmu.fill_shared(lo, host, hi - lo, p) }.is_ok()
     }
 
-    /// 私有匿名 VMA `start` 里可能有内容、可能驻留的范围（guest 地址），按地址排好，每段
-    /// 不超过 [`WINDOW_MAX`]：fork 借页（[`Mm::lend`]）、量驻留内存时只看这些，几 TB 的
-    /// 映射里只碰过几页时不必逐页查。
+    /// The ranges (guest addresses) of private anonymous VMA `start` that may have contents and may
+    /// be resident, sorted by address, each at most [`WINDOW_MAX`]: fork's lending
+    /// ([`Mm::lend`]) and resident-memory measurement look only at these, so a mapping of several
+    /// TB with only a few pages touched need not be checked page by page.
     ///
-    /// 依据是这条规则：私有匿名内存里有内容的页一定有表项。guest 访问、内核层经由页表读写
-    /// 都会先建表（[`Mm::fault_in`]）；内核层直接写宿主内存（[`Mm::write_kernel`]）、调入
-    /// （[`Mm::populate`]）时也补上；mprotect 成 `PROT_NONE` 时表项留着、权限清零；mremap
-    /// 搬动时表项一起搬（[`Mm::move_range`]）。写时复制的页也算进来（借来的页在
-    /// `PROT_NONE` 的 VMA 里没有表项）。所以给出的是有表项的叶子表（2 MB）连成的几段。
+    /// It rests on this rule: every page of private anonymous memory with contents has an entry.
+    /// Guest accesses and kernel-layer reads and writes through the page table fill the entries
+    /// first ([`Mm::fault_in`]); the kernel layer writing host memory directly
+    /// ([`Mm::write_kernel`]) or populating it ([`Mm::populate`]) fills them too; mprotect to
+    /// `PROT_NONE` keeps the entries with permissions cleared; mremap moves the entries along
+    /// ([`Mm::move_range`]). Copy-on-write pages count as well (borrowed pages in a `PROT_NONE`
+    /// VMA have no entries). So the result is the runs of leaf tables (2 MB) that have entries.
     fn touched_windows(&self, start: u64) -> Vec<(u64, u64)> {
         let v = &self.vmas[&start];
         let end = start + v.len;
         let cow = self.cow.borrow();
         let mut lent = cow.lent.range(start..end).copied().peekable();
         let mut borrowed = cow.borrowed.range(start..end).map(|(&p, _)| p).peekable();
-        // 下一个要看的页：有表项的、写时复制的，取最前面的
+        // The next page to look at: the earliest that has an entry or is copy-on-write
         let mut next = |from: u64| {
             while lent.next_if(|&p| p < from).is_some() {}
             while borrowed.next_if(|&p| p < from).is_some() {}
@@ -1655,9 +1781,10 @@ impl Mm {
         out
     }
 
-    /// 把一段宿主内存映射到 `[start, start + len)`；调用方保证区间空闲。文件映射的
-    /// `file_len` 是文件末尾之前的字节数（[`Vma::file_len`]），只给这一部分建表项：小文件
-    /// 以可执行权限映射成很大一段时，页表也只有文件那么大。
+    /// Maps a piece of host memory at `[start, start + len)`; the caller guarantees the range is
+    /// free. For file mappings `file_len` is the number of bytes before the end of the file
+    /// ([`Vma::file_len`]), and only that part gets entries: when a small file is mapped
+    /// executable over a large range, the page table is only as large as the file.
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
@@ -1702,7 +1829,7 @@ impl Mm {
         Ok(())
     }
 
-    /// 还能不能再多 `more` 个 VMA（`vm.max_map_count`）。
+    /// Whether there is room for `more` more VMAs (`vm.max_map_count`).
     fn room_for(&self, more: usize) -> Result<(), Errno> {
         if self.vmas.len() + more > MAX_MAP_COUNT.load(Ordering::Relaxed) {
             return Err(Errno::ENOMEM);
@@ -1710,7 +1837,7 @@ impl Mm {
         Ok(())
     }
 
-    /// 在这些地址上拆开 VMA 要多出几个。
+    /// How many more VMAs splitting at these addresses makes.
     fn splits(&self, addrs: &[u64]) -> usize {
         addrs
             .iter()
@@ -1723,7 +1850,7 @@ impl Mm {
             .count()
     }
 
-    /// 把一个完整的 VMA 放到 `start`；调用方保证区间空闲。
+    /// Puts a whole VMA at `start`; the caller guarantees the range is free.
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         self.room_for(1)?;
         let file = v.backing != Backing::Anonymous;
@@ -1733,9 +1860,10 @@ impl Mm {
         Ok(())
     }
 
-    /// guest 访问 `addr` 出错时调用。地址落在文件映射超出文件末尾的部分时返回
-    /// `Some(true)`，应当发 SIGBUS；共享映射的文件后来变长了，就把新的内容映射进来，
-    /// 返回 `Some(false)`，重新执行那条指令即可。其余情况返回 None。
+    /// Called when a guest access to `addr` faults. Returns `Some(true)` if the address is in the
+    /// part of a file mapping past the end of the file, which should raise SIGBUS; if the file of
+    /// a shared mapping has grown since, maps the new contents and returns `Some(false)`, and the
+    /// instruction can simply be re-executed. Returns None otherwise.
     pub fn fault_past_eof(&mut self, addr: u64) -> Option<bool> {
         let (&s, v) = self.vmas.range(..=addr).next_back()?;
         if addr >= s + v.len || addr < s + v.file_len {
@@ -1745,7 +1873,8 @@ impl Mm {
             let extent = file_extent(std::os::fd::AsRawFd::as_raw_fd(&**fd), *offset, v.len);
             if addr < s + extent {
                 let (from, prot) = (v.file_len, v.prot);
-                // SAFETY: 宿主映射覆盖整个 VMA，[from, extent) 现在有文件内容
+                // SAFETY: the host mapping covers the whole VMA, and [from, extent) now has file
+                // contents
                 let host = unsafe { v.host.add(from as usize) };
                 Self::map_pages(&mut self.mmu, s + from, host, extent - from, prot, true).ok()?;
                 self.vmas.get_mut(&s).unwrap().file_len = extent;
@@ -1755,10 +1884,11 @@ impl Mm {
         Some(true)
     }
 
-    /// 新的匿名宿主内存。宿主内存总是可读写（guest 的权限由页表管），所以 `reserve`
-    /// 按 Linux 的提交量规则由调用方决定：只有可写的私有映射计入，`MAP_NORESERVE`、
-    /// 只读和 `PROT_NONE` 的不计入。V8 为每块 wasm 内存预留 8 GB 的 `PROT_NONE`，
-    /// 计入的话在内存小的宿主上直接失败。
+    /// New anonymous host memory. Host memory is always readable and writable (the page table
+    /// carries the guest permissions), so the caller decides `reserve` by Linux's commit rules:
+    /// only writable private mappings are accounted, while `MAP_NORESERVE`, read-only and
+    /// `PROT_NONE` ones are not. V8 reserves 8 GB of `PROT_NONE` for every wasm memory, which
+    /// would fail outright on hosts with little memory if it were accounted.
     fn new_anonymous(len: u64, reserve: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
         let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
         let base = match recycled::take(host_len, reserve) {
@@ -1776,8 +1906,9 @@ impl Mm {
         ))
     }
 
-    /// 新的私有匿名映射的宿主内存：`PROT_NONE` 的只是预留，不占宿主的地址空间
-    /// （[`HostRegion::reserved`]），其余同 [`Mm::new_anonymous`]。
+    /// Host memory for a new private anonymous mapping: a `PROT_NONE` one is only a reservation
+    /// and takes no host address space ([`HostRegion::reserved`]); the rest as
+    /// [`Mm::new_anonymous`].
     fn private_anonymous(
         len: u64,
         prot: u32,
@@ -1791,9 +1922,11 @@ impl Mm {
         Self::new_anonymous(len, reserve)
     }
 
-    /// 预留的 VMA `start`（[`HostRegion::reserved`]）换上自己的宿主内存（全零），之后与普通
-    /// 的私有匿名映射一样。它没有表项，不用改页表。预留的往往有几百 GB，调用方先把要用的
-    /// 那一段拆出来。`reserve` 是计不计入宿主的提交量（[`Mm::new_anonymous`]）。
+    /// Gives reserved VMA `start` ([`HostRegion::reserved`]) its own host memory (all zero), after
+    /// which it behaves like an ordinary private anonymous mapping. It has no entries, so the page
+    /// table needs no change. Reservations are often hundreds of GB, so the caller first splits off
+    /// the piece it needs. `reserve` is whether it is counted in the host commit
+    /// ([`Mm::new_anonymous`]).
     fn back_reserved(&mut self, start: u64, reserve: bool) -> Result<(), Errno> {
         let v = &self.vmas[&start];
         if !v.reserved() {
@@ -1806,7 +1939,8 @@ impl Mm {
         Ok(())
     }
 
-    /// 在固定地址建立清零的匿名映射（加载器使用），区间必须空闲。
+    /// Creates a zeroed anonymous mapping at a fixed address (used by the loader); the range must
+    /// be free.
     pub fn map_anonymous(&mut self, start: u64, len: u64, prot: u32) -> Result<(), Errno> {
         if !start.is_multiple_of(PAGE_SIZE) || len == 0 || !len.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
@@ -1827,23 +1961,25 @@ impl Mm {
         )
     }
 
-    /// 把从 `start` 开始的映射标记为向下增长（`MAP_GROWSDOWN` 的私有匿名映射）。
+    /// Marks the mapping starting at `start` as growing downwards (a private anonymous mapping
+    /// with `MAP_GROWSDOWN`).
     pub fn set_growsdown(&mut self, start: u64) {
         if let Some(v) = self.vmas.get_mut(&start) {
             v.growsdown = true;
         }
     }
 
-    /// 映射主线程的初始栈 `[STACK_TOP - len, STACK_TOP)`（加载器使用）：可读写，向下增长。
-    /// 宿主内存在它下面预留到一共 `reserve` 字节（不碰不占内存），栈在这个范围里增长时
-    /// 只是就地加长同一个 VMA。
+    /// Maps the main thread's initial stack `[STACK_TOP - len, STACK_TOP)` (used by the loader):
+    /// readable and writable, growing downwards. Host memory is reserved below it up to `reserve`
+    /// bytes in all (taking no memory until touched), and while the stack grows within that range
+    /// the same VMA is only lengthened in place.
     pub fn map_stack(&mut self, len: u64, reserve: u64) -> Result<(), Errno> {
         let start = STACK_TOP - len;
         if !self.is_free(start, len) {
             return Err(Errno::EEXIST);
         }
         let (region, base) = Self::new_anonymous(reserve.max(len), false)?;
-        // SAFETY: 这段宿主内存至少有 len 字节
+        // SAFETY: this host memory is at least len bytes
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
         let rw = prot::READ | prot::WRITE;
         self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)?;
@@ -1852,20 +1988,23 @@ impl Mm {
         Ok(())
     }
 
-    /// 主线程栈目前的底部；还没有栈时是 0。
+    /// The current bottom of the main thread's stack; 0 while there is no stack.
     pub fn stack_low(&self) -> u64 {
         self.stack_low
     }
 
-    /// 访问没有映射的 `addr`（guest 的访存出错，或者内核访问 guest 内存之前）时调用：
-    /// 它上面紧挨着的是向下增长的映射（主线程栈、`MAP_GROWSDOWN`）时，把映射延伸到
-    /// `addr` 所在的页，返回 true。与 Linux 的 `expand_downwards` 一样，延伸之后与下面
-    /// 那个可访问的映射之间要留出 [`STACK_GUARD_GAP`]，大小不能超过 `limit`
-    /// （`RLIMIT_STACK` 的当前值），否则不增长（guest 收到 SIGSEGV，内核访问得到 EFAULT）。
+    /// Called on an access to unmapped `addr` (a guest access fault, or before the kernel accesses
+    /// guest memory): if the mapping right above it grows downwards (the main thread's stack,
+    /// `MAP_GROWSDOWN`), extends the mapping to the page of `addr` and returns true. As with
+    /// Linux's `expand_downwards`, after the extension a gap of [`STACK_GUARD_GAP`] must remain
+    /// to the accessible mapping below, and the size may not exceed `limit` (the current
+    /// `RLIMIT_STACK`); otherwise it does not grow (the guest gets SIGSEGV, a kernel access gets
+    /// EFAULT).
     ///
-    /// 宿主内存下面还有预留的空间时就地加长这个 VMA。没有时另外申请一段，长出来的部分
-    /// 是一个新的 VMA，宿主内存在它下面预留到与栈现在的大小相同：栈越长，VMA 的个数只按
-    /// 对数增加。
+    /// If there is reserved room below its host memory, the VMA is lengthened in place. Otherwise
+    /// another piece is allocated: the grown part is a new VMA whose host memory reserves room
+    /// below it as large as the current stack, so the number of VMAs grows only logarithmically
+    /// with the stack.
     pub fn grow_down(&mut self, addr: u64, limit: u64) -> bool {
         let page = addr & !(PAGE_SIZE - 1);
         if page < MMAP_MIN || self.is_mapped(addr) {
@@ -1885,7 +2024,8 @@ impl Mm {
         {
             return false;
         }
-        // 只是因为宿主内存不连续才分开的几个 VMA，在 Linux 上是同一个
+        // VMAs that are separate only because their host memory is not contiguous are one VMA on
+        // Linux
         let mut end = above;
         for (&s, o) in self.vmas.range(above..) {
             if s != end || !o.growsdown || o.prot != prot {
@@ -1909,8 +2049,9 @@ impl Mm {
         grown
     }
 
-    /// VMA `start` 的宿主内存下面还空着、可以就地向下加长的字节数：同一段宿主内存里
-    /// 别的 VMA（拆开的、被 mremap 搬走的部分）占着的不算。
+    /// Bytes still free below the host memory of VMA `start`, by which it can be lengthened
+    /// downwards in place: parts of the same host memory taken by other VMAs (split off, or moved
+    /// away by mremap) do not count.
     fn spare_below(&self, start: u64) -> u64 {
         let v = &self.vmas[&start];
         let host = v.host.as_ptr() as usize;
@@ -1924,14 +2065,16 @@ impl Mm {
         (host - low) as u64
     }
 
-    /// 向下增长的 VMA `start` 就地往下加长 `grow` 字节，用它的宿主内存下面空着的部分
-    /// （[`Mm::spare_below`]）。
+    /// Lengthens grows-down VMA `start` downwards in place by `grow` bytes, using the free part
+    /// below its host memory ([`Mm::spare_below`]).
     fn extend_down(&mut self, start: u64, grow: u64) -> bool {
         let v = &self.vmas[&start];
         let (page, prot) = (start - grow, v.prot);
-        // SAFETY: v.host 下面至少还有 grow 字节属于同一段宿主内存，没有别的映射在用
+        // SAFETY: at least grow bytes below v.host belong to the same host memory, and no other
+        // mapping uses them
         let host = unsafe { NonNull::new_unchecked(v.host.as_ptr().sub(grow as usize)) };
-        // 栈的下面一段解除映射之后又长回来：以前写过的内容要变回零
+        // The bottom of the stack grows back after being unmapped: what was written before must
+        // read as zero again
         unsafe { discard_host(host, grow as usize) };
         if Self::map_pages(&mut self.mmu, page, host, grow, prot, false).is_err() {
             return false;
@@ -1945,8 +2088,9 @@ impl Mm {
         true
     }
 
-    /// 在 `page` 映射 `grow` 字节的新 VMA，接在上面那个向下增长的 VMA 下面。宿主内存申请
-    /// `reserve` 字节，VMA 放在最上面，下面留着以后就地增长；申请不到时只申请 `grow` 字节。
+    /// Maps a new VMA of `grow` bytes at `page`, just below the grows-down VMA above it. It
+    /// allocates `reserve` bytes of host memory and puts the VMA at the top, leaving the rest below
+    /// for later growth in place; if that cannot be allocated, only `grow` bytes.
     fn new_stack_chunk(
         &mut self,
         page: u64,
@@ -1960,7 +2104,7 @@ impl Mm {
         else {
             return false;
         };
-        // SAFETY: 这段宿主内存至少有 grow 字节
+        // SAFETY: this host memory is at least grow bytes
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - grow as usize)) };
         let anon = Backing::Anonymous;
         if self
@@ -1975,7 +2119,8 @@ impl Mm {
         true
     }
 
-    /// 实现 mmap(2)。`file` 是宿主 fd、文件偏移，以及文件是否以可写方式打开。
+    /// Implements mmap(2). `file` is the host fd, the file offset, and whether the file was opened
+    /// for writing.
     pub fn mmap(
         &mut self,
         addr: u64,
@@ -2016,7 +2161,7 @@ impl Mm {
         };
 
         let st = file.and_then(|(fd, ..)| appine_hal::fstat(fd).ok());
-        // st_dev 在 macOS 上是 i32
+        // st_dev is i32 on macOS
         #[allow(clippy::unnecessary_cast)]
         let file_id = st
             .as_ref()
@@ -2030,13 +2175,14 @@ impl Mm {
             (Some(s), Some((dev, ino, _))) if !shared => content::version(s, dev, ino),
             _ => None,
         };
-        // 宿主映射与别的地址空间共用（FileMaps）
+        // The host mapping is shared with other address spaces (FileMaps)
         let mut cached = false;
         let (backing, may_write, region, host) = match file {
             None => {
                 let reserve =
                     prot & prot::WRITE != 0 && (shared || flags & flags::MAP_NORESERVE == 0);
-                // 向下增长的要在宿主内存里往下长（[`Mm::extend_down`]），不只是预留
+                // A grows-down mapping must grow downwards inside its host memory
+                // ([`Mm::extend_down`]), not just be reserved
                 let (region, host) = if shared || flags & flags::MAP_GROWSDOWN != 0 {
                     Self::new_anonymous(len, reserve)?
                 } else {
@@ -2059,7 +2205,8 @@ impl Mm {
                 } else {
                     Backing::PrivateFile
                 };
-                // 有可信版本的只读私有映射：所有地址空间共用一份宿主映射（FileMaps）
+                // A read-only private mapping with a trusted version: all address spaces share one
+                // host mapping (FileMaps)
                 let key = st
                     .as_ref()
                     .zip(content)
@@ -2100,7 +2247,7 @@ impl Mm {
             None => len,
         };
         let dup = match file {
-            // SAFETY: fd 在这次调用期间一直打开着
+            // SAFETY: fd stays open for the duration of this call
             Some((fd, offset, _)) if shared => Some((
                 Rc::new(
                     unsafe { BorrowedFd::borrow_raw(fd) }
@@ -2124,11 +2271,13 @@ impl Mm {
         Ok(start)
     }
 
-    /// mremap(`MREMAP_DONTUNMAP`)：内容搬到新地址（`fixed` 或者新找一段），原来的地址上
-    /// 留下权限相同、不再锁住的映射。与 Linux 5.13 起一样支持所有映射，原来的地址上
-    /// 相当于丢掉了页表：私有匿名映射变成空的；共享映射（文件或匿名）与新地址共用同
-    /// 一段宿主内存，相当于之后从文件或共享内存重新读进来；私有文件映射空出来，由调用
-    /// 方按返回的 [`Refill`] 重新映射文件。
+    /// mremap(`MREMAP_DONTUNMAP`): the contents move to a new address (`fixed`, or a newly found
+    /// range), and a mapping with the same permissions, no longer locked, stays at the old address.
+    /// Like Linux since 5.13 it supports every mapping, and the old address behaves as if its page
+    /// table were dropped: a private anonymous mapping becomes empty; a shared mapping (file or
+    /// anonymous) shares the same host memory with the new address, as if re-read from the file
+    /// or the shared memory afterwards; a private file mapping is left empty, and the caller maps
+    /// the file again from the returned [`Refill`].
     pub fn mremap_dontunmap(
         &mut self,
         old: u64,
@@ -2177,9 +2326,9 @@ impl Mm {
         Ok((new, refill))
     }
 
-    /// remap_file_pages(2)：与 Linux 4.0 起一样用 mmap 模拟，把 `[start, start + len)`
-    /// 换成同一个文件从 `offset` 开始的内容。区间要落在首尾相接、映射同一个文件、权限
-    /// 相同的共享映射里。
+    /// remap_file_pages(2): emulated with mmap as on Linux since 4.0, replacing
+    /// `[start, start + len)` with the same file's contents from `offset`. The range must lie in
+    /// contiguous shared mappings of the same file with the same permissions.
     pub fn remap_file_pages(&mut self, start: u64, len: u64, offset: u64) -> Result<(), Errno> {
         let end = start
             .checked_add(len)
@@ -2202,7 +2351,7 @@ impl Mm {
             v.ino,
             v.locked,
         );
-        // 同一个文件：按宿主的 (设备号, inode) 比较
+        // The same file: compared by the host (device, inode)
         let id = v.file_id.map(|(d, i, _)| (d, i));
         let mut at = s + v.len;
         while at < end {
@@ -2227,17 +2376,20 @@ impl Mm {
         Ok(())
     }
 
-    /// `addr` 所在的私有文件映射映射的仓库文件的 inode（不是私有文件映射、不知道 inode 时是
-    /// None）：mremap 扩展它之前要打开这个文件（[`Mm::mremap`]）。
+    /// The store inode of the file mapped by the private file mapping at `addr` (None if it is not
+    /// a private file mapping or the inode is unknown): mremap must open this file before growing
+    /// it ([`Mm::mremap`]).
     pub fn private_file_ino(&self, addr: u64) -> Option<u64> {
         let (&s, v) = self.vmas.range(..=addr).next_back()?;
         (addr < s + v.len && v.backing == Backing::PrivateFile && v.ino != 0).then_some(v.ino)
     }
 
-    /// 实现 mremap(2)：`fixed` 是 `MREMAP_FIXED` 的目标地址。变长时先尝试原地扩展，不行再搬到新的地址（`may_move`）：搬家不复制
-    /// 数据，只是把同一段宿主内存映射到新地址。新增的部分是匿名内存，共享文件映射
-    /// 则接着映射文件后面的内容；私有文件映射也是（私有地映射，`file` 是调用方按
-    /// [`Mm::private_file_ino`] 打开的那个文件），没有 `file` 时不能扩展。
+    /// Implements mremap(2): `fixed` is the `MREMAP_FIXED` target address. When growing it first
+    /// tries to extend in place, and otherwise moves to a new address (`may_move`): moving copies
+    /// no data, it only maps the same host memory at the new address. The added part is anonymous
+    /// memory, while a shared file mapping goes on to map the rest of the file; so does a private
+    /// file mapping (mapped privately, `file` being the file the caller opened from
+    /// [`Mm::private_file_ino`]), which cannot grow without `file`.
     pub fn mremap(
         &mut self,
         old: u64,
@@ -2253,14 +2405,15 @@ impl Mm {
         if !old.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
-        // Linux 要求原来的区间在一个 VMA 里；这里不合并相邻的 VMA（比如原地扩展过的），
-        // 所以只要求区间被首尾相接的 VMA 完全覆盖
+        // Linux requires the old range to be in one VMA; adjacent VMAs are not merged here (for
+        // example after growing in place), so the range only has to be fully covered by contiguous
+        // VMAs
         self.check_mapped(old, old_len).map_err(|_| Errno::EFAULT)?;
         let (&s, v) = self.vmas.range(..old_end).next_back().unwrap();
         let vma_end = s + v.len;
         let template = v.clone();
         let grow = new_len.saturating_sub(old_len);
-        // 扩展出来的部分接在原来区间的后面，对应 VMA 里的偏移 old_end - s
+        // The extension follows the old range, at offset old_end - s in the VMA
         let extension = |mm: &Mm| -> Result<Option<Vma>, Errno> {
             (grow > 0)
                 .then(|| mm.extension(&template, old_end - s, grow, file))
@@ -2305,8 +2458,8 @@ impl Mm {
         Ok(dst)
     }
 
-    /// mremap 扩展出来的 `len` 字节：接在 `template` 里偏移 `offset` 处之后，类型和
-    /// 权限与它相同。私有文件映射要 `file`（映射的那个文件的宿主 fd）。
+    /// The `len` bytes mremap grows by: following offset `offset` in `template`, with the same kind
+    /// and permissions. Private file mappings need `file` (the host fd of the mapped file).
     fn extension(
         &self,
         template: &Vma,
@@ -2314,7 +2467,7 @@ impl Mm {
         len: u64,
         file: Option<i32>,
     ) -> Result<Vma, Errno> {
-        // (宿主内存, 宿主地址, 共享映射留着的 fd, 有文件内容的字节数)
+        // (host memory, host address, fd kept for a shared mapping, bytes with file contents)
         let (region, host, file, file_len) = match (&template.backing, &template.file) {
             (Backing::Shared, Some((fd, start))) => {
                 let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
@@ -2331,8 +2484,8 @@ impl Mm {
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
             }
-            // 私有文件映射：接着私有地映射文件后面的内容（文件末尾之后的部分不进页表，
-            // 访问是 SIGBUS，与 Linux 相同）
+            // Private file mapping: go on to map the rest of the file privately (the part past the
+            // end of the file stays out of the page table, and accesses get SIGBUS, as on Linux)
             (Backing::PrivateFile, _) => {
                 let fd = file.ok_or(Errno::ENOMEM)?;
                 let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
@@ -2381,9 +2534,9 @@ impl Mm {
         })
     }
 
-    /// 把 `[old, old + len)` 里的映射原样搬到 `dst`（宿主内存不动）。
+    /// Moves the mappings in `[old, old + len)` to `dst` as they are (the host memory stays put).
     fn move_range(&mut self, old: u64, len: u64, dst: u64) -> Result<(), Errno> {
-        // 写时复制的页按 guest 地址记录：搬走之前先各自复制
+        // Copy-on-write pages are recorded by guest address: each side copies before the move
         self.cow_settle(old, old + len);
         self.split_at(old);
         self.split_at(old + len);
@@ -2391,8 +2544,9 @@ impl Mm {
         let mut moved = Vec::with_capacity(starts.len());
         for s in starts {
             let v = self.vmas.remove(&s).unwrap();
-            // 表项一起搬：按需建表的大映射里，有内容的页都有表项（Mm::touched_windows），
-            // 搬过去之后 insert_vma 不动已有的表项。调用方保证两段不重叠
+            // Move the entries along: in large on-demand mappings every page with contents has an
+            // entry (Mm::touched_windows), and after the move insert_vma leaves existing entries
+            // alone. The caller guarantees the two ranges do not overlap
             self.mmu
                 .move_entries(s, dst + (s - old), v.len)
                 .map_err(map_err)?;
@@ -2408,8 +2562,8 @@ impl Mm {
         Ok(())
     }
 
-    /// shmat：把共享内存段 `id` 映射到 `addr`（None 时自己找地方）。`remap` 时可以
-    /// 覆盖已有的映射，否则区间必须空闲。
+    /// shmat: maps shared memory segment `id` at `addr` (choosing a place itself when None). With
+    /// `remap` it may replace existing mappings; otherwise the range must be free.
     pub fn attach_shm(
         &mut self,
         addr: Option<u64>,
@@ -2449,7 +2603,7 @@ impl Mm {
         Ok(start)
     }
 
-    /// shmdt：解除从 `addr` 开始的那次 shmat 的映射，返回是哪个段。
+    /// shmdt: unmaps the shmat that starts at `addr` and returns its segment.
     pub fn detach_shm(&mut self, addr: u64) -> Result<crate::ipc::ShmKey, Errno> {
         let id = self
             .vmas
@@ -2470,7 +2624,7 @@ impl Mm {
         Ok(id)
     }
 
-    /// 共享内存段 `id` 在这个地址空间里被 shmat 了几次。
+    /// How many times shared memory segment `id` is attached in this address space.
     pub fn shm_attachments(&self, id: crate::ipc::ShmKey) -> usize {
         let mut bases: Vec<u64> = self
             .vmas
@@ -2482,22 +2636,24 @@ impl Mm {
         bases.len()
     }
 
-    /// 起点在 `[start, start + len)` 里的映射以后不能改成可写（只读打开的 /dev/zero 的
-    /// 共享映射）。
+    /// Mappings starting in `[start, start + len)` may never become writable (shared mappings of
+    /// /dev/zero opened read-only).
     pub fn deny_write(&mut self, start: u64, len: u64) {
         for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
             v.may_write = false;
         }
     }
 
-    /// 起点在 `[start, start + len)` 里的映射以后不能改成可执行（noexec 的挂载里的文件）。
+    /// Mappings starting in `[start, start + len)` may never become executable (files on a noexec
+    /// mount).
     pub fn deny_exec(&mut self, start: u64, len: u64) {
         for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
             v.may_exec = false;
         }
     }
 
-    /// mlock、munlock：锁住或解锁 `[addr, addr + len)`（按页扩大），区间必须完全已映射。
+    /// mlock, munlock: locks or unlocks `[addr, addr + len)` (widened to pages); the range must be
+    /// fully mapped.
     pub fn set_locked(&mut self, addr: u64, len: u64, locked: bool) -> Result<(), Errno> {
         let start = addr & !(PAGE_SIZE - 1);
         let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
@@ -2511,8 +2667,8 @@ impl Mm {
         Ok(())
     }
 
-    /// `MADV_DONTDUMP`、`MADV_DODUMP`：`[addr, addr + len)` 在 core 文件里写不写，区间必须
-    /// 完全已映射。
+    /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
+    /// range must be fully mapped.
     pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
         let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
         self.check_mapped(addr, len)?;
@@ -2525,19 +2681,19 @@ impl Mm {
         Ok(())
     }
 
-    /// mlockall、munlockall：锁住或解锁所有映射。
+    /// mlockall, munlockall: locks or unlocks every mapping.
     pub fn set_all_locked(&mut self, locked: bool) {
         for v in self.vmas.values_mut() {
             v.locked = locked;
         }
     }
 
-    /// 锁住的字节数（`/proc/<pid>/status` 的 VmLck、`RLIMIT_MEMLOCK`）。
+    /// Bytes locked (VmLck in `/proc/<pid>/status`, `RLIMIT_MEMLOCK`).
     pub fn locked_bytes(&self) -> u64 {
         self.vmas.values().filter(|v| v.locked).map(|v| v.len).sum()
     }
 
-    /// `[addr, addr + len)` 里已经锁住的字节数（mlock 只为新锁住的部分计数）。
+    /// Bytes already locked in `[addr, addr + len)` (mlock counts only the newly locked part).
     pub fn locked_in(&self, addr: u64, len: u64) -> u64 {
         let end = addr.saturating_add(len);
         self.vmas
@@ -2547,8 +2703,8 @@ impl Mm {
             .sum()
     }
 
-    /// `[addr, addr + len)` 里文件的共享映射对应的宿主地址区间，按宿主的页对齐（msync 的
-    /// `MS_SYNC`：宿主映射的就是 object，交给宿主写回）。
+    /// Host address ranges of the shared file mappings in `[addr, addr + len)`, aligned to host
+    /// pages (msync's `MS_SYNC`: the host maps the object itself, so the host writes it back).
     pub fn shared_file_ranges(&self, addr: u64, len: u64) -> Vec<(usize, usize)> {
         let end = addr.saturating_add(len);
         let page = appine_hal::page_size();
@@ -2567,8 +2723,8 @@ impl Mm {
             .collect()
     }
 
-    /// madvise 关心的区间性质：(区间里有没有锁住的页, 是不是全部是私有的匿名内存)。
-    /// 区间必须完全已映射。
+    /// The properties of a range madvise cares about: (whether it has locked pages, whether it is
+    /// all private anonymous memory). The range must be fully mapped.
     pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {
         self.check_mapped(addr, len)?;
         let end = addr + len;
@@ -2585,9 +2741,11 @@ impl Mm {
         Ok((locked, anon))
     }
 
-    /// madvise(`MADV_REMOVE`)：共享映射里这一段清零，文件映射就是在文件里打洞。与 Linux
-    /// 相同，有锁住的页或者私有的匿名映射是 EINVAL，其余私有的或者不能获得写权限的映射
-    /// 是 EACCES（6.7 起看的是能不能获得写权限，不是现在有没有）。区间必须完全已映射。
+    /// madvise(`MADV_REMOVE`): zeroes this part of shared mappings, which for a file mapping means
+    /// punching a hole in the file. As on Linux, a range with locked pages or private anonymous
+    /// mappings is EINVAL, and other private mappings or ones that cannot get write permission
+    /// are EACCES (since 6.7 what counts is whether write permission can be granted, not whether
+    /// it is held now). The range must be fully mapped.
     pub fn remove(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         self.check_mapped(addr, len)?;
         let end = addr + len;
@@ -2610,12 +2768,12 @@ impl Mm {
             }
         }
         for (&s, v) in overlapping() {
-            // 超出文件末尾的部分碰不得（宿主会发 SIGBUS）
+            // The part past the end of the file must not be touched (the host would raise SIGBUS)
             let from = addr.max(s);
             let to = end.min(s + v.file_len);
             if from < to {
-                // SAFETY: [from, to) 在这个 VMA 里，宿主内存由它持有；能获得写权限的共享
-                // 映射，宿主映射总是可写的
+                // SAFETY: [from, to) is inside this VMA, which holds the host memory; for a shared
+                // mapping that can get write permission the host mapping is always writable
                 unsafe {
                     std::ptr::write_bytes(
                         v.host.as_ptr().add((from - s) as usize),
@@ -2628,7 +2786,8 @@ impl Mm {
         Ok(())
     }
 
-    /// mincore：`[addr, addr + len)` 里每页是否在宿主内存里。区间必须完全已映射。
+    /// mincore: whether each page of `[addr, addr + len)` is in host memory. The range must be
+    /// fully mapped.
     pub fn residency(&self, addr: u64, len: u64) -> Result<Vec<bool>, Errno> {
         let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
         self.check_mapped(addr, end - addr)?;
@@ -2642,12 +2801,12 @@ impl Mm {
                 cursor = stop;
                 continue;
             }
-            // SAFETY: [cursor, stop) 落在这个 VMA 里，宿主内存由它持有
+            // SAFETY: [cursor, stop) is inside this VMA, which holds the host memory
             let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
             out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
             cursor = stop;
         }
-        // 借来的页在拥有者的宿主内存里
+        // Borrowed pages are in the owner's host memory
         for (&page, _) in self
             .cow
             .borrow()
@@ -2659,9 +2818,11 @@ impl Mm {
         Ok(out)
     }
 
-    /// `[addr, addr + len)` 里驻留的 4K 页数，借来的页算驻留（smaps、OOM killer 的记录）。
-    /// 与数 [`Mm::residency`] 的结果相同，但按需建表的大匿名映射只量可能有内容的几段
-    /// （[`Mm::touched_windows`]），不为几 TB 的映射分配逐页的数组。
+    /// The resident 4K pages in `[addr, addr + len)`, counting borrowed pages as resident (smaps,
+    /// the OOM killer's log). The same as counting [`Mm::residency`], but large on-demand
+    /// anonymous mappings are measured only over the spans that may have contents
+    /// ([`Mm::touched_windows`]), without allocating a per-page array for a mapping of several
+    /// TB.
     pub fn resident_in(&self, addr: u64, len: u64) -> u64 {
         let end = addr.saturating_add(len);
         let first = self
@@ -2691,9 +2852,11 @@ impl Mm {
         total + self.cow.borrow().borrowed.range(addr..end).count() as u64
     }
 
-    /// `[addr, end)` 里与别的地址空间共用的页（写时复制借出的、借来的）：页数，以及按
-    /// 共用它的地址空间个数分摊之后的字节数。smaps 把它们算作共享的脏页，Pss 只算分摊的
-    /// 一份，与 Linux 按 mapcount 算的一样；只剩一个借用方的孤儿页只属于它，不算。
+    /// Pages in `[addr, end)` shared with other address spaces (lent or borrowed for
+    /// copy-on-write): the page count, and the bytes after dividing each page among the address
+    /// spaces sharing it. smaps counts them as shared dirty pages and Pss as only the divided
+    /// share, as Linux does by mapcount; an orphan page with only one borrower left belongs to
+    /// it alone and does not count.
     pub fn cow_shared(&self, addr: u64, end: u64) -> (u64, u64) {
         let c = self.cow.borrow();
         let loans = self.loans.borrow();
@@ -2716,7 +2879,7 @@ impl Mm {
         (pages, pss)
     }
 
-    /// msync(2) 的范围检查：区间必须完全已映射。
+    /// The range check of msync(2): the range must be fully mapped.
     pub fn check_mapped(&self, addr: u64, len: u64) -> Result<(), Errno> {
         let end = page_up(len)
             .and_then(|l| addr.checked_add(l))
@@ -2734,7 +2897,7 @@ impl Mm {
         Ok(())
     }
 
-    /// 在 `addr` 处把跨过它的 VMA 切成两段。
+    /// Splits the VMA that spans `addr` into two at `addr`.
     fn split_at(&mut self, addr: u64) {
         let Some((&s, v)) = self.vmas.range(..addr).next_back() else {
             return;
@@ -2752,11 +2915,12 @@ impl Mm {
         if let Some(f) = &mut tail.file {
             f.1 += head_len;
         }
-        // 预留的没有宿主内存，地址只是算出来的（HostRegion::reserved），按整数算
+        // A reservation has no host memory and its address is only computed
+        // (HostRegion::reserved), so do integer arithmetic
         tail.host = if tail.reserved() {
             NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap()
         } else {
-            // SAFETY: addr 落在 VMA 内部，偏移不越过宿主映射
+            // SAFETY: addr is inside the VMA, so the offset stays within the host mapping
             unsafe { tail.host.add(head_len as usize) }
         };
         let head = self.vmas.get_mut(&s).unwrap();
@@ -2765,7 +2929,7 @@ impl Mm {
         self.vmas.insert(addr, tail);
     }
 
-    /// 实现 munmap(2)。
+    /// Implements munmap(2).
     pub fn munmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         let len = page_up(len).ok_or(Errno::EINVAL)?;
         if !addr.is_multiple_of(PAGE_SIZE)
@@ -2775,7 +2939,7 @@ impl Mm {
             return Err(Errno::EINVAL);
         }
         let end = addr + len;
-        // 与 Linux 一样，只有把一个 VMA 拆成三段时才受 max_map_count 限制
+        // As on Linux, max_map_count applies only when one VMA is split into three
         let inside = |a: u64| {
             self.vmas
                 .range(..a)
@@ -2790,7 +2954,8 @@ impl Mm {
         self.split_at(addr);
         self.split_at(end);
         let borrowed = self.cow_unmap(addr, end);
-        // 页表按页解除映射，所以只处理确实存在的 VMA：guest 传一个覆盖整个地址空间的长度也很快
+        // The page table unmaps page by page, so only VMAs that actually exist are handled: a guest
+        // passing a length that covers the whole address space is still fast
         let doomed: Vec<(u64, u64)> = self
             .vmas
             .range(addr..end)
@@ -2809,14 +2974,15 @@ impl Mm {
         Ok(())
     }
 
-    /// 实现 mprotect(2)：区间必须完全已映射。
+    /// Implements mprotect(2): the range must be fully mapped.
     pub fn mprotect(&mut self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
         let len = page_up(len).ok_or(Errno::EINVAL)?;
         if !addr.is_multiple_of(PAGE_SIZE) || addr.checked_add(len).is_none() {
             return Err(Errno::EINVAL);
         }
         let end = addr + len;
-        // 区间必须被 VMA 连续覆盖：先看跨过 addr 的那个，再逐个往后接
+        // The range must be covered by VMAs without gaps: first the one spanning addr, then each
+        // following one in turn
         let (mut cursor, mut writable, mut executable) = (addr, true, true);
         if let Some((&s, v)) = self
             .vmas
@@ -2845,8 +3011,8 @@ impl Mm {
         self.room_for(self.splits(&[addr, end]))?;
         self.split_at(addr);
         self.split_at(end);
-        // 写时复制的页在下面先拿到新的权限、再去掉写权限：在那之间别的线程不能执行 guest
-        // 代码，否则可能写进借出的页
+        // Copy-on-write pages below first get the new permissions and then lose write permission:
+        // no other thread may run guest code in between, or it could write into a lent page
         let cow = self.has_cow(addr, end);
         if cow {
             self.shootdown();
@@ -2862,7 +3028,7 @@ impl Mm {
                 self.unshare(s)?;
             }
         }
-        // 只是预留的（HostRegion::reserved）变得可以访问：这一段换上宿主内存
+        // A reservation (HostRegion::reserved) becomes accessible: give this part host memory
         if mmu_prot(prot) != 0 {
             let reserved: Vec<(u64, bool)> = self
                 .vmas
@@ -2875,18 +3041,22 @@ impl Mm {
             }
         }
         for (&s, v) in self.vmas.range_mut(addr..end) {
-            // 原来可执行的页：不再可执行时翻译要作废；W^X 的 JIT 改写代码之前也先去掉执行权限
+            // Pages that were executable: their translations must be invalidated when they stop
+            // being executable; a W^X JIT also removes execute permission before rewriting code
             if v.prot & prot::EXEC != 0 && v.prot != prot {
                 self.code_ranges.push((s, v.len));
             }
             self.exec_changed |= (v.prot | prot) & prot::EXEC != 0 && v.prot != prot;
-            // 只增加权限时 TLB 里的旧表项只是少了权限，未命中时会重新填写，不必刷新
+            // When permissions are only added, stale TLB entries merely lack permissions and are
+            // refilled on a miss, so no flush is needed
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
             self.dirty |= old & !new != 0;
-            // 已有的表项改权限；去掉全部权限时表项留着、权限清零（宿主页里可能有内容，
-            // fork 借页、量驻留内存按表项找，见 [`Mm::touched_windows`]）。新建的
-            // PROT_NONE 映射没有表项（[`Mm::map_pages`]），从没有权限变成有权限时补上
-            // （文件映射只补文件末尾之前的部分，大的等访问时按需建）
+            // Change the permissions of existing entries; when all permissions are removed the
+            // entries stay with permissions cleared (the host page may have contents, and fork's
+            // lending and resident-memory measurement find pages by entry, see
+            // [`Mm::touched_windows`]). A new PROT_NONE mapping has no entries
+            // ([`Mm::map_pages`]), so they are added when it goes from no permissions to some
+            // (file mappings only up to the end of the file, and large ones on demand at access)
             self.mmu.protect(s, v.len, new).map_err(map_err)?;
             if old == 0 && new != 0 {
                 let file = v.backing != Backing::Anonymous;
@@ -2903,8 +3073,8 @@ impl Mm {
         Ok(())
     }
 
-    /// madvise(MADV_DONTNEED)：匿名内存交给宿主回收（之后读到零），其余映射保持不变。
-    /// 区间必须完全已映射。
+    /// madvise(MADV_DONTNEED): anonymous memory goes back to the host (reading zero afterwards);
+    /// other mappings stay unchanged. The range must be fully mapped.
     pub fn discard(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         let len = page_up(len).ok_or(Errno::EINVAL)?;
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
@@ -2923,9 +3093,11 @@ impl Mm {
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((cursor, stop - cursor));
                 }
-                // 借出的页借用方还要用，借来的页要换成自己的（之后读到零）
+                // Borrowers still need lent pages, and borrowed pages are replaced by our own
+                // (reading zero afterwards)
                 self.cow_settle(cursor, stop);
-                // SAFETY: [cursor, stop) 落在这个 VMA 内，对应的宿主内存是它私有的匿名内存
+                // SAFETY: [cursor, stop) is inside this VMA, and its host memory is the VMA's
+                // private anonymous memory
                 unsafe {
                     discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
                 };
@@ -2935,10 +3107,12 @@ impl Mm {
         Ok(())
     }
 
-    /// fork：复制出一个新的地址空间。写过的私有匿名映射写时复制（[`Mm::lend`]），没写过
-    /// 的内容全是零，子进程用自己的；可写的私有文件映射逐页拷贝（全零的页跳过，只拷贝
-    /// 文件末尾之前的部分）。共享映射和只读的私有文件映射与子进程共用宿主内存。调用方
-    /// 先让同一地址空间的其他线程停在 guest 代码之外（[`Mm::quiesce`]）。
+    /// fork: makes a new address space. Written private anonymous mappings are copy-on-write
+    /// ([`Mm::lend`]); contents never written are all zero, so the child uses its own; writable
+    /// private file mappings are copied page by page (skipping all-zero pages, copying only the
+    /// part before the end of the file). Shared mappings and read-only private file mappings share
+    /// host memory with the child. The caller first stops the other threads of the same address
+    /// space outside guest code ([`Mm::quiesce`]).
     pub fn fork(&mut self) -> Result<Rc<RefCell<Mm>>, Errno> {
         if self.commit_too_big(appine_hal::ram_and_swap()) {
             return Err(Errno::ENOMEM);
@@ -2968,9 +3142,10 @@ impl Mm {
         let is_heap = |s: u64, v: &Vma| {
             s == heap_start && v.backing == Backing::Anonymous && v.len <= HEAP_RESERVE
         };
-        // 子进程自己的小映射（数据段、.bss、malloc 的小块）切自同一段宿主内存：shell fork
-        // 之后马上 execve，原来每个映射各一次宿主的 mmap 和 munmap。大的、堆和向下增长的
-        // 仍然各自一段，解除映射时才能交还宿主
+        // The child's own small mappings (data segment, .bss, malloc's small blocks) are carved
+        // from one piece of host memory: a shell execs right after fork, and each mapping used to
+        // cost one host mmap and one munmap. Large ones, the heap and grows-down ones still get a
+        // piece each, so they can be returned to the host when unmapped
         let pieces: Vec<u64> = self
             .vmas
             .iter()
@@ -2988,14 +3163,17 @@ impl Mm {
             .map(|(&s, _)| s)
             .collect();
         let mut carved = Self::carve(&self.vmas, &pieces)?;
-        // 写过的私有匿名映射写时复制：先映射好子进程自己的（全零的）宿主内存，再借给它
+        // Written private anonymous mappings are copy-on-write: map the child's own (all-zero)
+        // host memory first, then lend to it
         let mut cow = Vec::new();
         for (&start, v) in self.vmas.iter_mut() {
-            // 只是预留的没有内容，子进程也只是预留（HostRegion::reserved）
+            // A reservation has no contents, and the child's is a reservation too
+            // (HostRegion::reserved)
             let share = v.reserved()
                 || match v.backing {
                     Backing::Shared => true,
-                    // 两边都不能写，内容就不会分叉；谁要改成可写，再复制自己的一份
+                    // Neither side can write, so the contents cannot diverge; whoever makes it
+                    // writable copies its own
                     Backing::PrivateFile if v.prot & prot::WRITE == 0 => {
                         v.cow = true;
                         true
@@ -3005,7 +3183,8 @@ impl Mm {
             let (region, host) = if share {
                 (v.region.clone(), v.host)
             } else {
-                // 堆照样预留宿主地址空间，子进程里接着扩展也是同一个 VMA
+                // The heap still reserves host address space, so growing it in the child extends
+                // the same VMA too
                 let heap = is_heap(start, v);
                 let below = spare.get(&start).copied().unwrap_or(0);
                 let (region, host) = if let Some(piece) = carved.remove(&start) {
@@ -3013,20 +3192,22 @@ impl Mm {
                 } else if heap {
                     spare::anonymous(HEAP_RESERVE)?
                 } else if below > 0 {
-                    // 栈下面预留的宿主内存也照样留着
+                    // The host memory reserved below the stack is kept as well
                     let (region, base) = spare::anonymous(below + v.len)?;
-                    // SAFETY: 这段宿主内存有 below + v.len 字节
+                    // SAFETY: this host memory has below + v.len bytes
                     let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(below as usize)) };
                     (region, host)
                 } else {
-                    // MAP_NORESERVE 的照样不计入（mmap 时的规则）：ASan 十几 TB 的影子内存
+                    // MAP_NORESERVE is still not accounted (the rule at mmap): ASan's shadow memory
+                    // of more than ten TB
                     Self::new_anonymous(v.len, v.prot & prot::WRITE != 0 && !v.noreserve)?
                 };
                 let len = v.file_len as usize;
                 if v.backing == Backing::Anonymous && v.written.get() {
                     cow.push(start);
                 } else if v.backing != Backing::Anonymous {
-                    // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
+                    // SAFETY: both pieces of host memory have at least v.len bytes and do not
+                    // overlap
                     unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), len, None) };
                 }
                 (region, host)
@@ -3056,10 +3237,11 @@ impl Mm {
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
-            // 自己的页表项去掉了写权限：其他线程（已经停在 guest 代码之外）的 TLB 要刷新
+            // Our own entries lost write permission: the TLBs of the other threads (already stopped
+            // outside guest code) must be flushed
             self.dirty |= self.lend(start, &child, &mut borrowed, &mut lent);
         }
-        // 都是按地址顺序放进去的，一次建好
+        // Everything was added in address order, so build it in one go
         child.cow.get_mut().borrowed = borrowed.into_iter().collect();
         self.cow
             .get_mut()
@@ -3076,21 +3258,25 @@ impl Mm {
         Ok(shared)
     }
 
-    /// fork 之前与 Linux 的 `dup_mmap` 一样按提交量的估算（`vm.overcommit_memory` 是 0）
-    /// 检查每个计入提交量的 VMA（可写的私有映射，没有 `MAP_NORESERVE`）：有一个超过内存
-    /// 和交换区的总量 `limit`（字节，0 是不知道）就是 ENOMEM。appine 里每次 mmap 各是一段
-    /// 宿主内存，VMA 合不起来，而 Linux 把相邻、标志相同的合成一个，所以按合起来的算。
-    /// LTP 的 fork14 每次多映射 1 GB 再 fork：原生上合起来的一超过内存总量 fork 就失败，
-    /// 原来 appine 里一直成功，子进程的页表越建越大（soft-MMU 每 GB 2 MB）。
+    /// Before fork, like Linux's `dup_mmap`, checks every commit-accounted VMA (writable private
+    /// mappings without `MAP_NORESERVE`) against the commit estimate (`vm.overcommit_memory` is
+    /// 0): if one exceeds `limit`, the total of memory and swap (in bytes, 0 if unknown), it is
+    /// ENOMEM. In appine every mmap is its own piece of host memory and VMAs cannot merge, while
+    /// Linux merges adjacent ones with the same flags, so they are counted merged. LTP's fork14
+    /// maps 1 GB more each time and forks: natively, fork fails once the merged one exceeds total
+    /// memory, while appine used to always succeed, with the child's page table growing ever
+    /// larger (2 MB per GB in the soft-MMU).
     ///
-    /// 与 Linux 不同：Linux 的 `VM_ACCOUNT` 在可写过之后就一直带着，这里只看现在的权限。
+    /// Unlike Linux: Linux's `VM_ACCOUNT` stays set once the mapping has been writable, while
+    /// here only the current permissions count.
     fn commit_too_big(&self, limit: u64) -> bool {
         if limit == 0 {
             return false;
         }
         let accounted =
             |v: &Vma| v.backing != Backing::Shared && v.prot & prot::WRITE != 0 && !v.noreserve;
-        // Linux 的 vma_merge：首尾相接，权限、标志、名字相同，文件映射的偏移接得上
+        // Linux's vma_merge: contiguous, with the same permissions, flags and name, and file
+        // offsets that line up for file mappings
         let merges = |a: &Vma, b: &Vma| {
             (a.backing, a.locked, a.dontdump, a.growsdown, &a.name)
                 == (b.backing, b.locked, b.dontdump, b.growsdown, &b.name)
@@ -3101,7 +3287,7 @@ impl Mm {
                 }
                 && a.prot == b.prot
         };
-        // 上一个计入的 VMA 的起点、它，和合起来的长度
+        // The start of the previous accounted VMA, the VMA, and the merged length
         let mut run: Option<(u64, &Vma, u64)> = None;
         for (&s, v) in &self.vmas {
             if !accounted(v) {
@@ -3124,10 +3310,11 @@ impl Mm {
         false
     }
 
-    /// fork 时给子进程的小映射（起点是 `pieces`）切出宿主内存：切自同一段，各自按宿主页
-    /// 对齐。这一段不计入宿主的提交量（`MAP_NORESERVE`）：每个映射都不超过
-    /// [`FORK_PIECE_MAX`]，计不计入只关系到一次申请超过内存总量时失败。返回每个起点的
-    /// 那一段和它的宿主地址。
+    /// Carves host memory for the child's small mappings at fork (starting at `pieces`): all from
+    /// one piece, each aligned to host pages. The piece is not counted in the host commit
+    /// (`MAP_NORESERVE`): no mapping exceeds [`FORK_PIECE_MAX`], and accounting only matters for a
+    /// single request failing when it exceeds total memory. Returns each start's piece and its
+    /// host address.
     fn carve(vmas: &BTreeMap<u64, Vma>, pieces: &[u64]) -> Result<Carved, Errno> {
         let page = appine_hal::page_size() as u64;
         let mut out = BTreeMap::new();
@@ -3141,7 +3328,8 @@ impl Mm {
         let (region, base) = spare::anonymous(total)?;
         let mut at = 0;
         for &s in pieces {
-            // SAFETY: 各段按顺序排在这段宿主内存里，at + len 不超过 total
+            // SAFETY: the pieces lie in order within this host memory, and at + len does not exceed
+            // total
             let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(at as usize)) };
             out.insert(s, (region.clone(), host));
             at += vmas[&s].len.next_multiple_of(page);
@@ -3149,15 +3337,17 @@ impl Mm {
         Ok(out)
     }
 
-    /// 给一个和别的地址空间共用宿主内存的私有文件映射复制一份自己的。
+    /// Gives a private file mapping that shares host memory with other address spaces a copy of
+    /// its own.
     fn unshare(&mut self, start: u64) -> Result<(), Errno> {
         let v = &self.vmas[&start];
         let reserve = v.prot & prot::WRITE != 0 && !v.noreserve;
         let (region, host) = Self::new_anonymous(v.len, reserve)?;
-        // SAFETY: 两段宿主内存都至少有 v.len 字节，并且不重叠
+        // SAFETY: both pieces of host memory have at least v.len bytes and do not overlap
         unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
-        // 原来的表项指向共用的那段，先拿掉（map_pages 不动已有的表项）；超出文件末尾的
-        // 页仍然不进页表
+        // The old entries point at the shared piece, so remove them first (map_pages leaves
+        // existing entries alone); pages past the end of the file still stay out of the page
+        // table
         let (file_len, p) = (v.file_len, v.prot);
         self.mmu.unmap(start, file_len).map_err(map_err)?;
         Self::map_pages(&mut self.mmu, start, host, file_len, p, true)?;
@@ -3165,14 +3355,14 @@ impl Mm {
         let old = std::mem::replace(&mut v.region, region);
         v.host = host;
         v.cow = false;
-        // 其他线程的 TLB 里可能还有旧的翻译：shootdown 之后才释放
+        // Other threads' TLBs may still hold stale translations: release only after the shootdown
         self.graveyard.push(old);
         self.dirty = true;
         Ok(())
     }
 
-    /// 有没有能获得写权限的共享映射指向宿主文件 (`dev`, `ino`)（memfd 加 `F_SEAL_WRITE`
-    /// 之前检查）。
+    /// Whether a shared mapping that can get write permission points at host file (`dev`, `ino`)
+    /// (checked before a memfd gets `F_SEAL_WRITE`).
     pub fn writably_maps(&self, dev: u64, ino: u64) -> bool {
         self.vmas.values().any(|v| {
             v.backing == Backing::Shared
@@ -3181,10 +3371,11 @@ impl Mm {
         })
     }
 
-    /// 宿主文件 (`dev`, `ino`) 被截短成 `size` 字节：映射它的 VMA 里超出新末尾的页从
-    /// 页表里拿掉，之后 guest 访问得到 SIGBUS，与 Linux 的 truncate 相同。不拿掉的话，
-    /// 宿主访问超出文件末尾的映射会收到 SIGBUS，整个 App 退出。返回有没有改动，有改动时
-    /// 要做 shootdown（[`Mm::sync`]）。
+    /// Host file (`dev`, `ino`) was truncated to `size` bytes: pages past the new end in the VMAs
+    /// mapping it are removed from the page table, so later guest accesses get SIGBUS, as with
+    /// truncate on Linux. Otherwise the host would get SIGBUS accessing the mapping past the end
+    /// of the file, and the whole app would exit. Returns whether anything changed; if so a
+    /// shootdown is needed ([`Mm::sync`]).
     pub fn file_truncated(&mut self, dev: u64, ino: u64, size: u64) -> bool {
         let mut changed = false;
         for (&s, v) in self.vmas.iter_mut() {
@@ -3198,7 +3389,7 @@ impl Mm {
             if (d, i) != (dev, ino) || extent >= v.file_len {
                 continue;
             }
-            // unmap 只会因为参数不合法失败，这里的区间来自 VMA
+            // unmap fails only on invalid arguments, and this range comes from a VMA
             let _ = self.mmu.unmap(s + extent, v.file_len - extent);
             if v.prot & prot::EXEC != 0 {
                 self.code_ranges.push((s + extent, v.file_len - extent));
@@ -3210,8 +3401,8 @@ impl Mm {
         changed
     }
 
-    /// 给起点落在 `[start, start + len)` 里的文件映射记下文件的名字和 inode（`/proc/<pid>/maps`
-    /// 用）。与 Linux 一样，中间的匿名映射（.bss）没有名字。
+    /// Records the file's name and inode for file mappings starting in `[start, start + len)` (for
+    /// `/proc/<pid>/maps`). As on Linux, the anonymous mapping in between (.bss) has no name.
     pub fn label(&mut self, start: u64, len: u64, name: Option<Rc<[u8]>>, ino: u64) {
         for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
             if v.file_id.is_some() {
@@ -3221,13 +3412,14 @@ impl Mm {
         }
     }
 
-    /// 记下初始的栈指针（加载器使用）。
+    /// Records the initial stack pointer (used by the loader).
     pub fn set_start_stack(&mut self, sp: u64) {
         self.start_stack = sp;
     }
 
-    /// `/proc/<pid>/maps` 里标成 `[stack]` 的范围：与 Linux 一样是包含初始栈指针的映射，
-    /// 加上它下面接着的、向下增长而且权限相同的 VMA（宿主内存不连续时栈长出来的部分）。
+    /// The range labelled `[stack]` in `/proc/<pid>/maps`: as on Linux, the mapping containing
+    /// the initial stack pointer, plus the grows-down VMAs with the same permissions directly
+    /// below it (the parts the stack grew by when host memory was not contiguous).
     fn stack_range(&self) -> Option<(u64, u64)> {
         let sp = self.start_stack;
         let (&s, v) = self
@@ -3245,11 +3437,13 @@ impl Mm {
         Some((low, s + v.len))
     }
 
-    /// core dump 要写的映射（`crate::coredump`），一个 VMA 一项。写多少按 Linux 的
-    /// `vma_dump_size` 和 `coredump_filter`（`filter`，[`dump_filter`] 的位）：vDSO
-    /// 总是整个写；共享映射看它是匿名的（含 memfd、SysV 共享内存）还是文件的；写过的
-    /// 私有匿名映射整个写（从来没有可写过的、`PROT_NONE` 的预留不写）；私有文件映射
-    /// 可写过的整个写（数据段），否则只写 ELF 文件开头的一页，让调试器认出映射的是什么。
+    /// The mappings a core dump writes (`crate::coredump`), one entry per VMA. How much is written
+    /// follows Linux's `vma_dump_size` and `coredump_filter` (`filter`, the bits of
+    /// [`dump_filter`]): the vDSO is always written whole; shared mappings depend on whether they
+    /// are anonymous (including memfd and SysV shared memory) or file-backed; written private
+    /// anonymous mappings are written whole (never-writable ones and `PROT_NONE` reservations are
+    /// not); private file mappings that have been writable are written whole (data segments),
+    /// otherwise only the first page of an ELF file, so a debugger can tell what is mapped.
     pub fn dump_regions(&self, filter: u32) -> Vec<DumpRegion> {
         use dump_filter::*;
         self.vmas
@@ -3288,7 +3482,8 @@ impl Mm {
                                 && v.prot & prot::READ != 0
                                 && v.file_len >= PAGE_SIZE =>
                         {
-                            // SAFETY: 第一页落在文件内容里，宿主内存由这个 VMA 持有
+                            // SAFETY: the first page lies in the file contents, and this VMA holds
+                            // the host memory
                             let magic = unsafe { std::slice::from_raw_parts(v.host.as_ptr(), 4) };
                             if magic == b"\x7fELF" { PAGE_SIZE } else { 0 }
                         }
@@ -3308,9 +3503,11 @@ impl Mm {
             .collect()
     }
 
-    /// core dump 读一页（Linux 的 `get_dump_page`），不检查权限：`PROT_NONE` 的页不在
-    /// 页表里，按 VMA 读宿主内存。写时复制借来的页按页表读拥有者的。文件末尾之后的页
-    /// （一碰宿主就是 SIGBUS）和读不到的页返回 false，在 core 文件里留空洞。
+    /// Reads one page for a core dump (Linux's `get_dump_page`) without checking permissions:
+    /// `PROT_NONE` pages are not in the page table, so host memory is read by VMA. Pages borrowed
+    /// for copy-on-write read the owner's through the page table. Pages past the end of the file
+    /// (the host raises SIGBUS as soon as they are touched) and unreadable pages return false and
+    /// leave holes in the core file.
     pub fn dump_page(&self, addr: u64, buf: &mut [u8]) -> bool {
         let Some((&s, v)) = self
             .vmas
@@ -3332,17 +3529,20 @@ impl Mm {
                 None => return false,
             }
         } else {
-            // SAFETY: addr 落在这个 VMA 有文件内容的部分，宿主内存由它持有
+            // SAFETY: addr is in the part of this VMA with file contents, and it holds the host
+            // memory
             unsafe { v.host.as_ptr().add((addr - s) as usize) }
         };
-        // SAFETY: [host, host + n) 不越过这一页
+        // SAFETY: [host, host + n) does not cross this page
         unsafe { std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), n) };
         buf[n..].fill(0);
         true
     }
 
-    /// 所有映射，按地址排列；栈、堆和 vDSO 按 Linux 的习惯命名。相邻、权限相同的匿名映射（或者同一个文件里接着的部分）与 Linux 一样合成一段：
-    /// 每次匿名 mmap 都是单独的宿主内存，VMA 合不起来，python 跑一会儿就有几百个。
+    /// All mappings, in address order; the stack, heap and vDSO are named the way Linux names
+    /// them. Adjacent anonymous mappings with the same permissions (or contiguous parts of the
+    /// same file) are joined into one entry as on Linux: every anonymous mmap is separate host
+    /// memory, VMAs cannot be merged, and python has hundreds after running for a while.
     pub fn regions(&self) -> Vec<Region> {
         let stack = self.stack_range();
         let mut out: Vec<Region> = Vec::new();
@@ -3393,8 +3593,8 @@ impl Mm {
         out
     }
 
-    /// 把 `[addr, addr + len)` 的页调进宿主内存（mlock、`MAP_POPULATE`）。文件映射超出
-    /// 文件末尾的部分不碰。
+    /// Brings the pages of `[addr, addr + len)` into host memory (mlock, `MAP_POPULATE`). The part
+    /// of a file mapping past the end of the file is not touched.
     pub fn populate(&self, addr: u64, len: u64) {
         let end = addr.saturating_add(len);
         let first = self
@@ -3402,31 +3602,33 @@ impl Mm {
             .range(..=addr)
             .next_back()
             .map_or(addr, |(&s, _)| s);
-        // 与 Linux 一样，没有任何权限的映射不调入
+        // As on Linux, mappings without any permissions are not populated
         for (&s, v) in self.vmas.range(first..end).filter(|(_, v)| v.prot != 0) {
             let from = addr.max(s);
             let to = end.min(s + v.file_len);
             if from < to {
-                // SAFETY: [from, to) 在这个 VMA 里，宿主内存由它持有，并且在文件末尾之前
+                // SAFETY: [from, to) is inside this VMA, which holds the host memory, and before
+                // the end of the file
                 unsafe {
                     appine_hal::populate(
                         v.host.as_ptr().add((from - s) as usize),
                         (to - from) as usize,
                     )
                 };
-                // 表项也建好（按需建表的大映射原来没有）：调入的页量驻留内存时要找得到
-                // （Mm::touched_windows）。已有的表项（写时复制的）不动
+                // Build the entries too (large on-demand mappings had none): populated pages must
+                // be found when measuring resident memory (Mm::touched_windows). Existing entries
+                // (copy-on-write ones) are left alone
                 let (lo, hi) = (from & !(PAGE_SIZE - 1), page_up(to).unwrap_or(to));
-                // SAFETY: [lo, hi) 在这个 VMA 里，宿主内存由它持有
+                // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
                 let host = unsafe { v.host.add((lo - s) as usize) };
                 let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) };
             }
         }
     }
 
-    /// `/proc/<pid>/pagemap` 从 `addr` 起 `pages` 页的表项：驻留（第 63 位），文件页或者
-    /// 共享内存（第 61 位），私有匿名页只映射了一次（第 56 位）。与没有特权的进程在
-    /// Linux 上看到的一样，不给页框号。
+    /// The `/proc/<pid>/pagemap` entries of `pages` pages from `addr`: resident (bit 63), file
+    /// page or shared memory (bit 61), private anonymous page mapped only once (bit 56). Like what
+    /// an unprivileged process sees on Linux, no page frame numbers are given.
     pub fn pagemap(&self, addr: u64, pages: usize) -> Vec<u64> {
         const PRESENT: u64 = 1 << 63;
         const FILE: u64 = 1 << 61;
@@ -3449,7 +3651,7 @@ impl Mm {
             } else {
                 PRESENT | FILE
             };
-            // SAFETY: [from, to) 落在这个 VMA 内
+            // SAFETY: [from, to) is inside this VMA
             let host = unsafe { v.host.as_ptr().add((from - s) as usize) };
             let resident = appine_hal::page_residency(host, (to - from) as usize);
             let at = ((from - addr) / PAGE_SIZE) as usize;
@@ -3459,41 +3661,47 @@ impl Mm {
                 }
             }
         }
-        // 借来的页驻留，但不是只映射了一次
+        // Borrowed pages are resident, but not mapped only once
         for (&page, _) in self.cow.borrow().borrowed.range(addr..end) {
             out[((page - addr) / PAGE_SIZE) as usize] = PRESENT;
         }
         out
     }
 
-    /// 映射的总大小（字节）。
+    /// Total size of the mappings (bytes).
     pub fn size(&self) -> u64 {
         self.vmas.values().map(|v| v.len).sum()
     }
 
-    /// 驻留在宿主内存里的 4K 页数。没写过的匿名映射跳过：读它只会映射到零页，Linux 的
-    /// RSS 也不算零页。
+    /// Resident 4K pages in host memory. Anonymous mappings never written are skipped: reading them
+    /// only maps the zero page, and Linux's RSS does not count the zero page either.
     ///
-    /// 进程退出、execve 时各量一次（`ru_maxrss`），shell 每起一个进程就量两次：
-    /// - 宿主上首尾相接的映射（execve 时先后建立的那些大多是）合起来一次 mincore；
-    /// - 文件映射里只有宿主 page cache 的页（没写过的私有映射、共享映射）时，驻留多少是
-    ///   文件本身的事，与哪个进程映射无关，而 mincore 要在 page cache 里逐页查找：结果按
-    ///   文件的一段缓存一会儿（[`FileResidency`]），程序和库的代码段不必每次都查。
+    /// Measured once at process exit and once at execve (`ru_maxrss`), so twice for every process
+    /// the shell spawns:
+    /// - mappings contiguous on the host (mostly the ones execve creates one after another) are
+    ///   merged into one mincore;
+    /// - when a file mapping has only host page-cache pages (private mappings never written,
+    ///   shared mappings), how much is resident is a property of the file, independent of which
+    ///   process maps it, while mincore looks up the page cache page by page: the result is cached
+    ///   per piece of file for a while ([`FileResidency`]), so the code segments of programs and
+    ///   libraries need not be checked every time.
     pub fn resident_pages(&self) -> u64 {
         self.rss_plan().measure()
     }
 
-    /// 驻留页数峰值（`ru_maxrss`）的取样：自己的匿名内存不多时不量（[`RssPlan::estimate`]）。
-    /// `fresh` 时（fork 之后马上 execve，shell 起进程的常见做法）只算借来的页和缓存着的
-    /// 文件映射，不量它自己的匿名内存，那里只有 fork 之后写过的几页。
+    /// A sample for the peak resident page count (`ru_maxrss`): not measured when there is little
+    /// anonymous memory of its own ([`RssPlan::estimate`]). With `fresh` (execve right after fork,
+    /// the usual way a shell spawns), counts only borrowed pages and cached file mappings, without
+    /// measuring its own anonymous memory, which holds only the few pages written since fork.
     pub fn peak_resident_pages(&self, fresh: bool) -> u64 {
         let plan = self.rss_plan();
         if fresh { plan.fixed } else { plan.estimate() }
     }
 
-    /// [`Mm::resident_pages`] 要量的：不用 mincore 就知道的页数，和要 mincore 的宿主范围。
+    /// What [`Mm::resident_pages`] measures: pages known without mincore, and the host ranges to
+    /// mincore.
     fn rss_plan(&self) -> RssPlan {
-        // 借来的页与 Linux 上写时复制的页一样算在里面
+        // Borrowed pages are counted, like copy-on-write pages on Linux
         let mut total = self.cow.borrow().borrowed.len() as u64;
         let mut spans = Vec::with_capacity(self.vmas.len());
         let now = std::time::Instant::now();
@@ -3504,8 +3712,9 @@ impl Mm {
                 Backing::PrivateFile => !v.written.get(),
                 Backing::Shared => true,
             };
-            // 按需建表的大映射只量可能有内容的几段（Mm::touched_windows）：ASan 十几 TB 的
-            // 影子内存逐页 mincore 要几 GB 的结果数组
+            // Large on-demand mappings are measured only over the spans that may have contents
+            // (Mm::touched_windows): mincore over ASan's shadow memory of more than ten TB page
+            // by page would need a result array of several GB
             if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
                 for (lo, hi) in self.touched_windows(s) {
                     let host = Self::own_page(s, v, lo).as_ptr() as usize;
@@ -3530,13 +3739,14 @@ impl Mm {
         }
     }
 
-    /// 测试钩子（[`crate::bug`]）：让 `addr` 所在的页在页表里指向一个不能访问的宿主页，
-    /// guest 访问它时引擎在宿主上出错。那一页宿主内存不归任何 VMA，故意泄漏。
+    /// Test hook ([`crate::bug`]): points the page of `addr` at an inaccessible host page in the
+    /// page table, so a guest access makes the engine fault on the host. That host page belongs to
+    /// no VMA and is leaked on purpose.
     #[cfg(any(debug_assertions, feature = "test-hooks"))]
     pub fn break_page(&mut self, addr: u64) -> Result<(), Errno> {
         let host = appine_hal::map_inaccessible(PAGE_SIZE as usize).map_err(Errno)?;
         let page = addr & !(PAGE_SIZE - 1);
-        // SAFETY: 访问这页宿主内存正是要模拟的 bug；它从不释放
+        // SAFETY: accessing this host page is exactly the bug being simulated; it is never freed
         unsafe {
             self.mmu
                 .map(page, host, PAGE_SIZE, prot::READ | prot::WRITE)
@@ -3544,7 +3754,7 @@ impl Mm {
         .map_err(map_err)
     }
 
-    /// guest 地址是否落在某个映射里（区分 SEGV_MAPERR 和 SEGV_ACCERR）。
+    /// Whether a guest address falls in some mapping (telling SEGV_MAPERR from SEGV_ACCERR).
     pub fn is_mapped(&self, addr: u64) -> bool {
         self.vmas
             .range(..=addr)
@@ -3552,13 +3762,13 @@ impl Mm {
             .is_some_and(|(&s, v)| addr < s + v.len)
     }
 
-    /// 设置初始的 program break（加载器使用）。
+    /// Sets the initial program break (used by the loader).
     pub fn set_brk(&mut self, start: u64) {
         self.brk_start = start;
         self.brk = start;
     }
 
-    /// 实现 brk(2)：返回新的 break，失败时返回原值。
+    /// Implements brk(2): returns the new break, or the old one on failure.
     pub fn brk(&mut self, new: u64) -> u64 {
         if new < self.brk_start {
             return self.brk;
@@ -3586,7 +3796,8 @@ impl Mm {
         new
     }
 
-    /// 堆还没有映射时，在 `start` 映射 `len` 字节并预留 [`HEAP_RESERVE`] 的宿主地址空间。
+    /// When the heap is not mapped yet, maps `len` bytes at `start` and reserves [`HEAP_RESERVE`]
+    /// of host address space.
     fn start_heap(&mut self, start: u64, len: u64) -> bool {
         if start != page_up(self.brk_start).unwrap_or(0) || len > HEAP_RESERVE {
             return false;
@@ -3599,7 +3810,7 @@ impl Mm {
             .is_ok()
     }
 
-    /// 结束在 `end` 的堆 VMA 的宿主内存后面还有空余时，把它加长 `grow` 字节。
+    /// Lengthens the heap VMA ending at `end` by `grow` bytes if its host memory has room after it.
     fn grow_heap(&mut self, end: u64, grow: u64) -> bool {
         let Some((&s, v)) = self.vmas.range(..end).next_back() else {
             return false;
@@ -3616,8 +3827,8 @@ impl Mm {
         if used + grow as usize > v.region.len {
             return false;
         }
-        // 宿主上紧接着的这段不能有别的映射在用（堆的一部分被 mremap 搬走之后仍然属于
-        // 同一段宿主内存）
+        // No other mapping may use the host range right after it (a part of the heap moved away by
+        // mremap still belongs to the same host memory)
         let (lo, hi) = (v.host.as_ptr() as usize + v.len as usize, grow as usize);
         let taken = self.vmas.values().any(|o| {
             let at = o.host.as_ptr() as usize;
@@ -3626,9 +3837,10 @@ impl Mm {
         if taken {
             return false;
         }
-        // SAFETY: [lo, lo + hi) 在这段私有匿名内存里，没有别的映射在用
+        // SAFETY: [lo, lo + hi) is inside this private anonymous memory and no other mapping uses
+        // it
         let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
-        // 缩小之后又扩展：以前写过的内容要变回零
+        // Grown again after shrinking: what was written before must read as zero again
         unsafe { discard_host(host, hi) };
         if Self::map_pages(&mut self.mmu, end, host, grow, rw, false).is_err() {
             return false;
@@ -3640,7 +3852,7 @@ impl Mm {
         true
     }
 
-    /// 从 guest 内存读取（相当于 Linux 的 `copy_from_user`），要求每页可读。
+    /// Reads from guest memory (like Linux's `copy_from_user`); every page must be readable.
     pub fn read(&self, src: UserSlice, dst: &mut [u8]) -> Result<(), Errno> {
         assert_eq!(src.len, dst.len());
         self.for_each_page(src.addr, src.len, prot::READ, |host, done, chunk| unsafe {
@@ -3648,7 +3860,7 @@ impl Mm {
         })
     }
 
-    /// 写入 guest 内存（相当于 Linux 的 `copy_to_user`），要求每页可写。
+    /// Writes to guest memory (like Linux's `copy_to_user`); every page must be writable.
     pub fn write(&self, dst: UserSlice, data: &[u8]) -> Result<(), Errno> {
         assert_eq!(dst.len, data.len());
         self.for_each_page(dst.addr, dst.len, prot::WRITE, |host, done, chunk| unsafe {
@@ -3656,8 +3868,9 @@ impl Mm {
         })
     }
 
-    /// 内核层经由页表找 guest 地址 `addr` 的宿主指针，要求有 `need` 里的权限；还没有表项
-    /// 时先按需建（[`Mm::fault_in`]）。不处理写时复制（见 [`Mm::for_each_page`]）。
+    /// The host pointer the kernel layer finds for guest address `addr` through the page table,
+    /// requiring the permissions in `need`; if there is no entry yet it is filled on demand first
+    /// ([`Mm::fault_in`]). Does not handle copy-on-write (see [`Mm::for_each_page`]).
     pub fn translate(&self, addr: u64, need: u32) -> Option<NonNull<u8>> {
         self.mmu.translate(addr, need).or_else(|| {
             self.fault_in(addr, need)
@@ -3665,14 +3878,15 @@ impl Mm {
         })
     }
 
-    /// 读取以 NUL 结尾的字符串（不含 NUL），最长 `max` 字节，超出时返回 ENAMETOOLONG。
+    /// Reads a NUL-terminated string (without the NUL), at most `max` bytes; ENAMETOOLONG if
+    /// longer.
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let mut out = Vec::new();
         let mut cur = addr;
         loop {
             let chunk = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
             let host = self.translate(cur, prot::READ).ok_or(Errno::EFAULT)?;
-            // SAFETY: translate 保证这一页在本次调用期间有效
+            // SAFETY: translate guarantees this page stays valid for the duration of this call
             let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr(), chunk) };
             if let Some(n) = bytes.iter().position(|&b| b == 0) {
                 out.extend_from_slice(&bytes[..n]);
@@ -3690,12 +3904,14 @@ impl Mm {
         }
     }
 
-    /// 内核自己往 guest 内存写入，比如加载程序、构造初始栈。只要求已映射，不检查权限，
-    /// 所以按 VMA 找宿主内存：`PROT_NONE` 的页不在页表里。文件映射超出文件末尾的部分
-    /// 不能写。
+    /// The kernel itself writing into guest memory, such as loading a program or building the
+    /// initial stack. Requires only that it be mapped, without checking permissions, so host
+    /// memory is found by VMA: `PROT_NONE` pages are not in the page table. The part of a file
+    /// mapping past the end of the file cannot be written.
     pub(crate) fn write_kernel(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
-        // 直接写 VMA 自己的宿主内存：写时复制的页先换成自己的，与别的地址空间共用宿主
-        // 内存的文件映射先复制一份自己的
+        // Write the VMA's own host memory directly: copy-on-write pages are first replaced by our
+        // own, and file mappings sharing host memory with other address spaces first copy their
+        // own
         let end = page_up(addr.saturating_add(data.len() as u64)).unwrap_or(u64::MAX);
         self.cow_settle(addr & !(PAGE_SIZE - 1), end);
         let first = self
@@ -3712,7 +3928,8 @@ impl Mm {
         for s in shared {
             self.unshare(s)?;
         }
-        // 只是预留的（PROT_NONE，跟踪者强制写入）：写到的那几页拆出来换上宿主内存
+        // A reservation (PROT_NONE, a tracer forcing a write): the pages written are split off and
+        // given host memory
         let lo = addr & !(PAGE_SIZE - 1);
         if self
             .vmas
@@ -3743,7 +3960,8 @@ impl Mm {
             let chunk = ((s + v.file_len - cur) as usize).min(data.len() - done);
             v.written.set(true);
             self.exec_changed |= v.prot & prot::EXEC != 0;
-            // SAFETY: [cur, cur + chunk) 落在这个 VMA 有内容的部分，宿主内存由它持有
+            // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
+            // the host memory
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data[done..].as_ptr(),
@@ -3751,11 +3969,12 @@ impl Mm {
                     chunk,
                 )
             };
-            // 私有匿名内存里有内容的页要有表项（Mm::touched_windows），PROT_NONE 的权限为 0
+            // Pages with contents in private anonymous memory must have entries
+            // (Mm::touched_windows); PROT_NONE ones get permission 0
             if v.backing == Backing::Anonymous {
                 let lo = cur & !(PAGE_SIZE - 1);
                 let hi = page_up(cur + chunk as u64).unwrap_or(s + v.len);
-                // SAFETY: [lo, hi) 在这个 VMA 里，宿主内存由它持有
+                // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
                 let host = unsafe { v.host.add((lo - s) as usize) };
                 unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) }
                     .map_err(map_err)?;
@@ -3765,10 +3984,12 @@ impl Mm {
         Ok(())
     }
 
-    /// 跟踪者强制写入（PTRACE_POKETEXT、`/proc/<pid>/mem`，Linux 的 `FOLL_FORCE`）：没有写
-    /// 权限的私有映射也能写（程序的代码段：下断点），复制成自己的一份；没有写权限的共享映射
-    /// 不能写。写过的地方作废翻译，用着这个地址空间的线程先刷新 TLB；`current` 是写入的
-    /// 线程（它不在这个地址空间里时没有影响）。
+    /// A tracer forcing a write (PTRACE_POKETEXT, `/proc/<pid>/mem`, Linux's `FOLL_FORCE`):
+    /// private mappings without write permission can be written too (a program's code segment:
+    /// setting breakpoints), by copying them into our own; shared mappings without write
+    /// permission cannot. Translations of what was written are invalidated, and the threads using
+    /// this address space flush their TLBs first; `current` is the writing thread (no effect when
+    /// it is not in this address space).
     pub(crate) fn write_force(
         &mut self,
         addr: u64,
@@ -3796,7 +4017,8 @@ impl Mm {
         Ok(())
     }
 
-    /// 按页遍历 `[addr, addr + len)`，对每一段调用 `f(宿主指针, 已处理字节数, 本段长度)`。
+    /// Walks `[addr, addr + len)` page by page, calling `f(host pointer, bytes done, chunk length)`
+    /// for each chunk.
     fn for_each_page(
         &self,
         addr: u64,
@@ -3811,7 +4033,8 @@ impl Mm {
             let chunk = page_left.min(len - done);
             let host = match self.mmu.translate(cur, required_prot) {
                 Some(host) => host,
-                // 写时复制的页：先换成可写的（Mm::cow_break）；还没有表项的页按需建
+                // Copy-on-write pages: make them writable first (Mm::cow_break); pages without
+                // entries yet are filled on demand
                 None if required_prot & prot::WRITE != 0 && self.cow_break(cur)
                     || self.fault_in(cur, required_prot) =>
                 {
@@ -3828,29 +4051,31 @@ impl Mm {
     }
 }
 
-/// 写时复制（模块文档、kernel/mm 的 map）。经由共享借用进行：内核往 guest 内存写的时候
-/// 只有 `&Mm`，拥有者收回页时也要改借用方的页表。
+/// Copy-on-write (module docs, the kernel/mm map). Done through shared borrows: when the kernel
+/// writes into guest memory it has only `&Mm`, and an owner recalling pages must also change its
+/// borrowers' page tables.
 impl Mm {
-    /// 页 `page` 所在的私有匿名 VMA 和它的起点。
+    /// The private anonymous VMA containing page `page`, and its start.
     fn anon_vma(&self, page: u64) -> Option<(u64, &Vma)> {
         let (&s, v) = self.vmas.range(..=page).next_back()?;
         (page < s + v.len && v.backing == Backing::Anonymous).then_some((s, v))
     }
 
-    /// 页 `page` 在自己的 VMA 里的宿主页。
+    /// The host page of page `page` in its own VMA.
     fn own_page(s: u64, v: &Vma, page: u64) -> NonNull<u8> {
-        // SAFETY: page 落在这个 VMA 里，偏移不越过宿主映射
+        // SAFETY: page is inside this VMA, so the offset stays within the host mapping
         unsafe { v.host.add((page - s) as usize) }
     }
 
-    /// 页 `page` 写时复制的页表权限：没有写权限。
+    /// The page-table permission of a copy-on-write page: no write permission.
     fn read_only(v: &Vma) -> u32 {
         mmu_prot(v.prot) & !prot::WRITE
     }
 
-    /// 往 `page` 写之前调用（写缺页、内核写 guest 内存）：借来的页复制一份自己的，借出
-    /// 的页先让借用方各自复制。返回 true 表示页表项已经可写；VMA 不可写、不是写时复制
-    /// 的页时返回 false。
+    /// Called before writing to `page` (a write fault, the kernel writing guest memory): a borrowed
+    /// page is copied into our own, and borrowers of a lent page each copy theirs first. Returns
+    /// true if the entry is now writable; false if the VMA is not writable or the page is not
+    /// copy-on-write.
     pub fn cow_break(&self, page: u64) -> bool {
         let page = page & !(PAGE_SIZE - 1);
         if self
@@ -3871,35 +4096,39 @@ impl Mm {
         borrowed || lent
     }
 
-    /// 借来的页 `page` 换成自己的一份：复制到自己的 VMA 里对应的位置，页表项指向那里。
-    /// `notify` 时，还回的是最后一个借用的话让拥有者恢复写权限；拥有者自己收回时不必。
+    /// Replaces borrowed page `page` with our own copy: copies it to the matching place in our own
+    /// VMA and points the entry there. With `notify`, if this returns the last borrow, the owner
+    /// gets write permission back; not needed when the owner itself is recalling.
     fn materialize(&self, page: u64, notify: bool) {
         let Some(b) = self.cow.borrow_mut().borrowed.remove(&page) else {
             return;
         };
         if let Some((s, v)) = self.anon_vma(page) {
             let own = Self::own_page(s, v, page);
-            // SAFETY: 两边都是一整页，借来的那页由 b.region 持有
+            // SAFETY: both sides are a whole page, and b.region holds the borrowed page
             unsafe {
                 std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize)
             };
-            // PROT_NONE 的也建（权限为 0）：有内容的页要有表项（Mm::touched_windows）；
-            // 原来可能有指向借来的页、权限为 0 的表项，不能留着
-            // SAFETY: 宿主页属于这个 VMA
+            // Built even for PROT_NONE (permission 0): pages with contents must have entries
+            // (Mm::touched_windows); there may be an entry with permission 0 pointing at the
+            // borrowed page, which must not stay
+            // SAFETY: the host page belongs to this VMA
             let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
         }
-        // 线程的 TLB 里可能还指向借来的页：刷新之后才能还回去，拥有者接着就可能写它
+        // Threads' TLBs may still point at the borrowed page: return it only after flushing, since
+        // the owner may write it right after
         self.shootdown();
         self.return_loan(b.host, page, notify);
     }
 
-    /// 还回借来的宿主页 `host`（在这里的 guest 地址是 `page`）。
+    /// Returns borrowed host page `host` (at guest address `page` here).
     fn return_loan(&self, host: NonNull<u8>, page: u64, notify: bool) {
         self.return_loans([(page, host)], notify);
     }
 
-    /// 还回一批借来的页（这里的 guest 地址，拥有者的宿主页）。`notify` 时，还回的是最后
-    /// 一个借用的页让拥有者恢复写权限，同一个拥有者的一起处理。
+    /// Returns a batch of borrowed pages (guest addresses here, the owner's host pages). With
+    /// `notify`, pages whose last borrow is returned get write permission back at the owner,
+    /// handled together per owner.
     fn return_loans(&self, pages: impl IntoIterator<Item = (u64, NonNull<u8>)>, notify: bool) {
         let mut owners: Vec<(MmRef, Vec<u64>)> = Vec::new();
         {
@@ -3922,8 +4151,8 @@ impl Mm {
                 }
             }
         }
-        // 拥有者正被借用（它自己的操作引起的，比如收回）时不必管：它的页表项下次写缺页
-        // 时恢复（Mm::cow_break）
+        // An owner that is currently borrowed (because of its own operation, such as a recall)
+        // can be left alone: its entries are restored at its next write fault (Mm::cow_break)
         for (owner, addrs) in owners {
             if let Some(owner) = owner.upgrade()
                 && let Ok(owner) = owner.try_borrow()
@@ -3933,7 +4162,8 @@ impl Mm {
         }
     }
 
-    /// 借出的这些页没有借用方了：恢复写权限（只增加权限，不必刷新 TLB）。
+    /// These lent pages have no borrowers left: restore write permission (only adding
+    /// permissions, so no TLB flush is needed).
     fn repossess(&self, pages: &[u64]) {
         let mut runs = Runs::default();
         {
@@ -3953,7 +4183,8 @@ impl Mm {
         }
     }
 
-    /// 拥有者要改借出的页 `page` 之前：每个借用方复制自己的一份，然后恢复写权限。
+    /// Before the owner changes lent page `page`: every borrower copies its own, then write
+    /// permission is restored.
     fn recall(&self, page: u64) {
         let Some((s, v)) = self.anon_vma(page) else {
             self.cow.borrow_mut().lent.remove(&page);
@@ -3969,18 +4200,20 @@ impl Mm {
         self.repossess(&[page]);
     }
 
-    /// 页表项改指别处之后马上做的 shootdown：先改代数，使用者重新进入 guest 代码之前
-    /// 刷新 TLB；正在执行 guest 代码的打断、等它们退出（[`Mm::sync`] 的做法，但调用方
-    /// 接着就要用那一页）。
+    /// The immediate shootdown after a page-table entry is re-pointed: bump the generation first so
+    /// users flush their TLBs before re-entering guest code; kick those running guest code and wait
+    /// for them to leave (the approach of [`Mm::sync`], but the caller uses that page right after).
     fn shootdown(&self) {
         if self.users.is_empty() {
             return;
         }
-        // 与使用者那边"先标记、再读代数"配对：要么它读到新的代数，要么这里看到它在执行
+        // Pairs with the user's "mark, then read the generation": either it reads the new
+        // generation, or this side sees it running
         self.generation.fetch_add(1, Ordering::SeqCst);
         for u in &self.users {
             if u.in_guest.load(Ordering::SeqCst) {
-                // SAFETY: 线程在销毁自己的 Cpu 之前（持有 BKL）从 users 里注销
+                // SAFETY: a thread unregisters from users (holding the BKL) before destroying its
+                // Cpu
                 unsafe { u.kicker.kick() };
             }
         }
@@ -3991,8 +4224,9 @@ impl Mm {
         }
     }
 
-    /// `[start, end)` 里的页不再写时复制，内容保留在自己的宿主内存里：借出的先收回，
-    /// 借来的复制一份（mremap 搬走、丢弃、内核直接写宿主内存之前）。
+    /// Pages in `[start, end)` stop being copy-on-write, keeping their contents in our own host
+    /// memory: lent pages are recalled first, and borrowed ones are copied (before mremap moves,
+    /// discarding, or the kernel writing host memory directly).
     fn cow_settle(&self, start: u64, end: u64) {
         let (lent, borrowed): (Vec<u64>, Vec<u64>) = {
             let c = self.cow.borrow();
@@ -4009,8 +4243,9 @@ impl Mm {
         }
     }
 
-    /// `[start, end)` 要解除映射：借出的先收回；借来的从记录里拿走，等调用方改掉页表项、
-    /// 刷新 TLB 之后用 [`Mm::give_back`] 还回去（内容不要了，不必复制）。
+    /// `[start, end)` is about to be unmapped: lent pages are recalled first; borrowed ones are
+    /// taken out of the records and returned with [`Mm::give_back`] after the caller has changed
+    /// the entries and flushed the TLB (their contents are no longer wanted, so no copy).
     fn cow_unmap(&self, start: u64, end: u64) -> Vec<(u64, Borrowed)> {
         let lent: Vec<u64> = self.cow.borrow().lent.range(start..end).copied().collect();
         for page in lent {
@@ -4024,7 +4259,7 @@ impl Mm {
             .collect()
     }
 
-    /// 还回 [`Mm::cow_unmap`] 拿走的页。
+    /// Returns the pages [`Mm::cow_unmap`] took.
     fn give_back(&self, pages: Vec<(u64, Borrowed)>) {
         if pages.is_empty() {
             return;
@@ -4033,16 +4268,17 @@ impl Mm {
         self.return_loans(pages.into_iter().map(|(page, b)| (page, b.host)), true);
     }
 
-    /// mprotect 改了 `[start, end)` 的页表项之后：写时复制的页仍然不能写，借来的页仍然
-    /// 指向拥有者的宿主页。
+    /// After mprotect changed the entries of `[start, end)`: copy-on-write pages still cannot be
+    /// written, and borrowed pages still point at the owner's host pages.
     fn cow_protect(&self, start: u64, end: u64) {
         let c = self.cow.borrow();
         for &page in c.lent.range(start..end) {
             if let Some((s, v)) = self.anon_vma(page)
                 && Self::read_only(v) != 0
             {
-                // 照样建表项，不只是改权限：PROT_NONE 的映射原来可能没有表项
-                // SAFETY: 宿主页属于这个 VMA
+                // Build the entry, not just change its permissions: a PROT_NONE mapping may have
+                // had no entry
+                // SAFETY: the host page belongs to this VMA
                 let _ = unsafe {
                     self.mmu.map_shared(
                         page,
@@ -4057,7 +4293,7 @@ impl Mm {
             if let Some((_, v)) = self.anon_vma(page)
                 && Self::read_only(v) != 0
             {
-                // SAFETY: 借来的宿主页由 b.region 持有
+                // SAFETY: b.region holds the borrowed host page
                 let _ = unsafe {
                     self.mmu
                         .map_shared(page, b.host, PAGE_SIZE, Self::read_only(v))
@@ -4066,16 +4302,18 @@ impl Mm {
         }
     }
 
-    /// `[start, end)` 里有没有写时复制的页。
+    /// Whether `[start, end)` has copy-on-write pages.
     fn has_cow(&self, start: u64, end: u64) -> bool {
         let c = self.cow.borrow();
         c.lent.range(start..end).next().is_some() || c.borrowed.range(start..end).next().is_some()
     }
 
-    /// fork：VMA `start`（私有匿名、写过）里有内容的页借给子进程 `child`，子进程在同一个
-    /// 地址的 VMA 已经映射好了自己的（全零的）宿主内存。自己借来的页让子进程向原来的
-    /// 拥有者借。子进程借的页按地址顺序放进 `borrowed`，新借出的放进 `lent`，由调用方
-    /// 一起建表。返回有没有新借出的页（自己的页表项去掉了写权限，要做 shootdown）。
+    /// fork: lends the pages with contents in VMA `start` (private anonymous, written) to child
+    /// `child`, whose VMA at the same address already maps its own (all-zero) host memory. Pages
+    /// we borrowed ourselves are borrowed by the child from their original owner. The child's
+    /// borrowed pages go into `borrowed` in address order and newly lent ones into `lent`, and the
+    /// caller builds their entries together. Returns whether pages were newly lent (our own entries
+    /// lost write permission, so a shootdown is needed).
     fn lend(
         &self,
         start: u64,
@@ -4085,10 +4323,11 @@ impl Mm {
     ) -> bool {
         let v = &self.vmas[&start];
         let end = start + v.len;
-        // 只看可能有内容的几段（Mm::touched_windows）：按需建表的大映射里没碰过的部分没有
-        // 表项，几 TB 的映射也不必逐页看。宿主从没碰过的页一定是零，子进程用自己的就行。
-        // 小的映射多半都碰过，不为它们读 pagemap（一次 pread，fork 持锁时间的三成多），
-        // 全部借出
+        // Look only at the spans that may have contents (Mm::touched_windows): untouched parts of
+        // large on-demand mappings have no entries, so a mapping of several TB need not be walked
+        // page by page. A page the host never touched is zero, and the child can use its own.
+        // Small mappings are mostly touched, so pagemap is not read for them (one pread, over 30%
+        // of fork's hold time) and everything is lent
         let small = v.len <= LEND_ALL_MAX;
         let windows = if small {
             vec![(start, end)]
@@ -4098,8 +4337,8 @@ impl Mm {
         let ro = Self::read_only(v);
         let cow = self.cow.borrow();
         let mut loans = self.loans.borrow_mut();
-        // 自己借来的、已经借出的页按地址顺序和逐页的遍历合并，不必每页查一次；它们都在
-        // windows 里
+        // Pages we borrowed and pages already lent are merged with the page-by-page walk in address
+        // order instead of a lookup per page; they all lie in windows
         let mut mine = cow.borrowed.range(start..end).peekable();
         let mut out = cow.lent.range(start..end).peekable();
         let (mut parent_runs, mut child_runs) = (Runs::default(), Runs::default());
@@ -4145,15 +4384,17 @@ impl Mm {
         }
         if ro != 0 {
             for (_, page, host, len) in parent_runs.runs {
-                // 照样建表项，不只是改权限：不依赖宿主上碰过的页都已经有表项
-                // SAFETY: 宿主页属于这个 VMA
+                // Build the entry, not just change its permissions: this does not rely on every
+                // page the host touched already having an entry
+                // SAFETY: the host page belongs to this VMA
                 let _ = unsafe {
                     self.mmu
                         .map_shared(page, NonNull::new_unchecked(host as *mut u8), len, ro)
                 };
             }
             for (_, page, host, len) in child_runs.runs {
-                // SAFETY: 借来的宿主页由 Borrowed::region 持有，记在子进程的 borrowed 里
+                // SAFETY: Borrowed::region holds the borrowed host page, recorded in the child's
+                // borrowed
                 let _ = unsafe {
                     child
                         .mmu
@@ -4164,9 +4405,11 @@ impl Mm {
         lent.len() > before
     }
 
-    /// 地址空间销毁时：私有匿名内存里没有借出的页交还宿主。借出的页留给借用方，它们持有
-    /// 那段宿主内存，要等最后一个借用方还回来才释放；同一段宿主内存可能切成了几个 VMA，
-    /// 所以每个都要看（没写过的内容全是零、宿主没碰过，不必看）。
+    /// When the address space is destroyed: pages of private anonymous memory that are not lent go
+    /// back to the host. Lent pages stay with the borrowers, which hold that host memory, and are
+    /// released only when the last borrower returns them; one piece of host memory may have been
+    /// split into several VMAs, so each is checked (contents never written are all zero and
+    /// untouched by the host, so those need no check).
     fn discard_unlent(&self, lent: &BTreeSet<u64>) {
         for (&s, v) in self
             .vmas
@@ -4177,7 +4420,8 @@ impl Mm {
             let mut cursor = s;
             for page in lent.range(s..end).copied().chain([end]) {
                 if page > cursor {
-                    // SAFETY: [cursor, page) 落在这个私有匿名 VMA 里，不再有人用
+                    // SAFETY: [cursor, page) is inside this private anonymous VMA and no longer
+                    // used by anyone
                     unsafe { discard_host(Self::own_page(s, v, cursor), (page - cursor) as usize) };
                 }
                 cursor = page + PAGE_SIZE;
@@ -4193,9 +4437,9 @@ impl Drop for Mm {
             group.claims.borrow_mut().retain(|c| c.0 != self.code_tag);
         }
         self.release_cow();
-        // SAFETY: 之后不再使用 self.mmu
+        // SAFETY: self.mmu is not used afterwards
         let mmu = unsafe { ManuallyDrop::take(&mut self.mmu) };
-        // 持有 BKL 时放开之后再释放（release_unmapped）
+        // While holding the BKL, release it after the BKL is released (release_unmapped)
         if let Some(mmu) = UNMAPPED.with_borrow_mut(|u| match u {
             Some(u) => {
                 u.mmus.push(mmu);
@@ -4209,13 +4453,15 @@ impl Drop for Mm {
 }
 
 impl Mm {
-    /// 地址空间销毁时：记下翻译所在的映射，还回借来的页，借出的页留给借用方。
+    /// When the address space is destroyed: records the mappings the translations came from,
+    /// returns borrowed pages, and leaves lent pages with the borrowers.
     fn release_cow(&mut self) {
         if let Some(cs) = &self.code_space {
             cs.space.set_sources(&self.code_sources());
         }
         let cow = std::mem::take(self.cow.get_mut());
-        // 已经没有线程在用这个地址空间（退出、execve），还回借来的页之前不必刷新 TLB
+        // No thread uses this address space any more (exit, execve), so no TLB flush is needed
+        // before returning borrowed pages
         self.return_loans(
             cow.borrowed.into_iter().map(|(page, b)| (page, b.host)),
             true,
@@ -4223,7 +4469,7 @@ impl Mm {
         if cow.lent.is_empty() {
             return;
         }
-        // 借出的页成了孤儿页
+        // Lent pages become orphans
         {
             let mut loans = self.loans.borrow_mut();
             for &page in &cow.lent {
@@ -4245,12 +4491,13 @@ impl Default for Mm {
     }
 }
 
-/// 逐页拷贝，跳过全零的页（目标内存已经清零）。
+/// Copies page by page, skipping all-zero pages (the destination is already zeroed).
 ///
 /// # Safety
 ///
-/// `src` 和 `dst` 都必须指向至少 `len` 字节、互不重叠的可访问内存，`len` 是页大小的整数倍。
-/// `touched` 是每页有没有被碰过（[`appine_hal::touched_pages`]），没碰过的页不看。
+/// `src` and `dst` must both point to at least `len` bytes of accessible, non-overlapping memory,
+/// and `len` must be a multiple of the page size. `touched` tells whether each page was touched
+/// ([`appine_hal::touched_pages`]); untouched pages are not looked at.
 unsafe fn copy_nonzero_pages(src: *const u8, dst: *mut u8, len: usize, touched: Option<&[bool]>) {
     const PAGE: usize = PAGE_SIZE as usize;
     for (i, off) in (0..len).step_by(PAGE).enumerate() {
@@ -4276,7 +4523,7 @@ mod tests {
 
     #[test]
     fn code_groups_register_only_consistent_mappings() {
-        // 宿主不支持 Tier 1 时没有翻译可以共用
+        // Without Tier 1 support on the host there are no translations to share
         let Some(space) = appine_engine::DbtSpace::new(0, appine_engine::DbtRegs::Default) else {
             return;
         };
@@ -4296,22 +4543,25 @@ mod tests {
             shared: Cell::new(false),
         };
         let count = || group.ranges.borrow().len();
-        // 动态链接器先按整个文件映射、再盖上后面的段：同一个文件、同样的基址，已经覆盖
+        // The dynamic linker maps the whole file first, then maps the later segments over it: the
+        // same file with the same base, already covered
         assert!(group.extend(&[src(lib, 0x18000, 5, 0)]));
-        // 同一个文件后面的一段，基址相同：一致，登记进来
+        // A later piece of the same file with the same base: consistent, so it is registered
         assert!(group.extend(&[src(lib + 0x30000, 0x1000, 5, 0x30000)]));
         assert_eq!(count(), 2);
-        // 同一个地址上是别的文件、同一个文件的别的偏移、同一个文件的别的版本：都冲突，不改
+        // Another file at the same address, another offset of the same file, another version of
+        // the same file: all conflict and change nothing
         assert!(!group.extend(&[src(lib, 0x1000, 6, 0)]));
         assert!(!group.extend(&[src(lib + 0x1000, 0x1000, 5, 0)]));
         let mut other_version = src(lib, 0x1000, 5, 0);
         other_version.id[3] = 9;
         assert!(!group.extend(&[other_version]));
-        // 有一段冲突时整个 layout 都不登记
+        // If one piece conflicts, none of the layout is registered
         assert!(!group.extend(&[src(0x9000_0000, 0x1000, 9, 0), src(lib, 0x1000, 6, 0)]));
         assert_eq!(count(), 2);
-        // 最后一个成员离开组时留下块的范围：与登记的一致的、没登记过的留下，登记过的地址上
-        // 是别的文件的不留（那里的块是别的成员翻译的）
+        // Ranges whose blocks stay when the last member leaves the group: ones consistent with the
+        // registration and unregistered ones stay; registered addresses holding another file do
+        // not (the blocks there were translated by other members)
         let (same, other, new) = (
             src(lib, 0x18000, 5, 0),
             src(lib + 0x30000, 0x1000, 6, 0x30000),
@@ -4323,7 +4573,7 @@ mod tests {
             .map(|s| (s.start, s.id[1]))
             .collect();
         assert_eq!(kept, [(lib, 5), (0x9000_0000, 9)]);
-        // 不相交的新映射登记进来，登记满了就不再接受
+        // Disjoint new mappings are registered, and once registration is full no more are accepted
         let more: Vec<_> = (0..CodeGroup::MAX_RANGES as u64)
             .map(|i| src(0x1_0000_0000 + i * 0x10000, 0x1000, 100 + i, 0))
             .collect();
@@ -4352,15 +4602,18 @@ mod tests {
             closed: Cell::new(false),
             shared: Cell::new(false),
         };
-        // 别的成员（标签 2）在同一个地址也有 JIT 的代码：私有的范围之间可以重叠
+        // Another member (tag 2) also has JIT code at the same address: private ranges may overlap
+        // each other
         let jit = [(0x9000_0000, 0x9001_0000), (0xb000_0000, 0xb001_0000)];
         assert!(group.admit(2, &[src(lib, 0x10000, 5)], &jit));
-        // JIT 的代码压着登记过的文件、文件压着别的成员的 JIT 代码：都不行，什么也不改
+        // JIT code over a registered file, or a file over another member's JIT code: both refused,
+        // changing nothing
         assert!(!group.admit(2, &[], &[(lib + 0x8000, lib + 0x9000)]));
         assert!(!group.admit(2, &[src(0x9000_8000, 0x1000, 6)], &[]));
         assert_eq!(group.ranges.borrow().len(), 1);
         assert_eq!(group.claims.borrow().len(), 3);
-        // 自己原来 JIT 的地方换成了文件：登记，换上新的私有范围
+        // A file now where it used to have JIT code: registered, with the new private ranges
+        // installed
         assert!(group.admit(
             2,
             &[src(0xb000_0000, 0x1000, 6)],
@@ -4419,11 +4672,12 @@ mod tests {
         assert!(a + 4 * PAGE_SIZE <= mm.mmap_top);
         mm.write_kernel(a + 3 * PAGE_SIZE, b"tail").unwrap();
 
-        // 中间挖掉一页：两侧仍然可用，数据不变；宿主内存要等 shootdown 之后才释放
+        // Punch out a page in the middle: both sides stay usable with their data intact; the host
+        // memory is released only after the shootdown
         mm.munmap(a + PAGE_SIZE, PAGE_SIZE).unwrap();
         assert!(std::mem::take(&mut mm.dirty));
         assert_eq!(mm.graveyard.len(), 1);
-        // 几乎整个地址空间都没有映射：立即成功，什么都不做
+        // Almost the whole address space is unmapped: succeeds at once and does nothing
         mm.munmap(MMAP_MIN, a - MMAP_MIN).unwrap();
         assert!(!mm.dirty);
         assert_eq!(mm.vmas.len(), 2);
@@ -4433,7 +4687,7 @@ mod tests {
             .unwrap();
         assert_eq!(&buf, b"tail");
 
-        // mprotect 跨过空洞失败；在完整映射上切出只读的一页
+        // mprotect across a hole fails; carve a read-only page out of a complete mapping
         assert_eq!(
             mm.mprotect(a, 3 * PAGE_SIZE, prot::READ),
             Err(Errno::ENOMEM)
@@ -4444,7 +4698,7 @@ mod tests {
         assert!(mm.mmu().translate(a + 3 * PAGE_SIZE, prot::WRITE).is_some());
         assert_eq!(mm.vmas.len(), 3);
 
-        // MAP_FIXED 覆盖已有映射；NOREPLACE 不覆盖
+        // MAP_FIXED replaces existing mappings; NOREPLACE does not
         let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
         assert_eq!(mm.mmap(a, 2 * PAGE_SIZE, RW, fixed, None).unwrap(), a);
         let noreplace = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED_NOREPLACE;
@@ -4461,16 +4715,17 @@ mod tests {
         let rx = prot::READ | prot::EXEC;
         let data = mm.mmap(0, 2 * PAGE_SIZE, RW, anon, None).unwrap();
         let code = mm.mmap(0, 2 * PAGE_SIZE, rx, anon, None).unwrap();
-        // 数据页的变化只要刷新 TLB
+        // Changes to data pages need only a TLB flush
         mm.munmap(data, PAGE_SIZE).unwrap();
         mm.mprotect(data + PAGE_SIZE, PAGE_SIZE, prot::READ)
             .unwrap();
         mm.mprotect(code, PAGE_SIZE, rx).unwrap();
         assert!(std::mem::take(&mut mm.dirty) && mm.code_ranges.is_empty());
-        // 只增加权限：TLB 不必刷新
+        // Only adding permissions: no TLB flush needed
         mm.mprotect(data + PAGE_SIZE, PAGE_SIZE, RW).unwrap();
         assert!(!mm.dirty);
-        // 代码页去掉执行权限（W^X 的 JIT 改写代码之前）、被拆除：这些页的翻译要作废
+        // A code page loses execute permission (before a W^X JIT rewrites code) or is torn down:
+        // the translations of those pages must be invalidated
         mm.mprotect(code, PAGE_SIZE, RW).unwrap();
         assert_eq!(std::mem::take(&mut mm.code_ranges), [(code, PAGE_SIZE)]);
         mm.munmap(code + PAGE_SIZE, PAGE_SIZE).unwrap();
@@ -4487,13 +4742,13 @@ mod tests {
             log.since(1, 2),
             Some(vec![(0x5000, 0x2000), (0x9000, 0x1000)])
         );
-        // 读到的代数之后才记下的范围不算
+        // Ranges recorded after the generation read do not count
         assert_eq!(log.since(0, 1), Some(vec![(0x1000, 0x1000)]));
         let last = CodeLog::GENERATIONS + 36;
         for g in 3..=last {
             log.push(g, &[(g << 12, 0x1000)]);
         }
-        // 太旧的记录已经挤掉：只能整体清空
+        // Records too old have been pushed out: only a full flush is possible
         assert_eq!(log.since(0, last), None);
         assert_eq!(log.since(last - 1, last), Some(vec![(last << 12, 0x1000)]));
     }
@@ -4533,7 +4788,8 @@ mod tests {
             .read(UserSlice::new(shared, 4), &mut buf[..4])
             .unwrap();
         assert_eq!(&buf[..4], b"both");
-        // 映射自顶向下分配：private 上方就是 mmap 区的上界，没有映射
+        // Mappings are allocated top down: right above private is the upper bound of the mmap
+        // area, with nothing mapped
         assert!(child.is_mapped(private) && !child.is_mapped(private + 2 * PAGE_SIZE));
     }
 
@@ -4541,17 +4797,17 @@ mod tests {
     fn fork_skips_only_never_written_anonymous_mappings() {
         let mut mm = Mm::new();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
-        // V8 式的预留：PROT_NONE 加 MAP_NORESERVE，再把一部分改成可写
+        // A V8-style reservation: PROT_NONE plus MAP_NORESERVE, then part of it made writable
         let reserved = mm
             .mmap(0, 1 << 33, 0, anon | flags::MAP_NORESERVE, None)
             .unwrap();
         mm.mprotect(reserved, PAGE_SIZE, RW).unwrap();
         mm.write_kernel(reserved, b"heap").unwrap();
-        // 写过之后去掉权限：内容还在，fork 要复制
+        // Permissions removed after writing: the contents remain, so fork must copy them
         let hidden = mm.mmap(0, PAGE_SIZE, RW, anon, None).unwrap();
         mm.write_kernel(hidden, b"kept").unwrap();
         mm.mprotect(hidden, PAGE_SIZE, 0).unwrap();
-        // 加载器那样映射成只读再由内核写入
+        // Mapped read-only like the loader does, then written by the kernel
         let text = mm.mmap(0, PAGE_SIZE, prot::READ, anon, None).unwrap();
         mm.write_kernel(text, b"code").unwrap();
         let child = mm.fork().unwrap();
@@ -4561,7 +4817,8 @@ mod tests {
         assert_eq!(&buf, b"heap");
         child.read(UserSlice::new(text, 4), &mut buf).unwrap();
         assert_eq!(&buf, b"code");
-        // PROT_NONE 的页不在页表里，权限加回来之后内容还在
+        // PROT_NONE pages are not in the page table, and the contents are still there once
+        // permissions are added back
         assert!(child.mmu().translate(hidden, 0).is_none());
         assert!(child.mmu().translate(reserved + PAGE_SIZE, 0).is_none());
         child.mprotect(hidden, PAGE_SIZE, prot::READ).unwrap();
@@ -4579,7 +4836,8 @@ mod tests {
         f.write_all(&[7u8; 5000]).unwrap();
         let f = std::fs::File::open(&path).unwrap();
         let mut mm = Mm::new();
-        // 映射 3 页，文件只有 5000 字节：最后一页完全在文件末尾之后，碰了就是 SIGBUS
+        // Map 3 pages of a file of only 5000 bytes: the last page lies entirely past the end of the
+        // file, and touching it is SIGBUS
         let ro = mm
             .mmap(
                 0,
@@ -4608,12 +4866,13 @@ mod tests {
         assert_eq!(b[0], 7);
         child.read(UserSlice::new(rw, 6), &mut b).unwrap();
         assert_eq!(&b, b"parent");
-        // 共用的只读映射改成可写之前先复制一份：父进程写入，子进程看不到
+        // A shared read-only mapping copies first before becoming writable: the parent writes and
+        // the child does not see it
         mm.mprotect(ro, PAGE_SIZE, RW).unwrap();
         mm.write(UserSlice::new(ro, 1), &[1]).unwrap();
         child.read(UserSlice::new(ro, 1), &mut b[..1]).unwrap();
         assert_eq!(b[0], 7);
-        // 超出文件末尾的页不在页表里，复制一份之后也一样
+        // Pages past the end of the file are not in the page table, and stay so after the copy
         for m in [&mut mm, &mut child] {
             for base in [ro, rw] {
                 assert!(m.mmu().translate(base + PAGE_SIZE, prot::READ).is_some());
@@ -4622,7 +4881,8 @@ mod tests {
                 assert_eq!(m.fault_past_eof(base + PAGE_SIZE), None);
             }
         }
-        // 文件的可执行映射一次建好表项，但只建到文件末尾：1 GB 的映射只有两页
+        // An executable file mapping gets its entries at once, but only up to the end of the file:
+        // a 1 GB mapping has only two pages
         let exec = mm
             .mmap(
                 0,
@@ -4663,12 +4923,12 @@ mod tests {
         assert!(mm.mmu().translate(a, prot::WRITE).is_some());
         assert!(mm.mmu().translate(a + PAGE_SIZE, 0).is_none());
         assert_eq!(mm.fault_past_eof(a + PAGE_SIZE), Some(true));
-        // 文件变长之后，访问新的部分只需要重新执行
+        // After the file grows, accessing the new part only needs re-execution
         f.set_len(2 * PAGE_SIZE + 1).unwrap();
         assert_eq!(mm.fault_past_eof(a + 2 * PAGE_SIZE), Some(false));
         assert!(mm.mmu().translate(a + 2 * PAGE_SIZE, prot::WRITE).is_some());
         assert_eq!(mm.fault_past_eof(a + 3 * PAGE_SIZE), Some(true));
-        // 不在任何映射里的地址交给普通的 SIGSEGV 处理
+        // An address outside every mapping is left to ordinary SIGSEGV handling
         assert_eq!(mm.fault_past_eof(a + 4 * PAGE_SIZE), None);
         let _ = std::fs::remove_file(&path);
     }
@@ -4704,21 +4964,24 @@ mod tests {
             .mmap(0, 3 * PAGE_SIZE, 0, flags::MAP_PRIVATE, file(false))
             .unwrap();
         let meta = f.metadata().unwrap();
-        // 别的文件变短不影响这些映射
+        // Another file getting shorter does not affect these mappings
         assert!(!mm.file_truncated(meta.dev(), meta.ino() + 1, 0));
         f.set_len(PAGE_SIZE + 10).unwrap();
         assert!(mm.file_truncated(meta.dev(), meta.ino(), PAGE_SIZE + 10));
         for a in [shared, private] {
-            // 文件末尾所在的那一页还在，后面的页访问时得到 SIGBUS
+            // The page containing the end of the file stays, and the pages after it get SIGBUS on
+            // access
             assert!(mm.mmu().translate(a + PAGE_SIZE, prot::READ).is_some());
             assert!(mm.mmu().translate(a + 2 * PAGE_SIZE, 0).is_none());
             assert_eq!(mm.fault_past_eof(a + 2 * PAGE_SIZE), Some(true));
         }
-        // 没有权限的映射改成可读时也只放文件末尾之前的页
+        // A mapping without permissions made readable also gets only the pages before the end of
+        // the file
         mm.mprotect(hidden, 3 * PAGE_SIZE, prot::READ).unwrap();
         assert!(mm.mmu().translate(hidden + PAGE_SIZE, prot::READ).is_some());
         assert!(mm.mmu().translate(hidden + 2 * PAGE_SIZE, 0).is_none());
-        // 再次截短到同样的长度没有改动；共享映射的文件变长之后可以接着访问
+        // Truncating again to the same length changes nothing; after a shared mapping's file grows
+        // it can be accessed further
         assert!(!mm.file_truncated(meta.dev(), meta.ino(), PAGE_SIZE + 10));
         f.set_len(3 * PAGE_SIZE).unwrap();
         assert_eq!(mm.fault_past_eof(shared + 2 * PAGE_SIZE), Some(false));
@@ -4729,33 +4992,34 @@ mod tests {
     fn prot_none_stays_out_of_the_page_table() {
         let mut mm = Mm::new();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_NORESERVE;
-        // V8 为一块 wasm 内存预留的大小：一页都不进页表
+        // The size V8 reserves for one wasm memory: not a single page enters the page table
         let a = mm.mmap(0, 1 << 33, 0, anon, None).unwrap();
         let page = a + (1 << 32);
         assert!(mm.mmu().translate(page, 0).is_none());
         mm.mprotect(page, PAGE_SIZE, RW).unwrap();
         mm.write(UserSlice::new(page, 2), b"hi").unwrap();
         assert!(mm.mmu().translate(page + PAGE_SIZE, 0).is_none());
-        // 去掉权限再加回来，内容还在
+        // Remove permissions and add them back: the contents remain
         mm.mprotect(page, PAGE_SIZE, 0).unwrap();
         assert!(mm.mmu().translate(page, 0).is_none());
         mm.mprotect(page, PAGE_SIZE, prot::READ).unwrap();
         let mut buf = [0u8; 2];
         mm.read(UserSlice::new(page, 2), &mut buf).unwrap();
         assert_eq!(&buf, b"hi");
-        // 内核写入不看页表：没有权限的页也能写
+        // Kernel writes ignore the page table: pages without permissions can be written too
         mm.write_kernel(a, b"k").unwrap();
         mm.munmap(a, 1 << 33).unwrap();
         assert!(mm.mmu().translate(page, 0).is_none());
     }
 
-    /// 39 位宿主地址空间（HostRegion::reserved）：PROT_NONE 的预留不占宿主内存，只有变得
-    /// 可以访问、内核写过的那几段有；fork、mincore、pagemap、mremap 扩展、丢弃都不碰它。
+    /// 39-bit host address space (HostRegion::reserved): PROT_NONE reservations take no host
+    /// memory; only the parts that became accessible or were written by the kernel have some; fork,
+    /// mincore, pagemap, mremap growth and discarding leave them alone.
     #[test]
     fn prot_none_reservations_take_no_host_memory() {
         let mm = Mm::new().into_shared();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
-        // V8 的沙箱：1 TB
+        // V8's sandbox: 1 TB
         let len = 1 << 40;
         let a = mm.borrow_mut().mmap(0, len, 0, anon, None).unwrap();
         let backed = |m: &Rc<RefCell<Mm>>| -> Vec<(u64, u64)> {
@@ -4767,27 +5031,28 @@ mod tests {
                 .collect()
         };
         assert!(mm.borrow().vmas[&a].reserved());
-        // 中间两页变得可写：只有它们有宿主内存
+        // Two pages in the middle become writable: only they have host memory
         let p = a + (1 << 39);
         mm.borrow_mut().mprotect(p, 2 * PAGE_SIZE, RW).unwrap();
         assert_eq!(backed(&mm), [(p, 2 * PAGE_SIZE)]);
         poke(&mm, p + 1, b'p');
         assert_eq!(byte(&mm, p + 1), b'p');
-        // 没有内容，不驻留
+        // No contents, not resident
         let m = mm.borrow();
         assert_eq!(m.residency(a, 4 * PAGE_SIZE).unwrap(), [false; 4]);
         assert_eq!(m.pagemap(a, 2), [0, 0]);
         assert_eq!(m.resident_in(a, len), 1);
         drop(m);
         mm.borrow_mut().discard(a, p - a).unwrap();
-        // 内核往没有权限的页写（PTRACE_POKEDATA）：只有写到的那页换上宿主内存
+        // The kernel writes into a page without permissions (PTRACE_POKEDATA): only the page
+        // written gets host memory
         let q = a + 5 * PAGE_SIZE + 3;
         mm.borrow_mut().write_kernel(q, b"q").unwrap();
         assert_eq!(
             backed(&mm),
             [(a + 5 * PAGE_SIZE, PAGE_SIZE), (p, 2 * PAGE_SIZE)]
         );
-        // fork：子进程里也只是预留，写过的内容照样看得到
+        // fork: still only a reservation in the child, and what was written is still visible
         let child = mm.borrow_mut().fork().unwrap();
         assert_eq!(backed(&child).len(), 2);
         assert_eq!(byte(&child, p + 1), b'p');
@@ -4796,7 +5061,7 @@ mod tests {
             .mprotect(q & !(PAGE_SIZE - 1), PAGE_SIZE, prot::READ)
             .unwrap();
         assert_eq!(byte(&child, q), b'q');
-        // mremap 原地扩大一段预留：接上的也只是预留
+        // mremap grows a reservation in place: the added part is only a reservation too
         let r = 1 << 41;
         let fixed = anon | flags::MAP_FIXED;
         mm.borrow_mut().mmap(r, PAGE_SIZE, 0, fixed, None).unwrap();
@@ -4822,21 +5087,23 @@ mod tests {
         mm.mmap(top - PAGE_SIZE, PAGE_SIZE, RW, fixed, None)
             .unwrap();
         mm.set_growsdown(top - PAGE_SIZE);
-        // 访问下面隔了几页的地址：一直长到那里，长出来的部分还能接着长
+        // Access an address a few pages below: it grows all the way there, and the grown part can
+        // keep growing
         assert!(mm.grow_down(top - 5 * PAGE_SIZE + 8, u64::MAX));
         mm.write(UserSlice::new(top - 5 * PAGE_SIZE, 2), b"ok")
             .unwrap();
         assert!(mm.grow_down(top - 6 * PAGE_SIZE, u64::MAX));
-        // 已经映射的地址、不向下增长的映射下面都不增长
+        // No growth at an address already mapped, or below a mapping that does not grow down
         assert!(!mm.grow_down(top - 6 * PAGE_SIZE, u64::MAX));
         mm.mmap(base, PAGE_SIZE, RW, fixed, None).unwrap();
         assert!(!mm.grow_down(base - PAGE_SIZE, u64::MAX));
-        // 离下面那个映射不到 256 页：不增长；它是 PROT_NONE 时不算
+        // Less than 256 pages from the mapping below: no growth; it does not count when it is
+        // PROT_NONE
         let guard_end = base + PAGE_SIZE + STACK_GUARD_GAP;
         assert!(!mm.grow_down(guard_end - PAGE_SIZE, u64::MAX));
         mm.mprotect(base, PAGE_SIZE, 0).unwrap();
         assert!(mm.grow_down(guard_end - PAGE_SIZE, u64::MAX));
-        // fork 之后子进程里的也照样增长
+        // After fork it grows in the child as well
         let child = mm.fork().unwrap();
         let mut child = child.borrow_mut();
         assert!(child.grow_down(guard_end - 2 * PAGE_SIZE, u64::MAX));
@@ -4848,7 +5115,7 @@ mod tests {
         mm.map_stack(2 * PAGE_SIZE, 16 * PAGE_SIZE).unwrap();
         mm.set_start_stack(STACK_TOP - 16);
         mm.write(UserSlice::new(STACK_TOP - 4, 4), b"top!").unwrap();
-        // 预留的范围里：还是同一个 VMA，原来的内容不变
+        // Within the reserved range: still the same VMA, with the old contents unchanged
         assert!(mm.grow_down(STACK_TOP - 10 * PAGE_SIZE + 100, u64::MAX));
         assert_eq!(mm.vmas.len(), 1);
         assert_eq!(mm.stack_low(), STACK_TOP - 10 * PAGE_SIZE);
@@ -4859,13 +5126,14 @@ mod tests {
         assert_eq!(&buf, b"top!");
         assert!(mm.grow_down(STACK_TOP - 16 * PAGE_SIZE, u64::MAX));
         assert_eq!(mm.vmas.len(), 1);
-        // 超出预留：新的一段，下面再预留到和栈一样大，接着就地增长
+        // Beyond the reservation: a new piece, reserving below it as much as the stack again, then
+        // growing in place
         assert!(mm.grow_down(STACK_TOP - 17 * PAGE_SIZE, u64::MAX));
         assert!(mm.grow_down(STACK_TOP - 32 * PAGE_SIZE, u64::MAX));
         assert_eq!(mm.vmas.len(), 2);
         assert!(mm.grow_down(STACK_TOP - 33 * PAGE_SIZE, u64::MAX));
         assert_eq!(mm.vmas.len(), 3);
-        // maps 里仍然是一行 [stack]
+        // Still one [stack] line in maps
         let regions = mm.regions();
         assert_eq!(regions.len(), 1);
         assert_eq!(
@@ -4879,13 +5147,13 @@ mod tests {
     fn stack_growth_stops_at_the_limit() {
         let mut mm = Mm::new();
         mm.map_stack(2 * PAGE_SIZE, 4 * PAGE_SIZE).unwrap();
-        // 长完之后的大小按分开的几段合起来算
+        // The size after growing counts the separate pieces together
         assert!(!mm.grow_down(STACK_TOP - 9 * PAGE_SIZE, 8 * PAGE_SIZE));
         assert!(mm.grow_down(STACK_TOP - 6 * PAGE_SIZE, 8 * PAGE_SIZE));
         assert!(!mm.grow_down(STACK_TOP - 9 * PAGE_SIZE, 8 * PAGE_SIZE));
         assert!(mm.grow_down(STACK_TOP - 8 * PAGE_SIZE, 8 * PAGE_SIZE));
         assert_eq!(mm.vmas.len(), 3);
-        // 上限调高之后接着长
+        // Keeps growing after the limit is raised
         assert!(mm.grow_down(STACK_TOP - 9 * PAGE_SIZE, 9 * PAGE_SIZE));
     }
 
@@ -4926,7 +5194,7 @@ mod tests {
         let a = mm.mmap(0, len, RW, anon, None).unwrap();
         mm.write(UserSlice::new(a, len as usize), &vec![7u8; len as usize])
             .unwrap();
-        // 不按宿主页对齐的一段：中间交给宿主，两头清零
+        // A range not aligned to host pages: the middle goes to the host, both ends are zeroed
         mm.discard(a + PAGE_SIZE, 5 * PAGE_SIZE).unwrap();
         let mut buf = vec![0u8; len as usize];
         mm.read(UserSlice::new(a, len as usize), &mut buf).unwrap();
@@ -4942,13 +5210,14 @@ mod tests {
         let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
         let a = mm.mmap(0x100000, 2 * PAGE_SIZE, RW, fixed, None).unwrap();
         mm.write_kernel(a, b"keep").unwrap();
-        // 后面是空的：原地扩展
+        // Free space behind it: extend in place
         let b = mm
             .mremap(a, 2 * PAGE_SIZE, 3 * PAGE_SIZE, false, None, None)
             .unwrap();
         assert_eq!(b, a);
         mm.write_kernel(a + 2 * PAGE_SIZE, b"x").unwrap();
-        // 后面被占住：不许搬家就失败，许可就搬到别处，内容不变
+        // Space behind it taken: fails if moving is not allowed, otherwise moves elsewhere with the
+        // contents unchanged
         mm.mmap(a + 3 * PAGE_SIZE, PAGE_SIZE, RW, fixed, None)
             .unwrap();
         assert_eq!(
@@ -4966,13 +5235,13 @@ mod tests {
         mm.read(UserSlice::new(c + 4 * PAGE_SIZE, 4), &mut buf)
             .unwrap();
         assert_eq!(buf, [0; 4]);
-        // 缩小：去掉尾部
+        // Shrink: drop the tail
         assert_eq!(
             mm.mremap(c, 5 * PAGE_SIZE, PAGE_SIZE, false, None, None),
             Ok(c)
         );
         assert!(!mm.is_mapped(c + PAGE_SIZE));
-        // 没有完全映射的区间
+        // A range not fully mapped
         assert_eq!(
             mm.mremap(c, 2 * PAGE_SIZE, PAGE_SIZE, true, None, None),
             Err(Errno::EFAULT)
@@ -5041,7 +5310,7 @@ mod tests {
         let mut buf = [1u8; 3];
         mm.read(UserSlice::new(0x53_f000, 3), &mut buf).unwrap();
         assert_eq!(buf, [0; 3]);
-        // 子进程里接着扩展也还是一个 VMA，内容是复制过来的
+        // Growing further in the child is still one VMA, with the contents copied over
         mm.write_kernel(0x50_0000, b"heap").unwrap();
         let child = mm.fork().unwrap();
         let mut buf = [0u8; 4];
@@ -5052,7 +5321,8 @@ mod tests {
             child.read(UserSlice::new(0x50_0000, 4), &mut buf).unwrap();
             assert_eq!(&buf, b"heap");
         }
-        // 堆中间的一页被换掉之后，后面那段照样能扩展；子进程借的那页先复制给它
+        // After a page in the middle of the heap is replaced, the part after it can still grow; the
+        // page the child borrowed is copied for it first
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
         mm.mmap(0x50_0000, PAGE_SIZE, 0, anon, None).unwrap();
         child
@@ -5067,7 +5337,7 @@ mod tests {
         assert_eq!(regions[1].name.as_deref(), Some(&b"[heap]"[..]));
     }
 
-    /// 读 `addr` 处的一个字节。
+    /// Reads one byte at `addr`.
     fn byte(mm: &Rc<RefCell<Mm>>, addr: u64) -> u8 {
         let mut b = [0u8];
         mm.borrow().read(UserSlice::new(addr, 1), &mut b).unwrap();
@@ -5094,18 +5364,19 @@ mod tests {
             poke(&parent, a + i * PAGE_SIZE, b'p');
         }
         let child = parent.borrow_mut().fork().unwrap();
-        // 两边的页表都指向父进程的宿主页，都不能写
+        // Both page tables point at the parent's host page, and neither can write
         let host = |mm: &Rc<RefCell<Mm>>, addr| mm.borrow().mmu().translate(addr, prot::READ);
         assert_eq!(host(&parent, a), host(&child, a));
         assert!(!writable(&parent, a) && !writable(&child, a));
-        // 子进程写：复制一份自己的；父进程是唯一的使用者了，马上恢复写权限
+        // The child writes: it copies its own; the parent is now the only user and gets write
+        // permission back at once
         poke(&child, a, b'c');
         assert_eq!((byte(&parent, a), byte(&child, a)), (b'p', b'c'));
         assert!(writable(&parent, a) && writable(&child, a));
-        // 父进程写：子进程先复制一份
+        // The parent writes: the child copies first
         poke(&parent, a + PAGE_SIZE, b'q');
         assert_eq!(byte(&child, a + PAGE_SIZE), b'p');
-        // 孙进程向子进程借第 0 页，向原来的拥有者借第 2 页
+        // The grandchild borrows page 0 from the child and page 2 from the original owner
         let grandchild = child.borrow_mut().fork().unwrap();
         assert_eq!(
             host(&grandchild, a + 2 * PAGE_SIZE),
@@ -5116,12 +5387,13 @@ mod tests {
         assert_eq!(byte(&grandchild, a + 2 * PAGE_SIZE), b'p');
         poke(&child, a, b'd');
         assert_eq!(byte(&grandchild, a), b'c');
-        // 拥有者的地址空间销毁：借出的页留给子孙，内容不变，它们照样能写
+        // The owner's address space is destroyed: lent pages stay with the descendants, contents
+        // unchanged, and they can still write
         drop(parent);
         poke(&grandchild, a + 3 * PAGE_SIZE, b'g');
         assert_eq!(byte(&child, a + 3 * PAGE_SIZE), b'p');
         assert_eq!(byte(&grandchild, a + 3 * PAGE_SIZE), b'g');
-        // 子进程解除映射：孙进程借它的页先复制
+        // The child unmaps: pages the grandchild borrowed from it are copied first
         child.borrow_mut().munmap(a, 4 * PAGE_SIZE).unwrap();
         assert_eq!(byte(&grandchild, a), b'c');
         assert_eq!(byte(&grandchild, a + PAGE_SIZE), b'p');
@@ -5135,30 +5407,32 @@ mod tests {
     fn large_mappings_build_page_tables_on_demand() {
         let mm = Mm::new().into_shared();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_NORESERVE;
-        // 64 GB：逐页建表要 128 MB。起点按叶子表对齐
+        // 64 GB: building entries page by page would take 128 MB. The start is aligned to a leaf
+        // table
         let len = 64 << 30;
         let fixed = anon | flags::MAP_FIXED;
         let a = mm.borrow_mut().mmap(1 << 40, len, RW, fixed, None).unwrap();
         let present = |mm: &Rc<RefCell<Mm>>, from| mm.borrow().mmu().next_present(from, a + len);
         assert_eq!(present(&mm, a), a + len);
-        // 访问出错时补上同一张叶子表（2 MB）里的页，已经有表项的不再补
+        // A fault fills the pages in the same leaf table (2 MB), not those that already have
+        // entries
         assert!(mm.borrow().fault_in(a + 5 * PAGE_SIZE + 7, prot::WRITE));
         assert!(!mm.borrow().fault_in(a + 6 * PAGE_SIZE, prot::READ));
         assert!(writable(&mm, a + LEAF_SPAN - PAGE_SIZE));
         assert_eq!(present(&mm, a + LEAF_SPAN), a + len);
-        // 内核层读写也按需建表
+        // Kernel-layer reads and writes also fill entries on demand
         let far = a + len / 2 + 3 * PAGE_SIZE;
         poke(&mm, far, b'x');
         assert_eq!(byte(&mm, far), b'x');
         assert_eq!(present(&mm, a + LEAF_SPAN), far & !(LEAF_SPAN - 1));
-        // 映射外、没有这个权限的不补
+        // Nothing is filled outside the mapping or without the permission
         assert!(!mm.borrow().fault_in(a + len, prot::READ));
         assert!(!mm.borrow().fault_in(a, prot::EXEC));
-        // 驻留内存只量有表项的几段
+        // Resident memory measures only the spans with entries
         poke(&mm, a, b'p');
         assert!(mm.borrow().resident_pages() < 16);
         assert!(mm.borrow().resident_in(a, len) <= 2);
-        // fork 只借碰过的页
+        // fork lends only the pages touched
         let child = mm.borrow_mut().fork().unwrap();
         assert_eq!((byte(&child, a), byte(&child, far)), (b'p', b'x'));
         assert!(child.borrow().cow.borrow().borrowed.len() <= 2 * 512);
@@ -5169,7 +5443,8 @@ mod tests {
 
     #[test]
     fn written_pages_keep_entries_through_prot_none_mremap_and_kernel_writes() {
-        // 按需建表的大映射里，有内容的页一定有表项：fork 借页只看有表项的几段
+        // In large on-demand mappings every page with contents has an entry: fork's lending looks
+        // only at the spans with entries
         let mm = Mm::new().into_shared();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
         let len = 64 * LEAF_SPAN;
@@ -5177,9 +5452,9 @@ mod tests {
         let a = mm.borrow_mut().mmap(1 << 40, len, RW, fixed, None).unwrap();
         let (guest, kernel) = (a + 3 * LEAF_SPAN, a + 9 * LEAF_SPAN + 5);
         poke(&mm, guest, b'g');
-        // 内核层直接写宿主内存（加载程序、PTRACE_POKEDATA）
+        // The kernel layer writes host memory directly (loading programs, PTRACE_POKEDATA)
         mm.borrow_mut().write_kernel(kernel, b"k").unwrap();
-        // PROT_NONE：表项留着、权限清零，不能访问
+        // PROT_NONE: the entries stay with permissions cleared, so they are inaccessible
         mm.borrow_mut().mprotect(a, len, 0).unwrap();
         assert!(mm.borrow().mmu().translate(guest, 0).is_none());
         assert_eq!(
@@ -5197,7 +5472,7 @@ mod tests {
             assert_eq!(byte(m, a + 20 * LEAF_SPAN), b'n');
         }
         assert!(!writable(&mm, guest) && !writable(&child, guest));
-        // mremap 搬走：表项一起搬，之后 fork 的子进程照样看得到
+        // mremap moves it: the entries move along, and a child forked later still sees them
         let dst = 0x1000_0000_0000;
         let moved = mm
             .borrow_mut()
@@ -5222,7 +5497,8 @@ mod tests {
             poke(&parent, a + i * PAGE_SIZE, b'p');
         }
         let child = parent.borrow_mut().fork().unwrap();
-        // 去掉权限再加回来（包括 PROT_NONE，那时页不在页表里）：仍然借着、仍然不能写
+        // Remove permissions and add them back (including PROT_NONE, when the page is not in the
+        // page table): still borrowed, still not writable
         for mm in [&parent, &child] {
             for p in [prot::READ, 0, RW] {
                 mm.borrow_mut().mprotect(a, 3 * PAGE_SIZE, p).unwrap();
@@ -5230,7 +5506,7 @@ mod tests {
             assert_eq!(byte(mm, a), b'p');
             assert!(!writable(mm, a));
         }
-        // 丢弃：另一边的内容不变
+        // Discard: the other side's contents are unchanged
         parent.borrow_mut().discard(a, PAGE_SIZE).unwrap();
         child
             .borrow_mut()
@@ -5241,7 +5517,7 @@ mod tests {
             (byte(&parent, a + PAGE_SIZE), byte(&child, a + PAGE_SIZE)),
             (b'p', 0)
         );
-        // mremap 搬走之后各写各的
+        // After mremap moves it, each side writes its own
         let moved = parent
             .borrow_mut()
             .mremap(
@@ -5261,8 +5537,9 @@ mod tests {
 
     #[test]
     fn returned_loans_restore_each_vma_its_own_protection() {
-        // mprotect 切开的几个 VMA 的宿主内存是连着的：子进程还回借来的页时，父进程按每页
-        // 所在 VMA 的权限恢复，而不是按连着的一段里第一页的
+        // The host memory of the VMAs an mprotect split off is contiguous: when the child returns
+        // borrowed pages, the parent restores each page with its own VMA's permissions, not with
+        // those of the first page in the contiguous run
         let parent = Mm::new().into_shared();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
         let a = parent
@@ -5288,7 +5565,8 @@ mod tests {
 
     #[test]
     fn cow_shared_counts_pages_mapped_by_others() {
-        // smaps 的 Shared_Dirty 和 Pss：共用一页的地址空间个数与 Linux 的 mapcount 一样
+        // smaps Shared_Dirty and Pss: the number of address spaces sharing a page matches Linux's
+        // mapcount
         let parent = Mm::new().into_shared();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
         let a = parent
@@ -5302,14 +5580,15 @@ mod tests {
         let child = parent.borrow_mut().fork().unwrap();
         assert_eq!(shared(&parent), (2, PAGE_SIZE));
         assert_eq!(shared(&child), (2, PAGE_SIZE));
-        // 孙进程也借：三个地址空间各分摊三分之一
+        // The grandchild borrows too: each of the three address spaces gets a third
         let grandchild = child.borrow_mut().fork().unwrap();
         assert_eq!(shared(&grandchild), (2, 2 * (PAGE_SIZE / 3)));
-        // 子进程写了第 0 页，那一页只剩父进程和孙进程共用
+        // The child wrote page 0, which is now shared only by the parent and the grandchild
         poke(&child, a, b'c');
         assert_eq!(shared(&child), (1, PAGE_SIZE / 3));
         assert_eq!(shared(&parent), (2, PAGE_SIZE / 2 + PAGE_SIZE / 3));
-        // 父进程的地址空间销毁之后，只有一个借用方的孤儿页算私有的
+        // After the parent's address space is destroyed, an orphan page with one borrower counts
+        // as private
         drop(parent);
         drop(child);
         assert_eq!(shared(&grandchild), (0, 0));
@@ -5325,7 +5604,7 @@ mod tests {
             .unwrap();
         poke(&parent, a, 1);
         let child = parent.borrow_mut().fork().unwrap();
-        // 写时复制之后键就会变：借来的页先换成自己的
+        // The key would change after copy-on-write: a borrowed page is first replaced by our own
         let key = child.borrow().futex_key(a).unwrap();
         assert!(child.borrow().cow.borrow().borrowed.is_empty());
         assert!(key != parent.borrow().futex_key(a).unwrap());
@@ -5351,8 +5630,9 @@ mod tests {
         assert_eq!(mm.regions().len(), 4);
     }
 
-    /// fork 前的提交量检查按 Linux 合起来的 VMA 算：相邻的可写私有匿名映射合起来超过
-    /// 上限才算；中间隔着只读的、`MAP_NORESERVE` 的、共享的都断开，它们自己也不计入。
+    /// The commit check before fork counts VMAs merged as on Linux: adjacent writable private
+    /// anonymous mappings count only when together they exceed the limit; a read-only,
+    /// `MAP_NORESERVE` or shared mapping in between breaks the run, and does not count itself.
     #[test]
     fn fork_counts_the_commit_of_merged_mappings() {
         let mut mm = Mm::new();
@@ -5360,19 +5640,19 @@ mod tests {
         let fixed = anon | flags::MAP_FIXED;
         let base = 0x1000_0000;
         let mb = 1 << 20;
-        // 4 MB + 4 MB 首尾相接：8 MB
+        // 4 MB + 4 MB back to back: 8 MB
         mm.mmap(base, 4 * mb, RW, fixed, None).unwrap();
         mm.mmap(base + 4 * mb, 4 * mb, RW, fixed, None).unwrap();
         assert!(!mm.commit_too_big(8 * mb));
         assert!(mm.commit_too_big(8 * mb - PAGE_SIZE));
         assert!(!mm.commit_too_big(0));
-        // 后一半改成只读：断开，各 4 MB
+        // Second half made read-only: broken into 4 MB each
         mm.mprotect(base + 4 * mb, 4 * mb, prot::READ).unwrap();
         assert!(!mm.commit_too_big(5 * mb));
         assert!(mm.commit_too_big(4 * mb - PAGE_SIZE));
         mm.mprotect(base + 4 * mb, 4 * mb, RW).unwrap();
         assert!(mm.commit_too_big(5 * mb));
-        // 中间夹一段 MAP_NORESERVE 的：不计入，也断开
+        // A MAP_NORESERVE piece in between: not counted, and breaks the run
         mm.munmap(base + 4 * mb, 4 * mb).unwrap();
         mm.mmap(
             base + 4 * mb,
@@ -5384,17 +5664,17 @@ mod tests {
         .unwrap();
         mm.mmap(base + 8 * mb, 4 * mb, RW, fixed, None).unwrap();
         assert!(!mm.commit_too_big(5 * mb));
-        // 共享的不计入
+        // Shared ones are not counted
         let shared = flags::MAP_SHARED | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
         mm.mmap(base + 12 * mb, 64 * mb, RW, shared, None).unwrap();
         assert!(!mm.commit_too_big(5 * mb));
-        // 中间有空隙的不合
+        // Mappings with a gap between them are not merged
         mm.mmap(base + 77 * mb, 4 * mb, RW, fixed, None).unwrap();
         assert!(!mm.commit_too_big(5 * mb));
         mm.mmap(base + 76 * mb, mb, RW, fixed, None).unwrap();
         assert!(mm.commit_too_big(5 * mb - PAGE_SIZE));
         assert!(!mm.commit_too_big(5 * mb));
-        // 子进程照样带着 MAP_NORESERVE
+        // The child keeps MAP_NORESERVE too
         let child = mm.fork().unwrap();
         assert!(child.borrow().vmas[&(base + 4 * mb)].noreserve);
     }

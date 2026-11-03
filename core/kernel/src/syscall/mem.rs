@@ -1,4 +1,4 @@
-//! 内存类 syscall。
+//! Memory syscalls.
 
 use std::os::fd::AsRawFd;
 
@@ -15,13 +15,13 @@ use crate::vfs::dev::Device;
 use crate::vfs::ms;
 
 const PROT_MASK: u32 = prot::READ | prot::WRITE | prot::EXEC;
-/// `PROT_GROWSDOWN`、`PROT_GROWSUP`：只对栈有意义，按 Linux 的做法忽略。
+/// `PROT_GROWSDOWN`, `PROT_GROWSUP`: meaningful only for stacks, and ignored as on Linux.
 const PROT_GROWS: u32 = 0x0100_0000 | 0x0200_0000;
-/// 映射类型位：`MAP_SHARED`、`MAP_PRIVATE`、`MAP_SHARED_VALIDATE`。
+/// Mapping type bits: `MAP_SHARED`, `MAP_PRIVATE`, `MAP_SHARED_VALIDATE`.
 const MAP_TYPE: u32 = 0x0f;
 const MAP_SHARED_VALIDATE: u32 = 0x03;
-/// MAP_SHARED_VALIDATE 认识的标志（Linux 的 `LEGACY_MAP_MASK` 加上 `MAP_FIXED_NOREPLACE`、
-/// `MAP_UNINITIALIZED`，以及 MAP_HUGETLB 的页大小位）。
+/// Flags MAP_SHARED_VALIDATE recognises (Linux's `LEGACY_MAP_MASK` plus `MAP_FIXED_NOREPLACE`,
+/// `MAP_UNINITIALIZED`, and the page-size bits of MAP_HUGETLB).
 const MAP_VALIDATE_KNOWN: u32 = MAP_TYPE
     | flags::MAP_FIXED
     | flags::MAP_ANONYMOUS
@@ -36,7 +36,7 @@ const MAP_VALIDATE_KNOWN: u32 = MAP_TYPE
     | 0x4_0000 // MAP_HUGETLB
     | flags::MAP_FIXED_NOREPLACE
     | 0x400_0000 // MAP_UNINITIALIZED
-    | 0xfc00_0000; // MAP_HUGE_SHIFT 之上的页大小
+    | 0xfc00_0000; // page-size bits above MAP_HUGE_SHIFT
 const F_SEAL_WRITE: u32 = 0x8;
 const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 const MADV_DONTNEED: i32 = 4;
@@ -59,7 +59,7 @@ pub(super) fn mmap(
     fd: i32,
     offset: u64,
 ) -> SysResult {
-    // arm64 的 PROT_BTI、PROT_MTE 也在这里被拒绝：guest 看不到这两项特性
+    // arm64's PROT_BTI and PROT_MTE are rejected here too: the guest does not see those features
     if prot & !(PROT_MASK | PROT_GROWS) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -68,7 +68,8 @@ pub(super) fn mmap(
         return Err(Errno::EINVAL);
     }
     let kind = match flags & MAP_TYPE {
-        // MAP_SHARED_VALIDATE 要求认识所有的标志（MAP_SYNC 只对 DAX 文件有效）
+        // MAP_SHARED_VALIDATE requires every flag to be recognised (MAP_SYNC works only on DAX
+        // files)
         MAP_SHARED_VALIDATE if flags & !MAP_VALIDATE_KNOWN != 0 => {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -77,22 +78,23 @@ pub(super) fn mmap(
         _ => return Err(Errno::EINVAL),
     };
     let mut flags = (flags & !MAP_TYPE) | kind;
-    // 共享的匿名内存不能向下增长
+    // Shared anonymous memory cannot grow down
     const MAP_GROWSDOWN: u32 = 0x0100;
     let growsdown = flags & MAP_GROWSDOWN != 0;
     if growsdown && flags & flags::MAP_ANONYMOUS != 0 && kind == flags::MAP_SHARED {
         return Err(Errno::EINVAL);
     }
-    // 只读打开的 /dev/zero 的共享映射：不能有写权限，以后也不能改成可写
+    // A shared mapping of /dev/zero opened read-only: no write permission, now or later
     let mut deny_write = false;
-    // 文件映射在 /proc/<pid>/maps 里显示的路径和 inode
+    // The path and inode shown for a file mapping in /proc/<pid>/maps
     let mut label = None;
     let mut deny_exec = false;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         None
     } else {
         let file = cx.fds().get(fd)?;
-        // Linux 先查 fd（EBADF），再查长度（EINVAL），最后才查文件的权限（EACCES）
+        // Linux checks the fd first (EBADF), then the length (EINVAL), and the file's permissions
+        // (EACCES) last
         if len == 0 {
             return Err(Errno::EINVAL);
         }
@@ -107,8 +109,8 @@ pub(super) fn mmap(
                 if shared_write && !f.writable() {
                     return Err(Errno::EACCES);
                 }
-                // noexec 的挂载里的文件不能映射成可执行的，以后也不能改成可执行
-                // （Linux 的 do_mmap 去掉 VM_MAYEXEC）
+                // Files on a noexec mount cannot be mapped executable, now or later (Linux's
+                // do_mmap clears VM_MAYEXEC)
                 let noexec = f
                     .node()
                     .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
@@ -119,7 +121,7 @@ pub(super) fn mmap(
                     }
                     deny_exec = true;
                 }
-                // 封印了写入的 memfd 不能有可写的共享映射，以后也不能改成可写
+                // A memfd sealed against writes cannot have a writable shared mapping, now or later
                 let sealed = cx
                     .kr()
                     .seals
@@ -134,7 +136,8 @@ pub(super) fn mmap(
                     Some((host.as_raw_fd(), offset, f.writable()))
                 }
             }
-            // /dev/zero：私有映射是匿名内存，共享映射是共享的匿名内存
+            // /dev/zero: a private mapping is anonymous memory, a shared one is shared anonymous
+            // memory
             FileKind::Device {
                 dev: Device::Zero, ..
             } => {
@@ -159,7 +162,8 @@ pub(super) fn mmap(
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
     let start = cx.mm_mut().mmap(addr, len, prot, flags, file)?;
-    // 文件映射的 MAP_GROWSDOWN 不增长（Linux 上长出来的部分也映射文件，没有程序这样用）
+    // MAP_GROWSDOWN on a file mapping does not grow (on Linux the grown part also maps the file,
+    // and no program uses it that way)
     if growsdown && file.is_none() && kind == flags::MAP_PRIVATE {
         cx.mm_mut().set_growsdown(start);
     }
@@ -175,8 +179,8 @@ pub(super) fn mmap(
     if flags & MAP_LOCKED != 0 {
         cx.mm_mut().set_locked(start, len, true)?;
     }
-    // MAP_POPULATE（带 MAP_NONBLOCK 时不调）、MAP_LOCKED、mlockall(MCL_FUTURE) 都把页
-    // 调进内存
+    // MAP_POPULATE (not with MAP_NONBLOCK), MAP_LOCKED and mlockall(MCL_FUTURE) all bring the
+    // pages into memory
     const MAP_POPULATE: u32 = 0x8000;
     const MAP_NONBLOCK: u32 = 0x10000;
     let populate = flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE
@@ -197,7 +201,8 @@ pub(super) fn mremap(
     new_addr: u64,
 ) -> SysResult {
     let r = remap(cx, old, old_len, new_len, flags, new_addr);
-    // 搬动、扩展的可能是可以写的共享文件映射：不持 BKL 的 futex 要知道它们现在在哪里
+    // What was moved or grown may be writable shared file mappings: the no-BKL futex must know
+    // where they are now
     cx.mm().note_shared_files(true);
     r
 }
@@ -222,8 +227,8 @@ fn remap(
     let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
     if flags & MREMAP_DONTUNMAP != 0 {
         let (new, refill) = cx.mm_mut().mremap_dontunmap(old, old_len, fixed)?;
-        // 私有文件映射原来的地址上重新映射仓库里的文件；打不开（比如已经删除并回收）
-        // 时只好给空的匿名内存
+        // Map the store file again at the old address of a private file mapping; if it cannot be
+        // opened (for example deleted and reclaimed), empty anonymous memory is all that is left
         let vfs = cx.vfs()?;
         for r in refill {
             let file = (r.ino != 0)
@@ -243,7 +248,7 @@ fn remap(
         }
         return Ok(new);
     }
-    // 扩展私有文件映射：接着映射的是仓库里那个文件后面的内容，先打开它
+    // Growing a private file mapping maps the rest of that store file, so open it first
     let ino = (new_len > old_len)
         .then(|| cx.mm().private_file_ino(old + old_len.max(1) - 1))
         .flatten();
@@ -261,8 +266,9 @@ fn remap(
     )
 }
 
-/// remap_file_pages：已经废弃，与 Linux 4.0 起一样用 mmap 模拟（[`Mm::remap_file_pages`]）。
-/// `prot` 必须是 0，`flags` 只看 `MAP_NONBLOCK`。
+/// remap_file_pages: deprecated, and emulated with mmap as on Linux since 4.0
+/// ([`Mm::remap_file_pages`]). `prot` must be 0, and of `flags` only `MAP_NONBLOCK` is looked
+/// at.
 ///
 /// [`Mm::remap_file_pages`]: crate::mm::Mm::remap_file_pages
 pub(super) fn remap_file_pages(
@@ -290,7 +296,8 @@ pub(super) fn remap_file_pages(
     Ok(0)
 }
 
-/// msync：共享映射直接就是宿主的文件映射，不需要写回，只检查参数。
+/// msync: shared mappings are host file mappings themselves and need no write-back, so only the
+/// arguments are checked.
 pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
     const MS_ASYNC: u32 = 1;
     const MS_INVALIDATE: u32 = 2;
@@ -302,12 +309,14 @@ pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResu
         return Err(Errno::EINVAL);
     }
     cx.mm().check_mapped(addr, len)?;
-    // 锁住的页不能作废
+    // Locked pages cannot be invalidated
     if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
         return Err(Errno::EBUSY);
     }
-    // 文件的共享映射就是宿主对 object 的共享映射：MS_SYNC 交给宿主写回，放开 BKL 等。放锁
-    // 期间别的线程拆掉了映射时宿主报 ENOMEM，不管它（数据已经随拆映射交给了宿主的页缓存）
+    // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC leaves the
+    // write-back to the host and waits with the BKL released. If another thread tears down the
+    // mapping meanwhile the host reports ENOMEM, which is ignored (unmapping already handed the
+    // data to the host page cache)
     if flags & MS_SYNC != 0 {
         let ranges = cx.mm().shared_file_ranges(addr, len);
         if !ranges.is_empty() {
@@ -346,7 +355,8 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
         .checked_next_multiple_of(PAGE_SIZE)
         .filter(|&l| addr.checked_add(l).is_some())
         .ok_or(Errno::EINVAL)?;
-    // 没有 KSM、透明大页和内存故障注入（MERGEABLE、HUGEPAGE、COLLAPSE、HWPOISON 等）
+    // No KSM, transparent huge pages or memory fault injection (MERGEABLE, HUGEPAGE, COLLAPSE,
+    // HWPOISON and so on)
     if !matches!(advice, 0..=4 | 8..=11 | 16..=24) {
         return Err(Errno::EINVAL);
     }
@@ -359,10 +369,11 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     let (locked, private_anon) = cx.mm().advice_range(addr, len)?;
     match advice {
         MADV_DONTNEED if locked => Err(Errno::EINVAL),
-        // 其余建议只影响性能，可以忽略；DONTNEED 之后匿名内存必须读回 0
+        // The other advice only affects performance and can be ignored; after DONTNEED anonymous
+        // memory must read back as 0
         MADV_DONTNEED => cx.mm_mut().discard(addr, len).map(|()| 0),
         MADV_FREE | MADV_WIPEONFORK | MADV_KEEPONFORK if !private_anon => Err(Errno::EINVAL),
-        // core 文件里写不写（crate::coredump）
+        // Whether it is written to core files (crate::coredump)
         MADV_DONTDUMP | MADV_DODUMP => cx
             .mm_mut()
             .set_dontdump(addr, len, advice == MADV_DONTDUMP)
@@ -371,8 +382,8 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     }
 }
 
-/// 没有 `CAP_IPC_LOCK` 时，锁住的内存不能超过 `RLIMIT_MEMLOCK`（为 0 时根本不能锁）。
-/// `more` 是这次要新锁住的字节数。
+/// Without `CAP_IPC_LOCK`, locked memory may not exceed `RLIMIT_MEMLOCK` (nothing can be locked
+/// when it is 0). `more` is the bytes newly locked by this call.
 fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
     if cx.cred().capable(cap::IPC_LOCK) {
         return Ok(());
@@ -387,9 +398,9 @@ fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// mlock、munlock、mlock2：记录哪些映射被锁住（宿主内存不会被换出到 guest 能察觉的
-/// 地方），检查范围和 `RLIMIT_MEMLOCK`。与 Linux 一样，锁住时把页调进内存，
-/// `MLOCK_ONFAULT` 时不调。
+/// mlock, munlock, mlock2: records which mappings are locked (host memory is never swapped out
+/// anywhere the guest could notice) and checks the range and `RLIMIT_MEMLOCK`. As on Linux,
+/// locking brings the pages into memory, except with `MLOCK_ONFAULT`.
 pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool) -> SysResult {
     const MLOCK_ONFAULT: u32 = 1;
     if flags & !MLOCK_ONFAULT != 0 {
@@ -441,7 +452,7 @@ pub(super) fn munlockall(cx: &mut Cx<'_>) -> SysResult {
     Ok(0)
 }
 
-/// mincore：按宿主内存报告每页是否驻留。
+/// mincore: reports whether each page is resident, by host memory.
 pub(super) fn mincore(cx: &mut Cx<'_>, addr: u64, len: u64, vec: u64) -> SysResult {
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);

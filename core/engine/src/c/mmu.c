@@ -1,15 +1,19 @@
 /*
- * soft-MMU 页表（kernel/mm 的 map）：4 级基数树，每级 512 项，覆盖 48 位 guest
- * 地址空间。中间表项是下一级表的指针，叶子表项是 host 页地址 | 权限位。
- * 只有 TLB 未命中时才会遍历这棵树。
+ * soft-MMU page table (the kernel/mm map): a 4-level radix tree with 512 entries per level,
+ * covering a 48-bit guest address space. Intermediate entries point to the next level's table;
+ * leaf entries are a host page address | permission bits. The tree is walked only on a TLB miss.
  *
- * 表项按需建立：内核层只给小的映射预先建好，大的等 guest 第一次访问时一次补一张叶子表
- * （appine_mmu_fill），所以页表的大小随碰过的内存增长，而不是随映射的大小。遍历一段
- * 范围时，没有中间表的地方按缺的那一级整段跳过（一项覆盖 2 MB、1 GB 或 512 GB）。
+ * Entries are built on demand: the kernel layer builds them in advance only for small mappings,
+ * and large ones get a whole leaf table filled at the guest's first access (appine_mmu_fill), so
+ * the page table grows with the memory touched, not with the mapping size. A walk over a range
+ * skips a missing intermediate table by the whole span of the missing level (one entry covers
+ * 2 MB, 1 GB or 512 GB).
  *
- * 并发：修改只由内核层在持有 BKL 时进行，而共享同一地址空间的其他线程可能
- * 同时在遍历（TLB 未命中）。所以表项一律用原子操作读写：新建的中间表以
- * release 语义挂上，遍历时以 acquire 语义读取。中间表在 mmu 销毁前不会释放。
+ * Concurrency: only the kernel layer modifies the table, while holding the BKL, but other threads
+ * sharing the address space may walk it at the same time (TLB misses). So entries are always read
+ * and written atomically: new intermediate tables are linked in with release semantics and read
+ * with acquire semantics while walking. Intermediate tables are not freed before the mmu is
+ * destroyed.
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -19,7 +23,7 @@
 #define LEVELS MMU_LEVELS
 #define LEVEL_BITS MMU_LEVEL_BITS
 #define LEVEL_ENTRIES (1u << LEVEL_BITS)
-/* 一张叶子表覆盖的字节数 */
+/* Bytes covered by one leaf table */
 #define LEAF_SPAN ((uint64_t)APPINE_PAGE_SIZE << LEVEL_BITS)
 
 static unsigned level_shift(int level)
@@ -59,9 +63,10 @@ static void free_table(uintptr_t *table, int level)
 }
 
 /*
- * gva 所在的叶子表。中间表缺失时：alloc 为真就新建；否则返回 NULL，并把 *hole_end 设为
- * 从 gva 起整段没有表项的范围的末端（按缺失的那一级对齐，不超过 2^48）。alloc 时分配
- * 失败也返回 NULL
+ * The leaf table containing gva. If an intermediate table is missing: create it when alloc is
+ * true; otherwise return NULL and set *hole_end to the end of the range from gva that has no
+ * entries at all (aligned to the missing level, at most 2^48). With alloc, a failed allocation
+ * also returns NULL
  */
 static uintptr_t *leaf_table(const struct appine_mmu *mmu, uint64_t gva, bool alloc,
                              uint64_t *hole_end)
@@ -87,7 +92,7 @@ static uintptr_t *leaf_table(const struct appine_mmu *mmu, uint64_t gva, bool al
     return table;
 }
 
-/* gva 所在叶子表覆盖范围的末端，不超过 end */
+/* End of the range covered by gva's leaf table, at most end */
 static uint64_t leaf_end(uint64_t gva, uint64_t end)
 {
     uint64_t e = (gva | (LEAF_SPAN - 1)) + 1;
@@ -121,7 +126,8 @@ void appine_mmu_free(struct appine_mmu *mmu)
     free(mmu);
 }
 
-/* map 和 fill：only_empty 时已有表项（包括权限为 0 的）保持不变 */
+/* map and fill: with only_empty, existing entries (including ones with permission 0) stay as they
+ * are */
 static int store_range(struct appine_mmu *mmu, uint64_t gva, void *host, uint64_t len,
                        uint32_t prot, bool only_empty)
 {
@@ -245,7 +251,8 @@ uintptr_t appine_mmu_lookup_pte(const struct appine_mmu *mmu, uint64_t gva)
 void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot)
 {
     uintptr_t pte = appine_mmu_lookup_pte(mmu, gva);
-    /* 权限为 0 的表项（PROT_NONE 的页留着宿主页）不能访问，传 0 时也不算已映射 */
+    /* An entry with permission 0 (a PROT_NONE page keeping its host page) cannot be accessed, and
+     * does not count as mapped even when 0 is passed */
     if (!(pte & PTE_PROT_MASK) || (pte & required_prot) != required_prot)
         return NULL;
     return (void *)((pte & ~(uintptr_t)PAGE_MASK) + (gva & PAGE_MASK));
