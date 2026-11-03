@@ -112,6 +112,8 @@ bool appine_has2(uint64_t hwcap2)
  * The values returned when EL0 reads the ID register space (op0=3, op1=0, CRn=0), consistent
  * with what Linux emulates for user mode: MIDR is returned as is, MPIDR has only bit 31, and the
  * rest expose only the fields corresponding to HWCAP. key is bits 20:5 of the MRS encoding.
+ * Unlike Linux, which raises SIGILL for CRm=1 and for CRm=0 registers other than MIDR, MPIDR and
+ * REVIDR, those read 0 here.
  */
 bool appine_id_register(unsigned key, uint64_t *value)
 {

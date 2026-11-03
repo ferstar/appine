@@ -4,6 +4,8 @@
 > See `.claude/decisions/engine.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; corrected which template locks the guard misses)
 
 ## Responsibilities
 
@@ -462,15 +464,14 @@ Tier 1, only CPUID advertised).
   freed `Cpu`; if that state was unmapped rather than pooled, the app crashes (kernel-side path).
 - **Internal `abort()` checks bypass the fault guard:** overflow and group-slot assertions during
   translation or native-stub generation kill the whole app instead of one guest process.
-- **Locks taken inside guarded code are not all registered:** the template arena and shard locks
-  and the perf-map lock are not released on host-fault recovery, so a fault while holding one
+- **Locks taken inside guarded code are not all registered:** the template arena lock, the shard
+  locks `template_clear` takes all at once (the per-bucket `template_lock` is registered) and the
+  perf-map lock are not released on host-fault recovery, so a fault while holding one
   deadlocks later users. Registering more than 4 locks is silently ignored while drops still
   decrement, mis-pairing later releases (not reached today).
 - **Unallocated ID registers read 0:** `mrs` of CRm=1 and unallocated CRm=0 registers returns 0
   where Linux 6.1 delivers `SIGILL`.
 - **Unused API:** `Dbt::recheck` has no caller in the kernel.
-- **Stale comments:** the engine header says Tier 1 uses the ITLB; engine and task comments say
-  Tier 1 hands `ic ivau` to the kernel at `dsb`/`isb` (it is handled in place).
 
 ## Open questions
 

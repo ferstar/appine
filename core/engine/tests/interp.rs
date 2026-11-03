@@ -1,9 +1,9 @@
 //! Unit tests for the interpreter: memory accesses, branches, system instructions and the
 //! soft-MMU.
 //!
-//! Data processing instructions are tested against hardware by lockstep (tests/lockstep); M0's
-//! lockstep cannot execute memory access and control flow instructions, so they are tested here
-//! with fixed encodings. The encodings come from GNU as.
+//! Lockstep (tests/lockstep) tests instructions against hardware, but cannot run instructions that
+//! use SP or change control flow, and its memory accesses stay inside a data area that never
+//! faults; those cases are tested here with fixed encodings. The encodings come from GNU as.
 
 use std::ptr::NonNull;
 

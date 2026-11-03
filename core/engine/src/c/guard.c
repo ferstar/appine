@@ -7,8 +7,10 @@
  * guard is "armed": when a fault happens then, the handler siglongjmps back to
  * appine_guard_run(), which returns APPINE_EXIT_HOST_FAULT. So during that time the engine does
  * not call back into the kernel layer and does not call malloc (except for writing the perf map
- * file when profiling with APPINE_PERF_MAP), and every lock it holds is registered with
- * appine_guard_hold() and released after jumping back.
+ * file when profiling with APPINE_PERF_MAP), and every lock it holds is meant to be registered
+ * with appine_guard_hold() and released after jumping back. Not registered yet: dbt.c's template
+ * arena lock, the template shard locks taken all at once by template_clear(), and the perf-map
+ * lock.
  *
  * Other faults (the kernel layer's own, other host threads') first write a one-line report to
  * stderr and are then passed to the original handler (on Android, debuggerd, which produces a

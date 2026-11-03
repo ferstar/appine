@@ -1154,9 +1154,6 @@ fn crc32(g: &mut Rng, _: &Env) -> Case {
     )
 }
 
-/// The whole SIMD&FP data processing encoding space (bits 27:25 = 111). The whitelist itself is
-/// checked against LLVM (whitelist.rs); this checks the semantics and register moves of the
-/// executed instructions.
 /// SDOT, UDOT in vector and by-element forms (2S, 4S).
 fn dotprod(g: &mut Rng, _: &Env) -> Case {
     let q_u = (g.bit() << 30) | (g.bit() << 29);
@@ -1434,6 +1431,9 @@ fn dit(g: &mut Rng, _: &Env) -> Case {
     }
 }
 
+/// The whole SIMD&FP data processing encoding space (bits 27:25 = 111). The whitelist itself is
+/// checked against LLVM (whitelist.rs); this checks the semantics and register moves of the
+/// executed instructions.
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {
     g.next_u64() as u32 | 0x0e00_0000
 }

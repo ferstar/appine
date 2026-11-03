@@ -240,7 +240,6 @@ static inline bool mem_write(struct appine_cpu *cpu, uint64_t va, const void *in
     return true;
 }
 
-/* Execute an instruction that has already been fetched */
 /* ---- Host fault guard (guard.c) ---- */
 
 /*
@@ -321,6 +320,7 @@ enum appine_exit appine_simd_ldst(struct appine_cpu *cpu, uint32_t insn);
  * these classes */
 enum appine_exit appine_atomic_exec(struct appine_cpu *cpu, uint32_t insn);
 
+/* Execute an instruction that has already been fetched */
 enum appine_exit appine_interp_exec(struct appine_cpu *cpu, uint32_t insn);
 
 /* Fetch from cpu->pc and execute one instruction (Tier 0's single step) */

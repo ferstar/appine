@@ -2045,7 +2045,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
             return true;
         }
         unsigned op2 = FIELD(insn, 7, 5);
-        /* DSB, ISB: first hand over the page recorded by ic ivau (see dbt_run) */
+        /* DSB, ISB: if ic ivau recorded a page, first exit so that dbt_run invalidates it */
         if (op2 == 4 || op2 == 6) {
             emit(x, enc_ldr_x(T0, CTX, offsetof(struct appine_cpu, ivau_page)));
             emit_to_stub(x, enc_cbnz_x(T0), FIX_IMM19, R_INTERP, pc);
@@ -2117,10 +2117,10 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
     /*
      * DC CVAC, DC CVAU, DC CIVAC, DC CVAP, DC CVADP, IC IVAU: as in Tier 0, the address is only
      * checked for read access (the DC CVAP and CVADP features have been confirmed by Tier 0).
-     * ic ivau no longer exits on every instruction: it records its page (a JIT flushing its cache
-     * executes dozens of them per page), which is handed to the caller at dsb or isb to invalidate
-     * the translations in one go; when another page is already recorded, Tier 0 executes this
-     * one, and both pages are invalidated at the exit.
+     * ic ivau does not exit on every instruction: it records its page (a JIT flushing its cache
+     * executes dozens of them per page), and the next dsb or isb exits so that dbt_run
+     * invalidates the page's translations in place, in one go; when another page is already
+     * recorded, Tier 0 executes this one, and dbt_run invalidates both pages right after it.
      */
     uint32_t cmo = insn & 0xffffffe0;
     if (cmo == 0xd50b7a20 || cmo == 0xd50b7b20 || cmo == 0xd50b7e20 || cmo == 0xd50b7520 ||
@@ -2797,16 +2797,16 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
 
 /*
  * Invalidate the blocks that start in the pages covered by [start, start + len); if a forwarding
- * stub does not fit or the range is too large, request a full flush instead, done by the next
- * thread to enter the dispatcher. With `mmu`, only blocks whose guest instruction words differ
- * from the current ones are invalidated (a translation depends only on the pc and the instruction
- * words; literals are also read only at run time): a JIT rewriting one piece of code issues
- * ic ivau for only a line or two, while ic ivau is recorded per page, so blocks of other methods
- * in the same page remain usable. HotSpot keeps rewriting inline caches and method entries, and
- * previously the whole page's blocks were invalidated and retranslated each time, 310,000 blocks
- * per Maven build. After an unmap or the removal of exec permission the page has no executable
- * mapping, and all its blocks are invalidated as before. Parked blocks are left alone: they are
- * checked anyway when revived. Lock held
+ * stub does not fit, request a full flush instead, done by the next thread to enter the
+ * dispatcher. With `mmu`, only blocks whose guest instruction words differ from the current ones
+ * are invalidated (a translation depends only on the pc and the instruction words; literals are
+ * also read only at run time): a JIT rewriting one piece of code issues ic ivau for only a line or
+ * two, while ic ivau is recorded per page, so blocks of other methods in the same page remain
+ * usable. HotSpot keeps rewriting inline caches and method entries, and invalidating the whole
+ * page each time would retranslate 310,000 blocks per Maven build. After an unmap or the removal
+ * of exec permission the page has no executable mapping, and all its blocks are invalidated.
+ * Parked blocks are left alone: they are checked anyway when revived. Without `mmu` every block
+ * in the range is invalidated, parked ones included. Lock held
  */
 static void invalidate_locked(struct appine_dbt *d, const struct appine_mmu *mmu, uint64_t start,
                               uint64_t len)
@@ -2863,11 +2863,11 @@ full:
 }
 
 /*
- * Leader `pc` failed the shared check. The first time it is only recorded: cases such as the
- * stack not having grown that far yet are resolved once Tier 0 executes the members. The second
- * time it goes into nogroup and the blocks containing it are invalidated (blocks do not cross
- * pages, so they are all in its page's bucket), and on retranslation it is no longer grouped.
- * Lock held
+ * Leader `pc` failed the shared check, and the dispatcher has Tier 0 execute the leader. The first
+ * time it is only recorded: cases such as the stack not having grown that far yet are resolved
+ * once the members' own accesses have run. The second time it goes into nogroup and the blocks
+ * containing it are invalidated (blocks do not cross pages, so they are all in its page's
+ * bucket), and on retranslation it is no longer grouped. Lock held
  */
 static void ungroup(struct appine_dbt *d, uint64_t pc)
 {
@@ -2900,14 +2900,14 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
 /*
  * A block's translation depends only on its guest pc and the instruction words it translated
  * (plus the global feature set and the instance's register assignment), not on the process or
- * the mappings. Every translated block is stored as a template; when another instance (another
- * thread, a forked child, the same program exec'd again) translates the same pc, it first
- * compares the instruction words recorded in the template with those in its own memory, and if
- * they match it copies the template into its own code cache, recomputing only the few b
- * instructions that jump to routines. Links between blocks are patched in each copy, so different
- * processes mapping different code at the same address do not affect each other. When the
- * template arena is full it is discarded entirely, since instances only copy templates and never
- * reference them.
+ * the mappings. Every translated block is stored as a template; when another instance (that of
+ * another address space: the threads of one address space, and the address spaces of one code
+ * group, share one instance) translates the same pc, it first compares the instruction words
+ * recorded in the template with those in its own memory, and if they match it copies the template
+ * into its own code cache, recomputing only the few b instructions that jump to routines. Links
+ * between blocks are patched in each copy, so different processes mapping different code at the
+ * same address do not affect each other. When the template arena is full it is discarded
+ * entirely, since instances only copy templates and never reference them.
  *
  * All threads of all processes use the templates, and with a single lock, workloads such as go
  * build that start compiler processes concurrently spent a tenth of their time on the lock, so
@@ -3756,7 +3756,8 @@ static struct appine_dbt *pool_take(unsigned i)
     return d;
 }
 
-/* Free all the replaced registered ranges (appine_dbt_share); no thread is using this instance */
+/* Free the registered ranges (appine_dbt_share), the current list and every replaced one, and
+ * clear d->shared; no thread is using this instance */
 static void drop_shared(struct appine_dbt *d)
 {
     for (struct shared_ranges *s = d->shared, *older; s; s = older) {
@@ -4169,13 +4170,6 @@ static bool block_matches(const struct appine_dbt *d, const struct appine_mmu *m
     return *host && memcmp(*host + (b->pc & PAGE_MASK) / 4, d->words + b->words, b->nguest * 4) == 0;
 }
 
-/*
- * After an instance changes address space and before its first run: check the guest instruction
- * words block by block and invalidate those that do not match. It is the same check as when
- * copying a translation template, only done all at once, saving the per-block copying, relinking
- * and instruction-cache syncing. When most do not match (another program was exec'd), request a
- * full flush. Lock held
- */
 /* The block lies entirely within one of the previous user's file mappings (recorded by
  * appine_dbt_trust): while its page is not mapped yet it is worth parking, since the same content
  * will most likely be mapped back later; blocks in anonymous memory (JIT-generated code) will
@@ -4199,6 +4193,13 @@ static bool block_trusted(const struct appine_dbt *d, const struct block *b)
     return false;
 }
 
+/*
+ * After an instance changes address space and before its first run: check the guest instruction
+ * words block by block and invalidate those that do not match. It is the same check as when
+ * copying a translation template, only done all at once, saving the per-block copying, relinking
+ * and instruction-cache syncing. When most do not match (another program was exec'd), request a
+ * full flush. Lock held
+ */
 static void recheck(struct appine_dbt *d, const struct appine_cpu *c)
 {
     d->stale = false;
@@ -4580,8 +4581,10 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * The target is already translated: patch the link without the lock. Changing a b
              * into a b may be done concurrently; a full flush waits for this thread to stop, so
              * it cannot happen at the same time. The lock-free lookup may have found a block that
-             * was just invalidated, which cannot be anything other than the patch site itself: an
-             * invalidated block's entry jumps to the forwarding stub, which still exits to here
+             * was just invalidated. Linking to it is harmless, since its entry jumps to its
+             * forwarding stub, which still exits to here; the case to avoid is the block whose
+             * old entry is the patch site itself (its forwarding stub's exit brought us here),
+             * where the patch would make the entry branch to itself (hence target != patch_site)
              */
             uint32_t *target = patch_forward ? code + ENTRY_CHECK_WORDS : code;
             if (patch_generation == __atomic_load_n(&d->generation, __ATOMIC_ACQUIRE) &&
@@ -4655,8 +4658,8 @@ static enum appine_exit dbt_run(void *ctx, struct appine_cpu *c)
              * stubs, and other threads see that the next time they enter them (on hardware they
              * may likewise still execute old instructions before a context synchronization).
              * HotSpot does an ic ivau and a dsb for every code change, 80,000 times per Maven
-             * build, and previously each one exited, took the BKL, logged, and came back to
-             * invalidate
+             * build, and exiting for each one would take the BKL and log the change before coming
+             * back to invalidate
              */
             if (r == APPINE_EXIT_CODE) {
                 code_changed(t, c, c->fault_addr);

@@ -84,9 +84,9 @@ pub struct CpuState {
     dbt_site: u64,
     dbt_jump_cache: *mut c_void,
     dbt_rs: *mut c_void,
-    /// The page recorded by `ic ivau` in Tier 1 and not yet handed out for invalidation (0 means
-    /// none). The engine hands it out as [`Exit::InvalidateCode`] at dsb and isb; on exits for
-    /// other reasons the caller collects and invalidates it.
+    /// The page recorded by `ic ivau` in Tier 1 whose translations are not invalidated yet (0
+    /// means none). [`Dbt::run`] invalidates it in place at the next dsb or isb; when an exit
+    /// leaves it set, the caller collects and invalidates it.
     pub ivau_page: u64,
     dbt_groups: [u64; 4],
     tlb: [TlbEntry; TLB_ENTRIES],
@@ -787,10 +787,13 @@ impl Drop for DbtSpace {
 /// Tier 1: one thread's part of a same-ISA pass-through DBT (jump cache, shadow return stack,
 /// statistics), attached to a [`DbtSpace`].
 ///
-/// Translations never invalidate themselves: after the guest declares modified code with
-/// `ic ivau` ([`Exit::InvalidateCode`]), or after an executable mapping is torn down or changes
-/// permissions, [`Dbt::invalidate`] or [`Dbt::flush`] must be called (once, through any one
-/// thread attached to the same [`DbtSpace`]). Only aarch64 Linux hosts are supported.
+/// [`Dbt::run`] handles `ic ivau` in place: it invalidates the page recorded in
+/// [`CpuState::ivau_page`] at the next dsb or isb, and the page of an `ic ivau` it hands to Tier 0
+/// as soon as Tier 0 runs it. Otherwise translations never invalidate themselves: after
+/// [`Exit::InvalidateCode`], after an exit that leaves `ivau_page` set, or after an executable
+/// mapping is torn down or changes permissions, [`Dbt::invalidate`] or [`Dbt::flush`] must be
+/// called (once, through any one thread attached to the same [`DbtSpace`]). Only aarch64 Linux
+/// hosts are supported.
 pub struct Dbt {
     raw: NonNull<RawDbtThread>,
     space: Arc<DbtSpace>,

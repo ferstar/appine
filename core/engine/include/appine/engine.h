@@ -99,7 +99,8 @@ struct appine_watch {
     uint32_t reserved;
 };
 
-/* Instruction-fetch TLB entry, used only by Tier 0's instruction fetch and Tier 1's translation */
+/* Instruction-fetch TLB entry, used only by Tier 0's instruction fetch (Tier 1's translation
+ * reads guest code through the page table) */
 struct appine_itlb_entry {
     uint64_t tag;
     uint64_t addend;
@@ -146,8 +147,9 @@ struct appine_cpu {
     uint64_t dbt_site;
     void *dbt_jump_cache;
     void *dbt_rs; /* top of the shadow return stack (a 1 KB-aligned ring in the Tier 1 instance) */
-    /* The page recorded by ic ivau and not yet handed to the caller to invalidate translations
-     * (0 means none), handed out at dsb, isb and on exit; also aligns tlb to 16 bytes */
+    /* The page recorded by Tier 1's ic ivau whose translations are not invalidated yet (0 means
+     * none): appine_dbt_run() invalidates it in place at the next dsb or isb, and the caller
+     * collects it at other exits; also aligns tlb to 16 bytes */
     uint64_t ivau_page;
     /* Host base addresses of several access groups, kept by Tier 1 while a block runs (dbt.c's
      * plan_group) */
@@ -342,8 +344,10 @@ struct appine_dbt_stats {
  * host registers the translated code takes for itself (enum appine_dbt_regs); it only affects
  * speed.
  *
- * Translations never invalidate themselves: after the guest declares modified code with ic ivau
- * (APPINE_EXIT_CODE), or after an executable mapping is torn down or changes permissions, the
+ * appine_dbt_run() handles ic ivau in place: it invalidates the page recorded in ivau_page at the
+ * next dsb or isb, and the page of an ic ivau it hands to Tier 0 as soon as Tier 0 runs it.
+ * Otherwise translations never invalidate themselves: after APPINE_EXIT_CODE, after an exit that
+ * leaves ivau_page set, or after an executable mapping is torn down or changes permissions, the
  * caller must call appine_dbt_invalidate() or appine_dbt_flush() (once per address space, through
  * any one attached thread).
  */
