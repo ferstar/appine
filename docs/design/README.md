@@ -14,9 +14,9 @@
 6. 进程、线程与调度，已迁到 [kernel/process 的 map](../../.claude/maps/kernel/process.md)（英文）
 7. 信号与 ABI，已迁到 [kernel/signal 的 map](../../.claude/maps/kernel/signal.md)（英文）
 8. 文件系统，已迁到 [kernel/store](../../.claude/maps/kernel/store.md)、[kernel/vfs](../../.claude/maps/kernel/vfs.md)、[kernel/procfs](../../.claude/maps/kernel/procfs.md) 的 map（英文）
-9. TTY 与终端，已迁到 [kernel/tty 的 map](../../.claude/maps/kernel/tty.md)（英文），终端界面挪进了 §11.5
+9. TTY 与终端，已迁到 [kernel/tty 的 map](../../.claude/maps/kernel/tty.md)（英文），终端界面在 [android/terminal 的 map](../../.claude/maps/android/terminal.md)
 10. 网络，已迁到 [kernel/net](../../.claude/maps/kernel/net.md)、[kernel/netns](../../.claude/maps/kernel/netns.md)、[kernel/unix](../../.claude/maps/kernel/unix.md)、[kernel/poll](../../.claude/maps/kernel/poll.md) 的 map（英文）
-11. [用户、权限与 Android 集成](11-android.md)
+11. 用户、权限与 Android 集成，已迁到 [kernel/cred](../../.claude/maps/kernel/cred.md)、[android/service](../../.claude/maps/android/service.md)、[android/setup](../../.claude/maps/android/setup.md)、[android/documents](../../.claude/maps/android/documents.md)、[android/terminal](../../.claude/maps/android/terminal.md)、[android/native](../../.claude/maps/android/native.md) 的 map（英文）
 12. [威胁模型](12-threat-model.md)
 13. [工程](13-engineering.md)
 14. [里程碑](14-milestones.md)
@@ -44,7 +44,7 @@
 
 A–C 都已达到。D 档里 podman、docker（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 namespace、[kernel/netns 的 map](../../.claude/maps/kernel/netns.md)）和 OpenRC（[kernel/process 的 map](../../.claude/maps/kernel/process.md) 的 PID 1）实际能用；systemd、内核模块、GUI 不做。strace、gdb 可以用（[kernel/signal 的 map](../../.claude/maps/kernel/signal.md)）。
 
-发行版默认是 Alpine，设置里可以换成 Debian 13（§11.4）。glibc 的程序（manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK）不用改内核层就能运行。
+发行版默认是 Alpine，设置里可以换成 Debian 13（[android/setup 的 map](../../.claude/maps/android/setup.md)）。glibc 的程序（manylinux wheel、Node.js 的预编译模块、rustup、OpenJDK）不用改内核层就能运行。
 
 ### 1.3 性能目标
 

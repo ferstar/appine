@@ -13,7 +13,7 @@ import com.termux.view.TerminalView
 
 /**
  * 软键盘上没有的按键。Ctrl 和 Alt 是一次性的修饰键：按一下之后作用于下一个输入的键。
- * Termux 的扩展键栏属于 GPLv3 的主模块，这里是重新写的（设计文档 §11.5）。
+ * Termux 的扩展键栏属于 GPLv3 的主模块，这里是重新写的（android/terminal 的 map）。
  */
 @SuppressLint("ViewConstructor") // 只在代码里创建，不出现在布局文件里
 internal class ExtraKeysView(

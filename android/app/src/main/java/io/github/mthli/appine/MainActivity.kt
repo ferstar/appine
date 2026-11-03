@@ -179,7 +179,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         if (s.sessions.isEmpty() && s.machine != 0L) {
             // 最后一个标签页关掉了：界面退出。服务还有 guest 进程（OpenRC 起的服务等）时留在
-            // 后台，没有了就自己退出（设计文档 §11.2）
+            // 后台，没有了就自己退出（android/service 的 map）
             finish()
             return
         }

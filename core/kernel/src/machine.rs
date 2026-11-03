@@ -1,4 +1,4 @@
-//! 宿主眼中的 guest 内核（kernel/process 的 map、设计文档 §11.2）。
+//! 宿主眼中的 guest 内核（kernel/process 的 map、android/service 的 map）。
 //!
 //! [`Machine`] 持有一个内核实例：可以先后启动多个进程（[`Machine::spawn`]），每个进程
 //! 可以有自己的控制台（宿主持有主设备的进程内 PTY，[`Machine::open_console`]）。Android
@@ -587,7 +587,7 @@ impl Machine {
     }
 
     /// 控制台 `id` 前台进程组的当前目录（App 被杀之后恢复标签页时，新的 shell 从这里开始，
-    /// 设计文档 §11.2）。shell 已经退出时是 ESRCH。
+    /// android/service 的 map）。shell 已经退出时是 ESRCH。
     pub fn console_cwd(&self, id: u32) -> Result<Vec<u8>, Errno> {
         let k = self.shared.lock();
         crate::bug::host_call("Machine::console_cwd", || terminal::fg_cwd(&k, id))
@@ -595,7 +595,7 @@ impl Machine {
     }
 
     /// 还在运行的 guest 进程数（不算内置的 init 和僵尸进程）：App 关掉最后一个标签页之后据此
-    /// 决定留在后台还是退出（设计文档 §11.2）。
+    /// 决定留在后台还是退出（android/service 的 map）。
     pub fn processes(&self) -> usize {
         let k = self.shared.lock();
         k.groups
@@ -691,7 +691,7 @@ impl Machine {
         }
     }
 
-    /// 宿主内存紧张、App 的界面离开了一阵子（设计文档 §11.2）：丢掉可以重建的缓存，即池里
+    /// 宿主内存紧张、App 的界面离开了一阵子（android/service 的 map）：丢掉可以重建的缓存，即池里
     /// 保留的 Tier 1 翻译、共用的只读文件映射和 dentry/inode 缓存（运行中的进程用着的不动）。
     /// App 这时多半在后台，随时可能被杀掉，顺便提交推迟的写事务。
     pub fn trim_memory(&self) {
@@ -736,7 +736,7 @@ impl Machine {
     }
 
     /// 取走内核层结束了的 guest 进程（内核 bug、引擎的宿主故障、OOM killer）：App 在它们的
-    /// 标签页里说明原因，不在标签页里的发通知（设计文档 §11.2）。
+    /// 标签页里说明原因，不在标签页里的发通知（android/service 的 map）。
     pub fn take_kills(&self) -> Vec<crate::KillReport> {
         crate::bug::host_call("Machine::take_kills", || {
             std::mem::take(&mut *self.shared.lock().kills.borrow_mut())
@@ -745,7 +745,7 @@ impl Machine {
     }
 
     /// 取走 guest 改过目录项（新建、删除、改名）的目录在仓库里的路径：App 让"文件"App 刷新
-    /// 它们（设计文档 §11.3）。第一次调用时才开始记；删掉了的、tmpfs 里的不给。
+    /// 它们（android/documents 的 map）。第一次调用时才开始记；删掉了的、tmpfs 里的不给。
     pub fn take_changed_dirs(&self) -> Vec<Vec<u8>> {
         crate::bug::host_call("Machine::take_changed_dirs", || {
             let k = self.shared.lock();

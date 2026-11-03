@@ -93,7 +93,7 @@ pub fn read_file(store: &Path, path: &str) -> Result<Vec<u8>, Errno> {
     .unwrap_or(Err(Errno::EIO))
 }
 
-/// 宿主浏览仓库（App 的 DocumentsProvider，设计文档 §11.3）：另外打开一次仓库，对它调用
+/// 宿主浏览仓库（App 的 DocumentsProvider，android/documents 的 map）：另外打开一次仓库，对它调用
 /// `f`（[`vfs::browse`] 里的函数）。内核运行着也可以：另外打开仓库时内核先提交推迟的写事务，
 /// 看到的是最新的；这个连接开着期间内核不再推迟提交，所以每次用完就关，不长期开着。
 pub fn browse<R>(store: &Path, f: impl FnOnce(&Store) -> Result<R, Errno>) -> Result<R, Errno> {
@@ -123,7 +123,7 @@ pub fn browse_changing<R>(
 }
 
 /// 把宿主目录 `store` 里的 inode 仓库（连同所在的整个宿主文件系统）写到盘上：导入
-/// rootfs、写好配置之后，改名就位之前（设计文档 §11.4）。不然断电之后仓库在了，里面的
+/// rootfs、写好配置之后，改名就位之前（android/setup 的 map）。不然断电之后仓库在了，里面的
 /// object 却可能还是空的。
 pub fn sync_store(store: &Path) -> Result<(), Errno> {
     let dir =
@@ -131,7 +131,7 @@ pub fn sync_store(store: &Path) -> Result<(), Errno> {
     appine_hal::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)).map_err(Errno)
 }
 
-/// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（设计文档 §11.4）。
+/// 在宿主目录 `store` 新建 inode 仓库，并导入 rootfs 的 tar.gz（android/setup 的 map）。
 ///
 /// 目录里已经有仓库时返回 `EEXIST`。导入失败时仓库保持为空。
 pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno> {

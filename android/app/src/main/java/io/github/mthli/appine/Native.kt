@@ -39,7 +39,7 @@ internal object Native {
     @Throws(IOException::class)
     external fun readFile(store: String, path: String): ByteArray?
 
-    // ---- 宿主浏览仓库（DocumentsProvider，设计文档 §11.3）----
+    // ---- 宿主浏览仓库（DocumentsProvider，android/documents 的 map）----
     // 路径就是文档 ID：guest 的绝对路径，`%`、控制字符和不是 UTF-8 的字节写成 `%XX`。每次调用
     // 另外打开一次仓库，内核运行着也可以，调用方持 [Rootfs.access] 的读锁。元数据是
     // `<d|f>\t<字节数>\t<修改时间（毫秒）>\t<权限位>`。只有目录和普通文件（符号链接跟随），

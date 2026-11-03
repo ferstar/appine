@@ -24,7 +24,7 @@ import java.io.IOException
 import kotlin.concurrent.read
 
 /**
- * 系统"文件"App 里的 appine（设计文档 §11.3）：登录账号的家目录是一个根，设置里打开之后还有
+ * 系统"文件"App 里的 appine（android/documents 的 map）：登录账号的家目录是一个根，设置里打开之后还有
  * 只读的整个系统（`/`）。
  *
  * 文档 ID 就是 guest 的绝对路径（写法见 [Native] 的说明），直接在仓库里查（[Native.browseList]

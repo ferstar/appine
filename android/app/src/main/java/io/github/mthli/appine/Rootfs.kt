@@ -18,7 +18,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.write
 
 /**
- * rootfs 的导入和配置（设计文档 §11.4）：第一次运行时导入 APK 里的 Alpine，设置里可以换成
+ * rootfs 的导入和配置（android/setup 的 map）：第一次运行时导入 APK 里的 Alpine，设置里可以换成
  * Debian（选了才下载，版本和 sha256 固定写在这里，与 `scripts/fetch-rootfs` 一样只认摘要对得上
  * 的 tarball）。导入之后写入配置文件，在后台给镜像测速，选最快的一个写进包管理器的源；设置里
  * 也可以手动选。
@@ -336,7 +336,7 @@ internal object Rootfs {
 
     /**
      * Alpine 上把 App 带着的 doas 包放进仓库（`/var/cache/appine/doas.apk`）：普通用户第一次成为
-     * 登录账号时登录脚本离线装它（设计文档 §11.1）。每次启动内核之前写，App 升级之后换成新的。
+     * 登录账号时登录脚本离线装它（android/setup 的 map）。每次启动内核之前写，App 升级之后换成新的。
      */
     @Throws(IOException::class)
     fun ensureLoginTools(context: Context) {
@@ -405,7 +405,7 @@ internal object Rootfs {
 
     /**
      * `/etc/profile.d/appine.sh`：显示 motd、终端和语言的环境变量、彩色的提示符。从哪个目录开始
-     * 由 assets 的 `login.sh` 决定（App 被杀之后恢复的标签页从原来的目录开始，设计文档 §11.2）。
+     * 由 assets 的 `login.sh` 决定（App 被杀之后恢复的标签页从原来的目录开始，android/service 的 map）。
      */
     private val PROFILE = """
         cat /etc/motd 2>/dev/null

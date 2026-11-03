@@ -35,7 +35,7 @@ import kotlin.concurrent.thread
 import kotlin.concurrent.write
 
 /**
- * 持有 guest 内核和所有终端会话的前台服务（设计文档 §11.2）。会话的生命周期挂在服务上，
+ * 持有 guest 内核和所有终端会话的前台服务（android/service 的 map）。会话的生命周期挂在服务上，
  * 不挂在 Activity 上：Activity 关掉之后 shell 照常运行。通知栏显示会话数，并提供
  * "全部退出"。
  *
@@ -109,8 +109,8 @@ class TerminalService : Service() {
      * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
      *   宿主不让绑的 1024 以下的端口换了一个，要告诉用户连哪个；
      * - guest 的关机请求（busybox 的 reboot、halt、poweroff）；
-     * - guest 改过的目录：让"文件"App 刷新它们（设计文档 §11.3）；
-     * - 没有会话、界面也不在时还有没有 guest 进程：没有了就退出（设计文档 §11.2）。
+     * - guest 改过的目录：让"文件"App 刷新它们（android/documents 的 map）；
+     * - 没有会话、界面也不在时还有没有 guest 进程：没有了就退出（android/service 的 map）。
      */
     private val poll = object : Runnable {
         override fun run() {
@@ -185,7 +185,7 @@ class TerminalService : Service() {
     /** 恢复出来、还没显示过的会话存下的那份（模拟器还没建，回看记录和目录都还是原来的）。 */
     private val unshown = HashMap<TerminalSession, Tabs.Tab>()
 
-    /** 上次被系统杀掉时存下的标签页，内核第一次起来之后恢复（设计文档 §11.2）。 */
+    /** 上次被系统杀掉时存下的标签页，内核第一次起来之后恢复（android/service 的 map）。 */
     private var restore: Tabs.Saved? = null
 
     /** 恢复之后该显示的标签页（Activity 取用）。 */
@@ -333,7 +333,7 @@ class TerminalService : Service() {
     val tier: Int get() = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1)
 
     /**
-     * 新标签页的登录账号（设置里选，设计文档 §11.1）：[ConsolePty.LOGIN_AUTO]、
+     * 新标签页的登录账号（设置里选，android/setup 的 map）：[ConsolePty.LOGIN_AUTO]、
      * [ConsolePty.LOGIN_ROOT] 或账号名。换了发行版、重置 rootfs 之后回到自动。
      */
     val login: String get() = login(this)
@@ -345,7 +345,7 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
-    /** "文件"App 里是不是还显示只读的整个系统（设置里的开关，默认关，设计文档 §11.3）。 */
+    /** "文件"App 里是不是还显示只读的整个系统（设置里的开关，默认关，android/documents 的 map）。 */
     val systemDocuments: Boolean get() = showSystemDocuments(this)
 
     fun setSystemDocuments(on: Boolean) {
@@ -556,7 +556,7 @@ class TerminalService : Service() {
         each { it.onSettingsChanged() }
     }
 
-    /** 熄屏时保持运行（设置里、通知里的开关，默认关，设计文档 §11.2）。 */
+    /** 熄屏时保持运行（设置里、通知里的开关，默认关，android/service 的 map）。 */
     val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
 
     fun setKeepAwake(on: Boolean) {
@@ -749,7 +749,7 @@ class TerminalService : Service() {
     }
 
     /**
-     * 恢复上次被杀时的标签页（设计文档 §11.2）：每个起新的 shell，以原来的账号登录、从原来的
+     * 恢复上次被杀时的标签页（android/service 的 map）：每个起新的 shell，以原来的账号登录、从原来的
      * 目录开始，先显示原来的回看记录和一行提示。不恢复进程。
      */
     private fun restoreTabs(saved: Tabs.Saved) {

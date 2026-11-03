@@ -133,7 +133,7 @@ pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
     r
 }
 
-/// 内核层结束了一个 guest 进程（App 据此在它的标签页里说明原因，设计文档 §11.2、§12）。
+/// 内核层结束了一个 guest 进程（App 据此在它的标签页里说明原因，android/service 的 map、设计文档 §12）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillReport {
     /// 进程号（开机时的 pid 命名空间里的）。

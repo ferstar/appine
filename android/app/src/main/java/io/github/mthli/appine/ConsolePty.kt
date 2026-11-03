@@ -6,8 +6,8 @@ import java.io.IOException
 
 /**
  * 一个终端标签页的 PTY：内核里的一个控制台，上面跑一个登录 shell。[login] 是设置里的登录账号
- * （`auto`、`root` 或账号名），由 assets 里的 `login.sh` 以 root 运行时决定登录谁（设计文档 §11.1）；
- * [cwd] 是从哪个目录开始（App 被杀之后恢复的标签页，§11.2），null 是家目录。
+ * （`auto`、`root` 或账号名），由 assets 里的 `login.sh` 以 root 运行时决定登录谁（android/setup 的 map）；
+ * [cwd] 是从哪个目录开始（App 被杀之后恢复的标签页，android/service 的 map），null 是家目录。
  */
 internal class ConsolePty(
     private val machine: Long,

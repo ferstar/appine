@@ -1,4 +1,4 @@
-//! appine 的 Android 原生库（设计文档 §3、§11）：Kotlin 外壳经由 JNI 使用内核层。
+//! appine 的 Android 原生库（设计文档 §3、android/native 的 map）：Kotlin 外壳经由 JNI 使用内核层。
 //!
 //! 对应的 Kotlin 声明是 `android/app/src/main/java/io/github/mthli/appine/Native.kt`。
 //! [`Machine`] 登记在一张表里，交给 Kotlin 的是编号（`long` 句柄）。每次调用临时取一个
@@ -185,7 +185,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
     }
 }
 
-// ---- 宿主浏览仓库（DocumentsProvider，设计文档 §11.3）----
+// ---- 宿主浏览仓库（DocumentsProvider，android/documents 的 map）----
 //
 // 路径在 Java 一侧是字符串（文档 ID）：guest 的文件名是任意字节，合法 UTF-8 的部分照原样，
 // `%`、控制字符（列表的每一行用制表符分隔）和不是 UTF-8 的字节写成 `%XX`，能原样换回来。

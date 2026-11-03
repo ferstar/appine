@@ -230,7 +230,7 @@ class MachineTest {
     }
 
     /**
-     * 按 inittab 开机、关机（kernel/process 的 map、设计文档 §11.2）：开机之后 once 的命令在跑，guest 的
+     * 按 inittab 开机、关机（kernel/process 的 map、android/service 的 map）：开机之后 once 的命令在跑，guest 的
      * `poweroff` 是关机的请求，[Native.shutdown] 运行关机的命令、结束所有进程、释放句柄。
      * 启动之前写好只有回环接口的 /etc/network/interfaces。
      */
@@ -316,7 +316,7 @@ class MachineTest {
     }
 
     /**
-     * 恢复的标签页从原来的目录开始（设计文档 §11.2）：root 进得去就进；目录不在了回家目录；普通
+     * 恢复的标签页从原来的目录开始（android/service 的 map）：root 进得去就进；目录不在了回家目录；普通
      * 用户以自己的身份进，进不去（/root）回自己的家目录。
      */
     @Test
@@ -370,7 +370,7 @@ class MachineTest {
     }
 
     /**
-     * 存下的标签页（设计文档 §11.2）：标记还在（被杀）时读回原样，读过一次标记就没了；正常退出
+     * 存下的标签页（android/service 的 map）：标记还在（被杀）时读回原样，读过一次标记就没了；正常退出
      * （clear）之后什么也读不到。
      */
     @Test
@@ -405,7 +405,7 @@ class MachineTest {
     }
 
     /**
-     * 登录账号（设计文档 §11.1）：只有 root 时自动登录 root；建了普通用户之后自动以它登录，第一次
+     * 登录账号（android/setup 的 map）：只有 root 时自动登录 root；建了普通用户之后自动以它登录，第一次
      * 登录时加进 wheel、离线装上 App 带的 doas，没设密码时 doas 不问密码；设了密码之后要问；
      * 明确选 root 时是 root，选的账号不在了也是 root。最后删掉账号、doas 和留下的记录。
      */

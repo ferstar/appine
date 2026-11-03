@@ -1084,7 +1084,7 @@ impl Store {
     }
 
     /// 取走上次以来目录项改过（新建、删除、改名）的目录，第一次调用时开始记（App 让"文件"App
-    /// 刷新它们，设计文档 §11.3）。记的是操作当时的，之后回滚了的也在里面。
+    /// 刷新它们，android/documents 的 map）。记的是操作当时的，之后回滚了的也在里面。
     pub fn take_changed_dirs(&self) -> Vec<Ino> {
         let mut dirs = self.changed_dirs.borrow_mut();
         match dirs.as_mut() {

@@ -148,7 +148,7 @@ pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 控制台前台进程组的当前目录（App 被杀之后恢复标签页用，设计文档 §11.2）：组长的，组长
+/// 控制台前台进程组的当前目录（App 被杀之后恢复标签页用，android/service 的 map）：组长的，组长
 /// 已经退出时取组里的任何一个进程；路径按那个进程的根目录算（与它的 `/proc/<pid>/cwd` 一样）。
 /// 没有前台进程组（shell 已经退出）是 ESRCH。
 pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {

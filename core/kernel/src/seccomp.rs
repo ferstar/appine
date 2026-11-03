@@ -1,4 +1,4 @@
-//! seccomp（设计文档 §11.1）：线程在系统调用的入口按自己的 seccomp 模式检查这个系统调用。
+//! seccomp（kernel/cred 的 map）：线程在系统调用的入口按自己的 seccomp 模式检查这个系统调用。
 //!
 //! - 严格模式（`SECCOMP_MODE_STRICT`）只允许 read、write、exit、rt_sigreturn，别的系统调用
 //!   让线程以 SIGKILL 结束（Linux 的 `do_exit(SIGKILL)`，只结束这个线程）。

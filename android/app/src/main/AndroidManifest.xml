@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 设置里打开"熄屏时保持运行"时持有 PARTIAL_WAKE_LOCK（设计文档 §11.2） -->
+    <!-- 设置里打开"熄屏时保持运行"时持有 PARTIAL_WAKE_LOCK（android/service 的 map） -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
@@ -43,7 +43,7 @@
             android:exported="false"
             android:label="@string/settings_licenses" />
 
-        <!-- 设计文档 §11.3：系统"文件"App 里的家目录（和可选的只读整个系统）；只有系统（持有
+        <!-- android/documents 的 map：系统"文件"App 里的家目录（和可选的只读整个系统）；只有系统（持有
              MANAGE_DOCUMENTS 的"文件"App）能直接访问，别的 App 经由用户在里面选的授权 -->
         <provider
             android:name=".Documents"
@@ -56,7 +56,7 @@
             </intent-filter>
         </provider>
 
-        <!-- 设计文档 §11.2：会话运行期间保持一个 specialUse 前台服务 -->
+        <!-- android/service 的 map：会话运行期间保持一个 specialUse 前台服务 -->
         <service
             android:name=".TerminalService"
             android:exported="false"

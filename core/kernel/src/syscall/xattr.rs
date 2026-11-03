@@ -1,7 +1,7 @@
 //! 扩展属性：setxattr、getxattr、listxattr、removexattr，以及按符号链接本身（`l`）
 //! 和按 fd（`f`）的变体。
 //!
-//! 扩展属性存在 inode 仓库的数据库里（设计文档 §11）。合成文件系统（/proc、/dev/pts）
+//! 扩展属性存在 inode 仓库的数据库里（kernel/vfs 的 map）。合成文件系统（/proc、/dev/pts）
 //! 的节点没有扩展属性，管道、socket 等不在文件系统里的文件不支持。权限按 Linux 的
 //! `xattr_permission` 和 commoncap 的钩子检查（[`permission`]）；程序文件的能力
 //! `security.capability` 写的时候检查格式，读的时候按 [`FileCaps::xattr_for_reader`] 转换。

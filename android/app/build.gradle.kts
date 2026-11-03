@@ -118,7 +118,7 @@ abstract class CargoNdkTask : DefaultTask() {
     }
 }
 
-/** 把 rootfs tarball 放进 assets（首次启动时导入，设计文档 §11.4），doas 包也是（§11.1）。 */
+/** 把 rootfs tarball 放进 assets（首次启动时导入，android/setup 的 map），doas 包也是（登录账号用）。 */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
     @get:Optional

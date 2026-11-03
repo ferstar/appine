@@ -96,3 +96,10 @@
 - **Tradeoffs**: Synthetic filesystems accept watches but never report; no fanotify; the provider only reports creates, removes, moves, write opens and writes.
 - **Watch out**: Keep the no-watch cost at one emptiness check per event.
 - **Source**: rounds 11 (`11-m8-jvm`), 19 (`19-deferred`), 201 (`201-documents-notify`)
+
+### D14: `protected_symlinks` and `protected_hardlinks` are on by default and enforced
+- **What**: Both sysctls default to 1 and follow Linux 6.1's `may_follow_link` (trailing links in sticky, world-writable directories are followed only by their owner or when owned by the directory's owner, root included) and `may_linkat` (non-owners without `CAP_FOWNER` may only hard-link readable and writable regular files that are not setuid or executable setgid); the no-BKL resolver hands such links to the normal walk.
+- **Why**: Alpine's sysctl service writes them at boot and failed when they were missing; accepting the writes without enforcing them would misreport a security setting. systemd, Android's init and Alpine all set them to 1, as native VMs show.
+- **Tradeoffs**: `protected_regular` and `protected_fifos` are not implemented.
+- **Watch out**: The no-BKL `Cached` walk knows no credentials, so it must keep bailing out on links that the check might refuse.
+- **Source**: round 185 (`185-protected-links-random`)

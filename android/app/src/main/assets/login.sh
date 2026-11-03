@@ -1,6 +1,6 @@
-# appine 终端标签页的登录（设计文档 §11.1）：以 root 运行，$1 是设置里的登录账号：auto、root
+# appine 终端标签页的登录（android/setup 的 map）：以 root 运行，$1 是设置里的登录账号：auto、root
 # 或账号名。auto 用最先建的普通用户（UID 1000–65533、有登录 shell 的里 UID 最小的），没有就是
-# root；指定的账号不在了也是 root。$2 是从哪个目录开始（App 被杀之后恢复的标签页，§11.2），
+# root；指定的账号不在了也是 root。$2 是从哪个目录开始（App 被杀之后恢复的标签页，android/service 的 map），
 # 没有、进不去时是账号的家目录。
 #
 # 普通用户第一次成为登录账号时，照 Alpine 的 setup-user -a 把它加进管理员组、装好提权工具：

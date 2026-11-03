@@ -1,4 +1,4 @@
-//! 宿主浏览仓库（App 的 DocumentsProvider，设计文档 §11.3）：不经过内核，直接在仓库里按
+//! 宿主浏览仓库（App 的 DocumentsProvider，android/documents 的 map）：不经过内核，直接在仓库里按
 //! guest 路径查找、列目录、打开文件，在 App 的家目录里新建、写、删除、改名、移动。
 //!
 //! 看到的是仓库里的样子，也就是内核没在运行时的样子：挂载（procfs、`/dev`、`/run` 的

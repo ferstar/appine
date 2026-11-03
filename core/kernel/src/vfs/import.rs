@@ -1,4 +1,4 @@
-//! 把 rootfs 的 tar.gz 导入 inode 仓库（设计文档 §11.4）。
+//! 把 rootfs 的 tar.gz 导入 inode 仓库（android/setup 的 map）。
 //!
 //! 整个导入在一个事务里完成，保留权限位（含 setuid）、属主、mtime、符号链接
 //! 和硬链接。路径只在仓库的命名空间里解析，tar 里的 `..`、绝对路径和指向

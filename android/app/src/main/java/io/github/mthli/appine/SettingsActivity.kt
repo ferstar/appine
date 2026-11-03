@@ -22,8 +22,8 @@ import androidx.core.view.WindowInsetsCompat
 import kotlin.concurrent.thread
 
 /**
- * 设置：发行版、软件源镜像、重置 rootfs、执行层（设计文档 §11.4），登录账号（§11.1），熄屏时
- * 保持运行（§11.2），开源许可（§13.4）。状态都在 [TerminalService]
+ * 设置：发行版、软件源镜像、重置 rootfs、执行层（android/setup 的 map），登录账号（同上），熄屏时
+ * 保持运行（android/service 的 map），开源许可（设计文档 §13.4）。状态都在 [TerminalService]
  * 里，这里只显示和转达；内核没有在运行（启动中、正在换掉仓库）时只能看、不能改。换掉仓库、
  * 重启开始时回到终端，那里显示进度。
  */
