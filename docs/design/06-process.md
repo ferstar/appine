@@ -2,13 +2,14 @@
 
 - **1:1 线程模型**：每个 guest 线程（`struct task`）对应一个宿主 pthread，调度交给宿主内核。guest 线程结束之后它的宿主线程和引擎的 CPU 状态留一会儿给下一个 guest 线程用，fork 不必每次新建。CPU 时间取宿主线程的 CPU 时钟，用户态、内核态各自不倒退（照 Linux 的 `cputime_adjust`）。
 - **退出状态**：`exit_group`、致命信号先确定整个进程的退出状态；各线程单独退出时，由最后一个进入退出流程的线程确定。按 Linux 6.1 的 `synchronize_group_exit` 在 `PTRACE_EVENT_EXIT` 前同步。
-- **驻留内存**（`ru_maxrss`、VmRSS、OOM killer 挑进程）按 VMA 用宿主的 mincore 数，只看有表项的几段（§5.2），文件映射的结果按文件缓存一会儿。
+- **execve 的参数**：参数和环境变量最多占栈大小上限的 1/4，不超过 6 MB，不少于 128 KB，与 Linux 的 `bprm_stack_limits` 相同；setuid、setgid 程序的上限不超过默认的 8 MB。
+- **驻留内存**（`ru_maxrss`、VmRSS、OOM killer 挑进程）按 VMA 用宿主的 mincore 数，只看有表项的几段（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)），文件映射的结果按文件缓存一会儿。
 - **大内核锁（BKL）**：进入 syscall 时获取；执行 guest 代码时**不持有**；在内核层里等待之前**释放**。
   - 内核对象之间用 `Rc`/`RefCell` 共享，只在持有 BKL 时访问：计数和借用标志都不是原子的，连 clone、drop 也要持锁。系统调用中途放开 BKL 的只有等待和 `Cx::unlocked`，后者的闭包要求是 `Send`，碰不到内核对象；放锁期间 panic 时先重新拿到 BKL 再展开（§12 第 5 条）。inode 仓库（§8.1）也靠 BKL：`Store` 不是 Sync，SQLite 的连接不加锁。
   - 放开 BKL 时不能还借着内核对象：内核层用自己的 `RefCell`（`core/kernel/src/cell.rs`），数着每个线程借着几个，放锁时检查是 0；交给内核的仓库在不持着那个内核的 BKL 时被使用也算 bug。调试构建总是检查，发布构建打开 `borrow-check` 特性时检查（`appine-run` 和 debug 版 App 默认打开）。
   - 可能要等宿主的操作放开 BKL 做：宿主 fd（socket 等）的读写、普通文件的 pread/pwrite、刷盘，以及 execve 里映射各段、构造初始栈（只碰新的地址空间）。用文件位置的读写，同一个打开文件同时只有一次（相当于 f_pos_lock）。
   - 取锁时先自旋一会儿：临界区通常只有几微秒，睡下再被叫醒要几十微秒。同时最多让宿主 CPU 数一半（1 到 4 个）的等锁线程自旋，其余的直接睡下；自旋时只读一个"有人持有"的标志。
-  - 持有 BKL 时要叫醒的线程放开 BKL 之后再叫醒，免得它醒来又睡下去等锁；持有期间释放的宿主内存也在放开之后交还（§5.2）。
+  - 持有 BKL 时要叫醒的线程放开 BKL 之后再叫醒，免得它醒来又睡下去等锁；持有期间释放的宿主内存也在放开之后交还（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)）。
   - **不持 BKL 的快速路径**（`syscall::fast`）：stat（root、路径全在仓库的元数据缓存里、不经过合成文件系统和别的挂载时）、读时钟（宿主的时钟和线程自己的 CPU 时钟）、futex 的等待和唤醒（键就是宿主地址、这一页在页表里可写时；futex 的等待队列有自己的锁，持锁的和不持锁的路径不会漏掉唤醒）、nanosleep。做不了时什么也不改，照常取 BKL。线程在持有 BKL 时记下自己的根目录、当前目录和凭据，改它们的一方让一个全局计数加一，别的线程记下的随之作废。有 seccomp 的线程只有过滤器总是放行的编号走快速路径（§11.1）。
   - 其余的拆分按 profiling 决定（R1）：多数负载的系统调用只占几个百分点。几个进程同时起进程时 BKL 是瓶颈，要用上多核得缩小必须串行的部分（比如按 fork 家族给地址空间加锁），还没做。
 - **统一的等待机制**：guest 线程永远不直接阻塞在宿主 syscall 上。每个线程有一个专属的 **eventfd** 作为唤醒通道，所有等待都是一次宿主 `poll()`，监听集合里是这个 eventfd 加上要等的宿主 fd。这样 guest 信号、futex 和 I/O 就绪都走同一条唤醒路径，不需要用宿主信号去打断阻塞调用，也就不和 ART/bionic 抢信号编号。

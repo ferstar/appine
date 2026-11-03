@@ -1,7 +1,7 @@
 # appine 设计文档
 
 - **状态**：设计决策在 2026-10-24 的设计评审中逐条确认。M0–M8 已完成；M9（发布）进行中，还剩真机验证、许可证义务和 Play 提交（§14.1）。
-- **范围**：v1。第 1–13 节写当前的做法，随每一轮的改动更新；改动的经过、测量和出处记在各轮里（[milestones.md](../milestones.md)）。
+- **范围**：v1。第 1–13 节写当前的做法，随每一轮的改动更新；改动的经过、测量和出处记在各轮里（[milestones.md](../milestones.md)）。各子系统的做法正逐节迁到 `.claude/maps/` 里各模块的 map（英文，模块见 [MODULES.md](../../.claude/MODULES.md)），迁走的节从这里删掉，节号不变。
 - **一句话**：一个能上 Google Play 的**单进程** Android App，在进程内用解释器 / 同 ISA 二进制翻译运行未经修改的 Alpine Linux aarch64 用户态程序。思路与 iSH 相同，是它在 Android 上的对应物。
 
 **目录**
@@ -10,7 +10,7 @@
 2. [硬约束](#2-硬约束)
 3. [总体架构](#3-总体架构)
 4. [CPU 引擎](04-cpu.md)
-5. [内存：轻量用户态 soft-MMU](05-memory.md)
+5. 内存：轻量用户态 soft-MMU，已迁到 [kernel/mm 的 map](../../.claude/maps/kernel/mm.md)（英文）
 6. [进程、线程与调度](06-process.md)
 7. [信号与 ABI](07-signals.md)
 8. [文件系统](08-filesystem.md)

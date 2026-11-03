@@ -31,7 +31,7 @@
 
 宿主侧要处理的信号用普通 `sigaction` 安装，libsigchain 会把我们的处理函数链在 ART 自己的处理函数之后。
 
-- **越过 EOF 的 SIGBUS**：都事先避开了（§5.2），仓库的 object 文件只有 appine 自己会改。
+- **越过 EOF 的 SIGBUS**：都事先避开了（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)），仓库的 object 文件只有 appine 自己会改。
 - **引擎的 bug**（`core/engine/src/c/guard.c`）：引擎装了 SIGSEGV、SIGBUS、SIGILL 的处理函数。引擎运行期间出了故障，处理函数 `siglongjmp` 回运行函数，由它返回 `APPINE_EXIT_HOST_FAULT`，内核层只结束这个 guest 进程（§12 第 5 条）。为此运行期间引擎不调用 malloc、不回调内核层，拿到的锁都登记下来，跳回之后释放；用过的 Tier 1 实例直接释放，翻译模板整体丢弃。App 进程里 ART 的处理函数不认领的故障才交给我们。
 - 其余的故障先往 stderr 写一行报告，再交给原来的处理函数（Android 上是 debuggerd）。
 - 打断 guest 线程不用宿主信号：kick 只是置位 pending 标志（§7.3），等待中的线程经由 eventfd 唤醒（§6）。

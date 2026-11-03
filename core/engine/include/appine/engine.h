@@ -1,5 +1,5 @@
 /*
- * appine 引擎的对外接口（设计文档 §4、§5、§13.1）。
+ * appine 引擎的对外接口（设计文档 §4、§13.1，kernel/mm 的 map）。
  *
  * 引擎只负责执行 guest 指令和 soft-MMU 快速路径。遇到 svc、访存失败、未定义
  * 指令、brk 时，appine_cpu_run() 返回一个退出原因，由内核层（Rust）处理后
@@ -191,7 +191,7 @@ uint64_t appine_guest_hwcap2(void);
 /* guest 读到的 MIDR_EL1（宿主不允许读 ID 寄存器时为 0） */
 uint64_t appine_guest_midr(void);
 
-/* ---- soft-MMU 页表（设计文档 §5.1）---- */
+/* ---- soft-MMU 页表（kernel/mm 的 map）---- */
 
 enum {
     APPINE_OK = 0,

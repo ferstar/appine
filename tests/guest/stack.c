@@ -1,5 +1,5 @@
 /*
- * 主线程栈按需向下增长，大小受 RLIMIT_STACK 的当前值限制（设计文档 §5.4）。内核访问
+ * 主线程栈按需向下增长，大小受 RLIMIT_STACK 的当前值限制（kernel/mm 的 map）。内核访问
  * 还没长出来的栈（syscall 的缓冲区、信号帧）时也要让它长出来，与 Linux 相同。
  */
 #include <errno.h>

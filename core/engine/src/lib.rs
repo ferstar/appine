@@ -1,6 +1,6 @@
 //! appine 引擎（C 实现）的 Rust 绑定。
 //!
-//! 引擎负责执行 guest 指令和 soft-MMU 快速路径（设计文档 §4、§5）。内核层用
+//! 引擎负责执行 guest 指令和 soft-MMU 快速路径（设计文档 §4、kernel/mm 的 map）。内核层用
 //! [`Cpu::run`] 驱动执行，再根据返回的 [`Exit`] 处理 syscall、异常等事件。
 
 use std::ffi::{c_int, c_uint, c_void};
@@ -9,7 +9,7 @@ use std::mem::offset_of;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-/// guest 页大小，固定 4K（设计文档 §5.2）。
+/// guest 页大小，固定 4K（kernel/mm 的 map）。
 pub const PAGE_SIZE: u64 = 4096;
 /// guest 虚拟地址位数。
 pub const VA_BITS: u32 = 48;
@@ -255,7 +255,7 @@ fn map_result(rc: c_int) -> Result<(), MapError> {
     }
 }
 
-/// 一个 guest 地址空间的软件页表（设计文档 §5.1）。
+/// 一个 guest 地址空间的软件页表（kernel/mm 的 map）。
 pub struct Mmu {
     raw: NonNull<RawMmu>,
 }

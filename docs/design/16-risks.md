@@ -9,5 +9,5 @@
 | R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | ✅ 已关闭：瓶颈在引擎而不在事务；引擎变快之后改成推迟最多 5 毫秒合并提交（§8.1） | — |
 | R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | ✅ 已解决：不用，翻译后的代码不碰 X18，临时寄存器改用 X27（§4.2） | — |
 | A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | ✅ 已证实：Go 在 arm64 上 `_SA_RESTORER = 0`，信号处理函数经由 vDSO 的 `__kernel_rt_sigreturn` 返回 | — |
-| A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | ✅ 模拟器的 GKI 内核是这样（§5.4） | — |
+| A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | ✅ 模拟器的 GKI 内核是这样（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)） | — |
 | A3 | dynarmic 内存回调拿不到精确 guest 状态（根据接口签名推断） | 仅影响 §15 的论证 | — |
