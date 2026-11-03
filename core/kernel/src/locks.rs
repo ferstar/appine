@@ -87,8 +87,8 @@ impl Locks {
         locks.iter().find(|l| l.conflicts(req)).cloned()
     }
 
-    /// Sets (or, when `write` is None, removes) the locks in `req`'s range. The caller has already
-    /// made sure there is no conflict.
+    /// Sets (or, with `unlock`, removes) the locks in `req`'s range. The caller has already made
+    /// sure there is no conflict.
     pub fn set(&mut self, ino: Ino, req: Lock, unlock: bool) {
         let locks = self.by_ino.entry(ino).or_default();
         let (mut start, mut end) = (req.start, req.end);

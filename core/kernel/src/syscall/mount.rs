@@ -56,12 +56,11 @@ pub(super) fn mount(
     data: u64,
 ) -> SysResult {
     // As in Linux's ksys_mount: copy the arguments and resolve the mount point first, then look
-    // at the flags and permissions. Options in data (devpts's mode and gid, proc's hidepid and so
-    // on) are not looked at, only required to be readable
+    // at the flags and permissions
     let fstype = optional_str(cx, fstype)?;
     let source = optional_str(cx, source)?;
-    // Only tmpfs looks at the options; Linux copies at most one page, and EFAULT if the first byte
-    // cannot be read
+    // Only tmpfs and devpts look at the options in data (proc's hidepid and the like are ignored);
+    // Linux copies at most one page, and EFAULT if the first byte cannot be read
     let data = if data != 0 {
         get::<1>(cx, data)?;
         cx.mm().read_cstr(data, 4096).unwrap_or_default()
@@ -153,7 +152,7 @@ fn new_mount(
         return Err(Errno::EPERM);
     }
     // cgroup2 can be mounted without read-only (crun does so when mounting /sys/fs/cgroup for a
-    // container); only its files cannot be changed ([`Vfs::readonly`])
+    // container), and is then writable like the boot mount
     let vfs = cx.vfs()?;
     may_mount_on(&target)?;
     check_mnt(cx, &vfs, target.mnt())?;

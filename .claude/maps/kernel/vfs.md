@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/vfs.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -469,11 +471,10 @@ mapped).
   other users' open files and follow the links to their nodes, reaching files in directories it
   cannot search, and reopen their pipes with no permission check (Linux denies with `EACCES`).
   See the matching `kernel/procfs` item.
-- **Open-time `O_SYNC`/`O_DSYNC` do nothing:** open drops them, so writes return before the data
-  is durable (only `pwritev2` with `RWF_SYNC`/`RWF_DSYNC` fsyncs), contradicting the code's own
-  comment and Linux's `generic_write_sync`; `F_GETFL` also hides them. Programs relying on
-  `O_SYNC`/`O_DSYNC` instead of fsync (databases, loggers) can lose acknowledged writes on power
-  loss.
+- **Open-time `O_SYNC`/`O_DSYNC` do nothing:** open drops them, so writes return before the data is
+  durable (only `pwritev2` with `RWF_SYNC`/`RWF_DSYNC` fsyncs), contradicting Linux's
+  `generic_write_sync`; `F_GETFL` also hides them. Programs relying on `O_SYNC`/`O_DSYNC` instead of
+  fsync (databases, loggers) can lose acknowledged writes on power loss.
 - **execve drops POSIX record locks:** execve and `close_range(CLOSE_RANGE_UNSHARE)` always copy
   the fd table (the reference test ignores the second per-thread reference), the copy does not own
   the old table's POSIX locks, and the old owner dies, so a process's `fcntl` locks vanish at

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-03 (targeted verification: synchronous-write handling corrected from the kernel/vfs verification)
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -182,12 +182,11 @@ provider and rootfs installation UI (`android`).
 
 ### Sharing the store
 
-- Connections, not processes, are counted in `users` (the field's comment says processes). The
-  kernel and the app's DocumentsProvider run in the same process; each host call (`browse`,
-  `browse_changing`, `write_file`, `read_file`) opens its own short-lived connection, and while it
-  is open every operation commits immediately. A count leaked by a crash can only persist while
-  another process holds the shared lock (e.g. several `appine-run` processes on one store), so on
-  Android the next open is exclusive and resets it.
+- Connections, not processes, are counted in `users`. The kernel and the app's DocumentsProvider run
+  in the same process; each host call (`browse`, `browse_changing`, `write_file`, `read_file`) opens
+  its own short-lived connection, and while it is open every operation commits immediately. A count
+  leaked by a crash can only persist while another process holds the shared lock (e.g. several
+  `appine-run` processes on one store), so on Android the next open is exclusive and resets it.
 - Changes made by host calls are replayed to running kernels of the same store in this process
   (found in the machine's registry), under their BKL, as inotify events. Directories the guest
   changes are recorded (up to 256 per poll, starting from the first poll) and handed to the

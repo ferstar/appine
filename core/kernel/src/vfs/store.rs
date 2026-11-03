@@ -691,7 +691,7 @@ impl Cache {
 }
 
 /// A few words at the start of the `lock` file that all processes map shared: the number of
-/// commits, the number of processes using the store, and the range of inode numbers newly
+/// commits, the number of connections open on the store, and the range of inode numbers newly
 /// allocated by write transactions not yet committed.
 struct Commits {
     map: appine_hal::FileMapping,
@@ -721,10 +721,11 @@ impl Commits {
         self.word(0).fetch_add(1, Ordering::SeqCst)
     }
 
-    /// The number of processes using the store. A process that exited abnormally has not
-    /// subtracted itself, so it may be too high (which only makes other processes stop deferring
-    /// commits); it is reset to zero when the store is opened exclusively (the equivalent of
-    /// boot).
+    /// The number of [`Store`] connections open on the store (one process may hold several: each
+    /// host call opens its own besides the kernel's). A process that exited abnormally has not
+    /// subtracted its connections, so it may be too high (which only makes other connections stop
+    /// deferring commits); it is reset to zero when the store is opened exclusively (the
+    /// equivalent of boot).
     fn users(&self) -> &AtomicU64 {
         self.word(1)
     }
@@ -1164,7 +1165,7 @@ impl Store {
         r
     }
 
-    /// Write transactions may be deferred: no other process is using the store.
+    /// Write transactions may be deferred: no other connection is open on the store.
     fn defers(&self) -> bool {
         self.meta.commits.users().load(Ordering::Relaxed) <= 1
     }
@@ -1956,7 +1957,7 @@ impl Store {
         })
     }
 
-    /// Changes the owner and group; `None` means unchanged. For regular files the setuid bit is
+    /// Changes the owner and group; `None` means unchanged. For non-directories the setuid bit is
     /// cleared as well, and the setgid bit when the file is group-executable (Linux does this for
     /// root too).
     pub fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {

@@ -76,10 +76,10 @@ impl Node {
 /// namespaces together.
 pub(crate) type MountId = u32;
 
-/// Id of the boot mount namespace (the inode number in `/proc/<pid>/ns/mnt`, the same as is
-/// common on Linux).
 /// Device number of the mqueue filesystem of the boot IPC namespace (0:19).
 pub(crate) const MQUEUE_DEV: u64 = 0x13;
+/// Id of the boot mount namespace: the inode number in `/proc/<pid>/ns/mnt`, the same as is
+/// common on Linux.
 pub(crate) const INIT_MNT_NS: u64 = 4_026_531_841;
 
 /// A mount namespace (Linux's `struct mnt_namespace`): only an id; each mount records which
@@ -744,8 +744,8 @@ impl Vfs {
             flags,
             b"sysfs",
         );
-        // cgroup2 is mounted on sysfs's fs/cgroup (the kernel/vfs map) and is writable as on a
-        // Linux host: dockerd and runc create the containers' cgroups in it
+        // cgroup2 is mounted on sysfs's fs/cgroup and is writable as on a Linux host: dockerd and
+        // runc create the containers' cgroups in it
         if mounts.list.iter().any(|m| m.id == SYS_MOUNT) {
             mounts.boot(
                 CGROUP_MOUNT,
@@ -960,8 +960,6 @@ impl Vfs {
         }
     }
 
-    /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
-    /// synthetic filesystems always can.
     /// Whether, with `fs.protected_symlinks` on, symlink `link` in directory `dir` may be
     /// followed (Linux's `may_follow_link`): someone else's link in a sticky, world-writable
     /// directory (/tmp) is followed only when the link's owner is the directory's owner, for root
@@ -979,6 +977,8 @@ impl Vfs {
         Err(Errno::EACCES)
     }
 
+    /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
+    /// synthetic filesystems always can.
     fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
         match dir {
             Node::Store(_, ino) if !cred.searches_all() => {
@@ -2300,7 +2300,6 @@ pub fn read_file(store: &Store, path: &[u8]) -> Result<Vec<u8>, Errno> {
     Ok(data)
 }
 
-/// Splits path components, dropping empty components and `.`.
 /// Components for path resolution: `.` is kept, and with a trailing `/` one more `.` is added,
 /// so the preceding node must be a directory and a symlink in the last component is followed
 /// too (as on Linux).
@@ -2316,6 +2315,7 @@ fn components(path: &[u8]) -> VecDeque<Vec<u8>> {
     comps
 }
 
+/// Splits path components, dropping empty components and `.`.
 fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
     path.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")

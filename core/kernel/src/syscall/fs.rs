@@ -299,10 +299,11 @@ pub(super) fn create_parent_at<'p>(
 }
 
 /// The directory to create or delete in: one in the store. Those in synthetic filesystems cannot
-/// be modified, and are EROFS in a read-only mount (such as cgroup2). In the root directory of the
-/// mqueue filesystem only queues can be created and deleted (openat and unlinkat handle them
-/// separately); everything else (mkdir, mknod, symlink, link, rename) is EPERM as on Linux: its
-/// directory has no such operations.
+/// be modified, and are EROFS in a read-only mount. In the root directory of the mqueue filesystem
+/// only queues can be created and deleted (openat and unlinkat handle them separately); everything
+/// else (mkdir, mknod, symlink, link, rename) is EPERM as on Linux: its directory has no such
+/// operations. cgroup2 directories are EPERM too (mkdirat and unlinkat handle child cgroups
+/// before this).
 fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Store(mnt, ino) => Ok((*mnt, *ino)),
@@ -401,8 +402,8 @@ fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
     Ok(ino)
 }
 
-/// The store inode to modify: EROFS in a read-only mount (including cgroup2, which is always
-/// read-only); other nodes in synthetic filesystems cannot be modified.
+/// The store inode to modify: EROFS in a read-only mount; nodes in synthetic filesystems cannot
+/// be modified (EACCES).
 fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
     if cx.vfs()?.readonly(node) {
         return Err(Errno::EROFS);
@@ -1398,7 +1399,6 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
     Ok(FileKind::Pipe(end))
 }
 
-/// Opens a node in a synthetic filesystem.
 /// Opens a queue in the mqueue filesystem: the resulting fd is the same as mq_open's (on Linux it
 /// is the same kind of file), and mq_timedsend and the like work on it. A just-created one is not
 /// checked for permission again.
@@ -1419,6 +1419,7 @@ fn open_mq(
     Ok(FileKind::MessageQueue(q))
 }
 
+/// Opens a node in a synthetic filesystem.
 fn open_pseudo(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -3596,9 +3597,6 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     }
 }
 
-/// Called after a file gets shorter: in every address space, pages mapping it beyond the new end
-/// are removed from the page tables ([`crate::mm::Mm::file_truncated`]). The current process's
-/// address space syncs at the end of the syscall; other processes' sync here.
 /// Whether some address space maps this open file with a writable shared mapping.
 fn writably_mapped(cx: &Cx<'_>, f: &OpenFile) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -3617,6 +3615,9 @@ fn writably_mapped(cx: &Cx<'_>, f: &OpenFile) -> bool {
     })
 }
 
+/// Called after a file gets shorter: in every address space, pages mapping it beyond the new end
+/// are removed from the page tables ([`crate::mm::Mm::file_truncated`]). The current process's
+/// address space syncs at the end of the syscall; other processes' sync here.
 fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = host.metadata() else {
@@ -3764,9 +3765,10 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     }
 }
 
-/// sync_file_range, readahead, syncfs: only check arguments (data is written straight into the
-/// host file, and reads are cached by the host too). `kind` tells the three apart: 0 is
-/// sync_file_range, 1 readahead, 2 syncfs.
+/// sync_file_range, readahead, syncfs: mostly argument checks (data is written straight into the
+/// host file, and reads are cached by the host too). sync_file_range with flags on a regular file
+/// is passed to the host object with the BKL released; syncfs's flush is [`sync`], called after
+/// this. `kind` tells the three apart: 0 is sync_file_range, 1 readahead, 2 syncfs.
 pub(super) fn cache_hint(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -4063,6 +4065,10 @@ enum IoPath {
     Kmsg,
     /// `/proc/kmsg`: syslog's read.
     ProcKmsg(Rc<RefCell<crate::klog::Klog>>),
+    /// Everything else (files in the store, devices, other synthetic files, and files with no
+    /// read or write operation): never waits for data. Regular files are read and written with
+    /// the BKL released ([`unlocked_io`]), except `O_APPEND` writes; the rest is done directly
+    /// while holding the borrow.
     Local,
 }
 
@@ -4534,7 +4540,6 @@ fn proc_kmsg_read(
     Ok(text.len())
 }
 
-/// Files in the store and devices: never block, done directly while holding the borrow.
 /// The host fd of a regular file: the BKL can be released while reading or writing it
 /// ([`unlocked_io`]).
 fn regular_fd(f: &OpenFile) -> Option<i32> {
@@ -5142,7 +5147,8 @@ pub(super) fn write_file(
 /// (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do (Linux's
 /// generic_write_sync). Data, length and times are all in the host object, so the host flushes
 /// them, waited for with the BKL released; names are not among them, and on Linux the directory
-/// also needs a separate fsync.
+/// also needs a separate fsync. Unlike Linux, open does not keep `O_DSYNC` or `O_SYNC` in the
+/// open file's flags, so only `rwf` leads to a flush.
 fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
     const O_DSYNC: u32 = 0o10000;
     const O_SYNC_BIT: u32 = 0o4000000; // __O_SYNC; O_SYNC is it plus O_DSYNC
