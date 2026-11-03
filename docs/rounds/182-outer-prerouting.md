@@ -37,24 +37,11 @@ nft add rule ip px pre iifname "podman0" udp dport 53 redirect to :1053
 
 ## 测试
 
-- `origdst` 差分测试组的跨命名空间部分加了几种情形（外层开 `ip_forward`），两个执行层下都与原生逐字相同：
-  - A 连外面的地址（192.0.2.10，TEST-NET-1），外层 `iif br0 … redirect` 到外层的代理：代理看到的原目的地址是 192.0.2.10:2290，A 报告它连的那个。
-  - `fib daddr type local` 限定的规则：A 连网关时匹配、连外面的地址时不匹配，落到下一条规则的代理上。
-  - 外层 DNAT 到 B：B 报告它的本端地址，A 报告它连的外面的地址。A 和 B 在同一个网段，原生要 masquerade，B 的回答才经过外层换回来（appine 不执行 POSTROUTING，连接本来就在 socket 层）。
-  - 外层的 FORWARD 用 `oif br0` 拒绝转到 B 的一个端口：A 连外面的地址、A 连网关，被 DNAT 到那里时都是 ECONNREFUSED。B 在那个端口上一直监听着，没有拒绝的话连得上。
-  - UDP：A 发给网关、发给外面地址的 53 端口（劫持到外层的 1053），外层的服务端绑通配地址。回答分别来自 10.50.0.1:1053 和 192.0.2.10:53，连接了的 socket 也收得到。
-- 变异检查（每次在容器里 touch 之后重新编译），每处都让 `origdst` 组失败：
-  - 不进入外层：32 行不同。
-  - FORWARD 照旧按 DNAT 之后的目的地判断：4 行不同。
-  - `oif` 不匹配：4 行不同。
-  - 外层通配地址的 socket 不加 `IP_PKTINFO`：29 行不同。
-  - 第一次写的 FORWARD 情形连的是 B 上已经关掉的端口，拒绝没拒绝都是 ECONNREFUSED，变异没被抓到，改成上面那样。
-- DNAT 到外面的地址：差分测试里没有稳定能连到的外部地址，手动验证。外层把容器连 192.0.2.10:2295 的连接 DNAT 到宿主上的 HTTP 代理，现在连得上、拿到回答；改之前是 EINVAL。
-- 实测（Tier 1，`target/origdst/ctr-redir.sh`）：外层跑 ssserver 和 `sslocal --protocol redir`，一条 `iifname br0 tcp dport 1087 redirect to :1081`。容器里的 curl 访问外面的 HTTP 服务，经由 sslocal、ssserver 拿到了回答，ssserver 转了一次。
-- cargo test（332 个）、clippy（含 Android）、格式、两个执行层的全部差分测试（51 组）通过。Tier 0 下 `namespaces` 组有一次 user 命名空间里 exec 之后读到的 `/proc/self/status` 少了几行，当时正在同一个仓库里手动跑脚本，单独重跑两次都通过。
-- LTP 的 syscall 测试 1011 个通过（上一轮 1014），少的三个：
-  - process_vm_writev01：`/dev/shm/ltp_process_vm01_2` 已经存在（EEXIST）。8 路并发共用一个仓库，每个 appine 里的 pid 都是 2，与同时跑的 process_vm_readv01 撞了名字。单独重跑通过。
-  - epoll_pwait03、select02：[偶发项](../milestones.md#已知的偶发失败)，单独重跑也失败，第 179 轮的二进制在同一时刻也失败。
+- `origdst` 差分测试组的跨命名空间部分加了容器连外面的地址时外层的 REDIRECT、DNAT、`fib daddr type local`、FORWARD 上的 `oif`、劫持 UDP 53 端口时回答的来源（外层开 `ip_forward`），两个执行层下都与原生逐字相同。A 和 B 在同一个网段，原生要 masquerade，B 的回答才经过外层换回来。
+- 第一次写的 FORWARD 情形连的是 B 上已经关掉的端口，拒绝没拒绝都是 ECONNREFUSED，变异检验查不出来，改成 B 在那个端口上一直监听着。
+- DNAT 到外面的地址：差分测试里没有稳定能连到的外部地址，手动验证。外层把容器的连接 DNAT 到宿主上的 HTTP 代理，现在连得上；改之前是 EINVAL。
+- 实测（Tier 1，`target/origdst/ctr-redir.sh`）：外层跑 ssserver 和 sslocal 的 redir 模式、一条 `iifname br0 … redirect` 的规则，容器里的 curl 拿到了外面的 HTTP 服务的回答。
+- LTP 8 路并发共用一个仓库，每个 appine 里的 pid 都是 2：process_vm_writev01 和同时跑的 process_vm_readv01 在 `/dev/shm` 里的文件撞名，偶尔 EEXIST。
 
 **推迟项**：
 

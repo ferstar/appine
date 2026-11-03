@@ -31,20 +31,13 @@
 
 ## 测试
 
-- AddressSanitizer（Ubuntu 26.04 仓库里的 gcc 15，Tier 1）：
-  - 堆越界写、释放后使用：报告和原生一样（`heap-buffer-overflow`、`heap-use-after-free`，影子字节的转储），退出码 1。原来整个 `appine-run` 被宿主的 OOM killer 杀掉。
-  - LSan：退出时报告 123 字节的泄漏。它用 ptrace 停住所有线程扫描内存，也能用。
-  - fork（64 MB 写过的堆）：父子各写各的；8 个线程各分配、释放 1 MB。
-- LTP 的 fork14：通过，0.6 秒（原来 TBROK：最早 4 分多钟后被 OOM 结束，第 178 轮 2 秒左右被 OOM 结束）。它一直映射到 16 TB，fork 在第 4 次之后按提交量失败，映射本身不再占页表。
-- `MAP_NORESERVE` 的 fork：64 GB 的映射写两页再 fork，原生和 appine 都成功、子进程读到内容。改之前的二进制是 ENOMEM。
-- 单元测试新增 5 个，改 1 个（私有文件映射的那个加上：5000 字节的文件以可执行权限映射成 1 GB，只有两页有表项）：
-  - 引擎（`tests/mmu.rs`）：只填空表项（不碰映射到别处的、权限为 0 的）；整个 48 位地址空间里只有两页时查找、改权限、解除映射跳过空洞；搬表项带着权限、跨叶子表、拒绝重叠。
-  - 内核层：64 GB 映射没有表项，访问一次补一张叶子表，内核层读写也补，映射外、没有权限的不补，驻留内存只量到碰过的两页，fork 只借碰过的页、子进程读到内容、没碰过的是零；写过的页在 `PROT_NONE`、内核层直接写、mremap 搬走之后都还有表项，之后 fork 的子进程看得到内容。
-- 差分测试 `fork` 组新增一项：1 TB 的 `MAP_NORESERVE` 映射碰 4 页（开头、三分之一、一半多 5 MB、最后一个字节），fork 之后子进程读到内容、没碰过的是零、写自己的一份；`PROT_NONE` 再改回来、`MREMAP_FIXED` 搬走之后内容还在，再 fork 也看得到；VmRSS 不到 64 MB。改之前的二进制建了 2 GB 页表之后被 appine 自己的 OOM killer 结束。
+- AddressSanitizer（Ubuntu 26.04 仓库里的 gcc 15，Tier 1）：堆越界写、释放后使用的报告和原生一样，LSan（用 ptrace 停住所有线程扫描内存）、fork、多线程也正常；原来整个 `appine-run` 被宿主的 OOM killer 杀掉。
+- LTP 的 fork14 通过（原来 TBROK）：它一直映射到 16 TB，fork 在第 4 次之后按提交量失败，映射本身不再占页表。
+- 有 64 GB `MAP_NORESERVE` 映射的进程 fork，原生和 appine 都成功、子进程读到内容。
+- 单元测试：引擎（`tests/mmu.rs`）测页表的新操作和跳过空洞；内核层测按需补表、驻留内存和 fork 只看碰过的页，写过的页在 `PROT_NONE`、内核层直接写、mremap 之后都还有表项。
+- 差分测试 `fork` 组新增一项：1 TB 的 `MAP_NORESERVE` 映射只碰几页，fork、`PROT_NONE` 再改回来、`MREMAP_FIXED` 搬走之后的内容和 VmRSS。
 - DBT 恢复停放的块时页没有表项就留着：没有单独的测试（文件的可执行映射一次建好表项，平时碰不到）。
-- 变异检查（每次在容器里 touch 之后重新编译）：mprotect 成 `PROT_NONE` 时拿掉表项、`write_kernel` 不补表项、mremap 不搬表项、fork 申请宿主内存不看 `MAP_NORESERVE`，各自让新的单元测试在对应的断言上失败。
-- cargo test（326 个）、clippy（含 Android）、格式、两层的全部差分测试（50 组）通过。LTP 的 syscall 测试 1013 个通过（上一轮 1011）：fork14 通过，mmap21_02 这次通过（[偶发项](../milestones.md#已知的偶发失败)），其余相同。
-- 性能（虚拟机本地卷上的仓库，HEAD 与这一轮交替各 3 轮）：python、gcc、shell、git、node（冷启动、热的 10 次、4 个并发计算）、`java -version`、`go build` 冷编译、Maven 和 Gradle 热编译都在噪声以内（比如 gcc 2.18–2.26 秒对 2.19–2.21 秒，go build 4.69–4.78 秒对 4.66–4.78 秒）。大映射里只碰一点的微基准：
+- 性能：python、gcc、shell、git、node、java、go build、Maven 和 Gradle 的耗时在噪声以内。大映射里只碰一点的微基准：
 
   | | 原生 | HEAD | 这一轮 |
   |---|---|---|---|

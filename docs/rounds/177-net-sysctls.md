@@ -20,19 +20,6 @@
 
 ## 测试
 
-- 新的差分测试组 `netsysctl`（新的网络命名空间里）：
-  - 常用的 20 项的权限和默认值。
-  - 写入：整数、部分写、多写、不是数、拥塞控制算法有的和没有的、保留的端口、只读的（root 也是 "can't create … Permission denied"）。
-  - 另一个命名空间各有一份。
-  - 不比整个目录的列表：Linux 6.1 和 6.8 的项不一样。
-- `nsports` 组加了 UDP：发往 A 上没人绑的端口（外层在这个端口上有会回答的 UDP 服务）超时，发往只绑 127.0.0.1 的 UDP 服务也超时，A 自己发给 127.0.0.1 的有回答。
-- `netmap` 组的"先绑通配地址再 connect"那一项加了端口前后不变的检查。
-- 两个执行层下都与原生逐字相同，`portfwd`、`filter`、`nftables`、`netdev`、`lowports` 照旧通过。
-  - 写的时候碰到：ping socket 也是 SOCK_DGRAM，一开始被当成 UDP 丢掉了（netmap 的普通用户 ping 失败）；上面那个端口变了的问题（netmap 的 udpconn 失败）。
-- 单元测试新增 1 个（`netconf`），`netns` 的监听登记测试加了 UDP。
-- 变异检查：新命名空间里看不到这些 sysctl（`netsysctl`）、不丢发往没人绑的 UDP 端口（`nsports`，外层的服务回答了）、回到原来的断开方式（`netmap`，端口变了、回答被丢掉），都与原生不同。"之前在宿主上连过、断开后绑回原来的端口"这一条没有测试走到（单独去掉绑回时 `netmap` 照样通过）。
-- 普查（与原生对照，原生也重新跑过）：
-  - podman 的普查加了 `firewall_driver = "iptables"`（Alpine 上装了 iptables 时 netavark 默认用它，规则经由 iptables-nft 的 xt 扩展）：容器之间、外层到容器、`-p`（经由 127.0.0.1、外层地址，占着端口的监听）、按名字解析都与原生一致，没有发现新问题。
-  - docker 的普查加了 `--sysctl net.ipv4.tcp_keepalive_time=600 --sysctl net.core.somaxconn=1024`：容器里读到 600、1024，与原生相同。原来 appine 里没有 `tcp_keepalive_time` 这个文件（实测），runc 写 sysctl 失败就报错，容器起不来。
-  - 两个普查与原生不同的只剩 ping 外层的网关（有意的），没有内部错误。
-- cargo test（319 个）、clippy（含 Android）、格式、两层的全部差分测试（50 组）通过。LTP 的 syscall 测试 1012 个通过：上一轮因为 colima 的计时器精度失败的 select02 又通过了，别的与上一轮相同。clippy 起初报 `add_listener` 参数太多（加了 UDP）、测试模块之后还有条目：参数改成一个结构体，测试模块挪到文件末尾。
+- 新的差分测试组 `netsysctl`（新的网络命名空间里）：常用的 20 项的权限和默认值，各种写入，另一个命名空间各有一份。不比整个目录的列表：Linux 6.1 和 6.8 的项不一样。
+- `nsports` 组加了 UDP 发往没人绑的端口，`netmap` 组加了先绑通配地址再 connect 前后端口不变。两个执行层下都与原生逐字相同。ping socket（也是 SOCK_DGRAM）一开始被当成 UDP 丢掉了，是 `netmap` 的普通用户 ping 查出来的；上面那个端口变了的问题也是 `netmap` 查出来的。单元测试在 `netconf` 和 `netns` 的监听登记里。
+- 普查：podman 的普查加了 `firewall_driver = "iptables"`（Alpine 上装了 iptables 时 netavark 默认用它），与原生一致；docker 的普查加了 `--sysctl net.ipv4.tcp_keepalive_time=600` 这类选项，容器里读到的值与原生相同，原来 appine 里这样的容器起不来。

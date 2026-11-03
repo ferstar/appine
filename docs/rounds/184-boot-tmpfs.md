@@ -30,21 +30,9 @@ devfs 现在打印 "Remounting tmpfs on /dev"，按它的选项重新挂载（`n
 
 ## 测试
 
-- 单元测试：
-  - 开机时的挂载树：`/` 下面是 proc、dev、sys、run；`/dev` 下面是 pts、shm、mqueue。
-  - `/dev/null` 在 `/dev` 的 tmpfs 里，`/dev` 的路径和 `..` 正确。
-- `mount` 差分测试组新增一节：
-  - `/dev` 下面各个挂载的类型。docker 的也是 tmpfs、devpts、mqueue、tmpfs。
-  - 照 OpenRC 的 devfs 重新挂载 `/dev`：超级块的选项（`size=10240k,mode=755,inode64`）和 noexec 与原生相同。
-  - 之后标准的设备节点都在，`openpty` 得到的从设备名字在 `/dev/pts` 下面，urandom 读得出来。
-  - 原生的容器没有挂 `/run`，`/run` 不比。
-- 手动（`target/openrc/devfs.sh`）：OpenRC 的 sysinit 里加上 devfs、dmesg、mdev、hwdrivers，boot 里加上 seedrng、bootmisc、sysctl、hostname。
-  - 之后 `/dev` 的节点都在，tmux 能开会话，`/run` 没有被再挂一层。
-  - 改之前 `/dev` 只剩 console、fd、kmsg、log、mqueue、null、shm、stdin、stdout、stderr、tty、tty1，没有 ptmx。
-- cargo test（332 个）、两个执行层的全部差分测试（51 组）通过。
-- LTP 的 syscall 测试 1013 个通过。与第 183 轮相比只有 epoll_pwait03 不同：
-  - 它的睡眠一直比要求的长约一半（1 ms 的中位数 1.6 ms），连续重跑都是这样。
-  - 用第 183 轮的二进制重跑也一样失败，是 colima 这时的计时环境，与这轮无关。
+- 单元测试：开机时的挂载树，`/dev` 的 tmpfs 里的节点和路径。
+- `mount` 差分测试组新增一节：`/dev` 下面各个挂载的类型，照 OpenRC 的 devfs 重新挂载 `/dev` 之后的超级块选项、设备节点、`openpty` 和 urandom，与原生相同。原生的容器没有挂 `/run`，`/run` 不比。
+- 手动（`target/openrc/devfs.sh`）：OpenRC 的 sysinit、boot 里加上 devfs、mdev、seedrng 等服务之后，`/dev` 的节点都在，tmux 能开会话，`/run` 没有被再挂一层；改之前 `/dev` 里没有 ptmx。
 
 **推迟项**：
 

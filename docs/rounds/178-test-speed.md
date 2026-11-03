@@ -33,14 +33,8 @@
 
 ## 测试
 
-- 差分测试新增的用例：
-  - `nsports`、`nftables`：服务回完就退出，客户端等它退出之后才读回答（DNAT 的、直接发往映射端口的），来源照样是 guest 的端口。用改之前的二进制跑这两处都与原生不同（来源是宿主端口），确定地复现，不靠负载。
-  - `fork`：两段各比内存加交换区的一半多一页的可写私有映射，首尾相接时 fork 是 ENOMEM；单独一段、中间有空隙、后一段 `MAP_NORESERVE`、后一段只读的都成功；一次映射超过总量的是 ENOMEM（原来就是，由宿主拒绝）。用改之前的二进制跑，首尾相接的那项 fork 成功，与原生不同。
-- 单元测试新增 2 个、改 2 个：
-  - `fork_counts_the_commit_of_merged_mappings`：合起来的长度，改成只读、中间夹 `MAP_NORESERVE`、共享的、有空隙的都断开，子进程带着 `MAP_NORESERVE`。
-  - `memory_sized_defaults`：4 GB、8 GB 虚拟机的原生值，16 GB，封顶，不知道内存时用表里的值。
-  - `portmap` 的两个测试：释放之后还换得回来，过了 10 秒换不回，宿主端口分给新的映射时换成新的。
-- cargo test（321 个）、clippy（含 Android）、格式、两层的全部差分测试（50 组）通过。LTP 的 syscall 测试 1011 个通过（上一轮 1012），差别都是[偶发项](../milestones.md#已知的偶发失败)：futex_wait05 这次通过，mmap21_02、select02 这次失败。fork14 仍是 TBROK，只是从 150 秒的超时变成 2 秒左右被 OOM 结束。
+- 差分测试新增的用例：`nsports`、`nftables` 里服务回完就退出，客户端等它退出之后才读回答，来源照样是 guest 的端口：用改之前的二进制跑确定地复现，不靠负载。`fork` 组测几段可写私有映射合起来超过内存加交换区时 fork 的结果，首尾相接、有空隙、`MAP_NORESERVE`、只读的各种情形。
+- 单元测试：`fork_counts_the_commit_of_merged_mappings`、`memory_sized_defaults`，`portmap` 的测试加了释放之后的保留。
 - 耗时（8 个 CPU，差分测试 `-j 4`，LTP `-j 8`）：
 
   | | 原来 | 现在 | 现在最长的 |

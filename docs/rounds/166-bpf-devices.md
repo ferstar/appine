@@ -17,16 +17,10 @@ cgroup v2 没有 v1 的 `devices.allow`：runc、crun 给每个容器的 cgroup 
 
 ## 测试
 
-- 新的差分测试组 `bpf-devices`（原生一侧是特权容器）：加载一个 runc 那样的程序（字符设备 1:3 什么都行，1:5 不能写，别的都不行）；挂之前 /dev/null、zero、full、ptmx、urandom 都能读写，mknod 字符、块设备都行；`ALLOW_MULTI` 挂上之后在那个 cgroup 和它的子 cgroup 里按程序放行、拒绝（EPERM）；重复挂、不带 MULTI 叠上去、OVERRIDE 加 MULTI、REPLACE 不带 MULTI、替换的不对、目标不是 cgroup、fd 不是程序；查询（标志、个数、放不下的、子 cgroup 的、有效的比 t 多一个、错的标志）；按编号取 fd、取信息（类型、编号、名字、GPL、指令原样、tag），cgroup 的 fd 取信息是 EINVAL，fd 的链接；替换、取下（不带 fd、再取一次）；不带 MULTI 挂在父 cgroup 上时子 cgroup 不能挂，带 OVERRIDE 时可以、子 cgroup 只跑自己的；取下之后又都能开。校验器拒绝的十九种程序（与原生的错误码逐个相同）、空程序、坏名字、不认识的类型、长出来的部分不是 0、不认识的命令。tag 与原生相同，说明 SHA-1 和指令的编码都对。
-- `cgroup-freeze` 组新增 runc 的读法（读写方式打开 `cgroup.freeze`，写 1 再 seek 回 0 读、写 0 再 pread 0 读）；`edge-cases` 组新增 `/proc/self/status` 改名之后 seek 回 0、pread 0 读到新名字。
-- 两个执行层下都与原生逐字相同。变异检查：设备检查总是放行，`bpf-devices` 里挂了程序之后的那几段都不同；不重新生成，读回 `cgroup.freeze`、`status` 的那几行不同。
-- cargo test（301 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1010 个通过（上次 1011）：
-  - bpf_map01、bpf_prog01–04 由 CONF 变成 FAIL（TBROK）：原来 bpf 是 ENOSYS，LTP 当作不支持；现在有了 bpf，它们要的 map 和 socket 过滤程序是 EINVAL（见推迟项）。
-  - select02（睡得太久）失败，单独重跑时 nanosleep01、clock_nanosleep02、poll02、epoll_wait02 也都睡得太久。当时宿主的负载在 5 左右（一个系统进程占了一个核），用第 165 轮提交的代码编出来的二进制在同样的条件下这几个也一样失败，是计时的[偶发项](../milestones.md#已知的偶发失败)，不是这一轮改坏的。
-- `bpf.rs` 的单元测试：设备程序按规则放行；校验器的几种拒绝和收窄范围之后接受；栈、helper、调用之后 r1 不能读；SHA-1 的三个标准答案。
-- 在 appine 里实际跑：
-  - `docker run --network host` 起得来（`hello`、Alpine 的版本），dockerd 没有错误。`--memory 64m --pids-limit 20` 的容器里 `memory.max`、`pids.max` 是给的值，fork 到上限时 `can't fork`，`/dev/kmsg` 不在容器的 /dev 里；`--memory 32m` 的容器不停分配内存，被 OOM killer 在容器的 cgroup 里结束（137）；`docker pause`、`unpause` 成功，暂停期间 docker 不让 exec（与原生一样），恢复之后容器里的计数接着走。
-  - podman 不加 `--cgroups disabled`（crun、`cgroup_manager = "cgroupfs"`）：容器里 `memory.max`、`pids.max` 是给的值，fork 到上限时失败，OOM 结束（137），`podman pause`、`unpause` 成功。
+- 新的差分测试组 `bpf-devices`（原生一侧是特权容器）：加载 runc 那样的程序，挂上前后在 cgroup 和子 cgroup 里打开设备、mknod 的结果；挂、替换、取下、查询、取信息的各种标志和错误；校验器拒绝的十九种程序。错误码逐个与原生相同，tag 也相同（SHA-1 和指令的编码都对）。
+- `cgroup-freeze`、`edge-cases` 组新增伪文件写了之后、进程改名之后从 0 再读。两个执行层下都与原生逐字相同。`bpf.rs` 的单元测试测设备程序、校验器和 SHA-1。
+- LTP 的 bpf_map01、bpf_prog01–04 由 CONF 变成 FAIL（TBROK）：原来 bpf 是 ENOSYS，LTP 当作不支持；现在有了 bpf，它们要的 map 和 socket 过滤程序是 EINVAL（见推迟项）。
+- 在 appine 里实际跑：`docker run --network host` 和不加 `--cgroups disabled` 的 podman（`cgroup_manager = "cgroupfs"`）都起得来，容器里的内存、任务数上限起作用，`pause`、`unpause` 成功。
 
 **推迟项**：
 

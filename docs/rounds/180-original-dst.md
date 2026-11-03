@@ -27,16 +27,8 @@
 
 ## 测试
 
-- 新的差分测试组 `origdst`（原生一侧是特权容器，规则真的在内核里执行），两个执行层下都与原生逐字相同：
-  - 每种情形在新的网络命名空间里建规则、连接，看接受的一端、发起的一端、监听的 socket 回答什么：没有规则、空的 nat 链、ip 和 inet 的 `ct state` 规则（IPv4、IPv6）、nft 的 redirect 和 dnat、iptables 的 REDIRECT、ip6、inet 的表、双栈的监听接受 IPv4 的连接、AF_INET6 的客户端连 IPv4 映射的地址、客户端在 accept 之前和之后关掉；UDP、optlen 不够、AF_INET 上的 `SOL_IPV6`。
-  - 跨命名空间：一个 bridge、两个"容器"，B 的 PREROUTING 做 REDIRECT（A 带着标记 7 连过去时，B 的 `meta mark 7 return` 不起作用：标记经由 veth 时清掉了）、A 的 OUTPUT 做 DNAT 到 B、外层连 B、A 连外层的网关地址（外层 PREROUTING 对从 bridge 来的做 REDIRECT）。
-  - `SO_MARK`：默认 0、读写、optlen 2 的读和写、-1、UDP、没有权限的用户 EPERM（读是 0）、accept 出来的沿用监听的。
-  - iptables 的 `-m owner --uid-owner`、`! --uid-owner`、`--gid-owner`、`-m mark --mark`（含掩码）在 nat 的 OUTPUT 上做 REDIRECT 或者 RETURN，在 filter 的 OUTPUT 上做 REJECT；nft 的 `meta skuid`、`meta mark`。每种用 root、nobody，带或不带标记各连一次，看是哪个监听接受的。
-  - 一个 Python 写的透明代理：问 SO_ORIGINAL_DST，带着标记 0x100 连原来的目的地（规则放过有标记的），转一次请求和回答，两个不同的原目的地址。
-- 变异检查（每次在容器里 touch 之后重新编译）：getsockopt 交给宿主、accept 不领、总当作开着连接跟踪、owner 总不匹配、`SO_MARK` 不带进 nftables、设 `SO_MARK` 不查权限，各自让 `origdst` 组失败（2 到 121 行不同）；xt mark 总不匹配时差分测试照样通过（见上），由单元测试抓到。
-- 单元测试新增 6 个：`origdst` 的四元组换算（IPv4 和 IPv4 映射的对得上）、按命名空间领一次、上限、编码；`Nft::tracks`（空的 nat 链、redirect 在 ip/ip6/inet 的表、ct、counter、xt 的 REDIRECT 和 LOG）；xt 的 mark（掩码）和 owner（uid、取反的 gid、PREROUTING 上的 `! --uid-owner`）。
-- 实测 sslocal 的 redir 模式（Tier 1）：起 ssserver、sslocal redir 和一个源站，以 nobody 运行的 curl 访问源站，三种排除代理自己的连接的写法都拿到了页面、ssserver 每次只转一次：`iptables -m owner --uid-owner 65534 -j REDIRECT`，nft 的 `meta skuid 65534 … redirect`，`meta mark 1 return` 加上 sslocal、ssserver 的 `--outbound-fwmark 1`。改之前三种都不行（第一种规则不匹配、直接连到源站，第二种 sslocal 拿不到原目的地址，第三种死循环）。
-- cargo test（332 个）、clippy（含 Android）、格式、两个执行层的全部差分测试（51 组）通过。Tier 1 下 `compat` 组有一次原生一侧的 sockstat 少数了一个（用例的注释里记着这个竞争：前面用例的 socket 晚一点释放），单独重跑通过。LTP 的 syscall 测试 1014 个通过（上一轮 1013）：select02 这次通过（[偶发项](../milestones.md#已知的偶发失败)），其余相同。
+- 新的差分测试组 `origdst`（原生一侧是特权容器，规则真的在内核里执行）：各种规则和表下接受的一端、发起的一端回答的原目的地址（含双栈、跨命名空间），`SO_MARK`，owner、mark 匹配，一个 Python 写的透明代理。两个执行层下都与原生逐字相同。单元测试在 `origdst`、`Nft::tracks` 和 xt 的 mark、owner 里。
+- 实测 sslocal 的 redir 模式（Tier 1）：以 nobody 运行的 curl 经由它访问源站，三种排除代理自己的连接的写法（`-m owner --uid-owner`、nft 的 `meta skuid`、`meta mark` 加上 `--outbound-fwmark`）都拿到了页面、ssserver 每次只转一次；改之前三种都不行。
 
 **推迟项**：
 

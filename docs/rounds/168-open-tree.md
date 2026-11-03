@@ -22,20 +22,10 @@ open_tree 一旦能用，crun 所有的 bind 挂载（`get_bind_mount`：屏蔽�
 
 ## 测试
 
-- 新的差分测试组 `newmount`（原生一侧是特权容器）：
-  - 不带 CLONE 的 O_PATH fd（标志、链接），它不是挂载的根，move_mount 是 EINVAL；`AT_RECURSIVE` 不带 CLONE、不认识的标志、不存在的路径、空路径不带 `AT_EMPTY_PATH`。
-  - CLONE 出来的树：不出现在 mountinfo 里；经由 fd 读到源里的文件；不递归时下面的挂载不在；inode 与源相同。
-  - mount_setattr：只读、nosuid；未知位、坏的传播类型、改访问时间不清、idmap 给坏的 fd、太短、坏的标志、什么也不改、不是挂载的根。
-  - move_mount：坏的标志、SET_GROUP、目录挪到文件上；接上之后 mountinfo 里的标志（ro,nosuid）、读得到、写是 EROFS；接上了的再挪一次是挪过去。
-  - 递归的复制品带着下面的挂载，递归地设 noexec、strictatime，用 `T_EMPTY_PATH` 接到目录 fd 上；关掉没接上的复制品之后挂载没有变化；复制品不能再复制，但能不带 CLONE 地 open_tree；nobody 的 CLONE、move_mount、mount_setattr 是 EPERM，不带 CLONE 的可以；按路径 move_mount 挂着的挂载；不是挂载的根的源是 EINVAL；最后都卸下。
-- `mount` 组新增：自己命名空间里的挂载点 rmdir 是 EBUSY；另一个挂载命名空间里挂着 tmpfs 的目录可以 rmdir，那边的挂载随之没了。
-- `userns-ids` 组新增：开机时的命名空间里的普通用户不设 no_new_privs 装不了 seccomp 过滤器（EACCES），root 建了用户命名空间之后能装。原生的 Ubuntu 宿主开着 `apparmor_restrict_unprivileged_userns`，普通用户建的用户命名空间里能力被拒绝，所以用 root 建。写这一项时第一版用了内核头文件，Alpine 里没有，两边都编不过、等于没测，改成自己定义结构体。
-- 两个执行层下都与原生逐字相同。变异检查：mount_setattr 不改标志、open_tree 忽略 `AT_RECURSIVE`，`newmount` 在标志、递归的那几处与原生不同。
-- cargo test（302 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1012 个通过（上次 1011，futex_wait05 这次通过）。mount_setattr02 由 CONF 变成 FAIL：原来 ENOSYS 时跳过，现在走到了检查共享、从属的传播类型，appine 没有传播（见推迟项）；这一组别的用例（open_tree01、move_mount01 等）要 loop 设备，照旧 TBROK。
-- 在 appine 里实际跑：
-  - `podman run --uidmap 0:100000:65536` 起得来，容器里的 `uid_map` 是 `0 100000 65536`，能写，`--rm` 清理时不再报错。
-  - podman 的普查脚本与原生对照：除了原生嵌套时 `--memory` 找不到 `memory.max` 而 appine 可以之外，各步的结果都相同（普通容器、只读的卷、build 等都改走了新接口）。
-  - docker 的普查照常。
+- 新的差分测试组 `newmount`（原生一侧是特权容器）：open_tree 带不带 CLONE、递归与否，mount_setattr、move_mount 的标志和错误，没接上的复制品，nobody 的权限。
+- `mount` 组新增删除别的命名空间里的挂载点；`userns-ids` 组新增用户命名空间里装 seccomp 过滤器，原生的 Ubuntu 宿主开着 `apparmor_restrict_unprivileged_userns`，所以用 root 建用户命名空间。这一项第一版用了 Alpine 里没有的内核头文件，两边都编不过、等于没测。
+- 两个执行层下都与原生逐字相同。LTP 的 mount_setattr02 由 CONF 变成 FAIL：原来 ENOSYS 时跳过，现在走到了检查共享、从属的传播类型，appine 没有传播（见推迟项）。
+- 在 appine 里实际跑：`podman run --uidmap 0:100000:65536` 起得来、`--rm` 清理不报错；podman 的普查与原生对照各步相同（只有原生嵌套时 `--memory` 不行），docker 的照常。
 
 **推迟项**：
 

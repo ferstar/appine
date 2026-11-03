@@ -40,35 +40,9 @@
 
 ## 测试
 
-- 新的差分测试组 `filter`。原生一侧是特权容器，数据包真的经过过滤链。
-  - 拓扑：开机时的命名空间里两个 bridge，A、B 各挂一个，经由外层命名空间路由。
-  - 外层 FORWARD 上的 nftables 规则：
-    - 先放行已建立的；
-    - 从 br0 到 br1 的 7001 丢弃，7002 `reject with tcp reset`，7008 默认的 reject，UDP 7003 丢弃。
-  - 外层 FORWARD 上的 iptables-nft 规则：`-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT`，再丢弃从 br1 到 br0 的。
-  - 外层 INPUT 上：从 br0 来的 7004 丢弃。
-  - B 自己的 INPUT 上：7005 reject。
-  - A 的 OUTPUT 上（iptables-nft）：TCP 7006 DROP、7007 REJECT，UDP 7011 DROP。
-  - 比的结果：
-    - 丢弃的超时，拒绝的 ECONNREFUSED，OUTPUT 上丢弃的 TCP 超时、UDP 是 EPERM。
-    - A 到 B 的 UDP 的回答经由 ESTABLISHED 回来；B 主动连 A（TCP、UDP）被丢弃。
-    - 外层自己连 B 只过 OUTPUT，不过 FORWARD。
-    - 超时的要真的等到客户端设的超时（不是马上失败）；非阻塞的 connect 是 EINPROGRESS，一秒之内不可写。
-  - 两个执行层下都与原生逐字相同。`netmap`、`nsports`、`portfwd`、`nftables`、`netdev`、`lowports` 照旧通过。
-  - 写测试时遇到的原生行为：`fwd`、`in` 是 nft 的关键字，不能当链名；OUTPUT 上的 DROP 对 TCP 不是 EPERM，是重传到超时。
-- 变异检查：
-  - `filter` 组在下面每处都与原生不同：
-    - 不过 FORWARD；不过目的地的 INPUT；FORWARD 上没有出口接口（写这一轮时真犯过的）：该丢弃、拒绝的都连上了。
-    - 不记下收到过的对方：UDP 的回答被丢弃。
-    - 丢弃的 TCP 马上失败：原来的测试分不出来（Python 把 ETIMEDOUT 也当作超时），客户端加上等了多久、再加一条非阻塞 connect 之后才抓到。
-  - 单元测试抓到：xt 的 conntrack 匹配总是成立。
-- 单元测试新增 1 个（`nft`）：FORWARD 上按入口接口、端口丢弃和 reject，xt 的 conntrack 匹配认 ESTABLISHED，INPUT 的策略是丢弃，reject 的错误码。
-- 普查：docker 的普查加了一步"网络之间的隔离"，原生重新跑过：从另一个自定义网络连 mynet 上的容器，从 `--internal` 网络连它。
-  - 开着 iptables 时，从另一个网络连是 "download timed out"，与原生相同（docker 在 FORWARD 上丢弃网络之间的流量）。原来 appine 里连得上。
-  - 关着 iptables 时两边都连得上。
-  - `--internal` 网络两边都没有默认路由，是 "Network unreachable"。
-  - 别的各项与上一轮相同，没有内部错误。
-- cargo test（316 个）、clippy（含 Android）、格式、两层的全部差分测试（49 组）通过。LTP 的 syscall 测试 1012 个通过，每一项都与上一轮相同。clippy 起初嫌 `path_filter` 里依次进入的命名空间那个元组类型太复杂，改成了一个小结构体。
+- 新的差分测试组 `filter`（原生一侧是特权容器，数据包真的经过过滤链）：两个 bridge 上的 A、B 经由外层命名空间路由，在外层的 FORWARD、INPUT 和 A、B 自己的链上用 nftables、iptables-nft 写丢弃、拒绝和放行已建立的规则，比连接的结果和错误码、UDP 的回答。两个执行层下都与原生逐字相同。原生上 OUTPUT 上的 DROP 对 TCP 不是 EPERM，是重传到超时；`fwd`、`in` 是 nft 的关键字，不能当链名。单元测试（`nft`）测过滤链上的丢弃和 reject、conntrack 匹配。
+- 第一版用例分不出丢弃的 TCP 是马上失败还是等到超时（Python 把 ETIMEDOUT 也当作超时，变异检验发现的），客户端加上等了多久，再加一条非阻塞 connect 一秒之内不可写。
+- 普查：docker 的普查加了"网络之间的隔离"一步，开着 iptables 时从另一个网络连不上，与原生相同（原来 appine 里连得上）；关着时和 `--internal` 网络也与原生相同。
 
 **推迟项**：
 

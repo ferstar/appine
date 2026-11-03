@@ -14,10 +14,8 @@
 
 ## 测试
 
-- 新的差分测试组 `cgroup-freeze`（原生一侧是特权容器）：`cgroup.freeze` 写 2（ERANGE）、`abc`（EINVAL）；空的 cgroup 和它的子 cgroup 马上冻结，子 cgroup 的 `cgroup.freeze` 是 0，父 cgroup 不受影响；阻塞在 read、nanosleep、epoll_wait（在子 cgroup 里）、死循环、pause 的五个进程被冻结，状态都是 S，死循环的不再占 CPU，这期间写进管道、发的信号都没有处理，`waitpid(WUNTRACED)` 看不到；冻结期间迁移进来的、clone3 放进来的不运行；迁移出去的接着运行并处理信号；子 cgroup 自己也要求冻结时，解冻父 cgroup 之后它仍冻结；解冻之后 read 拿到数据，nanosleep 返回 0（到期时刻已过），pause 的处理信号，epoll_wait 是 EINTR；SIGKILL、`cgroup.kill` 结束冻结的进程。读子进程的结果最多等 3 秒，整个程序有 60 秒的 alarm：内核不对时用例失败而不是卡住（第一次做变异检查时卡住了）。
-- `edge-cases` 组新增：停止又继续之后 poll（600 毫秒）按原来的到期时刻返回，epoll_wait 提前返回 EINTR，futex 等待（600 毫秒）按原来的到期时刻超时；有超时的 futex 等待被带 SA_RESTART 的处理函数打断是 EINTR。改之前 appine 在 epoll_wait、poll、futex 三处都与原生不同（epoll_wait 超时返回 0，poll、futex 从头再等）。
-- 两个执行层下都与原生逐字相同。变异检查：投递信号前不为冻结停下，`cgroup-freeze` 从冻结起大段不同（线程状态是 R、管道里的数据被读走、迁移进来的子进程跑完了）。
-- cargo test（297 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过，与上一轮逐项相同（epoll_wait、poll、futex 的用例照旧通过）。
+- 新的差分测试组 `cgroup-freeze`（原生一侧是特权容器）：阻塞在各种系统调用里的和死循环的进程冻结、解冻前后的状态、信号和结果，冻结期间迁移进出、clone3 放进来的进程，子 cgroup 的冻结，结束冻结的进程。两个执行层下都与原生逐字相同。读子进程的结果最多等 3 秒、整个程序有 60 秒的 alarm，内核不对时用例失败而不是卡住（第一次做变异检查时卡住了）。
+- `edge-cases` 组新增停止又继续之后的 poll、epoll_wait 和有超时的 futex 等待，改之前 appine 在这三处都与原生不同。
 - 在 appine 里实际跑 `docker pause`、`podman pause` 要等容器起得来（下一步：eBPF 的设备过滤）。→ 起得来之后 `docker pause` 先撞上伪文件读不到写过的值，改了之后正常（M9 之前：cgroup 的设备过滤（eBPF））
 
 **推迟项**：

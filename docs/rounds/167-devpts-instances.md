@@ -14,18 +14,10 @@
 
 ## 测试
 
-- 新的差分测试组 `devpts`（原生一侧是特权容器，容器的 `/dev/pts` 是它自己的实例，与 appine 开机时的一样都从没有终端开始）：
-  - 新挂的实例、bind 挂载、默认选项的实例：设备号各不相同（bind 的相同）；根、ptmx 的 inode 号；各个实例里的编号都从 0 开始；ptmx 的权限按 `ptmxmode`。
-  - ptmx 设备节点所在目录里的 `pts` 是 devpts、没有 `pts`、`pts` 只是目录三种情况，以及用它开着主设备时卸下 `pts` 可以。
-  - 从设备的链接、设备号、inode、权限、属组；fstat 的设备号与路径的相同，与 `/dev/pts` 的不同；TIOCGPTPEER 打开的从设备的链接和 close-on-exec，在从设备上、锁着时是 EIO；经由 bind 打开的从设备；主设备的链接；ttyname。
-  - 经由实例里的终端读写；`ls` 各个实例；终端节点的属主、权限；开着终端时卸下是 EBUSY；关掉之后节点消失。
-  - 选项：写错的 `mode`、不认识的、写错的 `gid`、`max` 超出是 EINVAL；`ptmxmode=0777`、`uid=7,gid=8,mode=0640`（新终端的属主、权限）、`newinstance`、`max=1`（第二个是 ENOSPC）各自的 mountinfo。
-  - 原生上 `/dev/ptmx` 是 docker 放的指向 `pts/ptmx` 的符号链接，appine 的是设备节点，用它开的主设备的链接不比。
-- `mount` 组的设备号比较里加上新挂的 devpts（原来因为共用开机时的实例而不比），两边都是自己的设备号。
-- 两个执行层下都与原生逐字相同。变异检查：新挂的 devpts 不建新实例，编号、ptmx 的权限、fstat 的设备号、链接都与原生不同。第一次做变异检查时用例卡住了：从 p1 的主设备读回写进去的数据，变异之后数据写到了别的终端，读就一直等。改成最多等 2 秒，整个程序再加 60 秒的 alarm。
-- cargo test（302 个）、clippy（含 Android）、格式通过；两层的差分测试只有 Tier 1 的 `cgroup-freeze` 一次不同，是原生一侧：[cgroup.freeze](165-cgroup-freeze.md) 的用例要求睡 1 秒的进程总共睡够 1.5 秒（解冻就在 1.5 秒前后），原生这次差一点没到。不冻结时 1 秒就返回，阈值改成 1.25 秒，两层各跑两次都相同。LTP 的 syscall 测试 1011 个通过（上次 1010）：上次计时偶发失败的 select02 这次通过，其余逐项相同。
-- `tty.rs` 的单元测试：选项的默认值、各种写法、错误（含映射不到的 uid），显示的格式。
-- 在 appine 里实际跑：`docker run -t`、`podman run -t` 的容器里 `tty` 是 `/dev/pts/0`，`ls /dev/pts` 只有 `0` 和 `ptmx`，宿主的 `/dev/pts` 里看不到容器的终端。
+- 新的差分测试组 `devpts`（原生一侧是特权容器，容器的 `/dev/pts` 是它自己的实例，与 appine 开机时的一样都从没有终端开始）：各个实例和 bind 挂载的设备号、编号，ptmx 设备节点用哪个实例，主从设备的链接和 ttyname，TIOCGPTPEER，卸下，选项和 mountinfo。两个执行层下都与原生逐字相同。原生上 `/dev/ptmx` 是 docker 放的符号链接，用它开的主设备的链接不比。`tty.rs` 的单元测试测选项的解析和显示。
+- 第一次做变异检查时用例卡住了，改成最多等 2 秒，整个程序再加 60 秒的 alarm。
+- [cgroup.freeze](165-cgroup-freeze.md) 的用例要求睡 1 秒的进程总共睡够 1.5 秒，解冻就在 1.5 秒前后，原生一侧有一次差一点没到；不冻结时 1 秒就返回，阈值改成 1.25 秒。
+- 在 appine 里实际跑：`docker run -t`、`podman run -t` 的容器里 `tty` 是 `/dev/pts/0`，容器和宿主互相看不到对方的终端。
 
 **推迟项**：
 

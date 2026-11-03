@@ -44,42 +44,14 @@
 
 ## 测试
 
-- 新的差分测试组 `nftables`。原生一侧是特权容器，规则真的在内核里执行。
-  - 第一个新网络命名空间：
-    - 用 iptables-nft 照 dockerd 的顺序建内置 DNS 的规则：-N，-C（没有这条规则时报 "Bad rule"，退出码 1），-I，DNAT，SNAT。
-    - 出错的情形：建已有的链，往没有的链里加规则，删被引用的链（"CHAIN_DEL failed (Resource busy)"）。
-    - 列出：-S 和 `nft list ruleset`。
-    - 流量：服务端监听 127.0.0.11 的 40001（UDP）和 40002（TCP），客户端发往 127.0.0.11:53，有未连接的 UDP、连接的 UDP 和 TCP。比客户端看到的对端和回答的来源，服务端看到的来源和本端。删掉 DNAT 规则之后，连 53 是 ECONNREFUSED。
-  - 第二个新网络命名空间（dummy0，10.70.0.1/24）：
-    - 用 `nft -f` 装 netavark 那样的规则：inet 表、具名集合、匿名集合、`fib daddr type local`、`dnat ip to`、redirect、accept。
-    - 列出：`nft -a list ruleset`，比链、规则、集合的句柄。
-    - 流量：TCP、UDP 的端口转发，redirect，被 accept 的规则，非本机地址。
-    - 出错的情形：跳到没有的链，环（"Too many links"），跳到基础链，删被引用的链，改已有基础链的钩子，删用着的集合，add 和 create 已有的表。nft 标出的位置与原生相同。
-    - 删规则、清空链之后再看流量；删表之后重新装，链、规则的句柄又从 1 起。
-    - 没有 `CAP_NET_ADMIN` 时，nft、iptables 都报 "Operation not permitted"。
-  - 写测试时发现的原生行为：表的句柄不总是从 1 起（一次是 3，重跑又是 1），同一个命名空间里是计数器，删掉的不再用。这一项不比。
-  - 两个执行层下都与原生逐字相同。`netmap`、`netdev` 两组照旧通过。
-- 单元测试新增 3 个（`nft`）：
-  - iptables-nft 那样的批：句柄、USE、转储、执行、失败的批作废、EBUSY、EMLINK、ERESTART、EPERM、extack 的偏移。
-  - netavark 那样的批：匿名集合的名字、lookup 按名字引用、集合元素的转储、fib 加集合加 dnat 的执行、删表。
-  - 区间集合的查找。
-- 变异检查：`nftables` 组在下面每处都与原生不同——
-  - 收到的来源不换回：回答来自 40001。
-  - 规则不用表里的计数器：句柄不对。
-  - 不跟着 jump 走：DNS 那几项没有回答。
-  - 不带 extack 的偏移：nft 标出的位置不对。
-  - fib 不认本机地址：端口转发连不上。
-  - 不送到 127.a.b.254：发给自己虚拟地址的 UDP 没有回答。
+- 新的差分测试组 `nftables`（原生一侧是特权容器，规则真的在内核里执行）：用 iptables-nft 照 dockerd 的顺序建内置 DNS 的规则、用 `nft -f` 装 netavark 那样的规则，比列出的规则和句柄、出错的情形和 nft 标出的位置、经由 DNAT 的流量两边看到的地址、删规则和删表之后。两个执行层下都与原生逐字相同。原生上表的句柄不总是从 1 起，这一项不比。单元测试（`nft`）测这两种批和区间集合的查找。
 - 普查（与原生对照）：
-  - docker：`"iptables": false` 和默认两种配置下，自定义网络都能按名字解析了：nslookup 回答容器的地址，wget 按名字拿到页面。容器命名空间里的 nat 规则（`nft list ruleset` 的列表）与原生相同。`"iptables": true` 时 dockerd 起得来，外层命名空间里 nat、filter 两张表（ip、ip6 各一套）里的链与原生相同。
-  - podman（`firewall_driver = "nftables"`）：原来 netavark 调 nft 取规则集就失败，容器起不来。现在默认网络、容器之间、外层到容器、按名字解析都与原生一致。`-p 8080:80` 经由 127.0.0.1 和经由外层地址都拿到页面，走的是 OUTPUT 上的 DNAT（`fib daddr type local`，再 dnat 到容器）。inet netavark 表里的链与原生相同。
+  - docker 两种配置下自定义网络都能按名字解析了，`"iptables": true` 时 dockerd 起得来，两层命名空间里的规则与原生相同。
+  - podman 的 nftables 驱动原来容器起不来，现在各项与原生一致，`-p 8080:80` 经由 127.0.0.1 和外层地址都拿到页面（走 OUTPUT 上的 DNAT）。
   - 与原生不同的地方：
     - 容器里 ping 外层的网关通了（上一轮的推迟项）。
     - podman 占着 8080 的那个监听 socket 没有（第 4 步）。 → 有，原来是 MPTCP 的没列出来（M9 之前：发布的端口）
-    - strace 解不出 netlink 消息的类型（strace 靠 `SOCK_DIAG` 认协议）；写 sysctl 的次数与原生不同（原生容器里 rp_filter 本来就是要写的值）。这两条上一轮就是这样。
-  - 两个普查都没有内核层报告的内部错误。
-  - podman 的 `-p` 那一节有一次"经由外层地址"是 Connection refused，重跑又拿到了页面。服务端是 `nc -l` 的循环，处理完一个请求要重起 nc；appine 里起进程慢，紧接着的第二个连接可能赶在 nc 起来之前。
-- cargo test（311 个）、clippy（含 Android）、格式、两层的全部差分测试（46 组）通过。LTP 的 syscall 测试 1012 个通过（上次 1011）：只有 pselect01_64 不同，又通过了（上一轮它因为 colima 虚拟机的计时器精度失败）。
+  - podman 的 `-p` 那一节有一次"经由外层地址"是 Connection refused：服务端是 `nc -l` 的循环，appine 里起进程慢，紧接着的第二个连接可能赶在 nc 重新起来之前。
 - 差分测试的仓库加装了 `iptables`、`nftables`（`scripts/difftest` 的软件包列表），镜像要用 `-r` 重新导出。
 
 **推迟项**：

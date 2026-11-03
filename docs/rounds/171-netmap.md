@@ -21,23 +21,10 @@
 
 ## 测试
 
-- 新的差分测试组 `netmap`（原生一侧是特权容器，数据包真的经过 bridge）：开机时的命名空间里一个 bridge（10.50.0.1/24，像 docker 一样指定 MAC），两个新的网络命名空间 A、B 像容器一样各有一个挂在它上面的 veth（10.50.0.2、10.50.0.3，默认路由经由网关）。
-  - TCP：B 连 A 监听通配地址的服务、外层连 A、A 连自己 eth0 的地址、绑在 eth0 地址上的、监听 `::` 的（IPv4 映射的地址）、A 连网关上绑网关地址的和绑通配地址的服务；两边看到的本端、对端地址。
-  - UDP：B 发给 A 绑 eth0 地址的、B 发给网关上的；先绑通配地址的客户端（发送、connect 之后发送），回答的来源和客户端的本端地址。
-  - 低端口：B 连 A 监听的 80，外层发给 A 的 UDP 53。
-  - ping：root 的（raw socket 的模拟）A 到 B、A 到网关、外层到 B；普通用户的（ping socket，先绑通配地址）A 到网关、A 到 B。
-  - `/proc/net/tcp`：A、B 里还开着的连接和监听。
-  - 到不了：直连网段里没有的地址（EHOSTUNREACH）、没有监听的端口（ECONNREFUSED）、去掉默认路由之后的外面（TCP、UDP 都是 ENETUNREACH），绑别人的地址、网关的地址（EADDRNOTAVAIL）、自己的地址。
-  - A 的命名空间没了之后它的 veth 没了，B 照样连得到网关。
-  - 写的时候碰到的原生上的情形：bridge 不指定 MAC 时取端口里最小的，删掉那个端口 MAC 就变了，B 的 ARP 缓存对不上、连网关要超时；A 没了之后 B 连 A 的地址因为 ARP 缓存也是超时（appine 马上 EHOSTUNREACH，这一项不比）；`/proc/net/tcp` 的行序 Linux 先列监听的；busybox 的 ping 用 ping socket 时显示 ttl=42（两边一样）。
-  - 两个执行层下都与原生逐字相同。
-- 单元测试新增 1 个（`netns`）：开机时的命名空间和两个新命名空间各有一个带地址的设备，各个方向的 to_host、from_host，去掉默认路由之后外面到不了。原有的 lo 的用例改成新的接口。
-- 变异检查：别的命名空间的回环段不换回虚拟地址、目的地一律换成自己的段、低端口按自己命名空间的登记换、不加 `IP_PKTINFO`，`netmap` 组分别在看到的对端、能不能连上、连 80、绑通配地址的 UDP 客户端那几处与原生不同。
+- 新的差分测试组 `netmap`（原生一侧是特权容器，数据包真的经过 bridge）：开机时的命名空间里一个 bridge，两个新的网络命名空间 A、B 像容器一样挂在上面，测 TCP、UDP、低端口、ping 在容器、外层、网关之间连不连得上和两边看到的地址，各种到不了、绑不了的情形。两个执行层下都与原生逐字相同。原生上 bridge 不指定 MAC 时，删掉一个端口 MAC 就可能变，ARP 缓存对不上、连网关要超时，所以像 docker 一样指定 MAC；A 没了之后 B 连 A 的地址原生要等 ARP 超时（appine 马上 EHOSTUNREACH），这一项不比。单元测试 `netns` 测各个方向的地址换算。
 - 普查（与原生对照）：
-  - docker（`"iptables": false`）：容器之间按 IP、外层到容器的 IP、`-p 8080:80`（docker-proxy 起来了，经由 127.0.0.1 拿到回答，经由外层地址的 "Connection reset by peer" 也与原生相同）都与原生一致。不同的只剩两处：容器里 ping 外层的网关通了（原生没有 NAT 时不通，见推迟项）；自定义网络按名字解析（内置 DNS 的 nat 规则，第 3 步）。 → 按名字解析通了（M9 之前：nftables 的子集和 socket 层的 DNAT）
-  - podman（`firewall_driver = "none"`）：容器之间、外层到容器、自定义网络按名字解析（aardvark-dns 绑在网关地址上，nslookup、wget 按容器名都对）都与原生一致。不同的是 ping 外层的网关（同上）和 `-p` 时 podman 占着端口的那个监听 socket（第 4 步）。nftables 驱动仍是第 3 步。 → nftables 驱动能用了，`-p` 经由 127.0.0.1 和外层地址也通了（M9 之前：nftables 的子集和 socket 层的 DNAT）
-  - 两个普查都没有内核层报告的内部错误。
-- cargo test（308 个）、clippy（含 Android）、格式、两层的全部差分测试（45 组）通过。LTP 的 syscall 测试 1011 个通过（上次 1012）：pselect01_64 因为睡得太久失败（多睡了 0.5–2 ms）；用上一轮的提交编的二进制这时也连续失败；随后 pselect01、nanosleep01、select02、poll02 也都超了阈值，原生容器里同样的 `select` 也多睡这么多（睡 25 ms 多 4.4 ms，appine 里多 4.2 ms），是 colima 虚拟机这段时间的计时器精度，不是回归。
+  - docker（`"iptables": false`）：容器之间、外层到容器、`-p 8080:80` 都与原生一致，不同的只剩容器里 ping 外层的网关通了（见推迟项）和自定义网络按名字解析（第 3 步）。 → 按名字解析通了（M9 之前：nftables 的子集和 socket 层的 DNAT）
+  - podman（`firewall_driver = "none"`）：容器之间、外层到容器、按名字解析都与原生一致，不同的是 ping 外层的网关和 `-p` 时占着端口的监听（第 4 步），nftables 驱动仍是第 3 步。 → nftables 驱动能用了，`-p` 经由 127.0.0.1 和外层地址也通了（M9 之前：nftables 的子集和 socket 层的 DNAT）
 
 **推迟项**：
 

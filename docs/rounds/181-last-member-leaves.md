@@ -33,11 +33,8 @@ Illegal instruction
 
 ## 测试
 
-- `shared-code` 差分测试组新增 `alone`：父进程独自开组，fork 出来的子进程在一格地址上映射 f1（`movz w0, #1; ret`）、执行之后退出，父进程再在同一格映射 f2 执行。三棵独立的进程树各跑一次：主进程在的时候组里不止它一个，走不到这个情形。改之前父进程三次都得到 1（执行到子进程翻译的 f1），原生是 2；改之后两个执行层下都与原生相同。
-- 变异检查：留下的范围不过滤、直接用它全部的可信映射时，`alone` 失败（f2 的映射里还有 f1 的块）；不作废就是改之前。
-- 单元测试 `code_groups_register_only_consistent_mappings` 加上 `consistent`：同一个文件、没登记过的留下，登记过的地址上是别的文件的不留。
-- 原来的探测脚本（`target/origdst/xall.sh`）用新的二进制跑 8 次，都没有崩，4 组都通过。
-- cargo test（332 个）、clippy（含 Android）、格式、两个执行层的全部差分测试（51 组）通过。LTP 的 syscall 测试 1014 个通过，与上一轮逐项相同。
+- `shared-code` 差分测试组新增 `alone`：父进程独自开组，子进程在一格地址上映射、执行一个文件之后退出，父进程再在同一格映射另一个文件执行。要在三棵独立的进程树里各跑一次：主进程在的时候组里不止它一个，走不到这个情形。两个执行层下都与原生相同；单元测试 `code_groups_register_only_consistent_mappings` 加上 `consistent`。
+- 原来的探测脚本（`target/origdst/xall.sh`）跑 8 次都没有崩。
 
 **推迟项**：
 

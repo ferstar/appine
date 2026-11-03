@@ -31,25 +31,10 @@
 
 ## 测试
 
-- 新的差分测试组 `netdev`（原生一侧是特权容器，要写 `/proc/sys`）：
-  - 新的命名空间里：建 bridge、veth（指定、不指定名字）、dummy，`ip link`、种类、`/proc/net/dev`；挂到 bridge 上、端口状态、`ip link show master`；按顺序启用 bridge、一端、另一端、dummy，停用一端，看各自的标志和状态。
-  - 地址：同一网段的 secondary、重复的（busybox 的 ip 看错误码）、`brd +`、两个 IPv6 地址；`ip route show table all`（链路本地地址的本地路由按随机的地址排，挪到最后排好再比）。
-  - 路由：经由网关、指定度量、网关不在网段里、接口停用着、重复、主机位不是 0、`append`、首选源地址、IPv6 的；`ip route get` 经由网关的、直连的、按首选源地址的、本机 secondary 地址的、IPv6 的；删除、删不存在的；停用接口之后路由的变化、再启用。
-  - 改名（停用之后）、MTU 的上下限、MAC 不合法、bridge 的 MTU 跟着端口和用户设的；各种错误（重名、不认识的种类、lo 挂到 bridge、bridge 挂到 bridge、删 lo、删不存在的、移走 bridge、lo 移到它所在的命名空间、删不存在的地址、名字太长）。
-  - sysctl：两族的目录、几项默认值、写入和错误、`ip_forward`、`disable_ipv6` 去掉和恢复链路本地地址、关了 IPv6 时加地址、IPv6 的 `mtu` 和 `addr_gen_mode` 的范围、`stable_secret`、`ping_group_range`、`ip_local_port_range` 与 `ip_unprivileged_port_start` 的互相约束，以及普通用户 bind 80、1500 随后者变化。
-  - 停用接口时 IPv6 的地址和路由去掉、再启用又配置。
-  - 另一个命名空间：veth 的对端直接建在那边（`@if<n>`、`link-netnsid 0`）、两边各自启用、在那边配地址和默认路由；把 veth 移过去；名字冲突时 EEXIST、用新名字移过去；那个命名空间的进程退出之后，对端在那边的 veth 都没了。
-  - 删除 veth（连同对端）、对应的 sysctl 目录没了、bridge 上按地址加的路由带 linkdown、bridge 没有端口之后 MAC 是全 0。
-  - 开机时的命名空间（docker 容器的）：建 bridge、配地址、启用，`ip link`、地址、路由（宿主的和它的）、`ip route get`、sysfs 的 `operstate` 和 `type`、`if_nameindex`、`/proc/net/dev`、sysctl 目录；挂上 veth 之后 `bridge/stp_state`、`brport/state`、`brif/<端口>` 的链接和经由它读的状态、`iflink`、`operstate`；删掉之后都没了。
-  - 写的时候碰到的原生上的时序：IPv6 地址在 DAD 完成前是 tentative，即使 `accept_dad` 是 0 也要等一个随机的延迟（最多 1 秒）；bridge 经由 linkwatch（最多晚 1 秒）才知道端口的载波变了。这两处等一下再看。
-  - 两个执行层下都与原生逐字相同。
-- 单元测试 4 个（`netdev`）：对端在别的命名空间的 veth、命名空间释放之后清掉；bridge 的载波、MTU、MAC 跟着端口；地址和按地址加的路由、路由的错误、停用和启用；sysctl 的 `default`、`all` 和 `disable_ipv6`。`netconf` 1 个。
-- 变异检查：veth 的载波不看对端、接口停用时不去掉经由它的路由、secondary 的本地路由的首选源地址用它自己，`netdev` 组在状态、路由表、`ip route get` 那几处与原生不同。
+- 新的差分测试组 `netdev`（原生一侧是特权容器，要写 `/proc/sys`）：新的和开机时的命名空间里建 bridge、veth、dummy 之后的状态、地址、路由、`ip route get` 和 sysctl，接口停用、启用之后的变化，改名、MTU、MAC 和各种错误，veth 移到别的命名空间和删除。两个执行层下都与原生逐字相同。链路本地地址的本地路由按随机的地址排，挪到最后排好再比。原生上 IPv6 地址在 DAD 完成前是 tentative（即使 `accept_dad` 是 0 也要等最多 1 秒），bridge 经由 linkwatch 最多晚 1 秒才知道端口的载波变了，这两处等一下再看。单元测试（`netdev`、`netconf`）测 veth 两端、bridge、地址和路由、sysctl。
 - 普查（[第 169 轮](169-container-network-survey.md)的两个负载，与原生对照）：
-  - docker（`"iptables": false`）：docker0 的地址、状态（没有容器时 NO-CARRIER）、路由，默认网络的容器里 eth0 的地址、默认路由、resolv.conf，ping 外层的网关（原生关着 iptables 时也不通）都与原生逐行相同。容器之间按 IP 互访是 "Network unreachable"、外层访问容器的 IP 超时（下一步）；`-p 8080:80` 的容器起不来：dockerd 给监听 socket 装丢包的 BPF 过滤器（`SO_ATTACH_FILTER`），结构里的指针没有换成宿主的，EFAULT（下一步的 socket 层一起做）；自定义网络按名字解析不了：内置 DNS 要在容器里写 nat 规则，iptables-nft 用的 `NETLINK_NETFILTER` 没有（第 3 步）。iptables 开着时 dockerd 初始化 nftables 失败、起不来（同上）。 → 都通了（M9 之前：nftables 的子集和 socket 层的 DNAT）dockerd 的警告里还有发免费 ARP 要 AF_PACKET、conntrack 和 IPsec 的模块（`NETLINK_NETFILTER`、`NETLINK_XFRM`）。
-  - podman（`firewall_driver = "none"`）：默认网络的容器里 eth0 的地址、带度量 100 的默认路由、resolv.conf、ping 外层网关的结果与原生逐行相同；起初 crun 打不开 `/proc/sys/net/ipv4/ping_group_range`（podman 默认给有自己网络命名空间的容器设它），补上之后才起得来。容器之间、外层到容器同 docker；自定义网络的容器起不来：aardvark-dns 要在开机时的命名空间里绑网关地址 10.89.0.1:53，宿主上没有这个地址（EADDRNOTAVAIL，下一步的地址映射）；`-p` 时原生由 podman 占着端口（防火墙关着，连上去没有回应），appine 里没有那个监听 socket（第 4 步再看）。nftables 驱动时 netavark 调 nft 失败（第 3 步）。
-  - 两个普查都没有内核层报告的内部错误。
-- cargo test（307 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1012 个通过（与上次相同）：clone09 这次通过，futex_wait05 这次因为睡得太久失败（计时的用例，宿主有负载时时过时不过）。
+  - docker（`"iptables": false`）：docker0 和容器里的地址、路由、resolv.conf 都与原生逐行相同。容器之间、外层到容器不通（下一步）；`-p` 的容器起不来：dockerd 给监听 socket 装 BPF 过滤器（`SO_ATTACH_FILTER`），结构里的指针没有换，EFAULT；自定义网络按名字解析、iptables 开着时都要 `NETLINK_NETFILTER`（第 3 步）。 → 都通了（M9 之前：nftables 的子集和 socket 层的 DNAT）dockerd 的警告里还有发免费 ARP 要 AF_PACKET、conntrack 和 IPsec 的模块（`NETLINK_NETFILTER`、`NETLINK_XFRM`）。
+  - podman（`firewall_driver = "none"`）：容器里的地址、路由、resolv.conf 与原生逐行相同；起初 crun 打不开 `/proc/sys/net/ipv4/ping_group_range`，补上之后才起得来。自定义网络的 aardvark-dns 绑不上网关地址（EADDRNOTAVAIL，下一步），nftables 驱动和 `-p` 分别在第 3、4 步。
 
 **推迟项**：
 

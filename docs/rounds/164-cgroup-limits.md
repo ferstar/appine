@@ -20,14 +20,10 @@
 
 ## 测试
 
-- 新的差分测试组 `cgroup-limits`（原生一侧是特权容器）：先像 docker-in-docker 那样把容器根里的进程挪进 `init`、在根上开 pids 和 memory（容器的根不是真正的根，有进程时开不了）。
-  - pids：`pids.max` 写错的值（-1、2^22+1、不是数字）和边界；子孙 cgroup 里的任务算在上面开了 pids 的那个里；僵尸进程算、回收之后不算；第三个线程的 `pthread_create`、之后的 fork 是 EAGAIN；`pids.events` 记在哪个 cgroup 上；迁移进来超过上限；shell 里 fork 失败；关掉再开 pids 之后上限和事件回到默认。
-  - memory：`memory.max` 32M（`memory.swap.max` 0，有交换分区的宿主上也不换出）里不停分配的进程被 SIGKILL 结束，`memory.events` 和 `.local`、父 cgroup 的累加，`memory.peak` 超过 16M；分配了 48M 之后把上限调到 16M，进程被结束；`memory.oom.group` 时 shell、sleep 和分配的进程一起结束，`oom_kill` 是 4、`oom_group_kill` 是 1；最后容器根的 `memory.events` 是三个子 cgroup 累加的。`max` 只比是否大于 0（Linux 每次分配碰到上限都记，有几十次），调低上限的那次 `oom` 只比是否大于 0（Linux 在等进程退出时反复记，几千次）。
-- 两个执行层下都与原生逐字相同，Tier 1 多跑了一次。写用例时撞到的：awk 的 `printf` 的参数里 `>` 是输出重定向，要加括号；仓库里的 `/tmp` 是持久的，上次留下的 fifo 要先删；调低 `memory.max` 时 Linux 在写的时候就结束了进程，appine 原来稍后才结束，ash 打不打印 `Killed` 跟着变（后来也改成写的时候就结束，用例照样去掉了 `wait` 的 stderr）；Tier 1 下同步结束进程之后，定时检查在它退完之前又记了一次 `max`，改成等它的时候不记。
-- 变异检查：不检查 pids、不量 cgroup 的内存、调低上限时不结束进程，用例在三处都与原生不同。第一次做变异检查时用例卡住了（等着被结束的进程永远在 `pause()`），改成最多等 10 秒，内核不对时用例失败而不是卡住。
-- rootfs 测试里 OOM killer 的三个（`cgroup_memory_files_follow_the_oom_killer` 等）照旧通过。
-- cargo test（297 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过（上次 1012）：futex_wait05（睡得太久）这次失败，是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
-- 在 appine 里实际跑：podman 不加 `--cgroups disabled`、带 `--pids-limit`、`--memory` 时建好了容器的 cgroup，停在 crun 给它挂设备过滤的 eBPF 程序（`bpf create` 是 ENOSYS），与 docker 停在同一处，容器里的限制要等下一步之后才能实际看到。
+- 新的差分测试组 `cgroup-limits`（原生一侧是特权容器）：pids 的计数、上限、`pids.events` 和迁移，memory 上限里分配、调低上限、`memory.oom.group` 时进程被结束和各级的事件，两个执行层下都与原生逐字相同。容器的根有进程时开不了控制器，用例先像 docker-in-docker 那样把进程挪进 `init`；`max` 和调低上限那次的 `oom` 只比是否大于 0（Linux 每次碰到上限都记）。
+- 写用例时发现两处与 Linux 不同，都改了：调低 `memory.max` 时 Linux 在写的时候就结束进程；Tier 1 下同步结束进程之后，定时检查在它退完之前又记了一次 `max`。仓库里的 `/tmp` 是持久的，上次留下的 fifo 要先删。
+- 等着被结束的进程最多等 10 秒，内核不对时用例失败而不是卡住（第一次做变异检查时卡住了）。
+- 在 appine 里实际跑：podman 带 `--pids-limit`、`--memory` 时建好了容器的 cgroup，停在 crun 挂设备过滤的 eBPF 程序（`bpf create` 是 ENOSYS），与 docker 一样要等下一步。
 
 **推迟项**：
 
