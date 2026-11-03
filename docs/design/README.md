@@ -4,7 +4,7 @@
 - **范围**：v1。第 1–13 节写当前的做法，随每一轮的改动更新；改动的经过、测量和出处记在各轮里（[milestones.md](../milestones.md)）。各子系统的做法正逐节迁到 `.claude/maps/` 里各模块的 map（英文，模块见 [MODULES.md](../../.claude/MODULES.md)），迁走的节从这里删掉，节号不变。
 - **一句话**：一个能上 Google Play 的**单进程** Android App，在进程内用解释器 / 同 ISA 二进制翻译运行未经修改的 Alpine Linux aarch64 用户态程序。思路与 iSH 相同，是它在 Android 上的对应物。
 
-**目录**
+## 目录
 
 1. [目标与非目标](#1-目标与非目标)
 2. [硬约束](#2-硬约束)
@@ -63,7 +63,7 @@ A–C 都已达到。D 档里 podman、docker（[kernel/process 的 map](../../.
 | 页大小 | Android 15 起要求 App 兼容 16KB 页内核 | 给 guest 呈现的页大小必须和宿主页大小解耦 |
 | 宿主地址空间 | GKI 常见配置是 4K 页 + 39-bit VA，用户态只有约 512GB | 不能给每个 guest 进程预留很大的连续地址空间 |
 
-**最低系统版本：minSdk 29（Android 10）**。DNS 存根依赖 `android_res_nsend`，它从 API 29 开始提供。
+最低系统版本是 **minSdk 29（Android 10）**：DNS 存根依赖的 `android_res_nsend` 从 API 29 开始提供。
 
 ## 3. 总体架构
 
