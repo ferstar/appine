@@ -40,28 +40,9 @@ M9 计划的最后一轮，接着[上一轮](196-documents-read.md)的只读浏�
 
 ## 测试
 
-- 内核层（`cargo test`）新增 `changes_stay_inside_the_top_directory`：
-  - 新建时换名字（`a (1).txt`、`Docs (1)`、`.rc (1)`），不合法的名字是 EINVAL，属主和权限位；
-  - 写、追加、截断；
-  - 家目录外面的目录、经由符号链接出去的写和删除、删除家目录本身都是 EACCES，`/etc/motd` 没变；
-  - 删除符号链接只删链接；改名不覆盖；移动；目录不能移进自己里面；删除整个目录树。
-  - 把 `dir_in` 里的真实路径检查去掉时这个用例失败。
-- 仪器测试（Pixel 4a、API 34 的模拟器）新增 `documentsWriteInTheHomeDirectory`。在运行着的内核里建账号 bob，把它设成登录账号，经由 `DocumentsContract` 和 `ContentResolver`：
-  - 新建：`notes` → `notes.txt`，再建 `notes.txt` → `notes (1).txt`，`sub`（目录），`a/b` → `a_b`；
-  - 写：`wt` 写入、`wa` 追加之后，内核里 `cat` 出完整的内容；`w` 之后再 `wt`；
-  - 属主：`stat` 是 `bob bob 644`、`bob bob 755`；
-  - 文档标志：家目录本身只能新建，里面的文件能写、目录能删；
-  - 改名到已有的名字失败，改名、移动之后内核里看得到；删除整个目录之后内核里没了；
-  - 不能改的：在 `/etc` 新建，在指向 `/etc` 的链接里新建、写，删除家目录本身，都失败，`/etc/motd` 没变；
-  - 删除那个链接只删链接。
-- 上一轮的 `documentsShowTheHomeDirectory` 里"以写的模式打开失败"那条改成"整个系统那个根里的 `/etc/motd` 不能写"：家目录现在能写了。
-- 仪器测试 24 个全部通过（`downloadedDistributionsRun` 照例默认跳过）。
-- 手动（模拟器上的"文件"App）：
-  - 在"下载"里选一个文件"复制到…"，目标列表里有 appine，复制之后终端里 `ls -l ~` 看得到，内容对；
-  - 在 appine 里"新建文件夹" Projects，列表马上刷新，终端里是 0755、属于登录账号；
-  - 选中文件、工具栏的删除，终端里没了。
-  - "文件"App 自己不显示点开头的文件（`.ash_history`），菜单里有"显示隐藏文件"。
-- `cargo test --workspace`、clippy（整个工作区和 Android）、格式通过；lint 只有原来那类 UseKtx。内核层只加了宿主一侧的读写，guest 看到的行为没变，没有重跑差分测试和 LTP。
+- 内核层（`cargo test`）新增 `changes_stay_inside_the_top_directory`：新建时换名字、不合法的名字、属主和权限位，写、追加、截断，家目录外面和经由符号链接出去的都是 EACCES，删除符号链接只删链接，改名不覆盖、移动、删除整个目录树。
+- 仪器测试新增 `documentsWriteInTheHomeDirectory`：在运行着的内核里建账号 bob、设成登录账号，经由 `DocumentsContract` 和 `ContentResolver` 新建、写、改名、移动、删除，内核里马上看得到、属主是 bob，改不了的都失败。上一轮 `documentsShowTheHomeDirectory` 里"以写的模式打开失败"那条改成"整个系统那个根里的 `/etc/motd` 不能写"：家目录现在能写了。在 Pixel 4a（API 34）的模拟器上通过。
+- 手动（模拟器上的"文件"App）：从"下载""复制到…"appine、新建文件夹、删除，终端里都看得到。
 
 **推迟项**：
 

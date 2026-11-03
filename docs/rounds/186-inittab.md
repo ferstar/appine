@@ -67,17 +67,5 @@
 ## 测试
 
 - 单元测试（`inittab`）：Alpine 的 inittab 的开机和三种关机，Debian sysvinit-core 的按运行级别取舍，各种动作的先后、命令里的 `:`、空命令、注释。
-- rootfs 的集成测试新增一个，在自己写的 inittab 上跑：
-  - 内容：两个 `sysinit`、一个没装的程序、`wait`、`once`、两个 `respawn`、`shutdown`。
-  - `appine-run --init` 运行的程序看到 sysinit、wait 已经做完，日志里有 sysinit 打印的，环境变量是 busybox init 的。
-  - 程序结束之后 once、shutdown 都运行了，respawn 没有，没装的程序跳过了（日志里没有报错）。
-  - `poweroff`：关机的命令运行了，程序被 SIGTERM 结束（退出码 143），不到 4 秒。
-  - 不带 `--init` 时 `poweroff` 照旧返回、什么也不做。
-  - `Machine` 的接口：开机之前 `kill -TERM 1` 不算请求；开机之后 `processes` 数到 once 的命令，`kill -TERM 1` 是一次重启的请求（取走之后没有了），`shutdown` 之后没有进程，关机的命令运行了。
-- 手动（OpenRC 的仓库，`target/r186/`）：
-  - `appine-run --init` 开机之后 crond、sshd、redis 和一个测试用的服务都是 started，`/var/log/boot.log` 里是 OpenRC 的输出。
-  - 程序结束后那个服务的 `stop()` 被调用了（写了 "stopped gracefully"），日志末尾是 OpenRC 停服务的输出。
-  - 开机加关机一共 1 秒。
-  - guest 里 `poweroff` 之后 1 秒内关机退出，服务同样被正常停止。nobody 执行 `kill -USR2 1` 是 EPERM。
-- cargo test（337 个）、两个执行层的全部差分测试（52 组）通过。
-- LTP 的 syscall 测试：跑的时候宿主上开着 Android 模拟器、在编 APK，8 个计时类的（clock_nanosleep02、epoll_wait02、futex_wait05、poll02、pselect01、pselect01_64、select02，以及第 184 轮起就失败的 epoll_pwait03）睡过了头。关掉模拟器重跑仍然失败，用第 183 轮的二进制跑也一样失败，是 colima 这时的计时环境。别的与第 185 轮逐项相同。
+- rootfs 的集成测试新增一个，在自己写的 inittab 上测 `appine-run --init` 开机、关机时各种动作运行与否、跳过没装的程序、环境变量、guest 的 `poweroff`、不带 `--init` 时 `poweroff` 什么也不做，以及 `Machine` 的接口（开机之前 `kill -TERM 1` 不算请求、`processes`、取走关机请求、`shutdown`）。
+- 手动（OpenRC 的仓库，`target/r186/`）：`appine-run --init` 开机之后服务都起来了，程序结束或 guest 里 `poweroff` 之后服务被正常停止，开机加关机一共 1 秒。

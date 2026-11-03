@@ -62,26 +62,9 @@
 
 ## 测试
 
-- 仪器测试新增 `bootsAndShutsDownByInittab`（Pixel 4a、API 34 的模拟器上通过）：
-  - 写一个 inittab：sysinit 写文件，once 是 `sleep 30`，shutdown 再写一行。
-  - `boot` 之后 `processes` 至少 1，sysinit 运行了。
-  - guest 的 `poweroff` 之后 `takePower` 是 `POWER_OFF`，再取是 `POWER_NONE`。
-  - `shutdown` 不到 10 秒，之后 `processes` 是 0；下一个内核看到 shutdown 那一行。
-  - `ensureNetworkConfig` 写的 `/etc/network/interfaces` 在。
-  - 最后恢复原来的 inittab。
-- 手动（同一个模拟器上的 App，用 `adb shell input` 输入）：在 inittab 里加了 `::once:/bin/sleep 3600` 和 `::shutdown:/bin/touch /root/down`。
-  - guest 里 `reboot`：标签页换成新内核上的新会话，`/root/down` 有了（关机的命令运行了），`sleep 3600` 在新内核里运行。
-  - 用 `exit` 关掉唯一的标签页：界面退出，前台服务还在，通知是 "Running in the background"。
-  - 重新打开 App，执行 `poweroff`：3 秒内服务退出，`/root/down` 又有了。修上面那个问题之前，22 秒后服务还在，通知是"1 session running"。
-  - 杀掉 `sleep`、关掉标签页：5 秒内服务退出（没有 guest 进程了）。
-  - 最后恢复了模拟器里的 inittab。
-- 那段脚本在 OpenRC 的仓库里（`appine-run`）：没有时钟服务时加上 osclock，再跑不变；boot 里有 hwclock、default 里有 swclock 时都不动；没装 OpenRC 的仓库里返回 0、什么也不做。`--init` 开机之后 osclock 是 started，开机日志里没有 `[ !! ]`。
-- 仪器测试新增 `prefersOsclockOverHwclock`：没装 OpenRC 时返回 0；放一个假的 `rc-update` 和 `/etc/init.d/osclock`，它被调用了一次（`-q add osclock boot`）；boot 里有 hwclock 时不调用。
-- 模拟器上新装 App、选 Alpine：`/etc/network/interfaces` 写好了，没有 `/etc/runlevels`（脚本什么也没做），没有错误。
-- 两个 clippy、格式通过；App 的 Kotlin 编译通过。整个 MachineTest（加上上面那个是 14 个）在模拟器上跑过：只有 `downloadedDistributionsRun` 默认跳过（要联网，没带 `network=true` 时 assumeTrue 不成立），别的都通过。
-
-- 手动（OpenRC 的仓库，`appine-run --init`）：只有 lo 的 interfaces 时 crond、sshd、redis、nginx 和测试用的服务都起来了，networking 是 started，开机日志里只剩 hwclock 的 `[ !! ]`。用 `rc_provide="loopback net"` 时也都起来了，但多一行 "real and virtual service" 的报错；再加 `clock` 时 crond、nginx 起不来。
-- 用了 PostgreSQL 的那次：nginx、PostgreSQL、Redis、sshd、crond 都起来了，curl、psql、redis-cli 都通；`appine-run` 退出时它们逐个被 OpenRC 停下（开机、会话、关机一共 3 秒）。
+- 仪器测试新增 `bootsAndShutsDownByInittab`（按 inittab 开机、`processes`、guest 的 `poweroff` 和 `takePower`、`shutdown` 之后没有进程且关机的命令运行了、`ensureNetworkConfig`）和 `prefersOsclockOverHwclock`（没装 OpenRC、该加 osclock、boot 里已有 hwclock 三种情形）。整个 MachineTest 在 Pixel 4a、API 34 的模拟器上通过。
+- 手动在同一个模拟器上的 App 里试了 guest 的 `reboot`（换成新内核上的新会话，关机的命令运行了）、关掉唯一的标签页之后留在后台、`poweroff` 之后服务退出、没有 guest 进程之后服务退出；新装 App、选 Alpine 时 `/etc/network/interfaces` 写好了，没有错误。
+- 手动（OpenRC 的仓库，`appine-run --init`）：那段脚本没有时钟服务时加上 osclock、已有时钟服务和没装 OpenRC 时不动，加上之后开机日志里没有 `[ !! ]`；只有 lo 的 interfaces 时常见的服务和 networking 都起来了；用了 PostgreSQL 的那次，nginx、PostgreSQL、Redis 等都起来了，`appine-run` 退出时逐个被 OpenRC 停下。
 
 **推迟项**：
 

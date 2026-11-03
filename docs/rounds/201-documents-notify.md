@@ -33,9 +33,9 @@
 
 ## 测试
 
-- 内核层（`cargo test`）：`changes_stay_inside_the_top_directory` 加上记下的改动（截断打开、关闭；删除目录树先里后外、最后是目录自己）。新增 `files_app_changes_reach_inotify_watchers`（`hosts/cli/tests/rootfs_programs.rs`）：内核运行着，guest 里 busybox 的 `inotifyd` 监视一个目录，宿主经由 `browse_changing` 新建、截断打开写、关闭、改名、删除，guest 依次收到 `n c r c w m y d`；之后 guest 新建目录和文件，`take_changed_dirs` 给出这两个目录，再取是空的。去掉 `browse_changing` 里交给内核那一步、去掉 `dir_changed` 里的记录，它都失败。
-- 仪器测试（Pixel 4a、API 34 的模拟器）新增 `documentsChangesReachTheKernelAndBack`：内核里 `inotifyd` 监视 bob 的目录，经由 `DocumentsContract` 和 `ContentResolver` 新建、`wt` 写、改名、删除，收到 `n`、`w`（关闭回调来的）、`m`、`y`、`d`，`w` 在 `n` 之后；guest `touch` 之后 `takeChangedDirs` 给出那个目录，`dirsChanged` 之后注册在它的子项 URI 上的观察者收到通知。测试本身的坑：`inotifyd` 要在自己的控制台上跑，`sh` 辅助函数用完会关掉控制台、结束整个会话，`nohup` 也挡不住。
-- 修好唤醒请求之后，整个 `rootfs_programs` 并发地跑 30 次都不再卡；`cargo test --workspace` 347 个通过，clippy（整个工作区和 Android）、格式通过；差分测试两层各 52 组通过；LTP 1014 通过；仪器测试 25 个通过（`downloadedDistributionsRun` 照例默认跳过）。
+- 内核层（`cargo test`）：`changes_stay_inside_the_top_directory` 加上记下的改动。新增 `files_app_changes_reach_inotify_watchers`（`hosts/cli/tests/rootfs_programs.rs`）：宿主经由 `browse_changing` 新建、截断打开、关闭、改名、删除，guest 里 busybox 的 `inotifyd` 依次收到对应的事件；guest 新建之后 `take_changed_dirs` 给出改过的目录。
+- 仪器测试新增 `documentsChangesReachTheKernelAndBack`：经由 `DocumentsContract` 和 `ContentResolver` 的修改（包括关闭回调来的 `w`）guest 的 `inotifyd` 都收到，guest 改了之后注册在子项 URI 上的观察者收到通知；在 Pixel 4a（API 34）的模拟器上通过。测试本身的坑：`inotifyd` 要在自己的控制台上跑，`sh` 辅助函数用完会关掉控制台、结束整个会话，`nohup` 也挡不住。
+- 修好唤醒请求之后，整个 `rootfs_programs` 并发地跑 30 次都不再卡。
 
 **推迟项**：
 

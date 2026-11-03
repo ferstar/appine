@@ -23,10 +23,8 @@ appine: internal error in pid 12 (kernel-panic), …
 
 ## 测试
 
-- `guest_programs` 里撞上 bug 的那个用例：报告里要有 `kernel panic in syscall 43409: panic injected by the test hook at core/kernel/src/bug.rs:`。去掉 `install_panic_hook` 的调用时它失败。
-- 仪器测试 `killsAreReportedToTheApp` 同样检查交给 App 的报告里有 panic 的消息和位置。
+- `guest_programs` 里撞上 bug 的那个用例检查报告里有 panic 的消息和位置；仪器测试 `killsAreReportedToTheApp` 同样检查交给 App 的报告，仪器测试通过。
 - 在模拟器上手动走了一遍：临时让登录时运行测试钩子的 `kernel-panic`，标签页里出现说明，通知上有"复制报告"，点了之后通知收起，粘到终端里就是上面那四行。
-- `cargo test --workspace` 349 个通过，clippy（整个工作区和 Android）、格式通过；差分测试两层各 52 组通过；LTP 1014 通过（与第 202 轮相比只是偶发项 select02 这次过了）；仪器测试 25 个通过（`downloadedDistributionsRun` 照例默认跳过）。
 
 **推迟项**：
 

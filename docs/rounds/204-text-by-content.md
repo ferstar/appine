@@ -12,9 +12,8 @@
 
 ## 测试
 
-- 内核层新增 `text_is_told_by_content`：UTF-8 的文本、空文件、经由符号链接的是文本，开头 4 KB 处正好截断一个汉字的长文件也是；ELF、Latin-1 的、目录、不存在的不是；整个文件只有半个字符的不是。
-- 仪器测试 `documentsShowTheHomeDirectory` 加上 `.bashrc`（text/plain）和带 NUL 的 `blob`（照旧 application/octet-stream），链接到 `/etc/alpine-release` 的 `release` 原来是 application/octet-stream，现在列目录、查单个文档都是 text/plain。
-- `cargo test --workspace` 349 个通过，clippy（整个工作区和 Android）、格式通过；仪器测试 25 个通过（`downloadedDistributionsRun` 照例默认跳过）。
+- 内核层新增 `text_is_told_by_content`：各种算和不算文本的文件，包括开头 4 KB 处正好截断一个汉字的、整个文件只有半个字符的。
+- 仪器测试 `documentsShowTheHomeDirectory` 加上点文件、带 NUL 的文件和指向文本的链接，列目录、查单个文档时的类型都对；仪器测试通过。
 
 **推迟项**：
 

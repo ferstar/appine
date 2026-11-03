@@ -35,9 +35,9 @@
 
 ## 测试
 
-- 检查打开之后都没有撞上它：全量 `cargo test` 348 个通过（包括 `rootfs_programs` 里开机、关机、终端、"文件"App 的那些），clippy（整个工作区和 Android）、格式通过；差分测试两层各 52 组通过；LTP 1013 通过（与上一轮相比只多了偶发项 epoll_pwait03）；仪器测试（Pixel 4a、API 34 的模拟器，debug 版带着检查）25 个通过（`downloadedDistributionsRun` 照例默认跳过），logcat 里没有这条 panic。加上那次的 core，第 195 轮改掉的两处就是全部。
-- 变异：把 `Machine::inittab` 改回先取出 `vfs`、放开 BKL 再读（第 195 轮之前的样子），`init_runs_the_inittab` 第一次就失败，栈指向 `Machine::inittab`；原来要在全量并发时碰运气。
-- 新增 `a_running_kernels_store_needs_its_bkl`（`vfs/store.rs`）：没登记时谁都能用；登记给内核 A 之后，不持锁、持着内核 B 的锁时用都 panic，持着 A 的锁时正常；丢掉时不检查。把检查改成只看"持着某一把 BKL"时它失败。
+- 检查打开之后，全量 `cargo test`（包括 `rootfs_programs` 里开机、关机、终端、"文件"App 的那些）、两层的差分测试、LTP、仪器测试（Pixel 4a、API 34 的模拟器，debug 版带着检查）都没有撞上它。加上那次的 core，第 195 轮改掉的两处就是全部。
+- 把 `Machine::inittab` 改回先取出 `vfs`、放开 BKL 再读（第 195 轮之前的样子），`init_runs_the_inittab` 第一次就失败，栈指向 `Machine::inittab`；原来要在全量并发时碰运气。
+- 新增 `a_running_kernels_store_needs_its_bkl`（`vfs/store.rs`）：没登记时谁都能用；登记给内核 A 之后，不持锁、持着内核 B 的锁时用都 panic，持着 A 的锁时正常；丢掉时不检查。
 
 **推迟项**：
 

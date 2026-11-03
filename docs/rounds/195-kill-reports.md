@@ -55,20 +55,10 @@ App 的内存上限时说"App 的内存用到了上限，OOM killer 挑中了它
 
 ## 测试
 
-- 内核层（`cargo test`）：
-  - `host_calls_survive_kernel_bugs` 加了一段：在控制台上运行 `guest-bugs`（各种 bug 各在一个子进程里触发），之后 `take_kills` 至少 6 份，都是 bug、带着这个控制台的编号、报告里是同一个 pid；有 "kernel panic in syscall 43409" 那一份；取一次就空了。
-  - 新增 `oom_kills_are_reported_to_the_app`：cgroup 的 `memory.max` 是 16M，里面的 awk 拼出 64 MB 的字符串之后接着运行一会儿，报告是 cgroup `/oomt`、上限 16 MB、用量超过上限；App 的上限是 96 MB，awk 拼 128 MB，报告没有 cgroup、上限是 96 MB；`setsid` 出去、没有控制终端的进程，报告里没有控制台；`memory.oom.group` 的 cgroup 里 awk 被挑中、同组的 sleep 一起结束，正好两份报告（看代码时发现第一版里挑中的那个有两份，组里又算了一次；去掉修正时这一段失败）。
-  - `init_runs_the_inittab` 加了一段：inittab 里只有没装的程序时，开机之后上次的 `boot.log` 被清空。去掉清空的代码时这一段失败（读到 32 字节的旧内容）。
-- 差分测试新增：`cgroup-tree` 里 `mkdir /sys`、`/sys/fs`、`/sys/fs/cgroup`、`/proc/sys`、`/proc/self`、`/dev/pts` 都是 "File exists"，`mkdir -p /sys/fs/cgroup/t/p/q` 成功；`coreutils` 里 `dd` 从 /dev/zero 读 2 块 4M、从 /dev/urandom 读 1 块 1M，都是整块。两种执行层都与原生一致。全套差分测试两层各 52 组通过。
-- 仪器测试（Pixel 4a、API 34 的模拟器）：
-  - 新增 `killsAreReportedToTheApp`：测试钩子模拟的内核 panic 报告是 bug、进程名对、有控制台编号，报告里是同一个 pid；cgroup 里 awk 被 OOM 结束的报告是 `oom`、`/oomt`、上限 16777216、用量更大；取一次就空了。第一版用 `dd bs=64M` 吃内存，模拟器上 dd 17 毫秒就做完退出了，OOM killer 每 20 毫秒才量一次，有时发现不了（设计如此，§12 第 4 条），改成吃完内存之后接着运行一会儿的 awk，连跑 3 次都通过。
-  - `bootsAndShutsDownByInittab` 的 inittab 加了一项像 OpenRC 那样打印两个服务（一个重复）没起来的命令，`Rootfs.failedServices` 读出这两个。
-  - 22 个全部通过（`downloadedDistributionsRun` 照例默认跳过）。
-- 手动（模拟器上的 App）：
-  - 把 shell 放进 16M 的 cgroup，`sort /dev/zero`：标签页里先是 shell 的 "Killed" 和新的提示符，然后提示插在提示符上面。在屏幕已满、光标在最后一行、提示符后面输入了一半的 `echo typed half` 时也一样，回车照常执行。
-  - `setsid sort /dev/zero`：没有控制终端，发了通知（"sort was killed"）。在 vi 里时后台的 sort 被结束：vi 的画面没动，发了通知；退出 vi 之后标签页里也没有插入。在 busybox 的 less 里时（它不用备用屏幕）提示插在它的状态行上面，见推迟项。
-  - 开机失败的通知：上面说的旧 `boot.log` 让通知第一次就出来了（"2 services did not start: fake, other…"），修了清空之后重开 App 没有这条通知。真装 OpenRC、加一个起不来的服务的试验没做成：这时宿主的网络很差（`ping` 丢一半、170 毫秒），模拟器里 `apk add openrc` 下载一直停着；开发容器里修改前后的 `appine-run` 用 HTTPS 下载同样都在十几 KB 处停住，与这一轮的改动无关。
-- `cargo test --workspace`、clippy（整个工作区和 Android）、格式通过；lint 只有原来那类 UseKtx。LTP 的 syscall 测试 1014 个通过，与第 193 轮存的结果逐项比，只有[偶发项](../milestones.md#已知的偶发失败)里检查睡眠精度的 futex_wait05、pselect01_64 这次过了，没有 BUG。
+- 内核层（`cargo test`）：`host_calls_survive_kernel_bugs` 加了一段，看各种 bug 的报告；新增 `oom_kills_are_reported_to_the_app`，看 cgroup 的 `memory.max`、App 的内存上限、没有控制终端、`memory.oom.group` 几种情形的报告（看代码时发现第一版里挑中的那个报告了两份，修了）；`init_runs_the_inittab` 加了一段，看一个命令也没运行时上次的 `boot.log` 被清空。
+- 差分测试 `cgroup-tree` 新增合成文件系统里已有名字的 mkdir 和 `mkdir -p`，`coreutils` 新增 `dd` 从 /dev/zero、/dev/urandom 读大块，两种执行层都与原生一致。
+- 仪器测试新增 `killsAreReportedToTheApp`（测试钩子模拟的内核 panic、cgroup 里的 OOM），`bootsAndShutsDownByInittab` 加上读出没起来的服务；在 Pixel 4a（API 34）的模拟器上通过。第一版用 `dd bs=64M` 吃内存，模拟器上 dd 17 毫秒就做完退出了，OOM killer 每 20 毫秒才量一次，有时发现不了（§12 第 4 条），改成吃完内存之后接着运行一会儿的 awk。
+- 手动（模拟器上的 App）：OOM 的提示插在 shell 的提示符上面，屏幕已满、输入了一半的命令时也一样，回车照常；没有控制终端、在 vi 里时改发通知；busybox 的 less 见推迟项。真装 OpenRC、加一个起不来的服务的试验没做成：当时宿主的网络很差，模拟器里 `apk add openrc` 下载一直停着。
 
 **推迟项**：
 

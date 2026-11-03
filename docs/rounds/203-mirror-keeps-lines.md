@@ -14,7 +14,7 @@
 
 ## 测试
 
-仪器测试（Pixel 4a、API 34 的模拟器）`manualMirrorIsWritten` 扩充：在源里加上 http 的 `@testing` 行、注释掉的 community、一个第三方仓库，选中科大之后只有内置镜像的地址换了（`@testing` 那行保留 http），再选清华也一样；全换成列表以外的镜像之后选，返回"没有改动"，文件和记录都不变；删掉源文件之后选，照导入时的内容重写。Debian 的 deb822 内容直接调 `retarget`：https 的 `deb.debian.org`、http 的 `debian-security` 都换了主机、协议照旧，组件和 backports 留着，Docker 的源不动；只有 `ftp.cn.debian.org` 的返回"没有内置的镜像"。在模拟器上手动试过一次：guest 里把源改成列表以外的镜像，设置里选清华，弹出提示（第一版的文字带着路径，被截成两行），源和设置页显示的镜像都没变。仪器测试 25 个通过（`downloadedDistributionsRun` 照例默认跳过）。
+仪器测试 `manualMirrorIsWritten` 扩充：源里有用户加的行、注释掉的行、第三方仓库时只换内置镜像的地址、协议照旧，全是列表以外的镜像时什么也不改，源文件不在时重写；Debian 的 deb822 内容直接调 `retarget` 测了同样几种情形。在 Pixel 4a（API 34）的模拟器上通过；也在模拟器上手动试了源里全是列表以外的镜像时选镜像，弹出提示，什么也没改。
 
 **推迟项**：
 

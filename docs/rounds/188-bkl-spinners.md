@@ -92,7 +92,6 @@ perf 剖析 8 个同时 exec（cpu-clock 采样）：内核的 `try_to_wake_up` 
 ## 测试
 
 - 没有新的测试：锁本身还是 std 的 Mutex，只改了同时自旋的上限；多个线程、多个进程同时取 BKL 的路径原来的测试都覆盖到（guest 测试 `threads.c` 的反复 munmap、差分测试 `c-programs` 的并发读写和 stat、`fork`、`processes`）。
-- cargo test（337 个）、clippy（含 Android）、格式、两层的全部差分测试（52 组）通过。LTP 的 syscall 测试 1014 个通过（第 186 轮 1007）：多出来的 7 个都是[偶发项](../milestones.md#已知的偶发失败)里检查睡眠精度的（clock_nanosleep02、epoll_wait02、futex_wait05、poll02、pselect01、pselect01_64、select02），这次都通过，其余逐项相同。
 - 最后的 release 与 91300af 再交替 2 轮：exec 4 / 8 个同时 543–547 / 1129–1134 → 495–496 / 1047–1066 µs，管道 1924–1972 / 4140–4173 → 1673–1676 / 3570–3604 µs。
 - 只在 colima 的虚拟机里跑，没上手机。
 

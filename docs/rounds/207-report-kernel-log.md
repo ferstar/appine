@@ -33,11 +33,9 @@ APK 里的 `libappine.so` 是 AGP 去掉了符号的（`stripDebugDebugSymbols`�
 
 ## 测试
 
-- 单元测试 `lines_from_are_dmesg_lines_with_escapes`：两行的记录拆成两项，制表符、ESC 转义，不是 UTF-8 的字节换成 U+FFFD；清空过、关了时间也照样带时间；没定稿的那条不算；`upcoming_seq` 之后没有。
-- `guest_programs` 里撞上 bug 的那个用例（6 个以上的 bug 结束进程）：每份报告的日志每行都是 `[…] ` 开头，最后一行是报告自己；从第二份起，日志里有前一份报告。变异检验：`LOG_BEFORE` 改成 0 时"日志里有前一份报告"那条失败。
-- 仪器测试 `killsAreReportedToTheApp`：运行 `kernel-panic` 之前 `echo before the bug > /dev/kmsg`，交给 App 的那一项第 6 个字段按 U+001E 拆开，每行带时间，有 `] before the bug`，最后一行以报告结尾。
+- 单元测试 `lines_from_are_dmesg_lines_with_escapes`：拆行、转义、总是带时间、没定稿的那条不算。
+- `guest_programs` 里撞上 bug 的那个用例看每份报告带的日志：格式对，最后一行是报告自己，从第二份起有前一份报告。仪器测试 `killsAreReportedToTheApp` 看交给 App 的日志里有之前写进 `/dev/kmsg` 的那一行，仪器测试通过。
 - 在模拟器上手动走了一遍（上面那段）。
-- `cargo test --workspace` 350 个通过，clippy（整个工作区和 Android）、格式通过；差分测试两层各 52 组通过；LTP 1013 通过，与第 205 轮存的结果逐项比，只有[偶发项](../milestones.md#已知的偶发失败)里检查睡眠精度的 select02 这次没过，没有 BUG；仪器测试 25 个通过（`downloadedDistributionsRun` 照例默认跳过）。
 
 **推迟项**：
 

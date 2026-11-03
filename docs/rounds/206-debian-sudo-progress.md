@@ -39,13 +39,8 @@
 
 ## 测试
 
-- 在 `appine-run` 里（Debian 13 的 rootfs，`useradd -m -s /bin/bash alice`，用 guest 里的 `script` 开一个伪终端运行登录脚本，从管道定时送入 Ctrl-C 和命令）：
-  - 第一次登录，`apt-get update` 下载索引时按 Ctrl-C：打印跳过的那一行，进了 alice 的 shell；`tty; sleep 5` 时按 Ctrl-C，`echo still-here` 照常输出。
-  - 第二次登录（从 `/tmp` 恢复）：显示 apt 的进度和 dpkg 的输出，装上 sudo，打印 "alice is in the sudo group and can become root with sudo"，从 `/tmp` 开始。
-  - 第三次登录不再装，直接进 shell。
-  - Alpine 的仓库里 `su --help` 里没有 `--session-command`，照旧用 `-c`，从恢复的目录开始。
-- 仪器测试 `downloadedDistributionsRun`（联网，默认跳过）：建了 alice 之后，第一次登录等 apt 的进度出现时按 Ctrl-C，要有跳过的那一行；在 alice 的 shell 里 `tty` 是 `/dev/pts/…`，`sleep 30` 时按 Ctrl-C 之后 `echo still-here` 照常输出，没有 "Session terminated"；第二次登录要有 "Setting up sudo"，`sudo -n id -un` 是 root。新加的 `loginSteps` 按步骤交互：等输出里出现某段文字再输入下一段。
-- 模拟器（Pixel 4a、API 34）上 `downloadedDistributionsRun` 带 `network=true` 通过（第一次失败在用例的断言上：bash 在命令输出前先写 `\e[?2004l\r`，`/dev/pts/` 前面不是换行）；全部仪器测试 25 个通过（`downloadedDistributionsRun` 照例默认跳过）。只改了登录脚本和仪器测试，没有动 Rust，cargo test、差分测试、LTP 没有重跑。
+- 在 `appine-run` 里（Debian 13 的 rootfs，用 guest 里的 `script` 开一个伪终端运行登录脚本，从管道定时送入 Ctrl-C 和命令）：第一次登录按 Ctrl-C 跳过、进了 shell 之后 Ctrl-C 只打断前台的命令，第二次登录显示进度、装上 sudo，第三次不再装；Alpine 上照旧用 `-c`。
+- 仪器测试 `downloadedDistributionsRun`（联网，默认跳过）加上同样的几步：跳过、shell 里 Ctrl-C 之后会话还在、下一次登录装上；新加的 `loginSteps` 按步骤交互：等输出里出现某段文字再输入下一段。在 Pixel 4a（API 34）的模拟器上带 `network=true` 通过。第一次失败在用例的断言上：bash 在命令输出前先写 `\e[?2004l\r`，`/dev/pts/` 前面不是换行。
 
 **推迟项**：
 

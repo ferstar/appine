@@ -57,27 +57,7 @@
 
 ## 测试
 
-- 新的差分测试组 `protected`（带 `CAP_SYS_ADMIN`），两个执行层都与原生逐字相同：
-  - 四个 sysctl 的值和权限，nobody 也能读。`kernel.panic` 只比权限、是不是一个整数：它的值是宿主的配置，推送后 CI 的 runner 上是 -1（colima 是 0），第一次推送时这一组因此失败。
-  - **protected_symlinks**：
-    - root 跟随 /tmp 里 nobody 的链接是 EACCES，`stat -L` 也是。
-    - 经由它到目录里的文件（中间的组件）可以，readlink、lstat 可以。
-    - 经由 nobody 的悬空链接 `O_CREAT` 是 EACCES，什么也没建。
-    - nobody 跟随自己的、root 的链接可以。
-    - 不是粘滞位的目录里可以。
-    - 粘滞位目录的属主与链接的属主相同时可以，换了目录的属主之后不行。
-  - **protected_hardlinks**：nobody 链接 root 的 0600 文件、setuid、可执行的 setgid、设备节点、FIFO、只读的文件都是 EPERM；0666 的文件、不可执行的 setgid 文件、自己的 0000 文件可以，root 可以。
-  - **随机数的 ioctl**：上表的每一项，加上数据伸进没有映射的页（EFAULT）；nobody 能读熵、改的都是 EPERM。
-- 变异检查：
-  - 用第 184 轮的二进制跑这一组：没有这几个文件，跟随、`stat -L`、经由悬空链接新建都成功了，链接也都建成了，ioctl 是 ENOTTY。
-  - 只去掉"不持 BKL 的解析交给正常的解析"：`stat -L` 那一行成功了，与原生不同。
-- rootfs 的集成测试新增一个（容器里 `/proc/sys` 只读，写入比不了）：
-  - 照 00-alpine.conf 用 `sysctl -w` 写四项，读回来。
-  - `unprivileged_bpf_disabled` 改成 1 之后改不回 0，`protected_symlinks` 写 2 是 EINVAL，nobody 写不了。
-  - 关掉 `protected_symlinks` 之后 root 能跟随 nobody 的链接，打开之后不能。
-- 手动（差分测试的仓库，Python 直接调 bpf(2)）：
-  - `unprivileged_bpf_disabled` 是 2 时，nobody 的加载、查询都是 EPERM。
-  - 是 0 时，nobody 加载设备程序是 EPERM、套接字过滤是 EINVAL、查询是 EPERM。
-  - root 能加载设备程序。
-- 手动（OpenRC，`target/openrc/devfs.sh`）：boot 里的 sysctl、seedrng 都是 `[ ok ]`，seedrng 打印 "Seeding 256 bits and crediting"。
-- cargo test（333 个）、两个执行层的全部差分测试（52 组）通过。LTP 的 syscall 测试与第 184 轮逐项相同（1013 个通过，epoll_pwait03 仍是 colima 的计时问题）。
+- 新的差分测试组 `protected`（带 `CAP_SYS_ADMIN`）：四个 sysctl 的值和权限、protected_symlinks 和 protected_hardlinks 允许和挡住的各种情形、随机数的 ioctl，两个执行层都与原生逐字相同。`kernel.panic` 只比权限、是不是一个整数：它的值是宿主的配置，推送后 CI 的 runner 上是 -1（colima 是 0），第一次推送时这一组因此失败。
+- rootfs 的集成测试新增一个，测 `sysctl -w` 写四项再读回、写入的限制、关掉 `protected_symlinks` 之后能跟随（容器里 `/proc/sys` 只读，写入比不了原生）。
+- 手动用 Python 直接调 bpf(2)，看了 `unprivileged_bpf_disabled` 是 2 和 0 时 nobody 和 root 的加载、查询。
+- 手动（OpenRC，`target/openrc/devfs.sh`）：boot 里的 sysctl、seedrng 都是 `[ ok ]`。

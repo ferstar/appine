@@ -33,21 +33,9 @@ Manifest 里的 provider 由 `MANAGE_DOCUMENTS` 权限保护（只有系统的"�
 
 ## 测试
 
-- 内核层（`cargo test`）新增三个：
-  - `paths_resolve_through_links`：绝对、相对、指向 `..` 的符号链接，路径里的 `..`、`.`、`//`，断了的链接是 ENOENT，自己指向自己的是 ELOOP，FIFO 是 ENOENT，打开目录是 EISDIR，路径中间是文件时是 ENOTDIR。
-  - `listings_follow_links_and_hide_special_files`：列目录跟随链接、不列断了的链接和 FIFO；搜索不分大小写、浅的在前、到了上限和预算就停。
-  - `paths_survive_the_round_trip`：中文、`%`、制表符和换行、不是 UTF-8 的字节、像 `%41` 这样的名字都能原样换回来，编码之后没有制表符、换行。
-- 仪器测试（Pixel 4a、API 34 的模拟器）新增 `documentsShowTheHomeDirectory`，经由 `ContentResolver`，文件是运行中的内核刚写的：
-  - 根是 `home` → `/root`（登录账号设成 root）；
-  - 列目录：`100% 中文.txt`（ID 是 `/root/dt/100%25 中文.txt`，名字解码回来）、`a.txt`（text/plain、2 字节）、指向 `/etc/alpine-release` 的链接（显示成文件）、`sub`（目录）；断了的链接和 FIFO 不在；
-  - 读出文件内容，链接读到的是目标的内容；以写的模式打开失败；
-  - 家目录外面的 `/etc/motd`、带 `..` 的、带 `//` 的 ID 都查不到；
-  - 树的授权：树里面的能查，`/root/dt/../../etc/motd` 是 SecurityException；
-  - 搜索 `A.TXT` 找到 `/root/dt/a.txt`。第一版测试只给了 URI 里的查询，框架要求参数里也有（`QUERY_ARG_DISPLAY_NAME`，"文件"App 是这样传的），照它改了测试；
-  - 打开整个系统之后有两个根，能查 `/etc/motd`、列 `/`。
-  - 23 个全部通过（`downloadedDistributionsRun` 照例默认跳过）。
-- 手动（模拟器上的"文件"App）：在终端里建 `~/notes/hello.txt`，用 `content://…/root/home` 打开"文件"App：标题 appine、"root · Alpine Linux 3.24"，进 notes 看到两个文件（大小、时间对）；长按 hello.txt，菜单里只有"打开方式""排序""全选""复制到…""详细信息"；"复制到…"下载目录之后 `/sdcard/Download/hello.txt` 内容正确。设置里打开"整个系统"之后，侧栏里有两个 appine 的根，`/usr/bin` 里上百个指向 busybox 的链接一秒内列出来。
-- `cargo test --workspace`、clippy（整个工作区和 Android）、格式通过；lint 只有原来那类 UseKtx（第一版取可用空间用了 `File.usableSpace`，lint 建议改用 `getAllocatableBytes`，改了）。内核层只加了宿主一侧的读取，guest 看到的行为没变，没有重跑差分测试和 LTP。
+- 内核层（`cargo test`）新增 `paths_resolve_through_links`（各种符号链接和路径写法、断了的链接、ELOOP、FIFO、EISDIR、ENOTDIR）、`listings_follow_links_and_hide_special_files`（列目录、搜索）、`paths_survive_the_round_trip`（各种名字编码之后能原样换回来）。
+- 仪器测试新增 `documentsShowTheHomeDirectory`：经由 `ContentResolver` 看运行中的内核刚写的文件，测了根、列目录、读文件、家目录外面和不规范的 ID、树的授权、搜索、打开整个系统之后的根，在 Pixel 4a（API 34）的模拟器上通过。第一版测试搜索时只给了 URI 里的查询，框架要求参数里也有（`QUERY_ARG_DISPLAY_NAME`，"文件"App 是这样传的），照它改了测试。
+- 手动（模拟器上的"文件"App）：家目录的根、菜单里只有只读的几项、"复制到…"下载目录之后内容正确；打开"整个系统"之后有两个根，`/usr/bin` 里上百个链接一秒内列出来。
 
 **推迟项**：
 

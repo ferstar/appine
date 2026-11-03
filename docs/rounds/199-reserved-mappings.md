@@ -36,10 +36,9 @@ Chromium 每个进程（浏览器、两个 zygote、两个 crashpad、GPU、两�
 ## 测试
 
 - 模拟 39 位（`ulimit -v 512G`）：Chromium `--dump-dom` 正常输出（`<title>js:42</title>`）。起着 headless Chromium 时 appine-run 在宿主上的 VmSize 从 4.83 TB 降到 12.4 GB，宿主的映射从 2019 个变成 2244 个（提交的块各是一段宿主映射）。node（带 wasm）、java、`go build`、python3 在限制下照常。
-- 内核层（`cargo test`）新增 `prot_none_reservations_take_no_host_memory`：1 TB 的预留只有 mprotect 过的两页、内核写过的一页有宿主内存；mincore、pagemap、驻留量是 0；丢弃不碰它；fork 的子进程也只是预留，写过的内容看得到；mremap 原地扩展接上的也只是预留。fork 时把预留当成普通匿名映射（变异）时它失败。原来的 `prot_none_stays_out_of_the_page_table`（预留里改一页可写、改回来内容还在、内核往没有权限的页写）照样通过。
-- 速度（`target/mem/base.sh`，各跑两遍，与改之前的二进制交替）：shell、git、gcc、python、apk、`go build`、Maven、Gradle 都在波动范围内。
-- 仪器测试（Pixel 4a、API 34 的模拟器，宿主就是 39 位）24 个通过（`downloadedDistributionsRun` 照例默认跳过）。
-- `cargo test --workspace`、clippy（整个工作区和 Android）、格式通过；差分测试两层各 52 组通过；LTP 1011 通过（上一轮 1012），变化的 clock_nanosleep02、pselect01_64、futex_wait05 都是[计时精度的偶发项](../milestones.md#已知的偶发失败)。
+- 内核层（`cargo test`）新增 `prot_none_reservations_take_no_host_memory`：大的预留只有 mprotect 过、内核写过的页有宿主内存，mincore、pagemap、驻留量、丢弃、fork、mremap 原地扩展都照预留对待。
+- 常用负载的速度都在波动范围内。
+- 仪器测试在 Pixel 4a（API 34）的模拟器上通过，宿主就是 39 位。
 
 **推迟项**：
 

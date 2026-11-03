@@ -43,17 +43,11 @@
 
 ## 测试
 
-- 先在 `appine-run`（开发容器）里直接跑登录脚本：
-  - Alpine：只有 root 时 `auto` 是 root；`adduser -D alice` 之后 `auto` 是 alice，第一次登录加进 wheel、装上 doas、写好两份规则，没设密码时 `doas id -un` 是 root；`chpasswd` 设了密码之后下一次登录免密的那行没了，`doas -n` 是 "Authentication required"；`delgroup alice wheel` 之后不再加回去；`bob` 不在时打提示、用 root；`root` 是 root。world 里是 `doas`，不是固定的文件。
-  - Debian（本地的 debian-trixie tarball）：`useradd -m -s /bin/bash alice` 之后登录，装上 sudo、加进 sudo 组，`sudo -n id -un` 是 root，`su -l` 之后 SHELL、HOME 都对；设了密码之后 `sudo -n` 要密码。
-- guest 测试 `tests/guest/net.c` 新增 `test_dns_stub_fionread`：连到存根，`sendmmsg` 发 A、AAAA 两个查询，每个回答 `FIONREAD` 都等于随后 `recv` 的长度，ID 对得上，读完之后是 0。不需要外网（没网时存根回答 SERVFAIL）。变异检验：去掉修正之后报 "answer 0: FIONREAD 0, recv 102"。
-- 仪器测试（Pixel 4a、API 34 的模拟器）：
-  - 新增 `loginAccountsAndDoas`：只有 root 时登录是 root；`adduser -D alice` 之后 `Rootfs.regularAccounts` 是 [alice]，登录是 alice、在 wheel 里、`doas -n id -un` 是 root；设了密码之后 doas 要认证；明确选 root 是 root；`bob` 不在时提示并用 root。最后删掉账号、doas 和记录。
-  - `downloadedDistributionsRun`（联网）：`apt-get update` 改成看输出；再 `useradd` 一个用户，自动以它登录，装上 sudo（模拟器上 apt 装 sudo 要几分钟），`sudo -n id -un` 是 root。通过。
-  - 全部 18 个里 17 个通过，`downloadedDistributionsRun` 照例默认跳过。只在 4K 页的模拟器上跑了。
-  - 测试第一次卡住：测试一开始就把要执行的命令写进终端，装 sudo 时 apt、dpkg 把它们读走了，alice 的 shell 等不到输入。脚本里装软件的命令都改成从 `/dev/null` 读。
-- 手动（模拟器上的 App）：设置页的"登录账号"显示"Automatic: root…"；在终端里 `adduser -D -s /bin/ash alice` 之后显示"Automatic: alice (the first regular user)"；开新标签页，开头是 "appine: alice is in the wheel group and can become root with doas"，提示符是 `alice@localhost:~$`，`id` 里有 wheel，`doas id -un` 是 root，原来的第 1 个标签页仍是 root；单选里选 root，提示 "New tabs log in as root"，再开的标签页是 root。
-- `cargo test --workspace`、clippy（整个工作区和 Android）、格式通过；`init_runs_the_inittab` 在全量并发、同时模拟器在跑联网测试的那一次失败了一次（见推迟项），单独重跑 5 次都通过。差分测试两层各 52 组通过。LTP 的 syscall 测试 1012 个通过，与第 185 轮存的结果逐项比，只有[偶发项](../milestones.md#已知的偶发失败)里检查睡眠精度的 epoll_pwait03（这次过了）、futex_wait05、pselect01_64（这次没过）不同，没有 BUG。
+- 先在 `appine-run`（开发容器）里直接跑登录脚本：Alpine 和 Debian 上选账号、第一次登录加组和装提权工具、按有没有密码写免密规则、移出组之后不再加回去、账号不在时用 root、`su -l` 之后的环境都对。
+- guest 测试 `tests/guest/net.c` 新增 `test_dns_stub_fionread`：`sendmmsg` 发 A、AAAA 两个查询给存根，每个回答的 `FIONREAD` 都等于随后 `recv` 的长度。不需要外网（没网时存根回答 SERVFAIL）。
+- 仪器测试新增 `loginAccountsAndDoas`（选账号、加进 wheel、doas 免密和要认证）；联网的 `downloadedDistributionsRun` 的 `apt-get update` 改成看输出，并加上自动以新建的用户登录、装上 sudo。在 Pixel 4a（API 34）的模拟器上通过，只在 4K 页的模拟器上跑了。
+- 手动在模拟器上的 App 里看了设置页的"登录账号"随 `adduser` 变化、新标签页以 alice 登录并能 `doas`、选 root 之后新开的标签页是 root。
+- 全量并发的 `cargo test` 里 `init_runs_the_inittab` 失败过一次，单独重跑都通过（见推迟项）。
 
 **推迟项**：
 

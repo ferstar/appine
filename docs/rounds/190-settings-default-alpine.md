@@ -62,25 +62,11 @@
 
 ## 测试
 
-- 仪器测试新增两个：
-  - `downloadsCanBeCancelled`：本地的 HTTP 服务发三分之一就停住，进度回调里取消，`fetch` 抛出 `Rootfs.Cancelled`，`.part` 没有留下。
-  - `manualMirrorIsWritten`：内核运行着时 `setMirror`，guest 里 `cat /etc/apk/repositories` 马上是新的镜像，记录是手动的；最后恢复源文件和记录。
-  - `downloadedDistributionsRun` 只下 Debian 了。
-- Pixel 4a（API 34，4K 页）的模拟器：16 个里 15 个通过，`downloadedDistributionsRun` 照例默认跳过。带 `network=true`、给模拟器设上系统代理单独跑它：下载 Debian、导入、登录 bash、`apt-get update` 通过（20 秒）。→ `apt-get update` 这一项是假的通过：apt 取不到索引时只警告、退出码仍是 0。模拟器上 glibc 一次查 A 和 AAAA 的解析一直失败，第 193 轮查出来是 DNS 存根的回答在 `FIONREAD` 里报成 0，修了（M9：以指定用户登录），用例也改成看输出
-- Qenix 16K（API 37，16K 页）的模拟器：14 个通过，`downloadedDistributionsRun` 跳过，`lowPortsMoveToHighPortsOnTheHost` 失败。失败的是用例开头的前提："App 进程自己绑不了 22 端口"。这个 Android 17 的镜像上 App 自己就能绑：App 进程的 CapEff 是 0，`ip_unprivileged_port_start` 也是 1024，原因没查（见推迟项）。用例的其余部分照样通过：guest 绑 22 换到宿主的 10022，App 进程连得上。这条用例以前只在 API 34 上跑过（[低端口映射](156-low-ports.md)），与这一轮的改动无关。
-- 手动（4K 模拟器上新装的 App，用 `adb shell input` 操作、截图看）：
-  - 首次启动直接进 Alpine，第一个标签页里是 Alpine 的欢迎语；设置页显示 Alpine Linux 3.24、测速选出的中科大镜像、Tier 1。16K 模拟器上新装的也一样。
-  - 镜像手动选清华：设置页显示清华，不再带"测速选出的"。
-  - 不开代理换 Debian：GitHub 连不上，设置页一直是"0 / 47 MB"，30 秒后弹出"无法下载 Debian 13：timeout"，Alpine 照常。断网时马上弹出"Unable to resolve host"，同样不动原来的系统。
-  - 给模拟器设上系统代理（`settings put global http_proxy 10.0.2.2:1087`）再换 Debian：通知里有进度条、"取消下载"和"全部退出"；下载完设置页关掉，终端显示"正在准备 Debian 13…"，然后是 Debian 的欢迎语。里面 `PRETTY_NAME` 是 Debian 13，源是测速选出的 deb.debian.org，`/etc/apk` 没有了。
-  - 在 Debian 上重置：重新下载、导入，新会话。
-  - 取消：不带代理时下载卡在连接上，点"不再下载 Debian 13？"的"取消下载"，设置页马上回到 Debian 13，发行版、重置两行变灰（旧线程还在），线程结束后恢复，没有弹错误，缓存里没有 `.part`。
-  - 执行层换 Tier 0：确认之后重启，新会话里 `bash -c 'i=0; while ((i<20000)); do ((i++)); done'` 用了 2.19 秒；换回 Tier 1 之后 0.059 秒。
-  - 从 Debian 换回 Alpine（不用下载）：确认之后直接换，新会话是 Alpine。
-  - 把仓库的 `meta.db` 写坏再打开 App：显示"无法启动：cannot write /etc/network/interfaces: errno 5"；设置页里重置能点，重置之后是好的 Alpine。
-- 禁用的行用 `alpha` 0.4 画：截图里的标题亮度 255 → 102（缩小的截图上肉眼看不太出来，按像素量的）。
-- lint 没有新的警告（SharedPreferences 的 `edit()` 照原来的写法，与 `MainActivity` 一样有 UseKtx 的提示）。只改了 Kotlin 和文档，没有重跑 cargo test、差分测试和 LTP。
-- 第一次在 4K 模拟器上跑仪器测试时，模拟器上留着的旧仓库里 `/bin/sh` 读出来不是 ELF（"not an ELF file"），用到 shell 的用例都失败了。跑完测试 App 被卸载、数据跟着没了，没法再查是怎么坏的；重新导入之后都通过。见推迟项。
+- 仪器测试新增 `downloadsCanBeCancelled`（本地的 HTTP 服务发一部分就停住，取消之后抛出 `Rootfs.Cancelled`、不留 `.part`）和 `manualMirrorIsWritten`（内核运行着时 `setMirror`，guest 马上读到新的源）；`downloadedDistributionsRun` 只下 Debian 了。
+- Pixel 4a（API 34，4K 页）的模拟器上通过。带 `network=true`、给模拟器设上系统代理单独跑 `downloadedDistributionsRun`：下载 Debian、导入、登录 bash、`apt-get update` 通过。→ `apt-get update` 这一项是假的通过：apt 取不到索引时只警告、退出码仍是 0。模拟器上 glibc 一次查 A 和 AAAA 的解析一直失败，第 193 轮查出来是 DNS 存根的回答在 `FIONREAD` 里报成 0，修了（M9：以指定用户登录），用例也改成看输出
+- Qenix 16K（API 37，16K 页）的模拟器上只有 `lowPortsMoveToHighPortsOnTheHost` 失败，失败的是用例开头的前提"App 进程自己绑不了 22 端口"：这个 Android 17 的镜像上 App 自己就能绑（见推迟项），与这一轮的改动无关。
+- 手动（4K 模拟器上新装的 App，用 `adb shell input` 操作、截图看）：首次启动直接进 Alpine（16K 模拟器上也一样）、手动选镜像、经由系统代理换 Debian、在 Debian 上重置、连不上和断网时弹出原因并且不动原来的系统、下载中取消、换执行层、换回 Alpine、`meta.db` 写坏之后在设置页重置，都与预期相同。
+- 第一次在 4K 模拟器上跑仪器测试时，模拟器上留着的旧仓库里 `/bin/sh` 读出来不是 ELF，用到 shell 的用例都失败了；数据随 App 卸载没了，没法再查，重新导入之后都通过（见推迟项）。
 
 **推迟项**：
 

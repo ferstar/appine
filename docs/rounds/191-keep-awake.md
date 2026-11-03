@@ -24,16 +24,12 @@ appine 只要有内核就有前台服务（`specialUse`），所以只加 `PARTI
 
 在 Pixel 4a（API 34）的模拟器上，用 `dumpsys power` 看锁：
 
-- 新装的 App 打开之后没有 appine 的锁（默认关）。
-- 设置里打开：`PARTIAL_WAKE_LOCK 'appine:keep-awake'`，开关和说明文字都变了。
-- 熄屏、`dumpsys battery unplug`、`dumpsys deviceidle force-idle`（`mState=IDLE`）之后，这把锁仍在、没有 `DISABLED` 标记；过了一分钟仍是这样（`ACQ=-1m31s … LONG`）。上面从源码读出的规则在模拟器上成立。
-- 通知上显示"1 session running · kept awake"和"Allow sleep"；点"Allow sleep"放开（`REL`），通知变回"1 session running"、按钮变成"Keep awake"。
-- 通知上点"Keep awake"拿锁，再点"Exit all"：关机完成后放开（`ACQ` 到 `REL` 1.2 秒），服务停了。重新打开 App，内核起来之后自动又拿了锁（开关记住了）。
-- guest 里后台一个每秒写一行的循环：持锁时熄屏、强制 Doze 的 85 秒里写了 85 行；不持锁时 64 秒里也写满了 64 行。模拟器的 CPU 本来就不会休眠，这一项在模拟器上看不出差别，要真机（见推迟项）。
-- 仪器测试（MachineTest）照旧通过（16 个里 15 个，联网的那个默认跳过）。没有新的仪器测试：锁在服务里，要验证的是系统怎么对待它，靠上面的 `dumpsys`。
-- lint 没有新的警告（只剩原来那类 UseKtx 的提示）。只改了 Kotlin 和文档，没有重跑 cargo test、差分测试和 LTP。
+- 默认没有锁；设置里、通知上打开和关掉都对；"全部退出"时关机完成后才放开；重新打开 App，内核起来之后自动又拿了锁。
+- 熄屏、拔电、强制 Doze 之后这把锁仍在、没有 `DISABLED` 标记，过了一分钟仍是这样：上面从源码读出的规则在模拟器上成立。
+- 模拟器的 CPU 本来就不会休眠，熄屏之后 guest 的程序持不持锁都照常运行，看不出差别，要真机（见推迟项）。
+- 原来的仪器测试照旧通过。没有新的仪器测试：锁在服务里，要验证的是系统怎么对待它，靠上面的 `dumpsys`。
 
-测试时碰到的问题：上一轮在这个模拟器上给 App 的下载设过系统代理，用完 `settings delete global http_proxy` 删掉了。这一轮跑仪器测试时，两个用本地 HTTP 服务的用例返回 404：删掉 `http_proxy` 之后，系统由它派生出的 `global_http_proxy_host`、`global_http_proxy_port` 还在，排除列表却空了，连接服务一直按这个代理走到重启，127.0.0.1 的请求也被送去了代理。重启模拟器之后都通过。清掉代理要用 `settings put global http_proxy :0`（试过，马上生效，那个用例也通过）；`android/README.md` 上一轮写的办法改正了。
+测试时碰到的问题：上一轮用 `settings delete global http_proxy` 删掉模拟器的系统代理之后，系统由它派生出的 `global_http_proxy_host`、`global_http_proxy_port` 还在，排除列表却空了，连接服务一直按这个代理走到重启，两个用本地 HTTP 服务的用例因此返回 404。清掉代理要用 `settings put global http_proxy :0`；`android/README.md` 上一轮写的办法改正了。
 
 **推迟项**：
 

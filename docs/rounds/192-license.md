@@ -44,11 +44,10 @@ M9 计划里的许可证审计（风险 R3）。做之前用户提出想把 appi
 
 ## 测试
 
-- 仪器测试新增 `noticesCoverTheApp`：索引的每一行三栏、每个文件都在；appine 那一项有 AGPL 全文，Termux 那一项有"GPLv3 only"，Alpine 那一项里 busybox 是 GPL-2.0-only 并带 40 位的 aports 提交，Android 库里有 androidx.core，rusqlite 带 MIT 的许可文本，有 SQLite，没有 syn、thiserror-impl，GPL 2.0 的全文在。Pixel 4a（API 34）的模拟器上 17 个里 16 个通过，`downloadedDistributionsRun` 照例默认跳过。
-- 手动：设置页最后一行显示声明；开源许可页的列表、Alpine 和 appine 两项的全文（改字号之后 72 列不用横向滚动）；返回键从全文回到列表。
-- `scripts/fetch-rootfs`：下载到新目录通过；把脚本里的 sha256 改坏，提示签名有效、印出实际的摘要并失败；`PATH` 里没有 gpg 时提示跳过、照常完成；改了一个字节的 tarball 验签失败，原文件通过。
-- `appine-run --version`（开发容器里）印出声明；`appine-run` 的 clippy 干净；没有测试依赖原来的 `--version` 输出。
-- lint 没有新的警告（只剩原来那类 UseKtx）。内核层、引擎没有改，没有重跑 cargo test、差分测试和 LTP。
+- 仪器测试新增 `noticesCoverTheApp`：索引和文件都在，appine、Termux、Alpine、Android 库、Rust crate、SQLite 各项的关键内容都有，只有构建时用到的 crate 没有列进去。在 Pixel 4a（API 34）的模拟器上通过。
+- 手动看了设置页的声明、开源许可页的列表和全文、返回键。
+- `scripts/fetch-rootfs`：正常下载、摘要对不上、没有 gpg、tarball 改了一个字节几种情形都对。
+- `appine-run --version` 印出声明；没有测试依赖原来的 `--version` 输出。
 
 **推迟项**：
 

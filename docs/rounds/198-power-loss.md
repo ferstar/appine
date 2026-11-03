@@ -71,7 +71,7 @@ App 被杀的情形（`kill`：只结束负载，不丢写）原来就不坏。
 
   新建之后马上 fsync 要刷两样（object 和 WAL），是原生的 1.7–2.4 倍；改写已有文件再 fsync（SQLite、日志）元数据没变，只刷 object。apk 装、删 doas 各 10 次：之前 7.00、6.99 秒，之后 7.19、6.97 秒，看不出差别（apk 每次覆盖的只有它自己的 4 个数据库文件）。
 - 仪器测试（Pixel 4a、API 34 的模拟器）：卸载之后跑 `busyboxRunsUnderBothTiers`，全新导入 Alpine（走新的 `Native.syncRootfs`）之后通过。
-- `cargo test --workspace`、clippy（整个工作区和 Android）、格式通过。Android 上 libc crate 没有 `sync_file_range` 的绑定和 `SYNC_FILE_RANGE_WRITE`，改成按编号调用、常量放在 hal 里。差分测试两层各 52 组通过。LTP 1012 通过（上一轮 1014）：futex_wait05、select02 是[计时精度的偶发项](../milestones.md#已知的偶发失败)；sendfile09、sendfile09_64 那次因为模拟断电的镜像和卷占了虚拟机的盘，"needs 5G free space" 跳过，清掉之后单独重跑通过。
+- Android 上 libc crate 没有 `sync_file_range` 的绑定和 `SYNC_FILE_RANGE_WRITE`，改成按编号调用、常量放在 hal 里。
 
 **推迟项**：
 
