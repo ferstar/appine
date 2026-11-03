@@ -26,3 +26,5 @@ Registry of module IDs used by `.claude/maps/`, `.claude/decisions/` and `MODULE
 - `harness` — running and testing on the development host: `hosts/cli/` (`appine-run` and its integration tests), `tests/guest/`, `tests/bench/`, `tests/diff/`, `tests/survey/`, `tests/crash/`, `scripts/dev`, `scripts/dev.Dockerfile`, `scripts/difftest`, `scripts/build-ltp`, `scripts/ltp`, `scripts/survey`, `.github/workflows/`; the command-line front end, guest test programs, benchmarks, differential tests against a real kernel, LTP, the workload survey, the power-loss test, the development container and CI.
 
 ## Cross-cutting concerns
+
+- `knowledge-loop` — how changes are recorded and looked up: the Knowledge Loop Conventions in `CLAUDE.md`, `.claude/MODULES.md`, the use of `.claude/maps/` and `.claude/decisions/`, `docs/milestones.md` (measurement conditions, R1 measurements, known flaky tests) and the frozen `docs/rounds/`; what goes into commits, maps and decisions, and where deferred work is tracked.
