@@ -1,15 +1,21 @@
 /*
- * 进程结束（finish_group）的每一步分别兜住内核层的 bug（设计文档 §12 第 5 条）：第 n 步
- * 出错时只丢掉这一步做的事，后面的步骤照样做。bug 用 debug 构建的测试钩子模拟，appine-run
- * 要设置 APPINE_TEST_HOOKS=1 和 APPINE_ON_BUG=kill；要有控制终端，所以拷进仓库里运行。
+ * Each step of process finish (finish_group) catches kernel-layer bugs on its own (design doc §12
+ * item 5): when step n goes wrong, only what that step does is lost, and the later steps are done
+ * all the same. Bugs are simulated with the test hooks of debug builds; appine-run must set
+ * APPINE_TEST_HOOKS=1 and APPINE_ON_BUG=kill; a controlling terminal is needed, so run it copied
+ * into the store.
  *
- * 结束的进程 v 是会话组长、有控制终端，退出之前留下：
- *   - AIO 上下文（/proc/sys/fs/aio-nr）、用 SEM_UNDO 加过的 SysV 信号量；
- *   - 前台进程组里的子进程 a：登记了 PDEATHSIG（SIGUSR1），被 v 跟踪（SEIZE）；
- *   - 自己一个进程组、停住的子进程 s：v 退出之后它的进程组成了孤儿。
- * 都做了的话，v 结束之后 aio-nr 和信号量恢复，a 收到控制终端的 SIGHUP 和 PDEATHSIG、
- * 父进程是 1、不再被跟踪，s 收到 SIGHUP 之后继续运行，父进程照常回收 v。
- * 每一步出错时各检查一遍，最后打印 "all ok"。
+ * The finishing process v is a session leader with a controlling terminal, and before exiting it
+ * leaves behind:
+ *   - an AIO context (/proc/sys/fs/aio-nr) and a SysV semaphore adjusted with SEM_UNDO;
+ *   - a child a in the foreground process group: it registered a PDEATHSIG (SIGUSR1) and is
+ *     traced by v (SEIZE);
+ *   - a stopped child s in a process group of its own: after v exits, its process group is
+ *     orphaned.
+ * If everything is done, after v finishes, aio-nr and the semaphore are restored, a receives the
+ * controlling terminal's SIGHUP and the PDEATHSIG, has parent 1 and is no longer traced, s
+ * receives SIGHUP and then continues running, and the parent reaps v as usual.
+ * Each step going wrong is checked once, and at the end it prints "all ok".
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -25,20 +31,22 @@
 #include <unistd.h>
 
 #define TEST_SYSCALL 0xa991
-#define HOOK_PANIC_IN_FINISH 7 /* 这个进程结束时第 n 步 panic */
+#define HOOK_PANIC_IN_FINISH 7 /* step n panics when this process finishes */
 
 enum {
-    E_AIO = 1,      /* 第 1 步 */
-    E_REPARENT = 2, /* 第 2 步：子进程交给 init，PDEATHSIG、孤儿进程组也要用它的结果 */
-    E_DEATHSIG = 4, /* 第 3 步 */
-    E_SEM = 8,      /* 第 4 步 */
-    E_CTTY = 16,    /* 第 5 步；第 6 步报告给跟踪者，出错时直接交给父进程，什么也不丢 */
-    E_PARENT = 32,  /* 第 7 步 */
-    E_UNTRACE = 64, /* 第 8 步 */
-    E_ORPHAN = 128, /* 第 9 步 */
+    E_AIO = 1,      /* step 1 */
+    E_REPARENT = 2, /* step 2: children are handed to init, and PDEATHSIG and orphaned process
+                     * groups use its result too */
+    E_DEATHSIG = 4, /* step 3 */
+    E_SEM = 8,      /* step 4 */
+    E_CTTY = 16,    /* step 5; step 6 reports to the tracer, and on an error hands over to the
+                     * parent directly, losing nothing */
+    E_PARENT = 32,  /* step 7 */
+    E_UNTRACE = 64, /* step 8 */
+    E_ORPHAN = 128, /* step 9 */
 };
 #define STEPS 9
-/* 第 n 步出错时丢掉的，第 0 项是不出错 */
+/* What is lost when step n goes wrong; entry 0 is no error */
 static const int lost[STEPS + 1] = {
     0, E_AIO, E_REPARENT | E_DEATHSIG | E_ORPHAN, E_DEATHSIG, E_SEM, E_CTTY, 0, E_PARENT, E_UNTRACE, E_ORPHAN,
 };
@@ -92,7 +100,8 @@ static void read_line(int fd, char *buf, size_t size)
     buf[n] = 0;
 }
 
-/* v 的子进程：等测试程序在 go 上写一个字节（期间收到的信号由处理函数记下），再报告 */
+/* Child of v: waits for the test program to write a byte on go (the handler records the signals
+ * received meanwhile), then reports */
 static void child_report(int report, int go, char who)
 {
     char c, buf[64];
@@ -156,7 +165,7 @@ static void finish_with_bug(void)
         fail("semget", NULL);
     long aio_before = aio_nr();
     int l = lost[step];
-    alarm(10); /* 该做的没做、卡住时由 SIGALRM 结束测试 */
+    alarm(10); /* SIGALRM ends the test when something that should be done is not and it hangs */
     pid_t v = fork();
     if (v == 0)
         victim(master, ready, report[1], go[0], done[1], semid);
@@ -166,7 +175,7 @@ static void finish_with_bug(void)
     read_line(report[0], line, sizeof line);
     if (sscanf(line, "v %d %d", &a, &s) != 2)
         fail("setting up the process", line);
-    /* v 的 fd 表在进程结束的各步之后才释放 */
+    /* v's fd table is freed only after the steps of process finish */
     while (read(done[0], &c, 1) > 0)
         ;
     int status;
@@ -188,7 +197,8 @@ static void finish_with_bug(void)
         }
     }
     alarm(0);
-    /* 没有收拾好的留在那里：停住的 s、停在给已经退出的跟踪者的信号上的 a */
+    /* What was not cleaned up stays there: the stopped s, and a, stopped on a signal for the
+     * tracer that has already exited */
     kill(a, SIGKILL);
     kill(s, SIGKILL);
     semctl(semid, 0, IPC_RMID);

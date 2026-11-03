@@ -1,4 +1,5 @@
-# 全屏程序：在 tmux 里跑 htop、btop、fish、zsh、neovim（:terminal），截屏看画面
+# Full-screen programs: run htop, btop, fish, zsh and neovim (:terminal) in tmux and take
+# screenshots of the display
 export LANG=C.UTF-8
 T="tmux -S /tmp/tmux-tui"
 $T kill-server 2>/dev/null

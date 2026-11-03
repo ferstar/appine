@@ -1,14 +1,17 @@
 # docker-run-options: --cap-add SYS_ADMIN --security-opt apparmor=unconfined
-# mount、umount：procfs、sysfs、devpts、cgroup2 挂到别的目录上，bind 挂载它们里面的目录，
-# `..` 和 getcwd 经由挂载点，mountinfo 按进程的根目录列出，卸下、EBUSY 等错误。原生一侧是
-# 有 CAP_SYS_ADMIN 的 docker 容器，它的 /sys 是只读的、/proc/sys 另有只读的 bind，所以只在
-# 新挂的上面比较，不比超级块的选项（devpts 的新实例在 Linux 上默认 mode=600）
+# mount and umount: procfs, sysfs, devpts and cgroup2 mounted on other directories, bind mounts
+# of directories inside them, `..` and getcwd through mount points, mountinfo listed by the
+# process's root directory, unmounting, and errors like EBUSY. The native side is a docker
+# container with CAP_SYS_ADMIN whose /sys is read-only and whose /proc/sys has a separate
+# read-only bind, so only the new mounts are compared, and superblock options are not (a new
+# devpts instance defaults to mode=600 on Linux)
 cd /tmp
 rm -rf mnt
 mkdir -p mnt/proc mnt/sys mnt/pts mnt/b mnt/rb mnt/dir "mnt/sp ace"
 touch mnt/f
 
-# 挂在 /tmp/mnt 下的：编号换成出现的先后（挂在别处的写 -），不比设备号和超级块的选项
+# Mounts under /tmp/mnt: IDs replaced by order of appearance (a parent mounted elsewhere is
+# written as -); device numbers and superblock options are not compared
 show() {
     awk '$5 ~ /^\/tmp\/mnt/ {
         id[$1] = ++n
@@ -16,7 +19,7 @@ show() {
         print id[$1], ($2 in id) ? id[$2] : "-", $4, $5, $6, $(i + 1), $(i + 2)
     }' /proc/self/mountinfo
 }
-# 设备号与哪个挂载的相同（新的 procfs、devpts 实例有自己的）
+# Which mount's device number it shares (new procfs and devpts instances have their own)
 device() {
     d=$(stat -c %d "$1")
     for b in /proc /sys /sys/fs/cgroup /dev/pts /tmp/mnt/proc; do
@@ -31,7 +34,7 @@ device() {
 mount -t proc proc /tmp/mnt/proc && echo "proc $?"
 mount -t sysfs sysfs /tmp/mnt/sys -o nosuid,nodev && echo "sysfs $?"
 mount -t devpts devpts /tmp/mnt/pts -o noexec && echo "devpts $?"
-# 新挂的 sysfs 里 fs/cgroup 是空的，cgroup2 要另外挂（只读）
+# In a newly mounted sysfs fs/cgroup is empty, so cgroup2 has to be mounted separately (read-only)
 echo "fs/cgroup: $(ls /tmp/mnt/sys/fs/cgroup | wc -l) entries"
 mount -t cgroup2 -o ro cgroup /tmp/mnt/sys/fs/cgroup && echo "cgroup2 $?"
 grep -qx memory.max /dev/stdin <<EOF && echo "cgroup2 has memory.max"
@@ -47,13 +50,14 @@ echo "fs types: $(stat -f -c %t /tmp/mnt/proc /tmp/mnt/sys /tmp/mnt/pts /tmp/mnt
 echo "ptmx: $(ls /tmp/mnt/pts | grep -c ptmx)"
 head -c 5 /tmp/mnt/proc/version && echo
 
-# .. 和 getcwd 经由挂载点回到上一层
+# .. and getcwd go back up a level through mount points
 cd /tmp/mnt/proc/self && /bin/pwd -P | sed "s/$$/PID/" && cd ../.. && pwd -P
 cd /tmp/mnt/sys/fs/cgroup && cd .. && pwd -P && cd ../.. && pwd -P
 cd /tmp
 echo "proc/self/cwd: $(cd /tmp/mnt/sys/fs && readlink /proc/self/cwd)"
 
-# 同一个实例：sysfs、cgroup2 不能再挂在自己的挂载的根上，procfs、devpts 每次是新的实例
+# Same instance: sysfs and cgroup2 cannot be mounted again on the root of their own mount, while
+# procfs and devpts are a new instance each time
 mount -t sysfs sysfs /tmp/mnt/sys; echo "sysfs again $?"
 mount -t cgroup2 -o ro cgroup /tmp/mnt/sys/fs/cgroup; echo "cgroup2 again $?"
 mount -t proc proc /tmp/mnt/proc; echo "proc again $?"
@@ -62,7 +66,7 @@ umount /tmp/mnt/proc; echo "umount the top $?"
 mount -t appinefs nosuchsource /tmp/mnt/dir; echo "unknown type $?"
 mount -t proc proc /tmp/mnt/f; echo "on a file $?"
 
-# bind：procfs 里的目录、文件，--rbind 带上挂在里面的
+# bind: directories and files inside procfs, --rbind brings along the mounts inside
 mount --bind /tmp/mnt/proc/sys /tmp/mnt/b && echo "bind $?"
 ls /tmp/mnt/b | grep -x kernel
 mount --bind /tmp/mnt/proc/version /tmp/mnt/f && echo "bind a file $?"
@@ -74,7 +78,7 @@ device /tmp/mnt/b
 device /tmp/mnt/rb
 device /tmp/mnt/rb/fs/cgroup
 
-# 在用的挂载卸不下，挂载点删不掉、不能改名
+# A mount in use cannot be unmounted, and a mount point cannot be removed or renamed
 rmdir /tmp/mnt/b; echo "rmdir $?"
 mv /tmp/mnt/b /tmp/mnt/b2; echo "rename $?"
 rm /tmp/mnt/f; echo "unlink $?"
@@ -83,7 +87,7 @@ umount /tmp/mnt/rb; echo "with a mount inside $?"
 umount /tmp/mnt/rb/fs/cgroup /tmp/mnt/rb /tmp/mnt/b /tmp/mnt/f; echo "umount $?"
 umount /tmp/mnt/dir; echo "not a mount point $?"
 
-# 重新挂载成只读：写文件是 EROFS
+# Remount read-only: writing files is EROFS
 mount -o remount,ro /tmp/mnt/proc && echo "remount $?"
 show | head -n 1
 echo x 2>/dev/null >/tmp/mnt/proc/self/comm; echo "write $?"
@@ -109,7 +113,7 @@ def mount(source, target, fstype, flags=0, data=None):
 d = b"/tmp/mnt/py"
 os.mkdir(d)
 print("mount", mount(b"proc", d, b"proc"))
-# 挂载编号与 fdinfo 的 mnt_id 一致
+# Mount IDs match fdinfo's mnt_id
 fd = os.open(d + b"/self/status", os.O_RDONLY)
 with open("/proc/self/fdinfo/%d" % fd) as f:
     mnt = [l.split()[1] for l in f if l.startswith("mnt_id:")]
@@ -117,7 +121,7 @@ with open("/proc/self/mountinfo") as f:
     ids = [l.split()[0] for l in f if l.split()[4] == "/tmp/mnt/py"]
 print("mnt_id matches mountinfo", ids == mnt)
 os.close(fd)
-# statfs 的 f_flags 按挂载的标志（ST_VALID、ST_RELATIME、ST_RDONLY 等）
+# statfs's f_flags follow the mount flags (ST_VALID, ST_RELATIME, ST_RDONLY and so on)
 print("f_flag /", hex(os.statvfs("/").f_flag))
 print("f_flag proc", hex(os.statvfs(d).f_flag))
 print("f_flag noexec", hex(os.statvfs("/tmp/mnt/pts").f_flag))
@@ -130,14 +134,14 @@ with open("/proc/self/mountinfo") as f:
 print("remount,bind,strictatime", mount(None, d, None, 0x20 | 0x1000 | (1 << 24)))
 with open("/proc/self/mountinfo") as f:
     print("options", [l.split()[5] for l in f if l.split()[4] == "/tmp/mnt/py"])
-# 传播类型
+# Propagation types
 print("private", mount(None, d, None, 1 << 18))
 print("rprivate", mount(None, d, None, (1 << 18) | 0x4000))
 print("private and slave", mount(None, d, None, (1 << 18) | (1 << 19)))
 print("private with nosuid", mount(None, d, None, (1 << 18) | 2))
 print("private, not a mount point", mount(None, b"/tmp/mnt", None, 1 << 18))
 print("remount, not a mount point", mount(None, b"/tmp/mnt", None, 0x20))
-# 参数
+# Arguments
 print("no type", mount(b"x", d, None))
 print("MS_NOUSER", mount(b"proc", d, b"proc", 1 << 31))
 print("bad type pointer", mount(b"proc", d, 8))
@@ -145,8 +149,9 @@ print("bad data pointer", mount(b"proc", d, b"proc", 0, 8))
 print("missing target", mount(b"proc", b"/tmp/mnt/none", b"proc"))
 print("bind without source", mount(None, d, None, 0x1000))
 print("bind a missing source", mount(b"/tmp/mnt/none", d, None, 0x1000))
-# 经由 /proc/self/fd 到了已经删除的文件、管道上。挂在 /proc/self/fd/<n> 这一项本身上
-# （LTP 的 mount08）不比：Linux 6.12 起是 ENOENT，原生的虚拟机是 6.8
+# Through /proc/self/fd onto deleted files and pipes. Mounting on the /proc/self/fd/<n> entry
+# itself (LTP's mount08) is not compared: from Linux 6.12 on it is ENOENT, and the native VM runs
+# 6.8
 fd = os.open("/tmp/mnt/foo", os.O_RDONLY | os.O_CREAT)
 os.unlink("/tmp/mnt/foo")
 print("on a deleted file", mount(d + b"/version", ("/proc/self/fd/%d" % fd).encode(), None, 0x1000))
@@ -154,13 +159,13 @@ r, w = os.pipe()
 print("on a pipe", mount(d + b"/version", ("/proc/self/fd/%d" % r).encode(), None, 0x1000))
 for x in (fd, r, w):
     os.close(x)
-# MNT_EXPIRE：第一次只标记
+# MNT_EXPIRE: the first call only marks it
 print("expire", call(libc.umount2, d, 4))
 print("expire again", call(libc.umount2, d, 4))
 print("mount", mount(b"proc", d, b"proc"))
 print("unknown umount flag", call(libc.umount2, d, 16))
 print("expire and detach", call(libc.umount2, d, 6))
-# 没有 CAP_SYS_ADMIN
+# Without CAP_SYS_ADMIN
 sys.stdout.flush()
 pid = os.fork()
 if pid == 0:
@@ -169,8 +174,9 @@ if pid == 0:
     print("unprivileged umount", call(libc.umount2, d, 0), flush=True)
     os._exit(0)
 os.waitpid(pid, 0)
-# MNT_DETACH：当前目录在里面也卸得下，之后 getcwd 系统调用以 (unreachable) 开头（musl 当作
-# ENOENT），/proc/self/cwd 是从卸下的挂载的根算起的路径，文件照样能读
+# MNT_DETACH: it can be unmounted even with the current directory inside, after which the getcwd
+# system call starts with (unreachable) (musl treats it as ENOENT), /proc/self/cwd is the path
+# from the root of the unmounted mount, and files can still be read
 os.chdir(b"/tmp/mnt/py/self")
 print("busy", call(libc.umount2, d, 0))
 print("detach", call(libc.umount2, d, 2))
@@ -190,8 +196,9 @@ os.chdir("/")
 print("gone", call(libc.umount2, d, 0))
 PY
 
-# chroot 进去挂 procfs、devpts：mountinfo 只列根目录下面的，路径相对它；经由新挂的 devpts
-# 打开的终端，ttyname 找得到（/proc/self/fd 里的名字与 fstat 的设备号、inode 对得上）
+# chroot in and mount procfs and devpts: mountinfo lists only what is below the root directory,
+# with paths relative to it; ttyname finds a terminal opened through the newly mounted devpts
+# (the name in /proc/self/fd matches fstat's device number and inode)
 mkdir -p mnt/root/bin mnt/root/lib mnt/root/proc mnt/root/dev/pts
 cp /bin/busybox mnt/root/bin/
 cp /lib/ld-musl-aarch64.so.1 mnt/root/lib/
@@ -234,7 +241,8 @@ chroot /tmp/mnt/root /bin/busybox sh -c '
     /bin/busybox cut -d " " -f 1-3 /proc/self/mounts
     cd /proc/self && /bin/busybox pwd -P | /bin/busybox sed "s/[0-9][0-9]*/PID/" && cd ../.. && /bin/busybox pwd -P
     echo "root: $(/bin/busybox readlink /proc/self/root)"
-    # 根目录以外的：与 Linux 的 d_path 一样是从真正的根算起的路径，不加 (unreachable)
+    # Outside the root directory: as with d_path in Linux, the path counts from the real root,
+    # without (unreachable)
     echo "outside cwd: $(/bin/busybox readlink /proc/$PPID/cwd)"
     echo "outside root: $(/bin/busybox readlink /proc/$PPID/root)"
     echo "processes: $(/bin/busybox ps -o comm | /bin/busybox grep -c busybox)"
@@ -244,8 +252,9 @@ umount /tmp/mnt/root/proc /tmp/mnt/root/dev/pts /tmp/mnt/sys/fs/cgroup /tmp/mnt/
 echo "left: $(show | wc -l)"
 rm -rf /tmp/mnt
 
-# 删除别的挂载命名空间里的挂载点：只有自己命名空间里的挂载算 EBUSY（Linux 的
-# is_local_mountpoint），删掉之后别处挂在上面的卸下（detach_mounts）
+# Removing a mount point in another mount namespace: only mounts in one's own namespace count as
+# EBUSY (Linux's is_local_mountpoint), and after removal the mounts on it elsewhere are unmounted
+# (detach_mounts)
 mkdir -p /tmp/mp/d /tmp/mp/e
 mount -t tmpfs t /tmp/mp/e
 rmdir /tmp/mp/e 2>&1 | sed 's/^rmdir: //'
@@ -257,9 +266,10 @@ rmdir /tmp/mp/d && echo "rmdir a mount point of another namespace: ok"
 wait
 rm -rf /tmp/mp
 
-# 开机时的 /dev 是 tmpfs，devpts、/dev/shm 的 tmpfs、mqueue 挂在它里面（与容器运行时挂的
-# 一样，第 184 轮）。OpenRC 的 devfs 看到 /dev 已经挂着东西，只是照下面这样重新挂载：之后
-# 设备节点、终端都还在。不比挂载的标志（docker 的 /dev 是 strictatime）
+# At boot /dev is a tmpfs, with devpts, the tmpfs of /dev/shm and mqueue mounted inside it (as
+# container runtimes mount them, round 184). OpenRC's devfs sees something already mounted on
+# /dev and only remounts it as below: device nodes and terminals are still there afterwards. The
+# mount flags are not compared (docker's /dev is strictatime)
 awk '$5 ~ /^\/dev(\/|$)/ { for (i = 7; $i != "-"; i++) {}; print $5, $(i + 1) }' /proc/self/mountinfo | sort
 for d in /dev/pts /dev/shm /dev/mqueue; do
     parent=$(awk -v d=$d '$5 == d { print $2 }' /proc/self/mountinfo)

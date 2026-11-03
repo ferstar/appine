@@ -1,9 +1,11 @@
 /*
- * 每种会在内核里等待的系统调用都真正等一次（kernel/process 的 map）：有超时的用很短的超时，别的由
- * 另一个线程或者子进程稍后让它返回。调试构建的内核层在每次放开 BKL 时检查没有借着内核
- * 对象（crate::cell），cargo test 跑这个程序就把这些等待的路径都查一遍，不用碰上并发。
- * 在仓库里运行（要 /tmp）。每项通过时打印一行 "ok <名字>"，失败时打印原因并以 1 退出，
- * 全部通过时最后打印 "all ok"。
+ * Every kind of system call that can wait in the kernel really waits once (the kernel/process
+ * map): those with a timeout use a very short one, and for the others another thread or a child
+ * process makes them return a little later. The kernel layer of debug builds checks, every time
+ * the BKL is released, that no kernel object is borrowed (crate::cell), so cargo test running this
+ * program checks all these wait paths without having to hit concurrency. Run in the store (it
+ * needs /tmp). Each item that passes prints a line "ok <name>"; a failure prints the reason and
+ * exits with 1; when all pass it prints "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -54,7 +56,7 @@ static void ok(const char *name)
 
 static const struct timespec short_wait = {0, 5000000};
 
-/* 稍后在另一个线程里调用 f(arg)：主线程那时已经在等了 */
+/* Calls f(arg) a little later in another thread: by then the main thread is already waiting */
 struct later {
     pthread_t thread;
     void (*f)(long);
@@ -148,7 +150,7 @@ static void send_msg(long unused)
     msgsnd(msq, &m, sizeof m.text, 0);
 }
 
-/* seccomp 的通知 fd：在 NOTIF_RECV 里等，回答 42 */
+/* seccomp's notification fd: waits in NOTIF_RECV and answers 42 */
 #define SECCOMP_SET_MODE_FILTER 1
 #define FLAG_NEW_LISTENER 8
 #define RET_USER_NOTIF 0x7fc00000U
@@ -193,16 +195,18 @@ static void *answer(void *arg)
     return (void *)(long)(ioctl(listener, NOTIF_SEND, &r) != 0);
 }
 
-/* 租约的打破：子进程以写方式打开时，等父进程放弃读租约 */
+/* Lease breaking: when the child opens for writing, it waits for the parent to give up its read
+ * lease */
 static void lease_break(void)
 {
-    signal(SIGIO, SIG_IGN); /* 打破时通知持有者的信号 */
+    signal(SIGIO, SIG_IGN); /* the signal that notifies the holder of a break */
     int fd = open("/tmp/waits-lease", O_CREAT | O_RDONLY, 0644);
     CHECK(fd >= 0 && fcntl(fd, F_SETLEASE, F_RDLCK) == 0, "F_SETLEASE");
     pid_t pid = fork();
     if (pid == 0)
         _exit(open("/tmp/waits-lease", O_WRONLY) >= 0 ? 0 : 2);
-    /* 正在打破时 F_GETLEASE 报告要降成的类型：子进程已经在 open 里等了 */
+    /* While breaking, F_GETLEASE reports the type it is being lowered to: the child is already
+     * waiting in open */
     for (int i = 0; i < 5000 && fcntl(fd, F_GETLEASE) != F_UNLCK; i++)
         usleep(1000);
     CHECK(fcntl(fd, F_GETLEASE) == F_UNLCK, "the lease is not being broken");
@@ -215,8 +219,9 @@ static void lease_break(void)
     ok("lease break");
 }
 
-/* 文件位置锁（f_pos_lock）：两个线程同时从同一个打开文件各读 2 字节，读到的位置不重不漏。
- * 一个线程不持 BKL 地读宿主文件时，另一个的读等它做完；读这么多次总会碰上 */
+/* File position lock (f_pos_lock): two threads at once read 2 bytes each from the same open file,
+ * and the positions read neither repeat nor skip. While one thread reads a host file without the
+ * BKL, the other's read waits for it to finish; with this many reads they always meet */
 #define POS_SLOTS 4000
 static int pos_fd;
 static int pos_seen[POS_SLOTS];
@@ -251,7 +256,8 @@ static void file_position_lock(void)
     ok("file position lock");
 }
 
-/* AIO：管道上的 IOCB_CMD_POLL 由另一个线程写管道完成，io_getevents 不带超时一直等到它 */
+/* AIO: IOCB_CMD_POLL on a pipe is completed by another thread writing the pipe, and io_getevents
+ * without a timeout waits until then */
 struct iocb {
     uint64_t data;
     uint32_t key, rw_flags;
@@ -329,7 +335,7 @@ int main(void)
     struct later l;
     int p[2];
 
-    /* 只等超时的 */
+    /* Those that only wait for a timeout */
     int ep = epoll_create1(0);
     struct epoll_event ev;
     CHECK(epoll_wait(ep, &ev, 1, 5) == 0, "epoll_wait");
@@ -379,7 +385,7 @@ int main(void)
     CHECK(semtimedop(sem, &down, 1, &short_wait) < 0 && errno == EAGAIN, "semtimedop");
     semctl(sem, 0, IPC_RMID);
     ok("semtimedop timeout");
-    /* 可以写的共享文件映射里的 futex 走持锁的路径 */
+    /* A futex in a writable shared file mapping takes the path that holds the lock */
     int mfd = memfd_create("waits", 0);
     CHECK(mfd >= 0 && ftruncate(mfd, 4096) == 0, "memfd");
     int *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
@@ -388,7 +394,7 @@ int main(void)
               errno == ETIMEDOUT,
           "futex in a shared file mapping");
     ok("futex timeout");
-    /* netlink 没有回答可读时按 SO_RCVTIMEO 等 */
+    /* When no answer is readable, netlink waits for SO_RCVTIMEO */
     int nl = socket(AF_NETLINK, SOCK_RAW, 0 /* NETLINK_ROUTE */);
     struct timeval nl_wait = {0, 5000};
     CHECK(nl >= 0 && setsockopt(nl, SOL_SOCKET, SO_RCVTIMEO, &nl_wait, sizeof nl_wait) == 0,
@@ -397,7 +403,7 @@ int main(void)
     close(nl);
     ok("netlink recv timeout");
 
-    /* 等另一个线程 */
+    /* Wait for another thread */
     after(&l, write_byte, p[1]);
     CHECK(read(p[0], buf, sizeof buf) == 2, "pipe read");
     join(&l);
@@ -480,8 +486,8 @@ int main(void)
     CHECK(waitpid(child, &st, 0) == child && WEXITSTATUS(st) == 5, "waitpid");
     ok("waitpid");
     seccomp_listener();
-    /* syslog 的读：新开的 appine 里日志是空的，等到信号来（处理函数不带 SA_RESTART，
-     * EINTR）；再等到有人写 /dev/kmsg */
+    /* syslog reads: the log of a newly started appine is empty, so wait until a signal arrives
+     * (the handler has no SA_RESTART: EINTR); then wait until someone writes /dev/kmsg */
     struct sigaction sa = {.sa_handler = on_alrm};
     sigaction(SIGALRM, &sa, NULL);
     after(&l, send_alrm, 0);
@@ -491,7 +497,8 @@ int main(void)
     CHECK(syscall(SYS_syslog, 2, buf, (int)sizeof buf) > 0, "syslog read woken by a record");
     join(&l);
     ok("syslog read");
-    /* /proc/kmsg 与 syslog 的读共用位置：上面读走了，等下一条 */
+    /* /proc/kmsg shares its position with syslog reads: the reads above took everything, so wait
+     * for the next message */
     int pk = open("/proc/kmsg", O_RDONLY);
     CHECK(pk >= 0, "open /proc/kmsg");
     after(&l, write_kmsg, 0);
@@ -499,7 +506,7 @@ int main(void)
     join(&l);
     close(pk);
     ok("/proc/kmsg read");
-    /* /dev/kmsg：每个打开文件自己的位置，从末尾开始等 */
+    /* /dev/kmsg: each open file has its own position; wait starting from the end */
     int dk = open("/dev/kmsg", O_RDONLY);
     CHECK(dk >= 0 && lseek(dk, 0, SEEK_END) == 0, "open /dev/kmsg");
     after(&l, write_kmsg, 0);

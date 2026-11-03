@@ -1,9 +1,11 @@
 # docker-run-options: --privileged
-# cgroup 的设备过滤（eBPF 的 BPF_PROG_TYPE_CGROUP_DEVICE，docs/rounds/166-bpf-devices.md）：
-# runc、crun 给容器的 cgroup 挂上的就是它。加载、挂上、查询、按 ID 取、取信息、取下；打开设备
-# 节点和 mknod 按 cgroup 里的程序放行或者拒绝（EPERM），子 cgroup 继承；校验器拒绝的程序。
-# 原生一侧是特权容器（docker 给容器的根挂了自己的程序），只比在 t 下面的，有效的程序数只比
-# 比 t 多几个
+# cgroup device filtering (eBPF's BPF_PROG_TYPE_CGROUP_DEVICE, docs/rounds/166-bpf-devices.md):
+# it is what runc and crun attach to a container's cgroup. Loading, attaching, querying, getting by
+# ID, getting info, detaching; opening device nodes and mknod are allowed or refused (EPERM) by
+# the programs in the cgroup, and child cgroups inherit them; programs the verifier rejects. The
+# native side is a privileged container (docker attaches its own program to the container's
+# root), so only what is under t is compared, and for the effective program count only how many
+# more there are than for t
 cd /sys/fs/cgroup
 mkdir t t/d t/d/e
 cat > /tmp/bpfdev.c <<'C'
@@ -91,7 +93,7 @@ static void into(const char *name)
     close(fd);
 }
 
-// 在 cgroup t/<name> 里打开、mknod 设备
+// Open devices and mknod them in cgroup t/<name>
 static void devices(const char *name)
 {
     fflush(stdout);
@@ -124,12 +126,12 @@ static void devices(const char *name)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    // 字符设备 1:3 什么都行，1:5 不能写，别的都不行
+    // Character device 1:3 may do anything, 1:5 may not be written, nothing else is allowed
     struct insn prog[] = {
         I(0x61, 2, 1, 0, 0),    // r2 = *(u32 *)(r1 + 0)   access_type
         I(0xbc, 3, 2, 0, 0),    // w3 = w2
-        I(0x54, 3, 0, 0, 0xffff), // w3 &= 0xffff          设备类型
-        I(0x74, 2, 0, 0, 16),   // w2 >>= 16                访问
+        I(0x54, 3, 0, 0, 0xffff), // w3 &= 0xffff          device type
+        I(0x74, 2, 0, 0, 16),   // w2 >>= 16               access
         I(0x61, 4, 1, 4, 0),    // r4 = major
         I(0x61, 5, 1, 8, 0),    // r5 = minor
         I(0x55, 3, 0, 6, 2),    // if r3 != 2 goto deny
@@ -154,7 +156,7 @@ int main(void)
     printf("devices before attaching:\n");
     devices("d");
 
-    // 挂上：ALLOW_MULTI
+    // Attach: ALLOW_MULTI
     printf("attach multi: %s\n", err(attach(PROG_ATTACH, d, p1, ALLOW_MULTI, 0)));
     printf("attach the same again: %s\n", err(attach(PROG_ATTACH, d, p1, ALLOW_MULTI, 0)));
     printf("attach without multi on top: %s\n", err(attach(PROG_ATTACH, d, p2, 0, 0)));
@@ -178,7 +180,7 @@ int main(void)
     printf("devices in d/e:\n");
     devices("d/e");
 
-    // 按 ID 取、取信息
+    // Get by ID, get info
     unsigned char a[16] = {0};
     *(uint32_t *)a = id1;
     int byid = bpf(GET_FD_BY_ID, a, sizeof a);
@@ -194,7 +196,8 @@ int main(void)
     *(uint32_t *)(ia + 4) = sizeof info;
     *(uint64_t *)(ia + 8) = (uintptr_t)info;
     r = bpf(GET_INFO, ia, sizeof ia);
-    // tag 只比有没有：6.1、6.8 是程序的 SHA-1 的前 8 字节，新内核（CI 的）换了算法
+    // Only whether there is a tag is compared: on 6.1 and 6.8 it is the first 8 bytes of the
+    // program's SHA-1, while newer kernels (CI's) changed the algorithm
     int tagged = 0;
     for (int i = 0; i < 8; i++)
         tagged |= info[8 + i] != 0;
@@ -210,7 +213,7 @@ int main(void)
     readlink(path, link, sizeof link - 1);
     printf("fd link: %s\n", link);
 
-    // 替换、取下
+    // Replace, detach
     printf("replace p1 with p2: %s\n", err(attach(PROG_ATTACH, d, p2, ALLOW_MULTI | REPLACE, p1)));
     query(d, 0, 64, &flags, &total);
     printf("after replace cnt %u\n", total);
@@ -220,7 +223,7 @@ int main(void)
     query(d, 0, 64, &flags, &total);
     printf("after detach flags %u cnt %u\n", flags, total);
     printf("detach again: %s\n", err(attach(PROG_DETACH, d, p2, 0, 0)));
-    // 不带 multi 挂在 d 上：子 cgroup 就不能再挂；带 override 的可以
+    // Attached on d without multi: child cgroups can then no longer attach; with override they can
     printf("attach plain: %s\n", err(attach(PROG_ATTACH, d, p1, 0, 0)));
     printf("attach to the child: %s\n", err(attach(PROG_ATTACH, e, p2, ALLOW_MULTI, 0)));
     printf("attach plain again replaces: %s\n", err(attach(PROG_ATTACH, d, p2, 0, 0)));
@@ -236,7 +239,7 @@ int main(void)
     printf("devices after detaching:\n");
     devices("d/e");
 
-    // 校验器拒绝的
+    // Ones the verifier rejects
     struct { const char *what; struct insn p[4]; int n; } bad[] = {
         {"unknown opcode", {I(0xff, 0, 0, 0, 0), I(0x95, 0, 0, 0, 0)}, 2},
         {"no exit", {I(0xb7, 0, 0, 0, 1)}, 1},
@@ -271,7 +274,8 @@ int main(void)
     *(uint64_t *)(la + 8) = (uintptr_t)prog;
     *(uint64_t *)(la + 16) = (uintptr_t)"GPL";
     printf("unknown type: %s\n", err(bpf(PROG_LOAD, la, sizeof la)));
-    // 比内核的 bpf_attr 长的部分要是 0（6.1 和新内核的长度不同，只比远在后面的）
+    // The part longer than the kernel's bpf_attr must be 0 (6.1 and newer kernels have different
+    // lengths, so only a byte far beyond them is compared)
     unsigned char big[512] = {0};
     memcpy(big, la, sizeof la);
     *(uint32_t *)big = TYPE_CGROUP_DEVICE;

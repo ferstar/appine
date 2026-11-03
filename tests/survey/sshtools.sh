@@ -1,4 +1,4 @@
-# 经由 ssh 的工具：rsync、git（ssh 协议）、mosh（UDP，在 tmux 里开客户端）
+# Tools over ssh: rsync, git (ssh protocol), mosh (UDP, with the client opened in tmux)
 export LANG=C.UTF-8
 ssh-keygen -A >/dev/null
 mkdir -p /root/.ssh; chmod 700 /root/.ssh

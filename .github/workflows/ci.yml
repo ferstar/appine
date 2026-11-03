@@ -13,7 +13,7 @@ env:
 jobs:
   linux-arm64:
     name: Linux arm64
-    # 设计文档 §13.3：lockstep 以真实的 arm64 硬件作为标准答案
+    # Design doc §13.3: lockstep uses real arm64 hardware as the reference answer
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -29,8 +29,9 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
 
-      # llvm-mc 用来独立核对解释器的指令白名单（tests/lockstep/tests/whitelist.rs）；
-      # musl-gcc 用来编译链接 musl 的 guest 测试程序（tests/guest/*.c）
+      # llvm-mc independently checks the interpreter's instruction whitelist
+      # (tests/lockstep/tests/whitelist.rs); musl-gcc compiles the guest test programs linked with
+      # musl (tests/guest/*.c)
       - name: Install llvm and musl
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm musl-tools
 
@@ -42,7 +43,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # M1b 的端到端测试在 Alpine minirootfs 里运行 busybox；版本和 sha256 固定在脚本里
+      # M1b's end-to-end tests run busybox in the Alpine minirootfs; the version and sha256 are
+      # fixed in the script
       - uses: actions/cache@v6
         with:
           path: target/rootfs
@@ -57,8 +59,9 @@ jobs:
           APPINE_REQUIRE_MUSL: "1"
         run: cargo test --workspace
 
-      # M4 的退出标准：apk 从 Alpine 镜像安装 git、python3，git 经由 HTTPS 克隆仓库。
-      # 依赖外网，单独一步，失败时容易分清是网络还是内核的问题
+      # M4's exit criterion: apk installs git and python3 from an Alpine mirror, and git clones a
+      # repository over HTTPS. It depends on the internet, so it is a separate step, which makes it
+      # easy to tell a network problem from a kernel one when it fails
       - name: Network (apk add, git clone)
         env:
           APPINE_NETWORK_TESTS: "1"
@@ -67,18 +70,21 @@ jobs:
       - name: Lockstep (extended)
         run: cargo run --release -p appine-lockstep -- --iterations 200000
 
-      # M2 性能探针：在另一种 arm64 微架构上记录 Tier 1 的开销。
-      # 只检查三种运行方式的输出一致，不设耗时门槛
+      # M2 performance probe: records Tier 1's overhead on another arm64 microarchitecture.
+      # Only checks that the three ways of running give the same output, with no time threshold
       - name: Performance probe
         run: |
           cargo build --release -p appine-run -p appine-bench
           target/release/appine-bench --runs 3 --skip-tier0
 
-      # M7 的退出标准：同样的脚本在 appine（Tier 1）和 docker 里的原生 Alpine 上输出一致。
-      # 第一次运行时用 apk 安装用例需要的软件包，依赖外网。appine 把 guest 的 raw ICMP
-      # socket 换成宿主的 ping socket：Ubuntu 默认不让普通用户建（ping_group_range 是
-      # "1 0"），Android 和原生一侧的 Docker 容器都允许所有组。rust-cache 缓存整个 target/，
-      # 会恢复出上次运行留下的一部分仓库，所以每次重新创建，跑完再删掉，免得它又被存进缓存
+      # M7's exit criterion: the same scripts give the same output on appine (Tier 1) and on native
+      # Alpine in docker. The first run installs the packages the test cases need with apk, which
+      # depends on the internet. appine turns the guest's raw ICMP sockets into host ping sockets:
+      # Ubuntu does not let regular users create those by default (ping_group_range is "1 0"), while
+      # Android and the Docker container on the native side both allow all groups. rust-cache caches
+      # the whole target/ and would restore part of a store left by an earlier run, so the store is
+      # created afresh each time and deleted after the run, so that it is not saved into the cache
+      # again
       - name: Differential tests
         run: |
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
@@ -86,7 +92,8 @@ jobs:
           scripts/difftest
           rm -rf target/difftest
 
-      # Android NDK 用 clang 编译 C 引擎，这里提前暴露 clang 特有的警告
+      # The Android NDK compiles the C engine with clang, so clang-specific warnings show up here
+      # early
       - name: Engine and oracle with clang
         env:
           CC: clang
@@ -95,7 +102,8 @@ jobs:
 
   android:
     name: Android APK
-    # Google 只提供 x86_64 的 Linux 版 aapt2，所以在 x86_64 上交叉编译原生库
+    # Google provides aapt2 for Linux only on x86_64, so the native library is cross-compiled on
+    # x86_64
     runs-on: ubuntu-24.04
     env:
       NDK_VERSION: 29.0.14206865
@@ -112,7 +120,8 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      # 缓存 ~/.gradle 下的依赖和 Gradle 发行版：不缓存时每次都要下载，配置阶段约一分钟
+      # Cache the dependencies and Gradle distributions under ~/.gradle: without the cache every run
+      # downloads them, and the configuration phase takes about a minute
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -126,7 +135,8 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
-          # runner 预设的 ANDROID_NDK_ROOT 指向别的版本，两个都改，cargo-ndk 才不会警告
+          # The runner's preset ANDROID_NDK_ROOT points at another version; change both so cargo-ndk
+          # does not warn
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
@@ -143,7 +153,8 @@ jobs:
           CARGO_TARGET_DIR: target/android
         run: cargo ndk -t arm64-v8a --platform 29 clippy --release -p appine-android -p appine-kernel -- -D warnings
 
-      # 在模拟器上运行的 instrumentation 测试（app/src/androidTest）需要 KVM，在本地运行
+      # The instrumentation tests that run on an emulator (app/src/androidTest) need KVM, so they
+      # run locally
       - name: Build and lint
         working-directory: android
         run: ./gradlew assembleDebug lintDebug --console=plain

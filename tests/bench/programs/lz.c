@@ -1,9 +1,10 @@
 /*
- * 简单的 LZ77：用 4 字节哈希找匹配并贪心编码，再解码校验。访存和分支密集，
- * 用来代替 gzip（M1 之后再用真正的 busybox gzip 补测）。用法：lz [rounds]
+ * A simple LZ77: finds matches with a 4-byte hash and encodes greedily, then decodes to verify.
+ * Memory-access and branch heavy; stands in for gzip (after M1 the real busybox gzip is measured
+ * too). Usage: lz [rounds]
  *
- * 编码：token 最高位为 0 表示后面跟 (token + 1) 个字面字节；最高位为 1 表示
- * 匹配，长度 (token & 127) + 4，后跟 2 字节的回溯距离。
+ * Encoding: a token with the top bit 0 is followed by (token + 1) literal bytes; a top bit of 1
+ * means a match of length (token & 127) + 4, followed by a 2-byte backward distance.
  */
 #include "rt.h"
 

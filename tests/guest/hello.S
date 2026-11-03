@@ -1,4 +1,4 @@
-// M0 退出标准：手写的静态 aarch64 程序，只用 write + exit。
+// M0 exit criterion: a hand-written static aarch64 program that uses only write + exit.
     .section .rodata
 msg:
     .ascii  "Hello from appine!\n"

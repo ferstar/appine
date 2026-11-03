@@ -1,4 +1,4 @@
-/* SHA-256：32 位 ALU 密集，访存很少。用法：sha256 [rounds] */
+/* SHA-256: 32-bit ALU heavy, few memory accesses. Usage: sha256 [rounds] */
 #include "rt.h"
 
 static const uint32_t K[64] = {

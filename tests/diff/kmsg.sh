@@ -1,10 +1,12 @@
 # docker-run-options: --device /dev/kmsg --cap-add SYSLOG
-# 内核日志的 /dev/kmsg 和 syslog(2) 的读全部（Linux 6.1 的 kernel/printk/printk.c）。原生一侧
-# 把宿主的 /dev/kmsg 交给容器、加上 CAP_SYSLOG（与 appine 里的 root 一样）。宿主的日志里有
-# 别的消息，所以只看这次写的记录：每条都带着一个随机的记号，打印时换成 TOKEN；序号、时间戳
-# 两边不同，不打印。每次写都另开一个 fd：appine 默认的 printk_devkmsg 是 ratelimit，每个打开
-# 文件 5 秒内最多 10 条，原生的宿主可能是 on。缓冲区大小、dmesg_restrict 两边也可能不同，
-# 只比它们决定的结果是否一致
+# The kernel log's /dev/kmsg and syslog(2)'s read-all (kernel/printk/printk.c of Linux 6.1). The
+# native side passes the host's /dev/kmsg to the container and adds CAP_SYSLOG (like root in
+# appine). The host's log has other messages, so only the records written this time are looked
+# at: each carries a random token, replaced with TOKEN when printed; sequence numbers and
+# timestamps differ between the two sides and are not printed. Every write opens a new fd:
+# appine's default printk_devkmsg is ratelimit, at most 10 records per open file within 5
+# seconds, and the native host's may be on. The buffer size and dmesg_restrict may also differ
+# between the two sides, so only whether the results they determine agree is compared
 set -e
 cd /tmp
 cat > kmsg.c <<'C'
@@ -25,7 +27,7 @@ cat > kmsg.c <<'C'
 static char token[32];
 static int rd;
 
-/* 把 s 里的记号换成 TOKEN 打印 */
+/* Print s with the token in it replaced by TOKEN */
 static void put_masked(const char *s)
 {
     size_t n = strlen(token);
@@ -47,7 +49,7 @@ static void result(const char *what, long r)
         printf("%s: %ld\n", what, r);
 }
 
-/* 另开一个 fd 写一次 */
+/* Write once through a new fd */
 static long kw(const char *s, size_t len)
 {
     int fd = open("/dev/kmsg", O_WRONLY);
@@ -67,7 +69,7 @@ static void kws(const char *fmt)
     result("write", kw(buf, strlen(buf)));
 }
 
-/* 打印 rd 上读得到的、带着记号的记录：前缀、标志、正文 */
+/* Print the records readable on rd that carry the token: prefix, flags, text */
 static void records(const char *what)
 {
     char buf[8192];
@@ -138,7 +140,8 @@ int main(void)
     result("write with a NUL", kw(nul, len + 7));
     records("read");
 
-    /* 结尾没有换行的记录还没定稿，下一条来了才读得到 */
+    /* A record without a trailing newline is not finalized yet; it can be read only when the next
+     * one arrives */
     kws("%s open record");
     p.revents = 0;
     result("poll with only an open record", poll(&p, 1, 0));
@@ -146,7 +149,7 @@ int main(void)
     kws("%s closes it\n");
     records("after the next record");
 
-    /* 长度 0 的写也是一条（空的、没有换行的）记录 */
+    /* A zero-length write is a record too (an empty one without a newline) */
     char buf[8192];
     result("write nothing", kw("", 0));
     kws("%s after nothing\n");
@@ -161,7 +164,8 @@ int main(void)
         put_masked(strchr(buf, ';') + 1);
     }
 
-    /* 6.1 一次最多写 992 字节（6.2 起 1024），只比两边一样的 */
+    /* 6.1 writes at most 992 bytes at a time (1024 from 6.2 on); only what is the same on both
+     * sides is compared */
     char big[1100];
     memset(big, 'a', sizeof big);
     memcpy(big, token, strlen(token));
@@ -188,7 +192,7 @@ int main(void)
     close(w);
     records("writev");
 
-    /* 缓冲区放不下一条是 EINVAL，这条也算读过了 */
+    /* A buffer too small for a record is EINVAL, and that record also counts as read */
     kws("%s first\n");
     kws("%s second\n");
     result("read into 8 bytes", read(rd, buf, 8));
@@ -203,7 +207,7 @@ int main(void)
         result("pread", n);
     }
 
-    /* syslog(2) 的读全部：每行前面是 <前缀>[时间]，换掉时间 */
+    /* syslog(2)'s read-all: each line starts with <prefix>[time]; replace the time */
     long size = syscall(SYS_syslog, 10, NULL, 0);
     char *all = malloc(size + 1);
     long got = syscall(SYS_syslog, 3, all, size);
@@ -240,7 +244,8 @@ int main(void)
 }
 C
 gcc -O2 -Wall -o kmsg kmsg.c && ./kmsg
-# util-linux 的 dmesg 读 /dev/kmsg（Debian、Ubuntu 上的 dmesg 就是它），busybox 的用 syslog(2)
+# util-linux's dmesg reads /dev/kmsg (it is the dmesg on Debian and Ubuntu), busybox's uses
+# syslog(2)
 t=kmsgsh$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
 m() { grep "$t" | sed "s/$t/TOKEN/g; s/\[ *[0-9]*\.[0-9]*\]/[T]/"; }
 echo "<13>$t from the shell" > /dev/kmsg

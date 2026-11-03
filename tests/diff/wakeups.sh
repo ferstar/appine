@@ -1,10 +1,14 @@
-# 等待和唤醒：别的进程在别的管道、socket、eventfd、PTY 上来回读写，起进程（含 vfork、
-# posix_spawn）、结束进程，改别的 epoll、timerfd、inotify、signalfd，设定时器，建立、关闭
-# TCP 连接，查 netlink，加锁解锁、设租约、改管道大小，收发、开关消息队列，读写设了 O_ASYNC
-# 的管道，给自己发被屏蔽的信号、屏蔽着 SIGCHLD 起子进程时，空闲着等自己的对象的进程不被
-# 叫醒（自愿上下文切换的次数不变）；每一种对象上真正的事件都叫醒另一个进程里等着的线程，
-# vfork 的父进程、改短了的定时器、等锁和租约的进程、消息队列的通知、读空之后再来数据的
-# SIGIO、sigtimedwait 和 signalfd 等的被屏蔽的信号照常
+# Waiting and waking: while other processes read and write back and forth on other pipes,
+# sockets, eventfds and PTYs, start processes (including vfork and posix_spawn) and end them,
+# change other epolls, timerfds, inotify instances and signalfds, set timers, open and close TCP
+# connections, query netlink, lock and unlock, set leases, change pipe sizes, send and receive on
+# and open and close message queues, read and write pipes with O_ASYNC set, send themselves
+# blocked signals, or start children with SIGCHLD blocked, processes idly waiting on their own
+# objects are not woken (their voluntary context switch counts do not change); real events on
+# each kind of object wake the thread waiting in another process, and the vfork parent, shortened
+# timers, processes waiting for locks and leases, message queue notifications, SIGIO for data
+# that arrives after a read emptied the connection, and blocked signals waited for by
+# sigtimedwait and signalfd work as usual
 set -e
 rm -rf /tmp/wakeups.d /tmp/wakeups.idle /tmp/wakeups.lock /dev/shm/wakeups.lease
 mkdir -p /tmp/wakeups.d /tmp/wakeups.idle
@@ -44,7 +48,7 @@ cat > wakeups.c <<'C'
 #define SYS_pidfd_open 434
 #endif
 
-/* /proc/<pid>/status 的 voluntary_ctxt_switches：进程每睡下一次加一 */
+/* voluntary_ctxt_switches in /proc/<pid>/status: one more each time the process goes to sleep */
 static long switches(pid_t pid)
 {
     char path[64], line[128];
@@ -59,7 +63,7 @@ static long switches(pid_t pid)
     return n;
 }
 
-/* 打开一个 PTY，从设备设成 raw（不回显） */
+/* Open a PTY with the slave set to raw (no echo) */
 static void open_pty(int *master, int *slave)
 {
     *master = posix_openpt(O_RDWR | O_NOCTTY);
@@ -78,7 +82,7 @@ static void arm(int tfd, long ns)
     timerfd_settime(tfd, 0, &its, NULL);
 }
 
-/* 回环地址上监听一个系统分配的端口 */
+/* Listen on a system-assigned port on the loopback address */
 static int tcp_listener(struct sockaddr_in *a)
 {
     *a = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
@@ -90,7 +94,7 @@ static int tcp_listener(struct sockaddr_in *a)
     return l;
 }
 
-/* 一个 TCP 连接的两端 */
+/* Both ends of a TCP connection */
 static void tcp_pair(int *s, int *c)
 {
     struct sockaddr_in a;
@@ -101,8 +105,8 @@ static void tcp_pair(int *s, int *c)
     close(l);
 }
 
-/* netlink 查询所有网络接口（getifaddrs 的第一步）。镜像里没有 linux-headers：
- * linux/netlink.h、linux/rtnetlink.h 的定义 */
+/* Query all network interfaces over netlink (the first step of getifaddrs). The image has no
+ * linux-headers: definitions from linux/netlink.h and linux/rtnetlink.h */
 #define NETLINK_ROUTE 0
 #define RTM_GETLINK 18
 #define NLM_F_REQUEST 1
@@ -118,7 +122,7 @@ static void ask_links(int nl)
     send(nl, &req, sizeof req, 0);
 }
 
-/* ---- 空闲的等待者 ---- */
+/* ---- Idle waiters ---- */
 
 static const char *idle_kinds[] = {
     "epoll eventfd", "poll pipe",    "read unix stream", "poll unix dgram", "read pty",
@@ -126,7 +130,7 @@ static const char *idle_kinds[] = {
     "read mqueue",   "poll mqueue",
 };
 
-/* 一个只有自己知道的空消息队列（名字马上删掉） */
+/* An empty message queue only we know of (its name is removed at once) */
 static mqd_t own_queue(int flags)
 {
     char name[64];
@@ -138,7 +142,7 @@ static mqd_t own_queue(int flags)
 }
 #define NIDLE (int)(sizeof idle_kinds / sizeof idle_kinds[0])
 
-/* 子进程：建好自己的对象，告诉父进程，然后一直等它 */
+/* Child process: set up its own object, tell the parent, then wait on it forever */
 static void idle(int kind, int ready)
 {
     char buf[512];
@@ -222,7 +226,8 @@ static void idle(int kind, int ready)
     _exit(0);
 }
 
-/* 两个进程来回传 `size` 字节：本进程写 pw 读 pr，子进程读 cr 写 cw */
+/* Two processes pass `size` bytes back and forth: this process writes pw and reads pr, the child
+ * reads cr and writes cw */
 static void pingpong(int pw, int pr, int cr, int cw, size_t size, int rounds)
 {
     long v = 1;
@@ -241,7 +246,7 @@ static void pingpong(int pw, int pr, int cr, int cw, size_t size, int rounds)
     waitpid(p, NULL, 0);
 }
 
-/* 别的对象上的事件：都与空闲的进程无关 */
+/* Events on other objects: none of them concern the idle processes */
 static void traffic(void)
 {
     int a[2], b[2];
@@ -299,7 +304,7 @@ static void traffic(void)
     }
     close(in);
 
-    /* posix_spawn（musl、glibc 都用 CLONE_VFORK）和 vfork 之后直接退出 */
+    /* posix_spawn (musl and glibc both use CLONE_VFORK) and vfork followed by an immediate exit */
     char *args[] = {"/bin/true", NULL};
     for (int i = 0; i < 30; i++) {
         pid_t p;
@@ -310,7 +315,7 @@ static void traffic(void)
         waitpid(p, NULL, 0);
     }
 
-    /* 设定时器（都远在之后，最后取消） */
+    /* Set timers (all far in the future, cancelled at the end) */
     struct itimerval far = {.it_value = {3600, 0}}, off = {{0, 0}, {0, 0}};
     struct sigevent sev = {.sigev_notify = SIGEV_NONE};
     timer_t timer;
@@ -323,7 +328,7 @@ static void traffic(void)
     setitimer(ITIMER_REAL, &off, NULL);
     timer_delete(timer);
 
-    /* 改自己的 signalfd 的掩码 */
+    /* Change the mask of our own signalfd */
     sigset_t set;
     sigemptyset(&set);
     int sfd = signalfd(-1, &set, 0);
@@ -335,7 +340,7 @@ static void traffic(void)
     }
     close(sfd);
 
-    /* 建立、关闭 TCP 连接（宿主 socket），查 netlink */
+    /* Open and close TCP connections (host sockets), query netlink */
     struct sockaddr_in sa;
     int l = tcp_listener(&sa);
     for (int i = 0; i < 50; i++) {
@@ -351,7 +356,7 @@ static void traffic(void)
             freeifaddrs(ifa);
     }
 
-    /* flock、记录锁、OFD 锁的加锁和解锁，持着记录锁的进程退出 */
+    /* Lock and unlock flock, record and OFD locks; a process holding a record lock exits */
     int f = open("/tmp/wakeups.lock", O_RDWR | O_CREAT, 0644);
     struct flock fl = {.l_whence = SEEK_SET};
     for (int i = 0; i < 100; i++) {
@@ -378,7 +383,7 @@ static void traffic(void)
     }
     close(f);
 
-    /* 设、放弃租约，关闭设过租约的文件 */
+    /* Set and give up leases, close files that had leases */
     for (int i = 0; i < 20; i++) {
         int lf = open("/dev/shm/wakeups.lease", O_RDONLY | O_CREAT, 0644);
         fcntl(lf, F_SETLEASE, F_RDLCK);
@@ -387,13 +392,13 @@ static void traffic(void)
         close(lf);
     }
 
-    /* 改管道的大小 */
+    /* Change the pipe size */
     pipe(a);
     for (int i = 0; i < 50; i++)
         fcntl(a[1], F_SETPIPE_SZ, i % 2 ? 65536 : 131072);
     close(a[0]), close(a[1]);
 
-    /* 收发、开关别的消息队列 */
+    /* Send and receive on, open and close other message queues */
     mqd_t q = own_queue(O_NONBLOCK);
     for (int i = 0; i < 200; i++) {
         char m[16] = "m";
@@ -406,7 +411,7 @@ static void traffic(void)
         mq_close(mq_open("/wakeups.traffic", O_RDWR | O_CREAT, 0600, &ma));
     mq_unlink("/wakeups.traffic");
 
-    /* 读写设了 O_ASYNC 的管道（信号驱动的 I/O） */
+    /* Read and write a pipe with O_ASYNC set (signal-driven I/O) */
     signal(SIGIO, SIG_IGN);
     pipe(a);
     fcntl(a[0], F_SETOWN, getpid());
@@ -418,7 +423,8 @@ static void traffic(void)
     close(a[0]), close(a[1]);
     signal(SIGIO, SIG_DFL);
 
-    /* 给自己发被屏蔽的信号再取走；屏蔽着 SIGCHLD 起子进程（被所有线程屏蔽的信号） */
+    /* Send ourselves a blocked signal and take it; start a child with SIGCHLD blocked (a signal
+     * blocked by all threads) */
     sigset_t blk, u1;
     sigemptyset(&blk);
     sigaddset(&blk, SIGUSR1);
@@ -446,7 +452,7 @@ static void idle_waiters(void)
     pid_t pids[NIDLE];
     for (int i = 0; i < NIDLE; i++)
         if ((pids[i] = fork()) == 0) {
-            prctl(PR_SET_PDEATHSIG, SIGKILL); /* 卡住被结束时不留下它们 */
+            prctl(PR_SET_PDEATHSIG, SIGKILL); /* none left behind if killed while stuck */
             idle(i, ready[1]);
         }
     char c;
@@ -467,7 +473,7 @@ static void idle_waiters(void)
     close(ready[0]), close(ready[1]);
 }
 
-/* ---- 真正的事件叫醒等着的进程 ---- */
+/* ---- Real events wake the waiting processes ---- */
 
 static int fds[2], lsock, ep, efd, tfd, ifd, master, slave, pidfd;
 static pid_t sleeper;
@@ -483,11 +489,12 @@ static double now(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-static pid_t last_child; /* check 的 poke 要发信号给它 */
+static pid_t last_child; /* check's poke sends it a signal */
 
-/* 子进程执行 waiter（返回非 0 表示等到了；最多 3 秒，到时 SIGALRM 打断阻塞的调用），
- * 100 毫秒之后本进程执行 poke。2 秒之内等到才算被叫醒：没被叫醒的线程被 SIGALRM 叫醒
- * 之后也会看到条件早已成立 */
+/* The child runs waiter (nonzero means the wait succeeded; at most 3 seconds, after which SIGALRM
+ * interrupts the blocking call), and 100 ms later this process runs poke. It counts as woken only
+ * if the wait succeeds within 2 seconds: a thread that was not woken also finds, once SIGALRM
+ * wakes it, that the condition has long been true */
 static void check(const char *name, int (*waiter)(void), void (*poke)(void))
 {
     double start = now();
@@ -592,8 +599,8 @@ static void kill_sleeper(void)
 static void closefds(void) { close(fds[0]), close(fds[1]); }
 static void nothing(void) {}
 
-/* vfork：子进程 exec 或者过一会儿退出之后父进程继续。卡住时 SIGALRM 结束这个进程（vfork
- * 的等待只有致命信号能打断） */
+/* vfork: the parent continues after the child execs or exits a while later. If stuck, SIGALRM
+ * ends this process (only fatal signals can interrupt the vfork wait) */
 static int vfork_exec(void)
 {
     signal(SIGALRM, SIG_DFL);
@@ -617,7 +624,8 @@ static int vfork_exit_later(void)
     return waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 7;
 }
 
-/* 定时器先设 10 秒、再改成 100 毫秒：定时器线程要按新的时刻醒来 */
+/* Set a timer to 10 seconds first, then change it to 100 milliseconds: the timer thread must wake
+ * at the new time */
 static volatile int fired;
 static void on_fire(int sig) { (void)sig, fired = 1; }
 static int itimer_shortened(void)
@@ -648,7 +656,8 @@ static int posix_timer_shortened(void)
     return 1;
 }
 
-/* 一个线程 poll 掩码是空的 signalfd（进程挂着 SIGUSR2），另一个线程改掩码 */
+/* One thread polls a signalfd whose mask is empty (the process has SIGUSR2 pending), another
+ * thread changes the mask */
 static int sfd;
 static void *poll_sfd(void *arg)
 {
@@ -661,7 +670,7 @@ static int signalfd_mask(void)
     sigemptyset(&set);
     sigaddset(&set, SIGUSR2);
     sigprocmask(SIG_BLOCK, &set, NULL);
-    kill(getpid(), SIGUSR2); /* 发给进程：两个线程都看得到 */
+    kill(getpid(), SIGUSR2); /* sent to the process: both threads can see it */
     sigset_t none;
     sigemptyset(&none);
     sfd = signalfd(-1, &none, 0);
@@ -674,8 +683,9 @@ static int signalfd_mask(void)
     return r != NULL;
 }
 
-/* ---- 锁和租约：放开的一方叫醒等着的进程（等的进程先关掉继承来的 fd，它与本进程共用
- * 打开文件，否则 flock、OFD 锁、租约不会随本进程关闭而放开） ---- */
+/* ---- Locks and leases: the releasing side wakes the waiting process (the waiting process first
+ * closes the inherited fd, which shares the open file with this process; otherwise flock, OFD
+ * locks and leases would not be released when this process closes it) ---- */
 static int lockfd, leasefd;
 static pid_t holder;
 static struct flock wrlck = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
@@ -710,11 +720,12 @@ static int open_leased(void)
 }
 static void unlease(void) { fcntl(leasefd, F_SETLEASE, F_UNLCK); }
 
-/* ---- 宿主 socket ---- */
+/* ---- Host sockets ---- */
 static int tcp_s, tcp_c, tcp_ep, tcp_ev, nl;
 
-/* 一个线程 epoll 等着 tcp_s 时另一个线程把它关掉：对端读到 EOF（epoll 不持有文件，关闭
- * 之后连接就断开了）。等着的线程要被叫醒，放开它在宿主上等着的 socket */
+/* While one thread waits on tcp_s in epoll, another thread closes it: the peer reads EOF (epoll
+ * does not hold the file, so the connection is gone once it is closed). The waiting thread must
+ * be woken and release the socket it waits on in the host */
 static void *epoll_tcp(void *arg)
 {
     (void)arg;
@@ -742,7 +753,7 @@ static int poll_nl(void) { return pollin(nl); }
 static int read_nl(void) { return recv(nl, big, sizeof big, 0) > 0; }
 static void ask_nl(void) { ask_links(nl); }
 
-/* 写满的管道：改大之后写得进去 */
+/* A full pipe: writes go in after it is enlarged */
 static int write_full(void)
 {
     fcntl(fds[1], F_SETFL, 0);
@@ -750,7 +761,7 @@ static int write_full(void)
 }
 static void grow_pipe(void) { fcntl(fds[1], F_SETPIPE_SZ, 1 << 20); }
 
-/* ---- 消息队列 ---- */
+/* ---- Message queues ---- */
 static mqd_t mq;
 static int notified[2];
 static int mq_recv1(void)
@@ -766,7 +777,7 @@ static void mq_poke_recv(void)
     mq_receive(mq, m, sizeof m, NULL);
 }
 static int poll_mq(void) { return pollin(mq); }
-/* SIGEV_THREAD：musl 用一个 netlink socket 和一个阻塞在 recv 里的线程实现 */
+/* SIGEV_THREAD: musl implements it with a netlink socket and a thread blocked in recv */
 static void on_notify(union sigval v)
 {
     (void)v;
@@ -781,7 +792,7 @@ static int mq_notify_thread(void)
     return read(notified[0], &c, 1) == 1;
 }
 
-/* ---- 信号驱动的 I/O：TCP 连接读空之后，再来的数据也发 SIGIO ---- */
+/* ---- Signal-driven I/O: after a TCP connection is read empty, more data also sends SIGIO ---- */
 static volatile int sigios;
 static void on_sigio(int sig) { (void)sig, sigios++; }
 static int sigio_again(void)
@@ -809,7 +820,7 @@ static void write_s_twice(void)
     write(tcp_s, "b", 1);
 }
 
-/* ---- 被屏蔽的信号：sigtimedwait、signalfd 等着它 ---- */
+/* ---- Blocked signals: sigtimedwait and signalfd waiting for them ---- */
 static sigset_t usr12;
 static void block_usr12(void)
 {
@@ -889,8 +900,9 @@ static int nested_sfd_usr1(void)
     epoll_ctl(out, EPOLL_CTL_ADD, in, &ev);
     return epoll_wait(out, &ev, 1, 3000) == 1;
 }
-/* 外层以边沿触发关注内层：SIGUSR1 已经挂着（报告过一次），过一会儿另一个线程发来
- * SIGUSR2（两个线程都屏蔽着），要再报告一次 */
+/* The outer one watches the inner one edge-triggered: SIGUSR1 is already pending (reported
+ * once), and a while later another thread sends SIGUSR2 (both threads block it), which must be
+ * reported again */
 static void *kill_self_usr2(void *arg)
 {
     (void)arg;
@@ -943,7 +955,7 @@ static void wake_cases(void)
     bind(lsock, (void *)&addr, sizeof addr);
     listen(lsock, 0);
     check("accept unix", accept_one_w, connect_one);
-    connect_new(); /* backlog 0：再来一个连接就要等 accept */
+    connect_new(); /* backlog 0: one more connection has to wait for accept */
     check("connect unix (backlog)", connect_new, accept_one);
     close(lsock);
 
@@ -1022,7 +1034,7 @@ static void wake_cases(void)
     fcntl(lockfd, F_OFD_SETLK, &wrlck);
     check("ofd lock (close)", ofd_setlkw, close_lock);
 
-    signal(SIGIO, SIG_IGN); /* 租约被打破时发给持有者 */
+    signal(SIGIO, SIG_IGN); /* sent to the holder when the lease is broken */
     leasefd = open("/dev/shm/wakeups.lease", O_RDONLY | O_CREAT, 0644);
     fcntl(leasefd, F_SETLEASE, F_RDLCK);
     check("open (lease released)", open_leased, unlease);
@@ -1066,7 +1078,7 @@ static void wake_cases(void)
     mq_unlink("/wakeups.mq");
     check("mq_receive", mq_recv1, mq_poke_send);
     check("poll mqueue", poll_mq, mq_poke_send);
-    mq_poke_send(); /* 满了：再发要等 */
+    mq_poke_send(); /* full: another send has to wait */
     check("mq_send (full)", mq_send1, mq_poke_recv);
     mq_poke_recv(), mq_poke_recv();
     pipe(notified);
@@ -1078,7 +1090,7 @@ static void wake_cases(void)
     check("SIGIO tcp (again after drain)", sigio_again, write_s_twice);
     close(tcp_s), close(tcp_c);
 
-    block_usr12(); /* 子进程继承：父进程发来的信号不会在它屏蔽之前到达 */
+    block_usr12(); /* inherited: the parent's signals cannot arrive before the child blocks them */
     check("sigtimedwait (kill)", sigwait_usr1, kill_usr1);
     check("sigtimedwait (pthread_kill)", sigwait_thread, nothing);
     check("sigtimedwait (timer)", sigwait_timer, nothing);
@@ -1092,7 +1104,7 @@ static void wake_cases(void)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    alarm(120); /* 漏了唤醒、卡住时结束，不让差分测试一直等 */
+    alarm(120); /* end if a missed wakeup hangs it, so the differential test never waits forever */
     idle_waiters();
     wake_cases();
     return 0;

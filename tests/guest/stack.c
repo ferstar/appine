@@ -1,6 +1,7 @@
 /*
- * 主线程栈按需向下增长，大小受 RLIMIT_STACK 的当前值限制（kernel/mm 的 map）。内核访问
- * 还没长出来的栈（syscall 的缓冲区、信号帧）时也要让它长出来，与 Linux 相同。
+ * The main thread's stack grows downwards on demand, its size limited by the current value of
+ * RLIMIT_STACK (the kernel/mm map). When the kernel accesses stack that has not grown yet (syscall
+ * buffers, signal frames) it must grow it too, as on Linux.
  */
 #include <errno.h>
 #include <signal.h>
@@ -20,7 +21,7 @@ static void fail(const char *what)
     exit(1);
 }
 
-/* 每层占 1 KB 栈，一共用掉大约 bytes 字节 */
+/* Each level takes 1 KB of stack, using about `bytes` bytes in all */
 __attribute__((noinline)) static int recurse(long bytes)
 {
     volatile char buf[1024];
@@ -31,8 +32,8 @@ __attribute__((noinline)) static int recurse(long bytes)
 }
 
 /*
- * 把 SP 往下挪 off 字节（不碰那些页），在那里执行 read(fd, sp, len)，*at 是读到的
- * 位置。返回 read 的结果（失败时是 -errno）。
+ * Moves SP down by off bytes (without touching those pages) and runs read(fd, sp, len) there; *at
+ * is where it read to. Returns the result of read (-errno on failure).
  */
 static long read_below_sp(long off, int fd, long len, char **at)
 {
@@ -54,7 +55,8 @@ static long read_below_sp(long off, int fd, long len, char **at)
     return x0;
 }
 
-/* 把 SP 往下挪 off 字节（不碰那些页），在那里给自己发信号 sig：信号帧落在那下面 */
+/* Moves SP down by off bytes (without touching those pages) and sends itself signal sig there: the
+ * signal frame lands below that */
 static long kill_below_sp(long off, int sig)
 {
     register long x0 __asm__("x0") = getpid();
@@ -75,14 +77,14 @@ static volatile sig_atomic_t handled;
 
 static void on_usr1(int sig)
 {
-    /* 处理函数自己也在那里用栈 */
+    /* The handler itself uses stack there too */
     volatile char buf[8192];
     buf[0] = (char)sig;
     buf[sizeof buf - 1] = 1;
     handled = buf[0] == SIGUSR1 && buf[sizeof buf - 1] == 1;
 }
 
-/* 在子进程里调用 f，返回它的结束状态 */
+/* Calls f in a child process and returns its exit status */
 static int in_child(int (*f)(long), long arg)
 {
     pid_t pid = fork();
@@ -101,7 +103,8 @@ static int deep(long bytes)
     return recurse(bytes) > 0 ? 0 : 1;
 }
 
-/* 先把 RLIMIT_STACK 的软限制改成 arg 的低 32 位（MB），再递归高 32 位（MB） */
+/* First sets RLIMIT_STACK's soft limit to the low 32 bits of arg (MB), then recurses the high 32
+ * bits (MB) */
 static int deep_with_limit(long arg)
 {
     struct rlimit rl;
@@ -139,7 +142,8 @@ int main(void)
     if (getrlimit(RLIMIT_STACK, &rl) != 0 || rl.rlim_cur != 8 * MB)
         fail("default RLIMIT_STACK");
 
-    /* 内核写进栈底下面、SP 上面的缓冲区：栈先长出来，与 Linux 一样不是 EFAULT */
+    /* The kernel writes into a buffer below the stack bottom and above SP: the stack grows first,
+     * not EFAULT, as on Linux */
     int p[2];
     if (pipe(p) != 0 || write(p[1], "kernelok", 8) != 8)
         fail("pipe");
@@ -151,7 +155,7 @@ int main(void)
     }
     printf("read below the stack ok\n");
 
-    /* 信号帧落在栈底下面 */
+    /* The signal frame lands below the stack bottom */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_usr1;
@@ -161,7 +165,7 @@ int main(void)
         fail("signal frame below the stack");
     printf("signal frame below the stack ok\n");
 
-    /* 超出上限的地方：EFAULT */
+    /* Beyond the limit: EFAULT */
     if (write(p[1], "kernelok", 8) != 8)
         fail("pipe");
     n = read_below_sp(16 * MB, p[0], 8, &at);
@@ -171,13 +175,13 @@ int main(void)
     }
     printf("read past the limit is EFAULT\n");
 
-    /* 缺页时增长：默认上限 8 MB 以内可以，超出时 SIGSEGV */
+    /* Growth on a page fault: fine within the default 8 MB limit, SIGSEGV beyond it */
     if (deep(4 * MB) != 0)
         fail("4 MB of stack");
     expect_segv(in_child(deep, 16 * MB), "16 MB of stack under the default limit");
     printf("default limit ok\n");
 
-    /* 运行中调高上限立即生效，调低也一样 */
+    /* Raising the limit while running takes effect at once, and so does lowering it */
     expect_exit(in_child(deep_with_limit, sized(64, 32)), "32 MB of stack under 64 MB");
     expect_segv(in_child(deep_with_limit, sized(16, 24)), "24 MB of stack under 16 MB");
     printf("setrlimit ok\n");

@@ -1,26 +1,30 @@
-# podman 的 bridge 网络（docs/rounds/169-container-network-survey.md）：先后在 netavark 的
-# firewall_driver = "none" 和 "nftables" 下（podman 默认把宿主的代理环境变量带进容器，容器里的
-# wget 都加 -Y off），看默认网络和自定义网络里容器的地址和路由、
-# 访问外面、容器之间按 IP 互访、-p 端口发布、按容器名解析（aardvark-dns），以及 netavark 用到
-# 的 netlink、sysctl、nftables 规则。仓库与 podman.sh 的共用：
+# podman's bridge networks (docs/rounds/169-container-network-survey.md): under netavark's
+# firewall_driver = "none" and then "nftables" (podman passes the host's proxy environment variables
+# into containers by default, so wget in containers always gets -Y off), looks at containers'
+# addresses and routes in the default network and in a custom network, reaching the outside,
+# containers reaching each other by IP, -p port publishing, resolving by container name
+# (aardvark-dns), and the netlink, sysctl and nftables rules netavark uses. The store is shared with
+# podman.sh:
 #   scripts/survey -s target/survey/podman podman-bridge
-# 原生对照：SURVEY_DOCKER_OPTS=--privileged scripts/survey -n appine-podman-native podman-bridge
+# Native comparison:
+# SURVEY_DOCKER_OPTS=--privileged scripts/survey -n appine-podman-native podman-bridge
 exec 2>&1
 command -v strace >/dev/null || apk add -q strace
 command -v nft >/dev/null || apk add -q nftables
 command -v iptables >/dev/null || apk add -q iptables
 step() { echo; echo "== $*"; }
 tidy() { sed -E 's/[0-9a-f]{12,64}/ID/g; s/veth[0-9a-f]+/vethX/g; s/podman[0-9]+/podmanN/g'; }
-# 服务端是 nc -l 的循环（Alpine 的 busybox 没有 httpd）
+# The server is a loop of nc -l (Alpine's busybox has no httpd)
 serve() { echo "while true; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\n$1\\n\" | nc -l -p 80; done"; }
-# podman 起的 netavark 等子进程一起跟踪，记到 /tmp/pm.st。后台运行的容器（run -d）不跟踪：
-# strace -f 跟着容器里的进程，podman 就一直不返回；netavark 的调用在前台的 run、network create
-# 里看得到
+# Trace the child processes podman starts, such as netavark, too, into /tmp/pm.st. Containers run in
+# the background (run -d) are not traced: strace -f follows the processes in the container and
+# podman never returns; netavark's calls show up in the foreground run and network create
 pm() { strace -f -qq -a 1 -o /tmp/pm.one -e trace=execve,socket,sendto,sendmsg,openat -s 300 podman "$@"; r=$?; cat /tmp/pm.one >> /tmp/pm.st; return $r; }
 
 config() {
     mkdir -p /etc/containers
-    # 只看网络：两边都不用 cgroup（原生嵌套时开不了控制器）
+    # Only the network matters: neither side uses cgroups (natively, controllers cannot be enabled
+    # when nested)
     printf '[containers]\ncgroups = "disabled"\n[network]\n%s\n' "$1" > /etc/containers/containers.conf
     sed -i 's/^driver = .*/driver = "vfs"/' /etc/containers/storage.conf 2>/dev/null
     : > /tmp/pm.st
@@ -92,7 +96,7 @@ config 'firewall_driver = "none"'
 probe "firewall none"
 report "firewall none"
 
-# 默认的驱动是 iptables（装了 iptables 时），也试 nftables
+# The default driver is iptables (when iptables is installed); try nftables too
 config 'firewall_driver = "nftables"'
 probe "firewall nftables"
 report "firewall nftables"

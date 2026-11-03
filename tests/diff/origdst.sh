@@ -1,21 +1,28 @@
 # docker-run-options: --privileged
-# 透明代理要的几样（docs/rounds/180-original-dst.md）：
-# - SO_ORIGINAL_DST、IP6T_SO_ORIGINAL_DST：每种情形在新的网络命名空间里（lo 起来）建规则、
-#   连接，看接受的一端、发起的一端、监听的 socket 回答什么（optlen、地址、错误码）。没有
-#   规则、只有空的 nat 链（不开连接跟踪）、只有 ct 的 filter 规则（开）、nft 的 redirect 和
-#   dnat、iptables 的 REDIRECT、ip6 和 inet 的表，双栈的监听，IPv4 映射的地址，客户端在
-#   accept 之前就关掉了；
-# - 跨命名空间：开机时的命名空间里一个 bridge，A、B 两个"容器"，B 的 PREROUTING 做
-#   REDIRECT、A 的 OUTPUT 做 DNAT、外层的 PREROUTING 对从 bridge 来的做 REDIRECT；A 的 socket
-#   带着 SO_MARK 经由 veth 进入 B 时标记清掉；A 连外网的地址也经过外层的 PREROUTING：被
-#   REDIRECT 到外层的代理（只认本机地址的 `fib daddr type local` 规则不算）、DNAT 到 B（外层的
-#   FORWARD 拒绝的连不上）、UDP 的 53 端口劫持到外层（回答来自原来的目的地）；外层绑通配
-#   地址的 UDP 服务端回答 A 时，来源是外层面向 A 的地址；
-# - SO_MARK：读写、长度、没有权限、UDP、accept 出来的沿用监听的；
-# - iptables 的 owner、mark 匹配在 nat 和 filter 的 OUTPUT 上，nft 的 meta skuid、meta mark；
-# - 一个 Python 写的透明代理：问 SO_ORIGINAL_DST，带着 SO_MARK 连原来的目的地（规则放过有
-#   标记的），转一次请求。
-# 原生一侧是特权容器，规则真的在内核里执行。各个角色的 Python 都先 import 同一组模块。
+# What transparent proxies need (docs/rounds/180-original-dst.md):
+# - SO_ORIGINAL_DST, IP6T_SO_ORIGINAL_DST: each case sets up rules and connects in a new network
+#   namespace (with lo up), and looks at what the accepting end, the connecting end and the
+#   listening socket answer (optlen, address, error code). No rules, only an empty nat chain (no
+#   connection tracking), only a ct filter rule (tracking on), nft's redirect and dnat,
+#   iptables' REDIRECT, ip6 and inet tables, a dual-stack listener, IPv4-mapped addresses, a
+#   client that closes before accept;
+# - across namespaces: a bridge in the boot-time namespace and two "containers" A and B; B's
+#   PREROUTING does REDIRECT, A's OUTPUT does DNAT, and the outer PREROUTING does REDIRECT for
+#   what comes from the bridge; the mark of A's socket with SO_MARK is cleared on entering B
+#   through the veth; A connecting to an external address also goes through the outer
+#   PREROUTING: REDIRECTed to the outer proxy (`fib daddr type local` rules, which only match
+#   local addresses, do not count), DNATed to B (no connection when the outer FORWARD rejects
+#   it), UDP port 53 hijacked to the outer namespace (replies come from the original
+#   destination); when a UDP server in the outer namespace bound to the wildcard address replies
+#   to A, the source is the outer address facing A;
+# - SO_MARK: reading and writing, length, no permission, UDP, accepted sockets inheriting the
+#   listener's;
+# - iptables owner and mark matches on the OUTPUT of nat and filter, nft's meta skuid and meta
+#   mark;
+# - a transparent proxy written in Python: asks SO_ORIGINAL_DST, connects to the original
+#   destination with SO_MARK (the rules let marked ones through), and relays one request.
+# The native side is a privileged container, where the rules really run in the kernel. The Python
+# of every role imports the same set of modules first.
 exec 2>&1
 cd /tmp
 cat > od.py <<'PY'
@@ -52,7 +59,7 @@ def fmt(b):
 
 
 def q(s, level=socket.SOL_IP, ln=16):
-    """SO_ORIGINAL_DST：optlen（Linux 原样写回）和写进来的 sockaddr。"""
+    """SO_ORIGINAL_DST: optlen (which Linux writes back as is) and the sockaddr written in."""
     try:
         b = s.getsockopt(level, SO_ORIGINAL_DST, ln)
         return f"optlen={len(b)} " + fmt(b[: 28 if level == socket.IPPROTO_IPV6 else 16])
@@ -101,7 +108,7 @@ def show(tag, l, c, a, v6=False):
 
 
 def as_user(uid, fn):
-    """在子进程里以 uid（gid 同号）运行 fn，打印它的结果。"""
+    """Run fn in a child process as uid (with the same gid) and print its result."""
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -124,7 +131,8 @@ def as_user(uid, fn):
 
 
 def where(port, uid=0, mark=None, ls=()):
-    """连 127.0.0.2:port，返回哪个监听接受了它（被 REDIRECT 到 1081 的报原目的地址）。"""
+    """Connect to 127.0.0.2:port and return which listener accepted it (one REDIRECTed to 1081
+    reports the original destination address)."""
 
     def connect():
         c = socket.socket()
@@ -275,8 +283,9 @@ def owner():
 
 
 def proxy():
-    """一个透明代理：接受被 REDIRECT 来的连接，问 SO_ORIGINAL_DST，带着标记 0x100（规则放过
-    它）连原来的目的地，转一次请求和回答。"""
+    """A transparent proxy: accepts connections REDIRECTed to it, asks SO_ORIGINAL_DST, connects
+    to the original destination with mark 0x100 (the rules let it through), and relays one
+    request and its reply."""
     nft("table ip p { chain out { type nat hook output priority -100; "
         "meta mark 0x100 return; ip daddr 127.0.0.0/8 tcp dport { 2290, 2291 } redirect to :1081 } }")
     origin = [listener(V4, "127.0.0.2", 2290), listener(V4, "127.0.0.3", 2291)]
@@ -390,7 +399,7 @@ fresh proxy
 
 echo "== across namespaces"
 wait_for() { for i in $(seq 100); do [ -f "$1" ] && return; sleep 0.1; done; echo "timeout: $1"; }
-# 外层把 DNAT 到 B 的转发过去
+# The outer namespace forwards what is DNATed to B
 echo 1 > /proc/sys/net/ipv4/ip_forward
 ip link add br0 address 02:00:00:00:50:01 type bridge
 ip addr add 10.50.0.1/24 dev br0
@@ -407,7 +416,8 @@ container() {
 container A 10.50.0.2
 container B 10.50.0.3
 sleep 2
-# B 的 PREROUTING：标记 7 的放过（经由 veth 进来时标记已经清掉了）
+# B's PREROUTING: mark 7 is let through (the mark has already been cleared on coming in through
+# the veth)
 nsenter -t "$B" -n nft -f - <<'N'
 table ip t {
   chain pre {
@@ -425,10 +435,13 @@ table ip t {
   }
 }
 N
-# 外层：从 bridge 来的 2290 REDIRECT 到代理 1083；2292 只有发往本机地址的才到 1083（docker、
-# podman 发布端口的规则这样限定），别的到 1084；2293、2294 DNAT 到 B，FORWARD 拒绝 B 的 1085（B 在那里监听着）；
-# UDP 的 53 劫持到 1053。A 和 B 在同一个网段，DNAT 到 B 的要 masquerade，B 的回答才经过外层
-# 换回来（appine 不执行 POSTROUTING，连接本来就在 socket 层）
+# Outer namespace: 2290 from the bridge is REDIRECTed to the proxy at 1083; for 2292 only what is
+# sent to a local address goes to 1083 (docker's and podman's rules for published ports restrict
+# it this way), the rest to 1084; 2293 and 2294 are DNATed to B, and FORWARD rejects B's 1085 (B
+# listens there); UDP port 53 is hijacked to 1053. A and B are in the same subnet, so what is
+# DNATed to B needs masquerade for B's replies to pass through the outer namespace and be
+# translated back (appine does not execute POSTROUTING; the connections are at the socket layer
+# anyway)
 nft -f - <<'N'
 table ip t {
   chain pre {
@@ -453,7 +466,7 @@ N
 rm -f /tmp/ready-b /tmp/ready-b2 /tmp/ready-outer /tmp/ready-udp
 nsenter -t "$B" -n python3 /tmp/od.py srv 1081 1082 /tmp/ready-b 5 &
 b_srv=$!
-# 连到这里的都应该被外层的 FORWARD 拒绝：用完就停掉
+# Everything connecting here should be rejected by the outer FORWARD: stop it once done
 nsenter -t "$B" -n python3 /tmp/od.py srv 1085 /tmp/ready-b2 2 &
 b_rejected=$!
 python3 /tmp/od.py srv 1083 1084 /tmp/ready-outer 4 &

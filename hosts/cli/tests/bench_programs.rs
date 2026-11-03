@@ -1,6 +1,8 @@
-//! M2 基准程序的正确性：原生、Tier 0、Tier 1 三种方式运行，输出必须逐字相同。
+//! Correctness of the M2 benchmark programs: run natively, under Tier 0 and under Tier 1, the
+//! outputs must be identical byte for byte.
 //!
-//! 这里只用很小的轮数检查正确性，耗时对比见 `appine-bench`。需要 Linux aarch64 宿主。
+//! Only very small round counts are used here, to check correctness; for timing comparisons see
+//! `appine-bench`. Needs a Linux aarch64 host.
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
 use std::path::Path;

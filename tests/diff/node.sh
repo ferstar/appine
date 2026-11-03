@@ -1,5 +1,6 @@
-# Node.js：V8 的 JIT（反复优化、反优化）、WebAssembly 越界访问的 trap（V8 靠 SIGSEGV 和
-# 保护页实现）、worker_threads、子进程、回环上的 HTTP、crypto 和 zlib
+# Node.js: V8's JIT (repeated optimization and deoptimization), WebAssembly out-of-bounds access
+# traps (V8 implements them with SIGSEGV and guard pages), worker_threads, child processes, HTTP
+# over loopback, crypto and zlib
 cd /tmp
 cat > diff-node.js <<'JS'
 const assert = require('assert');
@@ -9,7 +10,7 @@ const zlib = require('zlib');
 const { execFileSync } = require('child_process');
 const { Worker } = require('worker_threads');
 
-// 多态调用让 V8 优化、反优化、再优化同一个函数
+// Polymorphic calls make V8 optimize, deoptimize and reoptimize the same function
 function area(s) { return s.w !== undefined ? s.w * s.h : 3.14159 * s.r * s.r; }
 let sum = 0;
 for (let i = 0; i < 200000; i++) {
@@ -27,7 +28,8 @@ const wasm = new Uint8Array([
   0x07, 0x08, 0x01, 0x04, 0x6c, 0x6f, 0x61, 0x64, 0x00, 0x00,
   0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x28, 0x02, 0x00, 0x0b,
 ]);
-// 不能叫 exports：和 CommonJS 包装函数的参数重名，Node 会改按 ES 模块加载
+// Must not be named exports: that clashes with a parameter of the CommonJS wrapper function, and
+// Node would then load the file as an ES module instead
 const { exports: mod } = new WebAssembly.Instance(new WebAssembly.Module(wasm));
 console.log('wasm load', mod.load(0), mod.load(65532));
 for (const addr of [65533, 65536, 1 << 30, -4]) {

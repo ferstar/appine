@@ -1,18 +1,23 @@
 # docker-run-options: --privileged
-# 虚拟网卡（docs/rounds/170-netdev.md）：bridge、veth、dummy 的建删改，地址、路由，
-# 载波和状态，接口的 sysctl，veth 的一端在别的网络命名空间里，以及开机时的命名空间里叠在
-# 宿主接口上的 bridge。原生一侧是特权容器（要写 /proc/sys）。
+# Virtual network devices (docs/rounds/170-netdev.md): creating, deleting and changing bridge,
+# veth and dummy devices, addresses, routes, carrier and state, interface sysctls, a veth with one
+# end in another network namespace, and a bridge stacked on the host interfaces in the boot-time
+# namespace. The native side is a privileged container (it has to write /proc/sys).
 #
-# - MAC 和按它生成的链路本地地址随机，换成 MAC、LL。新命名空间里先关掉 DAD
-#   （default/accept_dad），原生的 IPv6 地址就不会有一段时间是 tentative。
-# - 错误码用 busybox 的 ip 看（它不要 extack 的消息）；iproute2 打印的 extack 消息只比
-#   6.1 和 6.8 都有的那些。
-# - 原生上 bridge 经由 linkwatch（最多晚 1 秒）才知道端口的载波变了，启用端口之后等一下再看。
-# - 6.1 与 6.8 不同、这里不比的：启用着的接口改名（6.1 是 EBUSY，6.2 起可以）；veth 停用
-#   之后对端在别的命名空间里时的 operstate（6.8 看对端的载波）。把 lo 移到它所在的命名空间：
-#   6.1、6.8 是 EINVAL，新内核（CI 的）什么也不做，所以移到别的命名空间（都是 EINVAL）。
-# - 原生的 IPv4 sysctl 在新命名空间里照抄宿主的（Ubuntu 开着 ip_forward、rp_filter），
-#   只比两边都是默认值的项。
+# - MACs and the link-local addresses generated from them are random, and are replaced with MAC
+#   and LL. DAD is turned off first in new namespaces (default/accept_dad), so native IPv6
+#   addresses are never tentative for a while.
+# - Error codes are checked with busybox's ip (it does not ask for extack messages); of the
+#   extack messages iproute2 prints, only those that both 6.1 and 6.8 have are compared.
+# - Natively a bridge learns that a port's carrier changed only through linkwatch (up to 1 second
+#   late), so after bringing a port up wait a moment before looking.
+# - Differences between 6.1 and 6.8 not compared here: renaming an interface that is up (EBUSY on
+#   6.1, allowed from 6.2 on); the operstate after a veth is brought down while its peer is in
+#   another namespace (6.8 looks at the peer's carrier). Moving lo into the namespace it is in:
+#   EINVAL on 6.1 and 6.8, while newer kernels (CI's) do nothing, so it is moved to another
+#   namespace (EINVAL everywhere).
+# - Native IPv4 sysctls in a new namespace copy the host's (Ubuntu has ip_forward and rp_filter
+#   on), so only the entries that are at their defaults on both sides are compared.
 exec 2>&1
 norm() {
     sed -E 's/([0-9a-f]{2}:){5}[0-9a-f]{2}/MAC/g; s/fe80::[0-9a-f:]+/fe80::LL/g; s/8000\.[0-9A-F:]{17}/8000.MAC/g'
@@ -20,7 +25,7 @@ norm() {
 
 unshare -n sh -c '
 norm() { sed -E "s/([0-9a-f]{2}:){5}[0-9a-f]{2}/MAC/g; s/fe80::[0-9a-f:]+/fe80::LL/g"; }
-# 链路本地地址的本地路由按（随机的）地址排序：挪到最后、排好
+# Local routes of link-local addresses sort by the (random) address: move them to the end, sorted
 llsort() { norm | awk "/^local fe80::LL/ { print > \"/tmp/ll\"; next } { print }"; sort /tmp/ll 2>/dev/null; rm -f /tmp/ll; }
 echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad
 

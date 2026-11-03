@@ -1,4 +1,4 @@
-// 退出码要原样传给宿主。
+// The exit code must reach the host unchanged.
     .text
     .globl  _start
 _start:

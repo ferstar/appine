@@ -1,8 +1,9 @@
 #!/bin/sh
-# 编译 LTP 的 syscall 测试（设计文档 §13.3 第 2 层），输出 target/ltp/ltp-<版本>.tar，
-# 解开在 guest 的 /opt/ltp。在 appine 里从源码编译 LTP 要好几个小时，所以在原生的
-# Alpine arm64 容器里编译：它和 rootfs 是同一个 Alpine 版本，编出来的程序可以直接在
-# appine 里运行。版本和 sha256 固定写在这里，升级时一起修改。
+# Builds LTP's syscall tests (design doc §13.3 layer 2) into target/ltp/ltp-<version>.tar, which is
+# unpacked at /opt/ltp in the guest. Building LTP from source inside appine takes several hours, so
+# it is built in a native Alpine arm64 container: it is the same Alpine version as the rootfs, so
+# the programs it builds run directly in appine. The version and sha256 are fixed here and changed
+# together on upgrades.
 set -eu
 
 version=20260930
@@ -18,7 +19,7 @@ if [ -f "$tarball" ]; then
 fi
 mkdir -p "$out"
 
-# Docker daemon 配了代理时，容器里下载也走同一个代理
+# When the Docker daemon has a proxy configured, downloads in the container use the same proxy
 proxy=""
 for kv in "http_proxy=$(docker info --format '{{.HTTPProxy}}' 2>/dev/null || true)" \
     "https_proxy=$(docker info --format '{{.HTTPSProxy}}' 2>/dev/null || true)"; do
@@ -27,7 +28,7 @@ for kv in "http_proxy=$(docker info --format '{{.HTTPProxy}}' 2>/dev/null || tru
     fi
 done
 
-# shellcheck disable=SC2086 # proxy 为空时必须消失
+# shellcheck disable=SC2086 # proxy must vanish when empty
 docker run --rm --platform linux/arm64 $proxy -v "$out:/out" \
     -e "version=$version" -e "sha256=$sha256" -e "url=$url" alpine:3.24 sh -euc '
     apk add -q build-base linux-headers curl xz pkgconf
@@ -39,14 +40,16 @@ docker run --rm --platform linux/arm64 $proxy -v "$out:/out" \
     ./configure --prefix=/opt/ltp >/dev/null
     make -s -C lib -j"$(nproc)"
     make -s -C libs -j"$(nproc)"
-    # 少数测试在 musl 上编译不过：逐个目录编译，跳过失败的，其余照常安装（LTP 的上层
-    # Makefile 遇到第一个失败的子目录就停下）
+    # A few tests do not compile on musl: build directory by directory, skip the failures, and
+    # install the rest as usual (the top-level Makefile of LTP stops at the first failing
+    # subdirectory)
     for dir in testcases/kernel/syscalls/*/; do
         make -s -k -C "$dir" -j"$(nproc)" >/dev/null 2>&1 || echo "skipped: $dir"
         make -s -k -C "$dir" install >/dev/null 2>&1 || true
     done
     cp -r runtest /opt/ltp/
-    # 测试程序是静态链接、带调试信息的，去掉调试信息之后小得多
+    # The test programs are statically linked with debug information, and much smaller once it is
+    # stripped
     find /opt/ltp/testcases/bin -type f -exec strip {} + 2>/dev/null || true
     tar cf "/out/ltp-$version.tar.part" -C / opt/ltp
     mv "/out/ltp-$version.tar.part" "/out/ltp-$version.tar"

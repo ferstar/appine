@@ -1,8 +1,9 @@
-# Java（OpenJDK 21）：平台线程和虚拟线程、C2 编译后的隐式空指针检查和反优化、栈溢出
-# 保护页（都靠 SIGSEGV）、GC 与弱引用、子进程、NIO 上的 HTTP、IPv6 的回环、文件映射和
-# 文件锁、crypto，信号处理线程和 SIGTERM 触发的关闭钩子；ZGC 多重映射堆；jcmd 的 attach
-# （SIGQUIT + AF_UNIX）。java 经由 /usr/bin/java 这个符号链接启动，靠 /proc/self/exe
-# 找到 libjli.so
+# Java (OpenJDK 21): platform and virtual threads, implicit null checks and deoptimization after
+# C2 compilation, stack overflow guard pages (all relying on SIGSEGV), GC and weak references,
+# child processes, HTTP over NIO, IPv6 loopback, file mappings and file locks, crypto, the signal
+# handler thread and shutdown hooks triggered by SIGTERM; ZGC's multi-mapped heap; jcmd's attach
+# (SIGQUIT + AF_UNIX). java is started through the symlink /usr/bin/java and finds libjli.so
+# through /proc/self/exe
 set -e
 mkdir -p /tmp/diff-java
 cd /tmp/diff-java
@@ -49,7 +50,7 @@ public class Main {
     }
 
     public static void main(String[] args) throws Exception {
-        // 平台线程、synchronized、wait/notify
+        // Platform threads, synchronized, wait/notify
         long[] results = new long[8];
         Thread[] ts = new Thread[8];
         Object lock = new Object();
@@ -66,7 +67,7 @@ public class Main {
         for (Thread t : ts) t.join();
         System.out.println("threads " + Arrays.toString(results));
 
-        // 虚拟线程：continuation 在 ForkJoinPool 的载体线程之间搬栈
+        // Virtual threads: continuations move stacks between ForkJoinPool carrier threads
         AtomicInteger vt = new AtomicInteger();
         try (var ex = Executors.newVirtualThreadPerTaskExecutor()) {
             for (int i = 0; i < 10_000; i++) {
@@ -77,7 +78,8 @@ public class Main {
 
         System.out.println("parallel " + IntStream.range(0, 2_000_000).parallel().mapToLong(i -> i % 13).sum());
 
-        // 让 C2 编译 area，再用新的形状和 null 触发反优化、隐式空指针检查（SIGSEGV）
+        // Let C2 compile area, then use a new shape and null to trigger deoptimization and the
+        // implicit null check (SIGSEGV)
         double sum = 0;
         for (int i = 0; i < 3_000_000; i++) {
             sum += area(i % 3 == 0 ? new Circle(i % 10) : new Rect(i % 7, i % 5));
@@ -89,13 +91,14 @@ public class Main {
         int[] arr = new int[3];
         try { arr[spin(10) > 0 ? 5 : 0] = 1; } catch (ArrayIndexOutOfBoundsException e) { System.out.println("aioobe " + e.getMessage()); }
         try { System.out.println(1 / (int) (spin(1) - spin(1))); } catch (ArithmeticException e) { System.out.println("arith " + e.getMessage()); }
-        // 栈溢出靠线程栈上的保护页，第二次能再抓到说明黄区重新打开了
+        // Stack overflow relies on the guard pages on the thread stack; catching it a second time
+        // shows the yellow zone was re-enabled
         for (int i = 0; i < 2; i++) {
             depth = 0;
             try { recurse(); } catch (StackOverflowError e) { System.out.println("stack overflow caught " + (depth > 1000)); }
         }
 
-        // GC：大量短命对象，弱引用在 System.gc() 之后被清掉
+        // GC: lots of short-lived objects; weak references are cleared after System.gc()
         List<byte[]> keep = new ArrayList<>();
         long allocated = 0;
         for (int i = 0; i < 200_000; i++) {
@@ -109,12 +112,12 @@ public class Main {
         System.gc();
         System.out.println("gc " + allocated + " kept " + keep.size() + " weak cleared " + (weak.get() == null));
 
-        // 子进程（posix_spawn + jspawnhelper）
+        // Child process (posix_spawn + jspawnhelper)
         Process p = new ProcessBuilder("/bin/sh", "-c", "echo from $0; exit 3", "sh").redirectErrorStream(true).start();
         String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
         System.out.println("process " + out + " exit " + p.waitFor());
 
-        // 回环上的 HTTP：服务端和 HttpClient 都用 NIO Selector（epoll）
+        // HTTP over loopback: both the server and HttpClient use the NIO Selector (epoll)
         HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
         server.createContext("/", h -> {
             byte[] body = ("served " + h.getRequestURI()).getBytes(StandardCharsets.UTF_8);
@@ -130,7 +133,8 @@ public class Main {
         server.stop(0);
         ((ExecutorService) server.getExecutor()).shutdown();
 
-        // IPv6 的回环：JVM 看 /proc/net/if_inet6 里有没有地址，没有就整个关掉 IPv6
+        // IPv6 loopback: the JVM checks whether /proc/net/if_inet6 has addresses, and if not
+        // turns IPv6 off entirely
         try (ServerSocket ss = new ServerSocket(0, 1, InetAddress.getByName("::1"));
              Socket cs = new Socket(InetAddress.getByName("::1"), ss.getLocalPort());
              Socket as = ss.accept()) {
@@ -140,7 +144,7 @@ public class Main {
             System.out.println("ipv6 " + e);
         }
 
-        // 文件：内存映射、文件锁、遍历
+        // Files: memory mapping, file locks, traversal
         Path dir = Files.createTempDirectory("diff-java");
         Path f = dir.resolve("data.bin");
         try (FileChannel ch = FileChannel.open(f, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
@@ -154,7 +158,7 @@ public class Main {
         Files.writeString(dir.resolve("a.txt"), "hello");
         try (Stream<Path> s = Files.walk(dir)) { System.out.println("walk " + s.map(x -> dir.relativize(x).toString()).sorted().toList()); }
 
-        // crypto、zip、CRC32（aarch64 上都有指令内建）
+        // crypto, zip, CRC32 (all have instruction intrinsics on aarch64)
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         System.out.println("sha256 " + HexFormat.of().formatHex(md.digest("appine".getBytes(StandardCharsets.UTF_8))));
         Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
@@ -180,7 +184,8 @@ public class Main {
         System.out.println(new BigInteger("3").pow(500).mod(new BigInteger("1000000007")) + " " + new BigDecimal("1").divide(new BigDecimal("7"), MathContext.DECIMAL128));
         System.out.println(Math.sqrt(2) + " " + Math.exp(1) + " " + Math.sin(1e10) + " " + StrictMath.log(10) + " " + 1e21 + " " + -0.0 + " " + Double.MIN_VALUE + " " + (float) Math.PI);
 
-        // 信号：sun.misc.Signal 的处理函数在单独的线程里运行；最后 SIGTERM 让 JVM 跑关闭钩子后退出
+        // Signals: sun.misc.Signal handlers run in a separate thread; finally SIGTERM makes the
+        // JVM run the shutdown hooks and exit
         CountDownLatch hup = new CountDownLatch(1);
         sun.misc.Signal.handle(new sun.misc.Signal("HUP"), s -> { System.out.println("signal " + s.getName()); hup.countDown(); });
         sun.misc.Signal.raise(new sun.misc.Signal("HUP"));
@@ -193,7 +198,8 @@ public class Main {
     }
 }
 JAVA
-# sun.misc.Signal 会招来"内部专有 API"的警告，编译成功时不显示
+# sun.misc.Signal draws an "internal proprietary API" warning, which is not shown when compiling
+# succeeds
 javac -d . Main.java 2>javac.log || { cat javac.log; exit 1; }
 set +e
 java -cp . Main
@@ -210,7 +216,7 @@ JAVA
 javac -d . Sleeper.java
 java -cp . Sleeper > sleeper.out &
 pid=$!
-# 子进程可能还没创建 sleeper.out：grep -s 不报文件不存在
+# The child may not have created sleeper.out yet: grep -s does not report a missing file
 while ! grep -qs 'sleeper up' sleeper.out; do sleep 0.1; done
 jcmd $pid VM.version | tail -n +2
 kill $pid

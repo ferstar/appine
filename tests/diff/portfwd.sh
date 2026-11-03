@@ -1,23 +1,31 @@
 # docker-run-options: --privileged
-# 端口转发（docs/rounds/173-port-forwarding.md）：开机时的命名空间里两个 bridge（br0 10.60.0.1/24、
-# br1 10.61.0.1/24），新的网络命名空间 A、B 像容器一样各挂在一个上面（10.60.0.2、10.61.0.3，
-# 不同的网段：B 的回答经由开机时的命名空间，NAT 才换得回来）。开机时的命名空间里
-# 有 PREROUTING 的 nat 规则（podman、docker 发布端口的样子），A 连网关地址、外层地址上发布的
-# 端口，经由开机时的命名空间转到 B：比 A 看到的对端、回答的来源，B 看到的来源和本端，
-# iifname 的匹配、redirect，开机时的命名空间自己连（不经过 PREROUTING），以及像 podman 那样
-# 占着端口、从不 accept 的监听。原生一侧是特权容器，数据包真的经过 bridge 和 nat。
+# Port forwarding (docs/rounds/173-port-forwarding.md): two bridges in the boot-time namespace
+# (br0 10.60.0.1/24, br1 10.61.0.1/24), and new network namespaces A and B each attached to one
+# like containers (10.60.0.2, 10.61.0.3, in different subnets: B's reply goes through the
+# boot-time namespace, which is what lets NAT translate it back). The boot-time namespace has nat
+# rules in PREROUTING (the way podman and docker publish ports), and A connects to ports published
+# on the gateway address and the outer address, forwarded through the boot-time namespace to B:
+# compare the peer A sees, the source of the reply, the source and local end B sees, iifname
+# matching, redirect, the boot-time namespace connecting itself (not through PREROUTING), and a
+# listener that holds the port and never accepts, as podman does. The native side is a
+# privileged container, where packets really go through the bridges and nat.
 #
-# - 外层命名空间直接连 B 上没有监听的 8080 不比：appine 里外层占着 8080 的监听在宿主上绑的
-#   是通配地址，B 在宿主上的回环地址也在里面，连得上（原生是 ECONNREFUSED）。
-# - iifname 的规则用一个不存在的接口：appine 判断外面来的连接转不转发时，假设它从宿主上第一个
-#   接口进来；规则对它成立的话外层的这个监听交给转发线程，A 的连接也被它接走（推迟项）。
-# - 同一个网段里的容器经由网关连到发布的端口、容器连回自己发布的端口（hairpin）不比：原生上
-#   回答不经过网关，没有 masquerade 时连不上（netavark 为此加 masquerade，appine 不执行）。
+# - The outer namespace connecting directly to 8080 on B, where nothing listens, is not compared:
+#   in appine the outer listener holding 8080 binds the wildcard address on the host, which also
+#   covers B's loopback address on the host, so the connection succeeds (natively ECONNREFUSED).
+# - The iifname rule uses an interface that does not exist: when appine decides whether to
+#   forward a connection from outside, it assumes the connection came in on the host's first
+#   interface; if the rule holds for it, this outer listener is handed to the forwarding thread,
+#   and A's connections are taken by it too (deferred).
+# - Containers in the same subnet connecting to a published port through the gateway, and a
+#   container connecting back to its own published port (hairpin), are not compared: natively
+#   the reply does not go through the gateway, and without masquerade the connection fails
+#   (netavark adds masquerade for this, appine does not execute it).
 exec 2>&1
 cd /tmp
 cat > srv.py <<'PY'
 import socket, sys
-# srv.py tcp|udp <地址> <端口> <次数> <就绪文件>；没等到连接时 15 秒后退出
+# srv.py tcp|udp <address> <port> <count> <ready file>; exits after 15 seconds without a connection
 socket.setdefaulttimeout(15)
 kind, addr, port, n, ready = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 if kind == "tcp":
@@ -42,7 +50,7 @@ else:
 PY
 cat > cli.py <<'PY'
 import errno, socket, sys
-# cli.py tcp|udp|udpconn <地址> <端口> <消息>
+# cli.py tcp|udp|udpconn <address> <port> <message>
 kind, addr, port, msg = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 try:
     if kind == "tcp":
@@ -67,7 +75,7 @@ except OSError as e:
     print(f"{msg}: {errno.errorcode.get(e.errno, e.errno)}")
 PY
 wait_for() { for i in $(seq 100); do [ -f "$1" ] && return; sleep 0.1; done; echo "timeout: $1"; }
-# 在命名空间（pid）里后台起服务，served 等它们结束
+# Start servers in the background in the namespace of (pid); served waits for them to end
 servers=""
 serve() {
     pid=$1; shift; rm -f "/tmp/ready-$1-$3"
@@ -76,7 +84,7 @@ serve() {
     wait_for "/tmp/ready-$1-$3"
 }
 served() { wait $servers; servers=""; }
-# 外层地址（容器的 eth0）换成 HOST
+# The outer address (the container's eth0) is replaced with HOST
 host=$(ip -4 -o addr show eth0 | awk '{ print $4 }' | cut -d/ -f1)
 tidy() { sed "s/$host/HOST/g"; }
 
@@ -86,7 +94,7 @@ for n in 0 1; do
     ip addr add 10.6$n.0.1/24 dev br$n
     ip link set br$n up
 done
-# container <名字> <bridge> <地址> <网关>
+# container <name> <bridge> <address> <gateway>
 container() {
     unshare -n sleep 600 &
     eval "$1=$!"
@@ -111,7 +119,7 @@ table ip pf {
 }
 NFT
 echo "load: $?"
-# 像 podman 那样占着 8080、从不 accept
+# Hold 8080 and never accept, as podman does
 python3 -c '
 import socket, time
 s = socket.socket(); s.bind(("0.0.0.0", 8080)); s.listen(); open("/tmp/held", "w").close(); time.sleep(60)' &

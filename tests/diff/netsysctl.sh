@@ -1,10 +1,13 @@
 # docker-run-options: --privileged
-# 网络命名空间的 sysctl（docs/rounds/177-net-sysctls.md）：新的网络命名空间里 /proc/sys/net 下
-# 常用的几项的权限和默认值，写入（整数写几个改前几个、个数多了和不是数是 EINVAL、拥塞控制
-# 算法要是有的、只读的写不了），以及每个命名空间各有一份。docker、compose 的 `sysctls:` 在
-# 容器里写这些（原来 appine 里没有这些文件，容器起不来）。不比整个目录的列表：Linux 6.1 和
-# 6.8 的项不一样。tcp_rmem 的默认上限也不比：6.1、6.8 最多 6 MB，新内核（CI 的）最多 32 MB
-# （都按内存大小定）。
+# Network namespace sysctls (docs/rounds/177-net-sysctls.md): in a new network namespace, the
+# permissions and default values of the commonly used entries under /proc/sys/net, writes (writing
+# k integers changes the first k, too many or non-numbers are EINVAL, the congestion control
+# algorithm must be one that exists, read-only ones cannot be written), and that each namespace
+# has its own copy. The `sysctls:` of docker and compose write these inside the container (appine
+# used to lack these files, so the containers would not start). The listing of the whole directory
+# is not compared: Linux 6.1 and 6.8 have different entries. Nor is the default maximum of
+# tcp_rmem: 6.1 and 6.8 go up to 6 MB, newer kernels (CI's) up to 32 MB (all set by the memory
+# size).
 exec 2>&1
 unshare -n sh -c '
 cd /proc/sys/net

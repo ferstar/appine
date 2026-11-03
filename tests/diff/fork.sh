@@ -1,8 +1,10 @@
-# fork 之后父子进程的内存互不影响（写时复制）：几个子进程和父进程同时写；多线程的父进程
-# 在别的线程不停写的时候 fork，子进程看到的是某一瞬间的快照；借出的内存解除映射、搬走、
-# 丢弃；子进程结束之后借出的页恢复成各自的权限；smaps 里共用的页；子进程里用锁和条件
-# 变量；一层套一层的 fork；python 的 os.fork；fork 时按合起来的 VMA 估算提交量；只碰了几页的
-# 1 TB MAP_NORESERVE 映射
+# After fork the memory of parent and child does not affect each other (copy-on-write): several
+# children and the parent writing at once; a multithreaded parent forking while other threads keep
+# writing, with the child seeing a snapshot of one instant; lent memory being unmapped, moved and
+# discarded; lent pages returning to their own permissions after the child ends; shared pages in
+# smaps; locks and condition variables in the child; fork nested level upon level; python's
+# os.fork; the commit estimated over merged VMAs at fork; a 1 TB MAP_NORESERVE mapping with only
+# a few pages touched
 set -e
 cd /tmp
 cat > cow.c <<'C'
@@ -41,7 +43,7 @@ static int wait_all(int n)
     return bad;
 }
 
-/* 几个子进程和父进程同时写：各自只看到自己的修改 */
+/* Several children and the parent write at once: each sees only its own changes */
 static int concurrent_writers(void)
 {
     memset(mem, 'p', PAGES * PAGE);
@@ -51,7 +53,7 @@ static int concurrent_writers(void)
         if (fork() == 0) {
             char go;
             read(fds[0], &go, 1);
-            /* 写一半的页，另一半必须还是 fork 时的内容 */
+            /* Write half of the pages; the other half must still hold what they had at fork */
             for (int i = c % 2; i < PAGES; i += 2)
                 mem[(size_t)i * PAGE + c] = 'a' + c;
             int bad = 0;
@@ -65,7 +67,7 @@ static int concurrent_writers(void)
     }
     for (int c = 0; c < 4; c++)
         write(fds[1], "g", 1);
-    /* 父进程一边写，子进程一边检查 */
+    /* The parent writes while the children check */
     for (int i = 0; i < PAGES; i += 3)
         mem[(size_t)i * PAGE + 100] = 'q';
     int bad = wait_all(4);
@@ -76,7 +78,8 @@ static int concurrent_writers(void)
     return bad;
 }
 
-/* 线程按顺序把计数写进每一页，再加一：任何一瞬间前面若干页是 v、后面的是 v - 1 */
+/* Threads write the count into each page in order, then add one: at any instant the first few
+ * pages hold v and the rest v - 1 */
 static atomic_int stop;
 static unsigned *bufs[3];
 #define TPAGES 64
@@ -115,7 +118,8 @@ static int threads_and_fork(void)
             int ok = 1;
             for (int i = 0; i < 3; i++) {
                 ok &= consistent(bufs[i]);
-                /* 子进程自己写：快照不受父进程的线程影响 */
+                /* The child writes for itself: its snapshot is not affected by the parent's
+                 * threads */
                 unsigned snap = bufs[i][0];
                 usleep(2000);
                 ok &= bufs[i][0] == snap;
@@ -135,7 +139,8 @@ static int threads_and_fork(void)
     return bad;
 }
 
-/* 借出的内存被父进程解除映射、mremap 搬走、MADV_DONTNEED：子进程的内容不变 */
+/* Lent memory is unmapped by the parent, moved away by mremap, or MADV_DONTNEED'd: the child's
+ * contents do not change */
 static int unmap_move_discard(void)
 {
     size_t len = 64 * PAGE;
@@ -153,7 +158,7 @@ static int unmap_move_discard(void)
         char x;
         read(fds[0], &x, 1);
         int bad = check(a, 64, 'a') + check(b, 64, 'b') + check(c, 64, 'c');
-        /* 子进程也改一改：父进程那边不受影响 */
+        /* The child changes things too: the parent side is not affected */
         mprotect(c, len, PROT_READ);
         mprotect(c, len, PROT_READ | PROT_WRITE);
         memset(c, 'C', len / 2);
@@ -165,7 +170,7 @@ static int unmap_move_discard(void)
     munmap(a, len / 2);
     unsigned char *moved = mremap(b, len, 2 * len, MREMAP_MAYMOVE);
     madvise(c + len / 2, len / 2, MADV_DONTNEED);
-    /* 解除映射的地方重新映射、写上别的内容 */
+    /* Map again where it was unmapped, and write other contents */
     unsigned char *again =
         mmap(a, len / 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     memset(again, 'z', len / 2);
@@ -178,9 +183,11 @@ static int unmap_move_discard(void)
     return bad;
 }
 
-/* 子进程结束、还回借来的页之后，父进程的页恢复成各自所在映射的权限。一次 mmap 用
- * mprotect 切成的几段宿主内存是连着的，不能按第一段的权限一起恢复：保护页的 PROT_NONE
- * 会让后面的页都访问不了，可写的一段会让后面只读的一段也能写 */
+/* After the child ends and returns the borrowed pages, the parent's pages get back the
+ * permissions of the mapping each is in. The pieces of host memory that one mmap was split into
+ * by mprotect are contiguous, so they cannot all be restored with the first piece's permissions:
+ * a guard page's PROT_NONE would make all the following pages inaccessible, and a writable piece
+ * would make a following read-only piece writable too */
 static sigjmp_buf probe_jmp;
 
 static void probe_fault(int sig)
@@ -202,8 +209,9 @@ static int probe(volatile unsigned char *p, int write)
 
 static void returned_loans(void)
 {
-    /* 保护页、两页可写、一页只读；一页可写、一页只读；最后像线程的信号栈那样，一段开头
-     * 是没写过的保护页的映射，接在上一段的下面 */
+    /* A guard page, two writable pages, one read-only; one writable, one read-only; finally, like
+     * a thread's signal stack, a mapping that starts with a never-written guard page, placed
+     * right below the previous one */
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     unsigned char *m = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, flags, -1, 0);
     unsigned char *n = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, flags, -1, 0);
@@ -228,9 +236,10 @@ static void returned_loans(void)
     sigaction(SIGSEGV, &old, NULL);
 }
 
-/* fork 之后两边共用写过的页：smaps 里算共享的脏页，Pss 两边各算一半；一边写过之后各是
- * 各的。redis、valkey 在 arm64 上启动时就这样检查内核（写一页、MADV_FREE、再写，fork 之后
- * 子进程看 Shared_Dirty），是 0 就不肯启动 */
+/* After fork both sides share the written pages: smaps counts them as shared dirty pages, and
+ * each side's Pss counts half; after one side writes, each has its own. redis and valkey check
+ * the kernel this way when starting on arm64 (write a page, MADV_FREE, write again, then after
+ * fork the child looks at Shared_Dirty), and refuse to start if it is 0 */
 static void smaps_of(const char *who, unsigned char *addr)
 {
     FILE *f = fopen("/proc/self/smaps", "r");
@@ -286,7 +295,7 @@ static void shared_in_smaps(void)
     wait_all(1);
 }
 
-/* 子进程里的锁和条件变量（futex 在 fork 时借来的页上） */
+/* Locks and condition variables in the child (the futexes are on pages borrowed at fork) */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 static int turn;
@@ -322,7 +331,8 @@ static int locks_in_child(void)
     return wait_all(1);
 }
 
-/* 一层套一层：每一层都改一页，再看上面几层的内容 */
+/* Level upon level: each level changes one page, then looks at the contents of the levels
+ * above */
 static int nested(int depth)
 {
     mem[(size_t)depth * PAGE] = 'n';
@@ -357,9 +367,11 @@ int main(void)
 C
 gcc -O2 -o cow cow.c -pthread
 ./cow
-# fork 时的提交量估算（vm.overcommit_memory 是 0，Linux 的 dup_mmap）：可写的私有映射
-# 按合起来的 VMA 算，超过内存和交换区的总量时 fork 是 ENOMEM。两段各一半多一点的首尾
-# 相接（每段自己都不超过）；有空隙、后一段是 MAP_NORESERVE 或只读的都不合起来算
+# Commit estimate at fork (vm.overcommit_memory is 0, Linux's dup_mmap): writable private
+# mappings are counted by merged VMA, and fork is ENOMEM when that exceeds the total of memory
+# and swap. Two pieces of a little over half each, adjoining end to start (neither exceeds it on
+# its own); with a gap, or with the second piece MAP_NORESERVE or read-only, they are not counted
+# merged
 cat > commit.c <<'C'
 #include <errno.h>
 #include <stdio.h>
@@ -413,7 +425,7 @@ int main(void)
     case_("with a gap", 1 << 20, PROT_READ | PROT_WRITE, 0);
     case_("second MAP_NORESERVE", 0, PROT_READ | PROT_WRITE, MAP_NORESERVE);
     case_("second read-only", 0, PROT_READ, 0);
-    /* 原来的上限：一次映射超过总量的是 ENOMEM（宿主拒绝） */
+    /* The old limit: a single mapping over the total is ENOMEM (the host refuses it) */
     char *big = mmap(NULL, limit + (1 << 20), PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("one mapping over the limit: %s\n", big == MAP_FAILED ? strerror(errno) : "mapped");
@@ -422,10 +434,13 @@ int main(void)
 C
 gcc -O2 -o commit commit.c
 ./commit
-# 1 TB 的 MAP_NORESERVE 映射只碰几页（ASan 的影子内存就是这样）：fork 成功，子进程读到
-# 内容、写自己的一份、没碰过的是零；PROT_NONE 再改回来、mremap 搬走之后内容还在，再 fork
-# 也看得到；驻留内存只有碰过的几页。appine 的页表按需建立，fork 借页只看有表项的地方
-# （第 179 轮）；原来 fork 给子进程申请宿主内存时不看 MAP_NORESERVE，超过内存总量就是 ENOMEM
+# A 1 TB MAP_NORESERVE mapping with only a few pages touched (ASan's shadow memory works like
+# this): fork succeeds, the child reads the contents, writes its own copy, and untouched pages
+# are zero; after PROT_NONE and back, and after an mremap move, the contents are still there and
+# a further fork sees them too; resident memory is only the few touched pages. appine builds
+# page tables on demand, and fork lends pages only where there are entries (round 179); fork
+# used to ignore MAP_NORESERVE when requesting host memory for the child, so exceeding the total
+# memory was ENOMEM
 cat > sparse.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>

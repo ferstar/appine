@@ -1,4 +1,5 @@
-# Debian（glibc）：发行版的 node，npm 装带预编译 glibc 二进制的包（sharp），nodejs.org 的官方 glibc 构建
+# Debian (glibc): the distro's node, npm installing a package with prebuilt glibc binaries (sharp),
+# the official glibc build from nodejs.org
 cd /tmp; rm -rf nt; mkdir nt; cd nt
 node -e 'const os=require("os"); console.log("node", process.version, os.cpus().length, "cpus", (os.totalmem()/2**20|0), "MiB")'
 npm init -y >/dev/null; s=$(date +%s); npm install --no-audit --no-fund sharp 2>&1 | tail -2; echo "npm: $? ($(( $(date +%s) - s ))s)"

@@ -1,7 +1,8 @@
 /*
- * socket 与 I/O 多路复用的 guest 测试程序（M4）：用 musl-gcc -static 编译，在
- * appine-run 里直接运行（不需要 rootfs，也不需要外网）。每项检查通过时打印一行
- * "ok <名字>"，失败时打印原因并以 1 退出，全部通过时最后打印 "all ok"。
+ * Guest test program for sockets and I/O multiplexing (M4): build with musl-gcc -static and run
+ * directly in appine-run (no rootfs and no outside network needed). Each check that passes prints
+ * a line "ok <name>"; a failure prints the reason and exits with 1; when all pass it prints
+ * "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -84,14 +85,15 @@ static void test_stream_pair(void)
     int avail = 0;
     CHECK(ioctl(sv[1], FIONREAD, &avail) == 0 && avail == 10, "FIONREAD %d", avail);
     CHECK(recv(sv[1], buf, 3, MSG_PEEK) == 3 && memcmp(buf, "hel", 3) == 0, "peek");
-    /* 流式 socket 把两次写入合并读出 */
+    /* A stream socket reads two writes back merged */
     CHECK(read(sv[1], buf, sizeof buf) == 10 && memcmp(buf, "helloworld", 10) == 0, "read");
     CHECK(shutdown(sv[0], SHUT_WR) == 0, "shutdown");
     CHECK(read(sv[1], buf, sizeof buf) == 0, "EOF after SHUT_WR");
     CHECK(write(sv[1], "back", 4) == 4, "other direction still open");
     CHECK(read(sv[0], buf, sizeof buf) == 4, "read back");
 
-    /* 对方关闭之后：MSG_NOSIGNAL 只返回 EPIPE，否则还有 SIGPIPE */
+    /* After the peer closes: with MSG_NOSIGNAL only EPIPE is returned, otherwise there is also
+     * SIGPIPE */
     close(sv[1]);
     handle(SIGPIPE, on_sigpipe);
     CHECK(send(sv[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE, "EPIPE");
@@ -113,7 +115,7 @@ static void test_message_pairs(void)
         CHECK(socketpair(AF_UNIX, types[i] | SOCK_CLOEXEC, 0, sv) == 0, "socketpair %d", types[i]);
         CHECK(fcntl(sv[0], F_GETFD) == FD_CLOEXEC, "SOCK_CLOEXEC");
         CHECK(send(sv[0], "first", 5, 0) == 5 && send(sv[0], "second", 6, 0) == 6, "send");
-        /* 消息边界保持不变，读不完的部分被丢弃 */
+        /* Message boundaries are kept, and the part not read is discarded */
         struct iovec iov = {buf, 3};
         struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
         CHECK(recvmsg(sv[1], &msg, 0) == 3 && (msg.msg_flags & MSG_TRUNC), "truncated");
@@ -128,7 +130,7 @@ static void test_message_pairs(void)
     ok("unix datagram and seqpacket socketpairs");
 }
 
-/* 经由 SCM_RIGHTS 把管道的写端交给子进程，子进程收到后写入 */
+/* Passes a pipe's write end to a child through SCM_RIGHTS; the child writes to it once received */
 static void test_scm_rights(void)
 {
     int sv[2], pfd[2];
@@ -172,7 +174,7 @@ static void test_scm_rights(void)
     ok("SCM_RIGHTS");
 }
 
-/* 抽象地址上的 listen/connect/accept，以及双方的 SO_PEERCRED */
+/* listen/connect/accept on an abstract address, and SO_PEERCRED on both sides */
 static void test_unix_listen(void)
 {
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -220,14 +222,14 @@ static void test_unix_listen(void)
     CHECK(wait_child(pid) == 0, "child failed");
     close(conn);
     close(srv);
-    /* 地址随 socket 关闭释放 */
+    /* The address is released when the socket closes */
     int again = socket(AF_UNIX, SOCK_STREAM, 0);
     CHECK(bind(again, (struct sockaddr *)&addr, alen) == 0, "rebind");
     close(again);
     ok("unix listen, connect and SO_PEERCRED");
 }
 
-/* ---- TCP、UDP 回环（宿主 socket） ---- */
+/* ---- TCP and UDP loopback (host sockets) ---- */
 
 static void test_tcp_loopback(void)
 {
@@ -253,7 +255,7 @@ static void test_tcp_loopback(void)
     CHECK(conn >= 0, "accept");
     fcntl(c, F_SETFL, 0);
 
-    /* 阻塞的 recv 等对方的数据；大块数据分多次到达 */
+    /* A blocking recv waits for the peer's data; a large chunk of data arrives in several parts */
     static char big[256 * 1024], got[256 * 1024];
     memset(big, 'z', sizeof big);
     pid_t pid = fork();
@@ -295,17 +297,19 @@ static void test_udp_loopback(void)
 }
 
 /*
- * DNS 存根（127.0.0.53:53）的回答在 appine 自己的队列里：FIONREAD 要报告下一个回答的长度。
- * glibc 的解析器用 sendmmsg 一次发出 A、AAAA 两个查询，按 FIONREAD 分配第二个回答的缓冲区，
- * 报告 0 时它收不下 AAAA 的回答，解析失败（Debian 的 apt）。没有外网时存根回答 SERVFAIL，
- * 也有回答可读，所以这里不看回答的内容，只看长度对得上。
+ * The replies of the DNS stub (127.0.0.53:53) are in appine's own queue: FIONREAD must report the
+ * length of the next reply. glibc's resolver sends both the A and the AAAA query at once with
+ * sendmmsg and sizes the buffer for the second reply by FIONREAD; when that reports 0 it cannot
+ * take the AAAA reply and resolution fails (Debian's apt). Without outside network the stub replies
+ * SERVFAIL, still a readable reply, so this does not look at the replies' contents, only that the
+ * lengths match.
  */
 static void test_dns_stub_fionread(void)
 {
     static const unsigned char query[] = {
-        0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,  /* 头：RD，一个问题 */
+        0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,  /* header: RD, one question */
         9, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't', 0, /* localhost */
-        0, 1, 0, 1,                                         /* A，IN */
+        0, 1, 0, 1,                                         /* A, IN */
     };
     unsigned char q2[sizeof query];
     memcpy(q2, query, sizeof query);
@@ -335,7 +339,7 @@ static void test_dns_stub_fionread(void)
     ok("dns stub fionread");
 }
 
-/* getifaddrs 经由 NETLINK_ROUTE 列出接口和地址 */
+/* getifaddrs lists interfaces and addresses through NETLINK_ROUTE */
 static void test_netlink(void)
 {
     struct ifaddrs *list;
@@ -352,9 +356,11 @@ static void test_netlink(void)
     CHECK(if_nametoindex("lo") > 0, "if_nametoindex");
     ok("netlink interfaces");
 
-    /* 没有实现的协议与没有编进内核的子系统一样建不了：libaudit 据此当作没有审计，
-     * 不去等不会来的 ACK，ss 退回读 /proc/net。uevent 只是听，建得了；generic 有 nlctrl
-     * 一个族（回答的内容由差分测试 compat 比对） */
+    /* Unimplemented protocols cannot be created, like subsystems not compiled into the kernel:
+     * from this libaudit takes auditing to be absent and does not wait for an ACK that will never
+     * come, and ss falls back to reading /proc/net. uevent only listens, so it can be created;
+     * generic has one family, nlctrl (the replies' contents are compared by the differential test
+     * compat) */
     CHECK(socket(AF_NETLINK, SOCK_RAW, 9 /* NETLINK_AUDIT */) < 0 && errno == EPROTONOSUPPORT,
           "audit netlink socket");
     CHECK(socket(AF_NETLINK, SOCK_RAW, 4 /* NETLINK_SOCK_DIAG */) < 0 && errno == EPROTONOSUPPORT,
@@ -368,7 +374,7 @@ static void test_netlink(void)
     ok("netlink protocols");
 }
 
-/* ---- epoll、eventfd、select ---- */
+/* ---- epoll, eventfd, select ---- */
 
 static void test_epoll(void)
 {
@@ -383,7 +389,7 @@ static void test_epoll(void)
     struct epoll_event out[4];
     CHECK(epoll_wait(ep, out, 4, 0) == 0, "nothing ready");
 
-    /* 另一个进程写 socket：epoll_wait 被唤醒 */
+    /* Another process writes the socket: epoll_wait is woken */
     pid_t pid = fork();
     if (pid == 0) {
         usleep(20000);
@@ -410,7 +416,7 @@ static void test_epoll(void)
     ok("epoll, eventfd and select");
 }
 
-/* ---- 间隔定时器 ---- */
+/* ---- Interval timers ---- */
 
 static void test_itimer(void)
 {
@@ -426,7 +432,7 @@ static void test_itimer(void)
     CHECK(setitimer(ITIMER_REAL, &off, &cur) == 0 && cur.it_interval.tv_usec == 20000, "disarm");
     CHECK(getitimer(ITIMER_REAL, &cur) == 0 && cur.it_value.tv_sec == 0 && cur.it_value.tv_usec == 0,
           "disarmed");
-    /* alarm(2) 经由 setitimer 实现 */
+    /* alarm(2) is implemented through setitimer */
     alarms = 0;
     CHECK(alarm(1) == 0, "alarm");
     CHECK(alarm(0) >= 1, "alarm remaining");

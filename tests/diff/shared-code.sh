@@ -1,14 +1,20 @@
-# 同一个程序的几个进程共用 Tier 1 的翻译（docs/rounds/108-shared-translation.md）。共用的
-# 前提是它们在同样的地址映射着同样的代码，下面几种情形里两个进程在同一个地址上放了不同的
-# 代码，各自执行到的必须是自己的：
-#   files    父子进程在同一个地址映射两个不同的文件
-#   jit      父子进程在同一个地址各写各的代码（可写可执行的匿名映射）
-#   rewrite  父子进程先映射同一个文件，一起执行，之后子进程改写了自己那一份
-#   exec     子进程 exec 同一个程序，在同一个地址映射另一个文件
-#   dlopen   几个进程按不同的顺序 dlopen 两个库，同一个地址上是不同的库
-#   alone    子进程在一个地址映射一个文件、执行之后退出，组里只剩父进程，它在同一个地址映射
-#            另一个文件（各自一棵进程树：主进程在的时候组里不止它一个）
-# 文件的 ctime 离现在超过两秒才算可信（才能共用翻译），所以编译、写好文件之后先等一会儿
+# Several processes of the same program share Tier 1 translations
+# (docs/rounds/108-shared-translation.md). Sharing assumes they map the same code at the same
+# addresses; in the cases below two processes put different code at the same address, and each
+# must execute its own:
+#   files    parent and child map two different files at the same address
+#   jit      parent and child each write their own code at the same address (writable and
+#            executable anonymous mappings)
+#   rewrite  parent and child first map the same file and execute it together, after which the
+#            child rewrites its own copy
+#   exec     the child execs the same program and maps another file at the same address
+#   dlopen   several processes dlopen two libraries in different orders, so the same address
+#            holds different libraries
+#   alone    the child maps a file at an address, executes it and exits, leaving only the parent
+#            in the group, which maps another file at the same address (each case in its own
+#            process tree: while the main process is there, the group has more than just it)
+# A file is trusted (so translations can be shared) only once its ctime is more than two seconds
+# in the past, so wait a while after compiling and writing the files
 set -e
 cd /tmp
 mkdir -p shared && cd shared
@@ -57,7 +63,7 @@ static fn map_jit(int i, int n)
     return (fn)p;
 }
 
-/* 调用多次，返回结果（每次都一样时），不一样时返回 -1 */
+/* Call several times and return the result (when it is the same every time), -1 when it differs */
 static int run(fn f)
 {
     int first = f();
@@ -67,7 +73,7 @@ static int run(fn f)
     return first;
 }
 
-/* 父子进程各自准备好、互相等到对方也准备好，再一起执行 */
+/* Parent and child each get ready and wait until the other is ready too, then execute together */
 static int pa[2], pb[2];
 static void meet(int child)
 {
@@ -109,8 +115,8 @@ static fn jit(int child)
     return map_jit(1, child ? 3 : 4);
 }
 
-/* 每种情形在主进程 fork 出来的一个进程里跑：主进程自己不映射别的代码，一直可以共用翻译，
- * fork 出来的进程都加入它的组 */
+/* Each case runs in a process forked from the main process: the main process maps no other code
+ * itself and can share translations all along, and the forked processes all join its group */
 static void in_child(void (*body)(void))
 {
     pid_t pid = fork();
@@ -133,7 +139,8 @@ static void case_jit(void)
 
 static char *self;
 
-/* rewrite：先一起执行同一个文件，之后子进程改写自己的那一份再执行 */
+/* rewrite: first execute the same file together, then the child rewrites its own copy and
+ * executes it */
 static void case_rewrite(void)
 {
     fn f = map_file("f1", 2);
@@ -155,7 +162,8 @@ static void case_rewrite(void)
     printf("rewrite: child %d parent %d\n", WEXITSTATUS(status), mine);
 }
 
-/* exec：同一个程序的新地址空间在父进程映射着 f1 的地址上映射 f2 */
+/* exec: the new address space of the same program maps f2 at the address where the parent maps
+ * f1 */
 static void case_exec(void)
 {
     fn f = map_file("f1", 3);
@@ -169,7 +177,8 @@ static void case_exec(void)
     printf("exec: child %d parent %d\n", WEXITSTATUS(status), mine);
 }
 
-/* dlopen：两个进程按不同的顺序加载两个库，同一个地址上是不同的库 */
+/* dlopen: two processes load two libraries in different orders, so the same address holds
+ * different libraries */
 static void case_dlopen(void)
 {
     int results[2], status;
@@ -187,8 +196,9 @@ static void case_dlopen(void)
     printf("dlopen: %d %d\n", results[0], results[1]);
 }
 
-/* alone：子进程映射 f1、执行完退出之后，组里只剩开组的父进程，它在同一格映射 f2，离开组时
- * 留着组里的翻译：那一格里还有子进程翻译的 f1 的块 */
+/* alone: after the child maps f1, executes it and exits, only the parent that opened the group is
+ * left in it; it maps f2 in the same slot and, on leaving the group, keeps the group's
+ * translations: that slot still has the blocks of f1 that the child translated */
 static void case_alone(void)
 {
     pid_t pid = fork();
@@ -209,7 +219,7 @@ int main(int argc, char **argv)
         case_alone();
         return 0;
     }
-    if (argc == 3) { /* exec 出来的：在 argv[2] 那一格映射 argv[1] */
+    if (argc == 3) { /* the exec'd one: map argv[1] in the slot of argv[2] */
         fn f = map_file(argv[1], atoi(argv[2]));
         return f ? run(f) : 100;
     }
@@ -230,7 +240,7 @@ printf 'int v(void) { return 1; }\n' > a.c
 printf 'int v(void) { return 2; }\n' > b.c
 gcc -O2 -shared -fPIC -o liba.so a.c
 gcc -O2 -shared -fPIC -o libb.so b.c
-# 两个只有一页代码的文件：movz w0, #1; ret 和 movz w0, #2; ret
+# Two files with only one page of code: movz w0, #1; ret and movz w0, #2; ret
 printf '\040\000\200\122\300\003\137\326' > f1
 printf '\100\000\200\122\300\003\137\326' > f2
 truncate -s 4096 f1 f2

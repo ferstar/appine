@@ -1,9 +1,11 @@
 # docker-run-options: --privileged
-# 新的挂载接口里的 open_tree、move_mount、mount_setattr（docs/rounds/168-open-tree.md）：crun 用
-# 它们 bind 挂载（get_bind_mount），容器有用户命名空间（--uidmap）时在外面 open_tree 出一棵
-# 树交给里面 move_mount。不带 OPEN_TREE_CLONE 是 O_PATH 的 fd；带的复制出一棵不挂在任何地方
-# 的树（AT_RECURSIVE 连同下面的挂载），经由 fd 用得了，move_mount 接上；mount_setattr 改挂载
-# 的标志。原生一侧是特权容器，只在 /tmp 下面比
+# open_tree, move_mount and mount_setattr of the new mount API (docs/rounds/168-open-tree.md):
+# crun bind-mounts with them (get_bind_mount), and when the container has a user namespace
+# (--uidmap) it open_trees a tree outside and hands it to move_mount inside. Without
+# OPEN_TREE_CLONE the result is an O_PATH fd; with it, a tree attached nowhere is copied (with
+# AT_RECURSIVE, together with the mounts below), which is usable through the fd and is attached
+# with move_mount; mount_setattr changes mount flags. The native side is a privileged container,
+# and only what is under /tmp is compared
 cd /tmp
 rm -rf nm
 mkdir -p nm/src/sub nm/dst nm/dst2 nm/dst3 nm/dst4
@@ -51,7 +53,7 @@ static long setattr(int dfd, const char *p, unsigned f, struct mount_attr *a, si
 }
 static const char *err(long r) { return r < 0 ? strerror(errno) : "ok"; }
 
-// /tmp/nm 下面的挂载：挂载点、标志
+// Mounts under /tmp/nm: mount points, flags
 static void mounts(const char *what)
 {
     printf("%s:", what);
@@ -81,7 +83,7 @@ static void cat(const char *path)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    // 不带 CLONE：O_PATH 的 fd
+    // Without CLONE: an O_PATH fd
     int p = open_tree(AT_FDCWD, "/tmp/nm/src", 0);
     printf("open_tree plain: %s, O_PATH %d, cloexec %d\n", err(p), (fcntl(p, F_GETFL) & O_PATH) != 0,
            (fcntl(p, F_GETFD) & FD_CLOEXEC) != 0);
@@ -91,14 +93,14 @@ int main(void)
     printf("  link %s\n", link);
     printf("move_mount of a plain directory: %s\n", err(move_mount(p, "", AT_FDCWD, "/tmp/nm/dst", MOVE_MOUNT_F_EMPTY_PATH)));
     close(p);
-    // 错误的参数
+    // Bad arguments
     printf("recursive without clone: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/src", AT_RECURSIVE)));
-    // 用一个不会有定义的位：新内核（CI 的）给 open_tree 加了标志 2
+    // Use a bit that will never be defined: newer kernels (CI's) added flag 2 to open_tree
     printf("bad flags: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/src", 1u << 30)));
     printf("missing: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/missing", OPEN_TREE_CLONE)));
     printf("empty path without AT_EMPTY_PATH: %s\n", err(open_tree(AT_FDCWD, "", OPEN_TREE_CLONE)));
 
-    // CLONE：不挂在任何地方，经由 fd 用得了
+    // CLONE: attached nowhere, usable through the fd
     int t = open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE | O_CLOEXEC);
     printf("open_tree clone: %s, cloexec %d\n", err(t), (fcntl(t, F_GETFD) & FD_CLOEXEC) != 0);
     mounts("mounts after clone");
@@ -114,7 +116,7 @@ int main(void)
     fstat(t, &a);
     stat("/tmp/nm/src", &s);
     printf("  same inode as the source %d\n", a.st_ino == s.st_ino && a.st_dev == s.st_dev);
-    // mount_setattr：只读、nosuid
+    // mount_setattr: read-only, nosuid
     struct mount_attr ma = {.attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID};
     printf("setattr rdonly nosuid: %s\n", err(setattr(t, "", AT_EMPTY_PATH, &ma, sizeof ma)));
     struct mount_attr bad = {.attr_set = 0x4000};
@@ -130,7 +132,7 @@ int main(void)
     struct mount_attr nop = {0};
     printf("setattr nothing: %s\n", err(setattr(t, "", AT_EMPTY_PATH, &nop, sizeof nop)));
     printf("setattr not a mount root: %s\n", err(setattr(AT_FDCWD, "/tmp/nm/src", 0, &ma, sizeof ma)));
-    // move_mount 接上
+    // Attach with move_mount
     printf("move_mount bad flags: %s\n", err(move_mount(t, "", AT_FDCWD, "/tmp/nm/dst", 0x1000)));
     printf("move_mount set group: %s\n", err(move_mount(t, "", AT_FDCWD, "/tmp/nm/dst", MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_SET_GROUP)));
     printf("move_mount onto a file: %s\n", err(move_mount(t, "", AT_FDCWD, "/tmp/nm/afile", MOVE_MOUNT_F_EMPTY_PATH)));
@@ -139,12 +141,12 @@ int main(void)
     cat("/tmp/nm/dst/file");
     int w = open("/tmp/nm/dst/new", O_CREAT | O_WRONLY, 0600);
     printf("  create in it: %s\n", err(w));
-    // 已经接上的再 move_mount 一次：挪过去
+    // move_mount an already attached one again: it moves over
     printf("move it again: %s\n", err(move_mount(t, "", AT_FDCWD, "/tmp/nm/dst2", MOVE_MOUNT_F_EMPTY_PATH)));
     mounts("mounts after moving again");
     close(t);
 
-    // AT_RECURSIVE：连同下面的挂载；递归地改标志
+    // AT_RECURSIVE: together with the mounts below; change flags recursively
     int r = open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE | AT_RECURSIVE);
     f = openat(r, "sub/f", O_RDONLY);
     printf("recursive clone: sub/f %s\n", f < 0 ? strerror(errno) : "there");
@@ -157,19 +159,20 @@ int main(void)
     mounts("mounts after the recursive one");
     cat("/tmp/nm/dst3/sub/f");
     close(r);
-    // 关掉没接上的：树没了，什么也不挂
+    // Close an unattached one: the tree is gone and nothing is mounted
     int g = open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE);
     close(g);
     mounts("mounts after closing an unattached clone");
-    // 不在调用者的命名空间里挂着的挂载不能再 clone（open_tree 出来还没接上的）：6.1、6.8 是
-    // EINVAL，新内核（CI 的）可以，不比
+    // A mount that is not mounted in the caller's namespace cannot be cloned again (one from
+    // open_tree not yet attached): EINVAL on 6.1 and 6.8, allowed on newer kernels (CI's), not
+    // compared
     g = open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE);
     int gg = open_tree(g, "", OPEN_TREE_CLONE | AT_EMPTY_PATH);
     if (gg >= 0)
         close(gg);
     printf("plain open_tree of it: %s\n", err(open_tree(g, "", AT_EMPTY_PATH)));
     close(g);
-    // 普通用户
+    // Ordinary user
     if (fork() == 0) {
         setuid(65534);
         printf("nobody open_tree clone: %s\n", err(open_tree(AT_FDCWD, "/tmp/nm/src", OPEN_TREE_CLONE)));
@@ -179,7 +182,8 @@ int main(void)
         exit(0);
     }
     wait(NULL);
-    // move_mount 已经挂着的（目录路径，不带 EMPTY_PATH），不是挂载的根是 EINVAL
+    // move_mount of one already mounted (a directory path, without EMPTY_PATH); one that is not a
+    // mount root is EINVAL
     printf("move_mount by path: %s\n", err(move_mount(AT_FDCWD, "/tmp/nm/dst2", AT_FDCWD, "/tmp/nm/dst4", 0)));
     printf("move_mount not a mount root: %s\n", err(move_mount(AT_FDCWD, "/tmp/nm/src/file", AT_FDCWD, "/tmp/nm/afile", 0)));
     mounts("mounts at the end");

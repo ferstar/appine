@@ -1,6 +1,7 @@
-# epoll 的边沿触发和 EPOLLEXCLUSIVE：已经就绪时又来了数据也要再触发一次（mio 的唤醒器
-# 就靠这一点，tokio 程序原来会卡住），独占的关注一个边沿只叫醒一个进程（没轮到的进程的
-# 自愿上下文切换次数不变）
+# epoll edge triggering and EPOLLEXCLUSIVE: when data arrives while already ready, it must trigger
+# again (mio's waker relies on this; tokio programs used to hang), and an exclusive interest wakes
+# only one process per edge (the voluntary context switch count of the processes not picked does
+# not change)
 set -e
 cd /tmp
 rm -rf /tmp/etdir
@@ -38,7 +39,8 @@ static int wait1(int ms)
     return epoll_wait(ep, &e, 1, ms);
 }
 
-/* 关注 fd 的 events（边沿触发），poke 两次、中间不读：每次 poke 之后报告几个事件 */
+/* Watch fd for events (edge-triggered) and poke twice without reading in between: report how many
+ * events there are after each poke */
 static void twice(const char *name, int fd, uint32_t events, void (*poke)(void *), void *arg)
 {
     ep = epoll_create1(0);
@@ -104,7 +106,7 @@ static void ready_kinds(void)
 {
     int efd = eventfd(0, EFD_NONBLOCK);
     twice("eventfd", efd, EPOLLIN, write_one, &efd);
-    /* 写的一方：每次读都让它再触发 */
+    /* The writing side: every read makes it trigger again */
     int wfd = eventfd(5, EFD_NONBLOCK);
     twice("eventfd write", wfd, EPOLLOUT, read_one, &wfd);
 
@@ -179,8 +181,8 @@ static void ready_kinds(void)
     mq_unlink("/et");
 }
 
-/* mio 的唤醒器：eventfd 以边沿触发关注，从来不读走计数，另一个线程每写一次都要把
- * epoll_wait 叫醒一次 */
+/* mio's waker: an eventfd watched edge-triggered whose count is never read, where every write by
+ * another thread must wake epoll_wait once */
 static int waker, acks[2];
 
 static void *wake_thread(void *arg)
@@ -215,7 +217,8 @@ static void mio_waker(void)
     pthread_join(t, NULL);
 }
 
-/* /proc/<pid>/status 的 voluntary_ctxt_switches：进程每睡下一次加一；读不到时是 -1 */
+/* voluntary_ctxt_switches in /proc/<pid>/status: one more each time the process goes to sleep; -1
+ * when it cannot be read */
 static long switches(pid_t pid)
 {
     char path[64], line[128];
@@ -230,9 +233,10 @@ static long switches(pid_t pid)
     return n;
 }
 
-/* 几个进程各用一个 epoll，以 EPOLLEXCLUSIVE（水平触发）等同一个监听 socket：来一个连接
- * 只有一个进程从 epoll_wait 返回（不 accept 也一样），也只有它被叫醒过——没轮到的自愿
- * 切换的次数不变 */
+/* Several processes, each with its own epoll, wait on the same listening socket with
+ * EPOLLEXCLUSIVE (level-triggered): for each incoming connection only one process returns from
+ * epoll_wait (the same without accept), and only it was ever woken — the voluntary switch count
+ * of the ones not picked does not change */
 static void exclusive(const char *name, int l, void (*poke)(void *))
 {
     int ready[2], out[2];
@@ -304,8 +308,9 @@ C
 gcc -O1 -o et et.c
 ./et
 
-# 嵌套的 epoll：外层边沿触发关注内层时，内层关注的文件每来一次事件（即使已经就绪）外层
-# 都再触发一次，两层嵌套也是；外层在 epoll_wait 里等着时也被叫醒
+# Nested epoll: when the outer one watches the inner one edge-triggered, every event on a file the
+# inner one watches (even when already ready) triggers the outer one again, also with two levels
+# of nesting; the outer one is also woken while waiting in epoll_wait
 cat > nested.c <<'C'
 #define _GNU_SOURCE
 #include <netinet/in.h>
@@ -323,7 +328,8 @@ static int wait1(int ep, int ms)
     return epoll_wait(ep, &e, 1, ms);
 }
 
-/* 内层 epoll 以 inner_events 关注 fd，外层以边沿触发关注内层；每次 poke 之后外层报告几次 */
+/* The inner epoll watches fd with inner_events, the outer one watches the inner edge-triggered;
+ * after each poke report how many times the outer one reports */
 static void nested(const char *name, int fd, uint32_t inner_events, int wfd, size_t len)
 {
     int inner = epoll_create1(0), outer = epoll_create1(0);
@@ -337,7 +343,7 @@ static void nested(const char *name, int fd, uint32_t inner_events, int wfd, siz
     write(wfd, &one, len);
     int b = wait1(outer, 100);
     int c = wait1(outer, 50);
-    /* 外层还没报告过时新加一个已经就绪的关注 */
+    /* Add a new interest that is already ready while the outer one has not reported yet */
     int d = 0;
     printf("%-22s first %d, again %d, quiet %d\n", name, a, b, c);
     (void)d;
@@ -368,7 +374,8 @@ int main(void)
     int s2[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, s2);
     nested("unix, inner ET", s2[0], EPOLLIN | EPOLLET, s2[1], 1);
-    /* 两层嵌套：最外层边沿触发关注中间层，中间层水平触发关注内层 */
+    /* Two levels of nesting: the outermost watches the middle one edge-triggered, the middle one
+     * watches the inner one level-triggered */
     int e3 = eventfd(0, EFD_NONBLOCK);
     int in = epoll_create1(0), mid = epoll_create1(0), out = epoll_create1(0);
     struct epoll_event ev = {.events = EPOLLIN};
@@ -384,7 +391,8 @@ int main(void)
     int z = wait1(out, 50);
     printf("%-22s first %d, again %d, quiet %d\n", "two levels", x, y, z);
 
-    /* 外层报告过之后在 epoll_wait 里等着，另一个进程往已经可读的管道、TCP 连接里再写 */
+    /* After the outer one has reported it waits in epoll_wait, while another process writes again
+     * into a pipe and a TCP connection that are already readable */
     int fds[2][2];
     pipe(fds[0]);
     int c2 = socket(AF_INET, SOCK_STREAM, 0);
@@ -415,8 +423,9 @@ int main(void)
 C
 gcc -O1 -o nested nested.c && ./nested
 
-# 一个线程在 epoll_wait 里等时，另一个线程改 epoll fd 的打开标志（fcntl、FIONBIO）：
-# 等着的一方没有借着这个打开文件，改得了，之后照常被叫醒
+# While one thread waits in epoll_wait, another thread changes the open flags of the epoll fd
+# (fcntl, FIONBIO): the waiting side is not borrowing that open file, so the change goes through,
+# and it is woken as usual afterwards
 cat > flags.c <<'C'
 #include <pthread.h>
 #include <stdint.h>
@@ -459,8 +468,8 @@ int main(void)
 C
 gcc -O1 -o flags flags.c -lpthread && ./flags
 
-# 真实的 tokio 程序：uv 离线安装一个包（缓存里没有，失败）。原来 mio 的第二次唤醒丢了，
-# uv 一直卡住
+# A real tokio program: uv installs a package offline (not in the cache, so it fails). mio's
+# second wakeup used to be lost, and uv hung forever
 rm -rf /tmp/uvenv
 uv venv -q /tmp/uvenv
 uv pip install -q --offline --python /tmp/uvenv/bin/python pip || echo "uv exit $?"

@@ -1,4 +1,5 @@
-# Rust：cargo 新建、编译（release、debug）、测试、线程、子进程；从 crates.io 拉依赖
+# Rust: cargo new, building (release, debug), tests, threads, child processes; dependencies pulled
+# from crates.io
 cd /tmp; rm -rf hello; cargo new -q hello && cd hello || exit 1
 cat > src/main.rs <<'RS'
 use std::sync::{mpsc, Arc, Mutex};

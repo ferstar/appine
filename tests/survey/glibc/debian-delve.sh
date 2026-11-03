@@ -1,6 +1,7 @@
-# Debian（glibc）：delve 1.24 调试 Go 1.24 的程序。断点停在 goroutine 里、列 goroutine、
-# 调用栈、局部变量、单步、硬件观察点；dlv debug 现编现调，headless 的服务端加 dlv connect，
-# attach 到运行中的进程
+# Debian (glibc): delve 1.24 debugging Go 1.24 programs. Breakpoints that stop in goroutines,
+# listing goroutines, the call stack, local variables, single-stepping, hardware watchpoints; dlv
+# debug building and debugging on the spot, a headless server plus dlv connect, attaching to a
+# running process
 export DEBIAN_FRONTEND=noninteractive
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 if ! command -v dlv >/dev/null || ! command -v go >/dev/null; then
@@ -59,7 +60,7 @@ func main() {
 G
 s=$(date +%s)
 go build -gcflags='all=-N -l' -o hello . ; echo "build: $? ($(( $(date +%s) - s ))s)"
-# delve 打印的地址、goroutine 编号、pid 每次不同
+# The addresses, goroutine numbers and pids delve prints differ every time
 strip_addr() { sed -E 's/0x[0-9a-f]+/ADDR/g; s/Goroutine [0-9]+/Goroutine N/; s/goroutine\(([0-9]+)\)/goroutine(N)/; s/[Pp]rocess [0-9]+/process N/'; }
 cat > bp.dlv <<'D'
 break main.work
@@ -134,8 +135,9 @@ print main.counter > 0
 goroutines
 exit
 D
-# exit 问要不要结束进程，回答 n 时显式 detach。读到 EOF 时 delve 不 detach 就退出，由内核在
-# 跟踪者退出时 detach（appine 原来把 attach 的 SIGSTOP 投递出去，进程停住，见第 95 轮）
+# exit asks whether to end the process, and answering n detaches explicitly. On EOF delve exits
+# without detaching, and the kernel detaches when the tracer exits (appine used to deliver the
+# attach's SIGSTOP, leaving the process stopped, see round 95)
 echo n | dlv attach $p --init at.dlv --allow-non-terminal-interactive=true >a.log 2>&1; echo "exit $?"
 grep -E '^(true|false)$' a.log
 case $(cut -d' ' -f3 /proc/$p/stat) in [Tt]) echo "stopped after detach" ;; *) echo "running after detach" ;; esac

@@ -1,5 +1,5 @@
-# Go：goroutine、channel 和 select，死循环里的异步抢占（SIGURG）和 GC，nil 解引用转成
-# panic，os/signal，os/exec 和管道，浮点格式化
+# Go: goroutines, channels and select, asynchronous preemption (SIGURG) and GC in an infinite
+# loop, nil dereferences turned into panics, os/signal, os/exec and pipes, float formatting
 set -e
 mkdir -p /tmp/diff-go
 cd /tmp/diff-go
@@ -62,7 +62,8 @@ loop:
 	}
 	fmt.Println("select", total)
 
-	// 不调用任何函数的死循环只能靠信号异步抢占，否则 GC 的 stop-the-world 停不下来
+	// An infinite loop that calls no functions can only be preempted asynchronously by a signal;
+	// otherwise GC's stop-the-world cannot stop it
 	var stop int32
 	go func() {
 		x := 0

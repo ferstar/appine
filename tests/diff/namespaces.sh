@@ -1,8 +1,10 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
-# 命名空间：/proc/<pid>/ns 的链接和打开之后的文件，挂载命名空间（unshare、clone 的
-# CLONE_NEWNS，两边的挂载互不可见，/proc/<pid>/mountinfo 看那个进程的，setns 回去，在新的
-# 命名空间里 pivot_root 不影响外面），以及各种错误。原生一侧是有 CAP_SYS_ADMIN 的 docker 容器。
-# 命名空间的编号两边不同，只比格式和异同
+# Namespaces: the /proc/<pid>/ns links and the files opened from them, mount namespaces (unshare,
+# clone's CLONE_NEWNS, the two sides' mounts invisible to each other, /proc/<pid>/mountinfo
+# showing that process's, setns back, pivot_root in a new namespace not affecting the outside),
+# and various errors. The native side is a docker container with CAP_SYS_ADMIN. Namespace IDs
+# differ between the two sides, so only the format and whether they are the same or different
+# are compared
 cd /tmp
 rm -rf ns
 mkdir -p ns/a ns/b ns/root
@@ -18,7 +20,7 @@ echo "inode is the number: $([ "$(stat -L -c %i /proc/self/ns/mnt)" = "$(readlin
 echo "same for threads: $([ "$(readlink /proc/$$/ns/mnt)" = "$(readlink /proc/$$/task/$$/ns/mnt)" ] && echo yes)"
 stat -f -c %t /proc/self/ns/mnt
 
-# busybox 的 unshare -m：里面挂的外面看不到
+# busybox's unshare -m: what is mounted inside is not seen outside
 busybox unshare -m sh -c '
     mount --make-rprivate /
     mount -t tmpfs inside /tmp/ns/a && echo "inside: $(grep -c " /tmp/ns/a " /proc/self/mountinfo)"
@@ -44,8 +46,9 @@ def call(f, *args):
 
 
 def join(t):
-    # t.join() 返回时内核里的线程可能还没退完，紧接着 fork 时 Python 会按 /proc/self/stat 的
-    # 线程数警告"多线程的进程 fork"（原生上时有时无），所以等它退完
+    # When t.join() returns the thread may not have finished exiting in the kernel, and when
+    # forking right after that Python warns about a "fork of a multithreaded process" based on
+    # the thread count in /proc/self/stat (natively only sometimes), so wait until it has exited
     t.join()
     for _ in range(500):
         if len(os.listdir("/proc/self/task")) == 1:
@@ -79,7 +82,8 @@ print("cwd after setns", os.getcwd())
 os.chdir("/tmp")
 print("clone NEWNS with FS", libc.syscall(220, CLONE_NEWNS | CLONE_FS | 17, 0, 0, 0, 0), errno.errorcode[ctypes.get_errno()])
 
-# 子进程在新的挂载命名空间里：两边后来挂的互不可见，从外面看它的 mountinfo 看得到它的
+# The child in a new mount namespace: what either side mounts later is invisible to the other,
+# and its mountinfo seen from outside shows its mounts
 r1, w1 = os.pipe()
 r2, w2 = os.pipe()
 pid = os.fork()
@@ -92,7 +96,7 @@ if pid == 0:
     os.read(r2, 1)
     print("child sees parent's mount", mounted("/tmp/ns/b"), flush=True)
     print("child sees own mount", mounted("/tmp/ns/a"), flush=True)
-    # setns 回到原来的命名空间：根目录、当前目录换成那里的根
+    # setns back to the original namespace: the root and current directories become its root
     os.chdir("/tmp/ns")
     print("child setns back", call(libc.setns, mine, CLONE_NEWNS), flush=True)
     print("child back", ns() == ns(os.getppid()), os.getcwd(), mounted("/tmp/ns/a"), mounted("/tmp/ns/b"), flush=True)
@@ -101,7 +105,7 @@ os.read(r1, 1)
 print("parent mount", call(libc.mount, b"parent", b"/tmp/ns/b", b"tmpfs", 0, None))
 print("parent sees child's mount", mounted("/tmp/ns/a"))
 print("child's mountinfo", mounted("/tmp/ns/a", pid), mounted("/tmp/ns/b", pid))
-# 别的命名空间里的挂载：经由 /proc/<pid>/root 也不能 bind、卸下
+# Mounts in another namespace: they cannot be bound or unmounted even through /proc/<pid>/root
 print("bind from another namespace", call(libc.mount, ("/proc/%d/root/tmp/ns/a" % pid).encode(), b"/tmp/ns/root", None, MS_BIND, None))
 libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
 print("umount in another namespace", call(libc.umount2, ("/proc/%d/root/tmp/ns/a" % pid).encode(), 0))
@@ -109,7 +113,7 @@ os.write(w2, b"x")
 os.waitpid(pid, 0)
 libc.umount2(b"/tmp/ns/b", 0)
 
-# 在新的命名空间里 pivot_root：外面不受影响
+# pivot_root in a new namespace: the outside is not affected
 pid = os.fork()
 if pid == 0:
     os.unshare(CLONE_NEWNS)
@@ -125,7 +129,8 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("outside root", os.path.isdir("/tmp/ns/root"), mounted("/tmp/ns/root"), os.path.exists("/bin/sh"))
 
-# 多线程的进程不能 setns 挂载命名空间；没有 CAP_SYS_ADMIN 不能 unshare、setns
+# A multithreaded process cannot setns into a mount namespace; without CAP_SYS_ADMIN one cannot
+# unshare or setns
 ev = threading.Event()
 t = threading.Thread(target=ev.wait)
 t.start()
@@ -146,7 +151,7 @@ os.waitpid(pid, 0)
 PY
 echo "left: $(grep -c ' /tmp/ns' /proc/self/mountinfo)"
 
-# 用户命名空间
+# User namespaces
 cat /proc/self/uid_map /proc/self/gid_map /proc/self/projid_map /proc/self/setgroups
 echo "max_user_namespaces: $(test -r /proc/sys/user/max_user_namespaces && echo yes)"
 echo "unshare -r: $(busybox unshare -r sh -c 'id -u; id -g; cat /proc/self/uid_map' | tr -s ' \n' ' ')"
@@ -166,8 +171,9 @@ def call(f, *args):
 
 
 def join(t):
-    # t.join() 返回时内核里的线程可能还没退完，紧接着 fork 时 Python 会按 /proc/self/stat 的
-    # 线程数警告"多线程的进程 fork"（原生上时有时无），所以等它退完
+    # When t.join() returns the thread may not have finished exiting in the kernel, and when
+    # forking right after that Python warns about a "fork of a multithreaded process" based on
+    # the thread count in /proc/self/stat (natively only sometimes), so wait until it has exited
     t.join()
     for _ in range(500):
         if len(os.listdir("/proc/self/task")) == 1:
@@ -195,7 +201,8 @@ def capeff():
 
 
 def fork(f):
-    """在子进程里运行 f：出了什么错都打印出来，然后退出，不会接着跑父进程的代码。"""
+    """Run f in a child process: print whatever goes wrong, then exit, without going on to run
+    the parent's code."""
     pid = os.fork()
     if pid == 0:
         try:
@@ -223,8 +230,8 @@ def errno_of(f, *args):
         return errno.errorcode[e.errno]
 
 
-# /proc/<pid>/exe 要能看那个进程（PTRACE_MODE_READ_FSCREDS）：别的用户的、不可 dump 的
-# 看不了，自己的总可以
+# /proc/<pid>/exe requires being able to look at that process (PTRACE_MODE_READ_FSCREDS): other
+# users' and non-dumpable ones cannot be looked at, one's own always can
 def exe_as_nobody():
     os.setgid(65534)
     os.setuid(65534)
@@ -251,17 +258,19 @@ init_user = os.open("/proc/self/ns/user", os.O_RDONLY)
 print("setns to own user namespace", call(libc.setns, init_user, CLONE_NEWUSER))
 
 
-# root 新建的：没写映射时 ID 是 65534，有全部能力；自己写 0 0 1；gid_map 要先禁止 setgroups
+# Created by root: before the maps are written the IDs are 65534, with all capabilities; it writes
+# 0 0 1 itself; gid_map requires denying setgroups first
 def root_inside():
     os.unshare(CLONE_NEWUSER)
     print("new user ns", os.readlink("/proc/self/ns/user") != os.readlink("/proc/self/fd/%d" % init_user))
-    # 别的用户命名空间里的进程（父进程）的链接看不了：不在同一个用户命名空间，又没有那边的
-    # CAP_SYS_PTRACE
+    # The links of a process in another user namespace (the parent) cannot be read: we are not in
+    # the same user namespace, and have no CAP_SYS_PTRACE there
     try:
         os.readlink("/proc/%d/ns/user" % os.getppid())
     except OSError as e:
         print("parent's link", errno.errorcode[e.errno])
-    # exe 与 root、cwd 一样（proc_fd_access_allowed），读链接和跟随都不行
+    # exe is like root and cwd (proc_fd_access_allowed): neither reading the link nor following it
+    # works
     for link in ("exe", "cwd", "root"):
         path = "/proc/%d/%s" % (os.getppid(), link)
         print("parent's", link, errno_of(os.readlink, path), errno_of(os.stat, path),
@@ -296,9 +305,9 @@ def root_inside():
     os.close(w)
     print("exec", os.read(r, 100).split())
     os.waitpid(pid, 0)
-    # 在这个用户命名空间里不能回到上一层的
+    # From this user namespace one cannot go back to the parent one
     print("setns to the parent", call(libc.setns, init_user, CLONE_NEWUSER))
-    # 外面的 root 看它的映射
+    # root outside looks at its maps
     os.write(wfd, b"x")
     os.read(rfd2, 1)
 
@@ -313,7 +322,7 @@ with open("/proc/%d/status" % pid) as f:
     print("parent sees ids", [l.split()[1:3] for l in f if l.split()[0] in ("Uid:", "Gid:")])
 
 
-# 外面的 root 可以 setns 进去
+# root outside can setns into it
 def enter():
     fd = os.open("/proc/%d/ns/user" % pid, os.O_RDONLY)
     print("setns into it", call(libc.setns, fd, CLONE_NEWUSER), os.getuid(), capeff())
@@ -324,13 +333,15 @@ os.write(wfd2, b"x")
 os.waitpid(pid, 0)
 
 
-# 普通用户自己建的用户命名空间不在这里比：Ubuntu 23.10 起的
-# kernel.apparmor_restrict_unprivileged_userns（开发用的虚拟机、GitHub 的 runner 都开着）不让
-# 它们在里面有能力，原生一侧比出来的不是上游 Linux 的行为。这部分在 hosts/cli/tests 里按
-# 上游的行为检查（user_namespace_of_an_unprivileged_user）
+# User namespaces that ordinary users create themselves are not compared here: Ubuntu's
+# kernel.apparmor_restrict_unprivileged_userns from 23.10 on (on in the development VM and on
+# GitHub's runners) denies them capabilities inside, so what the native side shows is not the
+# behavior of upstream Linux. This part is checked against the upstream behavior in
+# hosts/cli/tests (user_namespace_of_an_unprivileged_user)
 
 
-# 错误：多线程不能 unshare，CLONE_NEWUSER 和 CLONE_FS 不能同用，chroot 了不能建，嵌套最多 32 层
+# Errors: a multithreaded process cannot unshare, CLONE_NEWUSER and CLONE_FS cannot be used
+# together, none can be created after chroot, nesting is at most 32 levels
 ev = threading.Event()
 t = threading.Thread(target=ev.wait)
 t.start()
@@ -367,7 +378,7 @@ def nested():
 child(nested)
 PY2
 
-# pid 命名空间：busybox 的 unshare -p -f --mount-proc，里面的 sh 是 1 号进程
+# pid namespaces: busybox's unshare -p -f --mount-proc, where the sh inside is process 1
 busybox unshare -p -f --mount-proc sh -c '
     echo "pid $$ ppid $PPID"
     echo /proc/[0-9]*
@@ -377,19 +388,21 @@ busybox unshare -p -f --mount-proc sh -c '
     grep -E "^(Tgid|Pid|PPid|NStgid|NSpid|NSpgid|NSsid)" /proc/self/status
     sleep 100 &
     kill -0 $! && echo "background $!"
-    # ash 报告作业被结束（Terminated）的时机与快慢有关，不比
+    # When ash reports the job as killed (Terminated) depends on speed, so it is not compared
     kill $! 2>/dev/null; wait $! 2>/dev/null; echo "killed with status $?"
     kill -TERM 1; kill -KILL 1; echo "init survives its own SIGTERM and SIGKILL"
     echo "last pid $(cat /proc/sys/kernel/ns_last_pid)"
 '
 echo "unshare exits with $?"
-# 在里面 strace -f：跟踪者拿到的新进程的编号（PTRACE_GETEVENTMSG）和 wait 的结果都是里面的
+# strace -f inside: the new process IDs the tracer gets (PTRACE_GETEVENTMSG) and the results of
+# wait are all the inner ones
 busybox unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
-# 1 号进程的 task/1/children 里是里面的编号（两个后台的 sleep 和 cat 自己）
+# task/1/children of process 1 has the inner IDs (the two background sleeps and cat itself)
 busybox unshare -p -f --mount-proc sh -c 'sleep 100 & sleep 100 & echo "children of 1: $(cat /proc/1/task/1/children)."; kill 2 3'
-# 父进程在 pid 命名空间外面被结束：里面的 1 号进程设的 PR_SET_PDEATHSIG（SIGKILL）照样收到，
-# 发送者在里面看不见，按强制的信号处理（util-linux 的 unshare --kill-child、bwrap 的
-# --die-with-parent 靠它）。exec 成 sleep 之前已经设好
+# The parent is killed outside the pid namespace: process 1 inside still receives the
+# PR_SET_PDEATHSIG (SIGKILL) it set, and since the sender is invisible inside, it is handled as a
+# forced signal (util-linux's unshare --kill-child and bwrap's --die-with-parent rely on this).
+# It is already set before exec'ing into sleep
 unshare -p -f --kill-child sleep 1000 &
 u=$!
 c=
@@ -427,8 +440,9 @@ def err(f, *args):
 
 
 def join(t):
-    # t.join() 返回时内核里的线程可能还没退完，紧接着 fork 时 Python 会按 /proc/self/stat 的
-    # 线程数警告"多线程的进程 fork"（原生上时有时无），所以等它退完
+    # When t.join() returns the thread may not have finished exiting in the kernel, and when
+    # forking right after that Python warns about a "fork of a multithreaded process" based on
+    # the thread count in /proc/self/stat (natively only sometimes), so wait until it has exited
     t.join()
     for _ in range(500):
         if len(os.listdir("/proc/self/task")) == 1:
@@ -437,7 +451,8 @@ def join(t):
 
 
 def fork(f):
-    """在子进程里运行 f：出了什么错都打印出来，然后退出，不会接着跑父进程的代码。"""
+    """Run f in a child process: print whatever goes wrong, then exit, without going on to run
+    the parent's code."""
     pid = os.fork()
     if pid == 0:
         try:
@@ -484,7 +499,8 @@ def pids(proc):
 
 
 def inner_global(init, local):
-    """1 号进程是全局的 init 时，它的命名空间里编号为 local 的进程在外面的编号。"""
+    """When process 1 is the global init, the ID outside of the process whose ID is local in its
+    namespace."""
     for d in pids("/proc"):
         try:
             if status(d, "NSpid")[-1] == str(local) and init in (d, int(status(d, "PPid")[0])):
@@ -493,8 +509,9 @@ def inner_global(init, local):
             pass
 
 
-# unshare 之后自己不变，之后的子进程在新的命名空间里、是那里的 1 号进程；进去之前不能再
-# unshare，也不能建线程；1 号进程退出之后不能再在里面建进程
+# After unshare one's own process does not change, and later children are in the new namespace,
+# the first being process 1 there; before entering it one cannot unshare again or create
+# threads; after process 1 exits no more processes can be created inside
 def unshared():
     me = os.getpid()
     os.unshare(CLONE_NEWPID)
@@ -530,7 +547,8 @@ child(unshared)
 print("thread NEWPID", libc.syscall(220, CLONE_NEWPID | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0), errno.errorcode[ctypes.get_errno()])
 
 
-# 1 号进程：它的子进程、孤儿过继给它、setsid、线程、kill(-1)、ns_last_pid、新的 procfs 实例
+# Process 1: its children, orphans reparented to it, setsid, threads, kill(-1), ns_last_pid, a new
+# procfs instance
 def first():
     os.unshare(CLONE_NEWPID)
 
@@ -571,7 +589,8 @@ def first():
     r2, w2 = os.pipe()
     pid = fork(init)
     os.read(r, 1)
-    # 外面看里面：新的 procfs 实例里的编号是里面的，self 没有；全局的 procfs 里有两层编号
+    # Looking inside from outside: IDs in the new procfs instance are the inner ones, and self is
+    # absent; the global procfs has the IDs of both levels
     print("outside: pids", pids("/tmp/ns/p"), "self", link("/tmp/ns/p/self"))
     print("outside: init status", status(1, "Pid", "/tmp/ns/p"), len(status(pid, "NStgid")), status(pid, "NStgid")[-1])
     print("outside: own NSpid", len(status("self", "NSpid")))
@@ -582,8 +601,8 @@ def first():
 child(first)
 
 
-# 信号：里面发给 1 号进程的 si_pid 是发送者在里面的编号，外面发的是 0；外面发的 SIGTERM
-# 按默认处理时被忽略，SIGKILL 不会
+# Signals: si_pid of signals sent to process 1 from inside is the sender's inner ID, and 0 for
+# ones sent from outside; SIGTERM from outside is ignored under default handling, SIGKILL is not
 def signals():
     os.unshare(CLONE_NEWPID)
     r, w = os.pipe()
@@ -614,8 +633,8 @@ def signals():
 child(signals)
 
 
-# 外面发的 SIGSTOP 让 1 号进程停下，里面发的 SIGCONT 虽然被丢掉也让它继续；按默认方式处理
-# 的同步异常照常结束它
+# SIGSTOP from outside stops process 1, and SIGCONT from inside resumes it even though it is
+# discarded; synchronous exceptions handled the default way kill it as usual
 def stop_cont():
     os.unshare(CLONE_NEWPID)
     ready, go = os.pipe(), os.pipe()
@@ -649,8 +668,9 @@ def stop_cont():
 child(stop_cont)
 
 
-# 1 号进程退出：里面别的进程都被结束、回收之后父进程才等到它。父进程在外面的（unshare、
-# setns 之后 fork 的）结束了要等父进程回收
+# Process 1 exits: the parent can wait for it only after all other processes inside have been
+# killed and reaped. Those whose parent is outside (forked after unshare or setns) must wait for
+# that parent to reap them after they end
 def zap():
     os.unshare(CLONE_NEWPID)
     r, w = os.pipe()
@@ -677,7 +697,8 @@ def zap():
 child(zap)
 
 
-# setns 到 pid 命名空间：之后的子进程在里面，看不到父进程；只能进自己的和后代命名空间
+# setns into a pid namespace: later children are inside and cannot see the parent; only one's own
+# namespace and descendant namespaces can be entered
 def entered():
     os.unshare(CLONE_NEWPID)
     r, w = os.pipe()
@@ -704,7 +725,7 @@ def entered():
 child(entered)
 
 
-# SO_PEERCRED：外面监听、里面连接，里面看到的对方 pid 是 0
+# SO_PEERCRED: listening outside and connecting inside, the peer pid seen inside is 0
 def peercred():
     os.unshare(CLONE_NEWPID)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -731,8 +752,9 @@ def peercred():
 child(peercred)
 
 
-# clone3 的 set_tid：指定新进程在各层的编号，从它所在的那层起往外。只比里面两层：docker 的
-# 容器本身在一个 pid 命名空间里，再往外的层两边不同
+# clone3's set_tid: specifies the new process's ID at each level, from its own level outwards.
+# Only the inner two levels are compared: the docker container itself is in a pid namespace, and
+# the levels further out differ between the two sides
 class CloneArgs(ctypes.Structure):
     _fields_ = [(n, ctypes.c_uint64) for n in (
         "flags", "pidfd", "child_tid", "parent_tid", "exit_signal", "stack", "stack_size",
@@ -776,8 +798,9 @@ def unprivileged_set_tid():
 child(unprivileged_set_tid)
 
 
-# 最多嵌套 32 层。docker 的容器本身在一个 pid 命名空间里，原生一侧少嵌套一层，只比错误
-# （层数在单元测试 pid_namespaces 里）
+# Nesting is at most 32 levels. The docker container itself is in a pid namespace, so the native
+# side nests one level less; only the error is compared (the level count is in the unit test
+# pid_namespaces)
 def nested():
     for level in range(1, 40):
         try:
@@ -794,7 +817,8 @@ def nested():
 child(nested)
 
 
-# PR_SET_CHILD_SUBREAPER：外面的 subreaper 不收养里面的孤儿（不跨出命名空间），里面的照常收养
+# PR_SET_CHILD_SUBREAPER: a subreaper outside does not adopt orphans inside (not across the
+# namespace), one inside adopts them as usual
 PR_SET_CHILD_SUBREAPER = 36
 
 
@@ -823,7 +847,7 @@ def subreapers():
 child(subreapers)
 PY3
 
-# UTS 命名空间：busybox 的 unshare -u 里改的主机名外面看不到
+# UTS namespaces: a hostname changed in busybox's unshare -u is not seen outside
 before=$(hostname)
 busybox unshare -u sh -c '
     hostname inner
@@ -898,7 +922,8 @@ def semop(sem, op, flg):
 name = socket.gethostname()
 
 
-# 新的 UTS 命名空间复制原来的名字；里面改的外面看不到；名字太长是 EINVAL；没有能力是 EPERM
+# A new UTS namespace copies the original names; changes inside are not seen outside; a name that
+# is too long is EINVAL; without capabilities it is EPERM
 def uts():
     os.unshare(CLONE_NEWUTS)
     print("copied", socket.gethostname() == name, "domain", os.uname().nodename == name)
@@ -920,8 +945,8 @@ child(lambda: (os.setuid(65534), print("unprivileged sethostname", err(socket.se
                                      "unshare", err(os.unshare, CLONE_NEWUTS))))
 
 
-# root 建的用户命名空间里的 UTS 命名空间：属主是新的用户命名空间，在里面能改名字；
-# setns 进去之后看到的是它的名字
+# A UTS namespace in a user namespace created by root: its owner is the new user namespace, and
+# the name can be changed inside; after setns into it, its name is seen
 def owned():
     os.unshare(CLONE_NEWUSER | CLONE_NEWUTS)
     socket.sethostname("owned")
@@ -951,8 +976,9 @@ def joined():
 child(joined)
 
 
-# IPC 命名空间：里面看不到外面的 System V IPC 对象和 POSIX 消息队列，id 重新编号；
-# shmat 的段在 unshare 之后照样能 shmdt；换命名空间时执行 SEM_UNDO 的撤销值
+# IPC namespaces: System V IPC objects and POSIX message queues outside are not visible inside,
+# and ids are numbered afresh; a segment attached with shmat can still be detached with shmdt
+# after unshare; SEM_UNDO adjustments are applied when switching namespaces
 shm = libc.shmget(KEY, 4096, IPC_CREAT | 0o600)
 sem = libc.semget(KEY, 1, IPC_CREAT | 0o600)
 msq = libc.msgget(KEY, IPC_CREAT | 0o600)
@@ -997,7 +1023,7 @@ print("clone NEWIPC with SYSVSEM", libc.syscall(220, CLONE_NEWIPC | CLONE_SYSVSE
 child(lambda: (os.setuid(65534), print("unprivileged unshare", err(os.unshare, CLONE_NEWIPC))))
 
 
-# setns 到别的进程的 IPC 命名空间：看到的是它的对象
+# setns into another process's IPC namespace: its objects are seen
 def joined_ipc():
     r, w = os.pipe()
 
@@ -1023,8 +1049,8 @@ libc.msgctl(msq, IPC_RMID, None)
 libc.mq_unlink(b"/appine-ns")
 PY4
 
-# 网络命名空间：busybox 的 unshare -n 里只有关着的 lo，ip 把它打开之后有 127.0.0.1/8、::1
-# 和 local 表里的路由，外面的地址到不了
+# Network namespaces: inside busybox's unshare -n there is only lo, down; after ip brings it up
+# there are 127.0.0.1/8, ::1 and routes in the local table, and outside addresses are unreachable
 busybox unshare -n sh -c '
     ip link show
     ip -o addr
@@ -1036,7 +1062,8 @@ busybox unshare -n sh -c '
     ping -c 1 -W 1 10.0.0.1 2>&1 | tail -1
 '
 
-# ICMPv6 在新的网络命名空间里：lo 打开之后 ::1 ping 得通（appine 的 ICMPv6 socket 用宿主的 ::1）
+# ICMPv6 in a new network namespace: once lo is up, ::1 can be pinged (appine's ICMPv6 sockets use
+# the host's ::1)
 busybox unshare -n sh -c 'ping6 -c 1 -W 1 ::1 2>&1 | tail -1; ip link set lo up; ping6 -c 1 ::1 | sed "s/ time=.*//; /round-trip/d"'
 
 python3 - <<'PY5'
@@ -1090,7 +1117,7 @@ def rtattr(ty, data):
 
 
 def rtnl(*msgs):
-    """经由 NETLINK_ROUTE 发请求，返回每个请求的确认里的错误码。"""
+    """Send requests over NETLINK_ROUTE and return the error code in each request's ack."""
     s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
     s.bind((0, 0))
     out = []
@@ -1101,13 +1128,14 @@ def rtnl(*msgs):
     return out
 
 
-# bubblewrap 的 loopback_setup：RTM_NEWADDR 加 127.0.0.1/8，再 RTM_NEWLINK 把 lo 打开，都要确认
+# bubblewrap's loopback_setup: RTM_NEWADDR adds 127.0.0.1/8, then RTM_NEWLINK brings lo up, both
+# asking for an ack
 NEWADDR = (20, 0x4 | 0x200 | 0x400, struct.pack("=BBBBI", socket.AF_INET, 8, 0x80, 254, 1)
            + rtattr(2, bytes([127, 0, 0, 1])) + rtattr(1, bytes([127, 0, 0, 1])))
 NEWLINK = (16, 0x4, struct.pack("=BBHiII", 0, 0, 0, 1, 1, 1))
 
 
-# 外面监听的回环端口和抽象地址：里面都连不到
+# A loopback port and an abstract address listened on outside: neither can be reached from inside
 outer = tcp()
 outer.bind(("127.0.0.1", 0))
 outer.listen()
@@ -1123,7 +1151,7 @@ def netns():
     print("new ns", os.readlink("/proc/self/ns/net") != me)
     print("interfaces", socket.if_nameindex(), "lo", socket.if_nametoindex("lo"),
           "eth0", err(socket.if_nametoindex, "eth0"))
-    # lo 关着：通配地址能绑，127.0.0.1 绑不上、连不到
+    # lo down: the wildcard address can be bound, 127.0.0.1 can neither be bound nor reached
     print("down: bind any", err(tcp().bind, ("0.0.0.0", 0)), "bind lo", err(tcp().bind, ("127.0.0.1", 0)),
           "connect", err(tcp().connect, ("127.0.0.1", 9)), "v6", err(tcp(socket.AF_INET6).connect, ("::1", 9)))
     r, w = os.pipe()
@@ -1131,7 +1159,7 @@ def netns():
     os.waitpid(pid, 0)
     print("unprivileged rtnl", os.read(r, 100).decode())
     print("bwrap's loopback_setup", rtnl(NEWADDR, NEWLINK), "again", rtnl(NEWADDR))
-    # 回环上的 TCP：两端的地址都是 127.0.0.1
+    # TCP over loopback: the addresses of both ends are 127.0.0.1
     srv = tcp()
     srv.bind(("127.0.0.1", 0))
     srv.listen()
@@ -1142,12 +1170,12 @@ def netns():
     c.sendall(b"hello")
     print("tcp", srv.getsockname()[0], c.getpeername() == ("127.0.0.1", port), peer[0],
           conn.getsockname() == c.getpeername(), conn.recv(5))
-    # 通配地址：getsockname 是 0.0.0.0，连 127.0.0.1 也连得上
+    # The wildcard address: getsockname is 0.0.0.0, and connecting to 127.0.0.1 works too
     any4 = tcp()
     any4.bind(("0.0.0.0", 0))
     any4.listen()
     print("any", any4.getsockname()[0], err(tcp().connect, ("127.0.0.1", any4.getsockname()[1])))
-    # IPv6 的 ::1 和 ::
+    # IPv6 ::1 and ::
     s6 = tcp(socket.AF_INET6)
     s6.bind(("::", 0))
     s6.listen()
@@ -1155,21 +1183,22 @@ def netns():
     c6.connect(("::1", s6.getsockname()[1]))
     a6, p6 = s6.accept()
     print("v6", s6.getsockname()[0], p6[0], c6.getpeername()[0])
-    # UDP 和自动绑定
+    # UDP and autobinding
     u = udp()
     u.bind(("127.0.0.1", 0))
     v = udp()
     v.sendto(b"x", u.getsockname())
     data, frm = u.recvfrom(10)
     print("udp", data, frm[0], frm == v.getsockname()[:0] or frm[1] == v.getsockname()[1], v.getsockname()[0])
-    # 外面的地址到不了；外面的回环端口和抽象地址在这里是另一套
+    # Outside addresses are unreachable; the outside loopback ports and abstract addresses are a
+    # separate set here
     print("outside", err(tcp().connect, ("10.0.0.1", 80)), err(udp().sendto, b"x", ("8.8.8.8", 53)),
           err(udp().connect, ("192.0.2.1", 9)), "bind", err(tcp().bind, ("10.0.0.1", 0)))
     print("outer port", err(tcp().connect, ("127.0.0.1", outer_port)))
     un = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     print("outer abstract", err(un.connect, "\0appine-netns"),
           "bind it here", err(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind, "\0appine-netns"))
-    # /proc/net 是这个命名空间的：dev 只有 lo，tcp 里只有这里的 socket
+    # /proc/net is this namespace's: dev has only lo, tcp has only the sockets here
     with open("/proc/self/net/dev") as f:
         print("dev", [l.split(":")[0].strip() for l in f.readlines()[2:]])
     with open("/proc/self/net/tcp") as f:
@@ -1177,7 +1206,8 @@ def netns():
     mine = {"0100007F:%04X" % port, "00000000:%04X" % any4.getsockname()[1],
             "0100007F:%04X" % c.getsockname()[1], "0100007F:%04X" % conn.getsockname()[1]}
     print("tcp listing has ours", mine <= listed, "not the outer one", "0100007F:%04X" % outer_port not in listed)
-    # setns 回原来的命名空间：之后建的 socket 连得上外面的端口
+    # setns back to the original namespace: sockets created afterwards can connect to the outside
+    # port
     fd = os.open("/proc/%d/ns/net" % os.getppid(), os.O_RDONLY)
     print("setns back", err(os.setns, fd, CLONE_NEWNET), err(tcp().connect, ("127.0.0.1", outer_port)),
           "old socket", err(c.send, b"y"))
@@ -1187,7 +1217,8 @@ child(netns)
 child(lambda: (os.setuid(65534), print("unprivileged unshare", err(os.unshare, CLONE_NEWNET))))
 
 
-# root 建的用户命名空间里的网络命名空间：属主是新的用户命名空间，在里面能配 lo
+# A network namespace in a user namespace created by root: its owner is the new user namespace,
+# and lo can be configured inside
 def owned():
     os.unshare(CLONE_NEWUSER | CLONE_NEWNET)
     lo_up()
@@ -1200,7 +1231,7 @@ def owned():
 child(owned)
 PY5
 
-# cgroup 命名空间：只有编号不同，里面看到的 cgroup 仍是根
+# cgroup namespaces: only the ID differs, and the cgroup seen inside is still the root
 python3 -c '
 import os
 me = os.readlink("/proc/self/ns/cgroup")
@@ -1208,8 +1239,9 @@ os.unshare(0x02000000)
 print("cgroup:", open("/proc/self/cgroup").read().strip(), "different ns:", os.readlink("/proc/self/ns/cgroup") != me)
 '
 
-# bubblewrap 的挂法：源和挂载点都经由 /proc/self/fd/N 给出，挂载点是 tmpfs 里的文件；
-# mountinfo 里的挂载点照样是那个文件的路径（bwrap 靠它找到挂载再改成只读）
+# bubblewrap's way of mounting: both the source and the mount point are given through
+# /proc/self/fd/N, the mount point being a file in a tmpfs; the mount point in mountinfo is still
+# that file's path (bwrap relies on this to find the mount and make it read-only)
 python3 - <<'PY6'
 import ctypes, os
 
@@ -1226,7 +1258,8 @@ open("/tmp/ns/m/h", "w").close()
 src = os.open("/tmp/ns/src", os.O_PATH)
 dst = os.open("/tmp/ns/m/h", os.O_PATH)
 print("bind by fd", libc.mount(b"/proc/self/fd/%d" % src, b"/proc/self/fd/%d" % dst, None, MS_BIND | MS_REC, None))
-# bind 之前打开的是被盖住的文件，不是挂载的根；bind 之后重新打开的才是
+# What was opened before the bind is the covered file, not the mount root; only what is reopened
+# after the bind is
 print("remount the covered one", libc.mount(None, b"/proc/self/fd/%d" % dst, None, MS_BIND | MS_REMOUNT | MS_RDONLY, None))
 top = os.open("/tmp/ns/m/h", os.O_PATH)
 print("remount ro", libc.mount(None, b"/proc/self/fd/%d" % top, None, MS_BIND | MS_REMOUNT | MS_RDONLY, None))

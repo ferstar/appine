@@ -1,6 +1,8 @@
-# 就地改写之后再执行的程序：同一个 inode 换了代码（cat >、dd conv=notrunc、可写的共享
-# 映射），之后执行的必须是新代码。程序的 ctime 离现在超过两秒才会复用上一次的翻译、不再
-# 核对代码段，所以改写前后都等一会儿
+# Programs executed after being rewritten in place: the same inode gets different code (cat >,
+# dd conv=notrunc, a writable shared mapping), and what is executed afterwards must be the new
+# code. The previous translation is reused, without rechecking the code segment, only once the
+# program's ctime is more than two seconds in the past, so wait a while both before and after
+# rewriting
 set -e
 cd /tmp
 for n in 42 43; do
@@ -15,7 +17,8 @@ cat > patch.c <<'C'
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* 经由可写的共享映射把 argv[2] 的内容写进 argv[1]（两个文件一样长） */
+/* Write the contents of argv[2] into argv[1] through a writable shared mapping (the two files are
+ * the same length) */
 int main(int argc, char **argv)
 {
     int dst = open(argv[1], O_RDWR), src = open(argv[2], O_RDONLY);
@@ -49,8 +52,9 @@ sleep 3
 sleep 3
 ./prog; ./prog
 
-# 共享库就地改写：池里的翻译在新进程第一次运行时库还没有映射，先停放起来，执行到时再
-# 核对，内容变了就不能用
+# Shared libraries rewritten in place: when a new process first runs, the library of a translation
+# in the pool is not mapped yet, so the translation is parked first and checked when execution
+# reaches it; if the contents changed it cannot be used
 for n in 42 43; do
     printf 'int v(void) { return %s * 3 + 1; }\n' $n > lib$n.c
     gcc -O2 -shared -fPIC -o lib$n.so lib$n.c

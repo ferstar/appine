@@ -1,8 +1,9 @@
 # docker-run-options: --cap-add SYS_ADMIN
-# fs.protected_symlinks、fs.protected_hardlinks（Linux 的 may_follow_link、may_linkat）和
-# 随机数设备的 ioctl（第 185 轮）。原生的虚拟机上两个 sysctl 都是 1；容器里 /proc/sys 是只读
-# 的，写入不比（rootfs_programs 的 sysctl 用例在 appine 里测）。随机数的 ioctl 要
-# CAP_SYS_ADMIN：加进熵池、重新播种对虚拟机没有坏处
+# fs.protected_symlinks and fs.protected_hardlinks (Linux's may_follow_link and may_linkat) and
+# the ioctls of the random devices (round 185). On the native VM both sysctls are 1; in the
+# container /proc/sys is read-only, so writes are not compared (the sysctl test case of
+# rootfs_programs tests them in appine). The random ioctls need CAP_SYS_ADMIN: adding to the
+# entropy pool and reseeding do the VM no harm
 cd /tmp
 rm -rf prot && mkdir prot && chmod 755 prot
 echo hi > prot/target && chmod 644 prot/target
@@ -11,12 +12,13 @@ echo "== sysctl"
 for f in fs/protected_symlinks fs/protected_hardlinks kernel/unprivileged_bpf_disabled; do
     echo "$f: $(cat /proc/sys/$f) $(stat -c %a /proc/sys/$f)"
 done
-# kernel.panic 的值是宿主的配置（CI 的 runner 是 -1），只比权限和格式
+# The value of kernel.panic is host configuration (-1 on CI's runners), so only the permissions and
+# the format are compared
 echo "kernel/panic: $(stat -c %a /proc/sys/kernel/panic) $(grep -cxE -- '-?[0-9]+' /proc/sys/kernel/panic)"
 su -s /bin/sh nobody -c 'cat /proc/sys/fs/protected_symlinks' 2>&1 | sed 's/^cat: //'
 
 echo "== protected_symlinks"
-# /tmp 是粘滞位、所有人可写、属于 root 的目录；nobody 的链接
+# /tmp is a sticky, world-writable directory owned by root; links owned by nobody
 rm -f /tmp/plink /tmp/rlink /tmp/pdir /tmp/pdangle /tmp/prot-new
 su -s /bin/sh nobody -c 'ln -s /tmp/prot/target /tmp/plink; ln -s /tmp/prot /tmp/pdir; ln -s /tmp/prot-new /tmp/pdangle'
 ln -s /tmp/prot/target /tmp/rlink
@@ -29,10 +31,10 @@ stat -L -c %s /tmp/plink 2>&1 | sed 's/^stat: //'
 echo x > /tmp/pdangle 2>&1 | sed 's/^.*: //'
 [ -e /tmp/prot-new ] && echo "created through the dangling link" || echo "nothing created"
 su -s /bin/sh nobody -c 'cat /tmp/plink; cat /tmp/rlink'
-# 不是粘滞位的目录里照常跟随
+# In a directory without the sticky bit, links are followed as usual
 su -s /bin/sh nobody -c 'mkdir /tmp/prot-open; chmod 777 /tmp/prot-open; ln -s /tmp/prot/target /tmp/prot-open/l'
 cat /tmp/prot-open/l
-# 符号链接的属主与目录的属主相同时也跟随
+# Also followed when the symlink's owner is the same as the directory's owner
 mkdir /tmp/prot-sticky && chmod 1777 /tmp/prot-sticky && chown nobody /tmp/prot-sticky
 su -s /bin/sh nobody -c 'ln -s /tmp/prot/target /tmp/prot-sticky/l'
 cat /tmp/prot-sticky/l
@@ -53,7 +55,7 @@ for f in private shared suid sgid sgid-noexec null fifo target; do
     su -s /bin/sh nobody -c "ln /tmp/prot/$f /tmp/prot/links/$f" 2>&1 | sed 's/^ln: //'
 done
 ls /tmp/prot/links
-# 属主可以链接自己的任何文件
+# The owner can link any of its own files
 su -s /bin/sh nobody -c 'echo mine > /tmp/prot/links/mine; chmod 0 /tmp/prot/links/mine; ln /tmp/prot/links/mine /tmp/prot/links/mine2 && echo "owner: ok"'
 ln /tmp/prot/private /tmp/prot/links/root-private && echo "root: ok"
 
@@ -78,7 +80,7 @@ call("RNDCLEARPOOL", 0x5206, 0)
 call("RNDRESEEDCRNG", 0x5207, 0)
 call("RNDGETPOOL", 0x80085202, b"\0" * 8)
 call("TCGETS", 0x5401, b"\0" * 60)
-# 数据伸进没有映射的页是 EFAULT
+# Data reaching into an unmapped page is EFAULT
 libc = ctypes.CDLL(None, use_errno=True)
 libc.mmap.restype = ctypes.c_void_p
 libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]

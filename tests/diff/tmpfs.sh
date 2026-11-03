@@ -1,14 +1,17 @@
 # docker-run-options: --cap-add SYS_ADMIN --security-opt apparmor=unconfined
-# tmpfs：挂载选项、mountinfo、statfs，里面的文件、目录、硬链接、socket、FIFO、共享映射，
-# 跨挂载的 EXDEV，卸下之后内容就没了，bind 出去的和打开着的文件让它活着。最后照 bubblewrap
-# 的步骤在一个进程里换根（不建命名空间）：tmpfs 做底，pivot_root 进去，只读 bind 程序目录，
-# --dev、--proc、--tmpfs，卸下原来的根，再 pivot_root(".", ".")。原生一侧是有 CAP_SYS_ADMIN
-# 的 docker 容器
+# tmpfs: mount options, mountinfo, statfs, the files, directories, hard links, sockets, FIFOs and
+# shared mappings inside it, EXDEV across mounts, the contents being gone after unmounting, and
+# what is bound elsewhere and open files keeping it alive. Finally the root is switched in one
+# process following bubblewrap's steps (without creating namespaces): a tmpfs as the base,
+# pivot_root into it, read-only binds of the program directories, --dev, --proc, --tmpfs,
+# unmount the old root, then pivot_root(".", "."). The native side is a docker container with
+# CAP_SYS_ADMIN
 cd /tmp
 rm -rf t
 mkdir -p t/a t/b t/c t/base
 
-# 挂在 /tmp/t 下的：编号换成出现的先后，看到的目录、挂载点、选项、类型、source、超级块选项
+# Mounts under /tmp/t: IDs replaced by order of appearance, the directory seen, mount point,
+# options, type, source, superblock options
 show() {
     awk '$5 ~ /^\/tmp\/t/ {
         id[$1] = ++n
@@ -26,7 +29,8 @@ stat -c '%a %u %g' /tmp/t/a /tmp/t/b
 stat -f -c %T /tmp/t/a
 echo "own device: $([ "$(stat -c %d /tmp/t/a)" != "$(stat -c %d /tmp/t)" ] && [ "$(stat -c %d /tmp/t/a)" != "$(stat -c %d /tmp/t/b)" ] && echo yes)"
 umount /tmp/t/c
-# 128 字节以内的符号链接存在 inode 里，不占块（shmem_symlink 的 SHORT_SYMLINK_LEN），长的一页
+# Symlinks of up to 128 bytes are stored in the inode and take no blocks (SHORT_SYMLINK_LEN of
+# shmem_symlink), longer ones take a page
 ln -s "$(printf %0127d 0)" /tmp/t/a/s127 && ln -s "$(printf %0128d 0)" /tmp/t/a/s128
 stat -c '%s %b' /tmp/t/a/s127 /tmp/t/a/s128
 rm /tmp/t/a/s127 /tmp/t/a/s128
@@ -54,7 +58,7 @@ def mount(source, target, fstype, data=None):
 
 s = os.statvfs(B)
 print("size", s.f_blocks * s.f_frsize, "free", s.f_bfree * s.f_frsize, "name max", s.f_namemax)
-# 里面的文件、目录、硬链接、改名
+# Files, directories, hard links and renames inside it
 with open(A + "/f", "w") as f:
     f.write("hello\n")
 os.mkdir(A + "/d")
@@ -65,7 +69,7 @@ print("listing", sorted(os.listdir(A)))
 attempt("rename across", os.rename, A + "/hard", "/tmp/t/hard")
 attempt("link across", os.link, A + "/hard", B + "/hard")
 attempt("rename to the other tmpfs", os.rename, A + "/hard", B + "/hard")
-# socket、FIFO、共享映射
+# Sockets, FIFOs, shared mappings
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 srv.bind(A + "/sock")
 srv.listen(1)
@@ -87,7 +91,7 @@ m.close()
 os.close(fd)
 for x in (conn, cli, srv):
     x.close()
-# 选项的错误
+# Option errors
 print("unknown option", mount(b"tmpfs", b"/tmp/t/c", b"tmpfs", b"bogus=1"))
 print("bad mode", mount(b"tmpfs", b"/tmp/t/c", b"tmpfs", b"mode=9"))
 print("bad size", mount(b"tmpfs", b"/tmp/t/c", b"tmpfs", b"size=1q"))
@@ -101,14 +105,14 @@ PY
 
 cd /tmp/t/a/d && pwd -P && cd .. && pwd -P && cd .. && pwd -P
 cd /tmp
-# 只读的 tmpfs
+# A read-only tmpfs
 mount -t tmpfs -o ro tmpfs /tmp/t/c && echo "read-only $?"
 touch /tmp/t/c/x 2>/dev/null; echo "touch $?"
 umount /tmp/t/c
-# 卸下之后内容就没了
+# After unmounting, the contents are gone
 umount /tmp/t/b && mount -t tmpfs tmpfs /tmp/t/b && echo "again: $(ls -A /tmp/t/b | wc -l) entries"
 umount /tmp/t/b
-# bind 出去的子目录、打开着的文件让它活着
+# A subdirectory bound elsewhere and open files keep it alive
 mkdir /tmp/t/a/sub && echo kept >/tmp/t/a/sub/y
 mount --bind /tmp/t/a/sub /tmp/t/c && echo "bind a subdirectory $?"
 show
@@ -120,11 +124,13 @@ echo "still open: $(cat <&3)"
 exec 3<&-
 umount /tmp/t/c && echo "umount the bind $?"
 echo "left: $(show | wc -l)"
-# 用量和限制（Linux 的 shmem_statfs、shmem_reserve_inode、shmem_inode_acct_block）：statfs
-# 的块、inode 按用量算（根目录、每个名字各占一个 inode，硬链接也是；普通文件按页数，长的
-# 符号链接一页）；写满了是 ENOSPC（能写一部分时写到满为止），inode 用完了新建、mkdir、
-# link、symlink 都是 ENOSPC；删掉、截短之后空出来。重新挂载可以改 size=、nr_inodes=：小于
-# 已经用掉的、原来不限的改成限制都是 EINVAL，mode= 这些不变
+# Usage and limits (Linux's shmem_statfs, shmem_reserve_inode, shmem_inode_acct_block): statfs's
+# blocks and inodes follow usage (the root directory and each name take one inode, hard links
+# too; regular files count by pages, long symlinks take one page); filling it up is ENOSPC (when
+# part can be written, it writes until full), and once inodes run out, creating files, mkdir,
+# link and symlink are all ENOSPC; deleting and truncating free space again. Remounting can
+# change size= and nr_inodes=: a value smaller than what is already used, or a limit on what was
+# unlimited, is EINVAL, and mode= and the like stay unchanged
 mkdir -p /tmp/quota
 mount -t tmpfs -o size=64k,nr_inodes=8,mode=700 quota /tmp/quota
 python3 - <<'PY'
@@ -148,20 +154,21 @@ os.link(D + "/d/a", D + "/b")
 os.symlink("short", D + "/s")
 os.symlink("L" * 200, D + "/long")
 usage("used")
-# 写满：能写的写进去，之后 ENOSPC
+# Filling up: what fits is written, then ENOSPC
 fd = os.open(D + "/big", os.O_WRONLY | os.O_CREAT, 0o644)
 print("write", err(os.write, fd, b"y" * 100000), "then", err(os.write, fd, b"y"))
 print("size", os.fstat(fd).st_size)
 usage("full")
 af = os.open(D + "/b", os.O_WRONLY | os.O_APPEND)
 print("pwrite inside", err(os.pwrite, fd, b"z" * 100, 0), "append to other", err(os.write, af, b"q" * 5000))
-# 删掉之后还开着的文件 Linux 上关掉时才释放，appine 删掉最后一个名字时就释放，不比
+# A deleted file that is still open is freed on Linux only when it is closed, in appine as soon
+# as its last name is removed, so this is not compared
 os.close(af)
 print("fallocate", err(os.posix_fallocate, fd, 0, 200000))
 os.ftruncate(fd, 4096)
 usage("truncated")
 os.close(fd)
-# inode 用完
+# Running out of inodes
 names = []
 for i in range(10):
     r = err(os.mknod, D + "/n%d" % i)
@@ -177,7 +184,8 @@ os.unlink(D + "/d/a")
 usage("last link")
 os.rename(D + "/s", D + "/long")
 usage("renamed over")
-# sendfile 拷进来（busybox 的 cp 用它）：也写到满为止；inode 用完时 AF_UNIX 的 bind 也是 ENOSPC
+# Copying in with sendfile (busybox's cp uses it): it also writes until full; when inodes run out,
+# bind of AF_UNIX is ENOSPC too
 src = os.open("/bin/busybox", os.O_RDONLY)
 dst = os.open(D + "/copy", os.O_WRONLY | os.O_CREAT, 0o644)
 print("sendfile", err(os.sendfile, dst, src, None, 1 << 20), "then", err(os.sendfile, dst, src, None, 4096))
@@ -189,7 +197,8 @@ usage("filled")
 os.unlink(D + "/copy")
 for n in made:
     os.unlink(D + "/m%d" % n)
-# 删掉之后不经过 statfs 直接新建、写：空出来的照样能用
+# Creating and writing directly after deleting, without going through statfs: the freed space can
+# be used as usual
 fd = os.open(D + "/again", os.O_WRONLY | os.O_CREAT, 0o644)
 print("after unlink", err(os.mknod, D + "/again2"), err(os.write, fd, b"a" * 40000))
 os.close(fd)
@@ -209,7 +218,7 @@ mount -o remount,size=1m /tmp/quota 2>/dev/null; echo "limit unlimited: $?"
 mount -o remount,nr_inodes=10 /tmp/quota 2>/dev/null; echo "limit unlimited inodes: $?"
 umount /tmp/quota
 
-# 照 bubblewrap 换根
+# Switch the root as bubblewrap does
 cat >t/minibwrap.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -231,7 +240,8 @@ static void check(int r, const char *what)
     }
 }
 
-/* 与 bwrap 的 bind_mount 一样：bind 之后按原来的标志加上 nosuid、nodev（设备除外）、ro */
+/* Like bwrap's bind_mount: after binding, add nosuid, nodev (except for devices) and ro to the
+ * original flags */
 static void bind(const char *src, const char *dest, int ro, int dev)
 {
     check(mount(src, dest, NULL, MS_SILENT | MS_BIND | MS_REC, NULL), dest);
@@ -251,7 +261,7 @@ int main(int argc, char **argv)
     check(mkdir("oldroot", 0755), "mkdir oldroot");
     check(syscall(SYS_pivot_root, base, "oldroot"), "pivot_root");
     check(chdir("/"), "chdir /");
-    /* --ro-bind /bin、/lib、/usr */
+    /* --ro-bind /bin, /lib, /usr */
     const char *dirs[] = {"bin", "lib", "usr"};
     for (int i = 0; i < 3; i++) {
         char src[64], dest[64];
@@ -285,7 +295,7 @@ int main(int argc, char **argv)
     /* --perms 0700 --tmpfs /tmp */
     check(mkdir("/newroot/tmp", 0755), "mkdir tmp");
     check(mount("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0700"), "tmp");
-    /* 卸下原来的根，再换一次 */
+    /* Unmount the old root, then switch once more */
     check(mount("oldroot", "oldroot", NULL, MS_SILENT | MS_REC | MS_PRIVATE, NULL), "private");
     check(umount2("oldroot", MNT_DETACH), "umount oldroot");
     check(chdir("/newroot"), "chdir newroot");
@@ -306,7 +316,8 @@ exec /tmp/t/minibwrap /bin/busybox sh -c '
     echo hi >/tmp/f && echo "tmp: $(cat /tmp/f) $(stat -c %a /tmp) $(stat -f -c %T /tmp /dev | tr "\n" " ")"
     echo x >/dev/null && echo "dev/null ok, zero: $(head -c 4 /dev/zero | wc -c)"
     echo "old root gone: $(ls /oldroot 2>&1 | wc -l)"
-    # 从原来的根 bind 过来的不比类型（原生是 overlay），设备的也不比选项（来源的挂载不同）
+    # For what is bound in from the old root the type is not compared (natively overlay), and for
+    # the devices the options are not compared either (the source mounts differ)
     awk "{
         id[\$1] = ++n
         for (i = 7; \$i != \"-\"; i++) {}

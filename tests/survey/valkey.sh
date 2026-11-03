@@ -1,4 +1,4 @@
-# valkey：和 redis 一样，arm64 上启动时检查 fork 之后 smaps 的 Shared_Dirty
+# valkey: like redis, on arm64 it checks smaps' Shared_Dirty after fork at startup
 rm -f /tmp/valkey.log
 rm -rf /tmp/valkey; mkdir -p /tmp/valkey
 valkey-server --port 6390 --daemonize yes --dir /tmp/valkey --logfile /tmp/valkey.log --save ''; echo "start: $?"; sleep 0.5

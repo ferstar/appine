@@ -1,6 +1,7 @@
-# Go 标准库的测试（-short，-count=1 不用上次缓存的结果），4 个包并行；只打印失败的部分和
-# 通过的包数。Alpine 的 go 包删掉了 src 里的 _test.go，所以用 go.dev 的官方构建（静态
-# 链接）作为 GOROOT
+# Go standard library tests (-short; -count=1 so cached results from last time are not used), 4
+# packages in parallel; prints only the failing parts and the number of passing packages. Alpine's
+# go package removes the _test.go files from src, so the official build from go.dev (statically
+# linked) is used as GOROOT
 cd /tmp; v=$(go env GOVERSION)
 [ -x go/bin/go ] || curl -fsSL "https://go.dev/dl/$v.linux-arm64.tar.gz" | tar xz
 export GOROOT=/tmp/go PATH=/tmp/go/bin:$PATH; go version

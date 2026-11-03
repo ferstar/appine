@@ -1,4 +1,4 @@
-// 把 argv[1..] 用空格连接后打印，用来检查初始栈布局（argc、argv、字符串）。
+// Prints argv[1..] joined with spaces, to check the initial stack layout (argc, argv, strings).
     .section .rodata
 space:
     .ascii  " "

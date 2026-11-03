@@ -1,11 +1,13 @@
-# openat2（Linux 6.1 的 fs/open.c、fs/namei.c）：struct open_how 的检查、标志的检查（与 openat
-# 不同，不认识的都是 EINVAL），RESOLVE_BENEATH、IN_ROOT、NO_SYMLINKS、NO_MAGICLINKS、NO_XDEV
-# 对路径解析的限制，O_CREAT 沿着悬空的符号链接新建时也受限制。都在 /tmp 和 /proc 里做：容器
-# 里的 /etc/hosts 这些是 bind 挂载，appine 里不是。6.4 起 O_DIRECTORY|O_CREAT 是 EINVAL（6.1
-# 不是）；6.1 里 RESOLVE_CACHED 配 O_DIRECTORY 是 EAGAIN（O_TMPFILE 的宏含 O_DIRECTORY），
-# 后来的内核不是；6.1、6.8 把 FMODE_NONOTIFY（0x4000000）当作不该给的位去掉，CI 上更新的
-# 内核把它当作不认识的位、EINVAL：这三种不比。RESOLVE_CACHED 在原生上要看 dentry 在不在缓存
-# 里，只比"成功或 EAGAIN"
+# openat2 (fs/open.c and fs/namei.c of Linux 6.1): the checks on struct open_how and on the flags
+# (unlike openat, anything unknown is EINVAL), the path-resolution restrictions of
+# RESOLVE_BENEATH, IN_ROOT, NO_SYMLINKS, NO_MAGICLINKS and NO_XDEV, which also apply when O_CREAT
+# creates a file through a dangling symlink. Everything is done in /tmp and /proc: in the
+# container /etc/hosts and the like are bind mounts, in appine they are not. From 6.4 on
+# O_DIRECTORY|O_CREAT is EINVAL (not in 6.1); in 6.1 RESOLVE_CACHED with O_DIRECTORY is EAGAIN
+# (the O_TMPFILE macro includes O_DIRECTORY), in later kernels it is not; 6.1 and 6.8 strip
+# FMODE_NONOTIFY (0x4000000) as a bit that should not be given, while the newer kernels on CI
+# treat it as an unknown bit, EINVAL: these three are not compared. RESOLVE_CACHED natively
+# depends on whether the dentry is in the cache, so only "success or EAGAIN" is compared
 set -e
 cd /tmp
 cat > openat2.c <<'C'
@@ -64,7 +66,7 @@ static const char *ename(int e)
 
 static struct stat root_st;
 
-/* 打印结果；成功时说出打开的是什么（根目录、某个文件），然后关掉 */
+/* Print the result; on success say what was opened (the root directory, a file), then close it */
 static void show(const char *what, long fd)
 {
     if (fd < 0) {

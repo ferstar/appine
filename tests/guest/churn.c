@@ -1,9 +1,10 @@
 /*
- * 线程频繁开始和退出的 guest 测试程序：4 个进程，每个进程里 4 个线程不停地创建、join
- * 短命的线程，跑 argv[1] 秒（默认 5）。线程退出时在 BKL 外丢掉 Rc 的弱引用，会和别的
- * 线程开始时的 Rc::downgrade 一起改同一个计数，几秒之内宿主的堆就被破坏（docs/rounds/
- * 71-thread-exit-race.md）。用 musl-gcc -static 编译，在 appine-run 里直接运行。全部
- * 正常时最后打印 "all ok"。
+ * Guest test program in which threads start and exit constantly: 4 processes, each with 4 threads
+ * that keep creating and joining short-lived threads, running for argv[1] seconds (default 5). When
+ * an exiting thread drops an Rc weak reference outside the BKL, it changes the same count as
+ * another thread's Rc::downgrade on start, and within a few seconds the host heap is corrupted
+ * (docs/rounds/71-thread-exit-race.md). Build with musl-gcc -static and run directly in
+ * appine-run. When all is well it prints "all ok" at the end.
  */
 #include <pthread.h>
 #include <stdatomic.h>

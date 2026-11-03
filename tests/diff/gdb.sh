@@ -1,5 +1,6 @@
-# gdb：断点、单步、看变量、软件和硬件观察点、硬件断点、线程。两边的加载地址和 pid 不同，
-# 归一化之后比
+# gdb: breakpoints, single-stepping, inspecting variables, software and hardware watchpoints,
+# hardware breakpoints, threads. Load addresses and pids differ between the two sides, so the
+# outputs are compared after normalization
 set -e
 cd /tmp
 cat > loop.c <<'C'
@@ -48,28 +49,31 @@ int main(void)
 C
 gcc -g -O0 -o loop loop.c
 gcc -g -O0 -o threads threads.c -lpthread
-# info threads 里不是当前线程的那几行只留编号和名字：另一个线程停在哪一帧取决于调度（主
-# 线程可能还在 clone 里，也可能已经在 pthread_join 里等）。当前线程那行名字后面对齐的空格
-# 随 LWP 号的位数变，压成一个
+# In info threads, keep only the number and name on the lines of threads other than the current
+# one: which frame the other thread is stopped in depends on scheduling (the main thread may still
+# be in clone, or already waiting in pthread_join). The aligning spaces after the name on the
+# current thread's line vary with the number of digits of the LWP number; squeeze them into one
 norm() {
     sed -E 's/0x[0-9a-f]+/ADDR/g; s/(process|LWP|Thread) [0-9]+/\1 N/g; s/^\[Inferior 1 \(process N\)/[Inferior 1/' |
         sed -E 's/^(  [0-9]+ +LWP N "[^"]*").*/\1/; s/^(\* [0-9]+ +LWP N "[^"]*") +/\1 /'
 }
-# 软件观察点（逐条单步之后比较）
+# Software watchpoints (compared after single-stepping each instruction)
 gdb -batch -nx -ex 'set can-use-hw-watchpoints 0' -ex 'break square' -ex run -ex bt -ex 'print x' \
     -ex next -ex next -ex 'print y' -ex finish -ex 'watch counter' -ex continue -ex continue -ex delete \
     -ex stepi -ex 'x/2i $pc' -ex 'print $w0' -ex 'print $pc == &square + 4' -ex continue ./loop 2>&1 | norm
-# square 先执行过（Tier 1 已经翻译了它），之后再下断点
+# square has run before (Tier 1 has already translated it), and the breakpoint is set afterwards
 gdb -batch -nx -ex 'break main' -ex run -ex next -ex next -ex next -ex next -ex 'break square' -ex continue \
     -ex bt -ex 'delete 2' -ex continue ./loop 2>&1 | norm
-# 不打印线程的创建和退出：程序最后的输出和 gdb 报告线程退出谁先谁后不一定
+# Do not print thread creation and exit: whether the program's last output or gdb's report of the
+# thread exiting comes first is not fixed
 gdb -batch -nx -ex 'set print thread-events off' -ex 'break worker' -ex run -ex 'info threads' \
     -ex 'print *(int *)arg' -ex finish -ex continue ./threads 2>&1 | norm
-# 停在系统调用上（PTRACE_SYSCALL）
+# Stop at system calls (PTRACE_SYSCALL)
 gdb -batch -nx -ex 'catch syscall writev' -ex run -ex 'info registers x8' -ex continue -ex continue ./loop 2>&1 | norm
-# 硬件观察点（写、不对齐的两个字节、读、读写）和硬件断点，另一个线程触发观察点。appine 的
-# 只有解释器检查，有它们的线程只用 Tier 0 执行。最后 kill：跑到结束的话，程序最后的输出和
-# gdb 报告线程退出谁先谁后不一定
+# Hardware watchpoints (write, two unaligned bytes, read, read-write) and hardware breakpoints,
+# with another thread triggering a watchpoint. appine's are checked only by the interpreter, and
+# threads that have them run only in Tier 0. kill at the end: if it ran to completion, whether the
+# program's last output or gdb's report of the thread exiting comes first is not fixed
 cat > watch.c <<'C'
 #include <pthread.h>
 #include <stdio.h>

@@ -1,8 +1,10 @@
-# AI 编程 CLI（docs/rounds/103-ai-cli-survey.md）：Claude Code、Codex、Gemini CLI 不用账号，
-# 下面的模拟服务冒充三家的模型 API，按固定的几步要 CLI 调用工具（执行命令、写读改文件、
-# grep、glob），打印每一步工具的结果；再看两家用 bubblewrap 的沙箱，以及 tmux 里的交互界面
-# （另有 opencode、GitHub Copilot CLI、Crush、Qwen Code，只看版本和界面）。Alpine、Debian
-# 的仓库和原生的容器里都能跑，缺的软件包用 apk 或 apt 装；npm 要联网。每一项前面是 "== 名字"
+# AI coding CLIs (docs/rounds/103-ai-cli-survey.md): Claude Code, Codex and Gemini CLI without
+# accounts; the mock server below poses as the three vendors' model APIs and asks the CLIs, in a
+# fixed few steps, to call tools (run commands, write, read and edit files, grep, glob), printing
+# each step's tool result; then the two vendors' bubblewrap sandboxes, and the interactive UIs in
+# tmux (plus opencode, GitHub Copilot CLI, Crush and Qwen Code, for versions and UIs only). Runs in
+# the Alpine and Debian stores and in native containers, installing missing packages with apk or
+# apt; npm needs the network. Each item is preceded by "== name"
 export LANG=C.UTF-8 HOME=/root PATH=/usr/local/bin:$PATH SHELL=/bin/sh
 need="nodejs npm python3 git ripgrep tmux bubblewrap socat curl bash"
 if command -v apk >/dev/null; then
@@ -15,14 +17,17 @@ fi
 echo "node $(node --version), npm $(npm --version)"
 W=/tmp/ai
 cat > /tmp/mock_llm.py <<'PY'
-"""模拟三家的模型 API，让 AI 编程 CLI 不用账号也能走完一轮带工具的对话：
-Anthropic Messages（Claude Code）、OpenAI Responses（Codex）、Gemini（Gemini CLI）。
+"""Mocks the three vendors' model APIs, so AI coding CLIs can complete a round of conversation
+with tools without accounts: Anthropic Messages (Claude Code), OpenAI Responses (Codex), Gemini
+(Gemini CLI).
 
-主对话（请求里有执行命令的工具）按 STEPS 依次要求调用工具，工具结果都回来之后回答
-"all steps done"；别的请求（起标题、判断话题之类）回答 "ok"。每个工具结果追加到 LOG，
-普查打印它，看各个工具在 appine 里的结果。每个请求的路径和工具名也记下来。
+The main conversation (requests carrying the tool that runs commands) asks for the tool calls in
+STEPS in turn, and answers "all steps done" once all tool results are back; other requests
+(making up a title, judging the topic and the like) get "ok". Each tool result is appended to LOG,
+which the survey prints to show each tool's result in appine. Each request's path and tool names
+are recorded too.
 
-    python3 mock_llm.py 端口 日志 工作目录
+    python3 mock_llm.py port log workdir
 """
 import json
 import sys
@@ -30,7 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT, LOG, WORK = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 
-# (动作, 参数)：shell 对三家都一样；文件类的动作按各家的工具名和参数名换
+# (action, argument): shell is the same for all three; file actions are converted to each vendor's
+# tool and parameter names
 STEPS = [
     ("shell", f"echo shell-ok; expr 6 '*' 7; uname -sr; cd {WORK} && pwd"),
     ("write", (f"{WORK}/hello.py", "print('hi from python')\n")),
@@ -61,7 +67,7 @@ def anthropic_call(step):
 
 
 def codex_call(step, tools):
-    """Codex 只给 shell 和 apply_patch：文件类的动作换成命令。"""
+    """Codex only offers shell and apply_patch: file actions become commands."""
     kind, a = step
     cmd = {
         "shell": lambda: a,
@@ -97,7 +103,9 @@ def codex_call(step, tools):
 
 
 def gemini_call(step, decls):
-    """按声明里的函数名和参数名填：各版本的参数名不同（absolute_path、file_path……）。"""
+    """Fills in by the function and parameter names in the declaration: versions differ in
+    parameter names (absolute_path, file_path…).
+    """
     kind, a = step
     names = {
         "shell": ["run_shell_command"],
@@ -129,7 +137,9 @@ def gemini_call(step, decls):
 
 
 def fake_json(schema):
-    """按 JSON schema（Gemini 的类型名是大写的）造一个合法的值：别的请求（模型路由的分类）要它。"""
+    """Builds a valid value from a JSON schema (Gemini's type names are upper case): other
+    requests (model routing's classification) need it.
+    """
     ty = str(schema.get("type", "object")).lower()
     if schema.get("enum"):
         return schema["enum"][0]
@@ -315,8 +325,9 @@ python3 /tmp/mock_llm.py 18080 /tmp/mock.log $W &
 mock=$!
 M=http://127.0.0.1:18080
 
-# 一个一个装：一次装七个、都命中缓存时 npm 同时解开几个大包，峰值超过开发虚拟机上 App 的
-# 内存上限（2 GB）
+# Install one at a time: installing all seven at once with every one hitting the cache makes npm
+# unpack several big packages at the same time, peaking above the app's memory limit on the
+# development VM (2 GB)
 for p in @anthropic-ai/claude-code @openai/codex @google/gemini-cli opencode-ai @github/copilot \
     @charmland/crush @qwen-code/qwen-code; do
     s=$(date +%s)
@@ -329,7 +340,8 @@ for c in claude codex gemini opencode copilot crush qwen; do
     echo "$c: $($c --version 2>&1 | head -n 1)"
 done
 
-# 跑一项：工作目录、模拟服务的日志都清空；打印退出码、用时、输出的最后几行和日志
+# Run one item: empty the work directory and the mock server's log; print the exit code, the time,
+# the last lines of the output and the log
 case_() {
     name=$1
     shift
@@ -359,15 +371,16 @@ EOF
 export MOCK_API_KEY=mock
 case_ codex codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "do the steps"
 
-# 认证方式要先选好；不信任当前目录时 --yolo 不起作用
+# The auth method must be chosen beforehand; --yolo has no effect when the current directory is not
+# trusted
 mkdir -p $HOME/.gemini
 echo '{"security": {"auth": {"selectedType": "gemini-api-key"}, "folderTrust": {"enabled": false}}}' \
     >$HOME/.gemini/settings.json
 export GOOGLE_GEMINI_BASE_URL=$M GEMINI_API_KEY=mock
 case_ gemini gemini -p "do the steps" --yolo
 
-# 沙箱：两家都用 bubblewrap。原生的 docker 容器要另外给权限才建得了命名空间
-# （SURVEY_DOCKER_OPTS，docs/rounds/123-bwrap.md）
+# Sandboxes: both vendors use bubblewrap. Native docker containers need extra permissions to create
+# namespaces (SURVEY_DOCKER_OPTS, docs/rounds/123-bwrap.md)
 case_ codex-sandbox codex exec --skip-git-repo-check -s workspace-write "do the steps"
 echo "== codex sandbox"
 codex sandbox -- sh -c 'echo inside' 2>&1 | tail -n 3
@@ -378,9 +391,10 @@ echo '{"sandbox": {"enabled": true}}' >$HOME/.claude/settings.json
 case_ claude-sandbox claude -p "do the steps" --allowedTools "Bash Read Write Edit Grep Glob"
 rm $HOME/.claude/settings.json
 
-# 交互界面：一次只开一个（几个一起开时 appine 里超过 App 的内存上限），在 tmux 里等一会儿
-# 截屏，再看所有进程合计用了多少内存（cgroup 的 memory.current：appine 里是 App 的用量，原生
-# 是容器的）。Codex 的后台服务在 Alpine 上读不到进程的启动时间（原生也一样），用 --no-daemon
+# Interactive UIs: only one open at a time (several at once exceed the app's memory limit in
+# appine); wait a while in tmux and take a screenshot, then see how much memory all processes used
+# together (cgroup's memory.current: the app's usage in appine, the container's natively). Codex's
+# background service cannot read process start times on Alpine (natively too), so use --no-daemon
 T="tmux -S /tmp/tmux-ai"
 mkdir -p $W
 for c in claude "codex --no-daemon" gemini opencode copilot crush qwen; do

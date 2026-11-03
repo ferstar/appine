@@ -1,8 +1,10 @@
-// 落盘相关的开销（第 198 轮）：fsbench <目录> <个数>。静态链接，拷进仓库里运行，与原生比
-//   create：新建 n 个 4 KB 的文件（不 fsync）
-//   replace：再写 n 个临时文件，逐个改名覆盖前面的（apk 装文件的样子）
-//   fsync：新建 n 个 4 KB 的文件，每个写完 fsync（dpkg、数据库的样子）
-//   rm：删掉这些文件
+// Costs related to syncing to disk (round 198): fsbench <directory> <count>. Statically linked,
+// copied into the store to run, and compared with native
+//   create: create n 4 KB files (no fsync)
+//   replace: write n more temporary files, renaming each over an earlier one (how apk installs
+//            files)
+//   fsync: create n 4 KB files, fsyncing each after writing it (how dpkg and databases work)
+//   rm: delete these files
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>

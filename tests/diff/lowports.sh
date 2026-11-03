@@ -1,10 +1,14 @@
-# 1024 以下的端口（docs/rounds/156-low-ports.md）：appine 在宿主上把它们绑到别的端口，guest 一侧
-# 要与原生（容器里的 root 直接绑）看不出区别：getsockname、getpeername、accept 到的对端、
-# recvfrom 的来源、/proc/net 里的端口；连本机的这些端口（回环、IPv6 双栈、通配地址）；用低端口
-# 当源端口；同一个端口的 TCP 和 UDP、SO_REUSEPORT；冲突照常 EADDRINUSE，连接关掉之后的
-# TIME_WAIT 也是（带 SO_REUSEADDR 时不是）；没有程序监听时 ECONNREFUSED；监听关掉之后已经建立的
-# 连接仍报告原来的端口。普通用户绑低端口不比：docker 的容器里 ip_unprivileged_port_start 是 0
-# 容器里宿主让绑原来的端口（208-low-ports-direct.md），总是映射才测得到换算
+# Ports below 1024 (docs/rounds/156-low-ports.md): appine binds them to other ports on the host,
+# and on the guest side this must be indistinguishable from native (root in the container binds
+# them directly): getsockname, getpeername, the peer from accept, the source from recvfrom, the
+# ports in /proc/net; connecting to these local ports (loopback, IPv6 dual stack, wildcard
+# address); using a low port as the source port; TCP and UDP on the same port, SO_REUSEPORT;
+# conflicts are EADDRINUSE as usual, and so is TIME_WAIT after a connection is closed (but not
+# with SO_REUSEADDR); ECONNREFUSED when no program is listening; after the listener is closed,
+# established connections still report the original port. Ordinary users binding low ports is not
+# compared: in docker containers ip_unprivileged_port_start is 0
+# In the container the host allows binding the original ports (208-low-ports-direct.md), so the
+# port conversion can only be tested by always mapping
 # appine-options: --always-map-low-ports
 set -e
 cd /tmp
@@ -33,7 +37,7 @@ static void names(const char *what, int fd)
     int local = getsockname(fd, (void *)&a, &n) ? -1 : port_of(&a);
     n = sizeof a;
     int peer = getpeername(fd, (void *)&a, &n) ? -errno : port_of(&a);
-    /* 临时端口每次不同，只报告是不是低端口 */
+    /* Ephemeral ports differ every time; only report whether they are low ports */
     printf("%s: local %d, peer %d\n", what, local < 1024 ? local : 1024,
            peer < 0 ? peer : peer < 1024 ? peer : 1024);
 }
@@ -63,7 +67,8 @@ static int server(int type, const char *ip, int port, int reuse)
     return s;
 }
 
-/* 本端是这个端口的行：TCP 只数监听的（还没 accept 的连接 appine 不列），UDP 全数 */
+/* Lines whose local end is this port: TCP counts only listeners (appine does not list connections
+ * not yet accepted), UDP counts all */
 static void proc_net(const char *file, int port, int tcp)
 {
     char line[512], want[16];
@@ -82,7 +87,8 @@ static void proc_net(const char *file, int port, int tcp)
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    /* TCP：通配地址上监听，经由回环、经由 IPv6 的 ::ffff:127.0.0.1 连 */
+    /* TCP: listen on the wildcard address, connect through loopback and through IPv6's
+     * ::ffff:127.0.0.1 */
     int l = server(SOCK_STREAM, "0.0.0.0", 79, 0);
     names("listener", l);
     proc_net("/proc/net/tcp", 79, 1);
@@ -122,7 +128,7 @@ int main(void)
     close(c);
     close(l6);
 
-    /* 用低端口当源端口：服务端 accept 到的对端是 513 */
+    /* A low port as the source port: the peer the server accepts is 513 */
     l = server(SOCK_STREAM, "127.0.0.1", 79, 0);
     c = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in src = v4("127.0.0.1", 513);
@@ -137,7 +143,7 @@ int main(void)
     close(c);
     close(l);
 
-    /* 冲突、没有监听 */
+    /* Conflicts, no listener */
     l = server(SOCK_STREAM, "127.0.0.1", 79, 0);
     int dup = server(SOCK_STREAM, "127.0.0.1", 79, 0);
     printf("second bind while listening: %s\n", dup < 0 ? "failed" : "ok");
@@ -148,7 +154,7 @@ int main(void)
            strerror(errno));
     close(c);
 
-    /* TIME_WAIT：服务端先关掉连接，端口留在 TIME_WAIT 里 */
+    /* TIME_WAIT: the server closes the connection first, and the port stays in TIME_WAIT */
     l = server(SOCK_STREAM, "127.0.0.1", 81, 0);
     c = socket(AF_INET, SOCK_STREAM, 0);
     to = v4("127.0.0.1", 81);
@@ -167,7 +173,7 @@ int main(void)
     names("rebound", l);
     close(l);
 
-    /* UDP：同一个端口的 TCP 和 UDP；SO_REUSEPORT；来源端口；连接了的 UDP */
+    /* UDP: TCP and UDP on the same port; SO_REUSEPORT; source ports; connected UDP */
     int t53 = server(SOCK_STREAM, "127.0.0.1", 53, 0);
     int u1 = server(SOCK_DGRAM, "127.0.0.1", 53, 1), u2 = server(SOCK_DGRAM, "127.0.0.1", 53, 1);
     printf("tcp and two reuseport udp on 53: %d %d %d\n", t53 >= 0, u1 >= 0, u2 >= 0);

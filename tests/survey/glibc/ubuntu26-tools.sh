@@ -1,6 +1,7 @@
-# Ubuntu 26.04 的常用命令（先运行 ubuntu26-install）：Rust 写的 coreutils（uutils）的各个命令、
-# findutils、tar 和压缩、procps、util-linux、iproute2、sudo、su、编译运行 C、python、git、
-# ssh、tmux、screen。输出尽量不带时刻、pid，用 -n 镜像和原生比
+# Common commands on Ubuntu 26.04 (run ubuntu26-install first): the commands of coreutils written in
+# Rust (uutils), findutils, tar and compression, procps, util-linux, iproute2, sudo, su, compiling
+# and running C, python, git, ssh, tmux, screen. Output avoids times and pids where possible, so it
+# can be compared with native with -n image
 export LC_ALL=C.UTF-8 HOME=/root
 cd /tmp && rm -rf u26 && mkdir u26 && cd u26
 r() { "$@" >/tmp/u26.out 2>&1; rc=$?; printf '%s: rc=%s %s\n' "$*" "$rc" "$(head -c 300 /tmp/u26.out | tr '\n' '|')"; }
@@ -81,8 +82,8 @@ r sh -c 'git init -q g && cd g && git config user.email a@b && git config user.n
 echo "== ssh, terminals"
 r sh -c 'ssh-keygen -q -t ed25519 -N "" -f k && ls k k.pub'
 r sh -c 'tmux new-session -d -s u26 "sleep 5" && tmux list-sessions -F "#S" && tmux kill-server'
-# 在 PTY 上：stty（Rust 的 coreutils 经由 glibc 2.43 的 tcgetattr，也就是 TCGETS2）、tput、
-# readline 的 bash；GNU screen 起窗口要 TIOCPKT
+# On a PTY: stty (Rust's coreutils go through glibc 2.43's tcgetattr, that is, TCGETS2), tput, bash
+# with readline; GNU screen needs TIOCPKT to start a window
 r sh -c 'screen -D -m sh -c "echo in-screen > /tmp/u26/scr" && cat scr'
 r sh -c 'script -qec "stty -a | head -1; tput cols; stty raw; stty -a | grep -c -- -icanon; stty sane" /dev/null </dev/null | tr -d "\r"'
 r sh -c 'script -qec "bash -ic \"bind -v | grep -c editing-mode\"" /dev/null </dev/null | tr -d "\r" | tail -1'

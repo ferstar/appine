@@ -1,16 +1,19 @@
-# docker 的 bridge 网络（docs/rounds/169-container-network-survey.md）：先后在 "iptables": false
-# 和默认（iptables 开着）下起 dockerd，看默认 bridge 网络和自定义网络里容器的地址和路由、
-# 访问外网、容器之间按 IP 互访、-p 端口发布、按容器名解析（自定义网络的内置 DNS），以及
-# dockerd 用到的 netlink、sysctl、iptables/nftables 规则和 docker-proxy。仓库与 docker.sh 的
-# 共用：
+# docker's bridge networks (docs/rounds/169-container-network-survey.md): starts dockerd with
+# "iptables": false and then with the default (iptables on), and looks at containers' addresses and
+# routes in the default bridge network and in a custom network, reaching the internet, containers
+# reaching each other by IP, -p port publishing, resolving by container name (the custom network's
+# built-in DNS), and the netlink, sysctl and iptables/nftables rules and docker-proxy that dockerd
+# uses. The store is shared with docker.sh:
 #   scripts/survey -s target/survey/docker docker-bridge
-# 原生对照：SURVEY_DOCKER_OPTS=--privileged scripts/survey -n appine-docker-native docker-bridge
+# Native comparison:
+# SURVEY_DOCKER_OPTS=--privileged scripts/survey -n appine-docker-native docker-bridge
 exec 2>&1
 [ -x /usr/bin/dockerd ] || apk add -q docker
 command -v strace >/dev/null || apk add -q strace
 command -v nft >/dev/null || apk add -q nftables
 step() { echo; echo "== $*"; }
-# 服务端是 nc -l 的循环（Alpine 的 busybox 没有 httpd）。容器的 ID、pid、随机的端口这些换成固定的写法
+# The server is a loop of nc -l (Alpine's busybox has no httpd). Container IDs, pids, random ports
+# and the like are replaced by fixed spellings
 tidy() { sed -E 's/[0-9a-f]{12,64}/ID/g; s/veth[0-9a-f]+/vethX/g'; }
 
 start() {
@@ -31,7 +34,8 @@ stop() {
     ip link del docker0 2>/dev/null
 }
 
-# dockerd 用到的：netlink 的消息类型和网卡的种类、写的 sysctl、执行的程序
+# What dockerd uses: netlink message types and kinds of network devices, the sysctls written, the
+# programs executed
 report() {
     step "$1: netlink messages"
     grep -oE 'nlmsg_type=RTM_[A-Z]+' /tmp/dockerd.st | sort | uniq -c | sort -rn | head -20

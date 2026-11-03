@@ -1,15 +1,17 @@
 #!/bin/sh
-# 断电（宿主崩溃）之后仓库的完整性（第 198 轮）。在 Linux 虚拟机里以 root 运行，要
-# dm-flakey 和 dmsetup，docker 里有 appine-dev、alpine:3.24.3 两个镜像，仓库的路径在虚拟机
-# 里与宿主相同（colima 的 virtiofs 就是这样）：
+# Integrity of the store after a power loss (host crash) (round 198). Run as root in the Linux VM;
+# needs dm-flakey and dmsetup, the two images appine-dev and alpine:3.24.3 in docker, and the
+# repository at the same path in the VM as on the host (as colima's virtiofs has it):
 #
-#   colima ssh -- sudo sh tests/crash/crash.sh <appine|native> <power|kill> [次数] [二进制]
+#   colima ssh -- sudo sh tests/crash/crash.sh <appine|native> <power|kill> [runs] [binary]
 #
-# 在 dm-flakey 上的 ext4 里放一个刚导入的 Alpine 仓库，跑 workload.sh；到随机的时刻（3–15
-# 秒）power 让设备丢掉之后所有的写（相当于断电）、结束负载、卸下、恢复、重新挂上；kill
-# 只结束负载（App 被杀），宿主的页缓存都在。然后在 appine 里（开机的清理照常做）跑
-# check.sh。native 在 alpine 容器里直接跑同一个负载，当对照。二进制是容器里的路径
-# （仓库挂在 /work）。STOP=1 时第一次失败就停下，仓库留在 /mnt/appine-crash/s。
+# A freshly imported Alpine store is put in an ext4 on dm-flakey and workload.sh runs; at a random
+# moment (3–15 seconds), power makes the device drop all later writes (like a power loss), ends the
+# workload, unmounts, restores and remounts; kill only ends the workload (the app being killed),
+# with the host's page cache intact. Then check.sh runs inside appine (with the boot cleanup done as
+# usual). native runs the same workload directly in an alpine container, for comparison. The binary
+# is a path in the container (the repository is mounted at /work). With STOP=1 it stops at the first
+# failure, leaving the store in /mnt/appine-crash/s.
 set -eu
 mode=$1 how=$2 runs=${3:-10}
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -43,7 +45,7 @@ if [ ! -d "$base" ]; then
         "$bin" --rootfs "$base" --import target/rootfs/alpine-minirootfs-3.24.3-aarch64.tar.gz
 fi
 
-# run "<docker 的选项>" 命令…：appine 里用仓库的 /bin/sh，原生用 alpine 的
+# run "<docker options>" command…: appine uses the store's /bin/sh, native uses alpine's
 run() {
     opts=$1
     shift
@@ -69,7 +71,8 @@ while [ "$n" -le "$runs" ]; do
     run "-d --name appine-crash-w" /bin/sh -c "$(cat "$repo/tests/crash/workload.sh")" sh "$data" >/dev/null
     delay=$(shuf -i 3-15 -n 1)
     sleep "$delay"
-    # 断电之前打印出来的才算：切换之后 fsync 里的写被丢掉，guest 看来照样成功
+    # Only what was printed before the power loss counts: after the switch, writes in fsync are
+    # dropped, yet succeed as far as the guest can tell
     docker logs appine-crash-w > "$out/log-$n" 2>&1
     [ "$how" = power ] && table "$drop"
     docker kill appine-crash-w >/dev/null

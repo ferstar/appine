@@ -1,9 +1,11 @@
 # docker-run-options: --cap-add SYS_ADMIN --security-opt apparmor=unconfined
-# 别的用户命名空间里的进程看到的 ID（from_kuid_munged）：SO_PEERCRED、SCM_CREDENTIALS（声明
-# 的凭据按 scm_check_creds 检查，没声明时是真实 ID）、信号的 si_uid（发送者按自己的命名空间
-# 填，目标在别的命名空间里时再换算；停止、继续时的 SIGCHLD 因此再换算一次，退出时的不）、
-# waitid 的 si_uid、SysV IPC 的属主（IPC_STAT、IPC_SET、/proc/sysvipc）、/proc/net/tcp 的
-# uid 和 auxv 的 AT_UID。子进程的用户命名空间里 0 是外面的 1000、100 是外面的 0
+# IDs seen by processes in other user namespaces (from_kuid_munged): SO_PEERCRED, SCM_CREDENTIALS
+# (declared credentials are checked by scm_check_creds; without a declaration they are the real
+# IDs), the si_uid of signals (the sender fills it in by its own namespace, and it is mapped again
+# when the target is in another namespace; so the SIGCHLD for a stop or continue is mapped once
+# more, the one for an exit is not), waitid's si_uid, the owners of SysV IPC (IPC_STAT, IPC_SET,
+# /proc/sysvipc), the uid in /proc/net/tcp and auxv's AT_UID. In the child's user namespace 0 is
+# 1000 outside and 100 is 0 outside
 python3 - <<'PY'
 import ctypes, errno, functools, os, signal, socket, struct, sys
 
@@ -79,8 +81,9 @@ def siginfo(info):
     return "%s code=%d uid=%d" % (signal.Signals(info.si_signo).name, info.si_code, info.si_uid)
 
 
-# 同一个命名空间里：没声明时 SCM_CREDENTIALS 是真实 ID（SO_PEERCRED 是有效 ID）；只能声明自己的
-# pid 和真实、有效、保存的 ID 之一；root 什么都能声明，pid 不存在是 ESRCH；长度不对是 EINVAL
+# In the same namespace: without a declaration SCM_CREDENTIALS gives the real IDs (SO_PEERCRED the
+# effective IDs); only one's own pid and one of the real, effective and saved IDs can be declared;
+# root can declare anything, a nonexistent pid is ESRCH; a wrong length is EINVAL
 a, b = socket.socketpair()
 b.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
 pid = os.fork()
@@ -103,7 +106,7 @@ print("root declares", recv_creds(a)[1][1:], "missing pid", err(b.sendmsg, [b"x"
 a.close()
 b.close()
 
-# 别的用户命名空间里的子进程
+# A child process in another user namespace
 try:
     os.unlink(SOCK)
 except FileNotFoundError:
@@ -119,7 +122,8 @@ print("set q2 owner", set_owner(q2, 5000, 5001), "unmapped", set_owner(q1, -1, 0
 signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
 r1, w1 = os.pipe()
 r2, w2 = os.pipe()
-# 新程序继续之后等父进程用 waitid 取走继续的事件再退出：退出了的子进程取不到（ECHILD）
+# After continuing, the new program waits for the parent to collect the continue event with
+# waitid before it exits: for a child that has exited it cannot be collected (ECHILD)
 r3, w3 = os.pipe()
 child = os.fork()
 if child == 0:
@@ -158,7 +162,7 @@ if child == 0:
             print("child received", msg, c[0] == os.getppid(), c[1:])
         for _ in range(3):
             print("child got", siginfo(signal.sigwaitinfo({signal.SIGUSR1, signal.SIGUSR2, rt})))
-        # 新程序的 AT_UID、AT_EUID、AT_GID、AT_EGID；之后停住、继续、退出
+        # The new program's AT_UID, AT_EUID, AT_GID and AT_EGID; then stop, continue, exit
         os.set_inheritable(r3, True)
         code = ("import os, signal, struct, sys\n"
                 "a = open('/proc/self/auxv', 'rb').read()\n"
@@ -196,7 +200,7 @@ if helper == 0:
     os._exit(0)
 os.waitpid(helper, 0)
 print("helper SIGCHLD", siginfo(signal.sigwaitinfo({signal.SIGCHLD})))
-# rt_sigqueueinfo：si_uid 是调用者给的、按它的命名空间
+# rt_sigqueueinfo: si_uid is what the caller gives, by the caller's namespace
 info = struct.pack("iiiiiIq", signal.SIGRTMIN, 0, -1, 0, os.getpid(), 0, 7).ljust(128, b"\0")
 libc.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_char_p]
 print("sigqueue", libc.syscall(138, child, signal.SIGRTMIN, info))
@@ -217,10 +221,12 @@ for q in (q1, q2, q3):
 os.unlink(SOCK)
 PY
 
-# 用户命名空间里的 root 没有 no_new_privs 也能装 seccomp 过滤器：要的是自己所在的命名空间里的
-# CAP_SYS_ADMIN（Linux 的 seccomp_prepare_filter 用 ns_capable），进了新的用户命名空间之后
-# 开机时的那个里的能力就没有了；开机时的命名空间里的普通用户不行。用 root 建用户命名空间：
-# 原生的 Ubuntu 宿主开着 apparmor_restrict_unprivileged_userns，普通用户建的里面能力被拒绝
+# Root in a user namespace can install a seccomp filter without no_new_privs: what it needs is
+# CAP_SYS_ADMIN in the namespace it is in (Linux's seccomp_prepare_filter uses ns_capable), and
+# after entering a new user namespace the capabilities in the boot-time one are gone; an ordinary
+# user in the boot-time namespace cannot. The user namespaces are created as root: the native
+# Ubuntu host has apparmor_restrict_unprivileged_userns on, so in one created by an ordinary user
+# the capabilities are denied
 cat > /tmp/sfilter.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -237,7 +243,7 @@ int main(int argc, char **argv)
         printf("unshare: %s\n", strerror(errno));
         return 0;
     }
-    // 没有内核头文件：BPF_RET | BPF_K 返回 SECCOMP_RET_ALLOW，SECCOMP_SET_MODE_FILTER 是 1
+    // No kernel headers: BPF_RET | BPF_K returns SECCOMP_RET_ALLOW, SECCOMP_SET_MODE_FILTER is 1
     struct { uint16_t code; uint8_t jt, jf; uint32_t k; } allow = {0x06, 0, 0, 0x7fff0000};
     struct { unsigned short len; void *filter; } prog = {1, &allow};
     long r = syscall(SYS_seccomp, 1, 0, &prog);

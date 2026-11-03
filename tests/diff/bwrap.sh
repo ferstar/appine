@@ -1,8 +1,11 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined --security-opt systempaths=unconfined
-# bubblewrap：几种常见的用法，包括 Codex 的沙箱实际传的参数（docs/rounds/123-bwrap.md）。
-# 原生一侧是有 CAP_SYS_ADMIN 的 docker 容器，不盖住 /proc 下的路径（盖住了 Linux 就不让在
-# 用户命名空间里挂新的 procfs）。附加组、不在新 pid 命名空间里时的 pid 两边不同，不比；
-# 挂载只比 bwrap 自己建的几个挂载点和是否只读（文件系统类型、外面带进来的挂载两边不同）
+# bubblewrap: a few common uses, including the arguments Codex's sandbox actually passes
+# (docs/rounds/123-bwrap.md). The native side is a docker container with CAP_SYS_ADMIN that does
+# not mask the paths under /proc (with them masked, Linux does not allow mounting a new procfs in
+# a user namespace). Supplementary groups, and pids when not in a new pid namespace, differ
+# between the two sides and are not compared; for mounts only the few mount points bwrap creates
+# itself and whether they are read-only are compared (filesystem types and mounts brought in from
+# outside differ between the two sides)
 cd /tmp
 rm -rf ws
 mkdir -p ws

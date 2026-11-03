@@ -1,4 +1,5 @@
-# mariadb：InnoDB 用 Linux AIO（io_submit、io_getevents），关闭时 io_destroy 叫醒等事件的线程
+# mariadb: InnoDB uses Linux AIO (io_submit, io_getevents), and on shutdown io_destroy wakes the
+# threads waiting for events
 rm -rf /tmp/my; mkdir -p /tmp/my /run/mysqld; chown mysql:mysql /tmp/my /run/mysqld
 timeout 300 mariadb-install-db --user=mysql --datadir=/tmp/my >/tmp/my-install.log 2>&1; echo "install-db: $?"; tail -2 /tmp/my-install.log
 rm -f /tmp/my.err

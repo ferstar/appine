@@ -1,8 +1,9 @@
 /*
- * 自修改代码的 guest 测试程序（M7）：像 JIT 一样往内存里写指令再执行，检查改写并执行
- * ic ivau 之后，Tier 1 不会继续执行旧的翻译。用 musl-gcc -static 编译，在 appine-run
- * 里直接运行。每项检查通过时打印一行 "ok <名字>"，失败时打印原因并以 1 退出，全部
- * 通过时最后打印 "all ok"。
+ * Guest test program for self-modifying code (M7): writes instructions into memory and runs them
+ * as a JIT does, checking that after rewriting and running ic ivau Tier 1 does not keep running the
+ * old translation. Build with musl-gcc -static and run directly in appine-run. Each check that
+ * passes prints a line "ok <name>"; a failure prints the reason and exits with 1; when all pass it
+ * prints "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -37,7 +38,7 @@ static void ok(const char *name)
 
 typedef int (*fn_t)(void);
 
-/* w0 = n * k：一个带回边的循环，翻译成几个互相链接的块 */
+/* w0 = n * k: a loop with a back edge, translated into several blocks linked to each other */
 static void emit_loop(uint32_t *code, unsigned n, unsigned k)
 {
     code[0] = 0x52800000u;                       /* mov w0, #0 */
@@ -53,7 +54,7 @@ static void publish(uint32_t *code, unsigned words)
     __builtin___clear_cache((char *)code, (char *)(code + words));
 }
 
-/* ---- CTR_EL0：修改代码之后必须执行 ic ivau ---- */
+/* ---- CTR_EL0: ic ivau must be run after modifying code ---- */
 
 static void test_ctr(void)
 {
@@ -64,7 +65,7 @@ static void test_ctr(void)
     ok("ctr_el0");
 }
 
-/* ---- 同一页反复改写：每次都执行新代码 ---- */
+/* ---- The same page rewritten again and again: the new code runs every time ---- */
 
 static void test_rewrite(void)
 {
@@ -78,7 +79,7 @@ static void test_rewrite(void)
         for (int i = 0; i < 20; i++)
             CHECK(f() == (int)(50 * k), "k = %u: got %d", k, f());
     }
-    /* 只改写循环体里的一条指令 */
+    /* Rewrite only one instruction in the loop body */
     emit_loop(code, 10, 3);
     publish(code, 6);
     CHECK(f() == 30, "before patch: %d", f());
@@ -89,7 +90,7 @@ static void test_rewrite(void)
     ok("rewrite");
 }
 
-/* ---- W^X：用 mprotect 在可写和可执行之间切换 ---- */
+/* ---- W^X: switching between writable and executable with mprotect ---- */
 
 static void test_wx_mprotect(void)
 {
@@ -107,12 +108,13 @@ static void test_wx_mprotect(void)
     ok("wx_mprotect");
 }
 
-/* ---- 双映射：同一个 memfd 映射成可写和可执行两份，在可写的一份里改写 ---- */
+/* ---- Dual mapping: one memfd mapped twice, writable and executable, rewritten in the writable
+ * one ---- */
 
 static void test_dual_mapping(void)
 {
     int fd = memfd_create("jit", 0);
-    if (fd < 0 && errno == ENOENT) { /* 不带 rootfs 运行时没有文件系统 */
+    if (fd < 0 && errno == ENOENT) { /* no filesystem when run without a rootfs */
         printf("skip dual_mapping\n");
         return;
     }
@@ -133,11 +135,12 @@ static void test_dual_mapping(void)
     ok("dual_mapping");
 }
 
-/* ---- 另一个线程执行过的代码被改写 ---- */
+/* ---- Code that another thread has run is rewritten ---- */
 
 /*
- * 两个槽轮流使用：第 k 轮改写第 k % 2 个槽，运行方这时只调用另一个槽，所以不会并发
- * 地执行正在被改写的指令；但它在第 k - 2 轮执行过这个槽，Tier 1 里留着旧的翻译。
+ * Two slots are used in turn: round k rewrites slot k % 2 while the runner calls only the other
+ * slot, so it never runs instructions while they are being rewritten; but it ran this slot in
+ * round k - 2, and Tier 1 still holds the old translation.
  */
 static uint32_t *shared_code;
 static atomic_int phase, done;
@@ -153,7 +156,8 @@ static void *runner(void *arg)
     for (int k = 1; k <= 20; k++) {
         while (atomic_load(&phase) < k)
             CHECK(slot(k - 1)() == 5 * (k - 1), "round %d: old slot", k);
-        /* 改写方发布新代码之后才推进 phase：看到 k 就必须执行新代码 */
+        /* The writer advances phase only after publishing the new code: seeing k means the new
+         * code must run */
         int r = slot(k)();
         CHECK(r == 5 * k, "round %d: got %d", k, r);
         atomic_store(&done, k);
@@ -184,7 +188,7 @@ static void test_cross_thread(void)
     ok("cross_thread");
 }
 
-/* ---- 对未映射的地址做缓存维护：SIGSEGV ---- */
+/* ---- Cache maintenance on an unmapped address: SIGSEGV ---- */
 
 static sigjmp_buf jump;
 static void *fault_addr;

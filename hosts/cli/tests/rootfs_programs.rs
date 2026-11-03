@@ -1,15 +1,18 @@
-//! 端到端测试：把 Alpine minirootfs 导入 inode 仓库，经由 `ld-musl` 运行 busybox
-//! （M1b、M3a、M3b 的退出标准）。每个用例都分别在 Tier 0 和 Tier 1 下运行。
+//! End-to-end tests: import the Alpine minirootfs into an inode store and run busybox through
+//! `ld-musl` (the exit criteria of M1b, M3a and M3b). Each test case runs under Tier 0 and under
+//! Tier 1 separately.
 //!
-//! 交互式的用例用 `appine-run --pty` 在进程内 PTY 上运行 `sh -i`，经由管道发送按键
-//! （^C、^Z 就是字节 0x03、0x1a），等到输出里出现预期的文字再发下一步。
+//! Interactive test cases run `sh -i` on an in-process PTY with `appine-run --pty`, send keys
+//! through a pipe (^C and ^Z are just the bytes 0x03 and 0x1a), and wait until the expected text
+//! appears in the output before sending the next step.
 //!
-//! rootfs 由 `scripts/fetch-rootfs` 下载到 `target/rootfs/`，也可以用环境变量
-//! `APPINE_ROOTFS_TARBALL` 指定。找不到时跳过这些测试；设置
-//! `APPINE_REQUIRE_ROOTFS=1`（CI 这样做）时改为失败。
+//! The rootfs is downloaded into `target/rootfs/` by `scripts/fetch-rootfs`, or can be given with
+//! the environment variable `APPINE_ROOTFS_TARBALL`. Without it these tests are skipped; with
+//! `APPINE_REQUIRE_ROOTFS=1` (as CI sets) that becomes a failure.
 //!
-//! 需要外网的用例（M4 的退出标准：apk 安装软件包、git 经由 HTTPS 克隆）只在设置了
-//! `APPINE_NETWORK_TESTS=1` 时运行，宿主的 `http_proxy`、`https_proxy` 会传给 guest。
+//! Test cases that need outside network (the M4 exit criteria: apk installing packages, git
+//! cloning over HTTPS) run only when `APPINE_NETWORK_TESTS=1` is set, and the host's `http_proxy`
+//! and `https_proxy` are passed to the guest.
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
 use std::io::{BufRead, Read, Write};
@@ -38,7 +41,7 @@ fn find_tarball() -> Option<PathBuf> {
     found.pop()
 }
 
-/// 导入一次 rootfs，所有用例共用同一个仓库。
+/// Imports the rootfs once; all test cases share the same store.
 fn store() -> Option<&'static Path> {
     static STORE: OnceLock<Option<PathBuf>> = OnceLock::new();
     STORE
@@ -75,7 +78,7 @@ fn command(store: &Path, tier: &str, args: &[&str]) -> Command {
     cmd
 }
 
-/// 在每个执行层下运行一次，返回 (执行层, 输出)；没有 rootfs 时返回空表。
+/// Runs once under each tier, returning (tier, output); returns an empty list without a rootfs.
 fn run(args: &[&str]) -> Vec<(&'static str, Output)> {
     let Some(store) = store() else {
         return Vec::new();
@@ -128,7 +131,7 @@ fn applets_run_through_symlinks() {
 
 #[test]
 fn cat_reads_files_and_follows_symlinks() {
-    // /etc/os-release 是指向 ../usr/lib/os-release 的相对符号链接
+    // /etc/os-release is a relative symbolic link to ../usr/lib/os-release
     for (tier, out) in run(&["/bin/cat", "/etc/os-release"]) {
         assert_ok(tier, &out);
         assert!(
@@ -229,16 +232,19 @@ fn stdin_reaches_the_guest() {
 
 #[test]
 fn idle_readers_of_host_stdin_sleep_through_other_traffic() {
-    // 不带 --pty 时 guest 的 stdin 是宿主的管道：阻塞在 read 里的进程只等宿主 fd，shell
-    // 在一个 FIFO 上的读写不叫醒它（自愿上下文切换的次数不变）；写进 stdin 之后照常读到。
-    // 用 dd 读：busybox 的 read 内建命令先 poll，测的就不是阻塞的读了。读写 FIFO 只用
-    // 内建命令：musl 的 fork 在 clone 前后屏蔽所有信号，这时有子进程退出的话 SIGCHLD 被所有
-    // 线程屏蔽，仍会叫醒所有等待者
+    // Without --pty the guest's stdin is a host pipe: a process blocked in read waits only for the
+    // host fd, and the shell's reads and writes on a FIFO do not wake it (its count of voluntary
+    // context switches stays the same); after a write to stdin it reads as usual. Read with dd:
+    // busybox's read builtin polls first, so it would not be testing a blocking read. Read and
+    // write the FIFO with builtins only: musl's fork blocks all signals around clone, and a child
+    // exiting then has SIGCHLD blocked by every thread, which still wakes all waiters
     let Some(store) = store() else {
         return;
     };
-    // 先等 dd 停在读里：已经 exec 成 dd、在内核里等着（S）、切换次数 0.2 秒没变（全量测试
-    // 并行时它可能还在启动）。读状态只用 shell 的内建命令，不起进程、不用管道
+    // First wait for dd to stop in its read: it has exec'd into dd, waits in the kernel (S), and
+    // its switch count has not changed for 0.2 seconds (it may still be starting while the full
+    // suite runs in parallel). Read the status with shell builtins only, starting no process and
+    // using no pipe
     let script = "mkfifo /tmp/hoststdin.fifo
         exec 3<&0 4<>/tmp/hoststdin.fifo
         rm /tmp/hoststdin.fifo
@@ -299,8 +305,9 @@ fn exit_status_and_errors_are_propagated() {
 
 #[test]
 fn fatal_signals_write_core_files() {
-    // RLIMIT_CORE 打开时，SIGSEGV 结束的进程在当前目录留下 ELF core 文件（ET_CORE、
-    // aarch64）；限制是 0 时不写；core_pattern 里的 %e、%s 展开成程序名和信号
+    // With RLIMIT_CORE on, a process killed by SIGSEGV leaves an ELF core file (ET_CORE, aarch64)
+    // in the current directory; with a limit of 0 nothing is written; %e and %s in core_pattern
+    // expand to the program name and the signal
     let script = "mkdir -p /tmp/cores && cd /tmp/cores && rm -f core* && ulimit -c unlimited && \
                   sh -c 'kill -SEGV $$'; echo status $?; od -A n -t x1 -N 4 core; \
                   od -A n -t d2 -j 16 -N 4 core; rm core; ulimit -c 0; \
@@ -334,7 +341,7 @@ fn fatal_signals_write_core_files() {
     }
 }
 
-/// 用 musl-gcc 静态编译 tests/guest/<name>.c；没有 musl-gcc 时返回 None。
+/// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.
 fn build_static(name: &str) -> Option<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/guest")
@@ -361,8 +368,9 @@ fn build_static(name: &str) -> Option<PathBuf> {
 
 #[test]
 fn every_kind_of_wait_releases_the_bkl_without_borrows() {
-    // 每种会在内核里等待的系统调用都等一次（tests/guest/waits.c）：调试构建的内核层在
-    // 放开 BKL 时检查没有借着内核对象（crate::cell），借着的话 panic，appine-run 终止
+    // Every kind of system call that waits in the kernel waits once (tests/guest/waits.c): the
+    // kernel layer of debug builds checks on releasing the BKL that no kernel object is borrowed
+    // (crate::cell); if one is, it panics and appine-run terminates
     let (Some(store), Some(program)) = (store(), build_static("waits")) else {
         return;
     };
@@ -383,8 +391,9 @@ fn every_kind_of_wait_releases_the_bkl_without_borrows() {
 
 #[test]
 fn kernel_log_is_empty_and_keeps_console_levels() {
-    // appine 没有内核日志：dmesg 什么也不打印；dmesg -n 改的控制台级别在
-    // /proc/sys/kernel/printk 里看得到；dmesg_restrict 为 1 时普通用户读不了，只能写 0、1
+    // appine has no kernel log: dmesg prints nothing; the console level dmesg -n changes is
+    // visible in /proc/sys/kernel/printk; with dmesg_restrict at 1 ordinary users cannot read it,
+    // and only 0 and 1 can be written
     let script = "dmesg; echo rc=$?; dmesg -n 3; cat /proc/sys/kernel/printk; \
         echo '6 4 1' > /proc/sys/kernel/printk; cat /proc/sys/kernel/printk; \
         echo 1 > /proc/sys/kernel/dmesg_restrict; su -s /bin/sh nobody -c dmesg; echo rc=$?; \
@@ -407,10 +416,12 @@ fn kernel_log_is_empty_and_keeps_console_levels() {
 
 #[test]
 fn kmsg_records_reach_dmesg() {
-    // 写 /dev/kmsg 的记录 dmesg 读得到（busybox 的 dmesg 用 syslog(2) 的读全部），结尾没有
-    // 换行的等下一条来了才读得到；printk_devkmsg 默认 ratelimit：一个打开文件 5 秒内最多
-    // 10 条，关闭时记一条丢了几条；on 不限，off 打不开；/proc/kmsg 只有 root 能读，与
-    // syslog 的读共用位置，dmesg -c 不影响它
+    // Records written to /dev/kmsg can be read by dmesg (busybox's dmesg uses syslog(2)'s
+    // read-all), and one without a trailing newline only once the next one arrives;
+    // printk_devkmsg defaults to ratelimit: at most 10 records per open file in 5 seconds, with a
+    // record of how many were dropped on close; on is unlimited, off cannot be opened; only root
+    // can read /proc/kmsg, which shares its position with syslog reads and is not affected by
+    // dmesg -c
     let script = "strip() { sed 's/\\[ *[0-9]*\\.[0-9]*\\] //'; }; \
         echo '<11>user err' > /dev/kmsg; printf 'no newline' > /dev/kmsg; dmesg -r | strip; \
         echo closes > /dev/kmsg; dmesg | strip; cat /proc/sys/kernel/printk_devkmsg; \
@@ -438,8 +449,8 @@ fn kmsg_records_reach_dmesg() {
 
 #[test]
 fn io_priority_reaches_the_host_thread() {
-    // ionice 之后执行的程序在宿主上的线程也设上了（Android 的应用 seccomp 放行 ioprio_set）：
-    // IDLE 照搬，RT 降成同一级的 BE
+    // After ionice, the host thread of the program it runs is set too (Android's app seccomp
+    // allows ioprio_set): IDLE is copied as is, RT is lowered to BE at the same level
     let Some(store) = store() else {
         return;
     };
@@ -473,8 +484,8 @@ fn io_priority_reaches_the_host_thread() {
 
 #[test]
 fn interface_counters_count_guest_traffic() {
-    // 回环上收发之后 /proc/net/dev、sysfs、netlink 三处 lo 的计数相同，增加的正好是载荷
-    // （tests/guest/traffic.c）
+    // After sending and receiving on the loopback, the lo counters in three places, /proc/net/dev,
+    // sysfs and netlink, are equal, and they grow by exactly the payload (tests/guest/traffic.c)
     let (Some(store), Some(program)) = (store(), build_static("traffic")) else {
         return;
     };
@@ -495,8 +506,9 @@ fn interface_counters_count_guest_traffic() {
 
 #[test]
 fn core_files_have_the_linux_layout() {
-    // 多线程的进程崩溃：core 文件的程序头、MADV_DONTDUMP、每个线程的 note、core_pattern、
-    // RLIMIT_CORE 的截断（tests/guest/coredump.c），程序要拷进仓库里运行
+    // A multithreaded process crashes: the core file's program headers, MADV_DONTDUMP, each
+    // thread's notes, core_pattern, truncation by RLIMIT_CORE (tests/guest/coredump.c); the
+    // program must be copied into the store to run
     let (Some(store), Some(program)) = (store(), build_static("coredump")) else {
         return;
     };
@@ -517,8 +529,10 @@ fn core_files_have_the_linux_layout() {
 
 #[test]
 fn each_step_of_finishing_a_process_survives_kernel_bugs() {
-    // 进程结束的一步撞上内核层的 bug（debug 构建的测试钩子模拟）时，只丢掉这一步做的事，
-    // 后面的步骤照样做（tests/guest/finish.c）；要有控制终端，程序拷进仓库里运行
+    // When a step of process finish hits a kernel-layer bug (simulated with the test hooks of debug
+    // builds), only what that step does is lost, and the later steps are done all the same
+    // (tests/guest/finish.c); a controlling terminal is needed, so the program is copied into the
+    // store to run
     if !cfg!(debug_assertions) {
         return;
     }
@@ -570,7 +584,7 @@ fn missing_or_non_executable_programs_fail_to_start() {
     }
 }
 
-/// 在 `sh -c` 里运行脚本，要求退出码为 0，返回 stdout。
+/// Checks that a script run in `sh -c` exits with 0, and returns its stdout.
 fn shell(tier: &str, out: &Output) -> String {
     assert_ok(tier, out);
     stdout(out).to_owned()
@@ -578,8 +592,8 @@ fn shell(tier: &str, out: &Output) -> String {
 
 #[test]
 fn file_permissions_apply_to_other_users() {
-    // su 到 nobody 之后：读不了 root 的 600 文件，进不了 /root，删不了粘滞位 /tmp 里
-    // 别人的文件；新文件属于 nobody
+    // After su to nobody: root's 600 files cannot be read, /root cannot be entered, and other
+    // users' files in the sticky /tmp cannot be deleted; new files belong to nobody
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -599,10 +613,12 @@ fn file_permissions_apply_to_other_users() {
 
 #[test]
 fn user_namespace_of_an_unprivileged_user() {
-    // nobody 自己建用户命名空间和挂载命名空间（busybox 的 unshare -r -m）：把自己映射成 root，
-    // 在里面有能力，但对没有映射的文件（属于真正的 root 的）没有特权，设备节点建不了；能在
-    // 自己的挂载命名空间里挂 tmpfs，外面看不到。期望值是上游 Linux 的行为：差分测试比不了，
-    // Ubuntu 的 kernel.apparmor_restrict_unprivileged_userns 不让这种命名空间里有能力
+    // nobody creates its own user and mount namespaces (busybox's unshare -r -m): it maps itself
+    // to root and has capabilities inside, but no privilege over unmapped files (those of the real
+    // root), and cannot create device nodes; it can mount a tmpfs in its own mount namespace,
+    // invisible outside. The expected values are upstream Linux's behaviour: a differential test
+    // cannot compare it, since Ubuntu's kernel.apparmor_restrict_unprivileged_userns allows no
+    // capabilities in such a namespace
     let inside = "id -u; id -g; tr -s ' ' < /proc/self/uid_map; \
                   cat /etc/shadow 2>/dev/null || echo denied; \
                   chown root /tmp 2>/dev/null || echo eperm; stat -c %u:%g /; \
@@ -663,7 +679,7 @@ fn trap_handlers_run_on_signals() {
         "trap 'echo caught USR1' USR1; kill -USR1 $$; echo after; \
          trap 'echo term; exit 5' TERM; trap 'echo bye' EXIT; kill -TERM $$; echo not reached",
     ]) {
-        // 与原生的 Alpine busybox 相同
+        // The same as the native Alpine busybox
         assert_eq!(
             stdout(&out),
             "caught USR1\nafter\nterm\nbye\n",
@@ -671,7 +687,8 @@ fn trap_handlers_run_on_signals() {
         );
         assert_eq!(out.status.code(), Some(5), "tier {tier}");
     }
-    // 没有 trap 的 SIGTERM 按默认动作终止 shell，EXIT trap 不会运行
+    // A SIGTERM without a trap terminates the shell by the default action, and the EXIT trap does
+    // not run
     for (tier, out) in run(&["/bin/sh", "-c", "trap 'echo bye' EXIT; kill $$; echo no"]) {
         assert_eq!(stdout(&out), "", "tier {tier}");
         assert_eq!(out.status.code(), Some(128 + 15), "tier {tier}");
@@ -680,7 +697,7 @@ fn trap_handlers_run_on_signals() {
 
 #[test]
 fn find_exec_and_xargs_spawn_programs() {
-    // busybox 用 vfork 启动 -exec 和 xargs 的命令
+    // busybox starts the commands of -exec and xargs with vfork
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -711,7 +728,7 @@ fn background_jobs_can_be_waited_for_and_killed() {
 
 #[test]
 fn closed_pipes_stop_writers_with_sigpipe() {
-    // yes 永远在写：head 退出之后它只能被 SIGPIPE 终止
+    // yes writes forever: after head exits it can only be terminated by SIGPIPE
     for (tier, out) in run(&["/bin/sh", "-c", "yes | head -n 2; echo end"]) {
         assert_eq!(shell(tier, &out), "y\ny\nend\n", "tier {tier}");
     }
@@ -779,7 +796,8 @@ fn procfs_describes_processes() {
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
-        // 后台的子进程可能还没 exec 成 sleep（comm 还是 sh），与 Linux 相同：先等它
+        // The background child may not have exec'd into sleep yet (comm is still sh), as on Linux:
+        // wait for it first
         "sleep 5 & i=0; until ps -o comm | grep -qx sleep || [ $i -ge 200 ]; do i=$((i+1)); done; \
          ps -o pid,comm | grep -c sleep; grep ^Name /proc/self/status; \
          readlink /proc/self/exe; cat /proc/self/cmdline | tr '\\0' ' '; echo; \
@@ -792,7 +810,7 @@ fn procfs_describes_processes() {
             [
                 "1",
                 "Name:\tgrep",
-                // 与 Linux 相同，exe 是解析完符号链接的路径
+                // As on Linux, exe is the path with symbolic links resolved
                 "/bin/busybox",
                 "cat /proc/self/cmdline ",
                 "1",
@@ -806,8 +824,9 @@ fn procfs_describes_processes() {
 
 #[test]
 fn procfs_fd_paths_resolve_symlinks() {
-    // 与 Linux 的 d_path 一样，/proc/<pid>/fd 里是解析完符号链接的路径：valgrind 按它带着
-    // O_NOFOLLOW 重新打开 Debian 的 /lib/ld-linux-aarch64.so.1（最后一级是链接）
+    // As with Linux's d_path, /proc/<pid>/fd holds paths with symbolic links resolved: valgrind
+    // reopens Debian's /lib/ld-linux-aarch64.so.1 (whose last component is a link) by it with
+    // O_NOFOLLOW
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -827,8 +846,9 @@ fn procfs_fd_paths_resolve_symlinks() {
 
 #[test]
 fn procfs_task_links_count_threads() {
-    // 与 Linux 的 proc_task_getattr 一样，/proc/<pid>/task 的链接数是 2 加线程数：Chromium
-    // 的 zygote fork 之前按它判断自己是不是单线程，不到 3 就崩溃
+    // As with Linux's proc_task_getattr, the link count of /proc/<pid>/task is 2 plus the number
+    // of threads: Chromium's zygote uses it before fork to decide whether it is single-threaded,
+    // and crashes when it is under 3
     for (tier, out) in run(&["/bin/sh", "-c", "stat -c %h /proc/self/task"]) {
         assert_eq!(shell(tier, &out), "3\n", "tier {tier}");
     }
@@ -836,7 +856,8 @@ fn procfs_task_links_count_threads() {
 
 #[test]
 fn procfs_net_is_under_each_process() {
-    // 与 Linux 一样，/proc/net 是指向 self/net 的链接，文件在每个进程（和线程）的目录下
+    // As on Linux, /proc/net is a link to self/net, and the files are under each process's (and
+    // thread's) directory
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -854,7 +875,8 @@ fn procfs_net_is_under_each_process() {
 
 #[test]
 fn procfs_marks_deleted_files() {
-    // 与 Linux 的 d_path 一样，删除之后还开着的文件在 /proc/<pid>/fd 里带着 " (deleted)"
+    // As with Linux's d_path, a file still open after deletion carries " (deleted)" in
+    // /proc/<pid>/fd
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -872,8 +894,8 @@ fn procfs_marks_deleted_files() {
 
 #[test]
 fn sysfs_and_limits_describe_the_machine() {
-    // busybox 的 nproc --all 数 /sys/devices/system/cpu 下的 cpu<n>；/proc/self/limits 与
-    // ulimit 一致
+    // busybox's nproc --all counts the cpu<n> under /sys/devices/system/cpu; /proc/self/limits
+    // agrees with ulimit
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -895,7 +917,8 @@ fn sysfs_and_limits_describe_the_machine() {
 
 #[test]
 fn network_configuration_is_visible() {
-    // netlink（ip）、接口 ioctl（ifconfig）、/proc/net/dev、指向 DNS 存根的 resolv.conf
+    // netlink (ip), interface ioctls (ifconfig), /proc/net/dev, a resolv.conf pointing at the DNS
+    // stub
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -918,8 +941,10 @@ fn network_configuration_is_visible() {
 
 #[test]
 fn routing_tables_are_visible() {
-    // 本地表按接口的地址合成，规则是 Linux 默认的那几条；ip route get 的本机地址走 lo；
-    // /proc/net/route 有表头，sockstat 数得到 socket（主表取决于宿主的网络，这里不看）
+    // The local table is synthesised from the interfaces' addresses, and the rules are Linux's
+    // default ones; ip route get for a local address goes through lo; /proc/net/route has a
+    // header, and sockstat counts sockets (the main table depends on the host's network, so it is
+    // not checked here)
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -945,7 +970,7 @@ fn routing_tables_are_visible() {
 
 #[test]
 fn syslog_messages_travel_over_a_unix_socket() {
-    // syslogd 把数据报 socket 绑定在 /dev/log 上，logger 按路径发过去
+    // syslogd binds a datagram socket on /dev/log, and logger sends to it by path
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
@@ -984,8 +1009,9 @@ fn stop_and_continue_signals() {
     for (tier, out) in run(&[
         "/bin/sh",
         "-c",
-        // 状态变过去之前一直看（最多 5 秒）：只等 0.2 秒的话，机器忙时 SIGCONT 之后的进程还没
-        // 回到 nanosleep 里，读到的是 R（CI 上遇到过）
+        // Keep looking until the state has changed (at most 5 seconds): waiting only 0.2 seconds,
+        // when the machine is busy the process has not yet gone back into nanosleep after
+        // SIGCONT, and R is read (seen on CI)
         "st() { for i in $(seq 50); do s=$(grep State /proc/$p/status); \
          case \"$s\" in *\"$1\"*) break;; esac; sleep 0.1; done; echo \"$s\"; }; \
          sleep 30 & p=$!; kill -STOP $p; st stopped; \
@@ -1000,12 +1026,12 @@ fn stop_and_continue_signals() {
     }
 }
 
-/// 在进程内 PTY 上运行的交互式 shell。
+/// An interactive shell running on an in-process PTY.
 struct Interactive {
     child: Child,
     stdin: ChildStdin,
     output: Arc<Mutex<Vec<u8>>>,
-    /// 已经匹配过的输出长度：`expect` 只在它之后查找。
+    /// Length of the output already matched: `expect` searches only after it.
     seen: usize,
     tier: &'static str,
 }
@@ -1061,7 +1087,7 @@ impl Interactive {
         self.stdin.flush().unwrap();
     }
 
-    /// 等到新的输出里出现 `text`。
+    /// Waits until `text` appears in the new output.
     fn expect(&mut self, text: &str) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1083,7 +1109,8 @@ impl Interactive {
         }
     }
 
-    /// 退出 shell，返回它的退出码。shell 不肯退出时（比如还有停住的作业）不一直等下去。
+    /// Exits the shell, returning its exit code. Does not wait forever when the shell refuses to
+    /// exit (for example when there are still stopped jobs).
     fn exit(mut self) -> Option<i32> {
         self.send(b"exit\n");
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1103,7 +1130,7 @@ impl Interactive {
 }
 
 impl Drop for Interactive {
-    /// 用例失败时不留下还在等输入的 appine-run。
+    /// Leaves no appine-run still waiting for input when a test case fails.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -1112,9 +1139,10 @@ impl Drop for Interactive {
 
 #[test]
 fn end_of_piped_input_is_an_eof_on_the_terminal() {
-    // --pty 时 stdin 是管道：输入结束、程序读完送进去的输入之后，像 script 那样送一个 ^D，
-    // 读到 EOF 就结束的程序随之退出（原来一直等下去）。输出里有行规程回显的输入，cat 的
-    // 那一行因此出现两次
+    // With --pty stdin is a pipe: when input ends and the program has read the input sent in, a ^D
+    // is sent as script does, and programs that end on reading EOF exit with it (they used to wait
+    // forever). The output holds the input echoed by the line discipline, so cat's line appears
+    // twice
     let Some(store) = store() else {
         return;
     };
@@ -1188,8 +1216,9 @@ fn ctrl_c_and_ctrl_z_control_the_foreground_job() {
     };
     for tier in TIERS {
         let mut s = Interactive::start(store, tier);
-        // 子进程打印 job-42 时已经是前台进程组；输出的文字不能出现在命令行里，
-        // 否则会先匹配到回显。作业停在读终端上
+        // The child is already the foreground process group when it prints job-42; the printed
+        // text must not appear on the command line, or the echo would match first. The job then
+        // sits reading the terminal
         s.send(b"sh -c 'echo job-$((6*7)); while read x; do echo got-$x; done'\n");
         s.expect("job-42");
         s.send(b"\x1a");
@@ -1198,10 +1227,12 @@ fn ctrl_c_and_ctrl_z_control_the_foreground_job() {
         s.send(b"jobs\n");
         s.expect("Stopped");
         s.expect(PROMPT);
-        // ash 的 fg 先打印作业的命令，再把终端交给它、让它继续。看到命令就按 ^C 的话，
-        // SIGINT 可能落到 shell 自己身上：shell 回到提示符，$? 也是 130，作业却一直停着，
-        // exit 不肯退出（原生 Linux 上也一样）。所以等作业读到一行、确实在前台运行了再按
-        // fg 打印的命令换成了双引号，`$` 前面加了反斜杠
+        // ash's fg first prints the job's command, then hands it the terminal and lets it
+        // continue. Pressing ^C as soon as the command shows, SIGINT may land on the shell itself:
+        // the shell returns to the prompt, $? is 130 too, yet the job stays stopped and exit
+        // refuses to exit (the same on native Linux). So wait until the job has read a line and is
+        // really running in the foreground before pressing
+        // The command fg prints has its quotes turned into double quotes and a backslash before `$`
         s.send(b"fg\n");
         s.expect("; done");
         s.send(b"ping\n");
@@ -1224,10 +1255,11 @@ fn vi_edits_a_file() {
         let mut s = Interactive::start(store, tier);
         let file = format!("/tmp/vi-{tier}");
         s.send(format!("rm -f {file}; vi {file}\n").as_bytes());
-        // 切到备用屏幕，画出状态行
+        // Switch to the alternate screen and draw the status line
         s.expect("\x1b[?1049h");
         s.expect("100%");
-        // vi 靠 ESC 之后有没有紧跟着的字节区分 ESC 键和转义序列，所以分开发送
+        // vi tells the ESC key from escape sequences by whether bytes follow the ESC right away,
+        // so they are sent separately
         s.send(b"ihello from vi");
         std::thread::sleep(Duration::from_millis(300));
         s.send(b"\x1b");
@@ -1255,7 +1287,8 @@ fn apk_installs_packages_and_git_clones_over_https() {
     let Some(tarball) = find_tarball() else {
         panic!("rootfs tarball not found; run scripts/fetch-rootfs");
     };
-    // 安装软件包会改动很多文件：用自己的仓库，不影响其他用例
+    // Installing packages changes many files: use a store of its own, not affecting other test
+    // cases
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("network-store");
     let _ = std::fs::remove_dir_all(&dir);
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
@@ -1268,7 +1301,7 @@ fn apk_installs_packages_and_git_clones_over_https() {
     assert!(out.status.success(), "import failed: {}", stderr(&out));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_appine-run"));
-    // Tier 0 太慢，只在 Tier 1 下运行
+    // Tier 0 is too slow, so run only under Tier 1
     cmd.args(["--tier", "1", "--env", PATH, "--env", "HOME=/root"]);
     for var in ["http_proxy", "https_proxy", "no_proxy"] {
         if let Ok(v) = std::env::var(var) {
@@ -1311,7 +1344,7 @@ fn importing_into_an_existing_store_fails() {
     assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
 }
 
-/// 读控制台直到会话结束（Android 的终端标签页就是这样用 Machine 的）。
+/// Reads the console until the session ends (the way the Android terminal tabs use Machine).
 fn read_console(machine: &appine_kernel::Machine, id: u32) -> String {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -1326,8 +1359,8 @@ fn read_console(machine: &appine_kernel::Machine, id: u32) -> String {
 
 #[test]
 fn threads_max_limits_root_too() {
-    // threads-max 对 root 也有效：线程数到了上限时 fork 返回 EAGAIN，busybox sh 报告
-    // "can't fork" 后退出；写入的值不能小于 20
+    // threads-max applies to root too: fork returns EAGAIN when the thread count is at the limit,
+    // and busybox sh reports "can't fork" and exits; a value written may not be below 20
     let script = "echo 19 > /proc/sys/kernel/threads-max || echo rejected; \
                   echo 25 > /proc/sys/kernel/threads-max; cat /proc/sys/kernel/threads-max; \
                   i=0; while [ $i -lt 40 ]; do sleep 5 & i=$((i + 1)); done; echo not reached";
@@ -1348,8 +1381,9 @@ fn threads_max_limits_root_too() {
 
 #[test]
 fn rlimit_stack_at_execve_sets_the_stack_and_layout() {
-    // 初始栈只映射参数下面再多 128 KB；参数最多占栈大小上限的 1/4（至少 128 KB）；不限
-    // 栈大小时 mmap 区让出 MAX_GAP（ld-musl 映射在 0x1555_5555_5000 以下）
+    // The initial stack maps only 128 KB more below the arguments; the arguments take at most 1/4
+    // of the stack size limit (at least 128 KB); with an unlimited stack size the mmap area leaves
+    // MAX_GAP free (ld-musl is mapped below 0x1555_5555_5000)
     let script = "grep stack /proc/self/maps; \
                   (ulimit -s 1024; /bin/busybox true $(seq 20000) 2>/dev/null || echo E2BIG; \
                    /bin/busybox true $(seq 10000) && echo small ok); \
@@ -1380,8 +1414,8 @@ fn rlimit_stack_at_execve_sets_the_stack_and_layout() {
 
 #[test]
 fn lowering_oom_score_adj_needs_cap_sys_resource() {
-    // 普通用户能调高 oom_score_adj、再调回下限，不能调到下限以下；root 写的值成为新的
-    // 下限，su 之后继承
+    // An ordinary user can raise oom_score_adj and lower it back to the lower bound, but not below
+    // it; a value root writes becomes the new lower bound, inherited after su
     let f = "/proc/self/oom_score_adj";
     let script = format!(
         "su -s /bin/sh nobody -c 'echo 500 > {f}; cat {f}; echo 0 > {f}; \
@@ -1406,9 +1440,10 @@ fn lowering_oom_score_adj_needs_cap_sys_resource() {
 
 #[test]
 fn oom_killer_honours_oom_score_adj() {
-    // 超出内存上限时先结束 oom_score_adj 为 1000 的进程（即使它几乎不占内存），等它退出
-    // 之后还超出，再结束真正吃内存的 awk。挑进程的规则与执行层无关，只在 Tier 1 下跑：
-    // Tier 0 的 debug 构建拼 128 MB 的字符串要十几秒
+    // Over the memory limit, first the process with oom_score_adj 1000 is killed (even though it
+    // takes almost no memory), and if it is still over after that one exits, the awk that really
+    // eats memory is killed. The rules for picking processes do not depend on the tier, so run only
+    // under Tier 1: in a Tier 0 debug build, building a 128 MB string takes over ten seconds
     let Some(store) = store() else {
         return;
     };
@@ -1437,9 +1472,9 @@ fn oom_killer_honours_oom_score_adj() {
 
 #[test]
 fn cgroup_memory_files_follow_the_oom_killer() {
-    // /sys/fs/cgroup/memory.max 是 --memory-limit 给的上限（none 时是 max）；OOM killer 结束了
-    // 进程之后 memory.events 记着，memory.peak 量到过超出上限的用量。只在 Tier 1 下跑，理由
-    // 同上
+    // /sys/fs/cgroup/memory.max is the limit --memory-limit gives (max with none); after the OOM
+    // killer kills a process memory.events records it, and memory.peak has measured a usage over
+    // the limit. Run only under Tier 1, for the same reason
     let Some(store) = store() else {
         return;
     };
@@ -1476,10 +1511,11 @@ fn cgroup_memory_files_follow_the_oom_killer() {
 
 #[test]
 fn oom_kills_are_reported_to_the_app() {
-    // OOM killer 结束的进程留下报告给 App（take_kills）：控制台的编号，哪个 cgroup 的
-    // memory.max（App 的上限时没有 cgroup），用量和上限。只在 Tier 1 下跑，理由同上。cgroup 里的
-    // awk 拼出 64 MB 的字符串之后接着运行一会儿：OOM killer 定时量用量，一下子用完就退出的进程
-    // 发现不了
+    // A process the OOM killer kills leaves a report for the app (take_kills): the console's
+    // number, which cgroup's memory.max (no cgroup for the app's limit), the usage and the limit.
+    // Run only under Tier 1, for the same reason. The awk in the cgroup keeps running for a while
+    // after building a 64 MB string: the OOM killer measures usage periodically, and would not
+    // notice a process that exits as soon as it has used it all
     use appine_kernel::{ExitStatus, KillReason, Machine, MachineOptions, Stdio, Tier};
     let Some(store) = store() else {
         return;
@@ -1537,7 +1573,7 @@ fn oom_kills_are_reported_to_the_app() {
             if *l == limit && used > l),
         "{awk:?}"
     );
-    // 不在控制台上的进程（这里是脱离了控制终端的）没有编号
+    // A process not on a console (here one detached from its controlling terminal) has no number
     let script = "setsid sh -c 'exec awk \"BEGIN { s = \\\"x\\\"; for (i = 0; i < 27; i++) s = s s }\"' \
                   </dev/null >/dev/null 2>&1; echo $?";
     let id = machine.open_console(24, 80).unwrap();
@@ -1552,8 +1588,10 @@ fn oom_kills_are_reported_to_the_app() {
         matches!(kills.as_slice(), [k] if k.comm == "awk" && k.console.is_none()),
         "{kills:?}"
     );
-    // memory.oom.group：同组的 sleep 一起结束，各一份报告，挑中的 awk 只有一份（Linux 在
-    // 整组结束时把挑中的那个再算一次）。运行脚本的 sh 不在组里，子 shell 进组之后 exec 成 awk
+    // memory.oom.group: the sleep in the same group is killed along with it, each with a report,
+    // and the picked awk has only one (Linux counts the picked one again when it kills the whole
+    // group). The sh running the script is not in the group; the subshell joins it, then execs
+    // into awk
     let script = "cd /sys/fs/cgroup; mkdir g; echo 16M > g/memory.max; echo 1 > g/memory.oom.group; \
                   sh -c 'echo $$ > g/cgroup.procs; sleep 30 & \
                       exec awk \"BEGIN { s = \\\"x\\\"; for (i = 0; i < 26; i++) s = s s; \
@@ -1581,11 +1619,13 @@ fn oom_kills_are_reported_to_the_app() {
 
 #[test]
 fn code_cache_pages_are_counted_once() {
-    // Tier 1 的代码缓存按 W^X 映射两次（写入用、执行用），宿主的 RSS 按映射数页：两个
-    // 视图都碰过的页算两次，App 的内存用量（内存上限、LMK 看的）里翻译多算一倍。所以定时器
-    // 线程每秒拆一次写入用的视图里写过的页，所有线程都等待之后再拆一次。一串 busybox 的
-    // 小程序拿到的是同一个程序留在池里的实例，翻译越攒越多，都在执行用的视图里占着；
-    // shell 停在 read 里之后，写入用的视图很快就不占页了
+    // Tier 1's code cache is mapped twice for W^X (one for writing, one for execution), and the
+    // host's RSS counts pages per mapping: a page touched in both views counts twice, so the
+    // translations count double in the app's memory usage (what the memory limit and the LMK look
+    // at). So the timer thread tears down the written pages of the writing view once a second,
+    // and once more after all threads are waiting. A series of small busybox programs gets the
+    // same program's instance kept in the pool, translations keep piling up, all occupying the
+    // execution view; once the shell stops in read, the writing view soon occupies no pages
     let Some(store) = store() else {
         return;
     };
@@ -1604,7 +1644,7 @@ fn code_cache_pages_are_counted_once() {
         .unwrap();
     let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
     assert_eq!(lines.next().unwrap().unwrap(), "ready");
-    // 代码缓存是 128 MB 的共享映射：各个视图的 (权限, Rss KB)
+    // The code cache is a 128 MB shared mapping: (permissions, Rss KB) of each view
     let caches = || {
         let smaps = std::fs::read_to_string(format!("/proc/{}/smaps", child.id())).unwrap();
         let (mut caches, mut view) = (Vec::new(), None);
@@ -1654,9 +1694,10 @@ fn code_cache_pages_are_counted_once() {
 
 #[test]
 fn processes_of_one_program_share_translations() {
-    // 同一个程序的进程映射得一样时共用 Tier 1 的翻译：shell 和它起的 6 个 sleep（都是
-    // busybox，sleep 在 fork 出来的进程里直接执行）只占一份代码缓存，原来各一份。文件的
-    // ctime 离现在超过两秒才算可信（这个仓库刚导入），所以先等一会儿再 exec 一个 shell
+    // Processes of one program that are mapped alike share Tier 1 translations: the shell and the
+    // 6 sleeps it starts (all busybox, sleep run directly in the forked process) take only one
+    // code cache, where each used to have its own. A file's ctime is trusted only once it is more
+    // than two seconds old (this store was just imported), so wait a while before exec'ing a shell
     let Some(store) = store() else {
         return;
     };
@@ -1669,7 +1710,7 @@ fn processes_of_one_program_share_translations() {
         .unwrap();
     let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
     assert_eq!(lines.next().unwrap().unwrap(), "ready");
-    // 等这几个 sleep 都开始执行（翻译了代码）
+    // Wait for these sleeps to all start running (having translated code)
     std::thread::sleep(Duration::from_millis(500));
     let smaps = std::fs::read_to_string(format!("/proc/{}/smaps", child.id())).unwrap();
     child.stdin.take().unwrap().write_all(b"\n").unwrap();
@@ -1684,15 +1725,17 @@ fn processes_of_one_program_share_translations() {
             (size == 128 << 20 && perms == "r-xs").then_some(())
         })
         .count();
-    // 共用的一份，加上池里留着的（exec 之前的 shell）
+    // The shared one, plus the one kept in the pool (the shell before exec)
     assert!((1..=2).contains(&caches), "{caches} code caches");
 }
 
-/// 1024 以下的端口（docs/rounds/156-low-ports.md、208-low-ports-direct.md）：宿主让绑原来的
-/// 端口就绑原来的（以 root 运行、在容器里时），不让就换一个；总是映射时，宿主上先占住
-/// 10000 + 端口，guest 的端口就换到 20000 + 端口。Machine 报告这次在非回环地址上的监听，
-/// 宿主经由报告的端口连得上，换了端口时 guest 的内核日志记着换到了哪里。每次用不同的端口：
-/// 前一次连接留下的 TIME_WAIT 不影响后一次。
+/// Ports below 1024 (docs/rounds/156-low-ports.md, 208-low-ports-direct.md): when the host allows
+/// binding the original port it is bound (running as root, or in a container), otherwise another
+/// one is used; when always mapping, the host first takes 10000 + port, and the guest's port moves
+/// to 20000 + port. Machine reports this listen on a non-loopback address, the host can connect
+/// through the reported port, and when the port moved the guest's kernel log records where it
+/// moved to. A different port each time, so the TIME_WAIT left by one connection does not affect
+/// the next.
 #[test]
 fn low_ports_bind_the_real_port_or_elsewhere() {
     use appine_kernel::{ExitStatus, ListenEvent, Machine, MachineOptions, Stdio, Tier};
@@ -1705,7 +1748,7 @@ fn low_ports_bind_the_real_port_or_elsewhere() {
         (Tier::Interpreter, 77, false),
         (Tier::Dbt, 76, false),
     ] {
-        // busybox 的 nc 绑 IPv6 的通配地址，这里也占住同一种
+        // busybox's nc binds the IPv6 wildcard address, so take the same kind here
         let busy = always_map.then(|| std::net::TcpListener::bind(("::", 10000 + port)));
         if let Some(Err(_)) = busy {
             eprintln!("skipped: cannot bind [::]:{} on the host", 10000 + port);
@@ -1747,7 +1790,8 @@ fn low_ports_bind_the_real_port_or_elsewhere() {
             host_port,
         };
         assert_eq!(event, want, "{tier:?}");
-        // nc 读完 stdin 之后不关连接，这一边读到了就关掉，它才退出
+        // nc does not close the connection after reading stdin; this side closes it once it has
+        // read, and only then does nc exit
         let mut conn = std::net::TcpStream::connect(("127.0.0.1", host_port)).unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -1757,7 +1801,7 @@ fn low_ports_bind_the_real_port_or_elsewhere() {
         drop(conn);
         let out = read_console(&machine, id);
         let log = format!("appine: port {port}/tcp is {host_port} on the host");
-        // 绑得了原来的端口时不记
+        // Nothing is logged when the original port can be bound
         assert_eq!(out.contains(&log), host_port != port, "{tier:?}: {out}");
         assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
         assert!(machine.take_listens().is_empty(), "{tier:?}");
@@ -1788,7 +1832,7 @@ fn one_machine_runs_several_terminal_sessions() {
                 .unwrap();
             (id, pid)
         };
-        // 两个会话同时运行，各自有自己的控制终端
+        // Two sessions run at once, each with its own controlling terminal
         let (a, pa) = sh("tty; stty size; echo one");
         let (b, pb) = sh("read line; echo got $line; exit 3");
         machine.write_console(b, b"input\n").unwrap();
@@ -1799,7 +1843,8 @@ fn one_machine_runs_several_terminal_sessions() {
         assert_eq!(out_b, "input\ngot input\n", "{tier:?}");
         assert_eq!(machine.wait(pa), ExitStatus::Exited(0));
         assert_eq!(machine.wait(pb), ExitStatus::Exited(3));
-        // 关闭控制台就是挂断终端：交互式 shell 收到 SIGHUP 退出
+        // Closing a console is hanging up the terminal: an interactive shell receives SIGHUP and
+        // exits
         let id = machine.open_console(24, 80).unwrap();
         let argv = [b"sh".to_vec(), b"-i".to_vec()];
         let pid = machine
@@ -1818,8 +1863,9 @@ fn one_machine_runs_several_terminal_sessions() {
     }
 }
 
-/// Alpine 的 sysctl 服务开机时写的几项（`/usr/lib/sysctl.d/00-alpine.conf`）和写入的规则：
-/// 容器里 `/proc/sys` 是只读的，差分测试比不了写入（第 185 轮）。
+/// The few settings Alpine's sysctl service writes at boot (`/usr/lib/sysctl.d/00-alpine.conf`),
+/// and the rules for writing them: `/proc/sys` is read-only in a container, so a differential
+/// test cannot compare writes (round 185).
 #[test]
 fn sysctls_written_at_alpine_boot() {
     let script = "
@@ -1847,10 +1893,11 @@ fn sysctls_written_at_alpine_boot() {
     }
 }
 
-/// 内置的 init 按 inittab 开机、关机（第 186 轮）：顺序，输出写到 /var/log/boot.log，环境
-/// 变量与 busybox init 的相同，跳过没装的程序和 respawn；开机之后 guest 的 poweroff、
-/// `kill -TERM 1` 是关机、重启的请求，没开机时什么也不做。一个用例里做完：都要改仓库里的
-/// /etc/inittab。
+/// The built-in init boots and shuts down by inittab (round 186): the order, output written to
+/// /var/log/boot.log, environment variables the same as busybox init's, skipping uninstalled
+/// programs and respawn; after boot the guest's poweroff and `kill -TERM 1` are requests to power
+/// off and to reboot, and without boot they do nothing. Done in one test case: they all change
+/// /etc/inittab in the store.
 #[test]
 fn init_runs_the_inittab() {
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Power, Stdio, Tier};
@@ -1887,7 +1934,7 @@ tty1::respawn:/sbin/getty 38400 tty1
                 .output()
                 .unwrap()
         };
-        // 程序在 sysinit、wait 之后启动；结束之后关机
+        // The program starts after sysinit and wait; after it ends, shut down
         let out = init("cat /tmp/inittab-order /var/log/boot.log; sleep 1.5");
         assert_ok(tier, &out);
         let booted = "sysinit /sbin:/usr/sbin:/bin:/usr/bin /\nwait\n";
@@ -1901,7 +1948,7 @@ tty1::respawn:/sbin/getty 38400 tty1
             format!("{booted}once\nshutdown\n"),
             "tier {tier}"
         );
-        // poweroff：关机的命令照常运行，程序被 SIGTERM 结束
+        // poweroff: the shutdown commands run as usual, and the program is ended by SIGTERM
         let start = Instant::now();
         let out = init("rm /tmp/inittab-order; poweroff; sleep 5; echo not reached");
         assert_eq!(
@@ -1912,14 +1959,15 @@ tty1::respawn:/sbin/getty 38400 tty1
         );
         assert!(start.elapsed() < Duration::from_secs(4), "tier {tier}");
         assert!(order(tier).contains("shutdown\n"), "tier {tier}");
-        // 不带 --init 时 poweroff 什么也不做
+        // Without --init, poweroff does nothing
         let out = command(store, tier, &["/bin/sh", "-c", "poweroff; echo still here"])
             .output()
             .unwrap();
         assert_ok(tier, &out);
         assert_eq!(stdout(&out), "still here\n", "tier {tier}");
     }
-    // Machine 的接口：App 用 take_power 取走请求、processes 决定留不留在后台
+    // The Machine interface: the app takes requests with take_power and decides by processes
+    // whether to stay in the background
     for tier in [Tier::Interpreter, Tier::Dbt] {
         let machine = Machine::start(&MachineOptions {
             tier,
@@ -1948,8 +1996,8 @@ tty1::respawn:/sbin/getty 38400 tty1
         machine.shutdown(Power::Reboot, Duration::from_secs(10));
         assert_eq!(machine.processes(), 0, "{tier:?}");
     }
-    // 一个命令也没运行（程序都没装）：上次开机的输出照样清掉（第 195 轮，App 从里面找没起来的
-    // 服务）
+    // Not a single command ran (none of the programs is installed): the previous boot's output is
+    // cleared all the same (round 195; the app looks in it for services that failed to start)
     let script = "cp /etc/inittab /tmp/inittab.saved; echo ::sysinit:/sbin/not-installed > /etc/inittab; \
                   echo ' * ERROR: stale failed to start' > /var/log/boot.log";
     assert_ok(
@@ -1982,10 +2030,12 @@ tty1::respawn:/sbin/getty 38400 tty1
 
 #[test]
 fn files_app_changes_reach_inotify_watchers() {
-    // "文件"App 改的东西（宿主另外打开仓库，appine_kernel::browse_changing）交给运行中的内核，
-    // guest 里监视着的程序照样收到事件：新建、为写打开（截断）、关闭时的写、改名、删除。
-    // busybox 的 inotifyd 把事件印成"字母\t目录\t名字"，字母按事件位的顺序是 acew0rmynd：
-    // c 是 IN_MODIFY，r 是 IN_OPEN，w 是 IN_CLOSE_WRITE，m、y 是移出、移入
+    // Changes made by the Files app (the host opening the store separately,
+    // appine_kernel::browse_changing) are handed to the running kernel, and programs watching in
+    // the guest receive events all the same: create, open for writing (truncate), write on close,
+    // rename, delete. busybox's inotifyd prints events as "letters\tdirectory\tname", the letters
+    // in event-bit order being acew0rmynd: c is IN_MODIFY, r IN_OPEN, w IN_CLOSE_WRITE, m and y
+    // moved out and moved in
     use appine_kernel::vfs::browse;
     use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
     use std::io::Write;
@@ -2045,7 +2095,8 @@ fn files_app_changes_reach_inotify_watchers() {
          d\t/root/fw\tb.txt\n",
         "{out}"
     );
-    // 反过来，guest 改过目录项的目录交给 App（"文件"App 刷新它们）：第一次取时才开始记
+    // Conversely, directories whose entries the guest changed are handed to the app (the Files app
+    // refreshes them): recording starts only at the first take
     assert!(machine.take_changed_dirs().is_empty());
     let script = "mkdir /root/fw/d && touch /root/fw/d/f && echo x > /root/fw/d/f";
     let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];

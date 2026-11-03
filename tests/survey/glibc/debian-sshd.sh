@@ -1,5 +1,7 @@
-# Debian（glibc）：sshd 的登录会话里 w、who 报告的空闲时间（终端的访问时间，第 79 轮）。
-# Alpine 的 musl 不写 utmp，w、who 什么也不列，所以用 Debian。会话先闲 20 秒再看
+# Debian (glibc): the idle time w and who report in an sshd login session (the terminal's access
+# time, round 79).
+# Alpine's musl does not write utmp, so w and who list nothing; hence Debian. The session idles for
+# 20 seconds before looking
 export DEBIAN_FRONTEND=noninteractive
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 if ! [ -x /usr/sbin/sshd ] || ! command -v w >/dev/null; then

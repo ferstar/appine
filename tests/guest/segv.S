@@ -1,4 +1,4 @@
-// 读未映射的地址：guest 应当以 SIGSEGV 终止。
+// Reads an unmapped address: the guest should terminate with SIGSEGV.
     .text
     .globl  _start
 _start:

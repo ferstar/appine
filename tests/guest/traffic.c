@@ -1,10 +1,12 @@
 /*
- * 网络接口和协议的流量计数（core/kernel/src/traffic.rs）：在回环上收发之后，/proc/net/dev、
- * /sys/class/net/lo/statistics 和 getifaddrs 的 ifa_data（netlink 的 IFLA_STATS）三处 lo 的
- * 计数相同，增加的字节数正好是收发的载荷，偷看（MSG_PEEK）的不算；/proc/net/snmp、netstat
- * 里 IP 的包数、字节数与 lo 的相同，TCP 的连接、UDP 的数据报、ping 的回显也数得对。包数、
- * 字节数只在 appine 里成立：Linux 还算协议头和 ACK。通过时打印 "all ok"，失败时打印原因并
- * 以 1 退出。
+ * Traffic counters of network interfaces and protocols (core/kernel/src/traffic.rs): after sending
+ * and receiving on the loopback, the lo counters in three places, /proc/net/dev,
+ * /sys/class/net/lo/statistics and getifaddrs' ifa_data (netlink's IFLA_STATS), are equal, the
+ * bytes added are exactly the payload sent and received, and peeking (MSG_PEEK) does not count;
+ * the IP packet and byte counts in /proc/net/snmp and netstat equal lo's, and TCP connections, UDP
+ * datagrams and ping echoes are counted correctly too. The packet and byte counts hold only in
+ * appine: Linux also counts protocol headers and ACKs. Prints "all ok" when it passes; a failure
+ * prints the reason and exits with 1.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -83,7 +85,7 @@ static struct counts from_sys(void)
                            sys_value("tx_packets")};
 }
 
-/* struct rtnl_link_stats 的前四项 */
+/* The first four fields of struct rtnl_link_stats */
 struct link_stats {
     uint32_t rx_packets, tx_packets, rx_bytes, tx_bytes;
 };
@@ -107,7 +109,7 @@ static struct counts from_ifaddrs(void)
     return c;
 }
 
-/* 三处的计数相同 */
+/* The counts in the three places are equal */
 static struct counts counters(void)
 {
     struct counts p = from_proc(), s = from_sys(), a = from_ifaddrs();
@@ -119,8 +121,9 @@ static struct counts counters(void)
 }
 
 /*
- * /proc/net/snmp、netstat 里 group 这一组的 field。每一组是字段名一行、数值一行，组名
- * 相同、个数相同；没有这一项时以 -1 返回（IcmpMsg 只列出不为 0 的类型）。
+ * The field `field` of group `group` in /proc/net/snmp or netstat. Each group is a line of field
+ * names and a line of values, with the same group name and the same count; returns -1 when there
+ * is no such entry (IcmpMsg lists only the types that are not 0).
  */
 static long long snmp(const char *file, const char *group, const char *field)
 {
@@ -196,7 +199,7 @@ int main(void)
               snmp("netstat", "MPTcpExt", "RcvWndConflict") == 0,
           "the last fields of TcpExt and MPTcpExt");
 
-    /* 回环上的 TCP 连接 */
+    /* A TCP connection on the loopback */
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     socklen_t len = sizeof addr;
     int l = socket(AF_INET, SOCK_STREAM, 0);
@@ -232,7 +235,8 @@ int main(void)
     close(s);
     close(l);
 
-    /* 没有 connect 的 UDP：按对端认接口；偷看一次，不算 */
+    /* UDP without connect: the interface is determined by the peer; peek once, which does not
+     * count */
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     addr.sin_port = 0;
     len = sizeof addr;
@@ -244,7 +248,7 @@ int main(void)
     CHECK(recv(u, buf, sizeof buf, MSG_PEEK) == DATAGRAM_BYTES, "peek");
     for (int i = 0; i < DATAGRAMS; i++)
         CHECK(recv(u, buf, sizeof buf, 0) == DATAGRAM_BYTES, "recv");
-    /* 发出去没人读的：只算发出的，收发两个方向的数因此不同 */
+    /* Sent but never read: counted only as sent, so the counts of the two directions differ */
     CHECK(sendto(v, buf, UNREAD_BYTES, 0, (void *)&addr, len) == UNREAD_BYTES, "sendto");
     close(u);
     close(v);
@@ -255,15 +259,15 @@ int main(void)
               after.rx_bytes - before.rx_bytes == bytes,
           "bytes: sent %llu, received %llu", after.tx_bytes - before.tx_bytes,
           after.rx_bytes - before.rx_bytes);
-    /* TCP 至少 2 个（回环的 MSS 约 64 KB），每个数据报 1 个 */
+    /* At least 2 for TCP (the loopback MSS is about 64 KB), 1 per datagram */
     CHECK(after.tx_packets - before.tx_packets >= DATAGRAMS + 3 &&
               after.rx_packets - before.rx_packets >= DATAGRAMS + 2,
           "packets: sent %llu, received %llu", after.tx_packets - before.tx_packets,
           after.rx_packets - before.rx_packets);
     printf("ok counters\n");
 
-    /* IP 的包数、字节数与 lo 的相同（都是 IPv4）；TCP 的段是除去数据报的那些，偷看的数据报
-     * 不算，没人读的只算发出的 */
+    /* IP packet and byte counts equal lo's (all IPv4); TCP segments are the rest after the
+     * datagrams, peeked datagrams do not count, and unread ones count only as sent */
     long long rx = after.rx_packets - before.rx_packets, tx = after.tx_packets - before.tx_packets;
     CHECK(snmp("snmp", "Ip", "InReceives") - ip_in == rx &&
               snmp("snmp", "Ip", "OutRequests") - ip_out == tx &&
@@ -283,7 +287,8 @@ int main(void)
           snmp("snmp", "Tcp", "CurrEstab") - estab, snmp("snmp", "Udp", "InDatagrams") - udp_in,
           snmp("snmp", "Udp", "OutDatagrams") - udp_out);
 
-    /* 连不上：阻塞的直接得到 ECONNREFUSED，非阻塞的从 SO_ERROR 得知，各算一次 */
+    /* Connection refused: a blocking connect gets ECONNREFUSED directly, a non-blocking one learns
+     * it from SO_ERROR, each counted once */
     long long fails = snmp("snmp", "Tcp", "AttemptFails");
     opens = snmp("snmp", "Tcp", "ActiveOpens");
     l = socket(AF_INET, SOCK_STREAM, 0);
@@ -314,7 +319,7 @@ int main(void)
           "refused: %lld active, %lld failed", snmp("snmp", "Tcp", "ActiveOpens") - opens,
           snmp("snmp", "Tcp", "AttemptFails") - fails);
 
-    /* ping socket 的回显：宿主不让建 ping socket 时跳过 */
+    /* Ping socket echoes: skipped when the host does not allow creating a ping socket */
     int ping = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     if (ping >= 0) {
         long long echos = snmp("snmp", "Icmp", "OutEchos"),

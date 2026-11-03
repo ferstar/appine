@@ -1,4 +1,4 @@
-# nginx：多个 worker、accept_mutex 关闭时用 EPOLLEXCLUSIVE、reload
+# nginx: several workers, EPOLLEXCLUSIVE when accept_mutex is off, reload
 mkdir -p /tmp/ng/www /run/nginx; echo hello-nginx > /tmp/ng/www/index.html
 cat > /tmp/ng/nginx.conf <<'C'
 worker_processes 4;

@@ -1,6 +1,6 @@
 /*
- * App 内存的上限和线程数的限制（设计文档 §12 第 4 条）。appine-run 要带 --memory-limit
- * 运行，上限远小于 1 GB。
+ * The app's memory limit and the limits on thread counts (design doc §12 item 4). appine-run must
+ * run this with --memory-limit, a limit far below 1 GB.
  */
 #include <errno.h>
 #include <signal.h>
@@ -17,7 +17,7 @@ static void fail(const char *what)
     exit(1);
 }
 
-/* fork 出一个停在 pause 里的子进程；失败时返回 -1 */
+/* Forks a child that stays in pause; returns -1 on failure */
 static pid_t spawn_paused(void)
 {
     pid_t pid = fork();
@@ -42,13 +42,13 @@ static int nproc_child(void)
     pid_t kids[4];
     if (setrlimit(RLIMIT_NPROC, &rl) != 0)
         return 10;
-    /* root 不受它限制 */
+    /* root is not limited by it */
     for (int i = 0; i < 4; i++) {
         if ((kids[i] = spawn_paused()) < 0)
             return 11;
     }
     reap(kids, 4);
-    /* 这个用户现在只有自己一个线程：再 fork 两个就到上限 */
+    /* This user now has only its own one thread: two more forks reach the limit */
     if (setuid(65534) != 0)
         return 12;
     int n = 0;
@@ -61,7 +61,8 @@ static int nproc_child(void)
     return err == EAGAIN ? 0 : 14;
 }
 
-/* RLIMIT_NPROC：有默认值；普通用户的线程数到了上限时 fork 返回 EAGAIN */
+/* RLIMIT_NPROC: has a default value; fork returns EAGAIN when an ordinary user's thread count is at
+ * the limit */
 static void nproc(void)
 {
     struct rlimit rl;
@@ -80,7 +81,8 @@ static void nproc(void)
 
 #define CHUNK (16 << 20)
 
-/* 分配并碰 bytes 字节的内存。每块之后歇一会儿：OOM killer 每隔几十毫秒才量一次 */
+/* Allocates and touches `bytes` bytes of memory, resting after each chunk: the OOM killer measures
+ * only every few tens of milliseconds */
 static void hog(size_t bytes, unsigned pause_us)
 {
     for (size_t total = 0; total < bytes; total += CHUNK) {
@@ -93,7 +95,8 @@ static void hog(size_t bytes, unsigned pause_us)
     }
 }
 
-/* 超出内存上限：用得最多的进程被 SIGKILL 结束，其余的照常运行 */
+/* Over the memory limit: the process using the most is killed with SIGKILL, the others keep
+ * running */
 static void oom(void)
 {
     pid_t pid = fork();
@@ -107,7 +110,7 @@ static void oom(void)
         fail("out of memory");
     }
     printf("out of memory: killed by SIGKILL\n");
-    /* 它的内存还回来了：这里再用一些也没事 */
+    /* Its memory came back: using some more here is fine */
     hog(32 << 20, 0);
     usleep(300000);
     printf("memory is back\n");

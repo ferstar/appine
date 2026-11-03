@@ -1,4 +1,4 @@
-# redis：事件循环、后台线程、fork 之后写 RDB（写时复制）、AOF、benchmark
+# redis: event loop, background threads, writing the RDB after fork (copy-on-write), AOF, benchmark
 cd /tmp; rm -f /tmp/redis.log /tmp/dump.rdb /tmp/appendonly*
 redis-server --port 6380 --daemonize yes --dir /tmp --logfile /tmp/redis.log --save '' --io-threads 2; echo "start: $?"
 sleep 0.5

@@ -1,10 +1,12 @@
 # docker-run-options: --privileged
-# 可写的 cgroup v2（docs/rounds/163-cgroup-tree.md）：建、删子 cgroup，迁移进程，
-# /proc/<pid>/cgroup，cgroup.events、cgroup.stat，subtree_control 的规则，cgroup.kill，
-# cgroup.max.depth、max.descendants，接口文件的格式，cgroup 命名空间里的路径，clone3 的
-# CLONE_INTO_CGROUP。原生一侧是特权容器（cgroup 可写）。容器的根 cgroup 是 cgroup 命名空间的
-# 根，里面有进程、开不了控制器，写它的大多数文件是 EPERM，appine 的根是真正的根，所以只在下面
-# 建的 t 里比。不比文件的完整列表（新内核有 PSI、cpu.stat.local）和大小
+# Writable cgroup v2 (docs/rounds/163-cgroup-tree.md): creating and removing child cgroups,
+# migrating processes, /proc/<pid>/cgroup, cgroup.events, cgroup.stat, the rules of
+# subtree_control, cgroup.kill, cgroup.max.depth and max.descendants, the format of interface
+# files, paths in a cgroup namespace, clone3's CLONE_INTO_CGROUP. The native side is a privileged
+# container (cgroups writable). The container's root cgroup is the root of the cgroup namespace:
+# it has processes, controllers cannot be enabled there, and writing most of its files is EPERM;
+# appine's root is the real root, so only the t created below it is compared. The full list of
+# files (newer kernels have PSI and cpu.stat.local) and the sizes are not compared
 cd /sys/fs/cgroup
 rmdir t/a/x t/a t/b t 2>/dev/null
 mkdir t && echo "mkdir t"
@@ -18,10 +20,11 @@ done
 echo "controllers [$(cat t/cgroup.controllers)] subtree [$(cat t/cgroup.subtree_control)]"
 echo "type $(cat t/cgroup.type)"
 mkdir t/a t/b
-# cgroup.stat 只比 6.1 就有的两项：新内核（CI 的）多了每个控制器的 nr_subsys_*
+# For cgroup.stat only the two entries 6.1 already has are compared: newer kernels (CI's) add
+# nr_subsys_* for each controller
 grep -vE '^nr_(dying_)?subsys_' t/cgroup.stat
 cat t/cgroup.events
-# 迁移进程
+# Migrating processes
 sleep 100 &
 pid=$!
 echo $pid > t/a/cgroup.procs && echo "moved to t/a"
@@ -32,12 +35,12 @@ echo "t: $(tr '\n' ' ' < t/cgroup.events)/ t/a: $(tr '\n' ' ' < t/a/cgroup.event
 rmdir t/a 2>&1
 rmdir t 2>&1
 echo $pid > t/b/cgroup.procs && cat /proc/$pid/cgroup
-# 命名空间的根（原生是容器的根，appine 是真正的根）上只能写 cgroup.procs、cgroup.threads、
-# cgroup.subtree_control
+# On the namespace root (natively the container's root, in appine the real root) only
+# cgroup.procs, cgroup.threads and cgroup.subtree_control can be written
 echo 1 > cgroup.max.depth
 echo max > memory.max
 echo 1 > memory.current
-# 写错的值
+# Wrong values
 echo $pid > t/a/cgroup.threads
 echo abc > t/a/cgroup.procs
 echo 999999 > t/a/cgroup.procs
@@ -58,7 +61,7 @@ cat t/cgroup.kill
 touch t/new
 rm -f t/cgroup.procs
 mknod t/fifo p
-# 深度和个数的上限
+# Limits on depth and count
 echo -1 > t/cgroup.max.depth
 echo 1 > t/cgroup.max.depth
 mkdir t/a/x
@@ -70,8 +73,8 @@ echo 2 > t/cgroup.max.descendants
 mkdir t/c
 echo max > t/cgroup.max.descendants
 echo "descendants $(cat t/cgroup.max.descendants)"
-# clone3 的 CLONE_INTO_CGROUP（放在 cgroup.kill 之前：6.8 写过 cgroup.kill 之后，经由它放进子树的子进程
-# 也被结束，新内核改了）
+# clone3's CLONE_INTO_CGROUP (placed before cgroup.kill: on 6.8, once cgroup.kill has been
+# written, children put into the subtree through it are killed too; newer kernels changed this)
 cat > /tmp/into.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
@@ -110,19 +113,20 @@ int main(void)
 }
 C
 gcc -o /tmp/into /tmp/into.c && /tmp/into
-# cgroup.kill：子树里的进程都结束
+# cgroup.kill: all processes in the subtree end
 echo 1 > t/cgroup.kill && echo "killed"
-# 子进程结束得早的话 ash 在别处回收了它，不报 Killed
+# If the child ends early, ash reaps it elsewhere and does not report Killed
 wait $pid 2>/dev/null
 echo "status $?"
 echo "t/b: $(tr '\n' ' ' < t/b/cgroup.events)"
-# 子进程随父进程；cgroup 命名空间里看到的路径
+# Children follow their parent; paths seen in a cgroup namespace
 sh -c "echo \$\$ > t/a/cgroup.procs; sleep 0.2; cat /proc/self/cgroup; exec unshare -C sh -c 'cat /proc/self/cgroup; echo 1 > /sys/fs/cgroup/t/a/cgroup.max.depth; sleep 100 & echo \$! > /sys/fs/cgroup/t/b/cgroup.procs; cat /proc/\$!/cgroup; kill \$!'"
-# 普通用户
+# Ordinary users
 su nobody -s /bin/sh -c 'mkdir /sys/fs/cgroup/t/x; echo $$ > /sys/fs/cgroup/t/a/cgroup.procs' 2>&1
 rmdir t/a t/b t 2>&1
 ls -d t 2>&1
-# 合成文件系统里已有的名字：mkdir 是 EEXIST，在目录能不能修改之前（mkdir -p 靠它）
+# Names that already exist in a synthetic filesystem: mkdir is EEXIST, checked before whether the
+# directory can be modified (mkdir -p relies on this)
 for d in /sys /sys/fs /sys/fs/cgroup /proc/sys /proc/self /dev/pts; do
     mkdir $d 2>&1
 done

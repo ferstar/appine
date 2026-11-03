@@ -1,18 +1,22 @@
-//! appine-run：在宿主终端里直接运行一个 guest 程序（开发用前端，设计文档 §13.3）。
+//! appine-run: runs a guest program directly in the host terminal (the development front end,
+//! design doc §13.3).
 //!
-//! 不带 `--rootfs` 时，`<program>` 是宿主路径，guest 看不到任何文件系统；带上
-//! `--rootfs` 时，`<program>` 是 inode 仓库里的 guest 路径，动态链接的程序经由
-//! 仓库里的 `ld-musl` 加载。guest 以 `argv[0] = <program>` 启动，环境变量只有
-//! `--env` 给出的那些。退出码沿用 shell 的约定：正常退出时是 guest 的退出码，
-//! 被信号终止时是 128 + 信号编号，程序无法启动时是 127（找不到）或 126（不能执行）。
+//! Without `--rootfs`, `<program>` is a host path and the guest sees no filesystem at all; with
+//! `--rootfs`, `<program>` is a guest path in the inode store, and dynamically linked programs are
+//! loaded through the store's `ld-musl`. The guest starts with `argv[0] = <program>`, and the
+//! environment holds only the variables given by `--env`. Exit codes follow the shell's
+//! convention: the guest's exit code on a normal exit, 128 + the signal number when killed by a
+//! signal, and 127 (not found) or 126 (cannot execute) when the program cannot start.
 //!
-//! stdin 和 stdout 都是终端时，guest 运行在一个进程内的 PTY 上（kernel/tty 的 map）：宿主
-//! 终端切到 raw 模式，按键原样交给 guest 的行规程，^C、^Z 由它变成发给前台进程组的
-//! 信号，窗口大小跟随宿主终端。`--pty` 在没有终端时也这样做（stdin 和 stdout 可以是
-//! 管道，测试用），`--no-pty` 让 guest 直接使用宿主的 stdin/stdout/stderr。
+//! When stdin and stdout are both terminals, the guest runs on an in-process PTY (the kernel/tty
+//! map): the host terminal switches to raw mode, keys go unchanged to the guest's line discipline,
+//! which turns ^C and ^Z into signals to the foreground process group, and the window size follows
+//! the host terminal. `--pty` does this even without a terminal (stdin and stdout may be pipes,
+//! for tests), and `--no-pty` lets the guest use the host's stdin/stdout/stderr directly.
 //!
-//! `--init` 先按 `/etc/inittab` 开机（与 App 一样，Alpine 上运行 OpenRC），程序结束或者
-//! guest 请求关机（busybox 的 reboot、halt、poweroff）时按它关机（kernel/process 的 map）。
+//! `--init` first boots by `/etc/inittab` (as the app does; OpenRC runs on Alpine), and shuts down
+//! by it when the program ends or the guest requests a shutdown (busybox's reboot, halt, poweroff)
+//! (the kernel/process map).
 
 use std::env;
 use std::ffi::OsString;
@@ -24,7 +28,8 @@ use std::process::ExitCode;
 use appine_kernel::errno::Errno;
 use appine_kernel::{DbtStats, ExitStatus, RunError, RunOptions, Terminal, Tier};
 
-/// `--version` 印的法律声明（AGPL 第 5 条：交互界面要显示版权、不提供担保和许可证）。
+/// The legal notice `--version` prints (AGPL section 5: an interactive interface must display the
+/// copyright, the absence of warranty and the license).
 const NOTICE: &str = "Copyright (C) 2026 Matthew Lee
 License AGPLv3+: GNU AGPL version 3 or later <https://gnu.org/licenses/agpl.html>.
 This is free software: you are free to change and redistribute it.
@@ -65,7 +70,7 @@ fn main() -> ExitCode {
             break;
         }
         args.remove(0);
-        // 带值的选项既可以写成 `--opt value`，也可以写成 `--opt=value`
+        // An option with a value can be written either as `--opt value` or as `--opt=value`
         let (name, inline) = match arg.split_once('=') {
             Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(OsString::from(v))),
             _ => (arg.clone(), None),
@@ -172,7 +177,7 @@ fn main() -> ExitCode {
         });
     }
     let result = appine_kernel::run(&program, &argv, &envp, &options);
-    // 先恢复宿主终端，再打印消息
+    // Restore the host terminal first, then print the message
     drop(raw);
     let report = match result {
         Ok(report) => report,
@@ -209,7 +214,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--memory-limit` 的值：字节数，可以带 K、M、G 后缀；`none` 表示不限制。
+/// The value of `--memory-limit`: a byte count, optionally with a K, M or G suffix; `none` means no
+/// limit.
 fn parse_size(s: &str) -> Option<u64> {
     if s == "none" {
         return Some(u64::MAX);

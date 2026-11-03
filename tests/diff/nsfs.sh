@@ -1,8 +1,10 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
-# 命名空间文件（nsfs）：打开着的、bind 挂载出去的命名空间文件让命名空间活着，里面的进程都
-# 退出之后照样能 setns 进去；NS_GET_* 这些 ioctl；挂载命名空间的文件不能 bind 进不比它新的
-# 命名空间，复制挂载命名空间时不带它们；busybox 的 unshare、nsenter 的持久命名空间。原生一侧
-# 是有 CAP_SYS_ADMIN 的 docker 容器。命名空间的编号两边不同，只比异同
+# Namespace files (nsfs): open namespace files, and ones bind-mounted elsewhere, keep the
+# namespace alive, and it can still be entered with setns after all processes in it have exited;
+# the NS_GET_* ioctls; mount namespace files cannot be bound into namespaces that are not newer
+# than them, and copying a mount namespace leaves them out; the persistent namespaces of busybox's
+# unshare and nsenter. The native side is a docker container with CAP_SYS_ADMIN. Namespace IDs
+# differ between the two sides, so only whether they are the same or different is compared
 cd /tmp
 rm -rf nsfs
 mkdir -p nsfs/run nsfs/m
@@ -36,7 +38,7 @@ def link(fd):
 
 
 def rel(fd, req):
-    """NS_GET_USERNS、NS_GET_PARENT 得到的命名空间的种类，或者错误。"""
+    """The kind of namespace NS_GET_USERNS or NS_GET_PARENT gives, or the error."""
     r = ioctl(fd, req)
     return r if isinstance(r, str) else link(r).split(":")[0]
 
@@ -46,7 +48,8 @@ def same(a, b):
 
 
 def fork(f):
-    """在子进程里运行 f，返回它的退出码。异常也结束子进程，不接着跑父进程的代码。"""
+    """Run f in a child process and return its exit code. An exception also ends the child, which
+    does not go on to run the parent's code."""
     pid = os.fork()
     if pid == 0:
         code = 0
@@ -66,11 +69,11 @@ def mounted(path):
 
 libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
 
-# 子进程建新的网络、UTS、IPC 命名空间，bind 挂载出去之后退出
+# The child creates new network, UTS and IPC namespaces, bind-mounts them elsewhere, and exits
 def holder():
     assert libc.unshare(CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC) == 0
     socket.sethostname("pinned")
-    # 一个不删的共享内存段：IPC 命名空间还在它就在
+    # A shared memory segment that is never removed: it exists as long as the IPC namespace does
     assert libc.shmget(0x5157, 4096, 0o1600) >= 0
     for k in ("net", "uts", "ipc"):
         open("%s/%s" % (RUN, k), "w").close()
@@ -84,14 +87,15 @@ for k in ("net", "uts", "ipc"):
           "mode", oct(st.st_mode), "nlink", st.st_nlink)
 net_dev = os.stat(RUN + "/net").st_dev
 for m in mounted(RUN + "/net"):
-    # 编号之外的列；nsfs 的设备号随内核版本不同（6.1、6.8 上是 0:4，更新的是 0:5），只比它是不是
-    # 这个文件 stat 出来的
+    # The columns other than the ID; the device number of nsfs differs between kernel versions
+    # (0:4 on 6.1 and 6.8, 0:5 on newer ones), so only whether it is the one stat gives for this
+    # file is compared
     dev = "%d:%d" % (os.major(net_dev), os.minor(net_dev))
     print("mountinfo dev is the file's", m[2] == dev, m[3].split(":")[0], m[5], m[6:])
 
 def enter():
     fd = os.open(RUN + "/net", os.O_RDONLY)
-    # 经由 bind 挂载打开的，路径是挂载点
+    # Opened through the bind mount, its path is the mount point
     print("open link", link(fd), "fdinfo", open("/proc/self/fdinfo/%d" % fd).read().split()[2:4])
     print("setns net", call(libc.setns, fd, CLONE_NEWNET))
     print("now in it", same(os.stat("/proc/self/ns/net").st_ino, os.fstat(fd).st_ino))
@@ -110,19 +114,19 @@ def enter():
 print("enter", fork(enter))
 print("shm outside", libc.shmget(0x5157, 0, 0) >= 0)
 
-# 卸下之后文件是原来那个普通文件
+# After unmounting, the file is the original regular file
 held = os.open(RUN + "/net", os.O_RDONLY)
 print("umount", call(libc.umount2, (RUN + "/net").encode(), MNT_DETACH), "mounted", len(mounted(RUN + "/net")))
 fd = os.open(RUN + "/net", os.O_RDONLY)
 print("plain file", call(libc.setns, fd, 0))
 os.close(fd)
-# 卸下之前打开的仍然指着那个命名空间
+# One opened before unmounting still refers to that namespace
 print("held", fork(lambda: print("setns held", call(libc.setns, held, CLONE_NEWNET), socket.if_nameindex())))
 os.close(held)
 for k in ("uts", "ipc"):
     libc.umount2(("%s/%s" % (RUN, k)).encode(), MNT_DETACH)
 
-# 只靠打开着的 fd：子进程退出之后经由它 setns
+# Only through an open fd: setns through it after the child has exited
 r1, w1 = os.pipe()
 r2, w2 = os.pipe()
 pid = os.fork()
@@ -145,17 +149,17 @@ def enter_fds():
 print("enter fds", fork(enter_fds))
 print("outside", os.listdir("/tmp/nsfs/m"))
 
-# 挂载命名空间的文件只能 bind 进比它旧的命名空间（Linux 的 mnt_ns_loop）
+# A mount namespace file can only be bound into a namespace older than it (Linux's mnt_ns_loop)
 open(RUN + "/mnt", "w").close()
 print("bind own mnt", call(libc.mount, b"/proc/self/ns/mnt", (RUN + "/mnt").encode(), None, MS_BIND, None))
 print("bind newer mnt", call(libc.mount, b"/proc/self/fd/%d" % mnt, (RUN + "/mnt").encode(), None, MS_BIND, None))
 open(RUN + "/net2", "w").close()
 print("bind net", call(libc.mount, b"/proc/self/fd/%d" % net, (RUN + "/net2").encode(), None, MS_BIND, None))
-# 复制挂载命名空间时不带挂载命名空间的文件，别的照样复制
+# Copying a mount namespace leaves out mount namespace files; other ones are copied as usual
 def copied():
     libc.unshare(CLONE_NEWNS)
     print("copied mnt", len(mounted(RUN + "/mnt")), "net", len(mounted(RUN + "/net2")))
-    # 原来的比自己的旧：不能 bind 进来
+    # The original one is older than our own: it cannot be bound in
     open(RUN + "/mnt2", "w").close()
     print("bind older mnt", call(libc.mount, b"/proc/%d/ns/mnt" % os.getppid(), (RUN + "/mnt2").encode(), None, MS_BIND, None))
 print("copy", fork(copied))
@@ -178,8 +182,9 @@ print("owner uid of init", ioctl(own["user"], NS_GET_OWNER_UID, ctypes.byref(uid
 print("unknown", ioctl(own["net"], 0xb7ff), "tcgets", ioctl(own["net"], 0x5401, ctypes.byref(ctypes.create_string_buffer(64))))
 
 def nested():
-    # root 建的用户命名空间，里面再建网络、pid 命名空间（Ubuntu 的宿主不让普通用户建的
-    # 用户命名空间里有能力）。在外面拿着它们的文件
+    # A user namespace created by root, with network and pid namespaces created inside it (an
+    # Ubuntu host does not give capabilities inside user namespaces created by ordinary users).
+    # Their files are held outside
     r1, w1 = os.pipe()
     r2, w2 = os.pipe()
     pid = os.fork()
@@ -190,7 +195,7 @@ def nested():
         assert libc.unshare(CLONE_NEWNET | CLONE_NEWPID) == 0
         user = os.open("/proc/self/ns/user", os.O_RDONLY)
         u = ioctl(os.open("/proc/self/ns/net", os.O_RDONLY), NS_GET_USERNS)
-        # 自己外面的用户命名空间看不到
+        # The user namespaces outside one's own cannot be seen
         print("inside: parent", rel(user, NS_GET_PARENT), "userns", rel(user, NS_GET_USERNS),
               "net's userns", same(os.fstat(u).st_ino, os.fstat(user).st_ino))
         kid = os.fork()
@@ -219,7 +224,7 @@ def nested():
           "userns", same(os.fstat(ioctl(child, NS_GET_USERNS)).st_ino, os.fstat(user).st_ino))
     os.write(w2, b"x")
     os.waitpid(pid, 0)
-    # 1 号进程退出之后：还能 setns 进去，但建不了进程
+    # After process 1 exits: it can still be entered with setns, but no processes can be created
     print("setns dead pid", call(libc.setns, child, CLONE_NEWPID))
     try:
         if os.fork() == 0:
@@ -227,22 +232,23 @@ def nested():
         print("fork ok")
     except OSError as e:
         print("fork", errno.errorcode[e.errno])
-    # 用户命名空间里的进程都退出了：照样能进去
+    # All processes in the user namespace have exited: it can still be entered
     print("setns user", call(libc.setns, user, CLONE_NEWUSER), os.getuid())
 print("nested", fork(nested))
 PY
 
-# busybox 的 unshare、nsenter：命名空间文件的路径
+# busybox's unshare and nsenter: paths of namespace files
 touch nsfs/run/bbnet nsfs/run/bbuts
 busybox unshare --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname bb; ip link show | grep -c "^[0-9]"'
-# 原生一侧的主机名是容器的编号（随机的十六进制），里面可能正好有 bb：要整行相同
+# On the native side the hostname is the container's ID (random hex), which may happen to contain
+# bb: the whole line must match
 echo "outside: $(hostname | grep -cx bb)"
 busybox nsenter --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname; ip -o link show | cut -d: -f2'
 umount /tmp/nsfs/run/bbnet /tmp/nsfs/run/bbuts
 busybox nsenter --net=/tmp/nsfs/run/bbnet true; echo "after umount: $?"
 
-# iproute2 的 ip netns：add 把 unshare 出来的网络命名空间 bind 到 /var/run/netns 下面（原生
-# 一侧的镜像里没有 /var、/run）
+# iproute2's ip netns: add bind-mounts a network namespace created by unshare under
+# /var/run/netns (the native side's image has no /var or /run)
 [ -e /var/run ] || { mkdir -p /var /run && ln -s ../run /var/run; }
 ip netns add appine-a
 ip netns list

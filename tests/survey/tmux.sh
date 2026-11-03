@@ -1,4 +1,4 @@
-# tmux：服务器在后台、PTY、unix socket、窗口和面板
+# tmux: the server in the background, PTYs, unix sockets, windows and panes
 T="tmux -S /tmp/tmux-survey"
 $T kill-server 2>/dev/null
 $T new-session -d -s s -x 100 -y 30 || echo "new-session failed: $?"

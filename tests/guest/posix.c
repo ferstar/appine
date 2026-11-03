@@ -1,7 +1,8 @@
 /*
- * System V IPC、POSIX 定时器、时钟、mremap、凭据、调度设置和 ptrace 的 guest 测试程序（M6）：用 musl-gcc -static
- * 编译，在 appine-run 里直接运行（不需要 rootfs）。每项检查通过时打印一行
- * "ok <名字>"，失败时打印原因并以 1 退出，全部通过时最后打印 "all ok"。
+ * Guest test program for System V IPC, POSIX timers, clocks, mremap, credentials, scheduling
+ * settings and ptrace (M6): build with musl-gcc -static and run directly in appine-run (no rootfs
+ * needed). Each check that passes prints a line "ok <name>"; a failure prints the reason and exits
+ * with 1; when all pass it prints "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -48,7 +49,7 @@ static void ok(const char *name)
     fflush(stdout);
 }
 
-/* 子进程的退出码 */
+/* The child's exit code */
 static int wait_child(pid_t pid)
 {
     int status;
@@ -57,7 +58,7 @@ static int wait_child(pid_t pid)
     return WEXITSTATUS(status);
 }
 
-/* ---- 消息队列：按类型收取、阻塞的 msgrcv、删除后 EIDRM ---- */
+/* ---- Message queues: receiving by type, blocking msgrcv, EIDRM after removal ---- */
 
 struct message {
     long mtype;
@@ -78,7 +79,7 @@ static void test_msg(void)
     CHECK(msgrcv(q, &m, sizeof m.text, 0, 0) == 4 && m.mtype == 2, "first message");
     CHECK(msgrcv(q, &m, sizeof m.text, 0, IPC_NOWAIT) < 0 && errno == ENOMSG, "ENOMSG");
 
-    /* 子进程等着收，父进程再发 */
+    /* The child waits to receive, then the parent sends */
     pid_t pid = fork();
     if (pid == 0) {
         struct message r;
@@ -98,7 +99,7 @@ static void test_msg(void)
     ok("msg");
 }
 
-/* ---- 信号量：原子的多个操作、阻塞、SEM_UNDO ---- */
+/* ---- Semaphores: several operations done atomically, blocking, SEM_UNDO ---- */
 
 static void test_sem(void)
 {
@@ -106,12 +107,12 @@ static void test_sem(void)
     CHECK(s >= 0, "semget");
     unsigned short vals[2] = {1, 0};
     CHECK(semctl(s, 0, SETALL, vals) == 0, "SETALL");
-    /* 第二个操作做不到：整个 semop 都不生效 */
+    /* The second operation cannot be done: the whole semop takes no effect */
     struct sembuf both[2] = {{0, -1, IPC_NOWAIT}, {1, -1, IPC_NOWAIT}};
     CHECK(semop(s, both, 2) < 0 && errno == EAGAIN, "atomic semop");
     CHECK(semctl(s, 0, GETVAL) == 1, "value unchanged");
 
-    /* 子进程等信号量 1，父进程加一 */
+    /* The child waits on semaphore 1, and the parent adds one */
     pid_t pid = fork();
     if (pid == 0) {
         struct sembuf down = {1, -1, 0};
@@ -124,7 +125,7 @@ static void test_sem(void)
     CHECK(semop(s, &up, 1) == 0, "semop up");
     CHECK(wait_child(pid) == 0, "child semop");
 
-    /* SEM_UNDO：子进程退出时撤销它的操作 */
+    /* SEM_UNDO: the child's operations are undone when it exits */
     pid = fork();
     if (pid == 0) {
         struct sembuf take = {0, -1, SEM_UNDO};
@@ -137,7 +138,8 @@ static void test_sem(void)
     ok("sem");
 }
 
-/* ---- 共享内存：父子进程看到同一段内存，IPC_RMID 等最后一次 shmdt ---- */
+/* ---- Shared memory: parent and child see the same memory, and IPC_RMID waits for the last
+ * shmdt ---- */
 
 static void test_shm(void)
 {
@@ -158,14 +160,14 @@ static void test_shm(void)
     CHECK(shmctl(id, IPC_STAT, &ds) == 0, "IPC_STAT");
     CHECK(ds.shm_segsz == 10000 && ds.shm_nattch == 1, "segsz %zu nattch %lu", ds.shm_segsz,
           (unsigned long)ds.shm_nattch);
-    /* 第二次映射到另一个地址，只读 */
+    /* A second attach at another address, read-only */
     char *q = shmat(id, NULL, SHM_RDONLY);
     CHECK(q != (void *)-1 && q != p && strcmp(q, "from child") == 0, "second shmat");
     CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2, "nattch 2");
     CHECK(shmdt(q) == 0, "shmdt");
     CHECK(shmdt(q) < 0 && errno == EINVAL, "shmdt twice");
 
-    /* 删除之后仍然可以用，直到最后一次 shmdt */
+    /* Still usable after removal, until the last shmdt */
     CHECK(shmctl(id, IPC_RMID, NULL) == 0, "IPC_RMID");
     strcpy(p, "still here");
     CHECK(shmctl(id, IPC_STAT, &ds) == 0 && (ds.shm_perm.mode & SHM_DEST), "SHM_DEST");
@@ -174,10 +176,10 @@ static void test_shm(void)
     ok("shm");
 }
 
-/* ---- POSIX 定时器：周期信号、超限次数、SIGEV_THREAD、CPU 时钟 ---- */
+/* ---- POSIX timers: periodic signals, overrun counts, SIGEV_THREAD, CPU clocks ---- */
 
 static volatile sig_atomic_t ticks;
-/* 每一次送达时的 si_overrun，按送达的顺序 */
+/* si_overrun at each delivery, in order of delivery */
 static volatile int overruns[64];
 
 static void on_tick(int sig, siginfo_t *si, void *uc)
@@ -217,8 +219,9 @@ static void test_timers(void)
     struct itimerspec cur;
     CHECK(timer_gettime(t, &cur) == 0 && cur.it_interval.tv_nsec == 10000000, "timer_gettime");
 
-    /* 信号挂着期间的到期次数记进 si_overrun。解除屏蔽之后送达的第一个是挂着的那个；
-     * 检查之前可能又到期了一次（周期只有 10 毫秒），所以只看第一个 */
+    /* Expiries while the signal is pending are counted in si_overrun. The first one delivered
+     * after unblocking is the pending one; the timer may have expired once more before the check
+     * (the period is only 10 milliseconds), so only the first is looked at */
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR1);
@@ -228,10 +231,10 @@ static void test_timers(void)
     sigprocmask(SIG_UNBLOCK, &block, NULL);
     CHECK(ticks > before && overruns[before] > 0, "overrun %d", overruns[before]);
     CHECK(timer_delete(t) == 0, "timer_delete");
-    /* musl 的 timer_delete 直接返回 -EINVAL，不设置 errno */
+    /* musl's timer_delete returns -EINVAL directly, without setting errno */
     CHECK(timer_delete(t) != 0, "deleted");
 
-    /* SIGEV_THREAD：musl 在用户态起一个线程调用回调 */
+    /* SIGEV_THREAD: musl starts a thread in user space to call the callback */
     sev.sigev_notify = SIGEV_THREAD;
     sev.sigev_notify_function = on_thread_tick;
     sev.sigev_value.sival_int = 5;
@@ -244,7 +247,7 @@ static void test_timers(void)
     CHECK(atomic_load(&thread_ticks) == 5, "callback %d", atomic_load(&thread_ticks));
     timer_delete(t);
 
-    /* 进程 CPU 时钟：忙等 30 毫秒的 CPU 时间之后到期 */
+    /* Process CPU clock: expires after 30 milliseconds of CPU time spent busy-waiting */
     sev.sigev_notify = SIGEV_SIGNAL;
     CHECK(timer_create(CLOCK_PROCESS_CPUTIME_ID, &sev, &t) == 0, "cpu timer");
     struct itimerspec cpu = {{0, 0}, {0, 30000000}};
@@ -256,9 +259,10 @@ static void test_timers(void)
     ok("timers");
 }
 
-/* ---- signalfd：取走被阻塞的信号，poll 能看到 ---- */
+/* ---- signalfd: takes blocked signals, and poll sees them ---- */
 
-/* ---- 时钟：宿主的时钟和自己的 CPU 时钟不持 BKL，别的持锁，结果一致；出错的参数 ---- */
+/* ---- Clocks: the host's clocks and one's own CPU clock without the BKL, the others holding the
+ * lock, with consistent results; invalid arguments ---- */
 
 static long long ns_of(const struct timespec *t)
 {
@@ -272,7 +276,8 @@ static void *spin(void *arg)
     return NULL;
 }
 
-/* 在新线程里看另一个空转的线程的 CPU 时钟：它的涨得多，自己的从 0 开始、睡着几乎不动 */
+/* From a new thread, watches the CPU clock of another, spinning thread: that one grows a lot,
+ * while its own starts at 0 and barely moves while sleeping */
 static void *watch(void *arg)
 {
     atomic_int stop = 0;
@@ -313,7 +318,8 @@ static void test_clocks(void)
           "bad timespec");
     CHECK(syscall(SYS_gettimeofday, (void *)8, NULL) == -1 && errno == EFAULT, "bad timeval");
 
-    /* 自己的 CPU 时钟：两种写法读的是同一个，忙一阵之后增加；进程的不比它少 */
+    /* Own CPU clock: both ways of naming it read the same clock, which grows after being busy for
+     * a while; the process's is no smaller */
     clockid_t self;
     CHECK(pthread_getcpuclockid(pthread_self(), &self) == 0, "getcpuclockid");
     CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &a) == 0, "thread clock");
@@ -324,7 +330,7 @@ static void test_clocks(void)
     CHECK(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &p) == 0 && ns_of(&p) >= ns_of(&b),
           "process clock %lld < thread clock %lld", ns_of(&p), ns_of(&b));
 
-    /* 别的线程的 CPU 时钟 */
+    /* Another thread's CPU clock */
     pthread_t t;
     CHECK(pthread_create(&t, NULL, watch, NULL) == 0, "pthread_create");
     CHECK(pthread_join(t, NULL) == 0, "pthread_join");
@@ -336,9 +342,10 @@ static long long us_of(struct timeval t)
     return t.tv_sec * 1000000LL + t.tv_usec;
 }
 
-/* 用户态、内核态的 CPU 时间各自不倒退：用户态的时间是总数减去内核态的，内核态的时间一下子
- * 多出一个时钟滴答时，用户态的时间原来会少掉同样多（LTP 的 times03）。边忙边让宿主内核干活
- * （缺页、mmap），直到内核态的时间跨过几个滴答 */
+/* User and system CPU time each never go backwards: user time is the total minus the system time,
+ * and when the system time suddenly gained a clock tick, user time used to lose just as much
+ * (LTP's times03). Keep busy while making the host kernel work (page faults, mmap), until the
+ * system time has crossed a few ticks */
 static void test_cpu_times(void)
 {
     struct rusage prev = {0}, cur, tprev = {0}, tcur;
@@ -403,7 +410,7 @@ static void test_signalfd(void)
     ok("signalfd");
 }
 
-/* ---- splice、tee、vmsplice：在管道之间搬数据 ---- */
+/* ---- splice, tee, vmsplice: moving data between pipes ---- */
 
 static void test_splice(void)
 {
@@ -411,7 +418,7 @@ static void test_splice(void)
     CHECK(pipe(a) == 0 && pipe(b) == 0, "pipe");
     struct iovec iov[2] = {{"hel", 3}, {"lo", 2}};
     CHECK(vmsplice(a[1], iov, 2, 0) == 5, "vmsplice");
-    /* tee 复制但不取走，splice 搬走 */
+    /* tee copies without taking the data, splice moves it */
     CHECK(tee(a[0], b[1], 100, 0) == 5, "tee");
     CHECK(splice(a[0], NULL, b[1], NULL, 100, 0) == 5, "splice");
     char buf[16] = {0};
@@ -426,7 +433,7 @@ static void test_splice(void)
     ok("splice");
 }
 
-/* ---- mremap：原地扩展、搬家、缩小 ---- */
+/* ---- mremap: growing in place, moving, shrinking ---- */
 
 static void test_mremap(void)
 {
@@ -443,7 +450,7 @@ static void test_mremap(void)
     ok("mremap");
 }
 
-/* ---- 凭据：降低权限之后的规则、setgroups、能力 ---- */
+/* ---- Credentials: the rules after dropping privileges, setgroups, capabilities ---- */
 
 static void test_creds(void)
 {
@@ -454,11 +461,11 @@ static void test_creds(void)
         gid_t back[4];
         CHECK(getgroups(4, back) == 2 && back[1] == 20, "getgroups");
         CHECK(setresgid(100, 100, 100) == 0, "setresgid");
-        /* 只改有效用户 ID：之后还能变回 root */
+        /* Change only the effective user ID: root can still be regained afterwards */
         CHECK(setresuid(-1, 1000, -1) == 0 && geteuid() == 1000 && getuid() == 0, "seteuid");
         CHECK(setgroups(0, NULL) < 0 && errno == EPERM, "no CAP_SETGID");
         CHECK(setresuid(-1, 0, -1) == 0 && geteuid() == 0, "back to root");
-        /* 三个 ID 都改掉：再也回不去 */
+        /* Change all three IDs: there is no way back */
         CHECK(setuid(1000) == 0, "setuid");
         uid_t r, e, s;
         CHECK(getresuid(&r, &e, &s) == 0 && r == 1000 && e == 1000 && s == 1000, "getresuid");
@@ -476,7 +483,7 @@ static void test_creds(void)
     ok("creds");
 }
 
-/* ---- 调度：亲和性、实时策略、RLIMIT_NOFILE 限制 fd ---- */
+/* ---- Scheduling: affinity, real-time policies, RLIMIT_NOFILE limiting fds ---- */
 
 static void test_sched(void)
 {
@@ -487,7 +494,7 @@ static void test_sched(void)
     CPU_ZERO(&set);
     CHECK(sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) == 1, "getaffinity");
     CHECK(sched_getcpu() == 0, "getcpu");
-    /* musl 的 sched_setscheduler 等不调用内核，直接返回 ENOSYS */
+    /* musl's sched_setscheduler and the like do not call the kernel and return ENOSYS directly */
     struct sched_param sp = {.sched_priority = 10};
     CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_RR, &sp) == 0, "SCHED_RR");
     CHECK(syscall(SYS_sched_getscheduler, 0) == SCHED_RR, "getscheduler");
@@ -505,9 +512,10 @@ static void test_sched(void)
     ok("sched");
 }
 
-/* ---- ptrace：信号投递停止、单步、系统调用的停止、改返回值，process_vm_readv ---- */
+/* ---- ptrace: signal-delivery stops, single-stepping, syscall stops, changing the return value,
+ * process_vm_readv ---- */
 
-/* struct ptrace_syscall_info 里用到的部分 */
+/* The part of struct ptrace_syscall_info that is used */
 struct syscall_info {
     unsigned char op;
     unsigned char pad[3];
@@ -521,7 +529,7 @@ static void test_ptrace(void)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        /* 跟踪不了时不能停下来，父进程会一直等 */
+        /* If it cannot be traced it must not stop, or the parent would wait forever */
         if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0)
             _exit(2);
         raise(SIGSTOP);
@@ -533,7 +541,7 @@ static void test_ptrace(void)
     struct iovec local = {buf, sizeof buf}, remote = {secret, sizeof secret};
     CHECK(process_vm_readv(pid, &local, 1, &remote, 1, 0) == sizeof buf && !strcmp(buf, "ptrace secret"),
           "process_vm_readv");
-    /* 单步：每次停下都是 SIGTRAP，普通指令是 TRAP_TRACE，svc 是 SI_USER */
+    /* Single-step: every stop is SIGTRAP, TRAP_TRACE for ordinary instructions, SI_USER for svc */
     for (int i = 0; i < 3; i++) {
         CHECK(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == 0, "SINGLESTEP");
         CHECK(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP, "step stop %#x", st);

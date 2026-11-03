@@ -1,9 +1,11 @@
 # docker-run-options: --privileged
-# devpts 的实例（docs/rounds/167-devpts-instances.md）：每次 mount -t devpts 是一个新的实例
-# （Linux 4.7 起），有自己的一套终端（编号从 0 开始）、设备号和选项（uid、gid、mode、
-# ptmxmode、max）；bind 挂载共用实例；fd 的链接、ttyname 是经由的挂载里的路径；不在 devpts
-# 里的 ptmx 设备节点用同一个目录里的 pts 挂着的实例；TIOCGPTPEER。原生一侧是特权容器，
-# 容器的 /dev/pts 是它自己的实例，appine 的是开机时的那个，都从没有终端开始
+# devpts instances (docs/rounds/167-devpts-instances.md): each mount -t devpts is a new instance
+# (since Linux 4.7), with its own set of terminals (numbered from 0), device number and options
+# (uid, gid, mode, ptmxmode, max); bind mounts share the instance; fd links and ttyname give the
+# path inside the mount the terminal was opened through; a ptmx device node outside devpts uses
+# the instance mounted at pts in the same directory; TIOCGPTPEER. The native side is a privileged
+# container; the container's /dev/pts is its own instance and appine's is the boot-time one, and
+# both start with no terminals
 cd /tmp
 rm -rf p1 p2 p3 d e f x
 mkdir -p p1 p2 p3 d e f/pts x
@@ -104,7 +106,8 @@ int main(void)
     int s3 = open("/tmp/p3/0", O_RDWR | O_NOCTTY);
     info("slave p3/0", s3);
     info("master p1", m1);
-    // /dev/ptmx 自己的链接不比：docker 的容器里它是指向 pts/ptmx 的符号链接，appine 的是设备节点
+    // The link of /dev/ptmx itself is not compared: in a docker container it is a symlink to
+    // pts/ptmx, in appine a device node
     close(m0);
     char *n = ttyname(s1);
     printf("ttyname p1/0: %s\n", n ? n : strerror(errno));
@@ -112,21 +115,23 @@ int main(void)
     printf("ttyname p3/0: %s\n", n ? n : strerror(errno));
     n = ttyname(peer);
     printf("ttyname peer: %s\n", n ? n : strerror(errno));
-    // 实例里的终端照常工作
+    // Terminals in an instance work as usual
     char buf[8] = "";
     write(s1, "hi", 2);
-    // 最多等 2 秒：内核不对时（写到了别的终端）用例失败而不是卡住
+    // Wait at most 2 seconds: if the kernel is wrong (the write went to another terminal), the
+    // test case fails instead of hanging
     struct pollfd pf = {m1, POLLIN, 0};
     int got = poll(&pf, 1, 2000) > 0 ? read(m1, buf, sizeof buf - 1) : 0;
     printf("echo through p1: %d %.2s\n", got, buf);
     system("ls /tmp/p1 /tmp/p2 /tmp/p3");
     system("stat -c '%n %A %u:%g' /tmp/p1/0 /tmp/p3/0 /tmp/p1/ptmx /tmp/p3/ptmx");
-    // 开着经由 p3 打开的终端时卸不下它；经由 d 里的设备节点 ptmx 开着的主设备不占 d/pts
+    // p3 cannot be unmounted while a terminal opened through it is open; a master opened through
+    // the ptmx device node in d does not keep d/pts busy
     printf("umount p3 while in use: %s\n", umount("/tmp/p3") ? strerror(errno) : "ok");
     close(m3);
     close(s3);
     system("ls /tmp/p3");
-    // 选项
+    // Options
     const char *opts[] = {"mode=xyz", "bogus", "gid=abc", "max=1048577", "ptmxmode=0777",
                           "uid=7,gid=8,mode=0640", "newinstance", "max=1"};
     for (int i = 0; i < 8; i++) {
@@ -150,7 +155,8 @@ gcc -o /tmp/pts /tmp/pts.c
 mount -t devpts devpts /tmp/p1 -o newinstance,ptmxmode=0666,mode=0620,gid=5 && echo "mount p1"
 mount --bind /tmp/p1 /tmp/p2 && echo "bind p2"
 mount -t devpts devpts /tmp/p3 && echo "mount p3 with the defaults"
-# 不在 devpts 里的 ptmx：同一个目录里的 pts 是 devpts（d）、没有 pts（e）、pts 只是目录（f）
+# ptmx outside devpts: pts in the same directory is a devpts (d), missing (e), or just a
+# directory (f)
 mknod /tmp/d/ptmx c 5 2
 mkdir /tmp/d/pts
 mount -t devpts devpts /tmp/d/pts -o ptmxmode=666

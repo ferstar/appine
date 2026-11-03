@@ -1,4 +1,5 @@
-# sshd：主机密钥、公钥登录（root 和普通用户）、分配 PTY、管道、scp/sftp、端口转发
+# sshd: host keys, public-key login (root and a regular user), PTY allocation, pipes, scp/sftp, port
+# forwarding
 ssh-keygen -A >/dev/null
 id u >/dev/null 2>&1 || adduser -D -s /bin/sh u
 passwd -u u >/dev/null 2>&1 || true

@@ -1,17 +1,21 @@
 # docker-run-options: --privileged
-# nftables 的子集（docs/rounds/172-nftables.md）：在新的网络命名空间里
-# - 用 iptables-nft 建 docker 写进容器的内置 DNS 规则（-N、-C、-I、DNAT、SNAT），看 -S、
-#   nft list ruleset，以及发往 127.0.0.11:53 的 UDP、TCP 被 DNAT 到服务真正监听的端口：
-#   客户端看到的对端、回答的来源，服务端看到的来源和本端；
-# - 用 nft -f 装一份 netavark 那样的规则（inet 表、匿名集合、具名集合、fib、dnat、
-#   redirect），看带句柄的列表、端口转发、删规则之后；
-# - 出错的情形：跳到没有的链、环、删被引用的链、已有的链、没有特权。
-# 原生一侧是特权容器，规则真的在内核里执行。计数器（appine 总是 0）都去掉。
+# A subset of nftables (docs/rounds/172-nftables.md): in a new network namespace
+# - build with iptables-nft the built-in DNS rules docker writes into containers (-N, -C, -I,
+#   DNAT, SNAT), and look at -S, nft list ruleset, and UDP and TCP sent to 127.0.0.11:53 being
+#   DNATed to the port the service really listens on: the peer the client sees, the source of the
+#   reply, and the source and local end the server sees;
+# - load with nft -f a rule set like netavark's (inet table, anonymous sets, named sets, fib,
+#   dnat, redirect), and look at the listing with handles, port forwarding, and the state after
+#   deleting rules;
+# - error cases: jumping to a missing chain, loops, deleting a referenced chain, an already
+#   existing chain, no privilege.
+# The native side is a privileged container, where the rules really run in the kernel. Counters
+# (always 0 in appine) are all removed.
 exec 2>&1
 cd /tmp
 cat > srv.py <<'PY'
 import socket, sys
-# srv.py tcp|udp <地址> <端口> <次数> <就绪文件>
+# srv.py tcp|udp <address> <port> <count> <ready file>
 socket.setdefaulttimeout(15)
 kind, addr, port, n, ready = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 if kind == "tcp":
@@ -36,8 +40,8 @@ else:
 PY
 cat > cli.py <<'PY'
 import errno, os, socket, sys, time
-# cli.py tcp|udp|udpconn <地址> <端口> <消息> [<文件>]：给了文件的，UDP 发出之后等它出现
-# （服务端已经退出）才读回答
+# cli.py tcp|udp|udpconn <address> <port> <message> [<file>]: when a file is given, after sending
+# over UDP wait until it appears (the server has exited) before reading the reply
 kind, addr, port, msg = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 late = sys.argv[5] if len(sys.argv) > 5 else None
 try:
@@ -68,7 +72,7 @@ try:
 except OSError as e:
     print(f"{msg}: {errno.errorcode.get(e.errno, e.errno)}")
 PY
-# 两个 unshare -n 的 shell 共用的函数
+# Functions shared by the two unshare -n shells
 cat > /tmp/fns.sh <<'SH'
 wait_for() { for i in $(seq 100); do [ -f "$1" ] && return; sleep 0.1; done; echo "timeout: $1"; }
 servers=""
@@ -79,7 +83,8 @@ serve() {
     wait_for "/tmp/ready-$3"
 }
 served() { wait $servers; servers=""; }
-# 表的句柄原生上不总是从 1 起（同一个命名空间里是计数器，见 docs/rounds/172-nftables.md），不比
+# Natively table handles do not always start at 1 (within one namespace they come from a counter,
+# see docs/rounds/172-nftables.md), so they are not compared
 nocount() { sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/; s/^(table .*) # handle [0-9]+$/\1/'; }
 SH
 
@@ -159,7 +164,8 @@ python3 /tmp/cli.py udp 10.70.0.1 8080 udp-8080
 serve tcp 127.0.0.1 9001 1
 python3 /tmp/cli.py tcp 127.0.0.1 8081 redirect-8081
 served
-# 服务端回完就退出，客户端之后才读到回答：来源照样是 8080
+# The server exits as soon as it has replied, and the client reads the reply only afterwards: the
+# source is still 8080
 rm -f /tmp/exited
 serve udp 10.70.0.1 9002 1
 python3 /tmp/cli.py udp 10.70.0.1 8080 udp-8080-late /tmp/exited &

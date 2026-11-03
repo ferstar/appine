@@ -1,5 +1,6 @@
-# Node.js 源码包里的 test/parallel，用装好的 node 跑（不解 deps 里的 V8、ICU、OpenSSL）。
-# 失败的测试各有一行 "Path: parallel/<名字>"
+# test/parallel from Node.js's source package, run with the installed node (V8, ICU and OpenSSL in
+# deps are not unpacked).
+# Each failed test has a line "Path: parallel/<name>"
 cd /tmp; v=$(node --version)
 [ -d node-$v ] || curl -fsSL "https://nodejs.org/dist/$v/node-$v.tar.xz" | xz -dc | \
     tar x --exclude "node-$v/deps/v8" --exclude "node-$v/deps/icu-small" --exclude "node-$v/deps/openssl"

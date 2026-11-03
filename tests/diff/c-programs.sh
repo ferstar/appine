@@ -1,8 +1,9 @@
-# gcc 编译并运行：浮点、自动向量化、原子操作和线程、setjmp；再比对编译器的输出；
-# 几个线程共用一个 fd 用文件位置读写、两个进程同时 O_APPEND 追加；别的线程 chdir、
-# 改名、setuid 之后 stat 立刻看到；共享文件映射里跨进程的 futex；新映射的匿名内存是零；
-# 点积指令；SHA3、SHA512、I8MM；LRCPC、LRCPC2；FP16、JSCVT；RDM、FCMA、FHM、BF16；FRINTTS、
-# FlagM、FlagM2、SB、DPB、DPB2
+# Compile with gcc and run: floating point, auto-vectorization, atomics and threads, setjmp; then
+# compare the compiler's output; several threads sharing one fd to read and write at the file
+# position, two processes appending with O_APPEND at once; stat seeing at once the effect of
+# chdir, rename and setuid done by another thread; futexes across processes in shared file
+# mappings; newly mapped anonymous memory being zero; dot product instructions; SHA3, SHA512,
+# I8MM; LRCPC, LRCPC2; FP16, JSCVT; RDM, FCMA, FHM, BF16; FRINTTS, FlagM, FlagM2, SB, DPB, DPB2
 set -e
 cd /tmp
 cat > diff1.c <<'C'
@@ -92,7 +93,7 @@ static unsigned char seen[CHUNKS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int bad;
 
-/* 每次 read 拿到的必须是一整块、而且没有别的线程拿过 */
+/* Each read must get a whole block, and one that no other thread got */
 static void *reader(void *arg)
 {
     (void)arg;
@@ -125,7 +126,7 @@ static void *writer(void *arg)
     return NULL;
 }
 
-/* 文件里每个 (线程, 序号) 的记录各出现一次 */
+/* Each (thread, sequence number) record in the file appears exactly once */
 static int count_records(const char *path, int writers)
 {
     FILE *f = fopen(path, "r");
@@ -172,7 +173,7 @@ int main(void)
            count_records("shared.txt", 4), bad);
     close(fd);
 
-    /* 两个进程各自打开、O_APPEND 追加 */
+    /* Two processes each open the file and append with O_APPEND */
     unlink("append.txt");
     pid_t pid = fork();
     fd = open("append.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -201,7 +202,8 @@ cat > diff3.c <<'C'
 
 #define ROUNDS 2000
 
-/* 检查线程做完开头的检查之后置 1；主线程每轮改完加一（奇数），检查线程检查完加一（偶数） */
+/* Set to 1 by the checker thread after its initial checks; each round the main thread adds one
+ * after its changes (odd), and the checker thread adds one after checking (even) */
 static atomic_int ready, turn;
 static atomic_int done;
 static atomic_int bad, stress_bad;
@@ -213,8 +215,9 @@ static void wait_for(int v)
         sched_yield();
 }
 
-/* 一开始当前目录是 start。第 i 轮：当前目录是 d<i%2>，里面有 in<i%2>；三个目录里都有
-   which，长度各不相同；文件叫 n<i%2> */
+/* At the start the current directory is start. Round i: the current directory is d<i%2>, which
+   contains in<i%2>; all three directories contain which, each of a different length; the file
+   is called n<i%2> */
 static void *checker(void *arg)
 {
     (void)arg;
@@ -239,7 +242,7 @@ static void *checker(void *arg)
     return NULL;
 }
 
-/* 不同步地一直 stat：拿到的总是同一个文件 */
+/* stat continually without synchronization: it always gets the same file */
 static void *stress(void *arg)
 {
     (void)arg;
@@ -260,7 +263,7 @@ static void *stress(void *arg)
 static atomic_int phase;
 static int helper_before, helper_after, helper_errno;
 
-/* 先 stat 一次（填进缓存），等主线程 setuid 之后再 stat */
+/* stat once first (filling the cache), then stat again after the main thread's setuid */
 static void *helper(void *arg)
 {
     (void)arg;
@@ -320,7 +323,8 @@ int main(void)
         pthread_join(s[i], NULL);
     printf("stat after changes: %d bad, stress %d bad\n", bad, stress_bad);
 
-    /* 换成普通用户之后要检查搜索权限（musl 让每个线程都换） */
+    /* After switching to an ordinary user the search permission must be checked (musl switches
+     * every thread) */
     mkdir("/tmp/fs3/priv", 0700);
     close(creat("/tmp/fs3/priv/x", 0644));
     pthread_create(&c, NULL, helper, NULL);
@@ -338,8 +342,9 @@ C
 gcc -O2 -o diff3 diff3.c -pthread
 ./diff3
 rm -rf /tmp/fs3
-# 共享文件映射里的 futex：父子进程各自映射同一个文件，宿主地址不同，要按文件和偏移认出
-# 是同一个 futex（不持 BKL 的 futex 只按宿主地址算键，要避开这种映射）
+# Futexes in shared file mappings: parent and child each map the same file, at different host
+# addresses, and it must be recognized by file and offset as the same futex (no-BKL futexes key
+# only by host address, so they must avoid such mappings)
 cat > diff4.c <<'C'
 #define _GNU_SOURCE
 #include <stdatomic.h>
@@ -395,9 +400,10 @@ C
 gcc -O2 -o diff4 diff4.c
 ./diff4
 
-# 新映射的匿名内存一定是零：appine 把拆掉的宿主内存丢弃内容之后留着，下一次申请同样大小
-# 的直接复用（docs/rounds/109-spawn-mmap-bkl.md）。几个线程和子进程反复映射、检查、写满、
-# 拆掉同样大小的几种块
+# Newly mapped anonymous memory must be zero: appine keeps torn-down host memory after discarding
+# its contents, and reuses it directly for the next request of the same size
+# (docs/rounds/109-spawn-mmap-bkl.md). Several threads and child processes repeatedly map, check,
+# fill and tear down blocks of a few fixed sizes
 cat > diff5.c <<'C'
 #include <pthread.h>
 #include <stdio.h>
@@ -447,9 +453,10 @@ C
 gcc -O2 -o diff5 diff5.c -pthread
 ./diff5
 
-# 点积指令（ASIMDDP）：宿主有时宣告，HWCAP、ID_AA64ISAR0_EL1 的 DP 字段、/proc/cpuinfo 的
-# asimddp 一致；SDOT、UDOT 的向量形式和按元素形式，-O3 时编译器把 int8 的点积循环向量化成
-# SDOT。整个文件只加 +dotprod，别的 v8.2 指令（RDM 等）appine 不宣告
+# Dot product instructions (ASIMDDP): the host sometimes advertises them, and HWCAP, the DP field
+# of ID_AA64ISAR0_EL1 and asimddp in /proc/cpuinfo agree; the vector and by-element forms of SDOT
+# and UDOT, and at -O3 the compiler vectorizing an int8 dot product loop into SDOT. The whole file
+# adds only +dotprod; appine does not advertise the other v8.2 instructions (RDM and so on)
 cat > dotprod.c <<'C'
 #include <arm_neon.h>
 #include <stdint.h>
@@ -521,9 +528,10 @@ gcc -O3 -march=armv8-a+dotprod -o dotprod dotprod.c && ./dotprod
 echo "sdot in the loop: $(gcc -O3 -march=armv8-a+dotprod -S -o - dotprod.c | grep -c 'sdot	v')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | grep -cw asimddp)"
 
-# SHA3（EOR3、BCAX、RAX1、XAR）、SHA512、I8MM（SMMLA、UMMLA、USMMLA、USDOT、SUDOT）：宿主有时
-# 宣告，HWCAP、HWCAP2、ID_AA64ISAR0_EL1 的 SHA2、SHA3 字段、ID_AA64ISAR1_EL1 的 I8MM 字段、
-# /proc/cpuinfo 一致，intrinsics 的结果相同。整个文件只加 +sha3+i8mm
+# SHA3 (EOR3, BCAX, RAX1, XAR), SHA512, I8MM (SMMLA, UMMLA, USMMLA, USDOT, SUDOT): the host
+# sometimes advertises them, and HWCAP, HWCAP2, the SHA2 and SHA3 fields of ID_AA64ISAR0_EL1, the
+# I8MM field of ID_AA64ISAR1_EL1 and /proc/cpuinfo agree, and the intrinsics give the same
+# results. The whole file adds only +sha3+i8mm
 cat > crypto.c <<'C'
 #include <arm_neon.h>
 #include <stdint.h>
@@ -602,9 +610,10 @@ gcc -O2 -march=armv8-a+sha3+i8mm -o crypto crypto.c && ./crypto
 echo "instructions: $(gcc -O2 -march=armv8-a+sha3+i8mm -S -o - crypto.c | grep -cE '^	(eor3|bcax|rax1|xar|sha512h|sha512h2|sha512su0|sha512su1|smmla|ummla|usmmla|usdot|sudot)	')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'sha3|sha512|i8mm')"
 
-# LRCPC：宿主有时宣告，HWCAP、ID_AA64ISAR1_EL1 的 LRCPC 字段、/proc/cpuinfo 的 lrcpc 一致；
-# LDAPR、LDAPRH、LDAPRB 读到的值，-march=armv8-a+rcpc 时 acquire 读编成 LDAPR，两个线程用
-# STLR、LDAPR 传消息时读到序号之后它对应的数据一定已经写好
+# LRCPC: the host sometimes advertises it, and HWCAP, the LRCPC field of ID_AA64ISAR1_EL1 and
+# lrcpc in /proc/cpuinfo agree; the values LDAPR, LDAPRH and LDAPRB read, acquire loads compiled
+# to LDAPR with -march=armv8-a+rcpc, and when two threads pass messages with STLR and LDAPR, the
+# data for a sequence number is always written by the time that number is read
 cat > lrcpc.c <<'C'
 #include <pthread.h>
 #include <stdint.h>
@@ -616,7 +625,7 @@ cat > lrcpc.c <<'C'
 
 static uint64_t slots[64];
 static uint64_t seq;
-/* 只读的页上也能 LDAPR（读不要写权限） */
+/* LDAPR works on a read-only page too (reading needs no write permission) */
 static const uint64_t ro_word = 0x0123456789abcdefull;
 
 static void *producer(void *arg)
@@ -633,7 +642,8 @@ int main(void)
     unsigned long hw = getauxval(AT_HWCAP);
     uint64_t isar1;
     __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
-    /* 宿主还有 LRCPC2（LDAPUR 这些）时 Linux 报 2，appine 只实现了 LRCPC，报 1 */
+    /* When the host also has LRCPC2 (LDAPUR and so on) Linux reports 2; appine implements only
+     * LRCPC and reports 1 */
     printf("lrcpc %d, LRCPC field at least 1: %d\n", !!(hw & HWCAP_LRCPC), (int)(isar1 >> 20 & 15) >= 1);
     if (!(hw & HWCAP_LRCPC))
         return 0;
@@ -668,9 +678,11 @@ gcc -O2 -march=armv8-a+rcpc -pthread -o lrcpc lrcpc.c && ./lrcpc
 echo "ldapr in the code: $(gcc -O2 -march=armv8-a+rcpc -S -o - lrcpc.c | grep -c '	ldapr')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cx lrcpc)"
 
-# LRCPC2（带偏移的 LDAPUR*、LDAPURS*、STLUR*）：宿主有时宣告，HWCAP 的 ilrcpc、
-# ID_AA64ISAR1_EL1 的 LRCPC 字段（至少 2）、cpuinfo 一致；各种宽度、补零和符号扩展的读，正负
-# 偏移，写，.rodata 上的读。汇编器不一定认这些助记符，直接写指令字，固定用 x0、x1
+# LRCPC2 (LDAPUR*, LDAPURS* and STLUR* with offsets): the host sometimes advertises it, and
+# ilrcpc in HWCAP, the LRCPC field of ID_AA64ISAR1_EL1 (at least 2) and cpuinfo agree; loads of
+# every width, zero- and sign-extending, positive and negative offsets, stores, loads from
+# .rodata. Assemblers do not always know these mnemonics, so the instruction words are written
+# directly, always using x0 and x1
 cat > lrcpc2.c <<'C'
 #include <stdint.h>
 #include <stdio.h>
@@ -700,7 +712,7 @@ int main(void)
     unsigned long hw = getauxval(AT_HWCAP);
     uint64_t isar1;
     __asm__ volatile("mrs %0, id_aa64isar1_el1" : "=r"(isar1));
-    /* 宿主还有 LRCPC3 时 Linux 报 3，appine 报 2 */
+    /* When the host also has LRCPC3 Linux reports 3, appine 2 */
     printf("ilrcpc %d, LRCPC field at least 2: %d\n", !!(hw & HWCAP_ILRCPC), (int)(isar1 >> 20 & 15) >= 2);
     if (!(hw & HWCAP_ILRCPC))
         return 0;
@@ -722,9 +734,10 @@ int main(void)
 C
 gcc -O1 -o lrcpc2 lrcpc2.c && ./lrcpc2
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cx ilrcpc)"
-# FP16（标量和向量的半精度运算）和 JSCVT（FJCVTZS）：宿主有时宣告。半精度的数组运算由编译器
-# 向量化成 fmla v.8h；FPCR.FZ16 写得进去、把非规格化的半精度结果冲成 0；FJCVTZS 按 JavaScript
-# 的 ToInt32 取模 2^32，精确时 Z 置位
+# FP16 (scalar and vector half-precision arithmetic) and JSCVT (FJCVTZS): the host sometimes
+# advertises them. Half-precision array arithmetic is vectorized by the compiler into fmla v.8h;
+# FPCR.FZ16 can be written and flushes denormal half-precision results to 0; FJCVTZS reduces
+# modulo 2^32 as JavaScript's ToInt32 does, setting Z when exact
 cat > fp16.c <<'C'
 #include <arm_neon.h>
 #include <math.h>
@@ -818,7 +831,8 @@ int main(void)
     printf("scalar: add %04x div %04x fma %04x cvt %d %u sqrt %04x\n", bits(h + k),
            bits(vdivh_f16(h, k)), bits(vfmah_f16(h, k, h)), vcvth_s32_f16(k * (__fp16)10),
            vcvtah_u32_f16(h), bits(vsqrth_f16(h)));
-    /* FZ16：非规格化的半精度结果冲成 0（单精度的 FZ 不管半精度） */
+    /* FZ16: denormal half-precision results are flushed to 0 (single precision's FZ does not
+     * cover half precision) */
     volatile __fp16 tiny = (__fp16)6.1e-5f, half = (__fp16)0.25f, r0, r1;
     r0 = tiny * half;
     uint64_t fpcr;
@@ -835,9 +849,10 @@ C
 gcc -O3 -march=armv8.2-a+fp16 -o fp16 fp16.c -lm && ./fp16
 echo "fmla in the loop: $(gcc -O3 -march=armv8.2-a+fp16 -S -o - fp16.c | grep -c 'fmla	v[0-9]*\.8h')"
 echo "cpuinfo: $(grep -m 1 ^Features /proc/cpuinfo | tr ' ' '\n' | grep -cxE 'fphp|asimdhp|jscvt')"
-# RDM（SQRDMLAH、SQRDMLSH）、FCMA（FCMLA、FCADD）、FHM（FMLAL、FMLSL）、BF16（BFDOT、BFMMLA、
-# BFMLALB/T、BFCVT、BFCVTN）：宿主有时宣告，HWCAP、ID 寄存器的字段、/proc/cpuinfo 一致，intrinsics
-# 的结果相同；SQRDMLAH 饱和时置 FPSR.QC
+# RDM (SQRDMLAH, SQRDMLSH), FCMA (FCMLA, FCADD), FHM (FMLAL, FMLSL), BF16 (BFDOT, BFMMLA,
+# BFMLALB/T, BFCVT, BFCVTN): the host sometimes advertises them, and HWCAP, the ID register
+# fields and /proc/cpuinfo agree, and the intrinsics give the same results; SQRDMLAH sets FPSR.QC
+# when it saturates
 cat > ext.c <<'C'
 #include <arm_neon.h>
 #include <stdint.h>
@@ -878,9 +893,10 @@ int main(void)
         s32[i] = (int32_t)(i * 400000007u - 1500000000u);
     if (hw & HWCAP_ASIMDRDM) {
         int16x8_t a = vld1q_s16(h16), b = vld1q_s16(h16 + 8), c = vdupq_n_s16(30000);
-        /* 先清 QC，再算（操作数经过这条 asm，计算排不到它前面），结果经过下一条 asm 再读 FPSR */
+        /* Clear QC first, then compute (the operands go through this asm, so the computation
+         * cannot be moved before it), and read FPSR after the result goes through the next asm */
         __asm__ volatile("msr fpsr, %1" : "+w"(c) : "r"(0UL));
-        int16x8_t r = vqrdmlahq_s16(b, b, c); /* b 的后几个元素加上约 0.9b 超出 32767 */
+        int16x8_t r = vqrdmlahq_s16(b, b, c); /* b's last few elements plus ~0.9b exceed 32767 */
         uint64_t qc;
         __asm__ volatile("mrs %0, fpsr" : "=r"(qc) : "w"(r));
         printf("fpsr.qc after a saturating sqrdmlah %d\n", (int)(qc >> 27 & 1));
@@ -901,7 +917,7 @@ int main(void)
         show("vcaddq_rot90_f32", (float32x4_t[]){vcaddq_rot90_f32(fa, fb)}, 16);
         float64x2_t da = {1.25, -3.5}, db = {0.5, 2.0};
         show("vcaddq_rot270_f64", (float64x2_t[]){vcaddq_rot270_f64(da, db)}, 16);
-        /* 半精度的形式还要 FP16 */
+        /* The half-precision forms also need FP16 */
         float16x8_t ha = vcvt_high_f16_f32(vcvt_f16_f32(fa), fb), hb = vrev64q_f16(ha);
         show("vcmlaq_f16", (float16x8_t[]){vcmlaq_f16(ha, ha, hb)}, 16);
     }
@@ -934,10 +950,11 @@ C
 gcc -O2 -march=armv8.3-a+fp16fml+bf16 -o ext ext.c && ./ext
 echo "instructions: $(gcc -O2 -march=armv8.3-a+fp16fml+bf16 -S -o - ext.c | grep -cE '^	(sqrdmlah|sqrdmlsh|fcmla|fcadd|fmlal|fmlsl|fmlal2|fmlsl2|bfdot|bfmmla|bfmlalb|bfmlalt|bfcvt|bfcvtn|bfcvtn2)	')"
 
-# FRINTTS、FlagM、FlagM2、SB、DPB、DPB2（宿主有时才宣告）：HWCAP、ID 寄存器的字段；CFINV、RMIF、
-# SETF8、SETF16、XAFLAG、AXFLAG 对 16 种 NZCV 的结果；FRINT32Z/X、FRINT64Z/X 的标量和向量形式
-# （含超出范围的、NaN、无穷，以及 FPCR 的四种舍入方式）和 FPSR.IOC；SB；DC CVAP、DC CVADP
-# 在可读、PROT_NONE、没有映射的地址上
+# FRINTTS, FlagM, FlagM2, SB, DPB, DPB2 (only sometimes advertised by the host): HWCAP and the ID
+# register fields; the results of CFINV, RMIF, SETF8, SETF16, XAFLAG and AXFLAG for all 16 NZCV
+# values; the scalar and vector forms of FRINT32Z/X and FRINT64Z/X (including out-of-range
+# values, NaN, infinities, and the four rounding modes of FPCR) and FPSR.IOC; SB; DC CVAP and
+# DC CVADP on readable, PROT_NONE and unmapped addresses
 cat > ext2.c <<'C'
 #include <arm_acle.h>
 #include <arm_neon.h>
@@ -973,7 +990,7 @@ static void on_segv(int sig, siginfo_t *si, void *uc)
     siglongjmp(env, si->si_code);
 }
 
-/* DC CVAP（cvadp 为真时 DC CVADP）x0；返回 0 或者 SIGSEGV 的 si_code */
+/* DC CVAP (DC CVADP when cvadp is true) x0; returns 0 or the si_code of SIGSEGV */
 static int persist(void *p, int cvadp)
 {
     int code = sigsetjmp(env, 1);

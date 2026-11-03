@@ -1,7 +1,9 @@
-# Debian（glibc）：headless Chromium。命令行的 --dump-dom、--screenshot、--print-to-pdf，再由
-# Puppeteer（经由 WebSocket 上的 DevTools 协议）和 Playwright（经由 fd 3、4 上的管道）驱动它：
-# 页面里的 JS、fetch、Web Worker、canvas、输入和点击、截图、PDF。Chromium 是多进程的（浏览器、
-# 渲染器、GPU、网络服务等），之间经由 AF_UNIX socket 和共享内存通信，渲染器里 V8 即时编译
+# Debian (glibc): headless Chromium. The command line's --dump-dom, --screenshot and --print-to-pdf,
+# then driving it with Puppeteer (through the DevTools protocol over WebSocket) and Playwright
+# (through pipes on fds 3 and 4): JS in the page, fetch, Web Workers, canvas, typing and clicking,
+# screenshots, PDF. Chromium is multi-process (browser, renderer, GPU, network service and so on),
+# communicating through AF_UNIX sockets and shared memory, with V8 compiling just in time in the
+# renderer
 export DEBIAN_FRONTEND=noninteractive
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 if ! command -v chromium >/dev/null || ! command -v npm >/dev/null || ! command -v python3 >/dev/null; then

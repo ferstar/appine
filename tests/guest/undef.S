@@ -1,4 +1,4 @@
-// 未定义指令：guest 应当以 SIGILL 终止。
+// An undefined instruction: the guest should terminate with SIGILL.
     .text
     .globl  _start
 _start:

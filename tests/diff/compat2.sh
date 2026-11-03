@@ -1,13 +1,16 @@
-# compat.sh 的续篇（difftest 把整个脚本作为 sh -c 的一个参数，不能超过 128 KB）：raw ICMP
-# socket、PR_SET_CHILD_SUBREAPER、O_APPEND 文件上带偏移的写、readlink 的空路径、F_GETFL 里的
-# O_LARGEFILE、/proc/<pid>/task/<tid>/children、PR_SET_PDEATHSIG 和 __WNOTHREAD、短的符号链接、
-# /proc/<pid>/exe 指向程序文件本身、DIT 在信号、fork、execve、ptrace 里
+# The sequel to compat.sh (difftest passes the whole script as one argument of sh -c, which must
+# not exceed 128 KB): raw ICMP sockets, PR_SET_CHILD_SUBREAPER, positional writes on O_APPEND
+# files, readlink with an empty path, O_LARGEFILE in F_GETFL, /proc/<pid>/task/<tid>/children,
+# PR_SET_PDEATHSIG and __WNOTHREAD, short symlinks, /proc/<pid>/exe pointing at the program file
+# itself, DIT across signals, fork, execve and ptrace
 set -e
 cd /tmp
-# raw ICMP socket（appine 在宿主上用 ping socket 模拟）：IPv4 收到的数据带 IP 头，echo 回答
-# 里是自己发出的 id，校验和对得上；ICMP_FILTER、ICMPV6_FILTER、IPV6_CHECKSUM、IP_RECVTTL 和
-# IP_PKTINFO 的控制消息（放不下时截短）、MSG_TRUNC。回环上 Linux 的 raw socket 也收到发出
-# 的 echo 请求，用例都先用过滤器只留回答。IP 头的 id、TOS 和标志不比
+# raw ICMP sockets (appine emulates them with ping sockets on the host): data received on IPv4
+# includes the IP header, an echo reply carries the id we sent, and the checksum is right;
+# ICMP_FILTER, ICMPV6_FILTER, IPV6_CHECKSUM, the control messages of IP_RECVTTL and IP_PKTINFO
+# (truncated when they do not fit), MSG_TRUNC. On loopback Linux's raw socket also receives the
+# echo requests sent, so the test cases all first use a filter to keep only the replies. The id,
+# TOS and flags of the IP header are not compared
 cat > rawicmp.c <<'C'
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -126,7 +129,8 @@ static void v4(void)
     printf("recvfrom %d from %s\n", n, inet_ntoa(from.sin_addr));
     show(buf, n);
 
-    /* 控制消息：PKTINFO 在 TTL 前面；放得下、只放得下第一条、第二条只放得下一部分 */
+    /* Control messages: PKTINFO comes before TTL; both fit, only the first fits, only part of the
+     * second fits */
     v = 1;
     setsockopt(s, IPPROTO_IP, IP_RECVTTL, &v, sizeof v);
     setsockopt(s, IPPROTO_IP, IP_PKTINFO, &v, sizeof v);
@@ -150,14 +154,15 @@ static void v4(void)
     setsockopt(s, IPPROTO_IP, IP_RECVTTL, &v, sizeof v);
     setsockopt(s, IPPROTO_IP, IP_PKTINFO, &v, sizeof v);
 
-    /* 截短：MSG_TRUNC 要完整的长度，收到的是 IP 头的开头 */
+    /* Truncation: MSG_TRUNC asks for the full length, and what is received is the start of the IP
+     * header */
     echo(s, 6, 200);
     struct iovec iov = {buf, 10};
     struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1};
     n = recvmsg(s, &m, MSG_TRUNC);
     printf("truncated: %d, MSG_TRUNC %d, first byte %#x\n", n, !!(m.msg_flags & MSG_TRUNC), buf[0]);
 
-    /* 过滤器挡掉的回答不会收到，偷看的时候也一样 */
+    /* Replies the filter blocks are not received, also when peeking */
     filt = ~0u;
     setsockopt(s, SOL_RAW, ICMP_FILTER, &filt, sizeof filt);
     for (int peek = 0; peek < 2; peek++) {
@@ -222,7 +227,7 @@ static void v6(void)
     int n = recvfrom(s, buf, sizeof buf, 0, (void *)&from, &l);
     char a[64];
     printf("recvfrom %d from %s\n", n, inet_ntop(AF_INET6, &from.sin6_addr, a, sizeof a));
-    /* 伪头部：源、目的地址，长度，下一个头 */
+    /* Pseudo-header: source and destination addresses, length, next header */
     unsigned char pseudo[40] = {0};
     memcpy(pseudo, &from.sin6_addr, 16);
     memcpy(pseudo + 16, &to.sin6_addr, 16);
@@ -234,7 +239,7 @@ static void v6(void)
     close(s);
 }
 
-/* 没有 CAP_NET_RAW 建不了 raw socket；协议号不对的先报告 */
+/* Without CAP_NET_RAW raw sockets cannot be created; a wrong protocol number is reported first */
 static void unprivileged(void)
 {
     fflush(stdout);
@@ -267,14 +272,15 @@ C
 gcc -O1 -o rawicmp rawicmp.c
 ./rawicmp
 
-# busybox 的 ping、ping6 以 root 运行时用 raw socket，普通用户建 raw socket 得到 EPERM 时
-# 改用 ping socket
+# busybox's ping and ping6 use raw sockets when run as root, and switch to ping sockets when an
+# ordinary user gets EPERM creating a raw socket
 ping -c 2 -s 100 127.0.0.1 | sed 's/ time=.*//; /round-trip/d'
 ping6 -c 1 ::1 | sed 's/ time=.*//; /round-trip/d'
 su -s /bin/sh nobody -c 'ping -c 1 127.0.0.1' | sed 's/ time=.*//; /round-trip/d'
 
-# PR_SET_CHILD_SUBREAPER：孤儿过继给祖先里最近的 subreaper，已经是僵尸的也由它回收；它退出
-# 之后它的孤儿交给再往上的；fork 不继承，execve 保留；没有 subreaper 时给 1 号进程
+# PR_SET_CHILD_SUBREAPER: orphans are reparented to the nearest subreaper among their ancestors,
+# which also reaps the ones already zombies; after it exits its orphans go to the next one up;
+# fork does not inherit it, execve keeps it; without a subreaper they go to process 1
 cat > subreaper.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -306,7 +312,7 @@ int main(int argc, char **argv)
     }
     pid_t me = getpid(), r;
     int st;
-    /* 行缓冲：fork 出来的进程不会再输出一遍父进程缓冲着的内容 */
+    /* Line buffering: forked processes do not output again what the parent has buffered */
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("default: %d\n", get());
     printf("set 5: %d, now %d\n", prctl(PR_SET_CHILD_SUBREAPER, 5), get());
@@ -326,7 +332,7 @@ int main(int argc, char **argv)
     }
     wait(NULL);
 
-    /* 孙子进程在父进程退出之后过继给这里，由这里回收 */
+    /* The grandchild is reparented here after its parent exits, and reaped here */
     int p[2];
     pipe(p);
     pid_t a = fork();
@@ -344,7 +350,7 @@ int main(int argc, char **argv)
     r = waitpid(-1, &st, 0);
     printf("reaped the orphan: %s, status %d\n", r > 0 && r != a ? "yes" : "no", WEXITSTATUS(st));
 
-    /* 父进程退出时已经是僵尸的孙子进程 */
+    /* A grandchild that is already a zombie when its parent exits */
     a = fork();
     if (a == 0) {
         pid_t g = fork();
@@ -358,7 +364,7 @@ int main(int argc, char **argv)
     r = waitpid(-1, &st, 0);
     printf("reaped the zombie: %s, status %d\n", r > 0 ? "yes" : "no", WEXITSTATUS(st));
 
-    /* 最近的 subreaper；它退出之后交给再往上的 */
+    /* The nearest subreaper; after it exits they go to the next one up */
     int q[2], back[2];
     pipe(q);
     pipe(back);
@@ -390,7 +396,7 @@ int main(int argc, char **argv)
     r = waitpid(-1, &st, 0);
     printf("reaped it: %s\n", r > 0 && r != b ? "yes" : "no");
 
-    /* 清掉之后孤儿给 1 号进程 */
+    /* After clearing it, orphans go to process 1 */
     prctl(PR_SET_CHILD_SUBREAPER, 0);
     a = fork();
     if (a == 0) {
@@ -411,9 +417,10 @@ int main(int argc, char **argv)
 C
 gcc -O1 -o subreaper subreaper.c && ./subreaper
 
-# 带偏移的写在 O_APPEND 的文件上照样写到末尾、文件位置不变（pwrite(2) 的 BUGS；musl 的 pwrite
-# 改用 pwritev2 的 RWF_NOAPPEND，这里直接调用系统调用）；readlink 的路径为空时读 dirfd 本身，
-# 它不是符号链接时是 ENOENT
+# Positional writes on an O_APPEND file still write at the end and leave the file position
+# unchanged (BUGS in pwrite(2); musl's pwrite uses RWF_NOAPPEND of pwritev2 instead, so the
+# system call is called directly here); readlink with an empty path reads dirfd itself, and when
+# that is not a symlink it is ENOENT
 cat > positional.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -474,11 +481,12 @@ int main(void)
 C
 gcc -O1 -o positional positional.c && ./positional
 
-# raw ICMP socket 收得到到达的所有 ICMP（appine 里经由汇集点）：别的 UDP socket 发的报文引起
-# 的端口不可达（引用原来的 IP 头、UDP 头和载荷），别的 raw socket 发的 echo 的回答；没连接的
-# UDP socket 看不到错误，连接了的只看到与连接对得上的硬错误（ECONNREFUSED）；raw socket 打开
-# IP_RECVERR 之后，网关报告的超时（TTL 1 发往外面的地址）进它的错误队列。引用的 IP 头的
-# TTL、id 不比
+# A raw ICMP socket receives all arriving ICMP (through the aggregation point in appine): port
+# unreachables caused by packets other UDP sockets send (quoting the original IP header, UDP
+# header and payload), replies to echoes other raw sockets send; an unconnected UDP socket sees
+# no error, a connected one sees only hard errors that match its connection (ECONNREFUSED); once
+# a raw socket turns on IP_RECVERR, time exceeded reported by the gateway (TTL 1 to an external
+# address) goes into its error queue. The TTL and id of the quoted IP header are not compared
 cat > icmperr.c <<'C'
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -494,7 +502,7 @@ cat > icmperr.c <<'C'
 
 #define ICMP_FILTER 1
 
-/* linux/errqueue.h（仓库里没有内核头文件） */
+/* linux/errqueue.h (the store has no kernel headers) */
 struct sock_extended_err {
     unsigned ee_errno;
     unsigned char ee_origin, ee_type, ee_code, ee_pad;
@@ -546,7 +554,7 @@ static const char *err(long n)
     return n < 0 ? strerror(errno) : "ok";
 }
 
-/* 等 raw socket 收到一个报文，打印外层和引用的 UDP */
+/* Wait for the raw socket to receive a packet, and print the outer and the quoted UDP */
 static void unreachable(int r, int port)
 {
     unsigned char b[512];
@@ -663,14 +671,15 @@ int main(void)
 C
 gcc -O1 -o icmperr icmperr.c && ./icmperr
 
-# busybox 的 traceroute：UDP 探测包（每个换一个端口）和 -I 的 echo，都用另一个 raw socket 收。
-# 只到本机的地址：网关对 ICMP 限速（每秒一个），几个探测包接着发时原生上也时有时无
+# busybox's traceroute: UDP probes (a different port for each) and -I echoes, both received with
+# another raw socket. Only to a local address: the gateway rate-limits ICMP (one per second), so
+# with several probes sent in a row the answers come and go even natively
 traceroute -n -q 2 -w 2 127.0.0.1 2>&1 | sed 's/ [0-9.]* ms//g'
 traceroute -I -n -q 2 -w 2 127.0.0.1 2>&1 | sed 's/ [0-9.]* ms//g'
 traceroute6 -n -q 2 -w 2 ::1 2>&1 | sed 's/ [0-9.]* ms//g'
 
-# F_GETFL、fdinfo 的标志：open 打开的带 O_LARGEFILE（O_PATH 的不带），管道、socket、eventfd、
-# epoll、memfd 这些按各自的系统调用
+# Flags of F_GETFL and fdinfo: files opened by open have O_LARGEFILE (O_PATH ones do not), and
+# pipes, sockets, eventfds, epolls, memfds and the like follow their own system calls
 python3 - <<'PY'
 import os, socket, select, fcntl
 def show(what, fd):
@@ -692,9 +701,11 @@ show("memfd", os.memfd_create("x"))
 show("reopened pipe", os.open("/proc/self/fd/%d" % r, os.O_RDONLY))
 PY
 
-# /proc/<pid>/task/<tid>/children：线程建的子进程（含僵尸进程），线程不算；建它们的线程退出
-# 之后排到同一个进程里还活着的线程的最后；CLONE_PARENT 建的算调用者的父线程的；subreaper
-# 收养的孤儿；非主线程 exec 之后都归它（它接过主线程的编号）。pid 换成名字比
+# /proc/<pid>/task/<tid>/children: the children a thread created (zombies included), not
+# counting threads; after the creating thread exits they go to the end of a thread still alive in
+# the same process; those created with CLONE_PARENT count for the caller's parent thread; orphans
+# adopted by a subreaper; after a non-main thread execs they all belong to it (it takes over the
+# main thread's ID). pids are replaced with names for comparison
 cat > children.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -761,8 +772,8 @@ static pid_t spawn(const char *name)
     return p;
 }
 
-/* pthread_join 返回时线程还可能没退完（Linux 在把子进程交出去之前就叫醒 join 的线程），等到
- * /proc/self/task 里没有它 */
+/* When pthread_join returns the thread may not have finished exiting (Linux wakes the joining
+ * thread before handing over its children), so wait until it is gone from /proc/self/task */
 static void wait_gone(pid_t tid)
 {
     char path[64];
@@ -817,7 +828,7 @@ static void wait_zombie(pid_t p)
 
 int main(int argc, char **argv)
 {
-    /* 线程 exec 时缓冲区里还没写出去的会丢掉 */
+    /* What is still unwritten in the buffer when a thread execs is lost */
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1 && strcmp(argv[1], "after-exec") == 0) {
         for (int i = 2; i < argc; i++) {
@@ -897,9 +908,11 @@ C
 gcc -O1 -pthread -o children children.c && ./children
 echo "children in task/<tid>: $(ls /proc/$$/task/$$ | grep -c '^children$'), in /proc/<pid>: $(ls /proc/$$ | grep -c '^children$')"
 
-# PR_SET_PDEATHSIG 按线程：建立子进程的线程一退出就发（进程还在也一样），别的线程退出不发；
-# 设置跟着设它的线程，新线程、fork 出来的子进程都是 0，execve 保留，setuid 之后清掉；
-# siginfo 是 SI_USER，发送者是父进程。wait 的 __WNOTHREAD 只等调用的线程建的子进程
+# PR_SET_PDEATHSIG is per thread: it is sent as soon as the thread that created the child exits
+# (even while the process lives on), not when other threads exit; the setting follows the thread
+# that set it, new threads and forked children have 0, execve keeps it, and setuid clears it;
+# siginfo is SI_USER with the parent as sender. __WNOTHREAD of wait waits only for children
+# created by the calling thread
 cat > pdeath.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -920,7 +933,8 @@ static int fds[2];
 static pid_t parent;
 static char *self;
 
-/* 子进程等 PR_SET_PDEATHSIG 的信号：在 ms 毫秒里收到的都写进管道 */
+/* The child waits for PR_SET_PDEATHSIG signals: those received within ms milliseconds are written
+ * into the pipe */
 static void await_signals(int ms)
 {
     sigset_t set;
@@ -961,8 +975,9 @@ static void *set_usr2(void *arg)
     return NULL;
 }
 
-/* how：0 只在主线程设 SIGUSR1；1 另一个线程再设 SIGUSR2、一直活着；2 设了之后 exec；3 另一个
- * 线程设了 SIGUSR2 之后退出（跟着它没了） */
+/* how: 0 sets SIGUSR1 only in the main thread; 1 another thread also sets SIGUSR2 and stays
+ * alive; 2 exec after setting; 3 another thread sets SIGUSR2 and then exits (the setting goes
+ * with it) */
 static pid_t spawn(int how, int ms)
 {
     pid_t p = fork();
@@ -1124,7 +1139,8 @@ int main(int argc, char **argv)
     }
     pthread_create(&t, NULL, waiter_thread, NULL);
     pthread_join(t, NULL);
-    /* pthread_join 返回时线程还可能没退完、它的子进程还没交给主线程：等到 /proc/self/task 里没有它 */
+    /* When pthread_join returns the thread may not have finished exiting, and its children may not
+     * have been handed to the main thread yet: wait until it is gone from /proc/self/task */
     char task[64];
     snprintf(task, sizeof task, "/proc/self/task/%d", waiter_tid);
     while (access(task, F_OK) == 0)
@@ -1134,7 +1150,8 @@ int main(int argc, char **argv)
     kill(a_pid, SIGKILL);
     printf("main waits any: %s\n", waitpid(-1, NULL, __WNOTHREAD) == a_pid ? "its own child" : strerror(errno));
 
-    /* 放在最后：孙进程成了孤儿，原生一侧这个程序是容器的 1 号进程时会收养它 */
+    /* Placed last: the grandchild becomes an orphan, and on the native side this program adopts it
+     * when it is the container's process 1 */
     pid_t mid = fork();
     if (mid == 0) {
         parent = getpid();
@@ -1151,8 +1168,9 @@ int main(int argc, char **argv)
 C
 gcc -O1 -pthread -o pdeath pdeath.c && ./pdeath
 
-# 短的符号链接存在 inode 里，不占块：ext4 上是目标短于 60 字节的（ext4_symlink），ls -l 的
-# total 因此不算它们（tmpfs 的在 tmpfs 组）
+# Short symlinks are stored in the inode and take no blocks: on ext4 those whose targets are
+# shorter than 60 bytes (ext4_symlink), so the total of ls -l does not count them (tmpfs ones are
+# in the tmpfs case)
 cd /tmp
 rm -f sl59 sl60
 ln -s "$(printf %059d 0)" sl59
@@ -1160,9 +1178,10 @@ ln -s "$(printf %060d 0)" sl60
 stat -c '%s %b' sl59 sl60
 rm -f sl59 sl60
 
-# /proc/<pid>/exe 指向程序文件本身（Linux 的 mm->exe_file）：删除、被 rename 换掉之后读出来
-# 带 " (deleted)"，跟随时（stat、open、execve）到的仍是原来那个文件；只改了名的也是原来
-# 那个（读出来的路径 Linux 跟着变，appine 不变，不比）
+# /proc/<pid>/exe points at the program file itself (Linux's mm->exe_file): after it is deleted or
+# replaced by rename, reading it gives " (deleted)", and following it (stat, open, execve) still
+# reaches the original file; one that was only renamed is also the original (the path read
+# follows the rename on Linux but not in appine, so it is not compared)
 cd /tmp
 cat > exelink.c <<'C'
 #define _GNU_SOURCE
@@ -1184,7 +1203,7 @@ static void show(const char *what, const char *link)
     printf("%s: %s\n", what, n > 0 ? buf : strerror(errno));
 }
 
-/* 经由链接 stat、open：是不是原来那个文件 */
+/* stat and open through the link: is it the original file */
 static void probe(const char *what, const char *link, const struct stat *orig)
 {
     struct stat st;
@@ -1210,7 +1229,7 @@ static void probe(const char *what, const char *link, const struct stat *orig)
     close(fd);
 }
 
-/* 主程序在 maps 里的那一行的路径 */
+/* The path on the main program's line in maps */
 static void maps(const char *what)
 {
     char line[600];
@@ -1263,7 +1282,7 @@ int main(int argc, char **argv)
         probe("after unlink", "/proc/self/exe", &orig);
         maps("after unlink");
         fflush(stdout);
-        /* 重新执行自己：Linux 执行的是删掉的那个文件 */
+        /* Re-execute ourselves: Linux executes the deleted file */
         char ino[64];
         snprintf(ino, sizeof ino, "%lu:%lu", (unsigned long)orig.st_dev, (unsigned long)orig.st_ino);
         execl("/proc/self/exe", "exelink", "again", ino, (char *)NULL);
@@ -1301,7 +1320,7 @@ int main(int argc, char **argv)
         stat("/tmp/exe-other", &orig);
         unlink("/tmp/exe-other");
         char c;
-        /* 告诉父进程已经删了，等它看完 */
+        /* Tell the parent it has been deleted, and wait until it has looked */
         write(10, "x", 1);
         read(11, &c, 1);
         return 0;
@@ -1314,7 +1333,8 @@ int main(int argc, char **argv)
     copy_self("/tmp/exe-mv");
     run("/tmp/exe-mv", "renamed");
 
-    /* 别的进程的 exe：子进程删掉自己的程序文件之后，经由 /proc/<pid>/exe 看 */
+    /* Another process's exe: after the child deletes its own program file, look through
+     * /proc/<pid>/exe */
     copy_self("/tmp/exe-other");
     stat("/tmp/exe-other", &orig);
     int up[2], down[2];
@@ -1343,9 +1363,11 @@ int main(int argc, char **argv)
 C
 gcc -O1 -o exelink exelink.c && ./exelink
 
-# DIT 是线程的状态（Linux 6.1）：信号处理函数带着被打断时的 DIT、信号帧的 pstate 第 24 位是它、
-# sigreturn 照帧里的恢复；fork、线程继承，execve 清零；ptrace 的 NT_PRSTATUS 里是 pstate 的第 24 位，
-# 跟踪者改了之后被跟踪者看到新的值。宿主没有 DIT 时两边都只打印 no DIT
+# DIT is thread state (Linux 6.1): a signal handler runs with the DIT it had when interrupted,
+# bit 24 of the signal frame's pstate is it, and sigreturn restores it from the frame; fork and
+# threads inherit it, execve clears it; ptrace's NT_PRSTATUS has it in bit 24 of pstate, and the
+# tracee sees the new value after the tracer changes it. When the host has no DIT both sides
+# only print no DIT
 cd /tmp
 cat > ditstate.c <<'C'
 #define _GNU_SOURCE
@@ -1386,8 +1408,8 @@ static void handler(int sig, siginfo_t *si, void *p)
     (void)sig, (void)si;
     in_handler = dit();
     frame_bit = (int)(uc->uc_mcontext.pstate >> 24 & 1);
-    uc->uc_mcontext.pstate ^= UINT64_C(1) << 24; /* sigreturn 照帧里的恢复 */
-    set(!in_handler);                            /* 处理函数自己改的不算 */
+    uc->uc_mcontext.pstate ^= UINT64_C(1) << 24; /* sigreturn restores it from the frame */
+    set(!in_handler);                            /* what the handler sets itself does not count */
 }
 
 static void *thread(void *a)

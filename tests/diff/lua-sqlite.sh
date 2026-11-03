@@ -1,4 +1,4 @@
-# Lua 和 SQLite 的命令行程序
+# The Lua and SQLite command-line programs
 lua5.4 -e '
 local t = {}
 for i = 1, 100000 do t[i] = i * i end

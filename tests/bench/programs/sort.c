@@ -1,4 +1,5 @@
-/* 快速排序 256K 个 32 位整数：访存和难以预测的分支。用法：sort [rounds] */
+/* Quicksort of 256K 32-bit integers: memory accesses and hard-to-predict branches.
+ * Usage: sort [rounds] */
 #include "rt.h"
 
 #define COUNT (1 << 18)
@@ -38,7 +39,7 @@ static void quicksort(uint32_t *v, long lo, long hi)
                 j--;
             }
         }
-        /* 先递归处理较短的一边，栈深度保持 O(log n) */
+        /* Recurse into the shorter side first, keeping the stack depth O(log n) */
         if (j - lo < hi - i) {
             quicksort(v, lo, j);
             lo = i;

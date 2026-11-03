@@ -1,6 +1,8 @@
-# 断电测试的负载（guest 或原生的 busybox sh）：$1 是数据目录。
-# 每一轮 v 把 f1..f20 用"写临时文件、改名覆盖"换成第 v 版（apk 就是这样装文件的）；
-# 每 5 轮写一个 s$v，fsync 它和目录之后打印 "synced v"（断电之后它必须完整），再停一下。
+# The workload of the power-loss test (the guest's or native busybox sh): $1 is the data directory.
+# Each round v replaces f1..f20 with version v by "write a temporary file, rename it over the old
+# one" (this is how apk installs files);
+# every 5 rounds it writes an s$v, fsyncs it and the directory, prints "synced v" (it must be intact
+# after a power loss), and pauses for a moment.
 d=$1
 mkdir -p "$d"
 cd "$d" || exit 1
@@ -17,7 +19,8 @@ while :; do
     if [ $((v % 5)) -eq 0 ]; then
         yes "s $v" | head -n 500 > s$v
         fsync s$v . && echo "synced $v"
-        # 停一下：appine 的后台线程在写入停下之后做完检查点，WAL 之后从头再用
+        # Pause: appine's background thread finishes the checkpoint once writes stop, and the WAL is
+        # reused from the start afterwards
         sleep 0.3
     fi
 done

@@ -1,11 +1,12 @@
-# Ubuntu 26.04（glibc 2.43，Rust 写的 coreutils）：先运行它装后面要的软件包。
-# 仓库由 docker 的 ubuntu:26.04 导出（docs/rounds/149-ubuntu26-survey.md）：
+# Ubuntu 26.04 (glibc 2.43, coreutils written in Rust): run this first to install the packages
+# needed later.
+# The store is exported from docker's ubuntu:26.04 (docs/rounds/149-ubuntu26-survey.md):
 #
 #   cid=$(docker create --platform linux/arm64 ubuntu:26.04)
 #   docker export $cid | gzip > target/glibc/ubuntu-26-04.tar.gz; docker rm $cid
 #   appine-run --rootfs target/glibc/ubuntu26-store --import target/glibc/ubuntu-26-04.tar.gz
 export DEBIAN_FRONTEND=noninteractive
-# docker export 出来的 rootfs 里 resolv.conf、hosts 是空的（docs/rounds/69-glibc-probe.md）
+# In a rootfs from docker export, resolv.conf and hosts are empty (docs/rounds/69-glibc-probe.md)
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 [ -s /etc/hosts ] || printf '127.0.0.1 localhost\n::1 localhost ip6-localhost\n' > /etc/hosts
 . /etc/os-release; echo "$PRETTY_NAME, $(ldd --version | head -1)"

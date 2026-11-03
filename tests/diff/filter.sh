@@ -1,8 +1,10 @@
 # docker-run-options: --privileged
-# 过滤链（docs/rounds/175-filter.md）：开机时的命名空间里两个 bridge（br0 10.80.0.1/24、
-# br1 10.81.0.1/24），A 挂在 br0、B 挂在 br1，经由外层命名空间路由。外层的 FORWARD、INPUT，
-# A 的 OUTPUT，B 的 INPUT 上有过滤规则（nftables 和 iptables-nft 的），比 A 连 B、连外层的
-# 结果：丢弃的超时，拒绝的 ECONNREFUSED，OUTPUT 上丢弃的 EPERM，已建立的连接的回答照常。
+# Filter chains (docs/rounds/175-filter.md): two bridges in the boot-time namespace
+# (br0 10.80.0.1/24, br1 10.81.0.1/24), A attached to br0 and B to br1, routed through the outer
+# namespace. With filter rules (nftables and iptables-nft ones) on the outer FORWARD and INPUT,
+# A's OUTPUT and B's INPUT, compare the results of A connecting to B and to the outer namespace:
+# dropped ones time out, rejected ones get ECONNREFUSED, ones dropped on OUTPUT get EPERM, and
+# replies on established connections go through as usual.
 exec 2>&1
 cd /tmp
 cat > srv.py <<'PY'
@@ -44,7 +46,7 @@ try:
         c.sendto(msg.encode(), (addr, port)); data, peer = c.recvfrom(200)
         print(f"{data.decode()}; reply from {peer[0]}:{peer[1]}")
 except TimeoutError:
-    # 丢弃的要等到超时（这里设的 2 秒），不是马上失败
+    # A dropped one has to wait for the timeout (2 seconds, set here), it does not fail at once
     waited = "after waiting" if time.monotonic() - start >= 1.5 else "at once"
     print(f"{msg}: timed out {waited}")
 except OSError as e:
@@ -94,7 +96,8 @@ table inet f {
 }
 NFT
 echo "outer rules: $?"
-# B -> A 的新连接由 iptables-nft 的规则丢弃，已建立的（A -> B 的回答）放行
+# New B -> A connections are dropped by the iptables-nft rules; established ones (the replies to
+# A -> B) are let through
 iptables -A FORWARD -i br1 -o br0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -A FORWARD -i br1 -o br0 -j DROP
 echo "outer iptables rules: $?"
@@ -112,7 +115,7 @@ nsenter -t "$A" -n sh -c 'iptables -A OUTPUT -d 10.81.0.3 -p tcp --dport 7006 -j
 echo "== A -> B"
 for p in 7000 7001 7002 7005 7006 7007 7008; do serve "$B" tcp 0.0.0.0 $p 1; done
 for p in 7000 7001 7002 7005 7006 7007 7008; do nsenter -t "$A" -n python3 cli.py tcp 10.81.0.3 $p a-to-b-$p; done
-# 非阻塞的 connect：丢弃的一直在连接中
+# Non-blocking connect: a dropped one stays in progress
 nsenter -t "$A" -n python3 -c '
 import errno, select, socket
 s = socket.socket(); s.setblocking(False)

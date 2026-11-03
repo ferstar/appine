@@ -12,7 +12,8 @@ appine-hal.workspace = true
 appine-kernel.workspace = true
 
 [features]
-# 差分测试、LTP、普查都用这个前端的发布构建，默认让它们也查借用（appine-kernel 的同名特性）
+# Differential tests, LTP and the survey all use this front end's release build, so by default they
+# check borrows too (the appine-kernel feature of the same name)
 default = ["borrow-check"]
 borrow-check = ["appine-kernel/borrow-check"]
 

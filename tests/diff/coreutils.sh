@@ -1,10 +1,10 @@
-# busybox 的文本处理、压缩和 shell 算术
+# busybox text processing, compression and shell arithmetic
 echo hello | sha256sum
 seq 1 10000 | awk '{ s += $1 } END { print s }'
 seq 1 2000 | sort -r | md5sum
 printf 'b\na\nc\n' | sort
 head -c 100000 /dev/zero | gzip -9 | wc -c
-# /dev/zero、/dev/urandom 一次读满整块（不是 64 KB）
+# /dev/zero and /dev/urandom fill the whole block in one read (not 64 KB)
 dd if=/dev/zero of=/dev/null bs=4M count=2 2>&1 | head -2
 dd if=/dev/urandom of=/dev/null bs=1M count=1 2>&1 | head -2
 gzip -c /etc/passwd | gzip -d | md5sum

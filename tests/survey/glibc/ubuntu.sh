@@ -1,4 +1,5 @@
-# Ubuntu 24.04（glibc 2.39）：apt 装 python、gcc，编译运行多线程程序
+# Ubuntu 24.04 (glibc 2.39): apt installs python and gcc, then compiles and runs a multithreaded
+# program
 export DEBIAN_FRONTEND=noninteractive
 . /etc/os-release; echo "$PRETTY_NAME, $(ldd --version | head -1)"
 apt-get update -q 2>&1 | tail -1

@@ -1,4 +1,4 @@
-/* 查表法 CRC-32：每个字节一次查表，读内存密集。用法：crc32 [rounds] */
+/* Table-driven CRC-32: one table lookup per byte, memory-read heavy. Usage: crc32 [rounds] */
 #include "rt.h"
 
 static uint32_t table[256];

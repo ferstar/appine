@@ -1,15 +1,17 @@
-# podman：在 appine 里跑容器。vfs 存储驱动（没有 overlayfs）、host 网络（没有 veth、
-# iptables）、不用 cgroup（只读）。仓库要另建：scripts/survey -s target/survey/podman podman
-# 原生对照：scripts/survey -n <装了 podman 的 alpine:3.24 镜像> podman，SURVEY_DOCKER_OPTS=--privileged
-# （docs/rounds/157-container-survey.md）
+# podman: runs containers inside appine. The vfs storage driver (no overlayfs), host networking (no
+# veth, iptables), no cgroups (read-only). The store must be created separately: scripts/survey -s
+# target/survey/podman podman
+# Native comparison: scripts/survey -n <an alpine:3.24 image with podman installed> podman,
+# SURVEY_DOCKER_OPTS=--privileged (docs/rounds/157-container-survey.md)
 exec 2>&1
 [ -x /usr/bin/podman ] || apk add -q podman
-# runc 与 crun 冲突，装了 runc 会换掉 crun；没有 cgroup 时 podman 也不让用 runc
+# runc conflicts with crun, and installing runc replaces crun; without cgroups podman does not allow
+# runc either
 [ -x /usr/bin/crun ] || apk add -q crun
 sed -i 's/^driver = .*/driver = "vfs"/' /etc/containers/storage.conf
 P="podman --runtime crun --cgroup-manager cgroupfs"
 R="--rm --network host --cgroups disabled"
-# 上一次留下的容器、卷、镜像
+# Containers, volumes and images left by the previous run
 podman rm -af >/dev/null 2>&1; podman volume rm -af >/dev/null 2>&1; podman rmi -f demo demo2 >/dev/null 2>&1
 rm -f /root/demo.tar
 step() { echo; echo "== $*"; }

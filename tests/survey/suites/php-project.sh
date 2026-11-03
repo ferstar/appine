@@ -1,4 +1,5 @@
-# PHP 的大项目：composer 新建 Laravel 项目（几千个文件），运行自带的测试、artisan、内置服务器
+# A big PHP project: composer creates a Laravel project (thousands of files), then its bundled
+# tests, artisan, the built-in server
 cd /tmp; rm -rf lara; s=$(date +%s)
 composer create-project -q --no-interaction laravel/laravel lara >/tmp/composer.log 2>&1; echo "create-project: $? ($(( $(date +%s) - s ))s)"; tail -3 /tmp/composer.log
 cd lara || exit 1; php artisan --version; find vendor -name '*.php' | wc -l

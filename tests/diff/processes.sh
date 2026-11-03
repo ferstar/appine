@@ -1,4 +1,4 @@
-# fork、管道、等待子进程、信号和作业的退出状态
+# fork, pipes, waiting for child processes, signals, and the exit status of jobs
 ( for i in 1 2 3 4 5 6; do (echo "child $i") & done; wait ) | sort
 sh -c 'exit 7'; echo "status $?"
 sh -c 'kill -TERM $$'; echo "status $?"

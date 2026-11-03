@@ -1,5 +1,5 @@
-# ptrace 和 process_vm_readv/writev：一个小跟踪器逐项检查停住、继续、事件和寄存器，再用
-# strace 跟踪几个程序
+# ptrace and process_vm_readv/writev: a small tracer checks stops, continues, events and registers
+# one by one, then strace traces a few programs
 set -e
 cd /tmp
 cat > tracer.c <<'C'
@@ -28,7 +28,7 @@ cat > tracer.c <<'C'
 #define NT_ARM_HW_BREAK 0x402
 #endif
 
-/* aarch64 的 user_pt_regs */
+/* aarch64's user_pt_regs */
 struct regs {
     unsigned long long x[31], sp, pc, pstate;
 };
@@ -64,8 +64,8 @@ static void regs(pid_t pid, struct regs *r, int set)
         perror("regset");
 }
 
-/* /proc/<pid>/status 的 State 和 TracerPid 是不是自己；在运行的进程的状态取决于调度，
-   不打印 */
+/* State in /proc/<pid>/status, and whether its TracerPid is us; the state of a running process
+   depends on scheduling, so it is not printed */
 static void status(pid_t pid, int show_state)
 {
     char path[64], line[128], state[64] = "";
@@ -81,8 +81,8 @@ static void status(pid_t pid, int show_state)
            tracer == getpid() ? "me" : tracer == 0 ? "nobody" : "other");
 }
 
-/* 系统调用的入口和出口：GET_SYSCALL_INFO、x7、改返回值、跳过系统调用，改了返回值就
-   PTRACE_DETACH */
+/* System call entry and exit: GET_SYSCALL_INFO, x7, changing the return value, skipping the
+   system call, and PTRACE_DETACH after changing the return value */
 static void syscalls(void)
 {
     printf("== syscall stops\n");
@@ -133,7 +133,7 @@ static void syscalls(void)
                 printf("enter kill(%lld, %lld): size %ld message %lu x7 %llu sp %s\n",
                        (long long)info.entry.args[0], (long long)info.entry.args[1], r, msg, g.x[7],
                        info.stack_pointer == g.sp ? "ok" : "differs");
-                /* 跳过它：编号改成 -1，返回值 77 */
+                /* Skip it: the number changed to -1, return value 77 */
                 int no = -1;
                 struct iovec iov = {&no, sizeof no};
                 ptrace(PTRACE_SETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov);
@@ -145,12 +145,13 @@ static void syscalls(void)
                 printf("exit getppid: size %ld message %lu x7 %llu rval is parent %d error %d\n", r, msg, g.x[7],
                        info.exit.rval == getpid(), info.exit.is_error);
                 g.x[0] = 4242;
-                g.x[7] = 99; /* 跟踪者改不了 x7 */
+                g.x[7] = 99; /* the tracer cannot change x7 */
                 regs(pid, &g, 1);
             } else if (last == SYS_getppid && getppids == 3) {
                 g.x[0] = 1234;
                 regs(pid, &g, 1);
-                /* 子进程放开之后马上打印自己那一行：等它退出再打印，两行的先后才固定 */
+                /* The child prints its own line as soon as it is released: printing only after it
+                 * exits keeps the order of the two lines fixed */
                 r = ptrace(PTRACE_DETACH, pid, 0, 0);
                 st = wait_for(pid);
                 printf("detach %ld\n", r);
@@ -164,7 +165,7 @@ static void syscalls(void)
     }
 }
 
-/* PTRACE_O_TRACEEXEC，以及不用它时 execve 之后的 SIGTRAP */
+/* PTRACE_O_TRACEEXEC, and the SIGTRAP after execve without it */
 static void exec_events(void)
 {
     printf("== exec\n");
@@ -191,7 +192,7 @@ static void exec_events(void)
     }
 }
 
-/* PTRACE_SEIZE、PTRACE_INTERRUPT、fork 之后跟进新进程、PTRACE_EVENT_EXIT */
+/* PTRACE_SEIZE, PTRACE_INTERRUPT, following the new process after fork, PTRACE_EVENT_EXIT */
 static void seize_fork(void)
 {
     printf("== seize and fork\n");
@@ -230,7 +231,8 @@ static void seize_fork(void)
     printf(", status %s\n", describe(msg));
     ptrace(PTRACE_CONT, g, 0, 0);
     printf("grandchild: %s\n", describe(wait_for(g)));
-    /* 孙进程退出了，子进程收到 SIGCHLD：被跟踪的线程先停下来让跟踪者看 */
+    /* The grandchild exited and the child gets SIGCHLD: the traced thread stops first for the
+     * tracer to see */
     ptrace(PTRACE_CONT, pid, 0, 0);
     while (st = wait_for(pid), WIFSTOPPED(st) && st >> 16 == 0) {
         printf("child gets a signal: %s\n", describe(st));
@@ -243,9 +245,9 @@ static void seize_fork(void)
     printf("child: %s\n", describe(wait_for(pid)));
 }
 
-/* 用 PTRACE_CONT 继续、停在系统调用中途的 fork 事件上时改用 PTRACE_SYSCALL：与 Linux
-   一样停在这个系统调用（clone）的出口，入口没有停过也一样；NT_ARM_SYSTEM_CALL 两次都是
-   clone 的编号 */
+/* Continue with PTRACE_CONT, and on a fork event stopped in the middle of a system call switch to
+   PTRACE_SYSCALL: as on Linux it stops at the exit of this system call (clone), even though the
+   entry never stopped; NT_ARM_SYSTEM_CALL gives clone's number both times */
 static int syscall_number(pid_t pid)
 {
     int nr = -2;
@@ -294,8 +296,8 @@ static void event_then_syscall(void)
     printf("child: %s\n", describe(st));
 }
 
-/* group-stop：SEIZE 时报告成 PTRACE_EVENT_STOP，PTRACE_LISTEN 等 SIGCONT；ATTACH 时
-   group-stop 没有 siginfo */
+/* group-stop: reported as PTRACE_EVENT_STOP with SEIZE, and PTRACE_LISTEN waits for SIGCONT;
+   with ATTACH group-stop has no siginfo */
 static void group_stop(void)
 {
     printf("== group stop\n");
@@ -351,16 +353,16 @@ static void group_stop(void)
     printf("end: %s\n", describe(wait_for(pid)));
 }
 
-/* 跟踪一个已经停住的进程：报告停住它的信号（这里是 SIGTSTP），父进程已经用 wait 取走了
-   停止事件也一样 */
+/* Tracing an already stopped process: the signal that stopped it (SIGTSTP here) is reported,
+   also when the parent has already collected the stop event with wait */
 static void stopped_attach(void)
 {
     printf("== attach to a stopped process\n");
     for (int seize = 0; seize < 2; seize++) {
         pid_t pid = fork();
         if (pid == 0) {
-            /* 自己一个进程组：父进程在同一会话的另一个进程组里，不是孤儿进程组，SIGTSTP 不会
-               被丢掉 */
+            /* A process group of its own: the parent is in another process group of the same
+               session, so it is not an orphaned process group, and SIGTSTP is not discarded */
             setpgid(0, 0);
             raise(SIGTSTP);
             _exit(6);
@@ -385,7 +387,8 @@ static void stopped_attach(void)
             ptrace(PTRACE_CONT, pid, 0, 0);
             printf("  then: %s\n", describe(wait_for(pid)));
         } else {
-            /* 然后是 ATTACH 发的 SIGSTOP；不投递它，线程组虽然停着，被跟踪的线程照常执行 */
+            /* Then the SIGSTOP sent by ATTACH; it is not delivered, and although the thread group
+             * is stopped, the traced thread runs as usual */
             ptrace(PTRACE_CONT, pid, 0, 0);
             printf("  then: %s\n", describe(wait_for(pid)));
         }
@@ -394,9 +397,10 @@ static void stopped_attach(void)
     }
 }
 
-/* 跟踪者不是父进程（是祖父进程，Yama 也允许）：被跟踪的进程结束之后先只报告给跟踪者，
-   它用 wait 取走之前父进程等不到、也没有收到 SIGCHLD，取走之后父进程才能回收；跟踪者
-   没取走就退出时交给父进程 */
+/* The tracer is not the parent (it is the grandparent, which Yama also allows): after the tracee
+   ends it is first reported only to the tracer, and until the tracer collects it with wait the
+   parent cannot wait for it and gets no SIGCHLD; only after that can the parent reap it; if the
+   tracer exits without collecting it, it is handed to the parent */
 static void foreign_tracer(void)
 {
     printf("== tracer that is not the parent\n");
@@ -449,7 +453,7 @@ static void foreign_tracer(void)
     waitpid(parent, &st, 0);
     printf("parent: %s\n", describe(st));
 
-    /* 跟踪者（祖父进程）没取走就退出了 */
+    /* The tracer (the grandparent) exited without collecting it */
     int done[2];
     pipe(done);
     pid_t tracer = fork();
@@ -486,7 +490,7 @@ static void foreign_tracer(void)
     printf("tracer: %s\n", describe(st));
 }
 
-/* 被跟踪的进程忽略的信号也挂起，跟踪者看得到它 */
+/* Signals the tracee ignores are also left pending, and the tracer sees them */
 static void ignored(void)
 {
     printf("== ignored signal\n");
@@ -517,7 +521,8 @@ static void *thread_main(void *arg)
     return 0;
 }
 
-/* PTRACE_O_TRACECLONE：新线程挂着 SIGSTOP 开始，退出时单独报告 */
+/* PTRACE_O_TRACECLONE: a new thread starts with SIGSTOP pending, and its exit is reported
+ * separately */
 static void threads(void)
 {
     printf("== threads\n");
@@ -545,7 +550,7 @@ static void threads(void)
     printf("process: %s\n", describe(wait_for(pid)));
 }
 
-/* PTRACE_O_EXITKILL：跟踪者退出时被跟踪的进程被结束 */
+/* PTRACE_O_EXITKILL: the tracee is killed when the tracer exits */
 static void exitkill(void)
 {
     printf("== exitkill\n");
@@ -573,7 +578,7 @@ static void exitkill(void)
 
 static char message[32] = "hello from the child";
 
-/* process_vm_readv/writev 和 PTRACE_PEEKDATA：fork 之后子进程里同一个地址 */
+/* process_vm_readv/writev and PTRACE_PEEKDATA: the same address in the child after fork */
 static void memory(void)
 {
     printf("== memory\n");
@@ -628,7 +633,7 @@ static long __attribute__((noinline)) do_svc(void)
     return x0;
 }
 
-/* 单步到下一个 SIGTRAP，打印 pc 相对 `base` 的位置和 siginfo */
+/* Single-step to the next SIGTRAP, and print pc's position relative to `base` and the siginfo */
 static struct regs step(pid_t pid, void *base)
 {
     struct regs r;
@@ -642,8 +647,9 @@ static struct regs step(pid_t pid, void *base)
     return r;
 }
 
-/* 断点（PTRACE_POKETEXT 和 /proc/<pid>/mem 写进 brk）、PTRACE_SINGLESTEP（普通指令和 svc）、
-   /proc/<pid>/auxv，以及不能强制写入的只读共享映射 */
+/* Breakpoints (brk written with PTRACE_POKETEXT and through /proc/<pid>/mem), PTRACE_SINGLESTEP
+   (ordinary instructions and svc), /proc/<pid>/auxv, and read-only shared mappings that cannot
+   be force-written */
 static void breakpoints(void)
 {
     printf("== breakpoints and single step\n");
@@ -653,7 +659,8 @@ static void breakpoints(void)
     pid_t pid = fork();
     if (pid == 0) {
         ptrace(PTRACE_TRACEME, 0, 0, 0);
-        /* 先执行过：Tier 1 已经翻译了它，写进断点之后要作废 */
+        /* Executed first: Tier 1 has already translated it, and writing the breakpoint must
+         * invalidate that */
         for (int i = 0; i < 100; i++)
             steps();
         raise(SIGSTOP);
@@ -680,7 +687,7 @@ static void breakpoints(void)
         r = step(pid, steps);
     printf("  x9 %llu\n", r.x[9]);
 
-    /* 经由 /proc/<pid>/mem 在 do_svc 下断点 */
+    /* Set a breakpoint at do_svc through /proc/<pid>/mem */
     char path[64];
     snprintf(path, sizeof path, "/proc/%d/mem", pid);
     int mem = open(path, O_RDWR);
@@ -700,7 +707,7 @@ static void breakpoints(void)
         r = step(pid, do_svc);
     printf("  x0 is the pid %d\n", r.x[0] == (unsigned long long)pid);
 
-    /* 只读的共享映射不能强制写入 */
+    /* A read-only shared mapping cannot be force-written */
     errno = 0;
     printf("poke read-only shared %ld %s\n", ptrace(PTRACE_POKEDATA, pid, shared, 0L), strerror(errno));
     errno = 0;
@@ -793,7 +800,7 @@ static void errors(void)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    /* 等不到该来的停止时不要一直卡着 */
+    /* Do not hang forever when an expected stop never comes */
     alarm(60);
     syscalls();
     exec_events();
@@ -814,7 +821,8 @@ C
 gcc -O1 -o tracer tracer.c -lpthread
 ./tracer
 
-# strace：地址、pid、环境变量个数在两边不同，归一化之后比
+# strace: addresses, pids and the number of environment variables differ between the two sides,
+# so the outputs are compared after normalization
 norm() {
     sed -E 's/0x[0-9a-f]+/ADDR/g; s/\/\* [0-9]+ vars \*\//VARS/; s/(si_pid|si_uid)=[0-9]+/\1=N/g' |
         sed -E 's/^(getpid|getppid|gettid|set_tid_address|clone|wait4)\((.*)\) += [0-9]+$/\1(\2) = PID/' |
@@ -845,7 +853,7 @@ env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -o st1 cat text
 norm < st1
 echo "strace sig: $(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -o st2 ./sig; echo $?)"
 norm < st2
-# -f：每个进程一个文件，按 pid 的顺序
+# -f: one file per process, in pid order
 rm -rf st3 && mkdir st3
 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -ff -e trace=process -e signal=none -o st3/t sh -c 'true; ls /dev/null >/dev/null; exit 2' || echo "strace -f: $?"
 for f in $(ls st3 | sort -t. -k2 -n); do
@@ -853,9 +861,11 @@ for f in $(ls st3 | sort -t. -k2 -n); do
     norm < st3/$f
 done
 
-# 硬件观察点和断点（NT_ARM_HW_WATCH、NT_ARM_HW_BREAK）：槽数、非法的控制字、读回规范化的
-# 控制字；写、读、不对齐的一个字节的观察点停在访问之前（数据还没写），si_code 是
-# TRAP_HWBKPT、si_addr 是访问的地址；停用之后单步完成访问；断点停在指令上
+# Hardware watchpoints and breakpoints (NT_ARM_HW_WATCH, NT_ARM_HW_BREAK): slot counts, invalid
+# control words, reading back canonicalized control words; write, read and unaligned one-byte
+# watchpoints stop before the access (the data is not written yet), with si_code TRAP_HWBKPT and
+# si_addr the accessed address; after disabling, a single step completes the access; a
+# breakpoint stops at the instruction
 cat > hw.c <<'C'
 #define _GNU_SOURCE
 #include <elf.h>
@@ -932,7 +942,7 @@ int main(void)
     uint32_t bad[] = {ctrl(0xff, 0), ctrl(0x5, 2), 0x1};
     for (int i = 0; i < 3; i++)
         printf("bad ctrl %#x: %d\n", bad[i], setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &bad[i]));
-    uint32_t c = ctrl(0xff, 2); /* 写 */
+    uint32_t c = ctrl(0xff, 2); /* write */
     printf("set store watch: %d\n", setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c));
     iov.iov_len = sizeof d;
     ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_WATCH, &iov);
@@ -943,11 +953,11 @@ int main(void)
     setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c);
     ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
     report(pid, "stepped");
-    c = ctrl(0xff, 1); /* 读 */
+    c = ctrl(0xff, 1); /* read */
     setdbg(pid, NT_ARM_HW_WATCH, 1, &a, &c);
     ptrace(PTRACE_CONT, pid, 0, 0);
     report(pid, "load watch");
-    /* 不对齐的一个字节：地址按 8 对齐，BAS 选第 3 个字节 */
+    /* An unaligned single byte: the address is aligned to 8, and BAS selects byte 3 */
     uint64_t b8 = (uint64_t)&bytes[3] & ~7ul;
     uint32_t cb = ctrl(1u << ((uint64_t)&bytes[3] & 7), 2);
     printf("set byte watch: %d\n", setdbg(pid, NT_ARM_HW_WATCH, 1, &b8, &cb));
@@ -972,7 +982,8 @@ int main(void)
 }
 C
 gcc -O1 -o hw hw.c && ./hw
-# 原子的读改写（LSE）也算读；16 字节的 SIMD 存储碰到后一半时报告访问的起点
+# Atomic read-modify-writes (LSE) also count as reads; a 16-byte SIMD store that touches the
+# second half reports the start of the access
 cat > hw3.c <<'C'
 #define _GNU_SOURCE
 #include <elf.h>
@@ -1000,8 +1011,9 @@ static void watch(pid_t pid, uint64_t addr, uint32_t bas, uint32_t type)
         perror("SETREGSET");
 }
 
-/* si_addr 要落在这条指令访问的 [start, start + len) 里。访问跨出观察的范围时报告哪个
- * 地址由核决定：Apple 的核报告访问的起点，CI 上的 Neoverse N2 报告的不是起点 */
+/* si_addr must fall within [start, start + len) of this instruction's access. Which address is
+ * reported when the access crosses out of the watched range is up to the core: Apple cores report
+ * the start of the access, the Neoverse N2 on CI reports one that is not the start */
 static void report(pid_t pid, const char *what, volatile void *start, size_t len)
 {
     int st;
@@ -1025,12 +1037,12 @@ int main(void)
     }
     int st;
     waitpid(pid, &st, 0);
-    /* 只读的观察点：原子的读改写也算读 */
+    /* A watchpoint for reads only: atomic read-modify-writes also count as reads */
     watch(pid, (uint64_t)&atom & ~7ull, 0xf << ((uint64_t)&atom & 7), 1);
     ptrace(PTRACE_CONT, pid, 0, 0);
     report(pid, "atomic add, load watch", &atom, sizeof atom);
     watch(pid, 0, 0, 0);
-    /* 16 字节的 SIMD 存储碰到后一半 */
+    /* A 16-byte SIMD store that touches the second half */
     watch(pid, (uint64_t)&vec[2], 0xff, 2);
     ptrace(PTRACE_CONT, pid, 0, 0);
     report(pid, "simd store", &vec[1], 16);
@@ -1043,9 +1055,10 @@ int main(void)
 C
 gcc -O1 -o hw3 hw3.c && ./hw3
 
-# 带着信号单步：停在处理函数的第一条指令上（ptrace_notify 的 SIGTRAP，si_code 也是
-# SIGTRAP），再单步才执行它；sigsuspend 里停住时 GETSIGMASK 读到的是原来的屏蔽字，
-# SETSIGMASK 之后处理函数返回时不再恢复原来的
+# Single-stepping with a signal: stops at the first instruction of the handler (ptrace_notify's
+# SIGTRAP, with si_code also SIGTRAP), and only the next single step executes it; when stopped in
+# sigsuspend, GETSIGMASK reads the original mask, and after SETSIGMASK the handler's return no
+# longer restores the original one
 cat > sigstep.c <<'C'
 #define _GNU_SOURCE
 #include <elf.h>
@@ -1101,7 +1114,7 @@ int main(void)
         ptrace(PTRACE_TRACEME, 0, 0, 0);
         raise(SIGSTOP);
         raise(SIGUSR1);
-        /* sigsuspend：临时屏蔽 SIGUSR2 以外再加 SIGINT */
+        /* sigsuspend: temporarily block SIGINT in addition to SIGUSR2 */
         sigset_t s;
         sigemptyset(&s);
         sigaddset(&s, SIGINT);
@@ -1114,9 +1127,10 @@ int main(void)
     siginfo_t si;
     wait_stop(pid, &si);
     ptrace(PTRACE_CONT, pid, 0, 0);
-    int sig = wait_stop(pid, &si); /* raise(SIGUSR1) 的信号投递停止 */
+    int sig = wait_stop(pid, &si); /* the signal-delivery stop of raise(SIGUSR1) */
     printf("stop %d\n", sig);
-    /* 带着信号单步：停在处理函数的第一条指令上（还没执行），还是执行了它之后 */
+    /* Single-stepping with a signal: does it stop at the handler's first instruction (not yet
+     * executed), or after executing it */
     ptrace(PTRACE_SINGLESTEP, pid, 0, SIGUSR1);
     sig = wait_stop(pid, &si);
     printf("step into handler: sig %d code %d at %s\n", sig, si.si_code, where(pc_of(pid)));
@@ -1124,7 +1138,8 @@ int main(void)
     sig = wait_stop(pid, &si);
     printf("next step: sig %d code %d at %s\n", sig, si.si_code, where(pc_of(pid)));
     ptrace(PTRACE_CONT, pid, 0, 0);
-    /* 子进程停在 sigsuspend 里；发 SIGUSR1 打断它，在信号投递停止里看屏蔽字 */
+    /* The child waits in sigsuspend; interrupt it with SIGUSR1 and look at the mask in the
+     * signal-delivery stop */
     usleep(100000);
     kill(pid, SIGUSR1);
     sig = wait_stop(pid, &si);
@@ -1132,7 +1147,8 @@ int main(void)
     ptrace(PTRACE_GETSIGMASK, pid, 8, &mask);
     printf("in sigsuspend: stop %d, mask has INT %d USR2 %d\n", sig, !!(mask & (1ull << (SIGINT - 1))),
            !!(mask & (1ull << (SIGUSR2 - 1))));
-    /* 跟踪者改了屏蔽字：处理函数返回之后是它，不再恢复 sigsuspend 之前的 */
+    /* The tracer changed the mask: after the handler returns that mask is in effect, and the one
+     * from before sigsuspend is no longer restored */
     mask = 1ull << (SIGQUIT - 1);
     ptrace(PTRACE_SETSIGMASK, pid, 8, &mask);
     ptrace(PTRACE_CONT, pid, 0, SIGUSR1);
@@ -1144,8 +1160,9 @@ int main(void)
 C
 gcc -O1 -o sigstep sigstep.c && ./sigstep
 
-# /proc/<pid>/mem 拿的是打开时的地址空间，execve 之后旧的 fd 读到 EOF；auxv、environ、
-# mem、maps 打开时要能跟踪那个进程（同一个用户、不可 dump 的打不开）
+# /proc/<pid>/mem holds the address space from when it was opened, so after execve the old fd
+# reads EOF; opening auxv, environ, mem and maps requires being able to trace that process (same
+# user; a non-dumpable one cannot be opened)
 cat > procmem.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -1163,7 +1180,8 @@ static volatile char secret[] = "before exec";
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    /* /proc/<pid>/mem 拿的是打开时的地址空间：子进程 execve 之后，旧的 fd 读到 EOF */
+    /* /proc/<pid>/mem holds the address space from when it was opened: after the child execves,
+     * the old fd reads EOF */
     int go[2];
     pipe(go);
     pid_t pid = fork();
@@ -1188,7 +1206,8 @@ int main(void)
     printf("reopen after exec: %d\n", fd2 >= 0);
     waitpid(pid, NULL, 0);
 
-    /* auxv、environ：同一个用户的进程不可 dump 时打不开（要能以只读方式跟踪它） */
+    /* auxv, environ: cannot be opened when a process of the same user is not dumpable (it must be
+     * possible to trace it in read mode) */
     int ready[2];
     pipe(ready);
     pid = fork();
@@ -1222,8 +1241,9 @@ int main(void)
 C
 gcc -O1 -o procmem procmem.c && ./procmem
 
-# 跟踪者不 detach 就退出：停住已经被 wait 取走的，信号投递停止里的信号丢掉，进程继续运行
-# （delve attach 之后不 detach 就退出）；还没取走的照常投递；group-stop 里的仍然停着
+# The tracer exits without detaching: if the stop was already collected by wait, the signal in a
+# signal-delivery stop is discarded and the process keeps running (delve exits after attach
+# without detaching); one not yet collected is delivered as usual; one in group-stop stays stopped
 cat > implicit.c <<'C'
 #include <signal.h>
 #include <stdio.h>
@@ -1251,14 +1271,15 @@ static char state(pid_t p)
     return c;
 }
 
-/* sig: 跟踪者先让它继续，再发 sig，等到 sig 的信号投递停止之后退出（unwaited 时不 wait，
- * 等 0.1 秒就退出）；0 表示停在 attach 的 SIGSTOP 上；-1 表示把 SIGSTOP 注入回去，等它进入
- * group-stop 之后退出 */
+/* sig: the tracer first lets it continue, then sends sig, and exits after the signal-delivery
+ * stop for sig (when unwaited, it does not wait, and exits after 0.1 seconds); 0 means stopping
+ * at the SIGSTOP of attach; -1 means injecting the SIGSTOP back and exiting after it enters
+ * group-stop */
 static void run(const char *what, int sig, int unwaited)
 {
     pid_t child = fork();
     if (child == 0) {
-        /* Yama 的 ptrace_scope 是 1 时，兄弟进程要被允许才能 attach */
+        /* When Yama's ptrace_scope is 1, a sibling process must be allowed before it can attach */
         prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
         signal(SIGUSR1, on_usr1);
         for (;;)
@@ -1294,7 +1315,8 @@ static void run(const char *what, int sig, int unwaited)
     if (waitpid(child, &st, WNOHANG) == child && WIFSIGNALED(st))
         printf("  after tracer exit: killed by %s\n", strsignal(WTERMSIG(st)));
     else {
-        /* 它在 usleep 的循环里，读到 R 还是 S 看时机：只看停没停住 */
+        /* It is in a usleep loop, so whether R or S is read depends on timing: only check whether
+         * it is stopped */
         char c = state(child);
         printf("  after tracer exit: %s\n", c == 'T' || c == 't' ? "stopped" : c == 'R' || c == 'S' ? "running" : "?");
     }

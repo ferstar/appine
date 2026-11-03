@@ -1,4 +1,5 @@
-# Rust 的大项目：ripgrep 的 release 构建和全部测试（集成测试会起几百次 rg）
+# A big Rust project: ripgrep's release build and all its tests (the integration tests start rg
+# hundreds of times)
 cd /tmp; [ -d ripgrep ] || git clone -q --depth 1 https://github.com/BurntSushi/ripgrep
 cd ripgrep || exit 1; git log -1 --format='ripgrep %h %cs'
 s=$(date +%s); cargo build -q --release -j4 2>&1 | tail -3; echo "build: $? ($(( $(date +%s) - s ))s)"

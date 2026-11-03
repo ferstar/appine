@@ -1,14 +1,17 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add SYS_TIME --security-opt apparmor=unconfined
-# 容器运行时（podman、crun、docker、runc）用到的内核接口（docs/rounds/157-container-survey.md
-# 起）：capget 探测版本、开机时的命名空间里拉起已经起着的 lo、合成文件系统根目录的 inode
-# 编号、线程目录里的 fd；不带只读地挂 cgroup2；mqueue 文件系统；经由 fd 执行 memfd 和已经删除的文件；
-# time 命名空间（原生一侧要 CAP_SYS_TIME 才能写 timens_offsets，用例不改宿主的时间）；
-# 写数字的 /proc 文件带着结尾的 NUL
+# Kernel interfaces used by container runtimes (podman, crun, docker, runc), from
+# docs/rounds/157-container-survey.md on: capget version probing, bringing up an already-up lo in
+# the boot-time namespace, inode numbers of synthetic filesystem roots, fds in thread directories;
+# mounting cgroup2 without read-only; the mqueue filesystem; executing memfds and deleted files
+# through fds; time namespaces (the native side needs CAP_SYS_TIME to write timens_offsets, and
+# the test case does not change the host's time); /proc files that take numbers being written
+# with a trailing NUL
 set -e
 cd /tmp
 
-# capget：数据指针为空时只是探测版本，不认识的版本也返回 0 并写回内核的版本，不看 pid
-# （moby/sys/capability 这样取版本）；有数据指针时才查版本、pid
+# capget: with a null data pointer it only probes the version; an unknown version also returns 0
+# and writes back the kernel's version, without looking at pid (moby/sys/capability gets the
+# version this way); only with a data pointer are the version and pid checked
 cat > capget.c <<'C'
 #include <errno.h>
 #include <stdio.h>
@@ -16,7 +19,7 @@ cat > capget.c <<'C'
 #include <sys/syscall.h>
 #include <unistd.h>
 
-// 仓库里没有内核的头文件，照 linux/capability.h 定义
+// The store has no kernel headers, so define them as in linux/capability.h
 #define _LINUX_CAPABILITY_VERSION_3 0x20080522
 struct __user_cap_header_struct {
     unsigned version;
@@ -50,8 +53,10 @@ int main(void)
 C
 gcc -D_GNU_SOURCE -o capget capget.c && ./capget
 
-# 开机时的网络命名空间里修改 lo：什么也不改的成功（dockerd 给默认网络沙箱拉起 lo），错误码
-# 照 Linux 6.1 的 rtnl_setlink、__rtnl_newlink。真要改的请求在原生上会改掉容器的 lo，不比
+# Changing lo in the boot-time network namespace: success when nothing is changed (dockerd brings
+# up lo for the default network sandbox), and error codes as in Linux 6.1's rtnl_setlink and
+# __rtnl_newlink. Requests that really change something would change the container's lo
+# natively, so they are not compared
 cat > nlset.c <<'C'
 #include <errno.h>
 #include <net/if.h>
@@ -60,7 +65,7 @@ cat > nlset.c <<'C'
 #include <sys/socket.h>
 #include <unistd.h>
 
-// 照 linux/netlink.h、linux/rtnetlink.h 定义
+// Defined as in linux/netlink.h and linux/rtnetlink.h
 #define NETLINK_ROUTE 0
 #define NLM_F_REQUEST 1
 #define NLM_F_ACK 4
@@ -173,17 +178,18 @@ ip link set lo up && echo "ip link set lo up: ok"
 ip link set dev lo mtu 65536 && echo "ip link set lo mtu 65536: ok"
 ip link set nosuch0 up 2>&1 || true
 
-# 合成文件系统根目录的 inode 编号是 1（runc 打开 /proc 之后检查它）。docker 的
-# /sys/fs/cgroup 是 cgroup 命名空间里的子目录，不比
+# The inode number of a synthetic filesystem's root directory is 1 (runc checks it after opening
+# /proc). docker's /sys/fs/cgroup is a subdirectory in a cgroup namespace, so it is not compared
 stat -c '%n %i' /proc /sys /dev/pts
 mkdir -p mnt/proc mnt/sys
 mount -t proc proc mnt/proc && mount -t sysfs sysfs mnt/sys
 stat -c '%n %i' mnt/proc mnt/sys
 umount mnt/proc mnt/sys
 
-# 线程目录里的 fd、fdinfo：runc 照 pathrs-lite 的做法，经由 openat2 从 /proc 打开
-# thread-self/fd/（不跟随魔法链接、不越过挂载），再读里面的链接。主线程、另一个线程，以及
-# 在新的 pid 命名空间里（runc init 那样，看到的还是外面的 procfs）
+# fds and fdinfo in thread directories: runc, following pathrs-lite, opens thread-self/fd/ from
+# /proc through openat2 (not following magic links, not crossing mounts), then reads the links
+# inside. The main thread, another thread, and in a new pid namespace (as runc init does, which
+# still sees the outer procfs)
 cat > threadfd.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
@@ -196,7 +202,7 @@ cat > threadfd.c <<'C'
 #include <sys/wait.h>
 #include <unistd.h>
 
-// 照 linux/openat2.h 定义
+// Defined as in linux/openat2.h
 struct open_how {
     unsigned long long flags, mode, resolve;
 };
@@ -258,9 +264,11 @@ C
 gcc -D_GNU_SOURCE -pthread -o threadfd threadfd.c && ./threadfd
 ls /proc/$$/task/$$/ | grep -x 'fd\|fdinfo'
 
-# cgroup2 可以不带只读挂上（crun 给容器挂 /sys/fs/cgroup 时这样挂），之后 bind 地重新挂成
-# 只读、可写。写文件、建子 cgroup 在原生上真会改，不比；不带 bind 的 remount 改的是超级块，
-# 原生上会改到 docker 给容器的 cgroup，也不做
+# cgroup2 can be mounted without read-only (as crun mounts /sys/fs/cgroup for containers), and
+# then remounted read-only or writable with bind. Writing files and creating child cgroups would
+# really change things natively, so they are not compared; a remount without bind changes the
+# superblock, which natively would change the cgroup docker gives the container, so it is not
+# done either
 mkdir -p mnt/cg
 mount -t cgroup2 cgroup2 mnt/cg && echo "cgroup2 rw: ok"
 opts() { awk -v p="$PWD/$1" '$5 == p {split($6, o, ","); print $5, o[1]}' /proc/self/mountinfo; }
@@ -272,11 +280,13 @@ python3 -c 'import os; print("ST_RDONLY", os.statvfs("mnt/cg").f_flag & 1)'
 mount -o remount,bind,rw mnt/cg && opts mnt/cg
 umount mnt/cg
 
-# mqueue 文件系统（crun 给每个容器挂 /dev/mqueue）：列出的是挂上它的进程所在的 IPC 命名
-# 空间里的 POSIX 消息队列。根目录 01777、大小按队列数；队列文件读到状态行；在里面新建的
-# 是队列（默认的大小），fd 可以当 mq 描述符用；unlink 删除队列（粘滞位：别人的是 EPERM，
-# libc 的 mq_unlink 换成 EACCES）；mkdir、mknod、symlink、rename 是 EPERM；同一个命名
-# 空间在自己的根上再挂是 EBUSY，新的 IPC 命名空间里是另一个实例
+# The mqueue filesystem (crun mounts /dev/mqueue for each container): it lists the POSIX message
+# queues in the IPC namespace of the process that mounted it. The root directory is 01777, its
+# size counts the queues; reading a queue file gives the status line; what is created inside is a
+# queue (default size), and its fd can be used as an mq descriptor; unlink removes the queue
+# (sticky bit: someone else's is EPERM, which libc's mq_unlink turns into EACCES); mkdir, mknod,
+# symlink and rename are EPERM; mounting again on its own root in the same namespace is EBUSY,
+# and in a new IPC namespace it is another instance
 mkdir -p mnt/mq mnt/mq2
 mount -t mqueue mqueue mnt/mq && echo "mqueue: ok"
 awk -v p="$PWD/mnt/mq" '$5 == p {for (i = 7; $i != "-"; i++) {}; split($6, o, ","); print "mountinfo", o[1], $(i + 1), $(i + 2)}' /proc/self/mountinfo
@@ -340,7 +350,7 @@ int main(void)
     close(fd);
     ls(D);
 
-    // 在文件系统里新建的是队列
+    // What is created in the filesystem is a queue
     int q2 = open(D "q2", O_CREAT | O_RDWR, 0666);
     show("open O_CREAT q2", q2);
     stat(D "q2", &st);
@@ -361,7 +371,7 @@ int main(void)
     stat(D, &dst);
     printf("dir: size %lld\n", (long long)dst.st_size);
 
-    // 元数据
+    // Metadata
     show("chmod q1 0600", chmod(D "q1", 0600));
     fstat(q1, &fst);
     printf("q1 mode via mq fd: %o\n", fst.st_mode);
@@ -376,7 +386,7 @@ int main(void)
     stat(D "q1", &st);
     printf("q1 times: %lld %lld\n", (long long)st.st_atime, (long long)st.st_mtime);
 
-    // 不支持的操作
+    // Unsupported operations
     show("mkdir", mkdir(D "d", 0755));
     show("mknod fifo", mknod(D "f", S_IFIFO | 0644, 0));
     show("symlink", symlink("q1", D "l"));
@@ -385,7 +395,7 @@ int main(void)
     show("unlink q1/", unlink(D "q1/"));
     show("unlink missing", unlink(D "nosuch"));
 
-    // 别人的队列：粘滞位
+    // Someone else's queue: the sticky bit
     fflush(stdout);
     pid_t c = fork();
     if (c == 0) {
@@ -409,7 +419,7 @@ int main(void)
     show("mq_open /q2 after unlink", mq_open("/q2", O_RDONLY));
     ls(D);
 
-    // 新的 IPC 命名空间里另外挂一个：是空的，设备号不同
+    // Another mount in a new IPC namespace: it is empty, with a different device number
     fflush(stdout);
     c = fork();
     if (c == 0) {
@@ -432,11 +442,12 @@ C
 gcc -D_GNU_SOURCE -o mqfs mqfs.c && ./mqfs
 umount mnt/mq2 2>/dev/null; umount mnt/mq
 
-# 经由 fd 执行 memfd 和已经删除的文件（runc 把自己复制进 memfd 再经由 /proc/self/fd/<n>
-# 执行，buildah 的 chroot 隔离用 fexecve）：fexecve（execveat 的 AT_EMPTY_PATH）、
-# execve("/proc/self/fd/<n>")；memfd 自己的 fd 不算写者（Linux 的 alloc_file_pseudo），经由
-# /proc 以写方式重新打开的算（ETXTBSY）；MFD_NOEXEC_SEAL 的执行不了。不比 comm：执行 fd
-# 时 Linux 6.8 用 fd 的编号，新内核改成文件名
+# Executing memfds and deleted files through fds (runc copies itself into a memfd and executes it
+# through /proc/self/fd/<n>, buildah's chroot isolation uses fexecve): fexecve (execveat's
+# AT_EMPTY_PATH), execve("/proc/self/fd/<n>"); the memfd's own fd does not count as a writer
+# (Linux's alloc_file_pseudo), but reopening it for writing through /proc does (ETXTBSY);
+# MFD_NOEXEC_SEAL ones cannot be executed. comm is not compared: when executing an fd Linux 6.8
+# uses the fd number, and newer kernels changed it to the file name
 cat > fdexec-hello.c <<'C'
 #include <stdio.h>
 #include <string.h>
@@ -484,7 +495,7 @@ static int copy_to(int fd)
     return n;
 }
 
-// 在子进程里执行，报告 execve 的错误或者程序的输出
+// Execute in a child process and report execve's error or the program's output
 static void run(const char *what, int how, int fd, const char *path)
 {
     fflush(stdout);
@@ -514,10 +525,10 @@ int main(void)
     snprintf(path, sizeof path, "/proc/self/fd/%d", m);
     run("memfd /proc/self/fd", 1, 0, path);
     run("memfd execveat AT_EMPTY_PATH", 2, m, NULL);
-    // 封住之后（runc 这样做）照样能执行
+    // Still executable after sealing (runc does this)
     fcntl(m, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
     run("sealed memfd", 0, m, NULL);
-    // 经由 /proc 以写方式重新打开的算写者
+    // Reopening for writing through /proc counts as a writer
     int m2 = memfd_create("hello2", MFD_CLOEXEC);
     copy_to(m2);
     snprintf(path, sizeof path, "/proc/self/fd/%d", m2);
@@ -526,12 +537,12 @@ int main(void)
     run("memfd reopened for write", 0, m2, NULL);
     close(w);
     run("memfd after closing the reopen", 0, m2, NULL);
-    // MFD_NOEXEC_SEAL：没有执行权限
+    // MFD_NOEXEC_SEAL: no execute permission
     int m3 = memfd_create("hello3", MFD_CLOEXEC | MFD_NOEXEC_SEAL);
     copy_to(m3);
     run("memfd MFD_NOEXEC_SEAL", 0, m3, NULL);
 
-    // 已经删除的普通文件
+    // A regular file already deleted
     int fd = open("/tmp/fdexec-copy", O_CREAT | O_TRUNC | O_RDWR, 0755);
     copy_to(fd);
     close(fd);
@@ -540,17 +551,17 @@ int main(void)
     run("deleted file fexecve", 0, fd, NULL);
     snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
     run("deleted file /proc/self/fd", 1, 0, path);
-    // 以写方式打开着的已经删除的文件：ETXTBSY
+    // A deleted file still open for writing: ETXTBSY
     int wf = open("/tmp/fdexec-copy2", O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0755);
     copy_to(wf);
     unlink("/tmp/fdexec-copy2");
     run("deleted file open for write", 0, wf, NULL);
-    // O_PATH 的 fd、还没有删除的文件
+    // An O_PATH fd, a file not yet deleted
     int p = open("/tmp/fdexec-hello", O_PATH | O_CLOEXEC);
     run("O_PATH fd", 2, p, NULL);
     int r = open("/tmp/fdexec-hello", O_RDONLY | O_CLOEXEC);
     run("regular file fexecve", 0, r, NULL);
-    // 不是普通文件
+    // Not a regular file
     int pipefd[2];
     pipe2(pipefd, O_CLOEXEC);
     run("pipe", 2, pipefd[0], NULL);
@@ -559,11 +570,14 @@ int main(void)
 C
 gcc -D_GNU_SOURCE -o fdexec fdexec.c && ./fdexec
 
-# time 命名空间（dockerd 看到 /proc/self/ns/time 就让 runc 建一个）：unshare(CLONE_NEWTIME)
-# 只建给子进程用的那个，偏移照抄、经由 /proc/<pid>/timens_offsets 设置，fork 出来的子进程
-# 进去之后不能再改；子进程看到的单调时钟、boottime、/proc/uptime、sysinfo、启动时间都加上
-# 偏移，绝对时刻的等待按偏移换算；setns 进去；线程、vfork 留在原来的里，execve 之后进新的
-# （Linux 6.2 起）。只比是否相差偏移、是否同一个命名空间，不比具体的时刻
+# Time namespaces (dockerd has runc create one when it sees /proc/self/ns/time):
+# unshare(CLONE_NEWTIME) creates only the one for children, with the offsets copied and set
+# through /proc/<pid>/timens_offsets, which can no longer be changed once a forked child has
+# entered it; the monotonic clock, boottime, /proc/uptime, sysinfo and start times the child sees
+# all include the offset, and waits for absolute times are converted by the offset; setns into
+# it; threads and vfork stay in the original one and enter the new one after execve (since Linux
+# 6.2). Only whether things differ by the offset and whether they are the same namespace is
+# compared, not the exact times
 cat > timens.c <<'C'
 #include <errno.h>
 #include <fcntl.h>
@@ -644,7 +658,7 @@ static void *blocked(void *arg)
 int main(int argc, char **argv)
 {
     if (argc == 3) {
-        // execve 之后的 vfork 子进程：进了给子进程用的那个
+        // The vfork child after execve: it has entered the one for children
         printf("after execve in the new ns: %d\n", ns_ino("/proc/self/ns/time") == (ino_t)atoll(argv[2]));
         return 0;
     }
@@ -665,7 +679,7 @@ int main(int argc, char **argv)
     set("one line", "7 3600 500000000");
     offsets("after one line");
 
-    // nobody 没有 CAP_SYS_TIME
+    // nobody has no CAP_SYS_TIME
     pid_t c = fork();
     if (c == 0) {
         setuid(65534);
@@ -691,13 +705,13 @@ int main(int argc, char **argv)
         struct sysinfo si;
         sysinfo(&si);
         printf("sysinfo uptime +3600: %d\n", si.uptime - si0.uptime >= 3600 && si.uptime - si0.uptime <= 3602);
-        // 启动时间（时钟滴答）也按 boottime 的偏移
+        // The start time (clock ticks) also follows the boottime offset
         unsigned long long start = 0;
         FILE *f = fopen("/proc/self/stat", "r");
         fscanf(f, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &start);
         fclose(f);
         printf("start time near uptime: %d\n", near(start / (double)sysconf(_SC_CLK_TCK), uptime()));
-        // 绝对时刻的等待按偏移换算，不会多等一天
+        // Waits for absolute times are converted by the offset, and do not wait an extra day
         struct timespec t;
         clock_gettime(CLOCK_MONOTONIC, &t);
         t.tv_nsec += 100000000;
@@ -747,7 +761,7 @@ int main(int argc, char **argv)
     set("after a child entered", "monotonic 1 0\n");
     printf("parent unchanged: %d\n", now(CLOCK_MONOTONIC) - m0 < 60);
 
-    // 线程留在原来的里；vfork 的子进程 execve 之后才进新的
+    // Threads stay in the original one; a vfork child enters the new one only after execve
     pthread_t th;
     pthread_create(&th, NULL, thread, &old);
     pthread_join(th, NULL);
@@ -760,7 +774,7 @@ int main(int argc, char **argv)
     }
     waitpid(v, NULL, 0);
 
-    // setns 进子进程所在的
+    // setns into the one the child is in
     char path[64];
     snprintf(path, sizeof path, "/proc/%d/ns/time", c);
     int nsfd = open(path, O_RDONLY);
@@ -779,9 +793,9 @@ int main(int argc, char **argv)
 C
 gcc -D_GNU_SOURCE -pthread -o timens timens.c && ./timens
 
-# 写数字的 /proc/<pid> 文件（oom_score_adj、coredump_filter）：runc 写 oom_score_adj 的值
-# 结尾带着 NUL（netlink 消息里的字符串），Linux 拷进 12 个字节的缓冲区、到 NUL 为止，按
-# kstrtoint 的基数 0 解析，超出 32 位是 ERANGE
+# /proc/<pid> files that take numbers (oom_score_adj, coredump_filter): the oom_score_adj value
+# runc writes ends with a NUL (a string from a netlink message), and Linux copies it into a
+# 12-byte buffer up to the NUL and parses it with kstrtoint base 0; beyond 32 bits it is ERANGE
 cat > procnum.c <<'C'
 #include <errno.h>
 #include <fcntl.h>

@@ -1,11 +1,13 @@
 /*
- * 内核层和引擎的 bug 只结束撞上它的 guest 进程（engine 的 map、设计文档 §12 第 5 条）。bug 用
- * debug 构建的测试钩子模拟：appine-run 要设置 APPINE_TEST_HOOKS=1 和 APPINE_ON_BUG=kill。
- * 每种 bug 都在子进程里触发，父进程检查子进程被 SIGSEGV 结束，自己照常运行。
- * 已经确定了整个进程的退出状态时，退出清理中的 bug 不再覆盖它。
+ * A kernel-layer or engine bug ends only the guest process that hits it (the engine map, design
+ * doc §12 item 5). Bugs are simulated with the test hooks of debug builds: appine-run must set
+ * APPINE_TEST_HOOKS=1 and APPINE_ON_BUG=kill. Each kind of bug is triggered in a child process;
+ * the parent checks that the child was killed by SIGSEGV and keeps running itself. Once the exit
+ * status of the whole process is settled, a bug during exit cleanup no longer overrides it.
  *
- * 带参数时只为宿主调用 Machine 的方法布下 bug（Machine 的测试用）：
- * host-call-then-exit 布下之后退出，host-call-then-read 布下之后读 stdin。
+ * With an argument it only plants a bug for the host's calls into Machine methods (for the Machine
+ * tests): host-call-then-exit exits after planting it, host-call-then-read reads stdin after
+ * planting it.
  */
 #include <pthread.h>
 #include <signal.h>
@@ -19,15 +21,15 @@
 #include <unistd.h>
 
 #define TEST_SYSCALL 0xa991
-#define HOOK_PANIC 1           /* 内核层 panic */
-#define HOOK_BREAK_PAGE 2      /* 让一页在页表里指向不能访问的宿主内存 */
-#define HOOK_PANIC_ON_EXIT 3   /* 调用的线程退出时 panic */
-#define HOOK_PANIC_ON_START 4  /* 这个进程下一个开始运行的线程 panic */
-#define HOOK_PANIC_IN_TIMERS 5 /* 定时器线程处理这个进程时 panic */
-#define HOOK_PANIC_IN_HOST 6   /* 宿主下一次调用 Machine 的方法时 panic */
-#define HOOK_PANIC_UNLOCKED 8  /* 放开 BKL 时 panic：展开时要先重新拿到 BKL */
-#define HOOK_PANIC_FAST 9      /* 下一次不持 BKL 的系统调用 panic */
-#define HOOK_PANIC_IN_FUTEX 10 /* 下一次在 futex 上等待、登记成等待者之后 panic */
+#define HOOK_PANIC 1           /* kernel-layer panic */
+#define HOOK_BREAK_PAGE 2      /* make a page in the page table point at inaccessible host memory */
+#define HOOK_PANIC_ON_EXIT 3   /* panic when the calling thread exits */
+#define HOOK_PANIC_ON_START 4  /* the next thread of this process to start running panics */
+#define HOOK_PANIC_IN_TIMERS 5 /* panic when the timer thread handles this process */
+#define HOOK_PANIC_IN_HOST 6   /* panic the next time the host calls a Machine method */
+#define HOOK_PANIC_UNLOCKED 8  /* panic with the BKL released: unwinding must retake it first */
+#define HOOK_PANIC_FAST 9      /* the next no-BKL system call panics */
+#define HOOK_PANIC_IN_FUTEX 10 /* panic on the next futex wait, after registering as a waiter */
 
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
@@ -50,7 +52,7 @@ static void expect_segv(pid_t pid, const char *what)
     printf("%s: killed by SIGSEGV\n", what);
 }
 
-/* 在 p 所在的页上模拟引擎的 bug，再访问它 */
+/* Simulates an engine bug on the page p is on, then accesses it */
 static void touch_broken_page(void)
 {
     volatile long *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -122,7 +124,7 @@ int main(int argc, char **argv)
     }
     expect_segv(pid, "kernel panic without the BKL");
 
-    /* clock_gettime 不持 BKL 做（syscall::fast） */
+    /* clock_gettime is done without the BKL (syscall::fast) */
     pid = fork();
     if (pid == 0) {
         struct timespec ts;
@@ -133,8 +135,8 @@ int main(int argc, char **argv)
     expect_segv(pid, "kernel panic in a syscall without the BKL");
 
     /*
-     * 在 futex 上等待时 panic：等待者要从队列里移除，否则之后的一次 FUTEX_WAKE 会算在
-     * 它身上，真正的等待者叫不醒
+     * A panic while waiting on a futex: the waiter must be removed from the queue, otherwise a
+     * later FUTEX_WAKE would be counted against it and the real waiter could not be woken
      */
     int *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (word == MAP_FAILED)
@@ -149,7 +151,7 @@ int main(int argc, char **argv)
     pid = fork();
     if (pid == 0)
         _exit(syscall(SYS_futex, word, FUTEX_WAIT, 0, NULL, NULL, 0) == 0 ? 0 : 1);
-    /* 唤醒一次就够：第一次返回 1 时叫醒的必须是它 */
+    /* Waking once is enough: when it first returns 1, the one woken must be it */
     while (syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0) == 0)
         usleep(10000);
     int woken = 0, wst;
@@ -169,7 +171,8 @@ int main(int argc, char **argv)
         touch_broken_page();
     expect_segv(pid, "engine fault");
 
-    /* 多线程：另一个线程正阻塞在内核里，整个进程照样被结束 */
+    /* Multithreaded: another thread is blocked in the kernel, and the whole process is still
+     * killed */
     pid = fork();
     if (pid == 0) {
         pthread_t t;
@@ -181,8 +184,8 @@ int main(int argc, char **argv)
     expect_segv(pid, "engine fault with another thread");
 
     /*
-     * 最后一个线程进入 exit 时，synchronize_group_exit 已经定下进程的退出码，
-     * 和 exit_group 一样，之后退出清理中的 oops 不再改它。
+     * When the last thread enters exit, synchronize_group_exit has already settled the process's
+     * exit code, and, as with exit_group, a later oops during exit cleanup no longer changes it.
      */
     pid = fork();
     if (pid == 0) {
@@ -194,7 +197,8 @@ int main(int argc, char **argv)
         fail("panic while exiting preserves the group exit code");
     printf("panic while exiting: kept exit code 11\n");
 
-    /* 还有线程没退出：故障仍结束整个进程，父进程看到 SIGSEGV。 */
+    /* Some threads have not exited yet: the fault still ends the whole process, and the parent
+     * sees SIGSEGV. */
     pid = fork();
     if (pid == 0) {
         pthread_t t;
@@ -205,7 +209,7 @@ int main(int argc, char **argv)
     }
     expect_segv(pid, "panic while a thread exits");
 
-    /* 新线程开始运行时 */
+    /* When a new thread starts running */
     pid = fork();
     if (pid == 0) {
         pthread_t t;
@@ -217,7 +221,7 @@ int main(int argc, char **argv)
     }
     expect_segv(pid, "panic while a thread starts");
 
-    /* 定时器线程处理这个进程时 */
+    /* When the timer thread handles this process */
     pid = fork();
     if (pid == 0) {
         if (syscall(TEST_SYSCALL, HOOK_PANIC_IN_TIMERS) != 0)
@@ -227,7 +231,7 @@ int main(int argc, char **argv)
     }
     expect_segv(pid, "panic in the timer thread");
 
-    /* 撞上 bug 之后，线程、fork 照常可用 */
+    /* After hitting a bug, threads and fork work as usual */
     pthread_t t;
     void *r;
     if (pthread_create(&t, NULL, worker, (void *)42) != 0 || pthread_join(t, &r) != 0 || r != (void *)42)
@@ -238,7 +242,7 @@ int main(int argc, char **argv)
     int status;
     if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 9)
         fail("fork after the bugs");
-    /* 定时器线程还在 */
+    /* The timer thread is still there */
     sigset_t block, old;
     sigemptyset(&block);
     sigaddset(&block, SIGALRM);

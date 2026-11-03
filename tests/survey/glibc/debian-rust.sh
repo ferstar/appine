@@ -1,4 +1,4 @@
-# Debian（glibc）：rustup 装 glibc 的工具链，cargo 编译带依赖的项目
+# Debian (glibc): rustup installs the glibc toolchain, and cargo builds a project with dependencies
 cd /tmp; s=$(date +%s)
 curl -fsSL https://sh.rustup.rs | sh -s -- -y -q --profile minimal 2>&1 | tail -2; echo "rustup: $? ($(( $(date +%s) - s ))s)"
 . "$HOME/.cargo/env"; rustc -vV | grep -E '^(release|host)'

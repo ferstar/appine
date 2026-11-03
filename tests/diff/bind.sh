@@ -1,8 +1,10 @@
 # docker-run-options: --cap-add SYS_ADMIN --security-opt apparmor=unconfined
-# 仓库里的目录、文件 bind 挂载：`..`、getcwd 和 mountinfo 经由挂载点，只读、noexec、nosuid、
-# nodev、nosymfollow 按经由的挂载算，跨挂载的 rename、link 是 EXDEV，--rbind 带上挂在里面
-# 的，MS_MOVE，最后 pivot_root 换掉根目录。原生一侧是有 CAP_SYS_ADMIN 的 docker 容器，根
-# 文件系统是 overlay：只比挂载点、看到的目录和挂载的选项，不比文件系统类型和 source
+# Bind mounts of directories and files in the store: `..`, getcwd and mountinfo through the mount
+# point, read-only, noexec, nosuid, nodev and nosymfollow judged by the mount gone through, rename
+# and link across mounts are EXDEV, --rbind brings along the mounts inside, MS_MOVE, and finally
+# pivot_root replaces the root directory. The native side is a docker container with
+# CAP_SYS_ADMIN whose root filesystem is overlay: only the mount points, the directories seen and
+# the mount options are compared, not the filesystem types and sources
 cd /tmp
 rm -rf b
 mkdir -p b/src/sub b/dst b/mv b/mv2 b/rb b/fd
@@ -20,7 +22,8 @@ C
 gcc -O1 -static -o b/src/euid b/euid.c
 chmod 4755 b/src/euid
 
-# 挂在 /tmp/b 下的：编号换成出现的先后，第四列（看到的目录）、挂载点、选项
+# Mounts under /tmp/b: IDs replaced by order of appearance, the fourth column (the directory seen),
+# mount point, options
 show() {
     awk '$5 ~ /^\/tmp\/b/ {
         id[$1] = ++n
@@ -35,18 +38,19 @@ ls /tmp/b/dst | tr '\n' ' ' && echo
 echo "same device: $([ "$(stat -c %d /tmp/b/src)" = "$(stat -c %d /tmp/b/dst)" ] && echo yes)"
 echo "same inode: $([ "$(stat -c %i /tmp/b/src/f)" = "$(stat -c %i /tmp/b/dst/f)" ] && echo yes)"
 echo written >/tmp/b/dst/new && cat /tmp/b/src/new
-# .. 和 getcwd 经由挂载点
+# .. and getcwd through the mount point
 cd /tmp/b/dst/sub && pwd -P && cd .. && pwd -P && cd .. && pwd -P
 echo "cwd link: $(cd /tmp/b/dst/sub && readlink /proc/self/cwd)"
 cd /tmp
 
-# 文件 bind 到文件上
+# Bind a file onto a file
 mount --bind /tmp/b/src/f /tmp/b/fd/t && echo "bind a file $?"
 cat /tmp/b/fd/t
 show | tail -n 1
 umount /tmp/b/fd/t && echo "umount the file $?"
 
-# --rbind 带上挂在里面的；有挂载在里面时卸不下，MNT_DETACH 连同里面的一起卸
+# --rbind brings along the mounts inside; with a mount inside it cannot be unmounted, and
+# MNT_DETACH unmounts it together with the ones inside
 mount -t proc proc /tmp/b/src/sub && echo "proc on sub $?"
 mount --rbind /tmp/b/src /tmp/b/rb && echo "rbind $?"
 show
@@ -100,18 +104,19 @@ def options():
         return [l.split()[5] for l in f if l.split()[4] == D]
 
 
-# 跨挂载：rename、link 是 EXDEV（同一个文件系统 bind 到两处也是），挂载里面照常
+# Across mounts: rename and link are EXDEV (also when the same filesystem is bound in two places),
+# inside a mount they work as usual
 attempt("rename across", os.rename, D + "/new", S + "/new2")
 attempt("link across", os.link, D + "/new", S + "/hard")
 attempt("rename inside", os.rename, D + "/new", D + "/new2")
 attempt("link inside", os.link, D + "/new2", D + "/hard")
 os.unlink(D + "/hard")
-# 改名、删除挂载点是 EBUSY（经由哪个挂载都算）
+# Renaming or removing a mount point is EBUSY (through whichever mount)
 attempt("rmdir the mount point", os.rmdir, D)
 attempt("rename the mount point", os.rename, D, "/tmp/b/dst2")
 
-# 只读：经由这个挂载的修改都是 EROFS，源那边照常；已经存在的名字先报 EEXIST，设备节点照常
-# 能写
+# Read-only: modifications through this mount are all EROFS, the source side works as usual; a
+# name that already exists reports EEXIST first, and device nodes can be written as usual
 print("remount ro", remount(MS_RDONLY), options())
 print("f_flag", hex(os.statvfs(D).f_flag), hex(os.statvfs(S).f_flag))
 attempt("open for write", os.open, D + "/f", os.O_WRONLY)
@@ -147,7 +152,8 @@ print("inherits ro", [l.split()[5] for l in open("/proc/self/mountinfo") if l.sp
 libc.umount2(b"/tmp/b/mv", 0)
 print("remount rw", remount(0), options())
 
-# noexec：执行是 EACCES，映射成可执行是 EPERM，以后也不能 mprotect 成可执行
+# noexec: exec is EACCES, mapping executable is EPERM, and it cannot be mprotected executable later
+# either
 print("remount noexec", remount(MS_NOEXEC), options())
 pid = os.fork()
 if pid == 0:
@@ -172,7 +178,7 @@ for i, l in enumerate(lines):
 os.close(fd)
 print("exec from the source", os.system(S + "/bb true"))
 
-# nosuid：setuid 位不起作用；nodev：设备节点打不开
+# nosuid: the setuid bit has no effect; nodev: device nodes cannot be opened
 print("remount nosuid,nodev", remount(MS_NOSUID | MS_NODEV), options())
 for path in (S + "/euid", D + "/euid"):
     pid = os.fork()
@@ -183,14 +189,15 @@ for path in (S + "/euid", D + "/euid"):
 attempt("open the device", os.open, D + "/null", os.O_RDONLY)
 attempt("open the device in the source", lambda: os.close(os.open(S + "/null", os.O_RDONLY)))
 
-# nosymfollow：符号链接（包括魔法链接）不跟随，readlink 照常
+# nosymfollow: symlinks (including magic links) are not followed, readlink works as usual
 print("remount nosymfollow", remount(MS_NOSYMFOLLOW), options())
 attempt("follow", lambda: open(D + "/link").read().strip())
 attempt("readlink", os.readlink, D + "/link")
 attempt("follow in the source", lambda: open(S + "/link").read().strip())
 print("remount plain", remount(0), options())
 
-# MS_MOVE：连同里面的挂载一起挪；源要是挂载的根，目标不能在它里面
+# MS_MOVE: moves together with the mounts inside; the source must be a mount root, and the target
+# cannot be inside it
 print("move", mount(D.encode(), b"/tmp/b/mv2", None, MS_MOVE))
 print("moved", os.path.exists(D + "/f"), open("/tmp/b/mv2/f").read().split())
 print("move a directory that is not a mount", mount(b"/tmp/b/mv2/sub", b"/tmp/b/mv", None, MS_MOVE))
@@ -198,8 +205,8 @@ print("move inside itself", mount(b"/tmp/b/mv2", b"/tmp/b/mv2/sub", None, MS_MOV
 print("move the root", mount(b"/", b"/tmp/b/mv", None, MS_MOVE))
 print("move back", mount(b"/tmp/b/mv2", D.encode(), None, MS_MOVE))
 
-# pivot_root 的错误：要有 CAP_SYS_ADMIN，new_root 要是挂载的根、不能是根目录所在的挂载，
-# put_old 要在 new_root 下面
+# pivot_root errors: needs CAP_SYS_ADMIN, new_root must be a mount root and not the mount the
+# root directory is on, put_old must be under new_root
 def pivot(new, old):
     r = libc.syscall(41, new, old)
     return "ok" if r == 0 else errno.errorcode[ctypes.get_errno()]
@@ -219,8 +226,9 @@ PY
 show
 umount /tmp/b/dst && echo "umount $?"
 
-# 最后用 pivot_root 换掉根目录：新的根是 bind 到自己上的目录，原来的根挂到它里面的 old
-# 上；所有根目录是原来的根的进程都换过去。之后只用新根里的 busybox
+# Finally replace the root directory with pivot_root: the new root is a directory bound onto
+# itself, and the old root is mounted on old inside it; every process whose root directory is the
+# old root switches over. Afterwards only the busybox in the new root is used
 mkdir -p b/nr/bin b/nr/lib b/nr/old b/nr/proc b/nr/tmp
 cp /bin/busybox b/nr/bin/
 cp /lib/ld-musl-aarch64.so.1 b/nr/lib/

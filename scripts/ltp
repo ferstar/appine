@@ -1,24 +1,31 @@
 #!/bin/sh
-# 在 appine 里运行 LTP 的 syscall 测试（设计文档 §13.3 第 2 层）。先用 scripts/build-ltp
-# 编译 LTP。在 Linux arm64 上运行，macOS 上经由 scripts/dev：
+# Runs LTP's syscall tests inside appine (design doc §13.3 layer 2). Build LTP with
+# scripts/build-ltp first. Runs on Linux arm64; on macOS through scripts/dev:
 #
-#   scripts/dev scripts/ltp [-a] [-j 并发数] [-t 执行层] [匹配整个测试名的正则]
+#   scripts/dev scripts/ltp [-a] [-j jobs] [-t tier] [regex matching the whole test name]
 #
-# 每个测试在一个新的 appine-run 进程里运行，结果写到 target/ltp/results.txt，每行
-# "<名字> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP> <退出码> <秒数>"，输出在 target/ltp/logs/<名字>.log，上一次
-# 运行的留在 <名字>.prev.log（失败之后单独重跑不会把失败的那次冲掉）。BUG 是内核层报告了
-# 内部错误（内核 bug、放开 BKL 时借着内核对象），不论退出码。
-# LTP 的退出码是各项结果的按位或：0 是全部通过，32（TCONF）是不适用而跳过。
+# Each test runs in a new appine-run process; the results go to target/ltp/results.txt, one line
+# each, "<name> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP> <exit code> <seconds>", the output to
+# target/ltp/logs/<name>.log, and the previous run's output stays in <name>.prev.log (rerunning a
+# failure alone does not wipe out the failed run). BUG means the kernel layer reported an
+# internal error (a kernel bug, a kernel object borrowed while the BKL is released), whatever the
+# exit code.
+# LTP's exit code is the bitwise OR of the results: 0 means everything passed, 32 (TCONF) means
+# skipped as not applicable.
 #
-# 测试用的仓库在 scripts/dev 的容器里放在虚拟机本地的 docker 卷上（/ltp/store），别处是
-# target/ltp/store，LTP_STORE 可以另指。macOS 上 target/ 经由 virtiofs，每次文件操作都要到
-# 宿主那边：八路同时写同一个仓库的 SQLite 时，等写锁超过 10 秒的操作是 EIO，每次全量都有
-# 几个到几十个测试因此失败；放在本地卷上全量从两分多钟降到一分钟。sendfile09 要 5 GB 空闲。
+# In scripts/dev's container the test store is on a docker volume local to the VM (/ltp/store),
+# elsewhere it is target/ltp/store; LTP_STORE can point somewhere else. On macOS target/ goes
+# through virtiofs, so every file operation has to go to the host: with eight jobs writing the same
+# store's SQLite at once, operations that waited over 10 seconds for the write lock got EIO, and
+# every full run had a few to a few dozen tests fail because of it; on the local volume a full run
+# went from over two minutes to one. sendfile09 needs 5 GB free.
 #
-# 下面 skip 里的测试不跑，结果记 SKIP（退出码 -），-a 时照常跑：
-# - sigtimedwait01、sigwaitinfo01：第一项等"空集合被信号打断返回 EINTR"，musl 的
-#   sigtimedwait、sigwaitinfo 遇到 EINTR 自己重试，又没有超时，每次都跑满 LTP 的 10 分钟
-#   超时；原生的 Alpine 上一样，内核这一层是对的（docs/rounds/17-compat.md）。
+# The tests in skip below are not run and are recorded as SKIP (exit code -); with -a they run as
+# usual:
+# - sigtimedwait01, sigwaitinfo01: the first item waits for "an empty set interrupted by a signal
+#   returns EINTR"; musl's sigtimedwait and sigwaitinfo retry on EINTR by themselves, with no
+#   timeout, so every run hits LTP's 10-minute timeout; the same happens on native Alpine, and the
+#   kernel side is right (docs/rounds/17-compat.md).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,7 +35,7 @@ store=$out/store
 store=${LTP_STORE:-$store}
 run=${APPINE_RUN:-$root/target/linux-arm64/release/appine-run}
 
-# xargs 为每个测试调用一次：scripts/ltp --one <执行层> <名字> <命令行……>
+# xargs calls this once per test: scripts/ltp --one <tier> <name> <command line…>
 if [ "${1:-}" = --one ]; then
     tier=$2
     name=$3
@@ -37,10 +44,12 @@ if [ "${1:-}" = --one ]; then
     [ -f "$log" ] && mv "$log" "$out/logs/$name.prev.log"
     start=$(date +%s.%N)
     set +e
-    # LTP 按自己的计时器判超时；appine 比原生慢，放宽 5 倍（每个测试至少 2.5 分钟）。它也
-    # 乘在 TST_RETRY_FUNC 的退避上限上：20 倍时一直失败的系统调用（bpf 的那些）要重试
-    # 33 秒。跑满规定时长的竞争测试（inotify09、timerfd_settime02 等，fuzzy sync）只跑
-    # 十分之一：它们找的是 Linux 自己的竞争，原来一个就要 1–2 分钟
+    # LTP judges timeouts by its own timer; appine is slower than native, so allow 5 times as long
+    # (at least 2.5 minutes per test). The factor also multiplies TST_RETRY_FUNC's backoff limit: at
+    # 20 times, system calls that always fail (the bpf ones) would be retried for 33 seconds. Race
+    # tests that run for a set duration (inotify09, timerfd_settime02 and so on, fuzzy sync) run
+    # only a tenth of it: they look for races in Linux itself, and one alone used to take 1–2
+    # minutes
     timeout 900 "$run" --tier "$tier" --rootfs "$store" \
         --env PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         --env LTPROOT=/opt/ltp --env TMPDIR=/tmp --env LTP_TIMEOUT_MUL=5 --env LTP_RUNTIME_MUL=0.1 \
@@ -80,7 +89,7 @@ if [ -z "$ltp" ] || [ -z "$rootfs" ]; then
 fi
 [ -x "$run" ] || (cd "$root" && cargo build --release -q -p appine-run)
 
-# 第一次运行时建一个装好 LTP 的仓库
+# On the first run, create a store with LTP installed
 if [ ! -f "$store/.ltp" ]; then
     rm -rf "$store"
     "$run" --rootfs "$store" --import "$rootfs" >/dev/null
@@ -88,8 +97,8 @@ if [ ! -f "$store/.ltp" ]; then
     touch "$store/.ltp"
 fi
 
-# 测试按内核配置决定跑不跑（.needs_kconfigs）：列出 appine 实现了的特性，没列出的
-# 当作没有
+# Tests decide whether to run by the kernel configuration (.needs_kconfigs): list the features
+# appine implements; anything not listed counts as absent
 "$run" --rootfs "$store" -- /bin/sh -c 'cat >/opt/ltp/appine.config' <<'EOF'
 CONFIG_64BIT=y
 CONFIG_ARM64=y
@@ -127,9 +136,10 @@ if [ -n "$skip" ]; then
 else
     cp "$out/tests.txt" "$out/run.txt"
 fi
-# 最长的先跑（按 durations.txt 里记的上次的耗时，没记过的当作 1 秒）：长的测试一开始就与
-# 别的并行，不在最后拖尾。awk 按文件名分开两个文件：NR == FNR 在第一个文件是空的时候对
-# 第二个也成立
+# Longest first (by the previous durations recorded in durations.txt; tests never recorded count as
+# 1 second): long tests run in parallel with others from the start instead of trailing at the end.
+# awk tells the two files apart by file name: NR == FNR also holds for the second file when the
+# first one is empty
 if [ -f "$out/durations.txt" ]; then
     awk 'FILENAME == ARGV[1] { d[$1] = $2; next } { print ($1 in d ? d[$1] : 1), $0 }' \
         "$out/durations.txt" "$out/run.txt" | sort -s -k1,1 -gr | cut -d' ' -f2- >"$out/run.sorted"
@@ -139,7 +149,7 @@ fi
     xargs -r -P "$jobs" -L 1 "$0" --one "$tier" <"$out/run.txt"
     [ -z "$skip" ] || grep -E "^($skip)[[:space:]]" "$out/tests.txt" | awk '{print $1, "SKIP - -"}'
 } | sort >"$out/results.txt"
-# 记下这次跑过的耗时（单独重跑几个测试时只更新它们）
+# Record the durations of the tests run this time (rerunning a few tests alone updates only theirs)
 touch "$out/durations.txt"
 awk 'FILENAME == ARGV[1] { if ($4 != "-") d[$1] = $4; next } !($1 in d) { print } END { for (n in d) print n, d[n] }' \
     "$out/results.txt" "$out/durations.txt" | sort >"$out/durations.new"

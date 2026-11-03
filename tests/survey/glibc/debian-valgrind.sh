@@ -1,6 +1,8 @@
-# Debian（glibc）：valgrind 的 memcheck（越界读、未初始化、泄漏）、helgrind 和 drd（数据竞争）、
-# massif、callgrind，跟进子进程。valgrind 自己也是二进制翻译器：读 /proc/self/maps 对照自己记的
-# 映射，把翻译出来的代码写进自己映射的内存再执行，客户程序的线程由它自己的调度器排着跑
+# Debian (glibc): valgrind's memcheck (out-of-bounds reads, uninitialised values, leaks), helgrind
+# and drd (data races), massif, callgrind, following child processes. valgrind is itself a binary
+# translator: it reads /proc/self/maps to check against the mappings it has recorded, writes the
+# translated code into memory it mapped and executes it there, and schedules the client program's
+# threads with its own scheduler
 export DEBIAN_FRONTEND=noninteractive
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 if ! command -v valgrind >/dev/null || ! command -v gcc >/dev/null; then
@@ -43,7 +45,8 @@ int main(void) {
 }
 C
 gcc -O0 -g -o m m.c && gcc -O0 -g -pthread -o r r.c
-# valgrind 的报告里地址、pid 每次不同，只看说明和源码位置
+# Addresses and pids in valgrind's reports differ every time; look only at the descriptions and
+# source locations
 filt() { sed -n 's/^==[0-9]*== //p' | grep -E "$1" | sed 's/0x[0-9A-F]*: //'; }
 s=$(date +%s)
 echo "== memcheck"; valgrind --leak-check=full --error-exitcode=9 ./m 2>m.log; echo "exit $? ($(( $(date +%s) - s ))s)"

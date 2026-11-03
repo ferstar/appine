@@ -1,5 +1,6 @@
-# seccomp：严格模式、过滤器的检查和各种动作、优先级、快速路径上的系统调用、继承和 TSYNC、
-# PTRACE_EVENT_SECCOMP、通知 fd（USER_NOTIF、ADDFD）。docker 里的 root 没有 CAP_SYS_ADMIN，开头先去掉它，两边一样
+# seccomp: strict mode, filter checks and the various actions, precedence, system calls on the
+# fast path, inheritance and TSYNC, PTRACE_EVENT_SECCOMP, the notification fd (USER_NOTIF, ADDFD).
+# Root in docker has no CAP_SYS_ADMIN, so it is dropped first, making the two sides the same
 rm -rf /tmp/seccomp-test
 mkdir -p /tmp/seccomp-test
 cd /tmp/seccomp-test
@@ -27,7 +28,7 @@ cat > sc.c <<'C'
 #include <ucontext.h>
 #include <unistd.h>
 
-/* 没有 linux-headers：自己定义 */
+/* No linux-headers: define them ourselves */
 struct sock_filter {
     uint16_t code;
     uint8_t jt, jf;
@@ -97,7 +98,7 @@ struct seccomp_notif_addfd {
 #define NOTIF_SEND 0xc0182101
 #define NOTIF_ID_VALID 0x40082102
 #define NOTIF_ADDFD 0x40182103
-/* ADDFD 的结构体可以加长：ioctl 编号里的长度是调用者给的 */
+/* The ADDFD struct can be extended: the size in the ioctl number is the one the caller gives */
 #define NOTIF_ADDFD_SIZE(n) (0x40002103 | (n) << 16)
 #define ADDFD_FLAG_SETFD 1
 #define ADDFD_FLAG_SEND 2
@@ -118,7 +119,7 @@ static long sys_seccomp(unsigned op, unsigned flags, void *args)
     return syscall(SYS_seccomp, op, flags, args);
 }
 
-/* 过滤编号为 nr 的系统调用，返回 action，别的放行 */
+/* Filter system call number nr, returning action, and allow everything else */
 static long install(int nr, uint32_t action, unsigned flags)
 {
     struct sock_filter f[] = {
@@ -163,7 +164,7 @@ static void result(const char *what, long r)
         printf("%s: %ld\n", what, r);
 }
 
-/* 去掉 CAP_SYS_ADMIN（docker 里的 root 本来就没有） */
+/* Drop CAP_SYS_ADMIN (root in docker does not have it anyway) */
 static void drop_sys_admin(void)
 {
     struct {
@@ -236,7 +237,7 @@ static void strict(void)
         _exit(0);
     }
     printf("getpid: %s\n", describe(wait_for(pid)));
-    /* exit_group 不在允许的里面：从 main 返回也是 SIGKILL */
+    /* exit_group is not among the allowed ones: returning from main is also SIGKILL */
     pid = fork();
     if (pid == 0) {
         sys_seccomp(0, 0, NULL);
@@ -295,8 +296,9 @@ static void checks(void)
     result("unknown flag", sys_seccomp(1, 64, &p));
     result("killable without listener", sys_seccomp(1, FLAG_WAIT_KILLABLE_RECV, &p));
     result("tsync and listener", sys_seccomp(1, FLAG_TSYNC | FLAG_NEW_LISTENER, &p));
-    /* 按转换后的 eBPF 长度计数：RET K、RET A、除以 X、双分支和大常数的
-       展开长度不同。每条链各自 fork，避免前一个用例消耗后一个的容量。 */
+    /* Count by the length of the converted eBPF: RET K, RET A, division by X, double branches and
+       large constants expand to different lengths. Each chain forks on its own, so that an
+       earlier test case does not use up the capacity of a later one. */
     const char *kinds[] = {"ret k", "ret a", "div x", "jset", "jeq large", "jeq small", "jeq both"};
     for (int kind = 0; kind < 7; kind++) {
         pid_t pid = fork();
@@ -379,8 +381,9 @@ static void *exit_thread(void *arg)
 static void actions(void)
 {
     printf("== actions\n");
-    /* 不写 core：core_pattern 是管道（CI 的 Ubuntu 宿主上是 apport）时 Linux 不管限制是不是 0
-       都交给它，只有 1 不交；写文件时不到一页也不写 */
+    /* No core: when core_pattern is a pipe (apport on CI's Ubuntu hosts) Linux hands the core to
+       it whether or not the limit is 0, and only 1 keeps it from doing so; when writing a file,
+       less than a page is not written either */
     struct rlimit no_core = {1, 1};
     setrlimit(RLIMIT_CORE, &no_core);
     pid_t pid = fork();
@@ -397,7 +400,8 @@ static void actions(void)
         result("user_notif without a listener", syscall(SYS_getuid));
         install(SYS_getgid, RET_TRACE, 0);
         result("trace without a tracer", syscall(SYS_getgid));
-        /* 参数：第一个参数的低 32 位是 12345 时 ERRNO 7，高 32 位是 1 时 ERRNO 9 */
+        /* Arguments: ERRNO 7 when the low 32 bits of the first argument are 12345, ERRNO 9 when
+         * the high 32 bits are 1 */
         struct sock_filter args[] = {
             STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
             JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpriority, 0, 6),
@@ -420,7 +424,8 @@ static void actions(void)
         result("arg 12345", syscall(SYS_getpriority, 12345, 0));
         result("arg 1 << 32", syscall(SYS_getpriority, 1UL << 32, 0));
         result("arg 0", syscall(SYS_getpriority, 0, 0) >= 0);
-        /* 同样严格时最新的过滤器的数据，更严格的动作优先 */
+        /* With equally strict actions the newest filter's data wins; a stricter action takes
+         * precedence */
         install(SYS_getppid, RET_ERRNO | EACCES, 0);
         result("newest errno wins", syscall(SYS_getppid));
         result("PR_GET_SECCOMP", prctl(PR_GET_SECCOMP, 0, 0, 0, 0));
@@ -428,7 +433,7 @@ static void actions(void)
         _exit(0);
     }
     printf("child: %s\n", describe(wait_for(pid)));
-    /* TRAP：处理函数看到原来的 x0，改掉它就是返回值 */
+    /* TRAP: the handler sees the original x0, and changing it sets the return value */
     pid = fork();
     if (pid == 0) {
         struct sigaction sa = {.sa_sigaction = sys_handler, .sa_flags = SA_SIGINFO};
@@ -439,7 +444,7 @@ static void actions(void)
         _exit(0);
     }
     printf("trap: %s\n", describe(wait_for(pid)));
-    /* TRAP 时 SIGSYS 被屏蔽或者忽略：恢复默认动作 */
+    /* SIGSYS blocked or ignored at TRAP: the default action is restored */
     for (int how = 0; how < 2; how++) {
         pid = fork();
         if (pid == 0) {
@@ -457,7 +462,8 @@ static void actions(void)
         }
         printf("trap with SIGSYS %s: %s\n", how ? "ignored" : "blocked", describe(wait_for(pid)));
     }
-    /* KILL_PROCESS：有处理函数、在别的线程里也结束整个进程；不认得的动作也是 */
+    /* KILL_PROCESS: ends the whole process even with a handler and from another thread; so do
+     * unknown actions */
     uint32_t kills[] = {RET_KILL_PROCESS, 0x00010000};
     for (int i = 0; i < 2; i++) {
         pid = fork();
@@ -472,14 +478,15 @@ static void actions(void)
         }
         printf("kill %#x from a thread: %s\n", kills[i], describe(wait_for(pid)));
     }
-    /* KILL_THREAD：只结束那个线程；只有一个线程时与结束进程一样 */
+    /* KILL_THREAD: ends only that thread; with only one thread it is the same as ending the
+     * process */
     pid = fork();
     if (pid == 0) {
         install(SYS_getppid, RET_KILL_THREAD, 0);
         pthread_t t;
         pthread_create(&t, NULL, getppid_thread, NULL);
-        /* 被内核结束的线程没有走 pthread_exit，musl 的 pthread_join 等不到它：看它在
-           /proc/self/task 里消失 */
+        /* A thread ended by the kernel did not go through pthread_exit, so musl's pthread_join
+           cannot wait for it: watch it disappear from /proc/self/task */
         while (!getppid_tid)
             usleep(1000);
         char path[64];
@@ -498,7 +505,8 @@ static void actions(void)
         _exit(0);
     }
     printf("kill the only thread: %s\n", describe(wait_for(pid)));
-    /* 主线程被 KILL_THREAD 结束，另一个线程用 exit 结束：进程的结束方式是最后一个退出的线程的 */
+    /* The main thread is ended by KILL_THREAD and another thread by exit: the process ends the
+     * way its last exiting thread did */
     pid = fork();
     if (pid == 0) {
         static int code = 5;
@@ -540,8 +548,8 @@ static void sibling_do(char c)
         read(sibling_done[0], &c, 1);
 }
 
-/* 不持 BKL 的快速路径（appine 的 syscall::fast）上的系统调用也要经过过滤器；vDSO 里读时钟
-   不进内核，过滤器管不到 */
+/* System calls on the no-BKL fast path (appine's syscall::fast) must also go through the
+   filters; reading the clock in the vDSO does not enter the kernel, so filters cannot see it */
 static void fast_path(void)
 {
     printf("== fast path\n");
@@ -601,8 +609,9 @@ static void fast_path(void)
         wait_for(pid);
     }
 
-    /* 按编号缓存（Linux 的 seccomp_cache）只记总是返回 ALLOW 的编号：看参数的、上一个过滤器
-       不放行的、返回别的动作的都要运行程序。appine 里这些编号照常走快速路径 */
+    /* The per-number cache (Linux's seccomp_cache) records only numbers that always return
+       ALLOW: those that look at arguments, that an earlier filter does not allow, or that return
+       other actions must run the program. In appine these numbers take the fast path as usual */
     pid_t pid = fork();
     if (pid == 0) {
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -643,7 +652,8 @@ static void fast_path(void)
         _exit(0);
     }
     printf("trap on clock_getres: %s\n", describe(wait_for(pid)));
-    /* 像 Chromium 那样按时钟过滤 clock_gettime：直接调用的被过滤，经由 vDSO 的不检查 */
+    /* Filter clock_gettime by clock as Chromium does: direct calls are filtered, calls through
+     * the vDSO are not checked */
     pid = fork();
     if (pid == 0) {
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -691,10 +701,10 @@ static void inherit(void)
         pthread_create(&t, NULL, sibling, NULL);
         char c;
         read(sibling_done[0], &c, 1);
-        /* 没有 seccomp 的兄弟线程可以同步 */
+        /* A sibling thread without seccomp can be synchronized */
         result("tsync", install(SYS_getppid, RET_ERRNO | EPERM, FLAG_TSYNC));
         sibling_do('c');
-        /* 兄弟线程自己又装了一个：它的链不再是我的链的一部分 */
+        /* The sibling thread installed one of its own: its chain is no longer part of mine */
         sibling_do('f');
         long r = install(SYS_getpgid, RET_ERRNO | 3, FLAG_TSYNC);
         printf("  tsync after the sibling diverged: %s\n",
@@ -740,12 +750,12 @@ static void trace(void)
         printf("stop: %s, message %#lx, info size %ld op %d nr %lld ret_data %#x\n", describe(st),
                msg, size, info.op, (long long)info.seccomp.nr, info.seccomp.ret_data);
         if (i == 0) {
-            /* 改成 getpid */
+            /* Change it to getpid */
             int nr = SYS_getpid;
             struct iovec iov = {&nr, sizeof nr};
             ptrace(PTRACE_SETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov);
         } else if (i == 1) {
-            /* 跳过，返回 55 */
+            /* Skip it, returning 55 */
             int nr = -1;
             struct iovec iov = {&nr, sizeof nr};
             ptrace(PTRACE_SETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov);
@@ -758,14 +768,14 @@ static void trace(void)
             errno = 0;
             r = ptrace(PTRACE_SECCOMP_GET_FILTER, pid, 0, NULL);
             printf("get filter without CAP_SYS_ADMIN: %ld %s\n", r, strerror(errno));
-            /* 不再跟踪 seccomp：之后的 TRACE 是 ENOSYS */
+            /* Stop tracing seccomp: later TRACEs are ENOSYS */
             ptrace(PTRACE_SETOPTIONS, pid, 0, 0);
         }
         ptrace(PTRACE_CONT, pid, 0, 0);
     }
     printf("end: %s\n", describe(wait_for(pid)));
 
-    /* PTRACE_SYSCALL：先是系统调用入口的停止，再是 seccomp 的，最后是出口 */
+    /* PTRACE_SYSCALL: first the system call entry stop, then the seccomp one, finally the exit */
     pid = fork();
     if (pid == 0) {
         pid_t parent = getppid();
@@ -779,7 +789,8 @@ static void trace(void)
     wait_for(pid);
     ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD);
     ptrace(PTRACE_SYSCALL, pid, 0, 0);
-    /* musl 的 raise 返回前还会恢复信号掩码；先找到目标调用的入口。 */
+    /* musl's raise also restores the signal mask before returning; find the entry of the target
+     * call first. */
     int seen = 0;
     while (seen < 3) {
         st = wait_for(pid);
@@ -802,8 +813,9 @@ static void trace(void)
     ptrace(PTRACE_CONT, pid, 0, 0);
     printf("end: %s\n", describe(wait_for(pid)));
 
-    /* 用 PTRACE_CONT 继续到 seccomp 的停止，再改用 PTRACE_SYSCALL：与 arm64 Linux 一样出口也停
-       （strace --seccomp-bpf 这样拿返回值）；跳过的系统调用在出口给返回值 */
+    /* Continue to the seccomp stop with PTRACE_CONT, then switch to PTRACE_SYSCALL: as on arm64
+       Linux the exit stops too (strace --seccomp-bpf gets return values this way); a skipped
+       system call gives its return value at the exit */
     pid = fork();
     if (pid == 0) {
         pid_t parent = getppid();
@@ -844,8 +856,9 @@ static void trace(void)
     }
     printf("end: %s\n", describe(wait_for(pid)));
 
-    /* 有过滤器的线程经由 vDSO 读时钟：Linux 上不进内核，PTRACE_SYSCALL 时也不停，在
-       raise 恢复信号掩码和 getpid 之间没有停止 */
+    /* A thread with filters reads the clock through the vDSO: on Linux that does not enter the
+       kernel and does not stop even under PTRACE_SYSCALL, so there is no stop between raise
+       restoring the signal mask and getpid */
     pid = fork();
     if (pid == 0) {
         ptrace(PTRACE_TRACEME, 0, 0, 0);
@@ -874,8 +887,9 @@ static void trace(void)
     printf("end: %s\n", describe(st));
 }
 
-/* 通知 fd：子进程装过滤器，把通知 fd 交给父进程，父进程回答它的系统调用。子进程把每次的
-   结果写进管道，由父进程打印，输出的先后是确定的 */
+/* Notification fd: the child installs a filter and hands the notification fd to the parent,
+   which answers its system calls. The child writes each result into a pipe and the parent
+   prints it, so the order of the output is deterministic */
 static int report[2];
 
 static void reportf(const char *fmt, long v)
@@ -940,7 +954,7 @@ static long errno_or(long r)
     return r < 0 ? -errno : r;
 }
 
-/* 子进程那一边 */
+/* The child's side */
 static void notified(int sock, unsigned flags)
 {
     pid_t expected_ppid = getppid();
@@ -1019,7 +1033,7 @@ static void notif(void)
     resp = (struct seccomp_notif_resp){n.id, 0, 0, 1};
     ioctl(l, NOTIF_SEND, &resp);
     report_line();
-    /* 被信号打断：重新执行时是一个新的通知 */
+    /* Interrupted by a signal: on re-execution it is a new notification */
     memset(&n, 0, sizeof n);
     ioctl(l, NOTIF_RECV, &n);
     uint64_t old = n.id;
@@ -1032,7 +1046,8 @@ static void notif(void)
     resp = (struct seccomp_notif_resp){n.id, 9, 0, 0};
     ioctl(l, NOTIF_SEND, &resp);
     report_line();
-    /* 回答最后一个通知，并保留 listener，观察子进程回收后的 POLLHUP。 */
+    /* Answer the last notification and keep the listener, to observe POLLHUP after the child is
+     * reaped. */
     memset(&n, 0, sizeof n);
     ioctl(l, NOTIF_RECV, &n);
     struct pollfd hup = {l, 0};
@@ -1041,7 +1056,8 @@ static void notif(void)
     resp = (struct seccomp_notif_resp){n.id, 0, -ENOSYS, 0};
     ioctl(l, NOTIF_SEND, &resp);
     report_line();
-    /* 子进程结束、被回收之前不算没有用户（僵尸进程仍用着过滤器） */
+    /* Until the child has ended and been reaped there are still users (a zombie still uses the
+     * filter) */
     char c;
     while (read(report[0], &c, 1) == 1)
         ;
@@ -1052,7 +1068,8 @@ static void notif(void)
     close(report[0]);
 }
 
-/* 等回答时只被致命信号打断（WAIT_KILLABLE_RECV）：取走之后来的信号等回答之后再处理 */
+/* While waiting for the answer only fatal signals interrupt (WAIT_KILLABLE_RECV): signals that
+ * come after the notification is received are handled after the answer */
 static void killable(void)
 {
     printf("== wait killable\n");
@@ -1099,7 +1116,7 @@ static void killable(void)
     close(report[0]);
 }
 
-/* ADDFD：监管进程把自己的 fd 装进对方的 fd 表。子进程那一边 */
+/* ADDFD: the supervisor installs its own fd into the other side's fd table. The child's side */
 static void addfd_child(int sock)
 {
     int null = open("/dev/null", O_RDONLY);
@@ -1176,13 +1193,13 @@ static void addfd(void)
     char buf[8] = {0};
     read(p[0], buf, 5);
     printf("  read from the pipe: %s\n", buf);
-    /* SETFD 换掉 50 上的 /dev/null，SEND 同时回答 */
+    /* SETFD replaces the /dev/null at 50, and SEND answers at the same time */
     memset(&n, 0, sizeof n);
     ioctl(l, NOTIF_RECV, &n);
     a = (struct seccomp_notif_addfd){n.id, ADDFD_FLAG_SETFD | ADDFD_FLAG_SEND, p[1], 50, O_CLOEXEC};
     result("setfd and send", ioctl(l, NOTIF_ADDFD, &a));
     report_line();
-    /* 受对方的 RLIMIT_NOFILE 限制：SETFD 超出是 EBADF，装满之后是 EMFILE */
+    /* Limited by the other side's RLIMIT_NOFILE: SETFD beyond it is EBADF, and once full EMFILE */
     memset(&n, 0, sizeof n);
     ioctl(l, NOTIF_RECV, &n);
     a = (struct seccomp_notif_addfd){n.id, ADDFD_FLAG_SETFD, p[1], 70, 0};
@@ -1203,7 +1220,7 @@ static void addfd(void)
     close(report[0]);
 }
 
-/* 关闭最后一个 listener：已经挂起的调用和之后的调用都得到 ENOSYS。 */
+/* Closing the last listener: calls already pending and later calls get ENOSYS. */
 static void close_listener(void)
 {
     printf("== close listener\n");
@@ -1236,8 +1253,9 @@ static void close_listener(void)
     close(report[0]);
 }
 
-/* 一个线程在 NOTIF_RECV 里等通知时，另一个线程改通知 fd 的打开标志（fcntl、FIONBIO）：
-   等着的一方没有借着这个打开文件，改得了，之后照常收到通知 */
+/* While one thread waits for a notification in NOTIF_RECV, another thread changes the open flags
+   of the notification fd (fcntl, FIONBIO): the waiting side is not borrowing that open file, so
+   the change goes through, and it receives notifications as usual afterwards */
 static int waited_listener;
 
 static void *answer_one(void *arg)
@@ -1295,8 +1313,9 @@ int main(void)
 C
 gcc -O1 -o sc sc.c -lpthread && timeout 120 ./sc
 
-# strace --seccomp-bpf：只在要看的系统调用上停（PTRACE_EVENT_SECCOMP），停住时改用
-# PTRACE_SYSCALL 拿到出口的返回值。pid 在两边不同，去掉
+# strace --seccomp-bpf: stops only on the system calls to be watched (PTRACE_EVENT_SECCOMP), and
+# when stopped switches to PTRACE_SYSCALL to get the return value at the exit. pids differ
+# between the two sides and are removed
 echo "some text" > text
 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin strace -f --seccomp-bpf -e trace=openat,close -e signal=none \
     -o st sh -c 'cat text >/dev/null; head -c1 text >/dev/null'

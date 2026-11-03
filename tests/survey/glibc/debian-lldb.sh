@@ -1,6 +1,7 @@
-# Debian（glibc）：lldb 19。lldb 经由 socket 驱动它起的 lldb-server，后者用 ptrace 管客户程序：
-# 线程里的断点、单步、寄存器、硬件观察点、表达式求值（JIT 出来的代码写进客户程序的内存里执行）、
-# attach 到运行中的进程、读 core 文件
+# Debian (glibc): lldb 19. lldb drives the lldb-server it starts over a socket, and the latter
+# manages the client program with ptrace: breakpoints in threads, single-stepping, registers,
+# hardware watchpoints, expression evaluation (JIT-compiled code written into the client program's
+# memory and executed there), attaching to a running process, reading core files
 export DEBIAN_FRONTEND=noninteractive
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 if ! command -v lldb >/dev/null || ! command -v gcc >/dev/null; then
@@ -36,7 +37,8 @@ int main(int argc, char **argv) {
 }
 C
 gcc -O0 -g -pthread -o t t.c
-# lldb 打印的地址、线程编号每次不同，去掉地址只看函数和源码位置
+# The addresses and thread numbers lldb prints differ every time; drop the addresses and look only
+# at functions and source locations
 strip_addr() { sed -E 's/0x[0-9a-f]+/ADDR/g; s/tid = [0-9]+/tid = N/; s/process [0-9]+/process N/'; }
 s=$(date +%s)
 echo "== breakpoint in thread"

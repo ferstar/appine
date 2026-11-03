@@ -1,4 +1,4 @@
-# zig、python 的 venv 和 pip（联网）、socat
+# zig, python's venv and pip (network), socat
 cd /tmp; rm -rf zigt; mkdir zigt; cd zigt
 cat > hello.zig <<'Z'
 const std = @import("std");

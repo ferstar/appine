@@ -1,4 +1,5 @@
-# CPython：哈希、浮点格式化、十进制、unicode、sqlite3、线程；文件和目录的时间戳；FICLONE
+# CPython: hashing, float formatting, decimal, unicode, sqlite3, threads; timestamps of files and
+# directories; FICLONE
 python3 - <<'PY'
 import base64, decimal, fractions, hashlib, json, math, re, sqlite3, struct, threading, unicodedata, zlib
 print(hashlib.sha256(b"x" * 10**6).hexdigest(), hashlib.md5(b"appine").hexdigest())
@@ -30,8 +31,9 @@ print(re.sub(r"(\w+)@(\w+)", r"\2 at \1", "alice@example bob@test"))
 print(int("9" * 400) % 1000000007, pow(3, 10**5, 10**9 + 7))
 PY
 
-# 时间戳：目录里新建、删除、改名改目录的 mtime 和 ctime；写、截断、chmod、utimensat 改
-# 文件的 ctime；import 找得到同一个目录里后来新建的模块（它按目录的 mtime 重新列目录）
+# Timestamps: creating, deleting and renaming in a directory change the directory's mtime and
+# ctime; write, truncate, chmod and utimensat change a file's ctime; import finds a module created
+# later in the same directory (it relists the directory based on the directory's mtime)
 rm -rf /tmp/ts && mkdir /tmp/ts && cd /tmp/ts && python3 - <<'PY'
 import os, sys, time
 def times(p):
@@ -76,7 +78,8 @@ import two
 print("import", one.x, two.x)
 PY
 
-# FICLONE：检查的顺序和错误码；文件系统不支持 reflink 时 Path.copy 退回普通的复制
+# FICLONE: the order of the checks and the error codes; when the filesystem does not support
+# reflink, Path.copy falls back to an ordinary copy
 python3 - <<'PY'
 import errno, fcntl, os, pathlib, struct
 FICLONE, FICLONERANGE = 0x40049409, 0x4020940d
@@ -94,7 +97,8 @@ rdonly = os.open("/tmp/ts/dst", os.O_RDONLY)
 append = os.open("/tmp/ts/dst", os.O_WRONLY | os.O_APPEND)
 directory = os.open("/tmp/ts", os.O_RDONLY)
 pipe = os.pipe()[0]
-# O_PATH 打开的 fd 不能做 ioctl 的对象，也不能做源（fdget 不接受，EBADF）
+# An fd opened with O_PATH can be neither the object of the ioctl nor its source (fdget does not
+# accept it, EBADF)
 path_src = os.open("/tmp/ts/src", os.O_PATH)
 path_dst = os.open("/tmp/ts/dst", os.O_PATH)
 for name, fd, arg in [("file", dst, src), ("rdonly", rdonly, src), ("append", append, src),

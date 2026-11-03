@@ -1,12 +1,13 @@
-//! M2 性能探针：分别以原生、Tier 0、Tier 1 运行基准程序，比较耗时（设计文档 §14）。
+//! M2 performance probe: runs the benchmark programs natively, under Tier 0 and under Tier 1, and
+//! compares the times (design doc §14).
 //!
 //! ```text
 //! cargo build --release -p appine-run -p appine-bench
 //! target/release/appine-bench [--runs N] [--quick] [--skip-tier0] [--only NAME] [--stats]
 //! ```
 //!
-//! 需要 Linux aarch64 宿主：基准程序要能原生运行。每种方式取多次运行的最短
-//! 耗时，并要求三种方式的输出逐字相同。
+//! Needs a Linux aarch64 host: the benchmark programs must run natively. Each way takes the
+//! shortest time of several runs, and the output of the three ways must be identical byte for byte.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -60,7 +61,8 @@ fn parse_options() -> Result<Options, String> {
     Ok(o)
 }
 
-/// 运行 `runs` 次，返回最短耗时和标准输出；要求每次都成功且输出一致。
+/// Runs `runs` times and returns the shortest time and the standard output; every run must succeed
+/// with the same output.
 fn measure(cmd: &[OsString], runs: usize) -> Result<(Duration, Vec<u8>), String> {
     let mut best = Duration::MAX;
     let mut first: Option<Vec<u8>> = None;

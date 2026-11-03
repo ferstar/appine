@@ -1,9 +1,10 @@
 /*
- * core dump 的 guest 测试程序：用 musl-gcc -static 编译，拷进仓库里运行（要文件系统）。
- * 子进程崩溃之后，父进程检查 wait 的状态和 core 文件的内容：ELF 头、写了和没写的映射、
- * 每个线程的 NT_PRSTATUS、NT_PRPSINFO、NT_SIGINFO、NT_FILE；再检查 core_pattern 和
- * RLIMIT_CORE 的截断。每项通过时打印 "ok <名字>"，失败时打印原因并以 1 退出，全部通过时
- * 最后打印 "all ok"。
+ * Guest test program for core dumps: build with musl-gcc -static and run it copied into the store
+ * (it needs a filesystem). After a child crashes, the parent checks the wait status and the core
+ * file's contents: the ELF header, written and unwritten mappings, each thread's NT_PRSTATUS,
+ * NT_PRPSINFO, NT_SIGINFO, NT_FILE; then it checks core_pattern and truncation by RLIMIT_CORE.
+ * Each item that passes prints "ok <name>"; a failure prints the reason and exits with 1; when all
+ * pass it prints "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <elf.h>
@@ -47,8 +48,9 @@ static void *idle(void *arg)
     return NULL;
 }
 
-/* 子进程：两块匿名内存写上标记，第二块 MADV_DONTDUMP，再起一个线程，然后访问空指针。
- * 两块的地址经由管道告诉父进程 */
+/* Child: writes markers into two pieces of anonymous memory, the second MADV_DONTDUMP, starts
+ * another thread, then accesses a null pointer. The two addresses are passed to the parent
+ * through a pipe */
 static void crash(int out, rlim_t limit)
 {
     struct rlimit rl = {limit, RLIM_INFINITY};
@@ -67,7 +69,8 @@ static void crash(int out, rlim_t limit)
     *(volatile int *)0 = 1;
 }
 
-/* fork 一个子进程崩溃，返回它的 pid、wait 的状态和两块内存的地址 */
+/* Forks a child that crashes; returns its pid, the wait status and the addresses of the two
+ * pieces */
 static pid_t run_crash(rlim_t limit, int *status, uint64_t addrs[2])
 {
     int p[2];
@@ -110,7 +113,7 @@ static char *read_file(const char *path, size_t *len)
     return buf;
 }
 
-/* 在 PT_NOTE 里数类型为 type 的 note，返回第 nth 个的内容 */
+/* Counts the notes of type `type` in PT_NOTE and returns the contents of the nth one */
 static const char *find_note(const char *core, const Elf64_Phdr *note, uint32_t type, int nth,
                              int *count, uint32_t *size)
 {
@@ -219,7 +222,7 @@ static void test_pattern_and_limit(void)
     write_file("/proc/sys/kernel/core_pattern", "core");
     ok("core_pattern");
 
-    /* 限制不到一页：不写；一页：截断了也算写了 */
+    /* A limit under one page: nothing is written; one page: truncated still counts as written */
     run_crash(100, &status, addrs);
     CHECK(!WCOREDUMP(status) && stat(DIR "/core", &st) < 0, "core under one page");
     run_crash(4096, &status, addrs);

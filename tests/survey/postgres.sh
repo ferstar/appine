@@ -1,4 +1,5 @@
-# postgres：initdb、启动、事务、索引、并行查询（动态共享内存）、LISTEN/NOTIFY、pgbench
+# postgres: initdb, startup, transactions, indexes, parallel queries (dynamic shared memory),
+# LISTEN/NOTIFY, pgbench
 D=/tmp/pg
 pkill postgres 2>/dev/null; sleep 0.5
 rm -rf $D; mkdir -p $D; chown postgres:postgres $D

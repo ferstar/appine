@@ -1,5 +1,7 @@
-# 断电之后检查 workload.sh 的数据目录 $1；标准输入是断电之前打印出来的 "synced v"。
-# f1..f20 都要在、是某一版的完整内容；fsync 过的 s$v 都要完整。打印 "ok" 或者问题。
+# After a power loss, checks the data directory $1 of workload.sh; standard input is the "synced v"
+# lines printed before the power loss.
+# f1..f20 must all exist, each with the complete content of some version; every s$v that was fsynced
+# must be intact. Prints "ok" or the problems.
 d=$1
 cd "$d" || { echo "FAIL no dir"; exit 1; }
 lines() { echo $(( ($1 * 7 + $2 * 13) % 40 * 50 + 50 )); }
@@ -7,7 +9,7 @@ bad=0
 i=1
 while [ $i -le 20 ]; do
     if [ ! -e f$i ]; then
-        # 第一轮还没写完时可以没有
+        # May be missing when the first round had not finished writing
         [ -e f1 ] && { echo "FAIL f$i missing"; bad=1; }
     else
         first=$(head -n 1 f$i 2>&1)

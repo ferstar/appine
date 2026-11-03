@@ -1,6 +1,7 @@
-# PTY 的模式：struct termios2 的 TCGETS2、TCSETS2、TCSETSW2、TCSETSF2（glibc 2.42 起
-# tcgetattr、tcsetattr、isatty 只用它们），速率字段按 CBAUD、CIBAUD 换算（Linux 的
-# set_termios），PTY 总是 8 位、不校验、允许接收（pty_set_termios），地址位不变
+# PTY modes: TCGETS2, TCSETS2, TCSETSW2 and TCSETSF2 of struct termios2 (from glibc 2.42 on
+# tcgetattr, tcsetattr and isatty use only these), speed fields converted by CBAUD and CIBAUD
+# (Linux's set_termios), a PTY always being 8-bit, without parity and with receiving enabled
+# (pty_set_termios), and the address bit not changing
 python3 - <<'PY'
 import errno, fcntl, functools, os, select, struct, termios
 
@@ -36,11 +37,11 @@ def show(label, fd):
 m, s = os.openpty()
 show("slave", s)
 show("master", m)
-# TCGETS 的前 36 字节与 TCGETS2 相同
+# The first 36 bytes of TCGETS are the same as TCGETS2's
 old = fcntl.ioctl(s, termios.TCGETS, bytes(36))
 print("tcgets prefix", old == fcntl.ioctl(s, TCGETS2, bytes(44))[:36])
 
-# 不是终端的：ENOTTY；坏的指针：EFAULT
+# Not a terminal: ENOTTY; a bad pointer: EFAULT
 r, w = os.pipe()
 nul = os.open("/dev/null", os.O_RDWR)
 f = os.open("/tmp", os.O_RDONLY)
@@ -64,20 +65,20 @@ def setcflag(fd, cbaud, ibaud=0, isp=0, osp=0, req=TCSETS2, keep=None):
     return "cflag=%o ispeed=%d ospeed=%d" % (c, isp2, osp2)
 
 
-# 老的 Bxxx 写法：速率按表换算，字段里的值不算
+# The old Bxxx style: the speed is converted by the table, the values in the fields do not count
 print("B9600", setcflag(s, 0o15, isp=1, osp=2))
 print("B115200/B1200", setcflag(s, 0o10002, 0o11))
 print("B4000000", setcflag(s, 0o10017))
 print("B0", setcflag(s, 0))
-# BOTHER：用字段里的速率，输入、输出可以不同
+# BOTHER: use the speed in the fields; input and output can differ
 print("BOTHER", setcflag(s, BOTHER, BOTHER, 12345, 54321))
 print("BOTHER out only", setcflag(s, BOTHER, 0, 777, 31250))
 print("BOTHER in only", setcflag(s, 0o15, BOTHER, 4242, 0))
-# 主设备上设置的是从设备的
+# What is set on the master is the slave's
 print("via master", setcflag(m, BOTHER, 0, 0, 2400))
 show("slave after master", s)
 
-# 老的 TCSETS 带着 BOTHER：速率字段沿用原来的
+# The old TCSETS with BOTHER: the speed fields keep their previous values
 t = get2(s)
 t[2] = t[2] & ~CBAUD & ~(CBAUD << IBSHIFT) | BOTHER
 t[6], t[7] = 1111, 2222
@@ -90,20 +91,21 @@ t2[2] = t2[2] & ~CBAUD & ~(CBAUD << IBSHIFT) | 0o17
 fcntl.ioctl(s, termios.TCSETS, struct.pack("<4IB19s", *t2))
 show("tcsets b38400", s)
 
-# TCSETA（termio）也重新换算速率
+# TCSETA (termio) also recomputes the speeds
 ta = bytearray(fcntl.ioctl(s, termios.TCGETA, bytes(18)))
 c = struct.unpack_from("<H", ta, 4)[0]
 struct.pack_into("<H", ta, 4, c & ~0o17 | 0o13)
 fcntl.ioctl(s, termios.TCSETA, bytes(ta))
 show("tcseta b2400", s)
 
-# PTY 总是 CS8、CREAD、不校验，地址位改不了
+# A PTY is always CS8, CREAD, without parity, and the address bit cannot be changed
 t = get2(s)
 t[2] = t[2] & ~0o60 & ~0o200 | 0o20 | 0o400 | 0o1000 | ADDRB
 set2(s, t)
 show("cs6 parenb parodd addrb", s)
 
-# 别的标志、控制字符、行规程编号原样保存；TCSETSF2 清掉没读的输入，TCSETSW2 照常
+# Other flags, the control characters and the line discipline number are kept as is; TCSETSF2
+# flushes unread input, TCSETSW2 works as usual
 t = get2(s)
 t[0] |= termios.IXANY
 t[3] &= ~termios.ECHO
@@ -114,19 +116,20 @@ t[5] = bytes(cc)
 set2(s, t, TCSETSW2)
 show("tcsetsw2", s)
 os.write(m, b"abc\n")
-select.select([s], [], [], 5)  # 原生上数据经由 flip buffer 异步交给行规程
+# Natively the data reaches the line discipline asynchronously through the flip buffer
+select.select([s], [], [], 5)
 print("before flush", struct.unpack("<i", fcntl.ioctl(s, termios.FIONREAD, bytes(4)))[0])
 set2(s, get2(s), TCSETSF2)
 print("after tcsetsf2", struct.unpack("<i", fcntl.ioctl(s, termios.FIONREAD, bytes(4)))[0])
 
-# 规范模式开关时已有的输入保留（与 TCSETS 一样）
+# Input already there is kept when canonical mode is switched on or off (as with TCSETS)
 os.write(m, b"xy")
 t = get2(s)
 t[3] &= ~termios.ICANON
 set2(s, t)
 print("raw read", os.read(s, 10))
 
-# Python 的 termios 模块（经由 libc 的 tcgetattr/tcsetattr）与 ioctl 一致
+# Python's termios module (through libc's tcgetattr/tcsetattr) agrees with the ioctls
 a = termios.tcgetattr(s)
 a[4] = a[5] = termios.B57600
 termios.tcsetattr(s, termios.TCSANOW, a)
@@ -134,10 +137,11 @@ show("tcsetattr b57600", s)
 print("isatty", os.isatty(s), os.isatty(m), os.isatty(r))
 PY
 
-# 包模式（TIOCPKT，Linux 的 pty_set_pktmode、n_tty_read、n_tty_poll）：主设备每次读先给
-# 一个状态字节。有状态（从设备的清空、^S/^Q 停住和恢复、流控的开关、EXTPROC 时 termios
-# 变了）时只读到它，否则是 TIOCPKT_DATA（0）加数据；有状态时 poll 带 POLLPRI。GNU screen
-# 打开每个窗口都要它，失败就不开窗口
+# Packet mode (TIOCPKT, Linux's pty_set_pktmode, n_tty_read, n_tty_poll): each read on the master
+# first gives a status byte. When there is a status (the slave flushing, ^S/^Q stopping and
+# resuming, flow control switching on or off, termios changing under EXTPROC) only that is read,
+# otherwise it is TIOCPKT_DATA (0) plus data; with a status, poll includes POLLPRI. GNU screen
+# needs it for every window it opens, and opens no window if it fails
 python3 - <<'PY'
 import errno, fcntl, functools, os, select, signal, struct, termios, time
 
@@ -172,9 +176,10 @@ def events(fd):
 
 
 def wait(fd, pri=False):
-    # 原生上写进主设备的数据经由 flip buffer 异步交给行规程，等到它产生结果。等状态（pri）
-    # 时也等可读：Linux 的 pty_stop、pty_start 唤醒时只带 EPOLLIN，只等异常条件的 select
-    # 不会被叫醒，要等到超时
+    # Natively data written to the master reaches the line discipline asynchronously through the
+    # flip buffer; wait until it produces a result. When waiting for a status (pri), also wait
+    # for readability: Linux's pty_stop and pty_start wake with only EPOLLIN, so a select that
+    # waits only for exceptional conditions is not woken and has to wait for the timeout
     select.select([fd], [], [fd] if pri else [], 5)
 
 
@@ -208,19 +213,20 @@ print("events with data", events(m))
 print("one byte", rd(m, 1), "then", rd(m))
 print("select exc", select.select([], [], [m], 0)[2] == [])
 
-# 从设备这一边的清空：输入是 FLUSHREAD，输出是 FLUSHWRITE；主设备那边的不报告
+# Flushes on the slave side: input is FLUSHREAD, output is FLUSHWRITE; those on the master side
+# are not reported
 for name, q in [("TCIFLUSH", termios.TCIFLUSH), ("TCOFLUSH", termios.TCOFLUSH), ("TCIOFLUSH", termios.TCIOFLUSH)]:
     termios.tcflush(s, q)
     print("slave", name, events(m), select.select([], [], [m], 0)[2] == [m], rd(m), rd(m))
 termios.tcflush(m, termios.TCIOFLUSH)
 print("master TCIOFLUSH", events(m), rd(m))
-# TCSETSF 从哪一边都是清空从设备的输入
+# TCSETSF from either side flushes the slave's input
 termios.tcsetattr(m, termios.TCSAFLUSH, termios.tcgetattr(m))
 print("TCSAFLUSH via master", rd(m))
 termios.tcsetattr(s, termios.TCSADRAIN, termios.tcgetattr(s))
 print("TCSADRAIN", rd(m))
 
-# 停住、恢复：TCOOFF/TCOON 和 ^S/^Q；两个都发生过时只剩后一个
+# Stop and resume: TCOOFF/TCOON and ^S/^Q; when both have happened only the latter remains
 termios.tcflow(s, termios.TCOOFF)
 print("TCOOFF", rd(m))
 termios.tcflow(s, termios.TCOOFF)
@@ -240,7 +246,7 @@ termios.tcflow(m, termios.TCOOFF)
 termios.tcflow(m, termios.TCOON)
 print("master TCOOFF/TCOON", rd(m))
 
-# ^S/^Q 流控的开关：IXON、VSTOP、VSTART 都要是默认的才算
+# Toggling ^S/^Q flow control: it counts only if IXON, VSTOP and VSTART are all at their defaults
 change(s, lambda a: a.__setitem__(0, a[0] & ~termios.IXON))
 print("IXON off", rd(m))
 change(s, lambda a: a.__setitem__(0, a[0] & ~termios.IXON))
@@ -266,8 +272,9 @@ print("EXTPROC kept", rd(m))
 change(s, lambda a: a.__setitem__(3, a[3] & ~EXTPROC))
 print("EXTPROC off", rd(m), rd(m))
 
-# ^C：没有前台进程组也清空两边（没设 NOFLSH）。关掉回显：Linux 清空输出只清还在 flip
-# buffer 里的，回显什么时候到主设备那边说不准
+# ^C: flushes both sides even without a foreground process group (NOFLSH not set). Echo turned
+# off: Linux's output flush only clears what is still in the flip buffer, and when the echo
+# reaches the master side is unpredictable
 change(s, lambda a: a.__setitem__(3, a[3] & ~termios.ECHO))
 os.write(m, b"abc\x03")
 wait(m, True)
@@ -280,7 +287,8 @@ change(s, lambda a: a.__setitem__(3, a[3] & ~termios.NOFLSH | termios.ECHO))
 termios.tcflush(s, termios.TCIFLUSH)
 rd(m)
 
-# 关掉包模式：没有头，状态不记；再打开时以前的状态也没有了
+# Turning packet mode off: no header, and statuses are not recorded; when it is turned on again
+# the earlier statuses are gone too
 termios.tcflush(s, termios.TCIFLUSH)
 pkt(m, 0)
 print("off", geti(m, TIOCGPKT), events(m))
@@ -294,7 +302,7 @@ termios.tcflush(s, termios.TCIFLUSH)
 pkt(m, 1)
 print("on while on", rd(m))
 
-# epoll 的 EPOLLPRI
+# EPOLLPRI of epoll
 ep = select.epoll()
 ep.register(m, select.EPOLLIN | select.EPOLLPRI)
 termios.tcflow(s, termios.TCOOFF)
@@ -302,7 +310,7 @@ print("epoll", ep.poll(0), rd(m))
 termios.tcflow(s, termios.TCOON)
 rd(m)
 
-# 从设备都关掉之后：先读完状态和数据，再是 EIO
+# After all slaves are closed: first the status and data are read out, then EIO
 os.write(s, b"last")
 wait(m)
 termios.tcflush(s, termios.TCIFLUSH)
@@ -310,7 +318,8 @@ os.close(s)
 print("closed", events(m), rd(m), rd(m), rd(m))
 os.close(m)
 
-# TIOCSIG：给从设备的前台进程组发信号，只能是 SIGINT、SIGQUIT、SIGTSTP
+# TIOCSIG: sends a signal to the slave's foreground process group; only SIGINT, SIGQUIT and
+# SIGTSTP
 m, s = os.openpty()
 name = os.ttyname(s)
 print("TIOCSIG without fg", err(fcntl.ioctl, m, TIOCSIG, signal.SIGINT), err(fcntl.ioctl, m, TIOCSIG, signal.SIGKILL),
@@ -330,9 +339,10 @@ _, st = os.waitpid(pid, 0)
 print("child", os.WIFSIGNALED(st) and signal.Signals(os.WTERMSIG(st)).name)
 PY
 
-# 新分配的终端：窗口大小全是 0；主设备的读只在从设备打开过、又全部关掉之后才是 EIO（poll
-# 带 POLLHUP，Linux 的 TTY_OTHER_CLOSED），从来没打开过时照常等。GNU screen 的子进程打开从
-# 设备之前，主进程就在读主设备
+# A newly allocated terminal: the window size is all 0; reading the master is EIO only after the
+# slave has been opened and then all closed (poll includes POLLHUP, Linux's TTY_OTHER_CLOSED),
+# and waits as usual when it has never been opened. GNU screen's main process is already reading
+# the master before its child opens the slave
 python3 - <<'PY'
 import errno, fcntl, functools, os, select, struct, time
 
@@ -376,7 +386,7 @@ print("reopened", st(m))
 os.close(s)
 os.close(m)
 
-# 阻塞的读：子进程过一会儿才打开从设备、写一行再关掉
+# Blocking read: the child opens the slave only after a while, writes a line, and closes it
 m = os.open("/dev/ptmx", os.O_RDWR | os.O_NOCTTY)
 name = "/dev/pts/%d" % struct.unpack("I", fcntl.ioctl(m, TIOCGPTN, bytes(4)))[0]
 lock(m, 0)

@@ -1,4 +1,5 @@
-# Debian（glibc）：python 的 venv 和 pip 装 manylinux 的 wheel（numpy、pandas），多线程、多进程
+# Debian (glibc): python's venv, pip installing manylinux wheels (numpy, pandas), multithreading,
+# multiprocessing
 cd /tmp; rm -rf venv; python3 -m venv venv || exit 1
 s=$(date +%s); venv/bin/pip install -q --disable-pip-version-check numpy pandas 2>&1 | tail -2; echo "pip: $? ($(( $(date +%s) - s ))s)"
 venv/bin/pip list 2>/dev/null | grep -iE 'numpy|pandas'

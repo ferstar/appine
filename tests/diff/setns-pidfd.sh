@@ -1,9 +1,11 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
-# setns(2) 经由 pidfd 一次换成那个进程的几种命名空间（Linux 5.8 起）：标志的检查，按用户、
-# 挂载、UTS、IPC、pid、cgroup、网络、time 的顺序逐个检查、全部通过才一起换，一起进了用户
-# 命名空间时后面几种按那里的能力算，多线程、fs 共用、跟踪权限、已经结束的进程。util-linux
-# 2.41 起的 nsenter -t 就是这样进去的，失败了不退回 /proc/<pid>/ns/*。原生一侧是有
-# CAP_SYS_ADMIN 的 docker 容器
+# setns(2) through a pidfd, switching to several of that process's namespaces at once (since
+# Linux 5.8): the flag checks; checking one by one in the order user, mount, UTS, IPC, pid,
+# cgroup, network, time, and switching them together only when all pass; when a user namespace is
+# entered along with them, the later ones are judged by the capabilities there; multiple threads,
+# shared fs, ptrace permission, processes that have already ended. nsenter -t from util-linux
+# 2.41 on enters this way, and does not fall back to /proc/<pid>/ns/* when it fails. The native
+# side is a docker container with CAP_SYS_ADMIN
 cd /tmp
 python3 - <<'PY'
 import ctypes, errno, functools, os, socket, threading, time
@@ -36,7 +38,8 @@ def same(a, b):
 
 
 def fork(body):
-    """在子进程里运行 body 并等它结束；body 抛出的异常也打印出来。"""
+    """Run body in a child process and wait for it to end; an exception body raises is printed
+    too."""
     pid = os.fork()
     if pid == 0:
         try:
@@ -48,8 +51,8 @@ def fork(body):
 
 
 def target(flags, hostname=None, pidns=False, nondumpable=False):
-    """起一个 unshare 了 flags 的进程，返回 (子进程, 目标, 目标的 pidfd)；pidns 时目标是新的
-    pid 命名空间里的 1 号进程（子进程 fork 出来的）。"""
+    """Start a process that has unshared flags and return (child, target, target's pidfd); with
+    pidns the target is process 1 in the new pid namespace (forked by the child)."""
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -98,7 +101,8 @@ class CapData(ctypes.Structure):
 
 
 def drop_caps(effective=(), permitted=()):
-    """capget、capset：从有效集（permitted 的也从允许集）里去掉这些能力。"""
+    """capget, capset: remove these capabilities from the effective set (those in permitted also
+    from the permitted set)."""
     h = CapHeader(0x20080522, 0)
     d = (CapData * 2)()
     assert libc.syscall(90, ctypes.byref(h), d) == 0
@@ -116,7 +120,7 @@ def parked_thread():
     return ev, t
 
 
-# 主机名两边不同：先换进自己的 UTS 命名空间
+# The hostname differs between the two sides: first switch into a UTS namespace of our own
 os.unshare(CLONE_NEWUTS)
 socket.sethostname("outer")
 me = os.pidfd_open(os.getpid())
@@ -161,7 +165,8 @@ def only_mnt():
 fork(only_mnt)
 
 
-# 只换挂载命名空间时 fs 不能和别的线程共用；一起换别的时 Linux 查的是临时复制的 fs，照样成功
+# When switching only the mount namespace, fs must not be shared with other threads; when
+# switching others along with it, Linux checks a temporary copy of fs, so it succeeds anyway
 def threaded():
     ev, th = parked_thread()
     print("threaded mnt only", err(os.setns, t[2], CLONE_NEWNS))
@@ -199,7 +204,8 @@ outer = os.pidfd_open(os.getpid())
 other = target(CLONE_NEWUTS, "other")
 
 
-# 从里层的 pid 命名空间进外层的是 EINVAL，一起要求的 UTS 也不换
+# Entering the outer pid namespace from an inner one is EINVAL, and the UTS namespace requested
+# along with it is not switched either
 def from_inside():
     os.unshare(CLONE_NEWPID)
     c = os.fork()
@@ -219,7 +225,8 @@ print("== user")
 t = target(CLONE_NEWUSER | CLONE_NEWUTS, "userns")
 
 
-# 没有 CAP_SYS_ADMIN 也是那个用户命名空间的属主：只进 UTS 不行，连同用户命名空间一起进可以
+# Without CAP_SYS_ADMIN but owning that user namespace: entering only UTS fails, entering it
+# together with the user namespace works
 def without_sys_admin():
     drop_caps(effective=[CAP_SYS_ADMIN])
     print("uts alone", err(os.setns, t[2], CLONE_NEWUTS), socket.gethostname())
@@ -266,7 +273,7 @@ os.waitpid(c, 0)
 print("reaped", err(os.setns, fd, CLONE_NEWUTS))
 PY
 
-# util-linux 的 nsenter -t、unshare
+# util-linux's nsenter -t and unshare
 echo "== nsenter $(nsenter --version | grep -c util-linux)"
 rm -f /tmp/ready*
 wait_for() { while [ ! -e "$1" ]; do sleep 0.01; done; }
@@ -289,9 +296,10 @@ wait_for /tmp/ready3
 nsenter -t $p3 -U -u sh -c 'echo "user: $(hostname) uid $(id -u) map $(tr -s " " </proc/self/uid_map)"'
 nsenter -t $p3 -a sh -c 'echo "user -a: $(hostname) uid $(id -u)"'
 echo "unshare -r: $(unshare -r sh -c 'id -u; id -g; cat /proc/self/setgroups' | tr '\n' ' ')"
-# unshare -f 的父进程等子进程时屏蔽了 SIGTERM，子进程是新的 pid 命名空间里的 1 号进程，
-# 祖先命名空间发来的信号只有 SIGKILL、SIGSTOP 一定送到：用 SIGKILL 杀它，不然 wait 要等
-# 里面的 sleep 100 自己结束
+# The parent of unshare -f blocks SIGTERM while waiting for the child, and the child is process 1
+# in a new pid namespace, to which only SIGKILL and SIGSTOP from ancestor namespaces are sure to
+# be delivered: kill it with SIGKILL, otherwise wait would have to wait for the sleep 100 inside
+# to end by itself
 kill $p1 $p2 $p3
 kill -9 $(pgrep -P $p2)
 wait

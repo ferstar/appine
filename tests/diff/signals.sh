@@ -1,5 +1,6 @@
-# 同步信号的 siginfo 和 ucontext：精确异常时寄存器、出错地址、ESR 的 EC 和 WnR 都要与
-# 硬件一致。x19–x28 先设成已知的值，其中 x27、x28 在 Tier 1 里存放在 cpu 结构体中
+# siginfo and ucontext of synchronous signals: on precise exceptions the registers, the fault
+# address, and the EC and WnR of ESR must all match the hardware. x19–x28 are first set to known
+# values; of them, x27 and x28 are kept in the cpu struct in Tier 1
 set -e
 cd /tmp
 cat > diff2.c <<'C'
@@ -26,7 +27,8 @@ static void handler(int sig, siginfo_t *si, void *ctx)
             wnr = ec == 0x24 ? (unsigned)(esr >> 6 & 1) : 0;
         }
     }
-    /* 出错地址：数据访问相对 target，指令相对 pc，SP 对齐错误相对 sp */
+    /* Fault address: relative to target for data accesses, to pc for instructions, to sp for SP
+     * alignment faults */
     long addr = (long)((char *)si->si_addr - target);
     if (sig == SIGILL || sig == SIGTRAP)
         addr = (long)((uint64_t)si->si_addr - mc->pc);
@@ -36,7 +38,7 @@ static void handler(int sig, siginfo_t *si, void *ctx)
     for (int r = 19; r <= 28; r++)
         printf(" %llx", (unsigned long long)mc->regs[r]);
     printf("\n");
-    mc->pc += 4; /* 跳过出错的指令 */
+    mc->pc += 4; /* skip the faulting instruction */
 }
 
 #define FAULT(insn, addr)                                                                          \
@@ -62,12 +64,12 @@ int main(void)
     target = mmap(NULL, 2 * page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     munmap(target + page, page);
     setvbuf(stdout, NULL, _IONBF, 0);
-    FAULT("ldr x0, [%0, #4096]", target);       /* 读未映射的页 */
-    FAULT("str xzr, [%0, #8]", target);         /* 写只读的页 */
-    FAULT("sub sp, sp, #8\n\tldr x0, [sp]\n\tadd sp, sp, #8", target); /* SP 没有对齐 */
-    FAULT("ldp x0, x1, [%0]", target + 4088);   /* 跨进未映射的页 */
-    FAULT("udf #0", target);                    /* 未定义指令 */
-    FAULT("brk #7", target);                    /* 断点 */
+    FAULT("ldr x0, [%0, #4096]", target);       /* read an unmapped page */
+    FAULT("str xzr, [%0, #8]", target);         /* write a read-only page */
+    FAULT("sub sp, sp, #8\n\tldr x0, [sp]\n\tadd sp, sp, #8", target); /* SP not aligned */
+    FAULT("ldp x0, x1, [%0]", target + 4088);   /* cross into an unmapped page */
+    FAULT("udf #0", target);                    /* undefined instruction */
+    FAULT("brk #7", target);                    /* breakpoint */
     printf("done\n");
     return 0;
 }

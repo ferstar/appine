@@ -1,7 +1,8 @@
-# nmap：以 root 运行时默认走 raw socket（SYN 扫描、ICMP/ARP 主机发现），Android 上的 App
-# 建不了这种 socket；NMAP_UNPRIVILEGED 让它改用 connect 扫描（docs/rounds/152-nmap-unprivileged.md）。
-# 原生对照：`scripts/survey -n alpine:3.24 nmap`，再加 SURVEY_DOCKER_OPTS=--cap-drop=NET_RAW
-# 就是没有 CAP_NET_RAW 的 root（与 Android 上的 App 一样）
+# nmap: run as root it uses raw sockets by default (SYN scans, ICMP/ARP host discovery), which an
+# app on Android cannot create; NMAP_UNPRIVILEGED makes it use connect scans instead
+# (docs/rounds/152-nmap-unprivileged.md).
+# Native comparison: `scripts/survey -n alpine:3.24 nmap`; adding
+# SURVEY_DOCKER_OPTS=--cap-drop=NET_RAW makes it root without CAP_NET_RAW (like the app on Android)
 [ -f /usr/share/nmap/nse_main.lua ] || apk add -q nmap nmap-nselibs nmap-scripts
 command -v python3 >/dev/null || apk add -q python3
 nmap --version | head -1

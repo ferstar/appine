@@ -1,13 +1,15 @@
 # docker-run-options: --privileged
-# cgroup v2 的视图：/proc/<pid>/cgroup、/proc/cgroups、挂载、/sys/fs/cgroup 里文件的权限和
-# 内容，以及 JVM、Node.js 看到的内存上限与 memory.max 一致。原生一侧是 docker 的特权容器
-# （cgroup 命名空间、可写的挂载、没有 --memory），memory.max 等取决于宿主的值只比它们是否
-# 自洽。写和子 cgroup 见 cgroup-tree
+# The cgroup v2 view: /proc/<pid>/cgroup, /proc/cgroups, the mount, the permissions and contents
+# of the files in /sys/fs/cgroup, and that the memory limits the JVM and Node.js see agree with
+# memory.max. The native side is a privileged docker container (cgroup namespace, writable
+# mount, no --memory); for memory.max and the others that depend on host values, only whether
+# they are self-consistent is compared. Writes and child cgroups are in cgroup-tree
 cd /sys/fs/cgroup
 echo "self: $(cat /proc/self/cgroup)"
 echo "shell: $(cat /proc/$$/cgroup)"
-# /proc/cgroups 列出哪些控制器取决于内核的配置（新内核不列没有 v1 支持的 cpuset、memory），
-# 只比都在 v2 的层级（0）上、有 cpu
+# Which controllers /proc/cgroups lists depends on the kernel configuration (newer kernels do not
+# list cpuset and memory without v1 support), so only that all are on the v2 hierarchy (0) and
+# that cpu is there is compared
 head -1 /proc/cgroups
 awk 'NR > 1 && $2 != 0 { v1 = 1 } $1 == "cpu" { cpu = 1 }
     END { print (v1 ? "a v1 hierarchy" : "all on the v2 hierarchy"), (cpu ? "with cpu" : "without cpu") }' \
@@ -19,8 +21,9 @@ stat -c '%A %n' /sys/fs/cgroup
 for c in cpuset cpu memory pids; do
     grep -qw $c cgroup.controllers && echo "controller $c"
 done
-# 内容与宿主无关的文件。appine 报告 6.1，新内核在 cgroup.stat、memory.events、cpu.stat、
-# pids.events 里多了项（nr_subsys_*、sock_throttled、nice_usec……），这几个只比 6.1 就有的
+# Files whose contents do not depend on the host. appine reports 6.1, and newer kernels have extra
+# entries in cgroup.stat, memory.events, cpu.stat and pids.events (nr_subsys_*, sock_throttled,
+# nice_usec...), so for these only the entries 6.1 already has are compared
 for f in cgroup.events cgroup.freeze cgroup.max.depth cgroup.max.descendants \
     cgroup.subtree_control cgroup.type cpu.idle cpu.max cpu.max.burst cpu.weight \
     cpu.weight.nice cpuset.cpus cpuset.cpus.effective cpuset.cpus.partition cpuset.mems \
@@ -39,14 +42,16 @@ for k in usage_usec user_usec system_usec nr_periods nr_throttled throttled_usec
     grep -q "^$k " cpu.stat && printf '%s ' $k
 done
 echo
-# memory.stat：新内核加了项，有没有 swapcached、*_thp、zswap 又取决于内核的配置，只比 6.1
-# 就有、不取决于配置的项的顺序，以及值都是数字
+# memory.stat: newer kernels added entries, and whether swapcached, *_thp and zswap are present
+# also depends on the kernel configuration, so only the order of the entries that 6.1 already has
+# and that do not depend on the configuration is compared, and that the values are all numbers
 echo "$(stat -c %A memory.stat) memory.stat: $(grep -oE '^[a-z_]+' memory.stat | grep -xE \
     'anon|file|kernel|kernel_stack|pagetables|sec_pagetables|percpu|sock|vmalloc|shmem|file_mapped|file_dirty|file_writeback|inactive_anon|active_anon|inactive_file|active_file|unevictable|slab_reclaimable|slab_unreclaimable|slab|workingset_[a-z_]+|pgscan|pgsteal|pgscan_kswapd|pgscan_direct|pgsteal_kswapd|pgsteal_direct|pgfault|pgmajfault|pgrefill|pgactivate|pgdeactivate|pglazyfree|pglazyfreed' |
     tr '\n' ' ')"
 grep -vqE '^[a-z_]+ [0-9]+$' memory.stat || echo "memory.stat has a line that is not a name and a number"
-# 取决于宿主和当时的状态的：只比格式（6.12 起 memory.peak 可写，不比它的权限；容器的
-# pids.max 可能有限制）
+# Those that depend on the host and the state at the time: only the format is compared (from 6.12
+# on memory.peak is writable, so its permissions are not compared; the container's pids.max may
+# have a limit)
 for f in cgroup.controllers cgroup.procs cgroup.threads memory.current memory.max \
     memory.swap.max pids.current pids.max cpu.stat; do
     echo "$(stat -c %A $f) $f"
@@ -59,13 +64,14 @@ for f in memory.max pids.max; do
 done
 grep -qx $$ cgroup.procs && echo "the shell is in cgroup.procs"
 grep -qx $$ cgroup.threads && echo "the shell is in cgroup.threads"
-# 可写的挂载（不写根的 cgroup.freeze 这些：原生一侧会冻住整个容器）：只读的文件写不了，
-# 建不了文件、删不了接口文件，子 cgroup 可以建、删
+# Writable mount (without writing the root's cgroup.freeze and the like: on the native side that
+# would freeze the whole container): read-only files cannot be written, files cannot be created
+# and interface files cannot be deleted, child cgroups can be created and removed
 echo 1 > memory.current
 touch new
 rm -f memory.max
 mkdir sub && rmdir sub && echo "mkdir and rmdir sub"
-# 运行时看到的内存上限：memory.max 是 max 时就是物理内存
+# The memory limit runtimes see: when memory.max is max it is the physical memory
 limit=$(cat memory.max)
 total=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) * 1024))
 cat > /tmp/Mem.java <<'J'
@@ -80,8 +86,9 @@ J
 jvm=$(java /tmp/Mem.java)
 if [ "$limit" = max ]; then want=$total; else want=$limit; fi
 [ "$jvm" = "$want" ] && echo "the JVM sees the limit" || echo "the JVM sees $jvm, not $want"
-# 挂载可写时 JVM 只在有 CPU 或内存的限制时当作在容器里（appine 的 memory.max 是 OOM killer
-# 的上限，原生一侧通常没有），在容器里时没有 CPU 配额
+# With a writable mount the JVM considers itself in a container only when there is a CPU or memory
+# limit (appine's memory.max is the OOM killer's limit, which the native side usually lacks), and
+# in a container there is no CPU quota
 s=$(java -XshowSettings:system -version 2>&1)
 echo "$s" | grep Provider
 if echo "$s" | grep -q 'not containerized'; then jvm=max; else jvm=$limit; fi

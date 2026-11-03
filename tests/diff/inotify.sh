@@ -1,6 +1,7 @@
-# inotify：目录和文件上的事件及其顺序、rename 的 cookie、覆盖和交换、一次性监视、
-# IN_IGNORED、错误码、FIONREAD、poll 和阻塞读、按 fd 的事件报给哪个目录；Java 的
-# WatchService 和 Node.js 的 fs.watch 建立在它上面
+# inotify: events on directories and files and their order, rename cookies, overwriting and
+# exchanging, one-shot watches, IN_IGNORED, error codes, FIONREAD, poll and blocking reads, which
+# directory fd-based events are reported to; Java's WatchService and Node.js's fs.watch are built
+# on it
 set -e
 mkdir -p /tmp/diff-inotify
 cd /tmp/diff-inotify
@@ -42,7 +43,7 @@ static void print_mask(unsigned m)
         printf(" OVERFLOW");
 }
 
-/* 读出现在排队的所有事件；cookie 只打印和上一个 MOVED_FROM 是否相同 */
+/* Read all events queued now; for cookies print only whether each equals the last MOVED_FROM's */
 static void drain(const char *step)
 {
     char buf[4096] __attribute__((aligned(8)));
@@ -129,7 +130,8 @@ int main(void)
     printf("fionread %d short read %zd %d\n", avail, read(in, buf, 8), errno);
     drain("after errors");
 
-    /* 阻塞读：子进程过一会儿新建目录（只产生一个事件，结果不依赖父进程醒来的时机） */
+    /* Blocking read: the child creates a directory after a while (only one event, so the result
+     * does not depend on when the parent wakes up) */
     fcntl(in, F_SETFL, 0);
     pid_t pid = fork();
     if (pid == 0) {
@@ -156,8 +158,9 @@ C
 gcc -O2 -o ino ino.c
 ./ino
 
-# 按 fd 的事件跟着打开时经过的目录项：监视建立之前打开的文件、打开之后改名、删除时
-# 还打开着（IN_DELETE_SELF 等到关闭）、硬链接、打开着的目录被 rmdir
+# fd-based events follow the directory entry the file was opened through: a file opened before
+# the watch was set up, renamed after opening, still open when deleted (IN_DELETE_SELF waits for
+# the close), hard links, an open directory removed with rmdir
 cat > fdev.c <<'C'
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -190,27 +193,27 @@ static void drain(const char *tag) {
 int main(void) {
     mkdir("/tmp/diff-inotify/fd", 0755); mkdir("/tmp/diff-inotify/fd/a", 0755); mkdir("/tmp/diff-inotify/fd/b", 0755);
     in = inotify_init1(IN_NONBLOCK);
-    /* 1. 建监视之前打开的文件 */
+    /* 1. A file opened before the watch is set up */
     int fd = open("/tmp/diff-inotify/fd/a/x", O_CREAT | O_WRONLY, 0644);
     wa = inotify_add_watch(in, "/tmp/diff-inotify/fd/a", IN_ALL_EVENTS);
     wb = inotify_add_watch(in, "/tmp/diff-inotify/fd/b", IN_ALL_EVENTS);
     write(fd, "1", 1);
     close(fd);
     drain("pre-open close");
-    /* 2. 打开之后改名到另一个目录 */
+    /* 2. Renamed into another directory after opening */
     fd = open("/tmp/diff-inotify/fd/a/x", O_WRONLY);
     rename("/tmp/diff-inotify/fd/a/x", "/tmp/diff-inotify/fd/b/y");
     write(fd, "2", 1);
     close(fd);
     drain("rename then write");
-    /* 3. 打开着删除最后一个链接 */
+    /* 3. Delete the last link while open */
     wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/b/y", IN_ALL_EVENTS);
     fd = open("/tmp/diff-inotify/fd/b/y", O_RDONLY);
     unlink("/tmp/diff-inotify/fd/b/y");
     drain("unlink while open");
     close(fd);
     drain("close after unlink");
-    /* 4. 两个打开 */
+    /* 4. Two opens */
     int f1 = open("/tmp/diff-inotify/fd/b/z", O_CREAT | O_RDWR, 0644);
     int f2 = open("/tmp/diff-inotify/fd/b/z", O_RDONLY);
     wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/b/z", IN_ALL_EVENTS);
@@ -220,7 +223,7 @@ int main(void) {
     drain("close one");
     close(f2);
     drain("close two");
-    /* 5. 硬链接 */
+    /* 5. Hard links */
     fd = open("/tmp/diff-inotify/fd/a/h", O_CREAT | O_RDWR, 0644);
     link("/tmp/diff-inotify/fd/a/h", "/tmp/diff-inotify/fd/b/h");
     wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/a/h", IN_ALL_EVENTS);
@@ -230,12 +233,12 @@ int main(void) {
     drain("unlink other link");
     close(fd);
     drain("close hardlinked");
-    /* 6. 没有打开时删除 */
+    /* 6. Delete while not open */
     close(open("/tmp/diff-inotify/fd/a/q", O_CREAT | O_RDWR, 0644));
     wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/a/q", IN_ALL_EVENTS);
     unlink("/tmp/diff-inotify/fd/a/q");
     drain("unlink closed");
-    /* 7. 打开着的目录 rmdir */
+    /* 7. rmdir of an open directory */
     mkdir("/tmp/diff-inotify/fd/a/d", 0755);
     wf = inotify_add_watch(in, "/tmp/diff-inotify/fd/a/d", IN_ALL_EVENTS);
     fd = open("/tmp/diff-inotify/fd/a/d", O_RDONLY | O_DIRECTORY);

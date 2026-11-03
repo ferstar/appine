@@ -1,11 +1,13 @@
-//! 端到端测试：用宿主 `cc` 把 tests/guest/*.S 汇编成静态 ELF，用 `musl-gcc` 把
-//! tests/guest/*.c 编译成静态链接 musl 的程序，再交给 appine-run 运行。每个用例都
-//! 分别在 Tier 0 和 Tier 1 下运行，结果必须相同。
+//! End-to-end tests: tests/guest/*.S are assembled into static ELFs with the host `cc`, and
+//! tests/guest/*.c are compiled into programs statically linked with musl by `musl-gcc`, then they
+//! are run by appine-run. Each test case runs under Tier 0 and under Tier 1 separately, and the
+//! results must be the same.
 //!
-//! 找不到 musl-gcc（Debian/Ubuntu 的 musl-tools）时跳过 C 程序；设置
-//! `APPINE_REQUIRE_MUSL=1`（CI 这样做）时改为失败。
+//! Without musl-gcc (Debian/Ubuntu's musl-tools) the C programs are skipped; with
+//! `APPINE_REQUIRE_MUSL=1` (as CI sets) that becomes a failure.
 //!
-//! 生成 Linux aarch64 ELF 需要 Linux arm64 宿主（设计文档 §13.3），其他宿主上整个文件不参与编译。
+//! Producing Linux aarch64 ELFs needs a Linux arm64 host (design doc §13.3); on other hosts the
+//! whole file is not compiled.
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
 use std::path::{Path, PathBuf};
@@ -13,8 +15,9 @@ use std::process::{Command, Output};
 
 const TIERS: [&str; 2] = ["0", "1"];
 
-/// 编译好的 guest 程序的路径，和编译时写的临时文件：几个用例可能同时编译同一个程序，
-/// 各自写完再改名过去，免得运行到别人写了一半的文件。
+/// The path of a built guest program, and the temporary file written while building it: several
+/// test cases may build the same program at once; each writes its own and then renames it into
+/// place, so that none runs a file another one has half written.
 fn output(name: &str) -> (PathBuf, PathBuf) {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -46,7 +49,7 @@ fn build_guest(name: &str) -> PathBuf {
     out
 }
 
-/// 用 musl-gcc 静态编译 tests/guest/<name>.c；没有 musl-gcc 时返回 None。
+/// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.
 fn build_c_guest(name: &str) -> Option<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/guest")
@@ -72,7 +75,7 @@ fn build_c_guest(name: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// 在每个执行层下运行一次 guest 程序，返回 (执行层, 输出)。
+/// Runs a guest program once under each tier, returning (tier, output).
 fn run(name: &str, args: &[&str]) -> Vec<(&'static str, Output)> {
     let program = build_guest(name);
     TIERS
@@ -166,8 +169,9 @@ fn undefined_instruction_kills_guest() {
 
 #[test]
 fn threads_signals_and_fork() {
-    // 互斥锁、条件变量、原子操作、线程局部存储、发给指定线程的信号、备用信号栈、
-    // 访存出错后修复返回、SA_RESTART、多线程进程里的 fork、分离的线程
+    // Mutexes, condition variables, atomics, thread-local storage, signals sent to a given thread,
+    // the alternate signal stack, returning after fixing up a memory access fault, SA_RESTART, fork
+    // in a multithreaded process, detached threads
     let Some(program) = build_c_guest("threads") else {
         return;
     };
@@ -194,8 +198,9 @@ fn threads_signals_and_fork() {
 
 #[test]
 fn thread_churn_keeps_the_host_heap_intact() {
-    // 4 个进程各用 4 个线程不停地创建、join 短命的线程 5 秒：线程退出时在 BKL 外丢掉
-    // Rc 的弱引用会破坏宿主的堆，appine 以 SIGABRT 退出（tests/guest/churn.c）
+    // 4 processes, each with 4 threads that keep creating and joining short-lived threads for 5
+    // seconds: an exiting thread dropping an Rc weak reference outside the BKL corrupts the host
+    // heap, and appine exits with SIGABRT (tests/guest/churn.c)
     let Some(program) = build_c_guest("churn") else {
         return;
     };
@@ -218,8 +223,8 @@ fn thread_churn_keeps_the_host_heap_intact() {
 
 #[test]
 fn sockets_polling_and_timers() {
-    // AF_UNIX（socketpair、SCM_RIGHTS、SO_PEERCRED、抽象地址）、TCP/UDP 回环、netlink、
-    // epoll/eventfd/select、setitimer；都不需要外网
+    // AF_UNIX (socketpair, SCM_RIGHTS, SO_PEERCRED, abstract addresses), TCP/UDP loopback, netlink,
+    // epoll/eventfd/select, setitimer; none of them needs outside network
     let Some(program) = build_c_guest("net") else {
         return;
     };
@@ -246,9 +251,10 @@ fn sockets_polling_and_timers() {
 
 #[test]
 fn bugs_kill_only_the_guest_process() {
-    // 内核层 panic（进入内核时、放开 BKL 时、不持 BKL 的系统调用里、线程开始和退出时、
-    // 定时器线程上）、引擎让宿主出错（用 debug 构建的测试钩子模拟）都只结束撞上它的 guest
-    // 进程，App 里别的照常运行
+    // A kernel-layer panic (on entering the kernel, while the BKL is released, in a no-BKL system
+    // call, when a thread starts and exits, on the timer thread) or the engine making the host
+    // fault (simulated with the test hooks of debug builds) ends only the guest process that hits
+    // it, and everything else in the app keeps running
     if !cfg!(debug_assertions) {
         return;
     }
@@ -275,7 +281,7 @@ fn bugs_kill_only_the_guest_process() {
             "tier {tier}: {}",
             stdout(&out)
         );
-        // 0xa991 是测试钩子的 syscall 编号
+        // 0xa991 is the test hook's syscall number
         for report in [
             "kernel panic in syscall 43409",
             "kernel panic in syscall 113 without the BKL",
@@ -295,8 +301,9 @@ fn bugs_kill_only_the_guest_process() {
 
 #[test]
 fn host_calls_survive_kernel_bugs() {
-    // 宿主调用 Machine 的方法时内核层 panic（测试钩子模拟）：只有这次调用失败，控制台上的
-    // 调用还挂断那个控制台，Machine 之后照常可用
+    // A kernel-layer panic while the host calls a Machine method (simulated by a test hook): only
+    // that call fails, a call on a console also hangs up that console, and the Machine stays usable
+    // afterwards
     use appine_kernel::errno::Errno;
     use appine_kernel::{ExitStatus, KillReason, Machine, MachineOptions, RunError, Stdio, Tier};
     use std::os::unix::ffi::OsStrExt;
@@ -306,8 +313,8 @@ fn host_calls_survive_kernel_bugs() {
     let Some(program) = build_c_guest("bugs") else {
         return;
     };
-    // 内核层只在第一次撞上 bug 时读 APPINE_ON_BUG：在设置了它和 APPINE_TEST_HOOKS 的
-    // 子进程里重新运行这个用例
+    // The kernel layer reads APPINE_ON_BUG only when it first hits a bug: rerun this test case in
+    // a child process that has it and APPINE_TEST_HOOKS set
     if std::env::var_os("APPINE_TEST_HOOKS").is_none() {
         let out = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "host_calls_survive_kernel_bugs", "--nocapture"])
@@ -347,7 +354,7 @@ fn host_calls_survive_kernel_bugs() {
             always_map_low_ports: false,
         })
         .unwrap();
-        // spawn 里出错：spawn 失败
+        // An error in spawn: spawn fails
         let pid = machine
             .spawn(
                 &path(&program),
@@ -359,7 +366,8 @@ fn host_calls_survive_kernel_bugs() {
         assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
         let r = machine.spawn(&path(&hello), &[b"hello".to_vec()], &[], Stdio::Host);
         assert!(matches!(r, Err(RunError::Internal)), "{tier:?}: {r:?}");
-        // 读控制台时出错：控制台被挂断，会话组长收到 SIGHUP
+        // An error while reading the console: the console is hung up, and the session leader
+        // receives SIGHUP
         let id = machine.open_console(24, 80).unwrap();
         let pid = machine
             .spawn(
@@ -375,7 +383,7 @@ fn host_calls_survive_kernel_bugs() {
             "{tier:?}"
         );
         assert_eq!(read_all(&machine, id).1, Err(Errno::ENOENT), "{tier:?}");
-        // 之后照常可用
+        // Usable as usual afterwards
         let id = machine.open_console(24, 80).unwrap();
         let pid = machine
             .spawn(&path(&hello), &[b"hello".to_vec()], &[], Stdio::Console(id))
@@ -387,7 +395,8 @@ fn host_calls_survive_kernel_bugs() {
             "{tier:?}"
         );
         assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
-        // 撞上 bug 被结束的进程留下报告给 App（take_kills）：带着控制台的编号，取走一次就没了
+        // A process killed for hitting a bug leaves a report for the app (take_kills): it carries
+        // the console's number, and once taken it is gone
         assert!(machine.take_kills().is_empty(), "{tier:?}");
         let id = machine.open_console(24, 80).unwrap();
         let pid = machine
@@ -414,15 +423,16 @@ fn host_calls_survive_kernel_bugs() {
                 "{tier:?}: {k:?}"
             );
         }
-        // 报告里有 panic 的消息和位置（bug::install_panic_hook），不只是"syscall 里 panic"
+        // The report holds the panic's message and location (bug::install_panic_hook), not just
+        // "panic in a syscall"
         assert!(
             kills.iter().any(|k| matches!(&k.reason, KillReason::Bug { report, .. } if report.contains(
                 "kernel panic in syscall 43409: panic injected by the test hook at core/kernel/src/bug.rs:"
             ))),
             "{tier:?}: {kills:?}"
         );
-        // 报告带着内核日志：`dmesg` 的写法，最后是报告自己，前面是更早的记录（这里是前一个
-        // bug 的报告）
+        // The report carries the kernel log, as `dmesg` writes it: the report itself last, older
+        // records before it (here the report of the previous bug)
         let reports: Vec<(&str, &[String])> = kills
             .iter()
             .map(|k| match &k.reason {
@@ -454,8 +464,8 @@ fn host_calls_survive_kernel_bugs() {
 
 #[test]
 fn memory_limit_and_thread_limits() {
-    // RLIMIT_NPROC 的默认值和检查（root 不受它限制），超出 App 内存的上限时结束用得最多
-    // 的 guest 进程
+    // RLIMIT_NPROC's default value and checks (root is not limited by it), and over the app's
+    // memory limit the guest process using the most is killed
     let Some(program) = build_c_guest("limits") else {
         return;
     };
@@ -487,8 +497,9 @@ fn memory_limit_and_thread_limits() {
 
 #[test]
 fn main_stack_grows_up_to_rlimit_stack() {
-    // 缺页、syscall 的缓冲区和信号帧都让主线程栈长出来，大小受 RLIMIT_STACK 的当前值
-    // 限制；超出时缺页得到 SIGSEGV，内核访问得到 EFAULT
+    // Page faults, syscall buffers and signal frames all make the main thread's stack grow, its
+    // size limited by the current value of RLIMIT_STACK; beyond that a page fault gets SIGSEGV and
+    // a kernel access gets EFAULT
     let Some(program) = build_c_guest("stack") else {
         return;
     };
@@ -515,9 +526,10 @@ fn main_stack_grows_up_to_rlimit_stack() {
 
 #[test]
 fn ipc_timers_credentials_and_scheduling() {
-    // System V 消息队列、信号量（SEM_UNDO）、共享内存跨 fork，POSIX 定时器（超限次数、
-    // SIGEV_THREAD、CPU 时钟），时钟（不持 BKL 的和持锁的一致），mremap，降低权限之后的
-    // 凭据规则，亲和性和实时策略，RLIMIT_NOFILE，ptrace 的单步、系统调用停止和 process_vm_readv
+    // System V message queues, semaphores (SEM_UNDO) and shared memory across fork, POSIX timers
+    // (overrun counts, SIGEV_THREAD, CPU clocks), clocks (no-BKL and locked ones agree), mremap,
+    // credential rules after dropping privileges, affinity and real-time policies, RLIMIT_NOFILE,
+    // ptrace single-stepping, syscall stops and process_vm_readv
     let Some(program) = build_c_guest("posix") else {
         return;
     };
@@ -544,8 +556,9 @@ fn ipc_timers_credentials_and_scheduling() {
 
 #[test]
 fn self_modifying_code() {
-    // 像 JIT 一样改写代码：同一页反复改写、W^X 的 mprotect、memfd 双映射、另一个线程
-    // 正在执行时改写，以及对未映射地址做缓存维护
+    // Rewriting code as a JIT does: the same page rewritten again and again, W^X mprotect, a dual
+    // memfd mapping, rewriting while another thread is running it, and cache maintenance on
+    // unmapped addresses
     let Some(program) = build_c_guest("jit") else {
         return;
     };

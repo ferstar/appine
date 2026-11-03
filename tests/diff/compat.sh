@@ -1,4 +1,5 @@
-# 不常用但程序会依赖的接口：实时信号排队、pidfd、execveat、终端的属主和权限等
+# Less common interfaces that programs depend on: queueing of real-time signals, pidfd, execveat,
+# the owner and permissions of terminals, and so on
 set -e
 cd /tmp
 cat > rtsig.c <<'C'
@@ -27,7 +28,8 @@ int main(void)
     sigaddset(&set, SIGRTMIN + 1);
     sigaddset(&set, SIGUSR1);
     sigprocmask(SIG_BLOCK, &set, &old);
-    /* 同一个实时信号排三次队，各带各的值；标准信号只挂起一个 */
+    /* Queue the same real-time signal three times, each with its own value; a standard signal is
+     * pending only once */
     for (int i = 1; i <= 3; i++)
         sigqueue(getpid(), SIGRTMIN + 1, (union sigval){.sival_int = i});
     for (int i = 4; i <= 5; i++)
@@ -42,7 +44,7 @@ int main(void)
     printf("usr1 again %d\n", sigtimedwait(&(sigset_t){0}, NULL, &zero) == -1 && errno == EAGAIN);
     sig = sigwaitinfo(&set, &si);
     printf("wait %d value %d\n", sig - SIGRTMIN, si.si_value.sival_int);
-    /* 剩下的交给处理函数：编号小的先，同一种按排队的先后 */
+    /* The rest goes to the handler: lower numbers first, the same signal in queueing order */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = handler;
@@ -54,8 +56,8 @@ int main(void)
     for (int i = 0; i < n; i++)
         printf(" %d", got[i]);
     printf("\n");
-    /* 队列满了：sigqueue 返回 EAGAIN，kill 照样挂起。Linux 按用户计数，同一用户的
-       其他进程也算在内，所以上限设成 0 */
+    /* Queue full: sigqueue returns EAGAIN, kill still leaves it pending. Linux counts per user,
+       including the user's other processes, so the limit is set to 0 */
     struct rlimit rl = {0, 0};
     setrlimit(RLIMIT_SIGPENDING, &rl);
     sigprocmask(SIG_BLOCK, &set, NULL);
@@ -74,9 +76,10 @@ C
 gcc -O1 -o rtsig rtsig.c
 ./rtsig
 
-# pidfd：进程结束时可读，waitid(P_PIDFD) 等它，pidfd_send_signal 发信号，
-# pidfd_getfd 复制它的 fd；clone 和 clone3 的 CLONE_PIDFD。只测 6.1 和更新的内核
-# 行为相同的部分（6.9 起回收之后有 POLLHUP，CLONE_PIDFD 可以和 CLONE_THREAD 一起用）
+# pidfd: readable when the process ends, waitid(P_PIDFD) waits for it, pidfd_send_signal sends
+# signals, pidfd_getfd copies its fds; CLONE_PIDFD of clone and clone3. Only the parts where 6.1
+# and newer kernels behave the same are tested (from 6.9 on there is POLLHUP after reaping, and
+# CLONE_PIDFD can be used together with CLONE_THREAD)
 cat > pidfd.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -92,7 +95,7 @@ cat > pidfd.c <<'C'
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* 镜像里没有 linux-headers */
+/* The image has no linux-headers */
 #define P_PIDFD 3
 #define PIDFD_NONBLOCK O_NONBLOCK
 #define CLONE_CLEAR_SIGHAND 0x100000000ULL
@@ -135,7 +138,7 @@ int main(void)
     printf("link %s\n", link);
     printf("readable before %d\n", readable(fd, 50));
     printf("read %zd %s\n", read(fd, path, 8), strerror(errno));
-    /* 子进程打开文件后才能取它的 fd：轮询到 42 号有效为止 */
+    /* Its fd can be taken only after the child opens the file: poll until fd 42 is valid */
     int copy = -1;
     for (int i = 0; i < 200 && copy < 0; i++) {
         copy = pidfd_getfd(fd, 42, 0);
@@ -164,7 +167,8 @@ int main(void)
     close(fd);
     close(nb);
 
-    /* 给自己发：pidfd 和 /proc/self 目录都行，带 siginfo 时 si_signo 要一致 */
+    /* Sending to ourselves: both a pidfd and the /proc/self directory work, and with a siginfo
+     * si_signo must match */
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGUSR1);
@@ -182,7 +186,8 @@ int main(void)
     printf("bad flags %d %s\n", pidfd_send_signal(self, SIGUSR1, NULL, 1 << 8), strerror(errno));
     printf("not pidfd %d %s\n", pidfd_send_signal(1, SIGUSR1, NULL, 0), strerror(errno));
 
-    /* clone(CLONE_PIDFD) 写到 parent_tid，不能和 CLONE_PARENT_SETTID 一起用 */
+    /* clone(CLONE_PIDFD) writes to parent_tid, and cannot be used together with
+     * CLONE_PARENT_SETTID */
     int cfd = -1;
     pid = syscall(SYS_clone, CLONE_PIDFD | SIGCHLD, 0, &cfd, 0, 0);
     if (pid == 0)
@@ -193,7 +198,7 @@ int main(void)
     printf("clone settid %ld %s\n", syscall(SYS_clone, CLONE_PIDFD | CLONE_PARENT_SETTID | SIGCHLD, 0, &cfd, 0, 0),
            strerror(errno));
 
-    /* clone3：pidfd 单独一个字段，exit_signal 也是 */
+    /* clone3: the pidfd is a field of its own, and so is exit_signal */
     struct clone_args args;
     memset(&args, 0, sizeof args);
     int c3 = -1;
@@ -220,7 +225,7 @@ int main(void)
     args.flags = 0;
     args.stack = (uintptr_t)big;
     printf("clone3 stack no size %ld %s\n", syscall(SYS_clone3, &args, sizeof args), strerror(errno));
-    /* CLONE_CLEAR_SIGHAND：处理函数恢复默认，忽略的仍然忽略 */
+    /* CLONE_CLEAR_SIGHAND: handlers are reset to default, ignored signals stay ignored */
     signal(SIGUSR2, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -245,8 +250,8 @@ C
 gcc -O1 -o pidfd pidfd.c
 ./pidfd
 
-# execveat：相对目录 fd 的路径、AT_EMPTY_PATH（fexecve）、AT_SYMLINK_NOFOLLOW；新程序
-# 看到的 AT_EXECFN 和 comm 是 /dev/fd/<n>[/<路径>]
+# execveat: paths relative to a directory fd, AT_EMPTY_PATH (fexecve), AT_SYMLINK_NOFOLLOW; the
+# AT_EXECFN and comm the new program sees are /dev/fd/<n>[/<path>]
 mkdir -p /tmp/xat
 cat > /tmp/xat/show.c <<'C'
 #include <stdio.h>
@@ -306,7 +311,7 @@ int main(void)
     run("bad flags", dir, "show", -1);
     run("not a dir", opath, "show", 0);
     run("empty without flag", dir, "", 0);
-    /* 脚本：close-on-exec 的 fd 在解释器打开它之前就关了 */
+    /* Script: a close-on-exec fd is closed before the interpreter opens it */
     int s = open("/tmp/xat/script", O_CREAT | O_WRONLY | O_TRUNC, 0755);
     dprintf(s, "#!/bin/sh\necho script $0\n");
     close(s);
@@ -322,8 +327,9 @@ gcc -O1 -o /tmp/xat/show /tmp/xat/show.c
 gcc -O1 -o xatest xat.c
 ./xatest
 
-# /proc/net/{tcp,tcp6,udp,udp6,icmp,icmp6,raw,unix}：按 fstat 的 inode 找到自己的
-# socket，只看与环境无关的列（端口是临时分配的，只比较是否与 getsockname 一致）
+# /proc/net/{tcp,tcp6,udp,udp6,icmp,icmp6,raw,unix}: find our own sockets by fstat's inode and
+# look only at the columns that do not depend on the environment (ports are allocated
+# ephemerally, so only whether they agree with getsockname is compared)
 cat > procnet.c <<'C'
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -351,7 +357,8 @@ static unsigned port(int fd, int peer)
     return ntohs(((struct sockaddr_in *)&ss)->sin_port);
 }
 
-/* 在 /proc/net/<file> 里找 inode 为 fd 的那一行，打印地址、端口和状态 */
+/* Find the line whose inode is fd's in /proc/net/<file>, and print the addresses, ports and
+ * state */
 static void inet(const char *file, const char *what, int fd)
 {
     char path[64], line[512];
@@ -377,7 +384,8 @@ static void inet(const char *file, const char *what, int fd)
     fclose(f);
 }
 
-/* raw socket 的一行：本端的"端口"是协议号，对端端口总是 0，行尾不补空格 */
+/* A raw socket's line: the local "port" is the protocol number, the remote port is always 0, and
+ * the end of the line is not padded with spaces */
 static void raw_line(const char *file, const char *what, int fd)
 {
     char path[64], line[512];
@@ -452,7 +460,7 @@ int main(void)
     bind(udp6, (struct sockaddr *)&a6, sizeof a6);
     inet("udp6", "bound", udp6);
     inet("tcp", "tcp6 socket", lis6);
-    /* ping socket 列在 icmp 里，raw ICMP socket 列在 raw 里 */
+    /* Ping sockets are listed in icmp, raw ICMP sockets in raw */
     struct sockaddr_in p = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     int ping = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     bind(ping, (struct sockaddr *)&p, sizeof p);
@@ -494,13 +502,15 @@ C
 gcc -O1 -o procnet procnet.c
 ./procnet
 
-# /proc/net/if_inet6：回环的那一行（别的接口的地址取决于容器的网络）。环境里没有 IPv6 时
-# 两边都没有这一行
+# /proc/net/if_inet6: the loopback line (addresses of other interfaces depend on the container's
+# network). Without IPv6 in the environment neither side has this line
 grep ' lo$' /proc/net/if_inet6 || echo "if_inet6: no lo"
 
-# 接口的流量计数：/proc/net/dev 的表头和 lo 那一行的格式，/sys/class/net/lo 的属性和
-# statistics 下的文件；在回环上收发之后 lo 的计数至少增加载荷的字节数（Linux 还算协议头，
-# appine 只数载荷），两处读到的相同。别的接口取决于容器的网络
+# Interface traffic counters: the header of /proc/net/dev and the format of the lo line, the
+# attributes of /sys/class/net/lo and the files under statistics; after sending and receiving on
+# loopback lo's counters grow by at least the payload bytes (Linux also counts protocol headers,
+# appine counts only the payload), and both places read the same. Other interfaces depend on the
+# container's network
 head -n 2 /proc/net/dev
 grep '^ *lo:' /proc/net/dev | awk '{ print "lo fields:", NF }'
 for f in addr_len address broadcast carrier flags ifindex iflink mtu operstate type; do
@@ -547,9 +557,11 @@ same = b["proc"] == (b["rx_bytes"], b["rx_packets"], b["tx_bytes"], b["tx_packet
 print("/proc/net/dev and sysfs", "agree" if same else "disagree")
 PY
 
-# NETLINK_GENERIC：nlctrl 的 GETFAMILY（按名字、按编号、转储）、GETPOLICY，查不存在的族、
-# 发往不存在的族编号、nlctrl 不认识的命令；回答的属性、错误码、确认的标志和错误消息附上
-# 的长度。转储里只看 nlctrl，别的族取决于内核配置
+# NETLINK_GENERIC: nlctrl's GETFAMILY (by name, by ID, dump) and GETPOLICY, querying a family
+# that does not exist, sending to a family ID that does not exist, commands nlctrl does not know;
+# the attributes of the replies, error codes, ack flags and the length attached to error
+# messages. In the dump only nlctrl is looked at; other families depend on the kernel
+# configuration
 cat > genl.c <<'C'
 #include <errno.h>
 #include <stdint.h>
@@ -559,7 +571,7 @@ cat > genl.c <<'C'
 #include <sys/time.h>
 #include <unistd.h>
 
-/* linux/netlink.h、linux/genetlink.h 里的（仓库里没有内核头文件） */
+/* From linux/netlink.h and linux/genetlink.h (the store has no kernel headers) */
 #define NETLINK_GENERIC 16
 #define NLM_F_REQUEST 1
 #define NLM_F_MULTI 2
@@ -648,7 +660,7 @@ static void attrs(struct nlattr *a, int len, int depth)
     }
 }
 
-/* 读回答直到 DONE、ERROR 或者没有更多 */
+/* Read replies until DONE, ERROR or nothing more */
 static void replies(const char *what)
 {
     printf("== %s\n", what);
@@ -676,7 +688,8 @@ static void replies(const char *what)
                        g->cmd, g->version);
             struct nlattr *a = (void *)((char *)g + GENL_HDRLEN);
             int len = h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
-            /* 转储里只看 nlctrl，别的族取决于内核配置 */
+            /* In the dump only nlctrl is looked at; other families depend on the kernel
+             * configuration */
             if (h->nlmsg_flags & NLM_F_MULTI) {
                 char *name = NULL;
                 for (int l = len; l >= NLA_HDRLEN; ) {
@@ -736,11 +749,13 @@ C
 gcc -O1 -o genl genl.c
 ./genl
 
-# 路由表：RTM_GETROUTE 的转储和单条查询（经由网关、同一网段、本机地址、回环网段、网段
-# 广播、组播、::1、没有 IPv6 路由），RTM_GETRULE 的转储，逐字节比对；RTM_GETNEIGH 的转储
-# 以 NLMSG_DONE 结束。转储怎么分成数据报随内核版本变（6.10 起有的转储把 NLMSG_DONE 并进
-# 最后一个数据报），只看消息。本机地址打印成 SELF，接口编号打印成名字；rta_cacheinfo 里
-# 路由缓存条目的引用数、上次使用的时间不确定，只比错误码
+# Routing tables: RTM_GETROUTE dumps and single lookups (through a gateway, the same subnet, a
+# local address, the loopback subnet, subnet broadcast, multicast, ::1, no IPv6 route), the
+# RTM_GETRULE dump, compared byte by byte; the RTM_GETNEIGH dump ending with NLMSG_DONE. How a
+# dump is split into datagrams varies with the kernel version (from 6.10 on some dumps merge
+# NLMSG_DONE into the last datagram), so only the messages are looked at. Local addresses are
+# printed as SELF and interface indexes as names; the reference count and last-use time of route
+# cache entries in rta_cacheinfo are not deterministic, so only the error code is compared
 cat > route.c <<'C'
 #include <arpa/inet.h>
 #include <errno.h>
@@ -753,7 +768,7 @@ cat > route.c <<'C'
 #include <sys/time.h>
 #include <unistd.h>
 
-/* linux/netlink.h、linux/rtnetlink.h 里的（仓库里没有内核头文件） */
+/* From linux/netlink.h and linux/rtnetlink.h (the store has no kernel headers) */
 #define NETLINK_ROUTE 0
 #define NLM_F_REQUEST 1
 #define NLM_F_MULTI 2
@@ -823,7 +838,7 @@ static void attribute(struct rtattr *a)
     printf("\n");
 }
 
-/* 读回答直到 NLMSG_DONE、错误或者一条不是 NLM_F_MULTI 的消息 */
+/* Read replies until NLMSG_DONE, an error, or a message that is not NLM_F_MULTI */
 static void replies(const char *what)
 {
     unsigned char buf[16384];
@@ -903,7 +918,8 @@ int main(void)
     replies("rules: IPv4");
     request(RTM_GETRULE, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
     replies("rules: all families");
-    /* 邻居表只看转储以 NLMSG_DONE 结束：Linux 上前面的用例在 lo 上留下了条目 */
+    /* For the neighbor table only check that the dump ends with NLMSG_DONE: on Linux earlier
+     * test cases left entries on lo */
     request(RTM_GETNEIGH, NLM_F_DUMP, AF_UNSPEC, NULL, 0);
     for (;;) {
         unsigned char buf[16384];
@@ -923,10 +939,13 @@ C
 gcc -O1 -o route route.c
 ./route
 
-# 接口和地址：RTM_GETADDR 的转储（IPv4、IPv6）逐字节比对（不看怎么分成数据报，同上），
-# ifa_cacheinfo 里创建、更新的时刻不比；RTM_GETLINK 的转储比对 ifinfomsg 和 ip link 用到的几个属性（Linux 还有设备参数等
-# 四十来个属性，这里没有）；不带 NLM_F_DUMP 的 RTM_GETLINK 按编号、名字查，查不到、
-# 没给条件、要确认。本机地址打印成 SELF，接口编号打印成名字，MAC 地址只看长度
+# Interfaces and addresses: RTM_GETADDR dumps (IPv4, IPv6) compared byte by byte (not looking at
+# how they are split into datagrams, as above), without the creation and update times in
+# ifa_cacheinfo; RTM_GETLINK dumps compare ifinfomsg and the few attributes ip link uses (Linux
+# also has some forty attributes such as device parameters, which are not here); RTM_GETLINK
+# without NLM_F_DUMP looks up by index and by name, not found, no criteria given, ack requested.
+# Local addresses are printed as SELF, interface indexes as names, and for MAC addresses only the
+# length is looked at
 cat > links.c <<'C'
 #include <errno.h>
 #include <net/if.h>
@@ -980,16 +999,18 @@ static void index_name(const unsigned char *p)
     printf(" index=%s", name);
 }
 
-/* 链路消息里比的属性：名字、txqlen、operstate、linkmode、mtu、group、promiscuity、carrier、
- * qdisc、proto_down；地址只看长度。收发队列数不比：docker 的 veth 按 CPU 数分配 */
+/* The attributes compared in link messages: name, txqlen, operstate, linkmode, mtu, group,
+ * promiscuity, carrier, qdisc, proto_down; for addresses only the length. The numbers of TX and
+ * RX queues are not compared: docker's veth allocates them by the number of CPUs */
 static int shown_link(int t)
 {
     return t == 3 || t == 13 || t == 16 || t == 17 || t == 4 || t == 27 || t == 30 || t == 33 ||
            t == 6 || t == 39;
 }
 
-/* 链路消息的属性按类型排好再打印：属性的顺序随内核版本变（6.10 前后 IFLA_QDISC 挪到了
- * 后面）；地址消息按原来的顺序 */
+/* Attributes of link messages are sorted by type before printing: their order varies with the
+ * kernel version (around 6.10 IFLA_QDISC moved further back); address messages keep the
+ * original order */
 static void attribute(struct nlmsghdr *h, int link, unsigned off)
 {
     uint16_t len, t;
@@ -1098,16 +1119,16 @@ int main(void)
 C
 gcc -O1 -o links links.c
 ./links
-# busybox 的 ip（软件包里有 iproute2，/sbin/ip 是它的）：MAC 地址和 docker 的 veth 特有的
-# @ifN、M-DOWN 不比
+# busybox's ip (the packages include iproute2, and /sbin/ip is iproute2's): MAC addresses and
+# docker's veth-specific @ifN and M-DOWN are not compared
 self=$(busybox ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
 norm() { sed -e "s/$self/SELF/g" -e 's/@if[0-9]*//' -e 's/,M-DOWN//' -e 's|link/ether [0-9a-f:]*|link/ether MAC|'; }
 busybox ip addr | norm
 busybox ip link | norm
 cat /sys/class/net/lo/tx_queue_len /sys/class/net/lo/operstate
 
-# 同样的表经由 busybox 的 ip、route、netstat 和 /proc/net 读出来；本机地址换成 SELF，
-# ipv6_route 的引用数不比
+# The same tables read through busybox's ip, route and netstat and through /proc/net; local
+# addresses are replaced with SELF, and the reference counts of ipv6_route are not compared
 self=$(busybox ip -4 addr show eth0 | awk '/inet / { split($2, a, "/"); print a[1] }')
 busybox ip route show table all | sed "s/$self/SELF/g"
 busybox ip -6 route show table all
@@ -1119,8 +1140,8 @@ busybox ip route get 1.1.1.1 | sed "s/$self/SELF/g"
 cat /proc/net/route
 awk '{ $7 = "R"; print }' /proc/net/ipv6_route
 
-# /proc/net/sockstat、sockstat6：开几个 socket 前后各项的变化（绝对数里有命名空间里别的
-# socket，TCP 的 alloc 是整个系统的）
+# /proc/net/sockstat, sockstat6: the change of each item before and after opening a few sockets
+# (the absolute numbers include other sockets in the namespace, and TCP's alloc is system-wide)
 python3 - <<'PY'
 import socket
 import time
@@ -1139,8 +1160,10 @@ def counts():
 
 
 def settled():
-    """前面用例关掉的 socket 由内核晚一点释放，"sockets used" 会接着往下掉：等它连续 0.1 秒不变
-    （最多 3 秒）再读。原来不等，Linux 宿主上的原生一侧几次里有一次少数两个以上。"""
+    """Sockets closed by earlier test cases are freed by the kernel a little later, so "sockets
+    used" keeps dropping: wait until it stays unchanged for 0.1 seconds in a row (at most 3
+    seconds) before reading. It used not to wait, and on Linux hosts the native side came up two
+    or more short about once in several runs."""
     last = counts()
     stable = 0
     for _ in range(60):
@@ -1171,17 +1194,21 @@ after = counts()
 for k in sorted(before):
     if k not in ("TCP alloc", "TCP mem", "UDP mem", "sockets used"):
         print(k, after[k] - before[k])
-# 命名空间里的总数：前面用例的 socket 晚一点释放时 Linux 上会少一个
+# The total in the namespace: on Linux it is one lower when the sockets of earlier test cases are
+# freed a little late
 print("sockets used grew by at least 12:", after["sockets used"] - before["sockets used"] >= 12)
 PY
 
-# 映射不到的用户、组 ID 显示成的 ID：bubblewrap 启动时读 kernel 下的这两个
+# The IDs shown for user and group IDs that cannot be mapped: bubblewrap reads these two under
+# kernel at startup
 cat /proc/sys/kernel/overflowuid /proc/sys/kernel/overflowgid /proc/sys/fs/overflowuid \
     /proc/sys/fs/overflowgid
 
-# /proc/net/snmp、netstat：每一组字段名一行、数值一行；字段随内核版本增加（Icmp 的还插在
-# 中间），只看各版本都有的几项。回环上连接、连不上、收发数据报前后几项计数的变化；IP 的
-# 包数、TCP 的段 Linux 还算握手和 ACK，不比
+# /proc/net/snmp, netstat: one line of field names and one line of values per group; fields grow
+# with kernel versions (Icmp's are even inserted in the middle), so only the few items every
+# version has are looked at. The changes of a few counters before and after connecting, failing
+# to connect, and sending and receiving datagrams on loopback; IP packet counts and TCP segments,
+# for which Linux also counts handshakes and ACKs, are not compared
 python3 - <<'PY'
 import errno
 import select
@@ -1258,7 +1285,7 @@ nonblocking.close()
 closed.close()
 changes("refused twice", before)
 
-# IPv4、IPv4 映射的地址算 Udp，IPv6 的不算
+# IPv4 and IPv4-mapped addresses count as Udp, IPv6 ones do not
 before = counts()
 v4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 v4.bind(("127.0.0.1", 0))
@@ -1277,10 +1304,12 @@ for s in (v4, v6, mapped):
 changes("datagrams", before)
 PY
 
-# 程序文件的能力（security.capability）和环境能力：以 nobody 等身份执行带不同能力的程序，
-# 看能力集、AT_SECURE、有效用户 ID；设置、读取、删除扩展属性的权限；写、截短、chown
-# 去掉文件能力和 setuid、setgid 位；securebits 的锁。能力集只打印用到的几个，等于边界集时
-# 打印 all（docker 默认的边界集比 appine 的小）
+# File capabilities (security.capability) and ambient capabilities: run programs with different
+# capabilities as nobody and others, and look at the capability sets, AT_SECURE and the effective
+# user ID; the permissions to set, read and remove the extended attribute; writing, truncating
+# and chown removing file capabilities and the setuid and setgid bits; securebits locks. Only the
+# few capabilities used are printed, and a set equal to the bounding set prints as all (docker's
+# default bounding set is smaller than appine's)
 cat > showcaps.c <<'C'
 #include <stdio.h>
 #include <string.h>
@@ -1346,7 +1375,7 @@ cat > fcaps.c <<'C'
 #include <sys/xattr.h>
 #include <unistd.h>
 
-/* linux/capability.h 里的（仓库里没有内核头文件） */
+/* From linux/capability.h (the store has no kernel headers) */
 struct cap_header { uint32_t version; int pid; };
 struct cap_data { uint32_t effective, permitted, inheritable; };
 #define CAP_V3 0x20080522
@@ -1357,7 +1386,8 @@ struct cap_data { uint32_t effective, permitted, inheritable; };
 
 static const char *showcaps;
 
-/* struct vfs_cap_data：版本（加上有效位）、两组 permitted、inheritable，v3 再加 rootid */
+/* struct vfs_cap_data: the version (plus the effective bit), two sets of permitted and
+ * inheritable, and for v3 also rootid */
 static int setcaps(const char *path, uint32_t magic, uint32_t p, uint32_t i, int v3, uint32_t rootid)
 {
     uint32_t v[6] = {magic, p, i, 0, 0, rootid};
@@ -1387,8 +1417,8 @@ static int caps_xattr_size(const char *path)
 
 enum { NNP = 1, KEEP_INHERITABLE = 2, AMBIENT = 4, DROP_CHOWN = 8, NOROOT = 16 };
 
-/* 以 uid 执行 path；KEEP_INHERITABLE 时保留可继承集里的 net_raw、net_bind_service，
- * AMBIENT 时再把 net_raw 提升为环境能力 */
+/* Run path as uid; with KEEP_INHERITABLE keep net_raw and net_bind_service in the inheritable
+ * set, and with AMBIENT also raise net_raw to an ambient capability */
 static void run(const char *label, const char *path, int uid, int opts)
 {
     fflush(stdout);
@@ -1472,7 +1502,7 @@ int main(int argc, char **argv)
     run("root with SECBIT_NOROOT runs plain", "./plain", 0, NOROOT);
     run("root with SECBIT_NOROOT runs net_raw+ep", "./ep", 0, NOROOT);
 
-    /* 扩展属性的权限 */
+    /* Permissions of the extended attribute */
     copy("own", 0755, NOBODY);
     fflush(stdout);
     if (fork() == 0) {
@@ -1492,7 +1522,7 @@ int main(int argc, char **argv)
     }
     wait(NULL);
 
-    /* 写、截短、chown 去掉特权 */
+    /* Writing, truncating and chown remove privileges */
     int fd = open("ep", O_WRONLY | O_APPEND);
     write(fd, "", 0);
     printf("after writing nothing: %d\n", caps_xattr_size("ep"));
@@ -1532,11 +1562,12 @@ int main(int argc, char **argv)
     }
     wait(NULL);
 
-    /* securebits 的锁和环境能力的 prctl */
+    /* securebits locks and the prctl of ambient capabilities */
     fflush(stdout);
     if (fork() == 0) {
         printf("lock keepcaps: %d\n", prctl(PR_SET_SECUREBITS, 1 << 5, 0, 0, 0));
-        /* 6.14 起第 8、10 位有了定义（SECBIT_EXEC_*），用哪个版本都没定义的第 20 位 */
+        /* From 6.14 on bits 8 and 10 are defined (SECBIT_EXEC_*), so use bit 20, which no version
+         * defines */
         printf("then set keepcaps: %d %s\n", prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), strerror(errno));
         printf("then unlock: %d %s\n", prctl(PR_SET_SECUREBITS, 0, 0, 0, 0), strerror(errno));
         printf("unknown bit: %d %s\n", prctl(PR_SET_SECUREBITS, 1 << 5 | 1 << 20, 0, 0, 0), strerror(errno));
@@ -1554,8 +1585,8 @@ gcc -O1 -o fcaps fcaps.c
 ./fcaps "$PWD/showcaps"
 rm -rf /tmp/fcaps
 
-# fdinfo 里 epoll、timerfd、signalfd 特有的行；mountinfo 的设备号与 stat 一致，
-# fdinfo 的 mnt_id 能在 mountinfo 里找到
+# The epoll-, timerfd- and signalfd-specific lines in fdinfo; device numbers in mountinfo agree
+# with stat, and the mnt_id of fdinfo can be found in mountinfo
 cat > fdinfo.c <<'C'
 #define _GNU_SOURCE
 #include <signal.h>
@@ -1578,7 +1609,7 @@ static void show(int fd)
     while (fgets(line, sizeof line, f)) {
         unsigned tfd, events;
         unsigned long long data, sec, nsec;
-        /* Linux 按内部的树排列关注，顺序不固定：按 fd 排 */
+        /* Linux orders the interests by its internal tree, so the order is not fixed: sort by fd */
         if (sscanf(line, "tfd: %u events: %x data: %llx", &tfd, &events, &data) == 3)
             tfds[tfd < 8 ? tfd : 7] = events, datas[tfd < 8 ? tfd : 7] = data;
         else if (sscanf(line, "it_value: (%llu, %llu)", &sec, &nsec) == 2)
@@ -1605,7 +1636,8 @@ static int mnt_id(int fd)
     return id;
 }
 
-/* mountinfo 里挂载点是 `where` 的那一行：设备号是否与 stat 一致，编号是否与 fd 的 mnt_id 一致 */
+/* The line in mountinfo whose mount point is `where`: whether the device number agrees with stat,
+ * and whether the ID agrees with the fd's mnt_id */
 static void mount(const char *where, int fd)
 {
     char line[512], point[256], type[64];
@@ -1619,7 +1651,7 @@ static void mount(const char *where, int fd)
         if (sscanf(line, "%d %d %u:%u %*s %255s", &id, &parent, &maj, &min, point) != 5 || strcmp(point, where) ||
             !dash || sscanf(dash, " - %63s", type) != 1)
             continue;
-        /* 容器的根是 overlay，这里是 ext4：只看 /proc 的类型 */
+        /* The container's root is overlay, here it is ext4: only the type of /proc is looked at */
         printf("%s: type %s dev %s mnt_id %s\n", where, strcmp(where, "/") ? type : "-",
                maj == major(st.st_dev) && min == minor(st.st_dev) ? "same" : "differs",
                id == mnt_id(fd) ? "same" : "differs");
@@ -1669,8 +1701,8 @@ C
 gcc -O1 -o fdinfo fdinfo.c
 ./fdinfo
 
-# 零碎的：老式 termio ioctl、RNDGETENTCNT、带偏移写管道的读端、MADV_REMOVE、
-# MREMAP_DONTUNMAP
+# Odds and ends: old-style termio ioctls, RNDGETENTCNT, writing with an offset to the read end of
+# a pipe, MADV_REMOVE, MREMAP_DONTUNMAP
 cat > misc.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -1746,7 +1778,7 @@ C
 gcc -O1 -o misc misc.c
 ./misc
 
-# smaps、smaps_rollup、pagemap；mlock 和 MAP_POPULATE 把页调进内存
+# smaps, smaps_rollup, pagemap; mlock and MAP_POPULATE bring pages into memory
 cat > smaps.c <<'C'
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -1756,7 +1788,7 @@ cat > smaps.c <<'C'
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* smaps 里起点为 addr 的映射：打印几项计数和 VmFlags */
+/* The mapping in smaps starting at addr: print a few counters and VmFlags */
 static void smaps(const char *what, void *addr)
 {
     char line[256];
@@ -1828,12 +1860,12 @@ int main(void)
     fgets(line, sizeof line, r);
     printf("rollup header ends with [rollup]: %d at column %ld\n", strstr(line, "[rollup]") != NULL,
            strstr(line, "[rollup]") - line);
-    /* 6.6 起多一行 KSM：只看几个字段在不在 */
+    /* From 6.6 on there is an extra KSM line: only check whether a few fields are present */
     int fields = 0;
     while (fgets(line, sizeof line, r))
         fields += !strncmp(line, "Rss:", 4) || !strncmp(line, "Pss_Anon:", 9) || !strncmp(line, "Locked:", 7);
     printf("rollup fields %d\n", fields);
-    /* maps 里没有名字的行末尾有一个空格 */
+    /* Lines in maps without a name end with a space */
     FILE *m = fopen("/proc/self/maps", "r");
     int unnamed = 0, trailing = 0;
     while (fgets(line, sizeof line, m)) {
@@ -1852,7 +1884,8 @@ C
 gcc -O1 -o smaps smaps.c
 ./smaps
 
-# 经由 /proc/self/fd 重新打开 memfd 和删除之后还开着的文件；O_NOFOLLOW 停在链接上是 ELOOP
+# Reopening memfds and files still open after deletion through /proc/self/fd; O_NOFOLLOW stopping
+# at the link is ELOOP
 cat > mfd.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -1897,9 +1930,10 @@ C
 gcc -O1 -o mfd mfd.c
 ./mfd
 
-# unshare、ru_maxrss、tkill 排不上队、futex 的负数、已经连接的 socket、接口 ioctl、
-# 有可写映射时封印写入。定时器超限次数封顶由 LTP 的 timer_settime03 测：间隔 1 纳秒的
-# 定时器在原生一侧会造成信号风暴，结果取决于时机
+# unshare, ru_maxrss, tkill failing to queue, negative futex arguments, already connected sockets,
+# interface ioctls, write seals while writable mappings exist. The cap on timer overrun counts is
+# tested by LTP's timer_settime03: a timer with a 1 ns interval causes a signal storm on the
+# native side, and the result depends on timing
 cat > misc2.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -1926,7 +1960,8 @@ cat > misc2.c <<'C'
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    /* unshare(CLONE_FILES)：之后关的 fd 不影响原来共用 fd 表的进程 */
+    /* unshare(CLONE_FILES): fds closed afterwards do not affect the process that used to share
+     * the fd table */
     int fd = open("/dev/null", O_RDONLY);
     pid_t pid = syscall(SYS_clone, CLONE_FILES | SIGCHLD, 0, 0, 0, 0);
     if (pid == 0) {
@@ -1948,7 +1983,8 @@ int main(void)
     printf("unshare bad %d %s\n", unshare(-1), strerror(errno));
     printf("unshare vm single-threaded %d\n", unshare(CLONE_VM));
 
-    /* 子进程用了 64 MB：ru_maxrss 至少有一半（内存紧张时有的页可能已经换出） */
+    /* The child used 64 MB: ru_maxrss is at least half of that (under memory pressure some pages
+     * may already be swapped out) */
     pid = fork();
     if (pid == 0) {
         char *p = malloc(64 << 20);
@@ -1960,7 +1996,7 @@ int main(void)
     getrusage(RUSAGE_CHILDREN, &ru);
     printf("children maxrss >= 32MB %d\n", ru.ru_maxrss >= 32 * 1024);
 
-    /* tkill 的实时信号排不上队是 EAGAIN */
+    /* A real-time signal from tkill that cannot be queued is EAGAIN */
     struct rlimit zero = {0, 0}, old;
     getrlimit(RLIMIT_SIGPENDING, &old);
     setrlimit(RLIMIT_SIGPENDING, &zero);
@@ -1975,7 +2011,7 @@ int main(void)
     printf("requeue negative %ld %s\n",
            syscall(SYS_futex, &f1, FUTEX_CMP_REQUEUE, 1, (long)-1, &f2, 0), strerror(errno));
 
-    /* 阻塞的 connect 返回之后再 connect 是 EISCONN */
+    /* Connecting again after a blocking connect has returned is EISCONN */
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     int l = socket(AF_INET, SOCK_STREAM, 0);
     bind(l, (void *)&a, sizeof a);
@@ -1990,7 +2026,7 @@ int main(void)
     printf("SIOCATMARK udp %d %s\n", ioctl(u, SIOCATMARK, &mark), strerror(errno));
     printf("SIOCSIFFLAGS bad %d %s\n", ioctl(u, SIOCSIFFLAGS, (void *)8), strerror(errno));
 
-    /* memfd 有可写的共享映射时不能封印写入 */
+    /* A memfd with a writable shared mapping cannot be sealed against writes */
     int m = memfd_create("seal", MFD_ALLOW_SEALING);
     ftruncate(m, 4096);
     void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, m, 0);
@@ -2003,8 +2039,8 @@ C
 gcc -O1 -o misc2 misc2.c
 ./misc2
 
-# 信号驱动的 I/O（O_ASYNC、F_SETSIG、FIOSETOWN）和文件租约。租约用 /dev/shm 里的文件：
-# 原生一侧的根是 overlayfs，Linux 在它上面不让设写租约
+# Signal-driven I/O (O_ASYNC, F_SETSIG, FIOSETOWN) and file leases. Leases use a file in
+# /dev/shm: the native side's root is overlayfs, on which Linux does not allow write leases
 cat > async.c <<'C'
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -2058,18 +2094,18 @@ int main(void)
     char c;
     read(p[0], &c, 1);
     wait(NULL);
-    /* 默认的 SIGIO */
+    /* The default SIGIO */
     fcntl(p[0], F_SETSIG, 0);
     write(p[1], "y", 1);
     wait_sig("pipe default", &set);
     read(p[0], &c, 1);
-    /* 没有属主：不发 */
+    /* No owner: nothing is sent */
     fcntl(p[0], F_SETOWN, 0);
     write(p[1], "z", 1);
     struct timespec zero = {0, 200000000};
     printf("no owner: %d\n", sigtimedwait(&set, NULL, &zero));
     read(p[0], &c, 1);
-    /* TCP：数据从别的进程来 */
+    /* TCP: the data comes from another process */
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     int l = socket(AF_INET, SOCK_STREAM, 0);
     bind(l, (void *)&a, sizeof a);
@@ -2116,7 +2152,7 @@ cat > lease.c <<'C'
 
 static const char *name(int t) { return t == F_RDLCK ? "RDLCK" : t == F_WRLCK ? "WRLCK" : "UNLCK"; }
 
-/* 子进程以 flags 打开文件（打破租约），退出码是 errno */
+/* The child opens the file with flags (breaking the lease); its exit code is errno */
 static pid_t opener(int flags)
 {
     pid_t pid = fork();
@@ -2125,7 +2161,7 @@ static pid_t opener(int flags)
     return pid;
 }
 
-/* 等子进程，打印它打开的结果 */
+/* Wait for the child and print the result of its open */
 static void reap(const char *what, pid_t pid)
 {
     int status;
@@ -2159,15 +2195,15 @@ int main(void)
     printf("unlock without a lease %d %s\n", fcntl(r, F_SETLEASE, F_UNLCK), strerror(errno));
     fcntl(r, F_SETSIG, SIGUSR1);
     printf("write lease %d, lease %s\n", fcntl(r, F_SETLEASE, F_WRLCK), name(fcntl(r, F_GETLEASE)));
-    /* 非阻塞的打开：通知持有者，立即返回 EWOULDBLOCK */
+    /* Nonblocking open: the holder is notified, and it returns EWOULDBLOCK at once */
     reap("nonblocking read open", opener(O_RDONLY | O_NONBLOCK));
     wait_break(&set, r);
-    /* 读方式打开：降成读租约之后打开完成 */
+    /* Open for reading: the open completes after downgrading to a read lease */
     pid_t pid = opener(O_RDONLY);
     usleep(200000);
     printf("  downgrade %d, lease %s\n", fcntl(r, F_SETLEASE, F_RDLCK), name(fcntl(r, F_GETLEASE)));
     reap("read open", pid);
-    /* 写方式打开：要放弃租约，降成读租约不行 */
+    /* Open for writing: the lease must be given up; downgrading to a read lease is not enough */
     pid = opener(O_WRONLY);
     wait_break(&set, r);
     printf("  downgrade %d, unlock %d\n", fcntl(r, F_SETLEASE, F_RDLCK), fcntl(r, F_SETLEASE, F_UNLCK));
@@ -2179,7 +2215,8 @@ C
 gcc -O1 -o lease lease.c
 ./lease
 
-# POSIX 消息队列：优先级、非阻塞和超时、状态行、poll、mq_notify（信号和 musl 的线程）
+# POSIX message queues: priorities, nonblocking and timeouts, the status line, poll, mq_notify
+# (signals and musl's thread)
 cat > mq.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -2236,7 +2273,7 @@ int main(void)
     mq_setattr(q, &nb, NULL);
     printf("nonblocking %zd %s\n", mq_receive(q, buf, sizeof buf, &prio), strerror(errno));
 
-    /* 信号通知：空队列来了消息 */
+    /* Signal notification: a message arrives on an empty queue */
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGUSR1);
@@ -2254,7 +2291,7 @@ int main(void)
     printf("signal code %d value %d from child %d\n", si.si_code, si.si_value.sival_int, si.si_pid == pid);
     waitpid(pid, NULL, 0);
     mq_receive(q, buf, sizeof buf, &prio);
-    /* musl 的 SIGEV_THREAD：经由 netlink socket 通知一个线程 */
+    /* musl's SIGEV_THREAD: a thread is notified through a netlink socket */
     struct sigevent th = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = on_notify,
                           .sigev_value.sival_int = 7};
     printf("thread notify %d\n", mq_notify(q, &th));
@@ -2270,7 +2307,8 @@ C
 gcc -O1 -o mq mq.c
 ./mq
 
-# 原生 AIO（直接发 syscall，不用 libaio）：读写、fsync、poll、eventfd 通知、取消
+# Native AIO (issuing the syscalls directly, without libaio): reads and writes, fsync, poll,
+# eventfd notification, cancellation
 cat > aio.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -2285,7 +2323,7 @@ cat > aio.c <<'C'
 #include <time.h>
 #include <unistd.h>
 
-/* 镜像里没有 linux-headers：linux/aio_abi.h 的定义 */
+/* The image has no linux-headers: definitions from linux/aio_abi.h */
 typedef unsigned long aio_context_t;
 enum { IOCB_CMD_PREAD = 0, IOCB_CMD_PWRITE = 1, IOCB_CMD_FSYNC = 2, IOCB_CMD_POLL = 5 };
 #define IOCB_FLAG_RESFD 1
@@ -2329,7 +2367,7 @@ static void events(aio_context_t ctx, long min, const char *what)
     printf("\n");
 }
 
-/* 在 io_getevents 里一直等（不限时） */
+/* Wait in io_getevents indefinitely (no time limit) */
 struct waiter {
     aio_context_t ctx;
     long min, n;
@@ -2387,8 +2425,9 @@ int main(void)
     printf("min > nr %ld %s\n", syscall(SYS_io_getevents, ctx, 2, 1, &res, NULL), strerror(errno));
     printf("destroy %ld again %ld %s\n", syscall(SYS_io_destroy, ctx), syscall(SYS_io_destroy, ctx),
            strerror(errno));
-    /* 别的线程在 io_getevents 里等着时销毁上下文：它醒来返回，一个事件也没有是 EINVAL，
-     * 已经完成的照样取走。mariadb 关闭时这样结束等事件的线程 */
+    /* Destroying the context while another thread waits in io_getevents: it wakes and returns,
+     * EINVAL if there is not a single event, and completed ones are still collected. mariadb
+     * ends its event-waiting threads this way on shutdown */
     for (int done = 0; done <= 1; done++) {
         struct waiter wt = {0, done ? 2 : 1, 0, 0};
         syscall(SYS_io_setup, 8, &wt.ctx);
@@ -2415,7 +2454,7 @@ C
 gcc -O1 -o aio aio.c -pthread
 ./aio
 
-# MREMAP_DONTUNMAP 用在各种映射上之后原来的地址上看到什么；remap_file_pages
+# What the original address shows after MREMAP_DONTUNMAP on various mappings; remap_file_pages
 cat > dun.c <<'C'
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -2436,7 +2475,7 @@ int main(void) {
     char buf[8192];
     memset(buf, 'f', sizeof buf);
     write(fd, buf, sizeof buf);
-    /* 共享文件映射 */
+    /* Shared file mapping */
     char *a = mmap(0, 2 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     memcpy(a, "AAAA", 4);
     char *b = mremap(a, 2 * pg, 2 * pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
@@ -2448,7 +2487,7 @@ int main(void) {
     show("shared file second page", a + pg, b + pg);
     pread(fd, buf, 4, 0);
     printf("file now %.4s\n", buf);
-    /* 私有文件映射 */
+    /* Private file mapping */
     char *p = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     memcpy(p, "PPPP", 4);
     char *q = mremap(p, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
@@ -2457,19 +2496,19 @@ int main(void) {
     memcpy(p, "OOOO", 4);
     pread(fd, buf, 4, 0);
     printf("private write old -> file %.4s\n", buf);
-    /* 共享匿名映射 */
+    /* Shared anonymous mapping */
     char *s = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     memcpy(s, "SSSS", 4);
     char *t = mremap(s, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
     show("shared anon", s, t);
     memcpy(t, "TTTT", 4);
     show("shared anon after write new", s, t);
-    /* 私有匿名映射 */
+    /* Private anonymous mapping */
     char *x = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     memcpy(x, "XXXX", 4);
     char *y = mremap(x, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
     show("private anon", x, y);
-    /* 只读的共享文件映射 */
+    /* Read-only shared file mapping */
     char *r = mmap(0, pg, PROT_READ, MAP_SHARED, fd, pg);
     char *r2 = mremap(r, pg, pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
     show("readonly shared", r, r2);
@@ -2485,8 +2524,8 @@ C
 gcc -O1 -o dun dun.c
 ./dun
 
-# sysfs 里 CPU 的拓扑（busybox 的 nproc --all 数 cpu<n> 目录）；possible、present 在有的
-# 宿主上比 online 多，不比
+# CPU topology in sysfs (busybox's nproc --all counts the cpu<n> directories); possible and
+# present exceed online on some hosts, so they are not compared
 n=$(grep -c ^processor /proc/cpuinfo)
 [ "$(nproc --all)" = "$n" ] && echo "nproc --all matches cpuinfo"
 [ "$(ls -d /sys/devices/system/cpu/cpu[0-9]* | wc -l)" = "$n" ] && echo "cpu directories match cpuinfo"
@@ -2496,11 +2535,11 @@ done
 test -r /sys/devices/system/cpu/possible && test -r /sys/devices/system/cpu/present && echo "possible present"
 stat -c 'size %s blocks %b' /sys/devices/system/cpu/online
 stat -f -c 'type %T' /sys
-# /proc/loadavg 的格式（数值取决于宿主）
+# The format of /proc/loadavg (the values depend on the host)
 sed -E 's/[0-9]+\.[0-9][0-9]/L/g; s/[0-9]+\/[0-9]+ [0-9]+$/R\/T P/' /proc/loadavg
 
-# /proc/<pid>/limits 与 getrlimit 一致，列宽与 Linux 相同；删除之后仍然打开着的文件可以
-# futimens
+# /proc/<pid>/limits agrees with getrlimit, with the same column widths as Linux; futimens works
+# on files still open after deletion
 cat > limits.c <<'C'
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -2559,8 +2598,8 @@ C
 gcc -O1 -o limits limits.c
 ./limits
 
-# mremap 扩展私有文件映射：后面接着的是文件的内容，私有地写不影响文件，文件末尾之后的页
-# 是 SIGBUS
+# mremap growing a private file mapping: what follows is the file's contents, private writes do
+# not affect the file, and pages past the end of the file are SIGBUS
 cat > mrp.c <<'C'
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -2584,7 +2623,8 @@ int main(void)
         memset(page, 'a' + i, sizeof page);
         write(fd, page, sizeof page);
     }
-    /* 只映射第一页，再扩到三页、五页：后面接着的是文件的内容，文件末尾之后 SIGBUS */
+    /* Map only the first page, then grow to three and five pages: what follows is the file's
+     * contents, and past the end of the file SIGBUS */
     int prots[] = {PROT_READ, PROT_READ | PROT_WRITE};
     for (int k = 0; k < 2; k++) {
         int prot = prots[k];
@@ -2614,8 +2654,8 @@ int main(void)
 C
 gcc -O1 -o mrp mrp.c && ./mrp
 
-# /sys/devices/system/cpu/cpu<n>/cache 照搬宿主的（CPU 编号换成 guest 的），只看已知的文件；
-# 宿主没有 cpufreq 时也没有
+# /sys/devices/system/cpu/cpu<n>/cache copies the host's (with CPU numbers turned into the
+# guest's), and only the known files are looked at; when the host has no cpufreq it is absent too
 cd /sys/devices/system/cpu
 for c in cpu*/; do
     for d in "$c"cache/index*; do
@@ -2630,9 +2670,10 @@ ls cpu0 | grep -c '^cache$' || true
 [ -d cpu0/cpufreq ] && echo cpufreq || echo no cpufreq
 cd /tmp
 
-# signalfd 不属于哪个线程：poll、epoll 和读看的都是调用的线程和它的进程挂起的信号。发给
-# 另一个线程的看不到，阻塞在 poll 里的线程收到发给自己的信号时醒来，fork 出来的子进程看
-# 自己的，创建它的线程退出之后照样可用
+# A signalfd belongs to no thread: poll, epoll and read look at the signals pending for the
+# calling thread and its process. Signals sent to another thread are not seen, a thread blocked
+# in poll wakes when it receives a signal sent to it, a forked child looks at its own, and it
+# stays usable after the thread that created it exits
 cat > sfd.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -2654,7 +2695,7 @@ static int pollnow(int fd)
     return poll(&p, 1, 0) == 1 && p.revents & POLLIN;
 }
 
-/* 读到的信号；没有时是 0（EAGAIN） */
+/* The signal read; 0 when there is none (EAGAIN) */
 static int readsig(int fd)
 {
     struct signalfd_siginfo si;
@@ -2662,7 +2703,8 @@ static int readsig(int fd)
     return n == sizeof si ? (int)si.ssi_signo : errno == EAGAIN ? 0 : -errno;
 }
 
-/* 线程 B 按命令执行：p poll，e epoll（B 自己的 epoll），r 读，w 阻塞 poll 最多 2 秒 */
+/* Thread B carries out commands: p poll, e epoll (B's own epoll), r read, w blocking poll for at
+ * most 2 seconds */
 static void *thread_b(void *arg)
 {
     (void)arg;
@@ -2763,8 +2805,9 @@ int main(void)
 C
 gcc -O1 -o sfd sfd.c -lpthread && ./sfd
 
-# /dev/pts/<n> 的属主、属组和权限（devpts 挂载时 gid=5、mode=620）：sshd 把终端 chown 给
-# 登录的用户和 tty 组；普通用户只能改自己的终端
+# Owner, group and permissions of /dev/pts/<n> (devpts mounted with gid=5, mode=620): sshd chowns
+# the terminal to the logged-in user and the tty group; ordinary users can change only their own
+# terminals
 cat > ptyown.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -2828,7 +2871,8 @@ int main(void)
 C
 gcc -O1 -o ptyown ptyown.c && ./ptyown
 
-# /proc/meminfo 和 sysinfo：照搬宿主的（两边是同一台宿主），可用量算上页缓存
+# /proc/meminfo and sysinfo: copied from the host (both sides are the same host), with the
+# available amount counting the page cache
 awk '/^MemTotal:/ { t = $2 } /^MemFree:/ { f = $2 } /^MemAvailable:/ { a = $2 } /^Cached:/ { c = $2 }
     END { print "meminfo: total", t, "available >= free", (a >= f), "cached", (c > 0) }' /proc/meminfo
 cat > si.c <<'C'
@@ -2860,8 +2904,9 @@ int main(void)
 C
 gcc -O1 -o si si.c && ./si
 
-# PTY 的 TCFLSH、TCXONC：主设备上 TCOFLUSH 不清从设备写出的数据、TCIFLUSH 清；TCOOFF 让
-# 这一端的写阻塞到 TCOON（^Q 恢复不了），停住之前写出的照样能读；TCIOFF 发 STOP 字符
+# TCFLSH and TCXONC on PTYs: on the master TCOFLUSH does not discard data the slave wrote, and
+# TCIFLUSH does; TCOOFF blocks writes on this end until TCOON (^Q cannot resume it), and what was
+# written before stopping can still be read; TCIOFF sends the STOP character
 python3 - <<'PY'
 import os, select, termios, threading
 m, s = os.openpty()
@@ -2901,7 +2946,8 @@ print("pty written before ^S", os.read(m, 16), "slave writable", writable(s))
 os.write(m, b"\x11")
 termios.tcflow(s, termios.TCIOFF)
 termios.tcflow(s, termios.TCION)
-# 两次 tcflow 各写一个字符，Linux 经由 flip buffer 异步交给主设备，一次读可能只读到第一个
+# The two tcflow calls each write one character, which Linux hands to the master asynchronously
+# through the flip buffer, so one read may get only the first
 xchars = os.read(m, 16)
 while len(xchars) < 2 and readable(m):
     xchars += os.read(m, 16)
@@ -2913,7 +2959,8 @@ termios.tcflow(m, termios.TCOON)
 print("pty master resumed", done.wait(2), os.read(s, 16))
 PY
 
-# FIFO 的读端以 O_NONBLOCK 打开时还没有写端：有写端打开过之前 poll 不报 POLLHUP
+# The read end of a FIFO opened with O_NONBLOCK while there is no writer: poll does not report
+# POLLHUP before a writer has opened it
 python3 - <<'PY'
 import os, select, tempfile
 fifo = os.path.join(tempfile.mkdtemp(), "fifo")
@@ -2934,7 +2981,8 @@ r2 = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
 print("fifo new reader", events(r2))
 PY
 
-# 已经删除的当前目录里不能新建（ENOENT）；socket、管道的 fd 可以 fchmod（libuv 的 uv_pipe_chmod）
+# Nothing can be created in a deleted current directory (ENOENT); fds of sockets and pipes can be
+# fchmod'ed (libuv's uv_pipe_chmod)
 python3 - <<'PY'
 import errno, os, socket
 def err(f):
@@ -2955,8 +3003,9 @@ print("fchmod socket", err(lambda: os.fchmod(s.fileno(), 0o777)))
 print("fchmod pipe", err(lambda: os.fchmod(os.pipe()[0], 0o600)))
 PY
 
-# 终端的时间：utimensat 可以改，读到数据改访问时间、写出数据改修改时间（只在相差 8 秒以上
-# 时改，这里从很久以前改到现在），chmod、utimensat 改状态改变时间
+# Terminal times: utimensat can change them, reading data changes the access time and writing
+# data the modification time (only when they differ by more than 8 seconds, so here they go from
+# long ago to now), chmod and utimensat change the status change time
 python3 - <<'PY'
 import os, time
 m, s = os.openpty()
@@ -2977,10 +3026,11 @@ print("pty after io", now - 10 < st.st_atime <= now + 1, now - 10 < st.st_mtime 
 print("pty fstat", os.fstat(s).st_mtime == st.st_mtime)
 PY
 
-# 关掉 PTY 的主设备挂断从设备（Linux 的 pty_close → tty_vhangup）：会话组长收到 SIGHUP 和
-# SIGCONT，会话里别的进程收不到、但都失去控制终端，组长退出时前台进程组才收到 SIGHUP
-# （tty_old_pgrp）；打开着的从设备读到 EOF（还没读的输入也没了），写和 ioctl 是 EIO，
-# tcsetpgrp 是 ENOTTY，poll 总是就绪；/dev/pts/<n> 删掉
+# Closing a PTY's master hangs up the slave (Linux's pty_close → tty_vhangup): the session leader
+# receives SIGHUP and SIGCONT, other processes in the session receive neither but all lose the
+# controlling terminal, and the foreground process group receives SIGHUP only when the leader
+# exits (tty_old_pgrp); an open slave reads EOF (unread input is gone too), writes and ioctls
+# are EIO, tcsetpgrp is ENOTTY, poll is always ready; /dev/pts/<n> is removed
 python3 - <<'PY'
 import errno, os, select, signal, time
 
@@ -3005,7 +3055,8 @@ if os.fork() == 0:
     signal.signal(signal.SIGCONT, lambda n, f: got.append("CONT"))
     os.setsid()
     fd = os.open(name, os.O_RDWR)
-    # 组长进程组（前台进程组）里的另一个进程：挂断时收不到，组长退出时才收到 SIGHUP
+    # Another process in the leader's process group (the foreground process group): it receives
+    # nothing at the hangup, and SIGHUP only when the leader exits
     leader = os.getpid()
     if os.fork() == 0:
         hups = []
@@ -3044,7 +3095,7 @@ if os.fork() == 0:
     out.append(f"tcsetpgrp {err(lambda: os.tcsetpgrp(fd, os.getpgrp()))}")
     out.append(f"isatty {os.isatty(fd)}")
     out.append(f"/dev/tty {err(lambda: os.open('/dev/tty', os.O_RDWR) and 'opened')}")
-    # 节点也没了（Linux 的 devpts_pty_kill），从设备还开着也一样
+    # The node is gone too (Linux's devpts_pty_kill), even while the slave is still open
     listed = os.path.basename(name) in os.listdir("/dev/pts")
     out.append(f"{name.startswith('/dev/pts/')} listed {listed}, "
                f"open {err(lambda: os.open(name, os.O_RDWR | os.O_NOCTTY) and 'opened')}")
@@ -3062,9 +3113,10 @@ print(os.read(r, 4096).decode())
 print(os.read(pg_r, 200).decode())
 PY
 
-# 被信号叫醒、还没跑起来的进程在 /proc 里是 R（Linux 的 try_to_wake_up 当场改状态）：
-# LTP 的 TST_PROCESS_STATE_WAIT 给停在 pause() 里的子进程发信号，等它的状态回到 S，就当它
-# 做完了下一步（shmctl01）
+# A process woken by a signal that has not run yet is R in /proc (Linux's try_to_wake_up changes
+# the state on the spot): LTP's TST_PROCESS_STATE_WAIT sends a signal to a child stopped in
+# pause(), waits for its state to return to S, and takes that as the child having done its next
+# step (shmctl01)
 cat > woken.c <<'C'
 #include <signal.h>
 #include <stdio.h>
@@ -3132,10 +3184,12 @@ C
 gcc -O1 -o woken woken.c
 ./woken
 
-# /proc/self/fd 和 maps 里的路径与 d_path 一样解析完符号链接：最后一级是链接、经由链接的
-# 目录、链接后面的 ..（按实际的目录回退）、O_PATH|O_NOFOLLOW 停在链接本身、沿着悬空的链接
-# 新建的文件、经由链接进入的当前目录下的相对路径；经由链接 mmap 的文件，PT_INTERP 指向
-# 链接的程序里解释器的映射（valgrind 按这些名字带着 O_NOFOLLOW 重新打开文件）
+# Paths in /proc/self/fd and maps have symlinks fully resolved, as with d_path: a link as the
+# last component, directories through links, .. after a link (going back by the actual
+# directory), O_PATH|O_NOFOLLOW stopping at the link itself, files created through dangling
+# links, relative paths under a current directory entered through a link; a file mmapped through
+# a link, and the interpreter's mapping in a program whose PT_INTERP points at a link (valgrind
+# reopens files by these names with O_NOFOLLOW)
 rm -rf /tmp/rp; mkdir -p /tmp/rp/real/sub; ln -s real /tmp/rp/link; echo x > /tmp/rp/real/f
 ln -s f /tmp/rp/real/flink; ln -s new /tmp/rp/dangling; ln -s /lib/ld-musl-aarch64.so.1 /tmp/rp/ld
 cat > rp.c <<'C'
@@ -3155,7 +3209,7 @@ static void show(const char *what, int fd)
     printf("%s %s\n", what, link);
 }
 
-/* maps 里含 `key` 的第一行的路径 */
+/* The path in the first line of maps that contains `key` */
 static void mapped(const char *what, const char *key)
 {
     char line[512];
@@ -3188,8 +3242,8 @@ C
 gcc -O1 -Wl,--dynamic-linker=/tmp/rp/ld -o rpaths rp.c
 ./rpaths
 
-# /proc/<pid>/task 的链接数是 2 加线程数：Chromium 的 zygote 按它判断自己是不是单线程，
-# fork 之前检查它至少是 3
+# The link count of /proc/<pid>/task is 2 plus the number of threads: Chromium's zygote uses it to
+# tell whether it is single-threaded, and checks that it is at least 3 before fork
 python3 - <<'PY'
 import os, threading
 print("task links, 1 thread", os.stat("/proc/self/task").st_nlink)
@@ -3204,8 +3258,9 @@ for t in ts:
     t.join()
 PY
 
-# /proc/net 是指向 self/net 的链接：文件在每个进程（和线程）的目录下，经由 /proc/net 打开的
-# 文件在 /proc/self/fd 里显示 /proc/<pid>/net/...；目录属于进程的用户，文件属于 root
+# /proc/net is a link to self/net: the files are under each process's (and thread's) directory,
+# and files opened through /proc/net show as /proc/<pid>/net/... in /proc/self/fd; the directory
+# belongs to the process's user, the files to root
 ls -ld /proc/net | cut -c1; readlink /proc/net
 for f in dev if_inet6 tcp tcp6 udp udp6 unix raw icmp; do test -r /proc/self/net/$f && echo "net/$f"; done
 ls /proc/self/task/*/net/ | grep -cx unix
@@ -3215,8 +3270,9 @@ head -n 2 /proc/net/dev | cmp - /dev/fd/3 3<<HEAD && echo "same header"
 $(head -n 2 /proc/self/net/dev)
 HEAD
 
-# 已经删除、仍然打开着或映射着的文件，fd 链接和 maps 里的路径后面有 " (deleted)"：删除、
-# 被 rename 盖掉（dpkg 升级库的做法，needrestart 按它找要重启的进程）；memfd 只有一个
+# For files deleted but still open or mapped, the paths in fd links and maps end with
+# " (deleted)": deleted, or overwritten by rename (how dpkg upgrades libraries; needrestart uses
+# it to find processes to restart); a memfd has only one
 cat > deleted.c <<'C'
 #define _GNU_SOURCE
 #include <fcntl.h>

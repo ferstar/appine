@@ -1,27 +1,31 @@
 #!/bin/sh
-# 负载普查（docs/rounds/62-workload-survey.md）：在 appine 里跑常见的服务和工具，收集
-# 失败和内核层的日志。在有 docker 的宿主上运行：
+# Workload survey (docs/rounds/62-workload-survey.md): runs common services and tools inside appine
+# and collects failures and the kernel layer's logs. Run on a host with docker:
 #
-#   scripts/survey [-t 执行层] [-s 仓库目录] [-n 镜像] [负载名……]
+#   scripts/survey [-t tier] [-s store directory] [-n image] [workload name…]
 #
-# 负载是 tests/survey/<名字>.sh（名字可以带子目录），拷进仓库里由 guest 的 /bin/sh 运行
-# （stdin 是 /dev/null），带 APPINE_LOG=1。stdout 写到 target/survey/<名字>.out，stderr
-# （含内核层的日志）写到 <名字>.err；最后每个负载一行：退出码、用时、内核层报告的内部
-# 错误（内核 bug、放开 BKL 时借着内核对象）的条数和未实现的 syscall。
-# 输出要人看：脚本只打印结果，不和原生比对。不带名字时跑 tests/survey/ 下的全部。每个
-# 负载最多跑 SURVEY_TIMEOUT 秒（默认 1500）。
+# Workloads are tests/survey/<name>.sh (names may include subdirectories), copied into the store and
+# run by the guest's /bin/sh (stdin is /dev/null), with APPINE_LOG=1. stdout is written to
+# target/survey/<name>.out and stderr (including the kernel layer's logs) to <name>.err; at the end
+# there is one line per workload: the exit code, the time, the number of internal errors reported by
+# the kernel layer (kernel bugs, kernel objects borrowed while the BKL is released) and the
+# unimplemented syscalls.
+# The output is for people to read: the script only prints results and does not compare with native.
+# Without names, everything under tests/survey/ runs. Each workload runs for at most SURVEY_TIMEOUT
+# seconds (1500 by default).
 #
-# -n 镜像：在这个 docker 镜像里原生运行同样的负载作为对照，输出写到 <名字>.native.out、
-# .native.err。环境变量 SURVEY_DOCKER_OPTS 另外加给原生的容器（比如沙箱要的
-# `--cap-add SYS_ADMIN --security-opt apparmor=unconfined`）。镜像可以由仓库导出
-# （docs/rounds/70-survey-suites.md）：
+# -n image: run the same workloads natively in this docker image for comparison, with the output in
+# <name>.native.out and .native.err. The environment variable SURVEY_DOCKER_OPTS is added to the
+# native container (such as `--cap-add SYS_ADMIN --security-opt apparmor=unconfined` for sandboxes).
+# The image can be exported from the store (docs/rounds/70-survey-suites.md):
 #
-#   appine-run --rootfs <仓库> --no-pty -- /bin/tar -C / -cf - --exclude ./proc \
+#   appine-run --rootfs <store> --no-pty -- /bin/tar -C / -cf - --exclude ./proc \
 #       --exclude ./sys --exclude ./dev --exclude ./tmp . > store.tar
-#   docker import --platform linux/arm64 store.tar <镜像>
+#   docker import --platform linux/arm64 store.tar <image>
 #
-# 仓库默认是 target/survey/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
-# 再用 apk 安装要的软件包，这一步要联网（沿用宿主或 docker 的代理），约 1 GB。
+# The store is target/survey/store by default; when it does not exist the minirootfs is imported
+# (run scripts/fetch-rootfs first) and then the needed packages are installed with apk, which needs
+# the network (using the host's or docker's proxy), about 1 GB.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -46,7 +50,8 @@ shift $((OPTIND - 1))
 limit=${SURVEY_TIMEOUT:-1500}
 out=target/survey
 if [ -n "$native" ]; then
-    # 原生对照：在宿主上直接用 docker，代理沿用 docker daemon 的（与 scripts/dev 相同）
+    # Native comparison: use docker directly on the host, with the docker daemon's proxy (as in
+    # scripts/dev)
     IFS='|' read -r http https <<EOF
 $(docker info --format '{{.HTTPProxy}}|{{.HTTPSProxy}}' 2>/dev/null || true)
 EOF
@@ -55,9 +60,9 @@ EOF
         mkdir -p "$(dirname "$out/$name")"
         start=$(date +%s)
         set +e
-        # shellcheck disable=SC2086 # 选项要按空白拆开
-        # --init：busybox 的 timeout 执行的 sh 不能是容器里的 1 号进程，1 号进程不理会超时时的
-        # SIGTERM，卡住的负载就一直不结束
+        # shellcheck disable=SC2086 # the options must be split on whitespace
+        # --init: the sh that busybox's timeout runs must not be process 1 in the container, which
+        # ignores the SIGTERM on timeout, so a stuck workload would never end
         docker run --rm -i --init --platform linux/arm64 --ulimit nice=40:40 ${SURVEY_DOCKER_OPTS:-} \
             -e http_proxy="$http" -e https_proxy="$https" -e no_proxy=127.0.0.1,localhost \
             -e PATH=/usr/sbin:/usr/bin:/sbin:/bin -e HOME=/root -e TERM=xterm "$native" \
@@ -70,7 +75,7 @@ EOF
     exit 0
 fi
 
-# 在 Linux arm64 上直接运行，别的宿主上整个脚本经由 scripts/dev 重新运行
+# Run directly on Linux arm64; on other hosts the whole script is rerun through scripts/dev
 if [ "$(uname -sm)" != "Linux aarch64" ]; then
     exec scripts/dev env SURVEY_TIMEOUT="$limit" scripts/survey -t "$tier" -s "$store" "$@"
 fi

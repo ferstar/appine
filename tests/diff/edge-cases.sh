@@ -1,6 +1,7 @@
-# 内核的边角：别的进程截短已映射的文件（SIGBUS，不能带走整个 App）、MADV_DONTNEED、
-# PROT_NONE 的大片预留、停止又继续之后 nanosleep 只睡剩下的时间、持有 robust 锁的进程
-# 退出之后等待者拿到 EOWNERDEAD、EPOLLEXCLUSIVE 的参数检查、跳到未对齐的地址（SIGBUS）
+# Kernel corners: another process truncating a mapped file (SIGBUS, which must not take down the
+# whole app), MADV_DONTNEED, large PROT_NONE reservations, nanosleep sleeping only the remaining
+# time after a stop and continue, waiters getting EOWNERDEAD after a process holding a robust
+# lock exits, EPOLLEXCLUSIVE argument checks, jumping to an unaligned address (SIGBUS)
 set -e
 mkdir -p /tmp/diff-edges
 cd /tmp/diff-edges
@@ -36,7 +37,7 @@ static void on_fault(int sig, siginfo_t *si, void *ctx)
     siglongjmp(env, 1);
 }
 
-/* 读一个字节并打印结果；出错时打印信号和 si_code */
+/* Read one byte and print the result; on a fault print the signal and si_code */
 static void probe(const char *label, volatile char *p)
 {
     if (sigsetjmp(env, 1)) {
@@ -83,7 +84,7 @@ int main(void)
     sigaction(SIGSEGV, &sa, NULL);
     long page = 4096;
 
-    /* 别的进程截短映射着的文件：超出新末尾的页得到 SIGBUS */
+    /* Another process truncates a mapped file: pages beyond the new end get SIGBUS */
     void (*truncators[])(void) = {child_ftruncate, child_truncate, child_otrunc};
     const char *names[] = {"ftruncate", "truncate", "O_TRUNC"};
     for (int i = 0; i < 3; i++) {
@@ -111,7 +112,7 @@ int main(void)
         close(fd);
     }
 
-    /* MADV_DONTNEED：私有匿名内存读回零，共享内存内容不变 */
+    /* MADV_DONTNEED: private anonymous memory reads back as zeros, shared memory is unchanged */
     char *anon = mmap(NULL, 8 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     char *shm = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     memset(anon, 7, 8 * page);
@@ -121,7 +122,7 @@ int main(void)
     printf("dontneed %d %d %d %d shared %d\n", anon[0], anon[page], anon[6 * page - 1], anon[6 * page],
            shm[page]);
 
-    /* PROT_NONE 的 8 GB 预留，中间一页改成可写 */
+    /* An 8 GB PROT_NONE reservation, with one page in the middle made writable */
     char *reserve = mmap(NULL, 1L << 33, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     char *mid = reserve + (1L << 32);
     mprotect(mid, page, PROT_READ | PROT_WRITE);
@@ -137,7 +138,8 @@ int main(void)
     probe("unmapped", mid);
     printf("\n");
 
-    /* procfs 的文件从偏移 0 再读时是现在的内容（seq_file）：改名之后 seek 回 0、pread 0 */
+    /* Reading a procfs file again from offset 0 gives the current contents (seq_file): after a
+     * rename, seek back to 0, and pread at 0 */
     {
         int st = open("/proc/self/status", O_RDONLY);
         char sb[64] = "";
@@ -154,7 +156,7 @@ int main(void)
         close(st);
     }
 
-    /* 停止又继续：nanosleep 接着睡剩下的时间，而不是重新睡满 */
+    /* Stop and continue: nanosleep sleeps on for the remaining time, not the full time again */
     int pipefd[2];
     pipe(pipefd);
     pid_t sleeper = fork();
@@ -175,8 +177,9 @@ int main(void)
     waitpid(sleeper, NULL, 0);
     printf("stopped sleep %s\n", slept >= 600 && slept < 850 ? "kept its deadline" : "restarted");
 
-    /* 停止又继续：poll（剩下的时间写回 timespec）、futex（restart_block）按原来的到期时刻
-       接着等，epoll_wait 是 EINTR（signal(7)，cgroup 冻结之后解冻也一样） */
+    /* Stop and continue: poll (the remaining time is written back to the timespec) and futex
+       (restart_block) go on waiting until the original deadline, epoll_wait is EINTR (signal(7);
+       the same after a cgroup is frozen and thawed) */
     for (int which = 0; which < 3; which++) {
         pid_t waiter = fork();
         if (waiter == 0) {
@@ -214,7 +217,7 @@ int main(void)
                : out[2] < 600 ? "returned early" : "restarted");
     }
 
-    /* 有处理函数时返回 EINTR，rem 是剩下的时间 */
+    /* With a handler it returns EINTR, and rem is the remaining time */
     struct sigaction su = {.sa_handler = on_usr1};
     sigaction(SIGUSR1, &su, NULL);
     pid_t parent = getpid();
@@ -229,7 +232,8 @@ int main(void)
     printf("interrupted sleep %d %s rem<2s %d\n", r, strerror(errno), rem.tv_sec < 2 && (rem.tv_sec || rem.tv_nsec));
     waitpid(poker, NULL, 0);
 
-    /* 有超时的 futex 等待被处理函数打断是 EINTR，即使有 SA_RESTART（restart_block） */
+    /* A futex wait with a timeout that a handler interrupts is EINTR, even with SA_RESTART
+     * (restart_block) */
     su.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &su, NULL);
     poker = fork();
@@ -244,7 +248,7 @@ int main(void)
     printf("interrupted futex with SA_RESTART %d %s\n", r, strerror(errno));
     waitpid(poker, NULL, 0);
 
-    /* 进程持有进程间共享的 robust 锁时退出：等待者拿到 EOWNERDEAD */
+    /* A process exits while holding a process-shared robust lock: the waiter gets EOWNERDEAD */
     pthread_mutex_t *m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     pthread_mutexattr_t ma;
     pthread_mutexattr_init(&ma);
@@ -265,7 +269,7 @@ int main(void)
     printf("unlock %d\n", pthread_mutex_unlock(m));
     alarm(0);
 
-    /* EPOLLEXCLUSIVE 只能在加入时用，不能用于 epoll，不能配别的标志 */
+    /* EPOLLEXCLUSIVE can be used only when adding, not on an epoll, and not with other flags */
     int ep = epoll_create1(0), ep2 = epoll_create1(0);
     struct epoll_event ev = {.events = EPOLLIN | EPOLLEXCLUSIVE};
     printf("exclusive add %d\n", epoll_ctl(ep, EPOLL_CTL_ADD, pipefd[0], &ev));
@@ -277,7 +281,8 @@ int main(void)
     ev.events = EPOLLIN | EPOLLEXCLUSIVE;
     printf("exclusive epoll %d %d\n", epoll_ctl(ep, EPOLL_CTL_ADD, ep2, &ev), errno);
 
-    /* 跳到未对齐的地址：取指时 SIGBUS（BUS_ADRALN），si_addr 是目标。经由函数指针调用和 ret */
+    /* Jumping to an unaligned address: SIGBUS (BUS_ADRALN) on instruction fetch, si_addr is the
+     * target. Through a call via a function pointer and through ret */
     uintptr_t targets[] = {1, 2, 0x1001};
     for (int i = 0; i < 3; i++) {
         for (int how = 0; how < 2; how++) {

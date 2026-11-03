@@ -1,27 +1,28 @@
 /*
- * 一个很小的字节码解释器：switch 分发会编译成跳转表，产生大量间接分支，
- * 用来近似 python 这类解释器负载。值一律是无符号数，溢出时按模回绕。
- * 用法：vm [n]
+ * A tiny bytecode interpreter: the switch dispatch compiles to a jump table and produces many
+ * indirect branches, approximating interpreter workloads such as python. All values are unsigned
+ * and wrap around modulo on overflow.
+ * Usage: vm [n]
  */
 #include "rt.h"
 
 enum {
-    OP_PUSH, /* 后跟一个立即数 */
-    OP_LOAD, /* 后跟局部变量编号 */
+    OP_PUSH, /* followed by an immediate */
+    OP_LOAD, /* followed by a local variable number */
     OP_STORE,
     OP_ADD,
     OP_SUB,
     OP_MUL,
     OP_MOD,
     OP_LT,
-    OP_JZ, /* 后跟目标地址 */
+    OP_JZ, /* followed by the target address */
     OP_JMP,
     OP_XOR,
     OP_SHR,
     OP_HALT,
 };
 
-/* locals: 0 = i, 1 = acc, 2 = n；acc += ((i * i) % 7) ^ (acc >> 3)，i 从 0 到 n - 1 */
+/* locals: 0 = i, 1 = acc, 2 = n; acc += ((i * i) % 7) ^ (acc >> 3), for i from 0 to n - 1 */
 static const uint64_t program[] = {
     OP_PUSH, 0, OP_STORE, 0,                            /*  0: i = 0 */
     OP_PUSH, 0, OP_STORE, 1,                            /*  4: acc = 0 */

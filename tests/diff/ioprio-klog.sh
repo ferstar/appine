@@ -1,10 +1,13 @@
 # docker-run-options: --cap-add SYS_NICE --cap-add SYSLOG
-# IO 优先级（ioprio_set、ioprio_get、ionice）、syslog(2) 和 adjtimex、clock_adjtime 的查询
-# （Linux 6.1 的 block/ioprio.c、kernel/printk/printk.c、kernel/time/ntp.c）。原生一侧加了
-# CAP_SYS_NICE（RT 类要它）和 CAP_SYSLOG，与 appine 里的 root 一样；没有 CAP_SYS_TIME，
-# appine 里改时钟也当作没有它。内核日志的内容、缓冲区大小、NTP 的 offset、freq、maxerror
-# 两边不同（appine 的日志是空的，NTP 状态取自宿主但一直在变），只比错误码、权限和不变的字段；
-# syslog 的读（type 2）在原生一侧会读走真正的日志，不调
+# IO priorities (ioprio_set, ioprio_get, ionice), syslog(2), and the queries of adjtimex and
+# clock_adjtime (block/ioprio.c, kernel/printk/printk.c and kernel/time/ntp.c of Linux 6.1). The
+# native side adds CAP_SYS_NICE (the RT class needs it) and CAP_SYSLOG, like root in appine; it
+# has no CAP_SYS_TIME, and changing the clock in appine is also treated as lacking it. The
+# contents of the kernel log, the buffer size, and NTP's offset, freq and maxerror differ between
+# the two sides (appine's log is empty, and the NTP state comes from the host but keeps
+# changing), so only the error codes, the permissions and the fields that do not change are
+# compared; syslog's read (type 2) would consume the real log on the native side, so it is not
+# called
 set -e
 cd /tmp
 cat > ioprio.c <<'C'
@@ -58,7 +61,7 @@ static void in_child(const char *what, int which)
     waitpid(p, NULL, 0);
 }
 
-/* 子进程停在这里，直到被结束 */
+/* The child process stays here until it is killed */
 static pid_t parked(int how, int pipefd[2])
 {
     pid_t p = fork();
@@ -67,7 +70,7 @@ static pid_t parked(int how, int pipefd[2])
         if (how == 1)
             r = nice(10) == -1 ? -1 : 0;
         if (how == 2) {
-            /* musl 的 sched_setscheduler 总是 ENOSYS */
+            /* musl's sched_setscheduler is always ENOSYS */
             struct sched_param sp = {0};
             r = syscall(SYS_sched_setscheduler, 0, SCHED_IDLE, &sp);
         }
@@ -94,8 +97,8 @@ static void ioprio(void)
     show("fresh raw", get(PROCESS, 0));
     show("bad class", set(PROCESS, 0, V(4, 0)));
     show("none with data", set(PROCESS, 0, V(0, 1)));
-    /* 级别 8 以上 6.1 是 EINVAL，6.5 起 data 的高位是提示（IOPRIO_PRIO_HINT），新内核接受，
-       不比 */
+    /* Levels 8 and above are EINVAL on 6.1; from 6.5 on the high bits of data are a hint
+       (IOPRIO_PRIO_HINT) and newer kernels accept them, so they are not compared */
     show("check before lookup", set(PROCESS, 99999, V(4, 0)));
     show("no such thread", set(PROCESS, 99999, V(2, 1)));
     show("bad which", set(0, 0, V(2, 1)));
@@ -137,7 +140,8 @@ static void ioprio(void)
     puts("effective from nice and policy");
     pid_t e = fork();
     if (e == 0) {
-        /* 自己一个进程组：没设过的按 nice 值和调度策略推出来，级别是 (nice + 20) / 5 */
+        /* A process group of its own: a priority never set is derived from the nice value and
+         * the scheduling policy, with level (nice + 20) / 5 */
         struct sched_param sp = {0};
         setpgid(0, 0);
         set(PROCESS, 0, V(0, 0));
@@ -264,7 +268,7 @@ static void adjtime_query(void)
     struct timex q = {.modes = ADJ_OFFSET_SS_READ};
     show("adjtime read", adj(&q));
     printf("  offset %ld modes %#x\n", q.offset, q.modes);
-    /* 内核里 ADJ_ADJTIME 是 0x8000、ADJ_OFFSET_SINGLESHOT 是 0x0001 */
+    /* In the kernel ADJ_ADJTIME is 0x8000 and ADJ_OFFSET_SINGLESHOT is 0x0001 */
     struct timex m = {.modes = 0x8000};
     show("adjtime without singleshot", adj(&m));
     m.modes = 0xa000;
@@ -319,7 +323,8 @@ int main(void)
 }
 C
 gcc -O1 -pthread -o ioprio ioprio.c && ./ioprio
-# ionice（util-linux 的；busybox 的另比一遍）：设不上时不加 -t 就不执行命令
+# ionice (util-linux's; busybox's is compared in a separate pass): when the setting fails, the
+# command is not run unless -t is given
 echo ionice
 ionice
 ionice -c3 sh -c ionice

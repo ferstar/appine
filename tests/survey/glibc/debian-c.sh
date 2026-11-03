@@ -1,4 +1,4 @@
-# Debian（glibc）：gcc/g++ 编译多线程程序、gdb、strace、locale、NSS、iconv
+# Debian (glibc): gcc/g++ compiling a multithreaded program, gdb, strace, locale, NSS, iconv
 cd /tmp; rm -rf ct; mkdir ct; cd ct
 cat > t.c <<'C'
 #define _GNU_SOURCE

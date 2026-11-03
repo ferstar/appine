@@ -1,4 +1,5 @@
-# Debian（glibc）：Miniforge（conda-forge 的 conda）装好之后建一个带 numpy 的环境，用它算一下
+# Debian (glibc): once Miniforge (conda-forge's conda) is installed, create an environment with
+# numpy and compute something with it
 export DEBIAN_FRONTEND=noninteractive
 [ -s /etc/resolv.conf ] || echo 'nameserver 127.0.0.53' > /etc/resolv.conf
 command -v curl >/dev/null || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q --no-install-recommends curl ca-certificates >/dev/null 2>&1; }

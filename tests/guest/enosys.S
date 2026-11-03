@@ -1,9 +1,9 @@
-// 未实现的 syscall 必须返回 -ENOSYS 而不是让程序崩溃（设计文档 §7.5）。
-// 返回 -38 时退出码为 0，否则为 1。
+// An unimplemented syscall must return -ENOSYS instead of crashing the program
+// (design doc §7.5). The exit code is 0 when it returns -38, otherwise 1.
     .text
     .globl  _start
 _start:
-    mov     x8, #1000               // 不存在的 syscall 编号
+    mov     x8, #1000               // a syscall number that does not exist
     svc     #0
     cmn     x0, #38
     cset    x0, ne

@@ -1,26 +1,26 @@
-//! M2 性能探针用到的基准程序（设计文档 §14）。
+//! Benchmark programs for the M2 performance probe (design doc §14).
 //!
-//! 程序位于 `programs/`，不依赖 libc，只用 `write`/`exit_group`，并用
-//! `-mgeneral-regs-only` 禁止 SIMD，这样 M0 的内核层和 M2 的原型 Tier 1 都能
-//! 运行它们。构建需要 Linux aarch64 宿主上的 gcc。
+//! The programs are in `programs/`; they do not depend on libc, use only `write`/`exit_group`, and
+//! are built with `-mgeneral-regs-only` to rule out SIMD, so that both M0's kernel layer and M2's
+//! prototype Tier 1 can run them. Building needs gcc on a Linux aarch64 host.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 一个基准程序。
+/// A benchmark program.
 #[derive(Debug, Clone, Copy)]
 pub struct Program {
-    /// 名字，也是 `programs/` 下的源文件名。
+    /// Name, also the source file name under `programs/`.
     pub name: &'static str,
-    /// 测量时传入的轮数，选到让原生运行约 0.3 秒。
+    /// Rounds passed in when measuring, chosen so that a native run takes about 0.3 seconds.
     pub rounds: u64,
-    /// 正确性测试用的小轮数。
+    /// A small number of rounds for correctness tests.
     pub test_rounds: u64,
-    /// 主要考察的负载特征。
+    /// The main workload characteristic it exercises.
     pub workload: &'static str,
 }
 
-/// 全部基准程序。
+/// All benchmark programs.
 pub const PROGRAMS: &[Program] = &[
     Program {
         name: "sha256",
@@ -54,7 +54,7 @@ pub const PROGRAMS: &[Program] = &[
     },
 ];
 
-/// 编译参数：静态、非 PIE、不依赖 libc、不使用 SIMD 和 PAC/BTI。
+/// Compiler flags: static, non-PIE, no libc, no SIMD and no PAC/BTI.
 pub const CFLAGS: &[&str] = &[
     "-O2",
     "-std=c11",
@@ -74,12 +74,12 @@ pub const CFLAGS: &[&str] = &[
     "-Wl,--build-id=none",
 ];
 
-/// 源文件目录。
+/// Source directory.
 pub fn programs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("programs")
 }
 
-/// 把 `program` 编译到 `out_dir`，返回可执行文件路径。
+/// Compiles `program` into `out_dir` and returns the executable's path.
 pub fn build(program: &Program, out_dir: &Path) -> Result<PathBuf, String> {
     let dir = programs_dir();
     let out = out_dir.join(program.name);
@@ -102,8 +102,9 @@ pub fn build(program: &Program, out_dir: &Path) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-/// 宿主 CPU 的简要描述，读自 `/proc/cpuinfo`，按核心型号分组计数，例如
-/// `ARM 0xd49 Neoverse-N2 x4`。大小核混合时依次列出每种核心。
+/// A short description of the host CPU, read from `/proc/cpuinfo`, counted by grouping core models,
+/// for example `ARM 0xd49 Neoverse-N2 x4`. With mixed big and little cores, each kind of core is
+/// listed in turn.
 pub fn host_cpu() -> String {
     let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") else {
         return "unknown".into();
@@ -155,7 +156,7 @@ fn vendor_name(implementer: u32) -> String {
     }
 }
 
-/// Arm 公版核心的 MIDR part 编号。表里没有的只显示编号。
+/// The MIDR part numbers of Arm's own cores. Parts not in the table show only the number.
 fn arm_part_name(part: u32) -> Option<&'static str> {
     Some(match part {
         0xd03 => "Cortex-A53",

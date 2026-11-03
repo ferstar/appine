@@ -1,10 +1,13 @@
 # docker-run-options: --privileged
-# cgroup 的限制（docs/rounds/164-cgroup-limits.md）：pids.max 挡住 fork 和建线程，
-# pids.current 算上僵尸进程，pids.events 记在哪里，迁移不看上限，关掉再开控制器回到默认；
-# memory.max 超出时结束进程，memory.events（往上累加）和 .local，调低 memory.max 时结束超出
-# 的，memory.oom.group 整组结束。原生一侧是特权容器，容器的根不是真正的根，有进程时开不了
-# 控制器，先像 docker-in-docker 那样把进程都挪进 init（appine 的根是真正的根，也照做）。
-# 内存只比事件的次数（max 是碰到上限的次数，Linux 每次分配都算，不比具体的数）
+# cgroup limits (docs/rounds/164-cgroup-limits.md): pids.max stops fork and thread creation,
+# pids.current counts zombies, where pids.events records events, migration ignores the limit,
+# disabling and re-enabling the controller returns to the defaults; exceeding memory.max kills
+# processes, memory.events (accumulated upwards) and .local, lowering memory.max kills those over
+# it, memory.oom.group kills the whole group. The native side is a privileged container whose
+# root is not the real root, and controllers cannot be enabled while it has processes, so first
+# move all processes into init as docker-in-docker does (appine's root is the real root, and
+# does the same). For memory only the event counts are compared (max is the number of times the
+# limit was hit, which Linux counts on every allocation, so the exact numbers are not compared)
 cd /sys/fs/cgroup
 mkdir init
 for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs 2>/dev/null; done
@@ -13,14 +16,16 @@ mkdir t
 echo "t controllers: $(cat t/cgroup.controllers)"
 echo "+pids +memory" > t/cgroup.subtree_control
 mkdir t/p t/p/q
-# pids.events：新内核（CI 的）改成往上累加，6.1、6.8 的含义挪到了 pids.events.local
+# pids.events: newer kernels (CI's) changed it to accumulate upwards, and the meaning it had on
+# 6.1 and 6.8 moved to pids.events.local
 pev() { cat "$1/pids.events.local" 2>/dev/null || cat "$1/pids.events"; }
 echo "p: max $(cat t/p/pids.max) current $(cat t/p/pids.current) $(pev t/p)"
 [ -e t/p/q/pids.max ] || echo "q has no pids.max"
 for v in -1 4194305 abc 4194304 max 3; do
     echo $v > t/p/pids.max && echo "pids.max $v ok"
 done
-# 僵尸进程算，线程算，超出时 pthread_create、fork 是 EAGAIN；q 里的算在 p 上
+# Zombies count, threads count, and over the limit pthread_create and fork are EAGAIN; those in q
+# count against p
 cat > /tmp/pids.c <<'C'
 #include <errno.h>
 #include <pthread.h>
@@ -68,7 +73,7 @@ gcc -pthread -o /tmp/pids /tmp/pids.c
 sh -c 'echo $$ > /sys/fs/cgroup/t/p/q/cgroup.procs; /tmp/pids'
 echo "events p: $(pev t/p), t: $(pev t)"
 echo "p current after: $(cat t/p/pids.current)"
-# 迁移进来不看上限
+# Migrating in ignores the limit
 sleep 100 & s1=$!
 sleep 100 & s2=$!
 sleep 100 & s3=$!
@@ -77,16 +82,17 @@ for s in $s1 $s2 $s3 $s4; do echo $s > t/p/cgroup.procs; done
 echo "after migration: $(cat t/p/pids.current) max $(cat t/p/pids.max)"
 kill $s1 $s2 $s3 $s4
 wait 2>/dev/null
-# shell 里 fork 不出来：ash 报错退出，留下两个 sleep
+# fork fails in the shell: ash reports an error and exits, leaving two sleeps behind
 sh -c 'echo $$ > /sys/fs/cgroup/t/p/cgroup.procs; for i in 1 2 3; do sleep 100 & done; echo unreachable'
 echo "shell status $?"
 echo "events p: $(pev t/p)"
 kill $(cat t/p/cgroup.procs)
-# 关掉再开 pids：上限、事件回到默认
+# Disable and re-enable pids: the limit and events return to the defaults
 echo "-pids" > t/cgroup.subtree_control && echo "+pids" > t/cgroup.subtree_control
 echo "p after re-enable: max $(cat t/p/pids.max) $(pev t/p)"
 
-# memory.max：超出时结束进程（swap.max 设 0，有交换分区的宿主上也不换出）
+# memory.max: exceeding it kills the process (swap.max is set to 0, so nothing is swapped out even
+# on hosts with swap)
 cat > /tmp/eat.c <<'C'
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,7 +103,8 @@ int main(int argc, char **argv)
     int mb = argc > 1 ? atoi(argv[1]) : 512;
     for (int i = 0; i < mb; i++)
         memset(malloc(1 << 20), 1, 1 << 20);
-    // 有参数时分配完了等着被结束，最多等 10 秒（不结束时用例也不会卡住）
+    // With an argument it waits to be killed after allocating, at most 10 seconds (so the test
+    // case does not hang if it is not killed)
     if (argc > 1) {
         puts("allocated");
         fflush(stdout);
@@ -110,8 +117,9 @@ int main(int argc, char **argv)
 }
 C
 gcc -o /tmp/eat /tmp/eat.c
-# 第二个参数是 exact 时比 oom 的次数，否则只比它是否大于 0（调低 memory.max 时 Linux 在
-# 等进程退出的时候反复记）
+# When the second argument is exact, compare the oom count, otherwise only whether it is greater
+# than 0 (when memory.max is lowered, Linux records it repeatedly while waiting for the process
+# to exit)
 events() {
     awk -v exact="${2:-}" '{ v[$1] = $2 } END {
         oom = exact ? v["oom"] : (v["oom"] > 0 ? ">0" : "0")
@@ -129,7 +137,7 @@ echo "t events: $(events t/memory.events)"
 echo "t local: $(events t/memory.events.local)"
 peak=$(cat t/m/memory.peak)
 echo "m peak over 16M: $((peak > 16 * 1024 * 1024))"
-# 调低 memory.max：已经超出的进程被结束
+# Lowering memory.max: a process already over it is killed
 mkdir t/w
 echo 0 > t/w/memory.swap.max
 rm -f /tmp/ready
@@ -139,12 +147,13 @@ w=$!
 read line < /tmp/ready
 echo "w: $line"
 echo 16M > t/w/memory.max && echo "lowered"
-# Linux 在写的时候就结束了它，appine 稍后：ash 打不打印 Killed 看等的时候它结束了没有
+# Linux kills it during the write, appine a little later: whether ash prints Killed depends on
+# whether it has ended when ash waits for it
 wait $w 2>/dev/null
 echo "w status $?"
 echo "w events: $(events t/w/memory.events)"
 rm /tmp/ready
-# memory.oom.group：整组结束，挑中的那个在 oom_kill 里算两次
+# memory.oom.group: the whole group is killed, and the chosen one is counted twice in oom_kill
 mkdir t/g
 echo 32M > t/g/memory.max
 echo 0 > t/g/memory.swap.max

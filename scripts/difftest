@@ -1,35 +1,44 @@
 #!/bin/sh
-# 差分测试（设计文档 §13.3 第 4 层）：同一个脚本分别在 appine 和真正的 arm64 Linux 上
-# 运行，比对输出和退出码。在有 docker 的宿主上运行：
+# Differential tests (design doc §13.3 layer 4): the same script runs on appine and on real arm64
+# Linux, and the outputs and exit codes are compared. Run on a host with docker:
 #
-#   scripts/difftest [-t 执行层] [-r] [-s 仓库目录] [-j 并发数] [用例名……]
+#   scripts/difftest [-t tier] [-r] [-s store directory] [-j jobs] [case name…]
 #
-# -j 同时跑几组（macOS 上默认 4，别的宿主上默认 1）：原生一侧各在各的容器里；appine 一侧
-# 每个并发通道用一份仓库的克隆（<仓库>-w<n>，各组都往 guest 的 /tmp 里写同名的文件，共用
-# 一个仓库会互相覆盖），macOS 上是 APFS 的 clonefile（`cp -c`，写时复制，几乎不占空间），
-# 别处是 `cp --reflink=auto`（不支持时真复制）。克隆在没有时、带 -r 时重新做（主仓库装了
-# 新的软件包之后本来就要 -r 重新导出镜像）。上次耗时长的组先开始（记在
-# target/difftest/durations-t<执行层>.txt）。每组的结果整段打印，`ok` 一行带耗时（原生、
-# appine 各几秒）。-j 1 照原来一组一组地跑。
-# 用例是 tests/diff/<名字>.sh，由 guest 的 /bin/sh 执行，stderr 并入 stdout。真正的
-# Linux 一侧是 docker 容器：先在 appine 里把仓库的根文件系统打包、导入成镜像，所以两边
-# 运行的是完全相同的文件。镜像只在第一次或者带 -r 时生成，换了仓库要带 -r。用例里
-# `# docker-run-options: …` 这一行的选项另外加给它的容器（比如 mount 要的 CAP_SYS_ADMIN），
-# `# appine-options: …` 这一行的另外加给 appine-run（比如 lowports 要的
-# --always-map-low-ports：容器里绑得了低端口，不加就不经过映射）。
+# -j runs several groups at once (4 by default on macOS, 1 on other hosts): on the native side each
+# runs in its own container; on the appine side each concurrent slot uses a clone of the store
+# (<store>-w<n>; the groups all write files of the same names into the guest's /tmp, so sharing one
+# store would make them overwrite each other), which on macOS is an APFS clonefile (`cp -c`,
+# copy-on-write, taking almost no space) and elsewhere `cp --reflink=auto` (a real copy where
+# unsupported). Clones are remade when missing or with -r (after new packages are installed into the
+# main store, -r is needed anyway to re-export the image). Groups that took long last time start
+# first (recorded in target/difftest/durations-t<tier>.txt). Each group's result is printed as a
+# whole, and the `ok` line carries the times (seconds each for native and appine). -j 1 runs the
+# groups one by one as before.
+# Test cases are tests/diff/<name>.sh, run by the guest's /bin/sh with stderr merged into stdout.
+# The real Linux side is a docker container: the store's root filesystem is first packed inside
+# appine and imported as an image, so both sides run exactly the same files. The image is generated
+# only the first time or with -r; after changing the store, pass -r. The options on a test case's
+# `# docker-run-options: …` line are added to its container (such as CAP_SYS_ADMIN for mount), and
+# those on the `# appine-options: …` line to appine-run (such as --always-map-low-ports for
+# lowports: the container can bind low ports, so without it the mapping is not exercised).
 #
-# 两边的输出写到 target/difftest/<名字>.native、.appine，下次运行时覆盖；不一致时另存
-# 一份到 target/difftest/failed/<时刻>-t<执行层>-<名字>.*，重跑之后也还能查。appine-run
-# 自己的 stderr 写到 <名字>.appine.err：里面有内核层报告的内部错误（内核 bug、放开 BKL 时
-# 借着内核对象）时，输出一致也算失败。
+# Both sides' outputs are written to target/difftest/<name>.native and .appine and overwritten on
+# the next run; on a mismatch a copy is also saved as
+# target/difftest/failed/<time>-t<tier>-<name>.*, which can still be inspected after a rerun.
+# appine-run's own stderr goes to <name>.appine.err: when it contains internal errors reported by
+# the kernel layer (a kernel bug, a kernel object borrowed while the BKL is released), the case
+# fails even if the outputs match.
 #
-# 仓库默认是 target/difftest/store，不存在时导入 minirootfs（先运行 scripts/fetch-rootfs），
-# 再在 appine 里用 apk 安装用例需要的软件包，这一步要联网（沿用宿主或 docker 的代理）。
-# 仓库必须在工作区里。appine-run 也在容器里运行，与原生一侧看到同一种网络（容器的 eth0、
-# 路由、地址），网络类的用例才比得了：Linux arm64 宿主上放进 APPINE_IMAGE（默认是
-# debian:trixie-slim，glibc 不能比编译 appine-run 的宿主旧）里运行，appine-run 可以用
-# 环境变量 APPINE_RUN 指定；其他宿主上经由 scripts/dev。环境变量 APPINE_DBT_REGS 照样交给
-# appine-run（APPINE_DBT_REGS=go 时所有程序都用 Tier 1 给 Go 的那组寄存器）。
+# The store is target/difftest/store by default; when it does not exist the minirootfs is imported
+# (run scripts/fetch-rootfs first) and then the packages the test cases need are installed with apk
+# inside appine, which needs the network (using the host's or docker's proxy). The store must be
+# inside the work tree. appine-run also runs in a container and sees the same kind of network as the
+# native side (the container's eth0, routes, addresses), so that network test cases are comparable:
+# on a Linux arm64 host it runs in APPINE_IMAGE (debian:trixie-slim by default; its glibc must not
+# be older than the one on the host that built appine-run), and the environment variable APPINE_RUN
+# can name the appine-run to use; on other hosts it goes through scripts/dev. The environment
+# variable APPINE_DBT_REGS is passed on to appine-run as well (with APPINE_DBT_REGS=go every program
+# uses the register set Tier 1 has for Go).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,7 +48,8 @@ rebuild=0
 store=target/difftest/store
 jobs=1
 [ "$(uname)" != Darwin ] || jobs=4
-# 并发时由自己调用自己跑一组（-G 用例名），这时不再准备仓库、镜像
+# When running concurrently, the script calls itself to run one group (-G case name), and then does
+# not prepare the store or the image
 group=
 image=appine-difftest
 packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc dmesg iptables nftables"
@@ -57,7 +67,8 @@ while getopts t:rs:j:G: opt; do
 done
 shift $((OPTIND - 1))
 
-# linux <shell 命令>：在 Linux arm64 环境里执行，$http_proxy 这类变量在那边展开
+# linux <shell command>: runs in the Linux arm64 environment, where variables like $http_proxy are
+# expanded
 if [ "$(uname -sm)" = "Linux aarch64" ]; then
     run=${APPINE_RUN:-target/linux-arm64/release/appine-run}
     [ -x "$run" ] || run=target/release/appine-run
@@ -66,8 +77,9 @@ if [ "$(uname -sm)" = "Linux aarch64" ]; then
     *) run=$root/$run ;;
     esac
     linux() { sh -c "$1"; }
-    # 以调用者的身份运行，新建的仓库属于调用者，宿主上的 linux 也打得开；与 scripts/dev
-    # 一样放开 nice 的上限（guest 线程的 nice 值设置到宿主线程上）
+    # Run as the caller, so a newly created store belongs to the caller and linux on the host can
+    # open it too; as in scripts/dev, lift the nice limit (the nice values of guest threads are set
+    # on host threads)
     appine() {
         docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
             ${APPINE_DBT_REGS:+-e APPINE_DBT_REGS} \
@@ -94,7 +106,8 @@ if [ ! -d "$store" ]; then
         -- /bin/sh -c "apk add -q '"$packages"'"'
     rebuild=1
 fi
-# 只看目录在不在不够：安装中途失败、缓存只恢复了一部分的仓库会让每个用例都失败
+# Checking only that the directory exists is not enough: a store whose install failed midway, or
+# whose cache was only partly restored, makes every test case fail
 if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
     /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap iptables nft &&
         nsenter --version | grep -q util-linux && dmesg --version | grep -q util-linux" >/dev/null 2>&1; then
@@ -105,7 +118,8 @@ fi
 
 if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "exporting the root filesystem of $store"
-    # /tmp 只要目录本身：历次运行留在仓库 /tmp 里的东西（可能上 GB）不必进镜像
+    # /tmp needs only the directory itself: what earlier runs left in the store's /tmp (possibly
+    # gigabytes) need not go into the image
     appine --tier 1 --rootfs "$store" -- /bin/tar -c -f - -C / --exclude='tmp/*' \
         bin etc lib sbin usr tmp 2>/dev/null |
         docker import --platform linux/arm64 - "$image" >/dev/null
@@ -118,12 +132,13 @@ if [ $# -eq 0 ]; then
     set -- $(cd tests/diff && ls *.sh | sed 's/\.sh$//')
 fi
 
-# 跑一组：两边各运行一次，比对；不一致时返回 1
+# Run one group: run both sides once and compare; return 1 on a mismatch
 run_group() {
     name=$1
     script="exec 2>&1; $(cat "tests/diff/$name.sh")"
-    # 脚本整个作为 sh -c 的一个参数交出去，Linux 不让单个参数超过 128 KB（MAX_ARG_STRLEN）：
-    # 超过时两边都执行不了（E2BIG），输出一样，会被当成通过
+    # The whole script is handed over as one argument of sh -c, and Linux does not allow a single
+    # argument over 128 KB (MAX_ARG_STRLEN): beyond that neither side can execute it (E2BIG), the
+    # outputs match, and it would count as passed
     if [ "$(printf '%s' "cd / && $script" | wc -c)" -ge 131072 ]; then
         echo "FAIL $name: tests/diff/$name.sh is longer than one argument can be (128 KB), split it"
         return 1
@@ -131,16 +146,16 @@ run_group() {
     options=$(sed -n 's/^# docker-run-options: //p' "tests/diff/$name.sh")
     appine_options=$(sed -n 's/^# appine-options: //p' "tests/diff/$name.sh")
     set +e
-    # Docker 默认的 seccomp 规则会改掉一些 syscall 的结果（clone3 返回 ENOSYS，
-    # pidfd_getfd 返回 EPERM），比对的应当是内核本身的行为
-    # shellcheck disable=SC2086 # 选项要按空白拆开
+    # Docker's default seccomp rules change the results of some syscalls (clone3 returns ENOSYS,
+    # pidfd_getfd returns EPERM); what should be compared is the kernel's own behaviour
+    # shellcheck disable=SC2086 # the options must be split on whitespace
     t0=$(date +%s)
     docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined $options \
         -e "$env_path" -e HOME=/root -w / "$image" \
         /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
     echo "exit $?" >>"$out/$name.native"
     t1=$(date +%s)
-    # shellcheck disable=SC2086 # 选项要按空白拆开
+    # shellcheck disable=SC2086 # the options must be split on whitespace
     appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root $appine_options -- \
         /bin/sh -c "cd / && $script" >"$out/$name.appine" 2>"$out/$name.appine.err"
     echo "exit $?" >>"$out/$name.appine"
@@ -163,7 +178,8 @@ run_group() {
     fi
 }
 
-# 并发时由自己调用自己：只跑 -G 给的那一组，用一个空闲的通道的仓库
+# When running concurrently, called by itself: run only the group -G gives, with the store of a free
+# slot
 if [ -n "$group" ]; then
     slot=""
     for w in $(seq 1 "$jobs"); do
@@ -177,7 +193,7 @@ if [ -n "$group" ]; then
         exit 1
     }
     store=$store-w$slot
-    # 整段输出攒好一次写出，几组同时结束时不交错
+    # Collect the whole output and write it at once, so groups finishing together do not interleave
     report=$(run_group "$group" 2>&1) && code=0 || code=1
     rmdir "$out/.slot-$slot"
     printf '%s\n' "$report"
@@ -203,18 +219,21 @@ else
             touch "$clone/.cloned"
         fi
     done
-    # 上次耗时（原生加 appine）长的先开始，最后不剩一组长的单独跑；没跑过的排在最后
+    # Groups that took long last time (native plus appine) start first, so no long group is left to
+    # run alone at the end; groups that never ran go last
     durations=$out/durations-t$tier.txt
     touch "$durations"
-    # 各组的结果按结束的先后打印；FAIL 的行数就是失败的组数
+    # Each group's result is printed in the order they finish; the number of FAIL lines is the
+    # number of failed groups
     reports=$out/.reports
-    # awk 按文件名分开两个文件：NR == FNR 在第一个文件是空的时候对第二个也成立
+    # awk tells the two files apart by file name: NR == FNR also holds for the second file when the
+    # first one is empty
     printf '%s\n' "$@" >"$out/.groups"
     awk 'FILENAME == ARGV[1] { d[$1] = $2; next } { print ($1 in d ? d[$1] : 0), $1 }' \
         "$durations" "$out/.groups" | sort -s -k1,1 -nr | cut -d' ' -f2 |
         xargs -P "$jobs" -I '{}' "$0" -t "$tier" -s "$store" -j "$jobs" -G '{}' | tee "$reports" || true
     failed=$(grep -c '^FAIL ' "$reports" || true)
-    # 记下这次通过的各组的耗时，没通过的留着上次的
+    # Record the times of the groups that passed this time; those that did not pass keep last time's
     sed -n 's/^ok   \([^ ]*\) (\([0-9]*\)s native, \([0-9]*\)s appine)$/\1 \2 \3/p' "$reports" \
         >"$out/.times"
     awk 'FILENAME == ARGV[1] { d[$1] = $2 + $3; next } !($1 in d) { print } END { for (n in d) print n, d[n] }' \

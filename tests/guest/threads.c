@@ -1,7 +1,7 @@
 /*
- * 多线程、futex 与信号的 guest 测试程序（M3a）：用 musl-gcc -static 编译，在 appine-run 里
- * 直接运行（不需要 rootfs）。每项检查通过时打印一行 "ok <名字>"，失败时打印原因并
- * 以 1 退出，全部通过时最后打印 "all ok"。
+ * Guest test program for threads, futexes and signals (M3a): build with musl-gcc -static and run
+ * directly in appine-run (no rootfs needed). Each check that passes prints a line "ok <name>"; a
+ * failure prints the reason and exits with 1; when all pass it prints "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -51,7 +51,7 @@ static void handle(int sig, void (*fn)(int), int flags)
     CHECK(sigaction(sig, &sa, NULL) == 0, "sigaction %d", sig);
 }
 
-/* ---- 互斥锁、原子操作、线程局部存储 ---- */
+/* ---- Mutexes, atomics, thread-local storage ---- */
 
 #define THREADS 8
 #define ROUNDS 4000
@@ -91,7 +91,7 @@ static void test_counters(void)
     ok("mutex-atomic-tls");
 }
 
-/* ---- 条件变量：生产者和消费者 ---- */
+/* ---- Condition variables: producer and consumer ---- */
 
 #define ITEMS 2000
 #define QUEUE 8
@@ -158,7 +158,7 @@ static void test_condvar(void)
     ok("condvar");
 }
 
-/* ---- 发给指定线程的信号 ---- */
+/* ---- Signals sent to a given thread ---- */
 
 static pthread_t handled_by;
 static atomic_int usr1_count;
@@ -190,7 +190,7 @@ static void test_thread_signal(void)
     ok("thread-signal");
 }
 
-/* ---- 备用信号栈 ---- */
+/* ---- Alternate signal stack ---- */
 
 static char *alt_base;
 static size_t alt_size;
@@ -224,7 +224,8 @@ static void test_altstack(void)
     ok("altstack");
 }
 
-/* ---- 访存出错：处理函数修复后返回，或者 siglongjmp 跳出 ---- */
+/* ---- Memory access faults: the handler fixes things up and returns, or jumps out with
+ * siglongjmp ---- */
 
 static char *page;
 static volatile int faults, last_code;
@@ -262,14 +263,15 @@ static void test_faults(void)
 
     sa.sa_sigaction = on_segv_jump;
     sigaction(SIGSEGV, &sa, NULL);
-    /* 地址经由 volatile 变量传过去，编译器看不出它是常量 */
+    /* The address is passed through a volatile variable, so the compiler cannot tell it is a
+     * constant */
     static volatile uintptr_t unmapped = 16;
     if (sigsetjmp(jump, 1) == 0) {
         *(volatile int *)unmapped = 1;
         CHECK(0, "no fault at address 16");
     }
     CHECK(last_code == SEGV_MAPERR, "si_code %d", last_code);
-    /* siglongjmp 恢复了屏蔽字，SIGSEGV 不能还被屏蔽着 */
+    /* siglongjmp restored the signal mask, so SIGSEGV must not still be blocked */
     sigset_t cur;
     sigprocmask(SIG_BLOCK, NULL, &cur);
     CHECK(!sigismember(&cur, SIGSEGV), "SIGSEGV still blocked");
@@ -277,7 +279,7 @@ static void test_faults(void)
     ok("faults");
 }
 
-/* ---- SA_RESTART：被信号打断的 read 是否重新执行 ---- */
+/* ---- SA_RESTART: whether a read interrupted by a signal is restarted ---- */
 
 static int restart_pipe[2];
 static pthread_t main_thread;
@@ -317,8 +319,9 @@ static void test_restart(void)
     ok("restart");
 }
 
-/* ---- futex 和 nanosleep（不持 BKL 的路径）：信号打断、超时、被唤醒、剩下的时间。共享
- * 文件映射里跨进程的 futex 要有文件系统，在差分测试 c-programs 里 ---- */
+/* ---- futex and nanosleep (the no-BKL paths): interrupted by a signal, timeouts, being woken, the
+ * time remaining. Cross-process futexes in shared file mappings need a filesystem and are in the
+ * differential test c-programs ---- */
 
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
@@ -363,14 +366,14 @@ static void test_futex_sleep(void)
     pthread_t t;
     struct timespec start;
 
-    /* 等待被信号打断（处理函数没有 SA_RESTART）：EINTR */
+    /* A wait interrupted by a signal (the handler has no SA_RESTART): EINTR */
     atomic_store(&fword, 0);
     pthread_create(&t, NULL, interrupt_main, NULL);
     long r = futex(&fword, FUTEX_WAIT_PRIVATE, 0, NULL);
     CHECK(r == -1 && errno == EINTR, "interrupted futex wait returned %ld errno %d", r, errno);
     pthread_join(t, NULL);
 
-    /* 超时、值不对 */
+    /* Timeout, wrong value */
     struct timespec ts = {0, 50000000};
     clock_gettime(CLOCK_MONOTONIC, &start);
     r = futex(&fword, FUTEX_WAIT_PRIVATE, 0, &ts);
@@ -379,7 +382,7 @@ static void test_futex_sleep(void)
     r = futex(&fword, FUTEX_WAIT_PRIVATE, 1, NULL);
     CHECK(r == -1 && errno == EAGAIN, "futex with a stale value returned %ld errno %d", r, errno);
 
-    /* 被另一个线程唤醒 */
+    /* Woken by another thread */
     pthread_create(&t, NULL, wake_main, NULL);
     while (atomic_load(&fword) == 0) {
         r = futex(&fword, FUTEX_WAIT_PRIVATE, 0, NULL);
@@ -387,7 +390,8 @@ static void test_futex_sleep(void)
     }
     pthread_join(t, NULL);
 
-    /* nanosleep 被信号打断：剩下的是真正剩下的，不是从被打断时重新算的 */
+    /* nanosleep interrupted by a signal: what remains is what really remains, not recomputed from
+     * the moment of the interruption */
     pthread_create(&t, NULL, interrupt_main, NULL);
     struct timespec req = {1, 0}, rem = {0, 0};
     r = nanosleep(&req, &rem);
@@ -399,8 +403,9 @@ static void test_futex_sleep(void)
     ok("futex_sleep");
 }
 
-/* ---- 一个线程一直在执行 guest 代码时另一个线程反复 munmap：被打断的线程不进内核、马上
- * 回到 guest 代码，解除映射的一方仍然要能等到它离开过（等不到时持着 BKL 卡住） ---- */
+/* ---- While one thread keeps running guest code, another thread munmaps repeatedly: the kicked
+ * thread does not enter the kernel and goes back to guest code at once, yet the unmapping side must
+ * still be able to wait until it has left (if it cannot, it hangs holding the BKL) ---- */
 
 static atomic_int spinning, stop_spin;
 
@@ -430,7 +435,8 @@ static void test_unmap_while_spinning(void)
     ok("unmap_while_spinning");
 }
 
-/* ---- 多线程进程里 fork：子进程只有调用 fork 的线程，内存是一份拷贝 ---- */
+/* ---- fork in a multithreaded process: the child has only the thread that called fork, and its
+ * memory is a copy ---- */
 
 static atomic_int stop_spinning;
 
@@ -464,7 +470,7 @@ static void test_fork(void)
     ok("fork");
 }
 
-/* ---- 分离的线程退出：musl 用 __unmapself 释放自己的栈 ---- */
+/* ---- A detached thread exits: musl frees its own stack with __unmapself ---- */
 
 static atomic_int detached_done;
 

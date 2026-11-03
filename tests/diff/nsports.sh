@@ -1,16 +1,19 @@
 # docker-run-options: --privileged
-# 各个网络命名空间的端口互不相干（docs/rounds/174-namespace-ports.md）：开机时的命名空间里一个
-# bridge（10.70.0.1/24），两个新的网络命名空间 A、B 挂在上面（10.70.0.2、10.70.0.3）。外层占着
-# 一个端口（监听通配地址、从不 accept，像 podman、docker-proxy 那样）时 A 照样绑得上同一个
-# 端口，反过来也一样，TCP、UDP；连到 A 上没有监听的端口是 ECONNREFUSED（外层的监听不会接走）；
-# 只绑 127.0.0.1、只绑 eth0 地址的服务从别的地址连不上；A 自己的冲突照常是 EADDRINUSE，
-# SO_REUSEPORT 照常可以；/proc/net/tcp 里是 guest 的端口；服务回完就退出、之后才读到的
-# 回答，来源照样是 guest 的端口。原生一侧是特权容器。
+# Ports of different network namespaces are independent (docs/rounds/174-namespace-ports.md): a
+# bridge (10.70.0.1/24) in the boot-time namespace, with two new network namespaces A and B
+# attached to it (10.70.0.2, 10.70.0.3). While the outer namespace holds a port (listening on the
+# wildcard address and never accepting, as podman and docker-proxy do), A can still bind the same
+# port, and the other way round, for TCP and UDP; connecting to a port of A with no listener is
+# ECONNREFUSED (the outer listener does not take the connection); services bound only to
+# 127.0.0.1, or only to the eth0 address, cannot be reached from other addresses; A's own
+# conflicts are EADDRINUSE as usual, and SO_REUSEPORT works as usual; /proc/net/tcp shows the
+# guest's ports; a reply read only after the service has replied and exited still comes from the
+# guest's port. The native side is a privileged container.
 exec 2>&1
 cd /tmp
 cat > srv.py <<'PY'
 import socket, sys
-# srv.py tcp|udp <地址> <端口> <次数> <就绪文件>；没等到连接时 15 秒后退出
+# srv.py tcp|udp <address> <port> <count> <ready file>; exits after 15 seconds without a connection
 socket.setdefaulttimeout(15)
 kind, addr, port, n, ready = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
@@ -36,8 +39,8 @@ else:
 PY
 cat > cli.py <<'PY'
 import errno, os, socket, sys, time
-# cli.py tcp|udp <地址> <端口> <消息> [<文件>]：给了文件的，UDP 发出之后等它出现（服务端
-# 已经退出）才读回答
+# cli.py tcp|udp <address> <port> <message> [<file>]: when a file is given, after sending over UDP
+# wait until it appears (the server has exited) before reading the reply
 kind, addr, port, msg = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 late = sys.argv[5] if len(sys.argv) > 5 else None
 fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
@@ -61,7 +64,8 @@ try:
 except OSError as e:
     print(f"{msg}: {errno.errorcode.get(e.errno, e.errno)}")
 PY
-# hold.py tcp|udp <端口> <就绪文件>：外层占着端口（TCP 监听、从不 accept），30 秒
+# hold.py tcp|udp <port> <ready file>: the outer namespace holds the port (TCP listening, never
+# accepting) for 30 seconds
 cat > hold.py <<'PY'
 import socket, sys, time
 kind, port, ready = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -172,7 +176,7 @@ a = try_bind("first 7006")
 b = try_bind("second 7006")
 c = try_bind("first 7007 reuseport", socket.SO_REUSEPORT)
 d = try_bind("second 7007 reuseport", socket.SO_REUSEPORT)
-# 行序不比（Linux 按哈希桶，appine 按 fd 的先后）
+# Row order is not compared (Linux orders by hash bucket, appine by the order of the fds)
 rows = []
 for l in open("/proc/net/tcp").read().splitlines()[1:]:
     f = l.split()

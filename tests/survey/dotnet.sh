@@ -1,4 +1,5 @@
-# .NET：dotnet new、build、run（JIT、GC、线程池、Task、子进程），cgroup 的内存上限和用量
+# .NET: dotnet new, build, run (JIT, GC, thread pool, Task, child processes), cgroup memory limit
+# and usage
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 DOTNET_GENERATE_ASPNET_CERTIFICATE=false HOME=/root
 dotnet --info 2>&1 | grep -E 'Version:|RID|OS Name' | head -4
 cd /tmp; rm -rf app; s=$(date +%s); dotnet new console -o app >/tmp/dotnet-new.log 2>&1; echo "new: $? ($(( $(date +%s) - s ))s)"; tail -3 /tmp/dotnet-new.log

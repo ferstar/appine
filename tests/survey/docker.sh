@@ -1,7 +1,9 @@
-# docker：dockerd + containerd + runc。vfs 存储驱动、不建网桥、不用 iptables，容器用 host
-# 网络。仓库要另建，不要和 podman 的共用（Alpine 的 runc 与 crun 冲突）：
+# docker: dockerd + containerd + runc. The vfs storage driver, no bridge, no iptables; containers
+# use host networking. The store must be created separately, not shared with podman's (Alpine's runc
+# conflicts with crun):
 #   scripts/survey -s target/survey/docker docker
-# 原生对照：scripts/survey -n <装了 docker 的 alpine 镜像> docker，SURVEY_DOCKER_OPTS=--privileged
+# Native comparison: scripts/survey -n <an alpine image with docker installed> docker,
+# SURVEY_DOCKER_OPTS=--privileged
 exec 2>&1
 [ -x /usr/bin/dockerd ] || apk add -q docker
 mkdir -p /etc/docker

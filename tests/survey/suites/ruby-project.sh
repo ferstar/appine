@@ -1,4 +1,5 @@
-# Ruby 的大项目：gem 装 Rails（编译 C 扩展），新建应用、scaffold、迁移、测试、启动服务器
+# A big Ruby project: gem installs Rails (compiling C extensions), then a new app, scaffold,
+# migrations, tests, starting the server
 cd /tmp; s=$(date +%s)
 gem install -N rails >/tmp/gem.log 2>&1; echo "gem install rails: $? ($(( $(date +%s) - s ))s)"; tail -2 /tmp/gem.log
 rm -rf blog; s=$(date +%s)

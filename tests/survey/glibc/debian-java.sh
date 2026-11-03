@@ -1,4 +1,4 @@
-# Debian（glibc）：OpenJDK 21 编译、运行多线程程序
+# Debian (glibc): OpenJDK 21 compiling and running a multithreaded program
 cd /tmp; rm -rf jt; mkdir jt; cd jt
 cat > T.java <<'J'
 import java.util.concurrent.*;

@@ -1,5 +1,5 @@
-// 计算 fib(50) 并以十进制打印。覆盖 bl/ret、循环与条件分支、栈上的
-// stp/ldp 与前变址 strb、udiv/msub。
+// Computes fib(50) and prints it in decimal. Covers bl/ret, loops and conditional branches,
+// stp/ldp on the stack and pre-indexed strb, udiv/msub.
     .section .rodata
 prefix:
     .ascii  "fib(50) = "
@@ -39,11 +39,11 @@ fib:
 2:  mov     x0, x1
     ret
 
-// 以十进制打印 x0，后跟换行
+// Print x0 in decimal, followed by a newline
 print_u64:
     stp     x29, x30, [sp, #-48]!
     mov     x29, sp
-    add     x1, sp, #47             // 从缓冲区末尾往前写
+    add     x1, sp, #47             // write backwards from the end of the buffer
     mov     w2, #10                 // '\n'
     strb    w2, [x1]
     mov     x3, #10
@@ -56,7 +56,7 @@ print_u64:
 
     mov     x0, #1
     add     x2, sp, #48
-    sub     x2, x2, x1              // 长度
+    sub     x2, x2, x1              // length
     mov     x8, #64                 // __NR_write
     svc     #0
     ldp     x29, x30, [sp], #48
