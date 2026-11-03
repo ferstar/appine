@@ -24,21 +24,27 @@ import java.io.IOException
 import kotlin.concurrent.read
 
 /**
- * 系统"文件"App 里的 appine（android/documents 的 map）：登录账号的家目录是一个根，设置里打开之后还有
- * 只读的整个系统（`/`）。
+ * appine in the system Files app (the android/documents map): the login account's home directory is
+ * one root, and once turned on in Settings there is also the whole system (`/`), read-only.
  *
- * 文档 ID 就是 guest 的绝对路径（写法见 [Native] 的说明），直接在仓库里查（[Native.browseList]
- * 这些），不需要内核在运行：运行着时看到的是它最新提交的，`/proc`、`/dev`、`/run` 这些挂载
- * 看不到（是仓库里的空目录）。符号链接跟随。只有目录和普通文件，设备节点、FIFO、socket 不列。
+ * Document IDs are the guest's absolute paths (written as described in [Native]) and are looked up
+ * directly in the store ([Native.browseList] and the like), without the kernel running: while it
+ * runs, what is seen is what it last committed, and mounts such as `/proc`, `/dev` and `/run` are
+ * not visible (they are empty directories in the store). Symbolic links are followed. Only
+ * directories and regular files; device nodes, FIFOs and sockets are not listed.
  *
- * 家目录里面可以新建、写、删除、改名、移动（家目录本身只能在里面新建），新建的属于登录账号；
- * 别处（整个系统那个根）只读。按真实路径限制：经由符号链接写到家目录外面去的不行。改了之后
- * 通知"文件"App 刷新那个目录，也告诉运行中的内核，guest 里监视着的程序收到 inotify 事件
- * （[Native.browseWritten]）。反过来，guest 改了目录项（新建、删除、改名）时服务定时取走
- * （[Native.takeChangedDirs]），通知"文件"App 刷新那个目录（[dirsChanged]）。
+ * Inside the home directory files can be created, written, deleted, renamed and moved (the home
+ * directory itself only allows creating inside it), and new ones belong to the login account;
+ * everywhere else (the whole-system root) is read-only. Confined by real path: writing out of the
+ * home directory through a symbolic link is not allowed. After a change, the Files app is told to
+ * refresh that directory, and the running kernel is told as well, so programs watching in the guest
+ * receive inotify events ([Native.browseWritten]). The other way round, when the guest changes
+ * directory entries (create, delete, rename), the service takes them periodically
+ * ([Native.takeChangedDirs]) and tells the Files app to refresh that directory ([dirsChanged]).
  *
- * 没打开整个系统时，只认家目录里面的文档：以前打开时授予别的 App 的 `/` 的权限，关掉之后也
- * 用不了了；换了登录账号，原来那个家目录也一样。
+ * With the whole system turned off, only documents inside the home directory are recognised: grants
+ * on `/` given to other apps while it was on no longer work after it is turned off; likewise for
+ * the old home directory after the login account changes.
  */
 class Documents : DocumentsProvider() {
     override fun onCreate(): Boolean = true
@@ -48,7 +54,7 @@ class Documents : DocumentsProvider() {
         val context = context ?: return result
         val home = home(context) ?: return result
         val distro = Rootfs.installed(context)?.label.orEmpty()
-        // 可用空间算上系统能清掉的缓存，与"设置"里显示的一致
+        // Free space includes caches the system can clear, matching what Settings shows
         val free = runCatching {
             val storage = context.getSystemService(StorageManager::class.java)
             storage.getAllocatableBytes(storage.getUuidForPath(context.filesDir))
@@ -58,7 +64,7 @@ class Documents : DocumentsProvider() {
             add(Root.COLUMN_DOCUMENT_ID, home.path)
             add(Root.COLUMN_TITLE, context.getString(R.string.app_name))
             add(Root.COLUMN_SUMMARY, context.getString(R.string.documents_home, home.account, distro))
-            // 能新建：别的 App 的"保存到"里也有它
+            // Creating is supported: so it also appears in other apps' "Save to"
             val flags = Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_SEARCH or
                 Root.FLAG_SUPPORTS_CREATE
             add(Root.COLUMN_FLAGS, flags)
@@ -120,9 +126,10 @@ class Documents : DocumentsProvider() {
         val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
         val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
         val opened = ParcelFileDescriptor.adoptFd(browse { Native.browseOpenWrite(it, home.path, path, truncate, append) })
-        // 对方直接写宿主的 object，写了什么、什么时候关，内核都看不到：按 object 的路径重新打开、
-        // 带上关闭的回调，关闭时告诉运行中的内核（guest 里监视着的程序收到 IN_MODIFY、
-        // IN_CLOSE_WRITE）。截断已经做过了
+        // The other side writes the host object directly, and the kernel sees neither what was
+        // written nor when it is closed: reopen it by the object's path with a close callback, and
+        // tell the running kernel on close (programs watching in the guest receive IN_MODIFY and
+        // IN_CLOSE_WRITE). Truncation has already been done
         return try {
             val file = File(Os.readlink("/proc/self/fd/${opened.fd}"))
             val mode = flags and ParcelFileDescriptor.MODE_TRUNCATE.inv()
@@ -140,7 +147,7 @@ class Documents : DocumentsProvider() {
         }
     }
 
-    /** 交出去写的文件关闭时的回调在这个线程上（[openDocument]）。 */
+    /** Close callbacks for files handed out for writing run on this thread ([openDocument]). */
     private val closer: Handler by lazy { Handler(HandlerThread("documents-close").apply { start() }.looper) }
 
     override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
@@ -212,7 +219,10 @@ class Documents : DocumentsProvider() {
         return result
     }
 
-    /** 登录账号、它的 UID 和 GID、家目录（文档 ID 的写法）。仓库还没有、家目录不在时是 null。 */
+    /**
+     * The login account, its UID and GID, and the home directory (as a document ID). null while
+     * there is no store or no home directory.
+     */
     private data class Home(val account: String, val uid: Int, val gid: Int, val path: String)
 
     private fun home(context: Context): Home? {
@@ -224,7 +234,7 @@ class Documents : DocumentsProvider() {
         val home = Rootfs.access.read {
             val account = Rootfs.loginAccount(context, login)
             val path = canonical("/" + account.home.trim('/')) ?: return@read null
-            // 家目录不在（账号没有建家目录）时不列这个根
+            // No root is listed when the home directory does not exist (the account has none)
             runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull() ?: return@read null
             Home(account.name, account.uid, account.gid, path)
         }
@@ -232,11 +242,17 @@ class Documents : DocumentsProvider() {
         return home
     }
 
-    /** 最近一次算出的家目录：一次浏览要查好几次，不必每次都读 /etc/passwd。 */
+    /**
+     * The home directory computed last: one browse queries several times, so /etc/passwd need not
+     * be read every time.
+     */
     @Volatile
     private var cache: Triple<Long, String, Home?>? = null
 
-    /** 文档 ID 规范、在现在显示的根里面时返回它，不然当作不存在。 */
+    /**
+     * Returns the document ID when it is canonical and inside a root shown now; otherwise treated
+     * as nonexistent.
+     */
     private fun visible(context: Context, documentId: String): String {
         val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
         if (TerminalService.showSystemDocuments(context)) return path
@@ -248,19 +264,22 @@ class Documents : DocumentsProvider() {
     private fun writableHome(context: Context): Home =
         home(context) ?: throw FileNotFoundException("no home directory")
 
-    /** 要修改的文档：规范、在家目录里面（[top] 时也可以是家目录本身），不然只读。 */
+    /**
+     * A document to modify: canonical and inside the home directory (with [top], also the home
+     * directory itself); otherwise read-only.
+     */
     private fun writable(home: Home, documentId: String, top: Boolean = false): String {
         val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
         if ((top && path == home.path) || isChildDocument(home.path, path)) return path
         throw UnsupportedOperationException("$documentId is read-only")
     }
 
-    /** 目录 [dir] 里的东西变了："文件"App 重新列它。 */
+    /** Something in directory [dir] changed: the Files app lists it again. */
     private fun childrenChanged(context: Context, dir: String) {
         context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
     }
 
-    /** ContentProvider 的 requireContext 要 API 30。 */
+    /** ContentProvider's requireContext needs API 30. */
     private fun attached(): Context = context ?: throw IllegalStateException("the provider is not attached")
 
     private fun <T> browse(call: (String) -> T): T {
@@ -275,9 +294,10 @@ class Documents : DocumentsProvider() {
     }
 
     /**
-     * [docs]（路径和元数据）里按扩展名猜不出类型的普通文件，按内容看是文本的那些
-     * （[Native.browseSniff]，一次打开仓库看完）。`/etc/profile`、`.bashrc`、脚本、`Makefile`
-     * 这样就是 text/plain，点开有编辑器能打开。
+     * The regular files in [docs] (paths and metadata) whose type the extension cannot tell and
+     * whose content looks like text ([Native.browseSniff], all checked with one opening of the
+     * store). That makes `/etc/profile`, `.bashrc`, scripts and `Makefile` text/plain, so tapping
+     * them opens an editor that can handle them.
      */
     private fun sniff(docs: List<Pair<String, String>>): Set<String> {
         val unknown = docs.filter { (path, meta) -> meta.startsWith("f\t") && guessType(displayName(path)) == null }
@@ -309,8 +329,10 @@ class Documents : DocumentsProvider() {
     }
 
     /**
-     * 文档能做什么：家目录里面的能删除、改名、移动，文件能写，目录能在里面新建；家目录本身只能
-     * 在里面新建；别处只读。按路径的字面判断，经由符号链接走出去的由原生库拒绝。
+     * What a document allows: inside the home directory, deleting, renaming and moving, writing for
+     * files, creating inside for directories; the home directory itself only allows creating inside
+     * it; everywhere else is read-only. Judged by the literal path; leading out through a symbolic
+     * link is refused by the native library.
      */
     private fun flags(path: String, dir: Boolean, home: String?): Int {
         if (home == null) return 0
@@ -326,7 +348,7 @@ class Documents : DocumentsProvider() {
 
         private const val TAG = "appine"
 
-        /** 一次搜索最多给出这么多个。 */
+        /** The most results one search gives. */
         private const val SEARCH_LIMIT = 200
 
         private const val CACHE_MS = 5_000L
@@ -342,19 +364,28 @@ class Documents : DocumentsProvider() {
 
         fun authority(context: Context) = "${context.packageName}.documents"
 
-        /** 登录账号、仓库、"显示整个系统"变了：让"文件"App 重新读根。 */
+        /**
+         * The login account, the store or "show the whole system" changed: the Files app reads the
+         * roots again.
+         */
         fun rootsChanged(context: Context) {
             context.contentResolver.notifyChange(DocumentsContract.buildRootsUri(authority(context)), null)
         }
 
-        /** guest 改了这些目录里的东西（[Native.takeChangedDirs]）："文件"App 正在看的话重新列。 */
+        /**
+         * The guest changed something in these directories ([Native.takeChangedDirs]): the Files
+         * app lists them again if it is looking at them.
+         */
         fun dirsChanged(context: Context, dirs: Array<String>) {
             for (dir in dirs) {
                 context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
             }
         }
 
-        /** 规范的路径：`/` 开头，没有空的、`.`、`..` 组件，不以 `/` 结尾（`/` 本身除外）。不是时是 null。 */
+        /**
+         * A canonical path: starts with `/`, has no empty, `.` or `..` components, and does not end
+         * with `/` (except `/` itself). null when it is not.
+         */
         fun canonical(path: String): String? {
             if (path == "/") return path
             if (!path.startsWith("/") || path.endsWith("/")) return null
@@ -368,9 +399,10 @@ class Documents : DocumentsProvider() {
         fun parent(path: String) = path.substringBeforeLast('/').ifEmpty { "/" }
 
         /**
-         * 新建、改名时用的名字：`/` 和 NUL 换成 `_`，空的、`.`、`..` 换成 `_`。新建文件时名字的
-         * 扩展名与 [mime] 不符的，照 Android 自己的存储那样补上（"文本"、text/plain → "文本.txt"）；
-         * 目录、application/octet-stream 不补。
+         * The name used when creating and renaming: `/` and NUL become `_`, and empty, `.` and `..`
+         * become `_`. When creating a file whose name's extension does not match [mime], one is
+         * added as Android's own storage does ("text", text/plain → "text.txt"); not for
+         * directories or application/octet-stream.
          */
         fun fileName(displayName: String, mime: String, directory: Boolean): String {
             val name = displayName.replace('/', '_').replace('\u0000', '_')
@@ -381,7 +413,10 @@ class Documents : DocumentsProvider() {
             return "$name.$ext"
         }
 
-        /** 路径最后一个组件给人看的名字：`%XX` 换回字节，按 UTF-8 解码（不是 UTF-8 的字节显示成 �）。 */
+        /**
+         * The human-readable name of the last component of a path: `%XX` turned back into bytes and
+         * decoded as UTF-8 (bytes that are not UTF-8 show as �).
+         */
         fun displayName(path: String): String {
             val last = path.substringAfterLast('/').ifEmpty { return "/" }
             val out = ByteArrayOutputStream()
@@ -403,12 +438,13 @@ class Documents : DocumentsProvider() {
             return String(out.toByteArray(), Charsets.UTF_8)
         }
 
-        /** 按扩展名猜 MIME 类型，猜不出时是 application/octet-stream。 */
+        /** Guesses the MIME type by extension; application/octet-stream when it cannot tell. */
         fun mimeType(name: String): String = guessType(name) ?: "application/octet-stream"
 
         /**
-         * 按扩展名猜 MIME 类型，猜不出（没有扩展名、不认识的扩展名）时是 null。`.bashrc` 这样的点
-         * 文件把点后面的当作扩展名，一般都不认识。
+         * Guesses the MIME type by extension; null when it cannot tell (no extension, an unknown
+         * extension). Dot files like `.bashrc` have what follows the dot taken as the extension,
+         * which is usually unknown.
          */
         fun guessType(name: String): String? {
             val ext = name.substringAfterLast('.', "").lowercase()
