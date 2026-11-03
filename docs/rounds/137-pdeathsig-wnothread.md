@@ -17,7 +17,7 @@
 - 差分测试 `compat2` 组新增 `pdeath.c`：哪个线程退出时发、siginfo、多个线程各设一个、execve 保留、新线程和 fork 读到 0、setuid 清掉、整个父进程结束时的孙进程；`__WNOTHREAD` 只等自己建的、ECHILD、线程退出之后转给主线程的子进程。两个执行层下都与原生相同。孙进程那一项放在最后：原生一侧这个程序是容器的 1 号进程，会收养这个孤儿。
 - `namespaces` 组新增 `unshare -p -f --kill-child`：`kill -9` 掉 unshare 之后命名空间里的 1 号进程跟着结束。
 
-**推迟项**：
+## 推迟项
 
 - `__WNOTHREAD` 对跟踪着的线程（ptrace-stop、跟踪者先取走的结束）仍按进程算：跟踪者记的是进程（[ptrace 的第一步](40-ptrace-strace.md)的推迟项）。
 - 凭据仍按进程记：单独一个线程用原始的 setuid 系统调用（不经过 libc 的广播）时，Linux 只改那个线程的凭据、只清那个线程的 PDEATHSIG，这里整个进程的都变了（凭据原来就是这样）。

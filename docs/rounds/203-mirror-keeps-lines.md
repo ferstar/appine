@@ -16,7 +16,7 @@
 
 仪器测试 `manualMirrorIsWritten` 扩充：源里有用户加的行、注释掉的行、第三方仓库时只换内置镜像的地址、协议照旧，全是列表以外的镜像时什么也不改，源文件不在时重写；Debian 的 deb822 内容直接调 `retarget` 测了同样几种情形。在 Pixel 4a（API 34）的模拟器上通过；也在模拟器上手动试了源里全是列表以外的镜像时选镜像，弹出提示，什么也没改。
 
-**推迟项**：
+## 推迟项
 
 - 只改 App 写的那一个文件（`/etc/apk/repositories`、`/etc/apt/sources.list.d/debian.sources`）。用户在 `sources.list.d` 里另加的文件、`/etc/apt/sources.list` 里的地址仍是原来的镜像。
 - 列表以外的镜像仍要手改，设置里不能填自己的地址。

@@ -4,6 +4,8 @@
 
 做的时候发现同一条路径上还缺几样：扩展属性完全不检查权限（任何用户都能设 `security.*`、`trusted.*`，有了文件能力就等于谁都能给自己加能力）；写文件时从来不去掉 setuid 位；securebits 只记录不起作用。这一轮一起按 Linux 6.1 做了。
 
+## 做法
+
 - **execve 的能力变换**（`core/kernel/src/cred.rs` 的 `Cred::exec`，Linux 的 `cap_bprm_creds_from_file`）：
   - 允许集是 (边界集 & 文件的允许集) | (可继承集 & 文件的可继承集) | 环境能力。有效用户 ID 或真实用户 ID 是 0（没有 `SECBIT_NOROOT`）时，文件的两个集合当作全 1；有效用户 ID 是 0 时有效位也置上。setuid root 的程序带着文件能力、由非 root 执行时不按 root 算，只有文件给的。
   - 有效集在文件的有效位置上时等于允许集，否则等于环境能力。文件能力或者 setuid、setgid 清掉环境能力。
@@ -29,13 +31,15 @@
   - write、pwrite 等写进了数据，以及 copy_file_range、sendfile 写进普通文件、truncate、ftruncate、`O_TRUNC`、fallocate 时：没有 `CAP_FSETID` 的进程去掉 setuid 位和带着组执行位时的 setgid 位，不论谁都去掉文件能力。
   - chown 原来就去掉 setuid、setgid，现在不是目录的也去掉文件能力（`chown_common` 的 `ATTR_KILL_PRIV`）。
   - 写文件很频繁，不能每次都查数据库：元数据缓存里放着有文件能力的 inode 的整个集合，第一次用时查一次，随提交计数一起作废，别的进程设置的也看得到。没有可去掉的时候不碰数据库。
-- **测试**：
-  - 单元测试：`cred` 测文件能力的各种组合、环境能力、securebits 的锁和 `security.capability` 的格式；`store` 测写和 chown 去掉特权。
-  - 差分测试 compat 组新增 `showcaps`、`fcaps` 两个 C 程序：各种执行方式得到的能力、扩展属性的权限、去掉特权、securebits 和环境能力的 prctl，与原生逐行相同。docker 里的 root 没有 `CAP_SYS_ADMIN`，`trusted.*`、`security.*` 只比较 nobody 的。
-  - 第一版漏了 `_GNU_SOURCE`，两边都编不过、输出一样，差分测试照样"通过"：新用例要看一眼输出。
-  - 写路径的开销在噪声范围内。
 
-**推迟项**：
+## 测试
+
+- 单元测试：`cred` 测文件能力的各种组合、环境能力、securebits 的锁和 `security.capability` 的格式；`store` 测写和 chown 去掉特权。
+- 差分测试 compat 组新增 `showcaps`、`fcaps` 两个 C 程序：各种执行方式得到的能力、扩展属性的权限、去掉特权、securebits 和环境能力的 prctl，与原生逐行相同。docker 里的 root 没有 `CAP_SYS_ADMIN`，`trusted.*`、`security.*` 只比较 nobody 的。
+- 第一版漏了 `_GNU_SOURCE`，两边都编不过、输出一样，差分测试照样"通过"：新用例要看一眼输出。
+- 写路径的开销在噪声范围内。
+
+## 推迟项
 
 - 没有用户命名空间：rootid 不是 0 的 v3 文件能力不起作用，setcap 也只能在初始命名空间里用。 → 用户命名空间补上了（M9 之前：用户命名空间）；v3 的 rootid 仍只认 0，命名空间里设置的文件能力也不转成 v3
 - 跟踪者只记了建立跟踪时有没有 `CAP_SYS_PTRACE`；Linux 记下整份凭据。和别的进程共用文件系统上下文（`CLONE_FS`，Linux 的 `LSM_UNSAFE_SHARE`）时也照样得到特权。

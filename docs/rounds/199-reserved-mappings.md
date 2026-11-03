@@ -40,7 +40,7 @@ Chromium 每个进程（浏览器、两个 zygote、两个 crashpad、GPU、两�
 - 常用负载的速度都在波动范围内。
 - 仪器测试在 Pixel 4a（API 34）的模拟器上通过，宿主就是 39 位。
 
-**推迟项**：
+## 推迟项
 
 - 可写的大映射仍然一对一占宿主地址空间：ASan 的影子内存（可写、`MAP_NORESERVE`，十几 TB）在 39 位的设备上仍然映射不出来，TSan、MSan 也一样。要做得把宿主内存分块、用到时再申请（[页表按需建立](179-demand-page-tables.md)的推迟项）。
 - 提交过又变回 `PROT_NONE` 的部分（PartitionAlloc 的 decommit）留着宿主映射，宿主地址空间按提交的峰值算。

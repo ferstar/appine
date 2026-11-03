@@ -4,6 +4,8 @@
 
 appine 的 TCP、UDP、ping socket 都是宿主 socket，宿主上没有可用的网络命名空间，所以这里不另造协议栈，而是在系统调用的边界上换算地址（`core/kernel/src/netns.rs`）：
 
+## 做法
+
 - **网络命名空间**（`crate::nsproxy::NetNs`）：与 UTS、IPC 命名空间一样按线程记。开机时的那个就是宿主的网络，什么都不换。新建的分到宿主回环网段里的一段 127.a.b.0/24（a、b 是 1 到 65535 里没有被还在用的命名空间占着的编号），里面有一个 lo：一开始关着、没有地址（Linux 的 `loopback_net_init`），打开时没有 IPv4 地址就配上 127.0.0.1/8、并且有 ::1（`inetdev_event`、addrconf）。
 - **socket 记下建立时所在的命名空间**（之后 setns 到别处也还在那个命名空间里，与 Linux 的 `sock_net` 一样），新命名空间里的 socket 的地址这样换：
   - guest 的 127.0.0.x 是宿主的 127.a.b.x；绑定通配地址时宿主上绑 127.a.b.1，getsockname 照旧报告通配地址，连接之后报告实际的。
@@ -17,12 +19,14 @@ appine 的 TCP、UDP、ping socket 都是宿主 socket，宿主上没有可用�
 - **AF_UNIX**：抽象地址按网络命名空间分开（Linux 的 `unix_find_abstract`），自动绑定的也是；路径地址不分。socketpair 和连接时新建的服务端一端在连接方的命名空间里（`unix_stream_connect`）。
 - **新建和进入**：clone、unshare 的 `CLONE_NEWNET` 要在（可能是新建的）用户命名空间里有 `CAP_SYS_ADMIN`，新命名空间属于它，所以 root 建的用户命名空间里新建的网络命名空间可以配 lo；setns（`netns_install`）要在它的属主和自己的用户命名空间里都有 `CAP_SYS_ADMIN`。`/proc/<pid>/ns/net` 按线程报告。
 - 顺带：`/proc/sys/user/max_*_namespaces` 可以写了（0 到 INT_MAX，只记下，仍不实际限制）：LTP 的网络命名空间测试一开始要改写它。
-- **测试**：
-  - 单元测试 `loopback_addresses_map_to_the_namespace_range`（绑定、连接和两个方向的地址换算）、`netlink_configures_lo`（bwrap 的两条请求和错误）。
-  - 差分测试 `namespaces` 组加上（docker 一侧另加 `NET_ADMIN`）：busybox 的 `unshare -n` 里的 `ip` 和 ping；Python 里配 lo、回环上的 TCP 和 UDP 的地址和数据、外面的地址和抽象地址到不了、`/proc/self/net`、setns 回去之后新旧 socket、各种 EPERM。两个执行层下都与原生相同。替没有绑定的 socket 先绑到 127.a.b.1 这一步从里面看不出来，没有用例能查。
-  - `scripts/ltp` 给 LTP 的内核配置加上 `CONFIG_NET_NS`，setsockopt05 由跳过变成通过；sendmsg03 由跳过变成失败（见推迟项）。
 
-**推迟项**：
+## 测试
+
+- 单元测试 `loopback_addresses_map_to_the_namespace_range`（绑定、连接和两个方向的地址换算）、`netlink_configures_lo`（bwrap 的两条请求和错误）。
+- 差分测试 `namespaces` 组加上（docker 一侧另加 `NET_ADMIN`）：busybox 的 `unshare -n` 里的 `ip` 和 ping；Python 里配 lo、回环上的 TCP 和 UDP 的地址和数据、外面的地址和抽象地址到不了、`/proc/self/net`、setns 回去之后新旧 socket、各种 EPERM。两个执行层下都与原生相同。替没有绑定的 socket 先绑到 127.a.b.1 这一步从里面看不出来，没有用例能查。
+- `scripts/ltp` 给 LTP 的内核配置加上 `CONFIG_NET_NS`，setsockopt05 由跳过变成通过；sendmsg03 由跳过变成失败（见推迟项）。
+
+## 推迟项
 
 - 127.0.0.0/8 里只有 127.0.0.0/24 换得了（宿主上每个命名空间只有一段 /24），别的回环地址绑不上、连不到；lo 上配的别的 IPv4 地址只记下、到不了；IPv6 只有 ::1。
 - 隔离只在 guest 一侧：宿主上别的进程（包括开机时的命名空间里的 guest 进程）连 127.a.b.x 连得到新命名空间里的服务；新命名空间里绑定的端口和宿主上绑通配地址的端口冲突。

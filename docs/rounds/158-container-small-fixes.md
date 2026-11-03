@@ -15,7 +15,7 @@
 - 写用例时两边都编译失败过一次（仓库里没有内核的头文件、musl 没有 `strerrorname_np`），输出一样算通过，看了 `.native` 才发现。
 - `net.rs` 的单元测试 `host_links_accept_requests_that_change_nothing`：各种请求和错误码，真要改的都是 EOPNOTSUPP。
 
-**推迟项**：
+## 推迟项
 
 - 线程目录里的 fd 用的是进程的 fd 表：clone 不带 `CLONE_FILES` 的线程（同一个线程组里很少见）在 Linux 上有自己的。
 - 开机时的命名空间里真要改接口的请求仍是 EOPNOTSUPP；Linux 上 root 改得了，App 在宿主上改不了。

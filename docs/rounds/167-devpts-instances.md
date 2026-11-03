@@ -19,7 +19,7 @@
 - [cgroup.freeze](165-cgroup-freeze.md) 的用例要求睡 1 秒的进程总共睡够 1.5 秒，解冻就在 1.5 秒前后，原生一侧有一次差一点没到；不冻结时 1 秒就返回，阈值改成 1.25 秒。
 - 在 appine 里实际跑：`docker run -t`、`podman run -t` 的容器里 `tty` 是 `/dev/pts/0`，容器和宿主互相看不到对方的终端。
 
-**推迟项**：
+## 推迟项
 
 - 不在 devpts 里的终端设备节点（mknod 的 136:n）打开的是开机时的实例里的终端；Linux 上这样打开从设备会失败。
 - 内核参数 `kernel.pty.max`、`kernel.pty.reserve` 没有，只有每个实例的 `max`。

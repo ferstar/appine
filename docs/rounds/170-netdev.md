@@ -36,7 +36,7 @@
   - docker（`"iptables": false`）：docker0 和容器里的地址、路由、resolv.conf 都与原生逐行相同。容器之间、外层到容器不通（下一步）；`-p` 的容器起不来：dockerd 给监听 socket 装 BPF 过滤器（`SO_ATTACH_FILTER`），结构里的指针没有换，EFAULT；自定义网络按名字解析、iptables 开着时都要 `NETLINK_NETFILTER`（第 3 步）。 → 都通了（M9 之前：nftables 的子集和 socket 层的 DNAT）dockerd 的警告里还有发免费 ARP 要 AF_PACKET、conntrack 和 IPsec 的模块（`NETLINK_NETFILTER`、`NETLINK_XFRM`）。
   - podman（`firewall_driver = "none"`）：容器里的地址、路由、resolv.conf 与原生逐行相同；起初 crun 打不开 `/proc/sys/net/ipv4/ping_group_range`，补上之后才起得来。自定义网络的 aardvark-dns 绑不上网关地址（EADDRNOTAVAIL，下一步），nftables 驱动和 `-p` 分别在第 3、4 步。
 
-**推迟项**：
+## 推迟项
 
 - 数据包不经过这些设备：容器之间、外层到容器、容器到网关的连接都还到不了（"Network unreachable"），容器里的程序只能用 lo 和宿主的网络（下一步：socket 层的地址映射）。 → 在 socket 层按地址映射连通了（M9 之前：经由虚拟网卡的连接）；数据包仍不经过它们
 - 没有 DAD，IPv6 地址加上就可用；没有路由通告、`autoconf`、临时地址。

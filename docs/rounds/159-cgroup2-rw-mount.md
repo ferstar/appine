@@ -13,6 +13,6 @@
 - 差分测试 `containers` 组新增：不带只读地挂 cgroup2，mountinfo 和 statvfs 是可写的，里面有 `cgroup.procs`；bind 地重新挂成只读、再挂回可写。写文件、建子 cgroup 在原生上真会改，不比；不带 bind 的 remount 改的是超级块，原生上会改到 docker 给容器的 cgroup，也不做。
 - 两个执行层下都与原生逐字相同。busybox 的 mount 得到 EROFS 时会改成只读再挂，只看挂没挂上查不出来，要看 mountinfo 和 statvfs。
 
-**推迟项**：
+## 推迟项
 
 - 可写的挂载里写文件是 EROFS：Linux 上可写的挂载里写 cgroup 文件、建目录照常成功（权限够的话）。等可写的 cgroup。→ 已改（M9 之前：cgroup 树：建子 cgroup、迁移进程）

@@ -21,6 +21,6 @@
 - `vhangup` 组加上包模式下挂断从设备：第一版照 `tty_ldisc_hangup` 报告了两种清空，与原生比出来 Linux 随后清掉了状态。
 - 真的 GNU screen：Ubuntu 26.04 的仓库（第 145 轮）里装上 screen 4.9.1，`screen -D -m sh -c '…'` 原来窗口里的命令根本没有运行（退出码却是 0），现在照常运行。Ubuntu 26.04 的 Rust 版 coreutils 的 `tty` 输出不带结尾的换行，原生上也一样。
 
-**推迟项**：
+## 推迟项
 
 - 主设备上的 `TIOCGPTPEER`（由主设备直接打开从设备）仍是 ENOTTY：glibc 的 openpty、systemd 在失败时退回按名字打开。→ 已补上（M9 之前：devpts 的实例）

@@ -27,7 +27,7 @@ open_tree 一旦能用，crun 所有的 bind 挂载（`get_bind_mount`：屏蔽�
 - 两个执行层下都与原生逐字相同。LTP 的 mount_setattr02 由 CONF 变成 FAIL：原来 ENOSYS 时跳过，现在走到了检查共享、从属的传播类型，appine 没有传播（见推迟项）。
 - 在 appine 里实际跑：`podman run --uidmap 0:100000:65536` 起得来、`--rm` 清理不报错；podman 的普查与原生对照各步相同（只有原生嵌套时 `--memory` 不行），docker 的照常。
 
-**推迟项**：
+## 推迟项
 
 - fsopen、fsconfig、fsmount、fspick 仍是 ENOSYS（程序退回 mount(2)）；listmount、statmount 是 6.8 起的，6.1 没有。
 - idmapped 挂载不支持（`MOUNT_ATTR_IDMAP` 是 EINVAL），podman、crun 的 `idmap` 卷选项用不了。

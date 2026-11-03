@@ -2,6 +2,8 @@
 
 把推迟项里顺手能补的几个内核兼容性缺口补上（ptrace 另做）：
 
+## 做法
+
 - **平均负载**（`/proc/loadavg`、sysinfo 的 `loads`，M3b 起一直是 0）：与 Linux 的 `kernel/sched/loadavg.c` 一样，每 5 秒取一次可运行的线程数，按 1、5、15 分钟做指数衰减平均，定点数的系数和取整都与 Linux 相同（`loadavg.rs`）。可运行的是不在内核里等待的 guest 线程，等 BKL 的也算，相当于 Linux 的 R 加 D。
   - 取样由定时器线程做。所有线程都在等待时它停下来，不为平均负载每 5 秒醒一次：下一个要执行 guest 代码的线程叫醒它（与内存上限的检查共用一个标志，`Shared::resume_checks`），停下来期间错过的取样按 0 补上；读的时候定时器线程还没来得及补的，读的一方先补上。这相当于 Linux 的 NO_HZ 在空闲的 CPU 上做的事。
   - 两个忙循环跑一阵、再停下来，读到的 1 分钟平均值与按 Linux 的公式算出来的相同，停下来期间补上了 0。`uptime`、`top` 的负载不再总是 0。`sleep 24` 期间，定时器线程在 18 秒里只醒了一次（就是发现所有线程都在等待、停下来的那次取样）。
@@ -14,8 +16,11 @@
   - 没有 `/sys/kernel/mm/transparent_hugepage`，相当于没有编进 THP 的内核：appine 不支持大页，Go、jemalloc 读不到它就不会去用。
   - procfs 的 `net/`、`sys/` 这些固定的目录和 sysfs 共用一套按路径表查找、列目录的代码。合成文件系统里的节点的设备号都按它所在的文件系统给（epoll 的 fdinfo 原来把 `/dev/pts` 目录也报成 procfs 的）。
 - **删除之后仍然打开着的文件的 `futimens`**（[文件操作的宿主开销](33-file-ops-host-cost.md)那一轮的推迟项）：普通文件的时间记在宿主 object 上，原来按 inode 编号拼出 object 的名字再设置，object 删掉之后是 ENOENT。按 fd 设置时（futimens，`AT_EMPTY_PATH`）改为直接设置打开着的 object。
-- **测试**：单元测试测平均负载的取样和停下来之后的补 0、恢复。`rootfs_programs` 新增 `nproc --all`、CPU 拓扑的文件和 `/proc/self/limits`。差分测试 `compat` 新增 sysfs 的内容和挂载信息、`/proc/loadavg` 的格式、`/proc/self/limits`、删除之后仍然打开着的文件的 futimens。`/proc/loadavg` 的数值取决于宿主，possible、present 在有的宿主上比 online 多，都不比。
 
-**推迟项**：
+## 测试
+
+单元测试测平均负载的取样和停下来之后的补 0、恢复。`rootfs_programs` 新增 `nproc --all`、CPU 拓扑的文件和 `/proc/self/limits`。差分测试 `compat` 新增 sysfs 的内容和挂载信息、`/proc/loadavg` 的格式、`/proc/self/limits`、删除之后仍然打开着的文件的 futimens。`/proc/loadavg` 的数值取决于宿主，possible、present 在有的宿主上比 online 多，都不比。
+
+## 推迟项
 
 - sysfs 只有 CPU 的拓扑：没有 `cpufreq`（Node.js 的 `os.cpus()` 的频率是 0）、`cache/`、`/sys/class`、`/sys/fs/cgroup`。`cpu<n>/online` 是只读的（Linux 上 root 可以写它让 CPU 下线）。→ `cache/`、`cpufreq/` 已补上，照搬宿主对应的 CPU 的（M9 之前：mremap 和 sysfs）；`/sys/fs/cgroup` 已补上，是只读的 cgroup v2（M9 之前：cgroup v2 的视图）；`/sys/class` 仍没有，`online` 仍是只读的；`/sys/class/net` 已补上（M9 之前：网络接口的流量计数），`/sys/class` 下别的仍没有

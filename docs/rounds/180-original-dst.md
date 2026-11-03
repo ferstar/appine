@@ -30,7 +30,7 @@
 - 新的差分测试组 `origdst`（原生一侧是特权容器，规则真的在内核里执行）：各种规则和表下接受的一端、发起的一端回答的原目的地址（含双栈、跨命名空间），`SO_MARK`，owner、mark 匹配，一个 Python 写的透明代理。两个执行层下都与原生逐字相同。单元测试在 `origdst`、`Nft::tracks` 和 xt 的 mark、owner 里。
 - 实测 sslocal 的 redir 模式（Tier 1）：以 nobody 运行的 curl 经由它访问源站，三种排除代理自己的连接的写法（`-m owner --uid-owner`、nft 的 `meta skuid`、`meta mark` 加上 `--outbound-fwmark`）都拿到了页面、ssserver 每次只转一次；改之前三种都不行。
 
-**推迟项**：
+## 推迟项
 
 - TPROXY（`IP_TRANSPARENT` 加 mangle 表的 TPROXY 和策略路由）：UDP 的透明代理（`sslocal --udp-redir tproxy`）要它。App 在宿主上没有 `IP_TRANSPARENT` 要的权限，包也不经过 appine 的规则，要模拟得在 socket 层另做一套，没做。TCP 用 REDIRECT 就够了。
 - tun（`/dev/net/tun`）：clash、sing-box 的 TUN 模式和 tun2socks 要它，需要在 appine 里另做一套用户态的 TCP/IP 栈（[容器网络的普查](169-container-network-survey.md)讨论过的方案 3），不做。

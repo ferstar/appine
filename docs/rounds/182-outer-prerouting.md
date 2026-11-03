@@ -43,7 +43,7 @@ nft add rule ip px pre iifname "podman0" udp dport 53 redirect to :1053
 - 实测（Tier 1，`target/origdst/ctr-redir.sh`）：外层跑 ssserver 和 sslocal 的 redir 模式、一条 `iifname br0 … redirect` 的规则，容器里的 curl 拿到了外面的 HTTP 服务的回答。
 - LTP 8 路并发共用一个仓库，每个 appine 里的 pid 都是 2：process_vm_writev01 和同时跑的 process_vm_readv01 在 `/dev/shm` 里的文件撞名，偶尔 EEXIST。
 
-**推迟项**：
+## 推迟项
 
 - 进入外层的只有经由外层网关的 IPv4 连接、数据报，IPv6 的不执行 PREROUTING（与原来一样）。
 - 一个没连接的 UDP socket，先发给被 REDIRECT 到外层的地址（这时给它绑上了回环地址），之后再发往外网的地址就出不去。原来经由网关连外层时就是这样。DNS 的解析器发给几个服务器时用同一个 socket，只有其中一部分被劫持时会碰到。 → 先发命名空间里的也在宿主上绑通配地址了；musl 的解析器其实先 bind 了通配地址、端口 0，本来就碰不到，碰到的是不先 bind 就 sendto 的程序（M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面）

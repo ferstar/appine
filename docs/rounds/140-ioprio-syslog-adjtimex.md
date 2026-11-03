@@ -30,7 +30,7 @@ Android 的应用 seccomp（bionic 的 `SECCOMP_BLOCKLIST_APP.TXT`）不让调 a
 - `tests/guest/waits.c` 加上 syslog 的读（等到信号）；hal 的单元测试比对合成的时钟状态和宿主内核的只读查询。
 - LTP 新通过 ioprio_get01、ioprio_set01–03、syslog11、syslog12、adjtimex03。adjtimex01、adjtimex02、clock_adjtime01、clock_adjtime02 仍失败：它们以 root 改时钟、NTP 参数，期望成功或者过了能力检查之后的 EINVAL，appine 当作没有 `CAP_SYS_TIME`，是 EPERM。
 
-**推迟项**：
+## 推迟项
 
 - 日志总是空的。OOM killer 结束进程、内核层报告的内部错误（§12 第 4、5 条）只写宿主的 stderr（Android 上是 logcat），没有进 dmesg；Linux 上它们都在内核日志里（[稳健性](20-robustness.md)那一轮"终端里只看到 Killed"的推迟项可以借它做）。→ 已补上（M9 之前：/dev/kmsg 和内核日志）：OOM killer、内部错误结束进程和 guest 写 `/dev/kmsg` 的都记进日志
 - 没有 `/dev/kmsg` 和 `/proc/kmsg`：util-linux 的 dmesg 退回 syslog(2)，往 `/dev/kmsg` 写日志的程序（systemd、一些 init 脚本）打不开它。→ 已补上（M9 之前：/dev/kmsg 和内核日志）

@@ -4,7 +4,7 @@
 
 翻译只取决于 pc 和指令字，所以几个地址空间在同样的地址映射着同样的代码时，块对它们都有效。appine 没有 ASLR，同一个程序的进程（fork 出来的、exec 了同一个程序的）映射在同样的地址上，可以像一个地址空间里的线程那样共用一个实例。难点是保证一个成员永远执行不到只对另一个成员有效的块。
 
-## 做了的
+## 做法
 
 - **按程序组成组**（`mm::CodeGroup`，登记在 Kernel 的 `code_groups` 里）：
   - 线程第一次运行时（`Mm::code_space`），找同一个程序（可执行文件的 inode，与池的键相同）、还开着、映射一致的组，加入它，共用它的 `DbtSpace`。
@@ -48,13 +48,14 @@
 
 shell 起进程快了约三成：fork 出来的子进程直接加入父进程的组，不用再从池里拿实例、逐块核对。原生是 0.15 秒，现在是原生的 1.13 倍。`-P4` 的几个 cc1 直接用前一个翻译好的代码。
 
-- **测试**：
-  - 新的差分测试组 `shared-code`：两个进程经由不同的文件（`files`）、各写各的代码（`jit`）、改写共用的文件（`rewrite`）、exec（`exec`）、按不同顺序 dlopen（`dlopen`）在同一个地址上放不同的代码，两个执行层下都与原生相同。文件写好之后要等 3 秒才可信，用例里等着。
-  - 新的 rootfs 测试 `processes_of_one_program_share_translations`：一个 shell 起的几个 sleep 在 appine-run 里只有一两份代码缓存。
-  - 单元测试 `code_groups_register_only_consistent_mappings`：哪些映射算一致、有冲突时整个不登记、登记满了。
-  - 只在 colima 的虚拟机里跑，没上手机。
+## 测试
 
-**推迟项**：
+- 新的差分测试组 `shared-code`：两个进程经由不同的文件（`files`）、各写各的代码（`jit`）、改写共用的文件（`rewrite`）、exec（`exec`）、按不同顺序 dlopen（`dlopen`）在同一个地址上放不同的代码，两个执行层下都与原生相同。文件写好之后要等 3 秒才可信，用例里等着。
+- 新的 rootfs 测试 `processes_of_one_program_share_translations`：一个 shell 起的几个 sleep 在 appine-run 里只有一两份代码缓存。
+- 单元测试 `code_groups_register_only_consistent_mappings`：哪些映射算一致、有冲突时整个不登记、登记满了。
+- 只在 colima 的虚拟机里跑，没上手机。
+
+## 推迟项
 
 - 成员跳到一个只有别的成员映射过、自己没有映射的地址时（野指针、跳进已经 dlclose 的库），执行的是那里的翻译，而不是收到 SIGSEGV。要发现的话每次进入块都得查一次取指的权限。
 - 离开组只看可执行映射有没有变：成员拆掉一个库、在同一个地址映射别的库时离开，只拆不映射时不离开（组里登记的还在，之后在那里映射别的东西时离开）。离开之后不再加入，要重新翻译它自己的代码。

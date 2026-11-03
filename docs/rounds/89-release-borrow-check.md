@@ -2,6 +2,8 @@
 
 [上一轮](88-futex-cleanup-borrow-check.md)的推迟项：放开 BKL 时借着内核对象的检查只在调试构建里有，差分测试、LTP、普查用的发布构建都不查。
 
+## 做法
+
 - **发布构建里也数借用**：
   - kernel crate 新增 `borrow-check` 特性，打开时与调试构建一样数着每个线程借着几个 `RefCell`，放开 BKL 时检查是 0（`core/kernel/src/cell.rs`）。
   - `appine-run` 默认打开它：差分测试、LTP、普查、手工测量用的都是 `appine-run` 的发布构建，不用记着另加参数。`--no-default-features` 可以去掉。
@@ -16,11 +18,16 @@
   - **文件位置锁**（`f_pos_lock`）：两个线程同时从同一个打开文件各读 2 字节，检查读到的位置不重不漏。一个线程放开 BKL 读宿主文件时另一个等它；临时加日志数过，4000 次读里两层各等了 2000 多次。
   - **AIO 的完成**：管道上的 `IOCB_CMD_POLL` 由另一个线程写管道完成，`io_getevents` 不带超时一直等到它。
   - 上一轮列的另外两项，放开 BKL 时的 execve 和 DNS 存根，走的是 `Cx::unlocked`，进入时就检查，不必真的碰上并发：cargo test 里每次 execve 都查，DNS 存根由 CI 里需要外网的 apk 用例查。
-- **开销**：在噪声范围内。
-- **测试**：
-  - 差分测试、LTP、普查（包括语言的测试集和大项目）都没有报告内部错误，结果与以前相同。
-  - debug 版 APK 的 `libappine.so` 里有这项检查；模拟器上的 instrumentation 测试这一轮没有跑。
 
-**推迟项**：
+## 结果
+
+在噪声范围内。
+
+## 测试
+
+- 差分测试、LTP、普查（包括语言的测试集和大项目）都没有报告内部错误，结果与以前相同。
+- debug 版 APK 的 `libappine.so` 里有这项检查；模拟器上的 instrumentation 测试这一轮没有跑。
+
+## 推迟项
 
 - cargo test、差分测试、LTP、普查都没跑到的等待仍然不查；发布构建只在这些路径真的等待时才查得出来（比如文件位置锁要碰上争用）。

@@ -66,7 +66,7 @@
 - 手动在同一个模拟器上的 App 里试了 guest 的 `reboot`（换成新内核上的新会话，关机的命令运行了）、关掉唯一的标签页之后留在后台、`poweroff` 之后服务退出、没有 guest 进程之后服务退出；新装 App、选 Alpine 时 `/etc/network/interfaces` 写好了，没有错误。
 - 手动（OpenRC 的仓库，`appine-run --init`）：那段脚本没有时钟服务时加上 osclock、已有时钟服务和没装 OpenRC 时不动，加上之后开机日志里没有 `[ !! ]`；只有 lo 的 interfaces 时常见的服务和 networking 都起来了；用了 PostgreSQL 的那次，nginx、PostgreSQL、Redis 等都起来了，`appine-run` 退出时逐个被 OpenRC 停下。
 
-**推迟项**：
+## 推迟项
 
 - 熄屏之后继续运行要的 `PARTIAL_WAKE_LOCK`（设计文档 §11.2）还没做：在后台跑着的服务熄屏后可能被暂停。→ 设置里、通知上可以打开"熄屏时保持运行"，持有 `PARTIAL_WAKE_LOCK`（M9：熄屏时保持运行）；默认仍是关的
 - 开机的输出只在 `/var/log/boot.log` 里，App 不提示有服务启动失败。→ 开机完成后找 OpenRC 的 "failed to start"，有就发通知（[M9：进程被结束、服务没起来时提示](195-kill-reports.md)）

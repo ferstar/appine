@@ -2,6 +2,8 @@
 
 把前几轮推迟的、在单进程模型里做得了的补上；io_uring 不做（见下面的推迟项和 §15）。
 
+## 做法
+
 - **信号驱动的 I/O**：`O_ASYNC`（`F_SETFL`、`FIOASYNC`），属主（`F_SETOWN`、`F_SETOWN_EX`，socket 上还有 `FIOSETOWN`/`SIOCSPGRP`）和 `F_SETSIG` 原来只记录，现在生效：文件变得可读、可写、出错或挂断时给属主（线程、进程或进程组）发 SIGIO，或者 `F_SETSIG` 设置的信号，带 `si_band`、`si_fd`（signalfd 也给出这两项），band 与 Linux 相同。读过之后仍然可读的（又来了数据）再通知一次。检查放在定时器线程上：内核状态的任何修改都会叫醒它，它顺便检查登记了 `O_ASYNC` 的文件，宿主 socket 的就绪也由它一起 poll。
 - **文件租约**：`F_SETLEASE`、`F_GETLEASE`、`/proc/sys/fs/lease-break-time`。规则与 Linux 相同：只有属主（或有 `CAP_LEASE`）能设置；读租约要求自己不可写、没有人以写方式打开，写租约要求没有别的打开。以写方式打开或者截短打破所有租约，以读方式打开打破写租约：持有者收到 `F_SETSIG` 的信号（`POLL_MSG`）或 SIGIO；`O_NONBLOCK` 的 open 返回 EWOULDBLOCK，否则等持有者降级或放弃，超过 lease-break-time 强制降级。被写方式的打开打破时不能降成读租约。
 - **POSIX 消息队列**：`mq_open`、`mq_unlink`、`mq_timedsend`、`mq_timedreceive`、`mq_notify`、`mq_getsetattr`；按优先级排序，同一优先级先进先出；`/proc/sys/fs/mqueue/*` 可写，属性按它们和 `CAP_SYS_RESOURCE` 检查。队列的 fd 能 poll、epoll，read 给出与 Linux 相同的状态行。`mq_notify` 支持 `SIGEV_SIGNAL`、`SIGEV_NONE` 和 musl 的 `SIGEV_THREAD`（经由 netlink socket 送 cookie，与 Linux 相同）。队列在内存里，App 进程重启就没了，相当于 Linux 重启后的 mqueue 文件系统。
@@ -25,7 +27,7 @@
 - 测试：差分测试 `compat` 新增信号驱动的 I/O、文件租约（在 /dev/shm 里，原生一侧的 overlayfs 不让设写租约）、消息队列、AIO、`MREMAP_DONTUNMAP` 和 remap_file_pages，`/proc/net` 那组加上 icmp、icmp6、raw（CI 的 Ubuntu 宿主默认不让普通用户建 ping socket，差分测试之前把 `ping_group_range` 改成允许所有组）；`inotify` 新增按 fd 的事件报给哪个目录。单元测试新增 inotify 推迟的 `IN_DELETE_SELF`、AF_UNIX 的垃圾回收、`MAP_GROWSDOWN`，以及 hal 的第一个单元测试（cachestat）。LTP 新通过 fcntl23–27、31–33、mq_notify01–03、mq_timedreceive01、mq_timedsend01、mq_unlink01、io_cancel01、io_destroy02、io_getevents01、io_setup02、io_submit02–04、epoll_wait14、epoll_wait16、nice05、mmap18、remap_file_pages01/02、shmctl05（用 remap_file_pages）、cachestat02、pidfd_send_signal03；cachestat01/04 要块设备，03 要 hugetlbfs。
 - 性能：每次 open 多挂一个记着目录项的对象，rename 要扫一遍所有 fd 表，新线程开始时多两个宿主 syscall；开销都在噪声之内。
 
-**推迟项**：
+## 推迟项
 
 - io_uring 不做，保持 ENOSYS。之后试做过一轮又放弃了：环放在共享内存里，请求在提交者的上下文里先不等待地执行一次（Cx 加"不等待"模式，让现有的阻塞循环直接返回 EAGAIN），会阻塞的挂起，由定时器线程把提交者叫进内核推进（相当于 task_work），SQPOLL 靠一直置位 `IORING_SQ_NEED_WAKEUP` 实现。接口和 49 个操作码写完是 3800 行，liburing 的测试先抽了 10 个，过了一半，剩下的细节（DEFER_TASKRUN 的完成时机、多次接收的 recvmsg、提供的缓冲区等）还有很长一串。考虑到用的人很少（见 §15），代码没有留下。
 - `PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做。

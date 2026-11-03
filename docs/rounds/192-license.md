@@ -49,7 +49,7 @@ M9 计划里的许可证审计（风险 R3）。做之前用户提出想把 appi
 - `scripts/fetch-rootfs`：正常下载、摘要对不上、没有 gpg、tarball 改了一个字节几种情形都对。
 - `appine-run --version` 印出声明；没有测试依赖原来的 `--version` 输出。
 
-**推迟项**：
+## 推迟项
 
 - 发布之前要做的（都是 GPLv3/AGPLv3、GPLv2 的义务，记在这里免得漏掉）：
   - 仓库现在是私有的。随 APK 要提供整个 App 的完整源码（包括静态链接的 crate：可以在发布时附上 `cargo vendor` 的结果），所以发布之前要公开仓库，或者附上提供源码的书面承诺。开源许可页里写的源码地址是 `https://github.com/mthli/appine`。→ `scripts/release-sources` 生成源码和 `cargo vendor` 的包（[发布时放出的源码](200-release-sources.md)）；仓库仍是私有的，公开还是附书面承诺由用户定

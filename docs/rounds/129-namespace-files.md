@@ -19,7 +19,7 @@
 - `compat` 组里原来按 busybox 的 `ip` 写的几行改成显式的 `busybox ip`：装了 iproute2 之后 `/sbin/ip` 是它，原生的容器里 eth0 是 veth，iproute2 多显示一个 `link-netnsid 0`（`IFLA_LINK_NETNSID`），appine 拿不到。
 - LTP 的 ioctl_ns01–04、ioctl_ns06 由跳过变成通过。
 
-**推迟项**：
+## 推迟项
 
 - 最后一个打开着的命名空间文件关掉之后，命名空间留下的挂载、IPC 对象要等下一次线程退出或者 umount 才清理（Linux 上马上释放）。没有进程在里面，看不出来，只是多占一会儿。
 - setns 仍不接受 pidfd（一次换几种命名空间）。→ 已补上（M9 之前：setns 经由 pidfd）

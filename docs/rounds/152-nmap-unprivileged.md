@@ -16,7 +16,7 @@
 - 原生对照：容器里的 root 有 CAP_NET_RAW，加 `SURVEY_DOCKER_OPTS=--cap-drop=NET_RAW` 之后输出与 appine 逐字相同，包括默认扫描的失败。
 - 没有改内核层，没跑全量测试。
 
-**推迟项**：
+## 推迟项
 
 - `sudo nmap` 仍会失败：sudo 默认 `env_reset`，去掉了这个变量。可以用 `nmap --unprivileged`，或者在 sudoers 里 `env_keep` 它。
 - 不读 profile 的场合（`ssh 主机 nmap …` 这类不起登录 shell 的命令、cron）没有这个变量。

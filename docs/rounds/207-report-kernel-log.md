@@ -37,7 +37,7 @@ APK 里的 `libappine.so` 是 AGP 去掉了符号的（`stripDebugDebugSymbols`�
 - `guest_programs` 里撞上 bug 的那个用例看每份报告带的日志：格式对，最后一行是报告自己，从第二份起有前一份报告。仪器测试 `killsAreReportedToTheApp` 看交给 App 的日志里有之前写进 `/dev/kmsg` 的那一行，仪器测试通过。
 - 在模拟器上手动走了一遍（上面那段）。
 
-**推迟项**：
+## 推迟项
 
 - 没有调用栈（见上）。
 - 固定取 10 条，不看时间：很久以前的记录（比如开机时发布端口的那几行）也会带上，隔得多远看时间戳。

@@ -23,7 +23,7 @@ guest 建 raw ICMP socket 时，内核层记下一份 `RawIcmp`（`core/kernel/s
 - 差分测试 `compat` 组新增 `rawicmp.c`：raw socket 的选项，回环上的 echo 回答的 IP 头和 ICMP，控制消息放不下时的截短，`MSG_TRUNC`，过滤器，IPv6，`CAP_NET_RAW`；另外跑 busybox 的 `ping`、`ping6` 和以 nobody 运行的 `ping`。两个执行层下都与原生相同。原生一侧回环上的 raw socket 还收到自己发出的 echo 请求，用例都先用过滤器只留回答。
 - 开发中差分测试抓到两处：ping socket 不填 `ipi_spec_dst`、不认 `MSG_TRUNC` 标志。
 
-**推迟项**：
+## 推迟项
 
 - ping socket 只收得到自己发出的 echo 请求的回答：raw socket 上收得到的别的 ICMP（发给本机的 echo 请求、目的不可达、超时）这里收不到，traceroute、mtr 这类靠 raw socket 收超时报文的仍不能用（可以经由宿主 socket 的 `IP_RECVERR` 错误队列转过来，没做）；也只能发 echo 请求，别的类型是 EINVAL。 → 汇集点把 raw socket 背后的 ping socket、设过 TTL 的 UDP socket 上到了的报文和 ICMP 错误分给所有 raw socket，busybox 和 Debian 的 traceroute、mtr 能用了（M9 之前：traceroute 和 mtr）；发给本机的 echo 请求、别的 UDP socket 引起的错误仍收不到，仍只能发 echo 请求
 - 一个 socket 上用几个 id 时，回答都换成最后发出的那个（宿主的 ping socket 只有一个编号，分不出来）。

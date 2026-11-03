@@ -17,7 +17,7 @@
 - 新的差分测试组 `setns-pidfd`（docker 一侧加 `SYS_ADMIN`、`NET_ADMIN`，关掉 AppArmor，与 `nsfs` 组相同）：Python 测标志和 fd 不对时的 EINVAL、一次进另一个进程的几种命名空间、多线程时的 EINVAL 和 EUSERS、pid 命名空间、按进去之后的用户命名空间算能力、EPERM 和 ESRCH；再跑 util-linux 的 nsenter、unshare 的常见用法。两个执行层下都与原生相同；改之前的 appine 上 nsenter 每一步都是 "reassociate to namespaces failed: Invalid argument"。
 - 差分测试的软件包加了 util-linux-misc（它换掉 busybox 的 nsenter、unshare 等），`nsfs`、`namespaces` 组里原来测 busybox 的改成显式调用 `busybox unshare` 这样；本地的仓库要 `apk add util-linux-misc` 再用 `-r` 重新导出镜像。
 
-**推迟项**：
+## 推迟项
 
 - 连同别的一起换挂载命名空间、fs 又和别的线程共用时，Linux 只换调用的线程的挂载命名空间（在它的 nsproxy 里），共用 fs 的线程的根目录、当前目录跟着变；appine 的挂载命名空间在 `FsContext` 里，那些线程的挂载命名空间也跟着换了（它们的 `/proc/<tid>/ns/mnt` 与 Linux 不同）。
 - 进 time 命名空间时只看线程数：Linux 的 `current_is_single_threaded` 还看有没有别的进程共用地址空间（`CLONE_VM` 不带 `CLONE_THREAD`、vfork 出来还没 exec 的子进程）。

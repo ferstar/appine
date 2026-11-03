@@ -2,6 +2,8 @@
 
 [glibc 发行版的探测](69-glibc-probe.md)那一轮的结论是：Debian、Ubuntu 的 rootfs 直接当作仓库就能完整地用，内核层不用改，给用户 glibc 环境（pip 的 manylinux wheel、各种预编译的二进制）更便宜的路是 App 能用它们建仓库，mount 的子集先不做。原来 App 只能建 Alpine 的仓库。这一轮只改 App 和 JNI 层。
 
+## 做法
+
 - **选发行版**：第一次运行时弹出选择框：Alpine Linux 3.24、Debian 13（需下载 47 MB）、Ubuntu 24.04（需下载 28 MB）。标签栏新增一个菜单（⋮），里面是"重置 rootfs…"，确认之后结束所有会话和 guest 进程，删掉仓库，再弹出选择框。下载、导入失败时选择框重新弹出，把原因写在标题下面（对话框挡住了中间的状态文字）。
 - **tarball**（`Rootfs.kt`）：
   - Alpine 的照旧在 APK 的 assets 里。
@@ -24,16 +26,18 @@
   - motd 和 `/etc/profile.d/appine.sh` 三个发行版一样，motd 里按发行版写 apk 或 apt 的例子。
 - **登录 shell**（`ConsolePty.LOGIN`）：原来固定是 `/bin/sh`（argv[0] 是 `-sh`），在 Debian、Ubuntu 上是 dash。改为以 `/etc/passwd` 里 root 的 shell 登录（`-l`），Alpine 是 ash，Debian、Ubuntu 是 bash，chsh 改过之后照样，找不到时用 `/bin/sh`。passwd 从 fd 3 读、exec 时关掉：第一版用 `while read ...; done < /etc/passwd`，循环的重定向也作用于里面 exec 的 shell，登录 shell 把 passwd 剩下的行当命令读了（仪器测试里看到 `bin:x:1:1:...: not found`）。
 - **JNI 的句柄**（`hosts/android/src/lib.rs`）：原来是 `Arc<Machine>` 的裸指针，要求 Kotlin 在 `stop` 之后不再用它。第一次在模拟器上试重置时 App 无响应：会话结束之后 TerminalSession 在主线程上才清理控制台（`ConsolePty.close` → `closeConsole`），这时 worker 已经 `stop` 释放了 Machine，主线程卡在已经释放的锁上。服务销毁（`onDestroy`）原来就是同样的顺序。改为把 Machine 登记在一张表里，交给 Kotlin 的是编号；`stop` 从表里删掉，之后的调用查不到它：读写返回 -1，`waitFor` 返回 -9，新开控制台、起进程抛出异常，别的什么也不做。
-- **测试**：
-  - 先在 `appine-run` 里验证这两个固定版本的 tarball：导入、照 App 的配置改好 `/etc` 之后，登录、经由存根解析、apt 都正常。
-  - `MachineTest` 新增五个：
-    - `loginShellComesFromPasswd`、`downloadsAreVerified`、`callsAfterStopAreHarmless`；
-    - `downloadsResumeWhereTheyBrokeOff`：测试里起一个本地的 HTTP 服务。Android 不让 App 走明文 HTTP，debug 版加了一份只允许 127.0.0.1 的网络安全配置（`src/debug/`）。
-    - `downloadedDistributionsRun`：真的下载 Debian、Ubuntu，在登录 shell 里看 os-release、`$SHELL`，运行 `apt-get update`。→ 在 Android 上这一项一直是假的通过：apt 取不到索引时退出码仍是 0，而 glibc 一次查 A 和 AAAA 的解析在 Android 上失败（DNS 存根的回答在 `FIONREAD` 里报成 0，第 193 轮修了，M9：以指定用户登录）；用例改成看输出。`appine-run`（Linux 宿主）上的那次是真的要联网，默认跳过，`-Pandroid.testInstrumentationRunnerArguments.network=true` 时运行。
-  - Android 14（4K 页）的模拟器上都通过，Android 17（16K 页）上不联网的都通过。联网的那个要模拟器开着 `-http-proxy` 单独跑：那样 127.0.0.1 也被转给代理，本地 HTTP 服务的用例不能一起跑；它第一次从 GitHub 下载 Debian 时读超时失败，于是加了断点续传。AGP 的结果 XML 把按假设跳过的用例记成 failure，Gradle 的退出码是 0。
-  - 在模拟器上点了一遍界面：首次启动的选择框、测速和下载进度、重置、断网时的报错都正常。
 
-**推迟项**：
+## 测试
+
+- 先在 `appine-run` 里验证这两个固定版本的 tarball：导入、照 App 的配置改好 `/etc` 之后，登录、经由存根解析、apt 都正常。
+- `MachineTest` 新增五个：
+  - `loginShellComesFromPasswd`、`downloadsAreVerified`、`callsAfterStopAreHarmless`；
+  - `downloadsResumeWhereTheyBrokeOff`：测试里起一个本地的 HTTP 服务。Android 不让 App 走明文 HTTP，debug 版加了一份只允许 127.0.0.1 的网络安全配置（`src/debug/`）。
+  - `downloadedDistributionsRun`：真的下载 Debian、Ubuntu，在登录 shell 里看 os-release、`$SHELL`，运行 `apt-get update`。→ 在 Android 上这一项一直是假的通过：apt 取不到索引时退出码仍是 0，而 glibc 一次查 A 和 AAAA 的解析在 Android 上失败（DNS 存根的回答在 `FIONREAD` 里报成 0，第 193 轮修了，M9：以指定用户登录）；用例改成看输出。`appine-run`（Linux 宿主）上的那次是真的要联网，默认跳过，`-Pandroid.testInstrumentationRunnerArguments.network=true` 时运行。
+- Android 14（4K 页）的模拟器上都通过，Android 17（16K 页）上不联网的都通过。联网的那个要模拟器开着 `-http-proxy` 单独跑：那样 127.0.0.1 也被转给代理，本地 HTTP 服务的用例不能一起跑；它第一次从 GitHub 下载 Debian 时读超时失败，于是加了断点续传。AGP 的结果 XML 把按假设跳过的用例记成 failure，Gradle 的退出码是 0。
+- 在模拟器上点了一遍界面：首次启动的选择框、测速和下载进度、重置、断网时的报错都正常。
+
+## 推迟项
 
 - Debian 的 tarball 只有 GitHub 一个来源，国内直连只有 18 KB/s，47 MB 要下四十多分钟；没有镜像站带 debuerreotype 的构建。可以自己放一份，或者改用清华、中科大的 LXC 镜像（每天构建、旧的几天后删掉，没法固定摘要，而且是 xz，导入只认 gzip）。→ 定了暂时只用 GitHub 这个官方来源，不自己托管（M9：设置页，默认导入 Alpine）；换成 Debian 改为先在后台下载，下载期间原来的系统照常能用，慢的问题仍在
 - 版本固定在 App 里：Debian、Ubuntu 出了新的小版本要发新版 App 才换，已经装好的由用户自己 `apt upgrade`。→ Ubuntu 按决定去掉了（M9：设置页，默认导入 Alpine）；Debian 仍是这样

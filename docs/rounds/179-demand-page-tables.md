@@ -44,7 +44,7 @@
   | mmap 2 GB、碰一页、munmap | 0.01 ms | 2.39 ms | 0.01 ms |
   | 映射了 2 GB、碰过 1 MB 时 fork 加子进程退出 | 0.09 ms | 4.06 ms | 0.15 ms |
 
-**推迟项**：
+## 推迟项
 
 - 不少 Android 设备的用户地址空间只有 39 位（512 GB）。appine 每个 guest 映射对应一段同样大的宿主映射，14 TB 的影子内存在宿主上映射不出来，ASan 在这些设备上仍然不能用：启动时报"failed to allocate … Perhaps you're using ulimit -v"退出，同一个会话里别的进程照常（在 docker 里用 `ulimit -v` 把宿主限制在 512 GB 模拟）。
   - 试过让 guest 的地址空间也缩到 39 位（临时把栈顶改成 `1 << 39`）：ASan 按栈的位置认出 39 位，影子内存只要约 48 GB，但它的分配器放不下——gcc 13、14 的固定在 `0x5000_0000_0000`，gcc 15 的要 4 TB（"heap size 40000002000 exceeds max user virtual address 7fffffffff"），第一次 malloc 就失败。原生的 39 位内核上也一样，这些 libasan 不支持 39 位。所以缩小 guest 的地址空间没用，反而让需要高地址的程序（固定地址映射）也用不了。

@@ -36,7 +36,7 @@ Illegal instruction
 - `shared-code` 差分测试组新增 `alone`：父进程独自开组，子进程在一格地址上映射、执行一个文件之后退出，父进程再在同一格映射另一个文件执行。要在三棵独立的进程树里各跑一次：主进程在的时候组里不止它一个，走不到这个情形。两个执行层下都与原生相同；单元测试 `code_groups_register_only_consistent_mappings` 加上 `consistent`。
 - 原来的探测脚本（`target/origdst/xall.sh`）跑 8 次都没有崩。
 
-**推迟项**：
+## 推迟项
 
 - [第 108 轮](108-shared-translation.md)记着的另一种：成员野跳到只有别的成员映射过、自己没映射的地址时，执行的是那里的翻译，不是收到 SIGSEGV。还是这样。
 - `origdst` 组里各个角色先 import 同一组模块的写法留着（原来是为了避开这个问题），不影响它测的东西。

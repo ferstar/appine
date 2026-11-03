@@ -2,6 +2,8 @@
 
 让 bubblewrap 能用的第四轮。bwrap 带着 `--unshare-user` 在新的用户命名空间里做挂载、写自己的 uid_map，Codex 每条命令都这样跑。
 
+## 做法
+
 - **凭据**（`core/kernel/src/cred.rs`）：新的 `UserNs`（编号、上一层、层数、建立者的有效用户 ID、uid_map、gid_map、setgroups 的状态），凭据里记着所在的命名空间。凭据里的 ID 照旧是内核 ID（开机时的命名空间里的），`IdMap` 换算：`down` 是 `make_kuid`，`up` 是 `from_kuid`。开机时的命名空间映射全部 ID；每次 `Cred::root()` 新建一份，按编号比较。
 - **能力分三种**，照 Linux 每处用的是哪种改过来（原来 74 处都看自己的有效集）：
   - `capable` 是 Linux 的 `capable()`：只认开机时的命名空间，别的命名空间里的进程总是没有。SYS_RESOURCE、SYS_NICE、IPC_LOCK、MKNOD、LEASE、trusted 扩展属性的 SYS_ADMIN、SETFCAP 这些 Linux 本来就这样查，不用改。
@@ -16,13 +18,15 @@
   - ptrace 的访问检查加上 commoncap 那一步（`cap_ptrace_access_check`）：两者在同一个用户命名空间里、目标的允许集不超过自己的，或者在目标那边有 CAP_SYS_PTRACE。`/proc/<pid>/ns/*`、`root`、`cwd` 跟随和读链接时按它检查（`PTRACE_MODE_READ_FSCREDS`，不许是 EACCES），所以 `Pseudo::follow` 能返回错误了。
   - setuid 系列改了有效、文件系统的用户或组，或者得到了新的能力时，进程不再可以 dump、父进程退出时不再给它发信号（`commit_creds`，原来只有 execve 这样做）；不可 dump 的进程的 `/proc/<pid>` 下的文件属于它的命名空间里的 root（`task_dump_owner`）。execve 普通程序时恢复成可以 dump（`begin_new_exec`），程序文件对调用者不可读时除外（`would_dump`），原来从不恢复。
   - `/proc/sys/user/max_*_namespaces`（threads-max 的一半，只读，不实际限制）。
-- **测试**：
-  - 单元测试 `user_namespaces`：映射的解析和换算、三种能力检查、换用户和 execve 之后的能力。
-  - 差分测试 `namespaces` 组加上 root 建的用户命名空间：映射和 setgroups 的读写和各种错误，里面看到的 ID 和能力，从外面读它的映射和 ID，setns，unshare 的错误和嵌套层数，两个执行层下都与原生相同。
-  - 普通用户自己建的命名空间差分测试比不了：开发用的虚拟机和 GitHub 的 runner 都是 Ubuntu 24.04，它的 `kernel.apparmor_restrict_unprivileged_userns` 不让这种命名空间里有能力，关掉它要改宿主的安全设置，没有做。改为集成测试 `user_namespace_of_an_unprivileged_user` 按上游 Linux 的行为检查：nobody 用 `unshare -r -m` 映射成 root 之后，能做和不能做的事。
-  - LTP 的 sysinfo01 这次失败，查出来与这一轮无关：`/proc/uptime` 四舍五入（Linux 截断到百分之一秒）、sysinfo 截断（Linux 有零头就进一秒），x.996 秒时两者颠倒，照 Linux 改了两处。ioctl_ns06 由失败变成跳过（走到了还没有的 `NS_GET_USERNS`）。
 
-**推迟项**：
+## 测试
+
+- 单元测试 `user_namespaces`：映射的解析和换算、三种能力检查、换用户和 execve 之后的能力。
+- 差分测试 `namespaces` 组加上 root 建的用户命名空间：映射和 setgroups 的读写和各种错误，里面看到的 ID 和能力，从外面读它的映射和 ID，setns，unshare 的错误和嵌套层数，两个执行层下都与原生相同。
+- 普通用户自己建的命名空间差分测试比不了：开发用的虚拟机和 GitHub 的 runner 都是 Ubuntu 24.04，它的 `kernel.apparmor_restrict_unprivileged_userns` 不让这种命名空间里有能力，关掉它要改宿主的安全设置，没有做。改为集成测试 `user_namespace_of_an_unprivileged_user` 按上游 Linux 的行为检查：nobody 用 `unshare -r -m` 映射成 root 之后，能做和不能做的事。
+- LTP 的 sysinfo01 这次失败，查出来与这一轮无关：`/proc/uptime` 四舍五入（Linux 截断到百分之一秒）、sysinfo 截断（Linux 有零头就进一秒），x.996 秒时两者颠倒，照 Linux 改了两处。ioctl_ns06 由失败变成跳过（走到了还没有的 `NS_GET_USERNS`）。
+
+## 推迟项
 
 - pid、网络、IPC、UTS、cgroup、time 命名空间还没有（下一轮起）。 → pid 命名空间已补上（M9 之前：pid 命名空间），UTS、IPC 命名空间也补上了（M9 之前：UTS 和 IPC 命名空间），网络命名空间也补上了（M9 之前：网络命名空间），cgroup 命名空间也补上了（M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱），time 命名空间也补上了（M9 之前：time 命名空间）
 - 还按内核 ID 报告、没有换算的：`SO_PEERCRED`、`SCM_CREDENTIALS`、siginfo 的 `si_uid`、SysV IPC 和消息队列的属主、core dump 里的 ID。→ 已补上（M9 之前：用户命名空间里的 ID 换算），连同 waitid 的 si_uid、auxv 的 `AT_UID` 这几项、`/proc/net/tcp` 等的 uid 列（这里的消息队列指 SysV 的）

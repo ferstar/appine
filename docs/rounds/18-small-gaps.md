@@ -2,6 +2,8 @@
 
 把推迟项和全量 LTP 的失败重新过了一遍：疑似 musl 的那些先在原生 Alpine 容器里跑，16 个在原生上同样失败（gethostname02、pathconf02、pwrite04、sbrk01、recvmmsg01、sendmsg01、readlink03、open13、clone08 等，sendto01 的第 4 项也是），不归 appine。 → 后来查明其中两处与 appine 有关（M9 之前：LTP 剩下的小差异）：sendto01 的第 4 项原生失败是宿主的 AppArmor 拒绝 AF_UNSPEC 的地址，上游 Linux 上成功，appine 已改为不把 TCP 的地址交给宿主；readlink03 在 appine 上还多一项空路径的失败，已修。剩下原生通过、appine 不通过的补上：
 
+## 做法
+
 - **/dev/shm 和 /run 开机清空**：Linux 上它们是 tmpfs。仓库被第一个使用者打开时（拿得到排他锁，也就是没有别的 appine 进程在用，相当于开机）清空这两个目录的内容，目录本身保留。原来共享内存、命名信号量、pid 文件会一直留在仓库里，LTP 的 cachestat02 就撞上了前一天的运行留下的文件。
 - **`/proc/<pid>/smaps`、`smaps_rollup`、`pagemap`**：驻留页按宿主内存算（mincore），匿名内存都算私有的脏页，文件映射都算私有的干净页；pagemap 每页 8 字节，在读的时候按位置现算（文件有 2^36 项），给驻留、文件页和独占位，与没有特权的进程在 Linux 上看到的一样不给页框号。maps 里没有名字的行末尾补上空格（Linux 就是这样），合并相邻映射时也比较是否锁住。
 - **把页调进内存**：mlock（不带 `MLOCK_ONFAULT`）、`mlockall(MCL_CURRENT)`、`MAP_POPULATE`、`MAP_LOCKED`、`mlockall(MCL_FUTURE)` 之后的映射，每个宿主页读一个字节；原来只是记一下，mincore 和 smaps 都看不出来。
@@ -20,7 +22,7 @@
 - 性能：shell 起 600 个进程慢了约 1%（退出和 execve 时的驻留内存取样），syscall 密集的小循环和 `git status` 不变。
 - 测试：差分测试 `compat` 新增 smaps 和 pagemap、重新打开已删除的文件、unshare、`ru_maxrss`、tkill、connect、接口 ioctl、memfd 封印；间隔 1 纳秒的定时器在原生一侧会造成信号风暴，结果取决于时机，留给 LTP 的 timer_settime03。单元测试新增开机清空的目录。LTP 新通过 getrusage03、times03、mlock05、mlock201、mmap12、mincore03、memfd_create01、munmap04、unshare02/03、tgkill02、futex_cmp_requeue02、connect01、setpriority02、setsockopt04、sockioctl01、timer_settime03；cachestat02 由失败变成跳过（走到了还没有的 cachestat），unshare01、unshare04 剩下的失败是命名空间。
 
-**推迟项**：
+## 推迟项
 
 - `MAP_GROWSDOWN` 的映射不会向下增长（mmap18）：要在映射下方预留宿主地址空间，并在缺页时延伸 VMA。→ 已补上（M9 之前：推迟项），不需要预留：长出来的部分是一个新的 VMA
 - cachestat；unshare 的命名空间。→ cachestat 已补上（M9 之前：推迟项）；命名空间原来定为不做，后来为了 bubblewrap 先做了挂载命名空间（M9 之前：挂载命名空间）、用户命名空间（M9 之前：用户命名空间）

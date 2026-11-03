@@ -9,10 +9,15 @@
 
 发给整个进程的信号（外面 kill、SIGCHLD、终端产生的）两边一样，signalfd 多半是这样用的；Go、Node.js、JVM、tokio、glib 都不用 signalfd。
 
+## 做法
+
 - **调用者**：guest 线程在自己的宿主线程上一直执行到结束，线程开始时在线程局部记下它和它的线程组（`task::current`，弱引用；系统调用里 `Task::state` 已经被借走，拿不到线程组）。signalfd 的就绪状态和数据代数（`EPOLLET`）改为看调用的线程和它的线程组，不再记创建它的线程。不在 guest 线程上检查时（定时器线程替信号驱动的 I/O、`EPOLLEXCLUSIVE` 的独占门检查）只看创建它的线程组。
 - **唤醒不用改**：发给线程的、被屏蔽的信号原来就叫醒所有等待者，各个 poll、epoll 醒来之后按自己重新判断。
-- **测试**：差分测试 `compat` 新增一段：两个线程各自 poll、epoll 和读同一个 signalfd，发给其中一个线程、发给进程的信号，阻塞在 poll 里时被叫醒，fork 出来的子进程 poll 继承来的 signalfd，创建 signalfd 的线程退出之后。
 
-**推迟项**：
+## 测试
+
+差分测试 `compat` 新增一段：两个线程各自 poll、epoll 和读同一个 signalfd，发给其中一个线程、发给进程的信号，阻塞在 poll 里时被叫醒，fork 出来的子进程 poll 继承来的 signalfd，创建 signalfd 的线程退出之后。
+
+## 推迟项
 
 - signalfd 的数据代数（`EPOLLET`）按调用的线程算：几个线程轮流在同一个 epoll 里以边沿触发等它时，换了线程计数就跟着变，可能多报告或者少报告一次。Linux 按进程的信号到达唤醒（`signalfd_wqh`）。

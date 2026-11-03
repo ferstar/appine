@@ -38,7 +38,7 @@
 - 仪器测试新增 `loginStartsInTheSavedDirectory`（root 和普通用户从给的目录开始，目录不在、进不去时回家目录）、`consoleCwdFollowsTheForegroundShell`（跟着 shell 的 `cd`，shell 退出之后取不到）、`tabsComeBackOnlyAfterAKill`（留了标记才读回存下的标签页，正常退出之后读不到），在 Pixel 4a（API 34）的模拟器上通过，只在 4K 页的模拟器上跑了。第一次跑时模拟器上留着上一轮手动测试建的 alice（重装 App 不清数据）和旧的 profile，几个用例因此失败；测试的准备步骤里也调用了 `Rootfs.updateProfile`。
 - 手动（模拟器上的 App）：开两个标签页各进一个目录，`am force-stop` 结束进程（不给 App 回调，与被系统杀掉一样），再打开时两个标签页、原来的输出、提示和目录都恢复了；通知里点"全部退出"之后再打开是一个新的标签页、没有提示。
 
-**推迟项**：
+## 推迟项
 
 - 回看记录是纯文本：颜色、粗体这些样式没有存，恢复之后都是默认颜色。
 - 存的是每分钟（和界面隐藏时）的状态：界面开着时被杀，最后一分钟之内的输出和 `cd` 会丢。

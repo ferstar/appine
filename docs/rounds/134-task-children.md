@@ -15,7 +15,7 @@
 
 - 差分测试 `compat2` 组新增 `children.c`：按线程分开列和格式、`/proc/self/children` 没有、线程退出后子进程转给主线程的顺序、僵尸进程、`CLONE_PARENT`、subreaper 收养、非主线程 exec 之后的顺序，pid 换成名字比；`namespaces` 组加上 pid 命名空间里 1 号进程的 `task/1/children`。两个执行层下都与原生相同。
 
-**推迟项**：
+## 推迟项
 
 - `PR_SET_PDEATHSIG` 仍在父进程结束时才发；Linux 上"父进程"是建立它的线程，那个线程退出（比如 `pthread_exit`）就发，进程还在也一样（prctl(2)）。现在记着父线程了，可以照改。→ 已补上（M9 之前：PDEATHSIG 和 __WNOTHREAD）
 - wait 系列的 `__WNOTHREAD` 接受但不起作用，仍等整个进程的子进程；Linux 只等调用的线程建的。→ 已补上（M9 之前：PDEATHSIG 和 __WNOTHREAD）；跟踪着的线程仍按进程算

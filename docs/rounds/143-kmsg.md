@@ -26,7 +26,7 @@
 - 差分测试的仓库加装 util-linux 的 `dmesg`（Alpine 的 `dmesg` 包）。导出镜像时 `/tmp` 只留目录：开发机上仓库的 `/tmp` 里攒了 830 MB 历次运行留下的东西，原来都进了镜像，docker 的盘放不下了。
 - rootfs 用例 `kmsg_records_reach_dmesg`（busybox 的 `dmesg`、限速、`printk_devkmsg`、`/proc/kmsg`），`cgroup_memory_files_follow_the_oom_killer` 加上 `dmesg` 里 OOM killer 的那两行；`tests/guest/waits.c` 加上 syslog 的读、`/proc/kmsg` 和 `/dev/kmsg` 的阻塞读（调试构建检查放开 BKL 时没有借着内核对象）。
 
-**推迟项**：
+## 推迟项
 
 - seccomp 的 `SECCOMP_RET_LOG` 和 `actions_logged` 仍只写 appine 的调试日志：Linux 没有 auditd 时经由 audit 写进内核日志（`audit: type=1326 …`），可以照这一轮加上（[seccomp](59-seccomp.md) 的推迟项）。
 - guest 进程因为未处理的 SIGSEGV 等结束时，Linux arm64 记一条 `<名字>[pid]: unhandled exception: …` 和寄存器（`show_unhandled_signals`），这里没有。

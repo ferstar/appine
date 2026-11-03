@@ -17,7 +17,7 @@
 - 单元测试：`speeds_follow_the_baud_bits`、`pty_keeps_eight_bits_and_the_address_bit`（`tty`）。
 - Ubuntu 26.04 的仓库在 `target/glibc/ubuntu26-store`（`target/glibc/ubuntu-26-04.tar.gz` 导入），见上。
 
-**推迟项**：
+## 推迟项
 
 - `TIOCGLCKTRMIOS`、`TIOCSLCKTRMIOS`（锁定 termios 的某些位）、`TIOCGSOFTCAR`、`TIOCSSOFTCAR` 仍是 ENOTTY：getty、setserial 这类管串口的程序才用。
 - 速率只是记下、读回，不影响任何东西（PTY 本来没有速率，Linux 上也一样）。

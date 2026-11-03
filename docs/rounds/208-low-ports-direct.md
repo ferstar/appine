@@ -35,7 +35,7 @@
 - 仪器测试 `lowPortsMoveToHighPortsOnTheHost` 拆成用 79 的 `lowPortsTheHostRefusesMoveToHighPorts` 和用 22 的 `lowPortsTheHostAllowsAreBoundAsTheyAre`（App 自己绑不了就跳过）。Pixel 4a（API 34）上通过，绑 22 的那个因为宿主不让绑而跳过；Qenix 16K（API 37）上都通过，190 篇里在 API 37 上失败的就是这个用例。通知的文字没有在界面上手动看。
 - 差分测试 `nsfs` 用 `hostname | grep -c bb` 看外面的主机名有没有被 unshare 里的改掉，原生一侧的主机名是容器的编号，随机的十六进制里正好有 "bb" 时 Tier 0 失败了一次，改成整行比较 `grep -cx`。
 
-**推迟项**：
+## 推迟项
 
 - 只在 API 37 的模拟器上看到放开的名单；真机上 Play 系统更新到了没有、厂商有没有改，要真机（R1）。
 - 同一台手机更新前后不一样：更新之前在 10022 上的 sshd，重启之后就在 22 上了，别的设备上写死了 10022 的（`~/.ssh/config`）连不上，要看新的通知。

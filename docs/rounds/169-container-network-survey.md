@@ -14,7 +14,9 @@
   - `strace -f` 跟着 `podman run -d` 时，它跟踪着后台容器里的进程，命令一直不返回。后台运行的不跟踪，netavark 的调用在前台的 `run`、`network create` 里看得到。
 - `scripts/survey` 的原生对照加了 `--init`：busybox 的 timeout 自己执行命令，sh 成了容器里的 1 号进程，1 号进程不理会超时时的 SIGTERM，卡住的负载过了上限也不结束。这次就卡了 18 分钟才发现。
 
-## 原生的结果
+## 结果
+
+### 原生的结果
 
 | | docker，iptables 关 | docker，iptables 开 | podman，防火墙 none | podman，nftables |
 |---|---|---|---|---|
@@ -40,11 +42,13 @@
 - **podman 的名字解析**：aardvark-dns 直接监听自定义网络的网关地址的 53 端口（10.89.0.1:53），容器的 resolv.conf 指向它，不需要 DNAT。
 - **podman 的 `-p`**：rootful 的 podman 没有用户态代理，端口发布完全靠防火墙规则。nftables 时 `inet netavark` 表里有 `NETAVARK-HOSTPORT-DNAT`、`SETMARK` 链和隔离、MASQUERADE 的链。驱动是 none 时宿主上只是占着端口（一个监听 socket），连上去没有回应。
 
-## appine 里
+### appine 里
 
 两家都在第一步失败：dockerd 报 `Failed to create bridge docker0 via netlink: operation not supported` 后退出；netavark 报 `create bridge: Netlink error: Not supported (os error 95)`。appine 的 netlink 现在建不了 bridge、veth，新的网络命名空间里只有 lo（[网络命名空间](122-net-namespaces.md)）。
 
-## 方案 1 要做的
+## 推迟项
+
+### 方案 1 要做的
 
 1. **有状态的 netlink 设备**：
    - 建 bridge、veth 对（含 `VETH_INFO_PEER`、经由命名空间的 fd 或 pid 建在别的命名空间里、`IFLA_MASTER`），启用、改名、设 MAC、挂到 bridge、移到别的命名空间，删除。
@@ -57,12 +61,12 @@
    - 别的规则（隔离、MASQUERADE、raw 表）接受下来、能列出来，但不执行。这一点要写进文档：防火墙的隔离不起作用。
 4. **podman 的端口发布**（→ 已做，M9 之前：发布的端口：从别的命名空间进来的执行 PREROUTING 的 DNAT，从 appine 外面进来的由宿主上的线程转发；占端口的那个 socket 原来在，只是 MPTCP 的没列出来）：只有 nftables 的 hostport DNAT 规则。在方案 1 里，要由 appine 在宿主上监听那个端口、把连接转给容器（相当于内核层里的 docker-proxy）。还要处理 podman 自己占着同一个端口的那个监听 socket。这一项可以放到最后，或者先说明 rootful podman 的 `-p` 不支持。
 
-## 推荐的配置
+### 推荐的配置
 
 - docker：`"iptables": false`（外层不写那一大批规则；容器命名空间里的 DNS 规则照样会写，需要第 3 项）。
 - podman：`firewall_driver = "none"`；要 `-p` 的话等第 4 项，或者用 nftables 驱动加 netfilter 子集。
 
-## 后续的顺序（建议）
+### 后续的顺序（建议）
 
 1. 有状态的 netlink 设备和接口的 sysctl：docker、podman 的 bridge 网络能建起来，容器能起。
 2. socket 层的地址映射：容器之间、外层到容器、访问外面、docker-proxy 的 `-p`、podman 的按名字解析。

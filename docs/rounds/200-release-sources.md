@@ -26,7 +26,7 @@ Alpine 那一份：
 - 故意把 pax-utils tarball 的期望摘要改错：报 "sha512 mismatch for pax-utils-1.3.9.tar.xz"，退出码 1，不生成 Alpine 那一份。
 - 只加了脚本和文档，没有动代码，没有重跑测试。
 
-**推迟项**：
+## 推迟项
 
 - 仓库仍是私有的：发布之前公开，还是随 APK 附上提供源码的书面承诺，由用户定；三份文件放在哪里（GitHub 的 release 附件）也要那时定。
 - Android 库（AndroidX、Kotlin 标准库，Apache-2.0）的源码没有打包，它们的源码由上游公开发布（Maven 上的 `-sources.jar`）；vendored 的 Termux 终端库在 appine 的源码里。

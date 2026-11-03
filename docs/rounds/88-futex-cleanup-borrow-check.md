@@ -2,6 +2,8 @@
 
 [上一轮](87-fast-panic-held-borrows.md)的两个推迟项。
 
+## 做法
+
 - **futex 等待者的清理**：
   - **问题**：futex 的三条等待路径（不持 BKL 的、持锁的、`futex_waitv`）都是先登记成等待者、等待、再移除。
     - 中途 panic 时，条目留在队列里，之后的一次 FUTEX_WAKE 会算在它身上，真正的等待者叫不醒。键是宿主地址时，那段内存以后还可能分给别的进程。
@@ -20,9 +22,12 @@
     - 各文件只改了导入。线程自己的 `TaskState`（只有它自己借，整个系统调用期间借着）和三个线程局部变量仍用标准库的。
     - 现有的 cargo test 一次没有触发。
   - **覆盖**：只有 cargo test 跑到的等待才查。新增的 guest 程序 `tests/guest/waits.c` 在仓库里运行，让 19 种会在内核里等待的系统调用（epoll、poll、select、信号、消息队列、AIO、SysV IPC、futex、管道、eventfd、AF_UNIX、timerfd、inotify、PTY、文件锁、waitpid、seccomp 通知）各真正等一次：有超时的用很短的超时，别的由另一个线程稍后让它返回。
-- **开销**：在误差范围内。
 
-**推迟项**：
+## 结果
+
+在误差范围内。
+
+## 推迟项
 
 - 借用的检查只在调试构建里有，差分测试、LTP、普查用的发布构建都不查。cargo test 没跑到的等待也不查，比如：
   - `copy_file_range`、sendfile 等文件位置的锁；

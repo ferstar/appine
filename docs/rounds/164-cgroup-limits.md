@@ -25,7 +25,7 @@
 - 等着被结束的进程最多等 10 秒，内核不对时用例失败而不是卡住（第一次做变异检查时卡住了）。
 - 在 appine 里实际跑：podman 带 `--pids-limit`、`--memory` 时建好了容器的 cgroup，停在 crun 挂设备过滤的 eBPF 程序（`bpf create` 是 ENOSYS），与 docker 一样要等下一步。
 
-**推迟项**：
+## 推迟项
 
 - `memory.max` 是定时检查的：不停分配的进程在被发现之前会超出几十 MB（大的 cgroup 检查得更稀，超得更多），`memory.peak` 也就超过上限；Linux 在分配时就挡住，峰值正好是上限。调低 `memory.max` 时 Linux 等到用量降下来才返回，这里结束进程之后马上返回。
 - `memory.current` 是各个进程的驻留内存之和：fork 之后共用的页、共享的映射在每个进程里各算一次，没有页缓存、内核内存；Linux 每页只记在第一次用它的 cgroup 上。

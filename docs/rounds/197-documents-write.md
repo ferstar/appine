@@ -44,7 +44,7 @@ M9 计划的最后一轮，接着[上一轮](196-documents-read.md)的只读浏�
 - 仪器测试新增 `documentsWriteInTheHomeDirectory`：在运行着的内核里建账号 bob、设成登录账号，经由 `DocumentsContract` 和 `ContentResolver` 新建、写、改名、移动、删除，内核里马上看得到、属主是 bob，改不了的都失败。上一轮 `documentsShowTheHomeDirectory` 里"以写的模式打开失败"那条改成"整个系统那个根里的 `/etc/motd` 不能写"：家目录现在能写了。在 Pixel 4a（API 34）的模拟器上通过。
 - 手动（模拟器上的"文件"App）：从"下载""复制到…"appine、新建文件夹、删除，终端里都看得到。
 
-**推迟项**：
+## 推迟项
 
 - "文件"App 做的修改不产生 inotify 事件，guest 里监视着的程序（编辑器、构建工具的 watch）不知道。→ 已改：交给运行中的内核报事件，写的文件在对方关闭时报 `IN_MODIFY`、`IN_CLOSE_WRITE`（[M9："文件"App 与 guest 双向的通知](201-documents-notify.md)）
 - 不检查 guest 的权限：家目录里属于 root 的文件也能改、删（这台设备的用户在终端里本来就能 `doas`）。

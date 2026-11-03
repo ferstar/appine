@@ -44,7 +44,7 @@
 - 第一版用例分不出丢弃的 TCP 是马上失败还是等到超时（Python 把 ETIMEDOUT 也当作超时，变异检验发现的），客户端加上等了多久，再加一条非阻塞 connect 一秒之内不可写。
 - 普查：docker 的普查加了"网络之间的隔离"一步，开着 iptables 时从另一个网络连不上，与原生相同（原来 appine 里连得上）；关着时和 `--internal` 网络也与原生相同。
 
-**推迟项**：
+## 推迟项
 
 - 只看 TCP、UDP 的 IPv4。ICMP（ping）、IPv6、raw socket 不过过滤链。
 - 没有 br_netfilter：同一个 bridge 上的容器之间不过外层的 FORWARD。docker 的 `--icc=false`（同一个网络里的容器互相隔离）不起作用。

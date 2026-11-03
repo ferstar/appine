@@ -24,7 +24,7 @@
 
   原生上点积省 11%，appine 里省 4.5%：点积的核心原样执行，省下的绝对时间差不多（0.17–0.2 秒），但 appine 里标量代码和访存检查占的比例更大。相对原生（都用点积）从 2.3× 到 2.2×。
 
-**推迟项**：
+## 推迟项
 
 - LRCPC、SHA3、SHA512 仍在 v1.x。SHA3（EOR3、RAX1、XAR、BCAX）和 SHA512 也是数据处理指令，同样只改判定就行，用得到的是 OpenSSL、Go 的 `crypto/sha512`、`crypto/sha3` 这些；LRCPC 的 LDAPR 是访存，要在两个执行层里照 LDAR 实现。→ SHA3、SHA512 已补上（M9 之前：SHA3、SHA512 和 I8MM）；LRCPC 也补上了（M9 之前：LRCPC）
 - 宿主有 RDM、I8MM、BF16、FHM、FCMA、JSCVT 这些时仍不宣告（不在 §4.4 的表里）；I8MM 和点积一样是数据处理指令，llama.cpp、libvpx 也用它。→ I8MM 已补上（M9 之前：SHA3、SHA512 和 I8MM）；JSCVT 已补上（M9 之前：FP16 和 JSCVT）；RDM、BF16、FHM、FCMA 已补上（M9 之前：RDM、FCMA、FHM 和 BF16）

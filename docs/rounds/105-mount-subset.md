@@ -2,6 +2,8 @@
 
 [glibc 发行版的探测](69-glibc-probe.md)那一轮发现，从 Alpine chroot 进 Debian 之后 `/proc`、`/sys` 是空的，ps、top、free 都不能用：mount、umount2 是 ENOSYS。那时估了两档工作量：只挂合成文件系统（procfs、sysfs、devpts）要让它们的节点记着经由的挂载点，中等；bind 仓库里的目录和 tmpfs 要把路径都换成"挂载加节点"，大。后来先做了 App 里选 rootfs（[第 99 轮](99-choose-rootfs.md)），这一轮做第一档：合成文件系统可以挂到任意目录上，它们里面的目录可以 bind。
 
+## 做法
+
 - **节点带着挂载**（`core/kernel/src/vfs/mod.rs`）：
   - `Node::Pseudo` 多了挂载的编号，相当于 Linux 的 `struct path`：开机时的 `/proc` 和后来挂在 `/debian/proc` 上的 procfs 里，同一个目录是两个节点，`..` 各自回到自己的挂载点。仓库里的节点不带挂载，根文件系统只挂在 `/`。
   - 挂载表（`Mount`：文件系统、看到的根、挂载点、标志、设备号、source）放在 `Vfs` 里，挂载点可以是仓库里的目录、文件（bind 文件时，另记找到它的目录和名字，文件没有唯一的上级目录），也可以是别的挂载里的目录。路径解析每查到一个节点，上面挂着东西就换成最上面那个挂载的根；`..` 照 Linux 的 `follow_dotdot`：在挂载的根上先回到挂载点（叠着的一层层回去），到了 chroot 的根就不动，取上级之后上级上挂着东西时再进去；getcwd、`/proc/<pid>/{cwd,root}` 经由挂载点算路径。
@@ -15,13 +17,15 @@
   - umount2：不是挂载的根是 EINVAL；挂载里还挂着别的、有进程的根目录、当前目录或者打开的文件在里面是 EBUSY；`MNT_DETACH` 连同里面的挂载一起卸下，还在里面的节点照常能用，卸下了的挂载的根没有上级，getcwd 以 `(unreachable)` 开头（musl 当作 ENOENT）；`MNT_EXPIRE` 第一次只标记、返回 EAGAIN。仓库是所有进程的根文件系统，卸它是 EBUSY。权限都要 `CAP_SYS_ADMIN`。
   - 删除、改名挂载点是 EBUSY（Linux 的 `is_local_mountpoint`）。原来 `rmdir /proc` 能把开机时的挂载点删掉。
 - **chroot 里的 ttyname**：从 Alpine chroot 进 Debian、挂上 devpts 之后，Python 的 `os.ttyname` 报 ENODEV。第一版给每个新的 devpts 挂载分配了设备号，可各个挂载用的是同一套终端，从设备的 fstat 报告开机时那个设备号；glibc、musl 的 ttyname 拿 `/proc/self/fd` 里的名字 stat 一下，与 fstat 比对设备号和 inode，对不上就是 ENODEV。改成 devpts 的挂载都用同一个设备号。
-- **测试**：
-  - 单元测试新增 `mounts_on_other_directories`：叠挂和 bind 之后的 `..`、路径、chroot 之后的不可达、设备号，不持 BKL 的解析交回正常路径，卸下之后的节点和编号。
-  - 新的差分测试组 `mount`：挂载、bind、重新挂载、卸下和各种错误，之后的 mountinfo、设备号、`..`，以及 chroot 进去再挂 procfs、devpts 之后的 ttyname，两个执行层下都与原生相同。原生一侧的容器要有 `CAP_SYS_ADMIN`，colima 的虚拟机和 GitHub 的 runner 上还要关掉 AppArmor：`scripts/difftest` 认用例里 `# docker-run-options:` 这一行，把选项加给它的容器。mountinfo 不比设备号和超级块的选项：docker 的 `/sys` 是只读的，devpts 的新实例在 Linux 上默认 `mode=600`。
-  - 从 Alpine chroot 进 Debian（第 69 轮的仓库），挂上 proc、sysfs、devpts 和 cgroup2 之后 ps、top、free、findmnt、`os.ttyname` 都正常。
-  - LTP 新通过 mount08。
 
-**推迟项**：
+## 测试
+
+- 单元测试新增 `mounts_on_other_directories`：叠挂和 bind 之后的 `..`、路径、chroot 之后的不可达、设备号，不持 BKL 的解析交回正常路径，卸下之后的节点和编号。
+- 新的差分测试组 `mount`：挂载、bind、重新挂载、卸下和各种错误，之后的 mountinfo、设备号、`..`，以及 chroot 进去再挂 procfs、devpts 之后的 ttyname，两个执行层下都与原生相同。原生一侧的容器要有 `CAP_SYS_ADMIN`，colima 的虚拟机和 GitHub 的 runner 上还要关掉 AppArmor：`scripts/difftest` 认用例里 `# docker-run-options:` 这一行，把选项加给它的容器。mountinfo 不比设备号和超级块的选项：docker 的 `/sys` 是只读的，devpts 的新实例在 Linux 上默认 `mode=600`。
+- 从 Alpine chroot 进 Debian（第 69 轮的仓库），挂上 proc、sysfs、devpts 和 cgroup2 之后 ps、top、free、findmnt、`os.ttyname` 都正常。
+- LTP 新通过 mount08。
+
+## 推迟项
 
 - 仓库里的目录不能 bind（`mount --rbind /dev`、`--bind /run`、把 `/root` 这类目录共享进 chroot），没有 tmpfs：第二档，仓库的节点也要带上挂载，当前目录、打开文件记的路径、inotify、AF_UNIX 的路径名都要跟着改（[第 69 轮](69-glibc-probe.md)）。chroot 进去之后 `/dev` 里的设备节点要自己复制过去（`cp -a /dev/null …`），`/dev/ptmx` 指向 `pts/ptmx`。 → 仓库里的目录、文件的 bind 已补上（M9 之前：仓库里的目录 bind）；tmpfs 也补上了（M9 之前：tmpfs）
 - `MS_MOVE`、pivot_root、新的挂载接口（fsopen、open_tree、move_mount、mount_setattr 等）都没有，util-linux 的 mount 在 ENOSYS 之后退回 mount(2)。LTP 里它们的测试和要 loop 设备的 mount、umount 测试照旧失败（loop 设备、块设备也没有）。 → `MS_MOVE`、pivot_root 已补上（M9 之前：仓库里的目录 bind）；新的挂载接口、loop 设备仍没有；open_tree、move_mount、mount_setattr 有了（M9 之前：open_tree、move_mount 和 mount_setattr），fsopen 这一组仍没有

@@ -8,6 +8,8 @@
 
 这一轮顺手带上了同一篇里两个小的：`ip neigh`（原来 `RTNETLINK answers: Not supported`）和 `/proc/net/sockstat`。
 
+## 做法
+
 - **两张表**（`core/kernel/src/route.rs`）：按 Linux 没有自定义规则时的样子拼出主表和本地表。
   - 主表是宿主的路由，来源有三个：
     - Android 上 App 读不了宿主的路由表，`TerminalService` 注册默认网络的 `NetworkCallback`，把 `LinkProperties.getRoutes()` 经由新加的 `Machine::set_routes`（JNI 的 `Native.setRoutes`）交给内核层，网络变化时重新交。清单里加了 `ACCESS_NETWORK_STATE`。Android 13 之前 `RouteInfo.getType()` 不公开，路由都当作单播。
@@ -27,13 +29,18 @@
   - `ipv6_route`：IPv6 的两张表，每张表最后是树根上的空路由（没有 `::/0` 时），引用数都写 1。
   - `sockstat`、`sockstat6`：guest 的 socket 数。TCP 的 inuse 数监听着、连接着（不是 CLOSE）的，alloc 数所有 TCP socket，UDP 数绑定了端口的，raw 数所有的；宿主内核里已经关掉、还在 TIME_WAIT 或者孤儿状态的连接看不到，内存页数也不知道，都是 0。
 - **模拟器上**（Android 14，4K 页）：交来 `LinkProperties` 之前是合成的 `default dev eth0 scope link`，交来之后是 `default via 10.0.2.2 dev eth0`，`ip route get 1.1.1.1`、`route -n` 都经由网关。模拟器的宿主内核里 eth0 是 10.0.2.15/8，DHCP 交给 `LinkProperties` 的却是 /24，所以本地表的广播是 10.255.255.255（与宿主内核一致），主表那条 10.0.2.0/24 不认作内核加的。
-- **测试**：
-  - cargo test：`route` 的单元测试（两张表的内容和顺序、两个 `/proc` 文件的格式、`ip route get` 的各种目标、规则），netlink 的转储和错误，宿主路由表的解析；端到端新增 `routing_tables_are_visible`。
-  - 差分测试 compat 组新增一个 C 程序，逐字节比对路由和规则的转储、各种目标的 `ip route get`，还比对 busybox 的 `ip route`、`ip rule`、`route -n`、`netstat -rn` 和两个 `/proc` 文件，以及开 socket 前后 sockstat 的变化。不确定的不比：邻居表只看转储以 `NLMSG_DONE` 结束（Linux 上前面的用例在 lo 上留下了条目），`rta_cacheinfo` 只比错误码，`ipv6_route` 不比引用数，TCP 的 alloc 是整个系统的。对照时发现两处不同：224.0.0.1 少了 `RTCF_LOCAL`（已改），`ip addr` 少了 `brd`（见推迟项）。
-  - Android：`MachineTest` 新增 `routesComeFromLinkProperties`，在 Android 14（4K 页）和 Android 17（16K 页）的模拟器上通过。
-- **开销**：只在查路由、读这几个文件时计算，收发数据的路径上没有改动。
 
-**推迟项**：
+## 结果
+
+只在查路由、读这几个文件时计算，收发数据的路径上没有改动。
+
+## 测试
+
+- cargo test：`route` 的单元测试（两张表的内容和顺序、两个 `/proc` 文件的格式、`ip route get` 的各种目标、规则），netlink 的转储和错误，宿主路由表的解析；端到端新增 `routing_tables_are_visible`。
+- 差分测试 compat 组新增一个 C 程序，逐字节比对路由和规则的转储、各种目标的 `ip route get`，还比对 busybox 的 `ip route`、`ip rule`、`route -n`、`netstat -rn` 和两个 `/proc` 文件，以及开 socket 前后 sockstat 的变化。不确定的不比：邻居表只看转储以 `NLMSG_DONE` 结束（Linux 上前面的用例在 lo 上留下了条目），`rta_cacheinfo` 只比错误码，`ipv6_route` 不比引用数，TCP 的 alloc 是整个系统的。对照时发现两处不同：224.0.0.1 少了 `RTCF_LOCAL`（已改），`ip addr` 少了 `brd`（见推迟项）。
+- Android：`MachineTest` 新增 `routesComeFromLinkProperties`，在 Android 14（4K 页）和 Android 17（16K 页）的模拟器上通过。
+
+## 推迟项
 
 - `RTM_NEWADDR` 少了 `IFA_BROADCAST`、`IFA_FLAGS`、`IFA_CACHEINFO`（[M4](06-m4.md) 起）：`ip addr` 不显示 `brd`，原生的地址消息长 76、88 字节，appine 的短一些。→ 已补上（M9 之前：接口和地址的 netlink 消息），地址消息与 Linux 逐字节相同；链路消息也补了 `ip link` 用到的属性，iproute2 的单条 `RTM_GETLINK` 也能用了
 - `/proc/net` 仍没有 `snmp`、`netstat`、`arp` 等（原生的容器里 57 个文件，这里 15 个）：iproute2 的 `ss -s` 的汇总要读 `snmp` 里的 `CurrEstab`。→ `snmp`、`netstat`、`arp` 已补上（M9 之前：snmp 和输入结束时的 EOF），现在 18 个；`snmp6` 等仍没有

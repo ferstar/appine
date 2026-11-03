@@ -23,7 +23,7 @@
 - `nsproxy.rs`、`misc.rs` 的单元测试：各个时钟的偏移、新建的照抄不冻结、读数加偏移、绝对时刻减偏移。
 - 在 appine 里实际跑：`docker run` 过了 time 命名空间和 runc 的 memfd，下一步停在 `mkdir /sys/fs/cgroup/docker: read-only file system`（普查的问题 9）。
 
-**推迟项**：
+## 推迟项
 
 - 写 `timens_offsets` 的能力按写的进程的凭据查，Linux 按打开文件时的（`file_ns_capable`），与 [用户命名空间](119-user-namespaces.md)写 ID 映射的推迟项一样。
 - 没有 ucounts：`/proc/sys/user/max_time_namespaces` 与别的几种一样可以读写，但不实际限制个数（[用户命名空间](119-user-namespaces.md)的推迟项）。

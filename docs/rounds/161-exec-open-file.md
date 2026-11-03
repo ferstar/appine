@@ -22,7 +22,7 @@
 - 差分测试 `containers` 组新增：把一个打印 `/proc/self/exe`、`AT_EXECFN` 和 maps 的小程序复制进 memfd 和普通文件，看 memfd 和删除了的文件经由几种方式执行、以写方式打开着时的 ETXTBSY、`MFD_NOEXEC_SEAL` 和不能执行的 fd 的 EACCES，两个执行层下都与原生逐字相同。不比 comm：执行 fd 时 Linux 6.8 用 fd 的编号，新内核改成了文件名。
 - 在 appine 里实际跑：`podman build --isolation chroot` 能构建了，RUN 一步在 chroot 里跑 `apk`，构建出来的镜像能运行。
 
-**推迟项**：
+## 推迟项
 
 - memfd 不经由挂载：Linux 的 memfd 在内核内部的 shm 挂载上，这里 noexec、nosuid 都不适用，结果一样。
 - 执行之后再经由 memfd 自己的 fd 写它，已经映射的代码会不会变：Linux 上 memfd 是共享内存，私有映射的页在写时复制之前看得到；runc 先封住了，没有对照。

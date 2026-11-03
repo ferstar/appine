@@ -22,7 +22,7 @@
 - 写用例时子进程的输出丢过一次：stdout 接的是管道、全缓冲，fork 出来的子进程 `_exit` 不刷，原生上也一样丢，等于没测到，fork 之前和 `_exit` 之前都加了 fflush。
 - 在 appine 里实际跑：不再需要任何临时绕过，`podman run --network host --cgroups disabled` 起得来，容器里的 `/dev/mqueue` 是 mqueue 文件系统。
 
-**推迟项**：
+## 推迟项
 
 - 状态行的 `NOTIFY_PID` 是全局的 pid，Linux 按读者的 pid 命名空间（`pid_vnr`）。原来就是这样。
 - 打开着的队列不算卸载时"还在用"：Linux 上经由挂载打开的文件让 umount 是 EBUSY。

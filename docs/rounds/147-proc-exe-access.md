@@ -10,6 +10,6 @@
 
 - 差分测试 `namespaces` 组：别的用户、不可 dump 的进程、新建用户命名空间之后读别的进程的 `exe`（以及 `cwd`、`root`），readlink、open、stat 是 EACCES，lstat 和读自己的照常。
 
-**推迟项**：
+## 推迟项
 
 - `exe` 仍按读出来的文字跟随（[已删除的后缀](97-deleted-suffix.md)的推迟项）：程序文件改了名、被删除之后，经由它打开的不是原来的那个文件。→ 已补上（M9 之前：/proc/<pid>/exe 指向程序文件本身）

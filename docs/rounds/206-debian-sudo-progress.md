@@ -16,9 +16,13 @@
 
 ## 做法
 
-**显示 apt 的输出。** 去掉 `-qq` 和 `>/dev/null`：`apt-get update`、`apt-get install` 在终端上有自己的进度（`45% [4 Packages 2125 kB/9614 kB 22%]`）、下载了什么、装了什么。开头那一行改成 "appine: installing sudo so that alice can become root (Ctrl-C skips it until the next login)"。
+### 显示 apt 的输出
 
-**Ctrl-C 跳过这一次。** 登录脚本一开始 `trap 'interrupted=1' INT`：脚本自己接住 SIGINT，不结束；子进程照样收到（接住的信号 exec 时恢复默认，忽略的会一直传下去，那样 apt-get 就停不下来了），被打断的 apt-get 失败，这次不装，打一行 "skipped installing sudo; appine tries again at the next login"（前面先换行：apt 的进度行停在一半）。之后照常登录。下一次登录还会再装：没有 sudo 这个账号提不了权，Debian 的 root 是锁着的（`/etc/shadow` 里是 `*`），`su` 也进不去。
+去掉 `-qq` 和 `>/dev/null`：`apt-get update`、`apt-get install` 在终端上有自己的进度（`45% [4 Packages 2125 kB/9614 kB 22%]`）、下载了什么、装了什么。开头那一行改成 "appine: installing sudo so that alice can become root (Ctrl-C skips it until the next login)"。
+
+### Ctrl-C 跳过这一次
+
+登录脚本一开始 `trap 'interrupted=1' INT`：脚本自己接住 SIGINT，不结束；子进程照样收到（接住的信号 exec 时恢复默认，忽略的会一直传下去，那样 apt-get 就停不下来了），被打断的 apt-get 失败，这次不装，打一行 "skipped installing sudo; appine tries again at the next login"（前面先换行：apt 的进度行停在一半）。之后照常登录。下一次登录还会再装：没有 sudo 这个账号提不了权，Debian 的 root 是锁着的（`/etc/shadow` 里是 `*`），`su` 也进不去。
 
 按在哪一步都不会把 dpkg 弄坏，在 `appine-run` 里实测（包先下载好，在 1.2、1.8、2.4 秒时按）：
 
@@ -42,7 +46,7 @@
 - 在 `appine-run` 里（Debian 13 的 rootfs，用 guest 里的 `script` 开一个伪终端运行登录脚本，从管道定时送入 Ctrl-C 和命令）：第一次登录按 Ctrl-C 跳过、进了 shell 之后 Ctrl-C 只打断前台的命令，第二次登录显示进度、装上 sudo，第三次不再装；Alpine 上照旧用 `-c`。
 - 仪器测试 `downloadedDistributionsRun`（联网，默认跳过）加上同样的几步：跳过、shell 里 Ctrl-C 之后会话还在、下一次登录装上；新加的 `loginSteps` 按步骤交互：等输出里出现某段文字再输入下一段。在 Pixel 4a（API 34）的模拟器上带 `network=true` 通过。第一次失败在用例的断言上：bash 在命令输出前先写 `\e[?2004l\r`，`/dev/pts/` 前面不是换行。
 
-**推迟项**：
+## 推迟项
 
 - 下一次登录还会再装：网络一直慢时，每开一个标签页都要按一次 Ctrl-C。不装又没法提权（Debian 的 root 是锁着的），只能在设置里把登录账号改成 root 再自己装。
 - apt 的输出有三十来行（索引、依赖、dpkg 的每一步），只在装的那一次出现。

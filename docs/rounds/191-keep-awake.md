@@ -31,7 +31,7 @@ appine 只要有内核就有前台服务（`specialUse`），所以只加 `PARTI
 
 测试时碰到的问题：上一轮用 `settings delete global http_proxy` 删掉模拟器的系统代理之后，系统由它派生出的 `global_http_proxy_host`、`global_http_proxy_port` 还在，排除列表却空了，连接服务一直按这个代理走到重启，两个用本地 HTTP 服务的用例因此返回 404。清掉代理要用 `settings put global http_proxy :0`；`android/README.md` 上一轮写的办法改正了。
 
-**推迟项**：
+## 推迟项
 
 - 只在模拟器上验证了系统怎么对待这把锁；熄屏之后 guest 的程序是不是真的一直在跑、多耗多少电，要真机（模拟器的 CPU 不休眠）。一些厂商的系统（MIUI、ColorOS 等）在 AOSP 之外另有后台管理，前台服务和 wake lock 都可能被它们停掉，没有处理，也没有引导用户去改。
 - Play Console 的 Android vitals 把长时间持有 partial wake lock 算作"过多唤醒锁定"，可能影响 App 在商店里的展示；这里是用户自己打开的，前台服务期间的锁怎么计算没有查。

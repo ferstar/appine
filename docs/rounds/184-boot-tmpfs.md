@@ -34,7 +34,7 @@ devfs 现在打印 "Remounting tmpfs on /dev"，按它的选项重新挂载（`n
 - `mount` 差分测试组新增一节：`/dev` 下面各个挂载的类型，照 OpenRC 的 devfs 重新挂载 `/dev` 之后的超级块选项、设备节点、`openpty` 和 urandom，与原生相同。原生的容器没有挂 `/run`，`/run` 不比。
 - 手动（`target/openrc/devfs.sh`）：OpenRC 的 sysinit、boot 里加上 devfs、mdev、seedrng 等服务之后，`/dev` 的节点都在，tmux 能开会话，`/run` 没有被再挂一层；改之前 `/dev` 里没有 ptmx。
 
-**推迟项**：
+## 推迟项
 
 - seedrng 仍然失败：`/dev/urandom` 的 `RNDADDENTROPY` 是 ENOTTY（下一轮）。→ 已补上（M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl）
 - mdev 的 `/proc/sys/kernel/hotplug` 写不了、没有 `/sys/dev`：appine 没有热插拔，不做，文档里说明。

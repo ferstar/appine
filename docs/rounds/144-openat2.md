@@ -25,7 +25,7 @@
 - 单元测试 `openat2_resolve_flags_limit_the_walk`（`vfs`）：五种限制在仓库和挂载上的各种情形，新建时的父目录。
 - LTP 新通过 openat201、openat202、openat203（原来因为 ENOSYS 跳过）。
 
-**推迟项**：
+## 推迟项
 
 - `O_CREAT` 沿着悬空的符号链接新建时，nd->root 取过没有是近似的（不看路径前面的符号链接里有没有 `..` 或绝对路径）：只影响 `NO_XDEV` 加 `O_CREAT` 加悬空的绝对链接这种组合。
 - 没有在真的 GNU tar（配 glibc ≥ 2.43 的新版本）上试过：手头的发行版里都没有，差分测试按它的调用方式（`O_PATH | O_DIRECTORY`、`RESOLVE_BENEATH`）比过。→ Ubuntu 26.04 的 tar 1.35+dfsg-4ubuntu0.4 就是，解包带子目录的归档照常，openat2 的调用与原生逐字相同（M9 之前：Ubuntu 26.04 的普查）

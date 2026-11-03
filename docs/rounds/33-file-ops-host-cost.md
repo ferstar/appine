@@ -1,6 +1,10 @@
 # M9 之前：文件操作的宿主开销（2026-10-26）
 
-上一轮的推迟项：文件操作剩下的差距在宿主上。先把对照换成同一个卷上的原生（`/bench` 卷 bind mount 到容器的 `/tmp`；上一轮的原生数字是在容器自己的 overlay 上量的，慢一些），`target/mem/fsab.sh` 每项重复 5 次取平均。这时 `cp -r` 再 `rm -rf` 是原生的 2 倍，`tar x` 再删除 2.3 倍。剖析 fsbench 和 `tar x`：
+上一轮的推迟项：文件操作剩下的差距在宿主上。先把对照换成同一个卷上的原生（`/bench` 卷 bind mount 到容器的 `/tmp`；上一轮的原生数字是在容器自己的 overlay 上量的，慢一些），`target/mem/fsab.sh` 每项重复 5 次取平均。这时 `cp -r` 再 `rm -rf` 是原生的 2 倍，`tar x` 再删除 2.3 倍。
+
+## 时间花在哪里
+
+剖析 fsbench 和 `tar x`：
 
 - 删除 object（宿主 unlink）占 16%，在持 BKL 的提交里一个一个做。
 - 新建一个文件要查三次数据库：操作里完全不读缓存，同一个名字查两次、上级目录的行再查一次。
@@ -9,7 +13,7 @@
 - `sendfile` 占 `cp` 的 27%：内核层先 pread 再 pwrite，每次还分配、清零 64 KB 的缓冲区。
 - `cat` 一堆文件经管道交给 `wc` 时，11% 花在叫醒对端：读端每读 1 KB 都把写端叫醒一次。
 
-做了的：
+## 做法
 
 - **后台线程删除 object**（§8.1）：提交之后把要删的 object 交给 `objects-reaper` 线程。inode 行以 nlink = 0 留到开机，编号不会在删完之前被重新分配。
   - 第一版开机清理时也交给它，结果把新文件的 object 删掉了：行一删，编号就分给了新建的文件，后台线程晚一点删的正是新文件的。bench 仓库里 fsbench 目录下 1859 个文件因此丢了数据（都是 fsbench 自己的临时文件，已经补上空 object 删掉）。
@@ -19,6 +23,8 @@
 - **object 相对 `objects` 目录操作**：`openat`、`unlinkat`、`utimensat`，不解析整个路径；utime 一次宿主调用。chmod、chown、utimensat、truncate、chdir、open 检查权限时只读 inode 行，不 stat object。
 - **普通文件之间的 sendfile、copy_file_range 交给宿主**：用宿主的 `sendfile`，因为 Android 14 之前 App 的 seccomp 不允许 `copy_file_range`，调用会收到 SIGSYS。输出 fd 的宿主位置要用，所以像不持 BKL 的读写一样占住输出的文件位置；两个方向的拷贝互相等时谁也不占着。第一版一次最多拷 16 MB，LTP 的 sendfile09 要求一次返回 1 GB，改成和 Linux 一样的 `MAX_RW_COUNT`。
 - **管道少叫醒**（§6）：与 Linux 一样，写入只在管道原来是空的时候叫醒读端；读出只在空间够了被阻塞的写端要的量、或者越过 `PIPE_BUF`（poll 报告可写的门槛）时叫醒写端；大块写入写满之后等到能写一页再接着写。
+
+## 结果
 
 | 每个操作（微秒） | 原生（同一个卷） | HEAD | 之后 |
 |---|---|---|---|
@@ -38,10 +44,12 @@
 
 `cat | wc` 剩下的主要是 `wc` 自己逐字节计数的循环（翻译后的代码占 54%）。
 
-- **一致性**：重复上一轮的随机 `kill -9`（这次还在循环里 chmod，重启之后再新建会重新用到编号），`target/mem/fsck.py` 都没有问题、没有多余的 object。
-- **测试**：单元测试新增上面那条。
+## 测试
 
-**推迟项**：
+- **一致性**：重复上一轮的随机 `kill -9`（这次还在循环里 chmod，重启之后再新建会重新用到编号），`target/mem/fsck.py` 都没有问题、没有多余的 object。
+- 单元测试新增上面那条。
+
+## 推迟项
 
 - 新建文件仍比原生慢 3 微秒：宿主上在 `objects` 目录里建 object 本身和原生新建一个文件差不多贵，剩下的是 guest 系统调用、路径解析和 SQLite 的插入。要再快只能把建 object 挪出 guest 线程（预先建好一批再改名或者链接过去，或者 `O_TMPFILE`），代价是开机清理和崩溃恢复都更复杂。→ 量过（M9 之前：openat 的开销）：`go build` 里新建夹在 guest 代码中间、缓存是冷的，一次 55 µs，宿主上建 object 约 27 µs；预先建 object 最多让解包快 13%，崩溃恢复和 `lock` 文件的格式要跟着改，仍没做
 - 对已删除、仍打开着的文件 `futimens` 会失败（按 inode 编号找 object，而它已经删了），以前就是这样。→ 已补上（M9 之前：平均负载、sysfs 和 limits）：按 fd 设置时直接设置打开着的 object

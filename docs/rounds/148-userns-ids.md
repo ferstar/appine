@@ -23,7 +23,7 @@
 - 单元测试 `si_uid_follows_the_user_namespace`（`signal`）。
 - 全量运行时原生一侧失败过一次：子进程继续之后马上退出，父进程再用 waitid 等继续的事件时它已经是僵尸，Linux 返回 ECHILD；用例改成子进程等父进程取走继续的事件再退出。
 
-**推迟项**：
+## 推迟项
 
 - POSIX 消息队列的通知按登记通知的进程现在的用户命名空间填 si_uid，Linux 用登记时的（`notify_user_ns`）。
 - 停止、继续时的 SIGCHLD 当作子进程自己发的再换算一次：Linux 用的是当时的 current，通常就是子进程，由别的线程、进程触发的情形没有分开。

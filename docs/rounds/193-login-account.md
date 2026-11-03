@@ -49,7 +49,7 @@
 - 手动在模拟器上的 App 里看了设置页的"登录账号"随 `adduser` 变化、新标签页以 alice 登录并能 `doas`、选 root 之后新开的标签页是 root。
 - 全量并发的 `cargo test` 里 `init_runs_the_inittab` 失败过一次，单独重跑都通过（见推迟项）。
 
-**推迟项**：
+## 推迟项
 
 - 普通用户第一次登录时自动加进管理员组，只在 App 打开的标签页里发生；用 `su - alice`、ssh 登录的不经过登录脚本，不会被加组、装工具。
 - Debian 上装 sudo 要联网，模拟器上要几分钟，期间这个标签页一直在装。没有进度，也不能跳过（Ctrl-C 会连登录一起中断）。 → 显示 apt 的进度，Ctrl-C 跳过这一次、登录照常（[M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制](206-debian-sudo-progress.md)）；仍要联网，跳过的下一次登录再装

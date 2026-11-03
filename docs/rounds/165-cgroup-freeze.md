@@ -18,7 +18,7 @@
 - `edge-cases` 组新增停止又继续之后的 poll、epoll_wait 和有超时的 futex 等待，改之前 appine 在这三处都与原生不同。
 - 在 appine 里实际跑 `docker pause`、`podman pause` 要等容器起得来（下一步：eBPF 的设备过滤）。→ 起得来之后 `docker pause` 先撞上伪文件读不到写过的值，改了之后正常（M9 之前：cgroup 的设备过滤（eBPF））
 
-**推迟项**：
+## 推迟项
 
 - 被跟踪、停在 ptrace-stop 里的线程不算已经停下，这时 `cgroup.events` 的 frozen 一直是 0；Linux 把停止、ptrace-stop 中的任务都算作冻结了的。
 - 不经过内核层等待的地方停不下来：卡在一次宿主调用里的线程（比如读一个阻塞的宿主文件）、vfork 之后等子进程的父进程（与 Linux 一样只有致命信号能打断，但 Linux 的那一处可以冻结），要等它们回来，frozen 才变成 1。

@@ -7,7 +7,9 @@
 
 ## 做法
 
-**"文件"App → guest。** provider 的修改都经由 `appine_kernel::browse_changing`：与原来的 `browse` 一样另外打开一次仓库，`vfs::browse` 的各个函数把改了什么记成 `Change`，仓库关闭（提交）之后交给用着同一个仓库、正在运行的内核（`machine::store_changed`）。内核启动时按规范化的仓库目录登记自己（弱引用，停了就失效），收到时持着 BKL 照对应的 syscall 报事件（`inotify::host_change`）：
+### "文件"App → guest
+
+provider 的修改都经由 `appine_kernel::browse_changing`：与原来的 `browse` 一样另外打开一次仓库，`vfs::browse` 的各个函数把改了什么记成 `Change`，仓库关闭（提交）之后交给用着同一个仓库、正在运行的内核（`machine::store_changed`）。内核启动时按规范化的仓库目录登记自己（弱引用，停了就失效），收到时持着 BKL 照对应的 syscall 报事件（`inotify::host_change`）：
 
 | 改动 | 报的事件 |
 |---|---|
@@ -19,7 +21,9 @@
 
 最后一行要知道对方什么时候关：provider 交出去的 fd 由别的 App 直接写宿主的 object，内核看不到每一次写。`ParcelFileDescriptor.wrap`（能给已有的 fd 加关闭的回调）要 API 30，App 的 minSdk 是 29，所以照旧由本地代码检查、截断，再按 `/proc/self/fd` 找到 object 的路径，用 API 19 起就有的 `ParcelFileDescriptor.open(file, mode, handler, onClose)` 重新打开交出去（截断已经做过，不再带 `MODE_TRUNCATE`），关闭时在 `documents-close` 线程上调 `Native.browseWritten`。重新打开失败时退回原来的 fd，只是没有关闭的事件。
 
-**guest → "文件"App。** 仓库在 `dir_changed`（新建、删除、改名时改目录时间的地方）里记下改过的目录，App 第一次来取时才开始记，两次之间最多 256 个。服务原来每 2 秒取一次监听的端口、被结束的进程，现在也取走这些目录（`Machine::take_changed_dirs`，按各级目录记着的上级和名字拼出仓库里的路径，删掉了的、tmpfs 里的不给），对每个目录 `notifyChange` 它的子项 URI（文档 ID 就是路径），"文件"App 正在看那个目录的话就重新列。
+### guest → "文件"App
+
+仓库在 `dir_changed`（新建、删除、改名时改目录时间的地方）里记下改过的目录，App 第一次来取时才开始记，两次之间最多 256 个。服务原来每 2 秒取一次监听的端口、被结束的进程，现在也取走这些目录（`Machine::take_changed_dirs`，按各级目录记着的上级和名字拼出仓库里的路径，删掉了的、tmpfs 里的不给），对每个目录 `notifyChange` 它的子项 URI（文档 ID 就是路径），"文件"App 正在看那个目录的话就重新列。
 
 ### 顺带修的：别的内核放锁时取走唤醒请求
 
@@ -37,7 +41,7 @@
 - 仪器测试新增 `documentsChangesReachTheKernelAndBack`：经由 `DocumentsContract` 和 `ContentResolver` 的修改（包括关闭回调来的 `w`）guest 的 `inotifyd` 都收到，guest 改了之后注册在子项 URI 上的观察者收到通知；在 Pixel 4a（API 34）的模拟器上通过。测试本身的坑：`inotifyd` 要在自己的控制台上跑，`sh` 辅助函数用完会关掉控制台、结束整个会话，`nohup` 也挡不住。
 - 修好唤醒请求之后，整个 `rootfs_programs` 并发地跑 30 次都不再卡。
 
-**推迟项**：
+## 推迟项
 
 - 对方一直开着 fd 写（不关）时，guest 只在关闭时收到一次 `IN_MODIFY`；对方为写打开、什么也没写就关，也照样报 `IN_MODIFY`（没有比较内容）。
 - 只改了文件内容（大小、时间变了）的目录不刷新"文件"App：仓库只在目录项变化时记。

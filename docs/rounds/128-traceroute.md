@@ -45,7 +45,7 @@ guest 的 raw ICMP socket 的实现挪到 `core/kernel/src/rawicmp.rs`。
 - 开发中差分测试抓到：没有连接的 UDP socket 引用的源地址是 0.0.0.0（现在按路由取）。
 - 非 ICMP 的 raw socket 改成 EPERM 没有改变 LTP 任何一项的结果。
 
-**推迟项**：
+## 推迟项
 
 - 只看着设过 TTL 的 UDP socket：Linux 的 raw socket 收得到所有 UDP 报文引起的错误，这里只收得到 traceroute 这类探测包的；guest 的 ping socket（不是 raw 的）收到的回答 raw socket 也收不到；发给本机的 echo 请求、重定向这些到不了 ping socket 的 ICMP 仍收不到。
 - 已连接的 UDP socket 在汇集点看着时发往别的地址，宿主连接改到了那个地址，之后只收得到从它来的数据报（Linux 上仍是从连的对端来的）。只有设过 TTL、又有 raw socket 时才会这样。

@@ -2,6 +2,8 @@
 
 [上一轮](86-rc-outside-bkl.md)的两个推迟项。
 
+## 做法
+
 - **不持 BKL 的系统调用兜住 panic**：
   - **原因**：`syscall::fast`（§6）在运行循环里直接调用，没有经过 `bug::catch`。那里出了内核 bug 时，panic 一直展开到 `thread_main` 的 `catch_unwind`，之后 abort，整个 App 终止，不符合 §12 第 5 条。
   - **改动**：
@@ -24,7 +26,7 @@
   - **改动**：两处都先在一句里取出要用的 `Rc`（epoll、过滤器，后者加了 `Listener::filter`），借用随这一句结束。epoll 的打开文件本身仍留到函数结束，等待期间 fd 被关掉也保活，与原来一样。
   - **测试**：差分测试 epoll 组、seccomp 组各新增一项：一个线程在 epoll_wait、`NOTIF_RECV` 里等，另一个线程对那个 fd 做 `fcntl(F_SETFL, O_NONBLOCK)`、`ioctl(FIONBIO)`，再叫醒它。
 
-**推迟项**：
+## 推迟项
 
 - 不持 BKL 的 futex 等待如果在登记成等待者之后、取消登记之前 panic，队列里会留下一个已经没人等的条目，之后一次 FUTEX_WAKE 会算在它身上。只在撞上内核 bug 时出现。→ 已补上（M9 之前：futex 等待者的清理，放开 BKL 时检查借用），三条等待路径都由守卫移除；顺带修了持锁的路径和 `futex_waitv` 超时时可能丢掉一次唤醒
 - 这次的排查是按函数名和缩进做的文本扫描。持着从 `Rc` 拿到的借用去等待，编译器拦不住，以后的改动可能再写出来。→ 已补上（M9 之前：futex 等待者的清理，放开 BKL 时检查借用）：调试构建里放开 BKL 时检查这个线程没有借着内核对象，`tests/guest/waits.c` 让各种等待都走一遍

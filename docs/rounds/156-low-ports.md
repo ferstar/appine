@@ -23,7 +23,7 @@
 - `rootfs_programs` 的 `low_ports_bind_elsewhere_on_the_host`：宿主上先占住偏移之后的端口，guest 的 nc 换到下一个，`Machine::take_listens` 报告它，宿主经由它连得上。
 - Android 模拟器（Pixel 4a，API 34）上 `MachineTest.lowPortsMoveToHighPortsOnTheHost` 通过；在 App 里手工起 `nc -lk -p 22`，`dmesg` 有映射的那一行，通知栏出现监听的通知。
 
-**推迟项**：
+## 推迟项
 
 - 别的设备、手机上别的 App 要连宿主上的端口（10022）；程序自己打印的、写进配置文件的仍是 22（"Listening on :22"），用户要看通知。→ 宿主让绑原来的端口时（2026 年 5 月起的 Play 系统更新放开了 22、80、443 等几个）就绑原来的，不换（[M9：宿主让绑的低端口就绑原来的](208-low-ports-direct.md)）；其余的端口、没有这个更新的系统上仍是这样
 - 用低端口当**源**端口的客户端（rsh、NFS 的 secure 端口、`bindresvport`）：对方看到的是 10xxx，检查源端口的服务会拒绝。
@@ -32,4 +32,3 @@
 - 监听通知只看 TCP 的 listen，UDP 的服务（DNS、mDNS、WireGuard）不通知；同一个（端口, 宿主端口）每次开机只通知一次。
 - raw ICMP 汇集点拼回的 ICMP 错误里引用的 UDP 头的端口是宿主上的（traceroute 到本机映射了的端口时看得到）。
 - 只在模拟器上验证了 App 绑不了低端口、映射之后别的进程连得上；真机上别的设备经由 Wi-Fi 连 10022 没试（R1）。
-

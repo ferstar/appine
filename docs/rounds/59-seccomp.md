@@ -2,6 +2,8 @@
 
 原来 guest 不能自己装 seccomp 过滤器（§11.1）：`prctl(PR_SET_SECCOMP)` 做完参数和权限检查之后返回 EINVAL，`seccomp(2)` 是 ENOSYS。用 seccomp 给自己加沙箱的程序要么报错，要么不带沙箱运行；靠 `SECCOMP_RET_TRACE` 的 `strace --seccomp-bpf`、靠通知 fd 代办系统调用的监管程序也用不了。这一轮在内核层实现 seccomp（`seccomp.rs`），行为按 Linux 6.1。
 
+## 做法
+
 - **模式**：
   - 严格模式只允许 read、write、exit、rt_sigreturn，别的系统调用以 SIGKILL 结束这个线程（Linux 的 `do_exit(SIGKILL)`）。exit_group 也不在里面，从 main 返回同样被结束。
   - 过滤模式：`seccomp(SECCOMP_SET_MODE_FILTER)` 或者 `prctl(PR_SET_SECCOMP, 2)` 装 cBPF 程序，要求 `no_new_privs` 或者 `CAP_SYS_ADMIN`。两种模式之间不能互换。
@@ -28,24 +30,30 @@
 - **PTRACE_SYSCALL 的出口**：与 arm64 Linux 一样（`syscall_trace_exit` 重新读标志），有 seccomp 的线程出口停不停看出口时的跟踪状态：跟踪者用 PTRACE_CONT 让它继续、在 `PTRACE_EVENT_SECCOMP` 停住时改用 PTRACE_SYSCALL 的，这次系统调用的出口也停，跳过的系统调用也一样。`strace --seccomp-bpf` 就这样只在要看的系统调用上停、在出口拿返回值。这一处是审查时查出来改的：原来出口只看入口时有没有停，strace 把下一个系统调用的入口当成出口，打印的返回值是错的（strace 自己也报 `exiting, ptrace_syscall_info.op == 1`）。
 - **ptrace 的其他部分**：`PTRACE_O_SUSPEND_SECCOMP`（checkpoint/restore 用，要求 `CAP_SYS_ADMIN`、跟踪者自己没有 seccomp），`PTRACE_SECCOMP_GET_FILTER` 读原样的程序，`PTRACE_SECCOMP_GET_METADATA` 读标志。`seccomp(2)` 的 `GET_ACTION_AVAIL`、`GET_NOTIF_SIZES` 也有了。
 - **进程的退出状态**（§6）：线程各自退出时，改按 6.1 的 [`synchronize_group_exit`](https://github.com/gregkh/linux/blob/linux-6.1.y/kernel/exit.c)，由最后一个进入退出流程的线程定下进程的退出状态（原来是主线程 exit 的退出码），在 `PTRACE_EVENT_EXIT` 之前定，跟踪者放行的先后不影响它。KILL_THREAD 结束了主线程、另一个线程之后 exit 时，进程的退出码是那个线程的。`tests/guest/bugs.c` 跟着改：最后一个线程用 SYS_exit 退出之后，退出清理里的内核 bug 不再把进程的结束方式改成 SIGSEGV，与 exit_group 之后一样。
-- **开销**：单线程、Tier 1 的每次调用（过滤器只看架构是 6 条，再比较 40 个编号是 46 条；原生一侧的过滤器由 JIT 执行）：
 
-  | | 原生：没有 / 6 条 / 46 条 | appine：没有 / 6 条 / 46 条 |
-  |---|---|---|
-  | clock_gettime（vDSO） | 20 / 19 / 19 纳秒 | 89 / 144 / 144 纳秒 |
-  | getppid | 127 / 148 / 148 | 95 / 112 / 290 |
-  | futex 唤醒（快速路径） | 159 / 180 / 181 | 59 / 123 / 307 |
-  | fstatat（快速路径） | 585 / 615 / 626 | 885 / 1250 / 1390 |
-  | pread | 226 / 246 / 248 | 427 / 440 / 630 |
+## 结果
 
-  装了过滤器之后，快速路径上的系统调用改走持 BKL 的路径：futex 唤醒慢一倍，fstatat 慢四成。vDSO 里读时钟虽然不检查，也一样进了持 BKL 的路径。解释器每条指令约 4.5 纳秒，而 libseccomp 生成的过滤器是一串线性比较，像 docker 默认规则那样放行几百个系统调用的，每次系统调用要运行几百条。
-- **测试**：新的差分测试 `seccomp` 比对：报告可用动作和状态的接口，严格模式，程序的检查和一条链的容量，各种动作，快速路径上的系统调用被过滤、经由 vDSO 的 clock_gettime 不被过滤，继承和 TSYNC，ptrace（`PTRACE_EVENT_SECCOMP`、改编号和跳过、出口的停止），通知 fd 和 ADDFD，`strace -f --seccomp-bpf`。
+单线程、Tier 1 的每次调用（过滤器只看架构是 6 条，再比较 40 个编号是 46 条；原生一侧的过滤器由 JIT 执行）：
 
-  动作那一节把 `RLIMIT_CORE` 设成 1，两边都不写 core：`core_pattern` 是管道时（CI 的 Ubuntu 宿主上是 apport）Linux 不管限制是不是 0 都交给它，只有 1 不交，写文件时不到一页也不写。docker 里的 root 没有 `CAP_SYS_ADMIN`，测试开头两边都先去掉它，所以要特权的成功路径（`GET_FILTER`、写 `actions_logged`、`SUSPEND_SECCOMP`）没有比对。快速路径、ADDFD、改用 PTRACE_SYSCALL 和 strace 这几节是审查时补的：原来过滤的都是本来就持 BKL 的系统调用，快速路径漏看 `seccomp_on` 时过滤器被绕过也查不出。要写 core 的几处（只剩一个线程时的 KILL_THREAD、SIGSYS 被忽略时的 TRAP、进程的退出码、`Seccomp_filters` 跟着 fork）只用临时用例比对过，两层都与原生一致，没有放进差分测试（原生一侧写不写取决于宿主的 `core_pattern`，见[core dump](43-coredump.md)那一篇）。
+| | 原生：没有 / 6 条 / 46 条 | appine：没有 / 6 条 / 46 条 |
+|---|---|---|
+| clock_gettime（vDSO） | 20 / 19 / 19 纳秒 | 89 / 144 / 144 纳秒 |
+| getppid | 127 / 148 / 148 | 95 / 112 / 290 |
+| futex 唤醒（快速路径） | 159 / 180 / 181 | 59 / 123 / 307 |
+| fstatat（快速路径） | 585 / 615 / 626 | 885 / 1250 / 1390 |
+| pread | 226 / 246 / 248 | 427 / 440 / 630 |
 
-  单元测试新增程序的检查和执行。LTP：`scripts/ltp` 给测试看的内核配置加上 `CONFIG_SECCOMP`、`CONFIG_SECCOMP_FILTER`，原来因此跳过的 seccomp01 通过，prctl02 照常通过，这两个是 LTP 里仅有的看这两项配置的测试。
+装了过滤器之后，快速路径上的系统调用改走持 BKL 的路径：futex 唤醒慢一倍，fstatat 慢四成。vDSO 里读时钟虽然不检查，也一样进了持 BKL 的路径。解释器每条指令约 4.5 纳秒，而 libseccomp 生成的过滤器是一串线性比较，像 docker 默认规则那样放行几百个系统调用的，每次系统调用要运行几百条。
 
-**推迟项**：
+## 测试
+
+新的差分测试 `seccomp` 比对：报告可用动作和状态的接口，严格模式，程序的检查和一条链的容量，各种动作，快速路径上的系统调用被过滤、经由 vDSO 的 clock_gettime 不被过滤，继承和 TSYNC，ptrace（`PTRACE_EVENT_SECCOMP`、改编号和跳过、出口的停止），通知 fd 和 ADDFD，`strace -f --seccomp-bpf`。
+
+动作那一节把 `RLIMIT_CORE` 设成 1，两边都不写 core：`core_pattern` 是管道时（CI 的 Ubuntu 宿主上是 apport）Linux 不管限制是不是 0 都交给它，只有 1 不交，写文件时不到一页也不写。docker 里的 root 没有 `CAP_SYS_ADMIN`，测试开头两边都先去掉它，所以要特权的成功路径（`GET_FILTER`、写 `actions_logged`、`SUSPEND_SECCOMP`）没有比对。快速路径、ADDFD、改用 PTRACE_SYSCALL 和 strace 这几节是审查时补的：原来过滤的都是本来就持 BKL 的系统调用，快速路径漏看 `seccomp_on` 时过滤器被绕过也查不出。要写 core 的几处（只剩一个线程时的 KILL_THREAD、SIGSYS 被忽略时的 TRAP、进程的退出码、`Seccomp_filters` 跟着 fork）只用临时用例比对过，两层都与原生一致，没有放进差分测试（原生一侧写不写取决于宿主的 `core_pattern`，见[core dump](43-coredump.md)那一篇）。
+
+单元测试新增程序的检查和执行。LTP：`scripts/ltp` 给测试看的内核配置加上 `CONFIG_SECCOMP`、`CONFIG_SECCOMP_FILTER`，原来因此跳过的 seccomp01 通过，prctl02 照常通过，这两个是 LTP 里仅有的看这两项配置的测试。
+
+## 推迟项
 
 - 记一笔只写 appine 的调试日志，没有 audit。
 - 没有 Linux 的按编号缓存（`seccomp_cache`：算出某个编号总是 ALLOW 时不再运行程序），每次系统调用都运行整条链。→ 已补上（M9 之前：seccomp 的缓存和快速路径）

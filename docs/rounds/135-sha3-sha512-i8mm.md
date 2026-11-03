@@ -19,7 +19,7 @@
   - SHA3-256：`hashlib.sha3_256` 原生 669–692 MB/s，关不关 SHA3 都一样，appine 里新旧都是 418–425 MB/s：这台机器上 OpenSSL 的 Keccak 不走 SHA3 指令（它只在认为划算的 CPU 上用）。
   - I8MM：[上一轮](133-asimddp.md)的 `vpxenc`（`VPX_SIMD_CAPS_MASK` 0x3 是 NEON 加点积，0x7 再加 I8MM）。原生 0x3 1.49–1.59s、0x7 1.49–1.55s，appine 里新旧二进制交替（ABBA）都是 3.5s 左右：VP9 编码在这个配置下几乎不走 I8MM 的路径，原生上也没有收益。
 
-**推迟项**：
+## 推迟项
 
 - 宿主只有 SHA3、SHA512 中的一个（或者没有 SHA2）时两个都不宣告。
 - BF16、FP16、RDM、FHM、FCMA、JSCVT 这些仍不宣告；SVE 和 HWCAP2 里别的位仍是 0。→ FP16、JSCVT 已补上（M9 之前：FP16 和 JSCVT）；BF16、RDM、FHM、FCMA 已补上（M9 之前：RDM、FCMA、FHM 和 BF16），HWCAP2 有了 BF16；HWCAP2 的 DCPODP、FLAGM2、FRINT 也补上了（M9 之前：FRINTTS、FlagM、SB 和 DPB）；SVE 和 HWCAP2 里别的位仍是 0

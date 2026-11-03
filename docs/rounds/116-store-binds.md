@@ -4,6 +4,8 @@ Codex、Claude Code 的沙箱用 bubblewrap 建，在 appine 里第一步就失�
 
 这一轮是[mount 的子集](105-mount-subset.md)说的第二档：仓库的节点也带上挂载，仓库里的目录、文件可以 bind，挂载的标志对仓库生效，再加上 bwrap 要的 `MS_MOVE`（它不用，顺手）和 pivot_root。
 
+## 做法
+
 - **仓库节点带着挂载**（`core/kernel/src/vfs/mod.rs`）：`Node::Store(挂载编号, inode)`，与 `Node::Pseudo` 一样相当于 Linux 的 `struct path`。同一个目录 bind 到两处是两个节点，`..`、getcwd、`/proc/<pid>/{cwd,root,fd}` 经由各自的挂载点回去；挂载的根没有上级（`parent_in_fs`），bind 挂载里看不到被 bind 的目录外面。
   - 根文件系统也进了挂载表（编号 1，原来单独处理），挂载点改成可选的：挂载树的根没有，Linux 上它挂在看不到的 rootfs 上，所以 mountinfo 里它的上级写 0（原来写它自己的 1）。pivot_root 可以换掉挂载树的根，原来的根挂到别处、卸下都照常。
   - 卸下（`MNT_DETACH`）的挂载原来直接从表里去掉，`..` 和设备号按文件系统算：bind 进来的合成目录卸下之后 `..` 能走到被 bind 的目录外面。现在卸下的挂载留一份记录，里面的节点照常能用、挂载的根没有上级，umount 之后丢掉没有进程的根目录、当前目录、打开文件在里面的。挂载可以被 `MS_MOVE`、pivot_root 挪到比它后挂上的挂载里，找挂在里面的挂载改成一层层找。
@@ -20,11 +22,13 @@ Codex、Claude Code 的沙箱用 bubblewrap 建，在 appine 里第一步就失�
   - 重新挂载根文件系统原来只接受访问时间的标志（别的是 EOPNOTSUPP），现在与别的挂载一样记在挂载上。
 - **`MS_MOVE`**：源要是挂在树上的挂载的根，目录和非目录不配是 EINVAL，目标在源里面是 ELOOP（挪挂载树的根也是：Linux 上它挂在 rootfs 上，目标总在它里面），连同挂在里面的一起挪。原来是 EOPNOTSUPP。
 - **pivot_root(2)**（原来是 ENOSYS）：照 Linux 6.1 的 `pivot_root`：先要 `CAP_SYS_ADMIN`；两个路径都要是目录；`put_old` 上挂着东西时挂在最上面的那个上；已经删除的目录是 ENOENT；`new_root`、`put_old` 在根目录所在的挂载里是 EBUSY；根目录、`new_root` 要是挂载的根，`put_old` 要在 `new_root` 下面，`new_root` 要在根目录下面，否则 EINVAL。然后 `new_root` 的挂载换到根目录所在的挂载的位置，原来的根挂到 `put_old` 上，根目录、当前目录是原来的根的进程都换过去（`chroot_fs_refs`）。bwrap 用的 `pivot_root(".", ".")` 加 `umount2(".", MNT_DETACH)` 也照 Linux：原来的根叠在新根上，umount 的路径最后要跟进挂在上面的（`LOOKUP_MOUNTPOINT`），mount 的挂载点也是（`lock_mount`），原来这两处对 `.`、当前目录这类不经过查找的路径不跟。
-- **测试**：
-  - 单元测试新增 `binds_store_directories`：bind 目录和文件之后的 `..` 和路径、chroot 进挂载里、只读按经由的挂载算、`MS_MOVE`、卸下之后的记录。
-  - 新的差分测试组 `bind`：bind 目录和文件、`--rbind`、`umount -l`，EXDEV 和 EBUSY，只读、noexec、nosuid、nodev、nosymfollow 下的各种操作，`MS_MOVE` 和 pivot_root 的错误，以及照 bwrap 那样 pivot_root 进 bind 的目录之后的 mountinfo，两个执行层下都与原生相同。原生一侧的根文件系统是 overlay，只比挂载点、看到的目录和选项。
 
-**推迟项**：
+## 测试
+
+- 单元测试新增 `binds_store_directories`：bind 目录和文件之后的 `..` 和路径、chroot 进挂载里、只读按经由的挂载算、`MS_MOVE`、卸下之后的记录。
+- 新的差分测试组 `bind`：bind 目录和文件、`--rbind`、`umount -l`，EXDEV 和 EBUSY，只读、noexec、nosuid、nodev、nosymfollow 下的各种操作，`MS_MOVE` 和 pivot_root 的错误，以及照 bwrap 那样 pivot_root 进 bind 的目录之后的 mountinfo，两个执行层下都与原生相同。原生一侧的根文件系统是 overlay，只比挂载点、看到的目录和选项。
+
+## 推迟项
 
 - 没有 tmpfs（下一轮）。→ 已补上（M9 之前：tmpfs）
 - 没有挂载命名空间（§6），pivot_root、`umount -l` 原来的根这些都作用于所有进程看到的同一张挂载表。 → 已补上（M9 之前：挂载命名空间）

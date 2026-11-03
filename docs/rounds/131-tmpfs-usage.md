@@ -17,7 +17,7 @@ Linux 的 tmpfs 在内存里，按页记用量（`shmem_inode_acct_block`），�
 - 单元测试 `tmpfs_counts_pages_and_inodes`：数用量、放不放得下、记账、重新挂载。
 - 第一版用例每一步之后都调 statfs，它把记下的用量纠正过来了，删除不记账查不出来（变异检验发现的），所以补了"删掉之后不经过 statfs 直接新建、写"。
 
-**推迟项**：
+## 推迟项
 
 - 页数按文件大小算，当作没有空洞：`truncate -s` 把文件加长、`lseek` 跳过一段再写，在 Linux 上不占空出来的那些页，这里都算用掉了，之后可能比 Linux 先 ENOSPC。`FALLOC_FL_KEEP_SIZE` 的预留不改大小，Linux 算页，这里不算。
 - 删掉最后一个名字时就释放它的页和 inode；Linux 上还开着的文件要等最后一次关掉才释放。

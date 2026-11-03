@@ -73,7 +73,7 @@ App 被杀的情形（`kill`：只结束负载，不丢写）原来就不坏。
 - 仪器测试（Pixel 4a、API 34 的模拟器）：卸载之后跑 `busyboxRunsUnderBothTiers`，全新导入 Alpine（走新的 `Native.syncRootfs`）之后通过。
 - Android 上 libc crate 没有 `sync_file_range` 的绑定和 `SYNC_FILE_RANGE_WRITE`，改成按编号调用、常量放在 hal 里。
 
-**推迟项**：
+## 推迟项
 
 - 只在虚拟机的 ext4 上模拟过。很多手机的 `/data` 是 f2fs：f2fs 没有 auto_da_alloc，原生程序在 f2fs 上改名覆盖、断电之后也可能是空的；appine 刷的是 fdatasync、syncfs，在 f2fs 上照样起作用。虚拟机里没有 mkfs.f2fs，没试。
 - 手机上刷一次要几毫秒到几十毫秒：新建文件就 fsync 的负载（dpkg、apt）大约是原生的两倍；改名覆盖的刷新持着 BKL，apk 升级大的包时别的进程跟着等。都没在真机上量（R1）。

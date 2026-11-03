@@ -54,7 +54,7 @@
   - podman 的 `-p` 那一节有一次"经由外层地址"是 Connection refused：服务端是 `nc -l` 的循环，appine 里起进程慢，紧接着的第二个连接可能赶在 nc 重新起来之前。
 - 差分测试的仓库加装了 `iptables`、`nftables`（`scripts/difftest` 的软件包列表），镜像要用 `-r` 重新导出。
 
-**推迟项**：
+## 推迟项
 
 - 只执行 OUTPUT 钩子上的 nat 链。别的钩子上的链只记下、能列出来，不执行：
   - PREROUTING 的 DNAT：从宿主外面连进来的端口转发，第 4 步。 → 从别的命名空间进来的执行 PREROUTING，从 appine 外面进来的由宿主上的线程转发（M9 之前：发布的端口）

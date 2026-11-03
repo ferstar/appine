@@ -30,7 +30,7 @@
 - LTP 新通过 clone303（clone3 的 `CLONE_INTO_CGROUP`，原来是 CONF）。
 - 在 appine 里实际跑：`docker run` 建好了 `/sys/fs/cgroup/docker/<容器>`、写过了 `oom_score_adj`，下一步停在 runc 给 cgroup 挂设备过滤的 eBPF 程序（`bpf_prog_query(BPF_CGROUP_DEVICE)` 是 ENOSYS）。
 
-**推迟项**：
+## 推迟项
 
 - 限制不起作用（`pids.max`、`memory.max`、`memory.high`、`cpu.max`、`cpuset.cpus` 这些只记下），`cgroup.freeze` 写 1 是 EOPNOTSUPP：下一步（普查的问题 9 的第二步）。子 cgroup 的 `memory.events`、`pids.events` 总是 0，`memory.peak` 就是当时的驻留内存。→ `pids.max`、`memory.max` 起作用了，事件和峰值也有了（M9 之前：cgroup 的 pids.max 和 memory.max 起作用）；`cgroup.freeze` 也有了（M9 之前：cgroup.freeze）；`memory.high`、`cpu.max`、`cpuset.cpus` 这些仍只记下
 - 没有 threaded cgroup（`cgroup.type` 写 `threaded` 是 EOPNOTSUPP），线程总在进程所在的 cgroup 里。

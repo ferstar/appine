@@ -2,6 +2,8 @@
 
 把推迟项里程序会直接碰到的接口缺口补上一轮：
 
+## 做法
+
 - **`/proc/<pid>/maps`**：所有文件映射（程序、解释器、mmap 的库和文件）都显示路径、文件偏移、设备号和 inode，与 stat 一致。原来只有程序和解释器有名字，vDSO 那一行还被错标成解释器。
 - **brk 和 VMA**：堆第一次扩展时预留 256 MB 的宿主地址空间（`MAP_NORESERVE`，不碰不占内存），之后的扩展只是加长同一个 VMA；收缩后再扩展的页清零，fork 出来的子进程照样预留。maps 里相邻、权限相同的匿名映射（以及同一个文件里接着的部分）与 Linux 一样合成一段：每次匿名 mmap 都是单独的宿主内存，VMA 本身合不起来。python 跑一会儿，maps 从 276 行变成 40 行左右。
 - **实时信号排队**：挂起的信号从位图换成 Linux 的 `sigpending` 结构，标准信号同一种只挂一个，实时信号每次产生都排队，按先后投递，各带各的 siginfo。一个线程组最多排 `RLIMIT_SIGPENDING` 个（默认 16384，与 4 GB 内存的 Linux 相同）；排满时 sigqueue 返回 EAGAIN，kill 照样挂起但丢掉 siginfo。`/proc/<pid>/status` 的 SigQ 是真实的数字。
@@ -21,7 +23,7 @@
 - LTP 的 sigtimedwait01、sigwaitinfo01 超时不是 appine 的问题：第一项测试等的是"空集合被信号打断返回 EINTR"，而 musl 的 `sigtimedwait` 遇到 EINTR 会自己重试，在原生 Alpine 上一样卡住；直接发 syscall 的 rt_sigtimedwait01 是通过的。
 - 测试：差分测试新增 `compat`（以上各项，只比较与环境无关的列），在两个执行层下都和原生一致。原生一侧的容器改为不加 seccomp 过滤：Docker 默认的规则让 clone3 返回 ENOSYS、pidfd_getfd 返回 EPERM，比对的应当是内核本身的行为。内核版本相关的部分（6.9 起 pidfd 的几处变化）只测各版本相同的。单元测试新增堆的扩展、maps 的合并和信号的排队。LTP 新通过 execveat01/02、pidfd 的 8 个、kcmp01–03、fcntl35、ioctl01、ioctl07、madvise02、pwritev202 和 splice06；getrusage03 由跳过变成失败（上次虚拟机内存不足没有运行），暴露出 `ru_maxrss` 总是 0。
 
-**推迟项**：
+## 推迟项
 
 - pidfd：`PIDFD_THREAD`、`/proc/sys/kernel/ns_last_pid`（pidfd_send_signal03 要用它让新进程拿到同一个 pid）。→ `ns_last_pid` 已补上（M9 之前：推迟项）；`PIDFD_THREAD` 是 6.9 的功能，appine 报告的是 6.1，不做
 - 不产生 core dump，`WCOREDUMP` 总是 0（waitid10）。→ 已补上（M9 之前：core dump）

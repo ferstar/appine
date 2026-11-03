@@ -22,7 +22,7 @@ cgroup v2 没有 v1 的 `devices.allow`：runc、crun 给每个容器的 cgroup 
 - LTP 的 bpf_map01、bpf_prog01–04 由 CONF 变成 FAIL（TBROK）：原来 bpf 是 ENOSYS，LTP 当作不支持；现在有了 bpf，它们要的 map 和 socket 过滤程序是 EINVAL（见推迟项）。
 - 在 appine 里实际跑：`docker run --network host` 和不加 `--cgroups disabled` 的 podman（`cgroup_manager = "cgroupfs"`）都起得来，容器里的内存、任务数上限起作用，`pause`、`unpause` 成功。
 
-**推迟项**：
+## 推迟项
 
 - 只有设备程序这一种：没有 map、pin 到 bpffs、link（`BPF_LINK_CREATE`）。crun 用 systemd 管 cgroup 时要把程序 pin 到 `/sys/fs/bpf`，这里只能用 cgroupfs；要 map 的程序（cilium、bpftrace 这些）都用不了。
 - 校验器比 Linux 的保守：不分路径（汇合处类型不同就当作没有初始化），没有有界循环（5.3 起）、BPF 之间的调用、原子操作、把指针存进栈、变量偏移的栈指针。Linux 接受的这类程序这里会被拒绝；runc、crun 生成的用不到。校验器的日志只在拒绝时写一行原因，措辞不全与 Linux 相同，成功时不写。

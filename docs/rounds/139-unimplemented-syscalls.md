@@ -4,7 +4,7 @@
 
 已经记过的不再列：io_uring（[推迟项](19-deferred.md)、§15），rseq、mbind、landlock、fchmodat2（[glibc 发行版的探测](69-glibc-probe.md)），get_mempolicy（[负载普查](62-workload-survey.md)），fanotify（[M6](08-m6.md)、[M8 补测](11-m8-jvm.md)），新的挂载接口（[mount 的子集](105-mount-subset.md)、§8.2）。arm64 上本来就没有的编号也不算：244–259 是留给各个架构的，295–402 没有分配，403–423 只给 32 位。
 
-## 怎么核对的
+## 做法
 
 - Linux 6.1 的 `kernel/sys_ni.c` 里列为 `COND_SYSCALL` 的，要配了对应的选项才编进内核，没配时 Linux 也返回 ENOSYS。下面按这一点分成两组。
 - 写了一个程序逐个调用（参数都不改状态：只读的 adjtimex、对 pid 1 的 ioprio_get、`SYSLOG_ACTION_SIZE_BUFFER`、fd 无效的 process_madvise 等），在 appine 和原生（colima 的 6.8 内核，Alpine 容器，带和不带 docker 默认的 seccomp 各一次）里各跑一遍。appine 里全是 ENOSYS。
@@ -15,7 +15,9 @@
 - 历次普查（第 62、69、70、92、103 轮）报告的未实现的系统调用里没有这些编号。
 - 原生容器带着 docker 默认的 seccomp 时，keyctl、bpf、perf_event_open、userfaultfd、acct、process_madvise 这些也都失败（EPERM），在容器里跑的程序本来就会碰到这些调用失败。
 
-## 与 Linux 6.1 不一样的
+## 结果
+
+### 与 Linux 6.1 不一样的
 
 Linux 6.1 上一般都有，appine 是 ENOSYS：
 
@@ -28,7 +30,7 @@ Linux 6.1 上一般都有，appine 是 ENOSYS：
 | 440 | process_madvise | 有 MMU、`CONFIG_ADVISE_SYSCALLS`（默认开）就有 | fd 无效时 EBADF |
 | 448 | process_mrelease | 有 MMU 就有 | fd 无效时 EBADF |
 
-## 与没配对应功能的 Linux 6.1 一样的
+### 与没配对应功能的 Linux 6.1 一样的
 
 这些属于宿主内核的事，或者 appine 里没有对应的东西，返回 ENOSYS 与没配这些选项的 Linux 相同：
 
@@ -50,7 +52,7 @@ Linux 6.1 上一般都有，appine 是 ENOSYS：
 
 452 起的编号都是 6.1 之后才有的，ENOSYS 与 appine 报告的 6.1 一致（fchmodat2 以前记过）。6.5 的 cachestat（451）是例外，已经实现了（§7.5）。
 
-**推迟项**：
+## 推迟项
 
 - openat2：`RESOLVE_*` 的几种限制（不越出起点、把起点当作根、不跟随符号链接、不跨挂载、不跟随魔法链接）要在路径解析里加上。→ 已补上（M9 之前：openat2），`RESOLVE_CACHED` 照常解析（与 gVisor 一样），没有照下面说的总回 EAGAIN
   - 2026-10-31 读源码查了谁在用（第 143 轮之后）：Go（含 1.24 起的 `os.Root`）、Rust std、musl、CPython、libuv、git、coreutils、dpkg、apk-tools 都不调；glibc 2.43 才有包装函数。调用的有 systemd v261 起的 `chase()`、filepath-securejoin（runc、containerd、podman）、libpathrs、crun、bubblewrap 0.12 起、cap-std 和 wasmtime 的 WASI、Bun、Nix 2.33 起、util-linux 2.42.2 起、rsync 3.4.3–3.4.4，几乎都在 ENOSYS 时退回逐级打开（rsync 3.4.3–3.4.4 的退路不认 `..`）。硬失败的是 GNU tar 的 git 版本（2025-11 的 75b03fdf 起，Fedora 44 的 tar 1.35-9 已带）配 glibc ≥ 2.43：`src/misc.c` 的 `open_subdir` 直接 `openat2(…, RESOLVE_BENEATH)`，gnulib 的替代只在 libc 没有它时编进去，解包带子目录的归档全部失败。现在 App 里的三个发行版（Alpine、Debian 13、Ubuntu 24.04）不受影响，换到 glibc 2.43 和新的 tar 之后会。
