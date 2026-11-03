@@ -11,20 +11,23 @@ plugins {
     id("com.android.application")
 }
 
-/** 仓库根目录：Cargo 工作区和 `scripts/fetch-rootfs` 下载的 rootfs 都在这里。 */
+/** Repository root: the Cargo workspace and the rootfs from `scripts/fetch-rootfs` are here. */
 val repoRoot: Directory = rootProject.layout.projectDirectory.dir("..")
 
-/** Alpine minirootfs：`scripts/fetch-rootfs` 下载并校验过的 tarball。 */
+/** Alpine minirootfs: the tarball `scripts/fetch-rootfs` downloaded and verified. */
 val rootfsTarball: File? = repoRoot.dir("target/rootfs").asFile
     .listFiles { f -> f.name.matches(Regex("alpine-minirootfs-.*-aarch64\\.tar\\.gz")) }
     ?.maxByOrNull { it.name }
 
-/** App 带着的 doas 包（`scripts/fetch-rootfs` 下载的），普通用户第一次成为登录账号时离线装上。 */
+/**
+ * The doas package bundled with the app (downloaded by `scripts/fetch-rootfs`), installed offline
+ * when a regular user first becomes the login account.
+ */
 val doasPackage: File? = repoRoot.dir("target/rootfs").asFile
     .listFiles { f -> f.name.matches(Regex("doas-.*\\.apk")) }
     ?.maxByOrNull { it.name }
 
-/** 例如 3.24.3 → v3.24，写进 apk 的仓库地址。 */
+/** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
     ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
     ?.let { "v${it.groupValues[1]}.${it.groupValues[2]}" }
@@ -52,7 +55,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            // 只在本地安装：用调试密钥签名
+            // Installed locally only: signed with the debug key
             signingConfig = signingConfigs.getByName("debug")
         }
     }
@@ -63,16 +66,18 @@ android {
     }
 
     packaging {
-        // 原生库不压缩、按页对齐地放在 APK 里，直接从 APK 映射（16K 页设备也一样）
+        // Native libraries are stored uncompressed and page-aligned in the APK and mapped directly
+        // from it (also on 16K-page devices)
         jniLibs.useLegacyPackaging = false
     }
 }
 
 /**
- * 用 cargo-ndk 构建 libappine.so（hosts/android）。Rust 部分总是 release 构建：调试构建的解释器太慢。
- * debug 版 App 打开 `test-hooks` 特性，instrumentation 测试用测试钩子在 App 进程里模拟内核层和
- * 引擎的 bug（只在设置了 `APPINE_TEST_HOOKS=1` 时生效）；也打开 `borrow-check`，放开 BKL 时检查
- * 没有借着内核对象。
+ * Builds libappine.so (hosts/android) with cargo-ndk. The Rust part is always a release build: the
+ * interpreter of a debug build is too slow. The debug app turns on the `test-hooks` feature, so
+ * instrumentation tests use the test hooks to simulate kernel-layer and engine bugs in the app
+ * process (effective only when `APPINE_TEST_HOOKS=1` is set); it also turns on `borrow-check`,
+ * which checks that no kernel object is borrowed when the BKL is released.
  */
 abstract class CargoNdkTask : DefaultTask() {
     @get:Internal
@@ -91,7 +96,7 @@ abstract class CargoNdkTask : DefaultTask() {
     abstract val exec: ExecOperations
 
     init {
-        // cargo 自己做增量构建
+        // cargo does its own incremental builds
         outputs.upToDateWhen { false }
     }
 
@@ -109,8 +114,9 @@ abstract class CargoNdkTask : DefaultTask() {
                 "build", "--release", "-p", "appine-android",
             )
             if (features.get().isNotEmpty()) args("--features", features.get().joinToString(","))
-            // 两个都设：只设一个时，环境里另一个指向别的 NDK（GitHub 的 runner 预设了
-            // ANDROID_NDK_ROOT）cargo-ndk 会警告，用哪个取决于它的优先顺序
+            // Set both: with only one set, when the other one in the environment points at another
+            // NDK (GitHub's runners preset ANDROID_NDK_ROOT), cargo-ndk warns, and which one it
+            // uses depends on its order of precedence
             environment("ANDROID_NDK_HOME", ndkDirectory.get())
             environment("ANDROID_NDK_ROOT", ndkDirectory.get())
             environment("CARGO_TARGET_DIR", File(root, "target/android").path)
@@ -118,7 +124,10 @@ abstract class CargoNdkTask : DefaultTask() {
     }
 }
 
-/** 把 rootfs tarball 放进 assets（首次启动时导入，android/setup 的 map），doas 包也是（登录账号用）。 */
+/**
+ * Puts the rootfs tarball into the assets (imported on first start, the android/setup map), and the
+ * doas package too (for the login account).
+ */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
     @get:Optional
@@ -146,12 +155,15 @@ abstract class RootfsAssetTask : DefaultTask() {
 }
 
 /**
- * 生成设置里"开源许可"页的内容（设计文档 §13.4），放在 assets 的 `notices/`：`index.tsv` 每行是
- * "标题<TAB>说明<TAB>文件名"，各个文件是纯文本。依次是 appine 自己（AGPL）、vendored 的 Termux
- * 终端库、APK 里的 Alpine minirootfs 的各个包、Android 库、链接进 libappine.so 的 Rust crate（各自
- * 发布的许可证文件原样附上）、SQLite，最后是几份许可证全文（`android/licenses/`）。
+ * Generates the content of the "Open source licenses" page in Settings (design doc §13.4) under
+ * `notices/` in the assets: each line of `index.tsv` is "title<TAB>description<TAB>file name", and
+ * the files are plain text. In order: appine itself (AGPL), the vendored Termux terminal libraries,
+ * the packages of the Alpine minirootfs in the APK, the Android libraries, the Rust crates linked
+ * into libappine.so (with the license files each one publishes attached as they are), SQLite, and
+ * last a few full license texts (`android/licenses/`).
  *
- * 新加的 Android 库不在下面认识的组里时构建失败：先确认它的许可证与 AGPL-3.0 兼容，再加进来。
+ * The build fails when a newly added Android library is not in one of the groups recognised below:
+ * first confirm its license is compatible with AGPL-3.0, then add it.
  */
 abstract class NoticesTask : DefaultTask() {
     @get:InputFile
@@ -171,7 +183,7 @@ abstract class NoticesTask : DefaultTask() {
     @get:InputFile
     abstract val cargoLock: RegularFileProperty
 
-    /** APK 里的 Android 库，`组:名字:版本`。 */
+    /** Android libraries in the APK, `group:name:version`. */
     @get:Input
     abstract val androidLibraries: ListProperty<String>
 
@@ -254,7 +266,10 @@ abstract class NoticesTask : DefaultTask() {
         File(out, "index.tsv").writeText(index.toString())
     }
 
-    /** APK 里的 Alpine minirootfs：标题、说明、正文（各个包的版本、许可证、aports 的提交）。 */
+    /**
+     * The Alpine minirootfs in the APK: title, description, body (each package's version, license,
+     * aports commit).
+     */
     private fun alpine(): Triple<String, String, String>? {
         val file = tarball.orNull?.asFile ?: return null
         val version = Regex("""alpine-minirootfs-([0-9.]+)-""").find(file.name)?.groupValues?.get(1) ?: "?"
@@ -287,7 +302,8 @@ abstract class NoticesTask : DefaultTask() {
         )
         for ((p, v, l, o, c) in rows) body.append("$p $v\n    License: $l\n    aports: main/$o at $c\n")
         doas.orNull?.asFile?.let { apk ->
-            // .PKGINFO 在包的第二段（签名、控制信息、数据三段 gzip 接在一起）
+            // .PKGINFO is in the package's second part (three gzip parts concatenated: signature,
+            // control information, data)
             val info = tarEntry(apk, ".PKGINFO").orEmpty().lines()
                 .mapNotNull { it.split(" = ", limit = 2).takeIf { kv -> kv.size == 2 } }
                 .associate { (k, v) -> k to v }
@@ -304,7 +320,7 @@ abstract class NoticesTask : DefaultTask() {
         return Triple("Alpine Linux $version minirootfs", "${rows.size} packages: ${licenses.joinToString(", ")}", body.toString())
     }
 
-    /** 从 tar.gz 里读出 [path] 的内容（ustar；GNU 的长文件名、pax 头跳过）。 */
+    /** Reads [path] from a tar.gz (ustar; GNU long names and pax headers are skipped). */
     private fun tarEntry(file: File, path: String): String? {
         GZIPInputStream(file.inputStream().buffered()).use { input ->
             val header = ByteArray(512)
@@ -323,8 +339,9 @@ abstract class NoticesTask : DefaultTask() {
     }
 
     /**
-     * 链接进 libappine.so 的 crate：从 appine-android 出发，只走普通依赖（不含构建、测试用的），
-     * 过程宏（thiserror-impl 这些）和只有它们用到的（syn、quote……）编译时运行，不在库里，不算。
+     * Crates linked into libappine.so: starting from appine-android, following only normal
+     * dependencies (not build or test ones); proc macros (thiserror-impl and the like) and what
+     * only they use (syn, quote…) run at compile time, are not in the library and do not count.
      */
     @Suppress("UNCHECKED_CAST")
     private fun crates(): List<Map<String, Any?>> {
@@ -363,9 +380,10 @@ abstract class NoticesTask : DefaultTask() {
     }
 
     /**
-     * crate 发布时带的许可证文件。许可证里 MIT 是可选的一项时（`MIT OR Apache-2.0` 这类）只附 MIT
-     * 的和不分许可证的（`AND` 的那一项，比如 Unicode），别的可选项（Apache、Zlib、0BSD、Unlicense）
-     * 不附：appine 按 MIT 使用它们。
+     * The license files a crate publishes. When MIT is one of the alternatives in the license
+     * (`MIT OR Apache-2.0` and the like), only the MIT one and the ones not tied to a license (the
+     * `AND` term, Unicode for example) are attached, and the other alternatives (Apache, Zlib,
+     * 0BSD, Unlicense) are not: appine uses these crates under MIT.
      */
     private fun licenseFiles(dir: File, expr: String): List<File> {
         val all = dir.listFiles().orEmpty()
@@ -384,8 +402,9 @@ abstract class NoticesTask : DefaultTask() {
         const val SOURCE = "https://github.com/mthli/appine"
 
         /**
-         * 把自己写的段落按 [width] 列折行，与许可证原文的排法一样（页面上保持原来的换行，放不下时
-         * 横向滚动）。有缩进的段落（列表、引文）不动。
+         * Wraps our own paragraphs at [width] columns, the way the license texts are laid out (the
+         * page keeps the original line breaks and scrolls sideways when they do not fit). Indented
+         * paragraphs (lists, quotations) are left alone.
          */
         fun wrap(text: String, width: Int = 72): String = text.split("\n\n").joinToString("\n\n") { para ->
             val lines = para.lines()
@@ -436,7 +455,7 @@ abstract class NoticesTask : DefaultTask() {
                May you share freely, never taking more than you give.
         """.trimIndent()
 
-        /** 这些组的库都是 Apache-2.0。 */
+        /** The libraries of these groups are all Apache-2.0. */
         val APACHE_GROUPS = listOf(
             "androidx.",
             "org.jetbrains.kotlin:",
@@ -473,7 +492,8 @@ androidComponents {
             doasPackage?.let { doas.set(it) }
             cargoLock.set(repoRoot.file("Cargo.lock"))
             workspace.set(repoRoot)
-            // 依赖图里的模块（不含 terminal-view 这些工程内的模块），只解析图、不下载
+            // Modules in the dependency graph (not in-project modules such as terminal-view),
+            // resolving only the graph without downloading
             androidLibraries.set(
                 variant.runtimeConfiguration.incoming.resolutionResult.rootComponent.map { top ->
                     val seen = mutableSetOf<ResolvedComponentResult>()

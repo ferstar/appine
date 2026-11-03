@@ -1,15 +1,19 @@
-//! appine 的 Android 原生库（设计文档 §3、android/native 的 map）：Kotlin 外壳经由 JNI 使用内核层。
+//! appine's Android native library (design doc §3, the android/native map): the Kotlin shell uses
+//! the kernel layer through JNI.
 //!
-//! 对应的 Kotlin 声明是 `android/app/src/main/java/io/github/mthli/appine/Native.kt`。
-//! [`Machine`] 登记在一张表里，交给 Kotlin 的是编号（`long` 句柄）。每次调用临时取一个
-//! 引用，所以 `stop` 和别的线程上正在阻塞的读并发时也是安全的：最后一个引用消失时才析构。
-//! `stop` 把它从表里删掉，之后用这个句柄的调用（会话结束之后才清理的 `closeConsole` 等）
-//! 查不到它，当作控制台已经关闭。
-//! 出错时抛出 `java.io.IOException`。阻塞的调用（读控制台、等进程结束）由 Kotlin 在
-//! 后台线程上进行。内核层的 bug（panic）在 [`Machine`] 的方法里就兜住了，变成这些调用
-//! 的错误，不会穿过 JNI 边界让 App 进程 abort。
+//! The matching Kotlin declarations are in
+//! `android/app/src/main/java/io/github/mthli/appine/Native.kt`.
+//! [`Machine`]s are registered in a table, and Kotlin gets a number (a `long` handle). Each call
+//! takes a temporary reference, so `stop` is safe even concurrently with a read blocked on another
+//! thread: the Machine is dropped only when the last reference goes away. `stop` removes it from
+//! the table, and later calls with the handle (such as `closeConsole`, cleaned up only after the
+//! session ends) do not find it and treat the console as closed.
+//! Errors throw `java.io.IOException`. Blocking calls (reading a console, waiting for a process to
+//! end) are made by Kotlin on background threads. Kernel-layer bugs (panics) are caught inside the
+//! [`Machine`] methods and become errors of these calls; they do not cross the JNI boundary and
+//! abort the app process.
 //!
-//! 只为 Android 编译，其他宿主上是一个空库。
+//! Compiled only for Android; on other hosts it is an empty library.
 #![cfg(target_os = "android")]
 
 use std::collections::BTreeMap;
@@ -24,7 +28,7 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, jstring};
 
-/// 抛出 `java.io.IOException`；JNI 调用之后由 Kotlin 看到。
+/// Throws `java.io.IOException`; Kotlin sees it after the JNI call returns.
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
     let _ = env.throw_new("java/io/IOException", message.as_ref());
 }
@@ -43,7 +47,7 @@ fn strings(env: &mut JNIEnv<'_>, array: &JObjectArray<'_>) -> Option<Vec<Vec<u8>
     Some(out)
 }
 
-/// 句柄 → Machine（模块文档）。
+/// Handle → Machine (module docs).
 static MACHINES: Mutex<BTreeMap<jlong, Arc<Machine>>> = Mutex::new(BTreeMap::new());
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 
@@ -51,12 +55,12 @@ fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, Arc<Machine>>> {
     MACHINES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// 句柄对应的 Machine，调用期间持有一个引用；已经 stop 了是 None。
+/// The Machine of a handle, holding a reference for the duration of the call; None once stopped.
 fn machine(handle: jlong) -> Option<Arc<Machine>> {
     machines().get(&handle).cloned()
 }
 
-/// 把 stderr（内核层的日志、内部错误）转到 logcat。
+/// Sends stderr (kernel-layer logs, internal errors) to logcat.
 fn redirect_stderr() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -93,7 +97,8 @@ fn redirect_stderr() {
     });
 }
 
-/// 第一次调用别的函数之前调用：stderr 转到 logcat，`verbose` 时打开内核层的调试日志。
+/// Called before any other function: stderr goes to logcat, and with `verbose` the kernel layer's
+/// debug log is turned on.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_init<'l>(
     _: JNIEnv<'l>,
@@ -102,7 +107,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_init<'l>(
 ) {
     redirect_stderr();
     if verbose != 0 {
-        // SAFETY: 在用到内核层之前设置，这时还没有别的线程读环境变量
+        // SAFETY: set before the kernel layer is used; no other thread reads the environment yet
         unsafe { std::env::set_var("APPINE_LOG", "1") };
     }
 }
@@ -123,7 +128,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_importRootfs<'l>(
     }
 }
 
-/// 把仓库写到盘上（导入、写好配置之后，改名就位之前）。
+/// Writes the store to disk (after an import and writing the configuration, before renaming it into
+/// place).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_syncRootfs<'l>(
     mut env: JNIEnv<'l>,
@@ -160,8 +166,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
     }
 }
 
-/// 读仓库里的一个普通文件（宿主看配置文件用，比如设置里列出账号）：不存在时返回 null，别的
-/// 错误抛出 IOException。内核运行着也可以读：另外打开仓库时，内核推迟的写事务先提交。
+/// Reads a regular file in the store (for the host to look at configuration files, such as listing
+/// accounts in Settings): returns null when it does not exist and throws IOException for other
+/// errors. Also works while the kernel runs: when the store is opened separately, the kernel's
+/// deferred write transaction commits first.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
     mut env: JNIEnv<'l>,
@@ -185,12 +193,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
     }
 }
 
-// ---- 宿主浏览仓库（DocumentsProvider，android/documents 的 map）----
+// ---- The host browsing the store (DocumentsProvider, the android/documents map) ----
 //
-// 路径在 Java 一侧是字符串（文档 ID）：guest 的文件名是任意字节，合法 UTF-8 的部分照原样，
-// `%`、控制字符（列表的每一行用制表符分隔）和不是 UTF-8 的字节写成 `%XX`，能原样换回来。
-// 每一项是 `<类型 d|f>\t<字节数>\t<修改时间（毫秒）>\t<权限位>`，列表、搜索的结果前面再加
-// 名字或路径和一个制表符。出错时抛出 FileNotFoundException（IOException 的子类）。
+// On the Java side paths are strings (document IDs): guest file names are arbitrary bytes; the
+// valid UTF-8 parts stay as they are, while `%`, control characters (each line of a list is
+// separated by tabs) and bytes that are not UTF-8 are written as `%XX`, so they convert back
+// exactly.
+// Each entry is `<type d|f>\t<bytes>\t<modification time (ms)>\t<permission bits>`; list and search
+// results are also prefixed with the name or path and a tab. Errors throw FileNotFoundException (a
+// subclass of IOException).
 
 fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
     let kind = if st.is_dir() { 'd' } else { 'f' };
@@ -225,7 +236,7 @@ fn string_array(env: &mut JNIEnv<'_>, items: &[String]) -> jobjectArray {
     array.into_raw()
 }
 
-/// 路径（文档 ID）指向的目录或普通文件（符号链接跟随）。
+/// The directory or regular file a path (document ID) points at (following symbolic links).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseStat<'l>(
     mut env: JNIEnv<'l>,
@@ -251,7 +262,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseStat<'l>(
     }
 }
 
-/// 列出目录：每一项是 `<名字>\t<类型>\t…`，名字按 [`browse::encode_path`] 写。
+/// Lists a directory: each entry is `<name>\t<type>\t…`, with the name written by
+/// [`browse::encode_path`].
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseList<'l>(
     mut env: JNIEnv<'l>,
@@ -280,7 +292,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseList<'l>(
     }
 }
 
-/// 打开普通文件读，返回宿主的 fd（交给 ParcelFileDescriptor.adoptFd，由它关）。
+/// Opens a regular file for reading and returns the host fd (handed to
+/// ParcelFileDescriptor.adoptFd, which closes it).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpen<'l>(
     mut env: JNIEnv<'l>,
@@ -304,8 +317,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpen<'l>(
     }
 }
 
-/// 这些路径指向的普通文件看起来是不是文本（[`browse::looks_like_text`]），一次打开仓库查完。
-/// 只看前 1000 个，之后的都当作不是。
+/// Whether the regular files at these paths look like text ([`browse::looks_like_text`]), all
+/// checked with one opening of the store. Only the first 1000 are looked at; the rest count as not
+/// text.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseSniff<'l>(
     mut env: JNIEnv<'l>,
@@ -313,7 +327,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSniff<'l>(
     store: JString<'l>,
     paths: JObjectArray<'l>,
 ) -> jbooleanArray {
-    /// 一次最多看多少个文件：每个要在宿主上打开、读 4 KB，大目录里不能一直看下去。
+    /// The most files looked at in one call: each has to be opened on the host and 4 KB read, so a
+    /// big directory cannot go on forever.
     const SNIFF_MAX: usize = 1000;
     let (Some(store), Some(paths)) = (string(&mut env, &store), strings(&mut env, &paths)) else {
         return std::ptr::null_mut();
@@ -344,7 +359,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSniff<'l>(
     array.into_raw()
 }
 
-/// 在目录下面按名字找（不分大小写）：每一项是 `<路径>\t<类型>\t…`。
+/// Searches by name under a directory (case-insensitive): each entry is `<path>\t<type>\t…`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
     mut env: JNIEnv<'l>,
@@ -385,11 +400,12 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
     }
 }
 
-// 修改：都限制在 `top`（登录账号的家目录）里面，按真实路径算（[`browse`] 的说明）。新的名字
-// 是用户给的，照 UTF-8 原样用，不解 `%XX`；返回的名字按 [`browse::encode_path`] 写。
+// Changes: all confined to `top` (the login account's home directory), judged by real path (see
+// [`browse`]). New names come from the user and are used as UTF-8 as they are, without decoding
+// `%XX`; returned names are written by [`browse::encode_path`].
 
-/// 在目录 [dir] 里新建文件或目录（[directory]），属主是 [uid]、[gid]；名字有了时换一个，
-/// 返回实际用的名字。
+/// Creates a file or directory ([directory]) in directory [dir], owned by [uid] and [gid]; when the
+/// name is taken another one is used, and the name actually used is returned.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
@@ -434,8 +450,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
     }
 }
 
-/// [browseOpenWrite] 交出去的文件关闭了：告诉运行中的内核它被写过（guest 里监视着的程序
-/// 收到 `IN_MODIFY`、`IN_CLOSE_WRITE`）。文件这期间不在了也不报错。
+/// A file handed out by [browseOpenWrite] was closed: tells the running kernel it was written
+/// (programs watching in the guest receive `IN_MODIFY` and `IN_CLOSE_WRITE`). No error if the file
+/// disappeared meanwhile.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseWritten<'l>(
     mut env: JNIEnv<'l>,
@@ -461,7 +478,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseWritten<'l>(
     });
 }
 
-/// 删除文件、符号链接或者整个目录树。
+/// Removes a file, a symbolic link or a whole directory tree.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
     mut env: JNIEnv<'l>,
@@ -490,7 +507,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
     }
 }
 
-/// 在同一个目录里改名（[name] 是新的名字），不覆盖。
+/// Renames within the same directory ([name] is the new name), without replacing.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseRename<'l>(
     mut env: JNIEnv<'l>,
@@ -529,7 +546,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRename<'l>(
     }
 }
 
-/// 移到另一个目录 [to]，名字不变，不覆盖。
+/// Moves to another directory [to], keeping the name, without replacing.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseMove<'l>(
     mut env: JNIEnv<'l>,
@@ -561,7 +578,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseMove<'l>(
     }
 }
 
-/// 打开普通文件读写（[truncate] 时先截断，[append] 时以 O_APPEND 打开），返回宿主的 fd。
+/// Opens a regular file for reading and writing (truncating first with [truncate], opening with
+/// O_APPEND with [append]) and returns the host fd.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
     mut env: JNIEnv<'l>,
@@ -599,7 +617,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
     }
 }
 
-/// 一次搜索最多看这么多项（目录项）：/usr 这样的大目录树里不会一直找下去。
+/// The most entries (directory entries) one search looks at: it does not search forever in a big
+/// tree like /usr.
 const SEARCH_BUDGET: usize = 50_000;
 
 #[unsafe(no_mangle)]
@@ -636,21 +655,22 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     }
 }
 
-/// 结束所有 guest 进程，从表里删掉句柄。
+/// Ends all guest processes and removes the handle from the table.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
 ) {
-    // 先删掉再结束：kill_all 要等，不能拿着表的锁
+    // Remove first, then kill: kill_all waits, so the table's lock must not be held
     let m = machines().remove(&handle);
     if let Some(m) = m {
         m.kill_all();
     }
 }
 
-/// 宿主内存紧张：丢掉可以重建的缓存（池里保留的翻译等），提交推迟的写事务。
+/// The host is short of memory: drop caches that can be rebuilt (translations kept in the pool and
+/// so on) and commit the deferred write transaction.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
     _: JNIEnv<'l>,
@@ -662,9 +682,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
     }
 }
 
-/// `Native.kt` 交来的一条路由：`<目标网段的十六进制>/<前缀长度> <网关的十六进制或者 -> <接口>`。
-/// 度量与 Linux 上同样的路由相同：IPv4 是 0，IPv6 的默认路由 1024（RA），别的 256（内核按
-/// 地址加的网段）。
+/// One route passed in from `Native.kt`:
+/// `<destination network in hex>/<prefix length> <gateway in hex or -> <interface>`. The metric is
+/// the same as for the same route on Linux: 0 for IPv4; for IPv6, 1024 for the default route (RA)
+/// and 256 for others (the networks the kernel adds for addresses).
 fn parse_route(line: &str) -> Option<HostRoute> {
     let hex = |s: &str| -> Option<Vec<u8>> {
         s.len()
@@ -703,8 +724,9 @@ fn parse_route(line: &str) -> Option<HostRoute> {
     })
 }
 
-/// 宿主的默认网络变了：guest 看到的路由表换成 `routes`（每一项见 [`parse_route`]），null 时
-/// 改回按接口的地址合成。
+/// The host's default network changed: the routing table the guest sees becomes `routes` (each
+/// entry as in [`parse_route`]); with null it goes back to being synthesised from the interfaces'
+/// addresses.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
     mut env: JNIEnv<'l>,
@@ -730,10 +752,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
     }
 }
 
-/// 取走内核层结束了的 guest 进程（内核 bug、引擎故障、OOM killer）：每一项是
-/// `<控制台或 -1>\t<pid>\t<进程名>\t<bug|oom>\t<a>\t<b>\t<c>`，bug 的 a 是报告、b 是内核日志的
-/// 最后几行（以 U+001E 分隔），oom 的 a 是 cgroup（App 的上限时是空的）、b 和 c 是用量和上限
-/// （字节）。各项里的换行、制表符、U+001E 换成空格。
+/// Takes the guest processes the kernel layer ended (kernel bug, engine fault, OOM killer): each
+/// entry is `<console or -1>\t<pid>\t<process name>\t<bug|oom>\t<a>\t<b>\t<c>`; for bug, a is the
+/// report and b the last few lines of the kernel log (separated by U+001E); for oom, a is the
+/// cgroup (empty for the app's limit), b and c the usage and the limit (bytes). Newlines, tabs and
+/// U+001E inside the fields are replaced by spaces.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     mut env: JNIEnv<'l>,
@@ -773,9 +796,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     array.into_raw()
 }
 
-/// 取走 guest 第一次在非回环地址上监听的端口（设计文档 §12 第 7 条）：每一项是
-/// `<进程名>\t<端口>\t<宿主上的端口>`，没有时是空数组。
-/// guest 改过目录项的目录（[`browse::encode_path`] 的写法，就是文档 ID）："文件"App 刷新它们。
+/// Takes the ports the guest listened on for the first time on a non-loopback address (design doc
+/// §12 item 7): each entry is `<process name>\t<port>\t<host port>`; an empty array when there are
+/// none.
+/// Directories whose entries the guest changed (written as by [`browse::encode_path`], that is,
+/// document IDs): the Files app refreshes them.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
     mut env: JNIEnv<'l>,
@@ -854,7 +879,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_spawn<'l>(
     let (Some(argv), Some(envp)) = (strings(&mut env, &argv), strings(&mut env, &envp)) else {
         return -1;
     };
-    // 负数：不要控制台，用宿主的 stdin/stdout/stderr（App 的是 /dev/null 和 logcat）
+    // Negative: no console, use the host's stdin/stdout/stderr (for the app, /dev/null and logcat)
     let stdio = u32::try_from(console).map_or(Stdio::Host, Stdio::Console);
     let Some(m) = machine(handle) else {
         throw(&mut env, "the machine is stopped");
@@ -869,7 +894,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_spawn<'l>(
     }
 }
 
-/// 读控制台的输出：返回读到的字节数，0 表示会话结束，-1 表示控制台已经关闭。
+/// Reads console output: returns the number of bytes read, 0 when the session ended, -1 when the
+/// console is closed.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
     env: JNIEnv<'l>,
@@ -887,7 +913,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
     let mut buf = vec![0u8; len as usize];
     match m.read_console(console as u32, &mut buf) {
         Ok(n) => {
-            // SAFETY: u8 和 i8 的布局相同
+            // SAFETY: u8 and i8 have the same layout
             let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n) };
             match env.set_byte_array_region(&buffer, 0, bytes) {
                 Ok(()) => n as jint,
@@ -898,7 +924,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
     }
 }
 
-/// 向控制台输入：返回写入的字节数，-1 表示会话已经结束或者控制台已经关闭。
+/// Input to a console: returns the number of bytes written, -1 when the session ended or the
+/// console is closed.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_write<'l>(
     env: JNIEnv<'l>,
@@ -916,7 +943,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_write<'l>(
     {
         return -1;
     }
-    // SAFETY: u8 和 i8 的布局相同
+    // SAFETY: u8 and i8 have the same layout
     let data = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len()) };
     let Some(m) = machine(handle) else {
         return -1;
@@ -961,8 +988,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_closeConsole<'l>(
     }
 }
 
-/// 等进程结束：返回退出码，被信号终止时返回负的信号编号（与 Termux 的约定相同）。内核已经
-/// stop 时进程都被 SIGKILL 结束了。
+/// Waits for a process to end: returns the exit code, or the negated signal number when a signal
+/// terminated it (the same convention as Termux). Once the kernel is stopped, all processes have
+/// been ended by SIGKILL.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     _: JNIEnv<'l>,
@@ -979,7 +1007,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     }
 }
 
-/// 按 `/etc/inittab` 开机（kernel/process 的 map）：阻塞到 sysinit、wait 的命令都结束。
+/// Boots by `/etc/inittab` (the kernel/process map): blocks until the sysinit and wait commands
+/// have all finished.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
     _: JNIEnv<'l>,
@@ -991,8 +1020,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
     }
 }
 
-/// 关机（[`Machine::shutdown`]）：运行 inittab 里关机的命令，给所有进程 SIGTERM，再结束
-/// 剩下的，然后从表里删掉句柄。关机的命令期间别的调用照常能用。
+/// Shuts down ([`Machine::shutdown`]): runs the shutdown commands in inittab, sends SIGTERM to all
+/// processes, ends those left, and then removes the handle from the table. Other calls keep working
+/// during the shutdown commands.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
     _: JNIEnv<'l>,
@@ -1005,8 +1035,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
     machines().remove(&handle);
 }
 
-/// 取走 guest 的关机请求（busybox 的 reboot、halt、poweroff）：0 没有，1 重启，2 停机，
-/// 3 关机。
+/// Takes the guest's power request (busybox's reboot, halt, poweroff): 0 none, 1 reboot, 2 halt,
+/// 3 power off.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takePower<'l>(
     _: JNIEnv<'l>,
@@ -1021,7 +1051,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takePower<'l>(
     }
 }
 
-/// 还在运行的 guest 进程数（不算 init）。
+/// Number of guest processes still running (not counting init).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
     _: JNIEnv<'l>,
@@ -1031,8 +1061,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
     machine(handle).map_or(0, |m| m.processes() as jint)
 }
 
-/// 控制台前台进程组的当前目录（App 被杀之后恢复标签页用）：取不到时（shell 已经退出、
-/// 句柄无效）返回 null。路径不是 UTF-8 时按 UTF-8 的规则替换。
+/// The current directory of the console's foreground process group (for restoring tabs after the
+/// app was killed): null when it cannot be had (the shell has exited, the handle is invalid). A
+/// path that is not UTF-8 is converted with UTF-8 replacement rules.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_consoleCwd<'l>(
     env: JNIEnv<'l>,

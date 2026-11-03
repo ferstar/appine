@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- guest 程序的网络（socket 透传）和首次启动时给镜像测速 -->
+    <!-- Networking for guest programs (socket passthrough) and the mirror speed probe at first
+         start -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- 默认网络的路由交给 guest 的路由表（设计文档 §10） -->
+    <!-- The default network's routes go into the guest's routing table (design doc §10) -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 设置里打开"熄屏时保持运行"时持有 PARTIAL_WAKE_LOCK（android/service 的 map） -->
+    <!-- PARTIAL_WAKE_LOCK is held when "Keep running with the screen off" is on in Settings
+         (the android/service map) -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
@@ -43,8 +45,10 @@
             android:exported="false"
             android:label="@string/settings_licenses" />
 
-        <!-- android/documents 的 map：系统"文件"App 里的家目录（和可选的只读整个系统）；只有系统（持有
-             MANAGE_DOCUMENTS 的"文件"App）能直接访问，别的 App 经由用户在里面选的授权 -->
+        <!-- The android/documents map: the home directory in the system Files app (and optionally
+             the whole system, read-only); only the system (the Files app, which holds
+             MANAGE_DOCUMENTS) has direct access, other apps go through grants the user picks
+             there -->
         <provider
             android:name=".Documents"
             android:authorities="${applicationId}.documents"
@@ -56,7 +60,7 @@
             </intent-filter>
         </provider>
 
-        <!-- android/service 的 map：会话运行期间保持一个 specialUse 前台服务 -->
+        <!-- The android/service map: a specialUse foreground service is kept while sessions run -->
         <service
             android:name=".TerminalService"
             android:exported="false"

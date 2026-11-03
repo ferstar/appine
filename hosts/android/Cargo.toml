@@ -17,6 +17,6 @@ jni = "0.21.1"
 libc.workspace = true
 
 [features]
-# 见 appine-kernel 的同名特性；app/build.gradle.kts 给 debug 版 App 打开
+# See appine-kernel's features of the same names; app/build.gradle.kts enables them in the debug app
 test-hooks = ["appine-kernel/test-hooks"]
 borrow-check = ["appine-kernel/borrow-check"]

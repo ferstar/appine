@@ -28,9 +28,9 @@ import java.nio.ByteOrder
 import kotlin.concurrent.thread
 
 /**
- * 在真机或模拟器上检查原生库：导入 rootfs、启动内核、在控制台上运行 shell（设计文档
- * §13.3 的 Android 专项测试）。4K 和 16K 页的设备上都要运行：
- * `./gradlew connectedDebugAndroidTest`。
+ * Checks the native library on a real device or an emulator: importing a rootfs, starting the
+ * kernel, running a shell on a console (the Android-specific tests of design doc §13.3). Run them
+ * on devices with both 4K and 16K pages: `./gradlew connectedDebugAndroidTest`.
  */
 @RunWith(AndroidJUnit4::class)
 class MachineTest {
@@ -40,7 +40,7 @@ class MachineTest {
     @Before
     fun prepare() {
         Rootfs.prepare(context, Rootfs.Distro.ALPINE)
-        // 与 App 启动内核之前一样，把以前导入时写的 profile 换成现在的
+        // As the app does before starting the kernel, replace the profile an earlier import wrote
         Rootfs.updateProfile(context)
     }
 
@@ -51,7 +51,7 @@ class MachineTest {
 
     private fun start(tier: Int) = Native.start(Rootfs.store(context).path, tier).also { machines.add(it) }
 
-    /** 读控制台直到会话结束，换行统一成 \n。 */
+    /** Reads the console until the session ends, normalising line breaks to \n. */
     private fun readAll(machine: Long, console: Int): String {
         val out = ByteArrayOutputStream()
         val buf = ByteArray(4096)
@@ -63,7 +63,7 @@ class MachineTest {
         return out.toString("UTF-8").replace("\r\n", "\n")
     }
 
-    /** 在新控制台上运行 `program`，返回输出和 [Native.waitFor] 的结果。 */
+    /** Runs `program` on a new console; returns the output and the result of [Native.waitFor]. */
     private fun run(machine: Long, program: String, vararg argv: String): Pair<String, Int> {
         val console = Native.openConsole(machine, 24, 80)
         val pid = Native.spawn(machine, console, program, arrayOf(*argv), ConsolePty.ENVIRONMENT)
@@ -73,12 +73,12 @@ class MachineTest {
         return out to code
     }
 
-    /** 在新控制台上运行 `sh -c script`，返回输出和退出码。 */
+    /** Runs `sh -c script` on a new console and returns the output and the exit code. */
     private fun sh(machine: Long, script: String) = run(machine, "/bin/sh", "sh", "-c", script)
 
     /**
-     * 在新控制台上像终端标签页一样运行登录脚本（[ConsolePty.script]，登录账号是 [account]），输入
-     * [input]，返回输出。
+     * Runs the login script on a new console as a terminal tab does ([ConsolePty.script], with
+     * [account] as the login account), types [input] and returns the output.
      */
     private fun login(
         machine: Long,
@@ -100,8 +100,9 @@ class MachineTest {
     }
 
     /**
-     * 像 [login] 一样运行登录脚本（自动选账号），但一步一步交互：每一步等输出里（上一步等到的地方
-     * 之后）出现 `wait`，最多两分钟，再输入 `send`。返回全部输出。
+     * Runs the login script like [login] (choosing the account automatically), but interactively
+     * step by step: each step waits up to two minutes for `wait` to appear in the output (after the
+     * point the previous step waited for), then types `send`. Returns all the output.
      */
     private fun loginSteps(machine: Long, vararg steps: Pair<String, String>): String {
         val console = Native.openConsole(machine, 24, 200)
@@ -148,7 +149,7 @@ class MachineTest {
             assertEquals(out, 0, code)
             val lines = out.lines()
             assertEquals(out, "hello", lines[0])
-            // guest 的页大小与宿主（可能是 16K）无关
+            // The guest's page size does not depend on the host's (which may be 16K)
             assertEquals(out, "4096", lines[1])
             assertTrue(out, lines[2].startsWith("3."))
             assertEquals(out, "73cb3858a687a849", lines[3])
@@ -169,7 +170,7 @@ class MachineTest {
         }
         type("sleep 30\n")
         Thread.sleep(500)
-        // ^C 经过行规程变成发给前台进程组的 SIGINT
+        // ^C goes through the line discipline and becomes a SIGINT to the foreground process group
         type("\u0003")
         type("echo status=\$?\n")
         type("exit 7\n")
@@ -189,7 +190,7 @@ class MachineTest {
         for (i in 0 until 3) assertEquals(results[i], "$i-1\n$i-2\n$i-3\n", results[i])
     }
 
-    /** 释放缓存（onTrimMemory）时正在运行的进程不受影响，之后照常起新进程。 */
+    /** Releasing caches (onTrimMemory) leaves running processes alone; new ones start as usual. */
     @Test
     fun trimMemoryKeepsTheMachineWorking() {
         val machine = start(1)
@@ -209,8 +210,9 @@ class MachineTest {
     }
 
     /**
-     * 内核停下之后再用它的句柄也安全：会话结束之后，TerminalSession 在主线程上才清理控制台，
-     * 这时服务可能已经停了内核（重置 rootfs、服务销毁）。
+     * Using a kernel's handle after it stopped is safe: after a session ends, TerminalSession
+     * cleans up the console only later on the main thread, and by then the service may have stopped
+     * the kernel (rootfs reset, service destroyed).
      */
     @Test
     fun callsAfterStopAreHarmless() {
@@ -230,9 +232,10 @@ class MachineTest {
     }
 
     /**
-     * 按 inittab 开机、关机（kernel/process 的 map、android/service 的 map）：开机之后 once 的命令在跑，guest 的
-     * `poweroff` 是关机的请求，[Native.shutdown] 运行关机的命令、结束所有进程、释放句柄。
-     * 启动之前写好只有回环接口的 /etc/network/interfaces。
+     * Booting and shutting down by inittab (the kernel/process map, the android/service map): after
+     * boot the once commands are running, the guest's `poweroff` is a request to shut down, and
+     * [Native.shutdown] runs the shutdown commands, ends all processes and releases the handle.
+     * Before the start, an /etc/network/interfaces with only the loopback interface is written.
      */
     @Test
     fun bootsAndShutsDownByInittab() {
@@ -241,7 +244,7 @@ class MachineTest {
         val original = sh(probe, "cat /etc/inittab").first.toByteArray()
         Native.stop(probe)
         val inittab = "::sysinit:/bin/sh -c 'echo sysinit > /tmp/inittab-order'\n" +
-            // OpenRC 的服务没起来时这样写（eerror），重复的只算一次
+            // This is what OpenRC writes when a service did not start (eerror); repeats count once
             "::sysinit:/bin/sh -c 'for s in fake fake other; do echo \" * ERROR: \$s failed to start\"; done'\n" +
             "::once:/bin/sleep 30\n" +
             "::shutdown:/bin/sh -c 'echo shutdown >> /tmp/inittab-order'\n"
@@ -271,14 +274,14 @@ class MachineTest {
     }
 
     /**
-     * 开机之前把 osclock 加进 boot（[Rootfs.PREFER_OSCLOCK]）：没装 OpenRC 时什么也不做；用一个
-     * 假的 rc-update 看它什么时候被调用，用户放了别的时钟服务时不调用。同时检查不带控制台的
-     * [Native.spawn]。
+     * Before boot, osclock is added to boot ([Rootfs.PREFER_OSCLOCK]): it does nothing when OpenRC
+     * is not installed; a fake rc-update shows when it is called, and it is not called when the
+     * user put another clock service there. Also checks [Native.spawn] without a console.
      */
     @Test
     fun prefersOsclockOverHwclock() {
         val machine = start(1)
-        // minirootfs 里没有 OpenRC 的目录：有的话是装过 OpenRC，不动它
+        // The minirootfs has no OpenRC directories: if they exist OpenRC was installed, leave it
         assumeTrue(sh(machine, "test -e /etc/init.d -o -e /etc/runlevels").second != 0)
         val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
         fun prefer() = Native.waitFor(machine, Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
@@ -298,7 +301,10 @@ class MachineTest {
         }
     }
 
-    /** 登录 shell 是 /etc/passwd 里 root 的 shell，chsh 改过之后照样；它读 /etc/profile。 */
+    /**
+     * The login shell is root's shell in /etc/passwd, also after chsh changed it; it reads
+     * /etc/profile.
+     */
     @Test
     fun loginShellComesFromPasswd() {
         val machine = start(1)
@@ -316,8 +322,9 @@ class MachineTest {
     }
 
     /**
-     * 恢复的标签页从原来的目录开始（android/service 的 map）：root 进得去就进；目录不在了回家目录；普通
-     * 用户以自己的身份进，进不去（/root）回自己的家目录。
+     * A restored tab starts in its original directory (the android/service map): root enters it if
+     * it can; if the directory is gone, the home directory; a regular user enters as itself, and
+     * when it cannot (/root), its own home directory.
      */
     @Test
     fun loginStartsInTheSavedDirectory() {
@@ -340,7 +347,10 @@ class MachineTest {
         }
     }
 
-    /** 控制台前台进程组的当前目录跟着 shell 的 cd 变；shell 退出之后取不到。 */
+    /**
+     * The current directory of the console's foreground process group follows the shell's cd;
+     * after the shell exits there is none.
+     */
     @Test
     fun consoleCwdFollowsTheForegroundShell() {
         val machine = start(1)
@@ -370,8 +380,9 @@ class MachineTest {
     }
 
     /**
-     * 存下的标签页（android/service 的 map）：标记还在（被杀）时读回原样，读过一次标记就没了；正常退出
-     * （clear）之后什么也读不到。
+     * Saved tabs (the android/service map): while the marker is still there (killed) they read back
+     * unchanged, and after one read the marker is gone; after a normal exit (clear) nothing is
+     * read.
      */
     @Test
     fun tabsComeBackOnlyAfterAKill() {
@@ -394,8 +405,9 @@ class MachineTest {
     }
 
     /**
-     * 登录脚本的输出里：`id -un` 是 alice，`id -nG` 里有 [group]，`doas`/`sudo -n id -un` 是 root
-     * （按行比，终端的输出里夹着控制序列和回车）。
+     * In the login script's output: `id -un` is alice, `id -nG` contains [group],
+     * `doas`/`sudo -n id -un` is root (compared by line, as terminal output has control sequences
+     * and CRs mixed in).
      */
     private fun becameAdmin(out: String, group: String): Boolean {
         val lines = out.lines().map { it.trim() }
@@ -405,9 +417,11 @@ class MachineTest {
     }
 
     /**
-     * 登录账号（android/setup 的 map）：只有 root 时自动登录 root；建了普通用户之后自动以它登录，第一次
-     * 登录时加进 wheel、离线装上 App 带的 doas，没设密码时 doas 不问密码；设了密码之后要问；
-     * 明确选 root 时是 root，选的账号不在了也是 root。最后删掉账号、doas 和留下的记录。
+     * The login account (the android/setup map): with only root, root logs in automatically; once a
+     * regular user exists it logs in automatically, and on its first login it is added to wheel and
+     * the app's bundled doas is installed offline; doas asks no password while none is set, and
+     * asks once one is set; choosing root explicitly gives root, and so does a chosen account that
+     * no longer exists. Finally removes the account, doas and the records left behind.
      */
     @Test
     fun loginAccountsAndDoas() {
@@ -437,7 +451,10 @@ class MachineTest {
         }
     }
 
-    /** 下载的 tarball 按长度和 sha256 校验，对不上时删掉（用 file: 地址代替网络）。 */
+    /**
+     * Downloaded tarballs are checked by length and sha256 and deleted on a mismatch (file: URLs,
+     * no network).
+     */
     @Test
     fun downloadsAreVerified() {
         val src = File(context.cacheDir, "download-src.tgz")
@@ -458,8 +475,9 @@ class MachineTest {
     }
 
     /**
-     * 下载中途断开时带 Range 接着下；服务器不认 Range（回 200）时从头再来。本地的 HTTP 服务
-     * 第一次只发前三分之一就断开连接。
+     * A download that broke off midway continues with Range; when the server ignores Range (replies
+     * 200) it starts over. The local HTTP server sends only the first third the first time and then
+     * drops the connection.
      */
     @Test
     fun downloadsResumeWhereTheyBrokeOff() {
@@ -499,8 +517,9 @@ class MachineTest {
     }
 
     /**
-     * 下载中止时（设置里取消换发行版）抛出 [Rootfs.Cancelled]，下了一半的不留。本地的 HTTP 服务
-     * 发三分之一之后停住，等客户端取消、断开。
+     * An aborted download (cancelling a distro switch in Settings) throws [Rootfs.Cancelled] and
+     * keeps no partial file. The local HTTP server stalls after a third and waits for the client to
+     * cancel and disconnect.
      */
     @Test
     fun downloadsCanBeCancelled() {
@@ -518,7 +537,7 @@ class MachineTest {
                 out.write(data, 0, data.size / 3)
                 out.flush()
                 sent.countDown()
-                // 停住，等客户端放弃（读到 EOF）
+                // Stall until the client gives up (the read sees EOF)
                 runCatching { c.getInputStream().read() }
             }
         }
@@ -538,8 +557,10 @@ class MachineTest {
     }
 
     /**
-     * 设置里手动选的镜像写进源：内核运行着也写得进去，guest 马上看得到；记下是手动选的。只换内置
-     * 镜像的地址，用户加的行（testing、自己的仓库、注释掉的）留着；一处内置的镜像也没有时不动。
+     * A mirror chosen by hand in Settings is written into the sources: also while the kernel runs,
+     * and the guest sees it at once; it is recorded as chosen by hand. Only the built-in mirrors'
+     * addresses are replaced, and lines the user added (testing, their own repositories,
+     * commented-out ones) stay; when there is no built-in mirror anywhere, nothing changes.
      */
     @Test
     fun manualMirrorIsWritten() {
@@ -558,27 +579,28 @@ class MachineTest {
             assertTrue(Rootfs.isMirrorManual(context))
             assertEquals(ustc, Rootfs.mirror(context))
             val bare = ustc.removePrefix("https://")
-            // 原来的源可能已经被 App 测速换过镜像
+            // The app's speed probe may already have replaced the mirror in the original sources
             assertEquals(
                 distro.mirrors.fold(before) { text, m -> text.replace(m, ustc) } +
                     "@testing http://$bare/edge/testing\n#$ustc/$branch/community\n" +
                     "https://packages.example.com/alpine/$branch/main\n",
                 sh(machine, "cat /etc/apk/repositories").first,
             )
-            // 再换一次：上次选的也是内置的镜像
+            // Switch once more: the previous choice is a built-in mirror too
             assertTrue(Rootfs.setMirror(context, distro, tuna))
             assertTrue(sh(machine, "cat /etc/apk/repositories").first.startsWith("$tuna/$branch/main\n"))
-            // 全换成了列表以外的镜像：不动，记录也不变
+            // Everything replaced by mirrors outside the list: no change, and the record stays too
             val custom = "https://mirror.example.org/alpine/$branch/main\n"
             sh(machine, "printf '$custom' > /etc/apk/repositories")
             assertFalse(Rootfs.setMirror(context, distro, ustc))
             assertEquals(custom, sh(machine, "cat /etc/apk/repositories").first)
             assertEquals(tuna, Rootfs.mirror(context))
-            // 源文件不在了：照导入时那样重写
+            // The sources file is gone: rewrite it as at import
             sh(machine, "rm /etc/apk/repositories")
             assertTrue(Rootfs.setMirror(context, distro, ustc))
             assertEquals("$ustc/$branch/main\n$ustc/$branch/community\n", sh(machine, "cat /etc/apk/repositories").first)
-            // Debian 的 deb822：只换内置镜像的主机，协议、组件、别人的仓库照旧
+            // Debian's deb822: only the host of built-in mirrors changes; scheme, components and
+            // other repositories stay
             val debian = """
                 Types: deb
                 URIs: https://deb.debian.org/debian
@@ -602,7 +624,8 @@ class MachineTest {
             )
             assertEquals(null, Rootfs.retarget(Rootfs.Distro.DEBIAN, "URIs: http://ftp.cn.debian.org/debian\n", "mirrors.aliyun.com"))
         } finally {
-            // 恢复原来的源和记录：别的用例、App 本身都用这个仓库
+            // Restore the original sources and record: other test cases and the app itself use this
+            // store
             Native.writeFile(Rootfs.store(context).path, "/etc/apk/repositories", before.toByteArray(), 420, true)
             prefs.edit().clear().apply {
                 for ((k, v) in saved) {
@@ -616,9 +639,10 @@ class MachineTest {
     }
 
     /**
-     * 构建时生成的开源许可（设计文档 §13.4）打进了 APK：appine 自己的 AGPL 声明和全文、Termux
-     * 的库、Alpine 里 GPL 的包（带 aports 的提交）、Android 库、链接进库的 crate（不含过程宏）、
-     * 许可证全文；索引里的每个文件都在。
+     * The open-source notices generated at build time (design doc §13.4) are in the APK: appine's
+     * own AGPL notice and full text, the Termux libraries, the GPL packages in Alpine (with the
+     * aports commit), the Android libraries, the crates linked into the library (no proc macros),
+     * and the full license texts; every file in the index is present.
      */
     @Test
     fun noticesCoverTheApp() {
@@ -640,10 +664,13 @@ class MachineTest {
     }
 
     /**
-     * 下载 Debian 的 rootfs 导入另外的仓库，在登录 shell（bash）里看系统信息、DNS，运行
-     * apt-get update（它取不到索引时只警告、退出码仍是 0，所以看输出）；再建一个普通用户，自动以它登录：
-     * 装 sudo 时按 Ctrl-C 跳过、shell 里按 Ctrl-C 不结束会话，下一次登录装上 sudo。要联网下载约 50 MB，默认跳过：
-     * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`。
+     * Downloads the Debian rootfs into another store and, in the login shell (bash), looks at the
+     * system information and DNS and runs apt-get update (when it cannot fetch the indexes it only
+     * warns and still exits 0, so the output is checked); then creates a regular user that logs in
+     * automatically: Ctrl-C while sudo installs skips it, Ctrl-C in the shell does not end the
+     * session, and the next login installs sudo. It downloads about 50 MB and is skipped by
+     * default:
+     * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`.
      */
     @Test
     fun downloadedDistributionsRun() {
@@ -662,9 +689,12 @@ class MachineTest {
                 assertTrue(out, out.contains(distro.label.substringBefore(' ')))
                 assertTrue(out, out.contains("shell=/bin/bash\n"))
                 assertTrue(out, out.contains("apt-ok\n"))
-                // 普通用户第一次成为登录账号：加进 sudo 组，联网装 sudo。apt-get update 下载时按
-                // Ctrl-C：这次跳过，登录照常。util-linux 的 su 不另起会话，shell 有控制终端和作业
-                // 控制：Ctrl-C 只打断前台的 sleep，不会结束整个会话（原来标签页就关了）
+                // A regular user becomes the login account for the first time: added to the sudo
+                // group, sudo installed from the network. Ctrl-C while apt-get update downloads:
+                // skipped this time, the login goes on as usual. util-linux's su starts no new
+                // session, so the shell has a controlling terminal and job control: Ctrl-C
+                // interrupts only the foreground sleep and does not end the whole session (it used
+                // to close the tab)
                 assertEquals(0, sh(machine, "useradd -m -s /bin/bash alice").second)
                 val skipped = loginSteps(
                     machine,
@@ -675,11 +705,13 @@ class MachineTest {
                     "$ " to "echo still-here; exit\n",
                 )
                 assertTrue(skipped, skipped.contains("appine: skipped installing sudo"))
-                // 输入的回显里没有这两段（bash 在命令的输出前面先写 \e[?2004l\r，不是换行）
+                // Neither appears in the echoed input (bash writes \e[?2004l\r before a command's
+                // output, not a newline)
                 assertTrue(skipped, skipped.contains("/dev/pts/"))
                 assertTrue(skipped, skipped.contains("still-here\n"))
                 assertFalse(skipped, skipped.contains("Session terminated"))
-                // 下一次登录装上 sudo（这次显示 apt 的进度），没设密码时不问
+                // The next login installs sudo (showing apt's progress this time); no password
+                // asked while none is set
                 val admin = login(machine, "id -un; id -nG; sudo -n id -un; exit\n")
                 assertTrue(admin, admin.contains("Setting up sudo"))
                 assertTrue(admin, admin.contains("alice is in the sudo group and can become root with sudo"))
@@ -692,9 +724,10 @@ class MachineTest {
     }
 
     /**
-     * guest 的路由表（kernel/net 的 map）：App 读不了宿主的 `/proc/net/route`，交来默认网络的
-     * `LinkProperties` 之前是按接口的地址合成的（默认路由没有网关），交来之后有网关；
-     * `ip route get` 的源地址由宿主选。
+     * The guest's routing table (the kernel/net map): the app cannot read the host's
+     * `/proc/net/route`; until the default network's `LinkProperties` are handed in, the table is
+     * synthesised from the interfaces' addresses (the default route has no gateway), and afterwards
+     * it has a gateway; the host chooses the source address of `ip route get`.
      */
     @Test
     fun routesComeFromLinkProperties() {
@@ -718,10 +751,12 @@ class MachineTest {
     }
 
     /**
-     * 宿主不让绑的 1024 以下的端口（kernel/net 的 map）：App 没有 CAP_NET_BIND_SERVICE，79 也不在
-     * Android 放开的那几个里；guest 的 nc 绑 79 时宿主上换成 10079，guest 里看到的还是 79。App
-     * 经由 [Native.takeListens] 知道外部端口（§12 第 7 条的通知用它），从 App 进程连 10079 收得到
-     * guest 发的数据，内核日志记着换到了哪里。
+     * Ports below 1024 that the host refuses (the kernel/net map): the app has no
+     * CAP_NET_BIND_SERVICE, and 79 is not among the few Android opened up; when the guest's nc
+     * binds 79 the host uses 10079 instead, and the guest still sees 79. The app learns the
+     * external port through [Native.takeListens] (the notification of §12 item 7 uses it), a
+     * connection from the app process to 10079 receives the data the guest sends, and the kernel
+     * log records where the port moved.
      */
     @Test
     fun lowPortsTheHostRefusesMoveToHighPorts() {
@@ -731,9 +766,10 @@ class MachineTest {
     }
 
     /**
-     * 宿主让绑的低端口：2026 年 5 月起的 Google Play 系统更新让 App 绑得了 22、80、443 这几个
-     * （Android 13 以上、内核 5.15 以上；API 37 的模拟器上有），guest 的 nc 绑 22 就是宿主的 22，
-     * 不换，也不记内核日志。没有这个更新的系统上跳过。
+     * Low ports the host allows: Google Play system updates since May 2026 let apps bind 22, 80 and
+     * 443 (Android 13 and later, kernel 5.15 and later; present on the API 37 emulator), so when
+     * the guest's nc binds 22 it is the host's 22, not remapped and not in the kernel log. Skipped
+     * on systems without that update.
      */
     @Test
     fun lowPortsTheHostAllowsAreBoundAsTheyAre() {
@@ -743,8 +779,9 @@ class MachineTest {
     }
 
     /**
-     * guest 的 nc 在 [port] 上监听：报告的监听事件是宿主上的 [hostPort]，从 App 进程连它收得到
-     * guest 发的数据。返回控制台的输出（之后 `dmesg` 里关于这个端口的行，没有时是 "no log"）。
+     * The guest's nc listens on [port]: the reported listen event is [hostPort] on the host, and a
+     * connection to it from the app process receives the data the guest sends. Returns the console
+     * output (followed by the `dmesg` lines about this port, or "no log" when there are none).
      */
     private fun ncListen(port: Int, hostPort: Int): String {
         val machine = start(1)
@@ -761,7 +798,8 @@ class MachineTest {
             Thread.sleep(50)
         }
         assertEquals("nc\t$port\t$hostPort", listens?.singleOrNull())
-        // nc 读完 stdin 之后不关连接：读到了就关掉，它才退出
+        // nc does not close the connection after reading all of stdin: close it once read, so nc
+        // exits
         Socket("127.0.0.1", hostPort).use { s ->
             val got = ByteArray(6)
             DataInputStream(s.getInputStream()).readFully(got)
@@ -774,10 +812,12 @@ class MachineTest {
     }
 
     /**
-     * 内核层和引擎的 bug 只结束撞上它的 guest 进程（engine 的 map、设计文档 §12 第 5 条），用 debug 版 App 的
-     * 测试钩子模拟。在 App 进程里，引擎在宿主上出错时 SIGSEGV 先经过 ART 的 libsigchain：ART 不认领，
-     * 才交给引擎的处理函数，由它 siglongjmp 回去。宿主调用（JNI）里内核层 panic 时，那次调用失败，
-     * 控制台被挂断。之后 ART 和 Machine 都照常工作。
+     * A kernel-layer or engine bug ends only the guest process that hit it (the engine map, design
+     * doc §12 item 5), simulated with the test hooks of the debug app. In the app process, when the
+     * engine faults on the host the SIGSEGV first goes through ART's libsigchain: only when ART
+     * does not claim it does it reach the engine's handler, which siglongjmps back. When the kernel
+     * layer panics in a host call (JNI), that call fails and the console is hung up. Afterwards ART
+     * and the Machine both keep working.
      */
     @Test
     fun bugsKillOnlyTheGuestProcess() {
@@ -788,9 +828,10 @@ class MachineTest {
             val machine = start(tier)
             assertEquals("tier $tier", -SIGSEGV, run(machine, "/tmp/engine-fault", "engine-fault").second)
             assertEquals("tier $tier", -SIGSEGV, run(machine, "/tmp/kernel-panic", "kernel-panic").second)
-            // 读控制台时内核层 panic：读到 -1，会话组长收到 SIGHUP
+            // The kernel layer panics while the console is read: the read gets -1, the session
+            // leader gets SIGHUP
             assertEquals("tier $tier", "" to -SIGHUP, run(machine, "/tmp/host-call", "host-call"))
-            // ART 照常工作：GC，栈溢出变成 StackOverflowError
+            // ART keeps working: GC, and a stack overflow becomes a StackOverflowError
             Runtime.getRuntime().gc()
             assertTrue(runCatching { depth(0) }.exceptionOrNull() is StackOverflowError)
             assertEquals("ok\n" to 0, sh(machine, "echo ok"))
@@ -798,10 +839,12 @@ class MachineTest {
     }
 
     /**
-     * 系统"文件"App 看到的（[Documents]）：根是登录账号的家目录，打开"整个系统"之后多一个 `/`；
-     * 列目录跟随符号链接，不列断了的链接和 FIFO；文件能读；家目录外面的要打开"整个系统"才看得到，
-     * 也不能写；树的授权不能用 `..` 走出去；按名字搜索。文件是运行着的内核刚写的：另外打开仓库时
-     * 内核先提交，看得到。
+     * What the system Files app sees ([Documents]): the root is the login account's home directory,
+     * and turning on "the whole system" adds `/`; listings follow symbolic links and leave out
+     * broken links and FIFOs; files can be read; things outside the home directory are visible only
+     * with "the whole system" on, and cannot be written; a tree grant cannot walk out with `..`;
+     * search by name. The files were just written by the running kernel: when the store is opened
+     * separately, the kernel commits first, so they are visible.
      */
     @Test
     fun documentsShowTheHomeDirectory() {
@@ -831,7 +874,8 @@ class MachineTest {
         try {
             assertEquals(listOf(listOf("home", "/root")), roots())
             assertEquals(
-                // 按扩展名猜不出的按内容：文本是 text/plain（点文件、链接到的版本号），有 NUL 的不是
+                // What the extension cannot tell goes by content: text is text/plain (dot files, a
+                // linked-to version number); anything with a NUL is not
                 listOf(
                     listOf("/root/dt/.bashrc", ".bashrc", "text/plain", "11"),
                     listOf("/root/dt/100%25 中文.txt", "100% 中文.txt", "text/plain", "1"),
@@ -846,12 +890,13 @@ class MachineTest {
             assertEquals("hi", read("/root/dt/a.txt"))
             assertEquals("x", read("/root/dt/100%25 中文.txt"))
             assertTrue(read("/root/dt/release").startsWith("3."))
-            // 家目录外面的、不规范的 ID 都当作不存在（查询返回 null）
+            // Things outside the home directory and non-canonical IDs count as nonexistent (the
+            // query returns null)
             assertEquals(listOf(listOf("text/plain")), rows(document("/root/dt/release"), mime))
             assertEquals(null, rows(document("/etc/motd"), id))
             assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
             assertEquals(null, rows(document("/root//dt"), id))
-            // 树的授权：里面的可以，`..` 走出去的不行
+            // Tree grants: what is inside works, walking out with `..` does not
             val tree = DocumentsContract.buildTreeDocumentUri(authority, "/root/dt")
             assertEquals(
                 listOf(listOf("/root/dt/sub")),
@@ -860,16 +905,16 @@ class MachineTest {
             assertThrows(SecurityException::class.java) {
                 rows(DocumentsContract.buildDocumentUriUsingTree(tree, "/root/dt/../../etc/motd"), id)
             }
-            // "文件"App 搜索时名字在参数里
+            // The Files app passes the name in the arguments when it searches
             val search = DocumentsContract.buildSearchDocumentsUri(authority, Documents.ROOT_HOME, "A.TXT")
             val args = android.os.Bundle().apply { putString(DocumentsContract.QUERY_ARG_DISPLAY_NAME, "A.TXT") }
             val found = rows(search, id, args = args)
             assertEquals(listOf(listOf("/root/dt/a.txt")), found)
-            // 打开"整个系统"
+            // Turn on "the whole system"
             prefs.edit().putBoolean("system_documents", true).commit()
             assertEquals(listOf(listOf("home", "/root"), listOf("system", "/")), roots())
             assertEquals(listOf(listOf("motd")), rows(document("/etc/motd"), name))
-            // 家目录外面的只读
+            // Outside the home directory is read-only
             assertThrows(Exception::class.java) { resolver.openOutputStream(document("/etc/motd"))!!.close() }
             assertTrue(rows(DocumentsContract.buildChildDocumentsUri(authority, "/"), name)!!.contains(listOf("etc")))
         } finally {
@@ -879,9 +924,12 @@ class MachineTest {
     }
 
     /**
-     * 在"文件"App 里改家目录（[Documents]）：新建（名字有了时换一个、按类型补扩展名）、写、追加、
-     * 截断、改名（不覆盖）、移动、删除整个目录；新建的属于登录账号。运行中的内核马上看得到。家目录
-     * 外面的、经由符号链接走出去的都不行，家目录本身不能删。
+     * Changing the home directory from the Files app ([Documents]): creating (another name when the
+     * name is taken, an extension added from the type), writing, appending, truncating, renaming
+     * (without replacing), moving, deleting a whole directory; new files belong to the login
+     * account. The running kernel sees the changes at once. Nothing outside the home directory, or
+     * leading out through a symbolic link, is allowed, and the home directory itself cannot be
+     * deleted.
      */
     @Test
     fun documentsWriteInTheHomeDirectory() {
@@ -917,12 +965,13 @@ class MachineTest {
             assertEquals("y" to 0, sh(machine, "cat '$dw/notes (1).txt'"))
             val owners = "stat -c '%U %G %a %n' $dw/notes.txt $dw/sub"
             assertEquals("bob bob 644 $dw/notes.txt\nbob bob 755 $dw/sub\n" to 0, sh(machine, owners))
-            // 文档的标志：家目录里面的能写、删、改名、移动，家目录本身只能在里面新建
+            // Document flags: inside the home directory, write, delete, rename and move; the home
+            // directory itself only allows creating inside it
             val home = DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
             assertEquals(home, flags("/home/bob"))
             assertTrue(flags("$dw/notes.txt") and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0)
             assertTrue(flags("$dw/sub") and DocumentsContract.Document.FLAG_SUPPORTS_DELETE != 0)
-            // 改名不覆盖；移动；删除整个目录
+            // Renaming does not replace; moving; deleting a whole directory
             assertThrows(Exception::class.java) {
                 DocumentsContract.renameDocument(resolver, uri("$dw/notes (1).txt"), "notes.txt")
             }
@@ -933,7 +982,8 @@ class MachineTest {
             assertEquals("y" to 0, sh(machine, "cat $dw/sub/renamed.txt"))
             assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/sub")))
             assertEquals(1, sh(machine, "test -e $dw/sub").second)
-            // 家目录外面、经由符号链接走出去的、家目录本身
+            // Outside the home directory, leading out through a symbolic link, the home directory
+            // itself
             val motd = sh(machine, "cat /etc/motd").first
             assertThrows(Exception::class.java) { create("/etc", "text/plain", "x") }
             assertThrows(Exception::class.java) { create("$dw/etc-link", "text/plain", "x") }
@@ -941,7 +991,7 @@ class MachineTest {
             assertThrows(Exception::class.java) { DocumentsContract.deleteDocument(resolver, uri("/home/bob")) }
             assertEquals(motd to 0, sh(machine, "cat /etc/motd"))
             assertEquals(1, sh(machine, "test -e /etc/x").second)
-            // 删除符号链接只删链接
+            // Deleting a symbolic link deletes only the link
             assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/etc-link")))
             assertEquals(0, sh(machine, "test ! -e $dw/etc-link && test -d /etc").second)
         } finally {
@@ -951,9 +1001,11 @@ class MachineTest {
     }
 
     /**
-     * "文件"App 改的东西交给运行中的内核，guest 里监视着的程序收到 inotify 事件：写的文件在"文件"App
-     * 这一侧关闭时才报（[Documents.openDocument] 带着关闭的回调重新打开 object）。反过来，guest 改过
-     * 目录项的目录由 [Native.takeChangedDirs] 取走，[Documents.dirsChanged] 通知"文件"App 刷新。
+     * Changes made in the Files app go to the running kernel, and a program watching in the guest
+     * receives inotify events: a written file is reported only when the Files app side closes it
+     * ([Documents.openDocument] reopens the object with a close callback). The other way round,
+     * directories whose entries the guest changed are taken by [Native.takeChangedDirs], and
+     * [Documents.dirsChanged] tells the Files app to refresh.
      */
     @Test
     fun documentsChangesReachTheKernelAndBack() {
@@ -967,8 +1019,9 @@ class MachineTest {
         val authority = Documents.authority(context)
         fun uri(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
         try {
-            // busybox 的 inotifyd 印成"字母\t目录\t名字"：n 新建，c 修改，r 打开，w 写完关闭，m、y 移出移入，
-            // d 删除。它在自己的控制台上跑，读到它退出（timeout）为止
+            // busybox's inotifyd prints "letter\tdirectory\tname": n created, c modified, r opened,
+            // w closed after writing, m and y moved out and in, d deleted. It runs on its own
+            // console, read until it exits (timeout)
             val console = Native.openConsole(machine, 24, 200)
             val argv = arrayOf("sh", "-c", "timeout 6 inotifyd - $dw")
             val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
@@ -987,7 +1040,8 @@ class MachineTest {
             assertTrue(out, want.all { log.lines().contains(it) })
             val lines = log.lines()
             assertTrue(log, lines.indexOf("w\tw.txt") > lines.indexOf("n\tw.txt"))
-            // guest 改过目录项的目录：第一次取时才开始记，通知之后"文件"App 的观察者收到
+            // Directories whose entries the guest changed: recorded only from the first take on;
+            // after the notification the Files app's observer gets it
             Native.takeChangedDirs(machine)
             assertEquals(0, sh(machine, "touch $dw/from-guest").second)
             val dirs = Native.takeChangedDirs(machine)!!
@@ -1012,10 +1066,12 @@ class MachineTest {
     private fun depth(n: Int): Int = if (n < 0) 0 else depth(n + 1) + 1
 
     /**
-     * 内核层结束的进程留下报告给 App（[Native.takeKills]）：控制台、pid、进程名、原因（bug 的还有内核日志的
-     * 最后几条），取走一次就没了。
-     * 内核 bug 用测试钩子模拟，OOM 用 cgroup 的 memory.max：awk 拼出 64 MB 的字符串之后接着运行
-     * 一会儿（OOM killer 定时量用量，一下子用完就退出的进程发现不了）。
+     * A process the kernel layer ended leaves a report for the app ([Native.takeKills]): console,
+     * pid, process name, reason (for a bug, also the last few kernel log entries); once taken, it
+     * is gone.
+     * Kernel bugs are simulated with the test hooks, OOM with cgroup's memory.max: awk builds a
+     * 64 MB string and then keeps running for a while (the OOM killer measures usage periodically
+     * and cannot catch a process that uses it all up and exits at once).
      */
     @Test
     fun killsAreReportedToTheApp() {
@@ -1030,9 +1086,11 @@ class MachineTest {
         assertEquals(listOf("kernel-panic", "bug"), bug.subList(2, 4))
         assertTrue(bug[0], bug[0].toInt() >= 0)
         assertTrue(bug[4], bug[4].contains("pid ${bug[1]} (kernel-panic)"))
-        // 报告里有 panic 的消息和位置（通知上"复制报告"复制的就是它）
+        // The report has the panic message and location (what "Copy report" on the notification
+        // copies)
         assertTrue(bug[4], bug[4].contains(": panic injected by the test hook at core/kernel/src/bug.rs:"))
-        // 还有内核日志里它前面的几条（guest 写的那一条）和它自己，带着时间
+        // And the kernel log entries before it (the one the guest wrote) and itself, with
+        // timestamps
         val log = bug[5].split('\u001e')
         assertTrue(bug[5], log.all { it.startsWith("[") } && log.any { it.endsWith("] before the bug") })
         assertTrue(bug[5], log.last().endsWith(bug[4]))
@@ -1052,24 +1110,25 @@ class MachineTest {
         const val SIGHUP = 1
         const val SIGSEGV = 11
 
-        /** 测试钩子的 syscall 编号（core/kernel/src/bug.rs），x0 是要模拟的 bug。 */
+        /** Syscall number of the test hook (core/kernel/src/bug.rs); x0 is the bug to simulate. */
         const val HOOK = 0xa991
         val SVC = 0xd4000001L.toInt()
 
-        /** `movz x<rd>, #imm`。 */
+        /** `movz x<rd>, #imm`. */
         fun movz(rd: Int, imm: Int) = (0xd2800000L or (imm.toLong() shl 5) or rd.toLong()).toInt()
 
-        /** `exit(x0)`。 */
+        /** `exit(x0)`. */
         val EXIT = intArrayOf(movz(8, 93), SVC)
 
         val GUESTS = mapOf(
-            // 让栈所在的页在页表里指向不能访问的宿主内存，再写它：引擎在宿主上出错
+            // Point the stack's page in the page table at inaccessible host memory, then write it:
+            // the engine faults on the host
             "engine-fault" to intArrayOf(
                 movz(0, 2), 0x910003e1L.toInt() /* mov x1, sp */, movz(8, HOOK), SVC,
                 0xf9000020L.toInt() /* str x0, [x1] */, movz(0, 4),
             ) + EXIT,
             "kernel-panic" to intArrayOf(movz(0, 1), movz(8, HOOK), SVC, movz(0, 7)) + EXIT,
-            // 为宿主下一次调用 Machine 的方法布下 bug，然后读 stdin
+            // Plant a bug for the host's next call to a Machine method, then read stdin
             "host-call" to intArrayOf(
                 movz(0, 6), movz(8, HOOK), SVC,
                 movz(0, 0), 0xd10043e1L.toInt() /* sub x1, sp, #16 */, movz(2, 1), movz(8, 63), SVC,
@@ -1077,20 +1136,23 @@ class MachineTest {
             ) + EXIT,
         )
 
-        /** 只有一个代码段的静态 aarch64 ELF：加载到 0x400000，从第一条指令开始执行。 */
+        /**
+         * A static aarch64 ELF with a single code segment: loaded at 0x400000, runs from the first
+         * instruction.
+         */
         fun elf(code: IntArray): ByteArray {
             val base = 0x400000L
             val headers = 64 + 56
             val size = (headers + 4 * code.size).toLong()
             val b = ByteBuffer.allocate(size.toInt()).order(ByteOrder.LITTLE_ENDIAN)
-            // 64 位、小端、版本 1
+            // 64-bit, little-endian, version 1
             b.put(byteArrayOf(0x7f, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte(), 2, 1, 1, 0))
             b.put(ByteArray(8))
-            // ET_EXEC、EM_AARCH64、版本、入口、程序头和节头的偏移、标志
+            // ET_EXEC, EM_AARCH64, version, entry, program and section header offsets, flags
             b.putShort(2).putShort(183).putInt(1).putLong(base + headers).putLong(64).putLong(0).putInt(0)
-            // 文件头和程序头的大小、一个程序头、没有节头
+            // Sizes of the file header and program header, one program header, no section headers
             b.putShort(64).putShort(56).putShort(1).putShort(64).putShort(0).putShort(0)
-            // PT_LOAD：可读可执行，整个文件
+            // PT_LOAD: readable and executable, the whole file
             b.putInt(1).putInt(5).putLong(0).putLong(base).putLong(base).putLong(size).putLong(size).putLong(0x1000)
             code.forEach { b.putInt(it) }
             return b.array()
