@@ -1,12 +1,15 @@
 #!/bin/sh
-# 下载并校验 Alpine minirootfs（设计文档 §11.4）和 App 带着的 doas 包（普通用户第一次成为
-# 登录账号时离线装上，§11.1）。版本和 sha256 固定写在这里，升级时一起修改。用法：
-# scripts/fetch-rootfs [输出目录]，默认 target/rootfs。
+# Downloads and verifies the Alpine minirootfs (design doc §11.4) and the doas package bundled with
+# the app (installed offline when a regular user first becomes the login account, §11.1). The
+# versions and sha256s are fixed here and changed together on upgrades. Usage:
+# scripts/fetch-rootfs [output directory], target/rootfs by default.
 #
-# 下载之后先用 Alpine 的发布密钥（scripts/alpine-ncopa.asc，Natanael Copa，指纹见
-# fingerprint）验签名，再比 sha256：摘要固定在这里，验签是给升级版本时确认新的摘要可信用的。
-# 升级时改 version，sha256 先不动，运行一次：签名有效、摘要不同时会印出新的摘要。没装 gpg
-# 时跳过验签。
+# After downloading, the signature is first verified with Alpine's release key
+# (scripts/alpine-ncopa.asc, Natanael Copa, fingerprint in fingerprint), then the sha256 is
+# compared: the digest is fixed here, and the signature check is for trusting the new digest when
+# upgrading the version. To upgrade, change version, leave sha256 as it is, and run this once: with
+# a valid signature and a different digest it prints the new digest. Without gpg the signature check
+# is skipped.
 set -eu
 
 version=3.24.3
@@ -15,7 +18,8 @@ name=alpine-minirootfs-$version-aarch64.tar.gz
 url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/aarch64/$name
 fingerprint=0482D84022F52DF1C4E7CD43293ACD0907D9495A
 
-# doas 用同一个分支的：包本身带着 Alpine 的签名，apk 装的时候用 rootfs 里的公钥验
+# doas from the same branch: the package itself carries Alpine's signature, and apk checks it with
+# the public keys in the rootfs when installing
 doas=doas-6.8.2-r8.apk
 doas_sha256=7d35ce1a0a76de43f7621e2099e45bfd83e6d8cf667db657633ab1f374d05f72
 doas_url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main/aarch64/$doas
@@ -25,7 +29,8 @@ out=${1:-$root/target/rootfs}
 mkdir -p "$out"
 file=$out/$name
 
-# 只取摘要比较：GNU 和 BSD 的 sha256sum 参数不同，输出的第一列都是摘要
+# Compare only the digest: GNU and BSD sha256sum take different arguments, but the first column of
+# the output is the digest in both
 digest() {
     if command -v sha256sum >/dev/null; then
         sha256sum "$1"
@@ -38,7 +43,8 @@ check() {
     [ "$(digest "$1")" = "$sha256" ]
 }
 
-# doas 包：只比固定的 sha256（签名在包里面，由 apk 验）
+# The doas package: only compared with the fixed sha256 (the signature is inside the package and
+# checked by apk)
 fetch_doas() {
     [ -f "$out/$doas" ] && [ "$(digest "$out/$doas")" = "$doas_sha256" ] && return 0
     curl -fsSL --retry 3 -o "$out/$doas.part" "$doas_url"
@@ -55,8 +61,9 @@ if [ -f "$file" ] && check "$file"; then
     echo "$file"
     exit 0
 fi
-# 用只含 Alpine 公钥的临时 keyring 验签（gpgv 不碰用户的 keyring，也不要 gpg-agent）。
-# 返回 0 签名有效，1 无效，2 没装 gpg
+# Verify the signature with a temporary keyring holding only Alpine's public key (gpgv touches
+# neither the user's keyring nor gpg-agent).
+# Returns 0 for a valid signature, 1 for an invalid one, 2 when gpg is not installed
 verify() {
     command -v gpg >/dev/null && command -v gpgv >/dev/null || return 2
     tmp=$(mktemp -d)

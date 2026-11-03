@@ -1,17 +1,25 @@
-# appine 终端标签页的登录（android/setup 的 map）：以 root 运行，$1 是设置里的登录账号：auto、root
-# 或账号名。auto 用最先建的普通用户（UID 1000–65533、有登录 shell 的里 UID 最小的），没有就是
-# root；指定的账号不在了也是 root。$2 是从哪个目录开始（App 被杀之后恢复的标签页，android/service 的 map），
-# 没有、进不去时是账号的家目录。
+# Login for an appine terminal tab (the android/setup map): runs as root, and $1 is the login
+# account from Settings: auto, root or an account name. auto uses the first regular user created
+# (the one with the smallest UID among those with UID 1000–65533 and a login shell), or root when
+# there is none; a named account that no longer exists is root too. $2 is the directory to start in
+# (for tabs restored after the app was killed, the android/service map); when it is missing or
+# cannot be entered, the account's home directory.
 #
-# 普通用户第一次成为登录账号时，照 Alpine 的 setup-user -a 把它加进管理员组、装好提权工具：
-# Alpine 是 wheel 组和 doas（App 带着这个包，离线也能装），Debian 是 sudo 组和 sudo（要联网，
-# 装不上时之后每次登录再试）。加过组的记在 /var/lib/appine/admins，之后用户自己把它移出组也不再
-# 加回去。设了密码的照发行版的
-# 惯例提权时要输密码；没设密码的（adduser -D）不问，每次登录按当时的密码重新写这条规则。
-# 装软件的命令都从 /dev/null 读：用户在提示符出来之前敲的字要留给登录 shell。
+# When a regular user first becomes the login account, it is added to the admin group and the
+# privilege tool is installed, as Alpine's setup-user -a does: on Alpine the wheel group and doas
+# (the app bundles that package, so it installs offline too), on Debian the sudo group and sudo
+# (needs the network; if it cannot be installed, it is retried at every later login). Accounts added
+# to the group are recorded in /var/lib/appine/admins; if the user later takes one out of the group,
+# it is not added back. With a password set, escalating asks for the password, following the
+# distro's convention; without one (adduser -D) it does not ask, and the rule is rewritten at every
+# login according to the password at that time.
+# The install commands all read from /dev/null: what the user types before the prompt appears is
+# left for the login shell.
 #
-# Ctrl-C 不结束登录：脚本自己接住 SIGINT（子进程照样被打断），装 sudo 时按了就跳过这一次。
-# 接住而不是忽略：忽略会传给子进程，apt-get 就停不下来了；exec 之后恢复默认
+# Ctrl-C does not end the login: the script catches SIGINT itself (child processes are still
+# interrupted), and pressing it while sudo installs skips installing this time.
+# Caught rather than ignored: an ignored SIGINT is inherited by child processes, and apt-get could
+# not be stopped; the default is restored after exec
 set -u
 interrupted=
 trap 'interrupted=1' INT
@@ -19,7 +27,7 @@ want=${1:-auto}
 dir=${2:-}
 user=root
 
-# 最先建的普通用户
+# The first regular user created
 first() {
     best=
     bestuid=
@@ -53,7 +61,7 @@ root) ;;
 esac
 
 if [ "$user" = root ]; then
-    # 从恢复的目录开始，不然是家目录
+    # Start in the restored directory, otherwise the home directory
     home=$(field root 6 /etc/passwd)
     { [ -n "$dir" ] && cd "$dir"; } 2>/dev/null || cd "$home" 2>/dev/null || cd /
     shell=$(field root 7 /etc/passwd)
@@ -72,7 +80,8 @@ else
 fi
 ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$group"; }
 
-# 第一次：加进管理员组，记下来（之后用户自己移出组也不再加回去）
+# The first time: add to the admin group and record it (if the user later takes it out of the group,
+# it is not added back)
 if ! grep -qsx "$user" "$admins"; then
     if [ "$group" = wheel ]; then
         addgroup "$user" wheel
@@ -89,21 +98,25 @@ else
     fresh=
 fi
 
-# 提权工具：装上过一次（或者本来就有）就记下，之后用户自己卸掉也不再装；没装上的（Debian
-# 当时没网）之后每次登录再试
+# Privilege tool: once installed (or already present) it is recorded, and if the user uninstalls it
+# later it is not installed again; if it could not be installed (Debian had no network then), it is
+# retried at every later login
 installed=/var/lib/appine/$tool-installed
 tried=
 if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
     tried=1
     if [ "$group" = wheel ]; then
-        # 用 App 带的包离线装（不读仓库索引）；再按名字加一次，world 里记的是 doas 而不是这个
-        # 文件，之后 apk upgrade 照常升级它
+        # Install offline from the package the app bundles (without reading the repository index);
+        # then add it once more by name, so world records doas rather than this file and apk upgrade
+        # upgrades it as usual
         apk add -q --no-network --repositories-file /dev/null /var/cache/appine/doas.apk </dev/null &&
             apk add -q --no-network --repositories-file /dev/null doas </dev/null
     else
-        # 联网下载索引和包要几分钟，照常显示 apt 的输出（进度）。下载时按 Ctrl-C，apt-get 被
-        # 打断、这次不装；dpkg 那一步 apt 让它在自己开的伪终端里另起会话，Ctrl-C 碰不到它，
-        # apt 等它装完才停
+        # Downloading the index and the package from the network takes a few minutes, so apt's
+        # output (the progress) is shown as usual. Ctrl-C during the download interrupts apt-get and
+        # skips installing this time; for the dpkg step apt starts a new session in a
+        # pseudo-terminal of its own, so Ctrl-C cannot reach it, and apt stops only after it has
+        # finished installing
         echo "appine: installing sudo so that $user can become root (Ctrl-C skips it until the next login)"
         apt-get update </dev/null &&
             DEBIAN_FRONTEND=noninteractive apt-get install -y sudo </dev/null
@@ -111,18 +124,19 @@ if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
 fi
 if command -v "$tool" >/dev/null; then
     : >"$installed"
-    # 第一次加进组时，或者这一次才装上时（之前没网、跳过了）说一声
+    # Say so when the user was first added to the group, or when the tool was installed only this
+    # time (no network before, skipped)
     if [ -n "$fresh" ] || [ -n "$tried" ]; then
         echo "appine: $user is in the $group group and can become root with $tool"
     fi
 elif [ -n "$interrupted" ]; then
-    # 被打断的 apt 的进度行停在一半
+    # The progress line of the interrupted apt stopped halfway
     printf '\nappine: skipped installing %s; appine tries again at the next login\n' "$tool" >&2
 elif [ ! -e "$installed" ]; then
     echo "appine: $user is in the $group group, but $tool is not installed yet; appine tries again at the next login" >&2
 fi
 
-# 没设密码的管理员（还在组里的）提权时不问密码
+# Admins without a password (still in the group) are not asked for a password when escalating
 nopass=
 while read -r u; do
     ingroup "$u" || continue
@@ -149,15 +163,19 @@ else
     rm -f "$rules"
 fi
 
-# 以登录 shell 运行（读 /etc/profile）；su 设好 HOME、SHELL、USER、LOGNAME。不用 su -l：它
-# 总是回家目录。恢复的目录以这个账号的身份进（root 进得去的它不一定进得去），进不去回家目录
+# Run as a login shell (reads /etc/profile); su sets HOME, SHELL, USER and LOGNAME. su -l is not
+# used: it always goes to the home directory. The restored directory is entered as this account (a
+# directory root can enter is not necessarily enterable by it); when it cannot be entered, go to the
+# home directory
 cd /
 q=$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")
 cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; exec \"\$SHELL\" -l"
-# util-linux 的 su（Debian）对 -c 的命令另起会话（防 TIOCSTI 往 root 的终端里塞字）：shell
-# 没有控制终端、没有作业控制，按 Ctrl-C 时 su 结束整个会话，标签页就关了。它的
-# --session-command 不另起会话；这里 su 是会话组长，它退出时会话也就结束了，没有以 root 身份
-# 接着读终端的进程。busybox su（Alpine）本来就不另起会话，也没有这个选项
+# util-linux's su (Debian) starts a new session for the -c command (to stop TIOCSTI from pushing
+# input into root's terminal): the shell has no controlling terminal and no job control, and on
+# Ctrl-C su ends the whole session, closing the tab. Its --session-command starts no new session;
+# here su is the session leader, and when it exits the session ends too, so no process goes on
+# reading the terminal as root. busybox su (Alpine) never starts a new session and has no such
+# option
 if su --help 2>&1 | grep -q -- --session-command; then
     exec su --session-command="$cmd" "$user"
 fi

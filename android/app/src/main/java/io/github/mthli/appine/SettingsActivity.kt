@@ -22,10 +22,12 @@ import androidx.core.view.WindowInsetsCompat
 import kotlin.concurrent.thread
 
 /**
- * 设置：发行版、软件源镜像、重置 rootfs、执行层（android/setup 的 map），登录账号（同上），熄屏时
- * 保持运行（android/service 的 map），开源许可（设计文档 §13.4）。状态都在 [TerminalService]
- * 里，这里只显示和转达；内核没有在运行（启动中、正在换掉仓库）时只能看、不能改。换掉仓库、
- * 重启开始时回到终端，那里显示进度。
+ * Settings: distro, package mirror, reset rootfs, execution tier (the android/setup map), login
+ * account (likewise), keep running with the screen off (the android/service map), open source
+ * licenses (design doc §13.4). All the state is in [TerminalService]; this only displays and
+ * forwards it, and while the kernel is not running (starting, replacing the store) everything can
+ * be viewed but not changed. When replacing the store or a restart begins, it goes back to the
+ * terminal, which shows the progress.
  */
 class SettingsActivity : Activity(), TerminalService.Listener {
 
@@ -35,7 +37,10 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     private lateinit var reset: Row
     private lateinit var account: Row
 
-    /** `/etc/passwd` 里的普通用户（[Rootfs.regularAccounts]），每次显示设置页时在后台读。 */
+    /**
+     * The regular users in `/etc/passwd` ([Rootfs.regularAccounts]), read in the background each
+     * time the settings page is shown.
+     */
     private var accounts: List<Rootfs.Account> = emptyList()
     private lateinit var tier: Row
     private lateinit var keepAwake: Row
@@ -58,8 +63,8 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * 一行设置：标题，下面是现在的值或者说明；[toggle] 的行右边有开关（点整行切换，开关本身只
-     * 显示）。
+     * One settings row: a title, with the current value or a description below; a [toggle] row has
+     * a switch on the right (tapping the whole row toggles it; the switch itself only displays).
      */
     private inner class Row(title: Int, toggle: Boolean = false, onClick: () -> Unit) {
         private val summary = TextView(this@SettingsActivity).apply {
@@ -115,7 +120,8 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         systemDocuments = Row(R.string.settings_system_documents, toggle = true) {
             service?.let { it.setSystemDocuments(!it.systemDocuments) }
         }
-        // AGPL 第 0、5 条的"适当的法律声明"：版权、不提供担保、许可证，以及看全文的地方
+        // AGPL sections 0 and 5's "Appropriate Legal Notices": copyright, no warranty, the license,
+        // and where to read the full text
         licenses = Row(R.string.settings_licenses) { startActivity(Intent(this, LicensesActivity::class.java)) }
         licenses.set(getString(R.string.licenses_summary), true)
 
@@ -183,14 +189,17 @@ class SettingsActivity : Activity(), TerminalService.Listener {
 
     override fun onSettingsChanged() = render()
 
-    /** 开始换掉仓库（导入新的发行版）：回到终端看进度。 */
+    /**
+     * Replacing the store (importing a new distro) begins: go back to the terminal to see the
+     * progress.
+     */
     override fun onProgress(text: String) = finish()
 
     override fun onRestarting() = finish()
 
     override fun onExitAll() = finish()
 
-    /** 换发行版的下载失败了。 */
+    /** The download for a distro switch failed. */
     override fun onNotice() {
         val text = service?.takeNotice() ?: return
         AlertDialog.Builder(this)
@@ -199,7 +208,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
             .show()
     }
 
-    // ---- 显示 ----
+    // ---- Display ----
 
     private fun render() {
         val s = service ?: return
@@ -225,16 +234,18 @@ class SettingsActivity : Activity(), TerminalService.Listener {
             },
             idle && !s.measuring,
         )
-        // 启动失败时也能重置：仓库坏了只能靠它恢复
+        // Reset is possible even when the start failed: it is the only way to recover a broken
+        // store
         reset.set(getString(R.string.reset_summary, (installed ?: Rootfs.Distro.ALPINE).label), s.canSwitch)
         tier.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
         account.set(loginSummary(s.login), installed != null && sw == null)
-        // 随时可以改：内核没在运行时只是记下，起来之后照这个持有
+        // Can be changed at any time: while the kernel is not running it is only recorded, and the
+        // lock is held accordingly once it is up
         keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
         systemDocuments.set(getString(R.string.system_documents_summary), true, s.systemDocuments)
     }
 
-    // ---- 操作 ----
+    // ---- Actions ----
 
     private fun onDistro() {
         val s = service ?: return
@@ -261,13 +272,16 @@ class SettingsActivity : Activity(), TerminalService.Listener {
             .show()
     }
 
-    /** 第一次导入就失败了（仓库不在）时重置成 Alpine，与第一次运行一样。 */
+    /** When the very first import failed (no store), resets to Alpine, as on the first run. */
     private fun onReset() {
         val installed = Rootfs.installed(this) ?: Rootfs.Distro.ALPINE
         confirmSwitch(installed, getString(R.string.reset_title))
     }
 
-    /** 换成 [distro]（重置是换成装着的那个）之前确认：要删掉 rootfs 里的所有文件。 */
+    /**
+     * Confirms before switching to [distro] (a reset switches to the installed one): every file in
+     * the rootfs is deleted.
+     */
     private fun confirmSwitch(distro: Rootfs.Distro, title: String) {
         val download = distro.download
         val message = if (download != null) {
@@ -315,7 +329,9 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         else -> if (accounts.any { it.name == login }) login else getString(R.string.login_missing, login)
     }
 
-    /** 选新标签页的登录账号：自动、root、`/etc/passwd` 里的普通用户。 */
+    /**
+     * Chooses the login account for new tabs: automatic, root, or a regular user in `/etc/passwd`.
+     */
     private fun onLogin() {
         val s = service ?: return
         val values = listOf(ConsolePty.LOGIN_AUTO, ConsolePty.LOGIN_ROOT) + accounts.map { it.name }
