@@ -4,6 +4,8 @@
 > See `.claude/decisions/harness.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -197,7 +199,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   pass silently; the tarball (and the survey's) is chosen by the lexically greatest name, so 3.3
   would beat 3.24.
 - **`appine-run` drops inline flag values** (`--pty=0` turns the PTY on, `--stats=no` turns stats
-  on); its header comment omits exit codes 1 and 2.
+  on).
 - **Killing `appine-run` skips the guest's shutdown.** Without signal handlers, `timeout` or ^C
   (with `--no-pty`) skip the inittab shutdown and the final store sync (losing the 5 ms deferred
   commit window) and, in PTY mode, leave the host terminal raw.

@@ -6,7 +6,9 @@
 //! loaded through the store's `ld-musl`. The guest starts with `argv[0] = <program>`, and the
 //! environment holds only the variables given by `--env`. Exit codes follow the shell's
 //! convention: the guest's exit code on a normal exit, 128 + the signal number when killed by a
-//! signal, and 127 (not found) or 126 (cannot execute) when the program cannot start.
+//! signal, 127 when the program is not found and 126 when it cannot start for another reason.
+//! appine-run's own failures exit with 1 (the inode store cannot be opened, or `--import` failed)
+//! and usage errors with 2.
 //!
 //! When stdin and stdout are both terminals, the guest runs on an in-process PTY (the kernel/tty
 //! map): the host terminal switches to raw mode, keys go unchanged to the guest's line discipline,

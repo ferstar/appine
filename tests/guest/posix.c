@@ -1,8 +1,8 @@
 /*
- * Guest test program for System V IPC, POSIX timers, clocks, mremap, credentials, scheduling
- * settings and ptrace (M6): build with musl-gcc -static and run directly in appine-run (no rootfs
- * needed). Each check that passes prints a line "ok <name>"; a failure prints the reason and exits
- * with 1; when all pass it prints "all ok" at the end.
+ * Guest test program for System V IPC, POSIX timers, clocks and CPU times, signalfd, splice,
+ * mremap, credentials, scheduling settings and ptrace (M6): build with musl-gcc -static and run
+ * directly in appine-run (no rootfs needed). Each check that passes prints a line "ok <name>"; a
+ * failure prints the reason and exits with 1; when all pass it prints "all ok" at the end.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -259,8 +259,6 @@ static void test_timers(void)
     ok("timers");
 }
 
-/* ---- signalfd: takes blocked signals, and poll sees them ---- */
-
 /* ---- Clocks: the host's clocks and one's own CPU clock without the BKL, the others holding the
  * lock, with consistent results; invalid arguments ---- */
 
@@ -386,6 +384,8 @@ static void test_cpu_times(void)
     } while (ticks < 4 && ns_of(&now) - ns_of(&start) < 5000000000LL);
     ok("cpu times");
 }
+
+/* ---- signalfd: takes blocked signals, and poll sees them ---- */
 
 static void test_signalfd(void)
 {

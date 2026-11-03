@@ -1114,7 +1114,8 @@ int main(void)
         ptrace(PTRACE_TRACEME, 0, 0, 0);
         raise(SIGSTOP);
         raise(SIGUSR1);
-        /* sigsuspend: temporarily block SIGINT in addition to SIGUSR2 */
+        /* sigsuspend: wait with only SIGINT blocked (the mask is replaced, so SIGUSR2 is not
+         * blocked during the call) */
         sigset_t s;
         sigemptyset(&s);
         sigaddset(&s, SIGINT);

@@ -391,9 +391,9 @@ fn every_kind_of_wait_releases_the_bkl_without_borrows() {
 
 #[test]
 fn kernel_log_is_empty_and_keeps_console_levels() {
-    // appine has no kernel log: dmesg prints nothing; the console level dmesg -n changes is
-    // visible in /proc/sys/kernel/printk; with dmesg_restrict at 1 ordinary users cannot read it,
-    // and only 0 and 1 can be written
+    // A new kernel's log is empty (appine writes no boot messages): dmesg prints nothing; the
+    // console level dmesg -n changes is visible in /proc/sys/kernel/printk; with dmesg_restrict at
+    // 1 ordinary users cannot read it, and only 0 and 1 can be written
     let script = "dmesg; echo rc=$?; dmesg -n 3; cat /proc/sys/kernel/printk; \
         echo '6 4 1' > /proc/sys/kernel/printk; cat /proc/sys/kernel/printk; \
         echo 1 > /proc/sys/kernel/dmesg_restrict; su -s /bin/sh nobody -c dmesg; echo rc=$?; \
@@ -1231,8 +1231,8 @@ fn ctrl_c_and_ctrl_z_control_the_foreground_job() {
         // continue. Pressing ^C as soon as the command shows, SIGINT may land on the shell itself:
         // the shell returns to the prompt, $? is 130 too, yet the job stays stopped and exit
         // refuses to exit (the same on native Linux). So wait until the job has read a line and is
-        // really running in the foreground before pressing
-        // The command fg prints has its quotes turned into double quotes and a backslash before `$`
+        // really running in the foreground before pressing ^C. The command fg prints has its quotes
+        // turned into double quotes and a backslash before `$`, so only its end is matched
         s.send(b"fg\n");
         s.expect("; done");
         s.send(b"ping\n");

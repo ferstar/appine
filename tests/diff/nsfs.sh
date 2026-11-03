@@ -1,8 +1,8 @@
 # docker-run-options: --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined
 # Namespace files (nsfs): open namespace files, and ones bind-mounted elsewhere, keep the
 # namespace alive, and it can still be entered with setns after all processes in it have exited;
-# the NS_GET_* ioctls; mount namespace files cannot be bound into namespaces that are not newer
-# than them, and copying a mount namespace leaves them out; the persistent namespaces of busybox's
+# the NS_GET_* ioctls; mount namespace files can only be bound into namespaces older than them,
+# and copying a mount namespace leaves them out; the persistent namespaces of busybox's
 # unshare and nsenter. The native side is a docker container with CAP_SYS_ADMIN. Namespace IDs
 # differ between the two sides, so only whether they are the same or different is compared
 cd /tmp
