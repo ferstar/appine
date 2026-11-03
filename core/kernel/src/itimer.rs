@@ -1,19 +1,23 @@
-//! 间隔定时器（setitimer、getitimer；musl 的 alarm 也经由 setitimer）和 POSIX 定时器
-//! （timer_create 系列）。
+//! Interval timers (setitimer, getitimer; musl's alarm also goes through setitimer) and POSIX
+//! timers (the timer_create family).
 //!
-//! 到期时刻记在线程组里，由 Machine 的定时器线程负责（[`expire`]）：等到最早的到期
-//! 时刻，给到期的进程发信号，有间隔的重新计时。设置定时器时请求唤醒，定时器线程随之
-//! 重新计算要等多久。
+//! Deadlines are recorded in the thread group and handled by the Machine's timer thread
+//! ([`expire`]): it waits until the earliest deadline, signals the processes whose timers expired,
+//! and re-arms those with an interval. Setting a timer requests a wake-up, and the timer thread
+//! then recomputes how long to wait.
 //!
-//! - `ITIMER_REAL` 按宿主的单调时钟计时，到期发 SIGALRM。
-//! - `ITIMER_VIRTUAL`、`ITIMER_PROF` 按进程用掉的 CPU 时间计时（宿主的线程 CPU 时钟分不出
-//!   用户态和内核态，两者都按总的 CPU 时间算），到期发 SIGVTALRM、SIGPROF。有这种定时器
-//!   时定时器线程每 10 毫秒检查一次，所以精度是 10 毫秒。
-//! - `RLIMIT_CPU`：CPU 时间超过软限制时发 SIGXCPU，并把软限制推后一秒（与 Linux 相同，
-//!   之后每秒一次），超过硬限制时发 SIGKILL。和 CPU 时间定时器一样每 10 毫秒检查。
-//! - POSIX 定时器按墙上时钟（宿主的单调时钟）或者进程、线程的 CPU 时间计时，到期发
-//!   `SI_TIMER` 信号（`SIGEV_THREAD_ID` 时发给指定线程）。上一个信号还没被取走时
-//!   不再发，只把超限次数（overrun）记在那个挂起的信号里。
+//! - `ITIMER_REAL` counts by the host's monotonic clock and sends SIGALRM on expiry.
+//! - `ITIMER_VIRTUAL` and `ITIMER_PROF` count by the CPU time the process has used (the host
+//!   thread CPU clock cannot tell user mode from kernel mode, so both count total CPU time), and
+//!   send SIGVTALRM and SIGPROF on expiry. While such a timer exists the timer thread checks every
+//!   10 ms, so the precision is 10 ms.
+//! - `RLIMIT_CPU`: when CPU time exceeds the soft limit, SIGXCPU is sent and the soft limit is
+//!   pushed back by one second (as on Linux, so once a second afterwards); exceeding the hard limit
+//!   sends SIGKILL. Checked every 10 ms, like the CPU-time timers.
+//! - POSIX timers count by the wall clock (the host's monotonic clock) or by process or thread CPU
+//!   time, and send an `SI_TIMER` signal on expiry (to the given thread with `SIGEV_THREAD_ID`).
+//!   While the previous signal has not been taken yet no new one is sent; only the overrun count
+//!   is recorded in that pending signal.
 
 use std::time::{Duration, Instant};
 
@@ -23,17 +27,18 @@ use crate::kernel::{Kernel, Tid};
 use crate::process::{RLIMIT_CPU, Signal, ThreadGroup};
 use crate::signal::{self, InfoFields, Pending, SigInfo, code};
 
-/// 一个进程的 `ITIMER_REAL`。
+/// A process's `ITIMER_REAL`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ITimer {
-    /// 下一次到期的时刻。
+    /// When it next expires.
     pub deadline: Instant,
-    /// 到期后重新计时的间隔，0 表示只触发一次。
+    /// The interval for re-arming after expiry; 0 means it fires only once.
     pub interval: Duration,
 }
 
 impl ITimer {
-    /// 在 `now` 到期之后的下一个状态：错过的周期不补发（与 Linux 相同，只算一次）。
+    /// The next state after expiring at `now`: missed periods are not made up (as on Linux, they
+    /// count once).
     fn next(self, now: Instant) -> Option<ITimer> {
         if self.interval.is_zero() {
             return None;
@@ -47,7 +52,8 @@ impl ITimer {
     }
 }
 
-/// 按 CPU 时间计时的定时器：到期时刻和间隔都是进程用掉的 CPU 纳秒数。
+/// A timer counting CPU time: the deadline and interval are both CPU nanoseconds used by the
+/// process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CpuTimer {
     pub deadline: u64,
@@ -55,7 +61,8 @@ pub(crate) struct CpuTimer {
 }
 
 impl CpuTimer {
-    /// 在进程用掉 `now` 纳秒时到期之后的下一个状态，错过的周期不补发。
+    /// The next state after expiring when the process has used `now` nanoseconds; missed periods
+    /// are not made up.
     fn next(self, now: u64) -> Option<CpuTimer> {
         if self.interval == 0 {
             return None;
@@ -68,46 +75,47 @@ impl CpuTimer {
     }
 }
 
-/// CPU 时间定时器的检查间隔。
+/// How often CPU-time timers are checked.
 const CPU_TICK: Duration = Duration::from_millis(10);
 
-/// POSIX 定时器按什么计时。
+/// What a POSIX timer counts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Clock {
-    /// 墙上时钟（`CLOCK_REALTIME`、`MONOTONIC`、`BOOTTIME`、`TAI`），按宿主的单调时钟
-    /// 计时，到期时刻是 [`Deadline::At`]。带着宿主上对应的时钟 id：设置绝对时间时按它
-    /// 换算。
+    /// The wall clock (`CLOCK_REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`), counted by the host's
+    /// monotonic clock, with deadlines as [`Deadline::At`]. Carries the matching host clock id,
+    /// used to convert absolute times when setting.
     Wall(i32),
-    /// 进程用掉的 CPU 时间，到期时刻是 [`Deadline::Cpu`]。
+    /// CPU time used by the process, with deadlines as [`Deadline::Cpu`].
     Process(Tid),
-    /// 线程用掉的 CPU 时间。
+    /// CPU time used by the thread.
     Thread(Tid),
 }
 
-/// POSIX 定时器的下一次到期。
+/// A POSIX timer's next expiry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Deadline {
     At(Instant),
-    /// CPU 纳秒数。
+    /// CPU nanoseconds.
     Cpu(u64),
 }
 
-/// 一个 POSIX 定时器（timer_create）。
+/// A POSIX timer (timer_create).
 #[derive(Clone, Debug)]
 pub(crate) struct PosixTimer {
     pub clock: Clock,
-    /// 到期时发的信号，以及 `SIGEV_THREAD_ID` 的目标线程；None 是 `SIGEV_NONE`。
+    /// The signal sent on expiry, and the target thread of `SIGEV_THREAD_ID`; None is `SIGEV_NONE`.
     pub signal: Option<(Signal, Option<Tid>)>,
-    /// `sigev_value`，放进 siginfo。
+    /// `sigev_value`, put into siginfo.
     pub value: u64,
     pub deadline: Option<Deadline>,
     pub interval: Duration,
-    /// 最近送达的一个信号累计的超限次数（timer_getoverrun，取出信号时更新）。
+    /// The overrun count accumulated by the most recently delivered signal (timer_getoverrun,
+    /// updated when the signal is taken).
     pub overrun: u32,
 }
 
 impl PosixTimer {
-    /// 时钟现在的值：墙上时钟返回 None（直接和 `Instant::now()` 比）。
+    /// The clock's current value: None for the wall clock (compare with `Instant::now()` directly).
     fn cpu_now(&self, k: &Kernel) -> Option<u64> {
         match self.clock {
             Clock::Wall(_) => None,
@@ -116,7 +124,7 @@ impl PosixTimer {
         }
     }
 
-    /// 离下一次到期还有多久；没有启动时是 None。
+    /// How long until the next expiry; None when not armed.
     pub fn remaining(&self, k: &Kernel) -> Option<Duration> {
         match self.deadline? {
             Deadline::At(d) => Some(d.saturating_duration_since(Instant::now())),
@@ -126,8 +134,8 @@ impl PosixTimer {
         }
     }
 
-    /// 从现在起 `value` 之后到期（`abs` 时 `value` 是 CPU 时钟的绝对值；墙上时钟的
-    /// 绝对时间由调用方换算成 `at`）。
+    /// Expires `value` from now (with `abs`, `value` is an absolute CPU-clock value; for the wall
+    /// clock the caller converts absolute times into `at`).
     pub fn arm(&mut self, k: &Kernel, value: Duration, at: Option<Instant>, abs: bool) {
         self.deadline = match self.cpu_now(k) {
             None => Some(Deadline::At(at.unwrap_or_else(|| Instant::now() + value))),
@@ -138,7 +146,8 @@ impl PosixTimer {
         };
     }
 
-    /// 到期了就返回错过的周期数（不含这一次，与 Linux 一样封顶在 INT_MAX），并重新计时。
+    /// If expired, returns the number of missed periods (not counting this one, capped at INT_MAX
+    /// as on Linux) and re-arms.
     fn fire(&mut self, k: &Kernel, now: Instant) -> Option<u32> {
         let (late, deadline) = match (self.deadline?, self.cpu_now(k)) {
             (Deadline::At(d), _) if d <= now => (now.duration_since(d), Deadline::At(d)),
@@ -151,7 +160,8 @@ impl PosixTimer {
             self.deadline = None;
             return Some(0);
         }
-        // 间隔很短、起点在很久以前时周期数超出 32 位：按真实的周期数推进
+        // With a short interval and a start long ago the period count exceeds 32 bits: advance by
+        // the real period count
         let periods = late.as_nanos() / self.interval.as_nanos();
         let step_ns = (self.interval.as_nanos() * (periods + 1)).min(u64::MAX as u128) as u64;
         self.deadline = Some(match deadline {
@@ -162,10 +172,10 @@ impl PosixTimer {
     }
 }
 
-/// 给定时器到期的进程发信号，返回下一次要检查的时刻。
+/// Signals the processes whose timers expired and returns when to check next.
 ///
-/// 处理一个进程时撞上内核层的 bug（[`crate::bug`]）：结束这个进程、清掉它的定时器，
-/// 其余的进程照常处理。
+/// If handling a process hits a kernel-layer bug ([`crate::bug`]): that process is ended and its
+/// timers cleared, and the other processes are handled as usual.
 pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
     let now = Instant::now();
     let mut next: Option<Instant> = None;
@@ -182,14 +192,14 @@ pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
     next
 }
 
-/// 停掉进程的所有定时器。
+/// Stops all of a process's timers.
 fn disarm(g: &mut ThreadGroup) {
     g.itimer = None;
     g.cpu_itimers = [None; 2];
     g.posix_timers.clear();
 }
 
-/// 处理进程 `tgid` 的定时器，返回它下一次要检查的时刻。
+/// Handles the timers of process `tgid` and returns when it should next be checked.
 fn expire_group(
     k: &Kernel,
     tgid: Tid,
@@ -290,7 +300,8 @@ fn expire_group(
     next
 }
 
-/// 定时器 `id` 上一次发的信号还挂着：超限次数加到那个信号的 siginfo 里，返回 true。
+/// The last signal sent by timer `id` is still pending: adds the overrun count to that signal's
+/// siginfo and returns true.
 fn add_overrun(k: &Kernel, tgid: Tid, tid: Option<Tid>, sig: Signal, id: i32, missed: u32) -> bool {
     let bump = |pending: &mut Pending| {
         let info = pending.infos_mut(sig).find(|info| {

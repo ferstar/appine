@@ -1,33 +1,35 @@
-//! 平均负载（`/proc/loadavg`、sysinfo）：与 Linux 的 `kernel/sched/loadavg.c` 一样，每 5 秒
-//! 取一次可运行的任务数（不在内核里等待的 guest 线程，等 BKL 的也算，相当于 Linux 的 R
-//! 加 D），按 1、5、15 分钟做指数衰减平均。
+//! Load average (`/proc/loadavg`, sysinfo): as in Linux's `kernel/sched/loadavg.c`, the number of
+//! runnable tasks (guest threads not waiting in the kernel; those waiting for the BKL count too,
+//! like Linux's R plus D) is sampled every 5 seconds and averaged with exponential decay over 1, 5
+//! and 15 minutes.
 //!
-//! 取样由定时器线程做。所有线程都在等待时停下来，不为它每 5 秒醒一次；有线程要接着执行
-//! guest 代码时叫醒定时器线程（[`Shared::resume_checks`]），停下来期间错过的取样都按 0
-//! 补上，相当于 Linux 的 NO_HZ 在空闲的 CPU 上做的事。
+//! The timer thread does the sampling. It stops while every thread is waiting, so it does not wake
+//! every 5 seconds for this; a thread about to go on running guest code wakes the timer thread
+//! ([`Shared::resume_checks`]), and the samples missed while stopped are filled in as 0, as Linux's
+//! NO_HZ does on an idle CPU.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::kernel::{Kernel, Shared};
 
-/// 取样的间隔（Linux 的 `LOAD_FREQ` 是 5 秒多一个滴答）。
+/// The sampling interval (Linux's `LOAD_FREQ` is 5 seconds plus one tick).
 const LOAD_FREQ: Duration = Duration::from_secs(5);
-/// 定点数的小数位数（`FSHIFT`）。
+/// Fraction bits of the fixed-point numbers (`FSHIFT`).
 const FSHIFT: u32 = 11;
 const FIXED_1: u64 = 1 << FSHIFT;
-/// 1、5、15 分钟的衰减系数：`FIXED_1 / exp(5 秒 / 时长)`。
+/// Decay factors for 1, 5 and 15 minutes: `FIXED_1 / exp(5 s / period)`.
 const EXP: [u64; 3] = [1884, 2014, 2037];
-/// sysinfo 的 `loads` 的小数位数（`SI_LOAD_SHIFT`）。
+/// Fraction bits of sysinfo's `loads` (`SI_LOAD_SHIFT`).
 const SI_LOAD_SHIFT: u32 = 16;
 
-/// 平均负载的状态，在 [`Kernel`] 里。
+/// Load-average state, in [`Kernel`].
 pub(crate) struct LoadAvg {
-    /// 1、5、15 分钟的平均值（定点数）。
+    /// Averages over 1, 5 and 15 minutes (fixed-point).
     avenrun: [u64; 3],
-    /// 下一次取样的时刻。
+    /// When the next sample is due.
     due: Instant,
-    /// 停下来了：上次取样时所有线程都在等待，没有安排下一次取样。
+    /// Stopped: every thread was waiting at the last sample, and no next sample is scheduled.
     stopped: bool,
 }
 
@@ -40,17 +42,17 @@ impl LoadAvg {
         }
     }
 
-    /// 定时器线程醒来时调用，现在有 `running` 个线程可运行：到了取样的时刻就取样。返回
-    /// 下一次要叫醒定时器线程的时刻，停下来时是 None。
+    /// Called when the timer thread wakes, with `running` threads now runnable: samples if a sample
+    /// is due. Returns when the timer thread should next be woken, or None when stopped.
     fn update(&mut self, now: Instant, running: u64) -> Option<Instant> {
         if now < self.due {
-            // 停下来之后有线程又运行了（它叫醒了定时器线程）
+            // A thread ran again after the sampler stopped (it woke the timer thread)
             if self.stopped && running > 0 {
                 self.stopped = false;
             }
         } else {
             let n = self.missed(now);
-            // 停下来的期间所有线程都在等待
+            // Every thread was waiting while stopped
             let active = if self.stopped { 0 } else { running };
             self.avenrun = fold(self.avenrun, active, n);
             self.due += LOAD_FREQ * n as u32;
@@ -59,7 +61,7 @@ impl LoadAvg {
         (!self.stopped).then_some(self.due)
     }
 
-    /// 到 `now` 为止错过的取样次数（`now` 不早于 `due`）。
+    /// The number of samples missed up to `now` (`now` is not earlier than `due`).
     fn missed(&self, now: Instant) -> u64 {
         let behind = (now - self.due).as_nanos() / LOAD_FREQ.as_nanos();
         1 + u64::try_from(behind)
@@ -67,7 +69,8 @@ impl LoadAvg {
             .min(u32::MAX as u64 - 1)
     }
 
-    /// 现在的平均值。停下来之后定时器线程还没补上的取样（读的线程刚刚醒来）在这里补上。
+    /// The current averages. Samples that the timer thread has not yet filled in since stopping
+    /// (the reading thread has just woken) are filled in here.
     fn current(&self, now: Instant) -> [u64; 3] {
         if self.stopped && now >= self.due {
             fold(self.avenrun, 0, self.missed(now))
@@ -77,7 +80,7 @@ impl LoadAvg {
     }
 }
 
-/// `n` 次取样都是 `active` 个任务之后的平均值（Linux 的 `calc_load_n`）。
+/// The averages after `n` samples of `active` tasks each (Linux's `calc_load_n`).
 fn fold(avenrun: [u64; 3], active: u64, n: u64) -> [u64; 3] {
     let active = active.saturating_mul(FIXED_1);
     let mut out = avenrun;
@@ -87,7 +90,7 @@ fn fold(avenrun: [u64; 3], active: u64, n: u64) -> [u64; 3] {
     out
 }
 
-/// Linux 的 `calc_load`：`load * exp + active * (1 - exp)`，向着 active 的方向取整。
+/// Linux's `calc_load`: `load * exp + active * (1 - exp)`, rounded towards active.
 fn calc_load(load: u64, exp: u64, active: u64) -> u64 {
     let mut new = load * exp + active * (FIXED_1 - exp);
     if active >= load {
@@ -96,7 +99,7 @@ fn calc_load(load: u64, exp: u64, active: u64) -> u64 {
     new / FIXED_1
 }
 
-/// 定点数 `x` 的 `n` 次方（Linux 的 `fixed_power_int`）。
+/// Fixed-point `x` to the power `n` (Linux's `fixed_power_int`).
 fn fixed_power(mut x: u64, mut n: u64) -> u64 {
     let mut result = FIXED_1;
     while n != 0 {
@@ -109,7 +112,7 @@ fn fixed_power(mut x: u64, mut n: u64) -> u64 {
     result
 }
 
-/// 可运行的线程数：不在内核里等待的 guest 线程。
+/// The number of runnable threads: guest threads not waiting in the kernel.
 pub(crate) fn running(k: &Kernel) -> u64 {
     k.tasks
         .values()
@@ -117,11 +120,11 @@ pub(crate) fn running(k: &Kernel) -> u64 {
         .count() as u64
 }
 
-/// 定时器线程每次醒来时调用。返回下一次要取样的时刻；停下来时返回 None，并让下一个
-/// 要执行 guest 代码的线程叫醒定时器线程。
+/// Called every time the timer thread wakes. Returns when the next sample is due; when stopped,
+/// returns None and makes the next thread about to run guest code wake the timer thread.
 pub(crate) fn sample(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     let now = Instant::now();
-    // 定时器线程有别的事时也会醒来：不到取样的时刻就不必数线程
+    // The timer thread also wakes for other work: no need to count threads before a sample is due
     if !k.load.stopped && now < k.load.due {
         return Some(k.load.due);
     }
@@ -133,9 +136,9 @@ pub(crate) fn sample(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     next
 }
 
-/// `/proc/loadavg` 的内容。
+/// The contents of `/proc/loadavg`.
 pub(crate) fn proc_loadavg(k: &Kernel, last_pid: crate::kernel::Tid) -> String {
-    // 与 Linux 一样加上 0.005 再截断成两位小数
+    // As on Linux, add 0.005 and then truncate to two decimal places
     let avg = k.load.current(Instant::now()).map(|a| a + FIXED_1 / 200);
     let int = |a: u64| a >> FSHIFT;
     let frac = |a: u64| ((a & (FIXED_1 - 1)) * 100) >> FSHIFT;
@@ -153,7 +156,7 @@ pub(crate) fn proc_loadavg(k: &Kernel, last_pid: crate::kernel::Tid) -> String {
     )
 }
 
-/// sysinfo 的 `loads`。
+/// sysinfo's `loads`.
 pub(crate) fn sysinfo_loads(k: &Kernel) -> [u64; 3] {
     k.load
         .current(Instant::now())
@@ -172,13 +175,13 @@ mod tests {
     fn samples_every_five_seconds() {
         let t0 = Instant::now();
         let mut l = LoadAvg::new(t0);
-        // 还没到取样的时刻
+        // No sample due yet
         assert_eq!(
             l.update(t0 + Duration::from_secs(1), 2),
             Some(t0 + LOAD_FREQ)
         );
         assert_eq!(l.avenrun, [0; 3]);
-        // 一个任务跑了一分钟：1 分钟的平均值约是 1 - 1/e
+        // One task ran for a minute: the 1-minute average is about 1 - 1/e
         let mut now = t0;
         for _ in 0..12 {
             now += LOAD_FREQ;
@@ -198,17 +201,18 @@ mod tests {
             l.update(now, 4);
         }
         let busy = l.avenrun;
-        // 所有线程都在等待：停下来
+        // Every thread is waiting: the sampler stops
         now += LOAD_FREQ;
         assert_eq!(l.update(now, 0), None);
         let first_idle = l.avenrun;
         assert!(first_idle[0] < busy[0]);
-        // 过了一分钟有线程醒来：错过的 12 次取样按 0 补上
+        // A thread wakes after a minute: the 12 missed samples are filled in as 0
         now += Duration::from_secs(60) + Duration::from_millis(1);
         assert_eq!(l.current(now), fold(first_idle, 0, 12));
         assert!(l.update(now, 1).is_some());
         assert_eq!(l.avenrun, fold(first_idle, 0, 12));
-        // 与一次次取样的结果相同：求幂时每次平方都舍入，可能差千分之几
+        // The same as sampling one by one: each squaring in the power rounds, so they may differ
+        // by a few thousandths
         let mut step = first_idle;
         for _ in 0..12 {
             step = fold(step, 0, 1);
@@ -221,7 +225,7 @@ mod tests {
                 step
             );
         }
-        // 下一次取样照常进行，按那时的线程数
+        // The next sample proceeds as usual, with the thread count at that time
         let due = l.due;
         assert!(l.update(due, 1).is_some());
         assert_eq!(l.avenrun, fold(fold(first_idle, 0, 12), 1, 1));
@@ -232,7 +236,7 @@ mod tests {
         let t0 = Instant::now();
         let mut l = LoadAvg::new(t0);
         assert_eq!(l.update(t0 + LOAD_FREQ, 0), None);
-        // 停下来之后、下一次取样之前有线程又运行了
+        // A thread ran again after the sampler stopped and before the next sample
         let next = t0 + LOAD_FREQ * 2;
         assert_eq!(
             l.update(t0 + LOAD_FREQ + Duration::from_secs(1), 1),

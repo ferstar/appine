@@ -1,20 +1,28 @@
-//! 内核层的全局状态、大内核锁和统一的等待机制（kernel/process 的 map）。
+//! The kernel layer's global state, the big kernel lock and the unified wait mechanism (the
+//! kernel/process map).
 //!
-//! 所有 guest 线程共享一个 [`Kernel`]，由一把大内核锁（BKL）保护：处理 syscall
-//! 和投递信号时持有，执行 guest 代码时不持有，等待之前释放。内核对象之间用
-//! `Rc`/`RefCell` 共享，它们只在持有 BKL 时被访问；唯一的例外是线程自己的
-//! [`TaskState`]，只有它所属的线程会访问，等待期间也一直借用着。`Rc` 的计数、`RefCell`
-//! 的借用标志都不是原子的，放开 BKL 时连 clone、drop 也不行：系统调用中途放开 BKL 的
-//! 只有等待（[`Cx::wait_on`] 等）和 [`Cx::unlocked`]，后者的闭包要是 `Send`，碰不到
-//! 内核对象；这两处 panic 时也先重新拿到 BKL，展开时外层各帧丢掉的 `Rc` 才不会和别的
-//! 线程同时改计数。放开 BKL 时也不能还借着内核对象，调试构建里由 [`crate::cell`] 检查。
+//! All guest threads share one [`Kernel`], protected by one big kernel lock (BKL): held while
+//! handling syscalls and delivering signals, not held while running guest code, and released
+//! before waiting. Kernel objects are shared among themselves through `Rc`/`RefCell` and are
+//! accessed only while holding the BKL; the only exception is a thread's own [`TaskState`], which
+//! only the thread it belongs to accesses, and which stays borrowed even while waiting. Neither
+//! `Rc` counts nor `RefCell` borrow flags are atomic, so without the BKL not even clone or drop is
+//! allowed: the only things that release the BKL in the middle of a syscall are the waits
+//! ([`Cx::wait_on`] and the like) and [`Cx::unlocked`], whose closure must be `Send` and so cannot
+//! touch kernel objects; on a panic in either place the BKL is also taken again first, so that
+//! the `Rc`s dropped by the outer frames during unwinding do not change counts at the same time
+//! as other threads. Kernel objects must not still be borrowed when the BKL is released either;
+//! debug builds check this through [`crate::cell`].
 //!
-//! 等待统一走宿主 `poll()`：每个线程有一个 eventfd，等待时把它和要等的宿主 fd
-//! 放在一起 poll。任何可能让别人的等待条件成立的修改都调用 [`request_wake`]，
-//! 释放 BKL 时唤醒正在等待的线程，由它们各自重新检查条件。修改按通道（[`wake`]）区分，
-//! 只叫醒关心这个通道的等待者：关闭文件、读写管道这类修改很频繁，不必每次都叫醒在 wait4
-//! 里等子进程的 shell 和定时器线程。futex 是例外：停在锁和条件变量上的线程很多，它们用
-//! [`Cx::wait_alone`] 等待，只被 FUTEX_WAKE、信号和结束线程组直接通知。
+//! Every wait goes through the host `poll()`: each thread has an eventfd, and while waiting polls
+//! it together with the host fds it waits on. Every change that might make someone else's wait
+//! condition true calls [`request_wake`], and when the BKL is released the waiting threads are
+//! woken and each re-checks its own condition. Changes are distinguished by channel ([`wake`]),
+//! and only the waiters interested in that channel are woken: changes such as closing files or
+//! reading and writing pipes are very frequent, and need not wake the shell waiting for children
+//! in wait4 and the timer thread every time. Futexes are the exception: many threads park on
+//! locks and condition variables; they wait with [`Cx::wait_alone`] and are notified directly,
+//! only by FUTEX_WAKE, signals and the ending of the thread group.
 
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
@@ -38,83 +46,93 @@ use crate::tty::Tty;
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
-/// 线程 ID；线程组 ID（pid）就是组里第一个线程的 tid。
+/// Thread ID; the thread group ID (pid) is the tid of the group's first thread.
 pub(crate) type Tid = i32;
 
-/// 内核层内置的 init（kernel/process 的 map）：只负责收养孤儿进程、回收僵尸进程。
+/// The kernel layer's built-in init (the kernel/process map): it only adopts orphans and reaps
+/// zombies.
 pub(crate) const INIT: Tid = 1;
 
-/// 最大的 tid，与 Linux 64 位上 `pid_max` 的上限相同。
+/// The largest tid, the same as the upper bound of `pid_max` on 64-bit Linux.
 pub(crate) const PID_MAX: Tid = 4 << 20;
 
-/// 主机名、域名的最大长度（`__NEW_UTS_LEN`）。
+/// Maximum length of the host name and domain name (`__NEW_UTS_LEN`).
 pub(crate) const UTS_LEN: usize = 64;
 
-/// 唤醒的通道：等待者登记自己关心哪些（[`Cx::wait_on`]），修改只叫醒关心它的等待者。
+/// Wake-up channels: waiters register which ones they are interested in ([`Cx::wait_on`]), and a
+/// change wakes only the waiters interested in it.
 pub(crate) mod wake {
-    /// 打开文件（管道、socket、PTY、消息队列……）上的修改。这些修改都按对象请求
-    /// （[`super::request_wake_object`]）：只听这个通道的等待者被它登记的对象上的修改
-    /// （没有登记对象的，任何对象上的修改）和请求所有通道的修改叫醒。
+    /// Changes on open files (pipes, sockets, PTYs, message queues...). These changes are all
+    /// requested per object ([`super::request_wake_object`]): a waiter listening only on this
+    /// channel is woken by changes on the objects it registered (one that registered no objects,
+    /// by changes on any object) and by changes that request all channels.
     pub const FILE: u32 = 1;
-    /// 其余一切：定时器的设置、信号等。
+    /// Everything else: setting timers, signals and so on.
     pub const OTHER: u32 = 2;
-    /// 子进程的状态变化（结束、停止、继续）：wait4、waitid 只听它。
+    /// Child status changes (exit, stop, continue): wait4 and waitid listen only to this.
     pub const CHILD: u32 = 4;
-    /// 宿主在等的进程（[`crate::Machine::spawn`] 启动的）结束了：`Machine::wait` 只听它。
+    /// A process the host is waiting for (started by [`crate::Machine::spawn`]) has ended:
+    /// `Machine::wait` listens only to this.
     pub const WATCHED: u32 = 8;
-    /// 有线程结束了（execve 在等别的线程结束，关闭时在等所有线程结束）。
+    /// A thread has ended (execve waits for the other threads to end, shutdown waits for all
+    /// threads to end).
     pub const EXITED: u32 = 16;
-    /// 文件锁（flock、fcntl 的记录锁和 OFD 锁）、租约和打开文件的位置锁（f_pos_lock）
-    /// 放开了或者变了：只有等它们的线程听。原来走文件类的通道，每次解锁都把所有停在
-    /// poll、epoll 里的线程叫醒一遍。
+    /// File locks (flock, fcntl record locks and OFD locks), leases and open-file position locks
+    /// (f_pos_lock) were released or changed: only the threads waiting for them listen. These
+    /// used to go through the file channel, and every unlock woke every thread parked in poll or
+    /// epoll.
     pub const LOCK: u32 = 32;
-    /// 被屏蔽的信号挂起了（发给进程的被所有线程屏蔽，发给线程的被它屏蔽）：只有等它们的
-    /// 线程听（sigtimedwait、signalfd 的读，poll、epoll 关注了 signalfd 的）。原来叫醒
-    /// 所有等待者：musl 的 fork 在 clone 前后屏蔽所有信号，这时有子进程退出，SIGCHLD 就
-    /// 是被所有线程屏蔽的，shell 起管道时常常碰到。
+    /// A blocked signal became pending (one sent to the process and blocked by every thread, or
+    /// one sent to a thread and blocked by it): only the threads waiting for them listen
+    /// (sigtimedwait, signalfd reads, poll and epoll watching a signalfd). This used to wake every
+    /// waiter: musl's fork blocks all signals around clone, and a child exiting at that moment has
+    /// its SIGCHLD blocked by every thread, which a shell setting up a pipeline often runs into.
     pub const SIGNAL: u32 = 64;
     pub const ALL: u32 = FILE | OTHER | CHILD | WATCHED | EXITED | LOCK | SIGNAL;
-    /// 有只影响某些对象的修改（[`super::request_wake_object`]），不是等待者关心的通道。
+    /// There are changes that affect only some objects ([`super::request_wake_object`]); not a
+    /// channel waiters are interested in.
     pub(super) const OBJECTS: u32 = 1 << 31;
 
-    /// 等待者等的对象（管道、eventfd、PTY、AF_UNIX 的 channel……）：对象的地址。
+    /// An object a waiter waits on (pipe, eventfd, PTY, AF_UNIX channel...): the object's address.
     pub type Object = usize;
 
-    /// `RefCell` 里的对象 `c` 的唤醒对象：里面的值的地址，与对象自己的方法里的
-    /// [`of_value`] 相同。
+    /// The wake object of object `c` in a `RefCell`: the address of the value inside, the same as
+    /// [`of_value`] inside the object's own methods.
     pub fn of<T>(c: &crate::cell::RefCell<T>) -> Object {
         c.as_ptr() as Object
     }
 
-    /// 在对象自己的方法里（只有 `&self`）：与 [`of`] 相同的地址。
+    /// Inside the object's own methods (with only `&self`): the same address as [`of`].
     pub fn of_value<T>(v: &T) -> Object {
         v as *const T as Object
     }
 }
 
-/// 不持 BKL 时请求的唤醒（不该有，留着兜底）：交给下一个放开任何一把 BKL 的线程。正常的
-/// 请求按线程记（[`PENDING`]）。
+/// Wake-ups requested without the BKL (there should be none; kept as a fallback): handed to the
+/// next thread that releases any BKL. Normal requests are recorded per thread ([`PENDING`]).
 static WAKE: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
-    /// 持有 BKL 时要触发的事件（[`signal_later`]）。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// Events to signal, recorded while holding the BKL ([`signal_later`]).
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static SIGNALS: std::cell::RefCell<Vec<Arc<Event>>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// 这个线程持有的 BKL（[`Shared::id`]），0 是没有。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// The BKL this thread holds ([`Shared::id`]), 0 meaning none.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// 这个线程持有 BKL 期间请求的唤醒：通道（[`wake`]）和对象，放开 BKL 时由同一个线程处理
-    /// （[`Kernel::flush_wakeups`]）。按线程记，不放在全局：同一个宿主进程里可以有几个内核
-    /// （测试、App 换内核、宿主改了仓库时 [`crate::machine::store_changed`] 去拿别的内核的
-    /// BKL），各有各的 BKL 和等待者，放在全局里会被别的内核放锁时取走、清掉，这边的等待者
-    /// 就一直睡着。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// Wake-ups requested while this thread holds the BKL: channels ([`wake`]) and objects,
+    /// processed by the same thread when it releases the BKL ([`Kernel::flush_wakeups`]).
+    /// Recorded per thread rather than globally: one host process can contain several kernels
+    /// (tests, the app switching kernels, [`crate::machine::store_changed`] taking another
+    /// kernel's BKL when the host changed the store), each with its own BKL and waiters; kept
+    /// globally, the requests would be taken and cleared when another kernel releases its lock,
+    /// and the waiters here would sleep forever.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static PENDING: std::cell::RefCell<(u32, Vec<wake::Object>)> =
         const { std::cell::RefCell::new((0, Vec::new())) };
 }
 
-/// 记下一次唤醒请求（[`request_wake`] 等）：持有 BKL 时记在这个线程上，否则（不该有）放进
-/// 全局的兜底里。
+/// Records a wake request ([`request_wake`] and the like): on this thread while holding the BKL,
+/// otherwise (which should not happen) in the global fallback.
 fn note_wake(channels: u32, object: Option<wake::Object>) {
     if HELD.get() != 0 {
         PENDING.with_borrow_mut(|(c, objects)| {
@@ -136,21 +154,22 @@ fn note_wake(channels: u32, object: Option<wake::Object>) {
     WAKE.fetch_or(channels, Ordering::Relaxed);
 }
 
-/// 当前线程持有 BKL。
+/// Whether the current thread holds the BKL.
 pub(crate) fn bkl_held() -> bool {
     HELD.get() != 0
 }
 
-/// 当前线程持有的是哪个内核的 BKL（[`Shared::id`]），0 是没有。只有检查的构建用
-/// （[`crate::vfs::store::Store::guard_with_bkl`]）。
+/// Which kernel's BKL the current thread holds ([`Shared::id`]), 0 meaning none. Used only by
+/// checking builds ([`crate::vfs::store::Store::guard_with_bkl`]).
 #[cfg(any(debug_assertions, feature = "borrow-check"))]
 pub(crate) fn bkl_holder() -> usize {
     HELD.get()
 }
 
-/// 放开 BKL 之后再触发 `event`。被叫醒的线程马上就要拿 BKL：放开之前叫醒它，它只会
-/// 再睡下去等锁，等这边放开时又要叫醒一次（shell 等子进程时每次都这样）。调用方持有
-/// BKL。
+/// Signals `event` only after the BKL is released. The woken thread will take the BKL right away:
+/// woken before the release, it would only go back to sleep waiting for the lock, and would need
+/// waking once more when this side releases it (every time a shell waits for a child). The caller
+/// holds the BKL.
 pub(crate) fn signal_later(event: &Arc<Event>) {
     SIGNALS.with_borrow_mut(|s| {
         if !s.iter().any(|e| Arc::ptr_eq(e, event)) {
@@ -159,198 +178,212 @@ pub(crate) fn signal_later(event: &Arc<Event>) {
     });
 }
 
-/// 不持 BKL 时请求叫醒的对象（[`WAKE`] 的兜底）。
+/// Objects requested to be woken without the BKL (the fallback of [`WAKE`]).
 static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
 
-/// 请求在释放 BKL 时唤醒所有等待中的线程。调用方持有 BKL。
+/// Requests that all waiting threads be woken when the BKL is released. The caller holds the BKL.
 pub(crate) fn request_wake() {
     note_wake(wake::ALL, None);
 }
 
-/// 文件锁、租约或者打开文件的位置锁放开了、变了：只叫醒关心 [`wake::LOCK`] 的等待者。
-/// 调用方持有 BKL。
+/// A file lock, lease or open-file position lock was released or changed: wakes only the waiters
+/// interested in [`wake::LOCK`]. The caller holds the BKL.
 pub(crate) fn request_wake_locks() {
     request_wake_on(wake::LOCK);
 }
 
-/// 请求在释放 BKL 时叫醒关心 `channels`（[`wake`]）里任何一个通道的等待者。调用方持有
-/// BKL。
+/// Requests that, when the BKL is released, the waiters interested in any channel in `channels`
+/// ([`wake`]) be woken. The caller holds the BKL.
 pub(crate) fn request_wake_on(channels: u32) {
     note_wake(channels, None);
 }
 
-/// 只影响对象 `object` 的修改（管道里的数据、eventfd 的计数、PTY 的输入输出、AF_UNIX
-/// channel 里的消息……）：只叫醒登记了这个对象的等待者（[`Cx::wait_object`]、
-/// [`Cx::wait_objects`]），以及没有指明对象的 [`wake::FILE`] 等待者。原来 shell 的每次
-/// 管道读写都把读着别的管道的进程（`$(...)` 外面的 shell、`tail`）叫醒一遍，poll、epoll
-/// 的等待者也被每一次这样的修改叫醒。调用方持有 BKL。
+/// A change that affects only object `object` (data in a pipe, an eventfd's count, a PTY's input
+/// and output, messages in an AF_UNIX channel...): wakes only the waiters that registered this
+/// object ([`Cx::wait_object`], [`Cx::wait_objects`]), plus [`wake::FILE`] waiters that named no
+/// objects. Every pipe read or write of a shell used to wake the processes reading other pipes
+/// (the shell outside `$(...)`, `tail`), and poll and epoll waiters were also woken by every such
+/// change. The caller holds the BKL.
 pub(crate) fn request_wake_object(object: wake::Object) {
     note_wake(wake::OBJECTS, Some(object));
 }
 
-/// 一个正在等待的线程：它的事件、它关心的通道（[`wake`]）和它等的对象（排好序；None
-/// 时任何对象上的修改都叫醒它）。一个 epoll 可能关注几千个文件，每次有对象被修改都要
-/// 查一遍，所以二分查找。
+/// A waiting thread: its event, the channels it is interested in ([`wake`]) and the objects it
+/// waits on (sorted; with None, a change on any object wakes it). One epoll may watch thousands
+/// of files, and the list is searched every time an object changes, hence binary search.
 type Waiter = (Arc<Event>, u32, Option<Box<[wake::Object]>>);
-/// 在等命名空间里的进程被回收的 pid 命名空间 1 号进程：命名空间、进程、可能变成孤儿的进程组。
+/// Pid 1 of a pid namespace waiting for the processes in the namespace to be reaped: the
+/// namespace, the process, and the process groups that may become orphaned.
 type HeldReaper = (Rc<crate::pidns::PidNs>, Rc<RefCell<ThreadGroup>>, Vec<Tid>);
 
-/// 持有 flock(2) 锁的打开文件（弱引用，关闭后锁随之释放），以及是不是排他锁。
+/// An open file holding a flock(2) lock (a weak reference; the lock is released with it when it is
+/// closed), and whether the lock is exclusive.
 pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool);
 
-/// 内核层的全局状态。
+/// The kernel layer's global state.
 pub(crate) struct Kernel {
-    /// 所有活着的线程。
+    /// All live threads.
     pub tasks: BTreeMap<Tid, Rc<Task>>,
-    /// 所有线程组，包括僵尸进程和 init。
+    /// All thread groups, including zombies and init.
     pub groups: BTreeMap<Tid, Rc<RefCell<ThreadGroup>>>,
-    /// 在新的 pid 命名空间里的线程、进程所在的那个命名空间（[`crate::pidns`]），编号不再
-    /// 使用时从各层的表里去掉。
+    /// For threads and processes in a new pid namespace, the namespace they are in
+    /// ([`crate::pidns`]); removed from each level's tables when the number is no longer used.
     pid_nss: std::collections::HashMap<Tid, Rc<crate::pidns::PidNs>>,
-    /// 退出了、在等命名空间里别的进程被回收的 pid 命名空间 1 号进程。
+    /// Pid 1 processes of pid namespaces that have exited and are waiting for the other processes
+    /// in the namespace to be reaped.
     held_reapers: Vec<HeldReaper>,
-    /// 执行引擎。
+    /// Execution engine.
     pub tier: Tier,
-    /// 宿主在等它结束的进程（[`crate::Machine::spawn`] 启动的进程）：结束后记下结束方式。
+    /// Processes whose end the host is waiting for (started by [`crate::Machine::spawn`]): how each
+    /// ended is recorded once it ends.
     pub watched: BTreeMap<Tid, Option<ExitStatus>>,
-    /// 根文件系统；没有时 guest 看不到任何文件系统。
+    /// Root filesystem; without it the guest sees no filesystem at all.
     pub vfs: Option<Rc<crate::vfs::Vfs>>,
-    /// Machine 正在关闭：定时器线程退出。
+    /// The Machine is shutting down: the timer thread exits.
     pub shutting_down: bool,
-    /// 已退出线程的 Tier 1 统计之和。
+    /// The sum of exited threads' Tier 1 statistics.
     pub dbt_stats: Option<DbtStats>,
-    /// 已退出线程用掉的 CPU 时间之和（`/proc/stat`）。
+    /// The total CPU time used by exited threads (`/proc/stat`).
     pub cpu: CpuTime,
-    /// 创建过的进程数（`/proc/stat` 的 processes）。
+    /// The number of processes created (processes in `/proc/stat`).
     pub forks: u64,
-    /// 本次运行的 `/proc/sys/kernel/random/boot_id`。
+    /// `/proc/sys/kernel/random/boot_id` of this run.
     pub boot_id: [u8; 16],
-    /// 所有 PTY，按所在的 devpts 实例（设备号）和实例里的编号；主设备和从设备都关闭之后
-    /// 条目失效。
+    /// All PTYs, by their devpts instance (device number) and their number within the instance; an
+    /// entry becomes stale once both master and slave are closed.
     pub ptys: BTreeMap<(u64, u32), Weak<RefCell<Tty>>>,
-    /// 宿主持有主设备的 PTY（[`crate::terminal`]），按 PTY 编号。
+    /// PTYs whose master the host holds ([`crate::terminal`]), by PTY number.
     pub consoles: BTreeMap<u32, crate::terminal::Console>,
-    /// flock(2) 的锁：每个 inode 上持有锁的打开文件，以及是不是排他锁。打开文件关闭后
-    /// 弱引用失效，锁随之释放。
+    /// flock(2) locks: for each inode, the open files holding a lock and whether it is exclusive.
+    /// Once an open file is closed its weak reference dies and the lock is released with it.
     pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
-    /// fcntl(2) 的记录锁。
+    /// fcntl(2) record locks.
     pub locks: crate::locks::Locks,
-    /// 开机时的 UTS、IPC 命名空间（[`crate::nsproxy`]）。
+    /// The boot-time UTS and IPC namespaces ([`crate::nsproxy`]).
     pub init_ns: crate::nsproxy::NsProxy,
-    /// 各个 IPC 命名空间里的 System V IPC 对象和 POSIX 消息队列，按命名空间的编号；没有
-    /// 线程用了的命名空间丢掉（[`Kernel::collect_ipc`]）。
+    /// The System V IPC objects and POSIX message queues of each IPC namespace, by namespace id;
+    /// namespaces that no thread uses any more are dropped ([`Kernel::collect_ipc`]).
     pub ipcs: BTreeMap<u64, (Weak<crate::nsproxy::IpcNs>, crate::ipc::Ipc)>,
-    /// cgroup 树（[`crate::cgroup`]）。
+    /// The cgroup tree ([`crate::cgroup`]).
     pub cgroups: crate::cgroup::Cgroups,
-    /// 加载了的 eBPF 程序的编号（[`crate::bpf`]）。
+    /// Ids of loaded eBPF programs ([`crate::bpf`]).
     pub bpf: crate::bpf::Registry,
-    /// 新建的网络命名空间（[`crate::nsproxy::NetNs`]）：分配宿主上的回环地址时避开还在用的。
+    /// Newly created network namespaces ([`crate::nsproxy::NetNs`]): host loopback addresses still
+    /// in use are avoided when allocating.
     net_nss: Vec<Weak<crate::nsproxy::NetNs>>,
-    /// AF_UNIX socket 绑定的地址。
+    /// Addresses bound by AF_UNIX sockets.
     pub unix: crate::unix::Names,
-    /// 消息里带着打开文件的 AF_UNIX channel（`unix::collect` 用）。
+    /// AF_UNIX channels with open files in their messages (for `unix::collect`).
     pub unix_inflight: Vec<Weak<RefCell<crate::unix::Channel>>>,
-    /// 正在被打开的命名管道（FIFO）：同一个 inode 的所有打开共用一个管道对象。
+    /// Named pipes (FIFOs) currently open: all opens of one inode share one pipe object.
     pub fifos: BTreeMap<Ino, Weak<RefCell<crate::pipe::Pipe>>>,
-    /// memfd 的封印（F_ADD_SEALS），以 inode 为键；不在这里的文件不能加封印。
+    /// memfd seals (F_ADD_SEALS), keyed by inode; files not in here cannot be sealed.
     pub seals: BTreeMap<Ino, u32>,
-    /// `/proc/sys/kernel/core_pattern`、`core_uses_pid`（`crate::coredump`）。
+    /// `/proc/sys/kernel/core_pattern`, `core_uses_pid` (`crate::coredump`).
     pub core_pattern: Vec<u8>,
     pub core_uses_pid: bool,
-    /// 内核日志（`syscall::misc::syslog`）：`/proc/sys/kernel/printk` 的四个级别（控制台、
-    /// 默认消息、控制台最低、控制台默认），`SYSLOG_ACTION_CONSOLE_OFF` 存下的控制台级别，
-    /// `/proc/sys/kernel/dmesg_restrict`。
+    /// Kernel log (`syscall::misc::syslog`): the four levels of `/proc/sys/kernel/printk`
+    /// (console, default message, minimum console, default console), the console level saved by
+    /// `SYSLOG_ACTION_CONSOLE_OFF`, and `/proc/sys/kernel/dmesg_restrict`.
     pub printk: [i32; 4],
     pub saved_console_loglevel: Option<i32>,
     pub dmesg_restrict: bool,
-    /// `/proc/sys/kernel/panic`：只记下，appine 的内核层没有 panic（内核 bug 只结束撞上它的
-    /// 进程）。
+    /// `/proc/sys/kernel/panic`: only recorded; appine's kernel layer has no panic (a kernel bug
+    /// ends only the process that hits it).
     pub panic: i32,
-    /// `/proc/sys/fs/protected_symlinks`、`protected_hardlinks`（Linux 的 `may_follow_link`、
-    /// `may_linkat`），默认与 systemd、Android 设的一样打开。
+    /// `/proc/sys/fs/protected_symlinks`, `protected_hardlinks` (Linux's `may_follow_link`,
+    /// `may_linkat`), on by default, as systemd and Android set them.
     pub protected_symlinks: bool,
     pub protected_hardlinks: bool,
-    /// `/proc/sys/kernel/unprivileged_bpf_disabled`：0 时没有能力的进程也能用 bpf(2) 的一部分
-    /// 命令，1 时改不回去，2（默认，`BPF_UNPRIV_DEFAULT_OFF`）时 root 可以改成 0。
+    /// `/proc/sys/kernel/unprivileged_bpf_disabled`: at 0, processes without capabilities may also
+    /// use some bpf(2) commands; at 1 it cannot be changed back; at 2 (the default,
+    /// `BPF_UNPRIV_DEFAULT_OFF`) root can change it to 0.
     pub unprivileged_bpf_disabled: u8,
-    /// 宿主按 inittab 启动了（[`crate::Machine::boot`]）：内置的 init 这时与 busybox 的一样
-    /// 处理 SIGTERM、SIGUSR1、SIGUSR2（[`crate::Power`]），收到的记在 `power` 里，由宿主
-    /// 取走（[`crate::Machine::take_power`]）去关机。
+    /// The host has booted from inittab ([`crate::Machine::boot`]): the built-in init then handles
+    /// SIGTERM, SIGUSR1 and SIGUSR2 like busybox's ([`crate::Power`]); what it receives is recorded
+    /// in `power` and taken by the host ([`crate::Machine::take_power`]) to shut down.
     pub init_handlers: bool,
     pub power: Option<crate::Power>,
-    /// 宿主开始关机、结束所有进程了（[`crate::Machine::shutdown`]、`kill_all`）：还在开机的
-    /// [`crate::Machine::boot`] 不再运行后面的命令。
+    /// The host has started shutting down and ending all processes ([`crate::Machine::shutdown`],
+    /// `kill_all`): a [`crate::Machine::boot`] still booting runs no further commands.
     pub stopping: bool,
-    /// 内核日志的记录（[`crate::klog`]）：`/dev/kmsg` 的打开文件也拿着它。
+    /// The kernel log records ([`crate::klog`]): open files of `/dev/kmsg` hold it too.
     pub klog: Rc<RefCell<crate::klog::Klog>>,
-    /// `/proc/sys/fs/pipe-max-size`：没有 `CAP_SYS_RESOURCE` 时管道的最大容量。
+    /// `/proc/sys/fs/pipe-max-size`: the largest pipe capacity without `CAP_SYS_RESOURCE`.
     pub pipe_max_size: usize,
-    /// `/proc/sys/fs/nr_open`：fd 的上限（`RLIMIT_NOFILE` 不能超过它）。
+    /// `/proc/sys/fs/nr_open`: the fd ceiling (`RLIMIT_NOFILE` cannot exceed it).
     pub nr_open: usize,
-    /// `/proc/sys/kernel/threads-max`：同时存在的线程数的上限，root 也受它限制。
+    /// `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing at once;
+    /// it applies to root too.
     pub threads_max: usize,
-    /// App 内存的上限和 OOM killer（[`crate::oom`]）。
+    /// The app's memory limit and the OOM killer ([`crate::oom`]).
     pub oom: crate::oom::Oom,
-    /// 内核层结束了的 guest 进程（内核 bug、引擎的宿主故障、OOM killer），等 App 取走
-    /// （[`crate::Machine::take_kills`]）。
+    /// Guest processes the kernel layer ended (kernel bugs, host faults in the engine, the OOM
+    /// killer), waiting for the app to take them ([`crate::Machine::take_kills`]).
     pub kills: RefCell<Vec<crate::bug::KillReport>>,
-    /// 同一个程序的地址空间共用 Tier 1 翻译的组（[`crate::mm::CodeGroup`]）。
+    /// Groups in which address spaces of the same program share Tier 1 translations
+    /// ([`crate::mm::CodeGroup`]).
     pub code_groups: crate::mm::CodeGroups,
-    /// 平均负载（[`crate::loadavg`]）。
+    /// Load average ([`crate::loadavg`]).
     pub load: crate::loadavg::LoadAvg,
-    /// 被跟踪的线程退出了、还没被跟踪者的 wait 取走的（[`crate::ptrace`]）。
+    /// Exits of traced threads not yet taken by the tracer's wait ([`crate::ptrace`]).
     pub trace_exits: Vec<crate::ptrace::TraceExit>,
     next_tid: Tid,
-    /// 正在等待的线程。
+    /// Waiting threads.
     waiters: Vec<Waiter>,
-    /// 等待中、因为边沿触发少等了一些事件的 epoll_wait（`syscall::poll`）。
+    /// Waiting epoll_waits that, because of edge triggering, leave some events out of what they
+    /// wait for (`syscall::poll`).
     pub edge_waiters: Vec<Arc<Event>>,
-    /// `EPOLLEXCLUSIVE` 关注的文件上等着的线程（`syscall::poll` 的独占门），由定时器线程
-    /// 检查。
+    /// Threads waiting on files watched with `EPOLLEXCLUSIVE` (the exclusive gates of
+    /// `syscall::poll`), checked by the timer thread.
     pub ex_gates: Vec<crate::syscall::ExGate>,
-    /// 设置了 `O_ASYNC` 的打开文件（`syscall::poll` 的 fasync）。
+    /// Open files with `O_ASYNC` set (the fasync of `syscall::poll`).
     pub fasync: Vec<crate::syscall::Fasync>,
-    /// 各个网络命名空间的 ICMP 汇集点（[`crate::rawicmp`]），由定时器线程看着。
+    /// The ICMP taps of the network namespaces ([`crate::rawicmp`]), watched by the timer thread.
     pub icmp_taps: Vec<std::rc::Weak<crate::cell::RefCell<crate::rawicmp::Tap>>>,
-    /// 文件租约，按 inode（`syscall::lease`）。
+    /// File leases, by inode (`syscall::lease`).
     pub leases: BTreeMap<Ino, Vec<crate::syscall::Lease>>,
-    /// `/proc/sys/fs/lease-break-time`：打破租约时最多等多少秒。
+    /// `/proc/sys/fs/lease-break-time`: the most seconds to wait when breaking a lease.
     pub lease_break_time: u64,
-    /// `/proc/sys/kernel/seccomp/actions_logged`：记哪些 seccomp 动作（`seccomp::logged`）。
+    /// `/proc/sys/kernel/seccomp/actions_logged`: which seccomp actions are logged
+    /// (`seccomp::logged`).
     pub seccomp_logged: u32,
-    /// 网络接口的流量计数（[`crate::traffic`]）。
+    /// Network interface traffic counters ([`crate::traffic`]).
     pub traffic: crate::traffic::Traffic,
-    /// 1024 以下的端口映射和 guest 在非回环地址上的监听（[`crate::portmap`]）。socket 的
-    /// 租约也引用它，所以用 Rc 共享。
+    /// The mapping of ports below 1024 and the guest's listeners on non-loopback addresses
+    /// ([`crate::portmap`]). Socket leases also refer to it, so it is shared through Rc.
     pub portmap: std::rc::Rc<crate::cell::RefCell<crate::portmap::PortMap>>,
-    /// 从宿主外面连到发布的端口的转发（[`crate::forward`]）。
+    /// Forwarding of connections from outside the host to published ports ([`crate::forward`]).
     pub forward: crate::forward::Forwarder,
-    /// 过滤链丢弃的 TCP 连接连去的宿主地址（`syscall::net::blackhole`），第一次用到时建。
+    /// The host address that TCP connections dropped by the filter chain connect to
+    /// (`syscall::net::blackhole`), created on first use.
     pub blackhole: std::cell::OnceCell<Option<Vec<u8>>>,
-    /// 被 nat 换过目的地址、还没被接受的 TCP 连接原来的目的地址（[`crate::origdst`]，
-    /// `SO_ORIGINAL_DST`）。
+    /// The original destination addresses of TCP connections whose destination was rewritten by
+    /// nat and that have not been accepted yet ([`crate::origdst`], `SO_ORIGINAL_DST`).
     pub orig_dst: crate::origdst::Table,
-    /// 宿主交来的主表路由（[`crate::Machine::set_routes`]，Android 上取自 `LinkProperties`），
-    /// None 时读宿主的（[`crate::route`]）。
+    /// Main-table routes handed over by the host ([`crate::Machine::set_routes`], taken from
+    /// `LinkProperties` on Android); when None, the host's are read ([`crate::route`]).
     pub host_routes: Option<Vec<appine_hal::net::Route>>,
-    /// AIO 上下文占用的事件数（`/proc/sys/fs/aio-nr`）和上限（`aio-max-nr`）。
+    /// The events taken by AIO contexts (`/proc/sys/fs/aio-nr`) and the limit (`aio-max-nr`).
     pub aio_nr: u64,
     pub aio_max_nr: u64,
-    /// 写过的 `/proc/sys/user/max_*_namespaces`（按名字；只记下，不实际限制）。
+    /// The written `/proc/sys/user/max_*_namespaces` values (by name; only recorded, not actually
+    /// enforced).
     pub max_namespaces: BTreeMap<Vec<u8>, u64>,
-    /// inotify 的所有监视。打开文件析构时要报告 `IN_CLOSE_*`，所以用 Rc 共享。
+    /// All inotify watches. Open files must report `IN_CLOSE_*` when destroyed, so it is shared
+    /// through Rc.
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
-    /// 所有地址空间共用的只读文件映射（[`crate::mm::FileMaps`]）。
+    /// Read-only file mappings shared by all address spaces ([`crate::mm::FileMaps`]).
     pub file_maps: crate::mm::FileMaps,
 }
 
-// SAFETY: Kernel 及其中的 Rc/RefCell 只在持有 BKL（Shared::kernel 这把锁）时访问，
-// 见模块文档
+// SAFETY: Kernel and the Rc/RefCell in it are accessed only while holding the BKL (the
+// Shared::kernel lock), see the module docs
 unsafe impl Send for Kernel {}
 
 impl Kernel {
     pub fn new(tier: Tier) -> Kernel {
-        // 在任何 guest 线程改变宿主亲和性之前记下宿主的 CPU
+        // Record the host's CPUs before any guest thread changes the host affinity
         appine_hal::host_cpus();
         let init_ns = crate::nsproxy::NsProxy::init();
         Kernel {
@@ -390,8 +423,8 @@ impl Kernel {
             seals: BTreeMap::new(),
             core_pattern: b"core".to_vec(),
             core_uses_pid: false,
-            // CONSOLE_LOGLEVEL_DEFAULT、MESSAGE_LOGLEVEL_DEFAULT、CONSOLE_LOGLEVEL_MIN 的默认
-            // 配置；没有 CONFIG_SECURITY_DMESG_RESTRICT
+            // The default configuration of CONSOLE_LOGLEVEL_DEFAULT, MESSAGE_LOGLEVEL_DEFAULT and
+            // CONSOLE_LOGLEVEL_MIN; no CONFIG_SECURITY_DMESG_RESTRICT
             printk: [7, 4, 1, 7],
             saved_console_loglevel: None,
             dmesg_restrict: false,
@@ -434,7 +467,7 @@ impl Kernel {
         }
     }
 
-    /// 分配一个没有被线程或线程组（含僵尸进程）占用的 tid。
+    /// Allocates a tid not taken by a thread or a thread group (zombies included).
     pub fn alloc_tid(&mut self) -> Result<Tid, Errno> {
         for _ in 0..PID_MAX {
             let tid = self.next_tid;
@@ -446,11 +479,13 @@ impl Kernel {
         Err(Errno::EAGAIN)
     }
 
-    /// 给 pid 命名空间 `ns` 里的新线程、进程选好全局编号（Linux 的 `alloc_pid` 的检查部分）。
-    /// `set_tid` 是 clone3 指定的各层编号，从 `ns` 那层起往外：层数不能比 `ns` 的多，
-    /// 编号在 1 到 pid_max 之间、命名空间里还没有进程时只能是 1（EINVAL），`cred` 要在那层的
-    /// 属主里有 `CAP_SYS_ADMIN` 或者 `CAP_CHECKPOINT_RESTORE`（EPERM），编号已经有人用了是
-    /// EEXIST。指定了全局编号就用它，否则另外分配。
+    /// Chooses the global number for a new thread or process in pid namespace `ns` (the checking
+    /// part of Linux's `alloc_pid`). `set_tid` holds the numbers clone3 specified for each level,
+    /// from the level of `ns` outwards: there may not be more levels than `ns` has; each number
+    /// must be between 1 and pid_max, and must be 1 while the namespace has no process yet
+    /// (EINVAL); `cred` must have `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` in that level's
+    /// owner (EPERM); a number already in use is EEXIST. If the global number is specified it is
+    /// used, otherwise one is allocated.
     pub fn choose_pid(
         &mut self,
         ns: &Rc<crate::pidns::PidNs>,
@@ -486,9 +521,10 @@ impl Kernel {
         }
     }
 
-    /// 新建一个空的 IPC 命名空间，属于用户命名空间 `owner`（Linux 的 `create_ipc_ns`：
-    /// 限制都是默认值）。`creator` 是建立它的进程的 fsuid、fsgid：mqueue 文件系统的根目录
-    /// 属于它（`mq_init_ns` 里 `mqueue_get_inode` 取 `current_fsuid()`）。
+    /// Creates an empty IPC namespace owned by user namespace `owner` (Linux's `create_ipc_ns`:
+    /// all limits at their defaults). `creator` is the fsuid and fsgid of the process creating it:
+    /// the root directory of the mqueue filesystem belongs to them (`mqueue_get_inode` in
+    /// `mq_init_ns` takes `current_fsuid()`).
     pub fn new_ipc_ns(
         &mut self,
         owner: Rc<crate::cred::UserNs>,
@@ -507,9 +543,10 @@ impl Kernel {
         ns
     }
 
-    /// 新建一个网络命名空间，属于用户命名空间 `owner`：里面只有关着的 lo，宿主上的回环
-    /// 地址 127.a.b.0/24 取一个还没有命名空间用的（a、b 不全为 0）；IPv4 的 sysctl 照抄
-    /// 开机时的命名空间现在的（[`crate::netconf`]）。
+    /// Creates a network namespace owned by user namespace `owner`: it contains only a down lo;
+    /// it takes a host loopback range 127.a.b.0/24 that no namespace uses yet (a and b not both
+    /// 0); the IPv4 sysctls are copied from the boot-time namespace's current ones
+    /// ([`crate::netconf`]).
     pub fn new_net_ns(
         &mut self,
         owner: Rc<crate::cred::UserNs>,
@@ -520,8 +557,9 @@ impl Kernel {
             .iter()
             .filter_map(|w| w.upgrade().and_then(|n| n.host_net))
             .collect();
-        // 127.255.0.0/16 留给开机时的命名空间里的虚拟地址（crate::netns::INIT_BLOCK），
-        // 127.254.0.0/16 留给从外面转发进来的连接（crate::forward::OUTSIDE_BLOCK）
+        // 127.255.0.0/16 is reserved for virtual addresses in the boot-time namespace
+        // (crate::netns::INIT_BLOCK), 127.254.0.0/16 for connections forwarded in from outside
+        // (crate::forward::OUTSIDE_BLOCK)
         let net = (1..=u16::MAX)
             .map(u16::to_be_bytes)
             .find(|n| {
@@ -544,14 +582,15 @@ impl Kernel {
         Ok(ns)
     }
 
-    /// 所有活着的网络命名空间，开机时的在前（地址换算用，[`crate::netns::World`]）。
+    /// All live network namespaces, the boot-time one first (for address translation,
+    /// [`crate::netns::World`]).
     pub fn world(&self) -> crate::netns::World {
         let mut all = vec![self.init_ns.net.clone()];
         all.extend(self.net_nss.iter().filter_map(Weak::upgrade));
         crate::netns::World { all }
     }
 
-    /// IPC 命名空间 `id` 里的对象。
+    /// The objects in IPC namespace `id`.
     pub fn ipc(&self, id: u64) -> &crate::ipc::Ipc {
         &self.ipcs[&id].1
     }
@@ -560,14 +599,14 @@ impl Kernel {
         &mut self.ipcs.get_mut(&id).expect("IPC namespace in use").1
     }
 
-    /// 没有线程用了的 IPC 命名空间：丢掉里面的对象（Linux 的 `free_ipc_ns`；共享内存段
-    /// 还映射着的，内存由映射留着）。
+    /// IPC namespaces that no thread uses any more: drops the objects in them (Linux's
+    /// `free_ipc_ns`; for shared memory segments still mapped, the mappings keep the memory).
     pub fn collect_ipc(&mut self) {
         self.ipcs.retain(|_, (ns, _)| ns.strong_count() > 0);
     }
 
-    /// 新的线程、进程 `tid` 在 pid 命名空间 `ns` 里：在各层分配编号（[`crate::pidns`]），
-    /// `set_tid` 见 [`Kernel::choose_pid`]。
+    /// New thread or process `tid` is in pid namespace `ns`: allocates its number at each level
+    /// ([`crate::pidns`]); for `set_tid` see [`Kernel::choose_pid`].
     pub fn register_pid(
         &mut self,
         ns: &Rc<crate::pidns::PidNs>,
@@ -582,8 +621,10 @@ impl Kernel {
         Ok(())
     }
 
-    /// 线程退出、僵尸进程被回收之后：编号 `tid` 线程和进程都不再用了，从各层的表里去掉。
-    /// 等着命名空间里的进程都被回收的 1 号进程（[`Kernel::hold_reaper`]）这时等到了就结束。
+    /// After a thread exits or a zombie is reaped: when number `tid` is used by neither a thread
+    /// nor a process any more, removes it from each level's tables. A pid 1 waiting for all
+    /// processes in its namespace to be reaped ([`Kernel::hold_reaper`]) finishes at this point
+    /// if its wait is over.
     pub fn release_pid(&mut self, tid: Tid) {
         if !self.tasks.contains_key(&tid)
             && !self.groups.contains_key(&tid)
@@ -600,8 +641,9 @@ impl Kernel {
         }
     }
 
-    /// pid 命名空间 `ns` 的 1 号进程 `group` 退出了，命名空间里还有别的进程：等它们都被
-    /// 回收了再报告给父进程（`pgrps` 是 [`crate::process::finish_group`] 算好的进程组）。
+    /// Pid 1 `group` of pid namespace `ns` has exited while other processes remain in the
+    /// namespace: reports to the parent only once they have all been reaped (`pgrps` are the
+    /// process groups [`crate::process::finish_group`] computed).
     pub fn hold_reaper(
         &mut self,
         ns: Rc<crate::pidns::PidNs>,
@@ -611,24 +653,25 @@ impl Kernel {
         self.held_reapers.push((ns, group, pgrps));
     }
 
-    /// 进程 `tgid` 所在的 pid 命名空间。
+    /// The pid namespace that process `tgid` is in.
     pub fn pid_ns_of(&self, tgid: Tid) -> Rc<crate::pidns::PidNs> {
         self.groups
             .get(&tgid)
             .map_or_else(crate::pidns::PidNs::init, |g| g.borrow().pid_ns.clone())
     }
 
-    /// 全局编号 `g` 在进程 `viewer` 的 pid 命名空间里的编号，看不到时是 0。
+    /// The number of global number `g` in the pid namespace of process `viewer`, 0 when it cannot
+    /// be seen.
     pub fn pid_seen_by(&self, viewer: Tid, g: Tid) -> Tid {
         self.pid_ns_of(viewer).vnr(g).unwrap_or(0)
     }
 
-    /// 最后分配的 tid（`/proc/sys/kernel/ns_last_pid`）。
+    /// The last allocated tid (`/proc/sys/kernel/ns_last_pid`).
     pub fn last_pid(&self) -> Tid {
         self.next_tid - 1
     }
 
-    /// 写 `ns_last_pid`：之后从 `pid + 1` 开始分配（被占用的跳过）。
+    /// Writes `ns_last_pid`: allocation then starts from `pid + 1` (skipping those taken).
     pub fn set_last_pid(&mut self, pid: Tid) {
         self.next_tid = if pid >= PID_MAX {
             INIT + 1
@@ -637,7 +680,7 @@ impl Kernel {
         };
     }
 
-    /// 所有 fd 表里的打开文件。同一个打开文件在几个 fd 表里时出现几次。
+    /// The open files in all fd tables. An open file in several fd tables appears that many times.
     pub(crate) fn open_files(&self) -> Vec<FileRef> {
         let mut tables: Vec<Rc<RefCell<FdTable>>> = Vec::new();
         let mut files = Vec::new();
@@ -685,45 +728,54 @@ impl Kernel {
     }
 }
 
-/// 取 BKL 时最多自旋多久（[`Shared::lock`]）。原来自旋 100 次（不到 1 微秒），四个
-/// 进程同时起进程时总吞吐还不如一个：持锁的线程一放开，等锁的线程都已经睡下，叫醒它们
-/// 的这段时间锁空着。10 到 60 微秒都差不多，更长时自旋的线程反而占了持锁线程的核。
+/// How long at most to spin when taking the BKL ([`Shared::lock`]). It used to spin 100 times
+/// (under 1 µs), and with four processes starting processes at once the total throughput was lower
+/// than with one: as soon as the holder released the lock, the waiters had all gone to sleep, and
+/// the lock stayed free while they were being woken. Anything from 10 to 60 µs is about the same;
+/// with longer spins the spinning threads take the holder's core instead.
 const BKL_SPIN: std::time::Duration = std::time::Duration::from_micros(30);
 
-/// 同时最多几个等 BKL 的线程自旋（[`Shared::lock`]），其余的直接睡下：宿主 CPU 数的一半，
-/// 1 到 4 个。原来只让一个自旋，8 个核上 8 个进程同时起进程时锁几乎一直有人等，自旋的
-/// 那个一拿到锁，下一次交接就只能叫醒睡着的，叫醒的这段时间锁空着（占了三成的时间）。
-/// 让 4 个自旋，同时 exec 快 7–10%、跑管道快 13%，这时多用 18% 的 CPU；go build、Maven
-/// 不变。再多没有更快，自旋的线程反而要占持锁线程的核。
+/// The most threads waiting for the BKL that spin at once ([`Shared::lock`]); the rest go straight
+/// to sleep: half the host CPUs, 1 to 4. It used to let only one spin; with 8 processes starting
+/// processes at once on 8 cores the lock almost always had waiters, and as soon as the spinning one
+/// got the lock, the next handover could only wake a sleeper, with the lock free while it woke
+/// (30% of the time). Letting 4 spin makes concurrent exec 7–10% faster and pipelines 13% faster,
+/// using 18% more CPU; go build and Maven are unchanged. More is not faster; the spinning threads
+/// would take the holder's core instead.
 fn max_spinners() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
 }
 
-/// 所有 guest 线程共享的内核对象。
+/// Kernel objects shared by all guest threads.
 pub(crate) struct Shared {
     kernel: Mutex<Kernel>,
-    /// 有线程持有 BKL（只是提示）：等锁的线程自旋时只读它，看起来空了才去抢，不让锁所在
-    /// 的缓存行在几个核之间来回。
+    /// Some thread holds the BKL (only a hint): waiters read only this while spinning and try to
+    /// take the lock only when it looks free, so that the lock's cache line does not bounce
+    /// between cores.
     held: AtomicBool,
-    /// 在自旋等 BKL 的线程数：最多 [`max_spinners`] 个，别的直接睡下，不白占几个核。
+    /// The number of threads spinning for the BKL: at most [`max_spinners`]; the others go
+    /// straight to sleep rather than wasting cores.
     spinning: AtomicU32,
-    /// 叫醒定时器线程。
+    /// Wakes the timer thread.
     pub timers: Arc<Event>,
-    /// 定时器线程的定期检查（内存上限 [`crate::oom`]、平均负载 [`crate::loadavg`]）停下来了：
-    /// 所有线程都在等待。
+    /// The timer thread's periodic checks (memory limit [`crate::oom`], load average
+    /// [`crate::loadavg`]) have stopped: all threads are waiting.
     pub checks_idle: AtomicBool,
-    /// 线程为不持 BKL 的系统调用记下的状态可能过时了就加一（[`Shared::fast_changed`]）。
+    /// Incremented whenever the state threads recorded for no-BKL syscalls may be stale
+    /// ([`Shared::fast_changed`]).
     fast: AtomicU64,
-    /// futex 的等待队列。不持 BKL 的 futex（`syscall::fast`）只取这把锁；持有 BKL 时也可以
-    /// 再取它，反过来不行。检查 futex 的值和登记成为等待者在同一次持锁里做，唤醒也要
-    /// 取它，所以两者之间不会漏掉唤醒。
+    /// The futex wait queue. No-BKL futexes (`syscall::fast`) take only this lock; it may also be
+    /// taken while holding the BKL, but not the other way round. Checking the futex value and
+    /// registering as a waiter happen in one hold of it, and waking takes it too, so no wake-up
+    /// is lost between the two.
     futexes: Mutex<Futexes>,
 }
 
 impl Shared {
-    /// 区分同一个宿主进程里的几个内核（测试、App 换内核时）：[`bkl_holder`] 用它说持的是
-    /// 哪一把 BKL。取 [`Shared::held`] 的地址，Shared 活着时不变，不会是 0。
+    /// Distinguishes the kernels in one host process (in tests, when the app switches kernels):
+    /// [`bkl_holder`] uses it to tell which BKL is held. It is the address of [`Shared::held`],
+    /// which does not change while Shared lives and is never 0.
     pub fn id(&self) -> usize {
         &self.held as *const AtomicBool as usize
     }
@@ -740,23 +792,25 @@ impl Shared {
         }
     }
 
-    /// 线程为不持 BKL 的系统调用记下的状态（`syscall::fast`）可能过时了：某个线程的根目录、
-    /// 当前目录或者凭据变了。持有 BKL 时调用。
+    /// The state threads recorded for no-BKL syscalls (`syscall::fast`) may be stale: some
+    /// thread's root directory, current directory or credentials changed. Called while holding
+    /// the BKL.
     pub fn fast_changed(&self) {
         self.fast.fetch_add(1, Ordering::Release);
     }
 
-    /// [`Shared::fast_changed`] 的次数。
+    /// The number of [`Shared::fast_changed`] calls.
     pub fn fast_epoch(&self) -> u64 {
         self.fast.load(Ordering::Acquire)
     }
 
-    /// futex 的等待队列（[`Shared::futexes`]）。
+    /// The futex wait queue ([`Shared::futexes`]).
     pub fn futexes(&self) -> MutexGuard<'_, Futexes> {
         self.futexes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 线程要接着执行 guest 代码了：定期检查停着时叫醒定时器线程。不需要持有 BKL。
+    /// The thread is about to go on running guest code: wakes the timer thread if the periodic
+    /// checks are stopped. Does not need the BKL.
     pub fn resume_checks(&self) {
         if self.checks_idle.load(Ordering::Relaxed)
             && self.checks_idle.swap(false, Ordering::Relaxed)
@@ -765,13 +819,16 @@ impl Shared {
         }
     }
 
-    /// 获取 BKL。内核层 panic 时锁会中毒：出问题的进程已经被结束（[`crate::bug`]），
-    /// 其余的照常使用它。
+    /// Takes the BKL. A kernel-layer panic poisons the lock: the offending process has already
+    /// been ended ([`crate::bug`]), and the rest go on using it as usual.
     ///
-    /// 持锁的时间通常只有几微秒（一次 lstat），长的（execve、fork、进程退出）十几到几十
-    /// 微秒，先自旋最多 [`BKL_SPIN`]：睡下再被叫醒要几十微秒，释放的一方还要多一次 futex
-    /// 唤醒，锁在这期间空着。`git status` 的并行 lstat 原来比单线程还慢。自旋只读
-    /// [`Shared::held`]，看起来空了才去抢；已经有 [`max_spinners`] 个在自旋时直接睡下。
+    /// The lock is usually held for only a few microseconds (one lstat), and long holds (execve,
+    /// fork, process exit) last from about ten to several tens of microseconds, so first spin for
+    /// at most [`BKL_SPIN`]: going to sleep and being woken takes tens of microseconds, the
+    /// releasing side needs one more futex wake, and the lock stays free meanwhile. Parallel
+    /// lstat in `git status` used to be slower than single-threaded. Spinning reads only
+    /// [`Shared::held`] and tries to take the lock only when it looks free; when [`max_spinners`]
+    /// threads are already spinning, go straight to sleep.
     pub fn lock(&self) -> Bkl<'_> {
         if let Ok(k) = self.kernel.try_lock() {
             return Bkl::new(k, &self.held);
@@ -789,7 +846,8 @@ impl Shared {
         )
     }
 
-    /// 自旋等 BKL，最多 [`BKL_SPIN`]；调用方已经把 [`Shared::spinning`] 加了一，这里减掉。
+    /// Spins for the BKL, for at most [`BKL_SPIN`]; the caller has already incremented
+    /// [`Shared::spinning`], and it is decremented here.
     fn spin(&self) -> Option<Bkl<'_>> {
         let mut deadline = None;
         for i in 0u32.. {
@@ -805,7 +863,8 @@ impl Shared {
                 }
             }
             std::hint::spin_loop();
-            // 读时钟比自旋一圈贵得多，隔一阵看一次
+            // Reading the clock costs much more than one spin iteration, so look only every so
+            // often
             if i % 64 == 63 {
                 let now = Instant::now();
                 if now >= *deadline.get_or_insert(now + BKL_SPIN) {
@@ -818,8 +877,8 @@ impl Shared {
     }
 }
 
-/// 持有 BKL 的凭证；释放时唤醒等待中的线程，再把持有期间释放的宿主内存交还宿主
-/// （[`crate::mm::release_unmapped`]）。
+/// Proof of holding the BKL; on release it wakes the waiting threads, then returns to the host
+/// the host memory released while it was held ([`crate::mm::release_unmapped`]).
 pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>, &'a AtomicBool);
 
 impl<'a> Bkl<'a> {
@@ -846,14 +905,15 @@ impl DerefMut for Bkl<'_> {
 
 impl Drop for Bkl<'_> {
     fn drop(&mut self) {
-        // 持有期间关掉了最后一个主设备的终端要挂断，挂断要发信号、叫醒等待者
+        // A terminal whose last master was closed while the lock was held must be hung up, and
+        // hanging up sends signals and wakes waiters
         let k: &mut Kernel = &mut self.0;
         if crate::bug::catch(|| crate::syscall::hang_up_closed(k)).is_none() {
             crate::bug::report(format_args!("kernel panic while hanging up terminals"));
         }
         self.0.flush_wakeups();
         self.1.store(false, Ordering::Relaxed);
-        // SAFETY: 之后不再使用 self.0
+        // SAFETY: self.0 is not used after this
         unsafe { ManuallyDrop::drop(&mut self.0) };
         HELD.set(0);
         crate::task::pool::notify_pending();
@@ -863,15 +923,16 @@ impl Drop for Bkl<'_> {
     }
 }
 
-/// 触发 [`signal_later`] 攒下的事件。
+/// Signals the events collected by [`signal_later`].
 pub(crate) fn flush_signals() {
     SIGNALS.with_borrow_mut(|s| s.drain(..).for_each(|e| e.signal()));
 }
 
-/// 释放 BKL 等待：事件被触发（[`request_wake`]、信号）、`host` 里的宿主 fd 就绪或者
-/// 到达 `deadline` 时重新获取 BKL 返回。调用方重新检查自己的条件。`interest` 是关心的
-/// 通道（[`wake`]）；为 0 时不登记在 [`request_wake`] 要叫醒的名单里，只有直接通知
-/// `event` 才会醒（futex）。
+/// Releases the BKL and waits: re-takes the BKL and returns when the event is signalled
+/// ([`request_wake`], signals), a host fd in `host` becomes ready, or `deadline` is reached. The
+/// caller re-checks its own condition. `interest` is the channels of interest ([`wake`]); when it
+/// is 0 the waiter is not put on the list [`request_wake`] wakes, and wakes only when `event` is
+/// signalled directly (futex).
 pub(crate) fn block<'a>(
     shared: &'a Shared,
     k: Bkl<'a>,
@@ -883,8 +944,8 @@ pub(crate) fn block<'a>(
     block_for(shared, k, event, deadline, host, interest, None)
 }
 
-/// [`block`]；`objects` 不为 None 时，只影响别的对象的修改（[`request_wake_object`]）
-/// 不叫醒它。
+/// [`block`]; when `objects` is not None, changes that affect only other objects
+/// ([`request_wake_object`]) do not wake it.
 pub(crate) fn block_for<'a>(
     shared: &'a Shared,
     mut k: Bkl<'a>,
@@ -920,20 +981,21 @@ pub(crate) fn block_for<'a>(
     }
     let r = match r {
         Ok(_) => Ok(()),
-        // 宿主信号打断 poll（比如调试器）：当作一次普通的唤醒
+        // A host signal interrupted poll (a debugger, say): treat it as an ordinary wake-up
         Err(e) if e == Errno::EINTR.0 => Ok(()),
         Err(e) => Err(Errno(e)),
     };
     (k, r)
 }
 
-/// 一次进入内核（syscall、信号投递）的上下文：持有 BKL 的凭证和当前线程。
+/// The context of one entry into the kernel (syscall, signal delivery): the proof of holding the
+/// BKL, and the current thread.
 pub(crate) struct Cx<'a> {
     pub shared: &'a Arc<Shared>,
     k: Option<Bkl<'a>>,
-    /// 当前线程里其他线程也会访问的部分。
+    /// The part of the current thread that other threads also access.
     pub task: &'a Rc<Task>,
-    /// 当前线程私有的状态。
+    /// The current thread's private state.
     pub t: &'a mut TaskState,
 }
 
@@ -952,107 +1014,113 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// 全局状态。
+    /// Global state.
     pub fn k(&mut self) -> &mut Kernel {
         self.k.as_mut().expect("BKL is held")
     }
 
-    /// 只读的全局状态。
+    /// Read-only global state.
     pub fn kr(&self) -> &Kernel {
         self.k.as_ref().expect("BKL is held")
     }
 
-    /// 当前线程的 tid。
+    /// The current thread's tid.
     pub fn tid(&self) -> Tid {
         self.task.tid.get()
     }
 
-    /// 当前进程的 pid（线程组 ID）。
+    /// The current process's pid (thread group ID).
     pub fn tgid(&self) -> Tid {
         self.task.tgid
     }
 
-    /// 地址空间。
+    /// Address space.
     pub fn mm(&self) -> Ref<'_, Mm> {
         self.t.mm.borrow()
     }
 
-    /// 可修改的地址空间。
+    /// Mutable address space.
     pub fn mm_mut(&self) -> RefMut<'_, Mm> {
         self.t.mm.borrow_mut()
     }
 
-    /// 让 `addr` 上面紧挨着的向下增长的映射（主线程栈、`MAP_GROWSDOWN`）长到它所在的页，
-    /// 大小不超过 `RLIMIT_STACK` 的当前值（[`Mm::grow_down`]）。
+    /// Grows the grows-down mapping (the main thread's stack, `MAP_GROWSDOWN`) right above `addr`
+    /// to reach the page containing it, to a size of at most the current `RLIMIT_STACK`
+    /// ([`Mm::grow_down`]).
     pub fn grow_stack(&self, addr: u64) -> bool {
         let limit = self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0;
         self.mm_mut().grow_down(addr, limit)
     }
 
-    /// syscall 入口：SP 已经低于主线程栈的底部（程序分配了大的栈帧但还没碰）时，先让栈
-    /// 长到 SP。syscall 用到的栈上缓冲区都在 SP 以上（arm64 没有 red zone），这样内核
-    /// 访问它们时与 Linux 一样不会 EFAULT。SP 在栈里（常见情况）只比较一次。
+    /// Syscall entry: when SP is already below the bottom of the main thread's stack (the program
+    /// allocated a large stack frame but has not touched it yet), first grow the stack to SP. The
+    /// on-stack buffers syscalls use are all above SP (arm64 has no red zone), so the kernel
+    /// accessing them does not get EFAULT, as on Linux. When SP is within the stack (the common
+    /// case) this is a single comparison.
     pub fn grow_stack_to(&self, sp: u64) {
         if sp >= self.mm().stack_low() {
             return;
         }
         let limit = self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0;
-        // 别的线程的栈在 mmap 区里，离主线程栈远得多：不用查
+        // Other threads' stacks are in the mmap area, much farther from the main thread's stack:
+        // no need to check
         if crate::loader::STACK_TOP - sp <= limit {
             self.mm_mut().grow_down(sp, limit);
         }
     }
 
-    /// fd 表。
+    /// fd table.
     pub fn fds(&self) -> Ref<'_, FdTable> {
         self.t.fds.borrow()
     }
 
-    /// 可修改的 fd 表。
+    /// Mutable fd table.
     pub fn fds_mut(&self) -> RefMut<'_, FdTable> {
         self.t.fds.borrow_mut()
     }
 
-    /// 根文件系统；没有 rootfs 时 guest 看不到任何文件。
+    /// Root filesystem; without a rootfs the guest sees no files.
     pub fn vfs(&self) -> Result<Rc<Vfs>, Errno> {
         self.t.vfs.clone().ok_or(Errno::ENOENT)
     }
 
-    /// 当前目录。
+    /// Current directory.
     pub fn cwd(&self) -> Node {
         self.t.fs.borrow().cwd.clone()
     }
 
-    /// 根目录（chroot）。
+    /// Root directory (chroot).
     pub fn root(&self) -> Node {
         self.t.fs.borrow().root.clone()
     }
 
-    /// 挂载命名空间的编号。
+    /// The mount namespace's id.
     pub fn mnt_ns(&self) -> u64 {
         self.t.fs.borrow().mnt_ns.id
     }
 
-    /// 换掉地址空间（execve），同时更新 procfs 能看到的那份。
+    /// Replaces the address space (execve), also updating the copy procfs sees.
     pub fn set_mm(&mut self, mm: Rc<RefCell<Mm>>) {
         self.task.res.borrow_mut().mm = mm.clone();
         self.t.mm = mm;
     }
 
-    /// 换掉 fd 表（execve、close_range 不再共享时），同时更新 procfs 能看到的那份。
+    /// Replaces the fd table (when execve or close_range stops sharing it), also updating the
+    /// copy procfs sees.
     pub fn set_fds(&mut self, fds: Rc<RefCell<FdTable>>) {
         self.task.res.borrow_mut().fds = fds.clone();
         self.t.fds = fds;
     }
 
-    /// 换掉根目录、当前目录和 umask（unshare），同时更新 procfs 能看到的那份。
+    /// Replaces the root directory, current directory and umask (unshare), also updating the copy
+    /// procfs sees.
     pub fn set_fs(&mut self, fs: Rc<RefCell<crate::task::FsContext>>) {
         self.task.res.borrow_mut().fs = fs.clone();
         self.t.fs = fs;
         self.shared.fast_changed();
     }
 
-    /// procfs、devpts 的视图（路径解析用）。
+    /// The procfs and devpts view (for path resolution).
     pub fn view<'v>(&'v self, vfs: &'v Vfs) -> crate::pseudo::View<'v> {
         crate::pseudo::View {
             k: self.kr(),
@@ -1062,8 +1130,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// 所在的 UTS、IPC 命名空间。
-    /// 线程所在的 time 命名空间里时钟 `clock` 的偏移（纳秒）。
+    /// The UTS and IPC namespaces it is in.
+    /// The offset (nanoseconds) of clock `clock` in the thread's time namespace.
     pub fn time_offset(&self, clock: i32) -> i64 {
         self.task.ns.borrow().time.offset(clock)
     }
@@ -1072,7 +1140,7 @@ impl<'a> Cx<'a> {
         self.task.ns.borrow().clone()
     }
 
-    /// 所在的 IPC 命名空间里的对象。
+    /// The objects in its IPC namespace.
     pub fn ipc(&self) -> &crate::ipc::Ipc {
         let id = self.task.ns.borrow().ipc.id;
         self.kr().ipc(id)
@@ -1083,24 +1151,26 @@ impl<'a> Cx<'a> {
         self.k().ipc_mut(id)
     }
 
-    /// 所在的 pid 命名空间。
+    /// The pid namespace it is in.
     pub fn pid_ns(&self) -> Rc<crate::pidns::PidNs> {
         self.t.group.borrow().pid_ns.clone()
     }
 
-    /// 新建的子进程所在的 pid 命名空间。
+    /// The pid namespace new child processes go into.
     pub fn pid_ns_children(&self) -> Rc<crate::pidns::PidNs> {
         let ns = self.task.pid_ns_children.borrow().clone();
         ns.unwrap_or_else(|| self.pid_ns())
     }
 
-    /// 全局编号 `g` 在自己的 pid 命名空间里的编号，看不到时是 0（返回给 guest 的 pid）。
+    /// The number of global number `g` in its own pid namespace, 0 when it cannot be seen (the pid
+    /// returned to the guest).
     pub fn pid_out(&self, g: Tid) -> Tid {
         self.pid_ns().vnr(g).unwrap_or(0)
     }
 
-    /// guest 给的 pid（自己的 pid 命名空间里的编号）对应的全局编号，看不到的是一个不存在
-    /// 的编号；0 和负数不变（Linux 的 `find_vpid`）。
+    /// The global number for a pid given by the guest (a number in its own pid namespace); one
+    /// that cannot be seen becomes a number that does not exist; 0 and negatives are unchanged
+    /// (Linux's `find_vpid`).
     pub fn pid_in(&self, l: Tid) -> Tid {
         if l <= 0 {
             return l;
@@ -1108,35 +1178,37 @@ impl<'a> Cx<'a> {
         self.pid_ns().find(l).unwrap_or(crate::syscall::NO_PID)
     }
 
-    /// 当前进程的凭据。
+    /// The current process's credentials.
     pub fn cred(&self) -> crate::cred::Cred {
         self.t.group.borrow().cred.clone()
     }
 
-    /// AF_UNIX 的 `SO_PEERCRED`：pid 和有效用户 ID、组 ID（内核 ID，Linux 的 `cred_to_ucred`）。
+    /// AF_UNIX `SO_PEERCRED`: the pid and the effective user and group IDs (kernel IDs, Linux's
+    /// `cred_to_ucred`).
     pub fn ucred(&self) -> crate::unix::Ucred {
         let g = self.t.group.borrow();
         crate::unix::Ucred::of(self.tgid(), g.cred.euid, g.cred.egid)
     }
 
-    /// 没有声明时附带的 `SCM_CREDENTIALS`：pid 和真实用户 ID、组 ID（Linux 的
-    /// `maybe_add_creds` 用 `current_uid_gid`）。
+    /// The `SCM_CREDENTIALS` attached when none is declared: the pid and the real user and group
+    /// IDs (Linux's `maybe_add_creds` uses `current_uid_gid`).
     pub fn scm_cred(&self) -> crate::unix::Ucred {
         let g = self.t.group.borrow();
         crate::unix::Ucred::of(self.tgid(), g.cred.ruid, g.cred.rgid)
     }
 
-    /// 文件创建掩码。
+    /// File-creation mask.
     pub fn umask(&self) -> u32 {
         self.t.fs.borrow().umask
     }
 
-    /// 有没有可以投递的信号，或者线程已经被要求退出。
+    /// Whether there is a deliverable signal, or the thread has been asked to exit.
     pub fn interrupted(&self) -> bool {
         crate::signal::interrupted(self)
     }
 
-    /// 释放 BKL 等待，见 [`block`]。等待期间不能借用任何共享的内核对象。
+    /// Releases the BKL and waits, see [`block`]. No shared kernel object may be borrowed while
+    /// waiting.
     pub fn wait(
         &mut self,
         deadline: Option<Instant>,
@@ -1145,14 +1217,16 @@ impl<'a> Cx<'a> {
         self.wait_on(deadline, host, wake::ALL)
     }
 
-    /// 只等直接的通知（futex 唤醒、信号、被结束）或者超时，[`request_wake`] 不会叫醒它。
-    /// 调用方必须保证让它的条件成立的每个地方都直接通知了 `self.task.event`。
+    /// Waits only for a direct notification (futex wake, signal, being ended) or a timeout;
+    /// [`request_wake`] does not wake it. The caller must make sure that every place that makes
+    /// its condition true notifies `self.task.event` directly.
     pub fn wait_alone(&mut self, deadline: Option<Instant>) -> Result<(), Errno> {
         self.wait_on(deadline, &mut [], 0)
     }
 
-    /// 与 [`Cx::wait`] 相同，但只被 `interest` 里的通道（[`wake`]）叫醒。调用方必须保证
-    /// 让它的条件成立的修改都请求了这些通道。
+    /// The same as [`Cx::wait`], but woken only by the channels in `interest` ([`wake`]). The
+    /// caller must make sure that the changes that make its condition true all request these
+    /// channels.
     pub fn wait_on(
         &mut self,
         deadline: Option<Instant>,
@@ -1162,15 +1236,16 @@ impl<'a> Cx<'a> {
         self.wait_for(deadline, host, interest, None)
     }
 
-    /// 等对象 `object`（管道）上的修改（[`request_wake_object`]）、请求所有通道的修改、
-    /// 直接的通知或者超时。
+    /// Waits for a change on object `object` (a pipe) ([`request_wake_object`]), a change that
+    /// requests all channels, a direct notification or a timeout.
     pub fn wait_object(&mut self, object: wake::Object) -> Result<(), Errno> {
         self.wait_for(None, &mut [], wake::FILE, Some(&[object]))
     }
 
-    /// 与 [`Cx::wait`] 相同，但只影响对象的修改（[`request_wake_object`]）只在是 `objects`
-    /// 里的对象时才叫醒它。调用方必须保证让它的条件成立的修改要么请求了这些对象之一，
-    /// 要么请求了 `interest` 里的某个通道（[`request_wake_on`]、[`request_wake`]）。
+    /// The same as [`Cx::wait`], but changes that affect only objects ([`request_wake_object`])
+    /// wake it only when the object is one in `objects`. The caller must make sure that each change
+    /// that makes its condition true either requests one of these objects or requests some
+    /// channel in `interest` ([`request_wake_on`], [`request_wake`]).
     pub fn wait_objects(
         &mut self,
         deadline: Option<Instant>,
@@ -1198,8 +1273,8 @@ impl<'a> Cx<'a> {
         r
     }
 
-    /// 释放 BKL 执行 `f`（可能阻塞的宿主 I/O）。`f` 不能访问任何内核对象：它是 `Send`，
-    /// 捕获不了 `Rc`、`RefCell` 和它们的引用。
+    /// Runs `f` (host I/O that may block) with the BKL released. `f` must not access any kernel
+    /// object: it is `Send`, so it cannot capture `Rc`, `RefCell` or references to them.
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R + Send) -> R {
         crate::cell::assert_none_held();
         self.task.sleeping.store(true, Ordering::Relaxed);
@@ -1209,10 +1284,13 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// 放开了 BKL 的 [`Cx`]（[`Cx::wait_on`] 等、[`Cx::unlocked`]）：析构时还没有重新拿到
-/// BKL 就拿到它。正常返回时就是重新拿锁；放锁期间 panic（内核层的 bug，[`crate::bug`]）
-/// 时也一样，展开经过的外层各帧丢掉的 `Rc`（vfs、打开文件……）要在持有 BKL 时丢：计数
-/// 不是原子的，会和同时持有 BKL 的线程一起改，改丢了就提前释放。
+/// A [`Cx`] that has released the BKL ([`Cx::wait_on`] and the like, [`Cx::unlocked`]): on drop,
+/// takes the BKL if it has not been taken again yet. On a normal return that is just re-taking
+/// the lock; the same happens on a panic while the lock is released (a kernel-layer bug,
+/// [`crate::bug`]): the `Rc`s (vfs, open files...) dropped by the outer frames the unwinding
+/// passes through must be dropped while holding the BKL, because their counts are not atomic and
+/// would be changed together with a thread holding the BKL at the same time; a lost update frees
+/// them early.
 struct Relock<'c, 'a>(&'c mut Cx<'a>);
 
 impl Drop for Relock<'_, '_> {
@@ -1229,15 +1307,17 @@ mod tests {
     use super::*;
     use crate::process::Tier;
 
-    /// 同一个宿主进程里的两个内核：A 持锁时请求的唤醒，不会被 B 在这期间放锁时取走
-    /// （[`PENDING`]）。原来放在全局里，B 放锁时清掉了，A 的等待者一直睡着。
+    /// Two kernels in one host process: wake-ups requested while A holds its lock are not taken by
+    /// B releasing its lock in the meantime ([`PENDING`]). They used to be global; B's release
+    /// cleared them, and A's waiters slept forever.
     #[test]
     fn wakeups_stay_with_their_kernel() {
         let a = Shared::new(Kernel::new(Tier::Interpreter));
         let b = Shared::new(Kernel::new(Tier::Interpreter));
         let event = Arc::new(Event::new().unwrap());
         a.lock().waiters.push((event.clone(), wake::LOCK, None));
-        // 放锁时可能顺带处理了别的测试不持 BKL 时的请求（全局的兜底），从这里开始算
+        // Releasing the lock may also have processed requests other tests made without the BKL
+        // (the global fallback), so count from here
         event.clear();
         let k = a.lock();
         request_wake_on(wake::LOCK);

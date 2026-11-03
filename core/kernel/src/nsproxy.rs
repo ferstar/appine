@@ -1,10 +1,12 @@
-//! 线程所在的 UTS、IPC、网络、cgroup、time 命名空间（Linux 的 `struct nsproxy` 里的这几种；挂载
-//! 命名空间在 `FsContext` 里，pid 命名空间见 [`crate::pidns`]）。与 Linux 一样按线程记：
-//! unshare、setns 只改调用的线程，clone 出来的线程、进程沿用父线程的。
+//! The UTS, IPC, network, cgroup and time namespaces a thread is in (these kinds of Linux's
+//! `struct nsproxy`; the mount namespace is in `FsContext`, and for the pid namespace see
+//! [`crate::pidns`]). As on Linux they are recorded per thread: unshare and setns change only the
+//! calling thread, and threads and processes created by clone keep the parent thread's.
 //!
-//! UTS 命名空间有自己的主机名和 NIS 域名。IPC 命名空间有自己的 System V IPC 对象、POSIX
-//! 消息队列和它们的限制，内容放在 [`crate::kernel::Kernel::ipcs`] 里按编号存，没有线程用它、
-//! 也没有命名空间文件留着它（[`NsRef`]）之后丢掉。网络命名空间见 [`NetNs`]。
+//! A UTS namespace has its own host name and NIS domain name. An IPC namespace has its own System
+//! V IPC objects, POSIX message queues and their limits; the contents are stored by number in
+//! [`crate::kernel::Kernel::ipcs`] and dropped once no thread uses the namespace and no namespace
+//! file keeps it ([`NsRef`]). For network namespaces see [`NetNs`].
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -12,37 +14,40 @@ use std::rc::Rc;
 use crate::cell::RefCell;
 use crate::cred::UserNs;
 
-/// 开机时的 UTS 命名空间的编号（`/proc/<pid>/ns/uts`）。
+/// The number of the boot UTS namespace (`/proc/<pid>/ns/uts`).
 pub(crate) const INIT_UTS_NS: u64 = 4_026_531_838;
-/// 开机时的 IPC 命名空间的编号。
+/// The number of the boot IPC namespace.
 pub(crate) const INIT_IPC_NS: u64 = 4_026_531_839;
-/// 开机时的网络命名空间的编号。
+/// The number of the boot network namespace.
 pub(crate) const INIT_NET_NS: u64 = 4_026_531_840;
-/// 开机时的 cgroup 命名空间的编号。
+/// The number of the boot cgroup namespace.
 pub(crate) const INIT_CGROUP_NS: u64 = 4_026_531_835;
-/// 开机时的 time 命名空间的编号。
+/// The number of the boot time namespace.
 pub(crate) const INIT_TIME_NS: u64 = 4_026_531_834;
 
-/// 一个 time 命名空间（Linux 5.6 起的 `struct time_namespace`）：里面的进程看到的
-/// CLOCK_MONOTONIC（含 RAW、COARSE）、CLOCK_BOOTTIME（含 ALARM）加上各自的偏移，绝对时刻
-/// 的等待、定时器反过来减去偏移，`/proc/uptime`、sysinfo 和进程的启动时间按 boottime 的偏移。
-/// unshare(`CLONE_NEWTIME`) 只建给子进程用的那个（偏移照抄原来的），之后 fork 出来的子进程
-/// 才进去；setns 进来的线程两个都换。偏移经由 `/proc/<pid>/timens_offsets` 设置，有进程进来
-/// 过之后不能再改。
+/// A time namespace (Linux's `struct time_namespace`, since 5.6): processes inside see
+/// CLOCK_MONOTONIC (including RAW and COARSE) and CLOCK_BOOTTIME (including ALARM) plus their
+/// offsets; absolute-time waits and timers subtract the offsets instead; `/proc/uptime`, sysinfo
+/// and process start times use the boottime offset. unshare(`CLONE_NEWTIME`) creates only the one
+/// for children (copying the old offsets), which children forked afterwards enter; a thread
+/// entering by setns switches both. Offsets are set through `/proc/<pid>/timens_offsets`, and can
+/// no longer be changed once a process has entered.
 #[derive(Debug)]
 pub(crate) struct TimeNs {
     pub id: u64,
-    /// 建立它时所在的用户命名空间：在这里有 `CAP_SYS_TIME` 才能设偏移，`CAP_SYS_ADMIN` 才能
-    /// setns 进来。
+    /// The user namespace it was created in: `CAP_SYS_TIME` here is needed to set the offsets, and
+    /// `CAP_SYS_ADMIN` to enter it by setns.
     pub owner: Rc<UserNs>,
-    /// CLOCK_MONOTONIC、CLOCK_BOOTTIME 的偏移，各是 (秒, 纳秒)，纳秒在 [0, 10⁹)。
+    /// Offsets of CLOCK_MONOTONIC and CLOCK_BOOTTIME, each (seconds, nanoseconds), with
+    /// nanoseconds in [0, 10⁹).
     pub offsets: Cell<[(i64, i64); 2]>,
-    /// 有进程进来过，偏移不能再改（Linux 的 `frozen_offsets`）。开机时的总是。
+    /// A process has entered, so the offsets can no longer change (Linux's `frozen_offsets`).
+    /// Always so for the boot namespace.
     pub frozen: Cell<bool>,
 }
 
 impl TimeNs {
-    /// 开机时的 time 命名空间（每个内核一份）。
+    /// The boot time namespace (one per kernel).
     pub fn init() -> Rc<TimeNs> {
         Rc::new(TimeNs {
             id: INIT_TIME_NS,
@@ -52,8 +57,8 @@ impl TimeNs {
         })
     }
 
-    /// 新建一个给子进程用的 time 命名空间，属于用户命名空间 `owner`，偏移照抄 `self`
-    /// （Linux 的 `clone_time_ns`）。
+    /// Creates a time namespace for children, owned by user namespace `owner`, copying the offsets
+    /// of `self` (Linux's `clone_time_ns`).
     pub fn copy(&self, owner: Rc<UserNs>) -> Rc<TimeNs> {
         Rc::new(TimeNs {
             id: crate::vfs::new_ns_id(),
@@ -63,19 +68,19 @@ impl TimeNs {
         })
     }
 
-    /// 时钟 `clock` 的偏移（纳秒）：只有单调时钟和 boottime 有。
+    /// The offset of clock `clock` (nanoseconds): only the monotonic clocks and boottime have one.
     pub fn offset(&self, clock: i32) -> i64 {
         let [mono, boot] = self.offsets_ns();
         match clock {
-            // CLOCK_MONOTONIC、CLOCK_MONOTONIC_RAW、CLOCK_MONOTONIC_COARSE
+            // CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_MONOTONIC_COARSE
             1 | 4 | 6 => mono,
-            // CLOCK_BOOTTIME、CLOCK_BOOTTIME_ALARM
+            // CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM
             7 | 9 => boot,
             _ => 0,
         }
     }
 
-    /// 两个偏移（纳秒）：单调时钟的、boottime 的。
+    /// The two offsets (nanoseconds): the monotonic clock's and boottime's.
     pub fn offsets_ns(&self) -> [i64; 2] {
         self.offsets
             .get()
@@ -83,20 +88,21 @@ impl TimeNs {
     }
 }
 
-/// 一个 UTS 命名空间。
+/// A UTS namespace.
 #[derive(Debug)]
 pub(crate) struct UtsNs {
     pub id: u64,
-    /// 建立它时所在的用户命名空间：在这里有 `CAP_SYS_ADMIN` 才能改名字、setns 进来。
+    /// The user namespace it was created in: `CAP_SYS_ADMIN` here is needed to change the names
+    /// and to enter it by setns.
     pub owner: Rc<UserNs>,
-    /// 主机名和 NIS 域名（uname、sethostname、`/proc/sys/kernel/hostname`），最长
-    /// [`crate::kernel::UTS_LEN`] 字节。
+    /// Host name and NIS domain name (uname, sethostname, `/proc/sys/kernel/hostname`), at most
+    /// [`crate::kernel::UTS_LEN`] bytes.
     pub hostname: RefCell<Vec<u8>>,
     pub domainname: RefCell<Vec<u8>>,
 }
 
 impl UtsNs {
-    /// 复制一份名字，属于用户命名空间 `owner`（Linux 的 `copy_utsname`）。
+    /// Copies the names, owned by user namespace `owner` (Linux's `copy_utsname`).
     pub fn copy(&self, owner: Rc<UserNs>) -> Rc<UtsNs> {
         Rc::new(UtsNs {
             id: crate::vfs::new_ns_id(),
@@ -107,99 +113,104 @@ impl UtsNs {
     }
 }
 
-/// 一个 IPC 命名空间。里面的对象在 [`crate::kernel::Kernel::ipcs`] 里。
+/// An IPC namespace. Its objects are in [`crate::kernel::Kernel::ipcs`].
 #[derive(Debug)]
 pub(crate) struct IpcNs {
     pub id: u64,
-    /// 建立它时所在的用户命名空间（权限检查用）。
+    /// The user namespace it was created in (for permission checks).
     pub owner: Rc<UserNs>,
 }
 
-/// 一个 cgroup 命名空间：`/proc/<pid>/cgroup` 里的路径、在里面挂的 cgroup2 的根，相对它的根
-/// cgroup（[`crate::cgroup`]）。
+/// A cgroup namespace: paths in `/proc/<pid>/cgroup` and the root of cgroup2 mounted inside are
+/// relative to its root cgroup ([`crate::cgroup`]).
 #[derive(Debug)]
 pub(crate) struct CgroupNs {
     pub id: u64,
-    /// 根：建立它的进程当时所在的 cgroup（[`crate::cgroup`] 的编号）。
+    /// Root: the cgroup its creating process was in at the time (a [`crate::cgroup`] number).
     pub root: u64,
-    /// 建立它时所在的用户命名空间（setns 的权限检查用）。
+    /// The user namespace it was created in (for setns permission checks).
     pub owner: Rc<UserNs>,
 }
 
-/// 一个网络命名空间。开机时的那个就是宿主的网络（socket 直接用宿主的）。新建的里面一开始
-/// 只有回环接口 lo：socket 仍是宿主 socket，地址换成宿主上给这个命名空间的回环地址
-/// 127.a.b.0/24（[`crate::netns`]），别的地址都到不了。两种都可以有虚拟设备
-/// （[`crate::netdev`]）。
+/// A network namespace. The boot one is the host's network (sockets use the host's directly). A
+/// new one starts with only the loopback interface lo: sockets are still host sockets, with
+/// addresses changed to the host loopback range 127.a.b.0/24 given to this namespace
+/// ([`crate::netns`]), and no other address can be reached. Both kinds can have virtual devices
+/// ([`crate::netdev`]).
 #[derive(Debug)]
 pub(crate) struct NetNs {
     pub id: u64,
-    /// 建立它时所在的用户命名空间：在这里有 `CAP_NET_ADMIN` 才能配置 lo。
+    /// The user namespace it was created in: `CAP_NET_ADMIN` here is needed to configure lo.
     pub owner: Rc<UserNs>,
-    /// 宿主上的回环地址 127.a.b.0/24 的 a、b；开机时的命名空间是 None。
+    /// a and b of the host loopback range 127.a.b.0/24; None for the boot namespace.
     pub host_net: Option<[u8; 2]>,
-    /// lo 的状态。
+    /// The state of lo.
     pub lo: RefCell<Loopback>,
-    /// 虚拟设备、经由它们的路由和 sysctl（[`crate::netdev`]）。
+    /// Virtual devices, routes through them, and sysctls ([`crate::netdev`]).
     pub devs: RefCell<crate::netdev::Devices>,
-    /// nftables 的规则集（[`crate::nft`]）。
+    /// The nftables rule set ([`crate::nft`]).
     pub nft: RefCell<crate::nft::Nft>,
-    /// 新的网络命名空间里监听着的 TCP socket、绑了的 UDP socket（[`crate::netns::listening`]）。
+    /// TCP sockets listening and UDP sockets bound in a new network namespace
+    /// ([`crate::netns::listening`]).
     pub listeners: RefCell<Vec<Listener>>,
 }
 
-/// 新的网络命名空间里一个监听着的 TCP socket 或者绑了的 UDP socket：宿主上它们都在这个命名
-/// 空间的回环地址上，连过来、发过来时按这里判断有没有人、绑的地址对不对得上（Linux 上 TCP
-/// 是 ECONNREFUSED，UDP 被丢掉）。
+/// A TCP socket listening or a UDP socket bound in a new network namespace: on the host they are
+/// all on this namespace's loopback addresses, and incoming connections and datagrams are checked
+/// against these for whether anyone is there and whether the bound address matches (on Linux TCP
+/// gets ECONNREFUSED and UDP is dropped).
 #[derive(Debug, Clone)]
 pub(crate) struct Listener {
-    /// 去掉时用的编号（[`crate::net::InetSocket::listener`]）。
+    /// The number used to remove it ([`crate::net::InetSocket::listener`]).
     pub id: u64,
-    /// guest 的端口。
+    /// The guest port.
     pub port: u16,
-    /// 绑的 guest 地址（4 或 16 字节），None 是通配地址。
+    /// The bound guest address (4 or 16 bytes); None is the wildcard address.
     pub addr: Option<Vec<u8>>,
-    /// AF_INET6 的 socket，以及它的 `IPV6_V6ONLY`。
+    /// An AF_INET6 socket, and its `IPV6_V6ONLY`.
     pub v6: bool,
     pub v6only: bool,
-    /// UDP 的（绑了的），不然是 TCP 的（监听着的）。
+    /// UDP (bound), otherwise TCP (listening).
     pub udp: bool,
 }
 
-/// 新的网络命名空间里 lo 的状态：一开始是关着的、没有地址（Linux 的 `loopback_net_init`）。
+/// The state of lo in a new network namespace: initially down and without addresses (Linux's
+/// `loopback_net_init`).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Loopback {
-    /// `IFF_UP`。
+    /// `IFF_UP`.
     pub up: bool,
-    /// IPv4 地址和前缀长度。
+    /// IPv4 addresses and prefix lengths.
     pub v4: Vec<([u8; 4], u8)>,
-    /// 有 ::1（lo 起来时自动加上，Linux 的 addrconf）。
+    /// Has ::1 (added automatically when lo comes up, Linux's addrconf).
     pub v6: bool,
-    /// 设过的 MTU（`SIOCSIFMTU`），默认 65536。
+    /// The MTU set (`SIOCSIFMTU`), 65536 by default.
     pub mtu: Option<u32>,
-    /// 宿主上绑在 127.a.b.254 上的 UDP 端口：发给自己的虚拟地址的 socket 绑在那里
-    /// （[`crate::netns`]），发往虚拟地址的这些端口的数据报（对它们的回答）要送到那里。
+    /// UDP ports bound on the host at 127.a.b.254: sockets sending to their own virtual addresses
+    /// are bound there ([`crate::netns`]), and datagrams sent to these ports of the virtual
+    /// addresses (replies to them) must be delivered there.
     pub self_udp: Vec<u16>,
 }
 
-/// 一个命名空间（Linux 的 `struct ns_common`）。打开着的命名空间文件、bind 挂载出去的
-/// 命名空间文件（nsfs）持有它：里面的进程都退出之后命名空间也还在，可以 setns 进去
-/// （`ip netns add` 就是这样留住网络命名空间的）。
+/// A namespace (Linux's `struct ns_common`). Open namespace files and namespace files bind-mounted
+/// elsewhere (nsfs) hold it: the namespace survives after every process in it has exited and can
+/// still be entered by setns (that is how `ip netns add` keeps a network namespace).
 #[derive(Clone, Debug)]
 pub(crate) enum NsRef {
     Mnt(Rc<crate::vfs::MntNs>),
     User(Rc<UserNs>),
-    /// `pid` 和 `pid_for_children` 的文件都是它。
+    /// Both the `pid` and the `pid_for_children` files are this.
     Pid(Rc<crate::pidns::PidNs>),
     Uts(Rc<UtsNs>),
     Ipc(Rc<IpcNs>),
     Net(Rc<NetNs>),
     Cgroup(Rc<CgroupNs>),
-    /// `time` 和 `time_for_children` 的文件都是它。
+    /// Both the `time` and the `time_for_children` files are this.
     Time(Rc<TimeNs>),
 }
 
 impl NsRef {
-    /// 编号（命名空间文件的 inode 号）。
+    /// The number (the inode number of the namespace file).
     pub fn id(&self) -> u64 {
         match self {
             NsRef::Mnt(n) => n.id,
@@ -213,8 +224,8 @@ impl NsRef {
         }
     }
 
-    /// 属主（Linux 的 `ns->ops->owner`）：建立它时所在的用户命名空间，用户命名空间的是
-    /// 上一层，开机时的用户命名空间没有。
+    /// The owner (Linux's `ns->ops->owner`): the user namespace it was created in; for a user
+    /// namespace, its parent; the boot user namespace has none.
     pub fn owner(&self) -> Option<Rc<UserNs>> {
         Some(match self {
             NsRef::Mnt(n) => n.owner.clone(),
@@ -229,20 +240,21 @@ impl NsRef {
     }
 }
 
-/// 线程的 UTS、IPC、网络、cgroup、time 命名空间。
+/// A thread's UTS, IPC, network, cgroup and time namespaces.
 #[derive(Clone, Debug)]
 pub(crate) struct NsProxy {
     pub uts: Rc<UtsNs>,
     pub ipc: Rc<IpcNs>,
     pub net: Rc<NetNs>,
     pub cgroup: Rc<CgroupNs>,
-    /// 所在的 time 命名空间，和之后建的子进程进的那个（unshare 了 `CLONE_NEWTIME` 时不同）。
+    /// The time namespace it is in, and the one children created later enter (different after an
+    /// unshare of `CLONE_NEWTIME`).
     pub time: Rc<TimeNs>,
     pub time_for_children: Rc<TimeNs>,
 }
 
 impl NsProxy {
-    /// 开机时的命名空间（每个内核一份，所有开机时的进程共用）。
+    /// The boot namespaces (one per kernel, shared by all processes from boot).
     pub fn init() -> NsProxy {
         let time = TimeNs::init();
         NsProxy {
@@ -280,7 +292,8 @@ impl NsProxy {
 mod tests {
     use super::*;
 
-    /// 偏移按时钟分：单调时钟的三种、boottime 的两种，别的没有；新建的照抄、没有冻结。
+    /// Offsets are per clock: the three monotonic clocks and the two boottime clocks, none for the
+    /// others; a new namespace copies them and is not frozen.
     #[test]
     fn time_namespace_offsets() {
         let init = TimeNs::init();

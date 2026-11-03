@@ -1,11 +1,13 @@
-//! ELF 加载器（kernel/process 的 map）。
+//! The ELF loader (the kernel/process map).
 //!
-//! 支持静态链接（`ET_EXEC`）和位置无关（`ET_DYN`）的 aarch64 程序。带
-//! `PT_INTERP` 的程序同时加载解释器（Alpine 上是 `ld-musl`），从解释器的入口
-//! 开始执行，由它完成动态链接。仓库里的程序以私有文件映射的方式映射各段，代码页
-//! 经由宿主 page cache 在进程之间共享（kernel/mm 的 map）；没有宿主文件的程序和段之间
-//! 共用页的程序把内容拷贝进匿名内存。初始栈按 Linux 的约定构造，auxv 与 arm64 Linux
-//! 给出的条目和顺序一致；vDSO 映射在解释器下方。
+//! Supports statically linked (`ET_EXEC`) and position-independent (`ET_DYN`) aarch64 programs.
+//! For a program with `PT_INTERP` the interpreter (`ld-musl` on Alpine) is loaded as well, and
+//! execution starts at the interpreter's entry, which does the dynamic linking. Programs in the
+//! store map their segments as private file mappings, so code pages are shared between processes
+//! through the host page cache (the kernel/mm map); programs without a host file, and programs
+//! whose segments share pages, copy the contents into anonymous memory. The initial stack is built
+//! by Linux's conventions, with auxv entries in the same set and order as arm64 Linux gives; the
+//! vDSO is mapped below the interpreter.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,9 +28,10 @@ const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
-/// Go 的链接器写的 build ID 注记（`.note.go.buildid`）的类型，名字是 "Go"。
+/// The type of the build ID note written by Go's linker (`.note.go.buildid`), with name "Go".
 const NT_GO_BUILDID: u32 = 4;
-/// 找 Go 的注记时最多读多少字节的 `PT_NOTE`（Go 的程序里只有一百来字节）。
+/// The most bytes of `PT_NOTE` read when looking for the Go note (Go programs have only about a
+/// hundred).
 const MAX_NOTES: u64 = 4096;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -57,38 +60,41 @@ const AT_EXECFN: u64 = 31;
 const AT_SYSINFO_EHDR: u64 = 33;
 const AT_MINSIGSTKSZ: u64 = 51;
 
-/// 初始栈顶（不含），即 47 位地址空间的上界。
+/// The initial stack top (exclusive), that is the upper bound of the 47-bit address space.
 pub const STACK_TOP: u64 = 1 << 47;
-/// 栈大小上限的默认值（`RLIMIT_STACK` 的默认软限制，Linux 的 `_STK_LIM`），也是加载时
-/// 在栈下面最多预留的宿主内存。
+/// The default stack size limit (the default soft limit of `RLIMIT_STACK`, Linux's `_STK_LIM`),
+/// which is also the most host memory reserved below the stack at load time.
 pub const STACK_SIZE: u64 = 8 << 20;
-/// 初始栈在参数下面多映射的大小（Linux `setup_arg_pages` 的 `stack_expand`）。
+/// How much more the initial stack maps below the arguments (`stack_expand` of Linux's
+/// `setup_arg_pages`).
 const STACK_EXPAND: u64 = 128 << 10;
-/// 栈大小上限再小，参数也至少能占这么多（Linux 的 `ARG_MAX`，32 页）。
+/// However small the stack size limit, the arguments may take at least this much (Linux's
+/// `ARG_MAX`, 32 pages).
 const ARG_MAX: u64 = 32 * PAGE_SIZE;
-/// 位置无关的主程序的加载基址：地址空间的 2/3，与 arm64 Linux 的 `ELF_ET_DYN_BASE` 取法相同。
+/// Load base of a position-independent main program: 2/3 of the address space, chosen the same
+/// way as arm64 Linux's `ELF_ET_DYN_BASE`.
 const ET_DYN_BASE: u64 = 0x5555_5555_0000;
-/// 解释器路径的最大长度。
+/// The maximum length of the interpreter path.
 const MAX_INTERP_PATH: u64 = 4096;
-/// `sysconf(_SC_CLK_TCK)`。
+/// `sysconf(_SC_CLK_TCK)`.
 pub const CLOCK_TICKS: u64 = 100;
 
-/// 加载失败的原因。
+/// Why loading failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
-    /// 不是 ELF 文件。
+    /// Not an ELF file.
     NotElf,
-    /// ELF 合法，但还不支持。
+    /// A valid ELF, but not supported yet.
     Unsupported(&'static str),
-    /// ELF 结构损坏。
+    /// The ELF structure is corrupt.
     Malformed(&'static str),
-    /// 参数和环境变量太多。
+    /// Too many arguments and environment variables.
     ArgumentsTooLong,
-    /// 建立映射失败。
+    /// Creating a mapping failed.
     Memory(Errno),
-    /// 读取文件失败。
+    /// Reading the file failed.
     Read(Errno),
-    /// 读取解释器失败。
+    /// Reading the interpreter failed.
     Interpreter(Vec<u8>, Errno),
 }
 
@@ -114,41 +120,43 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// guest 程序的启动参数。
+/// Start-up arguments of a guest program.
 #[derive(Debug, Clone, Copy)]
 pub struct Args<'a> {
-    /// argv。
+    /// argv.
     pub argv: &'a [Vec<u8>],
-    /// envp。
+    /// envp.
     pub envp: &'a [Vec<u8>],
-    /// 程序路径，放进 `AT_EXECFN`。
+    /// The program path, put into `AT_EXECFN`.
     pub execfn: &'a [u8],
-    /// 新程序的真实和有效用户 ID、组 ID（`AT_UID` 等）。
+    /// The new program's real and effective user IDs and group IDs (`AT_UID` and so on).
     pub ids: [u32; 4],
-    /// 特权执行（setuid、setgid、文件能力，[`crate::cred::Cred::exec`]）：设置 `AT_SECURE`。
+    /// A privileged exec (setuid, setgid, file capabilities, [`crate::cred::Cred::exec`]): sets
+    /// `AT_SECURE`.
     pub secure: bool,
-    /// 栈大小的上限（`RLIMIT_STACK` 的软限制）：决定地址空间的布局、参数最多占多少、
-    /// 初始栈映射多大。
+    /// The stack size limit (the soft limit of `RLIMIT_STACK`): decides the address-space layout,
+    /// how much the arguments may take, and how large the initial stack mapping is.
     pub stack_limit: u64,
 }
 
-/// argv、envp 的字符串和指针最多占用的栈空间，超过时报 `E2BIG`。与 Linux 的
-/// `bprm_stack_limits` 相同：栈大小上限的 1/4，不超过 6 MB（`_STK_LIM` 的 3/4），
-/// 不少于 [`ARG_MAX`]。
+/// The most stack space the strings and pointers of argv and envp may take; beyond it is `E2BIG`.
+/// The same as Linux's `bprm_stack_limits`: 1/4 of the stack size limit, at most 6 MB (3/4 of
+/// `_STK_LIM`), at least [`ARG_MAX`].
 pub fn arg_limit(stack_limit: u64) -> usize {
     (STACK_SIZE / 4 * 3).min(stack_limit / 4).max(ARG_MAX) as usize
 }
 
-/// 加载结果：guest 开始执行时的 pc 和 sp，以及程序和解释器所在的地址范围。
+/// The load result: pc and sp when the guest starts running, and the address ranges of the program
+/// and the interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
-    /// 入口地址（有解释器时是解释器的入口）。
+    /// The entry address (the interpreter's entry when there is one).
     pub entry: u64,
-    /// 初始栈指针，指向 argc。
+    /// The initial stack pointer, pointing at argc.
     pub sp: u64,
-    /// 主程序映射的 `[起点, 终点)`。
+    /// `[start, end)` of the main program's mapping.
     pub main: (u64, u64),
-    /// 解释器的路径和映射的 `[起点, 终点)`。
+    /// The interpreter's path and `[start, end)` of its mapping.
     pub interp: Option<(Vec<u8>, u64, u64)>,
 }
 
@@ -160,39 +168,41 @@ struct Segment {
     prot: u32,
 }
 
-/// 要加载的可执行文件：开头的一部分（或者全部内容），以及能直接映射进 guest 地址空间的
-/// 宿主文件。
+/// An executable file to load: its beginning (or its whole contents), and the host file that can
+/// be mapped straight into the guest address space.
 pub struct Executable {
-    /// 文件开头的 [`Executable::HEAD`] 字节：ELF 头、程序头、解释器的路径、`#!` 行一般
-    /// 都在里面。没有宿主文件时是全部内容。原来把整个文件映射进来再解析，每次 execve
-    /// 程序和解释器各多一次映射、缺页和解除映射。
+    /// The first [`Executable::HEAD`] bytes of the file: the ELF header, program headers,
+    /// interpreter path and `#!` line are usually in them. The whole contents when there is no host
+    /// file. Earlier the whole file was mapped in and then parsed, costing each execve one more
+    /// mapping, page fault and unmapping each for the program and the interpreter.
     head: Arc<[u8]>,
-    /// 文件的大小。
+    /// The size of the file.
     len: usize,
     file: Option<Arc<File>>,
 }
 
-/// 最近执行过的程序文件：打开着的宿主文件和读进来的开头。同一个版本
-/// （[`crate::mm::content_version`]）再执行时直接用，不必再打开、读、关闭（shell 每起
-/// 一个进程，程序和解释器各一次，都持着 BKL）。
+/// Recently executed program files: the open host file and the beginning read in. Executing the
+/// same version ([`crate::mm::content_version`]) again uses them directly, without opening,
+/// reading and closing again (each process a shell starts does that once each for the program
+/// and the interpreter, all with the BKL held).
 #[derive(Default)]
 pub struct ExeCache(Mutex<Vec<CachedExe>>);
 
 struct CachedExe {
-    /// 仓库里的 inode。
+    /// The inode in the store.
     ino: u64,
     exe: Executable,
-    /// 读进来时宿主文件的 (设备号, inode) 和内容的版本。
+    /// The host file's (device number, inode) and the content version when read in.
     version: (u64, u64, u64, u64),
-    /// 最近一次用到的序号，满了时去掉最久没用的。
+    /// The sequence number of the latest use; when full, the least recently used is removed.
     used: u64,
 }
 
 impl ExeCache {
-    /// 最多记几个程序。
+    /// The most programs to remember.
     const MAX: usize = 32;
 
-    /// 打开仓库里的 inode `ino`（`open` 打开它的宿主文件）作为要执行的文件。
+    /// Opens inode `ino` in the store (`open` opens its host file) as a file to execute.
     pub fn open(
         &self,
         ino: u64,
@@ -230,15 +240,16 @@ impl ExeCache {
         Ok(exe)
     }
 
-    /// 宿主文件 `fd` 的身份和内容的版本；没有可信的版本时是 None。
-    #[allow(clippy::unnecessary_cast)] // st_dev 在 macOS 上是 i32
+    /// The identity and content version of host file `fd`; None when there is no trustworthy
+    /// version.
+    #[allow(clippy::unnecessary_cast)] // st_dev is i32 on macOS
     fn version(fd: i32) -> Option<(u64, u64, u64, u64)> {
         let st = appine_hal::fstat(fd).ok()?;
         let (dev, ino) = (st.st_dev as u64, st.st_ino as u64);
         crate::mm::content_version(&st, dev, ino).map(|(ctime, size)| (dev, ino, ctime, size))
     }
 
-    /// 全部丢掉（宿主内存紧张时）。
+    /// Drops everything (when host memory is tight).
     pub fn clear(&self) {
         self.0
             .lock()
@@ -248,10 +259,10 @@ impl ExeCache {
 }
 
 impl Executable {
-    /// 宿主文件开头读进来多少。
+    /// How much of the host file's beginning is read in.
     const HEAD: usize = 4096;
 
-    /// 宿主文件（仓库里的 object）。
+    /// A host file (an object in the store).
     pub fn open(file: File) -> Result<Executable, Errno> {
         use std::os::unix::fs::FileExt;
         let io = |e: std::io::Error| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0));
@@ -265,12 +276,12 @@ impl Executable {
         })
     }
 
-    /// 宿主文件（`/proc/<pid>/exe` 记着它，[`crate::process::ExeFile`]）。
+    /// The host file (which `/proc/<pid>/exe` records, [`crate::process::ExeFile`]).
     pub fn host(&self) -> Option<Arc<File>> {
         self.file.clone()
     }
 
-    /// 同一个文件的又一个句柄（[`ExeCache`]）。
+    /// Another handle to the same file ([`ExeCache`]).
     fn share(&self) -> Executable {
         Executable {
             head: self.head.clone(),
@@ -279,7 +290,7 @@ impl Executable {
         }
     }
 
-    /// 内存里的内容，没有宿主文件：各段拷贝进匿名内存。
+    /// Contents in memory, with no host file: the segments are copied into anonymous memory.
     #[cfg(test)]
     pub fn from_bytes(data: Vec<u8>) -> Executable {
         Executable {
@@ -289,12 +300,13 @@ impl Executable {
         }
     }
 
-    /// 文件开头的一部分（至少 [`Executable::HEAD`] 字节，文件更短时是全部内容）。
+    /// The beginning of the file (at least [`Executable::HEAD`] bytes, or the whole contents if the
+    /// file is shorter).
     pub fn head(&self) -> &[u8] {
         &self.head
     }
 
-    /// 文件里 `[off, off + n)` 的内容；超出文件末尾时返回 None。
+    /// The contents `[off, off + n)` of the file; None if it goes past the end of the file.
     fn read(&self, off: u64, n: u64) -> Result<Option<std::borrow::Cow<'_, [u8]>>, Errno> {
         use std::os::unix::fs::FileExt;
         let Some(end) = off.checked_add(n).filter(|&e| e <= self.len as u64) else {
@@ -312,10 +324,10 @@ impl Executable {
     }
 }
 
-/// 解析后的 ELF 文件。
+/// A parsed ELF file.
 struct Elf<'a> {
     exe: &'a Executable,
-    /// 可以直接映射的宿主文件。
+    /// The host file that can be mapped directly.
     fd: Option<i32>,
     e_type: u16,
     entry: u64,
@@ -324,11 +336,11 @@ struct Elf<'a> {
     phdr_vaddr: Option<u64>,
     interp: Option<Vec<u8>>,
     segments: Vec<Segment>,
-    /// Go 编译出来的程序（带 Go 的 build ID 注记）。
+    /// A program built by Go (with Go's build ID note).
     go: bool,
 }
 
-/// 映射到内存后的 ELF。
+/// An ELF after mapping into memory.
 struct Loaded {
     bias: u64,
     entry: u64,
@@ -404,7 +416,8 @@ impl<'a> Elf<'a> {
                     }
                     elf.interp = Some(path.to_vec());
                 }
-                // 只是选 Tier 1 的寄存器分配（load_prepared），读不出来就当作不是
+                // Only selects Tier 1's register allocation (load_prepared); if it cannot be read,
+                // treat the program as not Go
                 PT_NOTE if !elf.go && filesz <= MAX_NOTES => {
                     elf.go =
                         matches!(exe.read(offset, filesz), Ok(Some(notes)) if has_go_note(&notes));
@@ -415,7 +428,8 @@ impl<'a> Elf<'a> {
                             "segment file size exceeds memory size",
                         ));
                     }
-                    // 只含 .bss 的段 filesz 为 0，p_offset 可以指到文件末尾之后，Linux 不会去读它
+                    // A segment with only .bss has filesz 0 and its p_offset may point past the
+                    // end of the file; Linux does not read it
                     let file_end = offset.checked_add(filesz);
                     if filesz > 0 && file_end.is_none_or(|end| end > exe.len as u64) {
                         return Err(LoadError::Malformed("segment exceeds the file"));
@@ -446,7 +460,7 @@ impl<'a> Elf<'a> {
         Ok(elf)
     }
 
-    /// 段覆盖的页范围 `[起点, 终点)`（未加偏移）。
+    /// The page range `[start, end)` the segments cover (without the bias).
     fn span(&self) -> (u64, u64) {
         let lo = self.segments.iter().map(|s| s.vaddr).min().unwrap() & !(PAGE_SIZE - 1);
         let hi = self
@@ -458,7 +472,8 @@ impl<'a> Elf<'a> {
         (lo, hi.next_multiple_of(PAGE_SIZE))
     }
 
-    /// 程序头在内存中的地址（未加偏移）：优先用 `PT_PHDR`，否则找包含程序头的段。
+    /// The in-memory address of the program headers (without the bias): `PT_PHDR` if present,
+    /// otherwise the segment containing the program headers.
     fn phdr_vaddr(&self) -> Result<u64, LoadError> {
         if let Some(v) = self.phdr_vaddr {
             return Ok(v);
@@ -473,7 +488,7 @@ impl<'a> Elf<'a> {
             .ok_or(LoadError::Malformed("program headers are not loaded"))
     }
 
-    /// 以偏移 `bias` 把段映射进 `mm`。
+    /// Maps the segments into `mm` with bias `bias`.
     fn map(&self, mm: &mut Mm, bias: u64) -> Result<Loaded, LoadError> {
         let (_, hi) = self.span();
         if bias
@@ -482,8 +497,9 @@ impl<'a> Elf<'a> {
         {
             return Err(LoadError::Unsupported("segment overlaps the stack"));
         }
-        // 段之间有没有共用的页：按起点排好之后看相邻的两段就够了（busybox 加 ld-musl 有
-        // 四百来页，原来逐页放进 BTreeMap，每次 execve 都要做一遍）
+        // Whether segments share pages: after sorting by start it is enough to look at adjacent
+        // pairs (busybox plus ld-musl have about four hundred pages; earlier each page went into a
+        // BTreeMap, on every execve)
         let mut spans: Vec<(u64, u64)> = self
             .segments
             .iter()
@@ -504,8 +520,8 @@ impl<'a> Elf<'a> {
             phnum: self.phnum,
             end: bias + hi,
         };
-        // 文件偏移和地址在页内的位置一致（Linux 也这样要求）并且段之间不共用页时，
-        // 直接映射宿主文件
+        // When file offsets and addresses agree within the page (Linux requires this too) and no
+        // segments share pages, map the host file directly
         let aligned = self
             .segments
             .iter()
@@ -516,7 +532,7 @@ impl<'a> Elf<'a> {
             }
             return Ok(loaded);
         }
-        // 每个 guest 页的权限是覆盖它的所有段的并集
+        // Each guest page's permissions are the union of all the segments covering it
         let mut pages: BTreeMap<u64, u32> = BTreeMap::new();
         for seg in &self.segments {
             let mut page = (bias + seg.vaddr) & !(PAGE_SIZE - 1);
@@ -525,7 +541,7 @@ impl<'a> Elf<'a> {
                 page += PAGE_SIZE;
             }
         }
-        // 相邻且权限相同的页合并成一次映射
+        // Adjacent pages with the same permissions are merged into one mapping
         let mut runs: Vec<(u64, u64, u32)> = Vec::new();
         for (&page, &page_prot) in &pages {
             match runs.last_mut() {
@@ -551,8 +567,9 @@ impl<'a> Elf<'a> {
         Ok(loaded)
     }
 
-    /// 以私有文件映射映射一个段：文件内容所在的页映射宿主文件，最后一页里文件内容之后
-    /// 的部分清零（.bss 的开头），其余的 .bss 是匿名内存。
+    /// Maps one segment as a private file mapping: the pages holding file contents map the host
+    /// file, the part of the last page after the file contents is zeroed (the start of .bss), and
+    /// the rest of .bss is anonymous memory.
     fn map_from_file(
         &self,
         mm: &mut Mm,
@@ -591,12 +608,12 @@ impl<'a> Elf<'a> {
     }
 }
 
-/// 按 guest 路径打开解释器文件的回调。
+/// The callback that opens the interpreter file by guest path.
 pub type ReadInterp<'a> = dyn FnMut(&[u8]) -> Result<Executable, Errno> + 'a;
 
-/// 把 ELF 文件 `file` 加载进 `mm`，并按 Linux 的约定构造初始栈。
+/// Loads ELF file `file` into `mm` and builds the initial stack by Linux's conventions.
 ///
-/// 程序带 `PT_INTERP` 时，用 `read_interp` 按 guest 路径读取解释器文件。
+/// When the program has `PT_INTERP`, `read_interp` reads the interpreter file by guest path.
 pub fn load(
     mm: &mut Mm,
     file: &Executable,
@@ -606,15 +623,17 @@ pub fn load(
     load_prepared(mm, &prepare(file, read_interp)?, args)
 }
 
-/// 程序和它的解释器，已经打开、检查过格式（[`prepare`]），只差映射（[`load_prepared`]）。
+/// A program and its interpreter, already opened and format-checked ([`prepare`]), needing only
+/// mapping ([`load_prepared`]).
 pub struct Prepared<'a> {
     exe: Elf<'a>,
     interp: Option<(Vec<u8>, Executable)>,
 }
 
-/// 加载的前一半：解析 `file`，带 `PT_INTERP` 时用 `read_interp` 打开解释器。打开解释器
-/// 要解析 guest 路径，调用方持有 BKL；后一半 [`load_prepared`] 只碰新的地址空间，execve
-/// 放开 BKL 做。
+/// The first half of loading: parses `file`, and with `PT_INTERP` opens the interpreter with
+/// `read_interp`. Opening the interpreter resolves a guest path, so the caller holds the BKL; the
+/// second half, [`load_prepared`], touches only the new address space, and execve runs it with
+/// the BKL released.
 pub fn prepare<'a>(
     file: &'a Executable,
     read_interp: &mut ReadInterp<'_>,
@@ -630,7 +649,8 @@ pub fn prepare<'a>(
     Ok(Prepared { exe, interp })
 }
 
-/// 加载的后一半：把 [`prepare`] 准备好的程序映射进 `mm`，构造初始栈。
+/// The second half of loading: maps the program prepared by [`prepare`] into `mm` and builds the
+/// initial stack.
 pub fn load_prepared(
     mm: &mut Mm,
     prepared: &Prepared<'_>,
@@ -681,7 +701,7 @@ pub fn load_prepared(
     mm.set_brk(main.end);
     let mut random = [0u8; 16];
     appine_hal::fill_random(&mut random).map_err(|e| LoadError::Memory(Errno(e)))?;
-    // arm64 的 ARCH_DLINFO（AT_SYSINFO_EHDR、AT_MINSIGSTKSZ）排在最前面
+    // arm64's ARCH_DLINFO (AT_SYSINFO_EHDR, AT_MINSIGSTKSZ) comes first
     let auxv = [
         (AT_SYSINFO_EHDR, vdso_base),
         (AT_MINSIGSTKSZ, crate::signal::MIN_SIGSTKSZ),
@@ -721,7 +741,7 @@ pub fn load_prepared(
     })
 }
 
-/// 一段 `PT_NOTE` 里有没有 Go 的 build ID 注记。
+/// Whether a `PT_NOTE` contains Go's build ID note.
 fn has_go_note(mut notes: &[u8]) -> bool {
     while let (Ok(namesz), Ok(descsz), Ok(kind)) =
         (u32_at(notes, 0), u32_at(notes, 4), u32_at(notes, 8))
@@ -740,8 +760,9 @@ fn has_go_note(mut notes: &[u8]) -> bool {
     false
 }
 
-/// Tier 1 给程序用哪一组寄存器：Go 的程序另用一组（[`DbtRegs::Go`]）。环境变量
-/// `APPINE_DBT_REGS`（`go` 或 `default`）让所有程序都用同一组，测试另一组用。
+/// Which register set Tier 1 uses for the program: Go programs use a separate one
+/// ([`DbtRegs::Go`]). The environment variable `APPINE_DBT_REGS` (`go` or `default`) makes every
+/// program use the same set, for testing the other one.
 fn dbt_regs(go: bool) -> DbtRegs {
     static FORCED: OnceLock<Option<DbtRegs>> = OnceLock::new();
     let forced = *FORCED.get_or_init(|| match std::env::var("APPINE_DBT_REGS").as_deref() {
@@ -752,32 +773,32 @@ fn dbt_regs(go: bool) -> DbtRegs {
     forced.unwrap_or(if go { DbtRegs::Go } else { DbtRegs::Default })
 }
 
-/// 初始栈的布局。
+/// The layout of the initial stack.
 struct StackLayout {
-    /// 指向 argc 的栈指针。
+    /// The stack pointer, pointing at argc.
     sp: u64,
-    /// argv 字符串所在的范围。
+    /// The range of the argv strings.
     args: (u64, u64),
-    /// envp 字符串所在的范围。
+    /// The range of the envp strings.
     env: (u64, u64),
-    /// 栈上的 auxv（`/proc/<pid>/auxv`）。
+    /// The auxv on the stack (`/proc/<pid>/auxv`).
     auxv: Rc<[u64]>,
 }
 
-/// 按 Linux 的布局构造初始栈：
+/// Builds the initial stack in Linux's layout:
 ///
 /// ```text
-/// sp → argc | argv[0..n] | NULL | envp[0..m] | NULL | auxv 键值对 | AT_NULL
-///      ……
-///      AT_RANDOM 的 16 字节 | argv、envp、AT_EXECFN、AT_PLATFORM 的字符串
+/// sp → argc | argv[0..n] | NULL | envp[0..m] | NULL | auxv pairs | AT_NULL
+///      ...
+///      16 bytes of AT_RANDOM | strings of argv, envp, AT_EXECFN, AT_PLATFORM
 /// STACK_TOP
 /// ```
 ///
-/// 栈先映射到参数下面再多 [`STACK_EXPAND`]（不超过栈大小的上限），之后按需向下增长
-/// （[`Mm::grow_down`]），与 Linux 的 `setup_arg_pages` 相同。
+/// The stack is first mapped [`STACK_EXPAND`] further below the arguments (within the stack size
+/// limit), then grows down on demand ([`Mm::grow_down`]), the same as Linux's `setup_arg_pages`.
 ///
-/// `auxv` 里 `AT_RANDOM`、`AT_EXECFN`、`AT_PLATFORM` 的值在这里填入。返回 sp，以及
-/// argv、envp 字符串所在的范围。
+/// The values of `AT_RANDOM`, `AT_EXECFN` and `AT_PLATFORM` in `auxv` are filled in here. Returns
+/// sp and the ranges of the argv and envp strings.
 fn build_stack(
     mm: &mut Mm,
     args: &Args<'_>,
@@ -857,7 +878,7 @@ fn to_prot(flags: u32) -> u32 {
         p |= prot::READ;
     }
     if flags & PF_W != 0 {
-        // arm64 Linux 没有只写页：可写意味着可读
+        // arm64 Linux has no write-only pages: writable implies readable
         p |= prot::READ | prot::WRITE;
     }
     if flags & PF_X != 0 {
@@ -893,7 +914,7 @@ mod tests {
     use super::*;
     use crate::uaccess::UserSlice;
 
-    /// 构造一个只有一个 PT_LOAD 段的最小 ELF，代码放在 0x400000 + 0x78。
+    /// Builds a minimal ELF with a single PT_LOAD segment, with code at 0x400000 + 0x78.
     fn tiny_elf(e_type: u16, code: &[u8]) -> Vec<u8> {
         let mut f = vec![0u8; 0x78];
         f[..4].copy_from_slice(b"\x7fELF");
@@ -917,12 +938,12 @@ mod tests {
         f
     }
 
-    /// 在 `tiny_elf` 后面追加一个 PT_INTERP 程序头和路径。
+    /// Appends a PT_INTERP program header and a path after `tiny_elf`.
     fn with_interp(f: Vec<u8>, path: &[u8]) -> Vec<u8> {
         with_segment(f, PT_INTERP, &[path, &[0]].concat())
     }
 
-    /// 在 `tiny_elf` 后面追加一个 `p_type` 类型的程序头，内容是 `data`。
+    /// Appends a program header of type `p_type` after `tiny_elf`, with contents `data`.
     fn with_segment(mut f: Vec<u8>, p_type: u32, data: &[u8]) -> Vec<u8> {
         let code = f.split_off(0x78);
         f.truncate(64 + 56);
@@ -958,7 +979,7 @@ mod tests {
         Executable::from_bytes(bytes.to_vec())
     }
 
-    /// 读出初始栈上的 auxv。
+    /// Reads the auxv on the initial stack.
     fn auxv(mm: &Mm, sp: u64) -> BTreeMap<u64, u64> {
         let argc = read_u64(mm, sp);
         let mut p = sp + 8 * (argc + 2);
@@ -1008,13 +1029,13 @@ mod tests {
             load(&mut mm, &exe(&elf), &args, &mut no_interp).unwrap();
             mm.dbt_regs
         };
-        // 外部链接的 Go 程序（Alpine 的 go）先有 GNU 的 build ID，再有 Go 的
+        // An externally linked Go program (Alpine's go) has a GNU build ID first, then Go's
         let gnu = note(b"GNU\0", 3, &[0xab; 20]);
         let go = note(b"Go\0\0", NT_GO_BUILDID, b"abc/def");
         assert_eq!(regs(&[&gnu[..], &go].concat()), DbtRegs::Go);
         assert_eq!(regs(&go), DbtRegs::Go);
         assert_eq!(regs(&gnu), DbtRegs::Default);
-        // 类型不对、名字被截断都不算
+        // A wrong type or a truncated name does not count
         assert_eq!(regs(&note(b"Go\0\0", 1, b"x")), DbtRegs::Default);
         assert_eq!(regs(&go[..14]), DbtRegs::Default);
     }
@@ -1069,11 +1090,11 @@ mod tests {
             .unwrap();
         assert_ne!(random, [0; 16]);
         assert_eq!(aux[&AT_MINSIGSTKSZ], crate::signal::MIN_SIGSTKSZ);
-        // /proc/<pid>/cmdline 和 environ 读的范围
+        // The ranges read by /proc/<pid>/cmdline and environ
         assert_eq!(mm.args.1 - mm.args.0, b"prog\0arg1\0".len() as u64);
         assert_eq!(mm.read_cstr(mm.args.0, 64).unwrap(), b"prog");
         assert_eq!((mm.env.0, mm.env.1 - mm.env.0), (mm.args.1, 4));
-        // vDSO 只读可执行，开头是 ELF 头
+        // The vDSO is read-only and executable, starting with an ELF header
         let vdso = aux[&AT_SYSINFO_EHDR];
         assert_eq!(vdso, mm.vdso);
         assert!(mm.mmu().translate(vdso, prot::EXEC).is_some());
@@ -1120,7 +1141,8 @@ mod tests {
 
     #[test]
     fn bss_only_segment_may_point_past_the_end_of_file() {
-        // 两个程序头：代码段，以及 filesz = 0、p_offset 越过文件末尾的 .bss 段
+        // Two program headers: the code segment, and a .bss segment with filesz = 0 and p_offset
+        // past the end of the file
         let mut f = tiny_elf(ET_EXEC, &[]);
         f.truncate(64 + 56);
         f[56..58].copy_from_slice(&2u16.to_le_bytes());
@@ -1138,7 +1160,7 @@ mod tests {
         f.extend_from_slice(&bss);
         f.extend_from_slice(&0xd503201fu32.to_le_bytes());
 
-        // 内存里的内容拷贝进匿名内存；宿主文件直接映射
+        // Contents in memory are copied into anonymous memory; a host file is mapped directly
         let path = std::env::temp_dir().join(format!("appine-loader-{}", std::process::id()));
         std::fs::write(&path, &f).unwrap();
         let from_file = Executable::open(File::open(&path).unwrap()).unwrap();
@@ -1160,7 +1182,7 @@ mod tests {
             let mut insn = [0u8; 4];
             mm.read(UserSlice::new(image.entry, 4), &mut insn).unwrap();
             assert_eq!(insn, 0xd503201fu32.to_le_bytes());
-            // program break 紧跟在最后一个段之后
+            // The program break follows right after the last segment
             assert_eq!(mm.brk(0), 0x424000);
         }
     }

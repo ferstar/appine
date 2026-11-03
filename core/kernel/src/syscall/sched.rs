@@ -1,13 +1,15 @@
-//! 调度类 syscall：nice 值（getpriority、setpriority）和 `sched_*`。
+//! Scheduling syscalls: nice values (getpriority, setpriority) and `sched_*`.
 //!
-//! guest 线程就是普通的宿主线程，由宿主调度。nice 值与 Linux 一样属于线程，和 CPU
-//! 亲和性一起设置到宿主线程上（[`apply_host`]），宿主据此分配 CPU；`SCHED_IDLE` 设成
-//! 宿主的最低优先级。guest 的 CPU `i` 是宿主允许本进程用的第 `i` 个 CPU
-//! （[`appine_hal::host_cpus`]）。实时策略和实时优先级只记录下来（procfs 和对应的 get
-//! 调用能看到）。权限
-//! 按 Linux 的规则检查：改别人的设置要求有效用户 ID 相同，提高优先级要求
-//! `RLIMIT_NICE` 允许或者 `CAP_SYS_NICE`，实时策略要求 `CAP_SYS_NICE`。`SCHED_DEADLINE`
-//! 的参数按 Linux 的规则检查后记录，不做带宽准入控制。
+//! Guest threads are ordinary host threads scheduled by the host. As on Linux the nice value
+//! belongs to the thread; it is applied to the host thread together with the CPU affinity
+//! ([`apply_host`]), and the host allocates CPUs accordingly; `SCHED_IDLE` becomes the host's
+//! lowest priority. Guest CPU `i` is the `i`th CPU the host allows this process to use
+//! ([`appine_hal::host_cpus`]). Real-time policies and real-time priorities are only recorded
+//! (visible in procfs and through the matching get calls). Permissions are checked by Linux's
+//! rules: changing another's settings needs the same effective user ID, raising priority needs
+//! `RLIMIT_NICE` to allow it or `CAP_SYS_NICE`, and real-time policies need `CAP_SYS_NICE`.
+//! `SCHED_DEADLINE` parameters are checked by Linux's rules and recorded, with no bandwidth
+//! admission control.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -33,24 +35,27 @@ const SCHED_DEADLINE: i32 = 6;
 const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 const SCHED_FLAG_RESET_ON_FORK: u64 = 1;
 
-/// `struct sched_attr` 的大小：第一版，以及这里支持的版本（带 util_min/util_max）。
+/// Sizes of `struct sched_attr`: the first version, and the version supported here (with
+/// util_min/util_max).
 const SCHED_ATTR_SIZE_VER0: usize = 48;
 const SCHED_ATTR_SIZE: usize = 56;
 
-/// `SCHED_RR` 的时间片（Linux 的 `RR_TIMESLICE`，100 毫秒）。
+/// The `SCHED_RR` time slice (Linux's `RR_TIMESLICE`, 100 ms).
 const RR_TIMESLICE_NS: i64 = 100_000_000;
 
-/// 能不能修改凭据为 `target` 的进程的调度参数（`check_same_owner`）。
+/// Whether the scheduling parameters of a process with credentials `target` may be changed
+/// (`check_same_owner`).
 fn same_owner(cred: &Cred, target: &Cred) -> bool {
     cred.euid == target.euid || cred.euid == target.ruid || cred.capable(cap::SYS_NICE)
 }
 
-/// getpriority、setpriority 作用的一个线程和它所在的进程。
+/// One thread that getpriority or setpriority acts on, and its process.
 type Target = (Option<Rc<Task>>, Rc<RefCell<ThreadGroup>>);
 
-/// getpriority、setpriority 作用的线程（不含僵尸进程）。与 Linux 一样，`PRIO_PROCESS`
-/// 是一个线程，`PRIO_PGRP`、`PRIO_USER` 是这些进程的所有线程。内置的 init 没有线程，但
-/// 它是 root 的进程：线程是 None，nice 值总是 0，改它没有效果。
+/// The threads getpriority and setpriority act on (zombies excluded). As on Linux, `PRIO_PROCESS`
+/// is one thread, and `PRIO_PGRP` and `PRIO_USER` are every thread of those processes. The
+/// built-in init has no threads but is a root process: its thread is None, its nice value is
+/// always 0, and changing it has no effect.
 fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Target>, Errno> {
     let k = cx.kr();
     let threads = |g: &Rc<RefCell<ThreadGroup>>| -> Vec<Target> {
@@ -107,7 +112,7 @@ fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Target>, Errno> {
 }
 
 pub(super) fn getpriority(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
-    // 与 Linux 的 syscall 一样返回 20 - nice（1–40），libc 再换算回来
+    // As Linux's syscall does, return 20 - nice (1–40); libc converts it back
     let nice = targets(cx, which, who)?
         .iter()
         .map(|(t, _)| t.as_ref().map_or(0, |t| t.nice.get()))
@@ -123,8 +128,8 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
     for (t, g) in targets(cx, which, who)? {
         let g = g.borrow();
         let current = t.as_ref().map_or(0, |t| t.nice.get());
-        // 别人的进程要求有效用户 ID 相同；提高优先级（降低 nice）要在目标的
-        // RLIMIT_NICE 之内，或者有 CAP_SYS_NICE（Linux 的 can_nice）
+        // Another's process needs the same effective user ID; raising priority (lowering nice)
+        // must be within the target's RLIMIT_NICE, or needs CAP_SYS_NICE (Linux's can_nice)
         if !same_owner(&cred, &g.cred) {
             result = Err(Errno::EPERM);
         } else if nice < current
@@ -140,7 +145,7 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
     result
 }
 
-// ---- IO 优先级（Linux 6.1 的 block/ioprio.c、blk-ioc.c） ----
+// ---- I/O priority (Linux 6.1's block/ioprio.c, blk-ioc.c) ----
 
 const IOPRIO_WHO_PROCESS: i32 = 1;
 const IOPRIO_WHO_PGRP: i32 = 2;
@@ -151,7 +156,7 @@ const IOPRIO_CLASS_NONE: u16 = 0;
 const IOPRIO_CLASS_RT: u16 = 1;
 const IOPRIO_CLASS_BE: u16 = 2;
 const IOPRIO_CLASS_IDLE: u16 = 3;
-/// RT、BE 的级别数（0 最高）。
+/// The number of RT and BE levels (0 is highest).
 const IOPRIO_NR_LEVELS: u16 = 8;
 
 fn ioprio_class(ioprio: u16) -> u16 {
@@ -162,11 +167,12 @@ fn ioprio_value(class: u16, data: u16) -> u16 {
     (class << IOPRIO_CLASS_SHIFT) | data
 }
 
-/// ioprio_set、ioprio_get 作用的线程。与 Linux 一样，`IOPRIO_WHO_PROCESS` 是一个线程，
-/// `IOPRIO_WHO_PGRP` 是进程组里所有进程的所有线程，`IOPRIO_WHO_USER` 是真实用户 ID 为它的
-/// 所有线程（看不到的 pid 命名空间里的不算）。内置的 init 没有线程，是 None。找不到是
-/// ESRCH。`uid` 是 `IOPRIO_WHO_USER` 时要找的内核用户 ID（set、get 对 who = 0 的理解不同，
-/// 由调用者算好）。
+/// The threads ioprio_set and ioprio_get act on. As on Linux, `IOPRIO_WHO_PROCESS` is one thread,
+/// `IOPRIO_WHO_PGRP` is every thread of every process in the process group, and
+/// `IOPRIO_WHO_USER` is every thread whose real user ID is it (those in invisible pid namespaces
+/// do not count). The built-in init has no threads and is None. Not found is ESRCH. `uid` is the
+/// kernel user ID to look for with `IOPRIO_WHO_USER` (set and get interpret who = 0 differently,
+/// so the caller computes it).
 fn ioprio_targets(
     cx: &Cx<'_>,
     which: i32,
@@ -231,9 +237,9 @@ fn ioprio_targets(
     Ok(found)
 }
 
-/// ioprio_set 的值本身合不合法、调用者能不能设（`ioprio_check_cap`）：RT 要
-/// `CAP_SYS_ADMIN` 或 `CAP_SYS_NICE`，RT、BE 的级别是 0–7，NONE 的级别只能是 0，IDLE 的
-/// 级别不检查。
+/// Whether the ioprio_set value itself is valid and the caller may set it (`ioprio_check_cap`):
+/// RT needs `CAP_SYS_ADMIN` or `CAP_SYS_NICE`, RT and BE levels are 0–7, the NONE level must be
+/// 0, and the IDLE level is not checked.
 fn ioprio_check(cred: &Cred, ioprio: u16) -> Result<(), Errno> {
     let data = ioprio & ((1 << IOPRIO_CLASS_SHIFT) - 1);
     match ioprio_class(ioprio) {
@@ -257,16 +263,18 @@ fn ioprio_check(cred: &Cred, ioprio: u16) -> Result<(), Errno> {
 
 pub(super) fn ioprio_set(cx: &mut Cx<'_>, which: i32, who: i32, ioprio: i32) -> SysResult {
     let cred = cx.cred();
-    // io_context 里的是 unsigned short，高位丢掉（检查只看第 0–15 位）
+    // io_context holds an unsigned short, so the high bits are dropped (the check looks only at
+    // bits 0–15)
     let ioprio = ioprio as u16;
     ioprio_check(&cred, ioprio)?;
-    // Linux 在这里用 make_kuid(current_user_ns(), who)：who = 0 是 root，不是自己
+    // Linux uses make_kuid(current_user_ns(), who) here: who = 0 is root, not the caller
     let uid = (which == IOPRIO_WHO_USER)
         .then(|| cred.uid_in(who as u32))
         .flatten();
     for (t, g) in ioprio_targets(cx, which, who, uid)? {
-        // set_task_ioprio：目标的真实用户 ID 要等于自己的有效或真实用户 ID，或者有
-        // CAP_SYS_NICE；进程组、用户的第一次失败就返回，前面的已经改了
+        // set_task_ioprio: the target's real user ID must equal the caller's effective or real
+        // user ID, or CAP_SYS_NICE is needed; for a process group or user the first failure
+        // returns, with the earlier ones already changed
         let target = g.borrow().cred.ruid;
         if target != cred.euid && target != cred.ruid && !cred.capable(cap::SYS_NICE) {
             return Err(Errno::EPERM);
@@ -278,8 +286,8 @@ pub(super) fn ioprio_set(cx: &mut Cx<'_>, which: i32, who: i32, ioprio: i32) -> 
     Ok(0)
 }
 
-/// 记下线程 `t` 的 IO 优先级（没有 io_context 时建一个），交给宿主线程。`CLONE_IO` 共用
-/// 这一份的线程也一起交给宿主。
+/// Records thread `t`'s I/O priority (creating an io_context if it has none) and hands it to the
+/// host thread. Threads sharing this one through `CLONE_IO` are handed to the host too.
 fn set_task_ioprio(cx: &Cx<'_>, t: &Rc<Task>, ioprio: u16) {
     let shared = {
         let mut slot = t.ioprio.borrow_mut();
@@ -301,14 +309,14 @@ fn set_task_ioprio(cx: &Cx<'_>, t: &Rc<Task>, ioprio: u16) {
     }
 }
 
-/// 线程的原始 IO 优先级：没有设置过是 0（`IOPRIO_DEFAULT`，NONE 类）。
+/// The thread's raw I/O priority: 0 if never set (`IOPRIO_DEFAULT`, class NONE).
 fn raw_ioprio(t: &Task) -> u16 {
     t.ioprio.borrow().as_ref().map_or(0, |c| c.get())
 }
 
-/// 线程实际的 IO 优先级（`__get_task_ioprio`）：NONE 类按调度策略和 nice 值推出来，
-/// `SCHED_IDLE` 是 IDLE，实时策略是 RT，其余是 BE，级别是 (nice + 20) / 5。内置的 init
-/// 是 BE 4。
+/// The thread's effective I/O priority (`__get_task_ioprio`): class NONE is derived from the
+/// scheduling policy and the nice value, IDLE for `SCHED_IDLE`, RT for real-time policies and BE
+/// otherwise, at level (nice + 20) / 5. The built-in init is BE 4.
 fn effective_ioprio(t: Option<&Task>) -> u16 {
     let Some(t) = t else {
         return ioprio_value(IOPRIO_CLASS_BE, 4);
@@ -327,7 +335,7 @@ fn effective_ioprio(t: Option<&Task>) -> u16 {
 
 pub(super) fn ioprio_get(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
     let cred = cx.cred();
-    // 这里 who = 0 是自己的真实用户（current_user()）
+    // Here who = 0 is the caller's real user (current_user())
     let uid = (which == IOPRIO_WHO_USER)
         .then(|| {
             if who == 0 {
@@ -338,8 +346,8 @@ pub(super) fn ioprio_get(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
         })
         .flatten();
     let targets = ioprio_targets(cx, which, who, uid)?;
-    // 一个线程时是它原来设的值（`get_task_raw_ioprio`），进程组和用户是实际的优先级里
-    // 最高的（数值最小，`ioprio_best`）
+    // For one thread, the value it originally set (`get_task_raw_ioprio`); for a process group
+    // or user, the highest of the effective priorities (the smallest value, `ioprio_best`)
     let prio = if which == IOPRIO_WHO_PROCESS {
         targets[0].0.as_deref().map_or(0, raw_ioprio)
     } else {
@@ -352,8 +360,9 @@ pub(super) fn ioprio_get(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
     Ok(prio as u64)
 }
 
-/// 新线程的 IO 优先级（`copy_io`）：创建者有 io_context 时，`CLONE_IO` 共用它，否则类别
-/// 不是 NONE 的复制一份；创建者没有的，新线程也没有。
+/// A new thread's I/O priority (`copy_io`): when the creator has an io_context, `CLONE_IO` shares
+/// it, otherwise a copy is made if its class is not NONE; if the creator has none, neither does
+/// the new thread.
 pub(super) fn inherit_ioprio(parent: &Option<Rc<Cell<u16>>>, flags: u64) -> Option<Rc<Cell<u16>>> {
     const CLONE_IO: u64 = 0x8000_0000;
     let p = parent.as_ref()?;
@@ -364,9 +373,10 @@ pub(super) fn inherit_ioprio(parent: &Option<Rc<Cell<u16>>>, flags: u64) -> Opti
     }
 }
 
-/// 按 guest 线程的 IO 优先级设置它的宿主线程的：RT 降成同一级的 BE（与 nice 值一样，
-/// guest 不能让宿主线程的 IO 压过界面），NONE 让宿主按 nice 值推。`reset` 时没设置过的也
-/// 写一次（线程池里复用的宿主线程还留着上一个 guest 线程的）。
+/// Sets a guest thread's host thread I/O priority from the guest thread's: RT becomes BE at the
+/// same level (as with nice values, the guest may not let the host thread's I/O override the UI),
+/// and NONE lets the host derive it from the nice value. With `reset`, it is written once even if
+/// never set (a host thread reused from the pool still has the previous guest thread's).
 fn apply_host_ioprio(t: &Task, reset: bool) {
     let tid = t.host_tid.get();
     if tid == 0 || (!reset && t.ioprio.borrow().is_none()) {
@@ -381,24 +391,26 @@ fn apply_host_ioprio(t: &Task, reset: bool) {
     appine_hal::set_thread_ioprio(tid, host);
 }
 
-/// guest 提高优先级时，宿主线程的 nice 值最低到这里：不超过 Android 上与显示有关的
-/// 线程（-4 到 -10），guest 的忙循环不会拖慢界面。
+/// When the guest raises priority, the host thread's nice value goes no lower than this: never
+/// above Android's display-related threads (-4 to -10), so guest busy loops do not slow the UI.
 const HOST_NICE_FLOOR: i32 = -4;
 
-/// 宿主线程开始运行 guest 线程 `t`：它继承的是创建它的宿主线程的优先级、IO 优先级和
-/// 亲和性（`reused` 时是上一个 guest 线程的），换成 `t` 自己的。
+/// A host thread starts running guest thread `t`: it has inherited the priority, I/O priority and
+/// affinity of the host thread that created it (of the previous guest thread when `reused`), and
+/// switches to `t`'s own.
 pub(crate) fn host_started(t: &Task, reused: bool) {
     apply_host(t);
     apply_host_ioprio(t, reused);
     let mask = t.affinity.get() & online_cpus();
-    // 线程池里复用的宿主线程还留着上一个 guest 线程的亲和性
+    // A host thread reused from the pool still has the previous guest thread's affinity
     if mask != online_cpus() || reused {
         appine_hal::set_thread_affinity(t.host_tid.get(), mask);
     }
 }
 
-/// 按 guest 线程的 nice 值和调度策略设置它的宿主线程的 nice 值。`SCHED_IDLE` 用宿主
-/// 最低的优先级。宿主线程还没有开始运行时，由它开始时设置。
+/// Sets a guest thread's host thread nice value from the guest thread's nice value and scheduling
+/// policy. `SCHED_IDLE` uses the host's lowest priority. If the host thread has not started
+/// running yet, it is set when it starts.
 fn apply_host(t: &Task) {
     let tid = t.host_tid.get();
     if tid == 0 {
@@ -412,8 +424,9 @@ fn apply_host(t: &Task) {
     appine_hal::set_thread_nice(tid, nice);
 }
 
-/// `sched_*` 的目标线程：pid 0 是自己。内置的 init 没有线程，返回 None。僵尸进程（和
-/// 组长已经退出的进程）也是 None：Linux 上回收之前还能找到组长，按默认的调度参数处理。
+/// The target thread of `sched_*`: pid 0 is the caller. The built-in init has no threads and
+/// returns None. Zombies (and processes whose leader has exited) are None too: on Linux the leader
+/// can still be found until it is reaped, and is handled with the default scheduling parameters.
 fn target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
     match pid {
         p if p < 0 => Err(Errno::EINVAL),
@@ -427,14 +440,14 @@ fn target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
     }
 }
 
-/// 线程所在进程的凭据。
+/// The credentials of the thread's process.
 fn cred_of(cx: &Cx<'_>, task: Option<&Rc<Task>>) -> Cred {
     task.and_then(|t| cx.kr().groups.get(&t.tgid))
         .map_or_else(Cred::root, |g| g.borrow().cred.clone())
 }
 
-/// 新线程继承的调度策略和 nice 值：`SCHED_RESET_ON_FORK` 时实时策略回到普通策略，
-/// 负的 nice 值回到 0。
+/// The scheduling policy and nice value a new thread inherits: with `SCHED_RESET_ON_FORK`,
+/// real-time policies go back to the normal policy and negative nice values back to 0.
 pub(super) fn inherit((policy, priority): (i32, i32), nice: i32) -> ((i32, i32), i32) {
     if policy & SCHED_RESET_ON_FORK != 0 {
         let base = policy & !SCHED_RESET_ON_FORK;
@@ -446,7 +459,7 @@ pub(super) fn inherit((policy, priority): (i32, i32), nice: i32) -> ((i32, i32),
     ((policy, priority), nice)
 }
 
-/// 设置调度策略：检查策略、优先级和权限。
+/// Sets the scheduling policy: checks the policy, priority and permissions.
 fn set_policy(
     cx: &Cx<'_>,
     task: Option<&Rc<Task>>,
@@ -473,8 +486,8 @@ fn set_policy(
     Ok(())
 }
 
-/// 设成 `SCHED_DEADLINE`（`__checkparam_dl`）：runtime ≤ deadline ≤ period，runtime 至少
-/// 1024 纳秒，period 为 0 时等于 deadline。
+/// Sets `SCHED_DEADLINE` (`__checkparam_dl`): runtime ≤ deadline ≤ period, runtime at least
+/// 1024 ns, and a period of 0 equals the deadline.
 fn set_deadline(
     cx: &Cx<'_>,
     task: Option<&Rc<Task>>,
@@ -502,7 +515,7 @@ fn set_deadline(
     Ok(0)
 }
 
-/// 读取 `struct sched_param` 的优先级。
+/// Reads the priority of a `struct sched_param`.
 fn read_priority(cx: &Cx<'_>, param: u64) -> Result<i32, Errno> {
     if param == 0 {
         return Err(Errno::EINVAL);
@@ -558,7 +571,7 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
     let mut b = vec![0u8; size];
     cx.mm()
         .read(crate::uaccess::UserSlice::new(attr, size), &mut b)?;
-    // 比这里认识的版本长时，多出来的部分必须是 0
+    // When longer than the version known here, the extra part must be 0
     if b.iter().skip(SCHED_ATTR_SIZE).any(|&x| x != 0) {
         put(cx, attr, (SCHED_ATTR_SIZE as u32).to_le_bytes())?;
         return Err(Errno::E2BIG);
@@ -626,14 +639,14 @@ pub(super) fn sched_getattr(
         b[32..40].copy_from_slice(&deadline.to_le_bytes());
         b[40..48].copy_from_slice(&period.to_le_bytes());
     }
-    // util_max 默认是 1024（SCHED_CAPACITY_SCALE）
+    // util_max defaults to 1024 (SCHED_CAPACITY_SCALE)
     b[52..56].copy_from_slice(&1024u32.to_le_bytes());
     cx.mm()
         .write(crate::uaccess::UserSlice::new(attr, n), &b[..n])
         .map(|()| 0)
 }
 
-/// 宿主的 CPU 个数对应的掩码（最多 64 个）。
+/// The mask for the host's CPU count (at most 64).
 fn online_cpus() -> u64 {
     let cpus = appine_hal::host_cpus().len();
     if cpus == 64 {
@@ -643,7 +656,8 @@ fn online_cpus() -> u64 {
     }
 }
 
-/// 亲和性的目标线程：与 Linux 相同，负数的 pid 是找不到的进程（ESRCH），不是 EINVAL。
+/// The affinity target thread: as on Linux, a negative pid is a process not found (ESRCH), not
+/// EINVAL.
 fn affinity_target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
     if pid < 0 {
         return Err(Errno::ESRCH);
@@ -652,7 +666,8 @@ fn affinity_target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
 }
 
 pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64) -> SysResult {
-    // 掩码短于内核的 cpumask（8 字节）时其余的位是 0，长出来的部分忽略
+    // A mask shorter than the kernel's cpumask (8 bytes) leaves the remaining bits 0; any longer
+    // part is ignored
     let mut b = [0u8; 8];
     let n = len.min(8);
     cx.mm()
@@ -675,7 +690,7 @@ pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
 }
 
 pub(super) fn sched_getaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64) -> SysResult {
-    // 内核的 cpumask 按 unsigned long 对齐；guest 给的缓冲区至少要能放下它
+    // The kernel's cpumask is aligned to unsigned long; the guest's buffer must at least hold it
     if len < 8 || !len.is_multiple_of(8) {
         return Err(Errno::EINVAL);
     }
@@ -695,7 +710,7 @@ pub(super) fn sched_priority_range(policy: i32, max: bool) -> SysResult {
 
 pub(super) fn sched_rr_get_interval(cx: &mut Cx<'_>, pid: i32, ts: u64) -> SysResult {
     let task = target(cx, pid)?;
-    // 只有 SCHED_RR 的线程有时间片
+    // Only SCHED_RR threads have a time slice
     let policy = task.map_or(SCHED_OTHER, |t| t.sched.get().0 & !SCHED_RESET_ON_FORK);
     let ns = if policy == SCHED_RR {
         RR_TIMESLICE_NS

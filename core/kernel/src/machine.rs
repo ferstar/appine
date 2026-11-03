@@ -1,15 +1,17 @@
-//! 宿主眼中的 guest 内核（kernel/process 的 map、android/service 的 map）。
+//! The guest kernel as the host sees it (the kernel/process map, the android/service map).
 //!
-//! [`Machine`] 持有一个内核实例：可以先后启动多个进程（[`Machine::spawn`]），每个进程
-//! 可以有自己的控制台（宿主持有主设备的进程内 PTY，[`Machine::open_console`]）。Android
-//! 的前台服务为每个终端标签页开一个控制台和一个登录 shell；`appine-run` 只启动一个
-//! 进程（[`run`]）。方法可以在任意宿主线程上调用，阻塞的方法和 guest 线程一样走统一的
-//! 等待机制。间隔定时器由一个宿主线程负责（[`crate::itimer`]）。
+//! A [`Machine`] holds one kernel instance: it can start several processes one after another
+//! ([`Machine::spawn`]), and each process can have its own console (an in-process PTY whose master
+//! the host holds, [`Machine::open_console`]). The Android foreground service opens one console
+//! and one login shell per terminal tab; `appine-run` starts only one process ([`run`]). Methods
+//! may be called on any host thread, and blocking methods use the same unified wait mechanism as
+//! guest threads. Interval timers are handled by one host thread ([`crate::itimer`]).
 //!
-//! 方法里的内核代码撞上内核层的 bug（panic）时，只让这次调用失败
-//! （[`crate::bug::host_call`]）：返回 EIO 或者 [`RunError::Internal`]，出错的是一个控制台上
-//! 的调用时还挂断那个控制台，免得终端标签页卡在坏掉的控制台上。只读一张表的方法
-//! （[`Machine::wait`] 等）不需要。
+//! When kernel code in a method hits a kernel-layer bug (a panic), only that call fails
+//! ([`crate::bug::host_call`]): it returns EIO or [`RunError::Internal`], and when the failing call
+//! is on a console it also hangs up that console, so the terminal tab does not get stuck on a
+//! broken console. Methods that only read one table ([`Machine::wait`] and the like) do not need
+//! this.
 
 use std::ffi::OsStr;
 use std::io;
@@ -39,42 +41,48 @@ use crate::terminal;
 use crate::tty::Winsize;
 use crate::vfs::{Node, Vfs};
 
-/// 内核实例的选项。
+/// Options of a kernel instance.
 #[derive(Debug, Clone, Default)]
 pub struct MachineOptions {
-    /// 执行引擎。
+    /// The execution engine.
     pub tier: Tier,
-    /// inode 仓库所在的宿主目录。设置后程序路径按 guest 路径在仓库里解析，否则按
-    /// 宿主路径读取，guest 也看不到任何文件系统。
+    /// The host directory of the inode store. When set, program paths are resolved as guest paths
+    /// in the store; otherwise they are read as host paths and the guest sees no filesystem at all.
     pub rootfs: Option<PathBuf>,
-    /// App 进程匿名内存的上限（字节）：超出时结束一个 guest 进程，免得 Android 的 LMK
-    /// 杀掉整个 App（设计文档 §12 第 4 条）。None 时取宿主物理内存的一半，`u64::MAX` 表示不限制。
+    /// The limit on the app process's anonymous memory (bytes): when exceeded a guest process is
+    /// ended, so that Android's LMK does not kill the whole app (design doc §12 item 4). None means
+    /// half the host's physical memory, and `u64::MAX` means no limit.
     pub memory_limit: Option<u64>,
-    /// 1024 以下的端口在宿主上换成的端口的偏移（[`crate::portmap`]）：None 是默认的 10000，
-    /// 0 表示不映射（Android 上绑多数低端口是 EACCES）。
+    /// The offset of the host ports that ports below 1024 are changed to ([`crate::portmap`]):
+    /// None is the default 10000, and 0 means no mapping (on Android binding most low ports is
+    /// EACCES).
     pub low_port_offset: Option<u16>,
-    /// 宿主让绑原来的低端口时也换一个（默认绑原来的）：在绑得了低端口的宿主（以 root 运行、
-    /// 容器里）上测映射。
+    /// Change low ports even when the host lets them be bound as they are (by default they are
+    /// bound as they are): for testing the mapping on hosts that can bind low ports (running as
+    /// root, in a container).
     pub always_map_low_ports: bool,
 }
 
-/// 新进程的 stdin/stdout/stderr。
+/// stdin/stdout/stderr of a new process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stdio {
-    /// 宿主进程自己的 0、1、2。
+    /// The host process's own 0, 1 and 2.
     Host,
-    /// 控制台（PTY 编号）的从设备：进程成为新会话的组长，控制台是它的控制终端。
+    /// The slave of a console (by PTY number): the process becomes the leader of a new session,
+    /// and the console is its controlling terminal.
     Console(u32),
 }
 
-/// 正在运行、用着仓库的内核：宿主另外打开仓库改了东西时（[`crate::browse_changing`]）找到
-/// 它们报 inotify 事件（[`store_changed`]）。仓库目录按规范化的路径比；内核停了弱引用就
-/// 失效，下次登记、查找时清掉。
+/// Running kernels that use a store: when the host opens a store separately and changes something
+/// ([`crate::browse_changing`]), they are found to report inotify events ([`store_changed`]). Store
+/// directories are compared by canonical path; when a kernel stops its weak reference expires and
+/// is cleared at the next registration or lookup.
 static RUNNING: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<Shared>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// 宿主改了仓库 `store` 里的 `changes`：交给用着它、正在运行的内核，各自持着 BKL 照对应的
-/// syscall 报 inotify 事件（[`crate::syscall::host_change`]）。
+/// The host changed `changes` in store `store`: hands them to the running kernels that use it,
+/// each of which reports inotify events as the matching syscall would, with the BKL held
+/// ([`crate::syscall::host_change`]).
 pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::browse::Change]) {
     if changes.is_empty() {
         return;
@@ -99,22 +107,23 @@ pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::brow
     }
 }
 
-/// 一个 guest 内核实例。析构时结束所有 guest 进程。
+/// A guest kernel instance. Dropping it ends every guest process.
 pub struct Machine {
     shared: Arc<Shared>,
     timers: Option<JoinHandle<()>>,
 }
 
-/// [`run`] 关机时 inittab 里关机的命令一共能用多久（OpenRC 停 PostgreSQL 最多等 15 秒）。
+/// How long the shutdown commands in inittab may take in total when [`run`] shuts down (OpenRC
+/// waits up to 15 s when stopping PostgreSQL).
 pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 thread_local! {
-    /// 宿主线程在 Machine 的阻塞方法里等待用的事件。
+    /// The event a host thread waits on in the Machine's blocking methods.
     static EVENT: Arc<Event> = Arc::new(Event::new().expect("cannot create an eventfd"));
 }
 
 impl Machine {
-    /// 建立内核实例：打开 inode 仓库，建好内置的 init（pid 1）。
+    /// Creates a kernel instance: opens the inode store and creates the built-in init (pid 1).
     pub fn start(options: &MachineOptions) -> Result<Machine, RunError> {
         crate::bug::host_call("Machine::start", || Self::start_kernel(options))
             .unwrap_or(Err(RunError::Internal))
@@ -130,13 +139,13 @@ impl Machine {
             None => None,
         };
         appine_hal::raise_fd_limit();
-        // 引擎的 bug 只结束撞上它的 guest 进程（crate::bug）
+        // An engine bug ends only the guest process that hits it (crate::bug)
         if crate::bug::contain() {
             appine_engine::install_fault_guard();
         }
         let shared = Arc::new(Shared::new(Kernel::new(options.tier)));
         if let Some(vfs) = &vfs {
-            // 推迟提交的写事务由定时器线程到点提交
+            // Deferred write transactions are committed by the timer thread when due
             let timers = shared.timers.clone();
             vfs.store().set_waker(Box::new(move || timers.signal()));
         }
@@ -178,8 +187,8 @@ impl Machine {
         })
     }
 
-    /// 启动一个新进程（init 的子进程），返回它的 pid。设置了仓库时 `program` 是 guest
-    /// 文件系统里的路径，否则是宿主路径。
+    /// Starts a new process (a child of init) and returns its pid. With a store, `program` is a
+    /// path in the guest filesystem; otherwise it is a host path.
     pub fn spawn(
         &self,
         program: &[u8],
@@ -273,7 +282,8 @@ impl Machine {
             &image,
         );
         crate::syscall::label_image(&mut mm, &image, (&exe, ino_of(program)), interp);
-        // 与 execve 一样记下程序文件（ETXTBSY、池里翻译的键、共用翻译的组）
+        // Record the program file as execve does (ETXTBSY, the key of pooled translations, the
+        // group sharing translations)
         mm.exe = Some(ino_of(program)).filter(|&ino| ino != 0);
 
         let tid = k.alloc_tid().map_err(io_err)?;
@@ -299,7 +309,8 @@ impl Machine {
             }
         };
         let mm = mm.into_shared();
-        // SAFETY: Mm 由任务的 TaskState 持有，线程退出或 execve 之前不会释放
+        // SAFETY: the Mm is held by the task's TaskState and is not released before the thread
+        // exits or execs
         let mut cpu = unsafe { Cpu::new(mm.borrow().mmu()) };
         cpu.state_mut().pc = image.entry;
         cpu.state_mut().sp = image.sp;
@@ -340,18 +351,18 @@ impl Machine {
         Ok(tid as u32)
     }
 
-    /// 在持有 BKL 时反复检查 `cond`，直到它给出结果。
+    /// Checks `cond` repeatedly with the BKL held until it gives a result.
     fn wait_for<T>(&self, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
         self.wait_on(wake::ALL, cond)
     }
 
-    /// 与 [`Machine::wait_for`] 相同，但只被 `interest` 里的通道（[`wake`]）叫醒。
+    /// The same as [`Machine::wait_for`], but woken only by the channels in `interest` ([`wake`]).
     fn wait_on<T>(&self, interest: u32, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
         self.wait_objects(interest, None, cond)
     }
 
-    /// 与 [`Machine::wait_on`] 相同；`objects` 不为 None 时，只影响别的对象的修改不叫醒它
-    /// （[`crate::kernel::Cx::wait_objects`]）。
+    /// The same as [`Machine::wait_on`]; when `objects` is not None, changes that affect only other
+    /// objects do not wake it ([`crate::kernel::Cx::wait_objects`]).
     fn wait_objects<T>(
         &self,
         interest: u32,
@@ -362,7 +373,7 @@ impl Machine {
             .expect("waited without a deadline")
     }
 
-    /// 与 [`Machine::wait_on`] 相同，到了 `deadline` 还没等到时返回 None。
+    /// The same as [`Machine::wait_on`], returning None if nothing comes by `deadline`.
     fn wait_until<T>(
         &self,
         interest: u32,
@@ -395,15 +406,16 @@ impl Machine {
         })
     }
 
-    /// 等 [`Machine::spawn`] 启动的进程结束。
+    /// Waits for a process started by [`Machine::spawn`] to end.
     pub fn wait(&self, pid: u32) -> ExitStatus {
-        // 只有宿主在等的进程结束时才要叫醒这里，别的进程结束、关闭文件都不必
+        // This needs waking only when a process the host waits for ends; other processes ending
+        // and files closing need not wake it
         self.wait_on(wake::WATCHED, |k| {
             k.watched.get(&(pid as i32)).copied().flatten()
         })
     }
 
-    /// [`Machine::spawn`] 启动的进程已经结束时返回它的结束方式。
+    /// Returns how a process started by [`Machine::spawn`] ended, if it has.
     pub fn try_wait(&self, pid: u32) -> Option<ExitStatus> {
         self.shared
             .lock()
@@ -413,7 +425,7 @@ impl Machine {
             .flatten()
     }
 
-    /// 新建一个控制台，返回它的 PTY 编号（`/dev/pts/<编号>`）。
+    /// Creates a console and returns its PTY number (`/dev/pts/<number>`).
     pub fn open_console(&self, rows: u16, cols: u16) -> Result<u32, Errno> {
         self.open_console_with(Winsize {
             rows,
@@ -429,8 +441,8 @@ impl Machine {
         .ok_or(Errno::EIO)
     }
 
-    /// 读控制台的输出，没有输出时等待。返回 0 表示会话结束：所有从设备都关闭了，
-    /// 输出也已经读完。
+    /// Reads the console's output, waiting when there is none. Returns 0 when the session has
+    /// ended: every slave is closed and the output has all been read.
     pub fn read_console(&self, id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
         let objects = terminal::wake_objects(&self.shared.lock(), id);
         let out = self.wait_objects(wake::FILE, objects.as_deref(), |k| {
@@ -443,8 +455,8 @@ impl Machine {
         Ok(out.len())
     }
 
-    /// 向控制台输入（经过行规程），输入队列满时等待。返回写入的字节数；会话已经结束时
-    /// 返回 EIO。
+    /// Writes input to the console (through the line discipline), waiting while the input queue is
+    /// full. Returns the number of bytes written; EIO if the session has already ended.
     pub fn write_console(&self, id: u32, data: &[u8]) -> Result<usize, Errno> {
         if data.is_empty() {
             return Ok(0);
@@ -457,7 +469,7 @@ impl Machine {
                     let n = room.min(data.len());
                     return terminal::feed(k, id, &data[..n]).map(|()| Some(n));
                 }
-                // 输入队列满了，但已经没有进程会读它
+                // The input queue is full, but no process will read it any more
                 match terminal::take_output(k, id, 0) {
                     Ok(Some(_)) => Err(Errno::EIO),
                     _ => Ok(None),
@@ -467,7 +479,7 @@ impl Machine {
         })
     }
 
-    /// 控制台的窗口大小变了：前台进程组收到 SIGWINCH。
+    /// The console's window size changed: the foreground process group gets SIGWINCH.
     pub fn resize_console(&self, id: u32, rows: u16, cols: u16) -> Result<(), Errno> {
         let w = Winsize {
             rows,
@@ -482,7 +494,7 @@ impl Machine {
         )
     }
 
-    /// 关闭控制台（终端标签页关闭）：会话组长收到 SIGHUP。
+    /// Closes the console (the terminal tab closed): the session leader gets SIGHUP.
     pub fn close_console(&self, id: u32) -> Result<(), Errno> {
         crate::bug::host_call("Machine::close_console", || {
             terminal::close(&mut self.shared.lock(), id)
@@ -490,7 +502,7 @@ impl Machine {
         .unwrap_or(Err(Errno::EIO))
     }
 
-    /// 结束所有 guest 进程，等所有 guest 线程退出。
+    /// Ends every guest process and waits for every guest thread to exit.
     pub fn kill_all(&self) {
         crate::bug::host_call("Machine::kill_all", || {
             let mut k = self.shared.lock();
@@ -512,10 +524,11 @@ impl Machine {
         self.wait_for(|k| k.tasks.is_empty().then_some(()));
     }
 
-    /// 按 `/etc/inittab` 开机（[`crate::inittab`]）：依次运行 sysinit、boot、bootwait、默认
-    /// 运行级别的 wait（每个都等它结束）和 once（不等），输出写到 [`crate::inittab::LOG`]。
-    /// 返回时 once 的命令可能还在运行。没有 inittab、没有仓库时什么也不做。之后内置的 init
-    /// 接受 busybox 的 reboot、halt、poweroff 的请求（[`Machine::take_power`]）。
+    /// Boots from `/etc/inittab` ([`crate::inittab`]): runs in order sysinit, boot, bootwait, and
+    /// the default runlevel's wait (each waited for) and once (not waited for), with output
+    /// written to [`crate::inittab::LOG`]. On return the once commands may still be running. Does
+    /// nothing without an inittab or a store. Afterwards the built-in init accepts busybox's
+    /// reboot, halt and poweroff requests ([`Machine::take_power`]).
     pub fn boot(&self) {
         self.shared.lock().init_handlers = true;
         let entries = self.inittab();
@@ -532,8 +545,8 @@ impl Machine {
                 self.wait(pid);
             }
         }
-        // 一个命令也没运行（没装 OpenRC）：上次开机的输出不留着，免得被当成这次的（App 从里面
-        // 找没起来的服务）
+        // No command ran at all (OpenRC not installed): the previous boot's output is not kept, so
+        // it is not taken for this boot's (the app looks in it for services that failed to start)
         if first {
             crate::bug::host_call("Machine::boot", || {
                 let k = self.shared.lock();
@@ -546,10 +559,11 @@ impl Machine {
         }
     }
 
-    /// 关机（busybox init 的 `run_shutdown_and_kill_processes`）：开过机的先依次运行 inittab
-    /// 里关机的命令（[`crate::inittab::shutdown_plan`]），然后给所有进程发 SIGTERM，最多等
-    /// 1 秒，再结束剩下的（[`Machine::kill_all`]）。`timeout` 限制关机的命令一共能用多久，
-    /// 到了就不再等。
+    /// Shuts down (busybox init's `run_shutdown_and_kill_processes`): if it has booted, first runs
+    /// the shutdown commands in inittab in order ([`crate::inittab::shutdown_plan`]); then sends
+    /// SIGTERM to every process, waits up to 1 second, and ends the rest ([`Machine::kill_all`]).
+    /// `timeout` limits how long the shutdown commands may take in total; once it is reached they
+    /// are no longer waited for.
     pub fn shutdown(&self, power: crate::Power, timeout: std::time::Duration) {
         let deadline = std::time::Instant::now() + timeout;
         let init = {
@@ -586,16 +600,18 @@ impl Machine {
         self.kill_all();
     }
 
-    /// 控制台 `id` 前台进程组的当前目录（App 被杀之后恢复标签页时，新的 shell 从这里开始，
-    /// android/service 的 map）。shell 已经退出时是 ESRCH。
+    /// The current directory of console `id`'s foreground process group (when the app restores
+    /// tabs after being killed, the new shell starts here; the android/service map). ESRCH if the
+    /// shell has already exited.
     pub fn console_cwd(&self, id: u32) -> Result<Vec<u8>, Errno> {
         let k = self.shared.lock();
         crate::bug::host_call("Machine::console_cwd", || terminal::fg_cwd(&k, id))
             .unwrap_or(Err(Errno::EIO))
     }
 
-    /// 还在运行的 guest 进程数（不算内置的 init 和僵尸进程）：App 关掉最后一个标签页之后据此
-    /// 决定留在后台还是退出（android/service 的 map）。
+    /// The number of guest processes still running (not counting the built-in init and zombies):
+    /// after the last tab is closed the app uses it to decide whether to stay in the background or
+    /// exit (the android/service map).
     pub fn processes(&self) -> usize {
         let k = self.shared.lock();
         k.groups
@@ -607,14 +623,14 @@ impl Machine {
             .count()
     }
 
-    /// 取走 guest 发给内置 init 的关机请求（busybox 的 reboot、halt、poweroff）。只在
-    /// [`Machine::boot`] 之后才有。
+    /// Takes the shutdown request the guest sent to the built-in init (busybox's reboot, halt,
+    /// poweroff). Only present after [`Machine::boot`].
     pub fn take_power(&self) -> Option<crate::Power> {
         self.shared.lock().power.take()
     }
 
-    /// 等 [`Machine::spawn`] 启动的进程结束，或者 guest 请求关机（[`Machine::take_power`]，
-    /// 请求不取走）。
+    /// Waits for a process started by [`Machine::spawn`] to end, or for the guest to request
+    /// shutdown ([`Machine::take_power`]; the request is not taken).
     pub fn wait_or_power(&self, pid: u32) -> Result<ExitStatus, crate::Power> {
         self.wait_on(wake::WATCHED, |k| match k.watched.get(&(pid as i32)) {
             Some(Some(status)) => Some(Ok(*status)),
@@ -622,8 +638,9 @@ impl Machine {
         })
     }
 
-    /// 读 `/etc/inittab`（跟随符号链接），没有时是空表。持着 BKL 读：关机时 guest 进程还在
-    /// 运行，仓库（SQLite 的连接、各种缓存）只能在 BKL 下用。
+    /// Reads `/etc/inittab` (following symlinks); an empty table if there is none. Read with the
+    /// BKL held: guest processes are still running at shutdown, and the store (the SQLite
+    /// connection, various caches) may only be used under the BKL.
     fn inittab(&self) -> Vec<crate::inittab::Entry> {
         let text = crate::bug::host_call("Machine::inittab", || {
             let k = self.shared.lock();
@@ -652,11 +669,13 @@ impl Machine {
             .unwrap_or_default()
     }
 
-    /// 由 `/bin/sh -c` 运行 inittab 里的命令（[`crate::inittab::script`]），返回 pid。命令的
-    /// 程序是不存在的绝对路径时（比如没装 OpenRC），或者起不来时，返回 None。
+    /// Runs an inittab command by `/bin/sh -c` ([`crate::inittab::script`]) and returns the pid.
+    /// Returns None when the command's program is an absolute path that does not exist (OpenRC not
+    /// installed, say) or when it cannot start.
     fn run_init_process(&self, process: &[u8], first: bool) -> Option<u32> {
         if let Some(program) = crate::inittab::program(process) {
-            // 持着 BKL 查：前面的 once 命令可能已经在运行（见 [`Machine::inittab`]）
+            // Checked with the BKL held: earlier once commands may already be running (see
+            // [`Machine::inittab`])
             let offline = crate::pseudo::Offline;
             let found = crate::bug::host_call("Machine::boot", || {
                 let k = self.shared.lock();
@@ -691,9 +710,11 @@ impl Machine {
         }
     }
 
-    /// 宿主内存紧张、App 的界面离开了一阵子（android/service 的 map）：丢掉可以重建的缓存，即池里
-    /// 保留的 Tier 1 翻译、共用的只读文件映射和 dentry/inode 缓存（运行中的进程用着的不动）。
-    /// App 这时多半在后台，随时可能被杀掉，顺便提交推迟的写事务。
+    /// Host memory is tight and the app's UI has been away for a while (the android/service map):
+    /// drops caches that can be rebuilt, that is the Tier 1 translations kept in the pool, the
+    /// shared read-only file mappings and the dentry/inode caches (those in use by running
+    /// processes are left alone). The app is most likely in the background then and may be killed
+    /// at any time, so deferred write transactions are committed too.
     pub fn trim_memory(&self) {
         crate::debug::log(format_args!("trimming memory"));
         appine_engine::trim_dbt_pool();
@@ -707,17 +728,19 @@ impl Machine {
         self.sync();
     }
 
-    /// 宿主的网络变了（kernel/net 的 map）：主表里的路由换成 `routes`，guest 的 `ip route`、
-    /// `/proc/net/route` 等看到的就是它们（[`crate::route`]）。Android 上 App 读不到宿主的
-    /// 路由表，由它从默认网络的 `LinkProperties` 取了交进来；None 时改回读宿主的，读不到时
-    /// 按接口的地址合成。
+    /// The host's network changed (the kernel/net map): the routes in the main table become
+    /// `routes`, which the guest's `ip route`, `/proc/net/route` and so on then see
+    /// ([`crate::route`]). On Android the app cannot read the host routing table, so it takes the
+    /// routes from the default network's `LinkProperties` and passes them in; None switches back to
+    /// reading the host's, synthesised from the interface addresses when that cannot be read.
     pub fn set_routes(&self, routes: Option<Vec<crate::HostRoute>>) {
         crate::bug::host_call("Machine::set_routes", || {
             self.shared.lock().host_routes = routes;
         });
     }
 
-    /// 提交 inode 仓库推迟提交的写事务（App 退到后台时，[`crate::vfs::store`]）。
+    /// Commits the inode store's deferred write transactions (when the app goes to the background,
+    /// [`crate::vfs::store`]).
     pub fn sync(&self) {
         crate::bug::host_call("Machine::sync", || {
             if let Some(vfs) = &self.shared.lock().vfs {
@@ -726,8 +749,9 @@ impl Machine {
         });
     }
 
-    /// 取走 guest 在非回环地址上第一次监听的端口（设计文档 §12 第 7 条）：App 据此发通知，
-    /// 告诉用户别的设备连哪个端口（低端口映射到了别处，[`crate::portmap`]）。
+    /// Takes the ports the guest first listened on at non-loopback addresses (design doc §12 item
+    /// 7): the app posts a notification from them, telling the user which port other devices
+    /// should connect to (low ports are mapped elsewhere, [`crate::portmap`]).
     pub fn take_listens(&self) -> Vec<crate::ListenEvent> {
         crate::bug::host_call("Machine::take_listens", || {
             self.shared.lock().portmap.borrow_mut().take_listens()
@@ -735,8 +759,9 @@ impl Machine {
         .unwrap_or_default()
     }
 
-    /// 取走内核层结束了的 guest 进程（内核 bug、引擎的宿主故障、OOM killer）：App 在它们的
-    /// 标签页里说明原因，不在标签页里的发通知（android/service 的 map）。
+    /// Takes the guest processes the kernel layer ended (kernel bug, engine host fault, OOM
+    /// killer): the app explains the reason in their tabs, and posts a notification for those not
+    /// in a tab (the android/service map).
     pub fn take_kills(&self) -> Vec<crate::KillReport> {
         crate::bug::host_call("Machine::take_kills", || {
             std::mem::take(&mut *self.shared.lock().kills.borrow_mut())
@@ -744,8 +769,9 @@ impl Machine {
         .unwrap_or_default()
     }
 
-    /// 取走 guest 改过目录项（新建、删除、改名）的目录在仓库里的路径：App 让"文件"App 刷新
-    /// 它们（android/documents 的 map）。第一次调用时才开始记；删掉了的、tmpfs 里的不给。
+    /// Takes the store paths of directories whose entries the guest changed (created, deleted,
+    /// renamed): the app has the Files app refresh them (the android/documents map). Recording
+    /// starts only at the first call; deleted directories and those in tmpfs are not reported.
     pub fn take_changed_dirs(&self) -> Vec<Vec<u8>> {
         crate::bug::host_call("Machine::take_changed_dirs", || {
             let k = self.shared.lock();
@@ -762,14 +788,14 @@ impl Machine {
         .unwrap_or_default()
     }
 
-    /// 使用 Tier 1 时已退出线程的统计之和。
+    /// The summed statistics of exited threads when using Tier 1.
     pub fn dbt_stats(&self) -> Option<DbtStats> {
         self.shared.lock().dbt_stats
     }
 }
 
-/// 执行控制台 `id` 上的宿主调用。内核层 panic 时像终端被挂断一样关闭这个控制台（会话组长
-/// 收到 SIGHUP），返回 EIO。
+/// Runs a host call on console `id`. On a kernel-layer panic the console is closed as if the
+/// terminal were hung up (the session leader gets SIGHUP), and EIO is returned.
 fn on_console<T>(
     k: &mut Kernel,
     id: u32,
@@ -797,13 +823,15 @@ impl Drop for Machine {
     }
 }
 
-/// 定时器线程：等到最早的到期时刻，发出到期的 SIGALRM（[`crate::itimer::expire`]），
-/// 有 guest 线程在运行时定时检查内存的上限、拆代码缓存在可写视图里写过的页
-/// （[`crate::oom`]）、为平均负载取样（[`crate::loadavg`]），到点提交 inode 仓库推迟提交的
-/// 写事务，直到 Machine 关闭。
+/// The timer thread: waits until the earliest deadline and sends the due SIGALRMs
+/// ([`crate::itimer::expire`]); while guest threads are running, periodically checks the memory
+/// limit, unmaps the pages the code cache wrote through its writable views ([`crate::oom`]) and
+/// samples the load average ([`crate::loadavg`]); commits the inode store's deferred write
+/// transactions when due; until the Machine shuts down.
 ///
-/// 撞上内核层的 bug 时（[`crate::bug`]）照常运行：处理一个进程的定时器时出错，结束那个
-/// 进程；内存上限的检查和信号驱动的 I/O 分不出是哪个进程的，出错时关掉这项功能。
+/// It keeps running when it hits a kernel-layer bug ([`crate::bug`]): an error while handling one
+/// process's timers ends that process; the memory-limit check and signal-driven I/O cannot tell
+/// which process is at fault, so an error turns that feature off.
 fn timers(shared: Arc<Shared>) {
     let event = shared.timers.clone();
     let mut k = shared.lock();
@@ -831,7 +859,7 @@ fn timers(shared: Arc<Shared>) {
             Some(None) => {}
             None => crate::bug::report(format_args!("kernel panic in the load average")),
         }
-        // inode 仓库推迟提交的写事务：开始推迟时叫醒这个线程
+        // The inode store's deferred write transactions: deferring starts by waking this thread
         if let Some(vfs) = k.vfs.clone() {
             match crate::bug::catch(|| vfs.store().commit_due()) {
                 Some(Some(due)) => next = Some(next.map_or(due, |n| n.min(due))),
@@ -841,7 +869,8 @@ fn timers(shared: Arc<Shared>) {
                 )),
             }
         }
-        // 信号驱动的 I/O：任何修改都会叫醒这个线程，顺便检查；宿主 socket 一起等
+        // Signal-driven I/O: every change wakes this thread, which checks along the way; host
+        // sockets are waited on together
         let fasync = crate::bug::catch(|| crate::syscall::check_fasync(&mut k));
         let mut host = fasync.unwrap_or_else(|| {
             crate::bug::report(format_args!(
@@ -850,7 +879,8 @@ fn timers(shared: Arc<Shared>) {
             k.fasync.clear();
             Vec::new()
         });
-        // EPOLLEXCLUSIVE 的独占门：这里替等着的线程看文件，来了新的边沿只叫醒一个
+        // EPOLLEXCLUSIVE exclusive gates: this thread watches the files for the waiting threads,
+        // and a new edge wakes only one
         match crate::bug::catch(|| crate::syscall::check_exclusive(&mut k)) {
             Some(fds) => host.extend(fds),
             None => {
@@ -862,12 +892,13 @@ fn timers(shared: Arc<Shared>) {
                 }
             }
         }
-        // raw ICMP socket 的汇集点：替 poll、epoll 的等待者取下到了的报文
+        // Collection point of raw ICMP sockets: takes arrived packets for poll and epoll waiters
         match crate::bug::catch(|| crate::rawicmp::check_taps(&mut k)) {
             Some(fds) => host.extend(fds),
             None => crate::bug::report(format_args!("kernel panic in the raw ICMP sockets")),
         }
-        // 定时器的设置不是打开文件上的修改；有信号驱动的 I/O、独占门时才要看每一次修改
+        // Setting a timer is not a change on an open file; every change needs watching only while
+        // signal-driven I/O or exclusive gates exist
         let interest = if k.fasync.is_empty() && k.ex_gates.is_empty() {
             wake::OTHER
         } else {
@@ -878,10 +909,11 @@ fn timers(shared: Arc<Shared>) {
     }
 }
 
-/// 加载 guest 程序并运行到它结束，然后结束其余的进程（`appine-run`）。
+/// Loads a guest program and runs it until it ends, then ends the other processes
+/// (`appine-run`).
 ///
-/// 设置了 [`RunOptions::rootfs`] 时，`program` 是 guest 文件系统里的路径；
-/// 否则是宿主路径。
+/// With [`RunOptions::rootfs`] set, `program` is a path in the guest filesystem;
+/// otherwise it is a host path.
 pub fn run(
     program: &OsStr,
     argv: &[Vec<u8>],
@@ -895,7 +927,8 @@ pub fn run(
         low_port_offset: options.low_port_offset,
         always_map_low_ports: options.always_map_low_ports,
     })?;
-    // 有终端时，进程是会话组长，接到宿主终端的控制台是它的控制终端
+    // With a terminal, the process is a session leader, and the console connected to the host
+    // terminal is its controlling terminal
     let console = options
         .terminal
         .map(|term| {
@@ -916,7 +949,8 @@ pub fn run(
             .expect("cannot start the terminal thread")
     });
     let status = if options.init {
-        // 程序结束时是关机；guest 请求了重启也只是关机，结束 appine-run
+        // The program ending means shutdown; a guest request to reboot is also only a shutdown,
+        // ending appine-run
         let power = machine.wait_or_power(pid).err();
         machine.shutdown(power.unwrap_or(crate::Power::PowerOff), SHUTDOWN_TIMEOUT);
         machine.wait(pid)
@@ -925,7 +959,7 @@ pub fn run(
         machine.kill_all();
         status
     };
-    // 桥接线程把剩下的输出写完才退出
+    // The bridge thread exits only after writing out the remaining output
     if let Some(b) = bridge {
         let _ = b.join();
     }

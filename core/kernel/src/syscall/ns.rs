@@ -1,8 +1,9 @@
-//! 命名空间（kernel/process 的 map）：`clone`、`unshare` 新建挂载、用户、pid（`crate::pidns`）、UTS、
-//! IPC、网络、cgroup 命名空间（`crate::nsproxy`），`/proc/<pid>/ns/*`
-//! （`crate::pseudo::NsKind`），命名空间文件上的 ioctl，经由命名空间文件或者 pidfd 的
-//! setns(2)。打开着的、bind 挂载出去的命名空间文件让命名空间活着（[`NsRef`]）。time 命名空间
-//! 只有开机时的那个，setns 到它什么也不做。
+//! Namespaces (the kernel/process map): `clone` and `unshare` create mount, user, pid
+//! (`crate::pidns`), UTS, IPC, network and cgroup namespaces (`crate::nsproxy`);
+//! `/proc/<pid>/ns/*` (`crate::pseudo::NsKind`); ioctls on namespace files; setns(2) through a
+//! namespace file or a pidfd. Namespace files that are open or bind-mounted elsewhere keep their
+//! namespace alive ([`NsRef`]). The only time namespace is the boot one, and setns to it does
+//! nothing.
 
 use std::rc::Rc;
 
@@ -17,8 +18,9 @@ use crate::pseudo::{NsKind, PseudoNode};
 use crate::task::FsContext;
 use crate::vfs::{MntNs, MountId, Node, Vfs, new_ns_id};
 
-/// 给 `fs` 一个新的挂载命名空间，属于用户命名空间 `owner`：复制原来的那个里的所有挂载，
-/// 根目录、当前目录换到复制出来的挂载上（Linux 的 `copy_mnt_ns`）。没有 rootfs 时只换编号。
+/// Gives `fs` a new mount namespace owned by user namespace `owner`: copies every mount in the old
+/// one and moves the root and the current directory onto the copied mounts (Linux's
+/// `copy_mnt_ns`). Without a rootfs only the number changes.
 pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs>) {
     let Some(vfs) = vfs else {
         fs.mnt_ns = Rc::new(MntNs {
@@ -38,9 +40,10 @@ pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs
     fs.mnt_ns = ns;
 }
 
-/// 新建用户命名空间（Linux 6.1 的 `create_user_ns`），`cred` 进到里面去：最多嵌套到第
-/// 33 层（ENOSPC，老内核是 EUSERS），chroot 了的进程不行（EPERM），建立者的有效用户 ID、
-/// 组 ID 在原来的命名空间里要有映射（EPERM）。`chrooted` 是根目录不是挂载命名空间的根。
+/// Creates a user namespace (Linux 6.1's `create_user_ns`) and moves `cred` into it: nesting goes
+/// up to level 33 at most (ENOSPC; older kernels give EUSERS), a chrooted process may not (EPERM),
+/// and the creator's effective user ID and group ID must be mapped in the old namespace (EPERM).
+/// `chrooted` means the root directory is not the mount namespace's root.
 pub(super) fn new_user_ns(cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
     let parent = cred.user_ns.clone();
     if parent.level > MAX_USER_NS_LEVEL {
@@ -59,10 +62,10 @@ pub(super) fn new_user_ns(cred: &mut Cred, chrooted: bool) -> Result<(), Errno> 
     Ok(())
 }
 
-/// 新建 pid 命名空间（Linux 6.1 的 `copy_pid_ns`、`create_pid_namespace`），在 `parent`
-/// （新建的子进程所在的那个）下面、属于用户命名空间 `owner`：`parent` 要是自己所在的
-/// （unshare 了还没有进去时 EINVAL），`owner` 要是 `parent` 的属主或者它的后代（EPERM），
-/// 最多嵌套 32 层（ENOSPC）。
+/// Creates a pid namespace (Linux 6.1's `copy_pid_ns`, `create_pid_namespace`) under `parent` (the
+/// one new children are in), owned by user namespace `owner`: `parent` must be the caller's own
+/// namespace (EINVAL after unshare but before entering it), `owner` must be `parent`'s owner or
+/// one of its descendants (EPERM), and nesting goes up to 32 levels (ENOSPC).
 pub(super) fn new_pid_ns(
     active: &PidNs,
     parent: &Rc<PidNs>,
@@ -80,7 +83,7 @@ pub(super) fn new_pid_ns(
     Ok(PidNs::child(parent, owner))
 }
 
-/// 新的 cgroup 命名空间，属于用户命名空间 `owner`，根是调用者所在的 cgroup `root`。
+/// A new cgroup namespace owned by user namespace `owner`, rooted at the caller's cgroup `root`.
 pub(super) fn new_cgroup_ns(owner: Rc<UserNs>, root: u64) -> Rc<crate::nsproxy::CgroupNs> {
     Rc::new(crate::nsproxy::CgroupNs {
         id: new_ns_id(),
@@ -89,7 +92,7 @@ pub(super) fn new_cgroup_ns(owner: Rc<UserNs>, root: u64) -> Rc<crate::nsproxy::
     })
 }
 
-/// 根目录不是挂载命名空间的根（chroot 了，Linux 的 `current_chrooted`）。
+/// The root directory is not the mount namespace's root (chrooted; Linux's `current_chrooted`).
 pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
     let Ok(vfs) = cx.vfs() else {
         return false;
@@ -98,7 +101,8 @@ pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
         .is_some_and(|root| root != cx.root())
 }
 
-/// 编号为 `id`、还有进程在里面（或者在它下面），或者是哪个线程给子进程用的 pid 命名空间。
+/// The pid namespace numbered `id` that still has processes in it (or below it), or that some
+/// thread uses for its children.
 fn find_pid_ns(k: &Kernel, id: u64) -> Option<Rc<PidNs>> {
     let up = |ns: Rc<PidNs>| {
         let mut ns = Some(ns);
@@ -120,12 +124,12 @@ fn find_pid_ns(k: &Kernel, id: u64) -> Option<Rc<PidNs>> {
         })
 }
 
-/// 还有线程在里面的 UTS、IPC、网络、cgroup 命名空间里 `f` 挑出来的那个。
+/// The UTS, IPC, network or cgroup namespace picked by `f` among those that still have threads.
 fn find_nsproxy<T>(k: &Kernel, f: impl Fn(&crate::nsproxy::NsProxy) -> Option<T>) -> Option<T> {
     k.tasks.values().find_map(|t| f(&t.ns.borrow()))
 }
 
-/// 编号为 `id`、还有进程在里面（或者在它下面）的用户命名空间。
+/// The user namespace numbered `id` that still has processes in it (or below it).
 fn find_user_ns(k: &Kernel, id: u64) -> Option<Rc<UserNs>> {
     k.groups.values().find_map(|g| {
         let mut ns = Some(g.borrow().cred.user_ns.clone());
@@ -139,8 +143,9 @@ fn find_user_ns(k: &Kernel, id: u64) -> Option<Rc<UserNs>> {
     })
 }
 
-/// 编号为 `id` 的 `kind` 种命名空间（打开命名空间文件时）：还有线程在里面（或者在它下面）
-/// 的，或者打开着的、bind 挂载出去的命名空间文件留着的。
+/// The namespace of kind `kind` numbered `id` (when opening a namespace file): one that still has
+/// threads in it (or below it), or one kept by a namespace file that is open or bind-mounted
+/// elsewhere.
 pub(crate) fn find(k: &Kernel, vfs: Option<&Vfs>, kind: NsKind, id: u64) -> Option<NsRef> {
     let live = match kind {
         NsKind::Mnt => vfs.and_then(|v| v.find_ns(id)).map(NsRef::Mnt),
@@ -161,7 +166,7 @@ pub(crate) fn find(k: &Kernel, vfs: Option<&Vfs>, kind: NsKind, id: u64) -> Opti
     };
     live.or_else(|| vfs.and_then(|v| v.pinned_ns(id)))
         .or_else(|| {
-            // 打开着的命名空间文件
+            // Open namespace files
             k.tasks.values().find_map(|t| {
                 let res = t.res.borrow();
                 let fds = res.fds.borrow();
@@ -176,10 +181,11 @@ pub(crate) fn find(k: &Kernel, vfs: Option<&Vfs>, kind: NsKind, id: u64) -> Opti
         })
 }
 
-/// setns(2)（Linux 6.1）：`fd` 是打开的命名空间文件（`/proc/<pid>/ns/<种类>`，或者 bind
-/// 挂载出去的），`nstype` 是 0 或者与它相同的 `CLONE_NEW*`；或者是 pidfd，`nstype` 是要换成
-/// 那个进程的哪几种命名空间（不能是 0），一次换过去。打开着的命名空间文件让命名空间活着，里面
-/// 的进程都退出了也能进去。
+/// setns(2) (Linux 6.1): `fd` is an open namespace file (`/proc/<pid>/ns/<kind>`, or one
+/// bind-mounted elsewhere), and `nstype` is 0 or its matching `CLONE_NEW*`; or `fd` is a pidfd and
+/// `nstype` is the kinds of that process's namespaces to switch to (not 0), all at once. An open
+/// namespace file keeps its namespace alive, so it can be entered even after all its processes
+/// have exited.
 pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
     let file = cx.fds().get(fd)?;
     let nstype = nstype as u32 as u64;
@@ -207,8 +213,8 @@ pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
     Ok(0)
 }
 
-/// setns 要换成的命名空间（Linux 的 `struct nsset`）：命名空间文件只有它那一种，pidfd 是那个
-/// 进程的、要求的那几种。
+/// The namespaces setns switches to (Linux's `struct nsset`): only the one kind for a namespace
+/// file, the requested kinds of that process's for a pidfd.
 #[derive(Default)]
 struct NsSet {
     user: Option<Rc<UserNs>>,
@@ -237,9 +243,10 @@ impl NsSet {
         set
     }
 
-    /// pidfd 指向的进程的 `flags` 里那几种命名空间（Linux 的 `validate_nsset` 开头取的
-    /// 快照）：pid 命名空间是它自己所在的，不是给子进程用的。进程已经被回收、主线程已经退出
-    /// 时 ESRCH，不能像 ptrace 那样读它（`PTRACE_MODE_READ_REALCREDS`）时 EPERM。
+    /// The kinds of namespaces in `flags` of the process the pidfd refers to (the snapshot taken at
+    /// the start of Linux's `validate_nsset`): the pid namespace is the one it is in, not the one
+    /// for its children. ESRCH if the process has been reaped or its main thread has exited, EPERM
+    /// if it may not be read as with ptrace (`PTRACE_MODE_READ_REALCREDS`).
     fn of(cx: &Cx<'_>, p: &Pidfd, flags: u64) -> Result<NsSet, Errno> {
         let k = cx.kr();
         let group = p.group(k).ok_or(Errno::ESRCH)?;
@@ -263,20 +270,23 @@ impl NsSet {
     }
 }
 
-/// 按 Linux 的顺序（用户、挂载、UTS、IPC、pid、cgroup、网络、time）检查能不能进 `set` 里的
-/// 每一种（各种命名空间的 `install`），一种不行就都不换。`flags` 是要换的那几种
-/// `CLONE_NEW*`。返回挂载命名空间的根目录。
+/// Checks, in Linux's order (user, mount, UTS, IPC, pid, cgroup, network, time), whether each kind
+/// in `set` may be entered (each namespace type's `install`); if any may not, none is switched.
+/// `flags` is the `CLONE_NEW*` kinds to switch. Returns the mount namespace's root directory.
 ///
-/// 一起进了用户命名空间时，后面几种要求的"自己的用户命名空间里的能力"按进去之后的那个算
-/// （Linux 的 `nsset->cred`），能力仍看原来的凭据：建立那个用户命名空间的用户不用
-/// `CAP_SYS_ADMIN` 也能一次进它和它的别的命名空间。
+/// When a user namespace is entered at the same time, the "capability in one's own user
+/// namespace" that the later kinds require is judged in the namespace being entered (Linux's
+/// `nsset->cred`), while the capabilities still come from the original credentials: the user who
+/// created that user namespace can enter it and its other namespaces at once without
+/// `CAP_SYS_ADMIN`.
 fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno> {
     let cred = cx.cred();
-    // 每个线程的 TaskState 和 TaskRes 各持有一份引用
+    // Each thread's TaskState and TaskRes each hold one reference
     let fs_shared = Rc::strong_count(&cx.t.fs) > 2;
     let threaded = cx.t.group.borrow().threads.len() > 1;
     let here = set.user.clone().unwrap_or_else(|| cred.user_ns.clone());
-    // Linux 的 utsns_install 这些：在它的属主和自己的用户命名空间里都要有 CAP_SYS_ADMIN
+    // Linux's utsns_install and the like: CAP_SYS_ADMIN is needed both in its owner and in one's
+    // own user namespace
     let may_enter = |owner: &UserNs| {
         if cred.ns_capable(owner, cap::SYS_ADMIN) && cred.ns_capable(&here, cap::SYS_ADMIN) {
             Ok(())
@@ -284,8 +294,9 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
             Err(Errno::EPERM)
         }
     };
-    // Linux 的 userns_install：不能重进自己的命名空间（借此拿回能力），多线程的进程、fs
-    // 共用时不行，要在目标命名空间里有 CAP_SYS_ADMIN
+    // Linux's userns_install: one's own namespace cannot be re-entered (to regain capabilities
+    // that way), not allowed for a multithreaded process or a shared fs, and CAP_SYS_ADMIN is
+    // needed in the target namespace
     if let Some(ns) = &set.user {
         if ns.id == cred.user_ns.id || threaded || fs_shared {
             return Err(Errno::EINVAL);
@@ -294,9 +305,10 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
             return Err(Errno::EPERM);
         }
     }
-    // Linux 的 mntns_install：先看能力，再看 fs 有没有和别的线程、进程共用。只换挂载命名
-    // 空间时看的是自己的 fs，一起换别的时 Linux 看的是临时复制的那一份（prepare_nsset），
-    // 总是只有自己在用
+    // Linux's mntns_install: first the capabilities, then whether the fs is shared with other
+    // threads or processes. When only the mount namespace is switched, one's own fs is checked;
+    // when others are switched too, Linux checks the temporary copy (prepare_nsset), which only
+    // the caller ever uses
     let mut root = None;
     if let Some(ns) = &set.mnt {
         let vfs = cx.vfs()?;
@@ -317,7 +329,7 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
     if let Some(ns) = &set.ipc {
         may_enter(&ns.owner)?;
     }
-    // Linux 的 pidns_install：只能是自己所在的或者它的后代
+    // Linux's pidns_install: only one's own namespace or a descendant of it
     if let Some(ns) = &set.pid {
         may_enter(&ns.owner)?;
         if !cx.pid_ns().is_ancestor_of(ns) {
@@ -330,7 +342,8 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
     if let Some(ns) = &set.net {
         may_enter(&ns.owner)?;
     }
-    // Linux 的 timens_install：多线程的进程不行（EUSERS），之后与别的一样查能力
+    // Linux's timens_install: not allowed for a multithreaded process (EUSERS), then capabilities
+    // are checked like the others
     if let Some(ns) = &set.time {
         if threaded {
             return Err(Errno::EUSERS);
@@ -340,10 +353,12 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
     Ok(root)
 }
 
-/// 换成 `set` 里的命名空间（Linux 的 `commit_nsset`），`root` 是挂载命名空间的根目录：
-/// 根目录、当前目录换到那里；换 IPC 命名空间之前执行并丢掉 SEM_UNDO 的撤销值（`exit_sem`）；
-/// pid 命名空间是之后建的子进程所在的（1 号进程已经退出的建不了，ENOMEM）。time 命名空间
-/// 自己和给子进程的都换成它，偏移从此不能再改（Linux 的 `timens_commit`）。
+/// Switches to the namespaces in `set` (Linux's `commit_nsset`), with `root` the mount namespace's
+/// root directory: the root and current directory move there; before switching the IPC namespace,
+/// SEM_UNDO adjustments are applied and dropped (`exit_sem`); the pid namespace is the one later
+/// children are created in (one whose process 1 has exited cannot get any, ENOMEM). Both the time
+/// namespace of the caller and the one for its children become it, and its offsets can no longer
+/// be changed (Linux's `timens_commit`).
 fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     if let Some(ns) = set.user {
         cx.t.group.borrow_mut().cred.enter_user_ns(ns);
@@ -386,7 +401,7 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
         p.time = ns.clone();
         p.time_for_children = ns;
         drop(p);
-        // 不持 BKL 读时钟的路径记着偏移
+        // The no-BKL clock-reading path caches the offsets
         cx.shared.fast_changed();
     }
 }
@@ -396,11 +411,12 @@ const NS_GET_PARENT: u32 = 0xb702;
 const NS_GET_NSTYPE: u32 = 0xb703;
 const NS_GET_OWNER_UID: u32 = 0xb704;
 
-/// 命名空间文件上的 ioctl（Linux 6.1 的 `ns_ioctl`）：`NS_GET_USERNS`、`NS_GET_PARENT` 打开
-/// 属主、上一层的命名空间，得到新的 fd（带 `FD_CLOEXEC`）；`NS_GET_NSTYPE` 是它的
-/// `CLONE_NEW*`；`NS_GET_OWNER_UID` 是用户命名空间的建立者在调用者的用户命名空间里的用户 ID。
-/// 别的是 ENOTTY（6.9 起才有的 `NS_GET_MNTNS_ID` 这些也是：appine 报告的内核是 6.1）。
-/// `mnt` 是文件经由的挂载，`kind` 是它的种类。
+/// ioctls on namespace files (Linux 6.1's `ns_ioctl`): `NS_GET_USERNS` and `NS_GET_PARENT` open the
+/// owner and the parent namespace, giving a new fd (with `FD_CLOEXEC`); `NS_GET_NSTYPE` is its
+/// `CLONE_NEW*`; `NS_GET_OWNER_UID` is the user ID of the user namespace's creator in the caller's
+/// user namespace. Anything else is ENOTTY (so are `NS_GET_MNTNS_ID` and the others added in 6.9:
+/// appine reports kernel 6.1). `mnt` is the mount the file was reached through, and `kind` is its
+/// kind.
 pub(super) fn ioctl(
     cx: &mut Cx<'_>,
     mnt: MountId,
@@ -418,12 +434,12 @@ pub(super) fn ioctl(
             let uid = cx.cred().uid_out(user.owner);
             return super::put(cx, arg, uid.to_le_bytes()).map(|()| 0);
         }
-        // 用户命名空间的上一层就是它的属主
+        // A user namespace's parent is its owner
         NS_GET_USERNS | NS_GET_PARENT if matches!(ns, NsRef::User(_)) => {
             (NsKind::User, NsRef::User(visible_owner(cx, ns)?))
         }
         NS_GET_USERNS => (NsKind::User, NsRef::User(visible_owner(cx, ns)?)),
-        // 上一层要是调用者所在的 pid 命名空间或者它下面的（Linux 的 pidns_get_parent）
+        // The parent must be the caller's pid namespace or below it (Linux's pidns_get_parent)
         NS_GET_PARENT => match ns {
             NsRef::Pid(p) => {
                 let parent = p.parent.clone().ok_or(Errno::EPERM)?;
@@ -439,7 +455,7 @@ pub(super) fn ioctl(
     let (kind, related) = related;
     let id = related.id();
     let name = format!("{}:[{id}]", kind.type_name());
-    // 与 Linux 的 open_related_ns 一样只读打开（没有 open 加上的 O_LARGEFILE）
+    // Opened read-only as in Linux's open_related_ns (without the O_LARGEFILE that open adds)
     let file = crate::fd::OpenFile::with_path(
         FileKind::Proc {
             mnt,
@@ -456,8 +472,8 @@ pub(super) fn ioctl(
     cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
 }
 
-/// 命名空间 `ns` 的属主，要是调用者所在的用户命名空间或者它下面的（Linux 的
-/// `ns_get_owner`），否则（包括开机时的用户命名空间没有属主）EPERM。
+/// The owner of namespace `ns`, which must be the caller's user namespace or below it (Linux's
+/// `ns_get_owner`); otherwise (including the boot user namespace, which has no owner) EPERM.
 fn visible_owner(cx: &Cx<'_>, ns: &NsRef) -> Result<Rc<UserNs>, Errno> {
     let owner = ns.owner().ok_or(Errno::EPERM)?;
     if !cx.cred().user_ns.is_ancestor_of(&owner) {
@@ -474,7 +490,7 @@ mod tests {
     fn pid_namespace_limits() {
         let init = PidNs::init();
         let user = UserNs::init();
-        // 最多 32 层：在第 31 层里还能建，第 32 层里是 ENOSPC
+        // At most 32 levels: creation still works in level 31, and is ENOSPC in level 32
         let mut ns = init.clone();
         for level in 1..=MAX_PID_NS_LEVEL {
             ns = new_pid_ns(&ns, &ns, user.clone()).unwrap();
@@ -484,13 +500,14 @@ mod tests {
             new_pid_ns(&ns, &ns, user.clone()).unwrap_err(),
             Errno::ENOSPC
         );
-        // unshare 了、还没进去：给子进程用的和自己所在的不同时 EINVAL
+        // After unshare but before entering: EINVAL when the namespace for children differs from
+        // one's own
         let child = new_pid_ns(&init, &init, user.clone()).unwrap();
         assert_eq!(
             new_pid_ns(&init, &child, user.clone()).unwrap_err(),
             Errno::EINVAL
         );
-        // 属主要是父命名空间的属主或者它的后代
+        // The owner must be the parent namespace's owner or a descendant of it
         let other = UserNs::child(&user, 1000);
         let owned = new_pid_ns(&init, &init, other.clone()).unwrap();
         assert_eq!(new_pid_ns(&owned, &owned, user).unwrap_err(), Errno::EPERM);

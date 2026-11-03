@@ -1,8 +1,8 @@
-//! guest 线程（Linux 的 task）与它的运行循环（kernel/process 的 map）。
+//! Guest threads (Linux's tasks) and their run loop (the kernel/process map).
 //!
-//! 每个 guest 线程对应一个宿主线程（1:1）。运行循环在不持有 BKL 的情况下执行
-//! guest 代码，遇到 syscall、同步异常或 kick 时获取 BKL 进入内核；少数系统调用不必
-//! 取 BKL（[`crate::syscall::fast`]）。
+//! Each guest thread corresponds to one host thread (1:1). The run loop executes guest code
+//! without holding the BKL, and takes the BKL to enter the kernel on a syscall, a synchronous
+//! exception or a kick; a few syscalls need not take the BKL ([`crate::syscall::fast`]).
 
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
@@ -28,159 +28,170 @@ use crate::syscall::{self, Flow};
 use crate::uaccess::UserSlice;
 use crate::vfs::{Node, Vfs};
 
-/// 运行循环与内核其他部分之间无锁共享的状态。
+/// State shared without locks between the run loop and the rest of the kernel.
 pub(crate) struct TaskSync {
-    /// 线程是否正在执行 guest 代码（TLB shootdown 要等它退出）。
+    /// Whether the thread is running guest code (a TLB shootdown waits for it to leave).
     pub in_guest: AtomicBool,
-    /// 打断线程的 Cpu。
+    /// Kicks the thread's Cpu.
     pub kicker: Kicker,
 }
 
-/// 根目录、当前目录和文件创建掩码（`CLONE_FS` 共享的部分），以及挂载命名空间。Linux 的
-/// 挂载命名空间在 nsproxy 里，但 `CLONE_NEWNS` 不能和 `CLONE_FS` 同用、setns 要求 fs 没有
-/// 共用，共用一个 fs 的任务总在同一个挂载命名空间里，放在一起是一样的。
+/// The root directory, current directory and file-creation mask (the part `CLONE_FS` shares),
+/// plus the mount namespace. On Linux the mount namespace is in the nsproxy, but `CLONE_NEWNS`
+/// cannot be combined with `CLONE_FS` and setns requires the fs not to be shared, so tasks sharing
+/// one fs are always in the same mount namespace and keeping them together is equivalent.
 pub(crate) struct FsContext {
-    /// 根目录（chroot）。
+    /// Root directory (chroot).
     pub root: Node,
     pub cwd: Node,
     pub umask: u32,
     pub mnt_ns: Rc<crate::vfs::MntNs>,
 }
 
-/// 线程用着的地址空间、fd 表和当前目录。它们本来在 [`TaskState`] 里，这里是一份
-/// 别的线程也能读的拷贝（procfs 用），由 [`Cx::set_mm`](crate::kernel::Cx::set_mm)
-/// 等在替换时同步更新。
+/// The address space, fd table and current directory the thread is using. They really live in
+/// [`TaskState`]; this is a copy other threads can read too (for procfs), kept in sync by
+/// [`Cx::set_mm`](crate::kernel::Cx::set_mm) and the like when they are replaced.
 pub(crate) struct TaskRes {
     pub mm: Rc<RefCell<Mm>>,
     pub fds: Rc<RefCell<FdTable>>,
     pub fs: Rc<RefCell<FsContext>>,
 }
 
-/// 一个 guest 线程。除 [`Task::state`] 外，其余字段也会被其他线程访问（发信号、
-/// 结束线程组），都只在持有 BKL 时进行。
+/// A guest thread. Apart from [`Task::state`], the fields are also accessed by other threads
+/// (sending signals, ending the thread group), always only while holding the BKL.
 pub(crate) struct Task {
-    /// tid。非主线程 execve 时接过主线程的 tid，所以会变。
+    /// tid. It changes, because a non-leader thread that calls execve takes over the leader's tid.
     pub tid: Cell<Tid>,
-    /// 所属线程组。
+    /// The thread group it belongs to.
     pub tgid: Tid,
-    /// 发给这个线程、尚未处理的信号。
+    /// Signals sent to this thread and not yet handled.
     pub pending: RefCell<Pending>,
-    /// 信号屏蔽字。
+    /// Signal mask.
     pub sigmask: Cell<u64>,
-    /// 新建的子进程所在的 pid 命名空间，None 是与自己的相同（Linux 的
-    /// `nsproxy->pid_ns_for_children`；unshare、setns 的 `CLONE_NEWPID` 改它）。放在这里
-    /// 而不是 TaskState 里，`/proc/<pid>/ns/pid_for_children` 要读它。
+    /// The pid namespace that new child processes go into, None meaning the same as its own
+    /// (Linux's `nsproxy->pid_ns_for_children`; changed by `CLONE_NEWPID` in unshare and setns).
+    /// It is here rather than in TaskState because `/proc/<pid>/ns/pid_for_children` reads it.
     pub pid_ns_children: RefCell<Option<Rc<crate::pidns::PidNs>>>,
-    /// 所在的 UTS、IPC 命名空间（[`crate::nsproxy`]）。
+    /// The UTS and IPC namespaces it is in ([`crate::nsproxy`]).
     pub ns: RefCell<crate::nsproxy::NsProxy>,
-    /// sigsuspend、ppoll 临时替换屏蔽字时原来的屏蔽字（Linux 的 `saved_sigmask` 加上
-    /// `TIF_RESTORE_SIGMASK`）：处理函数的帧里保存它，没有处理函数时恢复它。放在这里而不是
-    /// TaskState 里，跟踪者要读写它（PTRACE_GETSIGMASK、SETSIGMASK）。
+    /// The original mask while sigsuspend or ppoll temporarily replaces it (Linux's
+    /// `saved_sigmask` plus `TIF_RESTORE_SIGMASK`): saved in the handler's frame, or restored when
+    /// there is no handler. It is here rather than in TaskState because the tracer reads and writes
+    /// it (PTRACE_GETSIGMASK, SETSIGMASK).
     pub saved_sigmask: Cell<Option<u64>>,
-    /// 线程被要求退出（线程组整体退出、execve 结束其他线程）。
+    /// The thread has been asked to exit (whole-group exit, execve ending the other threads).
     pub killed: Cell<bool>,
-    /// 线程因为所在的 cgroup 被冻结而停在了投递信号之前（[`crate::signal::deliver`]）：
-    /// `cgroup.events` 的 frozen 看它。
+    /// The thread stopped before signal delivery because its cgroup is frozen
+    /// ([`crate::signal::deliver`]): the frozen field of `cgroup.events` looks at it.
     pub frozen: Cell<bool>,
-    /// `PR_SET_PDEATHSIG`：父进程里建立这个进程的线程退出时发给这个进程的信号，0 表示不发
-    /// （[`crate::process::pdeath_signals`]）。与 Linux 一样按线程记，新的线程、进程都从 0
-    /// 开始，execve 保留。
+    /// `PR_SET_PDEATHSIG`: the signal sent to this process when the thread in the parent that
+    /// created this process exits, 0 meaning none ([`crate::process::pdeath_signals`]). As on
+    /// Linux it is kept per thread; new threads and processes start at 0, and execve keeps it.
     pub pdeathsig: Cell<i32>,
-    /// 线程正在内核里等待（[`Task::asleep`]、平均负载）。在释放 BKL 之前设置，重新拿到
-    /// BKL 之后清除；不持 BKL 的等待（`syscall::fast`）也设置。
+    /// The thread is waiting in the kernel ([`Task::asleep`], load average). Set before the BKL is
+    /// released and cleared after it is taken again; waits without the BKL (`syscall::fast`) set
+    /// it too.
     pub sleeping: AtomicBool,
-    /// 线程名（`prctl(PR_SET_NAME)`）。
+    /// Thread name (`prctl(PR_SET_NAME)`).
     pub comm: Cell<[u8; 16]>,
-    /// nice 值（-20–19）：与 Linux 一样属于线程，新线程继承创建者的。宿主线程跟着
-    /// 设置（`syscall::sched`）。
+    /// nice value (-20–19): as on Linux it belongs to the thread, and a new thread inherits its
+    /// creator's. The host thread is set to match (`syscall::sched`).
     pub nice: Cell<i32>,
-    /// 调度策略（含 `SCHED_RESET_ON_FORK`）和实时优先级：只记录，由宿主调度。
+    /// Scheduling policy (including `SCHED_RESET_ON_FORK`) and real-time priority: only recorded;
+    /// the host does the scheduling.
     pub sched: Cell<(i32, i32)>,
-    /// IO 优先级（ioprio_set 设置的原始值，Linux 的 `io_context->ioprio`）。None 是还没有
-    /// io_context（ioprio_get 读到 0）；`CLONE_IO` 建的线程与创建者共用一份。宿主线程
-    /// 跟着设置（`syscall::sched`）。
+    /// I/O priority (the raw value set by ioprio_set, Linux's `io_context->ioprio`). None means no
+    /// io_context yet (ioprio_get reads 0); a thread created with `CLONE_IO` shares one with its
+    /// creator. The host thread is set to match (`syscall::sched`).
     pub ioprio: RefCell<Option<Rc<Cell<u16>>>>,
-    /// `SCHED_DEADLINE` 的 (runtime, deadline, period)，纳秒。
+    /// (runtime, deadline, period) of `SCHED_DEADLINE`, in nanoseconds.
     pub deadline: Cell<(u64, u64, u64)>,
-    /// `PR_SET_TIMERSLACK` 的定时器松弛量和默认值（纳秒）：只记录。新线程的两者都是
-    /// 父线程当前的松弛量，设成 0 时恢复默认值。
+    /// The timer slack of `PR_SET_TIMERSLACK` and its default (nanoseconds): only recorded. For a
+    /// new thread both are the parent thread's current slack; setting it to 0 restores the default.
     pub timerslack: Cell<(u64, u64)>,
-    /// CPU 亲和性（最多 64 个 CPU）：只记录。
+    /// CPU affinity (at most 64 CPUs): only recorded.
     pub affinity: Cell<u64>,
-    /// set_robust_list 设置的 robust futex 链表头和长度，新线程从空开始。只记录：线程
-    /// 退出时不处理链表里的 futex。
+    /// The robust futex list head and length set by set_robust_list; a new thread starts empty.
+    /// Only recorded: the futexes in the list are not processed when the thread exits.
     pub robust_list: Cell<(u64, u64)>,
     pub sync: Arc<TaskSync>,
-    /// 唤醒等待中的这个线程。
+    /// Wakes this thread while it waits.
     pub event: Arc<Event>,
-    /// 地址空间等资源的共享拷贝（procfs 用）。
+    /// A shared copy of the address space and other resources (for procfs).
     pub res: RefCell<TaskRes>,
-    /// 宿主线程的 CPU 时间时钟。
+    /// The host thread's CPU-time clock.
     pub clock: Cell<Option<i32>>,
-    /// 线程开始时宿主线程已经用掉的 CPU 时间和其中的内核态时间（纳秒）：宿主线程可能
-    /// 是线程池留下来的，跑过别的 guest 线程（[`pool`]）。
+    /// The CPU time, and the kernel-mode time within it, the host thread had already used when
+    /// the thread started (nanoseconds): the host thread may be left over from the pool and have
+    /// run other guest threads ([`pool`]).
     pub cpu_base: Cell<(u64, u64)>,
-    /// 上一次报告的 CPU 时间（[`Task::cpu`]）：用户态、内核态的时间都不比它少。
+    /// The CPU time last reported ([`Task::cpu`]): neither user nor kernel time goes below it.
     cpu_prev: Cell<CpuTime>,
-    /// 线程开始时宿主线程自愿、非自愿的上下文切换次数（宿主线程会被复用）：
-    /// `/proc/<pid>/status` 报告的是之后的。
+    /// The host thread's voluntary and involuntary context-switch counts when the thread started
+    /// (host threads are reused): `/proc/<pid>/status` reports those since then.
     pub ctxt_base: Cell<(u64, u64)>,
-    /// 宿主线程的 tid（读宿主记的内核态时间）。
+    /// The host thread's tid (to read the kernel-mode time the host records).
     pub host_tid: Cell<i32>,
-    /// ptrace 的状态（[`crate::ptrace`]）。
+    /// ptrace state ([`crate::ptrace`]).
     pub trace: RefCell<crate::ptrace::Trace>,
-    /// 跟踪者用 PTRACE_SYSCALL 让它继续了：系统调用都交给持有 BKL 的路径，好在入口和
-    /// 出口停下（`syscall::fast` 不持 BKL 时读它）。
+    /// The tracer resumed it with PTRACE_SYSCALL: all syscalls go to the BKL-holding path so that
+    /// they can stop at entry and exit (`syscall::fast` reads it without the BKL).
     pub syscall_traced: AtomicBool,
-    /// 线程自己结束时的结束方式：exit(2) 的退出码，或者 seccomp 让它以信号结束（被跟踪的
-    /// 线程退出时报告给跟踪者）。
+    /// How the thread ended itself: the exit code of exit(2), or seccomp having it end with a
+    /// signal (reported to the tracer when a traced thread exits).
     pub exit_status: Cell<ExitStatus>,
-    /// 已进入退出流程（可能还停在 PTRACE_EVENT_EXIT）。
+    /// Has entered the exit path (may still be stopped at PTRACE_EVENT_EXIT).
     exit_started: Cell<bool>,
-    /// seccomp 的状态（[`crate::seccomp`]），只在持有 BKL 时访问。
+    /// seccomp state ([`crate::seccomp`]), accessed only while holding the BKL.
     pub seccomp: RefCell<crate::seccomp::Seccomp>,
-    /// 线程有 seccomp：系统调用要先检查（`syscall::fast` 不持 BKL 时读它）。由
-    /// [`crate::seccomp::publish`] 随 `seccomp` 更新。
+    /// The thread has seccomp: syscalls must be checked first (`syscall::fast` reads it without
+    /// the BKL). Updated along with `seccomp` by [`crate::seccomp::publish`].
     pub seccomp_on: AtomicBool,
-    /// 过滤器对哪些编号总是返回 ALLOW（[`crate::seccomp::always_allowed`]）：这些系统调用照常
-    /// 走不持 BKL 的路径。由 [`crate::seccomp::publish`] 随 `seccomp` 更新。
+    /// The numbers for which the filter always returns ALLOW ([`crate::seccomp::always_allowed`]):
+    /// these syscalls take the no-BKL path as usual. Updated along with `seccomp` by
+    /// [`crate::seccomp::publish`].
     pub seccomp_allow: [AtomicU64; crate::seccomp::CACHE_WORDS],
-    /// 跟踪者用 PTRACE_SINGLESTEP 让它继续了：运行循环每次只让解释器执行一条指令
-    /// （[`crate::ptrace::step_done`]），不持 BKL 时读它。
+    /// The tracer resumed it with PTRACE_SINGLESTEP: the run loop has the interpreter execute one
+    /// instruction at a time ([`crate::ptrace::step_done`]); read without the BKL.
     pub stepping: AtomicBool,
-    /// 单步执行了 svc：下一次单步不执行指令，原地再报告一次（[`crate::ptrace::syscall_stepped`]）。
+    /// An svc was single-stepped: the next single step executes no instruction and reports again
+    /// in place ([`crate::ptrace::syscall_stepped`]).
     pub step_again: AtomicBool,
-    /// 只有线程自己访问的状态。
+    /// State accessed only by the thread itself.
     pub state: std::cell::RefCell<TaskState>,
 }
 
-/// 线程私有的状态，以及它和其他线程共享的资源。
+/// A thread's private state, and the resources it shares with other threads.
 pub(crate) struct TaskState {
-    /// 地址空间（`CLONE_VM` 共享）。
+    /// Address space (shared by `CLONE_VM`).
     pub mm: Rc<RefCell<Mm>>,
-    /// fd 表（`CLONE_FILES` 共享）。
+    /// fd table (shared by `CLONE_FILES`).
     pub fds: Rc<RefCell<FdTable>>,
-    /// 当前目录、umask（`CLONE_FS` 共享）。
+    /// Current directory, umask (shared by `CLONE_FS`).
     pub fs: Rc<RefCell<FsContext>>,
-    /// 所属线程组。
+    /// The thread group it belongs to.
     pub group: Rc<RefCell<ThreadGroup>>,
-    /// 根文件系统。
+    /// Root filesystem.
     pub vfs: Option<Rc<Vfs>>,
-    /// 备用信号栈。
+    /// Alternate signal stack.
     pub altstack: AltStack,
-    /// 线程退出时清零并 futex 唤醒的地址（`set_tid_address`、`CLONE_CHILD_CLEARTID`）。
+    /// The address zeroed and futex-woken when the thread exits (`set_tid_address`,
+    /// `CLONE_CHILD_CLEARTID`).
     pub clear_child_tid: u64,
-    /// vfork 的子进程：execve 或退出时置位，并直接叫醒父进程（它的事件）让它继续。
+    /// A vfork child: set on execve or exit, and wakes the parent directly (its event) so that it
+    /// continues.
     pub vfork_done: Option<(Rc<Cell<bool>>, Arc<Event>)>,
-    /// 被信号打断的 nanosleep、有超时的 futex 等待剩下的部分（`restart_syscall`）。
+    /// What remains of a nanosleep or timed futex wait interrupted by a signal (`restart_syscall`).
     pub restart: Option<crate::syscall::Restart>,
-    /// 不持 BKL 的 nanosleep、有相对超时的 futex 等待（`syscall::fast`）还没睡够就被叫醒，
-    /// 交给持锁的路径：原来的到期时刻。持锁的路径接着睡到它，被信号打断时也按它算剩下多少。
+    /// The original deadline of a no-BKL nanosleep or relative-timeout futex wait (`syscall::fast`)
+    /// that was woken before sleeping long enough and handed over to the locked path. The locked
+    /// path goes on sleeping until it, and when interrupted by a signal also computes what remains
+    /// from it.
     pub fast_sleep: Option<std::time::Instant>,
 }
 
 impl Task {
-    /// 为 `cpu` 新建线程。
+    /// Creates a thread for `cpu`.
     pub fn new(
         tid: Tid,
         tgid: Tid,
@@ -240,9 +251,10 @@ impl Task {
         }))
     }
 
-    /// Linux 的 synchronize_group_exit：最后一个进入退出流程的线程确定进程的退出
-    /// 状态，已有 exit_group/致命信号的状态不覆盖。必须在 PTRACE_EVENT_EXIT 之前做，
-    /// 不能按跟踪者放行之后的资源释放顺序决定。
+    /// Linux's synchronize_group_exit: the last thread to enter the exit path decides the
+    /// process's exit status, without overriding a status already set by exit_group or a fatal
+    /// signal. It must be done before PTRACE_EVENT_EXIT, and cannot follow the order in which
+    /// resources are released after the tracer lets the threads go.
     pub(crate) fn begin_exit(&self, k: &Kernel, group: &RefCell<ThreadGroup>, status: ExitStatus) {
         if self.exit_started.replace(true) {
             return;
@@ -257,20 +269,22 @@ impl Task {
         }
     }
 
-    /// 线程在内核里等待、还没被叫醒（`/proc/<pid>/stat` 的状态 S）。被叫醒之后到重新拿到
-    /// BKL 之前 [`Task::sleeping`] 还在，但它的事件已经触发了：与 Linux 的
-    /// `try_to_wake_up` 当场把状态改成可运行一样，算作 R。LTP 靠这个同步，比如 shmctl01
-    /// 给停在 pause() 里的子进程发信号，等它的状态回到 S 就当它做完了下一步。
+    /// The thread is waiting in the kernel and has not been woken yet (state S in
+    /// `/proc/<pid>/stat`). After being woken and before taking the BKL again, [`Task::sleeping`]
+    /// is still set but its event has already fired: like Linux's `try_to_wake_up` making the
+    /// state runnable on the spot, this counts as R. LTP synchronises on it: for example,
+    /// shmctl01 signals a child stopped in pause() and, once its state is back to S, takes it
+    /// that the child has done the next step.
     pub fn asleep(&self) -> bool {
         self.sleeping.load(Ordering::Relaxed) && !self.event.is_signaled()
     }
 
-    /// 线程用掉的 CPU 时间（纳秒），以宿主线程的 CPU 时间计。
+    /// The CPU time the thread has used (nanoseconds), counted by the host thread's CPU time.
     pub fn cpu_ns(&self) -> u64 {
         self.host_cpu_ns().saturating_sub(self.cpu_base.get().0)
     }
 
-    /// 宿主线程总共用掉的 CPU 时间（纳秒）。
+    /// The CPU time the host thread has used in total (nanoseconds).
     fn host_cpu_ns(&self) -> u64 {
         self.clock
             .get()
@@ -278,16 +292,17 @@ impl Task {
             .map_or(0, |(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
     }
 
-    /// 由线程自己调用的 [`Task::cpu`]：内核态时间用 getrusage 取，不必读 /proc（线程
-    /// 结束时原来占了五分之一）。
+    /// [`Task::cpu`] called by the thread itself: the kernel-mode time comes from getrusage, with
+    /// no need to read /proc (which used to take a fifth of thread exit).
     pub fn cpu_self(&self) -> CpuTime {
         let total_ns = self.cpu_ns();
         let sys_ns = appine_hal::thread_system_ns_self().saturating_sub(self.cpu_base.get().1);
         self.cpu_adjust(total_ns, sys_ns)
     }
 
-    /// 线程用掉的 CPU 时间，分出内核态：宿主内核替这个宿主线程干活的时间（转发的
-    /// I/O、缺页等）。内核层自己在宿主用户态做的事情算不进去，所以偏少。
+    /// The CPU time the thread has used, with kernel mode split out: the time the host kernel
+    /// spends working for this host thread (forwarded I/O, page faults and so on). What the kernel
+    /// layer itself does in host user mode is not counted, so it is an underestimate.
     pub fn cpu(&self) -> CpuTime {
         let total_ns = self.cpu_ns();
         let sys_ns = appine_hal::thread_system_ns(self.host_tid.get())
@@ -296,17 +311,20 @@ impl Task {
         self.cpu_adjust(total_ns, sys_ns)
     }
 
-    /// 让用户态、内核态的时间各自不倒退（Linux 的 `cputime_adjust`）。用户态的时间是总数
-    /// 减去内核态的，两者来源不同：总数是宿主线程的 CPU 时钟，精确到纳秒；内核态的时间
-    /// 读别的线程时只有 `/proc` 里按时钟滴答取整的值，线程自己读的 getrusage 也和总数不在
-    /// 同一刻。内核态的时间一下子多出一个滴答时，用户态的时间就会倒退（LTP 的 times03）。
+    /// Keeps user and kernel time each from going backwards (Linux's `cputime_adjust`). User time
+    /// is the total minus kernel time, and the two come from different sources: the total is the
+    /// host thread's CPU clock, accurate to the nanosecond; kernel time, when read for another
+    /// thread, is only the value in `/proc` rounded to clock ticks, and the getrusage the thread
+    /// reads for itself is not taken at the same moment as the total either. When kernel time
+    /// suddenly gains a tick, user time would go backwards (LTP's times03).
     fn cpu_adjust(&self, total_ns: u64, sys_ns: u64) -> CpuTime {
         let prev = self.cpu_prev.get();
         if total_ns <= prev.total_ns {
             return prev;
         }
-        // 之前的内核态时间不超过之前的总数，所以这里不超过 total_ns；用户态时间也不倒退的
-        // 话，内核态时间只多出总数增加的部分
+        // The previous kernel time does not exceed the previous total, so here it does not
+        // exceed total_ns; if user time is not to go backwards either, kernel time grows only by
+        // the increase in the total
         let mut sys_ns = sys_ns.min(total_ns).max(prev.sys_ns);
         if total_ns - sys_ns < prev.user_ns() {
             sys_ns = total_ns - prev.user_ns();
@@ -317,8 +335,9 @@ impl Task {
     }
 }
 
-/// 为 `task` 启动宿主线程，并把它登记到 kernel、线程组和地址空间里。调用方持有 BKL，
-/// 线程要等调用方释放 BKL 之后才开始运行。
+/// Starts a host thread for `task` and registers it in the kernel, the thread group and the
+/// address space. The caller holds the BKL; the thread starts running only after the caller
+/// releases the BKL.
 pub(crate) fn start(
     shared: &Arc<Shared>,
     k: &mut Kernel,
@@ -327,8 +346,8 @@ pub(crate) fn start(
 ) -> Result<(), Errno> {
     let tid = task.tid.get();
     let thread_shared = shared.clone();
-    // 不保留 JoinHandle：会话结束时等的是 kernel.tasks 变空，线程在那之后只剩释放自己的
-    // Cpu 和翻译缓存
+    // No JoinHandle is kept: at the end of a session what is waited for is kernel.tasks becoming
+    // empty, and after that the thread only has its own Cpu and translation cache left to free
     pool::spawn(Box::new(move |reused| {
         appine_hal::set_thread_name(&format!("guest-{tid}"));
         thread_main(thread_shared, tid, cpu, reused)
@@ -343,14 +362,16 @@ pub(crate) fn start(
     Ok(())
 }
 
-/// 宿主线程池：guest 线程结束之后，它的宿主线程留一会儿给下一个 guest 线程用。fork 的
-/// 时间原来有四分之一花在新建宿主线程上（内核栈、线程栈、TLS），线程结束时还要拆掉。
+/// Host thread pool: after a guest thread ends, its host thread stays for a while for the next
+/// guest thread to use. A quarter of fork's time used to go into creating host threads (kernel
+/// stack, thread stack, TLS), and they also had to be torn down when the thread ended.
 pub(crate) mod pool {
     use std::collections::VecDeque;
     use std::sync::{Condvar, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
-    /// 参数是这个宿主线程有没有跑过别的 guest 线程（亲和性这类宿主线程的设置要重新设置）。
+    /// The argument is whether this host thread has run other guest threads (host-thread settings
+    /// such as affinity must be set again).
     type Job = Box<dyn FnOnce(bool) + Send>;
 
     struct Pool {
@@ -365,18 +386,20 @@ pub(crate) mod pool {
     static READY: Condvar = Condvar::new();
 
     thread_local! {
-        /// 持有 BKL 时交给空闲线程的 job 数：放开 BKL 之后再叫醒它们（[`notify_pending`]），
-        /// 否则空闲线程醒来马上又要睡下去等 BKL。
-        #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+        /// The number of jobs handed to idle threads while holding the BKL: they are woken after
+        /// the BKL is released ([`notify_pending`]), otherwise an idle thread would wake only to
+        /// go straight back to sleep waiting for the BKL.
+        #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
         static PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    /// 最多留着几个空闲的宿主线程。
+    /// The most idle host threads kept.
     const MAX_IDLE: usize = 8;
-    /// 空闲的宿主线程留多久。
+    /// How long an idle host thread is kept.
     const LINGER: Duration = Duration::from_secs(5);
 
-    /// 在一个宿主线程上运行 `job`：有空闲的就交给它，没有就新建一个。`job` 不能 panic。
+    /// Runs `job` on a host thread: hands it to an idle one if there is one, otherwise creates a
+    /// new one. `job` must not panic.
     pub fn spawn(job: Job) -> std::io::Result<()> {
         let mut p = POOL.lock().unwrap_or_else(PoisonError::into_inner);
         if p.idle > p.jobs.len() {
@@ -395,7 +418,8 @@ pub(crate) mod pool {
             .map(drop)
     }
 
-    /// 叫醒持有 BKL 时交了 job 的空闲线程。放开 BKL 之后调用。
+    /// Wakes the idle threads that were handed jobs while the BKL was held. Called after releasing
+    /// the BKL.
     pub(crate) fn notify_pending() {
         for _ in 0..PENDING.replace(0) {
             READY.notify_one();
@@ -432,21 +456,22 @@ pub(crate) mod pool {
     }
 }
 
-/// 一个 guest 线程和它的线程组（弱引用）。
+/// A guest thread and its thread group (weak references).
 type Current = (Weak<Task>, Weak<RefCell<ThreadGroup>>);
 
 thread_local! {
-    /// 这个宿主线程正在执行的 guest 线程和它的线程组（[`current`]）。只在持有 BKL 时
-    /// 设置和清掉（[`exit`]）。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// The guest thread this host thread is running, and its thread group ([`current`]). Set and
+    /// cleared only while holding the BKL ([`exit`]).
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static CURRENT: std::cell::RefCell<Option<Current>> = const { std::cell::RefCell::new(None) };
 }
 
-/// 调用者：这个宿主线程正在执行的 guest 线程和它的线程组。不在 guest 线程上（定时器线程、
-/// 宿主调用 Machine 的线程）时是 None。系统调用里 [`Task::state`] 已经被借走，拿不到
-/// 线程组，所以线程开始时记下。
+/// The caller: the guest thread this host thread is running, and its thread group. None when not
+/// on a guest thread (the timer thread, a thread on which the host calls Machine). Inside a
+/// syscall [`Task::state`] is already borrowed and the thread group cannot be reached, so it is
+/// recorded when the thread starts.
 pub(crate) fn current() -> Option<(Rc<Task>, Rc<RefCell<ThreadGroup>>)> {
-    // upgrade 改弱引用指向的对象的计数
+    // upgrade changes the counts of the objects the weak references point at
     debug_assert!(crate::kernel::bkl_held(), "task::current without the BKL");
     CURRENT.with_borrow(|c| {
         let (task, group) = c.as_ref()?;
@@ -456,22 +481,24 @@ pub(crate) fn current() -> Option<(Rc<Task>, Rc<RefCell<ThreadGroup>>)> {
 
 fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu, reused)));
-    // CURRENT 已经由 exit 在持有 BKL 时清掉了
+    // CURRENT has already been cleared by exit while holding the BKL
     if r.is_err() {
-        // 内核层的 bug，而且不在兜住的地方（crate::bug）：线程找不到自己，或者出错之后的
-        // 收拾本身又出了错。BKL 保护的状态可能已经不一致，不能让其他线程继续
+        // A kernel-layer bug, and not in a place that contains it (crate::bug): the thread cannot
+        // find itself, or the cleanup after an error failed in turn. State protected by the BKL
+        // may already be inconsistent, so other threads must not go on
         eprintln!("appine: internal error in guest thread {tid}, aborting");
         std::process::abort();
     }
 }
 
-/// `reused`：宿主线程跑过别的 guest 线程（[`pool`]）。
+/// `reused`: the host thread has run other guest threads ([`pool`]).
 fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     let k = shared.lock();
     let task = k.tasks[&tid].clone();
     let group = Rc::downgrade(&task.state.borrow().group);
     CURRENT.set(Some((Rc::downgrade(&task), group)));
-    // 线程开始时的 bug 和进入内核时的一样只结束这个进程（crate::bug）
+    // A bug while the thread starts ends only this process, like one on entering the kernel
+    // (crate::bug)
     let started = crate::bug::catch(|| {
         crate::bug::trap(Trap::Start, task.tgid);
         task.clock.set(appine_hal::thread_cpu_clock());
@@ -490,8 +517,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         return exit(shared, task, cpu.state(), None);
     };
     let (sync, tier) = (task.sync.clone(), k.tier);
-    // Tier 1 的翻译由这个地址空间里的线程共用，同一个程序的几个地址空间也可能共用
-    // （crate::mm::CodeGroup）。Mm 只在持有 BKL 时访问；挂上去（清空跳转缓存等）不用 BKL
+    // Tier 1 translations are shared by the threads in this address space, and may also be
+    // shared by several address spaces of the same program (crate::mm::CodeGroup). Mm is accessed
+    // only while holding the BKL; attaching (clearing the jump cache and so on) needs no BKL
     let space_of = |k: &Kernel| match tier {
         Tier::Interpreter => None,
         Tier::Dbt => task
@@ -518,13 +546,16 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     };
     let mut seen = load(&generations);
     loop {
-        // 所有线程都在等待时定时器线程的定期检查会停下来（crate::oom、crate::loadavg）
+        // When every thread is waiting, the timer thread's periodic checks stop (crate::oom,
+        // crate::loadavg)
         shared.resume_checks();
-        // 先标记、再读代数，与 Mm::sync 的"先改代数、再看标记"配对
+        // Mark first, then read the generations, pairing with Mm::sync's "change the generation
+        // first, then look at the flags"
         sync.in_guest.store(true, Ordering::SeqCst);
         let now = load(&generations);
-        // 地址空间离开了共用翻译的组（crate::mm::CodeGroup）：换用它自己的翻译。离开时做了
-        // shootdown，所以这个线程不会再执行组里的翻译
+        // The address space has left its shared-translation group (crate::mm::CodeGroup): switch
+        // to its own translations. Leaving did a shootdown, so this thread will not run the
+        // group's translations again
         if now.2 != seen.2 {
             sync.in_guest.store(false, Ordering::SeqCst);
             if dbt.take().is_some() {
@@ -537,8 +568,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         if now.0 != seen.0 {
             cpu.tlb_flush();
         }
-        // 只有代码变了才需要作废翻译：按错过的范围逐页作废，记录不全时整体清空。翻译是
-        // 共用的，第一个看到新代数的线程做一次就够了
+        // Translations need invalidating only when code changed: invalidate page by page over the
+        // missed ranges, or flush everything when the record is incomplete. Translations are
+        // shared, so it is enough for the first thread that sees the new generation to do it once
         if now.1 != seen.1
             && let Some((d, space)) = &mut dbt
         {
@@ -554,10 +586,12 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             }
         }
         seen = now;
-        // PTRACE_SINGLESTEP：解释器只执行一条指令。执行完了（ic ivau 也算）进内核报告；
-        // svc 在系统调用做完之后报告，访存出错、brk 投递它们自己的信号（crate::ptrace）
+        // PTRACE_SINGLESTEP: the interpreter executes only one instruction. When it is done (ic
+        // ivau counts too) enter the kernel to report; an svc reports after the syscall
+        // completes, and memory faults and brk deliver their own signals (crate::ptrace)
         let (exit, stepped) = if task.stepping.load(Ordering::Relaxed) {
-            // 单步执行了 svc 之后的这一次不执行指令（crate::ptrace::syscall_stepped）
+            // This step right after single-stepping an svc executes no instruction
+            // (crate::ptrace::syscall_stepped)
             let r = if task.step_again.swap(false, Ordering::Relaxed) {
                 None
             } else {
@@ -569,17 +603,19 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
                 Some(e) => (e, false),
             }
         } else {
-            // 有硬件断点（ptrace 设置的）时只有解释器检查它们。观察点由 Tier 1 把被观察的页
-            // 上的访问交给解释器（CpuState::set_hw_debug）
+            // With hardware breakpoints (set by ptrace) only the interpreter checks them. For
+            // watchpoints, Tier 1 hands accesses to the watched pages to the interpreter
+            // (CpuState::set_hw_debug)
             let exit = match &mut dbt {
                 Some((d, _)) if !cpu.state().hw_breakpoints_active() => d.run(cpu),
                 _ => cpu.run(),
             };
             (exit, false)
         };
-        // 不持 BKL 就能做完的系统调用（syscall::fast）。它访问 guest 内存时仍然标记着在
-        // 执行 guest 代码。内核层的 bug 与持锁的路径一样只结束这个进程（crate::bug）：
-        // 这里展开经过的帧里没有 Rc，原来一直展开到 thread_main，终止整个 App
+        // Syscalls that can complete without the BKL (syscall::fast). While it accesses guest
+        // memory it is still marked as running guest code. A kernel-layer bug ends only this
+        // process, as on the locked path (crate::bug): the frames unwound through here hold no
+        // Rc; it used to unwind all the way to thread_main and terminate the whole app
         let done = match exit {
             Exit::Svc { .. } => crate::bug::catch(|| fast.syscall(shared, &task, cpu)),
             _ => Some(false),
@@ -597,7 +633,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             }
         }
 
-        // 内核层的 bug 只结束这个进程（crate::bug）
+        // A kernel-layer bug ends only this process (crate::bug)
         let pc = cpu.state().pc;
         let entered = crate::bug::catch(|| {
             let k = shared.lock();
@@ -626,9 +662,11 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             Flow::Continue => {}
             Flow::Exec => {
                 seen = load(&generations);
-                // 换了地址空间，换用它的翻译。先放开旧的：旧地址空间没人用了，它的翻译放回
-                // 池里，新的地址空间多半就拿到它。又一次 exec 的多半是同一个程序（shell
-                // 脚本里的 busybox），保留下来的翻译核对后继续用
+                // The address space changed, so switch to its translations. Release the old ones
+                // first: nobody uses the old address space any more, its translations go back to
+                // the pool, and the new address space most likely gets them. The next exec is
+                // most likely the same program (busybox in a shell script), and the kept
+                // translations are checked and reused
                 if dbt.take().is_some() {
                     let space = space_of(&shared.lock());
                     dbt = attach(space);
@@ -640,27 +678,27 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
     exit(shared, task, cpu.state(), dbt.map(|(d, _)| d.stats()));
 }
 
-// 合成 esr_context 用的 ESR 字段（ARM ARM D17.2.37）
+// ESR fields for synthesising esr_context (ARM ARM D17.2.37)
 const ESR_IL: u64 = 1 << 25;
 const ESR_WNR: u64 = 1 << 6;
 const EC_IABT_LOW: u64 = 0x20;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_DABT_LOW: u64 = 0x24;
 const EC_SP_ALIGN: u64 = 0x26;
-/// 第 3 级转换错误（页没有映射）。
+/// Level 3 translation fault (page not mapped).
 const FSC_TRANSLATION: u64 = 0x07;
-/// 第 3 级权限错误。
+/// Level 3 permission fault.
 const FSC_PERMISSION: u64 = 0x0f;
-/// 对齐错误。
+/// Alignment fault.
 const FSC_ALIGNMENT: u64 = 0x21;
 
-/// 处理一次 guest 退出。
+/// Handles one guest exit.
 fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     if cx.task.killed.get() {
         return Flow::Exit;
     }
-    // Tier 1 的 ic ivau 按页记下、到 dsb、isb 才交出来（Exit::InvalidateCode）：因为别的
-    // 原因退出时在这里作废
+    // Tier 1 records ic ivau per page and hands it over only at dsb or isb
+    // (Exit::InvalidateCode): when exiting for another reason, invalidate here
     let ivau = std::mem::take(&mut cpu.state_mut().ivau_page);
     let pc = cpu.state().pc;
     let (sig, info) = match exit {
@@ -680,9 +718,9 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             ));
             (Signal::ILL, SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL))
         }
-        // Linux 发断点的 SIGTRAP 时信号帧里没有 esr_context
+        // Linux's SIGTRAP for a breakpoint has no esr_context in the signal frame
         Exit::Breakpoint { .. } => (Signal::TRAP, SigInfo::fault(code::TRAP_BRKPT, pc, 0)),
-        // 引擎的 bug（crate::bug）
+        // An engine bug (crate::bug)
         Exit::HostFault {
             signal,
             code,
@@ -705,12 +743,13 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             access,
             kind: FaultKind::Page,
         } => {
-            // fork 之后写时复制的页：换成可写的，重新执行
+            // A copy-on-write page after fork: make it writable and re-execute
             if access == Access::Write && cx.mm().cow_break(addr) {
                 return signal::deliver(cx, cpu, false);
             }
-            // 等 BKL 的时候页表可能已经改好了（借用方还回了写时复制的页、别的线程
-            // mprotect），与 Linux 一样重新执行。引擎报告的是出错的那一页（跨页时是后一页）
+            // The page table may already have been fixed while waiting for the BKL (a borrower
+            // returned a copy-on-write page, another thread's mprotect); re-execute as on Linux.
+            // The engine reports the faulting page (the later page when an access crosses pages)
             let need = match access {
                 Access::Exec => prot::EXEC,
                 Access::Read => prot::READ,
@@ -719,7 +758,7 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             if cx.mm().mmu().translate(addr, need).is_some() {
                 return signal::deliver(cx, cpu, false);
             }
-            // 大的映射按需建表：第一次访问时补上表项，重新执行
+            // Large mappings fill entries on demand: fill them in on first access and re-execute
             if cx.mm().fault_in(addr, need) {
                 return signal::deliver(cx, cpu, false);
             }
@@ -730,7 +769,7 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             };
             let past_eof = cx.mm_mut().fault_past_eof(addr);
             if past_eof == Some(false) {
-                // 共享映射的文件变长了，新内容已经映射进来：重新执行
+                // The file of a shared mapping grew and the new contents are mapped in: re-execute
                 return signal::deliver(cx, cpu, false);
             }
             if past_eof == Some(true) {
@@ -739,7 +778,8 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 signal::force(cx, Signal::BUS, info);
                 return signal::deliver(cx, cpu, false);
             }
-            // 向下增长的映射（主线程栈、MAP_GROWSDOWN）长到这里：重新执行
+            // A grows-down mapping (the main thread's stack, MAP_GROWSDOWN) grows to here:
+            // re-execute
             if cx.grow_stack(addr) {
                 return signal::deliver(cx, cpu, false);
             }
@@ -772,8 +812,8 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             let info = SigInfo::fault(code::BUS_ADRALN, addr, EC_SP_ALIGN << 26 | ESR_IL);
             (Signal::BUS, info)
         }
-        // 硬件观察点（访问的起点）、断点（pc）：指令还没有执行，与 Linux 的
-        // ptrace_hbptriggered 一样没有 esr_context
+        // Hardware watchpoint (the start of the access) or breakpoint (pc): the instruction has
+        // not executed yet, and as in Linux's ptrace_hbptriggered there is no esr_context
         Exit::Fault {
             addr,
             kind: FaultKind::Watchpoint | FaultKind::HwBreakpoint,
@@ -784,7 +824,8 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     signal::deliver(cx, cpu, false)
 }
 
-/// 作废 `pages` 里各页（0 跳过）的翻译，并让共用地址空间的其他线程知道。
+/// Invalidates the translations of each page in `pages` (0 is skipped), and lets the other
+/// threads sharing the address space know.
 fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
     let sync = cx.task.sync.clone();
     let mut mm = cx.mm_mut();
@@ -794,18 +835,20 @@ fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
     mm.sync(&sync);
 }
 
-/// 线程离开它的地址空间（退出、execve）：处理 robust futex 链表，清零 `clear_child_tid`
-/// 并唤醒等它的线程（pthread_join），让 vfork 的父进程继续，从使用者里注销。
+/// The thread leaves its address space (exit, execve): processes the robust futex list, zeroes
+/// `clear_child_tid` and wakes the threads waiting for it (pthread_join), lets the vfork parent
+/// continue, and deregisters it from the users.
 pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
     let (head, _) = task.robust_list.replace((0, 0));
-    // 锁里记的是线程自己看到的 tid（它的 pid 命名空间里的）
+    // The lock records the tid the thread itself sees (in its pid namespace)
     let tid = st.group.borrow().pid_ns.vnr(task.tid.get()).unwrap_or(0);
     let mut futexes = shared.futexes();
     crate::futex::exit_robust_list(&mut futexes, &st.mm.borrow(), head, tid as u32);
     let addr = std::mem::take(&mut st.clear_child_tid);
     {
         let mm = st.mm.borrow();
-        // 与 Linux 的 mm_release 一样，地址空间没有别人在用时不必通知
+        // As in Linux's mm_release, no notification is needed when nobody else uses the address
+        // space
         if addr != 0
             && mm.shared_with_others()
             && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
@@ -815,8 +858,9 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
         }
     }
     drop(futexes);
-    // 父进程只等直接的通知：原来叫醒所有等待者，每次 posix_spawn（musl、glibc 都用
-    // CLONE_VFORK）都把读着管道、停在 poll 里的线程叫醒一遍
+    // The parent waits only for the direct notification: this used to wake every waiter, so each
+    // posix_spawn (musl and glibc both use CLONE_VFORK) woke every thread reading a pipe and
+    // parked in poll
     if let Some((done, parent)) = st.vfork_done.take() {
         done.set(true);
         crate::kernel::signal_later(&parent);
@@ -824,11 +868,12 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
     st.mm.borrow_mut().remove_user(&task.sync);
 }
 
-/// 线程退出：释放它的资源；它是线程组的最后一个线程时结束整个进程。`pc` 是线程最后的
-/// guest pc。
+/// Thread exit: releases its resources; when it is the last thread of the thread group, ends the
+/// whole process. `pc` is the thread's last guest pc.
 ///
-/// 每一步分别兜住内核层的 bug（crate::bug）：出错时结束这个进程，后面的步骤照样做，所以
-/// 线程总会从内核里注销，进程也总会结束，等它的父进程和宿主不会卡住。
+/// Each step contains kernel-layer bugs separately (crate::bug): on an error this process is
+/// ended and the later steps are still done, so the thread is always deregistered from the kernel
+/// and the process always ends, and its waiting parent and the host do not get stuck.
 fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<DbtStats>) {
     let pc = state.pc;
     let mut k = shared.lock();
@@ -838,7 +883,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     task.begin_exit(&k, &group, task.exit_status.get());
     let released = crate::bug::catch(|| {
         crate::bug::trap(Trap::Exit, tid);
-        // 进程正在写 core 文件：留下寄存器（crate::coredump）
+        // The process is writing a core file: leave the registers (crate::coredump)
         if let Some(core) = group.borrow_mut().core.as_mut() {
             core.push(crate::coredump::ThreadCore::of(&task, state));
         }
@@ -850,12 +895,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         k.cpu += cpu;
         group.borrow_mut().cpu += cpu;
         let mut st = task.state.borrow_mut();
-        // 进程的最后一个线程：退出之前给驻留内存的峰值取一次样
+        // The process's last thread: sample the peak resident memory once before exiting
         if group.borrow().threads.len() == 1 {
             group.borrow_mut().sample_rss(&st.mm.borrow());
         }
         release_mm(shared, &task, &mut st);
-        // 被跟踪的线程退出了：报告给跟踪者（crate::ptrace）
+        // A traced thread exited: report it to the tracer (crate::ptrace)
         let status = task.exit_status.get();
         crate::ptrace::tracee_exited(&mut k, &task, &mut group.borrow_mut(), status);
         crate::seccomp::exited(&task, &mut group.borrow_mut());
@@ -871,8 +916,8 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         g.threads.retain(|&t| t != tid);
         g.threads.is_empty()
     };
-    // 这个线程建的子进程交给进程里还活着的线程（Linux 的 forget_original_parent）；最后一个
-    // 线程的由 finish_group 过继出去
+    // The child processes this thread created go to a live thread of the process (Linux's
+    // forget_original_parent); the last thread's are reparented by finish_group
     if !last {
         let to = crate::process::alive_thread(&k, &group.borrow());
         let mine: Vec<Tid> = group
@@ -891,7 +936,8 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         let ruid = group.borrow().cred.ruid;
         crate::process::send_pdeath(&k, signals, tgid, ruid);
     }
-    // 后面的步骤出错时：还有别的线程就结束这个进程，否则它已经结束了，只报告
+    // When a later step fails: if other threads remain, end this process; otherwise it has
+    // already ended, so only report
     let failed = |k: &Kernel, step: &str| {
         if last {
             crate::bug::report(format_args!(
@@ -902,37 +948,43 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             crate::bug::kill_process(k, tgid, what);
         }
     };
-    // finish_group 自己分步兜住，这里只剩读进程状态的那几行
+    // finish_group contains bugs step by step itself; only the few lines reading process state
+    // are left for this catch
     if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
         failed(&k, "finishing the process");
     }
-    // 在持有 BKL 时释放线程的资源：地址空间、fd 表（关闭管道会唤醒另一端）……线程对象
-    // 可能还有别处拿着，命名空间先放掉
+    // Release the thread's resources while holding the BKL: the address space, the fd table
+    // (closing pipes wakes the other end)... The thread object may still be held elsewhere, so
+    // release the namespaces first
     *task.ns.borrow_mut() = k.init_ns.clone();
     if crate::bug::catch(|| drop((group, task))).is_none() {
         failed(&k, "releasing its resources");
     }
-    // fd 表里的 unix socket 关掉之后可能只剩在途的环
+    // After the fd table's unix sockets are closed, only in-flight cycles may remain
     if last
         && !k.unix_inflight.is_empty()
         && crate::bug::catch(|| crate::unix::collect(&mut k)).is_none()
     {
         failed(&k, "collecting unix sockets");
     }
-    // 最后一个用某个 IPC 命名空间的线程退出了：丢掉里面的对象
+    // The last thread using an IPC namespace exited: drop the objects in it
     k.collect_ipc();
-    // 最后一个用某个挂载命名空间的线程退出了：卸下它的挂载（里面的 tmpfs 随之删掉）
+    // The last thread using a mount namespace exited: take down its mounts (the tmpfs in them
+    // are deleted with them)
     if let Some(vfs) = &vfs
         && crate::bug::catch(|| crate::syscall::collect_namespaces(&k, vfs)).is_none()
     {
         failed(&k, "collecting mount namespaces");
     }
-    // 子进程的状态变化由 finish_group 另外请求（wake::CHILD），vfork 的父进程由
-    // release_mm 叫醒，关闭文件的各自请求；这里只叫醒等线程结束的（execve、关闭）
+    // Child state changes are requested separately by finish_group (wake::CHILD), the vfork
+    // parent is woken by release_mm, and closed files make their own requests; here only those
+    // waiting for threads to end are woken (execve, shutdown)
     request_wake_on(wake::EXITED);
-    // 线程局部变量里的两个弱引用也要在持有 BKL 时丢掉：Rc 的计数不是原子的，放开之后再丢，
-    // 会和同时持有 BKL 的线程（同一个进程里刚开始的线程做 Rc::downgrade）一起改同一个
-    // 计数，改丢了就提前释放，之后的访问都落在释放掉的内存上
+    // The two weak references in the thread-local must also be dropped while holding the BKL:
+    // Rc counts are not atomic, so dropping them after the release would race with a thread
+    // holding the BKL at the same time (a thread just starting in the same process doing
+    // Rc::downgrade) on the same count; a lost update frees it early, and later accesses all
+    // land on freed memory
     CURRENT.set(None);
 }
 

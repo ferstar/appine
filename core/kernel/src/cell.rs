@@ -1,17 +1,21 @@
-//! 内核对象用的 `RefCell`（kernel/process 的 map）：与标准库的相同，调试构建和打开 `borrow-check`
-//! 特性的构建里另外数着每个线程借着几个。
+//! A `RefCell` for kernel objects (the kernel/process map): the same as the standard library's,
+//! except that debug builds and builds with the `borrow-check` feature also count how many each
+//! thread holds borrowed.
 //!
-//! 内核对象由 BKL 保护，放开 BKL（等待、[`Cx::unlocked`](crate::kernel::Cx::unlocked)）
-//! 时不能还借着它们：别的线程这时借同一个对象会 panic（already borrowed），它所在的进程
-//! 就被当作撞上内核 bug 结束。经由 `cx` 拿到的借用编译器会拦住，从手里的 `Rc` 拿到的
-//! 借用（`file.borrow()`）拦不住，`if let`、`match`、`let … else` 的临时借用又不显眼。
-//! 放开 BKL 的地方调用 [`assert_none_held`]，每一次等待都检查，不用碰上并发也查得出来。
-//! 调试构建（cargo test）总是检查；发布构建打开 `borrow-check` 特性时检查（`appine-run`
-//! 默认打开，差分测试、LTP、普查用的就是它；debug 版 App 也打开），App 的发布版里计数
-//! 不存在，与标准库的 `RefCell` 一样。
+//! Kernel objects are protected by the BKL, and they must not still be borrowed when the BKL is
+//! released (waiting, [`Cx::unlocked`](crate::kernel::Cx::unlocked)): another thread borrowing the
+//! same object at that moment panics (already borrowed), and its process is ended for hitting a
+//! kernel bug. The compiler stops borrows obtained through `cx`, but not borrows obtained from an
+//! `Rc` in hand (`file.borrow()`), and the temporary borrows of `if let`, `match` and `let … else`
+//! are easy to miss. The places that release the BKL call [`assert_none_held`], so every wait
+//! checks, and the problem shows up without needing a concurrent collision. Debug builds (cargo
+//! test) always check; release builds check when the `borrow-check` feature is on (`appine-run`
+//! turns it on by default, and it is what the differential tests, LTP and surveys use; the debug
+//! app turns it on too). In the app's release build the count does not exist, just like the
+//! standard library's `RefCell`.
 //!
-//! 线程自己的 `TaskState`（只有它所属的线程会借，整个系统调用期间都借着）和线程局部
-//! 变量仍用标准库的 `RefCell`。
+//! A thread's own `TaskState` (borrowed only by the thread it belongs to, and held borrowed for the
+//! whole syscall) and thread-local variables still use the standard library's `RefCell`.
 
 use std::cell;
 use std::fmt;
@@ -19,12 +23,12 @@ use std::ops::{Deref, DerefMut};
 
 #[cfg(any(debug_assertions, feature = "borrow-check"))]
 thread_local! {
-    /// 这个线程借着的 [`RefCell`] 个数。
-    #[allow(clippy::missing_const_for_thread_local)] // 已经是 const，Android 上的 clippy 误报
+    /// How many [`RefCell`]s this thread holds borrowed.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static BORROWS: cell::Cell<usize> = const { cell::Cell::new(0) };
 }
 
-/// 一个活着的借用：检查的构建里创建时加一、丢掉时减一。
+/// One live borrow: in checking builds it adds one when created and subtracts one when dropped.
 struct Held;
 
 impl Held {
@@ -43,7 +47,8 @@ impl Drop for Held {
     }
 }
 
-/// 要放开 BKL 了：检查的构建里检查这个线程没有借着任何 [`RefCell`]。
+/// About to release the BKL: in checking builds, checks that this thread holds no [`RefCell`]
+/// borrowed.
 #[inline]
 pub(crate) fn assert_none_held() {
     #[cfg(any(debug_assertions, feature = "borrow-check"))]
@@ -56,17 +61,17 @@ pub(crate) fn assert_none_held() {
     }
 }
 
-/// 标准库的 `RefCell`，借用由检查的构建数着（模块文档）。
+/// The standard library's `RefCell`, with borrows counted by checking builds (module docs).
 #[derive(Default)]
 pub(crate) struct RefCell<T: ?Sized>(cell::RefCell<T>);
 
-/// [`RefCell::borrow`] 的借用。
+/// A borrow from [`RefCell::borrow`].
 pub(crate) struct Ref<'b, T: ?Sized> {
     inner: cell::Ref<'b, T>,
     _held: Held,
 }
 
-/// [`RefCell::borrow_mut`] 的借用。
+/// A borrow from [`RefCell::borrow_mut`].
 pub(crate) struct RefMut<'b, T: ?Sized> {
     inner: cell::RefMut<'b, T>,
     _held: Held,

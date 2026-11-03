@@ -1,5 +1,5 @@
-//! guest 进程（线程组）（kernel/process 的 map）。宿主启动的进程都是内置 init（pid 1）的子进程
-//! （[`crate::Machine`]）。
+//! Guest processes (thread groups) (the kernel/process map). Processes started by the host are
+//! all children of the built-in init (pid 1) ([`crate::Machine`]).
 
 use std::fmt;
 use std::fs::File;
@@ -21,98 +21,100 @@ use crate::tty::Tty;
 use crate::vfs::store::{Ino, Stat, mode};
 use crate::vfs::{Dentry, MountId, Node, Pseudo, Vfs};
 
-/// 一个信号编号（1–64）。
+/// A signal number (1–64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal(i32);
 
 impl Signal {
-    /// 挂起。
+    /// Hangup.
     pub const HUP: Signal = Signal(1);
-    /// 终端中断。
+    /// Terminal interrupt.
     pub const INT: Signal = Signal(2);
-    /// 终端退出（^\）。
+    /// Terminal quit (^\).
     pub const QUIT: Signal = Signal(3);
-    /// 未定义指令。
+    /// Undefined instruction.
     pub const ILL: Signal = Signal(4);
-    /// 断点。
+    /// Breakpoint.
     pub const TRAP: Signal = Signal(5);
-    /// abort。
+    /// abort.
     pub const ABRT: Signal = Signal(6);
-    /// 总线错误、未对齐访问。
+    /// Bus error, unaligned access.
     pub const BUS: Signal = Signal(7);
-    /// 强制终止。
+    /// Forced termination.
     pub const KILL: Signal = Signal(9);
-    /// 用户自定义信号 1。
+    /// User-defined signal 1.
     pub const USR1: Signal = Signal(10);
-    /// 用户自定义信号 2。
+    /// User-defined signal 2.
     pub const USR2: Signal = Signal(12);
-    /// 非法内存访问。
+    /// Invalid memory access.
     pub const SEGV: Signal = Signal(11);
-    /// 管道断开。
+    /// Broken pipe.
     pub const PIPE: Signal = Signal(13);
-    /// 定时器到期。
+    /// Timer expired.
     pub const ALRM: Signal = Signal(14);
-    /// 终止。
+    /// Termination.
     pub const TERM: Signal = Signal(15);
-    /// 子进程状态改变。
+    /// Child process status changed.
     pub const CHLD: Signal = Signal(17);
-    /// 让停止的进程继续。
+    /// Continues a stopped process.
     pub const CONT: Signal = Signal(18);
-    /// 停止（不能捕获）。
+    /// Stop (cannot be caught).
     pub const STOP: Signal = Signal(19);
-    /// 终端停止（^Z）。
+    /// Terminal stop (^Z).
     pub const TSTP: Signal = Signal(20);
-    /// 后台进程读终端。
+    /// A background process read the terminal.
     pub const TTIN: Signal = Signal(21);
-    /// 后台进程写终端或修改终端设置。
+    /// A background process wrote to the terminal or changed its settings.
     pub const TTOU: Signal = Signal(22);
-    /// CPU 时间超过 `RLIMIT_CPU`。
+    /// CPU time exceeded `RLIMIT_CPU`.
     pub const XCPU: Signal = Signal(24);
-    /// 文件大小超过 `RLIMIT_FSIZE`。
+    /// File size exceeded `RLIMIT_FSIZE`.
     pub const XFSZ: Signal = Signal(25);
-    /// `ITIMER_VIRTUAL` 到期。
+    /// `ITIMER_VIRTUAL` expired.
     pub const VTALRM: Signal = Signal(26);
-    /// `ITIMER_PROF` 到期。
+    /// `ITIMER_PROF` expired.
     pub const PROF: Signal = Signal(27);
-    /// 终端窗口大小改变。
+    /// Terminal window size changed.
     pub const WINCH: Signal = Signal(28);
-    /// 错误的系统调用（seccomp）。
+    /// Bad system call (seccomp).
     pub const SYS: Signal = Signal(31);
 
-    /// 最大的信号编号。
+    /// The largest signal number.
     pub const MAX: i32 = 64;
 
-    /// 由编号构造，编号必须在 1–64 之内。
+    /// Constructs from a number, which must be within 1–64.
     pub fn new(n: i32) -> Option<Signal> {
         (1..=Self::MAX).contains(&n).then_some(Signal(n))
     }
 
-    /// Linux 信号编号。
+    /// The Linux signal number.
     pub fn number(self) -> i32 {
         self.0
     }
 
-    /// 在信号集位图里对应的位。
+    /// The corresponding bit in a signal-set bitmap.
     pub(crate) fn bit(self) -> u64 {
         1 << (self.0 - 1)
     }
 
-    /// 在按信号编号排列的表里的下标。
+    /// The index in a table ordered by signal number.
     pub(crate) fn index(self) -> usize {
         self.0 as usize - 1
     }
 
-    /// 是不是实时信号（32 号起；libc 自己用掉前几个，它的 SIGRTMIN 更大）。
+    /// Whether this is a real-time signal (from 32; libc uses up the first few itself, so its
+    /// SIGRTMIN is larger).
     pub(crate) fn is_realtime(self) -> bool {
         self.0 >= 32
     }
 
-    /// 是不是停止信号（SIGSTOP、SIGTSTP、SIGTTIN、SIGTTOU）。
+    /// Whether this is a stop signal (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU).
     pub(crate) fn is_stop(self) -> bool {
         matches!(self.0, 19..=22)
     }
 
-    /// 默认动作是否是忽略：SIGCHLD、SIGCONT（它的"继续"在产生时就生效了）、SIGURG、SIGWINCH。
+    /// Whether the default action is to ignore: SIGCHLD, SIGCONT (its "continue" already took
+    /// effect when it was generated), SIGURG, SIGWINCH.
     pub(crate) fn ignored_by_default(self) -> bool {
         matches!(self.0, 17 | 18 | 23 | 28)
     }
@@ -132,26 +134,27 @@ impl fmt::Display for Signal {
     }
 }
 
-/// guest 进程的结束方式。
+/// How a guest process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitStatus {
-    /// 调用了 `exit` 或 `exit_group`。
+    /// Called `exit` or `exit_group`.
     Exited(i32),
-    /// 被信号终止。
+    /// Terminated by a signal.
     Signaled {
-        /// 信号。
+        /// The signal.
         signal: Signal,
-        /// 同步异常（访存出错、未定义指令、断点）时出错指令的地址。
+        /// For a synchronous exception (memory fault, undefined instruction, breakpoint), the
+        /// address of the faulting instruction.
         pc: Option<u64>,
-        /// 访存出错时的 guest 地址。
+        /// For a memory fault, the guest address.
         fault_addr: Option<u64>,
-        /// 写了 core 文件（`WCOREDUMP`）。
+        /// A core file was written (`WCOREDUMP`).
         core_dumped: bool,
     },
 }
 
 impl ExitStatus {
-    /// wait4 报告的状态字（`WIFEXITED` 等宏解码的格式）。
+    /// The status word wait4 reports (the format decoded by `WIFEXITED` and the other macros).
     pub(crate) fn wait_status(self) -> i32 {
         match self {
             ExitStatus::Exited(code) => (code & 0xff) << 8,
@@ -164,63 +167,66 @@ impl ExitStatus {
     }
 }
 
-/// 执行引擎（engine 的 map）。
+/// Execution engine (the engine map).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tier {
-    /// Tier 0：解释器。
+    /// Tier 0: the interpreter.
     #[default]
     Interpreter,
-    /// Tier 1：同 ISA 直通式 DBT（只支持 aarch64 Linux 宿主）。
+    /// Tier 1: a same-ISA pass-through DBT (only on aarch64 Linux hosts).
     Dbt,
 }
 
-/// 运行选项。
+/// Run options.
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
-    /// 执行引擎。
+    /// Execution engine.
     pub tier: Tier,
-    /// inode 仓库所在的宿主目录。设置后程序路径按 guest 路径在仓库里解析，
-    /// 否则按宿主路径读取，guest 也看不到任何文件系统。
+    /// Host directory of the inode store. When set, program paths are resolved as guest paths in
+    /// the store; otherwise they are read as host paths, and the guest sees no filesystem at all.
     pub rootfs: Option<PathBuf>,
-    /// 设置时，第一个进程以一个进程内 PTY 为 stdin/stdout/stderr 和控制终端，PTY 接到
-    /// 这些宿主 fd 上；否则 guest 直接使用宿主的 stdin/stdout/stderr。
+    /// When set, the first process gets an in-process PTY as stdin/stdout/stderr and controlling
+    /// terminal, with the PTY connected to these host fds; otherwise the guest uses the host's
+    /// stdin/stdout/stderr directly.
     pub terminal: Option<Terminal>,
-    /// 宿主进程匿名内存的上限，见 [`crate::MachineOptions::memory_limit`]。
+    /// Upper bound on the host process's anonymous memory, see
+    /// [`crate::MachineOptions::memory_limit`].
     pub memory_limit: Option<u64>,
-    /// 低端口映射的偏移，见 [`crate::MachineOptions::low_port_offset`]。
+    /// Offset for low-port mapping, see [`crate::MachineOptions::low_port_offset`].
     pub low_port_offset: Option<u16>,
-    /// 见 [`crate::MachineOptions::always_map_low_ports`]。
+    /// See [`crate::MachineOptions::always_map_low_ports`].
     pub always_map_low_ports: bool,
-    /// 先按 inittab 开机（[`crate::Machine::boot`]），第一个进程结束或者 guest 请求关机时
-    /// 再关机（[`crate::Machine::shutdown`]），不直接结束所有进程。
+    /// Boot from inittab first ([`crate::Machine::boot`]), and shut down
+    /// ([`crate::Machine::shutdown`]) when the first process ends or the guest requests a
+    /// shutdown, instead of ending all processes directly.
     pub init: bool,
 }
 
-/// 一次运行的结果。
+/// The result of a run.
 #[derive(Debug, Clone, Copy)]
 pub struct RunReport {
-    /// 第一个 guest 进程的结束方式。
+    /// How the first guest process ended.
     pub status: ExitStatus,
-    /// 使用 Tier 1 时所有线程的统计之和。
+    /// The sum of all threads' statistics when Tier 1 is used.
     pub dbt_stats: Option<DbtStats>,
 }
 
-/// guest 没能开始运行的原因。
+/// Why the guest could not start running.
 #[derive(Debug)]
 pub enum RunError {
-    /// 读取宿主上的程序文件失败。
+    /// Reading the program file on the host failed.
     Io(io::Error),
-    /// 打开 inode 仓库失败。
+    /// Opening the inode store failed.
     Rootfs(Errno),
-    /// 在 guest 文件系统里找不到或不能执行程序。
+    /// The program could not be found or executed in the guest filesystem.
     Exec(Errno),
-    /// 加载失败。
+    /// Loading failed.
     Load(LoadError),
-    /// 控制台不存在，或者已经属于一个会话。
+    /// The console does not exist, or already belongs to a session.
     Console(Errno),
-    /// 当前宿主不支持所选的执行引擎。
+    /// The current host does not support the chosen execution engine.
     TierUnavailable,
-    /// 内核层的 bug（panic），报告在宿主的 stderr 上（设计文档 §12 第 5 条）。
+    /// A kernel-layer bug (panic), reported on the host's stderr (design doc §12 item 5).
     Internal,
 }
 
@@ -246,36 +252,37 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-/// `RLIMIT_CPU`（秒）。
+/// `RLIMIT_CPU` (seconds).
 pub(crate) const RLIMIT_CPU: u32 = 0;
-/// `RLIMIT_FSIZE`。
+/// `RLIMIT_FSIZE`.
 pub(crate) const RLIMIT_FSIZE: u32 = 1;
-/// `RLIMIT_STACK`。
+/// `RLIMIT_STACK`.
 pub(crate) const RLIMIT_STACK: u32 = 3;
-/// `RLIMIT_CORE`。
+/// `RLIMIT_CORE`.
 pub(crate) const RLIMIT_CORE: u32 = 4;
-/// `RLIMIT_NPROC`：一个真实用户 ID 最多有多少个线程。
+/// `RLIMIT_NPROC`: the most threads one real user ID may have.
 pub(crate) const RLIMIT_NPROC: u32 = 6;
-/// `RLIMIT_NOFILE`。
+/// `RLIMIT_NOFILE`.
 pub(crate) const RLIMIT_NOFILE: u32 = 7;
-/// `RLIMIT_MEMLOCK`。
+/// `RLIMIT_MEMLOCK`.
 pub(crate) const RLIMIT_MEMLOCK: u32 = 8;
-/// `RLIMIT_SIGPENDING`。
+/// `RLIMIT_SIGPENDING`.
 pub(crate) const RLIMIT_SIGPENDING: u32 = 11;
-/// `RLIMIT_NICE`：不用 `CAP_SYS_NICE` 就能调到的最低 nice 值，记作 20 - nice。
+/// `RLIMIT_NICE`: the lowest nice value reachable without `CAP_SYS_NICE`, recorded as 20 - nice.
 pub(crate) const RLIMIT_NICE: u32 = 13;
-/// `RLIMIT_RTPRIO`。
+/// `RLIMIT_RTPRIO`.
 const RLIMIT_RTPRIO: u32 = 14;
-/// 资源种类数（`RLIM_NLIMITS`）。
+/// The number of resource kinds (`RLIM_NLIMITS`).
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
-/// `threads-max` 能写入的最小值（Linux 的 `MIN_THREADS`）。
+/// The smallest value `threads-max` accepts (Linux's `MIN_THREADS`).
 pub(crate) const MIN_THREADS: usize = 20;
 
-/// `/proc/sys/kernel/threads-max` 的默认值：同时存在的线程数的上限，挡住 fork 炸弹，root
-/// 也受它限制（`RLIMIT_NPROC` 管不了 root）。每个 guest 线程是一个宿主线程，还占一个
-/// 宿主 fd（等待用的 eventfd），所以按物理内存每 MB 一个（Linux 是每 128 KB 一个），
-/// 并且不超过宿主 fd 上限的一半，给打开的文件留出余地。
+/// Default for `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing
+/// at once, which stops fork bombs and applies to root too (`RLIMIT_NPROC` cannot limit root).
+/// Every guest thread is a host thread and also takes a host fd (the eventfd for waiting), so it
+/// is one per MB of physical memory (Linux: one per 128 KB), and at most half the host fd limit,
+/// leaving room for open files.
 pub(crate) fn default_threads_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
@@ -294,133 +301,148 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     r[RLIMIT_CORE as usize] = (0, u64::MAX);
     let (soft, hard) = crate::fd::DEFAULT_NOFILE;
     r[RLIMIT_NOFILE as usize] = (soft as u64, hard as u64);
-    // 与 Linux 5.16 起的默认值相同
+    // The same as the default since Linux 5.16
     r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
-    // 与 Linux 一样是 threads-max 的一半；root 不受它限制
+    // Half of threads-max, as on Linux; root is not limited by it
     let nproc = default_threads_max() as u64 / 2;
     r[RLIMIT_NPROC as usize] = (nproc, nproc);
-    // Linux 按内存大小算（max_threads / 2），4 GB 内存时是这个数
+    // Linux computes it from the memory size (max_threads / 2); this is the value for 4 GB of
+    // memory
     r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
     r[RLIMIT_NICE as usize] = (0, 0);
     r[RLIMIT_RTPRIO as usize] = (0, 0);
     r
 }
 
-/// 一个 guest 进程，即线程组。线程退出之后线程组可能作为僵尸进程留下来，直到父进程回收。
+/// A guest process, that is, a thread group. After its threads exit, the thread group may remain
+/// as a zombie process until the parent reaps it.
 pub(crate) struct ThreadGroup {
-    /// pid。
+    /// pid.
     pub tgid: Tid,
-    /// 父进程。
+    /// Parent process.
     pub ppid: Tid,
-    /// 父进程里建立它的线程（Linux 的 `real_parent`；`CLONE_PARENT` 时是调用者的父线程）：
-    /// 那个线程退出之后换成同一个进程里还活着的线程，过继时换成新的父进程里的线程。
-    /// `/proc/<pid>/task/<tid>/children` 按它列出线程的子进程。
+    /// The thread in the parent that created it (Linux's `real_parent`; with `CLONE_PARENT`, the
+    /// caller's parent thread): after that thread exits it becomes a live thread of the same
+    /// process, and on reparenting a thread of the new parent.
+    /// `/proc/<pid>/task/<tid>/children` lists a thread's children by it.
     pub parent_thread: Tid,
-    /// 进程组。
+    /// Process group.
     pub pgid: Tid,
-    /// 会话。
+    /// Session.
     pub sid: Tid,
-    /// 活着的线程，第一个是主线程（如果它还活着）。
+    /// Live threads, the first being the leader (if it is still alive).
     pub threads: Vec<Tid>,
-    /// 子进程（含僵尸进程）。
+    /// Child processes (zombies included).
     pub children: Vec<Tid>,
-    /// 所在的 pid 命名空间（线程都在这里）。
+    /// The pid namespace it is in (all its threads are in it).
     pub pid_ns: Rc<crate::pidns::PidNs>,
-    /// 所在的 cgroup（[`crate::cgroup`] 的编号）：fork 时随父进程，经由 `cgroup.procs` 迁移。
+    /// The cgroup it is in (a [`crate::cgroup`] number): follows the parent at fork, migrated
+    /// through `cgroup.procs`.
     pub cgroup: u64,
-    /// 按默认方式处理的同步信号被强制投递过：是 pid 命名空间的 1 号进程也照常结束（Linux 的
-    /// `force_sig_info_to_task` 去掉 `SIGNAL_UNKILLABLE`）。
+    /// A synchronous signal with default handling has been force-delivered: the process ends as
+    /// usual even if it is pid 1 of a pid namespace (Linux's `force_sig_info_to_task` clears
+    /// `SIGNAL_UNKILLABLE`).
     pub killable: bool,
-    /// 发给整个进程、尚未处理的信号。
+    /// Signals sent to the whole process and not yet handled.
     pub pending: Pending,
-    /// 信号处理方式。
+    /// Signal dispositions.
     pub sighand: Rc<RefCell<SigHandlers>>,
-    /// 资源限制：(软限制, 硬限制)。
+    /// Resource limits: (soft limit, hard limit).
     pub rlimits: [(u64, u64); RLIM_NLIMITS],
-    /// 正在整体退出（exit_group、致命信号）时的结束方式。
+    /// How it ends while exiting as a whole (exit_group, fatal signal).
     pub exiting: Option<ExitStatus>,
-    /// 主线程自己的结束方式，异常清理的备用值；正常退出由最后一个进入退出流程的线程
-    /// 确定 `exiting`（task::Task::begin_exit）。
+    /// How the leader itself ended, a fallback for abnormal cleanup; on a normal exit the last
+    /// thread to enter the exit path decides `exiting` (task::Task::begin_exit).
     pub leader_status: ExitStatus,
-    /// 所有线程都已退出、等待父进程回收时的结束方式。
+    /// How it ended, once all threads have exited and it waits for the parent to reap it.
     pub zombie: Option<ExitStatus>,
-    /// 退出时发给父进程的信号（clone 的低 8 位，通常是 SIGCHLD），0 表示不发。
+    /// The signal sent to the parent on exit (the low 8 bits of clone, usually SIGCHLD), 0 meaning
+    /// none.
     pub exit_signal: i32,
-    /// 控制终端。
+    /// Controlling terminal.
     pub ctty: Option<Rc<RefCell<Tty>>>,
-    /// 控制终端挂断时的前台进程组（Linux 的 `tty_old_pgrp`），只记在会话组长上：它退出时
-    /// 已经没有控制终端，改为给这个进程组发 SIGHUP 和 SIGCONT（[`release_ctty`]）。重新
-    /// 得到控制终端时清掉。
+    /// The foreground process group when the controlling terminal hung up (Linux's
+    /// `tty_old_pgrp`), recorded only on the session leader: when it exits it no longer has a
+    /// controlling terminal, so SIGHUP and SIGCONT go to this process group instead
+    /// ([`release_ctty`]). Cleared when it gets a controlling terminal again.
     pub tty_old_pgrp: Option<Tid>,
-    /// 整个线程组被停止信号停住了。
+    /// The whole thread group has been stopped by a stop signal.
     pub stopped: bool,
-    /// 所在的 cgroup 或者它的祖先被冻结了（`cgroup.freeze`）：线程在返回 guest 之前停下，
-    /// 与停止信号不同，父进程、wait 看不到。
+    /// Its cgroup or an ancestor of it is frozen (`cgroup.freeze`): threads stop before returning
+    /// to the guest; unlike a stop signal, the parent and wait do not see it.
     pub frozen: bool,
-    /// 停住线程组的停止信号（Linux 的 `JOBCTL_STOP_SIGMASK`），停着时有意义：父进程的
-    /// wait 取走停止事件之后仍然记着，停着的时候被跟踪的线程按它报告 group-stop。
+    /// The stop signal that stopped the thread group (Linux's `JOBCTL_STOP_SIGMASK`), meaningful
+    /// while stopped: it is still remembered after the parent's wait has taken the stop event, and
+    /// traced threads report group-stop with it while stopped.
     pub stop_signal: Signal,
-    /// 还没有被父进程的 wait 取走的"停止"事件。
+    /// A "stopped" event not yet taken by the parent's wait.
     pub stop_report: Option<Signal>,
-    /// 还没有被父进程的 wait 取走的"继续"事件。
+    /// A "continued" event not yet taken by the parent's wait.
     pub cont_report: bool,
-    /// 正在执行的程序文件（`/proc/<pid>/exe`）；还没执行过程序的（内置的 init）是 None。
+    /// The program file being executed (`/proc/<pid>/exe`); None for one that has not executed a
+    /// program yet (the built-in init).
     pub exe: Option<Rc<ExeFile>>,
-    /// 创建时刻，开机以来的时钟滴答数（`/proc/<pid>/stat`）。
+    /// Creation time, in clock ticks since boot (`/proc/<pid>/stat`).
     pub start_ticks: u64,
-    /// 已退出线程用掉的 CPU 时间。
+    /// CPU time used by exited threads.
     pub cpu: CpuTime,
-    /// 已回收的子进程用掉的 CPU 时间。
+    /// CPU time used by reaped children.
     pub child_cpu: CpuTime,
-    /// 驻留内存的峰值（kB，`ru_maxrss`）：getrusage、execve、退出时取样，跨 execve 保留。
+    /// Peak resident memory (kB, `ru_maxrss`): sampled at getrusage, execve and exit, and kept
+    /// across execve.
     pub maxrss_kb: u64,
-    /// 已回收的子进程（包括它们回收的）里最大的 `maxrss_kb`。
+    /// The largest `maxrss_kb` among reaped children (including those they reaped).
     pub child_maxrss_kb: u64,
-    /// getrusage 上次取样的时刻（[`ThreadGroup::sample_rss_throttled`]）。
+    /// When getrusage last sampled ([`ThreadGroup::sample_rss_throttled`]).
     pub rss_sampled: Option<std::time::Instant>,
-    /// `ITIMER_REAL`：fork 不继承，execve 保留。
+    /// `ITIMER_REAL`: not inherited by fork, kept by execve.
     pub itimer: Option<crate::itimer::ITimer>,
-    /// `ITIMER_VIRTUAL`、`ITIMER_PROF`，按进程用掉的 CPU 时间计时。
+    /// `ITIMER_VIRTUAL`, `ITIMER_PROF`, timed by the CPU time the process uses.
     pub cpu_itimers: [Option<crate::itimer::CpuTimer>; 2],
-    /// `PR_SET_CHILD_SUBREAPER`：后代成了孤儿时过继给最近的这样的祖先，而不是 init
-    /// （[`finish_group`]）；fork 不继承，execve 保留。
+    /// `PR_SET_CHILD_SUBREAPER`: orphaned descendants are reparented to the nearest such ancestor
+    /// instead of init ([`finish_group`]); not inherited by fork, kept by execve.
     pub child_subreaper: bool,
-    /// `PR_SET_DUMPABLE`，fork 继承。
+    /// `PR_SET_DUMPABLE`, inherited by fork.
     pub dumpable: bool,
-    /// `PR_SET_NO_NEW_PRIVS`，fork 和 execve 都保留。
+    /// `PR_SET_NO_NEW_PRIVS`, kept by both fork and execve.
     pub no_new_privs: bool,
-    /// `/proc/<pid>/oom_score_adj`（-1000–1000），fork 继承。OOM killer 挑进程时用
-    /// （[`crate::oom`]），-1000 表示不挑它。
+    /// `/proc/<pid>/oom_score_adj` (-1000–1000), inherited by fork. Used when the OOM killer picks
+    /// a process ([`crate::oom`]); -1000 means never pick it.
     pub oom_score_adj: i32,
-    /// 没有 `CAP_SYS_RESOURCE` 时 `oom_score_adj` 能调到的最低值：有这个能力的写入者
-    /// 写的值，fork 继承。
+    /// The lowest value `oom_score_adj` can be set to without `CAP_SYS_RESOURCE`: the value
+    /// written by a writer with that capability, inherited by fork.
     pub oom_score_adj_min: i32,
-    /// 凭据，fork 继承。
+    /// Credentials, inherited by fork.
     pub cred: Cred,
-    /// personality(2) 的执行域和标志：只记录，fork 和 execve 都保留。
+    /// The execution domain and flags of personality(2): only recorded, kept by both fork and
+    /// execve.
     pub personality: u32,
-    /// 执行过 execve（父进程不能再 setpgid 它）；fork 出来的进程从 false 开始。
+    /// Has called execve (the parent can no longer setpgid it); a forked process starts at false.
     pub execed: bool,
-    /// `PR_SET_THP_DISABLE`（没有透明大页，只记录），fork 继承。
+    /// `PR_SET_THP_DISABLE` (there are no transparent huge pages, only recorded), inherited by
+    /// fork.
     pub thp_disable: bool,
-    /// `/proc/<pid>/coredump_filter`（`mm::dump_filter`），fork 继承。
+    /// `/proc/<pid>/coredump_filter` (`mm::dump_filter`), inherited by fork.
     pub coredump_filter: u32,
-    /// 正在写 core 文件：其他线程退出时把寄存器留在这里（`crate::coredump`）。
+    /// Writing a core file: other threads leave their registers here when they exit
+    /// (`crate::coredump`).
     pub core: Option<Vec<crate::coredump::ThreadCore>>,
-    /// POSIX 定时器（timer_create），按 id；fork 不继承，execve 时删除。
+    /// POSIX timers (timer_create), by id; not inherited by fork, deleted on execve.
     pub posix_timers: std::collections::BTreeMap<i32, crate::itimer::PosixTimer>,
-    /// AIO 上下文，按 id（`syscall::aio`）。
+    /// AIO contexts, by id (`syscall::aio`).
     pub aio: std::collections::BTreeMap<u64, Rc<RefCell<crate::syscall::AioContext>>>,
-    /// 进程的编号，不重复：pid 被新进程重新使用之后用它区分新旧进程（`/proc/<pid>` 的
-    /// inode）。
+    /// The process's serial number, never repeated: after a pid is reused by a new process it
+    /// tells the old and new process apart (the inode of `/proc/<pid>`).
     pub serial: u64,
-    /// 主线程退出时跟踪着它的进程：整个进程结束时也报告给它（[`crate::ptrace`]）。
+    /// The process tracing the leader when the leader exited: it is also reported to when the
+    /// whole process ends ([`crate::ptrace`]).
     pub leader_tracer: Option<Tid>,
-    /// 结束时跟踪着主线程、又不是父进程的跟踪者：它用 wait 取走这次结束（或者它自己退出）
-    /// 之前，这个僵尸进程只有它看得见，父进程等不到、也不收到通知（Linux 的僵尸进程
-    /// 还被跟踪着时）。
+    /// A tracer that was tracing the leader at the end and is not the parent: until it takes this
+    /// end with wait (or exits itself), only it can see this zombie process, and the parent can
+    /// neither wait for it nor get notified (as with Linux's zombies that are still traced).
     pub exit_tracer: Option<Tid>,
-    /// 主线程结束时的 seccomp 过滤器链：与 Linux 一样，进程被回收时才放下（[`crate::seccomp`]）。
+    /// The leader's seccomp filter chain when it ended: as on Linux, released only when the
+    /// process is reaped ([`crate::seccomp`]).
     pub leader_seccomp: Option<crate::seccomp::Chain>,
 }
 
@@ -483,35 +505,37 @@ impl ThreadGroup {
 }
 
 impl ThreadGroup {
-    /// 用掉的 CPU 时间：已退出的线程加上活着的线程。
+    /// CPU time used: exited threads plus live threads.
     pub fn cpu(&self, k: &Kernel) -> CpuTime {
         let threads = self.threads.iter().filter_map(|t| k.tasks.get(t));
         threads.fold(self.cpu, |sum, t| sum + t.cpu())
     }
 
-    /// [`ThreadGroup::cpu`] 的总数。
+    /// The total of [`ThreadGroup::cpu`].
     pub fn cpu_ns(&self, k: &Kernel) -> u64 {
         self.cpu(k).total_ns
     }
 
-    /// 取一次驻留内存的样，更新峰值。
+    /// Samples resident memory once and updates the peak.
     pub fn sample_rss(&mut self, mm: &crate::mm::Mm) {
         self.maxrss_kb = self.maxrss_kb.max(mm.peak_resident_pages(false) * 4);
     }
 
-    /// execve 换掉地址空间之前的取样：fork 出来、还没执行过 execve、创建不超过一个时钟
-    /// 滴答的进程不量它自己的匿名内存（[`crate::mm::Mm::peak_resident_pages`]）。这次取样
-    /// 在 4 个进程同时起进程时占了不少时间：mincore 持着 BKL 等宿主的 mmap_lock，别的进程
-    /// 正在锁外 munmap。
+    /// The sample before execve replaces the address space: a process that was forked, has not
+    /// called execve yet and was created no more than one clock tick ago does not measure its own
+    /// anonymous memory ([`crate::mm::Mm::peak_resident_pages`]). With 4 processes starting
+    /// processes at once, this sample took a good deal of time: mincore waits for the host's
+    /// mmap_lock while holding the BKL, while other processes are doing munmap outside the lock.
     pub fn sample_rss_at_exec(&mut self, mm: &crate::mm::Mm) {
         let now = crate::pseudo::uptime_ns() / (1_000_000_000 / loader::CLOCK_TICKS);
         let fresh = !self.execed && now <= self.start_ticks + 1;
         self.maxrss_kb = self.maxrss_kb.max(mm.peak_resident_pages(fresh) * 4);
     }
 
-    /// getrusage 的取样：距上次不到 10 毫秒时沿用上次的峰值。取样要用 mincore 扫一遍写过
-    /// 的映射，JVM 频繁调用 getrusage、堆又很大，每次都取样时它占了 Maven 一成多的时间。
-    /// execve、退出时的取样不受限制。
+    /// The getrusage sample: within 10 ms of the last one, the last peak is reused. Sampling scans
+    /// the written mappings with mincore; the JVM calls getrusage often and has a large heap, and
+    /// sampling every time took more than a tenth of Maven's time. The samples at execve and exit
+    /// are not throttled.
     pub fn sample_rss_throttled(&mut self, mm: &crate::mm::Mm) {
         const INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         let now = std::time::Instant::now();
@@ -523,7 +547,8 @@ impl ThreadGroup {
     }
 }
 
-/// 用掉的 CPU 时间，其中 `sys_ns` 是内核态的部分（不超过 `total_ns`，见 [`Task::cpu`](crate::task::Task::cpu)）。
+/// CPU time used, of which `sys_ns` is the kernel-mode part (not more than `total_ns`, see
+/// [`Task::cpu`](crate::task::Task::cpu)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CpuTime {
     pub total_ns: u64,
@@ -552,16 +577,16 @@ impl std::ops::AddAssign for CpuTime {
     }
 }
 
-/// getrusage、wait4 报告的资源用量。
+/// Resource usage reported by getrusage and wait4.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Rusage {
     pub cpu: CpuTime,
-    /// 驻留内存的峰值（kB）。
+    /// Peak resident memory (kB).
     pub maxrss_kb: u64,
 }
 
 impl Rusage {
-    /// `struct rusage`：用户态、内核态的 CPU 时间和 `ru_maxrss`，其余字段为 0。
+    /// `struct rusage`: user and kernel CPU time and `ru_maxrss`; the other fields are 0.
     pub fn encode(&self) -> [u8; 144] {
         let mut b = [0u8; 144];
         for (at, ns) in [(0, self.cpu.user_ns()), (16, self.cpu.sys_ns)] {
@@ -573,9 +598,10 @@ impl Rusage {
     }
 }
 
-/// 进程 `g` 里还活着、没有正在被结束的第一个线程（Linux 的 `find_alive_thread`，主线程在
-/// 最前面），都在被结束时是第一个线程，没有线程时是 `tgid`。孤儿过继给一个进程时由它当父
-/// 线程。
+/// The first thread of process `g` that is alive and not being ended (Linux's
+/// `find_alive_thread`, leader first); the first thread when all are being ended, and `tgid`
+/// when there are no threads. It becomes the parent thread when orphans are reparented to a
+/// process.
 pub(crate) fn alive_thread(k: &Kernel, g: &ThreadGroup) -> Tid {
     g.threads
         .iter()
@@ -585,8 +611,9 @@ pub(crate) fn alive_thread(k: &Kernel, g: &ThreadGroup) -> Tid {
         .unwrap_or(g.tgid)
 }
 
-/// 子进程 `children` 里设了 `PR_SET_PDEATHSIG` 的线程各要收的信号：它们的父线程退出了
-/// （Linux 的 `forget_original_parent`：每个这样的线程一个，发给它所在的进程）。
+/// The signals that the threads with `PR_SET_PDEATHSIG` in the child processes `children` should
+/// each receive because their parent thread exited (Linux's `forget_original_parent`: one per such
+/// thread, sent to its process).
 pub(crate) fn pdeath_signals(k: &Kernel, children: &[Tid]) -> Vec<(Tid, Signal)> {
     let mut out = Vec::new();
     for c in children {
@@ -602,8 +629,9 @@ pub(crate) fn pdeath_signals(k: &Kernel, children: &[Tid]) -> Vec<(Tid, Signal)>
     out
 }
 
-/// 发 [`pdeath_signals`] 的信号：与 Linux 一样是 `SI_USER`，发送者是父进程 `parent`（真实
-/// 用户 ID 是 `ruid`），子进程的 pid 命名空间里看不到它时编号是 0、按强制的信号处理。
+/// Sends the [`pdeath_signals`] signals: as on Linux they are `SI_USER`, the sender is the parent
+/// process `parent` (whose real user ID is `ruid`), its pid is 0 when the child's pid namespace
+/// cannot see it, and they are handled as forced signals.
 pub(crate) fn send_pdeath(k: &Kernel, signals: Vec<(Tid, Signal)>, parent: Tid, ruid: u32) {
     for (c, sig) in signals {
         let Some(g) = k.groups.get(&c) else {
@@ -615,9 +643,10 @@ pub(crate) fn send_pdeath(k: &Kernel, signals: Vec<(Tid, Signal)>, parent: Tid, 
     }
 }
 
-/// 进程 `parent` 里的线程 `from` 退出了：它建的子进程改由同一个进程里的线程 `to` 当父线程，
-/// 排到子进程列表的最后（Linux 的 `forget_original_parent` 在本进程里找到新的父线程时
-/// `list_splice_tail_init`）。
+/// Thread `from` in process `parent` exited: the children it created get thread `to` of the same
+/// process as their parent thread, and move to the end of the child list (Linux's
+/// `forget_original_parent` does `list_splice_tail_init` when it finds a new parent thread in
+/// the same process).
 pub(crate) fn hand_thread_children(k: &Kernel, parent: &RefCell<ThreadGroup>, from: Tid, to: Tid) {
     let mut p = parent.borrow_mut();
     let (moved, kept): (Vec<Tid>, Vec<Tid>) = p.children.iter().partition(|c| {
@@ -632,11 +661,14 @@ pub(crate) fn hand_thread_children(k: &Kernel, parent: &RefCell<ThreadGroup>, fr
     p.children.extend(moved);
 }
 
-/// 线程组的最后一个线程退出之后：把子进程交给 init，通知父进程或者直接回收。
+/// After the last thread of a thread group exits: hands the children to init, and notifies the
+/// parent or reaps directly.
 ///
-/// 每一步分别兜住内核层的 bug（[`crate::bug`]）：出错时报告，后面的步骤照样做。出错的那一步
-/// 做的事丢了，别的不受牵连：父进程和宿主总能等到它结束，它的子进程、跟踪的进程、孤儿进程组
-/// 和 SysV IPC 的清理不会因为前面的一步出错而卡住。
+/// Each step contains kernel-layer bugs separately ([`crate::bug`]): on an error it is reported
+/// and the later steps are still done. What the failing step did is lost, but nothing else is
+/// affected: the parent and the host can always wait for it to end, and the cleanup of its
+/// children, its tracees, orphaned process groups and SysV IPC does not get stuck because an
+/// earlier step failed.
 pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     let (tgid, pgid, sid) = {
         let g = group.borrow();
@@ -646,12 +678,15 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         let contexts = std::mem::take(&mut group.borrow_mut().aio);
         crate::syscall::aio_released(k, contexts);
     });
-    // 这个进程退出之后可能变成孤儿的进程组（Linux 的 kill_orphaned_pgrp）：它把同一会话里
-    // 另一个进程组和这个进程组连在一起时，是它自己的进程组；以及同一会话里、另一个进程组的子进程的
+    // Process groups that may become orphaned after this process exits (Linux's
+    // kill_orphaned_pgrp): its own process group, when it connects another process group in the
+    // same session with this process group; and those of its children that are in the same
+    // session but in another process group
     let mut pgrps = Vec::new();
     let mut orphaned = Vec::new();
-    // pid 命名空间的 1 号进程退出：命名空间里的进程都被结束，之后不能再建进程，它等到
-    // 它们都被回收了才算结束（Linux 的 zap_pid_ns_processes）
+    // Pid 1 of a pid namespace exits: the processes in the namespace are all ended, no process
+    // can be created there afterwards, and it counts as ended only once they have all been
+    // reaped (Linux's zap_pid_ns_processes)
     let ns = group.borrow().pid_ns.clone();
     let zap = ns.level > 0 && ns.reaper.get() == Some(tgid);
     step(k, tgid, 2, "handing its children to init", |k| {
@@ -663,9 +698,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                 }
             }
         }
-        // 孤儿先过继给最近的 subreaper（Linux 的 find_new_reaper），没有就给它所在的 pid
-        // 命名空间的 1 号进程（find_child_reaper），开机时的命名空间里、或者 1 号进程自己
-        // 退出时给 init
+        // Orphans go first to the nearest subreaper (Linux's find_new_reaper), otherwise to pid 1
+        // of their pid namespace (find_child_reaper), and to init in the boot-time namespace or
+        // when pid 1 itself exits
         let subreaper = if zap {
             None
         } else {
@@ -682,7 +717,8 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             .groups
             .get(&reaper)
             .map_or(reaper, |g| alive_thread(k, &g.borrow()));
-        // 最后一个线程建的（别的线程退出时转给了它的）子进程要收的 PR_SET_PDEATHSIG
+        // The PR_SET_PDEATHSIG signals owed to the children created by the last thread (including
+        // those handed to it when other threads exited)
         orphaned = pdeath_signals(k, &group.borrow().children);
         let children = std::mem::take(&mut group.borrow_mut().children);
         for c in children {
@@ -697,7 +733,8 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                 if cg.pgid != pgid && cg.sid == sid {
                     pgrps.push(cg.pgid);
                 }
-                // 跟踪者还没取走的僵尸进程交给新的父进程，跟踪者取走之后由它回收
+                // A zombie the tracer has not taken yet goes to the new parent; once the tracer
+                // has taken it, the new parent reaps it
                 cg.zombie.filter(|_| cg.exit_tracer.is_none())
             };
             if reaper != INIT {
@@ -708,7 +745,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
                     k.groups.remove(&c);
                     k.release_pid(c);
                 }
-                // 新的父进程要回收它：与 Linux 的 reparent_leader 一样再通知一次
+                // The new parent must reap it: notify once more, as Linux's reparent_leader does
                 Some(status) => {
                     hand_to_parent(k, &child, (c, reaper, Signal::CHLD.number()), status)
                 }
@@ -717,7 +754,7 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             }
         }
     });
-    // PR_SET_PDEATHSIG：通知失去父进程的子进程
+    // PR_SET_PDEATHSIG: notify the children that lost their parent
     let ruid = group.borrow().cred.ruid;
     step(k, tgid, 3, "sending parent-death signals", |k| {
         send_pdeath(k, orphaned, tgid, ruid)
@@ -735,9 +772,10 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     }
 }
 
-/// 退出的进程 `group` 的孤儿要过继给的 subreaper：从父进程往上，同一层 pid 命名空间里最近
-/// 的设了 `PR_SET_CHILD_SUBREAPER`、还有活着的线程的进程（Linux 的 find_new_reaper 比 pid
-/// 的层数，不跨出命名空间；整个进程都在退出的跳过）。
+/// The subreaper to which the orphans of the exiting process `group` are reparented: going up
+/// from the parent, the nearest process in the same pid-namespace level that has set
+/// `PR_SET_CHILD_SUBREAPER` and still has live threads (Linux's find_new_reaper compares pid
+/// levels and does not leave the namespace; processes that are exiting as a whole are skipped).
 fn find_subreaper(k: &Kernel, group: &ThreadGroup) -> Option<Tid> {
     let level = group.pid_ns.level;
     let mut p = group.ppid;
@@ -754,8 +792,9 @@ fn find_subreaper(k: &Kernel, group: &ThreadGroup) -> Option<Tid> {
     None
 }
 
-/// [`finish_group`] 的后一半：报告给跟踪者、父进程。pid 命名空间的 1 号进程等到命名空间里
-/// 别的进程都被回收了才做这一半（[`Kernel::release_pid`]）。
+/// The second half of [`finish_group`]: reporting to the tracer and the parent. Pid 1 of a pid
+/// namespace does this half only once the other processes in the namespace have all been reaped
+/// ([`Kernel::release_pid`]).
 pub(crate) fn finish_reported(
     k: &mut Kernel,
     group: &Rc<RefCell<ThreadGroup>>,
@@ -769,23 +808,24 @@ pub(crate) fn finish_reported(
     if let Some(slot) = k.watched.get_mut(&tgid) {
         *slot = Some(status);
     }
-    // 被父进程以外的进程跟踪着的先报告给跟踪者，它取走之后再交给父进程
+    // When traced by a process other than the parent, report to the tracer first, and hand it to
+    // the parent after the tracer has taken it
     let traced = step(k, tgid, 6, "reporting to its tracer", |k| {
         crate::ptrace::group_finished(k, group, status)
     });
     if traced != Some(true) {
         step(k, tgid, 7, "handing it to its parent", |k| {
-            // 报告给跟踪者时出错：不再等跟踪者取走
+            // Reporting to the tracer failed: stop waiting for the tracer to take it
             group.borrow_mut().exit_tracer = None;
             hand_to_parent(k, group, (tgid, ppid, exit_signal), status);
         });
     }
-    // 它跟踪着的不再被跟踪
+    // The processes it traces are no longer traced
     step(k, tgid, 8, "releasing its tracees", |k| {
         crate::ptrace::tracer_exited(k, tgid)
     });
-    // POSIX：进程组因为这次退出变成孤儿时，如果组里有停住的进程，先发 SIGHUP 再发
-    // SIGCONT，否则它们再也没有机会继续
+    // POSIX: when this exit orphans a process group that has stopped processes in it, send
+    // SIGHUP and then SIGCONT, otherwise they never get a chance to continue
     step(k, tgid, 9, "signalling orphaned process groups", |k| {
         if let Some(p) = k.groups.get(&ppid) {
             let p = p.borrow();
@@ -809,7 +849,8 @@ pub(crate) fn finish_reported(
     finished(k, tgid);
 }
 
-/// [`finish_group`] 的第 `n` 步 `what`：兜住内核层的 bug，出错时报告，返回 None。
+/// Step `n`, `what`, of [`finish_group`]: contains kernel-layer bugs, reports on an error and
+/// returns None.
 fn step<R>(
     k: &mut Kernel,
     tgid: Tid,
@@ -829,15 +870,17 @@ fn step<R>(
     r
 }
 
-/// 进程 `tgid` 结束了：叫醒等子进程的线程，宿主在等它时也叫醒宿主。其余的等待者不必
-/// 醒：它们关心的修改（关闭文件、信号量的 undo、发信号）各自请求唤醒。
+/// Process `tgid` has ended: wakes the threads waiting for children, and the host too if it is
+/// waiting for it. The other waiters need not wake: the changes they care about (closing files,
+/// semaphore undo, sending signals) each request their own wake-ups.
 fn finished(k: &Kernel, tgid: Tid) {
     let watched = k.watched.contains_key(&tgid);
     request_wake_on(wake::CHILD | if watched { wake::WATCHED } else { 0 });
 }
 
-/// 跟踪者取走了结束了的进程 `group`（或者没取走就退出了）：交给父进程，与 Linux 的
-/// `wait_task_zombie`、`__ptrace_detach` 对僵尸进程的处理一样（[`crate::ptrace`]）。
+/// The tracer has taken the ended process `group` (or exited without taking it): hands it to the
+/// parent, the same as what Linux's `wait_task_zombie` and `__ptrace_detach` do with zombies
+/// ([`crate::ptrace`]).
 pub(crate) fn tracer_released(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     let (ids, status) = {
         let mut g = group.borrow_mut();
@@ -851,8 +894,9 @@ pub(crate) fn tracer_released(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) 
     request_wake_on(wake::CHILD);
 }
 
-/// 退出的进程（`tgid`、`ppid`、`exit_signal`）交给父进程：父进程是 init、已经不在了，
-/// 或者忽略 SIGCHLD（SIG_IGN、SA_NOCLDWAIT）时直接回收，否则变成僵尸进程并通知父进程。
+/// Hands an exited process (`tgid`, `ppid`, `exit_signal`) to its parent: when the parent is
+/// init, is gone, or ignores SIGCHLD (SIG_IGN, SA_NOCLDWAIT), the process is reaped directly;
+/// otherwise it becomes a zombie and the parent is notified.
 fn hand_to_parent(
     k: &mut Kernel,
     group: &Rc<RefCell<ThreadGroup>>,
@@ -881,10 +925,12 @@ fn hand_to_parent(
     }
 }
 
-/// 会话组长退出：控制终端不再属于这个会话，前台进程组收到 SIGHUP 和 SIGCONT
-/// （Linux 的 `disassociate_ctty`）。控制终端已经挂断了的，发给挂断时的前台进程组：
-/// tmux 的窗口关掉时，`sh -c` 起的命令和不 exec 的 sh（dash）在同一个进程组里，组长 sh
-/// 收到 SIGHUP 退出时它们收到 SIGHUP。
+/// The session leader exits: the controlling terminal no longer belongs to this session, and the
+/// foreground process group gets SIGHUP and SIGCONT (Linux's `disassociate_ctty`). If the
+/// controlling terminal has already hung up, they go to the foreground process group at hangup:
+/// when a tmux window is closed, a command started by `sh -c` is in the same process group as an
+/// sh that does not exec (dash), and when the group leader sh gets SIGHUP and exits, they get
+/// SIGHUP.
 fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     let (tgid, sid, ctty, old_pgrp) = {
         let mut g = group.borrow_mut();
@@ -920,29 +966,34 @@ fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
     }
 }
 
-/// 进程正在执行的程序文件（Linux 的 `mm->exe_file`）：`/proc/<pid>/exe` 读出来是它的路径，
-/// 跟随时直接到这个文件，不按路径重新解析。程序文件改了名、被删除或者被换掉（dpkg 升级
-/// 时用 rename 换掉正在运行的程序）之后，经由 exe 打开、执行的仍是原来那个。fork 共用，
-/// execve 换掉。
+/// The program file a process is executing (Linux's `mm->exe_file`): reading `/proc/<pid>/exe`
+/// gives its path, and following it leads straight to this file without resolving the path
+/// again. After the program file is renamed, deleted or replaced (dpkg upgrades replace running
+/// programs with rename), what is opened or executed through exe is still the original. Shared
+/// by fork, replaced by execve.
 pub struct ExeFile {
-    /// 执行时的绝对路径，符号链接全部解析：musl 按它展开主程序的 `$ORIGIN`，经由
-    /// /usr/bin/java 这种链接启动的程序靠它找到自己的库。
+    /// The absolute path at execution, with all symbolic links resolved: musl expands the main
+    /// program's `$ORIGIN` from it, and programs started through a link such as /usr/bin/java rely
+    /// on it to find their libraries.
     pub path: Rc<[u8]>,
-    /// 经由的挂载和仓库里的 inode；开发用的宿主文件（没有仓库）时是 None，按路径跟随。
+    /// The mount passed through and the inode in the store; None for a host file used in
+    /// development (no store), which is followed by path.
     pub node: Option<(MountId, Ino)>,
-    /// 最后经过的目录和名字：经由 exe 执行的程序的路径按它算（[`Pseudo::follow_dentry`]）。
+    /// The last directory passed through and the name: the path of a program executed through exe
+    /// is computed from it ([`Pseudo::follow_dentry`]).
     pub dentry: Option<Dentry>,
-    /// 打开着的宿主文件（仓库里的 object）：程序文件被删除之后 object 也删掉了，重新打开、
-    /// 执行靠它（[`open_exe_file`]）。
+    /// The open host file (the object in the store): after the program file is deleted the object
+    /// is deleted too, and reopening or executing relies on it ([`open_exe_file`]).
     pub host: Option<Arc<File>>,
 }
 
 impl ExeFile {
-    /// 刚执行的程序 `file`（仓库里的 inode `ino`）。`walked` 是按执行时的路径重新走一遍
-    /// 得到的节点和最后经过的目录项（[`Vfs::walk`]）；走不通时（经由 fd 执行已经删除的
-    /// 文件）用打开的节点 `opened`（执行的是脚本时没有：程序是解释器）。经由别的进程的
-    /// exe 执行已经删除的程序时（[`crate::pseudo::PseudoNode::OpenExe`]），挂载和 inode
-    /// 沿用那个进程的 `from`。
+    /// The just-executed program `file` (inode `ino` in the store). `walked` is the node and the
+    /// last directory entry obtained by walking the path at execution again ([`Vfs::walk`]); when
+    /// that fails (executing a deleted file through an fd), the opened node `opened` is used
+    /// (absent when a script was executed: the program is the interpreter). When a deleted program
+    /// is executed through another process's exe ([`crate::pseudo::PseudoNode::OpenExe`]), the
+    /// mount and inode are taken over from that process's `from`.
     pub(crate) fn new(
         path: Rc<[u8]>,
         walked: Option<(Node, Option<Dentry>)>,
@@ -967,9 +1018,9 @@ impl ExeFile {
     }
 }
 
-/// 已经删除的程序文件（`/proc/<pid>/exe` 跟随之后得到的
-/// [`crate::pseudo::PseudoNode::OpenExe`]）：经由记着的宿主文件打开，检查与 [`open_node`]
-/// 相同。
+/// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following
+/// `/proc/<pid>/exe`): opened through the recorded host file, with the same checks as
+/// [`open_node`].
 pub(crate) fn open_exe_file(
     vfs: &Vfs,
     cred: &Cred,
@@ -994,10 +1045,11 @@ pub(crate) fn open_exe_file(
     Ok((Executable::open(file)?, st, nosuid))
 }
 
-/// 经由打开着的文件执行（fexecve、execveat 的 `AT_EMPTY_PATH`、`/proc/<pid>/fd/<n>`）：用
-/// 它的宿主文件，已经删除的文件和 memfd 的 object 都不在了，按 inode 打不开。检查与
-/// [`open_node`] 相同，noexec、nosuid 按打开它时经由的挂载（memfd 不经由挂载）。不是
-/// 普通文件是 EACCES。
+/// Executing through an open file (fexecve, execveat's `AT_EMPTY_PATH`, `/proc/<pid>/fd/<n>`):
+/// uses its host file, because the objects of deleted files and of memfds are gone and cannot be
+/// opened by inode. The checks are the same as [`open_node`], with noexec and nosuid taken from
+/// the mount it was opened through (a memfd goes through no mount). A file that is not regular
+/// is EACCES.
 pub(crate) fn open_open_file(
     vfs: &Vfs,
     cred: &Cred,
@@ -1026,8 +1078,9 @@ pub(crate) fn open_open_file(
     Ok((Executable::open(file)?, st, nosuid))
 }
 
-/// 按 execve 的规则打开 guest 文件：必须是仓库里的普通文件，凭据为 `cred` 的进程
-/// 有执行权限。同时返回文件的元数据（setuid、setgid 位）。
+/// Opens a guest file by the rules of execve: it must be a regular file in the store, and a
+/// process with credentials `cred` must have execute permission. Also returns the file's
+/// metadata (setuid and setgid bits).
 pub(crate) fn open_executable(
     vfs: &Vfs,
     ps: &dyn Pseudo,
@@ -1039,9 +1092,10 @@ pub(crate) fn open_executable(
     open_node(vfs, cred, &vfs.resolve(ps, cred, root, cwd, path, true)?)
 }
 
-/// 打开要执行的文件 `node`（execveat 已经解析好的路径或者 fd）。没有跟随的符号链接
-/// 是 ELOOP（`AT_SYMLINK_NOFOLLOW`），noexec 的挂载里的是 EACCES（Linux 的 `path_noexec`）。
-/// 第三项是它在 nosuid 的挂载里：setuid、setgid 位和文件能力不起作用。
+/// Opens the file `node` to execute (a path or fd execveat has already resolved). An unfollowed
+/// symbolic link is ELOOP (`AT_SYMLINK_NOFOLLOW`), and one on a noexec mount is EACCES (Linux's
+/// `path_noexec`). The third item is whether it is on a nosuid mount: setuid and setgid bits and
+/// file capabilities then have no effect.
 pub(crate) fn open_node(
     vfs: &Vfs,
     cred: &Cred,
@@ -1065,7 +1119,7 @@ pub(crate) fn open_node(
     Ok((vfs.executable(ino)?, st, nosuid))
 }
 
-/// [`open_executable`]，只要文件本身。
+/// [`open_executable`], keeping only the file itself.
 pub(crate) fn read_executable(
     vfs: &Vfs,
     ps: &dyn Pseudo,
@@ -1077,7 +1131,7 @@ pub(crate) fn read_executable(
     open_executable(vfs, ps, cred, root, cwd, path).map(|(file, ..)| file)
 }
 
-/// 程序路径的最后一个组件，截到 15 字节（`comm`）。
+/// The last component of a program path, truncated to 15 bytes (`comm`).
 pub(crate) fn comm_of(path: &[u8]) -> [u8; 16] {
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
     let n = name.len().min(15);

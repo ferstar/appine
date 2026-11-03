@@ -1,16 +1,17 @@
-//! 内置 init 执行 `/etc/inittab` 的一个子集（kernel/process 的 map）：开机时的 `sysinit`、`boot`、
-//! `bootwait`、`wait`、`once`，关机时的 `shutdown`（busybox 的格式）和 0、6 运行级别的
-//! `wait`、`once`（sysvinit 的格式）。Alpine 的 inittab 由这几步运行 OpenRC，Debian 的
-//! sysvinit-core 运行 `/etc/init.d/rc`。没有终端，`respawn`、`askfirst`（getty）不运行：
-//! 登录 shell 是 App 的标签页。
+//! The built-in init runs a subset of `/etc/inittab` (the kernel/process map): `sysinit`, `boot`,
+//! `bootwait`, `wait` and `once` at boot, and at shutdown `shutdown` (busybox format) and the
+//! `wait` and `once` entries of runlevels 0 and 6 (sysvinit format). Alpine's inittab runs OpenRC
+//! through these steps, and Debian's sysvinit-core runs `/etc/init.d/rc`. There is no terminal, so
+//! `respawn` and `askfirst` (getty) never run: login shells are the app's tabs.
 //!
-//! 每一项由 `/bin/sh -c` 执行（busybox init 遇到 shell 的特殊字符时也这样做），stdin 是
-//! `/dev/null`，stdout、stderr 写到 [`LOG`]：appine 没有控制台。
+//! Each entry is run by `/bin/sh -c` (as busybox init also does when it meets shell special
+//! characters), with stdin `/dev/null` and stdout and stderr written to [`LOG`]: appine has no
+//! console.
 
-/// 开机、关机时 inittab 里的命令的输出。每次开机时清空。
+/// Output of the inittab commands at boot and shutdown. Truncated at every boot.
 pub const LOG: &str = "/var/log/boot.log";
 
-/// inittab 里的命令的环境变量，与 busybox init 设的相同。
+/// Environment variables of the inittab commands, the same as busybox init sets.
 pub(crate) const ENV: [&[u8]; 5] = [
     b"HOME=/",
     b"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
@@ -19,8 +20,8 @@ pub(crate) const ENV: [&[u8]; 5] = [
     b"TERM=linux",
 ];
 
-/// 关机的方式：busybox 的 reboot、halt、poweroff 不带 `-f` 时给 1 号进程发 SIGTERM、
-/// SIGUSR1、SIGUSR2，由 init 运行关机的命令、结束所有进程。
+/// How to shut down: busybox's reboot, halt and poweroff without `-f` send SIGTERM, SIGUSR1 and
+/// SIGUSR2 to process 1, and init runs the shutdown commands and ends every process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Power {
     Reboot,
@@ -29,7 +30,7 @@ pub enum Power {
 }
 
 impl Power {
-    /// busybox init 的信号处理：SIGTERM 重启，SIGUSR1 停机，SIGUSR2 关机。
+    /// busybox init's signal handling: SIGTERM reboots, SIGUSR1 halts, SIGUSR2 powers off.
     pub(crate) fn from_signal(sig: crate::process::Signal) -> Option<Power> {
         use crate::process::Signal;
         match sig {
@@ -40,7 +41,7 @@ impl Power {
         }
     }
 
-    /// sysvinit 的运行级别：停机、关机是 0，重启是 6。
+    /// sysvinit runlevels: halt and poweroff are 0, reboot is 6.
     fn runlevel(self) -> u8 {
         match self {
             Power::Reboot => b'6',
@@ -49,8 +50,9 @@ impl Power {
     }
 }
 
-/// inittab 的一项：`id:runlevels:action:process`。busybox 的格式里第一列是终端、第二列
-/// 总是空的；sysvinit 的格式第二列是运行级别，空的表示所有运行级别。
+/// One inittab entry: `id:runlevels:action:process`. In busybox format the first column is the
+/// terminal and the second is always empty; in sysvinit format the second column is the
+/// runlevels, and empty means all runlevels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub runlevels: Vec<u8>,
@@ -63,13 +65,14 @@ impl Entry {
         self.action == action
     }
 
-    /// 属于运行级别 `level`：没写运行级别的属于所有运行级别。
+    /// Belongs to runlevel `level`: an entry without runlevels belongs to all of them.
     fn in_level(&self, level: u8) -> bool {
         self.runlevels.is_empty() || self.runlevels.contains(&level)
     }
 }
 
-/// 解析 inittab：`#` 开头的行和空行跳过，少于四列的跳过；第四列（命令）可以含 `:`。
+/// Parses inittab: lines starting with `#` and empty lines are skipped, as are lines with fewer
+/// than four columns; the fourth column (the command) may contain `:`.
 pub(crate) fn parse(text: &[u8]) -> Vec<Entry> {
     text.split(|&b| b == b'\n')
         .filter_map(|line| {
@@ -91,16 +94,17 @@ pub(crate) fn parse(text: &[u8]) -> Vec<Entry> {
         .collect()
 }
 
-/// 开机时依次运行的命令和要不要等它结束：先是 `sysinit`，然后 `boot`、`bootwait`，
-/// 然后默认运行级别（`initdefault` 的，没有时是 2）的 `wait`，最后是它的 `once`（与
-/// busybox init 的顺序相同：所有 `wait` 在所有 `once` 之前）。
+/// The commands run in order at boot and whether to wait for each to finish: first `sysinit`, then
+/// `boot` and `bootwait`, then the `wait` entries of the default runlevel (`initdefault`'s, 2 if
+/// none), and finally its `once` entries (the same order as busybox init: every `wait` before every
+/// `once`).
 pub(crate) fn boot_plan(entries: &[Entry]) -> Vec<(Vec<u8>, bool)> {
     let level = entries
         .iter()
         .find(|e| e.is(b"initdefault"))
         .and_then(|e| e.runlevels.first().copied())
         .unwrap_or(b'2');
-    // 每一步：这一项属于它时，要不要等它结束
+    // Each step: whether to wait for an entry that belongs to it
     type Phase<'a> = &'a dyn Fn(&Entry) -> Option<bool>;
     let phases: [Phase; 4] = [
         &|e| e.is(b"sysinit").then_some(true),
@@ -119,8 +123,9 @@ pub(crate) fn boot_plan(entries: &[Entry]) -> Vec<(Vec<u8>, bool)> {
     plan
 }
 
-/// 关机时依次运行的命令（都等它结束）：busybox 格式的 `shutdown`，以及 sysvinit 格式里
-/// 写明了运行级别 0（停机、关机）或者 6（重启）的 `wait`、`once`。
+/// The commands run in order at shutdown (each waited for): busybox-format `shutdown` entries,
+/// and sysvinit-format `wait` and `once` entries that name runlevel 0 (halt, poweroff) or 6
+/// (reboot).
 pub(crate) fn shutdown_plan(entries: &[Entry], power: Power) -> Vec<Vec<u8>> {
     let level = power.runlevel();
     entries
@@ -136,15 +141,16 @@ pub(crate) fn shutdown_plan(entries: &[Entry], power: Power) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// 命令的程序（第一个词）：绝对路径时返回它，用来跳过没有安装的（Alpine 的 inittab 里有
-/// `/sbin/openrc`，没装 OpenRC 时不必每次开机都起一个 shell 报错）。
+/// The command's program (its first word): returned when it is an absolute path, used to skip
+/// programs that are not installed (Alpine's inittab has `/sbin/openrc`; without OpenRC
+/// installed, no shell need start and fail at every boot).
 pub(crate) fn program(process: &[u8]) -> Option<&[u8]> {
     let word = process.split(|b| b.is_ascii_whitespace()).next()?;
     word.starts_with(b"/").then_some(word)
 }
 
-/// 由 `/bin/sh -c` 执行的脚本：stdin 是 `/dev/null`，输出接到 [`LOG`]（`first` 时先清空），
-/// 再 `exec` 命令。`/var/log` 不在时输出丢掉。
+/// The script run by `/bin/sh -c`: stdin is `/dev/null`, output goes to [`LOG`] (truncated first
+/// when `first`), then the command is `exec`ed. Output is discarded when `/var/log` is missing.
 pub(crate) fn script(process: &[u8], first: bool) -> Vec<u8> {
     let redirect = if first { ">" } else { ">>" };
     let mut s = format!(

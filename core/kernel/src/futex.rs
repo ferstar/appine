@@ -1,11 +1,14 @@
-//! futex 的等待队列（kernel/process 的 map）。键是翻译后的宿主地址，所以 fork 之后共用同一段
-//! 宿主内存的进程能互相唤醒；文件的共享映射以宿主文件和偏移为键，因为各个进程分别
-//! 映射同一个文件（`sem_open` 的 `/dev/shm` 文件）时宿主地址各不相同。
+//! Futex wait queues (the kernel/process map). Keys are translated host addresses, so processes
+//! that share one piece of host memory after fork can wake each other; shared file mappings are
+//! keyed by host file and offset, because processes that each map the same file (the `/dev/shm`
+//! file of `sem_open`) see different host addresses.
 //!
-//! 等待者登记在队列里，然后等待；被唤醒的等待者从队列里移除，它重新检查时发现自己
-//! 不在队列里了，就知道是被 FUTEX_WAKE 唤醒的。唤醒只通知被唤醒的那几个线程（登记时
-//! 记下了它们的事件），不像别的等待那样叫醒所有在等的线程：JVM、Go 运行时里停在锁和
-//! 条件变量上的线程很多，别处的每次修改都把它们全部叫醒一遍，代价很大。
+//! A waiter registers in the queue and then waits; a woken waiter is removed from the queue, and
+//! when it re-checks and finds itself no longer in the queue it knows it was woken by FUTEX_WAKE.
+//! A wake notifies only the threads it wakes (their events were recorded when they registered),
+//! unlike other waits, which wake every waiting thread: the JVM and the Go runtime have many
+//! threads parked on locks and condition variables, and waking all of them on every change
+//! elsewhere would be costly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,12 +20,12 @@ use crate::kernel::Shared;
 use crate::mm::Mm;
 use crate::uaccess::UserSlice;
 
-/// futex 的键（[`crate::mm::Mm::futex_key`]）。
+/// A futex key ([`crate::mm::Mm::futex_key`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Key {
-    /// 宿主地址。
+    /// Host address.
     Host(usize),
-    /// 宿主文件（设备号、inode）里的偏移。
+    /// Offset in a host file (device number, inode).
     File { dev: u64, ino: u64, offset: u64 },
 }
 
@@ -30,11 +33,11 @@ struct Entry {
     id: u64,
     key: Key,
     bitset: u32,
-    /// 等待线程的事件（[`crate::task::Task::event`]）。
+    /// The waiting thread's event ([`crate::task::Task::event`]).
     event: Arc<Event>,
 }
 
-/// 所有 futex 等待者，按登记顺序排列（唤醒时先到先得）。
+/// All futex waiters, in registration order (first come, first served on wake).
 #[derive(Default)]
 pub(crate) struct Futexes {
     next_id: u64,
@@ -42,8 +45,8 @@ pub(crate) struct Futexes {
 }
 
 impl Futexes {
-    /// 登记一个等待者，返回它的编号。`event` 是唤醒它时要通知的事件；等待者要用
-    /// [`crate::kernel::Cx::wait_alone`] 等待。
+    /// Registers a waiter and returns its id. `event` is the event to signal when it is woken; the
+    /// waiter must wait with [`crate::kernel::Cx::wait_alone`].
     pub fn enqueue(&mut self, key: Key, bitset: u32, event: Arc<Event>) -> u64 {
         self.next_id += 1;
         self.waiting.push(Entry {
@@ -55,17 +58,18 @@ impl Futexes {
         self.next_id
     }
 
-    /// 等待者是否还在队列里（不在就是已经被唤醒）。
+    /// Whether the waiter is still queued (if not, it has already been woken).
     pub fn is_queued(&self, id: u64) -> bool {
         self.waiting.iter().any(|e| e.id == id)
     }
 
-    /// 移除等待者（超时、被信号打断）。
+    /// Removes a waiter (timed out, interrupted by a signal).
     pub fn remove(&mut self, id: u64) {
         self.waiting.retain(|e| e.id != id);
     }
 
-    /// 唤醒最多 `n` 个等在 `key` 上、bitset 有交集的等待者，返回唤醒的个数。
+    /// Wakes at most `n` waiters on `key` with an intersecting bitset, and returns how many were
+    /// woken.
     pub fn wake(&mut self, key: Key, n: u32, bitset: u32) -> u32 {
         let mut woken = 0;
         self.waiting.retain(|e| {
@@ -80,8 +84,8 @@ impl Futexes {
         woken
     }
 
-    /// FUTEX_REQUEUE：唤醒 `key` 上最多 `n_wake` 个等待者，再把最多 `n_requeue` 个
-    /// 移到 `key2` 上。返回唤醒和移动的总数。
+    /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue` more
+    /// to `key2`. Returns the total woken and moved.
     pub fn requeue(&mut self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
         let woken = self.wake(key, n_wake, u32::MAX);
         let mut moved = 0;
@@ -96,10 +100,11 @@ impl Futexes {
     }
 }
 
-/// 登记在队列里的等待者（[`Futexes::enqueue`]），等完了用 [`Enqueued::leave`] 离开。中途
-/// panic（内核层的 bug，[`crate::bug`]）时析构把还在队列里的移除：留下的条目没有人等，之后
-/// 的一次 FUTEX_WAKE 会算在它身上，真正的等待者就叫不醒了；键是宿主地址时，那段内存以后
-/// 还可能分给别的进程。
+/// Waiters registered in the queue ([`Futexes::enqueue`]); when done waiting they leave with
+/// [`Enqueued::leave`]. On a panic midway (a kernel-layer bug, [`crate::bug`]) the destructor
+/// removes those still queued: a leftover entry has nobody waiting on it, a later FUTEX_WAKE
+/// would count against it, and the real waiter would not be woken; when the key is a host
+/// address, that memory may later be given to another process.
 pub(crate) struct Enqueued<'s, I: AsRef<[u64]>> {
     shared: &'s Shared,
     ids: I,
@@ -115,14 +120,14 @@ impl<'s, I: AsRef<[u64]>> Enqueued<'s, I> {
         }
     }
 
-    /// 登记的编号。
+    /// The registered ids.
     pub fn ids(&self) -> &[u64] {
         self.ids.as_ref()
     }
 
-    /// 离开队列：在同一次持锁里移除还在队列里的，返回第一个已经不在队列里（被唤醒了）的
-    /// 下标。被唤醒与超时、被信号打断同时发生时算唤醒，与 Linux 的 `futex_unqueue` 一样，
-    /// 这次唤醒不会丢。
+    /// Leaves the queue: in the same lock hold, removes those still queued and returns the index of
+    /// the first one no longer queued (woken). A wake that coincides with a timeout or a signal
+    /// interruption counts as a wake, as in Linux's `futex_unqueue`, so that wake is not lost.
     pub fn leave(mut self) -> Option<usize> {
         self.left = true;
         let mut futexes = self.shared.futexes();
@@ -152,12 +157,13 @@ impl<I: AsRef<[u64]>> Drop for Enqueued<'_, I> {
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
-/// 最多处理的链表项（`ROBUST_LIST_LIMIT`），防止 guest 构造出环。
+/// The most list entries processed (`ROBUST_LIST_LIMIT`), against a cycle built by the guest.
 const ROBUST_LIST_LIMIT: usize = 2048;
 
-/// 线程退出或 execve 时处理它的 robust futex 链表（set_robust_list），与 Linux 的
-/// `exit_robust_list` 相同：它还持有的锁标上 `FUTEX_OWNER_DIED`，有等待者时唤醒一个，
-/// 等待者因此拿到 EOWNERDEAD。`head` 是 `struct robust_list_head` 的地址。
+/// Processes a thread's robust futex list (set_robust_list) when it exits or calls execve, the
+/// same as Linux's `exit_robust_list`: locks it still holds are marked `FUTEX_OWNER_DIED`, and if
+/// there are waiters one is woken, which thereby gets EOWNERDEAD. `head` is the address of the
+/// `struct robust_list_head`.
 pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u32) {
     if head == 0 {
         return;
@@ -168,7 +174,7 @@ pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u
             .ok()
             .map(|()| u64::from_le_bytes(b))
     };
-    // 链表项的最低位表示 PI futex
+    // The lowest bit of a list entry marks a PI futex
     let (Some(mut entry), Some(offset), Some(pending)) =
         (word(head), word(head + 8), word(head + 16))
     else {
@@ -181,7 +187,7 @@ pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u
         let Some(next) = word(entry & !1) else {
             return;
         };
-        // 正在加锁或解锁的那一项最后单独处理
+        // The entry being locked or unlocked is handled separately at the end
         if entry & !1 != pending & !1 {
             owner_died(
                 futexes,
@@ -200,9 +206,9 @@ pub(crate) fn exit_robust_list(futexes: &mut Futexes, mm: &Mm, head: u64, tid: u
     }
 }
 
-/// Linux 的 `handle_futex_death`：`addr` 处的锁由 `tid` 持有时标上 `FUTEX_OWNER_DIED`
-/// （保留 `FUTEX_WAITERS`），有等待者就唤醒一个。别的线程可能正在 guest 代码里用原子
-/// 操作改它，所以用比较交换。
+/// Linux's `handle_futex_death`: if the lock at `addr` is held by `tid`, marks it
+/// `FUTEX_OWNER_DIED` (keeping `FUTEX_WAITERS`), and wakes one waiter if there are any. Other
+/// threads may be changing it with atomic operations in guest code, so a compare-and-swap is used.
 fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pending: bool) {
     if !addr.is_multiple_of(4) {
         return;
@@ -210,7 +216,7 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     let Some(host) = mm.translate(addr, prot::READ | prot::WRITE) else {
         return;
     };
-    // SAFETY: 4 字节对齐、可写的 guest 内存，宿主内存由地址空间持有
+    // SAFETY: 4-byte-aligned, writable guest memory; the host memory is held by the address space
     let lock = unsafe { AtomicU32::from_ptr(host.as_ptr().cast()) };
     let mut cur = lock.load(Ordering::SeqCst);
     let wake = |futexes: &mut Futexes| {
@@ -218,7 +224,8 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
             futexes.wake(key, 1, u32::MAX);
         }
     };
-    // 解锁之后、唤醒等待者之前退出的：锁已经是 0，直接唤醒一个，免得它们永远等下去
+    // Exited after unlocking but before waking the waiters: the lock is already 0, so wake one
+    // directly, lest they wait forever
     if pending && !pi && cur == 0 {
         wake(futexes);
         return;
@@ -271,7 +278,7 @@ mod tests {
         let d = f.enqueue(k2, u32::MAX, event());
         assert_eq!(f.wake(k1, 1, 0b01), 1);
         assert!(!f.is_queued(a) && f.is_queued(b));
-        // 只通知被唤醒的那个线程
+        // Only the woken thread is notified
         assert!(signaled(&ea) && !signaled(&eb));
         assert_eq!(f.requeue(k1, 1, k2, 5), 2);
         assert!(!f.is_queued(b) && f.is_queued(c));
