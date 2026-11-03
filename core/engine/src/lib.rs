@@ -1,6 +1,6 @@
 //! appine 引擎（C 实现）的 Rust 绑定。
 //!
-//! 引擎负责执行 guest 指令和 soft-MMU 快速路径（设计文档 §4、kernel/mm 的 map）。内核层用
+//! 引擎负责执行 guest 指令和 soft-MMU 快速路径（engine 和 kernel/mm 的 map）。内核层用
 //! [`Cpu::run`] 驱动执行，再根据返回的 [`Exit`] 处理 syscall、异常等事件。
 
 use std::ffi::{c_int, c_uint, c_void};
@@ -601,7 +601,7 @@ impl Drop for Cpu {
     }
 }
 
-/// Tier 1 的翻译与运行统计（设计文档 §4.2）。
+/// Tier 1 的翻译与运行统计（engine 的 map）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DbtStats {
@@ -834,7 +834,7 @@ pub fn install_fault_guard() {
     unsafe { appine_fault_guard_install() }
 }
 
-/// 宣告给 guest 的 `AT_HWCAP`：宿主支持 ∩ Tier 0 已实现 ∩ 白名单（设计文档 §4.4）。
+/// 宣告给 guest 的 `AT_HWCAP`：宿主支持 ∩ Tier 0 已实现 ∩ 白名单（engine 的 map）。
 pub fn guest_hwcap() -> u64 {
     unsafe { appine_guest_hwcap() }
 }

@@ -1,11 +1,11 @@
 /*
- * Tier 0 解释器（设计文档 §4.2）。
+ * Tier 0 解释器（engine 的 map）。
  *
  * 覆盖范围：整数数据处理（立即数、寄存器，含 FlagM 的 RMIF、SETF）、CRC32、分支、
  * svc/brk、hint 与屏障（含 SB）、CFINV/XAFLAG/AXFLAG、MSR DIT、
  * NZCV/TPIDR_EL0/TPIDRRO_EL0/FPCR/FPSR/DIT 与 ID 寄存器、整数 load/store
  * （立即数、寄存器偏移、literal、pair）。SIMD&FP 在 simd.c，独占访问与原子
- * 操作在 atomic.c。其余编码一律按未定义指令上报，与 §4.4 的白名单原则一致：
+ * 操作在 atomic.c。其余编码一律按未定义指令上报，与 engine 的 map 里的白名单原则一致：
  * 没实现的就不执行。
  *
  * 约定：执行函数返回 APPINE_EXIT_NONE 表示继续；出错时 pc 保持不变，并且
@@ -677,7 +677,7 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         return next(c);
 #endif
     default: {
-        uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（§4.4） */
+        uint64_t id; /* ID 寄存器空间，与 HWCAP 一致（engine 的 map） */
         if (read && appine_has(APPINE_HWCAP_CPUID) && appine_id_register(FIELD(insn, 20, 5), &id)) {
             wx(c, rt, id);
             return next(c);
@@ -753,7 +753,7 @@ static enum appine_exit branch_sys(cpu_t *c, uint32_t insn)
         c->exit_info = FIELD(insn, 20, 5);
         return APPINE_EXIT_BRK;
     }
-    if ((insn & 0xfffff01f) == 0xd503201f) /* HINT：NOP、YIELD、PAC/BTI 系列一律当 NOP（§4.4） */
+    if ((insn & 0xfffff01f) == 0xd503201f) /* HINT：NOP、YIELD、PAC/BTI 系列一律当 NOP（engine 的 map） */
         return next(c);
     if ((insn & 0xfffff01f) == 0xd503301f) { /* 屏障 */
         switch (FIELD(insn, 7, 5)) {

@@ -1,4 +1,4 @@
-//! Tier 0 的指令白名单与 LLVM 反汇编器逐条对照（设计文档 §4.4）。
+//! Tier 0 的指令白名单与 LLVM 反汇编器逐条对照（engine 的 map）。
 //!
 //! 需要 Linux aarch64 宿主和 llvm-mc（`APPINE_LLVM_MC` 或 PATH 中的 llvm-mc），
 //! 缺少任何一个时跳过。样本数可以用 `APPINE_WHITELIST_SAMPLES` 调整。

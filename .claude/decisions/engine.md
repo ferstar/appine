@@ -1,0 +1,133 @@
+# CPU engine (engine) Decisions
+> Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
+> Last distilled: 2026-11-03 (HEAD = cd53f35) — seeded by hand from the retired design doc §4 and
+> the round records in `docs/rounds/`; no `MODULE: engine` Decision blocks exist yet, so sources
+> cite rounds instead of commits.
+
+## Active
+
+### D1: The guest ISA is aarch64, the same as the host
+- **What**: appine runs Alpine's official aarch64 binaries and translates aarch64 to aarch64.
+- **Why**: Guest and host share ARM's weak memory model (no TSO translation), most instructions can be copied verbatim, and arm64 requires `ic ivau` plus `isb` after modifying code, which gives a free invalidation hook without write-protecting code pages.
+- **Tradeoffs**: Only aarch64 guests, and the engine's fast paths only work on aarch64 hosts.
+- **Watch out**: Relying on `ic ivau` requires CTR_EL0 to report DIC = IDC = 0.
+- **Source**: design review 2026-10-24 (§4.1)
+
+### D2: Two tiers, with Tier 0 as the semantic reference
+- **What**: An interpreter handles cold code, single-stepping and anything Tier 1 does not translate; Tier 1 copies or translates only encodings Tier 0 accepts.
+- **Why**: Both tiers must give identical results for every instruction, and the interpreter is the simplest place to define that behaviour.
+- **Tradeoffs**: Every new instruction or extension must be implemented in Tier 0 first.
+- **Watch out**: The whitelist must be shared; Tier 1 asks Tier 0 (or its SIMD decoder) about each encoding.
+- **Source**: design review 2026-10-24, rounds 01 (`01-m2`), 02 (`02-m1a`), 09 (`09-m7`)
+
+### D3: Tier 0 uses nested-switch decoding, not threaded dispatch
+- **What**: Tier 0 decodes each instruction with mask tests and `switch` on encoding fields.
+- **Why**: With Tier 1 in place, Tier 0's speed barely affects overall performance.
+- **Tradeoffs**: Tier 0 alone is very slow (relevant if Tier 1 is unavailable on a host).
+- **Watch out**: Workloads stuck in Tier 0 (breakpoints, watchpoints, poisoned instances) run much slower.
+- **Source**: design review 2026-10-24 (§4.2)
+
+### D4: SIMD/FP, CRC32 and LSE run in Tier 0 as native single-instruction stubs
+- **What**: C does the whitelist check, address translation and register moves; a cached host stub executes the same instruction.
+- **Why**: Results are bit-identical to hardware (NaN propagation, rounding, FZ/DN, FPSR flags) without reimplementing floating point.
+- **Tradeoffs**: Tier 0 is no longer independent of the hardware for SIMD/FP, needs executable memory (Android allows JIT), and only works on aarch64 Linux hosts.
+- **Watch out**: Without native stubs no SIMD/FP (or other implemented) feature can be advertised.
+- **Source**: rounds 02 (`02-m1a`), 09 (`09-m7`)
+
+### D5: Exclusives are emulated as value compare-and-swap in both tiers
+- **What**: LDXR records address, size and value; STXR does a compare-and-swap against the recorded value on the host address.
+- **Why**: Extra memory accesses (TLB lookups) between `ldxr` and `stxr` can clear the host's exclusive monitor and livelock, and recognizing whole LL/SC sequences is unnecessary; musl hard-codes `ldaxr`/`stlxr`, so LL/SC must work even when LSE is advertised.
+- **Tradeoffs**: ABA is allowed (as in QEMU), harmless for correct LL/SC use.
+- **Watch out**: Tier 1's `ldaxr`/`stlxr` loop must keep only register operations between the two instructions.
+- **Source**: rounds 01 (`01-m2`), 02 (`02-m1a`), 09 (`09-m7`); risk R4
+
+### D6: Translated code never touches host x18 and never changes NZCV
+- **What**: Guest X18 is always kept in the CPU state, and inserted code uses `cbnz`/`tbnz`/`eor` instead of compares.
+- **Why**: x18 is Android's platform register (ShadowCallStack) and host signal handlers may run at any time; guest NZCV lives in the host's flags.
+- **Tradeoffs**: One more stolen register; inserted sequences are slightly constrained.
+- **Watch out**: Any new emitted sequence must respect both rules.
+- **Source**: round 09 (`09-m7`); risk R6
+
+### D7: Guest SP lives in host X26, and calls use host return prediction
+- **What**: The default register set keeps guest SP in X26; `bl`/`blr` become host calls with a shadow return stack and `ret x30` returns with a host `ret`.
+- **Why**: An SP-based `stp x29, x30, [sp, #-32]!` cost about 14 host instructions and every return went through a jump-cache lookup with millions of misses; SP appears in about one instruction in six and X26 is the least-used callee-saved register in compiled code.
+- **Tradeoffs**: Guest X26 becomes stolen; mismatched returns (longjmp, signals, coroutines) fall back to the jump cache.
+- **Watch out**: The shadow stack is reset whenever the instance is flushed.
+- **Source**: round 15 (`15-sp-return-prediction`)
+
+### D8: Inline TLB check indexes by the last byte and compares with the first
+- **What**: The TLB slot is chosen by the page of the access's last byte and its tag compared with the first byte's page.
+- **Why**: One compare rejects both misses and cross-page accesses, and TLB checks dominated translated code.
+- **Tradeoffs**: Cross-page accesses always take the out-of-line refill routine.
+- **Watch out**: Tier 1 depends on the TLB layout owned by `kernel/mm`.
+- **Source**: rounds 09 (`09-m7`), 23 (`23-tlb-checks`), 30 (`30-translated-access`)
+
+### D9: Blocks continue past conditional branches, but not across calls or jumps
+- **What**: A conditional branch becomes a side exit linked directly to its target block, and translation continues on the fall-through path; blocks still end at unconditional branches and calls.
+- **Why**: Ending at conditional branches produced far more blocks (500k versus 140k in the M7 measurement); continuing across calls and forward jumps (superblocks) gained at most about 2% and needed every return point to be invalidatable, so it was not adopted.
+- **Tradeoffs**: Conditional side exits are patched by rewriting the branch itself.
+- **Watch out**: Conditional branches are not safe to patch concurrently (CMODX), so they are relinked only when one thread is attached.
+- **Source**: rounds 09 (`09-m7`), 31 (`31-superblocks`)
+
+### D10: Same-base accesses in a block share one TLB check
+- **What**: A group leader checks the whole range (up to 512 bytes) and later members use the host base directly.
+- **Why**: Python's interpreter loop spent most of its translated time in TLB checks.
+- **Tradeoffs**: A failing leader must fall back to Tier 0; repeatedly failing leaders are ungrouped.
+- **Watch out**: Members after conditional branches may not execute, so the leader's range may include pages they never touch.
+- **Source**: round 27 (`27-interleaved-checks`)
+
+### D11: PAC hints are NOPs in both tiers, and PAC is not advertised
+- **What**: HINT-space PAC and BTI instructions do nothing; PACA/PACG are never advertised.
+- **Why**: Executing PAC natively in Tier 1 would sign with host keys while Tier 0 can only treat it as a NOP; the tiers must agree.
+- **Tradeoffs**: Guests get no pointer-authentication protection.
+- **Watch out**: Non-hint PAC instructions are undefined (`SIGILL`).
+- **Source**: design review 2026-10-24 (§4.4)
+
+### D12: Guest features are host ∩ implemented ∩ whitelist, checked against LLVM
+- **What**: One computed feature set drives `AT_HWCAP`, `/proc/cpuinfo` and ID-register reads, and the whitelist is sampled against `llvm-mc` decoding.
+- **Why**: Hardware can only tell whether an encoding executes, not whether it belongs to an unadvertised extension.
+- **Tradeoffs**: Extensions are added one at a time; LSE2 and SM3/SM4 are not done (the development machine lacks SM3/SM4, so they cannot be tested).
+- **Watch out**: The `llvm-mc` check runs only on Linux aarch64 and is skipped when `llvm-mc` is missing.
+- **Source**: rounds 02 (`02-m1a`), 133 (`133-asimddp`) to 155 (`155-dit`)
+
+### D13: Threads of an address space share one Tier 1 instance with lock-free lookups
+- **What**: One code cache and translation table per address space; lookups and translation run without the lock, and only installation is locked.
+- **Why**: Multithreaded workloads (JVM, `go build`) paid for per-thread translations and contended on a lock.
+- **Tradeoffs**: Patching must follow CMODX rules (`b`→`b` only while others run), and flushes must wait for every thread to leave translated code.
+- **Watch out**: Table writers may only fill empty slots and write tombstones.
+- **Source**: round 24 (`24-shared-translation`), 72 (`72-table-tombstones`)
+
+### D14: Translations are shared through templates and kept after an address space dies
+- **What**: Every block is stored in a process-global template arena, and dropped instances return to a pool keyed by program, re-checked (or parked) on reuse.
+- **Why**: Each new process re-copied and re-linked common code (600 spawns translated 690k blocks, 99.5% from templates).
+- **Tradeoffs**: Memory for the arena and pooled instances; reuse needs content checks or trusted sources.
+- **Watch out**: A trusted source must really identify its content (version = host object ctime and size).
+- **Source**: rounds 09 (`09-m7`), 14 (`14-spawn-translation`)
+
+### D15: Processes of the same program share one instance (code groups)
+- **What**: Address spaces running the same executable share one instance; blocks in consistent, trusted ranges are shared, others are private to the member that translated them.
+- **Why**: Each process had its own translation cache (four parallel `cc1` used 34–40 MB each); appine has no ASLR, so the same program maps at the same addresses.
+- **Tradeoffs**: Shared blocks never link to private ones; members with diverging layouts leave the group.
+- **Watch out**: The engine trusts the kernel to share only ranges every member maps identically.
+- **Source**: round 108 (`108-shared-translation`); see `kernel/mm` D13
+
+### D16: Go programs use a different stolen register set; V8 and HotSpot keep the default
+- **What**: Programs with a Go build-ID note use X21–X25 (plus X18) as stolen registers; others use X16, X17, X26–X28 (plus X18).
+- **Why**: Go's compiler fixes x28, x27, x26 and x16 for its own use (`go build` 3–5% faster), while V8 and HotSpot only read their fixed registers, so keeping them stolen costs little (switching gained V8 only 2–4%).
+- **Tradeoffs**: Routines and templates exist per register set.
+- **Watch out**: `APPINE_DBT_REGS` overrides the choice for experiments.
+- **Source**: rounds 113 (`113-go-registers`), 124 (`124-v8-hotspot-registers`)
+
+### D17: Code memory is W^X through double mapping, and the written view is dropped periodically
+- **What**: The code cache and native stubs are one shared anonymous region mapped twice (RW and RX) with `mremap`; pages written through the RW view lose their host page-table entries every second.
+- **Why**: W^X without depending on memfd, and the host counts pages touched through both views twice in RSS.
+- **Tradeoffs**: Falls back to RWX where the host refuses; the next write to a dropped page faults it back in.
+- **Watch out**: The OOM measurement must subtract the not-yet-dropped bytes.
+- **Source**: rounds 09 (`09-m7`), 106 (`106-code-cache-rss`)
+
+### D18: Invalidation is by content, and retired blocks forward to their replacement
+- **What**: Only blocks whose guest words changed are retired; a retired block's entry jumps to a forwarding stub, and re-translation patches the old entry to the new block.
+- **Why**: A JIT rewriting one spot should not invalidate other methods' blocks on the same page, and forwarding avoids rewriting every link into the old entry.
+- **Tradeoffs**: Retired code is reclaimed only by a full flush.
+- **Watch out**: Jump-cache entries are not cleared and rely on forwarders.
+- **Source**: rounds 11 (`11-m8-jvm`), 24 (`24-shared-translation`), 35 (`35-jit`)

@@ -329,7 +329,7 @@ class TerminalService : Service() {
         start(if (Rootfs.isReady(this)) null else Rootfs.Distro.ALPINE)
     }
 
-    /** 执行层（设置里选，设计文档 §4）：1 是 Tier 1，0 是解释器。下次启动内核时生效。 */
+    /** 执行层（设置里选，见 engine 的 map）：1 是 Tier 1，0 是解释器。下次启动内核时生效。 */
     val tier: Int get() = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1)
 
     /**

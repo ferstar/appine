@@ -1,5 +1,5 @@
 /*
- * Tier 1：同 ISA 直通式 DBT（设计文档 §4.2）。
+ * Tier 1：同 ISA 直通式 DBT（engine 的 map：`.claude/maps/engine.md`）。
  *
  * 翻译后的代码运行期间的寄存器约定（这里是默认的一组，Go 的程序另用一组，见 struct regs）：
  *   - guest X0–X15、X19–X25、X29、X30 放在同号的宿主寄存器里，guest SP 放在宿主 X26；
@@ -20,7 +20,7 @@
  * （此时指令还没有产生任何副作用）。直接
  * 分支通过块链接直接跳转，间接分支先查跳转缓存。函数调用压影子返回栈，RET 先看
  * 栈顶（emit_call）。Tier 0 不认识的指令同样
- * 交给 Tier 0，保证两层的白名单完全一致（§4.4）。
+ * 交给 Tier 0，保证两层的白名单完全一致（engine 的 map）。
  *
  * 翻译结果不会自己失效，见 appine_dbt_invalidate()。代码缓存按 W^X 双映射。
  */
@@ -78,7 +78,7 @@ _Static_assert(CODE_CACHE_BYTES <= (UINT64_C(128) << 20), "b 的偏移范围");
  * Go 的编译器把 X28 当作当前 goroutine（g）、X27 当作汇编器的临时寄存器、X26 当作闭包的
  * 上下文，函数序言的栈检查用 X16：原生的 `go build` 里 compile 有 15.5% 的执行时间落在用到
  * 默认一组被占用寄存器的指令上（gcc 的 cc1 是 5.2%），而 X19–X25 合计不到 1.5%（寄存器分配
- * 从低号用起）。所以 Go 的程序改占 X21–X25（设计文档 §4.2）。
+ * 从低号用起）。所以 Go 的程序改占 X21–X25（engine 的 map）。
  */
 struct regs {
     unsigned ctx, t0, t1, t2, sp;
@@ -1611,7 +1611,7 @@ static void emit_group(struct xlate *x, const struct memop *lead, uint64_t pc, i
     emit_member(x, lead, g->off[0]);
 }
 
-/* ---- 独占访问、acquire/release、LSE 原子操作（§4.5） ---- */
+/* ---- 独占访问、acquire/release、LSE 原子操作（engine 的 map） ---- */
 
 /*
  * 原子访问的地址，与 Tier 0 的 atomic_target 相同：要求自然对齐（所以不会跨页），
@@ -2049,7 +2049,7 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
 }
 
 /*
- * 询问 Tier 0 是否认识这条指令（§4.4：两层的白名单必须一致）。回答只取决于指令字，按它
+ * 询问 Tier 0 是否认识这条指令（两层的白名单必须一致，见 engine 的 map）。回答只取决于指令字，按它
  * 缓存在 `cache` 里（直接映射，每项是 1 << 40 | 指令字 << 1 | 回答）：Tier 0 要把指令
  * 执行一遍才知道，java 启动时翻译的每条指令都问一次，占了两个百分点。
  */
@@ -2736,7 +2736,7 @@ static void ungroup(struct appine_dbt *d, uint64_t pc)
     retire_flush(d, &r);
 }
 
-/* ---- 翻译模板：所有实例共享（§4.2） ---- */
+/* ---- 翻译模板：所有实例共享（engine 的 map） ---- */
 
 /*
  * 一个块的翻译只取决于它的 guest pc 和翻译过的指令字（以及全局的特性集合、实例的
@@ -3441,7 +3441,7 @@ static void emit_routines(struct appine_dbt *d)
     emit(x, enc_str_x(T1, 31, 104));
     emit(x, enc_mov(CTX, 0));
     emit(x, enc_mov(T0, 1));
-    /* guest 的 FP 状态在翻译后的代码里一直放在宿主寄存器里（§4.3） */
+    /* guest 的 FP 状态在翻译后的代码里一直放在宿主寄存器里（engine 的 map） */
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpcr)));
     emit(x, enc_msr_fpcr(T1));
     emit(x, enc_ldr_x(T1, CTX, offsetof(struct appine_cpu, fpsr)));

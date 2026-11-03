@@ -263,7 +263,7 @@ bool appine_id_register(unsigned key, uint64_t *value);
 /* ---- 原生指令桩（native.c）---- */
 
 /*
- * 原生桩在宿主 CPU 上执行一条 guest 指令（设计文档 §4.2）：通用寄存器字段被
+ * 原生桩在宿主 CPU 上执行一条 guest 指令（engine 的 map）：通用寄存器字段被
  * 换成宿主临时寄存器，执行前从 cpu 结构体读入、执行后写回。fp 为真时还会
  * 载入并写回 V0–V31、FPCR、FPSR 和 NZCV。
  */

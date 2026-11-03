@@ -1,5 +1,5 @@
 /*
- * 独占访问、acquire/release 与 LSE 原子操作（设计文档 §4.5）。
+ * 独占访问、acquire/release 与 LSE 原子操作（engine 的 map）。
  *
  * LDXR/STXR 不能交给宿主原样执行：两条指令之间我们自己的代码会访问内存，
  * 宿主的独占监视器随时可能被清掉，导致 STXR 永远失败。这里改用"比较并交换"

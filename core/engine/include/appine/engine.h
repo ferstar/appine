@@ -1,5 +1,5 @@
 /*
- * appine 引擎的对外接口（设计文档 §4、§13.1，kernel/mm 的 map）。
+ * appine 引擎的对外接口（设计文档 §13.1，engine 和 kernel/mm 的 map）。
  *
  * 引擎只负责执行 guest 指令和 soft-MMU 快速路径。遇到 svc、访存失败、未定义
  * 指令、brk 时，appine_cpu_run() 返回一个退出原因，由内核层（Rust）处理后
@@ -148,7 +148,7 @@ struct appine_cpu {
     struct appine_watch watch[APPINE_HW_SLOTS];
 };
 
-/* ---- guest 可见的 CPU 特性（设计文档 §4.4），取值与 Linux 的 HWCAP_* 一致 ---- */
+/* ---- guest 可见的 CPU 特性（engine 的 map），取值与 Linux 的 HWCAP_* 一致 ---- */
 
 #define APPINE_HWCAP_FP (UINT64_C(1) << 0)
 #define APPINE_HWCAP_ASIMD (UINT64_C(1) << 1)
@@ -274,7 +274,7 @@ int appine_cpu_layout_check(size_t size, size_t off_x, size_t off_pc, size_t off
                             size_t off_pending, size_t off_mmu, size_t off_jump_cache,
                             size_t off_tlb, size_t off_v);
 
-/* ---- Tier 1：同 ISA 直通式 DBT（设计文档 §4.2）---- */
+/* ---- Tier 1：同 ISA 直通式 DBT（engine 的 map）---- */
 
 struct appine_dbt;
 

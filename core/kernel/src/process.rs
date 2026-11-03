@@ -164,7 +164,7 @@ impl ExitStatus {
     }
 }
 
-/// 执行引擎（设计文档 §4.2）。
+/// 执行引擎（engine 的 map）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tier {
     /// Tier 0：解释器。

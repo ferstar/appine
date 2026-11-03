@@ -1,5 +1,5 @@
 /*
- * guest 可见的 CPU 特性（设计文档 §4.4）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
+ * guest 可见的 CPU 特性（engine 的 map）：宿主支持 ∩ Tier 0 已实现 ∩ 白名单。
  * HWCAP、ID 寄存器和 /proc/cpuinfo 都从这同一份集合生成，解码器
  * 也按它决定 AES/SHA/CRC32/LSE/DotProd/I8MM/LRCPC/LRCPC2/FP16/JSCVT/RDM/FHM/FCMA/BF16/
  * FRINTTS/FlagM/FlagM2/SB/DPB/DPB2/DIT 等可选指令是否合法。
@@ -41,7 +41,7 @@ static uint64_t host_midr;
 
 static void detect(void)
 {
-    /* ID 寄存器由我们自己模拟（§4.4），与宿主无关 */
+    /* ID 寄存器由我们自己模拟（engine 的 map），与宿主无关 */
     guest_hwcap = APPINE_HWCAP_CPUID;
 #ifdef HOST_IS_AARCH64_LINUX
     uint64_t host = getauxval(AT_HWCAP);

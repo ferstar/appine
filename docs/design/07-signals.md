@@ -22,7 +22,7 @@
 | `brk #imm` | SIGTRAP，`TRAP_BRKPT`；信号帧里没有 `esr_context` |
 | 对齐错误 | SIGBUS，`BUS_ADRALN`；ESR 的 EC 按数据访问（0x24）、SP 未对齐（0x26）、PC 未对齐（0x22）区分 |
 | `udf` 和白名单外的编码 | SIGILL，`ILL_ILLOPC` |
-| 异步信号 | kick 置位 CPU 上下文里的 pending 标志：解释器在指令边界检查，DBT 在经由后向边或间接分支进入块时检查（§4.2）。引擎随即退出，由内核层投递 |
+| 异步信号 | kick 置位 CPU 上下文里的 pending 标志：解释器在指令边界检查，DBT 在经由后向边或间接分支进入块时检查（[engine 的 map](../../.claude/maps/engine.md)）。引擎随即退出，由内核层投递 |
 
 - `rt_sigreturn` 恢复全部通用寄存器和 FPSIMD 寄存器，校验每个记录的 magic 和 size。信号处理函数**可能修改 pc**（Go 的异步抢占、V8 的 wasm trap），所以恢复后引擎按新的 pc 重新查找翻译。
 - syscall 重启语义照搬 Linux（`ERESTARTSYS` 等四种，配合 `restart_syscall`），像 Linux 那样**另外保存一份 `orig_x0`**；各个系统调用用哪一种也照 Linux。
@@ -38,7 +38,7 @@
 
 ## 7.5 auxv 与内核版本
 
-- auxv 依次提供：`AT_SYSINFO_EHDR`、`AT_MINSIGSTKSZ`、`AT_HWCAP`（§4.4）、`AT_PAGESZ=4096`、`AT_CLKTCK=100`、`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`、`AT_SECURE`、`AT_RANDOM`、`AT_HWCAP2`、`AT_EXECFN`、`AT_PLATFORM="aarch64"`。
+- auxv 依次提供：`AT_SYSINFO_EHDR`、`AT_MINSIGSTKSZ`、`AT_HWCAP`（[engine 的 map](../../.claude/maps/engine.md)）、`AT_PAGESZ=4096`、`AT_CLKTCK=100`、`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`、`AT_SECURE`、`AT_RANDOM`、`AT_HWCAP2`、`AT_EXECFN`、`AT_PLATFORM="aarch64"`。
 - `uname -r` 固定报告 `6.1.0-appine`，当作一份 **ABI 契约**：没写明的地方都按 Linux 6.1 的语义实现。比 6.1 新的功能一般不做，例外是 6.5 的 `cachestat`、6.12 起 `/proc/<pid>/fd` 里的项不能当挂载点、6.2 起 time 命名空间的放宽（原生对照的内核都比 6.1 新）。
 - 未实现的 syscall **一律返回 `ENOSYS`，绝不崩溃**，同时记录一条本地调试日志（`APPINE_LOG=1`）。有意不实现的：io_uring（§15）。别的返回 `ENOSYS` 的编号见[未实现的系统调用](../rounds/139-unimplemented-syscalls.md)。
 - guest 改不了宿主的时间：settimeofday、clock_settime 和要改东西的 adjtimex 是 `EPERM`（当作没有 `CAP_SYS_TIME`）；adjtimex 的查询取宿主的 NTP 状态，Android 上按未同步合成。
@@ -51,7 +51,7 @@
 - 停在系统调用上时把寄存器存一份，跟踪者读写的是这一份，继续时写回。PTRACE_SYSCALL 让线程继续之后，它的系统调用都交给持有 BKL 的路径（§6 的快速路径不走），vDSO 里读时钟的存根不停，与 Linux 上它们不进内核一样。
 - regset：`NT_PRSTATUS`、`NT_PRFPREG`、`NT_ARM_TLS`、`NT_ARM_SYSTEM_CALL`、`NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH`；没有 SVE、PAC、MTE、SME 的。
 - 单步由解释器执行一条指令（`appine_cpu_step`）。
-- 改写被跟踪进程的内存（POKETEXT、`/proc/<pid>/mem`）照 `FOLL_FORCE`：没有写权限的私有映射先复制一份再写。写过的地方作废翻译（§4.2），写过的映射不再算作可信的来源。
+- 改写被跟踪进程的内存（POKETEXT、`/proc/<pid>/mem`）照 `FOLL_FORCE`：没有写权限的私有映射先复制一份再写。写过的地方作废翻译（[engine 的 map](../../.claude/maps/engine.md)），写过的映射不再算作可信的来源。
 - **硬件断点和观察点**：报告 6 个断点、4 个观察点的槽，只有解释器检查。有断点的线程只用 Tier 0；有观察点的线程照常用 Tier 1，被观察的页不进它的数据 TLB，这些访问交给 Tier 0 执行那一条指令，由它检查观察点。
 
 ## 7.7 core dump

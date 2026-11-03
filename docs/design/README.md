@@ -9,7 +9,7 @@
 1. [目标与非目标](#1-目标与非目标)
 2. [硬约束](#2-硬约束)
 3. [总体架构](#3-总体架构)
-4. [CPU 引擎](04-cpu.md)
+4. CPU 引擎，已迁到 [engine 的 map](../../.claude/maps/engine.md)（英文）
 5. 内存：轻量用户态 soft-MMU，已迁到 [kernel/mm 的 map](../../.claude/maps/kernel/mm.md)（英文）
 6. [进程、线程与调度](06-process.md)
 7. [信号与 ABI](07-signals.md)

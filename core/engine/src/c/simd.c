@@ -1,5 +1,5 @@
 /*
- * SIMD&FP（设计文档 §4.2、§4.4）。
+ * SIMD&FP（engine 的 map）。
  *
  * 数据处理指令：这里只做白名单判定，运算交给原生指令桩。白名单是 ARMv8.0
  * 的基础 FP 和 Advanced SIMD，加上 guest 特性集合里有的 AES/PMULL/SHA1/SHA2/

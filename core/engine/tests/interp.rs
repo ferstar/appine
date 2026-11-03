@@ -267,7 +267,7 @@ fn unimplemented_encodings_are_undefined() {
     }
 }
 
-/// SIMD&FP 和原生桩只在 aarch64 Linux 宿主上可用（§4.4 的 HWCAP 会如实反映）。
+/// SIMD&FP 和原生桩只在 aarch64 Linux 宿主上可用（HWCAP 会如实反映，见 engine 的 map）。
 fn has_simd() -> bool {
     let need = hwcap::FP | hwcap::ASIMD;
     appine_engine::guest_hwcap() & need == need
@@ -909,7 +909,7 @@ fn exceptions_hints_and_system_registers() {
 
     g.step(0xd503201f); // nop
     g.set_x(30, 0x4000_1000);
-    g.step(0xd503233f); // paciasp：按设计文档 §4.4 当作 NOP
+    g.step(0xd503233f); // paciasp：按 engine 的 map 当作 NOP
     assert_eq!(g.x(30), 0x4000_1000);
     g.step(0xd5033bbf); // dmb ish
 

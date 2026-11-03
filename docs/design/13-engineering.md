@@ -21,7 +21,7 @@ int appine_mmu_unmap(struct appine_mmu *mmu, uint64_t gva, uint64_t len);
 int appine_mmu_protect(struct appine_mmu *mmu, uint64_t gva, uint64_t len, uint32_t prot);
 void *appine_mmu_translate(const struct appine_mmu *mmu, uint64_t gva, uint32_t required_prot);
 
-/* Tier 1 的翻译不会自己失效：由内核层按代码失效日志作废（§4.2） */
+/* Tier 1 的翻译不会自己失效：由内核层按代码失效日志作废，见 engine 的 map */
 void appine_dbt_invalidate(struct appine_dbt *dbt, uint64_t start, uint64_t len);
 void appine_dbt_flush(struct appine_dbt *dbt);
 void appine_dbt_recheck(struct appine_dbt *dbt);  /* exec 之后：保留翻译，下次运行前逐块核对 */
