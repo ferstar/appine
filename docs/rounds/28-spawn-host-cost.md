@@ -27,9 +27,9 @@
 | gcc 编译 `lvm.c`；python | 0.69s；0.36s | 2.24–2.31s；1.40–1.45s | 2.27–2.28s；1.43–1.45s |
 
 - **测试**：
-  - 差分测试新增 rewrite 组：同一个 inode 就地换了代码（`cat >`、`dd conv=notrunc`、可写的共享映射），之后执行的必须是新代码，改写前后等 3 秒，让翻译池复用上一次的翻译、不再核对。让版本比较时忽略 ctime 和大小，这一组就输出旧代码的结果。
-  - cargo test（170 个）、两层的 14 组差分测试、gcc 13 编译 C、Android clippy 都通过（Android 上的 clippy 把已经带 const 的 `thread_local!` 报成可以加 const，按项关掉了这个 lint）。LTP 的 syscall 测试 943 个通过，与上一轮相同（[偶发项](../milestones.md#已知的偶发失败) shmctl01 通过、futex_wait05 失败）。
-  - 跑了 16 次全量 cargo test：一次卡在 `ctrl_c_and_ctrl_z_control_the_foreground_job`（Tier 1，作业停着、shell 在等输入，测试在等它退出），重放这个用例 40 次（6 个并发）、之后 15 次全量都没再出现，原因还没查明（→ 已查明是测试自己的竞争：ash 的 `fg` 先打印命令、后交出终端，^C 可能落在 shell 上，原生上同样会发生；已改测试，等 shell 退出加了超时，见 M9 之前：测试自己的竞争和丢掉的现场）。一次 `ipc_timers_credentials_and_scheduling` 失败，HEAD 的二进制单独跑这个程序 30 次也失败 1 次：解除屏蔽、送达挂着的定时器信号之后，检查之前又到期了一次（周期只有 10 毫秒），检查的是最后一次送达的超限次数。改成只看解除屏蔽之后送达的第一个，之后连跑 20 次都通过。
+  - 差分测试新增 rewrite 组：同一个 inode 就地换了代码（`cat >`、`dd conv=notrunc`、可写的共享映射），之后执行的必须是新代码，改写前后等 3 秒，让翻译池复用上一次的翻译、不再核对。
+  - Android 上的 clippy 把已经带 const 的 `thread_local!` 报成可以加 const，按项关掉了这个 lint。
+  - 跑了 16 次全量 cargo test：一次卡在 `ctrl_c_and_ctrl_z_control_the_foreground_job`（Tier 1，作业停着、shell 在等输入，测试在等它退出），原因还没查明（→ 已查明是测试自己的竞争：ash 的 `fg` 先打印命令、后交出终端，^C 可能落在 shell 上，原生上同样会发生；已改测试，等 shell 退出加了超时，见 M9 之前：测试自己的竞争和丢掉的现场）。一次 `ipc_timers_credentials_and_scheduling` 失败：解除屏蔽、送达挂着的定时器信号之后，检查之前又到期了一次（周期只有 10 毫秒），检查的是最后一次送达的超限次数；改成只看解除屏蔽之后送达的第一个。
 
 **推迟项**：
 

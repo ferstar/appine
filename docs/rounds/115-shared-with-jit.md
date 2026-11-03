@@ -46,10 +46,8 @@ V8 的解释器、内置函数和 ICU 都在 node 的程序文件里，所以 no
 
 **测试**：
 
-- 引擎的单元测试 `members_share_file_code_and_keep_jit_code_apart`：两个成员共用一个实例，第一页是登记过的文件，第二页各有各的 JIT 代码，共用的块用 `bl` 直接调用第二页。交替运行 3 轮，各自得到自己的结果，第二个成员只翻译了自己的 JIT 代码。第二个成员再跳到"第一个成员的标签 | JIT 代码的地址"，要像 Tier 0 一样是取指错误。内核层的 `code_groups_keep_private_code_apart_from_registered_files`：两个成员的私有范围可以重叠；私有的压着登记的、登记的压着别人私有的都不接受，也什么都不改；自己原来私有的地方换成文件时登记，换上新的私有范围。
-- 变异检验，四种都失败：共用的块可以链接到私有的块、所有的块都按 pc 放、查表例程不排除超出 48 位的 pc（这三种单元测试执行到了另一个成员的代码），内核层不检查私有范围压着登记的映射。
-- 差分测试 `shared-code` 的 `jit` 情形（父子进程在同一个地址各写各的代码）现在两个进程都留在组里，结果与原生相同：脚本跑三遍，离开组的次数 18 → 12。
-- cargo test（243 个，lockstep 里 Tier 1 用的是不在组里的标签 0）、clippy（含 Android 目标）都通过；22 组差分测试在 Tier 1 下、`shared-code` 在 Tier 0 下都与原生一致。LTP 的 syscall 测试 958 个通过（上一轮 960）：futex_wait05、select02 由通过变成失败（"睡得太久"，[偶发项](../milestones.md#已知的偶发失败)），新旧二进制单独各跑两次都失败。
+- 引擎的单元测试 `members_share_file_code_and_keep_jit_code_apart`：两个成员共用文件里的块、各自执行自己的 JIT 代码，伪造别的成员的键是取指错误。内核层的 `code_groups_keep_private_code_apart_from_registered_files`：私有范围和登记的映射哪些可以重叠、哪些不接受。
+- 差分测试 `shared-code` 的 `jit` 情形（父子进程在同一个地址各写各的代码）现在两个进程都留在组里，结果与原生相同。
 
 **推迟项**：
 

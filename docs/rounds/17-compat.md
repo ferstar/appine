@@ -19,7 +19,7 @@
   - 读写 epoll 和 pidfd 是 EINVAL。
   - kcmp（LTP 的 pidfd_getfd01 用它核对复制来的 fd）：文件、地址空间、fd 表、fs、信号处理表比较对象本身，`KCMP_EPOLL_TFD` 到 epoll 里找目标文件；appine 没有 IO 上下文，SysV 信号量的 undo 表也不在进程之间共享，这两种总是相同。
 - LTP 的 sigtimedwait01、sigwaitinfo01 超时不是 appine 的问题：第一项测试等的是"空集合被信号打断返回 EINTR"，而 musl 的 `sigtimedwait` 遇到 EINTR 会自己重试，在原生 Alpine 上一样卡住；直接发 syscall 的 rt_sigtimedwait01 是通过的。
-- 测试：差分测试新增 `compat`（以上各项，只比较与环境无关的列），共 12 组，在两个执行层下都和原生一致。原生一侧的容器改为不加 seccomp 过滤：Docker 默认的规则让 clone3 返回 ENOSYS、pidfd_getfd 返回 EPERM，比对的应当是内核本身的行为。内核版本相关的部分只测各版本相同的：6.9 起进程回收之后 pidfd 有 POLLHUP，`CLONE_PIDFD` 可以和 `CLONE_THREAD` 一起用，这里与 6.1 相同。单元测试新增堆的扩展、maps 的合并和信号的排队。LTP 的 syscall 测试 889 个通过（上次 868），新通过的是 execveat01/02、pidfd 的 8 个、kcmp01–03、fcntl35（两个）、ioctl01、ioctl07、madvise02、pwritev202（两个）和 splice06，没有新失败。getrusage03 由跳过变成失败：上次虚拟机可用内存不足 512 MB 没有运行，这次运行了，暴露出 `ru_maxrss` 总是 0。
+- 测试：差分测试新增 `compat`（以上各项，只比较与环境无关的列），在两个执行层下都和原生一致。原生一侧的容器改为不加 seccomp 过滤：Docker 默认的规则让 clone3 返回 ENOSYS、pidfd_getfd 返回 EPERM，比对的应当是内核本身的行为。内核版本相关的部分（6.9 起 pidfd 的几处变化）只测各版本相同的。单元测试新增堆的扩展、maps 的合并和信号的排队。LTP 新通过 execveat01/02、pidfd 的 8 个、kcmp01–03、fcntl35、ioctl01、ioctl07、madvise02、pwritev202 和 splice06；getrusage03 由跳过变成失败（上次虚拟机内存不足没有运行），暴露出 `ru_maxrss` 总是 0。
 
 **推迟项**：
 

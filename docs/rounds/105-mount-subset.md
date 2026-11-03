@@ -16,10 +16,10 @@
   - 删除、改名挂载点是 EBUSY（Linux 的 `is_local_mountpoint`）。原来 `rmdir /proc` 能把开机时的挂载点删掉。
 - **chroot 里的 ttyname**：从 Alpine chroot 进 Debian、挂上 devpts 之后，Python 的 `os.ttyname` 报 ENODEV。第一版给每个新的 devpts 挂载分配了设备号，可各个挂载用的是同一套终端，从设备的 fstat 报告开机时那个设备号；glibc、musl 的 ttyname 拿 `/proc/self/fd` 里的名字 stat 一下，与 fstat 比对设备号和 inode，对不上就是 ENODEV。改成 devpts 的挂载都用同一个设备号。
 - **测试**：
-  - 单元测试新增 `mounts_on_other_directories`：挂在仓库的目录上、bind procfs 里的目录、叠在挂载上的挂载，`..`、路径、chroot 之后的路径和不可达，设备号，不持 BKL 的解析交回正常路径（包括 `..` 到了挂载点），卸下之后的节点和编号。把 `..` 经由挂载点那一步去掉，这个和原来的 `resolves_paths_and_symlinks` 都失败。
-  - 新的差分测试组 `mount`。原生一侧的容器要有 `CAP_SYS_ADMIN`，colima 的虚拟机和 GitHub 的 runner 上还要关掉 AppArmor：`scripts/difftest` 认用例里 `# docker-run-options:` 这一行，把选项加给它的容器。内容：四种文件系统挂到 `/tmp/mnt` 下、挂载点带空格，mountinfo（编号换成先后，不比设备号和超级块的选项：docker 的 `/sys` 是只读的，devpts 的新实例在 Linux 上默认 `mode=600`），设备号与哪个挂载的相同，statfs 的类型，`..` 和 pwd，再挂一次的 EBUSY 和叠挂，ENODEV、ENOTDIR，bind 目录和文件、`--rbind`，rmdir、mv、rm 挂载点和卸下在用的挂载的 EBUSY，重新挂载成只读之后写文件；Python 的 ctypes 比对 fdinfo 的 mnt_id、`f_flags`、重新挂载的标志、传播类型、各种参数错误（EFAULT、ENOENT、EINVAL）、`MNT_EXPIRE`、没有 `CAP_SYS_ADMIN` 的 EPERM、`MNT_DETACH` 之后的 getcwd；魔法链接到了已经删除的文件、管道上的挂载点；最后 chroot 进一个只有 busybox 的目录，在里面挂 procfs、devpts，看 mountinfo、`/proc/mounts`、`..`，用静态链接的小程序经由新挂的 devpts 打开终端、看 ttyname。两个执行层下都与原生相同。
-  - 从 Alpine chroot 进 Debian（第 69 轮的仓库）：挂上 proc、sysfs、devpts，`--rbind` cgroup2，apt 装上 procps 之后 ps、top、free、uptime 正常，findmnt 列出挂载的树，Python 的 `os.ttyname` 得到 `/dev/pts/0`，在 chroot 里再挂一次 proc 也行；卸下之后 mountinfo 里没有了。
-  - cargo test 233 个、clippy（含 Android 目标）、两层的全部差分测试都通过，`mount`、`compat`、`cgroup` 组在 Linux 宿主的分支上（appine-run 在 debian 容器里，与 CI 相同）也通过。LTP 959（上次 958）：mount08 由失败变成通过，别的与上次相同。
+  - 单元测试新增 `mounts_on_other_directories`：叠挂和 bind 之后的 `..`、路径、chroot 之后的不可达、设备号，不持 BKL 的解析交回正常路径，卸下之后的节点和编号。
+  - 新的差分测试组 `mount`：挂载、bind、重新挂载、卸下和各种错误，之后的 mountinfo、设备号、`..`，以及 chroot 进去再挂 procfs、devpts 之后的 ttyname，两个执行层下都与原生相同。原生一侧的容器要有 `CAP_SYS_ADMIN`，colima 的虚拟机和 GitHub 的 runner 上还要关掉 AppArmor：`scripts/difftest` 认用例里 `# docker-run-options:` 这一行，把选项加给它的容器。mountinfo 不比设备号和超级块的选项：docker 的 `/sys` 是只读的，devpts 的新实例在 Linux 上默认 `mode=600`。
+  - 从 Alpine chroot 进 Debian（第 69 轮的仓库），挂上 proc、sysfs、devpts 和 cgroup2 之后 ps、top、free、findmnt、`os.ttyname` 都正常。
+  - LTP 新通过 mount08。
 
 **推迟项**：
 

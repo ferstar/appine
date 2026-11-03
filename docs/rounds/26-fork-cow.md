@@ -25,9 +25,8 @@
 
   `go build`、JVM、python 的 subprocess 都用 vfork 或 `CLONE_VM`，不经过写时复制，持平；gcc 一行是与上上轮的二进制交替运行的结果。
 - **测试**：
-  - 单元测试新增三个：父子进程各写各的、孙进程向原来的拥有者借页、拥有者销毁之后的孤儿页、借用方解除映射时孙进程先复制；mprotect（包括 `PROT_NONE`）往返、`MADV_DONTNEED`、mremap 之后各写各的；借来的页取 futex 键时先换成自己的。
-  - 差分测试新增 fork 组：4 个子进程和父进程同时写 8 MB；三个线程不停地按顺序写计数时反复 fork，子进程看到的是某一瞬间的一致快照、之后不受父进程的线程影响；借出期间父进程 munmap、mremap、`MADV_DONTNEED`、子进程 mprotect 往返；子进程里两个线程用互斥锁和条件变量交替 4000 次；7 层嵌套 fork；python 的 `os.fork`。让 fork 时不去掉父进程页表项的写权限，这一组就出错。第一版两边都因为缺 `_GNU_SOURCE` 编译失败、输出相同而"通过"了，看了实际输出才发现。
-  - cargo test、两层的 13 组差分测试都通过。LTP 的 syscall 测试 943 个通过（上次 941，上上次 942），差别都是[偶发项](../milestones.md#已知的偶发失败)：futex_wait05、getrusage03、epoll_pwait03 这次通过；shmctl01 这次失败，用写时复制之前的二进制并发跑 shm 子集也会同样失败。
+  - 单元测试新增三个：借页和孤儿页、mprotect 往返和 `MADV_DONTNEED`、mremap 之后各写各的，以及借来的页的 futex 键。
+  - 差分测试新增 fork 组：父子进程同时写、多线程进程里反复 fork 看到一致的快照、借出期间的 munmap/mremap/`MADV_DONTNEED`/mprotect、子进程里的线程同步、多层嵌套 fork、python 的 `os.fork`。第一版两边都因为缺 `_GNU_SOURCE` 编译失败、输出相同而"通过"了，看了实际输出才发现。
 
 **推迟项**：
 

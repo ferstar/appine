@@ -18,7 +18,7 @@
   - 没有 `CAP_NET_ADMIN` 时 `SO_SNDBUFFORCE`、`SO_RCVBUFFORCE` 是 EPERM，有时退回到普通的 `SO_*BUF`。
   - 对内置的 init 调 setpriority 不再是 ESRCH。
 - 性能：shell 起 600 个进程慢了约 1%（退出和 execve 时的驻留内存取样），syscall 密集的小循环和 `git status` 不变。
-- 测试：差分测试 `compat` 新增 smaps 和 pagemap、重新打开已删除的文件、unshare、`ru_maxrss`、tkill、connect、接口 ioctl、memfd 封印；间隔 1 纳秒的定时器在原生一侧会造成信号风暴，结果取决于时机，留给 LTP 的 timer_settime03。单元测试新增开机清空的目录。全部 12 组差分测试在两个执行层下通过。LTP 的 syscall 测试 905 个通过（上次 889），新通过 17 个：getrusage03、times03、mlock05、mlock201、mmap12、mincore03、memfd_create01、munmap04、unshare02/03、tgkill02、futex_cmp_requeue02、connect01、setpriority02、setsockopt04、sockioctl01、timer_settime03；cachestat02 由失败变成跳过（走到了还没有的 cachestat）。shmctl01 这次失败（[偶发项](../milestones.md#已知的偶发失败)）。unshare01、unshare04 剩下的失败是命名空间。
+- 测试：差分测试 `compat` 新增 smaps 和 pagemap、重新打开已删除的文件、unshare、`ru_maxrss`、tkill、connect、接口 ioctl、memfd 封印；间隔 1 纳秒的定时器在原生一侧会造成信号风暴，结果取决于时机，留给 LTP 的 timer_settime03。单元测试新增开机清空的目录。LTP 新通过 getrusage03、times03、mlock05、mlock201、mmap12、mincore03、memfd_create01、munmap04、unshare02/03、tgkill02、futex_cmp_requeue02、connect01、setpriority02、setsockopt04、sockioctl01、timer_settime03；cachestat02 由失败变成跳过（走到了还没有的 cachestat），unshare01、unshare04 剩下的失败是命名空间。
 
 **推迟项**：
 

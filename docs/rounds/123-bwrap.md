@@ -21,10 +21,8 @@
 
   三个 CLI 不开沙箱时、七个 CLI 的交互界面都与上次一样，与原生相同（npm 这次装到了 Claude Code 2.1.314、Codex 0.166）。
 - **测试**：
-  - 新的差分测试组 `bwrap`（`scripts/difftest` 的软件包加上 bubblewrap；原生一侧的 docker 选项同上）：只读的根、`--dev` 里的设备、`--tmpfs`；bwrap 自己建的挂载点和是否只读（`--ro-bind` 文件、`--bind` 目录、`--proc`、`--dev`）；`--unshare-all --hostname`：ID、pid、主机名、`/proc` 里的进程数、lo 的地址、外面的地址到不了；Codex 那组参数：pid 1、当前目录、能力都去掉了、根下的目录、`/etc` 只读、工作目录写得进去且外面看得到、只有 lo；`--uid 1000 --gid 1000`；源路径不存在、`--chdir` 不存在时的错误。附加组、不在新 pid 命名空间里时的 pid、外面带进来的挂载两边环境不同，不比。两个执行层下都与原生相同。
-  - 差分测试 `namespaces` 组加上 cgroup 命名空间（编号不同，`/proc/self/cgroup` 仍是 `0::/`）和 bwrap 的挂法（源和挂载点都经由 `/proc/self/fd/N`、挂载点是 tmpfs 里的文件，mountinfo 里的挂载点，bind 之前打开的 fd remount 是 EINVAL、之后重新打开的可以）。
-  - 变异检验：跟随 fd 链接时不交出目录和名字，`bwrap` 组第一项就失败；remount 也找最上面的挂载，bind 之前打开的 fd remount 成功了。
-  - cargo test、clippy（含 Android）、两层的全部差分测试（现在 26 组）通过。LTP 的 syscall 测试全量 988 个通过（上次 989）：futex_wait05 失败，是[偶发项](../milestones.md#已知的偶发失败)；之后单独重跑它连续失败，同一个二进制在全量里通过了的 nanosleep01、clock_nanosleep02 那时也连续失败，是虚拟机当时的计时延迟。
+  - 新的差分测试组 `bwrap`（`scripts/difftest` 的软件包加上 bubblewrap；原生一侧的 docker 选项同上）：bwrap 建的挂载和只读、`--unshare-all --hostname` 里看到的、Codex 那组参数下的环境、`--uid`、参数错误，两个执行层下都与原生相同。附加组、不在新 pid 命名空间里时的 pid、外面带进来的挂载两边环境不同，不比。
+  - 差分测试 `namespaces` 组加上 cgroup 命名空间和 bwrap 的挂法（经由 `/proc/self/fd/N` 挂到 tmpfs 里的文件上、bind 前后打开的 fd 的 remount）。
 
 **推迟项**：
 

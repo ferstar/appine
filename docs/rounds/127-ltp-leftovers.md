@@ -16,9 +16,8 @@ LTP 的 syscall 测试全量 214 个失败里，146 个要 loop 设备（"Failed
 
 ## 测试
 
-- 差分测试 `compat2` 组新增：在 `O_APPEND` 的文件上 pwrite64、pwritev（直接调用系统调用，绕开 musl）之后的大小、文件位置和内容，没有 `O_APPEND` 的照常写在偏移处；readlinkat 的空路径在 `AT_FDCWD`、`O_PATH` 打开的符号链接、目录、普通文件、管道、无效的 fd 上。两个执行层下都与原生相同。sendto、文件句柄、`SHM_HUGETLB` 的原生结果取决于宿主的 AppArmor、文件系统和大页配置，不放进差分测试，由 LTP 的 sendto01、name_to_handle_at02、open_by_handle_at02、shmget02 检查（改之前都失败）。
-- 变异检验（第一层的 `compat2` 组）：不按 `O_APPEND` 写到末尾，三次写之后的大小都对不上；readlink 的空路径恢复原来的写法，`AT_FDCWD` 是 EBADF、目录和普通文件是 EINVAL。
-- cargo test、clippy（含 Android）、两层的全部 27 组差分测试通过。LTP 的 syscall 测试 992 个通过（上次 989）：name_to_handle_at02、open_by_handle_at02、sendto01、shmget02 由失败变成通过；[偶发项](../milestones.md#已知的偶发失败)里 futex_wait05 这次通过，epoll_pwait03 和 mmap21_02（unlink `/dev/shm` 下的文件得到 EIO）这次失败，其余逐项相同。readlink03、readlinkat02、pwrite04 仍失败，剩下的是 musl 的那几项。
+- 差分测试 `compat2` 组新增：`O_APPEND` 的文件上的 pwrite64、pwritev（直接调用系统调用，绕开 musl），各种 fd 上 readlinkat 的空路径。两个执行层下都与原生相同。sendto、文件句柄、`SHM_HUGETLB` 的原生结果取决于宿主的 AppArmor、文件系统和大页配置，不放进差分测试，由 LTP 检查。
+- LTP 的 name_to_handle_at02、open_by_handle_at02、sendto01、shmget02 由失败变成通过；readlink03、readlinkat02、pwrite04 仍失败，剩下的是 musl 的那几项。
 
 **推迟项**：
 

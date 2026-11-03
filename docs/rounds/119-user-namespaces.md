@@ -17,10 +17,10 @@
   - setuid 系列改了有效、文件系统的用户或组，或者得到了新的能力时，进程不再可以 dump、父进程退出时不再给它发信号（`commit_creds`，原来只有 execve 这样做）；不可 dump 的进程的 `/proc/<pid>` 下的文件属于它的命名空间里的 root（`task_dump_owner`）。execve 普通程序时恢复成可以 dump（`begin_new_exec`），程序文件对调用者不可读时除外（`would_dump`），原来从不恢复。
   - `/proc/sys/user/max_*_namespaces`（threads-max 的一半，只读，不实际限制）。
 - **测试**：
-  - 单元测试 `user_namespaces`：映射的解析和非法输入、换成内核 ID 时跨段拆开、建立者和别的用户在后代命名空间里的能力、开机时的命名空间里没有、写好映射之后的 ID 换算和对没有映射的文件的权限、换成映射不到的用户之后能力清掉、execve 之后里面的 root 保留能力。
-  - 差分测试 `namespaces` 组加上用户命名空间（root 建的）：开机时的三张映射和 setgroups，busybox 的 `unshare -r`；setns 到自己的用户命名空间是 EINVAL；新建之后读父进程的链接是 EACCES、ID 是 65534、有全部能力；写映射的两种 EINVAL、映射别人是 EPERM、写一次之后 EPERM、gid_map 要先 deny、deny 之后 allow 是 EPERM、乱写是 EINVAL、之后 setgroups 是 EPERM、setuid 到映射不到的 ID 是 EINVAL、stat 的属主、执行之后的 ID 和能力、回不到上一层；从外面读它的映射、setgroups 和 status 的 ID，setns 进去之后的 ID 和能力；多线程 unshare、`CLONE_NEWUSER | CLONE_FS`、chroot 之后 unshare 的错误，嵌套到第 34 层的 ENOSPC。两个执行层下都与原生相同。
-  - 普通用户自己建的命名空间差分测试比不了：开发用的虚拟机和 GitHub 的 runner 都是 Ubuntu 24.04，它的 `kernel.apparmor_restrict_unprivileged_userns` 不让这种命名空间里有能力（原生一侧写映射是 EPERM、挂 tmpfs 是 EACCES），关掉它要改宿主的安全设置，没有做。改为集成测试 `user_namespace_of_an_unprivileged_user` 按上游 Linux 的行为检查：nobody 用 `unshare -r -m` 把自己映射成 root，读不了 /etc/shadow、chown 不了 /tmp、看到 `/` 属于 65534，能挂 tmpfs、新文件属于 0、建不了设备节点，外面看不到这个 tmpfs。变异检验：`capable_wrt` 不要求属主属组有映射时，它读到了 /etc/shadow。
-  - cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试全量 980 个通过（上次 982）：futex_wait05 是[偶发项](../milestones.md#已知的偶发失败)；sysinfo01 这次失败，sysinfo 报告的 uptime 比之前读到的 `/proc/uptime` 还小 1 秒，查出来是两边取整不同：`/proc/uptime` 四舍五入（Linux 的 `uptime_proc_show` 截断到百分之一秒），sysinfo 截断（Linux 的 `do_sysinfo` 有零头就进一秒），x.996 秒时就颠倒了，与这一轮无关，照 Linux 改了两处，之后单独跑 sysinfo01 九次都通过；ioctl_ns06 由失败变成跳过（走到了还没有的 `NS_GET_USERNS`）。
+  - 单元测试 `user_namespaces`：映射的解析和换算、三种能力检查、换用户和 execve 之后的能力。
+  - 差分测试 `namespaces` 组加上 root 建的用户命名空间：映射和 setgroups 的读写和各种错误，里面看到的 ID 和能力，从外面读它的映射和 ID，setns，unshare 的错误和嵌套层数，两个执行层下都与原生相同。
+  - 普通用户自己建的命名空间差分测试比不了：开发用的虚拟机和 GitHub 的 runner 都是 Ubuntu 24.04，它的 `kernel.apparmor_restrict_unprivileged_userns` 不让这种命名空间里有能力，关掉它要改宿主的安全设置，没有做。改为集成测试 `user_namespace_of_an_unprivileged_user` 按上游 Linux 的行为检查：nobody 用 `unshare -r -m` 映射成 root 之后，能做和不能做的事。
+  - LTP 的 sysinfo01 这次失败，查出来与这一轮无关：`/proc/uptime` 四舍五入（Linux 截断到百分之一秒）、sysinfo 截断（Linux 有零头就进一秒），x.996 秒时两者颠倒，照 Linux 改了两处。ioctl_ns06 由失败变成跳过（走到了还没有的 `NS_GET_USERNS`）。
 
 **推迟项**：
 

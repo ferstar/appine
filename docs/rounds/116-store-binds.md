@@ -21,10 +21,8 @@ Codex、Claude Code 的沙箱用 bubblewrap 建，在 appine 里第一步就失�
 - **`MS_MOVE`**：源要是挂在树上的挂载的根，目录和非目录不配是 EINVAL，目标在源里面是 ELOOP（挪挂载树的根也是：Linux 上它挂在 rootfs 上，目标总在它里面），连同挂在里面的一起挪。原来是 EOPNOTSUPP。
 - **pivot_root(2)**（原来是 ENOSYS）：照 Linux 6.1 的 `pivot_root`：先要 `CAP_SYS_ADMIN`；两个路径都要是目录；`put_old` 上挂着东西时挂在最上面的那个上；已经删除的目录是 ENOENT；`new_root`、`put_old` 在根目录所在的挂载里是 EBUSY；根目录、`new_root` 要是挂载的根，`put_old` 要在 `new_root` 下面，`new_root` 要在根目录下面，否则 EINVAL。然后 `new_root` 的挂载换到根目录所在的挂载的位置，原来的根挂到 `put_old` 上，根目录、当前目录是原来的根的进程都换过去（`chroot_fs_refs`）。bwrap 用的 `pivot_root(".", ".")` 加 `umount2(".", MNT_DETACH)` 也照 Linux：原来的根叠在新根上，umount 的路径最后要跟进挂在上面的（`LOOKUP_MOUNTPOINT`），mount 的挂载点也是（`lock_mount`），原来这两处对 `.`、当前目录这类不经过查找的路径不跟。
 - **测试**：
-  - 单元测试新增 `binds_store_directories`：bind 目录和文件、`..` 和路径经由挂载点、bind 挂载里看不到外面、chroot 进挂载里、只读按经由的挂载算、`MS_MOVE`、卸下之后 `..` 不出挂载、记录丢掉之后。
-  - 新的差分测试组 `bind`（原生一侧是有 `CAP_SYS_ADMIN` 的 docker 容器，根文件系统是 overlay，只比挂载点、看到的目录和选项）：bind 目录、文件和设备号、inode，`..`、pwd、`/proc/self/cwd`，`--rbind` 带上挂在里面的 procfs、有挂载在里面时 EBUSY、`umount -l`；跨挂载的 rename、link 的 EXDEV，挂载点的 EBUSY；只读之后的 30 种修改（EROFS、EEXIST、设备照常能写、源那边照常、bind 只读的挂载也是只读的），statfs 的 `f_flag`；noexec 的 execve、mmap、mprotect 和 smaps 的 `me`；nosuid 下 setuid 程序的 euid；nodev；nosymfollow；`MS_MOVE` 和它的四种错误；pivot_root 的五种错误；最后 bind 一个目录到自己上，pivot_root 进去、在新根里挂 procfs、`umount -l` 原来的根，看 mountinfo。两个执行层下都与原生相同。
-  - 变异检验：去掉 `parent_in_fs` 里"挂载的根没有上级"那一步，单元测试失败；去掉新建时的 EROFS，`bind` 组的 create、mkdir、symlink、mknod 几行与原生不同。
-  - cargo test、clippy（含 Android）、两层的全部差分测试都通过，`bind`、`mount` 组在 Linux 宿主的分支上也通过。LTP 的 syscall 测试 959 个通过（上次 958，select02 是[偶发项](../milestones.md#已知的偶发失败)），别的与上次相同；pivot_root01 要 `unshare(CLONE_NEWNS)`，仍失败，mount、umount 的测试要 loop 设备。
+  - 单元测试新增 `binds_store_directories`：bind 目录和文件之后的 `..` 和路径、chroot 进挂载里、只读按经由的挂载算、`MS_MOVE`、卸下之后的记录。
+  - 新的差分测试组 `bind`：bind 目录和文件、`--rbind`、`umount -l`，EXDEV 和 EBUSY，只读、noexec、nosuid、nodev、nosymfollow 下的各种操作，`MS_MOVE` 和 pivot_root 的错误，以及照 bwrap 那样 pivot_root 进 bind 的目录之后的 mountinfo，两个执行层下都与原生相同。原生一侧的根文件系统是 overlay，只比挂载点、看到的目录和选项。
 
 **推迟项**：
 

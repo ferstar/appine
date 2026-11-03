@@ -27,9 +27,9 @@ Maven、Gradle 慢在 JIT 生成的代码上：Gradle 那次运行里，间接�
   - `sun.misc.Signal`、SIGTERM 触发关闭钩子，posix_spawn 加 jspawnhelper，NIO 的 epoll Selector，HttpClient 和 HttpServer，内存映射和文件锁，crypto 指令内建。
   - `-XshowSettings:system` 显示"No metrics available"，因为没有 cgroup（D 档）；JVM 退回到宿主的 CPU 数和内存，算出的参数与原生相同。
 - **测试**：
-  - 差分测试新增两组：`java`（上面的测试程序，加上 ZGC 运行一遍、jcmd attach）和 `inotify`（一个 C 程序逐步打印目录和文件上的事件序列、错误码、阻塞读，以及 WatchService 和 `fs.watch`）。差分测试的仓库多装 openjdk21-jdk。全部 10 组在两个执行层下都和原生一致。
-  - 单元测试新增 `real_path` 和 inotify 的投递、合并、一次性监视、溢出；rootfs 用例里 `readlink /proc/self/exe` 的期望值改为 `/bin/busybox`。
-  - LTP 的 syscall 测试 867 个通过（M8 是 856），新通过 inotify01、02、04、05、06、09–12 和 inotify_init1_01、02；inotify03、07、08 要挂载块设备。shmctl01 是[偶发失败](../milestones.md#已知的偶发失败)。
+  - 差分测试新增两组：`java`（上面的测试程序、ZGC、jcmd attach）和 `inotify`（C 程序打印的事件序列和错误码，以及 WatchService 和 `fs.watch`），两个执行层下都和原生一致。差分测试的仓库多装 openjdk21-jdk。
+  - 单元测试新增 `real_path` 和 inotify；rootfs 用例里 `readlink /proc/self/exe` 的期望值改为 `/bin/busybox`。
+  - LTP 新通过 inotify01、02、04、05、06、09–12 和 inotify_init1_01、02；inotify03、07、08 要挂载块设备。
 
 **改动和推迟项**：
 

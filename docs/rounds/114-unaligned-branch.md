@@ -16,9 +16,7 @@
 
 **测试**：
 
-- 单元测试 `branches_to_unaligned_addresses_fault`：先在第 0 页翻译一个块再作废，让墓碑落在查 1 时开始找的位置；然后 `br`、`blr`、`ret` 分别跳到 1、2、3 和 0x1001，都要像 Tier 0 一样报告对齐错误，pc 是目标。
-- 变异检验，三处各自去掉时都失败：空项还是 1（测试进程 SIGSEGV），查表例程不排除未对齐的 pc（执行了作废块所在地址的新代码，返回 svc），`table_find` 不排除（同上）。
-- 差分测试 `edge-cases` 加了一段：经由函数指针调用和 `ret` 跳到 1、2、0x1001，与原生一样收到 SIGBUS（`BUS_ADRALN`），`si_addr` 是目标。原来 appine 的 Tier 1 在第一个就报告内部错误、以 SIGSEGV 结束进程。
-- cargo test（241 个）、clippy 都通过；22 组差分测试在 Tier 1 下、`edge-cases` 在 Tier 0 下都与原生一致。LTP 的 syscall 测试 960 个通过（上一轮 959）：mmap21_02 由失败变成通过（[偶发项](../milestones.md#已知的偶发失败)）。
+- 单元测试 `branches_to_unaligned_addresses_fault`：先让墓碑落在查 1 时开始找的位置，再用 `br`、`blr`、`ret` 跳到几个未对齐的地址，都要像 Tier 0 一样报告对齐错误。
+- 差分测试 `edge-cases` 加了一段：经由函数指针调用和 `ret` 跳到未对齐的地址，与原生一样收到 SIGBUS（`BUS_ADRALN`）。
 
 **推迟项**：没有。

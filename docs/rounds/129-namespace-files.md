@@ -14,11 +14,10 @@
 
 ## 测试
 
-- 新的差分测试组 `nsfs`（原生一侧加 `CAP_SYS_ADMIN`、`CAP_NET_ADMIN`）：子进程 unshare 出网络、UTS、IPC 命名空间，设主机名、建一个不删的共享内存段，bind 到文件上之后退出；之后这些文件的设备号、inode、权限，mountinfo 里那一行，经由它们 setns 进去看到的接口、主机名、共享内存段，类型不对是 EINVAL；卸下之后原来的文件 setns 是 EINVAL，卸下之前打开的照样能进去；只靠打开着的 fd 进入已经没有进程的网络、挂载命名空间（看到里面挂的 tmpfs）；bind 自己的、更旧的挂载命名空间文件是 EINVAL，更新的可以，复制挂载命名空间时不带它、带着网络命名空间的；八种文件的 `NS_GET_NSTYPE`、`NS_GET_USERNS`、`NS_GET_PARENT`，`NS_GET_OWNER_UID`，不认识的 ioctl；root 建的用户命名空间里再建网络、pid 命名空间，从里面、外面各看一遍：属主、上一层、看不到的 EPERM、得到的 fd 的 `FD_CLOEXEC` 和 F_GETFL；1 号进程退出之后 setns 进 pid 命名空间可以、fork 是 ENOMEM，进程都退出了的用户命名空间也能进去；busybox 的 `unshare --net=<文件> --uts=<文件>` 和 `nsenter`，卸下之后 nsenter 失败；iproute2 的 `ip netns add`、`list`、`exec`（在里面拉起 lo、看地址）、`ip -n`、`identify`、`delete`。差分测试的软件包加上 iproute2（原生一侧的镜像只打包 bin、etc、lib、sbin、usr、tmp，用例先补上 `/var/run`）。`compat2` 组新增 open、`O_PATH`、管道两端、socket、socketpair、eventfd、epoll、memfd、经由 `/proc/self/fd` 重新打开的管道的 F_GETFL 和 fdinfo 的标志。
-- 单元测试：bind 出去的挂载命名空间文件留住命名空间、复制时不带它、卸下之后连同它的挂载一起清理掉（`bound_namespace_files_keep_namespaces`）；RTM_GETNSID 的回答和几种错误（`netns_ids_are_never_assigned`）。
-- 变异检验：bind 出去的挂载不持有命名空间，`nsfs` 组从第一次 setns 起就对不上（打开文件找不到命名空间，ENOENT）；复制挂载命名空间时不跳过挂载命名空间的文件，`copied mnt` 那一行对不上。
+- 新的差分测试组 `nsfs`（原生一侧加 `CAP_SYS_ADMIN`、`CAP_NET_ADMIN`）：bind 出去的、打开着的命名空间文件留住没有进程的命名空间，setns 进去看到的，卸下之后，挂载命名空间文件的 bind 和复制，`NS_GET_*` ioctl 从里面和外面看，busybox 的 `unshare --net=<文件>` 和 `nsenter`，iproute2 的 `ip netns` 各个子命令。差分测试的软件包加上 iproute2（原生一侧的镜像只打包 bin、etc、lib、sbin、usr、tmp，用例先补上 `/var/run`）。`compat2` 组新增各种打开文件的 F_GETFL 和 fdinfo 的标志。
+- 单元测试：`bound_namespace_files_keep_namespaces`（留住、复制时不带、卸下之后清理）；`netns_ids_are_never_assigned`（RTM_GETNSID 的回答和错误）。
 - `compat` 组里原来按 busybox 的 `ip` 写的几行改成显式的 `busybox ip`：装了 iproute2 之后 `/sbin/ip` 是它，原生的容器里 eth0 是 veth，iproute2 多显示一个 `link-netnsid 0`（`IFLA_LINK_NETNSID`），appine 拿不到。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 998 个通过（上次 994）：ioctl_ns01–04、ioctl_ns06 由跳过变成通过；mmap21_02 这次失败（打开 `/dev/shm/ltp_mmap21_2` 得到 EEXIST，[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
+- LTP 的 ioctl_ns01–04、ioctl_ns06 由跳过变成通过。
 
 **推迟项**：
 

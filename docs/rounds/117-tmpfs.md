@@ -9,9 +9,9 @@ Linux 的 tmpfs 在内存里。另写一个内存里的文件系统要让所有�
 - **mount(2)**（`core/kernel/src/syscall/mount.rs`）：选项按 Linux 6.1 的 `shmem_parse_one` 解析：`size=`（可以带 K、M、G 这些后缀，或者是物理内存的百分比）、`nr_blocks=`、`nr_inodes=`、`mode=`（八进制）、`uid=`、`gid=`（-1 是 EINVAL）、`inode32`、`inode64`、`huge=`、`mpol=`，以及 ro、rw、sync 这些通用的超级块标志；不认识的、值不对的是 EINVAL。根目录的权限默认 1777，属主、属组默认是挂载的进程的 fsuid、fsgid。mountinfo 的超级块选项照 `shmem_show_options`：大小、inode 数不是默认值（物理内存的一半）才写，权限不是 1777、属主属组不是 0 才写，最后是 `inode64` 或 `inode32`。原来 mount 读 data 只检查第一个字节读得了，现在读最多一页的字符串，只有 tmpfs 用。
 - statfs 报告 `TMPFS_MAGIC`，总量是 `size=` 或物理内存的一半，用量不记、都算空闲（Linux 数页数）。fstat 打开着的普通文件、FIFO 原来设备号总是根文件系统的，改成按经由的挂载。`/proc/filesystems` 加上 `nodev tmpfs`。
 - **测试**：
-  - 单元测试：仓库里不挂在根下的目录（上级是自己、根目录里看不到、里面挪目录、删掉、下次开机删掉上次留下的）；VFS 的 tmpfs（自己的设备号和选项、路径经由挂载点、卸下之后 bind 出去的子目录让它活着、都没了之后里面的文件删掉）。把删树那一步去掉，后者失败。
-  - 新的差分测试组 `tmpfs`：`/proc/filesystems`，三种选项的 mountinfo（包括超级块选项）、根目录的权限和属主、statfs 的类型和大小、自己的设备号；里面的文件、目录、硬链接、改名，跨挂载（到仓库、到另一个 tmpfs）的 rename、link 是 EXDEV；AF_UNIX socket、FIFO、共享映射，fstat 的设备号；五种选项的错误和 `nr_blocks=0x10,inode32` 的超级块选项；`..` 和 pwd；只读的 tmpfs；卸下再挂是空的；在用时 EBUSY，`umount -l` 之后打开着的文件和 bind 出去的子目录照常能用。最后用一个静态链接的小程序照 bubblewrap 的步骤在一个进程里换根（不建命名空间）：根改成 slave，tmpfs 做底，`newroot` bind 到自己上，pivot_root 进去，只读 bind `/bin`、`/lib`、`/usr`（加 nosuid、nodev），`--dev`（tmpfs 加上 bind 进去的六个设备、符号链接、新的 devpts），`--proc`（只读 bind `/proc/sys`），`--tmpfs /tmp` 带 `mode=0700`，`umount -l` 原来的根，`pivot_root(".", ".")` 再 `umount2(".", MNT_DETACH)`；之后在新根里跑 busybox 看目录、写只读的 `/bin`、写 `/tmp` 和设备、mountinfo。两个执行层下都与原生相同。
-  - cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 978 个通过（上次 959）：要只读文件系统的用例（`.needs_rofs`，LTP 自己挂一个只读的 tmpfs）原来卡在挂载这一步，现在 access04、chmod06、chown04、creat06、fchmod06、fchown04、fchownat03、lchown02、lchown02_16、link08、mkdir03、mkdirat02、mknod07、rmdir02、unlink10、utime06、utimes01 通过，madvise01 也通过（要一个 tmpfs 做文件映射）；chown04_16、fchown04_16 由失败变成跳过（arm64 没有 16 位的 chown，原来也卡在挂载）；futex_wait05 这次通过，是[偶发项](../milestones.md#已知的偶发失败)。
+  - 单元测试：仓库里不挂在根下的目录（新建、挪目录、删掉、下次开机删掉上次留下的）；VFS 的 tmpfs（设备号和选项、路径经由挂载点、卸下之后什么时候删掉里面的文件）。
+  - 新的差分测试组 `tmpfs`：选项和 mountinfo、statfs、里面的各种文件和 EXDEV、只读的 tmpfs、卸下和 `umount -l`，最后用一个静态链接的小程序照 bubblewrap 的步骤在一个进程里换根（不建命名空间），在新根里跑 busybox。两个执行层下都与原生相同。
+  - LTP 要只读文件系统的用例（`.needs_rofs`，LTP 自己挂一个只读的 tmpfs）原来卡在挂载这一步，现在 access04、chmod06、chown04、creat06、fchmod06、fchown04、fchownat03、lchown02、lchown02_16、link08、mkdir03、mkdirat02、mknod07、rmdir02、unlink10、utime06、utimes01 通过，madvise01 也通过（要一个 tmpfs 做文件映射）；chown04_16、fchown04_16 由失败变成跳过（arm64 没有 16 位的 chown）。
 
 **推迟项**：
 

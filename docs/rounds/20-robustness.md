@@ -14,13 +14,13 @@
   - guest 碰新的页由宿主内核直接处理，内核层看不到缺页，只能定时检查。有 guest 线程不在内核里等待时，定时器线程每 20 毫秒量一次，超过上限的 3/4 之后每 5 毫秒（这台虚拟机上读一次只要 1.6 微秒）；所有线程都在等待时内存不会再涨，检查停下来，某个线程要回到 guest 代码时经由一个原子标记叫醒它。最早用的 100 毫秒间隔下，不停分配内存的程序（Tier 1 下每秒碰好几 GB 的新页）在 512 MB 的上限上多用了 200–300 MB；改成 20/5 毫秒之后是 10–35 MB。
   - 超出时按 Linux 的 oom_badness 挑进程：驻留的页数，加上 `oom_score_adj` 按物理内存折算的页数，`oom_score_adj` 原来只记录，现在生效。第一版按上限折算，awk 的驻留内存超过整个上限时盖过了 +1000，改成与 Linux 一样按全部内存折算。挑中的用 SIGKILL 结束，报告写到 stderr；等它退完（最多 1 秒，卡在宿主 I/O 里的不再等也不再挑）再看要不要结束下一个。第一版等的是"任何正在退出的进程"，碰上一个无关的卡住的进程会白等，改成与 Linux 一样只等自己挑中的；挑中的进程已经在退出时不再结束它，与 Linux 的 `task_will_free_mem` 一样。
 - **线程数的上限**（§6）：`/proc/sys/kernel/threads-max` 原来只显示 pid_max，现在生效，可以写（20 到 `FUTEX_TID_MASK`），对 root 也有效。默认按物理内存每 MB 一个（Linux 是每 128 KB 一个：appine 的每个线程是一个宿主线程，还占一个 eventfd），并且不超过宿主 fd 上限的一半。`RLIMIT_NPROC` 原来不限，现在默认是 threads-max 的一半，与 Linux 一样按真实用户 ID 数线程，root 和有 `CAP_SYS_RESOURCE`、`CAP_SYS_ADMIN` 的不受它限制。
-- **性能**：与上一轮的二进制交替运行、各取最短：100 万次 `getppid` 从 59 毫秒变成 65 毫秒（每次进入引擎多一次 `sigsetjmp` 和一次 TLS 查找，约 6 纳秒；实际的 syscall 在 appine 里要几百纳秒到几微秒）；shell 起 300 个进程在噪声之内（406–436 毫秒对 422–429 毫秒）。
+- **性能**：与上一轮的二进制交替运行、各取最短：100 万次 `getppid` 从 59 毫秒变成 65 毫秒（每次进入引擎多一次 `sigsetjmp` 和一次 TLS 查找，约 6 纳秒；实际的 syscall 在 appine 里要几百纳秒到几微秒）；shell 起 300 个进程在噪声之内。
 - **测试**：
-  - 引擎新增 `tests/guard.rs`：两个执行层访问了指向 `PROT_NONE` 宿主页的页表项之后返回 `HostFault`，之后照常运行；Tier 0 在原生桩的读锁里出错之后锁被释放（否则接下来生成新桩要拿写锁，同一个线程会卡死）。这个测试也用 cargo-ndk 编成 Android 程序，在 4K（API 34）和 16K（API 37）的模拟器上直接运行，验证了 bionic 下的 `sigsetjmp`/`siglongjmp` 和 `ucontext`。
-  - `tests/guest/bugs.c` 在两个执行层下用测试钩子触发内核层 panic、引擎故障、另一个线程正阻塞在内核里时的引擎故障，子进程都被 SIGSEGV 结束，父进程之后照常建线程、fork。`tests/guest/limits.c` 检查 `RLIMIT_NPROC` 的默认值、root 不受限制、普通用户到上限时 fork 返回 EAGAIN，以及超出 256 MB 的上限时吃内存的子进程被 SIGKILL 结束、父进程之后照常分配内存。
-  - rootfs 用例新增两个：threads-max 的读写和对 root 生效（busybox sh 报告 "can't fork"）；`oom_score_adj` 为 1000 的进程先于吃内存的 awk 被结束（只在 Tier 1 下跑，Tier 0 的 debug 构建拼 128 MB 的字符串要十几秒）。
+  - 引擎新增 `tests/guard.rs`：两个执行层出了宿主故障之后返回 `HostFault`、照常运行，原生桩的读锁被释放。这个测试也用 cargo-ndk 编成 Android 程序，在 4K（API 34）和 16K（API 37）的模拟器上直接运行，验证了 bionic 下的 `sigsetjmp`/`siglongjmp` 和 `ucontext`。
+  - `tests/guest/bugs.c` 在两个执行层下用测试钩子触发内核层 panic 和引擎故障，子进程被 SIGSEGV 结束，父进程照常运行；`tests/guest/limits.c` 检查 `RLIMIT_NPROC` 和内存上限。
+  - rootfs 用例新增 threads-max 和 `oom_score_adj` 两个（后者只在 Tier 1 下跑，Tier 0 的 debug 构建拼 128 MB 的字符串要十几秒）。
   - 两个模拟器上的 instrumentation 测试都通过：App 进程（release 构建，装着兜底）里 ART 照常工作。
-  - 全部 12 组差分测试在两个执行层下都和原生一致（Go、Java、Node.js 都在默认的内存上限下运行）。LTP 的 syscall 测试 943 个通过（上次 944），唯一的不同是[偶发项](../milestones.md#已知的偶发失败) shmctl01。新的 `RLIMIT_NPROC`、threads-max 默认值没有让任何用例变化。
+  - 差分测试里的 Go、Java、Node.js 在默认的内存上限下照常运行。
 
 **推迟项**：
 

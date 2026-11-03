@@ -18,10 +18,9 @@ appine 的 TCP、UDP、ping socket 都是宿主 socket，宿主上没有可用�
 - **新建和进入**：clone、unshare 的 `CLONE_NEWNET` 要在（可能是新建的）用户命名空间里有 `CAP_SYS_ADMIN`，新命名空间属于它，所以 root 建的用户命名空间里新建的网络命名空间可以配 lo；setns（`netns_install`）要在它的属主和自己的用户命名空间里都有 `CAP_SYS_ADMIN`。`/proc/<pid>/ns/net` 按线程报告。
 - 顺带：`/proc/sys/user/max_*_namespaces` 可以写了（0 到 INT_MAX，只记下，仍不实际限制）：LTP 的网络命名空间测试一开始要改写它。
 - **测试**：
-  - 单元测试 `loopback_addresses_map_to_the_namespace_range`（lo 关着、打开之后的绑定和连接，IPv4、IPv6 两个方向的换算，外面的地址，开机时的命名空间不换）、`netlink_configures_lo`（bwrap 的两条请求、EEXIST、别的接口、没有能力）。
-  - 差分测试 `namespaces` 组加上（docker 一侧另加 `NET_ADMIN`，appine 里 root 本来就有）：busybox 的 `unshare -n` 里 `ip link show`、`ip -o addr` 在 lo 打开前后，`ip route show table local`，`/proc/net/dev`，ping 外面的地址是 Network unreachable；Python 里新命名空间的编号、if_nameindex、if_nametoindex，lo 关着时的绑定和连接，普通用户 netlink 配 lo 是 EPERM，bwrap 的 `loopback_setup` 两条请求都确认、再加一次是 EEXIST，回环上的 TCP 两端的地址和数据、通配地址、IPv6 的 :: 和 ::1、UDP 和自动绑定，外面的 TCP、UDP 都到不了、绑不上，外面监听的回环端口和抽象地址在里面连不到、同名的抽象地址在里面能绑，`/proc/self/net/dev` 只有 lo、tcp 里有自己的 socket 没有外面的，setns 回原来的命名空间之后新建的 socket 连得上外面的端口、原来的 socket 照常能用，普通用户 unshare 是 EPERM，root 建的用户命名空间里的网络命名空间（exec 之后的 `ip` 没有能力，与原生一样配不了 lo）。两个执行层下都与原生相同。
-  - 变异检验（第一层的 `namespaces` 组）：出口的地址不换回来，看到的是宿主上的 127.a.b.x；抽象地址不分命名空间，里面连上了外面的、绑不上同名的；netlink 配 lo 不查能力，普通用户也配得上。替没有绑定的 socket 先绑到 127.a.b.1 这一步从里面看不出来（宿主替它绑的通配地址报告出来也是通配地址），没有用例能查。
-  - cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试全量 989 个通过（上次 987，那次 mmap21_02 偶发失败）：`scripts/ltp` 给 LTP 的内核配置加上 `CONFIG_NET_NS`，setsockopt05 由跳过变成通过（它给新命名空间里的 lo 设 MTU 再经由回环发 UDP）；bind06、sendto03、setsockopt06–09 仍跳过，原因由缺 `CONFIG_NET_NS` 变成没有 AF_PACKET；sendmsg03 由跳过变成失败（见推迟项）。
+  - 单元测试 `loopback_addresses_map_to_the_namespace_range`（绑定、连接和两个方向的地址换算）、`netlink_configures_lo`（bwrap 的两条请求和错误）。
+  - 差分测试 `namespaces` 组加上（docker 一侧另加 `NET_ADMIN`）：busybox 的 `unshare -n` 里的 `ip` 和 ping；Python 里配 lo、回环上的 TCP 和 UDP 的地址和数据、外面的地址和抽象地址到不了、`/proc/self/net`、setns 回去之后新旧 socket、各种 EPERM。两个执行层下都与原生相同。替没有绑定的 socket 先绑到 127.a.b.1 这一步从里面看不出来，没有用例能查。
+  - `scripts/ltp` 给 LTP 的内核配置加上 `CONFIG_NET_NS`，setsockopt05 由跳过变成通过；sendmsg03 由跳过变成失败（见推迟项）。
 
 **推迟项**：
 

@@ -49,17 +49,9 @@
 shell 起进程快了约三成：fork 出来的子进程直接加入父进程的组，不用再从池里拿实例、逐块核对。原生是 0.15 秒，现在是原生的 1.13 倍。`-P4` 的几个 cc1 直接用前一个翻译好的代码。
 
 - **测试**：
-  - 新的差分测试组 `shared-code`，两个进程在同一个地址上放不同的代码：
-    - `files`：父子进程在同一个地址映射两个不同的文件；
-    - `jit`：在同一个地址各写各的代码；
-    - `rewrite`：先映射同一个文件、一起执行，之后子进程 mprotect 加写权限改写它；
-    - `exec`：子进程 exec 同一个程序，在父进程映射着别的文件的地址上映射；
-    - `dlopen`：两个进程按不同的顺序 dlopen 两个库，同一个地址上是不同的库。
-    - 每种情形在主进程 fork 出来的进程里跑，主进程自己一直可以共用；文件写好之后等 3 秒才可信。两个执行层下都与原生相同。
-    - 变异检查：成员从不离开时 `files`、`jit`、`rewrite`、`exec`、`dlopen` 都错（执行到了对方的代码）；只去掉登记时的冲突判断时 `files`、`exec`、`dlopen` 错。
-  - 新的 rootfs 测试 `processes_of_one_program_share_translations`：等 3 秒再 exec 一个 shell，它起 6 个 sleep（busybox，在 fork 出来的进程里直接执行），appine-run 里只有一两份代码缓存；不共用时是 7 份。
-  - 单元测试 `code_groups_register_only_consistent_mappings`：先长后短的同一个库、同一个文件后面的段、不同的文件、同一个文件对不上的偏移、别的版本、整个 layout 只要有一段冲突就都不登记、登记满了。
-  - cargo test（237 个）、clippy（含 Android 目标）、两层的 22 组差分测试都通过。LTP 的 syscall 测试 959 个通过（上一轮 958）：epoll_pwait03、futex_wait05 由失败变成通过，select02 由通过变成失败（"睡得太久"，[偶发项](../milestones.md#已知的偶发失败)，单独重跑两次、拿上一轮的二进制在同一时刻重跑也都失败）。
+  - 新的差分测试组 `shared-code`：两个进程经由不同的文件（`files`）、各写各的代码（`jit`）、改写共用的文件（`rewrite`）、exec（`exec`）、按不同顺序 dlopen（`dlopen`）在同一个地址上放不同的代码，两个执行层下都与原生相同。文件写好之后要等 3 秒才可信，用例里等着。
+  - 新的 rootfs 测试 `processes_of_one_program_share_translations`：一个 shell 起的几个 sleep 在 appine-run 里只有一两份代码缓存。
+  - 单元测试 `code_groups_register_only_consistent_mappings`：哪些映射算一致、有冲突时整个不登记、登记满了。
   - 只在 colima 的虚拟机里跑，没上手机。
 
 **推迟项**：

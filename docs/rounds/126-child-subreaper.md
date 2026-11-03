@@ -10,8 +10,8 @@
 
 ## 测试
 
-- 差分测试 `compat` 组新增 `subreaper.c`：默认值，设成 5 读出来是 1，设回 0，读到坏指针是 EFAULT；fork 出来的子进程没有，execve 之后还在；孤儿过继给 subreaper、由它回收，父进程退出时已经是僵尸的孙子进程也由它回收；过继给最近的 subreaper，它退出之后交给再往上的；清掉之后孤儿给 1 号进程。`namespaces` 组新增：外面的进程是 subreaper 时，新 pid 命名空间里的孤儿仍过继给里面的 1 号进程，里面的 subreaper 照常收养里面的孤儿。两个执行层下都与原生相同。
-- 变异检验（第一层）：不找 subreaper，`compat` 组的收养和回收都对不上，`namespaces` 组里面的 subreaper 收养不到；找的时候不比 pid 命名空间的层数，命名空间里的孤儿过继给了外面的 subreaper，1 号进程退出时等它们被回收、外面的进程又只等 1 号进程，`namespaces` 组卡住。用例开发时还遇到两处用例自己的问题：fork 之前 stdout 缓冲着的内容被子进程又输出一遍（改成行缓冲）；最后用 `waitpid(-1, WNOHANG)` 查有没有剩下的子进程，原生一侧偶尔得到 0，去掉了。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 989 个通过（上次 989）：prctl03 由跳过变成通过；futex_wait05 这次失败（[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
+- 差分测试 `compat` 组新增 `subreaper.c`：两个选项的读写、fork 和 execve 之后、孤儿和僵尸过继给最近的 subreaper 并由它回收；`namespaces` 组新增：外面的 subreaper 不收养新 pid 命名空间里的孤儿。两个执行层下都与原生相同。
+- 用例自己的两处问题：fork 之前 stdout 缓冲着的内容被子进程又输出一遍（改成行缓冲）；最后用 `waitpid(-1, WNOHANG)` 查有没有剩下的子进程，原生一侧偶尔得到 0，去掉了。
+- LTP 的 prctl03 由跳过变成通过。
 
 **推迟项**：无。

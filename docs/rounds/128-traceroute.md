@@ -39,11 +39,11 @@ guest 的 raw ICMP socket 的实现挪到 `core/kernel/src/rawicmp.rs`。
 
 ## 测试
 
-- 单元测试：`rawicmp` 的三个（回答换回 id 和拼 IP 头、按编号查不是 raw socket 的不换、过滤器；错误队列的一条拼成 ICMP 错误报文的各个字段和校验和、UDP 的补上 UDP 头、不是 ICMP 报告的不要、软错误和硬错误；控制消息截短），`netns` 的地址换算加上 ICMPv6 的几种。
-- 差分测试 `compat2` 组新增 `icmperr.c`：没连接的 UDP socket 发往关着的端口，raw socket 收到的端口不可达（报告者、类型、代码、校验和，引用的协议、源和目的地址、总长度、IP 头的校验和、目的端口、UDP 长度、载荷），这个 UDP socket 接着发没有错误、收是 EAGAIN、`SO_ERROR` 是 0、错误队列是空的；连接了的收到 ECONNREFUSED、再收是 EAGAIN；连接了、发往另一个端口的看不到错误，getpeername 仍是连的那个；另一个 raw socket 发出的 echo 的回答；raw socket 打开 `IP_RECVERR`、TTL 1 发往外面的地址，poll 报告 POLLERR，错误队列里是原来的 echo（id、序号、目的地址）、`IP_RECVERR` 的类型、代码、errno 和报告者（网关），读走之后 `SO_ERROR` 是 0、错误队列是空的。busybox 的 `traceroute`、`traceroute -I`、`traceroute6` 到本机（每跳两个探测包）。`namespaces` 组新增：`unshare -n` 里 lo 关着时 `ping6 ::1` 的错误、打开之后 ping 得通。两个执行层下都与原生相同。到外面地址的 traceroute 没有放进去：网关对 ICMP 限速（每秒一个），几个探测包接着发时原生上也时有时无。
+- 单元测试：`rawicmp` 的三个（回答换回 id 和拼 IP 头、错误拼成 ICMP 错误报文、控制消息截短），`netns` 的地址换算加上 ICMPv6 的几种。
+- 差分测试 `compat2` 组新增 `icmperr.c`：UDP socket 引起的端口不可达在 raw socket 上收到的报文、UDP socket 自己看到的错误（没连接、连接了、发往另一个端口），另一个 raw socket 的 echo 回答，raw socket 的 `IP_RECVERR` 和错误队列；另外跑 busybox 的 `traceroute`、`traceroute -I`、`traceroute6` 到本机。`namespaces` 组新增新命名空间里的 `ping6 ::1`。两个执行层下都与原生相同。到外面地址的 traceroute 没有放进去：网关对 ICMP 限速（每秒一个），几个探测包接着发时原生上也时有时无。
 - 手工对照上表的各个工具：Debian 13 的仓库里装上 traceroute、mtr-tiny、iputils-tracepath，在有和没有 NET_RAW 的宿主上各跑一遍，与原生的 Debian 容器比。
-- 变异检验（第一层）：报文只给发出它的那个 socket，`compat2` 组里别的 socket 引起的四个端口不可达、另一个 raw socket 的 echo 回答都收不到；不报告已连接 socket 的硬错误，连接了的 UDP socket 收到的不再是 ECONNREFUSED；不改连宿主的 UDP socket，发往另一个端口引起的错误收不到，busybox 的 traceroute 到本机全是 `*`；ICMPv6 不用宿主的 ::1，`namespaces` 组里新命名空间的 `ping6` 是 EINVAL。开发中差分测试还抓到：没有连接的 UDP socket 引用的源地址是 0.0.0.0（现在按路由取）。
-- cargo test、clippy（含 Android）、两层的全部 27 组差分测试通过。LTP 的 syscall 测试 994 个通过（上次 992）：[偶发项](../milestones.md#已知的偶发失败)里 epoll_pwait03、mmap21_02 这次通过，其余逐项相同；非 ICMP 的 raw socket 改成 EPERM 没有改变任何一项的结果。
+- 开发中差分测试抓到：没有连接的 UDP socket 引用的源地址是 0.0.0.0（现在按路由取）。
+- 非 ICMP 的 raw socket 改成 EPERM 没有改变 LTP 任何一项的结果。
 
 **推迟项**：
 

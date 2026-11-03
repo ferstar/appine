@@ -73,8 +73,7 @@
 | Gradle 热构建 | 1.39–1.47s | 1.31–1.38s |
 
 - **测试**：
-  - 引擎测试新增 `exits_beyond_48_bits_keep_the_whole_pc`：代码放在 48 位地址空间的最后一页，执行到页尾落到 2^48，取指故障报告的地址是 2^48。超出 48 位的目标也打包进数据字时，这个用例失败（报告成 0）。回填失败的精确退出、共用检查的退回、链接和作废原来就有用例（`cross_page_faults_are_precise`、`shared_checks_*` 等）。
-  - cargo test（235 个）、clippy（含 Android 目标）、两层的 21 组差分测试都通过。LTP 的 syscall 测试 958 个通过，与上一轮相同：epoll_pwait03 从通过变成失败（"睡得太久"，[偶发项](../milestones.md#已知的偶发失败)，单独重跑两次、拿上一轮的二进制在同一时刻重跑也都失败），pselect01_64 从失败变成通过。
+  - 引擎测试新增 `exits_beyond_48_bits_keep_the_whole_pc`：执行到 48 位地址空间的页尾，取指故障报告完整的地址。回填失败的精确退出、共用检查的退回、链接和作废原来就有用例（`cross_page_faults_are_precise`、`shared_checks_*` 等）。
   - 只在 colima 的虚拟机里跑，没上手机。
 
 **推迟项**：

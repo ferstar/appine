@@ -10,9 +10,9 @@
 - **setns(2)**（原来是 ENOSYS）：fd 要是打开的命名空间（不支持 pidfd，EINVAL），`nstype` 是 0 或与它相同的 `CLONE_NEW*`。挂载命名空间照 Linux 的 `mntns_install`：先要 `CAP_SYS_ADMIN`、`CAP_SYS_CHROOT`（EPERM），fs 和别的线程、进程共用时 EINVAL，然后根目录、当前目录都换成那边的根（setns 到自己的命名空间也是）。别的种类只有开机时的那个：用户命名空间是 EINVAL（已经在里面），其余要 `CAP_SYS_ADMIN`，什么也不做。
 - **`/proc/<pid>/root`、`cwd` 改成魔法链接**：原来按读出来的文字在读者自己的根下面解析，经由 `/proc/<pid>/root/...` 到不了别的命名空间（测试里从外面 bind 子进程命名空间里的挂载，Linux 是 EINVAL，appine 却在自己的命名空间里找到了同名的目录挂上了）。现在与 Linux 的 `proc_root_link`、`proc_cwd_link` 一样直接指到那个任务的节点，chroot 外面的也进得去。readlink 照旧。
 - **测试**：
-  - 单元测试 `copies_and_drops_mount_namespaces`：复制出来的挂载编号是新的、挂载点和根跟着换，新命名空间里挂的 tmpfs 外面看不到，没人用之后卸下、tmpfs 删掉。
-  - 新的差分测试组 `namespaces`（以后几轮接着加）：`/proc/self/ns` 的列表和十个链接的格式，nsfs 文件的类型、权限、设备号（各个相同、与 procfs 不同）、inode 号、statfs；busybox 的 `unshare -m` 里挂的外面看不到；Python 里打开的命名空间的 fd 链接、读是 EINVAL、setns 的三种错误和 setns 到自己的命名空间之后 cwd 是 `/`、`CLONE_NEWNS | CLONE_FS` 是 EINVAL；子进程 unshare 之后两边后来挂的互不可见，从外面看它的 mountinfo，经由 `/proc/<pid>/root` bind、umount 它的命名空间里的挂载是 EINVAL，它 setns 回来之后看到的是外面的挂载；新命名空间里 pivot_root、`umount -l` 原来的根，外面照旧；多线程的进程 setns 是 EINVAL，没有 `CAP_SYS_ADMIN` 的 unshare、setns 是 EPERM。两个执行层下都与原生相同。变异检验：不把新命名空间里的根目录、当前目录换到复制品上，子进程里的 mount 就是 EINVAL。
-  - cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 982 个通过（上次 978）：pivot_root01、setns01、unshare01、unshare04 通过；ioctl_ns01–04 由失败变成跳过（原来没有 `/proc/self/ns`，现在走到了还没有的 `NS_GET_*` ioctl），mount_setattr02 也变成跳过（走到了还没有的 mount_setattr）。
+  - 单元测试 `copies_and_drops_mount_namespaces`：复制出来的挂载、新命名空间里的 tmpfs 外面看不到、没人用之后卸下。
+  - 新的差分测试组 `namespaces`（以后几轮接着加）：`/proc/self/ns` 的链接和 nsfs 文件，unshare 之后两边挂的互不可见、从外面经由 `/proc/<pid>/root` 碰它的挂载，setns 和它的错误，新命名空间里 pivot_root，两个执行层下都与原生相同。
+  - LTP 新通过 pivot_root01、setns01、unshare01、unshare04；ioctl_ns01–04 由失败变成跳过（走到了还没有的 `NS_GET_*` ioctl），mount_setattr02 也变成跳过（走到了还没有的 mount_setattr）。
 
 **推迟项**：
 

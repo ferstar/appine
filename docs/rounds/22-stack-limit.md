@@ -13,13 +13,10 @@
 - **布局**：mmap 区的上界原来固定在栈顶往下 1 GB 加 8 MB，现在与 Linux 的 `mmap_base` 一样按 execve 时的 `RLIMIT_STACK` 留出间隔：至少是原来的大小（默认布局不变），最多地址空间的 5/6。不限栈大小时 Linux 改用自底向上的 legacy 布局，这里仍然自顶向下，间隔取最大值，ld-musl 从 `0x7fff_bf7…` 移到 `0x1555_5549…`。
 - **参数大小**：execve 的参数上限原来固定是 2 MB，现在按 Linux 的 `bprm_stack_limits`：栈大小上限的 1/4，不超过 6 MB，不少于 128 KB。setuid、setgid 程序的栈大小上限与 Linux 一样压到 8 MB，并写回进程的 `RLIMIT_STACK`。
 - **测试**：
-  - 内核层单元测试新增 4 个：就地增长到预留用完、之后按倍数申请、maps 里仍是一行 `[stack]`；上限按分开的几段合起来算、调高之后接着长；fork 之后子进程就地增长；mmap 区的上界。原来的 `MAP_GROWSDOWN` 用例加上 fork 之后的增长。
-  - 新的 guest 程序 `tests/guest/stack.c`，两个执行层：
-    - 用内联汇编把 SP 往下挪 1 MB（不碰那些页）再 read 进那里，挪 2 MB 再给自己发信号（处理函数在那里用 8 KB 栈），都成功；挪 16 MB 时 read 返回 EFAULT。分别去掉 syscall 入口、信号帧的增长时，对应的一项失败（EFAULT、SIGSEGV）。
-    - 默认上限下递归用掉 4 MB 可以，16 MB 被 SIGSEGV 结束；setrlimit 调到 64 MB 之后 32 MB 可以，调到 16 MB 之后 24 MB 被结束。上一轮的二进制在调高上限这一项失败。
-  - rootfs 用例新增一个：初始的 `[stack]` 是 132 KB；`ulimit -s 1024` 下 20000 个参数 E2BIG、10000 个可以，默认上限下 20000 个可以；`ulimit -s unlimited` 之后 ld-musl 映射在 `MAX_GAP` 下面。
-  - 全部 12 组差分测试在两个执行层下都和原生一致。LTP 的 syscall 测试 944 个通过（上次 941），没有新的失败，多出来的 3 个是[偶发项](../milestones.md#已知的偶发失败) futex_wait05、select02、shmctl01；mmap18、setrlimit04（栈限制在 1 MB 时运行程序）和 execve 系列照常通过。
-- **性能**：与上一轮的 release 二进制交替运行、各 5 次：100 万次 `getppid` 61.7–63.1 毫秒对 62.1–64.4 毫秒，在噪声之内；2000 次 fork 加 wait 从 240–243 毫秒降到 209–219 毫秒（栈的 VMA 从 8 MB 变成 132 KB，fork 查 pagemap 的范围小了）；第一次用到 6 MB 栈从 1.1–1.3 毫秒变成 1.8–2.1 毫秒（约 1500 次增长，每次 0.4 微秒左右）。
+  - 内核层单元测试新增栈的就地增长、按倍数申请、maps 里合成一行、上限的计算、fork 之后的增长和 mmap 区的上界；原来的 `MAP_GROWSDOWN` 用例加上 fork 之后的增长。
+  - 新的 guest 程序 `tests/guest/stack.c` 在两个执行层下检查 SP 挪到栈底下面之后的 read 和信号处理，以及不同上限下的递归深度和运行中调整上限。
+  - rootfs 用例新增一个：初始的 `[stack]` 大小、`ulimit -s` 对参数上限的影响、`ulimit -s unlimited` 之后的布局。
+- **性能**：与上一轮的 release 二进制交替运行、各 5 次：100 万次 `getppid` 在噪声之内；2000 次 fork 加 wait 从 240–243 毫秒降到 209–219 毫秒（栈的 VMA 从 8 MB 变成 132 KB，fork 查 pagemap 的范围小了）；第一次用到 6 MB 栈从 1.1–1.3 毫秒变成 1.8–2.1 毫秒（约 1500 次增长，每次 0.4 微秒左右）。
 
 **推迟项**：
 

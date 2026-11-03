@@ -19,10 +19,9 @@ guest 建 raw ICMP socket 时，内核层记下一份 `RawIcmp`（`core/kernel/s
 
 ## 测试
 
-- 单元测试 `raw_icmp_replies_look_like_raw_ones`：id 换回和校验和，IPv4 头的各个字段，只交出打开了的控制消息、`ipi_spec_dst`，过滤器，控制消息截短的几种情形，IPv6 只换 id、按第五个字过滤。
-- 差分测试 `compat` 组新增 `rawicmp.c`：raw socket 的 `SO_TYPE`，`ICMP_FILTER` 的默认值和设置，`IP_RECVTTL` 的默认值，SOL_RAW 别的选项；回环上的 echo 回答（IP 头的版本、头长、总长度、TTL、协议、校验和、源和目的地址，ICMP 的类型、id、序号、校验和、载荷）；`IP_RECVTTL`、`IP_PKTINFO` 的控制消息在空间够、只放得下第一条、第二条只放得下一部分、连头都放不下时的样子；`MSG_TRUNC`；过滤器挡掉的回答（包括偷看）之后也收不到；IPv6 的 `IPV6_CHECKSUM`、`ICMP6_FILTER`、echo 回答的 id 和校验和；nobody 建 raw socket 是 EPERM、协议号不对的错误码、ping socket 照常能建。另外跑 busybox 的 `ping`、`ping6` 和以 nobody 运行的 `ping`。原生一侧回环上的 raw socket 还收到自己发出的 echo 请求，用例都先用过滤器只留回答。两个执行层下都与原生相同。
-- 变异检验（第一层的 `compat` 组）：不换回 id，三处 id 和 busybox 的 ping 都对不上；不查 `CAP_NET_RAW`，nobody 建出了三种 raw socket，以 nobody 运行的 ping 走 raw socket，TTL 与原生的不同。开发中差分测试还抓到两处：ping socket 不填 `ipi_spec_dst`、不认 `MSG_TRUNC` 标志（截短时返回 30，原生是 220）。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 989 个通过（上次 988）：futex_wait05 这次通过（[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同；sendmsg03 仍失败（`IP_HDRINCL`，见推迟项）。
+- 单元测试 `raw_icmp_replies_look_like_raw_ones`：id 换回和校验和、IPv4 头、控制消息和截短、过滤器、IPv6。
+- 差分测试 `compat` 组新增 `rawicmp.c`：raw socket 的选项，回环上的 echo 回答的 IP 头和 ICMP，控制消息放不下时的截短，`MSG_TRUNC`，过滤器，IPv6，`CAP_NET_RAW`；另外跑 busybox 的 `ping`、`ping6` 和以 nobody 运行的 `ping`。两个执行层下都与原生相同。原生一侧回环上的 raw socket 还收到自己发出的 echo 请求，用例都先用过滤器只留回答。
+- 开发中差分测试抓到两处：ping socket 不填 `ipi_spec_dst`、不认 `MSG_TRUNC` 标志。
 
 **推迟项**：
 

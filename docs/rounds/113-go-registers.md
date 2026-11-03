@@ -40,11 +40,9 @@ Go 的寄存器分配从低号用起，x19–x25 几乎用不到。微基准（`
 
 **测试**：
 
-- lockstep 的 Tier 1 两组各跑一遍，和硬件、Tier 0 逐项比对：每个类别 10 万条，都一致。
-- 引擎的单元测试 `both_register_sets_run_the_same_code`：两组交替运行同一段代码，它用到全部 30 个通用寄存器和 SP。交替时同一个 pc 的模板、池里空的实例都在两组之间来回。另外检查 Go 的一组里引用 x16、x26–x28 的指令原样拷贝，引用 x21 的才改写。内核层的 `go_programs_get_their_own_tier1_registers` 测试认 Go 注记：前面有 GNU 的注记时也认得，类型不对、名字被截断时不认。
-- 变异检验，两种都失败：模板不按寄存器分配区分（单元测试和 lockstep 都崩溃），空的实例换一组时不重新生成例程（单元测试崩溃）。
-- cargo test（240 个）、clippy（含 Android 目标）都通过。22 组差分测试跑了三遍：Tier 0、Tier 1、`APPINE_DBT_REGS=go` 的 Tier 1，都与原生一致。
-- LTP 的 syscall 测试：Tier 1 下 959 个通过（上一轮 958），futex_wait05 由失败变成通过；`APPINE_DBT_REGS=go` 下 958 个，和 Tier 1 那一遍只差 futex_wait05（[偶发项](../milestones.md#已知的偶发失败)）。
+- lockstep 的 Tier 1 两组各跑一遍，和硬件、Tier 0 逐项比对，都一致。
+- 引擎的单元测试 `both_register_sets_run_the_same_code`：两组交替运行用到全部通用寄存器的同一段代码，模板、池里空的实例在两组之间来回，以及哪些指令原样拷贝、哪些改写。内核层的 `go_programs_get_their_own_tier1_registers` 测试认不认 Go 注记。
+- 差分测试、LTP 在 `APPINE_DBT_REGS=go` 下也跑了一遍，与默认的一组结果相同。
 
 **推迟项**：
 

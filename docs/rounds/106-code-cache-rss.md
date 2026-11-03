@@ -71,8 +71,7 @@
 - 池里保留的翻译最多 64 MB 代码（连同表等约 85 MB），界面离开 1 分钟或者内存紧张时释放（[onTrimMemory](37-trim-memory.md)）。
 
 - **测试**：
-  - 新增 `code_cache_pages_are_counted_once`（rootfs 测试）：Tier 1 下跑二十几个 busybox 的小程序，它们复用同一个程序留在池里的实例；shell 停在 `read` 里之后，最多等 5 秒，读 appine-run 的 smaps，执行视图里最大的实例不小于 1 MB，写入视图都不占页。让 `drop_written` 什么也不做时这个用例失败：每个实例写入视图的 Rss 和执行视图相同（180 KB、1452 KB、500 KB）。
-  - cargo test（234 个）、clippy（含 Android 目标）、两层的 21 组差分测试都通过。LTP 的 syscall 测试 958 个通过（上一次 960）：futex_wait05、pselect01_64 从通过变成失败，都是"睡得太久"（[偶发项](../milestones.md#已知的偶发失败)），单独重跑两次、拿 HEAD 的二进制在同一时刻重跑也都失败；其余逐项相同。
+  - 新增 `code_cache_pages_are_counted_once`（rootfs 测试）：Tier 1 下跑一批 busybox 的小程序、shell 停下之后，读 appine-run 的 smaps，执行视图占着页，写入视图都不占页。
   - 只在 colima 的虚拟机里跑，没上手机。
 
 **推迟项**：
