@@ -606,8 +606,9 @@ struct Vma {
     written: Cell<bool>,
     /// `MAP_GROWSDOWN`: grows downwards when an address below it is accessed ([`Mm::grow_down`]).
     growsdown: bool,
-    /// `MADV_DONTDUMP`: its contents are left out of core files ([`Mm::dump_regions`]); fork
-    /// inherits it.
+    /// `MADV_DONTDUMP`: its contents are left out of core files ([`Mm::dump_regions`]). Linux's
+    /// fork inherits it; here fork and mremap growth do not carry it over yet, so the child's
+    /// VMAs and the grown part start without it.
     dontdump: bool,
     /// `MAP_NORESERVE`: not counted in the commit ([`Mm::commit_too_big`]).
     noreserve: bool,
@@ -1675,17 +1676,17 @@ impl Mm {
         (top >= MMAP_MIN + len).then(|| top - len)
     }
 
-    /// Puts part of a VMA into the page table. `PROT_NONE` is left out: writing entries page by
-    /// page for the large address ranges V8 and the JVM reserve takes a lot of memory (16 MB for
-    /// 8 GB), so they are added when mprotect grants permissions ([`Mm::mprotect`]).
-    /// Builds entries for the VMA's own host memory `[host, host + len)` at
-    /// `[start, start + len)`, leaving existing entries alone (those changed by copy-on-write, or
-    /// kept by mprotect with permission 0). `PROT_NONE` gets none; neither does anything over
-    /// [`EAGER_MAX`], which is filled on demand at access ([`Mm::fault_in`]), except executable
-    /// file mappings, which are built anyway: when translations are shared, guest instruction
-    /// words are checked against the page table (the DBT's recheck), and blocks without entries
-    /// must be parked and restored page by page on first execution. Their size is bounded by the
-    /// file size.
+    /// Puts part of a VMA into the page table: builds entries for the VMA's own host memory
+    /// `[host, host + len)` at `[start, start + len)`, leaving existing entries alone (those
+    /// changed by copy-on-write, or kept by mprotect with permission 0). `PROT_NONE` gets none:
+    /// writing entries page by page for the large address ranges V8 and the JVM reserve takes a
+    /// lot of memory (16 MB for 8 GB), so they are added when mprotect grants permissions
+    /// ([`Mm::mprotect`]). Neither does anything over [`EAGER_MAX`], which is filled on demand at
+    /// access ([`Mm::fault_in`]), except executable mappings that are not private anonymous
+    /// (`file`: file mappings, shared anonymous memory, SysV shm), which are built anyway: when
+    /// translations are shared, guest instruction words are checked against the page table (the
+    /// DBT's recheck), and blocks without entries must be parked and restored page by page on
+    /// first execution. For a file mapping their size is bounded by the file size.
     fn map_pages(
         mmu: &mut Mmu,
         start: u64,
@@ -2741,11 +2742,12 @@ impl Mm {
         Ok((locked, anon))
     }
 
-    /// madvise(`MADV_REMOVE`): zeroes this part of shared mappings, which for a file mapping means
-    /// punching a hole in the file. As on Linux, a range with locked pages or private anonymous
-    /// mappings is EINVAL, and other private mappings or ones that cannot get write permission
-    /// are EACCES (since 6.7 what counts is whether write permission can be granted, not whether
-    /// it is held now). The range must be fully mapped.
+    /// madvise(`MADV_REMOVE`): zeroes this part of shared mappings. For a file mapping Linux
+    /// punches a hole in the file; here the zeros are written through the host mapping, so the
+    /// file reads back zeros but its storage is not freed. As on Linux, a range with locked pages
+    /// or private anonymous mappings is EINVAL, and other private mappings or ones that cannot get
+    /// write permission are EACCES (since 6.7 what counts is whether write permission can be
+    /// granted, not whether it is held now). The range must be fully mapped.
     pub fn remove(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         self.check_mapped(addr, len)?;
         let end = addr + len;

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-03 (targeted verification: added two facts carried over from the retired design doc §5 — shared-mapping coherence and the host address-space limit)
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -446,7 +446,7 @@ signals may still be delivered).
   do nothing; `MADV_KEEPONFORK` is rejected on non-private-anonymous ranges, which Linux does not do.
 - **`MADV_DONTNEED` on private file mappings is a no-op:** written private pages keep their data
   instead of reverting to the file. `MADV_REMOVE` zero-fills through the host mapping rather than
-  punching a hole, so storage is not freed and its doc comment is wrong.
+  punching a hole, so storage is not freed.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
 - **Truncation race can kill the process or the app:** the host file is shortened before page-table
@@ -462,8 +462,8 @@ signals may still be delivered).
   entries were moved drops VMAs and leaves stale entries at the destination.
 - **Shared anonymous `MAP_NORESERVE` is accounted:** contrary to its own comment and Linux, so a
   large shared reservation can fail with `ENOMEM`.
-- **`dontdump` is lost on fork and mremap growth:** contrary to the field comment and Linux, so a
-  child's core dump includes `MADV_DONTDUMP` regions and smaps loses `dd`.
+- **`dontdump` is lost on fork and mremap growth:** contrary to Linux, so a child's core dump
+  includes `MADV_DONTDUMP` regions and smaps loses `dd`.
 - **pagemap reports lent pages as exclusive:** they are mapped by several address spaces, contrary
   to Linux and the function's own description of the bit.
 - **Robust futex death skips CoW pages:** `owner_died` looks up the lock word with `translate`,
@@ -473,10 +473,6 @@ signals may still be delivered).
   would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
   loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,
   and the guard's comment cites a path (`recall`) that never reaches it.
-- **Stale comments:** the engine header says Tier 1 translation uses the ITLB; engine and task
-  comments say Tier 1 hands `ic ivau` to the kernel at `dsb`/`isb`; the `map_pages` comment says
-  only file mappings are eagerly mapped when executable; the `Vma.dontdump` comment says fork
-  inherits it.
 
 ## Open questions
 
