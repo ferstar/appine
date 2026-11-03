@@ -7,10 +7,9 @@
 - **对 socket 的 fd 做 fchmod 返回 EACCES**：libuv 的 `uv_pipe_chmod` 先 fchmod socket 的 fd，Linux 上改的是 sockfs 里它自己的 inode，会成功；只有 EINVAL、EOPNOTSUPP 才退回按路径 chmod。appine 的 fchmod 对仓库之外的 fd 返回 EBADF，musl 的 fchmod 遇到 EBADF 时退回 `chmod("/proc/self/fd/N")`（给 `O_PATH` 打开的 fd 用的），走到合成的节点上成了 EACCES。Node 的 `listen({ path, readableAll, writableAll })` 因此失败（test-net-server-listen-path、test-cluster-listen-pipe-readable-writable）。
   - 改动：socket 和匿名管道的 fd 可以 fchmod、fchown，当作调用者自己的（Linux 上属主是创建它的进程），按原来的规则检查权限，改了不记下来。
 - **测试**：
-  - 仓库的单元测试新增 `deleted_directories_take_no_new_entries`，去掉链接数的检查时失败。
-  - 差分测试 compat 组加了：删除掉的当前目录里 mkdir、open(O_CREAT)、symlink 的错误码，socket 和管道的 fd 上的 fchmod。两层都与原生相同。上一轮的二进制上 mkdir 成功了，open 和 symlink 报 EISDIR、EEXIST，fchmod 报 EACCES。
-  - 上面三个 Node 测试单独跑都通过。Node 的 test/parallel 整套重跑：12 个失败，原生的 5 个之外的 7 个都是被 OOM killer 结束的（[第二轮普查](70-survey-suites.md)的问题 5，这次 26 次），没有别的。
-  - cargo test（205 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 954 个通过，比上一轮少的 epoll_pwait03、futex_wait05、prctl09 都是睡眠精度（全量和 Node 的整套测试同时跑），CPU 空闲后单独重跑，这一轮和上一轮的二进制都是三个全部失败。
+  - 仓库的单元测试新增 `deleted_directories_take_no_new_entries`。
+  - 差分测试 compat 组加了删除掉的当前目录里新建的错误码、socket 和管道的 fd 上的 fchmod，两层都与原生相同。
+  - 上面三个 Node 测试都通过；test/parallel 整套重跑，比原生多出的失败都是被 OOM killer 结束的（[第二轮普查](70-survey-suites.md)的问题 5）。
 
 **推迟项**：
 

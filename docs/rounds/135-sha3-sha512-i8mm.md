@@ -11,15 +11,13 @@
 
 ## 测试
 
-- lockstep 新类别 `sha3_sha512`（八条指令，随机的寄存器、XAR 的移位数）和 `i8mm`（五条指令，向量和按元素形式）；类别要求的 HWCAP2 位放在 `requires` 的高 32 位。20 万轮的加长 lockstep 里各执行 200000 条，与硬件全部一致，Tier 1 没有退回 Tier 0。
-- 白名单与 llvm-mc 的对照加上 `+sha3`、`+i8mm`。20 万个随机样本一致；变异检验：去掉这两个之后报出 EOR3、BCAX、XAR、SHA512SU1、USDOT、SUDOT、USMMLA 等分歧。
-- 单元测试：`sha3_and_i8mm_follow_the_feature_set`（宿主有时 EOR3、SMMLA 的结果，没有时是未定义指令），`id_registers_match_hwcap` 加上 SHA2、SHA3、I8MM 字段和 SHA3、SHA512 一起宣告；`unimplemented_encodings_are_undefined` 里的 USDOT 换成 BF16 的 BFDOT 和 SM4E；auxv 的单元测试比对 `AT_HWCAP2`。
-- 差分测试 `c-programs` 组新增 `crypto.c`（整个文件只加 `+sha3+i8mm`）：HWCAP、HWCAP2、两个 ID 寄存器的字段、cpuinfo 的三个名字；EOR3、BCAX、RAX1、XAR、四条 SHA512 和 SMMLA、UMMLA、USMMLA、USDOT（4S、2S、按元素）、SUDOT 的 intrinsics 的结果，汇编里这些指令的条数。两个执行层下都与原生相同。
+- lockstep 新类别 `sha3_sha512` 和 `i8mm`，加长的 lockstep 里与硬件全部一致；类别要求的 HWCAP2 位放在 `requires` 的高 32 位。白名单与 llvm-mc 的对照加上 `+sha3`、`+i8mm`，随机样本一致。
+- 单元测试 `sha3_and_i8mm_follow_the_feature_set`，`id_registers_match_hwcap` 加上新的字段和 SHA3、SHA512 一起宣告；`unimplemented_encodings_are_undefined` 里的 USDOT 换成 BF16 的 BFDOT 和 SM4E；auxv 的单元测试比对 `AT_HWCAP2`。
+- 差分测试 `c-programs` 组新增 `crypto.c`：特性的几处宣告、各条指令的 intrinsics 的结果和汇编里的条数，两个执行层下都与原生相同。
 - **收益**：原生、上一轮的二进制、这一轮的二进制交替各跑三次，结果的摘要、输出的 md5 在各种组合下都相同。
   - SHA-512：Python 的 `hashlib.sha512`（OpenSSL 3.5.9，按 HWCAP 选 `sha512_block_armv8`）算 32 MiB。原生 1495–1532 MB/s，用 `OPENSSL_armcap` 关掉 SHA512 指令是 634–639 MB/s；appine 里 362–365 → 1488–1500 MB/s（4.1 倍），与原生用硬件指令时持平：整个循环都是原样执行的 SHA512 指令。
   - SHA3-256：`hashlib.sha3_256` 原生 669–692 MB/s，关不关 SHA3 都一样，appine 里新旧都是 418–425 MB/s：这台机器上 OpenSSL 的 Keccak 不走 SHA3 指令（它只在认为划算的 CPU 上用）。
   - I8MM：[上一轮](133-asimddp.md)的 `vpxenc`（`VPX_SIMD_CAPS_MASK` 0x3 是 NEON 加点积，0x7 再加 I8MM）。原生 0x3 1.49–1.59s、0x7 1.49–1.55s，appine 里新旧二进制交替（ABBA）都是 3.5s 左右：VP9 编码在这个配置下几乎不走 I8MM 的路径，原生上也没有收益。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1001 个通过（上次 1001），逐项相同。
 
 **推迟项**：
 

@@ -7,7 +7,7 @@
 - **改动**：恢复停放的块时，停放时留下的墓碑还在（这之后没有重建过表）就原样恢复，把 pc 写回去。代码地址没变，不持锁查表的线程读到恢复前还是恢复后的都对；占用数不变，墓碑数减一。这样表里每个不空的位置都有 `table_used` 记着，整体清空能全部清掉。
   - 顺带修了一处编译错误：非 aarch64 Linux 宿主上编译的 `appine_dbt_invalidate` 桩的参数没有跟着[JIT 负载](35-jit.md)那一轮改了的签名一起改（少了 cpu），在 macOS 上直接编译引擎报类型冲突。CI 和 Android 都是 aarch64 Linux，编译不到这一支。
 - **测试**：
-  - 引擎测试新增 `parking_and_flushing_over_and_over_keeps_free_slots`：在最小的表（4096 项）里，让一个块反复停放、恢复、整体清空 5000 轮。在另一个线程里跑，60 秒没跑完算失败。改动之前的代码上超时失败，改动之后瞬间跑完。
+  - 引擎测试新增 `parking_and_flushing_over_and_over_keeps_free_slots`：在最小的表里让一个块反复停放、恢复、整体清空。在另一个线程里跑、限时 60 秒，免得改错了卡住。
   - 用改好的二进制重跑被挡住的测试集，与原生对照：
 
     | 负载 | 原生 | appine |
@@ -18,7 +18,6 @@
     | Go 1.26 标准库 | 250 个包全部通过 | 250 个包全部通过 |
 
     Go 第一次重跑只用了 73 秒：上一轮崩溃之前已经通过的包的结果被 `go test` 缓存了。负载改成 `-count=1` 之后重跑，每个包都真的运行了（编译仍然用了缓存的结果，149 秒和原生的 5 分钟不能比）。
-  - cargo test（202 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 954 个通过（[/proc/meminfo 那一轮](68-meminfo.md) 958 个），差别都是[偶发项](../milestones.md#已知的偶发失败)：futex_wait05、nanosleep01、select02 是睡眠精度；mmap21_01 打开 `/dev/shm/ltp_mmap21_2` 得到 EEXIST，是它和 mmap21_02 并发时共用同一个文件。
 - **重跑新找到的问题**（Node.js 的测试）：
   1. **已经删除的目录里还能新建**。进程 chdir 进一个目录、把它 rmdir 之后，用相对路径 mkdir 成功了，Linux 上是 ENOENT（`may_create` 检查 `IS_DEADDIR`）。仓库的 `add_dentry` 只检查上级是不是目录，没看它的链接数是不是已经是 0。test-fs-mkdir 因此失败。
   2. **对 AF_UNIX socket 的 fd 做 fchmod 返回 EACCES**。libuv 的 `uv_pipe_chmod` 先 fchmod socket 的 fd（Linux 上改的是 sockfs 里它自己的 inode，会成功），只有 EINVAL、EOPNOTSUPP 才退回按路径 chmod；appine 的 fchmod 只认仓库里的文件和终端的从设备，对 socket 返回 EACCES。Node 的 `listen({ path, readableAll, writableAll })` 因此失败（test-net-server-listen-path、test-cluster-listen-pipe-readable-writable）。

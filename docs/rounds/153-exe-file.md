@@ -18,16 +18,8 @@
 
 ## 测试
 
-- 差分测试 `compat2` 组的 `exelink.c`：程序把自己复制一份再执行，然后
-  - 删掉自己的程序文件：读链接、经由它 stat（同一个文件、nlink 0）、open（读到 ELF 头，fstat 是同一个文件）、maps；再 `execl("/proc/self/exe")` 重新执行自己，新程序读到的 exe 和 maps 仍是 `/tmp/exe-del (deleted)`，stat 出来是删掉的那个文件；
-  - 像 dpkg 那样用 rename 换掉自己的程序文件：读链接带 ` (deleted)`，stat、open 到的是原来那个；
-  - 只改名：stat、open 到的是原来那个（读出来的路径 Linux 跟着变，appine 不变，不比）；
-  - 别的进程经由 `/proc/<pid>/exe` 看一个删掉了自己的程序文件的子进程。
-  
-  Tier 1 下与原生逐字相同。
-- 变异检查：跟随改回按文字解析、读链接不加 ` (deleted)`，用例从第二行起不同。
+- 差分测试 `compat2` 组的 `exelink.c`：程序把自己复制一份再执行，然后删掉、用 rename 换掉、只改名自己的程序文件，看读链接、经由它 stat、open、`execl("/proc/self/exe")` 和 maps，以及别的进程经由 `/proc/<pid>/exe` 看到的，Tier 1 下与原生逐字相同。只改名时读出来的路径 Linux 跟着变、appine 不变，不比。
 - 写用例时原生一侧卡住过一次：等着的子进程继承了另一根管道的写端，读不到 EOF，管道改成 `O_CLOEXEC`。
-- cargo test（283 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过（上次 1010）：futex_wait05 这次通过，是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
 
 **推迟项**：
 

@@ -12,11 +12,9 @@
   - netlink 的 `RTM_NEWLINK` 加上 `IFLA_STATS`（24 个 u32，截成 32 位）和 `IFLA_STATS64`（Linux 6.1 的 25 个 u64），musl 的 getifaddrs 把前者放进 `AF_PACKET` 那一项的 `ifa_data`；
   - 新增 `/sys/class/net/<接口>`：`statistics/` 下 Linux 的 24 个文件，另有 `address`、`addr_len`、`broadcast`、`carrier`、`flags`、`ifindex`、`iflink`、`mtu`、`operstate`、`type`，取值与 netlink 的回答一致（类型只分回环和以太网，`flags` 与 Linux 一样不含 `IFF_RUNNING` 这些按状态算的位）。Linux 上接口目录是指向 `/sys/devices` 下面的符号链接，这里是目录：宿主的设备路径拿不到，都指向 `devices/virtual/net` 又会让按它区分虚拟接口的程序把 wlan0 当成虚拟的。
 - **测试**：
-  - 新增的 guest 程序 `tests/guest/traffic.c`：在回环上建一条 TCP 连接发 100000 字节，没有 connect 的 UDP 收发 10 个 100 字节的数据报（先偷看一次），再发一个没人读的 50 字节数据报；之后 `/proc/net/dev`、sysfs、getifaddrs 的 `ifa_data` 三处 lo 的计数相同，发出的多 101050 字节、收到的多 101000 字节，包数至少多 13、12 个。只在 appine 里成立（Linux 还算协议头），放在 cargo test 里。
-  - 变异检验：偷看的也算、收到的不算、`IFLA_STATS` 的前四项排错、sysfs 的 `rx_bytes` 读成发出的，各自让它失败。最后一个起初查不出来：收发的字节数正好相等，所以加了那个没人读的数据报。
-  - 差分测试 compat 组新增一段：`/proc/net/dev` 的表头和 lo 那一行的列数，`/sys/class/net/lo` 的 10 项属性和 `statistics/` 下的文件列表，用 python 在回环上发 100000 字节之后 lo 的收发字节、包数都增加，`/proc/net/dev` 与 sysfs 一致。与原生逐行相同（原生的 lo 是 `0x9`、`unknown`、`772`、MTU 65536）。
-  - 单元测试新增 3 个（sockaddr 的解析、回环连接的计数和 MSS、没有 connect 的数据报按对端认），netlink 转储的单元测试检查 `IFLA_STATS` 截成 32 位、`IFLA_STATS64` 完整。
-  - cargo test（212 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过（上一轮 957），没有 BUG：select02 又通过了，futex_wait05 仍然失败（都是[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
+  - 新增的 guest 程序 `tests/guest/traffic.c`：在回环上用 TCP、UDP 收发之后，`/proc/net/dev`、sysfs、getifaddrs 的 `ifa_data` 三处 lo 的计数相同、增加的字节数正好是载荷。只在 appine 里成立（Linux 还算协议头），放在 cargo test 里。变异检验发现收发的字节数正好相等时 `rx_bytes` 读成发出的也查不出来，所以加了一个没人读的数据报。
+  - 差分测试 compat 组新增一段：`/proc/net/dev` 的格式，`/sys/class/net/lo` 的属性和 `statistics/` 下的文件列表，回环上收发之后计数增加、`/proc/net/dev` 与 sysfs 一致，与原生逐行相同。
+  - 单元测试：sockaddr 的解析、回环连接的计数和 MSS、没有 connect 的数据报按对端认，`IFLA_STATS` 截成 32 位、`IFLA_STATS64` 完整。
 - **开销**：只在 socket 的收发路径上。用一个回环上的微基准（`target/mem/netbench.c`：5000 次短连接，每次各收发 100 字节；5 万次 UDP 来回；1 GB 的 TCP 流），与上一轮的二进制交替跑三轮：
   - 短连接 0.103–0.106 → 0.108–0.112 秒（每条连接两端各一次 getsockname，约 1 微秒）；
   - UDP 来回 0.121–0.125 → 0.125–0.128 秒；

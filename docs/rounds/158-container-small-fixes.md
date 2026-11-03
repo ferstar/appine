@@ -11,16 +11,9 @@
 
 ## 测试
 
-- 新的差分测试组 `containers`（容器运行时用到的内核接口，之后几轮接着往里加）：
-  - capget：空数据指针时不认识的版本、pid 是 -1、没有这个进程都是 0，版本写回 `0x20080522`；有数据指针时 EINVAL、ESRCH。
-  - 开机时的命名空间里改 lo：按编号、按名字的 `RTM_NEWLINK`、`RTM_SETLINK` 拉起已经起着的 lo，标志全 0、整个 `ifi_flags`、相同的名字和 MTU 成功；没有这个编号、名字是 ENODEV，新建不认识的类型 EOPNOTSUPP，EXCL 是 EEXIST，REPLACE 是 EOPNOTSUPP，编号名字都没给时两种消息分别是 ENODEV、EINVAL，负的编号 EINVAL，nobody 是 EPERM；`ip link set lo up`、`ip link set dev lo mtu 65536`。真要改的请求在原生上会改掉容器的 lo，不比。原生一侧加 `--cap-add NET_ADMIN`。
-  - `/proc`、`/sys`、`/dev/pts`、新挂的 procfs 和 sysfs 的根目录都是 1。docker 容器里的 `/sys/fs/cgroup` 是 cgroup 命名空间里的子目录，原生上不是 1，不比。
-  - 照 pathrs-lite 的做法经由 openat2 打开 `thread-self/fd/` 和 `thread-self/fdinfo/2`，读链接与 `/proc/self/fd/2` 相同：主线程、另一个线程、新的 pid 命名空间里（runc init 那样，看到的还是外面的 procfs）。
-  
-  两个执行层下都与原生逐字相同。写用例时两边都编译失败过一次（仓库里没有内核的头文件、musl 没有 `strerrorname_np`），输出一样算通过，看了 `.native` 才发现。
-- 变异检查：四处改动一起拿掉，capget、netlink、inode、thread-self 四段都与原生不同。
-- `net.rs` 的单元测试 `host_links_accept_requests_that_change_nothing`：上面的各种请求和错误码，加上关掉 lo、混杂模式、别的 MTU、改名、别的属性都是 EOPNOTSUPP。
-- cargo test（291 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过（上次 1010）：mmap21_01 这次通过，是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
+- 新的差分测试组 `containers`（容器运行时用到的内核接口，之后几轮接着往里加）：capget 探测版本；开机时的命名空间里什么也不改的 `RTM_NEWLINK`、`RTM_SETLINK` 和各种错误、`ip link set lo up`（原生一侧加 `--cap-add NET_ADMIN`；真要改的请求在原生上会改掉容器的 lo，不比）；几个合成文件系统根目录的 inode 编号（docker 容器里的 `/sys/fs/cgroup` 是 cgroup 命名空间里的子目录，原生上不是 1，不比）；照 pathrs-lite 的做法经由 openat2 读 `thread-self/fd/`，含另一个线程和新的 pid 命名空间里。两个执行层下都与原生逐字相同。
+- 写用例时两边都编译失败过一次（仓库里没有内核的头文件、musl 没有 `strerrorname_np`），输出一样算通过，看了 `.native` 才发现。
+- `net.rs` 的单元测试 `host_links_accept_requests_that_change_nothing`：各种请求和错误码，真要改的都是 EOPNOTSUPP。
 
 **推迟项**：
 

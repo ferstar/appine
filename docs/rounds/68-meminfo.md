@@ -7,9 +7,8 @@
   - hal 的 `host_meminfo` 读宿主的 `/proc/meminfo`，guest 的 `/proc/meminfo` 照搬那 16 项，与 docker 的容器看到的一样；guest 能用的上限另由 cgroup 的 `memory.max` 告诉程序。读不了宿主的文件时退回 sysinfo，可用量按空闲加缓冲区估计。
   - guest 的 sysinfo 也照搬：除了总量和空闲量，`sharedram`（Shmem）、`bufferram`（Buffers）、`totalswap`、`freeswap` 原来都是 0。
 - **测试**：
-  - 差分测试 `compat` 新增：`MemTotal` 与原生相同（两边是同一台宿主），`MemAvailable` 不小于 `MemFree`，`Cached` 不是 0；sysinfo 的 `totalram`、`totalswap` 与 `/proc/meminfo` 一致，`bufferram`、`sharedram` 不是 0。上一轮的二进制上 `Cached`、`bufferram`、`sharedram` 都是 0。
-  - free 显示已用 372 MB、可用 3304 MB，与原生的 `/proc/meminfo` 相同；普查的 `tui` 里 htop 的内存条是 426M/3.81G（原来 2.88G 到 3.66G）。
-  - cargo test（200 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过（上次 957）：futex_wait05 这次通过，没有新的失败，sysinfo01、sysinfo02 照常通过（sysinfo03 与上一轮一样跳过）。
+  - 差分测试 `compat` 新增：`MemTotal` 与原生相同（两边是同一台宿主），别的项只比大小关系、不是 0，sysinfo 与 `/proc/meminfo` 一致。
+  - free 和普查的 `tui` 里 htop 显示的内存与原生的 `/proc/meminfo` 一致。
 
 **推迟项**：
 

@@ -19,11 +19,9 @@
 
 ## 测试
 
-- 新的差分测试组 `userns-ids`：同一个命名空间里没有声明时 `SCM_CREDENTIALS` 是真实 ID、声明有效 ID 可以、声明 root 和别人的 pid 是 EPERM、长度不对是 EINVAL，root 什么都能声明、pid 不存在是 ESRCH；父进程（root）写好子进程的映射（里面的 0 是外面的 1000，100 是外面的 0），子进程 setresuid 成里面的 0：两边的 `SO_PEERCRED`、没有声明和声明了的 `SCM_CREDENTIALS`（声明里面的 100 靠命名空间里的 CAP_SETUID 通过，外面看到 0；映射不到的是 EINVAL，声明父进程的 pid 是 EPERM；root 声明的 4242 里面看到 65534）；kill、真实 ID 是 5000 的进程的 kill、sigqueue 的 si_uid；SysV 消息队列的属主（IPC_STAT、IPC_SET 的 EINVAL、/proc/sysvipc）；`/proc/net/tcp` 的 uid；exec 之后的 auxv；停止、继续、退出的 SIGCHLD 和 waitid 的 si_uid。
+- 新的差分测试组 `userns-ids`：同一个命名空间里 `SCM_CREDENTIALS` 的声明和权限；改了 ID 的映射之后，两边看到的 `SO_PEERCRED`、`SCM_CREDENTIALS`、kill 和 sigqueue 的 si_uid、SysV 消息队列的属主、`/proc/net/tcp` 的 uid、auxv、SIGCHLD 和 waitid 的 si_uid。
 - 单元测试 `si_uid_follows_the_user_namespace`（`signal`）。
-- 变异检查：si_uid 不按目标换算，用例在子进程收到的 SIGUSR1 那一行起不同。
 - 全量运行时原生一侧失败过一次：子进程继续之后马上退出，父进程再用 waitid 等继续的事件时它已经是僵尸，Linux 返回 ECHILD；用例改成子进程等父进程取走继续的事件再退出。
-- cargo test（283 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过：mmap21_02 这次通过（[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
 
 **推迟项**：
 

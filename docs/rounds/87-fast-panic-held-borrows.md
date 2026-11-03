@@ -7,7 +7,7 @@
   - **改动**：
     - 用 `bug::catch` 兜住。出错时与持锁的路径一样，取 BKL 用 SIGSEGV 结束这个进程，报告 `kernel panic in syscall <编号> without the BKL`。
     - 展开经过的帧里只有原子变量、`Arc` 和 futex 队列的锁（中毒了照样用），没有 `Rc`。
-  - **测试**：测试钩子新增第 9 种，让调用的线程下一次不持 BKL 的系统调用 panic。`tests/guest/bugs.c` 用 `clock_gettime` 触发，子进程被 SIGSEGV 结束。变异检验：去掉 `bug::catch` 时，`appine-run` 报 `internal error in guest thread 5, aborting` 后 abort。
+  - **测试**：测试钩子新增第 9 种，让调用的线程下一次不持 BKL 的系统调用 panic。`tests/guest/bugs.c` 用 `clock_gettime` 触发，子进程被 SIGSEGV 结束。
 - **持着打开文件的借用去等待**：
   - **为什么要查**：`RefCell` 的借用活过了放开 BKL 的那一刻，不会改坏计数；但别的线程这时对同一个对象 `borrow_mut` 会 panic（already borrowed），它所在的进程就被当作撞上内核 bug 结束。
   - **编译器替我们查掉的部分**：
@@ -22,11 +22,7 @@
     - **epoll_pwait**：`let FileKind::Epoll(ep) = &epf.borrow().kind else { … };` 把 epoll fd 的打开文件借到了函数结束，等待期间也一直借着。后面的 `let ep = ep.clone()` 只是遮蔽了名字，不会提前结束借用。[M4](06-m4.md) 起就有。
     - **seccomp 通知 fd 的 ioctl**：`if let FileKind::SeccompNotify(l) = &file.borrow().kind { return seccomp::ioctl(…) }` 在 `NOTIF_RECV` 等通知期间一直借着通知 fd 的打开文件。[seccomp](59-seccomp.md)那一轮起就有。
   - **改动**：两处都先在一句里取出要用的 `Rc`（epoll、过滤器，后者加了 `Listener::filter`），借用随这一句结束。epoll 的打开文件本身仍留到函数结束，等待期间 fd 被关掉也保活，与原来一样。
-  - **测试**：
-    - 差分测试 epoll 组新增一项：一个线程在 epoll_wait 里等，另一个线程对 epoll fd 做 `fcntl(F_SETFL, O_NONBLOCK)`、`ioctl(FIONBIO)`，再写 eventfd 叫醒它。
-    - seccomp 组新增一项：一个线程在 `NOTIF_RECV` 里等，另一个线程对通知 fd 做同样的两件事，再触发一次通知，由它回答。
-    - 原生上两项都成功。上一轮的二进制上，这两个进程都被 SIGSEGV 结束（`borrow_mut` 时 panic）。
-- **测试**：cargo test（207 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过（上一轮 959），只有 futex_wait05 从通过变成失败（睡眠的精度，[偶发项](../milestones.md#已知的偶发失败)，上一轮刚从失败变成通过），其余逐项相同。
+  - **测试**：差分测试 epoll 组、seccomp 组各新增一项：一个线程在 epoll_wait、`NOTIF_RECV` 里等，另一个线程对那个 fd 做 `fcntl(F_SETFL, O_NONBLOCK)`、`ioctl(FIONBIO)`，再叫醒它。
 
 **推迟项**：
 

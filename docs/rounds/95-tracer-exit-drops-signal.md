@@ -14,11 +14,8 @@
   - 调试器、strace 都先 wait 再处理，所以实际碰到的几乎都是"已经取走"。
 - **改动**（`core/kernel/src/ptrace.rs` 的 `detach`）：跟踪者退出时，这次停住已经被 wait 取走（`Trace::reported`，`WNOWAIT` 不算）的，让它以信号 0 继续；没取走的照旧投递。PTRACE_DETACH 不变，按它的参数投递。group-stop 里的仍然停着，与原生相同。
 - **测试**：
-  - 差分测试 ptrace 组新增一个 C 程序，有六种情况：停在 attach 的 SIGSTOP、有处理函数的 SIGUSR1、默认动作的 SIGTERM 上（都已经 wait 取走），group-stop 里，以及 SIGUSR1、SIGTERM 还没 wait 就退出。每种情况之后看处理函数有没有运行、进程的状态、有没有被结束。
-  - 跟踪者和被跟踪的进程是兄弟进程。原生的容器没有 `CAP_SYS_PTRACE`、Yama 的 `ptrace_scope` 是 1，所以被跟踪的进程先 `PR_SET_PTRACER_ANY`。appine 没有 Yama 的限制，这个 prctl 返回 EINVAL，与没有 Yama 的 Linux 一样。
-  - 输出与原生逐行相同；变异检验（跟踪者退出时都照常投递）有三种情况不同。
-  - 第 92 轮最初卡住的用法，delve 读到 EOF 退出，现在进程照常运行，SIGTERM 能结束它。
-  - cargo test、clippy、两层的差分测试和 LTP 与[第 93 轮](93-fd-paths-resolve-symlinks.md)一起跑。
+  - 差分测试 ptrace 组新增一个 C 程序：跟踪者在已经 wait 取走、还没取走的信号投递停止和 group-stop 里退出之后，处理函数有没有运行、进程的状态、有没有被结束，与原生逐行相同。原生的容器没有 `CAP_SYS_PTRACE`、Yama 的 `ptrace_scope` 是 1，所以被跟踪的进程先 `PR_SET_PTRACER_ANY`；appine 上它返回 EINVAL，与没有 Yama 的 Linux 一样。
+  - 第 92 轮最初卡住的用法，delve 读到 EOF 退出，现在进程照常运行。
 
 **推迟项**：
 

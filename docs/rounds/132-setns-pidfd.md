@@ -14,13 +14,8 @@
 
 ## 测试
 
-- 新的差分测试组 `setns-pidfd`（docker 一侧加 `SYS_ADMIN`、`NET_ADMIN`，关掉 AppArmor，与 `nsfs` 组相同）：
-  - Python：标志为 0、有别的位、对自己的 pidfd 进自己的各种命名空间（用户命名空间是 EINVAL、time 可以）、普通文件、坏的 fd、命名空间文件配上不同的标志；一次进另一个进程的挂载、UTS、IPC、网络、cgroup 命名空间之后各个链接、主机名、当前目录（换成根），只进挂载命名空间；多线程时只进挂载命名空间是 EINVAL、连同 UTS 一起可以，time 命名空间（pidfd 和文件）是 EUSERS；进新的 pid 命名空间之后自己的不变、给子进程用的是它的，子进程在里面是 2 号；从里层的 pid 命名空间进外层的是 EINVAL，连同 UTS 一起要求时 UTS 也不换；去掉有效集里的 `CAP_SYS_ADMIN` 之后只进 root 建的用户命名空间的 UTS 是 EPERM、连同用户命名空间一起可以（之后有全部能力），多线程时连同用户命名空间是 EINVAL、UTS 也不换；去掉 `CAP_SYS_PTRACE` 之后对不可 dump 的进程是 EPERM；僵尸进程和已经回收的是 ESRCH。
-  - util-linux 的 nsenter：`-t` 进 UTS、网络（只有 lo），`-m -u -i -n` 和 `-a` 之后各种命名空间与目标相同；`unshare -p -f --mount-proc` 的 1 号进程的 pid、挂载命名空间里 `$$`；`unshare -U -r -u` 的用户命名空间里的主机名、用户 ID 和映射，`-a` 时也是；util-linux 的 `unshare -r`；目标退出之后失败。
-  - 两个执行层下都与原生相同；改之前的 appine 上 nsenter 每一步都是 "reassociate to namespaces failed: Invalid argument"。
-- 差分测试的软件包加了 util-linux-misc（它换掉 busybox 的 nsenter、unshare、setsid、taskset 等），`nsfs`、`namespaces` 组里原来测 busybox 的 `unshare`、`nsenter` 改成显式调用 `busybox unshare` 这样；本地的仓库要 `apk add util-linux-misc` 再用 `-r` 重新导出镜像。
-- 变异检验：后面几种按原来的用户命名空间算能力时，"user and uts" 那一行变成 EPERM；连同别的一起换挂载命名空间时也查 fs 共用，"threaded mnt and uts" 变成 EINVAL。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1000 个通过（上次 1000）：epoll_pwait03 由失败变成通过、futex_wait05 由通过变成失败，都是检查睡眠精度的[偶发项](../milestones.md#已知的偶发失败)，futex_wait05 与[上一轮](131-tmpfs-usage.md)的二进制交替单独跑各两次都失败；setns01、setns02 照常通过，其余逐项相同。
+- 新的差分测试组 `setns-pidfd`（docker 一侧加 `SYS_ADMIN`、`NET_ADMIN`，关掉 AppArmor，与 `nsfs` 组相同）：Python 测标志和 fd 不对时的 EINVAL、一次进另一个进程的几种命名空间、多线程时的 EINVAL 和 EUSERS、pid 命名空间、按进去之后的用户命名空间算能力、EPERM 和 ESRCH；再跑 util-linux 的 nsenter、unshare 的常见用法。两个执行层下都与原生相同；改之前的 appine 上 nsenter 每一步都是 "reassociate to namespaces failed: Invalid argument"。
+- 差分测试的软件包加了 util-linux-misc（它换掉 busybox 的 nsenter、unshare 等），`nsfs`、`namespaces` 组里原来测 busybox 的改成显式调用 `busybox unshare` 这样；本地的仓库要 `apk add util-linux-misc` 再用 `-r` 重新导出镜像。
 
 **推迟项**：
 

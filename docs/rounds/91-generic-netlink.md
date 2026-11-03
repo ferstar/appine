@@ -9,11 +9,9 @@
   - 错误消息附上整条请求（没有设 `NETLINK_CAP_ACK` 时 Linux 就这样）；确认只附上消息头，带 `NLM_F_CAPPED`。回答和确认各是一个数据报（`genlmsg_reply`、`netlink_ack`）：第一版放在了同一个数据报里，程序读一次就把确认一起读走、丢掉了，再等确认时一直等下去，差分测试的程序因此卡住。
 - **netlink socket 的 `SO_RCVTIMEO`**：原来只记在 TCP、UDP 的 socket 上，netlink socket 没有回答可读时一直等，不看它。上面那次卡住也是因为这个：程序设了 2 秒的超时，Linux 上会返回 EAGAIN。现在按它超时，`getsockopt` 读得回来。
 - **测试**：
-  - 差分测试 compat 组新增一个 C 程序：按名字和编号查 nlctrl（要确认和不要确认），查不存在的族、不带属性，发往不存在的族编号，nlctrl 不认识的命令，转储（只看 nlctrl，别的族取决于内核配置），`CTRL_CMD_GETPOLICY` 的三种错误，最后没有回答可读时 0.1 秒的 `SO_RCVTIMEO` 到期。打印回答的每个属性（嵌套的展开）、错误码、确认和错误消息的标志和附上的长度。与原生逐行相同；上一轮的二进制上 socket 就建不了。
-  - 单元测试新增一个（同样几种请求，回答和确认是两个数据报，错误消息附上整条请求）。
-  - guest 程序 `net.c` 原来检查 `NETLINK_GENERIC` 建不了，改成建得了，另查 `NETLINK_SOCK_DIAG` 仍是 EPROTONOSUPPORT；`waits.c` 加上在 netlink socket 上按 `SO_RCVTIMEO` 等一次。
-  - 变异检验：回答和确认放回同一个数据报、错误消息只附上消息头，单元测试失败，差分测试的程序与原生分别差 2 行、14 行（有了 `SO_RCVTIMEO`，少了确认也不再卡住，而是报 EAGAIN）；netlink 不看 `SO_RCVTIMEO`，`waits` 用例和差分测试的程序都卡到超时。
-  - cargo test（213 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过，与上一轮逐项相同，没有 BUG。
+  - 差分测试 compat 组新增一个 C 程序：nlctrl 的各种查询、错误、转储和 `SO_RCVTIMEO` 到期，打印回答的每个属性、错误码、确认和错误消息，与原生逐行相同。转储只看 nlctrl，别的族取决于内核配置。
+  - 单元测试新增一个：同样几种请求，回答和确认是两个数据报，错误消息附上整条请求。
+  - guest 程序 `net.c` 改成检查 `NETLINK_GENERIC` 建得了；`waits.c` 加上在 netlink socket 上按 `SO_RCVTIMEO` 等一次。
 
 **推迟项**：
 

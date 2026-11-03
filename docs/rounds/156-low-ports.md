@@ -18,15 +18,10 @@
 
 ## 测试
 
-- `portmap` 的单元测试：依次试三个偏移、都被占了让宿主分配；别的错误不往下试；同一个端口的多个租约共用宿主端口、最后一个归还才去掉登记；刚释放的再绑仍用原来的、被占就是 EADDRINUSE；命名空间、协议各自独立，UDP 先试 TCP 的宿主端口；监听事件每对只报一次。
-- 新的差分测试组 `lowports`：通配地址上监听 79，经由回环连，监听、客户端、accept 出来的连接的 getsockname、getpeername，`/proc/net/tcp` 里的监听行，监听关掉之后已经建立的连接；IPv6 双栈的 `[::]:113`，经由 IPv4、`::1` 连，`/proc/net/tcp6`；用 513 当源端口连过去，accept 到的对端是 513；正在监听时再绑是 EADDRINUSE，没有程序监听时 ECONNREFUSED；TIME_WAIT 里不带、带 `SO_REUSEADDR` 再绑；53 上一个 TCP 和两个 `SO_REUSEPORT` 的 UDP，`/proc/net/udp`，recvfrom 的来源是 53，连接了的 UDP。两个执行层下都与原生（容器里的 root 直接绑这些端口）逐字相同。原生容器里普通用户也绑得了低端口（docker 把 `ip_unprivileged_port_start` 设成 0），这一项不比；还没 accept 的连接 appine 的 `/proc/net` 本来就不列，只数监听的行。
-- 变异检查：`unmap_addr` 什么也不换，用例从第一行起不同（guest 看到的是 10079）。
-- 在 colima 的虚拟机里按 CI 的 Linux 宿主分支跑（appine-run 以 uid 501 运行，宿主本来就绑不了低端口，原来这一组全是 EACCES）：通过。
-- 开发机上确认宿主监听的是 10022（宿主的 `/proc/net/tcp6`），guest 的 `dmesg` 有那一行。
-- `rootfs_programs` 的 `low_ports_bind_elsewhere_on_the_host`：宿主上先占住 `[::]:10079`（Tier 0）、`10078`（Tier 1），guest 的 nc 换到 20079、20078；`Machine::take_listens` 报告 `nc`、端口、宿主端口，宿主经由它连得上、读到 nc 发的数据，guest 的内核日志有记录。把期望改成 10079 时测试失败，确认不是跳过了。
-- Android 模拟器（Pixel 4a，API 34）：`MachineTest.lowPortsMoveToHighPortsOnTheHost` 通过——App 进程自己 `ServerSocket(22)` 失败，guest 的 nc 绑 22 换到 10022，`Native.takeListens` 报告 `nc\t22\t10022`，App 进程连 10022 读到数据。在 App 里手工跑 `nc -lk -p 22 -e echo &`：guest 的 netstat 是 `:::22 LISTEN`，`dmesg` 有 `port 22/tcp is 10022 on the host`，通知栏出现「nc is listening on port 22」「Other devices connect to port 10022…」；`echo $NMAP_UNPRIVILEGED` 是 1（[第 152 轮](152-nmap-unprivileged.md)）。
-- App：`assembleDebug`、`lintDebug` 通过。
-- cargo test（290 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1010 个通过（上次 1010）：futex_wait05 这次通过，mmap21_01 这次失败，都是[偶发项](../milestones.md#已知的偶发失败)（mmap21_01 与 mmap21_02 是同一个程序，并发时两个都是 pid 2、共用 `/dev/shm` 里的同一个文件，这次 unlink 得到 ENOENT 的是它，表里补上了），其余逐项相同。
+- `portmap` 的单元测试：依次试几个偏移和让宿主分配、租约的共用和归还、刚释放的再绑、命名空间和协议各自独立、监听事件只报一次。
+- 新的差分测试组 `lowports`：低端口上 TCP、IPv6 双栈、UDP 的监听和连接，几方看到的 getsockname、getpeername、recvfrom 的来源和 `/proc/net` 里的行，用低端口当源端口，EADDRINUSE、ECONNREFUSED 和 TIME_WAIT 里再绑，两个执行层下都与原生（容器里的 root 直接绑这些端口）逐字相同。原生容器里普通用户也绑得了低端口（docker 把 `ip_unprivileged_port_start` 设成 0），这一项不比；还没 accept 的连接 appine 的 `/proc/net` 本来就不列，只数监听的行。CI 的 Linux 宿主分支上 appine-run 以普通用户运行、宿主本来就绑不了低端口，原来这一组全是 EACCES，现在在 colima 里按这个分支跑也通过。
+- `rootfs_programs` 的 `low_ports_bind_elsewhere_on_the_host`：宿主上先占住偏移之后的端口，guest 的 nc 换到下一个，`Machine::take_listens` 报告它，宿主经由它连得上。
+- Android 模拟器（Pixel 4a，API 34）上 `MachineTest.lowPortsMoveToHighPortsOnTheHost` 通过；在 App 里手工起 `nc -lk -p 22`，`dmesg` 有映射的那一行，通知栏出现监听的通知。
 
 **推迟项**：
 

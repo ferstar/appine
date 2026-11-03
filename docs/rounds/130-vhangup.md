@@ -12,9 +12,9 @@ Linux 的 `tty_vhangup` 和关掉最后一个主设备时的挂断都走 `__tty_
 
 ## 测试
 
-- 新的差分测试组 `vhangup`（原生一侧加 `CAP_SYS_TTY_CONFIG`、`CAP_SYS_ADMIN`）：没有控制终端时 vhangup 什么也不做；会话组长打开从设备作控制终端，会话里另一个进程组也开着它，主设备写进一行不读，组长 vhangup：组长收到 SIGHUP、SIGCONT，另一个进程收不到，两个旧的文件读到 EOF、写和 `tcgetattr` 是 EIO、`tcsetpgrp` 是 ENOTTY、TIOCSCTTY 是 EIO、`isatty` 为假、poll 全部就绪，`/dev/tty` 是 ENXIO，再 vhangup 什么也不做；重新打开从设备：又成了控制终端，挂断之前的输入没了，之后写进来的读得到，旧文件仍是挂断的；在新文件上 TIOCVHANGUP 同样挂断，再来一次是 EIO；主设备读得到从设备写出的；之后不带 `O_NOCTTY` 再打开照常能用；普通用户的 vhangup、TIOCVHANGUP 是 EPERM；主设备上的 TIOCVHANGUP：主设备读到 0、写是 EIO、poll 全部就绪，从设备照常能写，新开的 `/dev/ptmx` 不受影响。两个执行层下都与原生相同。
-- 变异检验：挂断时不丢掉没读的输入，重新打开之后读到的是挂断之前写进来的那一行；重新打开时不清掉 `hupped`，在新文件上的 TIOCVHANGUP 什么也没做，组长没有再收到信号（用例接着读那个没挂断的文件就卡住了，之后改成读之前先设成非阻塞）。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1001 个通过（上次 998）：vhangup01、vhangup02 由跳过变成通过；mmap21_02 这次通过（[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
+- 新的差分测试组 `vhangup`（原生一侧加 `CAP_SYS_TTY_CONFIG`、`CAP_SYS_ADMIN`）：没有控制终端时的 vhangup，会话组长 vhangup 之后的信号和旧文件上的读写、ioctl、poll、`/dev/tty`，重新打开之后的控制终端和输入，从设备和主设备上的 TIOCVHANGUP，普通用户的 EPERM，两个执行层下都与原生相同。
+- 变异检验让重新打开时不清掉 `hupped`，用例接着读那个没挂断的文件就卡住了，所以改成读之前先设成非阻塞。
+- LTP 新通过 vhangup01、vhangup02（原来跳过）。
 
 **推迟项**：
 

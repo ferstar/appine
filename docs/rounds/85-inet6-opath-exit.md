@@ -12,11 +12,9 @@
   - **编号**：原来只在入口停住时记下系统调用的编号，用 PTRACE_CONT 继续的线程停在 fork 事件上时，`NT_ARM_SYSTEM_CALL` 读到的是以前某一次入口停住时记的（测试里是 0）。现在有跟踪者时每个系统调用都记下（Linux 每次进内核都写 `regs->syscallno`）；vDSO 里读时钟的存根不记，Linux 上它们不进内核。
   - **查出来的 bug**：有 seccomp 的线程经由 vDSO 读时钟时，PTRACE_SYSCALL 下出口会多停一次。存根不停入口、不记编号，seccomp 也不检查它，但有 seccomp 时出口照样检查，拿上一次记的编号判断是不是存根，判断成普通的系统调用就停下：跟踪者看到一个没有入口的出口。自己装了过滤器的程序被 `strace -f` 跟踪时就会遇到。现在存根在出口也不停。这是 [seccomp](59-seccomp.md)那一轮起的 bug。
 - **测试**：
-  - 差分测试 ptrace 组新增一节：用 PTRACE_CONT 继续到 fork 事件，读 `NT_ARM_SYSTEM_CALL`，再改用 PTRACE_SYSCALL，下一次停住是 clone 的出口（op 2、编号 220、返回值是孙进程）。上一轮的二进制上，fork 事件时的编号是 0，下一次停在 rt_sigprocmask（135）的入口。
-  - seccomp 组新增一节：装了过滤器的子进程在 PTRACE_SYSCALL 下经由 vDSO 读一次时钟，raise 恢复信号掩码和 getpid 之间没有停止。上一轮的二进制多一次出口的停止。
-  - python 组的 FICLONE 那一段加了源、目标是 `O_PATH` 的 FICLONE，源是 `O_PATH` 的 FICLONERANGE，`O_PATH` 的 fd 上的 FIOCLEX：上一轮的二进制上前三个是 EXDEV，FIOCLEX 成功。
-  - compat 组比对 if_inet6 里回环的那一行，java 组在 `::1` 上监听、连接、收发一个字节。环境里没有 IPv6 时两边都没有那一行、报同样的错，结果仍然一致。上一轮的二进制上没有这个文件，JVM 报 `IPv6 protocol family unavailable`。
-  - cargo test（207 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过（上一轮 957）：只有 mmap21_02 从失败变成通过，是[偶发项](../milestones.md#已知的偶发失败)；futex_wait05 仍失败（睡眠的精度，偶发项），其余逐项相同。
+  - 差分测试 ptrace 组新增一节：用 PTRACE_CONT 继续到 fork 事件时读到的编号，改用 PTRACE_SYSCALL 之后停在 clone 的出口；seccomp 组新增一节：装了过滤器的子进程在 PTRACE_SYSCALL 下经由 vDSO 读时钟不多停。
+  - python 组的 FICLONE 那一段加了 `O_PATH` 的 fd 上的 FICLONE、FICLONERANGE、FIOCLEX。
+  - compat 组比对 if_inet6 里回环的那一行，java 组在 `::1` 上监听、连接、收发。环境里没有 IPv6 时两边都没有那一行、报同样的错，结果仍然一致。
 
 **推迟项**：
 

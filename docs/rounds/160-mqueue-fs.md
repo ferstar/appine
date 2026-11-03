@@ -18,11 +18,9 @@
 
 ## 测试
 
-- 差分测试 `containers` 组新增：挂上 mqueue，mountinfo、根目录的权限和大小、statfs 的类型，同一处再挂是 EBUSY；mq_open 建的队列在文件系统里的权限、大小、inode 和设备号与 fd 的 fstat 相同，读到状态行，目录列出它；在文件系统里 open(O_CREAT) 新建的队列用的是默认大小，打开的 fd 能 mq_getattr、mq_send，mq_open 收得到，write 是 EINVAL，fstatfs 的类型；O_EXCL、O_DIRECTORY；chmod、fchmod（mq fd）、chown、utimensat；mkdir、mknod、symlink、rename、rmdir、`q1/`、不存在的；nobody 删别人的队列（unlink、直接的 mq_unlink 系统调用都是 EPERM，libc 的 mq_unlink 是 EACCES），自己新建、删除；unlink 之后 mq_open 是 ENOENT；新的 IPC 命名空间里挂的是空的、设备号不同。
-- 两个执行层下都与原生逐字相同。写用例时子进程的输出丢过一次：stdout 接的是管道、全缓冲，fork 出来的子进程 `_exit` 不刷，原生上也一样丢，等于没测到，fork 之前和 `_exit` 之前都加了 fflush。
-- 变异检查：删除别人的队列改回 EACCES、根目录的大小不随队列数变，用例在这几处与原生不同。
+- 差分测试 `containers` 组新增：挂上 mqueue 之后的 mountinfo、根目录和 statfs，mq_open 建的队列在文件系统里的样子，在文件系统里新建、打开、改属性、删除队列，不支持的操作，粘滞位下删别人的队列（直接的系统调用是 EPERM、libc 的是 EACCES），新的 IPC 命名空间里的实例。两个执行层下都与原生逐字相同。
+- 写用例时子进程的输出丢过一次：stdout 接的是管道、全缓冲，fork 出来的子进程 `_exit` 不刷，原生上也一样丢，等于没测到，fork 之前和 `_exit` 之前都加了 fflush。
 - 在 appine 里实际跑：不再需要任何临时绕过，`podman run --network host --cgroups disabled` 起得来，容器里的 `/dev/mqueue` 是 mqueue 文件系统。
-- cargo test（291 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过，与上一轮逐项相同（mq_unlink01 照旧通过：libc 把 EPERM 换成 EACCES）。
 
 **推迟项**：
 

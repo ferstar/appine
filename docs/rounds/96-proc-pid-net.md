@@ -11,12 +11,8 @@
   - `/proc/net` 与 `/proc/mounts` 一样，是指向 `self/net` 的符号链接。
   - 属主和权限与原生相同：目录属于进程的用户，文件属于 root、0444，别的用户的进程也能读。
 - **测试**：
-  - cargo test 新增 `procfs_net_is_under_each_process`：`/proc/net` 读出来是 `self/net`；`/proc/self/net/dev` 能读；线程的目录下也有 net。
-  - 差分测试 compat 组新增一段，与原生逐行相同。检查的是：`/proc/net` 的类型和链接，9 个文件都在、能读，task 子目录里也有，经由 `/proc/net` 打开的文件的 fd 链接，目录和文件的权限、属主，以及经由两条路径读到的 `dev` 的表头相同。
-  - 变异检验：
-    - 改动之前的二进制在这一段的第一行就不同（`/proc/net` 是目录）；
-    - task 子目录下不给 net，cargo test 失败。
-  - cargo test（217 个）、clippy（含 Android）、两层的 20 组差分测试通过；LTP 的 syscall 测试 958 个通过，与第 95 轮逐项相同，没有 BUG。这一轮和下一轮的改动是一起跑的。
+  - cargo test 新增 `procfs_net_is_under_each_process`。
+  - 差分测试 compat 组新增一段：`/proc/net` 的链接，`/proc/self/net` 和 task 子目录里的文件，fd 链接，权限、属主，与原生逐行相同。
 - **开销**：经由 `/proc/net` 打开的文件多跟随一次链接。用 `target/mem/procbench.c` 读 `/proc/net/dev` 2 万次，0.471–0.477 → 0.477–0.487 秒，每次多约 0.5 µs；时间主要花在向宿主取接口上。
 
 **推迟项**：

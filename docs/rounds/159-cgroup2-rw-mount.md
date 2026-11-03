@@ -11,8 +11,7 @@
 ## 测试
 
 - 差分测试 `containers` 组新增：不带只读地挂 cgroup2，mountinfo 和 statvfs 是可写的，里面有 `cgroup.procs`；bind 地重新挂成只读、再挂回可写。写文件、建子 cgroup 在原生上真会改，不比；不带 bind 的 remount 改的是超级块，原生上会改到 docker 给容器的 cgroup，也不做。
-- 两个执行层下都与原生逐字相同。变异检查：拿掉改动，busybox 的 mount 得到 EROFS 后改成只读再挂，"挂上了"那一行仍一样，mountinfo 和 statvfs 两处与原生不同。
-- cargo test（291 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1011 个通过，与上一轮逐项相同。
+- 两个执行层下都与原生逐字相同。busybox 的 mount 得到 EROFS 时会改成只读再挂，只看挂没挂上查不出来，要看 mountinfo 和 statvfs。
 
 **推迟项**：
 

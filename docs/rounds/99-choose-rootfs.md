@@ -25,17 +25,13 @@
 - **登录 shell**（`ConsolePty.LOGIN`）：原来固定是 `/bin/sh`（argv[0] 是 `-sh`），在 Debian、Ubuntu 上是 dash。改为以 `/etc/passwd` 里 root 的 shell 登录（`-l`），Alpine 是 ash，Debian、Ubuntu 是 bash，chsh 改过之后照样，找不到时用 `/bin/sh`。passwd 从 fd 3 读、exec 时关掉：第一版用 `while read ...; done < /etc/passwd`，循环的重定向也作用于里面 exec 的 shell，登录 shell 把 passwd 剩下的行当命令读了（仪器测试里看到 `bin:x:1:1:...: not found`）。
 - **JNI 的句柄**（`hosts/android/src/lib.rs`）：原来是 `Arc<Machine>` 的裸指针，要求 Kotlin 在 `stop` 之后不再用它。第一次在模拟器上试重置时 App 无响应：会话结束之后 TerminalSession 在主线程上才清理控制台（`ConsolePty.close` → `closeConsole`），这时 worker 已经 `stop` 释放了 Machine，主线程卡在已经释放的锁上。服务销毁（`onDestroy`）原来就是同样的顺序。改为把 Machine 登记在一张表里，交给 Kotlin 的是编号；`stop` 从表里删掉，之后的调用查不到它：读写返回 -1，`waitFor` 返回 -9，新开控制台、起进程抛出异常，别的什么也不做。
 - **测试**：
-  - 先在 `appine-run` 里验证这两个固定版本的 tarball：导入（Debian 4407 个文件，Ubuntu 2562 个），照 App 的配置改好 `/etc` 之后，按 passwd 登录是 bash，`getent hosts` 经由存根解析，`apt-get update`、`apt-get install file` 都正常。
+  - 先在 `appine-run` 里验证这两个固定版本的 tarball：导入、照 App 的配置改好 `/etc` 之后，登录、经由存根解析、apt 都正常。
   - `MachineTest` 新增五个：
-    - `loginShellComesFromPasswd`：登录 shell 读了 /etc/profile，改了 passwd 里的 shell 之后照样；
-    - `downloadsAreVerified`：用 `file:` 地址代替网络，摘要、长度不对时删掉并报错；
-    - `downloadsResumeWhereTheyBrokeOff`：测试里起一个本地的 HTTP 服务，第一次只发三分之一就断开，第二次按 `Range` 回 206，或者不认 `Range`、回 200。Android 不让 App 走明文 HTTP，debug 版加了一份只允许 127.0.0.1 的网络安全配置（`src/debug/`）。
-    - `callsAfterStopAreHarmless`：`stop` 之后的各个调用。
+    - `loginShellComesFromPasswd`、`downloadsAreVerified`、`callsAfterStopAreHarmless`；
+    - `downloadsResumeWhereTheyBrokeOff`：测试里起一个本地的 HTTP 服务。Android 不让 App 走明文 HTTP，debug 版加了一份只允许 127.0.0.1 的网络安全配置（`src/debug/`）。
     - `downloadedDistributionsRun`：真的下载 Debian、Ubuntu，在登录 shell 里看 os-release、`$SHELL`，运行 `apt-get update`。→ 在 Android 上这一项一直是假的通过：apt 取不到索引时退出码仍是 0，而 glibc 一次查 A 和 AAAA 的解析在 Android 上失败（DNS 存根的回答在 `FIONREAD` 里报成 0，第 193 轮修了，M9：以指定用户登录）；用例改成看输出。`appine-run`（Linux 宿主）上的那次是真的要联网，默认跳过，`-Pandroid.testInstrumentationRunnerArguments.network=true` 时运行。
-  - Android 14（4K 页）的模拟器上 11 个都通过。联网的那个是模拟器开着 `-http-proxy`（经由 Mac 上的代理）单独跑的，那样 127.0.0.1 也被转给代理，本地 HTTP 服务的用例不能一起跑。联网的那个第一次在从 GitHub 下载 Debian 时读超时失败，于是加了断点续传；再跑时下到 26.8 MB 断了一次，接着下完，通过。Android 17（16K 页）的模拟器上不联网的 10 个通过。AGP 的结果 XML 把按假设跳过的用例记成 failure，Gradle 的退出码是 0。
-  - 变异检验：续传次数改成 0，`downloadsResumeWhereTheyBrokeOff` 以 `unexpected end of stream` 失败。
-  - 在模拟器上点了一遍界面：清掉数据后启动弹出选择框；选 Ubuntu，显示测速、下载进度，进入 bash，os-release、resolv.conf 都对；从菜单重置之后再弹出选择框；断网选 Debian，选择框重新弹出并写着无法解析主机名。
-  - lint 没有新的提示，`cargo ndk` 的 clippy 通过。内核层没有改动，没有重跑差分测试和 LTP。
+  - Android 14（4K 页）的模拟器上都通过，Android 17（16K 页）上不联网的都通过。联网的那个要模拟器开着 `-http-proxy` 单独跑：那样 127.0.0.1 也被转给代理，本地 HTTP 服务的用例不能一起跑；它第一次从 GitHub 下载 Debian 时读超时失败，于是加了断点续传。AGP 的结果 XML 把按假设跳过的用例记成 failure，Gradle 的退出码是 0。
+  - 在模拟器上点了一遍界面：首次启动的选择框、测速和下载进度、重置、断网时的报错都正常。
 
 **推迟项**：
 

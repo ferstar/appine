@@ -17,9 +17,7 @@ Puppeteer、Playwright 也因此连不上它。
 - **改动**（`core/kernel/src/pseudo.rs`）：`/proc/<pid>/task` 的链接数是 2 加线程组里的线程数，与 Linux 相同。别的合成目录仍是 2。
 - **测试**：
   - cargo test 新增 `procfs_task_links_count_threads`：用 busybox 的 stat，单线程时是 3。
-  - 差分测试 compat 组新增一段 python：1 个线程、4 个线程时 task 目录的链接数，以及经由 `/proc/thread-self/..` 到达的同一个目录。与原生相同，是 3、6、6。
-  - 变异检验：链接数固定是 2，cargo test 失败。
-  - 测试套件与[上一轮](93-fd-paths-resolve-symlinks.md)一起跑。
+  - 差分测试 compat 组新增一段 python：不同线程数时 task 目录的链接数，包括经由 `/proc/thread-self/..` 到达的，与原生相同。
 - 修好之后 Chromium 的负载都正常，见[第 92 轮](92-debuggers-valgrind-chromium.md)的表。
 
 **推迟项**：

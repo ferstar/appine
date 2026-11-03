@@ -12,9 +12,9 @@
 
 ## 测试
 
-- 普查负载 `tests/survey/nmap.sh`（Alpine 3.24 的 nmap 7.99）：不设环境变量的默认扫描、设了之后的端口扫描、主机发现（`-sn`）、服务版本（`-sV`，要 `nmap-scripts`）、从读 profile 的 shell 里运行。appine 里不设时 `Couldn't open a raw socket. Error: (1) Operation not permitted`，设了之后都正常。
-- 原生对照（`scripts/survey -n alpine:3.24 nmap`）：容器里的 root 有 CAP_NET_RAW，默认扫描成功；加 `SURVEY_DOCKER_OPTS=--cap-drop=NET_RAW` 之后，输出与 appine 逐字相同，包括默认扫描的失败。
-- App：`assembleDebug`、`lintDebug` 通过。没有改内核层，没跑全量测试。
+- 普查负载 `tests/survey/nmap.sh`（Alpine 3.24 的 nmap 7.99）：默认扫描、端口扫描、主机发现、服务版本、从读 profile 的 shell 里运行。appine 里不设变量时是 raw socket 的 EPERM，设了之后都正常。
+- 原生对照：容器里的 root 有 CAP_NET_RAW，加 `SURVEY_DOCKER_OPTS=--cap-drop=NET_RAW` 之后输出与 appine 逐字相同，包括默认扫描的失败。
+- 没有改内核层，没跑全量测试。
 
 **推迟项**：
 

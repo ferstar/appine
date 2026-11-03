@@ -19,15 +19,7 @@
 
 ## 测试
 
-- 差分测试 `containers` 组新增：编一个打印 `/proc/self/exe`、`AT_EXECFN` 和 maps 第一行的小程序，复制进 memfd 和一个普通文件，然后
-  - memfd 经由 fexecve、`/proc/self/fd/<n>`、直接的 execveat `AT_EMPTY_PATH` 执行，封住之后执行；
-  - memfd 经由 `/proc` 以写方式重新打开着时是 ETXTBSY，关掉之后能执行；`MFD_NOEXEC_SEAL` 的是 EACCES；
-  - 删除了的普通文件经由 fexecve、`/proc/self/fd/<n>` 执行，以写方式打开着的是 ETXTBSY；
-  - `O_PATH` 的 fd、没删除的文件的 fexecve，管道是 EACCES。
-
-  不比 comm：执行 fd 时 Linux 6.8 用 fd 的编号，新内核改成了文件名。
-- 两个执行层下都与原生逐字相同。变异检查：memfd 又算写者时四种执行都是 ETXTBSY，`/proc/self/fd/<n>` 不用打开文件时是 ENOENT。
-- cargo test（291 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1010 个通过（上次 1011）：futex_wait05 这次失败（睡得太久），是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
+- 差分测试 `containers` 组新增：把一个打印 `/proc/self/exe`、`AT_EXECFN` 和 maps 的小程序复制进 memfd 和普通文件，看 memfd 和删除了的文件经由几种方式执行、以写方式打开着时的 ETXTBSY、`MFD_NOEXEC_SEAL` 和不能执行的 fd 的 EACCES，两个执行层下都与原生逐字相同。不比 comm：执行 fd 时 Linux 6.8 用 fd 的编号，新内核改成了文件名。
 - 在 appine 里实际跑：`podman build --isolation chroot` 能构建了，RUN 一步在 chroot 里跑 `apk`，构建出来的镜像能运行。
 
 **推迟项**：

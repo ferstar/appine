@@ -8,9 +8,7 @@
 
 ## 测试
 
-- 差分测试 `namespaces` 组：setuid 成 nobody 的子进程读父进程（root）的 `exe`、经由它 open 是 EACCES，读自己的照常；它的子进程设成不可 dump 之后读自己的照常，它（同一个用户）读这个子进程的是 EACCES；新建用户命名空间之后读父进程的 `exe`、`cwd`、`root`，readlink 和 stat 是 EACCES、lstat 照常。
-- 变异检查：去掉这个检查，用例在 nobody 读父进程的 `exe` 那一行起不同。
-- cargo test（282 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1010 个通过：futex_wait05 这次通过、mmap21_02 这次失败，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
+- 差分测试 `namespaces` 组：别的用户、不可 dump 的进程、新建用户命名空间之后读别的进程的 `exe`（以及 `cwd`、`root`），readlink、open、stat 是 EACCES，lstat 和读自己的照常。
 
 **推迟项**：
 

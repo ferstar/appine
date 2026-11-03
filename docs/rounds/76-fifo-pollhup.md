@@ -5,9 +5,9 @@
 - **原因**：Linux 6.1 的 `pipe_poll` 只在"现在没有写端，而且这个读端的 `f_version` 和管道的 `w_counter` 不同"时才报 EPOLLHUP。`fifo_open` 以 `O_NONBLOCK` 只读打开、当时又没有写端时，把读端的 `f_version` 记成当时的 `w_counter`（注释是"在见到写端之前不报 EPOLLHUP"），写端每打开一次 `w_counter` 加一。其余情况 `f_version` 是 0，没有写端就报。appine 只看现在有没有写端。
 - **改动**：以 `O_NONBLOCK` 只读打开 FIFO、当时没有写端时，读端记下写端被打开过的次数（管道原来就有这个计数，阻塞的 open 用它等对端）；poll 在没有写端、并且这个次数没变时不报 POLLHUP。read 不受影响，没有写端时照样立刻返回 0，与 Linux 相同。
 - **测试**：
-  - 差分测试 compat 组加了 FIFO 的检查：以 `O_NONBLOCK` 只读打开之后、写端打开期间、写过数据、写端关掉之后，以及写端离开之后再打开的读端，各自的 poll 结果。两层都与原生相同。上一轮的二进制在写端来之前和最后那个新读端上都报 POLLHUP。
-  - Ruby 的 test_require 52 个测试全部通过（第 70 轮有 3 个 FIFO 测试失败）。
-  - cargo test（204 个）、clippy（含 Android）、两层的 20 组差分测试通过。第一次跑整套差分测试时 Tier 0 有一组失败，之后整套重跑 4 次、compat 组单独重跑 3 次都通过，失败的是哪一组已经被重跑的输出覆盖了，没有查到原因。LTP 的 syscall 测试 957 个通过，与上一轮逐项相同。
+  - 差分测试 compat 组加了 FIFO 在写端来之前、期间、离开之后的 poll 结果，两层都与原生相同。
+  - Ruby 的 test_require 全部通过。
+  - 第一次跑整套差分测试时 Tier 0 有一组失败，之后重跑都通过，失败的是哪一组已经被重跑的输出覆盖了，没有查到原因。
 
 **推迟项**：
 

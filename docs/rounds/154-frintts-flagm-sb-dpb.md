@@ -23,10 +23,8 @@ DIT 是 PSTATE 里的一位，信号帧、ptrace 都要带上，[下一轮](155-
 
 ## 测试
 
-- 引擎的单元测试：`flagm_sb_dpb_follow_the_feature_set`（CFINV、XAFLAG、AXFLAG 对 16 种 NZCV 与伪代码比，RMIF、SETF8、SETF16 的几个值，SB 不改状态，DC CVAP、CVADP 在只读页上成功、没有映射的地址上是读的缺页且 pc 不变）、`frintts_follows_the_feature_set`（3.7、3e10 的 FRINT32Z 和 IOC，2.5 的 FRINT64X，向量的 FRINT32X 含 NaN）；`id_registers_match_hwcap` 加上 TS、DPB、FRINTTS、SB 四个字段和"FlagM2、DPB2 只在前一级上宣告"；`unimplemented_encodings_are_undefined` 里原来的 FRINT32Z 换成半精度的 FRINT32Z，加上 CRm 不为 0 的 SB、CFINV 和 `msr ssbs, #1`。
-- lockstep 新类别 `frint`（标量、向量，FPCR 的舍入方式随机）、`flagm`、`flagm2`（NZCV 的初值随机）、`sb`、`dcpop`、`dcpodp` 各跑 20 万条，原生、Tier 0、Tier 1 三方一致；`adc_sbc`、`nzcv_move`、`fuzz_dp` 也通过。
+- 引擎的单元测试 `flagm_sb_dpb_follow_the_feature_set`、`frintts_follows_the_feature_set`，`id_registers_match_hwcap` 加上四个字段和"FlagM2、DPB2 只在前一级上宣告"；`unimplemented_encodings_are_undefined` 里原来的 FRINT32Z 换成半精度的 FRINT32Z，加上几种未定义的 SB、CFINV 和 `msr ssbs, #1`。
+- lockstep 新类别 `frint`、`flagm`、`flagm2`、`sb`、`dcpop`、`dcpodp`，原生、Tier 0、Tier 1 三方一致。
 - 白名单与 `llvm-mc` 的对照：`-mattr` 加上 `fptoint`、`flagm`、`altnzcv`、`sb`；新加抽样空间 `adc_flags`（ADC、SBC、RMIF、SETF 所在的组）。屏障组没有加：LLVM 把未分配的屏障编码解码成通用的 `msr S0_3_C3_Cx_y, xzr`，CRm 不为 0 的 SB 也认成 `sb`，与"按编码判定"对不上。
-- 差分测试 `c-programs` 加上 `ext2.c`（`-march=armv8.5-a`）：HWCAP、ID 寄存器的四个字段；六条 FlagM 指令对 16 种 NZCV、几个寄存器值的结果；ACLE 的 `__rint32zf` 等八个标量函数在 15 个值（含超出范围的、NaN、无穷）上、FPCR 的四种舍入方式下的结果和 IOC，向量的 `vrnd32xq_f32`、`vrnd64z_f32`、`vrnd64xq_f64`；SB；DC CVAP、DC CVADP 在可读、PROT_NONE、没有映射的地址上（后两种是 SIGSEGV 的 SEGV_ACCERR、SEGV_MAPERR）。两个执行层下都与原生逐字相同。
+- 差分测试 `c-programs` 加上 `ext2.c`（`-march=armv8.5-a`）：特性的宣告、FlagM 指令对各种 NZCV 的结果、FRINTTS 的标量和向量函数在边界值和四种舍入方式下的结果和 IOC、SB、DC CVAP 和 DC CVADP 在可读、PROT_NONE、没有映射的地址上，两个执行层下都与原生逐字相同。
 - 在 appine 里 `gcc -mcpu=native` 现在推出 `+flagm2 … +frintts … +sb`，定义 `__ARM_FEATURE_FRINT`，与原生相同（原生多一个 `+pauth`：PAC 按 §4.4 不宣告）。
-- 变异检查：Tier 0 的 AXFLAG 不清 C，lockstep 的 `flagm2` 在第 20 次就与硬件不同。
-- 引擎的单元测试、clippy（含 Android）、格式通过；全量测试与[第 155 轮](155-dit.md)合起来跑，结果记在那一篇。

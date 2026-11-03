@@ -10,10 +10,8 @@
   - 怎么判断已经删除：仓库里删掉最后一个名字之后，inode 的行以 nlink = 0 留到下次独占打开仓库时（§8.1），所以查的是元数据缓存里的 nlink。
   - 名字已经以 ` (deleted)` 结尾的（memfd）不再加。
 - **测试**：
-  - cargo test 新增 `procfs_marks_deleted_files`：用 busybox 打开一个文件，删除前后各读一次 fd 链接。
-  - 差分测试 compat 组新增一个 C 程序，有四种情况：打开之后删除、映射之后删除、映射着的文件被 rename 盖掉、memfd。fd 链接和 maps 里的名字与原生逐行相同。
-  - 变异检验：不加后缀时，cargo test 失败，差分测试的程序有 3 行不同。
-  - cargo test、clippy、两层的差分测试和 LTP 与[上一轮](96-proc-pid-net.md)一起跑。
+  - cargo test 新增 `procfs_marks_deleted_files`。
+  - 差分测试 compat 组新增一个 C 程序：打开之后删除、映射之后删除、映射着的文件被 rename 盖掉、memfd，fd 链接和 maps 里的名字与原生逐行相同。
 - **开销**：生成 maps、smaps 时，每个文件映射查一次元数据缓存。用 `target/mem/procbench.c` 读 `/proc/self/maps`：
   - 进程有 6 个文件映射时，读 2 万次 0.127–0.133 → 0.135–0.137 秒；
   - 再多映射 300 个文件区域、读 2000 次，0.211–0.213 → 0.215–0.218 秒，每次多约 2.5 µs（+2–3%）。

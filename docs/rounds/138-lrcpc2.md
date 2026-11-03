@@ -11,12 +11,10 @@
 
 ## 测试
 
-- lockstep 新类别 `lrcpc2`：四种宽度、各种 opc，偏移在 -256 到 255 之间按宽度对齐，基址加偏移指向数据区里对齐的地方。20 万轮的加长 lockstep 里执行 200000 条，全部一致，Tier 1 没有退回 Tier 0。变异检验：Tier 1 不加偏移，第一轮就对不上。
-- 白名单与 llvm-mc 的对照加上 `+rcpc-immo` 和新的抽样空间 `rcpc_unscaled`。20 万个样本里 162073 个能执行（16 种 size、opc 的组合里 13 种合法），与 LLVM 一致；空间可以声明要的特性，宿主没有 LRCPC2 时不要求它有能执行的样本。变异检验：去掉 `+rcpc-immo` 之后报出各种宽度的分歧。
-- 单元测试 `lrcpc2_follows_the_feature_set`：LDAPUR、两种扩展宽度的 LDAPURSB、STLUR 的结果，没对齐是对齐错误，宿主没有时是未定义指令；`id_registers_match_hwcap` 的 LRCPC 字段按 LRCPC、LRCPC2 是 1、2；`unimplemented_encodings_are_undefined` 里的 LDAPUR 换成 size 11、opc 10 的未分配编码。
-- 差分测试 `c-programs` 组新增 `lrcpc2.c`（汇编器不一定认这些助记符，用 `.inst` 写指令字）：HWCAP、ID 寄存器的字段至少是 2、cpuinfo 的 `ilrcpc`；各种宽度、补零和符号扩展的读，正负偏移，`.rodata` 上的读，三种宽度的写。两个执行层下都与原生相同。
+- lockstep 新类别 `lrcpc2`，加长的 lockstep 里与硬件全部一致。白名单与 llvm-mc 的对照加上 `+rcpc-immo` 和新的抽样空间 `rcpc_unscaled`，与 LLVM 一致；空间可以声明要的特性，宿主没有 LRCPC2 时不要求它有能执行的样本。
+- 单元测试 `lrcpc2_follows_the_feature_set`，`id_registers_match_hwcap` 的 LRCPC 字段按 LRCPC、LRCPC2 是 1、2；`unimplemented_encodings_are_undefined` 里的 LDAPUR 换成 size 11、opc 10 的未分配编码。
+- 差分测试 `c-programs` 组新增 `lrcpc2.c`（汇编器不一定认这些助记符，用 `.inst` 写指令字）：特性的宣告、各种宽度和扩展的读、正负偏移、`.rodata` 上的读、各种宽度的写，两个执行层下都与原生相同。
 - 没有要测的收益：运行时按 HWCAP 选它的程序很少，这一轮是让按 v8.4 编译的程序能跑。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1001 个通过（上次 1000）：mmap21_02 由失败变回通过（[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
 
 **推迟项**：
 

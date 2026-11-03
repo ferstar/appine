@@ -17,9 +17,9 @@
 
 ## 测试和测量
 
-- lockstep：白名单与 `llvm-mc` 的对照（`-mattr` 按 guest 特性加 `fullfp16`、`jsconv`）在各编码空间各 5 万个样本上一致；新类别 `fp16`（按表挑有定义的编码：两组新编码、按元素、跨元素、标量浮点各组、与整数互转、向量 FMOV 立即数）和 `jscvt`（随机的双精度位型，含 NaN、无穷、超出范围的）各跑 20 万条，原生、Tier 0、Tier 1 三方一致；`fuzz_simd_fp`、`fp_sysreg` 也通过。
-- 引擎的单元测试：`half_precision_follows_the_feature_set`（FADD h、FMLA 8H、FMOV 8H）、`javascript_conversion_follows_the_feature_set`（取模 2^32、只有精确时 Z 置位），`id_registers_match_hwcap` 加上 PFR0 和 ISAR1 的新字段；`unimplemented_encodings_are_undefined` 里原来的 FP16 例子换成 RDM 的 SQRDMLAH 和 FHM 的 FMLAL。
-- 差分测试 `c-programs` 加上 `fp16.c`（`-march=armv8.2-a+fp16`）：HWCAP 和 ID 寄存器的字段；FJCVTZS 的 13 个输入（3.0、-1.5、超出 2^32、±2^31 附近、1e20、-0、0.5、±∞、NaN 等）的结果和 Z；编译器向量化成 `fmla v.8h` 的数组乘加的校验和；vfmaq、vdivq、vsqrtq、vrndnq、vrecpeq、按元素的 vfmaq、比较、转换、跨元素的最大最小；标量的加、除、乘加、转换、开方；FZ16 把非规格化的半精度结果冲成 0、读回来还在。两个执行层下都与原生逐字相同。
+- lockstep：白名单与 `llvm-mc` 的对照（`-mattr` 按 guest 特性加 `fullfp16`、`jsconv`）一致；新类别 `fp16`（按表挑有定义的编码）和 `jscvt`（随机的双精度位型，含 NaN、无穷、超出范围的），原生、Tier 0、Tier 1 三方一致。
+- 引擎的单元测试 `half_precision_follows_the_feature_set`、`javascript_conversion_follows_the_feature_set`，`id_registers_match_hwcap` 加上新字段；`unimplemented_encodings_are_undefined` 里原来的 FP16 例子换成 RDM 的 SQRDMLAH 和 FHM 的 FMLAL。
+- 差分测试 `c-programs` 加上 `fp16.c`（`-march=armv8.2-a+fp16`）：特性的宣告、FJCVTZS 边界输入的结果和 Z、编译器向量化出的半精度乘加、向量和标量的各种半精度运算、FZ16，两个执行层下都与原生逐字相同。
 - 测量（开发用的虚拟机，Apple Silicon 上的 colima，4 核）：模仿 ggml 的 `ggml_vec_dot_f16` 写了两种 4096 个元素的 F16 点积，一种用 FP16 向量 FMLA（armv8.2_2 那一档的做法），一种先用 FCVTL 转成 f32 再 FMLA（armv8.2_1 和更低）。原生 0.0326 对 0.0734 ns/元素（2.25 倍）；appine 的 Tier 1 下 0.069 对 0.149 ns/元素（2.2 倍，两种都比原生慢一倍左右，是 soft-MMU 的访存检查）。上一轮的二进制不宣告 FP16，前一种 SIGILL，程序只能走后一种。
 - llama.cpp（v0.8.0）：在差分测试的 Alpine 镜像里原生编译 `-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF`，得到 armv8.0_1 到 armv9.2_2 八档 CPU 后端；一个目录放全部后端，另一个只留 armv8.0_1、armv8.2_1（相当于没有 FP16）。模型是 stories15M、Qwen2.5-0.5B-Instruct 的 Q4_0 和由它们转出来的 F16（`llama-quantize`）。`llama-bench -p 128 -n 32 -t 4 -r 3`，两个目录交替各跑两遍取平均，单位 tokens/s。原生在本地盘上，appine 的仓库在虚拟机本地的卷上（`/bench/store`），都用 Tier 1。
 
@@ -34,7 +34,7 @@
   - 带全部后端时，新的二进制挑中 armv8.2_2，上一轮的二进制挑中 armv8.2_1（ggml 的 `load_backend` 打印），数字与只留 armv8.2_1 的目录相同：差别全部来自宣告 FP16。
   - F16 的权重和注意力（KV cache 默认是 F16）走半精度的向量 FMA，提示处理在 appine 里快 82%，比原生的收益（65%）还大，原因没有细查（可能是没有 FP16 的那条路径访存更多，每次访存在 Tier 1 里都要过 soft-MMU 的检查）。Q4_0 的矩阵乘走 int8 点积，两档没有差别。
   - 相对原生（都用最好的那档）：Qwen F16 的提示 1.64×、生成 1.22×（不宣告 FP16 时 2.98×、1.74×），Q4_0 1.38×、1.21×。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。全量 cargo test 第一次和差分测试同时跑时 `stop_and_continue_signals` 失败过一次（STOP、CONT 之后各只等 0.2 秒就读进程状态），单独跑、空闲时全量跑都通过。 → 2026-11-02 推送第 180–183 轮之后 CI 上又失败一次（SIGCONT 之后读到 R），改成轮询状态、最多等 5 秒LTP 的 syscall 测试 1006 个通过（上次 1006）：epoll_pwait03 由失败变回通过，mmap21_02 这次是 `/dev/shm/ltp_mmap21_2` 的 EEXIST，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
+- 全量 cargo test 和差分测试同时跑时 `stop_and_continue_signals` 失败过一次（STOP、CONT 之后各只等 0.2 秒就读进程状态）。 → 2026-11-02 推送第 180–183 轮之后 CI 上又失败一次（SIGCONT 之后读到 R），改成轮询状态、最多等 5 秒
 
 **推迟项**：
 

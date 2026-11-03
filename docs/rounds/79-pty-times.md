@@ -5,9 +5,8 @@
 - **Linux 的做法**：devpts 的 inode 和普通文件一样有三个时间。6.1 的 `tty_update_time`：从设备读到数据时改访问时间，写出数据时改修改时间，只改秒，而且只在和原来相差 8 秒以上时才改，注释说精确的时刻会泄露别人敲键盘的节奏。chmod、chown、utimensat 改状态改变时间，utimensat 可以把访问、修改时间设成任意值。
 - **改动**：终端记下三个时间，打开主设备、建这个终端时取当前时间。从设备的读写按上面的规则更新；stat、fstat 报告它们；utimensat 和 chmod、chown 一样作用到终端上（`UTIME_NOW` 取当前时间，权限规则与仓库里的文件相同），并把状态改变时间改成现在；chmod、chown 也改状态改变时间。socket、匿名管道的 fd 上的 futimens 也成功了（和[第 77 轮](77-dead-dir-socket-fchmod.md)的 fchmod 一样，不记下来）。
 - **测试**：
-  - 终端的单元测试新增 `reads_and_writes_touch_the_times_every_8_seconds`：很久以前的时间改成现在的秒、纳秒不变，同一个 8 秒里不改。
-  - 差分测试 compat 组加了：utimensat 设成 1000、2000 之后 stat 读到的值，chmod 之后状态改变时间变了，从设备写出、读到数据之后修改时间和访问时间回到现在，fstat 与 stat 一致。两层都与原生相同。上一轮的二进制上 utimensat 报 EACCES。
-  - cargo test（206 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过，与 [/proc/meminfo 那一轮](68-meminfo.md)的结果逐项相同。
+  - 终端的单元测试新增 `reads_and_writes_touch_the_times_every_8_seconds`。
+  - 差分测试 compat 组加了终端上的 utimensat、chmod、读写之后的三个时间，两层都与原生相同。
 
 **推迟项**：
 

@@ -17,10 +17,9 @@
 
 ## 测试
 
-- 差分测试 `pty` 组加上包模式：从设备上的这几个 ioctl 是 ENOTTY，坏的指针 EFAULT；打开前后的读、空读、长度 0 和 1 的读；从设备上的 TCIFLUSH、TCOFLUSH、TCIOFLUSH 的状态和 poll、select 的异常集合，主设备上的清空不报告；经由主设备的 TCSAFLUSH、不清空的 TCSADRAIN；TCOOFF、再 TCOOFF、TCOON，先停后恢复只剩 START；^S、^Q（经由主设备写进去）；主设备上的 TCOOFF、TCOON；关掉 IXON（再关一次）、经由主设备打开，改 VSTOP 再改回来；EXTPROC 打开、保持、关掉；^C 清空两边、NOFLSH 时不清；关掉包模式之后没有头、状态不记，再打开时没有旧状态；EPOLLPRI；从设备关掉之后的顺序；`TIOCSIG` 没有前台进程组时、非法信号，以及让 `setsid` 之后打开从设备的子进程收到 SIGINT。`vhangup` 组加上包模式下挂断从设备（第一版照 `tty_ldisc_hangup` 报告了两种清空，与原生比出来 Linux 随后清掉了状态）。原生上写进主设备的字节经由 flip buffer 异步处理，用例先等到 POLLIN 或 POLLPRI 再读；产生信号时 Linux 只清还在 flip buffer 里的输出（[流控和清空](75-pty-flow.md)的推迟项），用例里关掉回显，不比这一处。两个执行层下都与原生逐字相同。
-- 变异检查：停住时不报告 STOP，用例在 TCOOFF 那一行起不同。
-- 真的 GNU screen：在 Ubuntu 26.04 的仓库（第 145 轮）里用 apt 装上 screen 4.9.1，`screen -D -m sh -c '…'`：145 轮的二进制下 screen 退出码是 0，但窗口里的命令根本没有运行；现在窗口里的命令照常运行，`tty` 是 `/dev/pts/0`、`stty size` 是 `24 80`。顺带看到 Ubuntu 26.04 的 Rust 版 coreutils 的 `tty` 输出不带结尾的换行，原生上也一样。
-- cargo test（282 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1010 个通过，与上次逐项相同。
+- 差分测试 `pty` 组加上包模式：几个 ioctl 的错误、包头和各种长度的读、各种清空、停住和恢复、流控和 EXTPROC 变化的状态、poll、select 和 EPOLLPRI、关掉再打开、从设备关掉之后的顺序、`TIOCSIG`，两个执行层下都与原生逐字相同。原生上写进主设备的字节经由 flip buffer 异步处理，用例先等到 POLLIN 或 POLLPRI 再读；产生信号时 Linux 只清还在 flip buffer 里的输出（[流控和清空](75-pty-flow.md)的推迟项），用例里关掉回显，不比这一处。
+- `vhangup` 组加上包模式下挂断从设备：第一版照 `tty_ldisc_hangup` 报告了两种清空，与原生比出来 Linux 随后清掉了状态。
+- 真的 GNU screen：Ubuntu 26.04 的仓库（第 145 轮）里装上 screen 4.9.1，`screen -D -m sh -c '…'` 原来窗口里的命令根本没有运行（退出码却是 0），现在照常运行。Ubuntu 26.04 的 Rust 版 coreutils 的 `tty` 输出不带结尾的换行，原生上也一样。
 
 **推迟项**：
 

@@ -21,12 +21,9 @@
 
 ## 测试和测量
 
-- 白名单与 `llvm-mc` 的对照（`-mattr` 按 guest 特性加 `rdm`、`complxnum`、`fp16fml`、`bf16`）在各编码空间各 100 万个样本上一致。三寄存器扩展组约占 SIMD&FP 样本的 1/64、按元素组 1/16、标量三寄存器扩展组 1/128，各有几千到几万个样本。
-- lockstep 新类别 `rdm`、`fcma`、`fhm`、`bf16`（按编码表生成，含按元素的各种下标）各跑 20 万条，原生、Tier 0、Tier 1 三方一致；`fp16`、`dotprod`、`i8mm`、`fuzz_simd_fp` 也通过。
-- 在宿主 CPU 上逐条执行了几个边界编码：64 位的半精度 FCMLA 按元素且 H = 1、单精度按元素 L = 1 或 64 位、双精度 FCMLA 的 64 位形式、Q = 0 的 BFMMLA、sz = 1 的 FMLAL、双精度源的 BFCVT、size 11 的 BFCVTN、size 00 和 11 的 SQRDMLAH、B 元素的标量 SQRDMLAH，都是 SIGILL，与白名单相同。
-- 引擎的单元测试 `rdm_fcma_fhm_bf16_follow_the_feature_set`：SQRDMLAH 的结果和饱和、FCADD #270 的复数、FMLAL 在单精度里累加（(1 + 2^-10)² 的 2^-20 那一项半精度表示不了）、BFDOT、BFCVT 的就近舍入到偶数；`id_registers_match_hwcap` 加上四个字段和"FHM 只和 FP16 一起"；`unimplemented_encodings_are_undefined` 里原来的 SQRDMLAH、FMLAL、BFDOT 换成 FRINT32Z（FRINTTS）、SM3PARTW1，以及 size 00 的 BFDOT、FCMLA 和 64 位的双精度 FCADD。
-- 差分测试 `c-programs` 加上 `ext.c`（`-march=armv8.3-a+fp16fml+bf16`）：HWCAP、HWCAP2、ID 寄存器的四个字段，`/proc/cpuinfo`；`vqrdmlahq_s16`（饱和时置 FPSR.QC）、`vqrdmlshq_laneq_s16`、`vqrdmlahq_s32`、标量的 `vqrdmlahh_s16`、`vqrdmlshs_s32`；`vcmlaq` 的四种旋转（含按元素）、`vcaddq_rot90_f32`、`vcaddq_rot270_f64`、半精度的 `vcmlaq_f16`；`vfmlalq_low_f16`、`vfmlslq_high_f16`、按元素的 `vfmlalq_laneq_high_f16`、64 位的 `vfmlsl_low_f16`；BFCVTN、`vbfdotq`（含按元素）、`vbfmmlaq`、`vbfmlalbq`、`vbfmlaltq_laneq`、BFCVT 的舍入。两个执行层下都与原生逐字相同。
-- 在 appine 里 `gcc -mcpu=native` 现在定义 `__ARM_FEATURE_QRDMX`、`__ARM_FEATURE_COMPLEX`、`__ARM_FEATURE_FP16_FML`、`__ARM_FEATURE_BF16`（原来没有），与原生相同。
+- 白名单与 `llvm-mc` 的对照（`-mattr` 按 guest 特性加 `rdm`、`complxnum`、`fp16fml`、`bf16`）一致；lockstep 新类别 `rdm`、`fcma`、`fhm`、`bf16`，原生、Tier 0、Tier 1 三方一致。几个边界编码在宿主 CPU 上逐条执行过，都是 SIGILL，与白名单相同。
+- 引擎的单元测试 `rdm_fcma_fhm_bf16_follow_the_feature_set`，`id_registers_match_hwcap` 加上四个字段和"FHM 只和 FP16 一起"；`unimplemented_encodings_are_undefined` 里原来的 SQRDMLAH、FMLAL、BFDOT 换成 FRINT32Z（FRINTTS）、SM3PARTW1，以及几种未定义的 BFDOT、FCMLA、FCADD。
+- 差分测试 `c-programs` 加上 `ext.c`（`-march=armv8.3-a+fp16fml+bf16`）：特性的宣告和四个扩展的各种 intrinsics（含按元素、饱和时的 FPSR.QC、BFCVT 的舍入），两个执行层下都与原生逐字相同。在 appine 里 `gcc -mcpu=native` 现在定义这四个扩展的 `__ARM_FEATURE_*` 宏，与原生相同。
 - 测量（开发用的虚拟机，M2 Pro 上的 colima；程序在 `target/ext142/bench.c`）：每种扩展写一个循环，与不用它的常见写法比，4096 个元素算 2 万遍，取 3 次里最快的，原生和 appine 的 Tier 1 各两遍取平均，单位 ns/元素：
 
   | 内核 | 原生：用扩展 | 原生：不用 | appine：用扩展 | appine：不用 |
@@ -38,7 +35,6 @@
 
   - BFDOT 一条做了两次展开、两次乘加，原生快 2.4 倍；appine 里循环的两次读都要过 soft-MMU 的检查，指令少了一半多的收益占比变小，仍快 1.5 倍。
   - 另外三种在 M2 上差别都在 5% 以内：这几个循环卡在累加器的依赖链上，M2 的 FMLAL、FCMLA 也不比拆开的写法快多少。Q15 的循环每 8 个元素一读一写，appine 里慢 6 倍是写的检查，与扩展无关。收益要看核心：别的核心上这几条指令的延迟、吞吐与 M2 不同，没有量。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1006 个通过（上次 1006）：epoll_pwait03 这次失败、mmap21_02 这次通过，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
 
 **推迟项**：
 

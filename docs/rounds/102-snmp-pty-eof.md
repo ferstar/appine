@@ -17,11 +17,10 @@
   - `InetSocket` 记下协议号：建 socket 时 guest 给的，给的是 0 时按类型取 TCP、UDP；accept 到的跟着监听的。
   - 桥接线程（`core/kernel/src/terminal.rs`）：stdin 读到结束（或者出错）之后不再读，等程序把已经送进去的输入读完（规范模式下没有完整的行，非规范模式下队列空了），往控制台送一个 termios 里的 VEOF（被禁用时不送），只送一次。与 util-linux 2.35 起的 `script` 相同：它在 stdin 结束时等从设备读空了再写一个 ^D。不当作挂断：发 SIGHUP 会把还在跑的命令杀掉，`printf 'sleep 3; echo done\n'` 就看不到 done。
 - **测试**：
-  - cargo test：`tests/guest/traffic.c` 加上 snmp、netstat 的检查：格式（每组名字一行、数值一行，个数相同）和常数项；回环上的一个连接让 ActiveOpens、PassiveOpens 各加 1、CurrEstab 加 2，关掉之后回到原来的数；IP 的包数和字节数与 lo 的计数相同，TCP 的段加上 UDP 的数据报等于 lo 的包数；阻塞、非阻塞的连接被拒绝各算一次 ActiveOpens 和 AttemptFails；ping 的回显。rootfs 测试新增：`--pty` 下经由管道给 `sh -i`、`cat` 输入，输入结束之后它们自己退出。
-  - 差分测试 compat 组：两个文件的组名、各组名字和数值的个数、各版本都有的几个常数项；回环上 IPv4、IPv6 各一个连接、关掉它们、阻塞和非阻塞地连一个没人监听的端口、IPv4 和 IPv4 映射的数据报（IPv6 的不算），前后 TCP、UDP 几项的变化。字段列表随内核版本变化，不比；IP 的包数、TCP 的段 Linux 还算握手和 ACK，不比。与原生相同。
-  - Debian 的仓库里：`ss -s` 显示 `estab 2`，`nstat -a` 列出连接、段、数据报和字节数。
-  - 变异检验：去掉送 VEOF（rootfs 用例 30 秒超时）、去掉 PassiveOpens 的计数、去掉 SO_ERROR 那里的失败计数，cargo test 都失败。变异检验最后一次 `cargo test --release` 留下的是变异过的 release 二进制，之后只跑了 clippy，第一次差分测试用的就是它，compat 组的 AttemptFails 少一次；重编之后通过。
-  - cargo test 232 个、clippy（含 Android 目标）、两层的差分测试都通过。LTP 958，与[上一轮](101-link-addr.md)相同：futex_wait05 由失败变成通过，mmap21_02 由通过变成失败（`open(/dev/shm/ltp_mmap21_2)` 得到 EEXIST），都是[已知的偶发失败](../milestones.md#已知的偶发失败)。
+  - cargo test：`tests/guest/traffic.c` 加上 snmp、netstat 的格式和常数项，连接、被拒绝的连接、数据报、ping 前后各项的变化，IP 的计数与 lo 的一致。rootfs 测试新增：`--pty` 下经由管道给 `sh -i`、`cat` 输入，输入结束之后它们自己退出。
+  - 差分测试 compat 组：两个文件的格式和常数项，回环上的连接、被拒绝的连接、数据报前后 TCP、UDP 几项的变化，与原生相同。字段列表随内核版本变化，不比；IP 的包数、TCP 的段 Linux 还算握手和 ACK，不比。
+  - Debian 的仓库里 `ss -s`、`nstat -a` 都正常。
+  - 变异检验最后一次 `cargo test --release` 留下的是变异过的 release 二进制，之后只跑了 clippy，第一次差分测试用的就是它：还原之后要重编。
 
 **推迟项**：
 

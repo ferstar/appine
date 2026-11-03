@@ -24,9 +24,7 @@
   - **`task::current` 加了 debug 断言**：调用时必须持有 BKL。
 - **测试**：
   - 测试钩子新增第 8 种：在 `Cx::unlocked` 的闭包里 panic；外层放一个守卫，展开到它时检查是否持有 BKL，没有就终止宿主进程。
-  - `tests/guest/bugs.c` 加了这一种。结果：子进程被 SIGSEGV 结束，`appine-run` 照常运行。
-  - 变异检验：去掉 `unlocked` 里的 `Relock` 时，`appine-run` 报 `unwound out of Cx::unlocked without the BKL` 后 abort。
-  - cargo test（207 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 959 个通过（上一轮 958），只有 futex_wait05 从失败变成通过（睡眠的精度，[偶发项](../milestones.md#已知的偶发失败)），其余逐项相同。
+  - `tests/guest/bugs.c` 加了这一种：子进程被 SIGSEGV 结束，`appine-run` 照常运行。
 
 **推迟项**：
 

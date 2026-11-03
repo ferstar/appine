@@ -22,13 +22,12 @@
 
 ## 测试
 
-- 新的差分测试组 `cgroup-tree`（原生一侧是特权容器，cgroup 可写；只在根下面建的 `t` 里比）：mkdir、重名、属主和权限位、各个文件在不在、控制器；迁移之后 `/proc/<pid>/cgroup`、`cgroup.procs`、`cgroup.events`，有进程、有子 cgroup 时 rmdir 是 EBUSY；命名空间的根上写 `cgroup.max.depth`、`memory.max`、`memory.current` 是 EPERM；写错的 pid、`cgroup.threads`、`subtree_control`、只读的文件、`cgroup.kill`、`cgroup.freeze`、`cgroup.type`，读 `cgroup.kill`；建文件、删接口文件、mknod；`cgroup.max.depth`、`max.descendants` 挡住 mkdir；clone3 的 `CLONE_INTO_CGROUP`（目录 fd、O_PATH、不是 cgroup、坏的 fd）；`cgroup.kill` 结束子树里的进程；子进程随父进程，`unshare -C` 之后看到的路径、写自己的根是 EPERM、写到根外面是 ENOENT；nobody 建不了、写不了。
-- `cgroup` 组：原生一侧改成特权容器（挂载可写）。原来比只读的那一段换成在根上写只读的文件（EPERM）、建文件、删接口文件、建删子 cgroup；不写根的 `cgroup.freeze`、`cgroup.kill`，原生上会冻住、结束整个容器。chmod 去掉了（见推迟项）。JVM 21.0.12 在 cgroup 挂载可写时只在有 CPU 或内存的限制时才当作在容器里，appine 的 `memory.max` 是 OOM killer 的上限、原生一侧通常是 max，改成比"有限制时才当作在容器里"、在容器里时没有 CPU 配额。
-- `containers` 组新增：`oom_score_adj` 写带 NUL 的、NUL 之后有别的、十六进制、八进制、带空白的、超出范围的（EINVAL）、超出 32 位的（ERANGE）、不是数字的、第 13 个字节起有别的（只收 12 个字节）、只有 NUL 的；`coredump_filter` 带 NUL 的、负数、超出 32 位、`+` 加八进制。
-- 两个执行层下都与原生逐字相同。写用例时撞到的：Linux 上 root 能以写方式打开只读的 cgroup 文件，写才是 EINVAL；`wait` 一个被 `cgroup.kill` 结束的后台进程时，ash 打不打印 `Killed` 看那个进程是不是已经在别处回收了（单独试过：等待状态两边都是被 SIGKILL 结束的，中间隔一个前台命令时两边都不打印），是时间上的竞争，用例去掉了 `wait` 的 stderr；原生上写 `oom_score_adj` 负数要 `CAP_SYS_RESOURCE`，docker 默认不给，用例只写正数。
-- 变异检查：迁移时不改进程的 cgroup，`cgroup-tree` 从迁移起大段不同；去掉命名空间的根的 EPERM，几处 EPERM 不见了。
-- `cgroup.rs` 的单元测试：建子 cgroup 的重名和换行、文件按 subtree_control、相对命名空间的根的路径（含 `..`）；深度和个数的上限；接口文件的值的格式。`pseudo.rs`：写数字的 /proc 文件的解析。
-- cargo test（297 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1012 个通过（上次 1009）：clone303（clone3 的 `CLONE_INTO_CGROUP`）由 CONF 变成通过，上次的两个[偶发项](../milestones.md#已知的偶发失败) futex_wait05、mmap21_02 这次通过，其余逐项相同。
+- 新的差分测试组 `cgroup-tree`（原生一侧是特权容器，cgroup 可写；只在根下面建的 `t` 里比）：建删子 cgroup、属主和权限、各个文件在不在、控制器、迁移之后的 `/proc/<pid>/cgroup` 和接口文件、命名空间的根上的 EPERM、各种写错的值、深度和个数的上限、clone3 的 `CLONE_INTO_CGROUP`、`cgroup.kill`、`unshare -C` 之后看到的路径、nobody 的权限。
+- `cgroup` 组的原生一侧也改成特权容器（挂载可写），原来比只读的那一段换成在根上写只读的文件、建删子 cgroup 这些；根的 `cgroup.freeze`、`cgroup.kill` 不写，原生上会冻住、结束整个容器；chmod 去掉了（见推迟项）。JVM 21.0.12 在 cgroup 挂载可写时只在有 CPU 或内存的限制时才当作在容器里，appine 的 `memory.max` 是 OOM killer 的上限、原生一侧通常是 max，改成比"有限制时才当作在容器里"、在容器里时没有 CPU 配额。
+- `containers` 组新增 `oom_score_adj`、`coredump_filter` 各种写法的解析（NUL、空白、进制、范围、只收 12 个字节）。原生上写 `oom_score_adj` 负数要 `CAP_SYS_RESOURCE`，docker 默认不给，用例只写正数。
+- 两个执行层下都与原生逐字相同。写用例时撞到的：Linux 上 root 能以写方式打开只读的 cgroup 文件，写才是 EINVAL；`wait` 一个被 `cgroup.kill` 结束的后台进程时，ash 打不打印 `Killed` 是时间上的竞争，用例去掉了 `wait` 的 stderr。
+- `cgroup.rs` 的单元测试：建子 cgroup、文件按 subtree_control、相对命名空间的根的路径、深度和个数的上限、接口文件的值的格式；`pseudo.rs`：写数字的 /proc 文件的解析。
+- LTP 新通过 clone303（clone3 的 `CLONE_INTO_CGROUP`，原来是 CONF）。
 - 在 appine 里实际跑：`docker run` 建好了 `/sys/fs/cgroup/docker/<容器>`、写过了 `oom_score_adj`，下一步停在 runc 给 cgroup 挂设备过滤的 eBPF 程序（`bpf_prog_query(BPF_CGROUP_DEVICE)` 是 ENOSYS）。
 
 **推迟项**：

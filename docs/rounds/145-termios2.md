@@ -13,11 +13,9 @@
 
 ## 测试
 
-- 新的差分测试组 `pty`（第 146 轮的包模式也放在这一组）：主设备、从设备的 `TCGETS2`，`TCGETS` 是它的前 36 字节；管道、`/dev/null`、目录上是 ENOTTY，坏的指针是 EFAULT；B9600、B115200 配 B1200 输入、B4000000、B0、`BOTHER`（输入输出不同、只有一边）设置之后的速率，字段里给的值在 `Bxxx` 时不算；经由主设备设置；老的 `TCSETS` 带 `BOTHER`、`TCSETA` 之后的速率；`CS6`、`PARENB`、`PARODD`、`ADDRB` 读回来的样子；别的标志、控制字符原样保存；`TCSETSF2` 清掉输入、`TCSETSW2` 不清；切到非规范模式时已有的输入保留；Python 的 `termios.tcsetattr`（musl）设 B57600 之后 `TCGETS2` 的速率；`isatty`。两个执行层下都与原生逐字相同。原生上写进主设备的数据经由 flip buffer 异步交给行规程，用例先等从设备可读再查 FIONREAD。
-- 变异检查：设置之后不重算速率，用例在 B9600 那一行起不同。
+- 新的差分测试组 `pty`（第 146 轮的包模式也放在这一组）：`TCGETS2` 和 `TCGETS`、不是终端的 fd、各种 `Bxxx` 和 `BOTHER` 设置之后的速率、老的 `TCSETS`、`TCSETA`、PTY 的硬件位、`TCSETSF2` 和 `TCSETSW2`、Python 的 `termios.tcsetattr`、`isatty`，两个执行层下都与原生逐字相同。原生上写进主设备的数据经由 flip buffer 异步交给行规程，用例先等从设备可读再查 FIONREAD。
 - 单元测试：`speeds_follow_the_baud_bits`、`pty_keeps_eight_bits_and_the_address_bit`（`tty`）。
 - Ubuntu 26.04 的仓库在 `target/glibc/ubuntu26-store`（`target/glibc/ubuntu-26-04.tar.gz` 导入），见上。
-- cargo test（282 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1010 个通过，与上次逐项相同（sigtimedwait01、sigwaitinfo01 按 e4c03b9 记作 SKIP）。
 
 **推迟项**：
 

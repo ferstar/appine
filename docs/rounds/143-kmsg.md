@@ -21,12 +21,10 @@
 
 ## 测试
 
-- 单元测试（`klog.rs`）：去掉一个换行、到 NUL 为止；没有换行的记录下一条来了才读得到；`/dev/kmsg` 格式的转义；满了丢掉最老的、按字节和按条数；syslog 格式的每行前缀和超长时丢行；读全部取放得下的最新的、读后清空；syslog 的读走和接着读、未读的字节数和记录数；前缀的解析（`<0>` 的 facility 仍是 user、`<x>`、`<>`）和限速、关闭时的报告。
-- 新的差分测试组 `kmsg`（原生一侧加 `--device /dev/kmsg`、`CAP_SYSLOG`）：设备号和权限；lseek 的各种 whence 和非 0 偏移；poll 在末尾、写了之后、只有未定稿的记录时；十几种写（各种前缀、`<4294967297>` 截成 1、没有换行、两个换行、中间的换行、转义、中间的 NUL、长度 0、1025 字节、900 字节）读回来的前缀、标志和正文；writev 拼成一条、总长 0；只写的 fd 读、只读的 fd 写；缓冲区放不下之后读到下一条；pread；syslog(2) 读全部里的这些行；普通用户只写打开（EACCES）、读方式打开随 `dmesg_restrict`。宿主的日志里有别的消息，所以每条都带随机的记号、只看带记号的；6.2 起一次能写 1024 字节（6.1 是 992），这之间的长度不比。
-- 差分测试的仓库加装 util-linux 的 `dmesg`（Alpine 的 `dmesg` 包，Debian、Ubuntu 上的 dmesg 就是它，读 `/dev/kmsg`），`kmsg` 组用它和 busybox 的 `dmesg` 读这次写的几条（`-r`、`-x`、`-l err`、`-f user -l info`）。导出镜像时 `/tmp` 只留目录：开发机上仓库的 `/tmp` 里攒了 830 MB 历次运行留下的东西，原来都进了镜像，docker 的盘放不下了。
-- 变异检查：让没有换行的记录马上读得到，`kmsg` 组在"只有未定稿的记录时 poll"一行起不同。
-- rootfs 用例 `kmsg_records_reach_dmesg`：busybox 的 `dmesg`、`dmesg -r`、`dmesg -c`，没有换行的记录，限速的 10 条和关闭时的报告，`printk_devkmsg` 的 on、off 和写错的值，`/proc/kmsg` 的读和普通用户读不了；`cgroup_memory_files_follow_the_oom_killer` 加上 `dmesg` 里 OOM killer 的那两行；`tests/guest/waits.c` 加上 syslog 的读被新记录叫醒、`/proc/kmsg` 和 `/dev/kmsg` 的阻塞读（调试构建检查放开 BKL 时没有借着内核对象）。
-- cargo test（279 个）、clippy（含 Android）、两层的全部差分测试通过，`kmsg`、`ioprio-klog` 在 Linux 宿主的分支（虚拟机里直接跑）也通过。LTP 的 syscall 测试 1007 个通过（上次 1006）：epoll_pwait03、futex_wait05 这次通过，select02 这次失败，都是[偶发项](../milestones.md#已知的偶发失败)；syslog11、syslog12 照旧通过，其余逐项相同。
+- 单元测试（`klog.rs`）：存记录、未定稿的记录、转义、满了丢掉最老的、syslog 格式和几种读法、前缀的解析、限速。
+- 新的差分测试组 `kmsg`（原生一侧加 `--device /dev/kmsg`、`CAP_SYSLOG`）：设备号和权限、lseek、poll、各种写读回来的前缀、标志和正文、writev、缓冲区放不下、pread、syslog(2) 读全部、普通用户的打开，再用 util-linux 和 busybox 的 `dmesg` 读这次写的几条。宿主的日志里有别的消息，所以每条都带随机的记号、只看带记号的；6.2 起一次能写 1024 字节（6.1 是 992），这之间的长度不比。
+- 差分测试的仓库加装 util-linux 的 `dmesg`（Alpine 的 `dmesg` 包）。导出镜像时 `/tmp` 只留目录：开发机上仓库的 `/tmp` 里攒了 830 MB 历次运行留下的东西，原来都进了镜像，docker 的盘放不下了。
+- rootfs 用例 `kmsg_records_reach_dmesg`（busybox 的 `dmesg`、限速、`printk_devkmsg`、`/proc/kmsg`），`cgroup_memory_files_follow_the_oom_killer` 加上 `dmesg` 里 OOM killer 的那两行；`tests/guest/waits.c` 加上 syslog 的读、`/proc/kmsg` 和 `/dev/kmsg` 的阻塞读（调试构建检查放开 BKL 时没有借着内核对象）。
 
 **推迟项**：
 

@@ -19,10 +19,8 @@
 
 ## 测试
 
-- 差分测试 `containers` 组新增（原生一侧加 `--cap-add SYS_TIME`）：unshare 之后自己没变、给子进程用的是新的，偏移照抄；写坏的时钟、纳秒、缺字段是 EINVAL，减到开机之前是 ERANGE，写两行、只写一行（用编号）；nobody 写不了；fork 出来的子进程在新的里，单调时钟（含 RAW、COARSE）、boottime、`/proc/uptime`、sysinfo、启动时间都相差偏移，墙上时钟不变，绝对时刻的 clock_nanosleep、timerfd、timer_settime、futex WAIT_BITSET 都不会多等一天；有子进程进去之后写偏移是 EACCES；父进程的时钟没变；线程留在原来的里，vfork 的子进程 execve 之后在新的里；多线程时 setns 是 EUSERS，之后 setns 进去，自己和给子进程的都换了。只比是否相差偏移、是否同一个命名空间，不比具体的时刻。
-- 两个执行层下都与原生逐字相同。变异检查：clock_gettime 不加偏移，子进程的四种时钟、setns 之后的单调时钟与原生不同；只拿掉绝对时刻的换算，子进程在 timerfd 那一步等了一个小时（加超时跑，卡在那里）。
-- `nsproxy.rs`、`misc.rs` 的单元测试：各个时钟的偏移、新建的照抄不冻结；读数加偏移的借位、负的偏移，绝对时刻减偏移不早于 0。
-- cargo test（293 个）、clippy（含 Android）、格式、两层的全部差分测试通过。LTP 的 syscall 测试 1009 个通过（上次 1010）：futex_wait05（睡得太久）、mmap21_02（`/dev/shm` 里的文件被同时跑的另一个用例删了）失败，都是[偶发项](../milestones.md#已知的偶发失败)，其余逐项相同。
+- 差分测试 `containers` 组新增（原生一侧加 `--cap-add SYS_TIME`）：unshare 和偏移照抄、写 `timens_offsets` 的各种错误和权限、子进程里各种时钟和 `/proc/uptime`、sysinfo、启动时间相差偏移、绝对时刻的几种等待不多等、进去之后写偏移是 EACCES、线程和 vfork、setns，两个执行层下都与原生逐字相同。只比是否相差偏移、是否同一个命名空间，不比具体的时刻。
+- `nsproxy.rs`、`misc.rs` 的单元测试：各个时钟的偏移、新建的照抄不冻结、读数加偏移、绝对时刻减偏移。
 - 在 appine 里实际跑：`docker run` 过了 time 命名空间和 runc 的 memfd，下一步停在 `mkdir /sys/fs/cgroup/docker: read-only file system`（普查的问题 9）。
 
 **推迟项**：

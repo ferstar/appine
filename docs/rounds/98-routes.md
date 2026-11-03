@@ -28,11 +28,9 @@
   - `sockstat`、`sockstat6`：guest 的 socket 数。TCP 的 inuse 数监听着、连接着（不是 CLOSE）的，alloc 数所有 TCP socket，UDP 数绑定了端口的，raw 数所有的；宿主内核里已经关掉、还在 TIME_WAIT 或者孤儿状态的连接看不到，内存页数也不知道，都是 0。
 - **模拟器上**（Android 14，4K 页）：交来 `LinkProperties` 之前是合成的 `default dev eth0 scope link`，交来之后是 `default via 10.0.2.2 dev eth0`，`ip route get 1.1.1.1`、`route -n` 都经由网关。模拟器的宿主内核里 eth0 是 10.0.2.15/8，DHCP 交给 `LinkProperties` 的却是 /24，所以本地表的广播是 10.255.255.255（与宿主内核一致），主表那条 10.0.2.0/24 不认作内核加的。
 - **测试**：
-  - cargo test：`route` 的单元测试 7 个（docker 容器里两张表的内容和顺序、合成、fib6 的顺序、两个 `/proc` 文件的格式、`ip route get` 的各种目标、规则），netlink 的转储和错误，宿主路由表的解析；端到端新增 `routing_tables_are_visible`（本地表、`ip rule`、`ip route get 127.0.0.9`、`/proc/net/route` 的表头、sockstat）。
-  - 差分测试 compat 组新增一个 C 程序，逐字节比对路由的转储（`AF_UNSPEC`、IPv6）、九种 `ip route get`（经由网关、同一网段、本机地址、回环网段、网段广播、两种组播、`::1`、没有 IPv6 路由的 ENETUNREACH）、规则的转储；邻居表只看转储以 `NLMSG_DONE` 结束（Linux 上前面的用例在 lo 上留下了条目）。本机地址打印成 SELF，接口编号打印成名字；`rta_cacheinfo` 里缓存条目的引用数、上次使用的时间不确定，只比错误码。还比对 busybox 的 `ip route show table all`、`ip -6 route show table all`、`ip rule`、`route -n`、`netstat -rn`、`ip route get` 和两个 `/proc` 文件（`ipv6_route` 不比引用数），以及开 13 个 socket 前后 sockstat、sockstat6 各项的变化（TCP 的 alloc 是整个系统的，不比）。对照时发现两处不同：224.0.0.1 少了 `RTCF_LOCAL`（已改），`ip addr` 少了 `brd`（见推迟项）。
-  - Android：`MachineTest` 新增 `routesComeFromLinkProperties`，交来模拟器默认网络的 `LinkProperties` 前后各跑一次 `ip route`、`ip route get`、`route -n`，在 Android 14（4K 页）和 Android 17（16K 页）的模拟器上与别的用例一起通过。
-  - 变异检验：`ip route get` 不带网关、sockstat 把没绑定的 UDP 也算上，差分测试各有 2 行不同。
-  - cargo test 226 个、clippy（含 Android 目标）、两层的差分测试都通过。LTP 957：与[上一轮](97-deleted-suffix.md)相比只多了 select02 失败，它是[已知的偶发失败](../milestones.md#已知的偶发失败)（睡眠的超时精度），单独重跑三次也失败，这时虚拟机里原生的 1 毫秒睡眠中位数也要 1.59 毫秒、5 毫秒要 7.6 毫秒。
+  - cargo test：`route` 的单元测试（两张表的内容和顺序、两个 `/proc` 文件的格式、`ip route get` 的各种目标、规则），netlink 的转储和错误，宿主路由表的解析；端到端新增 `routing_tables_are_visible`。
+  - 差分测试 compat 组新增一个 C 程序，逐字节比对路由和规则的转储、各种目标的 `ip route get`，还比对 busybox 的 `ip route`、`ip rule`、`route -n`、`netstat -rn` 和两个 `/proc` 文件，以及开 socket 前后 sockstat 的变化。不确定的不比：邻居表只看转储以 `NLMSG_DONE` 结束（Linux 上前面的用例在 lo 上留下了条目），`rta_cacheinfo` 只比错误码，`ipv6_route` 不比引用数，TCP 的 alloc 是整个系统的。对照时发现两处不同：224.0.0.1 少了 `RTCF_LOCAL`（已改），`ip addr` 少了 `brd`（见推迟项）。
+  - Android：`MachineTest` 新增 `routesComeFromLinkProperties`，在 Android 14（4K 页）和 Android 17（16K 页）的模拟器上通过。
 - **开销**：只在查路由、读这几个文件时计算，收发数据的路径上没有改动。
 
 **推迟项**：

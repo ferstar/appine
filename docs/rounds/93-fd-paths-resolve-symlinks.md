@@ -16,20 +16,13 @@
   - execve 时解释器在 maps 里的名字原来是 PT_INTERP 原样的字符串，现在也解析符号链接。起第一个程序（`Machine`）和 execve 共用 `interp_label`，名字和 inode 只查找一次（原来为了 inode 另外查找一次）。
 - **测试**：
   - cargo test 新增 `procfs_fd_paths_resolve_symlinks`，两层都跑：最后一级是链接、链接后面的 `..`、沿着悬空链接新建的文件、经由链接进入的当前目录下的相对路径。
-  - 差分测试 compat 组新增一个 C 程序，在上面几种情况之外还检查：`O_PATH | O_NOFOLLOW`，经由链接打开的目录，相对路径里的 `..`，经由链接 mmap 的文件在 maps 里的名字，以及 PT_INTERP 指向链接（`-Wl,--dynamic-linker=/tmp/rp/ld`）的程序里解释器的映射。输出与原生逐行相同。
-  - 变异检验：
-    - 打开时不看找到的目录和名字，cargo test 的四个路径都退回原样（`D/link/flink` 等）；
-    - 解释器用 PT_INTERP 原样的路径，差分测试里解释器那一行变成 `/tmp/rp/ld`。
-  - 上一轮的 valgrind 负载：memcheck 正好 3 个错误（越界读、未初始化、泄漏 40 字节），helgrind 2 个；跟进子进程和 python 都是 0 个。
-  - cargo test（215 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 958 个通过，与第 91 轮逐项相同，没有 BUG。这一轮和后面两轮的改动是一起跑的。
-- **开销**：只在两处。打开文件时，每次多算一遍找到文件的那个目录的路径，查的是元数据缓存；execve 时，解释器少查找一次。用 open 的微基准（`target/mem/openbench.c`，同一个文件开关 20 万次）和 `target/mem/ab.sh`，与上一轮的二进制交替跑：
+  - 差分测试 compat 组新增一个 C 程序，另外检查 `O_PATH | O_NOFOLLOW`、经由链接打开的目录和 mmap 的文件、PT_INTERP 指向链接的程序里解释器的映射，与原生逐行相同。
+  - 上一轮的 valgrind 负载：memcheck 只报出程序里故意留的 3 个错误，跟进的子进程和 python 都没有。
+- **开销**：只在两处。打开文件时，每次多算一遍找到文件的那个目录的路径，查的是元数据缓存；execve 时，解释器少查找一次。用 open 的微基准（`target/mem/openbench.c`，同一个文件开关 20 万次）与上一轮的二进制交替跑：
   - 绝对路径 0.374–0.390 → 0.392–0.394 秒，每次多约 0.05–0.1 µs；
   - 相对当前目录的路径 0.379–0.391 → 0.359–0.361 秒，原来要先算当前目录的路径、再做词法规范化；
   - 经由链接的路径 0.352–0.360 → 0.352–0.361 秒；
-  - python 1.37–1.40 → 1.34–1.38 秒，gcc 2.25–2.30 → 2.20–2.26 秒，shell 起进程 0.18–0.19 秒、`git status` 0.07–0.08 秒不变；
-  - `go build` 冷编译 6.27–6.30 → 6.14–6.22 秒，Maven 热构建 6.18–6.22 → 6.26–6.28 秒，在[第 89 轮](89-release-borrow-check.md)看到的波动范围（5.97–6.45 秒）里。
-
-  A/B 的二进制也带着第 94、95 轮的改动，它们只碰 `/proc` 的 stat 和跟踪者退出。
+  - python、gcc、shell 起进程、`git status`、`go build`、Maven 都在噪声范围内。
 
 **推迟项**：
 

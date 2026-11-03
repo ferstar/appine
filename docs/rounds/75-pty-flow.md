@@ -12,10 +12,9 @@
   - 主设备有自己的停止状态：主设备上 TCOOFF 之后，主设备的写阻塞到 TCOON。
   - TCIOFF、TCION 发 STOP、START 字符（禁用的不发）：从设备发给主设备，不受停住的限制，排在暂存的回显之前（`tty_send_xchar`）；主设备发的字符作为从设备的输入，经过 IXON 处理。
 - **测试**：
-  - 终端的单元测试新增 `stopped_output_blocks_the_slave_but_keeps_what_was_written`。变异检查：停住时仍然接收输出、^Q 能恢复 TCOOFF、停住时藏起已经写出的数据，各自都会失败。
-  - 差分测试 compat 组加了 PTY 的检查：主设备上 TCOFLUSH、TCIFLUSH 之后读到的数据，从设备的 TCIFLUSH，TCOOFF 时从设备不报可写、写阻塞、^Q 恢复不了、TCOON 之后写完，^S 之前写出的照样能读，TCIOFF、TCION 发的字符，主设备上 TCOOFF 时写阻塞。两层都与原生相同；上一轮的二进制卡在主设备 TCOFLUSH 之后的读上。
-  - CPython 的 test_termios、test_ioctl、test_pty、test_tty、test_readline、test_getpass 全部通过，一共 1.8 秒。
-  - cargo test（204 个）、clippy（含 Android）、两层的 20 组差分测试通过。LTP 的 syscall 测试 957 个通过，与上一轮相比只有 epoll_pwait03、select02 两个睡眠精度的[偶发项](../milestones.md#已知的偶发失败)一个通过、一个失败。
+  - 终端的单元测试新增 `stopped_output_blocks_the_slave_but_keeps_what_was_written`。
+  - 差分测试 compat 组加了 PTY 的检查：两端的 TCFLSH，TCOOFF、^S 停住时的写和 poll、怎样才能恢复，TCIOFF、TCION 发的字符，两层都与原生相同。
+  - CPython 的 test_termios、test_ioctl、test_pty、test_tty、test_readline、test_getpass 全部通过。
 
 **推迟项**：
 

@@ -14,9 +14,8 @@
 
 ## 测试
 
-- 差分测试 `compat2` 组新增 `pdeath.c`：建立子进程的线程退出时子进程收到 SIGUSR1，`SI_USER`、发送者是父进程、用户 ID 0；主线程建的子进程在别的线程退出时收不到；子进程里两个线程各设一个时两个都收到，设了的线程已经退出时只收到另一个；设了之后 execve 仍是那个值，照样收到；主线程设了之后新线程、fork 出来的子进程读到 0，setuid 之后清掉；整个父进程结束时的孙进程（放在最后：原生一侧这个程序是容器的 1 号进程，会收养这个孤儿）。`__WNOTHREAD`：线程等任意子进程只等到自己建的，再等是 ECHILD，等主线程的子进程是 ECHILD（不带它是 0），waitid 也是 ECHILD；线程退出之后它的子进程转给主线程，主线程带 `__WNOTHREAD` 等得到它，也等得到自己的。两个执行层下都与原生相同；上一轮的二进制在每一项上都与原生不同（收不到信号、新线程读到 12、`SI_KERNEL`、wait 返回 0）。
-- `namespaces` 组新增：`unshare -p -f --kill-child sleep` 之后 `kill -9` 掉 unshare，命名空间里的 1 号进程跟着结束。变异检验：发信号时不记发送者，1 号进程收不到这个 SIGKILL，这一行对不上。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1000 个通过（上次 1000）：futex_wait05 由失败变回通过，mmap21_02 这次是 `/dev/shm/ltp_mmap21_2` 的 EEXIST，都是[偶发项](../milestones.md#已知的偶发失败)；prctl01–03、prctl05、prctl08、prctl09 和 wait、waitid、waitpid 的各项照常通过，其余逐项相同。
+- 差分测试 `compat2` 组新增 `pdeath.c`：哪个线程退出时发、siginfo、多个线程各设一个、execve 保留、新线程和 fork 读到 0、setuid 清掉、整个父进程结束时的孙进程；`__WNOTHREAD` 只等自己建的、ECHILD、线程退出之后转给主线程的子进程。两个执行层下都与原生相同。孙进程那一项放在最后：原生一侧这个程序是容器的 1 号进程，会收养这个孤儿。
+- `namespaces` 组新增 `unshare -p -f --kill-child`：`kill -9` 掉 unshare 之后命名空间里的 1 号进程跟着结束。
 
 **推迟项**：
 

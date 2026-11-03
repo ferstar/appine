@@ -25,15 +25,10 @@ Android 的应用 seccomp（bionic 的 `SECCOMP_BLOCKLIST_APP.TXT`）不让调 a
 
 ## 测试
 
-- 新的差分测试组 `ioprio-klog`（原生一侧加 `CAP_SYS_NICE`、`CAP_SYSLOG`，与 appine 里的 root 一样）：
-  - ioprio：没设过是 0；类别、级别、which 不对是 EINVAL，检查先于找目标，找不到是 ESRCH；IDLE 的级别不检查、高位丢掉；RT；fork、线程继承 IDLE，设回 NONE 之后 fork 出来的是 0；`CLONE_IO` 建的子进程改了父进程也变，fork 的不变；自己一个进程组时按 nice 值和 `SCHED_IDLE`、`SCHED_FIFO` 推出的优先级（原始值仍是 0）；进程组里取最高的、按进程组设、按编号查、不存在的进程组；按用户查、设，不存在的用户，普通用户改别人的进程、设 RT 是 EPERM，改同一个用户的进程可以，who = 0 设的是 root 的（EPERM）、查的是自己的。级别 8 不比（见上，原生是 6.8）。
-  - syslog：各种参数错误、长度 0、超出用户空间的 EFAULT、控制台级别超出范围、未知的动作；普通用户的清空、打开、未知动作是 EPERM（权限先于参数检查），问大小和读全部跟着 `dmesg_restrict` 走（原生读的是宿主的 `dmesg_restrict`）。日志内容、缓冲区大小两边不同，读（2）在原生一侧会读走真正的日志，都不比。
-  - adjtimex：查询的返回值、status、constant、precision、tolerance、tick、tai（offset、freq、maxerror 随宿主的 NTP 在变，不比），modes 和填充不动，时间与 gettimeofday 相差不到 2 秒；`ADJ_OFFSET_SS_READ`；只有 `ADJ_ADJTIME`、只有 `ADJ_ADJTIME` 和 readonly 是 EINVAL，singleshot 不带 readonly、`ADJ_STATUS`、`ADJ_TICK`、`ADJ_SETOFFSET` 是 EPERM，频率溢出是 EINVAL、不溢出的查询照常；空指针，EPERM 和查询碰上只读的内存时 adjtimex 是 EFAULT、clock_adjtime 的 EPERM 不写回；clock_adjtime 的各种时钟编号，`CLOCK_REALTIME` 与 adjtimex 相同，坏指针先于坏时钟。
-  - util-linux 和 busybox 的 `ionice`：显示没设过的、IDLE、BE 5、RT 2；普通用户设 RT 时不带 `-t` 不执行命令、带 `-t` 照常执行。
-  - 两个执行层下都与原生相同。变异检验，四种都失败：`CLONE_IO` 不共用而复制、按 nice 推级别时总是 4、ioprio_set 不查属主、clock_adjtime 出错时也写回。
-- rootfs 用例 `kernel_log_is_empty_and_keeps_console_levels`：busybox 的 dmesg 什么也不打印，`dmesg -n 3` 之后 `/proc/sys/kernel/printk` 是 `3 4 1 7`，写前三个只改前三个；`dmesg_restrict` 为 1 时普通用户的 dmesg 是 EPERM，写 2 被拒绝。`io_priority_reaches_the_host_thread`：`ionice -c3` 执行的程序在宿主上的线程是 IDLE，`-c1 -n2` 的是 BE 2，没有 RT 的。
+- 新的差分测试组 `ioprio-klog`（原生一侧加 `CAP_SYS_NICE`、`CAP_SYSLOG`，与 appine 里的 root 一样）：ioprio 的参数检查、继承和 `CLONE_IO`、按调度策略和 nice 推出的优先级、按进程组和用户设和查、权限；syslog 的参数错误、权限和 `dmesg_restrict`；adjtimex、clock_adjtime 的查询、EINVAL 和 EPERM 的先后、写回和 EFAULT、各种时钟编号；util-linux 和 busybox 的 `ionice`。两个执行层下都与原生相同。原生是 6.8、读的是宿主的日志和 NTP 状态，所以 ioprio 的级别 8、日志内容、缓冲区大小、syslog 的读（2）、adjtimex 里随宿主的 NTP 在变的字段都不比。
+- rootfs 用例 `kernel_log_is_empty_and_keeps_console_levels`（busybox 的 dmesg、`dmesg -n`、`dmesg_restrict`）和 `io_priority_reaches_the_host_thread`（宿主上的线程拿到对应的 IO 优先级，没有 RT 的）。
 - `tests/guest/waits.c` 加上 syslog 的读（等到信号）；hal 的单元测试比对合成的时钟状态和宿主内核的只读查询。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1006 个通过（上次 1001），新通过 7 个：ioprio_get01、ioprio_set01–03、syslog11、syslog12、adjtimex03；epoll_pwait03、futex_wait05 由通过变失败，都是"slept for too long"（[偶发项](../milestones.md#已知的偶发失败)），单独重跑仍失败，上一轮的二进制同时重跑也一样失败。adjtimex01、adjtimex02、clock_adjtime01、clock_adjtime02 仍失败：它们以 root 改时钟、NTP 参数，期望成功，或者期望过了能力检查之后的 EINVAL（tick 超出范围），appine 当作没有 `CAP_SYS_TIME`，是 EPERM（原来是 ENOSYS，现在各自的查询、权限部分通过）。
+- LTP 新通过 ioprio_get01、ioprio_set01–03、syslog11、syslog12、adjtimex03。adjtimex01、adjtimex02、clock_adjtime01、clock_adjtime02 仍失败：它们以 root 改时钟、NTP 参数，期望成功或者过了能力检查之后的 EINVAL，appine 当作没有 `CAP_SYS_TIME`，是 EPERM。
 
 **推迟项**：
 
