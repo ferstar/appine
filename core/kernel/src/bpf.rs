@@ -1,4 +1,4 @@
-//! eBPF 的一个子集（设计文档 §8.2）：cgroup 的设备过滤程序（`BPF_PROG_TYPE_CGROUP_DEVICE`）。
+//! eBPF 的一个子集（kernel/procfs 的 map）：cgroup 的设备过滤程序（`BPF_PROG_TYPE_CGROUP_DEVICE`）。
 //!
 //! cgroup v2 没有 v1 的 `devices.allow`，runc、crun 给每个容器的 cgroup 挂一个 eBPF 程序，
 //! 进程打开设备节点、mknod 时内核用它决定放不放行。这里只有这一种程序：校验器

@@ -1,4 +1,4 @@
-//! mount(2)、umount2(2)、pivot_root(2)（设计文档 §8.2）。
+//! mount(2)、umount2(2)、pivot_root(2)（kernel/vfs 的 map）。
 //!
 //! 合成文件系统（procfs、sysfs、devpts、cgroup2）可以挂到任意目录上；仓库里的和合成文件
 //! 系统里的目录、文件都可以 bind 挂载（`MS_REC` 带上挂在里面的挂载），命名空间文件也可以

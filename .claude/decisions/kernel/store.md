@@ -1,0 +1,70 @@
+# Inode store (kernel/store) Decisions
+> Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
+> Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.1 and
+> the round records in `docs/rounds/`; no `MODULE: kernel/store` Decision blocks exist yet, so
+> sources cite rounds instead of commits.
+
+## Active
+
+### D1: The rootfs is an inode store — SQLite for the namespace, one host file per regular file
+- **What**: Directories, names, inodes, symlinks, device nodes, xattrs and hardlinks live in SQLite; each regular file's data is `objects/<ino>`, opened by number relative to the objects directory.
+- **Why**: A real directory tree plus a metadata database (iSH fakefs style) was rejected: Android cannot create hardlinks, and keeping the tree and the database consistent across rename and unlink is hard. SQLite gives atomic metadata operations; it is bundled as the amalgamation (rusqlite `bundled`) because the NDK exposes no system SQLite.
+- **Tradeoffs**: Every metadata operation goes through SQLite; host tools cannot browse the rootfs as plain files.
+- **Watch out**: Objects must always be addressed by inode number, never by guest path.
+- **Source**: design review 2026-10-24 (§8.1, §15)
+
+### D2: Regular files' size and times come from the host object
+- **What**: Size, mtime, atime and ctime of regular files are read from `objects/<ino>`; metadata changes chmod the object so the host bumps ctime.
+- **Why**: Data I/O goes straight to the host fd, so the host already maintains size and times. Directory and file timestamps used to go stale (breaking Python's import cache, PHP tests, Maildir, git's untracked cache); taking the later of the database and object ctime failed because the two clocks can differ (on virtiofs the object's clock was 84 ms ahead), so each file uses only the host's clock.
+- **Tradeoffs**: Non-regular inodes keep times in SQLite with atime equal to mtime.
+- **Watch out**: Changing a regular file's database metadata without touching the object leaves a stale ctime.
+- **Source**: design review 2026-10-24 (§8.1), round 73 (`73-timestamps`)
+
+### D3: Writes are deferred up to 5 ms in one transaction with a savepoint per operation
+- **What**: A write transaction stays open up to 5 ms; each operation is a savepoint that alone is rolled back on error or panic.
+- **Why**: A commit costs far more than the operation itself (package installs were dominated by per-operation commits); if the app is killed only the last few milliseconds are lost and the store stays at a consistent commit.
+- **Tradeoffs**: A failed commit loses every deferred operation in it; guest fsync, host sync and sharing with another connection force immediate commits.
+- **Watch out**: The timer thread must commit overdue transactions even when no further operation arrives.
+- **Source**: rounds 06 (`06-m4`, risk R5), 32 (`32-workloads-file-ops`)
+
+### D4: A metadata cache, invalidated across connections by a shared commit counter
+- **What**: Dentries (including negative ones), rows, symlink targets and listings are cached in memory; own writes invalidate precisely, and a foreign change of the counter in the `lock` file clears everything.
+- **Why**: Path lookup and stat dominated file-heavy workloads; the counter keeps several users of one store from reading stale data.
+- **Tradeoffs**: No eviction (cleared wholesale after a fill budget); readers without the BKL must fall back on any miss.
+- **Watch out**: The counter must be bumped only after `COMMIT`, so nothing older can be filled under a newer label.
+- **Source**: rounds 13 (`13-profiling`), 25 (`25-stat-without-bkl`)
+
+### D5: WAL checkpoints run on a background thread
+- **What**: A reaper thread with its own connection runs PASSIVE checkpoints; the committing thread only checkpoints when the WAL grows very large.
+- **Why**: SQLite's automatic checkpoint (two fsyncs) ran in the committing connection, usually under the BKL; on phone UFS/f2fs an fsync often takes milliseconds to tens of milliseconds, stalling every guest thread entering the kernel.
+- **Tradeoffs**: An extra thread and connection per store connection.
+- **Watch out**: Keep the inline fallback so the WAL cannot grow without bound.
+- **Source**: round 111 (`111-background-checkpoint`)
+
+### D6: Power-loss ordering mimics ext4 `data=ordered` with `auto_da_alloc`
+- **What**: Commits do not sync; fsync/sync really reach disk; files renamed over others are flushed before the rename commits; objects are deleted only after the unlinking commit is durable.
+- **Why**: Android kills apps routinely and phones lose power; a corrupted store (a `/bin/sh` that was not an ELF was once seen) would make the whole environment unusable, and programs like apk and editors rely on ext4's rename-over behaviour without calling fsync.
+- **Tradeoffs**: Rename-over commits flush data while holding the BKL.
+- **Watch out**: The crash test (`tests/crash`) only covers ext4 hosts.
+- **Source**: round 198 (`198-power-loss`)
+
+### D7: Several connections share one store through the `lock` file
+- **What**: Shared `flock`s, a shared-mapped header (commit counter, users, uncommitted inode range), `BEGIN IMMEDIATE`, no deferral while another connection is open, boot cleanup only with an exclusive lock.
+- **Why**: The app's DocumentsProvider must read and write the same store as the running kernel without stale or lost metadata.
+- **Tradeoffs**: Commits become immediate while the provider has a connection open.
+- **Watch out**: A crashed connection leaves `users` high, disabling deferral until the next exclusive open.
+- **Source**: rounds 32 (`32-workloads-file-ops`), 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`)
+
+### D8: tmpfs trees live in the store, not in memory
+- **What**: A tmpfs mount is a detached directory tree in the store whose files are ordinary objects, removed at the next boot if left over.
+- **Why**: bubblewrap builds its new root on a tmpfs, and keeping tmpfs data in host files avoids consuming the app's memory.
+- **Tradeoffs**: tmpfs is as fast as the store, not as RAM.
+- **Watch out**: Detached trees must be cleaned up when their last mount goes away and at boot.
+- **Source**: round 117 (`117-tmpfs`)
+
+### D9: The host browse API skips guest permissions but confines writes
+- **What**: The provider resolves guest paths itself, reads anywhere and writes only below a caller-supplied directory (the login account's home).
+- **Why**: Users copy files in and out of appine through Android's Files app; the provider acts for the device owner, not a guest user.
+- **Tradeoffs**: Guest permission bits do not restrict the provider; confinement relies on the caller-supplied directory.
+- **Watch out**: Host writes are replayed to running kernels as inotify events so guest watchers notice them.
+- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`)

@@ -1,4 +1,4 @@
-//! inode 仓库（设计文档 §8.1）。
+//! inode 仓库（kernel/store 的 map）。
 //!
 //! SQLite（WAL）保存完整的命名空间：目录项、inode、symlink 目标；普通文件的
 //! 数据存成宿主文件 `objects/<ino>`。普通文件的 size 和 mtime 以宿主 object

@@ -1,6 +1,6 @@
 # kernel/mm Map
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/mm.md` for the paired decision history (not created yet).
+> See `.claude/decisions/kernel/mm.md` for the paired decision history.
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 > Maintained: 2026-11-03 (targeted verification: added two facts carried over from the retired design doc §5 — shared-mapping coherence and the host address-space limit)
 

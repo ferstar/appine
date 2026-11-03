@@ -6,7 +6,7 @@
 | R2 | `specialUse` 前台服务能通过 Play 审核 | 提交 Play 时 | 准备好"运行用户主动发起的命令行任务"的说明；退而使用有时长限制的类型，并在 UI 中提示用户 |
 | R3 | Termux `terminal-emulator`/`terminal-view` 的许可证 | ✅ 已解决：按 GPLv3 对待，appine 改为 AGPL-3.0-or-later，两者可以结合，见 §13.4 | — |
 | R4 | DBT 中 LL/SC 序列的处理（独占监视器活锁） | ✅ 已解决：两层都用比较并交换的语义，Tier 1 的 STXR 是两条指令之间没有访存的 `ldaxr`/`stlxr` 循环，见 [engine 的 map](../../.claude/maps/engine.md) | — |
-| R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | ✅ 已关闭：瓶颈在引擎而不在事务；引擎变快之后改成推迟最多 5 毫秒合并提交（§8.1） | — |
+| R5 | 每个元数据操作一个 SQLite 事务时 `apk add` 的速度 | ✅ 已关闭：瓶颈在引擎而不在事务；引擎变快之后改成推迟最多 5 毫秒合并提交（[kernel/store 的 map](../../.claude/maps/kernel/store.md)） | — |
 | R6 | Tier 1 能否在 Android 上使用宿主 X18 作临时寄存器 | ✅ 已解决：不用，翻译后的代码不碰 X18，临时寄存器改用 X27（[engine 的 map](../../.claude/maps/engine.md)） | — |
 | A1 | Go 在 linux/arm64 上不设置 `SA_RESTORER`，依赖 vDSO 中的 sigreturn 跳板 | ✅ 已证实：Go 在 arm64 上 `_SA_RESTORER = 0`，信号处理函数经由 vDSO 的 `__kernel_rt_sigreturn` 返回 | — |
 | A2 | Android GKI 常见配置为 4K 页 + 39-bit VA | ✅ 模拟器的 GKI 内核是这样（[kernel/mm 的 map](../../.claude/maps/kernel/mm.md)） | — |

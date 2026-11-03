@@ -501,7 +501,7 @@ internal object Rootfs {
     /**
      * 把 [distro] 的包管理器的源换成 [mirror]（[retarget]）；源文件不在了就按 [sources] 重写。源里
      * 一处内置的镜像也没有（全换成了列表以外的镜像）时不动，返回 false。内核运行着也可以写：仓库
-     * 的提交计数器变了，内核层的缓存随之作废（设计文档 §8.1）。
+     * 的提交计数器变了，内核层的缓存随之作废（kernel/store 的 map）。
      */
     @Throws(IOException::class)
     private fun writeMirror(store: String, distro: Distro, mirror: String): Boolean {

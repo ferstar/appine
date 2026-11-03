@@ -1,4 +1,4 @@
-//! 字符设备（设计文档 §8）。
+//! 字符设备（kernel/vfs 的 map）。
 //!
 //! 开机时 `/dev` 上挂一个 tmpfs，标准的设备节点按 Linux 的设备号建在里面（[`populate`]，
 //! 相当于 Linux 的 devtmpfs），打开设备节点时按设备号找到这里的实现；guest 自己用 mknod

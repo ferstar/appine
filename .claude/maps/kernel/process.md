@@ -1,6 +1,6 @@
 # kernel/process Map
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/process.md` for the paired decision history (not created yet).
+> See `.claude/decisions/kernel/process.md` for the paired decision history.
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 
 ## Responsibilities

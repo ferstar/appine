@@ -1,4 +1,4 @@
-//! cgroup v2（设计文档 §8.2）：`/sys/fs/cgroup` 里的一棵 cgroup 树。
+//! cgroup v2（kernel/procfs 的 map）：`/sys/fs/cgroup` 里的一棵 cgroup 树。
 //!
 //! 起初是为了让运行时知道 App 的内存上限：JVM 的默认堆是物理内存的 1/4，Node.js 按物理内存
 //! 给 V8 定堆的上限，而 guest 能用的只有 OOM killer 的上限（默认物理内存的一半，

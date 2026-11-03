@@ -13,7 +13,7 @@
 5. 内存：轻量用户态 soft-MMU，已迁到 [kernel/mm 的 map](../../.claude/maps/kernel/mm.md)（英文）
 6. 进程、线程与调度，已迁到 [kernel/process 的 map](../../.claude/maps/kernel/process.md)（英文）
 7. 信号与 ABI，已迁到 [kernel/signal 的 map](../../.claude/maps/kernel/signal.md)（英文）
-8. [文件系统](08-filesystem.md)
+8. 文件系统，已迁到 [kernel/store](../../.claude/maps/kernel/store.md)、[kernel/vfs](../../.claude/maps/kernel/vfs.md)、[kernel/procfs](../../.claude/maps/kernel/procfs.md) 的 map（英文）
 9. [TTY 与终端](09-tty.md)
 10. [网络](10-network.md)
 11. [用户、权限与 Android 集成](11-android.md)

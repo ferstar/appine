@@ -1,4 +1,4 @@
-//! 合成文件系统（设计文档 §8.2）：procfs、devpts、sysfs（CPU 的拓扑、网络接口）和只读的
+//! 合成文件系统（kernel/procfs 的 map）：procfs、devpts、sysfs（CPU 的拓扑、网络接口）和
 //! cgroup2，开机时挂在 `/proc`、`/dev/pts`、`/sys`、`/sys/fs/cgroup` 上。
 //!
 //! 节点是 [`PseudoNode`]，目录结构经由 [`View`]（持有 BKL 时对内核状态的只读视图）

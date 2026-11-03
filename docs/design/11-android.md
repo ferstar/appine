@@ -31,7 +31,7 @@
 - **v1：DocumentsProvider**（`Documents.kt`）。把登录账号的家目录注册为系统"文件" App 里的一个根，设置里的开关（默认关）可以把整个 `/` 以只读方式暴露。用户在"文件" App 里用"复制到…"即可导入或导出文件。
   - 不经过内核，直接在仓库里按 guest 路径查（`vfs::browse`：符号链接跟随，只给目录和普通文件，挂载看不到），每次调用另外打开一次仓库，文件以只读打开宿主上的 object 交出去。类型按扩展名猜，猜不出的看开头 4 KB（没有 NUL、是 UTF-8）认出文本。文档 ID 是 guest 的绝对路径，只认规范的、在显示着的根里面的。
   - 家目录里面能新建（属于登录账号，0644/0755，名字有了时换成 `a (1).txt`）、写、删除、改名、移动，按真实路径限制：经由符号链接走到家目录外面的不行；整个 `/` 只读。
-  - 双向的通知：修改经由仓库的事务和提交计数器，运行中的内核马上看得到，也报 inotify 事件（§8.3）；为写交出去的文件带上关闭的回调，对方关闭时报 `IN_MODIFY`、`IN_CLOSE_WRITE`。反过来，guest 改了目录项的目录由仓库记下，服务定时取走（`Machine::take_changed_dirs`），通知"文件"App 刷新。
+  - 双向的通知：修改经由仓库的事务和提交计数器，运行中的内核马上看得到，也报 inotify 事件（[kernel/vfs 的 map](../../.claude/maps/kernel/vfs.md)）；为写交出去的文件带上关闭的回调，对方关闭时报 `IN_MODIFY`、`IN_CLOSE_WRITE`。反过来，guest 改了目录项的目录由仓库记下，服务定时取走（`Machine::take_changed_dirs`），通知"文件"App 刷新。
 - **v1.x：SAF 目录挂载到 `/mnt/<名字>`**。权限位是合成的（目录 0755、文件 0644）；`chmod`/`chown` 静默成功；`symlink`/`link` 返回 `EPERM`；目录列表在内存中缓存；不区分大小写这一点写进文档。
 - 不申请 `MANAGE_EXTERNAL_STORAGE`，Play 不批准终端类 App 使用。
 
@@ -40,7 +40,7 @@
 `android/app/src/main/java/.../Rootfs.kt`、`SettingsActivity.kt`：
 
 1. 第一次运行时直接导入 Alpine Linux，不让用户选。Alpine 的 minirootfs（`rootfs.tgz`）在 APK 的 assets 里，由 `scripts/fetch-rootfs` 下载，下载时验官方的 GPG 签名，版本和 sha256 固定写在脚本里。Debian 13 在设置里换：debuerreotype 构建的 `debian:trixie`（Docker 官方镜像用的同一份，固定在一个提交上），选了才下载，长度和 sha256 固定写在 `Rootfs.kt` 里，只比 sha256（没有签名，摘要写在 App 里，验签也不会更可信）。它只有 GitHub 一个来源，暂不自己托管。有几个来源时先测速，从快的开始试，一个失败了换下一个；中途断开时带 `Range` 接着下。校验过的 tarball 留在缓存目录里，导入成功才删掉。
-2. 以流的方式导入 `rootfs.tmp`，完成后（连同第 3 步写的配置）对整个文件系统 syncfs 一次再改名，改名之后让 `files` 目录也落盘（§8.1 的断电）；导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里。
+2. 以流的方式导入 `rootfs.tmp`，完成后（连同第 3 步写的配置）对整个文件系统 syncfs 一次再改名，改名之后让 `files` 目录也落盘（[kernel/store 的 map](../../.claude/maps/kernel/store.md) 的断电）；导入中途被杀时下次重来。装的是哪个发行版记在 App 的 SharedPreferences 里。
 3. 写入包管理器的源（`/etc/apk/repositories` 或 apt 的 deb822 源，apt 用 http：rootfs 里没有 ca-certificates，软件包有签名）、`/etc/hostname`、`/etc/hosts`、`/etc/motd`，以及 `/etc/profile.d/appine.sh`（`TERM=xterm-256color`、`LANG=C.UTF-8`、`NMAP_UNPRIVILEGED=1`、彩色 `PS1`，显示 motd）。Alpine 的 `/etc/resolv.conf` 由内核层在打开仓库时补上（§10）；Debian 的改成指向 DNS 存根。
    - 每次启动内核之前，没有 `/etc/network/interfaces` 时写一个只有回环接口的：网络是宿主的，OpenRC 为要网络的服务拉起 networking，没有这个文件时它失败，服务也起不来。不用 rc.conf 的 `rc_provide`：它加到每一个服务上，容易成环。
    - 装了 OpenRC、hwclock/osclock/swclock 都不在任何运行级别里时，把 osclock 加进 boot：OpenRC 默认用 hwclock 提供 `clock`，而 appine 没有 RTC、也设不了宿主的时间（[kernel/signal 的 map](../../.claude/maps/kernel/signal.md)），hwclock 必然失败。用户放了哪个时钟服务就不动。
@@ -48,6 +48,6 @@
 
 - **设置页**：标签栏菜单里的"设置"。状态都在 `TerminalService` 里，设置页只显示和转达；有设置页或终端界面在，都算界面可见。
 - **换发行版、重置 rootfs**：重置是换成装着的那个。确认之后先在后台下载并校验 tarball，这期间原来的系统照常运行，进度显示在设置页和通知里，两处都能取消；下载好了才结束所有会话、停下内核、删掉仓库、导入新的。下载失败时原来的系统不动；导入失败时退回 APK 里的 Alpine。内核启动失败时也能在设置里重置。一次只有一个 rootfs，换发行版就丢掉原来的文件；rootfs 导出和导入放到 v1.x。
-- **镜像选择**：每个发行版内置一份镜像列表：官方的、清华、中科大、阿里云。导入之后在后台并发测速，选最快的写入包管理器的源，全部失败时保持官方的。设置里可以手动选一个，或者选回"自动"重新测速。写进源时只把内置镜像的地址换成选的那个，协议照旧，用户加的行都留着；源里一处内置镜像也没有时不动，提示用户手改。内核运行着也可以写：仓库的提交计数器让内核层的缓存作废（§8.1）。
+- **镜像选择**：每个发行版内置一份镜像列表：官方的、清华、中科大、阿里云。导入之后在后台并发测速，选最快的写入包管理器的源，全部失败时保持官方的。设置里可以手动选一个，或者选回"自动"重新测速。写进源时只把内置镜像的地址换成选的那个，协议照旧，用户加的行都留着；源里一处内置镜像也没有时不动，提示用户手改。内核运行着也可以写：仓库的提交计数器让内核层的缓存作废（[kernel/store 的 map](../../.claude/maps/kernel/store.md)）。
 - **执行层**：设置里可以换成 Tier 0（解释器，排查问题用），记下之后重启内核。
 - **升级**：App 更新时不动用户已有的 rootfs。同一分支内由用户自己运行 `apk upgrade`、`apt upgrade`；跨分支升级由用户修改源。

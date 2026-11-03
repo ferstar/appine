@@ -1,6 +1,6 @@
 # engine Map
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/engine.md` for the paired decision history (not created yet).
+> See `.claude/decisions/engine.md` for the paired decision history.
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities

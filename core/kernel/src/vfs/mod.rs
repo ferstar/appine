@@ -1,4 +1,4 @@
-//! 虚拟文件系统（设计文档 §8）。
+//! 虚拟文件系统（kernel/vfs 的 map）。
 //!
 //! 根文件系统是 inode 仓库，`/dev` 里的设备节点也存在仓库里（[`dev`]）。procfs、
 //! devpts、sysfs 和 cgroup2 是合成文件系统：它们的内容来自内核状态，由内核层经由
@@ -705,7 +705,7 @@ impl Vfs {
             flags,
             b"sysfs",
         );
-        // cgroup2 挂在 sysfs 的 fs/cgroup 上（§8.2），与 Linux 的主机上一样可以写：dockerd、
+        // cgroup2 挂在 sysfs 的 fs/cgroup 上（kernel/vfs 的 map），与 Linux 的主机上一样可以写：dockerd、
         // runc 在里面建容器的 cgroup
         if mounts.list.iter().any(|m| m.id == SYS_MOUNT) {
             mounts.boot(
