@@ -5,9 +5,11 @@ import com.termux.terminal.TerminalSession
 import java.io.IOException
 
 /**
- * 一个终端标签页的 PTY：内核里的一个控制台，上面跑一个登录 shell。[login] 是设置里的登录账号
- * （`auto`、`root` 或账号名），由 assets 里的 `login.sh` 以 root 运行时决定登录谁（android/setup 的 map）；
- * [cwd] 是从哪个目录开始（App 被杀之后恢复的标签页，android/service 的 map），null 是家目录。
+ * The PTY of one terminal tab: a console in the kernel with a login shell running on it. [login] is
+ * the login account from Settings (`auto`, `root` or an account name), from which the assets'
+ * `login.sh`, running as root, decides whom to log in (the android/setup map); [cwd] is the
+ * directory to start in (tabs restored after the app was killed, the android/service map), null for
+ * the home directory.
  */
 internal class ConsolePty(
     private val machine: Long,
@@ -15,7 +17,7 @@ internal class ConsolePty(
     val login: String,
     private val cwd: String? = null,
 ) : TerminalSession.Pty {
-    /** 内核里的控制台编号，shell 启动之前是 -1。 */
+    /** The console number in the kernel, -1 before the shell starts. */
     @Volatile
     var console = -1
         private set
@@ -47,7 +49,10 @@ internal class ConsolePty(
     }
 
     companion object {
-        /** 设置里的登录账号：自动（最先建的普通用户，没有就是 root）。 */
+        /**
+         * Login account in Settings: automatic (the first regular user created, or root when there
+         * is none).
+         */
         const val LOGIN_AUTO = "auto"
         const val LOGIN_ROOT = "root"
 
@@ -55,13 +60,17 @@ internal class ConsolePty(
         private var cached: String? = null
 
         /**
-         * 登录脚本（assets 的 `login.sh`）：选账号，普通用户第一次成为登录账号时加进管理员组、装好
-         * doas 或 sudo，然后 `su -l` 过去；root 以 `/etc/passwd` 里的 shell 登录（chsh 改过也照样）。
+         * The login script (the assets' `login.sh`): chooses the account; when a regular user first
+         * becomes the login account, adds it to the admin group and installs doas or sudo, then
+         * `su -l` to it; root logs in with the shell in `/etc/passwd` (also after chsh changed it).
          */
         fun script(context: Context): String = cached
             ?: context.assets.open("login.sh").bufferedReader().readText().also { cached = it }
 
-        /** 以 root 运行登录脚本的 argv（`sh -c 脚本 appine-login 账号 目录`）。 */
+        /**
+         * The argv for running the login script as root
+         * (`sh -c script appine-login account directory`).
+         */
         fun argv(script: String, login: String, cwd: String? = null) =
             arrayOf("sh", "-c", script, "appine-login", login, cwd.orEmpty())
 
@@ -73,8 +82,9 @@ internal class ConsolePty(
             "SHELL=/bin/sh",
             "USER=root",
             "LOGNAME=root",
-            // nmap 以 root 运行时默认做要 raw socket 的扫描，App 建不了这种 socket（与没有
-            // CAP_NET_RAW 的 root 一样），nmap 直接退出；设了它就改用 connect 扫描
+            // Run as root, nmap does scans that need raw sockets by default, which the app cannot
+            // create (like root without CAP_NET_RAW), so nmap just exits; with this set it uses
+            // connect scans instead
             "NMAP_UNPRIVILEGED=1",
         )
     }

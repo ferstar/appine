@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 自适应图标的前景：108dp 画布，图形在中间 66dp 的安全区里 -->
+<!-- Foreground of the adaptive icon: a 108dp canvas, with the drawing in the 66dp safe zone in the
+     middle -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"

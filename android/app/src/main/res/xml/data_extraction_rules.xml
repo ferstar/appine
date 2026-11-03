@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- rootfs 可能很大，而且换一台设备也不一定能用：不备份，也不在设备之间迁移 -->
+<!-- The rootfs may be large and may not work on another device: no backup and no transfer between
+     devices -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />

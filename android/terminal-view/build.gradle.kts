@@ -1,4 +1,4 @@
-// Termux 的 terminal-view（vendored，见 android/README.md）
+// Termux's terminal-view (vendored, see android/README.md)
 plugins {
     id("com.android.library")
 }

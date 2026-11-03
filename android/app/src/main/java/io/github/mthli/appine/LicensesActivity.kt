@@ -22,8 +22,10 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 
 /**
- * 开源许可（设计文档 §13.4）：构建时生成的 `assets/notices/`（`NoticesTask`）。先是列表，点一项
- * 看全文；全文保持原来的换行（许可证按 70 多列排好），放不下时横向滚动。
+ * Open source licenses (design doc §13.4): the `assets/notices/` generated at build time
+ * (`NoticesTask`). A list first, and tapping an entry shows its full text; the full text keeps its
+ * original line breaks (licenses are laid out at seventy-some columns) and scrolls sideways when it
+ * does not fit.
  */
 class LicensesActivity : Activity() {
 
@@ -31,12 +33,15 @@ class LicensesActivity : Activity() {
 
     private lateinit var title: TextView
 
-    /** 放列表或全文。 */
+    /** Holds the list or the full text. */
     private lateinit var body: FrameLayout
     private lateinit var list: View
     private var showing: Entry? = null
 
-    /** 看全文时返回键回到列表（Android 13 起；之前的版本走 [onBackPressed]）。 */
+    /**
+     * While a full text is shown, the back key returns to the list (from Android 13 on; earlier
+     * versions go through [onBackPressed]).
+     */
     private var backCallback: Any? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -88,7 +93,8 @@ class LicensesActivity : Activity() {
         setContentView(root)
     }
 
-    // 只有 Android 13 之前的系统调用它；之后的走 interceptBack 登记的 OnBackInvokedCallback
+    // Only systems before Android 13 call it; later ones go through the OnBackInvokedCallback
+    // registered by interceptBack
     @SuppressLint("GestureBackNavigation")
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
@@ -127,7 +133,7 @@ class LicensesActivity : Activity() {
         setOnClickListener { show(e) }
     }
 
-    /** 看一项的全文。 */
+    /** Shows the full text of an entry. */
     private fun show(e: Entry) {
         val text = assets.open("notices/${e.file}").bufferedReader().readText()
         showing = e
@@ -149,8 +155,9 @@ class LicensesActivity : Activity() {
     }
 
     /**
-     * 字号取 [COLUMNS] 列正好放得下屏幕宽度的大小（许可证原文和生成的声明都按 72 列排），最大
-     * 13sp：手机上不用横向滚动，平板上也不会太大。
+     * The text size is the one at which [COLUMNS] columns just fit the screen width (the license
+     * texts and the generated notices are both laid out at 72 columns), at most 13sp: no sideways
+     * scrolling on phones, and not too big on tablets.
      */
     private fun fitColumns(view: TextView) {
         val width = resources.displayMetrics.widthPixels - dp(24)
@@ -160,7 +167,7 @@ class LicensesActivity : Activity() {
         view.setTextSize(TypedValue.COMPLEX_UNIT_PX, minOf(max, width / (COLUMNS * perChar)))
     }
 
-    /** 从全文回到列表；在列表上时关掉。 */
+    /** From the full text back to the list; closes when on the list. */
     private fun back() {
         if (showing == null) {
             finish()

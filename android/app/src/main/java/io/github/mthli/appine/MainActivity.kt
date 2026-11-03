@@ -33,8 +33,9 @@ import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 
 /**
- * 终端界面：上面是标签栏，中间是终端，下面是软键盘上没有的按键（Esc、Ctrl、方向键等）。
- * 会话属于 [TerminalService]，这里只负责显示和输入。
+ * The terminal screen: the tab bar on top, the terminal in the middle, and below it the keys the
+ * soft keyboard lacks (Esc, Ctrl, arrows and so on).
+ * Sessions belong to [TerminalService]; this only handles display and input.
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
@@ -105,8 +106,8 @@ class MainActivity : Activity(), TerminalService.Listener {
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
-        // 内容画到系统栏后面（Android 15 起 targetSdk 35 的默认行为，这里在所有版本上都这样
-        // 做）：按系统栏和输入法让出位置
+        // Content is drawn behind the system bars (the default for targetSdk 35 from Android 15 on;
+        // done here on every version): leave room for the system bars and the IME
         WindowCompat.setDecorFitsSystemWindows(window, false)
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
@@ -151,7 +152,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         if (s.sessions.isEmpty()) {
             newSession()
         } else {
-            // 被杀之后恢复的标签页：显示原来正在看的那个
+            // Tabs restored after a kill: show the one that was being viewed
             show(current?.takeIf { it in s.sessions } ?: s.focus?.takeIf { it in s.sessions } ?: s.sessions.last())
         }
     }
@@ -162,7 +163,9 @@ class MainActivity : Activity(), TerminalService.Listener {
         status.text = text
     }
 
-    /** 换发行版没有成功（下载失败、导入失败退回了 Alpine）。 */
+    /**
+     * A distro switch failed (the download failed, or the import failed and fell back to Alpine).
+     */
     override fun onNotice() {
         val text = service?.takeNotice() ?: return
         AlertDialog.Builder(this)
@@ -178,8 +181,9 @@ class MainActivity : Activity(), TerminalService.Listener {
             s.sessions.lastOrNull()?.let { show(it) }
         }
         if (s.sessions.isEmpty() && s.machine != 0L) {
-            // 最后一个标签页关掉了：界面退出。服务还有 guest 进程（OpenRC 起的服务等）时留在
-            // 后台，没有了就自己退出（android/service 的 map）
+            // The last tab was closed: the UI exits. The service stays in the background while it
+            // still has guest processes (services started by OpenRC and so on), and exits by itself
+            // when there are none (the android/service map)
             finish()
             return
         }
@@ -211,7 +215,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    // ---- 会话 ----
+    // ---- Sessions ----
 
     private fun newSession() {
         val s = service ?: return
@@ -263,7 +267,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         getSystemService(InputMethodManager::class.java).showSoftInput(terminal, 0)
     }
 
-    /** TerminalView 的回调：输入、缩放、按键修饰键。 */
+    /** TerminalView callbacks: input, zoom, key modifiers. */
     private inner class ViewClient : TerminalViewClient {
         override fun onScale(scale: Float): Float {
             if (scale in 0.9f..1.1f) return scale
@@ -286,7 +290,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun copyModeChanged(copyMode: Boolean) {}
 
         override fun onKeyDown(keyCode: Int, e: KeyEvent, session: TerminalSession): Boolean {
-            // 会话已经结束时按回车关闭它，与 Termux 相同
+            // When the session has ended, Enter closes it, as in Termux
             if (!session.isRunning && keyCode == KeyEvent.KEYCODE_ENTER) {
                 close(session)
                 return true

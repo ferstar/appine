@@ -16,30 +16,38 @@ import java.util.UUID;
  * {@link #updateSize(int, int, int, int)}, and threads are spawned to handle its I/O.
  * All terminal emulation and callback methods will be performed on the main thread.
  * <p>
- * appine 的修改：原来的实现经由 {@code JNI.createSubprocess} 在宿主 PTY 上启动子进程，
- * 这里换成 {@link Pty} 接口，接到 appine 进程内 PTY 的主设备上。线程结构（读、写、等待
- * 各一个线程，模拟在主线程上进行）和其余对外接口保持不变。
+ * appine's changes: the original implementation started a subprocess on a host PTY through
+ * {@code JNI.createSubprocess}; here it is replaced by the {@link Pty} interface, connected to the
+ * master side of a PTY inside the appine process. The thread structure (one thread each for
+ * reading, writing and waiting, with emulation on the main thread) and the rest of the public
+ * interface are unchanged.
  */
 public final class TerminalSession extends TerminalOutput {
 
-    /** 进程内 PTY 的主设备一侧，由 App 实现。除了 {@link #start} 之外的方法在后台线程上调用。 */
+    /**
+     * The master side of the in-process PTY, implemented by the app. Methods other than
+     * {@link #start} are called on background threads.
+     */
     public interface Pty {
-        /** 以给定的窗口大小启动 shell，返回它的 pid。 */
+        /** Starts the shell with the given window size and returns its pid. */
         int start(int columns, int rows) throws IOException;
 
-        /** 读 shell 的输出；返回 -1 表示会话结束。 */
+        /** Reads the shell's output; returns -1 when the session has ended. */
         int read(byte[] buffer) throws IOException;
 
-        /** 向 shell 输入。 */
+        /** Input to the shell. */
         void write(byte[] buffer, int offset, int count) throws IOException;
 
-        /** 窗口大小变了。 */
+        /** The window size changed. */
         void resize(int columns, int rows);
 
-        /** 等 shell 结束：返回退出码，被信号终止时返回负的信号编号。 */
+        /**
+         * Waits for the shell to end: returns the exit code, or the negated signal number when a
+         * signal terminated it.
+         */
         int waitFor();
 
-        /** 关闭 PTY：与关闭终端窗口一样，shell 收到 SIGHUP。 */
+        /** Closes the PTY: as when a terminal window is closed, the shell receives SIGHUP. */
         void close();
     }
 
@@ -81,8 +89,8 @@ public final class TerminalSession extends TerminalOutput {
     private final Integer mTranscriptRows;
 
     /**
-     * App 被杀之后恢复的标签页：模拟器建好、shell 启动之前先显示的内容（上次的回看记录和提示），
-     * 显示过就丢掉。
+     * For a tab restored after the app was killed: what to show after the emulator is created and
+     * before the shell starts (the previous transcript and a notice), discarded once shown.
      */
     private byte[] mRestored;
 
@@ -105,18 +113,24 @@ public final class TerminalSession extends TerminalOutput {
             mEmulator.updateTerminalSessionClient(client);
     }
 
-    /** 恢复的标签页：在 shell 的输出之前显示 [text]（终端的字节流，换行要是 \r\n）。 */
+    /**
+     * A restored tab: shows [text] before the shell's output (a terminal byte stream, so line
+     * breaks must be \r\n).
+     */
     public void setRestored(byte[] text) {
         mRestored = text;
     }
 
     /**
-     * 在终端里用黄色显示一行 App 的提示（进程被结束的原因这些），在主线程上调用。提示到的时候
-     * shell 多半已经印出了新的提示符，所以插在光标所在的行上面：先换行再回来（在最后一行时让
-     * 屏幕上卷，腾出地方），在光标的行插入提示占的行数，写提示，光标回到原处。提示符和输入了
-     * 一半的命令跟着下移，shell 的行编辑不受影响。模拟器还没建（标签页还没显示过）时攒着，
-     * 建好之后先显示。正在全屏程序（备用屏幕，vim、less 这些）里时不显示、返回 false：写进去会
-     * 弄乱它的画面。
+     * Shows a line of app notice in yellow in the terminal (such as why a process was ended);
+     * called on the main thread. By the time the notice arrives the shell has most likely printed a
+     * new prompt, so it is inserted above the cursor's line: move down a line and back (at the last
+     * line this scrolls the screen up to make room), insert as many lines as the notice takes at
+     * the cursor's line, write the notice, and put the cursor back. The prompt and any half-typed
+     * command move down with it, and the shell's line editing is unaffected. While the emulator is
+     * not created yet (the tab has never been shown), notices are kept and shown first once it is
+     * created. In a full-screen program (the alternate screen: vim, less and the like) nothing is
+     * shown and false is returned: writing would mess up its display.
      */
     public boolean showMessage(String text) {
         if (mEmulator == null) {
@@ -148,7 +162,10 @@ public final class TerminalSession extends TerminalOutput {
         return true;
     }
 
-    /** 回看记录的文本（保存标签页用）；模拟器还没建（标签页还没显示过）时是 null。 */
+    /**
+     * The transcript text (for saving tabs); null while the emulator is not created yet (the tab
+     * has never been shown).
+     */
     public String getTranscriptText() {
         return mEmulator == null ? null : mEmulator.getScreen().getTranscriptText();
     }
@@ -184,7 +201,7 @@ public final class TerminalSession extends TerminalOutput {
         try {
             mShellPid = mPty.start(columns, rows);
         } catch (IOException e) {
-            // 启动失败：把原因显示在终端里，会话按已结束处理
+            // Start failed: show the reason in the terminal and treat the session as ended
             Logger.logStackTraceWithMessage(mClient, LOG_TAG, "Cannot start the shell", e);
             byte[] message = ("\r\n[" + e.getMessage() + "]\r\n").getBytes(StandardCharsets.UTF_8);
             mEmulator.append(message, message.length);
@@ -233,8 +250,9 @@ public final class TerminalSession extends TerminalOutput {
             @Override
             public void run() {
                 int processExitCode = mPty.waitFor();
-                // shell 退出前的输出可能还没读完：等一会儿读线程（后台进程可能一直开着终端，
-                // 所以不能无限等）
+                // Output from before the shell exited may not have been read yet: wait a little for
+                // the reader thread (a background process may keep the terminal open forever, so it
+                // cannot wait without limit)
                 try {
                     reader.join(500);
                 } catch (InterruptedException e) {

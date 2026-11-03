@@ -12,10 +12,12 @@ import com.termux.terminal.KeyHandler
 import com.termux.view.TerminalView
 
 /**
- * 软键盘上没有的按键。Ctrl 和 Alt 是一次性的修饰键：按一下之后作用于下一个输入的键。
- * Termux 的扩展键栏属于 GPLv3 的主模块，这里是重新写的（android/terminal 的 map）。
+ * The keys the soft keyboard lacks. Ctrl and Alt are one-shot modifiers: pressed once, they apply
+ * to the next key typed.
+ * Termux's extra keys bar belongs to its GPLv3 main module, so this is a rewrite (the
+ * android/terminal map).
  */
-@SuppressLint("ViewConstructor") // 只在代码里创建，不出现在布局文件里
+@SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(
     context: Context,
     private val terminal: () -> TerminalView,
@@ -48,7 +50,7 @@ internal class ExtraKeysView(
         key("→") { send(KeyEvent.KEYCODE_DPAD_RIGHT) }
     }
 
-    /** TerminalView 读修饰键时调用：读一次就复位。 */
+    /** Called when TerminalView reads the modifier: one read resets it. */
     fun consumeCtrl(): Boolean = ctrl.also {
         if (it) {
             ctrl = false
@@ -82,7 +84,10 @@ internal class ExtraKeysView(
         return view
     }
 
-    /** 特殊键：经过 TerminalView，修饰键和终端的按键模式（比如应用光标键）都会生效。 */
+    /**
+     * Special keys: they go through TerminalView, so modifiers and the terminal's key modes
+     * (application cursor keys, say) take effect.
+     */
     private fun send(keyCode: Int) {
         var mod = 0
         if (consumeCtrl()) mod = mod or KeyHandler.KEYMOD_CTRL
@@ -90,7 +95,7 @@ internal class ExtraKeysView(
         terminal().handleKeyCode(keyCode, mod)
     }
 
-    /** 普通字符：Ctrl 和 Alt 由 TerminalView 读取（[consumeCtrl]、[consumeAlt]）。 */
+    /** Plain characters: Ctrl and Alt are read by TerminalView ([consumeCtrl], [consumeAlt]). */
     private fun type(text: String) {
         val view = terminal()
         for (c in text) view.inputCodePoint(KeyEvent.KEYCODE_UNKNOWN, c.code, false, false)
