@@ -1,20 +1,27 @@
-//! nftables 的一个子集（docs/rounds/172-nftables.md）：`NETLINK_NETFILTER` 上的表、链、规则、
-//! 集合，和 iptables-nft 用的 `nft_compat`（xt 扩展的版本查询）。
+//! A subset of nftables (docs/rounds/172-nftables.md): tables, chains, rules and sets over
+//! `NETLINK_NETFILTER`, and the `nft_compat` that iptables-nft uses (revision queries of xt
+//! extensions).
 //!
-//! 每个网络命名空间一份（[`crate::nsproxy::NetNs::nft`]）。照 Linux 的 `nf_tables_api.c`，回答的
-//! 格式、错误码与 6.8 的内核对照过：
+//! One per network namespace ([`crate::nsproxy::NetNs::nft`]). Follows Linux's
+//! `nf_tables_api.c`; the format of answers and the error codes were checked against a 6.8
+//! kernel:
 //!
-//! - 修改都在批里（`NFNL_MSG_BATCH_BEGIN` 到 `NFNL_MSG_BATCH_END`，同一个数据报）：整批都成功
-//!   才提交，生成号（`NFT_MSG_GETGEN`，所有回答的 `res_id`）加一；有一条失败就整批作废，报告
-//!   失败的那几条（设了 `NETLINK_EXT_ACK` 的带上出错的属性的偏移）。要在命名空间的属主里有
-//!   `CAP_NET_ADMIN`（查询也要，`nfnetlink_rcv`）。
-//! - 规则的表达式原样记下、转储时原样带回（iptables 的 `-C` 靠转储比较），只有引用匿名集合的
-//!   lookup、按编号的跳转换成名字（`__set0`）。表的句柄是命名空间里的计数器，链、规则、集合
-//!   的由表里的计数器分配；链的 USE 是被跳转引用的次数加上链里的规则数，表的 USE 是链和集合
-//!   的个数。
-//! - 执行（[`Nft::nat`]）：connect、sendto 时跑 nat 类型、挂在 OUTPUT 钩子上的链，DNAT
-//!   在 socket 层换目的地址（docker 写进容器的内置 DNS 规则、podman 的端口转发）。别的钩子的、
-//!   过滤的规则只记下、不执行；不认识的表达式当作规则不匹配。
+//! - Changes all come in batches (`NFNL_MSG_BATCH_BEGIN` to `NFNL_MSG_BATCH_END`, in one
+//!   datagram): a batch is committed only if all of it succeeds, and then the generation number
+//!   (`NFT_MSG_GETGEN`, the `res_id` of every answer) goes up by one; if any message fails, the
+//!   whole batch is discarded and the failed messages are reported (with the offset of the
+//!   offending attribute when `NETLINK_EXT_ACK` is set). Needs `CAP_NET_ADMIN` in the
+//!   namespace's owner (queries too, `nfnetlink_rcv`).
+//! - Rule expressions are recorded as given and returned as given in dumps (iptables' `-C`
+//!   compares dumps); only lookups referring to anonymous sets and jumps by id are rewritten to
+//!   names (`__set0`). Table handles come from a counter in the namespace, and those of chains,
+//!   rules and sets from a counter in the table; a chain's USE is the number of jumps referring
+//!   to it plus the number of rules in it, and a table's USE is the number of its chains and
+//!   sets.
+//! - Execution ([`Nft::nat`]): connect and sendto run the nat-type chains on the OUTPUT hook, and
+//!   DNAT replaces the destination address in the socket layer (the built-in DNS rules docker
+//!   writes into containers, podman's port forwarding). Rules on other hooks and filter rules are
+//!   only recorded, not executed; unknown expressions count as the rule not matching.
 
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
@@ -50,8 +57,8 @@ const NEWOBJ: u8 = 18;
 const GETOBJ: u8 = 19;
 const NEWFLOWTABLE: u8 = 22;
 const GETFLOWTABLE: u8 = 23;
-/// `NFT_MSG_DESTROYTABLE` 到 `NFT_MSG_DESTROYSETELEM`（6.3 起，依次是表、链、规则、集合、
-/// 元素）：与 DEL 一样，只是没有时也算成功。
+/// `NFT_MSG_DESTROYTABLE` to `NFT_MSG_DESTROYSETELEM` (since 6.3; table, chain, rule, set and
+/// element in that order): like DEL, but also succeeding when the object does not exist.
 const DESTROYTABLE: u8 = 26;
 const DESTROYSETELEM: u8 = 30;
 
@@ -65,10 +72,11 @@ const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_APPEND: u16 = 0x800;
 const NLM_F_NONREC: u16 = 0x100;
-/// ERESTART：批开头给的生成号已经过时（`NFNL_BATCH_GENID`）。
+/// ERESTART: the generation number given at the start of the batch is out of date
+/// (`NFNL_BATCH_GENID`).
 const ERESTART: i32 = 85;
 
-// 属性
+// Attributes
 const TABLE_NAME: u16 = 1;
 const TABLE_FLAGS: u16 = 2;
 const TABLE_USE: u16 = 3;
@@ -144,10 +152,11 @@ const NFT_SET_INTERVAL: u32 = 4;
 const NFT_SET_ELEM_INTERVAL_END: u32 = 1;
 const NFT_JUMP: i32 = -3;
 const NFT_GOTO: i32 = -4;
-/// 名字的最大长度（`NFT_NAME_MAXLEN`，含结尾的 NUL）。
+/// Maximum length of a name (`NFT_NAME_MAXLEN`, including the terminating NUL).
 const NAME_MAX: usize = 256;
 
-/// 已知的表达式（`nft_expr_type_get` 找得到的，6.1 常编进去的那些）：别的是 ENOENT。
+/// Known expressions (those `nft_expr_type_get` finds, the ones commonly built into 6.1): others
+/// are ENOENT.
 const EXPRS: [&str; 39] = [
     "bitwise",
     "byteorder",
@@ -190,7 +199,8 @@ const EXPRS: [&str; 39] = [
     "xfrm",
 ];
 
-/// xt 扩展（`nft_compat` 的 `NFNL_MSG_COMPAT_GET`）：名字、是不是目标、最高的版本。
+/// xt extensions (`NFNL_MSG_COMPAT_GET` of `nft_compat`): name, whether it is a target, highest
+/// revision.
 const XT: [(&str, bool, u32); 52] = [
     ("DNAT", true, 2),
     ("SNAT", true, 2),
@@ -246,13 +256,15 @@ const XT: [(&str, bool, u32); 52] = [
     ("u32", false, 0),
 ];
 
-/// 一个网络命名空间的规则集。
+/// The ruleset of one network namespace.
 #[derive(Debug, Clone)]
 pub(crate) struct Nft {
-    /// 生成号（`net->nft.base_seq`）：新命名空间里从 1 起，每次提交了改动加一。
+    /// Generation number (`net->nft.base_seq`): starts at 1 in a new namespace and goes up by one
+    /// with every committed change.
     pub generation: u32,
     tables: Vec<Table>,
-    /// 表的句柄（`nft_net->table_handle`）：命名空间里的计数器，删了的不再用。
+    /// Table handles (`nft_net->table_handle`): a counter in the namespace; deleted ones are
+    /// never reused.
     table_handle: u64,
 }
 
@@ -273,7 +285,7 @@ struct Table {
     handle: u64,
     flags: u32,
     userdata: Option<Vec<u8>>,
-    /// 表里的句柄计数器（`table->hgenerator`）：链、规则、集合共用。
+    /// The table's handle counter (`table->hgenerator`): shared by chains, rules and sets.
     hgen: u64,
     chains: Vec<Chain>,
     sets: Vec<Set>,
@@ -286,7 +298,7 @@ struct Chain {
     base: Option<Base>,
     userdata: Option<Vec<u8>>,
     rules: Vec<Rule>,
-    /// 批里的编号（`NFTA_CHAIN_ID`）：同一批里的规则按它找。
+    /// Id within the batch (`NFTA_CHAIN_ID`): rules in the same batch find the chain by it.
     id: Option<u32>,
 }
 
@@ -296,14 +308,14 @@ struct Base {
     priority: i32,
     ty: Vec<u8>,
     policy: u32,
-    /// 建的时候给了 `NFTA_CHAIN_COUNTERS`（转储时带上计数，总是 0）。
+    /// `NFTA_CHAIN_COUNTERS` was given at creation (dumps include the counters, always 0).
     counters: bool,
 }
 
 #[derive(Debug, Clone)]
 struct Rule {
     handle: u64,
-    /// `NFTA_RULE_EXPRESSIONS` 的内容（一串 `NFTA_LIST_ELEM`）。
+    /// Contents of `NFTA_RULE_EXPRESSIONS` (a series of `NFTA_LIST_ELEM`).
     exprs: Vec<u8>,
     userdata: Option<Vec<u8>>,
 }
@@ -315,14 +327,14 @@ struct Set {
     flags: u32,
     key_len: u32,
     id: Option<u32>,
-    /// 别的属性（KEY_TYPE、DATA_TYPE、DATA_LEN、POLICY、DESC、TIMEOUT、USERDATA 等），转储
-    /// 时原样带回。
+    /// Other attributes (KEY_TYPE, DATA_TYPE, DATA_LEN, POLICY, DESC, TIMEOUT, USERDATA and so
+    /// on), returned as given in dumps.
     other: Vec<(u16, Vec<u8>)>,
-    /// 元素（`NFTA_LIST_ELEM` 的内容）。
+    /// Elements (contents of `NFTA_LIST_ELEM`).
     elems: Vec<Vec<u8>>,
 }
 
-// ---- 编码 ----
+// ---- Encoding ----
 
 fn be32(v: u32) -> [u8; 4] {
     v.to_be_bytes()
@@ -348,7 +360,7 @@ fn get_be64(attrs: &[(u16, &[u8])], ty: u16) -> Option<u64> {
         .map(|d| u64::from_be_bytes(d.try_into().unwrap()))
 }
 
-/// 字符串属性（去掉结尾的 NUL）。
+/// A string attribute (without the terminating NUL).
 fn get_str<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
     get(attrs, ty).map(|d| d.split(|&c| c == 0).next().unwrap_or_default())
 }
@@ -359,7 +371,7 @@ fn cstr(s: &[u8]) -> Vec<u8> {
     v
 }
 
-/// 一条 nfnetlink 的消息：nfgenmsg（地址族、版本、`res_id`）加上属性。
+/// One nfnetlink message: nfgenmsg (address family, version, `res_id`) plus attributes.
 fn nfmsg(ty: u16, flags: u16, seq: u32, pid: u32, family: u8, res: u16, attrs: &[u8]) -> Vec<u8> {
     let mut p = vec![family, 0];
     p.extend_from_slice(&res.to_be_bytes());
@@ -371,12 +383,13 @@ fn nft_type(msg: u8) -> u16 {
     (NFNL_SUBSYS_NFTABLES << 8) | u16::from(msg)
 }
 
-/// 请求失败：错误码，以及出错的属性（extack 的 `NLMSGERR_ATTR_OFFS`：nft 按它在命令里标出
-/// 出错的那个词）。
+/// A failed request: the error code, and the offending attribute (extack's
+/// `NLMSGERR_ATTR_OFFS`: nft uses it to mark the offending word in the command).
 #[derive(Debug)]
 struct Fail {
     errno: i32,
-    /// 出错的属性的内容在请求里的地址（[`get`] 给的切片）。
+    /// Address within the request of the offending attribute's contents (the slice given by
+    /// [`get`]).
     at: Option<usize>,
 }
 
@@ -387,7 +400,7 @@ fn fail(e: Errno) -> Fail {
     }
 }
 
-/// 出错的是属性 `attr`（`NL_SET_BAD_ATTR`）。
+/// The offending attribute is `attr` (`NL_SET_BAD_ATTR`).
 fn bad(e: Errno, attr: Option<&[u8]>) -> Fail {
     Fail {
         errno: e.0,
@@ -395,7 +408,7 @@ fn bad(e: Errno, attr: Option<&[u8]>) -> Fail {
     }
 }
 
-/// 一条请求（整条消息）的各部分。
+/// The parts of one request (a whole message).
 struct Req<'a> {
     msg: u8,
     flags: u16,
@@ -410,8 +423,8 @@ impl Req<'_> {
     }
 }
 
-/// 应答的去处：这个 socket 的 `nl_pid`、`NETLINK_EXT_ACK`、`NETLINK_CAP_ACK`，发请求的进程
-/// （`NFT_MSG_NEWGEN` 的 `PROC_PID`、`PROC_NAME`）。
+/// Where answers go: the socket's `nl_pid`, `NETLINK_EXT_ACK` and `NETLINK_CAP_ACK`, and the
+/// requesting process (`PROC_PID` and `PROC_NAME` of `NFT_MSG_NEWGEN`).
 pub(crate) struct Peer<'a> {
     pub pid: u32,
     pub ext_ack: bool,
@@ -420,7 +433,7 @@ pub(crate) struct Peer<'a> {
     pub comm: &'a [u8],
 }
 
-/// 一个数据报里的各条消息。
+/// The messages in one datagram.
 fn split(data: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut off = 0;
@@ -446,8 +459,9 @@ fn parse(m: &[u8]) -> Req<'_> {
     }
 }
 
-/// 对请求 `req`（整条消息）的确认或者错误（`netlink_ack`）：出错的属性在请求里时，设了
-/// `NETLINK_EXT_ACK` 的附上它的偏移（从消息头算起，`NLMSGERR_ATTR_OFFS`）。
+/// The acknowledgement or error for request `req` (a whole message, `netlink_ack`): when the
+/// offending attribute is in the request and `NETLINK_EXT_ACK` is set, its offset is attached
+/// (counted from the message header, `NLMSGERR_ATTR_OFFS`).
 fn ack(req: &[u8], r: Result<(), Fail>, peer: &Peer<'_>) -> Vec<u8> {
     const NLM_F_CAPPED: u16 = 0x100;
     const NLM_F_ACK_TLVS: u16 = 0x200;
@@ -477,13 +491,15 @@ fn ack(req: &[u8], r: Result<(), Fail>, peer: &Peer<'_>) -> Vec<u8> {
     message(NLMSG_ERROR, flags, seq, peer.pid, &p)
 }
 
-/// 处理 guest 在 `NETLINK_NETFILTER` 上发来的一个数据报，返回各个回答的数据报。
+/// Handles one datagram the guest sent on `NETLINK_NETFILTER`, returning the datagrams of the
+/// answers.
 pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     let msgs = split(data);
     let Some(first) = msgs.first() else {
         return Vec::new();
     };
-    // 要在命名空间的属主里有 CAP_NET_ADMIN（nfnetlink_rcv：只确认第一条，别的丢掉）
+    // Needs CAP_NET_ADMIN in the namespace's owner (nfnetlink_rcv: only the first message is
+    // acknowledged, the rest are dropped)
     if !cred.ns_capable(&ns.owner, cap::NET_ADMIN) {
         return vec![ack(first, Err(fail(Errno::EPERM)), peer)];
     }
@@ -497,7 +513,7 @@ pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> V
                 .iter()
                 .position(|x| u16::from_le_bytes([x[4], x[5]]) == NFNL_MSG_BATCH_END);
             let Some(end) = end.map(|e| i + 1 + e) else {
-                // 没有结尾的批作废，什么也不回答
+                // A batch without an end is discarded, and nothing is answered
                 return out;
             };
             out.extend(batch(ns, m, &msgs[i + 1..end], peer));
@@ -510,7 +526,8 @@ pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> V
     out
 }
 
-/// 一个批：在规则集的副本上逐条做，都成功才换上。
+/// One batch: applied message by message on a copy of the ruleset, which replaces the ruleset
+/// only if all succeed.
 fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     let b = parse(begin);
     let res = begin
@@ -561,7 +578,7 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u
         if changed {
             st.generation = st.generation.wrapping_add(1).max(1);
         }
-        // 编号（NFTA_CHAIN_ID、NFTA_SET_ID）只在同一批里有效
+        // Ids (NFTA_CHAIN_ID, NFTA_SET_ID) are valid only within one batch
         for t in &mut st.tables {
             t.chains.iter_mut().for_each(|c| c.id = None);
             t.sets.iter_mut().for_each(|s| s.id = None);
@@ -571,7 +588,7 @@ fn batch(ns: &NetNs, begin: &[u8], msgs: &[&[u8]], peer: &Peer<'_>) -> Vec<Vec<u
     replies
 }
 
-/// 批以外的一条消息：查询、`NFT_MSG_GETGEN`、xt 扩展的版本、conntrack。
+/// One message outside a batch: queries, `NFT_MSG_GETGEN`, xt extension revisions, conntrack.
 fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     let r = parse(m);
     let ty = u16::from_le_bytes([m[4], m[5]]);
@@ -582,7 +599,7 @@ fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     let answer = match ty >> 8 {
         NFNL_SUBSYS_NFTABLES => st.query(&r, peer),
         NFNL_SUBSYS_NFT_COMPAT => compat(&r, peer),
-        // conntrack 的表总是空的：转储什么也没有
+        // The conntrack table is always empty: dumps contain nothing
         NFNL_SUBSYS_CTNETLINK | NFNL_SUBSYS_CTNETLINK_EXP if r.dump() => {
             Ok(vec![done(r.seq, peer.pid)])
         }
@@ -600,7 +617,7 @@ fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     }
 }
 
-/// `NFNL_MSG_COMPAT_GET`：xt 扩展有没有、最高的版本。
+/// `NFNL_MSG_COMPAT_GET`: whether an xt extension exists, and its highest revision.
 fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
     let (Some(name), Some(rev), Some(ty)) = (
         get_str(&r.attrs, COMPAT_NAME),
@@ -630,7 +647,7 @@ fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
     )])
 }
 
-/// 合法的地址族（`NFPROTO_*`）：inet、ip、arp、netdev、bridge、ip6。
+/// Valid address families (`NFPROTO_*`): inet, ip, arp, netdev, bridge, ip6.
 fn valid_family(f: u8) -> bool {
     matches!(f, 1 | 2 | 3 | 5 | 7 | 10)
 }
@@ -643,7 +660,7 @@ fn valid_name(n: &[u8]) -> Result<(), Fail> {
 }
 
 impl Nft {
-    /// 没有表。
+    /// There are no tables.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.tables.is_empty()
@@ -655,7 +672,8 @@ impl Nft {
             .position(|t| t.family == family && t.name == name)
     }
 
-    /// 请求里的表（按名字，没有名字时按句柄）：找不到是 ENOENT，出错的是那个属性。
+    /// The table in the request (by name, or by handle when there is no name): ENOENT when not
+    /// found, with that attribute as the offending one.
     fn table_of(
         &self,
         r: &Req<'_>,
@@ -679,7 +697,7 @@ impl Nft {
         Err(fail(Errno::EINVAL))
     }
 
-    /// 批里的一条修改（`nf_tables_newtable` 等）。
+    /// One change in a batch (`nf_tables_newtable` and so on).
     fn apply(&mut self, r: &Req<'_>) -> Result<(), Fail> {
         if !valid_family(r.family) {
             return Err(fail(Errno::EAFNOSUPPORT));
@@ -711,7 +729,8 @@ impl Nft {
             DELSET => self.del_set(r),
             NEWSETELEM | DELSETELEM => self.set_elems(r),
             NEWOBJ | NEWFLOWTABLE => Err(fail(Errno::EOPNOTSUPP)),
-            // 查询不在批里（nfnetlink_rcv_batch：不是 NFNL_CB_BATCH 的回调）
+            // Queries are not in batches (nfnetlink_rcv_batch: callbacks that are not
+            // NFNL_CB_BATCH)
             _ => Err(fail(Errno::EINVAL)),
         }
     }
@@ -721,7 +740,8 @@ impl Nft {
         let name = get_str(&r.attrs, TABLE_NAME).ok_or_else(|| fail(Errno::EINVAL))?;
         valid_name(name)?;
         let flags = get_be32(&r.attrs, TABLE_FLAGS).unwrap_or(0);
-        // 只有 NFT_TABLE_F_DORMANT：NFT_TABLE_F_OWNER（socket 关掉时表随之没了）没有做
+        // Only NFT_TABLE_F_DORMANT: NFT_TABLE_F_OWNER (the table goes away when the socket
+        // closes) is not implemented
         if flags & !1 != 0 {
             return Err(fail(Errno::EOPNOTSUPP));
         }
@@ -782,8 +802,9 @@ impl Nft {
             if policy.is_some_and(|p| p > 1) {
                 return Err(fail(Errno::EINVAL));
             }
-            // 已有的链：钩子、优先级、类型要与原来的一样（不一样时 6.8 的内核是 EOPNOTSUPP，
-            // nft 收到之后重新取缓存，自己报告 "already exists ... with different declaration"）
+            // An existing chain: hook, priority and type must match the original (when they
+            // differ a 6.8 kernel returns EOPNOTSUPP, and nft then refetches its cache and reports
+            // "already exists ... with different declaration" itself)
             if let Some(h) = &hook {
                 let Some(b) = &c.base else {
                     return Err(bad(Errno::EEXIST, attr));
@@ -817,7 +838,7 @@ impl Nft {
                 let priority =
                     get_be32(&h, HOOK_PRIORITY).ok_or_else(|| fail(Errno::EINVAL))? as i32;
                 let ty = get_str(&r.attrs, CHAIN_TYPE).unwrap_or(b"filter").to_vec();
-                // nat 链只能挂在 prerouting、input、output、postrouting 上
+                // nat chains can only be on prerouting, input, output and postrouting
                 let ok = match &ty[..] {
                     b"filter" => true,
                     b"route" => hooknum == 3,
@@ -870,7 +891,8 @@ impl Nft {
         let c = c.ok_or_else(|| bad(Errno::ENOENT, attr))?;
         let name = table.chains[c].name.clone();
         let refs = table.jumps_to(&name);
-        // NLM_F_NONREC：有规则或者被引用就不删；不然先删规则，还有别的链跳到它时 EBUSY
+        // NLM_F_NONREC: not deleted when it has rules or is referenced; otherwise its rules go
+        // first, and EBUSY when other chains still jump to it
         if r.flags & NLM_F_NONREC != 0 && refs + table.chains[c].rules.len() > 0 {
             return Err(fail(Errno::EBUSY));
         }
@@ -995,7 +1017,8 @@ impl Nft {
         if key_len == 0 || key_len > 64 {
             return Err(fail(Errno::EINVAL));
         }
-        // 名字里有 %d：取最小的没用过的编号（匿名集合是 __set%d，nf_tables_set_alloc_name）
+        // A name with %d: take the lowest unused number (anonymous sets are __set%d,
+        // nf_tables_set_alloc_name)
         let name = match name.windows(2).position(|w| w == b"%d") {
             Some(at) => {
                 let with =
@@ -1104,7 +1127,7 @@ impl Nft {
     }
 }
 
-/// 元素的键（`NFTA_SET_ELEM_KEY` 里的值）。
+/// An element's key (the value in `NFTA_SET_ELEM_KEY`).
 fn elem_key(e: &[u8]) -> Option<Vec<u8>> {
     let a = crate::route::attrs(e);
     data_value(get(&a, SET_ELEM_KEY)?)
@@ -1119,13 +1142,13 @@ fn elem_flags(e: &[u8]) -> u32 {
     get_be32(&crate::route::attrs(e), SET_ELEM_FLAGS).unwrap_or(0)
 }
 
-/// `NFTA_DATA_VALUE` 里的值。
+/// The value in `NFTA_DATA_VALUE`.
 fn data_value(d: &[u8]) -> Option<Vec<u8>> {
     get(&crate::route::attrs(d), DATA_VALUE).map(<[u8]>::to_vec)
 }
 
 impl Table {
-    /// 跳到链 `name` 的规则数（immediate 的 jump、goto）。
+    /// Number of rules jumping to chain `name` (immediate jump and goto).
     fn jumps_to(&self, name: &[u8]) -> usize {
         self.chains
             .iter()
@@ -1139,7 +1162,7 @@ impl Table {
             .sum()
     }
 
-    /// 从链 `start` 经由跳转到得了链 `goal`（含它自己）。
+    /// Whether chain `goal` can be reached from chain `start` through jumps (including itself).
     fn reaches(&self, start: &[u8], goal: &[u8], depth: usize) -> bool {
         if start == goal {
             return true;
@@ -1158,7 +1181,7 @@ impl Table {
         })
     }
 
-    /// 有规则用集合 `name`（lookup、dynset）。
+    /// Whether some rule uses set `name` (lookup, dynset).
     fn uses_set(&self, name: &[u8]) -> bool {
         self.chains.iter().flat_map(|c| &c.rules).any(|r| {
             exprs(&r.exprs).iter().any(|(n, d)| {
@@ -1168,7 +1191,8 @@ impl Table {
         })
     }
 
-    /// 去掉不再有规则用的匿名集合（规则删掉时它们随之没了）。
+    /// Removes the anonymous sets no rule uses any more (they go away with the rules when those
+    /// are deleted).
     fn drop_unused_anonymous(&mut self) {
         let unused: Vec<Vec<u8>> = self
             .sets
@@ -1179,13 +1203,15 @@ impl Table {
         self.sets.retain(|s| !unused.contains(&s.name));
     }
 
-    /// 检查规则的表达式（`nf_tables_newrule`）：名字要认识（ENOENT），跳转的链要在、不能是
-    /// 基础链，lookup 的集合要在。返回要记下的：lookup、dynset 引用的集合换成名字（按编号
-    /// 引用的匿名集合），跳转按编号引用的换成名字。
+    /// Checks a rule's expressions (`nf_tables_newrule`): names must be known (ENOENT), jump
+    /// targets must exist and must not be base chains, and lookup sets must exist. Returns what to
+    /// record: sets referred to by lookup and dynset are replaced by names (anonymous sets referred
+    /// to by id), and jumps by id are replaced by names.
     fn check_exprs(&self, e: &[u8], from: &[u8]) -> Result<Vec<u8>, Fail> {
         let mut out = Vec::new();
         for (_, elem) in crate::route::attrs(e) {
-            // 出错的是这个表达式（nf_tables_newrule 的 NL_SET_BAD_ATTR）；环是整条规则的
+            // The offending one is this expression (NL_SET_BAD_ATTR in nf_tables_newrule); a loop
+            // belongs to the whole rule
             let here = |f: Fail| {
                 if f.errno == Errno::EMLINK.0 {
                     f
@@ -1235,12 +1261,13 @@ impl Table {
         if chain.base.is_some() {
             return Err(fail(Errno::EOPNOTSUPP));
         }
-        // 跳回自己（直接或者经由别的链）是环：6.8 的内核按跳转的深度检查（nft_chain_validate），
-        // 超过 NFT_JUMP_STACK_SIZE 是 EMLINK
+        // Jumping back to itself (directly or through other chains) is a loop: a 6.8 kernel
+        // checks the jump depth (nft_chain_validate), and beyond NFT_JUMP_STACK_SIZE it is
+        // EMLINK
         if self.reaches(&chain.name, from, 0) {
             return Err(fail(Errno::EMLINK));
         }
-        // 按名字记下
+        // Record it by name
         let mut nv = Vec::new();
         attr(&mut nv, VERDICT_CODE, &be32(code as u32));
         attr(&mut nv, VERDICT_CHAIN, &cstr(&chain.name));
@@ -1257,8 +1284,9 @@ impl Table {
         Ok(out)
     }
 
-    /// lookup、dynset 引用的集合：按编号（同一批里刚建的匿名集合）或者名字找，记下名字，
-    /// 名字放在最前面（转储时内核这样排）。
+    /// The set referred to by lookup or dynset: found by id (an anonymous set just created in the
+    /// same batch) or by name; the name is recorded and put first (the kernel orders it that way
+    /// in dumps).
     fn check_set_ref(&self, data: &[u8], id_attr: u16) -> Result<Vec<u8>, Fail> {
         let a = crate::route::attrs(data);
         let by_id =
@@ -1284,7 +1312,7 @@ impl Table {
     }
 }
 
-/// 规则的表达式：(名字, 参数)。
+/// A rule's expressions: (name, arguments).
 fn exprs(e: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     crate::route::attrs(e)
         .into_iter()
@@ -1298,20 +1326,21 @@ fn exprs(e: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// immediate 的参数里跳转的链。
+/// The chain jumped to in immediate's arguments.
 fn verdict_chain(data: &[u8]) -> Option<Vec<u8>> {
     let d = get(&crate::route::attrs(data), IMMEDIATE_DATA)?;
     let v = get(&crate::route::attrs(d), DATA_VERDICT)?;
     get_str(&crate::route::attrs(v), VERDICT_CHAIN).map(<[u8]>::to_vec)
 }
 
-// ---- 查询 ----
+// ---- Queries ----
 
 fn done(seq: u32, pid: u32) -> Vec<u8> {
     message(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
 }
 
-/// 去掉嵌套属性的 `NLA_F_NESTED`（用户态带上，6.1 的内核转储时不带）。
+/// Removes `NLA_F_NESTED` from nested attributes (user space sets it; 6.1 kernels leave it out of
+/// dumps).
 fn unflag(mut b: &[u8]) -> Vec<u8> {
     const NLA_F_NESTED: u16 = 0x8000;
     let mut out = Vec::new();
@@ -1331,7 +1360,7 @@ fn unflag(mut b: &[u8]) -> Vec<u8> {
     out
 }
 
-/// 把转储的消息装进数据报（每个不超过 8 KiB），最后是 `NLMSG_DONE`。
+/// Packs dumped messages into datagrams (each at most 8 KiB), ending with `NLMSG_DONE`.
 fn dump_reply(msgs: Vec<Vec<u8>>, seq: u32, pid: u32) -> Vec<Vec<u8>> {
     const CHUNK: usize = 8192;
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -1394,7 +1423,8 @@ impl Table {
         p
     }
 
-    /// 规则；`prev` 是转储时带上的前一条规则的句柄（`NFTA_RULE_POSITION`）。
+    /// A rule; `prev` means including the previous rule's handle, as dumps do
+    /// (`NFTA_RULE_POSITION`).
     fn rule_attrs(&self, c: &Chain, i: usize, prev: bool) -> Vec<u8> {
         let r = &c.rules[i];
         let mut p = Vec::new();
@@ -1420,7 +1450,7 @@ impl Table {
         let other = |t: u16| s.other.iter().find(|(x, _)| *x == t).map(|(_, d)| &d[..]);
         attr(&mut p, SET_KEY_TYPE, other(SET_KEY_TYPE).unwrap_or(&[0; 4]));
         attr(&mut p, SET_KEY_LEN, &be32(s.key_len));
-        // nf_tables_fill_set 的顺序
+        // The order of nf_tables_fill_set
         for t in [
             SET_DATA_TYPE,
             SET_DATA_LEN,
@@ -1461,13 +1491,13 @@ impl Table {
 }
 
 impl Nft {
-    /// 批以外的 nftables 消息：`NFT_MSG_GET*`。
+    /// nftables messages outside batches: `NFT_MSG_GET*`.
     fn query(&self, r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
         let res = (self.generation & 0xffff) as u16;
         let one = |msg: u8, flags: u16, family: u8, attrs: &[u8]| {
             nfmsg(nft_type(msg), flags, r.seq, peer.pid, family, res, attrs)
         };
-        // 地址族 NFPROTO_UNSPEC 的转储列出所有的
+        // A dump with address family NFPROTO_UNSPEC lists everything
         let fam = |t: &Table| r.family == 0 || t.family == r.family;
         let by_name = |a: u16| get_str(&r.attrs, a);
         match r.msg {
@@ -1582,7 +1612,8 @@ impl Nft {
                     .iter()
                     .find(|s| s.name == n)
                     .ok_or_else(|| fail(Errno::ENOENT))?;
-                // nf_tables_dump_set：有元素的一条，最后总有一条元素是空的，和 DONE 在一起
+                // nf_tables_dump_set: one message with the elements when there are any, and
+                // always a final one with no elements, together with DONE
                 let mut out = Vec::new();
                 if !s.elems.is_empty() {
                     out.push(one(
@@ -1600,22 +1631,22 @@ impl Nft {
             GETSETELEM => Err(fail(Errno::EOPNOTSUPP)),
             GETOBJ | GETFLOWTABLE if r.dump() => Ok(dump_reply(Vec::new(), r.seq, peer.pid)),
             GETOBJ | GETFLOWTABLE => Err(fail(Errno::ENOENT)),
-            // 修改要在批里
+            // Changes must be in batches
             _ => Err(fail(Errno::EINVAL)),
         }
     }
 }
 
-// ---- 执行 ----
+// ---- Execution ----
 
 const NF_DROP: i32 = 0;
 const NF_ACCEPT: i32 = 1;
 const NFT_CONTINUE: i32 = -1;
 const NFT_BREAK: i32 = -2;
 const NFT_RETURN: i32 = -5;
-/// 跳转的深度（`NFT_JUMP_STACK_SIZE`）。
+/// Jump depth (`NFT_JUMP_STACK_SIZE`).
 const JUMP_STACK: usize = 16;
-/// PREROUTING、OUTPUT 钩子（`NF_INET_PRE_ROUTING`、`NF_INET_LOCAL_OUT`）。
+/// The PREROUTING and OUTPUT hooks (`NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_OUT`).
 pub(crate) const HOOK_PRE_ROUTING: u32 = 0;
 pub(crate) const HOOK_LOCAL_OUT: u32 = 3;
 const RTN_UNICAST: u32 = 1;
@@ -1625,9 +1656,9 @@ const RTN_MULTICAST: u32 = 5;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-/// 一个要发出的包（connect、sendto 时 socket 层看到的，guest 的地址）。
+/// A packet being sent (as the socket layer sees it at connect and sendto, with guest addresses).
 pub(crate) struct Packet<'a> {
-    /// 地址：IPv4 是 4 字节，IPv6 是 16 字节。
+    /// Addresses: 4 bytes for IPv4, 16 bytes for IPv6.
     pub src: &'a [u8],
     pub dst: &'a [u8],
     pub proto: u8,
@@ -1635,26 +1666,29 @@ pub(crate) struct Packet<'a> {
     pub dport: u16,
     pub uid: u32,
     pub gid: u32,
-    /// 地址在这个命名空间里的类型（`RTN_LOCAL` 等，fib 的 addrtype、xt 的 addrtype 用）。
+    /// The type of an address in this namespace (`RTN_LOCAL` and so on; used by fib's addrtype and
+    /// xt's addrtype).
     pub addr_type: &'a dyn Fn(&[u8]) -> u32,
-    /// 出口接口的编号和名字（OUTPUT、FORWARD 上；PREROUTING、INPUT 上还没有，见 [`Eval::meta`]）。
+    /// Index and name of the output interface (on OUTPUT and FORWARD; not yet known on
+    /// PREROUTING and INPUT, see [`Eval::meta`]).
     pub oif: &'a dyn Fn() -> (u32, Vec<u8>),
-    /// 钩子：[`HOOK_PRE_ROUTING`] 或者 [`HOOK_LOCAL_OUT`]。
+    /// Hook: [`HOOK_PRE_ROUTING`] or [`HOOK_LOCAL_OUT`].
     pub hook: u32,
-    /// 入口接口（PREROUTING、INPUT、FORWARD 上；OUTPUT 上没有）。
+    /// Input interface (on PREROUTING, INPUT and FORWARD; none on OUTPUT).
     pub iif: Option<Iif>,
-    /// 连接跟踪的状态（`NF_CT_STATE_BIT`）：新连接的第一个包是 [`CT_NEW`]，已经收到过对方的
-    /// UDP 回过去的是 [`CT_ESTABLISHED`]。
+    /// Connection tracking state (`NF_CT_STATE_BIT`): the first packet of a new connection is
+    /// [`CT_NEW`], and UDP sent back to a peer already received from is [`CT_ESTABLISHED`].
     pub ct_state: u32,
-    /// 包一开始的标记（`skb->mark`）：本机发出的是 socket 的 `SO_MARK`，经由 veth 进入别的
-    /// 命名空间时清掉（`skb_scrub_packet`）。
+    /// The packet's initial mark (`skb->mark`): the socket's `SO_MARK` for locally sent packets,
+    /// cleared when entering another namespace through a veth (`skb_scrub_packet`).
     pub mark: u32,
 }
 
 pub(crate) const CT_ESTABLISHED: u32 = 2;
 pub(crate) const CT_NEW: u32 = 8;
 
-/// 包进来的接口：编号、名字和它的第一个地址（redirect 换成这个地址，`nf_nat_redirect_ipv4`）。
+/// The interface a packet came in on: index, name and its first address (redirect rewrites to
+/// this address, `nf_nat_redirect_ipv4`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Iif {
     pub index: u32,
@@ -1662,18 +1696,19 @@ pub(crate) struct Iif {
     pub addr: Vec<u8>,
 }
 
-/// nat 链、过滤链的结果。
+/// The result of nat chains and filter chains.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Accept,
     Drop,
-    /// reject：发起方收到的错误码（ICMP 不可达、TCP RST 换成的）。
+    /// reject: the error code the initiator gets (translated from ICMP unreachable or TCP RST).
     Reject(i32),
-    /// 目的地换成这个地址、端口（`None` 是端口不变）。
+    /// Rewrite the destination to this address and port (`None` keeps the port).
     Dnat(Vec<u8>, Option<u16>),
 }
 
-/// 地址类型（[`Packet::addr_type`]）的通用部分：组播、广播；别的交给 `local`。
+/// The generic part of address types ([`Packet::addr_type`]): multicast and broadcast; the rest is
+/// left to `local`.
 pub(crate) fn addr_type(a: &[u8], local: impl Fn(&[u8]) -> bool) -> u32 {
     match a.len() {
         4 if a[0] & 0xf0 == 0xe0 => RTN_MULTICAST,
@@ -1684,24 +1719,24 @@ pub(crate) fn addr_type(a: &[u8], local: impl Fn(&[u8]) -> bool) -> u32 {
     }
 }
 
-/// 一条规则执行时的状态（`struct nft_regs` 和包）。
+/// The state of a rule while it runs (`struct nft_regs` and the packet).
 struct Eval<'a> {
     p: &'a Packet<'a>,
-    /// 网络层、传输层的头（按 [`Packet`] 合成的：TCP 是 SYN）。
+    /// Network- and transport-layer headers (synthesized from the [`Packet`]: TCP is a SYN).
     nh: Vec<u8>,
     th: Vec<u8>,
-    /// 寄存器（20 个 32 位的，前 4 个是判决用的）。
+    /// Registers (20 of 32 bits; the first 4 are for the verdict).
     regs: [u8; 80],
     verdict: i32,
     chain: Option<Vec<u8>>,
     mark: u32,
     dnat: Option<(Vec<u8>, Option<u16>)>,
-    /// reject 的错误码（判决同时是 NF_DROP）。
+    /// The reject error code (the verdict is NF_DROP at the same time).
     reject: Option<i32>,
 }
 
-/// 寄存器在 [`Eval::regs`] 里的位置（`nft_parse_register`）：NFT_REG_1..4 是 16 字节的，
-/// NFT_REG32_00..15 是 4 字节的，与前者重叠。
+/// Position of a register in [`Eval::regs`] (`nft_parse_register`): NFT_REG_1..4 are 16 bytes,
+/// and NFT_REG32_00..15 are 4 bytes, overlapping the former.
 fn reg(r: u32, len: usize) -> Option<std::ops::Range<usize>> {
     let at = match r {
         1..=4 => r as usize * 16,
@@ -1759,7 +1794,8 @@ impl Eval<'_> {
         Some(&self.regs[reg(r, len)?])
     }
 
-    /// 写寄存器，不满 4 字节的部分补零（`nft_reg_store*`、payload 的写法）。
+    /// Writes a register, zero-padding the part short of 4 bytes (as `nft_reg_store*` and payload
+    /// writes do).
     fn store(&mut self, r: u32, data: &[u8]) -> bool {
         let Some(at) = reg(r, data.len().next_multiple_of(4)) else {
             return false;
@@ -1773,7 +1809,8 @@ impl Eval<'_> {
         self.store(r, &v.to_ne_bytes())
     }
 
-    /// 一个表达式；不认识的、这里没法求值的当作规则不匹配（NFT_BREAK）。
+    /// One expression; unknown ones and those that cannot be evaluated here count as the rule not
+    /// matching (NFT_BREAK).
     fn expr(&mut self, table: &Table, name: &[u8], data: &[u8]) {
         let a = crate::route::attrs(data);
         let u = |t: u16| get_be32(&a, t).unwrap_or(0);
@@ -1801,7 +1838,8 @@ impl Eval<'_> {
             b"meta" => self.meta(u(1), u(2), get(&a, 3).map(|_| u(3))),
             b"ct" => match (get(&a, 4), u(2)) {
                 (Some(_), _) => true,
-                // 发出去的都是新连接的第一个包：状态 NEW、方向 ORIGINAL
+                // Everything sent is the first packet of a new connection: state NEW, direction
+                // ORIGINAL
                 (None, 0) => self.store_u32(u(1), self.p.ct_state),
                 (None, 1) => self.store(u(1), &[0]),
                 (None, 2 | 3) => self.store_u32(u(1), 0),
@@ -1841,7 +1879,7 @@ impl Eval<'_> {
     }
 
     fn payload(&mut self, a: &[(u16, &[u8])]) -> bool {
-        // 改包（NFTA_PAYLOAD_SREG）不做
+        // Packet mangling (NFTA_PAYLOAD_SREG) is not done
         if get(a, 5).is_some() {
             return false;
         }
@@ -1898,7 +1936,7 @@ impl Eval<'_> {
             return false;
         };
         let out = match get_be32(a, 6).unwrap_or(0) {
-            // NFT_BITWISE_BOOL：(src & mask) ^ xor
+            // NFT_BITWISE_BOOL: (src & mask) ^ xor
             0 => {
                 let (Some(m), Some(x)) = (
                     get(a, 4).and_then(data_value),
@@ -1913,7 +1951,7 @@ impl Eval<'_> {
                     .map(|i| (src[i] & m[i]) ^ x[i])
                     .collect::<Vec<u8>>()
             }
-            // 左移、右移：按本机字节序的 32 位字
+            // Left and right shifts: on 32-bit words in host byte order
             op @ (1 | 2) => {
                 let Some(s) = get(a, 7).and_then(data_value).and_then(|d| {
                     d.get(..4)
@@ -1965,7 +2003,7 @@ impl Eval<'_> {
 
     fn meta(&mut self, dreg: u32, key: u32, sreg: Option<u32>) -> bool {
         if let Some(s) = sreg {
-            // meta set：只有 mark 影响后面的匹配
+            // meta set: only mark affects later matching
             if key == 3
                 && let Some(v) = self.load(s, 4)
             {
@@ -1978,8 +2016,8 @@ impl Eval<'_> {
             0 => self.store_u32(dreg, (self.nh.len() + self.th.len()) as u32),
             1 => self.store(dreg, if v6 { &[0x86, 0xdd] } else { &[0x08, 0x00] }),
             3 => self.store_u32(dreg, self.mark),
-            // OUTPUT 上没有入口接口、PREROUTING 和 INPUT 上没有出口接口：编号 0、名字是空的
-            // （nft_meta_store_ifname）
+            // No input interface on OUTPUT, and no output interface on PREROUTING and INPUT:
+            // index 0 and an empty name (nft_meta_store_ifname)
             4 => self.store_u32(dreg, self.p.iif.as_ref().map_or(0, |i| i.index)),
             6 => {
                 let mut n = self
@@ -1991,7 +2029,7 @@ impl Eval<'_> {
                 n.resize(16, 0);
                 self.store(dreg, &n)
             }
-            // PREROUTING、INPUT 上还没有出口接口
+            // No output interface yet on PREROUTING and INPUT
             5 | 7 => {
                 let (index, mut n) = if matches!(self.p.hook, HOOK_PRE_ROUTING | 1) {
                     (0, Vec::new())
@@ -2004,7 +2042,7 @@ impl Eval<'_> {
                 n.resize(16, 0);
                 self.store(dreg, &n)
             }
-            // PREROUTING 上的包没有 socket（取不到是不匹配）
+            // Packets on PREROUTING have no socket (unavailable means no match)
             10 if self.p.hook == HOOK_LOCAL_OUT => self.store_u32(dreg, self.p.uid),
             11 if self.p.hook == HOOK_LOCAL_OUT => self.store_u32(dreg, self.p.gid),
             15 => self.store(dreg, &[if v6 { 10 } else { 2 }]),
@@ -2016,7 +2054,8 @@ impl Eval<'_> {
     }
 
     fn fib(&mut self, dreg: u32, result: u32, flags: u32) -> bool {
-        // 只有地址类型：NFT_FIB_RESULT_ADDRTYPE，按源地址（NFTA_FIB_F_SADDR）或者目的地址
+        // Only the address type: NFT_FIB_RESULT_ADDRTYPE, by source address (NFTA_FIB_F_SADDR)
+        // or destination address
         if result != 3 {
             return false;
         }
@@ -2044,7 +2083,7 @@ impl Eval<'_> {
         if found.is_some() == inv {
             return false;
         }
-        // 映射：把值写进目的寄存器（0 是判决）
+        // A map: write the value into the destination register (0 is the verdict)
         match (get_be32(a, 3), found) {
             (Some(dreg), Some(e)) => {
                 let Some(d) = get(&crate::route::attrs(&e), 2).map(<[u8]>::to_vec) else {
@@ -2074,9 +2113,9 @@ impl Eval<'_> {
         true
     }
 
-    /// nftables 自己的 nat（`dnat to`）：地址、端口在寄存器里。
+    /// nftables' own nat (`dnat to`): the address and port are in registers.
     fn nat(&mut self, a: &[(u16, &[u8])]) -> bool {
-        // NFT_NAT_DNAT；OUTPUT 上没有 SNAT
+        // NFT_NAT_DNAT; there is no SNAT on OUTPUT
         if get_be32(a, 1) != Some(1) {
             return true;
         }
@@ -2101,7 +2140,8 @@ impl Eval<'_> {
         self.set_dnat(addr, port)
     }
 
-    /// `redirect`：OUTPUT 上换成回环地址（nf_nat_redirect_ipv4 的 LOCAL_OUT）。
+    /// `redirect`: rewrites to the loopback address on OUTPUT (LOCAL_OUT in
+    /// nf_nat_redirect_ipv4).
     fn redir(&mut self, preg: Option<u32>) -> bool {
         let port = match preg {
             Some(r) => match self.load(r, 2) {
@@ -2114,8 +2154,8 @@ impl Eval<'_> {
         self.set_dnat(Some(to), port)
     }
 
-    /// redirect 换成的地址：OUTPUT 上是回环地址，PREROUTING 上是入口接口的地址
-    /// （`nf_nat_redirect_ipv4`；没有地址时不换）。
+    /// The address redirect rewrites to: the loopback address on OUTPUT, the input interface's
+    /// address on PREROUTING (`nf_nat_redirect_ipv4`; unchanged when there is no address).
     fn redirect_addr(&self) -> Vec<u8> {
         match &self.p.iif {
             Some(i) if i.addr.len() == self.p.dst.len() => i.addr.clone(),
@@ -2125,8 +2165,8 @@ impl Eval<'_> {
         }
     }
 
-    /// xt 目标（iptables-nft 的 `-j DNAT`、`-j REDIRECT`）。别的目标不改目的地址，当作
-    /// 继续。
+    /// xt targets (iptables-nft's `-j DNAT`, `-j REDIRECT`). Other targets do not change the
+    /// destination address and count as continue.
     fn target(&mut self, a: &[(u16, &[u8])]) -> bool {
         let (Some(name), Some(info)) = (get_str(a, 1), get(a, 3)) else {
             return false;
@@ -2139,8 +2179,8 @@ impl Eval<'_> {
         };
         let be16 =
             |b: &[u8], at: usize| b.get(at..at + 2).map(|x| u16::from_be_bytes([x[0], x[1]]));
-        // (flags, 地址, 端口)：rev 0 是 nf_nat_ipv4_multi_range_compat，rev 1、2 是
-        // nf_nat_range、nf_nat_range2
+        // (flags, address, port): rev 0 is nf_nat_ipv4_multi_range_compat, revs 1 and 2 are
+        // nf_nat_range and nf_nat_range2
         let range = |rev: u32| -> Option<(u32, Vec<u8>, u16)> {
             if rev == 0 && v4 {
                 Some((ne32(info, 4)?, info.get(8..12)?.to_vec(), be16(info, 16)?))
@@ -2160,13 +2200,13 @@ impl Eval<'_> {
                 let Some((flags, addr, port)) = range(rev) else {
                     return false;
                 };
-                // NF_NAT_RANGE_MAP_IPS、NF_NAT_RANGE_PROTO_SPECIFIED
+                // NF_NAT_RANGE_MAP_IPS, NF_NAT_RANGE_PROTO_SPECIFIED
                 let addr = (flags & 1 != 0).then_some(addr);
                 let port = (flags & 2 != 0).then_some(port);
                 self.set_dnat(addr, port)
             }
             b"REDIRECT" => {
-                // IPv4 是 rev 0 的 compat 结构，IPv6 是 nf_nat_range
+                // IPv4 uses the rev 0 compat structure, IPv6 nf_nat_range
                 let Some((flags, _, port)) = range(if v4 { 0 } else { 1 }) else {
                     return false;
                 };
@@ -2175,7 +2215,7 @@ impl Eval<'_> {
                 self.set_dnat(Some(to), port)
             }
             b"MARK" if rev >= 1 => {
-                // xt_mark_tginfo2：mark = (mark & ~mask) ^ value
+                // xt_mark_tginfo2: mark = (mark & ~mask) ^ value
                 let (Some(v), Some(m)) = (ne32(info, 0), ne32(info, 4)) else {
                     return false;
                 };
@@ -2191,8 +2231,8 @@ impl Eval<'_> {
                 true
             }
             b"REJECT" => {
-                // ipt_reject_info：with（ipt_reject_with）；IPv6 的 ip6t_reject_with 不同，按
-                // 端口不可达
+                // ipt_reject_info: with (ipt_reject_with); IPv6's ip6t_reject_with differs, so it
+                // is treated as port unreachable
                 let with = ne32(info, 0).unwrap_or(3);
                 let e = if v4 {
                     match with {
@@ -2212,7 +2252,7 @@ impl Eval<'_> {
         }
     }
 
-    /// xt 匹配：comment、addrtype、tcp、udp；别的当作不匹配。
+    /// xt matches: comment, addrtype, tcp, udp; others count as not matching.
     fn xt_match(&mut self, a: &[(u16, &[u8])]) -> bool {
         let (Some(name), Some(info)) = (get_str(a, 1), get(a, 3)) else {
             return false;
@@ -2228,7 +2268,8 @@ impl Eval<'_> {
         };
         match name {
             b"comment" => true,
-            // xt_mark_mtinfo1：mark、mask 和 invert；版本 0 的 xt_mark_info 是两个 unsigned long
+            // xt_mark_mtinfo1: mark, mask and invert; revision 0's xt_mark_info is two unsigned
+            // longs
             b"mark" => {
                 let ne64 = |at: usize| {
                     info.get(at..at + 8)
@@ -2244,9 +2285,10 @@ impl Eval<'_> {
                 };
                 ((self.mark & mask) == want) != (inv != 0)
             }
-            // xt_owner_match_info（xt_owner.c 的 owner_mt）：uid、gid 的范围，match、invert 的
-            // XT_OWNER_UID、GID、SOCKET 位。只有本机发出的包（OUTPUT）有 socket；没有 socket 时
-            // 只在什么都不要求时匹配。附加组（XT_OWNER_SUPPL_GROUPS）不看
+            // xt_owner_match_info (owner_mt in xt_owner.c): uid and gid ranges, and the
+            // XT_OWNER_UID, GID and SOCKET bits of match and invert. Only locally sent packets
+            // (OUTPUT) have a socket; without a socket it matches only when nothing is required.
+            // Supplementary groups (XT_OWNER_SUPPL_GROUPS) are not checked
             b"owner" => {
                 let (Some(umin), Some(umax), Some(gmin), Some(gmax)) =
                     (ne32(0), ne32(4), ne32(8), ne32(12))
@@ -2269,8 +2311,9 @@ impl Eval<'_> {
                 let gid_ok = (gmin..=gmax).contains(&self.p.gid) != (inv & GID != 0);
                 (want & UID == 0 || uid_ok) && (want & GID == 0 || gid_ok)
             }
-            // 连接跟踪的状态：xt_conntrack_mtinfo1..3 里 match_flags、invert_flags 在 146、148，
-            // state_mask 在 150（版本 1 是一个字节）；只认 XT_CONNTRACK_STATE（和 STATE_ALIAS）
+            // Connection tracking state: in xt_conntrack_mtinfo1..3, match_flags and invert_flags
+            // are at 146 and 148, and state_mask at 150 (one byte in revision 1); only
+            // XT_CONNTRACK_STATE (and STATE_ALIAS) are recognized
             b"conntrack" => {
                 let (Some(flags), Some(inv)) = (ne16(146), ne16(148)) else {
                     return false;
@@ -2288,13 +2331,13 @@ impl Eval<'_> {
                 };
                 flags & 1 == 0 || ((u32::from(mask) & self.p.ct_state != 0) != (inv & 1 != 0))
             }
-            // xt_state_info：statemask
+            // xt_state_info: statemask
             b"state" => ne32(0).is_some_and(|m| m & self.p.ct_state != 0),
             b"addrtype" => {
                 let (Some(src), Some(dst)) = (ne16(0), ne16(2)) else {
                     return false;
                 };
-                // rev 0：invert_source、invert_dest 两个 u32；rev 1：flags 的 1、2 位
+                // rev 0: two u32s, invert_source and invert_dest; rev 1: bits 1 and 2 of flags
                 let (inv_s, inv_d) = if rev == 0 {
                     (ne32(4).unwrap_or(0) != 0, ne32(8).unwrap_or(0) != 0)
                 } else {
@@ -2336,8 +2379,9 @@ impl Eval<'_> {
     }
 }
 
-/// 集合里键为 `key` 的元素：区间集合按区间找（有 KEY_END 的是 [起, 止]；没有的是排好序的
-/// 端点，不大于键的最后一个不是区间的结尾）。
+/// The element of the set with key `key`: interval sets are searched by interval (those with
+/// KEY_END are [start, end]; those without are sorted endpoints, and the last one not greater
+/// than the key must not be an interval end).
 fn set_find(set: &Set, key: &[u8]) -> Option<Vec<u8>> {
     if set.flags & NFT_SET_INTERVAL == 0 {
         return set
@@ -2373,22 +2417,24 @@ fn set_find(set: &Set, key: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl Nft {
-    /// 钩子 `hook` 上有没有 nat 类型的基础链（没有就不必合成包）。
+    /// Whether hook `hook` has a nat-type base chain (if not, no packet needs to be synthesized).
     pub(crate) fn has_nat(&self, hook: u32) -> bool {
         self.has(hook, true)
     }
 
-    /// 钩子 `hook` 上有没有 filter、route 类型的基础链。
+    /// Whether hook `hook` has a filter- or route-type base chain.
     pub(crate) fn has_filter(&self, hook: u32) -> bool {
         self.has(hook, false)
     }
 
-    /// 这个命名空间里 IPv4（`v6` 时是 IPv6）的包是不是经过连接跟踪：Linux 只在规则集里有
-    /// 用到它的表达式时才挂上连接跟踪的钩子（`nf_ct_netns_get`，在表达式初始化时调用，表
-    /// 停用了也算），ip、ip6 的表各管各的，inet 的两种都管。空的 nat 链不算（原生对照过）。
-    /// `SO_ORIGINAL_DST` 按它回答没被 nat 的连接（[`crate::origdst`]）。
+    /// Whether IPv4 (with `v6`, IPv6) packets in this namespace go through connection tracking:
+    /// Linux attaches the conntrack hooks only when the ruleset has expressions that use it
+    /// (`nf_ct_netns_get`, called when an expression is initialized, dormant tables included); ip
+    /// and ip6 tables each cover their own family, and inet tables cover both. An empty nat chain
+    /// does not count (checked against native). `SO_ORIGINAL_DST` answers by it for connections
+    /// that were not NATed ([`crate::origdst`]).
     pub(crate) fn tracks(&self, v6: bool) -> bool {
-        /// 初始化时调 `nf_ct_netns_get` 的表达式、xt 目标和匹配。
+        /// Expressions, xt targets and matches that call `nf_ct_netns_get` when initialized.
         const EXPRS: [&[u8]; 7] = [
             b"ct",
             b"nat",
@@ -2438,8 +2484,9 @@ impl Nft {
         })
     }
 
-    /// 跑 `p.hook` 钩子上 filter、route 类型的链：按优先级逐个，有一个丢弃（reject）就停，
-    /// 接受了的接着跑下一个（每个基础链各自判决）。
+    /// Runs the filter- and route-type chains on hook `p.hook`: one by one by priority, stopping
+    /// at the first drop (reject), and running the next one after an accept (each base chain gives
+    /// its own verdict).
     pub(crate) fn filter(&self, p: &Packet<'_>) -> Outcome {
         let fam = if p.dst.len() == 4 { 2 } else { 10 };
         let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
@@ -2480,8 +2527,9 @@ impl Nft {
         Outcome::Accept
     }
 
-    /// 跑 `p.hook` 钩子上的 nat 链（`nf_nat_inet_fn`）：按优先级逐个，有一个做了 DNAT 或者
-    /// 丢弃就停。地址族：IPv4 的包看 ip、inet 的表，IPv6 的看 ip6、inet 的。
+    /// Runs the nat chains on hook `p.hook` (`nf_nat_inet_fn`): one by one by priority, stopping
+    /// at the first that DNATs or drops. Address families: IPv4 packets look at ip and inet
+    /// tables, IPv6 ones at ip6 and inet tables.
     pub(crate) fn nat(&self, p: &Packet<'_>) -> Outcome {
         let fam = if p.dst.len() == 4 { 2 } else { 10 };
         let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
@@ -2529,9 +2577,10 @@ impl Nft {
     }
 }
 
-/// reject 表达式（`NFTA_REJECT_TYPE`、`NFTA_REJECT_ICMP_CODE`）让发起方收到的错误码
-/// （`icmp_err_convert`、`icmpv6_err_convert`）：TCP RST 是 ECONNREFUSED；ICMPX 的
-/// 无路由、端口不可达、主机不可达、管理禁止；ICMP、ICMPv6 按各自的代码。
+/// The error code the initiator gets from a reject expression (`NFTA_REJECT_TYPE`,
+/// `NFTA_REJECT_ICMP_CODE`; `icmp_err_convert`, `icmpv6_err_convert`): TCP RST is ECONNREFUSED;
+/// the ICMPX codes no route, port unreachable, host unreachable and administratively prohibited;
+/// ICMP and ICMPv6 by their own codes.
 fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
     let e = match (ty, code, v6) {
         (1, _, _) => Errno::ECONNREFUSED,
@@ -2551,11 +2600,11 @@ fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
     e.0
 }
 
-/// 从基础链 `base` 开始执行（`nft_do_chain`），返回最后的判决。
+/// Runs from base chain `base` (`nft_do_chain`), returning the final verdict.
 fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
     let mut stack: Vec<(&Chain, usize)> = Vec::new();
     let (mut chain, mut next) = (base, 0usize);
-    // 防止意外的环（Linux 提交时就拒绝了，见 check_loops）
+    // Guards against accidental loops (Linux already rejects them at commit, see check_loops)
     let mut budget = 100_000;
     loop {
         if next >= chain.rules.len() {
@@ -2663,7 +2712,7 @@ mod tests {
         d
     }
 
-    /// 一个表达式（NFTA_LIST_ELEM）：参数是 (属性, 内容)。
+    /// An expression (NFTA_LIST_ELEM): the arguments are (attribute, contents).
     fn expr(name: &str, args: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut d = Vec::new();
         for (t, v) in args {
@@ -2673,7 +2722,7 @@ mod tests {
         a(&mut e, EXPR_NAME, &cstr(name.as_bytes()));
         a(&mut e, EXPR_DATA, &d);
         let mut l = Vec::new();
-        // 用户态带 NLA_F_NESTED
+        // User space sets NLA_F_NESTED
         a(&mut l, LIST_ELEM | 0x8000, &e);
         l
     }
@@ -2757,7 +2806,7 @@ mod tests {
         b
     }
 
-    /// 回答里的错误码（NLMSG_ERROR 的，0 是确认），按顺序。
+    /// Error codes in the answers (of NLMSG_ERROR; 0 is an acknowledgement), in order.
     fn errors(replies: &[Vec<u8>]) -> Vec<i32> {
         replies
             .iter()
@@ -2767,7 +2816,7 @@ mod tests {
             .collect()
     }
 
-    /// 转储回答里的各条消息的属性（不含 DONE）。
+    /// Attributes of each message in a dump answer (excluding DONE).
     fn dumped(replies: &[Vec<u8>]) -> Vec<Vec<(u16, Vec<u8>)>> {
         replies
             .iter()
@@ -2815,8 +2864,9 @@ mod tests {
         }
     }
 
-    /// 连接跟踪开不开（[`Nft::tracks`]）：空的 nat 链不开；ct、redirect、xt 的 REDIRECT 开，
-    /// ip、ip6 的表各管各的，inet 的两种都管。
+    /// Whether connection tracking is on ([`Nft::tracks`]): an empty nat chain does not turn it
+    /// on; ct, redirect and xt REDIRECT do; ip and ip6 tables each cover their own family, and
+    /// inet tables cover both.
     #[test]
     fn conntrack_follows_the_rules() {
         let root = Cred::root();
@@ -2845,7 +2895,7 @@ mod tests {
         assert_eq!(run(&with(1, redir())), (true, true));
         let ct = expr("ct", &[(1, be32(1).to_vec()), (2, be32(0).to_vec())]);
         assert_eq!(run(&with(2, ct)), (true, false));
-        // 别的表达式不开
+        // Other expressions do not turn it on
         assert_eq!(run(&with(2, expr("counter", &[]))), (false, false));
         let xt = |name: &[u8]| {
             expr(
@@ -2857,9 +2907,10 @@ mod tests {
         assert_eq!(run(&with(2, xt(b"LOG"))), (false, false));
     }
 
-    /// xt 的 mark、owner 匹配（较早的 iptables-nft 的 `-m mark` 走 xt，现在的翻译成 meta
-    /// mark；`-m owner` 一直走 xt）：标记按掩码比，owner 只在本机发出的包上看 uid、gid，没有
-    /// socket 的包只在什么都不要求时匹配（`! --uid-owner` 匹配）。
+    /// xt mark and owner matches (older iptables-nft sends `-m mark` as xt, current ones translate
+    /// it to meta mark; `-m owner` always goes through xt): marks are compared under the mask,
+    /// owner checks uid and gid only on locally sent packets, and packets without a socket match
+    /// only when nothing is required (`! --uid-owner` matches).
     #[test]
     fn xt_mark_and_owner() {
         let ns = ns();
@@ -2886,7 +2937,7 @@ mod tests {
         mark.extend_from_slice(&7u32.to_ne_bytes());
         mark.extend_from_slice(&0xffu32.to_ne_bytes());
         mark.extend_from_slice(&[0; 4]);
-        // uid 1000、gid 50..60，match、invert
+        // uid 1000, gid 50..60, match and invert
         let owner = |want: u8, inv: u8| {
             let mut o = Vec::new();
             for v in [1000u32, 1000, 50, 60] {
@@ -2945,19 +2996,20 @@ mod tests {
             (p.mark, p.uid, p.gid, p.hook) = (mark, uid, gid, hook);
             st.nat(&p)
         };
-        // 标记按掩码：0x107 & 0xff 也是 7
+        // Marks under the mask: 0x107 & 0xff is 7 too
         assert_eq!(run(7, 0, 55, HOOK_LOCAL_OUT), to([10, 0, 0, 1]));
         assert_eq!(run(0x107, 0, 55, HOOK_LOCAL_OUT), to([10, 0, 0, 1]));
-        // uid 1000 的
+        // uid 1000
         assert_eq!(run(8, 1000, 55, HOOK_LOCAL_OUT), to([10, 0, 0, 2]));
-        // gid 不在 50..60 里的（取反）
+        // gid not in 50..60 (inverted)
         assert_eq!(run(0, 0, 61, HOOK_LOCAL_OUT), to([10, 0, 0, 3]));
         assert_eq!(run(0, 0, 55, HOOK_LOCAL_OUT), Outcome::Accept);
-        // PREROUTING 上没有 socket：--uid-owner 不匹配，! --uid-owner 匹配
+        // No socket on PREROUTING: --uid-owner does not match, ! --uid-owner does
         assert_eq!(run(0, 1000, 55, HOOK_PRE_ROUTING), to([10, 0, 0, 5]));
     }
 
-    /// docker 写进容器的内置 DNS 规则（iptables-nft 发的样子，docs/rounds/172-nftables.md）。
+    /// The built-in DNS rules docker writes into containers (as iptables-nft sends them,
+    /// docs/rounds/172-nftables.md).
     #[test]
     fn iptables_dnat_rules() {
         let ns = ns();
@@ -3008,11 +3060,12 @@ mod tests {
             ]),
             &peer(),
         );
-        // 没有要求确认：成功时什么也不回答
+        // No acknowledgement requested: nothing is answered on success
         assert!(r.is_empty(), "{r:?}");
         assert_eq!(generation(&ns), 2);
 
-        // 链的转储：句柄由表里的计数器分配，USE 是规则数加上跳到它的
+        // Chain dump: handles come from the table's counter, and USE is the number of rules plus
+        // jumps to it
         let r = handle(&ns, &root, &msg(GETCHAIN, NLM_F_DUMP, 2, &[]), &peer());
         let chains = dumped(&r);
         assert_eq!(chains.len(), 2);
@@ -3021,10 +3074,10 @@ mod tests {
         assert_eq!(find(&chains[0], CHAIN_USE), be32(2));
         assert_eq!(find(&chains[1], CHAIN_USE), be32(1));
         assert_eq!(find(&chains[1], CHAIN_FLAGS), be32(NFT_CHAIN_BASE));
-        // 表的 USE 是链的个数
+        // A table's USE is the number of chains
         let r = handle(&ns, &root, &msg(GETTABLE, NLM_F_DUMP, 0, &[]), &peer());
         assert_eq!(find(&dumped(&r)[0], TABLE_USE), be32(2));
-        // 规则原样带回（去掉 NLA_F_NESTED），按 TABLE、CHAIN 过滤
+        // Rules come back as given (without NLA_F_NESTED), filtered by TABLE and CHAIN
         let mut p = Vec::new();
         a(&mut p, RULE_TABLE, &cstr(b"nat"));
         a(&mut p, RULE_CHAIN, &cstr(b"OUTPUT"));
@@ -3042,7 +3095,7 @@ mod tests {
         let e = find(&rules[0], RULE_EXPRESSIONS);
         assert_eq!(u16::from_le_bytes([e[2], e[3]]), LIST_ELEM);
 
-        // 执行：只有发往 127.0.0.11:53 的 UDP 换目的地址
+        // Execution: only UDP to 127.0.0.11:53 gets a new destination address
         let unicast = |_: &[u8]| RTN_UNICAST;
         let st = ns.nft.borrow();
         let dns = [127, 0, 0, 11];
@@ -3057,7 +3110,8 @@ mod tests {
         );
         drop(st);
 
-        // 失败的批整个作废：跳到没有的链（ENOENT），生成号不变
+        // A failed batch is discarded as a whole: a jump to a missing chain (ENOENT), generation
+        // number unchanged
         let r = handle(
             &ns,
             &root,
@@ -3070,14 +3124,16 @@ mod tests {
         assert_eq!(errors(&r), [Errno::ENOENT.0]);
         assert_eq!(generation(&ns), 2);
         assert_eq!(ns.nft.borrow().tables[0].chains.len(), 2);
-        // 被跳到的链删不掉（EBUSY）；跳回自己是环（EMLINK）；跳到基础链不行
+        // A chain jumped to cannot be deleted (EBUSY); jumping back to itself is a loop (EMLINK);
+        // jumping to a base chain is not allowed
         let mut p = Vec::new();
         a(&mut p, CHAIN_TABLE, &cstr(b"nat"));
         a(&mut p, CHAIN_NAME, &cstr(b"DOCKER_OUTPUT"));
         let del = msg(DELCHAIN, 0, 2, &p);
         let r = handle(&ns, &root, &batch(std::slice::from_ref(&del)), &peer());
         assert_eq!(errors(&r), [Errno::EBUSY.0]);
-        // 设了 NETLINK_EXT_ACK 的：附上出错的属性（链的名字）在请求里的偏移
+        // With NETLINK_EXT_ACK set: the offset in the request of the offending attribute (the
+        // chain name) is attached
         let ext = Peer {
             ext_ack: true,
             ..peer()
@@ -3086,7 +3142,7 @@ mod tests {
         let m = split(&r[0])[0];
         assert_eq!(u16::from_le_bytes([m[6], m[7]]) & 0x200, 0x200);
         let tlv = crate::route::attrs(&m[20 + del.len()..]);
-        // nfgenmsg 之后：CHAIN_TABLE（"nat"，8 字节）、CHAIN_NAME
+        // After nfgenmsg: CHAIN_TABLE ("nat", 8 bytes), CHAIN_NAME
         assert_eq!(get(&tlv, 2), Some(&(16u32 + 4 + 8).to_ne_bytes()[..]));
         let r = handle(
             &ns,
@@ -3101,7 +3157,7 @@ mod tests {
             &peer(),
         );
         assert_eq!(errors(&r), [Errno::EMLINK.0, Errno::EOPNOTSUPP.0]);
-        // 批开头的生成号过时了：ERESTART
+        // The generation number at the start of the batch is out of date: ERESTART
         let mut begin = Vec::new();
         a(&mut begin, NFNL_BATCH_GENID, &be32(1));
         let mut b = message(
@@ -3119,7 +3175,7 @@ mod tests {
             &[0, 0, 0, 10],
         ));
         assert_eq!(errors(&handle(&ns, &root, &b, &peer())), [ERESTART]);
-        // 没有 CAP_NET_ADMIN：EPERM，查询也不行
+        // Without CAP_NET_ADMIN: EPERM, for queries too
         let user = Cred {
             euid: 1000,
             cap_effective: 0,
@@ -3130,7 +3186,8 @@ mod tests {
             errors(&handle(&ns, &user, &msg(GETGEN, 0, 0, &[]), &peer())),
             [Errno::EPERM.0]
         );
-        // 要求确认的单条查询：回答之后是确认；找不到是 ENOENT
+        // A single query asking for an acknowledgement: the answer, then the acknowledgement;
+        // not found is ENOENT
         let mut p = Vec::new();
         a(&mut p, CHAIN_TABLE, &cstr(b"nat"));
         a(&mut p, CHAIN_NAME, &cstr(b"INPUT"));
@@ -3151,7 +3208,8 @@ mod tests {
         assert_eq!(errors(&r), [0]);
     }
 
-    /// netavark 的 nftables 驱动的端口转发（inet 表、匿名集合、fib、nftables 自己的 dnat）。
+    /// Port forwarding by netavark's nftables driver (inet table, anonymous sets, fib, nftables'
+    /// own dnat).
     #[test]
     fn netavark_hostport_dnat() {
         let ns = ns();
@@ -3235,7 +3293,7 @@ mod tests {
             &peer(),
         );
         assert!(r.is_empty(), "{:?}", errors(&r));
-        // 匿名集合取了名字，lookup 按名字引用它（转储里没有 SET_ID）
+        // The anonymous set got a name, and lookup refers to it by name (no SET_ID in the dump)
         let r = handle(&ns, &root, &msg(GETSET, NLM_F_DUMP, 0, &[]), &peer());
         let sets = dumped(&r);
         assert_eq!(find(&sets[0], SET_NAME), b"__set0\0");
@@ -3250,7 +3308,7 @@ mod tests {
         let la = crate::route::attrs(&lookup);
         assert_eq!(get_str(&la, LOOKUP_SET), Some(&b"__set0"[..]));
         assert!(get(&la, LOOKUP_SET_ID).is_none());
-        // 集合的元素：有元素的一条，最后是空的一条和 DONE
+        // Set elements: one message with the elements, then an empty one and DONE
         let mut p = Vec::new();
         a(&mut p, SET_ELEM_LIST_TABLE, &cstr(b"netavark"));
         a(&mut p, SET_ELEM_LIST_SET, &cstr(b"__set0"));
@@ -3263,7 +3321,8 @@ mod tests {
         );
         assert!(find(&el[1], SET_ELEM_LIST_ELEMENTS).is_empty());
 
-        // 执行：发往本机地址的 8080 换成容器的 80；别的地址、UDP 不换
+        // Execution: 8080 on local addresses becomes the container's 80; other addresses and UDP
+        // are unchanged
         let local = |x: &[u8]| addr_type(x, |y| y[0] == 127);
         let st = ns.nft.borrow();
         let lo = [127, 0, 0, 1];
@@ -3278,7 +3337,7 @@ mod tests {
         assert_eq!(st.nat(&packet(17, &lo, 8080, &local)), Outcome::Accept);
         assert_eq!(st.nat(&packet(6, &lo, 8081, &local)), Outcome::Accept);
         drop(st);
-        // 用着的集合删不掉；删掉表，什么也不剩
+        // A set in use cannot be deleted; after deleting the table, nothing is left
         let mut p = Vec::new();
         a(&mut p, SET_TABLE, &cstr(b"netavark"));
         a(&mut p, SET_NAME, &cstr(b"__set0"));
@@ -3295,7 +3354,7 @@ mod tests {
         a(&mut p, TABLE_NAME, &cstr(b"netavark"));
         assert!(handle(&ns, &root, &batch(&[msg(DELTABLE, 0, 1, &p)]), &peer()).is_empty());
         assert!(ns.nft.borrow().is_empty());
-        // 再删是 ENOENT，DESTROY 不存在的也算成功
+        // Deleting again is ENOENT; DESTROY of something missing still succeeds
         assert_eq!(
             errors(&handle(
                 &ns,
@@ -3308,8 +3367,8 @@ mod tests {
         assert!(handle(&ns, &root, &batch(&[msg(DESTROYTABLE, 0, 1, &p)]), &peer()).is_empty());
     }
 
-    /// 过滤链：FORWARD 上按入口接口、端口丢弃和 reject，xt 的 conntrack 匹配认 ESTABLISHED，
-    /// INPUT 的策略是丢弃。
+    /// Filter chains: drop and reject on FORWARD by input interface and port, the xt conntrack
+    /// match recognizes ESTABLISHED, and the INPUT policy is drop.
     #[test]
     fn filter_chains() {
         let ns = ns();
@@ -3319,7 +3378,7 @@ mod tests {
         br0.resize(16, 0);
         let dport = |p: u16| [payload(2, 2, 2), cmp_eq(&p.to_be_bytes())];
         let verdict_expr = |code: i32| expr("immediate", &[(1, reg(0)), (2, verdict(code, None))]);
-        // xt_conntrack_mtinfo3：match_flags = XT_CONNTRACK_STATE，state_mask = ESTABLISHED|RELATED
+        // xt_conntrack_mtinfo3: match_flags = XT_CONNTRACK_STATE, state_mask = ESTABLISHED|RELATED
         let mut ct = vec![0u8; 168];
         ct[146..148].copy_from_slice(&1u16.to_ne_bytes());
         ct[150..152].copy_from_slice(&6u16.to_ne_bytes());
@@ -3328,7 +3387,7 @@ mod tests {
             &[(1, cstr(b"conntrack")), (2, be32(3).to_vec()), (3, ct)],
         );
         let mut input = chain_msg(1, b"t", b"INPUT", Some((1, 0, b"filter")));
-        // 策略丢弃（chain_msg 写的是接受）
+        // Policy drop (chain_msg writes accept)
         let at = input
             .windows(8)
             .position(|w| w == [8, 0, CHAIN_POLICY as u8, 0, 0, 0, 0, 1])
@@ -3402,17 +3461,18 @@ mod tests {
         );
         assert_eq!(at(1, 22, b"br0", CT_NEW), Outcome::Accept);
         assert_eq!(at(1, 80, b"br0", CT_NEW), Outcome::Drop);
-        // 别的钩子上没有过滤链
+        // No filter chains on other hooks
         assert_eq!(at(3, 7001, b"br0", CT_NEW), Outcome::Accept);
         assert!(st.has_filter(2) && st.has_filter(1) && !st.has_filter(0));
-        // reject 的错误码
+        // reject error codes
         assert_eq!(reject_errno(2, 1, false), Errno::ECONNREFUSED.0);
         assert_eq!(reject_errno(0, 1, false), Errno::EHOSTUNREACH.0);
         assert_eq!(reject_errno(0, 0, false), Errno::ENETUNREACH.0);
         assert_eq!(reject_errno(0, 4, true), Errno::ECONNREFUSED.0);
     }
 
-    /// 区间集合：排好序的端点，结尾的元素带 NFT_SET_ELEM_INTERVAL_END；有 KEY_END 的是闭区间。
+    /// Interval sets: sorted endpoints, with end elements carrying NFT_SET_ELEM_INTERVAL_END;
+    /// those with KEY_END are closed intervals.
     #[test]
     fn interval_sets() {
         let elem = |k: &[u8], end: bool, key_end: Option<&[u8]>| {
@@ -3433,7 +3493,7 @@ mod tests {
             key_len: 2,
             id: None,
             other: Vec::new(),
-            // 80-89、100-100（结尾是不含的下一个）
+            // 80-89, 100-100 (an end is the next value, exclusive)
             elems: vec![
                 elem(&[0, 80], false, None),
                 elem(&[0, 90], true, None),

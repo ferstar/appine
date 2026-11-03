@@ -1,19 +1,25 @@
-//! 从宿主外面连到发布的端口（docs/rounds/173-port-forwarding.md）。
+//! Connections from outside the host to published ports (docs/rounds/173-port-forwarding.md).
 //!
-//! 开机时的命名空间里有 PREROUTING 的 DNAT 规则（podman、docker 发布的端口）时，从 appine
-//! 外面（别的设备、手机上的浏览器）连到宿主上这个端口的连接，到的是 guest 在宿主上监听着的
-//! socket（podman 占着端口、从不 accept 的那个）。这样的 socket 复制一份交给这里的宿主线程：
-//! 它接受连接，连到 DNAT 的目的地（容器在宿主上的回环地址），在两边之间转发数据，相当于
-//! 内核层里的 docker-proxy。UDP 的按来源各开一个宿主 socket 转发，闲置两分钟就关掉。
+//! When the initial namespace has PREROUTING DNAT rules (ports published by podman or docker), a
+//! connection from outside appine (another device, a browser on the phone) to that port on the
+//! host reaches the socket the guest is listening on in the host (the one podman holds the port
+//! with and never accepts on). Such a socket is duplicated and handed to the host thread here: it
+//! accepts connections, connects to the DNAT destination (the container's loopback address on the
+//! host) and copies data between the two, acting as a docker-proxy inside the kernel layer. UDP is
+//! forwarded through one host socket per source, closed after two minutes idle.
 //!
-//! 外面的客户端是 IPv4、不是回环地址时（别的设备），转发的连接先绑一个 127.254.x.y 和客户端的
-//! 端口再连过去，登记下来（[`outside_peer`]）：容器里 accept、getpeername 看到的是客户端真实的
-//! 地址，与 Linux 上 DNAT 一样（docs/rounds/176-real-client-address.md）。回环地址来的（手机上
-//! 的别的 App、浏览器开 localhost）照旧绑网关在宿主上的地址：Linux 上从本机连发布的端口时
-//! netavark 做 masquerade、docker 经由 docker-proxy，容器看到的也是网关。
+//! When the outside client is IPv4 and not a loopback address (another device), the forwarded
+//! connection first binds a 127.254.x.y address and the client's port before connecting, and
+//! records it ([`outside_peer`]): accept and getpeername in the container see the client's real
+//! address, as with DNAT on Linux (docs/rounds/176-real-client-address.md). Connections from
+//! loopback addresses (other apps on the phone, a browser opening localhost) still bind the
+//! gateway's address on the host: on Linux, when a published port is reached from the same
+//! machine, netavark masquerades and docker goes through docker-proxy, so the container sees the
+//! gateway too.
 //!
-//! 线程只碰宿主 fd，不拿 BKL。要转发哪些端口、转到哪里由 `syscall::net` 按规则算好交来
-//! （[`Forwarder::add`]），socket 关掉、规则变了时丢掉 [`Handle`] 就不再转发。
+//! The thread only touches host fds and never takes the BKL. Which ports to forward and where to
+//! is computed from the rules by `syscall::net` and handed over ([`Forwarder::add`]); dropping the
+//! [`Handle`] when the socket closes or the rules change stops the forwarding.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,16 +36,18 @@ const SO_ERROR: i32 = 4;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SHUT_WR: i32 = 1;
-/// 每个方向缓冲的最多字节数（满了就先不读）。
+/// Most bytes buffered per direction (when full, reading pauses).
 const BUFFER: usize = 64 * 1024;
-/// UDP 的转发 socket 闲置多久关掉（docker-proxy 是 90 秒）。
+/// How long a UDP forwarding socket may stay idle before it is closed (docker-proxy: 90 seconds).
 const UDP_IDLE: Duration = Duration::from_secs(120);
 
-/// 宿主上 127.254.0.0/16 留给从外面转发进来的连接（新的网络命名空间的段不取它）。
+/// 127.254.0.0/16 on the host is kept for connections forwarded in from outside (blocks of new
+/// network namespaces never take it).
 pub(crate) const OUTSIDE_BLOCK: u8 = 254;
 
-/// 从外面转发进来的连接绑的宿主地址 → (客户端的地址, 客户端的端口, 绑上的宿主端口)。
-/// 进程里一份：地址按进程里的计数器分配，不会重复。
+/// Host address bound by a connection forwarded in from outside → (client address, client port,
+/// bound host port). One per process: addresses come from a process-wide counter, so they never
+/// repeat.
 static OUTSIDE: Mutex<Option<Outside>> = Mutex::new(None);
 
 #[derive(Default)]
@@ -48,15 +56,15 @@ struct Outside {
     peers: HashMap<[u8; 4], ([u8; 4], u16, u16)>,
 }
 
-/// 宿主地址 `host`（127.254.x.y）、端口 `port` 是从外面转发进来的连接时，客户端真实的地址和
-/// 端口。
+/// The client's real address and port, when host address `host` (127.254.x.y) and port `port`
+/// belong to a connection forwarded in from outside.
 pub(crate) fn outside_peer(host: [u8; 4], port: u16) -> Option<([u8; 4], u16)> {
     let g = OUTSIDE.lock().unwrap();
     let &(ip, cport, hport) = g.as_ref()?.peers.get(&host)?;
     (hport == port).then_some((ip, cport))
 }
 
-/// 给一个从外面来的连接分一个 127.254.x.y（跳过 .0.0）。
+/// Gives a connection from outside a 127.254.x.y address (skipping .0.0).
 fn take_outside() -> [u8; 4] {
     let mut g = OUTSIDE.lock().unwrap();
     let o = g.get_or_insert_with(Default::default);
@@ -77,7 +85,7 @@ fn record_outside(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
         .insert(host, (client, cport, hport));
 }
 
-/// 测试里登记一个从外面转发进来的连接（[`outside_peer`]）。
+/// Records a connection forwarded in from outside, in tests ([`outside_peer`]).
 #[cfg(test)]
 pub(crate) fn record_outside_for_test(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
     record_outside(host, client, cport, hport);
@@ -89,8 +97,8 @@ fn forget_outside(host: [u8; 4]) {
     }
 }
 
-/// accept 到的客户端地址里的 IPv4 地址和端口：IPv4 映射的 IPv6 地址取 IPv4 的部分；回环地址、
-/// 纯 IPv6 的是 None。
+/// The IPv4 address and port in an accepted client address: for an IPv4-mapped IPv6 address, the
+/// IPv4 part; None for loopback addresses and pure IPv6.
 fn outside_client(addr: &[u8]) -> Option<([u8; 4], u16)> {
     const MAPPED: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
     let port = u16::from_be_bytes([*addr.get(2)?, *addr.get(3)?]);
@@ -102,17 +110,18 @@ fn outside_client(addr: &[u8]) -> Option<([u8; 4], u16)> {
     (ip[0] != 127).then_some((ip, port))
 }
 
-/// 一个要转发的端口。
+/// A port to forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Target {
     pub udp: bool,
-    /// 宿主上的目的地（sockaddr）。
+    /// Destination on the host (sockaddr).
     pub addr: Vec<u8>,
-    /// 连过去之前绑的宿主地址（端口 0）：容器看到的来源（开机时的命名空间面向它的地址）。
+    /// Host address bound (port 0) before connecting: the source the container sees (the initial
+    /// namespace's address facing it).
     pub source: Option<Vec<u8>>,
 }
 
-/// 转发线程和交给它的端口。
+/// The forwarding thread and the ports handed to it.
 #[derive(Default)]
 pub(crate) struct Forwarder {
     shared: Arc<Shared>,
@@ -127,12 +136,14 @@ struct Shared {
 #[derive(Default)]
 struct State {
     next: u64,
-    /// 要转发的端口：复制出来的监听 fd 和目的地。
+    /// Ports to forward: the duplicated listening fd and the destination.
     ports: HashMap<u64, (i32, Target)>,
-    /// 不再转发的端口复制出来的 fd：由线程关掉（它可能正在 poll 它们）。
+    /// Duplicated fds of ports no longer forwarded: the thread closes them (it may be polling
+    /// them).
     closing: Vec<i32>,
     running: bool,
-    /// 内核没了（[`Forwarder`] 丢掉了）：线程关掉手上的 fd 退出。
+    /// The kernel is gone ([`Forwarder`] was dropped): the thread closes the fds it holds and
+    /// exits.
     stop: bool,
 }
 
@@ -145,7 +156,7 @@ impl Drop for Forwarder {
     }
 }
 
-/// 转发着的一个端口：丢掉时不再转发。
+/// One forwarded port: forwarding stops when it is dropped.
 pub(crate) struct Handle {
     shared: Arc<Shared>,
     id: u64,
@@ -175,7 +186,8 @@ impl Drop for Handle {
 }
 
 impl Forwarder {
-    /// 转发宿主上监听着的 `fd`（TCP 的监听 socket，UDP 的绑定了的 socket）到 `target`。
+    /// Forwards `fd`, listening on the host (a TCP listening socket, a bound UDP socket), to
+    /// `target`.
     pub(crate) fn add(&self, fd: i32, target: Target) -> Result<Handle, i32> {
         let event = match self.shared.event.get() {
             Some(e) => e,
@@ -212,19 +224,19 @@ impl Forwarder {
     }
 }
 
-/// 一条转发着的 TCP 连接。
+/// One forwarded TCP connection.
 struct Conn {
     client: i32,
     upstream: i32,
-    /// 绑的 127.254.x.y（[`outside_peer`]），连接结束时去掉登记。
+    /// The bound 127.254.x.y ([`outside_peer`]); its record is removed when the connection ends.
     outside: Option<[u8; 4]>,
-    /// 连到目的地完成了。
+    /// The connection to the destination has completed.
     ready: bool,
     to_up: Vec<u8>,
     to_client: Vec<u8>,
     client_eof: bool,
     up_eof: bool,
-    /// 已经对对方 shutdown(SHUT_WR) 了。
+    /// shutdown(SHUT_WR) already done toward the other side.
     up_shut: bool,
     client_shut: bool,
 }
@@ -243,7 +255,7 @@ impl Conn {
     }
 }
 
-/// UDP：一个来源的转发 socket。
+/// UDP: the forwarding socket of one source.
 struct Relay {
     fd: i32,
     port: u64,
@@ -255,9 +267,10 @@ fn family(addr: &[u8]) -> i32 {
     i32::from(u16::from_le_bytes([addr[0], addr[1]]))
 }
 
-/// 新建连到 `t` 的宿主 socket（非阻塞，连接可能还在进行），返回 (fd, 连上了, 绑的
-/// 127.254.x.y)。`client` 是外面的客户端的 IPv4 地址和端口时，先绑一个 127.254.x.y 和这个
-/// 端口（绑不上这个端口就让宿主选），登记下来；不然绑 `t.source`。
+/// Creates a host socket connecting to `t` (nonblocking; the connection may still be in
+/// progress) and returns (fd, connected, bound 127.254.x.y). When `client` is an outside client's
+/// IPv4 address and port, first binds a 127.254.x.y address and that port (letting the host choose
+/// if the port cannot be bound) and records it; otherwise binds `t.source`.
 fn open(t: &Target, client: Option<([u8; 4], u16)>) -> Result<(i32, bool, Option<[u8; 4]>), i32> {
     let fd = appine_hal::net::socket(
         family(&t.addr),
@@ -302,7 +315,7 @@ fn open(t: &Target, client: Option<([u8; 4], u16)>) -> Result<(i32, bool, Option
     }
 }
 
-/// 从 `fd` 读到 `buf` 里（最多到 [`BUFFER`]）：读到结尾是 Ok(false)。
+/// Reads from `fd` into `buf` (up to [`BUFFER`]): end of file is Ok(false).
 fn fill(fd: i32, buf: &mut Vec<u8>) -> Result<bool, i32> {
     let mut chunk = vec![0u8; BUFFER - buf.len()];
     match appine_hal::read(fd, &mut chunk) {
@@ -316,7 +329,7 @@ fn fill(fd: i32, buf: &mut Vec<u8>) -> Result<bool, i32> {
     }
 }
 
-/// 把 `buf` 写到 `fd`（写不完的留着）。
+/// Writes `buf` to `fd` (whatever cannot be written stays).
 fn drain(fd: i32, buf: &mut Vec<u8>) -> Result<(), i32> {
     while !buf.is_empty() {
         match appine_hal::net::sendmsg(fd, buf, &[], &[], 0) {
@@ -330,14 +343,15 @@ fn drain(fd: i32, buf: &mut Vec<u8>) -> Result<(), i32> {
     Ok(())
 }
 
-/// 转发线程。
+/// The forwarding thread.
 fn run(shared: &Shared) {
     let event = shared.event.get().expect("event before thread");
     let mut ports: HashMap<u64, (i32, Target)> = HashMap::new();
     let mut conns: Vec<Conn> = Vec::new();
     let mut relays: Vec<Relay> = Vec::new();
     loop {
-        // 取交来的端口；不再转发的关掉，它们的 UDP 转发 socket 也关掉
+        // Take the ports handed over; close those no longer forwarded, and their UDP
+        // forwarding sockets too
         {
             event.clear();
             let mut st = shared.state.lock().unwrap();
@@ -369,7 +383,8 @@ fn run(shared: &Shared) {
             }
             keep
         });
-        // 要等的：事件、各个端口、各条连接的两边、各个 UDP 转发 socket
+        // What to wait for: the event, every port, both sides of every connection, every UDP
+        // forwarding socket
         let mut fds: Vec<(i32, i16, i16)> = vec![(event.fd(), POLLIN, 0)];
         let order: Vec<(u64, i32, bool)> = ports
             .iter()
@@ -399,14 +414,14 @@ fn run(shared: &Shared) {
             fds.push((c.upstream, ue, 0));
         }
         fds.extend(relays.iter().map(|r| (r.fd, POLLIN, 0)));
-        // 下面新接受的连接、新开的转发 socket 不在这一轮里
+        // Connections accepted and forwarding sockets opened below are not in this round
         let (polled_conns, polled_relays) = (conns.len(), relays.len());
         let timeout = (!relays.is_empty()).then_some(Duration::from_secs(5));
         if appine_hal::poll(&mut fds, timeout).is_err() {
             continue;
         }
         let mut at = 1;
-        // 端口：接受连接、收数据报
+        // Ports: accept connections, receive datagrams
         for &(id, fd, udp) in &order {
             let ready = fds[at].2 != 0;
             at += 1;
@@ -418,7 +433,7 @@ fn run(shared: &Shared) {
                 datagrams(id, fd, target, &mut relays);
                 continue;
             }
-            // 一次最多接受 64 个，别的连接不至于饿着
+            // Accept at most 64 at a time so the other connections do not starve
             for _ in 0..64 {
                 let Ok((client, from)) = appine_hal::net::accept(fd) else {
                     break;
@@ -436,12 +451,12 @@ fn run(shared: &Shared) {
                         up_shut: false,
                         client_shut: false,
                     }),
-                    // 目的地连不上：客户端看到连接被关掉
+                    // The destination cannot be reached: the client sees the connection closed
                     Err(_) => appine_hal::net::close(client),
                 }
             }
         }
-        // 连接
+        // Connections
         let mut broken = vec![false; conns.len()];
         for (k, c) in conns.iter_mut().enumerate().take(polled_conns) {
             let (cr, ur) = (fds[at + 2 * k].2, fds[at + 2 * k + 1].2);
@@ -458,7 +473,7 @@ fn run(shared: &Shared) {
             }
             !gone
         });
-        // UDP 的回答发回来源
+        // Send UDP replies back to the source
         for (k, r) in relays.iter_mut().enumerate().take(polled_relays) {
             if fds[at + k].2 == 0 {
                 continue;
@@ -481,7 +496,7 @@ fn run(shared: &Shared) {
     }
 }
 
-/// 一条连接上就绪的事件（`cr` 是客户端那边的，`ur` 是目的地那边的）。
+/// Events ready on one connection (`cr` on the client side, `ur` on the destination side).
 fn step(c: &mut Conn, cr: i16, ur: i16) -> Result<(), i32> {
     if !c.ready {
         if ur == 0 {
@@ -501,7 +516,7 @@ fn step(c: &mut Conn, cr: i16, ur: i16) -> Result<(), i32> {
     }
     drain(c.upstream, &mut c.to_up)?;
     drain(c.client, &mut c.to_client)?;
-    // 一边读完了、数据都转过去了：对另一边半关
+    // One side reached its end and all its data went across: half-close toward the other side
     if c.client_eof && c.to_up.is_empty() && !c.up_shut {
         let _ = appine_hal::net::shutdown(c.upstream, SHUT_WR);
         c.up_shut = true;
@@ -513,7 +528,8 @@ fn step(c: &mut Conn, cr: i16, ur: i16) -> Result<(), i32> {
     Ok(())
 }
 
-/// UDP 的端口上收到的数据报：按来源找（没有就开）转发 socket，发给目的地。
+/// Datagrams received on a UDP port: finds (or opens) the forwarding socket of the source and
+/// sends them to the destination.
 fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
     let mut buf = vec![0u8; 65536];
     for _ in 0..64 {
@@ -527,8 +543,9 @@ fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
         {
             Some(i) => &mut relays[i],
             None => {
-                // UDP 照旧绑网关的地址：容器回给真实地址的数据报要经由转发 socket 回去，
-                // 地址映射里没有这个方向
+                // UDP still binds the gateway's address: datagrams the container sends back to
+                // the real address must go back through the forwarding socket, and the address
+                // mapping has no entry for that direction
                 let Ok((rfd, _, _)) = open(target, None) else {
                     continue;
                 };
@@ -561,14 +578,15 @@ mod tests {
         u16::from_be_bytes([a[2], a[3]])
     }
 
-    /// 阻塞地等 fd 就绪（测试里用）。
+    /// Waits, blocking, until the fd is ready (used in tests).
     fn wait(fd: i32, ev: i16) {
         let mut f = [(fd, ev, 0)];
         appine_hal::poll(&mut f, Some(Duration::from_secs(5))).unwrap();
         assert_ne!(f[0].2, 0, "timed out");
     }
 
-    /// TCP：外面连到监听着的 socket，数据到了目的地，回答回来，关掉之后两边都结束。
+    /// TCP: an outside connection to the listening socket gets its data to the destination and
+    /// the reply back, and both sides end after closing.
     #[test]
     fn tcp_is_forwarded() {
         let server = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
@@ -588,7 +606,7 @@ mod tests {
                 },
             )
             .unwrap();
-        // "外面"的客户端
+        // The "outside" client
         let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
         let _ = appine_hal::net::connect(c, &loopback(port(held)));
         wait(server, POLLIN);
@@ -604,10 +622,10 @@ mod tests {
         wait(c, POLLIN);
         assert_eq!(appine_hal::read(c, &mut buf), Ok(5));
         assert_eq!(&buf[..5], b"pong!");
-        // 目的地关了：客户端读到结尾
+        // The destination closed: the client reads end of file
         wait(c, POLLIN);
         assert_eq!(appine_hal::read(c, &mut buf), Ok(0));
-        // 不再转发：连进来的没人接受
+        // No longer forwarded: incoming connections are not accepted by anyone
         drop(h);
         std::thread::sleep(Duration::from_millis(100));
         let c2 = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
@@ -620,11 +638,13 @@ mod tests {
         }
     }
 
-    /// 外面的客户端（不是回环地址）：转发的连接绑一个 127.254.x.y 和客户端的端口，登记着客户端
-    /// 真实的地址；连接结束时去掉。
+    /// An outside client (not a loopback address): the forwarded connection binds a 127.254.x.y
+    /// address and the client's port and records the client's real address; the record is
+    /// removed when the connection ends.
     #[test]
     fn outside_clients_keep_their_address() {
-        // 宿主上一个不是回环的 IPv4 地址当作外面的客户端，没有就不测
+        // Use a non-loopback IPv4 address of the host as the outside client; skip the test if
+        // there is none
         let Some(ip) = appine_hal::net::interfaces().iter().find_map(|i| {
             i.addrs
                 .iter()
@@ -660,11 +680,11 @@ mod tests {
         let host: [u8; 4] = peer[4..8].try_into().unwrap();
         let hport = u16::from_be_bytes([peer[2], peer[3]]);
         assert_eq!(host[..2], [127, OUTSIDE_BLOCK]);
-        // 绑的是客户端的端口
+        // What is bound is the client's port
         assert_eq!(hport, port(c));
         assert_eq!(outside_peer(host, hport), Some((ip, port(c))));
         assert_eq!(outside_peer(host, hport.wrapping_add(1)), None);
-        // 两边都关掉之后登记没了
+        // After both sides close, the record is gone
         appine_hal::net::close(c);
         appine_hal::net::close(s);
         for _ in 0..50 {
@@ -674,13 +694,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(outside_peer(host, hport), None);
-        // 回环地址来的不是外面的客户端
+        // A connection from a loopback address is not an outside client
         assert_eq!(outside_client(&loopback(4000)), None);
         appine_hal::net::close(server);
         appine_hal::net::close(held);
     }
 
-    /// UDP：数据报转给目的地，回答从监听的 socket 发回来源。
+    /// UDP: datagrams go to the destination, and replies go back to the source from the
+    /// listening socket.
     #[test]
     fn udp_is_forwarded() {
         let server = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).unwrap();
@@ -708,7 +729,7 @@ mod tests {
         wait(c, POLLIN);
         let r = appine_hal::net::recvmsg(c, &mut buf, 0, 0).unwrap();
         assert_eq!(&buf[..r.len], b"answer");
-        // 回答来自客户端发往的那个端口
+        // The reply comes from the port the client sent to
         assert_eq!(r.addr[2..8], loopback(port(held))[2..8]);
         for fd in [server, held, c] {
             appine_hal::net::close(fd);

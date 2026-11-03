@@ -1,28 +1,31 @@
-//! 网络命名空间的 sysctl（`/proc/sys/net`）：接口的配置 `ipv4/conf/<接口>`、
-//! `ipv6/conf/<接口>`（含 `all`、`default`），以及 `ipv4/ip_forward`、
-//! `ipv4/ip_local_port_range`、`ipv4/ip_unprivileged_port_start`（bind 低于它的端口要
-//! `CAP_NET_BIND_SERVICE`）、`ipv4/ping_group_range`（只记下：ping socket 交给宿主，
-//! Android 允许所有组）、`core/somaxconn`。
+//! Network namespace sysctls (`/proc/sys/net`): the interface settings `ipv4/conf/<interface>`
+//! and `ipv6/conf/<interface>` (including `all` and `default`), plus `ipv4/ip_forward`,
+//! `ipv4/ip_local_port_range`, `ipv4/ip_unprivileged_port_start` (binding a port below it needs
+//! `CAP_NET_BIND_SERVICE`), `ipv4/ping_group_range` (only recorded: ping sockets are handed to
+//! the host, and Android allows all groups) and `core/somaxconn`.
 //!
-//! 项和默认值照 Linux 6.1（`devinet_sysctl_table`、`ipv4_devconf_dflt`，`addrconf_sysctl`、
-//! `ipv6_devconf_dflt`）。值都是整数（`stable_secret` 除外，没有设过时读是 EIO），写入时按
-//! `proc_dointvec` 解析。起作用的只有几项（[`crate::netdev`] 里处理）：`disable_ipv6`
-//! 去掉、恢复接口的 IPv6，`forwarding` 在 `all`（`ip_forward` 是它的别名）上写时改到每个
-//! 接口，IPv4 的 `default` 改到还没有单独设过这一项的接口。别的只记下来：appine 不转发、
-//! 不收发 ARP、路由通告。
+//! Entries and defaults as in Linux 6.1 (`devinet_sysctl_table`, `ipv4_devconf_dflt`;
+//! `addrconf_sysctl`, `ipv6_devconf_dflt`). All values are integers (except `stable_secret`,
+//! which reads as EIO until it is set), and writes are parsed as by `proc_dointvec`. Only a few
+//! take effect (handled in [`crate::netdev`]): `disable_ipv6` removes and restores an interface's
+//! IPv6, `forwarding` written on `all` (`ip_forward` is its alias) is applied to every interface,
+//! and IPv4 `default` is applied to the interfaces that have not set that entry on their own. The
+//! others are only recorded: appine does no forwarding and sends or receives no ARP or router
+//! advertisements.
 //!
-//! 与 Linux 一样，新建的接口照抄所在命名空间的 `default`；新建的命名空间的 IPv4 部分照抄
-//! 开机时的那个现在的值，IPv6 部分是默认值（`devconf_inherit_init_net` 为 0 时）。接口移到
-//! 别的命名空间时按那边的 `default` 重来。
+//! As on Linux, a new interface copies the `default` of its namespace; a new namespace's IPv4 part
+//! copies the initial namespace's current values, and its IPv6 part is the defaults (as when
+//! `devconf_inherit_init_net` is 0). An interface moved to another namespace starts over from that
+//! namespace's `default`.
 
 use std::collections::BTreeMap;
 
 use crate::errno::Errno;
 
-/// 接口配置的一项：名字、默认值（`default` 和接口的）、`all` 的值。
+/// One interface setting: name, default value (of `default` and of interfaces), value of `all`.
 type Item = (&'static str, i64, i64);
 
-/// IPv4 的项（按名字排序）。`all` 与 `default` 只有 `accept_source_route` 不同。
+/// The IPv4 entries (sorted by name). `all` and `default` differ only in `accept_source_route`.
 pub(crate) const V4: [Item; 33] = [
     ("accept_local", 0, 0),
     ("accept_redirects", 1, 1),
@@ -59,8 +62,9 @@ pub(crate) const V4: [Item; 33] = [
     ("tag", 0, 0),
 ];
 
-/// IPv6 的项（按名字排序）。`all` 与 `default` 只有 `accept_dad` 不同；`mtu` 在接口上是
-/// 接口的 MTU（[`Conf::mtu6`]），`stable_secret` 另外记。
+/// The IPv6 entries (sorted by name). `all` and `default` differ only in `accept_dad`; on an
+/// interface `mtu` is the interface's MTU ([`Conf::mtu6`]), and `stable_secret` is kept
+/// separately.
 pub(crate) const V6: [Item; 58] = [
     ("accept_dad", 1, 0),
     ("accept_ra", 1, 1),
@@ -122,37 +126,38 @@ pub(crate) const V6: [Item; 58] = [
     ("use_tempaddr", 0, 0),
 ];
 
-/// IPv6 的最小 MTU。
+/// The minimum IPv6 MTU.
 pub(crate) const IPV6_MIN_MTU: i64 = 1280;
 
-/// 一族的表。
+/// The table of one family.
 pub(crate) fn table(v6: bool) -> &'static [Item] {
     if v6 { &V6 } else { &V4 }
 }
 
-/// 项 `name` 在表里的位置。
+/// Position of entry `name` in the table.
 pub(crate) fn position(v6: bool, name: &[u8]) -> Option<usize> {
     table(v6).iter().position(|(n, ..)| n.as_bytes() == name)
 }
 
-/// 只读的项（`mc_forwarding`）。
+/// Read-only entries (`mc_forwarding`).
 pub(crate) fn read_only(name: &[u8]) -> bool {
     name == b"mc_forwarding"
 }
 
-/// 一组接口配置（一族的）：每一项的值，和单独设过哪些（IPv4 的 `default` 只改没设过的）。
+/// One set of interface settings (of one family): the value of every entry, and which were set
+/// individually (IPv4 `default` only changes those not set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Conf {
     pub vals: Vec<i64>,
     pub set: Vec<bool>,
-    /// IPv6 的 `stable_secret`：没有设过时读是 EIO。
+    /// IPv6 `stable_secret`: reads as EIO until it is set.
     pub secret: Option<[u8; 16]>,
-    /// IPv6 的 `mtu`：设过的值；接口上没设过时是接口的 MTU。
+    /// IPv6 `mtu`: the value set; on an interface, the interface's MTU while not set.
     pub mtu6: Option<i64>,
 }
 
 impl Conf {
-    /// 默认值：`all` 的或者 `default`（接口）的。
+    /// Defaults: those of `all` or of `default` (interfaces).
     pub fn new(v6: bool, all: bool) -> Conf {
         let t = table(v6);
         Conf {
@@ -163,7 +168,7 @@ impl Conf {
         }
     }
 
-    /// 新接口照抄的：`default` 的值，都算没设过。
+    /// What a new interface copies: the `default` values, all counted as not set.
     pub fn inherit(&self) -> Conf {
         Conf {
             set: vec![false; self.set.len()],
@@ -177,25 +182,26 @@ impl Conf {
     }
 }
 
-/// 一个网络命名空间的 sysctl。
+/// The sysctls of one network namespace.
 #[derive(Debug, Clone)]
 pub(crate) struct NetConf {
     pub all4: Conf,
     pub dflt4: Conf,
     pub all6: Conf,
     pub dflt6: Conf,
-    /// 不是虚拟设备的接口（新命名空间的 lo、开机时的命名空间里宿主的接口）的配置，按接口
-    /// 编号；没有时是 `default` 的。虚拟设备的记在设备上。
+    /// Settings of interfaces that are not virtual devices (lo in a new namespace, the host's
+    /// interfaces in the initial namespace), by interface index; `default`'s when absent. Those of
+    /// virtual devices are kept on the device.
     pub other: BTreeMap<u32, (Conf, Conf)>,
-    /// `core/somaxconn`。
+    /// `core/somaxconn`.
     pub somaxconn: i64,
-    /// `ipv4/ip_local_port_range`。
+    /// `ipv4/ip_local_port_range`.
     pub port_range: (i64, i64),
-    /// `ipv4/ip_unprivileged_port_start`（Linux 的 `sysctl_ip_prot_sock`）。
+    /// `ipv4/ip_unprivileged_port_start` (Linux's `sysctl_ip_prot_sock`).
     pub prot_sock: i64,
-    /// `ipv4/ping_group_range`。
+    /// `ipv4/ping_group_range`.
     pub ping_group: (i64, i64),
-    /// 写过的 [`SYSCTLS`]（没写过的是默认值）。
+    /// Written [`SYSCTLS`] (those never written have their default values).
     pub sysctls: BTreeMap<&'static str, String>,
 }
 
@@ -210,8 +216,9 @@ impl Default for NetConf {
             somaxconn: 4096,
             port_range: (32768, 60999),
             prot_sock: 1024,
-            // 开机时的命名空间与 Android（和 systemd 的默认配置）一样允许所有组；新建的
-            // 命名空间是 Linux 的默认值，谁也不允许（只记下，不限制）
+            // The initial namespace allows all groups, as Android (and systemd's default
+            // configuration) does; a new namespace gets Linux's default, which allows nobody
+            // (only recorded, not enforced)
             ping_group: (0, 2_147_483_647),
             sysctls: BTreeMap::new(),
         }
@@ -219,7 +226,8 @@ impl Default for NetConf {
 }
 
 impl NetConf {
-    /// 新建的命名空间的：IPv4 照抄 `init` 现在的 `all`、`default`，别的是默认值。
+    /// For a new namespace: IPv4 copies `init`'s current `all` and `default`; the rest are
+    /// defaults.
     pub fn for_new_ns(init: &NetConf) -> NetConf {
         NetConf {
             all4: init.all4.inherit(),
@@ -229,14 +237,16 @@ impl NetConf {
         }
     }
 
-    /// 不是虚拟设备的接口 `index` 的配置（没有时照抄 `default`）。
+    /// Settings of interface `index`, which is not a virtual device (copying `default` when
+    /// absent).
     pub fn other_mut(&mut self, index: u32) -> &mut (Conf, Conf) {
         let (d4, d6) = (self.dflt4.inherit(), self.dflt6.inherit());
         self.other.entry(index).or_insert((d4, d6))
     }
 }
 
-/// 按 `proc_dointvec` 解析写入的整数：可以有前导空白、正负号，后面可以跟空白（换行）。
+/// Parses a written integer as `proc_dointvec` does: leading whitespace and a sign are allowed,
+/// and whitespace (a newline) may follow.
 pub(crate) fn parse_int(data: &[u8]) -> Result<i64, Errno> {
     let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
     let s = s.trim_start();
@@ -250,8 +260,9 @@ pub(crate) fn parse_int(data: &[u8]) -> Result<i64, Errno> {
     s[..end].parse().map_err(|_| Errno::EINVAL)
 }
 
-/// 一项能取的值：大多是 int，几项有范围（Linux 用 `proc_dointvec_minmax`、`proc_douintvec`
-/// 的那些）。`mtu` 的上限是接口的 MTU，在 [`crate::netdev`] 里查。
+/// The values an entry may take: mostly any int; a few have ranges (those Linux handles with
+/// `proc_dointvec_minmax` and `proc_douintvec`). The upper bound of `mtu` is the interface's MTU,
+/// checked in [`crate::netdev`].
 pub(crate) fn check(v6: bool, name: &str, v: i64) -> Result<(), Errno> {
     let (lo, hi) = match (v6, name) {
         (true, "addr_gen_mode") => (0, 3),
@@ -270,13 +281,13 @@ pub(crate) fn check(v6: bool, name: &str, v: i64) -> Result<(), Errno> {
     }
 }
 
-/// `stable_secret` 的读：没有设过是 EIO。
+/// Reading `stable_secret`: EIO until it is set.
 pub(crate) fn show_secret(s: Option<[u8; 16]>) -> Result<String, Errno> {
     let s = s.ok_or(Errno::EIO)?;
     Ok(format!("{}\n", std::net::Ipv6Addr::from(s)))
 }
 
-/// `stable_secret` 的写：一个 IPv6 地址。
+/// Writing `stable_secret`: an IPv6 address.
 pub(crate) fn parse_secret(data: &[u8]) -> Result<[u8; 16], Errno> {
     let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
     s.trim()
@@ -285,7 +296,7 @@ pub(crate) fn parse_secret(data: &[u8]) -> Result<[u8; 16], Errno> {
         .map_err(|_| Errno::EINVAL)
 }
 
-/// 两个整数（`ip_local_port_range`、`ping_group_range` 的写）。
+/// Two integers (writes of `ip_local_port_range` and `ping_group_range`).
 fn parse_pair(data: &[u8]) -> Result<(i64, i64), Errno> {
     let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
     let mut it = s.split_ascii_whitespace().map(|w| w.parse::<i64>());
@@ -295,9 +306,9 @@ fn parse_pair(data: &[u8]) -> Result<(i64, i64), Errno> {
     Ok((a, b))
 }
 
-/// 写 `ipv4/ip_local_port_range`：两个数，都在 1 到 65535 之间、前一个不大于后一个，并且
-/// 不小于 `ip_unprivileged_port_start`（`prot_sock`），不然 EINVAL（Linux 6.1 的
-/// `ipv4_local_port_range`）。
+/// Writes `ipv4/ip_local_port_range`: two numbers, both between 1 and 65535, the first not
+/// greater than the second, and not below `ip_unprivileged_port_start` (`prot_sock`); otherwise
+/// EINVAL (Linux 6.1's `ipv4_local_port_range`).
 pub(crate) fn parse_port_range(data: &[u8], prot_sock: i64) -> Result<(i64, i64), Errno> {
     let (lo, hi) = parse_pair(data)?;
     if !(1..=65535).contains(&lo) || !(1..=65535).contains(&hi) || lo > hi || lo < prot_sock {
@@ -306,8 +317,8 @@ pub(crate) fn parse_port_range(data: &[u8], prot_sock: i64) -> Result<(i64, i64)
     Ok((lo, hi))
 }
 
-/// 写 `ipv4/ip_unprivileged_port_start`：0 到 65535，不能大于本地端口范围的下限
-/// （`ipv4_privileged_ports`）。
+/// Writes `ipv4/ip_unprivileged_port_start`: 0 to 65535, not greater than the lower bound of the
+/// local port range (`ipv4_privileged_ports`).
 pub(crate) fn parse_prot_sock(data: &[u8], range_low: i64) -> Result<i64, Errno> {
     let v = parse_int(data)?;
     if !(0..=65535).contains(&v) || range_low < v {
@@ -316,8 +327,8 @@ pub(crate) fn parse_prot_sock(data: &[u8], range_low: i64) -> Result<i64, Errno>
     Ok(v)
 }
 
-/// 写 `ipv4/ping_group_range`：两个组 ID（`ipv4_ping_group_range`）；后一个小于前一个时
-/// 换成谁也不允许的 1、0。
+/// Writes `ipv4/ping_group_range`: two group IDs (`ipv4_ping_group_range`); when the second is
+/// less than the first, they become 1, 0, which allows nobody.
 pub(crate) fn parse_ping_group(data: &[u8]) -> Result<(i64, i64), Errno> {
     let (lo, hi) = parse_pair(data)?;
     let gid = 0..=i64::from(u32::MAX - 1);
@@ -327,10 +338,11 @@ pub(crate) fn parse_ping_group(data: &[u8]) -> Result<(i64, i64), Errno> {
     Ok(if hi < lo { (1, 0) } else { (lo, hi) })
 }
 
-/// `/proc/sys/net` 下别的 sysctl（docs/rounds/177-net-sysctls.md）：路径（`core/`、`ipv4/`、`ipv6/`、
-/// `unix/` 下）、默认值（几个数之间是 tab）、权限位，以及是不是只在开机时的命名空间里有。
-/// 照 Linux 6.1 在新的网络命名空间里给出的那些（ipv4/conf、route 这些子目录除外）。写入的值
-/// 只记下，不起作用。
+/// Other sysctls under `/proc/sys/net` (docs/rounds/177-net-sysctls.md): the path (under `core/`,
+/// `ipv4/`, `ipv6/`, `unix/`), the default value (tabs between several numbers), the permission
+/// bits, and whether it exists only in the initial namespace. These are the ones Linux 6.1
+/// provides in a new network namespace (except subdirectories such as ipv4/conf and route).
+/// Written values are only recorded and have no effect.
 pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
     ("core/netdev_max_backlog", "1000", 0o644, true),
     ("core/optmem_max", "131072", 0o644, false),
@@ -402,7 +414,7 @@ pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
     ("ipv4/tcp_early_retrans", "3", 0o644, false),
     ("ipv4/tcp_ecn", "2", 0o644, false),
     ("ipv4/tcp_ecn_fallback", "1", 0o644, false),
-    // 按内存算（memory_default），这里的是 4 GB 内存时的
+    // Sized by memory (memory_default); these are the values for 4 GB of memory
     ("ipv4/tcp_ehash_entries", "-32768", 0o444, false),
     ("ipv4/tcp_fack", "0", 0o644, false),
     ("ipv4/tcp_fastopen", "1", 0o644, false),
@@ -423,7 +435,7 @@ pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
     ("ipv4/tcp_l3mdev_accept", "0", 0o644, false),
     ("ipv4/tcp_limit_output_bytes", "1048576", 0o644, false),
     ("ipv4/tcp_max_reordering", "300", 0o644, false),
-    // 这两项也按内存算
+    // These two are sized by memory too
     ("ipv4/tcp_max_syn_backlog", "256", 0o644, false),
     ("ipv4/tcp_max_tw_buckets", "16384", 0o644, false),
     ("ipv4/tcp_migrate_req", "0", 0o644, false),
@@ -496,8 +508,9 @@ pub(crate) const SYSCTLS: [(&str, &str, u16, bool); 145] = [
     ("unix/max_dgram_qlen", "10", 0o644, false),
 ];
 
-/// `/proc/sys/net/` 下的路径 `path`（如 `ipv4/tcp_keepalive_time`）在 [`SYSCTLS`] 里的那一项；
-/// `init` 是开机时的命名空间（只在那里有的也算）。
+/// The [`SYSCTLS`] entry of path `path` under `/proc/sys/net/` (such as
+/// `ipv4/tcp_keepalive_time`); `init` means the initial namespace (entries that exist only there
+/// count too).
 pub(crate) fn sysctl(
     path: &[u8],
     init: bool,
@@ -507,7 +520,7 @@ pub(crate) fn sysctl(
         .find(|(p, _, _, only)| p.as_bytes() == path && (init || !only))
 }
 
-/// 读 [`SYSCTLS`] 里的一项：写过的值或者默认值。
+/// Reads an entry of [`SYSCTLS`]: the written value or the default.
 pub(crate) fn sysctl_read(conf: &NetConf, path: &'static str) -> String {
     if let Some(v) = conf.sysctls.get(path) {
         return format!("{v}\n");
@@ -519,10 +532,11 @@ pub(crate) fn sysctl_read(conf: &NetConf, path: &'static str) -> String {
     format!("{dflt}\n")
 }
 
-/// 按内存大小定的默认值：TCP 连接表的桶数（[`ehash_entries`]）`cnt`，新的命名空间里
-/// `tcp_ehash_entries` 是 -cnt（与开机时的命名空间共用一张表），`tcp_max_tw_buckets` 是
-/// cnt / 2，`tcp_max_syn_backlog` 是 cnt / 128、至少 128（`tcp_sk_init`）。`total` 是内存
-/// 总量（字节），0 是不知道（用表里 4 GB 时的值）。
+/// Defaults sized by memory: with `cnt` buckets in the TCP connection table ([`ehash_entries`]),
+/// in a new namespace `tcp_ehash_entries` is -cnt (sharing one table with the initial
+/// namespace), `tcp_max_tw_buckets` is cnt / 2, and `tcp_max_syn_backlog` is cnt / 128, at least
+/// 128 (`tcp_sk_init`). `total` is the total memory (bytes); 0 means unknown (the table's values
+/// for 4 GB are used).
 fn memory_default(path: &str, total: u64) -> Option<String> {
     let cnt = ehash_entries(total)?;
     match path {
@@ -533,8 +547,9 @@ fn memory_default(path: &str, total: u64) -> Option<String> {
     }
 }
 
-/// Linux 的 TCP 连接表有多少个桶（`tcp_init` 调 `alloc_large_system_hash`）：内存按 MB 向上
-/// 取整，每 128 KB 一个，取 2 的幂，不超过 512 K 个。内存 4 GB 时是 32768，8 GB 时是 65536。
+/// How many buckets Linux's TCP connection table has (`tcp_init` calls
+/// `alloc_large_system_hash`): memory rounded up to whole MB, one per 128 KB, taken to a power of
+/// two, at most 512 K. 32768 with 4 GB of memory, 65536 with 8 GB.
 fn ehash_entries(total: u64) -> Option<u64> {
     if total == 0 {
         return None;
@@ -543,9 +558,10 @@ fn ehash_entries(total: u64) -> Option<u64> {
     Some(((mb << 20) >> 17).next_power_of_two().min(512 * 1024))
 }
 
-/// 写 [`SYSCTLS`] 里的一项：整数的按默认值的个数，写几个改前几个、多出来的不看
-/// （`proc_dointvec`）；
-/// 拥塞控制算法要是有的（不然 ENOENT）；保留的端口、TCP Fast Open 的密钥按格式。
+/// Writes an entry of [`SYSCTLS`]: integer entries have as many numbers as the default; writing
+/// some changes that many leading ones, and extra numbers are ignored (`proc_dointvec`);
+/// a congestion control algorithm must exist (otherwise ENOENT); reserved ports and TCP Fast Open
+/// keys must follow their formats.
 pub(crate) fn sysctl_write(
     conf: &mut NetConf,
     path: &'static str,
@@ -586,7 +602,7 @@ pub(crate) fn sysctl_write(
             let old = sysctl_read(conf, path);
             let mut vals: Vec<String> = old.trim_end().split('\t').map(str::to_owned).collect();
             let new: Vec<&str> = text.split_whitespace().collect();
-            // 多出来的不看（`__do_proc_dointvec` 按表里的个数读）
+            // Extra numbers are ignored (`__do_proc_dointvec` reads as many as the table has)
             let new = &new[..new.len().min(vals.len())];
             if new.is_empty() || new.iter().any(|v| v.parse::<i64>().is_err()) {
                 return Err(Errno::EINVAL);
@@ -605,8 +621,9 @@ pub(crate) fn sysctl_write(
 mod tests {
     use super::*;
 
-    /// 别的 sysctl：默认值，整数写几个改前几个、多出来的不看，不是数是 EINVAL，拥塞控制算法
-    /// 要是有的，只在开机时的命名空间里有的。
+    /// Other sysctls: defaults; integer writes change as many leading values as given and ignore
+    /// extra ones, non-numbers are EINVAL, a congestion control algorithm must exist, and some
+    /// entries exist only in the initial namespace.
     #[test]
     fn plain_sysctls() {
         let mut c = NetConf::default();
@@ -635,12 +652,12 @@ mod tests {
             sysctl_write(&mut c, "ipv4/ip_local_reserved_ports", b"x"),
             Err(Errno::EINVAL)
         );
-        // 新的命名空间里没有只在开机时的命名空间里有的
+        // A new namespace lacks the entries that exist only in the initial namespace
         assert!(sysctl(b"core/rmem_max", true).is_some());
         assert!(sysctl(b"core/rmem_max", false).is_none());
         assert!(sysctl(b"ipv4/tcp_keepalive_time", false).is_some());
         assert!(sysctl(b"ipv4/no_such", true).is_none());
-        // 每个命名空间各有一份
+        // Every namespace has its own copy
         let other = NetConf::for_new_ns(&c);
         assert_eq!(
             sysctl_read(&other, "ipv4/tcp_congestion_control"),
@@ -675,7 +692,8 @@ mod tests {
         assert_eq!(show_secret(None), Err(Errno::EIO));
     }
 
-    /// 按内存定的几项：colima 的 4 GB、8 GB 虚拟机上原生的值，16 GB，封顶。
+    /// The memory-sized entries: the native values on colima's 4 GB and 8 GB VMs, 16 GB, and the
+    /// cap.
     #[test]
     fn memory_sized_defaults() {
         let vm4 = 3_999_216 * 1024;

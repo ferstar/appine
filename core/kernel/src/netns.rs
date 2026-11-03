@@ -1,13 +1,15 @@
-//! 新建的网络命名空间（[`NetNs`]）：里面只有回环接口 lo。
+//! New network namespaces ([`NetNs`]): they contain only the loopback interface lo.
 //!
-//! socket 仍是宿主 socket，地址在系统调用的边界上换算：guest 的 127.0.0.x 是宿主上给这个
-//! 命名空间的 127.a.b.x，绑定通配地址时绑 127.a.b.1；AF_INET6 的 ::1、:: 是 IPv4 映射的
-//! ::ffff:127.a.b.1（宿主 socket 不设 `IPV6_V6ONLY`）。别的地址绑不上（EADDRNOTAVAIL）、
-//! 到不了（ENETUNREACH），lo 没起来、没有地址时 127.0.0.1 也一样。没有绑定就 connect、
-//! sendto、listen 的 socket 先绑到 127.a.b.1，免得宿主替它绑到所有接口上。
+//! Sockets stay host sockets, and addresses are translated at the syscall boundary: the guest's
+//! 127.0.0.x is the host's 127.a.b.x given to this namespace, and binding the wildcard address
+//! binds 127.a.b.1; AF_INET6 ::1 and :: are the IPv4-mapped ::ffff:127.a.b.1 (host sockets do not
+//! set `IPV6_V6ONLY`). Other addresses cannot be bound (EADDRNOTAVAIL) or reached (ENETUNREACH),
+//! and the same holds for 127.0.0.1 while lo is down or has no address. A socket that connects,
+//! sends or listens without being bound is first bound to 127.a.b.1, so that the host does not
+//! bind it to all interfaces instead.
 //!
-//! lo 的配置经由 netlink（`RTM_NEWADDR`、`RTM_DELADDR`、`RTM_NEWLINK`）和接口 ioctl 读写，
-//! bubblewrap 就是这样拉起 lo 的。
+//! lo's configuration is read and written through netlink (`RTM_NEWADDR`, `RTM_DELADDR`,
+//! `RTM_NEWLINK`) and interface ioctls, which is how bubblewrap brings lo up.
 
 use std::rc::Rc;
 
@@ -22,22 +24,23 @@ const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_LOWER_UP: u32 = 0x10000;
-/// 新的命名空间里 lo 的接口编号。
+/// Interface index of lo in a new namespace.
 pub(crate) const LO_INDEX: u32 = 1;
 const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
-/// guest 的地址拿来做什么。
+/// What a guest address is used for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Use {
-    /// bind：要是本地地址（不是时 EADDRNOTAVAIL），通配地址也行。
+    /// bind: must be a local address (EADDRNOTAVAIL otherwise); the wildcard address also works.
     Bind,
-    /// connect、sendto：要到得了（不然 ENETUNREACH）。
+    /// connect, sendto: must be reachable (ENETUNREACH otherwise).
     Reach,
 }
 
 impl Loopback {
-    /// IPv4 回环地址 `ip` 能不能这样用：与 Linux 上看到的一样，127.0.0.0/8 总能绑定（lo
-    /// 关着、没有地址时也行），要 lo 起来、地址所在的网段配在上面才到得了。
+    /// Whether IPv4 loopback address `ip` may be used this way: as seen on Linux, 127.0.0.0/8 can
+    /// always be bound (even while lo is down or has no address), and is reachable only when lo
+    /// is up and the address's subnet is configured on it.
     fn has_v4(&self, ip: [u8; 4], usage: Use) -> bool {
         let covered = |&(a, len): &([u8; 4], u8)| {
             let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
@@ -59,17 +62,19 @@ fn mapped(ip: &[u8]) -> Option<[u8; 4]> {
     (ip[..10] == [0; 10] && ip[10..12] == [0xff, 0xff]).then(|| ip[12..16].try_into().unwrap())
 }
 
-/// 所有的网络命名空间（地址换算要看别的命名空间里的虚拟地址）：第一个是开机时的。
+/// All network namespaces (address translation looks at virtual addresses in other
+/// namespaces): the first is the initial one.
 pub(crate) struct World {
     pub all: Vec<Rc<NetNs>>,
 }
 
-/// 开机时的命名空间里的虚拟地址在宿主上的回环地址段：127.255.0.0/16（新命名空间的段
-/// 127.a.b.0/24 的 a 不取 255）。
+/// Host loopback block for the virtual addresses of the initial namespace: 127.255.0.0/16 (the
+/// blocks 127.a.b.0/24 of new namespaces never use 255 for a).
 pub(crate) const INIT_BLOCK: u8 = 255;
 
-/// 新命名空间里连自己的虚拟地址时源地址绑的 127.a.b.254：换回来是这个命名空间的虚拟地址
-/// （guest 的 127.0.0.254 因此当作虚拟地址报告）。
+/// 127.a.b.254, which a new namespace binds as the source when connecting to its own virtual
+/// address: translated back, it is this namespace's virtual address (so the guest's 127.0.0.254
+/// is reported as the virtual address).
 const SELF_VIA_VADDR: u8 = 254;
 
 impl World {
@@ -77,12 +82,13 @@ impl World {
         &self.all[0]
     }
 
-    /// 宿主上的回环地址段 127.a.b.0/24 是哪个新命名空间的。
+    /// Which new namespace the host loopback block 127.a.b.0/24 belongs to.
     fn by_block(&self, a: u8, b: u8) -> Option<&Rc<NetNs>> {
         self.all.iter().find(|n| n.host_net == Some([a, b]))
     }
 
-    /// 虚拟地址 `ip` 在哪个命名空间（除了 `me`）：有好几个时取 `me` 有直连路由的网段里的。
+    /// Which namespace (other than `me`) has virtual address `ip`: when several do, the one in a
+    /// subnet `me` has a directly connected route to.
     fn owner(&self, me: &NetNs, ip: [u8; 4]) -> Option<&Rc<NetNs>> {
         let mut found = self.all.iter().filter(|n| {
             !std::ptr::eq(n.as_ref(), me)
@@ -98,7 +104,7 @@ impl World {
     }
 }
 
-/// `me` 里的直连网段（虚拟设备上没有网关、不是 /32 的路由）。
+/// The directly connected subnets in `me` (routes on virtual devices with no gateway, not /32).
 fn connected(me: &NetNs) -> Vec<([u8; 4], u8)> {
     crate::netdev::entries(me)
         .into_iter()
@@ -112,7 +118,8 @@ fn covers(net: [u8; 4], prefix: u8, ip: [u8; 4]) -> bool {
     u32::from_be_bytes(net) & mask == u32::from_be_bytes(ip) & mask
 }
 
-/// 开机时的命名空间里虚拟地址 `v` 在宿主上的回环地址（127.255.x.y），没有就分配一个。
+/// The host loopback address (127.255.x.y) of virtual address `v` in the initial namespace,
+/// allocated if there is none.
 pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> [u8; 4] {
     let mut d = init.devs.borrow_mut();
     if let Some((_, h)) = d.hostmap.iter().find(|(g, _)| *g == v) {
@@ -129,7 +136,7 @@ pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> [u8; 4] {
     h
 }
 
-/// 宿主上的 127.255.x.y 是开机时的命名空间里哪个虚拟地址。
+/// Which virtual address in the initial namespace the host's 127.255.x.y stands for.
 fn init_guest(init: &NetNs, h: [u8; 4]) -> Option<[u8; 4]> {
     init.devs
         .borrow()
@@ -139,7 +146,8 @@ fn init_guest(init: &NetNs, h: [u8; 4]) -> Option<[u8; 4]> {
         .map(|(g, _)| *g)
 }
 
-/// `m` 里面向 `me` 的那个虚拟地址：在 `me` 有直连路由的网段里的，没有就是第一个。
+/// The virtual address of `m` that faces `me`: one in a subnet `me` has a directly connected
+/// route to, otherwise the first.
 fn facing(m: &NetNs, me: &NetNs) -> Option<[u8; 4]> {
     let mine = crate::netdev::local_v4(m);
     let direct = connected(me);
@@ -149,8 +157,9 @@ fn facing(m: &NetNs, me: &NetNs) -> Option<[u8; 4]> {
         .map(|(a, _)| *a)
 }
 
-/// `me` 发往 `ip` 时的源地址（`inet_select_addr`）：路由的首选源地址，没有时取出口接口上
-/// 的地址，再没有就是 `me` 的第一个虚拟地址。
+/// The source address when `me` sends to `ip` (`inet_select_addr`): the route's preferred
+/// source, otherwise an address on the outgoing interface, otherwise `me`'s first virtual
+/// address.
 fn source(me: &NetNs, ip: [u8; 4]) -> Option<[u8; 4]> {
     let r = crate::netdev::route_v4(me, ip);
     r.as_ref()
@@ -160,7 +169,7 @@ fn source(me: &NetNs, ip: [u8; 4]) -> Option<[u8; 4]> {
         .or_else(|| crate::netdev::local_v4(me).first().map(|(a, _)| *a))
 }
 
-/// sockaddr 里的 IPv4 地址（IPv4 映射的 IPv6 地址取 IPv4 的部分）。
+/// The IPv4 address in a sockaddr (for an IPv4-mapped IPv6 address, the IPv4 part).
 fn ipv4_of(addr: &[u8]) -> Option<[u8; 4]> {
     match family(addr) {
         Some(AF_INET) if addr.len() >= 8 => addr[4..8].try_into().ok(),
@@ -169,7 +178,8 @@ fn ipv4_of(addr: &[u8]) -> Option<[u8; 4]> {
     }
 }
 
-/// 把 sockaddr 里的 IPv4 地址换成 `ip`（AF_INET6 的写成 IPv4 映射的，scope id 清零）。
+/// Replaces the IPv4 address in a sockaddr with `ip` (written IPv4-mapped for AF_INET6, with the
+/// scope id cleared).
 fn with_ipv4(addr: &[u8], ip: [u8; 4]) -> Vec<u8> {
     let mut out = addr.to_vec();
     if family(addr) == Some(AF_INET) {
@@ -185,16 +195,19 @@ fn with_ipv4(addr: &[u8], ip: [u8; 4]) -> Vec<u8> {
     out
 }
 
-/// guest 的地址换成宿主上的，结果（[`to_host`]）。
+/// A guest address translated to the host's, the result of [`to_host`].
 pub(crate) struct Mapped {
     pub addr: Vec<u8>,
-    /// 目的地在哪个网络命名空间（低端口映射按它的）；None 是交给宿主的网络（经由默认路由
-    /// 出去的、开机时的命名空间里不是虚拟地址的）。
+    /// The network namespace of the destination (low-port mapping goes by it); None means it is
+    /// handed to the host network (going out through the default route, or not a virtual address
+    /// in the initial namespace).
     pub target: Option<Rc<NetNs>>,
-    /// socket 还没绑定时先绑到这个宿主地址（端口 0）：新的命名空间里是它的 127.a.b.1，开机时
-    /// 的命名空间里连别的命名空间时是面向对方的虚拟地址在宿主上的那个。
+    /// Host address (port 0) an unbound socket is bound to first: in a new namespace, its
+    /// 127.a.b.1; in the initial namespace connecting to another namespace, the host address of
+    /// the virtual address facing the other side.
     pub source: Option<Vec<u8>>,
-    /// 新的命名空间里绑在虚拟地址上（宿主上是 127.a.b.1，getsockname 报告它）。
+    /// Bound to a virtual address in a new namespace (127.a.b.1 on the host; getsockname reports
+    /// the virtual address).
     pub vaddr: Option<[u8; 4]>,
 }
 
@@ -209,24 +222,28 @@ impl Mapped {
     }
 }
 
-/// guest 给的地址换成宿主上的（bind、connect、sendto）。不是 IPv4、IPv6 的（AF_UNSPEC 断开）
-/// 原样返回。
+/// Translates an address given by the guest to the host's (bind, connect, sendto). Addresses
+/// that are neither IPv4 nor IPv6 (AF_UNSPEC disconnects) are returned unchanged.
 ///
-/// 新的网络命名空间（127.a.b.0/24）：
-/// - 127.0.0.x 是 127.a.b.x，通配地址只在 bind 时可以，lo 没起来、没有地址时到不了
-///   （[`Loopback::has_v4`]）；::1、:: 是 IPv4 映射的 127.a.b.1。`icmp6` 是 ICMPv6 的 socket：
-///   它发不到 IPv4 映射的地址，::1 换成宿主真正的 ::1（echo 由宿主内核回答），通配地址也
-///   绑到 ::1。
-/// - 自己的虚拟设备上的地址也是 127.a.b.1（与通配地址相同，监听通配地址的服务从哪个地址都
-///   连得到）。
-/// - 别的命名空间的虚拟地址：要有经由虚拟设备的路由（没有是 ENETUNREACH），换成那个命名
-///   空间的 127.c.d.1，开机时的命名空间里的换成它的 127.255.x.y。
-/// - 不是谁的虚拟地址：经由网关的路由（默认路由）到得了的交给宿主网络，原样；直连网段里
-///   没有这个地址是 EHOSTUNREACH；没有路由是 ENETUNREACH。
-/// - 别的地址绑不上（EADDRNOTAVAIL）。
+/// A new network namespace (127.a.b.0/24):
+/// - 127.0.0.x is 127.a.b.x, the wildcard address is allowed only for bind, and 127.0.0.x is
+///   unreachable while lo is down or has no address ([`Loopback::has_v4`]); ::1 and :: are the
+///   IPv4-mapped 127.a.b.1. `icmp6` means an ICMPv6 socket: it cannot send to IPv4-mapped
+///   addresses, so ::1 becomes the host's real ::1 (echo is answered by the host kernel), and the
+///   wildcard address is bound to ::1 as well.
+/// - Addresses on its own virtual devices are 127.a.b.1 too (the same as the wildcard address, so
+///   a service listening on the wildcard address is reachable through any of them).
+/// - Another namespace's virtual address: needs a route through a virtual device (ENETUNREACH
+///   without one) and becomes that namespace's 127.c.d.1; those of the initial namespace become
+///   its 127.255.x.y.
+/// - An address that is nobody's virtual address: reachable through a route via a gateway (the
+///   default route), it is handed to the host network unchanged; missing from a directly
+///   connected subnet, EHOSTUNREACH; with no route, ENETUNREACH.
+/// - Other addresses cannot be bound (EADDRNOTAVAIL).
 ///
-/// 开机时的命名空间：自己的虚拟地址换成 127.255.x.y；经由虚拟设备的路由到得了的别的命名
-/// 空间的虚拟地址同上；别的原样。
+/// The initial namespace: its own virtual addresses become 127.255.x.y; another namespace's
+/// virtual addresses reachable through a route over a virtual device are handled as above; the
+/// rest are unchanged.
 pub(crate) fn to_host(
     w: &World,
     me: &Rc<NetNs>,
@@ -276,13 +293,14 @@ pub(crate) fn to_host(
                 return Ok(mapped_to(block(1), me, None));
             }
             if ip == LOOPBACK6 {
-                // 没有 ::1 时连接选不出源地址
+                // Without ::1 a connection cannot choose a source address
                 if !(lo.up && lo.v6) {
                     return Err(Errno::EADDRNOTAVAIL);
                 }
                 return Ok(mapped_to(block(1), me, None));
             }
-            // 别的 IPv6 地址：经由虚拟设备的路由出去的交给宿主网络
+            // Other IPv6 addresses: those going out through a route over a virtual device are
+            // handed to the host network
             if usage == Use::Reach && crate::netdev::routes_v6(me, &ip) {
                 return Ok(Mapped::plain(addr));
             }
@@ -308,7 +326,8 @@ pub(crate) fn to_host(
                 if usage == Use::Bind {
                     return Ok(mapped_to(block(1), me, Some(ip)));
                 }
-                // 连自己的虚拟地址：源地址绑到 127.a.b.254，两边都换回虚拟地址
+                // Connecting to its own virtual address: the source is bound to 127.a.b.254, and
+                // both ends translate back to the virtual address
                 let mut m = mapped_to(block(1), me, None);
                 m.source = m.source.map(|s| with_ipv4(&s, block(SELF_VIA_VADDR)));
                 return Ok(m);
@@ -319,7 +338,8 @@ pub(crate) fn to_host(
             let route = crate::netdev::route_v4(me, ip).ok_or_else(fail)?;
             match w.owner(me, ip) {
                 Some(m) => Ok(mapped_to(host_of(w, m, ip), m, None)),
-                // 交给宿主网络（经由网关出去）：不先绑回环地址，绑了就出不去
+                // Handed to the host network (going out through the gateway): no loopback address
+                // is bound first, or the traffic could not get out
                 None if route.gateway.is_some() => Ok(Mapped::plain(addr)),
                 None => Err(Errno::EHOSTUNREACH),
             }
@@ -329,8 +349,8 @@ pub(crate) fn to_host(
     }
 }
 
-/// 别的命名空间 `m` 里的虚拟地址 `ip` 在宿主上是哪个：新命名空间的 127.c.d.1，开机时的
-/// 127.255.x.y。
+/// The host address of virtual address `ip` in another namespace `m`: 127.c.d.1 for a new
+/// namespace, 127.255.x.y for the initial one.
 fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> [u8; 4] {
     match m.host_net {
         Some([c, d]) => [127, c, d, 1],
@@ -338,7 +358,7 @@ fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> [u8; 4] {
     }
 }
 
-/// 开机时的命名空间里的 [`to_host`]。
+/// [`to_host`] in the initial namespace.
 fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Mapped, Errno> {
     let Some(ip) = ipv4_of(addr).filter(|ip| ip[0] != 127 && *ip != [0; 4]) else {
         return Ok(Mapped::plain(addr));
@@ -354,7 +374,7 @@ fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Ma
     if usage == Use::Bind {
         return Ok(Mapped::plain(addr));
     }
-    // 只看经由虚拟设备的路由：宿主的网段归宿主
+    // Only routes through virtual devices count: the host's subnets belong to the host
     let Some(route) = crate::netdev::route_v4(me, ip) else {
         return Ok(Mapped::plain(addr));
     };
@@ -373,7 +393,7 @@ fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Ma
     }
 }
 
-/// 与 `addr` 同一地址族、端口为 0 的通配地址。
+/// The wildcard address of the same family as `addr`, with port 0.
 pub(crate) fn any_like(addr: &[u8]) -> Vec<u8> {
     let mut s = vec![
         0u8;
@@ -387,12 +407,13 @@ pub(crate) fn any_like(addr: &[u8]) -> Vec<u8> {
     s
 }
 
-/// 宿主地址是什么角色（[`from_host`]）。
+/// The role of a host address ([`from_host`]).
 pub(crate) enum Role<'a> {
-    /// 对端。
+    /// The peer.
     Peer,
-    /// 本端：guest 绑的是通配地址、还没有连接（报告通配地址），绑在虚拟地址上（宿主上是
-    /// 127.a.b.1），对端的宿主地址（面向它的那个地址）。
+    /// The local end: whether the guest bound the wildcard address and is not connected yet
+    /// (reporting the wildcard address), the virtual address it is bound to (127.a.b.1 on the
+    /// host), and the peer's host address (the local address facing it).
     Local {
         any: bool,
         vaddr: Option<[u8; 4]>,
@@ -400,11 +421,13 @@ pub(crate) enum Role<'a> {
     },
 }
 
-/// 宿主给的地址（本端、对端）换成 `me` 里的进程看到的：自己的段 127.a.b.x 是 127.0.0.x
-/// （127.a.b.1 也可能是连到它的 IPv4 的 127.0.0.1、::1，分不出来时按地址族），别的命名
-/// 空间的 127.c.d.1 是那个命名空间面向 `me` 的虚拟地址，127.255.x.y 是开机时的命名空间
-/// 里的虚拟地址。新的命名空间里经由宿主网络出去的连接，本端的宿主地址换成这个命名空间
-/// 发往对端时的源地址。`icmp6` 见 [`to_host`]。
+/// Translates an address given by the host (local or peer) to what processes in `me` see: its own
+/// block 127.a.b.x is 127.0.0.x (127.a.b.1 may also be the IPv4 127.0.0.1 or the ::1 that was
+/// connected to, decided by the address family when it cannot be told apart), another
+/// namespace's 127.c.d.1 is that namespace's virtual address facing `me`, and 127.255.x.y is a
+/// virtual address of the initial namespace. For a connection in a new namespace going out
+/// through the host network, the local host address becomes the source address this namespace
+/// uses toward the peer. For `icmp6` see [`to_host`].
 pub(crate) fn from_host(
     w: &World,
     me: &NetNs,
@@ -434,7 +457,7 @@ pub(crate) fn from_host(
     if x == [0; 4] {
         return out;
     }
-    // 从外面转发进来的连接（crate::forward）：客户端真实的地址和端口
+    // A connection forwarded in from outside (crate::forward): the client's real address and port
     if x[..2] == [127, crate::forward::OUTSIDE_BLOCK]
         && let Some((ip, port)) =
             crate::forward::outside_peer(x, u16::from_be_bytes([addr[2], addr[3]]))
@@ -457,13 +480,15 @@ pub(crate) fn from_host(
                     if let Some(v) = vaddr.filter(|_| x[3] == 1) {
                         return with_ipv4(addr, v);
                     }
-                    // 自己连自己的虚拟地址：本端也是虚拟地址
+                    // Connected to its own virtual address: the local end is the virtual address
+                    // too
                     if peer.and_then(ipv4_of) == Some([127, a, b, SELF_VIA_VADDR])
                         && let Some(v) = first()
                     {
                         return with_ipv4(addr, v);
                     }
-                    // 别的命名空间连过来的：本端是面向对方的那个地址
+                    // Connected from another namespace: the local end is the address facing the
+                    // other side
                     let remote = peer
                         .and_then(ipv4_of)
                         .filter(|p| p[0] != 127 || p[1..3] != [a, b]);
@@ -477,7 +502,8 @@ pub(crate) fn from_host(
                 if family(addr) == Some(AF_INET) {
                     out[4..8].copy_from_slice(&[127, 0, 0, x[3]]);
                 } else if x[3] == 1 {
-                    // 127.a.b.1 是 guest 的 ::1（也可能是连到它的 IPv4 的 127.0.0.1）
+                    // 127.a.b.1 is the guest's ::1 (or possibly the IPv4 127.0.0.1 that was
+                    // connected to)
                     out[8..24].copy_from_slice(&LOOPBACK6);
                 } else {
                     out[20..24].copy_from_slice(&[127, 0, 0, x[3]]);
@@ -487,7 +513,8 @@ pub(crate) fn from_host(
             if let Some(g) = remote_guest(w, me, x) {
                 return with_ipv4(addr, g);
             }
-            // 经由宿主网络出去的连接：本端是这个命名空间的源地址
+            // A connection going out through the host network: the local end is this
+            // namespace's source address
             if x[0] != 127
                 && let Role::Local { peer, .. } = &role
                 && let Some(s) = peer
@@ -503,9 +530,10 @@ pub(crate) fn from_host(
     }
 }
 
-/// 新的网络命名空间 `t` 里有没有在 guest 地址 `dst`（sockaddr，`t` 里看到的）上监听着的 TCP
-/// socket（[`crate::nsproxy::Listener`]）：通配地址的接受 IPv4 和 IPv6（AF_INET 的只接受
-/// IPv4，设了 `IPV6_V6ONLY` 的只接受 IPv6），绑在某个地址上的只接受发往它的。
+/// Whether a TCP socket ([`crate::nsproxy::Listener`]) in new network namespace `t` is listening
+/// on guest address `dst` (a sockaddr, as seen in `t`): a wildcard listener accepts IPv4 and IPv6
+/// (an AF_INET one only IPv4, one with `IPV6_V6ONLY` set only IPv6), and one bound to an address
+/// accepts only what is sent to it.
 pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
     let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
         return true;
@@ -526,8 +554,9 @@ pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
     })
 }
 
-/// [`add_listener`] 登记的：guest 的端口、绑的是不是通配地址、绑的虚拟地址、宿主上的本端、
-/// 地址族和 `IPV6_V6ONLY`、是不是 UDP。
+/// What [`add_listener`] records: the guest port, whether the wildcard address is bound, the
+/// virtual address bound, the local end on the host, the address family and `IPV6_V6ONLY`, and
+/// whether it is UDP.
 #[derive(Clone, Copy)]
 pub(crate) struct ListenAt<'a> {
     pub port: u16,
@@ -539,7 +568,8 @@ pub(crate) struct ListenAt<'a> {
     pub udp: bool,
 }
 
-/// 新的网络命名空间里的 TCP socket 开始监听、UDP socket 绑定：登记它（[`listening`]）。
+/// A TCP socket in a new network namespace starts listening, or a UDP socket binds: records it
+/// ([`listening`]).
 pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64 {
     let ListenAt {
         port,
@@ -552,7 +582,8 @@ pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64
     } = *l;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // 绑的 guest 地址：虚拟地址；127.a.b.x 是 127.0.0.x，AF_INET6 的 127.a.b.1 是 ::1
+    // The guest address bound: the virtual address; 127.a.b.x is 127.0.0.x, and AF_INET6
+    // 127.a.b.1 is ::1
     let addr = if any {
         None
     } else if let Some(v) = vaddr {
@@ -560,7 +591,8 @@ pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64
     } else {
         match ipv4_of(host) {
             Some([_, _, _, 1]) if v6 && mapped(&host[8..24]).is_some() => Some(LOOPBACK6.to_vec()),
-            // 发给自己的虚拟地址时绑的 127.a.b.254：收的是发往虚拟地址的
+            // 127.a.b.254, bound when sending to its own virtual address: it receives what is
+            // sent to the virtual address
             Some([_, _, _, SELF_VIA_VADDR]) => {
                 crate::netdev::local_v4(me).first().map(|(a, _)| a.to_vec())
             }
@@ -579,14 +611,16 @@ pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64
     std::num::NonZeroU64::new(id).expect("starts at 1")
 }
 
-/// 宿主地址 `host` 是 `me` 的 127.a.b.254（发给自己的虚拟地址时绑的源地址）。
+/// Whether host address `host` is `me`'s 127.a.b.254 (the source bound when sending to its own
+/// virtual address).
 pub(crate) fn is_self_source(me: &NetNs, host: &[u8]) -> bool {
     matches!((me.host_net, ipv4_of(host)), (Some([a, b]), Some(x)) if x == [127, a, b, SELF_VIA_VADDR])
 }
 
-/// `me` 里的数据报发往自己的虚拟地址 `dst`（guest 的）：端口是绑在 127.a.b.254 上的 socket
-/// 的（[`crate::nsproxy::Loopback::self_udp`]，发给自己的虚拟地址的客户端，这是对它的回答）
-/// 时，宿主上的目的地 `host` 换成 127.a.b.254。
+/// A datagram in `me` sent to its own virtual address `dst` (the guest's): when the port is that
+/// of a socket bound to 127.a.b.254 ([`crate::nsproxy::Loopback::self_udp`], a client that sent to
+/// its own virtual address, so this is the reply to it), the host destination `host` becomes
+/// 127.a.b.254.
 pub(crate) fn toward_self(me: &NetNs, dst: &[u8], host: Vec<u8>) -> Vec<u8> {
     let (Some([a, b]), Some(ip)) = (me.host_net, ipv4_of(dst)) else {
         return host;
@@ -600,8 +634,9 @@ pub(crate) fn toward_self(me: &NetNs, dst: &[u8], host: Vec<u8>) -> Vec<u8> {
     host
 }
 
-/// 绑在 127.a.b.254 上的 socket 收到来自 127.a.b.1 的数据报（`host` 是来源）：对方发往的是
-/// 自己的虚拟地址，来源也是它（[`toward_self`]）。
+/// A socket bound to 127.a.b.254 receives a datagram from 127.a.b.1 (`host` is the source): the
+/// other side sent it to its own virtual address, so the source is that address too
+/// ([`toward_self`]).
 pub(crate) fn from_self(me: &NetNs, host: &[u8]) -> Option<Vec<u8>> {
     let ([a, b], x) = (me.host_net?, ipv4_of(host)?);
     if x != [127, a, b, 1] {
@@ -611,18 +646,19 @@ pub(crate) fn from_self(me: &NetNs, host: &[u8]) -> Option<Vec<u8>> {
     Some(with_ipv4(host, v))
 }
 
-/// `me` 里发往 guest 地址 `peer` 时的本端：`local`（宿主上的本端，取它的端口）换成发往它时
-/// 的源地址。
+/// The local end in `me` when sending to guest address `peer`: `local` (the local end on the
+/// host, whose port is kept) with the source address used toward the peer.
 pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<u8>> {
     let ip = ipv4_of(peer)?;
     let src = source(me, ip)?;
     Some(with_ipv4(local, src))
 }
 
-/// nftables 的 OUTPUT nat（[`crate::nft::Nft::nat`]）：`me` 里协议 `proto`（TCP、UDP）
-/// 发往 guest 地址 `dst`（sockaddr）的连接、数据报。DNAT 了的返回新的目的地址，规则丢弃时
-/// 是 EPERM。`vaddr` 是 socket 绑的虚拟地址（源地址；没有时按路由选），`sport` 取本端端口，
-/// `mark` 是 socket 的 `SO_MARK`。
+/// nftables OUTPUT nat ([`crate::nft::Nft::nat`]): a connection or datagram in `me` with protocol
+/// `proto` (TCP, UDP) to guest address `dst` (a sockaddr). Returns the new destination when
+/// DNATed, and EPERM when a rule drops it. `vaddr` is the virtual address the socket is bound to
+/// (the source; chosen by route when absent), `sport` is the local port, and `mark` is the
+/// socket's `SO_MARK`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output_nat(
     me: &NetNs,
@@ -662,13 +698,16 @@ pub(crate) fn output_nat(
     hook_nat(me, &packet, dst)
 }
 
-/// `me` 里发往 guest 地址 `dst` 的连接、数据报（已经换成宿主上的 `m`）进入的别的命名空间，
-/// 那里的 PREROUTING 要执行（[`prerouting_nat`]）：
-/// - 目的地在别的命名空间（虚拟地址）；
-/// - 新命名空间里经由宿主网络出去时进入开机时的命名空间：网关是它的地址（容器经由外层的
-///   bridge 连外网），或者目的地是它的本机地址（宿主的地址：容器连外层地址上发布的端口）。
-///   外层的 PREROUTING 对从 bridge 来的做 REDIRECT、DNAT，就能透明代理、劫持容器连外网的
-///   连接和 DNS。网关在别的命名空间里（路由器那样的"容器"）时不经过谁的 PREROUTING。
+/// The other namespace that a connection or datagram in `me` to guest address `dst` (already
+/// translated to the host's `m`) enters, whose PREROUTING must run ([`prerouting_nat`]):
+/// - the destination is in another namespace (a virtual address);
+/// - going out through the host network from a new namespace enters the initial namespace when
+///   the gateway is its address (a container reaching the outside through the outer bridge), or
+///   the destination is one of its local addresses (a host address: a container connecting to a
+///   port published on an outer address). With REDIRECT and DNAT in the outer PREROUTING for
+///   traffic from the bridge, a container's outside connections and DNS can be transparently
+///   proxied or hijacked. When the gateway is in another namespace (a router-like "container"),
+///   nobody's PREROUTING is passed.
 pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Option<Rc<NetNs>> {
     match &m.target {
         Some(t) if !Rc::ptr_eq(t, me) => Some(t.clone()),
@@ -688,16 +727,17 @@ pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Opt
     }
 }
 
-/// 开机时的命名空间 `init` 里的本机地址（宿主的接口、lo 和虚拟设备上的）。
+/// Local addresses in the initial namespace `init` (on host interfaces, lo and virtual devices).
 fn init_local(init: &NetNs, ip: [u8; 4]) -> bool {
     crate::netdev::interfaces(init)
         .iter()
         .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
 }
 
-/// 从别的命名空间 `from` 进入 `t` 的连接、数据报（目的地是 `t` 的地址，guest 的 sockaddr
-/// `dst`；虚拟地址对谁都一样）经过 `t` 的 PREROUTING nat：DNAT 了的返回 `t` 里看到的新的目的
-/// 地址。源地址是 `from` 发往它时选的，入口接口是 `t` 里面向这个源地址的接口。
+/// A connection or datagram entering `t` from another namespace `from` (to an address of `t`,
+/// guest sockaddr `dst`; virtual addresses are the same for everyone) passes `t`'s PREROUTING nat:
+/// returns the new destination as seen in `t` when DNATed. The source address is the one `from`
+/// chooses toward it, and the input interface is the interface in `t` facing that source.
 pub(crate) fn prerouting_nat(
     from: &NetNs,
     t: &NetNs,
@@ -738,9 +778,11 @@ pub(crate) fn prerouting_nat(
     hook_nat(t, &packet, dst)
 }
 
-/// 从宿主外面（别的设备、手机上的别的 App）连到开机时的命名空间 `init` 里监听着的
-/// `dst`（guest 的 sockaddr，通配地址换成宿主的一个地址）时 PREROUTING nat 的结果：源地址
-/// 当作 192.0.2.1（TEST-NET-1），入口接口是宿主上第一个有 IPv4 地址、不是回环的接口。
+/// The PREROUTING nat result for a connection from outside the host (another device, another app
+/// on the phone) to `dst` listening in the initial namespace `init` (a guest sockaddr, with the
+/// wildcard address replaced by one of the host's addresses): the source is taken to be 192.0.2.1
+/// (TEST-NET-1), and the input interface is the host's first non-loopback interface with an IPv4
+/// address.
 pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8>> {
     if !init.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
         return None;
@@ -764,12 +806,13 @@ pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8
     hook_nat(init, &packet, &dst).ok().flatten()
 }
 
-/// 从外面来的包的源地址（TEST-NET-1）。
+/// Source address of packets from outside (TEST-NET-1).
 const EXTERNAL: [u8; 4] = [192, 0, 2, 1];
 
-/// 从宿主外面经由开机时的命名空间 `init` 转到 DNAT 的目的地 `there`（guest 地址，在
-/// 命名空间 `t` 里）：过 `init` 的 FORWARD（入口是宿主的接口）和 `t` 的 PREROUTING、INPUT 上
-/// 的 filter 链，丢弃、reject 了的不转发。
+/// Forwarding from outside the host through the initial namespace `init` to the DNAT
+/// destination `there` (a guest address in namespace `t`): passes `init`'s FORWARD (entering on
+/// the host's interface) and the filter chains on `t`'s PREROUTING and INPUT; what is dropped or
+/// rejected is not forwarded.
 pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there: &[u8]) -> bool {
     use crate::nft::{HOOK_PRE_ROUTING, Outcome};
     const HOOK_LOCAL_IN: u32 = 1;
@@ -826,7 +869,7 @@ pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there:
     true
 }
 
-/// 合成的包里 socket 以外的部分（[`hook_nat`]）。
+/// The parts of a synthetic packet besides the socket ([`hook_nat`]).
 struct NatPacket {
     hook: u32,
     proto: u8,
@@ -836,11 +879,12 @@ struct NatPacket {
     gid: u32,
     iif: Option<crate::nft::Iif>,
     ct_state: u32,
-    /// 包一开始的标记（[`crate::nft::Packet::mark`]）。
+    /// The packet's initial mark ([`crate::nft::Packet::mark`]).
     mark: u32,
 }
 
-/// sockaddr 里要按哪种包判断：(地址, 是不是 IPv4)。IPv4 映射的 IPv6 地址按 IPv4 的包。
+/// Which kind of packet a sockaddr is judged as: (address, is IPv4). IPv4-mapped IPv6 addresses
+/// count as IPv4 packets.
 fn nat_ip(dst: &[u8]) -> Option<(Vec<u8>, bool)> {
     match (family(dst), ipv4_of(dst)) {
         (Some(AF_INET | AF_INET6), Some(x)) => Some((x.to_vec(), true)),
@@ -853,8 +897,9 @@ fn is_loopback(a: &[u8]) -> bool {
     (a.len() == 4 && a[0] == 127) || a == std::net::Ipv6Addr::LOCALHOST.octets()
 }
 
-/// `ns` 的钩子 `p.hook` 上的 nat（[`crate::nft::Nft::nat`]）：发往 guest 地址 `dst` 的包，
-/// DNAT 了的返回新的目的地址（端口没换的照旧），规则丢弃时是 EPERM。
+/// nat on hook `p.hook` of `ns` ([`crate::nft::Nft::nat`]): for a packet to guest address `dst`,
+/// returns the new destination when DNATed (keeping the port when it is not changed), and EPERM
+/// when a rule drops it.
 fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
     let Some((_, v4)) = nat_ip(dst) else {
         return Ok(None);
@@ -878,8 +923,9 @@ fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Er
     }
 }
 
-/// 按 `p` 合成发往 `dst` 的包，跑 `ns` 的钩子 `p.hook` 上的 filter 链（`filter`）或者 nat 链。
-/// `oif` 是给定的出口接口的名字（FORWARD 上），None 时按路由。
+/// Builds a packet to `dst` from `p` and runs the filter chains (`filter`) or the nat chains on
+/// hook `p.hook` of `ns`. `oif` is the name of a given output interface (on FORWARD); with None,
+/// it is chosen by route.
 fn hook_eval(
     ns: &NetNs,
     p: &NatPacket,
@@ -902,7 +948,8 @@ fn hook_eval(
         vec![0; ip.len()]
     };
     let addr_type = |a: &[u8]| crate::nft::addr_type(a, local);
-    // 出口接口的编号和名字：给了名字的（FORWARD 上）按名字找，本机的是 lo，别的按路由
+    // Index and name of the output interface: by name when one is given (on FORWARD), lo for
+    // local addresses, otherwise by route
     let oif = || -> (u32, Vec<u8>) {
         let found = |f: &dyn Fn(&appine_hal::net::Interface) -> bool| {
             crate::netdev::interfaces(ns)
@@ -945,8 +992,8 @@ fn hook_eval(
     }
 }
 
-/// `t` 里面向 IPv4 地址 `src` 的接口（包从 `src` 来时进来的那个）：直连的网段所在的，
-/// 没有时是默认路由的出口。
+/// The interface in `t` facing IPv4 address `src` (the one packets from `src` come in on): the
+/// one with the directly connected subnet, otherwise the default route's output interface.
 fn iif_facing(t: &NetNs, src: [u8; 4]) -> crate::nft::Iif {
     let Some(e) = crate::netdev::route_v4(t, src) else {
         return Default::default();
@@ -965,7 +1012,8 @@ fn iif_facing(t: &NetNs, src: [u8; 4]) -> crate::nft::Iif {
     }
 }
 
-/// 宿主上第一个有 IPv4 地址、不是回环的接口：从外面进来的包的入口，出到外面的包的出口。
+/// The host's first non-loopback interface with an IPv4 address: the input interface of packets
+/// from outside and the output interface of packets going outside.
 fn outer_iface(init: &NetNs) -> Option<(crate::nft::Iif, [u8; 4])> {
     crate::netdev::interfaces(init).into_iter().find_map(|i| {
         let a = i
@@ -984,7 +1032,8 @@ fn outer_iface(init: &NetNs) -> Option<(crate::nft::Iif, [u8; 4])> {
     })
 }
 
-/// [`path_filter`] 里包依次进入的一个命名空间：钩子、入口接口、出口接口（FORWARD 上）。
+/// One namespace a packet enters in turn in [`path_filter`]: the hook, the input interface and
+/// the output interface (on FORWARD).
 struct Step<'a> {
     ns: &'a Rc<NetNs>,
     hook: u32,
@@ -998,35 +1047,37 @@ impl<'a> Step<'a> {
     }
 }
 
-/// [`path_filter`] 的参数：包是什么样的。
+/// Arguments of [`path_filter`]: what the packet looks like.
 pub(crate) struct Flow<'a> {
     pub proto: u8,
-    /// socket 绑的虚拟地址（源地址；没有时按路由选）。
+    /// The virtual address the socket is bound to (the source; chosen by route when absent).
     pub vaddr: Option<[u8; 4]>,
     pub sport: u16,
-    /// OUTPUT nat 之后 `me` 里看到的目的地。
+    /// The destination as seen in `me` after OUTPUT nat.
     pub dst: &'a [u8],
-    /// 到了目的地的命名空间里看到的（PREROUTING nat 之后）。
+    /// As seen on arrival in the destination's namespace (after PREROUTING nat).
     pub there: &'a [u8],
     pub uid: u32,
     pub gid: u32,
-    /// UDP 回给收到过的对方（连接跟踪的 ESTABLISHED）。
+    /// UDP replying to a peer it has received from (conntrack ESTABLISHED).
     pub established: bool,
-    /// socket 的 `SO_MARK`：OUTPUT 和经由 lo 回到自己的命名空间的包带着它，经由 veth 进入
-    /// 别的命名空间时清掉。
+    /// The socket's `SO_MARK`: packets on OUTPUT and those coming back to their own namespace
+    /// through lo carry it; it is cleared when entering another namespace through a veth.
     pub mark: u32,
 }
 
-/// `me` 里的 socket 发出的连接、数据报经过的过滤链（docs/rounds/175-filter.md），只看 IPv4：
+/// The filter chains a connection or datagram sent by a socket in `me` passes
+/// (docs/rounds/175-filter.md), IPv4 only:
 ///
-/// 1. `me` 的 OUTPUT。
-/// 2. 新命名空间里的，经由开机时的命名空间：出到宿主网络（`t` 是 None）走它的 FORWARD，出口是
-///    宿主的接口；到它自己走 INPUT；到别的命名空间而目的地不在 `me` 的直连网段里（经由网关）
-///    走 FORWARD。
-/// 3. 到了目的地的命名空间 `t`：INPUT（开机时的命名空间见上）。
+/// 1. `me`'s OUTPUT.
+/// 2. From a new namespace, through the initial namespace: going out to the host network (`t` is
+///    None) takes its FORWARD, with a host interface as the output; going to it takes INPUT; going
+///    to another namespace whose destination is not in `me`'s directly connected subnets (through
+///    a gateway) takes FORWARD.
+/// 3. On arrival in the destination's namespace `t`: INPUT (for the initial namespace see above).
 ///
-/// 进入一个命名空间时先过它 PREROUTING 上的 filter 链（raw 表这些）。返回结果和是不是在 OUTPUT
-/// 上丢弃、拒绝的。
+/// On entering a namespace, the filter chains on its PREROUTING (the raw table and the like) come
+/// first. Returns the result and whether it was dropped or rejected on OUTPUT.
 pub(crate) fn path_filter(
     w: &World,
     me: &Rc<NetNs>,
@@ -1074,7 +1125,7 @@ pub(crate) fn path_filter(
             return (o, true);
         }
     }
-    // 依次进入的：(命名空间, 钩子, 入口接口, 出口接口)
+    // The namespaces entered in turn: (namespace, hook, input interface, output interface)
     let init = w.init();
     let lo = crate::nft::Iif {
         index: 1,
@@ -1099,9 +1150,11 @@ pub(crate) fn path_filter(
             steps.push(Step::new(init, HOOK_LOCAL_IN, iif_facing(init, src), None))
         }
         Some(x) => {
-            // 不经由开机时的命名空间的：发往直连网段里 x 的地址（之后 x 的 PREROUTING 可能
-            // 再 DNAT）。发往网关后面的地址、外层的本机地址，在外层的 PREROUTING 上 DNAT 到
-            // x 的（容器连发布的端口、连外网被 DNAT 到别的容器），都经过外层的 FORWARD
+            // Not through the initial namespace: sent to x's address in a directly connected
+            // subnet (x's PREROUTING may DNAT it again afterwards). Sent to an address behind the
+            // gateway or to a local address of the outer namespace, and DNATed to x in the outer
+            // PREROUTING (a container connecting to a published port, or going outside and DNATed
+            // to another container): all of these pass the outer FORWARD
             let direct = crate::netdev::route_v4(me, ip).is_some_and(|e| e.gateway.is_none())
                 && !init_local(init, ip);
             if new_ns && !direct {
@@ -1121,7 +1174,7 @@ pub(crate) fn path_filter(
             let nft = ns.nft.borrow();
             (nft.has_filter(HOOK_PRE_ROUTING), nft.has_filter(hook))
         };
-        // 回环上自己发给自己的也经过 PREROUTING，Linux 一样
+        // What a namespace sends to itself over loopback also passes PREROUTING, as on Linux
         if pre {
             let o = hook_eval(
                 ns,
@@ -1144,7 +1197,8 @@ pub(crate) fn path_filter(
     (Outcome::Accept, false)
 }
 
-/// 宿主上别的命名空间的回环地址（127.c.d.1、127.255.x.y）在 `me` 里看到的虚拟地址。
+/// The virtual address seen in `me` for another namespace's loopback address on the host
+/// (127.c.d.1, 127.255.x.y).
 fn remote_guest(w: &World, me: &NetNs, x: [u8; 4]) -> Option<[u8; 4]> {
     if x[0] != 127 {
         return None;
@@ -1156,8 +1210,9 @@ fn remote_guest(w: &World, me: &NetNs, x: [u8; 4]) -> Option<[u8; 4]> {
     facing(m, me)
 }
 
-/// 宿主地址所在的命名空间（低端口映射的登记表按它，[`crate::portmap`]）：别的命名空间的
-/// 段是那个，127.255.x.y 是开机时的；别的是 None（按 socket 自己的）。
+/// The namespace a host address belongs to (the low-port mapping registry goes by it,
+/// [`crate::portmap`]): another namespace's block gives that namespace, 127.255.x.y the initial
+/// one; anything else None (the socket's own namespace is used).
 pub(crate) fn owner_of_host(w: &World, addr: &[u8]) -> Option<Rc<NetNs>> {
     let x = ipv4_of(addr).filter(|x| x[0] == 127)?;
     if x[1] == INIT_BLOCK {
@@ -1166,12 +1221,12 @@ pub(crate) fn owner_of_host(w: &World, addr: &[u8]) -> Option<Rc<NetNs>> {
     w.by_block(x[1], x[2]).cloned()
 }
 
-/// 是 IPv4、IPv6 的地址。
+/// Whether it is an IPv4 or IPv6 address.
 pub(crate) fn is_inet(addr: &[u8]) -> bool {
     matches!(family(addr), Some(AF_INET | AF_INET6))
 }
 
-/// guest 绑的是通配地址（0.0.0.0、::、::ffff:0.0.0.0）。
+/// Whether the guest bound a wildcard address (0.0.0.0, ::, ::ffff:0.0.0.0).
 pub(crate) fn is_any(addr: &[u8]) -> bool {
     match family(addr) {
         Some(AF_INET) => addr.get(4..8) == Some(&[0; 4]),
@@ -1182,7 +1237,7 @@ pub(crate) fn is_any(addr: &[u8]) -> bool {
     }
 }
 
-/// 没有绑定的 socket 先绑到的宿主地址（端口 0）。
+/// The host address (port 0) an unbound socket is bound to first.
 pub(crate) fn implicit_bind(ns: &NetNs, family: i32, icmp6: bool) -> Option<Vec<u8>> {
     let [a, b] = ns.host_net?;
     Some(if icmp6 {
@@ -1204,7 +1259,7 @@ pub(crate) fn implicit_bind(ns: &NetNs, family: i32, icmp6: bool) -> Option<Vec<
     })
 }
 
-/// lo 这个接口（netlink、procfs 的回答用）。
+/// The lo interface (for netlink and procfs answers).
 pub(crate) fn lo_interface(ns: &NetNs) -> Interface {
     let lo = ns.lo.borrow();
     let mut addrs: Vec<(i32, Vec<u8>, u8)> = lo
@@ -1229,8 +1284,9 @@ pub(crate) fn lo_interface(ns: &NetNs) -> Interface {
     }
 }
 
-/// 把 lo 打开或关上（`RTM_NEWLINK`、`SIOCSIFFLAGS`）：打开时没有 IPv4 地址就加上
-/// 127.0.0.1/8（Linux 的 `inetdev_event`），并且加上 ::1（addrconf）；关上时 ::1 随之去掉。
+/// Brings lo up or down (`RTM_NEWLINK`, `SIOCSIFFLAGS`): bringing it up adds 127.0.0.1/8 when
+/// it has no IPv4 address (Linux's `inetdev_event`), and adds ::1 (addrconf); bringing it down
+/// removes ::1 with it.
 pub(crate) fn set_up(lo: &mut Loopback, up: bool) {
     if up && !lo.up {
         if lo.v4.is_empty() {
@@ -1243,9 +1299,10 @@ pub(crate) fn set_up(lo: &mut Loopback, up: bool) {
     lo.up = up;
 }
 
-/// netlink 修改 lo 的请求（整条消息）：`RTM_NEWADDR`、`RTM_DELADDR`、`RTM_NEWLINK`
-/// （`RTM_SETLINK`）。返回 None 时不是这几种；Some 里是错误码（0 是成功）。要在命名空间的
-/// 属主里有 `CAP_NET_ADMIN`（EPERM，Linux 的 `netlink_net_capable`）。
+/// A netlink request that modifies lo (the whole message): `RTM_NEWADDR`, `RTM_DELADDR`,
+/// `RTM_NEWLINK` (`RTM_SETLINK`). None means it is none of these; Some holds the error code (0 is
+/// success). Needs `CAP_NET_ADMIN` in the namespace's owner (EPERM; Linux's
+/// `netlink_net_capable`).
 pub(crate) fn configure(ns: &NetNs, cred: &Cred, req: &[u8]) -> Option<i32> {
     const RTM_NEWLINK: u16 = 16;
     const RTM_SETLINK: u16 = 19;
@@ -1264,7 +1321,7 @@ pub(crate) fn configure(ns: &NetNs, cred: &Cred, req: &[u8]) -> Option<i32> {
     let body = &req[16..];
     let mut lo = ns.lo.borrow_mut();
     Some(match ty {
-        // struct ifinfomsg：地址族、类型、编号、标志、要改的标志
+        // struct ifinfomsg: address family, type, index, flags, flags to change
         RTM_NEWLINK | RTM_SETLINK => {
             let Some(b) = body.get(..16) else {
                 return Some(Errno::EINVAL.0);
@@ -1280,7 +1337,8 @@ pub(crate) fn configure(ns: &NetNs, cred: &Cred, req: &[u8]) -> Option<i32> {
             }
             0
         }
-        // struct ifaddrmsg：地址族、前缀长度、标志、范围、编号，后面是 IFA_LOCAL、IFA_ADDRESS
+        // struct ifaddrmsg: address family, prefix length, flags, scope, index, followed by
+        // IFA_LOCAL, IFA_ADDRESS
         _ => {
             let Some(b) = body.get(..8) else {
                 return Some(Errno::EINVAL.0);
@@ -1330,7 +1388,7 @@ pub(crate) fn configure(ns: &NetNs, cred: &Cred, req: &[u8]) -> Option<i32> {
                     }
                     (_, false) => Errno::EADDRNOTAVAIL.0,
                 },
-                // 别的 IPv6 地址到不了宿主上，不能配
+                // Other IPv6 addresses cannot reach the host, so they cannot be configured
                 (AF_INET6, Some(_)) => Errno::EOPNOTSUPP.0,
                 (AF_INET | AF_INET6, _) => Errno::EINVAL.0,
                 _ => Errno::EAFNOSUPPORT.0,
@@ -1339,8 +1397,8 @@ pub(crate) fn configure(ns: &NetNs, cred: &Cred, req: &[u8]) -> Option<i32> {
     })
 }
 
-/// 接口 ioctl（`struct ifreq`，40 字节，前 16 字节是名字）：新的命名空间里只有 lo。
-/// 返回 None 时不是这里处理的。
+/// Interface ioctls (`struct ifreq`, 40 bytes, the first 16 the name): a new namespace has only
+/// lo. None means it is not handled here.
 pub(crate) fn interface_ioctl(
     ns: &NetNs,
     cred: &Cred,
@@ -1396,7 +1454,8 @@ pub(crate) fn interface_ioctl(
             let flags = u16::from_le_bytes([data[0], data[1]]);
             set_up(&mut lo, u32::from(flags) & IFF_UP != 0);
         } else {
-            // 与 Linux 的 dev_set_mtu 一样不能小于 IPv4 的最小值 68（loopback 没有上限）
+            // As with Linux's dev_set_mtu, not below the IPv4 minimum of 68 (loopback has no
+            // upper bound)
             let mtu = i32::from_le_bytes(data[..4].try_into().unwrap());
             if mtu < 68 {
                 return Some(Err(Errno::EINVAL));
@@ -1432,7 +1491,8 @@ pub(crate) fn interface_ioctl(
     Some(Ok(()))
 }
 
-/// `SIOCGIFCONF`：配了 IPv4 地址、起来了的 lo（Linux 的 `inet_gifconf` 只列 IPv4 地址）。
+/// `SIOCGIFCONF`: lo while it is up with an IPv4 address (Linux's `inet_gifconf` lists only IPv4
+/// addresses).
 pub(crate) fn ifconf(ns: &NetNs) -> Vec<u8> {
     let lo = ns.lo.borrow();
     let mut out = Vec::new();
@@ -1483,8 +1543,8 @@ mod tests {
         set_up(&mut ns.lo.borrow_mut(), true);
     }
 
-    /// 从外面转发进来的连接（127.254.x.y，crate::forward）：对端报告成客户端真实的地址和端口，
-    /// 宿主端口对不上的不换。
+    /// Connections forwarded in from outside (127.254.x.y, crate::forward): the peer is reported
+    /// as the client's real address and port; unchanged when the host port does not match.
     #[test]
     fn outside_peers_show_the_real_client() {
         let n = Rc::new(ns());
@@ -1503,7 +1563,8 @@ mod tests {
         assert_ne!(other[4..8], [192, 168, 1, 50]);
     }
 
-    /// 监听的登记：通配地址按地址族、`IPV6_V6ONLY`，绑了地址的只接受发往它的。
+    /// Listener records: wildcard addresses go by address family and `IPV6_V6ONLY`; those bound
+    /// to an address accept only what is sent to it.
     #[test]
     fn listeners_match_like_linux() {
         let n = ns();
@@ -1575,21 +1636,21 @@ mod tests {
                 udp: false,
             },
         );
-        // 0.0.0.0：IPv4 的都行，纯 IPv6 的不行
+        // 0.0.0.0: any IPv4 works, pure IPv6 does not
         assert!(listening(&n, &v4(eth0, 7000), false));
         assert!(listening(&n, &v4([127, 0, 0, 1], 7000), false));
         assert!(!listening(&n, &v6(LOOPBACK6, 7000), false));
-        // [::] 且 IPV6_V6ONLY：只有 IPv6
+        // [::] with IPV6_V6ONLY: only IPv6
         assert!(listening(&n, &v6(LOOPBACK6, 7001), false));
         assert!(!listening(&n, &v4(eth0, 7001), false));
-        // 127.0.0.1、eth0 的地址、::1 只接受发往它的
+        // 127.0.0.1, eth0's address and ::1 accept only what is sent to them
         assert!(listening(&n, &v4([127, 0, 0, 1], 7002), false));
         assert!(!listening(&n, &v4(eth0, 7002), false));
         assert!(listening(&n, &v4(eth0, 7003), false));
         assert!(!listening(&n, &v4([127, 0, 0, 1], 7003), false));
         assert!(listening(&n, &v6(LOOPBACK6, 7004), false));
         assert!(!listening(&n, &v4([127, 0, 0, 1], 7004), false));
-        // UDP 和 TCP 分开登记
+        // UDP and TCP are registered separately
         add_listener(
             &n,
             &ListenAt {
@@ -1605,13 +1666,13 @@ mod tests {
         assert!(listening(&n, &v4(eth0, 7005), true));
         assert!(!listening(&n, &v4(eth0, 7005), false));
         assert!(!listening(&n, &v4(eth0, 7000), true));
-        // 没有监听的端口；去掉之后也没有了
+        // A port nobody listens on; and none after removal either
         assert!(!listening(&n, &v4(eth0, 7999), false));
         n.listeners.borrow_mut().retain(|l| l.id != a.get());
         assert!(!listening(&n, &v4(eth0, 7000), false));
     }
 
-    /// 只有开机时的命名空间和 `ns` 的世界里换算（只看地址）。
+    /// Translation in a world of only the initial namespace and `ns` (addresses only).
     fn th(ns: &Rc<NetNs>, addr: &[u8], usage: Use, icmp6: bool) -> Result<Vec<u8>, Errno> {
         let w = World {
             all: vec![crate::nsproxy::NsProxy::init().net, ns.clone()],
@@ -1638,7 +1699,8 @@ mod tests {
     #[test]
     fn loopback_addresses_map_to_the_namespace_range() {
         let ns = Rc::new(ns());
-        // lo 还关着：通配地址能绑，127.0.0.1 绑不上、连不到，外面的地址总是连不到
+        // lo still down: the wildcard address can be bound, 127.0.0.1 can be neither bound nor
+        // reached, and outside addresses are never reachable
         assert_eq!(
             th(&ns, &v4([0; 4], 80), Use::Bind, false).unwrap(),
             v4([127, 1, 2, 1], 80)
@@ -1673,7 +1735,7 @@ mod tests {
             th(&ns, &v4([127, 1, 0, 1], 80), Use::Bind, false),
             Err(Errno::EADDRNOTAVAIL)
         );
-        // ::1 和 :: 是 IPv4 映射的 127.a.b.1，反过来是 ::1
+        // ::1 and :: are the IPv4-mapped 127.a.b.1, and back again ::1
         let mapped = {
             let mut ip = [0u8; 16];
             ip[10..12].copy_from_slice(&[0xff, 0xff]);
@@ -1701,7 +1763,8 @@ mod tests {
             th(&ns, &v6(doc, 80), Use::Reach, false),
             Err(Errno::ENETUNREACH)
         );
-        // ICMPv6 的 socket：::1 是宿主的 ::1，通配地址也绑到它，别的照样到不了
+        // ICMPv6 sockets: ::1 is the host's ::1, the wildcard address is bound to it too, and
+        // others are still unreachable
         assert_eq!(
             th(&ns, &v6(LOOPBACK6, 0), Use::Reach, true).unwrap(),
             v6(LOOPBACK6, 0)
@@ -1716,7 +1779,7 @@ mod tests {
         );
         assert_eq!(fh(&ns, &v6(LOOPBACK6, 0), false, true), v6(LOOPBACK6, 0));
         assert_eq!(fh(&ns, &v6(LOOPBACK6, 0), true, true), v6([0; 16], 0));
-        // 开机时的命名空间不换
+        // The initial namespace does not translate
         let init = crate::nsproxy::NsProxy::init().net;
         assert_eq!(
             th(&init, &v4([8, 8, 8, 8], 53), Use::Reach, false).unwrap(),
@@ -1749,7 +1812,8 @@ mod tests {
         };
         let reach = |me: &Rc<NetNs>, ip| to_host(&w, me, &v4(ip, 80), Use::Reach, false);
         let target = |m: &Mapped| m.target.as_ref().map(|t| t.id);
-        // 别的容器、网关、外面、直连网段里没有的地址
+        // Another container, the gateway, outside, and an address missing from a directly
+        // connected subnet
         let m = reach(&a, [10, 50, 0, 3]).unwrap();
         assert_eq!(
             (m.addr.clone(), target(&m)),
@@ -1764,7 +1828,8 @@ mod tests {
             (v4([8, 8, 8, 8], 80), true, None)
         );
         assert_eq!(reach(&a, [10, 50, 0, 9]).err(), Some(Errno::EHOSTUNREACH));
-        // 绑自己的地址：宿主上是 127.a.b.1，记下虚拟地址；别人的绑不上
+        // Binding its own address: 127.a.b.1 on the host, recording the virtual address; others'
+        // cannot be bound
         let m = to_host(&w, &a, &v4([10, 50, 0, 2], 80), Use::Bind, false).unwrap();
         assert_eq!(
             (m.addr, m.vaddr),
@@ -1774,7 +1839,8 @@ mod tests {
             to_host(&w, &a, &v4([10, 50, 0, 3], 80), Use::Bind, false).err(),
             Some(Errno::EADDRNOTAVAIL)
         );
-        // 开机时的命名空间：连容器时先绑网关地址在宿主上的那个，自己的地址绑到它
+        // The initial namespace: connecting to a container first binds the host counterpart of
+        // the gateway address, and binding its own address binds to that too
         let m = reach(&init, [10, 50, 0, 2]).unwrap();
         assert_eq!(m.addr, v4([127, 7, 1, 1], 80));
         assert_eq!(m.source, Some(v4([127, INIT_BLOCK, 0, 1], 0)));
@@ -1784,7 +1850,8 @@ mod tests {
             reach(&init, [8, 8, 8, 8]).unwrap().addr,
             v4([8, 8, 8, 8], 80)
         );
-        // 反过来：别的命名空间的段、127.255.x.y 换回虚拟地址；本端面向对方
+        // The other way: another namespace's block and 127.255.x.y translate back to virtual
+        // addresses; the local end faces the other side
         let peer = |me: &NetNs, x| from_host(&w, me, &v4(x, 9), Role::Peer, false);
         assert_eq!(peer(&b, [127, 7, 1, 1]), v4([10, 50, 0, 2], 9));
         assert_eq!(peer(&a, [127, INIT_BLOCK, 0, 1]), v4(gw, 9));
@@ -1807,7 +1874,7 @@ mod tests {
             local(&a, [192, 168, 1, 5], [8, 8, 8, 8]),
             v4([10, 50, 0, 2], 9)
         );
-        // 没有默认路由时外面到不了
+        // Without a default route, outside is unreachable
         let mut r = vec![AF_INET as u8, 0, 0, 0, 254, 0, 255, 0, 0, 0, 0, 0];
         crate::net::attr(&mut r, 5, &gw);
         let del = crate::net::message(25, 1, 1, 0, &r);
@@ -1827,7 +1894,7 @@ mod tests {
             m.truncate(16 + body.len());
             m
         };
-        // bwrap 的 loopback_setup：先加 127.0.0.1/8，再打开 lo
+        // bwrap's loopback_setup: add 127.0.0.1/8 first, then bring lo up
         let mut addr = vec![AF_INET as u8, 8, 0x80, 254, 1, 0, 0, 0];
         crate::net::attr(&mut addr, 2, &[127, 0, 0, 1]);
         crate::net::attr(&mut addr, 1, &[127, 0, 0, 1]);
@@ -1844,7 +1911,7 @@ mod tests {
         let lo = lo_interface(&ns);
         assert_eq!(lo.flags & IFF_UP, IFF_UP);
         assert_eq!(lo.addrs.len(), 2);
-        // 别的接口没有；没有 CAP_NET_ADMIN 不能配
+        // There are no other interfaces; without CAP_NET_ADMIN nothing can be configured
         link[4..8].copy_from_slice(&2i32.to_le_bytes());
         assert_eq!(
             configure(&ns, &root, &msg(16, 0, &link)),
