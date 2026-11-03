@@ -1,7 +1,10 @@
 # android/native Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/native.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
+>
 > Maintained: 2026-11-03 (targeted verification: `scripts/release-sources` moved into this module)
 
 ## Responsibilities
@@ -46,7 +49,7 @@ what the app does with them (the other `android/*` modules).
 
 ## Data flow / lifecycle
 
-**1. Handles**
+### Handles
 
 - `start` creates a `Machine` and registers it; every call clones the `Arc` under the table lock,
   drops the lock and works, so a blocked read keeps its kernel alive across a concurrent `stop`.
@@ -58,7 +61,7 @@ what the app does with them (the other `android/*` modules).
   waiter threads, the main thread, provider binder threads); guest and timer threads never call
   back into Java.
 
-**2. stderr and panics**
+### stderr and panics
 
 - `init` replaces fd 2 with a pipe read by a thread that writes lines to logcat (tag `appine`) and
   sets `APPINE_LOG` when verbose.
@@ -68,7 +71,7 @@ what the app does with them (the other `android/*` modules).
   `try_wait`, `processes`, `take_power`, the wait loops of console reads and writes, `boot`,
   `shutdown` and `kill_all`, `Machine`'s drop, `sync_store`, and the JNI code itself.
 
-**3. Build**
+### Build
 
 - cargo-ndk builds `arm64-v8a` for API 29, always in release, into `target/android`; debug variants
   add the `test-hooks` and `borrow-check` features.
@@ -80,7 +83,7 @@ what the app does with them (the other `android/*` modules).
   property, the documents provider, a handful of normal permissions (no storage permission); the
   debug network security config allows cleartext to 127.0.0.1 only.
 
-**4. Released sources**
+### Released sources
 
 - `scripts/release-sources [dir]` (default `target/release-sources`) refuses to run with tracked
   changes in the work tree and writes `appine-<rev>.tar.gz` (`git archive HEAD`),
@@ -90,7 +93,7 @@ what the app does with them (the other `android/*` modules).
   `sha512sums`, fetched from Alpine's distfiles mirror and checked against those sums; APKBUILDs
   are never executed.
 
-**5. Tests**
+### Tests
 
 - `MachineTest` runs on emulators with 4 KB and 16 KB pages: boot and shutdown by inittab, consoles,
   login and doas, restore, documents, mirrors, downloads (some opt-in with network), memory trim,
@@ -98,11 +101,11 @@ what the app does with them (the other `android/*` modules).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `TerminalService`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`.
 
-**Outbound**
+### Outbound
 
 - `appine_kernel` (`Machine`, store and browse functions), `jni` 0.21, `libc`, Android `liblog`;
   cargo-ndk and NDK 29; AGP.

@@ -1,6 +1,8 @@
 # kernel/tty Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/tty.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -57,7 +59,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 
 ## Data flow / lifecycle
 
-**1. Allocation and opening**
+### Allocation and opening
 
 - `/dev/ptmx` → `new_pty`: drop dead table entries, read the instance's options, `ENOSPC` at
   `max`, take the lowest free index, owner from the options or the opener's fsuid/fsgid, mode
@@ -70,7 +72,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 - `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end
   (`ENXIO` without one) and never acquire one.
 
-**2. Input (master writes, host console feed)**
+### Input (master writes, host console feed)
 
 - The writer is clamped to `input_room`; each byte goes through `input_char`: `ISTRIP`; a pending
   `VLNEXT` makes it literal; `IGNCR`/`ICRNL`/`INLCR`; `IXON` (`VSTOP` stops output, `VSTART` or —
@@ -85,7 +87,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 - Not implemented: `IUCLC`, `IMAXBEL`, `ECHOPRT`, `PARMRK`, `BRKINT`/`IGNBRK`, `HUPCL`,
   `VDISCARD`; `EXTPROC` only reports a packet-mode `IOCTL` and leaves local editing on.
 
-**3. Reading on the slave**
+### Reading on the slave
 
 - Canonical: one line per read; an empty line returns 0 (EOF). Non-canonical: `VMIN`/`VTIME`
   (0/0 returns at once; 0/T times out from the start of the read; N/0 waits for
@@ -96,7 +98,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   wake object. The background check runs once before blocking (section 5). Reads update atime
   and writes mtime (seconds only, on 8-second boundaries).
 
-**4. Output (slave writes, master reads)**
+### Output (slave writes, master reads)
 
 - Slave writes are clamped to `output_room` (0 while output is stopped, otherwise 64 KiB minus
   the queue), then `OPOST` with `ONLCR`/`OCRNL` (no `ONOCR`, `ONLRET`, `OLCUC` or tab expansion,
@@ -111,7 +113,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   clears the other), `DOSTOP`/`NOSTOP` (when "default ^S/^Q flow" changes), `IOCTL` (with
   `EXTPROC`); enabling packet mode clears stale status; pending status adds `POLLPRI|POLLIN`.
 
-**5. Job control**
+### Job control
 
 - Acquire: the console's session leader gets the console at spawn; a session leader opening an
   unowned slave without `O_NOCTTY` acquires it (`session`, `fg` = its group); `TIOCSCTTY` returns
@@ -137,7 +139,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   group; a session leader's exit with its ctty sends both to the foreground group and clears the
   session, without one it signals `tty_old_pgrp`.
 
-**6. Hangup**
+### Hangup
 
 - Last master close: `PtyEnd::drop` cannot reach the kernel, so it queues the terminal on
   `CLOSED`; the thread releasing the BKL runs `hang_up_closed`, which marks it hung up, removes
@@ -152,7 +154,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   hung; the slave side also flushes input, clears packet status and detaches the session; the node
   stays and can be reopened.
 
-**7. termios ioctls**
+### termios ioctls
 
 - Either side: `TCGETS`/`TCGETS2`/`TCGETA`, all `TCSETS*`/`TCSETA*`/`TCSETS2*` (CS8 and CREAD
   forced, PARENB cleared; speeds recomputed and only recorded; the `W` forms do not drain, `F`
@@ -165,7 +167,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 - Defaults match Linux's pts `init_termios` (`tty_std_termios` without `HUPCL`); a control
   character of 0 is disabled.
 
-**8. Host console**
+### Host console
 
 - `terminal::open` creates a terminal on the boot devpts instance (lowest free index, unlocked,
   the given size) held by the kernel; `attach` (from `spawn`) makes the new session leader its
@@ -187,14 +189,14 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `kernel/vfs` (open by device number, `devpts_beside`, read/write/ioctl dispatch, devpts
   `nodev`), poll/epoll (`readiness`, `arrivals`), `kernel/process` (fork copying the ctty, setsid,
   exit releasing the ctty), `Bkl::drop` (`hang_up_closed`), the machine and JNI/CLI hosts (console
   API, bridge), procfs (stat of `/dev/pts/N`, `tty_nr`/`tpgid`).
 
-**Outbound**
+### Outbound
 
 - `kernel/signal` (`send_to_pgrp`, `send_to_group`, `pgrp_orphaned`, kernel siginfo), the kernel's
   wake objects and `wait_objects`, pid-namespace translation (`pid_in`/`pid_out`), the VFS

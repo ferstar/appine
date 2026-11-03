@@ -1,5 +1,7 @@
 # Processes and threads (kernel/process) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
+>
 > Last distilled: 2026-11-03 (HEAD = f9edf81) — seeded by hand from the retired design doc §6 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/process` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

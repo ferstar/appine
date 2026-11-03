@@ -1,6 +1,8 @@
 # android/terminal Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/terminal.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 
 ## Responsibilities
@@ -41,7 +43,7 @@ in the kernel (`kernel/tty`); the notices task and JNI (`android/native`).
 
 ## Data flow / lifecycle
 
-**1. Binding and tabs**
+### Binding and tabs
 
 - `onStart` starts and binds the service; `onServiceConnected` registers the listener and replays
   ready/error/progress and pending notices; `onStop` unregisters and unbinds.
@@ -50,7 +52,7 @@ in the kernel (`kernel/tty`); the notices task and JNI (`android/native`).
   tab while the kernel runs finishes the activity (the service stays). After a reconnect the focused
   tab is the service's `focus` or the last one.
 
-**2. A tab's console**
+### A tab's console
 
 - When the view first knows its size, `initializeEmulator` calls `Pty.start`: open a console with
   that size and spawn `/bin/sh -c <login.sh> appine-login <login> <cwd>` with a fixed environment.
@@ -63,7 +65,7 @@ in the kernel (`kernel/tty`); the notices task and JNI (`android/native`).
   save cursor, insert lines, write, restore cursor and move down; skipped on the alternate screen
   and queued until the emulator exists.
 
-**3. Input and display**
+### Input and display
 
 - Pinch zoom changes the font by 1 dp steps beyond a 0.9–1.1 scale band, within 6–32 dp, stored as
   pixels in the activity's preferences.
@@ -73,7 +75,7 @@ in the kernel (`kernel/tty`); the notices task and JNI (`android/native`).
 - A tap opens the IME; the content is edge-to-edge with the root padded by system-bar and IME
   insets; long-press selects text; copy and paste go through the service.
 
-**4. Licenses**
+### Licenses
 
 - The build writes `notices/` (appine's licence, Termux and jackpal, Alpine packages from the
   rootfs database, the doas package, Android libraries, Rust crates, SQLite, then full texts);
@@ -81,12 +83,12 @@ in the kernel (`kernel/tty`); the notices task and JNI (`android/native`).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `TerminalService` (sessions, focus, listener callbacks, `showMessage`, `setRestored`,
   `getTranscriptText`); `SettingsActivity` (licenses).
 
-**Outbound**
+### Outbound
 
 - `Native` (`openConsole`, `spawn`, `read`, `write`, `resize`, `closeConsole`, `waitFor`), hence
   the kernel's host console; `login.sh`; `assets/notices`.

@@ -1,6 +1,8 @@
 # kernel/vfs Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/vfs.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -92,7 +94,7 @@ mapped).
 
 ## Data flow / lifecycle
 
-**1. Path resolution**
+### Path resolution
 
 - Start (`start_dir`): an empty path is `ENOENT` before the dirfd is examined (`AT_EMPTY_PATH`
   returns the fd's own node, or the cwd for `AT_FDCWD`); absolute paths start at the process root;
@@ -138,7 +140,7 @@ mapped).
   trailing links that `protected_symlinks` might refuse; it never enters synthetic filesystems.
   Mount table changes call `mounts_changed`, and syscalls refresh threads with `fast_changed`.
 
-**2. Mount table and boot mounts**
+### Mount table and boot mounts
 
 - One global table holds every namespace's mounts; each `Mount` records its namespace. Ids are
   never reused; the list order is the mountinfo order.
@@ -154,7 +156,7 @@ mapped).
   mqueue maps to the mounter's IPC namespace; sysfs and cgroup2 share the boot device, and a
   cgroup2 mount is rooted at the caller's cgroup-namespace root.
 
-**3. mount(2) and the new mount API**
+### mount(2) and the new mount API
 
 - Order follows 6.1's `path_mount`: copy arguments, walk the target and lift to the topmost
   mount, strip `MS_MGC_VAL`, `MS_NOUSER` is `EINVAL`, `may_mount` (`CAP_SYS_ADMIN` in the user
@@ -197,7 +199,7 @@ mapped).
   namespaces are detached. Rename and link across mounts are `EXDEV`, even between binds of one
   filesystem.
 
-**4. Mount namespaces and cleanup**
+### Mount namespaces and cleanup
 
 - `CLONE_NEWNS` (clone/unshare) calls `copy_ns`, which clones every attached mount of the source
   namespace (ids allocated first, then remapped; mounts pinning a mount namespace and anything
@@ -213,7 +215,7 @@ mapped).
   reference; closing fds never triggers it, so reclaim of unused detached mounts, open_tree clones
   and tmpfs trees waits for the next such event (or the next boot).
 
-**5. tmpfs**
+### tmpfs
 
 - A tmpfs instance is a detached store directory (`create_detached_dir`); files are ordinary
   objects. Options follow 6.1's `shmem_parse_one` (`size=` with suffixes or `%`, `nr_blocks=`,
@@ -225,7 +227,7 @@ mapped).
   to the remaining room; truncation is never limited; unlinking the last name frees immediately.
   statfs and remount recount the whole tree; boot instances start uncounted.
 
-**6. fd tables and open files**
+### fd tables and open files
 
 - Allocation is the lowest free slot at or above the minimum and below the table's limit (no free
   slot `EMFILE`; `F_DUPFD` with min at or over the limit `EINVAL`; dup3 targets over it `EBADF`).
@@ -249,7 +251,7 @@ mapped).
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`, reads poll the host fd
   and read without the BKL; writes ignore guest `O_NONBLOCK`); with a console, the PTY slave.
 
-**7. Opening**
+### Opening
 
 - `open_path_with` (shared by openat, openat2 and `create_exclusive`): resolve; on create, check
   `may_create` (search, `EEXIST`, `EROFS`, write+search) and create with `mode & ~umask` and
@@ -267,7 +269,7 @@ mapped).
   or not watches exist; `O_TMPFILE` is not implemented (it reaches the directory branch and gets
   `EISDIR`).
 
-**8. Data I/O on regular files**
+### Data I/O on regular files
 
 - Without an explicit offset, `unlocked_io` emulates `f_pos_lock`: wait while `pos_busy` is set,
   take it, snapshot the position, run host `pread`/`pwrite` with the BKL released, then advance.
@@ -289,7 +291,7 @@ mapped).
   after the write succeeds).
 - Writes, truncation and fallocate on tmpfs files go through the instance's accounting.
 
-**9. Metadata and namespace syscalls**
+### Metadata and namespace syscalls
 
 - Stat: asm-generic `struct stat` with uid/gid mapped into the caller's user namespace; `st_dev`
   from the mount; `st_blksize` 4096; `st_blocks` from size (no holes; short symlinks and sysfs
@@ -322,7 +324,7 @@ mapped).
 - `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
   `protected_fifos` do not.
 
-**10. Extended attributes**
+### Extended attributes
 
 - Names need a `security.`, `system.`, `trusted.` or `user.` prefix (`EOPNOTSUPP` otherwise); bad
   name lengths `ERANGE`; values over 64 KiB `E2BIG`. `system.*` (including POSIX ACL names) is
@@ -335,7 +337,7 @@ mapped).
   v2. Synthetic nodes: get `ENODATA`, set/remove `EOPNOTSUPP`
   (`EROFS` first on ro), empty list; pipes and sockets `EOPNOTSUPP`.
 
-**11. Pipes and FIFOs**
+### Pipes and FIFOs
 
 - Data lives in process memory. `pipe2` accepts `O_CLOEXEC|O_NONBLOCK|O_DIRECT` (`O_DIRECT` is
   accepted and ignored: no packet mode). Capacity 64 KiB, capped at `pipe-max-size` (1 MiB)
@@ -349,7 +351,7 @@ mapped).
   atomic; larger writes are partial; nonblocking `EAGAIN`. Reads return 0 without writers.
   `FIONREAD` reports the buffered bytes.
 
-**12. Locks and leases**
+### Locks and leases
 
 - All in-process, keyed by store inode (bind mounts share them); the host `flock` is used only on
   the store's `lock` file. `flock` and fcntl locks are separate tables.
@@ -368,7 +370,7 @@ mapped).
   others wait until the holder downgrades or `lease-break-time` (45 s) forces it. `F_NOTIFY`
   (dnotify) is `EINVAL`.
 
-**13. Devices**
+### Devices
 
 - `dev::populate` creates in the boot `/dev` tmpfs, and `ensure_dev_nodes` in the store's `/dev`:
   `null`, `zero`, `full`, `random`, `urandom`, `kmsg`, `tty`, `console`, `ptmx`, the `fd`/`stdin`/
@@ -380,7 +382,7 @@ mapped).
   comes from the host `/dev/urandom` and never blocks (entropy count fixed at 256; the random
   ioctls follow 6.1's `random_ioctl`).
 
-**14. eventfd and timerfd**
+### eventfd and timerfd
 
 - eventfd: counter or semaphore mode; writing `u64::MAX` is `EINVAL`; overflow blocks; every
   read/write wakes the object (the syscalls live in `kernel/net`'s poll code).
@@ -388,7 +390,7 @@ mapped).
   at settime; settime resets the expiration count; `TFD_TIMER_CANCEL_ON_SET` is accepted but never
   yields `ECANCELED`.
 
-**15. inotify**
+### inotify
 
 - Instances: `inotify_init1` accepts `O_CLOEXEC|O_NONBLOCK`; per-user instance (`EMFILE`) and
   watch (`ENOSPC`) limits and the queue limit come from `/proc/sys/fs/inotify/*` (defaults 128
@@ -417,7 +419,7 @@ mapped).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - The syscall dispatcher; `kernel/process` (clone/unshare/setns, execve's fd-table handling and
   mount-flag checks, task exit's `collect`, the fast-path `Cached` resolver); `kernel/mm` (mmap
@@ -425,7 +427,7 @@ mapped).
   inotify and `protected_*`); `kernel/net` (AF_UNIX bind creating store nodes, poll/epoll reading
   open files, eventfd syscalls); the machine (boot, `store_changed` for inotify); core dumps.
 
-**Outbound**
+### Outbound
 
 - `kernel/store` (lookups, snapshots, objects, namespace changes, detached directories, xattrs,
   `fs_stats`, the metadata cache reader); `kernel/procfs` (the `Pseudo` views, `pseudo::stat`,

@@ -1,5 +1,7 @@
 # Synthetic filesystems (kernel/procfs) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
+>
 > Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.2 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/procfs` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

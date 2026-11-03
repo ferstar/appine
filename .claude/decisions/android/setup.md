@@ -1,5 +1,7 @@
 # Rootfs, settings and login (android/setup) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
+>
 > Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.1 and
 > §11.4 and the round records in `docs/rounds/`; no `MODULE: android/setup` Decision blocks exist
 > yet, so sources cite rounds instead of commits.

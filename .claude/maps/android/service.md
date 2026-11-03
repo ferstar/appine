@@ -1,6 +1,8 @@
 # android/service Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/service.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 
 ## Responsibilities
@@ -51,7 +53,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ## Data flow / lifecycle
 
-**1. Start and boot**
+### Start and boot
 
 - `onCreate` starts foreground (type `specialUse` on API 34+), takes saved tabs from a killed run
   (`Tabs.takeKilled`) and calls `start(ALPINE)` when no rootfs is ready, else `start(null)`.
@@ -66,14 +68,14 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - A failed import of a downloaded distro falls back to Alpine with a notice; any other failure sets
   `startError` and reports it.
 
-**2. Poll (every 2 s, on the worker)**
+### Poll (every 2 s, on the worker)
 
 - Fetches `takeListens`, `takeKills`, `takePower`, `processes`, `takeChangedDirs`; results are
   applied on the main thread only if the kernel is still the same.
 - Reboot → `restart()`; halt/poweroff → `exitAll()`; no sessions, no listeners and no guest
   processes → `exitAll()`. Changed directories go to `Documents.dirsChanged`.
 
-**3. Stopping, restarting, replacing**
+### Stopping, restarting, replacing
 
 - `exitAll`: mark exiting, cancel a switch, `onExitAll`, clear listeners immediately, `detach`, show
   "stopping services", `Native.shutdown` on the worker (inittab shutdown, 30 s), then release the
@@ -89,7 +91,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   inittab shutdown), join the mirror thread, delete the store, `start(distro)`.
 - `onDestroy` with a kernel still present shuts it down on the worker, best effort.
 
-**4. Wake lock and memory**
+### Wake lock and memory
 
 - `PARTIAL_WAKE_LOCK` held when keep-awake is on and the kernel runs or is shutting down; not
   reference-counted, no timeout; the notification shows a toggle and a "keep awake" suffix.
@@ -97,7 +99,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   worker) and saves tabs at once; a returning listener cancels it. `onTrimMemory` at
   `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and saves immediately.
 
-**5. Sessions, saving and restore**
+### Sessions, saving and restore
 
 - `createSession(login, cwd)` builds a `ConsolePty` and a `TerminalSession` (2000 rows); the shell
   starts when the view first knows its size. The shared session client forwards events to all
@@ -111,7 +113,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - Restore: each saved tab reopens with its saved login setting and cwd, preceded by its old
   transcript and a yellow notice with the save time; the saved current tab is focused.
 
-**6. Reports and notifications**
+### Reports and notifications
 
 - Kill reports (one tab-separated line each): written into the tab whose console matches, in
   yellow above the cursor line (skipped on the alternate screen); a notification follows when the
@@ -127,12 +129,12 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `MainActivity`, `SettingsActivity` (binder and listeners), notification `PendingIntent`s,
   `ConnectivityManager`, system trim callbacks, `Documents` (static settings).
 
-**Outbound**
+### Outbound
 
 - `Native` (start, boot, shutdown, stop, trim, poll calls, routes, spawn, waitFor, consoleCwd);
   `Rootfs` (prepare, download, mirrors, ensure-files, access lock, reset, failed services); `Tabs`;

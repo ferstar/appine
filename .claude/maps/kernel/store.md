@@ -1,7 +1,10 @@
 # kernel/store Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/store.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
+>
 > Maintained: 2026-11-03 (targeted verification: synchronous-write handling corrected from the kernel/vfs verification)
 
 ## Responsibilities
@@ -63,7 +66,7 @@ provider and rootfs installation UI (`android`).
 
 ## Data flow / lifecycle
 
-**1. On-disk layout and schema**
+### On-disk layout and schema
 
 - A store directory holds `meta.db` (SQLite, WAL mode), `objects/` and `lock`.
 - Tables: `inodes` (mode, owner, nlink, `..` parent for directories, rdev, mtime/ctime, symlink
@@ -72,7 +75,7 @@ provider and rootfs installation UI (`android`).
   timeout, a statement cache.
 - `Store::create` writes the root directory (0755, its own parent).
 
-**2. Objects and metadata ownership**
+### Objects and metadata ownership
 
 - Each regular file's data is `objects/<ino>` (mode 0600), always opened by number relative to an
   `O_PATH` directory fd, never by path. Directories, symlinks, device nodes, FIFOs and sockets
@@ -87,7 +90,7 @@ provider and rootfs installation UI (`android`).
 - Reads and writes go straight to the host fd (`pread`/`pwrite`); copies between two regular files
   use the host's `sendfile`.
 
-**3. Namespace operations**
+### Namespace operations
 
 - Every operation is atomic. Hardlinks are several dentries for one inode (directories cannot be
   linked, `EPERM`).
@@ -106,7 +109,7 @@ provider and rootfs installation UI (`android`).
 - `create_anonymous` (memfd) creates an nlink-0 row owned by root and an object that is unlinked at
   once, so only the returned fd holds the data.
 
-**4. Transactions and deferred commits**
+### Transactions and deferred commits
 
 - The first write opens `BEGIN IMMEDIATE`; each operation runs in a `SAVEPOINT` (single statements
   run without one; nested operations join the enclosing one). Failure or a kernel-layer panic rolls
@@ -120,7 +123,7 @@ provider and rootfs installation UI (`android`).
 - After a successful commit the uncommitted-inode range is cleared, the commit counter bumped, and
   doomed objects handed to the reaper.
 
-**5. Power-loss ordering**
+### Power-loss ordering
 
 - Commits write WAL frames without syncing; the WAL and objects reach disk independently. Three
   orderings mimic ext4 (`data=ordered`, `auto_da_alloc`):
@@ -139,7 +142,7 @@ provider and rootfs installation UI (`android`).
 - New regular files' objects exist immediately; the `lock` header records the uncommitted inode
   range so the next boot can delete objects without rows.
 
-**6. Reaper and checkpoints**
+### Reaper and checkpoints
 
 - One background thread per connection (every short-lived host connection spawns and joins one):
   when objects are queued it syncs the WAL (unless nothing was committed since the last sync) and
@@ -149,7 +152,7 @@ provider and rootfs installation UI (`android`).
   reaches 10,000 pages. Without a reaper thread SQLite's auto-checkpoint is kept and deletions
   happen inline.
 
-**7. Opening and boot cleanup**
+### Opening and boot cleanup
 
 - Every connection takes a shared `flock` on `lock`. If it can get the lock exclusively (nobody else
   has the store open), it runs boot cleanup: reset `users`, delete objects in the recorded
@@ -158,7 +161,7 @@ provider and rootfs installation UI (`android`).
   nlink-0 rows and their objects, commit. Then it downgrades to shared and increments `users`; if
   others are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
 
-**8. Metadata cache**
+### Metadata cache
 
 - Caches dentries (including names that do not exist), database rows, symlink targets, `..`
   parents, names, directory listings and the file-capability set; xattr values, emptiness checks
@@ -177,7 +180,7 @@ provider and rootfs installation UI (`android`).
   `Meta::reader` (read lock), which refuses when the counter moved; the no-BKL resolver falls back
   to the BKL path on any miss. Regular-file stats in a reader query the host while holding the lock.
 
-**9. Sharing the store**
+### Sharing the store
 
 - Connections, not processes, are counted in `users` (the field's comment says processes). The
   kernel and the app's DocumentsProvider run in the same process; each host call (`browse`,
@@ -191,7 +194,7 @@ provider and rootfs installation UI (`android`).
   provider through `Machine::take_changed_dirs`, which maps them to paths (deleted and tmpfs
   directories drop out).
 
-**10. Import**
+### Import
 
 - `import_rootfs` creates a new store and imports a gzip-compressed tar in one transaction: paths are
   normalised (`..` is `EINVAL`), missing parents created as 0755 root, directories' attributes
@@ -203,7 +206,7 @@ provider and rootfs installation UI (`android`).
   the host calls `sync_store` (host `syncfs`). The Android caller imports into a temporary store
   directory that is discarded before a retry.
 
-**11. Browse API**
+### Browse API
 
 - Paths resolve like `realpath` inside the guest tree (links followed, at most 40). Only directories
   and regular files are visible; mounts are not.
@@ -218,14 +221,14 @@ provider and rootfs installation UI (`android`).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `kernel/vfs` (path walks, file syscalls, tmpfs mounts, the no-BKL resolver, `Vfs::open` with the
   volatile list), `kernel/process` (`syscall::fast`), the machine (waker, timer `commit_due`,
   `sync`, `trim_memory`, teardown, the store registry, `take_changed_dirs`), inotify (`host_change`),
   host wrappers in `lib.rs` (JNI and `appine-run`).
 
-**Outbound**
+### Outbound
 
 - rusqlite with bundled SQLite (WAL hook, checkpoints); `appine_hal` (`open_at`, `stat_at`,
   `chmod_at`, `unlink_at`, times, `flock`, `map_file`, `fsync`, `syncfs`, `sync_file_range`,

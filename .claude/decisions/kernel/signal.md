@@ -1,5 +1,7 @@
 # Signals, ptrace and ABI (kernel/signal) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
+>
 > Last distilled: 2026-11-03 (HEAD = dd6c288) — seeded by hand from the retired design doc §7 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/signal` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

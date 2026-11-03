@@ -1,6 +1,8 @@
 # kernel/cred Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/cred.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 
 ## Responsibilities
@@ -57,7 +59,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 
 ## Data flow / lifecycle
 
-**1. Credentials and id syscalls**
+### Credentials and id syscalls
 
 - The first process gets root credentials (all ids 0, permitted/effective/bounding full) in the
   initial user namespace. Readers take a cheap by-value snapshot; fork copies the group's
@@ -79,7 +81,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   0..65536, mapped ids, then `CAP_SETGID` and the namespace's setgroups permission with a written
   gid map, else `EPERM`; stored sorted).
 
-**2. Capabilities**
+### Capabilities
 
 - Scopes: `capable` only in the initial user namespace; `capable_here` in the caller's own;
   `ns_capable` in a given namespace (including the parent-owner rule); `capable_wrt` additionally
@@ -92,7 +94,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   inheritable and no `NO_CAP_AMBIENT_RAISE`; securebits need `CAP_SETPCAP`, cannot change locked
   bits or unlock; keepcaps fails when locked.
 
-**3. execve**
+### execve
 
 - Inputs: the final interpreter's stat; setuid/setgid apply only with the mode bit, no
   no_new_privs, a mount without nosuid, owner and group mapped in the caller's namespace (setgid
@@ -113,7 +115,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   pdeathsig is cleared in those cases.
 - Writes, truncation and chown remove file caps (and set-id bits) from the inode (in the store).
 
-**4. Access decisions**
+### Access decisions
 
 - `permission(stat, mask)`: owner class if fsuid matches, group if fsgid or a supplementary group
   matches, else other; if the class allows everything requested, allow; otherwise directories
@@ -139,7 +141,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   process_vm, pidfd_getfd, kcmp and the opens of `/proc/<pid>/mem`, `auxv`, `environ`, `maps`,
   `smaps` and `pagemap` use real ones.
 
-**5. seccomp**
+### seccomp
 
 - Installing (`seccomp(2)`/prctl, Linux order): flag combinations `EINVAL`; length 0 or over 4096
   `EINVAL`; without no_new_privs (read from the thread group) or `CAP_SYS_ADMIN` in the caller's
@@ -174,7 +176,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `kernel/vfs` (every permission and ownership check, xattr capability rules, file-cap removal),
   `kernel/process` (fork/clone copies, execve, namespaces, setpriority/ioprio `PRIO_USER`,
@@ -182,7 +184,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   sysctls), `kernel/unix` (credentials), `kernel/net`/`kernel/netns` (capability checks), the syscall
   dispatcher and fast path (seccomp).
 
-**Outbound**
+### Outbound
 
 - User namespaces and id maps (`kernel/process`); `Stat` and modes (`kernel/store`); ptrace stops,
   `signal::force`/`force_fatal` (`kernel/signal`); the vDSO stub check; fd tables; the kernel's

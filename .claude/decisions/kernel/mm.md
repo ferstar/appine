@@ -1,5 +1,7 @@
 # Guest memory (kernel/mm) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
+>
 > Last distilled: 2026-11-03 (HEAD = 4b19037) — seeded by hand from the retired design doc §5 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/mm` Decision blocks exist yet, so sources
 > cite rounds instead of commits.

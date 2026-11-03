@@ -1,5 +1,7 @@
 # Terminal UI (android/terminal) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
+>
 > Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.5 and
 > the round records in `docs/rounds/`; no `MODULE: android/terminal` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

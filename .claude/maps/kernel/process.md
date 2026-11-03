@@ -1,7 +1,10 @@
 # kernel/process Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/process.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
+>
 > Maintained: 2026-11-03 (targeted verification: timeout overflow in the fast path, found during kernel/poll verification)
 
 ## Responsibilities
@@ -31,7 +34,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ## Key types
 
-**Tasks and processes**
+### Tasks and processes
 
 - `Task` — one guest thread: tid, `killed`, `pdeathsig`, exit status, CPU-clock bookkeeping, nice,
   affinity, I/O priority, its wake `event`, `sleeping`, `pid_ns_children`, `NsProxy`; thread-private
@@ -52,7 +55,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `Bkl` — the held-lock guard; its `Drop` performs release-time work.
 - `Cx` — the context of one syscall or signal delivery; holds the `Bkl` (absent while released).
 
-**Waiting and futexes**
+### Waiting and futexes
 
 - `wake` channels: `FILE`, `OTHER`, `CHILD`, `WATCHED`, `EXITED`, `LOCK`, `SIGNAL` (plus the
   internal `OBJECTS`); `wake::Object` is the address of a value inside a `RefCell`.
@@ -60,7 +63,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `futex::Key` — `Host(address)` or `File{dev, ino, offset}`; `Futexes` — one queue of
   (id, key, bitset, event) with its own mutex; `Enqueued` — removes its entry on drop.
 
-**Exec, timers, init, namespaces**
+### Exec, timers, init, namespaces
 
 - `loader::Executable`, `ExeCache` (32 opened executables), `Args`, `Prepared` (the hand-off
   between the locked and unlocked exec phases), `Image`; `process::ExeFile` (the process's
@@ -88,7 +91,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ## Data flow / lifecycle
 
-**1. Tasks and host threads**
+### Tasks and host threads
 
 - Each guest thread runs on its own host pthread, scheduled by the host kernel. A finished thread's
   host thread is pooled (at most 8 idle, 5 s) and its engine CPU state goes to the engine's spare
@@ -98,7 +101,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - CPU time is the host thread's CPU clock minus the base; user and system time are each kept
   monotonic like Linux `cputime_adjust`.
 
-**2. clone**
+### clone
 
 - `clone` takes the low 32 bits of the flags (the pidfd shares the parent-tid slot); `clone3` checks
   the structure size (non-zero tail is `E2BIG`). There are no separate fork or vfork syscalls on
@@ -118,7 +121,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   address space's users and the kernel's task table. A failure releases the pid and the pidfd.
 - vfork: the parent waits (interest none) until the child execs or exits, or it is killed.
 
-**3. Run loop**
+### Run loop
 
 - Tier: the kernel's tier is the interpreter or the translator; if attaching a translator fails or
   hardware breakpoints are set the thread runs `Cpu::run`; single-stepping uses `Cpu::step`.
@@ -129,7 +132,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - The result (`Continue`, `Exec`, `Exit`) decides the next step; `Exec` re-attaches the translator
   for the new address space. After each BKL-path handling the fast-path cache is refreshed.
 
-**4. Exit and reaping**
+### Exit and reaping
 
 - `exit` sets the thread's status (the leader's also records `leader_status`); `exit_group` and
   fatal signals set the group's `exiting` status once, mark every thread killed and wake them.
@@ -160,7 +163,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   if interrupted.
 - An exited leader keeps its tgid registered until the group is reaped.
 
-**5. execve**
+### execve
 
 - Arguments: the limit comes from `RLIMIT_STACK` (`bprm_stack_limits`: a quarter of the limit, at
   most 6 MB, at least 128 KB); a string of 128 KB or more or a larger total is `E2BIG`; an empty
@@ -186,7 +189,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   address space, reset the CPU state for the new page table (re-kicking if interrupted), and set
   PC and SP. The run loop then re-attaches the translator.
 
-**6. ELF loader**
+### ELF loader
 
 - Accepts 64-bit little-endian aarch64 `ET_EXEC` and `ET_DYN` (else `ENOEXEC`); a `PT_INTERP`
   (ld-musl, or glibc's ld.so) is loaded the same way and must itself be `ET_DYN` without an
@@ -206,7 +209,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - A Go build-ID note in the main program selects the translator's Go register set (`engine`).
 - Opened executables are cached (32 entries, checked against the host file's identity).
 
-**7. The BKL**
+### The BKL
 
 - One mutex over `Kernel`. Kernel objects are shared with `Rc` and the kernel's own `RefCell`; their
   counts and borrow flags are not atomic, so even cloning or dropping them needs the BKL.
@@ -230,7 +233,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   release builds with the `borrow-check` feature (enabled for `appine-run` and the debug app). The
   inode store also checks that its owning kernel's BKL is held.
 
-**8. Fast path** (`syscall::fast`)
+### Fast path (`syscall::fast`)
 
 - Without the BKL, a thread can run `futex` (WAIT, WAKE and the BITSET forms on a 4-byte-aligned
   address that translates writable and is not in a writable shared file mapping), `nanosleep`,
@@ -247,7 +250,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   event; dequeued means woken, still queued after waking hands over to the BKL path (a relative
   timeout's end time is preserved).
 
-**9. Waiting and waking**
+### Waiting and waking
 
 - A guest thread never blocks in a host syscall: every wait is one host `poll()` on the thread's own
   event (eventfd, or a pipe on other hosts) plus the host fds it waits on, with the deadline as
@@ -275,7 +278,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Pipes wake like Linux: a write wakes readers only if the pipe was empty; a read wakes writers only
   when enough space for the writer's request appears or `PIPE_BUF` is crossed.
 
-**10. Futexes**
+### Futexes
 
 - Keys are the translated host address, except for addresses in a shared file mapping (even a
   read-only one), which use (device, inode, offset) so different processes mapping the same file
@@ -290,7 +293,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Lock order is BKL then futex lock; the fast path takes only the futex lock, so BKL and fast paths
   share one queue without lost wakeups.
 
-**11. Timer thread**
+### Timer thread
 
 - One host thread ("timers") loops: take the BKL; expire interval timers, POSIX timers and CPU-time
   limits; run the OOM check, the translator code-view release, load-average sampling, deferred
@@ -306,7 +309,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   thread next enters guest code; armed timers still wake it. Changing `RLIMIT_CPU` does not wake
   the timer thread; the new limit takes effect at its next pass.
 
-**12. PID 1**
+### PID 1
 
 - The virtual init is a thread group with no threads and no guest program. Host-started processes
   (each terminal tab's login shell) are its children; it adopts orphans and its children are never
@@ -327,7 +330,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   kept until taken); senders not allowed get `EPERM`; other signals to pid 1 are ignored.
   `pidfd_send_signal` and broadcasts skip pid 1 and `rt_sigqueueinfo` to it is `ESRCH`.
 
-**13. Scheduling and TLS**
+### Scheduling and TLS
 
 - nice, CPU affinity and I/O priority are per thread and applied to the host thread; raising
   priority floors at host nice -4 (never above Android's display threads); `SCHED_IDLE` maps to host
@@ -337,7 +340,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
   ART's signal chain always sees bionic's value.
 
-**14. Namespaces**
+### Namespaces
 
 - All eight types exist. UTS, IPC, net, cgroup and time live in the task's `NsProxy`; the mount
   namespace lives in `FsContext` (tasks sharing a fs share it); the pid namespace belongs to the
@@ -374,14 +377,14 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - Syscall dispatch (`syscall/mod.rs`: the BKL around handlers, pid translation, `Mm::sync` after
   each call), `Machine` and the hosts (CLI, Android JNI: boot, shutdown, power, spawn), signals and
   ptrace (group exit, delivery, exit hooks), procfs, every blocking syscall (via the wait API),
   `kernel/mm` (kicks through `TaskSync`, `quiesce`), mount (nsfs binds, procfs/mqueue mounts).
 
-**Outbound**
+### Outbound
 
 - `engine`: `Cpu::new`/`run`/`step`/`reset`, `Dbt::attach`/`run`, `Kicker`, `guest_hwcap`.
 - `kernel/mm`: `fork`, `quiesce`, users, `futex_key`, `translate`, layout and mapping calls used by

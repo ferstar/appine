@@ -1,5 +1,7 @@
 # Terminals (kernel/tty) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
+>
 > Last distilled: 2026-11-03 (HEAD = c5236a1) — seeded by hand from the retired design doc §9 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/tty` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

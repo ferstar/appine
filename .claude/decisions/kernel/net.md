@@ -1,5 +1,7 @@
 # Socket layer (kernel/net) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
+>
 > Last distilled: 2026-11-03 (HEAD = 5d21cc4) — seeded by hand from the retired design doc §10 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/net` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

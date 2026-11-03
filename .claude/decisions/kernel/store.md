@@ -1,5 +1,7 @@
 # Inode store (kernel/store) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
+>
 > Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.1 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/store` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

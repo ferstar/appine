@@ -1,5 +1,7 @@
 # Host abstraction layer (hal) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
+>
 > Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the design doc §3 and the round
 > records in `docs/rounds/`; no `MODULE: hal` Decision blocks exist yet, so sources cite rounds
 > instead of commits.

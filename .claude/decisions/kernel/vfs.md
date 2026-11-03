@@ -1,5 +1,7 @@
 # VFS (kernel/vfs) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
+>
 > Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.2–§8.3
 > and the round records in `docs/rounds/`; no `MODULE: kernel/vfs` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

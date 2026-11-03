@@ -1,5 +1,7 @@
 # Terminal service (android/service) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
+>
 > Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.2 and
 > the round records in `docs/rounds/`; no `MODULE: android/service` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

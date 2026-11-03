@@ -1,5 +1,7 @@
 # Run and test harness (harness) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
+>
 > Last distilled: 2026-11-03 (HEAD = 12c4afa) — seeded by hand from the design doc §13.3 and the
 > round records in `docs/rounds/`; no `MODULE: harness` Decision blocks exist yet, so sources cite
 > rounds instead of commits.

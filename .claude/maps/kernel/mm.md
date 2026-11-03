@@ -1,7 +1,10 @@
 # kernel/mm Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/mm.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
+>
 > Maintained: 2026-11-03 (targeted verification: added two facts carried over from the retired design doc §5 — shared-mapping coherence and the host address-space limit)
 
 ## Responsibilities
@@ -36,7 +39,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 
 ## Key types
 
-**Address space**
+### Address space
 
 - `Mm` — one guest address space. Holds the page table (`mmu`, dropped first), the VMA table
   (`vmas: BTreeMap<start, Vma>`), the `graveyard` of host regions awaiting shootdown, brk and
@@ -54,7 +57,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
 - `Refill` — the private-file piece re-mapped at the old address after `MREMAP_DONTUNMAP`.
 
-**Host backing**
+### Host backing
 
 - `HostRegion` — owns one host range (`base`, `len`). `anonymous: Some(reserve)` marks a range that
   is recycled on drop. `reserved` marks a placeholder with no host memory, whose base is the fake
@@ -70,7 +73,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
   shared by all address spaces, keyed by device, inode, offset, length, ctime and size.
 - `SharedMemory` — host backing of a SysV shm segment.
 
-**Translation**
+### Translation
 
 - `struct appine_mmu` / `Mmu` — 4-level radix tree, 512 entries per level, covering 48-bit guest
   addresses; each leaf table spans 2 MB. A leaf entry is a 4 KB-aligned host page address ORed with
@@ -84,7 +87,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 - `struct appine_itlb_entry` — 512-entry instruction TLB, used only by Tier 0 instruction fetch.
 - `UserSlice` — an unchecked guest range passed to kernel-side accessors.
 
-**Copy-on-write**
+### Copy-on-write
 
 - `Loan` — one lent host page: its owner (`None` for an orphan) and its borrowers.
 - `Loans` — `HashMap<host page address, Loan>` shared by a whole fork family (execve starts a fresh
@@ -94,7 +97,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 - `Runs` — coalesces consecutive pages into runs for PTE updates; a run never crosses a VMA.
 - `MmRef` — weak self-handle (`me`) recorded in loans.
 
-**Consistency and code**
+### Consistency and code
 
 - `TaskSync` — per-thread `in_guest` flag plus a `Kicker`, shared without the BKL.
 - `Generations` — clones of the three counters (`tlb`, `code`, `space`) and the code log; the run
@@ -106,7 +109,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 - `CodeGroup` / `CodeGroups` — groups of address spaces running the same executable that share one
   `DbtSpace` (at most 256 registered trusted ranges); the kernel keeps a list of weak references.
 
-**Introspection**
+### Introspection
 
 - `Region` — one `/proc/<pid>/maps` / `smaps` line.
 - `RssPlan`, `FileResidency` — one RSS sample plan, and a 1 s, 1024-entry cache of file-mapping
@@ -142,7 +145,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 
 ## Data flow / lifecycle
 
-**1. Creation and layout**
+### Creation and layout
 
 - execve builds a fresh `Mm` (with a fresh `Loans` table) that shares the kernel-wide `FileMaps`.
 - `set_layout` sets `mmap_top` from the `RLIMIT_STACK` at execve: `STACK_TOP` minus the limit
@@ -154,7 +157,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
   `max(min(page-aligned RLIMIT_STACK, 8 MB), mapped length)`, leaving the rest below as reserved
   growth room.
 
-**2. mmap and host backing**
+### mmap and host backing
 
 - Lengths round up to a page; zero is `EINVAL`.
 - `MAP_FIXED` / `MAP_FIXED_NOREPLACE`: the address must be aligned and the end at most `1 << 48`;
@@ -182,7 +185,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 - `insert` enforces `vm.max_map_count` (default 65530, writable through procfs), builds page-table
   entries (section 3), and sets `locked` from `mlockall(MCL_FUTURE)`.
 
-**3. Page-table population and the TLB**
+### Page-table population and the TLB
 
 - `map_pages` builds entries eagerly when the part of the VMA before EOF is at most 1 MB, or when
   the mapping is executable and not private anonymous (file mappings, shared anonymous, SysV shm).
@@ -204,7 +207,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
   fault address is the start of the second page.
 - A TLB flush clears only the slots marked in `tlb_used`, plus the whole ITLB.
 
-**4. Guest page faults** (task run loop, under the BKL, in this order)
+### Guest page faults (task run loop, under the BKL, in this order)
 
 1. A write fault where `cow_break` succeeds → re-execute.
 2. The page now translates (another thread fixed it while this one waited for the BKL) → re-execute.
@@ -217,7 +220,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 "Re-execute" forces no signal and leaves the PC on the faulting instruction (already-pending
 signals may still be delivered).
 
-**5. munmap, mprotect, mremap**
+### munmap, mprotect, mremap
 
 - VMAs are only ever split (`split_at` adjusts file offsets and host pointers), never merged.
 - `munmap` moves removed host regions to the `graveyard`, sets `dirty`, and records executable
@@ -231,7 +234,7 @@ signals may still be delivered).
   free space above, and the new end at or below `mmap_top`; the grown part becomes a separate VMA.
   A move re-points the same host memory and moves the page-table entries with it.
 
-**6. Stack and heap growth**
+### Stack and heap growth
 
 - `grow_down` refuses pages below `0x10000` and addresses already mapped. It applies when the
   nearest VMA at or above the address is `growsdown`. It refuses if the single nearest VMA below is
@@ -250,7 +253,7 @@ signals may still be delivered).
   256 MB (`MAP_NORESERVE`), then falls back to a separate anonymous mapping. Shrinking unmaps.
   There is no `RLIMIT_DATA` or `RLIMIT_AS` enforcement.
 
-**7. Consistency: shootdown and code invalidation**
+### Consistency: shootdown and code invalidation
 
 - Mutators run under the BKL and only record what changed: `dirty` (unmap, permission downgrade,
   PTE re-pointing, truncation, leaving a code group), `graveyard`, `code_ranges`, and
@@ -272,7 +275,7 @@ signals may still be delivered).
   `membarrier(SYNC_CORE)` (which quiesces) is the way to force it. Tier 1 handles `ic ivau` inside
   the translator; the log carries mapping changes, Tier 0 invalidations, and leftover `ivau` pages.
 
-**8. Code groups** (mm side of translation sharing)
+### Code groups (mm side of translation sharing)
 
 - The first thread to run an `Mm` calls `code_space`: it joins an open group for the same
   executable if `admit` accepts its executable layout and a tag is free, otherwise it founds a new
@@ -284,7 +287,7 @@ signals may still be delivered).
 - A forked child starts outside any group and may join its parent's. On drop a member leaves the
   group and its claims are released.
 
-**9. fork and copy-on-write**
+### fork and copy-on-write
 
 - The caller quiesces the parent, then `fork` checks commit (`commit_too_big`: counts private
   writable non-`MAP_NORESERVE` VMAs by guest prot, merging adjacent ones the way Linux `vma_merge`
@@ -326,7 +329,7 @@ signals may still be delivered).
   anonymous VMAs is discarded. Lent or borrowed pages are never written in place, even by a sole
   orphan borrower.
 
-**10. Release of host memory**
+### Release of host memory
 
 - Regions stay in the `graveyard` until `sync` has quiesced the other threads, so guest data races
   never touch memory already returned to the host.
@@ -342,7 +345,7 @@ signals may still be delivered).
   graveyard.
 - The OOM killer skips a round while `UNMAPPING` is nonzero.
 
-**11. Files: EOF and truncation**
+### Files: EOF and truncation
 
 - Whole pages past EOF have no entries. A shared mapping whose file grew picks up the new content on
   the next fault; private mappings do not.
@@ -351,7 +354,7 @@ signals may still be delivered).
   invalidation, `dirty` is set; other address spaces are synced immediately and the current one at
   syscall exit.
 
-**12. Introspection**
+### Introspection
 
 - `regions` labels each VMA (file name, else `[stack]` for the VMA containing `start_stack` and the
   contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[heap]` inside
@@ -374,7 +377,7 @@ signals may still be delivered).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - Syscall dispatch: `syscall/mem.rs`, and `syscall/mod.rs` (`sync` after every BKL syscall, stack
   growth at entry).
@@ -386,7 +389,7 @@ signals may still be delivered).
 - Observers: procfs (`pseudo.rs`), core dumps, rusage, cgroups, the OOM killer.
 - `Machine` (initial `FileMaps`, `trim_memory`).
 
-**Outbound**
+### Outbound
 
 - `appine_engine`: `Mmu`, `Cpu::tlb_flush`, `Kicker`, `DbtSpace`/`Dbt` (trust, share,
   retire_outside, set_sources, invalidate, flush).

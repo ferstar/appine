@@ -1,6 +1,8 @@
 # hal Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/hal.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 
 ## Responsibilities
@@ -62,7 +64,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 ## Data flow / lifecycle
 
-**1. Errors and hosts**
+### Errors and hosts
 
 - Every function returns the raw host errno (`last_errno` falls back to `EIO`); the kernel wraps it
   and passes it to the guest unchanged, which is only correct on Linux and Android hosts, whose
@@ -73,7 +75,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `ENOSYS` `Edges`/`Watch`, reduced memory statistics). Linux-only functions (`copy_file`, the
   fsync family, `msync`) are `cfg`-gated in the hal but called ungated by the kernel.
 
-**2. Memory**
+### Memory
 
 - `map_anonymous` maps RW private anonymous memory (guest permissions live in the soft-MMU), adding
   `MAP_NORESERVE` for reservations; `map_inaccessible` maps `PROT_NONE` with `MAP_NORESERVE` (used
@@ -88,7 +90,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `memory_usage` reads `/proc/self/status`; `host_meminfo` copies host `/proc/meminfo` (falling
   back to `sysinfo`); long-lived fds for `/proc/self/status` and pagemap are kept in `OnceLock`s.
 
-**3. Files and storage**
+### Files and storage
 
 - The store opens its object directory with `open_dir` (`O_PATH`) and addresses objects with
   `open_at` (always `O_CLOEXEC`, follows symlinks, applies the umask), `stat_at`, `chmod_at`,
@@ -102,7 +104,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   result is ignored and `fd_limit` re-reads the limit later); `fill_random` opens and reads
   `/dev/urandom` on every call.
 
-**4. Waiting, threads, CPUs, time**
+### Waiting, threads, CPUs, time
 
 - `poll` uses `ppoll` with nanosecond timeouts (seconds clamped to `i32::MAX`; `poll` rounded up to
   milliseconds elsewhere), allocates per call and returns `EINTR` to the caller, which treats it as
@@ -120,7 +122,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - CLI: `RawMode::enter` on stdin; `sigwinch_notifier` installs a handler writing one byte to a
   nonblocking pipe (documented as callable once per process; the CLI calls it once).
 
-**5. Networking**
+### Networking
 
 - Sockets are created `SOCK_NONBLOCK|SOCK_CLOEXEC` (`accept4` likewise; non-Linux hosts set the
   flags afterwards); addresses, options and control bytes pass through raw (shared arm64 Linux
@@ -142,12 +144,12 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `core/kernel` throughout (mm, store, VFS, syscalls, timer thread, forwarder, raw ICMP, terminal,
   procfs, OOM); `hosts/cli` (`RawMode`, `sigwinch_notifier`, `isatty`, tests).
 
-**Outbound**
+### Outbound
 
 - `libc` (syscalls, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` on Android (DNS),
   host files (`/proc/self/status`, `/proc/self/pagemap`, `/proc/meminfo`, `/proc/net/route*`,

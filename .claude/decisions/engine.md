@@ -1,5 +1,7 @@
 # CPU engine (engine) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
+>
 > Last distilled: 2026-11-03 (HEAD = cd53f35) — seeded by hand from the retired design doc §4 and
 > the round records in `docs/rounds/`; no `MODULE: engine` Decision blocks exist yet, so sources
 > cite rounds instead of commits.

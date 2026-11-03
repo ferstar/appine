@@ -1,6 +1,8 @@
 # harness Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/harness.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 
 ## Responsibilities
@@ -58,7 +60,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ## Data flow / lifecycle
 
-**1. `appine-run`**
+### `appine-run`
 
 - Options stop at the first non-option, `--` or a non-UTF-8 argument. argv is the program and its
   arguments as given; the environment is only the `--env` values.
@@ -82,7 +84,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   kill only the guest process by default), `APPINE_TEST_HOOKS` (only in debug or `test-hooks`
   builds), `APPINE_DBT_REGS`.
 
-**2. Integration tests and benchmarks**
+### Integration tests and benchmarks
 
 - Guest programs (`tests/guest`): assembly built with the host `cc` (`-nostdlib -static`), C with
   `musl-gcc -static -O2 -Werror -pthread`, both natively on the aarch64 host; most run as host
@@ -99,7 +101,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   (minimum of N runs), fails if any output differs, and prints times, ratios and a geometric mean;
   it uses the `appine-run` next to its own executable.
 
-**3. Differential tests**
+### Differential tests
 
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined); elsewhere through `scripts/dev`.
@@ -115,7 +117,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   reflink copy), cases go slowest first by recorded time, and each lane prints its report in one
   write; failures are copied to `failed/`.
 
-**4. LTP**
+### LTP
 
 - `build-ltp` builds a pinned LTP release in `alpine:3.24`, directory by directory, skipping what
   does not build with musl, into `target/ltp/ltp-<ver>.tar`.
@@ -127,7 +129,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `LTP_TIMEOUT_MUL=5`, `LTP_RUNTIME_MUL=0.1`; exit 0 PASS, 32 CONF, 124 TIMEOUT, else FAIL, and any
   `appine: internal error` in the log makes it BUG.
 
-**5. Survey and crash**
+### Survey and crash
 
 - `survey` keeps a store with about 40 packages (network needed to build it); each workload script
   runs under `APPINE_LOG=1` and a timeout, and one line reports exit code, time, the count of
@@ -138,7 +140,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `appine-run`, drops writes at a random moment (power loss) or kills it, remounts, and checks that
   each file is one complete version and every fsynced file is whole; `native` mode is the control.
 
-**6. Development container and CI**
+### Development container and CI
 
 - `scripts/dev` runs a command in `rust:1.90.0-slim-trixie` plus rustfmt, clippy, llvm, clang and
   musl-tools, as root, with the repository at `/work`, `CARGO_TARGET_DIR=/work/target/linux-arm64`,
@@ -153,11 +155,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - Developers and scripts; CI; `appine-bench` (sibling binary); round records that quote results.
 
-**Outbound**
+### Outbound
 
 - `appine_kernel` (`run`, `import_rootfs`, `sync_store`, `Machine` in some tests), `appine_hal`
   (`RawMode`, `sigwinch_notifier`, `isatty`); docker and colima; `scripts/fetch-rootfs`; musl-tools;

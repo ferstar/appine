@@ -1,6 +1,8 @@
 # kernel/signal Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/signal.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -67,7 +69,7 @@ procfs.
 
 ## Data flow / lifecycle
 
-**1. Sending a signal**
+### Sending a signal
 
 - The siginfo is prepared for the target (`si_uid` translated, `si_pid` hidden if the target's pid
   namespace cannot see the sender); default-handled signals aimed at a pid-namespace init are
@@ -88,7 +90,7 @@ procfs.
 - Permissions: `may_signal` (same user or `CAP_KILL`); `kill` handles `-1` (all except init and
   self), `0` and negative process groups; pid 1 is handled by `kernel/process` (power requests).
 
-**2. Delivery**
+### Delivery
 
 - `deliver` runs before every return to guest code. For an interrupted syscall it first rewinds
   (`x0 = orig_x0`, PC back to the `svc`).
@@ -110,7 +112,7 @@ procfs.
 - Group stop: marks the group stopped, notifies the parent with `CLD_STOPPED` (`SIGCHLD` unless the
   parent set `SA_NOCLDSTOP`) and requests a `CHILD` wake.
 
-**3. Signal frames**
+### Signal frames
 
 - The frame copies Linux arm64 byte for byte: `siginfo` (always written), `ucontext` (flags and
   link 0, `uc_stack` describing the altstack before auto-disarm, the mask to restore),
@@ -125,7 +127,7 @@ procfs.
   x29 = the frame record; x30 = `sa_restorer` with `SA_RESTORER`, else the vDSO's
   `__kernel_rt_sigreturn`; pc = handler.
 
-**4. `rt_sigreturn`**
+### `rt_sigreturn`
 
 - Validates before changing anything: SP 16-byte aligned, frame readable, pstate mode bits zero,
   records with valid sizes, exactly one `fpsimd_context` of 528 bytes; ESR records ignored; any
@@ -135,7 +137,7 @@ procfs.
   handler may change it (Go preemption, V8 wasm traps).
 - A frame that cannot be written, or a bad frame at sigreturn, kills the group with `SIGSEGV`.
 
-**5. Synchronous faults to signals** (run loop, after `kernel/mm` decides page faults)
+### Synchronous faults to signals (run loop, after `kernel/mm` decides page faults)
 
 - `brk` → `SIGTRAP`/`TRAP_BRKPT`, `si_addr` = PC, no ESR record.
 - Hardware breakpoint/watchpoint → `SIGTRAP`/`TRAP_HWBKPT`, address = PC or access start, no ESR.
@@ -146,7 +148,7 @@ procfs.
 - The faulting instruction has no visible effect (no register or base writeback), and the PC in the
   frame points at it (precision comes from the engine's checks).
 
-**6. Signal syscalls**
+### Signal syscalls
 
 - `rt_sigaction`: installing an action for `SIGKILL`/`SIGSTOP` is `EINVAL` (querying them works);
   flags are stored and reported as given; any change that makes a signal ignored (`SIG_IGN`, or
@@ -159,7 +161,7 @@ procfs.
 - signalfd: reads dequeue matching signals of the calling thread and its group, in the Linux
   `signalfd_siginfo` layout; readiness also follows the calling thread.
 
-**7. exec and clone**
+### exec and clone
 
 - exec: shared handlers are unshared, handlers reset to default (ignored ones stay ignored), the
   altstack and `saved_sigmask` cleared; pending signals and the mask survive; the thread re-kicks
@@ -167,7 +169,7 @@ procfs.
 - clone: the child inherits the mask with nothing pending; `CLONE_SIGHAND` shares handlers,
   `CLONE_CLEAR_SIGHAND` resets them; a `CLONE_VM` child without vfork gets no altstack.
 
-**8. vDSO**
+### vDSO
 
 - One page, built at runtime as a minimal real ELF shared object (`ET_DYN`, a loadable segment and a
   dynamic segment, `DT_HASH`, symbol versions with `LINUX_2.6.39`, soname `linux-vdso.so.1`) and
@@ -178,7 +180,7 @@ procfs.
 - `__kernel_gettimeofday`, `clock_gettime` and `clock_getres` are `mov x8, #nr; svc #0; ret` stubs;
   an `svc` at those addresses takes the no-BKL fast path and skips ptrace and seccomp stops.
 
-**9. ptrace**
+### ptrace
 
 - Tracees are threads; the tracer is a process (any of its threads may issue requests; tracees are
   released only when the whole tracer process exits). No Yama restrictions. Tracing pid 1 is
@@ -213,7 +215,7 @@ procfs.
   process exits, tracees are killed with `EXITKILL`, otherwise detached; detaching a tracee in a
   stopped group returns it to the group stop.
 
-**10. Core dumps**
+### Core dumps
 
 - Written when a core-generating signal (`SIGQUIT`, `SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGBUS`,
   `SIGFPE`, `SIGSEGV`, `SIGXCPU`, `SIGXFSZ`, `SIGSYS`) takes its default action as the group's first
@@ -232,7 +234,7 @@ procfs.
   pages left as holes; writing stops at `RLIMIT_CORE`.
 - A successful dump sets the wait status's core flag and `CLD_DUMPED`.
 
-**11. Kernel log**
+### Kernel log
 
 - A printk-style ring buffer: 128 KB of text, at most 4096 records, oldest dropped first; records
   carry sequence, monotonic timestamp, facility, level and text (truncated to 991 bytes).
@@ -245,7 +247,7 @@ procfs.
 - Permissions follow `dmesg_restrict` and `CAP_SYSLOG` (`CAP_SYS_ADMIN` works with a warning);
   `printk_devkmsg=off` makes opening `/dev/kmsg` `EPERM`; console log levels are only recorded.
 
-**12. ABI contract**
+### ABI contract
 
 - `uname -r` reports `6.1.0-appine` (version `#1 SMP PREEMPT appine`, machine `aarch64`, nodename
   from the UTS namespace); `/proc/version` and `/proc/sys/kernel/{osrelease,version,ostype}`
@@ -264,7 +266,7 @@ procfs.
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - The run loop and dispatcher (`kernel/process`): delivery after every syscall, kick and fault;
   syscall-entry/exit ptrace stops; `orig_x0`; restart handling.
@@ -272,7 +274,7 @@ procfs.
   seccomp (`force_fatal`, `SECCOMP` event stops), procfs (signal state, `/proc/<pid>/mem`), the OOM
   killer and bug handling (kernel log).
 
-**Outbound**
+### Outbound
 
 - `kernel/process`: `request_wake*`, `signal_later`, group exit, namespace translation, wait.
 - `kernel/mm`: `read`/`write`/`write_force`, `grow_stack`, `dump_regions`/`dump_page`/`residency`.

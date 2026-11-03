@@ -1,6 +1,8 @@
 # kernel/procfs Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/procfs.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -60,7 +62,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 ## Data flow / lifecycle
 
-**1. Instances, lookup and metadata**
+### Instances, lookup and metadata
 
 - Each procfs mount is a new instance with its own device; if the mounter is in a non-initial pid
   namespace, the instance is bound to it, otherwise it uses the initial one. Mount options
@@ -85,7 +87,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2 plus threads);
   sizes are 0 except sysfs and cgroup files (4096).
 
-**2. Opening, reading and writing**
+### Opening, reading and writing
 
 - Open (in `kernel/vfs`'s pseudo open): DAC against the synthetic stat; for `mem`, `auxv`,
   `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap` one ptrace check with real credentials
@@ -107,7 +109,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Synthetic files (other than kmsg) cannot be added to epoll (`EPERM`) and poll as always ready, so
   mount table changes are never signalled through mountinfo.
 
-**3. Per-process files**
+### Per-process files
 
 - Entries: `auxv`, `stat`, `status`, `statm`, `cmdline`, `comm`, `environ`, `limits`, `maps`,
   `mem`, `smaps`, `smaps_rollup`, `pagemap`, `mounts`, `mountinfo`, `cwd`, `exe`, `root`, `fd/`,
@@ -140,7 +142,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
   empty, `fd/` is empty, `cwd`/`root`/`ns` are `ENOENT`.
 
-**4. System-wide files and `/proc/sys`**
+### System-wide files and `/proc/sys`
 
 - `meminfo`: 16 fields copied from the host's `/proc/meminfo` (falling back to host `sysinfo`), not
   clamped to cgroup limits. `sysinfo(2)` takes memory from the host but uptime (with the time
@@ -180,7 +182,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   filtered by namespace, uids mapped for the reader; host interface counters and routes only in
   the initial namespace (new namespaces show zeros); `arp` is a header line.
 
-**5. sysfs**
+### sysfs
 
 - Tree: `class/net/`, `devices/system/cpu/` (`online`, `possible`, `present`, `offline`, one
   `cpu<n>/` per guest CPU with synthesized `topology/` — each CPU its own core, one package — and
@@ -198,7 +200,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - sysfs is read-only (write opens `EACCES`, chmod/chown `EACCES`); one instance, so new mounts
   share the boot device and stacking on its root is `EBUSY`.
 
-**6. devpts and nsfs**
+### devpts and nsfs
 
 - Each devpts mount is an instance (`PtsRoot(dev)`) with its own terminals and `PtsOptions`
   (`uid`, `gid`, `mode`, `ptmxmode`, `max`; defaults `mode=600,ptmxmode=000`; the boot instance
@@ -214,7 +216,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   whose inode is the namespace id, device 0:4, statfs `NSFS_MAGIC`; opening keeps the namespace
   alive; reading is `EINVAL`; bind-mounting it pins the namespace.
 
-**7. cgroup v2**
+### cgroup v2
 
 - One global tree; the root (id 1, owned by root) looks like a docker container's root under a
   cgroup namespace with cpuset, cpu, memory and pids available. cgroup2 is mounted read-write at
@@ -258,7 +260,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `/proc/<pid>/cgroup` is `0::<path>` relative to the reader's cgroup-namespace root;
   `/proc/cgroups` reports hierarchy 0 for the v1 controller names.
 
-**8. bpf(2) and device programs**
+### bpf(2) and device programs
 
 - Commands: program load, attach, detach, query, get-fd-by-id, info by fd (no maps or links).
   When `unprivileged_bpf_disabled` is nonzero (default 2) every command needs `CAP_BPF` or
@@ -277,7 +279,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `kernel/vfs` (walker and magic links, pseudo open/read/write/lseek/stat/getdents, chmod/chown/
   utimensat on devpts nodes, mkdir/rmdir in cgroup2, mount options for devpts and cgroup2, device
@@ -285,7 +287,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   freezer stop in the signal path); the OOM killer (`memory_limits`, `measure_memory`,
   `oom_group`, events); `syscall/poll.rs` (epoll refusal); the machine (`Offline` before boot).
 
-**Outbound**
+### Outbound
 
 - Kernel state: thread groups and tasks, credentials (`permission`, `may_ptrace`, `capable`,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument

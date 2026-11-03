@@ -1,6 +1,8 @@
 # engine Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/engine.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -27,7 +29,7 @@ Tier 1, only CPUID advertised).
 
 ## Key types
 
-**CPU state and contract**
+### CPU state and contract
 
 - `struct appine_cpu` / `CpuState` — one per guest thread: X0–X30, SP, PC, NZCV, FPCR, FPSR,
   TPIDR_EL0, exit and fault information, the `pending` kick flag, the bound page table, the
@@ -41,7 +43,7 @@ Tier 1, only CPUID advertised).
   `InvalidateCode{addr}`, `HostFault{signal, code, addr, pc}`. `FaultKind`: page, alignment,
   stack alignment, watchpoint, hardware breakpoint. `Access`: read, write, exec.
 
-**Tier 1**
+### Tier 1
 
 - `DbtSpace` (`struct appine_dbt`) — one translation instance: 128 MB code cache with the shared
   routines at its start, the lock-free translation table, block records, saved guest words, per-page
@@ -77,7 +79,7 @@ Tier 1, only CPUID advertised).
 
 ## Data flow / lifecycle
 
-**1. Tier selection** (decided by the kernel run loop)
+### Tier selection (decided by the kernel run loop)
 
 - Tier 1 runs when the address space has a `DbtSpace`; Tier 0 (`Cpu::run`) runs when there is no
   instance, when hardware breakpoints are set, and when the instance is poisoned; `Cpu::step` is
@@ -85,7 +87,7 @@ Tier 1, only CPUID advertised).
 - Tier 1 itself executes any instruction it does not translate by calling Tier 0 for that one
   instruction.
 
-**2. CPU state and exits**
+### CPU state and exits
 
 - `Cpu::new` takes a pooled state or maps a new one and zeroes everything before the TLB, the
   V registers and the debug slots, flushing only used TLB entries.
@@ -95,7 +97,7 @@ Tier 1, only CPUID advertised).
   thread's last recorded host fault. Exit code 0 or an unknown code panics.
 - The kernel collects `ivau_page` on every exit and turns `Undefined` into `SIGILL`/`ILL_ILLOPC`.
 
-**3. Tier 0 execution**
+### Tier 0 execution
 
 - Step order: PC alignment (alignment fault), hardware breakpoint (before executing), instruction
   fetch through the ITLB (exec page fault), then decode.
@@ -117,7 +119,7 @@ Tier 1, only CPUID advertised).
 - `dc zva` zeroes 64 bytes and needs write permission; other DC operations and `ic ivau` only check
   read permission; `ic ivau` always exits with `InvalidateCode` in Tier 0. PRFM touches nothing.
 
-**4. Native stubs and FP state**
+### Native stubs and FP state
 
 - SIMD and FP data processing, CRC32 and the LSE atomics run as cached host "native stubs": C
   decides whether the encoding is whitelisted, translates the address and moves registers, and a
@@ -135,7 +137,7 @@ Tier 1, only CPUID advertised).
 - If native stubs are unavailable, those instructions are undefined and no SIMD or FP feature is
   advertised.
 
-**5. Exclusives and atomics** (both tiers)
+### Exclusives and atomics (both tiers)
 
 - LDXR records address, size and the loaded value; STXR succeeds only if address and size match
   and a compare-and-swap against the recorded value succeeds on the host address (ABA allowed).
@@ -149,7 +151,7 @@ Tier 1, only CPUID advertised).
   stolen register. LDAR/STLR, LDAPR, LDAPUR/STLUR, CAS and LSE run natively on the host address.
   LDXP/STXP, CASP with stolen operands, and misaligned atomics go to Tier 0.
 
-**6. Tier 1 register convention**
+### Tier 1 register convention
 
 - Guest registers live in the same-numbered host registers, except the "stolen" ones, which live
   in the CPU state: X16, X17, X18, X26, X27, X28 for the default set; X18 and X21–X25 for the Go
@@ -163,7 +165,7 @@ Tier 1, only CPUID advertised).
   build-ID note (`APPINE_DBT_REGS=go|default` overrides); routines and templates are generated per
   set.
 
-**7. Tier 1 blocks and instruction handling**
+### Tier 1 blocks and instruction handling
 
 - A block starts with a two-word kick check, holds at most 64 guest instructions, and never crosses
   a guest page (a forward chain exit to the next pc ends it). It ends at B, BL, SVC, BR/BLR/RET and
@@ -190,7 +192,7 @@ Tier 1, only CPUID advertised).
     address; CLREX clears `excl_size`.
 - Exit stubs carry the guest pc, the patch site and a packed reason word back to the dispatcher.
 
-**8. Tier 1 memory access**
+### Tier 1 memory access
 
 - Handled inline: integer LDR/STR in all immediate, pre/post-index and register-offset forms,
   literal loads, LDP/STP/LDNP/LDPSW, SIMD single-register, pair and literal forms, and LD1–LD4 /
@@ -238,7 +240,7 @@ Tier 1, only CPUID advertised).
   following 256 bytes (64-entry ring; templates are versioned by it). Failures while watchpoints
   are set are not counted.
 
-**9. Tier 1 control flow**
+### Tier 1 control flow
 
 - Direct branches are linked by patching a `b`: a link stub starts with a branch to its next word,
   which is rewritten to branch to the target block (concurrent `b`→`b` patching is allowed by
@@ -261,7 +263,7 @@ Tier 1, only CPUID advertised).
   loop passes through at least one check. The dispatcher also checks before entering code.
 - Stubs keep their data (guest pc, reason) in data words at their end, read by the routines.
 
-**10. Dispatcher**
+### Dispatcher
 
 - `appine_dbt_run` runs under the fault guard; a poisoned instance runs Tier 0 for the whole call.
 - Each iteration: join or perform a pending flush, catch up with the instance's generation (reset
@@ -273,7 +275,7 @@ Tier 1, only CPUID advertised).
   returned to the kernel, except `ic ivau`, which is absorbed in place.
 - A host fault inside the run marks the instance poisoned and clears the template arena.
 
-**11. Code cache, table and memory**
+### Code cache, table and memory
 
 - The code cache is 128 MB (the reach of `b`), mapped twice from one shared anonymous region with
   `mremap` (read-write for writing, read-execute for running; read-write-execute if the host
@@ -306,7 +308,7 @@ Tier 1, only CPUID advertised).
   kernel's timer thread calls it every second while guest threads run (and once after they all go
   idle), and the OOM and cgroup measurements subtract `written_code_bytes`.
 
-**12. Sharing translations**
+### Sharing translations
 
 - A block's translation depends only on its guest pc, its guest instruction words, the register set
   and whether it is shared; the words are saved and re-compared at install, recheck, revive and
@@ -336,7 +338,7 @@ Tier 1, only CPUID advertised).
   non-parkable mismatches exceed half of the live blocks, nothing is retired and a full flush is
   requested instead.
 
-**13. Invalidation**
+### Invalidation
 
 - The kernel replays its code-change log through `Dbt::invalidate(cpu, start, len)`, or calls
   `Dbt::flush` when the log no longer covers what the thread missed.
@@ -351,7 +353,7 @@ Tier 1, only CPUID advertised).
   Page 0 doubles as "none" (see bugs).
 - `retire_outside` (first join of a group) and `ungroup` also retire blocks.
 
-**14. CPU features and ID registers**
+### CPU features and ID registers
 
 - Guest features = host features ∩ Tier 0's implemented set ∩ the whitelist, computed once.
   CPUID is always advertised. The implemented set (FP, ASIMD, AES, PMULL, SHA1/2/3/512, CRC32,
@@ -370,7 +372,7 @@ Tier 1, only CPUID advertised).
   derived from the set, every other register in that range reads 0; CRm 8–15 is undefined.
 - DIT is kept in the CPU state; the host thread's DIT follows the guest's at each entry.
 
-**15. Host fault guard**
+### Host fault guard
 
 - `install_fault_guard` installs SIGSEGV, SIGBUS and SIGILL handlers (chained after ART's); the
   machine installs it only when kernel bugs are contained (release builds by default, or
@@ -387,7 +389,7 @@ Tier 1, only CPUID advertised).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - The kernel task run loop (`Cpu::run`/`step`, `Dbt::run`, exit handling, `ivau_page`, kicks).
 - `kernel/mm` (`DbtSpace` creation, code groups, `trust`/`share`/`retire_outside`/`set_sources`,
@@ -398,7 +400,7 @@ Tier 1, only CPUID advertised).
   (random instruction sequences compared between hardware, Tier 0 and Tier 1; the whitelist check
   against `llvm-mc`, which runs only on Linux aarch64 and is skipped without `llvm-mc`).
 
-**Outbound**
+### Outbound
 
 - `kernel/mm` structures: the page table (`appine_mmu_translate`, the PTE layout walked by the
   refill routine), the TLB entry layout and `tlb_used`.

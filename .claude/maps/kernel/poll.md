@@ -1,6 +1,8 @@
 # kernel/poll Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/poll.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -52,7 +54,7 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
 
 ## Data flow / lifecycle
 
-**1. The readiness contract**
+### The readiness contract
 
 - `readiness(file)` is one `match` over `FileKind` returning known events and, for host-backed
   files (host stdio, inet sockets other than ICMP), the host fd: pipes and eventfd inline; timerfd
@@ -65,7 +67,7 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
 - `arrivals(file)` gives monotonic `[in, out]` generation counters (plus host edges);
   `wake_objects(file)` the objects every state change wakes.
 
-**2. Waiting**
+### Waiting
 
 - `Waits` collects host fds and wake objects (readiness is computed again per file) and calls the
   kernel's wait: the BKL is dropped around one host poll of all host fds plus the thread's event
@@ -73,7 +75,7 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
   waits also listen on the CHILD and SIGNAL channels. Spurious wakeups just rescan. The BKL is held
   for every scan.
 
-**3. ppoll and pselect6**
+### ppoll and pselect6
 
 - ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`); each fd
   looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted.
@@ -85,7 +87,7 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
   `ERESTARTNOHAND` → wait; remaining time written back whenever a nonzero timeout was given (a
   failing write turns the restart into `EINTR`); restarts re-read the remaining time.
 
-**4. epoll**
+### epoll
 
 - `epoll_create1`: only `O_CLOEXEC` (else `EINVAL`).
 - `epoll_ctl` checks: epfd (`EBADF`, `EINVAL` if not an epoll); target (`EBADF`, `O_PATH`
@@ -119,7 +121,7 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
   every kernel change while gates exist, and to the host edges) wakes only the first waiter when a
   new edge appears; woken waiters requeue at the back.
 
-**5. eventfd**
+### eventfd
 
 - `eventfd2` flags `EFD_SEMAPHORE|O_CLOEXEC|O_NONBLOCK` (else `EINVAL`). Read: buffer under 8
   `EINVAL`; takes the count (or 1 in semaphore mode) or blocks/`EAGAIN`/`ERESTARTSYS`. Write: under
@@ -127,7 +129,7 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
   still counts as an arrival. Readiness: `POLLIN|RDNORM` when nonzero, `POLLOUT|WRNORM` below
   `u64::MAX - 1`; never `POLLERR`. Generations `[writes, reads]`.
 
-**6. Signal-driven I/O**
+### Signal-driven I/O
 
 - Turning `O_ASYNC` on (`F_SETFL`, `FIOASYNC`) registers a `Fasync` entry for any file kind,
   snapshotting the current events (already-ready events are not signalled) and waking the timer
@@ -141,13 +143,13 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - The syscall dispatcher (also the drain hook after I/O syscalls); AIO (`poll_once`, masks, resfd
   eventfds); the timer thread (`check_exclusive`, `check_fasync`); fcntl/ioctl (`register_fasync`);
   pipe writes (`arrived`); fdinfo and kcmp.
 
-**Outbound**
+### Outbound
 
 - The kernel's waits (`wait_objects`, `block_for`, `interrupted`), wake objects and channels,
   `edge_waiters`; `appine_hal::poll` and `appine_hal::Edges` (host epoll; unavailable on non-Linux

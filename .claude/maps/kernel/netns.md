@@ -1,6 +1,8 @@
 # kernel/netns Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/netns.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -63,7 +65,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Data flow / lifecycle
 
-**1. Namespaces**
+### Namespaces
 
 - Created by clone/unshare with `CLONE_NEWNET` (`CAP_SYS_ADMIN` in the new credentials' user
   namespace). The block is the first n in 1..=65535 whose bytes [a, b] are free and not 255
@@ -75,7 +77,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
   namespace files keep a namespace alive. A socket keeps the namespace it was created in, even
   after setns. Dropping a namespace drops its devices; a veth whose peer died is pruned lazily.
 
-**2. Address translation**
+### Address translation
 
 - Binding in a new namespace: the wildcard and `::` → 127.a.b.1 (flag `any`); 127.0.0.x →
   127.a.b.x (bindable even with lo down); other 127/8 addresses `EADDRNOTAVAIL`; the namespace's
@@ -104,7 +106,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
 - `/proc/<pid>/net` lists the sockets created in the target's namespace, translated through each
   socket's own namespace.
 
-**3. Ports and listeners in a namespace**
+### Ports and listeners in a namespace
 
 - Explicit nonzero binds keep the guest port and let the host choose (`portmap::bind_any`, keyed
   by namespace, protocol and guest port — no family or address, and the guest's `IPV6_V6ONLY` is
@@ -122,7 +124,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
 - Accepted sockets inherit the port map, `vaddr` and namespace; their peer is translated as above;
   getsockname reports the wildcard until a connect, then the facing address.
 
-**4. Virtual devices**
+### Virtual devices
 
 - Kinds: bridge, veth, dummy (others `EOPNOTSUPP`); bridges cannot move between namespaces.
   Changes need `CAP_NET_ADMIN` over the namespace owner (and over a target namespace named by
@@ -156,7 +158,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
 - ioctls: get/set flags, MTU, name, hardware address, txqlen, and the address getters; address
   setters `EPERM`. Statistics of virtual devices are zero.
 
-**5. nftables control plane**
+### nftables control plane
 
 - One ruleset per namespace; every request (queries too) needs `CAP_NET_ADMIN` over the
   namespace owner. Changes come in `BATCH_BEGIN`/`END` pairs within one datagram: the batch runs
@@ -179,7 +181,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
   empty ctnetlink dumps. No `NLM_F_ECHO`, no monitor notifications. Base-chain counters are 0.
 - An initial-namespace commit re-evaluates port forwarding.
 
-**6. nftables evaluation**
+### nftables evaluation
 
 - At connect and at every sendto with an address (connected UDP: once at connect), the socket
   layer builds a fake packet (addresses, protocol, ports, uid/gid, mark, interfaces, ct state) and
@@ -210,7 +212,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
   updates the mark.
 - `tracks()` (any conntrack-using table) decides whether `SO_ORIGINAL_DST` answers.
 
-**7. Forwarding from outside**
+### Forwarding from outside
 
 - Candidates: initial-namespace TCP listeners and UDP sockets bound to a nonzero port (not raw)
   when the initial namespace has PREROUTING nat. A synthetic packet from 192.0.2.1:40000 to the
@@ -235,14 +237,14 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, netlink
   configure and netfilter, forward targets, `SO_ORIGINAL_DST`); `kernel/process` (clone/unshare/
   setns create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`,
   `/sys/class/net`); the machine (the forwarder per kernel).
 
-**Outbound**
+### Outbound
 
 - `appine_hal::net` (host sockets, host interfaces, poll, dup, events); `kernel/net`'s portmap,
   routes (`route::merge`, `attrs`) and netlink encoding; credentials (`ns_capable`); the kernel

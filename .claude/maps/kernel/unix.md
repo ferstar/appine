@@ -1,6 +1,8 @@
 # kernel/unix Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/unix.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -48,7 +50,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 
 ## Data flow / lifecycle
 
-**1. Creating sockets**
+### Creating sockets
 
 - `socket`: protocol 0 or 1 (else `EPROTONOSUPPORT`); stream, datagram, seqpacket (`SOCK_RAW`
   becomes datagram; others `ESOCKTNOSUPPORT`); the socket records a new network namespace if the
@@ -56,7 +58,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 - `socketpair` (any of the three types) builds two connected stream channels or two datagram links
   pointing at each other; both ends record the creator's credentials as peer credentials.
 
-**2. Names**
+### Names
 
 - Addresses: over 128 bytes `EINVAL` (generic layer), then 2..110 bytes and `AF_UNIX`; an empty
   path is unnamed, a leading NUL abstract (all bytes kept), otherwise a path cut at the first NUL.
@@ -71,7 +73,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   namespace (the socket's creation namespace). Names die with their socket (pruned lazily); path
   nodes stay in the store.
 
-**3. Connections**
+### Connections
 
 - listen: datagram `EOPNOTSUPP`; unbound `EINVAL`; backlog clamped to 4096 (negative → 4096);
   records the listener's credentials; re-listen only updates the backlog.
@@ -94,7 +96,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   files) is discarded, so the peer's writes get `EPIPE`; a listener's pending ends are dropped (their
   clients see EOF/`EPIPE`). No `ECONNRESET` exists anywhere and `SO_ERROR` is always 0.
 
-**4. Sending and receiving**
+### Sending and receiving
 
 - Control messages on send: 16-byte headers, 8-byte alignment, at most 253 fds in total; other
   levels or types `EINVAL`; `SCM_CREDENTIALS` must match the sender (pid/uid/gid) unless
@@ -115,7 +117,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   dropped (closed). Control buffers are capped at 4096 bytes, data at 1 MiB per call.
 - Waits interrupted by a signal return `ERESTARTSYS`, even with a timeout set.
 
-**5. Options, readiness, listing**
+### Options, readiness, listing
 
 - setsockopt: `SO_PASSCRED`, `SO_RCVTIMEO`/`SO_SNDTIMEO` (negative times mean none); other
   `SOL_SOCKET` names are accepted and ignored (`SO_*BUFFORCE` needs `CAP_NET_ADMIN`); other levels
@@ -132,7 +134,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   state 1 (unconnected/listening), 3 (connected), pending connections as state 2; abstract names
   printed with `@`.
 
-**6. Garbage collection**
+### Garbage collection
 
 - Channels that queue files are recorded. `released` drops closed files and, if any was a unix
   socket, runs `collect`: candidates are unix-socket files all of whose references are in-flight
@@ -146,13 +148,13 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `kernel/net` (socket syscalls, read/write, ioctl, readiness, `accept4` installing the fd);
   `kernel/vfs` close paths (`released`); `kernel/process` (execve close-on-exec, last-thread
   exit); seccomp addfd; `kernel/procfs` (`/proc/net/unix`).
 
-**Outbound**
+### Outbound
 
 - `kernel/vfs` and `kernel/store` (path lookup, creation checks, `mknod`, tmpfs accounting,
   inotify); fd tables (`get`, `install`); credentials and namespaces (`permission`, `new_owner`,

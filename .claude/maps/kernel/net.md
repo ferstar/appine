@@ -1,6 +1,8 @@
 # kernel/net Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/kernel/net.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 
 ## Responsibilities
@@ -70,7 +72,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ## Data flow / lifecycle
 
-**1. Creating sockets**
+### Creating sockets
 
 - `socket`: flags other than the type, `SOCK_NONBLOCK` and `SOCK_CLOEXEC` are `EINVAL`.
   AF_INET/AF_INET6: `SOCK_RAW` with a protocol 1..255 is `EPERM` unless it is ICMP/ICMPv6 and the
@@ -82,7 +84,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - `socketpair` is AF_UNIX only (inet and netlink `EOPNOTSUPP`, others `EAFNOSUPPORT`/
   `EPROTONOSUPPORT`).
 
-**2. Binding, listening, connecting, accepting**
+### Binding, listening, connecting, accepting
 
 - bind: sockaddr over 128 bytes `EINVAL`; raw sockets drop the port; the namespace translation
   runs; ports below `ip_unprivileged_port_start` need `CAP_NET_BIND_SERVICE` over the namespace
@@ -104,7 +106,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   is unmapped and translated; the fd is installed before the address is written back (a failed
   write leaves it installed), and `EMFILE` comes after the connection was already taken.
 
-**3. Sending and receiving**
+### Sending and receiving
 
 - send (sendto, sendmsg, write; sendmmsg one message at a time): netlink goes to `handle`; DNS
   stub queries are answered in place (section 5); datagrams with an address go through `route()`
@@ -125,7 +127,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - Host sendmsg/recvmsg run under the BKL (nonblocking); only waits and the DNS query release it.
   There is no BKL-free fast path for sockets.
 
-**4. Options and ioctls**
+### Options and ioctls
 
 - Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (the old numbers; short buffers or negative times mean
   no timeout), `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace owner; stored
@@ -145,7 +147,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - Loopback in the initial namespace goes straight to the host, so other apps on the device can
   reach guest services.
 
-**5. DNS stub**
+### DNS stub
 
 - `Vfs::open` writes `nameserver 127.0.0.53` when `/etc/resolv.conf` is missing (existing files,
   empty files and symlinks are left alone); the Android app overwrites Debian's at import.
@@ -161,7 +163,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   queued on the socket with source `127.0.0.53:53`, readiness and `FIONREAD` follow the queue,
   and the send returns the query length.
 
-**6. Low ports and traffic counters**
+### Low ports and traffic counters
 
 - Mapping applies to TCP/UDP (MPTCP as TCP) non-raw sockets: in the initial namespace for guest
   ports 1..1023 (when the offset is nonzero), in new namespaces for every explicitly bound port
@@ -182,7 +184,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `CurrEstab` live from `TCP_INFO`, error and retransmission counters 0). DNS stub and AF_UNIX
   traffic are not counted; new namespaces show zeros. Counters are plain fields under the BKL.
 
-**7. `SO_ORIGINAL_DST` and transparent proxying**
+### `SO_ORIGINAL_DST` and transparent proxying
 
 - TCP connects whose destination nat rewrote register `(host local, host destination)` → the
   original destination per namespace; records survive the client's close (like conntrack) and go
@@ -194,7 +196,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   connections; the accepted side answers the claimed address, or its own local address when
   tracking; otherwise `ENOENT`. No TPROXY: the nft `tproxy`/`TPROXY` names parse but never match.
 
-**8. Raw ICMP**
+### Raw ICMP
 
 - A raw ICMP socket is a host ping socket with host `IP_RECVTTL`, `IP_PKTINFO` and `IP_RECVERR`
   (or `IPV6_RECVERR`), registered with its namespace's `Tap` (created on demand; the timer
@@ -218,7 +220,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   control messages only when enabled; `MSG_TRUNC`/`MSG_CTRUNC` as Linux; `MSG_ERRQUEUE` returns
   the socket's own errors. Readiness comes from the receiver queues (POLLOUT always).
 
-**9. Netlink**
+### Netlink
 
 - bind takes `nl_pid` (0 → the caller's tgid in its pid namespace; explicit ids unchecked;
   rebinding allowed; groups ignored); unbound sockets keep id 0 (no autobind); connect and
@@ -242,7 +244,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - `NETLINK_GENERIC`: `nlctrl` only, modelled on 6.8 (unknown families `ENOENT`, `GETPOLICY`
   `EOPNOTSUPP`). `NETLINK_NETFILTER` goes to nftables. `NETLINK_KOBJECT_UEVENT` never receives.
 
-**10. Routing table**
+### Routing table
 
 - Main table: the host's routes from `Machine::set_routes` (Android: the default network's
   `LinkProperties.getRoutes()`, an empty list on network loss), else the host's
@@ -258,14 +260,14 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - The syscall dispatcher; `kernel/vfs` (read/write/ioctl on sockets, `Vfs::open` writing
   `resolv.conf`); `kernel/poll`; `kernel/procfs` (`/proc/net`, sysfs counters); the machine
   (timer thread `check_taps`, `set_routes`, `take_listens`); `kernel/netns` (forward targets,
   netlink device requests); the message-queue code (mq_notify cookies on netlink sockets).
 
-**Outbound**
+### Outbound
 
 - `appine_hal::net` (host sockets, `dns_query`, `interfaces`, `routes`, `source_for`, epoll
   `Watch`); `kernel/netns` (`to_host`, `from_host`, `implicit_bind`, nat, filter, listener

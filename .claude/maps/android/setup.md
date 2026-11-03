@@ -1,6 +1,8 @@
 # android/setup Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/setup.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 
 ## Responsibilities
@@ -45,7 +47,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ## Data flow / lifecycle
 
-**1. Tarballs**
+### Tarballs
 
 - Alpine: `scripts/fetch-rootfs` downloads the minirootfs and the doas package at build time (pinned
   version and sha256; the GPG signature is checked when gpg is available); Gradle bundles them as
@@ -56,7 +58,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   sha256, and renames; a verified cached tarball is reused; cancellation is checked before each
   read.
 
-**2. Import**
+### Import
 
 - `prepare`: delete `rootfs.tmp`, import into it, delete the tarball, `configure`, record the
   distro and its first mirror in preferences (`commit`), sync the store, rename to the real store
@@ -70,7 +72,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - Before boot (`PREFER_OSCLOCK`): with OpenRC installed and no clock service in any runlevel, add
   osclock to boot.
 
-**3. Mirrors**
+### Mirrors
 
 - Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After an import the service
   probes them concurrently (up to 512 KB or 5 s each, by throughput) and writes the fastest unless
@@ -79,7 +81,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   scheme and the rest of each line, and leaves other sources alone; a missing sources file is
   written from the template; a file with no built-in mirror is left alone with a hint.
 
-**4. Accounts and login**
+### Accounts and login
 
 - `loginAccount`: `auto` is the regular account (UID 1000–65533, a real login shell) with the
   lowest UID, else root; `root`; or a named passwd entry, falling back to root.
@@ -95,7 +97,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
     util-linux su offers it); package commands read from `/dev/null` so early typing reaches the
     shell.
 
-**5. Settings**
+### Settings
 
 - Every row reads the service's state and calls it; rows that need a running kernel (mirror, tier)
   are disabled otherwise; distro and reset stay usable after a start failure; a running download
@@ -103,12 +105,12 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - `TerminalService` (start, switch, mirrors, login, tier), `Documents` (`loginAccount`, `installed`,
   `access`), `ConsolePty` (runs `login.sh`), `MainActivity` (opens Settings).
 
-**Outbound**
+### Outbound
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing); `HttpURLConnection` (system proxy); `BuildConfig`

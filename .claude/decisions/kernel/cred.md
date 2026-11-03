@@ -1,5 +1,7 @@
 # Credentials and seccomp (kernel/cred) Decisions
+
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
+>
 > Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.1 and
 > the round records in `docs/rounds/`; no `MODULE: kernel/cred` Decision blocks exist yet, so
 > sources cite rounds instead of commits.

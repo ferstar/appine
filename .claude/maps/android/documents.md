@@ -1,6 +1,8 @@
 # android/documents Map
+
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/documents.md` for the paired decision history.
+>
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 
 ## Responsibilities
@@ -35,7 +37,7 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 ## Data flow / lifecycle
 
-**1. Roots and IDs**
+### Roots and IDs
 
 - With a ready rootfs, the home comes from the login setting through `Rootfs.loginAccount`
   (`/etc/passwd` read from the store; root with `/root` when unreadable) and is shown only if it
@@ -53,7 +55,7 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   (first 4 KB without NUL and valid UTF-8 → `text/plain`, at most 1000 per call); otherwise
   `application/octet-stream`.
 
-**2. Operations**
+### Operations
 
 - Every call holds `Rootfs.access`'s read lock and opens the store afresh per JNI call; errors
   surface as `FileNotFoundException`.
@@ -68,7 +70,7 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   revokes grants on the source ID and notifies the affected directories.
 - Search: by name under the root, breadth first (200 results, 50,000 entries).
 
-**3. Notifications**
+### Notifications
 
 - Provider to kernel: the store's change path replays the changes under each running kernel's lock
   (guest inotify events).
@@ -80,12 +82,12 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 ## Dependencies (inbound / outbound)
 
-**Inbound**
+### Inbound
 
 - The framework (manifest provider: exported, grant URI permissions, `MANAGE_DOCUMENTS`);
   `TerminalService` (`rootsChanged`, `dirsChanged`); `MachineTest`.
 
-**Outbound**
+### Outbound
 
 - `Native.browse*`; `Rootfs` (`isReady`, `installed`, `access`, `loginAccount`); the service's
   static settings.
