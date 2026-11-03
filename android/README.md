@@ -1,6 +1,6 @@
 # appine Android app
 
-The Gradle project for the Android shell (design doc §3, §9, §11):
+The Gradle project for the Android shell (design doc §3, §11; terminals in the `kernel/tty` map):
 
 - `app/`: the Kotlin app. `TerminalService` is a `specialUse` foreground service that
   owns the guest kernel and the terminal sessions; `MainActivity` shows them with tabs

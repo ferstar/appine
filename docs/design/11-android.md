@@ -51,3 +51,8 @@
 - **镜像选择**：每个发行版内置一份镜像列表：官方的、清华、中科大、阿里云。导入之后在后台并发测速，选最快的写入包管理器的源，全部失败时保持官方的。设置里可以手动选一个，或者选回"自动"重新测速。写进源时只把内置镜像的地址换成选的那个，协议照旧，用户加的行都留着；源里一处内置镜像也没有时不动，提示用户手改。内核运行着也可以写：仓库的提交计数器让内核层的缓存作废（[kernel/store 的 map](../../.claude/maps/kernel/store.md)）。
 - **执行层**：设置里可以换成 Tier 0（解释器，排查问题用），记下之后重启内核。
 - **升级**：App 更新时不动用户已有的 rootfs。同一分支内由用户自己运行 `apk upgrade`、`apt upgrade`；跨分支升级由用户修改源。
+
+## 11.5 终端界面
+
+- App 里每个终端标签页对应一个 `/dev/pts/N`（内核层持有主设备的控制台，[kernel/tty 的 map](../../.claude/maps/kernel/tty.md)），在上面启动一个新会话和登录 shell（§11.4 第 4 步）。
+- 把 Termux 的 `terminal-emulator` + `terminal-view` vendor 进仓库，替换掉原来的 `TerminalSession`（它是 `final` 类，并且写死了 `JNI.createSubprocess`）。新实现经由 `Pty` 接口接到进程内 PTY 的主设备（`Machine` 的控制台）。扩展键栏属于 GPLv3 的 `termux-app` 主模块，所以重写了一份（`ExtraKeysView.kt`）。来源和改动记在 `android/README.md`。

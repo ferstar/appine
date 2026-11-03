@@ -6,7 +6,7 @@
 //! `--env` 给出的那些。退出码沿用 shell 的约定：正常退出时是 guest 的退出码，
 //! 被信号终止时是 128 + 信号编号，程序无法启动时是 127（找不到）或 126（不能执行）。
 //!
-//! stdin 和 stdout 都是终端时，guest 运行在一个进程内的 PTY 上（设计文档 §9）：宿主
+//! stdin 和 stdout 都是终端时，guest 运行在一个进程内的 PTY 上（kernel/tty 的 map）：宿主
 //! 终端切到 raw 模式，按键原样交给 guest 的行规程，^C、^Z 由它变成发给前台进程组的
 //! 信号，窗口大小跟随宿主终端。`--pty` 在没有终端时也这样做（stdin 和 stdout 可以是
 //! 管道，测试用），`--no-pty` 让 guest 直接使用宿主的 stdin/stdout/stderr。

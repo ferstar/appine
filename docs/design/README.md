@@ -14,7 +14,7 @@
 6. 进程、线程与调度，已迁到 [kernel/process 的 map](../../.claude/maps/kernel/process.md)（英文）
 7. 信号与 ABI，已迁到 [kernel/signal 的 map](../../.claude/maps/kernel/signal.md)（英文）
 8. 文件系统，已迁到 [kernel/store](../../.claude/maps/kernel/store.md)、[kernel/vfs](../../.claude/maps/kernel/vfs.md)、[kernel/procfs](../../.claude/maps/kernel/procfs.md) 的 map（英文）
-9. [TTY 与终端](09-tty.md)
+9. TTY 与终端，已迁到 [kernel/tty 的 map](../../.claude/maps/kernel/tty.md)（英文），终端界面挪进了 §11.5
 10. [网络](10-network.md)
 11. [用户、权限与 Android 集成](11-android.md)
 12. [威胁模型](12-threat-model.md)
