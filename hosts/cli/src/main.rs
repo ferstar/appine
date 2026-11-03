@@ -44,7 +44,10 @@ const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
                        bytes (K, M, G suffixes; \"none\" for no limit; default: half the RAM)
   --low-port-offset <n>
                        bind guest ports below 1024 to port + n on the host (then + 2n,
-                       + 3n, or any free port); 0 binds them as they are (default: 10000)
+                       + 3n, or any free port) when the host refuses the port itself;
+                       0 binds them as they are (default: 10000)
+  --always-map-low-ports
+                       move guest ports below 1024 even when the host lets appine bind them
   --init               boot by /etc/inittab first (sysinit, wait, once entries; output in
                        /var/log/boot.log) and shut down by it when the program exits or
                        the guest asks to (reboot, halt, poweroff)
@@ -84,6 +87,7 @@ fn main() -> ExitCode {
             }
             "--stats" => stats = true,
             "--init" => options.init = true,
+            "--always-map-low-ports" => options.always_map_low_ports = true,
             "--pty" => pty = Some(true),
             "--no-pty" => pty = Some(false),
             "--tier" => {

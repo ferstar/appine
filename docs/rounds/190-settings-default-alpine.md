@@ -92,5 +92,5 @@
 - 镜像测速和 tarball 的下载用 App 的 `HttpURLConnection`，走系统的 HTTP 代理；guest 的 apk、apt 不走。设备上开了代理时测出来的是经由代理的速度，选出的镜像对 guest 不一定最快。
 - 设置里选的镜像覆盖源文件，用户自己加的行（比如 Alpine 的 testing）也一起没了；列表以外的镜像仍要手改。→ 只换内置镜像的地址了，用户加的行留着；源里全是列表以外的镜像时不动、提示手改（[M9：换镜像不丢用户加的源](203-mirror-keeps-lines.md)）；列表以外的镜像仍要手改
 - 这一轮之前导入的仓库没有发行版的记录，当作 Alpine；开发用的安装上要是装着 Ubuntu，设置页会显示成 Alpine。
-- Android 17（API 37）的 16K 模拟器上 App 自己能绑 22 端口，`lowPortsMoveToHighPortsOnTheHost` 的前提断言失败，原因没查（App 没有 capability，`ip_unprivileged_port_start` 是 1024，可能是平台在 bind 上另有放行）。真机的 Android 17 上如果也这样，低端口映射在那里就不是必须的，现在照样映射。
+- Android 17（API 37）的 16K 模拟器上 App 自己能绑 22 端口，`lowPortsMoveToHighPortsOnTheHost` 的前提断言失败，原因没查（App 没有 capability，`ip_unprivileged_port_start` 是 1024，可能是平台在 bind 上另有放行）。真机的 Android 17 上如果也这样，低端口映射在那里就不是必须的，现在照样映射。→ 原因查明：2026 年 5 月起的 Google Play 系统更新让 App 绑得了 TCP 的 20–23、80、443、445、515、631 和 UDP 的 319、320、443（Android 13 以上、内核 5.15 以上），这个模拟器上有；现在宿主让绑原来的端口就绑原来的，用例拆成绑不了的 79 和绑得了的 22 两个（[M9：宿主让绑的低端口就绑原来的](208-low-ports-direct.md)）
 - 4K 模拟器上旧仓库的 `/bin/sh` 读出来不是 ELF，原因没查（数据已经没了）。仓库在宿主被强行关掉之后能不能保证程序文件完整，值得以后专门试一次（比如 `apk upgrade` 的中途杀掉模拟器）。→ 用 dm-flakey 模拟了断电：App 被杀（宿主的页缓存还在）不会坏，断电时改名覆盖的文件（apk 就这样装文件）全变成 0 字节，fsync 过的也是空的，与这里的症状一样；补上了落盘的顺序（[M9：断电之后仓库不坏](198-power-loss.md)）。那一次是不是这个原因已经没法确认

@@ -51,8 +51,11 @@ pub struct MachineOptions {
     /// 杀掉整个 App（设计文档 §12）。None 时取宿主物理内存的一半，`u64::MAX` 表示不限制。
     pub memory_limit: Option<u64>,
     /// 1024 以下的端口在宿主上换成的端口的偏移（[`crate::portmap`]）：None 是默认的 10000，
-    /// 0 表示不映射（Android 上绑低端口是 EACCES）。
+    /// 0 表示不映射（Android 上绑多数低端口是 EACCES）。
     pub low_port_offset: Option<u16>,
+    /// 宿主让绑原来的低端口时也换一个（默认绑原来的）：在绑得了低端口的宿主（以 root 运行、
+    /// 容器里）上测映射。
+    pub always_map_low_ports: bool,
 }
 
 /// 新进程的 stdin/stdout/stderr。
@@ -146,9 +149,13 @@ impl Machine {
             k.oom.limit = options
                 .memory_limit
                 .unwrap_or_else(crate::oom::default_limit);
-            k.portmap.borrow_mut().offset = options
-                .low_port_offset
-                .unwrap_or(crate::portmap::DEFAULT_OFFSET);
+            {
+                let mut portmap = k.portmap.borrow_mut();
+                portmap.offset = options
+                    .low_port_offset
+                    .unwrap_or(crate::portmap::DEFAULT_OFFSET);
+                portmap.always_map = options.always_map_low_ports;
+            }
             let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
             k.groups.insert(INIT, Rc::new(RefCell::new(init)));
         }
@@ -886,6 +893,7 @@ pub fn run(
         rootfs: options.rootfs.clone(),
         memory_limit: options.memory_limit,
         low_port_offset: options.low_port_offset,
+        always_map_low_ports: options.always_map_low_ports,
     })?;
     // 有终端时，进程是会话组长，接到宿主终端的控制台是它的控制终端
     let console = options

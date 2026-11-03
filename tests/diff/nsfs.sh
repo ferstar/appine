@@ -235,7 +235,8 @@ PY
 # busybox 的 unshare、nsenter：命名空间文件的路径
 touch nsfs/run/bbnet nsfs/run/bbuts
 busybox unshare --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname bb; ip link show | grep -c "^[0-9]"'
-echo "outside: $(hostname | grep -c bb)"
+# 原生一侧的主机名是容器的编号（随机的十六进制），里面可能正好有 bb：要整行相同
+echo "outside: $(hostname | grep -cx bb)"
 busybox nsenter --net=/tmp/nsfs/run/bbnet --uts=/tmp/nsfs/run/bbuts sh -c 'hostname; ip -o link show | cut -d: -f2'
 umount /tmp/nsfs/run/bbnet /tmp/nsfs/run/bbuts
 busybox nsenter --net=/tmp/nsfs/run/bbnet true; echo "after umount: $?"

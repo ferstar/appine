@@ -14,7 +14,9 @@
 # 用例是 tests/diff/<名字>.sh，由 guest 的 /bin/sh 执行，stderr 并入 stdout。真正的
 # Linux 一侧是 docker 容器：先在 appine 里把仓库的根文件系统打包、导入成镜像，所以两边
 # 运行的是完全相同的文件。镜像只在第一次或者带 -r 时生成，换了仓库要带 -r。用例里
-# `# docker-run-options: …` 这一行的选项另外加给它的容器（比如 mount 要的 CAP_SYS_ADMIN）。
+# `# docker-run-options: …` 这一行的选项另外加给它的容器（比如 mount 要的 CAP_SYS_ADMIN），
+# `# appine-options: …` 这一行的另外加给 appine-run（比如 lowports 要的
+# --always-map-low-ports：容器里绑得了低端口，不加就不经过映射）。
 #
 # 两边的输出写到 target/difftest/<名字>.native、.appine，下次运行时覆盖；不一致时另存
 # 一份到 target/difftest/failed/<时刻>-t<执行层>-<名字>.*，重跑之后也还能查。appine-run
@@ -127,6 +129,7 @@ run_group() {
         return 1
     fi
     options=$(sed -n 's/^# docker-run-options: //p' "tests/diff/$name.sh")
+    appine_options=$(sed -n 's/^# appine-options: //p' "tests/diff/$name.sh")
     set +e
     # Docker 默认的 seccomp 规则会改掉一些 syscall 的结果（clone3 返回 ENOSYS，
     # pidfd_getfd 返回 EPERM），比对的应当是内核本身的行为
@@ -137,7 +140,8 @@ run_group() {
         /bin/sh -c "$script" >"$out/$name.native" 2>/dev/null
     echo "exit $?" >>"$out/$name.native"
     t1=$(date +%s)
-    appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root -- \
+    # shellcheck disable=SC2086 # 选项要按空白拆开
+    appine --tier "$tier" --rootfs "$store" --env "$env_path" --env HOME=/root $appine_options -- \
         /bin/sh -c "cd / && $script" >"$out/$name.appine" 2>"$out/$name.appine.err"
     echo "exit $?" >>"$out/$name.appine"
     t2=$(date +%s)

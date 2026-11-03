@@ -621,6 +621,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
         rootfs: Some(PathBuf::from(store)),
         memory_limit: None,
         low_port_offset: None,
+        always_map_low_ports: false,
     };
     match Machine::start(&options) {
         Ok(m) => {

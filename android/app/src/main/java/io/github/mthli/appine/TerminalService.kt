@@ -107,7 +107,7 @@ class TerminalService : Service() {
     /**
      * 每隔 [POLL_MS] 在 [worker] 上问一次内核（要取 BKL）：
      * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 #7）：别的设备连得上它，
-     *   1024 以下的端口在宿主上换了一个，要告诉用户连哪个；
+     *   宿主不让绑的 1024 以下的端口换了一个，要告诉用户连哪个；
      * - guest 的关机请求（busybox 的 reboot、halt、poweroff）；
      * - guest 改过的目录：让"文件"App 刷新它们（设计文档 §11.3）；
      * - 没有会话、界面也不在时还有没有 guest 进程：没有了就退出（设计文档 §11.2）。
@@ -920,7 +920,7 @@ class TerminalService : Service() {
         val port = fields[1].toIntOrNull() ?: return
         val hostPort = fields[2].toIntOrNull() ?: return
         val text = if (hostPort != port) {
-            getString(R.string.listening_mapped, hostPort)
+            getString(R.string.listening_mapped, hostPort, port)
         } else {
             getString(R.string.listening_direct)
         }

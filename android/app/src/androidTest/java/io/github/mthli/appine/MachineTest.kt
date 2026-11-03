@@ -718,16 +718,38 @@ class MachineTest {
     }
 
     /**
-     * 1024 以下的端口（设计文档 §10）：App 没有 CAP_NET_BIND_SERVICE，宿主上绑不了 22；guest 的
-     * nc 绑 22 时宿主上换成 10022，guest 里看到的还是 22。App 经由 [Native.takeListens] 知道
-     * 外部端口（§12 #7 的通知用它），从 App 进程连 10022 收得到 guest 发的数据。
+     * 宿主不让绑的 1024 以下的端口（设计文档 §10）：App 没有 CAP_NET_BIND_SERVICE，79 也不在
+     * Android 放开的那几个里；guest 的 nc 绑 79 时宿主上换成 10079，guest 里看到的还是 79。App
+     * 经由 [Native.takeListens] 知道外部端口（§12 #7 的通知用它），从 App 进程连 10079 收得到
+     * guest 发的数据，内核日志记着换到了哪里。
      */
     @Test
-    fun lowPortsMoveToHighPortsOnTheHost() {
-        val denied = runCatching { ServerSocket(22).close() }.isFailure
+    fun lowPortsTheHostRefusesMoveToHighPorts() {
+        assertTrue("the app itself could bind port 79", runCatching { ServerSocket(79).close() }.isFailure)
+        val out = ncListen(79, 10079)
+        assertTrue(out, out.contains("appine: port 79/tcp is 10079 on the host"))
+    }
+
+    /**
+     * 宿主让绑的低端口：2026 年 5 月起的 Google Play 系统更新让 App 绑得了 22、80、443 这几个
+     * （Android 13 以上、内核 5.15 以上；API 37 的模拟器上有），guest 的 nc 绑 22 就是宿主的 22，
+     * 不换，也不记内核日志。没有这个更新的系统上跳过。
+     */
+    @Test
+    fun lowPortsTheHostAllowsAreBoundAsTheyAre() {
+        assumeTrue("apps cannot bind port 22 here", runCatching { ServerSocket(22).close() }.isSuccess)
+        val out = ncListen(22, 22)
+        assertTrue(out, out.contains("no log"))
+    }
+
+    /**
+     * guest 的 nc 在 [port] 上监听：报告的监听事件是宿主上的 [hostPort]，从 App 进程连它收得到
+     * guest 发的数据。返回控制台的输出（之后 `dmesg` 里关于这个端口的行，没有时是 "no log"）。
+     */
+    private fun ncListen(port: Int, hostPort: Int): String {
         val machine = start(1)
         val console = Native.openConsole(machine, 24, 80)
-        val script = "echo hello | nc -l -p 22; dmesg | grep 'port 22/'"
+        val script = "echo hello | nc -l -p $port; dmesg | grep 'port $port/' || echo no log"
         val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", script), ConsolePty.ENVIRONMENT)
         var out = ""
         val reader = thread { out = readAll(machine, console) }
@@ -738,18 +760,17 @@ class MachineTest {
             if (!listens.isNullOrEmpty()) break
             Thread.sleep(50)
         }
-        assertEquals("nc\t22\t10022", listens?.singleOrNull())
+        assertEquals("nc\t$port\t$hostPort", listens?.singleOrNull())
         // nc 读完 stdin 之后不关连接：读到了就关掉，它才退出
-        Socket("127.0.0.1", 10022).use { s ->
+        Socket("127.0.0.1", hostPort).use { s ->
             val got = ByteArray(6)
             DataInputStream(s.getInputStream()).readFully(got)
             assertEquals("hello\n", String(got))
         }
         reader.join(10_000)
         assertEquals(out, 0, Native.waitFor(machine, pid))
-        assertTrue(out, out.contains("appine: port 22/tcp is 10022 on the host"))
-        assertTrue("the app itself could bind port 22", denied)
         assertEquals(0, Native.takeListens(machine)?.size)
+        return out
     }
 
     /**

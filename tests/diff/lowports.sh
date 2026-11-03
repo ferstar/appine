@@ -4,6 +4,8 @@
 # 当源端口；同一个端口的 TCP 和 UDP、SO_REUSEPORT；冲突照常 EADDRINUSE，连接关掉之后的
 # TIME_WAIT 也是（带 SO_REUSEADDR 时不是）；没有程序监听时 ECONNREFUSED；监听关掉之后已经建立的
 # 连接仍报告原来的端口。普通用户绑低端口不比：docker 的容器里 ip_unprivileged_port_start 是 0
+# 容器里宿主让绑原来的端口（208-low-ports-direct.md），总是映射才测得到换算
+# appine-options: --always-map-low-ports
 set -e
 cd /tmp
 cat > lowports.c <<'C'

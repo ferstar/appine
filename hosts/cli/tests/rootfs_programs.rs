@@ -1490,6 +1490,7 @@ fn oom_kills_are_reported_to_the_app() {
         rootfs: Some(store.to_path_buf()),
         memory_limit: Some(limit),
         low_port_offset: None,
+        always_map_low_ports: false,
     })
     .unwrap();
     let env = [PATH.as_bytes().to_vec()];
@@ -1687,32 +1688,47 @@ fn processes_of_one_program_share_translations() {
     assert!((1..=2).contains(&caches), "{caches} code caches");
 }
 
-/// 1024 以下的端口在宿主上换一个（docs/rounds/156-low-ports.md）：宿主上先占住 10000 + 端口，
-/// guest 的端口就换到 20000 + 端口；Machine 报告这次在非回环地址上的监听，宿主经由换过的
-/// 端口连得上，guest 的内核日志记着换到了哪里。两个执行层用不同的端口：前一次连接留下的
-/// TIME_WAIT 不影响后一次。
+/// 1024 以下的端口（docs/rounds/156-low-ports.md、208-low-ports-direct.md）：宿主让绑原来的
+/// 端口就绑原来的（以 root 运行、在容器里时），不让就换一个；总是映射时，宿主上先占住
+/// 10000 + 端口，guest 的端口就换到 20000 + 端口。Machine 报告这次在非回环地址上的监听，
+/// 宿主经由报告的端口连得上，换了端口时 guest 的内核日志记着换到了哪里。每次用不同的端口：
+/// 前一次连接留下的 TIME_WAIT 不影响后一次。
 #[test]
-fn low_ports_bind_elsewhere_on_the_host() {
+fn low_ports_bind_the_real_port_or_elsewhere() {
     use appine_kernel::{ExitStatus, ListenEvent, Machine, MachineOptions, Stdio, Tier};
     let Some(store) = store() else {
         return;
     };
-    for (tier, port) in [(Tier::Interpreter, 79u16), (Tier::Dbt, 78)] {
+    for (tier, port, always_map) in [
+        (Tier::Interpreter, 79u16, true),
+        (Tier::Dbt, 78, true),
+        (Tier::Interpreter, 77, false),
+        (Tier::Dbt, 76, false),
+    ] {
         // busybox 的 nc 绑 IPv6 的通配地址，这里也占住同一种
-        let Ok(_busy) = std::net::TcpListener::bind(("::", 10000 + port)) else {
+        let busy = always_map.then(|| std::net::TcpListener::bind(("::", 10000 + port)));
+        if let Some(Err(_)) = busy {
             eprintln!("skipped: cannot bind [::]:{} on the host", 10000 + port);
             return;
+        }
+        let host_port = if always_map {
+            20000 + port
+        } else if std::net::TcpListener::bind(("::", port)).is_ok() {
+            port
+        } else {
+            10000 + port
         };
         let machine = Machine::start(&MachineOptions {
             tier,
             rootfs: Some(store.to_path_buf()),
             memory_limit: None,
             low_port_offset: None,
+            always_map_low_ports: always_map,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
         let id = machine.open_console(24, 80).unwrap();
-        let script = format!("echo hello | nc -l -p {port}; dmesg | grep 'port {port}/'");
+        let script = format!("echo hello | nc -l -p {port}; dmesg | grep 'port {port}/' || true");
         let argv = [b"sh".to_vec(), b"-c".to_vec(), script.into_bytes()];
         let pid = machine
             .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
@@ -1725,7 +1741,6 @@ fn low_ports_bind_elsewhere_on_the_host() {
             assert!(Instant::now() < deadline, "{tier:?}: no listen event");
             std::thread::sleep(Duration::from_millis(20));
         };
-        let host_port = 20000 + port;
         let want = ListenEvent {
             comm: "nc".into(),
             port,
@@ -1742,7 +1757,8 @@ fn low_ports_bind_elsewhere_on_the_host() {
         drop(conn);
         let out = read_console(&machine, id);
         let log = format!("appine: port {port}/tcp is {host_port} on the host");
-        assert!(out.contains(&log), "{tier:?}: {out}");
+        // 绑得了原来的端口时不记
+        assert_eq!(out.contains(&log), host_port != port, "{tier:?}: {out}");
         assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
         assert!(machine.take_listens().is_empty(), "{tier:?}");
     }
@@ -1760,6 +1776,7 @@ fn one_machine_runs_several_terminal_sessions() {
             rootfs: Some(store.to_path_buf()),
             memory_limit: None,
             low_port_offset: None,
+            always_map_low_ports: false,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
@@ -1909,6 +1926,7 @@ tty1::respawn:/sbin/getty 38400 tty1
             rootfs: Some(store.to_path_buf()),
             memory_limit: None,
             low_port_offset: None,
+            always_map_low_ports: false,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
@@ -1979,6 +1997,7 @@ fn files_app_changes_reach_inotify_watchers() {
         rootfs: Some(store.to_path_buf()),
         memory_limit: None,
         low_port_offset: None,
+        always_map_low_ports: false,
     })
     .unwrap();
     let env = [PATH.as_bytes().to_vec()];

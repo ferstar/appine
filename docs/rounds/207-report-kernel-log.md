@@ -1,6 +1,6 @@
 # M9：内核 bug 的报告带上出错之前的内核日志（2026-11-03）
 
-← [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制（2026-11-03）](206-debian-sudo-progress.md) · [索引](../milestones.md)
+← [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制（2026-11-03）](206-debian-sudo-progress.md) · [索引](../milestones.md) · [M9：宿主让绑的低端口就绑原来的（2026-11-03）](208-low-ports-direct.md) →
 
 [内核 bug 的报告能复制](205-copy-bug-report.md)那一轮的推迟项：通知上"复制报告"复制的只有出错的那一行，出错之前发生过什么要用户自己去 `dmesg` 里找。
 

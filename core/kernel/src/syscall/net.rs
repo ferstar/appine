@@ -425,8 +425,8 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         Socket::Inet(s) => {
             // 流量算在哪个接口上重新认（connect 也一样）
             s.route = None;
-            // 1024 以下的端口在宿主上换一个（crate::portmap）；新的网络命名空间里显式绑的端口
-            // 都换（宿主上不占这个端口，外层和别的命名空间照样绑得了）
+            // 1024 以下的端口宿主不让绑原来的就换一个（crate::portmap）；新的网络命名空间里
+            // 显式绑的端口都换（宿主上不占这个端口，外层和别的命名空间照样绑得了）
             let own = s.net.is_some() && !wide;
             match port_of(&host_addr)
                 .filter(|&p| mappable(s) && p != 0 && (own || map.borrow().maps(p)))
@@ -469,7 +469,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     };
                     let (host, lease, new) =
                         crate::portmap::bind(&map, ns_key(s), map_proto(s), port, try_bind, bound)?;
-                    if new {
+                    if new && host != port {
                         let proto = if map_proto(s) == IPPROTO_TCP {
                             "tcp"
                         } else {

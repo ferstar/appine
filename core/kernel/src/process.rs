@@ -189,6 +189,8 @@ pub struct RunOptions {
     pub memory_limit: Option<u64>,
     /// 低端口映射的偏移，见 [`crate::MachineOptions::low_port_offset`]。
     pub low_port_offset: Option<u16>,
+    /// 见 [`crate::MachineOptions::always_map_low_ports`]。
+    pub always_map_low_ports: bool,
     /// 先按 inittab 开机（[`crate::Machine::boot`]），第一个进程结束或者 guest 请求关机时
     /// 再关机（[`crate::Machine::shutdown`]），不直接结束所有进程。
     pub init: bool,
