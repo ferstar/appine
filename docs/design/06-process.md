@@ -1,0 +1,37 @@
+# 6. 进程、线程与调度
+
+- **1:1 线程模型**：每个 guest 线程（`struct task`）对应一个宿主 pthread，调度交给宿主内核。guest 线程结束之后它的宿主线程和引擎的 CPU 状态留一会儿给下一个 guest 线程用，fork 不必每次新建。CPU 时间取宿主线程的 CPU 时钟，用户态、内核态各自不倒退（照 Linux 的 `cputime_adjust`）。
+- **退出状态**：`exit_group`、致命信号先确定整个进程的退出状态；各线程单独退出时，由最后一个进入退出流程的线程确定。按 Linux 6.1 的 `synchronize_group_exit` 在 `PTRACE_EVENT_EXIT` 前同步。
+- **驻留内存**（`ru_maxrss`、VmRSS、OOM killer 挑进程）按 VMA 用宿主的 mincore 数，只看有表项的几段（§5.2），文件映射的结果按文件缓存一会儿。
+- **大内核锁（BKL）**：进入 syscall 时获取；执行 guest 代码时**不持有**；在内核层里等待之前**释放**。
+  - 内核对象之间用 `Rc`/`RefCell` 共享，只在持有 BKL 时访问：计数和借用标志都不是原子的，连 clone、drop 也要持锁。系统调用中途放开 BKL 的只有等待和 `Cx::unlocked`，后者的闭包要求是 `Send`，碰不到内核对象；放锁期间 panic 时先重新拿到 BKL 再展开（§12 第 5 条）。inode 仓库（§8.1）也靠 BKL：`Store` 不是 Sync，SQLite 的连接不加锁。
+  - 放开 BKL 时不能还借着内核对象：内核层用自己的 `RefCell`（`core/kernel/src/cell.rs`），数着每个线程借着几个，放锁时检查是 0；交给内核的仓库在不持着那个内核的 BKL 时被使用也算 bug。调试构建总是检查，发布构建打开 `borrow-check` 特性时检查（`appine-run` 和 debug 版 App 默认打开）。
+  - 可能要等宿主的操作放开 BKL 做：宿主 fd（socket 等）的读写、普通文件的 pread/pwrite、刷盘，以及 execve 里映射各段、构造初始栈（只碰新的地址空间）。用文件位置的读写，同一个打开文件同时只有一次（相当于 f_pos_lock）。
+  - 取锁时先自旋一会儿：临界区通常只有几微秒，睡下再被叫醒要几十微秒。同时最多让宿主 CPU 数一半（1 到 4 个）的等锁线程自旋，其余的直接睡下；自旋时只读一个"有人持有"的标志。
+  - 持有 BKL 时要叫醒的线程放开 BKL 之后再叫醒，免得它醒来又睡下去等锁；持有期间释放的宿主内存也在放开之后交还（§5.2）。
+  - **不持 BKL 的快速路径**（`syscall::fast`）：stat（root、路径全在仓库的元数据缓存里、不经过合成文件系统和别的挂载时）、读时钟（宿主的时钟和线程自己的 CPU 时钟）、futex 的等待和唤醒（键就是宿主地址、这一页在页表里可写时；futex 的等待队列有自己的锁，持锁的和不持锁的路径不会漏掉唤醒）、nanosleep。做不了时什么也不改，照常取 BKL。线程在持有 BKL 时记下自己的根目录、当前目录和凭据，改它们的一方让一个全局计数加一，别的线程记下的随之作废。有 seccomp 的线程只有过滤器总是放行的编号走快速路径（§11.1）。
+  - 其余的拆分按 profiling 决定（R1）：多数负载的系统调用只占几个百分点。几个进程同时起进程时 BKL 是瓶颈，要用上多核得缩小必须串行的部分（比如按 fork 家族给地址空间加锁），还没做。
+- **统一的等待机制**：guest 线程永远不直接阻塞在宿主 syscall 上。每个线程有一个专属的 **eventfd** 作为唤醒通道，所有等待都是一次宿主 `poll()`，监听集合里是这个 eventfd 加上要等的宿主 fd。这样 guest 信号、futex 和 I/O 就绪都走同一条唤醒路径，不需要用宿主信号去打断阻塞调用，也就不和 ART/bionic 抢信号编号。
+  - 任何可能让别人的等待条件成立的修改都请求一次唤醒，释放 BKL 时叫醒相应的等待者，由它们各自重新检查条件。唤醒请求按线程记：同一个宿主进程里可以有几个内核实例。
+  - **分通道**：打开文件上的修改、子进程的状态变化、宿主等的进程结束、线程结束、锁和租约、被屏蔽的信号各有一个通道，只有等它们的线程听。
+  - **按对象唤醒**：等待者登记它等的对象（管道、PTY、eventfd、timerfd、inotify、epoll、消息队列、socket 的接收队列……），只影响某个对象的修改只叫醒登记了它的等待者。poll、select、epoll_wait 登记关注的每个文件的对象。每种文件只要登记全了改变它就绪状态的对象就不会漏。只有 SysV IPC、AIO 完成、SIGCONT 这几样还叫醒所有人。
+  - 管道照 Linux 的时机叫醒：写入只在原来是空的时候叫醒读端，读出只在空间够了写端要的量、或者越过 `PIPE_BUF` 时叫醒写端。
+  - `/proc/<pid>/stat` 的状态：在等待的是 S；事件触发了、线程还没重新拿到 BKL 的是 R，与 Linux 的 `try_to_wake_up` 当场改成可运行一样。
+- **futex**：用自管的等待者表实现。键是翻译后的宿主地址；文件的共享映射以宿主文件的 (设备号, inode, 偏移) 为键，不同进程分别 mmap 同一个文件时也能互相唤醒。futex 的等待者不在别的唤醒通道上，只被 FUTEX_WAKE（只通知被唤醒的那几个线程）、信号和结束线程组直接通知。
+- **定时器线程**：`Machine` 有一个专门的宿主线程，等到最早的到期时刻，发出间隔定时器、POSIX 定时器和 CPU 时间限制的信号。它还替 `O_ASYNC` 文件和 `EPOLLEXCLUSIVE` 的独占门看着（§10），有 guest 线程在运行时定时检查 App 的内存上限（§12 第 4 条）、为平均负载取样；所有线程都在等待时停下来。
+- **TLS**：guest 的 `tpidr_el0` 只是 guest 状态结构里的一个字段。**宿主的 `TPIDR_EL0` 永远是 bionic 的值**，所以 ART 的信号处理链可以安全运行。
+- **PID 1**：内核层内置一个虚拟的 init。它不对应任何 guest 程序，负责收养孤儿进程、回收僵尸进程，每个终端标签页的登录 shell 都是它的子进程。
+  - 宿主要求时（App 总是，`appine-run --init`）它按 `/etc/inittab` 的一个子集开机、关机（`core/kernel/src/inittab.rs`）：开机运行 `sysinit`、`boot`、默认运行级别的 `wait` 和 `once`，关机运行 `shutdown` 和运行级别 0、6 的项，再 SIGTERM、最多等 1 秒、结束剩下的。没有终端，`respawn`、`askfirst` 不运行；输出写到 `/var/log/boot.log`。Alpine 的 inittab 由此运行 OpenRC。
+  - 开过机之后，root 发来的 SIGTERM、SIGUSR1、SIGUSR2 与 busybox 的 init 一样是重启、停机、关机的请求，交给宿主（`Machine::take_power`）。
+  - 孤儿先过继给最近的 `PR_SET_CHILD_SUBREAPER` 祖先。子进程记着父进程里建立它的线程（Linux 的 `real_parent`），`PR_SET_PDEATHSIG`、`__WNOTHREAD`、`/proc/<pid>/task/<tid>/children` 按它算。
+- **调度参数**：nice 值、亲和性、IO 优先级按线程设置到宿主线程上（guest 提高优先级时宿主线程最低到 -4，不超过 Android 上与显示有关的线程）；实时调度策略只记录。
+- **线程数的上限**：`threads-max` 对 root 也有效，默认按物理内存每 MB 一个，并且不超过宿主 fd 上限的一半（每个 guest 线程是一个宿主线程，还占一个 eventfd）；`RLIMIT_NPROC` 默认是它的一半。fork 炸弹停在上限，不会把宿主的线程和 fd 用完。
+- **namespace**：八种都有（`core/kernel/src/syscall/ns.rs`），bubblewrap（Codex、Claude Code 的沙箱）和 podman、docker 能用。语义照 Linux 6.1，这里只记做法：
+  - **挂载**：复制整棵挂载树。挂载命名空间放在 `FsContext` 里，共用一个 fs 的任务总在同一个挂载命名空间里。挂载的细节见 §8.2。
+  - **用户**（`crate::cred::UserNs`）：凭据里的 ID 总是内核 ID，对外（get*id、stat、procfs、`SO_PEERCRED`、si_uid……）按调用者的命名空间的 uid_map、gid_map 换算，映射不到的显示成 65534。能力只在自己的命名空间和后代里有效，各处的检查分成 `capable()`、`capable_wrt_inode_uidgid`、`ns_capable` 三种，照 Linux 用。
+  - **pid**（`crate::pidns`）：内核里的 pid、tid 总是全局的，每个新建的命名空间记一张全局编号到本层编号的表，系统调用的参数在分发时换成全局编号，返回值、siginfo、wait 的结果等出口换成调用者那层的；procfs 的每个实例按挂上它的进程所在的命名空间编号。
+  - **UTS、IPC**（`crate::nsproxy`）：与 Linux 的 nsproxy 一样按线程记。IPC 命名空间有自己的 System V IPC 对象和 POSIX 消息队列。
+  - **网络**：见 §10 的"网络命名空间"。
+  - **cgroup**：以建立它的进程所在的 cgroup 为根（§8.2）。
+  - **time**（`crate::nsproxy::TimeNs`）：给单调时钟和 boottime 各加一个偏移，读时钟加上，绝对时刻的等待减去，`/proc/uptime`、sysinfo 也按它。用 6.2 起的规则（线程、vfork 的子进程 execve 时才进）。
+  - **命名空间文件**：`/proc/<pid>/ns/` 下的魔法链接指向 nsfs 里的文件；打开着的、bind 挂载出去的命名空间文件持有那个命名空间（`crate::nsproxy::NsRef`），里面的进程都退出了也还能 setns 进去（`ip netns add`）。setns 也接受 pidfd（`nsenter -t`），按 Linux 的 `validate_nsset` 全部检查通过才一起换。

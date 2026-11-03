@@ -3,7 +3,7 @@
 [第 178 轮](178-test-speed.md)查 LTP 的 fork14 时记下的推迟项：soft-MMU 的页表按页建，映射多大页表就有多大（每 GB 2 MB）。当时以为真实程序很少碰到，实测 AddressSanitizer 之后发现不是这样，而且后果比 fork14 严重：
 
 - Ubuntu 26.04 仓库里 `gcc -fsanitize=address` 编出来的程序一启动就映射约 14 TB 的影子内存（可写、`MAP_NORESERVE`；Linux 上没碰过的部分不占内存也不占页表）。appine 在这一次 mmap 里逐页建表，要建约 28 GB。
-- 建表时持着 BKL，内核层的 OOM killer 是定时检查、也要 BKL，插不进来。结果是宿主的 OOM killer 把整个 `appine-run` 杀了（当时 7.7 GB），在 Android 上就是 LMK 杀掉整个 App，所有会话一起丢。一个进程的一次 mmap 带走了所有进程，违背了[稳健性](../design.md)那几轮的设计。
+- 建表时持着 BKL，内核层的 OOM killer 是定时检查、也要 BKL，插不进来。结果是宿主的 OOM killer 把整个 `appine-run` 杀了（当时 7.7 GB），在 Android 上就是 LMK 杀掉整个 App，所有会话一起丢。一个进程的一次 mmap 带走了所有进程，违背了[稳健性](../design/12-threat-model.md)那几轮的设计。
 - ASan、LSan 一个都用不了。TSan、MSan、Go 的 `-race` 也映射几 TB 的影子内存，应该一样（没试）。
 
 这一轮让页表按需建立：大的映射 mmap 时不建表项，guest 第一次访问时再补。

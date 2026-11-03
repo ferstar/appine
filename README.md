@@ -6,7 +6,7 @@ Run Alpine Linux as Android App 🤖
 
 ## Development
 
-The architecture and the milestone plan are described in [docs/design.md](docs/design.md);
+The architecture and the milestone plan are described in [docs/design](docs/design/README.md);
 each milestone and round of work has a record in [docs/rounds](docs/rounds), indexed in
 [docs/milestones.md](docs/milestones.md).
 
