@@ -1,7 +1,5 @@
 # M9 之前：`/proc/<pid>/task` 的链接数（2026-10-29）
 
-← [M9 之前：`/proc/<pid>/fd` 和 maps 里的路径解析符号链接（2026-10-29）](93-fd-paths-resolve-symlinks.md) · [索引](../milestones.md) · [M9 之前：跟踪者退出时丢掉已经取走的信号（2026-10-29）](95-tracer-exit-drops-signal.md) →
-
 [第 92 轮](92-debuggers-valgrind-chromium.md)在 Debian 上跑 headless Chromium，一启动就 abort（134）：
 
 ```

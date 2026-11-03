@@ -1,7 +1,5 @@
 # M9 之前：跳到未对齐的地址（2026-10-30）
 
-← [M9 之前：Go 换一组被占用的寄存器（2026-10-30）](113-go-registers.md) · [索引](../milestones.md) · [M9 之前：有 JIT 代码的进程也共用翻译（2026-10-30）](115-shared-with-jit.md) →
-
 为下一轮（[有 JIT 代码的进程也共用翻译](115-shared-with-jit.md)）读跳转缓存的代码时发现的：guest 的 `br`、`blr`、`ret` 跳到地址 1 时，Tier 1 跳进了 NULL。Linux 上这是取指时的对齐错误（SIGBUS，`BUS_ADRALN`，pc 是 1），Tier 0 也是这样报告的；Tier 1 在宿主上 SIGSEGV：appine-run 报告内部错误（引擎里的宿主故障），以 SIGSEGV 结束这个 guest 进程，信号处理函数没有机会运行，这个实例的翻译也作废了。
 
 原因是两处用同一个未对齐的值 1 当"不会被查到"的标记：

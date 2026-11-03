@@ -1,7 +1,5 @@
 # M9 之前：仓库里的目录 bind（2026-10-30）
 
-← [M9 之前：有 JIT 代码的进程也共用翻译（2026-10-30）](115-shared-with-jit.md) · [索引](../milestones.md) · [M9 之前：tmpfs（2026-10-30）](117-tmpfs.md) →
-
 Codex、Claude Code 的沙箱用 bubblewrap 建，在 appine 里第一步就失败（[AI 编程 CLI](103-ai-cli-survey.md)的推迟项）。看了 Codex 0.165 实际的调用：默认参数下每条命令都经由 `bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-net --ro-bind / / --tmpfs … --remount-ro … --dev /dev --proc /proc` 运行；它留着的 Landlock 退路（`features.use_legacy_landlock`）也要 bwrap，直接 panic（"filesystem-restricted execution requires bubblewrap"）。所以要让 bwrap 在 appine 里跑通，拆成几轮：仓库里的目录 bind（这一轮）、tmpfs、挂载命名空间和用户命名空间、pid 命名空间、网络等命名空间，最后用 bwrap、Codex、Claude Code 端到端地试。
 
 这一轮是[mount 的子集](105-mount-subset.md)说的第二档：仓库的节点也带上挂载，仓库里的目录、文件可以 bind，挂载的标志对仓库生效，再加上 bwrap 要的 `MS_MOVE`（它不用，顺手）和 pivot_root。

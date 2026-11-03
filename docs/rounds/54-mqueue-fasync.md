@@ -1,7 +1,5 @@
 # M9 之前：消息队列和信号驱动的 I/O 不再叫醒所有人（2026-10-27）
 
-← [M9 之前：锁和宿主 socket 只叫醒等它们的线程（2026-10-27）](53-locks-host-sockets.md) · [索引](../milestones.md) · [M9 之前：宿主 stdio 上的阻塞读只等宿主 fd（2026-10-27）](55-host-stdio.md) →
-
 [上一轮](53-locks-host-sockets.md)留下的推迟项：关闭 POSIX 消息队列，以及程序在设了 `O_ASYNC` 的文件上读数据，仍请求整个文件类的通道，叫醒所有 poll、epoll 的等待者。消息队列的收发更是请求所有通道（[按对象唤醒](49-targeted-wakeups.md)、[起进程和设定时器](51-spawn-timer-wakeups.md)的推迟项），连等子进程的 shell 也被叫醒。上一轮的微基准（`target/herd/sockherd.c`）加了三项，8 个空等的进程，epoll 和 recv 两种空等方式各量两次，每次操作的微秒数和空等的进程被叫醒的次数：
 
 | 操作 | 原生 | 之前 | 之后 |

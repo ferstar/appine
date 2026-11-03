@@ -1,7 +1,5 @@
 # M9 之前：目录和文件的时间戳（2026-10-28）
 
-← [M9 之前：翻译表里漏掉的墓碑（2026-10-28）](72-table-tombstones.md) · [索引](../milestones.md) · [M9 之前：FICLONE 返回 EOPNOTSUPP（2026-10-28）](74-ficlone.md) →
-
 [第二轮普查](70-survey-suites.md)的问题 1：目录的 mtime、ctime 不随目录项变化，普通文件的 ctime 不随内容变化。PHP 的 5 个 stat、touch 测试因此失败；Python 进程从一个目录 import 过之后，在那里新建的模块 import 不到（importlib 按目录的 mtime 决定要不要重新列目录）；Maildir、git 的 untracked cache 这类按目录 mtime 发现变化的程序会漏掉修改。
 
 - **改动**：

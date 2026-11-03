@@ -1,7 +1,5 @@
 # M9 之前：不持 BKL 的 stat（2026-10-26）
 
-← [M9 之前：多线程共用翻译和定向唤醒（2026-10-26）](24-shared-translation.md) · [索引](../milestones.md) · [M9 之前：fork 写时复制（2026-10-26）](26-fork-cow.md) →
-
 上一轮的推迟项：并行的 lstat 被 BKL 串行化，`git status` 开着并行 lstat（git 的默认）比单线程还慢；`go build`、JVM、node 的线程池也会并行 stat。
 
 - **做法**（§6、§8.1）：

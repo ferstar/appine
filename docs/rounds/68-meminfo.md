@@ -1,7 +1,5 @@
 # M9 之前：/proc/meminfo 照搬宿主的（2026-10-28）
 
-← [M9 之前：cgroup 的 memory.stat（2026-10-28）](67-memory-stat.md) · [索引](../milestones.md) · [M9 之前：glibc 发行版的探测（2026-10-28）](69-glibc-probe.md) →
-
 [负载普查](62-workload-survey.md)的问题 6：free 显示可用内存 650 MB（原生 3.4 GB），htop 的内存条几乎是满的。
 
 - **原因**：guest 的 `/proc/meminfo` 和 sysinfo 由宿主的 sysinfo 算，它只给得出总量和空闲量：`MemAvailable` 就是 `MemFree`，`Buffers`、`Cached` 都是 0，宿主的页缓存全算作已用。`AnonPages` 是总量减空闲量。按 `MemAvailable` 判断的程序（libuv 的 `uv_get_available_memory`、psutil）读到的同样偏小。

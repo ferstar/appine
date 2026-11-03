@@ -1,7 +1,5 @@
 # M9 之前：ptrace 的第二步，gdb（2026-10-27）
 
-← [M9 之前：ptrace 的第一步，strace（2026-10-27）](40-ptrace-strace.md) · [索引](../milestones.md) · [M9 之前：epoll 的边沿（2026-10-27）](42-epoll-edges.md) →
-
 [上一步](40-ptrace-strace.md)之后 strace 能用了，gdb 还不行：下不了断点（`Cannot insert breakpoint 1. Cannot access memory at address 0x7e8`），也不能单步。这一轮补上 gdb 要的部分（§7.6）。
 
 - **单步**（PTRACE_SINGLESTEP）：引擎新增 `appine_cpu_step`，用解释器执行 pc 处的一条指令，不理会 kick（`Cpu::step`）。跟踪者用 PTRACE_SINGLESTEP 让线程继续之后（`Task::stepping`，运行循环不持 BKL 时读它），运行循环每次只执行一条指令：

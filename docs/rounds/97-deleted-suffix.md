@@ -1,7 +1,5 @@
 # M9 之前：已经删除的文件带 ` (deleted)`（2026-10-29）
 
-← [M9 之前：`/proc/<pid>/net`（2026-10-29）](96-proc-pid-net.md) · [索引](../milestones.md) · [M9 之前：路由表（2026-10-29）](98-routes.md) →
-
 [第 93 轮](93-fd-paths-resolve-symlinks.md)的推迟项之一：打开着、映射着的文件被删除之后，Linux 的 `d_path` 在路径后面加上 ` (deleted)`，appine 没有（只有 memfd 的名字本来就带着）。用到它的有两类程序：
 
 - needrestart：apt 升级时 dpkg 用 rename 换掉旧的库，needrestart 按 maps 里的 ` (deleted)` 找出还在用旧库的进程；

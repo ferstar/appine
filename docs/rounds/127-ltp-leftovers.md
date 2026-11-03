@@ -1,7 +1,5 @@
 # M9 之前：LTP 剩下的小差异（2026-10-31）
 
-← [M9 之前：PR_SET_CHILD_SUBREAPER（2026-10-31）](126-child-subreaper.md) · [索引](../milestones.md) · [M9 之前：traceroute 和 mtr（2026-10-31）](128-traceroute.md) →
-
 LTP 的 syscall 测试全量 214 个失败里，146 个要 loop 设备（"Failed to acquire device"），17 个是测试自己缺命令（退出码 127），还有改时钟（App 改不了宿主的）、跟踪 pid 1 这些已知的。剩下十几个真正的失败，这一轮逐个放到原生 Alpine 容器里对照：不只看通不通过，还看是哪几条失败，并且换掉会影响结果的原生环境（容器的 overlayfs 不支持文件句柄，docker 默认的 AppArmor 会检查 sendmsg 带的地址）。[剩下的小缺口](18-small-gaps.md)那一轮也这样对照过，当时的原生环境掩盖了其中几个。
 
 **原生同样失败的**（musl 的行为，或者 musl 和内核版本的组合，不归 appine）：gethostname02（musl 截短主机名不报错）、pathconf02（musl 的 pathconf 不看路径）、gethostbyname_r01、sbrk01（musl 的 sbrk 只认 0）、nftw01、nftw6401、setgroups03（musl 的 `NGROUPS` 是 32）、mq_open01、open13（musl 的 fchmod、fchown 在 `O_PATH` 的 fd 上退回 `/proc/self/fd`）、readlinkat02 和 readlink03 里长度为 0 的一项（musl 把它换成 1），pwrite04（musl 1.2.5 的 pwrite 用 pwritev2 的 `RWF_NOAPPEND`，6.9 之前的内核是 EOPNOTSUPP）。

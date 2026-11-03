@@ -1,7 +1,5 @@
 # M9 之前：FP16 和 JSCVT（2026-10-31）
 
-← [M9 之前：ioprio、syslog 和 adjtimex（2026-10-31）](140-ioprio-syslog-adjtimex.md) · [索引](../milestones.md) · [M9 之前：RDM、FCMA、FHM 和 BF16（2026-10-31）](142-rdm-fcma-fhm-bf16.md) →
-
 宿主有时宣告半精度浮点运算（FEAT_FP16，`AT_HWCAP` 的 FPHP、ASIMDHP）和 FJCVTZS（FEAT_JSCVT）。§4.4 原来把 FP16 列在"v1 不做"，那时 SIMD&FP 的运算还没有交给原生指令桩；现在数据处理指令在 Tier 0 里由原生指令桩执行、在 Tier 1 里原样拷贝，加一个这类特性只要放行它的编码（与 [ASIMDDP](133-asimddp.md)、[SHA3、SHA512 和 I8MM](135-sha3-sha512-i8mm.md) 一样）。
 
 为什么是它：llama.cpp 的 ggml 按 HWCAP 挑 CPU 后端（`GGML_CPU_ALL_VARIANTS`，`ggml/src/ggml-feats.h` 的 `has_fp16 = FPHP && ASIMDHP`）。Linux 上的几档里只有 armv8.2_1 只要求 DOTPROD，往上每一档都要求 FP16，带 I8MM 的那档还要求 SVE：appine 宣告了 DOTPROD 和 I8MM，没有 FP16，ggml 一直停在 armv8.2_1，第 135 轮的 I8MM 在它这里也用不上。在 appine 里自己编译时，gcc 的 `-mcpu=native` 读 `/proc/cpuinfo` 的 Features 行，没有 fphp 就编出不带半精度运算的代码。2018 年以后的手机核心（Cortex-A55、A75 起）都有 FP16。JSCVT 是 V8 把 double 转成 int32（JavaScript 的 ToInt32）时用的一条指令，引擎里只差一行白名单，一起做了。

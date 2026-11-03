@@ -1,7 +1,5 @@
 # M9 之前：/proc/<pid>/exe 指向程序文件本身（2026-11-01）
 
-← [M9 之前：nmap 以 root 运行（2026-11-01）](152-nmap-unprivileged.md) · [索引](../milestones.md) · [M9 之前：FRINTTS、FlagM、SB 和 DPB（2026-11-01）](154-frintts-flagm-sb-dpb.md) →
-
 [已删除的后缀](97-deleted-suffix.md)和 [exe 的跟踪权限](147-proc-exe-access.md)两轮的推迟项：appine 的 `/proc/<pid>/exe` 只记着执行时的路径，跟随时按这段文字重新解析。程序文件改了名、被删除或者被换掉（dpkg、apk 升级时用 rename 换掉正在运行的程序）之后，经由它 stat、open、execve 到的是同一路径上的新文件，或者 ENOENT；读出来的路径也不带 ` (deleted)`（带了的话，按文字跟随就到不了）。Linux 的 exe 是 `mm->exe_file`，跟随时直接跳到那个文件（`proc_exe_link`、`nd_jump_link`），删除之后读出来的 `d_path` 带 ` (deleted)`。
 
 用到它的：Chromium、Electron 这类经由 `/proc/self/exe` 起子进程的程序，升级之后父子进程是两个版本；needrestart 按 exe 的 ` (deleted)` 找出升级后要重启的进程。

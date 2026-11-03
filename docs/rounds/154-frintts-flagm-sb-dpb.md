@@ -1,7 +1,5 @@
 # M9 之前：FRINTTS、FlagM、SB 和 DPB（2026-11-01）
 
-← [M9 之前：/proc/<pid>/exe 指向程序文件本身（2026-11-01）](153-exe-file.md) · [索引](../milestones.md) · [M9 之前：DIT（2026-11-01）](155-dit.md) →
-
 [RDM、FCMA、FHM 和 BF16](142-rdm-fcma-fhm-bf16.md)那一轮的推迟项：宿主（开发用的 M2 Pro、常见的手机核心）有、appine 仍不宣告的 CPU 扩展（§4.4 表里的"还没做"）。这一轮做其中只是指令层面的几种：
 
 - FRINTTS（`AT_HWCAP2` 的 `frint`）：FRINT32Z、FRINT32X、FRINT64Z、FRINT64X，舍入成 32、64 位整数范围里的整数值，超出范围的和 NaN 得到最小的那个整数，置 FPSR.IOC（JavaScript、C 的浮点转整数）。

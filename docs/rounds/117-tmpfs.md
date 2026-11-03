@@ -1,7 +1,5 @@
 # M9 之前：tmpfs（2026-10-30）
 
-← [M9 之前：仓库里的目录 bind（2026-10-30）](116-store-binds.md) · [索引](../milestones.md) · [M9 之前：挂载命名空间（2026-10-30）](118-mount-namespaces.md) →
-
 让 bubblewrap 能用的第二轮（第一轮见[仓库里的目录 bind](116-store-binds.md)）。bwrap 的新根本身就是一个 tmpfs（`mount("tmpfs", base, "tmpfs", MS_NODEV | MS_NOSUID)`，在里面建 `newroot`、`oldroot` 再 pivot_root），`--dev` 先在 `/dev` 上挂 tmpfs 再把设备 bind 进去，Codex 还要 `--tmpfs /tmp/codex-daemon-0`。原来 mount 别的类型都是 ENODEV。
 
 Linux 的 tmpfs 在内存里。另写一个内存里的文件系统要让所有按路径、按 fd 的系统调用都多一种节点，mmap、文件锁、inotify、AF_UNIX 的路径名也都要重新接一遍；而且 tmpfs 里的东西占 App 的内存，`/tmp` 当初就是因此放在仓库里的（§8.2）。所以这里的 tmpfs 是仓库里不挂在根目录下面的一棵树，其余照旧：

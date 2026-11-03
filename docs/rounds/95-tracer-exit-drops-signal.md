@@ -1,7 +1,5 @@
 # M9 之前：跟踪者退出时丢掉已经取走的信号（2026-10-29）
 
-← [M9 之前：`/proc/<pid>/task` 的链接数（2026-10-29）](94-task-dir-links.md) · [索引](../milestones.md) · [M9 之前：`/proc/<pid>/net`（2026-10-29）](96-proc-pid-net.md) →
-
 [第 92 轮](92-debuggers-valgrind-chromium.md)用 delve attach 到一个 Go 进程，执行 `exit`。delve 问要不要结束进程，stdin 是 /dev/null 时读到 EOF，`handleExit` 不 detach 就返回 2，dlv 退出。之后那个 Go 进程的每个线程都停在 T，TracerPid 是 0，SIGTERM 也结束不了它（Go 自己处理 SIGTERM，进程停着，处理函数跑不了），普查的脚本在 `wait` 上一直等到超时。
 
 - **原因**：

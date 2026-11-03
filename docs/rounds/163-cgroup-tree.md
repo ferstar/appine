@@ -1,7 +1,5 @@
 # M9 之前：cgroup 树：建子 cgroup、迁移进程（2026-11-01）
 
-← [M9 之前：time 命名空间（2026-11-01）](162-time-namespaces.md) · [索引](../milestones.md) · [M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）](164-cgroup-limits.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 9 的第一步：dockerd 起容器时先 `mkdir /sys/fs/cgroup/docker`，appine 的 cgroup v2 是只读的（[cgroup v2 的视图](58-cgroup.md)），回 `read-only file system`。podman 不加 `--cgroups disabled`、`podman build` 不加 runtime 参数时也要建子 cgroup、写 `cgroup.procs`。普查时原生的 docker 嵌套在容器里、启用不了控制器也能跑，所以分两步：这一轮只做层级和迁移，限制先按 Linux 的格式检查、记下，下一步再让 `pids.max`、`memory.max`、`cgroup.freeze` 真正起作用。照 Linux 6.1 的 `kernel/cgroup/cgroup.c`。
 
 ## 做法

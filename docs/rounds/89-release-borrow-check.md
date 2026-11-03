@@ -1,7 +1,5 @@
 # M9 之前：测试用的发布构建也检查借用（2026-10-29）
 
-← [M9 之前：futex 等待者的清理，放开 BKL 时检查借用（2026-10-29）](88-futex-cleanup-borrow-check.md) · [索引](../milestones.md) · [M9 之前：网络接口的流量计数（2026-10-29）](90-interface-counters.md) →
-
 [上一轮](88-futex-cleanup-borrow-check.md)的推迟项：放开 BKL 时借着内核对象的检查只在调试构建里有，差分测试、LTP、普查用的发布构建都不查。
 
 - **发布构建里也数借用**：

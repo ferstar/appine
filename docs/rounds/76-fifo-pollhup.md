@@ -1,7 +1,5 @@
 # M9 之前：FIFO 在写端来之前不报 POLLHUP（2026-10-28）
 
-← [M9 之前：PTY 的 TCFLSH 和 TCXONC（2026-10-28）](75-pty-flow.md) · [索引](../milestones.md) · [M9 之前：删除的目录里不能新建，socket 可以 fchmod（2026-10-28）](77-dead-dir-socket-fchmod.md) →
-
 [第二轮普查](70-survey-suites.md)的问题 3：FIFO 的读端在还没有写端连上过时，poll 报 POLLHUP。Ruby 的 `load` 一个 FIFO 时以 `O_NONBLOCK` 打开再 poll，在 appine 上立刻读到 EOF，当作空文件 load 成功，test_require 的三个 FIFO 测试因此失败。
 
 - **原因**：Linux 6.1 的 `pipe_poll` 只在"现在没有写端，而且这个读端的 `f_version` 和管道的 `w_counter` 不同"时才报 EPOLLHUP。`fifo_open` 以 `O_NONBLOCK` 只读打开、当时又没有写端时，把读端的 `f_version` 记成当时的 `w_counter`（注释是"在见到写端之前不报 EPOLLHUP"），写端每打开一次 `w_counter` 加一。其余情况 `f_version` 是 0，没有写端就报。appine 只看现在有没有写端。

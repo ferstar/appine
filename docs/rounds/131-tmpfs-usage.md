@@ -1,7 +1,5 @@
 # M9 之前：tmpfs 的用量和限制（2026-10-31）
 
-← [M9 之前：vhangup（2026-10-31）](130-vhangup.md) · [索引](../milestones.md) · [M9 之前：setns 经由 pidfd（2026-10-31）](132-setns-pidfd.md) →
-
 [tmpfs](117-tmpfs.md)那一轮的推迟项：`size=` 只影响 statfs 报告的总量，写满了也不会 ENOSPC，inode 数不限，用量不记，`df` 看到的已用总是 0；重新挂载时不看选项。bubblewrap 的 `--tmpfs`（Codex、Claude Code 的沙箱）、`--dev` 和手动挂的 tmpfs 都是这样。
 
 Linux 的 tmpfs 在内存里，按页记用量（`shmem_inode_acct_block`），按 inode 数限制（`shmem_reserve_inode`）。appine 的 tmpfs 是仓库里的一棵树，文件的数据在宿主的文件里，普通文件的写不持 BKL、直接写宿主的文件，大小也不经过仓库，所以用量要在各处自己记。

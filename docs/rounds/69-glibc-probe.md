@@ -1,7 +1,5 @@
 # M9 之前：glibc 发行版的探测（2026-10-28）
 
-← [M9 之前：/proc/meminfo 照搬宿主的（2026-10-28）](68-meminfo.md) · [索引](../milestones.md) · [M9 之前：第二轮普查，语言的测试集和大项目（2026-10-28）](70-survey-suites.md) →
-
 guest 里跑过的都是 Alpine 的 musl 程序（§1.1 的目标），glibc 的用户态从来没在 appine 里跑过。手机终端的用户常常需要 glibc：pip 上没有 musl 版本的 wheel、VS Code 的服务端、各种预编译好的二进制，Termux 的用户大量用 proot-distro 跑 Debian、Ubuntu 也是为了这个。这一轮看两件事：glibc 的程序本身在 appine 里能不能用；从 Alpine chroot 进一个 glibc 发行版缺什么，以此决定要不要做 mount 的一个子集。
 
 - **做法**：把 `debian:trixie`、`ubuntu:24.04` 的 arm64 镜像用 `docker export` 导出、gzip 压缩，`appine-run --import` 直接建成仓库，guest 的根就是 Debian 或 Ubuntu。负载是 `tests/survey/glibc/*.sh`，经由 `scripts/survey -s <仓库> glibc/<名字>` 运行（普查的负载名可以带子目录了）。chroot 用一个新导入的 Alpine 仓库，在 guest 里把同一个 Debian 的 tarball 解到 `/debian`。都在 colima 的虚拟机里用 Tier 1 跑。

@@ -1,7 +1,5 @@
 # M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）
 
-← [M9 之前：cgroup 树：建子 cgroup、迁移进程（2026-11-01）](163-cgroup-tree.md) · [索引](../milestones.md) · [M9 之前：cgroup.freeze（2026-11-01）](165-cgroup-freeze.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 9 的第二步的前一半：[上一轮](163-cgroup-tree.md)的限制只按格式记下，这一轮让 `pids.max`、`memory.max` 起作用（`docker run --pids-limit`、`--memory`，podman 的同名选项，systemd 的 `TasksMax=`、`MemoryMax=` 写的就是它们）。`cgroup.freeze` 要做透明的冻结和系统调用重启，下一轮单独做。照 Linux 6.1 的 `kernel/cgroup/pids.c`、`mm/memcontrol.c`、`mm/oom_kill.c`。
 
 ## 做法

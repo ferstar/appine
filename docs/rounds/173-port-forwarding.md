@@ -1,7 +1,5 @@
 # M9 之前：发布的端口：PREROUTING 的 DNAT 和宿主上的转发（2026-11-01）
 
-← [M9 之前：nftables 的子集和 socket 层的 DNAT（2026-11-01）](172-nftables.md) · [索引](../milestones.md) · [M9 之前：各个网络命名空间的端口互不相干（2026-11-01）](174-namespace-ports.md) →
-
 [容器网络的普查](169-container-network-survey.md)定下的方案 1 的第四步，也是最后一步。[上一轮](172-nftables.md)之后，podman 用 nftables 驱动时，`-p 8080:80` 只在 appine 里面经由 127.0.0.1、外层地址连得上：那是 OUTPUT 钩子上的 DNAT。别的情形还不行：
 
 - 从 appine 外面连（手机上的浏览器开 localhost:8080、别的设备），连接到的是 podman 占着端口、从不 accept 的那个监听 socket，没有回应。

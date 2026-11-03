@@ -1,7 +1,5 @@
 # M9 之前：嵌套 epoll 的边沿（2026-10-27）
 
-← [M9 之前：mremap 和 sysfs（2026-10-27）](46-mremap-sysfs.md) · [索引](../milestones.md) · [M9 之前：独占的唤醒（2026-10-27）](48-exclusive-wakeup.md) →
-
 [epoll 的边沿](42-epoll-edges.md)那一轮留下的推迟项：一个 epoll 放在另一个 epoll 里（外层以 `EPOLLET` 关注内层），内层关注的文件已经就绪时又来了事件，Linux 的外层再报告一次，appine 不报告。对照下来，内层水平或边沿触发关注 eventfd、管道、TCP、AF_UNIX，以及两层嵌套，原生都是"第一次 1、再来一次 1、没有新事件 0"，appine 第二次都是 0。Linux 里内层 epoll 每被唤醒一次（`ep_poll_callback`，按关注的事件过滤）都唤醒等它的 `poll_wait`，即使那个关注已经在就绪链表上（§10）。
 
 - **内层 epoll 的数据代数**（`epoll_arrivals`）：各个关注从加入起、在关注的方向上（读、写分开，与 Linux 按唤醒的事件过滤一样）来过事件的次数之和。去掉的关注（DEL、MOD 换掉的、文件关闭之后清掉的）的份额记进 `Epoll::base`，所以只增不减；加入、修改时已经就绪也算一次（Linux 的 `ep_insert`、`ep_modify` 那时唤醒 `poll_wait`）。`EPOLLONESHOT` 报告过、停用的关注份额停住，与 Linux 停用的不唤醒一样。再往里嵌套的按层数递归，不超过 `EP_MAX_NESTS`。外层的边沿触发照 42 轮的规则用这个数判断"又来了事件"。

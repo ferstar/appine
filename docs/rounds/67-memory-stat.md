@@ -1,7 +1,5 @@
 # M9 之前：cgroup 的 memory.stat（2026-10-28）
 
-← [M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）](66-aio-destroy.md) · [索引](../milestones.md) · [M9 之前：/proc/meminfo 照搬宿主的（2026-10-28）](68-meminfo.md) →
-
 [负载普查](62-workload-survey.md)的问题 5：另一个 guest 进程占着 400 MB 时，.NET 的 GC 报告的内存负载仍是 39 MiB，`memory.current` 却已经 543 MB。几个进程一起把内存用到 OOM killer 的上限时，.NET 不会提前收紧堆，结果被结束的可能是它。
 
 - **原因**：.NET 在 cgroup v2 下的用量是 `memory.current` 减去 `memory.stat` 里的 `inactive_file`（与 docker、kubernetes 算法相同），读不到 `memory.stat` 就退回 `/proc/self/statm` 里自己的 RSS。[cgroup v2 的视图](58-cgroup.md)那一轮没有做 `memory.stat`。（.NET 的这段逻辑是按记忆写的，没有对照源码；实测的行为与它一致：补上之后负载随别的进程变化。）

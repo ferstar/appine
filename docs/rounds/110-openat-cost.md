@@ -1,7 +1,5 @@
 # M9 之前：openat 的开销（2026-10-30）
 
-← [M9 之前：起进程和 mmap 的持锁时间（2026-10-30）](109-spawn-mmap-bkl.md) · [索引](../milestones.md) · [M9 之前：检查点挪到后台（2026-10-30）](111-background-checkpoint.md) →
-
 [上一轮](109-spawn-mmap-bkl.md)的推迟项：`go build` 里 openat 每次持锁 10–21 µs，没有拆开看。这一轮给 openat 分阶段计时（临时插桩 `target/mem/openinstr.py`，`openbuild.sh` 编到 `target/linux-arm64-exp`，`OPENSTAT=1` 时退出前打印），结论是不用改：openat 合计只占 `go build` 墙钟的 1.3%，平均数是被新建文件拉高的，新建文件的大头在宿主上建 object 和 SQLite，没有便宜的改法。
 
 **`go build`**（本地卷上的仓库，冷缓存，墙钟 5.9 秒）：

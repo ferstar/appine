@@ -1,7 +1,5 @@
 # M9 之前：开机时挂好 /dev、/dev/shm、/dev/mqueue 和 /run（2026-11-02）
 
-← [M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面（2026-11-02）](183-udp-wide-first.md) · [索引](../milestones.md)
-
 支持 OpenRC 的第一轮。调研时（Alpine 3.24、OpenRC 0.63.2）OpenRC 本身大多能用，有两处会把 appine 的目录盖住：
 
 - `init.sh`（每次 `openrc sysinit` 都执行）看到 `/run` 不是挂载点，就在上面挂一个 tmpfs。之前写进 `/run` 的东西都看不到了：比如 App 先开的标签页、`/etc/profile.d` 里留的标记。

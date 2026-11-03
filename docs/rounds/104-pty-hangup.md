@@ -1,7 +1,5 @@
 # M9 之前：关掉主设备时挂断从设备（2026-10-29）
 
-← [M9 之前：AI 编程 CLI（2026-10-29）](103-ai-cli-survey.md) · [索引](../milestones.md) · [M9 之前：mount 的子集（2026-10-29）](105-mount-subset.md) →
-
 [AI 编程 CLI](103-ai-cli-survey.md)那一轮找到的：tmux 里开着 opencode，`tmux kill-server` 之后它在原生上退出，在 appine 里留下来，按 25 毫秒一次的周期一直在画界面。几个 CLI 轮流开的时候前一个占着内存，后一个就被 OOM killer 结束了。
 
 原因是关掉 PTY 的主设备时 appine 只把计数减一、叫醒等待者。Linux 关掉最后一个主设备时（`pty_close` → `tty_vhangup`）挂断从设备，`__tty_hangup` 做这几件事：

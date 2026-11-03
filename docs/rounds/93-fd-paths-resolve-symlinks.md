@@ -1,7 +1,5 @@
 # M9 之前：`/proc/<pid>/fd` 和 maps 里的路径解析符号链接（2026-10-29）
 
-← [M9 之前：调试器、valgrind 和 headless Chromium（2026-10-29）](92-debuggers-valgrind-chromium.md) · [索引](../milestones.md) · [M9 之前：`/proc/<pid>/task` 的链接数（2026-10-29）](94-task-dir-links.md) →
-
 [上一轮](92-debuggers-valgrind-chromium.md)在 Debian 上跑 valgrind，memcheck 报了几千个"未初始化"的错误（`ERROR SUMMARY: 3421 errors from 313 contexts`，应该是 3 个），开头有两行 `When reading debug info from /lib/ld-linux-aarch64.so.1: can't open file to inspect ELF header`。跟进子进程的 sh、ls 和 python 也都报了一大堆。
 
 - **原因**：valgrind 自己加载客户程序和解释器，记下映射的文件名时读 `/proc/self/fd/<n>`，之后读调试信息时按这个名字 stat，再带着 `O_NOFOLLOW` 打开。

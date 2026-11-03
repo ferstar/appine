@@ -1,7 +1,5 @@
 # M9 之前：pid 命名空间（2026-10-30）
 
-← [M9 之前：用户命名空间（2026-10-30）](119-user-namespaces.md) · [索引](../milestones.md) · [M9 之前：UTS 和 IPC 命名空间（2026-10-30）](121-uts-ipc-namespaces.md) →
-
 让 bubblewrap 能用的第五轮。bwrap 的 `--unshare-pid` 在 `clone` 里带上 `CLONE_NEWPID`，它自己（`--as-pid-1` 时是要运行的命令）成为新命名空间里的 1 号进程，再挂一个新的 procfs；Codex 每条命令都这样跑。原来 `CLONE_NEWPID` 是 EPERM。
 
 - **编号**（`core/kernel/src/pidns.rs`）：内核里的 pid、tid 照旧是全局的（开机时的命名空间里的编号），各处的查找、`groups`、`tasks` 都不用改。每个新建的命名空间记一张全局编号到本层编号的表（和反过来的），进程在它所在的命名空间和每个祖先里各有一个编号；开机时的命名空间不记表，全局编号就是它的编号。编号不再使用（线程退出、僵尸进程被回收、非主线程 execve 接过主线程的 tid）时从各层的表里去掉。本层编号从上次分配的下一个起找，用到 pid_max 之后从 300 起（Linux 的 `alloc_pid`、`RESERVED_PIDS`）；`/proc/sys/kernel/ns_last_pid` 读写的是读者、写者所在的命名空间的，`/proc/loadavg` 的最后一列也是。

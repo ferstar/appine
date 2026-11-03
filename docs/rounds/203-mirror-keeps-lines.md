@@ -1,7 +1,5 @@
 # M9：换镜像不丢用户加的源（2026-11-03）
 
-← [M9：内核的仓库只在持着它的 BKL 时用（2026-11-03）](202-store-bkl-check.md) · [索引](../milestones.md) · [M9："文件"App 按内容认出文本文件（2026-11-03）](204-text-by-content.md) →
-
 [设置页](190-settings-default-alpine.md)那一轮的推迟项：设置里选镜像时把包管理器的源整个重写一遍，用户自己加的行一起没了。Alpine 上常见的是加 testing（`@testing https://…/edge/testing`），Debian 上是在组件里加 `contrib non-free`、在 suites 里加 `trixie-backports`，换一次镜像就得重新加；导入之后自动测速、在设置里选回"自动"重新测速，也是整个重写。
 
 ## 做法

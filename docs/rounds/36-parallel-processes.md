@@ -1,7 +1,5 @@
 # M9 之前：多进程并行（2026-10-26）
 
-← [M9 之前：JIT 负载（2026-10-26）](35-jit.md) · [索引](../milestones.md) · [M9 之前：onTrimMemory（2026-10-26）](37-trim-memory.md) →
-
 单个进程起进程已经和原生差不多（spawnbench 的 exec 145 微秒，原生 145），几个同时起时差得多：4 个 spawnbench 同时 exec，每次 470–520 微秒（原生 158）；4 个同时跑 shell 管道，每次 2200–2300 微秒（原生 565）。`make -j`、`xargs -P` 这类负载就是这种情形。
 
 - **BKL**：按 syscall 记下持锁时间，每起一个进程持锁约 80 微秒（execve 23、exit_group 22、clone 17），4 个同时跑时锁大半时间有人拿着。execve 和退出时取驻留内存的样（`ru_maxrss`）各要 4 次 mincore，持着 BKL 等宿主的 mmap_lock，而别的进程正在锁外 munmap（宿主剖析里 munmap 占 12.7%、mmap 9.5%，都在争同一把 mmap_lock）。

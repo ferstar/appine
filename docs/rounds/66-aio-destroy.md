@@ -1,7 +1,5 @@
 # M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）
 
-← [M9 之前：smaps 里共用的页（2026-10-28）](65-smaps-shared.md) · [索引](../milestones.md) · [M9 之前：cgroup 的 memory.stat（2026-10-28）](67-memory-stat.md) →
-
 [负载普查](62-workload-survey.md)的问题 4：`mariadb-install-db` 永远不结束，之后启动的 mariadbd 也因为拿不到数据文件的锁（还被卡住的那个占着）起不来。
 
 - **原因**：InnoDB 用 Linux 原生 AIO，一个线程专门在 `io_getevents` 里等完成事件。关闭时主线程 `io_destroy`，再 join 这个线程：Linux 的 `kill_ioctx` 把上下文标成已销毁并叫醒等它的线程，`aio_read_events` 看到 `ctx->dead`，这次一个事件也没取到就返回 EINVAL，线程据此退出。appine 的 `io_getevents` 一开始取了上下文的引用就一直拿着循环等；`io_destroy` 只把上下文从进程的表里拿掉、叫醒所有等待者，等待者醒来看到的还是那个上下文，接着等，主线程的 join 就永远等下去。这一点从 [M9 之前：推迟项](19-deferred.md)那一轮实现 AIO 起就是这样。

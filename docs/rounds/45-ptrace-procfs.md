@@ -1,7 +1,5 @@
 # M9 之前：ptrace 和 procfs 的细节（2026-10-27）
 
-← [M9 之前：硬件断点和观察点（2026-10-27）](44-hw-watchpoints.md) · [索引](../milestones.md) · [M9 之前：mremap 和 sysfs（2026-10-27）](46-mremap-sysfs.md) →
-
 [ptrace 的两步](40-ptrace-strace.md)留下几处没有和 Linux 对照、或者知道不同的细节，这一轮逐个在原生上量过再改（§7.6）。
 
 - **单步进入信号处理函数**：跟踪者在信号投递停止里用 PTRACE_SINGLESTEP 投递一个有处理函数的信号时，原来设置好帧之后接着执行了处理函数的第一条指令，停在第二条上。arm64 Linux 先快进单步状态（`user_fastforward_single_step`），再由 `tracehook_signal_handler` 停一次：停在处理函数的第一条指令上、还没执行，siginfo 是 `ptrace_notify(SIGTRAP)` 的格式（`si_code` 也是 SIGTRAP，发送者是线程自己），再单步才执行它、报告 `TRAP_TRACE`。现在一样（`ptrace::handler_entered`，事件为 0 的停住，跟踪者给的信号不投递）。

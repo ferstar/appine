@@ -1,7 +1,5 @@
 # M9 之前：fork 写时复制（2026-10-26）
 
-← [M9 之前：不持 BKL 的 stat（2026-10-26）](25-stat-without-bkl.md) · [索引](../milestones.md) · [M9 之前：交错访存共用检查（2026-10-26）](27-interleaved-checks.md) →
-
 上上轮的推迟项：fork 整份复制碰过的页。微基准 `target/mem/forkbench.c`（进程写过若干 MB 内存之后反复 fork，子进程立即 `_exit`，父进程 waitpid）显示 fork 的时间随写过的内存线性增长，100 MB 时 21 毫秒，原生 0.6 毫秒；复制期间持着 BKL，别的进程都要等，子进程还多占一倍内存。
 
 - **写时复制**（§5.3）：写过的私有匿名映射 fork 时不复制，父子进程的页表都指向父进程的宿主页、去掉写权限，按页记账（拥有者借出，别的地址空间借用，fork 家族共用一张借出记录）。借用方写时复制一份到自己 VMA 里对应的位置；拥有者写、munmap、mremap、`MADV_DONTNEED` 之前先让借用方各自复制；拥有者销毁时页成了孤儿页留给借用方；最后一个借用方还回来时马上恢复拥有者的写权限。内核往 guest 内存写（`Mm::write`、`write_kernel`）、futex 的键、mprotect 都要照顾到。

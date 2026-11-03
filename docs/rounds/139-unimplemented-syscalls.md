@@ -1,7 +1,5 @@
 # M9 之前：未实现的系统调用（2026-10-31）
 
-← [M9 之前：LRCPC2（2026-10-31）](138-lrcpc2.md) · [索引](../milestones.md) · [M9 之前：ioprio、syslog 和 adjtimex（2026-10-31）](140-ioprio-syslog-adjtimex.md) →
-
 第 138 轮之后全量核对推迟项时，拿分发表（`core/kernel/src/syscall/mod.rs`）对照 Linux 6.1 的系统调用表（`include/uapi/asm-generic/unistd.h`），发现一批返回 ENOSYS 的编号没有写进任何一篇。这一轮只记下来，不改代码。
 
 已经记过的不再列：io_uring（[推迟项](19-deferred.md)、§15），rseq、mbind、landlock、fchmodat2（[glibc 发行版的探测](69-glibc-probe.md)），get_mempolicy（[负载普查](62-workload-survey.md)），fanotify（[M6](08-m6.md)、[M8 补测](11-m8-jvm.md)），新的挂载接口（[mount 的子集](105-mount-subset.md)、§8.2）。arm64 上本来就没有的编号也不算：244–259 是留给各个架构的，295–402 没有分配，403–423 只给 32 位。

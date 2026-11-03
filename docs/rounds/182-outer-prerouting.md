@@ -1,7 +1,5 @@
 # M9 之前：容器连外网也经过外层的 PREROUTING（2026-11-02）
 
-← [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块（2026-11-02）](181-last-member-leaves.md) · [索引](../milestones.md) · [M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面（2026-11-02）](183-udp-wide-first.md) →
-
 [透明代理那一轮](180-original-dst.md)的推迟项：不能在外层命名空间里透明代理容器连外网的流量。Linux 上给 docker、podman 的容器做透明代理，常见的写法是在外层对从 bridge 进来的连接做 REDIRECT：
 
 ```sh

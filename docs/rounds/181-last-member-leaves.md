@@ -1,7 +1,5 @@
 # M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块（2026-11-02）
 
-← [M9 之前：透明代理：SO_ORIGINAL_DST、SO_MARK 和 owner 匹配（2026-11-02）](180-original-dst.md) · [索引](../milestones.md) · [M9 之前：容器连外网也经过外层的 PREROUTING（2026-11-02）](182-outer-prerouting.md) →
-
 [上一轮](180-original-dst.md)测试时发现的偶发 SIGILL：跨命名空间的探测脚本里，几个 python3 服务端 import 了 select，客户端没有。最后一个客户端时常在启动后不久崩掉：
 
 ```

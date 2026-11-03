@@ -1,7 +1,5 @@
 # M9 之前：硬件断点和观察点（2026-10-27）
 
-← [M9 之前：core dump（2026-10-27）](43-coredump.md) · [索引](../milestones.md) · [M9 之前：ptrace 和 procfs 的细节（2026-10-27）](45-ptrace-procfs.md) →
-
 [ptrace 的第二步](41-ptrace-gdb.md)让 `NT_ARM_HW_BREAK`、`NT_ARM_HW_WATCH` 报告 0 个槽，gdb 的 `watch` 只能退回软件观察点：每执行一条指令都停下来让 gdb 比较一次值，在真实程序上基本不能用；`hbreak` 也不能用。这一轮实现硬件断点和观察点（§7.6）。
 
 - **槽和控制字**：与常见的 Cortex-A 核一样报告 6 个断点、4 个观察点（`dbg_info` 的调试架构仍是 ARMv8）。设置时按 Linux 的 `ptrace_hbp_fill_attr_ctrl`、`hw_breakpoint_arch_parse` 检查和规范化（`syscall::ptrace::hw_slot`）：停用的原样记下；启用的字节选择（BAS）必须是连续的一段，观察点的种类是读、写或者两者，断点只能是执行、4 字节，否则 EINVAL；起点是地址加上 BAS 的偏移，再按 8 字节（断点按 4 字节）对齐、把偏移挪回 BAS，特权级记成 EL0，读回的就是规范化之后的值。超出槽数的项不是零时 ENOSPC。

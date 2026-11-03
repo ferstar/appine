@@ -1,7 +1,5 @@
 # M9 之前：setns 经由 pidfd（2026-10-31）
 
-← [M9 之前：tmpfs 的用量和限制（2026-10-31）](131-tmpfs-usage.md) · [索引](../milestones.md) · [M9 之前：点积指令 ASIMDDP（2026-10-31）](133-asimddp.md) →
-
 [挂载命名空间](118-mount-namespaces.md)那一轮起的推迟项：setns 只接受命名空间文件，pidfd 是 EINVAL。审推迟项时读 util-linux 的源码发现这会让 nsenter 用不了：2.41 起 `nsenter -t <pid>` 在内核版本高于 5.7 时用 pidfd_open 打开目标进程，再 setns(pidfd, 要进的那几种) 一次进去，失败了直接报 "reassociate to namespaces failed" 退出，不退回逐个打开 `/proc/<pid>/ns/*`。appine 报告 6.1、pidfd_open 也有，所以 Alpine 3.24（util-linux-misc 2.42.3）、Debian 13（2.41.5）上的 nsenter 进不了任何进程的命名空间，比如 bwrap 的沙箱；Ubuntu 24.04 的 2.39 和 busybox 的 nsenter 走路径，不受影响。
 
 ## 做法

@@ -1,7 +1,5 @@
 # M9 之前：futex 等待者的清理，放开 BKL 时检查借用（2026-10-29）
 
-← [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件（2026-10-29）](87-fast-panic-held-borrows.md) · [索引](../milestones.md) · [M9 之前：测试用的发布构建也检查借用（2026-10-29）](89-release-borrow-check.md) →
-
 [上一轮](87-fast-panic-held-borrows.md)的两个推迟项。
 
 - **futex 等待者的清理**：

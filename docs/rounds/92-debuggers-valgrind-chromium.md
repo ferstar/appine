@@ -1,7 +1,5 @@
 # M9 之前：调试器、valgrind 和 headless Chromium（2026-10-29）
 
-← [M9 之前：NETLINK_GENERIC 只有 nlctrl（2026-10-29）](91-generic-netlink.md) · [索引](../milestones.md) · [M9 之前：`/proc/<pid>/fd` 和 maps 里的路径解析符号链接（2026-10-29）](93-fd-paths-resolve-symlinks.md) →
-
 这一轮跑以前的普查（[第一轮](62-workload-survey.md)、[第二轮](70-survey-suites.md)、[glibc 发行版](69-glibc-probe.md)）没跑过的几类负载。它们碰的是 appine 最容易出偏差的地方：
 
 - **delve、lldb**：gdb、strace 以外的调试器，大量用 ptrace 的各种请求，读 `/proc/<pid>/` 下的东西；

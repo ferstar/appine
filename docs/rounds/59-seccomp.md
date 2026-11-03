@@ -1,7 +1,5 @@
 # M9 之前：seccomp（2026-10-28）
 
-← [M9 之前：cgroup v2 的视图（2026-10-27）](58-cgroup.md) · [索引](../milestones.md) · [M9 之前：seccomp 的缓存和快速路径（2026-10-28）](60-seccomp-cache.md) →
-
 原来 guest 不能自己装 seccomp 过滤器（§11.1）：`prctl(PR_SET_SECCOMP)` 做完参数和权限检查之后返回 EINVAL，`seccomp(2)` 是 ENOSYS。用 seccomp 给自己加沙箱的程序要么报错，要么不带沙箱运行；靠 `SECCOMP_RET_TRACE` 的 `strace --seccomp-bpf`、靠通知 fd 代办系统调用的监管程序也用不了。这一轮在内核层实现 seccomp（`seccomp.rs`），行为按 Linux 6.1。
 
 - **模式**：

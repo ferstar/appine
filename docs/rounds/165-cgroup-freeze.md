@@ -1,7 +1,5 @@
 # M9 之前：cgroup.freeze（2026-11-01）
 
-← [M9 之前：cgroup 的 pids.max 和 memory.max 起作用（2026-11-01）](164-cgroup-limits.md) · [索引](../milestones.md) · [M9 之前：cgroup 的设备过滤（eBPF）（2026-11-01）](166-bpf-devices.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 9 的第二步的后一半：`docker pause`、`podman pause`、runc/crun 的 `pause` 写 `cgroup.freeze`，systemd 冻结单元也用它。[cgroup 树](163-cgroup-tree.md)里写 1 是 EOPNOTSUPP。照 Linux 6.1 的 `kernel/cgroup/freezer.c`：冻结不是停止信号，父进程、wait 看不到，等待中的系统调用解冻后接着做。
 
 ## 做法

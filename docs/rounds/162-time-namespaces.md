@@ -1,7 +1,5 @@
 # M9 之前：time 命名空间（2026-11-01）
 
-← [M9 之前：经由 fd 执行 memfd 和已经删除的文件（2026-11-01）](161-exec-open-file.md) · [索引](../milestones.md) · [M9 之前：cgroup 树：建子 cgroup、迁移进程（2026-11-01）](163-cgroup-tree.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 7：appine 有 `/proc/<pid>/ns/time`，dockerd 看到它就在容器的规范里加上 time 命名空间；runc 再检查 `/proc/self/timens_offsets`，没有就报 `time namespaces aren't enabled in the kernel`。原来 `CLONE_NEWTIME` 是 EPERM，又没有 `timens_offsets`，与哪种 Linux 都对不上：配了 `CONFIG_TIME_NS` 的都有，没配的连 `ns/time` 也没有。
 
 两条路：去掉 `ns/time`，或者做 time 命名空间。appine 的时钟（连同 vDSO 的存根）都经过内核层，加偏移不难，命名空间也只剩这一种，就做了。照 Linux 6.1 的 `kernel/time/namespace.c`，加上 6.2 起放宽的几处（见下）。

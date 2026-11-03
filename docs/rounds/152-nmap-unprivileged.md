@@ -1,7 +1,5 @@
 # M9 之前：nmap 以 root 运行（2026-11-01）
 
-← [M9 之前：短的符号链接不占块（2026-11-01）](151-short-symlink-blocks.md) · [索引](../milestones.md) · [M9 之前：/proc/<pid>/exe 指向程序文件本身（2026-11-01）](153-exe-file.md) →
-
 第 151 轮之后筛兼容性推迟项时发现的，以前没记过：appine 默认以 root 登录，nmap 以 root 运行时一上来就退出。
 
 - nmap 按 `geteuid() == 0` 判断有没有特权（`NmapOps.cc` 的 `NmapOps::Initialize`，环境变量 `NMAP_PRIVILEGED`、`NMAP_UNPRIVILEGED` 优先），有特权时默认做 SYN 扫描，主机发现用 ICMP、ARP，都要 raw socket 或者 AF_PACKET。`UltraScanInfo::Init` 两样都打不开时 `fatal("Couldn't open a raw socket or eth handle.")`。

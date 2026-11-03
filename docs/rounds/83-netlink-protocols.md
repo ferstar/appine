@@ -1,7 +1,5 @@
 # M9 之前：没有实现的 netlink 协议建不了（2026-10-28）
 
-← [M9 之前：测试自己的竞争和丢掉的现场（2026-10-28）](82-test-races.md) · [索引](../milestones.md) · [M9 之前：补测待查的几项（2026-10-28）](84-debt-checks.md) →
-
 补测[终端的访问时间和修改时间](79-pty-times.md)那一轮的推迟项（在 sshd 的登录会话里看 w 的空闲时间）时发现：Alpine 的 musl 不写 utmp，w、who 什么也不列，换到 Debian 的仓库（[glibc 发行版的探测](69-glibc-probe.md)那一轮建的）里跑，sshd 根本登录不进去，日志是 "Access denied for user root by PAM account configuration"，原生的 `debian:trixie` 上同样的配置能登录。
 
 - **原因**：Debian 的 sshd 开着 PAM，libpam 编进了 libaudit，每个阶段都往内核发一条审计消息：`audit_open` 建一个 `NETLINK_AUDIT` 的 socket，发出消息之后等内核的 ACK，每次等半秒、最多重试 80 次。appine 对 `NETLINK_ROUTE` 以外的协议照样建出 socket，收到请求却从不回答，40 秒之后得到 EAGAIN，PAM 的 account 阶段以系统错误结束（直接调 `pam_acct_mgmt` 得到 "System error"，PAM 写的 syslog 是 "audit_log_acct_message() failed: Resource temporarily unavailable"）。Linux 上没有编进审计时，`socket(AF_NETLINK, …, NETLINK_AUDIT)` 返回 EPROTONOSUPPORT，libpam 把它当作没有审计，直接往下走。Debian、Ubuntu 上所有走 PAM 的登录（sshd、su、login）在 appine 上都不能用；Alpine 的 sshd 和 busybox 的 su 不用 PAM，[负载普查](62-workload-survey.md)没有碰到。

@@ -1,7 +1,5 @@
 # M9 之前：经由虚拟网卡的连接：socket 层的地址映射（2026-11-01）
 
-← [M9 之前：有状态的网卡（2026-11-01）](170-netdev.md) · [索引](../milestones.md) · [M9 之前：nftables 的子集和 socket 层的 DNAT（2026-11-01）](172-nftables.md) →
-
 [容器网络的普查](169-container-network-survey.md)定下的方案 1 的第二步。[上一轮](170-netdev.md)之后 docker、podman 的 bridge 网络建得起来、容器起得来，但数据包不经过虚拟网卡：容器之间、外层到容器都是 "Network unreachable"，docker 的 `-p` 容器起不来，podman 自定义网络的 aardvark-dns 绑不上网关地址。这一轮在 socket 层把虚拟设备上的地址换成宿主上的回环地址，连接、数据报都经由宿主的回环接口，与[网络命名空间](122-net-namespaces.md)换 lo 的地址是同一个办法。
 
 ## 做法

@@ -1,7 +1,5 @@
 # M9 之前：容器网络的普查（2026-11-01）
 
-← [M9 之前：open_tree、move_mount 和 mount_setattr（2026-11-01）](168-open-tree.md) · [索引](../milestones.md) · [M9 之前：有状态的网卡（2026-11-01）](170-netdev.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 12：容器现在只能用 host 网络。讨论之后先走"按地址映射模拟 bridge"这条路（方案 1）：容器的 socket 仍是宿主 socket，appine 里不出现包，容器的地址在系统调用的边界上换成宿主上的回环地址，与[网络命名空间](122-net-namespaces.md)现在的做法一样。动手之前先查清楚 docker 和 podman 的 bridge 网络到底依赖什么，重点是三件事：关掉防火墙之后还剩哪些依赖；自定义网络按容器名解析靠什么；端口发布（`-p`）是怎么实现的。
 
 ## 做法

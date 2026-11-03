@@ -1,7 +1,5 @@
 # M9 之前：推迟项（2026-10-25）
 
-← [M9 之前：剩下的小缺口（2026-10-25）](18-small-gaps.md) · [索引](../milestones.md) · [M9 之前：稳健性（2026-10-25）](20-robustness.md) →
-
 把前几轮推迟的、在单进程模型里做得了的补上；io_uring 不做（见下面的推迟项和 §15）。
 
 - **信号驱动的 I/O**：`O_ASYNC`（`F_SETFL`、`FIOASYNC`），属主（`F_SETOWN`、`F_SETOWN_EX`，socket 上还有 `FIOSETOWN`/`SIOCSPGRP`）和 `F_SETSIG` 原来只记录，现在生效：文件变得可读、可写、出错或挂断时给属主（线程、进程或进程组）发 SIGIO，或者 `F_SETSIG` 设置的信号，带 `si_band`、`si_fd`（signalfd 也给出这两项），band 与 Linux 相同。读过之后仍然可读的（又来了数据）再通知一次。检查放在定时器线程上：内核状态的任何修改都会叫醒它，它顺便检查登记了 `O_ASYNC` 的文件，宿主 socket 的就绪也由它一起 poll。

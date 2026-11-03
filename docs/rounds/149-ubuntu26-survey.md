@@ -1,7 +1,5 @@
 # M9 之前：Ubuntu 26.04 的普查（2026-10-31）
 
-← [M9 之前：用户命名空间里的 ID 换算（2026-10-31）](148-userns-ids.md) · [索引](../milestones.md) · [M9 之前：新分配的 PTY（2026-11-01）](150-new-pty-state.md) →
-
 [termios2](145-termios2.md)和[openat2](144-openat2.md)那两轮的问题都是新版的用户态才会碰到的：App 里现在的三个发行版（Alpine、Debian 13、Ubuntu 24.04）测不出来。这一轮拿最新的 LTS（Ubuntu 26.04.1：glibc 2.43，coreutils 换成了 Rust 写的 uutils 0.10）当仓库跑一遍常用的命令，与同一个仓库导出的原生容器比。
 
 ## 做法

@@ -1,7 +1,5 @@
 # M9 之前：podman 和 docker 的普查（2026-11-01）
 
-← [M9 之前：低端口映射和监听通知（2026-11-01）](156-low-ports.md) · [索引](../milestones.md) · [M9 之前：容器运行时碰到的四处小问题（2026-11-01）](158-container-small-fixes.md) →
-
 设计文档 §1.2 把 docker、podman 放在 D 档（不做），理由是"namespace、cgroup"。命名空间那一半后来为 bubblewrap 做了（除 time 以外都有，[bubblewrap](123-bwrap.md)），容器服务又很常见，这一轮普查现在离能跑容器还有多远：先用最省事的一组参数（vfs 存储驱动、host 网络、不用 cgroup），看依次撞到什么。
 
 ## 做法

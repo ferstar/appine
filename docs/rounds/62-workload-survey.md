@@ -1,7 +1,5 @@
 # M9 之前：负载普查（2026-10-28）
 
-← [M9 之前：进程结束的每一步分别兜住（2026-10-28）](61-finish-steps.md) · [索引](../milestones.md) · [M9 之前：fork 之后还回的页按各自的权限恢复（2026-10-28）](63-returned-loans.md) →
-
 剩下的内核推迟项按"常见程序碰不碰得到"筛下来，多是长尾。差分测试只覆盖 C 程序、coreutils、Go、Java、Node.js、Python、Lua/SQLite 和 gdb，手机终端上常见的服务和工具大多没在 appine 里跑过。这一轮把它们跑一遍，找出实际会碰到的缺口。
 
 - **做法**：`scripts/survey` 在 Alpine 3.24 的仓库里装好软件包（约 1 GB），把 `tests/survey/<名字>.sh` 拷进仓库运行，带 `APPINE_LOG=1`，最后每个负载一行：退出码、用时和未实现的 syscall。输出要人看，不和原生比对。看出异常的，再导出仓库在原生 Linux 上跑同样的命令，或者在 appine 里用 `APPINE_STRACE`、core 文件和 gdb 追下去。都在 colima 的虚拟机里用 Tier 1 跑。

@@ -1,7 +1,5 @@
 # M9 之前：起进程和 mmap 的持锁时间（2026-10-30）
 
-← [M9 之前：同一个程序共用翻译（2026-10-30）](108-shared-translation.md) · [索引](../milestones.md) · [M9 之前：openat 的开销（2026-10-30）](110-openat-cost.md) →
-
 内存的三轮做完，接着拆 BKL。先用第 38 轮的插桩（`target/mem/bklinstr.py`、`bklsurvey.sh`，按系统调用记持锁、等锁的时间）重新量了一遍，前几轮之后的分布（arm64 的编号：222 mmap、215 munmap、56 openat、94 exit_group、220 clone、221 execve、260 wait4、165 getrusage、62 lseek）：
 
 | 负载 | 持锁最多的 | 等锁最多的 |

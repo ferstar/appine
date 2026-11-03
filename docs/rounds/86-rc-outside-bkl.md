@@ -1,7 +1,5 @@
 # M9 之前：排查在 BKL 外改 Rc 的计数（2026-10-28）
 
-← [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口（2026-10-28）](85-inet6-opath-exit.md) · [索引](../milestones.md) · [M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件（2026-10-29）](87-fast-panic-held-borrows.md) →
-
 [线程退出时在 BKL 外丢掉弱引用](71-thread-exit-race.md)那一轮的推迟项。那一次，线程退出时在 BKL 外丢掉一个弱引用，与同时持有 BKL 的线程一起改同一个计数，计数改丢之后对象被提前释放，宿主的堆被破坏；`catch_unwind` 兜不住，整个 App 崩溃。那一轮只查了线程局部变量。这一轮把所有不持 BKL 运行内核代码的地方逐个查了一遍。`RefCell` 的借用标志和 `Rc` 的计数一样不是原子的，所以一起查。
 
 - **查的范围**：别的线程只能经由 `unsafe impl Send/Sync` 的类型接触到 `Rc`，即 `Kernel` 和元数据缓存 `Meta`；`HostRegion`、`FileMap` 里没有 `Rc`。静态变量必须是 `Sync`，线程局部变量每个线程一份，这两类编译器都替我们查了。所以要查的是：手里拿着从 `Kernel` 取出来的 `Rc` 的线程，在不持 BKL 时做了什么。逐个看了：

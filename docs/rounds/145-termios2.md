@@ -1,7 +1,5 @@
 # M9 之前：termios2（2026-10-31）
 
-← [M9 之前：openat2（2026-10-31）](144-openat2.md) · [索引](../milestones.md) · [M9 之前：PTY 的包模式（2026-10-31）](146-pty-packet-mode.md) →
-
 第 144 轮之后筛兼容性推迟项时读 glibc 的源码发现：glibc 2.42 起 `tcgetattr` 只用 `TCGETS2`（`struct termios2`，多了输入、输出速率），失败了不退回 `TCGETS`；`isatty` 就是 `tcgetattr(fd) == 0`；`tcsetattr` 在 `__ASSUME_TERMIOS2`（arm64 上总是定义）时只用 `TCSETS2`、`TCSETSW2`、`TCSETSF2`。appine 的终端没有这几个 ioctl（ENOTTY），glibc ≥ 2.42 的发行版（Ubuntu 25.10、26.04 LTS，Fedora 43 起，Arch，Debian 14）里每个终端都"不是终端"。App 里现在的三个发行版不受影响（Alpine 是 musl，Debian 13 是 glibc 2.41，Ubuntu 24.04 是 2.39），所以历次普查都没碰到；这一条以前也没记进推迟项。
 
 拿 Ubuntu 26.04.1 LTS（glibc 2.43，docker 的 `ubuntu:26.04` 导出成仓库）在 `--pty` 下跑 `bash -i` 确认过：改之前 `tty` 打印 "not a tty"，`stty size` 是 "Inappropriate ioctl for device"，readline 不启用（没有括号粘贴的开关序列）；改之后 `/dev/pts/0`、`24 80`。

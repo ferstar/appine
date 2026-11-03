@@ -1,7 +1,5 @@
 # M9：熄屏时保持运行（2026-11-02）
 
-← [M9：设置页，默认导入 Alpine（2026-11-02）](190-settings-default-alpine.md) · [索引](../milestones.md) · [M9：许可证改为 AGPL-3.0-or-later，开源许可页（2026-11-02）](192-license.md) →
-
 设计文档 §11.2 的"熄屏后继续运行依赖 `PARTIAL_WAKE_LOCK`，由用户手动开启，默认关闭"，M9 计划里的 wake lock 开关。[App 按 inittab 开机](187-app-init.md)之后，OpenRC 起的服务在没有标签页时也留在后台，熄屏后 CPU 一休眠它们就停住，那一轮把这个记成了推迟项。
 
 ## 先查清楚：Doze 里锁还算不算数

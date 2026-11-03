@@ -1,7 +1,5 @@
 # M9 之前：可写地挂 cgroup2（2026-11-01）
 
-← [M9 之前：容器运行时碰到的四处小问题（2026-11-01）](158-container-small-fixes.md) · [索引](../milestones.md) · [M9 之前：mqueue 文件系统（2026-11-01）](160-mqueue-fs.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 6：crun 给容器挂 `/sys/fs/cgroup` 时不带只读（podman 的规范里写的是 `rw`，之后按选项再 bind 地重新挂），appine 对不带只读的 cgroup2 挂载回 EROFS（[mount 的子集](105-mount-subset.md)："cgroup2 只能只读"），每个容器都起不来（`--cgroups disabled` 时也挂）。
 
 ## 做法

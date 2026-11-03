@@ -1,7 +1,5 @@
 # M9 之前：PDEATHSIG 和 __WNOTHREAD（2026-10-31）
 
-← [M9 之前：LRCPC（2026-10-31）](136-lrcpc.md) · [索引](../milestones.md) · [M9 之前：LRCPC2（2026-10-31）](138-lrcpc2.md) →
-
 [task 目录的 children](134-task-children.md)那一轮记下父线程之后剩下的两条推迟项，都是 Linux 上按线程、appine 原来按进程的地方：
 
 - `PR_SET_PDEATHSIG`：prctl(2) 写明这里的"父进程"是建立它的线程，那个线程退出（`pthread_exit`）就发，父进程还在也一样；设置本身也是线程的（`task_struct.pdeath_signal`），新线程、fork 出来的子进程都从 0 开始。appine 原来记在进程上，要等整个父进程结束才发；siginfo 是 `SI_KERNEL`，Linux 是 `SI_USER`、发送者是父进程。

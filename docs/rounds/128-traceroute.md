@@ -1,7 +1,5 @@
 # M9 之前：traceroute 和 mtr（2026-10-31）
 
-← [M9 之前：LTP 剩下的小差异（2026-10-31）](127-ltp-leftovers.md) · [索引](../milestones.md) · [M9 之前：命名空间文件留住命名空间（2026-10-31）](129-namespace-files.md) →
-
 [raw ICMP 的模拟](125-raw-icmp.md)的两条推迟项：traceroute、mtr 不能用，新的网络命名空间里 `ping6 ::1` 失败。
 
 先分别在 appine 和原生容器里量了各个工具，宿主有 `CAP_NET_RAW`（开发用的容器）和没有的（`--cap-drop NET_RAW`，像 Android 上的 App）两种都跑：

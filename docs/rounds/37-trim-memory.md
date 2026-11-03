@@ -1,7 +1,5 @@
 # M9 之前：onTrimMemory（2026-10-26）
 
-← [M9 之前：多进程并行（2026-10-26）](36-parallel-processes.md) · [索引](../milestones.md) · [M9 之前：拆 BKL（2026-10-26）](38-split-bkl.md) →
-
 上一轮翻译池放到 16 个实例之后，池里最多留七八十 MB 翻译。内核层的 `Machine::trim_memory`（丢掉池里保留的翻译、共用的只读文件映射、dentry/inode 缓存，提交推迟的写事务）早就有了，这一轮把它接到 App 上（§11.2）。
 
 - **能收到什么**：Android 14 起不再发 `RUNNING_MODERATE`、`RUNNING_LOW`、`RUNNING_CRITICAL`、`MODERATE`、`COMPLETE`，只发 `UI_HIDDEN` 和 `BACKGROUND`。第一版在 `UI_HIDDEN` 时释放，模拟器上按 HOME 之后一直没有收到：按 AOSP 的代码，系统只在进程状态降到 `IMPORTANT_BACKGROUND` 以下时才发它，有前台服务的进程停在前台服务；也不在后台的 LRU 列表里，收不到 `BACKGROUND`。所以有前台服务时，Android 14 起根本收不到 `onTrimMemory`。

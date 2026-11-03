@@ -1,7 +1,5 @@
 # M9 之前：平均负载、sysfs 和 limits（2026-10-27）
 
-← [M9 之前：拆 BKL（2026-10-26）](38-split-bkl.md) · [索引](../milestones.md) · [M9 之前：ptrace 的第一步，strace（2026-10-27）](40-ptrace-strace.md) →
-
 把推迟项里顺手能补的几个内核兼容性缺口补上（ptrace 另做）：
 
 - **平均负载**（`/proc/loadavg`、sysinfo 的 `loads`，M3b 起一直是 0）：与 Linux 的 `kernel/sched/loadavg.c` 一样，每 5 秒取一次可运行的线程数，按 1、5、15 分钟做指数衰减平均，定点数的系数和取整都与 Linux 相同（`loadavg.rs`）。可运行的是不在内核里等待的 guest 线程，等 BKL 的也算，相当于 Linux 的 R 加 D。

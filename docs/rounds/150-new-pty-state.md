@@ -1,7 +1,5 @@
 # M9 之前：新分配的 PTY（2026-11-01）
 
-← [M9 之前：Ubuntu 26.04 的普查（2026-10-31）](149-ubuntu26-survey.md) · [索引](../milestones.md) · [M9 之前：短的符号链接不占块（2026-11-01）](151-short-symlink-blocks.md) →
-
 [Ubuntu 26.04 的普查](149-ubuntu26-survey.md)的问题 1 和 3，都是新分配的终端的初始状态。
 
 问题 1：GNU screen 的窗口时好时坏（普查里没有运行，单独跑时多半正常）。screen 的主进程分配好终端、fork 出窗口的子进程之后马上读主设备，子进程这时可能还没打开从设备。appine 的主设备在"已经解锁、从设备一个都没打开着"时读就返回 EIO、poll 带 POLLHUP，screen 就当窗口已经结束了。Linux 只在从设备打开过、又全部关掉之后（`pty_close` 设的 `TTY_OTHER_CLOSED`）才这样，从来没打开过时照常阻塞（`ptm_unix98_ops` 装好一对终端时从设备的计数就是 1，不算关掉）；原生上确认过：已解锁、没打开过时读是 EAGAIN、没有 POLLHUP，打开再关掉之后才是 EIO 和 POLLHUP，重新打开又恢复。appine 的注释写的正是"从设备打开过又全部关闭之后返回 EIO"，实现漏了"打开过"。

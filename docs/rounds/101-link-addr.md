@@ -1,7 +1,5 @@
 # M9 之前：接口和地址的 netlink 消息（2026-10-29）
 
-← [M9 之前：文件能力（2026-10-29）](100-file-caps.md) · [索引](../milestones.md) · [M9 之前：`/proc/net/snmp` 和输入结束时的 EOF（2026-10-29）](102-snmp-pty-eof.md) →
-
 [路由表](98-routes.md)那一轮对照时发现、记为推迟项的一条：`RTM_NEWADDR` 少了几个属性，`ip addr` 不显示 `brd`。再和原生对照，缺的不止这些：
 
 - busybox 的 `ip addr`、`ip link` 少了 `brd`、`valid_lft forever preferred_lft forever` 那一行，以及链路那一行的 `qdisc noqueue state UP`。`ip link show eth0 | grep 'state UP'` 是脚本里判断网卡起没起来的常见写法，原来会判断错。

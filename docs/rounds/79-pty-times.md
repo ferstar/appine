@@ -1,7 +1,5 @@
 # M9 之前：终端的访问时间和修改时间（2026-10-28）
 
-← [M9 之前：网络信息的缺口（只补文档，2026-10-28）](78-net-info-gaps.md) · [索引](../milestones.md) · [M9 之前：CPU 时间不倒退（2026-10-28）](80-cpu-times.md) →
-
 [终端的属主和权限](64-pty-owner.md)那一轮的推迟项：`/dev/pts/<n>` 的访问时间、修改时间、状态改变时间都报告 stat 的那一刻，utimensat 是 EACCES。w、who 按终端的访问时间算空闲时间，在 appine 上永远是 0；util-linux 的 write 在用户有多个终端时挑访问时间最近的那个。
 
 - **Linux 的做法**：devpts 的 inode 和普通文件一样有三个时间。6.1 的 `tty_update_time`：从设备读到数据时改访问时间，写出数据时改修改时间，只改秒，而且只在和原来相差 8 秒以上时才改，注释说精确的时刻会泄露别人敲键盘的节奏。chmod、chown、utimensat 改状态改变时间，utimensat 可以把访问、修改时间设成任意值。

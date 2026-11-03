@@ -1,7 +1,5 @@
 # M9："文件"App 按内容认出文本文件（2026-11-03）
 
-← [M9：换镜像不丢用户加的源（2026-11-03）](203-mirror-keeps-lines.md) · [索引](../milestones.md) · [M9：内核 bug 的报告能复制，带着 panic 的位置（2026-11-03）](205-copy-bug-report.md) →
-
 [在"文件"App 里浏览](196-documents-read.md)那一轮的推迟项：provider 只按扩展名猜类型，没有扩展名的文本文件（`/etc/profile`、脚本、`Makefile`）和 `.bashrc` 这样的点文件（点后面的 `bashrc` 不是认识的扩展名）都是 `application/octet-stream`，"文件"App 里点开没有 App 能接，只能复制出去。[家目录可写](197-documents-write.md)之后，用 Android 上的编辑器改点文件和脚本正是常见的用法。
 
 ## 做法

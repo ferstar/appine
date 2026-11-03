@@ -1,7 +1,5 @@
 # M9 之前：命名空间文件留住命名空间（2026-10-31）
 
-← [M9 之前：traceroute 和 mtr（2026-10-31）](128-traceroute.md) · [索引](../milestones.md) · [M9 之前：vhangup（2026-10-31）](130-vhangup.md) →
-
 [挂载命名空间](118-mount-namespaces.md)到[网络命名空间](122-net-namespaces.md)几轮的同一条推迟项：打开着的、bind 挂载出去的命名空间文件不让命名空间活着，里面的进程都退出之后，对它 setns 是 EINVAL。`ip netns add` 正是这样留住网络命名空间的：它 unshare 出一个网络命名空间，把 `/proc/self/ns/net` bind 到 `/var/run/netns/<名字>` 上就退出，之后 `ip netns exec`、`ip -n` 打开这个文件 setns 进去。改之前在 appine 里 `ip netns add` 成功，`exec` 全是 "setting the network namespace failed: Invalid argument"；busybox 的 `unshare --net=<文件>` 和 `nsenter --net=<文件>` 也一样。顺带补上命名空间文件上的 `NS_GET_*` ioctl（原来是 ENOTTY），以及 `ip netns list` 要的 RTM_GETNSID。
 
 ## 做法

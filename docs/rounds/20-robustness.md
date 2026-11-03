@@ -1,7 +1,5 @@
 # M9 之前：稳健性（2026-10-25）
 
-← [M9 之前：推迟项（2026-10-25）](19-deferred.md) · [索引](../milestones.md) · [M9 之前：稳健性的收尾（2026-10-25）](21-robustness-finish.md) →
-
 开始 M9 之前，把设计文档 §12 里"一个 guest 程序就能弄垮整个 App"的几种情况补上：内核层 panic、引擎让宿主收到故障信号、guest 用掉太多内存、fork 炸弹。原来前两种直接终止宿主进程，后两种等 Android 的 LMK 杀掉整个 App（或者把宿主的线程和 fd 用完），所有会话一起丢掉。现在都只结束出问题的那个 guest 进程，别的会话照常运行。
 
 - **内核层 panic**（§12 第 5 条，`core/kernel/src/bug.rs`）：运行循环在每次进入内核（syscall、同步异常、kick）的地方 `catch_unwind`。panic hook 先打印消息和位置，再写一行报告（pid、comm、线程、最后的 guest pc、哪个 syscall），用 SIGSEGV 结束整个线程组，相当于 Linux 的 oops 结束当前任务；之后获取 BKL 时忽略中毒标记。BKL 保护的状态可能只改了一半，但出问题的进程已经结束，大部分不一致随之消失。线程开始和退出时的 panic 仍然终止宿主进程。

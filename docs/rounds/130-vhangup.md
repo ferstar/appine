@@ -1,7 +1,5 @@
 # M9 之前：vhangup（2026-10-31）
 
-← [M9 之前：命名空间文件留住命名空间（2026-10-31）](129-namespace-files.md) · [索引](../milestones.md) · [M9 之前：tmpfs 的用量和限制（2026-10-31）](131-tmpfs-usage.md) →
-
 [关掉主设备时挂断从设备](104-pty-hangup.md)那一轮的推迟项：`vhangup(2)`、`TIOCVHANGUP` 原来没有（ENOSYS、ENOTTY），程序自己不能挂断终端。util-linux 的 `login` 在登录之前调 vhangup 赶走终端上留下的进程（它不看返回值，没有的话旧进程照样能读写这个终端），agetty 的 `--hangup`、systemd 用 `TIOCVHANGUP` 做同样的事。App 自己登录不经过 login，只有用户自己运行 login、agetty 时才用得到。LTP 的 vhangup01、vhangup02 因此跳过。
 
 ## 做法

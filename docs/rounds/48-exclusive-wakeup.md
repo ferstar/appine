@@ -1,7 +1,5 @@
 # M9 之前：独占的唤醒（2026-10-27）
 
-← [M9 之前：嵌套 epoll 的边沿（2026-10-27）](47-nested-epoll.md) · [索引](../milestones.md) · [M9 之前：按对象唤醒（2026-10-27）](49-targeted-wakeups.md) →
-
 [epoll 的边沿](42-epoll-edges.md)那一轮让 `EPOLLEXCLUSIVE` 的一个边沿只报告给一个 epoll，但等待的线程仍然都被叫醒：几个进程各用一个 epoll 等同一个监听 socket，来一个连接，宿主 poll（TCP）或者文件类的广播（AF_UNIX）把每个等待者都叫醒，没轮到的在内核里重新检查之后接着睡。Linux 每次唤醒只叫醒一个独占的等待者，别的根本不醒。这一轮做到同样（§10）。
 
 - **能看到"有没有醒"**：`/proc/<pid>/status`（和线程的）的 `voluntary_ctxt_switches`、`nonvoluntary_ctxt_switches` 原来总是 0，现在取宿主线程的（`appine_hal::thread_ctxt_switches`，减去线程开始时的值，宿主线程会被复用）。宿主线程每睡下一次就是一次自愿切换，没被叫醒的线程不变，原生上也是这样，所以差分测试可以数"被叫醒过的进程"。量下来原来是返回 1 个、被叫醒 3 个，原生是 1 个、1 个。

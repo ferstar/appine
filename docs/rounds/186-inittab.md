@@ -1,7 +1,5 @@
 # M9 之前：内置的 init 按 inittab 开机、关机（2026-11-02）
 
-← [M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl（2026-11-02）](185-protected-links-random.md) · [索引](../milestones.md)
-
 支持 OpenRC 的第三轮。前两轮之后 OpenRC 在 appine 里能跑，缺的是"谁来跑它"：
 
 - 1 号进程是内核层内置的、不对应任何 guest 程序，不读 inittab。App 冷启动时没有地方执行 `openrc sysinit/boot/default`，只能在 `/etc/profile.d` 里靠标记文件自己起服务（只有开了标签页才会执行）。

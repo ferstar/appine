@@ -1,7 +1,5 @@
 # M9 之前：起进程的宿主开销（2026-10-26）
 
-← [M9 之前：交错访存共用检查（2026-10-26）](27-interleaved-checks.md) · [索引](../milestones.md) · [M9 之前：BKL 的等待和持锁（2026-10-26）](29-bkl-wait-hold.md) →
-
 上一轮的推迟项：shell 负载里 execve、退出时为 `ru_maxrss` 取样约占 4%，fork 时子进程的私有映射各自 mmap、exec 时再 munmap，每个新线程新建 Cpu。剖析 `ls`、`cat | wc` 的循环发现宿主内核占了 46%（缺页、munmap、mmap、mincore、唤醒），为此写了微基准 `target/mem/spawnbench.c`：fork 之后 `_exit`、fork 之后 exec `/bin/true`、vfork 之后 exec、`posix_spawn`、`posix_spawn` 一个 `sh -c 'cat /etc/passwd | wc -l'`，原生一侧在 Alpine 容器里跑同一份源码。
 
 - **放开 BKL 之后再叫醒、再交还内存**（§6、§5.2）：

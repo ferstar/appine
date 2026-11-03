@@ -1,7 +1,5 @@
 # M9 之前：网络命名空间的 sysctl 补齐、UDP 也查有没有人绑（2026-11-02）
 
-← [M9 之前：从外面转发进来的连接带上真实的客户端地址（2026-11-02）](176-real-client-address.md) · [索引](../milestones.md) · [M9 之前：测试提速，以及顺带找到的几个问题（2026-11-02）](178-test-speed.md) →
-
 审完 170–176 轮的推迟项之后，挑出值得做的两项，同时补跑一次没覆盖过的配置（podman 的 iptables 驱动）：
 
 - **sysctl 不全**（[第 170 轮](170-netdev.md)的推迟项）：`/proc/sys/net` 下只有 `ip_forward`、`ip_local_port_range` 等几项，Linux 新的网络命名空间里有的 `ipv4/tcp_keepalive_time`、`tcp_fin_timeout`、`tcp_syncookies` 这些都没有。docker、compose 的 `sysctls:`、`docker run --sysctl net.ipv4...` 由 runc 在容器里写这些文件，文件不存在，容器就起不来。

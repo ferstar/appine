@@ -1,7 +1,5 @@
 # M9 之前：透明代理：SO_ORIGINAL_DST、SO_MARK 和 owner 匹配（2026-11-02）
 
-← [M9 之前：页表按需建立，AddressSanitizer 能用了（2026-11-02）](179-demand-page-tables.md) · [索引](../milestones.md) · [M9 之前：共用翻译的组里最后一个成员离开时作废别人留下的块（2026-11-02）](181-last-member-leaves.md) →
-
 起因是用户问 ShadowSocks、proxychains 能不能用。在 appine 里实测了 shadowsocks-rust 1.24（Alpine 3.24 没有 shadowsocks-libev）和 proxychains-ng 4.17：
 
 - 能用：`sslocal` 的 SOCKS5、HTTP、tunnel 模式，TCP 和 UDP（SOCKS5 的 UDP ASSOCIATE、`tunnel -U`）；proxychains 的 LD_PRELOAD 链到 sslocal 或者外面的 HTTP 代理；`proxy_dns` 的远程解析；经由 ssserver 访问外网。

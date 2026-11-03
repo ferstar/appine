@@ -1,7 +1,5 @@
 # M9 之前：App 按 inittab 开机、关机，没有标签页时留在后台（2026-11-02）
 
-← [M9 之前：内置的 init 按 inittab 开机、关机（2026-11-02）](186-inittab.md) · [索引](../milestones.md) · [M9 之前：8 核上的扩展性和 BKL 的交接（2026-11-02）](188-bkl-spinners.md) →
-
 支持 OpenRC 的第四轮，也是最后一轮：把上一轮的 `Machine::boot`、`shutdown`、`take_power` 接到 App 上。原来 App 这边有三个问题：
 
 - 冷启动时没有地方起服务。

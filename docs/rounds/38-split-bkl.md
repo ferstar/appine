@@ -1,7 +1,5 @@
 # M9 之前：拆 BKL（2026-10-26）
 
-← [M9 之前：onTrimMemory（2026-10-26）](37-trim-memory.md) · [索引](../milestones.md) · [M9 之前：平均负载、sysfs 和 limits（2026-10-27）](39-loadavg-sysfs.md) →
-
 上一轮的结论是剩下的差距主要在 BKL。这一轮分几步把常用的路径从 BKL 下拿出来，每一步单独提交。先给工作区加上按 syscall 统计持锁、等锁时间的临时插桩（`target/mem/bklinstr.py`），在各类并行负载上各跑一次（`target/mem/bklsurvey.sh`）：
 
 | 负载 | 持锁或等锁最多的 |

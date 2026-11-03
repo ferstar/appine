@@ -1,7 +1,5 @@
 # M9 之前：smaps 里共用的页（2026-10-28）
 
-← [M9 之前：终端的属主和权限（2026-10-28）](64-pty-owner.md) · [索引](../milestones.md) · [M9 之前：io_destroy 叫醒等事件的线程（2026-10-28）](66-aio-destroy.md) →
-
 [负载普查](62-workload-survey.md)的问题 3：redis 8.8 和 valkey 9.0 启动就退出，日志说 "Your kernel has a bug that could lead to data corruption during background save"。
 
 - **原因**：arm64 Linux 有过一个 bug（`arm64: pgtable: Ensure dirty bit is preserved across pte_wrprotect()`），fork 时页表项的脏位可能丢掉，后台保存（fork 之后写 RDB）会写出坏数据。redis、valkey 在 arm64 上启动时检查它（`ARM64-COW-BUG`）：一页写过、`MADV_FREE`、再写，fork 之后子进程读 `/proc/self/smaps` 里那一页所在映射的 `Shared_Dirty`，是 0 就认为内核有这个 bug，退出（可以用 `ignore-warnings ARM64-COW-BUG` 跳过，但没人知道要这样做）。appine 的 smaps 把匿名内存的驻留页都算作私有的脏页，`Shared_Dirty` 总是 0。

@@ -1,7 +1,5 @@
 # M9 之前：用户命名空间（2026-10-30）
 
-← [M9 之前：挂载命名空间（2026-10-30）](118-mount-namespaces.md) · [索引](../milestones.md) · [M9 之前：pid 命名空间（2026-10-30）](120-pid-namespaces.md) →
-
 让 bubblewrap 能用的第四轮。bwrap 带着 `--unshare-user` 在新的用户命名空间里做挂载、写自己的 uid_map，Codex 每条命令都这样跑。
 
 - **凭据**（`core/kernel/src/cred.rs`）：新的 `UserNs`（编号、上一层、层数、建立者的有效用户 ID、uid_map、gid_map、setgroups 的状态），凭据里记着所在的命名空间。凭据里的 ID 照旧是内核 ID（开机时的命名空间里的），`IdMap` 换算：`down` 是 `make_kuid`，`up` 是 `from_kuid`。开机时的命名空间映射全部 ID；每次 `Cred::root()` 新建一份，按编号比较。

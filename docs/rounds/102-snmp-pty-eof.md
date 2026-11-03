@@ -1,7 +1,5 @@
 # M9 之前：`/proc/net/snmp` 和输入结束时的 EOF（2026-10-29）
 
-← [M9 之前：接口和地址的 netlink 消息（2026-10-29）](101-link-addr.md) · [索引](../milestones.md) · [M9 之前：AI 编程 CLI（2026-10-29）](103-ai-cli-survey.md) →
-
 审推迟项时挑出来的两个便宜的兼容性缺口：
 
 - **`/proc/net/snmp`、`netstat`、`arp`**（[网络信息的缺口](78-net-info-gaps.md)、[路由表](98-routes.md)的推迟项）原来没有。iproute2 的 `ss -s` 读 `snmp` 里的 CurrEstab，打印 `ss: get_snmpstat: No such file or directory`；net-tools 的 `netstat -s`、iproute2 的 `nstat`、sysstat 的 `sar -n TCP,UDP` 也读这两个文件。

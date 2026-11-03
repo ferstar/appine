@@ -1,7 +1,5 @@
 # M9 之前：性能剖析（2026-10-25）
 
-← [M9 之前：稳定性和内存（2026-10-25）](12-stability-memory.md) · [索引](../milestones.md) · [M9 之前：起进程的翻译开销（2026-10-25）](14-spawn-translation.md) →
-
 用 6 个代表负载剖析了一轮（perf；Tier 1 写 `/tmp/perf-<pid>.map`，见 README），原生一侧是同一个仓库导出的 docker 镜像。负载分成两类：
 
 - **文件系统和进程密集的**（shell 起外部命令、`git status`）：时间花在内核层。路径解析占 `git status` 的 47%、shell 的 28%，其中一半以上不是查询本身，而是 SQLite 每条语句单独开、关读事务时的 fcntl 加解锁（`unixShmLock`，git 的 24.5%）。shell 还有 14% 花在 fork 逐页扫描栈的 8 MB。

@@ -1,7 +1,5 @@
 # M9：内核 bug 的报告带上出错之前的内核日志（2026-11-03）
 
-← [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制（2026-11-03）](206-debian-sudo-progress.md) · [索引](../milestones.md) · [M9：宿主让绑的低端口就绑原来的（2026-11-03）](208-low-ports-direct.md) →
-
 [内核 bug 的报告能复制](205-copy-bug-report.md)那一轮的推迟项：通知上"复制报告"复制的只有出错的那一行，出错之前发生过什么要用户自己去 `dmesg` 里找。
 
 内核日志里有的是（`printk` 的调用方和 `/dev/kmsg`）：appine 自己的 bug 报告、OOM killer 结束进程、pids 控制器拒绝 fork、1024 以下的端口绑到了宿主上的哪个端口，以及 guest 写进 `/dev/kmsg` 的。没有开机信息。出错之前有没有别的 bug（一个 bug 留下的不一致可能引出下一个）、刚结束过哪个进程、内存紧不紧，都在这里。

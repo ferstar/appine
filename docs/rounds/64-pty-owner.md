@@ -1,7 +1,5 @@
 # M9 之前：终端的属主和权限（2026-10-28）
 
-← [M9 之前：fork 之后还回的页按各自的权限恢复（2026-10-28）](63-returned-loans.md) · [索引](../milestones.md) · [M9 之前：smaps 里共用的页（2026-10-28）](65-smaps-shared.md) →
-
 [负载普查](62-workload-survey.md)的问题 2：`ssh -t` 和交互式登录被 sshd 关掉，日志是 `chown(/dev/pts/1, 0, 5) failed: Permission denied`，经由 `ssh -t` 起服务端的 mosh 也就用不了。sshd 的特权进程分配终端之后，把它交给登录的用户和 tty 组（`pty_setowner`：属主或属组不对就 chown，权限不对就 chmod）。
 
 - **原因**：

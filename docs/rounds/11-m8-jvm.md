@@ -1,7 +1,5 @@
 # M8 补测：JVM（2026-10-25）
 
-← [M8 结果（2026-10-25）](10-m8.md) · [索引](../milestones.md) · [M9 之前：稳定性和内存（2026-10-25）](12-stability-memory.md) →
-
 **结论**：OpenJDK 21 和 25 在 appine 里行为正确。覆盖线程、虚拟线程、JIT、GC、异常、子进程、网络、文件和信号的测试程序，在两个执行层下、各种 GC 和 JIT 配置下输出都和原生一致；jshell、jcmd、jstack 和 `kill -3` 的线程转储正常；Maven 和 Gradle 能从 Maven Central 下载依赖，编译项目、跑 JUnit 5 测试并打包。补测发现两个问题并已修好：经由符号链接启动的程序找不到自己的库（`/proc/self/exe` 没有解析符号链接），以及没有 inotify（WatchService 用不了）。
 
 **测量条件**：与 M8 相同，原生是同一个仓库导出的 docker 镜像（Alpine 3.24 的 openjdk21 21.0.12、maven 3.9.16、gradle 8.14.4）：

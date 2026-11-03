@@ -1,7 +1,5 @@
 # M9 之前：经由 fd 执行 memfd 和已经删除的文件（2026-11-01）
 
-← [M9 之前：mqueue 文件系统（2026-11-01）](160-mqueue-fs.md) · [索引](../milestones.md) · [M9 之前：time 命名空间（2026-11-01）](162-time-namespaces.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 8，也是 [/proc/<pid>/exe 指向程序文件本身](153-exe-file.md)的推迟项：
 
 - runc 起容器之前把自己复制进 memfd、封住，再经由 `/proc/self/fd/<n>` 执行（防 CVE-2019-5736），appine 里是 `fork/exec /proc/self/fd/6: permission denied`；

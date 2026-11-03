@@ -1,7 +1,5 @@
 # M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口（2026-10-28）
 
-← [M9 之前：补测待查的几项（2026-10-28）](84-debt-checks.md) · [索引](../milestones.md) · [M9 之前：排查在 BKL 外改 Rc 的计数（2026-10-28）](86-rc-outside-bkl.md) →
-
 审内核功能缺口时挑出来的三项，都不大：Java 实际会碰到的 `/proc/net/if_inet6`，和两处与 Linux 不一致的细节。改出口的停止时另外查出一个 bug，一起修了。
 
 - **`/proc/net/if_inet6`**（[网络信息的缺口](78-net-info-gaps.md)的推迟项）：

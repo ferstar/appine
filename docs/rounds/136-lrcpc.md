@@ -1,7 +1,5 @@
 # M9 之前：LRCPC（2026-10-31）
 
-← [M9 之前：SHA3、SHA512 和 I8MM（2026-10-31）](135-sha3-sha512-i8mm.md) · [索引](../milestones.md) · [M9 之前：PDEATHSIG 和 __WNOTHREAD（2026-10-31）](137-pdeathsig-wnothread.md) →
-
 §4.4 的 v1.x 里剩下的最后一项。LRCPC（ARMv8.3）是 RCpc 语义的 load-acquire：LDAPR、LDAPRH、LDAPRB 只保证不越过之前的 release 之后的读（比 LDAR 弱），C/C++ 的 `memory_order_acquire` 在 `+rcpc` 下编成它。编译时就假定有 LRCPC 的程序（`-march=armv8.3-a` 以上、`-mcpu=neoverse-n1` 这些）原来在 appine 里一读就 SIGILL；运行时按 HWCAP 选它的很少，所以没有要测的收益。与前几轮不同，它是访存指令，两个执行层都要写。
 
 ## 做法

@@ -1,7 +1,5 @@
 # M9 之前：PR_SET_CHILD_SUBREAPER（2026-10-31）
 
-← [M9 之前：raw ICMP 的模拟（2026-10-30）](125-raw-icmp.md) · [索引](../milestones.md) · [M9 之前：LTP 剩下的小差异（2026-10-31）](127-ltp-leftovers.md) →
-
 [pid 命名空间](120-pid-namespaces.md)的推迟项。`PR_SET_CHILD_SUBREAPER` 让一个进程收养后代里的孤儿：子进程退出时，它的子进程不再交给 1 号进程，而是交给祖先里最近的 subreaper。tini、dumb-init、catatonit、s6 这类进程管理程序和 `systemd --user` 靠它回收自己起的服务留下的进程。原来 prctl 对这两个选项返回 EINVAL，这些程序要么报错退出，要么收养不到孤儿；LTP 的 prctl03 因此跳过。
 
 ## 做法

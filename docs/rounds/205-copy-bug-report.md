@@ -1,7 +1,5 @@
 # M9：内核 bug 的报告能复制，带着 panic 的位置（2026-11-03）
 
-← [M9："文件"App 按内容认出文本文件（2026-11-03）](204-text-by-content.md) · [索引](../milestones.md) · [M9：Debian 上装 sudo 显示进度、能跳过，普通用户的 shell 有作业控制（2026-11-03）](206-debian-sudo-progress.md) →
-
 [进程被结束的提示](195-kill-reports.md)那一轮的推迟项：appine 自己的 bug 结束进程时，App 只说"内部错误"，报告要用 `dmesg` 看，没有"复制报告"的入口。上架之后，用户能把问题带给开发者的就是这份报告。
 
 动手时发现报告本身也不够用：内核日志和交给 App 的那一行只说 `kernel panic in syscall 56`，panic 的消息和代码位置只有默认的 panic hook 打印到 stderr（Android 上转到 logcat，用户拿不到）。只凭系统调用号查不出是哪里出的错。

@@ -1,7 +1,5 @@
 # M9 之前：补测待查的几项（2026-10-28）
 
-← [M9 之前：没有实现的 netlink 协议建不了（2026-10-28）](83-netlink-protocols.md) · [索引](../milestones.md) · [M9 之前：if_inet6、O_PATH 的 ioctl 和中途停住之后的出口（2026-10-28）](85-inet6-opath-exit.md) →
-
 把各篇推迟项里"没有查""没有对照""没跑"的几项补测完。只改了一个普查脚本，内核层不用改。补测时发现的两个问题已经在前几轮修好：shmctl01 的状态同步（[第 81 轮](81-woken-state.md)），Debian、Ubuntu 上 PAM 登录不了（[第 83 轮](83-netlink-protocols.md)）。
 
 - **CPython 的 test_os 第一遍失败一个**（[第二轮普查](70-survey-suites.md)）：失败的是 `test_timerfd_ns_TFD_TIMER_ABSTIME`，它要求读 `CLOCK_REALTIME`、以绝对时间设 timerfd、再读剩余时间这三步之间不超过 1 毫秒，那次多了 2.77 毫秒（`-j4` 一起跑时）。照这三步写了个脚本（`target/debt/timerfd_gap.py`，每次 5000 遍）：空闲时 appine 的中位数 1.3 微秒（原生 0.7），没有系统性的偏差；4 个核被 6 个空转循环占满时，appine 3 次里超过 1 毫秒的有 3、3、2 遍，原生有 1、1、0 遍，最长的都是 3 毫秒左右（被调度出去一个时间片）。是这个测试对负载敏感，不是 appine 的问题。

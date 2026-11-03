@@ -1,7 +1,5 @@
 # M9 之前：页表按需建立，AddressSanitizer 能用了（2026-11-02）
 
-← [M9 之前：测试提速，以及顺带找到的几个问题（2026-11-02）](178-test-speed.md) · [索引](../milestones.md) · [M9 之前：透明代理（2026-11-02）](180-original-dst.md) →
-
 [第 178 轮](178-test-speed.md)查 LTP 的 fork14 时记下的推迟项：soft-MMU 的页表按页建，映射多大页表就有多大（每 GB 2 MB）。当时以为真实程序很少碰到，实测 AddressSanitizer 之后发现不是这样，而且后果比 fork14 严重：
 
 - Ubuntu 26.04 仓库里 `gcc -fsanitize=address` 编出来的程序一启动就映射约 14 TB 的影子内存（可写、`MAP_NORESERVE`；Linux 上没碰过的部分不占内存也不占页表）。appine 在这一次 mmap 里逐页建表，要建约 28 GB。

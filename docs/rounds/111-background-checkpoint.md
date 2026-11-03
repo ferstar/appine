@@ -1,7 +1,5 @@
 # M9 之前：检查点挪到后台（2026-10-30）
 
-← [M9 之前：openat 的开销（2026-10-30）](110-openat-cost.md) · [索引](../milestones.md) · [M9 之前：宿主内存的接缝（2026-10-30）](112-host-seams.md) →
-
 [多线程共用翻译和定向唤醒](24-shared-translation.md)的推迟项：SQLite 的自动检查点（WAL 攒到 1000 页时把它写回数据库文件，fsync 两次）在提交的连接里做，提交多半持着 BKL（推迟到点的提交在定时器线程里）。虚拟机的盘 fsync 很快；手机上的 UFS、f2fs 一次 fsync 常常要几毫秒到几十毫秒，这期间要进内核的 guest 线程（包括往终端输出的）都要等。仓库用的是 WAL 加 `synchronous=NORMAL`，平时的提交不 fsync，检查点是唯一 fsync 的地方。
 
 **量了一下**（给 COMMIT 计时的临时插桩，`target/mem/openinstr.py`）：`tar x` 解包 Python 标准库再删掉，连做 5 次（6300 个文件，0.46 秒），84 次提交里有一次带着检查点，持锁 8.4 ms，其余都在 0.1 ms 左右；`go build`、gcc 编译 Lua 一次也没碰上（WAL 没写满）。所以是新建、删除文件多的负载（解包、`npm install`、`git clone`、`apt install`）里每隔几千个文件一次的停顿。

@@ -1,7 +1,5 @@
 # M9 之前：挂载命名空间（2026-10-30）
 
-← [M9 之前：tmpfs（2026-10-30）](117-tmpfs.md) · [索引](../milestones.md) · [M9 之前：用户命名空间（2026-10-30）](119-user-namespaces.md) →
-
 让 bubblewrap 能用的第三轮（[仓库里的目录 bind](116-store-binds.md)、[tmpfs](117-tmpfs.md) 之后）。bwrap 用一次 `clone(CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET)` 建好所有命名空间，原来这些标志都是 EPERM（§6 定过不做）。用户命名空间牵涉 70 多处能力检查和所有对外的 uid、gid，单独一轮；这一轮先做挂载命名空间，连同 `/proc/<pid>/ns` 和 setns 这些各种命名空间共用的部分。
 
 - **放在哪**：Linux 的挂载命名空间在 nsproxy 里，这里放在 `FsContext`（根目录、当前目录、umask，`CLONE_FS` 共用的部分）里：`CLONE_NEWNS` 不能和 `CLONE_FS` 同用，unshare 的 `CLONE_NEWNS` 连带 `CLONE_FS`，setns 要求 fs 没有和别人共用，所以共用一个 fs 的任务总在同一个挂载命名空间里，放在一起是一样的，也省得这一轮先搭起整套 nsproxy。

@@ -1,7 +1,5 @@
 # M9 之前：ptrace 的第一步，strace（2026-10-27）
 
-← [M9 之前：平均负载、sysfs 和 limits（2026-10-27）](39-loadavg-sysfs.md) · [索引](../milestones.md) · [M9 之前：ptrace 的第二步，gdb（2026-10-27）](41-ptrace-gdb.md) →
-
 ptrace 原来一律返回 EPERM，gdb、strace 都不能用（[M6](08-m6.md)、[M8](10-m8.md) 起推迟到 v1 之后）。分两步做，这一轮先让 strace 能用；单步和改写被跟踪进程的内存（gdb 要的）留给下一步。设计见 §7.6。
 
 - **被跟踪的一方**（`ptrace.rs`）：被跟踪的线程在投递信号之前、group-stop、系统调用的入口和出口（PTRACE_SYSCALL）、`PTRACE_EVENT_*`（fork、vfork、clone、exec、vfork 结束、退出、`PTRACE_EVENT_STOP`）停在 ptrace-stop 里，通知跟踪者（叫醒它的 wait，发 `CLD_TRAPPED` 的 SIGCHLD），只等自己的事件。停住时把寄存器存一份，跟踪者读写这一份，继续时写回 CPU 状态。

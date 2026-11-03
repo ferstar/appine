@@ -1,7 +1,5 @@
 # M9 之前：App 里选 rootfs（2026-10-29）
 
-← [M9 之前：路由表（2026-10-29）](98-routes.md) · [索引](../milestones.md) · [M9 之前：文件能力（2026-10-29）](100-file-caps.md) →
-
 [glibc 发行版的探测](69-glibc-probe.md)那一轮的结论是：Debian、Ubuntu 的 rootfs 直接当作仓库就能完整地用，内核层不用改，给用户 glibc 环境（pip 的 manylinux wheel、各种预编译的二进制）更便宜的路是 App 能用它们建仓库，mount 的子集先不做。原来 App 只能建 Alpine 的仓库。这一轮只改 App 和 JNI 层。
 
 - **选发行版**：第一次运行时弹出选择框：Alpine Linux 3.24、Debian 13（需下载 47 MB）、Ubuntu 24.04（需下载 28 MB）。标签栏新增一个菜单（⋮），里面是"重置 rootfs…"，确认之后结束所有会话和 guest 进程，删掉仓库，再弹出选择框。下载、导入失败时选择框重新弹出，把原因写在标题下面（对话框挡住了中间的状态文字）。

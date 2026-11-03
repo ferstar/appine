@@ -1,7 +1,5 @@
 # M9：内核的仓库只在持着它的 BKL 时用（2026-11-03）
 
-← [M9："文件"App 与 guest 双向的通知（2026-11-03）](201-documents-notify.md) · [索引](../milestones.md) · [M9：换镜像不丢用户加的源（2026-11-03）](203-mirror-keeps-lines.md) →
-
 [以指定用户登录](193-login-account.md)那一轮，`init_runs_the_inittab` 在全量并发的 `cargo test` 里失败过一次：`poweroff` 让所有进程同时退出时，guest 线程在 rusqlite 的语句缓存里 panic（`cache.rs:142`，`RefCell` 已经被借走）。[进程被结束的提示](195-kill-reports.md)那一轮找到一处可疑的地方：宿主线程开机、关机时不持 BKL 读 `/etc/inittab`，改成了持锁，但没能复现，不能确认就是它，也不知道还有没有别处。
 
 要紧的不是 panic。rusqlite 打开连接时带 `SQLITE_OPEN_NO_MUTEX`（`Connection` 不是 Sync，由类型系统保证同一时刻只有一个线程用），SQLite 自己不给这个连接加锁；两个线程同时在里面，连接的状态、预编译的语句、进行中的事务都可能被弄乱，后果可能是仓库损坏。`Store` 也不是 Sync，内核的仓库能被几个线程拿到，靠的是 `Kernel` 手写的 `unsafe impl Send` 和"只在持着 BKL 时碰"的约定：宿主线程忘了拿锁，编译照样通过，只有撞上并发时才出事，测试里很难碰到。

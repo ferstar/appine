@@ -1,7 +1,5 @@
 # M9 之前：mqueue 文件系统（2026-11-01）
 
-← [M9 之前：可写地挂 cgroup2（2026-11-01）](159-cgroup2-rw-mount.md) · [索引](../milestones.md) · [M9 之前：经由 fd 执行 memfd 和已经删除的文件（2026-11-01）](161-exec-open-file.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 5：OCI 的默认挂载里有 `/dev/mqueue`，crun 给每个容器都挂（`mount -t mqueue`），appine 没有这种文件系统（[UTS 和 IPC 命名空间](121-uts-ipc-namespaces.md)的推迟项），是 ENODEV，podman 的容器一个也起不来。
 
 照 Linux 6.1 的 `ipc/mqueue.c` 做：mqueue 文件系统就是 POSIX 消息队列的名字表，列出的是挂上它的进程所在的 IPC 命名空间里的队列。

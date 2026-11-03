@@ -1,7 +1,5 @@
 # M9 之前：AI 编程 CLI（2026-10-29）
 
-← [M9 之前：`/proc/net/snmp` 和输入结束时的 EOF（2026-10-29）](102-snmp-pty-eof.md) · [索引](../milestones.md) · [M9 之前：关掉主设备时挂断从设备（2026-10-29）](104-pty-hangup.md) →
-
 审完推迟项之后决定的普查：现在在手机终端里跑 AI 编程 CLI 的人很多。它们的形式各不相同，有 Bun 编译的单个可执行文件、node 上的打包脚本、Rust 和 Go 的静态二进制；用到 ripgrep、PTY、子进程和后台作业，有的还要用户命名空间来建沙箱。
 
 - **做法**（`tests/survey/ai/agents.sh`，`scripts/survey ai/agents`）：

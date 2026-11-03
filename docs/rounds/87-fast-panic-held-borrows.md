@@ -1,7 +1,5 @@
 # M9 之前：不持 BKL 的系统调用兜住 panic，等待时不借着打开文件（2026-10-29）
 
-← [M9 之前：排查在 BKL 外改 Rc 的计数（2026-10-28）](86-rc-outside-bkl.md) · [索引](../milestones.md) · [M9 之前：futex 等待者的清理，放开 BKL 时检查借用（2026-10-29）](88-futex-cleanup-borrow-check.md) →
-
 [上一轮](86-rc-outside-bkl.md)的两个推迟项。
 
 - **不持 BKL 的系统调用兜住 panic**：

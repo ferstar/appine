@@ -1,7 +1,5 @@
 # M9 之前：devpts 的实例（2026-11-01）
 
-← [M9 之前：cgroup 的设备过滤（eBPF）（2026-11-01）](166-bpf-devices.md) · [索引](../milestones.md) · [M9 之前：open_tree、move_mount 和 mount_setattr（2026-11-01）](168-open-tree.md) →
-
 [podman 和 docker 的普查](157-container-survey.md)的问题 11（[mount 的子集](105-mount-subset.md)的推迟项）：appine 的各个 devpts 挂载共用开机时的那一套终端。容器里 `tty` 是 `/dev/pts/1`，`ls /dev/pts` 看得到宿主的终端，到了容器里就是隔离上的漏洞。Linux 4.7 起每次 `mount -t devpts` 是一个新的实例，有自己的一套终端（编号从 0 开始）。照 Linux 6.1 的 `fs/devpts/inode.c` 做。
 
 ## 做法

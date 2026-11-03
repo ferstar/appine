@@ -1,7 +1,5 @@
 # M9 之前：栈的大小上限（2026-10-26）
 
-← [M9 之前：稳健性的收尾（2026-10-25）](21-robustness-finish.md) · [索引](../milestones.md) · [M9 之前：访存检查和翻译表（2026-10-26）](23-tlb-checks.md) →
-
 原来 execve 总是映射固定 8 MB 的主线程栈，`RLIMIT_STACK` 只是记下来的一个数：`ulimit -s unlimited` 返回成功但没有效果，深递归的程序（刷题时常这样用）照样在 8 MB 处段错误，调小也不起作用。这一轮改成与 Linux 一样按需增长（§5.4）。
 
 - **按需增长**：execve 只映射参数、auxv 下面再多 128 KB（Linux `setup_arg_pages` 的 `stack_expand`），栈的 VMA 标成向下增长，guest 访问栈底下面的地址出错时延伸到那一页再重新执行，沿用上一轮给 `MAP_GROWSDOWN` 做的路径。延伸之后的大小按 `RLIMIT_STACK` 的当前值检查（Linux 的 `acct_stack_growth`），所以运行中 setrlimit 调高、调低都立即生效；`MAP_GROWSDOWN` 的映射也受它限制。

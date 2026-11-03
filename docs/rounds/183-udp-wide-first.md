@@ -1,7 +1,5 @@
 # M9 之前：新命名空间里没绑定的 UDP socket 先发命名空间里、再发外面（2026-11-02）
 
-← [M9 之前：容器连外网也经过外层的 PREROUTING（2026-11-02）](182-outer-prerouting.md) · [索引](../milestones.md)
-
 [上一轮](182-outer-prerouting.md)的推迟项。容器里一个没绑定的 UDP socket：
 
 - 先发往外面、再发往命名空间里的地址：两边都有回答，与原生一样。

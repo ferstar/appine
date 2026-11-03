@@ -1,7 +1,5 @@
 # M9：宿主让绑的低端口就绑原来的（2026-11-03）
 
-← [M9：内核 bug 的报告带上出错之前的内核日志（2026-11-03）](207-report-kernel-log.md) · [索引](../milestones.md)
-
 [设置页](190-settings-default-alpine.md)那一轮的推迟项：Android 17（API 37）的 16K 模拟器上 App 自己就能绑 22，`lowPortsMoveToHighPortsOnTheHost` 的前提断言失败，原因没查。第 207 轮之后筛推迟项时查到了原因：Google 从 2026 年 5 月的 Google Play 系统更新起放开了一批 1024 以下的端口，App 没有 `CAP_NET_BIND_SERVICE` 也能绑（[heise](https://heise.de/-11314477)、[Android Authority](https://www.androidauthority.com/p-3672981/) 的报道，来源是 Issue Tracker 里 Google 工程师的回复）：
 
 - TCP：20、21、22、23、80、443、445、515、631（FTP、SSH、Telnet、HTTP、HTTPS、SMB、打印）；

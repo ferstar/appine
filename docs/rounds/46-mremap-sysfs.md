@@ -1,7 +1,5 @@
 # M9 之前：mremap 和 sysfs（2026-10-27）
 
-← [M9 之前：ptrace 和 procfs 的细节（2026-10-27）](45-ptrace-procfs.md) · [索引](../milestones.md) · [M9 之前：嵌套 epoll 的边沿（2026-10-27）](47-nested-epoll.md) →
-
 内核兼容性里剩下的两个顺手的缺口：mremap 不能扩展私有文件映射（[M6](08-m6.md) 起），sysfs 只有 CPU 的拓扑、没有缓存和频率（[平均负载、sysfs 和 limits](39-loadavg-sysfs.md)）。
 
 - **mremap 扩展私有文件映射**：原来返回 ENOMEM。Linux 扩展出来的部分接着映射同一个文件后面的内容，私有地写不影响文件，文件末尾之后的页访问是 SIGBUS。私有文件映射的 VMA 不像共享映射那样留着宿主 fd，所以系统调用这一层先按 VMA 记的仓库 inode 打开文件（`Mm::private_file_ino`、`Store::open_object`，与 `MREMAP_DONTUNMAP` 补回原地址的做法相同），交给 `Mm::mremap`，扩展的部分私有地映射文件的那一段，有文件内容的长度照旧按文件大小算（之后的页不进页表，访问是 SIGBUS）。不知道 inode 的（比如 memfd 的私有映射）仍然 ENOMEM。

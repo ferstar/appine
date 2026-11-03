@@ -1,7 +1,5 @@
 # M9 之前：signalfd 看调用的线程（2026-10-27）
 
-← [M9 之前：起进程和设定时器不再叫醒所有人（2026-10-27）](51-spawn-timer-wakeups.md) · [索引](../milestones.md) · [M9 之前：锁和宿主 socket 只叫醒等它们的线程（2026-10-27）](53-locks-host-sockets.md) →
-
 [上一轮](51-spawn-timer-wakeups.md)写差分测试时发现：Linux 的 signalfd 不属于哪个线程，poll、epoll 和读看的都是调用的线程自己和它的进程挂起的信号（`signalfd_poll`、`signalfd_dequeue` 用的是 `current`）；appine 读时看调用的线程，poll、epoll 时看的却是创建它的线程和线程组。只有多线程程序用 signalfd 等发给某个线程的信号（`pthread_kill`、`raise`、`SIGEV_THREAD_ID` 的定时器），或者 fork 之后在子进程里用，才会撞上：
 
 - 发给创建者的线程定向信号：appine 对别的线程报告可读，它去读却得到 EAGAIN，水平触发的 epoll 一直返回，变成忙等；阻塞的读卡住。

@@ -1,7 +1,5 @@
 # M9 之前：按对象唤醒（2026-10-27）
 
-← [M9 之前：独占的唤醒（2026-10-27）](48-exclusive-wakeup.md) · [索引](../milestones.md) · [M9 之前：Tier 1 里的观察点（2026-10-27）](50-watchpoints-tier1.md) →
-
 [futex 定向唤醒](16-futex-targeted-wake.md)起一直留着的推迟项：poll、epoll 的等待者被所有文件类的修改叫醒。系统里任何一次管道、socket、eventfd、PTY 的读写都把每个停在 poll、epoll 里的线程叫醒一遍，它们抢 BKL、重新检查、再睡下去；Go 的 netpoller、Node.js 的 libuv、Python 的 asyncio、JVM 的 NIO 线程平时都停在 epoll 里。量下来（`target/herd/herd.c`）：8 个进程各自空等在一个没人碰的 eventfd 上，另外两个进程用管道、socketpair 各来回 2 万次，空等的进程一共被叫醒 52 万次（每个来回 13 次），socketpair 的一个来回从 30 微秒变成 56 微秒，管道从 31–33 微秒变成 37 微秒（原生都是 24–25 微秒，空等的进程不醒）。这一轮让等待者只被它等的对象上的修改叫醒（§6）。
 
 - **等待者登记一组对象**：原来等待者最多登记一个对象（管道），现在是一组（`Cx::wait_objects`，排好序，唤醒时二分查找：一个 epoll 可能关注几千个文件）。poll、ppoll、select、epoll_wait 登记关注的每个进程内文件的唤醒对象（`syscall::poll::wake_objects`）：管道，PTY，eventfd，timerfd，inotify 实例，epoll 自己（`epoll_ctl`），AF_UNIX socket 自己的接收队列和连接的两个方向（`UnixSocket::wake_objects`）；嵌套的 epoll 逐层往里加。宿主 fd 仍由宿主 poll 等。阻塞的 read、write、recv、send、accept、connect 也只登记自己的对象（eventfd、timerfd、inotify、PTY、AF_UNIX 的 channel），宿主控制台读输出、写输入（App 的终端、`appine-run` 的桥接线程）只登记它的 PTY。

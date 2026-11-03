@@ -1,7 +1,5 @@
 # M9 之前：epoll 的边沿（2026-10-27）
 
-← [M9 之前：ptrace 的第二步，gdb（2026-10-27）](41-ptrace-gdb.md) · [索引](../milestones.md) · [M9 之前：core dump（2026-10-27）](43-coredump.md) →
-
 评估内核兼容性还剩哪些值得做时实测发现，[M8](10-m8.md) 起 `EPOLLET` 的近似会让 tokio 写的程序卡住：`uv pip install --offline` 在 appine 里一直不结束，原生 0 秒。卡住时三个线程都在睡，uv 的 eventfd 以 `EPOLLET | EPOLLIN | EPOLLRDHUP` 关注，计数是 2：写过两次、一次也没有读。mio（tokio 的底层）的唤醒器在 epoll 上从来不读走 eventfd 的计数，靠的是 Linux 每次写都让边沿触发的关注再报告一次；原来的近似只在某一位从未就绪变成就绪、或者程序用完数据时才触发，第二次唤醒就丢了。一个小程序对照下来，eventfd、管道、AF_UNIX、TCP 都是这样：已经可读、没有读完时又来了数据，Linux 每次都报告，appine 不报告。这一轮按 Linux 唤醒等待队列的时机重做 `EPOLLET`，顺带让水平触发的 `EPOLLEXCLUSIVE` 也只报告给一个 epoll（§10）。
 
 - **数据代数**（`syscall::poll` 的 `arrivals`）：进程内的对象每来一次事件记一次，与 Linux 唤醒等待队列的地方对应：管道的写入，AF_UNIX 的消息和监听 socket 上新的连接，eventfd 的写（读的一方）和读（写的一方），timerfd 到期，PTY 的输入（从设备读的）和输出（主设备读的，包括回显），inotify 排进队列的事件，挂起的信号（signalfd；已经挂起的标准信号再产生时不算，与 Linux 一样），消息队列的发送和接收，netlink 和 DNS 存根的回答。AF_UNIX 的发送方也按 Linux 的 `unix_write_space`：对方读走数据之后仍然可写就记一次。边沿触发的关注在某一位从未就绪变成就绪，或者那个方向的代数变了时触发，触发时报告当前全部就绪的位；程序用完数据（EAGAIN、没有读写满）时作废上次报告的位，这一条照旧保留。

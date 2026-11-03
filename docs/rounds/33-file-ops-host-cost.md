@@ -1,7 +1,5 @@
 # M9 之前：文件操作的宿主开销（2026-10-26）
 
-← [M9 之前：别的负载和文件操作（2026-10-26）](32-workloads-file-ops.md) · [索引](../milestones.md) · [M9 之前：node 启动（2026-10-26）](34-node-startup.md) →
-
 上一轮的推迟项：文件操作剩下的差距在宿主上。先把对照换成同一个卷上的原生（`/bench` 卷 bind mount 到容器的 `/tmp`；上一轮的原生数字是在容器自己的 overlay 上量的，慢一些），`target/mem/fsab.sh` 每项重复 5 次取平均。这时 `cp -r` 再 `rm -rf` 是原生的 2 倍，`tar x` 再删除 2.3 倍。剖析 fsbench 和 `tar x`：
 
 - 删除 object（宿主 unlink）占 16%，在持 BKL 的提交里一个一个做。

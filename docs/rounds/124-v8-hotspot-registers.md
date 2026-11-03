@@ -1,7 +1,5 @@
 # M9 之前：V8 和 HotSpot 的寄存器（2026-10-30）
 
-← [M9 之前：bubblewrap 和 AI 编程 CLI 的沙箱（2026-10-30）](123-bwrap.md) · [索引](../milestones.md) · [M9 之前：raw ICMP 的模拟（2026-10-30）](125-raw-icmp.md) →
-
 [Go 换一组被占用的寄存器](113-go-registers.md)的推迟项：V8 固定用 x26（根表）、x27（上下文）、x28（指针压缩的基址），HotSpot 固定用 x27（堆基址）、x28（当前线程），正好是 Tier 1 默认占用的几个（§4.2）。这一轮量它们的 JIT 代码，结论是不换：只读不写的寄存器被占用代价很小，默认的一组对 HotSpot 已经是最好的，对 V8 换成 Go 的一组只让 tsc 快 2–4%。
 
 **怎么量的**：上一轮按程序文件反汇编，JIT 生成的代码量不到。这一轮把 `/bench/jvm`、`/bench/dstore` 两个仓库导出成原生的 Alpine 容器，perf 按单调时钟全系统采样（`target/regs/run.sh`），同时记下 JIT 代码的字节：node 用 `--perf-prof` 写的 jitdump，java 用一个 JVMTI 代理（`target/regs/codedump.c`，记下编译好的方法和解释器、桩这些动态生成的代码）。每个样本取那一刻之前最后一次生成在那个地址的代码，文件里的代码按偏移读，再按指令用到的通用寄存器归类（`target/regs/regjit.py`）。用户态的样本 98% 以上对上了指令（匿名内存里的 JIT 代码在 perf 里记在 `/tmp/perf-<pid>.map` 名下）。被占用的寄存器都算上 x18：

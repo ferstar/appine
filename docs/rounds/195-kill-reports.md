@@ -1,7 +1,5 @@
 # M9：进程被结束、服务没起来时提示（2026-11-02）
 
-← [M9：被杀之后恢复标签页（2026-11-02）](194-restore-tabs.md) · [索引](../milestones.md) · [M9：在"文件"App 里浏览（只读）（2026-11-02）](196-documents-read.md) →
-
 M9 计划里的第六轮。内核层结束 guest 进程（内核层的 bug、引擎让宿主出错、OOM killer）时，报告原来只写进 logcat 和内核日志（`dmesg`），标签页里只看到 shell 打印的 "Killed"、"Segmentation fault"，看不出是内存不够还是 appine 的 bug（[第 20 轮](20-robustness.md)、[第 21 轮](21-robustness-finish.md)、[第 143 轮](143-kmsg.md)的推迟项）。开机时 OpenRC 有服务没起来，输出只在 `/var/log/boot.log` 里，没人看（[第 187 轮](187-app-init.md)的推迟项）。
 
 ## 做法

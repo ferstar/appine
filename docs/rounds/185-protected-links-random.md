@@ -1,7 +1,5 @@
 # M9 之前：Alpine 开机时写的 sysctl、protected_symlinks/hardlinks 和随机数的 ioctl（2026-11-02）
 
-← [M9 之前：开机时挂好 /dev、/dev/shm、/dev/mqueue 和 /run（2026-11-02）](184-boot-tmpfs.md) · [索引](../milestones.md)
-
 支持 OpenRC 的第二轮。开机运行级别里的两个服务在 appine 里报错：
 
 - sysctl 服务执行 `/usr/lib/sysctl.d/00-alpine.conf`，其中 4 项在 appine 里没有：`kernel.panic`、`fs.protected_hardlinks`、`fs.protected_symlinks`、`kernel.unprivileged_bpf_disabled`。busybox 的 sysctl 用 `O_CREAT` 打开，procfs 里新建是 EACCES，报 "Permission denied"。

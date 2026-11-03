@@ -1,7 +1,5 @@
 # M9 之前：UTS 和 IPC 命名空间（2026-10-30）
 
-← [M9 之前：pid 命名空间（2026-10-30）](120-pid-namespaces.md) · [索引](../milestones.md) · [M9 之前：网络命名空间（2026-10-30）](122-net-namespaces.md) →
-
 让 bubblewrap 能用的第六轮。Codex 的命令都带 `--unshare-ipc`，`--unshare-uts`、`--hostname` 也常用；原来 `CLONE_NEWUTS`、`CLONE_NEWIPC` 是 EPERM。网络命名空间要另外做一套隔离的回环，下一轮单独做。
 
 - **放在哪**（`core/kernel/src/nsproxy.rs`）：与 Linux 的 `struct nsproxy` 一样按线程记在 `Task` 上（unshare 这两种不连带 `CLONE_THREAD`，多线程的进程里 unshare 只改调用的线程），clone 出来的线程、进程沿用父线程的。开机时的一份放在内核里，开机时的进程共用。`/proc/<pid>/ns/uts`、`ipc` 按线程报告。

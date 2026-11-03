@@ -1,7 +1,5 @@
 # M9 之前：ioprio、syslog 和 adjtimex（2026-10-31）
 
-← [M9 之前：未实现的系统调用（2026-10-31）](139-unimplemented-syscalls.md) · [索引](../milestones.md) · [M9 之前：FP16 和 JSCVT（2026-10-31）](141-fp16-jscvt.md) →
-
 [未实现的系统调用](139-unimplemented-syscalls.md)那一轮记下的推迟项里挑了三组，都是 Linux 6.1 上总有、appine 原来返回 ENOSYS 的：
 
 - **ioprio_set、ioprio_get**：util-linux 的 `ionice` 设不上时不带 `-t` 就 `err(EXIT_FAILURE)`（`schedutils/ionice.c` 的 `ioprio_setid`），busybox 的是 `bb_perror_msg_and_die`，都在 execvp 之前退出：`ionice -c3 make`、cron 和备份脚本里常见的 `nice ionice …` 后面的命令根本不执行。

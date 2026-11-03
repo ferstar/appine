@@ -1,7 +1,5 @@
 # M9 之前：NETLINK_GENERIC 只有 nlctrl（2026-10-29）
 
-← [M9 之前：网络接口的流量计数（2026-10-29）](90-interface-counters.md) · [索引](../milestones.md) · [M9 之前：调试器、valgrind 和 headless Chromium（2026-10-29）](92-debuggers-valgrind-chromium.md) →
-
 [没有实现的 netlink 协议建不了](83-netlink-protocols.md)那一轮的推迟项：`NETLINK_GENERIC` 在 Linux 上总是有的（genetlink 编在内核里，不能去掉），appine 却是 EPROTONOSUPPORT。用它的程序（iw、ethtool 的 netlink 接口、wg、iotop 的 TASKSTATS）先建 socket、再按名字查自己要的族，查不到才按"内核没有这个子系统"处理；socket 本身建不了，有的程序不预期。
 
 - **只有 nlctrl 一个族**（`core/kernel/src/net.rs`）：这是 Linux 上总会有的那个族（`GENL_ID_CTRL`，编号 16），别的子系统一个也没有，相当于没有编进 nl80211、ethtool、wireguard、TASKSTATS 的 Linux。行为照着原生的 Linux 6.8（差分测试的宿主）做，逐字节相同：

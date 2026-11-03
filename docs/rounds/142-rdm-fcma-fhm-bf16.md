@@ -1,7 +1,5 @@
 # M9 之前：RDM、FCMA、FHM 和 BF16（2026-10-31）
 
-← [M9 之前：FP16 和 JSCVT（2026-10-31）](141-fp16-jscvt.md) · [索引](../milestones.md) · [M9 之前：/dev/kmsg 和内核日志（2026-10-31）](143-kmsg.md) →
-
 宿主有时宣告的另外四个 SIMD 扩展，原来都不宣告（§4.4 表里的"还没做"，[ASIMDDP](133-asimddp.md)、[SHA3、SHA512 和 I8MM](135-sha3-sha512-i8mm.md)、[FP16 和 JSCVT](141-fp16-jscvt.md) 的推迟项）：
 
 - RDM（`asimdrdm`）：SQRDMLAH、SQRDMLSH，Q15、Q31 定点数的"乘、舍入、加到累加值"一条做完。
