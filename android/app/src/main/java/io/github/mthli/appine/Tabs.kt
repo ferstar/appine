@@ -8,31 +8,43 @@ import java.io.File
 import java.io.IOException
 
 /**
- * App 被杀之后恢复标签页（android/service 的 map）。内核运行期间留着"在运行"的标记，标签页的布局、
- * 每个标签页的登录账号、当前目录和回看记录定时存在 `files/tabs/`。正常退出时连同标记一起删掉；
- * 下次服务启动时标记还在，就是上次被系统杀掉了（或者崩溃了），按存下的恢复：每个标签页起新的
- * shell，从原来的目录开始，先显示原来的回看记录和一行提示。不恢复进程。
+ * Restoring tabs after the app was killed (the android/service map). While the kernel runs a
+ * "running" marker is kept, and the tab layout and each tab's login account, current directory and
+ * transcript are saved periodically in `files/tabs/`. A normal exit deletes them together with the
+ * marker; if the marker is still there the next time the service starts, the system killed the app
+ * last time (or it crashed), and the tabs are restored from what was saved: each tab starts a new
+ * shell in its original directory, showing the original transcript and a line of notice first.
+ * Processes are not restored.
  */
 internal object Tabs {
     private const val TAG = "appine"
 
-    /** 一个回看记录最多存这么多字符（取最后的部分）：2000 行的回看记录一般在这以内。 */
+    /**
+     * The most characters saved per transcript (the last part is kept): a 2000-line transcript
+     * usually fits.
+     */
     private const val MAX_TRANSCRIPT = 256 * 1024
 
-    /** 一个标签页：登录账号（[ConsolePty] 的 `login`）、前台进程的当前目录（取不到时是 null）、回看记录。 */
+    /**
+     * A tab: the login account ([ConsolePty]'s `login`), the foreground process's current directory
+     * (null when unavailable), the transcript.
+     */
     data class Tab(val login: String, val cwd: String?, val transcript: String)
 
-    /** 存下的标签页、当前是第几个、存的时刻（毫秒）。 */
+    /** The saved tabs, which one is current, and when they were saved (ms). */
     data class Saved(val tabs: List<Tab>, val current: Int, val time: Long)
 
     private fun dir(context: Context) = File(context.filesDir, "tabs")
 
     private fun marker(context: Context) = File(dir(context), "running")
 
-    /** 已经写过的文件内容的散列：内容没变就不再写（每分钟存一次，不要一直写闪存）。 */
+    /**
+     * Hashes of the file contents already written: unchanged content is not written again (saved
+     * every minute, so as not to keep writing flash).
+     */
     private val written = HashMap<String, Int>()
 
-    /** 内核起来了：留下"在运行"的标记。 */
+    /** The kernel is up: leave the "running" marker. */
     fun markRunning(context: Context) {
         runCatching {
             dir(context).mkdirs()
@@ -40,7 +52,7 @@ internal object Tabs {
         }.onFailure { Log.w(TAG, "cannot mark the tabs as running", it) }
     }
 
-    /** 正常退出：删掉标记和存下的标签页。 */
+    /** Normal exit: delete the marker and the saved tabs. */
     fun clear(context: Context) {
         synchronized(this) {
             written.clear()
@@ -49,8 +61,9 @@ internal object Tabs {
     }
 
     /**
-     * 服务启动时调用一次：上次没有正常退出（标记还在）时返回存下的标签页，不然删掉旧的、返回
-     * null。标记去掉，内核起来之后再留（[markRunning]）。
+     * Called once when the service starts: returns the saved tabs when the last run did not exit
+     * normally (the marker is still there), otherwise deletes the old ones and returns null. The
+     * marker is removed and left again once the kernel is up ([markRunning]).
      */
     fun takeKilled(context: Context): Saved? {
         if (!marker(context).exists()) {
@@ -76,8 +89,9 @@ internal object Tabs {
     }
 
     /**
-     * 存下标签页（在后台线程上调用）：先写各个回看记录，最后写索引，都是写临时文件再改名，
-     * 中途被杀时读到的是完整的上一份或者这一份（回看记录可能新一点）。
+     * Saves the tabs (called on a background thread): the transcripts first and the index last,
+     * each written to a temporary file and then renamed, so a kill midway leaves either the
+     * complete previous copy or this one to read (the transcripts may be slightly newer).
      */
     fun save(context: Context, tabs: List<Tab>, current: Int) = synchronized(this) {
         try {
@@ -89,14 +103,15 @@ internal object Tabs {
                 changed = writeIfChanged(File(dir, name), tab.transcript.takeLast(MAX_TRANSCRIPT)) || changed
                 entries.put(JSONObject().put("login", tab.login).put("cwd", tab.cwd ?: "").put("transcript", name))
             }
-            // 多出来的旧回看记录（标签页关掉了）
+            // Leftover old transcripts (tabs that were closed)
             dir.listFiles { f -> f.name.matches(Regex("t\\d+\\.txt")) }?.forEach { f ->
                 if (f.name.removePrefix("t").removeSuffix(".txt").toInt() >= tabs.size) {
                     f.delete()
                     written.remove(f.name)
                 }
             }
-            // 索引带着存的时刻：回看记录、布局、当前目录都没变时不重写
+            // The index carries the save time: not rewritten when the transcripts, the layout and
+            // the current directories are all unchanged
             val layout = (entries.toString() + current).hashCode()
             val index = File(dir, "index.json")
             if (changed || written[index.name] != layout || !index.isFile) {
@@ -112,7 +127,7 @@ internal object Tabs {
         }
     }
 
-    /** 内容变了才写；返回写了没有。 */
+    /** Writes only when the content changed; returns whether it wrote. */
     private fun writeIfChanged(file: File, text: String): Boolean {
         val hash = text.hashCode()
         if (written[file.name] == hash && file.isFile) return false

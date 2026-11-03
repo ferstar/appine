@@ -35,52 +35,61 @@ import kotlin.concurrent.thread
 import kotlin.concurrent.write
 
 /**
- * 持有 guest 内核和所有终端会话的前台服务（android/service 的 map）。会话的生命周期挂在服务上，
- * 不挂在 Activity 上：Activity 关掉之后 shell 照常运行。通知栏显示会话数，并提供
- * "全部退出"。
+ * The foreground service that holds the guest kernel and all terminal sessions (the android/service
+ * map). The sessions' lifecycle hangs on the service, not on an Activity: shells keep running after
+ * the Activity is closed. The notification shows the number of sessions and offers "Exit all".
  *
- * 内核启动之后按 `/etc/inittab` 开机（Alpine 上是 OpenRC 的服务），退出时先按它关机
- * （[exitAll]）。关掉最后一个标签页之后，还有 guest 进程（服务）在跑就留在后台，没有了才
- * 退出；guest 的 `poweroff`、`halt` 是全部退出，`reboot` 重启内核。
+ * Once the kernel starts it boots by `/etc/inittab` (OpenRC services on Alpine), and on exit it
+ * first shuts down by it ([exitAll]). After the last tab is closed the service stays in the
+ * background while guest processes (services) are still running, and exits only when there are
+ * none; the guest's `poweroff` and `halt` mean exit all, and `reboot` restarts the kernel.
  *
- * 第一次运行时导入 APK 里的 Alpine；设置里换发行版、重置 rootfs 时先在后台下载，原来的系统
- * 照常运行，下载好了才停下内核、换掉仓库（[switchTo]）。
+ * On the first run the Alpine in the APK is imported; switching distros or resetting the rootfs in
+ * Settings downloads in the background first while the old system keeps running, and only once the
+ * download is done is the kernel stopped and the store replaced ([switchTo]).
  */
 class TerminalService : Service() {
 
-    /** 界面（终端、设置）关心的事件。回调都在主线程上，界面只实现自己要的。 */
+    /**
+     * Events the UI (terminal, settings) cares about. Callbacks all run on the main thread; each UI
+     * implements only the ones it needs.
+     */
     interface Listener {
-        /** 内核已经启动（或启动失败，[error] 不为 null）。 */
+        /** The kernel has started (or failed to start, with [error] non-null). */
         fun onMachineReady(error: String?) {}
 
-        /** 准备 rootfs 的进度（[progress]）。 */
+        /** Progress of preparing the rootfs ([progress]). */
         fun onProgress(text: String) {}
 
-        /** 会话列表、标题或状态变了。 */
+        /** The session list, a title or a state changed. */
         fun onSessionsChanged() {}
 
-        /** 会话的屏幕内容变了。 */
+        /** A session's screen content changed. */
         fun onTextChanged(session: TerminalSession) {}
 
-        /** 全部退出：用户在通知里选了"全部退出"，或者 guest 关机了。 */
+        /** Exit all: the user chose "Exit all" in the notification, or the guest shut down. */
         fun onExitAll() {}
 
         /**
-         * 要重启：guest 的 `reboot`、设置里换了执行层。会话都结束了，内核关机之后重新启动（之后
-         * 是 [onMachineReady]）。
+         * About to restart: the guest's `reboot`, or the execution tier changed in Settings. All
+         * sessions have ended; the kernel shuts down and starts again (followed by
+         * [onMachineReady]).
          */
         fun onRestarting() {}
 
-        /** 设置里看的状态变了：换发行版的下载进度（[switching]）、镜像。 */
+        /**
+         * State shown in Settings changed: the download progress of a distro switch ([switching]),
+         * the mirror.
+         */
         fun onSettingsChanged() {}
 
-        /** 有要告诉用户的事（[takeNotice]）：换发行版没有成功。 */
+        /** There is something to tell the user ([takeNotice]): a distro switch failed. */
         fun onNotice() {}
     }
 
     /**
-     * 设置里换发行版（重置 rootfs 是换成同一个）：[distro] 的 tarball 正在后台下载，原来的
-     * 系统照常运行。
+     * A distro switch in Settings (resetting the rootfs is a switch to the same one): the tarball
+     * of [distro] is downloading in the background while the old system keeps running.
      */
     internal class Switch(val distro: Rootfs.Distro) {
         @Volatile var done = 0L
@@ -96,21 +105,28 @@ class TerminalService : Service() {
     private val main = Handler(Looper.getMainLooper())
 
     /**
-     * 释放缓存和停止内核按顺序在这个线程上做：两者都要取 BKL，不占主线程；停止之后也不会
-     * 再有释放缓存的调用用到已经释放的句柄。
+     * Releasing caches and stopping the kernel are done in order on this thread: both take the BKL,
+     * so they stay off the main thread; and after the stop, no cache-releasing call can use the
+     * released handle.
      */
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "appine-worker") }
 
-    /** 界面隐藏一段时间之后还没回来才释放缓存（[addListener]）。 */
+    /**
+     * Caches are released only when the UI has been hidden for a while and has not come back
+     * ([addListener]).
+     */
     private val trimWhenHidden = Runnable { trimMemory() }
 
     /**
-     * 每隔 [POLL_MS] 在 [worker] 上问一次内核（要取 BKL）：
-     * - guest 第一次在非回环地址上监听一个端口时发通知（设计文档 §12 第 7 条）：别的设备连得上它，
-     *   宿主不让绑的 1024 以下的端口换了一个，要告诉用户连哪个；
-     * - guest 的关机请求（busybox 的 reboot、halt、poweroff）；
-     * - guest 改过的目录：让"文件"App 刷新它们（android/documents 的 map）；
-     * - 没有会话、界面也不在时还有没有 guest 进程：没有了就退出（android/service 的 map）。
+     * Every [POLL_MS], asks the kernel on [worker] (this takes the BKL):
+     * - when the guest first listens on a port on a non-loopback address, posts a notification
+     *   (design doc §12 item 7): other devices can reach it, and a port below 1024 that the host
+     *   refuses was moved, so the user must be told which one to connect to;
+     * - the guest's power requests (busybox's reboot, halt, poweroff);
+     * - directories the guest changed: the Files app is told to refresh them (the android/documents
+     *   map);
+     * - whether guest processes remain when there are no sessions and no UI: if none, exit (the
+     *   android/service map).
      */
     private val poll = object : Runnable {
         override fun run() {
@@ -139,63 +155,80 @@ class TerminalService : Service() {
         }
     }
 
-    /** 正在关机退出（[exitAll]）。 */
+    /** Shutting down to exit ([exitAll]). */
     private var exiting = false
 
-    /** 内核句柄，启动之前是 0。 */
+    /** The kernel handle, 0 before the start. */
     var machine = 0L
         private set
 
-    /** 启动失败的原因。 */
+    /** Why the start failed. */
     var startError: String? = null
         private set
 
-    /** 正在准备 rootfs（导入、换发行版）时的进度，内核启动之后是 null。 */
+    /**
+     * Progress while preparing the rootfs (import, distro switch); null once the kernel has
+     * started.
+     */
     var progress: String? = null
         private set
 
-    /** 设置里换发行版，正在下载（[switchTo]）。 */
+    /** A distro switch from Settings that is downloading ([switchTo]). */
     internal var switching: Switch? = null
         private set
 
     /**
-     * 下载线程还没结束的那次换发行版。取消之后线程可能还卡在连接、读上（最多一个超时），这期间
-     * 不开始新的下载：两个线程会写同一个 `.part`，先结束的那个还会删掉它。
+     * The distro switch whose download thread has not finished yet. After cancelling, the thread
+     * may still be stuck connecting or reading (for at most one timeout), and no new download
+     * starts meanwhile: two threads would write the same `.part`, and the one that finishes first
+     * would also delete it.
      */
     private var downloader: Switch? = null
 
-    /** 要告诉用户、还没告诉的事（[Listener.onNotice]）。 */
+    /** Something to tell the user that has not been told yet ([Listener.onNotice]). */
     private var notice: String? = null
 
-    /** 导入之后、设置里选"自动"之后给镜像测速的线程：换掉仓库之前要等它写完源。 */
+    /**
+     * The thread that probes mirror speeds after an import or after "automatic" is chosen in
+     * Settings: replacing the store must wait until it has written the sources.
+     */
     @Volatile
     private var mirrorThread: Thread? = null
 
-    /** 正在给镜像测速。 */
+    /** Mirror speeds are being probed. */
     val measuring: Boolean get() = mirrorThread?.isAlive == true
 
-    /** 注册了 [network]。 */
+    /** [network] is registered. */
     private var watchingNetwork = false
 
     val sessions = mutableListOf<TerminalSession>()
 
-    /** 各个会话的 PTY（存标签页时要它的控制台和登录账号）。 */
+    /** Each session's PTY (saving tabs needs its console and login account). */
     private val ptys = HashMap<TerminalSession, ConsolePty>()
 
-    /** 恢复出来、还没显示过的会话存下的那份（模拟器还没建，回看记录和目录都还是原来的）。 */
+    /**
+     * The saved copy of restored sessions not shown yet (their emulator is not created yet, so the
+     * transcript and the directory are still the original ones).
+     */
     private val unshown = HashMap<TerminalSession, Tabs.Tab>()
 
-    /** 上次被系统杀掉时存下的标签页，内核第一次起来之后恢复（android/service 的 map）。 */
+    /**
+     * Tabs saved when the system last killed the app, restored after the kernel first comes up (the
+     * android/service map).
+     */
     private var restore: Tabs.Saved? = null
 
-    /** 恢复之后该显示的标签页（Activity 取用）。 */
+    /** The tab to show after restoring (taken by the Activity). */
     var focus: TerminalSession? = null
         private set
 
-    /** Activity 正在显示的标签页（存标签页时记下是第几个）。 */
+    /** The tab the Activity is showing (saving tabs records which one it is). */
     var current: TerminalSession? = null
 
-    /** 内核运行期间每 [SAVE_MS] 存一次标签页，界面隐藏、内存紧张时马上存。 */
+    /**
+     * Tabs are saved every [SAVE_MS] while the kernel runs, and at once when the UI is hidden or
+     * memory is short.
+     */
     private val periodicSave = object : Runnable {
         override fun run() {
             saveTabs()
@@ -203,12 +236,13 @@ class TerminalService : Service() {
         }
     }
 
-    /** 标签页开了、关了：稍等一下再存，接连几次只存一次。 */
+    /** A tab was opened or closed: save a little later, once for several in a row. */
     private val saveSoon = Runnable { saveTabs() }
 
     /**
-     * 默认网络的路由交给 guest（kernel/net 的 map）：Android 10 起 App 读不了宿主的路由表，guest
-     * 的 `ip route`、`/proc/net/route` 靠它。回调在系统的线程上，交给 [worker] 按顺序做。
+     * The default network's routes go to the guest (the kernel/net map): since Android 10 apps
+     * cannot read the host's routing table, and the guest's `ip route` and `/proc/net/route` rely
+     * on this. Callbacks come on system threads and are handed to [worker] to run in order.
      */
     private val network = object : ConnectivityManager.NetworkCallback() {
         override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
@@ -221,10 +255,12 @@ class TerminalService : Service() {
     }
 
     /**
-     * 看得见的界面（终端、设置），Activity 在 onStart 加上、onStop 去掉；都停下（切到别的 App、
-     * 熄屏）[TRIM_DELAY_MS] 之后还没回来就释放内核里可以重建的缓存：Android 14 起有前台服务的
-     * 进程收不到 `onTrimMemory` 的 `UI_HIDDEN`，只能自己看界面在不在；很快切回来时也不必重新
-     * 翻译。
+     * The visible UIs (terminal, settings), added by Activities in onStart and removed in onStop;
+     * when all have stopped (switched to another app, screen off) and none has come back after
+     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released: since Android 14 a process
+     * with a foreground service no longer gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch
+     * whether the UI is there itself; when the user switches back quickly, nothing has to be
+     * translated again either.
      */
     private val listeners = mutableListOf<Listener>()
 
@@ -238,15 +274,18 @@ class TerminalService : Service() {
         if (listeners.isEmpty()) {
             main.removeCallbacks(trimWhenHidden)
             main.postDelayed(trimWhenHidden, TRIM_DELAY_MS)
-            // 界面不在了，App 随时可能被杀：先存一份标签页
+            // The UI is gone and the app may be killed at any time: save the tabs first
             saveTabs()
         }
     }
 
-    /** 回调过程中界面可能去掉自己，所以先拷一份。 */
+    /** A UI may remove itself during a callback, so iterate over a copy. */
     private fun each(f: (Listener) -> Unit) = listeners.toList().forEach(f)
 
-    /** 所有会话共用的回调：会话比 Activity 活得久，事件转给当前的 Activity（如果有）。 */
+    /**
+     * Callbacks shared by all sessions: sessions outlive the Activity, so events go to the current
+     * Activity (if any).
+     */
     private val client = object : TerminalSessionClient {
         override fun onTextChanged(changedSession: TerminalSession) {
             each { it.onTextChanged(changedSession) }
@@ -323,29 +362,40 @@ class TerminalService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        // 上次没有正常退出：内核起来之后恢复标签页
+        // The last run did not exit normally: restore the tabs once the kernel is up
         restore = Tabs.takeKilled(this)
-        // 第一次运行（或者上次导入没完成）：导入 APK 里的 Alpine，别的发行版在设置里换
+        // First run (or the last import did not finish): import the Alpine in the APK; other
+        // distros are switched to in Settings
         start(if (Rootfs.isReady(this)) null else Rootfs.Distro.ALPINE)
     }
 
-    /** 执行层（设置里选，见 engine 的 map）：1 是 Tier 1，0 是解释器。下次启动内核时生效。 */
+    /**
+     * The execution tier (chosen in Settings, see the engine map): 1 is Tier 1, 0 is the
+     * interpreter. Takes effect at the next kernel start.
+     */
     val tier: Int get() = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1)
 
     /**
-     * 新标签页的登录账号（设置里选，android/setup 的 map）：[ConsolePty.LOGIN_AUTO]、
-     * [ConsolePty.LOGIN_ROOT] 或账号名。换了发行版、重置 rootfs 之后回到自动。
+     * The login account of new tabs (chosen in Settings, the android/setup map):
+     * [ConsolePty.LOGIN_AUTO], [ConsolePty.LOGIN_ROOT] or an account name. Goes back to automatic
+     * after a distro switch or a rootfs reset.
      */
     val login: String get() = login(this)
 
-    /** 设置里选了登录账号：之后新开的标签页用它，开着的不变；"文件"App 里的家目录跟着换。 */
+    /**
+     * A login account was chosen in Settings: tabs opened from now on use it, open ones are
+     * unchanged; the home directory in the Files app follows.
+     */
     fun setLogin(value: String) {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_LOGIN, value).apply()
         Documents.rootsChanged(this)
         settingsChanged()
     }
 
-    /** "文件"App 里是不是还显示只读的整个系统（设置里的开关，默认关，android/documents 的 map）。 */
+    /**
+     * Whether the Files app also shows the whole system, read-only (a switch in Settings, off by
+     * default, the android/documents map).
+     */
     val systemDocuments: Boolean get() = showSystemDocuments(this)
 
     fun setSystemDocuments(on: Boolean) {
@@ -354,7 +404,10 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
-    /** 启动内核；[distro] 不为 null 时先准备它的 rootfs（仓库要已经删掉了）。 */
+    /**
+     * Starts the kernel; when [distro] is non-null, prepares its rootfs first (the store must
+     * already be deleted).
+     */
     private fun start(distro: Rootfs.Distro?) {
         startError = null
         if (distro != null) preparing(getString(R.string.preparing, distro.label))
@@ -374,14 +427,15 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureLoginTools(this)
                 Rootfs.updateProfile(this)
-                // 内核打开仓库时要是唯一的用户（DocumentsProvider 另外打开的不算，见 Rootfs.access）
+                // The kernel must be the only user of the store when it opens it (a separate
+                // opening by the DocumentsProvider does not count, see Rootfs.access)
                 Rootfs.access.write { Native.start(Rootfs.store(this).path, tier) }
             }
             main.post {
                 result.onSuccess {
                     machine = it
                     progress = null
-                    // 仓库可能是刚导入的（第一次运行、换了发行版）
+                    // The store may have just been imported (first run, distro switch)
                     Documents.rootsChanged(this)
                     updateWakeLock()
                     Tabs.markRunning(this)
@@ -389,14 +443,16 @@ class TerminalService : Service() {
                     restore = null
                     main.removeCallbacks(periodicSave)
                     main.postDelayed(periodicSave, SAVE_MS)
-                    // 开机要等 sysinit、wait 的命令（OpenRC 起服务），不占 worker：标签页照常打开
+                    // Booting waits for the sysinit and wait commands (OpenRC starting services)
+                    // without occupying worker: tabs open as usual
                     thread(name = "appine-boot") {
                         runCatching {
                             val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
                             Native.waitFor(it, Native.spawn(it, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
                         }.onFailure { e -> Log.w(TAG, "cannot prefer osclock", e) }
                         Native.boot(it)
-                        // 开机完成：OpenRC 有服务没起来时发通知（输出在 boot.log 里，没人看）
+                        // Boot finished: notify when OpenRC services did not start (the output is
+                        // in boot.log, which nobody reads)
                         val failed = Rootfs.failedServices(this)
                         if (failed.isNotEmpty()) main.post { if (machine == it) notifyBootFailures(failed) }
                     }
@@ -409,8 +465,10 @@ class TerminalService : Service() {
                     Log.e(TAG, "cannot start", it)
                     val error = it.message ?: it.toString()
                     if (distro != null && distro != Rootfs.Distro.ALPINE && !Rootfs.isReady(this)) {
-                        // 换成别的发行版时导入失败（下载已经校验过，多半是空间不够）：原来的仓库
-                        // 已经删了，退回 APK 里的 Alpine，不让用户对着一个用不了的 App
+                        // The import failed while switching to another distro (the download was
+                        // already verified, so most likely space ran out): the old store is already
+                        // deleted, so fall back to the Alpine in the APK rather than leave the user
+                        // facing an app that does not work
                         tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
                         start(Rootfs.Distro.ALPINE)
                     } else {
@@ -430,22 +488,30 @@ class TerminalService : Service() {
         each { it.onProgress(text) }
     }
 
-    /** 记下要告诉用户的事，看得见的界面马上取走（[takeNotice]），没有的话等界面回来。 */
+    /**
+     * Records something to tell the user; a visible UI takes it at once ([takeNotice]), otherwise
+     * it waits for the UI to come back.
+     */
     private fun tell(text: String) {
         notice = text
         each { it.onNotice() }
     }
 
-    /** 取走要告诉用户的事（只给一个界面）。 */
+    /** Takes what there is to tell the user (given to one UI only). */
     fun takeNotice(): String? = notice.also { notice = null }
 
-    /** 可以换发行版、重置 rootfs：内核在运行，或者启动失败了（仓库坏了时靠它恢复）。 */
+    /**
+     * Switching distros or resetting the rootfs is possible: the kernel is running, or the start
+     * failed (this is how a broken store is recovered).
+     */
     val canSwitch: Boolean get() = switching == null && downloader == null && (machine != 0L || startError != null)
 
     /**
-     * 换成 [distro]（设置里；重置 rootfs 是换成装着的那个）。先在后台下载并校验 tarball，这期间
-     * 原来的系统照常运行，可以取消（[cancelSwitch]）；下载好了才结束所有会话、停下内核、删掉
-     * 仓库，导入新的。下载失败时原来的系统不动。
+     * Switches to [distro] (from Settings; resetting the rootfs switches to the installed one). The
+     * tarball is first downloaded and verified in the background while the old system keeps
+     * running, which can be cancelled ([cancelSwitch]); only when the download is done are all
+     * sessions ended, the kernel stopped and the store deleted, and the new one imported. If the
+     * download fails the old system stays untouched.
      */
     internal fun switchTo(distro: Rootfs.Distro) {
         if (!canSwitch) return
@@ -464,7 +530,8 @@ class TerminalService : Service() {
             main.post {
                 if (downloader === sw) downloader = null
                 if (switching !== sw) {
-                    // 已经取消了：结果不要，只是现在可以再换了
+                    // Already cancelled: the result is not wanted, it is just that switching is
+                    // possible again now
                     settingsChanged()
                     return@post
                 }
@@ -482,7 +549,7 @@ class TerminalService : Service() {
         }
     }
 
-    /** 不换了：中止下载（下了一半的不留）。 */
+    /** No switch after all: abort the download (keeping no partial file). */
     fun cancelSwitch() {
         val sw = switching ?: return
         sw.cancelled = true
@@ -491,11 +558,12 @@ class TerminalService : Service() {
     }
 
     /**
-     * [switchTo] 下载好之后：结束所有会话、停下内核（启动失败时没有）、删掉仓库，导入 [distro]。
-     * 停内核、删文件在 [worker] 上做。
+     * After [switchTo] has downloaded: ends all sessions, stops the kernel (there is none if the
+     * start failed), deletes the store and imports [distro]. Stopping the kernel and deleting files
+     * are done on [worker].
      */
     private fun replace(distro: Rootfs.Distro) {
-        // 原来的账号都随仓库删了
+        // The old accounts were all deleted with the store
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LOGIN).apply()
         val m = detach()
         startError = null
@@ -508,7 +576,10 @@ class TerminalService : Service() {
         }
     }
 
-    /** 设置里选了镜像：写进源（在 [worker] 上，要打开仓库）。 */
+    /**
+     * A mirror was chosen in Settings: write it into the sources (on [worker], as the store has to
+     * be opened).
+     */
     fun setMirror(mirror: String) {
         val distro = Rootfs.installed(this) ?: return
         if (machine == 0L || switching != null) return
@@ -524,14 +595,15 @@ class TerminalService : Service() {
     }
 
     /**
-     * 源里一处内置的镜像也没有（全换成了列表以外的），设置里选的镜像没有写进去：告诉用户手改。
-     * Android 12 起 toast 最多两行，不写路径。
+     * The sources contain no built-in mirror at all (all replaced by mirrors outside the list), so
+     * the mirror chosen in Settings was not written: tell the user to edit them by hand. Since
+     * Android 12 toasts have at most two lines, so no path is given.
      */
     private fun mirrorNotFound() {
         Toast.makeText(this, R.string.mirror_not_found, Toast.LENGTH_LONG).show()
     }
 
-    /** 设置里选了"自动"：重新测速，写进最快的。 */
+    /** "Automatic" was chosen in Settings: probe again and write the fastest. */
     fun autoMirror() {
         val distro = Rootfs.installed(this) ?: return
         if (machine == 0L || switching != null || mirrorThread?.isAlive == true) return
@@ -544,7 +616,7 @@ class TerminalService : Service() {
         }
     }
 
-    /** 设置里换了执行层：记下，重启内核。 */
+    /** The execution tier was changed in Settings: record it and restart the kernel. */
     fun setTier(value: Int) {
         if (value == tier) return
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_TIER, value).apply()
@@ -556,7 +628,10 @@ class TerminalService : Service() {
         each { it.onSettingsChanged() }
     }
 
-    /** 熄屏时保持运行（设置里、通知里的开关，默认关，android/service 的 map）。 */
+    /**
+     * Keep running with the screen off (a switch in Settings and in the notification, off by
+     * default, the android/service map).
+     */
     val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
 
     fun setKeepAwake(on: Boolean) {
@@ -565,18 +640,23 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
-    /** 熄屏时保持运行时持有的 `PARTIAL_WAKE_LOCK`。 */
+    /** The `PARTIAL_WAKE_LOCK` held while keeping running with the screen off. */
     private var wakeLock: PowerManager.WakeLock? = null
 
     /**
-     * 按开关和内核的状态持有、放开 `PARTIAL_WAKE_LOCK`：开着、内核在运行或者正在关机（[exitAll]，
-     * 服务停下来之前）时持有，不然熄屏之后 CPU 休眠，guest 的进程跟着停住。
+     * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
+     * while the switch is on and the kernel is running or shutting down ([exitAll], before the
+     * service stops); otherwise the CPU sleeps after the screen goes off and the guest's processes
+     * stop with it.
      *
-     * App 一直有前台服务，Doze 里这个锁照样有效：`PowerManagerService` 只禁用进程状态在
-     * `BOUND_FOREGROUND_SERVICE` 之后的 App 的 partial wake lock，网络也按同一个门槛放行
-     * （`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`），不必申请电池优化的豁免。
+     * The app always has a foreground service, so the lock stays effective in Doze:
+     * `PowerManagerService` disables partial wake locks only for apps whose process state comes
+     * after `BOUND_FOREGROUND_SERVICE`, and the network is let through by the same threshold
+     * (`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`), so no battery optimisation exemption is
+     * needed.
      */
-    // 用户打开的开关：持有到内核停下或者用户关掉，没有固定的时长，也不在同一次调用里放开
+    // A switch the user turned on: held until the kernel stops or the user turns it off, with no
+    // fixed duration, and not released within the same call
     @SuppressLint("WakelockTimeout", "Wakelock")
     private fun updateWakeLock() {
         val want = keepAwake && (machine != 0L || exiting)
@@ -598,15 +678,17 @@ class TerminalService : Service() {
     }
 
     /**
-     * 全部退出（通知里的按钮、guest 的 `poweroff`、关掉最后一个标签页之后也没有 guest 进程了）：
-     * 先按 inittab 关机（OpenRC 停服务，PostgreSQL 这些不必下次做崩溃恢复），完了才停止服务，
-     * 这期间前台服务和通知还在，App 进程不会被当作缓存进程杀掉。
+     * Exit all (the button in the notification, the guest's `poweroff`, or no guest processes left
+     * after the last tab was closed): first shut down by inittab (OpenRC stops the services, so
+     * PostgreSQL and the like need no crash recovery next time), and only then stop the service;
+     * meanwhile the foreground service and the notification remain, so the app process is not
+     * killed as a cached process.
      */
     fun exitAll() {
         if (exiting) return
         exiting = true
-        // Activity 要到 onStop 才放开，关机可能比它快：先当它们已经走了，关机完了还有界面就是
-        // 用户又打开了 App
+        // Activities release only in onStop, and the shutdown may be faster than that: treat them
+        // as already gone, and a UI present after the shutdown means the user opened the app again
         switching?.cancelled = true
         switching = null
         each { it.onExitAll() }
@@ -618,17 +700,18 @@ class TerminalService : Service() {
             main.post {
                 exiting = false
                 updateWakeLock()
-                // 正常退出：下次不恢复标签页
+                // Normal exit: do not restore the tabs next time
                 Tabs.clear(this)
-                // 关机期间用户又打开了 App：重新启动，不然界面一直停在"正在启动"
+                // The user opened the app again during the shutdown: start again, otherwise the UI
+                // stays at "Starting…" forever
                 if (listeners.isNotEmpty()) start(null) else stopSelf()
             }
         }
     }
 
     /**
-     * 重启（guest 的 `reboot`、设置里换了执行层）：关机，再启动一个新的内核（之后 Activity 开
-     * 新会话）。
+     * Restart (the guest's `reboot`, the execution tier changed in Settings): shut down, then start
+     * a new kernel (after which the Activity opens new sessions).
      */
     private fun restart() {
         if (machine == 0L) return
@@ -641,8 +724,9 @@ class TerminalService : Service() {
     }
 
     /**
-     * 不再用当前的内核：不听网络回调、不再轮询，结束所有会话，返回原来的句柄。先清掉句柄：
-     * 会话结束时 Activity 看到内核还在，会以为是最后一个标签页关掉了。
+     * Stops using the current kernel: stops listening to network callbacks and polling, ends all
+     * sessions, and returns the old handle. The handle is cleared first: otherwise, seeing the
+     * kernel still there when the sessions end, the Activity would think the last tab was closed.
      */
     private fun detach(): Long {
         val m = machine
@@ -680,14 +764,16 @@ class TerminalService : Service() {
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
         main.removeCallbacks(saveSoon)
-        // 服务正常停下（exitAll 之后）：下次不恢复。被杀时不会走到这里
+        // The service stopped normally (after exitAll): do not restore next time. Being killed
+        // never gets here
         Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.finishIfRunning()
         sessions.clear()
         val m = machine
         machine = 0
-        // 没经过 exitAll 就被停止了：照样关机，尽力而为。要等 guest 线程退出，不在主线程上做
+        // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
+        // guest threads to exit, so not on the main thread
         if (m != 0L) worker.execute { Native.shutdown(m) }
         worker.shutdown()
         wakeLock?.release()
@@ -696,10 +782,11 @@ class TerminalService : Service() {
     }
 
     /**
-     * 宿主内存紧张时立即丢掉内核里可以重建的缓存（池里保留的 Tier 1 翻译最多七八十 MB）。
-     * Android 14 起不再发 `RUNNING_*` 这些级别；界面隐藏（`UI_HIDDEN`）由 [removeListener] 处理。
+     * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
+     * translations kept in the pool take up to 70–80 MB). Since Android 14 the `RUNNING_*` levels
+     * are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by [removeListener].
      */
-    @Suppress("DEPRECATION") // RUNNING_LOW、RUNNING_CRITICAL 只在 Android 14 之前发
+    @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
@@ -715,13 +802,14 @@ class TerminalService : Service() {
 
     private fun setRoutes(routes: Array<String>) {
         val m = machine
-        // 回调可能和 onDestroy 交错：worker 已经关掉时就不用再交了
+        // Callbacks may interleave with onDestroy: once worker is shut down there is no need to
+        // hand it over
         if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
     }
 
     /**
-     * 新开一个终端会话（登录 shell），以 [account] 登录、从 [cwd] 开始（null 是家目录）。shell
-     * 在第一次知道窗口大小时启动。
+     * Opens a new terminal session (a login shell), logged in as [account] and starting in [cwd]
+     * (null is the home directory). The shell starts when the window size is first known.
      */
     fun createSession(account: String = login, cwd: String? = null): TerminalSession {
         val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
@@ -732,7 +820,7 @@ class TerminalService : Service() {
         return session
     }
 
-    /** 关闭会话：shell 收到 SIGHUP。 */
+    /** Closes a session: the shell receives SIGHUP. */
     fun removeSession(session: TerminalSession) {
         session.finishIfRunning()
         sessions.remove(session)
@@ -749,8 +837,9 @@ class TerminalService : Service() {
     }
 
     /**
-     * 恢复上次被杀时的标签页（android/service 的 map）：每个起新的 shell，以原来的账号登录、从原来的
-     * 目录开始，先显示原来的回看记录和一行提示。不恢复进程。
+     * Restores the tabs from when the app was last killed (the android/service map): each starts a
+     * new shell, logged in as the original account and starting in the original directory, showing
+     * the original transcript and a line of notice first. Processes are not restored.
      */
     private fun restoreTabs(saved: Tabs.Saved) {
         val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(saved.time))
@@ -765,8 +854,9 @@ class TerminalService : Service() {
     }
 
     /**
-     * 存下标签页（[Tabs]）：回看记录在主线程上取（模拟器在主线程上改），前台进程的当前目录要取
-     * BKL，和写文件一起在 [worker] 上做。已经结束的标签页不存。
+     * Saves the tabs ([Tabs]): transcripts are taken on the main thread (the emulator changes them
+     * on the main thread); the foreground process's current directory needs the BKL, so it is taken
+     * on [worker] together with writing the files. Tabs that have ended are not saved.
      */
     private fun saveTabs() {
         val m = machine
@@ -776,7 +866,7 @@ class TerminalService : Service() {
         val snapshot = live.map { s ->
             val pty = ptys.getValue(s)
             val text = s.transcriptText
-            // 还没显示过的恢复出来的标签页：shell 还没起，存原来的那份
+            // A restored tab not shown yet: its shell has not started, so save the original copy
             val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
             Triple(pty, text ?: old?.transcript.orEmpty(), old?.cwd)
         }
@@ -812,10 +902,12 @@ class TerminalService : Service() {
     }
 
     /**
-     * [Native.takeKills] 的一项：内核层结束了一个进程（内核 bug、引擎故障、OOM killer）。它的控制
-     * 终端是某个标签页时在那个标签页里说明原因（shell 只会打印 "Killed"、"Segmentation fault"），
-     * 不在标签页里（后台的服务）、标签页正在全屏程序里或者界面不在时发通知。appine 自己的 bug
-     * 总是发通知，上面有"复制报告"（[bugReport]），用户贴到反馈里。
+     * An entry of [Native.takeKills]: the kernel layer ended a process (kernel bug, engine fault,
+     * OOM killer). When its controlling terminal is a tab, the reason is explained in that tab (the
+     * shell only prints "Killed" or "Segmentation fault"); when it is not in a tab (a background
+     * service), when the tab is in a full-screen program, or when the UI is gone, a notification is
+     * posted. appine's own bugs always get a notification, with "Copy report" ([bugReport]) on it,
+     * for the user to paste into feedback.
      */
     private fun reportKill(line: String) {
         val f = line.split('\t')
@@ -823,7 +915,8 @@ class TerminalService : Service() {
         val console = f[0].toIntOrNull() ?: return
         val pid = f[1].toIntOrNull() ?: return
         val comm = f[2]
-        // memory.max 的 16M 是 16 MiB：用 1024 进制，不然上限显示成 17 MB，看不出超了
+        // memory.max's 16M is 16 MiB: use powers of 1024, otherwise the limit shows as 17 MB and
+        // the overrun is not visible
         val size = { bytes: String ->
             val b = bytes.toLongOrNull() ?: 0
             if (b >= 1L shl 30) DecimalFormat("0.#").format(b / 1073741824.0) + " GiB"
@@ -865,9 +958,11 @@ class TerminalService : Service() {
     }
 
     /**
-     * 复制给用户贴到反馈里的报告：App 的版本、设备、发行版和执行层，加上内核层的报告（进程、线程、
-     * 最后的 guest pc，panic 的消息和位置，与 `dmesg` 里的那一行相同），和内核日志里它前面的几条
-     * 和它自己（[log] 以 U+001E 分隔，与 `dmesg` 的写法一样带着时间）。
+     * The report copied for the user to paste into feedback: the app's version, the device, the
+     * distro and the execution tier, plus the kernel layer's report (process, thread, last guest
+     * pc, the panic message and location, the same as the line in `dmesg`), and the kernel log
+     * entries before it and itself ([log] separated by U+001E, with timestamps as `dmesg` writes
+     * them).
      */
     private fun bugReport(report: String, log: String): String = buildString {
         appendLine("appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
@@ -883,7 +978,10 @@ class TerminalService : Service() {
         }
     }
 
-    /** 通知上的"复制报告"：放进剪贴板，收起那条通知。Android 13 起系统自己提示已复制。 */
+    /**
+     * "Copy report" on the notification: puts it on the clipboard and dismisses that notification.
+     * Since Android 13 the system shows its own copied confirmation.
+     */
     private fun copyReport(report: String, notification: Int) {
         if (report.isEmpty()) return
         val clipboard = getSystemService(ClipboardManager::class.java)
@@ -894,7 +992,10 @@ class TerminalService : Service() {
         getSystemService(NotificationManager::class.java).cancel(notification)
     }
 
-    /** 开机时 OpenRC 有服务没起来：发一条通知，说是哪几个、输出在哪里。 */
+    /**
+     * OpenRC services did not start at boot: posts a notification saying which ones and where the
+     * output is.
+     */
     private fun notifyBootFailures(services: List<String>) {
         val title = resources.getQuantityString(R.plurals.boot_failed_title, services.size, services.size)
         val text = getString(R.string.boot_failed_text, services.joinToString(", "))
@@ -912,7 +1013,10 @@ class TerminalService : Service() {
         getSystemService(NotificationManager::class.java).notify(BOOT_NOTIFICATION_ID, notification)
     }
 
-    /** [Native.takeListens] 的一项：`<进程名>\t<端口>\t<宿主上的端口>`。每个端口一条通知。 */
+    /**
+     * An entry of [Native.takeListens]: `<process name>\t<port>\t<host port>`. One notification per
+     * port.
+     */
     private fun notifyListen(line: String) {
         val fields = line.split('\t')
         if (fields.size != 3) return
@@ -963,7 +1067,8 @@ class TerminalService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
         if (sw != null) {
-            // 换发行版的下载：进度放在第二行，可以在通知里取消
+            // A distro switch download: progress on the second line, cancellable from the
+            // notification
             val cancel = PendingIntent.getService(
                 this, 2, Intent(this, TerminalService::class.java).setAction(ACTION_CANCEL_SWITCH),
                 PendingIntent.FLAG_IMMUTABLE,
@@ -988,7 +1093,10 @@ class TerminalService : Service() {
     companion object {
         private const val TAG = "appine"
 
-        /** [Native.setRoutes] 的格式。Android 13 之前看不出路由的类型，都当作单播。 */
+        /**
+         * The format of [Native.setRoutes]. Before Android 13 the route type cannot be told, so all
+         * count as unicast.
+         */
         fun routes(lp: LinkProperties): Array<String> = lp.routes.mapNotNull { r ->
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && r.type != RouteInfo.RTN_UNICAST) {
                 return@mapNotNull null
@@ -1003,11 +1111,14 @@ class TerminalService : Service() {
         private const val CHANNEL_ID = "sessions"
         private const val NETWORK_CHANNEL_ID = "network"
         private const val PROBLEMS_CHANNEL_ID = "problems"
-        /** 开机失败的通知；进程被结束的按 pid 编号（与监听的错开）。 */
+        /**
+         * The boot failure notification; notifications of ended processes are numbered by pid
+         * (offset from the listen ones).
+         */
         private const val BOOT_NOTIFICATION_ID = 2
         private const val KILL_NOTIFICATION_BASE = 3000
         private const val NOTIFICATION_ID = 1
-        /** 监听的通知按端口编号，与 [NOTIFICATION_ID] 错开。 */
+        /** Listen notifications are numbered by port, offset from [NOTIFICATION_ID]. */
         private const val LISTEN_NOTIFICATION_BASE = 1000
         private const val POLL_MS = 2_000L
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
@@ -1023,11 +1134,14 @@ class TerminalService : Service() {
         private const val KEY_LOGIN = "login"
         private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
 
-        /** 设置里的登录账号（见实例的 [login]）；DocumentsProvider 也要用，不经过服务。 */
+        /**
+         * The login account in Settings (see the instance's [login]); the DocumentsProvider needs
+         * it too, without going through the service.
+         */
         fun login(context: Context): String =
             context.getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LOGIN, null) ?: ConsolePty.LOGIN_AUTO
 
-        /** 见实例的 [systemDocuments]。 */
+        /** See the instance's [systemDocuments]. */
         fun showSystemDocuments(context: Context): Boolean =
             context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_SYSTEM_DOCUMENTS, false)
         private const val TRANSCRIPT_ROWS = 2000
