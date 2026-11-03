@@ -1,6 +1,6 @@
 # appine 设计文档
 
-- **状态**：设计决策已在 2026-10-24 的设计评审中逐条确认。M0–M8 已完成，之后做了二十多轮发布前的补强，M9（发布）还没开始。各轮结果见 [milestones.md](milestones.md)。
+- **状态**：设计决策已在 2026-10-24 的设计评审中逐条确认。M0–M8 已完成，之后做了一百七十多轮发布前的补强；M9（发布）进行中：App 的工作做完了，还剩真机验证、发布前的许可证义务和 Play 提交（§14.1）。各轮结果见 [milestones.md](milestones.md)。
 - **范围**：v1。第 1–13 节写的是当前的实现：2026-10-25 逐节与代码核对过，之后随每一轮的改动更新；和最初设计不一样、或者还没做的地方都在原处写明。
 - **一句话**：一个能上 Google Play 的**单进程** Android App，在进程内用解释器 / 同 ISA 二进制翻译运行未经修改的 Alpine Linux aarch64 用户态程序。思路与 iSH 相同，是它在 Android 上的对应物。
 
@@ -788,7 +788,7 @@ appine 按 **AGPL-3.0-or-later** 发布（[许可证](rounds/192-license.md)，�
 | **M8 C 档正确性** | ✅ | Go（SIGURG 抢占、nil 解引用转 panic）、node（guest JIT、`ic ivau`、wasm trap handler）；JVM 随后补测 | 能跑一个 Go CLI，`node -e` 正常，`npm install` 一个小包成功 |
 | **M9 发布** | 进行中：App 的工作做完了（[第 190](rounds/190-settings-default-alpine.md)–[197 轮](rounds/197-documents-write.md)），还剩真机验证、发布前的许可证义务（[第 192 轮](rounds/192-license.md)的推迟项：要放出的源码由 `scripts/release-sources` 生成，公开仓库还是附书面承诺待定）和 Play 提交 | 设置页、被杀后恢复标签页、wake lock 开关、许可证审计、以指定用户登录、进程被结束的提示、DocumentsProvider | Play 正式版上线 |
 
-M8 之后、M9 之前插进了二十多轮补强：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、按对象唤醒、core dump、cgroup v2 的视图、seccomp，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
+M8 之后、M9 之前插进了一百七十多轮补强（第 12–189 轮）：稳定性和内存、兼容性补漏、把前面推迟的内核功能补上、让一个 guest 程序弄不垮整个 App（内核层和引擎的 bug、内存上限、fork 炸弹）、主线程栈按 `RLIMIT_STACK` 增长、`onTrimMemory`、平均负载和 sysfs、ptrace（含硬件断点和观察点）、epoll 的边沿触发、按对象唤醒、core dump、cgroup v2 的视图、seccomp，以及十几轮性能剖析和优化，各轮见 [milestones.md](milestones.md) 的索引。
 
 ### 14.2 排序依据
 
