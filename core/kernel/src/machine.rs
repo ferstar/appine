@@ -524,11 +524,12 @@ impl Machine {
         self.wait_for(|k| k.tasks.is_empty().then_some(()));
     }
 
-    /// Boots from `/etc/inittab` ([`crate::inittab`]): runs in order sysinit, boot, bootwait, and
-    /// the default runlevel's wait (each waited for) and once (not waited for), with output
-    /// written to [`crate::inittab::LOG`]. On return the once commands may still be running. Does
-    /// nothing without an inittab or a store. Afterwards the built-in init accepts busybox's
-    /// reboot, halt and poweroff requests ([`Machine::take_power`]).
+    /// Boots from `/etc/inittab` ([`crate::inittab`]): runs in order sysinit (waited for), boot and
+    /// bootwait together in file order (only bootwait waited for), and the default runlevel's
+    /// wait (waited for) and once (not waited for), with output written to
+    /// [`crate::inittab::LOG`]. On return the boot and once commands may still be running. Does
+    /// nothing without an inittab or a store. From the start of boot the built-in init accepts
+    /// busybox's reboot, halt and poweroff requests ([`Machine::take_power`]).
     pub fn boot(&self) {
         self.shared.lock().init_handlers = true;
         let entries = self.inittab();
@@ -823,11 +824,12 @@ impl Drop for Machine {
     }
 }
 
-/// The timer thread: waits until the earliest deadline and sends the due SIGALRMs
-/// ([`crate::itimer::expire`]); while guest threads are running, periodically checks the memory
-/// limit, unmaps the pages the code cache wrote through its writable views ([`crate::oom`]) and
-/// samples the load average ([`crate::loadavg`]); commits the inode store's deferred write
-/// transactions when due; until the Machine shuts down.
+/// The timer thread: waits until the earliest deadline and sends the signals of due interval
+/// timers, POSIX timers and CPU-time limits ([`crate::itimer::expire`]); checks signal-driven
+/// I/O, `EPOLLEXCLUSIVE` gates and raw ICMP taps; while guest threads are running, periodically
+/// checks the memory limit, unmaps the pages the code cache wrote through its writable views
+/// ([`crate::oom`]) and samples the load average ([`crate::loadavg`]); commits the inode store's
+/// deferred write transactions when due; until the Machine shuts down.
 ///
 /// It keeps running when it hits a kernel-layer bug ([`crate::bug`]): an error while handling one
 /// process's timers ends that process; the memory-limit check and signal-driven I/O cannot tell

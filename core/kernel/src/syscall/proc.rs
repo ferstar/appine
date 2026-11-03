@@ -1537,8 +1537,9 @@ pub(super) fn kcmp(
             (fs(&t1), fs(&t2))
         }
         KCMP_SIGHAND => (sighand(&t1), sighand(&t2)),
-        // No I/O context; SysV semaphore undo tables are not shared between processes, so both
-        // sides count as empty
+        // Unlike Linux, KCMP_IO always compares equal: threads have an I/O context
+        // (`Task::ioprio`, shared under `CLONE_IO`), but it is not compared. SysV semaphore undo
+        // tables are not shared between processes, so both sides count as empty
         KCMP_IO | KCMP_SYSVSEM => (0, 0),
         // idx2 points at a `struct kcmp_epoll_slot { efd, tfd, toff }`: the toff-th interest for
         // fd tfd in t2's epoll
@@ -1563,8 +1564,9 @@ pub(super) fn kcmp(
     })
 }
 
-/// unshare: stops sharing some resources with other threads and processes. Of namespaces only
-/// mount and user namespaces are supported; others return EPERM as with clone. As on Linux,
+/// unshare: stops sharing some resources with other threads and processes. Every namespace type
+/// is supported (mount, user, pid, UTS, IPC, network, cgroup, time); the caller does not enter a
+/// new pid namespace, and enters a new time namespace only at its next execve. As on Linux,
 /// `CLONE_THREAD`, `CLONE_SIGHAND` and `CLONE_VM` succeed only when nothing was shared in the
 /// first place (there is nothing to do).
 pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {

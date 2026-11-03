@@ -661,8 +661,9 @@ pub(crate) fn hand_thread_children(k: &Kernel, parent: &RefCell<ThreadGroup>, fr
     p.children.extend(moved);
 }
 
-/// After the last thread of a thread group exits: hands the children to init, and notifies the
-/// parent or reaps directly.
+/// After the last thread of a thread group exits: hands the children to the nearest subreaper,
+/// else to pid 1 of its pid namespace, else to the built-in init, and notifies the parent or reaps
+/// directly.
 ///
 /// Each step contains kernel-layer bugs separately ([`crate::bug`]): on an error it is reported
 /// and the later steps are still done. What the failing step did is lost, but nothing else is
@@ -775,7 +776,8 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
 /// The subreaper to which the orphans of the exiting process `group` are reparented: going up
 /// from the parent, the nearest process in the same pid-namespace level that has set
 /// `PR_SET_CHILD_SUBREAPER` and still has live threads (Linux's find_new_reaper compares pid
-/// levels and does not leave the namespace; processes that are exiting as a whole are skipped).
+/// levels and does not leave the namespace). Only a process with no threads left is skipped; one
+/// whose group exit has begun can still be chosen while a thread has not finished exiting.
 fn find_subreaper(k: &Kernel, group: &ThreadGroup) -> Option<Tid> {
     let level = group.pid_ns.level;
     let mut p = group.ppid;

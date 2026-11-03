@@ -12,16 +12,17 @@
 //! touch kernel objects; on a panic in either place the BKL is also taken again first, so that
 //! the `Rc`s dropped by the outer frames during unwinding do not change counts at the same time
 //! as other threads. Kernel objects must not still be borrowed when the BKL is released either;
-//! debug builds check this through [`crate::cell`].
+//! debug builds and builds with the `borrow-check` feature check this through [`crate::cell`].
 //!
 //! Every wait goes through the host `poll()`: each thread has an eventfd, and while waiting polls
 //! it together with the host fds it waits on. Every change that might make someone else's wait
-//! condition true calls [`request_wake`], and when the BKL is released the waiting threads are
-//! woken and each re-checks its own condition. Changes are distinguished by channel ([`wake`]),
-//! and only the waiters interested in that channel are woken: changes such as closing files or
-//! reading and writing pipes are very frequent, and need not wake the shell waiting for children
-//! in wait4 and the timer thread every time. Futexes are the exception: many threads park on
-//! locks and condition variables; they wait with [`Cx::wait_alone`] and are notified directly,
+//! condition true requests a wake-up ([`request_wake_on`], [`request_wake_object`],
+//! [`request_wake`]), and when the BKL is released the matching waiting threads are woken and each
+//! re-checks its own condition. Changes are distinguished by channel ([`wake`]) or by object, and
+//! only the waiters interested in that channel or object are woken: changes such as closing files
+//! or reading and writing pipes are very frequent, and need not wake the shell waiting for
+//! children in wait4 and the timer thread every time. Futexes are the exception: many threads park
+//! on locks and condition variables; they wait with [`Cx::wait_alone`] and are notified directly,
 //! only by FUTEX_WAKE, signals and the ending of the thread group.
 
 use std::collections::BTreeMap;
@@ -259,7 +260,7 @@ pub(crate) struct Kernel {
     pub flocks: BTreeMap<Ino, Vec<FlockHolder>>,
     /// fcntl(2) record locks.
     pub locks: crate::locks::Locks,
-    /// The boot-time UTS and IPC namespaces ([`crate::nsproxy`]).
+    /// The boot-time UTS, IPC, network, cgroup and time namespaces ([`crate::nsproxy`]).
     pub init_ns: crate::nsproxy::NsProxy,
     /// The System V IPC objects and POSIX message queues of each IPC namespace, by namespace id;
     /// namespaces that no thread uses any more are dropped ([`Kernel::collect_ipc`]).
@@ -1130,12 +1131,12 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// The UTS and IPC namespaces it is in.
     /// The offset (nanoseconds) of clock `clock` in the thread's time namespace.
     pub fn time_offset(&self, clock: i32) -> i64 {
         self.task.ns.borrow().time.offset(clock)
     }
 
+    /// The UTS, IPC, network, cgroup and time namespaces it is in ([`Task::ns`]).
     pub fn ns(&self) -> crate::nsproxy::NsProxy {
         self.task.ns.borrow().clone()
     }
@@ -1236,8 +1237,9 @@ impl<'a> Cx<'a> {
         self.wait_for(deadline, host, interest, None)
     }
 
-    /// Waits for a change on object `object` (a pipe) ([`request_wake_object`]), a change that
-    /// requests all channels, a direct notification or a timeout.
+    /// Waits, with no deadline, for a change on object `object` (a pipe, the kernel log)
+    /// ([`request_wake_object`]), a change that requests [`wake::FILE`] or all channels, or a
+    /// direct notification.
     pub fn wait_object(&mut self, object: wake::Object) -> Result<(), Errno> {
         self.wait_for(None, &mut [], wake::FILE, Some(&[object]))
     }

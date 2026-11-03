@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-03 (targeted verification: timeout overflow in the fast path, found during kernel/poll verification)
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; kcmp(KCMP_IO) found while checking them)
 
 ## Responsibilities
 
@@ -457,9 +457,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.
-- **Stale comments:** `Task::robust_list` (says exit does not process it), the namespace module comment
-  (says only the boot time namespace exists), the unshare comment (says only mount and user
-  namespaces), and `Machine::boot` (implies `boot` entries are waited).
+- **`kcmp(KCMP_IO)` always compares equal:** threads have an I/O context (`Task::ioprio`, shared
+  under `CLONE_IO`), but kcmp does not compare it, so two threads with different contexts compare
+  as the same, unlike Linux.
 
 ## Open questions
 

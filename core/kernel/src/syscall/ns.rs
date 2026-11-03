@@ -1,9 +1,9 @@
 //! Namespaces (the kernel/process map): `clone` and `unshare` create mount, user, pid
-//! (`crate::pidns`), UTS, IPC, network and cgroup namespaces (`crate::nsproxy`);
+//! (`crate::pidns`), UTS, IPC, network, cgroup and time namespaces (`crate::nsproxy`; a new time
+//! namespace is the one for children, and of the clone calls only clone3 can ask for it);
 //! `/proc/<pid>/ns/*` (`crate::pseudo::NsKind`); ioctls on namespace files; setns(2) through a
 //! namespace file or a pidfd. Namespace files that are open or bind-mounted elsewhere keep their
-//! namespace alive ([`NsRef`]). The only time namespace is the boot one, and setns to it does
-//! nothing.
+//! namespace alive ([`NsRef`]).
 
 use std::rc::Rc;
 

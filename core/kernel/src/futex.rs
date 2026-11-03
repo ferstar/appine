@@ -6,9 +6,9 @@
 //! A waiter registers in the queue and then waits; a woken waiter is removed from the queue, and
 //! when it re-checks and finds itself no longer in the queue it knows it was woken by FUTEX_WAKE.
 //! A wake notifies only the threads it wakes (their events were recorded when they registered),
-//! unlike other waits, which wake every waiting thread: the JVM and the Go runtime have many
-//! threads parked on locks and condition variables, and waking all of them on every change
-//! elsewhere would be costly.
+//! and futex waiters listen on no wake channel or object ([`crate::kernel::Cx::wait_alone`]), so
+//! no change elsewhere wakes them: the JVM and the Go runtime have many threads parked on locks
+//! and condition variables, and waking all of them on every change elsewhere would be costly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

@@ -72,7 +72,7 @@ pub(crate) struct Task {
     /// (Linux's `nsproxy->pid_ns_for_children`; changed by `CLONE_NEWPID` in unshare and setns).
     /// It is here rather than in TaskState because `/proc/<pid>/ns/pid_for_children` reads it.
     pub pid_ns_children: RefCell<Option<Rc<crate::pidns::PidNs>>>,
-    /// The UTS and IPC namespaces it is in ([`crate::nsproxy`]).
+    /// The UTS, IPC, network, cgroup and time namespaces it is in ([`crate::nsproxy`]).
     pub ns: RefCell<crate::nsproxy::NsProxy>,
     /// The original mask while sigsuspend or ppoll temporarily replaces it (Linux's
     /// `saved_sigmask` plus `TIF_RESTORE_SIGMASK`): saved in the handler's frame, or restored when
@@ -109,10 +109,11 @@ pub(crate) struct Task {
     /// The timer slack of `PR_SET_TIMERSLACK` and its default (nanoseconds): only recorded. For a
     /// new thread both are the parent thread's current slack; setting it to 0 restores the default.
     pub timerslack: Cell<(u64, u64)>,
-    /// CPU affinity (at most 64 CPUs): only recorded.
+    /// CPU affinity (at most 64 CPUs). The host thread is set to match (`syscall::sched`).
     pub affinity: Cell<u64>,
     /// The robust futex list head and length set by set_robust_list; a new thread starts empty.
-    /// Only recorded: the futexes in the list are not processed when the thread exits.
+    /// The list is processed when the thread leaves its address space at exit or execve
+    /// ([`release_mm`], [`crate::futex::exit_robust_list`]).
     pub robust_list: Cell<(u64, u64)>,
     pub sync: Arc<TaskSync>,
     /// Wakes this thread while it waits.
@@ -697,8 +698,10 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     if cx.task.killed.get() {
         return Flow::Exit;
     }
-    // Tier 1 records ic ivau per page and hands it over only at dsb or isb
-    // (Exit::InvalidateCode): when exiting for another reason, invalidate here
+    // Tier 1 records ic ivau per page and invalidates the recorded page itself at dsb or isb; a
+    // page still recorded when it exits for another reason is invalidated here. A thread running
+    // only Tier 0 (no translator, hardware breakpoints, single-stepping) exits with
+    // Exit::InvalidateCode at every ic ivau
     let ivau = std::mem::take(&mut cpu.state_mut().ivau_page);
     let pc = cpu.state().pc;
     let (sig, info) = match exit {
