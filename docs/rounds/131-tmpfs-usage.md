@@ -13,10 +13,9 @@ Linux 的 tmpfs 在内存里，按页记用量（`shmem_inode_acct_block`），�
 
 ## 测试
 
-- 差分测试 `tmpfs` 组新增（放在照 bubblewrap 换根的那一段前面：那一段最后 `exec` 别的程序，后面的不会执行）：`size=64k,nr_inodes=8` 的 tmpfs，空的、建了目录、两页多的文件和它的硬链接、短的和长的符号链接之后的 statfs；写 100000 字节写进 49152 字节后 ENOSPC；文件里面的 pwrite 照常，追加写只填满最后一页；fallocate 放不下是 ENOSPC；截短之后空出来；mknod 到 inode 用完，之后 mkdir、link、symlink、open 新建都是 ENOSPC；删掉一个硬链接、最后一个链接、被 rename 覆盖之后空出来；sendfile 拷进来写到满为止；inode 用完时 AF_UNIX 的 bind 是 ENOSPC；删掉之后不经过 statfs 直接新建、写。重新挂载改大小、改 inode 数、小于用量、`mode=`、`inode32`、改成不限、不限的改成限制，每次之后的 mountinfo 超级块选项；不限的 tmpfs 的 statfs。两个执行层下都与原生相同。原生一侧删掉之后还开着的文件要等关掉才释放，用例先关掉它们。
-- 单元测试 `tmpfs_counts_pages_and_inodes`：数用量（硬链接的页只算一次、名字各算一个 inode）、放不放得下、文件还能用多少页、记账、重新挂载不能小于用量和改了之后的超级块选项。
-- 变异检验：新建之前不检查，inode 用完之后照样能建；删除时不记账，删掉之后（不经过 statfs）新建是 ENOSPC。第一版用例每一步之后都调 statfs，它把记下的用量纠正过来了，删除不记账查不出来，所以补了"删掉之后不经过 statfs 直接新建、写"那一步。
-- cargo test、clippy（含 Android）、两层的全部差分测试通过。LTP 的 syscall 测试 1000 个通过（上次 1001）：epoll_pwait03 这次失败，单独重跑也失败，1 毫秒的睡眠量出的中位数是 1.6 毫秒，[上一轮](130-vhangup.md)的二进制在同一时刻交替跑结果相同，是虚拟机当时的计时精度（[偶发项](../milestones.md#已知的偶发失败)）；其余逐项相同。
+- 差分测试 `tmpfs` 组新增一段：限制了大小和 inode 数的 tmpfs 上，新建、写、截短、fallocate、删除、sendfile 之后的 statfs 和 ENOSPC，各种重新挂载之后的 mountinfo 超级块选项，两个执行层下都与原生相同。这一段要放在照 bubblewrap 换根的那一段前面（那一段最后 `exec` 别的程序）；原生一侧删掉之后还开着的文件要等关掉才释放，用例先关掉它们。
+- 单元测试 `tmpfs_counts_pages_and_inodes`：数用量、放不放得下、记账、重新挂载。
+- 第一版用例每一步之后都调 statfs，它把记下的用量纠正过来了，删除不记账查不出来（变异检验发现的），所以补了"删掉之后不经过 statfs 直接新建、写"。
 
 **推迟项**：
 

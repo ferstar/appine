@@ -30,18 +30,10 @@
   - chown 原来就去掉 setuid、setgid，现在不是目录的也去掉文件能力（`chown_common` 的 `ATTR_KILL_PRIV`）。
   - 写文件很频繁，不能每次都查数据库：元数据缓存里放着有文件能力的 inode 的整个集合，第一次用时查一次，随提交计数一起作废，别的进程设置的也看得到。没有可去掉的时候不碰数据库。
 - **测试**：
-  - cargo test：`cred` 的单元测试新增四个（文件能力的各种组合和 EPERM、环境能力、securebits 的锁、`security.capability` 的格式），`store` 新增一个（写和 chown 去掉特权，别的进程设置的文件能力经由提交计数看到）。
-  - 差分测试 compat 组新增两个 C 程序。`showcaps` 打印自己的能力集、有效用户 ID 和 `AT_SECURE`；`fcaps` 以 root 身份放几份带不同能力的 `showcaps`，检查：
-    - 14 种执行：nobody 执行 +ep、+p、+ie、v3 两种 rootid，带着可继承集、环境能力执行，setuid root 带文件能力，no_new_privs，边界集里去掉了的 EPERM，root 执行，`SECBIT_NOROOT`；
-    - 8 种扩展属性的权限；
-    - 8 种去掉特权：写了 0 字节不去掉，root 写去掉文件能力、保留 setuid，nobody 写去掉 setuid 和 setgid、保留不带组执行位的 setgid，truncate、`O_TRUNC`、`chown(-1, -1)`；
-    - 8 个 securebits 和环境能力的 prctl。
-    
-    与原生逐行相同。docker 默认的边界集比 appine 的小，能力集等于边界集时打印成 all；docker 里的 root 没有 `CAP_SYS_ADMIN`，`trusted.*`、`security.*` 只比较 nobody 的。第一版漏了 `_GNU_SOURCE`，两边一起编不过、输出一样，差分测试照样"通过"，而且 compat 脚本在那里就退出了：看了一眼输出才发现。
-  - 变异检验：execve 不把环境能力并进允许集，差分测试有 1 行不同；写文件时不去掉特权，有 2 行不同。
-  - [路由表](98-routes.md)那一轮的 sockstat 用例改了一处：原生的 "sockets used" 有一次只多了 12（前面用例的 socket 晚一点释放），总数改为只看至少多了 12 个。
-  - 写路径的开销：本地卷上的仓库里，改动前后的二进制交替跑三轮。1 字节的 write 0.515–0.554 → 0.531–0.561 µs，4 KB 的 pwrite 0.796–0.838 → 0.803–0.843 µs，`open(O_TRUNC)`+write+close 47–57 → 49–61 µs，都在噪声范围内。
-  - cargo test 231 个、clippy（含 Android 目标）、两层的差分测试都通过。LTP 959：与[路由表](98-routes.md)那一轮相比只有 futex_wait05、select02 由失败变成通过，都是[已知的偶发失败](../milestones.md#已知的偶发失败)；扩展属性、capset、prctl 的用例结果没有变化。
+  - 单元测试：`cred` 测文件能力的各种组合、环境能力、securebits 的锁和 `security.capability` 的格式；`store` 测写和 chown 去掉特权。
+  - 差分测试 compat 组新增 `showcaps`、`fcaps` 两个 C 程序：各种执行方式得到的能力、扩展属性的权限、去掉特权、securebits 和环境能力的 prctl，与原生逐行相同。docker 里的 root 没有 `CAP_SYS_ADMIN`，`trusted.*`、`security.*` 只比较 nobody 的。
+  - 第一版漏了 `_GNU_SOURCE`，两边都编不过、输出一样，差分测试照样"通过"：新用例要看一眼输出。
+  - 写路径的开销在噪声范围内。
 
 **推迟项**：
 
