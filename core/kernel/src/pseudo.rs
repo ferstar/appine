@@ -98,7 +98,7 @@ pub(crate) enum Entry {
     Fd,
     FdInfo,
     Task,
-    /// Files of the network namespace ([`PROC_NET`]); all processes are in the same namespace.
+    /// Files of the process's network namespace ([`PROC_NET`]).
     Net,
     OomScoreAdj,
     CoredumpFilter,
@@ -117,8 +117,8 @@ pub(crate) enum Entry {
     TimensOffsets,
 }
 
-/// Namespace kinds (the entries in `/proc/<pid>/ns`). Only mount namespaces can be created; all
-/// the others are the boot-time one.
+/// Namespace kinds (the entries in `/proc/<pid>/ns`); every kind can be created by clone or
+/// unshare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NsKind {
     Cgroup,
@@ -189,8 +189,8 @@ impl NsKind {
 
     /// The id (inode number) of this kind of namespace of thread `task`: for mount namespaces by
     /// its `FsContext`, for user namespaces by its credentials, for pid namespaces by its process
-    /// and thread, for UTS and IPC by its [`crate::nsproxy::NsProxy`], and the boot-time one for
-    /// the others (with the ids Linux commonly uses). None when there is none (ENOENT).
+    /// and thread, and for the others by its [`crate::nsproxy::NsProxy`]. None when there is none
+    /// (ENOENT).
     pub(crate) fn id_of(self, k: &Kernel, task: &Task) -> Option<u64> {
         let group = k.groups.get(&task.tgid);
         Some(match self {
@@ -878,8 +878,6 @@ impl<'a> View<'a> {
             .map_or_else(|| self.k.init_ns.clone(), |t| t.ns.borrow().clone())
     }
 
-    /// The reader's credentials (of the process `self` points to): IDs in procfs are translated
-    /// through its user namespace.
     /// The interface with index `index` in the reader's network namespace (the host's or lo, and
     /// virtual devices).
     fn interface(&self, index: u32) -> Option<appine_hal::net::Interface> {
@@ -927,6 +925,8 @@ impl<'a> View<'a> {
         (ns as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64
     }
 
+    /// The reader's credentials (of the process `self` points to): IDs in procfs are translated
+    /// through its user namespace.
     pub(crate) fn reader(&self) -> Cred {
         self.group(self.tgid)
             .map_or_else(Cred::root, |g| g.borrow().cred.clone())
@@ -1680,9 +1680,11 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     ) || matches!(node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"))
 }
 
-/// Writes a procfs file: `oom_score_adj`, the host name, the domain name and the System V IPC
-/// limits record the new value, and the other writable files accept writes without effect.
-/// `cred` is the writer's credentials.
+/// Writes a synthetic file: cgroup files go to [`crate::cgroup::write`], the id maps,
+/// `setgroups` and `timens_offsets` to their own writers, and the other writable files check the
+/// value and record it (namespaced sysctls in the writer's namespaces); some recorded values have
+/// no effect, and `kernel/pid_max` accepts writes and ignores them. `cred`, `ns` and `pid_ns` are
+/// the writer's.
 pub(crate) fn write(
     k: &mut Kernel,
     (tid, cred): (Tid, &Cred),
@@ -2212,9 +2214,8 @@ fn cpus() -> usize {
     appine_hal::host_cpus().len()
 }
 
-/// The thread group's CPU time (nanoseconds): live threads plus threads that have exited.
-/// The process state letter: R running guest code, S in the kernel or waiting, T stopped, Z
-/// zombie.
+/// The process state letter and name: Z zombie, t in a ptrace-stop, T stopped, S waiting in the
+/// kernel, and R otherwise (running guest code or handling a syscall).
 fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static str) {
     if g.zombie.is_some() {
         return ('Z', "zombie");
@@ -3045,8 +3046,6 @@ fn global_stat(ps: &View<'_>) -> String {
     s
 }
 
-/// All open sockets (each counted once) and the fsuid of the process that opened them, sorted by
-/// inode. Sockets that are only in SCM_RIGHTS messages or waiting to be accepted do not count.
 /// The id of the network namespace a socket is in.
 fn socket_net(s: &crate::net::Socket) -> u64 {
     use crate::net::Socket;
@@ -3058,6 +3057,9 @@ fn socket_net(s: &crate::net::Socket) -> u64 {
     net.map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
 }
 
+/// All open sockets (each counted once), sorted by inode, with the fsuid of the first process
+/// found holding each in its fd table (Linux shows the creator's), or 0 for sockets that are only
+/// in SCM_RIGHTS messages. Sockets waiting to be accepted do not count.
 pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
     let mut tables = HashSet::new();
     let mut seen = HashSet::new();
@@ -3095,9 +3097,9 @@ pub(crate) fn socket_ino(s: &SocketRef) -> u64 {
     Rc::as_ptr(s) as u64 >> 4
 }
 
-/// `/proc/net/dev`: the host's interfaces, with counters for the guest's own traffic
-/// ([`crate::traffic`]), in the same format as Linux's `dev_seq_printf_stats`.
-/// `/proc/net/dev`: the traffic counters of interfaces `ifaces` (all 0 when `counted` is false).
+/// `/proc/net/dev`: interfaces `ifaces` with counters for the guest's own traffic
+/// ([`crate::traffic`]; all 0 when `counted` is false), in the same format as Linux's
+/// `dev_seq_printf_stats`.
 fn net_dev(k: &Kernel, ifaces: &[appine_hal::net::Interface], counted: bool) -> String {
     let mut s = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
@@ -3365,8 +3367,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 format!("{a}\t{b}\t{c}\t{d}\n")
             }
             b"sys/kernel/printk_devkmsg" => format!("{}\n", ps.k.klog.borrow().devkmsg.name()),
-            // Per-user limits on the number of namespaces of each kind: half of threads-max, as
-            // in Linux's defaults; read-only, with no actual limit
+            // Per-user limits on the number of namespaces of each kind: the value last written
+            // (one kernel-wide table), or half of threads-max as in Linux's defaults; nothing is
+            // actually limited
             p if p.starts_with(b"sys/user/max_") => {
                 let v = ps.k.max_namespaces.get(p).copied();
                 format!("{}\n", v.unwrap_or(ps.k.threads_max as u64 / 2))
@@ -3908,7 +3911,8 @@ fn cpu_mask(set: Range<usize>) -> String {
 }
 
 /// `/proc/<pid>/fdinfo/<n>`: position, flags (plus close-on-exec; files opened with open carry
-/// `O_LARGEFILE`), mount id, inode, and the extra lines of eventfd and inotify.
+/// `O_LARGEFILE`), mount id, inode, and the extra lines of eventfd, inotify, pidfd, epoll,
+/// timerfd and signalfd.
 fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
     let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();

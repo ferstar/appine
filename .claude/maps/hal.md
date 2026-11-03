@@ -4,6 +4,8 @@
 > See `.claude/decisions/hal.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -168,8 +170,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 ## Confirmed bugs / technical debt
 
 - **macOS no longer compiles.** `open_dir` uses `O_PATH` (not defined for Apple targets) without a
-  `cfg` gate, and the kernel calls the Linux-only `copy_file`, fsync family and `msync` ungated; the
-  hal's own comment promises that other hosts compile, and CI builds only Linux and Android.
+  `cfg` gate, and the kernel calls the Linux-only `copy_file`, fsync family and `msync` ungated, and
+  CI builds only Linux and Android.
 - **`fill_random` can fail with `EMFILE`.** It opens `/dev/urandom` on every call while all guest
   processes share the app's fd table, so under fd exhaustion `getrandom` returns `EMFILE` (never
   seen on Linux), reads of the emulated random devices and exec's `AT_RANDOM` fail, and callers that

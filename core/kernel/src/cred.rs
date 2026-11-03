@@ -1064,8 +1064,8 @@ mod tests {
         assert!(inside.ns_capable(&ns, cap::SYS_ADMIN));
         assert!(!inside.ns_capable(&init, cap::SYS_ADMIN));
         assert_eq!(inside.uid_out(1000), OVERFLOW_ID);
-        // The creator (same effective user ID) has every capability over it in the parent; other
-        // users and root's ordinary capabilities do not count
+        // The creator (same effective user ID) has every capability over it in the parent, and
+        // so does root through its capabilities in the parent; other users have none
         assert!(user.ns_capable(&ns, cap::SYS_ADMIN));
         assert!(Cred::root().ns_capable(&ns, cap::SYS_ADMIN));
         let other = Cred {

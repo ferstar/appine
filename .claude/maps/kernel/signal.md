@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/signal.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
 
 ## Responsibilities
 
@@ -315,7 +317,7 @@ procfs.
   pins the current behaviour.
 - **Detach leaves hardware debug slots armed but invisible:** detaching resets the recorded
   breakpoints and watchpoints while the CPU keeps them until the next exec, so a later tracer reads
-  empty regsets while hits still raise `SIGTRAP` (the doc comment says detach keeps them).
+  empty regsets while hits still raise `SIGTRAP`.
 - **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
   skipped syscall (number -1), the step is not reported at syscall return.
 - **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`

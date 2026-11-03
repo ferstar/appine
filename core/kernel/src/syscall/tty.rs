@@ -839,7 +839,7 @@ pub(crate) fn ioctl(
                 return Err(Errno::EPERM);
             }
             // Already the controlling terminal of another session: it can be taken over only with
-            // arg 1 (root)
+            // arg 1 (root). Unlike Linux, the caller's CAP_SYS_ADMIN is not checked
             if let Some(other) = tty.borrow().session {
                 if arg != 1 {
                     return Err(Errno::EPERM);
@@ -871,7 +871,8 @@ pub(crate) fn ioctl(
             };
             if sid == tgid {
                 // The session leader gives up its controlling terminal: the whole session loses
-                // it, and the foreground process group receives SIGHUP
+                // it, and the foreground process group receives SIGHUP then SIGCONT (Linux's
+                // disassociate_ctty)
                 let fg = {
                     let mut t = tty.borrow_mut();
                     t.session = None;

@@ -3,8 +3,10 @@
 //! The production host is Android (bionic) and the development host is Linux (glibc); both run
 //! the Linux kernel, so there is only one implementation here. The error codes returned to the
 //! kernel layer are host errnos, which on Linux hosts match the guest's numbering and can be
-//! passed to the guest unchanged. Other hosts (macOS, for example) are only guaranteed to
-//! compile and are not supported (design doc §13.3).
+//! passed to the guest unchanged. Other hosts (macOS, for example) are not supported and are
+//! meant only to compile (design doc §13.3); macOS currently does not: [`open_dir`] uses
+//! `O_PATH`, and the kernel layer calls Linux-only functions (`copy_file`, the fsync family,
+//! `msync`) without `cfg` gates.
 
 pub mod net;
 
@@ -332,7 +334,8 @@ pub fn fstat(fd: i32) -> Result<libc::stat, i32> {
     Ok(st)
 }
 
-/// Opens a host directory used only as the starting point for [`stat_at`] (`O_PATH`).
+/// Opens a host directory (`O_PATH`) used only as the starting point of `*at` calls
+/// ([`open_at`], [`stat_at`], [`chmod_at`], [`set_times_at`], [`unlink_at`]).
 pub fn open_dir(path: &std::path::Path) -> Result<std::os::fd::OwnedFd, i32> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;

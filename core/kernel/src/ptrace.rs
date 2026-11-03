@@ -215,7 +215,9 @@ pub(crate) const WATCH_SLOTS: usize = 4;
 /// are used). Enabled ones are already normalized as Linux does: watchpoint addresses aligned to
 /// 8 bytes, with the offset moved into the byte select (BAS), and privilege level EL0
 /// (`syscall::ptrace`). As on Linux they belong to the thread: threads created by fork and clone
-/// have none, execve clears them, PTRACE_DETACH does not.
+/// have none, execve clears them, PTRACE_DETACH does not. Unlike Linux, [`detach`] resets this
+/// copy while the CPU keeps the slots armed until execve, so a later tracer reads empty slots
+/// that still trap.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HwDebug {
     pub brk: [(u64, u32); 16],

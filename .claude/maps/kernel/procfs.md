@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/procfs.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; socket owner column found while checking them)
 
 ## Responsibilities
 
@@ -307,9 +309,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   xattrs, links) fail on them.
 - `dev_ino` (epoll fdinfo) uses the hashed inode and the boot instance's device, which can disagree
   with stat for pid nodes, later procfs instances and nsfs files.
-- Several source comments are stale (the `Entry::Net` comment says every process shares one
-  network namespace; the `user.max_*` read comment says read-only; the `write` doc lists only a few
-  effective sysctls; the module doc calls cgroup2 read-only).
 
 ## Confirmed bugs / technical debt
 
@@ -355,6 +354,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   options are ignored; chown delegation of cgroups is impossible; no threaded cgroups; many
   standard files are absent; `kernel/pid_max` writes are ignored; `processes` in `/proc/stat`
   excludes threads; `Cpus_allowed_list` ignores task affinity.
+- **Socket owners in `/proc/net/*` can differ from Linux:** the uid column is the fsuid of the
+  first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
+  (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
+  sockets only in `SCM_RIGHTS` messages show 0.
 
 ## Open questions
 

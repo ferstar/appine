@@ -462,10 +462,10 @@ pub struct Tty {
     /// This side has not been reopened since its hangup (Linux's `TTY_HUPPED`): hanging it up
     /// again does nothing.
     pub hupped: [bool; 2],
-    /// The owner, group and mode of `/dev/pts/<index>`: as with Linux devpts mounted with
-    /// `gid=5,mode=620`, the owner is the fsuid of the process that opened the master, the group
-    /// is tty and the mode 0620; chown and chmod can change them, and the change lasts until the
-    /// terminal is closed.
+    /// The owner, group and mode of `/dev/pts/<index>`: opening ptmx takes them from the devpts
+    /// instance's [`PtsOptions`] (`syscall::tty::new_pty`; without uid or gid options, the
+    /// opener's fsuid and fsgid), and console terminals keep the default root:tty 0620; chown and
+    /// chmod can change them, and the change lasts until the terminal is closed.
     pub owner: (u32, u32),
     pub mode: u32,
     /// How many times data arrived for input (read by the slave) and output (read by the master):
@@ -1094,7 +1094,7 @@ pub(crate) fn take_closed() -> Vec<Rc<RefCell<Tty>>> {
     closed.iter().filter_map(Weak::upgrade).collect()
 }
 
-/// The control characters echoed as `^X`: the C0 control characters except TAB and NL, and DEL.
+/// Nanoseconds per second.
 const NS: i64 = 1_000_000_000;
 
 /// The current wall-clock time (nanoseconds).
@@ -1104,6 +1104,7 @@ pub(crate) fn wall_ns() -> i64 {
         .unwrap_or(0)
 }
 
+/// The control characters echoed as `^X`: the C0 control characters except TAB and NL, and DEL.
 fn is_ctrl(c: u8) -> bool {
     (c < 0x20 && c != b'\t' && c != b'\n') || c == 0x7f
 }
