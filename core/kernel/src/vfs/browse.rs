@@ -1,73 +1,85 @@
-//! 宿主浏览仓库（App 的 DocumentsProvider，android/documents 的 map）：不经过内核，直接在仓库里按
-//! guest 路径查找、列目录、打开文件，在 App 的家目录里新建、写、删除、改名、移动。
+//! The host browsing the store (the app's DocumentsProvider, the android/documents map): without
+//! going through the kernel, looks up guest paths, lists directories and opens files directly in
+//! the store, and creates, writes, removes, renames and moves inside the app's home directory.
 //!
-//! 看到的是仓库里的样子，也就是内核没在运行时的样子：挂载（procfs、`/dev`、`/run` 的
-//! tmpfs、bind 挂载）都不管，`/proc` 这些是仓库里的空目录。符号链接跟随，绝对路径从 guest
-//! 的根算起，与 guest 里看到的一样。只给出目录和普通文件：设备节点、FIFO、socket 和断了的
-//! 符号链接不列出来，也打不开（宿主读 FIFO 会一直等）。
+//! What it sees is the store as it is, that is, what it looks like when the kernel is not running:
+//! mounts (procfs, `/dev`, the `/run` tmpfs, bind mounts) are all ignored, and `/proc` and the
+//! like are empty directories in the store. Symlinks are followed, and absolute paths count from
+//! the guest's root, the same as seen in the guest. Only directories and regular files are given:
+//! device nodes, FIFOs, sockets and broken symlinks are not listed and cannot be opened (a host
+//! read of a FIFO would wait forever).
 //!
-//! 不检查 guest 的权限：仓库里的一切本来就属于 App 的用户，在终端里 `doas` 也都看得到。
+//! Guest permissions are not checked: everything in the store belongs to the app's user anyway,
+//! and `doas` in the terminal can see all of it too.
 
 use std::fs::File;
 
 use super::store::{Ino, ROOT, Stat, Store, mode};
 use crate::errno::Errno;
 
-/// 跟随符号链接的次数上限，与 Linux 的 `MAXSYMLINKS` 相同。
+/// The limit on the number of symlinks followed, the same as Linux's `MAXSYMLINKS`.
 const MAX_LINKS: usize = 40;
 
-/// 宿主改了仓库里的什么（[`crate::browse_changing`]）：交给用着同一个仓库、正在运行的内核，
-/// 它照对应的 syscall 报 inotify 事件，guest 里监视着的程序（编辑器、构建工具的 watch）就
-/// 知道"文件"App 改了文件。目录和名字都是仓库里的 inode 和目录项。
+/// What the host changed in the store ([`crate::browse_changing`]): handed to the running kernel
+/// that uses the same store, which reports inotify events as the corresponding syscall would, so
+/// programs watching in the guest (editors, build tools' watch modes) learn that the Files app
+/// changed a file. Directories and names are inodes and dentries in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    /// 在目录 `dir` 里新建了 `name`。
+    /// `name` was created in directory `dir`.
     Created {
         dir: Ino,
         name: Vec<u8>,
         is_dir: bool,
     },
-    /// 删除了目录 `dir` 里的 `name`（原来是 `ino`）。整个目录树是先里后外一项一项删的。
+    /// `name` in directory `dir` was removed (it was `ino`). A whole directory tree is removed
+    /// entry by entry, inside first.
     Removed {
         dir: Ino,
         name: Vec<u8>,
         ino: Ino,
         is_dir: bool,
     },
-    /// `ino` 从 `from` 移到了 `to`（目录和名字），不覆盖。
+    /// `ino` moved from `from` to `to` (directory and name), without overwriting.
     Moved {
         from: (Ino, Vec<u8>),
         to: (Ino, Vec<u8>),
         ino: Ino,
         is_dir: bool,
     },
-    /// 普通文件 `ino`（在目录 `parent.0` 里叫 `parent.1`）为写打开，`truncated` 时截断过。
+    /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
+    /// truncated if `truncated`.
     Opened {
         ino: Ino,
         parent: (Ino, Vec<u8>),
         truncated: bool,
     },
-    /// 为写打开的普通文件关闭了：写了些什么（对方直接写宿主的 object，内核看不到每一次写）。
+    /// A regular file opened for writing was closed: something was written (the other side
+    /// writes the host object directly, and the kernel does not see each write).
     Written { ino: Ino, parent: (Ino, Vec<u8>) },
 }
 
-/// 目录里的一项：名字和它（符号链接跟随之后）的元数据。
+/// An entry in a directory: the name and its metadata (after following symlinks).
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: Vec<u8>,
     pub stat: Stat,
 }
 
-/// 按 guest 路径找到 inode，符号链接都跟随（包括最后一个组件）。`..` 在根目录上不动。
+/// Finds the inode for a guest path, following all symlinks (including in the last component).
+/// `..` at the root directory stays put.
 pub fn resolve(store: &Store, path: &[u8]) -> Result<Ino, Errno> {
     walk(store, path).map(|(ino, _)| ino)
 }
 
-/// [`resolve`]，同时给出真实路径的组件（符号链接都换成了它指向的地方，像 realpath）。
+/// [`resolve`], also giving the components of the real path (with every symlink replaced by where
+/// it points, like realpath).
 fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
-    // 还没走的组件，倒着放（栈顶是下一个）；跟随符号链接时把目标的组件压进去
+    // The components not walked yet, in reverse (the top of the stack is the next one); following
+    // a symlink pushes the target's components
     let mut pending: Vec<Vec<u8>> = components(path).rev().collect();
-    // 走到的目录：真实路径的组件和各自的 inode（`..` 退一层就是真正的上级）
+    // The directories reached: the components of the real path and their inodes (going back one
+    // level for `..` is the real parent)
     let mut real: Vec<Vec<u8>> = Vec::new();
     let mut inos: Vec<Ino> = Vec::new();
     let mut links = 0;
@@ -101,7 +113,8 @@ fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
     Ok((inos.last().copied().unwrap_or(ROOT), real))
 }
 
-/// 路径的元数据（符号链接跟随）。不是目录、普通文件的是 ENOENT。
+/// The metadata of a path (following symlinks). ENOENT for anything but directories and regular
+/// files.
 pub fn stat(store: &Store, path: &[u8]) -> Result<Stat, Errno> {
     let st = store.stat(resolve(store, path)?)?;
     if !shown(&st) {
@@ -110,7 +123,8 @@ pub fn stat(store: &Store, path: &[u8]) -> Result<Stat, Errno> {
     Ok(st)
 }
 
-/// 列出目录 `dir`，按名字排序。符号链接给出目标的元数据，断了的、指向特殊文件的不列。
+/// Lists directory `dir`, sorted by name. Symlinks give their target's metadata; broken ones and
+/// ones pointing at special files are not listed.
 pub fn list(store: &Store, dir: &[u8]) -> Result<Vec<Entry>, Errno> {
     let ino = resolve(store, dir)?;
     if store.kind(ino)? != mode::S_IFDIR {
@@ -143,7 +157,7 @@ pub fn list(store: &Store, dir: &[u8]) -> Result<Vec<Entry>, Errno> {
     Ok(out)
 }
 
-/// 打开普通文件读：返回宿主上的 object 文件。目录是 EISDIR。
+/// Opens a regular file for reading: returns the object file on the host. EISDIR for a directory.
 pub fn open(store: &Store, path: &[u8]) -> Result<File, Errno> {
     let ino = resolve(store, path)?;
     match store.kind(ino)? {
@@ -153,12 +167,13 @@ pub fn open(store: &Store, path: &[u8]) -> Result<File, Errno> {
     }
 }
 
-/// [`looks_like_text`] 看文件开头多少字节。
+/// How many bytes at the start of a file [`looks_like_text`] looks at.
 const SNIFF_BYTES: usize = 4096;
 
-/// 路径指向的普通文件看起来是文本（[`is_text`]）："文件"App 按扩展名猜不出类型时
-/// （`/etc/profile`、`.bashrc`、脚本、`Makefile`）用它，是文本就当作 text/plain，编辑器才
-/// 打得开。目录、打不开的是 false。
+/// The regular file the path points at looks like text ([`is_text`]): the Files app uses this when
+/// it cannot guess the type from the extension (`/etc/profile`, `.bashrc`, scripts, `Makefile`);
+/// text is treated as text/plain, so that editors can open it. False for directories and files
+/// that cannot be opened.
 pub fn looks_like_text(store: &Store, path: &[u8]) -> bool {
     let Ok(file) = open(store, path) else {
         return false;
@@ -176,9 +191,10 @@ pub fn looks_like_text(store: &Store, path: &[u8]) -> bool {
     is_text(&head[..n], n < head.len())
 }
 
-/// 文件的开头 `head` 像文本：没有 NUL，是合法的 UTF-8，与 git 判断二进制文件的做法相近
-/// （它只看 NUL）。没读到文件末尾（`whole` 为假）时，最后一个字符可以被截断。空文件也算。
-/// Latin-1 这类别的编码的文本算作不是。
+/// The start of a file, `head`, looks like text: no NUL and valid UTF-8, close to how git decides
+/// a file is binary (it only looks for NUL). When the end of the file was not reached (`whole`
+/// false), the last character may be cut off. Empty files count too. Text in other encodings such
+/// as Latin-1 does not count.
 pub fn is_text(head: &[u8], whole: bool) -> bool {
     if head.contains(&0) {
         return false;
@@ -189,9 +205,11 @@ pub fn is_text(head: &[u8], whole: bool) -> bool {
     }
 }
 
-/// 在目录 `dir` 下面（不含它自己）找名字里有 `query` 的（不分大小写），最多 `limit` 个，
-/// 按广度优先：浅的在前。返回路径（从 `dir` 开始拼）和元数据。不进符号链接指向的目录，
-/// 免得绕圈；最多看 `budget` 项，大目录树里不会一直找下去。
+/// Finds entries below directory `dir` (not including itself) whose names contain `query`
+/// (case-insensitive), at most `limit` of them, breadth first: shallower ones first. Returns the
+/// paths (built starting from `dir`) and metadata. Does not enter directories that symlinks point
+/// at, to avoid going in circles; looks at most at `budget` entries, so it does not keep searching
+/// forever in a large tree.
 pub fn search(
     store: &Store,
     dir: &[u8],
@@ -235,16 +253,17 @@ pub fn search(
     Ok(out)
 }
 
-// ---- 修改（只在 App 的家目录里面）----
+// ---- Changes (only inside the app's home directory) ----
 //
-// 写的都限制在 `top`（App 的登录账号的家目录）里面：按真实路径算，经由符号链接走到外面去的
-// 不行（EACCES）。要删除、改名的目录项本身不跟随（删掉的是链接，不是它指向的东西），它所在
-// 的目录跟随。
+// All writes are confined to `top` (the home directory of the app's login account): counted by
+// real path, so getting outside through a symlink is not allowed (EACCES). The entry being removed
+// or renamed is itself not followed (what is removed is the link, not what it points at); the
+// directory it is in is followed.
 
-/// 一次新建时换名字最多试这么多次（`a (1).txt`、`a (2).txt`……）。
+/// The most names one create tries (`a (1).txt`, `a (2).txt`, ...).
 const MAX_TRIES: u32 = 100;
 
-/// `top` 的真实路径的组件，它要是目录。
+/// The components of `top`'s real path; it must be a directory.
 fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     let (ino, real) = walk(store, top)?;
     if store.kind(ino)? != mode::S_IFDIR {
@@ -253,7 +272,7 @@ fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     Ok(real)
 }
 
-/// `top` 里面的目录 `dir`（符号链接跟随）。
+/// Directory `dir` inside `top` (following symlinks).
 fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
     let top = top_of(store, top)?;
     let (ino, real) = walk(store, dir)?;
@@ -266,7 +285,8 @@ fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
     Ok(ino)
 }
 
-/// 要删除、改名、移走的目录项：所在的目录在 `top` 里面，名字本身不跟随。`top` 自己不行。
+/// An entry to remove, rename or move away: its directory is inside `top`, and the name itself is
+/// not followed. `top` itself is not allowed.
 fn entry_in(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, Vec<u8>), Errno> {
     let comps: Vec<Vec<u8>> = components(path).collect();
     let (name, dirs) = comps.split_last().ok_or(Errno::EACCES)?;
@@ -278,7 +298,7 @@ fn entry_in(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, Vec<u8>), Er
     Ok((dir, name.clone()))
 }
 
-/// 新的名字：不能是空的、`.`、`..`，不能有 `/` 和 NUL，最多 255 字节。
+/// A new name: not empty, `.` or `..`, no `/` or NUL, at most 255 bytes.
 fn check_name(name: &[u8]) -> Result<(), Errno> {
     if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
     {
@@ -290,10 +310,11 @@ fn check_name(name: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 名字的最大长度，与 Linux 的 `NAME_MAX` 相同。
+/// The maximum name length, the same as Linux's `NAME_MAX`.
 const NAME_MAX: usize = 255;
 
-/// 名字已经有了时换的名字：文件是 `a (1).txt`（扩展名留在最后），目录是 `a (1)`。
+/// The name to use when a name is taken: `a (1).txt` for a file (the extension stays last),
+/// `a (1)` for a directory.
 fn numbered(name: &[u8], n: u32, directory: bool) -> Vec<u8> {
     let dot = name
         .iter()
@@ -306,8 +327,9 @@ fn numbered(name: &[u8], n: u32, directory: bool) -> Vec<u8> {
     out
 }
 
-/// 在 `top` 里面的目录 `dir` 里新建文件（0644）或目录（0755），属主是 `uid`、`gid`。名字
-/// 已经有了时换一个（[`numbered`]），返回实际用的名字。
+/// Creates a file (0644) or directory (0755) in directory `dir` inside `top`, owned by `uid` and
+/// `gid`. When the name is taken another one is used ([`numbered`]); returns the name actually
+/// used.
 pub fn create(
     store: &Store,
     top: &[u8],
@@ -347,7 +369,8 @@ pub fn create(
     Err(Errno::EEXIST)
 }
 
-/// 删除 `top` 里面的文件、符号链接或者整个目录树（符号链接只删链接）。
+/// Removes a file, a symlink or a whole directory tree inside `top` (for a symlink, only the
+/// link).
 pub fn remove(
     store: &Store,
     top: &[u8],
@@ -383,7 +406,7 @@ fn remove_tree(
     Ok(())
 }
 
-/// 把 `ino` 从 `from` 移到 `to`（不覆盖），记下来。
+/// Moves `ino` from `from` to `to` (without overwriting) and records it.
 fn moved(
     store: &Store,
     from: (Ino, &[u8]),
@@ -402,7 +425,7 @@ fn moved(
     Ok(())
 }
 
-/// 在同一个目录里改名；新的名字已经有了是 EEXIST，不覆盖。
+/// Renames within the same directory; EEXIST if the new name is taken, without overwriting.
 pub fn rename(
     store: &Store,
     top: &[u8],
@@ -418,8 +441,8 @@ pub fn rename(
     moved(store, (dir, &name), (dir, new_name), changes)
 }
 
-/// 移到 `top` 里面的另一个目录 `to`，名字不变；那里已经有了是 EEXIST，目录移进自己里面是
-/// EINVAL。
+/// Moves to another directory `to` inside `top`, keeping the name; EEXIST if it is already there,
+/// EINVAL for moving a directory into itself.
 pub fn move_to(
     store: &Store,
     top: &[u8],
@@ -432,8 +455,9 @@ pub fn move_to(
     moved(store, (dir, &name), (to, &name), changes)
 }
 
-/// 打开 `top` 里面的普通文件读写（符号链接跟随，指向的文件也要在 `top` 里面），`truncate`
-/// 时先截断，`append` 时以 `O_APPEND` 打开。返回宿主上的 object。
+/// Opens a regular file inside `top` for reading and writing (following symlinks; the file pointed
+/// at must also be inside `top`), truncating it first with `truncate` and opening with `O_APPEND`
+/// with `append`. Returns the object on the host.
 pub fn open_write(
     store: &Store,
     top: &[u8],
@@ -455,8 +479,9 @@ pub fn open_write(
     Ok(file)
 }
 
-/// [`open_write`] 打开的文件关闭了（对方写的是宿主的 object，不经过这里）：记下
-/// [`Change::Written`]。文件这期间被删掉、移走了就不记。
+/// A file opened by [`open_write`] was closed (the other side writes to the host object, not
+/// through here): records [`Change::Written`]. Not recorded if the file was removed or moved away
+/// in the meantime.
 pub fn written(
     store: &Store,
     top: &[u8],
@@ -468,8 +493,8 @@ pub fn written(
     Ok(())
 }
 
-/// `top` 里面的普通文件 `path`（符号链接跟随，指向的文件也要在 `top` 里面）：它的 inode，
-/// 以及真实路径上所在的目录和名字。
+/// Regular file `path` inside `top` (following symlinks; the file pointed at must also be inside
+/// `top`): its inode, and the directory and name it has on its real path.
 fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, Vec<u8>)), Errno> {
     let top = top_of(store, top)?;
     let (ino, mut real) = walk(store, path)?;
@@ -486,8 +511,8 @@ fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, V
     Ok((ino, (dir, name)))
 }
 
-/// 目录 `dir` 在仓库里的路径（按各级目录记着的上级和名字往上找）。删掉了的、不挂在根目录
-/// 下面的（tmpfs 的根）是 ENOENT。
+/// The path of directory `dir` in the store (found by climbing the parent and name each directory
+/// records). ENOENT for deleted directories and ones not under the root directory (tmpfs roots).
 pub fn dir_path(store: &Store, dir: Ino) -> Result<Vec<u8>, Errno> {
     let mut comps = Vec::new();
     let mut cur = dir;
@@ -503,7 +528,7 @@ pub fn dir_path(store: &Store, dir: Ino) -> Result<Vec<u8>, Errno> {
     Ok(join(&comps))
 }
 
-/// 组件拼成绝对路径。
+/// Joins components into an absolute path.
 fn join(comps: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for c in comps {
@@ -516,9 +541,10 @@ fn join(comps: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// guest 的路径 → 宿主（Java）一侧的字符串（App 的文档 ID）：合法 UTF-8 的部分照原样，`%`、
-/// 控制字符和不是 UTF-8 的字节写成 `%XX`，能用 [`decode_path`] 原样换回来，里面也没有制表符、
-/// 换行（JNI 那边一项一行、用制表符分隔）。
+/// A guest path → a string on the host (Java) side (the app's document ID): valid UTF-8 parts
+/// stay as they are, and `%`, control characters and non-UTF-8 bytes are written as `%XX`, so
+/// [`decode_path`] turns it back exactly and it contains no tabs or newlines (the JNI side uses
+/// one line per entry, separated by tabs).
 pub fn encode_path(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len());
@@ -540,7 +566,7 @@ pub fn encode_path(bytes: &[u8]) -> String {
     out
 }
 
-/// [`encode_path`] 反过来；`%` 后面不是两位十六进制数时照原样。
+/// The reverse of [`encode_path`]; a `%` not followed by two hex digits is kept as it is.
 pub fn decode_path(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -562,12 +588,12 @@ pub fn decode_path(s: &str) -> Vec<u8> {
     out
 }
 
-/// 给宿主看的只有目录和普通文件。
+/// Only directories and regular files are shown to the host.
 fn shown(st: &Stat) -> bool {
     matches!(st.kind(), mode::S_IFDIR | mode::S_IFREG)
 }
 
-/// 路径的组件，去掉空的和 `.`。
+/// The components of a path, dropping empty ones and `.`.
 fn components(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
     path.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
@@ -658,7 +684,7 @@ mod tests {
             .map(|(p, _)| String::from_utf8(p).unwrap())
             .collect();
         assert_eq!(found, ["/home/alice/Docs/Notes.txt"]);
-        // 浅的在前，到了上限就停
+        // Shallower first, stopping at the limit
         let found = search(&s, b"/", "o", 2, 1000).unwrap();
         let paths: Vec<_> = found.iter().map(|(p, _)| p.as_slice()).collect();
         assert_eq!(paths, [b"/home".as_slice(), b"/etc/motd"]);
@@ -666,7 +692,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 没有扩展名的文件按内容判断是不是文本："文件"App 据此给 text/plain。
+    /// A file without an extension is judged text or not by its content: the Files app gives it
+    /// text/plain accordingly.
     #[test]
     fn text_is_told_by_content() {
         let (s, dir) = sample("text");
@@ -685,7 +712,7 @@ mod tests {
         file(b"empty", b"");
         file(b"elf", b"\x7fELF\x02\x01\x01\0\0\0");
         file(b"latin1", b"caf\xe9\n");
-        // 长文件在第 4096 个字节处截断了一个汉字：照样是文本
+        // A long file with a Chinese character cut off at byte 4096: still text
         let mut long = vec![b'a'; SNIFF_BYTES - 1];
         long.extend_from_slice("中文".as_bytes());
         file(b"long", &long);
@@ -698,7 +725,7 @@ mod tests {
         assert!(!looks_like_text(&s, b"/etc/latin1"));
         assert!(!looks_like_text(&s, b"/etc"), "a directory");
         assert!(!looks_like_text(&s, b"/etc/missing"));
-        // 整个文件只有一个字节截断的字符：不是文本
+        // A whole file that is only one cut-off character: not text
         assert!(!is_text("中".as_bytes().get(..2).unwrap(), true));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -733,7 +760,8 @@ mod tests {
             open(&s, p).unwrap().read_to_string(&mut text).unwrap();
             text
         };
-        // 名字已经有了时换一个；扩展名留在最后，点开头的名字没有扩展名
+        // When the name is taken another is used; the extension stays last, and a name starting
+        // with a dot has no extension
         assert_eq!(
             create(&s, top, top, b"a.txt", false, owner, &mut c).unwrap(),
             b"a.txt"
@@ -764,12 +792,12 @@ mod tests {
         assert_eq!((st.uid, st.gid, st.mode & 0o7777), (1000, 1000, 0o644));
         let st = stat(&s, b"/home/alice/Docs (1)").unwrap();
         assert_eq!((st.uid, st.mode & 0o7777), (1000, 0o755));
-        // 写；截断之后再写
+        // Write; write again after truncating
         open_write(&s, top, b"/home/alice/a.txt", false, false, &mut c)
             .unwrap()
             .write_all(b"hello")
             .unwrap();
-        // 追加：写在末尾
+        // Append: written at the end
         open_write(&s, top, b"/home/alice/a.txt", false, true, &mut c)
             .unwrap()
             .write_all(b"!")
@@ -796,7 +824,7 @@ mod tests {
                 Change::Written { ino: a, parent }
             ]
         );
-        // 家目录外面的、经由符号链接走出去的都不行
+        // Outside the home directory, or getting out through a symlink: neither is allowed
         assert_eq!(
             create(&s, top, b"/etc", b"x", false, owner, &mut c).unwrap_err(),
             Errno::EACCES
@@ -816,11 +844,11 @@ mod tests {
             move_to(&s, top, b"/home/alice/a.txt", b"/etc", &mut c).unwrap_err(),
             Errno::EACCES
         );
-        // 删除符号链接只删链接
+        // Removing a symlink removes only the link
         remove(&s, top, motd, &mut c).unwrap();
         assert_eq!(stat(&s, motd).unwrap_err(), Errno::ENOENT);
         assert_eq!(read(b"/etc/motd"), "welcome\n");
-        // 改名不覆盖
+        // Renaming does not overwrite
         let a1 = b"/home/alice/a (1).txt";
         assert_eq!(
             rename(&s, top, a1, b"a.txt", &mut c).unwrap_err(),
@@ -832,18 +860,18 @@ mod tests {
         );
         rename(&s, top, a1, b"b.txt", &mut c).unwrap();
         assert!(stat(&s, b"/home/alice/b.txt").is_ok());
-        // 移动；目录不能移进自己里面
+        // Move; a directory cannot be moved into itself
         move_to(&s, top, b"/home/alice/b.txt", b"/home/alice/Docs", &mut c).unwrap();
         assert!(stat(&s, b"/home/alice/Docs/b.txt").is_ok());
         assert_eq!(
             move_to(&s, top, b"/home/alice/Docs", b"/home/alice/Docs", &mut c).unwrap_err(),
             Errno::EINVAL
         );
-        // 删掉整个目录树
+        // Remove a whole directory tree
         c.clear();
         remove(&s, top, b"/home/alice/Docs", &mut c).unwrap();
         assert_eq!(stat(&s, b"/home/alice/Docs").unwrap_err(), Errno::ENOENT);
-        // 记下的改动：先里后外
+        // The recorded changes: inside first
         let home = resolve(&s, top).unwrap();
         let Some((
             Change::Removed {

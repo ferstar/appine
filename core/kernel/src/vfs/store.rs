@@ -1,38 +1,51 @@
-//! inode 仓库（kernel/store 的 map）。
+//! The inode store (the kernel/store map).
 //!
-//! SQLite（WAL）保存完整的命名空间：目录项、inode、symlink 目标；普通文件的
-//! 数据存成宿主文件 `objects/<ino>`。普通文件的 size 和 mtime 以宿主 object
-//! 文件为准，其余元数据（mode、uid/gid、nlink、rdev、ctime）存在 SQLite 里。普通文件
-//! 的 ctime 也取自 object：write、truncate、utimensat 改的是 object，数据库里改了它的
-//! 元数据（权限、属主、链接数、改名、xattr）时也 chmod 一下 object，由宿主更新它的
-//! ctime。数据库那一列用的时钟和宿主文件系统打时间戳的不一定一致（virtiofs 上差了几十
-//! 毫秒），两边取较晚的一个会漏掉改动。
-//! 硬链接就是多个目录项指向同一个 ino。宿主侧只会出现 `objects/<数字>` 这种
-//! 路径，永远不由 guest 输入拼出（§12 第 3 条）。
+//! SQLite (WAL) holds the whole namespace: dentries, inodes, symlink targets; regular files' data
+//! is stored as host files `objects/<ino>`. A regular file's size and mtime are taken from the
+//! host object file, and the other metadata (mode, uid/gid, nlink, rdev, ctime) is stored in
+//! SQLite. A regular file's ctime is also taken from the object: write, truncate and utimensat
+//! change the object, and when the database changes its metadata (permissions, owner, link count,
+//! rename, xattrs) the object is chmodded as well, so that the host updates its ctime. The clock
+//! the database column uses does not necessarily agree with the one the host filesystem stamps
+//! times with (tens of milliseconds apart on virtiofs), and taking the later of the two would
+//! miss changes.
+//! A hard link is simply several dentries pointing at the same ino. Only paths of the form
+//! `objects/<number>` ever appear on the host side, never built from guest input (§12 item 3).
 //!
-//! 删除最后一个链接时，普通文件的 object 在这次修改提交之后删除（已经打开的宿主文件
-//! 仍然可用），inode 行以 nlink = 0 留下来，让打开着它的 fd 还能 fstat；下次打开仓库时
-//! 清理。
+//! When the last link is removed, a regular file's object is deleted after this change is
+//! committed (host files already open remain usable), and the inode row stays with nlink = 0 so
+//! that fds that have it open can still fstat it; it is cleaned up the next time the store is
+//! opened.
 //!
-//! 写事务推迟提交（[`COMMIT_DELAY`]）：每次提交都要把改了的页写进 WAL，比修改本身贵十
-//! 倍，所以几毫秒里的元数据操作一起提交，每个操作是事务里的一个保存点，出错时只回滚
-//! 它自己。App 被杀掉时最多丢失最后几毫秒的修改，仓库仍然是某个时刻的完整状态（Linux
-//! 断电时丢失的更多）。别的 appine 进程也在用仓库时每个操作立即提交。检查点（把 WAL
-//! 写回数据库文件，要 fsync）由后台线程做（[`wal_hook`]），不在多半持着 BKL 的提交里。
+//! Write transactions are committed late ([`COMMIT_DELAY`]): every commit writes the changed
+//! pages into the WAL, ten times as expensive as the change itself, so metadata operations within
+//! a few milliseconds are committed together; each operation is a savepoint in the transaction
+//! and on error rolls back only itself. When the app is killed, at most the last few milliseconds
+//! of changes are lost, and the store is still the complete state of some moment (Linux loses
+//! more on power loss). While other appine processes are also using the store, every operation
+//! commits immediately. Checkpoints (writing the WAL back into the database file, which needs
+//! fsync) are done by a background thread ([`wal_hook`]), not in commits, which mostly hold the
+//! BKL.
 //!
-//! 宿主断电（或者崩溃）时页缓存里的都会丢，盘上的数据库和 object 各自只剩写回了的部分。
-//! 提交只写不刷（`synchronous = NORMAL`），WAL 和 object 由宿主各自写回，先后没有保证。
-//! 要保证的是三件事（[`Meta::sync_metadata`]）：guest 要求落盘（fsync、sync……）的数据和
-//! 元数据真的在盘上；改名覆盖别的文件时，新文件的数据先于这次改名落盘
-//! （[`Store::flush_replaced`]，原生 ext4 的 auto_da_alloc）；删除 object 在删掉它的最后一个
-//! 链接的提交落盘之后（[`reap`]），断电之后数据库回到之前的状态时 object 还在。
+//! When the host loses power (or crashes), everything in the page cache is lost, and the database
+//! and the objects on disk each keep only the parts that were written back. Commits write without
+//! flushing (`synchronous = NORMAL`), and the host writes the WAL and the objects back
+//! independently, with no guarantee of order. Three things are guaranteed
+//! ([`Meta::sync_metadata`]): data and metadata the guest asked to be made durable (fsync, sync,
+//! ...) really are on disk; when a rename replaces another file, the new file's data reaches the
+//! disk before the rename does ([`Store::flush_replaced`], native ext4's auto_da_alloc); an object
+//! is deleted only after the commit that removed its last link is on disk ([`reap`]), so when the
+//! database returns to an earlier state after power loss, the object is still there.
 //!
-//! 路径解析和 stat 走内存里的元数据缓存（目录项，包括不存在的名字；inode 行；符号
-//! 链接目标），不逐级查询数据库。自己的写入只去掉受影响的条目。多个 appine 进程可以
-//! 共用一个仓库，所以 `lock` 文件的前 8 字节是所有进程共享映射的计数器：每次提交之后
-//! 加一；缓存发现它不是因为自己的提交而变了，就整体作废。
+//! Path resolution and stat go through an in-memory metadata cache (dentries, including names that
+//! do not exist; inode rows; symlink targets) instead of querying the database level by level.
+//! Our own writes only remove the affected entries. Several appine processes can share one store,
+//! so the first 8 bytes of the `lock` file are a counter that all processes map shared: it is
+//! bumped after every commit, and when the cache finds that it changed other than by its own
+//! commit, the whole cache is invalidated.
 //!
-//! 缓存也可以不持 BKL 读（[`Meta`]）：并行的 lstat（`git status`、构建工具）不必排队。
+//! The cache can also be read without the BKL ([`Meta`]): parallel lstats (`git status`, build
+//! tools) need not queue up.
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
@@ -52,48 +65,55 @@ use crate::cell::RefCell;
 use crate::cred::XATTR_NAME_CAPS;
 use crate::errno::Errno;
 
-/// inode 编号。
+/// Inode number.
 pub type Ino = u64;
 
-/// 根目录的 inode。
+/// The root directory's inode.
 pub const ROOT: Ino = 1;
 
-/// 写事务最多推迟这么久提交（模块文档）。
+/// The longest a write transaction's commit is deferred (module docs).
 pub const COMMIT_DELAY: Duration = Duration::from_millis(5);
 
-/// WAL 里攒够这么多页没写回的，就请后台线程做检查点（与 SQLite 默认的自动检查点相同）。
+/// When this many pages not yet written back have accumulated in the WAL, the background thread
+/// is asked for a checkpoint (the same as SQLite's default auto-checkpoint).
 const CHECKPOINT_PAGES: c_int = 1000;
 
-/// WAL 长到这么多页时，提交的线程就地做检查点，让 WAL 从头再用（[`wal_hook`]）。
+/// When the WAL grows to this many pages, the committing thread checkpoints in place so the WAL
+/// is reused from the start ([`wal_hook`]).
 const INLINE_CHECKPOINT_PAGES: c_int = 10 * CHECKPOINT_PAGES;
 
-/// 写入停下来这么久之后，后台线程把 WAL 剩下的帧写回去（[`reap`]）。
+/// After writes have stopped for this long, the background thread writes back the frames left in
+/// the WAL ([`reap`]).
 const CHECKPOINT_QUIET: Duration = Duration::from_millis(100);
 
-/// WAL 从头再用时截短到这么长（`journal_size_limit`），不长期占着连续写入时长出来的空间。
+/// The length the WAL is truncated to when reused from the start (`journal_size_limit`), so it
+/// does not keep for long the space it grew to during sustained writes.
 const WAL_SIZE_LIMIT: i64 = 8 << 20;
 
-/// 宿主上 object 文件的权限位：只有 App 自己读写，guest 看到的权限记在数据库里。
+/// Permission bits of object files on the host: only the app itself reads and writes them; the
+/// permissions the guest sees are recorded in the database.
 const OBJECT_MODE: u32 = 0o600;
 
-/// [`Store::take_changed_dirs`] 两次之间最多记这么多个目录，多了不再记（"文件"App 少刷新几个）。
+/// The most directories recorded between two [`Store::take_changed_dirs`] calls; beyond that no
+/// more are recorded (the Files app refreshes a few fewer).
 const MAX_CHANGED_DIRS: usize = 256;
 
-/// 一次提交里改名覆盖了别的文件的普通文件不超过这么多个时逐个 fdatasync，多了就对整个
-/// 文件系统 syncfs 一次（[`Store::flush_replaced`]）。
+/// When at most this many regular files in one commit were renamed over other files, each is
+/// fdatasynced; beyond that the whole filesystem is syncfsed once ([`Store::flush_replaced`]).
 const FLUSH_EACH: usize = 16;
 
-/// [`Store::set_times`] 设置的时间。
+/// The times [`Store::set_times`] sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTime {
-    /// 现在。普通文件由宿主取，和宿主文件系统自己打的时间戳用同一个时钟（见模块的说明）。
+    /// Now. For regular files the host takes it, with the same clock as the host filesystem's own
+    /// timestamps (see the module docs).
     Now,
-    /// 指定的时间（纳秒）。
+    /// A given time (nanoseconds).
     At(i64),
 }
 
 impl FileTime {
-    /// 交给宿主的 (秒, 纳秒)。
+    /// (seconds, nanoseconds) to hand to the host.
     fn host(self) -> (i64, i64) {
         match self {
             FileTime::Now => appine_hal::TIME_NOW,
@@ -102,216 +122,235 @@ impl FileTime {
     }
 }
 
-/// 文件类型位（`st_mode` 的高位）。
+/// File type bits (the high bits of `st_mode`).
 pub mod mode {
-    /// 类型位掩码。
+    /// Type bit mask.
     pub const S_IFMT: u32 = 0o170000;
-    /// 目录。
+    /// Directory.
     pub const S_IFDIR: u32 = 0o040000;
-    /// 普通文件。
+    /// Regular file.
     pub const S_IFREG: u32 = 0o100000;
-    /// 符号链接。
+    /// Symbolic link.
     pub const S_IFLNK: u32 = 0o120000;
-    /// 字符设备。
+    /// Character device.
     pub const S_IFCHR: u32 = 0o020000;
-    /// 块设备。
+    /// Block device.
     pub const S_IFBLK: u32 = 0o060000;
-    /// FIFO。
+    /// FIFO.
     pub const S_IFIFO: u32 = 0o010000;
-    /// socket。
+    /// Socket.
     pub const S_IFSOCK: u32 = 0o140000;
-    /// setuid 位。
+    /// The setuid bit.
     pub const S_ISUID: u32 = 0o4000;
-    /// setgid 位。
+    /// The setgid bit.
     pub const S_ISGID: u32 = 0o2000;
-    /// 粘滞位。
+    /// The sticky bit.
     pub const S_ISVTX: u32 = 0o1000;
 }
 
-/// 一个 inode 的元数据。
+/// The metadata of an inode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stat {
-    /// inode 编号。
+    /// Inode number.
     pub ino: Ino,
-    /// 类型位与权限位。
+    /// Type and permission bits.
     pub mode: u32,
-    /// 硬链接数。
+    /// Number of hard links.
     pub nlink: u32,
-    /// 属主。
+    /// Owner.
     pub uid: u32,
-    /// 属组。
+    /// Group.
     pub gid: u32,
-    /// 设备号（设备节点）。
+    /// Device number (device nodes).
     pub rdev: u64,
-    /// 字节数。
+    /// Size in bytes.
     pub size: u64,
-    /// 访问时间（纳秒）。只有普通文件单独记录（宿主 object 的 atime），其余等于 mtime。
+    /// Access time (nanoseconds). Recorded separately only for regular files (the host object's
+    /// atime); for the others it equals mtime.
     pub atime_ns: i64,
-    /// 修改时间（纳秒）。
+    /// Modification time (nanoseconds).
     pub mtime_ns: i64,
-    /// 状态改变时间（纳秒）。
+    /// Status change time (nanoseconds).
     pub ctime_ns: i64,
 }
 
 impl Stat {
-    /// 文件类型位。
+    /// File type bits.
     pub fn kind(&self) -> u32 {
         self.mode & mode::S_IFMT
     }
 
-    /// 是不是目录。
+    /// Whether it is a directory.
     pub fn is_dir(&self) -> bool {
         self.kind() == mode::S_IFDIR
     }
 
-    /// 是不是符号链接。
+    /// Whether it is a symbolic link.
     pub fn is_symlink(&self) -> bool {
         self.kind() == mode::S_IFLNK
     }
 }
 
-/// 目录里的一项（不含 `.` 和 `..`）。
+/// An entry in a directory (not including `.` and `..`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
-    /// 名字。
+    /// Name.
     pub name: Vec<u8>,
-    /// inode 编号。
+    /// Inode number.
     pub ino: Ino,
-    /// 类型位与权限位。
+    /// Type and permission bits.
     pub mode: u32,
 }
 
-/// 一个 inode 仓库。
+/// An inode store.
 ///
-/// 不是 Sync：同一时刻只有一个线程用它。内核的仓库靠 BKL 保证这一点（`Kernel` 是手写的
-/// Send），检查的构建里由 [`Store::guard_with_bkl`] 检查。
+/// Not Sync: only one thread uses it at a time. The kernel's store relies on the BKL for this
+/// (`Kernel` implements Send by hand), and checked builds check it with
+/// [`Store::guard_with_bkl`].
 pub struct Store {
-    /// 数据库连接，经由 [`Store::db`] 用。要第一个丢掉（[`Store::connect`] 的 WAL 钩子）。
+    /// The database connection, used through [`Store::db`]. Must be dropped first (the WAL hook of
+    /// [`Store::connect`]).
     conn: Connection,
-    /// 属于哪个运行中的内核（[`crate::kernel::Shared::id`]），只能持着它的 BKL 用
-    /// （[`Store::guard_with_bkl`]）；0 是不属于。
+    /// The running kernel it belongs to ([`crate::kernel::Shared::id`]); it may be used only while
+    /// holding that kernel's BKL ([`Store::guard_with_bkl`]); 0 means it belongs to none.
     #[cfg(any(debug_assertions, feature = "borrow-check"))]
     owner: std::sync::atomic::AtomicUsize,
     objects: PathBuf,
-    /// 仓库目录里的 `lock` 文件。每个使用仓库的进程持有它的共享锁，只有独占使用时
-    /// 才清理已删除的 inode：别的进程可能还打开着它们。
+    /// The `lock` file in the store directory. Every process using the store holds a shared lock
+    /// on it, and deleted inodes are cleaned up only under exclusive use: other processes may still
+    /// have them open.
     lock: File,
-    /// 元数据缓存、提交计数器和 `objects` 目录。
+    /// The metadata cache, the commit counter and the `objects` directory.
     meta: Arc<Meta>,
-    /// 正在一个操作里（[`Store::transaction`]）：查到的可能是它回滚时会撤销的内容，不填
-    /// 进缓存。缓存照样读：这次操作改过的条目改的时候就去掉了（[`Store::touch_name`]），
-    /// 留下的都与数据库一致。
+    /// Inside an operation ([`Store::transaction`]): what is queried may be content its rollback
+    /// would undo, so it is not filled into the cache. The cache is still read: entries this
+    /// operation changed were removed when they were changed ([`Store::touch_name`]), and what
+    /// remains agrees with the database.
     writing: Cell<bool>,
-    /// [`Store::snapshot`] 里：还没开始读事务时是 Some(None)，开始时的提交计数是
-    /// Some(Some(n))。
+    /// Inside [`Store::snapshot`]: Some(None) before the read transaction has started, and
+    /// Some(Some(n)) with the commit count at its start.
     snapshot_at: Cell<Option<Option<u64>>>,
-    /// 推迟提交的写事务开始的时刻；None 时没有打开的写事务。
+    /// When the deferred write transaction started; None when no write transaction is open.
     pending: Cell<Option<Instant>>,
-    /// 写事务最多推迟多久（[`COMMIT_DELAY`]）。测试里加长：调试构建在慢的机器上一次操作
-    /// 就可能超过 5 毫秒，当场提交了，看不到推迟的状态。
+    /// The longest a write transaction is deferred ([`COMMIT_DELAY`]). Longer in tests: on a slow
+    /// machine one operation of a debug build can take over 5 ms and be committed on the spot,
+    /// hiding the deferred state.
     delay: Duration,
-    /// 最后一个链接已经删除、等写事务提交之后再删除的 object。
+    /// Objects whose last link has been removed, to be deleted after the write transaction
+    /// commits.
     doomed: RefCell<Vec<Ino>>,
-    /// 写事务里改名覆盖了别的文件的普通文件：提交之前让它们的数据落盘
-    /// （[`Store::flush_replaced`]）。
+    /// Regular files in the write transaction that were renamed over other files: their data is
+    /// made durable before the commit ([`Store::flush_replaced`]).
     replaced: RefCell<Vec<Ino>>,
-    /// 目录项改过的目录（[`Store::take_changed_dirs`]）；None 时不记。
+    /// Directories whose dentries changed ([`Store::take_changed_dirs`]); not recorded when None.
     changed_dirs: RefCell<Option<std::collections::BTreeSet<Ino>>>,
-    /// 开始推迟提交时调用：叫醒到点提交的线程（[`Store::commit_due`]）。
+    /// Called when a commit starts being deferred: wakes the thread that commits when it is due
+    /// ([`Store::commit_due`]).
     waker: RefCell<Option<Box<dyn Fn()>>>,
-    /// 删除 object 的后台线程（[`reap`]）。
+    /// The background thread that deletes objects ([`reap`]).
     reaper: Option<JoinHandle<()>>,
-    /// 这个操作成功之后放进缓存的内容（[`Fill`]）。
+    /// What goes into the cache after this operation succeeds ([`Fill`]).
     fills: RefCell<Vec<Fill>>,
 }
 
-/// 操作里新建的目录项和 inode 行：内容在操作里就知道了，操作成功之后直接放进缓存，新建
-/// 之后马上按路径 chmod、chown、stat 时不必再查数据库。之后同一个操作又改了它们的，
-/// 改的时候作废（[`Store::touch_name`]）。
+/// Dentries and inode rows created in an operation: their contents are known within the
+/// operation, and they go straight into the cache after it succeeds, so chmod, chown or stat by
+/// path right after creation need not query the database again. If the same operation changes
+/// them later, they are invalidated when changed ([`Store::touch_name`]).
 enum Fill {
     Name(Ino, Vec<u8>, Ino),
     Row(Stat),
 }
 
 impl Fill {
-    /// 每个操作最多记这么多：导入 rootfs 整个是一个操作，作废时逐个比较会变成平方级。
+    /// At most this many per operation: importing a rootfs is one whole operation, and comparing
+    /// them one by one on invalidation would become quadratic.
     const MAX: usize = 64;
 }
 
-/// 元数据缓存，以及不持 BKL 读它（`syscall::fast`）要用的东西。
+/// The metadata cache, and what reading it without the BKL (`syscall::fast`) needs.
 ///
-/// 只有 [`Store`] 的方法修改缓存，修改时持有写锁；它们读时不加锁，因为别的线程只会读：
-/// Store 不是 Sync，同一时刻只有一个线程（持有 BKL 的那个）调用它的方法。不持 BKL 的
-/// 线程只经由 [`Meta::reader`] 持读锁读。
+/// Only [`Store`]'s methods modify the cache, holding the write lock while they do; they read it
+/// without locking, because other threads only read: Store is not Sync, so only one thread (the
+/// one holding the BKL) calls its methods at a time. Threads without the BKL read only through
+/// [`Meta::reader`], holding the read lock.
 pub(crate) struct Meta {
     lock: RwLock<()>,
     cache: UnsafeCell<Cache>,
-    /// `lock` 文件开头的提交计数器（模块文档）。
+    /// The commit counter at the start of the `lock` file (module docs).
     commits: Commits,
-    /// `objects` 目录（宿主 `O_PATH`），按 inode 编号 stat object 不必解析整个路径。
+    /// The `objects` directory (a host `O_PATH`), so stat-ing an object by inode number need not
+    /// resolve the whole path.
     objects_dir: OwnedFd,
-    /// 等着后台线程删除的 object、要做的检查点（[`reap`]）。
+    /// Objects waiting for the background thread to delete them, and checkpoints to do
+    /// ([`reap`]).
     reaper: Reaper,
-    /// 仓库目录里 `lock` 文件的另一个 fd：syncfs 要普通的 fd，`objects_dir` 是 `O_PATH`。
+    /// Another fd of the `lock` file in the store directory: syncfs needs an ordinary fd, and
+    /// `objects_dir` is `O_PATH`.
     fs: File,
-    /// WAL（`meta.db-wal`）的路径。
+    /// The path of the WAL (`meta.db-wal`).
     wal: PathBuf,
-    /// 上一次让 WAL 落盘之前提交计数器的值加一：之后没有新的提交就不必再刷
-    /// （[`Meta::sync_metadata`]）。0 是还没刷过。
+    /// The commit counter's value before the WAL was last made durable, plus one: with no new
+    /// commits since, there is no need to flush again ([`Meta::sync_metadata`]). 0 means it has
+    /// never been flushed.
     durable: AtomicU64,
-    /// 让 WAL 落盘、提交之前刷改名覆盖的文件的次数（测试用）。
+    /// The counts of making the WAL durable and of flushing renamed-over files before commits
+    /// (for tests).
     #[cfg(test)]
     syncs: AtomicU64,
     #[cfg(test)]
     flushes: AtomicU64,
 }
 
-/// 提交之后要删除的 object 交给后台线程（[`reap`]）：宿主的 unlink 每个几微秒，还要拿
-/// `objects` 目录的锁，`rm -rf` 时占了 guest 线程一成多的时间，而且是持着 BKL 做的。
-/// 删除之前 App 被杀掉也没关系：inode 行以 nlink = 0 留着，开机时清理。检查点也由它做
-/// （[`wal_hook`]）。
+/// Objects to delete after a commit are handed to the background thread ([`reap`]): a host
+/// unlink takes a few microseconds each and also takes the `objects` directory's lock; during
+/// `rm -rf` it took over a tenth of the guest thread's time, and it was done holding the BKL. The
+/// app being killed before the deletion does no harm: the inode row stays with nlink = 0 and is
+/// cleaned up at boot. It also does the checkpoints ([`wal_hook`]).
 #[derive(Default)]
 struct Reaper {
     state: Mutex<Reaping>,
-    /// 有活干了，或者该退出了。
+    /// There is work to do, or it is time to quit.
     work: Condvar,
-    /// 队列空了、手上也没有在删的（测试等它）。
+    /// The queue is empty and nothing is being deleted (tests wait for this).
     idle: Condvar,
 }
 
 #[derive(Default)]
 struct Reaping {
     queue: Vec<Ino>,
-    /// 提交的线程请它做一次检查点。
+    /// The committing thread asks it for a checkpoint.
     checkpoint: bool,
-    /// 上一次请它做检查点时 WAL 里的页数：做完之后至少写回到这里。
+    /// The number of pages in the WAL at the last checkpoint request: once done, the checkpoint
+    /// has written back at least up to here.
     requested: c_int,
-    /// 最近一次提交之后 WAL 里的页数，和一共提交了几次。
+    /// The number of pages in the WAL after the latest commit, and how many commits there have
+    /// been in total.
     pages: c_int,
     commits: u64,
-    /// 上一次检查点写回到 WAL 的第几帧。
+    /// The WAL frame the last checkpoint wrote back up to.
     backfilled: c_int,
     busy: bool,
     quit: bool,
-    /// 一共交给它多少个（测试用）。
+    /// How many have been handed to it in total (for tests).
     #[cfg(test)]
     handed: usize,
-    /// 做过几次检查点（测试用）。
+    /// How many checkpoints have been done (for tests).
     #[cfg(test)]
     checkpoints: usize,
-    /// 不做检查点，模拟后台线程赶不上（测试用）。
+    /// No checkpoints, simulating a background thread that cannot keep up (for tests).
     #[cfg(test)]
     paused: bool,
 }
 
 impl Reaper {
-    /// 提交之后 WAL 里有 `pages` 页（[`wal_hook`]）：比上次请求时多出
-    /// [`CHECKPOINT_PAGES`] 页就请后台线程做检查点。
+    /// After a commit the WAL has `pages` pages ([`wal_hook`]): once that is [`CHECKPOINT_PAGES`]
+    /// pages more than at the last request, asks the background thread for a checkpoint.
     fn committed(&self, pages: c_int) {
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.pages = pages;
         st.commits += 1;
-        // 比原来还少：WAL 从头再用了
+        // Fewer than before: the WAL has been reused from the start
         if pages < st.requested {
             st.requested = 0;
         }
@@ -326,10 +365,11 @@ impl Reaper {
     }
 }
 
-/// 仓库的后台线程，直到 Store 关闭：删除 object（关闭之前删完队列里的），做检查点。
+/// The store's background thread, until the Store closes: deletes objects (finishing the queue
+/// before closing) and does checkpoints.
 fn reap(meta: Arc<Meta>, db: PathBuf) {
     let r = &meta.reaper;
-    // 检查点用自己的连接，第一次要做时才打开
+    // Checkpoints use their own connection, opened the first time one is needed
     let mut conn = None;
     let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
@@ -337,8 +377,10 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
             let inos = std::mem::take(&mut st.queue);
             st.busy = true;
             drop(st);
-            // 删掉它们最后一个链接的提交先落盘：不然断电之后数据库回到之前的状态，名字还在，
-            // object 却没了。刷的时候新交来的攒着，下一次一起
+            // The commit that removed their last links goes to disk first: otherwise after power
+            // loss the database returns to its earlier state, and the names are still there but
+            // the objects are gone. Objects handed over during the flush accumulate for the next
+            // round
             if let Err(e) = meta.sync_metadata() {
                 crate::debug::log(format_args!("inode store: syncing the WAL: {e:?}"));
             }
@@ -373,8 +415,9 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
         if st.quit {
             return;
         }
-        // WAL 已经长过一次检查点、还有没写回的帧：写入停下来之后写回剩下的，下一个写事务
-        // 就让 WAL 从头再用（[`wal_hook`]）。零星的小写入不到这么长，不为它们 fsync
+        // The WAL has grown past one checkpoint and has frames not written back: once writes
+        // stop, write back the rest, so the next write transaction reuses the WAL from the start
+        // ([`wal_hook`]). Sporadic small writes never get this long, and no fsync is spent on them
         if st.pages >= CHECKPOINT_PAGES && st.pages > st.backfilled {
             let seen = st.commits;
             let (g, wait) = r
@@ -391,8 +434,10 @@ fn reap(meta: Arc<Meta>, db: PathBuf) {
     }
 }
 
-/// PASSIVE 检查点：不等读者，也不挡写者，这时写不回去的帧留到下一次。返回写回到了第几
-/// 帧。失败时只记下来，WAL 接着变长，到 [`INLINE_CHECKPOINT_PAGES`] 时由提交的线程就地做。
+/// A PASSIVE checkpoint: waits for no readers and blocks no writers; frames that cannot be written
+/// back now are left for next time. Returns the frame it wrote back up to. Failures are only
+/// logged; the WAL keeps growing, and at [`INLINE_CHECKPOINT_PAGES`] the committing thread
+/// checkpoints in place.
 fn checkpoint(conn: &mut Option<Connection>, db: &Path) -> Option<c_int> {
     if conn.is_none() {
         match Connection::open(db) {
@@ -400,41 +445,50 @@ fn checkpoint(conn: &mut Option<Connection>, db: &Path) -> Option<c_int> {
             Err(e) => crate::debug::log(format_args!("inode store: checkpoint: {e}")),
         }
     }
-    // 结果是（是否被挡住、WAL 的帧数、写回到的帧）
+    // The result is (whether it was blocked, the number of WAL frames, the frame written back up
+    // to)
     conn.as_ref()?
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(2))
         .inspect_err(|e| crate::debug::log(format_args!("inode store: checkpoint: {e}")))
         .ok()
 }
 
-/// 代替 SQLite 默认的自动检查点（`sqlite3_wal_hook`）：每次提交之后由提交的线程调用，
-/// `pages` 是 WAL 里现在的页数。检查点要把 WAL 写回数据库文件、fsync 两次，提交多半
-/// 持着 BKL（推迟到点的提交在定时器线程里），手机上一次 fsync 就是几毫秒到几十毫秒，
-/// 这期间所有 guest 线程都要等，所以交给后台线程（[`reap`]）。
+/// Replaces SQLite's default auto-checkpoint (`sqlite3_wal_hook`): called by the committing
+/// thread after every commit, with `pages` the current number of pages in the WAL. A checkpoint
+/// writes the WAL back into the database file and fsyncs twice, while commits mostly hold the BKL
+/// (deferred commits that come due run in the timer thread); on a phone one fsync takes from a
+/// few to tens of milliseconds, during which every guest thread has to wait, so the checkpoint is
+/// handed to the background thread ([`reap`]).
 ///
-/// 后台的检查点不挡写者，可 WAL 只有在全部写回之后开始的写事务里才从头再用：一直有
-/// 提交时，后台总差最后几帧，WAL 越来越长。写入停下来的时候（交互使用多半如此）后台
-/// 赶得上；一直写到 [`INLINE_CHECKPOINT_PAGES`] 页时由提交的线程就地补上，这时大部分帧
-/// 后台已经写回，补的只是最后一千页以内的。
+/// The background checkpoint blocks no writers, but the WAL is reused from the start only by a
+/// write transaction that begins after everything has been written back: with commits coming
+/// all the time, the background thread is always the last few frames behind and the WAL keeps
+/// growing. When writes stop (as they mostly do in interactive use) the background thread catches
+/// up; when writes go on all the way to [`INLINE_CHECKPOINT_PAGES`] pages, the committing thread
+/// finishes the job in place, by which time the background thread has written back most frames
+/// and only those within the last thousand pages are left.
 unsafe extern "C" fn wal_hook(
     meta: *mut c_void,
     db: *mut ffi::sqlite3,
     name: *const c_char,
     pages: c_int,
 ) -> c_int {
-    // SAFETY: 注册时传的是这个连接所属的 Store 的 Meta，它比连接活得久（Store::connect）
+    // SAFETY: registration passed the Meta of the Store this connection belongs to, which
+    // outlives the connection (Store::connect)
     unsafe { &*meta.cast::<Meta>() }.reaper.committed(pages);
     if pages >= INLINE_CHECKPOINT_PAGES {
-        // SAFETY: SQLite 传来的是刚提交的那个连接和数据库的名字
+        // SAFETY: SQLite passes the connection that just committed and the database's name
         unsafe { ffi::sqlite3_wal_checkpoint(db, name) };
     }
     ffi::SQLITE_OK
 }
 
 impl Meta {
-    /// 让已经提交的元数据落盘：提交只把帧写进 WAL，不刷（`synchronous = NORMAL`），这里等
-    /// WAL 写到盘上。检查点写回了的帧在数据库文件里，检查点已经刷过它；WAL 不在了（最后一个
-    /// 连接关闭时写回、删掉）也就没有要刷的。可以放开 BKL 调用。
+    /// Makes committed metadata durable: commits only write frames into the WAL without flushing
+    /// (`synchronous = NORMAL`), and this waits until the WAL is on disk. Frames a checkpoint
+    /// wrote back are in the database file, which the checkpoint has already flushed; when the WAL
+    /// is gone (written back and deleted when the last connection closed) there is nothing to
+    /// flush either. May be called with the BKL released.
     pub(crate) fn sync_metadata(&self) -> Result<(), Errno> {
         let seen = self.commits.get();
         if self.durable.load(Ordering::Acquire) > seen {
@@ -451,8 +505,8 @@ impl Meta {
         Ok(())
     }
 
-    /// 把仓库所在的整个宿主文件系统写到盘上（guest 的 sync、syncfs）：object 的数据、WAL
-    /// 和数据库文件一起。可以放开 BKL 调用。
+    /// Writes the whole host filesystem the store is on to disk (the guest's sync, syncfs): object
+    /// data, the WAL and the database file together. May be called with the BKL released.
     pub(crate) fn sync_all(&self) -> Result<(), Errno> {
         let seen = self.commits.get();
         appine_hal::syncfs(self.fs.as_raw_fd()).map_err(Errno)?;
@@ -461,7 +515,7 @@ impl Meta {
     }
 }
 
-/// 删除 `objects` 目录里的 object；它已经不在时不算错误。
+/// Deletes an object in the `objects` directory; not an error if it is already gone.
 fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     let mut name = [0u8; 21];
     match appine_hal::unlink_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)) {
@@ -470,16 +524,17 @@ fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     }
 }
 
-// SAFETY: 缓存按上面的约定同步；提交计数器是共享映射里的原子变量，映射在 Meta 存续
-// 期间一直有效
+// SAFETY: the cache is synchronized by the convention above; the commit counter is an atomic in a
+// shared mapping, and the mapping stays valid for as long as Meta lives
 unsafe impl Send for Meta {}
 unsafe impl Sync for Meta {}
 
 impl Meta {
-    /// 不持 BKL 读缓存。缓存是最新的（提交计数器没变）时返回读者，持有读锁直到它被丢掉。
+    /// Reads the cache without the BKL. When the cache is current (the commit counter has not
+    /// changed), returns a reader, which holds the read lock until it is dropped.
     pub(crate) fn reader(&self) -> Option<Reader<'_>> {
         let guard = self.lock.read().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: 持有读锁，修改缓存的线程要等它释放
+        // SAFETY: the read lock is held, and a thread modifying the cache waits for its release
         let cache = unsafe { &*self.cache.get() };
         (cache.generation == self.commits.get()).then_some(Reader {
             _guard: guard,
@@ -489,8 +544,8 @@ impl Meta {
     }
 }
 
-/// 不持 BKL 读缓存的读者（[`Meta::reader`]）。查询没有命中时返回 None，调用方改为持有
-/// BKL 正常查询（会填进缓存）。
+/// A reader of the cache without the BKL ([`Meta::reader`]). A query that misses returns None, and
+/// the caller then queries normally with the BKL held (which fills the cache).
 pub(crate) struct Reader<'a> {
     _guard: RwLockReadGuard<'a, ()>,
     cache: &'a Cache,
@@ -498,28 +553,29 @@ pub(crate) struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    /// [`Store::lookup`]。
+    /// [`Store::lookup`].
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Option<Option<Ino>> {
         self.cache.dentries.get(&parent)?.get(name).copied()
     }
 
-    /// [`Store::kind`]。
+    /// [`Store::kind`].
     pub fn kind(&self, ino: Ino) -> Option<u32> {
         Some(self.cache.rows.get(&ino)?.kind())
     }
 
-    /// [`Store::readlink`]：不是符号链接时返回 None。
+    /// [`Store::readlink`]: None if it is not a symlink.
     pub fn readlink(&self, ino: Ino) -> Option<&[u8]> {
         self.cache.targets.get(&ino).map(Vec::as_slice)
     }
 
-    /// [`Store::parent`]。
+    /// [`Store::parent`].
     pub fn parent(&self, dir: Ino) -> Option<Ino> {
         self.cache.parents.get(&dir).copied()
     }
 
-    /// [`Store::stat`]。持有读锁时 stat object：inode 编号被删除后重新使用的话，结果
-    /// 不会一半来自旧文件、一半来自新文件。宿主上出错时返回 None。
+    /// [`Store::stat`]. Stats the object while holding the read lock: if the inode number is
+    /// reused after deletion, the result is not half from the old file and half from the new one.
+    /// None on a host error.
     pub fn stat(&self, ino: Ino) -> Option<Stat> {
         let mut st = *self.cache.rows.get(&ino)?;
         if st.kind() == mode::S_IFREG {
@@ -529,7 +585,8 @@ impl Reader<'_> {
     }
 }
 
-/// 普通文件的 size 和时间取自宿主 object 文件（ctime 见模块的说明）。
+/// A regular file's size and times are taken from the host object file (for ctime see the module
+/// docs).
 fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
     let mut name = [0u8; 21];
     let o =
@@ -541,7 +598,7 @@ fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), 
     Ok(())
 }
 
-/// object 的文件名（inode 编号的十进制表示），不分配内存。
+/// An object's file name (the inode number in decimal), without allocating.
 fn object_name(mut ino: Ino, buf: &mut [u8; 21]) -> &std::ffi::CStr {
     let mut i = buf.len() - 1;
     buf[i] = 0;
@@ -555,8 +612,9 @@ fn object_name(mut ino: Ino, buf: &mut [u8; 21]) -> &std::ffi::CStr {
     }
 }
 
-/// 缓存的哈希：键是 inode 号和文件名，不必抵御哈希碰撞攻击，用 FxHash（rustc 的做法）。
-/// 默认的 SipHash 在 `ls`、`git status` 的 stat 路径上占 4–5%。
+/// The cache's hasher: keys are inode numbers and file names, with no need to resist hash
+/// collision attacks, so FxHash (as rustc does). The default SipHash took 4–5% of the stat path
+/// of `ls` and `git status`.
 #[derive(Default, Clone, Copy)]
 struct FxHasher {
     hash: u64,
@@ -598,27 +656,30 @@ impl std::hash::Hasher for FxHasher {
 
 type Map<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
 
-/// 元数据缓存。条目对应提交计数为 `generation` 时数据库的内容。
+/// The metadata cache. Its entries correspond to the database contents at commit count
+/// `generation`.
 #[derive(Default)]
 struct Cache {
     generation: u64,
     entries: usize,
-    /// 目录 → 名字 → inode（None 表示不存在）。
+    /// Directory → name → inode (None means it does not exist).
     dentries: Map<Ino, Map<Vec<u8>, Option<Ino>>>,
     rows: Map<Ino, Stat>,
     targets: Map<Ino, Vec<u8>>,
     parents: Map<Ino, Ino>,
-    /// 目录 → inode → 目录里指向它的一个名字（[`Store::name_of`]，None 表示没有）。
+    /// Directory → inode → one name in the directory pointing at it ([`Store::name_of`]; None
+    /// means there is none).
     names: Map<Ino, Map<Ino, Option<Vec<u8>>>>,
-    /// 目录的完整列表（readdir）。
+    /// Complete listings of directories (readdir).
     listings: Map<Ino, Vec<DirEntry>>,
-    /// 有文件能力（`security.capability`）的 inode（[`Store::has_file_caps`]）；None 表示
-    /// 还没查。写文件时要查它，所以整个集合一起缓存，随提交计数一起作废。
+    /// Inodes with file capabilities (`security.capability`) ([`Store::has_file_caps`]); None
+    /// means not looked up yet. Writing a file has to check it, so the whole set is cached
+    /// together and invalidated with the commit count.
     file_caps: Option<Map<Ino, ()>>,
 }
 
 impl Cache {
-    /// 条目数的上限：超过就整体清空。
+    /// The limit on the number of entries: beyond it the whole cache is cleared.
     const MAX_ENTRIES: usize = 1 << 17;
 
     fn clear(&mut self, generation: u64) {
@@ -629,8 +690,9 @@ impl Cache {
     }
 }
 
-/// `lock` 文件开头所有进程共享映射的几个字：提交次数、正在使用仓库的进程数、还没提交的
-/// 写事务新分配的 inode 编号范围。
+/// A few words at the start of the `lock` file that all processes map shared: the number of
+/// commits, the number of processes using the store, and the range of inode numbers newly
+/// allocated by write transactions not yet committed.
 struct Commits {
     map: appine_hal::FileMapping,
 }
@@ -645,7 +707,8 @@ impl Commits {
     }
 
     fn word(&self, i: usize) -> &AtomicU64 {
-        // SAFETY: 映射按页对齐、至少 32 字节，存续期间一直有效
+        // SAFETY: the mapping is page-aligned, at least 32 bytes, and valid for its whole
+        // lifetime
         unsafe { AtomicU64::from_ptr(self.map.ptr.as_ptr().cast::<u64>().add(i)) }
     }
 
@@ -653,20 +716,24 @@ impl Commits {
         self.word(0).load(Ordering::SeqCst)
     }
 
-    /// 加一，返回原来的值。
+    /// Adds one, returning the old value.
     fn bump(&self) -> u64 {
         self.word(0).fetch_add(1, Ordering::SeqCst)
     }
 
-    /// 正在使用仓库的进程数。异常退出的进程没有减掉自己，所以可能偏大（只会让别的进程
-    /// 不推迟提交），独占打开仓库（相当于开机）时清零。
+    /// The number of processes using the store. A process that exited abnormally has not
+    /// subtracted itself, so it may be too high (which only makes other processes stop deferring
+    /// commits); it is reset to zero when the store is opened exclusively (the equivalent of
+    /// boot).
     fn users(&self) -> &AtomicU64 {
         self.word(1)
     }
 
-    /// 还没提交的写事务新分配的 inode 编号的最小值和最大值（0 表示没有）。进程在提交
-    /// 之前被杀掉时，这些 inode 随事务一起丢失，它们的 object 却已经建好，下次开机按这个
-    /// 范围删掉；不删的话编号再分配给目录之类没有 object 的 inode 时就永远留下了。
+    /// The minimum and maximum inode numbers newly allocated by write transactions not yet
+    /// committed (0 means none). When a process is killed before committing, these inodes are lost
+    /// with the transaction, but their objects have already been created; the next boot deletes
+    /// them by this range. Otherwise, once the numbers were allocated again to inodes without
+    /// objects, such as directories, the objects would stay forever.
     fn fresh(&self) -> (&AtomicU64, &AtomicU64) {
         (self.word(2), self.word(3))
     }
@@ -674,7 +741,7 @@ impl Commits {
 
 impl Drop for Commits {
     fn drop(&mut self) {
-        // SAFETY: 映射来自 map_file，之后不再访问
+        // SAFETY: the mapping came from map_file and is not accessed afterwards
         unsafe { appine_hal::unmap(self.map.base, self.map.len) }
     }
 }
@@ -687,10 +754,10 @@ const SCHEMA: &str = "
         gid      INTEGER NOT NULL,
         nlink    INTEGER NOT NULL,
         rdev     INTEGER NOT NULL DEFAULT 0,
-        parent   INTEGER NOT NULL DEFAULT 0, -- 目录的上级目录（..）
-        mtime_ns INTEGER NOT NULL DEFAULT 0, -- 没有 object 的 inode 才用这一列
+        parent   INTEGER NOT NULL DEFAULT 0, -- a directory's parent directory (..)
+        mtime_ns INTEGER NOT NULL DEFAULT 0, -- used only by inodes without an object
         ctime_ns INTEGER NOT NULL DEFAULT 0,
-        target   BLOB                        -- symlink 的目标
+        target   BLOB                        -- the symlink's target
     );
     CREATE TABLE IF NOT EXISTS dentries (
         parent INTEGER NOT NULL,
@@ -704,7 +771,8 @@ const SCHEMA: &str = "
         value BLOB NOT NULL,
         PRIMARY KEY (ino, name)
     ) WITHOUT ROWID;
-    -- 不挂在根目录下面的目录（tmpfs 的根）：开机时连同里面的一起删掉
+    -- Directories not under the root directory (tmpfs roots): deleted at boot along with
+    -- everything in them
     CREATE TABLE IF NOT EXISTS detached_roots (
         ino INTEGER PRIMARY KEY
     );
@@ -741,14 +809,15 @@ fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
     st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
 }
 
-/// 宿主上操作 object 出错（宿主的错误码）。
+/// An error operating on an object on the host (a host error code).
 fn object_err(ino: Ino, e: i32) -> Errno {
     crate::debug::log(format_args!("inode store: object {ino}: errno {e}"));
     Errno(e)
 }
 
 impl Store {
-    /// 在空目录（或不存在的目录）`dir` 里创建一个新仓库，只含根目录。
+    /// Creates a new store, containing only the root directory, in empty (or nonexistent)
+    /// directory `dir`.
     pub fn create(dir: &Path) -> Result<Store, Errno> {
         fs::create_dir_all(dir.join("objects")).map_err(io_err)?;
         if dir.join("meta.db").exists() {
@@ -768,9 +837,9 @@ impl Store {
         Ok(store)
     }
 
-    /// 打开已有的仓库。没有别的进程在使用它时（相当于开机），清空 `volatile` 里的目录
-    /// （相对根目录的路径，比如 `dev/shm`：Linux 上它们是 tmpfs），清理上次运行留下的
-    /// 已删除 inode。
+    /// Opens an existing store. When no other process is using it (the equivalent of boot),
+    /// empties the directories in `volatile` (paths relative to the root directory, such as
+    /// `dev/shm`: on Linux they are tmpfs) and cleans up deleted inodes left by the last run.
     pub fn open(dir: &Path, volatile: &[&[u8]]) -> Result<Store, Errno> {
         if !dir.join("meta.db").exists() {
             return Err(Errno::ENOENT);
@@ -784,15 +853,18 @@ impl Store {
                 store.empty_dir(path)?;
             }
             store.remove_detached_dirs()?;
-            // 上次可能是被杀掉的，它最后的提交也许还只在宿主的页缓存里：按数据库直接删 object
-            // 之前先让它们落盘，不然紧接着断电时数据库回到之前，object 却没了（[`reap`]）
+            // The last run may have been killed, and its last commit may still be only in the
+            // host's page cache: make it durable before deleting objects according to the
+            // database, or with power lost right afterwards the database returns to its earlier
+            // state but the objects are gone ([`reap`])
             store.meta.sync_metadata()?;
             store.transaction(|s| s.remove_orphans())?;
             store.commit()?;
         }
         appine_hal::flock(fd, false, true).map_err(Errno)?;
-        // 别的进程也在用仓库：等它提交推迟的写事务（它看到这个计数之后不再推迟），之后
-        // 才能看到它的修改
+        // Another process is also using the store: wait for it to commit its deferred write
+        // transaction (after seeing this count it no longer defers); only then are its changes
+        // visible
         if store.meta.commits.users().fetch_add(1, Ordering::SeqCst) > 0 {
             store.exec("BEGIN IMMEDIATE")?;
             store.exec("COMMIT")?;
@@ -800,7 +872,8 @@ impl Store {
         Ok(store)
     }
 
-    /// 删掉上次没来得及提交就丢失的 inode 留下的 object（[`Commits::fresh`]）。
+    /// Deletes the objects left by inodes lost last time before they could be committed
+    /// ([`Commits::fresh`]).
     fn remove_lost_objects(&self) -> Result<(), Errno> {
         let (lo, hi) = self.meta.commits.fresh();
         let range = lo.load(Ordering::SeqCst)..=hi.load(Ordering::SeqCst);
@@ -816,8 +889,8 @@ impl Store {
         Ok(())
     }
 
-    /// 清空目录 `path` 的内容，目录本身保留。不存在或者不是目录（比如符号链接）时
-    /// 什么也不做。
+    /// Empties the contents of directory `path`, keeping the directory itself. Does nothing if it
+    /// does not exist or is not a directory (a symlink, for example).
     fn empty_dir(&self, path: &[u8]) -> Result<(), Errno> {
         let mut dir = ROOT;
         for name in path.split(|&b| b == b'/') {
@@ -844,7 +917,8 @@ impl Store {
         Ok(())
     }
 
-    /// 删掉上次运行留下的不挂在根目录下面的目录（[`Store::create_detached_dir`]）。
+    /// Deletes the directories left by the last run that do not hang under the root directory
+    /// ([`Store::create_detached_dir`]).
     fn remove_detached_dirs(&self) -> Result<(), Errno> {
         let roots: Vec<Ino> = {
             let mut stmt = self
@@ -872,8 +946,10 @@ impl Store {
             rows.collect::<Result<_, _>>().map_err(db_err)?
         };
         for (ino, m) in orphans {
-            // 不交给后台线程：行一删掉，编号就可能分给新建的文件，后台线程晚一点删的会是
-            // 新文件的 object。提交之前删也没关系，这些行早就没有目录项指着了
+            // Not handed to the background thread: once the row is deleted, its number may be
+            // given to a newly created file, and a background thread deleting a bit later would
+            // delete the new file's object. Deleting before the commit does no harm: no dentry has
+            // pointed at these rows for a long time
             if m & mode::S_IFMT == mode::S_IFREG {
                 self.remove_object(ino)?;
             }
@@ -899,9 +975,10 @@ impl Store {
             .map_err(db_err)?;
         db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)
             .map_err(db_err)?;
-        // 多个 appine 进程可以同时使用同一个仓库：等别人的写事务结束，而不是立即失败
+        // Several appine processes can use the same store at once: wait for others' write
+        // transactions to end instead of failing at once
         db.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
-        // 元数据操作很频繁：所有语句都只编译一次
+        // Metadata operations are very frequent: every statement is compiled only once
         db.set_prepared_statement_cache_capacity(64);
         db.execute_batch(SCHEMA).map_err(db_err)?;
         let lock = OpenOptions::new()
@@ -939,9 +1016,10 @@ impl Store {
                 .ok()
         };
         if reaper.is_some() {
-            // SAFETY: 钩子拿到的 Meta 由 Store 和后台线程一起持有；Store 的字段里 conn 最先
-            // 丢掉，连接关闭之后钩子不会再被调用。后台线程没起来时保留 SQLite 自己的
-            // 自动检查点
+            // SAFETY: the Meta the hook gets is held by both the Store and the background thread;
+            // conn is the first of the Store's fields to be dropped, and the hook is never called
+            // after the connection closes. Without a background thread, SQLite's own
+            // auto-checkpoint is kept
             unsafe {
                 ffi::sqlite3_wal_hook(
                     db.handle(),
@@ -970,11 +1048,13 @@ impl Store {
         })
     }
 
-    /// 从现在起这个仓库属于运行中的内核 `kernel`（[`crate::kernel::Shared::id`]），只能持着它的
-    /// BKL 用。检查的构建（调试构建、`borrow-check` 特性，与 [`crate::cell`] 的相同）里，不持
-    /// 这把 BKL 用数据库连接、元数据缓存就当作内核的 bug：两个线程同时用一个连接，轻则
-    /// rusqlite 的语句缓存 panic，重则 SQLite 的连接状态（rusqlite 让 SQLite 不加锁）被弄乱。
-    /// 不用撞上并发就查得出来。发布构建里什么也不做。
+    /// From now on this store belongs to running kernel `kernel` ([`crate::kernel::Shared::id`])
+    /// and may be used only while holding its BKL. In checked builds (debug builds and the
+    /// `borrow-check` feature, the same as for [`crate::cell`]), using the database connection or
+    /// the metadata cache without holding this BKL is treated as a kernel bug: two threads using
+    /// one connection at once at best make rusqlite's statement cache panic, and at worst corrupt
+    /// the SQLite connection state (rusqlite has SQLite run without locking). This catches it
+    /// without having to hit the race. In release builds it does nothing.
     pub(crate) fn guard_with_bkl(&self, kernel: usize) {
         #[cfg(any(debug_assertions, feature = "borrow-check"))]
         self.owner.store(kernel, Ordering::Relaxed);
@@ -982,7 +1062,8 @@ impl Store {
         let _ = kernel;
     }
 
-    /// 检查的构建里：属于运行中的内核时，当前线程要持着它的 BKL（[`Store::guard_with_bkl`]）。
+    /// In checked builds: when it belongs to a running kernel, the current thread must hold that
+    /// kernel's BKL ([`Store::guard_with_bkl`]).
     #[inline]
     #[track_caller]
     fn check_owner(&self) {
@@ -996,7 +1077,7 @@ impl Store {
         }
     }
 
-    /// 数据库连接。
+    /// The database connection.
     #[inline]
     #[track_caller]
     fn db(&self) -> &Connection {
@@ -1004,7 +1085,7 @@ impl Store {
         &self.conn
     }
 
-    /// 执行一条不带参数的语句（BEGIN、COMMIT、保存点），只编译一次。
+    /// Executes a statement without parameters (BEGIN, COMMIT, savepoints), compiled only once.
     fn exec(&self, sql: &str) -> Result<(), Errno> {
         self.db()
             .prepare_cached(sql)
@@ -1013,17 +1094,20 @@ impl Store {
             .map_err(db_err)
     }
 
-    /// 把 `f` 作为一个元数据操作执行：要么全部生效，要么（`f` 出错或者 panic 时）全部
-    /// 回滚。操作是推迟提交的写事务（模块文档）里的一个保存点；写事务一开始就取得写锁
-    /// （`IMMEDIATE`）：先读后写的事务在别的进程提交之后无法升级成写事务，那时
-    /// busy_timeout 也帮不上忙。已经在操作里时（导入 rootfs 时整个导入是一个操作）直接
-    /// 并入外层。
+    /// Runs `f` as one metadata operation: either all of it takes effect or (when `f` fails or
+    /// panics) all of it is rolled back. The operation is a savepoint in the deferred write
+    /// transaction (module docs); the write transaction takes the write lock right at its start
+    /// (`IMMEDIATE`): a transaction that reads first and writes later cannot be upgraded to a
+    /// write transaction after another process has committed, and busy_timeout does not help
+    /// then. When already inside an operation (importing a rootfs is one whole operation), it
+    /// joins the enclosing one.
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
         self.operation(true, f)
     }
 
-    /// 只有一条写语句的操作（改权限、属主、时间）：语句本身是原子的，失败时 SQLite 只撤销
-    /// 这一条，不需要保存点。
+    /// An operation with only one write statement (changing permissions, owner, times): the
+    /// statement itself is atomic, and on failure SQLite undoes only it, so no savepoint is
+    /// needed.
     fn statement<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
         self.operation(false, f)
     }
@@ -1033,7 +1117,8 @@ impl Store {
         savepoint: bool,
         f: impl FnOnce(&Store) -> Result<T, Errno>,
     ) -> Result<T, Errno> {
-        // 读事务里（[`Store::snapshot`]）也直接执行：和原来一样在读事务里写
+        // Inside a read transaction ([`Store::snapshot`]) it also runs directly, writing inside the
+        // read transaction as before
         if self.writing.get() || (self.pending.get().is_none() && !self.db().is_autocommit()) {
             return f(self);
         }
@@ -1067,7 +1152,8 @@ impl Store {
             op.finish(r.is_ok());
             r
         });
-        // 别的进程也在用仓库时立即提交，免得它看不到；推迟够久了也提交
+        // Commit immediately when another process is also using the store, so that it does not
+        // miss the changes; also commit once deferred long enough
         let overdue = self
             .pending
             .get()
@@ -1078,13 +1164,15 @@ impl Store {
         r
     }
 
-    /// 写事务可以推迟提交：没有别的进程在用仓库。
+    /// Write transactions may be deferred: no other process is using the store.
     fn defers(&self) -> bool {
         self.meta.commits.users().load(Ordering::Relaxed) <= 1
     }
 
-    /// 取走上次以来目录项改过（新建、删除、改名）的目录，第一次调用时开始记（App 让"文件"App
-    /// 刷新它们，android/documents 的 map）。记的是操作当时的，之后回滚了的也在里面。
+    /// Takes the directories whose dentries changed (created, removed, renamed) since the last
+    /// call; recording starts at the first call (the app has the Files app refresh them, the
+    /// android/documents map). Directories are recorded as of the operation, so ones whose changes
+    /// were later rolled back are included too.
     pub fn take_changed_dirs(&self) -> Vec<Ino> {
         let mut dirs = self.changed_dirs.borrow_mut();
         match dirs.as_mut() {
@@ -1096,12 +1184,13 @@ impl Store {
         }
     }
 
-    /// 推迟提交时叫醒 `wake`（[`Store::commit_due`]）。
+    /// Wakes `wake` when a commit is deferred ([`Store::commit_due`]).
     pub fn set_waker(&self, wake: Box<dyn Fn()>) {
         *self.waker.borrow_mut() = Some(wake);
     }
 
-    /// 到点了就提交推迟的写事务；还没到点时返回该提交的时刻。
+    /// Commits the deferred write transaction if it is due; if not yet, returns when it will be
+    /// due.
     pub fn commit_due(&self) -> Option<Instant> {
         let due = self.pending.get()? + self.delay;
         if Instant::now() < due {
@@ -1111,9 +1200,10 @@ impl Store {
         None
     }
 
-    /// 提交推迟的写事务（fsync、sync、关闭时），然后删除等着它的 object。提交失败时
-    /// 推迟的修改全部丢失：数据库回到上次提交时的状态，缓存整个清空。只写进 WAL，不等它
-    /// 落盘（[`Meta::sync_metadata`]）。
+    /// Commits the deferred write transaction (on fsync, sync, close) and then deletes the objects
+    /// waiting for it. If the commit fails, all deferred changes are lost: the database returns to
+    /// the state of the last commit, and the whole cache is cleared. Only writes into the WAL,
+    /// without waiting for it to be durable ([`Meta::sync_metadata`]).
     pub fn commit(&self) -> Result<(), Errno> {
         if self.pending.take().is_none() {
             return Ok(());
@@ -1132,9 +1222,12 @@ impl Store {
         let (lo, hi) = self.meta.commits.fresh();
         lo.store(0, Ordering::SeqCst);
         hi.store(0, Ordering::SeqCst);
-        // 计数器必须在提交之后加：之前加的话，别的进程可能赶在提交完成之前重新读到旧的
-        // 内容，再记成新的计数。计数器在这之前被别人改过，自己的缓存也整体作废。也要在交给
-        // 后台线程删除之前加：它按计数器判断这次提交落盘了没有（[`Meta::sync_metadata`]）
+        // The counter must be bumped after the commit: if bumped before, another process could
+        // reread the old content before the commit completes and record it under the new count.
+        // If someone else changed the counter before this, our own cache is invalidated as a
+        // whole too. It must also be bumped before objects are handed to the background thread
+        // for deletion: the thread judges by the counter whether this commit is durable
+        // ([`Meta::sync_metadata`])
         self.update(|c| {
             let before = self.meta.commits.bump();
             if before == c.generation {
@@ -1147,12 +1240,16 @@ impl Store {
         Ok(())
     }
 
-    /// 写事务里改名覆盖了别的文件的普通文件（[`Store::rename`]），在提交之前让它们的数据
-    /// 落盘：提交之后 WAL 随时可能被宿主写回到盘上，那时新文件的内容要已经在盘上，断电之后
-    /// 名字下面才不会是空的或者半截的文件。原生的 ext4 在改名覆盖时做同样的事
-    /// （auto_da_alloc），apk 装文件、编辑器存盘都靠它，不调 fsync；appine 的改名只在数据库
-    /// 里，宿主看不到。几个时逐个 fdatasync（先都开始写回，ext4 上合进一次日志提交），多了
-    /// 就对整个文件系统 syncfs 一次。持着 BKL，刷的时候别的进程要等。刷不了只记下来。
+    /// Makes the data of regular files in the write transaction that were renamed over other
+    /// files ([`Store::rename`]) durable before the commit: after the commit the host may write
+    /// the WAL back to disk at any time, and by then the new file's content must already be on
+    /// disk, so that after power loss the name does not hold an empty or truncated file. Native
+    /// ext4 does the same on a replacing rename (auto_da_alloc), and apk installing files and
+    /// editors saving rely on it without calling fsync; appine's renames are only in the
+    /// database, invisible to the host. A few files are fdatasynced one by one (writeback is
+    /// started for all of them first, which ext4 merges into one journal commit); for more, the
+    /// whole filesystem is syncfsed once. This holds the BKL, so other processes wait during the
+    /// flush. Failures to flush are only logged.
     fn flush_replaced(&self) {
         let mut inos = std::mem::take(&mut *self.replaced.borrow_mut());
         if inos.is_empty() {
@@ -1163,7 +1260,7 @@ impl Store {
         let r = if inos.len() > FLUSH_EACH {
             appine_hal::syncfs(self.meta.fs.as_raw_fd())
         } else {
-            // 改名之后又删掉了的打不开，不用管
+            // Files deleted after the rename cannot be opened and need no attention
             let files: Vec<File> = inos
                 .iter()
                 .filter_map(|&ino| self.open_object(ino, false).ok())
@@ -1189,8 +1286,8 @@ impl Store {
             .fetch_add(inos.len() as u64, Ordering::Relaxed);
     }
 
-    /// 改了目录 `dir` 里的名字 `name`：从自己的缓存里去掉受影响的条目。别的进程的缓存
-    /// 在提交时作废（[`Store::commit`]）。
+    /// Name `name` in directory `dir` changed: removes the affected entries from our own cache.
+    /// Other processes' caches are invalidated at commit ([`Store::commit`]).
     fn touch_name(&self, dir: Ino, name: &[u8]) {
         self.fills
             .borrow_mut()
@@ -1204,7 +1301,7 @@ impl Store {
         });
     }
 
-    /// 操作成功之后把 `fill` 放进缓存。
+    /// Puts `fill` into the cache after the operation succeeds.
     fn fill(&self, fill: Fill) {
         let mut fills = self.fills.borrow_mut();
         if fills.len() < Fill::MAX {
@@ -1212,7 +1309,7 @@ impl Store {
         }
     }
 
-    /// 改了 inode `ino` 的行（同上）。
+    /// The row of inode `ino` changed (as above).
     fn touch_ino(&self, ino: Ino) {
         self.fills
             .borrow_mut()
@@ -1224,15 +1321,17 @@ impl Store {
         });
     }
 
-    /// 读缓存。只有 Store 的方法改缓存，它们自己读不必加锁（[`Meta`]）。
+    /// Reads the cache. Only Store's methods change the cache, so they need no lock to read it
+    /// themselves ([`Meta`]).
     fn cached<R>(&self, f: impl FnOnce(&Cache) -> R) -> R {
         self.check_owner();
-        // SAFETY: Store 不是 Sync，别的线程不会同时修改；f 不回调 Store 的方法，借用不会
-        // 与 update 的重叠
+        // SAFETY: Store is not Sync, so no other thread modifies it at the same time; f does not
+        // call back into Store's methods, so the borrow does not overlap with update's
         f(unsafe { &*self.meta.cache.get() })
     }
 
-    /// 改缓存：持有写锁，等不持 BKL 读缓存的线程读完。
+    /// Changes the cache: holds the write lock, waiting for threads reading the cache without the
+    /// BKL to finish.
     fn update<R>(&self, f: impl FnOnce(&mut Cache) -> R) -> R {
         self.check_owner();
         let _guard = self
@@ -1240,16 +1339,18 @@ impl Store {
             .lock
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: 持有写锁，没有别的线程在读；f 不回调 Store 的方法
+        // SAFETY: the write lock is held, so no other thread is reading; f does not call back into
+        // Store's methods
         f(unsafe { &mut *self.meta.cache.get() })
     }
 
-    /// 不持 BKL 读缓存要用的部分（[`Meta`]）。
+    /// The part needed to read the cache without the BKL ([`Meta`]).
     pub(crate) fn meta(&self) -> &Arc<Meta> {
         &self.meta
     }
 
-    /// 缓存没命中、要查数据库之前调用：在 [`Store::snapshot`] 里时，第一次查询开始读事务。
+    /// Called on a cache miss, before querying the database: inside [`Store::snapshot`], the
+    /// first query starts the read transaction.
     fn begin_read(&self) -> Result<(), Errno> {
         if self.snapshot_at.get() == Some(None) {
             self.snapshot_at.set(Some(Some(self.meta.commits.get())));
@@ -1258,13 +1359,14 @@ impl Store {
         Ok(())
     }
 
-    /// 缓存是现在的（读缓存之前已经清空过旧的）：操作成功之后往里填它新建的东西用。
+    /// The cache is current (stale content was cleared before the cache was read): used to fill in
+    /// what an operation created after it succeeds.
     fn cache_generation_any(&self) -> bool {
         self.cached(|c| c.generation) == self.meta.commits.get()
     }
 
-    /// 读缓存之前调用：缓存是旧的就先清空。查到的能填进缓存时（不在操作里）返回现在的
-    /// 提交计数。
+    /// Called before reading the cache: clears it first if it is stale. Returns the current commit
+    /// count when query results may be filled into the cache (not inside an operation).
     fn cache_generation(&self) -> Option<u64> {
         let now = self.meta.commits.get();
         if self.cached(|c| c.generation != now || c.entries > Cache::MAX_ENTRIES) {
@@ -1273,8 +1375,9 @@ impl Store {
         (!self.writing.get()).then_some(now)
     }
 
-    /// 刚查到的结果能不能放进缓存：读事务开始以来、以及这次查询期间都没有人提交过
-    /// （否则查到的可能比 `generation` 旧）。
+    /// Whether a result just queried may go into the cache: nobody has committed since the read
+    /// transaction began, nor during this query (otherwise the result may be older than
+    /// `generation`).
     fn may_fill(&self, generation: u64) -> bool {
         self.snapshot_at
             .get()
@@ -1283,10 +1386,12 @@ impl Store {
             && self.meta.commits.get() == generation
     }
 
-    /// 在一个读事务里执行 `f`，里面的查询看到同一个快照，并且共用一次加锁：WAL 模式下
-    /// 每条语句单独开、关读事务都要 fcntl 加解锁并检查文件长度，逐级解析一个路径时
-    /// 这比查询本身还贵。读事务在缓存第一次没命中时才开始，全部命中时不碰数据库。
-    /// 已经在事务里时直接执行。
+    /// Runs `f` in one read transaction, whose queries see the same snapshot and share one round
+    /// of locking: in WAL mode, every statement opening and closing its own read transaction takes
+    /// and releases fcntl locks and checks the file length, which costs more than the query itself
+    /// when a path is resolved level by level. The read transaction starts only at the first cache
+    /// miss, and when everything hits the database is not touched. Runs `f` directly when already
+    /// in a transaction.
     pub fn snapshot<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
         if !self.db().is_autocommit() || self.snapshot_at.get().is_some() {
             return f(self);
@@ -1294,14 +1399,15 @@ impl Store {
         self.snapshot_at.set(Some(None));
         let r = f(self);
         if self.snapshot_at.get().flatten().is_some() {
-            // 只读的事务提交只是释放读锁
+            // Committing a read-only transaction only releases the read lock
             let _ = self.exec(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
         self.snapshot_at.set(None);
         r
     }
 
-    /// 打开 object（相对 `objects` 目录，不解析整个路径），`flags` 是宿主 open 的标志。
+    /// Opens an object (relative to the `objects` directory, without resolving the whole path);
+    /// `flags` are host open flags.
     fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
         let mut name = [0u8; 21];
         let dir = self.meta.objects_dir.as_raw_fd();
@@ -1309,9 +1415,9 @@ impl Store {
             .map_err(|e| object_err(ino, e))
     }
 
-    /// 数据库里改了 inode `ino` 的元数据：是普通文件的话 chmod 一下 object，宿主更新它
-    /// 的 ctime（见模块的说明）。object 不在了（删除之后还打开着）或者改不了时不管，
-    /// ctime 只是没有更新。
+    /// The database changed the metadata of inode `ino`: for a regular file, chmod the object so
+    /// that the host updates its ctime (see the module docs). Ignored if the object is gone (still
+    /// open after deletion) or cannot be changed; the ctime is then just not updated.
     fn object_changed(&self, ino: Ino) {
         if self.kind(ino) == Ok(mode::S_IFREG) {
             let mut name = [0u8; 21];
@@ -1320,12 +1426,13 @@ impl Store {
         }
     }
 
-    /// 删除 object；它已经不在时不算错误。
+    /// Deletes an object; not an error if it is already gone.
     fn remove_object(&self, ino: Ino) -> Result<(), Errno> {
         remove_object(&self.meta.objects_dir, ino)
     }
 
-    /// 把 object 交给后台线程删除；线程没有建起来时自己删。
+    /// Hands objects to the background thread for deletion; deletes them itself when the thread
+    /// was not started.
     fn reap_later(&self, inos: Vec<Ino>) {
         if inos.is_empty() {
             return;
@@ -1348,7 +1455,7 @@ impl Store {
         r.work.notify_one();
     }
 
-    /// 在目录 `parent` 里查找 `name`。
+    /// Looks up `name` in directory `parent`.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.dentries.get(&parent)?.get(name).copied()) {
@@ -1373,8 +1480,8 @@ impl Store {
         Ok(found)
     }
 
-    /// 目录 `parent` 里指向 `ino` 的一个名字（getcwd 用；打开相对路径时也要算出绝对路径，
-    /// 见 `syscall::fs` 的 `display_path`，所以要缓存）。
+    /// One name in directory `parent` pointing at `ino` (for getcwd; opening a relative path also
+    /// needs the absolute path, see `display_path` in `syscall::fs`, hence the caching).
     pub fn name_of(&self, parent: Ino, ino: Ino) -> Result<Option<Vec<u8>>, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.names.get(&parent)?.get(&ino).cloned()) {
@@ -1401,7 +1508,7 @@ impl Store {
         Ok(found)
     }
 
-    /// 读取元数据。普通文件的 size 和 mtime 取自宿主 object 文件。
+    /// Reads metadata. A regular file's size and mtime are taken from the host object file.
     pub fn stat(&self, ino: Ino) -> Result<Stat, Errno> {
         let mut st = self.stat_row(ino)?;
         if st.kind() == mode::S_IFREG {
@@ -1410,24 +1517,27 @@ impl Store {
         Ok(st)
     }
 
-    /// 已打开的普通文件的元数据：size 和 mtime 取自打开的 object，文件被删除之后也能用。
+    /// Metadata of an open regular file: size and mtime are taken from the open object, which also
+    /// works after the file is deleted.
     pub fn stat_open(&self, ino: Ino, file: &File) -> Result<Stat, Errno> {
         let mut st = self.stat_row(ino)?;
         fill_from_object(&mut st, &file.metadata().map_err(io_err)?);
         Ok(st)
     }
 
-    /// 数据库里的元数据（不碰宿主，普通文件的 size、时间没有填）：打开文件时检查权限用。
+    /// Metadata in the database (without touching the host; a regular file's size and times are
+    /// not filled in): for permission checks when opening a file.
     pub fn attrs(&self, ino: Ino) -> Result<Stat, Errno> {
         self.stat_row(ino)
     }
 
-    /// 文件类型位（不需要读 object，删除之后仍然打开着的文件也能用）。
+    /// File type bits (no need to read the object; also works for files still open after
+    /// deletion).
     pub fn kind(&self, ino: Ino) -> Result<u32, Errno> {
         Ok(self.stat_row(ino)?.kind())
     }
 
-    /// 数据库里的元数据（普通文件的 size、mtime 还没有填）。
+    /// Metadata in the database (a regular file's size and mtime are not filled in yet).
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.rows.get(&ino).copied()) {
@@ -1484,7 +1594,7 @@ impl Store {
         })
     }
 
-    /// 读取符号链接的目标。
+    /// Reads a symlink's target.
     pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.targets.get(&ino).cloned()) {
@@ -1508,7 +1618,7 @@ impl Store {
         Ok(target)
     }
 
-    /// 目录的上级目录；根目录的上级是它自己。
+    /// A directory's parent directory; the root directory's parent is itself.
     pub fn parent(&self, dir: Ino) -> Result<Ino, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.parents.get(&dir).copied()) {
@@ -1531,7 +1641,7 @@ impl Store {
         Ok(parent)
     }
 
-    /// 列出目录内容，按名字排序，不含 `.` 和 `..`。
+    /// Lists a directory's contents, sorted by name, without `.` and `..`.
     pub fn readdir(&self, dir: Ino) -> Result<Vec<DirEntry>, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.listings.get(&dir).cloned()) {
@@ -1563,12 +1673,13 @@ impl Store {
         Ok(list)
     }
 
-    /// 打开普通文件的 object。
+    /// Opens a regular file's object.
     pub fn open_object(&self, ino: Ino, write: bool) -> Result<File, Errno> {
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
-    /// 打开普通文件的 object 读写，`append` 时以 `O_APPEND` 打开（宿主浏览仓库时写入用）。
+    /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
+    /// writes when the host browses the store).
     pub fn open_object_append(&self, ino: Ino, append: bool) -> Result<File, Errno> {
         let append = if append { libc::O_APPEND } else { 0 };
         self.object(ino, libc::O_RDWR | append)
@@ -1620,8 +1731,8 @@ impl Store {
         if !dir.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        // 已经删除的目录（还是谁的当前目录，或者还打开着）里不能新建：Linux 的 may_create
-        // 看到 IS_DEADDIR 返回 ENOENT
+        // Nothing can be created in a deleted directory (still someone's cwd, or still open):
+        // Linux's may_create returns ENOENT on seeing IS_DEADDIR
         if dir.nlink == 0 {
             return Err(Errno::ENOENT);
         }
@@ -1634,9 +1745,10 @@ impl Store {
         self.dir_changed(parent)
     }
 
-    /// 目录 `dir` 里的名字变了：它的 mtime、ctime 改成现在，和 Linux 的新建、删除、改名
-    /// 一样（Python 的 import、Maildir、git 按目录的 mtime 发现变化）。缓存里放新的行：
-    /// 路径解析每一级都要读目录的行。
+    /// The names in directory `dir` changed: its mtime and ctime become now, as with Linux's
+    /// create, delete and rename (Python's import, Maildir and git detect changes by directory
+    /// mtime). The new row goes into the cache: path resolution reads the directory's row at every
+    /// level.
     fn dir_changed(&self, dir: Ino) -> Result<(), Errno> {
         if let Some(dirs) = self.changed_dirs.borrow_mut().as_mut()
             && dirs.len() < MAX_CHANGED_DIRS
@@ -1655,7 +1767,7 @@ impl Store {
         Ok(())
     }
 
-    /// 新建目录。
+    /// Creates a directory.
     pub fn mkdir(
         &self,
         parent: Ino,
@@ -1679,7 +1791,7 @@ impl Store {
         })
     }
 
-    /// 新建空的普通文件，返回可读写的 object。
+    /// Creates an empty regular file, returning its object open for reading and writing.
     pub fn create_file(
         &self,
         parent: Ino,
@@ -1694,20 +1806,22 @@ impl Store {
             }
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 1, 0)?;
             s.add_dentry(parent, name, ino)?;
-            // 最后建 object：失败时整个操作回滚，不留下没有 object 的 inode
+            // Create the object last: on failure the whole operation rolls back, leaving no inode
+            // without an object
             let file = s.new_object(ino)?;
             Ok((ino, file))
         })
     }
 
-    /// 为新的 inode 建空的 object。已经有的话是没来得及提交就丢失的 inode 留下的
-    /// （inode 编号又分配了出来），清空后接着用。
+    /// Creates an empty object for a new inode. An existing one was left by an inode lost before
+    /// it could be committed (the inode number was allocated again), and is emptied and reused.
     fn new_object(&self, ino: Ino) -> Result<File, Errno> {
         self.object(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
     }
 
-    /// 新建一个不挂在根目录下面的目录（tmpfs 的根）：上级是它自己，记在 `detached_roots`
-    /// 里，[`Store::remove_detached_dir`] 或者下次开机时连同里面的一起删掉。
+    /// Creates a directory that does not hang under the root directory (a tmpfs root): its parent
+    /// is itself, it is recorded in `detached_roots`, and [`Store::remove_detached_dir`] or the
+    /// next boot deletes it along with everything in it.
     pub fn create_detached_dir(&self, perm: u32, uid: u32, gid: u32) -> Result<Ino, Errno> {
         self.transaction(|s| {
             let ino = s.new_inode(mode::S_IFDIR | (perm & 0o7777), uid, gid, 2, 0)?;
@@ -1724,8 +1838,9 @@ impl Store {
         })
     }
 
-    /// 删掉不挂在根目录下面的目录 `dir` 和里面的一切（tmpfs 卸下了）。与 unlink 一样，
-    /// 还打开着、映射着的文件照常能用，inode 的行留到下次开机。
+    /// Deletes directory `dir`, which does not hang under the root directory, and everything in it
+    /// (the tmpfs was unmounted). As with unlink, files still open or mapped keep working as usual,
+    /// and the inode rows stay until the next boot.
     pub fn remove_detached_dir(&self, dir: Ino) -> Result<(), Errno> {
         self.transaction(|s| {
             if s.stat_row(dir).is_ok_and(|st| st.nlink > 0) {
@@ -1744,8 +1859,9 @@ impl Store {
         })
     }
 
-    /// 新建一个没有名字的普通文件（memfd_create）：链接数为 0，object 一开始就删除，
-    /// 关闭之后数据随之消失，inode 在下次打开仓库时清理。
+    /// Creates a regular file without a name (memfd_create): its link count is 0 and its object is
+    /// deleted from the start, so the data goes away once it is closed; the inode is cleaned up
+    /// the next time the store is opened.
     pub fn create_anonymous(&self, perm: u32) -> Result<(Ino, File), Errno> {
         self.transaction(|s| {
             let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), 0, 0, 0, 0)?;
@@ -1755,7 +1871,7 @@ impl Store {
         })
     }
 
-    /// 新建符号链接。
+    /// Creates a symbolic link.
     pub fn symlink(
         &self,
         parent: Ino,
@@ -1779,7 +1895,7 @@ impl Store {
         })
     }
 
-    /// 新建设备节点、FIFO 或 socket 文件；它们只存在于数据库里。
+    /// Creates a device node, FIFO or socket file; these exist only in the database.
     pub fn mknod(
         &self,
         parent: Ino,
@@ -1804,7 +1920,7 @@ impl Store {
         })
     }
 
-    /// 给已有的非目录 inode 增加一个硬链接。
+    /// Adds a hard link to an existing non-directory inode.
     pub fn link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         self.transaction(|s| {
             if s.stat_row(ino)?.is_dir() {
@@ -1821,7 +1937,7 @@ impl Store {
         })
     }
 
-    /// 修改权限位（保留类型位）。
+    /// Changes the permission bits (keeping the type bits).
     pub fn set_mode(&self, ino: Ino, perm: u32) -> Result<(), Errno> {
         self.statement(|s| {
             let n = s
@@ -1840,8 +1956,9 @@ impl Store {
         })
     }
 
-    /// 修改属主和属组；`None` 表示不变。普通文件同时清除 setuid 位，组可执行时还清除
-    /// setgid 位（Linux 对 root 也这样做）。
+    /// Changes the owner and group; `None` means unchanged. For regular files the setuid bit is
+    /// cleared as well, and the setgid bit when the file is group-executable (Linux does this for
+    /// root too).
     pub fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
         let st = self.stat_row(ino)?;
         let mut perm = st.mode & 0o7777;
@@ -1852,7 +1969,8 @@ impl Store {
             }
         }
         self.transaction(|s| {
-            // 与 Linux 的 chown_common 一样，不是目录的还去掉文件能力（ATTR_KILL_PRIV）
+            // As in Linux's chown_common, non-directories also lose their file capabilities
+            // (ATTR_KILL_PRIV)
             if !st.is_dir() && s.has_file_caps(ino)? {
                 s.remove_xattr(ino, XATTR_NAME_CAPS)?;
             }
@@ -1860,9 +1978,10 @@ impl Store {
         })
     }
 
-    /// 写、截短普通文件之前去掉它的特权（Linux 的 `file_remove_privs`）：没有 `CAP_FSETID`
-    /// （`keep_setid` 为 false）时去掉 setuid 位，和带着组执行位时的 setgid 位；不论谁写都
-    /// 去掉文件能力。没有可去掉的时候不碰数据库。
+    /// Removes a regular file's privileges before it is written or truncated (Linux's
+    /// `file_remove_privs`): without `CAP_FSETID` (`keep_setid` false), removes the setuid bit,
+    /// and the setgid bit when the group execute bit is set; file capabilities are removed
+    /// whoever writes. Does not touch the database when there is nothing to remove.
     pub fn remove_privs(&self, ino: Ino, keep_setid: bool) -> Result<(), Errno> {
         let st = self.stat_row(ino)?;
         if st.kind() != mode::S_IFREG {
@@ -1887,7 +2006,8 @@ impl Store {
         })
     }
 
-    /// inode `ino` 有没有文件能力（`security.capability`）：查的是缓存的整个集合。
+    /// Whether inode `ino` has file capabilities (`security.capability`): looked up in the whole
+    /// cached set.
     pub fn has_file_caps(&self, ino: Ino) -> Result<bool, Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.file_caps.as_ref().map(|m| m.contains_key(&ino))) {
@@ -1913,12 +2033,12 @@ impl Store {
         Ok(hit)
     }
 
-    /// 改了文件能力：作废缓存的集合。
+    /// File capabilities changed: invalidates the cached set.
     fn touch_file_caps(&self) {
         self.update(|c| c.file_caps = None);
     }
 
-    /// 目录是否为空。
+    /// Whether a directory is empty.
     fn is_empty_dir(&self, dir: Ino) -> Result<bool, Errno> {
         let n: i64 = self
             .db()
@@ -1928,7 +2048,8 @@ impl Store {
         Ok(n == 0)
     }
 
-    /// 删除一个指向非目录的目录项；最后一个链接消失时普通文件的 object 一起删除。
+    /// Removes a dentry pointing at a non-directory; when the last link goes, a regular file's
+    /// object is deleted along with it.
     fn remove_link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         self.db()
             .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
@@ -1943,7 +2064,8 @@ impl Store {
         self.dir_changed(parent)?;
         let st = self.stat_row(ino)?;
         if st.nlink == 0 && st.kind() == mode::S_IFREG {
-            // 提交之后再删：提交之前 App 被杀掉的话，目录项还在，object 也得在
+            // Deleted after the commit: if the app is killed before the commit, the dentry is
+            // still there, so the object must be too
             self.doomed.borrow_mut().push(ino);
         } else {
             self.object_changed(ino);
@@ -1951,7 +2073,7 @@ impl Store {
         Ok(())
     }
 
-    /// 删除一个空目录的目录项。
+    /// Removes the dentry of an empty directory.
     fn remove_dir(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         if !self.is_empty_dir(ino)? {
             return Err(Errno::ENOTEMPTY);
@@ -1974,7 +2096,7 @@ impl Store {
         self.dir_changed(parent)
     }
 
-    /// unlink(2)：删除一个非目录的目录项。
+    /// unlink(2): removes a dentry of a non-directory.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> Result<(), Errno> {
         let ino = self.lookup(parent, name)?.ok_or(Errno::ENOENT)?;
         if self.stat_row(ino)?.is_dir() {
@@ -1983,7 +2105,7 @@ impl Store {
         self.transaction(|s| s.remove_link(parent, name, ino))
     }
 
-    /// rmdir(2)：删除一个空目录。
+    /// rmdir(2): removes an empty directory.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> Result<(), Errno> {
         let ino = self.lookup(parent, name)?.ok_or(Errno::ENOENT)?;
         if !self.stat_row(ino)?.is_dir() {
@@ -1995,8 +2117,8 @@ impl Store {
         self.transaction(|s| s.remove_dir(parent, name, ino))
     }
 
-    /// `ancestor` 是不是 `dir` 本身或者它的上级目录。根目录和不挂在根目录下面的目录的
-    /// 上级是它自己。
+    /// Whether `ancestor` is `dir` itself or one of its ancestor directories. The parent of the
+    /// root directory and of directories not under the root directory is itself.
     fn is_ancestor(&self, ancestor: Ino, mut dir: Ino) -> Result<bool, Errno> {
         loop {
             if dir == ancestor {
@@ -2010,7 +2132,8 @@ impl Store {
         }
     }
 
-    /// 把目录 `dir` 从 `from` 挪到 `to` 下面时更新 `..` 和两边的链接数。
+    /// Updates `..` and the link counts on both sides when directory `dir` moves from under `from`
+    /// to under `to`.
     fn reparent_dir(&self, dir: Ino, from: Ino, to: Ino) -> Result<(), Errno> {
         if from == to {
             return Ok(());
@@ -2043,14 +2166,15 @@ impl Store {
         Ok(())
     }
 
-    /// 改名改了两个目录（[`Store::dir_changed`]），同一个目录只改一次。
+    /// A rename changed two directories ([`Store::dir_changed`]); the same directory is changed
+    /// only once.
     fn dirs_changed(&self, a: Ino, b: Ino) -> Result<(), Errno> {
         self.dir_changed(a)?;
         if b != a { self.dir_changed(b) } else { Ok(()) }
     }
 
-    /// rename(2)/renameat2(2)：`noreplace` 是 `RENAME_NOREPLACE`，`exchange` 是
-    /// `RENAME_EXCHANGE`。整个操作在一个事务里完成。
+    /// rename(2)/renameat2(2): `noreplace` is `RENAME_NOREPLACE`, `exchange` is
+    /// `RENAME_EXCHANGE`. The whole operation is done in one transaction.
     pub fn rename(
         &self,
         old_dir: Ino,
@@ -2091,7 +2215,7 @@ impl Store {
                 if noreplace {
                     return Err(Errno::EEXIST);
                 }
-                // 两个名字指向同一个 inode（硬链接）：什么都不做
+                // The two names point at the same inode (hard links): do nothing
                 if d == src {
                     return Ok(());
                 }
@@ -2114,7 +2238,8 @@ impl Store {
                 } else {
                     s.remove_link(new_dir, new_name, d)?;
                 }
-                // 普通文件改名覆盖了别的文件：提交之前让它的数据落盘
+                // A regular file renamed over another file: make its data durable before the
+                // commit
                 if s.stat_row(src)?.kind() == mode::S_IFREG {
                     s.replaced.borrow_mut().push(src);
                 }
@@ -2133,17 +2258,17 @@ impl Store {
         })
     }
 
-    /// 截断普通文件。
+    /// Truncates a regular file.
     pub fn truncate(&self, ino: Ino, len: u64) -> Result<(), Errno> {
         self.open_object(ino, true)?.set_len(len).map_err(io_err)
     }
 
-    /// 仓库所在的宿主文件系统的容量（statfs 报告给 guest）。
+    /// The capacity of the host filesystem the store is on (reported to the guest by statfs).
     pub fn fs_stats(&self) -> Result<appine_hal::FsStats, Errno> {
         appine_hal::statvfs(&self.objects).map_err(Errno)
     }
 
-    /// 修改权限位、属主和属组（保留类型位）。
+    /// Changes the permission bits, owner and group (keeping the type bits).
     pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
         self.statement(|s| {
             s.db().prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
@@ -2155,8 +2280,8 @@ impl Store {
         })
     }
 
-    /// 设置扩展属性。`create`（`XATTR_CREATE`）时已经存在则失败，`replace`
-    /// （`XATTR_REPLACE`）时不存在则失败。
+    /// Sets an extended attribute. With `create` (`XATTR_CREATE`) it fails if the attribute
+    /// exists, with `replace` (`XATTR_REPLACE`) if it does not.
     pub fn set_xattr(
         &self,
         ino: Ino,
@@ -2186,7 +2311,7 @@ impl Store {
         })
     }
 
-    /// 读取扩展属性；没有时返回 ENODATA。
+    /// Reads an extended attribute; ENODATA if there is none.
     pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> Result<Vec<u8>, Errno> {
         self.db()
             .prepare_cached("SELECT value FROM xattrs WHERE ino = ?1 AND name = ?2")
@@ -2196,7 +2321,7 @@ impl Store {
             .ok_or(Errno::ENODATA)
     }
 
-    /// 所有扩展属性的名字。
+    /// The names of all extended attributes.
     pub fn list_xattr(&self, ino: Ino) -> Result<Vec<Vec<u8>>, Errno> {
         let mut stmt = self
             .db()
@@ -2206,7 +2331,7 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db_err)
     }
 
-    /// 删除扩展属性；没有时返回 ENODATA。
+    /// Removes an extended attribute; ENODATA if there is none.
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> Result<(), Errno> {
         self.transaction(|s| {
             let n = s
@@ -2234,13 +2359,15 @@ impl Store {
         Ok(())
     }
 
-    /// 设置修改时间：普通文件改宿主 object 的 mtime，其余改数据库。
+    /// Sets the modification time: the host object's mtime for regular files, the database for
+    /// the rest.
     pub fn set_mtime(&self, ino: Ino, mtime_ns: i64) -> Result<(), Errno> {
         self.set_times(ino, None, Some(FileTime::At(mtime_ns)))
     }
 
-    /// 设置访问时间和修改时间（None 表示不改）。普通文件改宿主 object 的时间；其余的
-    /// 只记录修改时间，访问时间跟着它。ctime 都改成现在（普通文件的是 object 的）。
+    /// Sets the access and modification times (None means unchanged). For regular files the host
+    /// object's times change; the rest record only the modification time, and the access time
+    /// follows it. ctime always becomes now (for regular files, the object's).
     pub fn set_times(
         &self,
         ino: Ino,
@@ -2273,8 +2400,8 @@ impl Store {
         })
     }
 
-    /// 经由打开的 object 设置普通文件 `ino` 的访问时间和修改时间：文件删除之后（object
-    /// 已经删了）也能用。
+    /// Sets the access and modification times of regular file `ino` through its open object: also
+    /// works after the file is deleted (when the object has already been deleted).
     pub fn set_times_open(
         &self,
         ino: Ino,
@@ -2291,13 +2418,14 @@ impl Store {
     }
 }
 
-/// 纳秒数拆成 (秒, 纳秒)。
+/// Splits nanoseconds into (seconds, nanoseconds).
 fn split_ns(ns: i64) -> (i64, i64) {
     (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
 }
 
-/// [`Store::transaction`] 里的一个操作：没有正常结束（出错或者 panic）时回滚到它的
-/// 保存点，撤销它要删除的 object。没有保存点的（[`Store::statement`]）只清掉"在操作里"。
+/// An operation in [`Store::transaction`]: when it does not finish normally (an error or a panic),
+/// it rolls back to its savepoint and cancels the object deletions it queued. One without a
+/// savepoint ([`Store::statement`]) only clears "inside an operation".
 struct Op<'a> {
     store: &'a Store,
     savepoint: bool,
@@ -2344,7 +2472,8 @@ impl Drop for Op<'_> {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // 内核已经没了（最后一个 Arc<Shared> 丢掉了），没有别的线程能用它
+        // The kernel is already gone (the last Arc<Shared> was dropped), so no other thread can
+        // use it
         #[cfg(any(debug_assertions, feature = "borrow-check"))]
         self.owner.store(0, Ordering::Relaxed);
         if let Err(e) = self.commit() {
@@ -2366,7 +2495,7 @@ mod tests {
     use std::io::Write;
 
     impl Store {
-        /// 等后台线程删完交给它的 object。
+        /// Waits for the background thread to finish deleting the objects handed to it.
         fn reaped(&self) {
             let r = &self.meta.reaper;
             let mut st = r.state.lock().unwrap();
@@ -2375,8 +2504,9 @@ mod tests {
             }
         }
 
-        /// 模拟进程在提交之前被杀掉：推迟的修改丢失，等着删除的 object 留着，`lock` 里
-        /// 新分配的 inode 编号范围也留着。
+        /// Simulates the process being killed before committing: the deferred changes are lost,
+        /// the objects waiting for deletion stay, and so does the range of newly allocated inode
+        /// numbers in `lock`.
         fn crash(self) {
             let _ = self.exec("ROLLBACK");
             self.pending.set(None);
@@ -2389,13 +2519,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("appine-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut s = Store::create(&dir).unwrap();
-        // 推迟的写事务只在测试自己提交时才提交，与机器快慢无关
+        // Deferred write transactions are committed only when the test commits them itself,
+        // regardless of how fast the machine is
         s.delay = Duration::from_secs(3600);
         (s, dir)
     }
 
-    /// 属于运行中的内核的仓库（[`Store::guard_with_bkl`]）只能持着那个内核的 BKL 用：不持、
-    /// 持着别的内核的都当作 bug，不用撞上并发就查得出来（第 193 轮那次语句缓存的 panic）。
+    /// A store belonging to a running kernel ([`Store::guard_with_bkl`]) may be used only while
+    /// holding that kernel's BKL: using it without holding it, or while holding another kernel's,
+    /// is treated as a bug, caught without having to hit the race (the statement-cache panic of
+    /// round 193).
     #[test]
     fn a_running_kernels_store_needs_its_bkl() {
         use crate::kernel::{Kernel, Shared};
@@ -2409,7 +2542,8 @@ mod tests {
             }))
             .is_ok()
         };
-        // 还不属于内核（开机之前，"文件"App 另外打开的）时谁都能用
+        // Before it belongs to a kernel (before boot, or opened separately by the Files app),
+        // anyone may use it
         assert!(used(&s));
         s.guard_with_bkl(a.id());
         assert!(!used(&s));
@@ -2421,7 +2555,7 @@ mod tests {
             let _k = a.lock();
             assert!(used(&s));
         }
-        // 丢掉时不检查：内核已经没了，没有别的线程能用它
+        // No check on drop: the kernel is already gone, so no other thread can use it
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2429,7 +2563,7 @@ mod tests {
     #[test]
     fn cache_follows_own_and_other_processes_writes() {
         let (a, dir) = temp_store("cache");
-        // 第二个连接相当于另一个 appine 进程
+        // A second connection stands in for another appine process
         let b = Store::open(&dir, &[]).unwrap();
         let names = |s: &Store| -> Vec<Vec<u8>> {
             s.readdir(ROOT)
@@ -2438,7 +2572,8 @@ mod tests {
                 .map(|e| e.name)
                 .collect()
         };
-        // 自己的写入：缓存里的"不存在"、属性和目录列表随之更新
+        // Our own writes: "does not exist", attributes and directory listings in the cache are
+        // updated accordingly
         assert_eq!(a.lookup(ROOT, b"f").unwrap(), None);
         assert!(names(&a).is_empty());
         let (f, _) = a.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
@@ -2450,7 +2585,7 @@ mod tests {
         a.rename(ROOT, b"f", ROOT, b"g", false, false).unwrap();
         assert_eq!(a.lookup(ROOT, b"f").unwrap(), None);
         assert_eq!(a.lookup(ROOT, b"g").unwrap(), Some(f));
-        // 别的进程的写入：计数器变了，整个缓存作废
+        // Another process's writes: the counter changed, so the whole cache is invalidated
         assert_eq!(b.lookup(ROOT, b"g").unwrap(), Some(f));
         assert_eq!(b.stat(f).unwrap().nlink, 1);
         a.link(ROOT, b"h", f).unwrap();
@@ -2461,7 +2596,8 @@ mod tests {
         let d = b.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap();
         assert_eq!(a.lookup(ROOT, b"d").unwrap(), Some(d));
         assert_eq!(a.stat(ROOT).unwrap().nlink, 3);
-        // 读事务里的查询同样走缓存，读事务之外的写入随后可见
+        // Queries in a read transaction go through the cache too, and writes outside the read
+        // transaction become visible afterwards
         a.snapshot(|s| {
             assert_eq!(s.lookup(ROOT, b"h")?, Some(f));
             assert_eq!(s.parent(d)?, ROOT);
@@ -2522,7 +2658,8 @@ mod tests {
         file.write_all(b"data").unwrap();
         s.link(ROOT, b"g", f).unwrap();
 
-        // 目录不能挪进自己的子目录；非目录不能覆盖目录
+        // A directory cannot be moved into its own subdirectory; a non-directory cannot replace a
+        // directory
         assert_eq!(
             s.rename(ROOT, b"a", b, b"x", false, false),
             Err(Errno::EINVAL)
@@ -2535,11 +2672,11 @@ mod tests {
             s.rename(ROOT, b"g", a, b"f", true, false),
             Err(Errno::EEXIST)
         );
-        // 同一个 inode 的两个名字之间 rename 什么都不做
+        // rename between two names of the same inode does nothing
         s.rename(ROOT, b"g", a, b"f", false, false).unwrap();
         assert_eq!(s.stat(f).unwrap().nlink, 2);
 
-        // 目录换了上级：.. 和两边的链接数都要更新
+        // A directory gets a new parent: .. and the link counts on both sides must be updated
         s.rename(a, b"b", ROOT, b"b", false, false).unwrap();
         assert_eq!(s.parent(b).unwrap(), ROOT);
         assert_eq!(
@@ -2550,7 +2687,8 @@ mod tests {
         assert_eq!(s.lookup(a, b"f").unwrap(), Some(b));
         assert_eq!(s.lookup(ROOT, b"b").unwrap(), Some(f));
 
-        // 删除最后一个链接：打开的文件仍然可读、可 fstat，重新打开仓库后才真正清理
+        // Removing the last link: the open file can still be read and fstat-ed; it is really
+        // cleaned up only after the store is reopened
         assert_eq!(s.rmdir(ROOT, b"a"), Err(Errno::ENOTEMPTY));
         s.unlink(ROOT, b"g").unwrap();
         s.unlink(ROOT, b"b").unwrap();
@@ -2573,7 +2711,7 @@ mod tests {
             let st = s.stat(ino).unwrap();
             (st.mtime_ns, st.ctime_ns)
         };
-        // 隔开一点再改：宿主的文件时间用的是粗粒度的时钟
+        // Change things with a short pause in between: the host's file times use a coarse clock
         let tick = || std::thread::sleep(Duration::from_millis(20));
         let newer = |ino: Ino, (m, c): (i64, i64), op: &mut dyn FnMut()| {
             tick();
@@ -2583,7 +2721,8 @@ mod tests {
         };
         let a = s.mkdir(ROOT, b"a", 0o755, 0, 0).unwrap();
         let b = s.mkdir(ROOT, b"b", 0o755, 0, 0).unwrap();
-        // 目录里新建、改名、删除都改它的 mtime 和 ctime，改名时两边的目录都改
+        // Creating, renaming and deleting in a directory all change its mtime and ctime; a rename
+        // changes the directories on both sides
         let mut created = None;
         let op = &mut || created = Some(s.create_file(a, b"f", 0o644, 0, 0).unwrap());
         assert_eq!(newer(a, times(a), op), (true, true));
@@ -2598,7 +2737,8 @@ mod tests {
         assert_eq!(newer(b, times(b), op), (true, true));
         let op = &mut || s.rmdir(ROOT, b"a").unwrap();
         assert_eq!(newer(ROOT, times(ROOT), op), (true, true));
-        // 普通文件：写、截断改的是 object，ctime 也跟着变；chmod 只改 ctime
+        // Regular file: write and truncate change the object, and the ctime follows; chmod changes
+        // only the ctime
         let op = &mut || file.write_all(b"data").unwrap();
         assert_eq!(newer(f, times(f), op), (true, true));
         let op = &mut || s.truncate(f, 1).unwrap();
@@ -2609,7 +2749,8 @@ mod tests {
         assert_eq!(newer(f, times(f), op), (false, true));
         let op = &mut || s.link(b, b"h", f).unwrap();
         assert_eq!(newer(f, times(f), op), (false, true));
-        // utimensat 设成以前的时间，ctime 是现在；目录只给访问时间也改 ctime
+        // utimensat sets an earlier time, and the ctime is now; for a directory, giving only the
+        // access time also changes the ctime
         let before = times(f);
         tick();
         s.set_times(f, Some(FileTime::At(1)), Some(FileTime::At(2_000_000_000)))
@@ -2634,7 +2775,8 @@ mod tests {
         let d = s.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap();
         let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
         s.rmdir(ROOT, b"d").unwrap();
-        // 删除之后它还可能是当前目录：在里面新建、链接、改名进去都是 ENOENT
+        // After deletion it may still be a cwd: creating, linking and renaming into it are all
+        // ENOENT
         assert_eq!(
             s.create_file(d, b"x", 0o644, 0, 0).err(),
             Some(Errno::ENOENT)
@@ -2660,22 +2802,22 @@ mod tests {
         assert!(!s.has_file_caps(f).unwrap());
         s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
             .unwrap();
-        // 别的进程设置的也看得到：缓存随提交计数作废
+        // What another process sets is visible too: the cache is invalidated with the commit count
         s.commit().unwrap();
         let other = Store::open(&dir, &[]).unwrap();
         assert!(other.has_file_caps(f).unwrap());
-        // 有 CAP_FSETID 的写：只去掉文件能力
+        // A write with CAP_FSETID: only the file capabilities are removed
         other.remove_privs(f, true).unwrap();
         other.commit().unwrap();
         assert!(!s.has_file_caps(f).unwrap());
         assert_eq!(s.attrs(f).unwrap().mode & 0o7777, 0o6755);
-        // 没有 CAP_FSETID：去掉 setuid 和（有组执行位时的）setgid
+        // Without CAP_FSETID: setuid and (when group-executable) setgid are removed
         s.remove_privs(f, false).unwrap();
         assert_eq!(s.attrs(f).unwrap().mode & 0o7777, 0o755);
         let (g, _) = s.create_file(ROOT, b"lock", 0o2644, 0, 0).unwrap();
         s.remove_privs(g, false).unwrap();
         assert_eq!(s.attrs(g).unwrap().mode & 0o7777, 0o2644);
-        // chown 也去掉文件能力
+        // chown also removes file capabilities
         s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
             .unwrap();
         assert!(s.has_file_caps(f).unwrap());
@@ -2715,13 +2857,15 @@ mod tests {
         let st = s.stat_open(anon, &file).unwrap();
         assert_eq!((st.nlink, st.size), (0, 4));
         s.set_xattr(anon, b"user.x", b"1", false, false).unwrap();
-        // 定时器线程到点提交；不提交的话，下面打开仓库要等到超时
+        // The timer thread commits when it is due; without the commit, opening the store below
+        // would wait until the timeout
         s.commit().unwrap();
-        // 别的进程还在使用仓库时不清理：它可能还打开着这个 inode
+        // No cleanup while another process is still using the store: it may still have this inode
+        // open
         let other = Store::open(&dir, &[]).unwrap();
         assert!(other.stat_row(anon).is_ok());
         drop(other);
-        // 独占打开仓库时清理掉没有名字的 inode 和它的扩展属性
+        // Opening the store exclusively cleans up the nameless inode and its extended attributes
         drop((file, s));
         let s = Store::open(&dir, &[]).unwrap();
         assert!(s.stat_row(anon).is_err());
@@ -2742,7 +2886,7 @@ mod tests {
         s.symlink(ROOT, b"tmp", b"run", 0, 0).unwrap();
         let volatile: &[&[u8]] = &[b"dev/shm", b"run", b"tmp", b"missing/dir"];
         s.commit().unwrap();
-        // 别的进程还在使用仓库：不是开机，什么都不删
+        // Another process is still using the store: not a boot, so nothing is deleted
         let other = Store::open(&dir, volatile).unwrap();
         assert!(other.lookup(shm, b"seg").unwrap().is_some());
         drop((other, s));
@@ -2757,25 +2901,26 @@ mod tests {
     #[test]
     fn detached_directories_are_removed() {
         let (s, dir) = temp_store("detached");
-        // 不挂在根目录下面：上级是它自己，根目录里看不到；里面照常建文件、目录
+        // Not under the root directory: its parent is itself and it is invisible from the root
+        // directory; files and directories are created in it as usual
         let a = s.create_detached_dir(0o1777, 0, 0).unwrap();
         assert_eq!(s.parent(a).unwrap(), a);
         assert_eq!(s.stat(a).unwrap().mode, mode::S_IFDIR | 0o1777);
         assert!(s.readdir(ROOT).unwrap().is_empty());
         let sub = s.mkdir(a, b"sub", 0o755, 0, 0).unwrap();
         let (f, _) = s.create_file(sub, b"f", 0o644, 0, 0).unwrap();
-        // 挪到别的子目录下面：祖先的检查停在它这里
+        // Moved under another subdirectory: the ancestor check stops at it
         let other = s.mkdir(a, b"other", 0o755, 0, 0).unwrap();
         s.rename(a, b"sub", other, b"sub", false, false).unwrap();
         assert_eq!(
             s.rename(other, b"sub", sub, b"x", false, false),
             Err(Errno::EINVAL)
         );
-        // 卸下了：连同里面的一起删掉
+        // Unmounted: deleted along with everything in it
         s.remove_detached_dir(a).unwrap();
         assert_eq!(s.stat(f).unwrap().nlink, 0);
         assert_eq!(s.stat(a).unwrap().nlink, 0);
-        // 下次开机时删掉上次留下的
+        // The next boot deletes what was left last time
         let b = s.create_detached_dir(0o755, 0, 0).unwrap();
         let (g, _) = s.create_file(b, b"g", 0o644, 0, 0).unwrap();
         s.commit().unwrap();
@@ -2789,7 +2934,8 @@ mod tests {
 
     #[test]
     fn concurrent_connections_wait_for_each_other() {
-        // 多个 appine 进程同时使用一个仓库：写操作等别人的事务结束，不会失败
+        // Several appine processes using one store at once: writes wait for others' transactions
+        // to end and do not fail
         let (s, dir) = temp_store("concurrent");
         let dirs: Vec<Ino> = (0..4)
             .map(|i| {
@@ -2823,7 +2969,7 @@ mod tests {
     fn deferred_commits() {
         let (s, dir) = temp_store("defer");
         let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
-        // 别的连接（直接读数据库）在提交之前看不到
+        // Other connections (reading the database directly) do not see it before the commit
         let raw = Connection::open(dir.join("meta.db")).unwrap();
         let count = |name: &[u8]| -> i64 {
             raw.query_row(
@@ -2834,8 +2980,8 @@ mod tests {
             .unwrap()
         };
         assert_eq!(count(b"f"), 0);
-        // 失败的操作只回滚它自己：在普通文件下面建符号链接，插入 inode 之后才发现上级
-        // 不是目录
+        // A failed operation rolls back only itself: creating a symlink under a regular file
+        // finds out that the parent is not a directory only after inserting the inode
         assert_eq!(s.symlink(f, b"x", b"t", 0, 0), Err(Errno::ENOTDIR));
         let max: Ino = s
             .db()
@@ -2845,7 +2991,7 @@ mod tests {
         assert_eq!(s.lookup(ROOT, b"f").unwrap(), Some(f));
         s.commit().unwrap();
         assert_eq!(count(b"f"), 1);
-        // 最后一个链接删除之后，object 在提交时才删
+        // After the last link is removed, the object is deleted only at commit
         let object = dir.join("objects").join(f.to_string());
         s.unlink(ROOT, b"f").unwrap();
         assert!(object.exists());
@@ -2869,8 +3015,9 @@ mod tests {
             })
             .collect();
         drop(s);
-        // 开机清理删掉这些 inode 行，编号又分配给新建的文件。清理时自己删 object，不交给
-        // 后台线程：它晚一点删的话，删掉的是新文件的
+        // Boot cleanup deletes these inode rows, and the numbers are allocated to newly created
+        // files again. Cleanup deletes the objects itself instead of handing them to the
+        // background thread: if that deleted them a bit later, it would delete the new files'
         let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.meta.reaper.state.lock().unwrap().handed, 0);
         for i in 0..50 {
@@ -2895,8 +3042,9 @@ mod tests {
             let st = s.meta.reaper.state.lock().unwrap();
             (st.checkpoints, st.pages, st.backfilled)
         };
-        // 每个操作单独提交，直到 WAL 攒够要做检查点的页数。提交的线程自己做的话（SQLite
-        // 默认的自动检查点），后台线程一次也没做过
+        // Each operation commits on its own, until the WAL has accumulated enough pages for a
+        // checkpoint. If the committing thread did it itself (SQLite's default auto-checkpoint),
+        // the background thread would never have done one
         let mut i = 0;
         while state(&s).0 == 0 {
             assert!(i < 5000, "no checkpoint after {i} commits");
@@ -2905,8 +3053,10 @@ mod tests {
             s.commit().unwrap();
             i += 1;
         }
-        // 写入停下来之后后台写回剩下的帧：下一个写事务让 WAL 从头再用。不能只等第二次检查点：
-        // 机器慢时第二次可能是最后几次提交期间请求的那一次，写不回它们，要等停下来之后的那次
+        // Once writes stop, the background thread writes back the remaining frames: the next
+        // write transaction reuses the WAL from the start. Waiting only for the second checkpoint
+        // is not enough: on a slow machine the second may be the one requested during the last
+        // few commits, which cannot write those back; the one after writes stop is needed
         let start = Instant::now();
         while {
             let (_, pages, backfilled) = state(&s);
@@ -2927,8 +3077,9 @@ mod tests {
             "WAL has {} pages",
             state(&s).1
         );
-        // 一直在写、后台赶不上：WAL 到 INLINE_CHECKPOINT_PAGES 页时由提交的线程补上，
-        // 之后也从头再用
+        // Writing all the time, with the background thread unable to keep up: at
+        // INLINE_CHECKPOINT_PAGES pages the committing thread catches up, and the WAL is reused
+        // from the start afterwards as well
         s.meta.reaper.state.lock().unwrap().paused = true;
         let (mut most, mut restarted) = (0, false);
         for k in 0..1500 {
@@ -2954,7 +3105,8 @@ mod tests {
         let (s, dir) = temp_store("killed");
         let (g, _) = s.create_file(ROOT, b"g", 0o644, 0, 0).unwrap();
         s.commit().unwrap();
-        // 没提交就被杀掉：删除没有生效，新建的文件随之丢失，它的 object 开机时删掉
+        // Killed without committing: the deletion did not take effect, the newly created file is
+        // lost with it, and its object is deleted at boot
         s.unlink(ROOT, b"g").unwrap();
         let (f, _) = s.create_file(ROOT, b"f", 0o644, 0, 0).unwrap();
         let object = |ino: Ino| dir.join("objects").join(ino.to_string());
@@ -2965,14 +3117,16 @@ mod tests {
         assert!(object(g).exists());
         assert_eq!(s.lookup(ROOT, b"f").unwrap(), None);
         assert!(!object(f).exists());
-        // 编号又分配了出来
+        // The number is allocated again
         assert_eq!(s.mkdir(ROOT, b"d", 0o755, 0, 0).unwrap(), f);
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 断电时的顺序（模块文档）：改名覆盖别的文件的普通文件在提交之前刷，改名到新名字、
-    /// 符号链接不刷；删除 object 之前 WAL 先落盘，开机清理时也是；没有新的提交不再刷 WAL。
+    /// Ordering for power loss (module docs): a regular file renamed over another file is flushed
+    /// before the commit, while renames to a new name and symlinks are not; the WAL goes to disk
+    /// before objects are deleted, at boot cleanup too; with no new commits the WAL is not flushed
+    /// again.
     #[test]
     fn power_loss_ordering() {
         let (s, dir) = temp_store("ordering");
@@ -2987,22 +3141,22 @@ mod tests {
         s.rename(ROOT, b"l", ROOT, b"c2", false, false).unwrap();
         s.commit().unwrap();
         assert_eq!(flushes(), 0);
-        // 覆盖 a：提交时才刷
+        // Replacing a: flushed only at commit
         s.rename(ROOT, b"c", ROOT, b"a", false, false).unwrap();
         assert_eq!(flushes(), 0);
         assert_eq!(*s.replaced.borrow(), [b]);
-        // 符号链接覆盖普通文件不刷
+        // A symlink replacing a regular file is not flushed
         s.create_file(ROOT, b"d", 0o644, 0, 0).unwrap();
         s.rename(ROOT, b"c2", ROOT, b"d", false, false).unwrap();
         s.commit().unwrap();
         assert_eq!(flushes(), 1);
         assert!(s.replaced.borrow().is_empty());
-        // 被覆盖的 a 的 object 在 WAL 落盘之后才删
+        // The object of the replaced a is deleted only after the WAL is on disk
         s.reaped();
         assert!(!dir.join("objects").join(a.to_string()).exists());
         let after_reap = syncs();
         assert!(after_reap >= 1);
-        // 没有新的提交：不再刷
+        // No new commits: no further flush
         s.meta.sync_metadata().unwrap();
         assert_eq!(syncs(), after_reap);
         s.set_mode(b, 0o600).unwrap();
@@ -3010,7 +3164,8 @@ mod tests {
         s.meta.sync_metadata().unwrap();
         assert_eq!(syncs(), after_reap + 1);
         drop((fa, fb, s));
-        // 开机时按数据库删 object（a 的行还以 nlink = 0 留着）之前也先刷
+        // At boot it also flushes before deleting objects according to the database (a's row
+        // still stays with nlink = 0)
         let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
         drop(s);
