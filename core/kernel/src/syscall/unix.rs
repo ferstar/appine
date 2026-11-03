@@ -1,9 +1,9 @@
-//! AF_UNIX socket 的 syscall（数据结构在 [`crate::unix`]）。
+//! AF_UNIX socket syscalls (the data structures are in [`crate::unix`]).
 //!
-//! 由 [`super::net`] 在发现 socket 是 AF_UNIX 时转过来。阻塞的操作经由
-//! [`Cx::wait_objects`] 等其他线程改变 channel 的状态（它们都会请求唤醒那个 channel，
-//! 见 [`UnixSocket::wake_objects`]），可以被信号打断，并按 `SO_RCVTIMEO`/`SO_SNDTIMEO`
-//! 超时。
+//! [`super::net`] passes calls here when it finds the socket is AF_UNIX. Blocking operations use
+//! [`Cx::wait_objects`] to wait for other threads to change a channel's state (they all request a
+//! wake of that channel, see [`UnixSocket::wake_objects`]); they can be interrupted by signals and
+//! time out according to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -38,7 +38,7 @@ const SO_DOMAIN: i32 = 39;
 
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
-/// 一条消息最多传递的打开文件数（Linux 的 `SCM_MAX_FD`）。
+/// The most open files one message passes (Linux's `SCM_MAX_FD`).
 const SCM_MAX_FD: usize = 253;
 
 const MSG_PEEK: u32 = 0x2;
@@ -48,30 +48,30 @@ const MSG_DONTWAIT: u32 = 0x40;
 const MSG_WAITALL: u32 = 0x100;
 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 
-/// `cmsghdr` 的长度（64 位）。
+/// The length of a `cmsghdr` (64-bit).
 const CMSG_HDR: usize = 16;
-/// listen 的 backlog 上限（`SOMAXCONN`）。
+/// The upper limit of the listen backlog (`SOMAXCONN`).
 const SOMAXCONN: usize = 4096;
 
-/// 检查 socket 类型和协议，返回实际的类型。
+/// Checks the socket type and protocol and returns the actual type.
 fn socket_type(ty: i32, protocol: i32) -> Result<i32, Errno> {
     if protocol != 0 && protocol != AF_UNIX {
         return Err(Errno::EPROTONOSUPPORT);
     }
     match ty {
         SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET => Ok(ty),
-        // 与 Linux 相同，SOCK_RAW 当作数据报
+        // As on Linux, SOCK_RAW is treated as datagram
         SOCK_RAW => Ok(SOCK_DGRAM),
         _ => Err(Errno::ESOCKTNOSUPPORT),
     }
 }
 
-/// 新建一个 AF_UNIX socket。
+/// Creates an AF_UNIX socket.
 pub(super) fn socket(ty: i32, protocol: i32) -> Result<Socket, Errno> {
     Ok(Socket::Unix(UnixSocket::new(socket_type(ty, protocol)?)))
 }
 
-/// socketpair(2)：两个互相连接的 socket。
+/// socketpair(2): two sockets connected to each other.
 pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socket), Errno> {
     let (mut a, mut b) = UnixSocket::pair(socket_type(ty, protocol)?, cx.ucred());
     let net = cx.task.ns.borrow().net.clone();
@@ -82,7 +82,7 @@ pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socke
     Ok((Socket::Unix(a), Socket::Unix(b)))
 }
 
-/// 借用 AF_UNIX socket 的内部状态。
+/// Borrows the internal state of an AF_UNIX socket.
 fn with<R>(sock: &SocketRef, f: impl FnOnce(&mut UnixSocket) -> R) -> R {
     match &mut *sock.borrow_mut() {
         Socket::Unix(u) => f(u),
@@ -90,13 +90,13 @@ fn with<R>(sock: &SocketRef, f: impl FnOnce(&mut UnixSocket) -> R) -> R {
     }
 }
 
-/// guest 给出的地址。
+/// An address given by the guest.
 enum Addr<'a> {
-    /// 只有地址族：bind 时自动绑定。
+    /// Only the address family: bind autobinds.
     Unnamed,
-    /// 路径（不含结尾的 NUL）。
+    /// A path (without the trailing NUL).
     Path(&'a [u8]),
-    /// 抽象地址：`sun_path` 的全部字节。
+    /// An abstract address: all bytes of `sun_path`.
     Abstract(&'a [u8]),
 }
 
@@ -115,7 +115,8 @@ fn parse(addr: &[u8]) -> Result<Addr<'_>, Errno> {
     })
 }
 
-/// 按地址找到绑定在上面的 socket（抽象地址在 `sock` 所在的网络命名空间里找）。
+/// Finds the socket bound at an address (abstract addresses are looked up in the network
+/// namespace of `sock`).
 fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> {
     let name = match parse(addr)? {
         Addr::Unnamed => return Err(Errno::EINVAL),
@@ -125,7 +126,7 @@ fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> 
             let vfs = cx.vfs()?;
             match node {
                 Node::Store(_, ino) if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK => {
-                    // 连接路径地址要求对 socket 文件有写权限
+                    // Connecting to a path address requires write permission on the socket file
                     cx.cred()
                         .permission(&vfs.store().stat(ino)?, crate::cred::MAY_WRITE)?;
                     Name::Path(ino)
@@ -155,8 +156,8 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
             bound.extend_from_slice(p);
         }
         Addr::Path(p) => {
-            // 与 Linux 相同，在文件系统里建一个 socket 节点；已经存在时失败。路径是 / 或者
-            // 以 . 结尾时，它指的是一个已有的目录
+            // As on Linux, create a socket node in the file system; fail when it already
+            // exists. When the path is / or ends with ., it refers to an existing directory
             let in_use = |e: Errno| {
                 if e == Errno::EEXIST {
                     Errno::EADDRINUSE
@@ -213,8 +214,9 @@ pub(super) fn listen(u: &mut UnixSocket, backlog: i32, cred: Ucred) -> Result<()
     }
 }
 
-/// 阻塞操作的公共部分：非阻塞或超时返回 EAGAIN，有信号返回 ERESTARTSYS，否则等到
-/// 有线程改变了 channel `on` 的状态（监听 socket 的连接队列记在它的接收队列上）。
+/// The common part of blocking operations: EAGAIN when nonblocking or timed out, ERESTARTSYS on a
+/// signal, otherwise wait until some thread changes the state of channel `on` (a listening
+/// socket's connection queue is recorded on its receive queue).
 fn block(
     cx: &mut Cx<'_>,
     nonblock: bool,
@@ -247,7 +249,7 @@ pub(super) fn accept(
             _ => Err(Errno::EINVAL),
         })?;
         if let Some(new) = new {
-            // 等 backlog 有空位的 connect 可以继续了
+            // Connects waiting for room in the backlog can go on now
             request_wake_object(wake::of(&queue));
             let peer = with(&new, |u| u.peer_name()).unwrap_or_else(unnamed);
             return Ok((new, peer));
@@ -294,7 +296,7 @@ pub(super) fn connect(
             else {
                 return Err(Errno::ECONNREFUSED);
             };
-            // 与 Linux 相同，最多容纳 backlog + 1 个等待 accept 的连接
+            // As on Linux, at most backlog + 1 connections wait for accept
             if pending.len() <= *backlog {
                 let (end, own) = with(sock, |u| {
                     (
@@ -305,7 +307,7 @@ pub(super) fn connect(
                 pending.push_back(Rc::new(RefCell::new(Socket::Unix(end))));
                 server.connections += 1;
                 request_wake_object(wake::of(&server.rx));
-                // 连上了：poll 着这个 socket 的线程登记的是它自己的接收队列
+                // Connected: threads polling this socket registered its own receive queue
                 request_wake_object(own);
                 return Ok(());
             }
@@ -316,7 +318,7 @@ pub(super) fn connect(
 }
 
 fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
-    // AF_UNSPEC：断开
+    // AF_UNSPEC: disconnect
     if addr.len() >= 2 && addr[..2] == [0, 0] {
         with(sock, |u| u.link = Link::None);
         return Ok(());
@@ -334,8 +336,8 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
     Ok(())
 }
 
-/// 解析 sendmsg 的控制消息，取出 `SCM_RIGHTS` 要传递的打开文件和 `SCM_CREDENTIALS` 声明的
-/// 凭据（内核 ID、全局 pid）。
+/// Parses sendmsg's control messages, taking out the open files `SCM_RIGHTS` passes and the
+/// credentials `SCM_CREDENTIALS` declares (kernel IDs, global pid).
 fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), Errno> {
     let mut files = Vec::new();
     let mut declared = None;
@@ -378,10 +380,11 @@ fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), 
     Ok((files, declared))
 }
 
-/// 发送者在 `SCM_CREDENTIALS` 里声明的凭据（Linux 的 `scm_check_creds` 和 `__scm_send`）：ID 在
-/// 自己的命名空间里要有映射（EINVAL）；pid 要是自己，或者在自己的 pid 命名空间的属主那里有
-/// CAP_SYS_ADMIN；用户 ID 要是自己的真实、有效、保存的之一，或者有 CAP_SETUID，组 ID 同样
-/// （CAP_SETGID），否则 EPERM；pid 不存在是 ESRCH。
+/// The credentials the sender declares in `SCM_CREDENTIALS` (Linux's `scm_check_creds` and
+/// `__scm_send`): the IDs must have a mapping in the sender's own namespace (EINVAL); the pid must
+/// be the sender's own, or the sender must have CAP_SYS_ADMIN over the owner of its pid namespace;
+/// the user ID must be one of its real, effective and saved ones, or it must have CAP_SETUID, and
+/// likewise for the group ID (CAP_SETGID), otherwise EPERM; a pid that does not exist is ESRCH.
 fn check_creds(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<Ucred, Errno> {
     let c = cx.cred();
     let (Some(kuid), Some(kgid)) = (c.uid_in(uid), c.gid_in(gid)) else {
@@ -411,7 +414,8 @@ pub(super) fn send(
 ) -> Result<usize, Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let (mut files, declared) = rights(cx, control)?;
-    // 没有声明时是发送者自己（Linux 的 maybe_add_creds 用真实用户 ID、组 ID）
+    // Without a declaration it is the sender itself (Linux's maybe_add_creds uses the real user ID
+    // and group ID)
     let cred = declared.unwrap_or_else(|| cx.scm_cred());
     let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
     let deadline = deadline(timeout);
@@ -447,7 +451,7 @@ pub(super) fn send(
                 if data.is_empty() && files.is_empty() {
                     return Ok(0);
                 }
-                // 流式 socket 可以只放下一部分；打开文件随第一部分传递
+                // A stream socket may queue only part of it; open files go with the first part
                 let n = c.space().min(data.len() - done);
                 if n > 0 || data.is_empty() {
                     if !files.is_empty() {
@@ -518,7 +522,7 @@ fn send_dgram(
         if p.ty != SOCK_DGRAM {
             return Err(Errno::EPROTOTYPE);
         }
-        // 对方连着别的 socket 时只收那个 socket 发来的数据报
+        // When the peer is connected to another socket it receives only datagrams from that socket
         if let Link::Dgram { tx, .. } = &p.link
             && !Weak::ptr_eq(tx, &own_rx)
         {
@@ -562,7 +566,7 @@ pub(super) fn recv(
     let (ty, timeout, passcred) = with(sock, |u| (u.ty, u.rcvtimeo, u.passcred));
     let deadline = deadline(timeout);
     let wait_all = flags & MSG_WAITALL != 0 && ty == SOCK_STREAM && !peek;
-    // MSG_WAITALL 时已经读到的部分
+    // The part already read under MSG_WAITALL
     let mut part: Option<Received> = None;
     loop {
         let rx = with(sock, |u| match &u.link {
@@ -618,8 +622,9 @@ pub(super) fn recv(
     }
 }
 
-/// 把读到的数据交给 guest：附上凭据，把传来的打开文件装进当前进程的 fd 表。控制缓冲区
-/// 放不下的部分丢弃并置 `MSG_CTRUNC`，与 Linux 相同。
+/// Hands the data read to the guest: attaches the credentials and installs the passed open files
+/// into the current process's fd table. What the control buffer cannot hold is dropped and
+/// `MSG_CTRUNC` is set, as on Linux.
 fn deliver(
     cx: &mut Cx<'_>,
     r: Received,
@@ -631,7 +636,8 @@ fn deliver(
     let mut out_flags = if r.len > r.data.len() { MSG_TRUNC } else { 0 };
     if passcred {
         if control_len >= CMSG_HDR + 12 {
-            // pid、ID 是接收者看到的（Linux 的 scm_recv 用 pid_vnr、from_kuid_munged）
+            // pid and IDs as the receiver sees them (Linux's scm_recv uses pid_vnr,
+            // from_kuid_munged)
             let me = cx.cred();
             let cred = Ucred {
                 pid: cx.pid_out(r.cred.pid),
@@ -671,7 +677,7 @@ fn deliver(
     }
 }
 
-/// 追加一条 `SOL_SOCKET` 的控制消息，按 8 字节对齐补齐。
+/// Appends a `SOL_SOCKET` control message, padded to 8-byte alignment.
 fn push_cmsg(out: &mut Vec<u8>, ty: i32, data: &[u8]) {
     out.extend_from_slice(&((CMSG_HDR + data.len()) as u64).to_le_bytes());
     out.extend_from_slice(&SOL_SOCKET.to_le_bytes());
@@ -710,14 +716,14 @@ pub(super) fn setsockopt(
         SO_PASSCRED => u.passcred = int != 0,
         SO_RCVTIMEO => u.rcvtimeo = timeval(value),
         SO_SNDTIMEO => u.sndtimeo = timeval(value),
-        // 缓冲区大小、SO_REUSEADDR 等：接受，但不起作用
+        // Buffer sizes, SO_REUSEADDR and so on: accepted but without effect
         _ => {}
     }
     Ok(())
 }
 
-/// `pid_ns`、`cred` 是调用者的 pid 命名空间和凭据：`SO_PEERCRED` 的 pid、ID 按它们换算
-/// （Linux 的 `cred_to_ucred`）。
+/// `pid_ns` and `cred` are the caller's pid namespace and credentials: `SO_PEERCRED`'s pid and IDs
+/// are translated by them (Linux's `cred_to_ucred`).
 pub(super) fn getsockopt(
     u: &UnixSocket,
     level: i32,
@@ -738,7 +744,7 @@ pub(super) fn getsockopt(
         SO_ACCEPTCONN => int(matches!(u.link, Link::Listening { .. }) as i32),
         SO_RCVTIMEO => encode_timeval(u.rcvtimeo),
         SO_SNDTIMEO => encode_timeval(u.sndtimeo),
-        // 没有对方时与 Linux 相同：pid 为 0，uid、gid 是 overflowuid
+        // Without a peer, as on Linux: pid 0, and uid and gid are overflowuid
         SO_PEERCRED => u
             .peer_cred
             .map(|c| Ucred {
