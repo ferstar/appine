@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vt_unavailable">这个版本没有实验终端：构建时加上 -Pappine.vt=true</string>
+    <string name="vt_exited">[进程已结束（%1$d）]</string>
+</resources>

@@ -17,6 +17,7 @@
     <string name="listening_mapped">Other devices connect to port %1$d: apps cannot use port %2$d on this phone, so appine moved it there.</string>
     <string name="listening_direct">Other devices on the network can connect to it.</string>
     <string name="menu_settings">Settings</string>
+    <string name="menu_experimental_terminal">New terminal (experimental)</string>
     <string name="settings">Settings</string>
     <string name="settings_distro">Distribution</string>
     <string name="settings_mirror">Package mirror</string>

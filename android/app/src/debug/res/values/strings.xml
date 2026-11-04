@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="vt_unavailable">This build has no experimental terminal: build with -Pappine.vt=true</string>
+    <string name="vt_exited">[Process completed (%1$d)]</string>
+</resources>

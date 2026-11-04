@@ -16,6 +16,7 @@
     <string name="listening_mapped">其他设备请连接端口 %1$d：这台手机上的 App 用不了端口 %2$d，appine 把它换到了这里。</string>
     <string name="listening_direct">同一网络里的其他设备连得上它。</string>
     <string name="menu_settings">设置</string>
+    <string name="menu_experimental_terminal">新终端（实验）</string>
     <string name="settings">设置</string>
     <string name="settings_distro">发行版</string>
     <string name="settings_mirror">软件源镜像</string>

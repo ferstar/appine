@@ -1,0 +1,55 @@
+#!/bin/sh
+# Downloads and verifies the Ghostty source release that libghostty-vt is built from (the
+# experimental terminal view, android/terminal map), then fetches the Zig packages its build needs,
+# so that the cargo build (hosts/android/build.rs) works offline. The version and sha256 are fixed
+# here and changed together on upgrades; Ghostty 1.4.0 needs Zig 0.17.0. Usage:
+# scripts/fetch-ghostty [output directory], target/ghostty by default; the source ends up in
+# <output directory>/ghostty-<version>.
+#
+# Only the sha256 is checked. The release is also signed with minisign
+# (<url>.minisig); checking that signature is left for when the build is no longer experimental.
+#
+# Zig's HTTP client fails through some proxies (HTTP 400 from deps.files.ghostty.org through
+# Clash and similar), so the proxy variables are removed for the fetch.
+set -eu
+
+version=1.4.0
+sha256=cb188ac6c3a8278d5fd7bfef15d8c017104c87f638b5560eb38024a71ae0f005
+name=ghostty-$version.tar.gz
+url=https://release.files.ghostty.org/$version/$name
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-$root/target/ghostty}
+mkdir -p "$out"
+
+# GNU and BSD sha256sum take different arguments, but the first column is the digest in both
+digest() {
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$1"
+    else
+        shasum -a 256 "$1"
+    fi | cut -d' ' -f1
+}
+
+if ! [ -f "$out/$name" ] || [ "$(digest "$out/$name")" != "$sha256" ]; then
+    curl -fsSL --retry 3 -o "$out/$name.part" "$url"
+    if [ "$(digest "$out/$name.part")" != "$sha256" ]; then
+        echo "fetch-ghostty: sha256 mismatch for $url: got $(digest "$out/$name.part")" >&2
+        rm -f "$out/$name.part"
+        exit 1
+    fi
+    mv "$out/$name.part" "$out/$name"
+fi
+
+src=$out/ghostty-$version
+if ! [ -f "$src/build.zig" ]; then
+    rm -rf "$src"
+    tar -xzf "$out/$name" -C "$out"
+fi
+
+# Lazy dependencies are fetched only when a build step needs them, so fetch everything the
+# libghostty-vt build for Android can reach
+cd "$src"
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+    zig build --fetch=all -Demit-lib-vt -Dtarget=aarch64-linux-android
+echo "fetch-ghostty: $src"

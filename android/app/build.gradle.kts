@@ -469,6 +469,15 @@ abstract class NoticesTask : DefaultTask() {
     }
 }
 
+/**
+ * The experimental terminal view built on libghostty-vt (VtActivity in the debug source set, the
+ * android/terminal map): with `-Pappine.vt=true` (or `appine.vt=true` in a gradle.properties) the
+ * debug app's native library gets the `vt` feature, which needs Zig 0.17 and the source from
+ * `scripts/fetch-ghostty`. Off by default, so builds without Zig (CI) still work; VtActivity then
+ * says the library lacks it.
+ */
+val experimentalTerminal = providers.gradleProperty("appine.vt").map { it.toBoolean() }.getOrElse(false)
+
 val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     rootfsTarball?.let { tarball.set(it) }
     doasPackage?.let { doas.set(it) }
@@ -480,7 +489,13 @@ androidComponents {
         val buildRust = tasks.register<CargoNdkTask>("buildRust${variant.name.replaceFirstChar(Char::uppercase)}") {
             workspace.set(repoRoot)
             ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
-            features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
+            features.set(
+                when {
+                    variant.buildType != "debug" -> emptyList()
+                    experimentalTerminal -> listOf("test-hooks", "borrow-check", "vt")
+                    else -> listOf("test-hooks", "borrow-check")
+                },
+            )
             outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)

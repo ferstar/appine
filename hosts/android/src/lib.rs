@@ -30,6 +30,9 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, jstring};
 
+#[cfg(feature = "vt")]
+mod vt;
+
 /// Throws `java.io.IOException`; Kotlin sees it after the JNI call returns.
 fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
     let _ = env.throw_new("java/io/IOException", message.as_ref());

@@ -211,6 +211,14 @@ class MainActivity : Activity(), TerminalService.Listener {
                 startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                 true
             }
+            // The experimental terminal on libghostty-vt exists only in the debug source set
+            if (BuildConfig.DEBUG) {
+                menu.add(R.string.menu_experimental_terminal).setOnMenuItemClickListener {
+                    val name = MainActivity::class.java.name.substringBeforeLast('.') + ".VtActivity"
+                    startActivity(Intent().setClassName(this@MainActivity, name))
+                    true
+                }
+            }
             show()
         }
     }
