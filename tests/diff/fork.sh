@@ -528,3 +528,124 @@ os.write(w, b"g")
 _, st = os.waitpid(pid, 0)
 print("python fork:", os.WEXITSTATUS(st), bytes(data[:4]))
 '
+# Fork-related madvise: MADV_WIPEONFORK gives a child zeros instead of a copy (BoringSSL reseeds its
+# random number generator this way) and the child keeps the flag, MADV_KEEPONFORK undoes it;
+# MADV_DONTFORK leaves the mapping out of the child, MADV_DOFORK undoes it; wiping applies only to
+# private anonymous memory; a neighbouring file mapping or locked mapping below the range does not
+# make the advice EINVAL; growing a mapping with mremap keeps its flags; smaps shows wf, dc and dd
+cat > advice.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define PAGE 4096
+
+/* Prints what a forked child reads at p[0], or the signal that ended it */
+static void reads(const char *label, volatile char *p)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        printf(" %s=%d", label, p[0]);
+        _exit(0);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    if (WIFSIGNALED(st))
+        printf(" %s=%s", label, WTERMSIG(st) == SIGSEGV ? "SIGSEGV" : "signal");
+}
+
+/* Whether the VmFlags of the mapping starting at p list `flag` */
+static int smaps_has(void *p, const char *flag)
+{
+    FILE *f = fopen("/proc/self/smaps", "r");
+    char line[512], start[32], want[16];
+    snprintf(start, sizeof start, "%lx-", (unsigned long)p);
+    snprintf(want, sizeof want, " %s ", flag);
+    int in = 0, found = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, start, strlen(start)) == 0) {
+            in = 1;
+        } else if (in && strncmp(line, "VmFlags:", 8) == 0) {
+            found = strstr(line, want) != NULL;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setrlimit(RLIMIT_CORE, &(struct rlimit){0, 0});
+    char *p = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    p[0] = 'A';
+    p[PAGE] = 'B';
+    printf("wipeonfork %d dontdump %d:", madvise(p, PAGE, MADV_WIPEONFORK),
+           madvise(p, PAGE, MADV_DONTDUMP));
+    reads("wiped", p);
+    reads("other page", p + PAGE);
+    printf(" wf %d %d\n", smaps_has(p, "wf"), smaps_has(p + PAGE, "wf"));
+    pid_t pid = fork();
+    if (pid == 0) {
+        p[0] = 'C';
+        printf("child: wf %d dd %d", smaps_has(p, "wf"), smaps_has(p, "dd"));
+        reads("grandchild", p);
+        printf("\n");
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    printf("keeponfork %d:", madvise(p, PAGE, MADV_KEEPONFORK));
+    reads("kept", p);
+    printf(" wf %d\n", smaps_has(p, "wf"));
+
+    printf("dontfork %d:", madvise(p + PAGE, PAGE, MADV_DONTFORK));
+    reads("left out", p + PAGE);
+    reads("other page", p);
+    printf(" dc %d\n", smaps_has(p + PAGE, "dc"));
+    printf("dofork %d:", madvise(p + PAGE, PAGE, MADV_DOFORK));
+    reads("back", p + PAGE);
+    printf(" dc %d\n", smaps_has(p + PAGE, "dc"));
+
+    /* A file mapping, then anonymous memory right above it; a locked page, then anonymous memory
+     * right above it */
+    int fd = open("advice-file", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, PAGE);
+    char *area = mmap(NULL, 4 * PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *file = mmap(area, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    char *anon = mmap(area + PAGE, PAGE, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    char *locked = mmap(area + 2 * PAGE, PAGE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    char *above = mmap(area + 3 * PAGE, PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    mlock(locked, PAGE);
+    printf("above a file mapping: free %d wipeonfork %d keeponfork %d\n",
+           madvise(anon, PAGE, MADV_FREE), madvise(anon, PAGE, MADV_WIPEONFORK),
+           madvise(anon, PAGE, MADV_KEEPONFORK));
+    printf("above a locked page: dontneed %d\n", madvise(above, PAGE, MADV_DONTNEED));
+    printf("on a file mapping: wipeonfork %d", madvise(file, PAGE, MADV_WIPEONFORK));
+    printf(" keeponfork %d\n", madvise(file, PAGE, MADV_KEEPONFORK));
+
+    /* Growing keeps the flags: the new part is wiped too */
+    char *q = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    q[0] = 'D';
+    madvise(q, PAGE, MADV_WIPEONFORK);
+    madvise(q, PAGE, MADV_DONTDUMP);
+    q = mremap(q, PAGE, 2 * PAGE, MREMAP_MAYMOVE);
+    q[PAGE] = 'E';
+    printf("grown:");
+    reads("start", q);
+    reads("new part", q + PAGE);
+    printf(" wf %d dd %d\n", smaps_has(q, "wf"), smaps_has(q, "dd"));
+    return 0;
+}
+C
+gcc -O2 -o advice advice.c
+./advice

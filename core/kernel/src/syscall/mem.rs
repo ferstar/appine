@@ -41,6 +41,8 @@ const F_SEAL_WRITE: u32 = 0x8;
 const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 const MADV_DONTNEED: i32 = 4;
 const MADV_REMOVE: i32 = 9;
+const MADV_DONTFORK: i32 = 10;
+const MADV_DOFORK: i32 = 11;
 const MADV_FREE: i32 = 8;
 const MADV_DONTDUMP: i32 = 16;
 const MADV_DODUMP: i32 = 17;
@@ -372,7 +374,15 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
         // The other advice only affects performance and can be ignored; after DONTNEED anonymous
         // memory must read back as 0
         MADV_DONTNEED => cx.mm_mut().discard(addr, len).map(|()| 0),
-        MADV_FREE | MADV_WIPEONFORK | MADV_KEEPONFORK if !private_anon => Err(Errno::EINVAL),
+        MADV_FREE | MADV_WIPEONFORK if !private_anon => Err(Errno::EINVAL),
+        MADV_WIPEONFORK | MADV_KEEPONFORK => cx
+            .mm_mut()
+            .set_wipeonfork(addr, len, advice == MADV_WIPEONFORK)
+            .map(|()| 0),
+        MADV_DONTFORK | MADV_DOFORK => cx
+            .mm_mut()
+            .set_dontfork(addr, len, advice == MADV_DONTFORK)
+            .map(|()| 0),
         // Whether it is written to core files (crate::coredump)
         MADV_DONTDUMP | MADV_DODUMP => cx
             .mm_mut()

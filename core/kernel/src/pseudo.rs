@@ -2709,8 +2709,10 @@ fn vm_flags(r: &Region) -> String {
         (r.shared, "ms"),
         (r.name.as_deref() == Some(b"[stack]"), "gd"),
         (r.locked, "lo"),
+        (r.dontfork, "dc"),
         // Commit-accounted: writable private anonymous mappings
         (r.file.is_none() && !r.shared && r.prot & 2 != 0, "ac"),
+        (r.wipeonfork, "wf"),
         (r.dontdump, "dd"),
     ];
     let mut s = String::from("VmFlags: ");

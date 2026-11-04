@@ -606,10 +606,14 @@ struct Vma {
     written: Cell<bool>,
     /// `MAP_GROWSDOWN`: grows downwards when an address below it is accessed ([`Mm::grow_down`]).
     growsdown: bool,
-    /// `MADV_DONTDUMP`: its contents are left out of core files ([`Mm::dump_regions`]). Linux's
-    /// fork inherits it; here fork and mremap growth do not carry it over yet, so the child's
-    /// VMAs and the grown part start without it.
+    /// `MADV_DONTDUMP`: its contents are left out of core files ([`Mm::dump_regions`]).
     dontdump: bool,
+    /// `MADV_WIPEONFORK` (private anonymous mappings only): a forked child gets this range
+    /// zero-filled instead of a copy, and keeps the flag (Linux's `dup_mmap`). Libraries such as
+    /// BoringSSL rely on it to reseed their random number generators in the child.
+    wipeonfork: bool,
+    /// `MADV_DONTFORK`: a forked child does not get this mapping at all.
+    dontfork: bool,
     /// `MAP_NORESERVE`: not counted in the commit ([`Mm::commit_too_big`]).
     noreserve: bool,
 }
@@ -1106,6 +1110,10 @@ pub struct Region {
     pub may_exec: bool,
     /// `MADV_DONTDUMP` (smaps `dd`).
     pub dontdump: bool,
+    /// `MADV_WIPEONFORK` (smaps `wf`).
+    pub wipeonfork: bool,
+    /// `MADV_DONTFORK` (smaps `dc`).
+    pub dontfork: bool,
 }
 
 /// One mapping in a core dump ([`Mm::dump_regions`]).
@@ -1824,6 +1832,8 @@ impl Mm {
                 written: Cell::new(prot & prot::WRITE != 0),
                 growsdown: false,
                 dontdump: false,
+                wipeonfork: false,
+                dontfork: false,
                 noreserve: false,
             },
         );
@@ -2530,7 +2540,10 @@ impl Mm {
             locked: template.locked,
             written: Cell::new(template.prot & prot::WRITE != 0),
             growsdown: false,
-            dontdump: false,
+            // The grown part belongs to the same mapping, as on Linux
+            dontdump: template.dontdump,
+            wipeonfork: template.wipeonfork,
+            dontfork: template.dontfork,
             noreserve: template.noreserve,
         })
     }
@@ -2671,13 +2684,32 @@ impl Mm {
     /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
     /// range must be fully mapped.
     pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
+        self.update_range(addr, len, |v| v.dontdump = dontdump)
+    }
+
+    /// `MADV_WIPEONFORK`, `MADV_KEEPONFORK`: whether a forked child gets `[addr, addr + len)`
+    /// zero-filled ([`Vma::wipeonfork`]); the range must be fully mapped (the caller checks that
+    /// wiping applies only to private anonymous memory).
+    pub fn set_wipeonfork(&mut self, addr: u64, len: u64, wipe: bool) -> Result<(), Errno> {
+        self.update_range(addr, len, |v| v.wipeonfork = wipe)
+    }
+
+    /// `MADV_DONTFORK`, `MADV_DOFORK`: whether a forked child gets `[addr, addr + len)` at all;
+    /// the range must be fully mapped.
+    pub fn set_dontfork(&mut self, addr: u64, len: u64, dontfork: bool) -> Result<(), Errno> {
+        self.update_range(addr, len, |v| v.dontfork = dontfork)
+    }
+
+    /// Splits the VMAs at both ends of `[addr, addr + len)` and applies `f` to each VMA inside;
+    /// the range must be fully mapped.
+    fn update_range(&mut self, addr: u64, len: u64, f: impl Fn(&mut Vma)) -> Result<(), Errno> {
         let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
         self.check_mapped(addr, len)?;
         self.room_for(self.splits(&[addr, end]))?;
         self.split_at(addr);
         self.split_at(end);
         for (_, v) in self.vmas.range_mut(addr..end) {
-            v.dontdump = dontdump;
+            f(v);
         }
         Ok(())
     }
@@ -2729,13 +2761,19 @@ impl Mm {
     pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {
         self.check_mapped(addr, len)?;
         let end = addr + len;
+        // The VMA starting below `addr` counts only if it reaches into the range
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
         let mut locked = false;
         let mut anon = true;
-        if let Some((_, v)) = self.vmas.range(..addr).next_back() {
-            locked |= v.locked;
-            anon &= v.backing == Backing::Anonymous;
-        }
-        for (_, v) in self.vmas.range(addr..end) {
+        for (_, v) in self
+            .vmas
+            .range(first..end)
+            .filter(|&(&s, v)| s + v.len > addr)
+        {
             locked |= v.locked;
             anon &= v.backing == Backing::Anonymous;
         }
@@ -3152,7 +3190,8 @@ impl Mm {
             .vmas
             .iter()
             .filter(|&(&s, v)| {
-                !v.growsdown
+                !v.dontfork
+                    && !v.growsdown
                     && !v.reserved()
                     && !is_heap(s, v)
                     && v.len <= FORK_PIECE_MAX
@@ -3169,6 +3208,9 @@ impl Mm {
         // host memory first, then lend to it
         let mut cow = Vec::new();
         for (&start, v) in self.vmas.iter_mut() {
+            if v.dontfork {
+                continue;
+            }
             // A reservation has no contents, and the child's is a reservation too
             // (HostRegion::reserved)
             let share = v.reserved()
@@ -3205,7 +3247,8 @@ impl Mm {
                     Self::new_anonymous(v.len, v.prot & prot::WRITE != 0 && !v.noreserve)?
                 };
                 let len = v.file_len as usize;
-                if v.backing == Backing::Anonymous && v.written.get() {
+                // Wiped on fork: the child keeps its own all-zero memory
+                if v.backing == Backing::Anonymous && v.written.get() && !v.wipeonfork {
                     cow.push(start);
                 } else if v.backing != Backing::Anonymous {
                     // SAFETY: both pieces of host memory have at least v.len bytes and do not
@@ -3236,6 +3279,8 @@ impl Mm {
             c.shm = v.shm;
             c.growsdown = v.growsdown;
             c.noreserve = v.noreserve;
+            c.dontdump = v.dontdump;
+            c.wipeonfork = v.wipeonfork;
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
@@ -3275,13 +3320,16 @@ impl Mm {
         if limit == 0 {
             return false;
         }
-        let accounted =
-            |v: &Vma| v.backing != Backing::Shared && v.prot & prot::WRITE != 0 && !v.noreserve;
+        // Mappings the child does not get are not counted (Linux checks after skipping them)
+        let accounted = |v: &Vma| {
+            v.backing != Backing::Shared && v.prot & prot::WRITE != 0 && !v.noreserve && !v.dontfork
+        };
         // Linux's vma_merge: contiguous, with the same permissions, flags and name, and file
         // offsets that line up for file mappings
         let merges = |a: &Vma, b: &Vma| {
             (a.backing, a.locked, a.dontdump, a.growsdown, &a.name)
                 == (b.backing, b.locked, b.dontdump, b.growsdown, &b.name)
+                && a.wipeonfork == b.wipeonfork
                 && match (a.file_id, b.file_id) {
                     (None, None) => true,
                     (Some((d, i, o)), Some(f)) => (d, i, o + a.len) == f,
@@ -3569,6 +3617,8 @@ impl Mm {
                 may_write: v.may_write,
                 may_exec: v.may_exec,
                 dontdump: v.dontdump,
+                wipeonfork: v.wipeonfork,
+                dontfork: v.dontfork,
             }
         });
         for r in regions {
@@ -3584,6 +3634,7 @@ impl Mm {
                     && last.end == r.start
                     && (last.prot, last.shared, last.locked) == (r.prot, r.shared, r.locked)
                     && (last.may_write, last.dontdump) == (r.may_write, r.dontdump)
+                    && (last.wipeonfork, last.dontfork) == (r.wipeonfork, r.dontfork)
                     && last.name == r.name
                 {
                     last.end = r.end;

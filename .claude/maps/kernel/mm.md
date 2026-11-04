@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-04 (targeted verification: `MADV_WIPEONFORK`/`MADV_DONTFORK` honoured at fork, flags kept by fork and mremap growth, madvise judges only overlapping VMAs; removed those bugs)
 
 ## Responsibilities
 
@@ -51,7 +51,7 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
   `VM_MAYWRITE`/`VM_MAYEXEC`), `Arc<HostRegion>` plus host pointer, `name`/`ino` for maps,
   `file_len` (bytes before EOF), `file_id`/`content` (file identity and version), a dup'd fd for
   shared file mappings, `shm`, and flags `cow`, `locked`, `written` (sticky), `growsdown`,
-  `dontdump`, `noreserve`.
+  `dontdump`, `wipeonfork`, `dontfork`, `noreserve`.
 - `Backing` — `Anonymous` (private anonymous), `PrivateFile` (private file mapping), `Shared`
   (shared file, shared anonymous, `/dev/zero` or SysV shm).
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
@@ -231,8 +231,13 @@ signals may still be delivered).
   accessible. Otherwise only a permission downgrade sets `dirty`; a range containing fork CoW pages
   gets an immediate `shootdown` either way.
 - `mremap` may span several contiguous VMAs. Growing in place needs the old end to be a VMA end,
-  free space above, and the new end at or below `mmap_top`; the grown part becomes a separate VMA.
-  A move re-points the same host memory and moves the page-table entries with it.
+  free space above, and the new end at or below `mmap_top`; the grown part becomes a separate VMA
+  with the same lock, dump and fork flags. A move re-points the same host memory and moves the
+  page-table entries with it.
+- `madvise` flag advice (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/`KEEPONFORK`, `DONTFORK`/`DOFORK`)
+  needs the range fully mapped, splits the VMAs at its ends and sets the flag. Whether the range is
+  locked (`MADV_DONTNEED` is `EINVAL`) or all private anonymous (`MADV_FREE` and `MADV_WIPEONFORK`
+  otherwise `EINVAL`) is judged over the VMAs overlapping it only.
 
 ### Stack and heap growth
 
@@ -290,10 +295,10 @@ signals may still be delivered).
 ### fork and copy-on-write
 
 - The caller quiesces the parent, then `fork` checks commit (`commit_too_big`: counts private
-  writable non-`MAP_NORESERVE` VMAs by guest prot, merging adjacent ones the way Linux `vma_merge`
-  would; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it). `fork` cannot fail after
-  lending starts.
-- Per VMA:
+  writable non-`MAP_NORESERVE` VMAs the child gets, by guest prot, merging adjacent ones the way
+  Linux `vma_merge` would; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it).
+  `fork` cannot fail after lending starts.
+- Per VMA (`MADV_DONTFORK` VMAs are skipped; the child's VMAs keep `dontdump` and `wipeonfork`):
   - shared mappings, reservations and read-only private file mappings share the parent's region;
     read-only private file VMAs are marked `cow` on both sides;
   - non-growsdown, non-reserved, non-heap anonymous or writable private-file VMAs of at most 1 MB
@@ -301,7 +306,8 @@ signals may still be delivered).
   - the heap (the anonymous VMA at the page-aligned `brk_start`, at most 256 MB) gets a spare region
     of 256 MB; a growsdown anonymous VMA with reserved room below gets a spare region of room plus
     length; everything else gets new anonymous memory;
-  - private anonymous VMAs that were ever written are lent; never-written ones need nothing;
+  - private anonymous VMAs that were ever written are lent, except `MADV_WIPEONFORK` ones, where
+    the child keeps its own all-zero memory; never-written ones need nothing;
   - writable private file VMAs are copied page by page up to EOF, skipping all-zero pages.
 - Lending: VMAs of at most 16 pages lend every page. Larger ones read the host
   `/proc/self/pagemap` only over 2 MB leaf windows that have entries or CoW pages (merged up to
@@ -359,8 +365,8 @@ signals may still be delivered).
 - `regions` labels each VMA (file name, else `[stack]` for the VMA containing `start_stack` and the
   contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[heap]` inside
   `[brk_start, brk)`) and joins adjacent entries for display when both are private anonymous or the
-  same file at contiguous offsets, and prot, shared, locked, may_write, dontdump and name all match
-  (may_exec is not compared). Shared anonymous entries are never joined.
+  same file at contiguous offsets, and prot, shared, locked, may_write, the dump and fork flags and
+  name all match (may_exec is not compared). Shared anonymous entries are never joined.
 - Residency always comes from host `mincore` on host pointers, never from guest addresses. Borrowed
   pages always count as resident; reserved VMAs never do.
 - `resident_pages` (VmRSS, statm, cgroup, OOM victim choice) skips never-written private anonymous
@@ -438,12 +444,8 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- **Spurious madvise `EINVAL`:** `advice_range` folds in the VMA just below the start address even
-  when it does not overlap, so `MADV_DONTNEED` fails if any locked VMA lies below, and `MADV_FREE`,
-  `MADV_WIPEONFORK` and `MADV_KEEPONFORK` fail if that VMA is file-backed or shared.
-- **Fork-related madvise advice ignored:** `MADV_WIPEONFORK` and `MADV_DONTFORK` are accepted but
-  fork still gives the child the parent's contents; `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*`
-  do nothing; `MADV_KEEPONFORK` is rejected on non-private-anonymous ranges, which Linux does not do.
+- **Some madvise advice is ignored:** `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*` are accepted
+  but do nothing.
 - **`MADV_DONTNEED` on private file mappings is a no-op:** written private pages keep their data
   instead of reverting to the file. `MADV_REMOVE` zero-fills through the host mapping rather than
   punching a hole, so storage is not freed.
@@ -462,8 +464,6 @@ signals may still be delivered).
   entries were moved drops VMAs and leaves stale entries at the destination.
 - **Shared anonymous `MAP_NORESERVE` is accounted:** contrary to its own comment and Linux, so a
   large shared reservation can fail with `ENOMEM`.
-- **`dontdump` is lost on fork and mremap growth:** contrary to Linux, so a child's core dump
-  includes `MADV_DONTDUMP` regions and smaps loses `dd`.
 - **pagemap reports lent pages as exclusive:** they are mapped by several address spaces, contrary
   to Linux and the function's own description of the bit.
 - **Robust futex death skips CoW pages:** `owner_died` looks up the lock word with `translate`,
