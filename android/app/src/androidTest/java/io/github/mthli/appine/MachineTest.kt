@@ -381,7 +381,8 @@ class MachineTest {
 
     /**
      * Saved tabs (the android/service map): while the marker is still there (killed) they read back
-     * unchanged (names included), and after one read the marker is gone; after a normal exit
+     * unchanged (names included), also a second time (killed again before the kernel came up); a
+     * later save replaces them and leaves only the transcripts its index names; after a normal exit
      * (clear) nothing is read.
      */
     @Test
@@ -397,9 +398,11 @@ class MachineTest {
         assertEquals(tabs, saved?.tabs)
         assertEquals(1, saved?.current)
         assertTrue(saved!!.time > 0)
-        assertEquals(null, Tabs.takeKilled(context))
-        Tabs.markRunning(context)
-        Tabs.save(context, tabs.take(1), 0)
+        assertEquals(tabs, Tabs.takeKilled(context)?.tabs)
+        Tabs.save(context, listOf(tabs[0].copy(transcript = "line 3")), 0)
+        assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.tabs?.map { it.transcript })
+        val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }
+        assertEquals(transcripts.toString(), 1, transcripts.size)
         Tabs.clear(context)
         assertEquals(null, Tabs.takeKilled(context))
     }
