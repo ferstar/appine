@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: guest timeouts and timer values saturate at `KTIME_MAX`; removed the long-sleep panic)
+> Maintained: 2026-11-04 (targeted verification: guest timeouts and timer values saturate at `KTIME_MAX`; removed the long-sleep panic; orphans in a dying pid namespace go to the virtual init, removed the teardown hang)
 
 ## Responsibilities
 
@@ -146,13 +146,14 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   freed after the BKL is released.
 - `finish_group`: release AIO; reparent children to the nearest `PR_SET_CHILD_SUBREAPER` ancestor
   in the same pid-namespace level that still has live threads (one in the middle of exiting can be
-  chosen, as on Linux), else the pid-namespace init, else the virtual init (children get
-  `exit_signal = SIGCHLD`; zombies handed to the virtual init are freed at once); send
-  `PR_SET_PDEATHSIG` signals (keyed to the creating thread); release SysV IPC and the controlling
-  terminal.
+  chosen, as on Linux), else the pid-namespace init while it has not exited, else the virtual init
+  (children get `exit_signal = SIGCHLD`; zombies handed to the virtual init are freed at once);
+  send `PR_SET_PDEATHSIG` signals (keyed to the creating thread); release SysV IPC and the
+  controlling terminal.
 - When a pid-namespace init exits, the namespace is marked dead and every other member gets
-  `SIGKILL`; the init's own children go to the virtual init, and its exit is reported only once all
-  other members are reaped (it stays registered meanwhile).
+  `SIGKILL`; the init's own children, and the orphans other members leave while they die, go to the
+  virtual init (which frees them at once, as Linux's exiting init reaps them), and its exit is
+  reported only once all other members are reaped (it stays registered meanwhile).
 - Reporting: the status is `exiting` or the leader's; it is reported to a tracer or the parent. The
   group is reaped immediately when the parent is the virtual init, gone, ignores `SIGCHLD` or has
   `SA_NOCLDWAIT`; otherwise it becomes a zombie and the parent gets `exit_signal`. Orphaned process
@@ -420,10 +421,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ## Confirmed bugs / technical debt
 
-- **Pid-namespace teardown can hang:** after the namespace init exits, orphans of other members are
-  reparented to the held, threadless init, which never reaps them; with a tree two or more levels
-  deep inside the namespace, the init's exit is never reported and its parent's `waitpid` blocks
-  forever.
 - **`uid_map`/`gid_map` (and `timens_offsets`) writes trust the writer, not the opener:** the opener's
   credentials, the opener-namespace check and the `CAP_SETFCAP` check for mapping uid 0 are
   missing, so an unprivileged user can pass an opened map file to a setuid-root program and get an

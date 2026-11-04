@@ -701,7 +701,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         }
         // Orphans go first to the nearest subreaper (Linux's find_new_reaper), otherwise to pid 1
         // of their pid namespace (find_child_reaper), and to init in the boot-time namespace or
-        // when pid 1 itself exits
+        // once pid 1 has exited: its group stays registered until the namespace is empty
+        // (Kernel::hold_reaper) but never waits again, and Linux's exiting pid 1 reaps them itself
+        // (zap_pid_ns_processes), so the built-in init, which frees them at once, takes its place
         let subreaper = if zap {
             None
         } else {
@@ -709,9 +711,9 @@ pub(crate) fn finish_group(k: &mut Kernel, group: &Rc<RefCell<ThreadGroup>>) {
         };
         let reaper = subreaper
             .or_else(|| {
-                ns.reaper
-                    .get()
-                    .filter(|&r| ns.level > 0 && !zap && k.groups.contains_key(&r))
+                ns.reaper.get().filter(|&r| {
+                    ns.level > 0 && !zap && !ns.dead.get() && k.groups.contains_key(&r)
+                })
             })
             .unwrap_or(INIT);
         let reaper_thread = k

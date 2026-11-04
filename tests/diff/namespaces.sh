@@ -399,6 +399,11 @@ echo "unshare exits with $?"
 busybox unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
 # task/1/children of process 1 has the inner IDs (the two background sleeps and cat itself)
 busybox unshare -p -f --mount-proc sh -c 'sleep 100 & sleep 100 & echo "children of 1: $(cat /proc/1/task/1/children)."; kill 2 3'
+# Process 1 exits while a deeper tree still runs (1 → sh → two sleeps): everything inside is
+# killed, the orphans left by the killed sh are reaped, and unshare sees process 1 end (Linux's
+# zap_pid_ns_processes)
+timeout 20 busybox unshare -p -f sh -c 'sh -c "sleep 100 & sleep 100 & wait" & sleep 0.5; exit 7'
+echo "process 1 left a deeper tree, unshare exits with $?"
 # The parent is killed outside the pid namespace: process 1 inside still receives the
 # PR_SET_PDEATHSIG (SIGKILL) it set, and since the sender is invisible inside, it is handled as a
 # forced signal (util-linux's unshare --kill-child and bwrap's --die-with-parent rely on this).
