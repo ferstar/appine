@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the Android job installs Zig and fetches the Ghostty source)
+> Maintained: 2026-11-04 (targeted verification: the Android job installs Zig and fetches the Ghostty source; counting processes inside a difftest case)
 
 ## Responsibilities
 
@@ -179,6 +179,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   while the native side starts fresh.
 - Durations are recorded only by parallel difftest runs (`-j 1`, as in CI, never updates them);
   a partial LTP run writes a `results.txt` holding only that subset (durations are merged).
+- A case that counts processes must not count its own pipeline: `ls /proc | grep -c` sees `grep`
+  only when it started before `ls` read `/proc`, which differs run to run on either side (the
+  `bwrap` case failed this way in CI); a shell glob (`set -- /proc/[0-9]*; echo $#`) starts no
+  process.
 
 ## Confirmed bugs / technical debt
 

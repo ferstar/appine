@@ -23,9 +23,12 @@ bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --ro-bind /etc/passwd /
     grep -E "^/(tmp|tmp/passwd|tmp/ws|dev/null|dev/pts|proc) " | sort
 
 echo "== unshare-all"
+# The processes in the new pid namespace are counted by the shell's own glob, which starts no
+# process: through a pipe (ls /proc | grep -c) grep was counted only when it had started before ls
+# read /proc, so the count was 3 or 4 on either side
 bwrap --unshare-all --hostname box --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp sh -c '
     echo "uid $(id -u) gid $(id -g) pid $$"; hostname
-    ls /proc | grep -c "^[0-9]"
+    set -- /proc/[0-9]*; echo "$# processes"
     ip -o addr | cut -d" " -f2-4
     wget -q -T 2 -O- http://10.0.0.1/ 2>&1 | head -1
 ' 2>&1
