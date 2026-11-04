@@ -141,7 +141,9 @@ class TerminalService : Service() {
                         when (power) {
                             Native.POWER_REBOOT -> restart()
                             Native.POWER_HALT, Native.POWER_OFF -> exitAll()
-                            else -> if (sessions.isEmpty() && listeners.isEmpty() && processes == 0) exitAll()
+                            // Tabs whose shell has ended do not count (restored ones not shown yet
+                            // do: their shell has not started)
+                            else -> if (sessions.none { it.isRunning } && listeners.isEmpty() && processes == 0) exitAll()
                         }
                     }
                 }
@@ -152,6 +154,21 @@ class TerminalService : Service() {
 
     /** Shutting down to exit ([exitAll]). */
     private var exiting = false
+
+    /** A [start] is running: the rootfs is being prepared or the kernel is starting. */
+    private var starting = false
+
+    /**
+     * [restart] or [replace] has let go of the old kernel and not yet called [start]: the wake lock
+     * stays held, and an [exitAll] meanwhile is finished by them.
+     */
+    private var transitioning = false
+
+    /**
+     * A distro switch whose download finished while the kernel was restarting (a guest reboot):
+     * replaced as soon as the new kernel is up or has failed.
+     */
+    private var pendingReplace: Rootfs.Distro? = null
 
     /** The kernel handle, 0 before the start. */
     var machine = 0L
@@ -182,6 +199,12 @@ class TerminalService : Service() {
 
     /** Something to tell the user that has not been told yet ([Listener.onNotice]). */
     private var notice: String? = null
+
+    /**
+     * The next ended-process notification ([reportKill]), counting up; it starts from the clock so
+     * a new service does not reuse the ids of reports still shown from the last one.
+     */
+    private var killNotifications = (System.currentTimeMillis() % KILL_NOTIFICATION_COUNT).toInt()
 
     /**
      * The thread that probes mirror speeds after an import or after "automatic" is chosen in
@@ -269,6 +292,18 @@ class TerminalService : Service() {
             main.postDelayed(trimWhenHidden, TRIM_DELAY_MS)
             // The UI is gone and the app may be killed at any time: save the tabs first
             saveTabs()
+            stopIfFailed()
+        }
+    }
+
+    /**
+     * The start failed and no UI is left to show it: stop rather than keep a foreground service
+     * and its notification with nothing running (without a kernel there is no poll to end it).
+     * Opening the app again tries again.
+     */
+    private fun stopIfFailed() {
+        if (machine == 0L && startError != null && !starting && !transitioning && !exiting && listeners.isEmpty()) {
+            stopSelf()
         }
     }
 
@@ -285,7 +320,8 @@ class TerminalService : Service() {
         }
 
         override fun onFinished(session: VtSession) {
-            each { it.onSessionsChanged() }
+            // The notification counts running tabs, and an ended tab is no longer saved
+            sessionsChanged()
         }
     }
 
@@ -361,6 +397,8 @@ class TerminalService : Service() {
      */
     private fun start(distro: Rootfs.Distro?) {
         startError = null
+        starting = true
+        updateWakeLock()
         if (distro != null) preparing(getString(R.string.preparing, distro.label))
         val tier = tier
         thread(name = "appine-start") {
@@ -383,11 +421,26 @@ class TerminalService : Service() {
                 Rootfs.access.write { Native.start(Rootfs.store(this).path, tier) }
             }
             main.post {
+                starting = false
+                if (exiting) {
+                    // "Exit all" while starting: stop the kernel that has just come up (not booted
+                    // yet, so without the inittab shutdown) and finish exiting
+                    progress = null
+                    finishExit(result.getOrDefault(0L), booted = false)
+                    return@post
+                }
                 result.onSuccess {
                     machine = it
                     progress = null
                     // The store may have just been imported (first run, distro switch)
                     Documents.rootsChanged(this)
+                    val next = pendingReplace
+                    if (next != null) {
+                        // A distro download finished while this kernel was starting
+                        pendingReplace = null
+                        replace(next)
+                        return@onSuccess
+                    }
                     updateWakeLock()
                     Tabs.markRunning(this)
                     restore?.let { saved -> restoreTabs(saved) }
@@ -423,10 +476,20 @@ class TerminalService : Service() {
                         tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
                         start(Rootfs.Distro.ALPINE)
                     } else {
-                        progress = null
-                        startError = error
-                        updateNotification()
-                        each { l -> l.onMachineReady(error) }
+                        val next = pendingReplace
+                        pendingReplace = null
+                        if (next != null) {
+                            // A distro download finished while this kernel was starting: replacing
+                            // the store is also how a failed one is recovered
+                            replace(next)
+                        } else {
+                            progress = null
+                            startError = error
+                            updateWakeLock()
+                            updateNotification()
+                            each { l -> l.onMachineReady(error) }
+                            stopIfFailed()
+                        }
                     }
                 }
             }
@@ -488,7 +551,11 @@ class TerminalService : Service() {
                 }
                 switching = null
                 result.onSuccess {
-                    if (machine != 0L || startError != null) replace(distro)
+                    when {
+                        machine != 0L || startError != null -> replace(distro)
+                        // The kernel is restarting (a guest reboot): replace once it is up
+                        starting || transitioning -> pendingReplace = distro
+                    }
                 }.onFailure {
                     if (it !is Rootfs.Cancelled) {
                         Log.w(TAG, "cannot download ${distro.label}", it)
@@ -516,6 +583,7 @@ class TerminalService : Service() {
     private fun replace(distro: Rootfs.Distro) {
         // The old accounts were all deleted with the store
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LOGIN).apply()
+        transitioning = true
         val m = detach()
         startError = null
         preparing(getString(R.string.preparing, distro.label))
@@ -523,7 +591,12 @@ class TerminalService : Service() {
             if (m != 0L) Native.stop(m)
             mirrorThread?.join()
             Rootfs.reset(this)
-            main.post { start(distro) }
+            main.post {
+                transitioning = false
+                // Also after "Exit all" meanwhile: the store is gone, so import the chosen distro
+                // (the start then stops it again) rather than leave the next start to import Alpine
+                start(distro)
+            }
         }
     }
 
@@ -599,9 +672,9 @@ class TerminalService : Service() {
 
     /**
      * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
-     * while the switch is on and the kernel is running or shutting down ([exitAll], before the
-     * service stops); otherwise the CPU sleeps after the screen goes off and the guest's processes
-     * stop with it.
+     * while the switch is on and the kernel is starting, running, restarting, being replaced or
+     * shutting down ([exitAll], before the service stops); otherwise the CPU sleeps after the screen
+     * goes off and the guest's processes stop with it.
      *
      * The app always has a foreground service, so the lock stays effective in Doze:
      * `PowerManagerService` disables partial wake locks only for apps whose process state comes
@@ -613,7 +686,7 @@ class TerminalService : Service() {
     // fixed duration, and not released within the same call
     @SuppressLint("WakelockTimeout", "Wakelock")
     private fun updateWakeLock() {
-        val want = keepAwake && (machine != 0L || exiting)
+        val want = keepAwake && (machine != 0L || exiting || starting || transitioning)
         val held = wakeLock
         if (want && held == null) {
             wakeLock = getSystemService(PowerManager::class.java)
@@ -645,17 +718,33 @@ class TerminalService : Service() {
         // as already gone, and a UI present after the shutdown means the user opened the app again
         switching?.cancelled = true
         switching = null
+        pendingReplace = null
         each { it.onExitAll() }
         listeners.clear()
         val m = detach()
         updateNotification()
+        // A start, restart or replacement in progress finishes exiting itself once its kernel is up
+        // (or has failed): there is nothing to shut down yet, and stopping the service now would
+        // leave that kernel running
+        if (starting || transitioning) return
+        finishExit(m)
+    }
+
+    /**
+     * The rest of [exitAll]: shuts [m] down by inittab (or, not [booted] yet, just stops it), then
+     * stops the service.
+     */
+    private fun finishExit(m: Long, booted: Boolean = true) {
         worker.execute {
-            if (m != 0L) Native.shutdown(m)
+            if (m != 0L) {
+                if (booted) Native.shutdown(m) else Native.stop(m)
+            }
             main.post {
                 exiting = false
                 updateWakeLock()
-                // Normal exit: do not restore the tabs next time
-                Tabs.clear(this)
+                // Normal exit: do not restore the tabs next time. Tabs of a killed run that have not
+                // been restored yet (the start never succeeded) are kept for the next start
+                if (restore == null) Tabs.clear(this)
                 // The user opened the app again during the shutdown: start again, otherwise the UI
                 // stays at "Starting…" forever
                 if (listeners.isNotEmpty()) start(null) else stopSelf()
@@ -669,11 +758,16 @@ class TerminalService : Service() {
      */
     private fun restart() {
         if (machine == 0L) return
+        transitioning = true
         val m = detach()
         each { it.onRestarting() }
         worker.execute {
             Native.shutdown(m)
-            main.post { if (!exiting) start(null) }
+            main.post {
+                transitioning = false
+                // "Exit all" meanwhile left the rest to here
+                if (exiting) finishExit(0) else start(null)
+            }
         }
     }
 
@@ -717,9 +811,10 @@ class TerminalService : Service() {
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
         main.removeCallbacks(saveSoon)
-        // The service stopped normally (after exitAll): do not restore next time. Being killed
-        // never gets here
-        Tabs.clear(this)
+        // The service stopped normally (after exitAll, or a failed start with no UI): do not restore
+        // next time, except tabs of a killed run that were never restored. Being killed never gets
+        // here
+        if (restore == null) Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) s.release()
         sessions.clear()
@@ -894,8 +989,10 @@ class TerminalService : Service() {
         }
         val session = sessions.firstOrNull { it.console == console && console >= 0 }
         val shown = session?.showMessage("[appine] $text") == true
-        if (shown && listeners.isNotEmpty() && !bug) return
-        val id = KILL_NOTIFICATION_BASE + pid % 1000
+        // Enough only when that tab is the one in front of the user: not another tab, and not
+        // Settings in front of the terminal
+        if (shown && session === current && listeners.any { it is MainActivity } && !bug) return
+        val id = KILL_NOTIFICATION_BASE + killNotifications++ % KILL_NOTIFICATION_COUNT
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
@@ -1011,11 +1108,14 @@ class TerminalService : Service() {
             this, 1, Intent(this, TerminalService::class.java).setAction(ACTION_EXIT_ALL),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        val n = sessions.size
+        // Tabs whose shell has ended stay open but are not running
+        val n = sessions.count { it.isRunning }
         val sw = switching
+        val error = startError
         val state = when {
             exiting -> getString(R.string.stopping)
             machine == 0L && progress != null -> progress
+            machine == 0L && error != null -> getString(R.string.start_failed, error)
             n == 0 && machine != 0L -> getString(R.string.background_running)
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
@@ -1072,14 +1172,16 @@ class TerminalService : Service() {
         private const val CHANNEL_ID = "sessions"
         private const val NETWORK_CHANNEL_ID = "network"
         private const val PROBLEMS_CHANNEL_ID = "problems"
-        /**
-         * The boot failure notification; notifications of ended processes are numbered by pid
-         * (offset from the listen ones, but a listen on port 2000–2999 gets the same id as a kill).
-         */
+        /** The boot failure notification. */
         private const val BOOT_NOTIFICATION_ID = 2
-        private const val KILL_NOTIFICATION_BASE = 3000
+        /**
+         * Notifications of ended processes: one id per report, above every listen id, so neither a
+         * listen nor a later report replaces one (and with it a bug's "Copy report").
+         */
+        private const val KILL_NOTIFICATION_BASE = 100_000
+        private const val KILL_NOTIFICATION_COUNT = 100_000
         private const val NOTIFICATION_ID = 1
-        /** Listen notifications are numbered by port, offset from [NOTIFICATION_ID]. */
+        /** Listen notifications are numbered by port: 1000 + port, below [KILL_NOTIFICATION_BASE]. */
         private const val LISTEN_NOTIFICATION_BASE = 1000
         private const val POLL_MS = 2_000L
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"

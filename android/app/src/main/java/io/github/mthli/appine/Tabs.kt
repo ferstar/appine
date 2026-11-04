@@ -6,6 +6,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
 
 /**
  * Restoring tabs after the app was killed (the android/service map). While the kernel runs a
@@ -39,8 +40,8 @@ internal object Tabs {
     private fun marker(context: Context) = File(dir(context), "running")
 
     /**
-     * Hashes of the file contents already written: unchanged content is not written again (saved
-     * every minute, so as not to keep writing flash).
+     * Hashes of the index contents already written: an unchanged index is not written again (saved
+     * every minute, so as not to keep writing flash; transcripts are skipped by their names).
      */
     private val written = HashMap<String, Int>()
 
@@ -63,14 +64,14 @@ internal object Tabs {
     /**
      * Called once when the service starts: returns the saved tabs when the last run did not exit
      * normally (the marker is still there), otherwise deletes the old ones and returns null. The
-     * marker is removed and left again once the kernel is up ([markRunning]).
+     * marker and the tabs stay until they are replaced by the restored tabs' own saves or cleared
+     * by a normal exit: killed again before the kernel is up, the next start still finds them.
      */
     fun takeKilled(context: Context): Saved? {
         if (!marker(context).exists()) {
             clear(context)
             return null
         }
-        marker(context).delete()
         return runCatching { load(context) }
             .onFailure { Log.w(TAG, "cannot read the saved tabs", it) }
             .getOrNull()
@@ -95,35 +96,32 @@ internal object Tabs {
     }
 
     /**
-     * Saves the tabs (called on a background thread): the transcripts first and the index last,
-     * each written to a temporary file and then renamed, so a kill midway leaves either the
-     * complete previous copy or this one to read (the transcripts may be slightly newer).
+     * Saves the tabs (called on a background thread). Each transcript is a file named by its
+     * content, written to a temporary file and then renamed; the index naming them is replaced
+     * last, and only then are transcripts no index names any more deleted. A kill at any point
+     * leaves a complete index whose transcripts all exist and belong to its own tabs.
      */
     fun save(context: Context, tabs: List<Tab>, current: Int) = synchronized(this) {
         try {
             val dir = dir(context).apply { mkdirs() }
             val entries = JSONArray()
-            var changed = false
-            tabs.forEachIndexed { i, tab ->
-                val name = "t$i.txt"
-                changed = writeIfChanged(File(dir, name), tab.transcript.takeLast(MAX_TRANSCRIPT)) || changed
+            val names = HashSet<String>()
+            tabs.forEach { tab ->
+                val text = tab.transcript.takeLast(MAX_TRANSCRIPT)
+                val name = transcriptName(text)
+                // Unchanged since the last save: the file with this content is already there
+                if (name !in names && !File(dir, name).isFile) replace(File(dir, name), text)
+                names.add(name)
                 entries.put(
                     JSONObject().put("login", tab.login).put("cwd", tab.cwd ?: "").put("transcript", name)
                         .apply { tab.name?.let { put("name", it) } },
                 )
             }
-            // Leftover old transcripts (tabs that were closed)
-            dir.listFiles { f -> f.name.matches(Regex("t\\d+\\.txt")) }?.forEach { f ->
-                if (f.name.removePrefix("t").removeSuffix(".txt").toInt() >= tabs.size) {
-                    f.delete()
-                    written.remove(f.name)
-                }
-            }
             // The index carries the save time: not rewritten when the transcripts, the layout and
             // the current directories are all unchanged
             val layout = (entries.toString() + current).hashCode()
             val index = File(dir, "index.json")
-            if (changed || written[index.name] != layout || !index.isFile) {
+            if (written[index.name] != layout || !index.isFile) {
                 val json = JSONObject()
                     .put("time", System.currentTimeMillis())
                     .put("current", current)
@@ -131,18 +129,21 @@ internal object Tabs {
                 replace(index, json.toString())
                 written[index.name] = layout
             }
+            // Transcripts of closed tabs and old contents, and leftovers of a save that was killed
+            // (including the t<i>.txt names of earlier versions)
+            dir.listFiles { f -> f.name.matches(TRANSCRIPT) && f.name !in names }?.forEach { it.delete() }
         } catch (e: IOException) {
             Log.w(TAG, "cannot save the tabs", e)
         }
     }
 
-    /** Writes only when the content changed; returns whether it wrote. */
-    private fun writeIfChanged(file: File, text: String): Boolean {
-        val hash = text.hashCode()
-        if (written[file.name] == hash && file.isFile) return false
-        replace(file, text)
-        written[file.name] = hash
-        return true
+    /** Transcript files (current and earlier names) and their temporary files. */
+    private val TRANSCRIPT = Regex("t[-0-9a-f]+\\.txt(\\.tmp)?")
+
+    /** The file name of a transcript: a digest of [text], so equal content keeps its file. */
+    private fun transcriptName(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+        return "t-" + digest.take(16).joinToString("") { "%02x".format(it) } + ".txt"
     }
 
     private fun replace(file: File, text: String) {
