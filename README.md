@@ -140,8 +140,8 @@ version 3 of the License, or (at your option) any later version. See [LICENSE](L
 Copyright (C) 2026 Matthew Lee
 ```
 
-The Android app also contains code under other licenses: the terminal libraries vendored from
-Termux (GPL 3.0 only, partly Apache 2.0), the Alpine Linux minirootfs (busybox, apk-tools and
-others under the GPL 2.0), AndroidX and Kotlin (Apache 2.0), and the Rust crates in
-`Cargo.lock` (MIT and other permissive licenses). The app lists them all under
+The Android app also contains code under other licenses: Ghostty's libghostty-vt and the
+libraries it links (MIT, BSD 3-Clause, Unicode), the JetBrains Mono font (OFL 1.1), the Alpine
+Linux minirootfs (busybox, apk-tools and others under the GPL 2.0), AndroidX and Kotlin
+(Apache 2.0), and the Rust crates in `Cargo.lock` (MIT and other permissive licenses). The app lists them all under
 Settings → Open source licenses; see `android/README.md`.

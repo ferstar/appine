@@ -1,13 +1,14 @@
 #!/bin/sh
-# Downloads and verifies the Ghostty source release that libghostty-vt is built from (the
-# experimental terminal view, android/terminal map), then fetches the Zig packages its build needs,
-# so that the cargo build (hosts/android/build.rs) works offline. The version and sha256 are fixed
-# here and changed together on upgrades; Ghostty 1.4.0 needs Zig 0.17.0. Usage:
-# scripts/fetch-ghostty [output directory], target/ghostty by default; the source ends up in
-# <output directory>/ghostty-<version>.
+# Downloads and verifies the Ghostty source release that libghostty-vt, the terminal of the app's
+# tabs, is built from (android/native and android/terminal maps), then fetches the Zig packages its
+# build needs into the source's zig-pkg/, so that the cargo build (hosts/android/build.rs) works
+# offline. The version and sha256 are fixed here and changed together on upgrades; Ghostty 1.4.0
+# needs Zig 0.17.0. Usage: scripts/fetch-ghostty [output directory], target/ghostty by default; the
+# source ends up in <output directory>/ghostty-<version>.
 #
-# Only the sha256 is checked. The release is also signed with minisign
-# (<url>.minisig); checking that signature is left for when the build is no longer experimental.
+# Only the pinned sha256 is checked here. When upgrading, check the new release's minisign
+# signature (<url>.minisig, with the key on ghostty.org) once before pinning its sha256. The Zig
+# packages are checked by Zig against the hashes in the source's build.zig.zon files.
 #
 # Zig's HTTP client fails through some proxies (HTTP 400 from deps.files.ghostty.org through
 # Clash and similar), so the proxy variables are removed for the fetch.
@@ -47,9 +48,12 @@ if ! [ -f "$src/build.zig" ]; then
     tar -xzf "$out/$name" -C "$out"
 fi
 
-# Lazy dependencies are fetched only when a build step needs them, so fetch everything the
-# libghostty-vt build for Android can reach
+# Lazy dependencies are fetched only when the build script asks for them: run its configure phase
+# with build.rs's options (--help stops before building), which fetches exactly what that build
+# uses. Packages already in Zig's global cache are unpacked into zig-pkg/ too, needed or not; with
+# an empty cache (ZIG_GLOBAL_CACHE_DIR) only the needed ones are (scripts/release-sources)
 cd "$src"
 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-    zig build --fetch=all -Demit-lib-vt -Dtarget=aarch64-linux-android
+    zig build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast -Dtarget=aarch64-linux-android \
+    --help >/dev/null
 echo "fetch-ghostty: $src"

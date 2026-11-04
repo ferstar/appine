@@ -45,9 +45,8 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * The terminal view on libghostty-vt (the android/terminal map), used for the tabs when the native
- * library has the `vt` feature: draws the [VtSession] attached to it with JetBrains Mono on a fixed
- * cell grid. Sessions belong to [TerminalService] and keep parsing output while no view shows them;
+ * The terminal view on libghostty-vt (the android/terminal map): draws the [VtSession] attached to
+ * it with JetBrains Mono on a fixed cell grid. Sessions belong to [TerminalService] and keep parsing output while no view shows them;
  * [attach] switches the view to another tab.
  *
  * Each frame takes the rows that changed ([VtNative.frame]) into a mirror of the screen and paints
@@ -133,7 +132,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private val curl = Path()
     private val glyphs = VtGlyphs()
 
-    /** The font size in pixels; [MainActivity] keeps it across starts, as for the Termux view. */
+    /** The font size in pixels; [MainActivity] keeps it across starts. */
     private var fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics)
     private var cellWidth = 1
     private var cellHeight = 1

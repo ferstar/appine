@@ -640,9 +640,9 @@ class MachineTest {
 
     /**
      * The open-source notices generated at build time (design doc §13.4) are in the APK: appine's
-     * own AGPL notice and full text, the Termux libraries, the GPL packages in Alpine (with the
-     * aports commit), the Android libraries, the crates linked into the library (no proc macros),
-     * and the full license texts; every file in the index is present.
+     * own AGPL notice and full text, libghostty-vt with what it links and the terminal font, the GPL
+     * packages in Alpine (with the aports commit), the Android libraries, the crates linked into the
+     * library (no proc macros), and the full license texts; every file in the index is present.
      */
     @Test
     fun noticesCoverTheApp() {
@@ -652,7 +652,12 @@ class MachineTest {
             .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
         val titles = index.map { it[0] }
         assertTrue(text("appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
-        assertTrue(text("Termux").contains("GPLv3 only"))
+        assertTrue(text("Ghostty ").contains("Mitchell Hashimoto"))
+        for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "Zig ")) {
+            assertTrue(component, text(component).contains("Permission is hereby granted") || text(component).contains("Redistribution and use"))
+        }
+        assertTrue(text("JetBrains Mono").contains("SIL OPEN FONT LICENSE"))
+        assertFalse(titles.any { it.contains("Termux") })
         val alpine = text("Alpine Linux")
         assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
         assertTrue(text("Android libraries").contains("androidx.core:core:"))

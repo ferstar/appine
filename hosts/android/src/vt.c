@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The tabs' emulator when the app is built with the `vt` feature (android/terminal map): one
-// libghostty-vt terminal per tab, behind a small C ABI that vt.rs calls. This file only talks to
+// The tabs' terminal emulator (android/terminal map): one libghostty-vt terminal per tab, behind
+// a small C ABI that vt.rs calls. This file only talks to
 // libghostty-vt; the console, threads and locking are vt.rs's.
 //
 // Threading: libghostty-vt is not thread-safe, and neither is anything here. vt.rs holds one lock
@@ -835,11 +835,11 @@ static size_t utf8_width(const uint8_t *s, size_t len) {
   return width;
 }
 
-// Shows a yellow line of app notice (a kill report) above the cursor's line, as the Termux
-// session does: move down and back as many lines as it takes (scrolling at the bottom), save the
-// cursor, insert the lines, write, restore the cursor and move it down. The prompt and a half-typed
-// command move down with it and the shell's line editing is unaffected. False on the alternate
-// screen (a full-screen program), where nothing is written.
+// Shows a yellow line of app notice (a kill report) above the cursor's line: move down and back as
+// many lines as it takes (scrolling at the bottom), save the cursor, insert the lines, write,
+// restore the cursor and move it down. The prompt and a half-typed command move down with it and
+// the shell's line editing is unaffected. False on the alternate screen (a full-screen program),
+// where nothing is written.
 bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
   if (is_alternate(vt)) return false;
   size_t width = utf8_width(text, len);

@@ -11,10 +11,8 @@ import android.widget.TextView
 
 /**
  * The keys the soft keyboard lacks. Ctrl and Alt are one-shot modifiers: pressed once, they apply
- * to the next key typed, which reads them ([consumeCtrl], [consumeAlt], or [ctrl], [alt] and
- * [modifiersUsed]).
- * Termux's extra keys bar belongs to its GPLv3 main module, so this is a rewrite (the
- * android/terminal map).
+ * to the next key typed, which reads them ([ctrl], [alt]) and reports taking them
+ * ([modifiersUsed]). The android/terminal map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(context: Context, private val target: Target) : LinearLayout(context) {
@@ -55,21 +53,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         key("↓") { send(KeyEvent.KEYCODE_DPAD_DOWN) }
         key("↑") { send(KeyEvent.KEYCODE_DPAD_UP) }
         key("→") { send(KeyEvent.KEYCODE_DPAD_RIGHT) }
-    }
-
-    /** Called when TerminalView reads the modifier: one read resets it. */
-    fun consumeCtrl(): Boolean = ctrl.also {
-        if (it) {
-            ctrl = false
-            post { refresh() }
-        }
-    }
-
-    fun consumeAlt(): Boolean = alt.also {
-        if (it) {
-            alt = false
-            post { refresh() }
-        }
     }
 
     /** The next key or character took both one-shot modifiers. */

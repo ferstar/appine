@@ -16,4 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "appine"
 
-include(":app", ":terminal-emulator", ":terminal-view")
+include(":app")

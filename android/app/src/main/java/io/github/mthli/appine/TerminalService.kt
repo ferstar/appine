@@ -25,8 +25,6 @@ import android.system.Os
 import android.system.OsConstants
 import android.util.Log
 import android.widget.Toast
-import com.termux.terminal.TerminalSession
-import com.termux.terminal.TerminalSessionClient
 import java.util.concurrent.Executors
 import java.text.DateFormat
 import java.text.DecimalFormat
@@ -63,9 +61,6 @@ class TerminalService : Service() {
 
         /** The session list, a title or a state changed. */
         fun onSessionsChanged() {}
-
-        /** A Termux session's screen content changed (libghostty-vt sessions redraw their view themselves). */
-        fun onTextChanged(session: Session) {}
 
         /** Exit all: the user chose "Exit all" in the notification, or the guest shut down. */
         fun onExitAll() {}
@@ -201,17 +196,14 @@ class TerminalService : Service() {
     /** [network] is registered. */
     private var watchingNetwork = false
 
-    /**
-     * The tabs, on libghostty-vt when the native library has it ([VtNative.available]), else on the
-     * Termux emulator.
-     */
-    val sessions = mutableListOf<Session>()
+    /** The tabs. */
+    internal val sessions = mutableListOf<VtSession>()
 
     /**
      * The saved copy of restored sessions not shown yet (their emulator is not created yet, so the
      * transcript and the directory are still the original ones).
      */
-    private val unshown = HashMap<Session, Tabs.Tab>()
+    private val unshown = HashMap<VtSession, Tabs.Tab>()
 
     /**
      * Tabs saved when the system last killed the app, restored after the kernel first comes up (the
@@ -220,11 +212,11 @@ class TerminalService : Service() {
     private var restore: Tabs.Saved? = null
 
     /** The tab to show after restoring (taken by the Activity). */
-    var focus: Session? = null
+    internal var focus: VtSession? = null
         private set
 
     /** The tab the Activity is showing (saving tabs records which one it is). */
-    var current: Session? = null
+    internal var current: VtSession? = null
 
     /**
      * Tabs are saved every [SAVE_MS] while the kernel runs, and at once when the UI is hidden or
@@ -283,83 +275,11 @@ class TerminalService : Service() {
     /** A UI may remove itself during a callback, so iterate over a copy. */
     private fun each(f: (Listener) -> Unit) = listeners.toList().forEach(f)
 
-    /** The [Session] of a Termux session. */
-    private fun termux(terminal: TerminalSession): Session? =
-        sessions.firstOrNull { it is TermuxSession && it.terminal === terminal }
-
     /**
-     * Callbacks shared by all Termux sessions: sessions outlive the Activity, so events go to the
-     * current Activity (if any).
+     * What the sessions report (title changes, ends) goes to the current Activity (if any); their
+     * screens go to their views directly.
      */
-    private val client = object : TerminalSessionClient {
-        override fun onTextChanged(changedSession: TerminalSession) {
-            val session = termux(changedSession) ?: return
-            each { it.onTextChanged(session) }
-        }
-
-        override fun onTitleChanged(changedSession: TerminalSession) {
-            each { it.onSessionsChanged() }
-        }
-
-        override fun onSessionFinished(finishedSession: TerminalSession) {
-            each { it.onSessionsChanged() }
-        }
-
-        override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
-            val clipboard = getSystemService(ClipboardManager::class.java)
-            clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), text))
-        }
-
-        override fun onPasteTextFromClipboard(session: TerminalSession?) {
-            val clipboard = getSystemService(ClipboardManager::class.java)
-            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this@TerminalService)
-            if (!text.isNullOrEmpty()) session?.emulator?.paste(text.toString())
-        }
-
-        override fun onBell(session: TerminalSession) {}
-
-        override fun onColorsChanged(session: TerminalSession) {
-            val s = termux(session) ?: return
-            each { it.onTextChanged(s) }
-        }
-
-        override fun onTerminalCursorStateChange(state: Boolean) {}
-
-        override fun setTerminalShellPid(session: TerminalSession, pid: Int) {}
-
-        override fun getTerminalCursorStyle(): Int? = null
-
-        override fun logError(tag: String?, message: String?) {
-            Log.e(tag, message.orEmpty())
-        }
-
-        override fun logWarn(tag: String?, message: String?) {
-            Log.w(tag, message.orEmpty())
-        }
-
-        override fun logInfo(tag: String?, message: String?) {
-            Log.i(tag, message.orEmpty())
-        }
-
-        override fun logDebug(tag: String?, message: String?) {
-            Log.d(tag, message.orEmpty())
-        }
-
-        override fun logVerbose(tag: String?, message: String?) {
-            Log.v(tag, message.orEmpty())
-        }
-
-        override fun logStackTraceWithMessage(tag: String?, message: String?, e: Exception?) {
-            Log.e(tag, message.orEmpty(), e)
-        }
-
-        override fun logStackTrace(tag: String?, e: Exception?) {
-            Log.e(tag, "", e)
-        }
-    }
-
-    /** What libghostty-vt sessions report; their screens go to their views directly. */
-    private val vtEvents = object : VtSession.Events {
+    private val sessionEvents = object : VtSession.Events {
         override fun onTitleChanged(session: VtSession) {
             each { it.onSessionsChanged() }
         }
@@ -826,23 +746,18 @@ class TerminalService : Service() {
 
     /**
      * Opens a new terminal session (a login shell), logged in as [account] and starting in [cwd]
-     * (null is the home directory), on libghostty-vt when the native library has it, else on the
-     * Termux emulator. The shell starts when the window size is first known.
+     * (null is the home directory). The shell starts when the window size is first known.
      */
-    fun createSession(account: String = login, cwd: String? = null): Session {
+    internal fun createSession(account: String = login, cwd: String? = null): VtSession {
         val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
-        val session = if (VtNative.available) {
-            VtSession(pty, machine, vtEvents)
-        } else {
-            TermuxSession(TerminalSession(pty, TRANSCRIPT_ROWS, client), pty)
-        }
+        val session = VtSession(pty, machine, sessionEvents)
         sessions.add(session)
         sessionsChanged()
         return session
     }
 
     /** Closes a session: the shell receives SIGHUP. */
-    fun removeSession(session: Session) {
+    internal fun removeSession(session: VtSession) {
         session.release()
         sessions.remove(session)
         unshown.remove(session)
@@ -1163,7 +1078,6 @@ class TerminalService : Service() {
         /** See the instance's [systemDocuments]. */
         fun showSystemDocuments(context: Context): Boolean =
             context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_SYSTEM_DOCUMENTS, false)
-        private const val TRANSCRIPT_ROWS = 2000
         private const val TRIM_DELAY_MS = 60_000L
         private const val SAVE_MS = 60_000L
         private const val SAVE_SOON_MS = 2_000L

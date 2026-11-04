@@ -10,6 +10,11 @@
 #   alpine-<version>-gpl-sources.tar  the GPL packages of the Alpine minirootfs in the APK: each
 #                                     one's directory at its aports commit (APKBUILD, patches) and
 #                                     the upstream sources
+#   ghostty-<version>.tar.gz          the Ghostty source release libghostty-vt (the terminal) is
+#                                     built from, as published (sha256 checked by fetch-ghostty)
+#   ghostty-<version>-zig-packages.tar.gz
+#                                     the Zig packages that build fetches (zig-pkg/ of the source:
+#                                     uucode, Highway, Wuffs and what its configure phase reads)
 #
 # The Alpine part: packages, versions, licenses, and the aports origins and commits come from
 # lib/apk/db/installed in the tarball (the open-source licenses page lists them too), and packages
@@ -51,6 +56,20 @@ cargo vendor --locked --quiet "$work/vendor" >/dev/null
 tar -czf "$out/appine-$rev-vendor.tar.gz" -C "$work" vendor
 rm -rf "$work/vendor"
 echo "$out/appine-$rev-vendor.tar.gz"
+
+# ---- libghostty-vt: the Ghostty release and the Zig packages its build uses ----
+gdir=$work/ghostty
+mkdir -p "$gdir"
+# Reuse the release tarball fetch-ghostty already downloaded and checked, if there is one
+cp "$root"/target/ghostty/ghostty-*.tar.gz "$gdir"/ 2>/dev/null || true
+# With an empty global cache only the packages the build uses end up in zig-pkg/
+src=$(ZIG_GLOBAL_CACHE_DIR=$work/zig-cache "$root/scripts/fetch-ghostty" "$gdir" | sed -n 's/^fetch-ghostty: //p')
+gname=$(basename "$src")
+cp "$gdir/$gname.tar.gz" "$out/$gname.tar.gz"
+echo "$out/$gname.tar.gz"
+tar -czf "$out/$gname-zig-packages.tar.gz" -C "$src" zig-pkg
+echo "$out/$gname-zig-packages.tar.gz"
+rm -rf "$gdir" "$work/zig-cache"
 
 # ---- The GPL packages in the Alpine minirootfs ----
 tarball=$("$root/scripts/fetch-rootfs" | tail -n 1)

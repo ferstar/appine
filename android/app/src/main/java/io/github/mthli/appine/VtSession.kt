@@ -10,20 +10,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
- * A tab on the libghostty-vt terminal (the android/terminal map), owned by [TerminalService]. The
- * terminal lives in the native library and takes the console's output on a pump thread whether or
- * not a [VtView] shows it ([view]); the shell starts when a view first knows the grid ([start]),
- * and until then restored text and messages wait. Input goes out on the tab's own writer thread, so
- * a program that stops reading blocks only its tab.
+ * A terminal tab (the android/terminal map), owned by [TerminalService]: a login shell on a kernel
+ * console ([ConsolePty]) and its libghostty-vt terminal. The terminal lives in the native library
+ * and takes the console's output on a pump thread whether or not a [VtView] shows it ([view]); the
+ * shell starts when a view first knows the grid ([start]), and until then restored text and
+ * messages wait. Input goes out on the tab's own writer thread, so a program that stops reading
+ * blocks only its tab. Calls are on the main thread, except [console] and [login], which saving
+ * reads on the service's worker.
  */
 internal class VtSession(
     private val pty: ConsolePty,
     private val machine: Long,
     private val events: Events,
-) : Session {
+) {
 
-    override val console: Int get() = pty.console
-    override val login: String get() = pty.login
+    /** The kernel console, -1 before the shell starts. */
+    val console: Int get() = pty.console
+
+    /** The login account setting the tab was opened with ([ConsolePty.login]). */
+    val login: String get() = pty.login
 
     /** What the service hears about (main thread). */
     interface Events {
@@ -60,11 +65,17 @@ internal class VtSession(
     /** The last transcript of the primary screen, kept for saves while a full-screen program runs. */
     private var lastTranscript: String? = null
 
-    override val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
+    /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
+    val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
 
-    override val isRunning: Boolean get() = exit == null
+    /** True until the shell has exited (also before it starts). */
+    val isRunning: Boolean get() = exit == null
 
-    override val transcriptText: String?
+    /**
+     * Plain text of the primary screen and its scrollback for saving the tab; null while the shell
+     * has not started (a restored tab not shown yet).
+     */
+    val transcriptText: String?
         get() {
             if (tab == 0L) return null
             VtNative.transcript(tab)?.let {
@@ -76,11 +87,16 @@ internal class VtSession(
             return lastTranscript.orEmpty()
         }
 
-    override fun setRestored(text: ByteArray) {
+    /** A restored tab: [text] (a terminal byte stream) is shown before the shell's output. */
+    fun setRestored(text: ByteArray) {
         pending = text
     }
 
-    override fun showMessage(text: String): Boolean {
+    /**
+     * Shows a yellow line of app notice above the cursor's line (a kill report); kept until the
+     * terminal exists; false in a full-screen program, where nothing is shown.
+     */
+    fun showMessage(text: String): Boolean {
         if (tab == 0L) {
             if (started) return false
             pending = (pending ?: ByteArray(0)) + "\u001b[33m$text\u001b[0m\r\n".toByteArray()
@@ -124,8 +140,8 @@ internal class VtSession(
         pending?.let { VtNative.print(t, it) }
         pending = null
         if (error != null) {
-            // As in a Termux tab: show why and treat the tab as ended. The console opened before
-            // spawning failed is closed here
+            // Show why and treat the tab as ended. The console opened before spawning failed is
+            // closed here
             VtNative.print(t, "\r\n[$error]\r\n".toByteArray())
             hangUp()
             exit = 127
@@ -168,11 +184,13 @@ internal class VtSession(
         }
     }
 
-    override fun finishIfRunning() {
+    /** Hangs up the console when the shell still runs: it gets SIGHUP. */
+    fun finishIfRunning() {
         if (isRunning) hangUp()
     }
 
-    override fun release() {
+    /** The tab is closed or its kernel goes away: hang up and free the terminal. */
+    fun release() {
         if (released) return
         released = true
         finishIfRunning()

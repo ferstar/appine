@@ -4,24 +4,12 @@ import java.nio.ByteBuffer
 
 /**
  * The JNI side of the libghostty-vt terminal (`hosts/android/src/vt.rs`, the android/terminal map):
- * a terminal per [VtSession], fed from its kernel console inside the native library. Present only
- * when the native library was built with the `vt` feature (debug builds with `-Pappine.vt=true`);
- * check [available] first. Without it, tabs use the Termux emulator.
+ * a terminal per [VtSession], fed from its kernel console inside the native library.
  */
 internal object VtNative {
     init {
         // Loads libappine.so and initialises it
         Native.hashCode()
-    }
-
-    /** Whether the native library has these functions. */
-    val available: Boolean by lazy {
-        try {
-            destroy(0)
-            true
-        } catch (_: UnsatisfiedLinkError) {
-            false
-        }
     }
 
     /** Creates the terminal of an open [console] of [machine]; returns the tab handle. */

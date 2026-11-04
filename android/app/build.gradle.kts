@@ -157,10 +157,11 @@ abstract class RootfsAssetTask : DefaultTask() {
 /**
  * Generates the content of the "Open source licenses" page in Settings (design doc §13.4) under
  * `notices/` in the assets: each line of `index.tsv` is "title<TAB>description<TAB>file name", and
- * the files are plain text. In order: appine itself (AGPL), the vendored Termux terminal libraries,
- * the packages of the Alpine minirootfs in the APK, the Android libraries, the Rust crates linked
- * into libappine.so (with the license files each one publishes attached as they are), SQLite, and
- * last a few full license texts (`android/licenses/`).
+ * the files are plain text. In order: appine itself (AGPL), the terminal (libghostty-vt and the
+ * libraries it links, and the JetBrains Mono font, from texts in `android/licenses/`), the packages
+ * of the Alpine minirootfs in the APK, the Android libraries, the Rust crates linked into
+ * libappine.so (with the license files each one publishes attached as they are), SQLite, and last
+ * a few full license texts (`android/licenses/`).
  *
  * The build fails when a newly added Android library is not in one of the groups recognised below:
  * first confirm its license is compatible with AGPL-3.0, then add it.
@@ -213,12 +214,39 @@ abstract class NoticesTask : DefaultTask() {
             "appine", "AGPL-3.0-or-later · $SOURCE", "appine.txt",
             wrap(APPINE_NOTICE) + "\n\n" + license.get().asFile.readText(),
         )
+        // The terminal: libghostty-vt and what it links, and the font (texts in ../licenses, from
+        // the sources scripts/fetch-ghostty downloads; change them together with its version)
         entry(
-            "Termux terminal-emulator, terminal-view",
-            "GPL-3.0-only; parts Apache-2.0 (Terminal Emulator for Android)",
-            "termux.txt",
-            wrap(TERMUX_NOTICE) + "\n\n" + text("termux-app-LICENSE.md") +
-                "\n\nNOTICE of Terminal Emulator for Android:\n\n" + text("jackpal-NOTICE.txt"),
+            "Ghostty 1.4.0 (libghostty-vt)", "MIT · the terminal emulator", "ghostty.txt",
+            wrap(GHOSTTY_NOTICE) + "\n\n" + text("ghostty-LICENSE"),
+        )
+        entry(
+            "uucode 0.2.0", "MIT; Unicode-3.0 (Unicode data)", "uucode.txt",
+            text("uucode-LICENSE.md") + "\n\n----- licenses/LICENSE_unicode -----\n\n" + text("uucode-LICENSE_unicode") +
+                "\n\n----- licenses/LICENSE_Bjoern_Hoehrmann -----\n\n" + text("uucode-LICENSE_Bjoern_Hoehrmann"),
+        )
+        entry(
+            "simdutf 9.0.0", "MIT (also offered under Apache-2.0)", "simdutf.txt",
+            "simdutf 9.0.0 (https://github.com/simdutf/simdutf), used under the MIT license:\n\n" + text("simdutf-LICENSE-MIT"),
+        )
+        entry(
+            "Highway", "BSD-3-Clause (also offered under Apache-2.0)", "highway.txt",
+            "Highway (https://github.com/google/highway) at commit 66486a10623fa0d72fe91260f96c892e41aceb06, " +
+                "used under the BSD 3-Clause license:\n\n" + text("highway-LICENSE-BSD3"),
+        )
+        entry(
+            "Wuffs", "MIT (also offered under Apache-2.0)", "wuffs.txt",
+            "Wuffs (https://github.com/google/wuffs) at commit 7411f488fe2e2c205c3d3b3d28638b7356522930, " +
+                "used under the MIT license:\n\n" + text("wuffs-LICENSE-MIT"),
+        )
+        entry(
+            "Zig 0.17.0 compiler_rt", "MIT", "zig.txt",
+            "compiler_rt of Zig 0.17.0 (https://ziglang.org), linked into libghostty-vt:\n\n" + text("zig-LICENSE"),
+        )
+        entry(
+            "JetBrains Mono 2.304", "OFL-1.1 · the terminal font", "jetbrains-mono.txt",
+            "JetBrains Mono 2.304 (https://github.com/JetBrains/JetBrainsMono), the variable upright and italic " +
+                "fonts:\n\n" + text("JetBrainsMono-OFL.txt"),
         )
         alpine()?.let { (title, subtitle, body) -> entry(title, subtitle, "alpine.txt", body) }
 
@@ -437,13 +465,11 @@ abstract class NoticesTask : DefaultTask() {
             The complete source code of this app is at $SOURCE.
         """.trimIndent()
 
-        val TERMUX_NOTICE = """
-            The terminal-emulator and terminal-view libraries come from termux-app
-            (https://github.com/termux/termux-app) at commit 8629e632fcb95da272221be327db653fb24befe9,
-            with the changes described in android/README.md of appine's source code. termux-app is
-            licensed under the GPL 3.0 only; parts of these two libraries come from Terminal Emulator for
-            Android (https://github.com/jackpal/Android-Terminal-Emulator) under the Apache License 2.0.
-            The full texts of both licenses are at the end of this list. termux-app's license statement:
+        val GHOSTTY_NOTICE = """
+            The terminal emulator is libghostty-vt from Ghostty 1.4.0 (https://ghostty.org), built with
+            Zig 0.17.0 and linked into the app's native library together with what it uses: uucode,
+            simdutf, Highway and Wuffs (listed below) and Zig's compiler_rt. Their source code, as
+            built, is also published together with appine's source code at $SOURCE. Ghostty's license:
         """.trimIndent()
 
         val SQLITE_BLESSING = """
@@ -469,15 +495,6 @@ abstract class NoticesTask : DefaultTask() {
     }
 }
 
-/**
- * The terminal on libghostty-vt (VtSession and VtView, the android/terminal map): with
- * `-Pappine.vt=true` (or `appine.vt=true` in a gradle.properties) the debug app's native library
- * gets the `vt` feature, which needs Zig 0.17 and the source from `scripts/fetch-ghostty`, and its
- * tabs use it instead of the Termux emulator. Off by default, so builds without Zig (CI) still
- * work.
- */
-val experimentalTerminal = providers.gradleProperty("appine.vt").map { it.toBoolean() }.getOrElse(false)
-
 val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     rootfsTarball?.let { tarball.set(it) }
     doasPackage?.let { doas.set(it) }
@@ -489,13 +506,7 @@ androidComponents {
         val buildRust = tasks.register<CargoNdkTask>("buildRust${variant.name.replaceFirstChar(Char::uppercase)}") {
             workspace.set(repoRoot)
             ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
-            features.set(
-                when {
-                    variant.buildType != "debug" -> emptyList()
-                    experimentalTerminal -> listOf("test-hooks", "borrow-check", "vt")
-                    else -> listOf("test-hooks", "borrow-check")
-                },
-            )
+            features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
             outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)
@@ -507,8 +518,8 @@ androidComponents {
             doasPackage?.let { doas.set(it) }
             cargoLock.set(repoRoot.file("Cargo.lock"))
             workspace.set(repoRoot)
-            // Modules in the dependency graph (not in-project modules such as terminal-view),
-            // resolving only the graph without downloading
+            // Modules in the dependency graph (not in-project modules), resolving only the graph
+            // without downloading
             androidLibraries.set(
                 variant.runtimeConfiguration.incoming.resolutionResult.rootComponent.map { top ->
                     val seen = mutableSetOf<ResolvedComponentResult>()
@@ -530,7 +541,6 @@ androidComponents {
 }
 
 dependencies {
-    implementation(project(":terminal-view"))
     implementation("androidx.core:core:1.19.1")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")

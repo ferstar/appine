@@ -23,7 +23,3 @@ cc.workspace = true
 # See appine-kernel's features of the same names; app/build.gradle.kts enables them in the debug app
 test-hooks = ["appine-kernel/test-hooks"]
 borrow-check = ["appine-kernel/borrow-check"]
-# The experimental terminal view (src/vt.rs): builds libghostty-vt with Zig from the source that
-# scripts/fetch-ghostty downloads; app/build.gradle.kts enables it in the debug app when the Gradle
-# property appine.vt is true
-vt = []

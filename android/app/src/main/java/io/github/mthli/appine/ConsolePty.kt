@@ -1,11 +1,10 @@
 package io.github.mthli.appine
 
 import android.content.Context
-import com.termux.terminal.TerminalSession
-import java.io.IOException
 
 /**
- * The PTY of one terminal tab: a console in the kernel with a login shell running on it. [login] is
+ * The PTY of one terminal tab ([VtSession]): a console in the kernel with a login shell running on
+ * it; the tab reads, writes and resizes the console itself, in the native library. [login] is
  * the login account from Settings (`auto`, `root` or an account name), from which the assets'
  * `login.sh`, running as root, decides whom to log in (the android/setup map); [cwd] is the
  * directory to start in (tabs restored after the app was killed, the android/service map), null for
@@ -16,35 +15,28 @@ internal class ConsolePty(
     private val script: String,
     val login: String,
     private val cwd: String? = null,
-) : TerminalSession.Pty {
+) {
     /** The console number in the kernel, -1 before the shell starts. */
     @Volatile
     var console = -1
         private set
     private var pid = -1
 
-    override fun start(columns: Int, rows: Int): Int {
+    /**
+     * Opens a console of [columns] × [rows] and spawns the login script on it; returns its pid.
+     * Throws `IOException` when either fails (the console may then be open: [close] it).
+     */
+    fun start(columns: Int, rows: Int): Int {
         console = Native.openConsole(machine, rows, columns)
         pid = Native.spawn(machine, console, "/bin/sh", argv(script, login, cwd), ENVIRONMENT)
         return pid
     }
 
-    override fun read(buffer: ByteArray): Int {
-        val n = Native.read(machine, console, buffer)
-        return if (n > 0) n else -1
-    }
+    /** Waits for the login script's process (the shell) to exit; its status. */
+    fun waitFor(): Int = Native.waitFor(machine, pid)
 
-    override fun write(buffer: ByteArray, offset: Int, count: Int) {
-        if (Native.write(machine, console, buffer, offset, count) < 0) {
-            throw IOException("the terminal is closed")
-        }
-    }
-
-    override fun resize(columns: Int, rows: Int) = Native.resize(machine, console, rows, columns)
-
-    override fun waitFor(): Int = Native.waitFor(machine, pid)
-
-    override fun close() {
+    /** Closes the console: the session leader gets SIGHUP. */
+    fun close() {
         if (console >= 0) Native.closeConsole(machine, console)
     }
 

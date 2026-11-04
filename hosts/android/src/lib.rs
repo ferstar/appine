@@ -30,7 +30,6 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, jstring};
 
-#[cfg(feature = "vt")]
 mod vt;
 
 /// Throws `java.io.IOException`; Kotlin sees it after the JNI call returns.

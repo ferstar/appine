@@ -148,6 +148,32 @@ jobs:
       - name: Fetch rootfs
         run: scripts/fetch-rootfs
 
+      # The terminal, libghostty-vt, is built with Zig from the Ghostty source release that
+      # scripts/fetch-ghostty downloads with the Zig packages it uses (the android/native map).
+      # The version and sha256 are those of ziglang.org/download/index.json
+      - name: Install Zig
+        env:
+          ZIG_VERSION: 0.17.0
+          ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components 1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      # The source with its zig-pkg/, and Zig's global cache (packages and build artifacts)
+      - uses: actions/cache@v6
+        with:
+          path: |
+            target/ghostty
+            ~/.cache/zig
+          key: ghostty-${{ hashFiles('scripts/fetch-ghostty') }}
+
+      - name: Fetch the Ghostty source
+        run: scripts/fetch-ghostty
+
       - name: Clippy for Android
         env:
           CARGO_TARGET_DIR: target/android

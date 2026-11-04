@@ -70,7 +70,7 @@ The minimum system version is **minSdk 29 (Android 10)**: `android_res_nsend`, w
 ```mermaid
 flowchart TB
     subgraph APP["Android app process (single process)"]
-        UI["Kotlin shell<br/>Activity · foreground service · DocumentsProvider<br/>terminal UI (vendored Termux terminal-view)"]
+        UI["Kotlin shell<br/>Activity · foreground service · DocumentsProvider<br/>terminal UI (libghostty-vt + appine's view)"]
         subgraph KERNEL["Kernel layer (Rust)"]
             SYS["syscall dispatch · processes/threads · signals · credentials · IPC"]
             MM["mm: VMA table + software page tables"]
@@ -106,6 +106,6 @@ Layering principles:
 - [arm64: entry: Convert to Generic Entry v11 (2026-01, includes SUD)](https://lkml.iu.edu/2601.3/04930.html)
 - [arm64 memory layout: 4KB pages + VA39 (LKML)](https://lore.kernel.org/lkml/YV3ZfmSHHKSWfDQu@arm.com/t/)
 - [AOSP sepolicy: support hard linking for split APKs (removes link from create_file_perms)](https://android.googlesource.com/platform/external/sepolicy/+/9bef250)
-- [termux-app LICENSE.md](https://github.com/termux/termux-app/blob/master/LICENSE.md)
+- [Ghostty (libghostty-vt)](https://github.com/ghostty-org/ghostty)
 - [azahar-emu/dynarmic (0BSD)](https://github.com/azahar-emu/dynarmic)
 - iSH: <https://github.com/ish-app/ish> (GPLv3; only the ideas are borrowed, no code is copied)

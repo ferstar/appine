@@ -1,6 +1,5 @@
-//! With the `vt` feature, builds libghostty-vt (static, with Zig) and vt.c, the experimental
-//! terminal view's emulator (src/vt.rs). Without it, or for a host other than Android (where the
-//! crate is empty), does nothing.
+//! Builds libghostty-vt (static, with Zig) and vt.c, the terminal emulator of the app's tabs
+//! (src/vt.rs). For a host other than Android (where the crate is empty) it does nothing.
 //!
 //! The Ghostty source comes from scripts/fetch-ghostty (target/ghostty/ghostty-<version>, or
 //! APPINE_GHOSTTY_SRC), which also fetched the Zig packages, so this build needs no network. The
@@ -17,9 +16,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/vt.c");
     println!("cargo:rerun-if-env-changed=APPINE_GHOSTTY_SRC");
     println!("cargo:rerun-if-env-changed=ZIG");
-    if env::var_os("CARGO_FEATURE_VT").is_none()
-        || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android")
-    {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
         return;
     }
 
@@ -45,7 +42,8 @@ fn main() {
     let prefix = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("ghostty");
     let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
     // Zig's HTTP client fails through some proxies (scripts/fetch-ghostty); with the packages
-    // already fetched it should not need the network, but a missing one then fails clearly
+    // already fetched it should not need the network, but a missing one then fails clearly. The
+    // options are also in scripts/fetch-ghostty, which fetches what this build uses: change both
     let status = Command::new(&zig)
         .current_dir(&src)
         .args([

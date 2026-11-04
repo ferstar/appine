@@ -4,7 +4,9 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
 
 - `app/`: the Kotlin app. `TerminalService` is a `specialUse` foreground service that
   owns the guest kernel and the terminal sessions; `MainActivity` shows them with tabs
-  and a row of extra keys. `Rootfs` imports Alpine from the APK assets on first launch,
+  and a row of extra keys. The terminal emulator is libghostty-vt from Ghostty, linked into
+  `libappine.so` (`hosts/android/src/vt.c`, `vt.rs`), and drawn by `VtView` with the bundled
+  JetBrains Mono font. `Rootfs` imports Alpine from the APK assets on first launch,
   picks the fastest mirror, and can replace it with Debian (downloaded and checked
   against a pinned sha256 digest). `SettingsActivity`, opened from the tab bar's menu,
   switches the distribution, resets the rootfs, chooses the package mirror, the login
@@ -12,15 +14,17 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),
   and switches to it with `su` (`--session-command` where su is util-linux's, so that the
-  shell keeps its controlling terminal and job control). `Native` is the JNI interface to `libappine.so`, which is built from
-  `hosts/android` with cargo-ndk.
-- `terminal-emulator/`, `terminal-view/`: vendored from Termux (see below).
+  shell keeps its controlling terminal and job control). `Native` is the JNI interface to
+  `libappine.so`, which is built from `hosts/android` with cargo-ndk.
 
 ## Building
 
 Requirements: the Android SDK with NDK 29.0.14206865, JDK 17 or later,
-`rustup target add aarch64-linux-android`, `cargo install cargo-ndk`, and the rootfs
-tarball (`scripts/fetch-rootfs`, run from the repository root).
+`rustup target add aarch64-linux-android`, `cargo install cargo-ndk`, Zig 0.17.0 on `PATH`
+(or in `ZIG`), the rootfs tarball (`scripts/fetch-rootfs`) and the Ghostty source with the
+Zig packages its build uses (`scripts/fetch-ghostty`), both run from the repository root.
+Behind a proxy, `fetch-ghostty` and the build drop the proxy variables for Zig, whose HTTP
+client fails through some proxies.
 
 ```sh
 ./gradlew installDebug                 # build and install on a connected arm64 device
@@ -40,33 +44,13 @@ HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
 `global_http_proxy_host` and `global_http_proxy_port` behind, and the proxy stays in effect
 (with an empty exclusion list, so 127.0.0.1 goes to the proxy too) until the next reboot.
 
-## Vendored code
-
-`terminal-emulator/` and `terminal-view/` come from
-[termux/termux-app](https://github.com/termux/termux-app) at commit
-`8629e632fcb95da272221be327db653fb24befe9`. Changes:
-
-- `JNI.java` and the native subprocess code (`src/main/jni`) are removed.
-- `TerminalSession.java` is rewritten: instead of `JNI.createSubprocess` on a host PTY,
-  it talks to appine's in-process PTY through the `TerminalSession.Pty` interface. Its
-  thread structure and public methods are unchanged. It also takes text to show before
-  the shell starts (`setRestored`) and returns the transcript (`getTranscriptText`), for
-  restoring tabs after the app is killed (`Tabs.kt`).
-- The Gradle build files are new.
-
-License: termux-app is released under the GPL 3.0 only (`licenses/termux-app-LICENSE.md`);
-its statement says these two libraries use code from jackpal's Terminal Emulator for Android
-under the Apache 2.0 (`licenses/jackpal-NOTICE.txt` is that project's NOTICE). About half of
-the vendored files were written by Termux contributors after 2016 and the rest were changed
-by them since, so the libraries are treated as GPL 3.0. appine itself is AGPL 3.0 or later,
-which can be combined with them (section 13 of both licenses), so risk R3 in the design doc
-no longer applies.
-
 ## Open source licenses
 
 `NoticesTask` in `app/build.gradle.kts` writes the notices shown under Settings → Open source
-licenses into the assets (`notices/`): appine's AGPL notice, the Termux libraries, the packages
-of the bundled Alpine minirootfs (from its `lib/apk/db/installed`, with the aports commit of
+licenses into the assets (`notices/`): appine's AGPL notice, Ghostty's libghostty-vt with the
+libraries it links (uucode, simdutf, Highway, Wuffs, Zig's compiler_rt) and the JetBrains Mono
+font (their texts are in `licenses/`, taken from the sources `scripts/fetch-ghostty` downloads;
+update them with its version), the packages of the bundled Alpine minirootfs (from its `lib/apk/db/installed`, with the aports commit of
 each), the Android libraries on the runtime classpath, every Rust crate linked into
 `libappine.so` with the license files it ships (only the MIT ones when MIT is one of the
 choices), SQLite, and the full texts in `licenses/`. The build fails when a new Android library

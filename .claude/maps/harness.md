@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-04 (targeted verification: the Android job installs Zig and fetches the Ghostty source)
 
 ## Responsibilities
 
@@ -151,9 +151,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - CI, Linux arm64 (`ubuntu-24.04-arm`): fmt, clippy (`-D warnings`), fetch the rootfs, `cargo test
   --workspace` with the require switches, the network test, a long lockstep run, release build and
   `appine-bench --runs 3 --skip-tier0`, `scripts/difftest` at Tier 1 with one lane, and the
-  engine tests built with clang. CI, Android: cargo-ndk clippy, `assembleDebug lintDebug`, the APK
-  as an artifact. Not in CI: LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest,
-  parallel lanes.
+  engine tests built with clang. CI, Android (x86_64): the NDK, the rootfs, Zig 0.17.0 (from
+  ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with `target/ghostty`
+  and Zig's global cache cached by the script's hash), then cargo-ndk clippy, `assembleDebug
+  lintDebug`, the APK as an artifact. Not in CI: LTP, the survey, instrumentation tests (no KVM),
+  Tier 0 difftest, parallel lanes.
 
 ## Dependencies (inbound / outbound)
 
