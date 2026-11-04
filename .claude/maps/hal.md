@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-05 (targeted verification: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug)
 
 ## Responsibilities
 
@@ -103,8 +103,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Durability: `fsync(data_only)`, `sync_file_range` (raw syscall, arm64 argument order), `syncfs`,
   `msync` — Linux/Android only.
 - `raise_fd_limit` raises the soft `RLIMIT_NOFILE` at machine start (after the store is opened; the
-  result is ignored and `fd_limit` re-reads the limit later); `fill_random` opens and reads
-  `/dev/urandom` on every call.
+  result is ignored and `fd_limit` re-reads the limit later); `fill_random` fills the buffer with
+  the host's `getrandom` (retrying `EINTR` and short results), so it needs no fd; other hosts
+  open and read `/dev/urandom` on every call.
 
 ### Waiting, threads, CPUs, time
 
@@ -155,8 +156,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 - `libc` (syscalls, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` on Android (DNS),
   host files (`/proc/self/status`, `/proc/self/pagemap`, `/proc/meminfo`, `/proc/net/route*`,
-  `/proc/self/task/*`, `/sys/devices/system/cpu`, `/sys/class/net`, `/dev/urandom`,
-  `/etc/resolv.conf`), Rust std (`available_parallelism`).
+  `/proc/self/task/*`, `/sys/devices/system/cpu`, `/sys/class/net`, `/dev/urandom` on non-Linux
+  hosts, `/etc/resolv.conf`), Rust std (`available_parallelism`).
 
 ## Invariants and gotchas
 
@@ -172,10 +173,6 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - **macOS no longer compiles.** `open_dir` uses `O_PATH` (not defined for Apple targets) without a
   `cfg` gate, and the kernel calls the Linux-only `copy_file`, fsync family and `msync` ungated, and
   CI builds only Linux and Android.
-- **`fill_random` can fail with `EMFILE`.** It opens `/dev/urandom` on every call while all guest
-  processes share the app's fd table, so under fd exhaustion `getrandom` returns `EMFILE` (never
-  seen on Linux), reads of the emulated random devices and exec's `AT_RANDOM` fail, and callers that
-  ignore the result silently use zero bytes.
 - **A signal makes a DNS lookup fail.** Non-Android `dns_query` treats an `EINTR` from `poll` (the
   CLI's `SIGWINCH` handler can cause one) as that server failing, possibly turning into SERVFAIL;
   Android reports an interrupted wait as `ETIMEDOUT` after cancelling. Mismatched-ID datagrams also

@@ -294,7 +294,30 @@ fn map_file_with(
     })
 }
 
+/// Fills `buf` from the host's random source: `getrandom`, which needs no fd (all guest processes
+/// share the app's fd table, and opening `/dev/urandom` failed with `EMFILE` once the guest had
+/// used it up).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
+    let mut done = 0;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        // SAFETY: the host writes at most rest.len() bytes into rest
+        let n = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if n < 0 {
+            let e = last_errno();
+            if e == libc::EINTR {
+                continue;
+            }
+            return Err(e);
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
 /// Fills `buf` from the host's random source.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")
@@ -1481,6 +1504,39 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    /// Random bytes need no fd: a child process with its fd limit at 0 (like the app once the
+    /// guest has used up the shared fd table) still gets them, also more than one getrandom call
+    /// returns at a time.
+    #[test]
+    fn random_bytes_need_no_fd() {
+        let mut big = vec![0u8; 1 << 20];
+        fill_random(&mut big).unwrap();
+        assert!(big.iter().filter(|&&b| b == 0).count() < big.len() / 64);
+        // SAFETY: the child only makes syscalls and leaves with _exit
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let mut buf = [0u8; 64];
+            // SAFETY: plain syscalls on local memory
+            let ok = unsafe {
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && {
+                    lim.rlim_cur = 0;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0
+                }
+            } && fill_random(&mut buf).is_ok()
+                && buf.iter().any(|&b| b != 0);
+            // SAFETY: ends the child without running the parent's destructors
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child forked above
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
 
     #[test]
     fn synthesized_clock_state_matches_a_kernel_without_ntp() {
