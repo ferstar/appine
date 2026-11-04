@@ -6,6 +6,8 @@
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
 > Maintained: 2026-11-04 (targeted verification: stale source comments fixed; socket owner column found while checking them)
+>
+> Maintained: 2026-11-05 (targeted verification: `/proc/<tid>` resolves any thread; removed the bug)
 
 ## Responsibilities
 
@@ -70,9 +72,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   namespace, the instance is bound to it, otherwise it uses the initial one. Mount options
   (`hidepid`, `subset`) are ignored.
 - `/proc` readdir: `self`, `thread-self`, the top-level static directories (`sys/`, `sysvipc/`),
-  the global files, then the pids visible in the instance's namespace, sorted. A pid name is
-  mapped through that namespace and must name a thread group: `/proc/<tid>` of a non-leader
-  thread is `ENOENT` (only `task/<tid>` reaches threads). `self`/`thread-self` are `ENOENT` for
+  the global files, then the processes visible in the instance's namespace, sorted. A pid name
+  is mapped through that namespace and may name any thread (`group_of`), though readdir lists
+  only processes: `/proc/<tid>` is its process's directory seen through that thread (`status`,
+  `comm`, `cwd` and `fd/` are the thread's, `stat` adds up the group's CPU time, `task/` lists the
+  group), and it disappears when the thread exits. `self`/`thread-self` are `ENOENT` for
   readers not visible in the instance. Numeric names (pids, fds) are parsed as signed 64-bit
   decimals of at most 10 characters without a leading zero, so a sign is accepted, and fd names
   are then truncated to 32 bits.
@@ -326,8 +330,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `cgroup.kill` (Linux requires write access to the common ancestor's `cgroup.procs`).
 - **Numeric names alias:** fd names are truncated to 32 bits (`/proc/self/fd/4294967296` is fd 0)
   and signs are accepted (`/proc/self/fd/+1`, `/proc/+1`), where Linux returns `ENOENT`.
-- **`/proc/<tid>` of non-leader threads is `ENOENT`:** Linux resolves any thread id (it is only
-  hidden from readdir), and programs open `/proc/<gettid()>/…` directly.
 - **Per-thread fd views are wrong:** `task/<tid>/fd` and `fdinfo` show the group leader's table even
   when the thread has its own (clone without `CLONE_FILES`, `unshare(CLONE_FILES)`).
 - **`cgroup.procs`/`cgroup.threads` show global ids:** readers in a child pid namespace (a container

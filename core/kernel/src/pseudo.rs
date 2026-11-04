@@ -801,6 +801,16 @@ pub(crate) fn ino_of(node: &PseudoNode) -> u64 {
     h.finish() | 1
 }
 
+/// The thread group a pid directory names. `/proc/<pid>` resolves any thread id, not only
+/// thread group ids (Linux's `proc_pid_lookup` finds any task; readdir lists only the groups):
+/// such a directory looks like its process's, seen through that thread (`status` and `comm` are
+/// the thread's, `stat` adds up the whole group).
+pub(crate) fn group_of(k: &Kernel, pid: Tid) -> Option<&Rc<RefCell<ThreadGroup>>> {
+    k.groups
+        .get(&pid)
+        .or_else(|| k.groups.get(&k.tasks.get(&pid)?.tgid))
+}
+
 /// The inode given by stat and readdir: for `/proc/<pid>` and the entries under it it also
 /// depends on which process it is, so as on Linux the inode differs after a new process reuses
 /// the pid.
@@ -817,7 +827,7 @@ pub(crate) fn node_ino(k: &Kernel, node: &PseudoNode) -> u64 {
         | PseudoNode::FdInfo(pid, _) => *pid,
         _ => return ino_of(node),
     };
-    let Some(g) = k.groups.get(&pid) else {
+    let Some(g) = group_of(k, pid) else {
         return ino_of(node);
     };
     let mut h = std::hash::DefaultHasher::new();
@@ -837,11 +847,11 @@ impl<'a> View<'a> {
     }
 
     fn group(&self, pid: Tid) -> Option<Rc<RefCell<ThreadGroup>>> {
-        self.k.groups.get(&pid).cloned()
+        group_of(self.k, pid).cloned()
     }
 
-    /// The thread group's representative thread (the main thread, or any live thread once it has
-    /// exited).
+    /// The thread a pid directory stands for: the thread itself when `pid` is a thread id, so the
+    /// main thread for a process (or any live thread once it has exited).
     fn leader(&self, pid: Tid) -> Option<Rc<Task>> {
         let g = self.group(pid)?;
         let threads = g.borrow().threads.clone();
@@ -936,7 +946,10 @@ impl<'a> View<'a> {
     /// `/proc/<pid>/task/<tid>` uses the given thread, otherwise the representative thread.
     fn task(&self, pid: Tid, tid: Option<Tid>) -> Option<Rc<Task>> {
         match tid {
-            Some(t) => self.k.tasks.get(&t).cloned().filter(|t| t.tgid == pid),
+            Some(t) => {
+                let tgid = self.group(pid)?.borrow().tgid;
+                self.k.tasks.get(&t).cloned().filter(|t| t.tgid == tgid)
+            }
             None => self.leader(pid),
         }
     }
@@ -1412,11 +1425,10 @@ impl View<'_> {
     /// Whether the reader may look at the root directory, current directory, program file and
     /// namespaces of process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`).
     fn may_read(&self, pid: Tid) -> bool {
-        pid == self.tgid
-            || self.group(pid).is_some_and(|g| {
-                let g = g.borrow();
-                self.reader().may_ptrace(&g.cred, g.dumpable, true)
-            })
+        self.group(pid).is_some_and(|g| {
+            let g = g.borrow();
+            g.tgid == self.tgid || self.reader().may_ptrace(&g.cred, g.dumpable, true)
+        })
     }
 
     /// The node reached by following `/proc/<pid>/fd/<n>` ([`Pseudo::follow`]).
@@ -1596,7 +1608,7 @@ fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
         // Files of a non-dumpable process belong to root in its user namespace (Linux's
         // task_dump_owner)
         PseudoNode::Pid(pid, _) | PseudoNode::Entry(pid, ..) | PseudoNode::Fd(pid, _) => {
-            k.groups.get(pid).map_or((0, 0), |g| {
+            group_of(k, *pid).map_or((0, 0), |g| {
                 let g = g.borrow();
                 let c = &g.cred;
                 if g.dumpable {
@@ -1873,7 +1885,7 @@ pub(crate) fn write(
             return Err(Errno::EINVAL);
         }
         let value = value as i32;
-        let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
+        let group = group_of(k, *pid).ok_or(Errno::ESRCH)?;
         let mut g = group.borrow_mut();
         // As on Linux: going below the minimum needs CAP_SYS_RESOURCE, and with it the value
         // written also becomes the new minimum
@@ -1988,7 +2000,7 @@ pub(crate) fn write(
     // bits
     if let PseudoNode::Entry(pid, _, Entry::CoredumpFilter) = node {
         let value = kstrto(proc_number(data)?, false)?;
-        let group = k.groups.get(pid).ok_or(Errno::ESRCH)?;
+        let group = group_of(k, *pid).ok_or(Errno::ESRCH)?;
         group.borrow_mut().coredump_filter = value as u32 & 0x1ff;
     }
     Ok(())
@@ -2383,7 +2395,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
     let tid = tid.unwrap_or(pid);
-    writeln!(s, "Tgid:\t{}\nNgid:\t0\nPid:\t{}", v(pid), v(tid)).unwrap();
+    writeln!(s, "Tgid:\t{}\nNgid:\t0\nPid:\t{}", v(g.tgid), v(tid)).unwrap();
     let tracer = task.as_ref().and_then(|t| t.trace.borrow().tracer);
     writeln!(
         s,
@@ -2428,7 +2440,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     writeln!(
         s,
         "NStgid:{}\nNSpid:{}\nNSpgid:{}\nNSsid:{}",
-        col(pid),
+        col(g.tgid),
         col(tid),
         col(g.pgid),
         col(g.sid)
@@ -2732,9 +2744,7 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
     if !pos.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
         return Err(Errno::EINVAL);
     }
-    let task = k
-        .groups
-        .get(&pid)
+    let task = group_of(k, pid)
         .and_then(|g| g.borrow().threads.first().copied())
         .and_then(|t| k.tasks.get(&t).cloned())
         .ok_or(Errno::ESRCH)?;
@@ -2751,9 +2761,7 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
 
 /// The address space of process `pid`.
 pub(crate) fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno> {
-    let task = k
-        .groups
-        .get(&pid)
+    let task = group_of(k, pid)
         .and_then(|g| g.borrow().threads.first().copied())
         .and_then(|t| k.tasks.get(&t).cloned())
         .ok_or(Errno::ESRCH)?;
@@ -3545,7 +3553,7 @@ fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
 /// in the parent is EPERM too. Linux checks the first two with the open file's credentials; here
 /// the writing process's are used.
 fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> Result<(), Errno> {
-    let g = k.groups.get(&pid).ok_or(Errno::ESRCH)?;
+    let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     let map = if gid { &ns.gid_map } else { &ns.uid_map };
     if !map.borrow().extents().is_empty() || !writer.ns_capable(&ns, cap::SYS_ADMIN) {
@@ -3642,7 +3650,7 @@ fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Resul
 /// only by whitespace (EINVAL); needs `CAP_SYS_ADMIN` in that user namespace. Once denied it
 /// cannot be allowed again, and it cannot be denied after gid_map has been written (EPERM).
 fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
-    let g = k.groups.get(&pid).ok_or(Errno::ESRCH)?;
+    let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
     if !writer.ns_capable(&ns, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);

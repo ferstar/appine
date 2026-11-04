@@ -187,8 +187,9 @@ pub(super) fn pidfd_send_signal(
                     .and_then(Weak::upgrade)
                     .is_some_and(|p| Rc::ptr_eq(&p, g))
             };
-            match cx.kr().groups.get(pid) {
-                Some(g) if same(g) => *pid,
+            // /proc/<tid> of any thread names its process
+            match crate::pseudo::group_of(cx.kr(), *pid) {
+                Some(g) if same(g) => g.borrow().tgid,
                 _ => return Err(Errno::ESRCH),
             }
         }

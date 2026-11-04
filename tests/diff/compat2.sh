@@ -3,7 +3,8 @@
 # files, readlink with an empty path, O_LARGEFILE in F_GETFL, /proc/<pid>/task/<tid>/children,
 # PR_SET_PDEATHSIG and __WNOTHREAD, short symlinks, /proc/<pid>/exe pointing at the program file
 # itself, DIT across signals, fork, execve and ptrace, a fixed btime in /proc/stat, POSIX locks
-# across execve and close_range, O_SYNC and O_DSYNC kept at open, chown(-1, -1) of set-id files
+# across execve and close_range, O_SYNC and O_DSYNC kept at open, chown(-1, -1) of set-id files,
+# /proc/<tid> of a thread that is not the main one
 set -e
 cd /tmp
 # raw ICMP sockets (appine emulates them with ping sockets on the host): data received on IPv4
@@ -1653,3 +1654,68 @@ for who in ("uid 65534", "root"):
 PY
 python3 chown.py
 rm -f chown.py
+
+# /proc/<tid> of any thread resolves (Linux's proc_pid_lookup finds any task), though readdir of
+# /proc lists only processes: it looks like the process's directory seen through that thread
+# (status and comm are the thread's), and goes away when the thread exits
+cat > tids.py <<'PY'
+import ctypes, os, threading
+
+libc = ctypes.CDLL(None, use_errno=True)
+PR_SET_NAME = 15
+ready, done = threading.Event(), threading.Event()
+info = {}
+
+
+def worker():
+    libc.prctl(PR_SET_NAME, b"worker", 0, 0, 0)
+    info["tid"] = threading.get_native_id()
+    ready.set()
+    done.wait()
+
+
+# A daemon thread, and each check reports its own error: a failing check must not leave the
+# script waiting for the thread
+t = threading.Thread(target=worker, daemon=True)
+t.start()
+ready.wait()
+pid, tid = os.getpid(), info["tid"]
+d = "/proc/%d" % tid
+
+
+def check(what, f):
+    try:
+        print(what, f())
+    except OSError as e:
+        print(what, "failed:", e.strerror)
+
+
+check("/proc/<tid> is a directory, listed in /proc:",
+      lambda: (os.path.isdir(d), str(tid) in os.listdir("/proc")))
+
+
+def status():
+    f = dict(l.split(":\t", 1) for l in open(d + "/status").read().splitlines() if ":\t" in l)
+    return (f["Name"].strip(), int(f["Pid"]) == tid, int(f["Tgid"]) == pid,
+            int(f["NStgid"]) == pid)
+
+
+def stat():
+    s = open(d + "/stat").read()
+    return int(s.split()[0]) == tid, s[s.index("("):s.index(")") + 1]
+
+
+check("status: Name, Pid is the tid, Tgid and NStgid are the process:", status)
+check("stat: pid field is the tid, comm:", stat)
+check("comm:", lambda: open(d + "/comm").read().strip())
+check("task lists both:", lambda: sorted(os.listdir(d + "/task")) == sorted([str(pid), str(tid)]))
+check("task/<tid>/comm:", lambda: open(d + "/task/%d/comm" % tid).read().strip())
+check("exe is the process's:", lambda: os.readlink(d + "/exe") == os.readlink("/proc/self/exe"))
+check("fd lists the same fds:",
+      lambda: sorted(os.listdir(d + "/fd")) == sorted(os.listdir("/proc/%d/fd" % pid)))
+done.set()
+t.join()
+print("after the thread exits:", os.path.exists(d))
+PY
+python3 tids.py
+rm -f tids.py

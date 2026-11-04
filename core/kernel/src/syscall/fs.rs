@@ -1504,7 +1504,7 @@ fn open_pseudo(
         // so after the process is reaped, using it as a pidfd is ESRCH even if the pid has been
         // given to a new process
         let process = match node {
-            PseudoNode::Pid(pid, None) => cx.kr().groups.get(&pid).map(Rc::downgrade),
+            PseudoNode::Pid(pid, None) => pseudo::group_of(cx.kr(), pid).map(Rc::downgrade),
             _ => None,
         };
         return Ok(FileKind::Directory {
@@ -1625,7 +1625,9 @@ fn reopen(
 
 /// The program file process `pid` is executing (`/proc/<pid>/exe`).
 pub(super) fn exe_file(cx: &Cx<'_>, pid: i32) -> Result<Rc<crate::process::ExeFile>, Errno> {
-    let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ENOENT)?;
+    let group = pseudo::group_of(cx.kr(), pid)
+        .cloned()
+        .ok_or(Errno::ENOENT)?;
     group.borrow().exe.clone().ok_or(Errno::ENOENT)
 }
 
