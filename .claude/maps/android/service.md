@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1)
+> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1; ended tabs no longer marked ✕)
 
 ## Responsibilities
 
@@ -175,8 +175,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   second kill (or a failed start) before the kernel is up wipes the saved tabs; a save rewrites
   transcripts by position before replacing the index, so a kill in between pairs old tabs with other
   tabs' transcripts.
-- **Finished tabs keep the service alive.** A shell that exits while the UI is away leaves its ✕
-  session in `sessions`, so the exit rule never fires; its exit also does not trigger a save.
+- **Finished tabs keep the service alive.** A shell that exits while the UI is away leaves its
+  ended session in `sessions`, so the exit rule never fires; its exit also does not trigger a save.
 - **Notification ids collide.** Listens use 1000 + guest port and kills 3000 + pid % 1000, so ports
   2000–2999 clash with kill notifications, and a later kill with
   the same pid % 1000 replaces an earlier bug notification and its "copy report".
