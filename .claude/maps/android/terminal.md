@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses, the terminal keeping the framework theme)
 
 ## Responsibilities
 
@@ -17,7 +17,10 @@
   JNI in the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
 - `LicensesActivity`: the notices generated at build time;
-- the app's strings and themes.
+- the app's strings and themes: `Theme.Appine` (Material 3 DayNight, for Settings and the
+  licenses) and `Theme.Appine.Terminal` (the framework's Material theme, black, for
+  `MainActivity`), and the Material 3 page layouts that Settings and the licenses share
+  (`page.xml`, `list_item.xml`, `list_header.xml`).
 
 Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `VtSession.kt`,
 `VtView.kt`, `VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt`, `ConsolePty.kt`, `ExtraKeysView.kt`,
@@ -39,7 +42,9 @@ libghostty-vt with Zig (`android/native`).
   to a `Target`; `Press` handles the touch on one key.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
   until started.
-- `LicensesActivity` — list from `assets/notices/index.tsv`, full text view.
+- `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
+  `assets/notices/index.tsv` (one `list_item.xml` row per entry), full text view; an
+  `OnBackPressedCallback`, enabled while a full text is shown, returns to the list.
 
 ### The terminal
 
@@ -64,8 +69,8 @@ libghostty-vt with Zig (`android/native`).
 
 ## Public entry points
 
-- Launcher activity `MainActivity` (`singleTask`, `adjustResize`, handles most configuration
-  changes itself); listener callbacks `onMachineReady`, `onProgress`, `onSessionsChanged`,
+- Launcher activity `MainActivity` (`singleTask`, `adjustResize`, `Theme.Appine.Terminal`, handles
+  most configuration changes itself, the dark mode included); listener callbacks `onMachineReady`, `onProgress`, `onSessionsChanged`,
   `onExitAll`, `onRestarting`, `onSettingsChanged`, `onNotice`.
 - `LicensesActivity`, opened from Settings.
 - `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`,
@@ -235,6 +240,13 @@ libghostty-vt with Zig (`android/native`).
   Highway, Wuffs, Zig's compiler_rt and JetBrains Mono; Alpine packages from the rootfs database,
   the doas package, Android libraries, Rust crates, SQLite, then full texts); full text is
   monospace, selectable and sized to fit 74 columns.
+- The page (`page.xml`): a `MaterialToolbar` (title, back arrow) in an `AppBarLayout` that lifts
+  while the content below it is scrolled, over a `NestedScrollView`; edge to edge (wallpaper
+  colours from Android 12 on through `DynamicColors`), with the bar padded under the status bar
+  and the scroll view clear of the navigation bar. The toolbar shows the entry's title over its
+  full text; the back arrow and back both return to the list, then close.
+- It follows the system's dark mode: a change recreates the activity, which shows the same full
+  text again (saved state).
 
 ## Dependencies (inbound / outbound)
 
@@ -247,6 +259,8 @@ libghostty-vt with Zig (`android/native`).
 
 - `Native` (`openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`), hence the kernel's host
   console; `login.sh`; `assets/notices`.
+- Material Components 1.14.0 with AppCompat and androidx.activity (`LicensesActivity`, the page
+  layouts and `Theme.Appine`).
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
   encoding, selection, plain-text formatting, title and width), linked into `libappine.so`
   (`android/native`); `Machine::read_console`, `write_console` and `resize_console` called from
@@ -294,12 +308,23 @@ libghostty-vt with Zig (`android/native`).
   using the Kitty protocol's release events sees only the release.
 - `VtView` turns off the default focus highlight: focused outside touch mode (after hardware or
   injected keys) the system would cover the whole view with a translucent grey.
+- `MainActivity` and `VtView` build their dialogs and menus with the framework's classes
+  (`AlertDialog`, `PopupMenu`, `ListPopupWindow`), which take their colours, and the text
+  selection handles `VtView` draws, from the framework theme; that is why `MainActivity` keeps
+  `Theme.Appine.Terminal`. The Material classes (`MaterialAlertDialogBuilder`, `MaterialSwitch`,
+  `MaterialToolbar`) need `Theme.Appine` and an `AppCompatActivity`.
+- Settings and the licenses leave `uiMode` out of their `configChanges` so that a dark-mode
+  change recreates them with the other colours; an AppCompat activity that handles `uiMode`
+  itself would keep the views it already made in the old ones.
 
 ## Confirmed bugs / technical debt
 
 - **The terminal lacks** the bell, mouse drags and motion for programs (only clicks and the wheel
   are sent), double- and triple-tap or rectangular selection, and handles that flip at the screen
   edges (a selection starting at column 0 has its start handle mostly off-screen).
+- **The terminal screen is not Material 3 yet**: its tab bar, extra keys, list of tabs, tab menu,
+  rename dialog and the paste confirmation keep the framework's look (fixed dark colours,
+  `MainActivity.BAR_COLOR`), unlike Settings and the licenses.
 
 ## Open questions
 

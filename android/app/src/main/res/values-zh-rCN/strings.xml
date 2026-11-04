@@ -28,6 +28,12 @@
     </plurals>
     <string name="menu_settings">设置</string>
     <string name="settings">设置</string>
+    <string name="navigate_up">返回</string>
+    <string name="settings_group_system">系统</string>
+    <string name="settings_group_android">Android</string>
+    <string name="settings_group_terminal">终端</string>
+    <string name="settings_group_debug">调试</string>
+    <string name="settings_group_about">关于</string>
     <string name="settings_distro">发行版</string>
     <string name="settings_mirror">软件源镜像</string>
     <string name="settings_reset">重置 rootfs</string>
@@ -75,8 +81,8 @@
     <string name="copy_report">复制报告</string>
     <string name="report_copied">已复制报告</string>
     <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>
-    <string name="settings_system_documents">在"文件"App 里显示整个系统</string>
-    <string name="system_documents_summary">除了家目录，"文件"App 里还列出从 / 开始的所有文件，只读。</string>
+    <string name="settings_system_documents">在“文件”App 里显示整个系统</string>
+    <string name="system_documents_summary">除了家目录，“文件”App 里还列出从 / 开始的所有文件，只读。</string>
     <string name="settings_fill_wide">中日韩文字占满两格</string>
     <string name="fill_wide_on">汉字、假名、谚文等比放大到正好占满两格，字之间不再空得很宽。</string>
     <string name="fill_wide_off">汉字、假名、谚文保持系统字体的大小，居中放在两格里，字距较宽。</string>

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: libghostty-vt built with Zig in every Android build; its notices, fetch and released sources)
+> Maintained: 2026-11-04 (targeted verification: libghostty-vt built with Zig in every Android build; its notices, fetch and released sources; the Material Components dependency, its notices and the activities' themes)
 
 ## Responsibilities
 
@@ -91,17 +91,24 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
   and runs the build's configure phase with `build.rs`'s options (`--help`), which fetches the Zig
   packages that build uses into the source's `zig-pkg/` (Zig checks them against the
   `build.zig.zon` hashes), so the cargo build needs no network.
+- Android libraries: `androidx.core` and Material Components 1.14.0 (which brings AppCompat,
+  androidx.activity, CoordinatorLayout and the Error Prone annotations).
 - Assets: the newest Alpine minirootfs tarball (as `rootfs.tgz`, since AAPT would unpack `.gz`),
   `doas.apk`, generated `notices/`, and the terminal font (`fonts/`, `android/terminal`);
   `BuildConfig` carries the Alpine branch.
 - Notices (`NoticesTask`): appine's notice, then the terminal's components with their license
   texts from `android/licenses/` (Ghostty, uucode with the Unicode and Hoehrmann licenses, simdutf,
   Highway and Wuffs under their MIT or BSD option, Zig's compiler_rt, JetBrains Mono's OFL),
-  Alpine, the Android libraries, the crates, SQLite and full texts. The component texts and
+  Alpine, the Android libraries, the crates, SQLite and full texts. Every Android library on the
+  runtime classpath must belong to a group known to be Apache-2.0 (AndroidX, Kotlin, kotlinx,
+  JetBrains annotations, Guava's listenablefuture, Material Components, Error Prone annotations,
+  JSpecify), or the task fails. The component texts and
   versions are copies kept by hand and change with the Ghostty version.
 - SDK: min 29, compile and target 37; uncompressed native libraries (`useLegacyPackaging = false`)
   so 16 KB-aligned `LOAD` segments (NDK 29's default) map directly from the APK.
-- Manifest: launcher and settings activities, the `specialUse` foreground service with its subtype
+- Manifest: launcher, settings and licenses activities (the application theme `Theme.Appine`,
+  Material 3; the launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave
+  `uiMode` out of their configuration changes), the `specialUse` foreground service with its subtype
   property, the documents provider, a handful of normal permissions (no storage permission); the
   debug network security config allows cleartext to 127.0.0.1 only.
 
@@ -136,7 +143,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 ### Outbound
 
 - `appine_kernel` (`Machine`, store and browse functions), `jni` 0.21, `libc`, Android `liblog`;
-  cargo-ndk and NDK 29; AGP.
+  cargo-ndk and NDK 29; AGP; `androidx.core` and Material Components from Google's Maven
+  repository.
 - Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate.
 
 ## Invariants and gotchas

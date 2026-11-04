@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the execution-tier row only in debug builds; release builds always run Tier 1; a switch for CJK characters filling two cells)
+> Maintained: 2026-11-04 (targeted verification: the execution-tier row only in debug builds; release builds always run Tier 1; a switch for CJK characters filling two cells; the settings screen in Material 3, its rows in groups)
 
 ## Responsibilities
 
@@ -34,9 +34,11 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   (urls, sha256, size), `Cancelled`, `Account`, `access` (a `ReentrantReadWriteLock`).
 - Preferences: file `rootfs` (`distro`, `mirror`, `mirror_manual`); file `settings` (`tier`, read
   by debug builds only; `login`, `keep_awake`, `system_documents`, `fill_wide`).
-- `SettingsActivity` — rows for distro, mirror, reset, login account, keep-awake, system
-  documents, CJK characters filling two cells (`android/terminal`), tier (debug builds only) and
-  licenses.
+- `SettingsActivity` — an `AppCompatActivity` on the Material 3 page that it shares with the
+  licenses (`android/terminal`'s `page.xml`, `list_item.xml`, `list_header.xml`); rows in groups
+  under headings: System (distro, mirror, login account, reset), Android (keep-awake, system
+  documents), Terminal (CJK characters filling two cells, `android/terminal`), Debugging (tier,
+  debug builds only) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
 
 ## Public entry points
@@ -107,6 +109,14 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   turns the distro row into "cancel".
 - The tier row exists only in a debug build (`BuildConfig.DEBUG`); a release build has no way to
   choose and always runs Tier 1.
+- Display: a row is a title over its value or description; a toggle row adds a `MaterialSwitch`
+  that only shows the state (tapping the row toggles, and accessibility services see the row as a
+  switch), whose first state jumps into place instead of sliding; a disabled row is drawn at 38%
+  opacity. Choices and confirmations are `MaterialAlertDialogBuilder` dialogs; the login change is
+  a toast.
+- Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
+  (`DynamicColors`), edge to edge. A dark-mode change recreates the screen (it does not handle
+  `uiMode`), which rebinds and renders again and drops an open dialog.
 
 ## Dependencies (inbound / outbound)
 

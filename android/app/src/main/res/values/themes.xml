@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Appine" parent="android:Theme.Material.NoActionBar">
+    <!-- Settings and the license pages: Material 3, light or dark with the system, with the
+         wallpaper's colours from Android 12 on (DynamicColors in their onCreate) -->
+    <style name="Theme.Appine" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">?attr/colorSurface</item>
+    </style>
+
+    <!-- The terminal: always black, and still the framework's Material theme, which the dialogs
+         and menus that MainActivity and VtView build with the framework classes need -->
+    <style name="Theme.Appine.Terminal" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@android:color/black</item>
         <item name="android:colorAccent">#FF26C6DA</item>
     </style>

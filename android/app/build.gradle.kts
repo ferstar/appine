@@ -257,7 +257,7 @@ abstract class NoticesTask : DefaultTask() {
             }
         }
         entry(
-            "Android libraries", "Apache-2.0 · AndroidX, Kotlin, kotlinx.coroutines and others", "android.txt",
+            "Android libraries", "Apache-2.0 · AndroidX, Material Components, Kotlin, kotlinx.coroutines and others", "android.txt",
             wrap(
                 "These libraries are built into the app and are licensed under the Apache License 2.0 " +
                     "(the full text is at the end of this list):",
@@ -488,6 +488,8 @@ abstract class NoticesTask : DefaultTask() {
             "org.jetbrains.kotlinx:",
             "org.jetbrains:annotations:",
             "com.google.guava:listenablefuture:",
+            "com.google.android.material:",
+            "com.google.errorprone:error_prone_annotations:",
             "org.jspecify:",
         )
 
@@ -542,6 +544,9 @@ androidComponents {
 
 dependencies {
     implementation("androidx.core:core:1.19.1")
+    // Material 3 for Settings and the license pages (brings AppCompat, which their activities
+    // extend, and androidx.activity for enableEdgeToEdge)
+    implementation("com.google.android.material:material:1.14.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
 }
