@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed)
+> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1)
 
 ## Responsibilities
 
@@ -19,8 +19,8 @@ outlives an Activity:
 - the ongoing notification and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories) and turns them into tab messages, notifications and lifecycle actions;
-- the settings state that the activities only display and forward (tier, keep-awake, login
-  account, system documents, distro switch, mirror).
+- the settings state that the activities only display and forward (tier in debug builds,
+  keep-awake, login account, system documents, distro switch, mirror).
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Tabs.kt`.
 
@@ -50,8 +50,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, COPY_REPORT;
   `START_NOT_STICKY`), `onTrimMemory`, `onDestroy`.
 - Called by activities: `addListener`/`removeListener`, `createSession`/`removeSession`, `exitAll`,
-  `setTier`, `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`, `setMirror`/`autoMirror`,
-  `setLogin`, `setSystemDocuments`, `takeNotice`.
+  `setTier` (ignored in a release build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
+  `setMirror`/`autoMirror`, `setLogin`, `setSystemDocuments`, `takeNotice`.
 - Static settings read by `Documents`: `login()`, `showSystemDocuments()`.
 
 ## Data flow / lifecycle
@@ -62,10 +62,11 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   (`Tabs.takeKilled`) and calls `start(ALPINE)` when no rootfs is ready, else `start(null)`.
 - `start` runs on an `appine-start` thread: import when a distro is given (`Rootfs.prepare`, then a
   mirror-probing thread), `ensureNetworkConfig`, `ensureLoginTools`, `updateProfile`, then
-  `Native.start(store, tier)` under `Rootfs.access`'s write lock. On success (main thread): set
-  `machine`, refresh Files roots, update the wake lock, mark running, restore saved tabs once,
-  schedule periodic saves, start the boot thread, register a default-network callback (routes),
-  post the poll, `onMachineReady(null)`.
+  `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the setting in a debug
+  build and always 1 in a release build, whatever an earlier debug install recorded). On success
+  (main thread): set `machine`, refresh Files roots, update the wake lock, mark running, restore
+  saved tabs once, schedule periodic saves, start the boot thread, register a default-network
+  callback (routes), post the poll, `onMachineReady(null)`.
 - Boot (`appine-boot` thread): run the osclock script without a console, `Native.boot` (blocks
   until inittab's boot entries finish), then notify OpenRC services that failed to start.
 - A failed import of a downloaded distro falls back to Alpine with a notice; any other failure sets
@@ -87,8 +88,9 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - `detach`: unregister the network callback, clear `machine` (before sessions end, so the UI does
   not treat it as the last tab closing), update the wake lock, cancel poll and saves, release
   (hang up and free) and clear all sessions; it runs before the kernel is shut down or stopped.
-- `restart` (guest reboot, tier change): `detach`, `onRestarting`, shutdown on the worker, then
-  `start(null)`; the UI opens a new tab when the new kernel is ready and no sessions exist.
+- `restart` (guest reboot, tier change in a debug build): `detach`, `onRestarting`, shutdown on the
+  worker, then `start(null)`; the UI opens a new tab when the new kernel is ready and no sessions
+  exist.
 - Distro switch/reset: download in the background (progress in Settings and the notification, both
   cancellable), then `replace`: reset the login setting, `detach`, `Native.stop` (kill all, no
   inittab shutdown), join the mirror thread, delete the store, `start(distro)`.
@@ -124,7 +126,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   notification follows when the message could not be shown, when no listener exists (Settings
   counts as one) or when it is an appine bug. Bugs always notify with "copy report": app version
   and build, device (Android release and API, maker and model, ABI, page size), distro and tier
-  setting, the kernel's report line, and up to 10 earlier kernel log records.
+  (always 1 in a release build), the kernel's report line, and up to 10 earlier kernel log records.
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot.
 - Listens: the first listen on a non-loopback address per (guest port, host port) pair and kernel
   (the kernel queues at most 32), with remap text when the ports differ.

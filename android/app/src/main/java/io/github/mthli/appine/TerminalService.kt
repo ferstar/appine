@@ -66,8 +66,8 @@ class TerminalService : Service() {
         fun onExitAll() {}
 
         /**
-         * About to restart: the guest's `reboot`, or the execution tier changed in Settings. All
-         * sessions have ended; the kernel shuts down and starts again (followed by
+         * About to restart: the guest's `reboot`, or (in a debug build) the execution tier changed
+         * in Settings. All sessions have ended; the kernel shuts down and starts again (followed by
          * [onMachineReady]).
          */
         fun onRestarting() {}
@@ -308,10 +308,12 @@ class TerminalService : Service() {
     }
 
     /**
-     * The execution tier (chosen in Settings, see the engine map): 1 is Tier 1, 0 is the
-     * interpreter. Takes effect at the next kernel start.
+     * The execution tier (see the engine map): 1 is Tier 1, 0 is the interpreter. A debug build
+     * takes it from Settings, effective at the next kernel start; a release build always runs Tier
+     * 1, ignoring a value recorded by an earlier debug install.
      */
-    val tier: Int get() = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1)
+    val tier: Int
+        get() = if (BuildConfig.DEBUG) getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1) else 1
 
     /**
      * The login account of new tabs (chosen in Settings, the android/setup map):
@@ -554,9 +556,12 @@ class TerminalService : Service() {
         }
     }
 
-    /** The execution tier was changed in Settings: record it and restart the kernel. */
+    /**
+     * The execution tier was changed in Settings (debug builds only): record it and restart the
+     * kernel.
+     */
     fun setTier(value: Int) {
-        if (value == tier) return
+        if (!BuildConfig.DEBUG || value == tier) return
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_TIER, value).apply()
         restart()
     }
@@ -648,8 +653,8 @@ class TerminalService : Service() {
     }
 
     /**
-     * Restart (the guest's `reboot`, the execution tier changed in Settings): shut down, then start
-     * a new kernel (after which the Activity opens new sessions).
+     * Restart (the guest's `reboot`, or the execution tier changed in a debug build's Settings):
+     * shut down, then start a new kernel (after which the Activity opens new sessions).
      */
     private fun restart() {
         if (machine == 0L) return

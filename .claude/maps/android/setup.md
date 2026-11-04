@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/setup.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: the execution-tier row only in debug builds; release builds always run Tier 1)
 
 ## Responsibilities
 
@@ -30,10 +32,10 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 - `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe), `Download`
   (urls, sha256, size), `Cancelled`, `Account`, `access` (a `ReentrantReadWriteLock`).
-- Preferences: file `rootfs` (`distro`, `mirror`, `mirror_manual`); file `settings` (`tier`,
-  `login`, `keep_awake`, `system_documents`).
-- `SettingsActivity` — rows for distro, mirror, reset, login account, tier, keep-awake, system
-  documents and licenses.
+- Preferences: file `rootfs` (`distro`, `mirror`, `mirror_manual`); file `settings` (`tier`, read
+  by debug builds only; `login`, `keep_awake`, `system_documents`).
+- `SettingsActivity` — rows for distro, mirror, reset, login account, keep-awake, system
+  documents, tier (debug builds only) and licenses.
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
 
 ## Public entry points
@@ -102,6 +104,8 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - Every row reads the service's state and calls it; rows that need a running kernel (mirror, tier)
   are disabled otherwise; distro and reset stay usable after a start failure; a running download
   turns the distro row into "cancel".
+- The tier row exists only in a debug build (`BuildConfig.DEBUG`); a release build has no way to
+  choose and always runs Tier 1.
 
 ## Dependencies (inbound / outbound)
 

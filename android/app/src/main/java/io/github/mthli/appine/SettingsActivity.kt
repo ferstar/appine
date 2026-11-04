@@ -22,12 +22,12 @@ import androidx.core.view.WindowInsetsCompat
 import kotlin.concurrent.thread
 
 /**
- * Settings: distro, package mirror, reset rootfs, execution tier (the android/setup map), login
- * account (likewise), keep running with the screen off (the android/service map), open source
- * licenses (design doc §13.4). All the state is in [TerminalService]; this only displays and
- * forwards it, and while the kernel is not running (starting, replacing the store) everything can
- * be viewed but not changed. When replacing the store or a restart begins, it goes back to the
- * terminal, which shows the progress.
+ * Settings: distro, package mirror, reset rootfs, execution tier (debug builds only; the
+ * android/setup map), login account (likewise), keep running with the screen off (the
+ * android/service map), open source licenses (design doc §13.4). All the state is in
+ * [TerminalService]; this only displays and forwards it, and while the kernel is not running
+ * (starting, replacing the store) everything can be viewed but not changed. When replacing the
+ * store or a restart begins, it goes back to the terminal, which shows the progress.
  */
 class SettingsActivity : Activity(), TerminalService.Listener {
 
@@ -42,7 +42,9 @@ class SettingsActivity : Activity(), TerminalService.Listener {
      * time the settings page is shown.
      */
     private var accounts: List<Rootfs.Account> = emptyList()
-    private lateinit var tier: Row
+
+    /** Only in debug builds: a release build always runs Tier 1 ([TerminalService.tier]). */
+    private var tier: Row? = null
     private lateinit var keepAwake: Row
     private lateinit var systemDocuments: Row
     private lateinit var licenses: Row
@@ -115,7 +117,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         mirror = Row(R.string.settings_mirror) { onMirror() }
         reset = Row(R.string.settings_reset) { onReset() }
         account = Row(R.string.settings_login) { onLogin() }
-        tier = Row(R.string.settings_tier) { onTier() }
+        if (BuildConfig.DEBUG) tier = Row(R.string.settings_tier) { onTier() }
         keepAwake = Row(R.string.settings_keep_awake, toggle = true) { service?.let { it.setKeepAwake(!it.keepAwake) } }
         systemDocuments = Row(R.string.settings_system_documents, toggle = true) {
             service?.let { it.setSystemDocuments(!it.systemDocuments) }
@@ -144,7 +146,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            for (row in listOf(distro, mirror, reset, account, keepAwake, systemDocuments, tier, licenses)) {
+            for (row in listOfNotNull(distro, mirror, reset, account, keepAwake, systemDocuments, tier, licenses)) {
                 addView(row.view)
             }
         }
@@ -237,7 +239,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         // Reset is possible even when the start failed: it is the only way to recover a broken
         // store
         reset.set(getString(R.string.reset_summary, (installed ?: Rootfs.Distro.ALPINE).label), s.canSwitch)
-        tier.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
+        tier?.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
         account.set(loginSummary(s.login), installed != null && sw == null)
         // Can be changed at any time: while the kernel is not running it is only recorded, and the
         // lock is held accordingly once it is up
