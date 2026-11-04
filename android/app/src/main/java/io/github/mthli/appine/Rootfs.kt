@@ -126,6 +126,9 @@ internal object Rootfs {
     /** Thrown when a download is aborted ([download]'s `cancelled` returns true). */
     class Cancelled : IOException("cancelled")
 
+    /** The server sent more than the pinned length ([fetch]); resuming would not help. */
+    private class Oversize(message: String) : IOException(message)
+
     private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
 
     /**
@@ -283,6 +286,9 @@ internal object Rootfs {
                                 if (cancelled()) throw Cancelled()
                                 val n = input.read(buf)
                                 if (n < 0) break
+                                // A server sending more than the pinned length is wrong whatever
+                                // follows: stop rather than fill the cache
+                                if (done + n > download.size) throw Oversize("$url: more than ${download.size} bytes")
                                 digest.update(buf, 0, n)
                                 output.write(buf, 0, n)
                                 done += n
@@ -296,7 +302,7 @@ internal object Rootfs {
                     }
                     break
                 } catch (e: IOException) {
-                    if (e is Cancelled || http == null || done == before || ++resumes > RESUMES) throw e
+                    if (e is Cancelled || e is Oversize || http == null || done == before || ++resumes > RESUMES) throw e
                     Log.w(TAG, "download of $url broke off at $done bytes, resuming", e)
                 } finally {
                     http?.disconnect()
@@ -586,9 +592,11 @@ internal object Rootfs {
         Log.i(TAG, "mirror speeds: ${distro.mirrors.zip(speeds)}, using ${best.first}")
         synchronized(this) {
             if (isMirrorManual(context)) return true
+            // Could not write (an I/O error): the sources and the recorded mirror both stay as they
+            // were, and the "no built-in mirror" hint would be wrong
             val written = runCatching { writeMirror(store(context).path, distro, best.first) }
                 .onFailure { Log.w(TAG, "cannot write the package sources", it) }
-                .getOrDefault(true)
+                .getOrElse { return true }
             if (written) {
                 prefs(context).edit().putString(KEY_MIRROR, best.first).apply()
             } else {

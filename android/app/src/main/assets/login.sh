@@ -60,7 +60,51 @@ root) ;;
     ;;
 esac
 
+admins=/var/lib/appine/admins
+if [ -f /etc/alpine-release ]; then
+    group=wheel
+    tool=doas
+    rules=/etc/doas.d/30-appine.conf
+else
+    group=sudo
+    tool=sudo
+    rules=/etc/sudoers.d/appine
+fi
+ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
+
+# Admins without a password (still in the group) are not asked for a password when escalating. The
+# rules are rewritten at every login, root's included, according to the passwords at that time. No
+# password means a shadow field that is empty or only "!" or "*" (adduser -D writes "!"); passwd -l
+# puts "!" in front of a hash, and that account still has a password. Without a shadow entry, or
+# without a readable /etc/shadow, an account counts as having a password
+refresh_rules() {
+    nopass=
+    if [ -f "$admins" ]; then
+        while read -r u; do
+            ingroup "$u" || continue
+            pw=$(awk -F: -v u="$u" '$1 == u { sub(/^!+/, "", $2); print "=" $2; exit }' /etc/shadow 2>/dev/null)
+            case $pw in '=' | '=*') nopass="$nopass $u" ;; esac
+        done <"$admins"
+    fi
+    if [ -n "$nopass" ] && [ -d "${rules%/*}" ]; then
+        {
+            echo "# Written by appine at each login: administrators without a password ($admins)."
+            for u in $nopass; do
+                if [ "$group" = wheel ]; then
+                    echo "permit nopass $u"
+                else
+                    echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
+                fi
+            done
+        } >"$rules"
+        chmod 0440 "$rules"
+    else
+        rm -f "$rules"
+    fi
+}
+
 if [ "$user" = root ]; then
+    refresh_rules
     # Start in the restored directory, otherwise the home directory
     home=$(field root 6 /etc/passwd)
     { [ -n "$dir" ] && cd "$dir"; } 2>/dev/null || cd "$home" 2>/dev/null || cd /
@@ -70,32 +114,26 @@ if [ "$user" = root ]; then
     exec "$shell" -l
 fi
 
-admins=/var/lib/appine/admins
-if [ -f /etc/alpine-release ]; then
-    group=wheel
-    tool=doas
-else
-    group=sudo
-    tool=sudo
-fi
-ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$group"; }
-
 # The first time: add to the admin group and record it (if the user later takes it out of the group,
-# it is not added back)
-if ! grep -qsx "$user" "$admins"; then
+# it is not added back). Recorded only once it really is in the group, so a failure is retried at
+# the next login
+fresh=
+if ! grep -Fqsx -- "$user" "$admins"; then
     if [ "$group" = wheel ]; then
         addgroup "$user" wheel
         mkdir -p /etc/doas.d
-        grep -qsx 'permit persist :wheel' /etc/doas.d/20-wheel.conf ||
+        grep -Fqsx 'permit persist :wheel' /etc/doas.d/20-wheel.conf ||
             echo 'permit persist :wheel' >>/etc/doas.d/20-wheel.conf
     else
         usermod -aG sudo "$user"
     fi
-    mkdir -p "${admins%/*}"
-    echo "$user" >>"$admins"
-    fresh=1
-else
-    fresh=
+    if ingroup "$user"; then
+        mkdir -p "${admins%/*}"
+        echo "$user" >>"$admins"
+        fresh=1
+    else
+        echo "appine: cannot add $user to the $group group; appine tries again at the next login" >&2
+    fi
 fi
 
 # Privilege tool: once installed (or already present) it is recorded, and if the user uninstalls it
@@ -136,32 +174,7 @@ elif [ ! -e "$installed" ]; then
     echo "appine: $user is in the $group group, but $tool is not installed yet; appine tries again at the next login" >&2
 fi
 
-# Admins without a password (still in the group) are not asked for a password when escalating
-nopass=
-while read -r u; do
-    ingroup "$u" || continue
-    case $(field "$u" 2 /etc/shadow) in '' | '!'* | '*'*) nopass="$nopass $u" ;; esac
-done <"$admins"
-if [ "$group" = wheel ]; then
-    rules=/etc/doas.d/30-appine.conf
-else
-    rules=/etc/sudoers.d/appine
-fi
-if [ -n "$nopass" ] && [ -d "${rules%/*}" ]; then
-    {
-        echo "# Written by appine at each login: administrators without a password ($admins)."
-        for u in $nopass; do
-            if [ "$group" = wheel ]; then
-                echo "permit nopass $u"
-            else
-                echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
-            fi
-        done
-    } >"$rules"
-    chmod 0440 "$rules"
-else
-    rm -f "$rules"
-fi
+refresh_rules
 
 # Run as a login shell (reads /etc/profile); su sets HOME, SHELL, USER and LOGNAME. su -l is not
 # used: it always goes to the home directory. The restored directory is entered as this account (a

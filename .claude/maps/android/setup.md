@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the execution-tier row only in debug builds; release builds always run Tier 1; a switch for CJK characters filling two cells; the settings screen in Material 3, its rows in groups)
+> Maintained: 2026-11-04 (targeted verification: NOPASSWD rules fail closed and are refreshed at root logins too; admins recorded only once in the group and matched literally; mirrors recorded only after writing; downloads stopped past the pinned length; four bugs removed or narrowed)
 
 ## Responsibilities
 
@@ -59,9 +59,9 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   `rootfs.tgz` and `doas.apk`; `prepare` copies the asset to the cache.
 - Debian: one pinned GitHub URL (debuerreotype `debian:trixie`) with fixed length and sha256.
   `fetch` probes sources when there are several, writes `.part` while hashing, resumes with `Range`
-  up to 5 times when an attempt made progress (restarting on a non-206 reply), checks length and
-  sha256, and renames; a verified cached tarball is reused; cancellation is checked before each
-  read.
+  up to 5 times when an attempt made progress (restarting on a non-206 reply), stops at once (no
+  resume) when a source sends more than the pinned length, checks length and sha256, and renames;
+  a verified cached tarball is reused; cancellation is checked before each read.
 
 ### Import
 
@@ -81,7 +81,8 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 - Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After an import the service
   probes them concurrently (up to 512 KB or 5 s each, by throughput) and writes the fastest unless
-  the user chose one; manual choice and automatic writes are serialised by one lock.
+  the user chose one; manual choice and automatic writes are serialised by one lock. The recorded
+  mirror changes only after the sources were written (a write that fails leaves both alone).
 - `retarget` rewrites only built-in mirror hosts (http or https, commented lines too), keeps the
   scheme and the rest of each line, and leaves other sources alone; a missing sources file is
   written from the template; a file with no built-in mirror is left alone with a hint.
@@ -91,13 +92,17 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - `loginAccount`: `auto` is the regular account (UID 1000–65533, a real login shell) with the
   lowest UID, else root; `root`; or a named passwd entry, falling back to root.
 - `login.sh` traps SIGINT for itself, picks the account the same way, and:
+  - every login, root's included: rewrite `/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`
+    with NOPASSWD lines for recorded admins still in the group that have no password: a shadow
+    field that, after any leading `!`s, is empty or `*` (`adduser -D` writes `!`); `passwd -l`'s `!`
+    before a hash still counts as a password, and so do a missing shadow entry and an unreadable
+    `/etc/shadow`;
   - root: `cd` to the directory and `exec` root's passwd shell as a login shell;
-  - a regular account the first time (not in `/var/lib/appine/admins`): add it to wheel (Alpine,
-    with `permit persist :wheel`) or sudo (Debian), record it, install doas from the bundled package
-    and re-add it by name, or install sudo from the network showing apt's progress (Ctrl-C skips
-    until the next login); marker files stop reinstalls;
-  - every regular login: rewrite `/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine` with
-    NOPASSWD lines for recorded admins still in the group whose shadow password is unset;
+  - a regular account the first time (not in `/var/lib/appine/admins`, matched literally): add it
+    to wheel (Alpine, with `permit persist :wheel`) or sudo (Debian) and record it once it really is
+    in the group (otherwise say so and retry at the next login), install doas from the bundled
+    package and re-add it by name, or install sudo from the network showing apt's progress (Ctrl-C
+    skips until the next login); marker files stop reinstalls;
   - switch with `su <account> -c '<cd dir or home>; exec "$SHELL" -l'` (`--session-command` when
     util-linux su offers it); package commands read from `/dev/null` so early typing reaches the
     shell.
@@ -146,24 +151,13 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ## Confirmed bugs / technical debt
 
-- **The mirror setting can disagree with the sources.** `chooseMirror` treats a failed write as
-  success (`getOrDefault(true)`), records the mirror and shows it in Settings while the sources
-  file still names the old one.
-- **The NOPASSWD rules fail open.** A shadow field starting with `!` counts as "no password", so a
-  `passwd -l` account gets NOPASSWD; a missing `/etc/shadow` makes every admin passwordless; rules
-  are refreshed only at regular-user logins, so a newly set password still has a NOPASSWD line
-  until then.
-- **The admin setup ignores failures and matches loosely.** Failed `addgroup`/`usermod` still
-  records the user as set up (never retried); the admins file is matched with a regex
-  (`grep -qsx` without `-F`).
+- **A password set in a running session keeps NOPASSWD for a while.** The rules are rewritten only
+  when a tab logs in, so after `passwd` the account still escalates without one until the next tab
+  opens.
 - **A switch interrupted by a kill silently becomes Alpine** (see above).
-- `fetch` reads until EOF with no cap at the expected size, so a misbehaving server can fill the
-  cache until the read timeout or a full disk.
 
 ## Open questions
 
-- Should a locked account (`!<hash>`) count as "no password" for the NOPASSWD rule?
-- Should root logins also refresh or remove the NOPASSWD rules?
 - Should an interrupted Debian import resume as Debian?
 
 ## To verify

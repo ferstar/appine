@@ -469,8 +469,11 @@ class MachineTest {
         assertEquals(src.length() to src.length(), last)
         assertTrue(dest.readBytes().contentEquals(src.readBytes()))
         dest.delete()
+        // A wrong digest, fewer bytes than expected, more bytes than expected (stopped as soon as it
+        // goes past the length)
         for (wrong in listOf(Rootfs.Download(listOf(src.toURI().toString()), "0".repeat(64), src.length()),
-            Rootfs.Download(listOf(src.toURI().toString()), sha, src.length() + 1))) {
+            Rootfs.Download(listOf(src.toURI().toString()), sha, src.length() + 1),
+            Rootfs.Download(listOf(src.toURI().toString()), sha, src.length() - 1))) {
             assertThrows(IOException::class.java) { Rootfs.fetch(wrong, dest) { _, _ -> } }
             assertFalse(dest.exists() || File(dest.path + ".part").exists())
         }
