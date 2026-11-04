@@ -6,6 +6,12 @@
 //! `android/app/src/debug/java/io/github/mthli/appine/VtNative.kt`. Like [`Machine`]s in the crate
 //! root, tabs are registered in a table and Kotlin holds a handle.
 //!
+//! A tab names its kernel by the crate root's handle too and looks it up for each call, as the
+//! `Native` functions do, instead of holding an `Arc<Machine>`: `Native.stop` and `shutdown` only
+//! remove the handle and end the processes, and the store is closed when the last reference is
+//! dropped. A tab outliving its kernel would keep the old store open after a reboot or a distro
+//! switch, and the next kernel would then start without the boot cleanup.
+//!
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames, resizes,
 //! scrolls and encodes keys. The terminal is not thread-safe, so every call into vt.c holds the
@@ -83,7 +89,8 @@ impl Drop for Term {
 }
 
 struct Tab {
-    machine: Arc<Machine>,
+    /// The kernel's handle in the crate root's table ([`machine`]).
+    machine: jlong,
     console: u32,
     term: Mutex<Term>,
     /// Output changed the terminal since the last frame. The pump tells the view only when it sets
@@ -96,10 +103,16 @@ impl Tab {
         self.term.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Writes input to the console until all of it is taken; false once the console is gone.
-    fn write(&self, mut data: &[u8]) -> bool {
+    /// The kernel, for the duration of one call; None once it is stopped.
+    fn machine(&self) -> Option<Arc<Machine>> {
+        machine(self.machine)
+    }
+
+    /// Writes input to the console of `m` (this tab's kernel) until all of it is taken; false once
+    /// the console is gone.
+    fn write(&self, m: &Machine, mut data: &[u8]) -> bool {
         while !data.is_empty() {
-            match self.machine.write_console(self.console, data) {
+            match m.write_console(self.console, data) {
                 Ok(n) => data = &data[n..],
                 Err(_) => return false,
             }
@@ -139,10 +152,10 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
     cell_width: jint,
     cell_height: jint,
 ) -> jlong {
-    let Some(m) = machine(handle) else {
+    if machine(handle).is_none() {
         throw(&mut env, "the machine is stopped");
         return 0;
-    };
+    }
     let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
     let raw = unsafe { appine_vt_new(cols, rows, cw, ch) };
     if raw.is_null() {
@@ -151,7 +164,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
     }
     let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
     let tab = Tab {
-        machine: m,
+        machine: handle,
         console: console as u32,
         term: Mutex::new(Term(raw)),
         dirty: AtomicBool::new(false),
@@ -188,15 +201,19 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     let Some(tab) = tab(handle) else { return };
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = match tab.machine.read_console(tab.console, &mut buf) {
+        // Looked up again for every read, so the kernel is not kept once the service stops it
+        let Some(m) = tab.machine() else { break };
+        let n = match m.read_console(tab.console, &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         let replies = tab.term().feed(&buf[..n]);
         // A program waiting for an answer (DA, DSR) does not read further until it comes
-        if !replies.is_empty() && !tab.write(&replies) {
+        if !replies.is_empty() && !tab.write(&m, &replies) {
             break;
         }
+        // Not kept across the call into Java either
+        drop(m);
         if !tab.dirty.swap(true, Ordering::AcqRel)
             && env.call_method(&view, "onOutput", "()V", &[]).is_err()
         {
@@ -245,7 +262,9 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_resize<'l>(
     let Some(tab) = tab(handle) else { return };
     let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
     unsafe { appine_vt_resize(tab.term().0, cols, rows, cw, ch) };
-    let _ = tab.machine.resize_console(tab.console, rows, cols);
+    if let Some(m) = tab.machine() {
+        let _ = m.resize_console(tab.console, rows, cols);
+    }
 }
 
 /// Scrolls the viewport by `delta` rows (negative: back); 0 returns to the bottom.

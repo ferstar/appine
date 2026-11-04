@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle)
 
 ## Responsibilities
 
@@ -55,9 +55,10 @@ feature that compiles libghostty-vt (`android/native`).
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers, modifier bits, actions.
 - `VtNative` — `@JvmStatic external` functions on the native library; `available` probes for them.
-- In `vt.rs`: `Tab` (`Arc<Machine>`, console number, the terminal under a mutex, a `dirty` flag)
-  in a table `TABS` keyed by handles from 1, never reused. In `vt.c`: `AppineVt` (the terminal, its
-  render state and key encoder, reply and frame buffers, the synchronized-output hold).
+- In `vt.rs`: `Tab` (the kernel's handle, console number, the terminal under a mutex, a `dirty`
+  flag) in a table `TABS` keyed by handles from 1, never reused. In `vt.c`: `AppineVt` (the
+  terminal, its render state and key encoder, reply and frame buffers, the synchronized-output
+  hold).
 
 ## Public entry points
 
@@ -194,6 +195,13 @@ feature that compiles libghostty-vt (`android/native`).
 
 ### Experimental terminal
 
+- A tab refers to its kernel by handle and looks it up for each call (each console read of the
+  pump, each reply write, each resize), like the `Native` functions: `Native.stop` and `shutdown`
+  only end the processes, and the store is closed when the last `Arc<Machine>` goes, so a tab
+  holding one would keep the old store open after a reboot, tier change or distro switch, and the
+  next kernel would start without the boot cleanup. The pump still holds the kernel during a read,
+  which returns once the shutdown has ended the shell; the service does not wait for that, since
+  `VtActivity` does not close its console on `onRestarting` as the service's own tabs are closed.
 - libghostty-vt is not thread-safe: every call into `vt.c` holds the tab's lock; the frame buffer is
   written only by `frame`, which only the main thread calls, so the main thread reads it after the
   lock is released.
@@ -224,17 +232,9 @@ feature that compiles libghostty-vt (`android/native`).
   throws the session is marked finished without closing it, and nothing closes it until the kernel
   stops. `VtActivity` leaks the same way and tries again on every later grid change (zoom,
   rotation, IME), leaking one more console each time.
-- **The experimental terminal keeps a stopped kernel alive.** Its `Tab` holds an `Arc<Machine>`
-  until `VtActivity` is destroyed, while `Native.stop` and `shutdown` only kill the processes and
-  leave closing the store to `Machine`'s drop. A restart (reboot, tier change) with the activity
-  open starts the new kernel while the old one still holds the store, so the new start skips the
-  boot cleanup (volatile directories, lost objects, orphans); a distro switch deletes the store
-  under it; and the final drop (store sync, timer-thread join) usually runs on the main thread in
-  `onDestroy`.
 - **The experimental terminal lacks** selection and copy, paste (`VtNative.bracketedPaste` exists
-  but nothing calls it),
-  mouse reporting, titles and the bell, and tabs; the plan is input next, then tabs in
-  `TerminalService` (save and restore, kill reports), then removing the Termux view.
+  but nothing calls it), mouse reporting, titles and the bell, and tabs; the plan is input next,
+  then tabs in `TerminalService` (save and restore, kill reports), then removing the Termux view.
 - **Tab saves during full-screen programs lose the scrollback.** `getTranscriptText` reads the
   current screen, which is the alternate buffer (no scrollback) while vim or less runs, and replaces
   the earlier save.
