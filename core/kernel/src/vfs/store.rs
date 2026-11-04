@@ -48,7 +48,7 @@
 //! tools) need not queue up.
 
 use std::cell::{Cell, UnsafeCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -946,7 +946,7 @@ impl Store {
                 .map_err(db_err)?;
             rows.collect::<Result<_, _>>().map_err(db_err)?
         };
-        for (ino, m) in orphans {
+        for &(ino, m) in &orphans {
             // Not handed to the background thread: once the row is deleted, its number may be
             // given to a newly created file, and a background thread deleting a bit later would
             // delete the new file's object. Deleting before the commit does no harm: no dentry has
@@ -965,6 +965,12 @@ impl Store {
                 .map_err(db_err)?;
             self.touch_file_caps();
         }
+        // Emptying the volatile directories and detached trees just before queued their objects
+        // for the background thread; they are gone now, and their numbers are free for new files
+        let removed: HashSet<Ino> = orphans.iter().map(|&(ino, _)| ino).collect();
+        self.doomed
+            .borrow_mut()
+            .retain(|ino| !removed.contains(ino));
         Ok(())
     }
 
@@ -3007,30 +3013,41 @@ mod tests {
     #[test]
     fn inode_numbers_reused_after_boot_keep_their_objects() {
         let (s, dir) = temp_store("reuse");
-        let inos: Vec<Ino> = (0..50)
-            .map(|i| {
-                let name = format!("f{i}");
-                let (ino, _) = s.create_file(ROOT, name.as_bytes(), 0o644, 0, 0).unwrap();
-                s.unlink(ROOT, name.as_bytes()).unwrap();
-                ino
-            })
-            .collect();
+        // Deleted last time, still in a volatile directory, and left in a tmpfs tree that was
+        // never unmounted: all three kinds are deleted by the next boot
+        let tmpfs = s.create_detached_dir(0o1777, 0, 0).unwrap();
+        let run = s.mkdir(ROOT, b"run", 0o755, 0, 0).unwrap();
+        let mut inos = Vec::new();
+        for i in 0..30 {
+            let name = format!("f{i}");
+            let (ino, _) = s.create_file(ROOT, name.as_bytes(), 0o644, 0, 0).unwrap();
+            s.unlink(ROOT, name.as_bytes()).unwrap();
+            inos.push(ino);
+            let (ino, _) = s.create_file(run, name.as_bytes(), 0o644, 0, 0).unwrap();
+            inos.push(ino);
+            let (ino, _) = s.create_file(tmpfs, name.as_bytes(), 0o644, 0, 0).unwrap();
+            inos.push(ino);
+        }
+        s.commit().unwrap();
         drop(s);
         // Boot cleanup deletes these inode rows, and the numbers are allocated to newly created
         // files again. Cleanup deletes the objects itself instead of handing them to the
         // background thread: if that deleted them a bit later, it would delete the new files'
-        let s = Store::open(&dir, &[]).unwrap();
+        let s = Store::open(&dir, &[b"run"]).unwrap();
         assert_eq!(s.meta.reaper.state.lock().unwrap().handed, 0);
-        for i in 0..50 {
-            s.create_file(ROOT, format!("g{i}").as_bytes(), 0o644, 0, 0)
+        for i in 0..inos.len() {
+            let (g, _) = s
+                .create_file(ROOT, format!("g{i}").as_bytes(), 0o644, 0, 0)
                 .unwrap();
+            s.open_object(g, true).unwrap().write_all(b"data").unwrap();
         }
         s.commit().unwrap();
         s.reaped();
-        for i in 0..50 {
+        for i in 0..inos.len() {
             let ino = s.lookup(ROOT, format!("g{i}").as_bytes()).unwrap().unwrap();
             assert!(inos.contains(&ino));
-            assert!(dir.join("objects").join(ino.to_string()).exists());
+            let object = dir.join("objects").join(ino.to_string());
+            assert_eq!(fs::read(object).unwrap(), b"data");
         }
         drop(s);
         let _ = fs::remove_dir_all(&dir);

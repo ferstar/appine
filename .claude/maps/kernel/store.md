@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-04 (targeted verification: boot cleanup no longer hands its own numbers to the reaper; removed that bug)
 
 ## Responsibilities
 
@@ -158,7 +158,8 @@ provider and rootfs installation UI (`android`).
   has the store open), it runs boot cleanup: reset `users`, delete objects in the recorded
   uncommitted range that have no row, empty the volatile directories passed in (the kernel passes
   `/dev/shm` and `/run`; host-side openers pass none), remove detached tmpfs trees, sync, delete
-  nlink-0 rows and their objects, commit. Then it downgrades to shared and increments `users`; if
+  nlink-0 rows and their objects (taking those numbers back out of the doomed list the emptying
+  filled), commit. Then it downgrades to shared and increments `users`; if
   others are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
 
 ### Metadata cache
@@ -242,7 +243,9 @@ provider and rootfs installation UI (`android`).
 - Only the thread holding the owning kernel's BKL may use a kernel's `Store` (checked in debug and
   `borrow-check` builds).
 - Objects are always addressed by inode number, never by guest path.
-- Inode numbers are reused only after boot cleanup has deleted their rows.
+- Inode numbers are reused only after boot cleanup has deleted their rows. Boot cleanup therefore
+  deletes those objects itself and must hand none of their numbers to the reaper, which unlinks
+  `objects/<ino>` without checking whose it is.
 - A crash that leaves `users` too high disables deferred commits until the next exclusive open.
 
 - A failed `COMMIT` loses every deferred operation already reported as successful (the documented
@@ -252,13 +255,6 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- **Boot cleanup can delete a new file's data:** emptying `/dev/shm`, `/run` and leftover tmpfs trees
-  queues their objects in the doomed list; the same cleanup then deletes those rows and objects
-  directly (to avoid exactly this), but the final commit still hands the doomed numbers to the
-  reaper, which syncs the WAL and then unlinks `objects/<ino>` without checking identity. A regular
-  file created right after boot that reuses such a number (above the highest surviving row — likely
-  for files the last session created in `/run` or `/dev/shm`; `/etc/resolv.conf` is written
-  immediately after open) loses its object, leaving a name whose data is gone.
 - **`linkat(AT_EMPTY_PATH)` re-links unlinked files:** `link` accepts an nlink-0 source; while the
   object still exists (deferred transaction or reaper not yet run) the link succeeds and nlink goes
   back to 1, but the inode stays doomed, so the object is deleted after commit and the new name
