@@ -19,6 +19,7 @@
     <string name="close_tab">关闭标签页</string>
     <string name="rename_tab">重命名标签页</string>
     <string name="rename_tab_hint">留空则显示程序设置的标题。</string>
+    <string name="tab_name">名称</string>
     <string name="next_tab">下一个标签页</string>
     <string name="previous_tab">上一个标签页</string>
     <string name="shortcuts_tabs">标签页</string>

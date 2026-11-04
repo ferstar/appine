@@ -1,7 +1,6 @@
 package io.github.mthli.appine
 
 import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -35,6 +34,7 @@ import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
@@ -930,7 +930,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             return
         }
         val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
-        AlertDialog.Builder(context)
+        MaterialAlertDialogBuilder(context)
             .setTitle(R.string.paste_unsafe_title)
             .setMessage(context.getString(R.string.paste_unsafe, preview))
             .setPositiveButton(android.R.string.paste) { _, _ ->

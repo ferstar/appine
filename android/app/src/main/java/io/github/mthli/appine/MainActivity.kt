@@ -3,15 +3,14 @@ package io.github.mthli.appine
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.ComponentName
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -31,16 +30,20 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.widget.BaseAdapter
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
-import android.widget.ListPopupWindow
-import android.widget.PopupMenu
 import android.widget.TextView
+import androidx.appcompat.widget.ListPopupWindow
+import androidx.appcompat.widget.PopupMenu
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import com.google.android.material.color.DynamicColors
+import com.google.android.material.color.MaterialColors
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import kotlin.math.abs
 
 /**
@@ -52,6 +55,9 @@ import kotlin.math.abs
  * The tab bar lists every tab in a row only when the window is at least [WIDE_DP] wide; narrower
  * (a phone held upright) it shows the number of tabs and the current tab's title, and tapping them
  * opens the list of tabs.
+ *
+ * Its dialogs, menus and the list of tabs are Material 3 (`Theme.Appine.Terminal`, always dark);
+ * the activity itself stays a framework one, and so do the views it builds.
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
@@ -94,6 +100,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
         fontSize = getPreferences(MODE_PRIVATE).getInt(PREF_FONT_SIZE, dp(12))
         screen = VtView(this, Host()).apply {
@@ -133,7 +140,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = touchFeedback(borderless = false)
+            background = touchFeedback()
             addView(tabCount)
             // The title moves with a swipe; its own frame clips it, so it never covers the count
             addView(FrameLayout(this@MainActivity).apply { addView(tabTitle) },
@@ -306,7 +313,7 @@ class MainActivity : Activity(), TerminalService.Listener {
      */
     override fun onNotice() {
         val text = service?.takeNotice() ?: return
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setMessage(text)
             .setPositiveButton(android.R.string.ok, null)
             .show()
@@ -460,28 +467,31 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /** Asks for a tab's name; an empty one shows the program's title again. */
+    /**
+     * Asks for a tab's name (dialog_rename.xml); an empty one shows the program's title again,
+     * which is the field's placeholder.
+     */
+    // A dialog's view has no parent to inflate it into
+    @SuppressLint("InflateParams")
     private fun rename(session: VtSession) {
-        val input = EditText(this).apply {
-            isSingleLine = true
+        val view = layoutInflater.inflate(R.layout.dialog_rename, null)
+        view.findViewById<TextInputLayout>(R.id.field).placeholderText =
+            session.title?.takeIf { it.isNotBlank() } ?: "sh"
+        val input = view.findViewById<TextInputEditText>(R.id.name).apply {
             setText(session.name.orEmpty())
             selectAll()
-            hint = session.title?.takeIf { it.isNotBlank() } ?: "sh"
-            imeOptions = EditorInfo.IME_ACTION_DONE
         }
-        val dialog = AlertDialog.Builder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.rename_tab)
-            .setMessage(R.string.rename_tab_hint)
-            .setView(FrameLayout(this).apply {
-                setPadding(dp(20), 0, dp(20), 0)
-                addView(input)
-            })
-            .setPositiveButton(android.R.string.ok) { _, _ -> service?.renameSession(session, input.text.toString()) }
+            .setView(view)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                service?.renameSession(session, input.text?.toString().orEmpty())
+            }
             .setNegativeButton(android.R.string.cancel, null)
             .create()
         input.setOnEditorActionListener { _, action, _ ->
             if (action != EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
             true
         }
         dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
@@ -498,7 +508,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         list = ListPopupWindow(this).apply {
             anchorView = bar
             setAdapter(tabList)
-            setBackgroundDrawable(ColorDrawable(LIST_COLOR))
             isModal = true
             // The IME stays up (the list may cover it), as the terminal still has the input focus
             inputMethodMode = ListPopupWindow.INPUT_METHOD_NOT_NEEDED
@@ -522,18 +531,13 @@ class MainActivity : Activity(), TerminalService.Listener {
         setTextColor(Color.LTGRAY)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         setPadding(dp(12), dp(10), dp(12), dp(10))
-        background = touchFeedback(borderless = false)
+        background = touchFeedback()
         setOnClickListener(onClick)
     }
 
     /** The theme's ripple for something that can be tapped. */
-    private fun touchFeedback(borderless: Boolean): Drawable? {
-        val attr = if (borderless) {
-            android.R.attr.selectableItemBackgroundBorderless
-        } else {
-            android.R.attr.selectableItemBackground
-        }
-        val a = obtainStyledAttributes(intArrayOf(attr))
+    private fun touchFeedback(): Drawable? {
+        val a = obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
         return a.getDrawable(0).also { a.recycle() }
     }
 
@@ -601,13 +605,21 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /** The rows of the list of tabs: `N: title`, the current one highlighted, and a close button. */
+    /**
+     * The rows of the list of tabs (list_tab.xml): `N: title`, the current one highlighted in the
+     * theme's secondary container colour, and a close button.
+     */
     private inner class TabList : BaseAdapter() {
         var items: List<VtSession> = emptyList()
             set(value) {
                 field = value
                 notifyDataSetChanged()
             }
+
+        private val currentBackground by lazy { color(com.google.android.material.R.attr.colorSecondaryContainer) }
+        private val currentText by lazy { color(com.google.android.material.R.attr.colorOnSecondaryContainer) }
+        private val runningText by lazy { color(com.google.android.material.R.attr.colorOnSurface) }
+        private val endedText by lazy { color(com.google.android.material.R.attr.colorOnSurfaceVariant) }
 
         override fun getCount() = items.size
 
@@ -616,42 +628,24 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun getItemId(position: Int) = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val row = convertView as? LinearLayout ?: newRow()
-            val text = row.getChildAt(0) as TextView
+            val row = convertView ?: layoutInflater.inflate(R.layout.list_tab, parent, false)
             val session = items[position]
-            text.text = label(position, session)
-            text.setTextColor(
-                when {
-                    !session.isRunning -> Color.GRAY
-                    session == current -> Color.WHITE
-                    else -> Color.LTGRAY
-                }
-            )
-            row.setBackgroundColor(if (session == current) CURRENT_COLOR else Color.TRANSPARENT)
-            // Not focusable, so the rest of the row still takes the list's taps
-            row.getChildAt(1).setOnClickListener { close(session) }
+            row.findViewById<TextView>(R.id.title).apply {
+                text = label(position, session)
+                setTextColor(
+                    when {
+                        session == current -> currentText
+                        session.isRunning -> runningText
+                        else -> endedText
+                    }
+                )
+            }
+            row.setBackgroundColor(if (session == current) currentBackground else Color.TRANSPARENT)
+            row.findViewById<View>(R.id.close).setOnClickListener { close(session) }
             return row
         }
 
-        private fun newRow() = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(48)
-            addView(TextView(this@MainActivity).apply {
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                isSingleLine = true
-                ellipsize = TextUtils.TruncateAt.END
-                setPadding(dp(16), dp(12), dp(8), dp(12))
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(TextView(this@MainActivity).apply {
-                text = "✕"
-                setTextColor(Color.LTGRAY)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                gravity = Gravity.CENTER
-                contentDescription = getString(R.string.close_tab)
-                background = touchFeedback(borderless = true)
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
-        }
+        private fun color(attr: Int) = MaterialColors.getColor(this@MainActivity, attr, Color.WHITE)
     }
 
     /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
@@ -690,8 +684,6 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     companion object {
         val BAR_COLOR = Color.rgb(0x20, 0x20, 0x20)
-        private val LIST_COLOR = Color.rgb(0x2a, 0x2a, 0x2a)
-        private val CURRENT_COLOR = Color.rgb(0x3a, 0x3a, 0x3a)
         private const val PREF_FONT_SIZE = "font_size"
 
         /** From this window width (dp, the usual tablet breakpoint) the bar lists every tab in a row. */

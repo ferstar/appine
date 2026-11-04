@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses, the terminal keeping the framework theme)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark)
 
 ## Responsibilities
 
@@ -18,8 +18,8 @@
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
 - `LicensesActivity`: the notices generated at build time;
 - the app's strings and themes: `Theme.Appine` (Material 3 DayNight, for Settings and the
-  licenses) and `Theme.Appine.Terminal` (the framework's Material theme, black, for
-  `MainActivity`), and the Material 3 page layouts that Settings and the licenses share
+  licenses) and `Theme.Appine.Terminal` (Material 3, always dark, with a black window and
+  system bars, for `MainActivity`), and the Material 3 page layouts that Settings and the licenses share
   (`page.xml`, `list_item.xml`, `list_header.xml`).
 
 Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `VtSession.kt`,
@@ -35,7 +35,8 @@ libghostty-vt with Zig (`android/native`).
 
 - `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
   tabs and a switcher with its `Swipe` touch listener, one of them shown) and the list of tabs
-  while open (`ListPopupWindow` over the `TabList` adapter); `Host : VtView.Host`,
+  while open (AppCompat's `ListPopupWindow` over the `TabList` adapter, rows from
+  `list_tab.xml`); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default layout, two rows of seven (ESC, `/`, `-`, HOME, ↑, END, PGUP;
   TAB, CTRL, ALT, ←, ↓, →, PGDN); keeps CTRL and ALT (one-shot or locked) and sends keys and text
@@ -99,9 +100,14 @@ libghostty-vt with Zig (`android/native`).
     the next tab (to the left) or the previous one (to the right), without going round; the title
     follows the finger, with more resistance where there is no tab.
 - A long press on a tab in the row, on the switcher (the current tab) or on a row of the list
-  opens a menu: "Rename tab" (closes the list; a dialog with the name selected and the program's
-  title as hint; Enter confirms; an empty name shows the program's title again;
+  opens a menu: "Rename tab" (closes the list; a dialog with an outlined text field,
+  `dialog_rename.xml`, holding the name selected, with the program's title as its placeholder and
+  the rule as its helper text; Enter confirms; an empty name shows the program's title again;
   `TerminalService.renameSession`) and "Close tab".
+- Its dialogs (rename, notices, the paste confirmation), its menus (⋮, the tab menu) and the list
+  of tabs are Material 3 in the theme's dark colours, from the wallpaper on Android 12 and later
+  (`DynamicColors`); the list highlights the current tab in the secondary container colour. The
+  tab bar, extra keys and status text keep their fixed colours.
 - Hardware-keyboard shortcuts, taken by the activity (`dispatchKeyEvent`) before the terminal sees
   them, together with the matching key release: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the
   current one (both once per press), Ctrl+Tab and Ctrl+Shift+Tab show the next and the previous
@@ -259,8 +265,9 @@ libghostty-vt with Zig (`android/native`).
 
 - `Native` (`openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`), hence the kernel's host
   console; `login.sh`; `assets/notices`.
-- Material Components 1.14.0 with AppCompat and androidx.activity (`LicensesActivity`, the page
-  layouts and `Theme.Appine`).
+- Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
+  and the page layouts, `MainActivity`'s dialogs, menus and list of tabs, `VtView`'s paste
+  confirmation).
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
   encoding, selection, plain-text formatting, title and width), linked into `libappine.so`
   (`android/native`); `Machine::read_console`, `write_console` and `resize_console` called from
@@ -308,11 +315,14 @@ libghostty-vt with Zig (`android/native`).
   using the Kitty protocol's release events sees only the release.
 - `VtView` turns off the default focus highlight: focused outside touch mode (after hardware or
   injected keys) the system would cover the whole view with a translucent grey.
-- `MainActivity` and `VtView` build their dialogs and menus with the framework's classes
-  (`AlertDialog`, `PopupMenu`, `ListPopupWindow`), which take their colours, and the text
-  selection handles `VtView` draws, from the framework theme; that is why `MainActivity` keeps
-  `Theme.Appine.Terminal`. The Material classes (`MaterialAlertDialogBuilder`, `MaterialSwitch`,
-  `MaterialToolbar`) need `Theme.Appine` and an `AppCompatActivity`.
+- `MainActivity` is a framework `Activity` on a Material theme: Material dialogs and AppCompat's
+  `PopupMenu` and `ListPopupWindow` take the theme, but the views it inflates from XML are the
+  framework's (no AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing
+  there (`ic_close` carries its own tint). The text selection handles `VtView` draws and the
+  floating text menu read framework attributes, which AppCompat forwards to the Material 3
+  colours (the handles are the primary colour). Theme.Material3 does not set the system bars'
+  colours, which Android applies up to version 14, so `Theme.Appine.Terminal` sets them black,
+  as the framework theme had them.
 - Settings and the licenses leave `uiMode` out of their `configChanges` so that a dark-mode
   change recreates them with the other colours; an AppCompat activity that handles `uiMode`
   itself would keep the views it already made in the old ones.
@@ -322,9 +332,9 @@ libghostty-vt with Zig (`android/native`).
 - **The terminal lacks** the bell, mouse drags and motion for programs (only clicks and the wheel
   are sent), double- and triple-tap or rectangular selection, and handles that flip at the screen
   edges (a selection starting at column 0 has its start handle mostly off-screen).
-- **The terminal screen is not Material 3 yet**: its tab bar, extra keys, list of tabs, tab menu,
-  rename dialog and the paste confirmation keep the framework's look (fixed dark colours,
-  `MainActivity.BAR_COLOR`), unlike Settings and the licenses.
+- **The tab bar and extra keys are not Material 3**: they keep fixed dark colours
+  (`MainActivity.BAR_COLOR`, light grey text, cyan for locked modifiers), while the terminal's
+  dialogs, menus and list of tabs follow the theme.
 
 ## Open questions
 
