@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/documents.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: the system root no longer depends on a home root; a home of `/` is no home, and the native side refuses `/` as the writable top; two bugs removed)
 
 ## Responsibilities
 
@@ -41,9 +43,10 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 - With a ready rootfs, the home comes from the login setting through `Rootfs.loginAccount`
   (`/etc/passwd` read from the store; root with `/root` when unreadable) and is shown only if it
-  exists. Home root: summary "account · distro", flags local-only, is-child, search, create
-  (making it a "Save to" target), free space from `getAllocatableBytes`. System root `/`: same
-  without create, only when the setting (default off) is on.
+  exists and is not `/` (which would make the whole system writable). Home root: summary
+  "account · distro", flags local-only, is-child, search, create (making it a "Save to" target),
+  free space from `getAllocatableBytes`. System root `/`: same without create, when the setting
+  (default off) is on, with or without a home root.
 - Document IDs are absolute guest paths with `%`, control characters and non-UTF-8 bytes written
   as `%XX`; only canonical IDs (no empty, `.` or `..` components) count. With the system root off
   only the home and IDs under it are visible; IDs under the home are writable, the home itself only
@@ -103,12 +106,6 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 ## Confirmed bugs / technical debt
 
-- **No roots at all without a home.** `queryRoots` returns before adding the system root when the
-  home cannot be resolved or is missing, so the whole-system root disappears even with its setting
-  on.
-- **A home of `/` makes everything writable.** When the login account's home is `/` (or empty), both
-  the provider's check and the native real-path check accept every path, breaking the read-only
-  whole-system rule.
 - **Grants outlive moved or deleted directories.** Only the exact source ID is revoked; grants on
   its descendants survive, and since IDs are paths a file later created at the same path is covered
   by the old grant.

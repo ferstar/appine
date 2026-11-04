@@ -52,14 +52,17 @@ class Documents : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: ROOT_COLUMNS)
         val context = context ?: return result
-        val home = home(context) ?: return result
+        if (!Rootfs.isReady(context)) return result
         val distro = Rootfs.installed(context)?.label.orEmpty()
         // Free space includes caches the system can clear, matching what Settings shows
         val free = runCatching {
             val storage = context.getSystemService(StorageManager::class.java)
             storage.getAllocatableBytes(storage.getUuidForPath(context.filesDir))
         }.getOrNull()
-        result.newRow().apply {
+        // Without a home directory there is no home root, but the whole system is still shown when
+        // it is turned on
+        val home = home(context)
+        if (home != null) result.newRow().apply {
             add(Root.COLUMN_ROOT_ID, ROOT_HOME)
             add(Root.COLUMN_DOCUMENT_ID, home.path)
             add(Root.COLUMN_TITLE, context.getString(R.string.app_name))
@@ -221,7 +224,8 @@ class Documents : DocumentsProvider() {
 
     /**
      * The login account, its UID and GID, and the home directory (as a document ID). null while
-     * there is no store or no home directory.
+     * there is no store or no home directory; a home of `/` counts as none, since it would make the
+     * whole system writable (the native side refuses it too).
      */
     private data class Home(val account: String, val uid: Int, val gid: Int, val path: String)
 
@@ -233,7 +237,7 @@ class Documents : DocumentsProvider() {
         }
         val home = Rootfs.access.read {
             val account = Rootfs.loginAccount(context, login)
-            val path = canonical("/" + account.home.trim('/')) ?: return@read null
+            val path = canonical("/" + account.home.trim('/'))?.takeIf { it != "/" } ?: return@read null
             // No root is listed when the home directory does not exist (the account has none)
             runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull() ?: return@read null
             Home(account.name, account.uid, account.gid, path)

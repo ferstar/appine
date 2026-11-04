@@ -935,6 +935,46 @@ class MachineTest {
     }
 
     /**
+     * Without a usable home directory (the login account has none, or its home is `/`) there is no
+     * home root, while "the whole system" still appears when it is on, and stays read-only: a home
+     * of `/` must not make every file writable.
+     */
+    @Test
+    fun documentsWithoutAHomeDirectory() {
+        val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        val machine = start(1)
+        val setup = "deluser carol 2>/dev/null; deluser dave 2>/dev/null; " +
+            "adduser -D -H -h / -u 1601 carol && adduser -D -H -h /home/dave -u 1602 dave"
+        assertEquals(0, sh(machine, setup).second)
+        val resolver = context.contentResolver
+        val authority = Documents.authority(context)
+        fun roots() = resolver.query(DocumentsContract.buildRootsUri(authority), null, null, null)?.use { c ->
+            val out = mutableListOf<String>()
+            while (c.moveToNext()) {
+                out.add(c.getString(c.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_ROOT_ID)))
+            }
+            out
+        }
+        fun document(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
+        try {
+            // Each account is its own login setting, so the provider's cached home is not reused
+            for (account in listOf("carol", "dave")) {
+                prefs.edit().putString("login", account).putBoolean("system_documents", false).commit()
+                assertEquals(account, emptyList<String>(), roots())
+                prefs.edit().putBoolean("system_documents", true).commit()
+                assertEquals(account, listOf("system"), roots())
+                assertThrows(account, Exception::class.java) { resolver.openOutputStream(document("/etc/motd"))!!.close() }
+                val created = runCatching { DocumentsContract.createDocument(resolver, document("/"), "text/plain", "x") }
+                assertEquals(account, null, created.getOrNull())
+            }
+            assertEquals(1, sh(machine, "test -e /x").second)
+        } finally {
+            prefs.edit().remove("login").remove("system_documents").commit()
+            sh(machine, "deluser carol; deluser dave")
+        }
+    }
+
+    /**
      * Changing the home directory from the Files app ([Documents]): creating (another name when the
      * name is taken, an extension added from the type), writing, appending, truncating, renaming
      * (without replacing), moving, deleting a whole directory; new files belong to the login

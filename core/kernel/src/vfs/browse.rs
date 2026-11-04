@@ -263,11 +263,15 @@ pub fn search(
 /// The most names one create tries (`a (1).txt`, `a (2).txt`, ...).
 const MAX_TRIES: u32 = 100;
 
-/// The components of `top`'s real path; it must be a directory.
+/// The components of `top`'s real path; it must be a directory other than the root directory
+/// (EACCES): an account whose home is `/`, or a link to it, would make the whole system writable.
 fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
     let (ino, real) = walk(store, top)?;
     if store.kind(ino)? != mode::S_IFDIR {
         return Err(Errno::ENOTDIR);
+    }
+    if real.is_empty() {
+        return Err(Errno::EACCES);
     }
     Ok(real)
 }
@@ -844,6 +848,22 @@ mod tests {
             move_to(&s, top, b"/home/alice/a.txt", b"/etc", &mut c).unwrap_err(),
             Errno::EACCES
         );
+        // A home of `/`, literally or through a link, does not make the whole system writable
+        for root in [b"/".as_slice(), b"/home/alice/up/.."] {
+            assert_eq!(
+                create(&s, root, b"/etc", b"x", false, owner, &mut c).unwrap_err(),
+                Errno::EACCES
+            );
+            assert_eq!(
+                open_write(&s, root, b"/etc/motd", true, false, &mut c).unwrap_err(),
+                Errno::EACCES
+            );
+            assert_eq!(
+                remove(&s, root, b"/etc/motd", &mut c).unwrap_err(),
+                Errno::EACCES
+            );
+        }
+        assert_eq!(read(b"/etc/motd"), "welcome\n");
         // Removing a symlink removes only the link
         remove(&s, top, motd, &mut c).unwrap();
         assert_eq!(stat(&s, motd).unwrap_err(), Errno::ENOENT);

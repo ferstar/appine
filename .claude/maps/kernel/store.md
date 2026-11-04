@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: boot cleanup no longer hands its own numbers to the reaper; removed that bug)
+> Maintained: 2026-11-04 (targeted verification: boot cleanup no longer hands its own numbers to the reaper, removed that bug; browse writes refuse the root directory as `top`)
 
 ## Responsibilities
 
@@ -213,8 +213,9 @@ provider and rootfs installation UI (`android`).
 - Reads (stat, list, open read-only, text sniffing on the first 4 KB of up to 1000 files, search with
   a 50,000-entry budget) accept any guest path. Writes (create with ` (n)` name variants, remove,
   rename and move without overwriting, open for writing with a read-write or append fd) are confined
-  to a caller-supplied `top` directory compared by real path (`EACCES` outside; `top` itself cannot
-  be removed). No guest permission checks are applied, tree removal is one operation per entry, and
+  to a caller-supplied `top` directory compared by real path (`EACCES` outside, and for a `top`
+  whose real path is the root directory, which would cover everything; `top` itself cannot be
+  removed). No guest permission checks are applied, tree removal is one operation per entry, and
   provider writes do not strip setuid/setgid bits or capabilities.
 - A provider write reports `Opened`, writes the object directly, and reports `Written` on close if
   the path still resolves (`IN_MODIFY`, `IN_CLOSE_WRITE` in the guest).
