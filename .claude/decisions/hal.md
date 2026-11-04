@@ -2,9 +2,8 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the design doc §3 and the round
-> records in `docs/rounds/`; no `MODULE: hal` Decision blocks exist yet, so sources cite rounds
-> instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D7 were seeded by hand from the design doc §3 and
+> the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
 
@@ -49,3 +48,17 @@
 - **Why**: Before Android 14 the app seccomp does not allow `copy_file_range` (the call gets `SIGSYS`).
 - **Tradeoffs**: `sendfile` writes at the output fd's host position, so the caller must hold the output file position while copying.
 - **Source**: round 33 (`33-file-ops-host-cost`)
+
+### D8: The host abstraction layer is a module of its own
+- **What**: hal covers `core/hal` (`lib.rs`, `net.rs`), described in one map rather than inside each kernel map or left to design §3.
+- **Why**: Apart from the design doc's §3, nothing documented the host layer, and the user asked to map it with §11.
+- **Tradeoffs**: Its DNS entry (D2) overlaps kernel/net D5 and refers to it.
+- **Watch out**: Bugs confirmed at the split stay open in the map: macOS no longer compiles, contrary to the hal's own comment, and a signal makes a non-Android DNS lookup fail.
+- **Source**: 12c4afa
+
+### D9: Random bytes come from getrandom(2), not `/dev/urandom`
+- **What**: On Linux and Android hosts `fill_random` calls getrandom(2) in a loop that retries `EINTR` and short results, while other hosts, which are not built, keep the `/dev/urandom` path.
+- **Why**: Opening `/dev/urandom` per call needs a free fd in the table the guest shares with the app, so randomness failed exactly when the guest exhausted fds.
+- **Tradeoffs**: There are two implementations behind cfg; a held fd would also have worked but occupies a slot and must survive fd-closing code.
+- **Watch out**: getrandom blocks until the host's entropy pool is initialised, which a booted Android or Linux system already is.
+- **Source**: 9e72dbb

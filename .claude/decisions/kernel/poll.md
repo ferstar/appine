@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-03 (HEAD = 5d21cc4) — seeded by hand from the retired design doc §10 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/poll` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design doc
+> §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -49,3 +49,17 @@
 - **Tradeoffs**: Delivery waits for the timer thread to run.
 - **Watch out**: Re-notify when more data arrives on an already-readable file, as Linux does.
 - **Source**: rounds 19 (`19-deferred`), 54 (`54-mqueue-fasync`)
+
+### D7: I/O multiplexing is a module of its own
+- **What**: kernel/poll covers `syscall/poll.rs`: the readiness model, ppoll and pselect6, epoll, eventfd2 and signal-driven I/O.
+- **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions.
+- **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them signal-driven I/O signalling any process, `EPOLLEXCLUSIVE` timerfds that may never fire, edge-triggered host sockets stalling without host edges and epoll results lost on `EFAULT`.
+- **Source**: c3df5d3
+
+### D8: select waits only for what its sets ask and clamps nfds to Linux's table size
+- **What**: nfds is clamped to an estimate of Linux's fd table size from the highest open fd (64, then 128 · 2^k), bits above it are neither read nor written back, only events in an fd's masks end the wait, and all three masks include `POLLNVAL` as native select does.
+- **Why**: select ended its wait on events it then did not report, and refused nfds values Linux accepts.
+- **Tradeoffs**: Linux's table never shrinks and a forked child's is sized by its parent's open fds, so a set bit on a closed fd just above the estimate is ignored where Linux returns `EBADF` (recorded in the map).
+- **Watch out**: A hung-up host socket in the except set is no longer polled, so a later event on it is noticed only on another wakeup or the timeout.
+- **Source**: 5c179b0

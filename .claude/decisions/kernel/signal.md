@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-03 (HEAD = dd6c288) — seeded by hand from the retired design doc §7 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/signal` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D11 were seeded by hand from the retired design
+> doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -84,3 +84,17 @@
 - **Tradeoffs**: NTP daemons in the guest only observe.
 - **Watch out**: On Android the synthesized state is unsynchronized, which is the real state there (Android sets time with `settimeofday` and runs no kernel NTP adjustment).
 - **Source**: round 140 (`140-ioprio-syslog-adjtimex`)
+
+### D12: Signals, ptrace, core dumps, the kernel log and the ABI contract are one kernel/signal module
+- **What**: kernel/signal covers signal generation and delivery, frames and sigreturn, the vDSO, ptrace, core dumps, the kernel log and the Linux 6.1 ABI contract (uname, the ENOSYS policy, clock setting), leaving host-side signal handling to engine and auxv to kernel/process.
+- **Why**: The retired design doc's §7 was the only current-state description of signals, ptrace, core dumps and the ABI contract, and it said nothing about generation and delivery semantics.
+- **Tradeoffs**: The project-wide ABI contract lives in a module map rather than a design section, and rounds keep § references to the deleted section.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them silent group kills on unwritable or bad frames, stalled process-directed signals, `kill(tid)` returning `ESRCH`, coalesced siginfo, hardware slots left armed after detach, late single-step reports and unforced ptrace reads.
+- **Source**: 9e5be2b
+
+### D13: pidfd_send_signal through a `/proc/<tid>` directory signals the thread group
+- **What**: A `/proc/<tid>` directory fd finds its process with `group_of` and the signal goes to its tgid, as `kill_pid_info` does for such an fd up to Linux 6.8.
+- **Why**: pidfd_send_signal through a non-leader thread's `/proc` directory found no process.
+- **Tradeoffs**: The differential test cannot cover it, since kernels from 6.9 infer the scope from the fd and treat this case differently.
+- **Watch out**: None known.
+- **Source**: 173da76

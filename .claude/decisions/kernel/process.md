@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-03 (HEAD = f9edf81) — seeded by hand from the retired design doc §6 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/process` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D13 were seeded by hand from the retired design
+> doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -79,11 +79,11 @@
 - **Source**: rounds 19 (`19-deferred`), 140 (`140-ioprio-syslog-adjtimex`)
 
 ### D11: A dedicated timer thread delivers timers and runs periodic checks
-- **What**: One host thread in `Machine` sleeps until the earliest deadline and handles interval and POSIX timers, CPU limits, the memory limit, load average and other periodic work.
+- **What**: One host thread in `Machine` sleeps until the earliest deadline and handles interval and POSIX timers, CPU limits, the memory limit, load average, DNS stub answers and other periodic work.
 - **Why**: Timer expiry and limits cannot rely on guest threads, and the memory limit can only be checked periodically because the host kernel handles guest page faults directly; when every thread waits, memory cannot grow, so the periodic checks stop.
 - **Tradeoffs**: Its work runs under the BKL and competes with guest syscalls; a finite `RLIMIT_CPU` keeps a 10 ms tick.
-- **Watch out**: Anything that changes a deadline must signal its event.
-- **Source**: rounds 19 (`19-deferred`), 20 (`20-robustness`)
+- **Watch out**: Anything that changes a deadline or hands it work (the DNS threads) must signal its event.
+- **Source**: rounds 19 (`19-deferred`), 20 (`20-robustness`); fe4bb2b
 
 ### D12: Namespaces keep global IDs inside the kernel and translate at the edges
 - **What**: Kernel pids and credential IDs are global; pid and user namespaces translate syscall arguments, results, procfs and signal info.
@@ -98,3 +98,31 @@
 - **Tradeoffs**: Diverges slightly from the 6.1 contract where 6.2 relaxed it.
 - **Watch out**: The fast path caches the offsets and must be invalidated on namespace entry.
 - **Source**: round 162 (`162-time-namespaces`)
+
+### D14: Processes, threads, scheduling, timers and namespaces are one kernel/process module
+- **What**: kernel/process covers tasks, execve and the ELF loader, the BKL and fast path, waits and futexes, timers, PID 1 and namespaces, leaving mount trees to kernel/vfs, network namespaces to kernel/netns and credentials to kernel/cred.
+- **Why**: The retired design doc's §6 was the only current-state description of processes, threads and scheduling and had drifted from the source (wake channels, fast-path coverage, timer-thread duties, boot plan, pid-namespace orphans).
+- **Tradeoffs**: The map is large because the module spans many files, and rounds keep § references to the deleted section.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `uid_map` writes trusting the writer rather than the opener, a stale user after a panic in the first stage of thread exit, `wait` ignoring `__WCLONE`/`__WALL` and `exit_signal`, and a non-atomic `unshare`.
+- **Source**: dd6c288
+
+### D15: Guest times saturate at KTIME_MAX through one helper
+- **What**: `timespec()` in `syscall/mod.rs` validates guest timespecs and saturates them at KTIME_MAX, and `read_timespec`, the fast path's reader, `timer_settime` and `read_itimerval` all use it, so deadlines stay plain `Instant`s and timers report the saturated time left as Linux does.
+- **Why**: `Instant + Duration` panics on overflow, so any valid timespec with a huge `tv_sec` (`sleep infinity`, futex waits, timers) killed the calling process.
+- **Tradeoffs**: Readers of guest times that do not go through the helper stay unprotected.
+- **Watch out**: A new reader of guest times added without the helper brings the panic back (a map gotcha).
+- **Source**: 96cd8bd
+
+### D16: Orphans of a dying pid namespace go to the built-in init
+- **What**: A namespace's pid 1 is chosen as the new parent only while the namespace is not dead, so a dying namespace's orphans fall through to the built-in init, which reaps them at once and lets the held init be released when the namespace empties.
+- **Why**: The held init of a dying namespace was still chosen after it had exited, so its orphans were never reaped and the namespace's teardown hung.
+- **Tradeoffs**: Those orphans, already SIGKILLed, are parented outside their namespace for the moment before they die, where Linux keeps them under the exiting init.
+- **Watch out**: A subreaper inside the dying namespace still takes orphans first; it is killed too and hands them on when it exits.
+- **Source**: 65c44f6
+
+### D17: execve unshares the fd table only when another process shares it
+- **What**: After the other threads are gone, execve copies the fd table only above two references, i.e. when another process shares it through `CLONE_FILES`, as Linux's `unshare_files` in `begin_new_exec`.
+- **Why**: Each thread holds two references to its table, so the old "more than one" test copied it at every exec and dropped the process's POSIX locks.
+- **Tradeoffs**: None; this matches Linux.
+- **Watch out**: It relies on exiting threads having dropped their references before `kill_other_threads` returns, which they do under the BKL.
+- **Source**: 68cafce

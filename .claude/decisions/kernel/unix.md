@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-03 (HEAD = 5d21cc4) — seeded by hand from the retired design doc §10 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/unix` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D3 were seeded by hand from the retired design doc
+> §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -28,3 +28,17 @@
 - **Tradeoffs**: The collector is conservative (any temporary extra reference keeps a socket) and runs synchronously on unix socket closes; Linux 6.8 runs it asynchronously, so it cannot be compared natively and is covered by unit tests.
 - **Watch out**: Only unix-socket files can be candidates.
 - **Source**: round 19 (`19-deferred`)
+
+### D4: AF_UNIX is a small module of its own
+- **What**: kernel/unix covers `unix.rs` and `syscall/unix.rs`, separate from kernel/net.
+- **Why**: The retired design doc's §10 gave a single line to a full in-process socket family with its own garbage collector.
+- **Tradeoffs**: Its map was verified more lightly (two research concerns, one verifier) than the large modules'.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them no `ECONNRESET`, datagram sends raising `SIGPIPE`, stream reads split and merged at the wrong places, zero-length recv blocking, `shutdown` refusing unconnected sockets and wrong `SO_PEERCRED` values without a peer.
+- **Source**: c3df5d3
+
+### D5: AF_UNIX parses socket timeouts with kernel/net's parser
+- **What**: Unix sockets use net's `timeval()` for `SO_RCVTIMEO` and `SO_SNDTIMEO` instead of their own copy.
+- **Why**: The copy had the same overflow on huge timeouts as the inet parser (kernel/net D10).
+- **Tradeoffs**: The two socket families now share one parser.
+- **Watch out**: None known.
+- **Source**: 96cd8bd

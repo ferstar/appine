@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-03 (HEAD = 5d21cc4) — seeded by hand from the retired design doc §10 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/netns` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -44,11 +44,11 @@
 - **Source**: round 175 (`175-filter`)
 
 ### D6: Namespace ports are registered in the namespace, not left to the host
-- **What**: Explicit binds get separate host ports; listeners and bound UDP sockets are registered per namespace; connections without a matching listener are refused.
+- **What**: Explicit binds get separate host ports, IPv4 and IPv6-only binds of one port each their own; listeners and bound UDP sockets are registered per namespace, by family and v6only; connections without a matching listener are refused.
 - **Why**: A port bound on the outer wildcard made the same port `EADDRINUSE` inside containers (`-p 8080:8080` style publishes failed); connections to unused ports were captured by outer wildcard listeners, and services bound only to a container's 127.0.0.1 were reachable from other containers.
 - **Tradeoffs**: 127.0.0.1 and the virtual address share one host address, so the same port on both conflicts.
 - **Watch out**: Unregister listeners when sockets close.
-- **Source**: round 174 (`174-namespace-ports`)
+- **Source**: round 174 (`174-namespace-ports`); ea08993
 
 ### D7: A host thread forwards outside connections to published ports
 - **What**: Initial-namespace sockets matched by PREROUTING DNAT are served by a forwarder thread that accepts and connects to the target; IPv4 TCP clients from outside keep their real address through a 127.254.x.y binding.
@@ -63,3 +63,17 @@
 - **Tradeoffs**: PREROUTING nat runs only once and only for IPv4.
 - **Watch out**: Wide UDP sockets must keep both paths usable.
 - **Source**: rounds 182 (`182-outer-prerouting`), 183 (`183-udp-wide-first`)
+
+### D9: Network namespaces, virtual devices, nftables and forwarding are one kernel/netns module
+- **What**: kernel/netns covers `netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs` and `netconf.rs`, keeping the nftables control plane and its evaluation in one map.
+- **Why**: The retired design doc's network-namespace section summarised address translation, devices, nftables and forwarding in five bullets, without their isolation limits.
+- **Tradeoffs**: The module is large (about 10k lines) and its map is dense.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `limit` and `quota` ignoring "over", the initial namespace reaching containers' loopback sockets, same-port binds judged by host address, ephemeral ports aliasing explicit ones, connected UDP escaping namespace checks, nat drops becoming `EPERM`, dual-stack listeners not forwarded and a forwarder that can busy-spin.
+- **Source**: c3df5d3
+
+### D10: `nft flush ruleset` flushes tables as Linux's `nf_tables_deltable` does
+- **What**: DELTABLE and DESTROYTABLE with family 0, or with neither a name nor a handle, remove every table of the family (all families for 0), only those with the given name if one is present, checked before the family validation; matching nothing succeeds.
+- **Why**: Firewall configurations conventionally start with `flush ruleset`, so none of them could be loaded with `nft -f`.
+- **Tradeoffs**: None; tables are self-contained, so dropping them whole matches `nft_flush_table`.
+- **Watch out**: Owner-flagged tables, which Linux skips for other sockets, cannot exist here, since the flag is `EOPNOTSUPP`.
+- **Source**: d27f421

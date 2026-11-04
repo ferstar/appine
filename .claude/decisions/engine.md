@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-03 (HEAD = cd53f35) — seeded by hand from the retired design doc §4 and
-> the round records in `docs/rounds/`; no `MODULE: engine` Decision blocks exist yet, so sources
-> cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D18 were seeded by hand from the retired design
+> doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -133,3 +133,10 @@
 - **Tradeoffs**: Retired code is reclaimed only by a full flush.
 - **Watch out**: Jump-cache entries are not cleared and rely on forwarders.
 - **Source**: rounds 11 (`11-m8-jvm`), 24 (`24-shared-translation`), 35 (`35-jit`)
+
+### D19: The engine module is `core/engine` without the page table and TLB fill
+- **What**: engine covers the Tier 0 interpreter, the Tier 1 translator, CPU features, the host fault guard, the C API with its Rust bindings and `tests/lockstep`, while the page table and the TLB fill and flush belong to kernel/mm.
+- **Why**: The retired design doc's §4 was the only current-state description of the CPU engine and had drifted from the source (precise state, indirect-branch lookup, flush triggers, feature gating).
+- **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them the generated table lookup entering the wrong block for target 0, `ic ivau` on guest page 0 being lost, conditional-branch relinking racing a new thread, internal aborts bypassing the fault guard and unregistered locks inside guarded code.
+- **Source**: f9edf81

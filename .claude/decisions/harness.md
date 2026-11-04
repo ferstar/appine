@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-04 (HEAD = b38d29c). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -56,8 +56,8 @@
 - **What**: harness holds `hosts/cli`, `tests/{guest,bench,diff,survey,crash}`, the dev container, the difftest, LTP and survey scripts and CI; lockstep stays with engine, `scripts/fetch-rootfs` with android/setup and `scripts/release-sources` with android/native, and design §13.3 remains the overview.
 - **Why**: hosts/cli was the last code with no module, its value lies in the test layers that drive it, and those layers' gotchas lived only in personal notes; `harness` names the drivers rather than every test.
 - **Tradeoffs**: "All tests" span two maps (lockstep is in engine), and the map repeats part of §13.3's overview.
-- **Watch out**: Recorded weaknesses let tests pass without running (missing cases, dead lanes, the low-ports early return, silent skips without a rootfs), and the two difftest sides start from different files, so results can be flaky.
-- **Source**: 16ac7a2
+- **Watch out**: Recorded weaknesses let tests pass without running (the low-ports early return, silent skips without a rootfs), and the two difftest sides start from different files, so results can be flaky.
+- **Source**: 16ac7a2 (list since updated by 1f93e3d)
 
 ### D10: CI installs a pinned Zig and fetches the Ghostty source for the Android job
 - **What**: The Android job downloads zig-x86_64-linux-0.17.0 from ziglang.org, checks it against the sha256 copied from ziglang.org/download/index.json, puts it on `PATH`, runs `scripts/fetch-ghostty`, and caches `target/ghostty` and `~/.cache/zig` keyed by the script's hash.
@@ -65,3 +65,31 @@
 - **Tradeoffs**: No third-party setup action, but ziglang.org asks CI users to prefer mirrors; the cache key ignores Zig's own build cache, so later runs reuse only the first run's artifacts.
 - **Watch out**: A download failure from ziglang.org fails the job.
 - **Source**: b38d29c
+
+### D11: Semantics the native kernel cannot show are tested by guest programs on both tiers
+- **What**: Where Linux 6.1's behaviour differs from the native kernel the differential tests run on (unprivileged TIOCSTI), a program in `tests/guest` runs in the rootfs store on both tiers through `rootfs_programs`, and the differential case keeps only what both kernels share (here with `--cap-add SYS_ADMIN`, treating `EPERM` and `EIO` alike).
+- **Why**: Unprivileged 6.1 semantics cannot be compared with a newer native kernel, and normalising the errors in the differential case alone would hide the own-terminal case.
+- **Tradeoffs**: The guest program runs only where musl-gcc and the rootfs tarball exist (CI and the dev container).
+- **Watch out**: The rest of the pty group now runs natively with `CAP_SYS_ADMIN`; it passes unchanged.
+- **Source**: ef5f836
+
+### D12: difftest fails every requested case that reports no result
+- **What**: After the lanes finish, each case in `.groups` without an ok or FAIL line is reported as "no result" and counted as failed, `run_group` fails a name without a script, and lanes are started through the script's absolute path computed before the cd to the repository root.
+- **Why**: The differential tests are the main regression check, and a run that silently skipped cases reported success.
+- **Tradeoffs**: None; a case reported twice still counts once as seen.
+- **Watch out**: A lane that prints a malformed report line makes its case count as missing, which errs on the side of failing.
+- **Source**: 1f93e3d
+
+### D13: Kernel fixes get a differential case that reproduces the triggering calls
+- **What**: Each fix adds a case to an existing differential group that reproduces the calls in Python, C or busybox (huge timeouts in edge-cases, a dying pid namespace in namespaces, master-side ioctls in pty, fork advice in fork, IPv4 and IPv6-only ports in nsports, locks across exec in compat2) instead of a kernel unit test or the real program (nginx, tmux), and runs anything that could hang under `timeout`.
+- **Why**: Native Linux is the reference for each fix's semantics, and the programs that hit the bugs are not in the difftest store.
+- **Tradeoffs**: The programs themselves are not exercised, each interrupted wait costs 100 ms, and `O_SYNC` durability is not checked in the suite.
+- **Watch out**: None recorded beyond each case's scope in its source commit.
+- **Source**: 96cd8bd, 65c44f6, d8136b6, e020977, ea08993, 68cafce
+
+### D14: Cases check only what Linux guarantees, not timing or order
+- **What**: Cases count processes with the shell's own glob (`set -- /proc/[0-9]*`) instead of a pipeline that races `ls`, and guest tests accept independent answers (DNS A and AAAA) in either order.
+- **Why**: The bwrap case's count flipped between 3 and 4 depending on whether grep had started, failing CI on unrelated pushes, and the asynchronous DNS stub answers in resolution order.
+- **Tradeoffs**: The bwrap case no longer runs ls or grep inside the sandbox and expects "2 processes".
+- **Watch out**: Other cases may still count processes or read `/proc` while their own pipelines run; the map's gotchas say how to count.
+- **Source**: 404a804, fe4bb2b

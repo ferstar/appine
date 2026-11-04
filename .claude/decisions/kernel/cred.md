@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.1 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/cred` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design doc
+> §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -49,3 +49,10 @@
 - **Tradeoffs**: Only the program shapes Linux recognises are cached; other numbers still take the BKL and the interpreter.
 - **Watch out**: During TSYNC another thread may read the old bitmap; this is acceptable only because a new chain is never looser, so the call counts as happening before the sync.
 - **Source**: round 60 (`60-seccomp-cache`)
+
+### D7: Credentials, capabilities and seccomp are a module of their own
+- **What**: kernel/cred covers `cred.rs` except user namespaces, `syscall/cred.rs` and `seccomp.rs`, while user namespaces stay in kernel/process.
+- **Why**: §11.1's credential and seccomp design had to leave the retired design doc, and the user asked for a module of its own.
+- **Tradeoffs**: User namespaces sit in kernel/process although their code is in `cred.rs`, and the Linux 6.1 comparisons rest on the verifiers' knowledge of the kernel source rather than a side-by-side reading.
+- **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, global pids in seccomp notifications, privilege gains despite a shared fs context, untranslated `PRIO_USER`, new-file modes and the ptrace access checks.
+- **Source**: 12c4afa

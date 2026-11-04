@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.2–§8.3
-> and the round records in `docs/rounds/`; no `MODULE: kernel/vfs` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D14 were seeded by hand from the retired design
+> doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
+> later entries cite commits.
 
 ## Active
 
@@ -104,4 +104,39 @@
 - **Why**: Alpine's sysctl service writes them at boot and failed when they were missing; accepting the writes without enforcing them would misreport a security setting. systemd, Android's init and Alpine all set them to 1, as native VMs show.
 - **Tradeoffs**: `protected_regular` and `protected_fifos` are not implemented.
 - **Watch out**: The no-BKL `Cached` walk knows no credentials, so it must keep bailing out on links that the check might refuse.
-- **Source**: round 185 (`185-protected-links-random`)
+- **Source**: round 185 (`185-protected-links-random`); 12c4afa
+
+### D15: Mounts, fds, file syscalls, pipes, locks, devices and inotify are one kernel/vfs module
+- **What**: kernel/vfs covers path resolution, the mount table and namespace tables, tmpfs instances, fd tables and file I/O, metadata syscalls, xattrs, pipes and FIFOs, locks and leases, device nodes, timerfd and inotify, with eventfd in kernel/poll.
+- **Why**: The retired design doc's §8.2–§8.3 covered mounts and inotify but not fd tables, file syscalls, pipes, locks or devices.
+- **Tradeoffs**: One large map covers about 12k lines of source.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `/proc/<pid>/fd` without an access check, relinking of unlinked files, unprotected `system.*` xattrs, file position races, `F_SETOWN` ignoring pid namespaces, `sendfile` appending to `O_APPEND` output and umount ignoring mappings.
+- **Source**: c5236a1
+
+### D16: timerfd and lease deadlines saturate at KTIME_MAX
+- **What**: timerfd's parser uses the shared `timespec()` helper (kernel/process D15), and the lease-break deadline clamps the `lease-break-time` sysctl at KTIME_MAX.
+- **Why**: timerfd_settime parsed timespecs on its own and lease breaking added the sysctl to now, so both could overflow `Instant` and panic.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 96cd8bd
+
+### D17: Open-time `O_SYNC`/`O_DSYNC` are kept, and `CLOSE_RANGE_UNSHARE` copies only a shared table
+- **What**: `CLOSE_RANGE_UNSHARE` copies the fd table only above two references, like `unshare(CLONE_FILES)`, and open keeps `O_DSYNC` and `__O_SYNC` (`KEPT_AT_OPEN`), so `F_GETFL` shows them, `F_SETFL` cannot clear them and `write_sync` fdatasyncs or fsyncs after each write.
+- **Why**: The unshare test ignored that each thread holds two references to its fd table, and open's status-flag mask lacked the sync flags although `write_sync` already acted on them.
+- **Tradeoffs**: sendfile, copy_file_range and splice into an `O_SYNC` file still do not sync (recorded in the map), and synchronous writes now pay a host fsync each, as they should.
+- **Watch out**: Programs that open files with `O_SYNC` by habit get slower writes.
+- **Source**: 68cafce
+
+### D18: A chown that would clear set-id bits needs ownership, after Linux 6.2
+- **What**: chown computes `keep_sgid` (in the file's group or `CAP_FSETID`) and, for a store non-directory with setuid or with a setgid bit that is group-executable or not kept, requires the owner or `CAP_FOWNER` and otherwise returns `EPERM` before changing anything, following 6.2's `setattr_should_drop_sgid`.
+- **Why**: Anyone could strip the set-id bits of root's programs on a writable mount with `chown(-1, -1)`, a denial of service against su and its kind.
+- **Tradeoffs**: It is one more exception to the 6.1 contract, which neither refused nor cleared a non-executable setgid bit on chown; native kernels (6.8, CI's) show the 6.2 rule.
+- **Watch out**: Writes (`remove_privs`) still clear setgid only with group exec, as 6.1 did, so chown and write differ for a writer outside the file's group (recorded in the map).
+- **Source**: ce7d0d8
+
+### D19: `/proc/<tid>` resolves to its thread group in the VFS too
+- **What**: `exe_file` and `open_pseudo`'s process reference find the process with `pseudo::group_of`, so a non-leader thread id works like its group's.
+- **Why**: `/proc/<tid>/exe` and opening `/proc/<tid>` as a directory looked the id up as a thread group only.
+- **Tradeoffs**: None.
+- **Watch out**: Code that treats a pid node's id as a thread group id misses threads (kernel/procfs D12).
+- **Source**: 173da76

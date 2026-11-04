@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.1 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/store` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D9 were seeded by hand from the retired design doc
+> §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -65,8 +65,29 @@
 - **Source**: round 117 (`117-tmpfs`)
 
 ### D9: The host browse API skips guest permissions but confines writes
-- **What**: The provider resolves guest paths itself, reads anywhere and writes only below a caller-supplied directory (the login account's home).
+- **What**: The provider resolves guest paths itself, reads anywhere and writes only below a caller-supplied directory (the login account's home), refusing with `EACCES` one whose real path is the root directory.
 - **Why**: Users copy files in and out of appine through Android's Files app; the provider acts for the device owner, not a guest user.
 - **Tradeoffs**: Guest permission bits do not restrict the provider; confinement relies on the caller-supplied directory.
 - **Watch out**: Host writes are replayed to running kernels as inotify events so guest watchers notice them.
-- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`)
+- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`); d5dbe29
+
+### D10: The inode store is a module of its own, below the VFS
+- **What**: kernel/store covers `vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs` and the host wrappers in `lib.rs` (the namespace and objects, deferred commits and power-loss ordering, the reaper and checkpoints, boot cleanup, the metadata cache, import and the browse API), with the VFS layer above it in kernel/vfs.
+- **Why**: The retired design doc's §8.1 described the store in prose that had drifted from the code.
+- **Tradeoffs**: The rationale lives only in this decisions file, and rounds keep § references to the design doc of their time.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `linkat` re-linking nlink-0 files, memfds owned by root, leaked objects and misreported import errors.
+- **Source**: c5236a1
+
+### D11: Boot cleanup keeps the numbers it removed away from the reaper
+- **What**: `remove_orphans` drops the inode numbers it just deleted from the doomed list, so the boot commit hands none of them to the reaper.
+- **Why**: Boot cleanup's unlinks queued objects that `remove_orphans` then deleted directly, and the reaper, still given those numbers, could delete a new file's object.
+- **Tradeoffs**: It relies on `remove_orphans` running in the same transaction as the emptying, which boot cleanup always does, and the reaper itself stays blind to identity.
+- **Watch out**: A boot-time step that unlinks files after `remove_orphans` would queue numbers for the reaper again (a map invariant).
+- **Source**: b8bf44c
+
+### D12: chown's setgid clearing is decided by the syscall layer
+- **What**: `set_owner` takes `keep_sgid` from its caller and clears setgid when it is false as well as when the file is group-executable, while setuid is still cleared for every caller.
+- **Why**: The store alone could not know the caller's group membership.
+- **Tradeoffs**: None.
+- **Watch out**: None known; the only other caller is a unit test.
+- **Source**: ce7d0d8

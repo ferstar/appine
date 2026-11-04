@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.3 and
-> the round records in `docs/rounds/`; no `MODULE: android/documents` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design doc
+> §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -22,10 +22,11 @@
 - **Source**: round 196 (`196-documents-read`)
 
 ### D3: Only the login account's home is writable, limited by real path, and new files belong to that account
-- **What**: Inside the home, files can be written, created, deleted, renamed and moved; the whole-system root (off by default) is read-only; symlinks leading outside the home are refused for changes; new files are owned by the account, 0644/0755, numbered on collision; renames and moves never overwrite.
+- **What**: Inside the home, files can be written, created, deleted, renamed and moved; the whole-system root (off by default) is read-only; symlinks leading outside the home are refused for changes; new files are owned by the account, 0644/0755, numbered on collision; renames and moves never overwrite; a home of `/` counts as no home, and the whole-system root is listed whenever its setting is on, with or without a home.
 - **Why**: Copying files in and editing them with Android apps is the common use, and files must be editable by the same account in the terminal.
-- **Tradeoffs**: No guest permission checks (everything in the store belongs to the device's user anyway); no `copyDocument`, so copies go through create-and-write.
-- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`)
+- **Tradeoffs**: No guest permission checks (everything in the store belongs to the device's user anyway); no `copyDocument`, so copies go through create-and-write; an account whose home is `/` gets no home root, so with the system root off the Files app shows nothing for it.
+- **Watch out**: A home that is a symlink to `/` passes the Kotlin check (its flags are only a hint), and only the store's check (kernel/store D9) refuses its writes.
+- **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`); d5dbe29
 
 ### D4: Changes reach the other side in both directions
 - **What**: Provider changes are replayed under each running kernel's lock as inotify events; write fds carry a close callback that reports `IN_MODIFY`/`IN_CLOSE_WRITE`; directories the guest changed are polled by the service and notified to the Files app.
@@ -44,3 +45,10 @@
 - **Why**: Play does not approve `MANAGE_EXTERNAL_STORAGE` for terminal apps (design doc §15).
 - **Tradeoffs**: Until then guest programs cannot open files in Android's shared storage directly.
 - **Source**: design doc §11.3, §15
+
+### D7: The Files app provider is a module of its own
+- **What**: android/documents covers `Documents.kt`, while the store-side browse API stays in kernel/store.
+- **Why**: §11.3 of the retired design doc, shared storage, needed a home.
+- **Tradeoffs**: Reading out of the home through symlinks remains an accepted limitation.
+- **Watch out**: Grants outlive moved or deleted directories (open in the map).
+- **Source**: 12c4afa

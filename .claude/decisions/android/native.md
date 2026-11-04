@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-04 (HEAD = b38d29c). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -12,8 +12,8 @@
 - **What**: Kotlin holds a numeric handle; each call looks up the `Arc<Machine>` in a global table and clones it; `stop` and `shutdown` remove the entry, after which calls find nothing and return sentinels or throw.
 - **Why**: The first design passed an `Arc` raw pointer and required Kotlin not to use it after `stop`; on a reset, the main thread closed a console after the worker had already freed the kernel and hung on a freed lock.
 - **Tradeoffs**: Every call takes the table lock briefly.
-- **Watch out**: Drop the table guard before dropping the last `Arc`, since `Machine`'s drop kills processes and joins threads.
-- **Source**: rounds 07 (`07-m5`), 99 (`99-choose-rootfs`)
+- **Watch out**: Drop the table guard before dropping the last `Arc`, since `Machine`'s drop kills processes and joins threads: bind a removed or replaced entry and drop it after the statement, because a temporary is dropped while the statement's guard is still held.
+- **Source**: rounds 07 (`07-m5`), 99 (`99-choose-rootfs`); 7f79758
 
 ### D2: The native library is always a release build; debug apps add test hooks and the borrow check
 - **What**: cargo-ndk builds `arm64-v8a` in release for every variant; debug variants enable `test-hooks` (the bug-simulation syscall) and `borrow-check`.
@@ -45,6 +45,20 @@
 - **Tradeoffs**: Every Android build needs Zig 0.17.0 and a one-off fetch; only the sha256 is checked, the minisign signature by hand when upgrading; the licence copies and versions are kept by hand, and build.rs and fetch-ghostty must keep the same zig build options.
 - **Watch out**: A Ghostty upgrade can change the C API silently (OPT_USERDATA changed meaning in 1.4), need a newer Zig and add linked components the notices miss (list libghostty-vt.a's objects again); Zig's HTTP client fails through some proxies; build.rs reruns only on vt.c, build.zig.zon and its environment variables.
 - **Source**: 394aecf, b38d29c
+
+### D7: Material Components is a direct dependency, with its licences allow-listed
+- **What**: `com.google.android.material:material:1.14.0` is declared inline like androidx.core, and NoticesTask's Apache groups gain `com.google.android.material` and `com.google.errorprone:error_prone_annotations`, both POMs checked.
+- **Why**: The Material 3 restyle needs Material Components on the classpath, and NoticesTask fails the build for any Android library outside the groups known to be Apache-2.0.
+- **Tradeoffs**: AppCompat, androidx.activity and CoordinatorLayout are used but arrive only through Material, and versions are still bumped by hand.
+- **Watch out**: A Material upgrade can bring a library outside the known groups, which stops the build until its licence is checked (as intended), and the APK's growth was not measured.
+- **Source**: 55be399
+
+### D8: Instrumentation tests cover oversized downloads, homeless accounts and repeated reads of saved tabs
+- **What**: `downloadsAreVerified` expects a download one byte past its pinned length to fail with no partial file, `documentsWithoutAHomeDirectory` checks the roots and refused writes for a home of `/` and a missing home, and the saved-tabs test reads the same tabs twice before the kernel is up and expects one content-named transcript per saved tab.
+- **Why**: The fetch cap, homes of `/` and keeping the killed-run marker had no device-side coverage, and the saved-tabs test still expected the marker to be deleted.
+- **Tradeoffs**: Only the `file:` URL path is exercised, not HTTP resumption.
+- **Watch out**: The saved-tabs test assumes transcripts are the only `.txt` files in `files/tabs`, and each home case needs its own login setting so the provider's cached home is not reused.
+- **Source**: 544418f, 711b034, d5dbe29
 
 ## Superseded
 

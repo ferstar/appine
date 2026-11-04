@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-04 (HEAD = b38d29c). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
 - **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
 - **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `CLONE_INTO_CGROUP` without a permission check, `cgroup.procs` migration without the common-ancestor check, `/proc/<tid>` returning `ENOENT` for non-leader threads, and no poll notifications.
-- **Source**: c5236a1
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `CLONE_INTO_CGROUP` without a permission check, `cgroup.procs` migration without the common-ancestor check and no poll notifications.
+- **Source**: c5236a1 (bug list since updated by 173da76)
 
 ### D10: `/proc/stat`'s btime is computed in nanoseconds on every read and follows the time namespace
 - **What**: Each read takes realtime in nanoseconds minus `with_boot_offset(uptime_ns())`, then whole seconds (no less than 0), so btime stays fixed and moves back by the reader's boottime offset.
@@ -77,3 +77,17 @@
 - **Tradeoffs**: The two clocks are read microseconds apart, so btime can still be one second off when the boot instant's fraction falls in that gap; unlike a cached value it follows host clock steps, as Linux does.
 - **Watch out**: A host clock step (Android network time) moves btime and programs that cached it disagree until they reread it; the difftest cases (compat2, containers) compare only stability and offsets, not exact values.
 - **Source**: eb3bc8b
+
+### D11: smaps' VmFlags show `dc` and `wf`
+- **What**: VmFlags lists `dc` (dontfork) and `wf` (wipeonfork) in Linux's bit order.
+- **Why**: smaps had no way to show the fork advice flags that kernel/mm D19 added.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: e020977
+
+### D12: Any thread id resolves under `/proc` through its thread group
+- **What**: `group_of` finds a pid node's thread group by group id or by the task's tgid and every pid-node lookup uses it, so `/proc/<tid>` (not listed by readdir) shows the thread's status, comm, cwd and fd with its group's Tgid while stat adds up the group, as Linux's tgid view of a thread does.
+- **Why**: Thread-aware programs open `/proc/<gettid()>/comm`, stat or status directly and got `ENOENT`.
+- **Tradeoffs**: A `/proc/<tid>` inode mixes in its group's serial, so a thread id reused within the same process keeps its inode number.
+- **Watch out**: Code outside procfs that treats a pid node's id as a thread group id can still miss threads; the known ones (exe, pidfd_send_signal's directory) use `group_of`.
+- **Source**: 173da76

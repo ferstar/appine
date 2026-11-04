@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-03 (HEAD = 5d21cc4) — seeded by hand from the retired design doc §10 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/net` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -37,11 +37,11 @@
 - **Source**: round 98 (`98-routes`)
 
 ### D5: DNS goes through a stub at 127.0.0.53 answered by the host resolver
-- **What**: `resolv.conf` points at `127.0.0.53`; UDP queries to it are intercepted in the socket layer and answered by `android_res_nsend` (other hosts forward to the host's servers), with SERVFAIL on failure.
+- **What**: `resolv.conf` points at `127.0.0.53`; UDP queries to it are intercepted in the socket layer and resolved by `android_res_nsend` (other hosts forward to the host's servers) on a `dns-stub` host thread per query, whose answer or SERVFAIL the timer thread queues on the socket.
 - **Why**: Going through the system resolver makes Android's Private DNS, VPNs and per-network routing apply to the guest; failing fast with SERVFAIL stops resolvers from waiting for their timeouts.
-- **Tradeoffs**: The query runs synchronously in the sending thread; TCP DNS and container namespaces are not intercepted.
-- **Watch out**: Keep `resolv.conf` written only when missing so user edits survive.
-- **Source**: rounds 06 (`06-m4`), 07 (`07-m5`)
+- **Tradeoffs**: Each query starts a host thread and answers arrive in resolution order, not send order; TCP DNS and container namespaces are not intercepted.
+- **Watch out**: Keep `resolv.conf` written only when missing so user edits survive; the DNS threads hold only the answer queue and the timer event, never the kernel, which they could outlive.
+- **Source**: rounds 06 (`06-m4`), 07 (`07-m5`); fe4bb2b
 
 ### D6: Low ports first try the real port, then fixed offsets, hidden from the guest
 - **What**: Binding a port below 1024 tries the port itself on the host, then +10000, +20000, +30000, then a host-chosen port; the guest always sees its own port, and the app is told about the first non-loopback listen.
@@ -63,3 +63,28 @@
 - **Tradeoffs**: TCP only; no TPROXY.
 - **Watch out**: Register the record before releasing the BKL so the peer cannot accept first.
 - **Source**: round 180 (`180-original-dst`)
+
+### D9: Internet and netlink sockets are one kernel/net module
+- **What**: kernel/net covers `net.rs`, `syscall/net.rs`, raw ICMP, the routing table, the port map, traffic counters and `SO_ORIGINAL_DST`, with host socket wrappers in hal and the namespace hooks described from kernel/netns's side.
+- **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits.
+- **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `MSG_PEEK|MSG_WAITALL` duplicating data, blocking connect ignoring `SO_SNDTIMEO`, accept4 leaking fds, unchecked recvmsg iovec sums, non-resumable netlink dumps, one echo id per raw ICMP socket and the host's counters in a new namespace's loopback statistics.
+- **Source**: c3df5d3
+
+### D10: Socket timeouts of KTIME_MAX or more mean none
+- **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
+- **Why**: `LONG_MAX` seconds, a common "never" value, overflowed the receive and send deadlines.
+- **Tradeoffs**: Values between KTIME_MAX (about 9.2e9 s) and Linux's `CONFIG_HZ`-dependent cut-off read back as 0 where Linux returns them.
+- **Watch out**: None known; kernel/unix uses the same parser.
+- **Source**: 96cd8bd
+
+### D11: Namespace port-map entries tell IPv6-only binds apart
+- **What**: The port map's key gains an IPv6-only flag (AF_INET6 with `IPV6_V6ONLY` and a non-mapped address), so such binds get their own host port, and `host_port` prefers that entry for a real IPv6 destination and never for IPv4.
+- **Why**: Keyed by namespace, protocol and guest port only, an IPv6-only and an IPv4 socket on one port (nginx's usual pair) got the same host port and their dual-stack host sockets conflicted.
+- **Tradeoffs**: An IPv6-only `[::]:P` and a dual-stack `[::]:P` now both bind where Linux refuses the second, and binds on different guest addresses that share a host address are still judged by host address.
+- **Watch out**: A new caller of `host_port` must pass the destination's family, or an IPv6 client could reach the IPv4 socket's host port.
+- **Source**: ea08993
+
+## Superseded
+
+- ~~DNS stub queries are resolved synchronously in the sending thread (rounds 06, 07)~~ → replaced by **D5** in fe4bb2b (2026-11-05)

@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-03 (HEAD = 4b19037) — seeded by hand from the retired design doc §5 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/mm` Decision blocks exist yet, so sources
-> cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D17 were seeded by hand from the retired design
+> doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -126,3 +126,17 @@
 - **Tradeoffs**: Large writable mappings are still one-to-one, so ASan's shadow memory still cannot be mapped on such hosts.
 - **Watch out**: Reserved regions have a fake host base that must never be dereferenced.
 - **Source**: round 199 (`199-reserved-mappings`)
+
+### D18: Guest memory, with the page table and software TLB, is one kernel/mm module
+- **What**: kernel/mm covers `mm.rs`, `syscall/mem.rs`, the page table in `mmu.c`, the software TLB in `cpu.c` and `internal.h` and the run loop's page-fault branch, so the engine module stops at instruction execution.
+- **Why**: The retired design doc's §5 was the only current-state description of guest memory, much shorter than the code warranted, and had drifted from it in several places.
+- **Tradeoffs**: The module spans the Rust kernel and the C engine, and a full mapping of a module this size cost about 1.3M subagent tokens.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them the truncation race, robust futex death skipping CoW pages, ignored `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*`, past-EOF faults ignoring permissions and `MAP_FIXED` below `0x10000`.
+- **Source**: cd53f35
+
+### D19: `MADV_WIPEONFORK` and `MADV_DONTFORK` are VMA flags applied at fork
+- **What**: madvise sets `wipeonfork` and `dontfork` VMA flags, splitting VMAs as for dontdump; fork skips dontfork VMAs (also in the commit check) and does not lend wipeonfork ones, so the child gets zeroed memory, while the child keeps dontdump and wipeonfork and mremap growth carries all three.
+- **Why**: fork ignored both advices and dropped dontdump, and `advice_range` folded in the VMA below the range even when it did not overlap, so madvise failed with `EINVAL` next to file or locked mappings.
+- **Tradeoffs**: The child's wiped VMA keeps `written` set, so a later fork of the child still lends it, since clearing it would skip pages the child writes without an mprotect.
+- **Watch out**: Any new path that copies a VMA must carry these flags too, and dontfork on the stack or heap kills the child, exactly as on Linux.
+- **Source**: e020977

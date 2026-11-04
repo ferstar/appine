@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-03 (HEAD = c5236a1) — seeded by hand from the retired design doc §9 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/tty` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -63,3 +63,24 @@
 - **Tradeoffs**: Programs that ignore EOF keep running until the first process exits.
 - **Watch out**: Resend `VEOF` if the program left canonical mode before reading it.
 - **Source**: rounds 05 (`05-m3b`), 102 (`102-snmp-pty-eof`)
+
+### D9: PTYs, the line discipline, job control and the host console are one kernel/tty module
+- **What**: kernel/tty covers `tty.rs`, `syscall/tty.rs` and `terminal.rs` (PTY pairs, the line discipline, termios2, packet mode, job control and the host console), while setsid/setpgid and exit-time signals stay in kernel/process and stop rules in kernel/signal.
+- **Why**: The retired design doc's §9 summarised the terminal layer in five bullets that missed its limits and differences from Linux.
+- **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `TIOCSCTTY` stealing terminals without privilege, echoes growing the output without limit, non-canonical read timing, pending input hidden on switching to canonical mode, no `SIGTTOU` for background tcflush/tcflow/tcdrain and an extra `SIGCONT` at a session leader's exit.
+- **Source**: 5d21cc4
+
+### D10: TIOCGPGRP and TIOCGSID on a master skip the controlling-terminal check
+- **What**: On a master, TIOCGPGRP and TIOCGSID answer without the ctty check (no session is still `ENOTTY` for TIOCGSID, no foreground group reads 0) and TIOCNOTTY is always `ENOTTY`, while the slave keeps the check, as on Linux.
+- **Why**: Both PTY ends share one `Tty`, so the slave-side check also ran on the master, and tmux's window names and pane cwd depend on asking the master.
+- **Tradeoffs**: Any holder of a master fd can read the slave's foreground group and session, exactly as on Linux.
+- **Watch out**: TIOCSPGRP keeps its ctty check on the master, also as on Linux.
+- **Source**: d8136b6
+
+### D11: TIOCSTI follows Linux 6.1: one's own controlling terminal or `CAP_SYS_ADMIN`
+- **What**: TIOCSTI returns `EPERM` unless the fd is a slave that is the caller's controlling terminal or the caller has `CAP_SYS_ADMIN`; a master is never a controlling terminal, and with the capability its byte goes to what the master reads, ahead of held output.
+- **Why**: Typing into another session's terminal is a privilege-escalation path (a root shell reading a terminal that an unprivileged process still holds).
+- **Tradeoffs**: Newer distribution kernels refuse TIOCSTI to everyone without `CAP_SYS_ADMIN`, while appine keeps 6.1's rule for one's own terminal.
+- **Watch out**: None known.
+- **Source**: ef5f836

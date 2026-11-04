@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.1 and
-> §11.4 and the round records in `docs/rounds/`; no `MODULE: android/setup` Decision blocks exist
-> yet, so sources cite rounds instead of commits.
+> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
+> entries cite commits.
 
 ## Active
 
@@ -54,3 +54,42 @@
 - **Why**: The design doc states the rule without a recorded reason.
 - **Tradeoffs**: Two distros cannot be used side by side or share files (that would need mounts across stores).
 - **Source**: round 99 (`99-choose-rootfs`); design doc §11.4
+
+### D9: Distributions, first boot, logins and Settings are one android/setup module
+- **What**: android/setup covers `Rootfs.kt`, `SettingsActivity.kt`, `login.sh` and `scripts/fetch-rootfs`, separate from android/service.
+- **Why**: §11.1's login account and §11.4's first boot and settings needed a home when the design doc was retired.
+- **Tradeoffs**: The service drives switches and imports, so those flows span two maps, and D8's reason was never recorded.
+- **Watch out**: The map's open bugs include a password set in a running session keeping NOPASSWD until the next tab logs in and a switch interrupted by a kill silently becoming Alpine.
+- **Source**: 12c4afa
+
+### D10: The execution tier row exists only in debug builds
+- **What**: Settings creates the tier row only when `BuildConfig.DEBUG`, with its strings left in `main`, which references them.
+- **Why**: Tier 0 only tells engine bugs from kernel bugs, and in a release build choosing it made everything tens of times slower and could stay on unnoticed.
+- **Tradeoffs**: Release users cannot be asked to retry on Tier 0 to locate a reported bug, and the release APK carries six strings it never shows.
+- **Watch out**: Where Tier 1 cannot start, a release build has no fallback to Tier 0 (the row was already disabled while the kernel was down, so this is no regression).
+- **Source**: 62a8c07
+
+### D11: Filling two cells with CJK is an on-off switch, not a scale
+- **What**: Settings offers a toggle row "CJK characters fill two cells" ("中日韩文字占满两格"), usable at any time, with summaries for on and off, rather than a choice of scales.
+- **Why**: The user asked for a switch in Settings between filling two cells and the old centring.
+- **Tradeoffs**: No intermediate scale.
+- **Watch out**: The row speaks of CJK characters, but every wide glyph narrower than two cells is enlarged.
+- **Source**: 0478dd5
+
+### D12: Settings is a Material 3 page of grouped rows
+- **What**: Rows inflated from `list_item.xml` into a `NestedScrollView` are grouped under System, Android, Terminal, Debugging (debug builds only) and About; toggles show a display-only `MaterialSwitch` presented to accessibility services as a switch, disabled rows are drawn at 38%, every dialog goes through `MaterialAlertDialogBuilder`, and state handling and the service calls are unchanged.
+- **Why**: The user asked for the settings screen to be restyled first, and it was a flat list of nine hand-coloured rows with a text arrow for back.
+- **Tradeoffs**: The groups and their names are the assistant's choice, not yet confirmed by the user, rows are plain views driven by the service's state rather than Preferences, and the login change stays a toast.
+- **Watch out**: The first state jumps into place through `SwitchCompat.jumpDrawablesToCurrentState` ending its thumb animator (read from AppCompat 1.7.1's bytecode), so a later AppCompat could slide the switches on every open again.
+- **Source**: 55be399
+
+### D13: Login rules, admin setup, mirror choice and downloads fail closed
+- **What**: NOPASSWD rules are refreshed at every login, root's included, and granted only when the account's shadow field after any leading `!` is empty or `*`; an admin is matched with `grep -F` and recorded only once `id -nG` shows the group (else retried at the next login); a failed mirror write leaves the sources and the record alone; and a download fails as soon as a source sends more than the pinned length.
+- **Why**: Locked accounts with a password, missing shadow entries and a missing `/etc/shadow` counted as passwordless, root logins never rewrote the rules, failed group changes were recorded, names were matched as regexes, a mirror that failed to write was recorded and fetch had no cap.
+- **Tradeoffs**: A password set inside a running session keeps NOPASSWD until the next tab logs in (map debt), and a locked account without a hash still counts as passwordless, as `adduser -D` accounts must.
+- **Watch out**: Shadow formats other than Alpine's and Debian's (`!`, `!!`, `*`, `!*`) are judged by the same rule, and the Debian sudo path was not run in a container, only shared with the Alpine path.
+- **Source**: 711b034
+
+## Superseded
+
+- ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
